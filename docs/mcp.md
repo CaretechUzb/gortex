@@ -54,7 +54,7 @@ Returned tools are auto-promoted (`promote:false` opts out) and the server fires
 
 The full ~180-tool surface is more than many agents need. A **tool preset** picks what the server publishes — the basis both for the lean shipped default and for a minimal, headless editing harness (an agent on a trusted box driving a remote daemon through a small, fixed tool set).
 
-Six built-in presets:
+Seven built-in presets:
 
 | Preset | Surface |
 |--------|---------|
@@ -64,10 +64,13 @@ Six built-in presets:
 | `readonly` | everything except the mutating tools (`edit_file`, `write_file`, `index_repository`, …) |
 | `edit` | the minimal headless editing set — orient + navigate + mutate + verify (`smart_context`, `search_symbols`, `find_files`, `edit_file`, `verify_change`, `get_test_targets`, …) |
 | `nav` | read-only navigation / exploration; no editors |
+| `localization` | the diet "where is the code that does X" set (~10 tools, read-only, compacted descriptions): `smart_context` + search + trace + read. The eager list is sourced from the instruction-profile table, so this surface and the `localization` profile's instructions body cannot drift. Aliases: `locate`, `find` |
 
 `tool_profile` and `tools_search` are always kept. Layer per-tool deltas on any preset with `allow` / `deny`.
 
 **Client-aware default.** With no `GORTEX_TOOLS` / config preset, the server picks the default per connection: a **known coding-agent client** (the same set that defaults the wire format to GCX — `claude-code`, `cursor`, `vscode`, `zed`, `aider`, `kilocode`, `opencode`, `openclaw`, `codex`, `omp-coding-agent`) gets `agent`; every other client keeps `core`. `GORTEX_TOOLS` always overrides. The `gortex mcp` proxy forwards its `GORTEX_TOOLS` / `--tools` to the daemon in the handshake, so a client's preset applies over the shared daemon (it can both narrow and widen the surface, not just subtract).
+
+**Instruction profiles.** The machine's active instruction profile (`gortex instructions switch <core|localization|full>` — see [`cli.md`](cli.md#gortex-instructions--instruction-profiles)) can carry a tool preset; sessions pick it up between the forwarded spec and the client-aware default. Full precedence: **forwarded spec (`GORTEX_TOOLS` / `--tools`) > operator-pinned `mcp.tools` config > active instruction profile > client-aware default > server default**. The shipped `core` profile carries no preset, so nothing changes until a machine explicitly switches; profile changes apply to new sessions only.
 
 **Two modes** (`mode`):
 

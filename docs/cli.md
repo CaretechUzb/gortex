@@ -237,6 +237,25 @@ gortex memory store --kind invariant --importance 5 --symbols pkg/foo.go::Bar \
 gortex memory note --tags decision --body "chose token bucket over leaky bucket because of burst tolerance"
 ```
 
+### `gortex instructions …` — instruction profiles
+
+An **instruction profile** bundles four agent-facing surfaces, generated from one table so they cannot drift: the instructions body (`~/.gortex/instructions/<name>.md`, @-included into `~/.claude/CLAUDE.md` through an `active.md` byte copy), the MCP tool preset sessions default to, the installed skills subset, and the hook-verbosity tier. Three profiles ship: `core` (balanced default), `localization` (lean code-finding surface: ~2 KB body, ~10 read-only tools, 3 skills, lean hooks), `full` (maximum guidance: the ~34-tool dev-cycle preset eager).
+
+| Verb | Effect |
+|---|---|
+| `instructions list` | profiles with the active marker, body bytes, preset, skills count, hook tier |
+| `instructions show <name>` | print one profile's instructions body |
+| `instructions switch <name>` | atomically repoint `active.md`, record the state, reconcile installed skills |
+| `instructions regen` | re-derive the profile files from the running binary (selection unchanged) |
+
+Switching applies to **new sessions only** — the @-include, `tools/list`, and skills all load at session start. A forwarded `GORTEX_TOOLS` or an operator-pinned `mcp.tools` config always beats the profile's preset (see [`mcp.md`](mcp.md#restricting-the-tool-surface-presets)); `GORTEX_INSTRUCTIONS_PROFILE=<name>` pins the profile per process tree (benchmarks, CI).
+
+```bash
+gortex instructions list
+gortex instructions switch localization   # lean machine: diet body + 10-tool surface + lean hooks
+gortex instructions switch core           # back to the balanced default
+```
+
 ### `gortex analyze` — unified analysis dispatcher
 
 `gortex analyze --kind <k>` runs the daemon's `analyze` dispatcher. `gortex analyze kinds` lists the valid kinds (no daemon needed). Universal typed flags (`--limit`, `--compact`, `--path-prefix`, `--format json|gcx|toon|text`) cover the common parameters; kind-specific parameters ride on `--arg key=value` (same coercion as `call`, and a `--arg` pair overrides the matching typed flag).
