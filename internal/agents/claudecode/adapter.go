@@ -587,13 +587,6 @@ func installPermissions(w io.Writer, settingsPath string, opts agents.ApplyOpts)
 	}, opts)
 }
 
-// installGlobalSkills writes ~/.claude/skills/gortex-*/SKILL.md for
-// each skill defined in GlobalSkills, skipping any that already
-// exist (users may have customised their copy).
-func installGlobalSkills(w io.Writer, home string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
-	return SyncGlobalSkills(w, home, nil, opts)
-}
-
 // instructionsDir resolves where the generated instruction profiles
 // live for this install run: the Env override (tests) or the machine
 // default shared with the daemon and the `gortex instructions` verb.
