@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 // Name is the stable identifier for this adapter, matching the
@@ -237,14 +238,28 @@ func (a *Adapter) applyGlobal(env agents.Env, opts agents.ApplyOpts, res *agents
 		res.Files = append(res.Files, hookAction)
 	}
 
-	// 4. ~/.claude/CLAUDE.md — merge the rule block. Without this,
-	// the rule only surfaces at deny-time (PreToolUse) which is
-	// late: the agent has already wasted a turn on a forbidden
-	// tool. The marker block keeps user content intact and is
-	// regeneratable on re-install.
+	// 4. Instruction profiles + ~/.claude/CLAUDE.md pointer block.
+	// The generated profiles live under the gortex home; CLAUDE.md
+	// carries only a thin marker-fenced block that @-includes the
+	// active profile, so `gortex instructions switch` changes
+	// guidance depth without ever rewriting CLAUDE.md. Without the
+	// block, the rule only surfaces at deny-time (PreToolUse) which
+	// is late: the agent has already wasted a turn on a forbidden
+	// tool.
+	insDir := instructionsDir(env)
 	if env.InstallGlobalInstructions {
+		insAction := agents.FileAction{Path: insDir, Action: agents.ActionMerge, Keys: []string{"instruction-profiles"}}
+		if opts.DryRun {
+			insAction.Action = agents.ActionWouldMerge
+			res.Files = append(res.Files, insAction)
+		} else if err := profiles.Generate(insDir); err != nil {
+			logWarn(w, "could not generate instruction profiles: %v", err)
+		} else {
+			logf(w, "[gortex install] wrote instruction profiles to %s", insDir)
+			res.Files = append(res.Files, insAction)
+		}
 		claudeMdPath := userClaudeMdPath(env.Home)
-		mdAction, err := agents.UpsertMarkedBlock(w, claudeMdPath, agents.GlobalInstructionsBody,
+		mdAction, err := agents.UpsertMarkedBlock(w, claudeMdPath, agents.GlobalPointerBody(insDir),
 			agents.GlobalRulesStartMarker, agents.GlobalRulesEndMarker, opts)
 		if err != nil {
 			logWarn(w, "could not install global CLAUDE.md: %v", err)
@@ -261,11 +276,11 @@ func (a *Adapter) applyGlobal(env agents.Env, opts agents.ApplyOpts, res *agents
 	}
 
 	// 3. ~/.claude/skills/gortex-*/SKILL.md — curated tool-usage
-	// skills (guide / explore / debug / impact / refactor). One
-	// source of truth per user rather than duplicated into every
-	// repo. Skipped when the files already exist so user edits
-	// survive.
-	skillActions, err := installGlobalSkills(w, env.Home, opts)
+	// skills, reconciled against the active instruction profile's
+	// subset (nil = all shipped skills). Existing files are never
+	// overwritten so user edits survive; out-of-profile skills are
+	// removed only when they still match a shipped body.
+	skillActions, err := SyncGlobalSkills(w, env.Home, profiles.Active(insDir).Skills, opts)
 	if err != nil {
 		logWarn(w, "could not install user-level skills: %v", err)
 	}
@@ -350,6 +365,20 @@ func (a *Adapter) RemoveGlobal(env agents.Env, opts agents.ApplyOpts) (removed i
 	ownedRemoved, ownedFailures := removeGlobalOwnedFiles(w, env.Home, opts)
 	removed += ownedRemoved
 	failures = append(failures, ownedFailures...)
+
+	// 6. Generated instruction profiles — gortex-owned generated
+	// files (plus the tiny active-state record), safe to delete.
+	insDir := instructionsDir(env)
+	if _, err := os.Stat(insDir); err == nil {
+		if opts.DryRun {
+			removed++
+		} else if err := profiles.Remove(insDir); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", insDir, err))
+		} else {
+			logf(w, "[gortex] removed instruction profiles at %s", insDir)
+			removed++
+		}
+	}
 
 	return removed, failures
 }
@@ -562,11 +591,67 @@ func installPermissions(w io.Writer, settingsPath string, opts agents.ApplyOpts)
 // each skill defined in GlobalSkills, skipping any that already
 // exist (users may have customised their copy).
 func installGlobalSkills(w io.Writer, home string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
+	return SyncGlobalSkills(w, home, nil, opts)
+}
+
+// instructionsDir resolves where the generated instruction profiles
+// live for this install run: the Env override (tests) or the machine
+// default shared with the daemon and the `gortex instructions` verb.
+func instructionsDir(env agents.Env) string {
+	if env.InstructionsDir != "" {
+		return env.InstructionsDir
+	}
+	return profiles.DefaultDir()
+}
+
+// SyncGlobalSkills reconciles ~/.claude/skills/gortex-* with the
+// allowed subset (nil = every shipped skill):
+//
+//   - allowed skills are installed when missing; an existing file is
+//     never overwritten, so user edits survive;
+//   - shipped skills OUTSIDE the subset are removed only when their
+//     on-disk SKILL.md is still byte-identical to the shipped body —
+//     a customised copy is kept (ActionSkip) with a warning, because
+//     deleting user work to enforce a profile is never worth it.
+//
+// Also used by `gortex instructions switch` to re-shape the installed
+// skill surface when the active profile changes.
+func SyncGlobalSkills(w io.Writer, home string, allowed []string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
+	var allowedSet map[string]bool
+	if allowed != nil {
+		allowedSet = make(map[string]bool, len(allowed))
+		for _, name := range allowed {
+			allowedSet[name] = true
+		}
+	}
 	out := make([]agents.FileAction, 0, len(GlobalSkills))
 	skillsDir := filepath.Join(userClaudeConfigDir(home), "skills")
 	for name, content := range GlobalSkills {
 		dir := filepath.Join(skillsDir, name)
 		path := filepath.Join(dir, "SKILL.md")
+		if allowedSet != nil && !allowedSet[name] {
+			existing, err := os.ReadFile(path)
+			if err != nil {
+				// Not installed (or unreadable): nothing to prune.
+				out = append(out, agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "outside-profile"})
+				continue
+			}
+			if string(existing) != content {
+				logWarn(w, "keeping customised skill %s (outside the active profile)", path)
+				out = append(out, agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "customised"})
+				continue
+			}
+			if opts.DryRun {
+				out = append(out, agents.FileAction{Path: path, Action: agents.ActionWouldDelete, Keys: []string{"skill"}})
+				continue
+			}
+			if err := os.RemoveAll(dir); err != nil {
+				return out, err
+			}
+			logf(w, "[gortex] removed skill %s (outside the active profile)", path)
+			out = append(out, agents.FileAction{Path: path, Action: agents.ActionDelete, Keys: []string{"skill"}})
+			continue
+		}
 		action, err := agents.WriteIfNotExists(w, path, content, opts)
 		if err != nil {
 			return out, err

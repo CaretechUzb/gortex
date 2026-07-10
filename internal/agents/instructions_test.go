@@ -164,34 +164,33 @@ func TestInstructionsBody_PolicyCoreAndSingleHome(t *testing.T) {
 	}
 }
 
-// TestGlobalInstructionsBody_PolicyCoreAndSingleHome mirrors the check for the
-// per-machine block written by `gortex install` into ~/.claude/CLAUDE.md — the
-// single home for the full memory-workflow triggers.
-func TestGlobalInstructionsBody_PolicyCoreAndSingleHome(t *testing.T) {
-	for _, token := range []string{
-		// Graph-tools policy core.
-		"search_symbols", "find_usages", "get_callers", "get_call_chain",
-		"get_symbol_source", "get_editing_context", "read_file",
-		"smart_context", "edit_file", "rename_symbol", "compress_bodies",
-		// Full memory triggers (the single home).
-		"distill_session", "surface_memories", "save_note", "store_memory",
-		"query_notes", "query_memories",
-		// Discovery pointers.
-		"tools_search", "gortex://guide", "gortex daemon start",
-	} {
-		if !strings.Contains(GlobalInstructionsBody, token) {
-			t.Errorf("GlobalInstructionsBody no longer mentions %q", token)
-		}
+// TestGlobalPointerBody_ShapeAndSentinel locks in the thin pointer
+// block `gortex install` writes into ~/.claude/CLAUDE.md: it must keep
+// the mandatory-rule heading (the cross-adapter idempotency sentinel),
+// @-include the active profile copy from the given directory, name the
+// switch verb with its next-session caveat, and stay tiny — the full
+// policy body lives in the profile file, not here.
+func TestGlobalPointerBody_ShapeAndSentinel(t *testing.T) {
+	const dir = "/home/user/.gortex/instructions"
+	body := GlobalPointerBody(dir)
+
+	if !strings.Contains(body, InstructionsSentinel) {
+		t.Error("pointer block lost the idempotency sentinel heading")
 	}
-	for _, banned := range []string{
-		providerMatrixMarker, analyzeCatalogMarker, formatDeepDiveMarker,
-		// Reference catalogs that relocated to the guide / schema resource.
-		// (A bare "search_ast" pointer is allowed; the DETECTOR catalog — named
-		// detectors like error-not-wrapped — must not be inlined.)
-		"k8s_resources", "error-not-wrapped", "gortex://report",
-	} {
-		if strings.Contains(GlobalInstructionsBody, banned) {
-			t.Errorf("GlobalInstructionsBody re-carries relocated content %q — single-home violation", banned)
-		}
+	if !strings.Contains(body, "@"+dir+"/active.md") {
+		t.Errorf("pointer block does not @-include the active profile: %q", body)
+	}
+	if !strings.Contains(body, "gortex instructions switch") {
+		t.Error("pointer block lost the switch verb")
+	}
+	if !strings.Contains(body, "NEW sessions only") {
+		t.Error("pointer block lost the next-session caveat")
+	}
+	if strings.Contains(body, "@~") {
+		t.Error("pointer block must embed a resolved path, not a ~ shorthand")
+	}
+	const pointerByteCeiling = 512
+	if len(body) > pointerByteCeiling {
+		t.Errorf("pointer block is %d bytes, over the %d ceiling — the body belongs in the profile file", len(body), pointerByteCeiling)
 	}
 }

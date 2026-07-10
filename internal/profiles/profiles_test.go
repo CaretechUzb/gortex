@@ -221,3 +221,52 @@ func TestActiveEnvOverride(t *testing.T) {
 		t.Errorf("unknown env value must fall through to state, got %q", got)
 	}
 }
+
+// Single-home markers: content that relocated to gortex://guide and the
+// schema resources must never re-inflate an instruction body. Mirrors
+// the pre-profiles guard on the CLAUDE.md rule block (the profile file
+// is that block's new home).
+var relocatedContentMarkers = []string{
+	"`local` / `anthropic` / `openai` / `azure` / `ollama` / `claudecli` / `codex` / `copilot` / `cursor` / `opencode` / `gemini` / `bedrock` / `deepseek`", // provider matrix
+	"Tarjan's SCC",                // analyze catalog deep-dive
+	"compact tabular text, lossy", // wire-format deep-dive
+	"k8s_resources",               // analyze kind catalog
+	"error-not-wrapped",           // search_ast detector catalog
+	"gortex://report",             // analyzer rollup roster
+}
+
+// fullPolicyTokens is the policy core the standard-depth profiles must
+// carry — the machine-level single home for the full memory-workflow
+// triggers. The localization profile intentionally keeps only the
+// positioning cues (TestEveryProfileKeepsPositioningCues).
+var fullPolicyTokens = []string{
+	"search_symbols", "find_usages", "get_callers", "get_call_chain",
+	"get_symbol_source", "get_editing_context", "read_file",
+	"smart_context", "edit_file", "rename_symbol", "compress_bodies",
+	"distill_session", "surface_memories", "save_note", "store_memory",
+	"query_notes", "query_memories",
+	"tools_search", "gortex://guide", "gortex daemon start",
+}
+
+func TestBodies_PolicyCoreAndSingleHome(t *testing.T) {
+	for _, name := range []string{"core", "full"} {
+		p, ok := ByName(name)
+		if !ok {
+			t.Fatalf("profile %q missing", name)
+		}
+		body := p.Body()
+		for _, token := range fullPolicyTokens {
+			if !strings.Contains(body, token) {
+				t.Errorf("%s body no longer mentions %q — policy core regression", name, token)
+			}
+		}
+	}
+	for _, p := range Table() {
+		body := p.Body()
+		for _, banned := range relocatedContentMarkers {
+			if strings.Contains(body, banned) {
+				t.Errorf("%s body re-carries relocated content %q — single-home violation", p.Name, banned)
+			}
+		}
+	}
+}

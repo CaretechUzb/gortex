@@ -18,6 +18,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 // InstructionsSentinel is the substring every doc-aware adapter checks
@@ -49,50 +51,20 @@ const (
 	GlobalRulesEndMarker   = "<!-- gortex:rules:end -->"
 )
 
-// GlobalInstructionsBody is the rule block written into the
-// user-level ~/.claude/CLAUDE.md by `gortex install`. Mirrors
-// InstructionsBody (the per-project rules) but trimmed to the
-// always-applicable parts — multi-repo specifics, project-skill
-// generation, and contracts hygiene are project-scoped and stay in
-// per-repo CLAUDE.md.
-const GlobalInstructionsBody = `## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
-
-A Gortex daemon is configured machine-wide via the ` + "`" + `gortex` + "`" + ` MCP server. Whenever you operate on indexed source (any repo the daemon tracks — check ` + "`" + `gortex daemon status` + "`" + `), you MUST prefer graph queries over file reads. PreToolUse hooks deny ` + "`" + `Read` + "`" + ` / ` + "`" + `Grep` + "`" + ` / ` + "`" + `Glob` + "`" + ` against indexed source — the deny message names the right tool.
-
-| Instead of...                       | Use...                                   |
-|-------------------------------------|------------------------------------------|
-| ` + "`" + `Grep` + "`" + ` / ` + "`" + `grep` + "`" + ` / ` + "`" + `rg` + "`" + ` for a symbol | ` + "`" + `search_symbols` + "`" + ` (BM25 + camelCase-aware) |
-| ` + "`" + `Grep` + "`" + ` for references               | ` + "`" + `find_usages` + "`" + ` (zero false positives)     |
-| Reading / grepping to find callers  | ` + "`" + `get_callers` + "`" + ` / ` + "`" + `get_call_chain` + "`" + `         |
-| ` + "`" + `Glob` + "`" + ` over source files            | ` + "`" + `get_repo_outline` + "`" + ` / ` + "`" + `search_symbols` + "`" + `    |
-| ` + "`" + `Read` + "`" + ` a file for one symbol        | ` + "`" + `get_symbol_source` + "`" + ` (` + "`" + `compress_bodies:true` + "`" + ` for the signature only) |
-| ` + "`" + `Read` + "`" + ` to understand a file         | ` + "`" + `get_file_summary` + "`" + ` / ` + "`" + `get_editing_context` + "`" + ` |
-| ` + "`" + `Read` + "`" + ` a non-indexed / raw file     | ` + "`" + `read_file` + "`" + `                              |
-| Multiple reads to explore a task    | ` + "`" + `smart_context` + "`" + ` (one call)               |
-| ` + "`" + `Edit` + "`" + ` / ` + "`" + `Write` + "`" + ` source             | ` + "`" + `edit_file` + "`" + ` / ` + "`" + `write_file` + "`" + ` / ` + "`" + `edit_symbol` + "`" + ` / ` + "`" + `rename_symbol` + "`" + ` / ` + "`" + `batch_edit` + "`" + ` |
-
-**CLI fallback (no MCP):** every tool above is reachable from a shell as ` + "`" + `gortex call <tool> --arg k=v` + "`" + ` (e.g. ` + "`" + `gortex call read_file --arg path=<file>` + "`" + `) — there is no bare ` + "`" + `gortex <tool>` + "`" + ` verb.
-
-Graph queries *narrow scope*; they do not replace reading the implementation. For the symbol you are about to change or depend on — especially behavior-critical code (migrations, retry / fallback / error-recovery paths, concurrency, compatibility shims) — read the real body with ` + "`" + `get_symbol_source` + "`" + ` and do NOT pass ` + "`" + `compress_bodies:true` + "`" + `, which elides the branches that carry the risk. ` + "`" + `format:"gcx"` + "`" + ` (compact wire, ~27% fewer tokens) and ` + "`" + `compress_bodies:true` + "`" + ` (body-eliding) exist on the read / list tools; the parameter legend is in the MCP server instructions.
-
-## MANDATORY: Session + development memory
-
-The graph remembers code; these tools remember **why you made a call**. They are behavior-critical — run each at its trigger, not "optionally":
-
-- **Session start / after a compaction** — call ` + "`" + `distill_session` + "`" + ` first: prior top symbols, pinned notes, decisions, recent excerpts. Seed your mental model before reading any file.
-- **Immediately after ` + "`" + `smart_context` + "`" + `** — call ` + "`" + `surface_memories task:"<task>" symbol_ids:"<top hits>"` + "`" + `: cross-session invariants / gotchas / decisions anchored to your working set. If it returns nothing, don't probe further.
-- **At every decision** — pick an approach, reject an alternative, hit a non-obvious constraint, or commit to an invariant → ` + "`" + `save_note tags:"decision" body:"<what+why>"` + "`" + `. Mention symbol IDs (` + "`" + `pkg/foo.go::Bar` + "`" + `) in the body for auto-linking; ` + "`" + `pinned:true` + "`" + ` for load-bearing notes.
-- **When you learn a durable fact worth teaching the team** — ` + "`" + `store_memory kind:"<invariant|gotcha|convention|decision|constraint|incident>" body:"<what+why>" symbol_ids:"<id>" importance:5` + "`" + `. ` + "`" + `save_note` + "`" + ` is the per-session scratchpad; ` + "`" + `store_memory` + "`" + ` is the workspace-wide store every future agent inherits. Supersede a stale memory with ` + "`" + `supersedes:"<old-id>"` + "`" + `.
-- **Before editing a symbol you've touched before** — ` + "`" + `query_notes symbol_id:"<id>"` + "`" + ` / ` + "`" + `query_memories symbol_id:"<id>"` + "`" + ` surface prior decisions and "do not change this without …" warnings.
-
-**Save / store:** decisions, non-obvious constraints, invariants, follow-ups, incident learnings, bug reproductions. **Skip:** play-by-play the diff already shows, anything derivable from the graph, content already in CLAUDE.md.
-
-## Reference and discovery
-
-- **` + "`" + `gortex://guide` + "`" + ` resource** (or the ` + "`" + `gortex guide [topic]` + "`" + ` CLI) is the full reference: LLM-provider matrix, capabilities catalog, analyze / search_ast catalogs, token-economy detail, MCP resources, session-start checklist. Read it on demand — it is not pre-paid here.
-- **` + "`" + `tools_search` + "`" + `** — the server publishes a lean tool preset eagerly and defers the rest; call ` + "`" + `tools_search` + "`" + ` to discover and load any tool by keyword (every tool stays callable by name).
-- The SessionStart hook injects daemon status. "daemon is not running" → run ` + "`" + `gortex daemon start --detach` + "`" + `; "cwd is not covered by any tracked repo" → graph tools are unavailable there.
-`
+// GlobalPointerBody renders the thin machine-level rule block
+// `gortex install` merges into ~/.claude/CLAUDE.md. The rule content
+// itself lives in <instructionsDir>/active.md — an atomic byte copy of
+// the selected instruction profile (internal/profiles) — and is pulled
+// in through an @-include, so switching guidance depth never rewrites
+// CLAUDE.md. The heading stays here as the idempotency sentinel and as
+// a functional minimum for readers that do not expand @-includes.
+func GlobalPointerBody(instructionsDir string) string {
+	active := filepath.Join(instructionsDir, profiles.ActiveFileName)
+	return "## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob\n\n" +
+		"The machine-wide Gortex rules load from the active instruction profile, imported below:\n\n" +
+		"@" + active + "\n\n" +
+		"Switch guidance depth with `gortex instructions switch <core|localization|full>` (`list` shows all) — applies to NEW sessions only.\n"
+}
 
 // InstructionsBody is the shared rule block every adapter writes to
 // its agent's instructions file. Tool names in the tables (Read, Grep)

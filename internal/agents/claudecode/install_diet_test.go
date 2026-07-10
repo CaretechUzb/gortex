@@ -8,13 +8,16 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/agentstest"
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 // Byte ceilings for the installed ambient layer. Approximated at ~4.4 B/token:
-//   - 6.5 KiB global section ≈ 1.5k tokens
+//   - 6.5 KiB global section (pointer block + the @-included default
+//     profile body) ≈ 1.5k tokens
 //   - 2.5 KiB skills-eager total ≈ 0.57k tokens
 // Blowing either (a future rule-block or description balloon) fails loudly
-// instead of silently re-inflating the per-session tax.
+// instead of silently re-inflating the per-session tax. Per-profile body
+// ceilings live in internal/profiles.
 const (
 	globalSectionByteCeiling = 6656 // 6.5 KiB
 	skillsEagerByteCeiling   = 2560 // 2.5 KiB
@@ -40,7 +43,11 @@ func frontmatterOf(s string) string {
 // the byte cost of the installed ambient layer and asserts the global rule
 // block and the skills-eager total stay inside their ceilings.
 func TestInstalledAmbientByteCeilings(t *testing.T) {
-	global := len(agents.GlobalInstructionsBody)
+	// What a session actually pays at the machine level: the pointer
+	// block in ~/.claude/CLAUDE.md plus the @-included active profile
+	// body (default profile on a fresh install).
+	def, _ := profiles.ByName(profiles.DefaultName)
+	global := len(agents.GlobalPointerBody("/home/user/.gortex/instructions")) + len(def.Body())
 
 	skillsFM := 0
 	for _, body := range GlobalSkills {
@@ -52,13 +59,13 @@ func TestInstalledAmbientByteCeilings(t *testing.T) {
 	}
 
 	t.Logf("installed ambient byte cost:")
-	t.Logf("  global CLAUDE.md section : %d bytes  (ceiling %d)", global, globalSectionByteCeiling)
+	t.Logf("  global section (pointer+default profile): %d bytes  (ceiling %d)", global, globalSectionByteCeiling)
 	t.Logf("  skills eager frontmatter : %d bytes  (ceiling %d, %d skills)", skillsFM, skillsEagerByteCeiling, len(GlobalSkills))
 	t.Logf("  sub-agent eager frontmatter: %d bytes  (%d agents)", subFM, len(SubAgents))
 	t.Logf("  projected installed eager: %d bytes", global+skillsFM+subFM)
 
 	if global > globalSectionByteCeiling {
-		t.Errorf("global CLAUDE.md section is %d bytes, over the %d ceiling", global, globalSectionByteCeiling)
+		t.Errorf("global section (pointer + default profile body) is %d bytes, over the %d ceiling", global, globalSectionByteCeiling)
 	}
 	if skillsFM > skillsEagerByteCeiling {
 		t.Errorf("skills eager frontmatter is %d bytes, over the %d ceiling", skillsFM, skillsEagerByteCeiling)
@@ -66,9 +73,11 @@ func TestInstalledAmbientByteCeilings(t *testing.T) {
 }
 
 // TestGlobalInstall_FatToSlimReplacement is the migration gate: a user
-// upgrading from a fat pre-diet rule block gets the slim one on re-install,
-// with the user's own prose around the marker block preserved and no duplicate
-// block. Exercises the marker-fenced merge on the real install path.
+// upgrading from a fat pre-diet rule block gets the thin pointer block
+// on re-install (the policy body moves to the @-included instruction
+// profile), with the user's own prose around the marker block preserved
+// and no duplicate block. Exercises the marker-fenced merge on the real
+// install path.
 func TestGlobalInstall_FatToSlimReplacement(t *testing.T) {
 	env, _ := agentstest.NewEnv(t)
 	env.Mode = agents.ModeGlobal
@@ -121,9 +130,24 @@ func TestGlobalInstall_FatToSlimReplacement(t *testing.T) {
 		t.Errorf("expected exactly 1 rule block, found %d", n)
 	}
 
-	// The block now carries the slim policy core…
-	if !strings.Contains(text, "gortex://guide") || !strings.Contains(text, "distill_session") {
-		t.Error("re-installed block is missing the slim policy core (guide pointer / memory triggers)")
+	// The block is now the thin pointer: it @-includes the active
+	// profile copy from the hermetic instructions dir…
+	activePath := filepath.Join(env.InstructionsDir, profiles.ActiveFileName)
+	if !strings.Contains(text, "@"+activePath) {
+		t.Errorf("re-installed block does not @-include the active profile (%s)", activePath)
+	}
+	if !strings.Contains(text, "gortex instructions switch") {
+		t.Error("re-installed block lost the switch verb")
+	}
+	// …and the slim policy core moved into the profile file itself.
+	activeBody, err := os.ReadFile(activePath)
+	if err != nil {
+		t.Fatalf("active profile copy was not generated: %v", err)
+	}
+	for _, token := range []string{"gortex://guide", "distill_session", "surface_memories", "smart_context"} {
+		if !strings.Contains(string(activeBody), token) {
+			t.Errorf("active profile body is missing the policy core token %q", token)
+		}
 	}
 	// …and the relocated fat content is gone.
 	for _, gone := range []string{

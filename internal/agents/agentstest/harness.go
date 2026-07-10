@@ -41,6 +41,10 @@ func NewEnv(t *testing.T) (agents.Env, *bytes.Buffer) {
 		HookCommand:  "/tmp/test-gortex hook",
 		Mode:         agents.ModeProject,
 		InstallHooks: true,
+		// Hermetic instruction-profile dir: global installs generate
+		// profile files and read the active profile from here instead
+		// of the developer's real ~/.gortex.
+		InstructionsDir: filepath.Join(home, ".gortex", "instructions"),
 		// SkillsRouting + GeneratedSkills are seeded so per-adapter
 		// tests exercise the community-routing write path — which
 		// is the only reason adapters touch per-repo instructions

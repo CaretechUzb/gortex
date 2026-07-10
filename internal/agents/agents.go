@@ -94,6 +94,13 @@ type Env struct {
 	// install delivers full enforcement; set false by --no-claude-md.
 	InstallGlobalInstructions bool
 
+	// InstructionsDir overrides where the generated instruction
+	// profiles (internal/profiles) are materialised and where the
+	// CLAUDE.md pointer block resolves its @-include. Empty means
+	// the machine default (profiles.DefaultDir()); tests set a temp
+	// directory for hermeticity.
+	InstructionsDir string
+
 	// AnalyzeRepo is true when the caller wants a dynamic CLAUDE.md
 	// preamble built from a fresh index. Only Claude Code uses it.
 	AnalyzeRepo bool
@@ -162,8 +169,10 @@ const (
 	ActionCreate      ActionKind = "create"
 	ActionMerge       ActionKind = "merge"
 	ActionSkip        ActionKind = "skip"
+	ActionDelete      ActionKind = "delete"
 	ActionWouldCreate ActionKind = "would-create"
 	ActionWouldMerge  ActionKind = "would-merge"
+	ActionWouldDelete ActionKind = "would-delete"
 )
 
 // FileAction describes one file write (real or planned). Keys is the
