@@ -4,12 +4,18 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 // TestMain ensures hook tests never write telemetry to the user's real
 // ~/.cache/gortex/hook-decisions.jsonl. Tests that want to inspect the
 // log redirect it again via t.Setenv to a per-test tmp file.
 func TestMain(m *testing.M) {
+	// Pin the instruction profile so a developer machine that ran
+	// `gortex instructions switch` cannot change hook-tier behavior
+	// in unrelated tests; tier tests stub activeHookTier directly.
+	_ = os.Setenv(profiles.ActiveEnv, profiles.DefaultName)
 	dir, err := os.MkdirTemp("", "gortex-hooks-test")
 	if err == nil {
 		_ = os.Setenv("GORTEX_HOOK_LOG", filepath.Join(dir, "hook-decisions.jsonl"))

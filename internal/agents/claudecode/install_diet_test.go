@@ -15,6 +15,7 @@ import (
 //   - 6.5 KiB global section (pointer block + the @-included default
 //     profile body) ≈ 1.5k tokens
 //   - 2.5 KiB skills-eager total ≈ 0.57k tokens
+//
 // Blowing either (a future rule-block or description balloon) fails loudly
 // instead of silently re-inflating the per-session tax. Per-profile body
 // ceilings live in internal/profiles.

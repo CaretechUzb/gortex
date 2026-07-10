@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/profiles"
 	"github.com/zzet/gortex/internal/toolref"
 )
 
@@ -120,12 +121,55 @@ func buildSessionStartBriefing(cwd string) string {
 		return sb.String()
 	}
 
-	// Happy path: daemon is reachable.
-	sb.WriteString(renderDaemonReadiness(status))
-	sb.WriteString(renderCwdCoverage(cwd, status))
+	// Happy path: daemon is reachable. The lean hook tier (set by the
+	// active instruction profile) compresses the status prose to one
+	// line; the rule preamble — the positioning cues — survives every
+	// tier, and so does the actionable not-covered warning.
+	if activeHookTier() == profiles.HookTierLean {
+		sb.WriteString(renderLeanReadiness(cwd, status))
+	} else {
+		sb.WriteString(renderDaemonReadiness(status))
+		sb.WriteString(renderCwdCoverage(cwd, status))
+	}
 	sb.WriteString("\n")
 	sb.WriteString(rulePreamble())
 	return sb.String()
+}
+
+// activeHookTier reads the machine's hook-verbosity tier from the
+// active instruction profile. Package var so tests pin a tier without
+// touching machine state.
+var activeHookTier = profiles.ActiveHookTier
+
+// renderLeanReadiness is the one-line status the lean tier emits when
+// the cwd is a tracked repo. The workspace-root and not-covered cases
+// keep their full explanations in every tier — those are actionable
+// warnings, not status prose.
+func renderLeanReadiness(cwd string, s *daemon.StatusResponse) string {
+	var totalNodes int
+	for _, r := range s.TrackedRepos {
+		totalNodes += r.Nodes
+	}
+	state := "ready"
+	if !s.Ready {
+		state = "warming up — enforcement partial"
+	}
+	line := fmt.Sprintf("✓ Gortex %s (v%s): %d repo(s), %d nodes.", state, s.Version, len(s.TrackedRepos), totalNodes)
+
+	abs := cwd
+	if cwd != "" {
+		if a, err := filepath.Abs(cwd); err == nil {
+			abs = a
+		}
+	}
+	if abs != "" {
+		if exact, _ := classifyCwd(abs, s.TrackedRepos); exact != nil {
+			return fmt.Sprintf("%s cwd tracked as `%s` — enforcement active.\n", line, exact.Name)
+		}
+		// Workspace-root and not-covered explanations stay verbatim.
+		return line + "\n\n" + renderCwdCoverage(cwd, s)
+	}
+	return line + "\n"
 }
 
 // renderDaemonReadiness summarises the daemon's overall state in one
