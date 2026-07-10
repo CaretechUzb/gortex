@@ -154,7 +154,8 @@ func renderLeanReadiness(cwd string, s *daemon.StatusResponse) string {
 	if !s.Ready {
 		state = "warming up — enforcement partial"
 	}
-	line := fmt.Sprintf("✓ Gortex %s (v%s): %d repo(s), %d nodes.", state, s.Version, len(s.TrackedRepos), totalNodes)
+	line := fmt.Sprintf("✓ Gortex %s (v%s): %d repo(s), %d nodes.",
+		state, strings.TrimPrefix(s.Version, "v"), len(s.TrackedRepos), totalNodes)
 
 	abs := cwd
 	if cwd != "" {
