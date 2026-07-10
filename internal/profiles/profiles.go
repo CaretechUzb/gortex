@@ -84,8 +84,11 @@ var localizationEagerTools = []string{
 	"search_symbols", "search_text",
 	// trace
 	"find_usages", "get_callers", "find_implementations",
-	// read
-	"get_symbol_source", "get_file_summary", "read_file",
+	// read — batch_symbols is load-bearing for turn economy: without a
+	// multi-symbol read, follow-ups on a localization neighborhood cost
+	// one turn per symbol (measured +1 median turn on the localization
+	// benchmark when it was left out of this surface).
+	"get_symbol_source", "batch_symbols", "get_file_summary", "read_file",
 }
 
 // Table returns the profile table. Callers must not mutate the

@@ -150,6 +150,7 @@ var localizationRows = []localizationRow{
 	{"get_callers", "Reading to find callers", "§get_callers§"},
 	{"find_implementations", "Hunting interface implementors", "§find_implementations§"},
 	{"get_symbol_source", "§Read§ a file for one symbol", "§get_symbol_source§"},
+	{"batch_symbols", "Reading several symbols one by one", "§batch_symbols§ (one call, many bodies)"},
 	{"get_file_summary", "§Read§ to understand a file", "§get_file_summary§"},
 	{"read_file", "§Read§ a non-indexed / raw file", "§read_file§"},
 }
