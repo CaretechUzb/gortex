@@ -49,6 +49,12 @@ const (
 // this test loudly instead of silently regressing the schema tax.
 const agentPresetByteCeiling = 27000
 
+// localizationPresetByteCeiling is the hard budget for the diet
+// localization preset (the `localization` instruction profile's tool
+// surface). It must stay well under the agent floor — the profile
+// exists to cut the per-turn schema tax.
+const localizationPresetByteCeiling = 20000
+
 // TestToolsListByteCeilings is the permanent measurement gate: it prints the
 // cold tools/list byte cost of every preset and asserts the agent preset
 // stays inside its ceiling while core and full shrink below their pre-diet
@@ -57,14 +63,28 @@ func TestToolsListByteCeilings(t *testing.T) {
 	agentBytes, agentNames := serializeToolsList(t, "agent", "defer")
 	coreBytes, _ := serializeToolsList(t, "core", "defer")
 	fullBytes, _ := serializeToolsList(t, "full", "")
+	locBytes, locNames := serializeToolsList(t, "localization", "defer")
 
 	t.Logf("tools/list byte cost per preset (cold):")
 	t.Logf("  agent  mode=defer tools=%-3d bytes=%d  (ceiling %d)", len(agentNames), agentBytes, agentPresetByteCeiling)
+	t.Logf("  loc    mode=defer tools=%-3d bytes=%d  (ceiling %d)", len(locNames), locBytes, localizationPresetByteCeiling)
 	t.Logf("  core   mode=defer          bytes=%d  (baseline %d)", coreBytes, corePresetBaselineBytes)
 	t.Logf("  full                       bytes=%d  (baseline %d)", fullBytes, fullPresetBaselineBytes)
 
 	require.LessOrEqualf(t, agentBytes, agentPresetByteCeiling,
 		"agent preset cold tools/list is %d bytes, over the %d ceiling", agentBytes, agentPresetByteCeiling)
+	require.LessOrEqualf(t, locBytes, localizationPresetByteCeiling,
+		"localization preset cold tools/list is %d bytes, over the %d ceiling", locBytes, localizationPresetByteCeiling)
+	require.Lessf(t, locBytes, agentBytes,
+		"localization (%d bytes) must stay leaner than the agent floor (%d bytes)", locBytes, agentBytes)
+
+	locSet := map[string]bool{}
+	for _, n := range locNames {
+		locSet[n] = true
+	}
+	require.True(t, locSet["smart_context"], "the one-shot opener must ship eagerly in the localization surface")
+	require.True(t, locSet[LazyToolsSearchName], "tools_search must survive every preset")
+	require.False(t, locSet["edit_file"], "the localization surface is read-only")
 	require.Lessf(t, coreBytes, corePresetBaselineBytes,
 		"core preset must shrink below its pre-diet baseline (%d), got %d", corePresetBaselineBytes, coreBytes)
 	require.Lessf(t, fullBytes, fullPresetBaselineBytes,

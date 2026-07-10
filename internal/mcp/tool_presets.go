@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 // ToolPolicyConfig is the operator-facing description of a restricted
@@ -142,6 +143,13 @@ var navPresetTools = []string{
 	"get_dependencies", "get_dependents", "get_repo_outline", "graph_stats",
 }
 
+// localizationPresetTools is the eager surface of the `localization`
+// preset — the lean "where is the code that does X" working set. The
+// list lives in internal/profiles (the instruction-profile table) so
+// the tool surface and the localization instructions body render from
+// the same slice and cannot drift.
+var localizationPresetTools = profiles.LocalizationEagerTools()
+
 // builtinToolPresetSet resolves a preset name to its explicit allow-set.
 // A nil set with denyMutating=false is the sentinel for "no explicit
 // restriction" (the full surface); `readonly` carries denyMutating=true
@@ -162,13 +170,15 @@ func builtinToolPresetSet(name string) (set map[string]bool, denyMutating, known
 		return toToolSet(editPresetTools), false, true
 	case "nav", "navigate", "explore":
 		return toToolSet(navPresetTools), false, true
+	case "localization", "locate", "find":
+		return toToolSet(localizationPresetTools), false, true
 	default:
 		return nil, false, false
 	}
 }
 
 // builtinPresetNames lists the recognised preset names for diagnostics.
-var builtinPresetNames = []string{"agent", "core", "full", "readonly", "edit", "nav"}
+var builtinPresetNames = []string{"agent", "core", "full", "readonly", "edit", "nav", "localization"}
 
 // toolPolicy is the resolved, in-memory restriction applied to the tool
 // surface by the lazy registry (defer mode) and toolSurfaceFilter /
@@ -240,6 +250,8 @@ func newToolPolicy(cfg ToolPolicyConfig, logger *zap.Logger) *toolPolicy {
 			label = "core"
 		case "coding-agent":
 			label = "agent"
+		case "locate", "find":
+			label = "localization"
 		}
 	} else {
 		// A typo'd preset fails open to the full surface (never strands
@@ -260,7 +272,7 @@ func newToolPolicy(cfg ToolPolicyConfig, logger *zap.Logger) *toolPolicy {
 		allow:        allow,
 		deny:         deny,
 		active:       active,
-		lean:         label == "agent",
+		lean:         label == "agent" || label == "localization",
 	}
 }
 
@@ -499,10 +511,61 @@ func (s *Server) resolveSessionPolicy(spec, mode, client string) *toolPolicy {
 		}
 		return newToolPolicy(cfg, s.logger)
 	}
+	if p := s.instructionProfilePolicy(); p != nil {
+		return p
+	}
 	if p := s.clientDefaultPolicy(client); p != nil {
 		return p
 	}
 	return nil
+}
+
+// activeInstructionPreset reads the machine's active instruction
+// profile and returns its tool preset ("" when the profile keeps the
+// defaults). Package var so tests can stub the machine state.
+var activeInstructionPreset = profiles.ActiveToolPreset
+
+// instructionProfilePolicy applies the active instruction profile's
+// tool preset to sessions that forwarded no explicit spec. Precedence:
+// a forwarded spec wins (checked by the caller before this), an
+// operator-pinned mcp.tools / GORTEX_TOOLS configuration wins, then
+// the profile, then the client-aware default. The default `core`
+// profile carries no preset, so machines that never ran
+// `gortex instructions switch` resolve exactly as before.
+func (s *Server) instructionProfilePolicy() *toolPolicy {
+	if s == nil || s.toolPolicyOperatorPinned {
+		return nil
+	}
+	preset := activeInstructionPreset()
+	if strings.TrimSpace(preset) == "" {
+		return nil
+	}
+	mode := toolPolicyModeDefer
+	if s.toolPolicy != nil && s.toolPolicy.mode != "" {
+		mode = s.toolPolicy.mode
+	}
+	return newToolPolicy(ToolPolicyConfig{Preset: preset, Mode: mode}, s.logger)
+}
+
+// operatorPinnedToolPolicy reports whether the base tool-policy config
+// expresses a deliberate operator choice rather than the shipped
+// default (`core` preset in defer mode, no deltas) — the active
+// instruction profile only refines the shipped default, never an
+// operator pin. GORTEX_TOOLS / GORTEX_TOOLS_MODE always pin.
+func operatorPinnedToolPolicy(base ToolPolicyConfig) bool {
+	if _, envSet := toolPolicyConfigFromEnv(); envSet {
+		return true
+	}
+	if len(base.Allow) > 0 || len(base.Deny) > 0 {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(base.Preset)) {
+	case "", "core", "default", "classic":
+		// The shipped default preset. A mode is only a pin when it
+		// deviates from the shipped defer default.
+		return strings.TrimSpace(base.Mode) != "" && normalizeToolMode(base.Mode) != toolPolicyModeDefer
+	}
+	return true
 }
 
 // clientDefaultPolicy returns the preset a known client should get when it

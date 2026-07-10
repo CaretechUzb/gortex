@@ -428,6 +428,11 @@ type Server struct {
 	// toolSurfaceFilter + checkToolGate and in defer mode by the lazy
 	// registry's eager predicate.
 	toolPolicy *toolPolicy
+	// toolPolicyOperatorPinned records whether the global policy came
+	// from a deliberate operator configuration (mcp.tools beyond the
+	// shipped default, or GORTEX_TOOLS) — when true, the active
+	// instruction profile does not adjust session tool surfaces.
+	toolPolicyOperatorPinned bool
 
 	// toolBudgetOnce / toolBudgetCached memoise the project-size-scaled
 	// exploration-call budget appended to navigation tools' descriptions
@@ -1338,7 +1343,9 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	// eager surface; hide mode is enforced later by toolSurfaceFilter /
 	// checkToolGate. Resolved before the register sweep so every
 	// addTool sees the policy.
-	s.toolPolicy = resolveToolPolicy(toolPolicyBaseFromOptions(opts), logger)
+	toolPolicyBase := toolPolicyBaseFromOptions(opts)
+	s.toolPolicyOperatorPinned = operatorPinnedToolPolicy(toolPolicyBase)
+	s.toolPolicy = resolveToolPolicy(toolPolicyBase, logger)
 	s.lazy = newLazyToolRegistry(lazyEnabledFromEnv() || s.toolPolicy.deferMode())
 	if s.toolPolicy.deferMode() {
 		s.lazy.SetEagerPredicate(s.toolPolicy.allows)
