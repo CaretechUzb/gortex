@@ -42,6 +42,7 @@ func TestObserveLocalizationTerminalRequiresExactEnforceableV2Contract(t *testin
 		mutate func(map[string]any)
 	}{
 		{name: "v1", mutate: func(root map[string]any) { completionMap(root)["contract_version"] = 1 }},
+		{name: "missing final response", mutate: func(root map[string]any) { delete(completionMap(root), "final_response") }},
 		{name: "advisory", mutate: func(root map[string]any) { completionMap(root)["enforceable"] = false }},
 		{name: "needs refinement", mutate: func(root map[string]any) { completionMap(root)["state"] = "needs_refinement" }},
 		{name: "wrong scope", mutate: func(root map[string]any) { completionMap(root)["scope"] = "diagnosis" }},
@@ -117,6 +118,18 @@ func TestObserveLocalizationTerminalRequiresMatchingAuthoritativeMeta(t *testing
 				return response
 			},
 		},
+		{
+			name: "final response mismatch",
+			response: func(t *testing.T) map[string]any {
+				response := terminalToolResponse(t, terminalContractMap(), true, false)
+				meta := response["_meta"].(map[string]any)
+				envelope := meta[localizationHostMetaKey].(map[string]any)
+				mismatched := cloneMap(t, terminalContractMap())
+				completionMap(mismatched)["final_response"] = "different response"
+				envelope["contract"] = mismatched
+				return response
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -128,6 +141,22 @@ func TestObserveLocalizationTerminalRequiresMatchingAuthoritativeMeta(t *testing
 				t.Fatalf("observed = %v, want %v", observed, tt.want)
 			}
 		})
+	}
+}
+
+func TestPostToolUseObservesMatchingFinalResponseContract(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	identity := beginTestLocalizationTurn(t, "terminal-final-response", "prompt", t.TempDir())
+	snapshotTestLocalizationTool(t, identity, gortexMCPToolPrefix+"read", "tool")
+	response := terminalToolResponse(t, terminalContractMap(), true, false)
+	parsed, ok := exactLocalizationTerminalContract(mustJSON(t, response))
+	if !ok || parsed.Completion.FinalResponse != completionMap(terminalContractMap())["final_response"] {
+		t.Fatalf("new-shape terminal response did not parse exactly: %#v", parsed)
+	}
+	post := localizationPostToolPayload(t, gortexMCPToolPrefix+"read", "tool", identity, response)
+	output := captureHookStdout(t, func() { runPostToolUse(post) })
+	if !strings.Contains(output, localizationTerminalContext) {
+		t.Fatalf("PostToolUse output %q does not contain terminal context", output)
 	}
 }
 
@@ -762,6 +791,7 @@ func terminalContractMap() map[string]any {
 			"state":              "answer_ready",
 			"scope":              "localization",
 			"required_action":    "respond",
+			"final_response":     "FILES:\n#1 repo/source.go\n\nSYMBOLS:\n#1 repo/source.go::Target\n\nEVIDENCE:\n#1 repo/source.go:1 — repo/source.go::Target",
 			"allowed_tool_calls": 0,
 			"contract_version":   localizationTerminalContractV2,
 			"enforceable":        true,

@@ -1042,8 +1042,8 @@ func TestLocalizationEvidenceReservesExactBeforePromotedNeighbor(t *testing.T) {
 	if len(envelope.Evidence) != 2 || envelope.Evidence[1].ID != exact.ID {
 		t.Fatalf("exact evidence missing: %+v", envelope.Evidence)
 	}
-	if len(envelope.Files) != 1 || envelope.Files[0] != "walk.go" {
-		t.Fatalf("files = %v, want exact target file retained with primary", envelope.Files)
+	if len(envelope.Files) != 2 || envelope.Files[0] != "walk.go" || envelope.Files[1] != "walk.go" {
+		t.Fatalf("files = %v, want one positional file per primary/exact row", envelope.Files)
 	}
 }
 

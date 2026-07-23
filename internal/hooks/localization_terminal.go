@@ -98,6 +98,7 @@ type localizationTerminalCompletion struct {
 	State            string `json:"state"`
 	Scope            string `json:"scope"`
 	RequiredAction   string `json:"required_action"`
+	FinalResponse    string `json:"final_response,omitempty"`
 	AllowedToolCalls *int   `json:"allowed_tool_calls"`
 	ContractVersion  int    `json:"contract_version"`
 	Enforceable      bool   `json:"enforceable"`
@@ -240,14 +241,15 @@ func sameLocalizationTerminalContract(left, right localizationTerminalContract) 
 		return false
 	}
 	lc, rc := left.Completion, right.Completion
-	if lc.AllowedToolCalls == nil || rc.AllowedToolCalls == nil {
-		return lc.AllowedToolCalls == nil && rc.AllowedToolCalls == nil &&
-			lc.State == rc.State && lc.Scope == rc.Scope && lc.RequiredAction == rc.RequiredAction &&
-			lc.ContractVersion == rc.ContractVersion && lc.Enforceable == rc.Enforceable
+	if lc.State != rc.State || lc.Scope != rc.Scope || lc.RequiredAction != rc.RequiredAction ||
+		lc.FinalResponse != rc.FinalResponse || lc.ContractVersion != rc.ContractVersion ||
+		lc.Enforceable != rc.Enforceable {
+		return false
 	}
-	return lc.State == rc.State && lc.Scope == rc.Scope && lc.RequiredAction == rc.RequiredAction &&
-		*lc.AllowedToolCalls == *rc.AllowedToolCalls && lc.ContractVersion == rc.ContractVersion &&
-		lc.Enforceable == rc.Enforceable
+	if lc.AllowedToolCalls == nil || rc.AllowedToolCalls == nil {
+		return lc.AllowedToolCalls == nil && rc.AllowedToolCalls == nil
+	}
+	return *lc.AllowedToolCalls == *rc.AllowedToolCalls
 }
 
 func unwrapJSONString(raw json.RawMessage) (json.RawMessage, bool) {
@@ -274,6 +276,7 @@ func enforceableLocalizationTerminalContract(contract localizationTerminalContra
 		completion.State == "answer_ready" &&
 		completion.Scope == "localization" &&
 		completion.RequiredAction == "respond" &&
+		strings.TrimSpace(completion.FinalResponse) != "" &&
 		completion.AllowedToolCalls != nil && *completion.AllowedToolCalls == 0 &&
 		completion.ContractVersion >= localizationTerminalContractV2 &&
 		completion.Enforceable

@@ -2976,7 +2976,6 @@ func buildLocalizationExploreResultForTaskFinalized(
 		}
 	}
 
-	seenFiles := make(map[string]struct{})
 	acceptedTargets := make([]exploreTarget, 0, len(targets))
 	for _, target := range targets {
 		if target.node == nil {
@@ -3001,9 +3000,9 @@ func buildLocalizationExploreResultForTaskFinalized(
 		candidate.Files = append([]string(nil), envelope.Files...)
 		candidate.Symbols = append([]string(nil), envelope.Symbols...)
 		candidate.Evidence = append([]localizationEvidence(nil), envelope.Evidence...)
-		if _, seen := seenFiles[path]; !seen {
-			candidate.Files = append(candidate.Files, path)
-		}
+		// Files, Symbols, and Evidence are one positional projection. Repeated
+		// files are intentional when multiple ranked symbols share a source file.
+		candidate.Files = append(candidate.Files, path)
 		candidate.Symbols = append(candidate.Symbols, n.ID)
 		candidate.Evidence = append(candidate.Evidence, evidence)
 		mandatory := len(envelope.Evidence) < mandatoryCount
@@ -3021,7 +3020,6 @@ func buildLocalizationExploreResultForTaskFinalized(
 			candidate.Evidence[len(candidate.Evidence)-1] = evidence
 		}
 		envelope = candidate
-		seenFiles[path] = struct{}{}
 		acceptedTargets = append(acceptedTargets, target)
 	}
 
@@ -3079,11 +3077,18 @@ func buildLocalizationExploreResultForTaskFinalized(
 	contract = localizationContractFor(envelope.Completion)
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal
+	digest := newLocalizationEvidenceDigest(envelope)
+	// The serialized completion, returned state, structuredContent, and host
+	// metadata must carry the same final_response. Build the digest first, then
+	// enrich the one completion value before any wire representation is made.
+	envelope.Completion = localizationCompletionWithDigest(envelope.Completion, digest)
+	contract = localizationContractFor(envelope.Completion)
+	envelope.Completion = contract.Completion
+	envelope.Terminal = contract.Terminal
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil, nil, envelope.Completion
 	}
-	digest := newLocalizationEvidenceDigest(envelope)
 	result := attachLocalizationHostEnvelope(mcp.NewToolResultText(string(body)), envelope.Completion, digest)
 	return result, append([]string(nil), envelope.Symbols...), digest, envelope.Completion
 }

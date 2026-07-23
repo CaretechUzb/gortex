@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 )
@@ -9,10 +11,9 @@ import (
 // Terminal evidence retention.
 //
 // The localize handler builds a byte-budgeted evidence envelope once and
-// retains a compact projection for host-side fallback and diagnostics. A
-// post-terminal tool call does not replay that projection: the original
-// localization response already supplied it, and repeating it consumed turns
-// and tokens while encouraging further navigation.
+// retains a compact projection for host-side fallback and deterministic replay.
+// A post-terminal navigation call returns the same successful ready-to-emit
+// answer instead of an error that would invite another recovery loop.
 
 const (
 	// localizationDigestMaxBytes bounds retained session state independently of
@@ -23,6 +24,9 @@ const (
 	// Five keeps the promoted structural/literal candidates reserved by the
 	// envelope builder while bounding repeat-turn cost.
 	localizationReplayEvidenceLimit = 5
+	// localizationFinalResponseMaxBytes bounds the ready-to-emit answer that
+	// accompanies the retained digest on terminal responses and replays.
+	localizationFinalResponseMaxBytes = 4096
 	// This canonical envelope is deliberately carried in MCP _meta. Adapting
 	// hosts may render its ordered evidence deterministically without exposing
 	// retained rows to model-visible text or structuredContent.
@@ -35,6 +39,10 @@ type localizationEvidenceDigest struct {
 	Files    []string                `json:"files,omitempty"`
 	Symbols  []string                `json:"symbols,omitempty"`
 	Evidence []localizationDigestRow `json:"evidence,omitempty"`
+
+	// finalResponse is derived from Evidence and excluded from digest JSON so
+	// the retained-state byte cap does not count the same identities twice.
+	finalResponse string
 }
 
 type localizationDigestRow struct {
@@ -86,8 +94,9 @@ func newLocalizationEvidenceDigest(envelope localizationExploreEnvelope) *locali
 	}
 	for {
 		rebuildLocalizationDigestSkeleton(digest)
+		digest.finalResponse = renderLocalizationFinalResponse(digest.Evidence)
 		encoded, err := json.Marshal(digest)
-		if err == nil && len(encoded) <= localizationDigestMaxBytes {
+		if err == nil && len(encoded) <= localizationDigestMaxBytes && len(digest.finalResponse) <= localizationFinalResponseMaxBytes {
 			return digest
 		}
 		if len(digest.Evidence) == 0 {
@@ -97,11 +106,12 @@ func newLocalizationEvidenceDigest(envelope localizationExploreEnvelope) *locali
 		if shedLocalizationDigestRowOptionalFields(&digest.Evidence[last]) {
 			continue
 		}
+		// The identity and file are the irreducible row. If even one pathological
+		// row cannot fit, prefer a bounded empty answer over retaining oversized
+		// session state or emitting a truncated, misleading identity.
 		if last == 0 {
-			// ID and file are the irreducible replay contract. They are bounded by
-			// filesystem and symbol extraction limits in production, so retain the
-			// mandatory row rather than returning an empty terminal replay.
-			return digest
+			digest.Evidence = nil
+			continue
 		}
 		digest.Evidence = digest.Evidence[:last]
 	}
@@ -135,22 +145,86 @@ func shedLocalizationDigestRowOptionalFields(row *localizationDigestRow) bool {
 func rebuildLocalizationDigestSkeleton(digest *localizationEvidenceDigest) {
 	digest.Files = digest.Files[:0]
 	digest.Symbols = digest.Symbols[:0]
-	seenFiles := make(map[string]struct{}, len(digest.Evidence))
-	seenSymbols := make(map[string]struct{}, len(digest.Evidence))
-	for _, row := range digest.Evidence {
-		if _, exists := seenFiles[row.File]; !exists {
-			seenFiles[row.File] = struct{}{}
-			digest.Files = append(digest.Files, row.File)
-		}
-		if _, exists := seenSymbols[row.ID]; !exists {
-			seenSymbols[row.ID] = struct{}{}
-			digest.Symbols = append(digest.Symbols, row.ID)
-		}
+	for index := range digest.Evidence {
+		row := &digest.Evidence[index]
+		row.Rank = index + 1
+		// Keep these arrays positional, including repeated files. A consumer can
+		// now pair FILES #N, SYMBOLS #N, and EVIDENCE #N without guessing.
+		digest.Files = append(digest.Files, row.File)
+		digest.Symbols = append(digest.Symbols, row.ID)
 	}
 }
 
-const localizationAnswerReadyNotice = "Localization is complete. Do not call another tool. " +
-	"Answer the user now in your own words using the evidence already returned."
+func localizationFinalResponseField(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func renderLocalizationFinalResponse(rows []localizationDigestRow) string {
+	if len(rows) == 0 {
+		return "FILES:\n(none)\n\nSYMBOLS:\n(none)\n\nEVIDENCE:\nNo bounded localization evidence was found."
+	}
+	var response strings.Builder
+	response.WriteString("FILES:\n")
+	for index, row := range rows {
+		fmt.Fprintf(&response, "#%d %s\n", index+1, localizationFinalResponseField(row.File))
+	}
+	response.WriteString("\nSYMBOLS:\n")
+	for index, row := range rows {
+		fmt.Fprintf(&response, "#%d %s\n", index+1, localizationFinalResponseField(row.ID))
+	}
+	response.WriteString("\nEVIDENCE:\n")
+	for index, row := range rows {
+		file := localizationFinalResponseField(row.File)
+		id := localizationFinalResponseField(row.ID)
+		if row.Line > 0 {
+			fmt.Fprintf(&response, "#%d %s:%d — %s\n", index+1, file, row.Line, id)
+			continue
+		}
+		fmt.Fprintf(&response, "#%d %s — %s\n", index+1, file, id)
+	}
+	return response.String()
+}
+
+const localizationAnswerReadyDirective = "You already hold the localization answer — respond now using this evidence; do not call another tool."
+
+func localizationCompletionWithDigest(completion localizationCompletion, digest *localizationEvidenceDigest) localizationCompletion {
+	if digest == nil {
+		digest = completion.digest
+	}
+	completion.digest = digest
+	if completion.State != localizationStateAnswerReady {
+		completion.FinalResponse = ""
+		return completion
+	}
+	if digest != nil && digest.finalResponse != "" {
+		completion.FinalResponse = digest.finalResponse
+	} else if completion.FinalResponse == "" {
+		completion.FinalResponse = renderLocalizationFinalResponse(nil)
+	}
+	return completion
+}
+
+func localizationTerminalStructuredContent(payload any, contract localizationTerminalContract) map[string]any {
+	var structured map[string]any
+	switch existing := payload.(type) {
+	case map[string]any:
+		structured = make(map[string]any, len(existing)+4)
+		for key, value := range existing {
+			structured[key] = value
+		}
+	case nil:
+		structured = make(map[string]any, 4)
+	default:
+		structured = map[string]any{"payload": existing}
+	}
+	structured["completion"] = contract.Completion
+	structured["terminal"] = contract.Terminal
+	if contract.Terminal && contract.Completion.FinalResponse != "" {
+		structured["final_response"] = contract.Completion.FinalResponse
+		structured["directive"] = localizationAnswerReadyDirective
+	}
+	return structured
+}
 
 // localizationHostEnvelope stores each retained row exactly once. Hosts render
 // the ordered rows with fallback_format; no prewritten answer or duplicate row
@@ -169,6 +243,14 @@ func attachLocalizationHostEnvelope(result *mcpgo.CallToolResult, completion loc
 	if result == nil {
 		return result
 	}
+	completion = localizationCompletionWithDigest(completion, digest)
+	contract := localizationContractFor(completion)
+	// Preserve preterminal tool payloads byte-for-byte. Only answer_ready adds
+	// the terminal host projection; refinement and recovery retain their
+	// existing structuredContent shape and visible completion envelope.
+	if completion.State == localizationStateAnswerReady {
+		result.StructuredContent = localizationTerminalStructuredContent(result.StructuredContent, contract)
+	}
 	if result.Meta == nil {
 		result.Meta = &mcpgo.Meta{}
 	}
@@ -179,22 +261,17 @@ func attachLocalizationHostEnvelope(result *mcpgo.CallToolResult, completion loc
 		Version:        1,
 		FallbackFormat: "{file}:{line} — {id} ({signature})",
 		Evidence:       digest,
-		Contract:       localizationContractFor(completion),
+		Contract:       contract,
 	}
 	return result
 }
 
-// localizationAnswerReadyResult is deliberately successful, answer-neutral,
-// and constant-size. An error invites tool-recovery loops; replaying retained
-// evidence invites more analysis. The completion contract is sufficient for
-// hosts, while the imperative text reliably steers non-adapted models to a
-// final answer without supplying a prewritten one.
+// localizationAnswerReadyResult is the successful, deterministic evidence
+// replay. Hooked hosts may stop before dispatch; every other host receives the
+// same ready-to-emit answer and directive on every post-terminal navigation.
 func localizationAnswerReadyResult(completion localizationCompletion) *mcpgo.CallToolResult {
-	result := mcpgo.NewToolResultText(localizationAnswerReadyNotice)
-	contract := localizationContractFor(completion)
-	result.StructuredContent = map[string]any{
-		"completion": contract.Completion,
-		"terminal":   contract.Terminal,
-	}
+	completion = localizationCompletionWithDigest(completion, completion.digest)
+	visible := completion.FinalResponse + "\n\n" + localizationAnswerReadyDirective
+	result := mcpgo.NewToolResultText(visible)
 	return attachLocalizationHostEnvelope(result, completion, completion.digest)
 }

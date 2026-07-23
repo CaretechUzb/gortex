@@ -146,9 +146,10 @@ func TestDivergentDefaultOwnerPromotesFromStoreProjectionWithoutEviction(t *test
 	require.True(t, ok)
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(body), &envelope))
-	require.GreaterOrEqual(t, len(envelope.Files), 2)
+	require.GreaterOrEqual(t, len(envelope.Files), 3)
 	require.Equal(t, fixture.childCtor.FilePath, envelope.Files[0])
-	require.Equal(t, fixture.write.FilePath, envelope.Files[1])
+	require.Equal(t, fixture.childType.FilePath, envelope.Files[1])
+	require.Equal(t, fixture.write.FilePath, envelope.Files[2])
 	require.GreaterOrEqual(t, len(envelope.Symbols), 3)
 	require.Equal(t, []string{fixture.childCtor.ID, fixture.childType.ID, fixture.write.ID}, envelope.Symbols[:3])
 }
