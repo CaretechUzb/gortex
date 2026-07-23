@@ -816,6 +816,29 @@ func (s *localizationTerminalState) finishReservedRead(success bool) localizatio
 }
 
 func (s *localizationTerminalState) finishReservedReadToken(token uint64, success bool) localizationCompletion {
+	return s.finishReservedReadTokenInternal(token, success, nil, false, false)
+}
+
+// finishReservedReadTokenWithDigest is the production finalizer for a reserved
+// localization read. Handler-captured evidence is trusted only after the token
+// and generation match, and is published only when this transition actually
+// reaches answer_ready.
+func (s *localizationTerminalState) finishReservedReadTokenWithDigest(
+	token uint64,
+	success bool,
+	currentEvidence []localizationDigestRow,
+	evidenceRecorded bool,
+) localizationCompletion {
+	return s.finishReservedReadTokenInternal(token, success, currentEvidence, evidenceRecorded, true)
+}
+
+func (s *localizationTerminalState) finishReservedReadTokenInternal(
+	token uint64,
+	success bool,
+	currentEvidence []localizationDigestRow,
+	evidenceRecorded bool,
+	captureRequired bool,
+) (completion localizationCompletion) {
 	if s == nil {
 		return newLocalizationOpenCompletion()
 	}
@@ -826,6 +849,31 @@ func (s *localizationTerminalState) finishReservedReadToken(token uint64, succes
 	}
 	s.readReservationToken = 0
 	s.readReservationGen = 0
+
+	wireSuccess := success
+	capturedResult := wireSuccess && evidenceRecorded && len(currentEvidence) > 0
+	zeroResult := wireSuccess && evidenceRecorded && len(currentEvidence) == 0
+	if captureRequired && zeroResult {
+		// An explicitly recorded empty typed page is a bounded zero-result, not
+		// evidence that can safely terminalize the session. A synthetic handler
+		// with no capture record keeps the legacy transition contract.
+		success = false
+	}
+	defer func() {
+		if !captureRequired || s.state != localizationStateAnswerReady {
+			return
+		}
+		switch {
+		case capturedResult:
+			s.digest = mergeLocalizationEvidenceDigest(currentEvidence, s.digest)
+		case !wireSuccess || zeroResult:
+			// Exhaustion without current evidence must never replay the stale
+			// localization candidates that triggered recovery.
+			s.digest = nil
+		}
+		completion = s.completionLocked()
+	}()
+
 	switch s.state {
 	case localizationStateRecoveryInFlight:
 		if success {

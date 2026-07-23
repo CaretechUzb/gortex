@@ -24,6 +24,60 @@ func TestRunSessionStart_RejectsWrongEvent(t *testing.T) {
 	}
 }
 
+func TestRulePreambleRoutesByOutcomeAndPreservesExactIdentifiers(t *testing.T) {
+	briefing := rulePreamble()
+	for _, required := range []string{
+		"For an explicitly named file",
+		"choose by requested output",
+		"requested output is files, symbols, or supporting evidence",
+		"preserve the user's exact technical identifiers, paths, literals, error text, and observed symptoms",
+		"only when work will actually continue beyond localization into diagnosis, relationship analysis, or implementation",
+		"make no further tool calls after `answer_ready`",
+	} {
+		if !strings.Contains(briefing, required) {
+			t.Fatalf("rule preamble missing %q: %s", required, briefing)
+		}
+	}
+	for _, forced := range []string{
+		"including a request framed as diagnosis or a why question",
+		"Call `explore` first for code discovery, diagnosis",
+	} {
+		if strings.Contains(briefing, forced) {
+			t.Fatalf("rule preamble contains forced-localize wording %q: %s", forced, briefing)
+		}
+	}
+}
+
+func TestRunSessionStartEmitsNeutralRoutingAndIdentifierGuidance(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	withFakeStatus(t, func() (*daemon.StatusResponse, error) { return nil, errDaemonUnreachable })
+	payload := mustJSON(t, map[string]any{
+		"hook_event_name": "SessionStart",
+		"session_id":      "routing-event",
+		"cwd":             t.TempDir(),
+	})
+	output := captureHookStdout(t, func() { runSessionStart(payload) })
+	var decoded HookOutput
+	if err := json.Unmarshal([]byte(output), &decoded); err != nil {
+		t.Fatalf("decode SessionStart output: %v; output=%q", err, output)
+	}
+	if decoded.Decision != "" || decoded.Reason != "" || decoded.SystemMessage != "" || decoded.HookSpecificOutput == nil {
+		t.Fatalf("unexpected SessionStart output shape: %#v", decoded)
+	}
+	if decoded.HookSpecificOutput.HookEventName != "SessionStart" {
+		t.Fatalf("hook event = %q, want SessionStart", decoded.HookSpecificOutput.HookEventName)
+	}
+	context := decoded.HookSpecificOutput.AdditionalContext
+	for _, required := range []string{"choose by requested output", "preserve the user's exact technical identifiers", "after `answer_ready`"} {
+		if !strings.Contains(context, required) {
+			t.Fatalf("SessionStart event missing %q: %s", required, context)
+		}
+	}
+	if strings.Contains(context, "including a request framed as diagnosis or a why question") {
+		t.Fatalf("SessionStart event contains forced-localize diagnosis wording: %s", context)
+	}
+}
+
 func TestRunSessionStart_DaemonDown(t *testing.T) {
 	withFakeStatus(t, func() (*daemon.StatusResponse, error) {
 		return nil, errDaemonUnreachable

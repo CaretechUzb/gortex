@@ -23,7 +23,7 @@ const (
 	localizationTerminalAgentHardCap    = 64
 	localizationTerminalJanitorDeletes  = 32
 
-	localizationTerminalContext    = "Gortex localization is complete. Respond to the user now; do not call another tool in this turn."
+	localizationTerminalContext    = "[Gortex] Localization is answer-ready. Respond now using the current Gortex tool result and completion.final_response. Do not call native tools or any other tool in this turn."
 	localizationTerminalDenyReason = "[Gortex] Localization is complete. Respond to the user now; no further tool calls are allowed in this turn."
 	gortexPluginMCPToolPrefix      = "mcp__plugin_gortex_gortex__"
 	localizationHostMetaKey        = "gortex/localization"
@@ -142,10 +142,10 @@ func observeLocalizationTerminal(data []byte) (localizationTerminalHookInput, bo
 		return localizationTerminalHookInput{}, false
 	}
 	contract, ok := exactLocalizationTerminalContract(input.ToolResponse)
-	if !ok || !enforceableLocalizationTerminalContract(contract) {
+	if !ok || !answerReadyLocalizationTerminalContract(contract) {
 		return localizationTerminalHookInput{}, false
 	}
-	if !markLocalizationTerminal(identity, contract.Completion.ContractVersion) {
+	if enforceableLocalizationTerminalContract(contract) && !markLocalizationTerminal(identity, contract.Completion.ContractVersion) {
 		return localizationTerminalHookInput{}, false
 	}
 	return input, true
@@ -200,7 +200,7 @@ func localizationHostContract(meta map[string]json.RawMessage) (localizationTerm
 	if err := json.Unmarshal(raw, &envelope); err != nil || envelope.Version != localizationTerminalHostMetaVersion {
 		return localizationTerminalContract{}, false
 	}
-	if !enforceableLocalizationTerminalContract(envelope.Contract) {
+	if !answerReadyLocalizationTerminalContract(envelope.Contract) {
 		return localizationTerminalContract{}, false
 	}
 	return envelope.Contract, true
@@ -270,7 +270,7 @@ func unwrapJSONString(raw json.RawMessage) (json.RawMessage, bool) {
 	return raw, true
 }
 
-func enforceableLocalizationTerminalContract(contract localizationTerminalContract) bool {
+func answerReadyLocalizationTerminalContract(contract localizationTerminalContract) bool {
 	completion := contract.Completion
 	return contract.Terminal &&
 		completion.State == "answer_ready" &&
@@ -278,8 +278,11 @@ func enforceableLocalizationTerminalContract(contract localizationTerminalContra
 		completion.RequiredAction == "respond" &&
 		strings.TrimSpace(completion.FinalResponse) != "" &&
 		completion.AllowedToolCalls != nil && *completion.AllowedToolCalls == 0 &&
-		completion.ContractVersion >= localizationTerminalContractV2 &&
-		completion.Enforceable
+		completion.ContractVersion >= localizationTerminalContractV2
+}
+
+func enforceableLocalizationTerminalContract(contract localizationTerminalContract) bool {
+	return answerReadyLocalizationTerminalContract(contract) && contract.Completion.Enforceable
 }
 
 func localizationNavigationTool(tool string) bool {

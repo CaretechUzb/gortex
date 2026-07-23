@@ -34,7 +34,7 @@ func TestObserveLocalizationTerminalAcceptsDirectAndPluginNavigationFacades(t *t
 	}
 }
 
-func TestObserveLocalizationTerminalRequiresExactEnforceableV2Contract(t *testing.T) {
+func TestObserveLocalizationTerminalRequiresExactAnswerReadyV2Contract(t *testing.T) {
 	configureLocalizationTerminalTestHome(t)
 	valid := terminalContractMap()
 	tests := []struct {
@@ -43,7 +43,6 @@ func TestObserveLocalizationTerminalRequiresExactEnforceableV2Contract(t *testin
 	}{
 		{name: "v1", mutate: func(root map[string]any) { completionMap(root)["contract_version"] = 1 }},
 		{name: "missing final response", mutate: func(root map[string]any) { delete(completionMap(root), "final_response") }},
-		{name: "advisory", mutate: func(root map[string]any) { completionMap(root)["enforceable"] = false }},
 		{name: "needs refinement", mutate: func(root map[string]any) { completionMap(root)["state"] = "needs_refinement" }},
 		{name: "wrong scope", mutate: func(root map[string]any) { completionMap(root)["scope"] = "diagnosis" }},
 		{name: "tool allowed", mutate: func(root map[string]any) { completionMap(root)["allowed_tool_calls"] = 1 }},
@@ -157,6 +156,89 @@ func TestPostToolUseObservesMatchingFinalResponseContract(t *testing.T) {
 	output := captureHookStdout(t, func() { runPostToolUse(post) })
 	if !strings.Contains(output, localizationTerminalContext) {
 		t.Fatalf("PostToolUse output %q does not contain terminal context", output)
+	}
+}
+
+func TestPostToolUseAnswerReadyEventAuthenticationAndJSONShape(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	tests := []struct {
+		name       string
+		response   func(*testing.T) map[string]any
+		wantOutput bool
+		wantMarker bool
+	}{
+		{
+			name: "advisory",
+			response: func(t *testing.T) map[string]any {
+				contract := terminalContractMap()
+				completionMap(contract)["enforceable"] = false
+				return terminalToolResponse(t, contract, true, false)
+			},
+			wantOutput: true,
+		},
+		{
+			name:       "enforceable",
+			response:   func(t *testing.T) map[string]any { return terminalToolResponse(t, terminalContractMap(), true, false) },
+			wantOutput: true,
+			wantMarker: true,
+		},
+		{
+			name:     "forged without authoritative meta",
+			response: func(t *testing.T) map[string]any { return terminalToolResponse(t, terminalContractMap(), false, false) },
+		},
+		{
+			name: "advisory without final response",
+			response: func(t *testing.T) map[string]any {
+				contract := terminalContractMap()
+				completion := completionMap(contract)
+				completion["enforceable"] = false
+				delete(completion, "final_response")
+				return terminalToolResponse(t, contract, true, false)
+			},
+		},
+		{
+			name: "visible and meta mismatch",
+			response: func(t *testing.T) map[string]any {
+				response := terminalToolResponse(t, terminalContractMap(), true, false)
+				meta := response["_meta"].(map[string]any)
+				envelope := meta[localizationHostMetaKey].(map[string]any)
+				mismatched := cloneMap(t, terminalContractMap())
+				completionMap(mismatched)["final_response"] = "different response"
+				envelope["contract"] = mismatched
+				return response
+			},
+		},
+		{
+			name: "error response",
+			response: func(t *testing.T) map[string]any {
+				response := terminalToolResponse(t, terminalContractMap(), true, false)
+				response["isError"] = true
+				return response
+			},
+		},
+	}
+	want := string(mustJSON(t, HookOutput{HookSpecificOutput: &HookSpecificOutput{
+		HookEventName:     "PostToolUse",
+		AdditionalContext: localizationTerminalContext,
+	}}))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			identity := beginTestLocalizationTurn(t, t.Name(), "prompt", t.TempDir())
+			tool := gortexMCPToolPrefix + "read"
+			snapshotTestLocalizationTool(t, identity, tool, "tool")
+			post := localizationPostToolPayload(t, tool, "tool", identity, tt.response(t))
+			output := captureHookStdout(t, func() { runPostToolUse(post) })
+			if tt.wantOutput {
+				if output != want {
+					t.Fatalf("PostToolUse JSON = %s, want exact shape %s", output, want)
+				}
+			} else if output != "" {
+				t.Fatalf("unauthenticated PostToolUse emitted %q", output)
+			}
+			if got := hasLocalizationTerminal(identity); got != tt.wantMarker {
+				t.Fatalf("hard terminal marker = %v, want %v", got, tt.wantMarker)
+			}
+		})
 	}
 }
 

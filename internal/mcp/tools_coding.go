@@ -978,6 +978,10 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		result["omissions"] = omissions
 	}
 
+	// Capture the validated typed owner before any output encoding branch. The
+	// dispatcher consumes it only when this reserved call itself succeeds.
+	captureLocalizationReadSource(ctx, node)
+
 	// ETag conditional fetch.
 	etag := computeETag(result)
 	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {

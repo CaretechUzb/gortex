@@ -117,6 +117,71 @@ func newLocalizationEvidenceDigest(envelope localizationExploreEnvelope) *locali
 	}
 }
 
+func cloneLocalizationDigestRows(rows []localizationDigestRow) []localizationDigestRow {
+	if len(rows) == 0 {
+		return nil
+	}
+	cloned := make([]localizationDigestRow, len(rows))
+	for index, row := range rows {
+		cloned[index] = row
+		cloned[index].Callers = append([]string(nil), row.Callers...)
+		cloned[index].Callees = append([]string(nil), row.Callees...)
+	}
+	return cloned
+}
+
+// mergeLocalizationEvidenceDigest puts evidence returned by the terminalizing
+// permitted call first, then fills the bounded tail from the retained localize
+// digest. Files, Symbols, and Evidence are rebuilt from the same rows so their
+// ordinal positions can never diverge.
+func mergeLocalizationEvidenceDigest(current []localizationDigestRow, retained *localizationEvidenceDigest) *localizationEvidenceDigest {
+	digest := &localizationEvidenceDigest{}
+	seen := make(map[string]struct{}, localizationReplayEvidenceLimit)
+	appendRows := func(rows []localizationDigestRow) {
+		for _, row := range rows {
+			if len(digest.Evidence) >= localizationReplayEvidenceLimit {
+				return
+			}
+			row.ID = strings.TrimSpace(row.ID)
+			row.File = strings.TrimSpace(row.File)
+			if row.ID == "" || row.File == "" {
+				continue
+			}
+			if _, exists := seen[row.ID]; exists {
+				continue
+			}
+			seen[row.ID] = struct{}{}
+			row.Callers = append([]string(nil), row.Callers...)
+			row.Callees = append([]string(nil), row.Callees...)
+			digest.Evidence = append(digest.Evidence, row)
+		}
+	}
+	appendRows(current)
+	if retained != nil {
+		appendRows(retained.Evidence)
+	}
+	for {
+		rebuildLocalizationDigestSkeleton(digest)
+		digest.finalResponse = renderLocalizationFinalResponse(digest.Evidence)
+		encoded, err := json.Marshal(digest)
+		if err == nil && len(encoded) <= localizationDigestMaxBytes && len(digest.finalResponse) <= localizationFinalResponseMaxBytes {
+			return digest
+		}
+		if len(digest.Evidence) == 0 {
+			return digest
+		}
+		last := len(digest.Evidence) - 1
+		if shedLocalizationDigestRowOptionalFields(&digest.Evidence[last]) {
+			continue
+		}
+		if last == 0 {
+			digest.Evidence = nil
+			continue
+		}
+		digest.Evidence = digest.Evidence[:last]
+	}
+}
+
 func shedLocalizationDigestRowOptionalFields(row *localizationDigestRow) bool {
 	if row == nil {
 		return false

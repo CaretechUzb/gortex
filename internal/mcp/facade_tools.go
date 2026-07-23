@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
@@ -526,7 +527,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	localizationReadSucceeded := false
 	defer func() {
 		if localizationReadReservation != 0 {
-			terminal.finishReservedReadToken(localizationReadReservation, localizationReadSucceeded)
+			terminal.finishReservedReadTokenWithDigest(localizationReadReservation, localizationReadSucceeded, nil, false)
 		}
 		if localizeReservation != 0 && !localizeFinished {
 			// Errors and panics roll back to the previous completion contract.
@@ -540,16 +541,26 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 			return blocked, nil
 		}
 		localizationReadReservation = reservation
+		if reservation != 0 {
+			ctx = withLocalizationPermittedEvidenceCapture(ctx, reservation)
+		}
 	}
 	result, err := s.invokeFacadeSpec(ctx, req, spec)
 	succeeded := err == nil && result != nil && !result.IsError
 	if localizationReadReservation != 0 {
 		localizationReadSucceeded = succeeded
+		var currentEvidence []localizationDigestRow
+		evidenceRecorded := false
+		if succeeded {
+			currentEvidence, evidenceRecorded = localizationEvidenceForPermittedCall(ctx, facade, operation, localizationReadReservation)
+		}
 		// Finalize before decorating so a preclassified route or bounded recovery
-		// can expose its next state in this same response. Every failed allowance
-		// is converted to a tool error carrying either its one restored retry or
-		// terminal answer_ready; a Go handler error must not hide the contract.
-		completion := terminal.finishReservedReadToken(localizationReadReservation, succeeded)
+		// can expose its next state in this same response. Typed identities are
+		// merged under the terminal-state lock only when this call transitions to
+		// answer_ready. Every failed allowance is converted to a tool error carrying
+		// either its one restored retry or terminal answer_ready; a Go handler error
+		// must not hide the contract.
+		completion := terminal.finishReservedReadTokenWithDigest(localizationReadReservation, succeeded, currentEvidence, evidenceRecorded)
 		localizationReadReservation = 0
 		if succeeded {
 			result = decorateLocalizationReadResult(result, completion)
@@ -562,6 +573,133 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		localizeFinished = true
 	}
 	return result, err
+}
+
+type localizationPermittedEvidenceCaptureKey struct{}
+
+type localizationPermittedEvidenceCapture struct {
+	mu       sync.Mutex
+	token    uint64
+	recorded bool
+	rows     []localizationDigestRow
+}
+
+func withLocalizationPermittedEvidenceCapture(ctx context.Context, token uint64) context.Context {
+	if token == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, localizationPermittedEvidenceCaptureKey{}, &localizationPermittedEvidenceCapture{token: token})
+}
+
+func captureLocalizationRows(ctx context.Context, rows []localizationDigestRow) {
+	capture, _ := ctx.Value(localizationPermittedEvidenceCaptureKey{}).(*localizationPermittedEvidenceCapture)
+	if capture == nil {
+		return
+	}
+	capture.mu.Lock()
+	capture.rows = cloneLocalizationDigestRows(rows)
+	capture.recorded = true
+	capture.mu.Unlock()
+}
+
+// captureLocalizationSearchSymbols records the exact typed, scoped page that
+// search_symbols is about to render. The request-private context value keeps a
+// concurrent or stale search from supplying identities to another reservation.
+func captureLocalizationSearchSymbols(ctx context.Context, nodes []*graph.Node) {
+	rows := make([]localizationDigestRow, 0, len(nodes))
+	for _, node := range nodes {
+		if row, ok := localizationDigestRowFromNode(node, "permitted_search_symbols"); ok {
+			rows = append(rows, row)
+		}
+	}
+	captureLocalizationRows(ctx, rows)
+}
+
+// captureLocalizationSearchText promotes only graph-backed symbol identities
+// from the typed search.text page. File-only hits have no SymbolID, and the
+// rendered MCP Content is never parsed as evidence.
+func (s *Server) captureLocalizationSearchText(ctx context.Context, matches []enrichedTextMatch) {
+	capture, _ := ctx.Value(localizationPermittedEvidenceCaptureKey{}).(*localizationPermittedEvidenceCapture)
+	if capture == nil {
+		return
+	}
+	rows := make([]localizationDigestRow, 0, len(matches))
+	if s.graph != nil {
+		for _, match := range matches {
+			id := strings.TrimSpace(match.SymbolID)
+			if id == "" {
+				continue
+			}
+			node := s.graph.GetNode(id)
+			if node == nil || !s.nodeInSessionScope(ctx, node) {
+				continue
+			}
+			if row, ok := localizationDigestRowFromNode(node, "permitted_search_text"); ok {
+				rows = append(rows, row)
+			}
+		}
+	}
+	captureLocalizationRows(ctx, rows)
+}
+
+// captureLocalizationReadSource records the validated graph node whose source
+// was successfully read. It never reconstructs identity from serialized output.
+func captureLocalizationReadSource(ctx context.Context, node *graph.Node) {
+	rows := make([]localizationDigestRow, 0, 1)
+	if row, ok := localizationDigestRowFromNode(node, "permitted_read_source"); ok {
+		rows = append(rows, row)
+	}
+	captureLocalizationRows(ctx, rows)
+}
+
+func localizationCapturedEvidence(ctx context.Context, token uint64) ([]localizationDigestRow, bool) {
+	capture, _ := ctx.Value(localizationPermittedEvidenceCaptureKey{}).(*localizationPermittedEvidenceCapture)
+	if capture == nil || token == 0 || capture.token != token {
+		return nil, false
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if !capture.recorded {
+		return nil, false
+	}
+	return cloneLocalizationDigestRows(capture.rows), true
+}
+
+func localizationDigestRowFromNode(node *graph.Node, provenance string) (localizationDigestRow, bool) {
+	if node == nil {
+		return localizationDigestRow{}, false
+	}
+	id := strings.TrimSpace(node.ID)
+	file := strings.TrimSpace(nodeDisplayPath(node))
+	if id == "" || file == "" {
+		return localizationDigestRow{}, false
+	}
+	signature := ""
+	if node.Meta != nil {
+		signature, _ = node.Meta["signature"].(string)
+	}
+	return localizationDigestRow{
+		ID:         id,
+		Name:       node.Name,
+		QualName:   node.QualName,
+		Kind:       string(node.Kind),
+		File:       file,
+		Line:       node.StartLine,
+		Signature:  signature,
+		Provenance: provenance,
+	}, true
+}
+
+func localizationEvidenceForPermittedCall(ctx context.Context, facade, operation string, token uint64) ([]localizationDigestRow, bool) {
+	if token == 0 {
+		return nil, false
+	}
+	switch facade + "." + operation {
+	case "search.symbols", "search.text", "read.source":
+		return localizationCapturedEvidence(ctx, token)
+	default:
+		return nil, false
+	}
 }
 
 func decorateExhaustedLocalizationReadFailure(
