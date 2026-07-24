@@ -115,6 +115,12 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 				reason = localizationAdvisoryDenyReason
 			}
 			if reason != "" {
+				// Hand the answer back with the refusal. A bare "you are done"
+				// leaves the caller with nothing to act on, so it reaches for the
+				// next tool and the turn budget drains one denial at a time.
+				if answer := strings.TrimSpace(marker.FinalResponse); answer != "" {
+					reason += "\n\n" + answer
+				}
 				emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
 					HookEventName:            "PreToolUse",
 					PermissionDecision:       "deny",

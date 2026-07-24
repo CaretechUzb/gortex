@@ -87,6 +87,10 @@ type localizationTerminalMarker struct {
 	Identity         localizationTerminalIdentity `json:"identity"`
 	ObservedUnixNano int64                        `json:"observed_unix_nano"`
 	Advisory         bool                         `json:"advisory,omitempty"`
+	// FinalResponse rides the marker so a blocked call can hand back the answer
+	// itself. A refusal that only says "you are done" gives the caller nothing
+	// to act on and it tries the next tool; the answer ends the turn.
+	FinalResponse string `json:"final_response,omitempty"`
 }
 
 type localizationTerminalHookInput struct {
@@ -162,7 +166,7 @@ func observeLocalizationTerminal(data []byte) (localizationTerminalHookInput, bo
 	// PreToolUse snapshot. Visible tool JSON is never an authority on this path.
 	if authToken != "" {
 		if receipt, authenticated := localizationauth.Consume(authToken); authenticated {
-			if !markLocalizationTerminalReceipt(identity, receipt.ContractVersion, receipt.Enforceable) {
+			if !markLocalizationTerminalReceipt(identity, receipt.ContractVersion, receipt.Enforceable, receipt.FinalResponse) {
 				return localizationTerminalHookInput{}, false
 			}
 			input.TerminalReceipt = receipt
@@ -177,7 +181,7 @@ func observeLocalizationTerminal(data []byte) (localizationTerminalHookInput, bo
 	if !ok || !answerReadyLocalizationTerminalContract(contract) {
 		return localizationTerminalHookInput{}, false
 	}
-	if !markLocalizationTerminalReceipt(identity, contract.Completion.ContractVersion, contract.Completion.Enforceable) {
+	if !markLocalizationTerminalReceipt(identity, contract.Completion.ContractVersion, contract.Completion.Enforceable, contract.Completion.FinalResponse) {
 		return localizationTerminalHookInput{}, false
 	}
 	input.TerminalReceipt = localizationauth.Receipt{
@@ -618,14 +622,18 @@ func localizationTerminalIdentityCurrent(identity localizationTerminalIdentity) 
 }
 
 func markLocalizationTerminal(identity localizationTerminalIdentity, contractVersion int) bool {
-	return markLocalizationTerminalWithStrength(identity, contractVersion, false)
+	return markLocalizationTerminalWithStrength(identity, contractVersion, false, "")
 }
 
-func markLocalizationTerminalReceipt(identity localizationTerminalIdentity, contractVersion int, enforceable bool) bool {
-	return markLocalizationTerminalWithStrength(identity, contractVersion, !enforceable)
+func markLocalizationTerminalReceipt(
+	identity localizationTerminalIdentity, contractVersion int, enforceable bool, finalResponse string,
+) bool {
+	return markLocalizationTerminalWithStrength(identity, contractVersion, !enforceable, finalResponse)
 }
 
-func markLocalizationTerminalWithStrength(identity localizationTerminalIdentity, contractVersion int, advisory bool) bool {
+func markLocalizationTerminalWithStrength(
+	identity localizationTerminalIdentity, contractVersion int, advisory bool, finalResponse string,
+) bool {
 	if identity.SessionID == "" || identity.CWD == "" || identity.TurnToken == "" ||
 		contractVersion < localizationTerminalContractV2 {
 		return false
@@ -636,6 +644,7 @@ func markLocalizationTerminalWithStrength(identity localizationTerminalIdentity,
 		Identity:         identity,
 		ObservedUnixNano: time.Now().UnixNano(),
 		Advisory:         advisory,
+		FinalResponse:    strings.TrimSpace(finalResponse),
 	}
 	path := localizationTerminalMarkerPath(identity)
 	if advisory {

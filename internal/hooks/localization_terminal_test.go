@@ -350,8 +350,8 @@ func TestLocalizationTerminalHookFlowDeniesThenPromptRotatesTurn(t *testing.T) {
 			if output.HookSpecificOutput == nil || output.HookSpecificOutput.PermissionDecision != "deny" {
 				t.Fatalf("expected all-tool terminal deny, got %#v", output)
 			}
-			if got := output.HookSpecificOutput.PermissionDecisionReason; got != localizationTerminalDenyReason {
-				t.Fatalf("terminal deny reason = %q, want %q", got, localizationTerminalDenyReason)
+			if got := output.HookSpecificOutput.PermissionDecisionReason; !strings.HasPrefix(got, localizationTerminalDenyReason) {
+				t.Fatalf("terminal deny reason = %q, want prefix %q", got, localizationTerminalDenyReason)
 			}
 			for _, required := range []string{
 				"Localization for this task is complete",

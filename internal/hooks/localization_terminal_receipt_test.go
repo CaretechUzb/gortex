@@ -152,8 +152,15 @@ func TestLocalizationReceiptMarkerStrengthControlsPreToolUse(t *testing.T) {
 					if tt.enforceable {
 						wantReason = localizationTerminalDenyReason
 					}
-					if got := output.HookSpecificOutput.PermissionDecisionReason; got != wantReason {
-						t.Fatalf("terminal deny reason = %q, want %q", got, wantReason)
+					got := output.HookSpecificOutput.PermissionDecisionReason
+					if !strings.HasPrefix(got, wantReason) {
+						t.Fatalf("terminal deny reason = %q, want prefix %q", got, wantReason)
+					}
+					// The refusal hands back the answer, so the caller has
+					// something to act on instead of another tool to try.
+					if answer := strings.TrimSpace(marker.FinalResponse); answer != "" &&
+						!strings.Contains(got, answer) {
+						t.Fatalf("terminal deny reason %q does not carry the retained answer %q", got, answer)
 					}
 				})
 			}
@@ -200,7 +207,7 @@ func TestLocalizationTerminalMarkerStrengthIsMonotonic(t *testing.T) {
 			t.Fatalf("invalid hard terminal deny for %s: %v\n%s", tool, err, encoded)
 		}
 		if output.HookSpecificOutput.PermissionDecision != "deny" ||
-			output.HookSpecificOutput.PermissionDecisionReason != localizationTerminalDenyReason {
+			!strings.HasPrefix(output.HookSpecificOutput.PermissionDecisionReason, localizationTerminalDenyReason) {
 			t.Fatalf("hard marker did not remain enforceable for %s: %#v", tool, output.HookSpecificOutput)
 		}
 	}
@@ -238,7 +245,7 @@ func TestLocalizationAdvisoryMarkerRotatesAndDelayedPostCannotPoisonNewTurn(t *t
 	if _, observed := observeLocalizationTerminal(pendingPost); observed {
 		t.Fatal("pending pre-rotation advisory receipt armed the next turn")
 	}
-	if !markLocalizationTerminalReceipt(oldTurn, localizationTerminalContractV2, false) {
+	if !markLocalizationTerminalReceipt(oldTurn, localizationTerminalContractV2, false, "") {
 		t.Fatal("simulate delayed advisory marker write")
 	}
 	if _, marked := localizationTerminalMarkerFor(newTurn); marked {
