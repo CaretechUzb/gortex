@@ -6,12 +6,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/indexer"
 )
+
+// trackAcceptedHeadroom is how long before the MCP request deadline the
+// track handler stops waiting for the first index and answers `accepted`.
+// Without the headroom the daemon aborts the request first and the caller
+// sees a bare timeout instead of a usable answer.
+const trackAcceptedHeadroom = 5 * time.Second
 
 // registerMultiRepoTools registers MCP tools for multi-repo management:
 // track_repository, untrack_repository, set_active_project, get_active_project.
@@ -99,39 +107,88 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		entry.Force = force
 	}
 
-	result, trackErr := s.multiIndexer.TrackRepoCtx(s.progressCtx(ctx, req), entry)
-	if trackErr != nil {
-		return mcp.NewToolResultError(trackErr.Error()), nil
+	// A fresh repo's first index routinely outruns the MCP request deadline,
+	// and registration only lands *after* TrackRepoCtx returns — so the
+	// cancelled index left the repo untracked and a retry just repeated the
+	// cycle (#326). Run the index on a context detached from the request and
+	// answer `accepted` before the deadline, so the work continues
+	// server-side the way boot indexing does.
+	absPath, absErr := filepath.Abs(path)
+	if absErr != nil {
+		absPath = path
+	}
+	if _, busy := s.trackInFlight.LoadOrStore(absPath, struct{}{}); busy {
+		return s.respondJSONOrTOON(ctx, req, map[string]any{
+			"status": "accepted",
+			"path":   path,
+			"detail": "an initial index for this path is already running; call track again later to read its result",
+		})
 	}
 
-	// Already tracked — TrackRepo returns nil result when repo exists.
-	if result == nil {
-		return mcp.NewToolResultText("repository already tracked"), nil
+	type trackOutcome struct {
+		result *indexer.IndexResult
+		err    error
 	}
-
-	// Persist updated config.
-	if s.configManager != nil {
-		if saveErr := s.configManager.Global().Save(); saveErr != nil {
-			s.logger.Warn("failed to persist config after tracking repo",
-				zap.String("path", path), zap.Error(saveErr))
+	done := make(chan trackOutcome, 1)
+	go func() {
+		defer s.trackInFlight.Delete(absPath)
+		// WithoutCancel keeps the request's values (progress token, session)
+		// while dropping its cancellation, so the daemon's request lifetime
+		// can no longer kill a half-written first index.
+		res, trackErr := s.multiIndexer.TrackRepoCtx(
+			s.progressCtx(context.WithoutCancel(ctx), req), entry)
+		if trackErr == nil && res != nil {
+			// Persist and refresh here rather than in the caller: the caller
+			// may already have answered `accepted` and returned.
+			if s.configManager != nil {
+				if saveErr := s.configManager.Global().Save(); saveErr != nil {
+					s.logger.Warn("failed to persist config after tracking repo",
+						zap.String("path", path), zap.Error(saveErr))
+				}
+			}
+			s.RunAnalysis()
 		}
+		done <- trackOutcome{result: res, err: trackErr}
+	}()
+
+	// A nil channel blocks forever, so a request with no deadline (CLI, tests)
+	// keeps today's fully synchronous contract.
+	var answerBy <-chan time.Time
+	if deadline, ok := ctx.Deadline(); ok {
+		wait := max(time.Until(deadline)-trackAcceptedHeadroom, 0)
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		answerBy = timer.C
 	}
 
-	// Re-run analysis after adding a new repo.
-	s.RunAnalysis()
-
-	prefix := result.RepoPrefix
-	if prefix == "" {
-		prefix = config.ResolvePrefix(entry)
+	select {
+	case out := <-done:
+		if out.err != nil {
+			return mcp.NewToolResultError(out.err.Error()), nil
+		}
+		// Already tracked — TrackRepo returns nil result when repo exists.
+		if out.result == nil {
+			return mcp.NewToolResultText("repository already tracked"), nil
+		}
+		prefix := out.result.RepoPrefix
+		if prefix == "" {
+			prefix = config.ResolvePrefix(entry)
+		}
+		return s.respondJSONOrTOON(ctx, req, map[string]any{
+			"status":     "tracked",
+			"path":       path,
+			"prefix":     prefix,
+			"file_count": out.result.FileCount,
+			"node_count": out.result.NodeCount,
+			"edge_count": out.result.EdgeCount,
+		})
+	case <-answerBy:
+		return s.respondJSONOrTOON(ctx, req, map[string]any{
+			"status": "accepted",
+			"path":   path,
+			"detail": "initial index is still running server-side and is no longer bound to this request; call track again to read the tracked result",
+		})
 	}
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"status":     "tracked",
-		"path":       path,
-		"prefix":     prefix,
-		"file_count": result.FileCount,
-		"node_count": result.NodeCount,
-		"edge_count": result.EdgeCount,
-	})
 }
 
 // handleUntrackRepository removes a repo from the workspace and persists to GlobalConfig.
