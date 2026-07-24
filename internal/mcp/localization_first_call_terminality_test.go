@@ -125,3 +125,40 @@ func TestExploreQuotedRecallCompactTermIgnoresUnrelatedRequestAnchor(t *testing.
 	// literal lane still runs and can reach the registration site.
 	require.False(t, exploreQuotedRecallHasExactSourceNode(task, []string{"kx"}, node, query.QueryOptions{}))
 }
+
+func TestTerminalExploreResultKeepsEvidenceBesideTheAnswer(t *testing.T) {
+	node := &graph.Node{
+		ID: "repo/storage/disk.go::DiskStorage.Load", Name: "DiskStorage.Load",
+		Kind: graph.KindMethod, FilePath: "storage/disk.go", StartLine: 12,
+		QualName: "storage.DiskStorage.Load",
+		Meta: map[string]any{
+			"signature":        "func (s *DiskStorage) Load(path string) ([]byte, error)",
+			"search_qual_name": "storage.DiskStorage.Load",
+		},
+	}
+	result, _, _, completion := buildLocalizationExploreResultForTaskFinalized(
+		newLocalizationCompletion(true, ""),
+		"DiskStorage.Load truncates large payloads",
+		[]exploreTarget{{node: node, source: "func (s *DiskStorage) Load(path string) ([]byte, error) { return nil, nil }"}},
+		exploreDefaultBudgetTokens,
+	)
+	require.Equal(t, localizationStateAnswerReady, completion.State)
+	require.NotNil(t, result)
+
+	// The terminal projection must not be the only thing a structuredContent
+	// host can see: an answer without its evidence sends the caller looking for
+	// the source it was just handed.
+	structured, ok := result.StructuredContent.(map[string]any)
+	require.True(t, ok, "terminal result must carry structured content")
+	require.Contains(t, structured, "final_response")
+	require.Contains(t, structured, "files")
+	require.Contains(t, structured, "symbols")
+	require.Contains(t, structured, "evidence")
+	rows, ok := structured["evidence"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, rows, "terminal page keeps its ranked rows")
+	first, ok := rows[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, node.ID, first["id"])
+	require.NotEmpty(t, first["source"], "the ranked head keeps the body the caller would otherwise read")
+}
