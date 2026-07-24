@@ -146,6 +146,11 @@ type Server struct {
 	// changes with a reindex under a different exclude set, so
 	// daemon-lifetime caching is safe.
 	testIndexProbe sync.Map
+	// trackInFlight guards first-index runs by absolute repo path.
+	// track answers before the index finishes (#326), so without this a
+	// second call for the same path would start a duplicate full index:
+	// TrackRepoCtx's already-tracked check only sees repos that finished.
+	trackInFlight sync.Map
 	// scopeWorkspace / scopeProject default-scope every query at this
 	// server instance to a single (workspace, project) tuple. Set by
 	// `gortex server --workspace <slug> [--scope-project <slug>]`.
