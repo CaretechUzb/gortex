@@ -30,6 +30,7 @@ func TestLocalizationEvidencePolicyKeepsRankedReadinessTerminal(t *testing.T) {
 		},
 	}
 	finalized := localizationFinalizeCompletionEvidence(
+		"DiskStorage.Load truncates large payloads",
 		envelope.Completion, []exploreTarget{{node: node}}, envelope,
 	)
 	// Without one of the hard provenance shapes the page keeps its ranked

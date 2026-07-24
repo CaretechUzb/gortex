@@ -291,22 +291,22 @@ func TestLocalizationEvidencePolicyRequiresEveryPackedProofRole(t *testing.T) {
 		{ID: owner.ID, Provenance: localizationProvenanceDivergentDefault},
 		{ID: typeNode.ID, Provenance: localizationProvenanceDivergentDefaultType},
 	}}
-	complete := localizationFinalizeCompletionEvidence(completion, targets, completeEnvelope)
+	complete := localizationFinalizeCompletionEvidence("owner default permission", completion, targets, completeEnvelope)
 	require.True(t, complete.enforceableOnAnswerReady)
 
 	missingSupport := completeEnvelope
 	missingSupport.Evidence = missingSupport.Evidence[:1]
-	incomplete := localizationFinalizeCompletionEvidence(completion, targets, missingSupport)
+	incomplete := localizationFinalizeCompletionEvidence("owner default permission", completion, targets, missingSupport)
 	require.False(t, incomplete.enforceableOnAnswerReady)
 
 	ready := newLocalizationCompletion(true, "")
-	ready = localizationFinalizeCompletionEvidence(ready, targets, completeEnvelope)
+	ready = localizationFinalizeCompletionEvidence("owner default permission", ready, targets, completeEnvelope)
 	require.True(t, ready.Enforceable)
 
 	spoofed := newLocalizationCompletion(true, "")
 	spoofed.Enforceable = true
 	spoofed.enforceableOnAnswerReady = true
-	weak := localizationFinalizeCompletionEvidence(spoofed, []exploreTarget{{
+	weak := localizationFinalizeCompletionEvidence("owner default permission", spoofed, []exploreTarget{{
 		node: owner, source: ownerTarget.source, sourceLiteral: true, exactContent: true,
 	}}, localizationExploreEnvelope{Evidence: []localizationEvidence{{ID: owner.ID}}})
 	require.False(t, weak.Enforceable)

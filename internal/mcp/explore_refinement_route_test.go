@@ -210,35 +210,29 @@ func TestBuildLocalizationRefinementResultKeepsWireAndStateAuthorizationEqual(t 
 	}
 }
 
-func TestBuildLocalizationRefinementResultCompletesWithoutValidPreferredRoute(t *testing.T) {
+func TestBuildLocalizationRefinementResultOffersRecoveryWithoutValidPreferredRoute(t *testing.T) {
 	unhydrated := &graph.Node{ID: "repo/unhydrated", Name: "replace", Kind: graph.KindMethod, FilePath: "src/replace.rs"}
 	targets := []exploreTarget{{node: unhydrated}}
 	result, completion, bounded, _ := buildLocalizationRefinementResultForTask(
 		unhydrated.ID, "find the replace implementation", targets, exploreDefaultBudgetTokens,
 		exploreLocalizationRefinementRoutes(targets),
 	)
-	// With no prevalidated route to authorize there is nothing further to read
-	// under the contract, so the page completes advisorily instead of spending
-	// a call on evidence it cannot authorize.
-	if completion.State != localizationStateAnswerReady || completion.RequiredAction != "respond" || completion.AllowedToolCalls != 0 {
-		t.Fatalf("invalid preferred route completion = %#v, want advisory terminal contract", completion)
-	}
-	if completion.Enforceable {
-		t.Fatalf("advisory completion must not be enforceable: %#v", completion)
+	if completion.State != localizationStateNeedsRecovery || completion.RequiredAction != "recover_once" || completion.AllowedToolCalls != 1 {
+		t.Fatalf("invalid preferred route completion = %#v, want bounded recovery contract", completion)
 	}
 	if len(bounded) != 0 {
 		t.Fatalf("invalid preferred route retained authorization: %v", bounded)
 	}
 	text, ok := singleTextContent(result)
 	if !ok {
-		t.Fatal("advisory localization result has no single text payload")
+		t.Fatal("recovery localization result has no single text payload")
 	}
 	var envelope localizationExploreEnvelope
 	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
-		t.Fatalf("decode advisory localization envelope: %v", err)
+		t.Fatalf("decode recovery localization envelope: %v", err)
 	}
-	if envelope.Completion.State != localizationStateAnswerReady || envelope.Completion.RequiredAction != "respond" || len(envelope.Completion.AllowedSymbols) != 0 {
-		t.Fatalf("wire completion = %#v, want advisory terminal without a prevalidated route", envelope.Completion)
+	if envelope.Completion.State != localizationStateNeedsRecovery || envelope.Completion.RequiredAction != "recover_once" || len(envelope.Completion.AllowedSymbols) != 0 {
+		t.Fatalf("wire completion = %#v, want bounded recovery without a prevalidated route", envelope.Completion)
 	}
 }
 

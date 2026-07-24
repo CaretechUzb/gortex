@@ -3711,7 +3711,7 @@ func buildLocalizationExploreResultForTaskFinalized(
 	// Strong enforcement is derived only from proof rows that survived final
 	// byte-budget packing. Visible text, retained state, and host metadata then
 	// share this one normalized completion value.
-	envelope.Completion = localizationFinalizeCompletionEvidence(envelope.Completion, acceptedTargets, envelope)
+	envelope.Completion = localizationFinalizeCompletionEvidence(task, envelope.Completion, acceptedTargets, envelope)
 	contract = localizationContractFor(envelope.Completion)
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal

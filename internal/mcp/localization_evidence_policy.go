@@ -135,7 +135,32 @@ func localizationExactReadSatisfiedByEnvelope(task string, envelope localization
 	return false
 }
 
+// localizationRankedEvidenceCarriesLead reports whether the packed rows mention
+// what the request is actually about, using the same lead-alignment bar the
+// reserved read must clear before it may end a session. Ranking can be
+// confident about a page that never names the request's subject; that page
+// still owes the caller its one bounded call.
+func localizationRankedEvidenceCarriesLead(
+	task string,
+	completion localizationCompletion,
+	envelope localizationExploreEnvelope,
+) bool {
+	rows := make([]localizationDigestRow, 0, len(envelope.Evidence))
+	for _, evidence := range envelope.Evidence {
+		if strings.TrimSpace(evidence.ID) == "" || strings.TrimSpace(evidence.File) == "" {
+			continue
+		}
+		rows = append(rows, localizationDigestRow{
+			Rank: evidence.Rank, ID: evidence.ID, Name: evidence.Name,
+			QualName: evidence.QualName, Kind: evidence.Kind, File: evidence.File,
+			Line: evidence.Line, Signature: evidence.Signature,
+		})
+	}
+	return localizationReservedReadEvidenceAlignedWithLead(task, completion.taskLead, "", rows)
+}
+
 func localizationFinalizeCompletionEvidence(
+	task string,
 	completion localizationCompletion,
 	targets []exploreTarget,
 	envelope localizationExploreEnvelope,
@@ -147,10 +172,19 @@ func localizationFinalizeCompletionEvidence(
 	proof := localizationStrongEvidenceForCompletion(completion, targets)
 	if !localizationEvidenceProofVisible(proof, envelope) {
 		// A ranked head that is answer-ready stays terminal without one of the
-		// hard provenance shapes. The ranked evidence and its ready-to-emit
-		// answer are already packed into this envelope, so an extra bounded
-		// navigation call only re-reads what the caller can already see. The
-		// proof keeps gating hard enforcement; it no longer gates terminality.
+		// hard provenance shapes: its evidence and ready-to-emit answer are
+		// already packed here, so an extra bounded call only re-reads what the
+		// caller can see. The proof keeps gating hard enforcement. Evidence that
+		// does not carry the request's lead is the exception — unproven AND
+		// unaligned is where ranked confidence has been wrong, so that page
+		// keeps its one bounded call.
+		if completion.State == localizationStateAnswerReady && strings.TrimSpace(task) != "" &&
+			(len(envelope.Evidence) > 0 || len(envelope.Symbols) > 0) &&
+			!localizationRankedEvidenceCarriesLead(task, completion, envelope) {
+			recovery := newLocalizationRecoveryCompletion()
+			recovery.digest = completion.digest
+			return recovery
+		}
 		return completion
 	}
 	switch completion.State {
