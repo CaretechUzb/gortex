@@ -146,12 +146,20 @@ func newLocalizationPlannedRecoveryCompletion(operation, anchor string) localiza
 	}
 }
 
+// localizationAnswerReadyInstruction states the emit contract in the field every
+// non-terminal completion already uses, so a host that reads only
+// completion.instruction carries the same obligation as one that reads the
+// rendered page. required_action stays "respond" — the terminal gate matches
+// that exact value.
+const localizationAnswerReadyInstruction = "Respond now from completion.final_response: quote its LOCALIZATION lines verbatim as the first lines of your reply — same paths, line numbers, and identifiers — then add your own conclusion in your own words. Do not call another tool."
+
 func newLocalizationCompletion(answerReady bool, exactSymbol string) localizationCompletion {
 	if answerReady {
 		return localizationCompletion{
 			State:            localizationStateAnswerReady,
 			Scope:            "localization",
 			RequiredAction:   "respond",
+			Instruction:      localizationAnswerReadyInstruction,
 			AllowedToolCalls: 0,
 			ContractVersion:  localizationTerminalContractV2,
 		}
