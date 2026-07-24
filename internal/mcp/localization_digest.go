@@ -396,8 +396,11 @@ func localizationFinalResponseField(value string) string {
 }
 
 const (
-	localizationFinalResponsePrimaryLimit    = 3
-	localizationFinalResponseSupportingLimit = 4
+	localizationFinalResponsePrimaryLimit = 3
+	// The answer asks the caller to reproduce these lines verbatim, so the
+	// presentation must cover every row the digest retained: a retained row
+	// that never reaches the answer is evidence the page found and then hid.
+	localizationFinalResponseSupportingLimit = localizationReplayEvidenceLimit - localizationFinalResponsePrimaryLimit
 )
 
 type localizationFinalResponseRow struct {

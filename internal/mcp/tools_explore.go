@@ -3724,13 +3724,21 @@ func buildLocalizationExploreResultForTaskFinalized(
 	contract = localizationContractFor(envelope.Completion)
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal
-	// The ready-to-emit answer is derived from the packed rows, so it lands
+	// The ready-to-emit answer is derived from the retained rows, so it lands
 	// after the fit checks above and can push the envelope past its budget.
-	// Source bodies are the largest and most recoverable payload, so they are
-	// shed last-first until the enriched envelope is back inside the budget —
-	// except a body that just retired a prescribed read, which is the evidence
-	// the caller would otherwise have spent a call to obtain.
+	// Give back the weakest presented row first — the caller is asked to
+	// reproduce these lines, so a row that cannot be shown is a row that cannot
+	// be retained either — then packed source bodies, which are the largest and
+	// most recoverable payload. A body that just retired a prescribed read is
+	// kept: it is the evidence the caller would otherwise have paid a call for.
 	for !localizationEnvelopeFits(envelope, maxBytes) {
+		if digest != nil && len(digest.Evidence) > localizationFinalResponsePrimaryLimit {
+			digest.Evidence = digest.Evidence[:len(digest.Evidence)-1]
+			rebuildLocalizationDigestSkeleton(digest)
+			digest.finalResponse = renderLocalizationFinalResponseForTask(task, nil, digest.Evidence)
+			envelope.Completion = localizationCompletionWithDigest(envelope.Completion, digest)
+			continue
+		}
 		shed := -1
 		for index := range envelope.Evidence {
 			if strings.TrimSpace(envelope.Evidence[index].Source) == "" ||
