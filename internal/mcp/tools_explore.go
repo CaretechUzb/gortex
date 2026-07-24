@@ -3756,20 +3756,7 @@ func buildLocalizationExploreResultForTaskFinalized(
 	if err != nil {
 		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil, nil, envelope.Completion
 	}
-	result := mcp.NewToolResultText(string(body))
-	// At answer_ready the terminal projection takes over structuredContent, and
-	// a host that renders it would see the answer lines with none of the
-	// evidence they came from — the very moment a caller goes looking for the
-	// source itself and spends a turn being told it already has the answer.
-	// Mirror the packed envelope first so the terminal page keeps its rows and
-	// bodies beside final_response.
-	if envelope.Completion.State == localizationStateAnswerReady {
-		mirrored := make(map[string]any, 8)
-		if err := json.Unmarshal(body, &mirrored); err == nil {
-			result.StructuredContent = mirrored
-		}
-	}
-	result = attachLocalizationHostEnvelope(result, envelope.Completion, digest)
+	result := attachLocalizationHostEnvelope(mcp.NewToolResultText(string(body)), envelope.Completion, digest)
 	return result, append([]string(nil), envelope.Symbols...), digest, envelope.Completion
 }
 

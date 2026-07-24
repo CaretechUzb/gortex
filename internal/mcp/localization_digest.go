@@ -871,7 +871,21 @@ func attachLocalizationHostEnvelope(result *mcpgo.CallToolResult, completion loc
 	// the terminal host projection; refinement and recovery retain their
 	// existing structuredContent shape and visible completion envelope.
 	if completion.State == localizationStateAnswerReady {
-		result.StructuredContent = localizationTerminalStructuredContent(result.StructuredContent, contract)
+		base := result.StructuredContent
+		if base == nil {
+			// A host that renders structured content in preference to text sees
+			// only this projection. Replacing a nil payload would therefore erase
+			// the tool's own answer — including the source an authorized read was
+			// just permitted to fetch — so decode the text payload and keep it
+			// underneath the terminal keys.
+			if text, ok := singleTextContent(result); ok {
+				var decoded map[string]any
+				if err := json.Unmarshal([]byte(text), &decoded); err == nil {
+					base = decoded
+				}
+			}
+		}
+		result.StructuredContent = localizationTerminalStructuredContent(base, contract)
 	}
 	if result.Meta == nil {
 		result.Meta = &mcpgo.Meta{}

@@ -3,6 +3,7 @@ package mcp
 import (
 	"testing"
 
+	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -161,4 +162,22 @@ func TestTerminalExploreResultKeepsEvidenceBesideTheAnswer(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, node.ID, first["id"])
 	require.NotEmpty(t, first["source"], "the ranked head keeps the body the caller would otherwise read")
+}
+
+func TestTerminalProjectionKeepsTheToolsOwnPayload(t *testing.T) {
+	// The authorized read answers with source in its text payload and no
+	// structured content of its own. The terminal projection must land on top
+	// of it, not in place of it — a caller that renders structured content
+	// would otherwise be told to answer from evidence it can no longer see.
+	payload := `{"symbol":"repo/storage/disk.go::DiskStorage.Load",` +
+		`"source":"func (s *DiskStorage) Load(path string) ([]byte, error) { return nil, nil }"}`
+	completion := newLocalizationCompletion(true, "")
+	completion.FinalResponse = "LOCALIZATION:\n- PRIMARY — storage/disk.go:12 — repo/storage/disk.go::DiskStorage.Load"
+
+	result := attachLocalizationHostEnvelope(mcpgo.NewToolResultText(payload), completion, nil)
+	structured, ok := result.StructuredContent.(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "repo/storage/disk.go::DiskStorage.Load", structured["symbol"])
+	require.Contains(t, structured["source"], "func (s *DiskStorage) Load")
+	require.Contains(t, structured, "final_response")
 }
