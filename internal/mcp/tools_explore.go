@@ -2415,8 +2415,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		if c == nil || c.Node == nil || !exploreLocalizableKind(c.Node.Kind) {
 			continue
 		}
-		isTest, _ := c.Node.Meta["is_test"].(bool)
-		if isTest || !exploreCodeDefinitionKind(c.Node.Kind) {
+		if exploreLocalizationTestLaneNode(searchQuery, c.Node) || !exploreCodeDefinitionKind(c.Node.Kind) {
 			test = append(test, c)
 		} else {
 			prod = append(prod, c)
@@ -4560,6 +4559,23 @@ func exploreQuotedRecallHasExactSourceCandidate(
 	return false
 }
 
+// exploreQuotedRecallCompactTerms reports whether every requested term is a
+// compact source value. Callers test coverage one term at a time, so this is
+// effectively "the term under test is a compact value" — matched against
+// declaration text only, never satisfied by a request-level anchor on an
+// unrelated symbol.
+func exploreQuotedRecallCompactTerms(terms []string) bool {
+	if len(terms) == 0 {
+		return false
+	}
+	for _, term := range terms {
+		if !exploreCompactSourceLiteral(term, utf8.RuneCountInString(term)) {
+			return false
+		}
+	}
+	return true
+}
+
 func exploreQuotedRecallHasExactSourceNode(
 	task string,
 	terms []string,
@@ -4573,7 +4589,14 @@ func exploreQuotedRecallHasExactSourceNode(
 	if exploreDraftIsTestNode(node) && !exploreQueryHasTestIntent(task) {
 		return false
 	}
-	if exploreLocalizationExplicitAnchor(task, node) {
+	// The explicit-anchor short-circuit answers "is this node named by the
+	// request", not "is this term already covered". A compact value — a locale,
+	// protocol, or configuration code — is never a declaration identity, so a
+	// candidate that merely matches some other anchor of the same request must
+	// not mark that value as covered: doing so suppresses the one bounded lane
+	// able to find where the value is registered. Declaration text below still
+	// settles compact coverage exactly as before.
+	if !exploreQuotedRecallCompactTerms(terms) && exploreLocalizationExplicitAnchor(task, node) {
 		return true
 	}
 	retrieval := node.RetrievalMetadata()
@@ -4594,6 +4617,25 @@ func exploreQuotedRecallHasExactSourceNode(
 		}
 	}
 	return false
+}
+
+// exploreLocalizationTestLaneNode reports whether a ranked candidate belongs in
+// the demoted lane. The indexer's is_test stamp is language-dependent and misses
+// test assemblies whose only marker is a path token (a dotted `.Tests.` segment,
+// a `spec/` directory), so the draft detector votes too — unless the request is
+// about test code or names this candidate outright, in which case the test node
+// is the answer and keeps its production slot.
+func exploreLocalizationTestLaneNode(query string, node *graph.Node) bool {
+	if node == nil {
+		return false
+	}
+	if stamped, _ := node.Meta["is_test"].(bool); stamped {
+		return true
+	}
+	if !exploreDraftIsTestNode(node) {
+		return false
+	}
+	return !exploreQueryHasTestIntent(query) && !exploreLocalizationExplicitAnchor(query, node)
 }
 
 func exploreQueryHasTestIntent(task string) bool {
