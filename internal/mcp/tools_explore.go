@@ -3655,6 +3655,17 @@ func buildLocalizationExploreResultForTaskFinalized(
 		seenBody[index] = struct{}{}
 		bodyOrder = append(bodyOrder, index)
 	}
+	// The authorized exact symbol's body is precisely what the prescribed read
+	// would return, so it packs first: shipping it here can retire the round
+	// trip, while a preferred body that loses the slot stays one call away.
+	if envelope.Completion.State == localizationStateNeedsExactRead && requiredSymbol != "" {
+		for index, target := range acceptedTargets {
+			if target.node != nil && target.node.ID == requiredSymbol {
+				appendBodyIndex(index)
+				break
+			}
+		}
+	}
 	for _, preferredID := range preferredBodyIDs {
 		for index, target := range acceptedTargets {
 			if target.node != nil && exploreDraftNodeKey(target.node) == preferredID {
@@ -3686,6 +3697,18 @@ func buildLocalizationExploreResultForTaskFinalized(
 	if len(finalize) > 0 && finalize[0] != nil {
 		envelope.Completion = finalize[0](envelope)
 	}
+	// A prescribed read this envelope already answers buys nothing: the caller
+	// would spend a call to receive the body packed above. Complete instead,
+	// keeping the same evidence and the same lead-alignment bar.
+	satisfiedSymbol := ""
+	if envelope.Completion.State == localizationStateNeedsExactRead &&
+		localizationExactReadSatisfiedByEnvelope(task, envelope) {
+		satisfiedSymbol = envelope.Completion.ExactSymbol
+		satisfied := newLocalizationCompletion(true, "")
+		satisfied.taskLead = envelope.Completion.taskLead
+		satisfied.digest = envelope.Completion.digest
+		envelope.Completion = satisfied
+	}
 	// Strong enforcement is derived only from proof rows that survived final
 	// byte-budget packing. Visible text, retained state, and host metadata then
 	// share this one normalized completion value.
@@ -3702,6 +3725,26 @@ func buildLocalizationExploreResultForTaskFinalized(
 	contract = localizationContractFor(envelope.Completion)
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal
+	// The ready-to-emit answer is derived from the packed rows, so it lands
+	// after the fit checks above and can push the envelope past its budget.
+	// Source bodies are the largest and most recoverable payload, so they are
+	// shed last-first until the enriched envelope is back inside the budget —
+	// except a body that just retired a prescribed read, which is the evidence
+	// the caller would otherwise have spent a call to obtain.
+	for !localizationEnvelopeFits(envelope, maxBytes) {
+		shed := -1
+		for index := range envelope.Evidence {
+			if strings.TrimSpace(envelope.Evidence[index].Source) == "" ||
+				envelope.Evidence[index].ID == satisfiedSymbol {
+				continue
+			}
+			shed = index
+		}
+		if shed < 0 {
+			break
+		}
+		envelope.Evidence[shed].Source = ""
+	}
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil, nil, envelope.Completion

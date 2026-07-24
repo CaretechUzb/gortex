@@ -358,7 +358,7 @@ func TestHandleExploreLocalizeTerminatesEmptyResultAdvisory(t *testing.T) {
 	require.NotNil(t, server.localization.block("search", "symbols", map[string]any{"query": "better anchor"}))
 }
 
-func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testing.T) {
+func TestHandleExploreLocalizeCompletesUnprovenEvidenceWithoutEnforcement(t *testing.T) {
 	server := newExploreQualityServer(t)
 	store, ok := server.graph.(*store_sqlite.Store)
 	require.True(t, ok)
@@ -373,13 +373,18 @@ func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testi
 	require.False(t, result.IsError, text)
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(text), &envelope))
-	require.Equal(t, localizationStateNeedsRecovery, envelope.Completion.State)
+	// Evidence without one of the hard provenance shapes still answers the
+	// request: the page completes, carries its ready-to-emit answer, and only
+	// forfeits enforcement.
+	require.Equal(t, localizationStateAnswerReady, envelope.Completion.State)
 	require.Empty(t, envelope.Completion.ExactSymbol)
-	require.Equal(t, "recover_once", envelope.Completion.RequiredAction)
-	require.Equal(t, 1, envelope.Completion.AllowedToolCalls)
-	require.Equal(t, localizationRecoveryOperations, envelope.Completion.AllowedOperations)
+	require.Equal(t, "respond", envelope.Completion.RequiredAction)
+	require.Equal(t, 0, envelope.Completion.AllowedToolCalls)
+	require.Empty(t, envelope.Completion.AllowedOperations)
 	require.Empty(t, envelope.Completion.AllowedSymbols)
-	require.False(t, envelope.Terminal)
+	require.False(t, envelope.Completion.Enforceable)
+	require.True(t, envelope.Terminal)
+	require.Contains(t, envelope.Completion.FinalResponse, "LOCALIZATION:")
 	require.NotEmpty(t, envelope.Evidence)
 	require.NotEmpty(t, envelope.Symbols)
 
@@ -389,13 +394,15 @@ func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testi
 	preferred := terminal.refinementSymbol
 	authorized := append([]string(nil), terminal.refinementSymbols...)
 	terminal.mu.Unlock()
-	require.Equal(t, localizationStateNeedsRecovery, state)
+	require.Equal(t, localizationStateAnswerReady, state)
 	require.Empty(t, preferred)
 	require.Empty(t, authorized)
+	// Terminal state replays the retained evidence for every later navigation
+	// call instead of authorizing another one.
 	blocked, reserved := terminal.authorize("search", "symbols", map[string]any{"query": "culture route"})
-	require.Nil(t, blocked)
-	require.True(t, reserved)
-	require.Equal(t, localizationStateAnswerReady, terminal.finishReservedRead(true).State)
+	require.NotNil(t, blocked)
+	require.False(t, reserved)
+	require.False(t, blocked.IsError, "post-terminal navigation replays evidence, never errors")
 	candidateRead := map[string]any{"target": map[string]any{"symbol": envelope.Symbols[0]}}
 	blocked, reserved = terminal.authorize("read", "source", candidateRead)
 	require.NotNil(t, blocked)

@@ -1,6 +1,10 @@
 package mcp
 
-import "github.com/zzet/gortex/internal/graph"
+import (
+	"strings"
+
+	"github.com/zzet/gortex/internal/graph"
+)
 
 // Hard terminal enforcement is deliberately narrower than answer readiness.
 // The latter is a ranking decision; the former requires one of these bounded,
@@ -95,6 +99,42 @@ func localizationStrongEvidenceForCompletion(completion localizationCompletion, 
 	return localizationEvidenceProof{}
 }
 
+// localizationExactReadSatisfiedByEnvelope reports whether the single read the
+// completion prescribes would only return evidence this envelope already
+// carries. The authorized symbol must be packed WITH its source body, and that
+// body must clear the same lead-alignment test the reserved read applies when
+// it completes — so completing here accepts exactly what the round trip would.
+func localizationExactReadSatisfiedByEnvelope(task string, envelope localizationExploreEnvelope) bool {
+	symbol := strings.TrimSpace(envelope.Completion.ExactSymbol)
+	if symbol == "" {
+		return false
+	}
+	for _, evidence := range envelope.Evidence {
+		if evidence.ID != symbol {
+			continue
+		}
+		if strings.TrimSpace(evidence.Source) == "" || strings.TrimSpace(evidence.File) == "" {
+			return false
+		}
+		row := localizationDigestRow{
+			Rank:       evidence.Rank,
+			ID:         evidence.ID,
+			Name:       evidence.Name,
+			QualName:   evidence.QualName,
+			Kind:       evidence.Kind,
+			File:       evidence.File,
+			Line:       evidence.Line,
+			Signature:  evidence.Signature,
+			Callers:    append([]string(nil), evidence.Callers...),
+			Callees:    append([]string(nil), evidence.Callees...),
+			Provenance: evidence.Provenance,
+		}
+		return localizationReservedReadEvidenceAlignedWithLead(
+			task, envelope.Completion.taskLead, symbol, []localizationDigestRow{row})
+	}
+	return false
+}
+
 func localizationFinalizeCompletionEvidence(
 	completion localizationCompletion,
 	targets []exploreTarget,
@@ -106,12 +146,11 @@ func localizationFinalizeCompletionEvidence(
 	completion.enforceableOnAnswerReady = false
 	proof := localizationStrongEvidenceForCompletion(completion, targets)
 	if !localizationEvidenceProofVisible(proof, envelope) {
-		if completion.State == localizationStateAnswerReady &&
-			(len(envelope.Evidence) > 0 || len(envelope.Symbols) > 0) {
-			recovery := newLocalizationRecoveryCompletion()
-			recovery.digest = completion.digest
-			return recovery
-		}
+		// A ranked head that is answer-ready stays terminal without one of the
+		// hard provenance shapes. The ranked evidence and its ready-to-emit
+		// answer are already packed into this envelope, so an extra bounded
+		// navigation call only re-reads what the caller can already see. The
+		// proof keeps gating hard enforcement; it no longer gates terminality.
 		return completion
 	}
 	switch completion.State {
