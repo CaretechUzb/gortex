@@ -409,6 +409,38 @@ func toEnvSkills(src []genskills.GeneratedSkill) []agents.GeneratedSkill {
 	return out
 }
 
+// initRepoConfig resolves the layered per-repo config for root exactly the way
+// the daemon does — builtin baseline, the repo's own `.gitignore` (unless
+// `respect_gitignore: false`), global config, and workspace excludes — and
+// returns it with Index.Exclude populated.
+//
+// init previously loaded the config with an empty *config file* path, which
+// carries no repo, so the `.gitignore` layer never ran. indexer.New then saw an
+// empty Index.Exclude and fell back to excludes.Builtin alone, so the init walk
+// admitted gitignored trees (nested worktrees under an ignored directory,
+// generated output) that the daemon's indexer prunes (#324).
+//
+// globalPath is empty in production (the default ~/.gortex/config.yaml); tests
+// pass a temp path so they never read the developer's real global config.
+func initRepoConfig(globalPath, root string, logger *zap.Logger) *config.Config {
+	cm, err := config.NewConfigManager(globalPath)
+	if err != nil {
+		// Preserve the previous best-effort behaviour: an unreadable global
+		// config should not block indexing outright.
+		cfg, loadErr := config.Load("")
+		if loadErr != nil {
+			return &config.Config{}
+		}
+		return cfg
+	}
+	if logger != nil {
+		cm.SetLogger(logger)
+	}
+	prefix := config.ResolvePrefix(config.RepoEntry{Path: root})
+	cm.LoadWorkspaceConfig(prefix, root)
+	return cm.GetRepoConfig(prefix)
+}
+
 // indexRepoForInit runs a one-shot index of the repo. Kept inside
 // cmd/gortex (not an adapter) because the indexer pulls in many
 // gortex-internal packages we'd rather not leak into internal/agents.
@@ -431,10 +463,7 @@ func indexRepoForInit(ctx context.Context, root string, logger *zap.Logger) (gra
 	}
 	defer func() { _ = logger.Sync() }()
 
-	cfg, err := config.Load("")
-	if err != nil {
-		cfg = &config.Config{}
-	}
+	cfg := initRepoConfig("", root, logger)
 
 	tmpDir, err := os.MkdirTemp("", "gortex-init-store-*")
 	if err != nil {
