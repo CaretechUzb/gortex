@@ -595,6 +595,35 @@ func TestExploreBroadWellAlignedNeighborhoodGetsExplicitAnswerReadyContract(t *t
 	if !exploreAnswerReady(task, targets) {
 		t.Fatal("well-aligned hydrated implementation should produce answer_ready for explore(localize)")
 	}
+	if !exploreSingleQualifiedImplementation(task, targets) {
+		t.Fatal("one hydrated implementation above the confidence threshold should be recognized as the only qualified result")
+	}
+	localized := exploreLocalizationCompletion(true, false, task, targets, "")
+	if localized.State != localizationStateLocalized || localized.RequiredAction != "continue_task" {
+		t.Fatalf("single qualified implementation should produce a non-terminal localized cue: %#v", localized)
+	}
+	if contract := localizationContractFor(localized); contract.Terminal || contract.Completion.Enforceable {
+		t.Fatalf("single-result cue must not create a terminal contract: %#v", contract)
+	}
+	if artifact := exploreLocalizationCompletion(true, true, task, targets, ""); artifact.State != localizationStateAnswerReady {
+		t.Fatalf("artifact terminality must retain its existing contract: %#v", artifact)
+	}
+	competitor := exploreTarget{
+		node: &graph.Node{
+			ID:       "internal/mcp/facade_tools.go::dispatchFacadeRoutingSchema",
+			Name:     "dispatchFacadeRoutingSchema",
+			Kind:     graph.KindFunction,
+			FilePath: "internal/mcp/facade_tools.go",
+		},
+		source: "func dispatchFacadeRoutingSchema() { dispatchOperation() }",
+	}
+	multiple := append(targets, competitor)
+	if exploreSingleQualifiedImplementation(task, multiple) {
+		t.Fatal("a second implementation above the same confidence threshold must prevent the single-result cue")
+	}
+	if completion := exploreLocalizationCompletion(true, false, task, multiple, ""); completion.State != localizationStateAnswerReady {
+		t.Fatalf("multiple qualified implementations must retain the existing completion path: %#v", completion)
+	}
 	metadataOnly := targets[0]
 	metadataOnly.conceptImplementation = false
 	metadataOnly.source = ""

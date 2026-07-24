@@ -44,6 +44,14 @@ func TestObserveLocalizationTerminalRequiresExactAnswerReadyV2Contract(t *testin
 		{name: "v1", mutate: func(root map[string]any) { completionMap(root)["contract_version"] = 1 }},
 		{name: "missing final response", mutate: func(root map[string]any) { delete(completionMap(root), "final_response") }},
 		{name: "needs refinement", mutate: func(root map[string]any) { completionMap(root)["state"] = "needs_refinement" }},
+		{name: "localized continue task", mutate: func(root map[string]any) {
+			root["terminal"] = false
+			completion := completionMap(root)
+			completion["state"] = "localized"
+			completion["required_action"] = "continue_task"
+			completion["enforceable"] = false
+			delete(completion, "final_response")
+		}},
 		{name: "wrong scope", mutate: func(root map[string]any) { completionMap(root)["scope"] = "diagnosis" }},
 		{name: "tool allowed", mutate: func(root map[string]any) { completionMap(root)["allowed_tool_calls"] = 1 }},
 		{name: "not terminal", mutate: func(root map[string]any) { root["terminal"] = false }},
@@ -59,6 +67,64 @@ func TestObserveLocalizationTerminalRequiresExactAnswerReadyV2Contract(t *testin
 				t.Fatal("unexpected terminal observation")
 			}
 		})
+	}
+}
+
+func TestLocalizedCompletionCreatesNoTerminalMarker(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	identity := beginTestLocalizationTurn(t, t.Name(), "prompt", t.TempDir())
+	tool := gortexMCPToolPrefix + "explore"
+	toolUseID := "localized-tool"
+	snapshotTestLocalizationTool(t, identity, tool, toolUseID)
+	contract := terminalContractMap()
+	contract["terminal"] = false
+	completion := completionMap(contract)
+	completion["state"] = "localized"
+	completion["required_action"] = "continue_task"
+	completion["enforceable"] = false
+	delete(completion, "final_response")
+	data := localizationPostToolPayload(
+		t, tool, toolUseID, identity, terminalToolResponse(t, contract, true, false),
+	)
+	if output := strings.TrimSpace(captureHookStdout(t, func() { runPostToolUse(data) })); output != "" {
+		t.Fatalf("localized PostToolUse emitted terminal context: %s", output)
+	}
+	if marker, marked := localizationTerminalMarkerFor(identity); marked {
+		t.Fatalf("localized completion created a terminal marker: %#v", marker)
+	}
+
+	t.Setenv(editBlockingEnvVar, "0")
+	nextTools := []struct {
+		name  string
+		input map[string]any
+	}{
+		{name: gortexMCPToolPrefix + "search", input: map[string]any{"operation": "symbols", "query": "registerFacadeTools"}},
+		{name: gortexMCPToolPrefix + "read", input: map[string]any{"operation": "source", "target": map[string]any{"symbol": "pkg/file.go::Run"}}},
+		{name: gortexMCPToolPrefix + "edit", input: map[string]any{"operation": "file", "target": map[string]any{"file": "pkg/file.go"}}},
+		{name: gortexMCPToolPrefix + "change", input: map[string]any{"operation": "impact", "target": map[string]any{"file": "pkg/file.go"}}},
+		{name: "Edit", input: map[string]any{"file_path": filepath.Join(identity.CWD, "notes.txt")}},
+		{name: "Write", input: map[string]any{"file_path": filepath.Join(identity.CWD, "notes.txt")}},
+		{name: "Bash", input: map[string]any{"command": "go build ./cmd/gortex"}},
+		{name: "Bash", input: map[string]any{"command": "go test ./internal/mcp"}},
+	}
+	for index, next := range nextTools {
+		payload := preToolPayload(t, next.name, fmt.Sprintf("next-%d", index), identity, next.input)
+		output := strings.TrimSpace(captureHookStdout(t, func() { runPreToolUse(payload, 0, ModeDeny) }))
+		if output == "" {
+			continue
+		}
+		var decoded HookOutput
+		if err := json.Unmarshal([]byte(output), &decoded); err != nil {
+			t.Fatalf("decode %s PreToolUse output: %v\n%s", next.name, err, output)
+		}
+		if decoded.Decision == "deny" ||
+			(decoded.HookSpecificOutput != nil && decoded.HookSpecificOutput.PermissionDecision == "deny") {
+			t.Fatalf("%s received a denial after localized completion: %#v", next.name, decoded)
+		}
+		if strings.Contains(decoded.Reason, "Localization for this task is complete") ||
+			(decoded.HookSpecificOutput != nil && strings.Contains(decoded.HookSpecificOutput.PermissionDecisionReason, "Localization for this task is complete")) {
+			t.Fatalf("%s received terminal localization guidance after localized completion: %#v", next.name, decoded)
+		}
 	}
 }
 

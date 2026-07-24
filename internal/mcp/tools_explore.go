@@ -1195,6 +1195,34 @@ func exploreDraftSymbol(n *graph.Node) string {
 	return n.Name
 }
 
+// exploreSingleQualifiedImplementation recognizes the narrow case where one
+// hydrated production callable, and only one, satisfies the same evidence
+// threshold that made localization answer-ready. Supporting graph rows may
+// remain visible, but none can independently justify another implementation.
+func exploreSingleQualifiedImplementation(task string, targets []exploreTarget) bool {
+	// This cue is intentionally narrower than answer readiness. The direct
+	// bounded result must contain exactly one hydrated production callable;
+	// supporting graph relations may still be rendered later, but a selected
+	// alternate can never be described as absent merely because it ranked lower.
+	if len(targets) != 1 || len(exploreQuotedRecallTerms(task)) > 0 ||
+		!exploreHydratedProductionCallable(targets[0]) {
+		return false
+	}
+	return exploreAnswerReady(task, targets)
+}
+
+func exploreLocalizationCompletion(
+	answerReady, artifactReady bool,
+	task string,
+	targets []exploreTarget,
+	exactSymbol string,
+) localizationCompletion {
+	if answerReady && !artifactReady && exploreSingleQualifiedImplementation(task, targets) {
+		return newLocalizationSingleResultCompletion()
+	}
+	return newLocalizationCompletion(answerReady, exactSymbol)
+}
+
 // exploreAnswerReady decides whether the ranked head is strong enough to end
 // localization. A result is terminal only when its symbols visibly align with
 // the shaped query; rank alone is not enough because broad review/audit prompts
@@ -2625,7 +2653,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		)
 		return result, nil
 	}
-	completion := newLocalizationCompletion(answerReady, exactSymbol)
+	completion := exploreLocalizationCompletion(
+		answerReady, artifactLane.ready, task, symbolTargets, exactSymbol,
+	)
 	// The digest derives from the same serialized projection the host sees,
 	// and is retained for post-terminal replay — for the exact-read contract
 	// too, whose success promotes to answer_ready with the evidence already
@@ -2654,6 +2684,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			task, refinement.refinementSymbol, refinement.AllowedSymbols, boundedRoutes, refinedDigest,
 		)
 		return refined, nil
+	}
+	if completion.State == localizationStateLocalized {
+		// `localized` is a wire-only confidence cue. Persisting that state would
+		// make the session authorizer treat it as a live contract, so commit the
+		// inactive state and leave every later navigation and coding tool open.
+		s.localizationFor(ctx).keepOpenForTask(task)
+		return result, nil
 	}
 	completion.digest = digest
 	s.localizationFor(ctx).armForTask(completion, task)

@@ -425,6 +425,70 @@ func TestSearchTextCaptureResolvesInScopeOwnerThenFileEvidence(t *testing.T) {
 	}
 }
 
+func TestFacadeLocalizedCompletionStripsAuthWithoutPublishingReceipt(t *testing.T) {
+	t.Setenv("GORTEX_HOOK_SESSION_DIR", t.TempDir())
+	registry := newFacadeRegistry()
+	var server *Server
+	handlerSawAuth := false
+	registry.capture(mcpgo.NewTool("explore", mcpgo.WithString("task", mcpgo.Required())), func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		if arguments, ok := req.Params.Arguments.(map[string]any); ok {
+			_, handlerSawAuth = arguments[localizationauth.ArgumentKey]
+		}
+		completion := newLocalizationSingleResultCompletion()
+		targets := []exploreTarget{{
+			node:   localizationV8Node("internal/mcp/facade_tools.go::registerFacadeTools", "registerFacadeTools", "internal/mcp/facade_tools.go"),
+			source: "func registerFacadeTools() { registerRoutingSchema() }",
+		}}
+		result := newLocalizationExploreResultForTask(
+			completion, req.GetString("task", ""), targets, 1600,
+		)
+		// Exercise the defensive state boundary too: even a caller that arms the
+		// wire-only completion directly must persist inactive navigation state.
+		server.localizationFor(ctx).armForTask(completion, req.GetString("task", ""))
+		return result, nil
+	})
+	server = &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+
+	token, ok := localizationauth.NewToken()
+	if !ok {
+		t.Fatal("could not create localization auth token")
+	}
+	ctx := WithSessionID(context.Background(), "auth_localized_nonterminal")
+	arguments := map[string]any{
+		"operation":                  "localize",
+		"task":                       "investigate facade routing schema registration behavior",
+		localizationauth.ArgumentKey: token,
+	}
+	result, err := server.handleFacade(ctx, "explore", mcpgo.CallToolRequest{
+		Params: mcpgo.CallToolParams{Name: "explore", Arguments: arguments},
+	})
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("localized facade result = (%#v, %v)", result, err)
+	}
+	if handlerSawAuth {
+		t.Fatal("reserved auth argument reached the legacy handler")
+	}
+	if _, exists := arguments[localizationauth.ArgumentKey]; exists {
+		t.Fatal("reserved auth argument survived facade entry")
+	}
+	if _, published := localizationauth.Consume(token); published {
+		t.Fatal("localized completion published a terminal receipt")
+	}
+	host, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	if !ok {
+		t.Fatalf("localized typed host envelope = %T", result.Meta.AdditionalFields[localizationHostMetaKey])
+	}
+	if host.Contract.Terminal || host.Contract.Completion.State != localizationStateLocalized ||
+		host.Contract.Completion.Enforceable || host.Contract.Completion.FinalResponse != "" {
+		t.Fatalf("localized host contract became terminal: %#v", host.Contract)
+	}
+	for _, facade := range []string{"explore", "search", "read", "relations", "trace", "analyze", "edit", "change", "refactor"} {
+		if blocked := server.localizationFor(ctx).block(facade, "anything", nil); blocked != nil {
+			t.Fatalf("%s blocked after localized completion: %#v", facade, blocked)
+		}
+	}
+}
+
 func TestFacadeAuthArgumentIsStrippedAndPublishesTypedTerminalReceipts(t *testing.T) {
 	t.Setenv("GORTEX_HOOK_SESSION_DIR", t.TempDir())
 	registry := newFacadeRegistry()

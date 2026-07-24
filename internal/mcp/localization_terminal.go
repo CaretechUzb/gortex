@@ -18,16 +18,21 @@ const (
 	localizationStateRefineInFlight    = "refinement_in_flight"
 	localizationStateExactReadInFlight = "exact_read_in_flight"
 	localizationStateRecoveryInFlight  = "recovery_in_flight"
+	localizationStateLocalized         = "localized"
 	localizationStateAnswerReady       = "answer_ready"
 	localizationTerminalContractV2     = 2
 )
 
 var localizationRecoveryOperations = []string{"search.text", "search.symbols", "read.source"}
 
+const localizationSingleResultInstruction = "The indexed localization pass is complete for this request. Its bounded evidence contains exactly one supported primary production implementation candidate and no competing direct candidate. Continue the requested coding work using this result. Editing, building, testing, and other task tools remain available; further localization is unnecessary unless they reveal contradictory evidence."
+
 // localizationCompletion is the host-neutral terminality contract returned by
 // explore(operation:"localize"). Hosts may stop the turn from this payload;
 // the server also enforces it for later Gortex navigation calls in the same
-// MCP session.
+// MCP session. AllowedToolCalls bounds only follow-up localization calls
+// prescribed by this completion; it never limits editing, building, testing,
+// or other task-execution tools.
 type localizationCompletion struct {
 	State             string   `json:"state"`
 	Scope             string   `json:"scope"`
@@ -152,6 +157,21 @@ func newLocalizationCompletion(answerReady bool, exactSymbol string) localizatio
 		}
 	}
 	return newLocalizationExactReadCompletion(exactSymbol, false)
+}
+
+// newLocalizationSingleResultCompletion reports that localization has enough
+// unique implementation evidence to continue the task without arming terminal
+// state. The model gets a strong completeness cue, while every coding and
+// navigation tool remains available if later implementation evidence disagrees.
+func newLocalizationSingleResultCompletion() localizationCompletion {
+	return localizationCompletion{
+		State:            localizationStateLocalized,
+		Scope:            "localization",
+		RequiredAction:   "continue_task",
+		Instruction:      localizationSingleResultInstruction,
+		AllowedToolCalls: 0,
+		ContractVersion:  localizationTerminalContractV2,
+	}
 }
 
 func newLocalizationExactReadCompletion(exactSymbol string, correction bool) localizationCompletion {
@@ -327,6 +347,12 @@ func (s *localizationTerminalState) arm(completion localizationCompletion) {
 func (s *localizationTerminalState) armForTask(completion localizationCompletion, task string) {
 	if s == nil {
 		return
+	}
+	// `localized` is a wire-only confidence cue. Normalize it at the state
+	// boundary as a second line of defense so no current or future caller can
+	// accidentally turn the non-blocking cue into an unknown blocking state.
+	if completion.State == localizationStateLocalized {
+		completion = newLocalizationOpenCompletion()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

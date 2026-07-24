@@ -228,6 +228,80 @@ func TestLocalizationCompletionEnvelope(t *testing.T) {
 	}
 }
 
+func TestLocalizationSingleResultCompletionDoesNotArmTerminalState(t *testing.T) {
+	task := "investigate facade routing schema registration dispatch behavior"
+	completion := newLocalizationSingleResultCompletion()
+	targets := []exploreTarget{{
+		node: &graph.Node{
+			ID:        "internal/mcp/facade_tools.go::registerFacadeTools",
+			Name:      "registerFacadeTools",
+			Kind:      graph.KindFunction,
+			FilePath:  "internal/mcp/facade_tools.go",
+			StartLine: 42,
+		},
+		conceptImplementation: true,
+		source:                "func registerFacadeTools() { registerRoutingSchema() }",
+	}}
+	result, _, _, finalized := buildLocalizationExploreResultForTaskFinalized(
+		completion, task, targets, 1600,
+	)
+	text, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("expected one text result: %#v", result)
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("decode localized envelope: %v\n%s", err, text)
+	}
+	if finalized.State != localizationStateLocalized || envelope.Completion.State != localizationStateLocalized ||
+		envelope.Completion.RequiredAction != "continue_task" || envelope.Terminal || envelope.Completion.Enforceable ||
+		envelope.Completion.FinalResponse != "" {
+		t.Fatalf("single-result completion must remain non-terminal: finalized=%#v envelope=%#v", finalized, envelope)
+	}
+	for _, required := range []string{
+		"indexed localization pass is complete",
+		"bounded evidence contains exactly one supported primary production implementation candidate",
+		"no competing direct candidate",
+		"Continue the requested coding work",
+		"Editing, building, testing",
+	} {
+		if !strings.Contains(envelope.Completion.Instruction, required) {
+			t.Fatalf("localized instruction %q does not contain %q", envelope.Completion.Instruction, required)
+		}
+	}
+	for _, forbidden := range []string{"Respond now", "do not call another tool"} {
+		if strings.Contains(envelope.Completion.Instruction, forbidden) || strings.Contains(envelope.Completion.FinalResponse, forbidden) {
+			t.Fatalf("localized completion retained terminal wording %q: %#v", forbidden, envelope.Completion)
+		}
+	}
+	host, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	if !ok {
+		t.Fatalf("localized host envelope missing: %#v", result.Meta)
+	}
+	if host.Contract.Terminal || host.Contract.Completion.State != localizationStateLocalized ||
+		host.Contract.Completion.Enforceable || host.Contract.Completion.FinalResponse != "" {
+		t.Fatalf("localized host contract was terminally enriched: %#v", host.Contract)
+	}
+
+	state := newLocalizationTerminalState()
+	state.arm(newLocalizationCompletion(true, ""))
+	state.armForTask(newLocalizationSingleResultCompletion(), task)
+	state.mu.Lock()
+	persistedState := state.state
+	state.mu.Unlock()
+	if persistedState != localizationStateInactive {
+		t.Fatalf("wire-only localized cue persisted as %q instead of inactive", persistedState)
+	}
+	for _, facade := range []string{
+		"explore", "search", "read", "relations", "trace", "analyze",
+		"change", "edit", "refactor", "workspace", "session", "recall", "remember", "capabilities",
+	} {
+		if blocked := state.block(facade, "anything", nil); blocked != nil {
+			t.Fatalf("%s must remain dispatchable after a localized cue: %#v", facade, blocked)
+		}
+	}
+}
+
 func TestLocalizationEnvelopeRowsStayPositionallyAlignedForDuplicateFiles(t *testing.T) {
 	targets := []exploreTarget{
 		{node: &graph.Node{ID: "repo/pkg/shared.go::First", Name: "First", Kind: graph.KindFunction, FilePath: "pkg/shared.go", StartLine: 10}},
