@@ -87,7 +87,8 @@ type exploreTarget struct {
 	source                string // full body (may be empty for non-source kinds)
 	divergentDefaultOwner bool   // unique child constructor whose concrete default causes the queried behavior
 	divergentDefaultType  bool   // owning type paired with divergentDefaultOwner for coherent file/symbol output
-	conceptImplementation bool   // one identifier-backed callable protected from final truncation
+	conceptImplementation bool   // primary identifier-backed callable; may establish answer readiness
+	conceptComplement     bool   // marginal concept callable protected as evidence, never as terminal proof
 	exactContent          bool   // verified full quoted-literal hit from content_fts
 	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
 	sourceLiteral         bool   // exact source-body hit that must survive final envelope packing
@@ -1593,6 +1594,171 @@ func exploreTerminalTermRoot(term string) string {
 	return term
 }
 
+var exploreConceptComplementLowValueTerms = map[string]struct{}{
+	"arg": {}, "argument": {}, "debug": {}, "diagnostic": {}, "input": {},
+	"line": {}, "log": {}, "output": {}, "path": {}, "read": {},
+	"reader": {}, "search": {}, "trace": {}, "version": {},
+}
+
+// exploreConceptIssueLead returns the report headline carried by the canonical
+// explore query. shapeExploreQuery repeats a multiline headline before the
+// distilled body; inline agent paraphrases keep it as their first sentence.
+func exploreConceptIssueLead(query string) string {
+	lead := strings.TrimSpace(query)
+	if lead == "" {
+		return ""
+	}
+	end := len(lead)
+	for _, separator := range [...]string{"\n", "\r", ". ", "? ", "! ", "; ", " - "} {
+		if index := strings.Index(lead, separator); index >= 12 && index < end {
+			end = index
+		}
+	}
+	return strings.TrimSpace(lead[:end])
+}
+
+// exploreConceptBehavioralTermGroup collapses the bounded inflection family
+// accepted by exploreConceptTermPresent. Each behavioral root can therefore
+// contribute at most one independent issue-lead group.
+func exploreConceptBehavioralTermGroup(term string) string {
+	for _, suffix := range [...]string{"ing", "ed"} {
+		if !strings.HasSuffix(term, suffix) {
+			continue
+		}
+		stem := strings.TrimSuffix(term, suffix)
+		if len(stem) < 5 {
+			continue
+		}
+		if len(stem) > 1 && stem[len(stem)-1] == stem[len(stem)-2] {
+			stem = stem[:len(stem)-1]
+		}
+		return stem
+	}
+	return term
+}
+
+func exploreConceptDiagnosticLiteral(token string) bool {
+	token = strings.Trim(token, "`'\"()[]{}<>,;")
+	if token == "" {
+		return false
+	}
+	if colon := strings.LastIndexByte(token, ':'); colon >= 0 && colon+1 < len(token) {
+		line := token[colon+1:]
+		digits := true
+		for index := 0; index < len(line); index++ {
+			if line[index] < '0' || line[index] > '9' {
+				digits = false
+				break
+			}
+		}
+		if digits {
+			return true
+		}
+	}
+	if !strings.ContainsAny(token, "/\\") {
+		return false
+	}
+	separator := strings.LastIndexAny(token, "/\\")
+	base := token[separator+1:]
+	if colon := strings.LastIndexByte(base, ':'); colon >= 0 {
+		base = base[:colon]
+	}
+	dot := strings.LastIndexByte(base, '.')
+	if dot <= 0 || dot+1 >= len(base) || len(base)-dot-1 > 8 {
+		return false
+	}
+	for index := dot + 1; index < len(base); index++ {
+		value := base[index]
+		if !exploreASCIIAlphaNumeric(value) {
+			return false
+		}
+	}
+	return true
+}
+
+// exploreConceptComplementLowValueTermSet marks structural report noise only
+// for complement selection. The ordinary retrieval and primary implementation
+// ranking retain their established contract.
+func exploreConceptComplementLowValueTermSet(query string) map[string]struct{} {
+	low := make(map[string]struct{}, len(exploreConceptComplementLowValueTerms)+8)
+	for term := range exploreConceptComplementLowValueTerms {
+		low[term] = struct{}{}
+	}
+	for _, token := range strings.Fields(query) {
+		if !exploreConceptDiagnosticLiteral(token) {
+			continue
+		}
+		for _, raw := range rerank.Tokenize(token) {
+			term := exploreTerminalTermRoot(strings.ToLower(strings.TrimSpace(raw)))
+			if len(term) >= 3 {
+				low[term] = struct{}{}
+			}
+		}
+	}
+	return low
+}
+
+func exploreConceptComplementHasTerm(node *graph.Node, term string) bool {
+	if exploreConceptImplementationHasTerm(node, term) {
+		return true
+	}
+	if node == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(node.Name + " " + node.QualName))
+	return exploreConceptTermPresent(text, term)
+}
+
+func exploreConceptCallableFamily(name string) string {
+	for _, raw := range rerank.Tokenize(name) {
+		term := exploreTerminalTermRoot(strings.ToLower(strings.TrimSpace(raw)))
+		if len(term) >= 3 {
+			return exploreConceptBehavioralTermGroup(term)
+		}
+	}
+	return ""
+}
+
+func exploreConceptOwnerFamily(node *graph.Node) string {
+	if node == nil {
+		return ""
+	}
+	owner := strings.TrimSpace(node.QualName)
+	separator := strings.LastIndex(owner, "::")
+	if dot := strings.LastIndexByte(owner, '.'); dot > separator {
+		separator = dot
+	}
+	if separator <= 0 {
+		return ""
+	}
+	return strings.ToLower(owner[:separator])
+}
+
+func exploreConceptComplementFamilyPenalty(node *graph.Node, reserved []*graph.Node) int {
+	if node == nil {
+		return 0
+	}
+	family := exploreConceptCallableFamily(node.Name)
+	owner := exploreConceptOwnerFamily(node)
+	file := strings.ToLower(strings.TrimSpace(node.FilePath))
+	penalty := 0
+	for _, other := range reserved {
+		if other == nil {
+			continue
+		}
+		if family != "" && family == exploreConceptCallableFamily(other.Name) {
+			penalty += 2
+		}
+		if owner != "" && owner == exploreConceptOwnerFamily(other) {
+			penalty += 2
+		}
+		if file != "" && file == strings.ToLower(strings.TrimSpace(other.FilePath)) {
+			penalty++
+		}
+	}
+	return penalty
+}
+
 type exploreConceptImplementationMetric struct {
 	index       int
 	overlap     int
@@ -1602,9 +1768,12 @@ type exploreConceptImplementationMetric struct {
 	matchedMask uint64
 }
 
-// reserveExploreConceptImplementation keeps one identifier-backed callable in
-// the final window without widening retrieval or increasing response size.
-// The semantic head is preserved whenever maxSymbols permits a second slot.
+const exploreConceptComplementSignal = "explore_concept_complement"
+
+// reserveExploreConceptImplementation keeps the strongest identifier-backed
+// callable plus up to two callables that cover distinct task concepts in the
+// final window. Retrieval width and response size remain unchanged. The
+// semantic head stays first; reserved implementations occupy the next slots.
 func reserveExploreConceptImplementation(
 	query string,
 	queryClass rerank.QueryClass,
@@ -1630,6 +1799,7 @@ func reserveExploreConceptImplementation(
 	for term := range queryTermSet {
 		queryTerms = append(queryTerms, term)
 	}
+	sort.Strings(queryTerms)
 	var frequencyStorage [64]int
 	var frequency []int
 	if len(queryTerms) <= len(frequencyStorage) {
@@ -1708,18 +1878,204 @@ func reserveExploreConceptImplementation(
 	if best.index < 0 {
 		return candidates, ""
 	}
+
 	protected := candidates[best.index]
 	targetIndex := 0
 	if maxSymbols > 1 && best.index > 0 {
 		targetIndex = 1
 	}
-	if best.index == targetIndex {
+
+	// Complements are chosen iteratively. Independent behavioral groups from
+	// the issue lead dominate; marginal coverage from the full canonical task
+	// breaks broader ties. Low-value report mechanics can still break a final
+	// tie but cannot authorize a complement by themselves.
+	type complementScore struct {
+		metric             exploreConceptImplementationMetric
+		behavioralMarginal int
+		behavioralTotal    int
+		highMarginal       int
+		marginalRare       int
+		marginalWeight     int
+		marginal           int
+		familyPenalty      int
+		longest            int
+	}
+	lowValue := exploreConceptComplementLowValueTermSet(query)
+	leadTerms := exploreTerminalTerms(exploreConceptIssueLead(query))
+	behavioralGroups := make([]string, len(queryTerms))
+	for index, term := range queryTerms {
+		if _, low := lowValue[term]; low {
+			continue
+		}
+		if _, inLead := leadTerms[term]; inLead {
+			behavioralGroups[index] = exploreConceptBehavioralTermGroup(term)
+		}
+	}
+	complementFrequency := make([]int, len(queryTerms))
+	for _, metric := range metrics {
+		node := candidates[metric.index].Node
+		for index, term := range queryTerms {
+			if exploreConceptComplementHasTerm(node, term) {
+				complementFrequency[index]++
+			}
+		}
+	}
+	coveredTerms := make([]bool, len(queryTerms))
+	coveredBehavior := make(map[string]struct{}, len(leadTerms))
+	markCoverage := func(node *graph.Node) {
+		for index, term := range queryTerms {
+			if !exploreConceptComplementHasTerm(node, term) {
+				continue
+			}
+			coveredTerms[index] = true
+			if group := behavioralGroups[index]; group != "" {
+				coveredBehavior[group] = struct{}{}
+			}
+		}
+	}
+	markCoverage(candidates[0].Node)
+	markCoverage(protected.Node)
+	reservedNodes := []*graph.Node{candidates[0].Node}
+	if protected.Node != candidates[0].Node {
+		reservedNodes = append(reservedNodes, protected.Node)
+	}
+	available := maxSymbols - targetIndex - 1
+	if available > 2 {
+		available = 2
+	}
+	selected := make([]complementScore, 0, max(0, available))
+	selectedIndexes := make(map[int]struct{}, max(0, available))
+	for len(selected) < available {
+		complement := complementScore{metric: exploreConceptImplementationMetric{index: -1}}
+		for _, metric := range metrics {
+			if metric.index == best.index {
+				continue
+			}
+			if _, exists := selectedIndexes[metric.index]; exists {
+				continue
+			}
+			node := candidates[metric.index].Node
+			duplicateCallable := false
+			for _, reserved := range reservedNodes {
+				if reserved != nil && node.Name != "" && strings.EqualFold(node.Name, reserved.Name) {
+					duplicateCallable = true
+					break
+				}
+			}
+			if duplicateCallable {
+				continue
+			}
+
+			score := complementScore{
+				metric:        metric,
+				familyPenalty: exploreConceptComplementFamilyPenalty(node, reservedNodes),
+			}
+			candidateBehavior := make(map[string]struct{}, len(leadTerms))
+			for index, term := range queryTerms {
+				if !exploreConceptComplementHasTerm(node, term) {
+					continue
+				}
+				if group := behavioralGroups[index]; group != "" {
+					candidateBehavior[group] = struct{}{}
+				}
+				if coveredTerms[index] {
+					continue
+				}
+				score.marginal++
+				frequency := complementFrequency[index]
+				if frequency < 1 {
+					frequency = 1
+				}
+				if _, low := lowValue[term]; low {
+					score.marginalWeight++
+					continue
+				}
+				score.highMarginal++
+				score.marginalWeight += 1000 / frequency
+				if frequency == 1 {
+					score.marginalRare++
+				}
+				if len(term) > score.longest {
+					score.longest = len(term)
+				}
+			}
+			score.behavioralTotal = len(candidateBehavior)
+			for group := range candidateBehavior {
+				if _, covered := coveredBehavior[group]; !covered {
+					score.behavioralMarginal++
+				}
+			}
+			if score.behavioralMarginal == 0 && score.highMarginal == 0 {
+				continue
+			}
+			if score.behavioralMarginal < 2 && score.highMarginal < 2 &&
+				(score.longest < 5 || metric.segments < 2) {
+				continue
+			}
+			better := complement.metric.index < 0 ||
+				score.behavioralMarginal > complement.behavioralMarginal ||
+				(score.behavioralMarginal == complement.behavioralMarginal && score.behavioralTotal > complement.behavioralTotal) ||
+				(score.behavioralMarginal == complement.behavioralMarginal && score.behavioralTotal == complement.behavioralTotal && score.highMarginal > complement.highMarginal) ||
+				(score.behavioralMarginal == complement.behavioralMarginal && score.behavioralTotal == complement.behavioralTotal && score.highMarginal == complement.highMarginal && score.marginalWeight > complement.marginalWeight) ||
+				(score.behavioralMarginal == complement.behavioralMarginal && score.behavioralTotal == complement.behavioralTotal && score.highMarginal == complement.highMarginal && score.marginalWeight == complement.marginalWeight && score.marginalRare > complement.marginalRare) ||
+				(score.behavioralMarginal == complement.behavioralMarginal && score.behavioralTotal == complement.behavioralTotal && score.highMarginal == complement.highMarginal && score.marginalWeight == complement.marginalWeight && score.marginalRare == complement.marginalRare && score.marginal > complement.marginal) ||
+				(score.behavioralMarginal == complement.behavioralMarginal && score.behavioralTotal == complement.behavioralTotal && score.highMarginal == complement.highMarginal && score.marginalWeight == complement.marginalWeight && score.marginalRare == complement.marginalRare && score.marginal == complement.marginal && score.familyPenalty < complement.familyPenalty) ||
+				(score.behavioralMarginal == complement.behavioralMarginal && score.behavioralTotal == complement.behavioralTotal && score.highMarginal == complement.highMarginal && score.marginalWeight == complement.marginalWeight && score.marginalRare == complement.marginalRare && score.marginal == complement.marginal && score.familyPenalty == complement.familyPenalty && score.metric.overlap > complement.metric.overlap) ||
+				(score.behavioralMarginal == complement.behavioralMarginal && score.behavioralTotal == complement.behavioralTotal && score.highMarginal == complement.highMarginal && score.marginalWeight == complement.marginalWeight && score.marginalRare == complement.marginalRare && score.marginal == complement.marginal && score.familyPenalty == complement.familyPenalty && score.metric.overlap == complement.metric.overlap && score.longest > complement.longest) ||
+				(score.behavioralMarginal == complement.behavioralMarginal && score.behavioralTotal == complement.behavioralTotal && score.highMarginal == complement.highMarginal && score.marginalWeight == complement.marginalWeight && score.marginalRare == complement.marginalRare && score.marginal == complement.marginal && score.familyPenalty == complement.familyPenalty && score.metric.overlap == complement.metric.overlap && score.longest == complement.longest && score.metric.segments > complement.metric.segments) ||
+				(score.behavioralMarginal == complement.behavioralMarginal && score.behavioralTotal == complement.behavioralTotal && score.highMarginal == complement.highMarginal && score.marginalWeight == complement.marginalWeight && score.marginalRare == complement.marginalRare && score.marginal == complement.marginal && score.familyPenalty == complement.familyPenalty && score.metric.overlap == complement.metric.overlap && score.longest == complement.longest && score.metric.segments == complement.metric.segments && score.metric.index < complement.metric.index)
+			if better {
+				complement = score
+			}
+		}
+		if complement.metric.index < 0 {
+			break
+		}
+		selected = append(selected, complement)
+		selectedIndexes[complement.metric.index] = struct{}{}
+		node := candidates[complement.metric.index].Node
+		markCoverage(node)
+		reservedNodes = append(reservedNodes, node)
+	}
+	if best.index == targetIndex && len(selected) == 0 {
 		return candidates, protected.Node.ID
 	}
+
 	result := append([]*rerank.Candidate(nil), candidates...)
-	if best.index > targetIndex {
-		copy(result[targetIndex+1:best.index+1], result[targetIndex:best.index])
-		result[targetIndex] = protected
+	candidateIndex := func(want *rerank.Candidate) int {
+		for index, candidate := range result {
+			if candidate == want || (candidate != nil && candidate.Node != nil && want != nil && want.Node != nil &&
+				candidate.Node.ID != "" && candidate.Node.ID == want.Node.ID) {
+				return index
+			}
+		}
+		return -1
+	}
+	moveBefore := func(candidate *rerank.Candidate, target int) {
+		current := candidateIndex(candidate)
+		if current < 0 || current <= target || target < 0 || target >= len(result) {
+			return
+		}
+		copy(result[target+1:current+1], result[target:current])
+		result[target] = candidate
+	}
+	moveBefore(protected, targetIndex)
+
+	for offset, complement := range selected {
+		candidate := candidates[complement.metric.index]
+		complementIndex := targetIndex + 1 + offset
+		if complementIndex < maxSymbols && complementIndex < len(result) {
+			moveBefore(candidate, complementIndex)
+		}
+		if index := candidateIndex(candidate); index >= 0 && index < maxSymbols {
+			clone := *result[index]
+			clone.Signals = make(map[string]float64, len(result[index].Signals)+1)
+			for key, value := range result[index].Signals {
+				clone.Signals[key] = value
+			}
+			clone.Signals[exploreConceptComplementSignal] = 1
+			result[index] = &clone
+		}
 	}
 	return result, protected.Node.ID
 }
@@ -2082,7 +2438,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			protectedSyntacticAnchors, protectedImplementationID,
 		)
 	}
-	protectedFinalCandidateIDs := exploreTypedAnchorReservedCandidateIDs(
+	protectedFinalCandidateIDs := exploreFinalReservedCandidateIDs(
 		cands, protectedSyntacticAnchors, protectedImplementationID,
 	)
 	if len(cands) == 0 && len(artifactLane.targets) == 0 {
@@ -2125,6 +2481,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			conceptImplementation: n.ID == protectedImplementationID,
 		}
 		if c.Signals != nil {
+			t.conceptComplement = c.Signals[exploreConceptComplementSignal] > 0
 			t.exactContent = c.Signals[exploreContentRecallExactSignal] > 0
 			t.exactContentAmbiguous = c.Signals[exploreContentRecallAmbiguousSignal] > 0
 			t.sourceLiteral = c.Signals[exploreSourceLiteralSignal] > 0
@@ -2753,6 +3110,21 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 			appendTarget(target)
 		}
 	}
+	// Concept reservations are weaker than exact, source-literal, typed, and
+	// divergent causal evidence, but stronger than draft relations. Keep the
+	// primary and up to two diverse complements adjacent whenever those stronger
+	// contracts leave room; only the primary may establish answer readiness.
+	for _, target := range targets {
+		if target.conceptImplementation {
+			appendTarget(target)
+			break
+		}
+	}
+	for _, target := range targets {
+		if target.conceptComplement {
+			appendTarget(target)
+		}
+	}
 	appendEntry := func(entry exploreDraftEntry) {
 		if entry.node == nil {
 			return
@@ -2789,6 +3161,14 @@ const (
 // came from the same scoped graph walks as the parent target; this helper never
 // performs a new lookup or reconstructs an identity from rendered output.
 func interleaveLocalizationDirectRelations(task, requiredID string, targets []exploreTarget) []exploreTarget {
+	return interleaveLocalizationDirectRelationsWithRoutes(task, requiredID, targets, nil)
+}
+
+func interleaveLocalizationDirectRelationsWithRoutes(
+	task, requiredID string,
+	targets []exploreTarget,
+	routes map[string]localizationRefinementRoute,
+) []exploreTarget {
 	if len(targets) == 0 {
 		return targets
 	}
@@ -2813,11 +3193,12 @@ func interleaveLocalizationDirectRelations(task, requiredID string, targets []ex
 		}
 		direct[target.node.ID] = target
 		if index < localizationDirectEvidenceReserve || target.node.ID == requiredID ||
-			target.divergentDefaultOwner || target.divergentDefaultType || target.conceptImplementation ||
+			target.divergentDefaultOwner || target.divergentDefaultType || target.conceptImplementation || target.conceptComplement ||
 			target.exactContent || target.sourceLiteral || target.typedAnchorProjection {
 			protected[target.node.ID] = struct{}{}
 		}
 		if target.node.ID == requiredID || target.divergentDefaultOwner || target.divergentDefaultType ||
+			target.conceptImplementation || target.conceptComplement ||
 			target.exactContent || target.sourceLiteral || target.typedAnchorProjection {
 			orderedPrefix = index + 1
 		}
@@ -2832,6 +3213,33 @@ func interleaveLocalizationDirectRelations(task, requiredID string, targets []ex
 		orderedPrefix++
 	}
 	terms := exploreTerminalTerms(shapeExploreQuery(task))
+	type refinementPair struct {
+		wrapper        string
+		implementation string
+	}
+	provenWrapperRoutes := make(map[refinementPair]struct{}, len(routes))
+	for symbol, route := range routes {
+		if !route.enforceable {
+			continue
+		}
+		wrapper, implementation := "", ""
+		switch {
+		case route.implementationSymbol != "":
+			wrapper, implementation = symbol, route.implementationSymbol
+		case route.proofSymbol != "":
+			wrapper, implementation = route.proofSymbol, symbol
+		}
+		if wrapper == "" || implementation == "" {
+			continue
+		}
+		if _, wrapperVisible := direct[wrapper]; !wrapperVisible {
+			continue
+		}
+		if _, implementationVisible := direct[implementation]; !implementationVisible {
+			continue
+		}
+		provenWrapperRoutes[refinementPair{wrapper: wrapper, implementation: implementation}] = struct{}{}
+	}
 	selected := make([]exploreTarget, 0, limit)
 	seen := make(map[string]struct{}, limit)
 	appendTarget := func(target exploreTarget) bool {
@@ -2860,6 +3268,12 @@ func interleaveLocalizationDirectRelations(task, requiredID string, targets []ex
 					continue
 				}
 				overlap, longest := exploreDraftTermOverlap(terms, node)
+				_, provenWrapper := provenWrapperRoutes[refinementPair{
+					wrapper: target.node.ID, implementation: node.ID,
+				}]
+				if overlap == 0 && (direction != "direct_callee" || !provenWrapper) {
+					continue
+				}
 				candidate := relationCandidate{
 					node:       node,
 					direction:  direction,
@@ -2891,6 +3305,13 @@ func interleaveLocalizationDirectRelations(task, requiredID string, targets []ex
 		relation, exists := direct[best.node.ID]
 		if !exists {
 			relation = exploreTarget{node: best.node, localizationRelation: best.direction}
+		} else if relation.node.ID != requiredID &&
+			!relation.divergentDefaultOwner && !relation.divergentDefaultType &&
+			!relation.conceptImplementation && !relation.conceptComplement &&
+			!relation.exactContent && !relation.sourceLiteral && !relation.typedAnchorProjection {
+			// A draft-promoted graph neighbor may already be present in the direct
+			// map. Preserve its hydrated data while retaining the relation proof.
+			relation.localizationRelation = best.direction
 		}
 		return relation, true
 	}
@@ -3058,7 +3479,9 @@ func buildLocalizationExploreResultForTaskFinalized(
 	if refinementFirst {
 		targets = prioritizeLocalizationEvidenceTarget(requiredSymbol, targets)
 	}
-	targets = interleaveLocalizationDirectRelations(task, requiredSymbol, targets)
+	targets = interleaveLocalizationDirectRelationsWithRoutes(
+		task, requiredSymbol, targets, completion.refinementRoutes,
+	)
 	contract := localizationContractFor(completion)
 	envelope := localizationExploreEnvelope{
 		Completion: contract.Completion,
@@ -3081,6 +3504,9 @@ func buildLocalizationExploreResultForTaskFinalized(
 			mandatoryCount = index + 1
 		}
 		if target.typedAnchorProjection && index+1 > mandatoryCount {
+			mandatoryCount = index + 1
+		}
+		if (target.conceptImplementation || target.conceptComplement) && index+1 > mandatoryCount {
 			mandatoryCount = index + 1
 		}
 	}
@@ -3231,6 +3657,7 @@ func buildLocalizationExploreResultForTaskFinalized(
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal
 	digest := newLocalizationEvidenceDigest(envelope)
+	envelope.Completion = localizationCompletionBoundedByDigest(envelope.Completion, digest)
 	// The serialized completion, returned state, structuredContent, and host
 	// metadata must carry the same final_response. Build the digest first, then
 	// enrich the one completion value before any wire representation is made.

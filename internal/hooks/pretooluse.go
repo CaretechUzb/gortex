@@ -103,15 +103,27 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	// Terminal enforcement is deliberately the first policy branch. It is a
 	// local marker lookup, so it neither waits for the daemon nor gets bypassed
 	// by permissive permission modes. A new user prompt clears the marker.
-	terminalIdentity, terminalTurnReady := currentLocalizationTurn(input.SessionID, input.PromptID, input.AgentID, input.CWD)
-	if terminalTurnReady && hasLocalizationTerminal(terminalIdentity) {
-		emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
-			HookEventName:            "PreToolUse",
-			PermissionDecision:       "deny",
-			PermissionDecisionReason: localizationTerminalDenyReason,
-		}})
-		localizationTerminalTelemetry("denied", true, started)
-		return
+	terminalTurn, terminalTurnReady := currentLocalizationTurnState(input.SessionID, input.PromptID, input.AgentID, input.CWD)
+	terminalIdentity := terminalTurn.Identity
+	if terminalTurnReady {
+		if marker, marked := localizationTerminalMarkerFor(terminalIdentity); marked {
+			reason := ""
+			switch {
+			case !marker.Advisory:
+				reason = localizationTerminalDenyReason
+			case localizationNavigationTool(input.ToolName):
+				reason = localizationAdvisoryDenyReason
+			}
+			if reason != "" {
+				emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
+					HookEventName:            "PreToolUse",
+					PermissionDecision:       "deny",
+					PermissionDecisionReason: reason,
+				}})
+				localizationTerminalTelemetry("denied", true, started)
+				return
+			}
+		}
 	}
 	localizationAuthToken := ""
 	if terminalTurnReady {
@@ -124,6 +136,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 			localizationAuthToken = authToken
 		}
 	}
+	updatedInput := localizationPreToolUpdatedInput(input, localizationAuthToken, terminalTurn.ProblemStatement)
 
 	// The installed matcher is deliberately broad so terminal state can stop
 	// any tool. With no marker, tools outside the historical access-policy
@@ -159,8 +172,8 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		if adv := gortexReadNudge(input.ToolName, input.ToolInput); adv != "" {
 			hso.AdditionalContext = adv
 		}
-		if localizationAuthToken != "" {
-			hso.UpdatedInput = localizationAuthUpdatedInput(input.ToolInput, localizationAuthToken)
+		if updatedInput != nil {
+			hso.UpdatedInput = updatedInput
 		}
 		emitted = hso.AdditionalContext != "" || hso.PermissionDecisionReason != ""
 		emitPreToolUse(HookOutput{HookSpecificOutput: hso})
@@ -173,10 +186,10 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	// call itself is a no-op pass-through — nothing to enrich.
 	if mode == ModeConsultUnlock && isGortexMCP {
 		markGraphConsulted(input.SessionID)
-		if localizationAuthToken != "" {
+		if updatedInput != nil {
 			emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
 				HookEventName: "PreToolUse",
-				UpdatedInput:  localizationAuthUpdatedInput(input.ToolInput, localizationAuthToken),
+				UpdatedInput:  updatedInput,
 			}})
 		}
 		return
@@ -185,10 +198,10 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	result := applyMode(input, isGortexMCP, mode, enrich(input, gortexPort))
 
 	if result.context == "" && !result.deny {
-		if localizationAuthToken != "" {
+		if updatedInput != nil {
 			emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
 				HookEventName: "PreToolUse",
-				UpdatedInput:  localizationAuthUpdatedInput(input.ToolInput, localizationAuthToken),
+				UpdatedInput:  updatedInput,
 			}})
 		}
 		return
@@ -199,8 +212,8 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 			HookEventName: "PreToolUse",
 		},
 	}
-	if localizationAuthToken != "" {
-		output.HookSpecificOutput.UpdatedInput = localizationAuthUpdatedInput(input.ToolInput, localizationAuthToken)
+	if updatedInput != nil {
+		output.HookSpecificOutput.UpdatedInput = updatedInput
 	}
 
 	if result.deny {

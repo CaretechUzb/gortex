@@ -44,7 +44,8 @@ func TestRunCodexSessionStartUsesManagedOrientationHook(t *testing.T) {
 		t.Fatalf("invalid SessionStart hook output: %s", out)
 	}
 	if !strings.Contains(hso.AdditionalContext, "choose by requested output") ||
-		!strings.Contains(hso.AdditionalContext, "preserve the user's exact technical identifiers") {
+		!strings.Contains(hso.AdditionalContext, "localize task may be concise") ||
+		!strings.Contains(hso.AdditionalContext, "faithfully preserve the issue title") {
 		t.Fatalf("mandatory localization routing orientation missing: %q", hso.AdditionalContext)
 	}
 }

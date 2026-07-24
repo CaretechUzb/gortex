@@ -71,3 +71,64 @@ func TestRunUserPromptSubmitTrivialPromptIsNoOp(t *testing.T) {
 	// Wrong event name is also a no-op.
 	runUserPromptSubmit([]byte(`{"hook_event_name":"SessionStart","prompt":"do something big"}`))
 }
+
+func TestFramedLocalizationProblemStatementPreservesOnlyFramedProblem(t *testing.T) {
+	prompt := "runner metadata\r\n" +
+		"--- BUG REPORT --------------------------------\r\n" +
+		"\r\n" +
+		"Title: Queue entries vanish\r\n" +
+		"\r\n" +
+		"Path: internal/queue/store.go\r\n" +
+		"  keep  interior spacing\r\n" +
+		"\r\n" +
+		"------------------------------------------------\r\n" +
+		"Do not edit. FILES / SYMBOLS / EVIDENCE only."
+
+	got, ok := framedLocalizationProblemStatement(prompt)
+	require.True(t, ok)
+	require.Equal(t, "Title: Queue entries vanish\n\nPath: internal/queue/store.go\n  keep  interior spacing", got)
+	require.NotContains(t, got, "runner metadata")
+	require.NotContains(t, got, "Do not edit")
+}
+
+func TestFramedLocalizationProblemStatementAcceptsApprovedLabels(t *testing.T) {
+	labels := []string{"BUG", "ISSUE REPORT", "problem details", "Production Incident", "FAILURE", "change request"}
+	for _, label := range labels {
+		t.Run(label, func(t *testing.T) {
+			prompt := "=== " + label + "\n\nTitle: Neutral storage behavior\n\n================"
+			got, ok := framedLocalizationProblemStatement(prompt)
+			require.True(t, ok)
+			require.Equal(t, "Title: Neutral storage behavior", got)
+		})
+	}
+}
+
+func TestFramedLocalizationProblemStatementFailsOpen(t *testing.T) {
+	valid := "--- BUG ---\nTitle: One\n----------------"
+	tests := map[string]string{
+		"absent":             "Title: One without framing",
+		"unapproved label":   "--- TASK ---\nTitle: One\n----------------",
+		"unsupported fence":  "___ BUG ___\nTitle: One\n________________",
+		"mismatched closer":  "--- BUG ---\nTitle: One\n================",
+		"short closer":       "--- BUG ---\nTitle: One\n---------------",
+		"short trailing run": "--- BUG --\nTitle: One\n----------------",
+		"empty body":         "--- BUG ---\n\n\t\n----------------",
+		"ambiguous":          valid + "\n" + valid,
+		"interior separator": "--- BUG ---\nTitle: One\n----------------\nMore details\n----------------",
+		"overflow":           "--- BUG ---\n" + strings.Repeat("x", localizationProblemStatementMaxBytes+1) + "\n----------------",
+	}
+	for name, prompt := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, ok := framedLocalizationProblemStatement(prompt)
+			require.False(t, ok)
+			require.Empty(t, got)
+		})
+	}
+}
+
+func TestFramedLocalizationProblemStatementAllowsExactByteLimit(t *testing.T) {
+	statement := strings.Repeat("x", localizationProblemStatementMaxBytes)
+	got, ok := framedLocalizationProblemStatement("--- ISSUE ---\n" + statement + "\n----------------")
+	require.True(t, ok)
+	require.Equal(t, statement, got)
+}

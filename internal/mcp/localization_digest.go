@@ -61,36 +61,47 @@ type localizationDigestRow struct {
 // newLocalizationEvidenceDigest retains only concrete ranked evidence rows.
 // Files and Symbols are rebuilt from those rows, so an item that was shed by
 // the replay limit or byte budget cannot survive as an unsupported answer
-// candidate. The upstream ordering already reserves the strongest direct,
-// exact, literal, and promoted structural targets before lower-ranked fan-out.
+// candidate. Exact and refinement-authorized rows form a stable protected
+// prefix in retained state only; the visible envelope keeps its original order.
 func newLocalizationEvidenceDigest(envelope localizationExploreEnvelope) *localizationEvidenceDigest {
 	digest := &localizationEvidenceDigest{}
+	priorityIDs := localizationDigestPriorityIDs(envelope.Completion, envelope.Evidence)
+
 	seen := make(map[string]struct{}, localizationReplayEvidenceLimit)
-	for _, row := range envelope.Evidence {
-		if len(digest.Evidence) >= localizationReplayEvidenceLimit {
-			break
+	appendRows := func(priority bool) {
+		for _, row := range envelope.Evidence {
+			if len(digest.Evidence) >= localizationReplayEvidenceLimit {
+				return
+			}
+			if row.ID == "" || row.File == "" {
+				continue
+			}
+			_, prioritized := priorityIDs[row.ID]
+			if prioritized != priority {
+				continue
+			}
+			if _, exists := seen[row.ID]; exists {
+				continue
+			}
+			seen[row.ID] = struct{}{}
+			digest.Evidence = append(digest.Evidence, localizationDigestRow{
+				Rank:       row.Rank,
+				ID:         row.ID,
+				Name:       row.Name,
+				QualName:   row.QualName,
+				Kind:       row.Kind,
+				File:       row.File,
+				Line:       row.Line,
+				Signature:  row.Signature,
+				Callers:    append([]string(nil), row.Callers...),
+				Callees:    append([]string(nil), row.Callees...),
+				Provenance: row.Provenance,
+			})
 		}
-		if row.ID == "" || row.File == "" {
-			continue
-		}
-		if _, exists := seen[row.ID]; exists {
-			continue
-		}
-		seen[row.ID] = struct{}{}
-		digest.Evidence = append(digest.Evidence, localizationDigestRow{
-			Rank:       row.Rank,
-			ID:         row.ID,
-			Name:       row.Name,
-			QualName:   row.QualName,
-			Kind:       row.Kind,
-			File:       row.File,
-			Line:       row.Line,
-			Signature:  row.Signature,
-			Callers:    append([]string(nil), row.Callers...),
-			Callees:    append([]string(nil), row.Callees...),
-			Provenance: row.Provenance,
-		})
 	}
+	appendRows(true)
+	appendRows(false)
+
 	for {
 		rebuildLocalizationDigestSkeleton(digest)
 		digest.finalResponse = renderLocalizationFinalResponse(digest.Evidence)
@@ -114,6 +125,39 @@ func newLocalizationEvidenceDigest(envelope localizationExploreEnvelope) *locali
 		}
 		digest.Evidence = digest.Evidence[:last]
 	}
+}
+
+// localizationDigestPriorityIDs protects every identity required to justify a
+// live authorization, not only the identity the client may read. Dependencies
+// still remain subject to the hard byte cap; post-pack reconciliation below
+// removes or downgrades any authorization whose complete proof did not fit.
+func localizationDigestPriorityIDs(completion localizationCompletion, evidence []localizationEvidence) map[string]struct{} {
+	priority := make(map[string]struct{}, 1+len(completion.AllowedSymbols)+len(completion.refinementRoutes)*3)
+	add := func(symbol string) {
+		if symbol = strings.TrimSpace(symbol); symbol != "" {
+			priority[symbol] = struct{}{}
+		}
+	}
+	add(completion.ExactSymbol)
+	for _, symbol := range completion.AllowedSymbols {
+		add(symbol)
+	}
+	for symbol, route := range completion.refinementRoutes {
+		add(symbol)
+		add(route.implementationSymbol)
+		add(route.proofSymbol)
+	}
+	for _, row := range evidence {
+		switch row.Provenance {
+		case localizationProvenanceSourceLiteralCallee,
+			localizationProvenanceDivergentDefault,
+			localizationProvenanceDivergentDefaultType,
+			localizationProvenanceImplementationRoute,
+			localizationProvenanceImplementationTarget:
+			add(row.ID)
+		}
+	}
+	return priority
 }
 
 func cloneLocalizationDigestRows(rows []localizationDigestRow) []localizationDigestRow {
@@ -181,6 +225,132 @@ func mergeLocalizationEvidenceDigest(current []localizationDigestRow, retained *
 	}
 }
 
+const localizationSameOwnerEvidenceReserve = 3
+
+// mergeLocalizationEvidenceDigestForTask preserves a small coherent method
+// cohort around the terminalizing read before byte shedding considers the
+// unrelated tail. It only reorders already-retained rows; cardinality and byte
+// limits remain centralized in mergeLocalizationEvidenceDigest.
+func mergeLocalizationEvidenceDigestForTask(task string, current []localizationDigestRow, retained *localizationEvidenceDigest) *localizationEvidenceDigest {
+	ordered := &localizationEvidenceDigest{Evidence: localizationTaskAwareRetainedRows(task, current, retained)}
+	digest := mergeLocalizationEvidenceDigest(current, ordered)
+	finalResponse := renderLocalizationFinalResponseForTask(task, current, digest.Evidence)
+	if len(finalResponse) <= localizationFinalResponseMaxBytes {
+		digest.finalResponse = finalResponse
+	}
+	return digest
+}
+
+func localizationTaskAwareRetainedRows(task string, current []localizationDigestRow, retained *localizationEvidenceDigest) []localizationDigestRow {
+	if retained == nil || len(retained.Evidence) == 0 {
+		return nil
+	}
+	rows := retained.Evidence
+	ordered := make([]localizationDigestRow, 0, len(rows))
+	selected := make(map[string]struct{}, len(rows)+len(current))
+	ownerKeys := make(map[string]struct{}, len(current))
+	seenFiles := make(map[string]struct{}, len(current))
+	for _, row := range current {
+		if id := strings.TrimSpace(row.ID); id != "" {
+			selected[id] = struct{}{}
+		}
+		if file := strings.TrimSpace(row.File); file != "" {
+			seenFiles[file] = struct{}{}
+		}
+		if key := localizationDigestRowOwnerKey(row); key != "" {
+			ownerKeys[key] = struct{}{}
+		}
+	}
+	appendWhere := func(limit int, keep func(localizationDigestRow) bool) {
+		added := 0
+		for _, row := range rows {
+			id := strings.TrimSpace(row.ID)
+			if id == "" {
+				continue
+			}
+			if _, exists := selected[id]; exists || !keep(row) {
+				continue
+			}
+			selected[id] = struct{}{}
+			ordered = append(ordered, row)
+			if file := strings.TrimSpace(row.File); file != "" {
+				seenFiles[file] = struct{}{}
+			}
+			added++
+			if limit > 0 && added == limit {
+				return
+			}
+		}
+	}
+	sameOwner := func(row localizationDigestRow) bool {
+		key := localizationDigestRowOwnerKey(row)
+		_, exists := ownerKeys[key]
+		return key != "" && exists
+	}
+	appendWhere(0, func(row localizationDigestRow) bool {
+		return localizationDigestRowTaskCited(task, row)
+	})
+	appendWhere(localizationSameOwnerEvidenceReserve, sameOwner)
+	taskTerms := exploreTerminalTerms(task)
+	appendWhere(0, func(row localizationDigestRow) bool {
+		return !sameOwner(row) && localizationDigestRowTaskAligned(task, taskTerms, row)
+	})
+	appendWhere(0, func(row localizationDigestRow) bool {
+		_, seen := seenFiles[strings.TrimSpace(row.File)]
+		return !seen
+	})
+	appendWhere(0, func(localizationDigestRow) bool { return true })
+	return ordered
+}
+
+func localizationDigestRowTaskCited(task string, row localizationDigestRow) bool {
+	for _, value := range []string{row.ID, row.Name, row.QualName, row.File, row.Signature} {
+		if localizationTaskCitesConcreteEvidence(task, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func localizationDigestRowTaskAligned(task string, taskTerms map[string]struct{}, row localizationDigestRow) bool {
+	if localizationDigestRowTaskCited(task, row) {
+		return true
+	}
+	values := []string{row.ID, row.Name, row.QualName, row.File, row.Signature}
+	for term := range exploreTerminalTerms(strings.Join(values, " ")) {
+		if _, aligned := taskTerms[term]; aligned {
+			return true
+		}
+	}
+	return false
+}
+
+func localizationDigestRowOwnerKey(row localizationDigestRow) string {
+	if !strings.EqualFold(strings.TrimSpace(row.Kind), "method") {
+		return ""
+	}
+	file := strings.TrimSpace(row.File)
+	owner := strings.TrimSpace(row.QualName)
+	if owner == "" {
+		owner = strings.TrimSpace(row.ID)
+		if prefix := file + "::"; file != "" && strings.HasPrefix(owner, prefix) {
+			owner = strings.TrimPrefix(owner, prefix)
+		}
+	}
+	if cut := strings.LastIndex(owner, "."); cut > 0 {
+		owner = owner[:cut]
+	} else if cut := strings.LastIndex(owner, "::"); cut > 0 {
+		owner = owner[:cut]
+	} else {
+		return ""
+	}
+	owner = strings.TrimSpace(owner)
+	if file == "" || owner == "" {
+		return ""
+	}
+	return file + "\x00" + owner
+}
+
 func shedLocalizationDigestRowOptionalFields(row *localizationDigestRow) bool {
 	if row == nil {
 		return false
@@ -223,35 +393,412 @@ func localizationFinalResponseField(value string) string {
 	return strings.Join(strings.Fields(value), " ")
 }
 
-func renderLocalizationFinalResponse(rows []localizationDigestRow) string {
-	if len(rows) == 0 {
-		return "FILES:\n(none)\n\nSYMBOLS:\n(none)\n\nEVIDENCE:\nNo bounded localization evidence was found.\n\n" + localizationAnswerReadyDirective
+const (
+	localizationFinalResponsePrimaryLimit    = 3
+	localizationFinalResponseSupportingLimit = 4
+)
+
+type localizationFinalResponseRow struct {
+	row     localizationDigestRow
+	primary bool
+}
+
+type localizationFinalResponseTaskScore struct {
+	matched  int
+	longest  int
+	callable bool
+}
+
+func localizationFinalResponsePrimaryProvenance(provenance string) bool {
+	switch provenance {
+	case localizationProvenanceSourceLiteralCallee,
+		localizationProvenanceDivergentDefault,
+		localizationProvenanceImplementationTarget,
+		localizationProvenanceTypedAnchorProjection:
+		return true
+	default:
+		return false
 	}
-	var response strings.Builder
-	response.WriteString("FILES:\n")
-	for index, row := range rows {
-		fmt.Fprintf(&response, "#%d %s\n", index+1, localizationFinalResponseField(row.File))
+}
+
+func localizationFinalResponseSupportingProvenance(provenance string) bool {
+	switch provenance {
+	case localizationProvenanceDivergentDefaultType,
+		localizationProvenanceImplementationRoute,
+		"direct_caller", "direct_callee":
+		return true
+	default:
+		return false
 	}
-	response.WriteString("\nSYMBOLS:\n")
-	for index, row := range rows {
-		fmt.Fprintf(&response, "#%d %s\n", index+1, localizationFinalResponseField(row.ID))
+}
+
+func localizationFinalResponseIdentifierText(row localizationDigestRow) string {
+	id := strings.TrimSpace(row.ID)
+	if cut := strings.LastIndex(id, "::"); cut >= 0 {
+		id = id[cut+2:]
 	}
-	response.WriteString("\nEVIDENCE:\n")
-	for index, row := range rows {
-		file := localizationFinalResponseField(row.File)
-		id := localizationFinalResponseField(row.ID)
-		if row.Line > 0 {
-			fmt.Fprintf(&response, "#%d %s:%d — %s\n", index+1, file, row.Line, id)
+	return strings.ToLower(strings.Join([]string{row.Name, row.QualName, id}, " "))
+}
+
+func scoreLocalizationFinalResponseTask(taskTerms map[string]struct{}, row localizationDigestRow) localizationFinalResponseTaskScore {
+	score := localizationFinalResponseTaskScore{
+		callable: strings.EqualFold(strings.TrimSpace(row.Kind), "function") ||
+			strings.EqualFold(strings.TrimSpace(row.Kind), "method"),
+	}
+	text := localizationFinalResponseIdentifierText(row)
+	for term := range taskTerms {
+		if !exploreConceptTermPresent(text, term) {
 			continue
 		}
-		fmt.Fprintf(&response, "#%d %s — %s\n", index+1, file, id)
+		score.matched++
+		if len(term) > score.longest {
+			score.longest = len(term)
+		}
+	}
+	return score
+}
+
+func localizationFinalResponseBetterTaskScore(left, right localizationFinalResponseTaskScore) bool {
+	if left.matched != right.matched {
+		return left.matched > right.matched
+	}
+	if left.callable != right.callable {
+		return left.callable
+	}
+	return left.longest > right.longest
+}
+
+func localizationFinalResponseNeighborContains(ids []string, id string) bool {
+	for _, candidate := range ids {
+		if strings.TrimSpace(candidate) == id {
+			return true
+		}
+	}
+	return false
+}
+
+func localizationFinalResponseDirectRelation(row localizationDigestRow, primaries []localizationDigestRow) bool {
+	if localizationFinalResponseSupportingProvenance(row.Provenance) {
+		return true
+	}
+	id := strings.TrimSpace(row.ID)
+	for _, primary := range primaries {
+		primaryID := strings.TrimSpace(primary.ID)
+		if localizationFinalResponseNeighborContains(primary.Callers, id) ||
+			localizationFinalResponseNeighborContains(primary.Callees, id) ||
+			localizationFinalResponseNeighborContains(row.Callers, primaryID) ||
+			localizationFinalResponseNeighborContains(row.Callees, primaryID) {
+			return true
+		}
+	}
+	return false
+}
+
+// localizationFinalResponseRows selects a bounded model-facing projection
+// without changing the retained evidence rows or their positional JSON arrays.
+func localizationFinalResponseRows(task string, current, rows []localizationDigestRow) []localizationFinalResponseRow {
+	if len(rows) == 0 {
+		return nil
+	}
+	primaries := make([]localizationDigestRow, 0, localizationFinalResponsePrimaryLimit)
+	supporting := make([]localizationDigestRow, 0, localizationFinalResponseSupportingLimit)
+	selected := make(map[string]struct{}, localizationFinalResponsePrimaryLimit+localizationFinalResponseSupportingLimit)
+	appendRow := func(dst *[]localizationDigestRow, limit int, row localizationDigestRow) bool {
+		id := strings.TrimSpace(row.ID)
+		if id == "" || strings.TrimSpace(row.File) == "" || len(*dst) >= limit {
+			return false
+		}
+		if _, exists := selected[id]; exists {
+			return false
+		}
+		selected[id] = struct{}{}
+		*dst = append(*dst, row)
+		return true
+	}
+
+	rowsByID := make(map[string]localizationDigestRow, len(rows))
+	for _, row := range rows {
+		rowsByID[strings.TrimSpace(row.ID)] = row
+	}
+	// A successful authorized read is the freshest bounded evidence and leads
+	// the presentation even when its retained predecessor carried more metadata.
+	for _, row := range current {
+		if retained, exists := rowsByID[strings.TrimSpace(row.ID)]; exists {
+			appendRow(&primaries, localizationFinalResponsePrimaryLimit, retained)
+		}
+	}
+	for _, row := range rows {
+		if localizationFinalResponsePrimaryProvenance(row.Provenance) {
+			appendRow(&primaries, localizationFinalResponsePrimaryLimit, row)
+		}
+	}
+
+	taskTerms := exploreTerminalTerms(task)
+	ownerKeys := make(map[string]struct{}, len(current))
+	for _, row := range current {
+		key := localizationDigestRowOwnerKey(row)
+		if key == "" {
+			if retained, exists := rowsByID[strings.TrimSpace(row.ID)]; exists {
+				key = localizationDigestRowOwnerKey(retained)
+			}
+		}
+		if key != "" {
+			ownerKeys[key] = struct{}{}
+		}
+	}
+	bestSameOwner := -1
+	var bestSameOwnerScore localizationFinalResponseTaskScore
+	if len(primaries) < localizationFinalResponsePrimaryLimit && len(ownerKeys) > 0 {
+		for index, row := range rows {
+			if _, exists := selected[strings.TrimSpace(row.ID)]; exists {
+				continue
+			}
+			key := localizationDigestRowOwnerKey(row)
+			if _, sameOwner := ownerKeys[key]; key == "" || !sameOwner {
+				continue
+			}
+			score := scoreLocalizationFinalResponseTask(taskTerms, row)
+			if bestSameOwner < 0 || localizationFinalResponseBetterTaskScore(score, bestSameOwnerScore) {
+				bestSameOwner, bestSameOwnerScore = index, score
+			}
+		}
+		if bestSameOwner >= 0 {
+			appendRow(&primaries, localizationFinalResponsePrimaryLimit, rows[bestSameOwner])
+		}
+	}
+
+	bestTaskMatch := -1
+	var bestTaskScore localizationFinalResponseTaskScore
+	if len(primaries) < localizationFinalResponsePrimaryLimit && len(taskTerms) > 0 {
+		for index, row := range rows {
+			if _, exists := selected[strings.TrimSpace(row.ID)]; exists {
+				continue
+			}
+			score := scoreLocalizationFinalResponseTask(taskTerms, row)
+			if score.matched == 0 {
+				continue
+			}
+			if bestTaskMatch < 0 || localizationFinalResponseBetterTaskScore(score, bestTaskScore) {
+				bestTaskMatch, bestTaskScore = index, score
+			}
+		}
+		if bestTaskMatch >= 0 {
+			appendRow(&primaries, localizationFinalResponsePrimaryLimit, rows[bestTaskMatch])
+		}
+	}
+	for _, row := range rows {
+		appendRow(&primaries, localizationFinalResponsePrimaryLimit, row)
+	}
+
+	for _, row := range rows {
+		if localizationFinalResponseDirectRelation(row, primaries) {
+			appendRow(&supporting, localizationFinalResponseSupportingLimit, row)
+		}
+	}
+	for _, row := range rows {
+		appendRow(&supporting, localizationFinalResponseSupportingLimit, row)
+	}
+
+	presented := make([]localizationFinalResponseRow, 0, len(primaries)+len(supporting))
+	for _, row := range primaries {
+		presented = append(presented, localizationFinalResponseRow{row: row, primary: true})
+	}
+	for _, row := range supporting {
+		presented = append(presented, localizationFinalResponseRow{row: row})
+	}
+	return presented
+}
+
+func renderLocalizationFinalResponse(rows []localizationDigestRow) string {
+	return renderLocalizationFinalResponseForTask("", nil, rows)
+}
+
+func renderLocalizationFinalResponseForTask(task string, current, rows []localizationDigestRow) string {
+	presented := localizationFinalResponseRows(task, current, rows)
+	if len(presented) == 0 {
+		return "LOCALIZATION:\nNo bounded localization evidence was found.\n\n" + localizationAnswerReadyDirective
+	}
+	var response strings.Builder
+	response.WriteString("LOCALIZATION:\n")
+	for _, item := range presented {
+		role := "SUPPORTING"
+		if item.primary {
+			role = "PRIMARY"
+		}
+		file := localizationFinalResponseField(item.row.File)
+		id := localizationFinalResponseField(item.row.ID)
+		if item.row.Line > 0 {
+			fmt.Fprintf(&response, "- %s — %s:%d — %s\n", role, file, item.row.Line, id)
+			continue
+		}
+		fmt.Fprintf(&response, "- %s — %s — %s\n", role, file, id)
 	}
 	response.WriteString("\n")
 	response.WriteString(localizationAnswerReadyDirective)
 	return response.String()
 }
 
-const localizationAnswerReadyDirective = "You already hold the localization answer — respond now using this evidence; do not call another tool."
+const localizationAnswerReadyDirective = "Localization for this task is complete. Respond now using this evidence; do not call another tool."
+
+func localizationDigestRowsByID(digest *localizationEvidenceDigest) map[string]localizationDigestRow {
+	retained := make(map[string]localizationDigestRow)
+	if digest == nil {
+		return retained
+	}
+	for _, row := range digest.Evidence {
+		if symbol := strings.TrimSpace(row.ID); symbol != "" {
+			retained[symbol] = row
+		}
+	}
+	return retained
+}
+
+func localizationDigestHasProvenance(rows map[string]localizationDigestRow, provenance string) bool {
+	for _, row := range rows {
+		if row.Provenance == provenance {
+			return true
+		}
+	}
+	return false
+}
+
+func localizationDigestStrongProofRetained(rows map[string]localizationDigestRow, symbol string) bool {
+	row, exists := rows[strings.TrimSpace(symbol)]
+	if !exists {
+		return false
+	}
+	switch row.Provenance {
+	case localizationProvenanceSourceLiteralCallee:
+		return true
+	case localizationProvenanceDivergentDefault:
+		return localizationDigestHasProvenance(rows, localizationProvenanceDivergentDefaultType)
+	case localizationProvenanceImplementationRoute:
+		return localizationDigestHasProvenance(rows, localizationProvenanceImplementationTarget)
+	case localizationProvenanceImplementationTarget:
+		return localizationDigestHasProvenance(rows, localizationProvenanceImplementationRoute)
+	default:
+		return false
+	}
+}
+
+func localizationDigestAnyStrongProofRetained(rows map[string]localizationDigestRow) bool {
+	for symbol := range rows {
+		if localizationDigestStrongProofRetained(rows, symbol) {
+			return true
+		}
+	}
+	return false
+}
+
+// localizationDigestReconcileRoute preserves a concrete advisory read when its
+// optional proof was shed, but never preserves a generic-wrapper hop without
+// the concrete implementation that makes the route useful.
+func localizationDigestReconcileRoute(
+	symbol string,
+	route localizationRefinementRoute,
+	rows map[string]localizationDigestRow,
+) (localizationRefinementRoute, bool) {
+	row, retained := rows[symbol]
+	if !retained {
+		return localizationRefinementRoute{}, false
+	}
+	if route.implementationSymbol != "" {
+		implementation, implementationRetained := rows[route.implementationSymbol]
+		if !implementationRetained {
+			return localizationRefinementRoute{}, false
+		}
+		if route.enforceable && (row.Provenance != localizationProvenanceImplementationRoute ||
+			implementation.Provenance != localizationProvenanceImplementationTarget) {
+			route.enforceable = false
+		}
+	}
+	if route.proofSymbol != "" {
+		proof, proofRetained := rows[route.proofSymbol]
+		if !proofRetained || proof.Provenance != localizationProvenanceImplementationRoute ||
+			row.Provenance != localizationProvenanceImplementationTarget {
+			route.proofSymbol = ""
+			route.enforceable = false
+		}
+	}
+	if route.enforceable && route.implementationSymbol == "" && route.proofSymbol == "" &&
+		row.Provenance != localizationProvenanceSourceLiteralCallee {
+		route.enforceable = false
+	}
+	return route, true
+}
+
+func localizationCompletionBoundedByDigest(completion localizationCompletion, digest *localizationEvidenceDigest) localizationCompletion {
+	if digest == nil {
+		return completion
+	}
+	retained := localizationDigestRowsByID(digest)
+	advisory := func() localizationCompletion {
+		bounded := newLocalizationCompletion(true, "")
+		bounded.taskLead = completion.taskLead
+		return bounded
+	}
+
+	switch completion.State {
+	case localizationStateAnswerReady:
+		if completion.Enforceable && !localizationDigestAnyStrongProofRetained(retained) {
+			completion.Enforceable = false
+		}
+	case localizationStateNeedsExactRead:
+		if _, exists := retained[completion.ExactSymbol]; !exists || completion.ExactSymbol == "" {
+			return advisory()
+		}
+		if completion.enforceableOnAnswerReady &&
+			!localizationDigestStrongProofRetained(retained, completion.ExactSymbol) {
+			completion.enforceableOnAnswerReady = false
+		}
+	case localizationStateNeedsRefinement:
+		allowed := make([]string, 0, len(completion.AllowedSymbols))
+		seen := make(map[string]struct{}, len(completion.AllowedSymbols))
+		var routes map[string]localizationRefinementRoute
+		if len(completion.refinementRoutes) > 0 {
+			routes = make(map[string]localizationRefinementRoute, len(completion.refinementRoutes))
+		}
+		for _, symbol := range completion.AllowedSymbols {
+			symbol = strings.TrimSpace(symbol)
+			if symbol == "" {
+				continue
+			}
+			if _, exists := retained[symbol]; !exists {
+				continue
+			}
+			if _, duplicate := seen[symbol]; duplicate {
+				continue
+			}
+			if route, exists := completion.refinementRoutes[symbol]; exists {
+				reconciled, usable := localizationDigestReconcileRoute(symbol, route, retained)
+				if !usable {
+					continue
+				}
+				routes[symbol] = reconciled
+			}
+			seen[symbol] = struct{}{}
+			allowed = append(allowed, symbol)
+		}
+		if len(allowed) == 0 {
+			return advisory()
+		}
+		preferred := strings.TrimSpace(completion.refinementSymbol)
+		if _, exists := seen[preferred]; !exists {
+			preferred = allowed[0]
+		}
+		bounded := newLocalizationRefinementCompletionForSymbols(preferred, allowed)
+		bounded.enforceableOnAnswerReady = completion.enforceableOnAnswerReady
+		bounded.taskLead = completion.taskLead
+		if routes != nil {
+			bounded.refinementRoutes = routes
+			bounded.correctionSymbol, bounded.correctionRoute = localizationRankedCorrection(
+				preferred, allowed, bounded.refinementRoutes,
+			)
+		}
+		return bounded
+	}
+	return completion
+}
 
 func localizationCompletionWithDigest(completion localizationCompletion, digest *localizationEvidenceDigest) localizationCompletion {
 	if digest == nil {

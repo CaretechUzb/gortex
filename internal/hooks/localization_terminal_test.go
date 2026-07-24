@@ -157,6 +157,15 @@ func TestPostToolUseObservesMatchingFinalResponseContract(t *testing.T) {
 	if !strings.Contains(output, localizationTerminalContext) {
 		t.Fatalf("PostToolUse output %q does not contain terminal context", output)
 	}
+	for _, required := range []string{
+		"Localization for this task is complete",
+		"completion.final_response",
+		"do not call another tool",
+	} {
+		if !strings.Contains(output, required) {
+			t.Fatalf("PostToolUse output %q does not contain %q", output, required)
+		}
+	}
 }
 
 func TestPostToolUseAnswerReadyEventAuthenticationAndJSONShape(t *testing.T) {
@@ -256,14 +265,38 @@ func TestLocalizationTerminalHookFlowDeniesThenPromptRotatesTurn(t *testing.T) {
 		t.Fatalf("PostToolUse output %q does not contain fixed terminal context", postOutput)
 	}
 
-	pre := preToolPayload(t, "WebSearch", "", identity, nil)
-	preOutput := captureHookStdout(t, func() { runPreToolUse(pre, 0, ModeDeny) })
-	var output HookOutput
-	if err := json.Unmarshal([]byte(preOutput), &output); err != nil {
-		t.Fatalf("decode PreToolUse output %q: %v", preOutput, err)
-	}
-	if output.HookSpecificOutput == nil || output.HookSpecificOutput.PermissionDecision != "deny" {
-		t.Fatalf("expected all-tool terminal deny, got %#v", output)
+	for _, tt := range []struct {
+		name  string
+		tool  string
+		input map[string]any
+	}{
+		{name: "web search", tool: "WebSearch"},
+		{name: "host read", tool: "Read", input: map[string]any{"file_path": "repo/source.go"}},
+		{name: "host grep", tool: "Grep", input: map[string]any{"pattern": "Target", "path": "repo"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pre := preToolPayload(t, tt.tool, "", identity, tt.input)
+			preOutput := captureHookStdout(t, func() { runPreToolUse(pre, 0, ModeDeny) })
+			var output HookOutput
+			if err := json.Unmarshal([]byte(preOutput), &output); err != nil {
+				t.Fatalf("decode PreToolUse output %q: %v", preOutput, err)
+			}
+			if output.HookSpecificOutput == nil || output.HookSpecificOutput.PermissionDecision != "deny" {
+				t.Fatalf("expected all-tool terminal deny, got %#v", output)
+			}
+			if got := output.HookSpecificOutput.PermissionDecisionReason; got != localizationTerminalDenyReason {
+				t.Fatalf("terminal deny reason = %q, want %q", got, localizationTerminalDenyReason)
+			}
+			for _, required := range []string{
+				"Localization for this task is complete",
+				"retained evidence",
+				"do not call another tool",
+			} {
+				if !strings.Contains(output.HookSpecificOutput.PermissionDecisionReason, required) {
+					t.Fatalf("terminal deny reason %q does not contain %q", output.HookSpecificOutput.PermissionDecisionReason, required)
+				}
+			}
+		})
 	}
 
 	beginTestLocalizationTurn(t, sessionID, "prompt-2", cwd)

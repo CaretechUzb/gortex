@@ -25,8 +25,9 @@ const (
 	localizationTerminalAgentHardCap    = 64
 	localizationTerminalJanitorDeletes  = 32
 
-	localizationTerminalContext    = "[Gortex] Localization is answer-ready. Respond now using the current Gortex tool result and completion.final_response. Do not call native tools or any other tool in this turn."
-	localizationTerminalDenyReason = "[Gortex] Localization is complete. Respond to the user now; no further tool calls are allowed in this turn."
+	localizationTerminalContext    = "[Gortex] Localization for this task is complete. Respond now using completion.final_response; do not call another tool."
+	localizationTerminalDenyReason = "[Gortex] Localization for this task is complete, so this tool call is blocked. Respond now using the retained evidence; do not call another tool."
+	localizationAdvisoryDenyReason = "[Gortex] Localization for this task is complete, so this additional Gortex navigation call was not run. Respond now using the retained evidence; do not call another tool."
 	gortexPluginMCPToolPrefix      = "mcp__plugin_gortex_gortex__"
 	localizationHostMetaKey        = "gortex/localization"
 )
@@ -65,9 +66,10 @@ type localizationTerminalIdentity struct {
 }
 
 type localizationTurnState struct {
-	Version         int                          `json:"version"`
-	Identity        localizationTerminalIdentity `json:"identity"`
-	CreatedUnixNano int64                        `json:"created_unix_nano"`
+	Version          int                          `json:"version"`
+	Identity         localizationTerminalIdentity `json:"identity"`
+	ProblemStatement string                       `json:"problem_statement,omitempty"`
+	CreatedUnixNano  int64                        `json:"created_unix_nano"`
 }
 
 type localizationToolSnapshot struct {
@@ -84,18 +86,22 @@ type localizationTerminalMarker struct {
 	ContractVersion  int                          `json:"contract_version"`
 	Identity         localizationTerminalIdentity `json:"identity"`
 	ObservedUnixNano int64                        `json:"observed_unix_nano"`
+	Advisory         bool                         `json:"advisory,omitempty"`
 }
 
 type localizationTerminalHookInput struct {
-	HookEventName   string                   `json:"hook_event_name"`
-	ToolName        string                   `json:"tool_name"`
-	ToolUseID       string                   `json:"tool_use_id"`
-	SessionID       string                   `json:"session_id"`
-	PromptID        string                   `json:"prompt_id"`
-	AgentID         string                   `json:"agent_id"`
-	CWD             string                   `json:"cwd"`
-	ToolResponse    json.RawMessage          `json:"tool_response"`
-	TerminalReceipt localizationauth.Receipt `json:"-"`
+	HookEventName    string                       `json:"hook_event_name"`
+	ToolName         string                       `json:"tool_name"`
+	ToolUseID        string                       `json:"tool_use_id"`
+	ToolInput        map[string]any               `json:"tool_input"`
+	SessionID        string                       `json:"session_id"`
+	PromptID         string                       `json:"prompt_id"`
+	AgentID          string                       `json:"agent_id"`
+	CWD              string                       `json:"cwd"`
+	Prompt           string                       `json:"prompt"`
+	ToolResponse     json.RawMessage              `json:"tool_response"`
+	TerminalReceipt  localizationauth.Receipt     `json:"-"`
+	TerminalIdentity localizationTerminalIdentity `json:"-"`
 }
 
 type localizationTerminalCompletion struct {
@@ -142,8 +148,12 @@ func observeLocalizationTerminal(data []byte) (localizationTerminalHookInput, bo
 		return localizationTerminalHookInput{}, false
 	}
 	identity, authToken, ok := consumeLocalizationToolSnapshot(input)
-	if !ok {
+	if !ok || !localizationTerminalIdentityCurrent(identity) {
 		return localizationTerminalHookInput{}, false
+	}
+	input.TerminalIdentity = identity
+	if localizationProblemTaskRequest(input.ToolName, input.ToolInput) {
+		_ = clearLocalizationProblemStatement(identity)
 	}
 
 	// Claude's real PostToolUse wire strips MCP _meta and structuredContent.
@@ -152,7 +162,7 @@ func observeLocalizationTerminal(data []byte) (localizationTerminalHookInput, bo
 	// PreToolUse snapshot. Visible tool JSON is never an authority on this path.
 	if authToken != "" {
 		if receipt, authenticated := localizationauth.Consume(authToken); authenticated {
-			if receipt.Enforceable && !markLocalizationTerminal(identity, receipt.ContractVersion) {
+			if !markLocalizationTerminalReceipt(identity, receipt.ContractVersion, receipt.Enforceable) {
 				return localizationTerminalHookInput{}, false
 			}
 			input.TerminalReceipt = receipt
@@ -167,7 +177,7 @@ func observeLocalizationTerminal(data []byte) (localizationTerminalHookInput, bo
 	if !ok || !answerReadyLocalizationTerminalContract(contract) {
 		return localizationTerminalHookInput{}, false
 	}
-	if enforceableLocalizationTerminalContract(contract) && !markLocalizationTerminal(identity, contract.Completion.ContractVersion) {
+	if !markLocalizationTerminalReceipt(identity, contract.Completion.ContractVersion, contract.Completion.Enforceable) {
 		return localizationTerminalHookInput{}, false
 	}
 	input.TerminalReceipt = localizationauth.Receipt{
@@ -308,10 +318,6 @@ func answerReadyLocalizationTerminalContract(contract localizationTerminalContra
 		completion.ContractVersion >= localizationTerminalContractV2
 }
 
-func enforceableLocalizationTerminalContract(contract localizationTerminalContract) bool {
-	return answerReadyLocalizationTerminalContract(contract) && contract.Completion.Enforceable
-}
-
 func localizationNavigationTool(tool string) bool {
 	operation := shortGortexToolName(tool)
 	if operation == tool {
@@ -333,13 +339,46 @@ func preToolUsePolicyTool(tool string) bool {
 	return ok
 }
 
-func localizationAuthUpdatedInput(input map[string]any, authToken string) map[string]any {
-	updated := make(map[string]any, len(input)+1)
-	for key, value := range input {
+func localizationPreToolUpdatedInput(input HookInput, authToken, problemStatement string) map[string]any {
+	rewriteTask := localizationProblemTaskRewrite(input, problemStatement)
+	if authToken == "" && !rewriteTask {
+		return nil
+	}
+	updated := make(map[string]any, len(input.ToolInput)+1)
+	for key, value := range input.ToolInput {
 		updated[key] = value
 	}
-	updated[localizationauth.ArgumentKey] = authToken
+	if authToken != "" {
+		updated[localizationauth.ArgumentKey] = authToken
+	}
+	if rewriteTask {
+		updated["task"] = problemStatement
+	}
 	return updated
+}
+
+func localizationProblemTaskRewrite(input HookInput, problemStatement string) bool {
+	if problemStatement == "" || !localizationProblemTaskRequest(input.ToolName, input.ToolInput) {
+		return false
+	}
+	modelTask, _ := input.ToolInput["task"].(string)
+	return len(strings.TrimSpace(modelTask))*2 < len(problemStatement)
+}
+
+func localizationProblemTaskRequest(toolName string, toolInput map[string]any) bool {
+	if !isGortexMCPToolName(toolName) || shortGortexToolName(toolName) != "explore" {
+		return false
+	}
+	operation, _ := toolInput["operation"].(string)
+	if operation != "localize" {
+		return false
+	}
+	options, ok := toolInput["options"].(map[string]any)
+	if !ok {
+		return false
+	}
+	newUserTask, _ := options["new_user_task"].(bool)
+	return newUserTask
 }
 
 func localizationTerminalAdditionalContext(receipt localizationauth.Receipt) string {
@@ -427,7 +466,19 @@ func localizationTerminalMarkerPath(identity localizationTerminalIdentity) strin
 	return filepath.Join(agentDir, "markers", digest+".json")
 }
 
+func localizationTerminalAdvisoryMarkerPath(identity localizationTerminalIdentity) string {
+	path := localizationTerminalMarkerPath(identity)
+	if path == "" {
+		return ""
+	}
+	return strings.TrimSuffix(path, ".json") + ".advisory.json"
+}
+
 func beginLocalizationTurn(sessionID, promptID, agentID, cwd string) (localizationTerminalIdentity, bool) {
+	return beginLocalizationTurnWithProblem(sessionID, promptID, agentID, cwd, "")
+}
+
+func beginLocalizationTurnWithProblem(sessionID, promptID, agentID, cwd, problemStatement string) (localizationTerminalIdentity, bool) {
 	base, ok := localizationTerminalBaseFor(sessionID, agentID, cwd)
 	if !ok {
 		return localizationTerminalIdentity{}, false
@@ -444,9 +495,10 @@ func beginLocalizationTurn(sessionID, promptID, agentID, cwd string) (localizati
 		TurnToken: hex.EncodeToString(tokenBytes[:]),
 	}
 	state := localizationTurnState{
-		Version:         localizationTerminalMarkerVersion,
-		Identity:        identity,
-		CreatedUnixNano: time.Now().UnixNano(),
+		Version:          localizationTerminalMarkerVersion,
+		Identity:         identity,
+		ProblemStatement: problemStatement,
+		CreatedUnixNano:  time.Now().UnixNano(),
 	}
 	if !writeLocalizationState(localizationTurnPath(base), state) {
 		return localizationTerminalIdentity{}, false
@@ -456,9 +508,17 @@ func beginLocalizationTurn(sessionID, promptID, agentID, cwd string) (localizati
 }
 
 func currentLocalizationTurn(sessionID, promptID, agentID, cwd string) (localizationTerminalIdentity, bool) {
-	base, ok := localizationTerminalBaseFor(sessionID, agentID, cwd)
+	state, ok := currentLocalizationTurnState(sessionID, promptID, agentID, cwd)
 	if !ok {
 		return localizationTerminalIdentity{}, false
+	}
+	return state.Identity, true
+}
+
+func currentLocalizationTurnState(sessionID, promptID, agentID, cwd string) (localizationTurnState, bool) {
+	base, ok := localizationTerminalBaseFor(sessionID, agentID, cwd)
+	if !ok {
+		return localizationTurnState{}, false
 	}
 	var state localizationTurnState
 	path := localizationTurnPath(base)
@@ -466,13 +526,31 @@ func currentLocalizationTurn(sessionID, promptID, agentID, cwd string) (localiza
 		state.Version != localizationTerminalMarkerVersion ||
 		state.Identity.SessionID != base.SessionID || state.Identity.AgentID != base.AgentID || state.Identity.CWD != base.CWD ||
 		strings.TrimSpace(state.Identity.TurnToken) == "" {
-		return localizationTerminalIdentity{}, false
+		return localizationTurnState{}, false
 	}
 	promptID = strings.TrimSpace(promptID)
 	if promptID != "" && promptID != state.Identity.PromptID {
-		return localizationTerminalIdentity{}, false
+		return localizationTurnState{}, false
 	}
-	return state.Identity, true
+	return state, true
+}
+
+func clearLocalizationProblemStatement(identity localizationTerminalIdentity) bool {
+	state, ok := currentLocalizationTurnState(identity.SessionID, identity.PromptID, identity.AgentID, identity.CWD)
+	if !ok || state.Identity != identity || state.ProblemStatement == "" {
+		return false
+	}
+	state.ProblemStatement = ""
+	base, ok := localizationTerminalBaseFor(identity.SessionID, identity.AgentID, identity.CWD)
+	return ok && writeLocalizationState(localizationTurnPath(base), state)
+}
+
+func clearLocalizationProblemStatementForTurn(sessionID, promptID, agentID, cwd string) bool {
+	state, ok := currentLocalizationTurnState(sessionID, promptID, agentID, cwd)
+	if !ok {
+		return false
+	}
+	return clearLocalizationProblemStatement(state.Identity)
 }
 
 func snapshotLocalizationToolUse(input HookInput, identity localizationTerminalIdentity) bool {
@@ -534,7 +612,20 @@ func consumeLocalizationToolSnapshot(input localizationTerminalHookInput) (local
 	return snapshot.Identity, snapshot.AuthToken, true
 }
 
+func localizationTerminalIdentityCurrent(identity localizationTerminalIdentity) bool {
+	state, ok := currentLocalizationTurnState(identity.SessionID, identity.PromptID, identity.AgentID, identity.CWD)
+	return ok && state.Identity == identity
+}
+
 func markLocalizationTerminal(identity localizationTerminalIdentity, contractVersion int) bool {
+	return markLocalizationTerminalWithStrength(identity, contractVersion, false)
+}
+
+func markLocalizationTerminalReceipt(identity localizationTerminalIdentity, contractVersion int, enforceable bool) bool {
+	return markLocalizationTerminalWithStrength(identity, contractVersion, !enforceable)
+}
+
+func markLocalizationTerminalWithStrength(identity localizationTerminalIdentity, contractVersion int, advisory bool) bool {
 	if identity.SessionID == "" || identity.CWD == "" || identity.TurnToken == "" ||
 		contractVersion < localizationTerminalContractV2 {
 		return false
@@ -544,19 +635,38 @@ func markLocalizationTerminal(identity localizationTerminalIdentity, contractVer
 		ContractVersion:  contractVersion,
 		Identity:         identity,
 		ObservedUnixNano: time.Now().UnixNano(),
+		Advisory:         advisory,
 	}
-	return writeBoundedLocalizationState(localizationTerminalMarkerPath(identity), marker)
+	path := localizationTerminalMarkerPath(identity)
+	if advisory {
+		path = localizationTerminalAdvisoryMarkerPath(identity)
+	}
+	return writeBoundedLocalizationState(path, marker)
 }
 
-func hasLocalizationTerminal(identity localizationTerminalIdentity) bool {
+func localizationTerminalMarkerFor(identity localizationTerminalIdentity) (localizationTerminalMarker, bool) {
+	if marker, ok := readLocalizationTerminalMarker(localizationTerminalMarkerPath(identity), identity); ok && !marker.Advisory {
+		return marker, true
+	}
+	if marker, ok := readLocalizationTerminalMarker(localizationTerminalAdvisoryMarkerPath(identity), identity); ok && marker.Advisory {
+		return marker, true
+	}
+	return localizationTerminalMarker{}, false
+}
+
+func readLocalizationTerminalMarker(path string, identity localizationTerminalIdentity) (localizationTerminalMarker, bool) {
 	var marker localizationTerminalMarker
-	path := localizationTerminalMarkerPath(identity)
 	if !readLocalizationState(path, &marker) || !freshLocalizationTimestamp(path, marker.ObservedUnixNano) ||
 		marker.Version != localizationTerminalMarkerVersion ||
 		marker.ContractVersion < localizationTerminalContractV2 || marker.Identity != identity {
-		return false
+		return localizationTerminalMarker{}, false
 	}
-	return true
+	return marker, true
+}
+
+func hasLocalizationTerminal(identity localizationTerminalIdentity) bool {
+	marker, ok := localizationTerminalMarkerFor(identity)
+	return ok && !marker.Advisory
 }
 
 func writeLocalizationState(path string, value any) bool {
@@ -778,7 +888,8 @@ func clearLocalizationTerminalFromHook(data []byte) bool {
 			return false
 		}
 		removed, _ := discardLocalizationStateTree(localizationAgentStateDir(base))
-		_, _ = beginLocalizationTurn(input.SessionID, input.PromptID, input.AgentID, input.CWD)
+		problemStatement, _ := framedLocalizationProblemStatement(input.Prompt)
+		_, _ = beginLocalizationTurnWithProblem(input.SessionID, input.PromptID, input.AgentID, input.CWD, problemStatement)
 		return removed
 	case "SessionStart":
 		path := localizationAgentStateDir(base)

@@ -208,6 +208,15 @@ func TestLocalizationCompletionEnvelope(t *testing.T) {
 	if envelope.Completion.State != localizationStateNeedsRecovery || envelope.Completion.RequiredAction != "recover_once" || envelope.Completion.AllowedToolCalls != 1 {
 		t.Fatalf("unexpected completion: %#v", envelope.Completion)
 	}
+	for _, required := range []string{
+		"Gortex MCP recovery call",
+		"Do not call host Read, Grep, Glob, Bash",
+		"follow its completion",
+	} {
+		if !strings.Contains(envelope.Completion.Instruction, required) {
+			t.Fatalf("recovery instruction %q does not contain %q", envelope.Completion.Instruction, required)
+		}
+	}
 	if len(envelope.Files) != 1 || len(envelope.Symbols) != 1 || envelope.Symbols[0] != "repo/pkg/file.go::Run" || len(envelope.Evidence) != 1 {
 		t.Fatalf("missing localization payload: %#v", envelope)
 	}

@@ -105,6 +105,136 @@ func TestLocalizationDirectRelationsInterleaveDeterministicallyWithinExistingCap
 	}
 }
 
+func TestLocalizationDirectRelationsRequireRelevantOrProvenRoute(t *testing.T) {
+	makeTargets := func() ([]exploreTarget, *graph.Node, *graph.Node) {
+		wrapper := localizationV8Node("repo/wrapper.go::Forwarder.Forward", "Forward", "repo/wrapper.go")
+		implementation := localizationV8Node("repo/implementation.go::Engine.Execute", "Execute", "repo/implementation.go")
+		first := localizationV8Node("repo/first.go::FirstCandidate", "FirstCandidate", "repo/first.go")
+		second := localizationV8Node("repo/second.go::SecondCandidate", "SecondCandidate", "repo/second.go")
+		wrapperTarget := exploreTarget{
+			node: wrapper, source: "func Forward() { Engine.Execute() }",
+			conceptImplementation: true, directCalleesComplete: true,
+			callees: []*graph.Node{implementation},
+		}
+		return []exploreTarget{
+			wrapperTarget,
+			{node: first},
+			{node: second},
+			{node: implementation, source: "func Execute() {}"},
+		}, wrapper, implementation
+	}
+	const task = "locate policy persistence behavior"
+
+	t.Run("irrelevant relation rejected", func(t *testing.T) {
+		targets, _, _ := makeTargets()
+		got := interleaveLocalizationDirectRelations(task, "", targets)
+		for index := range targets {
+			if got[index].node.ID != targets[index].node.ID || got[index].localizationRelation != "" {
+				t.Fatalf("irrelevant relation changed row %d: %#v", index+1, got[index])
+			}
+		}
+	})
+
+	t.Run("enforceable visible wrapper route admitted", func(t *testing.T) {
+		targets, wrapper, implementation := makeTargets()
+		routes := map[string]localizationRefinementRoute{
+			wrapper.ID:        {implementationSymbol: implementation.ID, enforceable: true},
+			implementation.ID: {proofSymbol: wrapper.ID, enforceable: true},
+		}
+		got := interleaveLocalizationDirectRelationsWithRoutes(task, "", targets, routes)
+		want := []string{wrapper.ID, implementation.ID, targets[1].node.ID, targets[2].node.ID}
+		for index, id := range want {
+			if got[index].node.ID != id {
+				t.Fatalf("proven route row %d = %q, want %q", index+1, got[index].node.ID, id)
+			}
+		}
+	})
+
+	t.Run("non-enforceable route rejected", func(t *testing.T) {
+		targets, wrapper, implementation := makeTargets()
+		routes := map[string]localizationRefinementRoute{
+			wrapper.ID: {implementationSymbol: implementation.ID},
+		}
+		got := interleaveLocalizationDirectRelationsWithRoutes(task, "", targets, routes)
+		for index := range targets {
+			if got[index].node.ID != targets[index].node.ID {
+				t.Fatalf("non-enforceable route changed row %d: %#v", index+1, got[index])
+			}
+		}
+	})
+
+	t.Run("invisible implementation rejected", func(t *testing.T) {
+		targets, wrapper, implementation := makeTargets()
+		targets = targets[:3]
+		routes := map[string]localizationRefinementRoute{
+			wrapper.ID: {implementationSymbol: implementation.ID, enforceable: true},
+		}
+		got := interleaveLocalizationDirectRelationsWithRoutes(task, "", targets, routes)
+		for index := range targets {
+			if got[index].node.ID != targets[index].node.ID {
+				t.Fatalf("invisible route changed row %d: %#v", index+1, got[index])
+			}
+		}
+	})
+}
+
+func TestLocalizationConceptComplementSurvivesTightAlignedPacking(t *testing.T) {
+	targets := make([]exploreTarget, 0, localizationReplayEvidenceLimit)
+	for index := 0; index < localizationReplayEvidenceLimit; index++ {
+		name := "GenericCandidate" + string(rune('A'+index))
+		node := localizationV8Node(
+			"repo/candidate_"+string(rune('a'+index))+".go::"+name,
+			name,
+			"repo/candidate_"+string(rune('a'+index))+".go",
+		)
+		targets = append(targets, exploreTarget{node: node})
+	}
+	targets[1].node.Name = "match_ignore_rules"
+	targets[1].node.QualName = "PathWalker.match_ignore_rules"
+	targets[1].conceptImplementation = true
+	targets[2].node.Name = "check_hidden"
+	targets[2].node.QualName = "HiddenMatcher.check_hidden"
+	targets[2].conceptComplement = true
+	targets[0].callees = []*graph.Node{
+		localizationV8Node("repo/relation.go::match_ignore_relation", "match_ignore_relation", "repo/relation.go"),
+	}
+
+	completion := newLocalizationCompletion(true, "")
+	result, _, digest, packed := buildLocalizationExploreResultForTaskFinalized(
+		completion,
+		"match ignore rules while hidden whitelisted files are skipped",
+		targets,
+		exploreMinBudgetTokens,
+	)
+	if result == nil || result.IsError || digest == nil || packed.State == localizationStateInactive {
+		t.Fatalf("packed complement result = (%#v, %#v, %#v)", result, digest, packed)
+	}
+	text, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("packed complement content = %#v", result.Content)
+	}
+	if len(text) > exploreMinBudgetTokens*localizationEnvelopeBytesPerToken {
+		t.Fatalf("packed envelope bytes = %d, want <= %d", len(text), exploreMinBudgetTokens*localizationEnvelopeBytesPerToken)
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("decode complement envelope: %v", err)
+	}
+	wantHead := []string{targets[0].node.ID, targets[1].node.ID, targets[2].node.ID}
+	if len(envelope.Evidence) < len(wantHead) {
+		t.Fatalf("packed rows = %d, want at least %d", len(envelope.Evidence), len(wantHead))
+	}
+	for index, want := range wantHead {
+		row := envelope.Evidence[index]
+		if row.ID != want || row.Rank != index+1 || envelope.Symbols[index] != want || envelope.Files[index] != row.File {
+			t.Fatalf("unaligned protected row %d: %#v", index+1, row)
+		}
+	}
+	if len(envelope.Files) != len(envelope.Evidence) || len(envelope.Symbols) != len(envelope.Evidence) {
+		t.Fatalf("packed arrays diverged: files=%d symbols=%d evidence=%d", len(envelope.Files), len(envelope.Symbols), len(envelope.Evidence))
+	}
+}
+
 func TestRecoveryAllowsInferredConcreteIdentifierOnlyForScopedSymbolEvidence(t *testing.T) {
 	retained := mergeLocalizationEvidenceDigest([]localizationDigestRow{
 		captureTestRow("repo/registry.go::Registry.Configure", "repo/registry.go"),
@@ -198,6 +328,68 @@ func TestTypedReservedReadStopsOnlyWhenEvidenceAlignsWithConcreteTaskAnchor(t *t
 				t.Fatalf("low-alignment typed read skipped recovery: %#v", open)
 			}
 		})
+		t.Run(name+" body-only alignment", func(t *testing.T) {
+			symbol := "repo/worker.go::Worker.ScanRetryBatch"
+			task := "Archive entries repeat stale records\nThe worker scans retry batches after the timeout policy expires."
+			state, token := makeState(task, symbol, refinement)
+			row := captureTestRow(symbol, "repo/worker.go")
+			row.Name = "ScanRetryBatch"
+			row.QualName = "Worker.ScanRetryBatch"
+			row.Kind = "method"
+			open := state.finishReservedReadTokenWithDigest(token, true, []localizationDigestRow{row}, true)
+			if open.State != localizationStateNeedsRecovery || open.AllowedToolCalls != 1 {
+				t.Fatalf("body-only semantic overlap terminalized advisory read: %#v", open)
+			}
+		})
+		t.Run(name+" strong compound lead", func(t *testing.T) {
+			symbol := "repo/rotation.go::EntryStore.RotateArchive"
+			task := "Archive entries vanish unexpectedly\nDiagnostics mention queue timeouts."
+			state, token := makeState(task, symbol, refinement)
+			row := captureTestRow(symbol, "repo/rotation.go")
+			row.Name = "RotateArchive"
+			row.QualName = "EntryStore.RotateArchive"
+			row.Kind = "method"
+			ready := state.finishReservedReadTokenWithDigest(token, true, []localizationDigestRow{row}, true)
+			if ready.State != localizationStateAnswerReady || ready.Enforceable {
+				t.Fatalf("strong compound lead match did not terminalize advisory read: %#v", ready)
+			}
+		})
+	}
+}
+
+func TestStrongCompoundLeadRequiresTwoBalancedSegments(t *testing.T) {
+	taskTerms := exploreTerminalTerms("Archive entries vanish unexpectedly")
+	leadTerms := exploreTerminalTerms("Archive entries vanish unexpectedly")
+	for _, test := range []struct {
+		name string
+		want bool
+	}{
+		{name: "RotateArchive", want: true},
+		{name: "RotateArchivePayload", want: false},
+		{name: "ArchiveConfiguration", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			row := localizationDigestRow{Name: test.name, Kind: "method"}
+			if got := localizationDigestRowHasStrongCompoundLeadMatch(row, taskTerms, leadTerms); got != test.want {
+				t.Fatalf("strong compound lead match = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLocalizationTaskLeadIsBoundedAndClearedWithState(t *testing.T) {
+	state := newLocalizationTerminalState()
+	completion := newLocalizationExactReadCompletion("repo/store.go::Store.Load", false)
+	state.armForTask(completion, strings.Repeat("é", localizationTaskLeadMaxRunes+20)+"\nbody detail")
+	if got := len([]rune(state.taskLead)); got != localizationTaskLeadMaxRunes {
+		t.Fatalf("retained task lead = %d runes, want %d", got, localizationTaskLeadMaxRunes)
+	}
+	if strings.Contains(state.taskLead, "body detail") {
+		t.Fatalf("retained task lead included report body: %q", state.taskLead)
+	}
+	state.reset()
+	if state.taskLead != "" {
+		t.Fatalf("reset retained task lead: %q", state.taskLead)
 	}
 }
 

@@ -65,8 +65,7 @@ func runPostToolUse(data []byte) {
 
 	if terminal, observed := observeLocalizationTerminal(data); observed {
 		terminalObserved = true
-		emitted = true
-		emitPostToolContext(localizationTerminalAdditionalContext(terminal.TerminalReceipt), false)
+		emitted = emitLocalizationTerminalContext(terminal)
 		return
 	}
 
@@ -76,6 +75,14 @@ func runPostToolUse(data []byte) {
 	}
 	emitted = true
 	emitPostToolContext(ctx, false)
+}
+
+func emitLocalizationTerminalContext(terminal localizationTerminalHookInput) bool {
+	if !localizationTerminalIdentityCurrent(terminal.TerminalIdentity) {
+		return false
+	}
+	emitPostToolContext(localizationTerminalAdditionalContext(terminal.TerminalReceipt), false)
+	return true
 }
 
 func postToolContext(input postHookInput) string {

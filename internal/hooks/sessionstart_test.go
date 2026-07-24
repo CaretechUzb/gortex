@@ -30,9 +30,24 @@ func TestRulePreambleRoutesByOutcomeAndPreservesExactIdentifiers(t *testing.T) {
 		"For an explicitly named file",
 		"choose by requested output",
 		"requested output is files, symbols, or supporting evidence",
-		"preserve the user's exact technical identifiers, paths, literals, error text, and observed symptoms",
+		"localize task may be concise",
+		"faithfully preserve the issue title",
+		"every user-supplied technical identifier, path, literal, error, symptom, and stated hypothesis",
+		"never invent a causal hypothesis",
+		"clearly framed problem section may be restored exactly at execution",
+		"only for a clearly lossy model task",
+		"evidence can reflect details beyond a concise tool argument",
 		"only when work will actually continue beyond localization into diagnosis, relationship analysis, or implementation",
-		"make no further tool calls after `answer_ready`",
+		"For `needs_recovery`, make one accepted, bounded Gortex MCP `search` or `read` call",
+		"preserves the recovery allowance",
+		"the rejected request does not count as the accepted recovery",
+		"Do not call host Read, Grep, Glob, or Bash",
+		"one aligned file/symbol tuple",
+		"preserve the PRIMARY file and symbol identities",
+		"SUPPORTING rows are optional context",
+		"intentionally not executed and replays the same retained terminal payload",
+		"not stale or canned output or an integration failure",
+		"Outside an active localization contract",
 	} {
 		if !strings.Contains(briefing, required) {
 			t.Fatalf("rule preamble missing %q: %s", required, briefing)
@@ -68,7 +83,26 @@ func TestRunSessionStartEmitsNeutralRoutingAndIdentifierGuidance(t *testing.T) {
 		t.Fatalf("hook event = %q, want SessionStart", decoded.HookSpecificOutput.HookEventName)
 	}
 	context := decoded.HookSpecificOutput.AdditionalContext
-	for _, required := range []string{"choose by requested output", "preserve the user's exact technical identifiers", "after `answer_ready`"} {
+	for _, required := range []string{
+		"choose by requested output",
+		"localize task may be concise",
+		"faithfully preserve the issue title",
+		"clearly framed problem section may be restored exactly at execution",
+		"only for a clearly lossy model task",
+		"evidence can reflect details beyond a concise tool argument",
+		"For `needs_recovery`",
+		"one accepted, bounded Gortex MCP `search` or `read` call",
+		"preserves the recovery allowance",
+		"the rejected request does not count as the accepted recovery",
+		"Do not call host Read, Grep, Glob, or Bash",
+		"At `answer_ready`",
+		"respond from `completion.final_response`",
+		"one aligned file/symbol tuple",
+		"preserve the PRIMARY file and symbol identities",
+		"SUPPORTING rows are optional context",
+		"intentionally not executed and replays the same retained terminal payload",
+		"not stale or canned output or an integration failure",
+	} {
 		if !strings.Contains(context, required) {
 			t.Fatalf("SessionStart event missing %q: %s", required, context)
 		}

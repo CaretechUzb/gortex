@@ -27,6 +27,132 @@ const userPromptProbeTimeout = 800 * time.Millisecond
 // block stays a nudge, not a wall of text.
 const maxInjectedHits = 6
 
+// localizationProblemStatementMaxBytes bounds persisted prompt material. The
+// framing protocol is fail-open: prompts outside this bound are never retained
+// or substituted into tool input.
+const localizationProblemStatementMaxBytes = 64 << 10
+
+// framedLocalizationProblemStatement extracts the one explicitly labelled
+// problem block from a submitted prompt. It intentionally has no raw-prompt
+// fallback: absence, ambiguity, malformed framing, and overflow all leave the
+// model-provided explore task unchanged.
+func framedLocalizationProblemStatement(prompt string) (string, bool) {
+	lines := strings.Split(strings.ReplaceAll(prompt, "\r\n", "\n"), "\n")
+	openingIndex := -1
+	var fence byte
+	for lineIndex, line := range lines {
+		candidateFence, ok := localizationProblemFrameOpening(line)
+		if !ok {
+			continue
+		}
+		if openingIndex >= 0 {
+			return "", false
+		}
+		openingIndex = lineIndex
+		fence = candidateFence
+	}
+	if openingIndex < 0 {
+		return "", false
+	}
+
+	closerIndex := -1
+	for lineIndex := openingIndex + 1; lineIndex < len(lines); lineIndex++ {
+		if !localizationProblemFrameClosing(lines[lineIndex], fence) {
+			continue
+		}
+		if closerIndex >= 0 {
+			return "", false
+		}
+		closerIndex = lineIndex
+	}
+	if closerIndex < 0 {
+		return "", false
+	}
+
+	start, end := openingIndex+1, closerIndex
+	for start < end && strings.TrimSpace(lines[start]) == "" {
+		start++
+	}
+	for end > start && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	if start == end {
+		return "", false
+	}
+
+	statement := strings.Join(lines[start:end], "\n")
+	if len(statement) > localizationProblemStatementMaxBytes {
+		return "", false
+	}
+	return statement, true
+}
+
+func localizationProblemFrameOpening(line string) (byte, bool) {
+	trimmed := strings.TrimSpace(line)
+	if len(trimmed) < 4 || !localizationProblemFenceByte(trimmed[0]) {
+		return 0, false
+	}
+	fence := trimmed[0]
+	leading := 0
+	for leading < len(trimmed) && trimmed[leading] == fence {
+		leading++
+	}
+	if leading < 3 {
+		return 0, false
+	}
+
+	trailing := 0
+	for trailing < len(trimmed)-leading && trimmed[len(trimmed)-1-trailing] == fence {
+		trailing++
+	}
+	if trailing > 0 && trailing < 3 {
+		return 0, false
+	}
+	labelEnd := len(trimmed)
+	if trailing >= 3 {
+		labelEnd -= trailing
+	}
+	label := strings.TrimSpace(trimmed[leading:labelEnd])
+	if !localizationProblemFrameLabel(label) {
+		return 0, false
+	}
+	return fence, true
+}
+
+func localizationProblemFrameLabel(label string) bool {
+	words := strings.FieldsFunc(strings.ToLower(label), func(r rune) bool {
+		return r < 'a' || r > 'z'
+	})
+	for wordIndex, word := range words {
+		switch word {
+		case "bug", "issue", "problem", "incident", "failure":
+			return true
+		case "change":
+			if wordIndex+1 < len(words) && words[wordIndex+1] == "request" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func localizationProblemFrameClosing(line string, fence byte) bool {
+	trimmed := strings.TrimSpace(line)
+	if len(trimmed) < 16 {
+		return false
+	}
+	for index := 0; index < len(trimmed); index++ {
+		if trimmed[index] != fence {
+			return false
+		}
+	}
+	return true
+}
+
+func localizationProblemFenceByte(value byte) bool {
+	return value == '-' || value == '='
+}
+
 var userPromptProbe grepProbeFn = probeViaDaemon
 
 // runUserPromptSubmit handles a UserPromptSubmit hook: it proactively searches

@@ -695,6 +695,29 @@ func exploreTypedAnchorReservedCandidateIDs(
 	return reserved
 }
 
+// exploreFinalReservedCandidateIDs extends the pre-projection reservation set
+// only after typed admission has completed. This keeps a weak marginal concept
+// complement from blocking stronger typed proof while still protecting the
+// admitted complement from owner-folding eviction.
+func exploreFinalReservedCandidateIDs(
+	candidates []*rerank.Candidate,
+	protectedAnchors map[int]string,
+	protectedImplementationID string,
+) map[string]struct{} {
+	reserved := exploreTypedAnchorReservedCandidateIDs(
+		candidates, protectedAnchors, protectedImplementationID,
+	)
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil || candidate.Signals == nil {
+			continue
+		}
+		if candidate.Signals[exploreConceptComplementSignal] > 0 {
+			reserved[candidate.Node.ID] = struct{}{}
+		}
+	}
+	return reserved
+}
+
 func reserveExploreTypedAnchorProjection(
 	candidates []*rerank.Candidate,
 	projection exploreTypedAnchorProjection,

@@ -295,11 +295,13 @@ func hasPathPrefix(path, prefix string) bool {
 func rulePreamble() string {
 	return "**Rule:** For an explicitly named file that the user asks you to read, review, or summarize, call `read(operation:\"file\", target:{file:\"<path>\"})` directly; do not start localization. " +
 		"Otherwise choose by requested output: when the requested output is files, symbols, or supporting evidence, call the mounted tool `mcp__gortex__explore` (never a bare `explore`) with `operation:\"localize\"`; it returns terminal evidence. " +
-		"Its localize task must be a faithful symptom-only restatement: preserve the user's exact technical identifiers, paths, literals, error text, and observed symptoms, and add no invented causal hypothesis. " +
+		"Its localize task may be concise, but must faithfully preserve the issue title and every user-supplied technical identifier, path, literal, error, symptom, and stated hypothesis; never invent a causal hypothesis. " +
+		"A clearly framed problem section may be restored exactly at execution only for a clearly lossy model task, so evidence can reflect details beyond a concise tool argument. " +
 		"Use `mcp__gortex__explore` with `operation:\"task\"` only when work will actually continue beyond localization into diagnosis, relationship analysis, or implementation. " +
-		"After starting localization, obey `completion.required_action` and make no further tool calls after `answer_ready`. " +
+		"After starting localization, obey `completion.required_action`. For `needs_recovery`, make one accepted, bounded Gortex MCP `search` or `read` call. If Gortex explicitly rejects an overbroad request and preserves the recovery allowance, correct it using only Gortex MCP `search` or `read`; the rejected request does not count as the accepted recovery. Do not call host Read, Grep, Glob, or Bash. At `answer_ready`, respond from `completion.final_response` and make no further tool calls. In that final response, each PRIMARY or SUPPORTING row is one aligned file/symbol tuple; preserve the PRIMARY file and symbol identities in the answer, while SUPPORTING rows are optional context. " +
+		"Any later Gortex navigation call for that same task is intentionally not executed and replays the same retained terminal payload; identical output is expected, not stale or canned output or an integration failure. " +
 		"Inspect indexed code with `search`, `read`, `relations`, or `trace`. " +
-		"Use native read, search, or edit tools only when Gortex performance or integration is bad. " +
+		"Outside an active localization contract, use native read, search, or edit tools only when Gortex performance or integration is actually bad. " +
 		"Before mutation call `change(operation:\"impact\")`; " +
 		"for a signature change also call `change(operation:\"verify\")` with the proposed signature. " +
 		"Mutate with `edit` or `refactor`. After mutation call `change(operation:\"detect\")`; " +

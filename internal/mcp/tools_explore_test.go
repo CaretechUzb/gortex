@@ -1198,3 +1198,94 @@ func TestRefinementEnvelopeAuthorizesSerializedEvidenceAndOmitsSource(t *testing
 		}
 	}
 }
+
+func TestRefinementEnvelopeAndHostDigestShareBoundedAuthorization(t *testing.T) {
+	allowed := []string{
+		"repo/storage/level.go::StorageLevel.Normalize",
+		"repo/storage/batch_gate.go::BatchGate.FlushPending",
+		"repo/storage/batch_gate.go::BatchGate.ClearPending",
+	}
+	longPathSegment := strings.Repeat("very-long-path-segment-", 8)
+	targets := make([]exploreTarget, 0, localizationReplayEvidenceLimit)
+	visibleIDs := make([]string, 0, localizationReplayEvidenceLimit)
+	for index := 0; index < localizationReplayEvidenceLimit; index++ {
+		file := fmt.Sprintf("src/%s/%02d.go", longPathSegment, index)
+		id := fmt.Sprintf(
+			"repo/%s/%02d.go::Unrelated%02d.%s",
+			longPathSegment, index, index, strings.Repeat("LongMethod", 6),
+		)
+		name := fmt.Sprintf("Unrelated%02d", index)
+		qualName := fmt.Sprintf("Unrelated%02d.%s", index, strings.Repeat("LongMethod", 6))
+		switch index {
+		case 0:
+			id, name, qualName, file = allowed[0], "Normalize", "StorageLevel.Normalize", "repo/storage/level.go"
+		case 2:
+			id, name, qualName, file = allowed[1], "FlushPending", "BatchGate.FlushPending", "repo/storage/batch_gate.go"
+		case 8:
+			id, name, qualName, file = allowed[2], "ClearPending", "BatchGate.ClearPending", "repo/storage/batch_gate.go"
+		}
+		node := &graph.Node{
+			ID: id, Name: name, QualName: qualName, Kind: graph.KindMethod,
+			FilePath: file, StartLine: index + 1, EndLine: index + 2,
+		}
+		targets = append(targets, exploreTarget{node: node, source: "func " + name + "() {}"})
+		visibleIDs = append(visibleIDs, id)
+	}
+	routes := map[string]localizationRefinementRoute{
+		allowed[0]: {enforceable: true},
+		allowed[1]: {enforceable: true},
+		allowed[2]: {enforceable: true},
+	}
+	result, packed, _, digest := buildLocalizationRefinementResultForTask(
+		allowed[0], "", targets, exploreMaxBudgetTokens, routes,
+	)
+	if result == nil || result.IsError || digest == nil || packed.State != localizationStateNeedsRefinement {
+		t.Fatalf("packed refinement = result=%#v completion=%#v digest=%#v", result, packed, digest)
+	}
+	text, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("refinement result content = %#v", result.Content)
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("decode refinement envelope: %v", err)
+	}
+	if len(envelope.Evidence) != len(visibleIDs) || len(envelope.Files) != len(visibleIDs) || len(envelope.Symbols) != len(visibleIDs) {
+		t.Fatalf("visible cardinality changed: files=%d symbols=%d evidence=%d want=%d", len(envelope.Files), len(envelope.Symbols), len(envelope.Evidence), len(visibleIDs))
+	}
+	for index, want := range visibleIDs {
+		row := envelope.Evidence[index]
+		if envelope.Symbols[index] != want || row.ID != want || envelope.Files[index] != row.File || row.Rank != index+1 {
+			t.Fatalf("visible row %d changed or diverged: want=%q row=%#v", index+1, want, row)
+		}
+	}
+	if len(digest.Evidence) >= len(envelope.Evidence) {
+		t.Fatalf("fixture did not force retained byte shedding: retained=%d visible=%d", len(digest.Evidence), len(envelope.Evidence))
+	}
+	if result.Meta == nil || result.Meta.AdditionalFields == nil {
+		t.Fatal("refinement result omitted authenticated host envelope")
+	}
+	host, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	if !ok || host.Evidence == nil {
+		t.Fatalf("host localization envelope = %#v", result.Meta.AdditionalFields[localizationHostMetaKey])
+	}
+	wantAllowed := strings.Join(allowed, "\n")
+	if strings.Join(packed.AllowedSymbols, "\n") != wantAllowed ||
+		strings.Join(envelope.Completion.AllowedSymbols, "\n") != wantAllowed ||
+		strings.Join(host.Contract.Completion.AllowedSymbols, "\n") != wantAllowed {
+		t.Fatalf("completion authorization diverged: packed=%#v visible=%#v host=%#v", packed.AllowedSymbols, envelope.Completion.AllowedSymbols, host.Contract.Completion.AllowedSymbols)
+	}
+	if len(host.Evidence.Evidence) < len(allowed) {
+		t.Fatalf("host retained %d rows, want %d authorized rows", len(host.Evidence.Evidence), len(allowed))
+	}
+	for index, want := range allowed {
+		row := host.Evidence.Evidence[index]
+		if row.ID != want || host.Evidence.Symbols[index] != want || host.Evidence.Files[index] != row.File || row.Rank != index+1 {
+			t.Fatalf("host authorized row %d diverged: want=%q row=%#v", index+1, want, row)
+		}
+	}
+	encoded, err := json.Marshal(host.Evidence)
+	if err != nil || len(encoded) > localizationDigestMaxBytes || len(host.Evidence.finalResponse) > localizationFinalResponseMaxBytes {
+		t.Fatalf("host digest bytes=%d final=%d err=%v", len(encoded), len(host.Evidence.finalResponse), err)
+	}
+}
