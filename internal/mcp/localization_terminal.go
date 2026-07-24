@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"unicode"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 )
@@ -519,6 +520,12 @@ func (s *localizationTerminalState) localizationRecoveryAllowsLocked(facade, ope
 		return true
 	}
 	query, _ := arguments["query"].(string)
+	if operation == "symbols" && localizationRecoveryConcreteIdentifier(query) {
+		// A symbol-shaped recovery query is validated by the scoped graph search
+		// result captured for this reservation. An empty typed page restores the
+		// allowance; search.text remains anchored to the original task.
+		return true
+	}
 	return localizationRecoveryQueryAligned(s.taskFingerprint, query)
 }
 
@@ -548,6 +555,111 @@ func localizationRecoveryQueryAligned(task, query string) bool {
 		}
 	}
 	return localizationRecoverySpecificAnchor(query)
+}
+
+// localizationRecoveryConcreteIdentifier admits one exact-looking symbol query
+// even when the identifier was inferred from preceding graph evidence rather
+// than copied from the task. Authorization alone is not success: the scoped,
+// typed search page must contain a graph node before the allowance is consumed.
+func localizationRecoveryConcreteIdentifier(query string) bool {
+	identifier := strings.Trim(strings.TrimSpace(query), "`'\"")
+	runes := []rune(identifier)
+	if len(runes) < 3 || !unicode.IsLetter(runes[0]) ||
+		(!unicode.IsLetter(runes[len(runes)-1]) && !unicode.IsDigit(runes[len(runes)-1])) {
+		return false
+	}
+	hasLower := false
+	hasUpper := false
+	hasQualifier := false
+	hasCaseBoundary := false
+	previousLowerOrDigit := false
+	for _, r := range runes {
+		switch {
+		case unicode.IsLetter(r):
+			if unicode.IsLower(r) {
+				hasLower = true
+			} else if unicode.IsUpper(r) {
+				hasUpper = true
+				if previousLowerOrDigit {
+					hasCaseBoundary = true
+				}
+			}
+			previousLowerOrDigit = unicode.IsLower(r)
+		case unicode.IsDigit(r):
+			previousLowerOrDigit = true
+		case r == '_' || r == '$' || r == '.' || r == ':':
+			hasQualifier = true
+			previousLowerOrDigit = false
+		default:
+			return false
+		}
+	}
+	return hasQualifier || hasCaseBoundary || (unicode.IsUpper(runes[0]) && hasUpper && hasLower)
+}
+
+// localizationReservedReadEvidenceAligned recognizes a successful reserved read
+// as sufficient only when its typed graph identity agrees with a concrete task
+// anchor. Two independent semantic terms are also accepted; a single generic
+// overlap keeps the bounded recovery path open.
+func localizationReservedReadEvidenceAligned(task, requested string, rows []localizationDigestRow) bool {
+	if strings.TrimSpace(task) == "" || len(rows) == 0 {
+		return false
+	}
+	if localizationTaskCitesConcreteEvidence(task, requested) {
+		return true
+	}
+	taskTerms := exploreTerminalTerms(task)
+	for _, row := range rows {
+		values := []string{row.ID, row.Name, row.QualName, row.File, row.Signature}
+		for _, value := range values {
+			if localizationTaskCitesConcreteEvidence(task, value) {
+				return true
+			}
+		}
+		overlap := 0
+		for term := range exploreTerminalTerms(strings.Join(values, " ")) {
+			if _, aligned := taskTerms[term]; aligned {
+				overlap++
+			}
+		}
+		if overlap >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
+func localizationTaskCitesConcreteEvidence(task, value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	lowerTask := strings.ToLower(task)
+	lowerValue := strings.ToLower(value)
+	if strings.ContainsAny(value, "/\\.:") && strings.Contains(lowerTask, lowerValue) {
+		return true
+	}
+	if localizationRecoveryConcreteIdentifier(value) && strings.Contains(task, value) {
+		return true
+	}
+	name := value
+	if cut := strings.LastIndexAny(name, "/\\.:"); cut >= 0 && cut+1 < len(name) {
+		name = name[cut+1:]
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	if exploreQueryHasCallAnchor(task, name) {
+		return true
+	}
+	lowerName := strings.ToLower(name)
+	for _, quote := range []string{"`", "'", "\""} {
+		if strings.Contains(lowerTask, quote+lowerName+quote) {
+			return true
+		}
+	}
+	return false
 }
 
 // localizationRecoverySpecificAnchor admits compact path-like literals that
@@ -601,7 +713,7 @@ func localizationRecoveryMisalignedResult(completion localizationCompletion, fac
 }
 
 func localizationRecoveryRejectedResult(completion localizationCompletion, facade, operation string) *mcpgo.CallToolResult {
-	return newStructuredErrorResult(StructuredError{
+	result := newStructuredErrorResult(StructuredError{
 		ErrorCode: ErrCodeLocalizationTerminal,
 		Message:   "the one bounded localization recovery call must be search.text or search.symbols with a task-aligned query, or read.source with a concrete symbol; localization is now terminal",
 		Retriable: false,
@@ -612,6 +724,7 @@ func localizationRecoveryRejectedResult(completion localizationCompletion, facad
 			"allowed_operations": append([]string(nil), localizationRecoveryOperations...),
 		},
 	}, true)
+	return attachLocalizationHostEnvelope(result, completion, completion.digest)
 }
 
 // beginLocalize reserves the only localization handler slot for this session.
@@ -853,6 +966,10 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 	wireSuccess := success
 	capturedResult := wireSuccess && evidenceRecorded && len(currentEvidence) > 0
 	zeroResult := wireSuccess && evidenceRecorded && len(currentEvidence) == 0
+	var mergedDigest *localizationEvidenceDigest
+	if capturedResult {
+		mergedDigest = mergeLocalizationEvidenceDigest(currentEvidence, s.digest)
+	}
 	if captureRequired && zeroResult {
 		// An explicitly recorded empty typed page is a bounded zero-result, not
 		// evidence that can safely terminalize the session. A synthetic handler
@@ -863,14 +980,12 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 		if !captureRequired || s.state != localizationStateAnswerReady {
 			return
 		}
-		switch {
-		case capturedResult:
-			s.digest = mergeLocalizationEvidenceDigest(currentEvidence, s.digest)
-		case !wireSuccess || zeroResult:
-			// Exhaustion without current evidence must never replay the stale
-			// localization candidates that triggered recovery.
-			s.digest = nil
+		if capturedResult {
+			s.digest = mergedDigest
 		}
+		// A recorded empty page or handler failure carries no new evidence, but
+		// the retained digest still belongs to this token's generation and task.
+		// Stale or cross-task finishers were rejected before reaching this defer.
 		completion = s.completionLocked()
 	}()
 
@@ -892,6 +1007,8 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 		implementationSymbol := s.inFlightImplementationSymbol
 		routeEnforceable := s.inFlightEnforceable
 		wasCorrection := s.exactReadIsCorrection
+		confidentRead := capturedResult && mergedDigest != nil && len(mergedDigest.Evidence) > 0 &&
+			localizationReservedReadEvidenceAligned(s.taskFingerprint, s.exactSymbol, currentEvidence)
 		s.inFlightImplementationSymbol = ""
 		s.inFlightEnforceable = false
 		s.inFlightCorrectionSymbol = ""
@@ -911,7 +1028,7 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 			s.exactReadIsCorrection = false
 			s.exactReadRoute = localizationRefinementRoute{}
 			s.correctionRetriesRemaining = 0
-			if !wasCorrection && !s.enforceableOnAnswerReady {
+			if !wasCorrection && !s.enforceableOnAnswerReady && !confidentRead {
 				s.state = localizationStateNeedsRecovery
 				s.recoveryRetriesRemaining = 1
 				return s.completionLocked()
@@ -935,6 +1052,8 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 		}
 		s.state = localizationStateNeedsExactRead
 	case localizationStateRefineInFlight:
+		confidentRead := capturedResult && mergedDigest != nil && len(mergedDigest.Evidence) > 0 &&
+			localizationReservedReadEvidenceAligned(s.taskFingerprint, s.refinementSymbol, currentEvidence)
 		if success {
 			implementationSymbol := s.inFlightImplementationSymbol
 			enforceable := s.inFlightEnforceable
@@ -966,7 +1085,7 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 				s.correctionRetriesRemaining = 1
 				return s.completionLocked()
 			}
-			if !enforceable {
+			if !enforceable && !confidentRead {
 				s.state = localizationStateNeedsRecovery
 				s.recoveryRetriesRemaining = 1
 				return s.completionLocked()

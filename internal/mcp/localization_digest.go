@@ -19,11 +19,10 @@ const (
 	// localizationDigestMaxBytes bounds retained session state independently of
 	// the original envelope budget.
 	localizationDigestMaxBytes = 4096
-	// localizationReplayEvidenceLimit prevents a broad localization envelope
-	// from becoming an exhaustive, implicitly endorsed answer during replay.
-	// Five keeps the promoted structural/literal candidates reserved by the
-	// envelope builder while bounding repeat-turn cost.
-	localizationReplayEvidenceLimit = 5
+	// localizationReplayEvidenceLimit preserves the five strongest direct rows
+	// plus at most one graph-validated direct relationship for each. The retained
+	// byte cap remains authoritative when long identities cannot all fit.
+	localizationReplayEvidenceLimit = 10
 	// localizationFinalResponseMaxBytes bounds the ready-to-emit answer that
 	// accompanies the retained digest on terminal responses and replays.
 	localizationFinalResponseMaxBytes = 4096
@@ -226,7 +225,7 @@ func localizationFinalResponseField(value string) string {
 
 func renderLocalizationFinalResponse(rows []localizationDigestRow) string {
 	if len(rows) == 0 {
-		return "FILES:\n(none)\n\nSYMBOLS:\n(none)\n\nEVIDENCE:\nNo bounded localization evidence was found."
+		return "FILES:\n(none)\n\nSYMBOLS:\n(none)\n\nEVIDENCE:\nNo bounded localization evidence was found.\n\n" + localizationAnswerReadyDirective
 	}
 	var response strings.Builder
 	response.WriteString("FILES:\n")
@@ -247,6 +246,8 @@ func renderLocalizationFinalResponse(rows []localizationDigestRow) string {
 		}
 		fmt.Fprintf(&response, "#%d %s — %s\n", index+1, file, id)
 	}
+	response.WriteString("\n")
+	response.WriteString(localizationAnswerReadyDirective)
 	return response.String()
 }
 
@@ -336,7 +337,13 @@ func attachLocalizationHostEnvelope(result *mcpgo.CallToolResult, completion loc
 // same ready-to-emit answer and directive on every post-terminal navigation.
 func localizationAnswerReadyResult(completion localizationCompletion) *mcpgo.CallToolResult {
 	completion = localizationCompletionWithDigest(completion, completion.digest)
-	visible := completion.FinalResponse + "\n\n" + localizationAnswerReadyDirective
+	visible := completion.FinalResponse
+	// Older retained completions may predate the in-response convergence cue.
+	// Preserve their successful replay shape without duplicating the directive
+	// for newly rendered terminal evidence.
+	if !strings.HasSuffix(visible, localizationAnswerReadyDirective) {
+		visible += "\n\n" + localizationAnswerReadyDirective
+	}
 	result := mcpgo.NewToolResultText(visible)
 	return attachLocalizationHostEnvelope(result, completion, completion.digest)
 }

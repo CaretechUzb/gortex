@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/zzet/gortex/internal/localizationauth"
 )
 
 const (
@@ -72,6 +74,7 @@ type localizationToolSnapshot struct {
 	Version         int                          `json:"version"`
 	ToolUseID       string                       `json:"tool_use_id"`
 	ToolName        string                       `json:"tool_name"`
+	AuthToken       string                       `json:"auth_token,omitempty"`
 	Identity        localizationTerminalIdentity `json:"identity"`
 	CreatedUnixNano int64                        `json:"created_unix_nano"`
 }
@@ -84,14 +87,15 @@ type localizationTerminalMarker struct {
 }
 
 type localizationTerminalHookInput struct {
-	HookEventName string          `json:"hook_event_name"`
-	ToolName      string          `json:"tool_name"`
-	ToolUseID     string          `json:"tool_use_id"`
-	SessionID     string          `json:"session_id"`
-	PromptID      string          `json:"prompt_id"`
-	AgentID       string          `json:"agent_id"`
-	CWD           string          `json:"cwd"`
-	ToolResponse  json.RawMessage `json:"tool_response"`
+	HookEventName   string                   `json:"hook_event_name"`
+	ToolName        string                   `json:"tool_name"`
+	ToolUseID       string                   `json:"tool_use_id"`
+	SessionID       string                   `json:"session_id"`
+	PromptID        string                   `json:"prompt_id"`
+	AgentID         string                   `json:"agent_id"`
+	CWD             string                   `json:"cwd"`
+	ToolResponse    json.RawMessage          `json:"tool_response"`
+	TerminalReceipt localizationauth.Receipt `json:"-"`
 }
 
 type localizationTerminalCompletion struct {
@@ -137,16 +141,39 @@ func observeLocalizationTerminal(data []byte) (localizationTerminalHookInput, bo
 	if !localizationNavigationTool(input.ToolName) {
 		return localizationTerminalHookInput{}, false
 	}
-	identity, ok := consumeLocalizationToolSnapshot(input)
+	identity, authToken, ok := consumeLocalizationToolSnapshot(input)
 	if !ok {
 		return localizationTerminalHookInput{}, false
 	}
+
+	// Claude's real PostToolUse wire strips MCP _meta and structuredContent.
+	// The one-shot receipt was published by the MCP server immediately before
+	// returning answer_ready and is correlated through the authenticated
+	// PreToolUse snapshot. Visible tool JSON is never an authority on this path.
+	if authToken != "" {
+		if receipt, authenticated := localizationauth.Consume(authToken); authenticated {
+			if receipt.Enforceable && !markLocalizationTerminal(identity, receipt.ContractVersion) {
+				return localizationTerminalHookInput{}, false
+			}
+			input.TerminalReceipt = receipt
+			return input, true
+		}
+	}
+
+	// Retain compatibility with hosts that preserve the authoritative _meta
+	// envelope. It still requires byte-equivalent visible and server metadata;
+	// an arbitrary visible contract alone can never arm terminal state.
 	contract, ok := exactLocalizationTerminalContract(input.ToolResponse)
 	if !ok || !answerReadyLocalizationTerminalContract(contract) {
 		return localizationTerminalHookInput{}, false
 	}
 	if enforceableLocalizationTerminalContract(contract) && !markLocalizationTerminal(identity, contract.Completion.ContractVersion) {
 		return localizationTerminalHookInput{}, false
+	}
+	input.TerminalReceipt = localizationauth.Receipt{
+		FinalResponse:   contract.Completion.FinalResponse,
+		ContractVersion: contract.Completion.ContractVersion,
+		Enforceable:     contract.Completion.Enforceable,
 	}
 	return input, true
 }
@@ -306,6 +333,19 @@ func preToolUsePolicyTool(tool string) bool {
 	return ok
 }
 
+func localizationAuthUpdatedInput(input map[string]any, authToken string) map[string]any {
+	updated := make(map[string]any, len(input)+1)
+	for key, value := range input {
+		updated[key] = value
+	}
+	updated[localizationauth.ArgumentKey] = authToken
+	return updated
+}
+
+func localizationTerminalAdditionalContext(receipt localizationauth.Receipt) string {
+	return localizationTerminalContext + "\n\n" + receipt.FinalResponse
+}
+
 func localizationTerminalBaseFor(sessionID, agentID, cwd string) (localizationTerminalBase, bool) {
 	base := localizationTerminalBase{
 		SessionID: strings.TrimSpace(sessionID),
@@ -436,27 +476,40 @@ func currentLocalizationTurn(sessionID, promptID, agentID, cwd string) (localiza
 }
 
 func snapshotLocalizationToolUse(input HookInput, identity localizationTerminalIdentity) bool {
+	_, ok := snapshotLocalizationToolUseWithAuth(input, identity)
+	return ok
+}
+
+func snapshotLocalizationToolUseWithAuth(input HookInput, identity localizationTerminalIdentity) (string, bool) {
 	if !localizationNavigationTool(input.ToolName) || strings.TrimSpace(input.ToolUseID) == "" {
-		return false
+		return "", false
 	}
 	base, ok := localizationTerminalBaseFor(input.SessionID, input.AgentID, input.CWD)
 	if !ok {
-		return false
+		return "", false
+	}
+	authToken, ok := localizationauth.NewToken()
+	if !ok {
+		return "", false
 	}
 	snapshot := localizationToolSnapshot{
 		Version:         localizationTerminalMarkerVersion,
 		ToolUseID:       strings.TrimSpace(input.ToolUseID),
 		ToolName:        input.ToolName,
+		AuthToken:       authToken,
 		Identity:        identity,
 		CreatedUnixNano: time.Now().UnixNano(),
 	}
-	return writeBoundedLocalizationState(localizationSnapshotPath(base, input.ToolUseID), snapshot)
+	if !writeBoundedLocalizationState(localizationSnapshotPath(base, input.ToolUseID), snapshot) {
+		return "", false
+	}
+	return authToken, true
 }
 
-func consumeLocalizationToolSnapshot(input localizationTerminalHookInput) (localizationTerminalIdentity, bool) {
+func consumeLocalizationToolSnapshot(input localizationTerminalHookInput) (localizationTerminalIdentity, string, bool) {
 	base, ok := localizationTerminalBaseFor(input.SessionID, input.AgentID, input.CWD)
 	if !ok || strings.TrimSpace(input.ToolUseID) == "" {
-		return localizationTerminalIdentity{}, false
+		return localizationTerminalIdentity{}, "", false
 	}
 	path := localizationSnapshotPath(base, input.ToolUseID)
 	var snapshot localizationToolSnapshot
@@ -464,13 +517,21 @@ func consumeLocalizationToolSnapshot(input localizationTerminalHookInput) (local
 		snapshot.Version != localizationTerminalMarkerVersion ||
 		snapshot.ToolUseID != strings.TrimSpace(input.ToolUseID) || snapshot.ToolName != input.ToolName ||
 		snapshot.Identity.SessionID != base.SessionID || snapshot.Identity.AgentID != base.AgentID || snapshot.Identity.CWD != base.CWD {
-		return localizationTerminalIdentity{}, false
+		return localizationTerminalIdentity{}, "", false
 	}
-	_ = os.Remove(path)
 	if promptID := strings.TrimSpace(input.PromptID); promptID != "" && promptID != snapshot.Identity.PromptID {
-		return localizationTerminalIdentity{}, false
+		return localizationTerminalIdentity{}, "", false
 	}
-	return snapshot.Identity, true
+	claimToken, ok := localizationauth.NewToken()
+	if !ok {
+		return localizationTerminalIdentity{}, "", false
+	}
+	claimPath := path + ".consume-" + claimToken
+	if err := os.Rename(path, claimPath); err != nil {
+		return localizationTerminalIdentity{}, "", false
+	}
+	defer os.Remove(claimPath) //nolint:errcheck // one-shot cleanup is best effort
+	return snapshot.Identity, snapshot.AuthToken, true
 }
 
 func markLocalizationTerminal(identity localizationTerminalIdentity, contractVersion int) bool {

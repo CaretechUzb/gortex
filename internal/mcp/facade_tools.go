@@ -15,6 +15,7 @@ import (
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/localizationauth"
 	"github.com/zzet/gortex/internal/telemetry"
 )
 
@@ -418,6 +419,8 @@ func parseLocalizationNewUserBoundary(facade, operation string, arguments map[st
 
 func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	started := time.Now()
+	input, _ := req.Params.Arguments.(map[string]any)
+	localizationAuthToken := localizationauth.TakeArgument(input)
 	operation := normalizeFacadeOperation(req.GetString("operation", ""))
 	if facade == "analyze" {
 		operation = requestedAnalyzeKind(req.GetArguments())
@@ -452,6 +455,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		blocked, recoveryGeneration = terminal.interceptAnswerReady(facade, operation, req.GetArguments())
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
+			publishLocalizationAuthReceipt(localizationAuthToken, blocked)
 			return blocked, nil
 		}
 	}
@@ -497,12 +501,12 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		s.recordFacadeTelemetry(facade, "unknown", facadeOutcomeInvalidOperation, time.Since(started))
 		return result, nil
 	}
-	input, _ := req.Params.Arguments.(map[string]any)
 	if invalid := validateFacadeInput(spec, input); invalid != nil {
 		if completion, consumed := terminal.consumeInvalidRecovery(facade, operation, recoveryGeneration); consumed {
 			invalid, _ = decorateExhaustedLocalizationReadFailure(invalid, nil, completion, spec)
 		}
 		s.recordFacadeTelemetry(facade, operation, facadeOutcomeInvalidArgument, time.Since(started))
+		publishLocalizationAuthReceipt(localizationAuthToken, invalid)
 		return invalid, nil
 	}
 	// Every localize call and an explicit new-user task call starts a
@@ -517,6 +521,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		localizeReservation, blocked = terminal.beginLocalize(req.GetString("task", ""), newUserTask)
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
+			publishLocalizationAuthReceipt(localizationAuthToken, blocked)
 			return blocked, nil
 		}
 		if !freshLocalizeFlow {
@@ -538,6 +543,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		blocked, reservation := terminal.authorizeWithToken(facade, operation, req.GetArguments())
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
+			publishLocalizationAuthReceipt(localizationAuthToken, blocked)
 			return blocked, nil
 		}
 		localizationReadReservation = reservation
@@ -572,7 +578,24 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		terminal.finishLocalize(localizeReservation, succeeded)
 		localizeFinished = true
 	}
+	publishLocalizationAuthReceipt(localizationAuthToken, result)
 	return result, err
+}
+
+func publishLocalizationAuthReceipt(token string, result *mcpgo.CallToolResult) {
+	if token == "" || result == nil || result.Meta == nil || result.Meta.AdditionalFields == nil {
+		return
+	}
+	host, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	if !ok || !host.Contract.Terminal || host.Contract.Completion.State != localizationStateAnswerReady {
+		return
+	}
+	completion := host.Contract.Completion
+	localizationauth.Publish(token, localizationauth.Receipt{
+		FinalResponse:   completion.FinalResponse,
+		ContractVersion: completion.ContractVersion,
+		Enforceable:     completion.Enforceable,
+	})
 }
 
 type localizationPermittedEvidenceCaptureKey struct{}
@@ -615,31 +638,84 @@ func captureLocalizationSearchSymbols(ctx context.Context, nodes []*graph.Node) 
 	captureLocalizationRows(ctx, rows)
 }
 
-// captureLocalizationSearchText promotes only graph-backed symbol identities
-// from the typed search.text page. File-only hits have no SymbolID, and the
-// rendered MCP Content is never parsed as evidence.
+// captureLocalizationSearchText promotes only graph-backed identities from the
+// typed search.text page. A file-level literal may have no enclosing SymbolID;
+// in that case the matching path and line are resolved back to the narrowest
+// in-scope graph declaration, or finally to the graph's file node. Rendered MCP
+// Content is never parsed as evidence.
 func (s *Server) captureLocalizationSearchText(ctx context.Context, matches []enrichedTextMatch) {
 	capture, _ := ctx.Value(localizationPermittedEvidenceCaptureKey{}).(*localizationPermittedEvidenceCapture)
 	if capture == nil {
 		return
 	}
 	rows := make([]localizationDigestRow, 0, len(matches))
-	if s.graph != nil {
-		for _, match := range matches {
-			id := strings.TrimSpace(match.SymbolID)
-			if id == "" {
-				continue
+	for _, match := range matches {
+		node, provenance := s.localizationTextMatchNode(ctx, match)
+		if row, ok := localizationDigestRowFromNode(node, provenance); ok {
+			if match.Line > 0 {
+				row.Line = match.Line
 			}
-			node := s.graph.GetNode(id)
-			if node == nil || !s.nodeInSessionScope(ctx, node) {
-				continue
-			}
-			if row, ok := localizationDigestRowFromNode(node, "permitted_search_text"); ok {
-				rows = append(rows, row)
-			}
+			rows = append(rows, row)
 		}
 	}
 	captureLocalizationRows(ctx, rows)
+}
+
+func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTextMatch) (*graph.Node, string) {
+	if s == nil || s.graph == nil {
+		return nil, ""
+	}
+	if id := strings.TrimSpace(match.SymbolID); id != "" {
+		if node := s.graph.GetNode(id); node != nil && s.nodeInSessionScope(ctx, node) {
+			return node, "permitted_search_text"
+		}
+		return nil, ""
+	}
+	path := strings.TrimSpace(match.Path)
+	if path == "" {
+		return nil, ""
+	}
+	var owner *graph.Node
+	var fileNode *graph.Node
+	ownerSpan := int(^uint(0) >> 1)
+	for _, node := range s.graph.GetFileNodes(path) {
+		if node == nil || !s.nodeInSessionScope(ctx, node) {
+			continue
+		}
+		if node.Kind == graph.KindFile {
+			if fileNode == nil || node.ID < fileNode.ID {
+				fileNode = node
+			}
+			continue
+		}
+		if match.Line <= 0 || node.StartLine <= 0 || node.StartLine > match.Line || !exploreLocalizableKind(node.Kind) {
+			continue
+		}
+		end := node.EndLine
+		if end <= 0 {
+			end = node.StartLine
+		}
+		if end < match.Line {
+			continue
+		}
+		span := end - node.StartLine
+		if owner == nil || span < ownerSpan || (span == ownerSpan && node.ID < owner.ID) {
+			owner = node
+			ownerSpan = span
+		}
+	}
+	if owner != nil {
+		return owner, "permitted_search_text_owner"
+	}
+	if fileNode == nil {
+		if node := s.graph.GetNode(path); node != nil && node.Kind == graph.KindFile && s.nodeInSessionScope(ctx, node) {
+			fileNode = node
+		}
+	}
+	if fileNode != nil {
+		return fileNode, "permitted_search_text_file"
+	}
+	return nil, ""
 }
 
 // captureLocalizationReadSource records the validated graph node whose source

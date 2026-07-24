@@ -217,9 +217,10 @@ func TestPostToolUseAnswerReadyEventAuthenticationAndJSONShape(t *testing.T) {
 			},
 		},
 	}
+	finalResponse := completionMap(terminalContractMap())["final_response"].(string)
 	want := string(mustJSON(t, HookOutput{HookSpecificOutput: &HookSpecificOutput{
 		HookEventName:     "PostToolUse",
-		AdditionalContext: localizationTerminalContext,
+		AdditionalContext: localizationTerminalContext + "\n\n" + finalResponse,
 	}}))
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

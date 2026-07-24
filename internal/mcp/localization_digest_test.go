@@ -96,8 +96,11 @@ func requireLocalizationTerminalReplay(t *testing.T, result *mcpgo.CallToolResul
 		structured["directive"] != localizationAnswerReadyDirective {
 		t.Fatalf("terminal replay stable keys = %#v", structured)
 	}
-	if text != contract.Completion.FinalResponse+"\n\n"+localizationAnswerReadyDirective {
+	if text != contract.Completion.FinalResponse {
 		t.Fatalf("terminal replay text diverged from final_response: %q", text)
+	}
+	if !strings.HasSuffix(contract.Completion.FinalResponse, localizationAnswerReadyDirective) {
+		t.Fatalf("terminal convergence directive is outside final_response: %q", contract.Completion.FinalResponse)
 	}
 	return contract
 }
@@ -360,11 +363,11 @@ func TestLocalizationDigestKeepsOnlyConcreteBoundedEvidence(t *testing.T) {
 	}
 
 	digest := newLocalizationEvidenceDigest(envelope)
-	if len(digest.Evidence) != localizationReplayEvidenceLimit {
-		t.Fatalf("retained evidence = %d, want %d", len(digest.Evidence), localizationReplayEvidenceLimit)
+	if len(digest.Evidence) != 6 {
+		t.Fatalf("retained evidence = %d, want 6", len(digest.Evidence))
 	}
-	wantFiles := []string{"pkg/a.go", "pkg/b.go", "pkg/c.go", "pkg/d.go", "pkg/e.go"}
-	wantSymbols := []string{"repo/pkg/a.go::A", "repo/pkg/b.go::B", "repo/pkg/c.go::C", "repo/pkg/d.go::D", "repo/pkg/e.go::E"}
+	wantFiles := []string{"pkg/a.go", "pkg/b.go", "pkg/c.go", "pkg/d.go", "pkg/e.go", "pkg/f.go"}
+	wantSymbols := []string{"repo/pkg/a.go::A", "repo/pkg/b.go::B", "repo/pkg/c.go::C", "repo/pkg/d.go::D", "repo/pkg/e.go::E", "repo/pkg/f.go::F"}
 	if !reflect.DeepEqual(digest.Files, wantFiles) {
 		t.Fatalf("digest files = %#v, want %#v", digest.Files, wantFiles)
 	}

@@ -113,11 +113,16 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		localizationTerminalTelemetry("denied", true, started)
 		return
 	}
+	localizationAuthToken := ""
 	if terminalTurnReady {
-		// Correlate the current turn with this exact tool invocation. PostToolUse
-		// consumes the snapshot, so a delayed result from a previous turn cannot
-		// arm the new turn's marker.
-		_ = snapshotLocalizationToolUse(input, terminalIdentity)
+		// Correlate the current turn with this exact tool invocation. The nonce is
+		// injected into the MCP request, then the server publishes a one-shot
+		// answer_ready receipt under it immediately before returning. PostToolUse
+		// consumes both the snapshot and receipt, so stripped response metadata,
+		// delayed events, and visible JSON cannot arm terminal state.
+		if authToken, snapshotReady := snapshotLocalizationToolUseWithAuth(input, terminalIdentity); snapshotReady {
+			localizationAuthToken = authToken
+		}
 	}
 
 	// The installed matcher is deliberately broad so terminal state can stop
@@ -154,6 +159,9 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		if adv := gortexReadNudge(input.ToolName, input.ToolInput); adv != "" {
 			hso.AdditionalContext = adv
 		}
+		if localizationAuthToken != "" {
+			hso.UpdatedInput = localizationAuthUpdatedInput(input.ToolInput, localizationAuthToken)
+		}
 		emitted = hso.AdditionalContext != "" || hso.PermissionDecisionReason != ""
 		emitPreToolUse(HookOutput{HookSpecificOutput: hso})
 		return
@@ -165,12 +173,24 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	// call itself is a no-op pass-through — nothing to enrich.
 	if mode == ModeConsultUnlock && isGortexMCP {
 		markGraphConsulted(input.SessionID)
+		if localizationAuthToken != "" {
+			emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
+				HookEventName: "PreToolUse",
+				UpdatedInput:  localizationAuthUpdatedInput(input.ToolInput, localizationAuthToken),
+			}})
+		}
 		return
 	}
 
 	result := applyMode(input, isGortexMCP, mode, enrich(input, gortexPort))
 
 	if result.context == "" && !result.deny {
+		if localizationAuthToken != "" {
+			emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
+				HookEventName: "PreToolUse",
+				UpdatedInput:  localizationAuthUpdatedInput(input.ToolInput, localizationAuthToken),
+			}})
+		}
 		return
 	}
 
@@ -178,6 +198,9 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		HookSpecificOutput: &HookSpecificOutput{
 			HookEventName: "PreToolUse",
 		},
+	}
+	if localizationAuthToken != "" {
+		output.HookSpecificOutput.UpdatedInput = localizationAuthUpdatedInput(input.ToolInput, localizationAuthToken)
 	}
 
 	if result.deny {

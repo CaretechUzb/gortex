@@ -294,9 +294,9 @@ func hasPathPrefix(path, prefix string) bool {
 // to reach for graph tools first.
 func rulePreamble() string {
 	return "**Rule:** For an explicitly named file that the user asks you to read, review, or summarize, call `read(operation:\"file\", target:{file:\"<path>\"})` directly; do not start localization. " +
-		"Otherwise choose by requested output: when the requested output is files, symbols, or supporting evidence, call `explore(operation:\"localize\")`; it returns terminal evidence. " +
-		"In the localize task, preserve the user's exact technical identifiers, paths, literals, error text, and observed symptoms; do not replace them with a causal hypothesis. " +
-		"Call `explore(operation:\"task\")` only when work will actually continue beyond localization into diagnosis, relationship analysis, or implementation. " +
+		"Otherwise choose by requested output: when the requested output is files, symbols, or supporting evidence, call the mounted tool `mcp__gortex__explore` (never a bare `explore`) with `operation:\"localize\"`; it returns terminal evidence. " +
+		"Its localize task must be a faithful symptom-only restatement: preserve the user's exact technical identifiers, paths, literals, error text, and observed symptoms, and add no invented causal hypothesis. " +
+		"Use `mcp__gortex__explore` with `operation:\"task\"` only when work will actually continue beyond localization into diagnosis, relationship analysis, or implementation. " +
 		"After starting localization, obey `completion.required_action` and make no further tool calls after `answer_ready`. " +
 		"Inspect indexed code with `search`, `read`, `relations`, or `trace`. " +
 		"Use native read, search, or edit tools only when Gortex performance or integration is bad. " +

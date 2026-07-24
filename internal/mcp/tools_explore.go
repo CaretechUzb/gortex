@@ -95,6 +95,7 @@ type exploreTarget struct {
 	sourceLiteralAligned  bool   // source-literal callee that instantiates the task's value; strongest literal owner
 	typedAnchorProjection bool   // bounded field-owner-call proof promoted from a task-aligned typed field
 	foldedOwner           bool   // synthetic owner inserted by concept member folding
+	localizationRelation  string // direct_caller/direct_callee row promoted only into the bounded terminal projection
 }
 
 type exploreCausalNeighbor struct {
@@ -2778,6 +2779,153 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 	return selected
 }
 
+const (
+	localizationDirectRelationSourceLimit = 5
+	localizationDirectEvidenceReserve     = 3
+)
+
+// interleaveLocalizationDirectRelations promotes one already-hydrated direct
+// caller or callee beside each high-ranked evidence row. The relationship nodes
+// came from the same scoped graph walks as the parent target; this helper never
+// performs a new lookup or reconstructs an identity from rendered output.
+func interleaveLocalizationDirectRelations(task, requiredID string, targets []exploreTarget) []exploreTarget {
+	if len(targets) == 0 {
+		return targets
+	}
+	limit := min(len(targets), localizationReplayEvidenceLimit)
+	type relationCandidate struct {
+		node       *graph.Node
+		direction  string
+		overlap    int
+		longest    int
+		production bool
+		callable   bool
+		order      int
+	}
+
+	direct := make(map[string]exploreTarget, len(targets))
+	protected := make(map[string]struct{}, localizationDirectEvidenceReserve+6)
+	orderedPrefix := 0
+	hasDivergentDefault := false
+	for index, target := range targets {
+		if target.node == nil || target.node.ID == "" {
+			continue
+		}
+		direct[target.node.ID] = target
+		if index < localizationDirectEvidenceReserve || target.node.ID == requiredID ||
+			target.divergentDefaultOwner || target.divergentDefaultType || target.conceptImplementation ||
+			target.exactContent || target.sourceLiteral || target.typedAnchorProjection {
+			protected[target.node.ID] = struct{}{}
+		}
+		if target.node.ID == requiredID || target.divergentDefaultOwner || target.divergentDefaultType ||
+			target.exactContent || target.sourceLiteral || target.typedAnchorProjection {
+			orderedPrefix = index + 1
+		}
+		if target.divergentDefaultOwner || target.divergentDefaultType {
+			hasDivergentDefault = true
+		}
+	}
+	// Divergent-default evidence is an ordered causal triple: promoted owner,
+	// owning type, then the original consumer. Relationships may enrich the
+	// projection only after that prefix, never between its proof rows.
+	if hasDivergentDefault && orderedPrefix < len(targets) {
+		orderedPrefix++
+	}
+	terms := exploreTerminalTerms(shapeExploreQuery(task))
+	selected := make([]exploreTarget, 0, limit)
+	seen := make(map[string]struct{}, limit)
+	appendTarget := func(target exploreTarget) bool {
+		if len(selected) >= limit || target.node == nil || target.node.ID == "" || nodeDisplayPath(target.node) == "" {
+			return false
+		}
+		if _, exists := seen[target.node.ID]; exists {
+			return false
+		}
+		seen[target.node.ID] = struct{}{}
+		selected = append(selected, target)
+		return true
+	}
+	chooseRelation := func(target exploreTarget) (exploreTarget, bool) {
+		var best relationCandidate
+		found := false
+		order := 0
+		consider := func(nodes []*graph.Node, direction string) {
+			for _, node := range nodes {
+				candidateOrder := order
+				order++
+				if node == nil || node.ID == "" || node.ID == target.node.ID || nodeDisplayPath(node) == "" || !exploreLocalizableKind(node.Kind) {
+					continue
+				}
+				if _, exists := seen[node.ID]; exists {
+					continue
+				}
+				overlap, longest := exploreDraftTermOverlap(terms, node)
+				candidate := relationCandidate{
+					node:       node,
+					direction:  direction,
+					overlap:    overlap,
+					longest:    longest,
+					production: !exploreDraftIsTestNode(node),
+					callable:   node.Kind == graph.KindFunction || node.Kind == graph.KindMethod,
+					order:      candidateOrder,
+				}
+				better := !found || candidate.overlap > best.overlap ||
+					(candidate.overlap == best.overlap && candidate.production && !best.production) ||
+					(candidate.overlap == best.overlap && candidate.production == best.production && candidate.callable && !best.callable) ||
+					(candidate.overlap == best.overlap && candidate.production == best.production && candidate.callable == best.callable && candidate.longest > best.longest) ||
+					(candidate.overlap == best.overlap && candidate.production == best.production && candidate.callable == best.callable && candidate.longest == best.longest && candidate.order < best.order)
+				if better {
+					best = candidate
+					found = true
+				}
+			}
+		}
+		// Callees win a complete tie because a wrapper-to-implementation hop is
+		// the most common missing terminal relation. A task-aligned caller still
+		// wins through the overlap comparison above.
+		consider(target.callees, "direct_callee")
+		consider(target.callers, "direct_caller")
+		if !found {
+			return exploreTarget{}, false
+		}
+		relation, exists := direct[best.node.ID]
+		if !exists {
+			relation = exploreTarget{node: best.node, localizationRelation: best.direction}
+		}
+		return relation, true
+	}
+
+	protectedRemaining := func() int {
+		remaining := 0
+		for id := range protected {
+			if _, exists := seen[id]; !exists {
+				remaining++
+			}
+		}
+		return remaining
+	}
+	for index, target := range targets {
+		targetProtected := false
+		if target.node != nil {
+			_, targetProtected = protected[target.node.ID]
+		}
+		if targetProtected || len(selected)+protectedRemaining() < limit {
+			appendTarget(target)
+		}
+		if len(selected) >= limit {
+			break
+		}
+		if index+1 < orderedPrefix || index >= localizationDirectRelationSourceLimit ||
+			target.node == nil || len(selected)+protectedRemaining() >= limit {
+			continue
+		}
+		if relation, ok := chooseRelation(target); ok {
+			appendTarget(relation)
+		}
+	}
+	return selected
+}
+
 func newLocalizationExploreResult(completion localizationCompletion, targets []exploreTarget, budget int) *mcp.CallToolResult {
 	return newLocalizationExploreResultForTask(completion, "", targets, budget)
 }
@@ -2910,6 +3058,7 @@ func buildLocalizationExploreResultForTaskFinalized(
 	if refinementFirst {
 		targets = prioritizeLocalizationEvidenceTarget(requiredSymbol, targets)
 	}
+	targets = interleaveLocalizationDirectRelations(task, requiredSymbol, targets)
 	contract := localizationContractFor(completion)
 	envelope := localizationExploreEnvelope{
 		Completion: contract.Completion,
@@ -2984,6 +3133,10 @@ func buildLocalizationExploreResultForTaskFinalized(
 		n := target.node
 		path := nodeDisplayPath(n)
 		retrieval := n.RetrievalMetadata()
+		provenance := localizationTargetProvenance(completion, target)
+		if target.localizationRelation != "" {
+			provenance = target.localizationRelation
+		}
 		evidence := localizationEvidence{
 			Rank: len(envelope.Evidence) + 1, ID: n.ID,
 			Name: compactLocalizationField(n.Name, localizationMaxNameRunes),
@@ -2993,7 +3146,7 @@ func buildLocalizationExploreResultForTaskFinalized(
 			Signature:  compactLocalizationField(retrieval.Signature, localizationMaxSignatureRunes),
 			Callers:    boundedLocalizationNeighborIDs(target.callers, localizationMaxNeighborIDs),
 			Callees:    boundedLocalizationNeighborIDs(target.callees, localizationMaxNeighborIDs),
-			Provenance: localizationTargetProvenance(completion, target),
+			Provenance: provenance,
 		}
 
 		candidate := envelope

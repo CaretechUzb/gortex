@@ -37,7 +37,7 @@ func TestMergeLocalizationEvidenceDigestIsCurrentFirstAlignedAndBounded(t *testi
 	if merged == nil {
 		t.Fatal("merge returned nil digest")
 	}
-	if got, want := len(merged.Evidence), localizationReplayEvidenceLimit; got != want {
+	if got, want := len(merged.Evidence), 6; got != want {
 		t.Fatalf("evidence count = %d, want %d", got, want)
 	}
 	wantIDs := []string{
@@ -46,6 +46,7 @@ func TestMergeLocalizationEvidenceDigestIsCurrentFirstAlignedAndBounded(t *testi
 		"repo/storage/mirror.go::Mirror.Load",
 		"repo/storage/cloud.go::CloudStorage.Load",
 		"repo/storage/cache.go::Cache.Load",
+		"repo/storage/archive.go::Archive.Load",
 	}
 	for index, want := range wantIDs {
 		row := merged.Evidence[index]
@@ -193,7 +194,7 @@ func TestFinishReservedReadWithDigestMergesOnlyOnAnswerReady(t *testing.T) {
 	}
 }
 
-func TestFinishReservedReadWithDigestRetriesRecordedZeroThenClearsStaleDigest(t *testing.T) {
+func TestFinishReservedReadWithDigestRetriesRecordedZeroThenPreservesCurrentTaskDigest(t *testing.T) {
 	retained := mergeLocalizationEvidenceDigest([]localizationDigestRow{
 		captureTestRow("repo/storage/base.go::Storage.Load", "repo/storage/base.go"),
 	}, nil)
@@ -220,8 +221,11 @@ func TestFinishReservedReadWithDigestRetriesRecordedZeroThenClearsStaleDigest(t 
 	if completion.State != localizationStateAnswerReady {
 		t.Fatalf("exhausted zero-result state = %q", completion.State)
 	}
-	if state.digest != nil || completion.digest != nil {
-		t.Fatalf("exhaustion replayed stale digest: state=%#v completion=%#v", state.digest, completion.digest)
+	if state.digest != retained || completion.digest != retained {
+		t.Fatalf("same-task exhaustion discarded retained evidence: state=%#v completion=%#v", state.digest, completion.digest)
+	}
+	if got := completion.digest.Evidence[0].ID; got != "repo/storage/base.go::Storage.Load" {
+		t.Fatalf("same-task exhaustion changed retained identity: %q", got)
 	}
 }
 

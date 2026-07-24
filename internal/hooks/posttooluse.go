@@ -63,10 +63,10 @@ func runPostToolUse(data []byte) {
 		logHookEffectiveness("PostToolUse", emitted, daemonReachableFn(), 0, time.Since(started))
 	}()
 
-	if _, observed := observeLocalizationTerminal(data); observed {
+	if terminal, observed := observeLocalizationTerminal(data); observed {
 		terminalObserved = true
 		emitted = true
-		emitPostToolContext(localizationTerminalContext, false)
+		emitPostToolContext(localizationTerminalAdditionalContext(terminal.TerminalReceipt), false)
 		return
 	}
 
