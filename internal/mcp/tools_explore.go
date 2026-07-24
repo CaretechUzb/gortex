@@ -3716,7 +3716,7 @@ func buildLocalizationExploreResultForTaskFinalized(
 	contract = localizationContractFor(envelope.Completion)
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal
-	digest := newLocalizationEvidenceDigest(envelope)
+	digest := newLocalizationEvidenceDigestForTask(task, envelope)
 	envelope.Completion = localizationCompletionBoundedByDigest(envelope.Completion, digest)
 	// The serialized completion, returned state, structuredContent, and host
 	// metadata must carry the same final_response. Build the digest first, then

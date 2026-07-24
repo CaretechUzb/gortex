@@ -58,12 +58,14 @@ type localizationDigestRow struct {
 	Provenance string   `json:"provenance,omitempty"`
 }
 
-// newLocalizationEvidenceDigest retains only concrete ranked evidence rows.
-// Files and Symbols are rebuilt from those rows, so an item that was shed by
-// the replay limit or byte budget cannot survive as an unsupported answer
+// newLocalizationEvidenceDigestForTask retains only concrete ranked evidence
+// rows. Files and Symbols are rebuilt from those rows, so an item that was shed
+// by the replay limit or byte budget cannot survive as an unsupported answer
 // candidate. Exact and refinement-authorized rows form a stable protected
 // prefix in retained state only; the visible envelope keeps its original order.
-func newLocalizationEvidenceDigest(envelope localizationExploreEnvelope) *localizationEvidenceDigest {
+// The request is rendered into the ready-to-emit answer, so a page completing
+// on its first call presents the same task-scored rows a later merge would.
+func newLocalizationEvidenceDigestForTask(task string, envelope localizationExploreEnvelope) *localizationEvidenceDigest {
 	digest := &localizationEvidenceDigest{}
 	priorityIDs := localizationDigestPriorityIDs(envelope.Completion, envelope.Evidence)
 
@@ -104,7 +106,7 @@ func newLocalizationEvidenceDigest(envelope localizationExploreEnvelope) *locali
 
 	for {
 		rebuildLocalizationDigestSkeleton(digest)
-		digest.finalResponse = renderLocalizationFinalResponse(digest.Evidence)
+		digest.finalResponse = renderLocalizationFinalResponseForTask(task, nil, digest.Evidence)
 		encoded, err := json.Marshal(digest)
 		if err == nil && len(encoded) <= localizationDigestMaxBytes && len(digest.finalResponse) <= localizationFinalResponseMaxBytes {
 			return digest
@@ -638,7 +640,11 @@ func renderLocalizationFinalResponseForTask(task string, current, rows []localiz
 	return response.String()
 }
 
-const localizationAnswerReadyDirective = "Localization for this task is complete. Respond now using this evidence; do not call another tool."
+// The directive is the only instruction the caller sees on a terminal page, so
+// it names the one failure mode measurement keeps finding: an answer that
+// paraphrases the located identifier into a neighbouring one it inferred from
+// the request text, losing the located symbol.
+const localizationAnswerReadyDirective = "Localization for this task is complete. Respond now: reproduce the LOCALIZATION lines above verbatim, then explain; never swap in a symbol you inferred elsewhere, and do not call another tool."
 
 func localizationDigestRowsByID(digest *localizationEvidenceDigest) map[string]localizationDigestRow {
 	retained := make(map[string]localizationDigestRow)
@@ -893,4 +899,11 @@ func localizationAnswerReadyResult(completion localizationCompletion) *mcpgo.Cal
 	}
 	result := mcpgo.NewToolResultText(visible)
 	return attachLocalizationHostEnvelope(result, completion, completion.digest)
+}
+
+// newLocalizationEvidenceDigest retains rows without a request in hand. Callers
+// that know the request use newLocalizationEvidenceDigestForTask so the
+// presented rows are scored against it.
+func newLocalizationEvidenceDigest(envelope localizationExploreEnvelope) *localizationEvidenceDigest {
+	return newLocalizationEvidenceDigestForTask("", envelope)
 }

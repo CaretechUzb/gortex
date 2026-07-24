@@ -25,9 +25,9 @@ const (
 	localizationTerminalAgentHardCap    = 64
 	localizationTerminalJanitorDeletes  = 32
 
-	localizationTerminalContext    = "[Gortex] Localization for this task is complete. Respond now using completion.final_response; do not call another tool."
-	localizationTerminalDenyReason = "[Gortex] Localization for this task is complete, so this tool call is blocked. Respond now using the retained evidence; do not call another tool."
-	localizationAdvisoryDenyReason = "[Gortex] Localization for this task is complete, so this additional Gortex navigation call was not run. Respond now using the retained evidence; do not call another tool."
+	localizationTerminalContext    = "[Gortex] Localization for this task is complete. Respond now from completion.final_response: reproduce its LOCALIZATION lines verbatim — same paths, same symbol identifiers — before any explanation of your own, and do not call another tool."
+	localizationTerminalDenyReason = "[Gortex] Localization for this task is complete, so this tool call is blocked. Respond now from the retained evidence, reproducing its LOCALIZATION lines verbatim; do not call another tool."
+	localizationAdvisoryDenyReason = "[Gortex] Localization for this task is complete, so this additional Gortex navigation call was not run. Respond now from the retained evidence, reproducing its LOCALIZATION lines verbatim; do not call another tool."
 	gortexPluginMCPToolPrefix      = "mcp__plugin_gortex_gortex__"
 	localizationHostMetaKey        = "gortex/localization"
 )

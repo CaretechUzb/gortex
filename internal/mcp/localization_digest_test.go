@@ -77,7 +77,8 @@ func requireLocalizationTerminalReplay(t *testing.T, result *mcpgo.CallToolResul
 	}
 	for _, required := range []string{
 		"Localization for this task is complete",
-		"Respond now using this evidence",
+		"Respond now",
+		"verbatim",
 		"do not call another tool",
 	} {
 		if !strings.Contains(text, required) {
