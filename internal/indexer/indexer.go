@@ -191,6 +191,9 @@ type Indexer struct {
 	trigramSearcher *trigram.Searcher
 	trigramGen      uint64
 	trigramMu       sync.Mutex
+	// trigramBudgetOverride scopes the idle/LRU eviction budget to one
+	// test rather than the process-wide default. Nil in production.
+	trigramBudgetOverride *trigramBudget
 
 	// repoPrefix is set in multi-repo mode to prefix all file paths and node IDs.
 	// When empty, the indexer operates in single-repo mode (backward compatible).
