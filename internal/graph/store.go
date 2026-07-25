@@ -554,6 +554,15 @@ type SymbolSearcher interface {
 	SearchSymbols(query string, limit int) ([]SymbolHit, error)
 }
 
+// SymbolFTSCounter is the optional authoritative document count. The
+// search.Backend Count() contract reports a since-construction delta of the
+// indexer's Add/Remove calls, which is not a corpus size and can legitimately
+// be negative; anything that wants to report how many documents are actually
+// indexed must ask the store instead of the adapter.
+type SymbolFTSCounter interface {
+	SymbolFTSCount() (int, error)
+}
+
 // SymbolFTSBatchUpserter is the optional incremental fast path. It is kept
 // separate from SymbolSearcher so alternate search implementations and test
 // doubles retain source compatibility. Indexing paths use this capability as

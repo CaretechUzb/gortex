@@ -154,6 +154,28 @@ func (b *SymbolSearcherBackend) Count() int {
 	return int(b.count.Load())
 }
 
+// DocCount returns the authoritative number of indexed documents, straight
+// from the underlying index, and reports whether it could be obtained.
+//
+// Count() must not be used for this: it is a delta of the indexer's Add and
+// Remove calls since construction, so it is not a corpus size and can be
+// negative. Anything user-facing asks here and omits the figure when the
+// answer is unavailable, rather than printing the delta.
+func (b *SymbolSearcherBackend) DocCount() (int, bool) {
+	if b == nil || b.s == nil {
+		return 0, false
+	}
+	counter, ok := b.s.(graph.SymbolFTSCounter)
+	if !ok {
+		return 0, false
+	}
+	count, err := counter.SymbolFTSCount()
+	if err != nil || count < 0 {
+		return 0, false
+	}
+	return count, true
+}
+
 // Close is a no-op. The wrapped SymbolSearcher is owned by the
 // graph.Store; closing it from the search adapter would race the
 // indexer's own lifecycle.
