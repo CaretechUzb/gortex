@@ -258,9 +258,11 @@ func TestLocalizationSingleResultCompletionDoesNotArmTerminalState(t *testing.T)
 		t.Fatalf("decode localized envelope: %v\n%s", err, text)
 	}
 	if finalized.State != localizationStateLocalized || envelope.Completion.State != localizationStateLocalized ||
-		envelope.Completion.RequiredAction != "continue_task" || envelope.Terminal || envelope.Completion.Enforceable ||
-		envelope.Completion.FinalResponse != "" {
+		envelope.Completion.RequiredAction != "continue_task" || envelope.Terminal || envelope.Completion.Enforceable {
 		t.Fatalf("single-result completion must remain non-terminal: finalized=%#v envelope=%#v", finalized, envelope)
+	}
+	if strings.Contains(envelope.Completion.FinalResponse, localizationAnswerReadyDirective) {
+		t.Fatalf("single-result page carried the terminal directive: %q", envelope.Completion.FinalResponse)
 	}
 	for _, required := range []string{
 		"indexed localization pass is complete",
@@ -283,8 +285,11 @@ func TestLocalizationSingleResultCompletionDoesNotArmTerminalState(t *testing.T)
 		t.Fatalf("localized host envelope missing: %#v", result.Meta)
 	}
 	if host.Contract.Terminal || host.Contract.Completion.State != localizationStateLocalized ||
-		host.Contract.Completion.Enforceable || host.Contract.Completion.FinalResponse != "" {
+		host.Contract.Completion.Enforceable {
 		t.Fatalf("localized host contract was terminally enriched: %#v", host.Contract)
+	}
+	if strings.Contains(host.Contract.Completion.FinalResponse, localizationAnswerReadyDirective) {
+		t.Fatalf("localized host page carried the terminal directive: %q", host.Contract.Completion.FinalResponse)
 	}
 
 	state := newLocalizationTerminalState()

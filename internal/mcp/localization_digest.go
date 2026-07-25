@@ -42,6 +42,11 @@ type localizationEvidenceDigest struct {
 	// finalResponse is derived from Evidence and excluded from digest JSON so
 	// the retained-state byte cap does not count the same identities twice.
 	finalResponse string
+	// provisionalResponse is the same rows rendered for a state that has not
+	// proven its answer yet. A caller can run out of turns at any point, and a
+	// session that ends holding nothing is the one outcome with no recovery, so
+	// every state carries a page — labelled for what it is.
+	provisionalResponse string
 }
 
 type localizationDigestRow struct {
@@ -106,7 +111,7 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 
 	for {
 		rebuildLocalizationDigestSkeleton(digest)
-		digest.finalResponse = renderLocalizationFinalResponseForTask(task, nil, digest.Evidence)
+		refreshLocalizationDigestResponses(digest, task, nil)
 		encoded, err := json.Marshal(digest)
 		if err == nil && len(encoded) <= localizationDigestMaxBytes && len(digest.finalResponse) <= localizationFinalResponseMaxBytes {
 			return digest
@@ -226,7 +231,7 @@ func mergeLocalizationEvidenceDigest(current []localizationDigestRow, retained *
 	appendRows(current, localizationReplayEvidenceLimit)
 	for {
 		rebuildLocalizationDigestSkeleton(digest)
-		digest.finalResponse = renderLocalizationFinalResponse(digest.Evidence)
+		refreshLocalizationDigestResponses(digest, "", nil)
 		encoded, err := json.Marshal(digest)
 		if err == nil && len(encoded) <= localizationDigestMaxBytes && len(digest.finalResponse) <= localizationFinalResponseMaxBytes {
 			return digest
@@ -258,6 +263,7 @@ func mergeLocalizationEvidenceDigestForTask(task string, current []localizationD
 	finalResponse := renderLocalizationFinalResponseForTask(task, current, digest.Evidence)
 	if len(finalResponse) <= localizationFinalResponseMaxBytes {
 		digest.finalResponse = finalResponse
+		digest.provisionalResponse = renderLocalizationProvisionalResponseForTask(task, current, digest.Evidence)
 	}
 	return digest
 }
@@ -639,11 +645,42 @@ func renderLocalizationFinalResponse(rows []localizationDigestRow) string {
 
 func renderLocalizationFinalResponseForTask(task string, current, rows []localizationDigestRow) string {
 	presented := localizationFinalResponseRows(task, current, rows)
+	return renderLocalizationAnswerPage(presented, localizationAnswerHeading,
+		"No bounded localization evidence was found.", localizationAnswerReadyDirective)
+}
+
+// renderLocalizationProvisionalResponseForTask renders the same rows for a
+// state that has not proven its answer yet. The heading and closing line are
+// the whole difference: a caller must be able to tell a proven answer from the
+// best one available so far, or the page teaches it to trust both equally.
+// Unlike the proven page, this one trims its own tail to stay inside the byte
+// cap — it is additional payload on responses that previously carried none, so
+// it may not push an envelope over budget on its way in.
+func renderLocalizationProvisionalResponseForTask(task string, current, rows []localizationDigestRow) string {
+	presented := localizationFinalResponseRows(task, current, rows)
+	if len(presented) > localizationProvisionalRowLimit {
+		presented = presented[:localizationProvisionalRowLimit]
+	}
+	for {
+		page := renderLocalizationAnswerPage(presented, localizationProvisionalHeading,
+			"No localization evidence has been retained for this request yet.",
+			localizationProvisionalDirective)
+		if len(page) <= localizationFinalResponseMaxBytes || len(presented) == 0 {
+			return page
+		}
+		presented = presented[:len(presented)-1]
+	}
+}
+
+func renderLocalizationAnswerPage(
+	presented []localizationFinalResponseRow, heading, empty, directive string,
+) string {
 	if len(presented) == 0 {
-		return "LOCALIZATION:\nNo bounded localization evidence was found.\n\n" + localizationAnswerReadyDirective
+		return heading + "\n" + empty + "\n\n" + directive
 	}
 	var response strings.Builder
-	response.WriteString("LOCALIZATION:\n")
+	response.WriteString(heading)
+	response.WriteString("\n")
 	for _, item := range presented {
 		role := "SUPPORTING"
 		if item.primary {
@@ -658,8 +695,20 @@ func renderLocalizationFinalResponseForTask(task string, current, rows []localiz
 		fmt.Fprintf(&response, "- %s — %s — %s\n", role, file, id)
 	}
 	response.WriteString("\n")
-	response.WriteString(localizationAnswerReadyDirective)
+	response.WriteString(directive)
 	return response.String()
+}
+
+// refreshLocalizationDigestResponses keeps the proven and provisional pages
+// derived from one row set. They are rebuilt together at every site that
+// reshapes Evidence, so a shed row can never survive in one page after it has
+// left the other.
+func refreshLocalizationDigestResponses(digest *localizationEvidenceDigest, task string, current []localizationDigestRow) {
+	if digest == nil {
+		return
+	}
+	digest.finalResponse = renderLocalizationFinalResponseForTask(task, current, digest.Evidence)
+	digest.provisionalResponse = renderLocalizationProvisionalResponseForTask(task, current, digest.Evidence)
 }
 
 // The directive is the only instruction the caller sees on a terminal page, so
@@ -677,6 +726,27 @@ func renderLocalizationFinalResponseForTask(task string, current, rows []localiz
 // name what the answer should carry, and leave the caller free to disagree —
 // its disagreement is right more often than not.
 const localizationAnswerReadyDirective = "Localization for this task is complete. Answer now from this evidence, naming the files and symbols you rely on. If it does not fit the request, say so and name what does — your judgement about the code is welcome, another navigation call is not."
+
+const (
+	localizationAnswerHeading      = "LOCALIZATION:"
+	localizationProvisionalHeading = "LOCALIZATION (UNCONFIRMED):"
+)
+
+// The provisional page exists because a session can stop at any turn: the
+// caller may run out of steps, decide it has enough, or give up. Until now
+// every state but one handed back no answer at all, so those sessions ended
+// with nothing — measurably, one in five of them.
+// It is deliberately terse. The envelope budget is 6400 bytes and a real page
+// already fills most of it, so a wordy fallback is a fallback that gets shed
+// before it ever reaches a caller. Say the three things that matter — these
+// are unconfirmed, the prescribed step is still the better move, and stopping
+// with them beats stopping with nothing — and stop.
+const localizationProvisionalDirective = "Unconfirmed. Prefer the step this response prescribes; if you stop here instead, answer with these candidates and say they are unconfirmed."
+
+// localizationProvisionalRowLimit keeps the unconfirmed page to the rows most
+// likely to be the answer. Every identity it lists is already in the
+// envelope's evidence, so a longer page buys repetition, not information.
+const localizationProvisionalRowLimit = localizationFinalResponsePrimaryLimit
 
 func localizationDigestRowsByID(digest *localizationEvidenceDigest) map[string]localizationDigestRow {
 	retained := make(map[string]localizationDigestRow)
@@ -838,13 +908,38 @@ func localizationCompletionBoundedByDigest(completion localizationCompletion, di
 	return completion
 }
 
+// localizationStateCarriesEvidence reports whether a state is inside a
+// localization flow that has ranked something. The inactive state is excluded
+// deliberately: it rides responses that were never a localization request, and
+// a candidate page there is payload with no question to answer.
+func localizationStateCarriesEvidence(state string) bool {
+	switch state {
+	case localizationStateNeedsExactRead, localizationStateExactReadInFlight,
+		localizationStateNeedsRefinement, localizationStateRefineInFlight,
+		localizationStateNeedsRecovery, localizationStateRecoveryInFlight,
+		localizationStateLocalized:
+		return true
+	default:
+		return false
+	}
+}
+
 func localizationCompletionWithDigest(completion localizationCompletion, digest *localizationEvidenceDigest) localizationCompletion {
 	if digest == nil {
 		digest = completion.digest
 	}
 	completion.digest = digest
 	if completion.State != localizationStateAnswerReady {
+		// The rows are already ranked and packed here; only the confidence to
+		// call them an answer is missing. Discarding the page left a caller that
+		// stops early — out of steps, or satisfied — with nothing to say, which
+		// is strictly worse than a candidate list that admits it is unconfirmed.
+		// A state holding no evidence still gets nothing: boilerplate with no
+		// identities in it is payload the caller cannot answer from.
 		completion.FinalResponse = ""
+		if localizationStateCarriesEvidence(completion.State) && digest != nil && len(digest.Evidence) > 0 {
+			completion.FinalResponse = digest.provisionalResponse
+		}
 		return completion
 	}
 	if digest != nil && digest.finalResponse != "" {

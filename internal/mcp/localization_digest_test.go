@@ -452,8 +452,14 @@ func TestLocalizationCompletionReconcilesShedAllowedSymbols(t *testing.T) {
 		if _, exists := bounded.refinementRoutes[preferred]; !exists {
 			t.Fatalf("preferred route missing after reconciliation: %#v", bounded.refinementRoutes)
 		}
-		if !strings.Contains(bounded.RequiredAction, preferred) || bounded.FinalResponse != "" {
+		if !strings.Contains(bounded.RequiredAction, preferred) {
 			t.Fatalf("preferred refinement action was not rebuilt: %#v", bounded)
+		}
+		// The page a refinement hands back is the unconfirmed one: it must exist,
+		// and it must not read as an answer the caller may stop on.
+		if !strings.HasPrefix(bounded.FinalResponse, localizationProvisionalHeading) ||
+			strings.Contains(bounded.FinalResponse, localizationAnswerReadyDirective) {
+			t.Fatalf("bounded refinement page was not provisional: %q", bounded.FinalResponse)
 		}
 		if len(digest.Symbols) != 1 || digest.Symbols[0] != preferred {
 			t.Fatalf("oversized alternate survived digest: %#v", digest.Symbols)
@@ -1123,8 +1129,13 @@ func TestAttachLocalizationHostEnvelopePreservesPreterminalStructuredContent(t *
 	if !ok {
 		t.Fatalf("preterminal host envelope missing: %#v", attached.Meta)
 	}
-	if host.Contract.Terminal || host.Contract.Completion.State != localizationStateNeedsRecovery || host.Contract.Completion.FinalResponse != "" {
+	if host.Contract.Terminal || host.Contract.Completion.State != localizationStateNeedsRecovery {
 		t.Fatalf("preterminal host contract was terminally enriched: %#v", host.Contract)
+	}
+	// A recovery state hands back its candidates, but as the unconfirmed page —
+	// never carrying the directive that tells a caller to stop navigating.
+	if strings.Contains(host.Contract.Completion.FinalResponse, localizationAnswerReadyDirective) {
+		t.Fatalf("preterminal page carried the terminal directive: %q", host.Contract.Completion.FinalResponse)
 	}
 }
 

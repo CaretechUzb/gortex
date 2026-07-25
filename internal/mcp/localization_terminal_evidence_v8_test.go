@@ -479,8 +479,13 @@ func TestFacadeLocalizedCompletionStripsAuthWithoutPublishingReceipt(t *testing.
 		t.Fatalf("localized typed host envelope = %T", result.Meta.AdditionalFields[localizationHostMetaKey])
 	}
 	if host.Contract.Terminal || host.Contract.Completion.State != localizationStateLocalized ||
-		host.Contract.Completion.Enforceable || host.Contract.Completion.FinalResponse != "" {
+		host.Contract.Completion.Enforceable {
 		t.Fatalf("localized host contract became terminal: %#v", host.Contract)
+	}
+	// A localized result may hand back candidates, but never the directive that
+	// ends a session — the caller is explicitly free to keep working here.
+	if strings.Contains(host.Contract.Completion.FinalResponse, localizationAnswerReadyDirective) {
+		t.Fatalf("localized page carried the terminal directive: %q", host.Contract.Completion.FinalResponse)
 	}
 	for _, facade := range []string{"explore", "search", "read", "relations", "trace", "analyze", "edit", "change", "refactor"} {
 		if blocked := server.localizationFor(ctx).block(facade, "anything", nil); blocked != nil {
