@@ -77,9 +77,9 @@ func requireLocalizationTerminalReplay(t *testing.T, result *mcpgo.CallToolResul
 	}
 	for _, required := range []string{
 		"Localization for this task is complete",
-		"Respond now",
-		"verbatim",
-		"do not call another tool",
+		"Answer now",
+		"naming the files and symbols you rely on",
+		"another navigation call is not",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("terminal replay text %q does not contain %q", text, required)

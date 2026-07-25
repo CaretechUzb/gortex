@@ -151,7 +151,7 @@ func newLocalizationPlannedRecoveryCompletion(operation, anchor string) localiza
 // completion.instruction carries the same obligation as one that reads the
 // rendered page. required_action stays "respond" — the terminal gate matches
 // that exact value.
-const localizationAnswerReadyInstruction = "Respond now from completion.final_response: quote its LOCALIZATION lines verbatim as the first lines of your reply — same paths, line numbers, and identifiers — then add your conclusion in at most two sentences. Do not call another tool."
+const localizationAnswerReadyInstruction = "Answer now from completion.final_response, naming the files and symbols you rely on. If its evidence does not fit the request, say so and name what does. Either way, do not call another tool."
 
 func newLocalizationCompletion(answerReady bool, exactSymbol string) localizationCompletion {
 	if answerReady {

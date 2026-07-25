@@ -356,7 +356,7 @@ func TestLocalizationTerminalHookFlowDeniesThenPromptRotatesTurn(t *testing.T) {
 			for _, required := range []string{
 				"Localization for this task is complete",
 				"retained evidence",
-				"do not call another tool",
+				"naming what you rely on",
 			} {
 				if !strings.Contains(output.HookSpecificOutput.PermissionDecisionReason, required) {
 					t.Fatalf("terminal deny reason %q does not contain %q", output.HookSpecificOutput.PermissionDecisionReason, required)

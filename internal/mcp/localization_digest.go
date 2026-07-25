@@ -651,7 +651,13 @@ func renderLocalizationFinalResponseForTask(task string, current, rows []localiz
 // class in a session, and asking for the located lines verbatim already moved
 // median output up measurably; an unbounded "explain" invites the model to
 // restate evidence it has just quoted.
-const localizationAnswerReadyDirective = "Localization for this task is complete. Respond now: reproduce the LOCALIZATION lines above verbatim, then explain in at most two sentences; never swap in a symbol you inferred elsewhere, and do not call another tool."
+// Wording matters more than it looks. Ordering a caller to reproduce a page it
+// judges wrong reads as coercion: measured across 336 sessions, pages carrying
+// the word "verbatim" drew an explicit manipulation accusation in 30% of the
+// caller's own statements against 2% on pages without it. Ask for the answer,
+// name what the answer should carry, and leave the caller free to disagree —
+// its disagreement is right more often than not.
+const localizationAnswerReadyDirective = "Localization for this task is complete. Answer now from this evidence, naming the files and symbols you rely on. If it does not fit the request, say so and name what does — your judgement about the code is welcome, another navigation call is not."
 
 func localizationDigestRowsByID(digest *localizationEvidenceDigest) map[string]localizationDigestRow {
 	retained := make(map[string]localizationDigestRow)
