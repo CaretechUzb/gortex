@@ -175,16 +175,29 @@ func cloneLocalizationDigestRows(rows []localizationDigestRow) []localizationDig
 	return cloned
 }
 
+// localizationFreshEvidenceReserve bounds how much of the retained digest the
+// terminalizing call's own output may claim. A targeted read returns one row and
+// deserves to lead; a broad search returns a whole page of its own and would
+// otherwise evict every ranked localization row — including a rank-one ground
+// truth the caller has already read — leaving an answer built entirely from the
+// caller's last query. The localization evidence is what the session exists to
+// deliver, so it keeps the majority of the bounded digest.
+const localizationFreshEvidenceReserve = 3
+
 // mergeLocalizationEvidenceDigest puts evidence returned by the terminalizing
 // permitted call first, then fills the bounded tail from the retained localize
 // digest. Files, Symbols, and Evidence are rebuilt from the same rows so their
-// ordinal positions can never diverge.
+// ordinal positions can never diverge. Fresh rows lead but cannot crowd the
+// retained ranking out of its own answer.
 func mergeLocalizationEvidenceDigest(current []localizationDigestRow, retained *localizationEvidenceDigest) *localizationEvidenceDigest {
 	digest := &localizationEvidenceDigest{}
 	seen := make(map[string]struct{}, localizationReplayEvidenceLimit)
-	appendRows := func(rows []localizationDigestRow) {
+	appendRows := func(rows []localizationDigestRow, limit int) {
+		if limit > localizationReplayEvidenceLimit {
+			limit = localizationReplayEvidenceLimit
+		}
 		for _, row := range rows {
-			if len(digest.Evidence) >= localizationReplayEvidenceLimit {
+			if len(digest.Evidence) >= limit {
 				return
 			}
 			row.ID = strings.TrimSpace(row.ID)
@@ -201,10 +214,16 @@ func mergeLocalizationEvidenceDigest(current []localizationDigestRow, retained *
 			digest.Evidence = append(digest.Evidence, row)
 		}
 	}
-	appendRows(current)
-	if retained != nil {
-		appendRows(retained.Evidence)
+	freshLead := localizationReplayEvidenceLimit
+	if retained != nil && len(retained.Evidence) > 0 {
+		freshLead = localizationFreshEvidenceReserve
 	}
+	appendRows(current, freshLead)
+	if retained != nil {
+		appendRows(retained.Evidence, localizationReplayEvidenceLimit)
+	}
+	// Any capacity the retained rows did not need goes back to the fresh page.
+	appendRows(current, localizationReplayEvidenceLimit)
 	for {
 		rebuildLocalizationDigestSkeleton(digest)
 		digest.finalResponse = renderLocalizationFinalResponse(digest.Evidence)

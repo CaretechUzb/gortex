@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"fmt"
 	"testing"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
@@ -225,4 +226,51 @@ func TestExploreDelegatedImplementationCalleeRecognisesWrapperHelpers(t *testing
 	typeNode := &graph.Node{ID: "repo/storage/disk.go::resolvePathRec", Name: "resolvePathRec", Kind: graph.KindType, FilePath: "storage/disk.go"}
 	require.False(t, exploreDelegatedImplementationCallee(base, typeNode))
 	require.False(t, exploreDelegatedImplementationCallee(nil, typeNode))
+}
+
+func TestMergeKeepsRankedEvidenceWhenTheFreshPageIsLarge(t *testing.T) {
+	// The terminalizing call returns a whole page of its own — what a broad
+	// search does — while the retained digest holds the ranked localization,
+	// truth first. The answer must still be built from the localization.
+	fresh := make([]localizationDigestRow, 0, 20)
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("repo/build/config.js::helper%02d", i)
+		fresh = append(fresh, localizationDigestRow{
+			Rank: i + 1, ID: id, Name: fmt.Sprintf("helper%02d", i),
+			Kind: "function", File: "build/config.js", Line: i + 1,
+		})
+	}
+	retained := &localizationEvidenceDigest{Evidence: []localizationDigestRow{
+		{Rank: 1, ID: "repo/storage/disk.go::DiskStorage.Load", Name: "DiskStorage.Load",
+			Kind: "method", File: "storage/disk.go", Line: 12},
+		{Rank: 2, ID: "repo/storage/disk.go::DiskStorage.read", Name: "DiskStorage.read",
+			Kind: "method", File: "storage/disk.go", Line: 40},
+	}}
+
+	merged := mergeLocalizationEvidenceDigest(fresh, retained)
+	ids := make([]string, 0, len(merged.Evidence))
+	for _, row := range merged.Evidence {
+		ids = append(ids, row.ID)
+	}
+	require.Contains(t, ids, "repo/storage/disk.go::DiskStorage.Load",
+		"the rank-one localization row must survive a large fresh page")
+	require.Contains(t, ids, "repo/storage/disk.go::DiskStorage.read")
+	require.LessOrEqual(t, len(merged.Evidence), localizationReplayEvidenceLimit)
+
+	// The fresh page still leads, but only up to its reserve.
+	leading := 0
+	for _, row := range merged.Evidence {
+		if row.File != "build/config.js" {
+			break
+		}
+		leading++
+	}
+	require.LessOrEqual(t, leading, localizationFreshEvidenceReserve,
+		"a broad fresh page cannot claim more than its reserve")
+	require.Contains(t, merged.finalResponse, "DiskStorage.Load",
+		"the answer must name the localization, not only the caller's last query")
+
+	// With nothing retained to protect, the fresh page keeps the whole digest.
+	alone := mergeLocalizationEvidenceDigest(fresh, nil)
+	require.Len(t, alone.Evidence, localizationReplayEvidenceLimit)
 }
