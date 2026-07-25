@@ -447,6 +447,15 @@ type Server struct {
 	// USD estimate from a stubbed usage seam.
 	reviewPricingOverride *llm.ProviderPricing
 
+	// sourceLiteralRecallBudgetOverride replaces the per-anchor wall-clock
+	// slice the bounded source-literal recall may spend. Test-only:
+	// production leaves it zero and gets exploreSourceLiteralRecallBudget.
+	// A test that asserts which owners the recall maps widens the slice so
+	// the answer cannot depend on how loaded the machine is; the tests that
+	// assert deadline behaviour leave it zero. See
+	// pinExploreSourceLiteralRecallBudget.
+	sourceLiteralRecallBudgetOverride time.Duration
+
 	// critiqueLLMGenOverride substitutes the critique_review tool's LLM seam.
 	// Test-only: production leaves it nil and the handler builds the closure
 	// over llmService.Generate. A non-nil override stands in for the real

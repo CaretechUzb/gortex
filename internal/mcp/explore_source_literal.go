@@ -24,6 +24,17 @@ const (
 	exploreSourceLiteralRecallMaxFilesPerTerm  = 2
 )
 
+// sourceLiteralRecallBudget is the wall-clock slice one anchor of the bounded
+// source-literal recall may spend. Everything the recall reports — which
+// owners it mapped, and the reason it stopped — is a function of this slice,
+// so tests pin it rather than racing the default against a loaded machine.
+func (s *Server) sourceLiteralRecallBudget() time.Duration {
+	if s != nil && s.sourceLiteralRecallBudgetOverride > 0 {
+		return s.sourceLiteralRecallBudgetOverride
+	}
+	return exploreSourceLiteralRecallBudget
+}
+
 type exploreSourceLiteralHit struct {
 	nodeID    string
 	rank      int
@@ -228,8 +239,9 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 		return exploreSourceLiteralRecall{}
 	}
 
+	recallBudget := s.sourceLiteralRecallBudget()
 	started := time.Now()
-	boundedCtx, cancelBounded := context.WithTimeout(ctx, 2*exploreSourceLiteralRecallBudget)
+	boundedCtx, cancelBounded := context.WithTimeout(ctx, 2*recallBudget)
 	defer cancelBounded()
 	type literalAttempt struct {
 		term       string
@@ -245,7 +257,7 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 		}
 		attemptCtx, cancelAttempt := context.WithTimeout(boundedCtx, budget)
 		defer cancelAttempt()
-		searchBudget := exploreSourceLiteralRecallBudget
+		searchBudget := recallBudget
 		if budget < searchBudget {
 			searchBudget = budget
 		}
@@ -308,9 +320,9 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 		return result
 	}
 
-	attemptBudget := 2 * exploreSourceLiteralRecallBudget
+	attemptBudget := 2 * recallBudget
 	if len(attemptTerms) > 1 {
-		attemptBudget = exploreSourceLiteralRecallBudget
+		attemptBudget = recallBudget
 	}
 	for index, term := range attemptTerms {
 		if boundedCtx.Err() != nil {
@@ -325,7 +337,7 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 		primary := results[0]
 		if fallback := exploreSourceLiteralFallback(terms, primary.term); fallback != "" &&
 			(len(primary.recall.hits) == 0 || primary.recall.ambiguous || primary.search.incomplete) {
-			run(fallback, 1, exploreSourceLiteralRecallBudget)
+			run(fallback, 1, recallBudget)
 		}
 	}
 	for _, term := range terms {
@@ -421,7 +433,7 @@ func (s *Server) mapDiscoveredExploreSourceLiteralMatches(
 	scope query.QueryOptions,
 	discoveryErr error,
 ) (exploreSourceLiteralRecall, error) {
-	mappingCtx, cancelMapping := context.WithTimeout(ctx, exploreSourceLiteralRecallBudget)
+	mappingCtx, cancelMapping := context.WithTimeout(ctx, s.sourceLiteralRecallBudget())
 	recall := s.mapExploreSourceLiteralMatchesContext(mappingCtx, term, search.matches, scope)
 	mappingErr := mappingCtx.Err()
 	cancelMapping()
