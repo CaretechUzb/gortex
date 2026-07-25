@@ -1,3 +1,5 @@
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Fzzet%2Fgortex.svg)](https://mcptoplist.com/server/glama%2Fzzet%2Fgortex)
+
 
 <div align="center">
 <p align="center">
