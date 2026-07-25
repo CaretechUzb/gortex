@@ -167,6 +167,9 @@ func newLogger() *zap.Logger {
 
 func execute() {
 	assignCommandGroups()
+	// Cobra only adds its own `help` and `completion` commands from inside
+	// Execute, so register them before anything below reads the command tree.
+	primeBuiltinCommands(os.Args[1:])
 	// Recover the `gortex <tool>` misuse (issue #259) before cobra prints a
 	// bare "unknown command": point the user at `gortex call <tool> --arg …`.
 	if maybeToolInvocationHint(os.Stderr, os.Args[1:]) {
