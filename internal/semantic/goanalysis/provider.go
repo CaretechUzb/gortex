@@ -307,12 +307,27 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// whole (possibly non-Go) repository — measured minutes on a Rust tree —
 	// and the pass would additionally hold the serialized gate for that whole
 	// time, stalling every genuine Go repo queued behind it.
-	if !goModulePresent(absRoot) {
+	loadDir, moduleRoots := goLoadDir(absRoot)
+	if moduleRoots == 0 {
 		return &semantic.EnrichResult{
 			Provider:       p.Name(),
 			Language:       "go",
 			Degraded:       true,
 			DegradedReason: "no go.mod/go.work within two directory levels; go/packages not attempted",
+		}, nil
+	}
+	// Several modules below the root and none at it: there is no single
+	// directory in which "./..." names all of them, so this pass has nothing
+	// correct to load. Report the shape rather than letting the loadability
+	// probe below call the modules unloadable, which they are not.
+	if loadDir == absRoot && !hasGoManifest(absRoot) {
+		return &semantic.EnrichResult{
+			Provider: p.Name(),
+			Language: "go",
+			Degraded: true,
+			DegradedReason: fmt.Sprintf(
+				"%d Go modules below the repository root and none at it; go/packages needs a single module directory",
+				moduleRoots),
 		}, nil
 	}
 
@@ -328,11 +343,12 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// normally and paying a second metadata enumeration on every healthy repo
 	// is a measured per-repo tax with no yield.
 	if !hasGoManifest(absRoot) {
-		if loadable, realPkgs, erroredPkgs := p.probeGoPackagesLoadable(ctx, absRoot); !loadable {
+		if loadable, realPkgs, erroredPkgs := p.probeGoPackagesLoadable(ctx, loadDir); !loadable {
 			if p.logger != nil {
 				p.logger.Info("go-types: skipping unloadable module before heavy load",
 					zap.String("repo_prefix", repoPrefix),
 					zap.String("root", absRoot),
+					zap.String("module_dir", loadDir),
 					zap.Int("real_packages", realPkgs),
 					zap.Int("errored_packages", erroredPkgs))
 			}
@@ -354,7 +370,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	if !goTypesNeedDepsClosure() {
 		depIndexStart := time.Now()
 		var depErr error
-		depIndex, depErr = p.loadDepModuleIndex(ctx, absRoot)
+		depIndex, depErr = p.loadDepModuleIndex(ctx, loadDir)
 		if depErr != nil && p.logger != nil {
 			p.logger.Warn("go-types: dependency metadata index failed; external classification degraded for this pass",
 				zap.String("repo_prefix", repoPrefix),
@@ -389,9 +405,12 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	if p.logger != nil {
 		p.logger.Info("go-types: package load starting",
 			zap.String("repo_prefix", repoPrefix),
-			zap.String("root", absRoot))
+			zap.String("root", absRoot),
+			zap.String("module_dir", loadDir))
 	}
-	pkgs, fset, err := p.loadPackagesContext(ctx, absRoot, "./...")
+	// absRoot stays the relativization base for every graph path below; only
+	// the directory go/packages runs in follows the module.
+	pkgs, fset, err := p.loadPackagesContext(ctx, loadDir, "./...")
 	if err != nil {
 		return nil, fmt.Errorf("load packages: %w", err)
 	}
@@ -919,7 +938,12 @@ func (p *Provider) EnrichFilesContext(ctx context.Context, g graph.Store, repoPr
 		}
 		patterns = append(patterns, "file="+filepath.Join(absRoot, filepath.FromSlash(relPath)))
 	}
-	pkgs, fset, err := p.loadPackagesContext(ctx, absRoot, patterns...)
+	// The file= patterns are absolute, but Dir still selects the module whose
+	// build list resolves them: a repository whose module lives in a
+	// subdirectory resolves nothing from the root. absRoot remains the
+	// relativization base for graph paths.
+	fileLoadDir, _ := goLoadDir(absRoot)
+	pkgs, fset, err := p.loadPackagesContext(ctx, fileLoadDir, patterns...)
 	if err != nil {
 		return nil, fmt.Errorf("load packages for %d files: %w", len(requestedFiles), err)
 	}
