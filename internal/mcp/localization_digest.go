@@ -846,7 +846,10 @@ func localizationTerminalStructuredContent(payload any, contract localizationTer
 	structured["completion"] = contract.Completion
 	structured["terminal"] = contract.Terminal
 	if contract.Terminal && contract.Completion.FinalResponse != "" {
-		structured["final_response"] = contract.Completion.FinalResponse
+		// completion already carries the answer, and the directive is its closing
+		// line. A second top-level copy is the same block billed twice at the
+		// cache-write rate, which is the most expensive place to repeat oneself:
+		// point at it instead.
 		structured["directive"] = localizationAnswerReadyDirective
 	}
 	return structured

@@ -102,8 +102,11 @@ func requireLocalizationTerminalReplay(t *testing.T, result *mcpgo.CallToolResul
 		contract.Completion.AllowedToolCalls != 0 || contract.Completion.FinalResponse == "" {
 		t.Fatalf("terminal replay contract = %#v", contract)
 	}
-	if structured["final_response"] != contract.Completion.FinalResponse ||
-		structured["directive"] != localizationAnswerReadyDirective {
+	// The answer rides the completion once; the top level carries only the
+	// pointer to it, so the same block is never billed twice on the wire.
+	if _, duplicated := structured["final_response"]; duplicated ||
+		structured["directive"] != localizationAnswerReadyDirective ||
+		contract.Completion.FinalResponse == "" {
 		t.Fatalf("terminal replay stable keys = %#v", structured)
 	}
 	if text != contract.Completion.FinalResponse {

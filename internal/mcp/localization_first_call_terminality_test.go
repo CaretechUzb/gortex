@@ -158,7 +158,13 @@ func TestTerminalExploreResultKeepsEvidenceBesideTheAnswer(t *testing.T) {
 	// the source it was just handed.
 	structured, ok := result.StructuredContent.(map[string]any)
 	require.True(t, ok, "terminal result must carry structured content")
-	require.Contains(t, structured, "final_response")
+	// The answer travels once, on the completion — a top-level duplicate would be
+	// the same block billed twice at the cache-write rate.
+	require.NotContains(t, structured, "final_response")
+	require.Contains(t, structured, "directive")
+	completionOut, ok := structured["completion"].(localizationCompletion)
+	require.True(t, ok)
+	require.Contains(t, completionOut.FinalResponse, "LOCALIZATION:")
 	require.Contains(t, structured, "files")
 	require.Contains(t, structured, "symbols")
 	require.Contains(t, structured, "evidence")
@@ -186,7 +192,7 @@ func TestTerminalProjectionKeepsTheToolsOwnPayload(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "repo/storage/disk.go::DiskStorage.Load", structured["symbol"])
 	require.Contains(t, structured["source"], "func (s *DiskStorage) Load")
-	require.Contains(t, structured, "final_response")
+	require.Contains(t, structured, "directive")
 }
 
 func TestExploreDelegatedImplementationCalleeRecognisesWrapperHelpers(t *testing.T) {
