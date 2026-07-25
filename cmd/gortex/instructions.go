@@ -9,8 +9,18 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/claudecode"
+	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/profiles"
 )
+
+// fileContains reports whether path exists and holds needle. Used to
+// decide whether an agent's rule block is installed at all; an
+// unreadable file is treated as "not installed" so a switch never
+// creates a surface `gortex install` did not.
+func fileContains(path, needle string) bool {
+	data, err := os.ReadFile(path)
+	return err == nil && strings.Contains(string(data), needle)
+}
 
 // instructions.go is the `gortex instructions` command tree — the CLI
 // front end for instruction profiles (internal/profiles): named
@@ -135,6 +145,19 @@ func runInstructionsSwitch(cmd *cobra.Command, args []string) error {
 		// profile only reaches agents through the @-include.
 		if md, err := os.ReadFile(claudecode.UserClaudeMdPath(home)); err != nil || !strings.Contains(string(md), agents.GlobalRulesStartMarker) {
 			cmd.Printf("Note: no Gortex rule block found in ~/.claude/CLAUDE.md — run `gortex install` to wire the @-include pointer.\n")
+		}
+
+		// Codex has no @-include: its rule block is a copy of the active
+		// profile body, so the switch has to rewrite it. Refresh only
+		// when a block is already installed — creation stays with
+		// `gortex install`, which is what decides Codex is set up at all.
+		if path := codex.GlobalInstructionsPath(home); fileContains(path, agents.GlobalRulesStartMarker) {
+			if _, err := agents.UpsertMarkedBlock(nil, path, agents.GlobalInlineBody(dir),
+				agents.GlobalRulesStartMarker, agents.GlobalRulesEndMarker, agents.ApplyOpts{}); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not refresh %s: %v\n", path, err)
+			} else {
+				cmd.Printf("Refreshed the Gortex rule block in %s.\n", path)
+			}
 		}
 	}
 

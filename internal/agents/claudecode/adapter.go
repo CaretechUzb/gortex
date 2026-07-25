@@ -617,10 +617,7 @@ func installPermissions(w io.Writer, settingsPath string, opts agents.ApplyOpts)
 // live for this install run: the Env override (tests) or the machine
 // default shared with the daemon and the `gortex instructions` verb.
 func instructionsDir(env agents.Env) string {
-	if env.InstructionsDir != "" {
-		return env.InstructionsDir
-	}
-	return profiles.DefaultDir()
+	return agents.InstructionsDir(env)
 }
 
 // SyncGlobalSkills reconciles ~/.claude/skills/gortex-* with the
