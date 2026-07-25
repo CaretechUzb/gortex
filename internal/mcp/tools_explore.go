@@ -3801,13 +3801,6 @@ func buildLocalizationExploreResultForTaskFinalized(
 	// most recoverable payload. A body that just retired a prescribed read is
 	// kept: it is the evidence the caller would otherwise have paid a call for.
 	for !localizationEnvelopeFits(envelope, maxBytes) {
-		// The unproven page goes first. It is a prose restatement of evidence
-		// rows this envelope already carries, so paying for it with those rows
-		// would cost the caller real information to keep a convenience copy.
-		if envelope.Completion.State != localizationStateAnswerReady && envelope.Completion.FinalResponse != "" {
-			envelope.Completion.FinalResponse = ""
-			continue
-		}
 		if digest != nil && len(digest.Evidence) > localizationFinalResponsePrimaryLimit {
 			digest.Evidence = digest.Evidence[:len(digest.Evidence)-1]
 			rebuildLocalizationDigestSkeleton(digest)
@@ -3824,6 +3817,20 @@ func buildLocalizationExploreResultForTaskFinalized(
 			shed = index
 		}
 		if shed < 0 {
+			// Last resort. The unproven page is the answer a caller that stops
+			// here would give, so it outranks every packed body and survives
+			// until nothing else can be given back — and even then it goes only
+			// if going makes the envelope fit. Dropping it from a response that
+			// is over budget either way costs the caller its answer and buys
+			// nothing.
+			page := envelope.Completion.FinalResponse
+			if envelope.Completion.State != localizationStateAnswerReady && page != "" {
+				envelope.Completion.FinalResponse = ""
+				if localizationEnvelopeFits(envelope, maxBytes) {
+					break
+				}
+				envelope.Completion.FinalResponse = page
+			}
 			break
 		}
 		envelope.Evidence[shed].Source = ""
