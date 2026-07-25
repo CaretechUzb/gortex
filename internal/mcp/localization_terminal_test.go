@@ -205,24 +205,20 @@ func TestLocalizationCompletionEnvelope(t *testing.T) {
 	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
 		t.Fatalf("decode completion envelope: %v\n%s", err, text)
 	}
-	// A ranked page that answers the request completes on this call: hard
-	// enforcement still needs a provenance proof, terminality does not.
-	if envelope.Completion.State != localizationStateAnswerReady || envelope.Completion.RequiredAction != "respond" || envelope.Completion.AllowedToolCalls != 0 {
+	// Unproven ranked evidence keeps its one bounded call; the payload still
+	// carries the ranked rows the caller needs to spend it well.
+	if envelope.Completion.State != localizationStateNeedsRecovery || envelope.Completion.RequiredAction != "recover_once" || envelope.Completion.AllowedToolCalls != 1 {
 		t.Fatalf("unexpected completion: %#v", envelope.Completion)
 	}
-	if envelope.Completion.Enforceable {
-		t.Fatalf("unproven evidence must not be enforceable: %#v", envelope.Completion)
-	}
-	if !envelope.Terminal {
-		t.Fatalf("answer-ready envelope must be terminal: %#v", envelope)
+	if envelope.Completion.Enforceable || envelope.Terminal {
+		t.Fatalf("unproven evidence must not be enforceable or terminal: %#v", envelope.Completion)
 	}
 	for _, required := range []string{
-		"LOCALIZATION:",
-		"repo/pkg/file.go::Run",
-		localizationAnswerReadyDirective,
+		"Gortex MCP recovery call",
+		"Do not call host Read, Grep, Glob, Bash",
 	} {
-		if !strings.Contains(envelope.Completion.FinalResponse, required) {
-			t.Fatalf("final response %q does not contain %q", envelope.Completion.FinalResponse, required)
+		if !strings.Contains(envelope.Completion.Instruction, required) {
+			t.Fatalf("recovery instruction %q does not contain %q", envelope.Completion.Instruction, required)
 		}
 	}
 	if len(envelope.Files) != 1 || len(envelope.Symbols) != 1 || envelope.Symbols[0] != "repo/pkg/file.go::Run" || len(envelope.Evidence) != 1 {

@@ -18,7 +18,7 @@ func firstCallEvidence(id, name, file, source string) localizationEvidence {
 	}
 }
 
-func TestLocalizationEvidencePolicyKeepsRankedReadinessTerminal(t *testing.T) {
+func TestLocalizationEvidencePolicyHoldsRankedReadinessWithoutProof(t *testing.T) {
 	node := &graph.Node{
 		ID: "repo/storage/disk.go::DiskStorage.Load", Name: "DiskStorage.Load",
 		Kind: graph.KindMethod, FilePath: "storage/disk.go",
@@ -34,13 +34,13 @@ func TestLocalizationEvidencePolicyKeepsRankedReadinessTerminal(t *testing.T) {
 		"DiskStorage.Load truncates large payloads",
 		envelope.Completion, []exploreTarget{{node: node}}, envelope,
 	)
-	// Without one of the hard provenance shapes the page keeps its ranked
-	// verdict and only forfeits enforcement — it never bills another call.
-	require.Equal(t, localizationStateAnswerReady, finalized.State)
-	require.Equal(t, "respond", finalized.RequiredAction)
-	require.Equal(t, 0, finalized.AllowedToolCalls)
+	// Without one of the hard provenance shapes the ranked verdict does not end
+	// navigation: the page spends its one bounded call before answering.
+	require.Equal(t, localizationStateNeedsRecovery, finalized.State)
+	require.Equal(t, "recover_once", finalized.RequiredAction)
+	require.Equal(t, 1, finalized.AllowedToolCalls)
 	require.False(t, finalized.Enforceable)
-	require.True(t, localizationContractFor(finalized).Terminal)
+	require.False(t, localizationContractFor(finalized).Terminal)
 }
 
 func TestLocalizationExactReadSatisfiedOnlyByPackedAlignedBody(t *testing.T) {
@@ -137,10 +137,17 @@ func TestTerminalExploreResultKeepsEvidenceBesideTheAnswer(t *testing.T) {
 			"search_qual_name": "storage.DiskStorage.Load",
 		},
 	}
+	// A source-literal callee is one of the hard provenance shapes, so this page
+	// is terminal on any branch — the assertion below is about what a terminal
+	// page CARRIES, not about when a page becomes terminal.
+	target := exploreTarget{
+		node: node, source: "func (s *DiskStorage) Load(path string) ([]byte, error) { return nil, nil }",
+		sourceLiteral: true, sourceLiteralCallee: true, exactContent: true,
+	}
 	result, _, _, completion := buildLocalizationExploreResultForTaskFinalized(
 		newLocalizationCompletion(true, ""),
 		"DiskStorage.Load truncates large payloads",
-		[]exploreTarget{{node: node, source: "func (s *DiskStorage) Load(path string) ([]byte, error) { return nil, nil }"}},
+		[]exploreTarget{target},
 		exploreDefaultBudgetTokens,
 	)
 	require.Equal(t, localizationStateAnswerReady, completion.State)

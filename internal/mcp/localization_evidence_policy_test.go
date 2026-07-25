@@ -39,7 +39,7 @@ func requireLocalizationHostContractMatchesVisible(
 	return host
 }
 
-func TestLocalizationEvidencePolicyKeepsWeakOwnerTerminalWithoutEnforcementFromSQLiteCSharpIndex(t *testing.T) {
+func TestLocalizationEvidencePolicyHoldsWeakOwnerForOneBoundedCallFromSQLiteCSharpIndex(t *testing.T) {
 	root := t.TempDir()
 	rel := "src/Humanizer/Localisation/Localiser.cs"
 	path := filepath.Join(root, filepath.FromSlash(rel))
@@ -95,20 +95,20 @@ func TestLocalizationEvidencePolicyKeepsWeakOwnerTerminalWithoutEnforcementFromS
 		newLocalizationCompletion(true, ""), `FindLocaliser handles the literal "ku"`,
 		[]exploreTarget{target}, exploreDefaultBudgetTokens,
 	)
-	// An advisory owner (no resolved call edge) cannot buy hard enforcement,
-	// but the ranked page already answers the request: it ends navigation.
-	require.Equal(t, localizationStateAnswerReady, completion.State)
+	// An advisory owner (no resolved call edge) neither proves the answer nor
+	// ends navigation: the page keeps its one bounded call.
+	require.Equal(t, localizationStateNeedsRecovery, completion.State)
 	require.False(t, completion.Enforceable)
-	require.Equal(t, "respond", completion.RequiredAction)
-	require.Equal(t, 0, completion.AllowedToolCalls)
-	require.Empty(t, completion.AllowedOperations)
+	require.Equal(t, "recover_once", completion.RequiredAction)
+	require.Equal(t, 1, completion.AllowedToolCalls)
+	require.Equal(t, localizationRecoveryOperations, completion.AllowedOperations)
 
 	body, ok := singleTextContent(result)
 	require.True(t, ok)
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(body), &envelope))
-	require.True(t, envelope.Terminal)
-	require.Equal(t, localizationStateAnswerReady, envelope.Completion.State)
+	require.False(t, envelope.Terminal)
+	require.Equal(t, localizationStateNeedsRecovery, envelope.Completion.State)
 	require.False(t, envelope.Completion.Enforceable)
 	require.Len(t, envelope.Evidence, 1)
 	require.Empty(t, envelope.Evidence[0].Provenance)
