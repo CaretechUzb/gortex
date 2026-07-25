@@ -33,24 +33,63 @@ var moduleProbeSkippedDirs = map[string]struct{}{
 // falls back to a GOPATH-mode scan of the entire repository, which on a
 // non-Go tree costs minutes and yields nothing.
 func goModulePresent(root string) bool {
+	return len(goModuleRoots(root)) > 0
+}
+
+// goModuleRoots returns every directory — root itself, or one at most two
+// levels below it — that carries a go.mod or go.work, shallowest first and
+// otherwise in directory order.
+//
+// goModulePresent only answers whether a manifest is in reach. Returning the
+// locations is what lets the caller run go/packages in the directory that
+// actually owns the module. A repository whose Go code lives in a
+// subdirectory (services/foo, backend/, src/go/) is a healthy module; only
+// "./..." evaluated from the repository root is meaningless for it, and that
+// is an argument about where to run, not about whether the module resolves.
+//
+// The walk shares moduleProbeBudget with the boolean form, so the cost stays
+// bounded on a pathological tree.
+func goModuleRoots(root string) []string {
+	var roots []string
 	if hasGoManifest(root) {
-		return true
+		roots = append(roots, root)
 	}
 	budget := moduleProbeBudget
 	level1 := listProbeSubdirs(root, &budget)
 	for _, dir := range level1 {
 		if hasGoManifest(dir) {
-			return true
+			roots = append(roots, dir)
 		}
 	}
 	for _, dir := range level1 {
 		for _, sub := range listProbeSubdirs(dir, &budget) {
 			if hasGoManifest(sub) {
-				return true
+				roots = append(roots, sub)
 			}
 		}
 	}
-	return false
+	return roots
+}
+
+// goLoadDir reports the directory go/packages must run in for root, and how
+// many module roots were found.
+//
+// A manifest at the repository root keeps the historical behaviour exactly.
+// Otherwise the single module below the root is the only directory in which
+// "./..." names that module's packages. When several modules sit below the
+// root and none is at it there is no single correct directory, so the caller
+// degrades — as it already did, but now for a reason that names the shape
+// instead of reporting the module as unloadable.
+func goLoadDir(root string) (dir string, moduleRoots int) {
+	roots := goModuleRoots(root)
+	switch {
+	case len(roots) == 0:
+		return root, 0
+	case hasGoManifest(root), len(roots) == 1:
+		return roots[0], len(roots)
+	default:
+		return root, len(roots)
+	}
 }
 
 func hasGoManifest(dir string) bool {
