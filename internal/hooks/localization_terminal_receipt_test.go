@@ -120,10 +120,16 @@ func TestLocalizationReceiptMarkerStrengthControlsPreToolUse(t *testing.T) {
 				tool       string
 				input      map[string]any
 				navigation bool
+				// redirected marks a host tool whose access-policy deny would
+				// prescribe a Gortex graph call — a call the marker above then
+				// refuses. The marker answers those itself.
+				redirected bool
 			}{
 				{name: "direct navigation", tool: gortexMCPToolPrefix + "read", input: map[string]any{"operation": "source"}, navigation: true},
 				{name: "plugin navigation", tool: gortexPluginMCPToolPrefix + "search", input: map[string]any{"operation": "symbols"}, navigation: true},
-				{name: "host read", tool: "Read", input: map[string]any{"file_path": "README.md"}},
+				{name: "host read", tool: "Read", input: map[string]any{"file_path": "README.md"}, redirected: true},
+				{name: "host grep", tool: "Grep", input: map[string]any{"pattern": "load"}, redirected: true},
+				{name: "host glob", tool: "Glob", input: map[string]any{"pattern": "**/*.go"}, redirected: true},
 				{name: "host web search", tool: "WebSearch", input: map[string]any{"query": "storage"}},
 				{name: "direct non-navigation Gortex", tool: gortexMCPToolPrefix + "workspace", input: map[string]any{"operation": "info"}},
 				{name: "plugin non-navigation Gortex", tool: gortexPluginMCPToolPrefix + "change", input: map[string]any{"operation": "impact"}},
@@ -138,7 +144,7 @@ func TestLocalizationReceiptMarkerStrengthControlsPreToolUse(t *testing.T) {
 							t.Fatalf("decode PreToolUse output %q: %v", encoded, err)
 						}
 					}
-					wantDenied := tt.enforceable || check.navigation
+					wantDenied := tt.enforceable || check.navigation || check.redirected
 					if !wantDenied {
 						if output.HookSpecificOutput != nil && output.HookSpecificOutput.PermissionDecision == "deny" {
 							t.Fatalf("advisory marker denied pass-through tool: %#v", output.HookSpecificOutput)

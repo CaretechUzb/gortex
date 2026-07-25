@@ -41,6 +41,22 @@ var localizationNavigationOperations = map[string]struct{}{
 	"analyze":   {},
 }
 
+// localizationRedirectedHostTools are the host tools whose access-policy deny
+// answers with "call a Gortex graph tool instead". While a localization marker
+// is live that advice walks the caller straight into a refusal — measured as
+// advise-then-refuse pairs, one wasted turn each — so the marker answers these
+// tools itself rather than prescribing a call it will not honour.
+var localizationRedirectedHostTools = map[string]struct{}{
+	"Read": {},
+	"Grep": {},
+	"Glob": {},
+}
+
+func localizationRedirectedHostTool(tool string) bool {
+	_, redirected := localizationRedirectedHostTools[tool]
+	return redirected
+}
+
 var preToolUsePolicyTools = map[string]struct{}{
 	"Read":  {},
 	"Grep":  {},

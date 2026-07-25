@@ -113,6 +113,12 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 				reason = localizationTerminalDenyReason
 			case localizationNavigationTool(input.ToolName):
 				reason = localizationAdvisoryDenyReason
+			case localizationRedirectedHostTool(input.ToolName):
+				// Left to the access policy this deny becomes "call a Gortex
+				// graph tool instead", and the branch above then refuses that
+				// call. Prescribing a step we will not honour spends the
+				// caller's turn and teaches it nothing, so answer here instead.
+				reason = localizationAdvisoryDenyReason
 			}
 			if reason != "" {
 				// Hand the answer back with the refusal. A bare "you are done"
