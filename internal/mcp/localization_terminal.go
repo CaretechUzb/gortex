@@ -700,6 +700,36 @@ func localizationRecoveryConcreteIdentifier(query string) bool {
 	return hasQualifier || hasCaseBoundary || (unicode.IsUpper(runes[0]) && hasUpper && hasLower)
 }
 
+// localizationTermMatchesAcrossJoin reports whether a candidate term matches a
+// requested term set across the one systematic difference between prose and
+// code: prose separates what an identifier joins. "DevTools" in a sentence
+// tokenizes to [dev tool] while devtoolsImpl tokenizes to [devtool impl], so a
+// direct set intersection is empty for the very symbol the request is about.
+// Matching a candidate against a term plus its remainder closes that gap
+// without loosening what the terms themselves have to be.
+func localizationTermMatchesAcrossJoin(candidate string, terms map[string]struct{}) bool {
+	if candidate == "" {
+		return false
+	}
+	if _, exact := terms[candidate]; exact {
+		return true
+	}
+	const minJoinPart = 3
+	for term := range terms {
+		if len(term) < minJoinPart || len(candidate) <= len(term) || !strings.HasPrefix(candidate, term) {
+			continue
+		}
+		remainder := candidate[len(term):]
+		if len(remainder) < minJoinPart {
+			continue
+		}
+		if _, joined := terms[remainder]; joined {
+			return true
+		}
+	}
+	return false
+}
+
 func localizationReservedReadEvidenceAlignedWithLead(task, lead, requested string, rows []localizationDigestRow) bool {
 	if strings.TrimSpace(task) == "" || len(rows) == 0 {
 		return false
@@ -726,10 +756,13 @@ func localizationReservedReadEvidenceAlignedWithLead(task, lead, requested strin
 		overallOverlap := 0
 		leadOverlap := 0
 		for term := range candidateTerms {
-			if _, aligned := taskTerms[term]; aligned {
+			// Both counters cross the same prose/identifier boundary, so both
+			// need the join: a request naming its subject in separated words
+			// must still match the symbol that spells it as one.
+			if localizationTermMatchesAcrossJoin(term, taskTerms) {
 				overallOverlap++
 			}
-			if _, aligned := leadTerms[term]; aligned {
+			if localizationTermMatchesAcrossJoin(term, leadTerms) {
 				leadOverlap++
 			}
 		}
@@ -814,7 +847,8 @@ func localizationDigestRowLacksRecoveryLeadCoverage(row localizationDigestRow, l
 	}
 	matchedConcepts := 0
 	for term := range leadTerms {
-		if exploreIdentifierTerminalMatches(row.Name, []string{term}) == 0 {
+		if exploreIdentifierTerminalMatches(row.Name, []string{term}) == 0 &&
+			!localizationRowIdentifierJoinsLeadTerm(row.Name, term, leadTerms) {
 			continue
 		}
 		matchedConcepts++
@@ -1693,4 +1727,22 @@ func (s *Server) localizationFor(ctx context.Context) *localizationTerminalState
 		return s.localization
 	}
 	return s.sessions.get(id).localization
+}
+
+// localizationRowIdentifierJoinsLeadTerm applies the prose/identifier join to a
+// row's own name, so a name the request describes in separated words is not
+// refused for spelling it as one word.
+func localizationRowIdentifierJoinsLeadTerm(name, term string, leadTerms map[string]struct{}) bool {
+	if strings.TrimSpace(name) == "" || term == "" {
+		return false
+	}
+	for candidate := range exploreTerminalTerms(name) {
+		if !strings.HasPrefix(candidate, term) {
+			continue
+		}
+		if localizationTermMatchesAcrossJoin(candidate, leadTerms) {
+			return true
+		}
+	}
+	return false
 }
