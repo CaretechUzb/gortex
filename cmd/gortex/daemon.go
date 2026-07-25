@@ -594,19 +594,17 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		if v1EventHub != nil && mw != nil {
 			go v1EventHub.Run(mw.Events())
 		}
-		// Community detection and process discovery only run when a
-		// repo is tracked or indexed via MCP — a daemon coming up off
-		// a snapshot never triggers them. Fire once here so
-		// get_communities / get_processes / dashboards reflect the
-		// loaded graph instead of returning "run index_repository
-		// first" against a fully populated state.
+		// Community detection and process discovery are a whole-graph pass
+		// costing minutes on a large workspace, and most sessions never ask
+		// for them. Running it here delayed readiness and kept the result
+		// resident for every daemon whether or not anything read it, so the
+		// pass is now started by the first consumer that needs it: those
+		// tools answer with a retry hint while it runs in the background
+		// instead of the old "run index_repository first", which was
+		// misleading against a fully populated graph.
 		if state.mcpServer != nil {
-			analysisStart := time.Now()
-			publishReadinessPhase(state, "analysis", true, nil)
-			state.mcpServer.RunAnalysis()
-			warmup.analysis = time.Since(analysisStart)
-			publishReadinessPhase(state, "analysis_done", true, map[string]any{
-				"elapsed_ms": warmup.analysis.Milliseconds(),
+			publishReadinessPhase(state, "analysis_deferred", true, map[string]any{
+				"reason": "analysis runs on first use",
 			})
 			// Co-change pre-warm: fire the git-history mine in the
 			// background so the first user-visible

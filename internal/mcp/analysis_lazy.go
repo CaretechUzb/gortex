@@ -143,7 +143,14 @@ func (s *Server) analysisProcessesForNodes(nodeIDs []string) ([]graph.AnalysisPr
 // generation receipt and graph tokens remain published, so the next request can
 // query bounded rows without a whole-graph recomputation.
 func (s *Server) releaseTransientAnalysisIfIdle() bool {
-	s.analysisMu.Lock()
+	// This runs on the tail of every tool call while an analysis pass holds
+	// analysisMu for its whole multi-minute run, so taking the lock
+	// unconditionally stalls every request — including ones that never touch
+	// analysis — behind that pass. The release is pure opportunistic
+	// housekeeping, so a contended lock defers it to the next call.
+	if !s.analysisMu.TryLock() {
+		return false
+	}
 	defer s.analysisMu.Unlock()
 	if !s.analysisGenerationReady {
 		return false
