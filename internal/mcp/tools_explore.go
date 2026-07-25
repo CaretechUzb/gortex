@@ -4077,15 +4077,6 @@ func ringNeighbors(nodes []*graph.Node, selfID string, cap int) []*graph.Node {
 	return out
 }
 
-// ringFileShare bounds how many of the exposed ring slots one file may take
-// before other files get a turn. A ring is a map of the neighbourhood, and a
-// neighbourhood described entirely by one file is not a map — measured, the
-// symbol a request is about often sits in the second file, inside the full
-// ring but past the exposed prefix. Neighbours held back are not lost: they
-// fill whatever slots remain once the spread is covered, so this costs no
-// extra bytes and only changes which neighbours are shown.
-const ringFileShare = 2
-
 // ringNeighborsProjection also reports whether every eligible neighbor fit in
 // the projection. Callers can reject uniqueness claims made from a saturated
 // ring without issuing another graph query.
@@ -4094,27 +4085,11 @@ func ringNeighborsProjection(nodes []*graph.Node, selfID string, cap int) ([]*gr
 		return nil, false
 	}
 	out := make([]*graph.Node, 0, cap)
-	crowded := make([]*graph.Node, 0, cap)
-	perFile := make(map[string]int, cap)
 	complete := true
 	for _, n := range nodes {
 		if n == nil || n.ID == selfID || !exploreLocalizableKind(n.Kind) {
 			continue
 		}
-		if len(out) >= cap {
-			complete = false
-			continue
-		}
-		if perFile[n.FilePath] >= ringFileShare {
-			crowded = append(crowded, n)
-			continue
-		}
-		perFile[n.FilePath]++
-		out = append(out, n)
-	}
-	// Diversity reorders the ring, it never shrinks it: whatever one file gave
-	// up comes back as soon as the spread is covered.
-	for _, n := range crowded {
 		if len(out) >= cap {
 			complete = false
 			continue
