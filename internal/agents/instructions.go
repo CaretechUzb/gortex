@@ -67,7 +67,48 @@ func GlobalPointerBody(instructionsDir string) string {
 	return "## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob\n\n" +
 		"The machine-wide Gortex rules load from the active instruction profile, imported below:\n\n" +
 		"@" + active + "\n\n" +
-		"Switch guidance depth with `gortex instructions switch <core|localization|full>` (`list` shows all) — applies to NEW sessions only.\n"
+		switchDepthLine
+}
+
+// switchDepthLine is the profile-discovery footer the pointer body
+// carries, so a machine that switched guidance depth can always find its
+// way back. The generated profile bodies end with their own switch-back
+// bullet; this is for the surfaces that do not embed one.
+const switchDepthLine = "Switch guidance depth with `gortex instructions switch <core|localization|full>` (`list` shows all) — applies to NEW sessions only.\n"
+
+// GlobalInlineBody renders the machine-level rule block for agents whose
+// instructions file is consumed as literal markdown, with no @-include
+// mechanism to follow. Claude Code gets GlobalPointerBody — a thin
+// pointer at <instructionsDir>/active.md, so `gortex instructions
+// switch` never has to rewrite CLAUDE.md. Codex reads its AGENTS.md
+// verbatim (an @path line is prose to it), so it gets a copy of the
+// active profile body inlined instead. The block is marker-fenced, so
+// `gortex install` and `gortex instructions switch` both refresh the
+// copy in place rather than appending a second one.
+//
+// No switch-back footer is appended: every generated profile body
+// already ends with one, and the file Codex loads on every session
+// should not pay for the same line twice.
+func GlobalInlineBody(instructionsDir string) string {
+	body := strings.TrimRight(profiles.Active(instructionsDir).Body(), "\n")
+	if body == "" {
+		// No profile row resolved (unknown name, empty table row): fall
+		// back to the shared agent-neutral block plus the switch footer,
+		// so the agent still gets the rule rather than an empty fence.
+		return strings.TrimRight(InstructionsBody, "\n") + "\n\n" + switchDepthLine
+	}
+	return body + "\n"
+}
+
+// InstructionsDir resolves where the generated instruction profiles live
+// for an install run: the Env override (tests pin a temp dir) or the
+// machine default shared with the daemon and the `gortex instructions`
+// verb.
+func InstructionsDir(env Env) string {
+	if env.InstructionsDir != "" {
+		return env.InstructionsDir
+	}
+	return profiles.DefaultDir()
 }
 
 // InstructionsBody is the shared, agent-neutral rule block every doc-aware

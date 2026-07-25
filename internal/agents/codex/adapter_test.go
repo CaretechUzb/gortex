@@ -1154,3 +1154,189 @@ func hasHookCommand(t *testing.T, cfg map[string]any, event string, command stri
 	}
 	return false
 }
+
+// TestCodexInstallWritesGlobalInstructions covers the surface that makes a
+// Codex session reach for Gortex at all. Codex merges ~/.codex/AGENTS.md into
+// every session; without a block there, the only Gortex guidance a session can
+// get is the SessionStart hook — which Codex skips until the user trusts it.
+func TestCodexInstallWritesGlobalInstructions(t *testing.T) {
+	env := codexGlobalEnv(t)
+	env.InstallGlobalInstructions = true
+	a := New()
+
+	res, err := a.Apply(env, agents.ApplyOpts{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	path := GlobalInstructionsPath(env.Home)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	got := string(data)
+	if !strings.Contains(got, agents.InstructionsSentinel) {
+		t.Fatalf("expected the mandatory-rule sentinel in %s:\n%s", path, got)
+	}
+	if !strings.Contains(got, agents.GlobalRulesStartMarker) || !strings.Contains(got, agents.GlobalRulesEndMarker) {
+		t.Fatalf("expected a marker-fenced block in %s:\n%s", path, got)
+	}
+	// Codex reads AGENTS.md as literal markdown — an @-include line is prose
+	// to it, so the profile body must be inlined, not pointed at.
+	if strings.Contains(got, "@"+filepath.Join(env.InstructionsDir, "active.md")) {
+		t.Fatalf("expected an inlined body, got an @-include pointer:\n%s", got)
+	}
+	if !strings.Contains(got, "explore") {
+		t.Fatalf("expected the active profile body to be inlined:\n%s", got)
+	}
+
+	var reported bool
+	for _, f := range res.Files {
+		if f.Path == path {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Fatalf("apply did not report %s in its file actions: %#v", path, res.Files)
+	}
+}
+
+// TestCodexGlobalInstructionsIdempotent asserts a re-run leaves exactly one
+// block. `gortex install` is re-run after every upgrade, so an appending
+// writer would grow the file Codex loads on every session without bound.
+func TestCodexGlobalInstructionsIdempotent(t *testing.T) {
+	env := codexGlobalEnv(t)
+	env.InstallGlobalInstructions = true
+	a := New()
+
+	for i := 0; i < 3; i++ {
+		if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+			t.Fatalf("apply %d: %v", i, err)
+		}
+	}
+	data, err := os.ReadFile(GlobalInstructionsPath(env.Home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(data), agents.GlobalRulesStartMarker); n != 1 {
+		t.Fatalf("expected exactly one rule block after 3 applies, got %d", n)
+	}
+}
+
+// TestCodexGlobalInstructionsPreservesUserContent asserts the block merges
+// into a personal AGENTS.md instead of replacing it.
+func TestCodexGlobalInstructionsPreservesUserContent(t *testing.T) {
+	env := codexGlobalEnv(t)
+	env.InstallGlobalInstructions = true
+	path := GlobalInstructionsPath(env.Home)
+	if err := os.WriteFile(path, []byte("# My rules\n\nAlways run gofmt.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "Always run gofmt.") {
+		t.Fatalf("user content was clobbered:\n%s", got)
+	}
+	if !strings.Contains(got, agents.InstructionsSentinel) {
+		t.Fatalf("rule block missing after merge:\n%s", got)
+	}
+}
+
+// TestCodexGlobalInstructionsOptOutAndScope pins the two cases that must not
+// write the file: --no-claude-md (InstallGlobalInstructions=false) and project
+// mode, where `gortex init` has no business writing user-level rules.
+func TestCodexGlobalInstructionsOptOutAndScope(t *testing.T) {
+	t.Run("opt-out", func(t *testing.T) {
+		env := codexGlobalEnv(t)
+		env.InstallGlobalInstructions = false
+		if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if _, err := os.Stat(GlobalInstructionsPath(env.Home)); !os.IsNotExist(err) {
+			t.Fatalf("--no-claude-md should not write %s (stat err=%v)", GlobalInstructionsPath(env.Home), err)
+		}
+	})
+	t.Run("project-mode", func(t *testing.T) {
+		env := codexGlobalEnv(t)
+		env.Mode = agents.ModeProject
+		env.InstallGlobalInstructions = true
+		if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if _, err := os.Stat(GlobalInstructionsPath(env.Home)); !os.IsNotExist(err) {
+			t.Fatalf("project mode should not write user-level rules (stat err=%v)", err)
+		}
+	})
+}
+
+// TestCodexGlobalInstructionsDryRun asserts --dry-run plans the write without
+// touching disk, and that Plan agrees with what Apply would do.
+func TestCodexGlobalInstructionsDryRun(t *testing.T) {
+	env := codexGlobalEnv(t)
+	env.InstallGlobalInstructions = true
+	a := New()
+
+	plan, err := a.Plan(env)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	var planned bool
+	for _, f := range plan.Files {
+		if f.Path == GlobalInstructionsPath(env.Home) {
+			planned = true
+		}
+	}
+	if !planned {
+		t.Fatalf("plan omitted %s: %#v", GlobalInstructionsPath(env.Home), plan.Files)
+	}
+
+	if _, err := a.Apply(env, agents.ApplyOpts{DryRun: true}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if _, err := os.Stat(GlobalInstructionsPath(env.Home)); !os.IsNotExist(err) {
+		t.Fatalf("dry-run wrote %s (stat err=%v)", GlobalInstructionsPath(env.Home), err)
+	}
+}
+
+// TestCodexHookInstallWarnsAboutTrust pins the notice that makes an otherwise
+// silent failure visible: Codex hashes each non-managed hook and skips new or
+// changed ones until they are trusted in `/hooks`, so writing the hook set is
+// only half the job. The notice must not repeat once the hooks are unchanged.
+func TestCodexHookInstallWarnsAboutTrust(t *testing.T) {
+	env := codexGlobalEnv(t)
+	a := New()
+
+	res, err := a.Apply(env, agents.ApplyOpts{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res.Warnings) == 0 {
+		t.Fatal("expected a hook-trust notice on first install")
+	}
+	found := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "/hooks") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("hook-trust notice should name /hooks: %#v", res.Warnings)
+	}
+
+	// Second run changes nothing, so the trust hashes still match and there
+	// is nothing for the user to re-approve.
+	res2, err := a.Apply(env, agents.ApplyOpts{})
+	if err != nil {
+		t.Fatalf("re-apply: %v", err)
+	}
+	if len(res2.Warnings) != 0 {
+		t.Fatalf("unchanged hooks should not re-warn: %#v", res2.Warnings)
+	}
+}
