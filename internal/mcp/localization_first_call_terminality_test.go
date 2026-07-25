@@ -55,14 +55,14 @@ func TestLocalizationExactReadSatisfiedOnlyByPackedAlignedBody(t *testing.T) {
 			firstCallEvidence(symbol, "DiskStorage.Load", "storage/disk.go", body),
 		},
 	}
-	require.True(t, localizationExactReadSatisfiedByEnvelope(task, packed),
+	require.True(t, localizationPrescribedReadSatisfiedByEnvelope(task, symbol, packed),
 		"a packed, task-aligned body is exactly what the prescribed read would return")
 
 	withoutBody := packed
 	withoutBody.Evidence = []localizationEvidence{
 		firstCallEvidence(symbol, "DiskStorage.Load", "storage/disk.go", ""),
 	}
-	require.False(t, localizationExactReadSatisfiedByEnvelope(task, withoutBody),
+	require.False(t, localizationPrescribedReadSatisfiedByEnvelope(task, symbol, withoutBody),
 		"a signature-only row still owes the caller the body")
 
 	absent := packed
@@ -70,12 +70,12 @@ func TestLocalizationExactReadSatisfiedOnlyByPackedAlignedBody(t *testing.T) {
 		firstCallEvidence("repo/storage/cloud.go::CloudStorage.Load", "CloudStorage.Load",
 			"storage/cloud.go", body),
 	}
-	require.False(t, localizationExactReadSatisfiedByEnvelope(task, absent),
+	require.False(t, localizationPrescribedReadSatisfiedByEnvelope(task, symbol, absent),
 		"another symbol's body cannot satisfy the authorized read")
 
 	unset := packed
 	unset.Completion = newLocalizationCompletion(true, "")
-	require.False(t, localizationExactReadSatisfiedByEnvelope(task, unset))
+	require.False(t, localizationPrescribedReadSatisfiedByEnvelope(task, "", unset))
 }
 
 func TestExploreLocalizationTestLaneNodeExemptsTestIntentAndExplicitAnchor(t *testing.T) {

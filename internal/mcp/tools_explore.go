@@ -3724,9 +3724,10 @@ func buildLocalizationExploreResultForTaskFinalized(
 	for index := range acceptedTargets {
 		appendBodyIndex(index)
 	}
-	// A needs-refinement response deliberately carries no source body. The
-	// single authorized read supplies the chosen body once; embedding it here
-	// would duplicate the largest payload and still require the same read.
+	// A needs-refinement response carries no source body by default: the single
+	// authorized read supplies the chosen body once, and duplicating it here
+	// would pay the largest payload twice. The one exception is handled below —
+	// a body that lets the page retire the read outright is not a duplicate.
 	if completion.State != localizationStateNeedsRefinement {
 		for _, index := range bodyOrder {
 			if acceptedTargets[index].source == "" {
@@ -3748,10 +3749,38 @@ func buildLocalizationExploreResultForTaskFinalized(
 	// would spend a call to receive the body packed above. Complete instead,
 	// keeping the same evidence and the same lead-alignment bar.
 	satisfiedSymbol := ""
+	prescribedEnvelope := envelope
+	// Inlining a body is only worth its bytes if the page can then drop the
+	// instruction to go and read it. Measurement is explicit here: inlining
+	// alone leaves most callers reading the symbol anyway, because the page
+	// still told them to. So pack the body and retire the read together, or
+	// do neither — the half-measure costs payload and saves no call.
+	if prescribed := localizationPrescribedSymbol(envelope.Completion); prescribed != "" {
+		retiring := envelope
+		if envelope.Completion.State == localizationStateNeedsRefinement {
+			retiring = localizationEnvelopePackingPrescribedBody(
+				envelope, acceptedTargets, bodyOrder, prescribed, maxBytes)
+		}
+		if localizationPrescribedReadSatisfiedByEnvelope(task, prescribed, retiring) {
+			satisfiedSymbol = prescribed
+			envelope = retiring
+			envelope.Completion = localizationCompletionRetiringPrescribedRead(envelope.Completion)
+		}
+	}
 	// Strong enforcement is derived only from proof rows that survived final
 	// byte-budget packing. Visible text, retained state, and host metadata then
 	// share this one normalized completion value.
 	envelope.Completion = localizationFinalizeCompletionEvidence(task, envelope.Completion, acceptedTargets, envelope)
+	if satisfiedSymbol != "" && envelope.Completion.State != localizationStateAnswerReady {
+		// The policy would not stand behind the retirement — an unproven answer
+		// is demoted to a recovery page, which is a worse offer than the bounded
+		// read we started from. Put back the prescription, and with it the bytes
+		// that only made sense if the read went away.
+		satisfiedSymbol = ""
+		envelope = prescribedEnvelope
+		envelope.Completion = localizationFinalizeCompletionEvidence(
+			task, envelope.Completion, acceptedTargets, envelope)
+	}
 	contract = localizationContractFor(envelope.Completion)
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal

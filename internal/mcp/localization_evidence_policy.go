@@ -99,13 +99,68 @@ func localizationStrongEvidenceForCompletion(completion localizationCompletion, 
 	return localizationEvidenceProof{}
 }
 
-// localizationExactReadSatisfiedByEnvelope reports whether the single read the
-// completion prescribes would only return evidence this envelope already
-// carries. The authorized symbol must be packed WITH its source body, and that
+// localizationEnvelopePackingPrescribedBody returns the envelope with the
+// prescribed symbol's source packed, if it fits. Only that one body: a
+// refinement page that grew by every candidate's source would spend the whole
+// budget restating what its one bounded read was going to fetch anyway.
+func localizationEnvelopePackingPrescribedBody(
+	envelope localizationExploreEnvelope,
+	targets []exploreTarget,
+	bodyOrder []int,
+	prescribed string,
+	maxBytes int,
+) localizationExploreEnvelope {
+	for _, index := range bodyOrder {
+		if index >= len(targets) || index >= len(envelope.Evidence) {
+			continue
+		}
+		node := targets[index].node
+		if node == nil || node.ID != prescribed || targets[index].source == "" {
+			continue
+		}
+		candidate := envelope
+		candidate.Evidence = append([]localizationEvidence(nil), envelope.Evidence...)
+		candidate.Evidence[index].Source = targets[index].source
+		if localizationEnvelopeFits(candidate, maxBytes) {
+			return candidate
+		}
+		return envelope
+	}
+	return envelope
+}
+
+// localizationPrescribedSymbol names the one symbol a completion is asking the
+// caller to go and read, whichever state prescribes it.
+func localizationPrescribedSymbol(completion localizationCompletion) string {
+	switch completion.State {
+	case localizationStateNeedsExactRead:
+		return strings.TrimSpace(completion.ExactSymbol)
+	case localizationStateNeedsRefinement:
+		return strings.TrimSpace(completion.refinementSymbol)
+	default:
+		return ""
+	}
+}
+
+// localizationCompletionRetiringPrescribedRead turns a page whose prescribed
+// body is already packed into an answer. Inlining the body alone was measured
+// to leave most callers reading it again anyway — the page still told them to.
+// So the instruction has to go at the same moment the body arrives.
+func localizationCompletionRetiringPrescribedRead(completion localizationCompletion) localizationCompletion {
+	completed := newLocalizationCompletion(true, "")
+	completed.taskLead = completion.taskLead
+	completed.enforceableOnAnswerReady = completion.enforceableOnAnswerReady
+	completed.digest = completion.digest
+	return completed
+}
+
+// localizationPrescribedReadSatisfiedByEnvelope reports whether the single read
+// the completion prescribes would only return evidence this envelope already
+// carries. The prescribed symbol must be packed WITH its source body, and that
 // body must clear the same lead-alignment test the reserved read applies when
 // it completes — so completing here accepts exactly what the round trip would.
-func localizationExactReadSatisfiedByEnvelope(task string, envelope localizationExploreEnvelope) bool {
-	symbol := strings.TrimSpace(envelope.Completion.ExactSymbol)
+func localizationPrescribedReadSatisfiedByEnvelope(task, symbol string, envelope localizationExploreEnvelope) bool {
+	symbol = strings.TrimSpace(symbol)
 	if symbol == "" {
 		return false
 	}
