@@ -33,6 +33,7 @@ type analysisGenerationInput struct {
 	adjacency      analysis.AdjacencyPersistenceSnapshot
 	communities    []graph.AnalysisCommunitySummary
 	processes      []graph.AnalysisProcessSummary
+	processSteps   map[string][]graph.AnalysisProcessStep
 	concepts       []graph.AnalysisConcept
 	conceptRelated map[string][]string
 }
@@ -66,6 +67,35 @@ func normalizePersistedAnalysis(candidate *persistedAnalysis) {
 	}
 }
 
+// sanitizeAnalysisFiles drops empty and duplicate paths from a community /
+// process file list and returns it sorted.
+//
+// Communities and processes are keyed on nodes, and a node need not have a
+// file: synthetic, external, and stub nodes carry an empty FilePath, and two
+// nodes routinely share one. The store validates these lists as non-empty and
+// unique and rejects the entire generation on the first violation, so an
+// unfiltered list makes every analysis save fail — which silently costs both
+// the warm-start cache and the header-only residency the save enables.
+func sanitizeAnalysisFiles(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, file := range in {
+		if file == "" {
+			continue
+		}
+		if _, duplicate := seen[file]; duplicate {
+			continue
+		}
+		seen[file] = struct{}{}
+		out = append(out, file)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func prepareAnalysisGeneration(candidate persistedAnalysis, revision uint64) (analysisGenerationInput, error) {
 	normalizePersistedAnalysis(&candidate)
 	if candidate.communities == nil || candidate.leiden == nil || candidate.processes == nil ||
@@ -76,8 +106,7 @@ func prepareAnalysisGeneration(candidate persistedAnalysis, revision uint64) (an
 	adjacency := candidate.adjacency.PersistenceSnapshot()
 	communities := make([]graph.AnalysisCommunitySummary, 0, len(candidate.communities.Communities))
 	for _, community := range candidate.communities.Communities {
-		files := append([]string(nil), community.Files...)
-		sort.Strings(files)
+		files := sanitizeAnalysisFiles(community.Files)
 		communities = append(communities, graph.AnalysisCommunitySummary{
 			ID: community.ID, Label: community.Label, Hub: community.Hub, ParentID: community.ParentID,
 			Size: community.Size, Cohesion: community.Cohesion, Files: files,
@@ -85,13 +114,35 @@ func prepareAnalysisGeneration(candidate persistedAnalysis, revision uint64) (an
 	}
 	sort.Slice(communities, func(i, j int) bool { return communities[i].ID < communities[j].ID })
 
+	// A process step can point at a node this generation does not carry:
+	// BuildAdjacencySnapshot deliberately skips unresolved and dangling
+	// endpoints to keep its dense index consistent, so analysis_nodes has no
+	// row for them while DiscoverProcesses still walks them. The step insert
+	// resolves node_rowid through analysis_nodes and rejects the generation
+	// when it finds none. Drop those steps here, renumber the survivors so
+	// ordinals stay contiguous, and report the surviving count as StepCount —
+	// the store validates step_count against the persisted step rows.
+	generationNodes := make(map[string]struct{}, len(adjacency.IDs))
+	for _, nodeID := range adjacency.IDs {
+		generationNodes[nodeID] = struct{}{}
+	}
+	processSteps := make(map[string][]graph.AnalysisProcessStep, len(candidate.processes.Processes))
 	processes := make([]graph.AnalysisProcessSummary, 0, len(candidate.processes.Processes))
 	for _, process := range candidate.processes.Processes {
-		files := append([]string(nil), process.Files...)
-		sort.Strings(files)
+		files := sanitizeAnalysisFiles(process.Files)
+		steps := make([]graph.AnalysisProcessStep, 0, len(process.Steps))
+		for _, step := range process.Steps {
+			if _, known := generationNodes[step.ID]; !known {
+				continue
+			}
+			steps = append(steps, graph.AnalysisProcessStep{
+				ProcessID: process.ID, NodeID: step.ID, Ordinal: len(steps), Depth: step.Depth,
+			})
+		}
+		processSteps[process.ID] = steps
 		processes = append(processes, graph.AnalysisProcessSummary{
 			ID: process.ID, Name: process.Name, EntryPoint: process.EntryPoint,
-			StepCount: process.StepCount, Score: process.Score, Truncated: process.Truncated, Files: files,
+			StepCount: len(steps), Score: process.Score, Truncated: process.Truncated, Files: files,
 		})
 	}
 	sort.Slice(processes, func(i, j int) bool { return processes[i].ID < processes[j].ID })
@@ -133,7 +184,7 @@ func prepareAnalysisGeneration(candidate persistedAnalysis, revision uint64) (an
 			ProcessesTruncated:        candidate.processes.Truncated,
 			ProcessesTruncationReason: candidate.processes.TruncationReason,
 		},
-		adjacency: adjacency, communities: communities, processes: processes,
+		adjacency: adjacency, communities: communities, processes: processes, processSteps: processSteps,
 		concepts: concepts, conceptRelated: conceptSnapshot.Related,
 	}, nil
 }
@@ -197,16 +248,11 @@ func persistAnalysisGeneration(
 			return graph.AnalysisGenerationHeader{}, accepted, err
 		}
 	}
-	for _, process := range candidate.processes.Processes {
-		for start := 0; start < len(process.Steps); start += analysisGenerationWriteChunk {
-			end := min(start+analysisGenerationWriteChunk, len(process.Steps))
-			steps := make([]graph.AnalysisProcessStep, 0, end-start)
-			for ordinal, step := range process.Steps[start:end] {
-				steps = append(steps, graph.AnalysisProcessStep{
-					ProcessID: process.ID, NodeID: step.ID, Ordinal: start + ordinal, Depth: step.Depth,
-				})
-			}
-			accepted, err = writer.AppendAnalysisProcesses(expectedRevision, generationID, nil, steps)
+	for _, process := range input.processes {
+		steps := input.processSteps[process.ID]
+		for start := 0; start < len(steps); start += analysisGenerationWriteChunk {
+			end := min(start+analysisGenerationWriteChunk, len(steps))
+			accepted, err = writer.AppendAnalysisProcesses(expectedRevision, generationID, nil, steps[start:end])
 			if err != nil || !accepted {
 				return graph.AnalysisGenerationHeader{}, accepted, err
 			}
