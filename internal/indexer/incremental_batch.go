@@ -725,9 +725,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 				continue
 			}
 			oldNodeIDs = append(oldNodeIDs, node.ID)
-			if node.Kind != graph.KindFile && node.Kind != graph.KindImport {
-				idx.search.Remove(node.ID)
-			}
+			idx.removeFromSearch(node)
 			if node.Kind == graph.KindFunction || node.Kind == graph.KindMethod {
 				oldFuncIDs = append(oldFuncIDs, node.ID)
 			}
@@ -1388,9 +1386,7 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 					continue
 				}
 				nodeIDs = append(nodeIDs, node.ID)
-				if node.Kind != graph.KindFile && node.Kind != graph.KindImport {
-					idx.search.Remove(node.ID)
-				}
+				idx.removeFromSearch(node)
 			}
 			_ = i
 		}

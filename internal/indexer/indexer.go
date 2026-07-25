@@ -723,6 +723,32 @@ func (idx *Indexer) shouldIndexForSearch(n *graph.Node) bool {
 	return true
 }
 
+// removeFromSearch drops a node from the symbol index, gated on the same
+// predicate that admits it. Every eviction path must go through this rather
+// than its own Kind check.
+//
+// The backend's Remove is an unconditional decrement with no membership set,
+// so evicting on a broader predicate than Add uses does not just miscount by
+// a constant: it subtracts the difference set on every reconcile of the same
+// file and never adds it back. KindLocal dominates that set — those bindings
+// are persisted only to satisfy dataflow FK constraints, so they are present
+// in the prior-node list of every Go file, while shouldIndexForSearch has
+// always refused to index them.
+//
+// Safe on nodes read back from the store: every input the predicate reads
+// (Kind, Language, Stub, Origin, data_class) is a persisted column, so it
+// evaluates the same on a stored node as on the freshly extracted one that
+// was admitted.
+func (idx *Indexer) removeFromSearch(n *graph.Node) {
+	if idx == nil || idx.search == nil || n == nil {
+		return
+	}
+	if !idx.shouldIndexForSearch(n) {
+		return
+	}
+	idx.search.Remove(n.ID)
+}
+
 // upgradeSearchToBleve constructs a Bleve backend from the current graph
 // and atomically swaps it in. Designed to run in a background goroutine
 // triggered by IndexCtx after the initial index completes. Does nothing
@@ -3806,9 +3832,7 @@ func (idx *Indexer) indexFile(
 	var oldFuncIDs []string
 	evictExisting := func() {
 		for _, n := range idx.graph.GetFileNodes(graphPath) {
-			if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
-				idx.search.Remove(n.ID)
-			}
+			idx.removeFromSearch(n)
 			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
 				oldFuncIDs = append(oldFuncIDs, n.ID)
 			}
@@ -4355,9 +4379,7 @@ func (idx *Indexer) EvictFile(filePath string) (int, int) {
 	graphPath := idx.prefixPath(relPath)
 	// Remove from search index.
 	for _, n := range idx.graph.GetFileNodes(graphPath) {
-		if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
-			idx.search.Remove(n.ID)
-		}
+		idx.removeFromSearch(n)
 	}
 	idx.restubIncomingRefs(graphPath)
 	idx.evictEnrichment(graphPath)
