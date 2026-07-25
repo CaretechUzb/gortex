@@ -5509,6 +5509,10 @@ func (idx *Indexer) incrementalReindexPaths(
 			absPath := filepath.Join(absRoot, filepath.FromSlash(relPath))
 			_, statErr := os.Stat(absPath)
 			if statErr == nil {
+				// Present-but-excluded must be purged (same as full IncrementalReindex).
+				if idx.shouldExclude(absPath, absRoot, false) {
+					deletedFiles = append(deletedFiles, relPath)
+				}
 				continue
 			}
 			if errors.Is(statErr, os.ErrNotExist) {
@@ -5671,23 +5675,17 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 
 	// Detect deleted files. A file that's tracked in fileMtimes but
 	// absent from the current discovery walk is a candidate, but
-	// "absent from discovery" is not the same as "absent from disk":
+	// "absent from discovery" is not always "absent from disk":
 	//
-	//   - The exclude list (.gortex.yaml, builtin, workspace) may have
-	//     grown since the last index — every newly-excluded file would
-	//     be classified as deleted.
-	//   - A language extractor's Extensions() may have changed across
-	//     versions — files whose ext is no longer detected would be
-	//     classified as deleted.
+	//   - Newly excluded (user/config intent): treat as deleted so the
+	//     graph does not retain permanent orphans (#321).
+	//   - Language extractor Extensions() shrank: file still on disk and
+	//     not excluded — preserve graph state.
 	//   - WalkDir swallowed a transient error (EACCES, EIO, NFS hiccup,
-	//     ELOOP) — the file is unreachable this pass but still on disk.
+	//     ELOOP) — preserve on non-ENOENT stat failures.
 	//
-	// All three would purge legitimate graph state on every daemon
-	// restart. Stat the candidate first: only treat ENOENT/ENOTDIR as
-	// deletion; preserve on success (file exists, just not discovered)
-	// and on transient errors. The cost is one extra stat per
-	// previously-indexed-but-not-discovered file, which is bounded by
-	// the size of the exclusion delta.
+	// Stat the candidate: ENOENT => deleted; exists+excluded => deleted;
+	// exists+not-excluded => preserve; other errors => preserve.
 	idx.mtimeMu.RLock()
 	var candidates []string
 	for relPath := range idx.fileMtimes {
@@ -5702,8 +5700,15 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 		absPath := filepath.Join(absRoot, relPath)
 		_, err := os.Stat(absPath)
 		if err == nil {
-			// File exists on disk; it was excluded or its extension is
-			// no longer detected. Preserve.
+			// File still exists on disk but was not admitted by this walk.
+			// If the admission set now excludes it, treat it like a deletion
+			// so exclude-list refinements do not leave permanent orphans
+			// (file_count drops while node_count/search stay stale). See #321.
+			// If it is not excluded (e.g. extension no longer detected),
+			// preserve graph state.
+			if idx.shouldExclude(absPath, absRoot, false) {
+				deletedFiles = append(deletedFiles, relPath)
+			}
 			continue
 		}
 		if errors.Is(err, os.ErrNotExist) {
