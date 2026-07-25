@@ -77,6 +77,20 @@ func (s *Store) UpsertSymbolFTS(nodeID, tokens string) error {
 	return s.BatchUpsertSymbolFTS([]graph.SymbolFTSItem{{NodeID: nodeID, Tokens: tokens}})
 }
 
+// SymbolFTSCount reports how many symbols are actually indexed. It counts the
+// symbol_fts_rowid ownership sidecar rather than the FTS5 vtable: the sidecar
+// carries exactly one row per indexed node, is WITHOUT ROWID so the primary
+// key index is the table, and counting it avoids making the vtable resolve
+// every document. One row per document is the invariant the delete path
+// maintains, so this is the corpus size.
+func (s *Store) SymbolFTSCount() (int, error) {
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM symbol_fts_rowid`).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 // symbolFTSBatchStats records the actual bounded SQL statements executed by
 // one incremental batch. It is returned by the internal implementation so
 // tests can enforce that statement count grows by chunks, never by symbols.

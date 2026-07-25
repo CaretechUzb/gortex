@@ -1189,11 +1189,21 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 		t.AppendRow(table.Row{"memory", formatBytes(st.MemoryBytes)})
 	}
 	if sb := st.SearchBackend; sb.Name != "" {
+		// formatSearchDocs renders the trailing-space "docs=N  " fragment,
+		// or nothing when the backend cannot report a real count. Backends
+		// whose only figure is a since-construction Add/Remove delta must
+		// print nothing rather than pass the delta off as a corpus size.
+		formatSearchDocs := func(sb daemon.SearchBackendStats) string {
+			if !sb.DocCountKnown {
+				return ""
+			}
+			return fmt.Sprintf("docs=%d  ", sb.DocCount)
+		}
 		switch {
 		case sb.DiskPath != "":
 			t.AppendRow(table.Row{"search", fmt.Sprintf(
-				"%s  docs=%d  heap=%s  disk=%s  path=%s",
-				sb.Name, sb.DocCount, formatBytes(sb.Bytes),
+				"%s  %sheap=%s  disk=%s  path=%s",
+				sb.Name, formatSearchDocs(sb), formatBytes(sb.Bytes),
 				formatBytes(sb.DiskBytes), sb.DiskPath)})
 		case sb.DiskResident:
 			// No heap footprint to report — the index lives inside the
@@ -1201,11 +1211,11 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			// structure. Printing "heap=0 B" here would read as "this
 			// backend costs nothing", which is false.
 			t.AppendRow(table.Row{"search", fmt.Sprintf(
-				"%s  docs=%d  disk-resident (indexed in the graph store)",
-				sb.Name, sb.DocCount)})
+				"%s  %sdisk-resident (indexed in the graph store)",
+				sb.Name, formatSearchDocs(sb))})
 		default:
 			t.AppendRow(table.Row{"search", fmt.Sprintf(
-				"%s  docs=%d  heap=%s", sb.Name, sb.DocCount, formatBytes(sb.Bytes))})
+				"%s  %sheap=%s", sb.Name, formatSearchDocs(sb), formatBytes(sb.Bytes))})
 		}
 	}
 	rt := st.Runtime

@@ -318,6 +318,12 @@ type RuntimeStats struct {
 type SearchBackendStats struct {
 	Name      string `json:"name"`                 // "bm25" | "bleve-memory" | "bleve-disk" | "sqlite-fts5"
 	DocCount  int    `json:"doc_count"`            // indexed documents across all repos
+	// DocCountKnown distinguishes "the index holds zero documents" from
+	// "this backend cannot report a document count". Backends whose only
+	// available figure is a since-construction Add/Remove delta leave it
+	// false so renderers omit the number instead of presenting the delta
+	// as a corpus size.
+	DocCountKnown bool `json:"doc_count_known,omitempty"`
 	Bytes     uint64 `json:"bytes"`                // approximate heap footprint
 	DiskPath  string `json:"disk_path,omitempty"`  // set only when Name == "bleve-disk"
 	DiskBytes uint64 `json:"disk_bytes,omitempty"` // current on-disk size for "bleve-disk"

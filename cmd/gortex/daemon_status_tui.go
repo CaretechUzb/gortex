@@ -330,12 +330,21 @@ func (m statusTUI) headerRightCol() string {
 		state,
 		tuiSub.Render("up " + humanizeDur(time.Duration(st.UptimeSeconds)*time.Second)),
 	}, tuiHint.Render(" · "))
-	row3 := strings.Join([]string{
+	row3Cells := []string{
 		tuiKey.Render(humanizeBytes(st.Runtime.Alloc)) + tuiSub.Render(" alloc"),
-		tuiKey.Render(humanizeInt(st.SearchBackend.DocCount)) + tuiSub.Render(" docs"),
-		tuiKey.Render(fmt.Sprintf("%d", st.Sessions)) + tuiSub.Render(" sessions"),
-		tuiKey.Render(fmt.Sprintf("%d", st.Runtime.NumGoroutine)) + tuiSub.Render(" goroutines"),
-	}, tuiHint.Render(" · "))
+	}
+	// Omitted entirely when the backend has no real count to report —
+	// its only figure would be a since-construction Add/Remove delta,
+	// which is not a document count and can be negative.
+	if st.SearchBackend.DocCountKnown {
+		row3Cells = append(row3Cells,
+			tuiKey.Render(humanizeInt(st.SearchBackend.DocCount))+tuiSub.Render(" docs"))
+	}
+	row3Cells = append(row3Cells,
+		tuiKey.Render(fmt.Sprintf("%d", st.Sessions))+tuiSub.Render(" sessions"),
+		tuiKey.Render(fmt.Sprintf("%d", st.Runtime.NumGoroutine))+tuiSub.Render(" goroutines"),
+	)
+	row3 := strings.Join(row3Cells, tuiHint.Render(" · "))
 	return lipgloss.JoinVertical(lipgloss.Left, row1, "", row2, row3)
 }
 
