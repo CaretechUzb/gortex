@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/spf13/cobra"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/toolref"
 )
@@ -149,10 +150,37 @@ func firstPositionalArg(args []string) string {
 	return ""
 }
 
+// primeBuiltinCommands registers the two commands cobra otherwise only adds
+// from inside Execute: `help` and `completion` (with its per-shell
+// subcommands). Until they exist the command tree is incomplete, so
+// isKnownRootCommand — which decides whether a verb is real by walking that
+// tree — reports a built-in as unknown and the tool hint shadows it. That is
+// how `gortex completion zsh` came to answer with a `graph_completion_search`
+// suggestion instead of the script, which in turn broke the completions
+// Homebrew generates by running the binary at install time.
+//
+// Both initializers are idempotent, so cobra's own calls during Execute become
+// no-ops. args is the command line below the binary name — cobra reads it to
+// decide whether a root whose only subcommand would be `completion` is
+// actually being asked for it, and it is threaded through a parameter rather
+// than read from os.Args so tests can drive it.
+func primeBuiltinCommands(args []string) {
+	rootCmd.InitDefaultHelpCmd()
+	rootCmd.InitDefaultCompletionCmd(args...)
+}
+
 // isKnownRootCommand reports whether name matches a registered top-level cobra
 // command or one of its aliases. No daemon, no tool registry — a plain walk of
-// the already-registered command tree.
+// the command tree, which primeBuiltinCommands has topped up with cobra's
+// lazily-added built-ins.
 func isKnownRootCommand(name string) bool {
+	// Cobra adds the shell-completion protocol commands from an unexported
+	// initializer that priming cannot reach, so they never appear in the walk
+	// below. They carry every completion request a generated script makes, and
+	// a hint printed in their place would land in the shell's candidate list.
+	if name == cobra.ShellCompRequestCmd || name == cobra.ShellCompNoDescRequestCmd {
+		return true
+	}
 	for _, c := range rootCmd.Commands() {
 		if c.Name() == name {
 			return true
