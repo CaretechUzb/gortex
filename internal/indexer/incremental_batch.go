@@ -142,6 +142,17 @@ func (idx *Indexer) reindexIncrementalChunk(
 	priorByFile := idx.graph.GetFileNodesByPaths(graphPaths)
 
 	stages := make([]*incrementalBatchStage, 0, len(files))
+	// Each staged result carries the tree-sitter tree its extraction
+	// produced — C memory the Go GC cannot reclaim. Nothing downstream
+	// of staging reads the tree (the commit works off Nodes/Edges), so
+	// release the batch's trees on every exit, committed or not.
+	defer func() {
+		for _, stage := range stages {
+			if stage != nil {
+				stage.result.ReleaseTree()
+			}
+		}
+	}()
 	fallbacks := make([]incrementalFallback, 0)
 	receipts := make([]fileReadReceipt, 0, len(files))
 	nodeCount, edgeCount := 0, 0
