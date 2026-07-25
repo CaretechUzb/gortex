@@ -35,7 +35,6 @@ import (
 	"github.com/zzet/gortex/internal/savings"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
-	"github.com/zzet/gortex/internal/server/hub"
 	"github.com/zzet/gortex/internal/telemetry"
 	"github.com/zzet/gortex/internal/tokens"
 )
@@ -204,6 +203,10 @@ type Server struct {
 	hotspotsReady   bool
 	hotspotsBuildMu sync.Mutex
 	analysisEpoch   uint64
+	// analysisRun tracks the background on-demand analysis pass so a tool
+	// call can report "running, retry in Ns" instead of blocking for
+	// minutes on a whole-graph computation.
+	analysisRun analysisRunState
 	// hotspotsFn is a test seam for deterministic concurrency/invalidation
 	// tests. Production leaves it nil and uses analysis.FindHotspots.
 	hotspotsFn func(graph.Store, *analysis.CommunityResult, float64) []analysis.HotspotEntry
@@ -2658,31 +2661,13 @@ func (s *Server) SetEventRules(rules []config.EventRule) {
 	s.eventRules = rules
 }
 
-// WatchForReanalysis subscribes to hub events and re-runs analysis after
-// a debounce period of inactivity. It runs in a background goroutine.
-func (s *Server) WatchForReanalysis(h *hub.Hub, debounceMs int) {
-	subID, events := h.Subscribe()
-	debounce := time.Duration(debounceMs) * time.Millisecond
-
-	go func() {
-		var timer *time.Timer
-		for ev := range events {
-			_ = ev // any event triggers reanalysis
-			if timer != nil {
-				timer.Stop()
-			}
-			timer = time.AfterFunc(debounce, func() {
-				s.logger.Info("re-running analysis after graph change")
-				s.RunAnalysis()
-			})
-		}
-		// Channel closed — hub is shutting down.
-		if timer != nil {
-			timer.Stop()
-		}
-		_ = subID
-	}()
-}
+// Analysis deliberately has no watcher-driven trigger. Re-running it on every
+// graph change was self-defeating: the pass is minutes of whole-graph work
+// started by a change, so it ran while further changes landed and could never
+// be published against a stable revision. Nothing has to replace it — the
+// currency token is derived from graph state, so a change already makes the
+// snapshot non-current, and the next consumer starts a fresh pass through
+// ensureAnalysis.
 
 // ServeStdio starts the MCP server on stdin/stdout.
 func (s *Server) ServeStdio() error {

@@ -382,12 +382,8 @@ func runMCP(cmd *cobra.Command, args []string) error {
 			eventHub := hub.New()
 			go eventHub.Run(watcher.Events())
 
-			srv.WatchForReanalysis(eventHub, 500)
 			fmt.Fprintf(os.Stderr, "[gortex] watch mode active\n")
 		}
-
-		// Run initial analysis.
-		srv.RunAnalysis()
 	}()
 
 	// Handle graceful shutdown.

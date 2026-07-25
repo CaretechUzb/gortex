@@ -71,6 +71,9 @@ func (s *Server) registerAnalysisTools() {
 }
 
 func (s *Server) handleGetCommunities(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if pending := s.ensureAnalysis(); !pending.Ready {
+		return s.respondJSONOrTOON(ctx, req, analysisPendingPayload(pending, "communities"))
+	}
 	comms := s.getCommunities()
 
 	// If id is provided, return the single community in detail.
@@ -129,6 +132,9 @@ func (s *Server) handleGetCommunities(ctx context.Context, req mcp.CallToolReque
 }
 
 func (s *Server) handleGetProcesses(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if pending := s.ensureAnalysis(); !pending.Ready {
+		return s.respondJSONOrTOON(ctx, req, analysisPendingPayload(pending, "processes"))
+	}
 	procs := s.getProcesses()
 
 	// If id is provided, return the single process in detail.
