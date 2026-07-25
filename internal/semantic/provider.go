@@ -232,10 +232,15 @@ type EnrichmentStatus struct {
 	// textDocument/references (no call hierarchy) — the intelephense-style
 	// add mode. Distinguishes it from the call-hierarchy add mode.
 	ReferencesAddPass bool `json:"references_add_pass,omitempty"`
-	// Degraded marks that this provider ran in reference-confirmation-only
-	// mode because a needed compilation database was missing. Not a failure —
-	// State stays "completed" — but hover / hierarchy edges are absent, so
-	// index_health can flag it with the remediation. DegradedReason says why.
+	// Degraded marks that this provider could not run its full pass — e.g. a
+	// clangd sweep with no compilation database, or a language toolchain that
+	// would not load. State stays "completed"; DegradedReason says why.
+	//
+	// Degraded alone does not say whether anything landed, and the difference
+	// matters to index_health: a pass that still confirmed edges is a partial
+	// success, while one whose counters are all zero means the semantic tier
+	// does not exist for that language at all. index_health separates the two
+	// and only the second lowers semantic_enrichment_ok.
 	Degraded       bool   `json:"degraded,omitempty"`
 	DegradedReason string `json:"degraded_reason,omitempty"`
 	Detail         string `json:"detail,omitempty"`

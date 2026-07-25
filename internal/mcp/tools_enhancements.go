@@ -3087,18 +3087,55 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 		}
 	}
 
-	// Compile-database-degraded providers: a clangd pass with no
-	// compile_commands.json intentionally runs reference confirmation only (no
-	// hover / hierarchy sweep). This is not a failure — semantic_enrichment_ok
-	// stays true — but the missing tiers are worth flagging with the remediation.
-	var degradedProviders []string
+	// Degraded providers split by whether the pass still landed work.
+	//
+	// REDUCED is the shape this concept was written for: a clangd pass with no
+	// compile_commands.json runs reference confirmation only. Edges still land,
+	// so it is a genuine partial success — semantic_enrichment_ok stays true
+	// and the remediation points at the compilation database.
+	//
+	// INERT is different in kind: the provider degraded and landed nothing at
+	// all — no edges, no nodes, no symbols. For that language the semantic tier
+	// does not exist, and calling that healthy is how a repository sits at
+	// health_score 100 with lsp_resolved_edges_by_language 0 for a language it
+	// is full of. It counts as incomplete, and it reports the provider's own
+	// reason rather than a canned compilation-database remediation that may not
+	// even name the right toolchain.
+	var reducedProviders, inertProviders, inertReasons []string
 	for _, st := range enrichStatuses {
-		if st.Degraded {
-			degradedProviders = append(degradedProviders, st.Provider+" in "+st.Repo)
+		if !st.Degraded {
+			continue
+		}
+		label := st.Provider + " in " + st.Repo
+		landed := st.EdgesConfirmed + st.EdgesAdded + st.NodesEnriched + st.SymbolsCovered
+		// A provider that degrades for a language the graph does not contain is
+		// correct and expected — the Go pass on a Rust tree is the case the
+		// module gate exists to skip cheaply. Only a language actually present
+		// in the graph can be under-enriched, so only that can lower health.
+		presentInGraph := st.Language != "" && stats.ByLanguage[st.Language] > 0
+		if landed == 0 && presentInGraph {
+			inertProviders = append(inertProviders, label)
+			if st.DegradedReason != "" {
+				inertReasons = append(inertReasons, label+": "+st.DegradedReason)
+			}
+			continue
+		}
+		reducedProviders = append(reducedProviders, label)
+	}
+	if len(reducedProviders) > 0 {
+		msg := "Semantic enrichment ran in degraded (reference-confirmation-only) mode for " + strings.Join(reducedProviders, ", ") + " because no compilation database was found — hover types and call/type-hierarchy edges were skipped. Generate compile_commands.json (cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON, bear -- make, or meson) at the repo root, then reindex_repository."
+		if recommendation == "" {
+			recommendation = msg
+		} else {
+			recommendation = msg + " " + recommendation
 		}
 	}
-	if len(degradedProviders) > 0 {
-		msg := "Semantic enrichment ran in degraded (reference-confirmation-only) mode for " + strings.Join(degradedProviders, ", ") + " because no compilation database was found — hover types and call/type-hierarchy edges were skipped. Generate compile_commands.json (cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON, bear -- make, or meson) at the repo root, then reindex_repository."
+	if len(inertProviders) > 0 {
+		enrichmentIncomplete = true
+		msg := "Semantic enrichment produced nothing for " + strings.Join(inertProviders, ", ") + ", so no LSP-tier edges exist for those languages: tier-filtered queries (min_tier=lsp_resolved) return nothing there rather than under-reporting, and every edge you do see came from the AST pass."
+		if len(inertReasons) > 0 {
+			msg += " Reported reason — " + strings.Join(inertReasons, "; ") + "."
+		}
 		if recommendation == "" {
 			recommendation = msg
 		} else {
