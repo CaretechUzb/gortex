@@ -3200,6 +3200,44 @@ func interleaveLocalizationDirectRelations(task, requiredID string, targets []ex
 	return interleaveLocalizationDirectRelationsWithRoutes(task, requiredID, targets, nil)
 }
 
+// exploreDelegatedImplementationCallee reports whether the callee is the
+// caller's own implementation, recognised by the one convention that holds
+// across languages: the implementation's identifier extends the wrapper's with
+// a short suffix (a recursive, inner, or impl helper on the same base name).
+// This is a naming convention, never a repository fact, so it carries no
+// project-specific vocabulary.
+func exploreDelegatedImplementationCallee(caller, callee *graph.Node) bool {
+	if caller == nil || callee == nil {
+		return false
+	}
+	if callee.Kind != graph.KindFunction && callee.Kind != graph.KindMethod {
+		return false
+	}
+	if exploreDraftIsTestNode(callee) {
+		return false
+	}
+	base := strings.TrimSpace(caller.Name)
+	extended := strings.TrimSpace(callee.Name)
+	const (
+		// A short base admits the plural/variant family — Read/ReadAll,
+		// Load/LoadAll — which are sibling operations, not delegations. Require
+		// enough base identifier that the extension is a helper on the same work.
+		minBaseRunes   = 6
+		maxSuffixRunes = 8
+	)
+	if len([]rune(base)) < minBaseRunes || !strings.HasPrefix(extended, base) {
+		return false
+	}
+	suffix := []rune(extended[len(base):])
+	if len(suffix) == 0 || len(suffix) > maxSuffixRunes {
+		return false
+	}
+	// The suffix must continue the identifier rather than start an unrelated
+	// one: a separator or an uppercase boundary, never a digit series.
+	head := suffix[0]
+	return head == '_' || unicode.IsUpper(head) || unicode.IsLower(head)
+}
+
 func interleaveLocalizationDirectRelationsWithRoutes(
 	task, requiredID string,
 	targets []exploreTarget,
@@ -3212,6 +3250,7 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 	type relationCandidate struct {
 		node       *graph.Node
 		direction  string
+		delegated  bool
 		overlap    int
 		longest    int
 		production bool
@@ -3307,20 +3346,29 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 				_, provenWrapper := provenWrapperRoutes[refinementPair{
 					wrapper: target.node.ID, implementation: node.ID,
 				}]
-				if overlap == 0 && (direction != "direct_callee" || !provenWrapper) {
+				delegated := direction == "direct_callee" &&
+					exploreDelegatedImplementationCallee(target.node, node)
+				if overlap == 0 && !delegated && (direction != "direct_callee" || !provenWrapper) {
 					continue
 				}
 				candidate := relationCandidate{
 					node:       node,
 					direction:  direction,
+					delegated:  delegated,
 					overlap:    overlap,
 					longest:    longest,
 					production: !exploreDraftIsTestNode(node),
 					callable:   node.Kind == graph.KindFunction || node.Kind == graph.KindMethod,
 					order:      candidateOrder,
 				}
-				better := !found || candidate.overlap > best.overlap ||
-					(candidate.overlap == best.overlap && candidate.production && !best.production) ||
+				// A callee whose identifier extends its caller's is that caller's
+				// implementation, and it shares every task term the wrapper matched
+				// — so overlap can never separate the pair. Rank the delegation
+				// first, otherwise the wrapper's own siblings win on list order and
+				// the code that actually changes never reaches the answer.
+				better := !found || (candidate.delegated && !best.delegated) ||
+					(candidate.delegated == best.delegated && candidate.overlap > best.overlap) ||
+					(candidate.delegated == best.delegated && candidate.overlap == best.overlap && candidate.production && !best.production) ||
 					(candidate.overlap == best.overlap && candidate.production == best.production && candidate.callable && !best.callable) ||
 					(candidate.overlap == best.overlap && candidate.production == best.production && candidate.callable == best.callable && candidate.longest > best.longest) ||
 					(candidate.overlap == best.overlap && candidate.production == best.production && candidate.callable == best.callable && candidate.longest == best.longest && candidate.order < best.order)

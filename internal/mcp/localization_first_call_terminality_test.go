@@ -188,3 +188,35 @@ func TestTerminalProjectionKeepsTheToolsOwnPayload(t *testing.T) {
 	require.Contains(t, structured["source"], "func (s *DiskStorage) Load")
 	require.Contains(t, structured, "final_response")
 }
+
+func TestExploreDelegatedImplementationCalleeRecognisesWrapperHelpers(t *testing.T) {
+	wrapper := &graph.Node{ID: "repo/storage/disk.go::DiskStorage.Load", Name: "Load", Kind: graph.KindMethod, FilePath: "storage/disk.go"}
+	helper := &graph.Node{ID: "repo/storage/disk.go::DiskStorage.LoadRec", Name: "LoadRec", Kind: graph.KindMethod, FilePath: "storage/disk.go"}
+	require.False(t, exploreDelegatedImplementationCallee(wrapper, helper),
+		"a short base admits the variant family (Load/LoadAll), so it cannot claim LoadRec")
+
+	base := &graph.Node{ID: "repo/storage/disk.go::DiskStorage.resolvePath", Name: "resolvePath", Kind: graph.KindFunction, FilePath: "storage/disk.go"}
+	for _, impl := range []struct {
+		name string
+		want bool
+		why  string
+	}{
+		{"resolvePathRec", true, "recursive helper on the same base"},
+		{"resolvePathImpl", true, "implementation helper"},
+		{"resolvePath_inner", true, "separator-joined helper"},
+		{"resolvePath", false, "identical identifier is the caller itself"},
+		{"resolve", false, "shorter identifier is not an extension"},
+		{"resolvePathWithAVeryLongTail", false, "an unbounded tail is a different function"},
+		{"unrelatedHelper", false, "no shared base"},
+	} {
+		node := &graph.Node{ID: "repo/storage/disk.go::" + impl.name, Name: impl.name, Kind: graph.KindFunction, FilePath: "storage/disk.go"}
+		require.Equal(t, impl.want, exploreDelegatedImplementationCallee(base, node), impl.why)
+	}
+
+	// Direction and kind still gate it: a test double or a type never counts.
+	testNode := &graph.Node{ID: "repo/storage/disk_test.go::resolvePathRec", Name: "resolvePathRec", Kind: graph.KindFunction, FilePath: "storage/disk_test.go", Meta: map[string]any{"is_test": true}}
+	require.False(t, exploreDelegatedImplementationCallee(base, testNode))
+	typeNode := &graph.Node{ID: "repo/storage/disk.go::resolvePathRec", Name: "resolvePathRec", Kind: graph.KindType, FilePath: "storage/disk.go"}
+	require.False(t, exploreDelegatedImplementationCallee(base, typeNode))
+	require.False(t, exploreDelegatedImplementationCallee(nil, typeNode))
+}
