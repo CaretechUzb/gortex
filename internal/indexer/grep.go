@@ -31,6 +31,12 @@ func (idx *Indexer) GrepText(query string, limit int) []trigram.Match {
 func (idx *Indexer) warmTrigramSearcher() *trigram.Searcher {
 	gen := idx.indexGen.Load()
 
+	// Announce the use before taking trigramMu: touch may evict OTHER
+	// repos' searchers, and each eviction takes that repo's trigramMu.
+	// Doing it here keeps this goroutine holding at most one trigramMu at
+	// a time, so two repos warming concurrently cannot deadlock.
+	defer idx.trigramBudget().touch(idx, idx.releaseTrigramSearcher)
+
 	idx.trigramMu.Lock()
 	defer idx.trigramMu.Unlock()
 	if idx.trigramSearcher != nil && idx.trigramGen == gen {
@@ -53,6 +59,30 @@ func (idx *Indexer) warmTrigramSearcher() *trigram.Searcher {
 	idx.trigramSearcher = trigram.Build(root, rels)
 	idx.trigramGen = gen
 	return idx.trigramSearcher
+}
+
+// trigramBudget returns the budget this Indexer participates in, defaulting
+// to the process-wide one so an Indexer built without wiring is still bounded.
+func (idx *Indexer) trigramBudget() *trigramBudget {
+	if idx.trigramBudgetOverride != nil {
+		return idx.trigramBudgetOverride
+	}
+	return processTrigramBudget
+}
+
+// releaseTrigramSearcher drops this repo's built trigram index. Called by the
+// budget when the repo has gone idle or has been pushed out by more recently
+// used repos. Safe to call when nothing is built; the next search rebuilds
+// from disk, which costs latency but never correctness — the searcher is only
+// a candidate filter over files Grep re-reads anyway.
+func (idx *Indexer) releaseTrigramSearcher() {
+	if idx == nil {
+		return
+	}
+	idx.trigramMu.Lock()
+	idx.trigramSearcher = nil
+	idx.trigramGen = 0
+	idx.trigramMu.Unlock()
 }
 
 // GrepRegexp runs a trigram-accelerated regular-expression search for
