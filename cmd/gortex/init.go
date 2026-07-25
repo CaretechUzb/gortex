@@ -108,7 +108,7 @@ func init() {
 	initCmd.Flags().BoolVar(&initJSON, "json", false, "emit a structured JSON report on stdout")
 	initCmd.Flags().BoolVar(&initDryRun, "dry-run", false, "plan writes without modifying disk")
 	initCmd.Flags().BoolVar(&initDryRunIntake, "dry-run-intake", false, "emit a privacy-safe corpus intake manifest and exit before parsing or writing")
-	initCmd.Flags().BoolVar(&initForce, "force", false, "overwrite keys we would otherwise preserve during a merge")
+	initCmd.Flags().BoolVar(&initForce, "force", false, "overwrite keys we would otherwise preserve during a merge; also bypasses the filesystem-root/home-directory safety check")
 
 	rootCmd.AddCommand(initCmd)
 }
@@ -147,6 +147,16 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		root = args[0]
 	}
 
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	if !initForce {
+		if reason := indexer.UnsafeIndexRootReason(absRoot); reason != "" {
+			return fmt.Errorf("%s; pass --force to init it anyway", reason)
+		}
+	}
+
 	if initNoHooks {
 		initInstallHooks = false
 	}
@@ -183,10 +193,6 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		}
 	}
 
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		return err
-	}
 	if initDryRunIntake {
 		return emitInitDryRunIntake(cmd, absRoot)
 	}

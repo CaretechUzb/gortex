@@ -229,6 +229,84 @@ func TestInitDryRunSkipsProjectMarker(t *testing.T) {
 	}
 }
 
+// TestInitRefusesHomeDirectory pins the safety guard in runInit:
+// pointing gortex init directly at $HOME must be refused before any
+// indexing or file writes happen, since that would crawl every
+// project and dotfile under it.
+func TestInitRefusesHomeDirectory(t *testing.T) {
+	saved := struct {
+		yes, dryRun, json, force bool
+		agents                   string
+	}{initYes, initDryRun, initJSON, initForce, initAgents}
+	t.Cleanup(func() {
+		initYes, initDryRun, initJSON, initForce = saved.yes, saved.dryRun, saved.json, saved.force
+		initAgents = saved.agents
+	})
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	initYes = true
+	initDryRun = false
+	initJSON = false
+	initForce = false
+	initAgents = "claude-code"
+
+	var stdout, stderr bytes.Buffer
+	initCmd.SetOut(&stdout)
+	initCmd.SetErr(&stderr)
+	t.Cleanup(func() {
+		initCmd.SetOut(nil)
+		initCmd.SetErr(nil)
+	})
+
+	err := runInit(initCmd, []string{home})
+	if err == nil {
+		t.Fatal("expected runInit to refuse indexing $HOME, got nil error")
+	}
+	if !strings.Contains(err.Error(), "home directory") || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	if _, statErr := os.Stat(filepath.Join(home, ".gortex")); statErr == nil {
+		t.Fatal("refused init still wrote .gortex/ into $HOME")
+	}
+}
+
+// TestInitForceBypassesHomeDirectoryGuard confirms --force is the
+// documented escape hatch for the guard above.
+func TestInitForceBypassesHomeDirectoryGuard(t *testing.T) {
+	saved := struct {
+		yes, dryRun, json, force bool
+		agents                   string
+	}{initYes, initDryRun, initJSON, initForce, initAgents}
+	t.Cleanup(func() {
+		initYes, initDryRun, initJSON, initForce = saved.yes, saved.dryRun, saved.json, saved.force
+		initAgents = saved.agents
+	})
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	initYes = true
+	initDryRun = true // planning-only: keeps the forced run from writing into $HOME during the test
+	initJSON = false
+	initForce = true
+	initAgents = "claude-code"
+
+	var stdout, stderr bytes.Buffer
+	initCmd.SetOut(&stdout)
+	initCmd.SetErr(&stderr)
+	t.Cleanup(func() {
+		initCmd.SetOut(nil)
+		initCmd.SetErr(nil)
+	})
+
+	if err := runInit(initCmd, []string{home}); err != nil {
+		t.Fatalf("runInit with --force: %v\nstderr: %s", err, stderr.String())
+	}
+}
+
 func TestInitHooksOnlyRefreshesClaudeAndCodexHooks(t *testing.T) {
 	restore := saveInitGlobals(t)
 	defer restore()
