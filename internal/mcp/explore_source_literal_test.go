@@ -91,6 +91,21 @@ func newExploreSourceLiteralServer(t testing.TB, nodes []*graph.Node) *Server {
 	return &Server{graph: store}
 }
 
+// pinExploreSourceLiteralRecallBudget takes the bounded source-literal recall
+// off the wall clock. In production the recall gets a 75ms slice per anchor
+// and reports a deadline when it runs out, which is the right trade for a
+// best-effort fallback. Mapping a two-file fixture costs single-digit
+// milliseconds, but a loaded CI runner can deschedule it past that slice, and
+// a test asserting which owners were mapped then fails against a recall that
+// behaved correctly. Tests that assert what the recall finds pin a slice they
+// cannot miss; the ones that assert what it does when the slice runs out —
+// TestGatherExploreSourceLiteralRecallBoundsMappingByRequestDeadline — keep
+// the production default.
+func pinExploreSourceLiteralRecallBudget(s *Server) *Server {
+	s.sourceLiteralRecallBudgetOverride = 30 * time.Second
+	return s
+}
+
 func newExploreSourceLiteralGraphServer(
 	t testing.TB,
 	nodes []*graph.Node,
@@ -595,7 +610,9 @@ func TestGatherExploreSourceLiteralRecallAggregatesCompactAnchorsAcrossLanguages
 			second.Language = fixture.language
 			store.AddBatch([]*graph.Node{first, second}, nil)
 			counting := &exploreSourceLiteralCountingStore{Store: store}
-			server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
+			server := pinExploreSourceLiteralRecallBudget(
+				&Server{graph: counting, indexer: idx, logger: zap.NewNop()},
+			)
 
 			recall := server.gatherExploreSourceLiteralRecall(
 				context.Background(), []string{"aa", "bb"}, "", query.QueryOptions{},
@@ -691,17 +708,20 @@ func TestGatherExploreSourceLiteralRecallKeepsMultiAnchorOwnerUnderNearCapCompet
 	idx.SetFileMtimes(map[string]int64{competitorRel: 1, targetRel: 1})
 	store.AddBatch(nodes, nil)
 	counting := &exploreSourceLiteralCountingStore{Store: store}
-	server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
+	// What this test pins down is the retention rule — a second-file owner
+	// must survive an anchor page crowded with same-file competitors — so
+	// take it off the wall clock.
+	server := pinExploreSourceLiteralRecallBudget(
+		&Server{graph: counting, indexer: idx, logger: zap.NewNop()},
+	)
 	scope := query.QueryOptions{RepoAllow: map[string]bool{"demo": true}}
 
-	started := time.Now()
 	recall := server.gatherExploreSourceLiteralRecall(context.Background(), []string{"pl", "ku"}, "", scope)
-	require.Less(t, time.Since(started), 500*time.Millisecond, "near-cap two-anchor recall must honor the shared deadline")
 	require.Len(t, recall.diagnostics, 2)
 	for _, diagnostic := range recall.diagnostics {
 		// Bounded grep collapses repeated lines to one hit per file. The large
 		// competitor body still exercises production parsing and both per-anchor
-		// deadlines without multiplying retained owners.
+		// mapping passes without multiplying retained owners.
 		require.Equal(t, 2, diagnostic.rawHits)
 		require.Equal(t, 2, diagnostic.mappedOwners)
 		require.Equal(t, 2, diagnostic.retainedOwners)
@@ -738,7 +758,8 @@ func TestGatherExploreSourceLiteralRecallKeepsMultiAnchorOwnerUnderNearCapCompet
 }
 
 func TestGatherExploreSourceLiteralRecallRecordsTermCapDiagnostic(t *testing.T) {
-	server := &Server{logger: zap.NewNop()}
+	// "cc" must be reported as term_cap, not as a deadline the runner caused.
+	server := pinExploreSourceLiteralRecallBudget(&Server{logger: zap.NewNop()})
 	recall := server.gatherExploreSourceLiteralRecall(
 		context.Background(), []string{"aa", "bb", "cc"}, "demo", query.QueryOptions{},
 	)
@@ -771,7 +792,9 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	require.NotEmpty(t, constructors)
 	require.NotEmpty(t, callees)
 	counting := &exploreSourceLiteralCountingStore{Store: store}
-	server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
+	server := pinExploreSourceLiteralRecallBudget(
+		&Server{graph: counting, indexer: idx, logger: zap.NewNop()},
+	)
 
 	recall := server.gatherExploreSourceLiteralRecall(
 		context.Background(), []string{"ku"}, "", query.QueryOptions{},
@@ -792,7 +815,9 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 		"long parenthesized issue prose must use concept retrieval without losing its unique literal proof")
 	engine := query.NewEngine(counting)
 	engine.SetSearchProvider(idx.Search)
-	fullServer := NewServer(engine, counting, idx, nil, zap.NewNop(), nil)
+	fullServer := pinExploreSourceLiteralRecallBudget(
+		NewServer(engine, counting, idx, nil, zap.NewNop(), nil),
+	)
 	req := mcpgo.CallToolRequest{}
 	req.Params.Arguments = map[string]any{
 		"task": task, "localize": true, "max_symbols": 10,
@@ -884,7 +909,9 @@ func TestExploreCompactLiteralIgnoresTestMetadataAndPrefersSpecificProductionCal
 	_, err = idx.IndexCtx(context.Background(), root)
 	require.NoError(t, err)
 	counting := &exploreSourceLiteralCountingStore{Store: store}
-	server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
+	server := pinExploreSourceLiteralRecallBudget(
+		&Server{graph: counting, indexer: idx, logger: zap.NewNop()},
+	)
 
 	task := `CultureNotFoundException for culture "ku" (Kurdish) thrown when code enumerates or references all supported cultures, e.g. in number-to-words or collection initialization; find where "ku" locale/culture is registered or iterated causing crash on platforms lacking that culture.`
 	testNodes := store.FindNodesByName("ToOrdinalWordsKurdish")
@@ -907,7 +934,9 @@ func TestExploreCompactLiteralIgnoresTestMetadataAndPrefersSpecificProductionCal
 
 	engine := query.NewEngine(counting)
 	engine.SetSearchProvider(idx.Search)
-	fullServer := NewServer(engine, counting, idx, nil, zap.NewNop(), nil)
+	fullServer := pinExploreSourceLiteralRecallBudget(
+		NewServer(engine, counting, idx, nil, zap.NewNop(), nil),
+	)
 	req := mcpgo.CallToolRequest{}
 	req.Params.Arguments = map[string]any{
 		"task": task, "localize": true, "max_symbols": 6,

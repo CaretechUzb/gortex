@@ -71,7 +71,9 @@ func TestLocalizationEvidencePolicyRejectsWeakFindLocaliserOwnerFromSQLiteCSharp
 	}
 	require.NotNil(t, owner)
 
-	server := &Server{graph: store, indexer: idx, logger: zap.NewNop()}
+	server := pinExploreSourceLiteralRecallBudget(
+		&Server{graph: store, indexer: idx, logger: zap.NewNop()},
+	)
 	recall := server.gatherExploreSourceLiteralRecall(
 		context.Background(), []string{"ku"}, "", query.QueryOptions{},
 	)
