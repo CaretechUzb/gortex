@@ -647,7 +647,11 @@ func renderLocalizationFinalResponseForTask(task string, current, rows []localiz
 // it names the one failure mode measurement keeps finding: an answer that
 // paraphrases the located identifier into a neighbouring one it inferred from
 // the request text, losing the located symbol.
-const localizationAnswerReadyDirective = "Localization for this task is complete. Respond now: reproduce the LOCALIZATION lines above verbatim, then explain; never swap in a symbol you inferred elsewhere, and do not call another tool."
+// The conclusion is bounded deliberately. Output is the most expensive token
+// class in a session, and asking for the located lines verbatim already moved
+// median output up measurably; an unbounded "explain" invites the model to
+// restate evidence it has just quoted.
+const localizationAnswerReadyDirective = "Localization for this task is complete. Respond now: reproduce the LOCALIZATION lines above verbatim, then explain in at most two sentences; never swap in a symbol you inferred elsewhere, and do not call another tool."
 
 func localizationDigestRowsByID(digest *localizationEvidenceDigest) map[string]localizationDigestRow {
 	retained := make(map[string]localizationDigestRow)
