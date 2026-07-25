@@ -3208,8 +3208,11 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					// Release the parse tree now that the per-file
 					// contract pass is done. Post-passes that need a
 					// tree for this file (cross-file handler resolution)
-					// re-parse on demand. Nil-safe.
-					result.Tree.Release()
+					// re-parse on demand. Nil-safe. Deliberately not a
+					// defer: this is a per-file loop body inside a
+					// long-lived worker goroutine, so a defer would pin
+					// every tree in the chunk until the worker exits.
+					result.ReleaseTree()
 					atomic.AddInt64(&fileCount, 1)
 				}
 				if len(localContracts) > 0 {
@@ -3882,6 +3885,12 @@ func (idx *Indexer) indexFile(
 			_ = quarantine.Save()
 		}
 	}
+	// The tree-sitter tree behind result.Tree is C memory the Go GC
+	// cannot reclaim, and this function has many early returns below.
+	// Release it on every exit path — nothing after this point reads
+	// the tree (the incremental contract pass parses its own), so the
+	// defer is the whole lifetime.
+	defer result.ReleaseTree()
 	if result == nil {
 		// No usable parse result (transient parse failure, quarantine,
 		// timeout). Do NOT evict — the file's prior nodes/edges/search
@@ -4258,6 +4267,11 @@ func (idx *Indexer) StructuralSymbols(filePath string) ([]*graph.Node, bool) {
 	if quarantine != nil && quarantine.Len() > 0 {
 		_ = quarantine.Save()
 	}
+	// This probe only ever reads result.Nodes, so the parse tree is
+	// dead the moment extraction returns. Release it on both exits —
+	// the inertness probe runs on every watcher event, so a retained
+	// tree here leaks C memory at save frequency.
+	defer result.ReleaseTree()
 	// A skipped (quarantined / timed-out) file produces only a
 	// synthetic node — not the real symbol set — so inertness cannot
 	// be proven and the caller must reindex normally.
