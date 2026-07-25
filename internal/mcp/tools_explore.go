@@ -3755,23 +3755,31 @@ func buildLocalizationExploreResultForTaskFinalized(
 	// alone leaves most callers reading the symbol anyway, because the page
 	// still told them to. So pack the body and retire the read together, or
 	// do neither — the half-measure costs payload and saves no call.
-	if prescribed := localizationPrescribedSymbol(envelope.Completion); prescribed != "" {
-		retiring := envelope
-		if envelope.Completion.State == localizationStateNeedsRefinement {
-			retiring = localizationEnvelopePackingPrescribedBody(
-				envelope, acceptedTargets, bodyOrder, prescribed, maxBytes)
-		}
-		if localizationPrescribedReadSatisfiedByEnvelope(task, prescribed, retiring) {
+	claimedAnswer := false
+	if prescribed := localizationPrescribedSymbol(envelope.Completion); prescribed != "" &&
+		localizationPrescriptionHasNothingLeftToChoose(envelope.Completion) {
+		// The allowance is what makes this reachable: a full page fills its
+		// budget with ranked rows, so at the ordinary limit an ordinary body
+		// overflows by a few hundred bytes and the round trip survives.
+		retiring := localizationEnvelopePackingPrescribedBody(
+			envelope, acceptedTargets, bodyOrder, prescribed,
+			maxBytes+localizationRetiredReadAllowance(maxBytes))
+		if localizationEvidenceCarriesPackedBody(retiring, prescribed) {
 			satisfiedSymbol = prescribed
 			envelope = retiring
-			envelope.Completion = localizationCompletionRetiringPrescribedRead(envelope.Completion)
+			if localizationPrescribedReadSatisfiedByEnvelope(task, prescribed, retiring) {
+				claimedAnswer = true
+				envelope.Completion = localizationCompletionRetiringPrescribedRead(envelope.Completion)
+			} else {
+				envelope.Completion = localizationCompletionReleasingPrescribedRead(envelope.Completion)
+			}
 		}
 	}
 	// Strong enforcement is derived only from proof rows that survived final
 	// byte-budget packing. Visible text, retained state, and host metadata then
 	// share this one normalized completion value.
 	envelope.Completion = localizationFinalizeCompletionEvidence(task, envelope.Completion, acceptedTargets, envelope)
-	if satisfiedSymbol != "" && envelope.Completion.State != localizationStateAnswerReady {
+	if claimedAnswer && envelope.Completion.State != localizationStateAnswerReady {
 		// The policy would not stand behind the retirement — an unproven answer
 		// is demoted to a recovery page, which is a worse offer than the bounded
 		// read we started from. Put back the prescription, and with it the bytes
@@ -3800,7 +3808,11 @@ func buildLocalizationExploreResultForTaskFinalized(
 	// be retained either — then packed source bodies, which are the largest and
 	// most recoverable payload. A body that just retired a prescribed read is
 	// kept: it is the evidence the caller would otherwise have paid a call for.
-	for !localizationEnvelopeFits(envelope, maxBytes) {
+	shedBudget := maxBytes
+	if satisfiedSymbol != "" {
+		shedBudget = maxBytes + localizationRetiredReadAllowance(maxBytes)
+	}
+	for !localizationEnvelopeFits(envelope, shedBudget) {
 		if digest != nil && len(digest.Evidence) > localizationFinalResponsePrimaryLimit {
 			digest.Evidence = digest.Evidence[:len(digest.Evidence)-1]
 			rebuildLocalizationDigestSkeleton(digest)
@@ -3826,7 +3838,7 @@ func buildLocalizationExploreResultForTaskFinalized(
 			page := envelope.Completion.FinalResponse
 			if envelope.Completion.State != localizationStateAnswerReady && page != "" {
 				envelope.Completion.FinalResponse = ""
-				if localizationEnvelopeFits(envelope, maxBytes) {
+				if localizationEnvelopeFits(envelope, shedBudget) {
 					break
 				}
 				envelope.Completion.FinalResponse = page

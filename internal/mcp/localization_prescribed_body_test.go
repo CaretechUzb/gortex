@@ -39,11 +39,10 @@ func decodeLocalizationEnvelope(t *testing.T, result *mcpgo.CallToolResult) loca
 	return envelope
 }
 
-// Packing the prescribed body is worth its bytes only if the page can then
-// drop the instruction to go and read it — inlining while still commanding the
-// read leaves the caller doing both. So a refinement that cannot retire its
-// read carries no body, exactly as before.
-func TestARefinementThatCannotRetireItsReadCarriesNoBody(t *testing.T) {
+// Body and instruction move together. A single-target prescription whose body
+// this page now ships owes no read at all — but it claims nothing about
+// ranking either, so it releases rather than declaring a proven answer.
+func TestASingleTargetPrescriptionShipsItsBodyAndReleasesTheRead(t *testing.T) {
 	const task = "loading a stored record leaves the path empty"
 	symbol, targets := prescribedBodyTargets(
 		`func (d *DiskStorage) Load(path string) ([]byte, error) { return os.ReadFile(path) }`)
@@ -52,12 +51,42 @@ func TestARefinementThatCannotRetireItsReadCarriesNoBody(t *testing.T) {
 		newLocalizationRefinementCompletion(symbol), task, targets, 1600)
 	envelope := decodeLocalizationEnvelope(t, result)
 
-	if finalized.State == localizationStateAnswerReady {
-		t.Fatalf("this fixture is supposed to leave the read standing: %#v", finalized)
+	if finalized.State != localizationStateLocalized {
+		t.Fatalf("a satisfied single-target prescription still commands its read: %#v", finalized)
+	}
+	if finalized.AllowedToolCalls != 0 || strings.Contains(finalized.Instruction, "read(") {
+		t.Fatalf("a released prescription still asks for a call: %#v", finalized)
+	}
+	var carried bool
+	for _, evidence := range envelope.Evidence {
+		if evidence.ID == symbol && strings.TrimSpace(evidence.Source) != "" {
+			carried = true
+		}
+	}
+	if !carried {
+		t.Fatal("the read was released without the body that justifies releasing it")
+	}
+}
+
+// A refinement that authorizes several candidates is asking the caller to pick
+// between them. Shipping one of those bodies does not answer that question, so
+// the page keeps its bounded read and spends no bytes on a partial answer.
+func TestARefinementWithACandidateChoiceKeepsItsRead(t *testing.T) {
+	const task = "loading a stored record leaves the path empty"
+	symbol, targets := prescribedBodyTargets(
+		`func (d *DiskStorage) Load(path string) ([]byte, error) { return os.ReadFile(path) }`)
+	completion := newLocalizationRefinementCompletionForSymbols(
+		symbol, []string{symbol, "storage/cache.go::Cache.Warm"})
+
+	result, _, _, finalized := buildLocalizationExploreResultForTaskFinalized(completion, task, targets, 1600)
+	envelope := decodeLocalizationEnvelope(t, result)
+
+	if finalized.State == localizationStateLocalized || finalized.State == localizationStateAnswerReady {
+		t.Fatalf("a page with a choice left to make released its read: %#v", finalized)
 	}
 	for _, evidence := range envelope.Evidence {
 		if strings.TrimSpace(evidence.Source) != "" {
-			t.Fatalf("a page that still commands the read also paid for the body: %#v", evidence)
+			t.Fatalf("a page that kept its read also paid for a body: %#v", evidence)
 		}
 	}
 }

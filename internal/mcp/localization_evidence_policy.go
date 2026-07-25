@@ -99,6 +99,79 @@ func localizationStrongEvidenceForCompletion(completion localizationCompletion, 
 	return localizationEvidenceProof{}
 }
 
+// localizationRetiredReadByteAllowance caps the extra payload a response may
+// spend on the one body that removes a round trip. Measured, a full page fills
+// its budget to within a few hundred bytes with ranked rows alone, so an
+// ordinary body overflows by a little and is refused — and that is the
+// expensive outcome. The caller spends those bytes either way: inline they are
+// paid once, as a round trip they are paid again as a fresh request, its cache
+// write and its output.
+const localizationRetiredReadByteAllowance = 4096
+
+// localizationRetiredReadAllowance bounds that spend against what the caller
+// asked for: nothing below the real minimum budget, and never more than half
+// again.
+func localizationRetiredReadAllowance(maxBytes int) int {
+	if maxBytes < exploreMinBudgetTokens*localizationEnvelopeBytesPerToken {
+		return 0
+	}
+	if allowance := maxBytes / 2; allowance < localizationRetiredReadByteAllowance {
+		return allowance
+	}
+	return localizationRetiredReadByteAllowance
+}
+
+// localizationEvidenceCarriesPackedBody reports whether the envelope already
+// ships the named symbol's source — the only precondition for dropping the
+// instruction to go and read it.
+func localizationEvidenceCarriesPackedBody(envelope localizationExploreEnvelope, symbol string) bool {
+	symbol = strings.TrimSpace(symbol)
+	if symbol == "" {
+		return false
+	}
+	for _, evidence := range envelope.Evidence {
+		if evidence.ID == symbol && strings.TrimSpace(evidence.Source) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// localizationPrescriptionHasNothingLeftToChoose reports whether the page asks
+// for one specific body and nothing else. A refinement authorizing several
+// candidates is asking the caller to pick between them, and shipping one of
+// those bodies does not answer that question.
+func localizationPrescriptionHasNothingLeftToChoose(completion localizationCompletion) bool {
+	switch completion.State {
+	case localizationStateNeedsExactRead:
+		return true
+	case localizationStateNeedsRefinement:
+		return len(completion.AllowedSymbols) <= 1
+	default:
+		return false
+	}
+}
+
+// localizationCompletionReleasingPrescribedRead drops a prescription the page
+// has already answered, without claiming more than the evidence supports. It
+// deliberately does not reuse the single-result completion, which asserts there
+// is exactly one supported candidate and no competitor — a ranking claim this
+// path has not earned.
+func localizationCompletionReleasingPrescribedRead(completion localizationCompletion) localizationCompletion {
+	return localizationCompletion{
+		State:            localizationStateLocalized,
+		Scope:            "localization",
+		RequiredAction:   "continue_task",
+		Instruction:      localizationReleasedReadInstruction,
+		AllowedToolCalls: 0,
+		ContractVersion:  localizationTerminalContractV2,
+		taskLead:         completion.taskLead,
+		digest:           completion.digest,
+	}
+}
+
+const localizationReleasedReadInstruction = "The source this response prescribed is included above, so the read it asked for would return bytes you already hold. Answer or continue from this evidence. This is not a claim that the evidence is complete — every tool remains available if it does not fit the request."
+
 // localizationEnvelopePackingPrescribedBody returns the envelope with the
 // prescribed symbol's source packed, if it fits. Only that one body: a
 // refinement page that grew by every candidate's source would spend the whole
