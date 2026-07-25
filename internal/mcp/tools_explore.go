@@ -3700,14 +3700,6 @@ func buildLocalizationExploreResultForTaskFinalized(
 	// would spend a call to receive the body packed above. Complete instead,
 	// keeping the same evidence and the same lead-alignment bar.
 	satisfiedSymbol := ""
-	if envelope.Completion.State == localizationStateNeedsExactRead &&
-		localizationExactReadSatisfiedByEnvelope(task, envelope) {
-		satisfiedSymbol = envelope.Completion.ExactSymbol
-		satisfied := newLocalizationCompletion(true, "")
-		satisfied.taskLead = envelope.Completion.taskLead
-		satisfied.digest = envelope.Completion.digest
-		envelope.Completion = satisfied
-	}
 	// Strong enforcement is derived only from proof rows that survived final
 	// byte-budget packing. Visible text, retained state, and host metadata then
 	// share this one normalized completion value.

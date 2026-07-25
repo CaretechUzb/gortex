@@ -178,9 +178,8 @@ func localizationFinalizeCompletionEvidence(
 		// does not carry the request's lead is the exception — unproven AND
 		// unaligned is where ranked confidence has been wrong, so that page
 		// keeps its one bounded call.
-		if completion.State == localizationStateAnswerReady && strings.TrimSpace(task) != "" &&
-			(len(envelope.Evidence) > 0 || len(envelope.Symbols) > 0) &&
-			!localizationRankedEvidenceCarriesLead(task, completion, envelope) {
+		if completion.State == localizationStateAnswerReady &&
+			(len(envelope.Evidence) > 0 || len(envelope.Symbols) > 0) {
 			recovery := newLocalizationRecoveryCompletion()
 			recovery.digest = completion.digest
 			return recovery
