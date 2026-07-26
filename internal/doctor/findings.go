@@ -32,7 +32,26 @@ type Finding struct {
 // agentActivity is one harness's slice of the invocation log, so the finding
 // rules below cannot accidentally read another agent's rows.
 type agentActivity struct {
-	events map[string]hooks.EventActivity
+	events  map[string]hooks.EventActivity
+	summary hooks.EffectivenessSummary
+}
+
+// silent reports that an event demonstrably did not run for this agent.
+//
+// Zero attributed runs is not enough. A log is mixed for as long as the
+// window still reaches back past the upgrade that introduced attribution, and
+// during that overlap an event may have run with no agent recorded — most
+// visibly for events that fire once per session, where a busy PreToolUse
+// stream attributes itself within minutes while SessionStart waits for the
+// next session. Concluding silence there accuses a working install.
+func (a agentActivity) silent(event string) bool {
+	return a.events[event].Runs == 0 && a.summary.AmbiguousRuns(event) == 0
+}
+
+// ambiguous reports that the window holds runs of this event that cannot be
+// attributed either way.
+func (a agentActivity) ambiguous(event string) bool {
+	return a.events[event].Runs == 0 && a.summary.AmbiguousRuns(event) > 0
 }
 
 // AgentHooks is what an adapter's config declares, per lifecycle event.
@@ -64,7 +83,7 @@ func Diagnose(agent AgentHooks, summary hooks.EffectivenessSummary, adoption Ado
 	// Scope the evidence to this harness. On a machine running more than one
 	// agent the union would let a busy Claude Code session vouch for hooks
 	// Codex is skipping — exactly the failure doctor exists to catch.
-	activity := agentActivity{events: summary.ForAgent(agent.Agent)}
+	activity := agentActivity{events: summary.ForAgent(agent.Agent), summary: summary}
 	add := func(sev Severity, remedy, format string, args ...any) {
 		findings = append(findings, Finding{Severity: sev, Summary: fmt.Sprintf(format, args...), Remedy: remedy})
 	}
@@ -79,15 +98,22 @@ func Diagnose(agent AgentHooks, summary hooks.EffectivenessSummary, adoption Ado
 	}
 	sort.Strings(events)
 
-	var ran int
+	var ran, ambiguous int
 	for _, event := range events {
 		ran += activity.events[event].Runs
+		ambiguous += summary.AmbiguousRuns(event)
 	}
 
 	switch {
 	case configured == 0:
 		add(SeverityWarn, "gortex install",
 			"%s has no Gortex lifecycle hooks configured.", agent.Agent)
+	case ran == 0 && ambiguous > 0:
+		// The window straddles the upgrade that introduced attribution: runs
+		// exist, they just cannot be assigned. Say so rather than accuse.
+		add(SeverityInfo, "re-run after the window clears the upgrade",
+			"%d hook run(s) in this window predate per-agent attribution, so %s's hooks can be neither confirmed nor ruled out.",
+			ambiguous, agent.Agent)
 	case ran == 0 && agent.RequiresTrust:
 		// The headline case. Every declared hook is on disk and none has
 		// run, which for a trust-gating agent means the hooks were never
@@ -106,7 +132,7 @@ func Diagnose(agent AgentHooks, summary hooks.EffectivenessSummary, adoption Ado
 	if ran > 0 {
 		for _, event := range events {
 			stats := activity.events[event]
-			if stats.Runs > 0 {
+			if stats.Runs > 0 || !activity.silent(event) {
 				continue
 			}
 			remedy := "re-run `gortex install`"

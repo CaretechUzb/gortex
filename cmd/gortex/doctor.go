@@ -156,6 +156,13 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		Stderr:       nil, // suppress progress lines; doctor is read-only
 	}
 
+	if doctorRedact {
+		// Install the rewriter before anything renders, so every section —
+		// static, runtime, and the paths quoted inside findings — agrees on
+		// what a given repo is called.
+		doctorPath = newDoctorPathRedactor(home, root)
+	}
+
 	doctorEnv := doctorEnvironment()
 
 	registry := buildRegistry()
@@ -310,7 +317,7 @@ func inspectAdapter(a agents.Adapter, env agents.Env) DoctorAgentReport {
 func printDoctorEnvironment(w io.Writer, env DoctorEnvironment) {
 	fmt.Fprintln(w, "Gortex doctor — environment:")
 	if env.BinaryOnPath {
-		fmt.Fprintf(w, "  %s gortex on PATH: %s\n", glyphCheck, env.BinaryPath)
+		fmt.Fprintf(w, "  %s gortex on PATH: %s\n", glyphCheck, doctorPath(env.BinaryPath))
 	} else {
 		fmt.Fprintf(w, "  %s gortex not found on PATH (%s)\n", glyphCross, env.BinaryError)
 	}
@@ -319,7 +326,7 @@ func printDoctorEnvironment(w io.Writer, env DoctorEnvironment) {
 		if ver == "" {
 			ver = "ok"
 		}
-		fmt.Fprintf(w, "  %s daemon handshake: %s (%s)\n", glyphCheck, ver, env.DaemonSocket)
+		fmt.Fprintf(w, "  %s daemon handshake: %s (%s)\n", glyphCheck, ver, doctorPath(env.DaemonSocket))
 	} else {
 		fmt.Fprintf(w, "  %s daemon handshake: %s\n", glyphCross, env.DaemonError)
 	}
@@ -378,7 +385,7 @@ func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
 				}
 				extra = fmt.Sprintf(" (init would %s)", verb)
 			}
-			fmt.Fprintf(w, "      %s %s%s\n", statusSym, f.Path, extra)
+			fmt.Fprintf(w, "      %s %s%s\n", statusSym, doctorPath(f.Path), extra)
 		}
 		if r.DocsURL != "" {
 			fmt.Fprintf(w, "      docs: %s\n", r.DocsURL)
