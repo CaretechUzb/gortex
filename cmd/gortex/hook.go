@@ -21,7 +21,11 @@ var hookCmd = &cobra.Command{
 		// Claude Code format; protocol-specific agents branch below, and the
 		// remaining external agents share the hookSpecificOutput.additionalContext
 		// wire shape.
-		switch hookAgent {
+		// Attribute every telemetry row this process writes to the harness that
+	// invoked it, before any handler runs.
+	hooks.SetAgent(hookAgent)
+
+	switch hookAgent {
 		case "hermes":
 			// Hermes (NousResearch hermes-agent) sends
 			// snake_case events and expects an action/message decision shape, so

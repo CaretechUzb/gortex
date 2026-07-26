@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/zzet/gortex/internal/platform"
@@ -35,13 +36,49 @@ type hookDecision struct {
 // the existing probe log while making skipped/no-output invocations visible;
 // that denominator is what catches regressions such as "91% skipped".
 type hookEffectiveness struct {
-	Timestamp           string `json:"ts"`
-	Event               string `json:"event"`
+	Timestamp string `json:"ts"`
+	Event     string `json:"event"`
+	// Agent names the harness whose hook invoked us. Without it a machine
+	// running two agents produces one indistinguishable stream, and "these
+	// hooks never ran" — the finding that identifies an agent silently
+	// skipping them — cannot be said about either one. Omitted (and read as
+	// unattributed) in logs written before this field existed.
+	Agent               string `json:"agent,omitempty"`
 	EmittedContext      bool   `json:"emitted_context"`
 	DaemonReachable     *bool  `json:"daemon_reachable,omitempty"`
 	AlternationSegments int    `json:"alternation_segments"`
 	DurationMS          int64  `json:"duration_ms"`
 }
+
+// AgentClaudeCode is the attribution for the default wire protocol: the
+// `--agent` flag is empty for Claude Code, so the empty string has to be
+// resolved to a name rather than recorded as "unknown".
+const AgentClaudeCode = "claude-code"
+
+// activeAgent is the harness this hook process is serving, set once from the
+// command line before any handler runs. A package-level value rather than a
+// parameter threaded through every logging call site: a hook process handles
+// exactly one event for one agent and then exits.
+var activeAgent = AgentClaudeCode
+
+// SetAgent records which harness invoked this hook process. Empty resolves to
+// Claude Code, matching the `--agent` flag's documented default — so no hook
+// command string has to change to gain attribution. That matters beyond
+// tidiness: Codex records trust against each hook command's hash and skips
+// hooks whose definition changed, so rewriting one to add a flag would
+// silently disable it until every user re-approved it in /hooks.
+func SetAgent(name string) {
+	name = strings.TrimSpace(strings.ToLower(name))
+	switch name {
+	case "", "claude", "claude-code", "claudecode":
+		activeAgent = AgentClaudeCode
+	default:
+		activeAgent = name
+	}
+}
+
+// ActiveAgent reports the harness this process is serving.
+func ActiveAgent() string { return activeAgent }
 
 var hookEffectivenessEvents = map[string]bool{
 	"PostToolUse":                          true,
@@ -137,6 +174,7 @@ func logHookEffectivenessReachability(event string, emitted bool, reachable *boo
 	appendHookJSONL(path, hookEffectiveness{
 		Timestamp:           time.Now().UTC().Format(time.RFC3339Nano),
 		Event:               event,
+		Agent:               activeAgent,
 		EmittedContext:      emitted,
 		DaemonReachable:     reachable,
 		AlternationSegments: alternationSegments,

@@ -42,16 +42,74 @@ type EventActivity struct {
 // LastSeen is tracked across the entire log, not just the window, so a
 // caller can say "last ran 9 days ago" instead of only "not in window".
 type EffectivenessSummary struct {
-	Path       string                   `json:"path"`
-	Present    bool                     `json:"present"`
-	WindowRows int                      `json:"window_rows"`
-	TotalRows  int                      `json:"total_rows"`
-	Events     map[string]EventActivity `json:"events"`
+	Path       string `json:"path"`
+	Present    bool   `json:"present"`
+	WindowRows int    `json:"window_rows"`
+	TotalRows  int    `json:"total_rows"`
+	// Events is the union across every agent — the right denominator for
+	// "is anything running on this machine at all".
+	Events map[string]EventActivity `json:"events"`
+	// ByAgent partitions the same rows by harness, so a machine running two
+	// agents can be asked about one of them.
+	ByAgent map[string]map[string]EventActivity `json:"by_agent,omitempty"`
+	// Attributed is true once any row in the window carries an agent. Rows
+	// written before the field existed do not, and a summary of only those
+	// cannot answer per-agent questions at all.
+	Attributed bool `json:"attributed"`
+	// UnattributedRows counts window rows with no agent, so a caller can say
+	// how much of its evidence predates attribution.
+	UnattributedRows int `json:"unattributed_rows"`
 }
 
-// Ran reports whether the event was invoked at least once in the window.
+// Ran reports whether the event was invoked at least once in the window,
+// across every agent.
 func (s EffectivenessSummary) Ran(event string) bool {
 	return s.Events[event].Runs > 0
+}
+
+// ForAgent returns the rollups attributable to one harness.
+//
+// The fallback is deliberately asymmetric, because the two unknowns are not
+// equally safe. When the log carries no attribution at all — every row
+// predates the agent field — the union is returned: it over-reports this
+// agent, but a caller that concludes "these hooks never ran" from a log that
+// simply cannot say would be manufacturing a blocker out of missing metadata.
+// When the log *is* attributed and this agent has no rows, that is real
+// evidence of silence and is returned as such.
+func (s EffectivenessSummary) ForAgent(agent string) map[string]EventActivity {
+	if !s.Attributed {
+		return s.Events
+	}
+	if events, ok := s.ByAgent[agent]; ok {
+		return events
+	}
+	return map[string]EventActivity{}
+}
+
+// accumulate folds one record into a rollup. Shared by the union and the
+// per-agent partition so the two can never disagree about what a row means.
+func accumulate(into *EventActivity, rec hookEffectiveness) {
+	into.Runs++
+	into.TotalMS += rec.DurationMS
+	if rec.EmittedContext {
+		into.Emitted++
+	}
+	if rec.DaemonReachable != nil {
+		into.DaemonKnown++
+		if *rec.DaemonReachable {
+			into.DaemonUp++
+		}
+	}
+}
+
+// AgentNames lists the harnesses seen in the window, sorted.
+func (s EffectivenessSummary) AgentNames() []string {
+	out := make([]string, 0, len(s.ByAgent))
+	for name := range s.ByAgent {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // EventNames lists the events present in the summary, sorted.
@@ -73,7 +131,11 @@ func (s EffectivenessSummary) EventNames() []string {
 // must not blind the diagnostic to the 40,000 good rows before it.
 func ReadEffectiveness(since time.Time) (EffectivenessSummary, error) {
 	path := EffectivenessLogPath()
-	summary := EffectivenessSummary{Path: path, Events: map[string]EventActivity{}}
+	summary := EffectivenessSummary{
+		Path:    path,
+		Events:  map[string]EventActivity{},
+		ByAgent: map[string]map[string]EventActivity{},
+	}
 	if path == "" {
 		return summary, nil
 	}
@@ -111,16 +173,23 @@ func ReadEffectiveness(since time.Time) (EffectivenessSummary, error) {
 		}
 		if !stamp.Before(since) {
 			summary.WindowRows++
-			activity.Runs++
-			activity.TotalMS += rec.DurationMS
-			if rec.EmittedContext {
-				activity.Emitted++
-			}
-			if rec.DaemonReachable != nil {
-				activity.DaemonKnown++
-				if *rec.DaemonReachable {
-					activity.DaemonUp++
+			accumulate(&activity, rec)
+			if rec.Agent == "" {
+				summary.UnattributedRows++
+			} else {
+				summary.Attributed = true
+				perAgent := summary.ByAgent[rec.Agent]
+				if perAgent == nil {
+					perAgent = map[string]EventActivity{}
+					summary.ByAgent[rec.Agent] = perAgent
 				}
+				scoped := perAgent[event]
+				scoped.Event = event
+				if stamp.After(scoped.LastSeen) {
+					scoped.LastSeen = stamp
+				}
+				accumulate(&scoped, rec)
+				perAgent[event] = scoped
 			}
 		}
 		summary.Events[event] = activity

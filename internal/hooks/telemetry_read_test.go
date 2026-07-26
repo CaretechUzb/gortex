@@ -143,3 +143,123 @@ func TestEventNamesSorted(t *testing.T) {
 		}
 	}
 }
+
+func TestSetAgentResolvesTheDefault(t *testing.T) {
+	t.Cleanup(func() { SetAgent("") })
+	cases := map[string]string{
+		"":            AgentClaudeCode, // the --agent flag's documented default
+		"claude":      AgentClaudeCode,
+		"claude-code": AgentClaudeCode,
+		"  Claude  ":  AgentClaudeCode,
+		"codex":       "codex",
+		"CODEX":       "codex",
+		"kimi":        "kimi",
+	}
+	for in, want := range cases {
+		SetAgent(in)
+		if got := ActiveAgent(); got != want {
+			t.Errorf("SetAgent(%q) → %q want %q", in, got, want)
+		}
+	}
+}
+
+func TestReadEffectivenessPartitionsByAgent(t *testing.T) {
+	now := time.Now()
+	writeEffectivenessLog(t, []hookEffectiveness{
+		{Timestamp: stamp(now.Add(-10 * time.Minute)), Event: "SessionStart", Agent: "claude-code", EmittedContext: true},
+		{Timestamp: stamp(now.Add(-9 * time.Minute)), Event: "PreToolUse", Agent: "claude-code", EmittedContext: true},
+		{Timestamp: stamp(now.Add(-8 * time.Minute)), Event: "PreToolUse", Agent: "codex", EmittedContext: false},
+	})
+
+	got, err := ReadEffectiveness(now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Attributed {
+		t.Fatal("rows carry an agent, so the summary is attributed")
+	}
+	if got.UnattributedRows != 0 {
+		t.Errorf("unattributed=%d want 0", got.UnattributedRows)
+	}
+	if got.Events["PreToolUse"].Runs != 2 {
+		t.Errorf("union PreToolUse=%d want 2", got.Events["PreToolUse"].Runs)
+	}
+
+	codex := got.ForAgent("codex")
+	if codex["PreToolUse"].Runs != 1 {
+		t.Errorf("codex PreToolUse=%d want 1", codex["PreToolUse"].Runs)
+	}
+	// The load-bearing assertion: Claude Code running SessionStart must not
+	// vouch for Codex's SessionStart, which is the hook Codex skips.
+	if codex["SessionStart"].Runs != 0 {
+		t.Errorf("codex SessionStart=%d want 0 — another agent's rows leaked in", codex["SessionStart"].Runs)
+	}
+	if names := got.AgentNames(); len(names) != 2 || names[0] != "claude-code" || names[1] != "codex" {
+		t.Errorf("AgentNames=%v want [claude-code codex]", names)
+	}
+}
+
+// TestForAgentFallbackIsAsymmetric pins the rule that keeps an upgrade from
+// inventing a blocker: a log that predates attribution cannot say a given
+// agent was silent, so the union stands in. Once the log *is* attributed, an
+// agent with no rows really was silent and must read as such.
+func TestForAgentFallbackIsAsymmetric(t *testing.T) {
+	now := time.Now()
+
+	t.Run("unattributed log falls back to the union", func(t *testing.T) {
+		writeEffectivenessLog(t, []hookEffectiveness{
+			{Timestamp: stamp(now.Add(-time.Minute)), Event: "SessionStart", EmittedContext: true},
+		})
+		got, err := ReadEffectiveness(now.Add(-time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Attributed {
+			t.Fatal("no row carries an agent")
+		}
+		if got.UnattributedRows != 1 {
+			t.Errorf("unattributed=%d want 1", got.UnattributedRows)
+		}
+		if got.ForAgent("codex")["SessionStart"].Runs != 1 {
+			t.Error("an unattributed log must not be read as proof that codex was silent")
+		}
+	})
+
+	t.Run("attributed log reports a silent agent as silent", func(t *testing.T) {
+		writeEffectivenessLog(t, []hookEffectiveness{
+			{Timestamp: stamp(now.Add(-time.Minute)), Event: "SessionStart", Agent: "claude-code", EmittedContext: true},
+		})
+		got, err := ReadEffectiveness(now.Add(-time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.ForAgent("codex")) != 0 {
+			t.Error("codex has no rows in an attributed log, which is real evidence of silence")
+		}
+	})
+}
+
+// TestLogRecordsActiveAgent closes the loop: the writer stamps what SetAgent
+// was told, and the reader partitions on it.
+func TestLogRecordsActiveAgent(t *testing.T) {
+	t.Cleanup(func() { SetAgent("") })
+	path := filepath.Join(t.TempDir(), "hook-effectiveness.jsonl")
+	t.Setenv("GORTEX_HOOK_EFFECTIVENESS_LOG", path)
+
+	SetAgent("codex")
+	logHookEffectiveness("SessionStart", true, true, 0, 5*time.Millisecond)
+
+	got, err := ReadEffectiveness(time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Attributed {
+		t.Fatal("the writer did not stamp the agent")
+	}
+	if got.ForAgent("codex")["SessionStart"].Runs != 1 {
+		t.Errorf("codex rows=%+v", got.ByAgent)
+	}
+	if len(got.ForAgent(AgentClaudeCode)) != 0 {
+		t.Error("the row belongs to codex only")
+	}
+}
