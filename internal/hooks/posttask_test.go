@@ -81,9 +81,9 @@ func TestRunPostTask_RendersDiagnostics(t *testing.T) {
 
 	ac := payload.HookSpecificOutput.AdditionalContext
 	mustContain := []string{
-		"Post-Task Diagnostics",
+		"Working-Tree Diagnostics",
 		"risk `MEDIUM`",
-		"Tests to Run",
+		"Tests Covering These Symbols",
 		"internal/foo_test.go::TestFoo",
 		"Guard Violations",
 		"boundary my-rule",
@@ -96,6 +96,63 @@ func TestRunPostTask_RendersDiagnostics(t *testing.T) {
 		if !strings.Contains(ac, frag) {
 			t.Errorf("briefing missing %q\n---\n%s", frag, ac)
 		}
+	}
+}
+
+// TestPostTaskBriefing_DisclosesWholeTreeScope pins the honesty contract: the
+// briefing must name the tree it diffed, admit it does not attribute changes to
+// a session, admit untracked files are invisible, and must not tell the agent to
+// run tests for work that may not be its own.
+func TestPostTaskBriefing_DisclosesWholeTreeScope(t *testing.T) {
+	srv := newRecordingFakeServer(map[string]string{
+		"detect_changes": `{
+			"changed_files":["internal/foo.go"],
+			"changed_symbols":[{"id":"internal/foo.go::Foo","name":"Foo","kind":"function","file_path":"gortex/internal/foo.go"}],
+			"risk":"LOW","summary":"1 symbol",
+			"scope":"all","repo":"gortex","repo_root":"/tmp/checkout-a"
+		}`,
+		"get_test_targets": "internal/foo_test.go TestFoo\n",
+	})
+	defer srv.Close()
+
+	data := []byte(`{"hook_event_name":"Stop","stop_hook_active":false}`)
+	out := captureStdout(t, func() { runPostTask(data, portFromURL(t, srv.URL)) })
+	if out == "" {
+		t.Fatal("expected a briefing")
+	}
+
+	for _, frag := range []string{
+		"/tmp/checkout-a",    // names the tree actually diffed
+		"does not attribute", // admits the limitation
+		"whole working tree", // states the real scope
+		"Untracked",          // discloses the blind spot
+		"parallel session",   // names the concurrent-session case
+		"uncommitted (staged + unstaged)",
+	} {
+		if !strings.Contains(out, frag) {
+			t.Errorf("briefing missing %q\n---\n%s", frag, out)
+		}
+	}
+	for _, banned := range []string{
+		"Run the tests above", // the old imperative
+		"**Changed:**",        // the old session-implying claim
+		"Post-Task",           // the old title
+	} {
+		if strings.Contains(out, banned) {
+			t.Errorf("briefing still contains %q\n---\n%s", banned, out)
+		}
+	}
+
+	// The scope we request must match the scope we claim in prose.
+	calls := srv.argsFor("detect_changes")
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 detect_changes call, got %d", len(calls))
+	}
+	if got := calls[0]["scope"]; got != postTaskDiffScope {
+		t.Errorf("detect_changes scope = %v, want %q", got, postTaskDiffScope)
+	}
+	if got := calls[0]["summary_only"]; got != true {
+		t.Errorf("detect_changes summary_only = %v, want true", got)
 	}
 }
 
@@ -136,7 +193,7 @@ func TestDispatch_RoutesStop(t *testing.T) {
 
 	data := []byte(`{"hook_event_name":"Stop","stop_hook_active":false}`)
 	out := captureStdout(t, func() { runFromBytes(t, data, port) })
-	if !strings.Contains(out, "Post-Task Diagnostics") {
+	if !strings.Contains(out, "Working-Tree Diagnostics") {
 		t.Errorf("Run did not route to PostTask handler:\n%s", out)
 	}
 }

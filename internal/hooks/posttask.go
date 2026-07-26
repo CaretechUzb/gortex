@@ -7,6 +7,18 @@ import (
 	"time"
 )
 
+// postTaskDiffScope is the detect_changes scope both Stop-hook briefings
+// measure. "all" == `git diff HEAD`: staged and unstaged changes to tracked
+// files. The previous "unstaged" hid staged work entirely, so a session that
+// staged its edits got a briefing about only what it had *not* staged.
+// Untracked files are invisible to every scope — MapGitDiff parses git diff
+// output, which never lists them.
+const postTaskDiffScope = "all"
+
+// postTaskScopePhrase describes postTaskDiffScope in prose. Kept beside the
+// constant so the scope we request and the scope we claim cannot drift.
+const postTaskScopePhrase = "uncommitted (staged + unstaged) changes to tracked files"
+
 // PostTaskInput is the JSON structure Claude Code sends to Stop hooks.
 // stop_hook_active is true when the hook is already being rerun (another
 // Stop hook asked the agent to continue) — we must skip in that case to
@@ -66,28 +78,76 @@ func runPostTask(data []byte, port int) {
 	fmt.Print(string(out))
 }
 
+// changedSymbol is one entry of detect_changes' changed_symbols list.
+// FilePath carries the graph node's file, which is repo-prefixed in
+// multi-repo mode while changed_files is not — see attributeChanges.
+type changedSymbol struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+	FilePath string `json:"file_path"`
+}
+
+// changeSet is the slice of a detect_changes response both Stop-hook
+// briefings read. Scope/Repo/RepoRoot are echoed by the handler so the
+// briefing can name the tree it actually diffed instead of guessing.
+type changeSet struct {
+	ChangedFiles   []string        `json:"changed_files"`
+	ChangedSymbols []changedSymbol `json:"changed_symbols"`
+	Risk           string          `json:"risk"`
+	Summary        string          `json:"summary"`
+	Scope          string          `json:"scope"`
+	Repo           string          `json:"repo"`
+	RepoRoot       string          `json:"repo_root"`
+}
+
+// detectChangeSet asks the bridge for the current diff and decodes it.
+// Returns nil when the bridge is unreachable or the payload is unusable.
+func detectChangeSet(port int) *changeSet {
+	raw := callServerTool(port, "detect_changes", map[string]any{
+		"scope": postTaskDiffScope,
+		// The briefings never read by_depth; summary_only drops the
+		// largest part of the response.
+		"summary_only": true,
+	})
+	if raw == "" {
+		return nil
+	}
+	var changes changeSet
+	if err := json.Unmarshal([]byte(raw), &changes); err != nil {
+		return nil
+	}
+	return &changes
+}
+
+// briefingScope names the working tree detect_changes actually diffed.
+// The daemon echoes repo / repo_root; when an older daemon omits both we
+// say so rather than guessing from the hook cwd — diffRepoScope resolves
+// the tree as explicit-selector → lone-tracked-repo → session cwd, so with
+// several repos tracked a cwd-derived name can label a repo the diff never
+// touched, replacing one wrong claim with a subtler one.
+func briefingScope(repo, repoRoot string) string {
+	switch {
+	case strings.TrimSpace(repoRoot) != "":
+		return "`" + strings.TrimSpace(repoRoot) + "`"
+	case strings.TrimSpace(repo) != "":
+		return "repo `" + strings.TrimSpace(repo) + "`"
+	default:
+		return "the working tree Gortex resolved for this session"
+	}
+}
+
 // buildPostTaskBriefing runs diagnostics on the current working tree and
 // returns a compact markdown summary. Returns empty string when there's
 // nothing to report or the bridge is unreachable.
+//
+// The change set is the whole working tree, not a record of this session's
+// edits: Gortex does not attribute a diff to a session, so another agent on
+// the same checkout, a parallel session, or an earlier turn all land in it.
+// The rendered output says so — see the scope caveat below.
 func buildPostTaskBriefing(port int) string {
-	raw := callServerTool(port, "detect_changes", map[string]any{
-		"scope": "unstaged",
-	})
-	if raw == "" {
-		return ""
-	}
-
-	var changes struct {
-		ChangedFiles   []string `json:"changed_files"`
-		ChangedSymbols []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-			Kind string `json:"kind"`
-		} `json:"changed_symbols"`
-		Risk    string `json:"risk"`
-		Summary string `json:"summary"`
-	}
-	if err := json.Unmarshal([]byte(raw), &changes); err != nil {
+	changes := detectChangeSet(port)
+	if changes == nil {
 		return ""
 	}
 
@@ -104,13 +164,18 @@ func buildPostTaskBriefing(port int) string {
 	idsCSV := strings.Join(ids, ",")
 
 	var sb strings.Builder
-	sb.WriteString("## Gortex Post-Task Diagnostics\n\n")
-	fmt.Fprintf(&sb, "**Changed:** %d symbols across %d files — risk `%s`.\n\n",
-		len(changes.ChangedSymbols), len(changes.ChangedFiles), changes.Risk)
+	sb.WriteString("## Gortex Working-Tree Diagnostics\n\n")
+	fmt.Fprintf(&sb, "**Measured:** %d symbol(s) across %d file(s) with %s in %s — aggregate risk `%s`.\n\n",
+		len(changes.ChangedSymbols), len(changes.ChangedFiles), postTaskScopePhrase,
+		briefingScope(changes.Repo, changes.RepoRoot), changes.Risk)
+	sb.WriteString("**Scope caveat:** this is a diff of the whole working tree, not a record of your edits. " +
+		"Gortex does not attribute changes to a session, so anything left uncommitted by another agent, " +
+		"a parallel session on this same checkout, or an earlier turn is included below. " +
+		"Untracked (never `git add`ed) files are invisible to this check entirely.\n\n")
 
 	// Test targets — what to run.
 	if tests := renderTestTargets(port, idsCSV); tests != "" {
-		sb.WriteString("### Tests to Run\n\n")
+		sb.WriteString("### Tests Covering These Symbols\n\n")
 		sb.WriteString(tests)
 		sb.WriteString("\n")
 	}
@@ -124,7 +189,7 @@ func buildPostTaskBriefing(port int) string {
 
 	// Dead code — specifically whether any of the changed symbols are now orphaned.
 	if dead := renderDeadCodeHits(port, ids); dead != "" {
-		sb.WriteString("### Potential Dead Code (among changed symbols)\n\n")
+		sb.WriteString("### Potential Dead Code (among uncommitted symbols)\n\n")
 		sb.WriteString(dead)
 		sb.WriteString("\n")
 	}
@@ -134,7 +199,7 @@ func buildPostTaskBriefing(port int) string {
 	// matched" or just an empty body) — we don't want to nag when the
 	// repo simply doesn't run `gortex enrich coverage`.
 	if gaps := renderCoverageGapsHits(port, ids); gaps != "" {
-		sb.WriteString("### Coverage Gaps (among changed symbols)\n\n")
+		sb.WriteString("### Coverage Gaps (among uncommitted symbols)\n\n")
 		sb.WriteString(gaps)
 		sb.WriteString("\n")
 	}
@@ -143,7 +208,7 @@ func buildPostTaskBriefing(port int) string {
 	// symbols is itself a flag site or toggles one — pointing the agent
 	// at flag rollouts they may have just touched.
 	if flags := renderStaleFlagHits(port, ids); flags != "" {
-		sb.WriteString("### Stale Flag Sites Touched\n\n")
+		sb.WriteString("### Stale Flag Sites Among Uncommitted Symbols\n\n")
 		sb.WriteString(flags)
 		sb.WriteString("\n")
 	}
@@ -155,7 +220,8 @@ func buildPostTaskBriefing(port int) string {
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("_Run the tests above and review any flagged items before handoff._\n")
+	sb.WriteString("_Cross-check each finding against the edits you actually made this turn: act on the ones " +
+		"that match, ignore the rest. Do not investigate or \"fix\" changes you did not make._\n")
 	return sb.String()
 }
 
@@ -165,18 +231,8 @@ func buildPostTaskBriefing(port int) string {
 // change set. The hook is advisory: an unavailable daemon or an edit touching
 // no indexed symbol yields no output and never changes the completed mutation.
 func buildMutationBriefing(port int) string {
-	raw := callServerTool(port, "detect_changes", map[string]any{"scope": "unstaged"})
-	if raw == "" {
-		return ""
-	}
-	var changes struct {
-		ChangedFiles   []string `json:"changed_files"`
-		ChangedSymbols []struct {
-			ID string `json:"id"`
-		} `json:"changed_symbols"`
-		Risk string `json:"risk"`
-	}
-	if json.Unmarshal([]byte(raw), &changes) != nil || len(changes.ChangedSymbols) == 0 {
+	changes := detectChangeSet(port)
+	if changes == nil || len(changes.ChangedSymbols) == 0 {
 		return ""
 	}
 	ids := make([]string, 0, len(changes.ChangedSymbols))
@@ -192,8 +248,13 @@ func buildMutationBriefing(port int) string {
 
 	var out strings.Builder
 	out.WriteString("## Gortex mutation follow-up\n\n")
-	fmt.Fprintf(&out, "Detected %d affected symbol(s) across %d file(s); risk `%s`.\n\n", len(ids), len(changes.ChangedFiles), changes.Risk)
-	out.WriteString("Affected symbols:\n")
+	fmt.Fprintf(&out, "Working-tree scan after this mutation: %d symbol(s) across %d file(s) with %s in %s; "+
+		"aggregate risk `%s`. The scan covers every uncommitted change in the tree, not only the patch just "+
+		"applied — entries that predate this mutation, or that belong to another agent on this checkout, are "+
+		"included.\n\n",
+		len(ids), len(changes.ChangedFiles), postTaskScopePhrase,
+		briefingScope(changes.Repo, changes.RepoRoot), changes.Risk)
+	out.WriteString("Uncommitted symbols in scope:\n")
 	for _, id := range ids {
 		fmt.Fprintf(&out, "- `%s`\n", id)
 	}
@@ -213,7 +274,8 @@ func buildMutationBriefing(port int) string {
 		out.WriteString(contracts)
 		out.WriteString("\n")
 	}
-	out.WriteString("Run the selected tests and resolve any guard or contract findings before handoff.\n")
+	out.WriteString("Run the tests covering the symbols this patch actually changed, and resolve any guard or " +
+		"contract finding the patch introduced. Ignore entries you did not touch.\n")
 	return out.String()
 }
 

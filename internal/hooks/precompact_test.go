@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -152,6 +153,61 @@ func newFakeServer(toolResponses map[string]string) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(body)
 	}))
+}
+
+// recordingFakeServer is newFakeServer plus a record of the `arguments`
+// object each tool call carried, so a test can assert what the hook
+// *asked for* and not only what it rendered. Separate from newFakeServer
+// because that helper has ~10 call sites across four test files.
+type recordingFakeServer struct {
+	*httptest.Server
+	mu   sync.Mutex
+	args map[string][]map[string]any
+}
+
+func newRecordingFakeServer(toolResponses map[string]string) *recordingFakeServer {
+	rec := &recordingFakeServer{args: make(map[string][]map[string]any)}
+	rec.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/v1/tools/") {
+			http.NotFound(w, r)
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/v1/tools/")
+
+		var req struct {
+			Arguments map[string]any `json:"arguments"`
+		}
+		if raw, err := io.ReadAll(r.Body); err == nil {
+			_ = json.Unmarshal(raw, &req)
+		}
+		rec.mu.Lock()
+		rec.args[name] = append(rec.args[name], req.Arguments)
+		rec.mu.Unlock()
+
+		text, ok := toolResponses[name]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		body, _ := json.Marshal(map[string]any{
+			"content": []map[string]any{{"type": "text", "text": text}},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	return rec
+}
+
+// argsFor returns the recorded `arguments` objects for one tool, in call order.
+func (r *recordingFakeServer) argsFor(tool string) []map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.args[tool]
+}
+
+// callCount reports how many times a tool was invoked.
+func (r *recordingFakeServer) callCount(tool string) int {
+	return len(r.argsFor(tool))
 }
 
 func portFromURL(t *testing.T, u string) int {

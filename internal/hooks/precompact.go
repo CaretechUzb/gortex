@@ -83,7 +83,9 @@ func buildPreCompactBriefing(port int) string {
 	}
 
 	if churn := renderSymbolHistory(port); churn != "" {
-		sb.WriteString("### Recently Modified Symbols (this session)\n\n")
+		// Not session-scoped: get_symbol_history reads the process-global
+		// Server.symHistory, which every client of a shared daemon writes to.
+		sb.WriteString("### Recently Modified Symbols (Gortex-tracked edits on this daemon, all clients)\n\n")
 		sb.WriteString(churn)
 		sb.WriteString("\n")
 	}
