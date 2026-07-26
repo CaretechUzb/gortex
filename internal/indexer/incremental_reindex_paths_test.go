@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -117,8 +118,9 @@ func TestIncrementalReindexPaths_ScopesToSingleFile(t *testing.T) {
 	res, err := idx.IncrementalReindexPaths(dir, []string{filepath.Join(dir, "one.go")})
 	require.NoError(t, err)
 	assert.Equal(t, 1, res.StaleFileCount)
-	assert.Equal(t, 1, res.FileCount,
-		"FileCount for a single-file scope is the one in-scope file")
+	assert.Equal(t, 2, res.FileCount,
+		"FileCount describes the repo — both files — not the one-file scope; "+
+			"the scope size is StaleFileCount")
 	assert.NotEmpty(t, g.FindNodesByName("OneEdited"))
 	assert.Empty(t, g.FindNodesByName("TwoEdited"),
 		"the unscoped file must not be re-indexed")
@@ -232,4 +234,74 @@ func TestIncrementalReindexPaths_ConvergesForScopedFile(t *testing.T) {
 	assert.Len(t, gA.FindNodesByName("helper"), len(gB.FindNodesByName("helper")))
 	assert.NotEmpty(t, gA.FindNodesByName("Other"),
 		"a scoped reindex must leave the untouched file's nodes intact")
+}
+
+// TestIncrementalReindexPathsReportsRepoFileCountNotScopeSize pins the
+// documented contract on IndexResult.FileCount: it is how big the repo
+// is, not how much work the pass did. A scoped pass walks only the
+// caller's paths, so reporting the size of that walk here used to make
+// `daemon status` show an actively-edited repo's file count as the size
+// of its last changed-file batch.
+func TestIncrementalReindexPathsReportsRepoFileCountNotScopeSize(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "pkg"), 0o755))
+	const total = 10
+	for i := range total {
+		name := filepath.Join(dir, fmt.Sprintf("f%d.go", i))
+		if i >= total/2 {
+			name = filepath.Join(dir, "pkg", fmt.Sprintf("f%d.go", i))
+		}
+		writeFile(t, name, fmt.Sprintf("package main\n\nfunc F%d() {}\n", i))
+	}
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	full, err := idx.Index(dir)
+	require.NoError(t, err)
+	require.Equal(t, total, full.FileCount, "baseline: a full pass counts the repo")
+
+	// Scope the pass to exactly one changed file.
+	one := filepath.Join(dir, "f0.go")
+	bumpMtime(t, one, "package main\n\nfunc F0() {}\n\nfunc F0Edited() {}\n")
+
+	res, err := idx.IncrementalReindexPaths(dir, []string{one})
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.StaleFileCount,
+		"the pass's work size belongs to StaleFileCount")
+	assert.Equal(t, total, res.FileCount,
+		"FileCount must stay the repo's size under a one-file scope")
+
+	// Same contract when the scope is a directory rather than one file.
+	sub := filepath.Join(dir, "pkg", "f5.go")
+	bumpMtime(t, sub, "package main\n\nfunc F5() {}\n\nfunc F5Edited() {}\n")
+
+	res, err = idx.IncrementalReindexPaths(dir, []string{filepath.Join(dir, "pkg")})
+	require.NoError(t, err)
+	assert.Equal(t, total, res.FileCount,
+		"FileCount must stay the repo's size under a directory scope")
+}
+
+// TestIncrementalReindexPathsFileCountTracksAddsAndDeletes verifies the
+// repo-wide count still moves when the repo itself changes size, so the
+// fix reports a live total rather than a frozen one.
+func TestIncrementalReindexPathsFileCountTracksAddsAndDeletes(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "a.go"), "package main\n\nfunc A() {}\n")
+	writeFile(t, filepath.Join(dir, "b.go"), "package main\n\nfunc B() {}\n")
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	added := filepath.Join(dir, "c.go")
+	writeFile(t, added, "package main\n\nfunc C() {}\n")
+	res, err := idx.IncrementalReindexPaths(dir, []string{added})
+	require.NoError(t, err)
+	assert.Equal(t, 3, res.FileCount, "a new file grows the repo count")
+
+	require.NoError(t, os.Remove(added))
+	res, err = idx.IncrementalReindexPaths(dir, []string{added})
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.FileCount, "a deleted file shrinks the repo count")
 }
