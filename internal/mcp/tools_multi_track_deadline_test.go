@@ -60,7 +60,17 @@ func TestTrackRepositoryDetachesFirstIndexFromRequestLifetime(t *testing.T) {
 	second, err := srv.handleTrackRepository(context.Background(), req)
 	require.NoError(t, err)
 	require.False(t, second.IsError)
-	require.Contains(t, extractTextFromContent(t, second.Content), "already tracked")
+	// The property is that the second call finds the repo instead of starting
+	// over. Whether it reports the index as finished or still running depends
+	// on whether the detached first index has completed yet — which is exactly
+	// what "detached" leaves unspecified, so pinning one of the two wordings
+	// makes this assertion a race against the machine rather than a check on
+	// the handler.
+	secondText := extractTextFromContent(t, second.Content)
+	require.True(t,
+		strings.Contains(secondText, "already tracked") ||
+			strings.Contains(secondText, "already running"),
+		"the second call must recognise the repo rather than start over: %s", secondText)
 }
 
 // TestTrackRepositoryAnswersBeforeTheRequestDeadline pins the second half of
