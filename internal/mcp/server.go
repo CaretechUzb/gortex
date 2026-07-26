@@ -814,7 +814,15 @@ func (ts *tokenStats) record(node *graph.Node, tool string, returned, fullFile i
 	// in), with the hint's own global-last fallback inside Read.
 	var model string
 	if h, ok := modelhint.Read(fallbackRepo); ok {
-		model = h.Model
+		// The hint is keyed by working directory, so on a machine where two
+		// agents share a repo the wrong one can read it. Adopting a model
+		// across agents is worse than recording none: it books the call
+		// against another vendor's model and prices it at their rates. Only
+		// take the model when the hint's agent is consistent with this
+		// session's client.
+		if modelhint.SameClient(h.Client, clientName) {
+			model = h.Model
+		}
 		if clientName == "" {
 			clientName = h.Client
 		}

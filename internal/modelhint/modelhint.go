@@ -109,6 +109,32 @@ func Write(cwd, model, client string) {
 	}
 }
 
+// NormalizeClient reduces an agent or MCP client name to a comparable form.
+// The two sides of this bridge name the same harness differently: the hook
+// layer knows the agent it was invoked for ("codex"), while the MCP session
+// knows the client app that connected ("codex-mcp-client"). Comparing them
+// raw would reject every legitimate match.
+func NormalizeClient(name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	for _, suffix := range []string{"-mcp-client", "-mcp", "-client"} {
+		n = strings.TrimSuffix(n, suffix)
+	}
+	return n
+}
+
+// SameClient reports whether two agent/client names denote the same harness.
+//
+// An empty side is "unknown" and cannot contradict the other, so it matches.
+// That asymmetry is deliberate: a hint with no recorded client predates the
+// field, and rejecting it would silently drop attribution that used to work.
+// Two *known* names that disagree, though, are proof the hint belongs to a
+// different agent — and adopting it there is how a Codex call ends up priced
+// as a Claude model.
+func SameClient(a, b string) bool {
+	na, nb := NormalizeClient(a), NormalizeClient(b)
+	return na == "" || nb == "" || na == nb
+}
+
 // Read returns the model hint for `cwd`: the per-cwd announcement when
 // one exists and is fresh, otherwise the global most-recent hint. The
 // bool is false when no usable hint is found (none written, all stale,

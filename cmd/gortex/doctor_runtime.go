@@ -66,6 +66,11 @@ func collectRuntime(home string, days int) doctorRuntime {
 	since := now.Add(-time.Duration(days) * 24 * time.Hour)
 
 	state := codex.Inspect(home)
+	if doctorRedact {
+		state.ConfigPath = doctorPath(state.ConfigPath)
+		state.InstructionsPath = doctorPath(state.InstructionsPath)
+		state.ShadowedBy = doctorPath(state.ShadowedBy)
+	}
 	activity, err := hooks.ReadEffectiveness(since)
 	if err != nil {
 		// A log we cannot read is not fatal; the other sections still carry
@@ -95,6 +100,7 @@ func collectRuntime(home string, days int) doctorRuntime {
 
 	if doctorRedact {
 		out.Adoption = redactAdoption(out.Adoption)
+		out.Hooks.Path = doctorPath(out.Hooks.Path)
 	}
 	return out
 }
@@ -147,20 +153,22 @@ func collectSavings(since time.Time) doctorSavings {
 // into an issue. Tool names, counts, and timings are never sensitive and are
 // always left intact — redacting them would defeat the point of sharing it.
 func redactAdoption(a doctor.Adoption) doctor.Adoption {
-	a.Root = redactPath(a.Root)
+	a.Root = doctorPath(a.Root)
 	for i := range a.Sessions {
-		a.Sessions[i].CWD = redactPath(a.Sessions[i].CWD)
-		a.Sessions[i].Branch = redactPath(a.Sessions[i].Branch)
+		a.Sessions[i].CWD = doctorPath(a.Sessions[i].CWD)
+		a.Sessions[i].Branch = redactName(a.Sessions[i].Branch)
 	}
 	return a
 }
 
-func redactPath(value string) string {
+// redactName hashes a value that is not a path — a branch name can carry a
+// ticket id or a customer name just as readily as a repo path can.
+func redactName(value string) string {
 	if value == "" {
 		return ""
 	}
 	sum := sha256.Sum256([]byte(value))
-	return "…/<" + hex.EncodeToString(sum[:])[:8] + ">"
+	return "<" + hex.EncodeToString(sum[:])[:8] + ">"
 }
 
 func printDoctorRuntime(w io.Writer, r doctorRuntime) {
@@ -186,29 +194,42 @@ func printDoctorRuntime(w io.Writer, r doctorRuntime) {
 		fmt.Fprintf(w, "    no %s — no hook has ever run on this machine\n", r.Hooks.Path)
 	} else {
 		scoped := r.Hooks.ForAgent(codex.Name)
-		fmt.Fprintf(w, "    %-18s %7s %9s %10s  %s\n", "event", "runs", "injected", "daemon-up", "last seen")
+		fmt.Fprintf(w, "    %-18s %7s %9s %10s %8s  %s\n", "event", "runs", "injected", "daemon-up", "unattrib", "last seen")
 		for _, event := range doctorEventOrder(r.Hooks) {
 			stats := scoped[event]
 			daemon := "n/a"
 			if stats.DaemonKnown > 0 {
 				daemon = fmt.Sprintf("%d/%d", stats.DaemonUp, stats.DaemonKnown)
 			}
-			last := "never"
-			if !stats.LastSeen.IsZero() {
-				last = stats.LastSeen.Format(time.RFC3339)[:19]
+			// A zero in `runs` is only alarming when `unattrib` is zero too;
+			// showing them side by side is what keeps the reader from
+			// reaching the conclusion the findings deliberately withheld.
+			ambiguous := r.Hooks.AmbiguousRuns(event)
+			seen := stats.LastSeen
+			if seen.IsZero() {
+				// The event did run, we just cannot say for whom — dating it
+				// "never" would contradict the count beside it.
+				seen = r.Hooks.Unattributed[event].LastSeen
 			}
-			fmt.Fprintf(w, "    %-18s %7d %9d %10s  %s\n", event, stats.Runs, stats.Emitted, daemon, last)
+			last := "never"
+			if !seen.IsZero() {
+				last = seen.Format(time.RFC3339)[:19]
+			}
+			fmt.Fprintf(w, "    %-18s %7d %9d %10s %8d  %s\n", event, stats.Runs, stats.Emitted, daemon, ambiguous, last)
 		}
 		fmt.Fprintf(w, "    %d row(s) in window, %d in the whole log\n", r.Hooks.WindowRows, r.Hooks.TotalRows)
 		if agents := r.Hooks.AgentNames(); len(agents) > 0 {
 			fmt.Fprintf(w, "    agents seen                %s\n", joinComma(agents))
 		}
 		if r.Hooks.UnattributedRows > 0 {
-			// Rows written before the agent field existed cannot be assigned,
-			// so say how much of the evidence is shared rather than let the
-			// table imply a precision it does not have.
-			fmt.Fprintf(w, "    note: %d row(s) predate per-agent attribution and are counted for\n", r.Hooks.UnattributedRows)
-			fmt.Fprintln(w, "          every agent; they clear as the window rolls forward.")
+			// Rows written before the agent field existed cannot be assigned
+			// to anyone. They are held out of every agent's counts rather
+			// than shared into all of them, and a `runs` of 0 beside a
+			// non-zero `unattrib` means "cannot tell", not "did not run".
+			fmt.Fprintf(w, "    note: %d row(s) predate per-agent attribution (the unattrib column).\n", r.Hooks.UnattributedRows)
+			fmt.Fprintln(w, "          They can neither confirm nor rule out an agent's hooks, so a 0 in")
+			fmt.Fprintln(w, "          runs beside a non-zero unattrib is withheld from the findings.")
+			fmt.Fprintln(w, "          They clear as the window rolls past the upgrade.")
 		}
 	}
 	fmt.Fprintln(w)

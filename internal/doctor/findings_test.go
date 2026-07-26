@@ -269,3 +269,100 @@ func TestDiagnoseFallsBackOnUnattributedLogs(t *testing.T) {
 		t.Errorf("a pre-attribution log is not evidence of failure: %+v", findings)
 	}
 }
+
+// TestMixedAttributionDoesNotAccuse reproduces the state every machine passes
+// through right after the upgrade that introduced per-agent attribution: a
+// window holding thousands of unattributed rows plus a handful of attributed
+// ones. PreToolUse fires constantly and attributes itself within minutes;
+// SessionStart fires once per session and has not run again yet. Reading its
+// empty attributed bucket as silence accuses a working install of exactly the
+// failure doctor exists to detect.
+func TestMixedAttributionDoesNotAccuse(t *testing.T) {
+	now := time.Now()
+	mixed := hooks.EffectivenessSummary{
+		Present:          true,
+		Attributed:       true, // one attributed row is enough to flip this
+		UnattributedRows: 17317,
+		Events: map[string]hooks.EventActivity{
+			"SessionStart": {Runs: 6, Emitted: 6}, "UserPromptSubmit": {Runs: 8, Emitted: 0},
+			"PreToolUse": {Runs: 1700, Emitted: 400}, "PostToolUse": {Runs: 59, Emitted: 0},
+		},
+		// Only the constantly-firing hook has attributed rows yet.
+		ByAgent: map[string]map[string]hooks.EventActivity{
+			"codex": {"PreToolUse": {Runs: 15, Emitted: 3, DaemonKnown: 15, DaemonUp: 15}},
+		},
+		// Everything else in the window predates the field.
+		Unattributed: map[string]hooks.EventActivity{
+			"SessionStart": {Runs: 6, Emitted: 6}, "UserPromptSubmit": {Runs: 8},
+			"PreToolUse": {Runs: 1685, Emitted: 397}, "PostToolUse": {Runs: 59},
+		},
+	}
+
+	findings := Diagnose(codexAgent(), mixed, Adoption{FilesFound: 7, InWindow: 7, GortexCalls: 338, ShellCalls: 102}, now)
+
+	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PostToolUse"} {
+		assertNoFindingWith(t, findings, event+" is configured but never ran")
+	}
+	if HasBlocker(findings) {
+		t.Fatalf("mixed attribution is not evidence of failure: %+v", findings)
+	}
+}
+
+// TestAttributedSilenceStillBlocks: once the window holds no unattributed
+// runs of an event, an empty bucket really is silence and must still block —
+// the guard above must not swallow the finding it exists to protect.
+func TestAttributedSilenceStillBlocks(t *testing.T) {
+	now := time.Now()
+	clean := hooks.EffectivenessSummary{
+		Present:    true,
+		Attributed: true,
+		Events: map[string]hooks.EventActivity{
+			"PreToolUse": {Runs: 15, Emitted: 3},
+		},
+		ByAgent: map[string]map[string]hooks.EventActivity{
+			"codex": {"PreToolUse": {Runs: 15, Emitted: 3, DaemonKnown: 15, DaemonUp: 15}},
+		},
+		Unattributed: map[string]hooks.EventActivity{},
+	}
+
+	findings := Diagnose(codexAgent(), clean, Adoption{FilesFound: 1, InWindow: 1, GortexCalls: 9, ShellCalls: 1}, now)
+	got := findingWith(t, findings, "SessionStart is configured but never ran")
+	if got.Severity != SeverityBlocker {
+		t.Errorf("severity=%s want BLOCKER", got.Severity)
+	}
+	if !strings.Contains(got.Remedy, "/hooks") {
+		t.Errorf("remedy=%q", got.Remedy)
+	}
+}
+
+// TestWhollyAmbiguousWindowReportsUncertainty: no attributed runs at all for
+// this agent, but the window has unattributed runs — doctor must say it
+// cannot tell rather than either accuse or stay silent.
+func TestWhollyAmbiguousWindowReportsUncertainty(t *testing.T) {
+	now := time.Now()
+	summary := hooks.EffectivenessSummary{
+		Present:          true,
+		Attributed:       true,
+		UnattributedRows: 40,
+		Events: map[string]hooks.EventActivity{
+			"SessionStart": {Runs: 10}, "UserPromptSubmit": {Runs: 10},
+			"PreToolUse": {Runs: 10}, "PostToolUse": {Runs: 10},
+		},
+		ByAgent: map[string]map[string]hooks.EventActivity{
+			"claude-code": {"Stop": {Runs: 3}},
+		},
+		Unattributed: map[string]hooks.EventActivity{
+			"SessionStart": {Runs: 10}, "UserPromptSubmit": {Runs: 10},
+			"PreToolUse": {Runs: 10}, "PostToolUse": {Runs: 10},
+		},
+	}
+
+	findings := Diagnose(codexAgent(), summary, Adoption{}, now)
+	got := findingWith(t, findings, "predate per-agent attribution")
+	if got.Severity != SeverityInfo {
+		t.Errorf("severity=%s want INFO — uncertainty is not a failure", got.Severity)
+	}
+	if HasBlocker(findings) {
+		t.Errorf("must not accuse on evidence that cannot decide: %+v", findings)
+	}
+}

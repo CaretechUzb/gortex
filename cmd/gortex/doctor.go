@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -81,13 +82,15 @@ var (
 	doctorJSON   bool
 	doctorDays   int
 	doctorRedact bool
+	doctorAll    bool
 )
 
 func init() {
 	for _, c := range []*cobra.Command{doctorCmd, initDoctorCmd} {
 		c.Flags().BoolVar(&doctorJSON, "json", false, "emit a structured JSON report on stdout")
 		c.Flags().IntVar(&doctorDays, "days", 7, "look-back window for hook activity, adoption, and savings")
-		c.Flags().BoolVar(&doctorRedact, "redact", false, "hash repo paths and branch names so the report can be shared")
+		c.Flags().BoolVar(&doctorRedact, "redact", false, "rewrite repo and home paths, and hash branch names, so the report can be shared")
+		c.Flags().BoolVar(&doctorAll, "all", false, "list planned files for adapters that are not installed too")
 	}
 	silenceDoctorErrors(doctorCmd, initDoctorCmd)
 	rootCmd.AddCommand(doctorCmd)
@@ -154,6 +157,13 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		Mode:         agents.ModeProject,
 		InstallHooks: true,
 		Stderr:       nil, // suppress progress lines; doctor is read-only
+	}
+
+	if doctorRedact {
+		// Install the rewriter before anything renders, so every section —
+		// static, runtime, and the paths quoted inside findings — agrees on
+		// what a given repo is called.
+		doctorPath = newDoctorPathRedactor(home, root)
 	}
 
 	doctorEnv := doctorEnvironment()
@@ -310,7 +320,7 @@ func inspectAdapter(a agents.Adapter, env agents.Env) DoctorAgentReport {
 func printDoctorEnvironment(w io.Writer, env DoctorEnvironment) {
 	fmt.Fprintln(w, "Gortex doctor — environment:")
 	if env.BinaryOnPath {
-		fmt.Fprintf(w, "  %s gortex on PATH: %s\n", glyphCheck, env.BinaryPath)
+		fmt.Fprintf(w, "  %s gortex on PATH: %s\n", glyphCheck, doctorPath(env.BinaryPath))
 	} else {
 		fmt.Fprintf(w, "  %s gortex not found on PATH (%s)\n", glyphCross, env.BinaryError)
 	}
@@ -319,27 +329,49 @@ func printDoctorEnvironment(w io.Writer, env DoctorEnvironment) {
 		if ver == "" {
 			ver = "ok"
 		}
-		fmt.Fprintf(w, "  %s daemon handshake: %s (%s)\n", glyphCheck, ver, env.DaemonSocket)
+		fmt.Fprintf(w, "  %s daemon handshake: %s (%s)\n", glyphCheck, ver, doctorPath(env.DaemonSocket))
 	} else {
 		fmt.Fprintf(w, "  %s daemon handshake: %s\n", glyphCross, env.DaemonError)
 	}
 	fmt.Fprintln(w)
 }
 
-// glyphCheck / glyphCross are the doctor's status markers.
+// The doctor's status markers. The distinction between glyphAbsent and
+// glyphCross is the whole point of having both: a per-repo file that `gortex
+// init` has not written is not a fault — a machine-wide `gortex install`
+// covers the agent, and most repos never need repo-local config at all.
+// Marking it ✗ turned an optional file into an accusation and implied work
+// the user does not have to do. ✗ is reserved for a real gap: something
+// broken, outdated, or genuinely not wired up.
 const (
-	glyphCheck = "✓"
-	glyphCross = "✗"
+	glyphCheck  = "✓"
+	glyphCross  = "✗"
+	glyphWarn   = "!"
+	glyphAbsent = "·"
 )
 
 // printDoctorHuman renders the human-readable summary. One row per
 // agent, with a nested file list. Columns line up for copy-paste
 // into issue reports.
+// printDoctorHuman renders the adapter section. Adapters that are neither
+// installed nor carrying Gortex files collapse to a name list: their planned
+// paths describe writes that will never happen, and one uninstalled agent can
+// contribute twenty of them — burying the handful of lines that describe the
+// machine the user actually has. An absent agent that still holds Gortex files
+// is kept and called out instead: that is leftover config, which is a finding.
+// --all restores the full listing, and --json is always complete.
 func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
-	fmt.Fprintln(w, "Gortex doctor — observed state of every adapter's planned files:")
+	fmt.Fprintln(w, "Gortex doctor — observed state of every detected adapter:")
+	fmt.Fprintf(w, "  %s present   %s absent (optional — repo-local config)   %s needs attention\n",
+		glyphCheck, glyphAbsent, glyphWarn)
 	fmt.Fprintln(w)
 
+	var absent []string
 	for _, r := range reports {
+		if !doctorAll && !r.Detected && !r.Configured {
+			absent = append(absent, r.Name)
+			continue
+		}
 		detMark := "–"
 		if r.Detected {
 			detMark = "✓"
@@ -348,16 +380,18 @@ func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
 		if r.Configured {
 			cfgMark = "✓"
 		}
-		fmt.Fprintf(w, "  [%s detected] [%s any-file-present]  %s\n", detMark, cfgMark, r.Name)
+		fmt.Fprintf(w, "  [%s installed] [%s gortex files]  %s\n", detMark, cfgMark, r.Name)
 		for _, f := range r.Files {
 			statusSym := "?"
 			switch f.Status {
 			case "present":
-				statusSym = "✓"
+				statusSym = glyphCheck
 			case "missing":
-				statusSym = "✗"
+				// Absent, not wrong: repo-local config is optional on a
+				// machine configured by `gortex install`.
+				statusSym = glyphAbsent
 			case "unreadable":
-				statusSym = "!"
+				statusSym = glyphWarn
 			}
 			extra := ""
 			if f.Status == "present" && f.ByteSize > 0 {
@@ -365,7 +399,10 @@ func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
 			}
 			switch f.StanzaStatus {
 			case "stale":
-				extra += " [stale stanza: run `gortex install` to migrate]"
+				// Present but outdated is a real gap — Gortex wrote this and
+				// the shape has since moved on.
+				statusSym = glyphWarn
+				extra += " [outdated stanza: `gortex upgrade --run` migrates it, or `gortex install`]"
 			case "current":
 				extra += " [stanza current]"
 			}
@@ -376,13 +413,22 @@ func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
 				if len(verb) > len("would-") && verb[:len("would-")] == "would-" {
 					verb = verb[len("would-"):]
 				}
-				extra = fmt.Sprintf(" (init would %s)", verb)
+				extra = fmt.Sprintf(" (optional — `gortex init` would %s)", verb)
 			}
-			fmt.Fprintf(w, "      %s %s%s\n", statusSym, f.Path, extra)
+			fmt.Fprintf(w, "      %s %s%s\n", statusSym, doctorPath(f.Path), extra)
+		}
+		if !r.Detected && r.Configured {
+			fmt.Fprintln(w, "      note: not installed, but Gortex files are present — leftover config.")
 		}
 		if r.DocsURL != "" {
 			fmt.Fprintf(w, "      docs: %s\n", r.DocsURL)
 		}
+		fmt.Fprintln(w)
+	}
+
+	if len(absent) > 0 {
+		fmt.Fprintf(w, "  not installed (%d): %s\n", len(absent), strings.Join(absent, ", "))
+		fmt.Fprintln(w, "  nothing is written for these; --all lists what init would write if they were.")
 		fmt.Fprintln(w)
 	}
 }

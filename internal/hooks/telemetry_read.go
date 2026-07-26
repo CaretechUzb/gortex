@@ -59,6 +59,20 @@ type EffectivenessSummary struct {
 	// UnattributedRows counts window rows with no agent, so a caller can say
 	// how much of its evidence predates attribution.
 	UnattributedRows int `json:"unattributed_rows"`
+	// Unattributed rolls those rows up per event. A log is not simply
+	// attributed or not: after an upgrade it is *mixed* for as long as the
+	// window still reaches back past it, and during that overlap an event
+	// with no attributed rows may still have run — the rows just cannot say
+	// for whom. Keeping the per-event count is what lets a caller tell
+	// "did not run" from "cannot tell".
+	Unattributed map[string]EventActivity `json:"unattributed,omitempty"`
+}
+
+// AmbiguousRuns reports how many invocations of an event in the window carry
+// no agent, and so might belong to any harness. Non-zero means silence cannot
+// be concluded for that event, however empty a given agent's rows look.
+func (s EffectivenessSummary) AmbiguousRuns(event string) int {
+	return s.Unattributed[event].Runs
 }
 
 // Ran reports whether the event was invoked at least once in the window,
@@ -132,9 +146,10 @@ func (s EffectivenessSummary) EventNames() []string {
 func ReadEffectiveness(since time.Time) (EffectivenessSummary, error) {
 	path := EffectivenessLogPath()
 	summary := EffectivenessSummary{
-		Path:    path,
-		Events:  map[string]EventActivity{},
-		ByAgent: map[string]map[string]EventActivity{},
+		Path:         path,
+		Events:       map[string]EventActivity{},
+		ByAgent:      map[string]map[string]EventActivity{},
+		Unattributed: map[string]EventActivity{},
 	}
 	if path == "" {
 		return summary, nil
@@ -176,6 +191,13 @@ func ReadEffectiveness(since time.Time) (EffectivenessSummary, error) {
 			accumulate(&activity, rec)
 			if rec.Agent == "" {
 				summary.UnattributedRows++
+				orphan := summary.Unattributed[event]
+				orphan.Event = event
+				if stamp.After(orphan.LastSeen) {
+					orphan.LastSeen = stamp
+				}
+				accumulate(&orphan, rec)
+				summary.Unattributed[event] = orphan
 			} else {
 				summary.Attributed = true
 				perAgent := summary.ByAgent[rec.Agent]
