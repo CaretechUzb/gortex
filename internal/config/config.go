@@ -902,6 +902,12 @@ type EventBusBoundarySpec struct {
 // grammar must be a compiled shared library (.so / .dylib / .dll)
 // exporting the standard tree-sitter `tree_sitter_<language>` entry
 // point, built against a compatible tree-sitter ABI.
+//
+// Loading one needs a runtime dynamic loader, so the statically linked
+// linux release binary declines and logs a warning per entry (see
+// internal/parser/languages/grammar_load_static.go); a source build is
+// dynamically linked and supports them. macOS and Windows releases are
+// unaffected.
 type GrammarSpec struct {
 	// Language is the name the extractor registers under. A name that
 	// collides with a built-in extractor is skipped — built-ins win.
