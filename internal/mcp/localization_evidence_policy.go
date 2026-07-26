@@ -263,30 +263,6 @@ func localizationPrescribedReadSatisfiedByEnvelope(task, symbol string, envelope
 	return false
 }
 
-// localizationRankedEvidenceCarriesLead reports whether the packed rows mention
-// what the request is actually about, using the same lead-alignment bar the
-// reserved read must clear before it may end a session. Ranking can be
-// confident about a page that never names the request's subject; that page
-// still owes the caller its one bounded call.
-func localizationRankedEvidenceCarriesLead(
-	task string,
-	completion localizationCompletion,
-	envelope localizationExploreEnvelope,
-) bool {
-	rows := make([]localizationDigestRow, 0, len(envelope.Evidence))
-	for _, evidence := range envelope.Evidence {
-		if strings.TrimSpace(evidence.ID) == "" || strings.TrimSpace(evidence.File) == "" {
-			continue
-		}
-		rows = append(rows, localizationDigestRow{
-			Rank: evidence.Rank, ID: evidence.ID, Name: evidence.Name,
-			QualName: evidence.QualName, Kind: evidence.Kind, File: evidence.File,
-			Line: evidence.Line, Signature: evidence.Signature,
-		})
-	}
-	return localizationReservedReadEvidenceAlignedWithLead(task, completion.taskLead, "", rows)
-}
-
 func localizationFinalizeCompletionEvidence(
 	task string,
 	completion localizationCompletion,
