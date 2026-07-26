@@ -39,7 +39,7 @@ func requireLocalizationHostContractMatchesVisible(
 	return host
 }
 
-func TestLocalizationEvidencePolicyRejectsWeakFindLocaliserOwnerFromSQLiteCSharpIndex(t *testing.T) {
+func TestLocalizationEvidencePolicyHoldsWeakOwnerForOneBoundedCallFromSQLiteCSharpIndex(t *testing.T) {
 	root := t.TempDir()
 	rel := "src/Humanizer/Localisation/Localiser.cs"
 	path := filepath.Join(root, filepath.FromSlash(rel))
@@ -97,9 +97,12 @@ func TestLocalizationEvidencePolicyRejectsWeakFindLocaliserOwnerFromSQLiteCSharp
 		newLocalizationCompletion(true, ""), `FindLocaliser handles the literal "ku"`,
 		[]exploreTarget{target}, exploreDefaultBudgetTokens,
 	)
+	// An advisory owner (no resolved call edge) neither proves the answer nor
+	// ends navigation: the page keeps its one bounded call.
 	require.Equal(t, localizationStateNeedsRecovery, completion.State)
 	require.False(t, completion.Enforceable)
 	require.Equal(t, "recover_once", completion.RequiredAction)
+	require.Equal(t, 1, completion.AllowedToolCalls)
 	require.Equal(t, localizationRecoveryOperations, completion.AllowedOperations)
 
 	body, ok := singleTextContent(result)
@@ -290,22 +293,22 @@ func TestLocalizationEvidencePolicyRequiresEveryPackedProofRole(t *testing.T) {
 		{ID: owner.ID, Provenance: localizationProvenanceDivergentDefault},
 		{ID: typeNode.ID, Provenance: localizationProvenanceDivergentDefaultType},
 	}}
-	complete := localizationFinalizeCompletionEvidence(completion, targets, completeEnvelope)
+	complete := localizationFinalizeCompletionEvidence("owner default permission", completion, targets, completeEnvelope)
 	require.True(t, complete.enforceableOnAnswerReady)
 
 	missingSupport := completeEnvelope
 	missingSupport.Evidence = missingSupport.Evidence[:1]
-	incomplete := localizationFinalizeCompletionEvidence(completion, targets, missingSupport)
+	incomplete := localizationFinalizeCompletionEvidence("owner default permission", completion, targets, missingSupport)
 	require.False(t, incomplete.enforceableOnAnswerReady)
 
 	ready := newLocalizationCompletion(true, "")
-	ready = localizationFinalizeCompletionEvidence(ready, targets, completeEnvelope)
+	ready = localizationFinalizeCompletionEvidence("owner default permission", ready, targets, completeEnvelope)
 	require.True(t, ready.Enforceable)
 
 	spoofed := newLocalizationCompletion(true, "")
 	spoofed.Enforceable = true
 	spoofed.enforceableOnAnswerReady = true
-	weak := localizationFinalizeCompletionEvidence(spoofed, []exploreTarget{{
+	weak := localizationFinalizeCompletionEvidence("owner default permission", spoofed, []exploreTarget{{
 		node: owner, source: ownerTarget.source, sourceLiteral: true, exactContent: true,
 	}}, localizationExploreEnvelope{Evidence: []localizationEvidence{{ID: owner.ID}}})
 	require.False(t, weak.Enforceable)

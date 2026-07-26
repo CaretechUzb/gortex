@@ -109,6 +109,7 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	enriched := s.enrichTextMatches(matches)
+	s.captureLocalizationSearchText(ctx, enriched)
 	resp := map[string]any{
 		"query":   query,
 		"matches": enriched,

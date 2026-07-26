@@ -24,6 +24,94 @@ func TestRunSessionStart_RejectsWrongEvent(t *testing.T) {
 	}
 }
 
+func TestRulePreambleRoutesByOutcomeAndPreservesExactIdentifiers(t *testing.T) {
+	briefing := rulePreamble()
+	for _, required := range []string{
+		"For an explicitly named file",
+		"choose by requested output",
+		"requested output is files, symbols, or supporting evidence",
+		"localize task may be concise",
+		"faithfully preserve the issue title",
+		"every user-supplied technical identifier, path, literal, error, symptom, and stated hypothesis",
+		"never invent a causal hypothesis",
+		"clearly framed problem section may be restored exactly at execution",
+		"only for a clearly lossy model task",
+		"evidence can reflect details beyond a concise tool argument",
+		"only when work will actually continue beyond localization into diagnosis, relationship analysis, or implementation",
+		"For `needs_recovery`, make one accepted, bounded Gortex MCP `search` or `read` call",
+		"preserves the recovery allowance",
+		"the rejected request does not count as the accepted recovery",
+		"Do not call host Read, Grep, Glob, or Bash",
+		"one aligned file/symbol tuple",
+		"preserve the PRIMARY file and symbol identities",
+		"SUPPORTING rows are optional context",
+		"intentionally not executed and replays the same retained terminal payload",
+		"not stale or canned output or an integration failure",
+		"Outside an active localization contract",
+	} {
+		if !strings.Contains(briefing, required) {
+			t.Fatalf("rule preamble missing %q: %s", required, briefing)
+		}
+	}
+	for _, forced := range []string{
+		"including a request framed as diagnosis or a why question",
+		"Call `explore` first for code discovery, diagnosis",
+	} {
+		if strings.Contains(briefing, forced) {
+			t.Fatalf("rule preamble contains forced-localize wording %q: %s", forced, briefing)
+		}
+	}
+}
+
+func TestRunSessionStartEmitsNeutralRoutingAndIdentifierGuidance(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	withFakeStatus(t, func() (*daemon.StatusResponse, error) { return nil, errDaemonUnreachable })
+	payload := mustJSON(t, map[string]any{
+		"hook_event_name": "SessionStart",
+		"session_id":      "routing-event",
+		"cwd":             t.TempDir(),
+	})
+	output := captureHookStdout(t, func() { runSessionStart(payload) })
+	var decoded HookOutput
+	if err := json.Unmarshal([]byte(output), &decoded); err != nil {
+		t.Fatalf("decode SessionStart output: %v; output=%q", err, output)
+	}
+	if decoded.Decision != "" || decoded.Reason != "" || decoded.SystemMessage != "" || decoded.HookSpecificOutput == nil {
+		t.Fatalf("unexpected SessionStart output shape: %#v", decoded)
+	}
+	if decoded.HookSpecificOutput.HookEventName != "SessionStart" {
+		t.Fatalf("hook event = %q, want SessionStart", decoded.HookSpecificOutput.HookEventName)
+	}
+	context := decoded.HookSpecificOutput.AdditionalContext
+	for _, required := range []string{
+		"choose by requested output",
+		"localize task may be concise",
+		"faithfully preserve the issue title",
+		"clearly framed problem section may be restored exactly at execution",
+		"only for a clearly lossy model task",
+		"evidence can reflect details beyond a concise tool argument",
+		"For `needs_recovery`",
+		"one accepted, bounded Gortex MCP `search` or `read` call",
+		"preserves the recovery allowance",
+		"the rejected request does not count as the accepted recovery",
+		"Do not call host Read, Grep, Glob, or Bash",
+		"At `answer_ready`",
+		"respond from `completion.final_response`",
+		"one aligned file/symbol tuple",
+		"preserve the PRIMARY file and symbol identities",
+		"SUPPORTING rows are optional context",
+		"intentionally not executed and replays the same retained terminal payload",
+		"not stale or canned output or an integration failure",
+	} {
+		if !strings.Contains(context, required) {
+			t.Fatalf("SessionStart event missing %q: %s", required, context)
+		}
+	}
+	if strings.Contains(context, "including a request framed as diagnosis or a why question") {
+		t.Fatalf("SessionStart event contains forced-localize diagnosis wording: %s", context)
+	}
+}
+
 func TestRunSessionStart_DaemonDown(t *testing.T) {
 	withFakeStatus(t, func() (*daemon.StatusResponse, error) {
 		return nil, errDaemonUnreachable

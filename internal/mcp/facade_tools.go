@@ -9,11 +9,13 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/localizationauth"
 	"github.com/zzet/gortex/internal/telemetry"
 )
 
@@ -417,6 +419,8 @@ func parseLocalizationNewUserBoundary(facade, operation string, arguments map[st
 
 func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	started := time.Now()
+	input, _ := req.Params.Arguments.(map[string]any)
+	localizationAuthToken := localizationauth.TakeArgument(input)
 	operation := normalizeFacadeOperation(req.GetString("operation", ""))
 	if facade == "analyze" {
 		operation = requestedAnalyzeKind(req.GetArguments())
@@ -451,6 +455,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		blocked, recoveryGeneration = terminal.interceptAnswerReady(facade, operation, req.GetArguments())
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
+			publishLocalizationAuthReceipt(localizationAuthToken, blocked)
 			return blocked, nil
 		}
 	}
@@ -496,12 +501,12 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		s.recordFacadeTelemetry(facade, "unknown", facadeOutcomeInvalidOperation, time.Since(started))
 		return result, nil
 	}
-	input, _ := req.Params.Arguments.(map[string]any)
 	if invalid := validateFacadeInput(spec, input); invalid != nil {
 		if completion, consumed := terminal.consumeInvalidRecovery(facade, operation, recoveryGeneration); consumed {
 			invalid, _ = decorateExhaustedLocalizationReadFailure(invalid, nil, completion, spec)
 		}
 		s.recordFacadeTelemetry(facade, operation, facadeOutcomeInvalidArgument, time.Since(started))
+		publishLocalizationAuthReceipt(localizationAuthToken, invalid)
 		return invalid, nil
 	}
 	// Every localize call and an explicit new-user task call starts a
@@ -516,6 +521,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		localizeReservation, blocked = terminal.beginLocalize(req.GetString("task", ""), newUserTask)
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
+			publishLocalizationAuthReceipt(localizationAuthToken, blocked)
 			return blocked, nil
 		}
 		if !freshLocalizeFlow {
@@ -526,7 +532,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	localizationReadSucceeded := false
 	defer func() {
 		if localizationReadReservation != 0 {
-			terminal.finishReservedReadToken(localizationReadReservation, localizationReadSucceeded)
+			terminal.finishReservedReadTokenWithDigest(localizationReadReservation, localizationReadSucceeded, nil, false)
 		}
 		if localizeReservation != 0 && !localizeFinished {
 			// Errors and panics roll back to the previous completion contract.
@@ -537,19 +543,30 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		blocked, reservation := terminal.authorizeWithToken(facade, operation, req.GetArguments())
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
+			publishLocalizationAuthReceipt(localizationAuthToken, blocked)
 			return blocked, nil
 		}
 		localizationReadReservation = reservation
+		if reservation != 0 {
+			ctx = withLocalizationPermittedEvidenceCapture(ctx, reservation)
+		}
 	}
 	result, err := s.invokeFacadeSpec(ctx, req, spec)
 	succeeded := err == nil && result != nil && !result.IsError
 	if localizationReadReservation != 0 {
 		localizationReadSucceeded = succeeded
+		var currentEvidence []localizationDigestRow
+		evidenceRecorded := false
+		if succeeded {
+			currentEvidence, evidenceRecorded = localizationEvidenceForPermittedCall(ctx, facade, operation, localizationReadReservation)
+		}
 		// Finalize before decorating so a preclassified route or bounded recovery
-		// can expose its next state in this same response. Every failed allowance
-		// is converted to a tool error carrying either its one restored retry or
-		// terminal answer_ready; a Go handler error must not hide the contract.
-		completion := terminal.finishReservedReadToken(localizationReadReservation, succeeded)
+		// can expose its next state in this same response. Typed identities are
+		// merged under the terminal-state lock only when this call transitions to
+		// answer_ready. Every failed allowance is converted to a tool error carrying
+		// either its one restored retry or terminal answer_ready; a Go handler error
+		// must not hide the contract.
+		completion := terminal.finishReservedReadTokenWithDigest(localizationReadReservation, succeeded, currentEvidence, evidenceRecorded)
 		localizationReadReservation = 0
 		if succeeded {
 			result = decorateLocalizationReadResult(result, completion)
@@ -561,7 +578,204 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		terminal.finishLocalize(localizeReservation, succeeded)
 		localizeFinished = true
 	}
+	publishLocalizationAuthReceipt(localizationAuthToken, result)
 	return result, err
+}
+
+func publishLocalizationAuthReceipt(token string, result *mcpgo.CallToolResult) {
+	if token == "" || result == nil || result.Meta == nil || result.Meta.AdditionalFields == nil {
+		return
+	}
+	host, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	if !ok || !host.Contract.Terminal || host.Contract.Completion.State != localizationStateAnswerReady {
+		return
+	}
+	completion := host.Contract.Completion
+	localizationauth.Publish(token, localizationauth.Receipt{
+		FinalResponse:   completion.FinalResponse,
+		ContractVersion: completion.ContractVersion,
+		Enforceable:     completion.Enforceable,
+	})
+}
+
+type localizationPermittedEvidenceCaptureKey struct{}
+
+type localizationPermittedEvidenceCapture struct {
+	mu       sync.Mutex
+	token    uint64
+	recorded bool
+	rows     []localizationDigestRow
+}
+
+func withLocalizationPermittedEvidenceCapture(ctx context.Context, token uint64) context.Context {
+	if token == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, localizationPermittedEvidenceCaptureKey{}, &localizationPermittedEvidenceCapture{token: token})
+}
+
+func captureLocalizationRows(ctx context.Context, rows []localizationDigestRow) {
+	capture, _ := ctx.Value(localizationPermittedEvidenceCaptureKey{}).(*localizationPermittedEvidenceCapture)
+	if capture == nil {
+		return
+	}
+	capture.mu.Lock()
+	capture.rows = cloneLocalizationDigestRows(rows)
+	capture.recorded = true
+	capture.mu.Unlock()
+}
+
+// captureLocalizationSearchSymbols records the exact typed, scoped page that
+// search_symbols is about to render. The request-private context value keeps a
+// concurrent or stale search from supplying identities to another reservation.
+func captureLocalizationSearchSymbols(ctx context.Context, nodes []*graph.Node) {
+	rows := make([]localizationDigestRow, 0, len(nodes))
+	for _, node := range nodes {
+		if row, ok := localizationDigestRowFromNode(node, "permitted_search_symbols"); ok {
+			rows = append(rows, row)
+		}
+	}
+	captureLocalizationRows(ctx, rows)
+}
+
+// captureLocalizationSearchText promotes only graph-backed identities from the
+// typed search.text page. A file-level literal may have no enclosing SymbolID;
+// in that case the matching path and line are resolved back to the narrowest
+// in-scope graph declaration, or finally to the graph's file node. Rendered MCP
+// Content is never parsed as evidence.
+func (s *Server) captureLocalizationSearchText(ctx context.Context, matches []enrichedTextMatch) {
+	capture, _ := ctx.Value(localizationPermittedEvidenceCaptureKey{}).(*localizationPermittedEvidenceCapture)
+	if capture == nil {
+		return
+	}
+	rows := make([]localizationDigestRow, 0, len(matches))
+	for _, match := range matches {
+		node, provenance := s.localizationTextMatchNode(ctx, match)
+		if row, ok := localizationDigestRowFromNode(node, provenance); ok {
+			if match.Line > 0 {
+				row.Line = match.Line
+			}
+			rows = append(rows, row)
+		}
+	}
+	captureLocalizationRows(ctx, rows)
+}
+
+func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTextMatch) (*graph.Node, string) {
+	if s == nil || s.graph == nil {
+		return nil, ""
+	}
+	if id := strings.TrimSpace(match.SymbolID); id != "" {
+		if node := s.graph.GetNode(id); node != nil && s.nodeInSessionScope(ctx, node) {
+			return node, "permitted_search_text"
+		}
+		return nil, ""
+	}
+	path := strings.TrimSpace(match.Path)
+	if path == "" {
+		return nil, ""
+	}
+	var owner *graph.Node
+	var fileNode *graph.Node
+	ownerSpan := int(^uint(0) >> 1)
+	for _, node := range s.graph.GetFileNodes(path) {
+		if node == nil || !s.nodeInSessionScope(ctx, node) {
+			continue
+		}
+		if node.Kind == graph.KindFile {
+			if fileNode == nil || node.ID < fileNode.ID {
+				fileNode = node
+			}
+			continue
+		}
+		if match.Line <= 0 || node.StartLine <= 0 || node.StartLine > match.Line || !exploreLocalizableKind(node.Kind) {
+			continue
+		}
+		end := node.EndLine
+		if end <= 0 {
+			end = node.StartLine
+		}
+		if end < match.Line {
+			continue
+		}
+		span := end - node.StartLine
+		if owner == nil || span < ownerSpan || (span == ownerSpan && node.ID < owner.ID) {
+			owner = node
+			ownerSpan = span
+		}
+	}
+	if owner != nil {
+		return owner, "permitted_search_text_owner"
+	}
+	if fileNode == nil {
+		if node := s.graph.GetNode(path); node != nil && node.Kind == graph.KindFile && s.nodeInSessionScope(ctx, node) {
+			fileNode = node
+		}
+	}
+	if fileNode != nil {
+		return fileNode, "permitted_search_text_file"
+	}
+	return nil, ""
+}
+
+// captureLocalizationReadSource records the validated graph node whose source
+// was successfully read. It never reconstructs identity from serialized output.
+func captureLocalizationReadSource(ctx context.Context, node *graph.Node) {
+	rows := make([]localizationDigestRow, 0, 1)
+	if row, ok := localizationDigestRowFromNode(node, "permitted_read_source"); ok {
+		rows = append(rows, row)
+	}
+	captureLocalizationRows(ctx, rows)
+}
+
+func localizationCapturedEvidence(ctx context.Context, token uint64) ([]localizationDigestRow, bool) {
+	capture, _ := ctx.Value(localizationPermittedEvidenceCaptureKey{}).(*localizationPermittedEvidenceCapture)
+	if capture == nil || token == 0 || capture.token != token {
+		return nil, false
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if !capture.recorded {
+		return nil, false
+	}
+	return cloneLocalizationDigestRows(capture.rows), true
+}
+
+func localizationDigestRowFromNode(node *graph.Node, provenance string) (localizationDigestRow, bool) {
+	if node == nil {
+		return localizationDigestRow{}, false
+	}
+	id := strings.TrimSpace(node.ID)
+	file := strings.TrimSpace(nodeDisplayPath(node))
+	if id == "" || file == "" {
+		return localizationDigestRow{}, false
+	}
+	signature := ""
+	if node.Meta != nil {
+		signature, _ = node.Meta["signature"].(string)
+	}
+	return localizationDigestRow{
+		ID:         id,
+		Name:       node.Name,
+		QualName:   node.QualName,
+		Kind:       string(node.Kind),
+		File:       file,
+		Line:       node.StartLine,
+		Signature:  signature,
+		Provenance: provenance,
+	}, true
+}
+
+func localizationEvidenceForPermittedCall(ctx context.Context, facade, operation string, token uint64) ([]localizationDigestRow, bool) {
+	if token == 0 {
+		return nil, false
+	}
+	switch facade + "." + operation {
+	case "search.symbols", "search.text", "read.source":
+		return localizationCapturedEvidence(ctx, token)
+	default:
+		return nil, false
+	}
 }
 
 func decorateExhaustedLocalizationReadFailure(

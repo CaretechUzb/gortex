@@ -34,7 +34,7 @@ func TestObserveLocalizationTerminalAcceptsDirectAndPluginNavigationFacades(t *t
 	}
 }
 
-func TestObserveLocalizationTerminalRequiresExactEnforceableV2Contract(t *testing.T) {
+func TestObserveLocalizationTerminalRequiresExactAnswerReadyV2Contract(t *testing.T) {
 	configureLocalizationTerminalTestHome(t)
 	valid := terminalContractMap()
 	tests := []struct {
@@ -42,8 +42,16 @@ func TestObserveLocalizationTerminalRequiresExactEnforceableV2Contract(t *testin
 		mutate func(map[string]any)
 	}{
 		{name: "v1", mutate: func(root map[string]any) { completionMap(root)["contract_version"] = 1 }},
-		{name: "advisory", mutate: func(root map[string]any) { completionMap(root)["enforceable"] = false }},
+		{name: "missing final response", mutate: func(root map[string]any) { delete(completionMap(root), "final_response") }},
 		{name: "needs refinement", mutate: func(root map[string]any) { completionMap(root)["state"] = "needs_refinement" }},
+		{name: "localized continue task", mutate: func(root map[string]any) {
+			root["terminal"] = false
+			completion := completionMap(root)
+			completion["state"] = "localized"
+			completion["required_action"] = "continue_task"
+			completion["enforceable"] = false
+			delete(completion, "final_response")
+		}},
 		{name: "wrong scope", mutate: func(root map[string]any) { completionMap(root)["scope"] = "diagnosis" }},
 		{name: "tool allowed", mutate: func(root map[string]any) { completionMap(root)["allowed_tool_calls"] = 1 }},
 		{name: "not terminal", mutate: func(root map[string]any) { root["terminal"] = false }},
@@ -59,6 +67,64 @@ func TestObserveLocalizationTerminalRequiresExactEnforceableV2Contract(t *testin
 				t.Fatal("unexpected terminal observation")
 			}
 		})
+	}
+}
+
+func TestLocalizedCompletionCreatesNoTerminalMarker(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	identity := beginTestLocalizationTurn(t, t.Name(), "prompt", t.TempDir())
+	tool := gortexMCPToolPrefix + "explore"
+	toolUseID := "localized-tool"
+	snapshotTestLocalizationTool(t, identity, tool, toolUseID)
+	contract := terminalContractMap()
+	contract["terminal"] = false
+	completion := completionMap(contract)
+	completion["state"] = "localized"
+	completion["required_action"] = "continue_task"
+	completion["enforceable"] = false
+	delete(completion, "final_response")
+	data := localizationPostToolPayload(
+		t, tool, toolUseID, identity, terminalToolResponse(t, contract, true, false),
+	)
+	if output := strings.TrimSpace(captureHookStdout(t, func() { runPostToolUse(data) })); output != "" {
+		t.Fatalf("localized PostToolUse emitted terminal context: %s", output)
+	}
+	if marker, marked := localizationTerminalMarkerFor(identity); marked {
+		t.Fatalf("localized completion created a terminal marker: %#v", marker)
+	}
+
+	t.Setenv(editBlockingEnvVar, "0")
+	nextTools := []struct {
+		name  string
+		input map[string]any
+	}{
+		{name: gortexMCPToolPrefix + "search", input: map[string]any{"operation": "symbols", "query": "registerFacadeTools"}},
+		{name: gortexMCPToolPrefix + "read", input: map[string]any{"operation": "source", "target": map[string]any{"symbol": "pkg/file.go::Run"}}},
+		{name: gortexMCPToolPrefix + "edit", input: map[string]any{"operation": "file", "target": map[string]any{"file": "pkg/file.go"}}},
+		{name: gortexMCPToolPrefix + "change", input: map[string]any{"operation": "impact", "target": map[string]any{"file": "pkg/file.go"}}},
+		{name: "Edit", input: map[string]any{"file_path": filepath.Join(identity.CWD, "notes.txt")}},
+		{name: "Write", input: map[string]any{"file_path": filepath.Join(identity.CWD, "notes.txt")}},
+		{name: "Bash", input: map[string]any{"command": "go build ./cmd/gortex"}},
+		{name: "Bash", input: map[string]any{"command": "go test ./internal/mcp"}},
+	}
+	for index, next := range nextTools {
+		payload := preToolPayload(t, next.name, fmt.Sprintf("next-%d", index), identity, next.input)
+		output := strings.TrimSpace(captureHookStdout(t, func() { runPreToolUse(payload, 0, ModeDeny) }))
+		if output == "" {
+			continue
+		}
+		var decoded HookOutput
+		if err := json.Unmarshal([]byte(output), &decoded); err != nil {
+			t.Fatalf("decode %s PreToolUse output: %v\n%s", next.name, err, output)
+		}
+		if decoded.Decision == "deny" ||
+			(decoded.HookSpecificOutput != nil && decoded.HookSpecificOutput.PermissionDecision == "deny") {
+			t.Fatalf("%s received a denial after localized completion: %#v", next.name, decoded)
+		}
+		if strings.Contains(decoded.Reason, "Localization for this task is complete") ||
+			(decoded.HookSpecificOutput != nil && strings.Contains(decoded.HookSpecificOutput.PermissionDecisionReason, "Localization for this task is complete")) {
+			t.Fatalf("%s received terminal localization guidance after localized completion: %#v", next.name, decoded)
+		}
 	}
 }
 
@@ -117,6 +183,18 @@ func TestObserveLocalizationTerminalRequiresMatchingAuthoritativeMeta(t *testing
 				return response
 			},
 		},
+		{
+			name: "final response mismatch",
+			response: func(t *testing.T) map[string]any {
+				response := terminalToolResponse(t, terminalContractMap(), true, false)
+				meta := response["_meta"].(map[string]any)
+				envelope := meta[localizationHostMetaKey].(map[string]any)
+				mismatched := cloneMap(t, terminalContractMap())
+				completionMap(mismatched)["final_response"] = "different response"
+				envelope["contract"] = mismatched
+				return response
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -126,6 +204,115 @@ func TestObserveLocalizationTerminalRequiresMatchingAuthoritativeMeta(t *testing
 			_, observed := observeLocalizationTerminal(data)
 			if observed != tt.want {
 				t.Fatalf("observed = %v, want %v", observed, tt.want)
+			}
+		})
+	}
+}
+
+func TestPostToolUseObservesMatchingFinalResponseContract(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	identity := beginTestLocalizationTurn(t, "terminal-final-response", "prompt", t.TempDir())
+	snapshotTestLocalizationTool(t, identity, gortexMCPToolPrefix+"read", "tool")
+	response := terminalToolResponse(t, terminalContractMap(), true, false)
+	parsed, ok := exactLocalizationTerminalContract(mustJSON(t, response))
+	if !ok || parsed.Completion.FinalResponse != completionMap(terminalContractMap())["final_response"] {
+		t.Fatalf("new-shape terminal response did not parse exactly: %#v", parsed)
+	}
+	post := localizationPostToolPayload(t, gortexMCPToolPrefix+"read", "tool", identity, response)
+	output := captureHookStdout(t, func() { runPostToolUse(post) })
+	if !strings.Contains(output, localizationTerminalContext) {
+		t.Fatalf("PostToolUse output %q does not contain terminal context", output)
+	}
+	for _, required := range []string{
+		"Localization for this task is complete",
+		"completion.final_response",
+		"do not call another tool",
+	} {
+		if !strings.Contains(output, required) {
+			t.Fatalf("PostToolUse output %q does not contain %q", output, required)
+		}
+	}
+}
+
+func TestPostToolUseAnswerReadyEventAuthenticationAndJSONShape(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	tests := []struct {
+		name       string
+		response   func(*testing.T) map[string]any
+		wantOutput bool
+		wantMarker bool
+	}{
+		{
+			name: "advisory",
+			response: func(t *testing.T) map[string]any {
+				contract := terminalContractMap()
+				completionMap(contract)["enforceable"] = false
+				return terminalToolResponse(t, contract, true, false)
+			},
+			wantOutput: true,
+		},
+		{
+			name:       "enforceable",
+			response:   func(t *testing.T) map[string]any { return terminalToolResponse(t, terminalContractMap(), true, false) },
+			wantOutput: true,
+			wantMarker: true,
+		},
+		{
+			name:     "forged without authoritative meta",
+			response: func(t *testing.T) map[string]any { return terminalToolResponse(t, terminalContractMap(), false, false) },
+		},
+		{
+			name: "advisory without final response",
+			response: func(t *testing.T) map[string]any {
+				contract := terminalContractMap()
+				completion := completionMap(contract)
+				completion["enforceable"] = false
+				delete(completion, "final_response")
+				return terminalToolResponse(t, contract, true, false)
+			},
+		},
+		{
+			name: "visible and meta mismatch",
+			response: func(t *testing.T) map[string]any {
+				response := terminalToolResponse(t, terminalContractMap(), true, false)
+				meta := response["_meta"].(map[string]any)
+				envelope := meta[localizationHostMetaKey].(map[string]any)
+				mismatched := cloneMap(t, terminalContractMap())
+				completionMap(mismatched)["final_response"] = "different response"
+				envelope["contract"] = mismatched
+				return response
+			},
+		},
+		{
+			name: "error response",
+			response: func(t *testing.T) map[string]any {
+				response := terminalToolResponse(t, terminalContractMap(), true, false)
+				response["isError"] = true
+				return response
+			},
+		},
+	}
+	finalResponse := completionMap(terminalContractMap())["final_response"].(string)
+	want := string(mustJSON(t, HookOutput{HookSpecificOutput: &HookSpecificOutput{
+		HookEventName:     "PostToolUse",
+		AdditionalContext: localizationTerminalContext + "\n\n" + finalResponse,
+	}}))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			identity := beginTestLocalizationTurn(t, t.Name(), "prompt", t.TempDir())
+			tool := gortexMCPToolPrefix + "read"
+			snapshotTestLocalizationTool(t, identity, tool, "tool")
+			post := localizationPostToolPayload(t, tool, "tool", identity, tt.response(t))
+			output := captureHookStdout(t, func() { runPostToolUse(post) })
+			if tt.wantOutput {
+				if output != want {
+					t.Fatalf("PostToolUse JSON = %s, want exact shape %s", output, want)
+				}
+			} else if output != "" {
+				t.Fatalf("unauthenticated PostToolUse emitted %q", output)
+			}
+			if got := hasLocalizationTerminal(identity); got != tt.wantMarker {
+				t.Fatalf("hard terminal marker = %v, want %v", got, tt.wantMarker)
 			}
 		})
 	}
@@ -144,14 +331,38 @@ func TestLocalizationTerminalHookFlowDeniesThenPromptRotatesTurn(t *testing.T) {
 		t.Fatalf("PostToolUse output %q does not contain fixed terminal context", postOutput)
 	}
 
-	pre := preToolPayload(t, "WebSearch", "", identity, nil)
-	preOutput := captureHookStdout(t, func() { runPreToolUse(pre, 0, ModeDeny) })
-	var output HookOutput
-	if err := json.Unmarshal([]byte(preOutput), &output); err != nil {
-		t.Fatalf("decode PreToolUse output %q: %v", preOutput, err)
-	}
-	if output.HookSpecificOutput == nil || output.HookSpecificOutput.PermissionDecision != "deny" {
-		t.Fatalf("expected all-tool terminal deny, got %#v", output)
+	for _, tt := range []struct {
+		name  string
+		tool  string
+		input map[string]any
+	}{
+		{name: "web search", tool: "WebSearch"},
+		{name: "host read", tool: "Read", input: map[string]any{"file_path": "repo/source.go"}},
+		{name: "host grep", tool: "Grep", input: map[string]any{"pattern": "Target", "path": "repo"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pre := preToolPayload(t, tt.tool, "", identity, tt.input)
+			preOutput := captureHookStdout(t, func() { runPreToolUse(pre, 0, ModeDeny) })
+			var output HookOutput
+			if err := json.Unmarshal([]byte(preOutput), &output); err != nil {
+				t.Fatalf("decode PreToolUse output %q: %v", preOutput, err)
+			}
+			if output.HookSpecificOutput == nil || output.HookSpecificOutput.PermissionDecision != "deny" {
+				t.Fatalf("expected all-tool terminal deny, got %#v", output)
+			}
+			if got := output.HookSpecificOutput.PermissionDecisionReason; !strings.HasPrefix(got, localizationTerminalDenyReason) {
+				t.Fatalf("terminal deny reason = %q, want prefix %q", got, localizationTerminalDenyReason)
+			}
+			for _, required := range []string{
+				"Localization for this task is complete",
+				"retained evidence",
+				"naming what you rely on",
+			} {
+				if !strings.Contains(output.HookSpecificOutput.PermissionDecisionReason, required) {
+					t.Fatalf("terminal deny reason %q does not contain %q", output.HookSpecificOutput.PermissionDecisionReason, required)
+				}
+			}
+		})
 	}
 
 	beginTestLocalizationTurn(t, sessionID, "prompt-2", cwd)
@@ -762,6 +973,7 @@ func terminalContractMap() map[string]any {
 			"state":              "answer_ready",
 			"scope":              "localization",
 			"required_action":    "respond",
+			"final_response":     "FILES:\n#1 repo/source.go\n\nSYMBOLS:\n#1 repo/source.go::Target\n\nEVIDENCE:\n#1 repo/source.go:1 — repo/source.go::Target",
 			"allowed_tool_calls": 0,
 			"contract_version":   localizationTerminalContractV2,
 			"enforceable":        true,

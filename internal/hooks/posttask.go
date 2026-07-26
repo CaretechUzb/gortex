@@ -14,6 +14,8 @@ import (
 type PostTaskInput struct {
 	HookEventName  string `json:"hook_event_name"`
 	SessionID      string `json:"session_id"`
+	PromptID       string `json:"prompt_id"`
+	AgentID        string `json:"agent_id"`
 	TranscriptPath string `json:"transcript_path"`
 	CWD            string `json:"cwd"`
 	StopHookActive bool   `json:"stop_hook_active"`
@@ -35,6 +37,7 @@ func runPostTask(data []byte, port int) {
 	if input.HookEventName != "Stop" {
 		return
 	}
+	_ = clearLocalizationProblemStatementForTurn(input.SessionID, input.PromptID, input.AgentID, input.CWD)
 	emitted := false
 	defer func() {
 		logHookEffectiveness("Stop", emitted, daemonReachableFn(), 0, time.Since(started))

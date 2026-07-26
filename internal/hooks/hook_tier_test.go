@@ -40,7 +40,7 @@ func TestSessionStart_LeanTier_TrackedCwd(t *testing.T) {
 	if !strings.Contains(briefing, "enforcement active") {
 		t.Errorf("lean briefing lost the enforcement signal:\n%s", briefing)
 	}
-	if !strings.Contains(briefing, "Rule:") || !strings.Contains(briefing, "`explore`") || !strings.Contains(briefing, "`search`") {
+	if !strings.Contains(briefing, "Rule:") || !strings.Contains(briefing, "`mcp__gortex__explore`") || strings.Contains(briefing, "call `explore`") || !strings.Contains(briefing, "`search`") {
 		t.Errorf("lean briefing lost the rule preamble cues:\n%s", briefing)
 	}
 	// The standard-tier status prose must be gone.

@@ -458,10 +458,15 @@ func TestManager_CloseStopsLegacyProviderBeforeReturning(t *testing.T) {
 		t.Fatal("legacy provider did not start")
 	}
 	require.NoError(t, mgr.Close())
+	// The pass signals completion from a deferred close in another goroutine,
+	// so a non-blocking poll here asserts that goroutine was scheduled before
+	// this statement — a timing property nothing guarantees, and one a loaded
+	// runner loses. Wait bounded instead: the bug this guards against is Close
+	// returning while the pass runs on, which no amount of waiting hides.
 	select {
 	case <-done:
-	default:
-		t.Fatal("Close returned before the legacy provider and pass stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the legacy provider and pass were still running after Close returned")
 	}
 }
 

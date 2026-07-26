@@ -1828,6 +1828,8 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// Decorate the page with absolute file paths so every output format
 	// below surfaces an openable path alongside the repo-relative one.
 	page = s.withAbsPaths(page)
+	// Capture the final ranked, scoped page once, before JSON/TOON/GCX encoding.
+	captureLocalizationSearchSymbols(ctx, page)
 	nextCursor := ""
 	if end < total {
 		nextCursor = encodeCursor(end)

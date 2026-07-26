@@ -43,7 +43,7 @@ func TestHandleFacadeRejectsLocalizationBypassesWithoutClearingState(t *testing.
 				t.Fatalf("handleFacade() transport error = %v", err)
 			}
 			operation, _ := request.args["operation"].(string)
-			requireLocalizationTerminalError(t, result, "explore", normalizeFacadeOperation(operation))
+			requireLocalizationTerminalReplay(t, result, "explore", normalizeFacadeOperation(operation))
 			if blocked := terminal.block("search", "symbols", nil); blocked == nil {
 				t.Fatal("invalid localization request cleared terminal state")
 			}
@@ -205,8 +205,21 @@ func TestLocalizationCompletionEnvelope(t *testing.T) {
 	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
 		t.Fatalf("decode completion envelope: %v\n%s", err, text)
 	}
+	// Unproven ranked evidence keeps its one bounded call; the payload still
+	// carries the ranked rows the caller needs to spend it well.
 	if envelope.Completion.State != localizationStateNeedsRecovery || envelope.Completion.RequiredAction != "recover_once" || envelope.Completion.AllowedToolCalls != 1 {
 		t.Fatalf("unexpected completion: %#v", envelope.Completion)
+	}
+	if envelope.Completion.Enforceable || envelope.Terminal {
+		t.Fatalf("unproven evidence must not be enforceable or terminal: %#v", envelope.Completion)
+	}
+	for _, required := range []string{
+		"Gortex MCP recovery call",
+		"Do not call host Read, Grep, Glob, Bash",
+	} {
+		if !strings.Contains(envelope.Completion.Instruction, required) {
+			t.Fatalf("recovery instruction %q does not contain %q", envelope.Completion.Instruction, required)
+		}
 	}
 	if len(envelope.Files) != 1 || len(envelope.Symbols) != 1 || envelope.Symbols[0] != "repo/pkg/file.go::Run" || len(envelope.Evidence) != 1 {
 		t.Fatalf("missing localization payload: %#v", envelope)
@@ -219,12 +232,120 @@ func TestLocalizationCompletionEnvelope(t *testing.T) {
 	}
 }
 
+func TestLocalizationSingleResultCompletionDoesNotArmTerminalState(t *testing.T) {
+	task := "investigate facade routing schema registration dispatch behavior"
+	completion := newLocalizationSingleResultCompletion()
+	targets := []exploreTarget{{
+		node: &graph.Node{
+			ID:        "internal/mcp/facade_tools.go::registerFacadeTools",
+			Name:      "registerFacadeTools",
+			Kind:      graph.KindFunction,
+			FilePath:  "internal/mcp/facade_tools.go",
+			StartLine: 42,
+		},
+		conceptImplementation: true,
+		source:                "func registerFacadeTools() { registerRoutingSchema() }",
+	}}
+	result, _, _, finalized := buildLocalizationExploreResultForTaskFinalized(
+		completion, task, targets, 1600,
+	)
+	text, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("expected one text result: %#v", result)
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("decode localized envelope: %v\n%s", err, text)
+	}
+	if finalized.State != localizationStateLocalized || envelope.Completion.State != localizationStateLocalized ||
+		envelope.Completion.RequiredAction != "continue_task" || envelope.Terminal || envelope.Completion.Enforceable {
+		t.Fatalf("single-result completion must remain non-terminal: finalized=%#v envelope=%#v", finalized, envelope)
+	}
+	if strings.Contains(envelope.Completion.FinalResponse, localizationAnswerReadyDirective) {
+		t.Fatalf("single-result page carried the terminal directive: %q", envelope.Completion.FinalResponse)
+	}
+	for _, required := range []string{
+		"indexed localization pass is complete",
+		"bounded evidence contains exactly one supported primary production implementation candidate",
+		"no competing direct candidate",
+		"Continue the requested coding work",
+		"Editing, building, testing",
+	} {
+		if !strings.Contains(envelope.Completion.Instruction, required) {
+			t.Fatalf("localized instruction %q does not contain %q", envelope.Completion.Instruction, required)
+		}
+	}
+	for _, forbidden := range []string{"Respond now", "do not call another tool"} {
+		if strings.Contains(envelope.Completion.Instruction, forbidden) || strings.Contains(envelope.Completion.FinalResponse, forbidden) {
+			t.Fatalf("localized completion retained terminal wording %q: %#v", forbidden, envelope.Completion)
+		}
+	}
+	host, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	if !ok {
+		t.Fatalf("localized host envelope missing: %#v", result.Meta)
+	}
+	if host.Contract.Terminal || host.Contract.Completion.State != localizationStateLocalized ||
+		host.Contract.Completion.Enforceable {
+		t.Fatalf("localized host contract was terminally enriched: %#v", host.Contract)
+	}
+	if strings.Contains(host.Contract.Completion.FinalResponse, localizationAnswerReadyDirective) {
+		t.Fatalf("localized host page carried the terminal directive: %q", host.Contract.Completion.FinalResponse)
+	}
+
+	state := newLocalizationTerminalState()
+	state.arm(newLocalizationCompletion(true, ""))
+	state.armForTask(newLocalizationSingleResultCompletion(), task)
+	state.mu.Lock()
+	persistedState := state.state
+	state.mu.Unlock()
+	if persistedState != localizationStateInactive {
+		t.Fatalf("wire-only localized cue persisted as %q instead of inactive", persistedState)
+	}
+	for _, facade := range []string{
+		"explore", "search", "read", "relations", "trace", "analyze",
+		"change", "edit", "refactor", "workspace", "session", "recall", "remember", "capabilities",
+	} {
+		if blocked := state.block(facade, "anything", nil); blocked != nil {
+			t.Fatalf("%s must remain dispatchable after a localized cue: %#v", facade, blocked)
+		}
+	}
+}
+
+func TestLocalizationEnvelopeRowsStayPositionallyAlignedForDuplicateFiles(t *testing.T) {
+	targets := []exploreTarget{
+		{node: &graph.Node{ID: "repo/pkg/shared.go::First", Name: "First", Kind: graph.KindFunction, FilePath: "pkg/shared.go", StartLine: 10}},
+		{node: &graph.Node{ID: "repo/pkg/shared.go::Second", Name: "Second", Kind: graph.KindFunction, FilePath: "pkg/shared.go", StartLine: 20}},
+		{node: &graph.Node{ID: "repo/pkg/other.go::Third", Name: "Third", Kind: graph.KindFunction, FilePath: "pkg/other.go", StartLine: 30}},
+	}
+	result := newLocalizationExploreResult(newLocalizationCompletion(true, ""), targets, 1600)
+	text, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("expected one text result: %#v", result)
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("decode aligned envelope: %v", err)
+	}
+	if len(envelope.Files) != 3 || len(envelope.Symbols) != 3 || len(envelope.Evidence) != 3 {
+		t.Fatalf("files=%d symbols=%d evidence=%d, want three positional rows", len(envelope.Files), len(envelope.Symbols), len(envelope.Evidence))
+	}
+	for index := range envelope.Evidence {
+		row := envelope.Evidence[index]
+		if envelope.Files[index] != row.File || envelope.Symbols[index] != row.ID || row.Rank != index+1 {
+			t.Fatalf("row %d is misaligned: file=%q symbol=%q evidence=%#v", index+1, envelope.Files[index], envelope.Symbols[index], row)
+		}
+	}
+	if envelope.Files[0] != "pkg/shared.go" || envelope.Files[1] != "pkg/shared.go" {
+		t.Fatalf("duplicate source path was deduplicated: %#v", envelope.Files)
+	}
+}
+
 func TestLocalizationTerminalStateInterceptsOnlyNavigation(t *testing.T) {
 	state := newLocalizationTerminalState()
 	state.arm(newLocalizationCompletion(true, ""))
 	for _, facade := range []string{"explore", "search", "read", "relations", "trace", "analyze"} {
 		blocked := state.block(facade, "anything", nil)
-		requireLocalizationTerminalError(t, blocked, facade, "anything")
+		requireLocalizationTerminalReplay(t, blocked, facade, "anything")
 	}
 	for _, facade := range []string{"change", "edit", "refactor", "workspace", "session", "recall", "remember", "capabilities"} {
 		if blocked := state.block(facade, "anything", nil); blocked != nil {
@@ -291,7 +412,7 @@ func TestLocalizationRefinementAllowsExactlyOneCandidateRead(t *testing.T) {
 	if blocked, reserved := state.authorize("read", "source", read); reserved {
 		t.Fatal("second successful refinement read reserved a handler")
 	} else {
-		requireLocalizationTerminalError(t, blocked, "read", "source")
+		requireLocalizationTerminalReplay(t, blocked, "read", "source")
 	}
 }
 
@@ -362,7 +483,7 @@ func TestHandleFacadeRefinementReadReturnsAnswerReadyCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("terminal analyze returned transport error: %v", err)
 	}
-	requireLocalizationTerminalError(t, blockedAnalyze, "analyze", "why")
+	requireLocalizationTerminalReplay(t, blockedAnalyze, "analyze", "why")
 	if analyzeCalls != 0 {
 		t.Fatalf("terminal analyze reached its legacy handler %d time(s)", analyzeCalls)
 	}
@@ -375,12 +496,21 @@ func TestLocalizationTerminalStateIsPerSession(t *testing.T) {
 	}
 	ctxA := WithSessionID(context.Background(), "a")
 	ctxB := WithSessionID(context.Background(), "b")
-	server.localizationFor(ctxA).arm(newLocalizationCompletion(true, ""))
-	if server.localizationFor(ctxA).block("search", "symbols", nil) == nil {
-		t.Fatal("armed session should be blocked")
+	completionA := newLocalizationCompletion(true, "")
+	completionA.digest = newLocalizationEvidenceDigest(localizationExploreEnvelope{Evidence: []localizationEvidence{{
+		ID: "repo/a.go::A", File: "repo/a.go", Line: 1,
+	}}})
+	server.localizationFor(ctxA).arm(completionA)
+	replayA := server.localizationFor(ctxA).block("search", "symbols", nil)
+	if replayA == nil || replayA.IsError {
+		t.Fatalf("armed session replay = %#v", replayA)
+	}
+	textA, _ := singleTextContent(replayA)
+	if !strings.Contains(textA, "repo/a.go::A") {
+		t.Fatalf("session A lost its evidence: %q", textA)
 	}
 	if blocked := server.localizationFor(ctxB).block("search", "symbols", nil); blocked != nil {
-		t.Fatalf("separate session inherited terminality: %#v", blocked)
+		t.Fatalf("separate session inherited terminality or evidence: %#v", blocked)
 	}
 	if blocked := server.localizationFor(context.Background()).block("search", "symbols", nil); blocked != nil {
 		t.Fatalf("embedded default inherited daemon session state: %#v", blocked)
@@ -413,7 +543,7 @@ func TestHandleFacadeTaskCannotEscapeTerminalState(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ordinary task escaped terminal state: result=%#v err=%v", result, err)
 		}
-		requireLocalizationTerminalError(t, result, "explore", "task")
+		requireLocalizationTerminalReplay(t, result, "explore", "task")
 	}
 	if called {
 		t.Fatal("ordinary explore(task) dispatched after localization completed")
@@ -464,7 +594,9 @@ func TestHandleFacadeExplicitNewUserTaskCrossesTerminalBoundary(t *testing.T) {
 	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
 	ctx := WithSessionID(context.Background(), "explicit-task-boundary")
 	terminal := server.localizationFor(ctx)
-	terminal.armForTask(newLocalizationCompletion(true, ""), "Locate Foo")
+	prior := newLocalizationCompletion(true, "")
+	prior.digest = testEvidenceDigest()
+	terminal.armForTask(prior, "Locate Foo")
 
 	req := mcpgo.CallToolRequest{}
 	req.Params.Name = "explore"
@@ -485,9 +617,15 @@ func TestHandleFacadeExplicitNewUserTaskCrossesTerminalBoundary(t *testing.T) {
 	}
 	terminal.mu.Lock()
 	fingerprint := terminal.taskFingerprint
+	state := terminal.state
+	digest := terminal.digest
+	completion := terminal.completionLocked()
 	terminal.mu.Unlock()
 	if fingerprint != "Diagnose Bar" {
 		t.Fatalf("successful diagnostic task committed fingerprint %q", fingerprint)
+	}
+	if state != localizationStateInactive || digest != nil || completion.digest != nil || completion.FinalResponse != "" {
+		t.Fatalf("new user task leaked prior terminal replay: state=%q digest=%#v completion=%#v", state, digest, completion)
 	}
 }
 
@@ -533,7 +671,7 @@ func TestHandleFacadeExactReadCommitsOnlyOnSuccess(t *testing.T) {
 	if err != nil || calls != 3 {
 		t.Fatalf("post-recovery exact read = result=%#v err=%v calls=%d", fourth, err, calls)
 	}
-	requireLocalizationTerminalError(t, fourth, "read", "source")
+	requireLocalizationTerminalReplay(t, fourth, "read", "source")
 }
 
 func TestHandleFacadeExhaustedCorrectionFailureCarriesTerminalCompletion(t *testing.T) {
@@ -603,7 +741,7 @@ func TestHandleFacadeExhaustedCorrectionFailureCarriesTerminalCompletion(t *test
 	if blocked, err := read(alternate); err != nil {
 		t.Fatalf("post-terminal read returned transport error: %v", err)
 	} else {
-		requireLocalizationTerminalError(t, blocked, "read", "source")
+		requireLocalizationTerminalReplay(t, blocked, "read", "source")
 	}
 }
 
@@ -725,7 +863,7 @@ func TestHandleFacadeExplicitNewUserTaskCommitsOnSuccess(t *testing.T) {
 	if err != nil || calls != 1 {
 		t.Fatalf("later localize without boundary escaped: result=%#v err=%v calls=%d", blocked, err, calls)
 	}
-	requireLocalizationTerminalError(t, blocked, "explore", "localize")
+	requireLocalizationTerminalReplay(t, blocked, "explore", "localize")
 }
 
 func TestHandleFacadeNewUserTaskPanicRollsBack(t *testing.T) {
@@ -887,7 +1025,7 @@ func TestHandleFacadeExactReadPanicRestoresReservation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fourth exact read = (%v, %v), want terminal block", fourth, err)
 	}
-	requireLocalizationTerminalError(t, fourth, "read", "source")
+	requireLocalizationTerminalReplay(t, fourth, "read", "source")
 	if calls != 3 {
 		t.Fatalf("legacy source calls = %d, want 3", calls)
 	}
@@ -917,7 +1055,7 @@ func TestHandleFacadeLocalizeBlocksParaphrasesWithoutBoundary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("localize(%q) bypassed active contract: result=%#v err=%v", task, result, err)
 		}
-		requireLocalizationTerminalError(t, result, "explore", "localize")
+		requireLocalizationTerminalReplay(t, result, "explore", "localize")
 	}
 	if calls != 0 {
 		t.Fatalf("blocked localize calls dispatched %d legacy request(s)", calls)
