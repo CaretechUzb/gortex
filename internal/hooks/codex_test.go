@@ -400,7 +400,7 @@ func TestRunCodexPostToolUseApplyPatchMutationPipeline(t *testing.T) {
 		"detect_changes":   changed,
 		"get_test_targets": "internal/a_test.go::TestA",
 		"check_guards":     "boundary layering violated",
-		"contracts":        "orphan provider GET /a",
+		"contracts":        "matched: 0 pairs\norphan providers: 1\n  [repo] GET /a a.go:1\norphan consumers: 0\n",
 	})
 	defer srv.Close()
 	payload := []byte(`{"hook_event_name":"PostToolUse","tool_name":"apply_patch","cwd":"/repo","tool_input":{"command":"*** Begin Patch"},"tool_response":"Done!"}`)

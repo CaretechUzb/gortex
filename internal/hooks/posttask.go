@@ -289,7 +289,7 @@ func renderTestTargets(port int, idsCSV string) string {
 	if raw == "" || raw == "no test targets found" {
 		return ""
 	}
-	return cappedLines(raw, 15)
+	return cappedText(raw, 15, 2000)
 }
 
 // renderGuardViolations asks the bridge for .gortex.yaml guard rule violations.
@@ -299,10 +299,14 @@ func renderGuardViolations(port int, idsCSV string) string {
 		"compact": true,
 	})
 	raw = strings.TrimSpace(raw)
-	if raw == "" || strings.HasPrefix(raw, "no guard rule violations") {
+	// Two distinct clean sentinels: no violations found, and no rules to
+	// evaluate in the first place.
+	if raw == "" ||
+		strings.HasPrefix(raw, "no guard rule violations") ||
+		strings.HasPrefix(raw, "no guard rules configured") {
 		return ""
 	}
-	return cappedLines(raw, 10)
+	return cappedText(raw, 10, 1500)
 }
 
 // renderDeadCodeHits filters analyze:dead_code results to the intersection
@@ -427,20 +431,43 @@ func renderStaleFlagHits(port int, ids []string) string {
 	return strings.Join(hits, "\n") + "\n"
 }
 
-// renderContractMismatches runs the contracts check and returns a short list
-// of orphan providers/consumers. Empty when all contracts are matched.
+// renderContractMismatches runs the contracts check and returns only the
+// orphan providers/consumers. Empty when all contracts are matched.
+//
+// The compact summary always opens with `matched: N pairs` followed by one
+// row per matched pair, and puts the orphan counts and rows at the END. So a
+// leading "is it clean?" prefix test can never fire, and a leading line cap
+// truncates the orphan lists — the only actionable part — off the bottom in
+// any repo with enough matched pairs. Locate the orphan block and render from
+// there instead.
 func renderContractMismatches(port int) string {
-	raw := callServerTool(port, "contracts", map[string]any{
+	raw := strings.TrimSpace(callServerTool(port, "contracts", map[string]any{
 		"action":  "check",
 		"compact": true,
-	})
-	raw = strings.TrimSpace(raw)
+	}))
 	if raw == "" {
 		return ""
 	}
-	// The compact summary prefixes "no contract issues" when clean.
-	if strings.HasPrefix(strings.ToLower(raw), "no contract") {
+
+	lines := strings.Split(raw, "\n")
+	orphanStart := -1
+	providers, consumers := 0, 0
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if n, _ := fmt.Sscanf(trimmed, "orphan providers: %d", &providers); n == 1 {
+			if orphanStart < 0 {
+				orphanStart = i
+			}
+			continue
+		}
+		if n, _ := fmt.Sscanf(trimmed, "orphan consumers: %d", &consumers); n == 1 && orphanStart < 0 {
+			orphanStart = i
+		}
+	}
+	// No recognizable orphan block (older or changed compact shape) — suppress
+	// rather than paste an unparsed blob under an "issues" heading.
+	if orphanStart < 0 || (providers == 0 && consumers == 0) {
 		return ""
 	}
-	return cappedLines(raw, 10)
+	return cappedText(strings.TrimSpace(strings.Join(lines[orphanStart:], "\n")), 10, 1500)
 }

@@ -66,3 +66,24 @@ func TestCheckGuards_NoRulesNoArchitecture(t *testing.T) {
 	// "nothing configured" message, not a violation list.
 	require.Equal(t, "no guard rules configured", out["message"])
 }
+
+// TestCheckGuards_NoRulesCompactReturnsText covers the path that skipped the
+// compact branch: with nothing configured the handler returned JSON even to a
+// compact caller, so the Stop hook pasted a raw payload under a "Guard
+// Violations" heading that had nothing to report.
+func TestCheckGuards_NoRulesCompactReturnsText(t *testing.T) {
+	s := newGuardsTestServer(t)
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"ids": "dom", "compact": true}
+
+	res, err := s.handleCheckGuards(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.False(t, res.IsError)
+	tc, ok := res.Content[0].(mcp.TextContent)
+	require.True(t, ok)
+
+	require.Equal(t, "no guard rules configured\n", tc.Text)
+	var discard map[string]any
+	require.Error(t, json.Unmarshal([]byte(tc.Text), &discard), "compact output must not be JSON")
+}
