@@ -421,7 +421,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	started := time.Now()
 	input, _ := req.Params.Arguments.(map[string]any)
 	localizationAuthToken := localizationauth.TakeArgument(input)
-	operation := normalizeFacadeOperation(req.GetString("operation", ""))
+	operation := resolveFacadeOperationAlias(facade, normalizeFacadeOperation(req.GetString("operation", "")))
 	if facade == "analyze" {
 		operation = requestedAnalyzeKind(req.GetArguments())
 		if operation == "" {
