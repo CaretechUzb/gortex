@@ -120,6 +120,36 @@ func TestGetTestTargets_CompactNoTargets(t *testing.T) {
 	}
 }
 
+// TestDetectChanges_EchoesMeasuredScope pins the scope echo the Stop briefing
+// needs in order to name the tree it was answered about. It cannot derive this
+// from its own cwd: diffRepoScope resolves the tree as explicit-selector →
+// lone-tracked-repo → session cwd, so a cwd-derived label can name a repo the
+// diff never touched.
+func TestDetectChanges_EchoesMeasuredScope(t *testing.T) {
+	g := graph.New()
+	s := &Server{
+		graph:   g,
+		engine:  query.NewEngine(g),
+		session: newSessionState(),
+	}
+
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"format": "json"}
+	res, err := s.handleDetectChanges(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.False(t, res.IsError)
+	tc, ok := res.Content[0].(mcp.TextContent)
+	require.True(t, ok)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal([]byte(tc.Text), &payload))
+	// The handler default, and the "." fallback when no repo resolves.
+	require.Equal(t, "unstaged", payload["scope"])
+	require.Equal(t, ".", payload["repo_root"])
+	require.Contains(t, payload, "repo")
+}
+
 // TestGetTestTargets_JSONShapeUnchanged locks the non-compact contract that
 // `gortex affected` and `gortex edit tests` parse.
 func TestGetTestTargets_JSONShapeUnchanged(t *testing.T) {

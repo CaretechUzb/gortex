@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/zzet/gortex/internal/daemon"
 )
 
 func TestRunPostTask_RejectsWrongEvent(t *testing.T) {
@@ -284,6 +286,141 @@ func TestRenderTestTargets_CapsBytes(t *testing.T) {
 	}
 	if !strings.Contains(out, "truncated") {
 		t.Errorf("expected a truncation marker in the capped section:\n%s", out)
+	}
+}
+
+// incidentChangeSet mirrors the reported failure: a session that edited one Go
+// file while a sibling session on the same checkout left three release-config
+// files dirty.
+const incidentChangeSet = `{
+	"changed_files":["internal/hooks/posttask.go",".goreleaser.yml",".github/workflows/ci.yml",".github/workflows/release.yml"],
+	"changed_symbols":[
+		{"id":"gortex/internal/hooks/posttask.go::runPostTask","name":"runPostTask","kind":"function","file_path":"gortex/internal/hooks/posttask.go"},
+		{"id":"gortex/.goreleaser.yml::builds","name":"builds","kind":"config","file_path":"gortex/.goreleaser.yml"},
+		{"id":"gortex/.github/workflows/ci.yml::jobs","name":"jobs","kind":"config","file_path":"gortex/.github/workflows/ci.yml"},
+		{"id":"gortex/.github/workflows/release.yml::jobs","name":"jobs","kind":"config","file_path":"gortex/.github/workflows/release.yml"}
+	],
+	"risk":"HIGH","summary":"4 symbols touched",
+	"scope":"all","repo":"gortex","repo_root":"/repo"
+}`
+
+// TestRunPostTask_AttributesOnlyThisSessionsEdits is the regression test for
+// the reported bug: session A's Stop hook reported session B's in-flight edits
+// and told A to run tests for files it never touched.
+func TestRunPostTask_AttributesOnlyThisSessionsEdits(t *testing.T) {
+	withSessionDir(t)
+	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: "/repo"})
+	saveSessionState("sess-a", sessionState{
+		WrittenPaths: []string{"/repo/internal/hooks/posttask.go"},
+	})
+
+	srv := newRecordingFakeServer(map[string]string{
+		"detect_changes":        incidentChangeSet,
+		"get_test_targets":      "internal/hooks/posttask_test.go TestRunPostTask\nrun: go test ./internal/hooks/\n",
+		"explain_change_impact": `{"risk":"LOW","summary":"1 symbol","total_affected":2}`,
+	})
+	defer srv.Close()
+
+	data := []byte(`{"hook_event_name":"Stop","stop_hook_active":false,"session_id":"sess-a","cwd":"/repo"}`)
+	out := captureStdout(t, func() { runPostTask(data, portFromURL(t, srv.URL)) })
+	if out == "" {
+		t.Fatal("expected a briefing for the session's own edit")
+	}
+
+	// The session's own work is reported...
+	for _, want := range []string{
+		"Post-Task Diagnostics",
+		"Your edits this session:** 1 symbol(s) across 1 file(s)",
+		"internal/hooks/posttask_test.go",
+		"risk `LOW`", // the owned risk, NOT the tree-wide HIGH
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("briefing missing %q\n---\n%s", want, out)
+		}
+	}
+	// ...the sibling's files appear only as unattributed, never as work to do...
+	if !strings.Contains(out, "Also dirty, not attributed to this session") {
+		t.Errorf("sibling files were not disclosed as unattributed\n---\n%s", out)
+	}
+	// ...and the tree-wide risk must not leak in as if it were the session's.
+	if strings.Contains(out, "risk `HIGH`") {
+		t.Errorf("reported another session's risk tier\n---\n%s", out)
+	}
+
+	// Downstream diagnostics must be scoped to the owned symbol only. This is
+	// the concrete harm in the report: tests requested for someone else's files.
+	testCalls := srv.argsFor("get_test_targets")
+	if len(testCalls) != 1 {
+		t.Fatalf("expected 1 get_test_targets call, got %d", len(testCalls))
+	}
+	gotIDs, _ := testCalls[0]["ids"].(string)
+	if gotIDs != "gortex/internal/hooks/posttask.go::runPostTask" {
+		t.Errorf("get_test_targets ids = %q; must carry only the session's own symbol", gotIDs)
+	}
+	for _, banned := range []string{"goreleaser", "ci.yml", "release.yml"} {
+		if strings.Contains(gotIDs, banned) {
+			t.Errorf("ids leaked another session's symbol %q: %s", banned, gotIDs)
+		}
+	}
+}
+
+// TestRunPostTask_SessionOwnsNothing_Silent is the exact scenario from the
+// report: the session touched nothing in the repo while a sibling edited it.
+// Stop fires every turn, so this must be silent rather than a repeated notice.
+func TestRunPostTask_SessionOwnsNothing_Silent(t *testing.T) {
+	withSessionDir(t)
+	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: "/repo"})
+	// The session wrote only outside the repo — scratchpad and memory files.
+	saveSessionState("sess-a", sessionState{
+		WrittenPaths: []string{"/tmp/scratch/report.html", "/Users/dev/.claude/memory/MEMORY.md"},
+	})
+
+	srv := newRecordingFakeServer(map[string]string{
+		"detect_changes":   incidentChangeSet,
+		"get_test_targets": "should-never-be-called\n",
+	})
+	defer srv.Close()
+
+	data := []byte(`{"hook_event_name":"Stop","stop_hook_active":false,"session_id":"sess-a","cwd":"/repo"}`)
+	out := captureStdout(t, func() { runPostTask(data, portFromURL(t, srv.URL)) })
+
+	if out != "" {
+		t.Errorf("expected silence when the session owns none of the diff, got:\n%s", out)
+	}
+	if n := srv.callCount("get_test_targets"); n != 0 {
+		t.Errorf("asked for test targets %d times for work this session did not do", n)
+	}
+}
+
+// TestRunPostTask_OwnsAll_SkipsImpactCall keeps the single-session case free of
+// an extra round-trip: when the session owns the whole diff, detect_changes'
+// own risk already describes it.
+func TestRunPostTask_OwnsAll_SkipsImpactCall(t *testing.T) {
+	withSessionDir(t)
+	withTrackedRepos(t, daemon.TrackedRepoStatus{Prefix: "gortex", Path: "/repo"})
+	saveSessionState("sess-a", sessionState{WrittenPaths: []string{"/repo/internal/foo.go"}})
+
+	srv := newRecordingFakeServer(map[string]string{
+		"detect_changes": `{
+			"changed_files":["internal/foo.go"],
+			"changed_symbols":[{"id":"gortex/internal/foo.go::Foo","name":"Foo","kind":"function","file_path":"gortex/internal/foo.go"}],
+			"risk":"MEDIUM","summary":"1","scope":"all","repo":"gortex","repo_root":"/repo"
+		}`,
+		"get_test_targets": "internal/foo_test.go TestFoo\n",
+	})
+	defer srv.Close()
+
+	data := []byte(`{"hook_event_name":"Stop","stop_hook_active":false,"session_id":"sess-a","cwd":"/repo"}`)
+	out := captureStdout(t, func() { runPostTask(data, portFromURL(t, srv.URL)) })
+
+	if n := srv.callCount("explain_change_impact"); n != 0 {
+		t.Errorf("recomputed risk %d times when the session owns the whole diff", n)
+	}
+	if !strings.Contains(out, "risk `MEDIUM`") {
+		t.Errorf("expected detect_changes' own risk to be reused:\n%s", out)
+	}
+	if strings.Contains(out, "Also dirty") {
+		t.Errorf("nothing should be unattributed here:\n%s", out)
 	}
 }
 

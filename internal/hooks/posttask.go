@@ -59,7 +59,10 @@ func runPostTask(data []byte, port int) {
 		return
 	}
 
-	briefing := buildPostTaskBriefing(port)
+	briefing := buildPostTaskBriefing(port, sessionScope{
+		SessionID: input.SessionID,
+		CWD:       firstNonEmpty(input.CWD, loadHookCWD()),
+	})
 	if briefing == "" {
 		return
 	}
@@ -137,15 +140,80 @@ func briefingScope(repo, repoRoot string) string {
 	}
 }
 
-// buildPostTaskBriefing runs diagnostics on the current working tree and
+// changedSymbolIDs projects a changed-symbol list to its IDs, dropping blanks.
+func changedSymbolIDs(symbols []changedSymbol) []string {
+	ids := make([]string, 0, len(symbols))
+	for _, cs := range symbols {
+		if id := strings.TrimSpace(cs.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// ownedRisk returns the blast-radius tier for just the session's own symbols.
+// When the session owns the entire change set there is nothing to recompute,
+// so detect_changes' own risk is reused and the round-trip skipped — the
+// common single-session case. Never falls back to the tree-wide tier on a
+// partition: that number belongs to another session's work.
+func ownedRisk(port int, ownedIDs []string, treeRisk string, ownsAll bool) string {
+	if ownsAll {
+		return treeRisk
+	}
+	if len(ownedIDs) == 0 {
+		return "unknown"
+	}
+	raw := callServerTool(port, "explain_change_impact", map[string]any{
+		"ids":          strings.Join(ownedIDs, ","),
+		"summary_only": true,
+	})
+	if raw == "" {
+		return "unknown"
+	}
+	var impact struct {
+		Risk string `json:"risk"`
+	}
+	if json.Unmarshal([]byte(raw), &impact) != nil || strings.TrimSpace(impact.Risk) == "" {
+		return "unknown"
+	}
+	return impact.Risk
+}
+
+// renderUnattributedFiles names the dirty files this session did not write, so
+// an attribution miss degrades to a mention rather than a disappearance.
+func renderUnattributedFiles(files []string, capped bool) string {
+	if len(files) == 0 {
+		return ""
+	}
+	const show = 5
+	shown := files
+	suffix := ""
+	if len(shown) > show {
+		shown = shown[:show]
+		suffix = fmt.Sprintf(" (+%d more)", len(files)-show)
+	}
+	quoted := make([]string, len(shown))
+	for i, f := range shown {
+		quoted[i] = "`" + f + "`"
+	}
+	out := "_Also dirty, not attributed to this session:_ " + strings.Join(quoted, ", ") + suffix + "\n"
+	if capped {
+		out += "_This session's tracked-edit set hit its cap, so some of your own edits may be listed above._\n"
+	}
+	return out + "\n"
+}
+
+// buildPostTaskBriefing runs diagnostics on the changes this session made and
 // returns a compact markdown summary. Returns empty string when there's
 // nothing to report or the bridge is unreachable.
 //
-// The change set is the whole working tree, not a record of this session's
-// edits: Gortex does not attribute a diff to a session, so another agent on
-// the same checkout, a parallel session, or an earlier turn all land in it.
-// The rendered output says so — see the scope caveat below.
-func buildPostTaskBriefing(port int) string {
+// detect_changes answers about the whole working tree, so on a shared checkout
+// it also carries a sibling session's in-flight edits. attributeChanges splits
+// the result using the write targets PreToolUse recorded for this session; the
+// diagnostics below run over this session's symbols only, and the remainder is
+// named rather than dropped. When the session cannot be identified at all the
+// briefing falls back to the whole tree and labels itself as such.
+func buildPostTaskBriefing(port int, scope sessionScope) string {
 	changes := detectChangeSet(port)
 	if changes == nil {
 		return ""
@@ -157,21 +225,41 @@ func buildPostTaskBriefing(port int) string {
 		return ""
 	}
 
-	ids := make([]string, len(changes.ChangedSymbols))
-	for i, cs := range changes.ChangedSymbols {
-		ids[i] = cs.ID
+	attr := attributeChanges(scope, changes)
+	symbols := changes.ChangedSymbols
+	risk := changes.Risk
+	if attr.Attributed {
+		if len(attr.OwnedSymbols) == 0 {
+			// Every dirty file belongs to somebody else. Say nothing: Stop
+			// fires at the end of every turn, so a session reading code beside
+			// an editing sibling would otherwise get the same notice each time.
+			return ""
+		}
+		symbols = attr.OwnedSymbols
+		risk = ownedRisk(port, changedSymbolIDs(symbols), changes.Risk,
+			len(attr.OwnedSymbols) == len(changes.ChangedSymbols))
 	}
+
+	ids := changedSymbolIDs(symbols)
 	idsCSV := strings.Join(ids, ",")
 
 	var sb strings.Builder
-	sb.WriteString("## Gortex Working-Tree Diagnostics\n\n")
-	fmt.Fprintf(&sb, "**Measured:** %d symbol(s) across %d file(s) with %s in %s — aggregate risk `%s`.\n\n",
-		len(changes.ChangedSymbols), len(changes.ChangedFiles), postTaskScopePhrase,
-		briefingScope(changes.Repo, changes.RepoRoot), changes.Risk)
-	sb.WriteString("**Scope caveat:** this is a diff of the whole working tree, not a record of your edits. " +
-		"Gortex does not attribute changes to a session, so anything left uncommitted by another agent, " +
-		"a parallel session on this same checkout, or an earlier turn is included below. " +
-		"Untracked (never `git add`ed) files are invisible to this check entirely.\n\n")
+	if attr.Attributed {
+		// Only now is "post-task" a true description of the content.
+		sb.WriteString("## Gortex Post-Task Diagnostics\n\n")
+		fmt.Fprintf(&sb, "**Your edits this session:** %d symbol(s) across %d file(s) in %s — risk `%s`.\n\n",
+			len(symbols), len(attr.OwnedFiles), briefingScope(changes.Repo, changes.RepoRoot), risk)
+		sb.WriteString(renderUnattributedFiles(attr.Unattributed, attr.Capped))
+	} else {
+		sb.WriteString("## Gortex Working-Tree Diagnostics\n\n")
+		fmt.Fprintf(&sb, "**Measured:** %d symbol(s) across %d file(s) with %s in %s — aggregate risk `%s`.\n\n",
+			len(symbols), len(changes.ChangedFiles), postTaskScopePhrase,
+			briefingScope(changes.Repo, changes.RepoRoot), risk)
+		sb.WriteString("**Scope:** whole working tree. Gortex does not attribute these changes to a session — " +
+			"this is a diff of everything uncommitted, not a record of your work. Anything left by another agent, " +
+			"a parallel session on this same checkout, or an earlier turn is included below. " +
+			"Untracked (never `git add`ed) files are invisible to this check entirely.\n\n")
+	}
 
 	// Test targets — what to run.
 	if tests := renderTestTargets(port, idsCSV); tests != "" {
@@ -213,15 +301,25 @@ func buildPostTaskBriefing(port int) string {
 		sb.WriteString("\n")
 	}
 
-	// Contract mismatches.
+	// Contract mismatches. `contracts check` has no id filter, so this
+	// section stays repo-wide even when everything above is session-scoped —
+	// label it rather than drop a real signal or imply it is yours.
 	if contracts := renderContractMismatches(port); contracts != "" {
-		sb.WriteString("### API Contract Issues\n\n")
+		if attr.Attributed {
+			sb.WriteString("### API Contract Issues (repo-wide, not attributed to this session)\n\n")
+		} else {
+			sb.WriteString("### API Contract Issues\n\n")
+		}
 		sb.WriteString(contracts)
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("_Cross-check each finding against the edits you actually made this turn: act on the ones " +
-		"that match, ignore the rest. Do not investigate or \"fix\" changes you did not make._\n")
+	if attr.Attributed {
+		sb.WriteString("_Run the tests above and resolve any flagged item in your own changes before handoff._\n")
+	} else {
+		sb.WriteString("_Cross-check each finding against the edits you actually made this turn: act on the ones " +
+			"that match, ignore the rest. Do not investigate or \"fix\" changes you did not make._\n")
+	}
 	return sb.String()
 }
 
@@ -230,17 +328,30 @@ func buildPostTaskBriefing(port int) string {
 // symbols first, then asks for tests, guards, and contracts using that observed
 // change set. The hook is advisory: an unavailable daemon or an edit touching
 // no indexed symbol yields no output and never changes the completed mutation.
-func buildMutationBriefing(port int) string {
+//
+// Threaded with the same sessionScope as the Stop briefing so the two share one
+// attribution path. Note that Codex's PreToolUse payload carries no session_id,
+// so nothing is ever recorded for it and it always resolves to the labeled
+// whole-tree fallback — this does not give Codex attribution coverage.
+func buildMutationBriefing(port int, scope sessionScope) string {
 	changes := detectChangeSet(port)
 	if changes == nil || len(changes.ChangedSymbols) == 0 {
 		return ""
 	}
-	ids := make([]string, 0, len(changes.ChangedSymbols))
-	for _, symbol := range changes.ChangedSymbols {
-		if strings.TrimSpace(symbol.ID) != "" {
-			ids = append(ids, symbol.ID)
+
+	attr := attributeChanges(scope, changes)
+	symbols := changes.ChangedSymbols
+	risk := changes.Risk
+	if attr.Attributed {
+		if len(attr.OwnedSymbols) == 0 {
+			return ""
 		}
+		symbols = attr.OwnedSymbols
+		risk = ownedRisk(port, changedSymbolIDs(symbols), changes.Risk,
+			len(attr.OwnedSymbols) == len(changes.ChangedSymbols))
 	}
+
+	ids := changedSymbolIDs(symbols)
 	if len(ids) == 0 {
 		return ""
 	}
@@ -248,12 +359,20 @@ func buildMutationBriefing(port int) string {
 
 	var out strings.Builder
 	out.WriteString("## Gortex mutation follow-up\n\n")
-	fmt.Fprintf(&out, "Working-tree scan after this mutation: %d symbol(s) across %d file(s) with %s in %s; "+
-		"aggregate risk `%s`. The scan covers every uncommitted change in the tree, not only the patch just "+
-		"applied — entries that predate this mutation, or that belong to another agent on this checkout, are "+
-		"included.\n\n",
-		len(ids), len(changes.ChangedFiles), postTaskScopePhrase,
-		briefingScope(changes.Repo, changes.RepoRoot), changes.Risk)
+	if attr.Attributed {
+		fmt.Fprintf(&out, "After this mutation, your session's uncommitted work is %d symbol(s) across %d file(s) "+
+			"in %s; risk `%s`. The set spans everything you have edited this session, not only the patch just "+
+			"applied.\n\n",
+			len(ids), len(attr.OwnedFiles), briefingScope(changes.Repo, changes.RepoRoot), risk)
+		out.WriteString(renderUnattributedFiles(attr.Unattributed, attr.Capped))
+	} else {
+		fmt.Fprintf(&out, "Working-tree scan after this mutation: %d symbol(s) across %d file(s) with %s in %s; "+
+			"aggregate risk `%s`. The scan covers every uncommitted change in the tree, not only the patch just "+
+			"applied — entries that predate this mutation, or that belong to another agent on this checkout, are "+
+			"included.\n\n",
+			len(ids), len(changes.ChangedFiles), postTaskScopePhrase,
+			briefingScope(changes.Repo, changes.RepoRoot), risk)
+	}
 	out.WriteString("Uncommitted symbols in scope:\n")
 	for _, id := range ids {
 		fmt.Fprintf(&out, "- `%s`\n", id)

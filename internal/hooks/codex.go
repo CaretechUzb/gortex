@@ -405,7 +405,10 @@ func runCodexPostToolUse(data []byte, port int, mode CodexMode) {
 		return
 	}
 	if input.ToolName == "apply_patch" {
-		ctx := buildMutationBriefing(port)
+		ctx := buildMutationBriefing(port, sessionScope{
+			SessionID: input.SessionID,
+			CWD:       firstNonEmpty(input.CWD, loadHookCWD()),
+		})
 		emitted := ctx != ""
 		logHookEffectiveness("PostToolUse", emitted, daemonReachableFn(), 0, time.Since(started))
 		if !emitted {

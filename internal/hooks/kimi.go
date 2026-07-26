@@ -146,7 +146,10 @@ func runKimiStop(data []byte, port int) {
 	if input.StopHookActive {
 		return
 	}
-	briefing := buildPostTaskBriefing(port)
+	briefing := buildPostTaskBriefing(port, sessionScope{
+		SessionID: input.SessionID,
+		CWD:       firstNonEmpty(input.CWD, loadHookCWD()),
+	})
 	if briefing == "" {
 		return
 	}

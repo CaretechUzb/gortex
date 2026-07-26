@@ -22,6 +22,10 @@ type postHookInput struct {
 	ToolInput     map[string]any `json:"tool_input"`
 	ToolResponse  any            `json:"tool_response"`
 	CWD           string         `json:"cwd"`
+	// SessionID scopes the mutation briefing to this session's own edits.
+	// Absent from Codex payloads, which therefore fall back to the labeled
+	// whole-tree briefing.
+	SessionID string `json:"session_id"`
 }
 
 // runPostToolUse parses the PostToolUse payload and appends graph

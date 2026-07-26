@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/profiles"
 )
 
@@ -29,5 +30,8 @@ func TestMain(m *testing.M) {
 	fileIndexedFn = func(_, _ string) (bool, int) { return false, 0 }
 	fileSummaryFn = func(_, _ string) (*hookFileSummary, bool) { return nil, false }
 	callServerToolDaemonFn = func(string, string, map[string]any) string { return "" }
+	// Same reason: attribution resolves the diffed repo through the daemon's
+	// tracked-repo list. Tests that want a resolved repo stub this.
+	hookTrackedReposFn = func() []daemon.TrackedRepoStatus { return nil }
 	os.Exit(m.Run())
 }

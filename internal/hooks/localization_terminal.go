@@ -744,11 +744,15 @@ func writeBoundedLocalizationState(path string, value any) bool {
 	if !writeLocalizationState(path, value) {
 		return false
 	}
-	trimLocalizationStateDir(filepath.Dir(path), path)
+	trimStateDir(filepath.Dir(path), path, localizationTerminalMarkerTTL, localizationTerminalPruneLimit)
 	return true
 }
 
-func trimLocalizationStateDir(dir, preserve string) {
+// trimStateDir bounds a directory of .json state files: anything older than
+// ttl is removed outright, then the directory is pruned to hardCap oldest-
+// first. preserve is never removed. Best-effort — every I/O error is ignored,
+// because a hook must not fail over housekeeping.
+func trimStateDir(dir, preserve string, ttl time.Duration, hardCap int) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -768,13 +772,13 @@ func trimLocalizationStateDir(dir, preserve string) {
 			continue
 		}
 		age := time.Since(info.ModTime())
-		if age < 0 || age > localizationTerminalMarkerTTL {
+		if age < 0 || age > ttl {
 			_ = os.Remove(path)
 			continue
 		}
 		files = append(files, stateFile{path: path, modTime: info.ModTime()})
 	}
-	if len(files) <= localizationTerminalPruneLimit {
+	if len(files) <= hardCap {
 		return
 	}
 	sort.Slice(files, func(i, j int) bool {
@@ -783,7 +787,7 @@ func trimLocalizationStateDir(dir, preserve string) {
 		}
 		return files[i].modTime.Before(files[j].modTime)
 	})
-	remove := len(files) - localizationTerminalPruneLimit
+	remove := len(files) - hardCap
 	for _, file := range files {
 		if remove == 0 {
 			break
