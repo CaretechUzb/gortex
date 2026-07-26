@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
+
+	"github.com/zzet/gortex/internal/modelhint"
 )
 
 func TestParseCodexModeDefaultsAdvisory(t *testing.T) {
@@ -717,4 +719,75 @@ func codexPreToolPayloadWithPermission(toolName string, input string, permission
 
 func codexPostBashPayload(command string, response string) []byte {
 	return []byte(`{"hook_event_name":"PostToolUse","tool_name":"Bash","session_id":"codex-shape","tool_input":{"command":` + strconv.Quote(command) + `},"tool_response":` + strconv.Quote(response) + `}`)
+}
+
+// TestCodexCapturesTheModelHint closes the gap that left every Codex call
+// either unattributed or — before the reader checked the hint's agent —
+// booked against whichever model Claude Code last announced for the same
+// working directory. Codex hands us the active model slug on every hook
+// event; nothing was reading it.
+func TestCodexCapturesTheModelHint(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GORTEX_MODEL_HINT_DIR", dir)
+	// SessionStart otherwise dials the real daemon socket and waits out its
+	// timeout — two seconds of I/O, and enough stdout noise to bury the
+	// result line. Pin the status so this stays a unit test.
+	origStatus := sessionStartStatusFn
+	sessionStartStatusFn = func() (*daemon.StatusResponse, error) { return nil, errDaemonUnreachable }
+	t.Cleanup(func() { sessionStartStatusFn = origStatus })
+
+	payload := func(event, model string) []byte {
+		return []byte(`{"hook_event_name":"` + event + `","cwd":"/repo","model":"` + model + `","prompt":"hi"}`)
+	}
+
+	runCodex(payload("SessionStart", "gpt-5.6-sol"), 0)
+
+	got, ok := modelhint.Read("/repo")
+	if !ok {
+		t.Fatal("no hint written for a Codex session")
+	}
+	if got.Model != "gpt-5.6-sol" {
+		t.Errorf("model = %q, want gpt-5.6-sol", got.Model)
+	}
+	// Must be tagged as Codex, or the reader's cross-agent guard cannot tell
+	// this hint from one Claude Code wrote for the same directory.
+	if !modelhint.SameClient(got.Client, "codex-mcp-client") {
+		t.Errorf("client = %q, should match the codex MCP client", got.Client)
+	}
+	if modelhint.SameClient(got.Client, "claude-code") {
+		t.Errorf("client = %q must not be adopted by a Claude session", got.Client)
+	}
+}
+
+// TestCodexModelHintWriteCadence: PreToolUse fires hundreds of times a
+// session, so it must not turn a 12-hour hint into a per-tool-call disk write.
+// The turn- and session-scoped events are frequent enough to keep it fresh.
+func TestCodexModelHintWriteCadence(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GORTEX_MODEL_HINT_DIR", dir)
+
+	captureCodexModelHint("PreToolUse", "/repo", "gpt-5.6-sol")
+	if _, ok := modelhint.Read("/repo"); ok {
+		t.Error("PreToolUse should not write a hint")
+	}
+
+	captureCodexModelHint("UserPromptSubmit", "/repo", "gpt-5.6-sol")
+	if _, ok := modelhint.Read("/repo"); !ok {
+		t.Error("UserPromptSubmit should write a hint")
+	}
+}
+
+// TestCodexModelHintIgnoresEmpty keeps an older Codex that omits the field
+// from clearing a good hint.
+func TestCodexModelHintIgnoresEmpty(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GORTEX_MODEL_HINT_DIR", dir)
+
+	captureCodexModelHint("SessionStart", "/repo", "gpt-5.6-sol")
+	captureCodexModelHint("SessionStart", "/repo", "")
+
+	got, ok := modelhint.Read("/repo")
+	if !ok || got.Model != "gpt-5.6-sol" {
+		t.Errorf("an empty model must not clobber a good hint: %+v ok=%v", got, ok)
+	}
 }

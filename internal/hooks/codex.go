@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/zzet/gortex/internal/modelhint"
 )
 
 // CodexMode is deliberately separate from the cross-agent hook Mode: Codex's
@@ -65,10 +67,15 @@ func runCodex(data []byte, port int, selected ...CodexMode) {
 		HookEventName string `json:"hook_event_name"`
 		ToolName      string `json:"tool_name"`
 		CWD           string `json:"cwd"`
+		// Codex sends the active model slug on every hook event. Claude Code
+		// does not, which is why its hint has to be recovered from the
+		// transcript; here it is simply handed to us.
+		Model string `json:"model"`
 	}
 	if err := json.Unmarshal(data, &peek); err != nil {
 		return
 	}
+	captureCodexModelHint(peek.HookEventName, peek.CWD, peek.Model)
 	mode := CodexModeEnrich
 	if len(selected) > 0 {
 		mode = selected[0]
@@ -100,6 +107,29 @@ func runCodex(data []byte, port int, selected ...CodexMode) {
 		// Claude Code — hookSpecificOutput.additionalContext).
 		runUserPromptSubmit(data)
 	}
+}
+
+// captureCodexModelHint records which model is driving this Codex session so
+// the daemon can attribute savings to it. Without a writer of its own, a Codex
+// session either recorded no model or — worse, before the reader learned to
+// check the hint's agent — inherited whichever model Claude Code last
+// announced for the same working directory.
+//
+// Only the once-per-session and once-per-turn events write. PreToolUse fires
+// hundreds of times per session and would turn a 12-hour hint into a
+// per-tool-call disk write for no extra freshness.
+func captureCodexModelHint(event, cwd, model string) {
+	switch event {
+	case "SessionStart", "UserPromptSubmit":
+	default:
+		return
+	}
+	if strings.TrimSpace(model) == "" {
+		return
+	}
+	// Tagged with the agent name; modelhint.SameClient bridges it to the
+	// "codex-mcp-client" the MCP session reports.
+	modelhint.Write(cwd, model, "codex")
 }
 
 func runCodexBashHardDeny(data []byte, port int) {
