@@ -2658,6 +2658,16 @@ func (mi *MultiIndexer) ReconcileAllCtx(ctx context.Context) map[string]*IndexRe
 		if m, ok := mi.repos[prefix]; ok && m != nil {
 			m.FileMtimes = idx.FileMtimes()
 			m.LastIndexTime = time.Now()
+			// This pass was whole-repo, so its counts describe the repo
+			// and are safe to stamp. Doing so also heals metadata that a
+			// scoped pass left describing only its own scope, so a daemon
+			// already reporting a wrong file count converges on its own
+			// instead of needing a restart.
+			if result != nil {
+				m.FileCount = result.FileCount
+				m.NodeCount = result.NodeCount
+				m.EdgeCount = result.EdgeCount
+			}
 		}
 		mi.mu.Unlock()
 	}

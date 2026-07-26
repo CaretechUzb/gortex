@@ -5252,6 +5252,17 @@ func (idx *Indexer) FileMtimes() map[string]int64 {
 	return out
 }
 
+// trackedFileCount reports how many files this indexer currently holds
+// mtime records for — the repo's whole file set, independent of any one
+// pass's scope. A scoped pass adds and evicts its own files within scope
+// before reading this, so the count stays current. Kept separate from
+// FileMtimes() so callers that only need the size do not copy the map.
+func (idx *Indexer) trackedFileCount() int {
+	idx.mtimeMu.RLock()
+	defer idx.mtimeMu.RUnlock()
+	return len(idx.fileMtimes)
+}
+
 // RefreshFileMtime restamps the recorded modification time for a file
 // from its current on-disk mtime, without re-indexing it. The watcher
 // calls this when a save turned out to be structurally inert and the
@@ -5576,10 +5587,22 @@ func (idx *Indexer) incrementalReindexPaths(
 	}
 
 	nodes, edges := idx.repoNodeEdgeCount()
+	// FileCount must describe the repo, never this pass. diskFiles holds
+	// only the files under the caller's scope, so len(diskFiles) is the
+	// size of the batch — stamping that onto RepoMetadata is what made
+	// `daemon status` report an actively-edited repo's file count as the
+	// size of its last changed-file batch. How much work this pass did is
+	// already carried by StaleFileCount / DeletedFileCount.
+	fileCount := idx.trackedFileCount()
+	if fileCount == 0 {
+		// No prior full pass populated the mtime map (a virgin indexer
+		// reaching the scoped path). The scope is all we know about.
+		fileCount = len(diskFiles)
+	}
 	result := &IndexResult{
 		NodeCount:           nodes,
 		EdgeCount:           edges,
-		FileCount:           len(diskFiles),
+		FileCount:           fileCount,
 		StaleFileCount:      len(staleFiles),
 		DeletedFileCount:    len(deletedFiles),
 		FailedFiles:         failedFiles,

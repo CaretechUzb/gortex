@@ -940,3 +940,47 @@ func TestSingleToMultiRepoTransition(t *testing.T) {
 			"multi-repo node ID %q should start with %q", n.ID, prefix)
 	}
 }
+
+// TestScopedReindexPreservesRepoMetadataFileCount is the end-to-end
+// guard on the bug that made `gortex daemon status` report an
+// actively-edited repo's file count as the size of its last
+// changed-file batch. IncrementalReindexRepo is the door the git
+// watcher and the MCP reindex_repository tool both come through, and it
+// full-replaces RepoMetadata from the scoped IndexResult — so a scoped
+// pass must still carry the repo-wide count.
+func TestScopedReindexPreservesRepoMetadataFileCount(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "myrepo")
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	const total = 6
+	for i := range total {
+		writeFile(t, filepath.Join(dir, fmt.Sprintf("f%d.go", i)),
+			fmt.Sprintf("package main\n\nfunc F%d() {}\n", i))
+	}
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: dir, Name: "myrepo"}}}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	g := graph.New()
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+
+	meta := mi.GetMetadata("myrepo")
+	require.NotNil(t, meta)
+	require.Equal(t, total, meta.FileCount, "baseline: the full pass counts the repo")
+
+	// The watcher's door: one changed file, scoped.
+	one := filepath.Join(dir, "f0.go")
+	writeFile(t, one, "package main\n\nfunc F0() {}\n\nfunc F0Edited() {}\n")
+	_, err = mi.IncrementalReindexRepo("myrepo", []string{one})
+	require.NoError(t, err)
+
+	meta = mi.GetMetadata("myrepo")
+	require.NotNil(t, meta)
+	assert.Equal(t, total, meta.FileCount,
+		"a scoped reindex must not overwrite the repo's file count with its batch size")
+}
