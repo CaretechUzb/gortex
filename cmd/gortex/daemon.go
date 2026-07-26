@@ -594,19 +594,17 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		if v1EventHub != nil && mw != nil {
 			go v1EventHub.Run(mw.Events())
 		}
-		// Community detection and process discovery only run when a
-		// repo is tracked or indexed via MCP — a daemon coming up off
-		// a snapshot never triggers them. Fire once here so
-		// get_communities / get_processes / dashboards reflect the
-		// loaded graph instead of returning "run index_repository
-		// first" against a fully populated state.
+		// Community detection and process discovery are a whole-graph pass
+		// costing minutes on a large workspace, and most sessions never ask
+		// for them. Running it here delayed readiness and kept the result
+		// resident for every daemon whether or not anything read it, so the
+		// pass is now started by the first consumer that needs it: those
+		// tools answer with a retry hint while it runs in the background
+		// instead of the old "run index_repository first", which was
+		// misleading against a fully populated graph.
 		if state.mcpServer != nil {
-			analysisStart := time.Now()
-			publishReadinessPhase(state, "analysis", true, nil)
-			state.mcpServer.RunAnalysis()
-			warmup.analysis = time.Since(analysisStart)
-			publishReadinessPhase(state, "analysis_done", true, map[string]any{
-				"elapsed_ms": warmup.analysis.Milliseconds(),
+			publishReadinessPhase(state, "analysis_deferred", true, map[string]any{
+				"reason": "analysis runs on first use",
 			})
 			// Co-change pre-warm: fire the git-history mine in the
 			// background so the first user-visible
@@ -1191,11 +1189,21 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 		t.AppendRow(table.Row{"memory", formatBytes(st.MemoryBytes)})
 	}
 	if sb := st.SearchBackend; sb.Name != "" {
+		// formatSearchDocs renders the trailing-space "docs=N  " fragment,
+		// or nothing when the backend cannot report a real count. Backends
+		// whose only figure is a since-construction Add/Remove delta must
+		// print nothing rather than pass the delta off as a corpus size.
+		formatSearchDocs := func(sb daemon.SearchBackendStats) string {
+			if !sb.DocCountKnown {
+				return ""
+			}
+			return fmt.Sprintf("docs=%d  ", sb.DocCount)
+		}
 		switch {
 		case sb.DiskPath != "":
 			t.AppendRow(table.Row{"search", fmt.Sprintf(
-				"%s  docs=%d  heap=%s  disk=%s  path=%s",
-				sb.Name, sb.DocCount, formatBytes(sb.Bytes),
+				"%s  %sheap=%s  disk=%s  path=%s",
+				sb.Name, formatSearchDocs(sb), formatBytes(sb.Bytes),
 				formatBytes(sb.DiskBytes), sb.DiskPath)})
 		case sb.DiskResident:
 			// No heap footprint to report — the index lives inside the
@@ -1203,11 +1211,11 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			// structure. Printing "heap=0 B" here would read as "this
 			// backend costs nothing", which is false.
 			t.AppendRow(table.Row{"search", fmt.Sprintf(
-				"%s  docs=%d  disk-resident (indexed in the graph store)",
-				sb.Name, sb.DocCount)})
+				"%s  %sdisk-resident (indexed in the graph store)",
+				sb.Name, formatSearchDocs(sb))})
 		default:
 			t.AppendRow(table.Row{"search", fmt.Sprintf(
-				"%s  docs=%d  heap=%s", sb.Name, sb.DocCount, formatBytes(sb.Bytes))})
+				"%s  %sheap=%s", sb.Name, formatSearchDocs(sb), formatBytes(sb.Bytes))})
 		}
 	}
 	rt := st.Runtime

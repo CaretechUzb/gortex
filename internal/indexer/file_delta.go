@@ -101,6 +101,16 @@ func (idx *Indexer) prepareFileDelta(filePath string) (fileDeltaProbe, bool) {
 	if quarantine != nil && quarantine.Len() > 0 {
 		_ = quarantine.Save()
 	}
+	// Ownership of the result's tree-sitter tree — C memory the Go GC
+	// cannot reclaim — passes to idx.prepared only on the success path
+	// at the bottom. Every early return below drops the result on the
+	// floor, so release the tree unless it was stored.
+	stored := false
+	defer func() {
+		if !stored {
+			result.ReleaseTree()
+		}
+	}()
 	if result == nil || skipped || err != nil {
 		return probe, false
 	}
@@ -124,6 +134,10 @@ func (idx *Indexer) prepareFileDelta(filePath string) (fileDeltaProbe, bool) {
 	if idx.prepared == nil {
 		idx.prepared = make(map[string]*preparedExtraction)
 	}
+	// A second prepare for the same path before the first was consumed
+	// displaces the earlier entry; it owns a tree that nothing else can
+	// reach once the map slot is overwritten.
+	displaced := idx.prepared[absPath]
 	idx.prepared[absPath] = &preparedExtraction{
 		absPath:     absPath,
 		relPath:     relPath,
@@ -133,8 +147,21 @@ func (idx *Indexer) prepareFileDelta(filePath string) (fileDeltaProbe, bool) {
 		readVersion: readVersion,
 	}
 	idx.preparedMu.Unlock()
+	// Released outside the lock: Release closes the tree through cgo.
+	displaced.releaseTree()
+	stored = true
 	probe.readVersion = readVersion
 	return probe, true
+}
+
+// releaseTree drops the prepared extraction's parse tree. Nil-safe on
+// the entry and on the result, so a caller that took a map slot which
+// may or may not have been occupied can call it unconditionally.
+func (p *preparedExtraction) releaseTree() {
+	if p == nil {
+		return
+	}
+	p.result.ReleaseTree()
 }
 
 func (idx *Indexer) takePreparedExtraction(absPath, relPath, lang string, src []byte) (*parser.ExtractionResult, bool) {
@@ -143,6 +170,9 @@ func (idx *Indexer) takePreparedExtraction(absPath, relPath, lang string, src []
 	delete(idx.prepared, absPath)
 	idx.preparedMu.Unlock()
 	if prepared == nil || prepared.relPath != relPath || prepared.lang != lang || !bytes.Equal(prepared.src, src) {
+		// The entry is already out of the map and the caller gets
+		// nothing, so this is the last reference to its tree.
+		prepared.releaseTree()
 		return nil, false
 	}
 	return prepared.result, true
@@ -162,10 +192,14 @@ func (idx *Indexer) takePreparedRefresh(filePath string) (*preparedExtraction, b
 	}
 	current, readVersion, err := readFileWithVersion(absPath)
 	if err != nil {
+		prepared.releaseTree()
 		return nil, false
 	}
 	current = idx.transforms.run(prepared.relPath, current)
 	if !bytes.Equal(current, prepared.src) {
+		// The file moved on since the speculative parse; the entry is
+		// already out of the map, so drop its tree with it.
+		prepared.releaseTree()
 		return nil, false
 	}
 	prepared.readVersion = readVersion
@@ -178,8 +212,11 @@ func (idx *Indexer) discardPreparedExtraction(filePath string) {
 		return
 	}
 	idx.preparedMu.Lock()
+	discarded := idx.prepared[absPath]
 	delete(idx.prepared, absPath)
 	idx.preparedMu.Unlock()
+	// Released outside the lock: Release closes the tree through cgo.
+	discarded.releaseTree()
 }
 
 type fingerprintMode uint8
@@ -655,6 +692,11 @@ func (idx *Indexer) applyPreparedMetadataRefresh(filePath string, priorNodes []*
 		return nil, false, false
 	}
 	result := prepared.result
+	// takePreparedRefresh already removed the entry from idx.prepared,
+	// so this function owns the tree. Only Nodes/Edges are read from
+	// here on, and every shape-mismatch check below returns early —
+	// release on all of them.
+	defer result.ReleaseTree()
 	idx.applyRepoPrefix(result.Nodes, result.Edges)
 	graphPath := idx.prefixPath(prepared.relPath)
 

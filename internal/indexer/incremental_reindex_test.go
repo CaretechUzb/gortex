@@ -17,12 +17,11 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// TestIncrementalReindex_PreservesExcludedFiles is the regression test for
-// the deletion-classification bug: a file that's tracked in fileMtimes but
-// absent from the discovery walk must NOT be purged unless it's truly gone
-// from disk. Otherwise an exclude-list change between passes silently
-// destroys legitimate graph state.
-func TestIncrementalReindex_PreservesExcludedFiles(t *testing.T) {
+// TestIncrementalReindex_EvictsExcludedFiles is the regression for #321:
+// when a previously-indexed file becomes excluded, IncrementalReindex must
+// purge its nodes even though the file still exists on disk. Otherwise
+// file_count drops while node_count/search keep serving orphans.
+func TestIncrementalReindex_EvictsExcludedFiles(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "keep.go"), `package main
 
@@ -40,18 +39,18 @@ func Dropped() {}
 	require.NotEmpty(t, g.FindNodesByName("Kept"))
 	require.NotEmpty(t, g.FindNodesByName("Dropped"))
 
-	// Mid-flight exclusion change: future discoveries will not visit
-	// drop.go, but it's still on disk. The old code would treat it as
-	// deleted and purge its nodes; the new code stats it and preserves.
+	// Mid-flight exclusion: drop.go remains on disk but must leave the graph.
 	idx.config.Exclude = append(append([]string{}, excludes.Builtin...), "drop.go")
 	idx.excludes = nil
 	idx.excludeOnce = sync.Once{}
 
-	_, err = idx.IncrementalReindex(dir)
+	res, err := idx.IncrementalReindex(dir)
 	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Equal(t, 1, res.DeletedFileCount, "excluded-but-present file must count as deleted")
 
 	assert.NotEmpty(t, g.FindNodesByName("Kept"), "kept.go was not excluded; nodes must survive")
-	assert.NotEmpty(t, g.FindNodesByName("Dropped"), "drop.go was excluded but still on disk; nodes must be preserved")
+	assert.Empty(t, g.FindNodesByName("Dropped"), "drop.go is excluded; nodes must be evicted")
 }
 
 // TestIncrementalReindex_EvictsTrulyDeletedFiles is the control case: a

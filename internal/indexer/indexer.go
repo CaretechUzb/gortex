@@ -191,6 +191,9 @@ type Indexer struct {
 	trigramSearcher *trigram.Searcher
 	trigramGen      uint64
 	trigramMu       sync.Mutex
+	// trigramBudgetOverride scopes the idle/LRU eviction budget to one
+	// test rather than the process-wide default. Nil in production.
+	trigramBudgetOverride *trigramBudget
 
 	// repoPrefix is set in multi-repo mode to prefix all file paths and node IDs.
 	// When empty, the indexer operates in single-repo mode (backward compatible).
@@ -721,6 +724,32 @@ func (idx *Indexer) shouldIndexForSearch(n *graph.Node) bool {
 		return false
 	}
 	return true
+}
+
+// removeFromSearch drops a node from the symbol index, gated on the same
+// predicate that admits it. Every eviction path must go through this rather
+// than its own Kind check.
+//
+// The backend's Remove is an unconditional decrement with no membership set,
+// so evicting on a broader predicate than Add uses does not just miscount by
+// a constant: it subtracts the difference set on every reconcile of the same
+// file and never adds it back. KindLocal dominates that set — those bindings
+// are persisted only to satisfy dataflow FK constraints, so they are present
+// in the prior-node list of every Go file, while shouldIndexForSearch has
+// always refused to index them.
+//
+// Safe on nodes read back from the store: every input the predicate reads
+// (Kind, Language, Stub, Origin, data_class) is a persisted column, so it
+// evaluates the same on a stored node as on the freshly extracted one that
+// was admitted.
+func (idx *Indexer) removeFromSearch(n *graph.Node) {
+	if idx == nil || idx.search == nil || n == nil {
+		return
+	}
+	if !idx.shouldIndexForSearch(n) {
+		return
+	}
+	idx.search.Remove(n.ID)
 }
 
 // upgradeSearchToBleve constructs a Bleve backend from the current graph
@@ -3208,8 +3237,11 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					// Release the parse tree now that the per-file
 					// contract pass is done. Post-passes that need a
 					// tree for this file (cross-file handler resolution)
-					// re-parse on demand. Nil-safe.
-					result.Tree.Release()
+					// re-parse on demand. Nil-safe. Deliberately not a
+					// defer: this is a per-file loop body inside a
+					// long-lived worker goroutine, so a defer would pin
+					// every tree in the chunk until the worker exits.
+					result.ReleaseTree()
 					atomic.AddInt64(&fileCount, 1)
 				}
 				if len(localContracts) > 0 {
@@ -3803,9 +3835,7 @@ func (idx *Indexer) indexFile(
 	var oldFuncIDs []string
 	evictExisting := func() {
 		for _, n := range idx.graph.GetFileNodes(graphPath) {
-			if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
-				idx.search.Remove(n.ID)
-			}
+			idx.removeFromSearch(n)
 			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
 				oldFuncIDs = append(oldFuncIDs, n.ID)
 			}
@@ -3882,6 +3912,12 @@ func (idx *Indexer) indexFile(
 			_ = quarantine.Save()
 		}
 	}
+	// The tree-sitter tree behind result.Tree is C memory the Go GC
+	// cannot reclaim, and this function has many early returns below.
+	// Release it on every exit path — nothing after this point reads
+	// the tree (the incremental contract pass parses its own), so the
+	// defer is the whole lifetime.
+	defer result.ReleaseTree()
 	if result == nil {
 		// No usable parse result (transient parse failure, quarantine,
 		// timeout). Do NOT evict — the file's prior nodes/edges/search
@@ -4258,6 +4294,11 @@ func (idx *Indexer) StructuralSymbols(filePath string) ([]*graph.Node, bool) {
 	if quarantine != nil && quarantine.Len() > 0 {
 		_ = quarantine.Save()
 	}
+	// This probe only ever reads result.Nodes, so the parse tree is
+	// dead the moment extraction returns. Release it on both exits —
+	// the inertness probe runs on every watcher event, so a retained
+	// tree here leaks C memory at save frequency.
+	defer result.ReleaseTree()
 	// A skipped (quarantined / timed-out) file produces only a
 	// synthetic node — not the real symbol set — so inertness cannot
 	// be proven and the caller must reindex normally.
@@ -4341,9 +4382,7 @@ func (idx *Indexer) EvictFile(filePath string) (int, int) {
 	graphPath := idx.prefixPath(relPath)
 	// Remove from search index.
 	for _, n := range idx.graph.GetFileNodes(graphPath) {
-		if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
-			idx.search.Remove(n.ID)
-		}
+		idx.removeFromSearch(n)
 	}
 	idx.restubIncomingRefs(graphPath)
 	idx.evictEnrichment(graphPath)
@@ -5470,6 +5509,10 @@ func (idx *Indexer) incrementalReindexPaths(
 			absPath := filepath.Join(absRoot, filepath.FromSlash(relPath))
 			_, statErr := os.Stat(absPath)
 			if statErr == nil {
+				// Present-but-excluded must be purged (same as full IncrementalReindex).
+				if idx.shouldExclude(absPath, absRoot, false) {
+					deletedFiles = append(deletedFiles, relPath)
+				}
 				continue
 			}
 			if errors.Is(statErr, os.ErrNotExist) {
@@ -5632,23 +5675,17 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 
 	// Detect deleted files. A file that's tracked in fileMtimes but
 	// absent from the current discovery walk is a candidate, but
-	// "absent from discovery" is not the same as "absent from disk":
+	// "absent from discovery" is not always "absent from disk":
 	//
-	//   - The exclude list (.gortex.yaml, builtin, workspace) may have
-	//     grown since the last index — every newly-excluded file would
-	//     be classified as deleted.
-	//   - A language extractor's Extensions() may have changed across
-	//     versions — files whose ext is no longer detected would be
-	//     classified as deleted.
+	//   - Newly excluded (user/config intent): treat as deleted so the
+	//     graph does not retain permanent orphans (#321).
+	//   - Language extractor Extensions() shrank: file still on disk and
+	//     not excluded — preserve graph state.
 	//   - WalkDir swallowed a transient error (EACCES, EIO, NFS hiccup,
-	//     ELOOP) — the file is unreachable this pass but still on disk.
+	//     ELOOP) — preserve on non-ENOENT stat failures.
 	//
-	// All three would purge legitimate graph state on every daemon
-	// restart. Stat the candidate first: only treat ENOENT/ENOTDIR as
-	// deletion; preserve on success (file exists, just not discovered)
-	// and on transient errors. The cost is one extra stat per
-	// previously-indexed-but-not-discovered file, which is bounded by
-	// the size of the exclusion delta.
+	// Stat the candidate: ENOENT => deleted; exists+excluded => deleted;
+	// exists+not-excluded => preserve; other errors => preserve.
 	idx.mtimeMu.RLock()
 	var candidates []string
 	for relPath := range idx.fileMtimes {
@@ -5663,8 +5700,15 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 		absPath := filepath.Join(absRoot, relPath)
 		_, err := os.Stat(absPath)
 		if err == nil {
-			// File exists on disk; it was excluded or its extension is
-			// no longer detected. Preserve.
+			// File still exists on disk but was not admitted by this walk.
+			// If the admission set now excludes it, treat it like a deletion
+			// so exclude-list refinements do not leave permanent orphans
+			// (file_count drops while node_count/search stay stale). See #321.
+			// If it is not excluded (e.g. extension no longer detected),
+			// preserve graph state.
+			if idx.shouldExclude(absPath, absRoot, false) {
+				deletedFiles = append(deletedFiles, relPath)
+			}
 			continue
 		}
 		if errors.Is(err, os.ErrNotExist) {

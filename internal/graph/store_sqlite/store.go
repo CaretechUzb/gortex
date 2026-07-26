@@ -1499,6 +1499,17 @@ func (s *Store) ReindexEdge(e *graph.Edge, oldTo string) {
 // mutations.
 const reindexChunkSize = 5000
 
+// errReindexWriterGateContended marks a reindex abandoned because the writer
+// gate stayed contended past its bounded window (see reindexEdgesSetOriented).
+// It is recoverable by design -- the batch is dropped and its edges are rebound
+// by a later resolve pass -- so ReindexEdges swallows it instead of escalating
+// through panicOnFatal. The bounded gate exists precisely so a mandatory
+// reindex cannot block the store indefinitely; turning that liveness signal
+// into a daemon-killing panic (which it did during warmup, when a checkpoint or
+// a sibling mutation held writeMu past the window) is strictly worse than
+// leaving a few edges unresolved until the next pass.
+var errReindexWriterGateContended = errors.New("store_sqlite: reindex writer gate contended")
+
 // ReindexEdges applies resolver re-binds through bounded VALUES relations.
 // Each bounded transaction prefetches only the relevant identities through
 // variable-safe VALUES relations, simulates the prior ordered DELETE + INSERT
@@ -1510,6 +1521,10 @@ func (s *Store) ReindexEdges(batch []graph.EdgeReindex) {
 		}
 	}
 	if _, err := s.reindexEdgesSetOriented(batch); err != nil {
+		if errors.Is(err, errReindexWriterGateContended) {
+			log.Printf("store_sqlite: reindex writer gate contended, dropping %d rebind(s) — a later resolve pass rebinds them: %v", len(batch), err)
+			return
+		}
 		panicOnFatal(err)
 	}
 }

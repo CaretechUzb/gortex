@@ -42,6 +42,16 @@ const (
 
 const codexSessionStartMatcher = "startup|resume|clear|compact"
 
+// codexHookTrustNotice is surfaced whenever this run wrote or changed a Codex
+// lifecycle hook. Codex records trust against each non-managed hook's current
+// hash and skips new or changed hooks until the user reviews them in `/hooks`,
+// so a freshly installed hook set is inert — and inert silently: the config
+// file looks identical whether the hooks are trusted or skipped. Since
+// SessionStart is what puts the Gortex rule in front of a Codex session at
+// all, an untrusted hook set reads to the user as "Gortex configured, Gortex
+// ignored". Nothing on disk says so, which is why the installer has to.
+const codexHookTrustNotice = "Codex skips new or changed hooks until they are trusted — run `/hooks` inside Codex, review the gortex entries, and trust them"
+
 // v060CodexSessionStart* fingerprints the static hook shipped by gortex
 // v0.60.0 so an upgrade replaces it instead of installing a duplicate. The
 // concrete retirement gate is documented in docs/versioning.md.
@@ -54,6 +64,10 @@ const (
 	codexPostToolUseMatcher             = "^(Bash|apply_patch)$"
 	codexHookTimeoutSeconds             = 5
 	codexHookModeEnvVar                 = "GORTEX_CODEX_HOOK_MODE"
+	// Codex merges its home instructions file into every session ahead of
+	// the repo's own AGENTS.md, preferring the override name when present.
+	codexGlobalInstructionsFile         = "AGENTS.md"
+	codexGlobalInstructionsOverrideFile = "AGENTS.override.md"
 )
 
 type Adapter struct{}
@@ -89,6 +103,12 @@ func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 			Keys:   keys,
 		})
 	}
+	if env.Mode == agents.ModeGlobal && env.InstallGlobalInstructions && env.Home != "" {
+		p.Files = append(p.Files, agents.FileAction{
+			Path: GlobalInstructionsPath(env.Home), Action: agents.ActionWouldMerge,
+			Keys: []string{"gortex-rules-block"},
+		})
+	}
 	if env.Mode != agents.ModeGlobal && env.SkillsRouting != "" {
 		p.Files = append(p.Files, agents.FileAction{
 			Path: filepath.Join(env.Root, "AGENTS.md"), Action: agents.ActionWouldMerge,
@@ -96,6 +116,49 @@ func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 		})
 	}
 	return p, nil
+}
+
+// GlobalInstructionsPath is Codex's user-level instructions file. Codex
+// merges it into every session ahead of the repo's own AGENTS.md, which
+// makes it the Codex analogue of ~/.claude/CLAUDE.md.
+func GlobalInstructionsPath(home string) string {
+	return filepath.Join(home, ".codex", codexGlobalInstructionsFile)
+}
+
+// upsertGlobalInstructions writes the machine-wide Gortex rule block into
+// ~/.codex/AGENTS.md. Without it a Codex session carries no standing rule:
+// the MCP server's `instructions` field is not guaranteed to reach the
+// model, and the lifecycle hooks only re-surface guidance when the prompt
+// probe returns graph hits — so most turns arrive with nothing and the
+// model falls back to shell reads and greps. Claude Code gets a thin
+// @-include pointer at the active profile; Codex cannot resolve one, so
+// the profile body is inlined and refreshed in place on every install and
+// every `gortex instructions switch`.
+func upsertGlobalInstructions(env agents.Env, opts agents.ApplyOpts) (agents.FileAction, error) {
+	path := GlobalInstructionsPath(env.Home)
+	// Codex prefers AGENTS.override.md in its home when that file exists,
+	// and never reads AGENTS.md alongside it. Write ours either way — the
+	// override is the user's file to own — but say so, otherwise the block
+	// lands somewhere Codex silently ignores.
+	if _, err := os.Stat(filepath.Join(env.Home, ".codex", codexGlobalInstructionsOverrideFile)); err == nil {
+		internalutil.Warnf(env.Stderr, "Codex reads %s instead of %s; copy the Gortex block there or delete the override",
+			codexGlobalInstructionsOverrideFile, codexGlobalInstructionsFile)
+	}
+	action, err := agents.UpsertMarkedBlock(nil, path, agents.GlobalInlineBody(agents.InstructionsDir(env)),
+		agents.GlobalRulesStartMarker, agents.GlobalRulesEndMarker, opts)
+	if err != nil {
+		return agents.FileAction{}, err
+	}
+	// UpsertMarkedBlock is shared with the per-repo communities block, so
+	// it labels every action with "communities-block". Relabel here so the
+	// install report distinguishes the two.
+	if action.Keys != nil {
+		action.Keys = []string{"gortex-rules-block"}
+	}
+	if !opts.DryRun && action.Action != agents.ActionSkip {
+		internalutil.Logf(env.Stderr, "[gortex install] wrote rule block to %s", path)
+	}
+	return action, nil
 }
 
 func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, error) {
@@ -112,6 +175,7 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 	internalutil.Logf(env.Stderr, "[gortex init] setting up OpenAI Codex CLI integration...")
 
 	path := filepath.Join(env.Home, ".codex", "config.toml")
+	hooksChanged := false
 	action, err := agents.MergeTOML(env.Stderr, path, func(root map[string]any, _ bool) (bool, error) {
 		changed := upsertCodexMCPServer(root, opts)
 		if supported, detectedVersion := codexSupportsDirectToolNamespaces(); supported || codexHasDirectToolNamespaces(root) {
@@ -125,6 +189,7 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		if env.InstallHooks {
 			if upsertCodexHooks(root, env, opts) {
 				changed = true
+				hooksChanged = true
 			}
 		}
 		return changed, nil
@@ -133,6 +198,20 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		return res, err
 	}
 	res.Files = append(res.Files, action)
+	if hooksChanged {
+		res.Warnings = append(res.Warnings, codexHookTrustNotice)
+	}
+
+	// User-level instructions → ~/.codex/AGENTS.md. This is the surface
+	// that makes Codex reach for the graph tools on every turn; see
+	// upsertGlobalInstructions for why the hooks alone do not cover it.
+	if env.Mode == agents.ModeGlobal && env.InstallGlobalInstructions {
+		insAction, err := upsertGlobalInstructions(env, opts)
+		if err != nil {
+			return res, fmt.Errorf("codex global instructions: %w", err)
+		}
+		res.Files = append(res.Files, insAction)
+	}
 
 	// Repo-local community routing → AGENTS.md (also read by
 	// OpenCode; both adapters upsert the same marker-guarded block,

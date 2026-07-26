@@ -153,3 +153,105 @@ func TestProbeGoPackagesLoadableHonorsInjectedLoader(t *testing.T) {
 		t.Fatalf("all-errored load must not be loadable: loadable=%v real=%d errored=%d", loadable, real, errored)
 	}
 }
+
+func writeGoModule(t *testing.T, dir, path string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"),
+		[]byte("module "+path+"\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.go"),
+		[]byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGoModuleRoots(t *testing.T) {
+	t.Run("no manifest", func(t *testing.T) {
+		if roots := goModuleRoots(t.TempDir()); len(roots) != 0 {
+			t.Fatalf("want no roots, got %v", roots)
+		}
+	})
+	t.Run("root manifest is first", func(t *testing.T) {
+		root := t.TempDir()
+		writeProbeFile(t, filepath.Join(root, "go.mod"))
+		writeProbeFile(t, filepath.Join(root, "services", "api", "go.mod"))
+		roots := goModuleRoots(root)
+		if len(roots) != 2 || roots[0] != root {
+			t.Fatalf("root manifest must sort first, got %v", roots)
+		}
+	})
+	t.Run("depth-two module is located, not just detected", func(t *testing.T) {
+		root := t.TempDir()
+		want := filepath.Join(root, "services", "domain-core")
+		writeProbeFile(t, filepath.Join(want, "go.mod"))
+		roots := goModuleRoots(root)
+		if len(roots) != 1 || roots[0] != want {
+			t.Fatalf("want [%s], got %v", want, roots)
+		}
+	})
+}
+
+func TestGoLoadDir(t *testing.T) {
+	t.Run("root manifest keeps the root", func(t *testing.T) {
+		root := t.TempDir()
+		writeProbeFile(t, filepath.Join(root, "go.mod"))
+		writeProbeFile(t, filepath.Join(root, "tools", "go.mod"))
+		dir, n := goLoadDir(root)
+		if dir != root || n != 2 {
+			t.Fatalf("want root dir with 2 roots, got dir=%s n=%d", dir, n)
+		}
+	})
+	t.Run("single nested module becomes the load dir", func(t *testing.T) {
+		root := t.TempDir()
+		want := filepath.Join(root, "backend")
+		writeProbeFile(t, filepath.Join(want, "go.mod"))
+		dir, n := goLoadDir(root)
+		if dir != want || n != 1 {
+			t.Fatalf("want %s with 1 root, got dir=%s n=%d", want, dir, n)
+		}
+	})
+	t.Run("several nested modules stay ambiguous", func(t *testing.T) {
+		root := t.TempDir()
+		writeProbeFile(t, filepath.Join(root, "a", "go.mod"))
+		writeProbeFile(t, filepath.Join(root, "b", "go.mod"))
+		dir, n := goLoadDir(root)
+		if dir != root || n != 2 {
+			t.Fatalf("ambiguous layout must not pick one: dir=%s n=%d", dir, n)
+		}
+	})
+	t.Run("no module reports zero", func(t *testing.T) {
+		root := t.TempDir()
+		if dir, n := goLoadDir(root); dir != root || n != 0 {
+			t.Fatalf("want root/0, got dir=%s n=%d", dir, n)
+		}
+	})
+}
+
+func TestProbeGoPackagesLoadableSubdirModuleLoadsAtItsOwnDir(t *testing.T) {
+	// Same fixture as TestProbeGoPackagesLoadableSubdirModuleRootFailsClosed:
+	// the module lives under backend/. Probed at the ROOT it fails closed,
+	// which is correct — `./...` there is out-of-module. Probed at the
+	// directory that owns the module it loads cleanly, which is the point:
+	// the module is healthy, only the directory was wrong.
+	root := t.TempDir()
+	backend := filepath.Join(root, "backend")
+	writeGoModule(t, backend, "example.com/backend")
+
+	p := &Provider{}
+	if loadable, real, _ := p.probeGoPackagesLoadable(context.Background(), root); loadable || real != 0 {
+		t.Fatalf("root probe must still fail closed: loadable=%v real=%d", loadable, real)
+	}
+
+	dir, n := goLoadDir(root)
+	if dir != backend || n != 1 {
+		t.Fatalf("goLoadDir must select the module dir: dir=%s n=%d", dir, n)
+	}
+	loadable, real, errored := p.probeGoPackagesLoadable(context.Background(), dir)
+	if !loadable || real < 1 {
+		t.Fatalf("module dir must load cleanly: loadable=%v real=%d errored=%d", loadable, real, errored)
+	}
+}

@@ -92,6 +92,27 @@ func (pt *ParseTree) Close() {
 	pt.Release()
 }
 
+// ReleaseTree drops the result's reference to its parse tree, if it
+// holds one. Nil-safe on the result, on the handle, and on repeat
+// calls, so every path that consumes an ExtractionResult can
+// unconditionally `defer result.ReleaseTree()` right after extraction
+// without first knowing whether this language's extractor retains a
+// tree (only the Go extractor does today) or whether the extraction
+// even succeeded.
+//
+// Clearing the field before releasing is what makes the repeat call
+// safe: a second ReleaseTree must not decrement a count the caller no
+// longer owns, which would close the tree out from under a consumer
+// that legitimately holds its own Acquire'd reference.
+func (r *ExtractionResult) ReleaseTree() {
+	if r == nil || r.Tree == nil {
+		return
+	}
+	tree := r.Tree
+	r.Tree = nil
+	tree.Release()
+}
+
 // HasParseErrors reports whether the underlying tree contains any
 // ERROR or MISSING nodes. Returns false for a nil ParseTree so
 // language extractors that drop their tree (most non-Go languages)

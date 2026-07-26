@@ -246,7 +246,7 @@ func (a *Adapter) applyGlobal(env agents.Env, opts agents.ApplyOpts, res *agents
 	// block, the rule only surfaces at deny-time (PreToolUse) which
 	// is late: the agent has already wasted a turn on a forbidden
 	// tool.
-	insDir := instructionsDir(env)
+	insDir := agents.InstructionsDir(env)
 	if env.InstallGlobalInstructions {
 		insAction := agents.FileAction{Path: insDir, Action: agents.ActionMerge, Keys: []string{"instruction-profiles"}}
 		if opts.DryRun {
@@ -368,7 +368,7 @@ func (a *Adapter) RemoveGlobal(env agents.Env, opts agents.ApplyOpts) (removed i
 
 	// 6. Generated instruction profiles — gortex-owned generated
 	// files (plus the tiny active-state record), safe to delete.
-	insDir := instructionsDir(env)
+	insDir := agents.InstructionsDir(env)
 	if _, err := os.Stat(insDir); err == nil {
 		if opts.DryRun {
 			removed++
@@ -611,16 +611,6 @@ func installPermissions(w io.Writer, settingsPath string, opts agents.ApplyOpts)
 		perms["allow"] = allow
 		return true, nil
 	}, opts)
-}
-
-// instructionsDir resolves where the generated instruction profiles
-// live for this install run: the Env override (tests) or the machine
-// default shared with the daemon and the `gortex instructions` verb.
-func instructionsDir(env agents.Env) string {
-	if env.InstructionsDir != "" {
-		return env.InstructionsDir
-	}
-	return profiles.DefaultDir()
 }
 
 // SyncGlobalSkills reconciles ~/.claude/skills/gortex-* with the

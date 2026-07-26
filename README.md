@@ -1,4 +1,3 @@
-
 <div align="center">
 <p align="center">
   <img src="assets/wall.svg" alt="Gortex" width="500">
@@ -19,6 +18,7 @@
 [![Linux](https://img.shields.io/badge/Linux-supported-blue.svg)](#)
 [![Windows](https://img.shields.io/badge/Windows-supported-blue.svg)](#)
 
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Fzzet%2Fgortex.svg)](https://mcptoplist.com/server/glama%2Fzzet%2Fgortex)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/zzet/gortex/badge)](https://scorecard.dev/viewer/?uri=github.com/zzet/gortex)
 [![Go Reference](https://pkg.go.dev/badge/github.com/zzet/gortex.svg)](https://pkg.go.dev/github.com/zzet/gortex)
   <br />

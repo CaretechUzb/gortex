@@ -64,11 +64,9 @@ const CLIENT_NAME = "pi";
 const CLIENT_VERSION = "1.0.0";
 const WIRE_FORMATS: string[] = ["gcx"];
 
-// Names of the Gortex tools registered into Pi — the daemon's bare tool
-// names (search_symbols, tools_search, ...). Registered unprefixed so
-// every name the server's tools_search reply cites is exactly a callable
-// Pi tool; on an (unlikely) collision with another extension's tool,
-// safeRegister leaves the existing registration standing.
+// Names the Gortex tools are registered under in Pi — usually the bare
+// daemon name, except for a few aliased to dodge Pi's built-ins (see
+// piAliasName). Tracks the post-alias name.
 const gortexToolNames = new Set<string>();
 
 // ---------------------------------------------------------------------------
@@ -433,15 +431,48 @@ interface ToolDescriptor {
   inputSchema?: unknown;
 }
 
-// safeRegister registers a Pi tool, tolerating a redundant registration —
-// a config reload can re-fire session_start without resetting the session's
-// tool registry, in which case the name is already live and Pi may throw.
-function safeRegister(pi: any, def: any): void {
+// Pi's reserved built-in names (mirrors toolNameMap's keys). Pi lets an
+// extension silently replace a built-in by reusing its name, but our
+// generic bridge doesn't match the built-in's result shape — breaking
+// Pi's own rendering and any extension hooked to the built-in (e.g. a
+// lint-on-edit plugin). Only "edit"/"read" collide today; checking all
+// seven guards against future facade additions too.
+const PI_RESERVED_TOOL_NAMES = new Set(Object.keys(toolNameMap));
+const PI_ALIAS_PREFIX = "gortex_";
+
+// piAliasName is unchanged unless name collides with a built-in above, in
+// which case it's registered under a `gortex_`-prefixed alias instead.
+function piAliasName(name: string): string {
+  return PI_RESERVED_TOOL_NAMES.has(name) ? PI_ALIAS_PREFIX + name : name;
+}
+
+// piAliasNote tells the model which tools got aliased this session, so it
+// can translate bare names in Gortex's own guidance. Pi-local by design —
+// not a fact any other agent needs.
+function piAliasNote(): string {
+  const aliased = Array.from(gortexToolNames).filter((n) => n.startsWith(PI_ALIAS_PREFIX));
+  if (aliased.length === 0) return "";
+  const pairs = aliased
+    .map((n) => `\`${n.slice(PI_ALIAS_PREFIX.length)}\` -> \`${n}\``)
+    .join(", ");
+  return (
+    `[Gortex] This session renamed these Gortex tools to avoid colliding with Pi's own built-ins ` +
+    `of the same name: ${pairs}. Wherever Gortex's guidance or tool descriptions mention the bare name, call the renamed one instead.`
+  );
+}
+
+// safeRegister registers under the alias name (piAliasName), tolerating a
+// redundant registration — a reload can re-fire session_start without
+// resetting the registry. Returns the name actually registered.
+function safeRegister(pi: any, def: any): string {
+  def.name = piAliasName(def.name);
+  def.label = def.name;
   try {
     pi.registerTool(def);
   } catch {
     // already live this session — the existing registration stands.
   }
+  return def.name;
 }
 
 // Lazily resolved TUI Text component, used only to collapse a gortex
@@ -474,8 +505,7 @@ try {
 function registerOneTool(pi: any, desc: ToolDescriptor): void {
   const name = desc.name;
   if (!name) return;
-  if (gortexToolNames.has(name)) return;
-  gortexToolNames.add(name);
+  if (gortexToolNames.has(piAliasName(name))) return;
   const parameters =
     desc.inputSchema && typeof desc.inputSchema === "object"
       ? desc.inputSchema
@@ -513,7 +543,7 @@ function registerOneTool(pi: any, desc: ToolDescriptor): void {
       return new TuiText!(text, 0, 0);
     };
   }
-  safeRegister(pi, def);
+  gortexToolNames.add(safeRegister(pi, def));
 }
 
 // registerGortexTools fetches the daemon's eager surface (tools/list —
@@ -621,6 +651,8 @@ export default function (pi: any) {
       bridgeError = "";
     }
     if (decision.orientation) parts.push(decision.orientation);
+    const aliasNote = piAliasNote();
+    if (aliasNote) parts.push(aliasNote);
     if (parts.length > 0) {
       pendingOrientation = parts.join("\n\n");
       orientationInjected = true;

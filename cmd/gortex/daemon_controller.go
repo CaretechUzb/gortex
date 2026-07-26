@@ -615,24 +615,32 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 			out.Name = "bleve-memory"
 		}
 		out.DocCount = back.Count()
+		out.DocCountKnown = true
 		out.Bytes = back.SizeBytes()
 	case *search.BM25Backend:
 		out.Name = "bm25"
 		out.DocCount = back.Count()
+		out.DocCountKnown = true
 		out.Bytes = back.SizeBytes()
 	case *search.SymbolSearcherBackend:
 		// The FTS5 index lives inside the graph store's own file, not a
 		// separate in-memory structure — there is no honest byte count
-		// to report here (Count() is only a since-construction delta,
-		// documented as non-authoritative on the adapter itself). Report
-		// the backend truthfully as disk-resident instead of printing a
-		// fabricated "heap=0 B".
+		// to report here. Report the backend truthfully as disk-resident
+		// instead of printing a fabricated "heap=0 B".
+		//
+		// The document count comes from the index itself, never from
+		// Count(): that is a since-construction Add/Remove delta, which
+		// is not a corpus size and goes negative as soon as an eviction
+		// path drops more than the admit predicate ever added. When the
+		// index cannot answer, the figure is omitted rather than filled
+		// in with the delta.
 		out.Name = "sqlite-fts5"
-		out.DocCount = back.Count()
 		out.DiskResident = true
+		out.DocCount, out.DocCountKnown = back.DocCount()
 	default:
 		out.Name = "unknown"
 		out.DocCount = b.Count()
+		out.DocCountKnown = true
 		out.Bytes = search.BackendSize(b)
 	}
 	return out

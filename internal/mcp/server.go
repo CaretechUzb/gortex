@@ -35,7 +35,6 @@ import (
 	"github.com/zzet/gortex/internal/savings"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
-	"github.com/zzet/gortex/internal/server/hub"
 	"github.com/zzet/gortex/internal/telemetry"
 	"github.com/zzet/gortex/internal/tokens"
 )
@@ -146,6 +145,11 @@ type Server struct {
 	// changes with a reindex under a different exclude set, so
 	// daemon-lifetime caching is safe.
 	testIndexProbe sync.Map
+	// trackInFlight guards first-index runs by absolute repo path.
+	// track answers before the index finishes (#326), so without this a
+	// second call for the same path would start a duplicate full index:
+	// TrackRepoCtx's already-tracked check only sees repos that finished.
+	trackInFlight sync.Map
 	// scopeWorkspace / scopeProject default-scope every query at this
 	// server instance to a single (workspace, project) tuple. Set by
 	// `gortex server --workspace <slug> [--scope-project <slug>]`.
@@ -199,6 +203,10 @@ type Server struct {
 	hotspotsReady   bool
 	hotspotsBuildMu sync.Mutex
 	analysisEpoch   uint64
+	// analysisRun tracks the background on-demand analysis pass so a tool
+	// call can report "running, retry in Ns" instead of blocking for
+	// minutes on a whole-graph computation.
+	analysisRun analysisRunState
 	// hotspotsFn is a test seam for deterministic concurrency/invalidation
 	// tests. Production leaves it nil and uses analysis.FindHotspots.
 	hotspotsFn func(graph.Store, *analysis.CommunityResult, float64) []analysis.HotspotEntry
@@ -438,6 +446,15 @@ type Server struct {
 	// service (Pricing). A non-nil override lets a test assert a deterministic
 	// USD estimate from a stubbed usage seam.
 	reviewPricingOverride *llm.ProviderPricing
+
+	// sourceLiteralRecallBudgetOverride replaces the per-anchor wall-clock
+	// slice the bounded source-literal recall may spend. Test-only:
+	// production leaves it zero and gets exploreSourceLiteralRecallBudget.
+	// A test that asserts which owners the recall maps widens the slice so
+	// the answer cannot depend on how loaded the machine is; the tests that
+	// assert deadline behaviour leave it zero. See
+	// pinExploreSourceLiteralRecallBudget.
+	sourceLiteralRecallBudgetOverride time.Duration
 
 	// critiqueLLMGenOverride substitutes the critique_review tool's LLM seam.
 	// Test-only: production leaves it nil and the handler builds the closure
@@ -2653,31 +2670,13 @@ func (s *Server) SetEventRules(rules []config.EventRule) {
 	s.eventRules = rules
 }
 
-// WatchForReanalysis subscribes to hub events and re-runs analysis after
-// a debounce period of inactivity. It runs in a background goroutine.
-func (s *Server) WatchForReanalysis(h *hub.Hub, debounceMs int) {
-	subID, events := h.Subscribe()
-	debounce := time.Duration(debounceMs) * time.Millisecond
-
-	go func() {
-		var timer *time.Timer
-		for ev := range events {
-			_ = ev // any event triggers reanalysis
-			if timer != nil {
-				timer.Stop()
-			}
-			timer = time.AfterFunc(debounce, func() {
-				s.logger.Info("re-running analysis after graph change")
-				s.RunAnalysis()
-			})
-		}
-		// Channel closed — hub is shutting down.
-		if timer != nil {
-			timer.Stop()
-		}
-		_ = subID
-	}()
-}
+// Analysis deliberately has no watcher-driven trigger. Re-running it on every
+// graph change was self-defeating: the pass is minutes of whole-graph work
+// started by a change, so it ran while further changes landed and could never
+// be published against a stable revision. Nothing has to replace it — the
+// currency token is derived from graph state, so a change already makes the
+// snapshot non-current, and the next consumer starts a fresh pass through
+// ensureAnalysis.
 
 // ServeStdio starts the MCP server on stdin/stdout.
 func (s *Server) ServeStdio() error {

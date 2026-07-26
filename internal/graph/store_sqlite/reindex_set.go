@@ -76,7 +76,11 @@ func (s *Store) reindexEdgesSetOriented(batch []graph.EdgeReindex) (sqliteReinde
 	gateErr := s.writeMu.LockContext(gateCtx)
 	cancelGate()
 	if gateErr != nil {
-		return stats, fmt.Errorf("store_sqlite: reindex writer gate: %w", gateErr)
+		// Wrap the recoverable sentinel so ReindexEdges can tell a contended
+		// gate (drop the batch, rebind later) apart from a fatal store error
+		// (panic). gateErr stays wrapped too, so callers still see the
+		// underlying context.DeadlineExceeded / Canceled.
+		return stats, fmt.Errorf("%w: %w", errReindexWriterGateContended, gateErr)
 	}
 	defer s.writeMu.Unlock()
 

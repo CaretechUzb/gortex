@@ -89,7 +89,8 @@ type Env struct {
 	HookMode string
 
 	// InstallGlobalInstructions toggles whether `gortex install`
-	// merges the rule block into ~/.claude/CLAUDE.md. Only honoured
+	// merges the rule block into each agent's user-level instructions
+	// file (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md). Only honoured
 	// in ModeGlobal; ignored elsewhere. Default true so a fresh
 	// install delivers full enforcement; set false by --no-claude-md.
 	InstallGlobalInstructions bool
