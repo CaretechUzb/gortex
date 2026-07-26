@@ -12,7 +12,8 @@ machine. Nineteen adapters ship today.
   hooks where supported, per-agent marker-guarded community-routing
   blocks, and `.claude/skills/generated/` per-community SKILL.md.
 
-Run `gortex init doctor` to see what's currently configured. Both
+Run `gortex doctor` to see what's currently configured — and, past what a
+config file can prove, whether the hooks it declares are actually running. Both
 commands accept `--agents=<csv>` to constrain setup and
 `--agents-skip=<csv>` to exclude an adapter.
 
@@ -137,8 +138,9 @@ gortex init --force                  # overwrite merge-preserved keys
 gortex init --hooks-only             # refresh supported agent hooks only
 
 # Observe-only
-gortex init doctor                   # read-only state report
-gortex init doctor --json            # machine-readable report
+gortex doctor                        # config + hook activity + adoption
+gortex doctor --json                 # machine-readable report
+gortex doctor --redact               # safe to paste into an issue
 ```
 
 ## Adapter contract
@@ -246,6 +248,14 @@ installer says so.
 > installer prints a reminder whenever it writes or changes one). Until then
 > `SessionStart` never fires, which is the surface that puts the Gortex rule
 > in front of the model.
+
+To tell the two states apart, run `gortex doctor`. It correlates the Codex
+config, the hook-invocation log, the Codex session transcripts, and the savings
+ledger into one verdict — *hooks configured but none has run* is the
+untrusted-hook signature, reported as a blocker with the `/hooks` remedy.
+`--redact` hashes repo paths and branch names so the report can be pasted into
+an issue, `--json` emits it machine-readably, and the exit status is non-zero
+when a blocker is found.
 
 When hooks are enabled
 (the default), Codex receives user-level hooks. The default posture remains
