@@ -442,3 +442,28 @@ func normalizeFacadeOperation(value string) string {
 	value = strings.ReplaceAll(value, "-", "_")
 	return value
 }
+
+// facadeOperationAliases resolves the near-misses a caller can only have meant
+// one way. Refusing them is expensive out of proportion to the mistake: a
+// rejected operation costs a whole turn, and a turn costs the caller its entire
+// prompt again, so one guessed word is paid for in tens of thousands of tokens.
+//
+// Only unambiguous names belong here. `symbol` is the singular of the batch
+// form `symbols`, and one symbol's source is exactly `source` — a caller asking
+// to read "symbol" cannot have meant the batch handler.
+var facadeOperationAliases = map[string]map[string]string{
+	"read": {
+		"symbol":            "source",
+		"symbol_source":     "source",
+		"get_symbol_source": "source",
+	},
+}
+
+func resolveFacadeOperationAlias(facade, operation string) string {
+	if byFacade, exists := facadeOperationAliases[facade]; exists {
+		if target, aliased := byFacade[operation]; aliased {
+			return target
+		}
+	}
+	return operation
+}
