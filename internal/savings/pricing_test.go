@@ -78,3 +78,89 @@ func TestPricing_EnvUnsetUsesDefaults(t *testing.T) {
 		t.Errorf("unset env should use defaults, got %d", len(got))
 	}
 }
+
+// TestDefaultPricingCoversCurrentGeneration pins list prices for the model
+// generation gortex's own clients actually run on. A missing row here is not
+// a cosmetic gap: findPrice returns nil for an unknown id and CostAvoided
+// then reports $0.00 next to millions of tokens saved, which reads as "this
+// model avoided nothing" rather than "we have no rate for it".
+func TestDefaultPricingCoversCurrentGeneration(t *testing.T) {
+	// USD per 1M input tokens.
+	want := map[string]float64{
+		"claude-fable-5":    10.00,
+		"claude-mythos-5":   10.00,
+		"claude-opus-5":     5.00,
+		"claude-opus-4-8":   5.00,
+		"claude-sonnet-5":   3.00,
+		"claude-sonnet-4-6": 3.00,
+		"claude-haiku-4-5":  1.00,
+		// OpenAI slugs the codex CLI reports into savings attribution.
+		"gpt-5.6-sol":   5.00,
+		"gpt-5.6-terra": 2.50,
+		"gpt-5.6-luna":  1.00,
+	}
+	for model, rate := range want {
+		got := ModelRate(model)
+		if got == 0 {
+			t.Errorf("ModelRate(%q) = 0 — model missing from the pricing table, so its "+
+				"cost avoided renders as $0.00", model)
+			continue
+		}
+		if got != rate {
+			t.Errorf("ModelRate(%q) = %.2f, want %.2f", model, got, rate)
+		}
+	}
+}
+
+// TestPricingExactMatchBeatsSubstring guards the resolution order that keeps
+// same-family ids from stealing each other's rate — claude-opus-5 must not
+// resolve against claude-opus-4-8, and claude-sonnet-5 must not resolve
+// against claude-sonnet-4-6.
+func TestPricingExactMatchBeatsSubstring(t *testing.T) {
+	if got := CostAvoided(1_000_000, "claude-opus-5"); got != 5.00 {
+		t.Errorf("CostAvoided(1M, claude-opus-5) = %.4f, want 5.00", got)
+	}
+	if got := CostAvoided(1_000_000, "claude-sonnet-5"); got != 3.00 {
+		t.Errorf("CostAvoided(1M, claude-sonnet-5) = %.4f, want 3.00", got)
+	}
+	if got := CostAvoided(1_000_000, "claude-fable-5"); got != 10.00 {
+		t.Errorf("CostAvoided(1M, claude-fable-5) = %.4f, want 10.00", got)
+	}
+}
+
+// TestModelRateReportsUnknownAsZero is the contract formatModelCost relies on
+// to tell "unpriced" apart from "avoided nothing".
+func TestModelRateReportsUnknownAsZero(t *testing.T) {
+	if got := ModelRate("totally-unknown-model-xyz"); got != 0 {
+		t.Errorf("ModelRate(unknown) = %.4f, want 0", got)
+	}
+	if got := ModelRate(""); got != 0 {
+		t.Errorf("ModelRate(\"\") = %.4f, want 0", got)
+	}
+}
+
+// TestPricingGPT56TierDoesNotCollideWithGPT55 guards the substring resolver:
+// the gpt-5.6 tiers and gpt-5.5 are distinct rows, and neither may resolve
+// against the other. gpt-5.6-sol and gpt-5.5 happen to share a rate, so
+// assert on the resolved row rather than only on the dollar figure.
+func TestPricingGPT56TierDoesNotCollideWithGPT55(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		want  float64
+	}{
+		{"gpt-5.6-sol", 5.00},
+		{"gpt-5.6-terra", 2.50},
+		{"gpt-5.6-luna", 1.00},
+		{"gpt-5.5", 5.00},
+		{"gpt-5.4", 2.50},
+	} {
+		if got := ModelRate(tc.model); got != tc.want {
+			t.Errorf("ModelRate(%q) = %.2f, want %.2f", tc.model, got, tc.want)
+		}
+	}
+	// The tiers must not be interchangeable — terra and luna are cheaper
+	// than sol, so a collision would silently misprice a third of a bill.
+	if ModelRate("gpt-5.6-terra") == ModelRate("gpt-5.6-sol") {
+		t.Error("gpt-5.6-terra resolved to the same rate as gpt-5.6-sol — substring collision")
+	}
+}

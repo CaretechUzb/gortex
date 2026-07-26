@@ -202,3 +202,32 @@ func TestEmitSavingsDashboard_EmptyTotals(t *testing.T) {
 		t.Errorf("empty ledger must not print a tracking-since line, got:\n%s", out)
 	}
 }
+
+// TestDefaultHeadlineModelIsPriced pins the invariant behind the dashboard's
+// headline figure. pickHeadlineCost falls back to the highest-value entry
+// when defaultHeadlineModel isn't in the pricing table, so an unpriced
+// headline model silently re-denominates every headline number against a
+// different model instead of failing.
+func TestDefaultHeadlineModelIsPriced(t *testing.T) {
+	if rate := savings.ModelRate(defaultHeadlineModel); rate <= 0 {
+		t.Fatalf("defaultHeadlineModel %q has no pricing row (rate %.4f) — the headline "+
+			"cost would silently re-denominate against another model", defaultHeadlineModel, rate)
+	}
+}
+
+// TestFormatModelCostSeparatesUnpricedFromZero is the fix for a model with
+// millions of tokens saved rendering as $0.0000 purely because the pricing
+// table had never heard of its id.
+func TestFormatModelCostSeparatesUnpricedFromZero(t *testing.T) {
+	if got := formatModelCost(20_676_506, "claude-opus-5"); got != "$103.38" {
+		t.Errorf("formatModelCost(20.68M, claude-opus-5) = %q, want $103.38", got)
+	}
+	if got := formatModelCost(5_000_000, "some-unreleased-model"); got != "unpriced" {
+		t.Errorf("formatModelCost(5M, unknown model) = %q, want \"unpriced\"", got)
+	}
+	// A priced model that genuinely saved nothing still reads as a dollar
+	// amount — that is a real zero, not a missing rate.
+	if got := formatModelCost(0, "claude-opus-5"); got != "$0.0000" {
+		t.Errorf("formatModelCost(0, claude-opus-5) = %q, want $0.0000", got)
+	}
+}
