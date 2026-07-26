@@ -60,7 +60,10 @@ func enrichTask(toolInput map[string]any, port int) enrichResult {
 	}
 
 	if churn := renderSymbolHistory(port); churn != "" {
-		sb.WriteString("### Recently Modified (this session)\n\n")
+		// Not session-scoped: renderSymbolHistory reads the process-global
+		// Server.symHistory, shared by every client of the daemon — and a
+		// subagent turn never wrote any of it.
+		sb.WriteString("### Recently Modified (Gortex-tracked edits on this daemon, all clients)\n\n")
 		sb.WriteString(churn)
 		sb.WriteString("\n")
 	}

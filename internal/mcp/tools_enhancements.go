@@ -455,6 +455,12 @@ func (s *Server) handleCheckGuards(ctx context.Context, req mcp.CallToolRequest)
 	}
 
 	if len(s.guardRules) == 0 && s.architecture.IsEmpty() {
+		// Honor compact here too. This branch used to return JSON regardless,
+		// so a compact caller (the Stop hook) got a raw payload under a
+		// "Guard Violations" heading that had nothing to report.
+		if isCompact(req) {
+			return mcp.NewToolResultText("no guard rules configured\n"), nil
+		}
 		if s.isGCX(ctx, req) {
 			return s.gcxResponseWithBudget(req)(encodeCheckGuards(nil, true))
 		}

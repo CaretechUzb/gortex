@@ -390,8 +390,9 @@ var editGuardsCmd = &cobra.Command{
 // --- edit tests ------------------------------------------------------------
 
 var (
-	editTestsIDs   string
-	editTestsDepth int
+	editTestsIDs     string
+	editTestsDepth   int
+	editTestsCompact bool
 )
 
 var editTestsCmd = &cobra.Command{
@@ -401,8 +402,11 @@ var editTestsCmd = &cobra.Command{
 		if editTestsIDs == "" {
 			return fmt.Errorf("--ids is required (comma-separated symbol IDs)")
 		}
-		return runEditTool(cmd, "get_test_targets",
-			map[string]any{"ids": editTestsIDs, "depth": editTestsDepth}, nil)
+		toolArgs := map[string]any{"ids": editTestsIDs, "depth": editTestsDepth}
+		if editTestsCompact {
+			toolArgs["compact"] = true
+		}
+		return runEditTool(cmd, "get_test_targets", toolArgs, nil)
 	},
 }
 
@@ -582,6 +586,7 @@ func init() {
 	// tests
 	editTestsCmd.Flags().StringVar(&editTestsIDs, "ids", "", "comma-separated changed symbol IDs")
 	editTestsCmd.Flags().IntVar(&editTestsDepth, "depth", 3, "caller traversal depth")
+	editTestsCmd.Flags().BoolVar(&editTestsCompact, "compact", false, "one-line-per-test-file text output")
 
 	// contract
 	editContractCmd.Flags().StringVar(&editContractSource, "source", "", "change source: auto|diff|edit|symbols|ranges")

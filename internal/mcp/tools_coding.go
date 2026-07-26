@@ -92,6 +92,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithDescription("Given changed symbol IDs, traces the call graph to find test files and test functions that exercise those symbols. Use after editing to know exactly which tests to run — no guessing, no running the entire suite."),
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of changed symbol IDs")),
 			mcp.WithNumber("depth", mcp.Description("Caller traversal depth (default: 3)")),
+			mcp.WithBoolean("compact", mcp.Description("One-line-per-test-file text output (file then its test functions), then the run commands, then the uncovered symbol IDs")),
 		),
 		s.handleGetTestTargets,
 	)
@@ -1418,6 +1419,15 @@ func (s *Server) handleGetTestTargets(ctx context.Context, req mcp.CallToolReque
 		})
 	}
 
+	// Both testFiles and its inner func sets are maps, so the loop above
+	// yields a different order on every call — which run_commands then bakes
+	// into its `-run TestA|TestB` join. Sort so the response (and anything
+	// hashing or diffing it) is stable.
+	sort.Slice(targets, func(i, j int) bool { return targets[i].File < targets[j].File })
+	for i := range targets {
+		sort.Strings(targets[i].Functions)
+	}
+
 	// Build run commands (Go-specific for now, extensible later).
 	var runCommands []string
 	for _, t := range targets {
@@ -1439,6 +1449,32 @@ func (s *Server) handleGetTestTargets(ctx context.Context, req mcp.CallToolReque
 		if !coveredSymbols[id] {
 			uncovered = append(uncovered, id)
 		}
+	}
+
+	// Compact text for callers that paste this into a prompt or a hook
+	// briefing — notably the Stop hook, which has always passed compact:true
+	// and, until this branch existed, got a JSON blob pasted into markdown.
+	if isCompact(req) {
+		var b strings.Builder
+		// Sentinel first, so a caller can recognize "nothing covers this"
+		// from the leading line rather than having to scan to the end.
+		if len(targets) == 0 {
+			b.WriteString("no test targets found\n")
+		}
+		for _, t := range targets {
+			if len(t.Functions) > 0 {
+				fmt.Fprintf(&b, "%s %s\n", t.File, strings.Join(t.Functions, " "))
+			} else {
+				fmt.Fprintf(&b, "%s\n", t.File)
+			}
+		}
+		for _, c := range runCommands {
+			fmt.Fprintf(&b, "run: %s\n", c)
+		}
+		if len(uncovered) > 0 {
+			fmt.Fprintf(&b, "uncovered: %s\n", strings.Join(uncovered, " "))
+		}
+		return mcp.NewToolResultText(b.String()), nil
 	}
 
 	return s.respondJSONOrTOON(ctx, req, map[string]any{

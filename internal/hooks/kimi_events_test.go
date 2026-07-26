@@ -91,7 +91,7 @@ func TestRunKimiStopEmitsDiagnostics(t *testing.T) {
 	if strings.Contains(out, "hookSpecificOutput") {
 		t.Fatalf("Kimi Stop should append plain-stdout context, got JSON: %q", out)
 	}
-	if !strings.Contains(out, "Post-Task Diagnostics") || !strings.Contains(out, "TestFoo") {
+	if !strings.Contains(out, "Working-Tree Diagnostics") || !strings.Contains(out, "TestFoo") {
 		t.Fatalf("expected the diagnostics briefing with test targets, got: %q", out)
 	}
 }

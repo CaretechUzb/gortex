@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/zzet/gortex/internal/platform"
 )
@@ -26,7 +27,39 @@ type sessionState struct {
 	// calls (Read / Grep / Glob) since the last symbolic call or nudge.
 	// ModeAdaptiveNudge fires a soft-deny when it crosses the threshold.
 	NonSymbolicStreak int `json:"non_symbolic_streak,omitempty"`
+	// WrittenPaths is the set of file paths (and graph symbol IDs, whose
+	// path part is extracted at match time) this session's tool calls were
+	// about to rewrite. It is what lets a Stop-hook briefing tell this
+	// session's edits apart from a sibling session's on a shared checkout.
+	//
+	// Recorded at PreToolUse, i.e. before the write executes, so a denied
+	// or failed write leaves an entry here that never happened. That is
+	// safe: ownership is only ever tested against files already dirty in
+	// git, and a write that never landed leaves its file clean, so the
+	// stale entry cannot match anything.
+	WrittenPaths []string `json:"written_paths,omitempty"`
+	// WrittenPathsTruncated records that WrittenPaths hit its cap and
+	// stopped accepting new entries, so a briefing can admit that some of
+	// this session's own edits may be missing from the attributed set.
+	WrittenPathsTruncated bool `json:"written_paths_truncated,omitempty"`
+	// UpdatedUnixNano stamps the last write so the janitor can age the
+	// file out even on filesystems with coarse mtimes.
+	UpdatedUnixNano int64 `json:"updated_unix_nano,omitempty"`
 }
+
+const (
+	// sessionWrittenPathsCap bounds the attribution set per session.
+	// Matches localizationTerminalPruneLimit so both hook state stores
+	// read the same.
+	sessionWrittenPathsCap = 256
+	// sessionWritePathsPerCall bounds what one tool call may contribute
+	// (cf. bashWriteProbeLimit for the shell-command probe).
+	sessionWritePathsPerCall = 8
+	// sessionStateTTL / sessionStateHardCap bound the state directory,
+	// mirroring the localization store's constants.
+	sessionStateTTL     = 24 * time.Hour
+	sessionStateHardCap = 128
+)
 
 // hookSessionDirEnvVar lets tests redirect the per-session state
 // directory, parallel to GORTEX_HOOK_LOG for telemetry.
@@ -124,9 +157,15 @@ func saveSessionState(sessionID string, st sessionState) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return
 	}
+	st.UpdatedUnixNano = time.Now().UnixNano()
 	data, err := json.Marshal(st)
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, data, 0o644)
+	if os.WriteFile(path, data, 0o644) != nil {
+		return
+	}
+	// Until write-target capture shipped, nothing called this in the default
+	// posture, so the directory could never grow. It can now, so bound it.
+	trimStateDir(filepath.Dir(path), path, sessionStateTTL, sessionStateHardCap)
 }

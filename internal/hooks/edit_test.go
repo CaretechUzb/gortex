@@ -205,6 +205,61 @@ func TestEditBlockingEnabled_Variants(t *testing.T) {
 	}
 }
 
+// TestPreToolUse_RecordsWriteTargets covers the three placement hazards for
+// the write-target capture: it must survive the auto-approve early return
+// under a permissive permission mode (the primary Gortex write door), it must
+// fire for tools outside preToolUsePolicyTools, and it must stay silent for
+// reads.
+func TestPreToolUse_RecordsWriteTargets(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    []string
+	}{
+		{
+			name:    "host Edit",
+			payload: `{"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Edit","tool_input":{"file_path":"/repo/a.go"}}`,
+			want:    []string{"/repo/a.go"},
+		},
+		{
+			// MultiEdit is not in preToolUsePolicyTools, so capture has to
+			// happen above that gate or this records nothing.
+			name:    "MultiEdit above the policy gate",
+			payload: `{"hook_event_name":"PreToolUse","session_id":"s","tool_name":"MultiEdit","tool_input":{"file_path":"/repo/multi.go"}}`,
+			want:    []string{"/repo/multi.go"},
+		},
+		{
+			// Under acceptEdits every Gortex MCP call short-circuits at the
+			// auto-approve branch; capture has to happen above that too.
+			name:    "gortex edit under acceptEdits",
+			payload: `{"hook_event_name":"PreToolUse","session_id":"s","permission_mode":"acceptEdits","tool_name":"mcp__gortex__edit","tool_input":{"target":{"file":"internal/b.go"}}}`,
+			want:    []string{"internal/b.go"},
+		},
+		{
+			name:    "Read records nothing",
+			payload: `{"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Read","tool_input":{"file_path":"/repo/a.go"}}`,
+			want:    nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withSessionDir(t)
+			captureStdout(t, func() { runPreToolUse([]byte(tc.payload), 0, ModeDeny) })
+
+			got := loadSessionState("s").WrittenPaths
+			if len(got) != len(tc.want) {
+				t.Fatalf("WrittenPaths = %v, want %v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("WrittenPaths[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestEnrichEdit_ReturnsValidJSONWhenWrappedByDispatcher(t *testing.T) {
 	// Sanity: runPreToolUse must produce well-formed deny JSON when
 	// the underlying enrichEdit denies. Catches future regressions

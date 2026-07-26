@@ -270,6 +270,13 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 			"changed_files":   diff.ChangedFiles,
 			"risk":            "NONE",
 			"summary":         "no indexed symbols affected by current changes",
+			// Echo the resolved scope so a caller can name the tree it got
+			// answered about. diffRepoScope prefers an explicit selector, then
+			// the lone tracked repo, then the session cwd — so the caller
+			// cannot derive this from its own cwd without risking a wrong name.
+			"scope":     scope,
+			"repo":      repoPrefix,
+			"repo_root": repoRoot,
 		})
 	}
 
@@ -291,6 +298,11 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		"affected_communities": impact.AffectedCommunities,
 		"test_files":           impact.TestFiles,
 		"total_affected":       impact.TotalAffected,
+		// See the zero-symbol branch above: the resolved scope rides along so
+		// callers can report which working tree these changes came from.
+		"scope":     scope,
+		"repo":      repoPrefix,
+		"repo_root": repoRoot,
 	}
 	applyImpactDepthPaging(detectResult, impact.ByDepth,
 		req.GetBool("summary_only", false),

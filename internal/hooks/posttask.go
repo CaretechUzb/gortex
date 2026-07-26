@@ -7,6 +7,18 @@ import (
 	"time"
 )
 
+// postTaskDiffScope is the detect_changes scope both Stop-hook briefings
+// measure. "all" == `git diff HEAD`: staged and unstaged changes to tracked
+// files. The previous "unstaged" hid staged work entirely, so a session that
+// staged its edits got a briefing about only what it had *not* staged.
+// Untracked files are invisible to every scope — MapGitDiff parses git diff
+// output, which never lists them.
+const postTaskDiffScope = "all"
+
+// postTaskScopePhrase describes postTaskDiffScope in prose. Kept beside the
+// constant so the scope we request and the scope we claim cannot drift.
+const postTaskScopePhrase = "uncommitted (staged + unstaged) changes to tracked files"
+
 // PostTaskInput is the JSON structure Claude Code sends to Stop hooks.
 // stop_hook_active is true when the hook is already being rerun (another
 // Stop hook asked the agent to continue) — we must skip in that case to
@@ -47,7 +59,10 @@ func runPostTask(data []byte, port int) {
 		return
 	}
 
-	briefing := buildPostTaskBriefing(port)
+	briefing := buildPostTaskBriefing(port, sessionScope{
+		SessionID: input.SessionID,
+		CWD:       firstNonEmpty(input.CWD, loadHookCWD()),
+	})
 	if briefing == "" {
 		return
 	}
@@ -66,28 +81,141 @@ func runPostTask(data []byte, port int) {
 	fmt.Print(string(out))
 }
 
-// buildPostTaskBriefing runs diagnostics on the current working tree and
-// returns a compact markdown summary. Returns empty string when there's
-// nothing to report or the bridge is unreachable.
-func buildPostTaskBriefing(port int) string {
+// changedSymbol is one entry of detect_changes' changed_symbols list.
+// FilePath carries the graph node's file, which is repo-prefixed in
+// multi-repo mode while changed_files is not — see attributeChanges.
+type changedSymbol struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+	FilePath string `json:"file_path"`
+}
+
+// changeSet is the slice of a detect_changes response both Stop-hook
+// briefings read. Scope/Repo/RepoRoot are echoed by the handler so the
+// briefing can name the tree it actually diffed instead of guessing.
+type changeSet struct {
+	ChangedFiles   []string        `json:"changed_files"`
+	ChangedSymbols []changedSymbol `json:"changed_symbols"`
+	Risk           string          `json:"risk"`
+	Summary        string          `json:"summary"`
+	Scope          string          `json:"scope"`
+	Repo           string          `json:"repo"`
+	RepoRoot       string          `json:"repo_root"`
+}
+
+// detectChangeSet asks the bridge for the current diff and decodes it.
+// Returns nil when the bridge is unreachable or the payload is unusable.
+func detectChangeSet(port int) *changeSet {
 	raw := callServerTool(port, "detect_changes", map[string]any{
-		"scope": "unstaged",
+		"scope": postTaskDiffScope,
+		// The briefings never read by_depth; summary_only drops the
+		// largest part of the response.
+		"summary_only": true,
 	})
 	if raw == "" {
+		return nil
+	}
+	var changes changeSet
+	if err := json.Unmarshal([]byte(raw), &changes); err != nil {
+		return nil
+	}
+	return &changes
+}
+
+// briefingScope names the working tree detect_changes actually diffed.
+// The daemon echoes repo / repo_root; when an older daemon omits both we
+// say so rather than guessing from the hook cwd — diffRepoScope resolves
+// the tree as explicit-selector → lone-tracked-repo → session cwd, so with
+// several repos tracked a cwd-derived name can label a repo the diff never
+// touched, replacing one wrong claim with a subtler one.
+func briefingScope(repo, repoRoot string) string {
+	switch {
+	case strings.TrimSpace(repoRoot) != "":
+		return "`" + strings.TrimSpace(repoRoot) + "`"
+	case strings.TrimSpace(repo) != "":
+		return "repo `" + strings.TrimSpace(repo) + "`"
+	default:
+		return "the working tree Gortex resolved for this session"
+	}
+}
+
+// changedSymbolIDs projects a changed-symbol list to its IDs, dropping blanks.
+func changedSymbolIDs(symbols []changedSymbol) []string {
+	ids := make([]string, 0, len(symbols))
+	for _, cs := range symbols {
+		if id := strings.TrimSpace(cs.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// ownedRisk returns the blast-radius tier for just the session's own symbols.
+// When the session owns the entire change set there is nothing to recompute,
+// so detect_changes' own risk is reused and the round-trip skipped — the
+// common single-session case. Never falls back to the tree-wide tier on a
+// partition: that number belongs to another session's work.
+func ownedRisk(port int, ownedIDs []string, treeRisk string, ownsAll bool) string {
+	if ownsAll {
+		return treeRisk
+	}
+	if len(ownedIDs) == 0 {
+		return "unknown"
+	}
+	raw := callServerTool(port, "explain_change_impact", map[string]any{
+		"ids":          strings.Join(ownedIDs, ","),
+		"summary_only": true,
+	})
+	if raw == "" {
+		return "unknown"
+	}
+	var impact struct {
+		Risk string `json:"risk"`
+	}
+	if json.Unmarshal([]byte(raw), &impact) != nil || strings.TrimSpace(impact.Risk) == "" {
+		return "unknown"
+	}
+	return impact.Risk
+}
+
+// renderUnattributedFiles names the dirty files this session did not write, so
+// an attribution miss degrades to a mention rather than a disappearance.
+func renderUnattributedFiles(files []string, capped bool) string {
+	if len(files) == 0 {
 		return ""
 	}
-
-	var changes struct {
-		ChangedFiles   []string `json:"changed_files"`
-		ChangedSymbols []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-			Kind string `json:"kind"`
-		} `json:"changed_symbols"`
-		Risk    string `json:"risk"`
-		Summary string `json:"summary"`
+	const show = 5
+	shown := files
+	suffix := ""
+	if len(shown) > show {
+		shown = shown[:show]
+		suffix = fmt.Sprintf(" (+%d more)", len(files)-show)
 	}
-	if err := json.Unmarshal([]byte(raw), &changes); err != nil {
+	quoted := make([]string, len(shown))
+	for i, f := range shown {
+		quoted[i] = "`" + f + "`"
+	}
+	out := "_Also dirty, not attributed to this session:_ " + strings.Join(quoted, ", ") + suffix + "\n"
+	if capped {
+		out += "_This session's tracked-edit set hit its cap, so some of your own edits may be listed above._\n"
+	}
+	return out + "\n"
+}
+
+// buildPostTaskBriefing runs diagnostics on the changes this session made and
+// returns a compact markdown summary. Returns empty string when there's
+// nothing to report or the bridge is unreachable.
+//
+// detect_changes answers about the whole working tree, so on a shared checkout
+// it also carries a sibling session's in-flight edits. attributeChanges splits
+// the result using the write targets PreToolUse recorded for this session; the
+// diagnostics below run over this session's symbols only, and the remainder is
+// named rather than dropped. When the session cannot be identified at all the
+// briefing falls back to the whole tree and labels itself as such.
+func buildPostTaskBriefing(port int, scope sessionScope) string {
+	changes := detectChangeSet(port)
+	if changes == nil {
 		return ""
 	}
 
@@ -97,20 +225,45 @@ func buildPostTaskBriefing(port int) string {
 		return ""
 	}
 
-	ids := make([]string, len(changes.ChangedSymbols))
-	for i, cs := range changes.ChangedSymbols {
-		ids[i] = cs.ID
+	attr := attributeChanges(scope, changes)
+	symbols := changes.ChangedSymbols
+	risk := changes.Risk
+	if attr.Attributed {
+		if len(attr.OwnedSymbols) == 0 {
+			// Every dirty file belongs to somebody else. Say nothing: Stop
+			// fires at the end of every turn, so a session reading code beside
+			// an editing sibling would otherwise get the same notice each time.
+			return ""
+		}
+		symbols = attr.OwnedSymbols
+		risk = ownedRisk(port, changedSymbolIDs(symbols), changes.Risk,
+			len(attr.OwnedSymbols) == len(changes.ChangedSymbols))
 	}
+
+	ids := changedSymbolIDs(symbols)
 	idsCSV := strings.Join(ids, ",")
 
 	var sb strings.Builder
-	sb.WriteString("## Gortex Post-Task Diagnostics\n\n")
-	fmt.Fprintf(&sb, "**Changed:** %d symbols across %d files — risk `%s`.\n\n",
-		len(changes.ChangedSymbols), len(changes.ChangedFiles), changes.Risk)
+	if attr.Attributed {
+		// Only now is "post-task" a true description of the content.
+		sb.WriteString("## Gortex Post-Task Diagnostics\n\n")
+		fmt.Fprintf(&sb, "**Your edits this session:** %d symbol(s) across %d file(s) in %s — risk `%s`.\n\n",
+			len(symbols), len(attr.OwnedFiles), briefingScope(changes.Repo, changes.RepoRoot), risk)
+		sb.WriteString(renderUnattributedFiles(attr.Unattributed, attr.Capped))
+	} else {
+		sb.WriteString("## Gortex Working-Tree Diagnostics\n\n")
+		fmt.Fprintf(&sb, "**Measured:** %d symbol(s) across %d file(s) with %s in %s — aggregate risk `%s`.\n\n",
+			len(symbols), len(changes.ChangedFiles), postTaskScopePhrase,
+			briefingScope(changes.Repo, changes.RepoRoot), risk)
+		sb.WriteString("**Scope:** whole working tree. Gortex does not attribute these changes to a session — " +
+			"this is a diff of everything uncommitted, not a record of your work. Anything left by another agent, " +
+			"a parallel session on this same checkout, or an earlier turn is included below. " +
+			"Untracked (never `git add`ed) files are invisible to this check entirely.\n\n")
+	}
 
 	// Test targets — what to run.
 	if tests := renderTestTargets(port, idsCSV); tests != "" {
-		sb.WriteString("### Tests to Run\n\n")
+		sb.WriteString("### Tests Covering These Symbols\n\n")
 		sb.WriteString(tests)
 		sb.WriteString("\n")
 	}
@@ -124,7 +277,7 @@ func buildPostTaskBriefing(port int) string {
 
 	// Dead code — specifically whether any of the changed symbols are now orphaned.
 	if dead := renderDeadCodeHits(port, ids); dead != "" {
-		sb.WriteString("### Potential Dead Code (among changed symbols)\n\n")
+		sb.WriteString("### Potential Dead Code (among uncommitted symbols)\n\n")
 		sb.WriteString(dead)
 		sb.WriteString("\n")
 	}
@@ -134,7 +287,7 @@ func buildPostTaskBriefing(port int) string {
 	// matched" or just an empty body) — we don't want to nag when the
 	// repo simply doesn't run `gortex enrich coverage`.
 	if gaps := renderCoverageGapsHits(port, ids); gaps != "" {
-		sb.WriteString("### Coverage Gaps (among changed symbols)\n\n")
+		sb.WriteString("### Coverage Gaps (among uncommitted symbols)\n\n")
 		sb.WriteString(gaps)
 		sb.WriteString("\n")
 	}
@@ -143,19 +296,30 @@ func buildPostTaskBriefing(port int) string {
 	// symbols is itself a flag site or toggles one — pointing the agent
 	// at flag rollouts they may have just touched.
 	if flags := renderStaleFlagHits(port, ids); flags != "" {
-		sb.WriteString("### Stale Flag Sites Touched\n\n")
+		sb.WriteString("### Stale Flag Sites Among Uncommitted Symbols\n\n")
 		sb.WriteString(flags)
 		sb.WriteString("\n")
 	}
 
-	// Contract mismatches.
+	// Contract mismatches. `contracts check` has no id filter, so this
+	// section stays repo-wide even when everything above is session-scoped —
+	// label it rather than drop a real signal or imply it is yours.
 	if contracts := renderContractMismatches(port); contracts != "" {
-		sb.WriteString("### API Contract Issues\n\n")
+		if attr.Attributed {
+			sb.WriteString("### API Contract Issues (repo-wide, not attributed to this session)\n\n")
+		} else {
+			sb.WriteString("### API Contract Issues\n\n")
+		}
 		sb.WriteString(contracts)
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("_Run the tests above and review any flagged items before handoff._\n")
+	if attr.Attributed {
+		sb.WriteString("_Run the tests above and resolve any flagged item in your own changes before handoff._\n")
+	} else {
+		sb.WriteString("_Cross-check each finding against the edits you actually made this turn: act on the ones " +
+			"that match, ignore the rest. Do not investigate or \"fix\" changes you did not make._\n")
+	}
 	return sb.String()
 }
 
@@ -164,27 +328,30 @@ func buildPostTaskBriefing(port int) string {
 // symbols first, then asks for tests, guards, and contracts using that observed
 // change set. The hook is advisory: an unavailable daemon or an edit touching
 // no indexed symbol yields no output and never changes the completed mutation.
-func buildMutationBriefing(port int) string {
-	raw := callServerTool(port, "detect_changes", map[string]any{"scope": "unstaged"})
-	if raw == "" {
+//
+// Threaded with the same sessionScope as the Stop briefing so the two share one
+// attribution path. Note that Codex's PreToolUse payload carries no session_id,
+// so nothing is ever recorded for it and it always resolves to the labeled
+// whole-tree fallback — this does not give Codex attribution coverage.
+func buildMutationBriefing(port int, scope sessionScope) string {
+	changes := detectChangeSet(port)
+	if changes == nil || len(changes.ChangedSymbols) == 0 {
 		return ""
 	}
-	var changes struct {
-		ChangedFiles   []string `json:"changed_files"`
-		ChangedSymbols []struct {
-			ID string `json:"id"`
-		} `json:"changed_symbols"`
-		Risk string `json:"risk"`
-	}
-	if json.Unmarshal([]byte(raw), &changes) != nil || len(changes.ChangedSymbols) == 0 {
-		return ""
-	}
-	ids := make([]string, 0, len(changes.ChangedSymbols))
-	for _, symbol := range changes.ChangedSymbols {
-		if strings.TrimSpace(symbol.ID) != "" {
-			ids = append(ids, symbol.ID)
+
+	attr := attributeChanges(scope, changes)
+	symbols := changes.ChangedSymbols
+	risk := changes.Risk
+	if attr.Attributed {
+		if len(attr.OwnedSymbols) == 0 {
+			return ""
 		}
+		symbols = attr.OwnedSymbols
+		risk = ownedRisk(port, changedSymbolIDs(symbols), changes.Risk,
+			len(attr.OwnedSymbols) == len(changes.ChangedSymbols))
 	}
+
+	ids := changedSymbolIDs(symbols)
 	if len(ids) == 0 {
 		return ""
 	}
@@ -192,8 +359,21 @@ func buildMutationBriefing(port int) string {
 
 	var out strings.Builder
 	out.WriteString("## Gortex mutation follow-up\n\n")
-	fmt.Fprintf(&out, "Detected %d affected symbol(s) across %d file(s); risk `%s`.\n\n", len(ids), len(changes.ChangedFiles), changes.Risk)
-	out.WriteString("Affected symbols:\n")
+	if attr.Attributed {
+		fmt.Fprintf(&out, "After this mutation, your session's uncommitted work is %d symbol(s) across %d file(s) "+
+			"in %s; risk `%s`. The set spans everything you have edited this session, not only the patch just "+
+			"applied.\n\n",
+			len(ids), len(attr.OwnedFiles), briefingScope(changes.Repo, changes.RepoRoot), risk)
+		out.WriteString(renderUnattributedFiles(attr.Unattributed, attr.Capped))
+	} else {
+		fmt.Fprintf(&out, "Working-tree scan after this mutation: %d symbol(s) across %d file(s) with %s in %s; "+
+			"aggregate risk `%s`. The scan covers every uncommitted change in the tree, not only the patch just "+
+			"applied — entries that predate this mutation, or that belong to another agent on this checkout, are "+
+			"included.\n\n",
+			len(ids), len(changes.ChangedFiles), postTaskScopePhrase,
+			briefingScope(changes.Repo, changes.RepoRoot), risk)
+	}
+	out.WriteString("Uncommitted symbols in scope:\n")
 	for _, id := range ids {
 		fmt.Fprintf(&out, "- `%s`\n", id)
 	}
@@ -213,7 +393,8 @@ func buildMutationBriefing(port int) string {
 		out.WriteString(contracts)
 		out.WriteString("\n")
 	}
-	out.WriteString("Run the selected tests and resolve any guard or contract findings before handoff.\n")
+	out.WriteString("Run the tests covering the symbols this patch actually changed, and resolve any guard or " +
+		"contract finding the patch introduced. Ignore entries you did not touch.\n")
 	return out.String()
 }
 
@@ -227,7 +408,7 @@ func renderTestTargets(port int, idsCSV string) string {
 	if raw == "" || raw == "no test targets found" {
 		return ""
 	}
-	return cappedLines(raw, 15)
+	return cappedText(raw, 15, 2000)
 }
 
 // renderGuardViolations asks the bridge for .gortex.yaml guard rule violations.
@@ -237,10 +418,14 @@ func renderGuardViolations(port int, idsCSV string) string {
 		"compact": true,
 	})
 	raw = strings.TrimSpace(raw)
-	if raw == "" || strings.HasPrefix(raw, "no guard rule violations") {
+	// Two distinct clean sentinels: no violations found, and no rules to
+	// evaluate in the first place.
+	if raw == "" ||
+		strings.HasPrefix(raw, "no guard rule violations") ||
+		strings.HasPrefix(raw, "no guard rules configured") {
 		return ""
 	}
-	return cappedLines(raw, 10)
+	return cappedText(raw, 10, 1500)
 }
 
 // renderDeadCodeHits filters analyze:dead_code results to the intersection
@@ -365,20 +550,43 @@ func renderStaleFlagHits(port int, ids []string) string {
 	return strings.Join(hits, "\n") + "\n"
 }
 
-// renderContractMismatches runs the contracts check and returns a short list
-// of orphan providers/consumers. Empty when all contracts are matched.
+// renderContractMismatches runs the contracts check and returns only the
+// orphan providers/consumers. Empty when all contracts are matched.
+//
+// The compact summary always opens with `matched: N pairs` followed by one
+// row per matched pair, and puts the orphan counts and rows at the END. So a
+// leading "is it clean?" prefix test can never fire, and a leading line cap
+// truncates the orphan lists — the only actionable part — off the bottom in
+// any repo with enough matched pairs. Locate the orphan block and render from
+// there instead.
 func renderContractMismatches(port int) string {
-	raw := callServerTool(port, "contracts", map[string]any{
+	raw := strings.TrimSpace(callServerTool(port, "contracts", map[string]any{
 		"action":  "check",
 		"compact": true,
-	})
-	raw = strings.TrimSpace(raw)
+	}))
 	if raw == "" {
 		return ""
 	}
-	// The compact summary prefixes "no contract issues" when clean.
-	if strings.HasPrefix(strings.ToLower(raw), "no contract") {
+
+	lines := strings.Split(raw, "\n")
+	orphanStart := -1
+	providers, consumers := 0, 0
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if n, _ := fmt.Sscanf(trimmed, "orphan providers: %d", &providers); n == 1 {
+			if orphanStart < 0 {
+				orphanStart = i
+			}
+			continue
+		}
+		if n, _ := fmt.Sscanf(trimmed, "orphan consumers: %d", &consumers); n == 1 && orphanStart < 0 {
+			orphanStart = i
+		}
+	}
+	// No recognizable orphan block (older or changed compact shape) — suppress
+	// rather than paste an unparsed blob under an "issues" heading.
+	if orphanStart < 0 || (providers == 0 && consumers == 0) {
 		return ""
 	}
-	return cappedLines(raw, 10)
+	return cappedText(strings.TrimSpace(strings.Join(lines[orphanStart:], "\n")), 10, 1500)
 }

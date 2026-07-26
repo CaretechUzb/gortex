@@ -150,10 +150,20 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	}
 	updatedInput := localizationPreToolUpdatedInput(input, localizationAuthToken, terminalTurn.ProblemStatement)
 
+	// Record what this call is about to rewrite, so a Stop-hook briefing can
+	// tell this session's edits apart from a sibling session's on a shared
+	// checkout. Placed here deliberately: after the terminal deny above (a
+	// refused call is never credited) but ahead of both gates below, because
+	// MultiEdit / NotebookEdit are outside preToolUsePolicyTools and every
+	// Gortex MCP write short-circuits at the auto-approve branch under a
+	// permissive permission mode. For a tool that writes nothing this returns
+	// before touching disk, so the no-op contract below still holds.
+	recordSessionWriteTargets(input)
+
 	// The installed matcher is deliberately broad so terminal state can stop
 	// any tool. With no marker, tools outside the historical access-policy
 	// matcher must be an immediate no-op: no daemon probe, classification,
-	// enrichment, or telemetry I/O.
+	// enrichment, or telemetry I/O beyond the write-target record above.
 	if !preToolUsePolicyTool(input.ToolName) {
 		return
 	}
@@ -953,22 +963,11 @@ func cachedDaemonStatus() (*daemon.StatusResponse, error) {
 // resolveFilePath server-side and have the hook forward {cwd, file_path}
 // verbatim — left to the maintainer as it touches a shared handler.
 func repoRootForFile(abs string) string {
-	status, err := cachedDaemonStatus()
-	if err != nil || status == nil {
+	repo, ok := trackedRepoForPath(abs)
+	if !ok {
 		return ""
 	}
-	var best string
-	for _, r := range status.TrackedRepos {
-		if r.Path == "" {
-			continue
-		}
-		if abs == r.Path || strings.HasPrefix(abs, r.Path+string(filepath.Separator)) {
-			if len(r.Path) > len(best) {
-				best = r.Path
-			}
-		}
-	}
-	return best
+	return repo.Path
 }
 
 // parseFileSummaryIndexed unwraps a get_file_summary tools/call response —

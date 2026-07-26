@@ -83,7 +83,9 @@ func buildPreCompactBriefing(port int) string {
 	}
 
 	if churn := renderSymbolHistory(port); churn != "" {
-		sb.WriteString("### Recently Modified Symbols (this session)\n\n")
+		// Not session-scoped: get_symbol_history reads the process-global
+		// Server.symHistory, which every client of a shared daemon writes to.
+		sb.WriteString("### Recently Modified Symbols (Gortex-tracked edits on this daemon, all clients)\n\n")
 		sb.WriteString(churn)
 		sb.WriteString("\n")
 	}
@@ -181,6 +183,23 @@ func cappedLines(s string, max int) string {
 		lines = lines[:max]
 	}
 	return strings.Join(lines, "\n") + "\n"
+}
+
+// cappedText caps s by line count first and then by bytes, so a single
+// enormous line — a JSON payload from a tool that ignored `compact` — cannot
+// blow the briefing budget. cappedLines alone counts newlines, which bounds
+// nothing when the whole payload is one line. The byte cut lands on a line
+// boundary when one exists inside the budget.
+func cappedText(s string, maxLines, maxBytes int) string {
+	out := cappedLines(s, maxLines)
+	if maxBytes <= 0 || len(out) <= maxBytes {
+		return out
+	}
+	cut := out[:maxBytes]
+	if nl := strings.LastIndexByte(cut, '\n'); nl > 0 {
+		cut = cut[:nl]
+	}
+	return cut + "\n… truncated …\n"
 }
 
 // callServerTool resolves a Gortex tool call for a hook handler. Live hook
