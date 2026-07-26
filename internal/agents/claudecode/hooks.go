@@ -19,8 +19,13 @@ import (
 // "Read|Grep|Glob|Task|Bash", or "Read|Grep|Glob|Task|Bash|Edit|Write";
 // upgradeGortexMatcher rewrites those in place. Edit and Write are
 // included so the hook can redirect whole-file rewrites of indexed
-// source to the Gortex MCP edit tools (gated by GORTEX_HOOK_BLOCK_EDIT
-// in the hook itself). The native "*" match-all sentinel lets a local,
+// source to the Gortex MCP edit tools, and Bash carries the same
+// redirect for the shell shapes that rewrite a file (`sed -i`, a `>`
+// redirect, `tee`). All three say so in every posture; whether they also
+// block depends on GORTEX_HOOK_BLOCK_EDIT, which no installed
+// configuration sets, and on the posture itself (`enrich` never denies,
+// `nudge` batches a deny per burst). So today the write redirect is
+// advice everywhere. The native "*" match-all sentinel lets a local,
 // constant-time terminal marker stop any tool after answer_ready without the
 // host evaluating a regular expression for every call.
 const CurrentPreToolUseMatcher = "*"

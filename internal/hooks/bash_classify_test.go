@@ -43,6 +43,8 @@ func TestClassifyBashCommand(t *testing.T) {
 		{"cat .log (not source)", `cat /tmp/app.log`, BashActionPassthrough, ""},
 		{"cat .json", `cat package.json`, BashActionPassthrough, ""},
 		{"cat .go | grep", `cat /repo/x.go | grep foo`, BashActionReadSource, "/repo/x.go"},
+		{"cat .go redirected elsewhere", `cat /repo/x.go > /tmp/out.txt`, BashActionReadSource, "/repo/x.go"},
+		{"cat into a source file is a write, not a read", `cat > /repo/new.go`, BashActionWriteSource, "/repo/new.go"},
 
 		// --- conservative file-list shapes ---
 		{"fd", `fd '\\.go$' internal`, BashActionFileList, ""},
@@ -65,7 +67,7 @@ func TestClassifyBashCommand(t *testing.T) {
 		{"sed high bounded range", `sed -n '5000,5050p' internal/x.go`, BashActionReadRange, "internal/x.go"},
 		{"sed default printing is not bounded", `sed '20,80p' internal/x.go`, BashActionPassthrough, ""},
 		{"sed oversized range stays passthrough", `sed -n '1,5000p' internal/x.go`, BashActionPassthrough, ""},
-		{"sed in-place stays passthrough", `sed -i 's/a/b/' internal/x.go`, BashActionPassthrough, ""},
+		{"sed in-place is a write", `sed -i 's/a/b/' internal/x.go`, BashActionWriteSource, "internal/x.go"},
 		{"awk line range", `awk 'NR>=20 && NR<=80 {print}' internal/x.go`, BashActionReadRange, "internal/x.go"},
 		{"awk oversized range stays passthrough", `awk 'NR>=1 && NR<=5000 {print}' internal/x.go`, BashActionPassthrough, ""},
 		{"awk system stays passthrough", `awk '{system($0)}' internal/x.go`, BashActionPassthrough, ""},
@@ -93,7 +95,7 @@ func TestClassifyBashCommand(t *testing.T) {
 				if got.Pattern != tt.wantExtra {
 					t.Errorf("pattern = %q, want %q", got.Pattern, tt.wantExtra)
 				}
-			case BashActionReadSource, BashActionReadRange:
+			case BashActionReadSource, BashActionReadRange, BashActionWriteSource:
 				if got.Path != tt.wantExtra {
 					t.Errorf("path = %q, want %q", got.Path, tt.wantExtra)
 				}

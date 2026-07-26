@@ -28,14 +28,22 @@ const (
 	// BashActionReadRange is a bounded sed/awk source read. It is never denied
 	// or rewritten; PostToolUse may add graph context for the referenced file.
 	BashActionReadRange
+	// BashActionWriteSource means the command MUTATES a source-looking file —
+	// a shell redirect, `tee`, an in-place editor, or an inline interpreter
+	// script that opens the path for writing. Writes holds every recognised
+	// target and Path the first of them. Appended last on purpose: the value
+	// is compared, never persisted, but renumbering the read actions would
+	// still be a needless diff.
+	BashActionWriteSource
 )
 
 // BashClassification is the result of classifyBashCommand.
 type BashClassification struct {
 	Action  BashAction
-	Pattern string // for GrepLike / FindName
-	Path    string // for ReadSource / ReadRange
-	Primary string // the primary command token (grep, rg, cat, …) — for messages
+	Pattern string      // for GrepLike / FindName
+	Path    string      // for ReadSource / ReadRange / WriteSource
+	Writes  []BashWrite // every recognised write target, for WriteSource
+	Primary string      // the primary command token (grep, rg, cat, …) — for messages
 }
 
 // classifyBashCommand inspects a Bash tool_input.command and returns the first
@@ -43,29 +51,40 @@ type BashClassification struct {
 // (start-of-line or after ; && ||; a segment after a single `|` is a filter on
 // upstream output and is ignored).
 //
+// A recognised write shape is answered before any read shape. A command that
+// both reads and writes source (`cat old.go > new.go`) is a mutation, and the
+// mutation is the fact the caller has to act on. Write recognition is the one
+// part that looks past a pipe, because `… | tee x.go` writes through the
+// segment a read classification would drop.
+//
 // The parser is intentionally small. It respects single/double quotes but
-// does NOT attempt to handle escapes, subshells ($() / backticks), heredocs,
-// or redirects. Anything it can't classify confidently falls through to
-// BashActionPassthrough — the conservative answer since a false deny is more
-// disruptive than a miss.
+// does NOT attempt to handle escapes or subshells ($() / backticks). Anything
+// it can't classify confidently falls through to BashActionPassthrough — the
+// conservative answer since a false deny is more disruptive than a miss.
 func classifyBashCommand(cmd string) BashClassification {
+	if writes := classifyBashWriteTargets(cmd); len(writes) > 0 {
+		return BashClassification{
+			Action:  BashActionWriteSource,
+			Path:    writes[0].Path,
+			Writes:  writes,
+			Primary: writes[0].Shape,
+		}
+	}
+	return classifyBashReadCommand(cmd)
+}
+
+// classifyBashReadCommand is classifyBashCommand without the write pre-pass.
+// Whether a write target matters is only knowable from the daemon, so a
+// command that writes an untracked path and reads indexed source in the same
+// breath has to be able to come back here for the read answer rather than
+// losing it to a write classification that turned out not to apply.
+func classifyBashReadCommand(cmd string) BashClassification {
 	for _, seg := range primarySegments(cmd) {
-		tokens := tokenize(seg)
-		if len(tokens) == 0 {
-			continue
-		}
-		// Skip over `sudo` / `time` / env assignments (FOO=bar cmd).
-		for len(tokens) > 0 && (tokens[0] == "sudo" || tokens[0] == "time" || strings.Contains(tokens[0], "=")) {
-			if strings.Contains(tokens[0], "=") && !strings.HasPrefix(tokens[0], "-") {
-				tokens = tokens[1:]
-				continue
-			}
-			if tokens[0] == "sudo" || tokens[0] == "time" {
-				tokens = tokens[1:]
-				continue
-			}
-			break
-		}
+		// A redirect names where output goes, not what the command reads:
+		// without removing it, `cat internal/x.go > /tmp/out.go` reports
+		// /tmp/out.go as the file being read and the indexed read is lost.
+		command, _ := splitSegmentRedirects(seg)
+		tokens := skipCommandPrefix(tokenize(command))
 		if len(tokens) == 0 {
 			continue
 		}
@@ -104,45 +123,83 @@ func classifyBashCommand(cmd string) BashClassification {
 	return BashClassification{Action: BashActionPassthrough}
 }
 
-// primarySegments splits cmd on ; && || and returns the segments that are
-// primary commands (everything up to the first `|` inside each statement).
-// Segments that appear after a single `|` are not primary and are dropped.
-func primarySegments(cmd string) []string {
+// skipCommandPrefix drops the leading `sudo` / `time` wrappers and env
+// assignments (FOO=bar cmd) so the first remaining token is the command.
+func skipCommandPrefix(tokens []string) []string {
+	for len(tokens) > 0 && (tokens[0] == "sudo" || tokens[0] == "time" || strings.Contains(tokens[0], "=")) {
+		if strings.Contains(tokens[0], "=") && !strings.HasPrefix(tokens[0], "-") {
+			tokens = tokens[1:]
+			continue
+		}
+		if tokens[0] == "sudo" || tokens[0] == "time" {
+			tokens = tokens[1:]
+			continue
+		}
+		break
+	}
+	return tokens
+}
+
+// primarySegments splits cmd on newlines and ; && || and returns the segments
+// that are primary commands (everything up to the first `|` inside each
+// statement). Segments after a single `|` are not primary and are dropped, and
+// heredoc payloads are not commands at all — see splitCommandSegments.
+func primarySegments(cmd string) []string { return splitCommandSegments(cmd, false) }
+
+// allCommandSegments splits cmd the same way but keeps the segments a pipe
+// would filter out. Write recognition needs them: the mutation in
+// `go run ./gen | tee internal/x.go` lives entirely after the pipe.
+func allCommandSegments(cmd string) []string { return splitCommandSegments(cmd, true) }
+
+// splitCommandSegments returns the commands in cmd. A newline separates
+// statements exactly as `;` does — without that, one line break hides every
+// following command from classification. Heredoc payloads are removed first:
+// what an agent writes into a file is data, and a shell snippet quoted inside
+// it must never be read as a command of its own.
+func splitCommandSegments(cmd string, keepPiped bool) []string {
+	cmd, _ = splitHeredocs(cmd)
 	var out []string
-	var cur strings.Builder
+	cur := make([]byte, 0, len(cmd))
 	inSingle, inDouble := false, false
 	primary := true
 	i, n := 0, len(cmd)
 	flush := func() {
-		if primary {
-			s := strings.TrimSpace(cur.String())
-			if s != "" {
+		if primary || keepPiped {
+			if s := strings.TrimSpace(string(cur)); s != "" {
 				out = append(out, s)
 			}
 		}
-		cur.Reset()
+		cur = cur[:0]
 	}
 	for i < n {
 		c := cmd[i]
 		if c == '\'' && !inDouble {
 			inSingle = !inSingle
-			cur.WriteByte(c)
+			cur = append(cur, c)
 			i++
 			continue
 		}
 		if c == '"' && !inSingle {
 			inDouble = !inDouble
-			cur.WriteByte(c)
+			cur = append(cur, c)
 			i++
 			continue
 		}
 		if inSingle || inDouble {
-			cur.WriteByte(c)
+			cur = append(cur, c)
+			i++
+			continue
+		}
+		// A trailing backslash continues the statement onto the next line, so
+		// the newline is whitespace rather than a boundary. Splitting there
+		// would cut an invocation in half and hide its operands.
+		if c == '\n' && len(cur) > 0 && cur[len(cur)-1] == '\\' {
+			cur[len(cur)-1] = ' '
 			i++
 			continue
 		}
 		// Statement boundaries reset "primary" to true.
-		if c == ';' {
+		if c == ';' || c == '\n' {
 			flush()
 			primary = true
 			i++
@@ -160,6 +217,12 @@ func primarySegments(cmd string) []string {
 			i += 2
 			continue
 		}
+		// `>|` is one redirect operator, not a redirect followed by a pipe.
+		if c == '|' && i > 0 && cmd[i-1] == '>' {
+			cur = append(cur, c)
+			i++
+			continue
+		}
 		// Single `|` ends primary; stay non-primary until next statement.
 		if c == '|' {
 			flush()
@@ -167,7 +230,7 @@ func primarySegments(cmd string) []string {
 			i++
 			continue
 		}
-		cur.WriteByte(c)
+		cur = append(cur, c)
 		i++
 	}
 	flush()

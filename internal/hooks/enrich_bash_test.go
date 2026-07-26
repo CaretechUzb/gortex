@@ -170,6 +170,165 @@ func TestEnrichBash_UnrelatedCommand(t *testing.T) {
 	}
 }
 
+// probedIndexedBridge stubs the daemon file-indexed probe and records every
+// path it was asked about, so a test can assert the write path stays within
+// its probe budget.
+func probedIndexedBridge(t *testing.T, indexed map[string]bool) *[]string {
+	t.Helper()
+	probes := &[]string{}
+	prev := fileIndexedFn
+	t.Cleanup(func() { fileIndexedFn = prev })
+	fileIndexedFn = func(_, filePath string) (bool, int) {
+		*probes = append(*probes, filePath)
+		if indexed[filePath] {
+			return true, 4
+		}
+		return false, 0
+	}
+	return probes
+}
+
+func TestEnrichBash_WriteIndexedSource_AdvisesWhenBlockingOff(t *testing.T) {
+	redirectTelemetry(t)
+	withEditBlocking(t, false)
+	newIndexedBridge(t, 4)
+
+	r := enrichBash(map[string]any{"command": `sed -i 's/a/b/' internal/x.go`}, "")
+	if r.deny {
+		t.Fatalf("shell write must not hard-block without the env gate, got %+v", r)
+	}
+	for _, want := range []string{"internal/x.go", "parse gate", `edit(operation:"file"`} {
+		if !strings.Contains(r.context, want) {
+			t.Errorf("context missing %q:\n%s", want, r.context)
+		}
+	}
+	if strings.Contains(r.context, "BLOCKED") {
+		t.Error("advisory context must not claim the command was blocked")
+	}
+}
+
+func TestEnrichBash_WriteIndexedSource_DeniesUnderEnvGate(t *testing.T) {
+	redirectTelemetry(t)
+	withEditBlocking(t, true)
+	newIndexedBridge(t, 4)
+
+	r := enrichBash(map[string]any{"command": "cat > internal/x.go <<'EOF'\npackage x\nEOF"}, "")
+	if !r.deny {
+		t.Fatalf("expected deny for a shell write to indexed source, got %+v", r)
+	}
+	for _, want := range []string{"BLOCKED", "internal/x.go", `edit(operation:"write"`, "GORTEX_HOOK_BLOCK_EDIT"} {
+		if !strings.Contains(r.reason, want) {
+			t.Errorf("reason missing %q:\n%s", want, r.reason)
+		}
+	}
+}
+
+func TestEnrichBash_WriteRecordsRedirectDecision(t *testing.T) {
+	logPath := redirectTelemetry(t)
+	withEditBlocking(t, true)
+	newIndexedBridge(t, 4)
+
+	_ = enrichBash(map[string]any{"command": `sed -i 's/a/b/' internal/x.go`}, "")
+
+	recs := readDecisions(t, logPath)
+	if len(recs) != 1 {
+		t.Fatalf("expected 1 telemetry record, got %d", len(recs))
+	}
+	if recs[0].Tool != "Bash" || recs[0].Decision != DecisionRedirectedWrite {
+		t.Errorf("record = %+v, want Bash/redirected_write", recs[0])
+	}
+}
+
+func TestEnrichBash_WriteNewFile_PassesThrough(t *testing.T) {
+	// A file the graph does not know is a new file; enrichWrite lets that
+	// through for Write and the shell door has to agree.
+	withEditBlocking(t, true)
+	fakeIndexedBridge(t, map[string]bool{"internal/existing.go": true})
+
+	r := enrichBash(map[string]any{"command": `cat > internal/new.go`}, "")
+	if r.deny || r.context != "" {
+		t.Errorf("write to an unindexed path should pass through, got %+v", r)
+	}
+}
+
+func TestEnrichBash_WriteNonSourceTarget_NoProbe(t *testing.T) {
+	withEditBlocking(t, true)
+	probes := probedIndexedBridge(t, map[string]bool{})
+
+	for _, cmd := range []string{
+		`go test -race ./... > /tmp/test.log 2>&1`,
+		`go build -o gortex ./cmd/gortex/`,
+		`gortex guide > docs/notes.md`,
+	} {
+		if r := enrichBash(map[string]any{"command": cmd}, ""); r.deny || r.context != "" {
+			t.Errorf("%q should pass through, got %+v", cmd, r)
+		}
+	}
+	if len(*probes) != 0 {
+		t.Errorf("non-source write targets must not probe the daemon, got %v", *probes)
+	}
+}
+
+func TestEnrichBash_WriteAfterPipe_IsGuarded(t *testing.T) {
+	redirectTelemetry(t)
+	withEditBlocking(t, true)
+	probes := probedIndexedBridge(t, map[string]bool{"internal/x.go": true})
+
+	r := enrichBash(map[string]any{"command": `go run ./gen | tee internal/x.go`}, "")
+	if !r.deny {
+		t.Fatalf("a write after a pipe is still a write, got %+v", r)
+	}
+	if len(*probes) != 1 || (*probes)[0] != "internal/x.go" {
+		t.Errorf("probes = %v, want exactly internal/x.go", *probes)
+	}
+}
+
+func TestEnrichBash_WriteProbesBoundedByCandidateLimit(t *testing.T) {
+	redirectTelemetry(t)
+	withEditBlocking(t, true)
+	probes := probedIndexedBridge(t, map[string]bool{"internal/c.go": true})
+
+	r := enrichBash(map[string]any{
+		"command": `echo a > internal/a.go; echo b > internal/b.go; echo c > internal/c.go; echo d > internal/d.go`,
+	}, "")
+	if !r.deny {
+		t.Fatalf("expected deny once a candidate is indexed, got %+v", r)
+	}
+	if !strings.Contains(r.reason, "internal/c.go") {
+		t.Errorf("reason should name the indexed target:\n%s", r.reason)
+	}
+	if len(*probes) > bashWriteProbeLimit {
+		t.Errorf("probed %d paths, budget is %d: %v", len(*probes), bashWriteProbeLimit, *probes)
+	}
+}
+
+func TestEnrichBash_UnindexedWriteFallsBackToReadAnswer(t *testing.T) {
+	// The write pre-pass claims this command, but /tmp/scratch.go is not in
+	// the graph. The indexed read in the same command must still be answered.
+	redirectTelemetry(t)
+	withEditBlocking(t, true)
+	probedIndexedBridge(t, map[string]bool{"internal/x.go": true})
+
+	r := enrichBash(map[string]any{"command": `sed -i 's/a/b/' /tmp/scratch.go && cat internal/x.go`}, "")
+	if !r.deny {
+		t.Fatalf("expected the read deny to survive an inapplicable write shape, got %+v", r)
+	}
+	if !strings.Contains(r.reason, "reads indexed source") {
+		t.Errorf("expected the read answer, got:\n%s", r.reason)
+	}
+}
+
+func TestEnrichBash_WriteDispatchedFromEnrich(t *testing.T) {
+	redirectTelemetry(t)
+	withEditBlocking(t, true)
+	newIndexedBridge(t, 4)
+
+	input := HookInput{ToolName: "Bash", ToolInput: map[string]any{"command": `sed -i 's/a/b/' internal/x.go`}}
+	if r := enrich(input, 0); !r.deny {
+		t.Errorf("dispatcher must route a Bash write through enrichBash; got %+v", r)
+	}
+}
+
 func TestEnrichBash_TelemetryTaggedAsBash(t *testing.T) {
 	logPath := redirectTelemetry(t)
 	stubProbe(t, []grepSymbolHit{

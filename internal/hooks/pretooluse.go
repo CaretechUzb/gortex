@@ -313,13 +313,16 @@ func emitPreToolUse(output HookOutput) {
 }
 
 // downgradeReason picks the human text to surface when a deny is
-// softened to additionalContext: the deny reason if present, else the
-// advisory context. Shared by ModeEnrich and ModeConsultUnlock.
+// softened to additionalContext. An advisory rendering of the same
+// message wins when the enrichment supplied one: the call is about to
+// proceed, so telling the agent it was BLOCKED and how to unset a flag
+// would be two false statements in one line. Shared by ModeEnrich and
+// ModeConsultUnlock.
 func downgradeReason(result enrichResult) string {
-	if result.reason != "" {
-		return result.reason
+	if result.context != "" {
+		return result.context
 	}
-	return result.context
+	return result.reason
 }
 
 // consultUnlockReason augments a hard deny reason with the one-line
@@ -1001,10 +1004,11 @@ func parseFileSummaryIndexed(resp []byte) (bool, int) {
 }
 
 // enrichBash classifies the Bash command and routes codebase-search shapes
-// through the same graph probes the Grep and Read enrichments use. Anything
-// not recognised as a codebase search passes through silently — false-deny
-// is more disruptive than a miss, so the classifier only flags primary
-// grep/rg/find-name/cat-source invocations.
+// through the same graph probes the Grep and Read enrichments use, and shell
+// mutations of indexed source through the same answer Edit and Write get.
+// Anything not recognised passes through silently — false-deny is more
+// disruptive than a miss, so the classifier only flags primary
+// grep/rg/find-name/cat-source invocations and recognised write shapes.
 func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 	cmd, _ := toolInput["command"].(string)
 	if cmd == "" {
@@ -1012,6 +1016,15 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 	}
 
 	c := classifyBashCommand(cmd)
+	if c.Action == BashActionWriteSource {
+		if result, answered := enrichBashWrite(c, cwd); answered {
+			return result
+		}
+		// The write targets are all outside the graph. Whatever the command
+		// also reads still deserves the read answer, so re-read it without
+		// the write pre-pass instead of returning silence.
+		c = classifyBashReadCommand(cmd)
+	}
 	switch c.Action {
 	case BashActionGrepLike:
 		return probeSymbolPattern("Bash", c.Pattern, defaultGrepGuidance())
@@ -1047,6 +1060,48 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 	}
 
 	return enrichResult{}
+}
+
+// enrichBashWrite answers a shell command that would mutate indexed source.
+// The shell is the write door that skips both the graph-aware edit tools and
+// the pre-write parse gate, and it used to be the one door that said nothing
+// at all — so an agent that fell back to `sed -i` once had no reason to ever
+// come back. It now gets the same answer Edit and Write get, at the same
+// strength.
+//
+// A path the daemon does not know is left alone, mirroring enrichWrite:
+// writing a new file is not a graph operation yet. The second return reports
+// whether the write shape was answered at all, so the caller can fall back to
+// the read classification when it was not.
+func enrichBashWrite(c BashClassification, cwd string) (enrichResult, bool) {
+	started := time.Now()
+	write, symbolCount, indexed := firstIndexedWriteTarget(c.Writes, cwd)
+	if !indexed {
+		return enrichResult{}, false
+	}
+	logHookDecision("Bash", "", DecisionRedirectedWrite, symbolCount, time.Since(started))
+	return writeRedirect(
+		fmt.Sprintf(
+			"Bash `%s` writes %s (indexed source, %d symbols). A shell write goes around the graph, which only catches up afterwards, and around the parse gate `edit` runs before it touches disk. Use:",
+			write.Shape, write.Path, symbolCount),
+		"`edit(operation:\"symbol\", target:{symbol:\"<id>\"})` for one symbol",
+		"`edit(operation:\"file\", target:{file:\"<path>\"})` for a guarded replacement — this one parse-gates",
+		"`edit(operation:\"write\", target:{file:\"<path>\"})` for a whole-file write — this one too",
+		"`refactor(operation:\"rename\")` for a coordinated rename",
+	), true
+}
+
+// firstIndexedWriteTarget returns the first recognised target the daemon
+// confirms is indexed. Candidates are already capped at bashWriteProbeLimit,
+// so a compound command costs a bounded number of probes rather than one per
+// redirect.
+func firstIndexedWriteTarget(writes []BashWrite, cwd string) (BashWrite, int, bool) {
+	for _, write := range writes {
+		if indexed, symbolCount := queryFileIndexed(cwd, write.Path); indexed {
+			return write, symbolCount, true
+		}
+	}
+	return BashWrite{}, 0, false
 }
 
 // daemonReachableFn is the seam tests use to fake daemon availability
@@ -1205,19 +1260,47 @@ func isGreedySourceGlob(pattern string) bool {
 	return stem == "*" || stem == "**"
 }
 
-// editBlockingEnvVar gates Edit/Write enforcement. We ship behind a
-// flag because Edit/Write redirects are higher-blast-radius than
-// Read/Grep — false positives stop the agent from making any
-// progress at all. Once we have field telemetry showing the
-// classifier is reliable, the gate can flip default-on or be
-// removed.
+// editBlockingEnvVar gates how hard a write redirect lands, not whether
+// it happens. A false positive on a write stops the agent from making
+// progress at all, so blocking stays opt-in; but a write door that says
+// nothing is how the shell quietly became the default one, so every door
+// speaks in every posture and only the strength is gated.
 const editBlockingEnvVar = "GORTEX_HOOK_BLOCK_EDIT"
 
-// editBlockingEnabled reports whether the env-gated Edit/Write
-// redirect is on. Anything besides empty/"0"/"false"/"no"/"off"
-// enables.
+// editBlockingEnabled reports whether a write redirect blocks rather
+// than advises. Anything besides empty/"0"/"false"/"no"/"off" enables.
 func editBlockingEnabled() bool {
 	return envGateEnabled(editBlockingEnvVar)
+}
+
+// writeRedirect renders the one answer every write door gives for a
+// mutation of indexed source: what was written, why the graph path is
+// different, and which operation to use instead. Edit, Write, and a shell
+// write share it so no door can drift into being the quiet one — the whole
+// failure this guards against is an agent finding the door that says nothing.
+func writeRedirect(subject string, alternatives ...string) enrichResult {
+	var body strings.Builder
+	body.WriteString(subject)
+	body.WriteString("\n")
+	for _, alternative := range alternatives {
+		fmt.Fprintf(&body, "  - %s\n", alternative)
+	}
+	body.WriteString("\n")
+	body.WriteString(toolref.MCPRequiredLine())
+
+	advisory := "[Gortex] " + body.String()
+	if !editBlockingEnabled() {
+		return enrichResult{context: advisory}
+	}
+	// The advisory text rides along with the deny. A posture that downgrades
+	// a deny reads `context`, and handing it an empty string is how a blocking
+	// door ends up quieter than an advisory one.
+	return enrichResult{
+		deny: true,
+		reason: "[Gortex] BLOCKED: " + body.String() +
+			"To bypass this redirect: unset GORTEX_HOOK_BLOCK_EDIT, or target a path outside the tracked repos.\n",
+		context: advisory,
+	}
 }
 
 // envGateEnabled reports whether a boolean env-var gate is on. Empty,
@@ -1233,60 +1316,46 @@ func envGateEnabled(name string) bool {
 }
 
 // enrichEdit redirects whole-file edits of indexed source to the
-// Gortex MCP edit tools. Behind GORTEX_HOOK_BLOCK_EDIT until the
-// classifier is proven; without it the hook is a no-op so Edit
-// behaves exactly as it did pre-feature.
+// Gortex MCP edit tools, which don't require a prior Read and update the
+// graph atomically. Advisory by default and a hard block under
+// GORTEX_HOOK_BLOCK_EDIT.
 func enrichEdit(toolInput map[string]any, cwd string) enrichResult {
-	if !editBlockingEnabled() {
-		return enrichResult{}
-	}
-	filePath, ok := toolInput["file_path"].(string)
-	if !ok || filePath == "" {
-		return enrichResult{}
-	}
-	if !looksLikeSourceFile(filePath) {
-		return enrichResult{}
-	}
-	indexed, _ := queryFileIndexed(cwd, filePath)
+	filePath, indexed := indexedSourceTarget(toolInput, cwd)
 	if !indexed {
 		return enrichResult{}
 	}
+	return writeRedirect(
+		fmt.Sprintf("Edit of %s (indexed source). Use Gortex MCP edit tools — they don't require a prior Read and update the graph atomically:", filePath),
+		"choose `edit` operation `symbol`, `file`, or `batch`; for example `edit(operation:\"file\", target:{file:\"<path>\"})`",
+		"`refactor(operation:\"rename\")` for a coordinated rename",
+	)
+}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "[Gortex] BLOCKED: Edit of %s (indexed source). Use Gortex MCP edit tools — they don't require a prior Read and update the graph atomically:\n", filePath)
-	b.WriteString("  - choose `edit` operation `symbol`, `file`, or `batch`; for example `edit(operation:\"file\", target:{file:\"<path>\"})`\n")
-	b.WriteString("  - `refactor(operation:\"rename\")` for a coordinated rename\n\n")
-	b.WriteString(toolref.MCPRequiredLine())
-	b.WriteString("To bypass this redirect: unset GORTEX_HOOK_BLOCK_EDIT, or target a file outside the tracked repos.\n")
-	return enrichResult{deny: true, reason: b.String()}
+// indexedSourceTarget resolves a tool input's file_path and reports whether
+// the daemon knows it as source. A path outside the graph is a new file, which
+// the graph has no opinion about yet.
+func indexedSourceTarget(toolInput map[string]any, cwd string) (string, bool) {
+	filePath, ok := toolInput["file_path"].(string)
+	if !ok || filePath == "" || !looksLikeSourceFile(filePath) {
+		return "", false
+	}
+	indexed, _ := queryFileIndexed(cwd, filePath)
+	return filePath, indexed
 }
 
 // enrichWrite mirrors enrichEdit for whole-file Write. New files
 // (not yet indexed) pass through; rewrites of existing indexed
 // files are redirected to `edit_file` / `write_file`.
 func enrichWrite(toolInput map[string]any, cwd string) enrichResult {
-	if !editBlockingEnabled() {
-		return enrichResult{}
-	}
-	filePath, ok := toolInput["file_path"].(string)
-	if !ok || filePath == "" {
-		return enrichResult{}
-	}
-	if !looksLikeSourceFile(filePath) {
-		return enrichResult{}
-	}
-	indexed, _ := queryFileIndexed(cwd, filePath)
+	filePath, indexed := indexedSourceTarget(toolInput, cwd)
 	if !indexed {
 		return enrichResult{}
 	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "[Gortex] BLOCKED: Write of %s (indexed source — would overwrite existing tracked file). Use:\n", filePath)
-	b.WriteString("  - `edit(operation:\"write\")` for a whole-file write\n")
-	b.WriteString("  - `edit(operation:\"file\")` for a guarded replacement\n\n")
-	b.WriteString(toolref.MCPRequiredLine())
-	b.WriteString("To bypass: unset GORTEX_HOOK_BLOCK_EDIT, or target a path outside tracked repos.\n")
-	return enrichResult{deny: true, reason: b.String()}
+	return writeRedirect(
+		fmt.Sprintf("Write of %s (indexed source — would overwrite existing tracked file). Use:", filePath),
+		"`edit(operation:\"write\")` for a whole-file write",
+		"`edit(operation:\"file\")` for a guarded replacement",
+	)
 }
 
 func looksLikeSourceFile(path string) bool {
