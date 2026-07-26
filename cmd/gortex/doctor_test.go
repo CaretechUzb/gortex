@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/agents"
@@ -94,4 +96,72 @@ func TestDoctorVerifiesPathDaemonAndStaleStanza(t *testing.T) {
 			t.Errorf("a non-JSON file must be ignored; got (%q,%v)", st, ok)
 		}
 	})
+}
+
+// TestDoctorCollapsesUninstalledAdapters: the adapter section describes the
+// machine the user has. An agent that is neither installed nor holding Gortex
+// files contributes only planned paths for writes that will never happen —
+// and one such agent can contribute twenty, burying the lines that matter.
+func TestDoctorCollapsesUninstalledAdapters(t *testing.T) {
+	reports := []DoctorAgentReport{
+		{Name: "claude-code", Detected: true, Configured: true, Files: []DoctorFileStatus{
+			{Path: "/repo/.mcp.json", Status: "present", ByteSize: 12},
+		}},
+		{Name: "hermes", Detected: false, Configured: false, Files: []DoctorFileStatus{
+			{Path: "/home/u/.hermes/skills/a/SKILL.md", Status: "missing", Planned: "would-create"},
+			{Path: "/home/u/.hermes/skills/b/SKILL.md", Status: "missing", Planned: "would-create"},
+		}},
+		{Name: "zed", Detected: false, Configured: false},
+	}
+
+	t.Run("collapsed by default", func(t *testing.T) {
+		doctorAll = false
+		var buf bytes.Buffer
+		printDoctorHuman(&buf, reports)
+		got := buf.String()
+
+		if strings.Contains(got, "SKILL.md") {
+			t.Errorf("planned files for an uninstalled agent should be hidden:\n%s", got)
+		}
+		if !strings.Contains(got, "not installed (2): hermes, zed") {
+			t.Errorf("absent agents should still be named:\n%s", got)
+		}
+		if !strings.Contains(got, "/repo/.mcp.json") {
+			t.Errorf("detected agents keep their detail:\n%s", got)
+		}
+	})
+
+	t.Run("--all restores the listing", func(t *testing.T) {
+		doctorAll = true
+		t.Cleanup(func() { doctorAll = false })
+		var buf bytes.Buffer
+		printDoctorHuman(&buf, reports)
+		if !strings.Contains(buf.String(), "SKILL.md") {
+			t.Errorf("--all should list everything:\n%s", buf.String())
+		}
+	})
+}
+
+// TestDoctorKeepsLeftoverConfig: an agent that is gone but still holds Gortex
+// files is not noise — it is stale config the user probably wants to clean up,
+// so it survives the collapse and says why it is there.
+func TestDoctorKeepsLeftoverConfig(t *testing.T) {
+	doctorAll = false
+	var buf bytes.Buffer
+	printDoctorHuman(&buf, []DoctorAgentReport{
+		{Name: "windsurf", Detected: false, Configured: true, Files: []DoctorFileStatus{
+			{Path: "/home/u/.codeium/mcp_config.json", Status: "present", ByteSize: 40},
+		}},
+	})
+	got := buf.String()
+
+	if strings.Contains(got, "not installed (1)") {
+		t.Errorf("an agent holding Gortex files must not be collapsed away:\n%s", got)
+	}
+	if !strings.Contains(got, "leftover config") {
+		t.Errorf("say why an uninstalled agent is still listed:\n%s", got)
+	}
+	if !strings.Contains(got, "/home/u/.codeium/mcp_config.json") {
+		t.Errorf("the leftover file itself is the point:\n%s", got)
+	}
 }

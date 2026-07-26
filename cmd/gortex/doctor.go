@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -81,13 +82,15 @@ var (
 	doctorJSON   bool
 	doctorDays   int
 	doctorRedact bool
+	doctorAll    bool
 )
 
 func init() {
 	for _, c := range []*cobra.Command{doctorCmd, initDoctorCmd} {
 		c.Flags().BoolVar(&doctorJSON, "json", false, "emit a structured JSON report on stdout")
 		c.Flags().IntVar(&doctorDays, "days", 7, "look-back window for hook activity, adoption, and savings")
-		c.Flags().BoolVar(&doctorRedact, "redact", false, "hash repo paths and branch names so the report can be shared")
+		c.Flags().BoolVar(&doctorRedact, "redact", false, "rewrite repo and home paths, and hash branch names, so the report can be shared")
+		c.Flags().BoolVar(&doctorAll, "all", false, "list planned files for adapters that are not installed too")
 	}
 	silenceDoctorErrors(doctorCmd, initDoctorCmd)
 	rootCmd.AddCommand(doctorCmd)
@@ -342,11 +345,23 @@ const (
 // printDoctorHuman renders the human-readable summary. One row per
 // agent, with a nested file list. Columns line up for copy-paste
 // into issue reports.
+// printDoctorHuman renders the adapter section. Adapters that are neither
+// installed nor carrying Gortex files collapse to a name list: their planned
+// paths describe writes that will never happen, and one uninstalled agent can
+// contribute twenty of them — burying the handful of lines that describe the
+// machine the user actually has. An absent agent that still holds Gortex files
+// is kept and called out instead: that is leftover config, which is a finding.
+// --all restores the full listing, and --json is always complete.
 func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
-	fmt.Fprintln(w, "Gortex doctor — observed state of every adapter's planned files:")
+	fmt.Fprintln(w, "Gortex doctor — observed state of every detected adapter:")
 	fmt.Fprintln(w)
 
+	var absent []string
 	for _, r := range reports {
+		if !doctorAll && !r.Detected && !r.Configured {
+			absent = append(absent, r.Name)
+			continue
+		}
 		detMark := "–"
 		if r.Detected {
 			detMark = "✓"
@@ -387,9 +402,18 @@ func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
 			}
 			fmt.Fprintf(w, "      %s %s%s\n", statusSym, doctorPath(f.Path), extra)
 		}
+		if !r.Detected && r.Configured {
+			fmt.Fprintln(w, "      note: not installed, but Gortex files are present — leftover config.")
+		}
 		if r.DocsURL != "" {
 			fmt.Fprintf(w, "      docs: %s\n", r.DocsURL)
 		}
+		fmt.Fprintln(w)
+	}
+
+	if len(absent) > 0 {
+		fmt.Fprintf(w, "  not installed (%d): %s\n", len(absent), strings.Join(absent, ", "))
+		fmt.Fprintln(w, "  nothing is written for these; --all lists what init would write if they were.")
 		fmt.Fprintln(w)
 	}
 }

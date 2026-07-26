@@ -139,8 +139,9 @@ gortex init --hooks-only             # refresh supported agent hooks only
 
 # Observe-only
 gortex doctor                        # config + hook activity + adoption
-gortex doctor --json                 # machine-readable report
+gortex doctor --json                 # machine-readable report (always complete)
 gortex doctor --redact               # safe to paste into an issue
+gortex doctor --all                  # include adapters that are not installed
 ```
 
 ## Adapter contract
