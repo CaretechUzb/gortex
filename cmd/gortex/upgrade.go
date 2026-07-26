@@ -139,8 +139,11 @@ func normalizeSemver(v string) string {
 var upgradeRun bool
 
 var upgradeCmd = &cobra.Command{
-	Use:   "upgrade [version]",
-	Short: "Update gortex to the latest release using the method it was installed with",
+	Use: "upgrade [version]",
+	// "update" is what people type — the command's own summary line has always
+	// said "Update gortex…" — and it used to be an unknown-command error.
+	Aliases: []string{"update"},
+	Short:   "Update gortex to the latest release using the method it was installed with",
 	Long: "Detects how this gortex binary was installed (Homebrew, Scoop, go install, or the " +
 		"installer script) and runs the matching update command. Pass a version (or set " +
 		"GORTEX_VERSION) to pin a specific release. By default the command is printed; pass --run to " +
@@ -215,12 +218,7 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 		// lands is when they should be brought current — telling the user to
 		// go run `gortex install` afterwards hands back a chore the upgrade
 		// can do itself. Runs from the new binary; see upgrade_migrate.go.
-		if upgradeNoMigrate {
-			upgradeMigrationSkipped(out)
-		} else {
-			migrateAgentConfigs(cmd.Context(), out, cmd.ErrOrStderr())
-			migrated = true
-		}
+		migrated = postUpgradeSteps(cmd.Context(), out, cmd.ErrOrStderr(), upgradeNoMigrate)
 	}
 
 	// A new binary may carry newer per-language extractors, so the indexed

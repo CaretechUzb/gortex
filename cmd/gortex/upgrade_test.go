@@ -224,3 +224,55 @@ func TestUpgradeFollowUpsListConfigOnlyWhenNotDone(t *testing.T) {
 		t.Errorf("a dry run still owes the config step:\n%s", skipped.String())
 	}
 }
+
+// TestUpgradeAcceptsUpdate: "update" is what people type, and the command's
+// own summary line has always said "Update gortex…". It used to be an
+// unknown-command error, which meant the post-upgrade config refresh would
+// never run for anyone whose habit is `gortex update`.
+func TestUpgradeAcceptsUpdate(t *testing.T) {
+	found, _, err := rootCmd.Find([]string{"update"})
+	if err != nil {
+		t.Fatalf("`gortex update` does not resolve: %v", err)
+	}
+	if found != upgradeCmd {
+		t.Fatalf("`gortex update` resolved to %q, want the upgrade command", found.Name())
+	}
+}
+
+// TestPostUpgradeStepsDecision pins the wiring the whole feature hangs on:
+// after a real upgrade the refresh runs, --no-migrate skips it visibly, and
+// the return value is what the closing advice keys off.
+func TestPostUpgradeStepsDecision(t *testing.T) {
+	var ran bool
+	orig := upgradeMigrateCommand
+	upgradeMigrateCommand = func(ctx context.Context, bin string) *exec.Cmd {
+		ran = true
+		return exec.CommandContext(ctx, "true")
+	}
+	t.Cleanup(func() { upgradeMigrateCommand = orig })
+
+	t.Run("refreshes by default", func(t *testing.T) {
+		ran = false
+		var out, errw bytes.Buffer
+		if migrated := postUpgradeSteps(context.Background(), &out, &errw, false); !migrated {
+			t.Error("a completed upgrade should report the refresh as done")
+		}
+		if !ran {
+			t.Error("the refresh did not run")
+		}
+	})
+
+	t.Run("--no-migrate skips visibly", func(t *testing.T) {
+		ran = false
+		var out, errw bytes.Buffer
+		if migrated := postUpgradeSteps(context.Background(), &out, &errw, true); migrated {
+			t.Error("--no-migrate must not report the refresh as done")
+		}
+		if ran {
+			t.Error("the refresh ran despite --no-migrate")
+		}
+		if !strings.Contains(out.String(), "--no-migrate") {
+			t.Errorf("skipping must be stated, not silent:\n%s", out.String())
+		}
+	})
+}

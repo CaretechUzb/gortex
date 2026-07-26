@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 )
 
 // upgrade_migrate.go re-applies agent configuration after a successful binary
@@ -110,11 +109,15 @@ func upgradeMigrationSkipped(out io.Writer) {
 	fmt.Fprintln(out, "\nSkipping the agent config refresh (--no-migrate).")
 }
 
-// binaryName is used in messages that name the command a user would type.
-func binaryName(path string) string {
-	base := filepath.Base(strings.TrimSpace(path))
-	if base == "" || base == "." {
-		return "gortex"
+// postUpgradeSteps runs what has to happen once the new binary is on disk and
+// reports whether the config refresh was performed. Split out from runUpgrade
+// so the decision is testable without a real install method, a real release
+// check, or a real package manager.
+func postUpgradeSteps(ctx context.Context, out, errw io.Writer, noMigrate bool) bool {
+	if noMigrate {
+		upgradeMigrationSkipped(out)
+		return false
 	}
-	return base
+	migrateAgentConfigs(ctx, out, errw)
+	return true
 }
