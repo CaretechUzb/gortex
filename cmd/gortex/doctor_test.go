@@ -165,3 +165,46 @@ func TestDoctorKeepsLeftoverConfig(t *testing.T) {
 		t.Errorf("the leftover file itself is the point:\n%s", got)
 	}
 }
+
+// TestDoctorReservesTheCrossForRealGaps: an absent repo-local file is not a
+// fault. A machine configured by `gortex install` needs no repo-local config
+// at all, so marking it ✗ read as an accusation and implied work the user
+// does not have to do. ✗ belongs to things that are broken or outdated.
+func TestDoctorReservesTheCrossForRealGaps(t *testing.T) {
+	doctorAll = false
+	var buf bytes.Buffer
+	printDoctorHuman(&buf, []DoctorAgentReport{{
+		Name: "claude-code", Detected: true, Configured: true,
+		Files: []DoctorFileStatus{
+			{Path: "/repo/.mcp.json", Status: "missing", Planned: "would-create"},
+			{Path: "/repo/.claude/settings.local.json", Status: "present", ByteSize: 26774},
+			{Path: "/home/u/.gemini/mcp_config.json", Status: "present", ByteSize: 223, StanzaStatus: "stale"},
+			{Path: "/repo/.broken.json", Status: "unreadable"},
+		},
+	}})
+	got := buf.String()
+
+	for _, line := range strings.Split(got, "\n") {
+		if strings.Contains(line, ".mcp.json") && !strings.Contains(line, "gemini") {
+			if strings.Contains(line, glyphCross) {
+				t.Errorf("an optional absent file must not be marked as a gap: %q", line)
+			}
+			if !strings.Contains(line, glyphAbsent) || !strings.Contains(line, "optional") {
+				t.Errorf("an absent optional file should read as optional: %q", line)
+			}
+		}
+		if strings.Contains(line, "settings.local.json") && !strings.Contains(line, glyphCheck) {
+			t.Errorf("a present file is fine: %q", line)
+		}
+		// Present-but-outdated and unreadable are the real gaps.
+		if strings.Contains(line, "gemini") && !strings.Contains(line, glyphWarn) {
+			t.Errorf("an outdated stanza needs attention: %q", line)
+		}
+		if strings.Contains(line, ".broken.json") && !strings.Contains(line, glyphWarn) {
+			t.Errorf("an unreadable file needs attention: %q", line)
+		}
+	}
+	if !strings.Contains(got, "needs attention") {
+		t.Errorf("the legend should explain the markers:\n%s", got)
+	}
+}

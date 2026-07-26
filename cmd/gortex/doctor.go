@@ -336,10 +336,18 @@ func printDoctorEnvironment(w io.Writer, env DoctorEnvironment) {
 	fmt.Fprintln(w)
 }
 
-// glyphCheck / glyphCross are the doctor's status markers.
+// The doctor's status markers. The distinction between glyphAbsent and
+// glyphCross is the whole point of having both: a per-repo file that `gortex
+// init` has not written is not a fault — a machine-wide `gortex install`
+// covers the agent, and most repos never need repo-local config at all.
+// Marking it ✗ turned an optional file into an accusation and implied work
+// the user does not have to do. ✗ is reserved for a real gap: something
+// broken, outdated, or genuinely not wired up.
 const (
-	glyphCheck = "✓"
-	glyphCross = "✗"
+	glyphCheck  = "✓"
+	glyphCross  = "✗"
+	glyphWarn   = "!"
+	glyphAbsent = "·"
 )
 
 // printDoctorHuman renders the human-readable summary. One row per
@@ -354,6 +362,8 @@ const (
 // --all restores the full listing, and --json is always complete.
 func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
 	fmt.Fprintln(w, "Gortex doctor — observed state of every detected adapter:")
+	fmt.Fprintf(w, "  %s present   %s absent (optional — repo-local config)   %s needs attention\n",
+		glyphCheck, glyphAbsent, glyphWarn)
 	fmt.Fprintln(w)
 
 	var absent []string
@@ -370,16 +380,18 @@ func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
 		if r.Configured {
 			cfgMark = "✓"
 		}
-		fmt.Fprintf(w, "  [%s detected] [%s any-file-present]  %s\n", detMark, cfgMark, r.Name)
+		fmt.Fprintf(w, "  [%s installed] [%s gortex files]  %s\n", detMark, cfgMark, r.Name)
 		for _, f := range r.Files {
 			statusSym := "?"
 			switch f.Status {
 			case "present":
-				statusSym = "✓"
+				statusSym = glyphCheck
 			case "missing":
-				statusSym = "✗"
+				// Absent, not wrong: repo-local config is optional on a
+				// machine configured by `gortex install`.
+				statusSym = glyphAbsent
 			case "unreadable":
-				statusSym = "!"
+				statusSym = glyphWarn
 			}
 			extra := ""
 			if f.Status == "present" && f.ByteSize > 0 {
@@ -387,7 +399,10 @@ func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
 			}
 			switch f.StanzaStatus {
 			case "stale":
-				extra += " [stale stanza: run `gortex install` to migrate]"
+				// Present but outdated is a real gap — Gortex wrote this and
+				// the shape has since moved on.
+				statusSym = glyphWarn
+				extra += " [outdated stanza: run `gortex install` to migrate]"
 			case "current":
 				extra += " [stanza current]"
 			}
@@ -398,7 +413,7 @@ func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
 				if len(verb) > len("would-") && verb[:len("would-")] == "would-" {
 					verb = verb[len("would-"):]
 				}
-				extra = fmt.Sprintf(" (init would %s)", verb)
+				extra = fmt.Sprintf(" (optional — `gortex init` would %s)", verb)
 			}
 			fmt.Fprintf(w, "      %s %s%s\n", statusSym, doctorPath(f.Path), extra)
 		}
