@@ -23,13 +23,51 @@ builds:
   - id: main
     main: ./cmd/gortex/
     binary: gortex
+    # A statically linked glibc cannot dlopen anything on a host whose glibc
+    # differs from the build host's — and it does not fail cleanly, it SEGVs
+    # inside the loader. These three tags remove every dlopen from the binary:
+    #   netgo      — resolver reads /etc/resolv.conf instead of getaddrinfo
+    #   osusergo   — user lookup reads /etc/passwd instead of getpwuid
+    #   static_link — custom tree-sitter grammars decline up front instead of
+    #                 crashing the daemon (internal/parser/languages)
+    # Without them -static would produce a binary that starts everywhere and
+    # then dies on first use.
+    tags:
+      - netgo
+      - osusergo
+      - static_link
     ldflags:
       # main.version + main.commit get parsed at startup into a SemVer 2.0.0
       # Version (see internal/version). Commit lands in the +build slot so
       # `gortex version` output round-trips as canonical semver.
       - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}} -X main.date={{.Date}}
+      # Link the C/C++ runtime in, the same way release.yml does for the
+      # windows .exe. The C++ stdlib is in the link at all because some
+      # tree-sitter grammars carry C++ external scanners; linking it
+      # dynamically stamped the binary with the goreleaser-cross image's
+      # GLIBCXX/GLIBC floor (Ubuntu 24.04, GCC 13.3 -> GLIBCXX_3.4.32 +
+      # GLIBC_2.34), so it refused to start on any older distro:
+      #
+      #   gortex: /lib/x86_64-linux-gnu/libstdc++.so.6:
+      #           version `GLIBCXX_3.4.32' not found (required by gortex)
+      #
+      # Debian 12 and Ubuntu 22.04 top out at GLIBCXX_3.4.30/3.4.29, so the
+      # dynamic build only ran on Ubuntu 24.04+/Debian 13+. Static linking
+      # removes the floor entirely and makes the README's "single static
+      # binary, no dependency chain" claim true on linux. The
+      # "Verify linux binaries are self-contained" step in release.yml is the
+      # gate that keeps it that way.
+      - -extldflags "-static"
     env:
       - CGO_ENABLED=1
+    hooks:
+      # Run per built binary, before anything is archived or published, so a
+      # link that quietly went dynamic again aborts the release instead of
+      # shipping. `goreleaser release` creates the GitHub release as part of
+      # the same run, so this has to be a build hook — a workflow step after
+      # it would only ever be a post-mortem.
+      post:
+        - cmd: sh scripts/verify-static-elf.sh "{{ .Path }}"
     goos:
       - linux
     goarch:
