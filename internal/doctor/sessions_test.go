@@ -175,3 +175,103 @@ func TestScanCodexSessionsLimitsListedRows(t *testing.T) {
 		t.Errorf("listed rows=%d want 2", len(got.Sessions))
 	}
 }
+
+// claudeTranscript writes a Claude Code transcript: assistant messages whose
+// content array carries tool_use parts, which is where the tool name lives.
+func claudeTranscript(t *testing.T, home, slug, name string, tools []string, mod time.Time) {
+	t.Helper()
+	dir := filepath.Join(home, "projects", slug)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	content := []map[string]any{}
+	for _, tool := range tools {
+		content = append(content, map[string]any{"type": "tool_use", "name": tool, "input": map[string]any{"command": "rg TODO ."}})
+	}
+	rec := map[string]any{
+		"type": "assistant", "cwd": "/repo", "gitBranch": "main", "version": "2.0.0",
+		"message": map[string]any{"model": "claude-sonnet-5", "content": content},
+	}
+	blob, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf.Write(blob)
+	buf.WriteByte('\n')
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(buf.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, mod, mod); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScanClaudeSessionsClassifiesToolCalls(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now()
+	claudeTranscript(t, home, "-repo", "a.jsonl", []string{
+		"mcp__gortex__explore", "mcp__gortex__read",
+		"mcp__other__lookup",
+		"Read", "Grep", // native reads compete with graph queries
+		"Bash",      // its input is a rg command, so read-shaped
+		"TodoWrite", // neither
+	}, now)
+
+	got := ScanClaudeSessions(home, now.Add(-24*time.Hour), 10)
+
+	if got.GortexCalls != 2 {
+		t.Errorf("gortex=%d want 2", got.GortexCalls)
+	}
+	if got.OtherMCP != 1 {
+		t.Errorf("otherMCP=%d want 1", got.OtherMCP)
+	}
+	// Read + Grep + Bash: a native Read is the same competing behaviour as a
+	// shell read and belongs in the same denominator.
+	if got.ShellCalls != 3 {
+		t.Errorf("shell=%d want 3", got.ShellCalls)
+	}
+	if got.ShellReads != 3 {
+		t.Errorf("shellReads=%d want 3", got.ShellReads)
+	}
+	if got.Tools["explore"] != 1 || got.Tools["read"] != 1 {
+		t.Errorf("tools=%v — the mcp__gortex__ prefix should be stripped", got.Tools)
+	}
+	if got.Models["claude-sonnet-5"] != 1 {
+		t.Errorf("models=%v", got.Models)
+	}
+	if len(got.Sessions) != 1 || got.Sessions[0].CWD != "/repo" || got.Sessions[0].Branch != "main" {
+		t.Errorf("session row=%+v", got.Sessions)
+	}
+}
+
+func TestScanClaudeSessionsWindowAndEmpties(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now()
+	claudeTranscript(t, home, "-repo", "recent.jsonl", []string{"mcp__gortex__read"}, now)
+	claudeTranscript(t, home, "-repo", "old.jsonl", []string{"Read"}, now.Add(-30*24*time.Hour))
+	claudeTranscript(t, home, "-repo", "chat.jsonl", nil, now)
+
+	got := ScanClaudeSessions(home, now.Add(-24*time.Hour), 10)
+
+	if got.InWindow != 1 {
+		t.Errorf("inWindow=%d want 1", got.InWindow)
+	}
+	if got.ShellCalls != 0 {
+		t.Errorf("shell=%d — the out-of-window transcript leaked in", got.ShellCalls)
+	}
+	if got.GortexCalls != 1 {
+		t.Errorf("gortex=%d want 1", got.GortexCalls)
+	}
+}
+
+func TestScanClaudeSessionsMissingHome(t *testing.T) {
+	if got := ScanClaudeSessions("", time.Now().Add(-time.Hour), 10); got.FilesFound != 0 {
+		t.Errorf("empty home should yield nothing, got %+v", got)
+	}
+	got := ScanClaudeSessions(filepath.Join(t.TempDir(), "absent"), time.Now().Add(-time.Hour), 10)
+	if got.FilesFound != 0 || got.GortexShare() != -1 {
+		t.Errorf("missing projects dir should yield nothing, got %+v", got)
+	}
+}

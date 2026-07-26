@@ -198,8 +198,10 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 // second error line — the findings already said what is wrong, and cobra
 // would otherwise echo the error on top of them.
 func doctorExit(r doctorRuntime) error {
-	if doctor.HasBlocker(r.Findings) {
-		return errDoctorBlocker
+	for _, a := range r.Agents {
+		if doctor.HasBlocker(a.Findings) {
+			return errDoctorBlocker
+		}
 	}
 	return nil
 }
