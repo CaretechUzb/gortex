@@ -243,6 +243,35 @@ jobs:
       - name: Reclaim ownership of dist/ from Docker
         run: sudo chown -R "$(id -u):$(id -g)" dist
 
+      # The goreleaser build hook already refused to archive a dynamically
+      # linked binary (scripts/verify-static-elf.sh). Re-assert it on the
+      # packaged artifacts, then prove it by execution on the exact userlands
+      # the dynamic build broke on: debian:11 is glibc 2.31 / GLIBCXX_3.4.28
+      # — the reported failure class — and alpine has no glibc at all. A
+      # correctly static binary runs unchanged on both. Only amd64 can execute
+      # on this runner; arm64 is covered by the ELF assertions.
+      - name: Verify linux binaries are self-contained
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for tgz in dist/gortex_linux_*.tar.gz; do
+            workdir="$(mktemp -d)"
+            tar -xzf "$tgz" -C "$workdir" gortex
+            echo "== $(basename "$tgz")"
+            file "$workdir/gortex"
+            sh scripts/verify-static-elf.sh "$workdir/gortex"
+            rm -rf "$workdir"
+          done
+
+          workdir="$(mktemp -d)"
+          tar -xzf dist/gortex_linux_amd64.tar.gz -C "$workdir" gortex
+          chmod +x "$workdir/gortex"
+          for img in debian:11 alpine:3; do
+            echo "== runtime smoke on $img"
+            docker run --rm -v "$workdir/gortex:/gortex:ro" "$img" /gortex version
+          done
+          rm -rf "$workdir"
+
       # Now that goreleaser's --clean has run, fold the darwin tarballs in
       # alongside the linux ones so the notarize / cosign / checksum / upload
       # steps below treat all platforms uniformly.
