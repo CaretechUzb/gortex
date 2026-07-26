@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -138,15 +142,85 @@ func TestRunUpgradeCommandDaemonBounce(t *testing.T) {
 // TestUpgradeReleaseTagParse covers the /releases/latest redirect tag parse.
 func TestUpgradeReleaseTagParse(t *testing.T) {
 	cases := map[string]string{
-		"https://github.com/zzet/gortex/releases/tag/v0.49.0":      "v0.49.0",
-		"https://github.com/zzet/gortex/releases/tag/v1.0.0-rc1":   "v1.0.0-rc1",
-		"https://github.com/zzet/gortex/releases/tag/v0.49.0?x=1":  "v0.49.0",
-		"https://github.com/zzet/gortex/releases":                  "",
-		"":                                                         "",
+		"https://github.com/zzet/gortex/releases/tag/v0.49.0":     "v0.49.0",
+		"https://github.com/zzet/gortex/releases/tag/v1.0.0-rc1":  "v1.0.0-rc1",
+		"https://github.com/zzet/gortex/releases/tag/v0.49.0?x=1": "v0.49.0",
+		"https://github.com/zzet/gortex/releases":                 "",
+		"": "",
 	}
 	for loc, want := range cases {
 		if got := tagFromReleaseLocation(loc); got != want {
 			t.Errorf("tagFromReleaseLocation(%q) = %q, want %q", loc, got, want)
 		}
+	}
+}
+
+// TestUpgradeMigratesWithTheNewBinary pins the sequencing that makes the
+// post-upgrade refresh correct at all: this process is the OLD binary, so
+// re-applying adapters in-process would faithfully write the shapes the
+// upgrade is meant to migrate away from. The refresh must re-exec.
+func TestUpgradeMigratesWithTheNewBinary(t *testing.T) {
+	var gotBin string
+	var gotArgs []string
+	orig := upgradeMigrateCommand
+	upgradeMigrateCommand = func(ctx context.Context, bin string) *exec.Cmd {
+		gotBin = bin
+		c := exec.CommandContext(ctx, "true")
+		gotArgs = []string{"install", "--yes"}
+		return c
+	}
+	t.Cleanup(func() { upgradeMigrateCommand = orig })
+
+	var out, errw bytes.Buffer
+	migrateAgentConfigs(context.Background(), &out, &errw)
+
+	if gotBin == "" {
+		t.Fatal("migration did not resolve a binary to re-exec")
+	}
+	if !filepath.IsAbs(gotBin) {
+		t.Errorf("re-exec target should be absolute, got %q", gotBin)
+	}
+	if len(gotArgs) != 2 || gotArgs[0] != "install" || gotArgs[1] != "--yes" {
+		t.Errorf("migration should run a non-interactive install, got %v", gotArgs)
+	}
+	if !strings.Contains(out.String(), "Refreshing agent configuration") {
+		t.Errorf("the refresh should announce itself:\n%s", out.String())
+	}
+}
+
+// TestUpgradeMigrationFailureDoesNotFailTheUpgrade: the binary has already
+// been replaced by the time the refresh runs, so a refresh that cannot run is
+// a warning with a manual command — never a failed upgrade.
+func TestUpgradeMigrationFailureDoesNotFailTheUpgrade(t *testing.T) {
+	orig := upgradeMigrateCommand
+	upgradeMigrateCommand = func(ctx context.Context, bin string) *exec.Cmd {
+		return exec.CommandContext(ctx, "false")
+	}
+	t.Cleanup(func() { upgradeMigrateCommand = orig })
+
+	var out, errw bytes.Buffer
+	migrateAgentConfigs(context.Background(), &out, &errw)
+
+	if !strings.Contains(errw.String(), "run `gortex install` by hand") {
+		t.Errorf("a failed refresh must hand back a manual command:\n%s", errw.String())
+	}
+}
+
+// TestUpgradeFollowUpsListConfigOnlyWhenNotDone keeps the closing advice
+// honest: it must not tell the user to run the step just performed.
+func TestUpgradeFollowUpsListConfigOnlyWhenNotDone(t *testing.T) {
+	var done bytes.Buffer
+	upgradeFollowUps(&done, true, true)
+	if strings.Contains(done.String(), "gortex install") {
+		t.Errorf("config was refreshed; do not ask for it again:\n%s", done.String())
+	}
+	if !strings.Contains(done.String(), "gortex index .") {
+		t.Errorf("reindex advice is unconditional:\n%s", done.String())
+	}
+
+	var skipped bytes.Buffer
+	upgradeFollowUps(&skipped, false, false)
+	if !strings.Contains(skipped.String(), "gortex install") {
+		t.Errorf("a dry run still owes the config step:\n%s", skipped.String())
 	}
 }

@@ -402,7 +402,7 @@ func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
 				// Present but outdated is a real gap — Gortex wrote this and
 				// the shape has since moved on.
 				statusSym = glyphWarn
-				extra += " [outdated stanza: run `gortex install` to migrate]"
+				extra += " [outdated stanza: `gortex upgrade --run` migrates it, or `gortex install`]"
 			case "current":
 				extra += " [stanza current]"
 			}

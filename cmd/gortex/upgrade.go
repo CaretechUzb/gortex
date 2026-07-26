@@ -151,6 +151,7 @@ var upgradeCmd = &cobra.Command{
 
 func init() {
 	upgradeCmd.Flags().BoolVar(&upgradeRun, "run", false, "execute the detected upgrade command instead of printing it")
+	upgradeCmd.Flags().BoolVar(&upgradeNoMigrate, "no-migrate", false, "skip refreshing agent config after the upgrade")
 	rootCmd.AddCommand(upgradeCmd)
 }
 
@@ -197,6 +198,7 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(out, "Upgrading gortex (install method: %s)\n", method)
 	}
 
+	migrated := false
 	if !upgradeRun {
 		fmt.Fprintf(out, "Run:\n  %s\n", command)
 	} else {
@@ -209,12 +211,21 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 		if rerr := runUpgradeCommand(out, cmd.ErrOrStderr(), defaultUpgradeDaemonOps(cmd), run); rerr != nil {
 			return fmt.Errorf("upgrade command failed: %w", rerr)
 		}
+		// Config shapes drift between releases, and the moment the new binary
+		// lands is when they should be brought current — telling the user to
+		// go run `gortex install` afterwards hands back a chore the upgrade
+		// can do itself. Runs from the new binary; see upgrade_migrate.go.
+		if upgradeNoMigrate {
+			upgradeMigrationSkipped(out)
+		} else {
+			migrateAgentConfigs(cmd.Context(), out, cmd.ErrOrStderr())
+			migrated = true
+		}
 	}
 
-	// Post-upgrade advisory: a new binary may carry newer per-language
-	// extractors, so the indexed graph for an affected language is stale until
-	// reindexed. F2 enriches this with the exact stale languages per repo.
-	fmt.Fprintln(out, "\nAfter upgrading, reindex so the graph picks up any extractor changes:\n  gortex index .")
+	// A new binary may carry newer per-language extractors, so the indexed
+	// graph for an affected language is stale until reindexed.
+	upgradeFollowUps(out, upgradeRun, migrated)
 	return nil
 }
 
