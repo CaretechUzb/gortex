@@ -97,6 +97,34 @@ xattr -d com.apple.quarantine /usr/local/bin/gortex
 gortex version
 ```
 
+## System requirements
+
+Every published binary is self-contained — there is no runtime dependency to
+install, and no minimum glibc or `libstdc++` version.
+
+| Platform | Requirement |
+|---|---|
+| Linux (amd64 / arm64) | Any kernel ≥ 3.7. Statically linked — runs unchanged on glibc distros of any vintage (Debian 11, Ubuntu 20.04, RHEL 8, Astra …) and on musl distros like Alpine. |
+| macOS (amd64 / arm64) | macOS 11+. Links only against system frameworks. |
+| Windows (amd64) | Windows 10+. The mingw C/C++ runtime is linked in, so no DLLs to ship. |
+
+Linux builds up to and including v0.61.4 were dynamically linked and so
+inherited the build host's `GLIBCXX`/`GLIBC` floor — on anything older than
+Ubuntu 24.04 / Debian 13 they failed at startup with:
+
+```
+gortex: /lib/x86_64-linux-gnu/libstdc++.so.6: version `GLIBCXX_3.4.32' not found
+```
+
+If you hit that, upgrade to a later release; no workaround is needed.
+
+**One caveat to the static linux build:** custom tree-sitter grammars
+(`index.grammars` in `.gortex.yaml`) load a shared object at runtime, which a
+static binary cannot do. Gortex logs a warning and skips those entries — the
+257 built-in grammars are unaffected. If you need a custom grammar on Linux,
+[build from source](#from-source); that build is dynamically linked and
+supports them.
+
 ## Verifying releases (supply-chain security)
 
 Every GitHub release is:
