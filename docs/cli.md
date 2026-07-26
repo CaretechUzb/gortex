@@ -4,7 +4,7 @@
 gortex install               One-time machine-wide setup (user-level MCP, skills, hooks, daemon wiring)
 gortex init [path]           Per-repo setup (.mcp.json, hooks, community routing, per-community SKILL.md)
 gortex init --dry-run-intake Emit a privacy-safe intake manifest and exit before parsing/writes
-gortex init doctor           Zero-op drift report across all detected agents (human or --json)
+gortex doctor                Zero-op state report: adapter drift, hook activity, adoption, savings (human or --json)
 gortex mcp [flags]           Start the MCP stdio server (auto-detects daemon; --no-daemon / --proxy; --server adds HTTP API)
 gortex daemon start [flags]  Start the daemon; --http-addr <addr> serves the HTTP/JSON API under /v1/* plus the MCP /mcp transport (--http-auth-token, --cors-origin)
 gortex daemon <sub>          start / stop / restart / reload / status / logs / install-service / service-status / uninstall-service / server (multi-server roster)

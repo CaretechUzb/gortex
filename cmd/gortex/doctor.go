@@ -13,28 +13,84 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/doctor"
 )
 
-// initDoctorCmd implements `gortex init doctor`. It re-runs every
-// adapter's Detect + Plan against the current environment and
-// reports drift — files we'd like to write, files that already
-// exist, files whose contents look wrong. Zero writes: doctor
-// never modifies disk.
+// doctorCmd implements `gortex doctor`. It re-runs every adapter's
+// Detect + Plan against the current environment and reports drift —
+// files we'd like to write, files that already exist, files whose
+// contents look wrong — and then goes past what a config file can
+// prove: whether the hooks those files declare have actually run,
+// whether the agent is calling Gortex tools, and what the savings
+// ledger recorded. Zero writes: doctor never modifies disk.
+//
+// The runtime half exists because an agent config is not evidence.
+// Codex, for one, records trust against each hook's hash and skips new
+// or changed hooks until the user approves them — so a fully populated
+// config.toml and a completely inert integration look identical on
+// disk. Only the invocation log tells them apart.
 //
 // This is the zero-op form of the installer and the primary
 // support-channel tool. Output defaults to a human-readable table;
 // --json emits a machine-readable report for CI consumers.
-var initDoctorCmd = &cobra.Command{
+var doctorCmd = &cobra.Command{
 	Use:   "doctor",
-	Short: "Report the configured state of every Gortex integration without writing anything",
-	Args:  cobra.NoArgs,
-	RunE:  runInitDoctor,
+	Short: "Diagnose the Gortex install: config, hook activity, agent adoption, savings",
+	Long: `Reports the machine-wide state of every Gortex integration without
+writing anything.
+
+Static half — per-adapter Detect + Plan: which files exist, which are
+missing, whether an MCP stanza is stale.
+
+Runtime half — the evidence a config file cannot carry:
+
+  hook activity   did the hook processes actually run, did they inject
+                  context, did they reach the daemon? An event configured
+                  with zero invocations is the signature of a hook the
+                  agent is skipping (Codex requires per-hook trust via
+                  /hooks before a new or changed hook runs).
+  adoption        for agents that keep session transcripts, how often the
+                  model called a Gortex tool versus shelling out.
+  savings         what the ledger recorded, and how much of it carries no
+                  client or model attribution.
+
+Examples:
+
+  gortex doctor                    # last 7 days
+  gortex doctor --days 30
+  gortex doctor --redact           # hash repo paths before sharing
+  gortex doctor --json             # machine-readable
+
+Exit status is 1 when a blocker is found, so CI can gate on it.`,
+	Args: cobra.NoArgs,
+	RunE: runDoctor,
 }
 
-var initDoctorJSON bool
+// initDoctorCmd keeps `gortex init doctor` working for anyone with it in a
+// script. The name always oversold its scope — doctor reports machine-wide
+// state, not this repo's — so the canonical spelling is `gortex doctor`.
+var initDoctorCmd = &cobra.Command{
+	Use:        "doctor",
+	Short:      "Deprecated alias for `gortex doctor`",
+	Args:       cobra.NoArgs,
+	Deprecated: "use `gortex doctor` (doctor reports machine-wide state, not one repo's).",
+	RunE:       runDoctor,
+}
+
+var (
+	doctorJSON   bool
+	doctorDays   int
+	doctorRedact bool
+)
 
 func init() {
-	initDoctorCmd.Flags().BoolVar(&initDoctorJSON, "json", false, "emit a structured JSON report on stdout")
+	for _, c := range []*cobra.Command{doctorCmd, initDoctorCmd} {
+		c.Flags().BoolVar(&doctorJSON, "json", false, "emit a structured JSON report on stdout")
+		c.Flags().IntVar(&doctorDays, "days", 7, "look-back window for hook activity, adoption, and savings")
+		c.Flags().BoolVar(&doctorRedact, "redact", false, "hash repo paths and branch names so the report can be shared")
+	}
+	silenceDoctorErrors(doctorCmd, initDoctorCmd)
+	rootCmd.AddCommand(doctorCmd)
 	initCmd.AddCommand(initDoctorCmd)
 }
 
@@ -84,7 +140,7 @@ type DoctorFileStatus struct {
 	StanzaHint   string `json:"stanza_hint,omitempty"`
 }
 
-func runInitDoctor(cmd *cobra.Command, _ []string) error {
+func runDoctor(cmd *cobra.Command, _ []string) error {
 	home, _ := os.UserHomeDir()
 	root, err := filepath.Abs(".")
 	if err != nil {
@@ -108,13 +164,33 @@ func runInitDoctor(cmd *cobra.Command, _ []string) error {
 		reports = append(reports, inspectAdapter(a, env))
 	}
 
-	if initDoctorJSON {
+	runtime := collectRuntime(home, doctorDays)
+
+	if doctorJSON {
 		enc := json.NewEncoder(cmd.OutOrStdout())
 		enc.SetIndent("", "  ")
-		return enc.Encode(map[string]any{"environment": doctorEnv, "agents": reports})
+		if err := enc.Encode(map[string]any{
+			"environment": doctorEnv,
+			"agents":      reports,
+			"runtime":     runtime,
+		}); err != nil {
+			return err
+		}
+		return doctorExit(runtime)
 	}
 	printDoctorEnvironment(cmd.OutOrStdout(), doctorEnv)
 	printDoctorHuman(cmd.OutOrStdout(), reports)
+	printDoctorRuntime(cmd.OutOrStdout(), runtime)
+	return doctorExit(runtime)
+}
+
+// doctorExit turns a blocker into a non-zero status without printing a
+// second error line — the findings already said what is wrong, and cobra
+// would otherwise echo the error on top of them.
+func doctorExit(r doctorRuntime) error {
+	if doctor.HasBlocker(r.Findings) {
+		return errDoctorBlocker
+	}
 	return nil
 }
 
@@ -232,7 +308,7 @@ func inspectAdapter(a agents.Adapter, env agents.Env) DoctorAgentReport {
 // and the daemon handshake. These two lines answer "is the integration
 // actually live", not just "is the config file present".
 func printDoctorEnvironment(w io.Writer, env DoctorEnvironment) {
-	fmt.Fprintln(w, "Gortex init doctor — environment:")
+	fmt.Fprintln(w, "Gortex doctor — environment:")
 	if env.BinaryOnPath {
 		fmt.Fprintf(w, "  %s gortex on PATH: %s\n", glyphCheck, env.BinaryPath)
 	} else {
@@ -260,7 +336,7 @@ const (
 // agent, with a nested file list. Columns line up for copy-paste
 // into issue reports.
 func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
-	fmt.Fprintln(w, "Gortex init doctor — observed state of every adapter's planned files:")
+	fmt.Fprintln(w, "Gortex doctor — observed state of every adapter's planned files:")
 	fmt.Fprintln(w)
 
 	for _, r := range reports {
