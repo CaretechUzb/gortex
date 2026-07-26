@@ -10,7 +10,7 @@ import (
 	"github.com/zzet/gortex/internal/platform"
 )
 
-// DecisionKind enumerates the outcomes the Grep-redirect probe can log.
+// DecisionKind enumerates the outcomes a PreToolUse redirect can log.
 type DecisionKind string
 
 const (
@@ -21,6 +21,10 @@ const (
 	// DecisionNudged records that ModeAdaptiveNudge fired its
 	// once-per-burst soft-deny after a streak of non-symbolic calls.
 	DecisionNudged DecisionKind = "nudged"
+	// DecisionRedirectedWrite records that a shell command was recognised as
+	// mutating indexed source and answered with the graph-aware edit path.
+	// Without it a shell write leaves no trace of which door a change took.
+	DecisionRedirectedWrite DecisionKind = "redirected_write"
 )
 
 type hookDecision struct {

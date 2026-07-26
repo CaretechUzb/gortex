@@ -33,13 +33,21 @@ func fakeIndexedBridge(t *testing.T, indexedPaths map[string]bool) int {
 	return 0
 }
 
-func TestEnrichEdit_Disabled_NoOp(t *testing.T) {
+func TestEnrichEdit_Disabled_AdvisesWithoutBlocking(t *testing.T) {
+	// The env gate decides how hard the redirect lands, not whether the agent
+	// hears about it. A write door that stays silent is the whole defect.
 	withEditBlocking(t, false)
 	fakeIndexedBridge(t, map[string]bool{"/repo/foo.go": true})
 
 	result := enrichEdit(map[string]any{"file_path": "/repo/foo.go"}, "")
-	if result.deny || result.context != "" {
-		t.Errorf("disabled ⇒ silent; got deny=%v ctx=%q", result.deny, result.context)
+	if result.deny {
+		t.Fatalf("disabled ⇒ must not block; got deny=%v", result.deny)
+	}
+	if !strings.Contains(result.context, "/repo/foo.go") || !strings.Contains(result.context, "`edit`") {
+		t.Errorf("disabled ⇒ advisory naming the graph path; got %q", result.context)
+	}
+	if strings.Contains(result.context, "BLOCKED") {
+		t.Error("advisory context must not claim the edit was blocked")
 	}
 }
 
@@ -91,6 +99,19 @@ func TestEnrichWrite_IndexedSource_Denies(t *testing.T) {
 	}
 }
 
+func TestEnrichWrite_Disabled_AdvisesWithoutBlocking(t *testing.T) {
+	withEditBlocking(t, false)
+	fakeIndexedBridge(t, map[string]bool{"/repo/server.go": true})
+
+	result := enrichWrite(map[string]any{"file_path": "/repo/server.go"}, "")
+	if result.deny {
+		t.Fatalf("disabled ⇒ must not block; got deny=%v", result.deny)
+	}
+	if !strings.Contains(result.context, `edit(operation:"write")`) {
+		t.Errorf("disabled ⇒ advisory naming the graph path; got %q", result.context)
+	}
+}
+
 func TestEnrichWrite_NewFile_PassThrough(t *testing.T) {
 	withEditBlocking(t, true)
 	fakeIndexedBridge(t, map[string]bool{}) // nothing indexed
@@ -98,6 +119,52 @@ func TestEnrichWrite_NewFile_PassThrough(t *testing.T) {
 	result := enrichWrite(map[string]any{"file_path": "/repo/new.go"}, "")
 	if result.deny || result.context != "" {
 		t.Errorf("new file ⇒ pass through; got deny=%v ctx=%q", result.deny, result.context)
+	}
+}
+
+func TestWriteRedirect_BlockingKeepsTextForPosturesThatDowngrade(t *testing.T) {
+	// A posture that softens a deny reads `context`. Leaving it empty when
+	// blocking made turning the gate ON quieter than leaving it off.
+	withEditBlocking(t, true)
+	fakeIndexedBridge(t, map[string]bool{"/repo/foo.go": true})
+
+	blocked := enrichEdit(map[string]any{"file_path": "/repo/foo.go"}, "")
+	if !blocked.deny {
+		t.Fatal("gate on ⇒ deny")
+	}
+	if !strings.Contains(blocked.context, "/repo/foo.go") {
+		t.Fatalf("blocking redirect must still carry advisory text, got %q", blocked.context)
+	}
+	if strings.Contains(blocked.context, "BLOCKED") {
+		t.Error("the downgrade text must not claim the call was blocked")
+	}
+
+	input := HookInput{ToolName: "Edit", ToolInput: map[string]any{"file_path": "/repo/foo.go"}}
+	softened := applyMode(input, false, ModeEnrich, blocked)
+	if softened.deny {
+		t.Error("ModeEnrich must never deny")
+	}
+	if !strings.Contains(softened.context, "/repo/foo.go") || strings.Contains(softened.context, "BLOCKED") {
+		t.Errorf("ModeEnrich should advise without claiming a block, got %q", softened.context)
+	}
+}
+
+func TestWriteRedirect_NudgePostureStillAdvisesBelowThreshold(t *testing.T) {
+	withSessionDir(t)
+	withEditBlocking(t, true)
+	fakeIndexedBridge(t, map[string]bool{"/repo/foo.go": true})
+
+	input := HookInput{
+		ToolName:  "Edit",
+		ToolInput: map[string]any{"file_path": "/repo/foo.go"},
+		SessionID: "write-nudge",
+	}
+	result := applyMode(input, false, ModeAdaptiveNudge, enrichEdit(input.ToolInput, ""))
+	if result.deny {
+		t.Fatal("the first call of a burst is allowed through")
+	}
+	if !strings.Contains(result.context, "/repo/foo.go") {
+		t.Errorf("an allowed write must still be told about the graph path, got %q", result.context)
 	}
 }
 
