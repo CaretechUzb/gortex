@@ -123,19 +123,30 @@ func TestResolveAllDeferredLSPPassBudgetStopsNewCalls(t *testing.T) {
 	r.SetLSPHelper(helper)
 	r.SetLSPResolvePassBudget(5 * time.Millisecond)
 
-	started := time.Now()
 	stats := r.ResolveAll()
-	elapsed := time.Since(started)
 
+	// The invariant is call-shaped, not time-shaped: once the pass budget is
+	// spent the resolver must issue no further Definition call, so the helper's
+	// delay is paid once per pass rather than once per deferred edge. The
+	// counters below state that exactly, and callNames is an identity for the
+	// number of sleeps — Definition records every call before sleeping, and it
+	// is the only place the delay exists.
+	//
+	// Deliberately not asserted against wall clock. The obvious bound would
+	// have to cover all of ResolveAll (spool setup, import closure, the tail
+	// attribution passes), not just the LSP pass, so it measures mostly
+	// unrelated work; CI runs this package under -race with coverage, where
+	// that overhead is unbounded. A 100ms ceiling here failed on main twice and
+	// on two PR branches, always as the only failing assertion while every
+	// counter passed — and it added no detection power, because a breaker that
+	// never opens leaves LSPBudgetExhausted false and trips the require below
+	// first.
 	require.True(t, stats.LSPBudgetExhausted)
 	assert.Equal(t, len(edges), stats.LSPDeferred)
 	assert.Equal(t, 1, stats.LSPAttempted, "only the already-in-flight call may outlive the pass budget")
 	assert.Equal(t, 1, stats.LSPResolved)
 	assert.Equal(t, len(edges)-1, stats.LSPBudgetSkipped)
 	assert.Len(t, helper.callNames(), 1, "skipped edges must not invoke the helper")
-	assert.GreaterOrEqual(t, elapsed, helper.delay)
-	assert.Less(t, elapsed, 100*time.Millisecond,
-		"the cumulative breaker must avoid paying the delay once per deferred edge")
 
 	lspResolved := 0
 	for _, edge := range edges {
