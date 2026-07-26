@@ -311,20 +311,36 @@ func emitSavingsDashboard(snap savings.File, buckets []savings.Bucket, modelTota
 				nameWidth = l
 			}
 		}
+		unpriced := 0
 		for _, m := range modelTotals {
 			adj := tokens.ScaleFromCL100K(m.Name, m.TokensSaved)
+			priced := savings.ModelRate(m.Name) > 0
+			if !priced {
+				unpriced++
+			}
 			if tty {
-				cost := savings.CostAvoided(adj, m.Name)
+				tone := progress.StatGood
+				if !priced {
+					tone = progress.StatNeutral
+				}
 				stats := []string{
-					progress.Stat(formatUSD(cost), "", progress.StatGood),
+					progress.Stat(formatModelCost(adj, m.Name), "", tone),
 					progress.Stat(humanInt(m.CallsCounted), "calls", progress.StatNeutral),
 					progress.Stat(humanInt(adj), "tokens saved", progress.StatNeutral),
 				}
 				fmt.Printf("     %-*s  %s\n", nameWidth, m.Name, progress.StatStrip(stats...))
 			} else {
 				fmt.Printf("  %-*s %s   (%s calls · %s tokens saved)\n",
-					nameWidth, m.Name, formatUSD(savings.CostAvoided(adj, m.Name)),
+					nameWidth, m.Name, formatModelCost(adj, m.Name),
 					humanInt(m.CallsCounted), humanInt(adj))
+			}
+		}
+		if unpriced > 0 {
+			hint := fmt.Sprintf("%d model(s) have no list price on file — set GORTEX_MODEL_PRICING_JSON to price them.", unpriced)
+			if tty {
+				fmt.Println("     " + progress.Caption(hint))
+			} else {
+				fmt.Println("  " + hint)
 			}
 		}
 	}
@@ -457,6 +473,18 @@ func formatUSD(usd float64) string {
 		return fmt.Sprintf("$%.2f", usd)
 	}
 	return fmt.Sprintf("$%.4f", usd)
+}
+
+// formatModelCost renders one model's cost avoided, separating "no list
+// price on file" from "this model avoided nothing". Both used to print
+// $0.0000, so a model the pricing table has never heard of — a newly
+// released id, or a provider whose rates we don't carry — read as a real
+// zero sitting next to millions of tokens saved.
+func formatModelCost(tokensSaved int64, model string) string {
+	if savings.ModelRate(model) <= 0 {
+		return "unpriced"
+	}
+	return formatUSD(savings.CostAvoided(tokensSaved, model))
 }
 
 // printBucket renders a sorted breakdown of name → Totals. Skipped when

@@ -23,15 +23,26 @@ type Price struct {
 // the input rate. Users can override the whole table via
 // GORTEX_MODEL_PRICING_JSON='[{"model":"...","usd_per_m_input":N},...]'.
 var defaultPricing = []Price{
-	// Anthropic — claude-opus-4-8 is the headline default (see savings.go);
-	// claude-mythos-preview is the current preview flagship.
+	// Anthropic — claude-opus-4-8 is the headline default (see savings.go).
+	// Keep the current generation listed first: findPrice resolves an exact
+	// match before any substring match, so a missing row is what turns a live
+	// model's cost avoided into a silent $0.00.
+	{"claude-fable-5", 10.00},
+	{"claude-mythos-5", 10.00},
 	{"claude-mythos-preview", 10.00},
+	{"claude-opus-5", 5.00},
 	{"claude-opus-4-8", 5.00},
 	{"claude-opus-4-7", 5.00},
 	{"claude-opus-4-6", 5.00},
+	{"claude-sonnet-5", 3.00},
 	{"claude-sonnet-4-6", 3.00},
 	{"claude-haiku-4-5", 1.00},
-	// OpenAI (also reachable via Azure).
+	// OpenAI (also reachable via Azure). The gpt-5.6 tiers are the slugs the
+	// codex CLI reports, so they show up in savings attribution even though
+	// gortex never calls them directly.
+	{"gpt-5.6-sol", 5.00},
+	{"gpt-5.6-terra", 2.50},
+	{"gpt-5.6-luna", 1.00},
 	{"gpt-5.5", 5.00},
 	{"gpt-5.4", 2.50},
 	{"gpt-5.4-mini", 0.75},
