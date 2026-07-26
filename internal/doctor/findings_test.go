@@ -215,3 +215,57 @@ func TestNoHooksConfiguredIsNotATrustProblem(t *testing.T) {
 	}
 	assertNoFindingWith(t, findings, "trusted")
 }
+
+// TestDiagnoseScopesEvidenceToTheAgent is the reason the invocation log
+// gained an agent dimension: on a machine running Claude Code and Codex side
+// by side, a busy Claude session must not vouch for hooks Codex is skipping.
+func TestDiagnoseScopesEvidenceToTheAgent(t *testing.T) {
+	now := time.Now()
+	busyClaude := hooks.EffectivenessSummary{
+		Present:    true,
+		Attributed: true,
+		Events: map[string]hooks.EventActivity{
+			"SessionStart": {Runs: 40, Emitted: 40}, "UserPromptSubmit": {Runs: 40, Emitted: 40},
+			"PreToolUse": {Runs: 400, Emitted: 90}, "PostToolUse": {Runs: 40, Emitted: 8},
+		},
+		ByAgent: map[string]map[string]hooks.EventActivity{
+			"claude-code": {
+				"SessionStart": {Runs: 40, Emitted: 40}, "UserPromptSubmit": {Runs: 40, Emitted: 40},
+				"PreToolUse": {Runs: 400, Emitted: 90}, "PostToolUse": {Runs: 40, Emitted: 8},
+			},
+		},
+	}
+
+	findings := Diagnose(codexAgent(), busyClaude, Adoption{FilesFound: 2, InWindow: 2, ShellCalls: 9}, now)
+	got := findingWith(t, findings, "none has run")
+	if got.Severity != SeverityBlocker {
+		t.Fatalf("severity=%s want BLOCKER — codex's silence was masked by another agent", got.Severity)
+	}
+
+	// The same evidence, asked about the agent that *was* busy, is healthy.
+	claude := codexAgent()
+	claude.Agent = "claude-code"
+	claude.RequiresTrust = false
+	assertNoFindingWith(t, Diagnose(claude, busyClaude, Adoption{}, now), "none has run")
+}
+
+// TestDiagnoseFallsBackOnUnattributedLogs: right after an upgrade every row
+// predates attribution, and doctor must not turn that missing metadata into a
+// blocker against a working install.
+func TestDiagnoseFallsBackOnUnattributedLogs(t *testing.T) {
+	legacy := hooks.EffectivenessSummary{
+		Present:          true,
+		Attributed:       false,
+		UnattributedRows: 4,
+		Events: map[string]hooks.EventActivity{
+			"SessionStart": {Runs: 4, Emitted: 4}, "UserPromptSubmit": {Runs: 4, Emitted: 4},
+			"PreToolUse": {Runs: 4, Emitted: 2}, "PostToolUse": {Runs: 4, Emitted: 2},
+		},
+	}
+
+	findings := Diagnose(codexAgent(), legacy, Adoption{FilesFound: 1, InWindow: 1, GortexCalls: 9, ShellCalls: 1}, time.Now())
+	assertNoFindingWith(t, findings, "none has run")
+	if HasBlocker(findings) {
+		t.Errorf("a pre-attribution log is not evidence of failure: %+v", findings)
+	}
+}

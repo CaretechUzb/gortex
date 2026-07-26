@@ -29,6 +29,12 @@ type Finding struct {
 	Remedy   string   `json:"remedy,omitempty"`
 }
 
+// agentActivity is one harness's slice of the invocation log, so the finding
+// rules below cannot accidentally read another agent's rows.
+type agentActivity struct {
+	events map[string]hooks.EventActivity
+}
+
 // AgentHooks is what an adapter's config declares, per lifecycle event.
 type AgentHooks struct {
 	// Agent is the adapter name ("codex").
@@ -53,8 +59,12 @@ type AgentHooks struct {
 // Diagnose turns the collected evidence into ordered findings, most
 // actionable first. It takes plain data so the whole decision table is
 // testable without a machine that has Codex, hooks, or a daemon on it.
-func Diagnose(agent AgentHooks, activity hooks.EffectivenessSummary, adoption Adoption, now time.Time) []Finding {
+func Diagnose(agent AgentHooks, summary hooks.EffectivenessSummary, adoption Adoption, now time.Time) []Finding {
 	var findings []Finding
+	// Scope the evidence to this harness. On a machine running more than one
+	// agent the union would let a busy Claude Code session vouch for hooks
+	// Codex is skipping — exactly the failure doctor exists to catch.
+	activity := agentActivity{events: summary.ForAgent(agent.Agent)}
 	add := func(sev Severity, remedy, format string, args ...any) {
 		findings = append(findings, Finding{Severity: sev, Summary: fmt.Sprintf(format, args...), Remedy: remedy})
 	}
@@ -71,7 +81,7 @@ func Diagnose(agent AgentHooks, activity hooks.EffectivenessSummary, adoption Ad
 
 	var ran int
 	for _, event := range events {
-		ran += activity.Events[event].Runs
+		ran += activity.events[event].Runs
 	}
 
 	switch {
@@ -95,7 +105,7 @@ func Diagnose(agent AgentHooks, activity hooks.EffectivenessSummary, adoption Ad
 	// same problem: one hook's definition changed, so only its trust lapsed.
 	if ran > 0 {
 		for _, event := range events {
-			stats := activity.Events[event]
+			stats := activity.events[event]
 			if stats.Runs > 0 {
 				continue
 			}
@@ -109,7 +119,7 @@ func Diagnose(agent AgentHooks, activity hooks.EffectivenessSummary, adoption Ad
 	}
 
 	for _, event := range events {
-		stats := activity.Events[event]
+		stats := activity.events[event]
 		if stats.Runs == 0 {
 			continue
 		}

@@ -181,13 +181,14 @@ func printDoctorRuntime(w io.Writer, r doctorRuntime) {
 	}
 	fmt.Fprintln(w)
 
-	fmt.Fprintln(w, "  hook activity   (did the hook processes actually run?)")
+	fmt.Fprintf(w, "  hook activity   (did %s's hook processes actually run?)\n", codex.Name)
 	if !r.Hooks.Present {
 		fmt.Fprintf(w, "    no %s — no hook has ever run on this machine\n", r.Hooks.Path)
 	} else {
+		scoped := r.Hooks.ForAgent(codex.Name)
 		fmt.Fprintf(w, "    %-18s %7s %9s %10s  %s\n", "event", "runs", "injected", "daemon-up", "last seen")
 		for _, event := range doctorEventOrder(r.Hooks) {
-			stats := r.Hooks.Events[event]
+			stats := scoped[event]
 			daemon := "n/a"
 			if stats.DaemonKnown > 0 {
 				daemon = fmt.Sprintf("%d/%d", stats.DaemonUp, stats.DaemonKnown)
@@ -199,9 +200,17 @@ func printDoctorRuntime(w io.Writer, r doctorRuntime) {
 			fmt.Fprintf(w, "    %-18s %7d %9d %10s  %s\n", event, stats.Runs, stats.Emitted, daemon, last)
 		}
 		fmt.Fprintf(w, "    %d row(s) in window, %d in the whole log\n", r.Hooks.WindowRows, r.Hooks.TotalRows)
+		if agents := r.Hooks.AgentNames(); len(agents) > 0 {
+			fmt.Fprintf(w, "    agents seen                %s\n", joinComma(agents))
+		}
+		if r.Hooks.UnattributedRows > 0 {
+			// Rows written before the agent field existed cannot be assigned,
+			// so say how much of the evidence is shared rather than let the
+			// table imply a precision it does not have.
+			fmt.Fprintf(w, "    note: %d row(s) predate per-agent attribution and are counted for\n", r.Hooks.UnattributedRows)
+			fmt.Fprintln(w, "          every agent; they clear as the window rolls forward.")
+		}
 	}
-	fmt.Fprintln(w, "    note: this log has no agent dimension — on a machine running more than")
-	fmt.Fprintln(w, "          one agent, these counts are the sum.")
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "  codex adoption  (what the model actually called)")
