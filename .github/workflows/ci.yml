@@ -56,6 +56,56 @@ jobs:
       - name: Test Windows agent integrations
         run: go test -timeout=5m -count=1 ./internal/agents
 
+  build-linux-static:
+    # The linux release ships a statically linked binary so it runs on any
+    # distro (see .goreleaser.yml). That only holds while the code stays
+    # link-clean under -static + netgo/osusergo — a new cgo dependency, or a
+    # dep that needs a runtime dlopen, breaks it. The release-time build hook
+    # catches that at tag time; this catches it on the PR that introduces it.
+    #
+    # ubuntu-latest is the same Ubuntu 24.04 / GCC 13 generation as the
+    # goreleaser-cross image, so it reproduces the same GLIBCXX floor the
+    # dynamic build used to inherit — without pulling that multi-GB image.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build with the release link flags
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          go build -tags netgo,osusergo,static_link \
+            -ldflags '-s -w -extldflags "-static"' \
+            -o gortex-static ./cmd/gortex/
+
+      - name: Verify the binary is self-contained
+        run: |
+          file gortex-static
+          sh scripts/verify-static-elf.sh gortex-static
+
+      # The static-only code path (custom grammars declining instead of
+      # dlopen'ing) is compiled out of every other job, so it needs its tests
+      # run under the tag or they never execute anywhere.
+      - name: Test the static-only code paths
+        run: go test -count=1 -tags netgo,osusergo,static_link ./internal/parser/languages/
+
+      - name: Run it where the dynamic build could not
+        # debian:11 (glibc 2.31 / GLIBCXX_3.4.28) is the userland that reported
+        # `GLIBCXX_3.4.32 not found`; alpine has no glibc at all. Exercise a
+        # command that resolves the user's home dir and touches the net stack,
+        # so a missing netgo/osusergo tag fails here rather than for a user.
+        run: |
+          set -euo pipefail
+          for img in debian:11 alpine:3; do
+            echo "== $img"
+            docker run --rm -v "$PWD/gortex-static:/gortex:ro" "$img" /gortex version
+            docker run --rm -v "$PWD/gortex-static:/gortex:ro" "$img" /gortex daemon status || true
+          done
+
   lint:
     runs-on: ubuntu-latest
     steps:
