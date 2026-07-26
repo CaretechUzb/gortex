@@ -36,20 +36,15 @@ type agentActivity struct {
 	summary hooks.EffectivenessSummary
 }
 
-// silent reports that an event demonstrably did not run for this agent.
-//
-// Zero attributed runs is not enough. A log is mixed for as long as the
-// window still reaches back past the upgrade that introduced attribution, and
-// during that overlap an event may have run with no agent recorded — most
-// visibly for events that fire once per session, where a busy PreToolUse
-// stream attributes itself within minutes while SessionStart waits for the
-// next session. Concluding silence there accuses a working install.
-func (a agentActivity) silent(event string) bool {
-	return a.events[event].Runs == 0 && a.summary.AmbiguousRuns(event) == 0
-}
-
 // ambiguous reports that the window holds runs of this event that cannot be
-// attributed either way.
+// attributed either way, so silence cannot be concluded from an empty bucket.
+//
+// Zero attributed runs is not evidence on its own. A log is mixed for as long
+// as the window still reaches back past the upgrade that introduced
+// attribution, and during that overlap an event may have run with no agent
+// recorded — most visibly for events that fire once per session, where a busy
+// PreToolUse stream attributes itself within minutes while SessionStart waits
+// for the next session. Concluding silence there accuses a working install.
 func (a agentActivity) ambiguous(event string) bool {
 	return a.events[event].Runs == 0 && a.summary.AmbiguousRuns(event) > 0
 }
@@ -132,7 +127,7 @@ func Diagnose(agent AgentHooks, summary hooks.EffectivenessSummary, adoption Ado
 	if ran > 0 {
 		for _, event := range events {
 			stats := activity.events[event]
-			if stats.Runs > 0 || !activity.silent(event) {
+			if stats.Runs > 0 || activity.ambiguous(event) {
 				continue
 			}
 			remedy := "re-run `gortex install`"
