@@ -39,6 +39,12 @@ import (
 // Idempotent: a second run re-picks the same canonical and finds the
 // fragments' edges already moved, so every rewrite is a no-op.
 func (r *Resolver) mergeCSharpPartialTypes() {
+	// Same gate as the Go/Python attribution passes: skip the KindType scan
+	// outright when the graph indexes no C# at all (the common case in a
+	// polyglot workspace with none).
+	if !r.graphHasLanguage("csharp") {
+		return
+	}
 	groups := make(map[csharpTypeKey][]*graph.Node)
 	for n := range r.nodesByKindLang(graph.KindType, "csharp") {
 		if n.Name == "" || n.FilePath == "" {

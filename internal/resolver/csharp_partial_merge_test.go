@@ -188,6 +188,32 @@ func TestMergeCSharpPartialTypes_DifferentReposNotMerged(t *testing.T) {
 	assert.Nil(t, g.GetNode("repoA/A.cs::Foo").Meta["partial"])
 }
 
+// noCSharpStore reports "no csharp anywhere" the way the on-disk backend
+// can (HasLanguage); the in-memory graph it wraps deliberately contains a
+// mergeable fragment pair, so a merge happening at all proves the gate
+// was ignored.
+type noCSharpStore struct{ graph.Store }
+
+func (noCSharpStore) HasLanguage(string) bool { return false }
+
+// TestMergeCSharpPartialTypes_SkipsGraphWithoutCSharp locks the
+// graphHasLanguage gate: on a store that answers false the pass must not
+// scan or merge — the gate exists so polyglot workspaces without C# never
+// pay for the KindType sweep.
+func TestMergeCSharpPartialTypes_SkipsGraphWithoutCSharp(t *testing.T) {
+	g := graph.New()
+	g.AddNode(csharpType("A.cs::Foo", "Foo", "App", "A.cs"))
+	g.AddNode(csharpType("B.cs::Foo", "Foo", "App", "B.cs"))
+	g.AddNode(&graph.Node{ID: "B.cs::Foo.M", Kind: graph.KindMethod, Name: "M", FilePath: "B.cs", Language: "csharp"})
+	memberB := &graph.Edge{From: "B.cs::Foo.M", To: "B.cs::Foo", Kind: graph.EdgeMemberOf, FilePath: "B.cs", Line: 1}
+	g.AddEdge(memberB)
+
+	New(noCSharpStore{g}).mergeCSharpPartialTypes()
+
+	assert.Equal(t, "B.cs::Foo", memberB.To, "gated-off pass must not merge")
+	assert.Nil(t, g.GetNode("B.cs::Foo").Meta["partial_merged_into"])
+}
+
 // TestMergeCSharpPartialTypesForFile_ScopesToFileKeys: the per-file
 // variant merges only groups keyed by a type the edited file defines,
 // and leaves unrelated partial groups for the whole-graph sweep.
