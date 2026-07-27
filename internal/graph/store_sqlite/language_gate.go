@@ -8,8 +8,8 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// HasLanguage reports whether any indexed node carries the given language
-// (backs the resolver's graphHasLanguage gate). nodes has no
+// HasLanguage reports whether any indexed NAMED node carries the given
+// language (backs the resolver's graphHasLanguage gate). nodes has no
 // language-leading index, so a bare language predicate would scan the
 // table exactly on the miss — the case a gate exists for. The recursive
 // CTE instead skip-scans the distinct repo prefixes (one MIN seek each,
@@ -17,6 +17,18 @@ import (
 // nodes_by_repo_language_name partial index — the non-empty-name
 // predicate is what makes it eligible. Unexpected errors answer true so
 // a gated pass runs rather than being silently skipped.
+//
+// Measured on a 5.3 GB, 34-prefix store: 8ms on a miss and ~1ms on a hit,
+// against 2.5s for the equivalent `WHERE language = ? LIMIT 1`.
+//
+// `name <> ''` is therefore load-bearing for the plan, and it narrows the
+// question to "are there NAMED nodes in this language" — a language
+// present only as unnamed nodes answers false. That is the right question
+// for every caller today (each gates a pass over symbols), and no such
+// language exists in practice: on the same store, every language with any
+// node has at least one named node. Callers needing raw presence,
+// including of nameless nodes, need a different probe — this one cannot
+// answer it without giving up the index.
 func (s *Store) HasLanguage(lang string) bool {
 	if lang == "" {
 		return false
