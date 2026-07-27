@@ -522,9 +522,24 @@ func (s *Server) resolveGraphPath(graphPath string) (string, error) {
 // prefixed nodes in multi-repo mode.
 func (s *Server) graphRelPath(fp string) string {
 	if _, rel, err := s.resolveFilePath(fp); err == nil && rel != "" {
-		return rel
+		return s.graphPathSpelling(rel)
 	}
 	return fp
+}
+
+// graphPathSpelling renders a repo-relative path the way graph node IDs
+// spell it: the repo prefix joined with "/", the repo-relative remainder in
+// the OS separator. resolveFilePath echoes a caller-supplied relative path
+// back verbatim, so without this a forward-slash path — the spelling every
+// agent writes — missed every node below the repo root on Windows and the
+// read tools answered file_not_indexed for an indexed file. Identity on
+// POSIX, where the two separators already agree.
+func (s *Server) graphPathSpelling(rel string) string {
+	prefixed := false
+	if s.multiIndexer != nil {
+		prefixed = matchedRepoPrefix(s.multiIndexer, rel) != ""
+	}
+	return graphMatchPathKey(rel, prefixed)
 }
 
 // fileAttributionNode synthesizes a node carrying just the repo prefix
