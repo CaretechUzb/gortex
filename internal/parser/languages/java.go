@@ -788,8 +788,8 @@ func (e *JavaExtractor) emitMethod(m parser.QueryResult, filePath, fileID string
 					FilePath: filePath,
 					Line:     startLine1,
 					Meta: map[string]any{
-						"provides_for": rt,
-						"binding":      "bean",
+						graph.MetaDIProvidesFor: rt,
+						graph.MetaDIBinding:     graph.DIBindingBean,
 					},
 				})
 			}

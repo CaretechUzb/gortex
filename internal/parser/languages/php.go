@@ -1165,9 +1165,9 @@ func (e *PHPExtractor) emitLaravelBindings(methodNodes map[string]*sitter.Node, 
 						FilePath: filePath,
 						Line:     line,
 						Meta: map[string]any{
-							"provides_for": first,
-							"binding":      "useClass",
-							"origin":       method,
+							graph.MetaDIProvidesFor: first,
+							graph.MetaDIBinding:     graph.DIBindingUseClass,
+							graph.MetaDIOrigin:      method,
 						},
 					})
 				}
@@ -1183,9 +1183,13 @@ func (e *PHPExtractor) emitLaravelBindings(methodNodes map[string]*sitter.Node, 
 					FilePath: filePath,
 					Line:     line,
 					Meta: map[string]any{
-						"di_token": first,
-						"binding":  method,
-						"origin":   method,
+						graph.MetaDIToken: first,
+						// Laravel's binding method name (bind / singleton /
+						// instance), not one of the graph's DIBinding* forms —
+						// these token providers are deliberately outside the
+						// contract switch in di_contracts.go.
+						graph.MetaDIBinding: method,
+						graph.MetaDIOrigin:  method,
 					},
 				})
 			}

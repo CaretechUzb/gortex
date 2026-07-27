@@ -26,8 +26,10 @@ import (
 //
 // The binding is modelled as an EdgeProvides carrying
 // binding:"useClass" + provides_for:<interface> and pointing at
-// `unresolved::<impl>` (Meta keys exported as graph.MetaDI* /
-// graph.DIBinding* so the resolver consumes the same spelling). That is
+// `unresolved::<impl>`. Every Meta key and binding form in this contract
+// is enumerated as a graph.MetaDI* / graph.DIBinding* constant, and both
+// the emitters here and the consumers (resolver.buildProvidesForIndex,
+// indexer's DI post-pass) compile against that one spelling. That is
 // the exact shape NestJS useClass and
 // Laravel `$this->app->bind` already produce, so the existing
 // resolver.buildProvidesForIndex pass — which rewrites abstract-typed

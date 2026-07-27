@@ -1555,6 +1555,11 @@ func emitProvidersFromObject(config *sitter.Node, src []byte, classID, filePath 
 		if abstract == "" {
 			continue
 		}
+		// The NestJS provider field names coincide with the graph's
+		// binding values, but they are different vocabularies — the field
+		// is a source token, the binding is the graph contract. Pair them
+		// explicitly so a NestJS rename cannot silently rewrite the
+		// contract (or vice versa).
 		if concrete := objectFieldIdentifier(entry, src, "useClass"); concrete != "" {
 			result.Edges = append(result.Edges, &graph.Edge{
 				From:     classID,
@@ -1563,15 +1568,19 @@ func emitProvidersFromObject(config *sitter.Node, src []byte, classID, filePath 
 				FilePath: filePath,
 				Line:     int(entry.StartPoint().Row) + 1,
 				Meta: map[string]any{
-					"provides_for": abstract,
-					"binding":      "useClass",
-					"origin":       originTag,
+					graph.MetaDIProvidesFor: abstract,
+					graph.MetaDIBinding:     graph.DIBindingUseClass,
+					graph.MetaDIOrigin:      originTag,
 				},
 			})
 			continue
 		}
-		for _, variant := range []string{"useValue", "useFactory", "useExisting"} {
-			if objectFieldValue(entry, src, variant) == nil {
+		for _, variant := range []struct{ field, binding string }{
+			{"useValue", graph.DIBindingUseValue},
+			{"useFactory", graph.DIBindingUseFactory},
+			{"useExisting", graph.DIBindingUseExisting},
+		} {
+			if objectFieldValue(entry, src, variant.field) == nil {
 				continue
 			}
 			result.Edges = append(result.Edges, &graph.Edge{
@@ -1581,9 +1590,9 @@ func emitProvidersFromObject(config *sitter.Node, src []byte, classID, filePath 
 				FilePath: filePath,
 				Line:     int(entry.StartPoint().Row) + 1,
 				Meta: map[string]any{
-					"di_token": abstract,
-					"binding":  variant,
-					"origin":   originTag,
+					graph.MetaDIToken:   abstract,
+					graph.MetaDIBinding: variant.binding,
+					graph.MetaDIOrigin:  originTag,
 				},
 			})
 			break
@@ -1744,8 +1753,8 @@ func emitInjectFromDecorator(dec *sitter.Node, src []byte, classID, filePath str
 		FilePath: filePath,
 		Line:     int(dec.StartPoint().Row) + 1,
 		Meta: map[string]any{
-			"di_token": tok,
-			"via":      "@Inject",
+			graph.MetaDIToken: tok,
+			"via":             "@Inject",
 		},
 	})
 }

@@ -71,10 +71,10 @@ func (idx *Indexer) linkSpringBeansFromEdges(repoEdges []*graph.Edge) {
 		if e.Kind != graph.EdgeProvides || e.Meta == nil {
 			return
 		}
-		if b, _ := e.Meta["binding"].(string); b != "bean" {
+		if b, _ := e.Meta[graph.MetaDIBinding].(string); b != graph.DIBindingBean {
 			return
 		}
-		rt, _ := e.Meta["provides_for"].(string)
+		rt, _ := e.Meta[graph.MetaDIProvidesFor].(string)
 		if rt == "" {
 			return
 		}
@@ -197,32 +197,30 @@ func diContractFromEdge(e *graph.Edge) (contracts.Contract, bool) {
 
 	switch e.Kind {
 	case graph.EdgeProvides:
-		// Providers carry binding: "useClass" / "useValue" / "useFactory"
-		// / "useExisting" / "bean". useClass and Spring's bean both
-		// name their abstract via provides_for; the token forms use
-		// the token name itself.
-		binding, _ := e.Meta["binding"].(string)
+		// useClass and Spring's bean both name their abstract via
+		// provides_for; the token forms use the token name itself.
+		binding, _ := e.Meta[graph.MetaDIBinding].(string)
 		switch binding {
-		case "useClass", "bean":
-			if s, _ := e.Meta["provides_for"].(string); s != "" {
+		case graph.DIBindingUseClass, graph.DIBindingBean:
+			if s, _ := e.Meta[graph.MetaDIProvidesFor].(string); s != "" {
 				token = s
 			}
-		case "useValue", "useFactory", "useExisting":
-			if s, _ := e.Meta["di_token"].(string); s != "" {
+		case graph.DIBindingUseValue, graph.DIBindingUseFactory, graph.DIBindingUseExisting:
+			if s, _ := e.Meta[graph.MetaDIToken].(string); s != "" {
 				token = s
 			}
 		default:
 			return zero, false
 		}
 		role = contracts.RoleProvider
-		meta = map[string]any{"binding": binding}
+		meta = map[string]any{graph.MetaDIBinding: binding}
 		if target := e.To; target != "" {
 			// For useClass / bean, record the concrete target so the
 			// orphan list in the contracts tool links straight to
 			// either the concrete class (useClass) or the factory
 			// method (bean). Token-form providers point at the token
 			// directly, no extra info needed.
-			if binding == "useClass" || binding == "bean" {
+			if binding == graph.DIBindingUseClass || binding == graph.DIBindingBean {
 				meta[binding] = target
 			}
 		}
@@ -230,7 +228,7 @@ func diContractFromEdge(e *graph.Edge) (contracts.Contract, bool) {
 		if v, _ := e.Meta["via"].(string); v != "@Inject" {
 			return zero, false
 		}
-		token, _ = e.Meta["di_token"].(string)
+		token, _ = e.Meta[graph.MetaDIToken].(string)
 		role = contracts.RoleConsumer
 		meta = map[string]any{"via": "@Inject"}
 	default:

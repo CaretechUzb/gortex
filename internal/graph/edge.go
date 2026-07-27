@@ -706,13 +706,27 @@ const MetaSpeculative = "speculative"
 // framework synthesizers consume them. Exported here so both sides
 // compile against one spelling.
 const (
-	MetaDIBinding       = "binding"        // DIBindingUseClass or DIBindingAsImplemented
+	MetaDIBinding       = "binding"        // one of the DIBinding* values below
 	MetaDIProvidesFor   = "provides_for"   // interface short name the binding serves
 	MetaDISource        = "di"             // declaring container ("spring", "autofac", …)
 	MetaDIInterfaceFQCN = "interface_fqcn" // full interface name, for fidelity
 	MetaDIImplFQCN      = "impl_fqcn"      // full implementation name
+	// MetaDIToken names the injection token for the binding forms that
+	// have no concrete class to point at (useValue / useFactory /
+	// useExisting), where provides_for is absent.
+	MetaDIToken = "di_token"
+	// MetaDIOrigin records the provider method or decorator that
+	// declared the binding. Unrelated to Edge.Origin, which records how
+	// the edge itself was resolved.
+	MetaDIOrigin = "origin"
 
-	DIBindingUseClass      = "useClass"
+	// Binding forms. useClass and bean name their abstract via
+	// provides_for; the token forms use MetaDIToken instead.
+	DIBindingUseClass      = "useClass"    // container maps an abstract to a concrete class
+	DIBindingBean          = "bean"        // Spring @Bean factory method
+	DIBindingUseValue      = "useValue"    // token bound to a literal value
+	DIBindingUseFactory    = "useFactory"  // token bound to a factory function
+	DIBindingUseExisting   = "useExisting" // token aliased to another provider
 	DIBindingAsImplemented = "asImplementedInterfaces"
 )
 
