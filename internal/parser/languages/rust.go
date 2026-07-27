@@ -67,6 +67,8 @@ const qRustAll = `
 
   (ordered_field_declaration_list) @tuplefields.def
 
+  (impl_item) @impl.def
+
   (macro_invocation) @minvoke.expr
 
   (let_declaration
@@ -253,6 +255,9 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 
 		case m.Captures["xcrate.def"] != nil:
 			emitRustExternCrate(m.Captures["xcrate.def"].Node, filePath, fileID, src, result)
+
+		case m.Captures["impl.def"] != nil:
+			emitRustImplBlock(m.Captures["impl.def"].Node, filePath, src, result, annotationSeen)
 
 		case m.Captures["tuplefields.def"] != nil:
 			emitRustTupleFields(m.Captures["tuplefields.def"].Node, filePath, src, result, seen, containers)
@@ -1171,11 +1176,26 @@ func emitRustAnnotationEdges(attrs []*sitter.Node, fromID, filePath string, src 
 		}
 		line := int(attr.StartPoint().Row) + 1
 		if name == "derive" && args != "" {
-			for _, t := range strings.Split(args, ",") {
+			for _, t := range rustSplitTopLevel(args, ',') {
 				traitName := strings.TrimSpace(t)
-				if traitName != "" {
-					EmitAnnotationEdge(fromID, "rust", traitName, "", filePath, line, result, seen)
+				if traitName == "" {
+					continue
 				}
+				EmitAnnotationEdge(fromID, "rust", traitName, "", filePath, line, result, seen)
+				// A derive really does implement the trait — it is how
+				// most Rust types acquire Debug, Clone, Serialize. The
+				// annotation edge alone left find_implementations and
+				// get_class_hierarchy blind to all of them.
+				base := rustTraitPathBaseName(traitName)
+				if base == "" {
+					continue
+				}
+				result.Edges = append(result.Edges, &graph.Edge{
+					From: fromID, To: "unresolved::" + base,
+					Kind: graph.EdgeImplements, FilePath: filePath, Line: line,
+					Origin: graph.OriginASTInferred,
+					Meta:   map[string]any{"via": "derive"},
+				})
 			}
 			continue
 		}

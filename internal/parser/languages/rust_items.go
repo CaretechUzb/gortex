@@ -296,6 +296,50 @@ func emitRustAssociatedType(def *sitter.Node, filePath string, src []byte, resul
 	})
 }
 
+// emitRustImplBlock handles what an `impl` block carries beyond its
+// methods: the trait it implements, and the attributes written on the
+// block itself.
+//
+// `impl Display for Buf` left no relationship between Buf and Display at
+// all — only a method-level EdgeOverrides — so find_implementations and
+// get_class_hierarchy could not see the trait hierarchy, and a marker
+// impl with no methods (`impl Send for Handle {}`) left no trace
+// whatsoever.
+//
+// Attributes on the block were dropped outright, which is how
+// #[wasm_bindgen] impl, #[async_trait] impl and #[pymethods] all went
+// unrecorded — including the file-level wasm_bindgen sentinel, which
+// only ever saw function-level attributes.
+func emitRustImplBlock(def *sitter.Node, filePath string, src []byte, result *parser.ExtractionResult, annotationSeen map[string]bool) {
+	if def == nil {
+		return
+	}
+	typeNode := def.ChildByFieldName("type")
+	if typeNode == nil {
+		return
+	}
+	implType := rustImplReceiverName(typeNode.Content(src))
+	if implType == "" {
+		return
+	}
+	line := int(def.StartPoint().Row) + 1
+	// The impl target may be a generic instantiation (`Replacer<M>`);
+	// the node it belongs to is declared under the bare name.
+	typeID := filePath + "::" + rustTraitPathBaseName(implType)
+
+	if tr := def.ChildByFieldName("trait"); tr != nil {
+		if base := rustTraitPathBaseName(strings.TrimSpace(tr.Content(src))); base != "" {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: typeID, To: "unresolved::" + base,
+				Kind: graph.EdgeImplements, FilePath: filePath, Line: line,
+				Origin: graph.OriginASTInferred,
+				Meta:   map[string]any{"via": "impl"},
+			})
+		}
+	}
+	emitRustAnnotationEdges(rustCollectAttributes(def), typeID, filePath, src, result, annotationSeen)
+}
+
 // emitRustTupleFields emits positional fields for a tuple struct or a
 // tuple enum variant. `struct Meters(f64)` and `Msg::Failed(Error)` used
 // to emit no member at all, which also meant the wrapped type was
