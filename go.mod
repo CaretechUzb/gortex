@@ -225,7 +225,7 @@ require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/fwcd/tree-sitter-kotlin v0.0.0-20260411204054-55622a49bd59
 	github.com/gofrs/flock v0.13.0
-	github.com/gomlx/go-huggingface v0.3.5
+	github.com/gomlx/go-huggingface v0.4.0
 	github.com/google/go-github/v88 v88.0.0
 	github.com/google/uuid v1.6.0
 	github.com/gortexhq/gcx-go v0.1.0
@@ -238,9 +238,9 @@ require (
 	github.com/gortexhq/tree-sitter-swift v0.1.1-0.20260424235305-8dde3a3327dd
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/jedib0t/go-pretty/v6 v6.8.3
-	github.com/knights-analytics/hugot v0.7.5
+	github.com/knights-analytics/hugot v0.7.6
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
-	github.com/mark3labs/mcp-go v0.56.0
+	github.com/mark3labs/mcp-go v0.57.0
 	github.com/muesli/termenv v0.16.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/pkoukk/tiktoken-go v0.1.8
@@ -324,13 +324,14 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/go-errors/errors v1.5.1 // indirect
-	github.com/go-logr/logr v1.4.3 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
+	github.com/gomlx/compute v0.0.0-20260716164435-04857206aff7 // indirect
 	github.com/gomlx/exceptions v0.0.3 // indirect
-	github.com/gomlx/go-xla v0.2.2 // indirect
-	github.com/gomlx/gomlx v0.27.3 // indirect
-	github.com/gomlx/onnx-gomlx v0.4.2 // indirect
+	github.com/gomlx/go-xla v0.3.0 // indirect
+	github.com/gomlx/gomlx v0.28.0 // indirect
+	github.com/gomlx/onnx-gomlx v0.5.0 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/google/renameio v1.0.1 // indirect
@@ -363,7 +364,6 @@ require (
 	github.com/viant/afs v1.30.0 // indirect
 	github.com/viterin/partial v1.1.0 // indirect
 	github.com/viterin/vek v0.4.3 // indirect
-	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/zeebo/assert v1.3.0 // indirect
@@ -371,7 +371,7 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
-	golang.org/x/exp v0.0.0-20260709172345-9ea1abe57597 // indirect
+	golang.org/x/exp v0.0.0-20260718201538-764159d718ef // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	modernc.org/libc v1.74.1 // indirect
