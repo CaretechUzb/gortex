@@ -3920,11 +3920,11 @@ func (r *Resolver) buildProvidesForIndex() {
 		if ed.Meta == nil {
 			continue
 		}
-		pf, _ := ed.Meta["provides_for"].(string)
+		pf, _ := ed.Meta[graph.MetaDIProvidesFor].(string)
 		if pf == "" {
 			continue
 		}
-		if b, _ := ed.Meta["binding"].(string); b != "useClass" {
+		if b, _ := ed.Meta[graph.MetaDIBinding].(string); b != graph.DIBindingUseClass {
 			continue
 		}
 		to := ed.To

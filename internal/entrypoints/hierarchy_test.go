@@ -25,11 +25,9 @@ func extendsEdge(from, to string) *graph.Edge {
 }
 
 // TestPropagateEntryPointsDownHierarchy_StampsTransitiveDescendants is
-// the measured reference-codebase gap: extraction stamps BaseController
-// (it extends Controller directly, visible in its own file) but not the
-// 44 controllers that extend BaseController — the base's own base list
-// lives in another file. The inverted walk seeds from the stamped base
-// and stamps every descendant, including depth > 1.
+// the measured gap: extraction stamps BaseController but not the 44
+// controllers extending it. The walk seeds from the stamped base and
+// stamps every descendant, including depth > 1.
 func TestPropagateEntryPointsDownHierarchy_StampsTransitiveDescendants(t *testing.T) {
 	g := graph.New()
 	base := hierType("Base/BaseController.cs::BaseController", "BaseController", "csharp", controllerMeta())
@@ -132,10 +130,9 @@ func TestPropagateEntryPointsDownHierarchyScoped_SeedInFrontier(t *testing.T) {
 }
 
 // TestPropagateEntryPointsDownHierarchyScoped_DerivedFindsAncestor: a
-// save that adds a NEW derived type carries only that type in the
-// frontier; the stamped base lives in an unchanged file (possibly an
-// unchanged repo). The upward walk must find the stamped ancestor —
-// through an unstamped intermediate — and stamp the whole path down.
+// save adding a NEW derived type carries only that type in the frontier;
+// the upward walk must find the stamped ancestor — through an unstamped
+// intermediate — and stamp the whole path down.
 func TestPropagateEntryPointsDownHierarchyScoped_DerivedFindsAncestor(t *testing.T) {
 	g := graph.New()
 	base := hierType("B.cs::BaseController", "BaseController", "csharp", controllerMeta())

@@ -6,21 +6,18 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// hierarchyEntryKind registers an entry-point kind that a base class
-// confers on every derived type. Per-file detection stamps a type whose
-// OWN file shows the framework shape; a type inheriting it through a
-// project-local base shows nothing in its file and is missed — that hole
-// is language-generic, so the propagation below is too.
+// hierarchyEntryKind registers an entry-point kind a base class confers
+// on every derived type — a hole per-file detection cannot see when the
+// base's own base list lives in another file, in any language.
 type hierarchyEntryKind struct {
 	kind     string // MetaEntryKind value that seeds a walk and is stamped downward
 	language string // extractor language whose KindType nodes participate
 }
 
-// aspnet:controller is the first registered kind: a `ClaimController :
-// BaseController` routes like a controller even though nothing
-// controller-shaped appears in its own file — 44 of 119 controllers on
-// the measured reference codebase, each a dead-code false positive.
-// Spring/Django/Rails analogues slot in here without touching the pass.
+// aspnet:controller first: `ClaimController : BaseController` routes
+// like a controller with nothing controller-shaped in its own file —
+// 44 of 119 controllers on the reference codebase. Other frameworks'
+// analogues slot in without touching the pass.
 var hierarchyEntryKinds = []hierarchyEntryKind{
 	{kind: "aspnet:controller", language: "csharp"},
 }
@@ -29,19 +26,12 @@ var hierarchyEntryKinds = []hierarchyEntryKind{
 // batches, mirroring the indexer's test-metadata lookup cap.
 const hierarchyLookupBatchSize = 512
 
-// PropagateEntryPointsDownHierarchy stamps every registered
-// hierarchy-conferred entry-point kind down resolved extends chains,
-// whole-graph. It runs where the other global derived passes run (cold
-// index, end-of-batch); the incremental path uses the Scoped variant.
-//
-// The walk is inverted relative to an extends-table scan: seeds are the
-// types Detect already stamped, and the pass follows INCOMING extends
-// edges outward, so cost is O(seed subtree), zero when a workspace has
-// no seeds. Seed discovery itself is language-gated (HasLanguage) and
-// kind+language-bounded, so a workspace without the registered kind's
-// language never scans anything.
-//
-// Returns the number of newly stamped types.
+// PropagateEntryPointsDownHierarchy stamps every registered kind down
+// resolved extends chains, whole-graph (cold index / end-of-batch; the
+// watcher path uses the Scoped variant). Inverted walk: seeds are the
+// types Detect already stamped, followed via INCOMING extends edges —
+// O(seed subtree), and nothing at all when the store lacks the kind's
+// language. Returns the number of newly stamped types.
 func PropagateEntryPointsDownHierarchy(g graph.Store) int {
 	if g == nil {
 		return 0
@@ -62,22 +52,13 @@ func PropagateEntryPointsDownHierarchy(g graph.Store) int {
 	return total
 }
 
-// PropagateEntryPointsDownHierarchyScoped is the incremental form: the
-// changed-type frontier both bounds and drives seed discovery, like the
-// scoped passes around it in RunIncrementalDerivedPasses. Two cases per
-// registered kind:
-//
-//   - a changed type already stamped with the kind seeds a downward walk
-//     (an edit created or re-parented a base);
-//   - a changed UNSTAMPED type walks up its resolved extends chain — if a
-//     stamped ancestor exists, that ancestor seeds (an edit hung a new
-//     derived type off an existing hierarchy).
-//
-// Cross-repo posture: the frontier is exact node IDs (no repo-prefix
-// readers), the upward walk may land in a repository the changed one
-// depends on (a shared base project), and the downward walk stamps
-// derived types wherever they live — "changed repos plus what they
-// depend on", never a whole-graph scan.
+// PropagateEntryPointsDownHierarchyScoped is the incremental form,
+// driven by the changed-type frontier: a stamped frontier type seeds a
+// downward walk, an unstamped one first climbs to a stamped ancestor
+// (a new derived type hung off an unchanged hierarchy). Frontier IDs
+// are exact — no repo-prefix readers — and both walks follow resolved
+// edges wherever they lead: changed repos plus what they depend on,
+// never a whole-graph scan.
 func PropagateEntryPointsDownHierarchyScoped(g graph.Store, typeIDs []string) int {
 	if g == nil || len(typeIDs) == 0 {
 		return 0
@@ -109,11 +90,9 @@ func PropagateEntryPointsDownHierarchyScoped(g graph.Store, typeIDs []string) in
 	return total
 }
 
-// stampedAncestors walks up the resolved extends chains of the given
-// types and returns the ancestors already stamped with hk.kind. Chains
-// are short (inheritance depth), the visited set caps cycles, and a type
-// stamped with a DIFFERENT kind ends its path — it is not part of this
-// kind's hierarchy.
+// stampedAncestors climbs resolved extends chains and returns ancestors
+// already stamped with hk.kind. The visited set caps cycles; a type
+// stamped with a different kind ends its path.
 func stampedAncestors(g graph.Store, hk hierarchyEntryKind, ids []string) map[string]bool {
 	found := make(map[string]bool)
 	visited := make(map[string]bool, len(ids))
@@ -148,15 +127,11 @@ func stampedAncestors(g graph.Store, hk hierarchyEntryKind, ids []string) map[st
 	return found
 }
 
-// propagateFromSeeds BFSes downward from the seed set along incoming
-// resolved extends edges, stamping matching-language KindType descendants
-// that carry no entry-point kind yet. A descendant stamped with a
-// different kind (a derived xunit fixture, say) is left alone and ends
-// its branch. Persists like the test-symbol stamping pass: fetched nodes
-// are decoded copies on the SQLite backend, so Meta writes only land via
-// an explicit batch upsert. Idempotent — already-stamped descendants
-// re-enter the frontier (their subtree may still need work) but never
-// re-persist or re-count.
+// propagateFromSeeds BFSes down incoming resolved extends edges,
+// stamping same-language KindType descendants with no entry-point kind
+// yet (a different kind — a derived xunit fixture — ends the branch).
+// Fetched nodes are decoded copies on the SQLite backend, so the stamps
+// only land via the batch upsert. Idempotent.
 func propagateFromSeeds(g graph.Store, hk hierarchyEntryKind, seeds map[string]bool) int {
 	if len(seeds) == 0 {
 		return 0

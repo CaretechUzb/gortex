@@ -40,11 +40,11 @@ func ResolveCSharpDIImplementedInterfacesScoped(g graph.Store, scope map[string]
 		if e.Meta == nil {
 			continue
 		}
-		switch b, _ := e.Meta["binding"].(string); b {
-		case "asImplementedInterfaces":
+		switch b, _ := e.Meta[graph.MetaDIBinding].(string); b {
+		case graph.DIBindingAsImplemented:
 			markers = append(markers, e)
-		case "useClass":
-			pf, _ := e.Meta["provides_for"].(string)
+		case graph.DIBindingUseClass:
+			pf, _ := e.Meta[graph.MetaDIProvidesFor].(string)
 			existing[e.From+"\x00"+pf+"\x00"+providesTargetName(e.To)] = struct{}{}
 		}
 	}
@@ -72,7 +72,7 @@ func ResolveCSharpDIImplementedInterfacesScoped(g graph.Store, scope map[string]
 			if cand == nil || cand.Language != "csharp" || cand.Kind != graph.KindType {
 				continue
 			}
-			if cand.Meta != nil && cand.Meta["partial_merged_into"] != nil {
+			if cand.Meta != nil && cand.Meta[metaPartialMergedInto] != nil {
 				continue
 			}
 			if impl != nil {
@@ -118,11 +118,11 @@ func ResolveCSharpDIImplementedInterfacesScoped(g graph.Store, scope map[string]
 				Line:     iface.StartLine,
 				Origin:   graph.OriginASTInferred,
 				Meta: map[string]any{
-					"binding":         "useClass",
-					"provides_for":    iface.Name,
-					"di":              "autofac",
-					"impl_fqcn":       implName,
-					MetaSynthesizedBy: SynthCSharpDIIfaces,
+					graph.MetaDIBinding:     graph.DIBindingUseClass,
+					graph.MetaDIProvidesFor: iface.Name,
+					graph.MetaDISource:      "autofac",
+					graph.MetaDIImplFQCN:    implName,
+					MetaSynthesizedBy:       SynthCSharpDIIfaces,
 				},
 			})
 			added++

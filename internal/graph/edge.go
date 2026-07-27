@@ -700,6 +700,22 @@ const (
 // edge-returning surface drops these unless the caller opts in.
 const MetaSpeculative = "speculative"
 
+// DI-container binding contract (full shape documented in
+// internal/parser/languages/di_container.go): container extractors emit
+// EdgeProvides with these Meta keys; the resolver's provides-index and
+// framework synthesizers consume them. Exported here so both sides
+// compile against one spelling.
+const (
+	MetaDIBinding       = "binding"        // DIBindingUseClass or DIBindingAsImplemented
+	MetaDIProvidesFor   = "provides_for"   // interface short name the binding serves
+	MetaDISource        = "di"             // declaring container ("spring", "autofac", …)
+	MetaDIInterfaceFQCN = "interface_fqcn" // full interface name, for fidelity
+	MetaDIImplFQCN      = "impl_fqcn"      // full implementation name
+
+	DIBindingUseClass      = "useClass"
+	DIBindingAsImplemented = "asImplementedInterfaces"
+)
+
 // MetaReparsePendingEnrichment is a KindFile-node Meta key (not an edge key)
 // set by the indexer when a live watch re-parse resolved the file's references
 // without re-running semantic enrichment — so the file's edges may sit below

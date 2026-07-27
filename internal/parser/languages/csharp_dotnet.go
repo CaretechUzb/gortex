@@ -138,8 +138,26 @@ func detectDotNetSurfaces(src []byte, result *parser.ExtractionResult) {
 //   - multiple .As<>(): only the first interface is captured
 //   - assembly scanning (RegisterAssemblyTypes): the registered set is a
 //     runtime property of the assembly, not the call text
+//   - no comment/string stripping: a registration spelled inside a //
+//     comment or a verbatim string emits a real binding (pre-existing
+//     for the di_registrations metadata; shared by all patterns here)
 func emitDotNetDIBindings(text string, file *graph.Node, result *parser.ExtractionResult) {
-	lineAt := func(off int) int { return 1 + strings.Count(text[:off], "\n") }
+	// Cheap containment gate before six full-file regex alternations —
+	// most C# files are not composition roots.
+	if !strings.Contains(text, "RegisterType") &&
+		!strings.Contains(text, ".Add") && !strings.Contains(text, ".Register") {
+		return
+	}
+	// One newline table serves all six passes — each restarts at offset
+	// 0, so a shared cursor would rewind and a per-match strings.Count
+	// would be O(file × registrations).
+	var newlines []int
+	for i := 0; i < len(text); i++ {
+		if text[i] == '\n' {
+			newlines = append(newlines, i)
+		}
+	}
+	lineAt := func(off int) int { return 1 + sort.SearchInts(newlines, off) }
 	// Closed-generic registrations (As<IRepository<User>>) bind on the
 	// de-genericized name — type nodes index generic-erased, so the
 	// type-argument list would keep the edge unresolvable forever.
@@ -205,9 +223,9 @@ func emitDotNetDIBindings(text string, file *graph.Node, result *parser.Extracti
 			Line:     lineAt(ix[0]),
 			Origin:   graph.OriginASTInferred,
 			Meta: map[string]any{
-				"binding":   "asImplementedInterfaces",
-				"di":        "autofac",
-				"impl_fqcn": diNormalizeFQCN(deGeneric(text[ix[2]:ix[3]])),
+				graph.MetaDIBinding:  graph.DIBindingAsImplemented,
+				graph.MetaDISource:   "autofac",
+				graph.MetaDIImplFQCN: diNormalizeFQCN(deGeneric(text[ix[2]:ix[3]])),
 			},
 		})
 	}

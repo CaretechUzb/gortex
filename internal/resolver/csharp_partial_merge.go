@@ -26,10 +26,9 @@ import (
 //
 // Per group with >1 fragment the lowest ID is canonical (deterministic,
 // order-independent); the rest fold their in-edges and out-edges onto it
-// (mechanics at the rewrite sites below). The emptied fragment stays — the
-// store has no node removal — stamped Meta["partial_merged_into"]; the
-// markers are in-memory hints only, not SQLite-persisted, while the edge
-// rewrites route through Store methods and are what carry the merge.
+// (mechanics at the rewrite sites below). The emptied fragment stays —
+// the store has no node removal — stamped Meta[metaPartialMergedInto],
+// persisted so the DI synthesizer's husk skip holds across restarts.
 //
 // Scope: csharp class / struct / record only (KindType), mirroring the Go-only
 // gate on rebindGoMethodReceivers. Partial INTERFACES are intentionally out of
@@ -90,6 +89,11 @@ func (r *Resolver) mergeCSharpPartialTypesForFile(filePath string) {
 	r.mergeCSharpPartialGroups(groups)
 }
 
+// metaPartialMergedInto marks a merged-away fragment husk with its
+// canonical node's ID. The DI synthesizer's husk skip reads it, so the
+// marker is persisted, not an in-memory hint.
+const metaPartialMergedInto = "partial_merged_into"
+
 // csharpTypeKey identifies one C# type across its partial fragments:
 // same workspace repository, same enclosing namespace, same name.
 type csharpTypeKey struct{ repo, ns, name string }
@@ -103,26 +107,19 @@ func (r *Resolver) mergeCSharpPartialGroups(groups map[csharpTypeKey][]*graph.No
 	t0 := time.Now()
 	merged := 0
 	var batch []graph.EdgeReindex
+	var changedNodes []*graph.Node
 	for _, frags := range groups {
 		if len(frags) < 2 {
 			continue
 		}
-		// Canonical = lowest ID. Defensive kind-consistency guard: every
-		// member of the group should be the same KindType subtype (all the
-		// fragments of one partial type); if not, leave the group alone
-		// rather than fuse two unrelated nodes.
+		// Canonical = lowest ID (every group member is KindType by
+		// construction of the scan above; class/struct/record are Meta
+		// distinctions, not separate kinds).
 		canonical := frags[0]
-		sameKind := true
 		for _, n := range frags[1:] {
-			if n.Kind != canonical.Kind {
-				sameKind = false
-			}
 			if n.ID < canonical.ID {
 				canonical = n
 			}
-		}
-		if !sameKind {
-			continue
 		}
 
 		fragIDs := make([]string, 0, len(frags)-1)
@@ -175,14 +172,25 @@ func (r *Resolver) mergeCSharpPartialGroups(groups map[csharpTypeKey][]*graph.No
 				if frag.Meta == nil {
 					frag.Meta = map[string]any{}
 				}
-				frag.Meta["partial_merged_into"] = canonical.ID
+				if frag.Meta[metaPartialMergedInto] != canonical.ID {
+					frag.Meta[metaPartialMergedInto] = canonical.ID
+					changedNodes = append(changedNodes, frag)
+				}
 			}
 		}
 		if canonical.Meta == nil {
 			canonical.Meta = map[string]any{}
 		}
-		canonical.Meta["partial"] = true
+		if canonical.Meta["partial"] != true {
+			canonical.Meta["partial"] = true
+			changedNodes = append(changedNodes, canonical)
+		}
 		merged++
+	}
+	// Fetched nodes are decoded copies on the SQLite backend: the marker
+	// writes above only land via an explicit upsert.
+	if len(changedNodes) > 0 {
+		r.graph.AddBatch(changedNodes, nil)
 	}
 	// Batched like the sibling attribution passes: buffered while the
 	// incremental cache is active, applied directly otherwise.

@@ -41,13 +41,17 @@ func Detect(relPath, lang string, nodes []*graph.Node, edges []*graph.Edge) int 
 	return 0
 }
 
-// stamp marks a node as a framework entry point.
-func stamp(n *graph.Node, kind string) {
+// stamp marks a node as a framework entry point, reporting whether it
+// was previously unstamped so a detector pair touching one symbol
+// counts it once. The later, more specific stamp wins the Meta write.
+func stamp(n *graph.Node, kind string) bool {
 	if n.Meta == nil {
 		n.Meta = map[string]any{}
 	}
+	first := n.Meta[MetaEntryPoint] != true
 	n.Meta[MetaEntryPoint] = true
 	n.Meta[MetaEntryKind] = kind
+	return first
 }
 
 func isFnOrMethod(k graph.NodeKind) bool {
@@ -75,8 +79,9 @@ func detectAlembic(nodes []*graph.Node) int {
 	for _, n := range nodes {
 		if n.Kind == graph.KindFile ||
 			(n.Kind == graph.KindFunction && (n.Name == "upgrade" || n.Name == "downgrade")) {
-			stamp(n, "alembic:migration")
-			count++
+			if stamp(n, "alembic:migration") {
+				count++
+			}
 		}
 	}
 	return count
@@ -134,13 +139,15 @@ func detectNextJS(relPath string, nodes []*graph.Node) int {
 	count := 0
 	for _, n := range nodes {
 		if n.Kind == graph.KindFile {
-			stamp(n, kind)
-			count++
+			if stamp(n, kind) {
+				count++
+			}
 			continue
 		}
 		if isFnOrMethod(n.Kind) && nextEntrySymbols[n.Name] {
-			stamp(n, kind)
-			count++
+			if stamp(n, kind) {
+				count++
+			}
 		}
 	}
 	return count
@@ -159,12 +166,14 @@ func detectASPNet(relPath string, nodes []*graph.Node) int {
 	for _, n := range nodes {
 		switch {
 		case n.Kind == graph.KindFile:
-			stamp(n, "aspnet:host")
-			count++
+			if stamp(n, "aspnet:host") {
+				count++
+			}
 		case isFnOrMethod(n.Kind) &&
 			(n.Name == "Main" || n.Name == "ConfigureServices" || n.Name == "Configure"):
-			stamp(n, "aspnet:host")
-			count++
+			if stamp(n, "aspnet:host") {
+				count++
+			}
 		}
 	}
 	return count
@@ -252,14 +261,16 @@ func detectDotNetFramework(nodes []*graph.Node, edges []*graph.Edge) int {
 				kind = "aspnet:controller"
 			}
 			if kind != "" {
-				stamp(n, kind)
-				count++
+				if stamp(n, kind) {
+					count++
+				}
 			}
 		case graph.KindFunction, graph.KindMethod:
 			for a := range annos[n.ID] {
 				if k, ok := csharpEntryMethodAnnos[a]; ok {
-					stamp(n, k)
-					count++
+					if stamp(n, k) {
+						count++
+					}
 					break
 				}
 			}
@@ -364,8 +375,9 @@ func detectJava(nodes []*graph.Node, edges []*graph.Edge) int {
 		case graph.KindType, graph.KindInterface:
 			for a := range annos[n.ID] {
 				if kind, ok := javaEntryClassAnnos[a]; ok {
-					stamp(n, kind)
-					count++
+					if stamp(n, kind) {
+						count++
+					}
 					break
 				}
 			}
@@ -381,8 +393,9 @@ func detectJava(nodes []*graph.Node, edges []*graph.Edge) int {
 				kind = "java:main"
 			}
 			if kind != "" {
-				stamp(n, kind)
-				count++
+				if stamp(n, kind) {
+					count++
+				}
 			}
 		}
 	}
