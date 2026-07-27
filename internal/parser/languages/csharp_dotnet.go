@@ -110,6 +110,34 @@ func detectDotNetSurfaces(src []byte, result *parser.ExtractionResult) {
 	}
 }
 
+// diRegistrationSentinels are the literal substrings the registration
+// patterns require: no match is possible in a file containing none of
+// them, so the six alternations are skipped outright.
+//
+// Spelled out per lifetime rather than probing the shorter ".Add",
+// which `list.Add(x)` makes one of the most common substrings in any C#
+// file — the loose sentinel admitted nearly every file to the full
+// sweep. The regexes allow no space between "Add" and the lifetime
+// (`\.Add(Scoped|Singleton|Transient|HostedService)`), so each is a
+// contiguous literal.
+var diRegistrationSentinels = []string{
+	"RegisterType",     // autofac generic, typeof, and AsImplementedInterfaces forms
+	".Register",        // autofac factory lambda
+	"AddScoped",        // MS.DI two-arg generic + factory lambda
+	"AddSingleton",     //
+	"AddTransient",     //
+	"AddHostedService", // two-arg generic only
+}
+
+func hasDIRegistrationSentinel(text string) bool {
+	for _, sentinel := range diRegistrationSentinels {
+		if strings.Contains(text, sentinel) {
+			return true
+		}
+	}
+	return false
+}
+
 // emitDotNetDIBindings turns explicit .NET DI registrations into
 // EdgeProvides interface→implementation bindings — the shape the
 // resolver's provides-index consumes to land interface-typed call sites
@@ -144,8 +172,7 @@ func detectDotNetSurfaces(src []byte, result *parser.ExtractionResult) {
 func emitDotNetDIBindings(text string, file *graph.Node, result *parser.ExtractionResult) {
 	// Cheap containment gate before six full-file regex alternations —
 	// most C# files are not composition roots.
-	if !strings.Contains(text, "RegisterType") &&
-		!strings.Contains(text, ".Add") && !strings.Contains(text, ".Register") {
+	if !hasDIRegistrationSentinel(text) {
 		return
 	}
 	// One newline table serves all six passes — each restarts at offset

@@ -199,3 +199,49 @@ builder.RegisterType<ClaimDataWriteService>()
 	require.Contains(t, collectProvides(result),
 		provided{iface: "IWriteService", impl: "ClaimDataWriteService", source: "autofac"})
 }
+
+// TestDIRegistrationSentinel_SkipsOrdinaryCollectionCode locks the
+// tightened prefilter: `.Add(` is among the most common substrings in
+// C#, so ordinary collection code must not reach the six alternations.
+// Guarded from the other side by every binding test above — each covered
+// form still has to pass the gate.
+func TestDIRegistrationSentinel_SkipsOrdinaryCollectionCode(t *testing.T) {
+	for name, src := range map[string]string{
+		"list add":     `public void Load() { var xs = new List<int>(); xs.Add(1); xs.AddRange(ys); }`,
+		"dict add":     `public void Seed() { map.Add("k", v); map.Add("k2", v2); }`,
+		"no di at all": `public class Plain { public int Value => 42; }`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if hasDIRegistrationSentinel(src) {
+				t.Errorf("ordinary code reached the regex sweep: %s", src)
+			}
+			result := &parser.ExtractionResult{
+				Nodes: []*graph.Node{{ID: "F.cs", Kind: graph.KindFile, FilePath: "F.cs"}},
+			}
+			detectDotNetSurfaces([]byte(src), result)
+			require.Empty(t, collectProvides(result), "no bindings from non-registration code")
+		})
+	}
+}
+
+// TestDIRegistrationSentinel_AdmitsEveryCoveredForm pins the sentinel
+// list to the patterns: a form the gate rejects can never emit, and the
+// failure would be silent under-detection rather than a test error in
+// the binding tests, which build their own source.
+func TestDIRegistrationSentinel_AdmitsEveryCoveredForm(t *testing.T) {
+	for _, src := range []string{
+		`services.AddScoped<IFoo, Foo>();`,
+		`services.AddSingleton<IClock, SystemClock>();`,
+		`services.AddTransient<IFoo, Foo>();`,
+		`services.AddHostedService<Worker>();`,
+		`services.AddScoped<IMailer>(sp => new SmtpMailer());`,
+		`builder.RegisterType<Foo>().As<IFoo>();`,
+		`builder.RegisterType(typeof(Foo)).As(typeof(IFoo));`,
+		`builder.RegisterType<Foo>().AsImplementedInterfaces();`,
+		`builder.Register(c => new PdfRenderer()).As<IRenderer>();`,
+	} {
+		if !hasDIRegistrationSentinel(src) {
+			t.Errorf("covered registration form rejected by the prefilter: %s", src)
+		}
+	}
+}
