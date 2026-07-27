@@ -34,7 +34,7 @@ func Detect(relPath, lang string, nodes []*graph.Node, edges []*graph.Edge) int 
 	case "typescript", "javascript":
 		return detectNextJS(slashed, nodes)
 	case "csharp":
-		return detectASPNet(slashed, nodes)
+		return detectASPNet(slashed, nodes) + detectDotNetFramework(nodes, edges)
 	case "java":
 		return detectJava(nodes, edges)
 	}
@@ -168,6 +168,119 @@ func detectASPNet(relPath string, nodes []*graph.Node) int {
 		}
 	}
 	return count
+}
+
+// csharpAnnoPrefix is the synthetic annotation node-ID prefix the C#
+// extractor emits (languages.AnnotationNodeID("csharp", name)); the bare
+// attribute name is the suffix. C# lets the `Attribute` suffix be elided
+// at the use site ([HttpGet] == [HttpGetAttribute]), so matching strips it.
+const csharpAnnoPrefix = "annotation::csharp::"
+
+// csharpEntryClassAnnos maps a type-level C# attribute to the entry-point
+// kind it confers — the framework instantiates and drives the type, so it
+// has no in-application constructor / caller (ASP.NET (Core) controllers).
+var csharpEntryClassAnnos = map[string]string{
+	"ApiController": "aspnet:controller",
+	"Controller":    "aspnet:controller",
+}
+
+// csharpEntryMethodAnnos maps a method-level C# attribute to the entry-point
+// kind it confers — request handlers the routing layer invokes and test
+// methods the runner invokes, neither of which has an in-app caller.
+var csharpEntryMethodAnnos = map[string]string{
+	"HttpGet":    "aspnet:handler",
+	"HttpPost":   "aspnet:handler",
+	"HttpPut":    "aspnet:handler",
+	"HttpDelete": "aspnet:handler",
+	"HttpPatch":  "aspnet:handler",
+	"HttpHead":   "aspnet:handler",
+	"Route":      "aspnet:handler",
+	"Fact":       "xunit:test",
+	"Theory":     "xunit:test",
+	"Test":       "nunit:test",
+	"TestMethod": "mstest:test",
+}
+
+// csharpControllerBases are base types whose subclasses ASP.NET drives as
+// controllers even without a [Controller] / [ApiController] attribute.
+var csharpControllerBases = map[string]bool{
+	"Controller":     true,
+	"ControllerBase": true,
+}
+
+// detectDotNetFramework flags ASP.NET (Core) controllers + action handlers
+// and xUnit / NUnit / MSTest methods from the annotation and base-type edges
+// the C# extractor emits. Modeled on detectJava: it stamps the individual
+// framework-invoked symbols, NOT the file node — a controller file can still
+// hold genuinely-dead private helpers, and only the entry symbols should be
+// live roots. Edges are per-file (Detect runs during extraction), so a
+// type's own EdgeAnnotated / EdgeExtends edges are in the slice.
+func detectDotNetFramework(nodes []*graph.Node, edges []*graph.Edge) int {
+	annos := map[string]map[string]bool{} // symbol ID → attribute names (suffix-stripped)
+	controllerBase := map[string]bool{}   // type ID → extends a controller base
+	for _, e := range edges {
+		switch e.Kind {
+		case graph.EdgeAnnotated:
+			name, ok := strings.CutPrefix(e.To, csharpAnnoPrefix)
+			if !ok {
+				continue
+			}
+			name = strings.TrimSuffix(name, "Attribute")
+			if annos[e.From] == nil {
+				annos[e.From] = map[string]bool{}
+			}
+			annos[e.From][name] = true
+		case graph.EdgeExtends:
+			if csharpControllerBases[csharpBaseSimpleName(e.To)] {
+				controllerBase[e.From] = true
+			}
+		}
+	}
+
+	count := 0
+	for _, n := range nodes {
+		switch n.Kind {
+		case graph.KindType, graph.KindInterface:
+			kind := ""
+			for a := range annos[n.ID] {
+				if k, ok := csharpEntryClassAnnos[a]; ok {
+					kind = k
+					break
+				}
+			}
+			if kind == "" && controllerBase[n.ID] {
+				kind = "aspnet:controller"
+			}
+			if kind != "" {
+				stamp(n, kind)
+				count++
+			}
+		case graph.KindFunction, graph.KindMethod:
+			for a := range annos[n.ID] {
+				if k, ok := csharpEntryMethodAnnos[a]; ok {
+					stamp(n, k)
+					count++
+					break
+				}
+			}
+		}
+	}
+	return count
+}
+
+// csharpBaseSimpleName strips the `unresolved::` marker, any ID path, and
+// namespace qualification from a base-type edge target, leaving the bare
+// type name (`unresolved::Microsoft.AspNetCore.Mvc.ControllerBase` →
+// "ControllerBase").
+func csharpBaseSimpleName(to string) string {
+	to = strings.TrimPrefix(to, "unresolved::")
+	if i := strings.LastIndex(to, "::"); i >= 0 {
+		to = to[i+2:]
+	}
+	if i := strings.LastIndex(to, "."); i >= 0 {
+		to = to[i+1:]
+	}
+	return to
 }
 
 // javaAnnoPrefix is the synthetic annotation node-ID prefix the Java

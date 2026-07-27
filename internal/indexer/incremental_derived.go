@@ -22,11 +22,14 @@ type IncrementalDerivedReport struct {
 	TestSymbols    int
 	TestEdges      int
 	Capability     int
-	Framework      int
-	ExternalCalls  int
-	CrossRepo      int
-	Contracts      int
-	DurationMs     int64
+	// ControllerHierarchy counts aspnet:controller stamps propagated down
+	// the resolved C# extends chain on declaration-shape changes.
+	ControllerHierarchy int
+	Framework           int
+	ExternalCalls       int
+	CrossRepo           int
+	Contracts           int
+	DurationMs          int64
 }
 
 // RunIncrementalDerivedPasses executes only the derived families invalidated
@@ -113,6 +116,12 @@ func (mi *MultiIndexer) RunIncrementalDerivedPasses(
 	if merged.Flags.Has(DerivedInvalidatesRuntime) || merged.Flags.Has(DerivedInvalidatesTests) {
 		report.TestSymbols, report.TestEdges = markTestSymbolsAndEmitEdgesScoped(mi.graph, scopedPrefixes, merged.Files...)
 	}
+	if merged.Flags.Has(DerivedInvalidatesDeclarations) {
+		// A save that adds/re-parents a type can hang a new controller off
+		// an intermediate base; the pass is one extends-kind scan, cheap
+		// enough to re-run whole-graph on declaration-shape changes.
+		report.ControllerHierarchy = propagateAspNetControllerHierarchy(mi.graph)
+	}
 	if merged.Flags.Has(DerivedInvalidatesRuntime) {
 		readsEnv, execProc, fields := synthesizeCapabilityEdgesScoped(mi.graph, scopedPrefixes, merged.Files...)
 		report.Capability = readsEnv + execProc + fields
@@ -146,6 +155,7 @@ func (mi *MultiIndexer) logIncrementalDerived(report IncrementalDerivedReport, p
 		zap.Int("implements", report.Implements),
 		zap.Int("overrides", report.Overrides),
 		zap.Int("test_edges", report.TestEdges),
+		zap.Int("controller_hierarchy", report.ControllerHierarchy),
 		zap.Int("capability_edges", report.Capability),
 		zap.Int("framework_edges", report.Framework),
 		zap.Int("external_calls", report.ExternalCalls),

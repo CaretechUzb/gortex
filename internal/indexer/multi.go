@@ -1340,6 +1340,16 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 		zap.Int("test_symbols", marked),
 		zap.Int("edges", emitted),
 		zap.Duration("elapsed", time.Since(testStart)))
+	passStart("controller_hierarchy")
+	ctrlStart := time.Now()
+	// Whole-graph regardless of scope: a controller hierarchy can span
+	// repos (a shared base project), and the pass is one extends-kind
+	// scan — far cheaper than mis-scoping a cross-repo chain.
+	if ctrl := propagateAspNetControllerHierarchy(mi.graph); ctrl > 0 {
+		mi.logger.Info("global pass: controller hierarchy",
+			zap.Int("stamped", ctrl),
+			zap.Duration("elapsed", time.Since(ctrlStart)))
+	}
 	passStart("capability_edges")
 	capStart := time.Now()
 	capRe, capEp, capFa := synthesizeCapabilityEdgesScoped(mi.graph, changedPrefixes)

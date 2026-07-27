@@ -1,0 +1,176 @@
+package resolver
+
+import (
+	"strings"
+
+	"github.com/zzet/gortex/internal/graph"
+)
+
+// ResolveCSharpDIImplementedInterfaces expands Autofac
+// AsImplementedInterfaces() registrations into concrete interface→impl
+// bindings. The extractor cannot see the interface set in the call text
+// (`RegisterType<Foo>().AsImplementedInterfaces()` binds Foo to whatever
+// Foo implements), so it emits a marker EdgeProvides (binding
+// "asImplementedInterfaces", no provides_for) that the provides-index
+// ignores. This pass joins each marker with the impl's resolved
+// EdgeImplements set — the same information Autofac reflects over at
+// runtime — and emits one useClass binding per implemented interface,
+// the shape buildProvidesForIndex consumes.
+//
+// Runs with the framework synthesizers, after the implements-producing
+// passes, so the join sees the settled hierarchy (including implements
+// edges the partial-class merge folded onto the canonical fragment).
+func ResolveCSharpDIImplementedInterfaces(g graph.Store) int {
+	return ResolveCSharpDIImplementedInterfacesScoped(g, nil)
+}
+
+// ResolveCSharpDIImplementedInterfacesScoped limits partial work to
+// markers whose registration file lives in a changed repository. A nil
+// scope preserves the full/cold whole-graph behavior.
+func ResolveCSharpDIImplementedInterfacesScoped(g graph.Store, scope map[string]bool) int {
+	if g == nil {
+		return 0
+	}
+
+	// One provides scan yields both the markers to expand and the dedup
+	// set that makes a re-run (or an overlapping explicit .As<>) a no-op.
+	var markers []*graph.Edge
+	existing := map[string]struct{}{}
+	for _, e := range frameworkRepoEdges(g, scope, graph.EdgeProvides) {
+		if e.Meta == nil {
+			continue
+		}
+		switch b, _ := e.Meta["binding"].(string); b {
+		case "asImplementedInterfaces":
+			markers = append(markers, e)
+		case "useClass":
+			pf, _ := e.Meta["provides_for"].(string)
+			existing[e.From+"\x00"+pf+"\x00"+providesTargetName(e.To)] = struct{}{}
+		}
+	}
+	if len(markers) == 0 {
+		return 0
+	}
+
+	added := 0
+	for _, m := range markers {
+		implName := providesTargetName(m.To)
+		if implName == "" {
+			continue
+		}
+		// The marker's To stays an unresolved:: stub (the provides-index
+		// never binds it), so locate the impl by an exact, same-repo,
+		// unique csharp type lookup — ambiguity means skip, never guess.
+		// Merged-away partial fragments are excluded so the join reads
+		// the canonical node's full implements set.
+		repoPrefix := ""
+		if fileNode := g.GetNode(m.From); fileNode != nil {
+			repoPrefix = fileNode.RepoPrefix
+		}
+		var impl *graph.Node
+		for _, cand := range g.FindNodesByNameInRepo(implName, repoPrefix) {
+			if cand == nil || cand.Language != "csharp" || cand.Kind != graph.KindType {
+				continue
+			}
+			if cand.Meta != nil && cand.Meta["partial_merged_into"] != nil {
+				continue
+			}
+			if impl != nil {
+				impl = nil // ambiguous
+				break
+			}
+			impl = cand
+		}
+		if impl == nil {
+			continue
+		}
+
+		for _, e := range g.GetOutEdges(impl.ID) {
+			if e.Kind != graph.EdgeImplements {
+				continue
+			}
+			// Method-set-inferred implements edges link every same-shaped
+			// type in the repo; binding DI on them would invent
+			// registrations. Source-declared hierarchy only.
+			if e.Meta != nil && e.Meta["via"] == MetaViaMethodSetInference {
+				continue
+			}
+			// The interface must land on an in-repo node: it supplies the
+			// synthesized edge's distinct provenance site (the store keys
+			// edges on (From,To,Kind,FilePath,Line), and every binding of
+			// this marker shares the first three), and it filters the
+			// framework interfaces (IDisposable, …) Autofac technically
+			// registers but no find_implementations caller wants.
+			iface := csharpDIResolveIface(g, e.To, impl.RepoPrefix)
+			if iface == nil {
+				continue
+			}
+			key := m.From + "\x00" + iface.Name + "\x00" + implName
+			if _, dup := existing[key]; dup {
+				continue
+			}
+			existing[key] = struct{}{}
+			g.AddEdge(&graph.Edge{
+				From:     m.From,
+				To:       graph.UnresolvedMarker + implName,
+				Kind:     graph.EdgeProvides,
+				FilePath: iface.FilePath,
+				Line:     iface.StartLine,
+				Origin:   graph.OriginASTInferred,
+				Meta: map[string]any{
+					"binding":         "useClass",
+					"provides_for":    iface.Name,
+					"di":              "autofac",
+					"impl_fqcn":       implName,
+					MetaSynthesizedBy: SynthCSharpDIIfaces,
+				},
+			})
+			added++
+		}
+	}
+	return added
+}
+
+// csharpDIResolveIface lands an implements-edge target on its in-repo
+// interface node: directly when the resolver has already bound it, else
+// by an exact, same-repo, unique name lookup (the base-list may still
+// carry `unresolved::` stubs when the synthesizers run). Nil when the
+// interface is not indexed in this repo — external framework interfaces
+// are deliberately not bound.
+func csharpDIResolveIface(g graph.Store, to, repoPrefix string) *graph.Node {
+	if !graph.IsUnresolvedTarget(to) {
+		n := g.GetNode(to)
+		if n != nil && n.Kind == graph.KindInterface && n.Language == "csharp" {
+			return n
+		}
+		return nil
+	}
+	name := graph.UnresolvedName(to)
+	if name == "" {
+		return nil
+	}
+	var found *graph.Node
+	for _, cand := range g.FindNodesByNameInRepo(name, repoPrefix) {
+		if cand == nil || cand.Language != "csharp" || cand.Kind != graph.KindInterface {
+			continue
+		}
+		if found != nil {
+			return nil // ambiguous — skip, never guess
+		}
+		found = cand
+	}
+	return found
+}
+
+// providesTargetName reduces a provides/implements edge target to the
+// bare type name the provides-index groups by: `unresolved::Foo` → Foo,
+// `path/File.cs::Foo` → Foo, `Foo` → Foo.
+func providesTargetName(to string) string {
+	if graph.IsUnresolvedTarget(to) {
+		return graph.UnresolvedName(to)
+	}
+	if cut := strings.LastIndex(to, "::"); cut >= 0 {
+		return to[cut+2:]
+	}
+	return to
+}
