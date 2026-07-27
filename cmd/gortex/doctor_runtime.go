@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/doctor"
 	"github.com/zzet/gortex/internal/hooks"
@@ -32,11 +33,35 @@ type doctorRuntime struct {
 	Window   string                     `json:"window"`
 	Since    time.Time                  `json:"since"`
 	Redacted bool                       `json:"redacted"`
-	Codex    codex.InstallState         `json:"codex"`
 	Hooks    hooks.EffectivenessSummary `json:"hooks"`
-	Adoption doctor.Adoption            `json:"adoption"`
+	Agents   []doctorAgentRuntime       `json:"agents"`
 	Savings  doctorSavings              `json:"savings"`
-	Findings []doctor.Finding           `json:"findings"`
+}
+
+// doctorAgentRuntime is one agent's runtime slice. Reporting a list rather
+// than a single agent is the difference between "here is your machine" and
+// "here is the one agent doctor happens to know about" — the invocation log
+// has always been partitioned per agent, and only the rendering singled Codex
+// out.
+type doctorAgentRuntime struct {
+	Agent      string                         `json:"agent"`
+	Install    doctorAgentInstall             `json:"install"`
+	HookEvents []string                       `json:"hook_events"`
+	Activity   map[string]hooks.EventActivity `json:"activity"`
+	Adoption   doctor.Adoption                `json:"adoption"`
+	Findings   []doctor.Finding               `json:"findings"`
+}
+
+// doctorAgentInstall is the shape both adapters' Inspect calls lower into, so
+// the renderer does not branch per agent.
+type doctorAgentInstall struct {
+	ConfigPath        string         `json:"config_path"`
+	ConfigPresent     bool           `json:"config_present"`
+	MCPServer         bool           `json:"mcp_server"`
+	Hooks             map[string]int `json:"hooks"`
+	InstructionsPath  string         `json:"instructions_path,omitempty"`
+	InstructionsWired bool           `json:"instructions_wired"`
+	ShadowedBy        string         `json:"shadowed_by,omitempty"`
 }
 
 type doctorSavings struct {
@@ -65,42 +90,104 @@ func collectRuntime(home string, days int) doctorRuntime {
 	now := time.Now()
 	since := now.Add(-time.Duration(days) * 24 * time.Hour)
 
-	state := codex.Inspect(home)
-	if doctorRedact {
-		state.ConfigPath = doctorPath(state.ConfigPath)
-		state.InstructionsPath = doctorPath(state.InstructionsPath)
-		state.ShadowedBy = doctorPath(state.ShadowedBy)
-	}
 	activity, err := hooks.ReadEffectiveness(since)
 	if err != nil {
 		// A log we cannot read is not fatal; the other sections still carry
 		// signal, and the empty summary renders as "no hook has ever run".
 		activity.Path = hooks.EffectivenessLogPath()
 	}
-	adoption := doctor.ScanCodexSessions(doctor.CodexHome(), since, 10)
 
 	out := doctorRuntime{
 		Window:   fmt.Sprintf("last %dd", days),
 		Since:    since,
 		Redacted: doctorRedact,
-		Codex:    state,
 		Hooks:    activity,
-		Adoption: adoption,
 		Savings:  collectSavings(since),
 	}
-	out.Findings = doctor.Diagnose(doctor.AgentHooks{
-		Agent:                codex.Name,
-		Configured:           state.Hooks,
-		RequiresTrust:        true,
-		TrustRemedy:          codex.TrustRemedy,
-		InstructionsPath:     state.InstructionsPath,
-		InstructionsWired:    state.InstructionsWired,
-		InstructionsShadowed: state.ShadowedBy,
-	}, activity, adoption, now)
+	for _, probe := range doctorAgentProbes(home) {
+		out.Agents = append(out.Agents, probe(since, activity, now))
+	}
+	if doctorRedact {
+		out.Hooks.Path = doctorPath(out.Hooks.Path)
+	}
+	return out
+}
 
+// agentProbe collects one agent's runtime slice.
+type agentProbe func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime
+
+// doctorAgentProbes returns a probe per agent doctor can speak about. Adding
+// an agent here is the whole cost of covering it — the finding rules, the
+// per-agent log partition, and the renderer are all already generic.
+func doctorAgentProbes(home string) []agentProbe {
+	return []agentProbe{
+		func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
+			state := codex.Inspect(home)
+			return buildAgentRuntime(agentRuntimeInput{
+				agent:      codex.Name,
+				hookEvents: codex.HookEvents,
+				install: doctorAgentInstall{
+					ConfigPath: state.ConfigPath, ConfigPresent: state.ConfigPresent,
+					MCPServer: state.MCPServer, Hooks: state.Hooks,
+					InstructionsPath: state.InstructionsPath, InstructionsWired: state.InstructionsWired,
+					ShadowedBy: state.ShadowedBy,
+				},
+				// Codex is the one harness that gates hook execution on an
+				// explicit per-hook approval.
+				requiresTrust: true,
+				trustRemedy:   codex.TrustRemedy,
+				adoption:      doctor.ScanCodexSessions(doctor.CodexHome(), since, 10),
+			}, activity, now)
+		},
+		func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
+			state := claudecode.Inspect(home)
+			return buildAgentRuntime(agentRuntimeInput{
+				agent:      hooks.AgentClaudeCode,
+				hookEvents: claudecode.HookEvents,
+				install: doctorAgentInstall{
+					ConfigPath: state.ConfigPath, ConfigPresent: state.ConfigPresent,
+					MCPServer: state.MCPServer, Hooks: state.Hooks,
+					InstructionsPath: state.InstructionsPath, InstructionsWired: state.InstructionsWired,
+				},
+				adoption: doctor.ScanClaudeSessions(doctor.ClaudeHome(), since, 10),
+			}, activity, now)
+		},
+	}
+}
+
+type agentRuntimeInput struct {
+	agent         string
+	hookEvents    []string
+	install       doctorAgentInstall
+	requiresTrust bool
+	trustRemedy   string
+	adoption      doctor.Adoption
+}
+
+func buildAgentRuntime(in agentRuntimeInput, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
+	if doctorRedact {
+		in.install.ConfigPath = doctorPath(in.install.ConfigPath)
+		in.install.InstructionsPath = doctorPath(in.install.InstructionsPath)
+		in.install.ShadowedBy = doctorPath(in.install.ShadowedBy)
+	}
+	out := doctorAgentRuntime{
+		Agent:      in.agent,
+		Install:    in.install,
+		HookEvents: in.hookEvents,
+		Activity:   activity.ForAgent(in.agent),
+		Adoption:   in.adoption,
+	}
+	out.Findings = doctor.Diagnose(doctor.AgentHooks{
+		Agent:                in.agent,
+		Configured:           in.install.Hooks,
+		RequiresTrust:        in.requiresTrust,
+		TrustRemedy:          in.trustRemedy,
+		InstructionsPath:     in.install.InstructionsPath,
+		InstructionsWired:    in.install.InstructionsWired,
+		InstructionsShadowed: in.install.ShadowedBy,
+	}, activity, in.adoption, now)
 	if doctorRedact {
 		out.Adoption = redactAdoption(out.Adoption)
-		out.Hooks.Path = doctorPath(out.Hooks.Path)
 	}
 	return out
 }
@@ -172,44 +259,72 @@ func redactName(value string) string {
 }
 
 func printDoctorRuntime(w io.Writer, r doctorRuntime) {
-	fmt.Fprintf(w, "Gortex doctor — runtime evidence (%s):\n\n", r.Window)
+	fmt.Fprintf(w, "Gortex doctor — runtime evidence (%s):\n", r.Window)
 
-	fmt.Fprintln(w, "  codex install")
-	if !r.Codex.ConfigPresent {
-		fmt.Fprintf(w, "    %s %s missing\n", glyphCross, r.Codex.ConfigPath)
-	} else {
-		fmt.Fprintf(w, "    %s mcp_servers.gortex\n", mark(r.Codex.MCPServer))
-		for _, event := range codex.HookEvents {
-			fmt.Fprintf(w, "    %s hook %-17s %d configured\n", mark(r.Codex.Hooks[event] > 0), event, r.Codex.Hooks[event])
+	for _, agent := range r.Agents {
+		printAgentRuntime(w, agent, r.Hooks)
+	}
+	printSavings(w, r.Savings)
+
+	fmt.Fprintln(w, "  findings")
+	for _, agent := range r.Agents {
+		for _, f := range agent.Findings {
+			glyph := "·"
+			switch f.Severity {
+			case doctor.SeverityBlocker:
+				glyph = glyphCross
+			case doctor.SeverityWarn:
+				glyph = glyphWarn
+			case doctor.SeverityOK:
+				glyph = glyphCheck
+			}
+			fmt.Fprintf(w, "    %s %-7s [%s] %s\n", glyph, f.Severity, agent.Agent, f.Summary)
+			if f.Remedy != "" {
+				fmt.Fprintf(w, "              → %s\n", f.Remedy)
+			}
 		}
 	}
-	fmt.Fprintf(w, "    %s rule block in %s\n", mark(r.Codex.InstructionsWired), r.Codex.InstructionsPath)
-	if r.Codex.ShadowedBy != "" {
-		fmt.Fprintf(w, "    %s shadowed by %s\n", glyphCross, r.Codex.ShadowedBy)
+	if !r.Redacted {
+		fmt.Fprintln(w, "\n  sharing this? re-run with --redact to hash repo paths and branch names.")
 	}
 	fmt.Fprintln(w)
+}
 
-	fmt.Fprintf(w, "  hook activity   (did %s's hook processes actually run?)\n", codex.Name)
-	if !r.Hooks.Present {
-		fmt.Fprintf(w, "    no %s — no hook has ever run on this machine\n", r.Hooks.Path)
+func printAgentRuntime(w io.Writer, a doctorAgentRuntime, summary hooks.EffectivenessSummary) {
+	fmt.Fprintf(w, "\n  %s — install\n", a.Agent)
+	if !a.Install.ConfigPresent {
+		fmt.Fprintf(w, "    %s %s missing\n", glyphAbsent, a.Install.ConfigPath)
 	} else {
-		scoped := r.Hooks.ForAgent(codex.Name)
+		fmt.Fprintf(w, "    %s mcp server registered\n", mark(a.Install.MCPServer))
+		for _, event := range a.HookEvents {
+			fmt.Fprintf(w, "    %s hook %-17s %d configured\n", mark(a.Install.Hooks[event] > 0), event, a.Install.Hooks[event])
+		}
+	}
+	if a.Install.InstructionsPath != "" {
+		fmt.Fprintf(w, "    %s rule block in %s\n", mark(a.Install.InstructionsWired), a.Install.InstructionsPath)
+	}
+	if a.Install.ShadowedBy != "" {
+		fmt.Fprintf(w, "    %s shadowed by %s\n", glyphWarn, a.Install.ShadowedBy)
+	}
+
+	fmt.Fprintf(w, "\n  %s — hook activity\n", a.Agent)
+	if !summary.Present {
+		fmt.Fprintf(w, "    no %s — no hook has ever run on this machine\n", summary.Path)
+	} else {
 		fmt.Fprintf(w, "    %-18s %7s %9s %10s %8s  %s\n", "event", "runs", "injected", "daemon-up", "unattrib", "last seen")
-		for _, event := range doctorEventOrder(r.Hooks) {
-			stats := scoped[event]
+		for _, event := range a.HookEvents {
+			stats := a.Activity[event]
 			daemon := "n/a"
 			if stats.DaemonKnown > 0 {
 				daemon = fmt.Sprintf("%d/%d", stats.DaemonUp, stats.DaemonKnown)
 			}
 			// A zero in `runs` is only alarming when `unattrib` is zero too;
-			// showing them side by side is what keeps the reader from
-			// reaching the conclusion the findings deliberately withheld.
-			ambiguous := r.Hooks.AmbiguousRuns(event)
+			// showing them side by side keeps the reader from reaching the
+			// conclusion the findings deliberately withheld.
+			ambiguous := summary.AmbiguousRuns(event)
 			seen := stats.LastSeen
 			if seen.IsZero() {
-				// The event did run, we just cannot say for whom — dating it
-				// "never" would contradict the count beside it.
-				seen = r.Hooks.Unattributed[event].LastSeen
+				seen = summary.Unattributed[event].LastSeen
 			}
 			last := "never"
 			if !seen.IsZero() {
@@ -217,61 +332,48 @@ func printDoctorRuntime(w io.Writer, r doctorRuntime) {
 			}
 			fmt.Fprintf(w, "    %-18s %7d %9d %10s %8d  %s\n", event, stats.Runs, stats.Emitted, daemon, ambiguous, last)
 		}
-		fmt.Fprintf(w, "    %d row(s) in window, %d in the whole log\n", r.Hooks.WindowRows, r.Hooks.TotalRows)
-		if agents := r.Hooks.AgentNames(); len(agents) > 0 {
-			fmt.Fprintf(w, "    agents seen                %s\n", joinComma(agents))
-		}
-		if r.Hooks.UnattributedRows > 0 {
-			// Rows written before the agent field existed cannot be assigned
-			// to anyone. They are held out of every agent's counts rather
-			// than shared into all of them, and a `runs` of 0 beside a
-			// non-zero `unattrib` means "cannot tell", not "did not run".
-			fmt.Fprintf(w, "    note: %d row(s) predate per-agent attribution (the unattrib column).\n", r.Hooks.UnattributedRows)
-			fmt.Fprintln(w, "          They can neither confirm nor rule out an agent's hooks, so a 0 in")
-			fmt.Fprintln(w, "          runs beside a non-zero unattrib is withheld from the findings.")
-			fmt.Fprintln(w, "          They clear as the window rolls past the upgrade.")
-		}
 	}
-	fmt.Fprintln(w)
 
-	fmt.Fprintln(w, "  codex adoption  (what the model actually called)")
-	if r.Adoption.FilesFound == 0 {
-		fmt.Fprintf(w, "    no session transcripts under %s\n", r.Adoption.Root)
+	fmt.Fprintf(w, "\n  %s — adoption (what the model actually called)\n", a.Agent)
+	if a.Adoption.FilesFound == 0 {
+		fmt.Fprintf(w, "    no session transcripts under %s\n", a.Adoption.Root)
 	} else {
-		fmt.Fprintf(w, "    sessions with tool calls   %d of %d on disk\n", r.Adoption.InWindow, r.Adoption.FilesFound)
-		fmt.Fprintf(w, "    gortex MCP calls           %d\n", r.Adoption.GortexCalls)
-		fmt.Fprintf(w, "    other MCP calls            %d\n", r.Adoption.OtherMCP)
-		fmt.Fprintf(w, "    shell calls                %d (%d read/search shaped)\n", r.Adoption.ShellCalls, r.Adoption.ShellReads)
-		if len(r.Adoption.Tools) > 0 {
-			fmt.Fprintf(w, "    gortex tools used          %s\n", topCounts(r.Adoption.Tools, 8))
+		fmt.Fprintf(w, "    sessions with tool calls   %d of %d in window\n", a.Adoption.InWindow, a.Adoption.FilesFound)
+		fmt.Fprintf(w, "    gortex MCP calls           %d\n", a.Adoption.GortexCalls)
+		fmt.Fprintf(w, "    other MCP calls            %d\n", a.Adoption.OtherMCP)
+		fmt.Fprintf(w, "    native read/shell calls    %d (%d read/search shaped)\n", a.Adoption.ShellCalls, a.Adoption.ShellReads)
+		if len(a.Adoption.Tools) > 0 {
+			fmt.Fprintf(w, "    gortex tools used          %s\n", topCounts(a.Adoption.Tools, 8))
 		}
-		if len(r.Adoption.Models) > 0 {
-			fmt.Fprintf(w, "    models                     %s\n", topCounts(r.Adoption.Models, 4))
+		if len(a.Adoption.Models) > 0 {
+			fmt.Fprintf(w, "    models                     %s\n", topCounts(a.Adoption.Models, 4))
 		}
 	}
-	fmt.Fprintln(w, "    note: Codex does not persist hook-injected context into transcripts, so")
-	fmt.Fprintln(w, "          this section cannot prove a hook fired — hook activity above does.")
 	fmt.Fprintln(w)
+}
 
+func printSavings(w io.Writer, sv doctorSavings) {
 	fmt.Fprintln(w, "  savings ledger")
 	switch {
-	case !r.Savings.Available:
-		fmt.Fprintf(w, "    unavailable: %s\n", r.Savings.Error)
-	case r.Savings.Events == 0:
+	case !sv.Available:
+		fmt.Fprintf(w, "    unavailable: %s\n", sv.Error)
+	case sv.Events == 0:
 		fmt.Fprintln(w, "    no recorded events in window")
 	default:
-		baseline := r.Savings.Saved + r.Savings.Returned
+		baseline := sv.Saved + sv.Returned
 		pct := 0.0
 		if baseline > 0 {
-			pct = 100 * float64(r.Savings.Saved) / float64(baseline)
+			pct = 100 * float64(sv.Saved) / float64(baseline)
 		}
-		fmt.Fprintf(w, "    events                     %d\n", r.Savings.Events)
-		fmt.Fprintf(w, "    saved / baseline           %d / %d (%.1f%%)\n", r.Savings.Saved, baseline, pct)
-		fmt.Fprintf(w, "    without client / model     %d / %d\n", r.Savings.NoClient, r.Savings.NoModel)
-		for label, rows := range map[string][]doctorDimTotal{
-			"by tool": r.Savings.ByTool, "by client": r.Savings.ByClient, "by model": r.Savings.ByModel,
-		} {
-			for i, row := range rows {
+		fmt.Fprintf(w, "    events                     %d\n", sv.Events)
+		fmt.Fprintf(w, "    saved / baseline           %d / %d (%.1f%%)\n", sv.Saved, baseline, pct)
+		fmt.Fprintf(w, "    without client / model     %d / %d\n", sv.NoClient, sv.NoModel)
+		for _, group := range []struct {
+			label string
+			rows  []doctorDimTotal
+		}{{"by tool", sv.ByTool}, {"by client", sv.ByClient}, {"by model", sv.ByModel}} {
+			label := group.label
+			for i, row := range group.rows {
 				if i >= 6 {
 					break
 				}
@@ -284,45 +386,6 @@ func printDoctorRuntime(w io.Writer, r doctorRuntime) {
 	fmt.Fprintln(w, "          returned). explore / search / relations / trace record nothing, and")
 	fmt.Fprintln(w, "          reading a whole file records 0 — so this describes those calls only.")
 	fmt.Fprintln(w)
-
-	fmt.Fprintln(w, "  findings")
-	for _, f := range r.Findings {
-		glyph := "·"
-		switch f.Severity {
-		case doctor.SeverityBlocker:
-			glyph = glyphCross
-		case doctor.SeverityWarn:
-			glyph = "!"
-		case doctor.SeverityOK:
-			glyph = glyphCheck
-		}
-		fmt.Fprintf(w, "    %s %-7s %s\n", glyph, f.Severity, f.Summary)
-		if f.Remedy != "" {
-			fmt.Fprintf(w, "              → %s\n", f.Remedy)
-		}
-	}
-	if !r.Redacted {
-		fmt.Fprintln(w, "\n  sharing this? re-run with --redact to hash repo paths and branch names.")
-	}
-	fmt.Fprintln(w)
-}
-
-// doctorEventOrder lists the adapter's own events first, in lifecycle order,
-// then anything else the log saw — so the events a reader is looking for are
-// never buried under LocalizationTerminal rows.
-func doctorEventOrder(s hooks.EffectivenessSummary) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(s.Events)+len(codex.HookEvents))
-	for _, event := range codex.HookEvents {
-		out = append(out, event)
-		seen[event] = true
-	}
-	for _, event := range s.EventNames() {
-		if !seen[event] {
-			out = append(out, event)
-		}
-	}
-	return out
 }
 
 func topCounts(counts map[string]int, limit int) string {
