@@ -1612,7 +1612,55 @@ func rustImplMethodReceiver(fn *sitter.Node, src []byte) string {
 	if typeNode == nil {
 		return ""
 	}
-	return typeNode.Content(src)
+	return rustImplReceiverName(typeNode.Content(src))
+}
+
+// rustImplReceiverName reduces an impl target to the name a method node
+// can hang off. `impl Trait for &'a Buf` used to mint the method id
+// `<file>::&'a Buf.show` with a member_of edge to a node that never
+// exists; the same went for slice, array and raw-pointer impls.
+//
+// The generic spelling is deliberately preserved — `Replacer<M>.replace`
+// is the established id shape, and rebindRustLocalGenericMemberOwners
+// repairs the member_of target for it separately.
+func rustImplReceiverName(t string) string {
+	t = strings.TrimSpace(t)
+	for {
+		trimmed := t
+		// Reference: &T, &mut T, &'a T.
+		if strings.HasPrefix(trimmed, "&") {
+			trimmed = strings.TrimSpace(trimmed[1:])
+			if strings.HasPrefix(trimmed, "'") {
+				if i := strings.IndexAny(trimmed, " \t"); i > 0 {
+					trimmed = strings.TrimSpace(trimmed[i:])
+				}
+			}
+			trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "mut "))
+		}
+		// Raw pointer: *const T, *mut T.
+		if strings.HasPrefix(trimmed, "*") {
+			trimmed = strings.TrimSpace(trimmed[1:])
+			trimmed = strings.TrimPrefix(trimmed, "const ")
+			trimmed = strings.TrimPrefix(trimmed, "mut ")
+			trimmed = strings.TrimSpace(trimmed)
+		}
+		// Slice or array: [T] and [T; N].
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+			if parts := rustSplitTopLevel(inner, ';'); len(parts) > 0 {
+				inner = parts[0]
+			}
+			trimmed = strings.TrimSpace(inner)
+		}
+		if strings.HasPrefix(trimmed, "dyn ") {
+			trimmed = strings.TrimSpace(trimmed[4:])
+		}
+		if trimmed == t {
+			break
+		}
+		t = trimmed
+	}
+	return t
 }
 
 // rustTraitMethodOwner returns the trait name when fn is a direct member
