@@ -292,6 +292,10 @@ func (e *PHPExtractor) extractPhpMembers(
 	ownerName, ownerID string,
 ) map[string]*sitter.Node {
 	methodNodes := make(map[string]*sitter.Node)
+	// Property types are read once for the whole body so every method's call
+	// sites can type a `$this->prop->m()` receiver, including properties
+	// declared after the method that uses them.
+	props := phpClassPropertyTypes(body, src)
 	for i, _nc := 0, int(body.NamedChildCount()); i < _nc; i++ {
 		child := body.NamedChild(i)
 		switch child.Type() {
@@ -299,7 +303,7 @@ func (e *PHPExtractor) extractPhpMembers(
 			if n := e.findChildByFieldName(child, "name"); n != nil {
 				methodNodes[n.Content(src)] = child
 			}
-			e.extractMethod(child, src, filePath, fileNode, result, seen, ownerName)
+			e.extractMethod(child, src, filePath, fileNode, result, seen, ownerName, props)
 		case "const_declaration":
 			e.extractPhpClassConst(child, src, filePath, fileNode, result, seen, ownerName, ownerID)
 		case "property_declaration":
@@ -705,10 +709,13 @@ func (e *PHPExtractor) extractFunction(
 	// Typed parameters → EdgeTypedAs usage edges on the function.
 	e.emitPHPParamTypeUseEdges(node, src, id, filePath, result)
 
-	// Extract call sites within the function body.
+	// Extract call sites within the function body. A free function has no
+	// `$this`, so only its typed parameters and local `new` bindings type a
+	// receiver.
 	body := e.findChildByType(node, "compound_statement")
 	if body != nil {
-		e.extractCallSites(body, src, filePath, id, result)
+		e.extractCallSitesInScope(body, src, filePath, id, result,
+			newPHPReceiverEnv(node, src, "", nil))
 	}
 }
 
@@ -716,7 +723,7 @@ func (e *PHPExtractor) extractMethod(
 	node *sitter.Node, src []byte,
 	filePath string, fileNode *graph.Node,
 	result *parser.ExtractionResult, seen map[string]bool,
-	className string,
+	className string, props map[string]string,
 ) {
 	nameNode := e.findChildByFieldName(node, "name")
 	if nameNode == nil {
@@ -771,10 +778,13 @@ func (e *PHPExtractor) extractMethod(
 		From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine,
 	})
 
-	// Extract call sites within the method body.
+	// Extract call sites within the method body. `$this` is the declaring
+	// class, so every unqualified member call in the body carries a receiver
+	// type the resolver can bind exactly.
 	body := e.findChildByType(node, "compound_statement")
 	if body != nil {
-		e.extractCallSites(body, src, filePath, id, result)
+		e.extractCallSitesInScope(body, src, filePath, id, result,
+			newPHPReceiverEnv(node, src, className, props))
 	}
 }
 
@@ -845,7 +855,23 @@ func (e *PHPExtractor) extractCallSites(
 	filePath string, callerID string,
 	result *parser.ExtractionResult,
 ) {
+	e.extractCallSitesInScope(node, src, filePath, callerID, result, phpReceiverEnv{})
+}
+
+// extractCallSitesInScope is extractCallSites carrying the receiver-typing
+// environment of the function body being walked. Descending into a closure
+// derives a child scope rather than reusing the parent's, so a closure
+// parameter shadows an outer variable of the same name instead of inheriting
+// its type.
+func (e *PHPExtractor) extractCallSitesInScope(
+	node *sitter.Node, src []byte,
+	filePath string, callerID string,
+	result *parser.ExtractionResult,
+	env phpReceiverEnv,
+) {
 	switch node.Type() {
+	case "anonymous_function", "anonymous_function_creation_expression", "arrow_function":
+		env = env.childScope(node, src)
 	case "function_call_expression":
 		funcNode := node.ChildByFieldName("function")
 		if funcNode != nil {
@@ -859,7 +885,7 @@ func (e *PHPExtractor) extractCallSites(
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
 			})
 		}
-	case "member_call_expression", "scoped_call_expression":
+	case "member_call_expression", "nullsafe_member_call_expression", "scoped_call_expression":
 		nameNode := node.ChildByFieldName("name")
 		if nameNode != nil {
 			name := nameNode.Content(src)
@@ -905,22 +931,32 @@ func (e *PHPExtractor) extractCallSites(
 							}
 							edge.Meta["eloquent_model"] = model
 							edge.Meta["eloquent_method"] = name
+						} else if rt := env.phpScopeReceiverType(scope, src); rt != "" {
+							// `Utils::pick()` / `$cls::make()` — the scope names
+							// the class the static method belongs to, which is
+							// the strongest receiver evidence PHP offers.
+							edge.Meta = map[string]any{"receiver_type": rt}
 						}
 					}
 				}
 			}
-			// Chained-factory receiver: `make()->with()->build()` -- carry the
-			// receiver object (`->` normalised to `.`) so the shared walker can
-			// type the chain or preserve it for the graph-aware resolver.
-			if node.Type() == "member_call_expression" {
+			if node.Type() == "member_call_expression" || node.Type() == "nullsafe_member_call_expression" {
 				obj := node.ChildByFieldName("object")
 				if obj == nil && node.NamedChildCount() > 0 {
 					obj = node.NamedChild(0)
 				}
 				if obj != nil {
-					recv := strings.ReplaceAll(strings.TrimSpace(obj.Content(src)), "->", ".")
-					if strings.Contains(recv, ".") || strings.Contains(recv, "(") {
-						stampFactoryChainReceiver(edge, recv, resolveChainType(recv, nil, result))
+					if rt := env.phpReceiverTypeFor(obj, src); rt != "" {
+						edge.Meta = map[string]any{"receiver_type": rt}
+					} else {
+						// Chained-factory receiver: `make()->with()->build()` --
+						// carry the receiver object (`->` normalised to `.`) so
+						// the shared walker can type the chain or preserve it
+						// for the graph-aware resolver.
+						recv := strings.ReplaceAll(strings.TrimSpace(obj.Content(src)), "->", ".")
+						if strings.Contains(recv, ".") || strings.Contains(recv, "(") {
+							stampFactoryChainReceiver(edge, recv, resolveChainType(recv, env.vars, result))
+						}
 					}
 				}
 			}
@@ -931,7 +967,7 @@ func (e *PHPExtractor) extractCallSites(
 	// Recurse into children.
 	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
 		child := node.NamedChild(i)
-		e.extractCallSites(child, src, filePath, callerID, result)
+		e.extractCallSitesInScope(child, src, filePath, callerID, result, env)
 	}
 }
 

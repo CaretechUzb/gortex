@@ -92,6 +92,26 @@ func (r *Resolver) resolvePHPOverrideDispatch() int {
 			continue
 		}
 
+		// Receiver-directed path: the extractor typed the receiver
+		// (`$this->m()`, a typed property / parameter, `$v = new Foo`,
+		// `Foo::m()`), so the call binds to the method that type declares —
+		// or, when the type inherits it, to the nearest ancestor declaring
+		// it. This is a single precise bind, not a fan-out: the receiver's
+		// static type is stated by the source, so there is nothing to guess.
+		// The generic resolver already binds the case where the receiver type
+		// declares the method itself; this pass exists for the inherited case,
+		// which a same-receiver name match cannot see.
+		if rt := edgeReceiverType(e); rt != "" {
+			if base := phpBaseTypeName(rt); base != "" {
+				if target := r.nearestPHPMethod(name, []string{base}, direct, repo); target != nil && target.ID != caller.ID {
+					jobs = append(jobs, job{edge: e, single: target})
+				}
+			}
+			// A typed receiver that resolved to nothing stays unresolved: a
+			// name-only fan-out would contradict the type the source declared.
+			continue
+		}
+
 		// Fan-out path: a plain member call whose same-name candidates are an
 		// override family related through the hierarchy.
 		cands := phpOverrideCandidates(r.cachedFindNodesByNameInRepo(name, repo))
@@ -116,7 +136,11 @@ func (r *Resolver) resolvePHPOverrideDispatch() int {
 			if j.edge.Confidence < phpDispatchConfidence {
 				j.edge.Confidence = phpDispatchConfidence
 			}
-			phpEnsureMeta(j.edge)["dispatch"] = "scope"
+			if edgeReceiverType(j.edge) != "" {
+				phpEnsureMeta(j.edge)["dispatch"] = "receiver"
+			} else {
+				phpEnsureMeta(j.edge)["dispatch"] = "scope"
+			}
 			g.ReindexEdges([]graph.EdgeReindex{{Edge: j.edge, OldTo: oldTo}})
 			n++
 			continue
