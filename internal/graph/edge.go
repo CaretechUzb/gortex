@@ -705,6 +705,13 @@ const MetaSpeculative = "speculative"
 // EdgeProvides with these Meta keys; the resolver's provides-index and
 // framework synthesizers consume them. Exported here so both sides
 // compile against one spelling.
+//
+// Scoped to EdgeProvides. "binding" is not a reserved word elsewhere in
+// the graph: the ORM extractors put an unrelated "binding" on model
+// NODES (values "subclass" / "decorator" / "annotation" / "schema-macro",
+// beside "orm" and "table_name") describing how a model was declared.
+// The two never meet — different carrier, different values — so a
+// key-name sweep must not fold them together.
 const (
 	MetaDIBinding       = "binding"        // one of the DIBinding* values below
 	MetaDIProvidesFor   = "provides_for"   // interface short name the binding serves
