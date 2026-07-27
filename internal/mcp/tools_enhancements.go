@@ -454,7 +454,7 @@ func (s *Server) handleCheckGuards(ctx context.Context, req mcp.CallToolRequest)
 		ids[i] = strings.TrimSpace(ids[i])
 	}
 
-	if len(s.guardRules) == 0 && s.architecture.IsEmpty() {
+	if !s.hasGuardRules(ids) && s.architecture.IsEmpty() {
 		// Honor compact here too. This branch used to return JSON regardless,
 		// so a compact caller (the Stop hook) got a raw payload under a
 		// "Guard Violations" heading that had nothing to report.
@@ -474,7 +474,7 @@ func (s *Server) handleCheckGuards(ctx context.Context, req mcp.CallToolRequest)
 		return s.respondJSONOrTOON(ctx, req, empty)
 	}
 
-	violations := analysis.EvaluateGuards(s.graph, s.guardRules, ids)
+	violations := s.evaluateGuards(ids)
 	violations = append(violations, analysis.EvaluateArchitecture(s.graph, s.architecture, ids)...)
 
 	if isCompact(req) {

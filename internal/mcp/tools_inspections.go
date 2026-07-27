@@ -9,6 +9,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/analysis"
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -383,13 +384,23 @@ func runStaleCodeInspection(s *Server, scope inspectionScope) []inspectionViolat
 func runGuardsInspection(s *Server, scope inspectionScope) []inspectionViolation {
 	// Evaluate against every node in scope. check_guards' substrate
 	// accepts a slice of IDs; we pass the scoped set.
-	if len(s.guardRules) == 0 {
+	if !s.anyGuardRulesConfigured() {
 		return nil
 	}
+	// Rules are per repo; memoize the lookup so a whole-graph sweep pays
+	// one config resolution per repo rather than one per node.
+	rulesByRepo := make(map[string][]config.GuardRule, 2)
+	resolver := s.newRepoScopeResolver()
 	out := make([]inspectionViolation, 0)
 	for _, n := range s.graph.AllNodes() {
 		if !scope.keep(n.FilePath) {
 			continue
+		}
+		prefix := resolver.prefixOf(n.ID)
+		rules, ok := rulesByRepo[prefix]
+		if !ok {
+			rules = s.guardRulesFor(prefix)
+			rulesByRepo[prefix] = rules
 		}
 		// Cheap proxy: a real implementation would evaluate the rule
 		// expression. We surface the guard rule's name + scope when
@@ -397,7 +408,7 @@ func runGuardsInspection(s *Server, scope inspectionScope) []inspectionViolation
 		// pointer to the relevant rule. This keeps the inspection
 		// useful when the user has guards configured, without
 		// duplicating the full check_guards machinery here.
-		for _, rule := range s.guardRules {
+		for _, rule := range rules {
 			if rule.Name == "" {
 				continue
 			}

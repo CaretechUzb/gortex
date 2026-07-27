@@ -1090,8 +1090,8 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 
 	// Gate: guard + architecture rules.
 	var guards []analysis.GuardViolation
-	if len(ids) > 0 && (len(s.guardRules) > 0 || !s.architecture.IsEmpty()) {
-		guards = analysis.EvaluateGuards(s.graph, s.guardRules, ids)
+	if len(ids) > 0 && (s.hasGuardRules(ids) || !s.architecture.IsEmpty()) {
+		guards = s.evaluateGuards(ids)
 		guards = append(guards, analysis.EvaluateArchitecture(s.graph, s.architecture, ids)...)
 	}
 
