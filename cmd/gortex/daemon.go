@@ -16,6 +16,7 @@ import (
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/daemon"
@@ -70,10 +71,13 @@ If no daemon is running, ` + "`gortex mcp`" + ` still works standalone — the d
 is additive, not required.`,
 }
 
+// RunE is wired in init() rather than here: runDaemonStart reaches back for
+// daemonStartCmd's flag set (to know what the re-exec'd child accepts), and
+// naming runDaemonStart in this initializer would close an initialization
+// cycle the compiler rejects.
 var daemonStartCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Start the daemon",
-	RunE:  runDaemonStart,
 }
 
 var daemonStopCmd = &cobra.Command{
@@ -107,6 +111,7 @@ var daemonLogsCmd = &cobra.Command{
 }
 
 func init() {
+	daemonStartCmd.RunE = runDaemonStart
 	daemonStartCmd.Flags().BoolVar(&daemonDetach, "detach", false,
 		"fork to background after starting (logs to the daemon log file — see `gortex daemon logs`)")
 	daemonStartCmd.Flags().BoolVar(&daemonEmbeddings, "embeddings", false,
@@ -176,7 +181,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("daemon already running (pid %d) — stop it with `gortex daemon stop`, or use `gortex daemon restart`", pid)
 	}
 	if daemonDetach && os.Getenv("GORTEX_DAEMON_CHILD") != "1" {
-		return spawnDetachedDaemon()
+		return spawnDetachedDaemon(detachedDaemonArgs(cmd.Flags(), daemonStartAcceptedFlags()))
 	}
 	logger := newLogger()
 
@@ -197,8 +202,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 
 	// Record whether `--embeddings` was set explicitly so
 	// buildDaemonState can let it override the `embedding:` config
-	// block. With `--detach` the re-exec'd child sees no flags, so an
-	// explicit opt-in there must travel via GORTEX_EMBEDDINGS instead.
+	// block. `--detach` forwards the flag verbatim (including
+	// `--embeddings=false`), so the child sees the same explicit-ness
+	// the parent did.
 	daemonEmbeddingsChanged = cmd.Flags().Changed("embeddings")
 
 	// Fast path: snapshot load + indexer + MCP server wiring. The
@@ -742,15 +748,70 @@ func startPeriodicSnapshots(g *graph.Graph, mi *indexer.MultiIndexer, version st
 	return func() { close(stop) }
 }
 
+// daemonStartAcceptedFlags returns every flag the re-exec'd `daemon start`
+// can parse: its own, plus the persistent flags it inherits from the root
+// command. cobra only folds the inherited half into Flags() when the command
+// actually executes, so callers that reach the spawn from a *different*
+// command (`daemon restart`, `install --start`) have to ask for it explicitly
+// or --log-level / --config would look unrecognised and be dropped.
+func daemonStartAcceptedFlags() *pflag.FlagSet {
+	accepted := pflag.NewFlagSet("daemon start", pflag.ContinueOnError)
+	accepted.AddFlagSet(daemonStartCmd.Flags())
+	accepted.AddFlagSet(daemonStartCmd.InheritedFlags())
+	return accepted
+}
+
+// detachedDaemonArgs rebuilds the argv the detached child needs so a
+// `--detach` start behaves exactly like the same command without it.
+// Only flags the user actually set are emitted (pflag's Visit walks the
+// changed set), in `--name=value` form — there is no shell between us and
+// the child, so values that would need quoting are safe, and defaults stay
+// implicit so the child still resolves them from config the same way a
+// foreground start does.
+//
+// `changed` is the flag set of the command being run (cobra merges the
+// inherited persistent flags into it, so --log-level / --config ride along);
+// `accepted` is the child's `daemon start` flag set. A changed flag the child
+// wouldn't recognise is dropped rather than handed to a process that would
+// exit on "unknown flag" — that is what lets `daemon restart` and
+// `install --start` reuse this without leaking their own flags. --detach is
+// dropped too: the child *is* the detached daemon.
+func detachedDaemonArgs(changed, accepted *pflag.FlagSet) []string {
+	var out []string
+	if changed == nil {
+		return out
+	}
+	changed.Visit(func(f *pflag.Flag) {
+		if f.Name == "detach" {
+			return
+		}
+		if accepted != nil && accepted.Lookup(f.Name) == nil {
+			return
+		}
+		// Slice flags stringify as "[a,b]", which pflag can't parse back.
+		// Repeat the flag instead — the second Set appends.
+		if sv, ok := f.Value.(pflag.SliceValue); ok {
+			for _, v := range sv.GetSlice() {
+				out = append(out, "--"+f.Name+"="+v)
+			}
+			return
+		}
+		out = append(out, "--"+f.Name+"="+f.Value.String())
+	})
+	return out
+}
+
 // spawnDetachedDaemon re-invokes the binary with GORTEX_DAEMON_CHILD=1
 // set, the log redirected to the daemon log file, and the child
 // parented to init. Parent exits as soon as the child has the socket up.
+// childArgs (from detachedDaemonArgs) carries the caller's flags through
+// to the re-exec'd `daemon start`.
 //
 // On a TTY the parent shows a mesh-spinner banner and a styled "ready" card
 // once the socket is live. On a non-TTY (CI scripts, automation) we keep the
 // historical one-line "[gortex daemon] detached (pid X, log: Y)" message so
 // existing parsers don't break.
-func spawnDetachedDaemon() error {
+func spawnDetachedDaemon(childArgs []string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve executable: %w", err)
@@ -763,19 +824,13 @@ func spawnDetachedDaemon() error {
 	if err != nil {
 		return fmt.Errorf("open log file: %w", err)
 	}
-	child := exec.Command(exe, "daemon", "start")
-	childEnv := append(os.Environ(), "GORTEX_DAEMON_CHILD=1")
-	// --detach re-execs `daemon start` with no flags, so the tool-preset
-	// selection must travel to the child via env (the GORTEX_TOOLS
-	// override path), mirroring how --embeddings propagates. Appended
-	// last so an explicit flag wins over any inherited GORTEX_TOOLS.
-	if daemonTools != "" {
-		childEnv = append(childEnv, "GORTEX_TOOLS="+daemonTools)
-	}
-	if daemonToolsMode != "" {
-		childEnv = append(childEnv, "GORTEX_TOOLS_MODE="+daemonToolsMode)
-	}
-	child.Env = childEnv
+	child := exec.Command(exe, append([]string{"daemon", "start"}, childArgs...)...)
+	// The child re-parses the forwarded flags itself, so nothing has to
+	// travel by env any more except the marker that stops it detaching
+	// again (and stops it clearing a stop-intent written meanwhile).
+	// Inherited GORTEX_* overrides keep the precedence they have on a
+	// foreground start rather than being re-injected from a flag here.
+	child.Env = append(os.Environ(), "GORTEX_DAEMON_CHILD=1")
 	child.Stdout = logFile
 	child.Stderr = logFile
 	child.Stdin = nil

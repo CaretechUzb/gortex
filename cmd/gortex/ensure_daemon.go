@@ -35,9 +35,15 @@ const (
 // testable without a real daemon.
 var (
 	isDaemonRunning  = daemon.IsRunning
-	spawnDaemon      = spawnDetachedDaemon
+	spawnDaemon      = spawnBareDaemon
 	stopIntentActive = daemon.StopIntentActive
 )
+
+// spawnBareDaemon is the autostart default for spawnDaemon. Autostart has no
+// `daemon start` flags to forward — it is `gortex mcp` / `gortex track`
+// bringing up a default daemon, not a user-typed start — so the child argv
+// stays bare and the daemon resolves everything from config.
+func spawnBareDaemon() error { return spawnDetachedDaemon(nil) }
 
 // resolveDaemonDecision probes the socket and, when auto-start is enabled
 // and no daemon is up, single-flights a spawn. It never returns an error;

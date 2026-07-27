@@ -13,7 +13,7 @@ import (
 
 func restoreSeams() {
 	isDaemonRunning = daemon.IsRunning
-	spawnDaemon = spawnDetachedDaemon
+	spawnDaemon = spawnBareDaemon
 	stopIntentActive = daemon.StopIntentActive
 }
 

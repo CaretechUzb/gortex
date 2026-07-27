@@ -43,6 +43,9 @@ gortex install --no-hooks           # skip user-level hook installation
 
 # Daemon lifecycle (also spawned by `gortex install --start`):
 gortex daemon start --detach        # spawn in background
+gortex daemon start --detach --http-addr 127.0.0.1:7411 --log-level debug
+                                    # --detach forwards every other flag to the background process,
+                                    # so a detached start behaves like the same command without it
 gortex daemon status                # PID, uptime, memory, tracked repos, sessions, server roster, search backend, warmup + enrichment progress
 gortex daemon stop                  # graceful shutdown + final snapshot
 gortex daemon restart               # stop + start

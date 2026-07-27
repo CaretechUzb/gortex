@@ -296,7 +296,7 @@ func runInstallFollowUps(cmd *cobra.Command) error {
 		if daemon.IsRunning() {
 			fmt.Fprintln(w, "[gortex install] daemon already running (skipped --start)")
 		} else {
-			if err := spawnDetachedDaemon(); err != nil {
+			if err := spawnDetachedDaemon(detachedDaemonArgs(cmd.Flags(), daemonStartAcceptedFlags())); err != nil {
 				return fmt.Errorf("start daemon: %w", err)
 			}
 			fmt.Fprintln(w, "[gortex install] daemon started (detached)")
