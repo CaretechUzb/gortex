@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -184,6 +185,16 @@ func (s *Server) filterTextMatchesByResolvedScope(matches []trigram.Match, resol
 			continue
 		}
 		n := s.graph.GetNode(m.Path)
+		if n == nil {
+			// A trigram match path is always forward-slash, but node IDs
+			// keep the repo-relative remainder in the OS separator. The two
+			// spellings agree only for a file at the repo root, so on
+			// Windows every match below the root failed attribution here and
+			// the fail-closed drop below emptied the entire result set.
+			if key := graphMatchPathKey(m.Path, knownRepo); key != m.Path {
+				n = s.graph.GetNode(key)
+			}
+		}
 		if n == nil && knownRepo {
 			// GrepTextForRepos stamps the registry prefix onto every
 			// match path, but a repo indexed in single-repo mode minted
@@ -192,6 +203,11 @@ func (s *Server) filterTextMatchesByResolvedScope(matches []trigram.Match, resol
 			// stripped so attribution works in a lone-repo daemon.
 			if meta := s.multiIndexer.GetMetadata(repo); meta != nil && meta.Unprefixed {
 				n = s.graph.GetNode(rest)
+				if n == nil {
+					if key := graphMatchPathKey(rest, false); key != rest {
+						n = s.graph.GetNode(key)
+					}
+				}
 			}
 		}
 		if n == nil || !opts.ScopeAllows(n) {
@@ -202,19 +218,51 @@ func (s *Server) filterTextMatchesByResolvedScope(matches []trigram.Match, resol
 	return out
 }
 
+// graphMatchPathKey spells a trigram match path the way graph node IDs
+// spell it. Match paths are always forward-slash; a node ID joins the repo
+// prefix with "/" but keeps the repo-relative remainder in the OS separator,
+// so the two forms diverge on Windows for every file below the repo root.
+// repoPrefixed says whether the first segment names a tracked repo rather
+// than an ordinary directory. Returns path unchanged where the separators
+// already agree, so POSIX callers pay nothing.
+func graphMatchPathKey(path string, repoPrefixed bool) string {
+	if filepath.Separator == '/' {
+		return path
+	}
+	if repoPrefixed {
+		if repo, rest, ok := strings.Cut(path, "/"); ok {
+			return repo + "/" + filepath.FromSlash(rest)
+		}
+	}
+	return filepath.FromSlash(path)
+}
+
 // enrichTextMatches decorates every trigram match with its enclosing
 // graph symbol. It builds one per-file symbol index for the set of
 // matched files, then resolves each match's line through it.
+//
+// The index is queried under both path spellings: file nodes are fetched
+// and keyed by the graph's own FilePath, which on Windows is not the
+// forward-slash path the match carries.
 func (s *Server) enrichTextMatches(matches []trigram.Match) []enrichedTextMatch {
 	out := make([]enrichedTextMatch, 0, len(matches))
 	paths := make(map[string]struct{}, len(matches))
 	for _, m := range matches {
 		paths[m.Path] = struct{}{}
+		if key := graphMatchPathKey(m.Path, true); key != m.Path {
+			paths[key] = struct{}{}
+		}
 	}
 	idx := s.buildFileSymbolIndexForPaths(paths)
 	for _, m := range matches {
 		em := enrichedTextMatch{Path: m.Path, Line: m.Line, Text: m.Text}
-		if fi := idx[m.Path]; fi != nil {
+		fi := idx[m.Path]
+		if fi == nil {
+			if key := graphMatchPathKey(m.Path, true); key != m.Path {
+				fi = idx[key]
+			}
+		}
+		if fi != nil {
 			em.SymbolID, em.SymbolName = fi.find(m.Line)
 		}
 		out = append(out, em)
