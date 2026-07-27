@@ -3,6 +3,8 @@ package languages
 import (
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
@@ -21,8 +23,7 @@ import (
 //     (is_pattern_expression), `x as Foo` (as_expression)
 //     → EdgeReferences, Meta["ref_context"]="cast"
 //   - STATIC ACCESS   `Foo.Const` / `Foo.Method()` (member_access_expression
-//     whose receiver is a bare Capitalized identifier),
-//     `typeof(Foo)`, `nameof(Foo)`
+//     whose receiver names a type), `typeof(Foo)`, `nameof(Foo)`
 //     → EdgeReferences, Meta["ref_context"]="static_access"
 //   - ATTRIBUTE TYPE  `[Foo]` / `[Foo(...)]` (attribute) names the type Foo
 //     → EdgeReferences, Meta["ref_context"]="attribute"
@@ -52,12 +53,14 @@ import (
 // the guard polices at all, but it carries the same origin for
 // consistency.
 //
-// Scope discipline keeps the graph clean: only Capitalized leaf type
-// names are emitted (lowercase locals / primitives are skipped via the
-// Capitalization gate + isCSharpPrimitive), and a member access only
-// counts when its receiver is a bare Capitalized identifier — `this.x`,
-// `local.Foo`, and chained `a.b.C` are all excluded so a field read on an
-// instance is never mistaken for a static type reference.
+// Scope discipline keeps the graph clean, but only where a heuristic is
+// actually needed. A name in a syntactically guaranteed type position
+// (`new T()`, `(T)x`, `x as T`, `x is T`, `typeof(T)`, `[T]`, `List<T>`) is
+// emitted on the grammar's authority alone; primitives are still skipped.
+// Type-ness is inferred only for a member-access receiver, where `Type.X` and
+// `local.X` are the same shape — see csharpStaticReceiverEligible, which
+// accepts an uppercase receiver outright and falls back to "is this name
+// bound to a value in this file" for scripts that have no case at all.
 func emitCSharpReferenceForms(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
 	if root == nil {
 		return
@@ -75,11 +78,27 @@ func emitCSharpReferenceForms(root *sitter.Node, src []byte, filePath, fileID st
 		return fileID
 	}
 
+	// Identifiers this file declares as VALUES. A member access whose
+	// receiver is one of them reads an instance, not a type — the thing the
+	// Capitalization gate stands in for. Collected once so the caseless-script
+	// path can ask the real question instead of the ASCII-shaped proxy.
+	valueIdents := csharpDeclaredValueIdents(root, src)
+
 	// emitRef appends an EdgeReferences (cast / static_access / attribute)
-	// or EdgeInstantiates edge for a single Capitalized, non-primitive type.
-	emit := func(rawType string, line int, kind graph.EdgeKind, refContext string) {
+	// or EdgeInstantiates edge for a single non-primitive type.
+	//
+	// typePosition says the grammar already guarantees the name is a type —
+	// `new T()`, `(T)x`, `x as T`, `x is T`, `typeof(T)`, `[T]`, `List<T>`.
+	// Those positions need no naming heuristic at all, and applying one there
+	// dropped every such reference in a codebase whose types are named in a
+	// script without case. A receiver read out of `T.Member` is the only
+	// position where type-ness must be inferred.
+	emit := func(rawType string, line int, kind graph.EdgeKind, refContext string, typePosition bool) {
 		canon := canonicalizeCSharpTypeRef(rawType)
-		if canon == "" || isCSharpPrimitive(canon) || !isCSharpTypeNameCapitalized(canon) {
+		if canon == "" || isCSharpPrimitive(canon) {
+			return
+		}
+		if !typePosition && !csharpStaticReceiverEligible(canon, valueIdents) {
 			return
 		}
 		owner := ownerFor(line)
@@ -114,61 +133,60 @@ func emitCSharpReferenceForms(root *sitter.Node, src []byte, filePath, fileID st
 			// named child (identifier / generic_name / qualified_name);
 			// implicit_object_creation (`new()`) has no type and is skipped.
 			if name := csharpCreationTypeName(n, src); name != "" {
-				emit(name, line, graph.EdgeInstantiates, "")
+				emit(name, line, graph.EdgeInstantiates, "", true)
 			}
 
 		case "array_creation_expression":
 			// `new Foo[3]` — the element type lives on the nested array_type.
 			if at := csharpFirstChildOfType(n, "array_type"); at != nil {
 				if name := csharpArrayElementTypeName(at, src); name != "" {
-					emit(name, line, graph.EdgeInstantiates, "")
+					emit(name, line, graph.EdgeInstantiates, "", true)
 				}
 			}
 
 		case "cast_expression":
 			// `(Foo)x` — the type is the `type` field (first named child).
 			if name := csharpCastTypeName(n, src); name != "" {
-				emit(name, line, graph.EdgeReferences, "cast")
+				emit(name, line, graph.EdgeReferences, "cast", true)
 			}
 
 		case "as_expression":
 			// `x as Foo` — binary form `value as Type`; the type is the
 			// second named child.
 			if name := csharpAsExpressionTypeName(n, src); name != "" {
-				emit(name, line, graph.EdgeReferences, "cast")
+				emit(name, line, graph.EdgeReferences, "cast", true)
 			}
 
 		case "is_pattern_expression":
 			// `x is Foo` (constant_pattern) / `x is Foo f` (declaration_pattern).
 			if name := csharpIsPatternTypeName(n, src); name != "" {
-				emit(name, line, graph.EdgeReferences, "cast")
+				emit(name, line, graph.EdgeReferences, "cast", true)
 			}
 
 		case "typeof_expression":
 			// `typeof(Foo)` — the type is the named child.
 			if name := csharpUnaryTypeArgName(n, src); name != "" {
-				emit(name, line, graph.EdgeReferences, "static_access")
+				emit(name, line, graph.EdgeReferences, "static_access", true)
 			}
 
 		case "member_access_expression":
-			// `Foo.Const` / `Foo.Method` — only when the receiver is a bare
-			// Capitalized identifier (a type), never `this.x` / `local.X` /
-			// chained `a.b.C`.
+			// `Foo.Const` / `Foo.Method` — only when the receiver names a
+			// type, never `this.x` / `local.X` / chained `a.b.C`.
 			if name := csharpStaticAccessReceiver(n, src); name != "" {
-				emit(name, line, graph.EdgeReferences, "static_access")
+				emit(name, line, graph.EdgeReferences, "static_access", false)
 			}
 
 		case "invocation_expression":
 			// `nameof(Foo)` parses as a plain invocation, not a dedicated
 			// node — special-case it so the referenced type surfaces.
 			if name := csharpNameofTypeArg(n, src); name != "" {
-				emit(name, line, graph.EdgeReferences, "static_access")
+				emit(name, line, graph.EdgeReferences, "static_access", false)
 			}
 
 		case "attribute":
 			// `[Foo]` / `[Foo(...)]` names the attribute type Foo.
 			if name := csharpAttributeTypeName(n, src); name != "" {
-				emit(name, line, graph.EdgeReferences, "attribute")
+				emit(name, line, graph.EdgeReferences, "attribute", true)
 			}
 
 		case "type_argument_list":
@@ -199,31 +217,78 @@ func emitCSharpReferenceForms(root *sitter.Node, src []byte, filePath, fileID st
 					// `List<Qux>` — its head names a type; the nested
 					// type_argument_list (<Qux>) is visited separately.
 					if head := csharpFirstChildOfType(arg, "identifier"); head != nil {
-						emit(strings.TrimSpace(head.Content(src)), line, graph.EdgeReferences, "generic_arg")
+						emit(strings.TrimSpace(head.Content(src)), line, graph.EdgeReferences, "generic_arg", true)
 					}
 				case "identifier", "qualified_name", "nullable_type", "array_type":
 					// `Foo`, `Ns.Foo`, `Foo?`, `Foo[]` — canonicalizeCSharpTypeRef
 					// (called inside emit) strips the namespace / nullable /
 					// array decoration down to the bare named type.
-					emit(strings.TrimSpace(arg.Content(src)), line, graph.EdgeReferences, "generic_arg")
+					emit(strings.TrimSpace(arg.Content(src)), line, graph.EdgeReferences, "generic_arg", true)
 				}
 			}
 		}
 	})
 }
 
-// isCSharpTypeNameCapitalized reports whether a canonicalized type name
-// begins with an uppercase ASCII letter — the Capitalization gate that
-// keeps lowercase locals, parameters, and keywords out of the reference
-// surface. canonicalizeCSharpTypeRef has already stripped generics,
-// nullable markers, arrays, and namespace qualification, so the first
-// rune of the bare name is the discriminator.
-func isCSharpTypeNameCapitalized(name string) bool {
+// csharpStaticReceiverEligible reports whether a bare member-access receiver
+// may be read as a type rather than as a value.
+//
+// An uppercase first rune is the C# convention and is accepted outright, so
+// nothing changes for a codebase written in a cased script. A script WITHOUT
+// case — Chinese, Japanese, Korean, Hebrew, Arabic, Thai — has no such
+// convention available: no identifier in it is ever "Capitalized", so gating
+// on capitalisation silently dropped every reference form in such a codebase
+// rather than merely being imprecise. For those names the question the gate
+// was really asking is answered directly instead: a receiver the file
+// declares as a value is an instance access, anything else may be a type.
+// A lowercase cased letter is still rejected, and so is anything that is not
+// a letter, which keeps `_field.X` and `local.X` out as before.
+func csharpStaticReceiverEligible(name string, valueIdents map[string]bool) bool {
 	if name == "" {
 		return false
 	}
-	c := name[0]
-	return c >= 'A' && c <= 'Z'
+	r, _ := utf8.DecodeRuneInString(name)
+	if r == utf8.RuneError {
+		return false
+	}
+	if unicode.IsUpper(r) {
+		return true
+	}
+	if unicode.IsLower(r) || !unicode.IsLetter(r) {
+		return false
+	}
+	return !valueIdents[name]
+}
+
+// csharpDeclaredValueIdents collects every identifier the file binds to a
+// VALUE: locals and fields (variable_declarator), parameters, foreach
+// variables, pattern designations (`x is Foo f`), and catch bindings. It is
+// deliberately file-scoped rather than block-scoped — a name bound as a value
+// anywhere in the file is treated as a value throughout, which errs toward
+// dropping a reference rather than inventing one.
+func csharpDeclaredValueIdents(root *sitter.Node, src []byte) map[string]bool {
+	out := map[string]bool{}
+	add := func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if name := strings.TrimSpace(n.Content(src)); name != "" {
+			out[name] = true
+		}
+	}
+	walkNodes(root, func(n *sitter.Node) {
+		switch n.Type() {
+		case "variable_declarator", "single_variable_designation":
+			add(csharpFirstChildOfType(n, "identifier"))
+		case "parameter", "catch_declaration", "foreach_statement":
+			if nameNode := n.ChildByFieldName("name"); nameNode != nil {
+				add(nameNode)
+			} else {
+				add(csharpFirstChildOfType(n, "identifier"))
+			}
+		}
+	})
+	return out
 }
 
 // csharpFirstChildOfType returns the first named child of node whose type
