@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
@@ -61,11 +62,35 @@ func nestedRepoServer(t *testing.T, entries []config.RepoEntry) (*Server, *graph
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
-	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
+	singleton := indexer.New(g, reg, config.IndexConfig{}, zap.NewNop())
+	srv := NewServer(query.NewEngine(g), g, singleton, nil, zap.NewNop(), nil, MultiRepoOptions{
 		ConfigManager: cm,
 		MultiIndexer:  mi,
 	})
 	return srv, g
+}
+
+// TestGraphRelPath_LoneRepoForwardSlash covers the read side of the same
+// separator gap. resolveFilePath echoes a caller-supplied relative path back
+// verbatim, so a forward-slash path — what agents write, and what every tool
+// description shows — reached the graph unchanged and missed the node below
+// the repo root on Windows: get_file_summary answered file_not_indexed for a
+// file that was indexed.
+func TestGraphRelPath_LoneRepoForwardSlash(t *testing.T) {
+	solo := setupNestedRepo(t, "solo", "shared", "package sub\n\nfunc SoloHandler() {}\n")
+	srv, g := nestedRepoServer(t, []config.RepoEntry{{Path: solo, Name: "solo", Project: "backend"}})
+
+	nodeKey := filepath.FromSlash("pkg/sub/main.go")
+	require.NotNil(t, g.GetNode(nodeKey), "fixture invariant: a lone repo mints unprefixed node ids")
+
+	require.Equal(t, nodeKey, srv.graphRelPath("pkg/sub/main.go"),
+		"a forward-slash path must be normalised to the graph's spelling")
+	require.Equal(t, nodeKey, srv.graphRelPath(nodeKey),
+		"an already OS-spelled path is unchanged (idempotent)")
+
+	res := callTool(t, srv, "get_file_summary", map[string]any{"path": "pkg/sub/main.go"})
+	require.False(t, res.IsError, "a forward-slash repo-relative path must resolve")
+	require.Contains(t, res.Content[0].(mcplib.TextContent).Text, "SoloHandler")
 }
 
 // TestFilterTextMatchesByResolvedScope_BelowRepoRoot is the regression for
