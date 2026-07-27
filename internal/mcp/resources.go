@@ -246,6 +246,9 @@ func (s *Server) handleResourceSchema(_ context.Context, req mcp.ReadResourceReq
 - methods    — interface/trait method names ([]string, for IMPLEMENTS inference)
 - proto_type — protobuf: "message", "enum"
 - sql_type   — SQL: "table", "view", "index", "trigger"
+- schema     — SQL: schema qualifier of a schema-qualified object (Name stays the bare object name)
+- qualified_name — SQL: "schema.object", set only when the declaration was qualified
+- indexes    — SQL: qualified name of the table a CREATE INDEX covers
 - visibility — "private" for unexported symbols
 - temporal_role — Temporal node role: activity / workflow / activity_interface / workflow_interface / signal / query / update
 

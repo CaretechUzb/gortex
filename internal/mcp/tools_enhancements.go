@@ -1795,9 +1795,11 @@ func (s *Server) handleAnalyzeOrphanTables(ctx context.Context, req mcp.CallTool
 		QueryCount int    `json:"query_count"`
 	}
 	var rows []orphanRow
+	tableCount, queryEdges := 0, 0
 	// Kind pushdown — only KindTable carries the providers/queries
 	// fan-in we care about; the rest of the node table is noise.
 	for _, n := range s.scopedNodesByKinds(ctx, []graph.NodeKind{graph.KindTable}) {
+		tableCount++
 		// Walk incoming edges to detect both providers (migrations)
 		// and consumers (query call sites).
 		hasProvider := false
@@ -1810,6 +1812,7 @@ func (s *Server) handleAnalyzeOrphanTables(ctx context.Context, req mcp.CallTool
 				queryCount++
 			}
 		}
+		queryEdges += queryCount
 		if hasProvider {
 			continue
 		}
@@ -1837,20 +1840,52 @@ func (s *Server) handleAnalyzeOrphanTables(ctx context.Context, req mcp.CallTool
 		return rows[i].ID < rows[j].ID
 	})
 
+	note := vacuousTableAnalysisNote(tableCount, queryEdges)
 	if isCompact(req) {
 		var b strings.Builder
 		for _, r := range rows {
 			fmt.Fprintf(&b, "%-3d  %s\n", r.QueryCount, r.ID)
 		}
 		if len(rows) == 0 {
-			b.WriteString("no orphan tables\n")
+			if note != "" {
+				fmt.Fprintf(&b, "%s\n", note)
+			} else {
+				b.WriteString("no orphan tables\n")
+			}
 		}
 		return mcp.NewToolResultText(b.String()), nil
 	}
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"orphans": rows,
-		"total":   len(rows),
-	})
+	out := map[string]any{
+		"orphans":     rows,
+		"total":       len(rows),
+		"tables":      tableCount,
+		"query_edges": queryEdges,
+	}
+	if note != "" {
+		out["note"] = note
+	}
+	return s.respondJSONOrTOON(ctx, req, out)
+}
+
+// vacuousTableAnalysisNote returns the caveat to attach when a
+// table analyzer's empty result carries no information.
+//
+// orphan_tables and unreferenced_tables both cross-reference migration
+// providers against query call sites. When the graph holds no
+// EdgeQueries at all — SQL query extraction is gated off, or the code
+// side builds its queries in a shape the extractor does not see — each
+// returns a number that reads like an all-clear but was never computed
+// against anything. Saying so is the difference between "nothing to
+// clean up" and "this layer is empty".
+func vacuousTableAnalysisNote(tableCount, queryEdges int) string {
+	switch {
+	case tableCount == 0:
+		return "tables: 0 — no table nodes in scope; result is not meaningful"
+	case queryEdges == 0:
+		return "query_edges: 0 — no SQL query edges in scope, so provider/consumer " +
+			"cross-referencing had nothing to compare; result is not meaningful"
+	}
+	return ""
 }
 
 // handleAnalyzeUnreferencedTables is the inverse of
@@ -1875,8 +1910,10 @@ func (s *Server) handleAnalyzeUnreferencedTables(ctx context.Context, req mcp.Ca
 		ProviderCount int    `json:"provider_count"`
 	}
 	var rows []unrefRow
+	tableCount, queryEdges := 0, 0
 	// Kind pushdown — same story as orphan_tables.
 	for _, n := range s.scopedNodesByKinds(ctx, []graph.NodeKind{graph.KindTable}) {
+		tableCount++
 		providerCount := 0
 		queryCount := 0
 		for _, e := range s.graph.GetInEdges(n.ID) {
@@ -1887,6 +1924,7 @@ func (s *Server) handleAnalyzeUnreferencedTables(ctx context.Context, req mcp.Ca
 				queryCount++
 			}
 		}
+		queryEdges += queryCount
 		if providerCount == 0 || queryCount > 0 {
 			continue
 		}
@@ -1908,20 +1946,30 @@ func (s *Server) handleAnalyzeUnreferencedTables(ctx context.Context, req mcp.Ca
 		return rows[i].ID < rows[j].ID
 	})
 
+	note := vacuousTableAnalysisNote(tableCount, queryEdges)
 	if isCompact(req) {
 		var b strings.Builder
 		for _, r := range rows {
 			fmt.Fprintln(&b, r.ID)
 		}
-		if len(rows) == 0 {
+		if len(rows) == 0 && note == "" {
 			b.WriteString("no unreferenced tables\n")
+		}
+		if note != "" {
+			fmt.Fprintf(&b, "%s\n", note)
 		}
 		return mcp.NewToolResultText(b.String()), nil
 	}
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	out := map[string]any{
 		"unreferenced": rows,
 		"total":        len(rows),
-	})
+		"tables":       tableCount,
+		"query_edges":  queryEdges,
+	}
+	if note != "" {
+		out["note"] = note
+	}
+	return s.respondJSONOrTOON(ctx, req, out)
 }
 
 // handleAnalyzeCoverageSummary aggregates meta.coverage_pct per
