@@ -37,6 +37,38 @@ var jsTSImportExts = []string{
 	".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs",
 }
 
+// jsTSEmittedSourceExts maps an EMITTED JavaScript extension a module
+// specifier may carry to the TypeScript source extensions that compile to
+// it, in TypeScript's own resolution order.
+//
+// Under `moduleResolution: node16` / `nodenext` — mandatory for ESM
+// TypeScript, and what `"type": "module"` projects use — a specifier names
+// the file the compiler EMITS, not the file on disk: `./alpha.ts` is
+// imported as `./alpha.js`, `./alpha.mts` as `./alpha.mjs`. Probing such a
+// stem only verbatim (and then as `alpha.js.ts`, `alpha.js/index.ts`)
+// never matches the real source, so the import edge stays unresolved and
+// every call routed through it is reverted by the cross-package guard
+// (issue #304).
+//
+// Deliberate deviation from tsc: the verbatim `.js` is probed BEFORE these
+// counterparts, whereas tsc prefers `.ts`/`.d.ts` over a co-located `.js`.
+// A graph binds to implementations, so an indexed `alpha.js` that really
+// exists is the better target than a sibling `alpha.d.ts` that carries
+// types but no body. `.d.*` entries stay last for the same reason.
+var jsTSEmittedSourceExts = map[string][]string{
+	".js":  {".ts", ".tsx", ".d.ts"},
+	".jsx": {".tsx", ".d.ts"},
+	".mjs": {".mts", ".d.mts"},
+	".cjs": {".cts", ".d.cts"},
+}
+
+// EmittedJSSourceExts returns the TypeScript source extensions that compile
+// to the emitted-JavaScript extension ext (".js", ".jsx", ".mjs", ".cjs"),
+// in probe order — nil for anything else. Exported so the query layer's
+// re-export barrel walk expands `nodenext` specifiers exactly the way the
+// resolver does, instead of keeping a second copy of the mapping.
+func EmittedJSSourceExts(ext string) []string { return jsTSEmittedSourceExts[ext] }
+
 // resolveJSTSImportTarget resolves a JS/TS EdgeImports / EdgeReExports
 // specifier onto the in-repo file (or exported symbol) it names, or
 // returns "" when the caller is not JS/TS, the specifier is a genuine
@@ -130,11 +162,18 @@ func probeJSTSFile(getNode func(string) *graph.Node, stem string) string {
 		return n != nil && n.Kind == graph.KindFile
 	}
 	// An explicit source extension the author wrote (`./auth.js`) is tried
-	// verbatim first.
-	switch jsTSExt(stem) {
+	// verbatim first, then — when it names an emitted JavaScript file —
+	// against the TypeScript sources that compile to it.
+	switch ext := jsTSExt(stem); ext {
 	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
 		if isFile(stem) {
 			return stem
+		}
+		base := strings.TrimSuffix(stem, ext)
+		for _, srcExt := range jsTSEmittedSourceExts[ext] {
+			if id := base + srcExt; isFile(id) {
+				return id
+			}
 		}
 	}
 	for _, ext := range jsTSImportExts {

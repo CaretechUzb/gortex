@@ -209,7 +209,9 @@ func importConsumerCount(g Store, symbolID string) int {
 var zeroEdgeMessages = map[ZeroEdgeClass]string{
 	ZeroEdgeLikelyUnused: "no incoming call or reference edges, but the symbol is " +
 		"indexed (it has structural or outgoing edges) — consistent with genuine " +
-		"unused code that is safe to remove.",
+		"unused code. It is also what an import specifier the resolver could not " +
+		"expand looks like, so this is evidence of no callers, not proof: confirm " +
+		"with a text search for the symbol name before removing it.",
 	ZeroEdgePossibleExtractionGap: "the symbol has no graph edges of any kind. A " +
 		"normally indexed symbol always has at least a structural edge, so the " +
 		"extractor most likely did not process it — treat this empty result as " +

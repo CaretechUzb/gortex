@@ -7,6 +7,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/resolver"
 )
 
 // Barrel re-export resolve-through for find_usages.
@@ -118,8 +119,29 @@ func parseReExportTarget(to string) (spec, orig string) {
 // probeRelativeModuleFile joins a relative specifier against the importing
 // file's directory and returns the matching file node's id, trying the module
 // extensions and an index file, or "" when no such file node exists.
+//
+// A specifier carrying an emitted-JavaScript extension — `./impl.js` for a
+// module whose source is `impl.ts`, mandatory under `moduleResolution:
+// node16` / `nodenext` — is probed verbatim and then against the sources
+// that compile to it; appending extensions alone would only ever look for
+// `impl.js.ts` (issue #304).
 func probeRelativeModuleFile(g graph.Store, fromFile, spec string) string {
 	stem := path.Clean(path.Join(path.Dir(fromFile), spec))
+	isFile := func(id string) bool {
+		n := g.GetNode(id)
+		return n != nil && n.Kind == graph.KindFile
+	}
+	if ext := path.Ext(stem); ext != "" {
+		if isFile(stem) {
+			return stem
+		}
+		base := strings.TrimSuffix(stem, ext)
+		for _, srcExt := range resolver.EmittedJSSourceExts(ext) {
+			if isFile(base + srcExt) {
+				return base + srcExt
+			}
+		}
+	}
 	for _, ext := range jsBarrelExts {
 		if g.GetNode(stem+ext) != nil {
 			return stem + ext
