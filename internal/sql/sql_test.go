@@ -228,6 +228,15 @@ func TestIsMigrationPath(t *testing.T) {
 		{"pkg/queries/select.sql", false},
 		{"main.go", false},
 		{"docs/migration_guide.md", false}, // not .sql
+
+		// The indexer hands coverage extractors an OS-native relative
+		// path, so on Windows these arrive backslash-separated. Matching
+		// '/'-only segments disabled migration extraction there for every
+		// nested path.
+		{`db\migrate\001_create_users.sql`, true},
+		{`services\domain-core\db\migrations\000009_identity_kyc.up.sql`, true},
+		{`internal\db\migrations\init.sql`, true},
+		{`pkg\queries\select.sql`, false},
 	}
 	for _, c := range cases {
 		if got := IsMigrationPath(c.path); got != c.want {

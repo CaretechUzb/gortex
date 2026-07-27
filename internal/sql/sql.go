@@ -795,11 +795,19 @@ func MigrationNodeID(path string) string {
 // (case-insensitive). Matches Rails (db/migrate/), golang-migrate
 // (migrations/), Alembic when wrapped (we mostly handle alembic
 // via Python parsers separately), and most ORM generators.
+//
+// Separators are folded to '/' first. The indexer hands coverage
+// extractors an OS-native relative path on purpose (graphRelKey keeps
+// backslashes on Windows so incremental evictions match the keys the
+// cold walk wrote), so matching '/'-only segments here silently
+// disabled migration extraction for every nested path on Windows —
+// no migration nodes, no provides edges, and unreferenced_tables
+// reporting zero because nothing had a provider at all.
 func IsMigrationPath(filePath string) bool {
 	if !strings.HasSuffix(strings.ToLower(filePath), ".sql") {
 		return false
 	}
-	lower := strings.ToLower(filePath)
+	lower := strings.ReplaceAll(strings.ToLower(filePath), "\\", "/")
 	for _, segment := range []string{"/migrate/", "/migrations/", "/migrate.", "/migrations."} {
 		if strings.Contains(lower, segment) {
 			return true
