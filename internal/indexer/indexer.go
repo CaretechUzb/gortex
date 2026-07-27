@@ -942,8 +942,8 @@ func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 			zap.Int("edges", emitted),
 		)
 	}
-	if ctrl := propagateAspNetControllerHierarchy(idx.graph); ctrl > 0 {
-		idx.logger.Info("controller hierarchy stamped (global)", zap.Int("stamped", ctrl))
+	if ctrl := entrypoints.PropagateEntryPointsDownHierarchy(idx.graph); ctrl > 0 {
+		idx.logger.Info("entry-point hierarchy stamped (global)", zap.Int("stamped", ctrl))
 	}
 	if re, ep, fa := synthesizeCapabilityEdges(idx.graph); re > 0 || ep > 0 || fa > 0 {
 		idx.logger.Info("capability edges emitted (global)",
@@ -3595,8 +3595,8 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					zap.Int("edges", emitted),
 				)
 			}
-			if ctrl := propagateAspNetControllerHierarchy(idx.graph); ctrl > 0 {
-				idx.logger.Info("controller hierarchy stamped", zap.Int("stamped", ctrl))
+			if ctrl := entrypoints.PropagateEntryPointsDownHierarchy(idx.graph); ctrl > 0 {
+				idx.logger.Info("entry-point hierarchy stamped", zap.Int("stamped", ctrl))
 			}
 			if re, ep, fa := synthesizeCapabilityEdges(idx.graph); re > 0 || ep > 0 || fa > 0 {
 				idx.logger.Info("capability edges emitted",
