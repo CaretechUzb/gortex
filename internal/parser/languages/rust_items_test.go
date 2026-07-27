@@ -191,6 +191,47 @@ pub struct Dto { x: i32 }
 	assert.True(t, got["annotation::rust::Clone"])
 }
 
+// An associated const belongs to its impl. Emitting every const at file
+// scope meant two impls declaring the same const name fought over one id
+// and the loser was dropped with no node and no edge.
+func TestRsExtractor_AssociatedConstsKeepTheirOwner(t *testing.T) {
+	byID, edges := rustNodesByID(t, `const MAX: u32 = 1;
+struct A;
+struct B;
+impl A { pub const LIMIT: usize = 10; }
+impl B { pub const LIMIT: usize = 20; }
+`)
+	require.NotNil(t, byID["probe.rs::A.LIMIT"], "impl A's const must survive")
+	require.NotNil(t, byID["probe.rs::B.LIMIT"], "impl B's const must survive too")
+	assert.Equal(t, "A", byID["probe.rs::A.LIMIT"].Meta["receiver"])
+	assert.Equal(t, "B", byID["probe.rs::B.LIMIT"].Meta["receiver"])
+
+	owners := map[string]string{}
+	for _, e := range edges {
+		if e.Kind == graph.EdgeMemberOf {
+			owners[e.From] = e.To
+		}
+	}
+	assert.Equal(t, "probe.rs::A", owners["probe.rs::A.LIMIT"])
+	assert.Equal(t, "probe.rs::B", owners["probe.rs::B.LIMIT"])
+
+	top := byID["probe.rs::MAX"]
+	require.NotNil(t, top)
+	assert.Equal(t, graph.KindConstant, top.Kind, "a const is a constant, not a variable")
+	assert.Equal(t, "u32", top.Meta["declared_type"])
+}
+
+// `static mut` is the one form that is genuinely mutable shared state.
+func TestRsExtractor_StaticMutIsMarked(t *testing.T) {
+	byID, _ := rustNodesByID(t, `static mut COUNTER: u64 = 0;
+static NAME: &str = "x";
+`)
+	require.NotNil(t, byID["probe.rs::COUNTER"])
+	assert.Equal(t, graph.KindVariable, byID["probe.rs::COUNTER"].Kind)
+	assert.Equal(t, true, byID["probe.rs::COUNTER"].Meta["mutable"])
+	assert.Nil(t, byID["probe.rs::NAME"].Meta["mutable"])
+}
+
 // Result error extraction split on every comma and looked at the last
 // "::" in the string, so a tuple payload produced the literal target
 // "u16)" and a fully-qualified Result produced no edge at all.

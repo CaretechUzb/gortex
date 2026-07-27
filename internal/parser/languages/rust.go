@@ -225,10 +225,10 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			e.emitField(m, filePath, src, result, containers)
 
 		case m.Captures["const.def"] != nil:
-			e.emitNamed(m, "const", filePath, fileID, result, seen)
+			e.emitNamed(m, "const", filePath, fileID, src, result, seen, annotationSeen, containers)
 
 		case m.Captures["static.def"] != nil:
-			e.emitNamed(m, "static", filePath, fileID, result, seen)
+			e.emitNamed(m, "static", filePath, fileID, src, result, seen, annotationSeen, containers)
 
 		case m.Captures["use.def"] != nil:
 			e.emitUse(m, filePath, fileID, src, result)
@@ -1481,26 +1481,69 @@ func (e *RustExtractor) emitField(m parser.QueryResult, filePath string, src []b
 // emitNamed handles const_item / static_item — they share the same
 // node shape so we collapse them into one helper that takes the
 // capture-name prefix.
-func (e *RustExtractor) emitNamed(m parser.QueryResult, kind, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+func (e *RustExtractor) emitNamed(m parser.QueryResult, kind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, containers rustContainerIDs) {
 	nameCap := m.Captures[kind+".name"]
 	def := m.Captures[kind+".def"]
 	if nameCap == nil || def == nil {
 		return
 	}
 	name := nameCap.Text
-	id := filePath + "::" + name
-	if seen[id] {
+	startLine1 := def.StartLine + 1
+
+	meta := map[string]any{
+		"decl":       kind,
+		"visibility": rustVisibility(def.Node, src),
+	}
+	applyRustScopeMod(meta, def.Node, src)
+	if t := def.Node.ChildByFieldName("type"); t != nil {
+		meta["declared_type"] = strings.TrimSpace(t.Content(src))
+	}
+	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+		meta["doc"] = doc
+	}
+
+	// An associated const belongs to its impl or trait. Emitting it at
+	// file scope meant `impl A { const MAX }` and `impl B { const MAX }`
+	// fought over one id and the loser was dropped entirely.
+	base := filePath + "::" + name
+	ownerNode, ownerName := rustAssociatedItemOwner(def.Node, src)
+	if ownerName != "" {
+		base = containers.lookup(ownerNode, filePath+"::"+ownerName) + "." + name
+		meta["receiver"] = ownerName
+	}
+	id, ok := disambiguateID(seen, base, startLine1)
+	if !ok {
 		return
 	}
-	seen[id] = true
+
+	// `static mut` is the one form that is actually mutable shared
+	// state, which is worth being able to query for on its own.
+	nodeKind := graph.KindConstant
+	if kind == "static" {
+		nodeKind = graph.KindVariable
+		for i, _nc := 0, int(def.Node.ChildCount()); i < _nc; i++ {
+			if c := def.Node.Child(i); c != nil && c.Content(src) == "mut" {
+				meta["mutable"] = true
+				break
+			}
+		}
+	}
+
 	result.Nodes = append(result.Nodes, &graph.Node{
-		ID: id, Kind: graph.KindVariable, Name: name,
-		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-		Language: "rust",
+		ID: id, Kind: nodeKind, Name: name,
+		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
+		Language: "rust", Meta: meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
-		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
 	})
+	if ownerName != "" {
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: id, To: containers.lookup(ownerNode, filePath+"::"+ownerName),
+			Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine1,
+		})
+	}
+	emitRustAnnotationEdges(rustCollectAttributes(def.Node), id, filePath, src, result, annotationSeen)
 }
 
 func (e *RustExtractor) emitUse(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {

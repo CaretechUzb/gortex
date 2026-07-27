@@ -295,6 +295,35 @@ func emitRustAssociatedType(def *sitter.Node, filePath string, src []byte, resul
 	})
 }
 
+// rustAssociatedItemOwner returns the impl or trait an associated item
+// (a const, static or type declared inside a `declaration_list`) belongs
+// to, together with the owner's type name. Returns a nil node and an
+// empty name for a file-scope item.
+func rustAssociatedItemOwner(item *sitter.Node, src []byte) (*sitter.Node, string) {
+	if item == nil {
+		return nil, ""
+	}
+	parent := item.Parent()
+	if parent == nil || parent.Type() != "declaration_list" {
+		return nil, ""
+	}
+	owner := parent.Parent()
+	if owner == nil {
+		return nil, ""
+	}
+	switch owner.Type() {
+	case "trait_item":
+		return owner, rustDeclName(owner, src)
+	case "impl_item":
+		t := owner.ChildByFieldName("type")
+		if t == nil {
+			return nil, ""
+		}
+		return owner, rustTraitPathBaseName(strings.TrimSpace(t.Content(src)))
+	}
+	return nil, ""
+}
+
 // rustFieldOwner resolves the declaration a named field belongs to. A
 // `field_declaration` can appear under a struct, a union, or a
 // struct-shaped enum variant; the owner name for a variant is
