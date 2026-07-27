@@ -110,6 +110,7 @@ const (
 	SynthSpringEvent         = "spring-event"
 	SynthMediatR             = "mediatr-dispatch"
 	SynthCSharpIfaceDispatch = "csharp-iface-dispatch"
+	SynthCSharpDIIfaces      = "csharp-di-implemented-interfaces"
 	SynthSidekiq             = "sidekiq-dispatch"
 	SynthLaravelEvent        = "laravel-event"
 	SynthFnPointerDispatch   = "fn-pointer-dispatch"
@@ -234,6 +235,7 @@ var frameworkSynthLanguageFamilies = map[string][]string{
 	SynthSpringEvent:         {"jvm"},
 	SynthMediatR:             {"dotnet"},
 	SynthCSharpIfaceDispatch: {"dotnet"},
+	SynthCSharpDIIfaces:      {"dotnet"},
 	SynthSidekiq:             {"ruby"},
 	SynthLaravelEvent:        {"php"},
 	SynthFnPointerDispatch:   {"c"},
@@ -939,6 +941,11 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// MediatR CQRS dispatch: Send(new X()) → the IRequestHandler<X>
 		// Handle, Publish(new X()) → every INotificationHandler<X>.
 		synthFunc{name: SynthMediatR, fn: ResolveMediatRCalls},
+		// Autofac AsImplementedInterfaces(): expand each extractor-emitted
+		// marker into one useClass provides binding per interface the impl
+		// declares. After the implements-producing passes so the join reads
+		// the settled hierarchy.
+		synthFunc{name: SynthCSharpDIIfaces, fn: ResolveCSharpDIImplementedInterfaces, scopedFn: ResolveCSharpDIImplementedInterfacesScoped},
 		// C# member-level interface dispatch: a call bound to an interface
 		// member fans out to the same-named member on each in-repo
 		// implementation, at the ast_inferred tier so it rides in the default

@@ -18,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/embedding"
+	"github.com/zzet/gortex/internal/entrypoints"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/pathkey"
@@ -1340,6 +1341,16 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 		zap.Int("test_symbols", marked),
 		zap.Int("edges", emitted),
 		zap.Duration("elapsed", time.Since(testStart)))
+	passStart("entrypoint_hierarchy")
+	ctrlStart := time.Now()
+	// Seeds from already-stamped entry points, so cost is O(seed
+	// subtree) and language-gated — safe to run unscoped here like the
+	// other global passes; the watcher path uses the Scoped variant.
+	if ctrl := entrypoints.PropagateEntryPointsDownHierarchy(mi.graph); ctrl > 0 {
+		mi.logger.Info("global pass: entry-point hierarchy",
+			zap.Int("stamped", ctrl),
+			zap.Duration("elapsed", time.Since(ctrlStart)))
+	}
 	passStart("capability_edges")
 	capStart := time.Now()
 	capRe, capEp, capFa := synthesizeCapabilityEdgesScoped(mi.graph, changedPrefixes)

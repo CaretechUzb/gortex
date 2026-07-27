@@ -942,6 +942,9 @@ func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 			zap.Int("edges", emitted),
 		)
 	}
+	if ctrl := entrypoints.PropagateEntryPointsDownHierarchy(idx.graph); ctrl > 0 {
+		idx.logger.Info("entry-point hierarchy stamped (global)", zap.Int("stamped", ctrl))
+	}
 	if re, ep, fa := synthesizeCapabilityEdges(idx.graph); re > 0 || ep > 0 || fa > 0 {
 		idx.logger.Info("capability edges emitted (global)",
 			zap.Int("reads_env", re),
@@ -3591,6 +3594,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					zap.Int("test_symbols", marked),
 					zap.Int("edges", emitted),
 				)
+			}
+			if ctrl := entrypoints.PropagateEntryPointsDownHierarchy(idx.graph); ctrl > 0 {
+				idx.logger.Info("entry-point hierarchy stamped", zap.Int("stamped", ctrl))
 			}
 			if re, ep, fa := synthesizeCapabilityEdges(idx.graph); re > 0 || ep > 0 || fa > 0 {
 				idx.logger.Info("capability edges emitted",

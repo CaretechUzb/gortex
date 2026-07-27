@@ -322,9 +322,9 @@ func (p *resolveAllPassIndexes) ensureProvides(prefixes []string) {
 		if edge == nil || edge.Meta == nil {
 			continue
 		}
-		providesFor, _ := edge.Meta["provides_for"].(string)
-		binding, _ := edge.Meta["binding"].(string)
-		if providesFor == "" || binding != "useClass" {
+		providesFor, _ := edge.Meta[graph.MetaDIProvidesFor].(string)
+		binding, _ := edge.Meta[graph.MetaDIBinding].(string)
+		if providesFor == "" || binding != graph.DIBindingUseClass {
 			continue
 		}
 		name := edge.To

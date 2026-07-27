@@ -26,7 +26,9 @@ import (
 //
 // The binding is modelled as an EdgeProvides carrying
 // binding:"useClass" + provides_for:<interface> and pointing at
-// `unresolved::<impl>`. That is the exact shape NestJS useClass and
+// `unresolved::<impl>` (Meta keys exported as graph.MetaDI* /
+// graph.DIBinding* so the resolver consumes the same spelling). That is
+// the exact shape NestJS useClass and
 // Laravel `$this->app->bind` already produce, so the existing
 // resolver.buildProvidesForIndex pass — which rewrites abstract-typed
 // call sites onto the concrete impl — picks these up with no resolver
@@ -437,11 +439,11 @@ func emitDIProvides(result *parser.ExtractionResult, fileID, filePath string, li
 		Line:     line,
 		Origin:   graph.OriginASTInferred,
 		Meta: map[string]any{
-			"binding":        "useClass",
-			"provides_for":   ifaceShort,
-			"di":             source,
-			"interface_fqcn": diNormalizeFQCN(ifaceFQCN),
-			"impl_fqcn":      diNormalizeFQCN(implFQCN),
+			graph.MetaDIBinding:       graph.DIBindingUseClass,
+			graph.MetaDIProvidesFor:   ifaceShort,
+			graph.MetaDISource:        source,
+			graph.MetaDIInterfaceFQCN: diNormalizeFQCN(ifaceFQCN),
+			graph.MetaDIImplFQCN:      diNormalizeFQCN(implFQCN),
 		},
 	})
 }

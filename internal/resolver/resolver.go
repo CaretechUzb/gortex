@@ -2473,6 +2473,11 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 	sub("attribute_go_external_calls")
 	r.attributeGoExternalCalls()
 	t6 := time.Now()
+	// Last, so refs the passes above just bound to a partial fragment are
+	// folded onto the canonical node in the same sweep.
+	sub("merge_csharp_partial_types")
+	r.mergeCSharpPartialTypes()
+	t7 := time.Now()
 	// Diagnostic sub-phase breakdown of the whole-graph attribution sweep,
 	// mirroring the framework-synthesizer per-pass timing — go_attribution
 	// was previously one opaque duration in "resolver: pass complete", so a
@@ -2483,7 +2488,8 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 		zap.Duration("bind_dataflow_callee_refs", t3.Sub(t2)),
 		zap.Duration("bind_generic_param_refs", t4.Sub(t3)),
 		zap.Duration("attribute_go_builtins", t5.Sub(t4)),
-		zap.Duration("attribute_go_external_calls", t6.Sub(t5)))
+		zap.Duration("attribute_go_external_calls", t6.Sub(t5)),
+		zap.Duration("merge_csharp_partial_types", t7.Sub(t6)))
 }
 
 // runFileAttributionPassesForFileLocked is the single-file equivalent of
@@ -2503,6 +2509,7 @@ func (r *Resolver) runFileAttributionPassesForFileLocked(filePath string) {
 	r.bindGenericParamRefsForFile(filePath)
 	r.attributeGoBuiltinsForFile(filePath)
 	r.attributeGoExternalCallsForFile(filePath)
+	r.mergeCSharpPartialTypesForFile(filePath)
 }
 
 // ResolveIncomingForFile is the reverse of ResolveFile: instead of
@@ -3913,11 +3920,11 @@ func (r *Resolver) buildProvidesForIndex() {
 		if ed.Meta == nil {
 			continue
 		}
-		pf, _ := ed.Meta["provides_for"].(string)
+		pf, _ := ed.Meta[graph.MetaDIProvidesFor].(string)
 		if pf == "" {
 			continue
 		}
-		if b, _ := ed.Meta["binding"].(string); b != "useClass" {
+		if b, _ := ed.Meta[graph.MetaDIBinding].(string); b != graph.DIBindingUseClass {
 			continue
 		}
 		to := ed.To

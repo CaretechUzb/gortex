@@ -6,6 +6,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/entrypoints"
 	"github.com/zzet/gortex/internal/resolver"
 )
 
@@ -22,11 +23,15 @@ type IncrementalDerivedReport struct {
 	TestSymbols    int
 	TestEdges      int
 	Capability     int
-	Framework      int
-	ExternalCalls  int
-	CrossRepo      int
-	Contracts      int
-	DurationMs     int64
+	// EntryPointHierarchy counts entry-point stamps (aspnet:controller
+	// today) propagated down resolved extends chains on declaration-shape
+	// changes.
+	EntryPointHierarchy int
+	Framework           int
+	ExternalCalls       int
+	CrossRepo           int
+	Contracts           int
+	DurationMs          int64
 }
 
 // RunIncrementalDerivedPasses executes only the derived families invalidated
@@ -113,6 +118,12 @@ func (mi *MultiIndexer) RunIncrementalDerivedPasses(
 	if merged.Flags.Has(DerivedInvalidatesRuntime) || merged.Flags.Has(DerivedInvalidatesTests) {
 		report.TestSymbols, report.TestEdges = markTestSymbolsAndEmitEdgesScoped(mi.graph, scopedPrefixes, merged.Files...)
 	}
+	if merged.Flags.Has(DerivedInvalidatesDeclarations) && len(merged.TypeIDs) > 0 {
+		// A save that adds/re-parents a type can hang a new derived type
+		// off a stamped hierarchy (or stamp a new base); the changed-type
+		// frontier drives seed discovery, like the scoped passes above.
+		report.EntryPointHierarchy = entrypoints.PropagateEntryPointsDownHierarchyScoped(mi.graph, merged.TypeIDs)
+	}
 	if merged.Flags.Has(DerivedInvalidatesRuntime) {
 		readsEnv, execProc, fields := synthesizeCapabilityEdgesScoped(mi.graph, scopedPrefixes, merged.Files...)
 		report.Capability = readsEnv + execProc + fields
@@ -146,6 +157,7 @@ func (mi *MultiIndexer) logIncrementalDerived(report IncrementalDerivedReport, p
 		zap.Int("implements", report.Implements),
 		zap.Int("overrides", report.Overrides),
 		zap.Int("test_edges", report.TestEdges),
+		zap.Int("entrypoint_hierarchy", report.EntryPointHierarchy),
 		zap.Int("capability_edges", report.Capability),
 		zap.Int("framework_edges", report.Framework),
 		zap.Int("external_calls", report.ExternalCalls),
