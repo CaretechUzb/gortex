@@ -661,9 +661,22 @@ func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error
 	g := c.graph
 	c.mu.Unlock()
 	var memEstimates map[string]graph.RepoMemoryEstimate
+	var wholeStoreNodes, wholeStoreEdges int
 	if g != nil {
 		memEstimates = g.AllRepoMemoryEstimates()
+		// NodeCount/EdgeCount share that profile: COUNT(*) on the SQLite
+		// backend, a walk of every shard in memory. They were computed
+		// under c.mu until the same stall showed up on the whole-store
+		// path, so they are hoisted out alongside the estimate.
+		wholeStoreNodes = g.NodeCount()
+		wholeStoreEdges = g.EdgeCount()
 	}
+
+	// runtime.ReadMemStats stops the world. Under reindex allocation churn
+	// that pause is long enough to matter, and holding c.mu across it makes
+	// every queued control request wait out the pause as well.
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -717,11 +730,8 @@ func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error
 		// not the reported bug.
 		allMeta := c.multiIndexer.AllMetadata()
 		soleRepo := len(allMeta) == 1
-		var wholeStoreNodes, wholeStoreEdges int
-		if g != nil {
-			wholeStoreNodes = g.NodeCount()
-			wholeStoreEdges = g.EdgeCount()
-		}
+		// wholeStoreNodes / wholeStoreEdges were computed above, before the
+		// controller mutex was taken — see the note at the top of Status.
 
 		// Diagnostic: when AllMetadata has tracked repos but
 		// AllRepoMemoryEstimates returns nothing (or a much smaller
@@ -750,7 +760,7 @@ func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error
 				c.logger.Warn("daemon: per-repo counters below tracked-repo count — graph mutation cleared per-repo index?",
 					zap.Int("tracked_repos", tracked),
 					zap.Int("counter_buckets", counted),
-					zap.Int("graph_total_nodes", c.graph.NodeCount()))
+					zap.Int("graph_total_nodes", wholeStoreNodes))
 			}
 		}
 
@@ -935,8 +945,8 @@ func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error
 		workspaces = append(workspaces, *wsAgg[k])
 	}
 
-	var mem runtime.MemStats
-	runtime.ReadMemStats(&mem)
+	// mem was sampled before the mutex was taken — see the note at the top
+	// of Status.
 
 	resp := daemon.StatusResponse{
 		TrackedRepos:  tracked,
@@ -1103,11 +1113,31 @@ func enrichmentProgressFromStatuses(statuses []semantic.EnrichmentStatus) *daemo
 	return out
 }
 
+// searchSymbolsFetchFactor bounds how many name-index candidates
+// SearchSymbols pulls before the File/Import and repo filters run. The name
+// index cannot express those filters, so pushing the caller's limit down
+// verbatim can return a page saturated with rows the filter then drops.
+// Over-fetching absorbs that without giving up the bound; a repo-scoped
+// probe over-fetches harder because one repo can be a thin slice of a
+// multi-repo workspace.
+const (
+	searchSymbolsFetchFactor     = 8
+	searchSymbolsRepoFetchFactor = 32
+	searchSymbolsMaxFetch        = 2000
+)
+
 // SearchSymbols runs a substring match over node names and returns the
 // matching symbols. It's the cheap probe path for clients (notably the
 // Grep-redirect hook) that need a fast yes/no without setting up a full
 // MCP session. File and Import nodes are excluded — the hook only cares
 // about real symbol matches.
+//
+// Candidates come from the sharded name index — one shard read-locked at a
+// time, with the fetch bound pushed down — not from AllNodes. AllNodes
+// read-locks every shard at once and materialises a slice of the entire
+// graph, so on a multi-repo daemon this probe queued behind the indexer's
+// shard writers and blew past the hook's 200ms budget. The hook then logged
+// probed_miss / timed_out and never once produced a hit.
 func (c *realController) SearchSymbols(_ context.Context, p daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
 	c.mu.Lock()
 	g := c.graph
@@ -1121,32 +1151,93 @@ func (c *realController) SearchSymbols(_ context.Context, p daemon.SearchSymbols
 	if limit <= 0 || limit > 50 {
 		limit = 20
 	}
-	needle := strings.ToLower(p.Query)
 	hits := make([]daemon.SymbolHit, 0, limit)
-	for _, n := range g.AllNodes() {
-		if n == nil {
+
+	// Fast path. Everything that reaches this probe is a grep pattern the
+	// hook already classified as identifier-shaped, and the overwhelmingly
+	// common answer is a symbol whose short name matches exactly. byName is
+	// a hash bucket per shard, so this is a handful of map lookups rather
+	// than a walk over every name in the graph — the difference between
+	// microseconds and blowing the hook's probe budget on a large graph.
+	for _, n := range g.FindNodesByName(p.Query) {
+		if !probeSymbolCandidate(n, p.Repo) {
 			continue
 		}
-		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
-			continue
-		}
-		if p.Repo != "" && n.RepoPrefix != p.Repo {
-			continue
-		}
-		if !strings.Contains(strings.ToLower(n.Name), needle) {
-			continue
-		}
-		hits = append(hits, daemon.SymbolHit{
-			Name:     n.Name,
-			Kind:     string(n.Kind),
-			FilePath: n.FilePath,
-			Line:     n.StartLine,
-		})
+		hits = append(hits, probeSymbolHit(n))
 		if len(hits) >= limit {
 			break
 		}
 	}
+	if len(hits) > 0 {
+		return daemon.SearchSymbolsResult{Hits: hits}, nil
+	}
+
+	// Substring fallback, for patterns that name part of a symbol. The name
+	// index cannot express the File/Import or repo filters, so a saturated
+	// page can come back with every row filtered away — a query matching
+	// many file paths crowds real symbols off it. Widen and retry rather
+	// than under-report, but stay bounded: a few rounds capped at
+	// searchSymbolsMaxFetch, still orders of magnitude below a full scan.
+	//
+	// The explicit Contains re-check preserves the pre-index semantics
+	// exactly (full Unicode case folding, where SQLite's LIKE folds ASCII
+	// only).
+	needle := strings.ToLower(p.Query)
+	fetch := limit * searchSymbolsFetchFactor
+	if p.Repo != "" {
+		fetch = limit * searchSymbolsRepoFetchFactor
+	}
+	for {
+		if fetch > searchSymbolsMaxFetch {
+			fetch = searchSymbolsMaxFetch
+		}
+		candidates := g.FindNodesByNameContaining(p.Query, fetch)
+		hits = hits[:0]
+		for _, n := range candidates {
+			if !probeSymbolCandidate(n, p.Repo) {
+				continue
+			}
+			if !strings.Contains(strings.ToLower(n.Name), needle) {
+				continue
+			}
+			hits = append(hits, probeSymbolHit(n))
+			if len(hits) >= limit {
+				break
+			}
+		}
+		// Enough hits, the index is exhausted, or the bound is reached.
+		if len(hits) >= limit || len(candidates) < fetch || fetch >= searchSymbolsMaxFetch {
+			break
+		}
+		fetch *= 4
+	}
 	return daemon.SearchSymbolsResult{Hits: hits}, nil
+}
+
+// probeSymbolCandidate reports whether n can answer a symbol probe. File and
+// Import nodes are named for paths rather than code, so they must never make
+// a grep pattern look like a real symbol; a repo-scoped probe additionally
+// keeps only that repo's nodes.
+func probeSymbolCandidate(n *graph.Node, repo string) bool {
+	if n == nil {
+		return false
+	}
+	if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+		return false
+	}
+	if repo != "" && n.RepoPrefix != repo {
+		return false
+	}
+	return true
+}
+
+func probeSymbolHit(n *graph.Node) daemon.SymbolHit {
+	return daemon.SymbolHit{
+		Name:     n.Name,
+		Kind:     string(n.Kind),
+		FilePath: n.FilePath,
+		Line:     n.StartLine,
+	}
 }
 
 // AttachWatcher is called by warmup to hand over the MultiWatcher once
