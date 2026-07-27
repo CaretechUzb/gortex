@@ -191,6 +191,34 @@ pub struct Dto { x: i32 }
 	assert.True(t, got["annotation::rust::Clone"])
 }
 
+// A newtype's wrapped type used to be invisible: no field node meant
+// find_usages on Config could not see that Wrapper carries one.
+func TestRsExtractor_TupleStructAndVariantPayloads(t *testing.T) {
+	byID, edges := rustNodesByID(t, `struct Wrapper(Config, u8);
+enum Msg { Started, Failed(Error), Rich { code: u16 } }
+`)
+	w0 := byID["probe.rs::Wrapper.0"]
+	require.NotNil(t, w0, "a tuple struct's positional field must exist")
+	assert.Equal(t, "Config", w0.Meta["field_type"])
+	assert.Equal(t, true, w0.Meta["positional"])
+	require.NotNil(t, byID["probe.rs::Wrapper.1"])
+
+	// A payload nests under its variant so two payload-carrying
+	// variants cannot collide on ".0".
+	require.NotNil(t, byID["probe.rs::Msg.Failed.0"])
+	assert.Equal(t, "Msg.Failed", byID["probe.rs::Msg.Failed.0"].Meta["receiver"])
+	require.NotNil(t, byID["probe.rs::Msg.Rich.code"],
+		"a struct-shaped variant's fields were dropped as well")
+
+	var typed bool
+	for _, e := range edges {
+		if e.From == "probe.rs::Wrapper.0" && e.To == "unresolved::Config" && e.Kind == graph.EdgeTypedAs {
+			typed = true
+		}
+	}
+	assert.True(t, typed, "the wrapped type must be reachable from the newtype")
+}
+
 // An associated const belongs to its impl. Emitting every const at file
 // scope meant two impls declaring the same const name fought over one id
 // and the loser was dropped with no node and no edge.

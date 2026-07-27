@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -295,6 +296,88 @@ func emitRustAssociatedType(def *sitter.Node, filePath string, src []byte, resul
 	})
 }
 
+// emitRustTupleFields emits positional fields for a tuple struct or a
+// tuple enum variant. `struct Meters(f64)` and `Msg::Failed(Error)` used
+// to emit no member at all, which also meant the wrapped type was
+// invisible: find_usages on Error could not see that Msg::Failed carries
+// one. Fields are named by position, matching how Rust addresses them
+// (`self.0`).
+func emitRustTupleFields(list *sitter.Node, filePath string, src []byte, result *parser.ExtractionResult, seen map[string]bool, containers rustContainerIDs) {
+	if list == nil {
+		return
+	}
+	ownerNode, ownerName, variant := rustTupleFieldOwner(list, src)
+	if ownerNode == nil || ownerName == "" {
+		return
+	}
+	ownerID := containers.lookup(ownerNode, filePath+"::"+ownerName)
+	if variant != "" {
+		// A variant payload nests under the variant, not the enum, so
+		// two payload-carrying variants cannot collide on ".0".
+		ownerID += "." + variant
+		ownerName += "." + variant
+	}
+	pos := 0
+	for i := 0; i < int(list.ChildCount()); i++ {
+		c := list.Child(i)
+		if c == nil || list.FieldNameForChild(i) != "type" {
+			continue
+		}
+		typeText := strings.TrimSpace(c.Content(src))
+		line := int(c.StartPoint().Row) + 1
+		name := strconv.Itoa(pos)
+		id, ok := disambiguateID(seen, ownerID+"."+name, line)
+		pos++
+		if !ok {
+			continue
+		}
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindField, Name: name,
+			FilePath: filePath, StartLine: line, EndLine: int(c.EndPoint().Row) + 1,
+			Language: "rust",
+			Meta: map[string]any{
+				"receiver":   ownerName,
+				"field_type": typeText,
+				"positional": true,
+				"visibility": rustVisibility(list.Parent(), src),
+			},
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: line,
+		})
+		emitRustTypeUseEdges(id, typeText, filePath, line, result)
+	}
+}
+
+// rustTupleFieldOwner resolves the struct or enum variant that owns a
+// positional field list. The third result is the variant name when the
+// owner is an enum variant, so the caller can nest the field under it.
+func rustTupleFieldOwner(list *sitter.Node, src []byte) (*sitter.Node, string, string) {
+	parent := list.Parent()
+	if parent == nil {
+		return nil, "", ""
+	}
+	switch parent.Type() {
+	case "struct_item":
+		return parent, rustDeclName(parent, src), ""
+	case "enum_variant":
+		variant := ""
+		if n := parent.ChildByFieldName("name"); n != nil {
+			variant = n.Content(src)
+		}
+		enum := findEnclosingRustContainer(parent, "enum_item")
+		if enum == nil || variant == "" {
+			return nil, "", ""
+		}
+		enumName := rustDeclName(enum, src)
+		if enumName == "" {
+			return nil, "", ""
+		}
+		return enum, enumName, variant
+	}
+	return nil, "", ""
+}
+
 // rustAssociatedItemOwner returns the impl or trait an associated item
 // (a const, static or type declared inside a `declaration_list`) belongs
 // to, together with the owner's type name. Returns a nil node and an
@@ -328,11 +411,11 @@ func rustAssociatedItemOwner(item *sitter.Node, src []byte) (*sitter.Node, strin
 // `field_declaration` can appear under a struct, a union, or a
 // struct-shaped enum variant; the owner name for a variant is
 // `Enum.Variant` so it nests under the enum rather than floating free.
-func rustFieldOwner(field *sitter.Node, src []byte) (*sitter.Node, string) {
+func rustFieldOwner(field *sitter.Node, src []byte) (*sitter.Node, string, string) {
 	for p := field.Parent(); p != nil; p = p.Parent() {
 		switch p.Type() {
 		case "struct_item", "union_item":
-			return p, rustDeclName(p, src)
+			return p, rustDeclName(p, src), ""
 		case "enum_variant":
 			variant := ""
 			if n := p.ChildByFieldName("name"); n != nil {
@@ -340,18 +423,18 @@ func rustFieldOwner(field *sitter.Node, src []byte) (*sitter.Node, string) {
 			}
 			enum := findEnclosingRustContainer(p, "enum_item")
 			if enum == nil || variant == "" {
-				return nil, ""
+				return nil, "", ""
 			}
 			enumName := rustDeclName(enum, src)
 			if enumName == "" {
-				return nil, ""
+				return nil, "", ""
 			}
 			// Anchor on the enum so the field id reads
 			// <file>::<Enum>.<Variant>.<field>.
-			return enum, enumName + "." + variant
+			return enum, enumName, variant
 		}
 	}
-	return nil, ""
+	return nil, "", ""
 }
 
 // rustEnclosingModulePath walks the parent chain and joins every

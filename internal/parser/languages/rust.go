@@ -65,6 +65,8 @@ const qRustAll = `
 
   (associated_type) @assoc.def
 
+  (ordered_field_declaration_list) @tuplefields.def
+
   (macro_invocation) @minvoke.expr
 
   (let_declaration
@@ -251,6 +253,9 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 
 		case m.Captures["xcrate.def"] != nil:
 			emitRustExternCrate(m.Captures["xcrate.def"].Node, filePath, fileID, src, result)
+
+		case m.Captures["tuplefields.def"] != nil:
+			emitRustTupleFields(m.Captures["tuplefields.def"].Node, filePath, src, result, seen, containers)
 
 		case m.Captures["assoc.def"] != nil:
 			emitRustAssociatedType(m.Captures["assoc.def"].Node, filePath, src, result, seen)
@@ -1447,12 +1452,16 @@ func (e *RustExtractor) emitField(m parser.QueryResult, filePath string, src []b
 	// A named field can sit in a struct, a union, or a struct-shaped
 	// enum variant. Only the struct case used to be handled, so union
 	// fields and variant payloads were dropped outright.
-	ownerNode, ownerName := rustFieldOwner(def.Node, src)
+	ownerNode, ownerName, variant := rustFieldOwner(def.Node, src)
 	if ownerNode == nil || ownerName == "" {
 		return
 	}
 	fieldName := m.Captures["field.name"].Text
 	structID := containers.lookup(ownerNode, filePath+"::"+ownerName)
+	if variant != "" {
+		structID += "." + variant
+		ownerName += "." + variant
+	}
 	fieldID := structID + "." + fieldName
 	meta := map[string]any{
 		"receiver":   ownerName,
