@@ -509,6 +509,13 @@ func (c *realController) Reload(ctx context.Context) (json.RawMessage, error) {
 		return nil, fmt.Errorf("reload config: %w", err)
 	}
 
+	// Re-read every already-tracked repo's `.gortex.yaml` and push the
+	// refreshed excludes into its live indexer. The tracked-repo diff
+	// below keeps such repos by root path and never re-tracks them, so
+	// without this an edit to a per-repo config could not reach a running
+	// daemon at all: reload was global-config-only in practice.
+	refreshed := c.multiIndexer.RefreshRepoConfigs()
+
 	var added, removed int
 
 	// Match configured entries to currently-tracked instances by ROOT
@@ -556,8 +563,9 @@ func (c *realController) Reload(ctx context.Context) (json.RawMessage, error) {
 	}
 
 	return json.Marshal(map[string]any{
-		"added":   added,
-		"removed": removed,
+		"added":     added,
+		"removed":   removed,
+		"refreshed": refreshed,
 	})
 }
 
