@@ -50,6 +50,33 @@ func TestSQLiteHasLanguageEmptyStore(t *testing.T) {
 	}
 }
 
+// TestSQLiteHasLanguageNarrowsToNamedNodes pins the documented boundary:
+// the `name <> ''` predicate is what makes the partial index eligible, so
+// the probe answers "are there NAMED nodes in this language". A language
+// present only as unnamed nodes reads as absent. Every caller gates a
+// pass over symbols, so that is the intended question — but it is a real
+// narrowing, and dropping the predicate to widen it would silently cost
+// the index scan the probe exists to avoid.
+func TestSQLiteHasLanguageNarrowsToNamedNodes(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	store.AddBatch([]*graph.Node{
+		{ID: "a.rb::Widget", Kind: graph.KindType, Name: "Widget", Language: "ruby", FilePath: "a.rb"},
+		{ID: "b.zig", Kind: graph.KindFile, Name: "", Language: "zig", FilePath: "b.zig"},
+	}, nil)
+
+	if !store.HasLanguage("ruby") {
+		t.Error("a language with a named node must be present")
+	}
+	if store.HasLanguage("zig") {
+		t.Error("a language with only unnamed nodes reads as absent — see HasLanguage's doc comment")
+	}
+}
+
 // TestSQLiteNodesByKindLang: the pushed-down filter must yield exactly the
 // kind∩language intersection and honour early stop.
 func TestSQLiteNodesByKindLang(t *testing.T) {
