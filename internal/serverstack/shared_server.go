@@ -356,11 +356,13 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			semMgr.RegisterProvider(tp)
 		}
 
-		lspWorkspace := cfg.Index
-		if lspWorkspace == "" {
-			lspWorkspace, _ = os.Getwd()
-		}
-		lspRouter := lsp.NewRouter(lspWorkspace, logger).
+		// Only the embedded single-repo path (cfg.Index set) has one
+		// meaningful default workspace. The daemon tracks many repos and is
+		// routinely launched from none of them, so its default stays empty:
+		// every caller passes the tracked repo's own root per request, and
+		// one that forgets now fails loudly instead of spawning a language
+		// server in the daemon's launch directory.
+		lspRouter := lsp.NewRouter(cfg.Index, logger).
 			WithIdleTimeout(10 * time.Minute).
 			WithReaperInterval(time.Minute).
 			WithMaxAlive(6).

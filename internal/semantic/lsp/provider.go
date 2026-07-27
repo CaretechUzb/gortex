@@ -2726,6 +2726,13 @@ func (p *Provider) Client() *Client { return p.client }
 // LSP server (idempotent) so callers that want diagnostics or code
 // actions outside an Enrich pass can prime the connection on demand.
 func (p *Provider) EnsureClient(workspaceRoot string) error {
+	// filepath.Abs("") is the process's working directory. For a daemon
+	// tracking many repos that is a directory belonging to none of them, so
+	// an omitted root must be an error rather than a server rooted wherever
+	// the daemon was launched.
+	if workspaceRoot == "" {
+		return fmt.Errorf("lsp %s: no workspace root supplied; pass the tracked repo's own path", p.command)
+	}
 	abs, err := filepath.Abs(workspaceRoot)
 	if err != nil {
 		return err

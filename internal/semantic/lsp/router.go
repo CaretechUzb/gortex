@@ -32,6 +32,50 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
+// absWorkspace absolutises a workspace root, preserving the empty string.
+// filepath.Abs("") returns the process's own working directory — for a
+// daemon tracking many repos that is a directory belonging to none of
+// them, and it must never silently become a language server's cwd.
+func absWorkspace(workspace string) string {
+	if workspace == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(workspace); err == nil {
+		return abs
+	}
+	return workspace
+}
+
+// validateWorkspaceRoot rejects a workspace that cannot serve as an LSP
+// subprocess's working directory. The router hands this value to
+// exec.Cmd.Dir, so an unusable one surfaces as an opaque
+// `chdir <path>: no such file or directory` from the OS long after the
+// mistake was made. Checking here names the real problem — and lets the
+// caller fail without tripping markSpawnFailed, which would disable the
+// spec for every other repo the daemon tracks.
+//
+// requested is what the caller asked for (before absolutisation);
+// resolved is what would actually be handed to exec. Both matter: a
+// requested root that is merely relative is already wrong even when it
+// happens to resolve, because it resolved against the daemon's launch
+// directory rather than against the tracked repo.
+func validateWorkspaceRoot(specName, requested, resolved string) error {
+	if requested == "" {
+		return fmt.Errorf("LSP server %q: no workspace root supplied; the workspace must be the tracked repo's own path", specName)
+	}
+	if !filepath.IsAbs(requested) {
+		return fmt.Errorf("LSP server %q: workspace %q is not absolute; a relative root resolves against the daemon's launch directory, not the tracked repo", specName, requested)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return fmt.Errorf("LSP server %q: workspace %s is not usable as a working directory: %w", specName, resolved, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("LSP server %q: workspace %s is not a directory", specName, resolved)
+	}
+	return nil
+}
+
 // Router is a daemon-managed pool of LSP providers keyed by ServerSpec.
 // It routes requests to the right provider by file extension, spawns
 // providers lazily on first touch, and reaps idle ones to bound the
@@ -133,13 +177,17 @@ type providerKey struct {
 // directory passed to LSP servers as `rootUri` when the caller uses
 // For / ForSpec without specifying a workspace. Multi-repo daemons
 // override on a per-request basis via ForWorkspace / ForSpecWorkspace.
+//
+// Pass "" when there is no single meaningful default (the multi-repo
+// daemon case): an empty default stays empty, so a caller that omits the
+// per-repo workspace gets a clear error instead of a server spawned in
+// whatever directory the daemon happened to be launched from.
 func NewRouter(defaultWorkspace string, logger *zap.Logger) *Router {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	abs, _ := filepath.Abs(defaultWorkspace)
 	return &Router{
-		defaultWorkspace: abs,
+		defaultWorkspace: absWorkspace(defaultWorkspace),
 		logger:           logger,
 		providers:        make(map[providerKey]*routedProvider),
 		enabled:          make(map[string]*ServerSpec),
@@ -399,10 +447,7 @@ func (r *Router) workspaceKey(specName, workspace string) providerKey {
 	if workspace == "" {
 		workspace = r.defaultWorkspace
 	}
-	if abs, err := filepath.Abs(workspace); err == nil {
-		workspace = abs
-	}
-	return providerKey{specName: specName, workspace: workspace}
+	return providerKey{specName: specName, workspace: absWorkspace(workspace)}
 }
 
 // ReleaseSpecWorkspace marks a provider previously obtained via
@@ -477,9 +522,11 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	if workspace == "" {
 		workspace = r.defaultWorkspace
 	}
-	if abs, err := filepath.Abs(workspace); err == nil {
-		workspace = abs
-	}
+	// Keep what was asked for: validateWorkspaceRoot needs it to tell a
+	// genuine absolute repo root from a relative fragment that merely
+	// resolved against the daemon's launch directory.
+	requested := workspace
+	workspace = absWorkspace(workspace)
 	key := providerKey{specName: spec.Name, workspace: workspace}
 
 	r.mu.Lock()
@@ -493,6 +540,16 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 		return rp.provider, nil
 	}
 	r.mu.Unlock()
+
+	// The workspace becomes the subprocess's working directory, so validate
+	// it before spawning. A caller that handed us a path anchored on the
+	// daemon's launch cwd instead of on the tracked repo's own root would
+	// otherwise fail deep inside exec with a bare chdir error — and would
+	// take the spec down for every repo via markSpawnFailed. Failing here
+	// keeps the fault local to the one bad workspace.
+	if err := validateWorkspaceRoot(spec.Name, requested, workspace); err != nil {
+		return nil, err
+	}
 
 	// Spawn outside the lock — initialize() blocks on stdio I/O.
 	p := NewProviderFromSpec(spec, r.logger)
