@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
-	"strings"
+	"sort"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/semantic/lsp"
 )
@@ -46,7 +48,11 @@ func (s *Server) enrichNodeOnDemand(node *graph.Node) {
 	if err != nil || provider == nil {
 		return
 	}
-	_, _ = provider.EnrichNode(s.graph, s.workspaceRootFor(absPath), node)
+	root, err := s.workspaceRootFor(absPath)
+	if err != nil {
+		return
+	}
+	_, _ = provider.EnrichNode(s.graph, root, node)
 }
 
 // confirmSymbolRefsOnDemand faults in a callable symbol's INCOMING references
@@ -75,7 +81,11 @@ func (s *Server) confirmSymbolRefsOnDemand(node *graph.Node) {
 	if err != nil || provider == nil {
 		return
 	}
-	_, _ = provider.ConfirmSymbolRefs(s.graph, s.workspaceRootFor(absPath), node)
+	root, err := s.workspaceRootFor(absPath)
+	if err != nil {
+		return
+	}
+	_, _ = provider.ConfirmSymbolRefs(s.graph, root, node)
 	// Record after the attempt (even on 0/err) so a query doesn't re-spawn the
 	// server every call; a file re-index clears staleness through the normal
 	// restub path. Durable-ledger + retry semantics are the fuller version.
@@ -378,7 +388,10 @@ func (s *Server) lspProviderForPath(path string) (*lsp.Provider, string, error) 
 			// in a multi-repo daemon, each rooted correctly. A
 			// shared (spec, defaultWorkspace) reuse would corrupt
 			// rootURI for files outside the first-spawned repo.
-			root := s.workspaceRootFor(abs)
+			root, err := s.workspaceRootFor(abs)
+			if err != nil {
+				return nil, abs, err
+			}
 			lp, err := r.ForSpecWorkspace(spec, root)
 			if err != nil {
 				return nil, abs, fmt.Errorf("router spawn %s: %w", spec.Name, err)
@@ -402,7 +415,10 @@ func (s *Server) lspProviderForPath(path string) (*lsp.Provider, string, error) 
 			continue
 		}
 		// Lazy spawn — Provider.EnsureClient is idempotent.
-		root := s.workspaceRootFor(abs)
+		root, err := s.workspaceRootFor(abs)
+		if err != nil {
+			return nil, abs, err
+		}
 		if err := lp.EnsureClient(root); err != nil {
 			return nil, abs, fmt.Errorf("ensure client %s: %w", spec.Name, err)
 		}
@@ -455,30 +471,76 @@ func (s *Server) absolutePath(path string) (string, error) {
 			return filepath.Join(root, path), nil
 		}
 	}
+	// A repo-relative fragment the prefix join could not claim (an
+	// unprefixed graph path in a multi-repo daemon) still belongs to one of
+	// the tracked repos. Anchor it there before considering filepath.Abs,
+	// which would join it onto the daemon's own launch directory and mint a
+	// path that exists nowhere.
+	if abs := s.anchorOnTrackedRepo(path); abs != "" {
+		return abs, nil
+	}
 	if abs, err := filepath.Abs(path); err == nil {
 		return abs, nil
 	}
 	return path, nil
 }
 
-// workspaceRootFor returns the workspace root the LSP server should
-// be initialised with for the given file. Falls back to the file's
-// directory when no indexer root is available.
-func (s *Server) workspaceRootFor(absPath string) string {
+// anchorOnTrackedRepo joins a repo-relative path onto each tracked repo
+// root and returns the first candidate that exists on disk. Roots are
+// walked in sorted-prefix order so the answer stays deterministic when the
+// same relative path resolves under more than one tracked repo.
+func (s *Server) anchorOnTrackedRepo(rel string) string {
+	roots := s.collectRepoRoots("")
+	if len(roots) == 0 {
+		return ""
+	}
+	prefixes := make([]string, 0, len(roots))
+	for prefix := range roots {
+		prefixes = append(prefixes, prefix)
+	}
+	sort.Strings(prefixes)
+	for _, prefix := range prefixes {
+		candidate := filepath.Join(roots[prefix], rel)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// workspaceRootFor returns the workspace root the LSP server should be
+// initialised with — and chdir'd into — for the given file: the tracked
+// repo that contains it.
+//
+// It never derives a root from the daemon process's own working
+// directory. A daemon tracking several repos is normally launched from
+// none of them, and handing a language server a directory synthesised
+// from that cwd fails the spawn with an opaque chdir error, silently
+// dropping that language's enrichment for the rest of the session.
+func (s *Server) workspaceRootFor(absPath string) (string, error) {
 	if s.indexer != nil {
-		root := s.indexer.RootPath()
-		if root != "" && strings.HasPrefix(absPath, root) {
-			return root
+		// Component-boundary containment: a plain string prefix would let
+		// the root /src/repo claim a file under /src/repo-old.
+		if root := s.indexer.RootPath(); root != "" && pathkey.HasPathPrefix(absPath, root) {
+			return root, nil
 		}
 	}
 	if s.multiIndexer != nil {
 		if prefix := s.multiIndexer.RepoForFile(absPath); prefix != "" {
-			if meta := s.multiIndexer.GetMetadata(prefix); meta != nil {
-				return meta.RootPath
+			if meta := s.multiIndexer.GetMetadata(prefix); meta != nil && meta.RootPath != "" {
+				return meta.RootPath, nil
 			}
 		}
 	}
-	return filepath.Dir(absPath)
+	// Last resort — the file's own directory, and only when it really
+	// exists. An unindexed-but-real file (a scratch file an editor opened)
+	// is a legitimate workspace; a directory that exists nowhere is the
+	// mis-anchored-path bug, and must not reach a spawn.
+	dir := filepath.Dir(absPath)
+	if info, err := os.Stat(dir); err == nil && info.IsDir() {
+		return dir, nil
+	}
+	return "", fmt.Errorf("no tracked repo contains %s: refusing to derive an LSP workspace from the daemon's working directory", absPath)
 }
 
 // lspNoProviderResult returns a structured error for the "no LSP

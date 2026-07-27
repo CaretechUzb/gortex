@@ -171,6 +171,20 @@ touched only intermittently. Override them by editing the
 `lsp.NewRouter(...).With...` chain in your build if you need a longer
 warm pool or a tighter memory bound.
 
+### Workspace roots
+
+Each cached provider is keyed by `(spec, workspace)`, and the workspace
+is what the language server is initialised against **and chdir'd into**.
+It always comes from the tracked repo's own recorded path — never from
+the directory the daemon process happened to be launched in. A daemon
+tracking several repos is normally started from none of them, so a
+workspace derived from its launch cwd would name a directory that exists
+nowhere and fail the spawn.
+
+The router therefore requires an absolute, existing directory and
+rejects anything else before spawning. `gortex daemon --detach` can be
+started from anywhere; no repo needs to be the daemon's cwd.
+
 ## Enrichment cost model
 
 The resolution path (use 1 at the top of this page) runs as a batch
@@ -418,6 +432,12 @@ for repositories you trust.
   boot but the subprocess failed to initialise (commonly a missing
   dependency such as `node` for `pyright`, or a workspace-config
   mismatch). The error surfaces the LSP server's stderr.
+- **`workspace ... is not usable as a working directory` error:** the
+  caller supplied a workspace root that names no directory. The router
+  refuses it rather than spawning the server there, because that value
+  becomes the subprocess's working directory. A rejection is local to
+  the one workspace — the spec stays available for every other tracked
+  repo.
 - **Server keeps restarting:** the idle reaper closed it, then the
   next request re-spawned. Increase `WithIdleTimeout` if this hurts
   warm-cache benchmarks.
