@@ -225,8 +225,12 @@ func scanKindUsage(repoRoot string, declared []kindDecl) (map[string]int, error)
 		}
 		// Worktrees can hide a duplicate copy of the source tree
 		// under .claude/worktrees/* — already skipped by the .claude
-		// directory rule above; defensive double-check.
-		if strings.Contains(path, "/worktrees/") {
+		// directory rule above; defensive double-check. Match against
+		// the repo-relative path: the checkout ITSELF often lives under
+		// a `worktrees/` directory, and testing the absolute path there
+		// skips every file in the repo, orphaning all 108 kinds.
+		if rel, relErr := filepath.Rel(repoRoot, path); relErr == nil &&
+			strings.Contains(filepath.ToSlash(rel), "worktrees/") {
 			return nil
 		}
 		// Don't let the audit's own file count as a reference — it
