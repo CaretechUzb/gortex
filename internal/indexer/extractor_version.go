@@ -26,7 +26,8 @@ var extractorVersions = map[string]int{
 	// Languages default to version 1 (no salt). Raise an entry here in
 	// the same change that alters a language's extraction logic, e.g.
 	//   "go": 2,
-	"php": 2, // class/interface inheritance now emits typed structural edges
+	"php":    2, // class/interface inheritance now emits typed structural edges
+	"csharp": 2, // null-conditional call edges; reference forms for caseless type names
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
