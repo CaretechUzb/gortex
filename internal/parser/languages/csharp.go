@@ -77,6 +77,12 @@ const qCSharpAll = `
       expression: (_) @callm.receiver
       name: (identifier) @callm.method)) @callm.expr
 
+  (invocation_expression
+    function: (conditional_access_expression
+      condition: (_) @callm.receiver
+      (member_binding_expression
+        name: (identifier) @callm.method))) @callm.expr
+
   (local_declaration_statement
     (variable_declaration
       type: (_) @lvar.type
