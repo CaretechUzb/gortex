@@ -104,6 +104,41 @@ Recent extraction refinements (each covered by a per-feature CI golden): Java `@
 | Makefile | `Makefile`, `GNUmakefile`, `.mk`, `.make` | Targets, `define…endef`, `VAR = …`, `include` / `-include` |
 | CMake | `CMakeLists.txt`, `.cmake` | `function(…)`, `macro(…)`, `add_library`, `add_executable`, `include(…)`, `set(…)` |
 
+### SQL coverage boundary
+
+A `.sql` file is read by two independent passes, and knowing which one
+produced a symbol explains what you can ask of it.
+
+- **The tree-sitter DDL walk** runs on every `.sql` file and emits a
+  `type` node per `CREATE TABLE` / `CREATE VIEW`, a `function` node per
+  `CREATE FUNCTION`, and `variable` nodes for indexes and triggers.
+  Schema-qualified names are indexed under the object's own name
+  (`identity.kyc_submissions` → `kyc_submissions`), with the schema on
+  `meta.schema` and the full name on `meta.qualified_name`; the same
+  table name under two schemas stays two symbols. The walk descends
+  through parse errors, so statements following a dollar-quoted
+  PL/pgSQL body are still extracted.
+- **Migration ingest** additionally runs on files under `migrate/` or
+  `migrations/`, and on `gortex db schema` dumps anywhere, emitting the
+  canonical `table` / `column` / `migration` nodes plus `provides`
+  edges. This pass is regex-based: it reads `CREATE TABLE` and ignores
+  `ALTER` / `DROP`, so a column added by a later migration is not on
+  the table.
+
+What is **not** covered:
+
+- **Query edges from application code are opt-in.** Table reads and
+  writes found in string-literal SQL are gated behind the `sql`
+  coverage domain, which is off by default because literal-scanning is
+  noisy. With it off there are no `queries` edges, and the analyzers
+  built on them (`sql_call_sites`, `orphan_tables`,
+  `unreferenced_tables`) return an empty result annotated with
+  `query_edges: 0` — an empty layer, not an all-clear.
+- **Dynamic SQL is invisible** — queries assembled by concatenation or
+  a query builder have no literal to read.
+- **Schema deltas are not modeled.** The graph holds the shape each
+  migration declares, not the accumulated result of replaying them.
+
 ## Template engines
 
 | Language | Extensions | What it extracts |

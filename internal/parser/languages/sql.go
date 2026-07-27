@@ -1,6 +1,8 @@
 package languages
 
 import (
+	"strings"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
@@ -55,44 +57,62 @@ func (e *SQLExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	}
 
 	seen := make(map[string]bool)
-
-	// Walk top-level statements.
-	for i, _nc := 0, int(root.NamedChildCount()); i < _nc; i++ {
-		stmt := root.NamedChild(i)
-		if stmt.Type() != "statement" {
-			continue
-		}
-		for j, _nc := 0, int(stmt.NamedChildCount()); j < _nc; j++ {
-			child := stmt.NamedChild(j)
-			switch child.Type() {
-			case "create_table":
-				e.extractCreateTable(child, src, filePath, fileNode.ID, seen, result)
-			case "create_view":
-				e.extractCreateView(child, src, filePath, fileNode.ID, seen, result)
-			case "create_function":
-				e.extractCreateFunction(child, src, filePath, fileNode.ID, seen, result)
-			case "create_index":
-				e.extractCreateIndex(child, src, filePath, fileNode.ID, seen, result)
-			case "create_trigger":
-				e.extractCreateTrigger(child, src, filePath, fileNode.ID, seen, result)
-			}
-		}
-	}
+	e.walkDDL(root, src, filePath, fileNode.ID, seen, result, 0)
 
 	return result, nil
 }
 
-func (e *SQLExtractor) extractCreateTable(node *sitter.Node, src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
-	name := findObjectName(node, src)
-	if name == "" || seen[name] {
+// maxDDLWalkDepth bounds the recursive descent. Real DDL nests a handful
+// of levels; a deeper tree is either pathological or an error cascade,
+// and neither is worth unbounded stack.
+const maxDDLWalkDepth = 64
+
+// walkDDL descends the whole tree looking for CREATE statements rather
+// than only visiting `statement` children of the root.
+//
+// The recursion is load-bearing, not defensive. tree-sitter-sql has no
+// grammar for dollar-quoted PL/pgSQL bodies, so a `CREATE FUNCTION … $$
+// BEGIN … END $$` — routine in Postgres migrations — parses as an ERROR
+// node that swallows the rest of the file. Under a top-level-only walk
+// every table declared after the first trigger function silently
+// disappeared, which is most of a real migration set. Descending through
+// ERROR recovers those statements: the sub-nodes are still parsed
+// correctly, they are just re-parented under the error.
+func (e *SQLExtractor) walkDDL(node *sitter.Node, src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult, depth int) {
+	if depth > maxDDLWalkDepth {
 		return
 	}
-	seen[name] = true
-	id := filePath + "::" + name
+	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "create_table":
+			e.extractCreateTable(child, src, filePath, fileID, seen, result)
+		case "create_view":
+			e.extractCreateView(child, src, filePath, fileID, seen, result)
+		case "create_function":
+			e.extractCreateFunction(child, src, filePath, fileID, seen, result)
+		case "create_index":
+			e.extractCreateIndex(child, src, filePath, fileID, seen, result)
+		case "create_trigger":
+			e.extractCreateTrigger(child, src, filePath, fileID, seen, result)
+		default:
+			e.walkDDL(child, src, filePath, fileID, seen, result, depth+1)
+		}
+	}
+}
+
+func (e *SQLExtractor) extractCreateTable(node *sitter.Node, src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
+	obj := findObject(node, src)
+	if obj.Name == "" || seen[obj.key("table")] {
+		return
+	}
+	seen[obj.key("table")] = true
+	name := obj.Name
+	id := filePath + "::" + obj.qualified()
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: int(node.StartPoint().Row) + 1, EndLine: int(node.EndPoint().Row) + 1,
-		Language: "sql", Meta: map[string]any{"sql_type": "table", "type_flavor": "table"},
+		Language: "sql", Meta: obj.meta(map[string]any{"sql_type": "table", "type_flavor": "table"}),
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines,
@@ -106,7 +126,7 @@ func (e *SQLExtractor) extractCreateTable(node *sitter.Node, src []byte, filePat
 			for k, _nc := 0, int(child.NamedChildCount()); k < _nc; k++ {
 				col := child.NamedChild(k)
 				if col.Type() == "column_definition" {
-					colName := firstNamedChildOfType(col, "identifier", src)
+					colName := stripSQLQuoting(firstNamedChildOfType(col, "identifier", src))
 					if colName != "" {
 						colID := id + "." + colName
 						if !seen[colID] {
@@ -129,16 +149,16 @@ func (e *SQLExtractor) extractCreateTable(node *sitter.Node, src []byte, filePat
 }
 
 func (e *SQLExtractor) extractCreateView(node *sitter.Node, src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
-	name := findObjectName(node, src)
-	if name == "" || seen[name] {
+	obj := findObject(node, src)
+	if obj.Name == "" || seen[obj.key("view")] {
 		return
 	}
-	seen[name] = true
-	id := filePath + "::" + name
+	seen[obj.key("view")] = true
+	id := filePath + "::" + obj.qualified()
 	result.Nodes = append(result.Nodes, &graph.Node{
-		ID: id, Kind: graph.KindType, Name: name,
+		ID: id, Kind: graph.KindType, Name: obj.Name,
 		FilePath: filePath, StartLine: int(node.StartPoint().Row) + 1, EndLine: int(node.EndPoint().Row) + 1,
-		Language: "sql", Meta: map[string]any{"sql_type": "view", "type_flavor": "view"},
+		Language: "sql", Meta: obj.meta(map[string]any{"sql_type": "view", "type_flavor": "view"}),
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines,
@@ -147,16 +167,16 @@ func (e *SQLExtractor) extractCreateView(node *sitter.Node, src []byte, filePath
 }
 
 func (e *SQLExtractor) extractCreateFunction(node *sitter.Node, src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
-	name := findObjectName(node, src)
-	if name == "" || seen[name] {
+	obj := findObject(node, src)
+	if obj.Name == "" || seen[obj.key("function")] {
 		return
 	}
-	seen[name] = true
-	id := filePath + "::" + name
+	seen[obj.key("function")] = true
+	id := filePath + "::" + obj.qualified()
 	result.Nodes = append(result.Nodes, &graph.Node{
-		ID: id, Kind: graph.KindFunction, Name: name,
+		ID: id, Kind: graph.KindFunction, Name: obj.Name,
 		FilePath: filePath, StartLine: int(node.StartPoint().Row) + 1, EndLine: int(node.EndPoint().Row) + 1,
-		Language: "sql",
+		Language: "sql", Meta: obj.meta(nil),
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines,
@@ -164,17 +184,26 @@ func (e *SQLExtractor) extractCreateFunction(node *sitter.Node, src []byte, file
 	})
 }
 
+// extractCreateIndex names the index after its own identifier, not the
+// table it indexes. `CREATE INDEX idx ON schema.tbl (col)` puts the index
+// name in a bare `identifier` child and the ON-target in the statement's
+// first `object_reference`; the shared findObject path would therefore
+// name every index after the table it covers.
 func (e *SQLExtractor) extractCreateIndex(node *sitter.Node, src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
-	name := findObjectName(node, src)
-	if name == "" || seen[name] {
+	obj := findDeclaredIdentifier(node, src)
+	if obj.Name == "" || seen[obj.key("index")] {
 		return
 	}
-	seen[name] = true
-	id := filePath + "::" + name
+	seen[obj.key("index")] = true
+	meta := obj.meta(map[string]any{"sql_type": "index"})
+	if target := findObject(node, src); target.Name != "" {
+		meta["indexes"] = target.qualified()
+	}
+	id := filePath + "::" + obj.qualified()
 	result.Nodes = append(result.Nodes, &graph.Node{
-		ID: id, Kind: graph.KindVariable, Name: name,
+		ID: id, Kind: graph.KindVariable, Name: obj.Name,
 		FilePath: filePath, StartLine: int(node.StartPoint().Row) + 1, EndLine: int(node.EndPoint().Row) + 1,
-		Language: "sql", Meta: map[string]any{"sql_type": "index"},
+		Language: "sql", Meta: meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines,
@@ -183,16 +212,19 @@ func (e *SQLExtractor) extractCreateIndex(node *sitter.Node, src []byte, filePat
 }
 
 func (e *SQLExtractor) extractCreateTrigger(node *sitter.Node, src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
-	name := findObjectName(node, src)
-	if name == "" || seen[name] {
+	// A trigger's own name is the statement's first `object_reference`
+	// (`CREATE TRIGGER trg BEFORE UPDATE ON tbl …`), so the shared path
+	// is correct here — unlike CREATE INDEX.
+	obj := findObject(node, src)
+	if obj.Name == "" || seen[obj.key("trigger")] {
 		return
 	}
-	seen[name] = true
-	id := filePath + "::" + name
+	seen[obj.key("trigger")] = true
+	id := filePath + "::" + obj.qualified()
 	result.Nodes = append(result.Nodes, &graph.Node{
-		ID: id, Kind: graph.KindVariable, Name: name,
+		ID: id, Kind: graph.KindVariable, Name: obj.Name,
 		FilePath: filePath, StartLine: int(node.StartPoint().Row) + 1, EndLine: int(node.EndPoint().Row) + 1,
-		Language: "sql", Meta: map[string]any{"sql_type": "trigger"},
+		Language: "sql", Meta: obj.meta(map[string]any{"sql_type": "trigger"}),
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines,
@@ -200,17 +232,110 @@ func (e *SQLExtractor) extractCreateTrigger(node *sitter.Node, src []byte, fileP
 	})
 }
 
-// findObjectName extracts the name from a CREATE statement by finding
-// the first object_reference > identifier child.
-func findObjectName(node *sitter.Node, src []byte) string {
+// sqlObject is the identifier a CREATE statement declares, split into
+// the object's own name and the schema it was qualified with.
+type sqlObject struct {
+	Name   string // bare object name, quoting stripped
+	Schema string // schema qualifier; "" when the name was unqualified
+}
+
+// qualified renders the name the graph keys the object under. Staying
+// bare for unqualified names keeps node IDs stable for the single-schema
+// files that already worked.
+func (o sqlObject) qualified() string {
+	if o.Schema == "" {
+		return o.Name
+	}
+	return o.Schema + "." + o.Name
+}
+
+// key is the per-file dedupe key. It is qualified and kind-scoped so
+// `identity.accounts` and `billing.accounts` in one migration are two
+// tables rather than one, and a trigger may share a table's name.
+func (o sqlObject) key(kind string) string { return kind + "::" + o.qualified() }
+
+// meta merges the schema qualifier into a node's metadata, leaving base
+// untouched (and nil-preserving) when the name was unqualified.
+func (o sqlObject) meta(base map[string]any) map[string]any {
+	if o.Schema == "" {
+		return base
+	}
+	if base == nil {
+		base = map[string]any{}
+	}
+	base["schema"] = o.Schema
+	base["qualified_name"] = o.qualified()
+	return base
+}
+
+// findObject resolves the object a CREATE statement declares from its
+// first `object_reference`.
+//
+// A schema-qualified reference (`identity.kyc_submissions`) exposes one
+// `identifier` child per dotted segment, so the object's own name is the
+// LAST segment. Reading the first segment named every table after its
+// schema instead — which then collapsed under the per-file dedupe, so a
+// migration declaring `identity.accounts` and `identity.kyc_submissions`
+// produced a single bogus symbol called `identity` and lost the rest.
+func findObject(node *sitter.Node, src []byte) sqlObject {
 	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
 		child := node.NamedChild(i)
 		if child.Type() == "object_reference" {
-			return firstNamedChildOfType(child, "identifier", src)
+			return objectFromReference(child, src)
 		}
 	}
-	// Fallback: first identifier child directly.
-	return firstNamedChildOfType(node, "identifier", src)
+	// Fallback: a bare identifier child, no object_reference wrapper.
+	return sqlObject{Name: stripSQLQuoting(firstNamedChildOfType(node, "identifier", src))}
+}
+
+// objectFromReference splits an `object_reference` into schema + name.
+// Segments carry their own quoting (`"billing"."balance_transactions"`,
+// MySQL backticks), which is stripped per segment so a quoted name
+// containing a dot stays intact — something splitting the raw text on
+// the last dot would get wrong.
+func objectFromReference(ref *sitter.Node, src []byte) sqlObject {
+	var segments []string
+	for i, _nc := 0, int(ref.NamedChildCount()); i < _nc; i++ {
+		child := ref.NamedChild(i)
+		if child.Type() == "identifier" {
+			segments = append(segments, stripSQLQuoting(child.Content(src)))
+		}
+	}
+	switch len(segments) {
+	case 0:
+		return sqlObject{}
+	case 1:
+		return sqlObject{Name: segments[0]}
+	default:
+		// `db.schema.table` keeps only the immediate parent as schema,
+		// matching internal/sql's splitSchemaTable.
+		return sqlObject{Name: segments[len(segments)-1], Schema: segments[len(segments)-2]}
+	}
+}
+
+// findDeclaredIdentifier resolves the name of a statement that declares
+// its object as a bare identifier ahead of an ON-target — CREATE INDEX.
+func findDeclaredIdentifier(node *sitter.Node, src []byte) sqlObject {
+	if name := stripSQLQuoting(firstNamedChildOfType(node, "identifier", src)); name != "" {
+		return sqlObject{Name: name}
+	}
+	return findObject(node, src)
+}
+
+// stripSQLQuoting removes the three identifier-quoting styles: double
+// quotes (ANSI), backticks (MySQL), brackets (T-SQL).
+func stripSQLQuoting(name string) string {
+	name = strings.TrimSpace(name)
+	if len(name) >= 2 {
+		first, last := name[0], name[len(name)-1]
+		switch {
+		case first == '"' && last == '"',
+			first == '`' && last == '`',
+			first == '[' && last == ']':
+			return name[1 : len(name)-1]
+		}
+	}
+	return name
 }
 
 func firstNamedChildOfType(node *sitter.Node, nodeType string, src []byte) string {

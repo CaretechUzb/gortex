@@ -88,3 +88,61 @@ func TestIndex_GeneratedSchemaIngestedAnywhere(t *testing.T) {
 		t.Error("generated-schema column node 'owner' missing")
 	}
 }
+
+// TestIndex_SchemaQualifiedMultiStatementMigration is the end-to-end
+// repro from issue #313: a migration that declares several
+// schema-qualified tables around a dollar-quoted PL/pgSQL body. Every
+// table must be reachable by its own name through both extraction
+// paths — the canonical KindTable nodes the migration ingest emits and
+// the KindType nodes the tree-sitter walk emits — instead of collapsing
+// into one symbol named after the schema.
+func TestIndex_SchemaQualifiedMultiStatementMigration(t *testing.T) {
+	dir := t.TempDir()
+	mig := filepath.Join(dir, "db", "migrations")
+	require.NoError(t, os.MkdirAll(mig, 0o755))
+	writeFile(t, filepath.Join(mig, "000009_identity_kyc.up.sql"), `CREATE TABLE identity.accounts (
+    id uuid NOT NULL,
+    email text NOT NULL,
+    PRIMARY KEY (id)
+);
+
+CREATE OR REPLACE FUNCTION identity.set_updated_at() RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER accounts_touch BEFORE UPDATE ON identity.accounts
+    FOR EACH ROW EXECUTE FUNCTION identity.set_updated_at();
+
+CREATE TABLE identity.kyc_submissions (
+    id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    PRIMARY KEY (id)
+);
+
+CREATE TABLE billing.balance_transactions (
+    id bigint NOT NULL,
+    PRIMARY KEY (id)
+);
+`)
+
+	g := graph.New()
+	idx := newSQLTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	for _, table := range []string{"accounts", "kyc_submissions", "balance_transactions"} {
+		if findKindNamed(g, graph.KindTable, table) == nil {
+			t.Errorf("KindTable node for schema-qualified table %q missing", table)
+		}
+		if findKindNamed(g, graph.KindType, table) == nil {
+			t.Errorf("KindType node for schema-qualified table %q missing", table)
+		}
+	}
+	// The schema is metadata, never a table in its own right.
+	if n := findKindNamed(g, graph.KindType, "identity"); n != nil {
+		t.Errorf("schema name leaked as a table symbol: %s", n.ID)
+	}
+}
