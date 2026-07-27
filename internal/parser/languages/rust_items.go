@@ -422,6 +422,32 @@ func rustTupleFieldOwner(list *sitter.Node, src []byte) (*sitter.Node, string, s
 	return nil, "", ""
 }
 
+// rustEnclosingTraitVisibility returns the visibility of the trait
+// declaring n. A trait member has no visibility modifier of its own, so
+// its reachability is the trait's.
+func rustEnclosingTraitVisibility(n *sitter.Node, src []byte) string {
+	if tr := findEnclosingRustContainer(n, "trait_item"); tr != nil {
+		return rustVisibility(tr, src)
+	}
+	return rustVisibility(n, src)
+}
+
+// rustTraitImplVisibility returns the visibility to record for a method
+// in `impl Trait for Type`. Such a method is callable by anyone who can
+// name the trait, whatever the impl block looks like, so it is public
+// rather than the "private" an absent modifier would otherwise imply.
+// An inherent impl keeps ordinary per-method visibility.
+func rustTraitImplVisibility(fn *sitter.Node, src []byte) string {
+	explicit := rustVisibility(fn, src)
+	if explicit != VisibilityPrivate {
+		return explicit
+	}
+	if rustImplTraitName(fn, src) != "" {
+		return VisibilityPublic
+	}
+	return explicit
+}
+
 // rustAssociatedItemOwner returns the impl or trait an associated item
 // (a const, static or type declared inside a `declaration_list`) belongs
 // to, together with the owner's type name. Returns a nil node and an

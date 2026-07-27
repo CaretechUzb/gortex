@@ -579,9 +579,11 @@ func (e *RustExtractor) emitFunction(m parser.QueryResult, filePath, fileID stri
 			return
 		}
 		meta := map[string]any{
-			"receiver":   implType,
-			"signature":  buildRustSignature(def.Node, name, src),
-			"visibility": visibility,
+			"receiver":  implType,
+			"signature": buildRustSignature(def.Node, name, src),
+			// A trait impl's method is callable by anyone who can name
+			// the trait, so an absent `pub` does not make it private.
+			"visibility": rustTraitImplVisibility(def.Node, src),
 		}
 		applyRustFnQualifiers(meta, def.Node, src)
 		applyRustScopeMod(meta, def.Node, src)
@@ -1767,9 +1769,16 @@ func (e *RustExtractor) emitTraitMethodNode(traitName, name string, def *parser.
 	meta := map[string]any{
 		"receiver":   traitName,
 		"trait_decl": "true",
-		"signature":  "fn " + name + "(...)",
-		"visibility": rustVisibility(def.Node, src),
+		"signature":  buildRustSignature(def.Node, name, src),
+		// A trait member carries no visibility modifier of its own — it
+		// is exactly as reachable as the trait that declares it. Reading
+		// the absent modifier as "private" made every method of every
+		// public trait look private, which understates the public API
+		// surface and invites the dead-code pass to over-reach.
+		"visibility": rustEnclosingTraitVisibility(def.Node, src),
 	}
+	applyRustFnQualifiers(meta, def.Node, src)
+	applyRustScopeMod(meta, def.Node, src)
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
 		meta["doc"] = doc
 	}
