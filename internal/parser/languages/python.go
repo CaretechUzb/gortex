@@ -61,6 +61,14 @@ const qPyAll = `
     left: (identifier) @uvar.name
     right: (call
       function: (identifier) @uvar.callee)) @uvar.def
+
+  (typed_parameter
+    (identifier) @tparam.name
+    type: (type) @tparam.type) @tparam.def
+
+  (typed_default_parameter
+    name: (identifier) @tdparam.name
+    type: (type) @tdparam.type) @tdparam.def
 ]
 `
 
@@ -146,8 +154,11 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	seen := make(map[string]bool)
 	annotationSeen := make(map[string]bool)
 	imports := map[string]string{} // alias → module path
-	tenv := make(typeEnv)
-	tenvHasExplicit := make(map[string]bool) // names with Tier 0 type, lock from Tier 1 overwrite
+	// Name→type bindings are collected flat here and bucketed into
+	// per-function scopes once the function ranges exist — the query walk
+	// runs in document order, before any function node is available to
+	// own them. See buildPyScopedTypeEnv.
+	var assigns []pyAssign
 
 	var calls []pyDeferredCall
 	var typeUses []deferredTypeUse
@@ -210,33 +221,41 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 			calls = append(calls, dc)
 
 		case m.Captures["tvar.def"] != nil:
-			// Tier 0: explicit type annotation — overwrite tenv.
-			name := m.Captures["tvar.name"].Text
+			// Tier 0: a written annotation on an assignment.
 			rawType := m.Captures["tvar.type"].Text
-			typeName := normalizePyTypeName(rawType)
-			if typeName != "" {
-				tenv[name] = typeName
-				tenvHasExplicit[name] = true
+			line := m.Captures["tvar.def"].StartLine + 1
+			if typeName := normalizePyTypeName(rawType); typeName != "" {
+				assigns = append(assigns, pyAssign{
+					name: m.Captures["tvar.name"].Text, typeName: typeName,
+					line: line, explicit: true,
+				})
 			}
 			typeUses = append(typeUses, deferredTypeUse{
 				typeText: rawType,
-				line:     m.Captures["tvar.def"].StartLine + 1,
+				line:     line,
 			})
 
+		case m.Captures["tparam.def"] != nil:
+			// A written parameter annotation declares that parameter's
+			// type for the whole function body. Annotated parameters are
+			// the second-largest source of statically stated receivers
+			// after `self`, and were previously ignored entirely.
+			pyAppendParamAssign(&assigns, m.Captures["tparam.name"], m.Captures["tparam.type"])
+
+		case m.Captures["tdparam.def"] != nil:
+			pyAppendParamAssign(&assigns, m.Captures["tdparam.name"], m.Captures["tdparam.type"])
+
 		case m.Captures["uvar.def"] != nil:
-			// Tier 1: constructor-call inference. Only fills in keys
-			// that didn't get an explicit type — match the legacy
-			// `if _, exists := tenv[name]; exists { continue }` guard.
-			name := m.Captures["uvar.name"].Text
-			if tenvHasExplicit[name] {
-				return
-			}
-			if _, exists := tenv[name]; exists {
-				return
-			}
+			// Tier 1: constructor-call inference. Precedence against an
+			// explicit annotation, and the two-different-classes conflict
+			// rule, are both applied in buildPyScopedTypeEnv once the
+			// binding's scope is known.
 			callee := m.Captures["uvar.callee"].Text
 			if callee != "" && unicode.IsUpper(rune(callee[0])) {
-				tenv[name] = callee
+				assigns = append(assigns, pyAssign{
+					name: m.Captures["uvar.name"].Text, typeName: callee,
+					line: m.Captures["uvar.def"].StartLine + 1,
+				})
 			}
 
 		case m.Captures["var.def"] != nil:
@@ -247,6 +266,9 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	// All function/method nodes have been emitted; map call sites to
 	// their enclosing definition.
 	funcRanges := buildFuncRanges(result)
+
+	// Bucket the name→type bindings into the scope that owns each one.
+	scoped := buildPyScopedTypeEnv(assigns, funcRanges)
 
 	// Type-use edges: a `x: T` annotation references type T. Attributed
 	// to the enclosing function (fallback: the file node) so find_usages(T)
@@ -265,7 +287,8 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	emitPythonReferenceForms(root, src, filePath, fileID, funcRanges, result)
 
 	for _, c := range calls {
-		callerID := findEnclosingFunc(funcRanges, c.line)
+		ownerFunc := findEnclosingFunc(funcRanges, c.line)
+		callerID := ownerFunc
 		if callerID == "" {
 			// Module-level call (`app = Flask(__name__)`), a call in a
 			// class body (`name = Column(String)`), or a decorator
@@ -314,10 +337,24 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 				From: callerID, To: "unresolved::*." + c.name,
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			}
-			if recvType, ok := tenv[c.receiver]; ok {
-				edge.Meta = map[string]any{"receiver_type": recvType}
-			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
-				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenv, result))
+			switch c.receiver {
+			case "self", "cls":
+				// `self`/`cls` name the class the call is written in.
+				// That is known exactly — no inference, no ambiguity —
+				// and it is the single most common typed receiver in
+				// idiomatic Python. It is also the shape an inherited
+				// method needs: the declaring class may be an ancestor,
+				// which a name-only match cannot find.
+				if cls := pyEnclosingClassName(c.expr, src); cls != "" {
+					edge.Meta = map[string]any{"receiver_type": cls}
+				}
+			default:
+				if recvType, ok := scoped.lookup(ownerFunc, c.receiver); ok {
+					edge.Meta = map[string]any{"receiver_type": recvType}
+				} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
+					stampFactoryChainReceiver(edge, c.receiver,
+						resolveChainType(c.receiver, scoped.flatten(ownerFunc), result))
+				}
 			}
 			stampReturnUsage(edge, c.returnUsage)
 			result.Edges = append(result.Edges, edge)
