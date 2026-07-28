@@ -637,6 +637,13 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// every reconcile and derived pass, so it observes the state the
 		// daemon will actually serve rather than a mid-warmup transient.
 		logRepoOwnershipAudit(state.graph, logger)
+		// Carry stored note / memory symbol anchors onto prefixed node ids.
+		// Also here, and for the same reason: the rewrite decides by asking
+		// the graph which ids resolve, so it needs the settled graph. Marked
+		// per repo in the sidecar, so this is a no-op on every later start.
+		if state.mcpServer != nil {
+			state.mcpServer.MigrateSymbolAnchors(logger)
+		}
 	}()
 
 	return srv.Serve()
