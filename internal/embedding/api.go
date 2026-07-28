@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -32,6 +35,30 @@ const maxRetryAfterWait = 60 * time.Second
 // generated symbols.
 const maxEmbedInputBytes = 8000
 
+// maxOllamaBatchSize bounds the number of inputs sent in one /api/embed
+// request. Ollama fans an input array out internally, so forwarding the
+// indexer's 500-item chunks unchanged can overwhelm or crash its runner.
+// Keeping the provider-level cap here also protects direct EmbedBatch
+// callers while preserving the indexer's configured outer concurrency.
+const maxOllamaBatchSize = 64
+
+// maxOllamaSingletonRetries bounds recovery once bisection isolates one
+// input. The first retry is unchanged so a restarted runner can accept it;
+// the next two halve the UTF-8-safe byte cap (8000 → 4000 → 2000) to handle
+// Ollama runners that repeatedly die on one long embedding input.
+const maxOllamaSingletonRetries = 3
+
+func truncateUTF8Head(text string, maxBytes int) string {
+	if len(text) <= maxBytes {
+		return text
+	}
+	end := maxBytes
+	for end > 0 && text[end]&0xC0 == 0x80 {
+		end--
+	}
+	return text[:end]
+}
+
 // truncateEmbedInputs head-truncates any input over the byte cap, on a
 // UTF-8 rune boundary so the JSON payload stays valid. Returns the same
 // slice when nothing needed trimming (the common case).
@@ -45,11 +72,7 @@ func truncateEmbedInputs(texts []string) []string {
 			out = make([]string, len(texts))
 			copy(out, texts)
 		}
-		b := []byte(t[:maxEmbedInputBytes])
-		for len(b) > 0 && b[len(b)-1]&0xC0 == 0x80 { // back off mid-rune
-			b = b[:len(b)-1]
-		}
-		out[i] = string(b)
+		out[i] = truncateUTF8Head(t, maxEmbedInputBytes)
 	}
 	if out == nil {
 		return texts
@@ -257,18 +280,153 @@ func parseRetryAfter(v string) time.Duration {
 // --- Ollama API ---
 
 type ollamaRequest struct {
-	Model string `json:"model"`
-	Input any    `json:"input"` // string or []string
+	Model    string `json:"model"`
+	Input    any    `json:"input"` // string or []string
+	Truncate bool   `json:"truncate"`
 }
 
 type ollamaResponse struct {
 	Embeddings [][]float32 `json:"embeddings"`
 }
 
+type ollamaAPIError struct {
+	statusCode int
+	body       string
+}
+
+func (e *ollamaAPIError) Error() string {
+	return fmt.Sprintf("API error %d: %s", e.statusCode, e.body)
+}
+
 func (p *APIProvider) embedOllama(ctx context.Context, texts []string) ([][]float32, error) {
+	if len(texts) <= maxOllamaBatchSize {
+		return p.embedOllamaRecover(ctx, texts)
+	}
+
+	vecs := make([][]float32, 0, len(texts))
+	for start := 0; start < len(texts); start += maxOllamaBatchSize {
+		end := min(start+maxOllamaBatchSize, len(texts))
+		batch, err := p.embedOllamaRecover(ctx, texts[start:end])
+		if err != nil {
+			return nil, err
+		}
+		vecs = append(vecs, batch...)
+	}
+	return vecs, nil
+}
+
+func (p *APIProvider) embedOllamaRecover(ctx context.Context, texts []string) ([][]float32, error) {
+	vecs, err := p.embedOllamaOnce(ctx, texts)
+	if err == nil {
+		return vecs, nil
+	}
+	if !isOllamaRunnerTokenizerEOF(err) {
+		return nil, err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if len(texts) == 0 {
+		return nil, err
+	}
+	if len(texts) == 1 {
+		return p.recoverOllamaSingleton(ctx, texts[0], err)
+	}
+
+	mid := len(texts) / 2
+	left, err := p.embedOllamaRecover(ctx, texts[:mid])
+	if err != nil {
+		return nil, err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	right, err := p.embedOllamaRecover(ctx, texts[mid:])
+	if err != nil {
+		return nil, err
+	}
+	return append(left, right...), nil
+}
+
+func (p *APIProvider) recoverOllamaSingleton(ctx context.Context, text string, initialErr error) ([][]float32, error) {
+	candidate := truncateUTF8Head(text, maxEmbedInputBytes)
+	lastErr := initialErr
+	attempts := 0
+
+	for retry := 0; retry < maxOllamaSingletonRetries; retry++ {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if retry > 0 {
+			shortened := truncateUTF8Head(candidate, len(candidate)/2)
+			if shortened == "" || shortened == candidate {
+				break
+			}
+			candidate = shortened
+		}
+
+		attempts++
+		vecs, err := p.embedOllamaOnce(ctx, []string{candidate})
+		if err == nil {
+			return vecs, nil
+		}
+		if !isOllamaRunnerTokenizerEOF(err) {
+			return nil, err
+		}
+		lastErr = err
+	}
+
+	return nil, fmt.Errorf(
+		"ollama tokenizer runner failed for one input after %d recovery attempts: %w",
+		attempts, lastErr,
+	)
+}
+
+// isOllamaRunnerTokenizerEOF recognizes the narrow failure reported in
+// #296: Ollama returns HTTP 400 even though its private loopback tokenizer
+// transport died. Ordinary validation errors, remote URLs, other runner
+// endpoints, and other status codes must not trigger retries.
+func isOllamaRunnerTokenizerEOF(err error) bool {
+	var apiErr *ollamaAPIError
+	if !errors.As(err, &apiErr) || apiErr.statusCode != http.StatusBadRequest {
+		return false
+	}
+
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(apiErr.body), &payload) != nil {
+		return false
+	}
+
+	const postMarker = `Post "`
+	start := strings.Index(payload.Error, postMarker)
+	if start < 0 {
+		return false
+	}
+	rest := payload.Error[start+len(postMarker):]
+	end := strings.IndexByte(rest, '"')
+	if end < 0 || strings.TrimSpace(rest[end+1:]) != ": EOF" {
+		return false
+	}
+
+	runnerURL, err := url.Parse(rest[:end])
+	if err != nil || runnerURL.Scheme != "http" || runnerURL.Path != "/tokenize" || runnerURL.Port() == "" {
+		return false
+	}
+	host := runnerURL.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func (p *APIProvider) embedOllamaOnce(ctx context.Context, texts []string) ([][]float32, error) {
 	reqBody := ollamaRequest{
-		Model: p.model,
-		Input: truncateEmbedInputs(texts),
+		Model:    p.model,
+		Input:    truncateEmbedInputs(texts),
+		Truncate: true,
 	}
 
 	body, err := json.Marshal(reqBody)
@@ -294,7 +452,10 @@ func (p *APIProvider) embedOllama(ctx context.Context, texts []string) ([][]floa
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+		return nil, &ollamaAPIError{
+			statusCode: resp.StatusCode,
+			body:       string(respBody),
+		}
 	}
 
 	var result ollamaResponse
