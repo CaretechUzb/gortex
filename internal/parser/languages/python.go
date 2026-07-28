@@ -268,7 +268,16 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
-			continue
+			// Module-level call (`app = Flask(__name__)`), a call in a
+			// class body (`name = Column(String)`), or a decorator
+			// expression — decorators sit above the `def` line, so they
+			// fall outside every function range. All three execute at
+			// import time and belong to the file. Attribute them to the
+			// file node rather than dropping them: dropping made every
+			// such callee invisible to find_usages / get_callers, which
+			// in Python costs the whole module-level configuration layer
+			// (routes, ORM columns, settings, registrations).
+			callerID = fileID
 		}
 		if c.dynShape != "" {
 			// Tagged dynamic-dispatch blind-spot call. The placeholder carries
