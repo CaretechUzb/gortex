@@ -2990,7 +2990,13 @@ func (s *Server) handleIndexHealth(ctx context.Context, req mcp.CallToolRequest)
 	if s.indexer == nil {
 		return mcp.NewToolResultError("no indexer available"), nil
 	}
-	result := s.buildIndexHealthPayload()
+	result, err := s.buildIndexHealthPayloadCtx(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(
+			"index_health was cancelled before it finished: the scan is proportional to workspace size " +
+				"(one stat per tracked file plus a graph scan) and the caller's deadline expired first. " +
+				"Retry when indexing settles, or pass compact:true for the cheaper summary."), nil
+	}
 
 	if isCompact(req) {
 		stale, _ := result["stale_files"].([]string)
@@ -3009,18 +3015,49 @@ func (s *Server) handleIndexHealth(ctx context.Context, req mcp.CallToolRequest)
 // buildIndexHealthPayload returns the same data the `index_health`
 // tool emits. Shared with the `gortex://index-health` resource.
 // Returns nil when no indexer is wired.
+//
+// Prefer buildIndexHealthPayloadCtx on any request path: this variant cannot
+// be cancelled, and the work below is proportional to workspace size.
 func (s *Server) buildIndexHealthPayload() map[string]any {
+	payload, _ := s.buildIndexHealthPayloadCtx(context.Background())
+	return payload
+}
+
+// healthScanCancelStride is how many iterations pass between context checks in
+// the payload's per-file loops. Checking every iteration would cost more than
+// the syscall it guards on a warm cache; a few hundred keeps the worst-case
+// overshoot in the millisecond range.
+const healthScanCancelStride = 512
+
+// buildIndexHealthPayloadCtx is buildIndexHealthPayload with cancellation.
+//
+// "Minimal health probe" is what the tool looks like from outside, but the work
+// is proportional to the workspace: one os.Stat per tracked file to answer
+// staleness, plus a whole-graph scan. On a 20k-file workspace under indexing
+// load that is tens of seconds of syscalls — and, before this, not one of them
+// checked whether the caller was still there. A client that gave up at 30s left
+// the daemon finishing a scan for nobody, holding a transport slot the whole
+// time.
+func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any, error) {
 	if s.indexer == nil {
-		return nil
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	totalDetected := s.indexer.TotalDetected()
 	parseErrors := s.indexer.ParseErrors()
 
+	// One whole-graph Stats() for the whole payload. It used to be computed
+	// twice — once for the totalDetected fallback and again below — which on a
+	// large graph doubled the most expensive read in the function for no
+	// additional information.
+	stats := s.graph.Stats()
+
 	// When totalDetected is 0 (e.g., graph restored from cache without a full re-index),
 	// fall back to counting file nodes in the graph.
 	if totalDetected == 0 {
-		stats := s.graph.Stats()
 		if fileCount, ok := stats.ByKind[string(graph.KindFile)]; ok {
 			totalDetected = fileCount
 		}
@@ -3035,13 +3072,19 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 
 	var staleFiles []string
 	mtimes := s.indexer.FileMtimes()
+	scanned := 0
 	for relPath := range mtimes {
+		if scanned%healthScanCancelStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		scanned++
 		if s.indexer.IsStale(relPath) {
 			staleFiles = append(staleFiles, relPath)
 		}
 	}
 
-	stats := s.graph.Stats()
 	langCoverage := make(map[string]bool)
 	for lang := range stats.ByLanguage {
 		langCoverage[lang] = true
@@ -3052,7 +3095,14 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 	// minified / parse_failed / parse_panic) instead of guessing.
 	skipped := map[string]int{}
 	repoPrefixes := map[string]struct{}{}
+	scanned = 0
 	for n := range s.graph.NodesByKind(graph.KindFile) {
+		if scanned%healthScanCancelStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		scanned++
 		if n == nil {
 			continue
 		}
@@ -3260,7 +3310,7 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 		result["recommendation"] = recommendation
 	}
 
-	return result
+	return result, nil
 }
 
 // buildIndexHealthFileRollup reads the per-file metadata sidecar (when the

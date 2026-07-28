@@ -22,7 +22,7 @@ import (
 // (top-N, summary counts) — agents that need the full analyzer output
 // fall back to the corresponding `analyze` tool invocation.
 func (s *Server) registerAnalyzerResources() {
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://report",
 			"Orientation Report",
@@ -32,7 +32,7 @@ func (s *Server) registerAnalyzerResources() {
 		s.handleResourceReport,
 	)
 
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://god-nodes",
 			"God Nodes",
@@ -42,7 +42,7 @@ func (s *Server) registerAnalyzerResources() {
 		s.handleResourceGodNodes,
 	)
 
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://surprises",
 			"Codebase Surprises",
@@ -52,7 +52,7 @@ func (s *Server) registerAnalyzerResources() {
 		s.handleResourceSurprises,
 	)
 
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://audit",
 			"Agent Config Audit",
@@ -62,7 +62,7 @@ func (s *Server) registerAnalyzerResources() {
 		s.handleResourceAudit,
 	)
 
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://questions",
 			"Open Questions",

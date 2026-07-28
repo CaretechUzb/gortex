@@ -411,6 +411,13 @@ type Server struct {
 	// NewServer; on by default.
 	sanitizeInjection bool
 
+	// ToolCallTimeout overrides the per-tool-call deadline enforced by the
+	// hang firewall (see tool_deadline.go). Zero takes the value from
+	// GORTEX_MCP_TOOL_TIMEOUT, falling back to DefaultToolCallTimeout;
+	// negative disables the bound. Exported so tests and embedders can
+	// tighten it without touching the environment.
+	ToolCallTimeout time.Duration
+
 	// llmService is the optional LLM service backing the `ask` MCP tool
 	// and the `search_symbols` assist modes. nil until SetLLMService is
 	// called by the daemon entrypoint. The service wraps whichever

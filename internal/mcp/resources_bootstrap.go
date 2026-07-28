@@ -17,7 +17,7 @@ import (
 // registered. Client support for resources is patchier than tools —
 // keeping the tool form alive avoids regressing those clients.
 func (s *Server) registerBootstrapResources() {
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://index-health",
 			"Index Health",
@@ -27,7 +27,7 @@ func (s *Server) registerBootstrapResources() {
 		s.handleResourceIndexHealth,
 	)
 
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://workspace",
 			"Workspace Info",
@@ -37,7 +37,7 @@ func (s *Server) registerBootstrapResources() {
 		s.handleResourceWorkspace,
 	)
 
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://repos",
 			"Workspace Repos",
@@ -47,7 +47,7 @@ func (s *Server) registerBootstrapResources() {
 		s.handleResourceRepos,
 	)
 
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://active-project",
 			"Active Project",
@@ -58,8 +58,11 @@ func (s *Server) registerBootstrapResources() {
 	)
 }
 
-func (s *Server) handleResourceIndexHealth(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	payload := s.buildIndexHealthPayload()
+func (s *Server) handleResourceIndexHealth(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	payload, err := s.buildIndexHealthPayloadCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if payload == nil {
 		payload = map[string]any{
 			"error": "no indexer available",
