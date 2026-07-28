@@ -20,6 +20,19 @@ const (
 	exploreDefaultOwnerFileCap     = 3
 	exploreDefaultOwnerFileNodeCap = 64
 	exploreDefaultOwnerTotalCap    = 96
+	// exploreDefaultOwnerFallbackSLO bounds the ranked-callable fallback that
+	// runs when no base constructor/type pair was already ranked. It is a
+	// SILENT bound: every check inside
+	// exploreDivergentDefaultBasesFromRankedCallables returns "no bases" on
+	// expiry, so the caller simply promotes nothing and the response is a
+	// smaller symbol set with no error and no warning.
+	//
+	// 25ms is ample for the batched inbound lookup + node hydration on an idle
+	// machine and is routinely exceeded on a loaded one, where those SQLite
+	// reads are descheduled. That makes WHICH owner gets promoted a function
+	// of machine load — fine for production (the fallback is best-effort by
+	// design) and fatal for a test that asserts the promoted identity, which
+	// is why promoteExploreDivergentDefaultOwner takes an overridable slice.
 	exploreDefaultOwnerFallbackSLO = 25 * time.Millisecond
 )
 
@@ -62,7 +75,13 @@ type exploreDivergentDefaultProjection struct {
 // lookup and one batched node hydration, and fails closed at every cap. A unique
 // match replaces its represented base pair before being moved to the head, so
 // promotion never evicts an unrelated protected candidate.
-func promoteExploreDivergentDefaultOwner(task string, targets []exploreTarget, store graph.Store, maxSymbols int, readSource func(*graph.Node) string) []exploreTarget {
+// The optional fallbackSLO overrides the wall-clock slice the ranked-callable
+// fallback may spend. Omitted (or zero) means the production default. Only a
+// caller that ASSERTS which owner gets promoted passes one, so its answer
+// cannot depend on machine load — see the note on
+// exploreDefaultOwnerFallbackSLO. Left variadic so the fifteen call sites that
+// never reach the fallback stay untouched.
+func promoteExploreDivergentDefaultOwner(task string, targets []exploreTarget, store graph.Store, maxSymbols int, readSource func(*graph.Node) string, fallbackSLO ...time.Duration) []exploreTarget {
 	if store == nil || readSource == nil || len(targets) == 0 || !exploreQueryIsConceptTask(task) {
 		return targets
 	}
@@ -72,7 +91,11 @@ func promoteExploreDivergentDefaultOwner(task string, targets []exploreTarget, s
 		return targets
 	}
 	if len(bases) == 0 {
-		deadline := time.Now().Add(exploreDefaultOwnerFallbackSLO)
+		slo := exploreDefaultOwnerFallbackSLO
+		if len(fallbackSLO) > 0 && fallbackSLO[0] > 0 {
+			slo = fallbackSLO[0]
+		}
+		deadline := time.Now().Add(slo)
 		bases, ok = exploreDivergentDefaultBasesFromRankedCallables(taskTerms, targets, store, deadline)
 		if !ok || len(bases) == 0 {
 			return targets

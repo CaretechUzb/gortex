@@ -2571,7 +2571,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if exploreQueryIsConceptTask(task) && len(targets) > len(artifactTargets) {
 		symbolTargets := promoteExploreDivergentDefaultOwner(task, targets[len(artifactTargets):], s.graph, maxSymbols, func(node *graph.Node) string {
 			return s.manifestSymbolSource(ctx, node)
-		})
+		}, s.divergentDefaultFallbackSLOOverride)
 		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
 	}
 	// Direct retrieval owns the ranked head. Once graph promotion has selected
