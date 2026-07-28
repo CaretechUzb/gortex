@@ -12,24 +12,10 @@ import (
 )
 
 const (
-	// fallbackTokenBudget is the token budget used when a model directory has no
-	// parseable config.json to read max_position_embeddings from. 512 - 2 = 510,
-	// matching the classic BERT/MiniLM context window minus the two special tokens.
-	fallbackTokenBudget = 510
-
-	// specialTokenReserve is the number of positions the inference pipeline consumes
-	// for special tokens ([CLS]/[SEP]) appended after client-side truncation, so the
-	// truncation budget is max_position_embeddings minus this.
-	specialTokenReserve = 2
-
-	// runeClampBudgetFactor caps the rune-clamp fallback at budget runes. A
-	// WordPiece token spans at least one rune, so token_count <= rune_count;
-	// clamping to budget runes therefore guarantees token_count <= budget. A
-	// looser cap (e.g. 4*budget) would NOT bound the token count and could let a
-	// token-dense input (CJK, single-char words) overflow the window it is meant
-	// to protect. Recall loss in this rare fallback is an acceptable price for a
-	// hard safety bound.
-	runeClampBudgetFactor = 1
+	// fallbackTokenBudget is the total sequence budget used when a model directory
+	// has no parseable config.json. It matches the classic BERT/MiniLM context
+	// window, including tokenizer-added special tokens.
+	fallbackTokenBudget = 512
 )
 
 // tokenTruncator caps input texts at a model's positional budget before they reach
@@ -41,42 +27,78 @@ const (
 // client-side keeps that failure from ever occurring; because a transformer cannot
 // attend past its positional budget, cutting the tail is lossless by construction.
 //
-// A tokenTruncator returned by newTokenTruncator is always safe to use: if the real
-// tokenizer could not be loaded, tk is nil and Truncate degrades to a rune clamp
-// rather than disabling truncation (and the caller's local backend) entirely.
+// tokenTruncator uses the same post-processing semantics as the inference
+// pipeline. budget is the model's total sequence width, including special tokens.
+type annotatedTokenizer interface {
+	EncodeWithAnnotations(string) api.AnnotatedEncoding
+}
+
 type tokenTruncator struct {
-	tk     *hftokenizer.Tokenizer // nil ⇒ rune-clamp fallback
-	budget int                    // max token count before truncation (max_position_embeddings - 2)
-	clamp  int                    // rune cap used when tk == nil
+	tk              annotatedTokenizer
+	budget          int
+	asciiFastBudget int // >= 0 only for the known BERT + WordPiece pipeline
 }
 
 // newTokenTruncator builds a truncator for the model cached under modelDir. It reads
-// <modelDir>/tokenizer.json (the same file hugot loads) and derives the token budget
-// from <modelDir>/config.json's max_position_embeddings.
+// <modelDir>/tokenizer.json (the same file Hugot loads) and derives the total
+// sequence budget from <modelDir>/config.json's max_position_embeddings.
 //
-// The returned truncator is always non-nil and usable. A non-nil error is
-// informational: it reports a degraded state (a fallback budget because config.json
-// was missing/unparseable, or rune-clamp-only mode because tokenizer.json could not
-// be loaded) so the caller can warn without disabling the provider.
+// A missing or malformed config.json degrades to fallbackTokenBudget and returns an
+// informational error alongside a usable truncator. Tokenizer failures are fatal:
+// without the exact tokenizer there is no safe way to prove an input fits the model.
 func newTokenTruncator(modelDir string) (*tokenTruncator, error) {
 	budget, budgetErr := readTokenBudget(modelDir)
-	t := &tokenTruncator{budget: budget, clamp: budget * runeClampBudgetFactor}
 
 	tkBytes, err := os.ReadFile(filepath.Join(modelDir, "tokenizer.json"))
 	if err != nil {
-		return t, fmt.Errorf("token truncation degraded to rune clamp: read tokenizer.json: %w", err)
+		return nil, fmt.Errorf("read tokenizer.json: %w", err)
 	}
 	tk, err := hftokenizer.NewFromContent(nil, tkBytes)
 	if err != nil {
-		return t, fmt.Errorf("token truncation degraded to rune clamp: parse tokenizer.json: %w", err)
+		return nil, fmt.Errorf("parse tokenizer.json: %w", err)
 	}
-	// Encode without special tokens so every returned span is a real byte span into
-	// the original text; the two reserved positions cover the [CLS]/[SEP] the pipeline
-	// adds later. IncludeSpans is required for EncodeWithAnnotations to populate Spans.
-	if err := tk.With(api.EncodeOptions{IncludeSpans: true, AddSpecialTokens: false}); err != nil {
-		return t, fmt.Errorf("token truncation degraded to rune clamp: configure tokenizer: %w", err)
+	// Match Hugot's inference tokenizer: post-processing is enabled, so [CLS],
+	// [SEP], and any model-specific special tokens count against the same total
+	// max_position_embeddings budget as the tensor sent to the model.
+	if err := tk.With(api.EncodeOptions{
+		AddSpecialTokens:         true,
+		IncludeSpans:             true,
+		IncludeSpecialTokensMask: true,
+	}); err != nil {
+		return nil, fmt.Errorf("configure tokenizer: %w", err)
 	}
-	t.tk = tk
+	specials := len(tk.EncodeWithAnnotations("").IDs)
+	if specials > budget {
+		return nil, fmt.Errorf("tokenizer adds %d special tokens, exceeding model budget %d", specials, budget)
+	}
+	t := &tokenTruncator{tk: tk, budget: budget, asciiFastBudget: -1}
+	var tokenizerConfig struct {
+		Model struct {
+			Type string `json:"type"`
+		} `json:"model"`
+		Normalizer struct {
+			Type string `json:"type"`
+		} `json:"normalizer"`
+		PreTokenizer struct {
+			Type string `json:"type"`
+		} `json:"pre_tokenizer"`
+		PostProcessor struct {
+			Type   string                       `json:"type"`
+			Single []map[string]json.RawMessage `json:"single"`
+		} `json:"post_processor"`
+	}
+	if json.Unmarshal(tkBytes, &tokenizerConfig) == nil &&
+		tokenizerConfig.Model.Type == "WordPiece" &&
+		tokenizerConfig.Normalizer.Type == "BertNormalizer" &&
+		tokenizerConfig.PreTokenizer.Type == "BertPreTokenizer" &&
+		tokenizerConfig.PostProcessor.Type == "TemplateProcessing" &&
+		hasSingleSequenceTemplate(tokenizerConfig.PostProcessor.Single) {
+		// This exact pipeline emits at most one WordPiece token per ASCII byte:
+		// BERT normalization cannot expand ASCII, and every subword consumes at
+		// least one byte. Non-ASCII and other tokenizer pipelines always take the
+		// exact path.
+		t.asciiFastBudget = budget - specials
+	}
 
 	if budgetErr != nil {
 		return t, fmt.Errorf("using fallback token budget %d: %w", budget, budgetErr)
@@ -84,46 +106,115 @@ func newTokenTruncator(modelDir string) (*tokenTruncator, error) {
 	return t, nil
 }
 
-// Truncate returns text unchanged when it fits the token budget, otherwise the
-// longest prefix that stays within budget, cut on a token (and rune) boundary.
+func hasSingleSequenceTemplate(items []map[string]json.RawMessage) bool {
+	sequences := 0
+	for _, item := range items {
+		if len(item) != 1 {
+			return false
+		}
+		if sequence, ok := item["Sequence"]; ok {
+			var spec struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(sequence, &spec) != nil || spec.ID != "A" {
+				return false
+			}
+			sequences++
+			continue
+		}
+		if _, ok := item["SpecialToken"]; !ok {
+			return false
+		}
+	}
+	return sequences == 1
+}
+
+// Truncate returns text unchanged when the inference tokenizer produces a sequence
+// within the model budget. Otherwise it repeatedly cuts to the longest token prefix
+// that can fit, re-tokenizing each candidate until the total sequence (including
+// special tokens) satisfies the hard postcondition.
 func (t *tokenTruncator) Truncate(text string) string {
-	if t == nil || t.budget <= 0 || text == "" {
+	if t == nil || t.tk == nil || t.budget <= 0 || text == "" {
 		return text
 	}
-	// Fast path: a WordPiece/subword token spans at least one rune (true for every
-	// registered variant — MiniLM/BGE/Jina are all WordPiece), so a rune count
-	// within budget guarantees the token count is too. Only longer texts pay for the
-	// extra tokenizer pass; tokenization is µs–ms while inference dominates. (A
-	// byte-level-BPE variant, where one rune can yield several tokens, would need
-	// this invariant revisited — but the exact-tokenize path below is always correct.)
-	if utf8.RuneCountInString(text) <= t.budget {
+	if t.asciiFastBudget >= 0 && len(text) <= t.asciiFastBudget && isASCII(text) {
 		return text
 	}
-	if t.tk == nil {
-		return clampRunes(text, t.clamp)
+	for text != "" {
+		enc := t.tk.EncodeWithAnnotations(text)
+		if len(enc.IDs) <= t.budget {
+			return text
+		}
+
+		cut := tokenPrefixCut(enc.Spans, enc.SpecialTokensMask, t.budget, len(text))
+		if cut <= 0 {
+			cut = geometricPrefixCut(text)
+		}
+		for cut > 0 && cut < len(text) && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		text = text[:cut]
 	}
-	enc := t.tk.EncodeWithAnnotations(text)
-	if len(enc.IDs) <= t.budget {
-		return text
+	return text
+}
+
+func isASCII(text string) bool {
+	for i := 0; i < len(text); i++ {
+		if text[i] >= utf8.RuneSelf {
+			return false
+		}
 	}
-	if len(enc.Spans) < t.budget {
-		// Spans unexpectedly short (tokenizer without span support) — degrade safely.
-		return clampRunes(text, t.clamp)
+	return true
+}
+
+// tokenPrefixCut returns the byte end of the longest non-special token prefix
+// that can coexist with the encoded sequence's special tokens inside budget. If
+// several subwords share a full-word span, it walks back to a strict byte prefix;
+// otherwise a one-pass cut could retain the whole word and remain over budget.
+func tokenPrefixCut(spans []api.TokenSpan, specialMask []int, budget, textBytes int) int {
+	if budget <= 0 || len(spans) == 0 || len(spans) != len(specialMask) {
+		return 0
 	}
-	cut := enc.Spans[t.budget-1].End
-	// cut must land strictly inside the text: we only reach here with more than
-	// budget tokens, so the budget-th token ends before the end. cut == len(text)
-	// means a degenerate (zero-width) later span — fall back to the rune clamp
-	// rather than returning the full over-budget text.
-	if cut <= 0 || cut >= len(text) {
-		return clampRunes(text, t.clamp)
+	specials := 0
+	for _, special := range specialMask {
+		if special != 0 {
+			specials++
+		}
 	}
-	// Defensive: token spans already align to rune boundaries, but never hand back a
-	// string split mid-rune.
-	for cut < len(text) && !utf8.RuneStart(text[cut]) {
+	contentBudget := budget - specials
+	if contentBudget <= 0 {
+		return 0
+	}
+	contentTokens := 0
+	target := -1
+	for i := range spans {
+		if specialMask[i] != 0 {
+			continue
+		}
+		contentTokens++
+		if contentTokens == contentBudget {
+			target = i
+			break
+		}
+	}
+	for i := target; i >= 0; i-- {
+		if specialMask[i] == 0 && spans[i].End > 0 && spans[i].End < textBytes {
+			return spans[i].End
+		}
+	}
+	return 0
+}
+
+// geometricPrefixCut is the bounded defensive path for malformed annotations.
+// Halving ensures strict UTF-8-safe progress and at most logarithmically many
+// additional tokenizer passes, rather than removing and re-tokenizing one rune at
+// a time.
+func geometricPrefixCut(text string) int {
+	cut := len(text) / 2
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
 		cut--
 	}
-	return text[:cut]
+	return cut
 }
 
 // TruncateAll applies Truncate to every text. It returns the input slice
@@ -151,9 +242,9 @@ func (t *tokenTruncator) TruncateAll(texts []string) []string {
 	return out
 }
 
-// readTokenBudget derives the truncation budget from <modelDir>/config.json's
-// max_position_embeddings. It returns the fallback budget with a non-nil error when
-// the file is missing, unparseable, or carries an implausible value — never failing.
+// readTokenBudget derives the total sequence budget from
+// <modelDir>/config.json's max_position_embeddings. It returns the fallback budget
+// with a non-nil error when the file is missing, unparseable, or implausible.
 func readTokenBudget(modelDir string) (int, error) {
 	raw, err := os.ReadFile(filepath.Join(modelDir, "config.json"))
 	if err != nil {
@@ -165,24 +256,8 @@ func readTokenBudget(modelDir string) (int, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return fallbackTokenBudget, fmt.Errorf("parse config.json: %w", err)
 	}
-	if cfg.MaxPositionEmbeddings <= specialTokenReserve {
+	if cfg.MaxPositionEmbeddings <= 0 {
 		return fallbackTokenBudget, fmt.Errorf("config.json max_position_embeddings=%d is implausible", cfg.MaxPositionEmbeddings)
 	}
-	return cfg.MaxPositionEmbeddings - specialTokenReserve, nil
-}
-
-// clampRunes returns the longest prefix of text with at most maxRunes runes, always
-// cutting on a rune boundary.
-func clampRunes(text string, maxRunes int) string {
-	if maxRunes <= 0 {
-		return ""
-	}
-	count := 0
-	for i := range text {
-		if count == maxRunes {
-			return text[:i]
-		}
-		count++
-	}
-	return text
+	return cfg.MaxPositionEmbeddings, nil
 }
