@@ -25,7 +25,7 @@ func phpNodeNamed(nodes []*graph.Node, name string) *graph.Node {
 	return nil
 }
 
-func TestPHPNamespace_DeclarationsCarryNamespaceAndQualName(t *testing.T) {
+func TestPHPNamespace_DeclarationsCarryNamespace(t *testing.T) {
 	nodes, _ := phpExtract(t, "src/Models/User.php", `<?php
 namespace App\Models;
 
@@ -39,25 +39,29 @@ interface Nameable {}
 
 function helper(): void {}
 `)
-	cls := phpNodeNamed(nodes, "User")
-	require.NotNil(t, cls)
-	assert.Equal(t, `App\Models`, cls.Meta["scope_ns"])
-	assert.Equal(t, `App\Models\User`, cls.QualName)
+	for _, name := range []string{"User", "Nameable", "helper", "ROLE", "id", "name"} {
+		n := phpNodeNamed(nodes, name)
+		require.NotNil(t, n, "no node for %s", name)
+		assert.Equal(t, `App\Models`, n.Meta["scope_ns"], "scope_ns on %s", name)
+	}
+}
 
-	iface := phpNodeNamed(nodes, "Nameable")
-	require.NotNil(t, iface)
-	assert.Equal(t, `App\Models\Nameable`, iface.QualName)
+// Node.QualName backs a UNIQUE SQLite index — a second node with the same
+// non-empty qual_name fails the insert outright. PHP mints duplicate
+// fully-qualified names in practice, so the namespace rides Meta instead and
+// QualName is deliberately left empty.
+func TestPHPNamespace_QualNameNeverStamped(t *testing.T) {
+	nodes, _ := phpExtract(t, "src/Models/User.php", `<?php
+namespace App\Models;
 
-	fn := phpNodeNamed(nodes, "helper")
-	require.NotNil(t, fn)
-	assert.Equal(t, `App\Models\helper`, fn.QualName)
-
-	// Members carry the namespace but no QualName — the qual-name index holds
-	// one node per name and nobody looks a method up by FQN.
-	m := phpNodeNamed(nodes, "name")
-	require.NotNil(t, m)
-	assert.Equal(t, `App\Models`, m.Meta["scope_ns"])
-	assert.Empty(t, m.QualName)
+class User {
+    public function name(): string { return ''; }
+}
+function helper(): void {}
+`)
+	for _, n := range nodes {
+		assert.Empty(t, n.QualName, "node %s must not claim a unique qual_name slot", n.ID)
+	}
 }
 
 func TestPHPNamespace_GlobalNamespaceFileUnchanged(t *testing.T) {
@@ -67,7 +71,6 @@ class Legacy {}
 	cls := phpNodeNamed(nodes, "Legacy")
 	require.NotNil(t, cls)
 	assert.NotContains(t, cls.Meta, "scope_ns")
-	assert.Empty(t, cls.QualName)
 }
 
 // phpTargetFQN returns the target_fqn stamped on the first edge of the given
@@ -186,11 +189,11 @@ namespace App\Beta {
 `)
 	first := phpNodeNamed(nodes, "First")
 	require.NotNil(t, first)
-	assert.Equal(t, `App\Alpha\First`, first.QualName)
+	assert.Equal(t, `App\Alpha`, first.Meta["scope_ns"])
 
 	second := phpNodeNamed(nodes, "Second")
 	require.NotNil(t, second)
-	assert.Equal(t, `App\Beta\Second`, second.QualName)
+	assert.Equal(t, `App\Beta`, second.Meta["scope_ns"])
 }
 
 // `use function NS\foo as bar` feeds the resolver's scope_use_aliases contract,

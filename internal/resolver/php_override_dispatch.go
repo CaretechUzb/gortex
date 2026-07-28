@@ -406,12 +406,36 @@ func phpNarrowByTargetFQN(e *graph.Edge, candidates []*graph.Node) []*graph.Node
 	}
 	var out []*graph.Node
 	for _, c := range candidates {
+		if c != nil && c.Language == "php" && phpNodeNamespace(c) == ns {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// phpFindByFQN returns the PHP declarations whose namespace and name match a
+// fully-qualified name. Used where a lookup by Node.QualName would be natural
+// but is not available: qual_name backs a UNIQUE index that a duplicate FQN
+// fails outright, so PHP carries its namespace in Meta instead.
+func (r *Resolver) phpFindByFQN(fqn, repo string) []*graph.Node {
+	name, ns := fqn, ""
+	if i := strings.LastIndex(fqn, `\`); i >= 0 {
+		ns, name = fqn[:i], fqn[i+1:]
+	}
+	if name == "" {
+		return nil
+	}
+	var out []*graph.Node
+	for _, c := range r.cachedFindNodesByNameInRepo(name, repo) {
 		if c == nil || c.Language != "php" {
 			continue
 		}
-		// A stamped QualName is the strongest match; fall back to the
-		// namespace, which every PHP declaration carries.
-		if c.QualName == fqn || (c.QualName == "" && phpNodeNamespace(c) == ns) {
+		switch c.Kind {
+		case graph.KindType, graph.KindInterface, graph.KindFunction:
+		default:
+			continue
+		}
+		if phpNodeNamespace(c) == ns {
 			out = append(out, c)
 		}
 	}

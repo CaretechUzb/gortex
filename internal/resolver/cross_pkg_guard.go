@@ -275,11 +275,9 @@ func sameScopePackage(a, b *graph.Node) bool {
 // import of the method's package, and the import closure structurally misses
 // inherited / indirectly-typed receivers (owner.foo() where owner came from a
 // return value the caller's file never imports the type of). Restricted to the
-// statically-typed languages (java, go) where a lone method name is unambiguous
-// — TS / Python duck typing makes a same-name coincidence likelier, so the
-// guard's revert stays load-bearing there — and gated on the receiver, when
-// known, naming an in-repo type so an external-typed receiver (a logging
-// facade's `logger.info`) still reverts rather than latching onto an unrelated
+// languages listed in loneMemberLang, and gated on the receiver, when known,
+// naming an in-repo type so an external-typed receiver (a logging facade's
+// `logger.info`) still reverts rather than latching onto an unrelated
 // same-named local method.
 func (r *Resolver) loneMemberDefnKeep(target *graph.Node, e *graph.Edge, oldTo string) bool {
 	if target == nil || !loneMemberLang(target.Language) {
@@ -320,13 +318,21 @@ func (r *Resolver) loneMemberDefnKeep(target *graph.Node, e *graph.Edge, oldTo s
 }
 
 // loneMemberLang reports whether a lone in-repo method definition is safe to
-// keep against the cross-package guard for the given language. Limited to the
-// statically-typed languages where exactly one same-named member is
-// structurally unambiguous; TS / Python / JS duck typing makes a same-name
-// coincidence likelier, so their guard revert stays.
+// keep against the cross-package guard for the given language.
+//
+// The bar is not static typing as such — loneMemberDefnKeep already excludes
+// bare free-function calls and receivers typed as something the repo does not
+// define, and only fires when the name has exactly ONE in-repo method
+// definition, which is the case duck typing cannot confuse. The bar is whether
+// a class-based member call is the language's dispatch model. PHP qualifies:
+// its calls carry a receiver, and since PHP call sites stamp receiver_type the
+// external-receiver gate above screens them more effectively than it does for
+// most of this list. TS / Python / JS stay out — an object literal or a
+// dynamically attached method makes a same-name coincidence likelier there,
+// and their guard revert is load-bearing.
 func loneMemberLang(lang string) bool {
 	switch lang {
-	case "java", "go", "rust", "csharp", "kotlin", "scala":
+	case "java", "go", "rust", "csharp", "kotlin", "scala", "php":
 		return true
 	}
 	return false

@@ -209,14 +209,6 @@ func (r *phpNameResolver) resolve(raw string, line int) string {
 	return ns + `\` + raw
 }
 
-// phpQualifiedNameOf builds the fully-qualified name of a declaration.
-func phpQualifiedNameOf(ns, name string) string {
-	if ns == "" {
-		return name
-	}
-	return ns + `\` + name
-}
-
 // phpNamespaceScopedKinds are the declaration kinds that live in a namespace
 // and so carry scope_ns. Fields and enum members belong to a type, not
 // directly to a namespace, but carrying it keeps a member's owner recoverable
@@ -231,13 +223,17 @@ func phpNamespaceScopedKind(k graph.NodeKind) bool {
 }
 
 // applyPHPNamespaceIdentity stamps every PHP declaration with the namespace it
-// lives in, gives types and functions a fully-qualified QualName, and records
-// on each type-reference edge the fully-qualified name the source names.
+// lives in and records on each type-reference edge the fully-qualified name the
+// source names.
 //
-// QualName is stamped only on types, interfaces and free functions: those are
-// what a PHP developer looks up by FQN, and the graph's qual-name index holds
-// one node per name, so minting an entry for every method and property would
-// grow it by an order of magnitude for no lookup anyone performs.
+// Deliberately NOT Node.QualName. That field backs a UNIQUE SQLite index
+// (nodes_by_qual): a second node with the same non-empty qual_name fails the
+// insert outright, which would take the whole index down rather than degrade.
+// PHP produces duplicate fully-qualified names in practice — indexing
+// laravel/framework mints six, where a class and the annotation stub for a
+// same-named attribute land in one namespace — so the FQN lives in scope_ns,
+// which is plain Meta and tolerates repetition. Everything that would have used
+// QualName (reference narrowing, import binding) matches on scope_ns instead.
 func applyPHPNamespaceIdentity(root *sitter.Node, src []byte, result *parser.ExtractionResult) {
 	if result == nil || root == nil {
 		return
@@ -259,10 +255,6 @@ func applyPHPNamespaceIdentity(root *sitter.Node, src []byte, result *parser.Ext
 			n.Meta = map[string]any{}
 		}
 		n.Meta["scope_ns"] = ns
-		switch n.Kind {
-		case graph.KindType, graph.KindInterface, graph.KindFunction:
-			n.QualName = phpQualifiedNameOf(ns, n.Name)
-		}
 	}
 
 	// `use function NS\foo as bar` — the resolver's scope_use_aliases contract
