@@ -109,6 +109,19 @@ type pyDeferredCall struct {
 	returnUsage string
 }
 
+// pyDeferredVar is a module-level `name = ...` binding held back until the
+// whole file has been walked, so real definitions win the shared id.
+// Values are copied out of the match rather than holding the
+// *parser.CapturedNode: EachMatch recycles those between matches, so a
+// retained pointer reads back another match's capture. Node pointers are
+// stable — they address the tree, which outlives the walk.
+type pyDeferredVar struct {
+	name      string
+	node      *sitter.Node
+	startLine int
+	endLine   int
+}
+
 // pyStringLiteralValue returns the unquoted value of a Python string-literal
 // token (handling an optional r/f/b/u prefix), or "" when the token is not a
 // string literal (e.g. a variable subscript key obj[name]).
@@ -162,6 +175,7 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 
 	var calls []pyDeferredCall
 	var typeUses []deferredTypeUse
+	var topLevelVars []pyDeferredVar
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
@@ -259,9 +273,26 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 			}
 
 		case m.Captures["var.def"] != nil:
-			e.emitTopLevelVar(m, filePath, fileID, result, seen)
+			if nameCap, defCap := m.Captures["var.name"], m.Captures["var.def"]; nameCap != nil && defCap != nil {
+				topLevelVars = append(topLevelVars, pyDeferredVar{
+					name:      nameCap.Text,
+					node:      defCap.Node,
+					startLine: defCap.StartLine,
+					endLine:   defCap.EndLine,
+				})
+			}
 		}
 	})
+
+	// Module-level variables are emitted only after the whole walk, so a
+	// class or function of the same name has already claimed the canonical
+	// `file::Name` id and the variable yields to it. `seen` is shared
+	// across all three emitters — emitting a variable inline would let
+	// `Config = load()` sitting above `class Config:` take the id and
+	// delete the class from the graph entirely.
+	for _, v := range topLevelVars {
+		e.emitTopLevelVar(v, filePath, fileID, result, seen)
+	}
 
 	// All function/method nodes have been emitted; map call sites to
 	// their enclosing definition.
@@ -1183,10 +1214,22 @@ func pyImportDisplayName(path string) string {
 	return path
 }
 
-func (e *PythonExtractor) emitTopLevelVar(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
-	name := m.Captures["var.name"].Text
-	def := m.Captures["var.def"]
-	if def.Node == nil || def.Node.Parent() == nil || def.Node.Parent().Type() != "module" {
+func (e *PythonExtractor) emitTopLevelVar(v pyDeferredVar, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := v.name
+	if v.node == nil {
+		return
+	}
+	// An `assignment` is never a direct child of `module` — tree-sitter
+	// wraps every bare expression in an `expression_statement` first. The
+	// old check compared the assignment's immediate parent against
+	// "module", which no module-level assignment could ever satisfy, so
+	// this whole function was unreachable and Python emitted zero
+	// variable nodes for any file.
+	parent := v.node.Parent()
+	if parent != nil && parent.Type() == "expression_statement" {
+		parent = parent.Parent()
+	}
+	if parent == nil || parent.Type() != "module" {
 		return
 	}
 	id := filePath + "::" + name
@@ -1196,11 +1239,11 @@ func (e *PythonExtractor) emitTopLevelVar(m parser.QueryResult, filePath, fileID
 	seen[id] = true
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindVariable, Name: name,
-		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		FilePath: filePath, StartLine: v.startLine + 1, EndLine: v.endLine + 1,
 		Language: "python",
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
-		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: v.startLine + 1,
 	})
 }
 
