@@ -633,6 +633,10 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			"warmup_ms":      elapsed.Milliseconds(),
 		})
 		logWarmupSummary(logger, warmup, queryableElapsed, elapsed)
+		// Audit repo ownership once the graph has settled. Runs here, after
+		// every reconcile and derived pass, so it observes the state the
+		// daemon will actually serve rather than a mid-warmup transient.
+		logRepoOwnershipAudit(state.graph, logger)
 	}()
 
 	return srv.Serve()

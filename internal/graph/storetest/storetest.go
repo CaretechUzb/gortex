@@ -109,6 +109,53 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("ReleaseEnrichmentSidecar", func(t *testing.T) { testReleaseEnrichmentSidecar(t, factory) })
 	t.Run("BlameEnrichmentSidecar", func(t *testing.T) { testBlameEnrichmentSidecar(t, factory) })
 	t.Run("ContractBridgeRoundTrip", func(t *testing.T) { testContractBridgeRoundTrip(t, factory) })
+	t.Run("PrefixDiagnostics", func(t *testing.T) { testPrefixDiagnostics(t, factory) })
+}
+
+// testPrefixDiagnostics is the cross-backend fence for the repo-ownership
+// audit. Every backend must classify the same node set identically —
+// store_sqlite answers with SQL predicates while the in-memory store walks
+// shards through graph.ClassifyNodePrefix, and a divergence there would make
+// the ghost-graph detector report clean on exactly the backend the daemon
+// runs.
+//
+// Backends that implement neither the native capability nor AllNodes skip.
+func testPrefixDiagnostics(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+
+	// One owned code node, one unowned (single-repo-mode) code node, one
+	// misprefixed node whose stamped repo its identity does not carry, and
+	// one synthetic global external that must not be audited at all.
+	s.AddNode(mkRepoNode("r1/a.go::Owned", "Owned", "r1/a.go", "r1", graph.KindFunction))
+	s.AddNode(mkNode("b.go::Unowned", "Unowned", "b.go", graph.KindFunction))
+	s.AddNode(mkRepoNode("c.go::Misprefixed", "Misprefixed", "c.go", "r1", graph.KindFunction))
+	s.AddNode(mkNode("dep::go.uber.org/zap::Logger", "Logger", "", graph.KindFunction))
+
+	d, ok := graph.ReadPrefixDiagnostics(s, 5)
+	if !ok {
+		t.Skip("backend implements neither PrefixDiagnosticsReader nor AllNodes")
+	}
+
+	if d.OwnedCodeNodes != 1 {
+		t.Errorf("OwnedCodeNodes = %d, want 1 (%s)", d.OwnedCodeNodes, d.Summary())
+	}
+	if d.UnownedCodeNodes != 1 {
+		t.Errorf("UnownedCodeNodes = %d, want 1 — the synthetic dep:: node must not count (%s)",
+			d.UnownedCodeNodes, d.Summary())
+	}
+	if d.MisprefixedNodes != 1 {
+		t.Errorf("MisprefixedNodes = %d, want 1 (%s)", d.MisprefixedNodes, d.Summary())
+	}
+	if !d.Mixed() {
+		t.Errorf("Mixed() = false with both populations present (%s)", d.Summary())
+	}
+	if d.Clean() {
+		t.Errorf("Clean() = true for a mixed, misprefixed graph (%s)", d.Summary())
+	}
+	if len(d.UnownedSamples) != 1 || d.UnownedSamples[0] != "b.go::Unowned" {
+		t.Errorf("UnownedSamples = %v, want [b.go::Unowned]", d.UnownedSamples)
+	}
 }
 
 // -- fixture helpers ---------------------------------------------------

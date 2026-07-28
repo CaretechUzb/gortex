@@ -71,6 +71,14 @@ func pendingRepoPrefixes(r *Resolver, pending []*graph.Edge) ([]string, map[stri
 		sources = make(map[string]*graph.Node)
 	}
 	set := make(map[string]struct{})
+	// Prefixes derived from the ID alone, with no hydrated node to confirm
+	// them. RepoPrefixOfID returns the leading path segment, so on an
+	// UNPREFIXED node id ("internal/foo.go::Bar") it yields "internal" —
+	// a directory name masquerading as a repo. Feeding that into the
+	// dep / provides / dir indexes below builds them under a key nothing
+	// matches, and they come back empty with no error anywhere. Track the
+	// unconfirmed set so the pass can say so instead of silently degrading.
+	var unconfirmed []string
 	for _, edge := range pending {
 		if edge == nil {
 			continue
@@ -78,6 +86,10 @@ func pendingRepoPrefixes(r *Resolver, pending []*graph.Edge) ([]string, map[stri
 		prefix := graph.RepoPrefixOfID(edge.From)
 		if source := sources[edge.From]; source != nil && source.RepoPrefix != "" {
 			prefix = source.RepoPrefix
+		} else if prefix != "" {
+			if _, dup := set[prefix]; !dup {
+				unconfirmed = append(unconfirmed, prefix)
+			}
 		}
 		set[prefix] = struct{}{}
 	}
@@ -86,6 +98,13 @@ func pendingRepoPrefixes(r *Resolver, pending []*graph.Edge) ([]string, map[stri
 		prefixes = append(prefixes, prefix)
 	}
 	sort.Strings(prefixes)
+	if len(unconfirmed) > 0 && r != nil && r.logger != nil {
+		sort.Strings(unconfirmed)
+		r.logger.Warn("resolver: repo scope derived from unprefixed node ids — the dep/provides/dir indexes for this "+
+			"pass are keyed on leading path segments, not real repos, and will match nothing",
+			zap.Strings("derived_prefixes", unconfirmed),
+			zap.Int("pending_edges", len(pending)))
+	}
 	return prefixes, sources
 }
 

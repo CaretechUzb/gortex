@@ -3132,6 +3132,13 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 	}
 	densityDegenerate := fileNodes >= 5 && nodesPerFile > 0 && nodesPerFile < 1.2
 
+	// Repo-ownership audit. A node's repo prefix keys every per-repo bucket,
+	// scope filter and partial index, so a graph holding both prefixed and
+	// unprefixed copies of the same code answers every repo-scoped read with
+	// half its contents — while every other signal in this payload stays
+	// green. Nothing else here can see that, so it gets its own block.
+	prefixAudit, prefixAuditOK := graph.ReadPrefixDiagnostics(s.graph, 3)
+
 	lastIndexTime := s.indexer.LastIndexTime()
 	lastIndexStr := ""
 	if !lastIndexTime.IsZero() {
@@ -3141,6 +3148,16 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 	var recommendation string
 	if healthScore < 80 {
 		recommendation = "Health score below 80%. Run index_repository with path \".\" to re-index the codebase."
+	}
+	if prefixAuditOK && !prefixAudit.Clean() {
+		msg := "Graph holds inconsistent repository ownership (" + prefixAudit.Summary() + "). " +
+			"Repo-scoped reads (find_usages, search_symbols with a repo filter, per-repo counts) will silently " +
+			"see only part of the graph. Re-index with index_repository path \".\"; if it persists, untrack and re-track the repo."
+		if recommendation == "" {
+			recommendation = msg
+		} else {
+			recommendation = msg + " " + recommendation
+		}
 	}
 
 	// Edgeless-index sanity check: a populated graph with files and
@@ -3261,6 +3278,25 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 		// the daemon caught (and self-healed) a live-patch or boot-reload
 		// resolution regression rather than silently serving a shrunken graph.
 		"resolution_regressions": indexer.ResolutionRegressions(),
+	}
+	if prefixAuditOK {
+		ownership := map[string]any{
+			"owned_code_nodes":   prefixAudit.OwnedCodeNodes,
+			"unowned_code_nodes": prefixAudit.UnownedCodeNodes,
+			"consistent":         prefixAudit.Clean(),
+		}
+		if prefixAudit.MisprefixedNodes > 0 {
+			ownership["misprefixed_nodes"] = prefixAudit.MisprefixedNodes
+			ownership["misprefixed_samples"] = prefixAudit.MisprefixedSamples
+		}
+		// Only surface samples when they point at a defect; on a
+		// single-repo daemon every node is legitimately unowned and a
+		// sample list would read as an error.
+		if prefixAudit.Mixed() {
+			ownership["mixed"] = true
+			ownership["unowned_samples"] = prefixAudit.UnownedSamples
+		}
+		result["repo_ownership"] = ownership
 	}
 	// Tool-surface state: the active global preset (the per-session default
 	// may differ by client) and the per-workspace learned surface size, so

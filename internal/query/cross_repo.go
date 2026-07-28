@@ -23,10 +23,18 @@ import (
 //
 // No-op when the candidate set comes from a single repository (or is
 // empty): the merged ranks are already a fair within-repo order.
+//
+// Only NON-EMPTY prefixes count toward "a repository". Synthetic global
+// externals (dep::, external::, non-Go module::) carry RepoPrefix == "" by
+// design — they model third-party symbols owned by no repo. Counting "" as
+// a repository made a one-repo result set look like two, activating the
+// renumbering and promoting the top external stub to rank 0 alongside the
+// top first-party hit. Nothing errored; the results were just quietly
+// worse, which is why this is fenced by a test rather than an assertion.
 func crossRepoRerank(cands []*rerank.Candidate) {
 	repos := make(map[string]struct{}, 4)
 	for _, c := range cands {
-		if c != nil && c.Node != nil {
+		if c != nil && c.Node != nil && c.Node.RepoPrefix != "" {
 			repos[c.Node.RepoPrefix] = struct{}{}
 		}
 	}
