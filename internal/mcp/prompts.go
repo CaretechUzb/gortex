@@ -12,7 +12,7 @@ import (
 )
 
 func (s *Server) registerPrompts() {
-	s.mcpServer.AddPrompt(
+	s.addPrompt(
 		mcp.NewPrompt("pre_commit",
 			mcp.WithPromptDescription("Review uncommitted changes before committing. Shows changed symbols, blast radius, risk level, affected tests, and run commands."),
 			mcp.WithArgument("scope",
@@ -25,14 +25,14 @@ func (s *Server) registerPrompts() {
 		s.handlePromptPreCommit,
 	)
 
-	s.mcpServer.AddPrompt(
+	s.addPrompt(
 		mcp.NewPrompt("orientation",
 			mcp.WithPromptDescription("Orient in an unfamiliar codebase. Shows graph stats, functional communities, execution flows, and key symbols."),
 		),
 		s.handlePromptOrientation,
 	)
 
-	s.mcpServer.AddPrompt(
+	s.addPrompt(
 		mcp.NewPrompt("safe_to_change",
 			mcp.WithPromptDescription("Analyze whether it's safe to change specific symbols. Shows blast radius, edit plan, affected tests, and risk level."),
 			mcp.WithArgument("ids",

@@ -225,6 +225,39 @@ Four additional push channels modeled on `subscribe_diagnostics` — per-session
 | `subscribe_graph_invalidated` | `notifications/graph_invalidated` — coarse "the graph was rebuilt, drop cached results" signal. `{node_count, edge_count, reason, ts}`; unfiltered |
 | `unsubscribe_graph_invalidated` | Opt back out — idempotent |
 
+## Request lifetime (why a call can never hang)
+
+Every tool call and resource read is bounded, on every transport. A request that
+overruns its budget is **abandoned**: the client gets a terminal, structured
+error and the transport's slot is released immediately, so the session keeps
+serving later requests. The handler itself keeps running — it may be inside a
+store call that cannot be interrupted — so treat any side effect of an abandoned
+call as *unknown* and re-read before assuming it did or did not land.
+
+| Layer | Bound | Knob |
+|---|---|---|
+| Tool call / resource read / prompt fetch (all transports) | 60 s | `GORTEX_MCP_TOOL_TIMEOUT` (Go duration; `off` disables) |
+| Daemon socket, per JSON-RPC request | 60 s, terminal `-32001` | — |
+| Daemon socket, concurrent dispatches | 8 | `GORTEX_MCP_MAX_CONCURRENT_DISPATCHES` (max 64) |
+| Control RPC (`daemon status` / `search_symbols` / `proxy`) | 30 s, terminal `timeout` | — |
+| Control RPC (`shutdown`) | unbounded on the daemon — the store flush precedes the ack. `gortex daemon stop` bounds its own wait at 30 s, then watches the process for up to 2 min and force-kills | — |
+| Control RPC (`track` / `untrack` / `reload` / `enrich_*`) | unbounded by design | — |
+
+The handler bound fires just inside any deadline the transport already imposed,
+so the client receives the tool-shaped diagnosis rather than an opaque transport
+timeout. Track / reload / enrichment are deliberately left unbounded: they are
+long by design, and a user who starts one is waiting on purpose. Shutdown is
+unbounded for a different reason — abandoning a half-done store flush is worse
+than a slow stop — so the *command* carries the bound instead.
+
+`GORTEX_MCP_TOOL_TIMEOUT` is read in the server's own process, so set it in the
+**daemon's** environment (or the `gortex mcp` process for the embedded server),
+not in the MCP client's config. It can always tighten the bound. It can only
+*raise* it past 60 s on the embedded stdio server and Streamable HTTP — on the
+daemon socket the per-request lifetime is a hard 60 s that clamps it. Raise it
+when a tool legitimately runs longer than a minute: a first `index_repository`
+over a very large tree, or `ask` against a slow local model.
+
 ## Coding workflow
 
 | Tool | Description |

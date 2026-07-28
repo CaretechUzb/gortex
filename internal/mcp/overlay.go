@@ -87,7 +87,11 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 	// Prompt-injection screening sits closest to the handler so it
 	// sees the real arguments and the real result (see sanitize.go).
 	h = s.sanitizeToolHandler(h)
-	return func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
+	// The hang firewall is the OUTERMOST layer (applied last, at the bottom
+	// of this function) so it bounds the whole middleware chain, not just the
+	// leaf handler — the overlay build, the freshness sweep, and the response
+	// capture below all touch the graph and can block on the same locks.
+	return s.boundToolHandler(func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
 		beginMCPToolCall()
 		defer func() {
 			endMCPToolCall(s.logger, req.Params.Name)
@@ -194,7 +198,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			res = s.maybeAttachMomentumNote(ctx, req.Params.Name, res)
 		}
 		return res, hErr
-	}
+	})
 }
 
 // errBaseSHADrift is the structured drift error returned by the

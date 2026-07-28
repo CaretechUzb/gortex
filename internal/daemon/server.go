@@ -40,6 +40,13 @@ type Server struct {
 	// MCPToolCallTimeout bounds individual tools/call dispatches. Zero uses DefaultMCPToolCallTimeout.
 	MCPToolCallTimeout time.Duration
 
+	// ControlTimeout overrides the budget applied to bounded control kinds
+	// (see ControlTimeoutFor). Zero uses the per-kind default. Kinds that are
+	// unbounded by policy — track / reload / enrich_* — stay unbounded
+	// regardless: this tunes how long "should be quick" is allowed to take,
+	// it does not put a clock on work the user deliberately started.
+	ControlTimeout time.Duration
+
 	// Controller handles control-mode RPCs (track/untrack/reload/status/shutdown).
 	Controller Controller
 
@@ -559,24 +566,66 @@ func (s *Server) serveControl(conn net.Conn, reader *bufio.Reader, sess *Session
 			})
 			continue
 		}
-		resp := s.handleControl(sess, req)
-		if err := WriteJSONLine(conn, resp); err != nil {
-			return
-		}
+		resp := s.handleControlBounded(sess, req)
+		writeErr := WriteJSONLine(conn, resp)
 		if req.Kind == ControlShutdown && resp.OK {
-			// Give the client one more moment to flush the ack before the
-			// listener goes away, then stop.
+			// Scheduled regardless of whether the ack reached the client. The
+			// controller flushes and closes the store before answering, so a
+			// client that gave up waiting (or died) has already left by the
+			// time we get here — and skipping the teardown on a failed write
+			// would leave a daemon that flushed its store and then kept
+			// running, holding the on-disk lock the next start needs.
+			//
+			// The short delay gives a client that IS still listening a moment
+			// to read the ack before the listener goes away.
 			go func() {
 				time.Sleep(100 * time.Millisecond)
 				_ = s.Shutdown()
 			}()
 			return
 		}
+		if writeErr != nil {
+			return
+		}
 	}
 }
 
-func (s *Server) handleControl(_ *Session, req ControlRequest) ControlResponse {
-	ctx := context.Background()
+// handleControlBounded runs one control request under the kind's budget (see
+// ControlTimeoutFor). Handlers that block past it — the common case being a
+// controller mutex held for the length of a track / reload / enrichment — are
+// abandoned rather than waited on, so the caller gets a terminal ErrTimeout
+// response instead of an open-ended silence. The abandoned handler keeps
+// running and completes normally; only this connection's turn is given back.
+//
+// Unbounded kinds (track / reload / enrich_*) run inline, exactly as before:
+// they are long by design and a caller that starts one is waiting on purpose.
+func (s *Server) handleControlBounded(sess *Session, req ControlRequest) ControlResponse {
+	budget := ControlTimeoutFor(req.Kind)
+	if budget > 0 && s.ControlTimeout > 0 {
+		budget = s.ControlTimeout
+	}
+	if budget <= 0 {
+		return s.handleControl(context.Background(), sess, req)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	done := make(chan ControlResponse, 1)
+	go func() { done <- s.handleControl(ctx, sess, req) }()
+
+	select {
+	case resp := <-done:
+		return resp
+	case <-ctx.Done():
+		s.Logger.Warn("daemon: control request exceeded its budget",
+			zap.String("kind", req.Kind), zap.Duration("budget", budget))
+		return controlErr(ErrTimeout, fmt.Sprintf(
+			"control request %q did not complete within %s; the daemon is busy (a track / reload / enrichment may be holding the controller) — retry, or run `gortex daemon status` for progress",
+			req.Kind, budget))
+	}
+}
+
+func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlRequest) ControlResponse {
 	switch req.Kind {
 	case ControlTrack:
 		var p TrackParams

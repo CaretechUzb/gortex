@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -241,16 +242,16 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			return preset, mode, srv.LearnedToolCount()
 		}
 	}
-	controller.onShutdown = func() error {
+	controller.setShutdownHook(func() error {
 		// Stop watchers first so no late events race the snapshot
 		// write — we want the snapshot to reflect a quiescent graph,
 		// not one being mutated by an in-flight re-index.
-		controller.mu.Lock()
-		mw := controller.multiWatcher
-		controller.mu.Unlock()
-		if mw != nil {
-			_ = mw.Stop()
-		}
+		//
+		// StopWatcher is lock-free by design. This is the first thing a
+		// stop request does, and reading the watcher under the coarse
+		// controller mutex put it straight back behind the long-running
+		// track / reload / enrichment the user is trying to end.
+		controller.StopWatcher()
 		if mg, ok := state.graph.(*graph.Graph); ok {
 			// Memory backend — snapshot the full in-memory graph;
 			// the next warmup replays nodes/edges from the gob+gzip
@@ -272,7 +273,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			_ = state.mcpServer.FlushSavings()
 		}
 		return nil
-	}
+	})
 	srv.Controller = controller
 	// Surface warmup state on the handshake ack: a proxy / CLI that connects
 	// during the (minutes-long) warmup should know the graph is still filling
@@ -997,29 +998,71 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 		// the daemon hasn't cleaned up. Fall back to killing by PID.
 		return killByPID()
 	}
-	resp, err := c.Control(daemon.ControlShutdown, nil)
+	// Explicit budget: the daemon flushes and closes its store before acking,
+	// so the ack is unbounded by policy on the server side (abandoning a
+	// half-done flush is worse than a slow stop). The wait belongs here
+	// instead, where giving up is safe — the daemon is already on its way
+	// down and the exit wait below finishes the job.
+	resp, err := c.ControlWithTimeout(daemon.ControlShutdown, nil, daemonShutdownAckTimeout)
 	_ = c.Close()
-	if err != nil {
+	// A daemon that accepted the request but hasn't acked is not a reason to
+	// abandon the stop. The ack is synchronous with the controller's
+	// flush-and-close, so on a large workspace — or behind a track / reload
+	// holding the controller — it can legitimately overrun the budget while
+	// the process is still on its way down. Returning an error here left the
+	// user with a daemon they could only `kill -9`. Fall through to the exit
+	// wait instead: it force-kills and cleans up if the daemon really is
+	// wedged, so `daemon stop` always terminates and always leaves the socket
+	// and PID file in a startable state.
+	grace := daemonExitGrace
+	switch {
+	case errors.Is(err, daemon.ErrDaemonUnresponsive),
+		err == nil && !resp.OK && resp.ErrorCode == daemon.ErrTimeout:
+		fmt.Fprintln(w, "[gortex daemon] no shutdown ack yet — the daemon is busy; waiting for it to exit")
+		grace = daemonBusyExitGrace
+	case err != nil:
 		return err
-	}
-	if !resp.OK {
+	case !resp.OK:
 		return fmt.Errorf("shutdown rejected: %s %s", resp.ErrorCode, resp.ErrorMsg)
 	}
 	if havePID {
-		waitForDaemonExit(pid)
+		waitForDaemonExitWithin(pid, grace)
 	}
 	emitDaemonStopSummary(w, socket, uptime)
 	return nil
 }
 
-// waitForDaemonExit blocks until the daemon process pid has exited — and thus
-// released the store's on-disk lock — force-killing it if a graceful shutdown
-// stalls. This is what makes `daemon stop` honest: when it returns, the store
-// is free for the next process, which is the foundation `daemon restart`
-// stands on. Polls cheaply; the common case (a clean flush) clears in well
-// under a second.
-func waitForDaemonExit(pid int) {
-	deadline := time.Now().Add(15 * time.Second)
+const (
+	// daemonExitGrace is how long a normal stop waits for the process to go
+	// away after a successful ack — the flush has already happened by then.
+	daemonExitGrace = 15 * time.Second
+	// daemonBusyExitGrace applies when the daemon never acked. The flush is
+	// presumed still running, so force-killing on the normal schedule would
+	// interrupt exactly the store write we want to complete.
+	daemonBusyExitGrace = 2 * time.Minute
+	// daemonStatusCardTimeout bounds the advisory Status lookups that only
+	// decorate output. They must never be the reason a command hangs.
+	daemonStatusCardTimeout = 3 * time.Second
+	// daemonShutdownAckTimeout is how long the stop command waits for the
+	// shutdown ack before switching to watching the process itself. Generous,
+	// because the ack trails a real store flush.
+	daemonShutdownAckTimeout = 30 * time.Second
+)
+
+// waitForDaemonExitWithin blocks until the daemon process pid has exited — and
+// thus released the store's on-disk lock — force-killing it if a graceful
+// shutdown stalls. This is what makes `daemon stop` honest: when it returns,
+// the store is free for the next process, which is the foundation `daemon
+// restart` stands on. Polls cheaply; the common case (a clean flush) clears in
+// well under a second.
+//
+// grace is the caller's, not a constant, because how long to wait depends on
+// what the ack told us: daemonExitGrace after a successful ack (the flush has
+// already happened), daemonBusyExitGrace when none arrived (it probably has
+// not, and force-killing on the normal schedule would interrupt the store
+// write we want to complete).
+func waitForDaemonExitWithin(pid int, grace time.Duration) {
+	deadline := time.Now().Add(grace)
 	for time.Now().Before(deadline) {
 		if !platform.ProcessAlive(pid) {
 			return
@@ -1042,13 +1085,19 @@ func waitForDaemonExit(pid int) {
 // a Status control before shutdown so the summary card can show how long the
 // process ran. Returns 0 on any error — we'd rather degrade the card than
 // fail the stop.
+//
+// Bounded hard: Status aggregates the whole store and serialises behind the
+// controller mutex, so on a busy daemon this decorative lookup was the first
+// thing `daemon stop` blocked on — the stop request had not even been sent
+// yet. A card without an uptime is a fine outcome; a stop that never returns
+// is not.
 func daemonUptimeBeforeStop() time.Duration {
 	c, err := daemonControlClient()
 	if err != nil {
 		return 0
 	}
 	defer c.Close()
-	resp, err := c.Control(daemon.ControlStatus, nil)
+	resp, err := c.ControlWithTimeout(daemon.ControlStatus, nil, daemonStatusCardTimeout)
 	if err != nil || !resp.OK {
 		return 0
 	}

@@ -11,7 +11,7 @@ import (
 
 func (s *Server) registerResources() {
 	// Session state: survives context compaction.
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://session",
 			"Session State",
@@ -24,7 +24,7 @@ func (s *Server) registerResources() {
 	// Static resource: graph stats (session start orientation). Same
 	// payload as the `graph_stats` tool — kept as a tool too for
 	// back-compat with clients that don't speak resources.
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://stats",
 			"Graph Statistics",
@@ -35,7 +35,7 @@ func (s *Server) registerResources() {
 	)
 
 	// Static resource: graph schema reference.
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://schema",
 			"Graph Schema",
@@ -49,7 +49,7 @@ func (s *Server) registerResources() {
 	// content that used to be pre-paid in the installed CLAUDE.md section —
 	// the LLM-provider matrix, capabilities catalog, token-economy detail,
 	// resources list, and pointers into the analyze / search_ast catalogs.
-	s.mcpServer.AddResource(
+	s.addResource(
 		mcp.NewResource(
 			"gortex://guide",
 			"Gortex Guide",
@@ -60,7 +60,7 @@ func (s *Server) registerResources() {
 	)
 
 	// Template resource: a single guide section by topic keyword.
-	s.mcpServer.AddResourceTemplate(
+	s.addResourceTemplate(
 		mcp.NewResourceTemplate(
 			"gortex://guide/{topic}",
 			"Gortex Guide Section",
@@ -80,7 +80,7 @@ func (s *Server) registerResources() {
 	s.registerAnalyzerResources()
 
 	// Template resources: communities and processes (dynamic, parameterized).
-	s.mcpServer.AddResourceTemplate(
+	s.addResourceTemplate(
 		mcp.NewResourceTemplate(
 			"gortex://communities",
 			"Communities",
@@ -90,7 +90,7 @@ func (s *Server) registerResources() {
 		s.handleResourceCommunities,
 	)
 
-	s.mcpServer.AddResourceTemplate(
+	s.addResourceTemplate(
 		mcp.NewResourceTemplate(
 			"gortex://community/{id}",
 			"Community Detail",
@@ -100,7 +100,7 @@ func (s *Server) registerResources() {
 		s.handleResourceCommunity,
 	)
 
-	s.mcpServer.AddResourceTemplate(
+	s.addResourceTemplate(
 		mcp.NewResourceTemplate(
 			"gortex://processes",
 			"Processes",
@@ -110,7 +110,7 @@ func (s *Server) registerResources() {
 		s.handleResourceProcesses,
 	)
 
-	s.mcpServer.AddResourceTemplate(
+	s.addResourceTemplate(
 		mcp.NewResourceTemplate(
 			"gortex://process/{id}",
 			"Process Detail",
