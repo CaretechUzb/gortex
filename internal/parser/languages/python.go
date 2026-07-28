@@ -29,8 +29,7 @@ const qPyAll = `
   (class_definition
     name: (identifier) @class.name) @class.def
 
-  (import_statement
-    name: (dotted_name) @import.name) @import.def
+  (import_statement) @import.def
 
   (import_from_statement
     module_name: (dotted_name) @import.module) @importfrom.def
@@ -707,32 +706,54 @@ func pyDocstringFromDef(defNode *sitter.Node, src []byte) string {
 // emitImport handles `import os`, `import os.path`, `import numpy as np`.
 // Walks the import_statement node to populate the alias→module map used
 // by attribute-call classification.
+//
+// The query deliberately matches `(import_statement)` with no `name:`
+// constraint. That field holds a `dotted_name` for `import os` but an
+// `aliased_import` for `import numpy as np`, so a pattern anchored on
+// `(dotted_name)` never fired for an aliased import — and `import x as y`
+// is how the entire numpy/pandas idiom is written. Walking the children
+// here covers both shapes, and every name in the statement.
 func (e *PythonExtractor) emitImport(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, imports map[string]string) {
-	name := m.Captures["import.name"]
-	pyEmitImportNode(filePath, fileID, name.Text, "", name.StartLine+1, result)
-	result.Edges = append(result.Edges, &graph.Edge{
-		From: fileID, To: "unresolved::import::" + name.Text,
-		Kind: graph.EdgeImports, FilePath: filePath, Line: name.StartLine + 1,
-	})
 	def, ok := m.Captures["import.def"]
 	if !ok || def.Node == nil {
 		return
 	}
 	stmt := def.Node
+	emit := func(modulePath, alias string, line int) {
+		if modulePath == "" {
+			return
+		}
+		pyEmitImportNode(filePath, fileID, modulePath, alias, line, result)
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileID, To: "unresolved::import::" + modulePath,
+			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
+		})
+	}
+	// One statement can bind several modules (`import os.path, numpy as
+	// np`), so every name child emits its own import node — the previous
+	// single-node-per-statement shape dropped the trailing names.
 	for i, _nc := 0, int(stmt.NamedChildCount()); i < _nc; i++ {
 		child := stmt.NamedChild(i)
+		if child == nil {
+			continue
+		}
+		line := int(child.StartPoint().Row) + 1
 		switch child.Type() {
 		case "dotted_name":
 			dotted := child.Content(src)
-			alias := dotted
+			bind := dotted
 			if j := strings.Index(dotted, "."); j >= 0 {
-				alias = dotted[:j] // `import os.path` binds `os`
+				bind = dotted[:j] // `import os.path` binds `os`
 			}
-			imports[alias] = dotted
+			imports[bind] = dotted
+			emit(dotted, "", line)
 		case "aliased_import":
 			var modulePath, alias string
-			for j, _nc := 0, int(child.NamedChildCount()); j < _nc; j++ {
+			for j, _jc := 0, int(child.NamedChildCount()); j < _jc; j++ {
 				cc := child.NamedChild(j)
+				if cc == nil {
+					continue
+				}
 				switch cc.Type() {
 				case "dotted_name":
 					modulePath = cc.Content(src)
@@ -740,9 +761,11 @@ func (e *PythonExtractor) emitImport(m parser.QueryResult, filePath, fileID stri
 					alias = cc.Content(src)
 				}
 			}
-			if alias != "" && modulePath != "" {
-				imports[alias] = modulePath
+			if alias == "" || modulePath == "" {
+				continue
 			}
+			imports[alias] = modulePath
+			emit(modulePath, alias, line)
 		}
 	}
 }
