@@ -74,31 +74,31 @@ func TestLSPDisabledSet_Empty(t *testing.T) {
 	}
 }
 
-// TestWarmMtimePrefix covers the single- vs multi-repo prefix decision the
-// warm-restart mtime lookup hangs on. The bug it guards: a lone repo indexes
-// unprefixed (rows under ""), but EffectiveRepoPrefix returns the basename, so
-// looking up the basename finds nothing and forces a paid cold re-index every
-// restart.
+// TestWarmMtimePrefix covers the key the warm-restart mtime lookup hangs on.
+// It must be the prefix the indexer actually wrote the rows under, which is
+// now always the effective prefix — a lone repo included.
+//
+// This used to mirror the indexer's single-vs-multi gate and return "" for a
+// lone repo. The two decisions had to agree exactly, and when they drifted
+// the symptom was not an error but a full cold re-index (with an API
+// embedder, a paid re-embed) on every restart.
 func TestWarmMtimePrefix(t *testing.T) {
 	cases := []struct {
 		name       string
 		effective  string
-		repoCount  int
 		wantPrefix string
 		wantOK     bool
 	}{
-		{"single repo uses empty prefix (the bug)", "drools", 1, "", true},
-		{"single repo, zero configured still unprefixed", "drools", 0, "", true},
-		{"multi-repo keeps its derived prefix", "drools", 2, "drools", true},
-		{"multi-repo with no prefix is untrustworthy", "", 3, "", false},
-		{"single repo already empty prefix", "", 1, "", true},
+		{"a lone repo is keyed by its prefix like any other", "drools", "drools", true},
+		{"a derived worktree prefix is preserved", "drools@ws", "drools@ws", true},
+		{"no effective prefix is untrustworthy — cold index instead", "", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotPrefix, gotOK := warmMtimePrefix(tc.effective, tc.repoCount)
+			gotPrefix, gotOK := warmMtimePrefix(tc.effective)
 			if gotPrefix != tc.wantPrefix || gotOK != tc.wantOK {
-				t.Fatalf("warmMtimePrefix(%q, %d) = (%q, %v), want (%q, %v)",
-					tc.effective, tc.repoCount, gotPrefix, gotOK, tc.wantPrefix, tc.wantOK)
+				t.Fatalf("warmMtimePrefix(%q) = (%q, %v), want (%q, %v)",
+					tc.effective, gotPrefix, gotOK, tc.wantPrefix, tc.wantOK)
 			}
 		})
 	}

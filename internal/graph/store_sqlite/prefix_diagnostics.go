@@ -10,7 +10,7 @@ import (
 //
 // The predicates below are the SQL transcription of
 // graph.ClassifyNodePrefix, and the two must be changed together. Both key
-// off `file_path <> ''`, which is what separates real code nodes from the
+// off a non-empty file_path, which is what separates real code nodes from the
 // synthetic `dep::` / `external::` / `module::` / `builtin::` namespaces
 // that carry no source file and are not path-prefixed.
 //

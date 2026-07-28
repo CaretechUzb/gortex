@@ -116,10 +116,10 @@ func TestReconcileRepoCtx_ScopedEqualsFullIndex(t *testing.T) {
 		"a four-file mutation in a 23-file repo must route scoped, not full-retrack")
 
 	// Sanity: the deltas actually landed on the reconciled store.
-	require.NotEmpty(t, s.GetFileNodes("added.go"), "added file must be present after reconcile")
-	require.NotEmpty(t, s.GetFileNodes("rennew.go"), "renamed-new file must be present after reconcile")
-	require.Empty(t, s.GetFileNodes("deleted.go"), "deleted file must be evicted after reconcile")
-	require.Empty(t, s.GetFileNodes("renold.go"), "renamed-old file must be evicted after reconcile")
+	require.NotEmpty(t, s.GetFileNodes("repo/added.go"), "added file must be present after reconcile")
+	require.NotEmpty(t, s.GetFileNodes("repo/rennew.go"), "renamed-new file must be present after reconcile")
+	require.Empty(t, s.GetFileNodes("repo/deleted.go"), "deleted file must be evicted after reconcile")
+	require.Empty(t, s.GetFileNodes("repo/renold.go"), "renamed-old file must be evicted after reconcile")
 
 	// Golden: a from-scratch full index of the final tree, on a fresh disk
 	// store through an equivalent single-repo config (so node IDs prefix the

@@ -51,7 +51,7 @@ func TestReconcileRepoCtx_EvictsOfflineDeletions(t *testing.T) {
 
 	// Locate nodes for b.go before reconciliation — they exist in
 	// the graph since the first pass indexed it.
-	assert.NotEmpty(t, g.GetFileNodes("b.go"), "b.go nodes must exist pre-reconcile")
+	assert.NotEmpty(t, g.GetFileNodes("repo/b.go"), "b.go nodes must exist pre-reconcile")
 
 	// Second "daemon run": fresh MultiIndexer, graph already populated
 	// from the "snapshot", reconcile with prior mtimes.
@@ -60,10 +60,10 @@ func TestReconcileRepoCtx_EvictsOfflineDeletions(t *testing.T) {
 	require.NoError(t, err)
 
 	// The deleted file's nodes must be evicted — that's B2's contract.
-	assert.Empty(t, g.GetFileNodes("b.go"),
+	assert.Empty(t, g.GetFileNodes("repo/b.go"),
 		"offline-deleted file's nodes must be evicted by reconciliation (B2)")
 	// The surviving file's nodes must still be present.
-	assert.NotEmpty(t, g.GetFileNodes("a.go"),
+	assert.NotEmpty(t, g.GetFileNodes("repo/a.go"),
 		"unchanged file's nodes must survive reconciliation")
 }
 
@@ -129,7 +129,7 @@ func TestReconcileAll_CatchesJanitorTargets(t *testing.T) {
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
-	require.NotEmpty(t, g.GetFileNodes("drop.go"))
+	require.NotEmpty(t, g.GetFileNodes("repo/drop.go"))
 
 	// Simulate an edit the watcher missed: delete drop.go on disk
 	// without routing through IndexFile.
@@ -137,8 +137,8 @@ func TestReconcileAll_CatchesJanitorTargets(t *testing.T) {
 
 	mi.ReconcileAll()
 
-	assert.Empty(t, g.GetFileNodes("drop.go"),
+	assert.Empty(t, g.GetFileNodes("repo/drop.go"),
 		"janitor must evict files deleted outside the watcher path")
-	assert.NotEmpty(t, g.GetFileNodes("keep.go"),
+	assert.NotEmpty(t, g.GetFileNodes("repo/keep.go"),
 		"janitor must not disturb unchanged files")
 }

@@ -86,12 +86,14 @@ func TestMultiIndexer_IndexAll_SingleRepo(t *testing.T) {
 	assert.Greater(t, res.NodeCount, 0)
 	assert.Greater(t, res.FileCount, 0)
 
-	// Single repo: should NOT be multi-repo mode.
+	// One repo: IsMultiRepo() is false — it reports the repo COUNT.
 	assert.False(t, mi.IsMultiRepo())
 
-	// Nodes should NOT have repo prefix in single-repo mode (backward compat).
+	// ...but the ID shape does not depend on that count. A lone repo is the
+	// first tracked repo and its nodes carry its prefix like any other's.
 	for _, n := range g.AllNodes() {
-		assert.Empty(t, n.RepoPrefix, "single-repo nodes should not have RepoPrefix")
+		assert.Equal(t, "myrepo", n.RepoPrefix, "a lone repo's nodes carry its prefix")
+		assert.True(t, strings.HasPrefix(n.ID, "myrepo/"), "node ID %q must carry the repo prefix", n.ID)
 	}
 
 	// Metadata should be populated.
@@ -537,20 +539,23 @@ func TestMultiIndexer_IndexAll_EmptyRepos(t *testing.T) {
 	assert.Nil(t, results)
 }
 
-// Feature: multi-repo-support, Property 6: Node ID format by mode
+// Feature: multi-repo-support, Property 6: Node ID format
 //
-// TestPropertyNodeIDFormatByMode verifies that:
-//   - In multi-repo mode (2+ repos), node IDs match <repo_prefix>/<path>::<Symbol>
-//     and RepoPrefix is non-empty.
-//   - In single-repo mode (1 repo), node IDs match <path>::<Symbol>
-//     and RepoPrefix is empty.
-func TestPropertyNodeIDFormatByMode(t *testing.T) {
+// TestPropertyNodeIDFormat verifies that node IDs always match
+// <repo_prefix>/<path>::<Symbol> and RepoPrefix is always non-empty,
+// whether the workspace holds one repo or several.
+//
+// This property used to be conditional — a lone repo minted <path>::<Symbol>
+// with an empty RepoPrefix — which meant one graph could carry two ID
+// schemes depending on how many repos happened to be tracked. Repo COUNT
+// still decides IsMultiRepo(), but it no longer decides ID SHAPE.
+func TestPropertyNodeIDFormat(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		// Generate random function names for uniqueness per iteration.
 		funcNameA := "Func" + rapid.StringMatching(`[A-Z][a-z]{2,6}`).Draw(rt, "funcNameA")
 		funcNameB := "Func" + rapid.StringMatching(`[A-Z][a-z]{2,6}`).Draw(rt, "funcNameB")
 
-		// Decide mode: single-repo or multi-repo.
+		// The number of tracked repos must not change the ID shape.
 		multiRepo := rapid.Bool().Draw(rt, "multiRepo")
 
 		tmpBase := t.TempDir()
@@ -592,27 +597,9 @@ func TestPropertyNodeIDFormatByMode(t *testing.T) {
 				rt.Error("expected IsMultiRepo() == true for 2 repos")
 			}
 
-			for _, n := range g.AllNodes() {
-				// RepoPrefix must be non-empty.
-				if n.RepoPrefix == "" {
-					rt.Errorf("multi-repo node %q has empty RepoPrefix", n.ID)
-				}
-
-				// ID must start with "<repo_prefix>/".
-				prefix := n.RepoPrefix + "/"
-				if !strings.HasPrefix(n.ID, prefix) {
-					rt.Errorf("multi-repo node ID %q does not start with prefix %q", n.ID, prefix)
-				}
-
-				// ID must contain "::" separating path from symbol (for non-file nodes).
-				if n.Kind != graph.KindFile && n.Kind != graph.KindPackage && n.Kind != graph.KindImport {
-					if !strings.Contains(n.ID, "::") {
-						rt.Errorf("multi-repo node ID %q missing '::' separator", n.ID)
-					}
-				}
-			}
+			assertNodesArePrefixed(rt, g, "two repos")
 		} else {
-			// --- Single-repo mode: 1 repo ---
+			// --- One repo: same ID shape, IsMultiRepo() is false ---
 			repoDir := filepath.Join(tmpBase, "solo-repo")
 			require.NoError(t, os.MkdirAll(repoDir, 0o755))
 
@@ -638,26 +625,35 @@ func TestPropertyNodeIDFormatByMode(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, results, 1)
 
-			// Must NOT be multi-repo mode.
+			// One repo: not multi-repo, but the IDs look identical.
 			if mi.IsMultiRepo() {
 				rt.Error("expected IsMultiRepo() == false for 1 repo")
 			}
 
-			for _, n := range g.AllNodes() {
-				// RepoPrefix must be empty in single-repo mode.
-				if n.RepoPrefix != "" {
-					rt.Errorf("single-repo node %q has non-empty RepoPrefix %q", n.ID, n.RepoPrefix)
-				}
-
-				// ID must NOT contain a repo prefix slash before the path.
-				// In single-repo mode, IDs are <path>::<Symbol>, not <prefix>/<path>::<Symbol>.
-				// We verify by checking no known prefix appears.
-				if strings.HasPrefix(n.ID, "solo-repo/") {
-					rt.Errorf("single-repo node ID %q should not have repo prefix", n.ID)
-				}
-			}
+			assertNodesArePrefixed(rt, g, "one repo")
 		}
 	})
+}
+
+// assertNodesArePrefixed is the single ID-shape invariant, applied to
+// workspaces of every size: every node carries a repo prefix, its ID starts
+// with that prefix, and symbol nodes keep the "::" path/symbol separator.
+func assertNodesArePrefixed(rt *rapid.T, g *graph.Graph, workspace string) {
+	for _, n := range g.AllNodes() {
+		if n.RepoPrefix == "" {
+			rt.Errorf("%s: node %q has empty RepoPrefix", workspace, n.ID)
+			continue
+		}
+		prefix := n.RepoPrefix + "/"
+		if !strings.HasPrefix(n.ID, prefix) {
+			rt.Errorf("%s: node ID %q does not start with prefix %q", workspace, n.ID, prefix)
+		}
+		if n.Kind != graph.KindFile && n.Kind != graph.KindPackage && n.Kind != graph.KindImport {
+			if !strings.Contains(n.ID, "::") {
+				rt.Errorf("%s: node ID %q missing '::' separator", workspace, n.ID)
+			}
+		}
+	}
 }
 
 // Feature: multi-repo-support, Property 9: Re-index isolation
@@ -758,12 +754,18 @@ func countRepoEdges(g graph.Store, repoPrefix string) int {
 	return count
 }
 
-// --- Task 17.1: Backward compatibility verification ---
+// --- Backward compatibility verification ---
 
-// TestSingleRepoMode_BackwardCompat verifies that single --index with no repos
-// config behaves identically to the current implementation.
-func TestSingleRepoMode_BackwardCompat(t *testing.T) {
-	t.Run("node_ids_use_existing_format", func(t *testing.T) {
+// TestLoneRepo_ConfigCompat verifies that a workspace with one repo, or a
+// `.gortex.yaml` carrying no repos/workspace sections, still loads and
+// indexes cleanly.
+//
+// It no longer asserts an unprefixed ID format: a lone repo is the first
+// tracked repo and is prefixed like any other. The shape assertion lives in
+// TestPropertyNodeIDFormat, which now applies one invariant to every
+// workspace size.
+func TestLoneRepo_ConfigCompat(t *testing.T) {
+	t.Run("node_ids_carry_the_repo_prefix", func(t *testing.T) {
 		dir := setupRepoDir(t, "myrepo")
 
 		tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
@@ -782,15 +784,13 @@ func TestSingleRepoMode_BackwardCompat(t *testing.T) {
 		_, err = mi.IndexAll()
 		require.NoError(t, err)
 
-		// Single-repo mode: IsMultiRepo should be false.
+		// One repo: IsMultiRepo reports the count, not the ID shape.
 		assert.False(t, mi.IsMultiRepo())
 
-		// Node IDs should use existing format without prefix.
 		for _, n := range g.AllNodes() {
-			assert.Empty(t, n.RepoPrefix, "single-repo nodes should not have RepoPrefix")
-			// IDs should NOT start with "myrepo/" prefix.
-			assert.False(t, strings.HasPrefix(n.ID, "myrepo/"),
-				"single-repo node ID %q should not have repo prefix", n.ID)
+			assert.Equal(t, "myrepo", n.RepoPrefix, "a lone repo's nodes carry its prefix")
+			assert.True(t, strings.HasPrefix(n.ID, "myrepo/"),
+				"node ID %q must carry the repo prefix", n.ID)
 		}
 	})
 
@@ -869,15 +869,21 @@ guards:
 	})
 }
 
-// --- Task 17.2: Single-to-multi-repo transition ---
+// --- Growing a workspace from one repo to two ---
 
-// TestSingleToMultiRepoTransition verifies that when upgrading from single-repo
-// to multi-repo, a full re-index generates Qualified_Node_IDs.
-func TestSingleToMultiRepoTransition(t *testing.T) {
+// TestGrowWorkspaceFromOneRepoToTwo verifies that adding a second repo is not
+// a migration: the first repo's node IDs are already qualified, so they are
+// unchanged by the second repo joining, and a full re-index reproduces them.
+//
+// This used to be the single→multi TRANSITION test, and the interesting
+// assertion was that repo-a's IDs changed shape at the moment repo-b arrived.
+// Nothing changes shape any more; the point of the test is now that nothing
+// does.
+func TestGrowWorkspaceFromOneRepoToTwo(t *testing.T) {
 	repoA := setupRepoDir(t, "repo-a")
 	repoB := setupRepoDir(t, "repo-b")
 
-	// Step 1: Start in single-repo mode with just repo-a.
+	// Step 1: one tracked repo.
 	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
 	gc := &config.GlobalConfig{
 		Repos: []config.RepoEntry{{Path: repoA, Name: "repo-a"}},
@@ -894,23 +900,25 @@ func TestSingleToMultiRepoTransition(t *testing.T) {
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
-	// Verify single-repo mode: no prefixes.
+	// One repo, already fully qualified.
 	assert.False(t, mi.IsMultiRepo())
 	for _, n := range g.AllNodes() {
-		assert.Empty(t, n.RepoPrefix)
-		assert.False(t, strings.HasPrefix(n.ID, "repo-a/"))
+		assert.Equal(t, "repo-a", n.RepoPrefix)
+		assert.True(t, strings.HasPrefix(n.ID, "repo-a/"), "node ID %q must carry the repo prefix", n.ID)
 	}
 
-	// Step 2: Track a second repo to transition to multi-repo mode.
+	// Step 2: track a second repo.
 	result, err := mi.TrackRepo(config.RepoEntry{Path: repoB, Name: "repo-b"})
 	require.NoError(t, err)
 	require.NotNil(t, result)
 
-	// Now we're in multi-repo mode.
 	assert.True(t, mi.IsMultiRepo())
 
-	// Step 3: Full re-index to generate Qualified_Node_IDs.
-	// Create a new graph and multi-indexer to simulate full re-index.
+	// repo-a's nodes are untouched by repo-b joining — no re-mint happened
+	// because there was never a second ID shape to migrate away from.
+	require.NotNil(t, g.GetNode("repo-a/main.go::Hello"))
+
+	// Step 3: a full cold re-index reproduces the same IDs.
 	gc2 := &config.GlobalConfig{
 		Repos: []config.RepoEntry{
 			{Path: repoA, Name: "repo-a"},
