@@ -233,21 +233,35 @@ func phpNewExpressionClass(expr *sitter.Node, src []byte) string {
 	return ""
 }
 
-// phpSoleTypeAtom reduces a declared type to a single bindable class name. A
-// union / intersection / nullable-of-union declaration names more than one
-// possible runtime class, so it yields "" rather than an arbitrary branch;
-// `?Foo` is Foo (the null branch has no members to call). Builtin scalar and
-// pseudo types never name a graph node.
+// phpSoleTypeAtom reduces a declared type to a single bindable class name.
+//
+// A UNION (`Foo|Bar`) names alternatives — the value is one of them, and
+// picking a branch would bind a call to the wrong class at the resolved tier —
+// so it yields "". An INTERSECTION (`Foo&Bar`) is the opposite: the value is
+// every branch at once, so any branch is a true statement about it and the
+// first non-builtin one is taken. If the method being called lives on a
+// different branch, the hierarchy walk from this one simply finds nothing and
+// the call stays unresolved — never a wrong bind. This matters because
+// `PushoverHandler&MockObject` is the idiomatic type of a mocked collaborator
+// in a modern PHP test suite.
+//
+// `?Foo` is Foo (the null branch has no members to call), and a nullable union
+// stays a union. Builtin scalar and pseudo types never name a graph node.
 func phpSoleTypeAtom(decl string) string {
 	decl = strings.TrimSpace(decl)
-	if decl == "" || strings.ContainsAny(decl, "|&") {
+	if decl == "" || strings.ContainsRune(decl, '|') {
 		return ""
 	}
-	t := canonicalizePHPTypeRef(decl)
-	if t == "" || phpBuiltinType(t) {
-		return ""
+	// PHP 8.2 disjunctive normal form parenthesises intersection groups inside
+	// a union; the union check above already rejected those.
+	for _, branch := range strings.Split(decl, "&") {
+		t := canonicalizePHPTypeRef(branch)
+		if t == "" || phpBuiltinType(t) {
+			continue
+		}
+		return t
 	}
-	return t
+	return ""
 }
 
 // phpClassPropertyTypes maps each declared property of a class / trait / enum
