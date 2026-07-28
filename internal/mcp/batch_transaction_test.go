@@ -195,6 +195,113 @@ func TestAtomicBatchConcurrentIdempotencyWritesOnce(t *testing.T) {
 	}
 }
 
+func TestBatchTransactionPublishCopiesReceiptStorage(t *testing.T) {
+	state := &batchTransactionState{done: make(chan struct{})}
+	completedAt := time.Now().UTC()
+	original := completedAt
+	published := batchTransactionReceipt{
+		Status:      "prepared",
+		Results:     []batchEditResult{{FilePath: "a.txt", Status: "validated"}},
+		Files:       []batchTransactionFile{{Path: "/tmp/a.txt"}},
+		Summary:     map[string]int{"total": 1},
+		CompletedAt: &completedAt,
+	}
+	state.publish(published, false)
+
+	// A publisher goes on mutating its own receipt after publishing; none of
+	// that may reach the state, which concurrent readers snapshot under RLock.
+	published.Results[0].Status = "applied"
+	published.Files[0].ReindexReceipt = "receipt-1"
+	published.Summary["total"] = 99
+	*published.CompletedAt = completedAt.Add(time.Hour) // also rewrites completedAt
+
+	stored := state.snapshot()
+	if stored.Results[0].Status != "validated" {
+		t.Errorf("Results storage is shared with the publisher: %q", stored.Results[0].Status)
+	}
+	if stored.Files[0].ReindexReceipt != "" {
+		t.Errorf("Files storage is shared with the publisher: %q", stored.Files[0].ReindexReceipt)
+	}
+	if stored.Summary["total"] != 1 {
+		t.Errorf("Summary map is shared with the publisher: %d", stored.Summary["total"])
+	}
+	if !stored.CompletedAt.Equal(original) {
+		t.Errorf("CompletedAt is shared with the publisher: %s", stored.CompletedAt)
+	}
+
+	// The snapshot side owes the same isolation in the other direction.
+	stored.Results[0].Status = "failed"
+	stored.Summary["total"] = 7
+	if again := state.snapshot(); again.Results[0].Status != "validated" || again.Summary["total"] != 1 {
+		t.Errorf("snapshot storage is shared with the state: %+v", again)
+	}
+}
+
+func TestAtomicBatchSnapshotIsolatedFromCommitInProgress(t *testing.T) {
+	s := newAtomicBatchTestServer(t, mutationTestWatcher{})
+	path := writeAtomicBatchFixture(t, t.TempDir(), "isolated.txt", "old\n")
+	edits := []batchEditItem{atomicFileEdit(path, "old", "new")}
+	fingerprint := batchEditFingerprint(edits)
+
+	committing := make(chan struct{})
+	s.batchWriteOverride = func(target string, content []byte, mode os.FileMode) error {
+		// Signalled without waiting on the reader: a back-edge would order the
+		// commit loop's writes behind the reader's loads and hide the race.
+		close(committing)
+		return agents.AtomicWriteFile(target, content, mode)
+	}
+
+	stop := make(chan struct{})
+	torn := make(chan string, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-committing
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// The call path the race detector reported: an idempotent retry
+			// classifies the in-flight transaction by snapshotting its receipt.
+			state, _, err := s.loadOrCreateBatchTransaction("isolated-key", fingerprint)
+			if err != nil {
+				continue
+			}
+			observed := state.snapshot()
+			if observed.Status == "committed" {
+				continue
+			}
+			for _, result := range observed.Results {
+				if result.Status == "applied" {
+					select {
+					case torn <- fmt.Sprintf("status %q carried an applied result", observed.Status):
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	receipt, err := s.runBatchTransaction(context.Background(), edits, "isolated-key")
+	close(stop)
+	wg.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Status != "committed" || receipt.GraphStatus != "fresh" {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+	select {
+	case message := <-torn:
+		t.Fatalf("reader observed a receipt the committer was still mutating: %s", message)
+	default:
+	}
+}
+
 func TestAtomicBatchPreflightFailureWritesNothing(t *testing.T) {
 	var scheduled atomic.Int64
 	s := newAtomicBatchTestServer(t, mutationTestWatcher{scheduled: &scheduled})

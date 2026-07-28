@@ -75,24 +75,40 @@ type batchTransactionState struct {
 	receipt     batchTransactionReceipt
 }
 
+// cloneBatchReceipt returns a receipt that shares no slice or map storage with
+// the original. Both state boundaries copy through it, so a published receipt is
+// owned solely by the state: a publisher stays free to keep mutating its own
+// copy — runBatchTransaction stamps Results[i].Status = "applied" in place after
+// publishing "prepared" — without writing into memory a concurrent reader holds.
+func cloneBatchReceipt(receipt batchTransactionReceipt) batchTransactionReceipt {
+	clone := receipt
+	clone.Results = append([]batchEditResult(nil), receipt.Results...)
+	clone.Files = append([]batchTransactionFile(nil), receipt.Files...)
+	if receipt.Summary != nil {
+		clone.Summary = make(map[string]int, len(receipt.Summary))
+		for key, value := range receipt.Summary {
+			clone.Summary[key] = value
+		}
+	}
+	if receipt.CompletedAt != nil {
+		completedAt := *receipt.CompletedAt
+		clone.CompletedAt = &completedAt
+	}
+	return clone
+}
+
 func (state *batchTransactionState) snapshot() batchTransactionReceipt {
 	state.mu.RLock()
 	defer state.mu.RUnlock()
-	copyReceipt := state.receipt
-	copyReceipt.Results = append([]batchEditResult(nil), state.receipt.Results...)
-	copyReceipt.Files = append([]batchTransactionFile(nil), state.receipt.Files...)
-	if state.receipt.Summary != nil {
-		copyReceipt.Summary = make(map[string]int, len(state.receipt.Summary))
-		for key, value := range state.receipt.Summary {
-			copyReceipt.Summary[key] = value
-		}
-	}
-	return copyReceipt
+	return cloneBatchReceipt(state.receipt)
 }
 
 func (state *batchTransactionState) publish(receipt batchTransactionReceipt, terminal bool) {
+	// Copy before taking the lock: the clone reads only the publisher's own
+	// storage, and the state must not retain a slice the publisher still holds.
+	stored := cloneBatchReceipt(receipt)
 	state.mu.Lock()
-	state.receipt = receipt
+	state.receipt = stored
 	state.mu.Unlock()
 	if terminal {
 		state.doneOnce.Do(func() { close(state.done) })
