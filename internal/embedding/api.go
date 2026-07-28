@@ -377,7 +377,7 @@ func (p *APIProvider) recoverOllamaSingleton(ctx context.Context, text string, i
 	}
 
 	return nil, fmt.Errorf(
-		"Ollama tokenizer runner failed for one input after %d recovery attempts: %w",
+		"ollama tokenizer runner failed for one input after %d recovery attempts: %w",
 		attempts, lastErr,
 	)
 }
