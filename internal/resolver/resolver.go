@@ -3420,6 +3420,14 @@ func (r *Resolver) resolveTypeOrFunc(e *graph.Edge, name string, stats *ResolveS
 
 	callerDir := r.dirFor(e.FilePath)
 
+	// PHP: narrow to the namespace the source actually names before ranking.
+	// `new User()` in a file that imports App\Models\User must not land on
+	// App\Entities\User just because it sorts better. See
+	// phpNarrowByTargetFQN — narrowing only, never a loss.
+	if narrowed := phpNarrowByTargetFQN(e, candidates); len(narrowed) > 0 {
+		candidates = narrowed
+	}
+
 	// Land the edge on the canonical type/interface definition (real,
 	// exported, top-level, non-test), preferring same-package only as a
 	// tiebreak. See bestTypeCandidate / resolveTypeRef for the rationale:
@@ -3472,6 +3480,16 @@ func (r *Resolver) resolveTypeRef(e *graph.Edge, name string, stats *ResolveStat
 		return
 	}
 	callerDir := r.dirFor(e.FilePath)
+
+	// PHP: the extractor recorded the fully-qualified name the source names,
+	// resolved through the file's `use` imports. Narrowing to the candidates
+	// declared under that namespace is the difference between `App\Models\User`
+	// and `App\Entities\User`, which the bare name cannot tell apart. Narrowing
+	// only — when no candidate matches, the full set is ranked as before, so
+	// this can sharpen a binding but never lose one.
+	if narrowed := phpNarrowByTargetFQN(e, candidates); len(narrowed) > 0 {
+		candidates = narrowed
+	}
 
 	// Land the edge on the canonical type/interface definition. The
 	// ranker prefers a real, exported, top-level, non-test definition

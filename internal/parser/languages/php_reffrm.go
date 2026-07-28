@@ -108,6 +108,11 @@ func emitPHPReferenceForms(root *sitter.Node, src []byte, filePath, fileID strin
 		if refContext != "" {
 			edge.Meta = map[string]any{"ref_context": refContext}
 		}
+		// Canonicalisation drops the namespace the source wrote
+		// (`\App\Core\Base` → `Base`). Carry the written form so the
+		// namespace pass can qualify the reference exactly instead of
+		// assuming the current namespace; it consumes and removes the key.
+		phpStampRawTypeRef(edge, rawType, canon)
 		result.Edges = append(result.Edges, edge)
 	}
 

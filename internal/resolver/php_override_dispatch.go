@@ -384,3 +384,45 @@ func phpEnsureMeta(e *graph.Edge) map[string]any {
 func phpTypedReceiverCaller(caller *graph.Node) bool {
 	return caller != nil && caller.Language == "php"
 }
+
+// phpNarrowByTargetFQN filters same-named type candidates down to the ones
+// declared under the namespace the reference actually names. The PHP extractor
+// stamps target_fqn by resolving the written name through the file's `use`
+// imports and its own namespace, which is precisely PHP's own class-name
+// resolution rule.
+//
+// Returns nil when the edge carries no fully-qualified target, when the caller
+// is not PHP, or when no candidate matches — callers treat nil as "keep the
+// candidates you had", so a reference into a vendor namespace the graph does
+// not hold degrades to the previous ranking instead of losing its edge.
+func phpNarrowByTargetFQN(e *graph.Edge, candidates []*graph.Node) []*graph.Node {
+	fqn := phpEdgeMetaString(e, "target_fqn")
+	if fqn == "" || len(candidates) < 2 {
+		return nil
+	}
+	ns := ""
+	if i := strings.LastIndex(fqn, `\`); i >= 0 {
+		ns = fqn[:i]
+	}
+	var out []*graph.Node
+	for _, c := range candidates {
+		if c == nil || c.Language != "php" {
+			continue
+		}
+		// A stamped QualName is the strongest match; fall back to the
+		// namespace, which every PHP declaration carries.
+		if c.QualName == fqn || (c.QualName == "" && phpNodeNamespace(c) == ns) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// phpNodeNamespace reads the namespace a PHP declaration lives in.
+func phpNodeNamespace(n *graph.Node) string {
+	if n == nil || n.Meta == nil {
+		return ""
+	}
+	s, _ := n.Meta[MetaScopeNamespace].(string)
+	return s
+}

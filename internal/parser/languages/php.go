@@ -72,6 +72,10 @@ func (e *PHPExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	captureLaravelEvents(result, root, filePath, src)
 	captureDrupalHooks(result, filePath)
 
+	// Namespace identity runs last so it sees every node and edge the passes
+	// above produced.
+	applyPHPNamespaceIdentity(root, src, result)
+
 	return result, nil
 }
 
@@ -634,14 +638,16 @@ func emitPHPTypeUseEdges(ownerID, typeText, filePath string, line int, result *p
 			continue
 		}
 		seen[t] = true
-		result.Edges = append(result.Edges, &graph.Edge{
+		edge := &graph.Edge{
 			From:     ownerID,
 			To:       "unresolved::" + t,
 			Kind:     graph.EdgeTypedAs,
 			FilePath: filePath,
 			Line:     line,
 			Origin:   graph.OriginASTInferred,
-		})
+		}
+		phpStampRawTypeRef(edge, atom, t)
+		result.Edges = append(result.Edges, edge)
 	}
 }
 
