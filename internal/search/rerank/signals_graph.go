@@ -132,7 +132,18 @@ func (CommunitySignal) Contribute(_ string, c *Candidate, ctx *Context) float64 
 		}
 	}
 
-	if ctx.RepoPrefix != "" && c.Node.RepoPrefix == ctx.RepoPrefix {
+	// Same-repo affinity, but only when the batch actually spans repos.
+	//
+	// This saturates the signal at 1.0, overriding the community score
+	// computed above. That is the point when candidates come from several
+	// repositories: the session's home repo should win. On a single-repo
+	// batch it is a constant — every first-party candidate is in the home
+	// repo — so it would flatten the one part of this signal that still
+	// discriminates. It used to be unreachable on a solo workspace because
+	// candidates carried no prefix at all and the ctx.RepoPrefix != ""
+	// guard failed; now they carry one, so the batch check is what keeps
+	// it from firing.
+	if ctx.multiRepoBatch && ctx.RepoPrefix != "" && c.Node.RepoPrefix == ctx.RepoPrefix {
 		if 1.0 > best {
 			best = 1.0
 		}

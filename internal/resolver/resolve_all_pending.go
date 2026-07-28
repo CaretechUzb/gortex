@@ -70,25 +70,37 @@ func pendingRepoPrefixes(r *Resolver, pending []*graph.Edge) ([]string, map[stri
 	if sources == nil {
 		sources = make(map[string]*graph.Node)
 	}
+	// Repo prefixes known to the store. Used to reject an ID-derived guess
+	// that names no repo: RepoPrefixOfID is a syntactic split on the first
+	// "/", so for an id it cannot confirm it happily yields a directory
+	// name ("internal/foo.go::Bar" → "internal"). Feeding that into the
+	// dep / provides / dir indexes below keys them on something nothing
+	// matches, and they come back empty with no error anywhere.
+	known := make(map[string]struct{})
+	if lister, ok := r.graph.(interface{ RepoPrefixes() []string }); ok {
+		for _, p := range lister.RepoPrefixes() {
+			known[p] = struct{}{}
+		}
+	}
+
 	set := make(map[string]struct{})
-	// Prefixes derived from the ID alone, with no hydrated node to confirm
-	// them. RepoPrefixOfID returns the leading path segment, so on an
-	// UNPREFIXED node id ("internal/foo.go::Bar") it yields "internal" —
-	// a directory name masquerading as a repo. Feeding that into the
-	// dep / provides / dir indexes below builds them under a key nothing
-	// matches, and they come back empty with no error anywhere. Track the
-	// unconfirmed set so the pass can say so instead of silently degrading.
-	var unconfirmed []string
+	var rejected []string
 	for _, edge := range pending {
 		if edge == nil {
 			continue
 		}
 		prefix := graph.RepoPrefixOfID(edge.From)
 		if source := sources[edge.From]; source != nil && source.RepoPrefix != "" {
+			// Confirmed by the hydrated node — authoritative.
 			prefix = source.RepoPrefix
-		} else if prefix != "" {
-			if _, dup := set[prefix]; !dup {
-				unconfirmed = append(unconfirmed, prefix)
+		} else if prefix != "" && len(known) > 0 {
+			if _, ok := known[prefix]; !ok {
+				// A guess that names no tracked repo. Drop it rather
+				// than scope the pass to a key nothing can match.
+				if _, dup := seenIn(rejected, prefix); !dup {
+					rejected = append(rejected, prefix)
+				}
+				continue
 			}
 		}
 		set[prefix] = struct{}{}
@@ -98,14 +110,27 @@ func pendingRepoPrefixes(r *Resolver, pending []*graph.Edge) ([]string, map[stri
 		prefixes = append(prefixes, prefix)
 	}
 	sort.Strings(prefixes)
-	if len(unconfirmed) > 0 && r != nil && r.logger != nil {
-		sort.Strings(unconfirmed)
-		r.logger.Warn("resolver: repo scope derived from unprefixed node ids — the dep/provides/dir indexes for this "+
-			"pass are keyed on leading path segments, not real repos, and will match nothing",
-			zap.Strings("derived_prefixes", unconfirmed),
+	if len(rejected) > 0 && r != nil && r.logger != nil {
+		sort.Strings(rejected)
+		r.logger.Warn("resolver: dropped ID-derived repo prefixes that name no tracked repo — "+
+			"these came from node ids the pass could not hydrate, and scoping to them "+
+			"would have keyed the dep/provides/dir indexes on a directory name",
+			zap.Strings("rejected_prefixes", rejected),
 			zap.Int("pending_edges", len(pending)))
 	}
 	return prefixes, sources
+}
+
+// seenIn reports whether v is already in xs. Linear, and deliberately so:
+// the caller's slice holds distinct rejected prefixes, which is a handful
+// even on a pathological page.
+func seenIn(xs []string, v string) (int, bool) {
+	for i, x := range xs {
+		if x == v {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 func pendingNeedsDepIndex(pending []*graph.Edge) bool {
