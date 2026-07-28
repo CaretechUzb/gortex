@@ -37,6 +37,8 @@ func Detect(relPath, lang string, nodes []*graph.Node, edges []*graph.Edge) int 
 		return detectASPNet(slashed, nodes) + detectDotNetFramework(nodes, edges)
 	case "java":
 		return detectJava(nodes, edges)
+	case "rust":
+		return detectRust(slashed, nodes, edges)
 	}
 	return 0
 }

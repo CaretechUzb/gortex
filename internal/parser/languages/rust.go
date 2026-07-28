@@ -49,6 +49,28 @@ const qRustAll = `
   (use_declaration
     argument: (_) @use.path) @use.def
 
+  (mod_item
+    name: (identifier) @mod.name) @mod.def
+
+  (type_item
+    name: (type_identifier) @alias.name) @alias.def
+
+  (union_item
+    name: (type_identifier) @union.name) @union.def
+
+  (macro_definition
+    name: (identifier) @macro.name) @macro.def
+
+  (extern_crate_declaration) @xcrate.def
+
+  (associated_type) @assoc.def
+
+  (ordered_field_declaration_list) @tuplefields.def
+
+  (impl_item) @impl.def
+
+  (macro_invocation) @minvoke.expr
+
   (let_declaration
     pattern: (identifier) @lvar.name
     type: (_)? @lvar.type
@@ -65,6 +87,25 @@ const qRustAll = `
     function: (field_expression
       value: (_) @callm.receiver
       field: (field_identifier) @callm.method)) @callm.expr
+
+  ; Turbofish call sites. A trailing ::<T> wraps the callee in a
+  ; generic_function node, so the three patterns above never match
+  ; xs.collect::<Vec<_>>() or parse::<u32>(s) — 5,301 such sites went
+  ; unrecorded across a 4,000-file sample of crate source.
+  (call_expression
+    function: (generic_function
+      function: (identifier) @callg.name)) @callg.expr
+
+  (call_expression
+    function: (generic_function
+      function: (scoped_identifier
+        name: (identifier) @callgp.name))) @callgp.expr
+
+  (call_expression
+    function: (generic_function
+      function: (field_expression
+        value: (_) @callgm.receiver
+        field: (field_identifier) @callgm.method))) @callgm.expr
 ]
 `
 
@@ -97,6 +138,14 @@ type rustDeferredCall struct {
 	// (graph.ReturnUsage* label), classified at capture time and
 	// stamped as edge Meta on the EdgeCalls emitted for this site.
 	returnUsage string
+	// viaMacro names the macro whose body the site was recovered from
+	// ("" for an ordinary call_expression). Recovered sites are token
+	// matches rather than parsed expressions, so consumers that want
+	// only grammar-certain edges can filter on it.
+	viaMacro string
+	// isMacro marks the site as a macro invocation rather than a
+	// function call, so it can bind to a `macro_rules!` node.
+	isMacro bool
 }
 
 // rustDeferredLet buffers a let_declaration for the post-pass type-env
@@ -141,6 +190,7 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	seen := make(map[string]bool)
 	annotationSeen := make(map[string]bool)
 	traitMethods := make(map[string][]string) // trait name → declared method names
+	containers := make(rustContainerIDs)      // container start row → minted node id
 
 	var calls []rustDeferredCall
 	var lets []rustDeferredLet
@@ -164,28 +214,84 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			funcDefs = append(funcDefs, rustFuncDef{node: sd.Node, owner: rustTraitMethodOwner(sd.Node, src), line: sd.StartLine + 1})
 
 		case m.Captures["struct.def"] != nil:
-			e.emitStruct(m, filePath, fileID, src, result, seen, annotationSeen)
+			e.emitStruct(m, filePath, fileID, src, result, seen, annotationSeen, containers)
 
 		case m.Captures["enum.def"] != nil:
-			e.emitEnum(m, filePath, fileID, src, result, seen, annotationSeen)
+			e.emitEnum(m, filePath, fileID, src, result, seen, annotationSeen, containers)
 
 		case m.Captures["trait.def"] != nil:
-			e.emitTrait(m, filePath, fileID, src, result, seen, annotationSeen, traitMethods)
+			e.emitTrait(m, filePath, fileID, src, result, seen, annotationSeen, traitMethods, containers)
 
 		case m.Captures["variant.def"] != nil:
-			e.emitVariant(m, filePath, src, result)
+			e.emitVariant(m, filePath, src, result, containers)
 
 		case m.Captures["field.def"] != nil:
-			e.emitField(m, filePath, src, result)
+			e.emitField(m, filePath, src, result, containers)
 
 		case m.Captures["const.def"] != nil:
-			e.emitNamed(m, "const", filePath, fileID, result, seen)
+			e.emitNamed(m, "const", filePath, fileID, src, result, seen, annotationSeen, containers)
 
 		case m.Captures["static.def"] != nil:
-			e.emitNamed(m, "static", filePath, fileID, result, seen)
+			e.emitNamed(m, "static", filePath, fileID, src, result, seen, annotationSeen, containers)
 
 		case m.Captures["use.def"] != nil:
 			e.emitUse(m, filePath, fileID, src, result)
+
+		case m.Captures["mod.def"] != nil:
+			emitRustModule(m.Captures["mod.def"].Node, m.Captures["mod.name"].Text,
+				filePath, fileID, src, result, seen, annotationSeen)
+
+		case m.Captures["alias.def"] != nil:
+			emitRustTypeAlias(m.Captures["alias.def"].Node, m.Captures["alias.name"].Text,
+				filePath, fileID, src, result, seen, annotationSeen)
+
+		case m.Captures["union.def"] != nil:
+			emitRustUnion(m.Captures["union.def"].Node, m.Captures["union.name"].Text,
+				filePath, fileID, src, result, seen, annotationSeen, containers)
+
+		case m.Captures["macro.def"] != nil:
+			emitRustMacroDef(m.Captures["macro.def"].Node, m.Captures["macro.name"].Text,
+				filePath, fileID, src, result, seen, annotationSeen)
+
+		case m.Captures["xcrate.def"] != nil:
+			emitRustExternCrate(m.Captures["xcrate.def"].Node, filePath, fileID, src, result)
+
+		case m.Captures["impl.def"] != nil:
+			emitRustImplBlock(m.Captures["impl.def"].Node, filePath, src, result, annotationSeen)
+
+		case m.Captures["tuplefields.def"] != nil:
+			emitRustTupleFields(m.Captures["tuplefields.def"].Node, filePath, src, result, seen, containers)
+
+		case m.Captures["assoc.def"] != nil:
+			emitRustAssociatedType(m.Captures["assoc.def"].Node, filePath, src, result, seen)
+
+		case m.Captures["minvoke.expr"] != nil:
+			inv := m.Captures["minvoke.expr"]
+			// The invocation itself is a use of the macro, so a
+			// `macro_rules!` definition gets incoming edges.
+			if mn := inv.Node.ChildByFieldName("macro"); mn != nil {
+				full := mn.Content(src)
+				c := rustDeferredCall{
+					name:    rustLastPathSegment(full),
+					line:    inv.StartLine + 1,
+					isMacro: true,
+				}
+				if strings.Contains(full, "::") {
+					c.path = full
+				}
+				calls = append(calls, c)
+			}
+			for _, mc := range scanRustMacroCalls(inv.Node, src) {
+				calls = append(calls, rustDeferredCall{
+					name:       mc.name,
+					receiver:   mc.receiver,
+					path:       mc.path,
+					line:       mc.line,
+					isSelector: mc.isSelector,
+					viaMacro:   mc.macroName,
+					isMacro:    mc.isMacro,
+				})
+			}
 
 		case m.Captures["lvar.def"] != nil:
 			d := rustDeferredLet{
@@ -241,6 +347,38 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			expr := m.Captures["call.expr"]
 			calls = append(calls, rustDeferredCall{
 				name:        m.Captures["call.name"].Text,
+				line:        expr.StartLine + 1,
+				returnUsage: classifyReturnUsage(expr.Node, src, rustReturnUsageSpec),
+			})
+
+		case m.Captures["callgm.expr"] != nil:
+			expr := m.Captures["callgm.expr"]
+			calls = append(calls, rustDeferredCall{
+				name:        m.Captures["callgm.method"].Text,
+				receiver:    m.Captures["callgm.receiver"].Text,
+				line:        expr.StartLine + 1,
+				isSelector:  true,
+				returnUsage: classifyReturnUsage(expr.Node, src, rustReturnUsageSpec),
+			})
+
+		case m.Captures["callgp.expr"] != nil:
+			expr := m.Captures["callgp.expr"]
+			c := rustDeferredCall{
+				name:        m.Captures["callgp.name"].Text,
+				line:        expr.StartLine + 1,
+				returnUsage: classifyReturnUsage(expr.Node, src, rustReturnUsageSpec),
+			}
+			if fn := expr.Node.ChildByFieldName("function"); fn != nil {
+				if inner := fn.ChildByFieldName("function"); inner != nil {
+					c.path = inner.Content(src)
+				}
+			}
+			calls = append(calls, c)
+
+		case m.Captures["callg.expr"] != nil:
+			expr := m.Captures["callg.expr"]
+			calls = append(calls, rustDeferredCall{
+				name:        m.Captures["callg.name"].Text,
 				line:        expr.StartLine + 1,
 				returnUsage: classifyReturnUsage(expr.Node, src, rustReturnUsageSpec),
 			})
@@ -363,6 +501,7 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 				edge.Meta["rust_recv_expr"] = c.receiver
 			}
 			stampReturnUsage(edge, c.returnUsage)
+			stampRustMacroOrigin(edge, c)
 			result.Edges = append(result.Edges, edge)
 			continue
 		}
@@ -377,6 +516,7 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			edge.Meta = map[string]any{"rust_path": c.path}
 		}
 		stampReturnUsage(edge, c.returnUsage)
+		stampRustMacroOrigin(edge, c)
 		result.Edges = append(result.Edges, edge)
 	}
 
@@ -439,10 +579,14 @@ func (e *RustExtractor) emitFunction(m parser.QueryResult, filePath, fileID stri
 			return
 		}
 		meta := map[string]any{
-			"receiver":   implType,
-			"signature":  "fn " + name + "(...)",
-			"visibility": visibility,
+			"receiver":  implType,
+			"signature": buildRustSignature(def.Node, name, src),
+			// A trait impl's method is callable by anyone who can name
+			// the trait, so an absent `pub` does not make it private.
+			"visibility": rustTraitImplVisibility(def.Node, src),
 		}
+		applyRustFnQualifiers(meta, def.Node, src)
+		applyRustScopeMod(meta, def.Node, src)
 		if doc != "" {
 			meta["doc"] = doc
 		}
@@ -499,11 +643,19 @@ func (e *RustExtractor) emitFunction(m parser.QueryResult, filePath, fileID stri
 		return
 	}
 	meta := map[string]any{
-		"signature":  "fn " + name + "(...)",
+		"signature":  buildRustSignature(def.Node, name, src),
 		"visibility": visibility,
 	}
+	applyRustFnQualifiers(meta, def.Node, src)
+	applyRustScopeMod(meta, def.Node, src)
 	if doc != "" {
 		meta["doc"] = doc
+	}
+	// Parity with the impl-method and trait-method paths, which have
+	// always stamped return_type — a free function is just as worth
+	// filtering by what it returns.
+	if rt := extractRustReturnType(def.Node, src); rt != "" {
+		meta["return_type"] = rt
 	}
 	if len(typeParams) > 0 {
 		meta["type_params"] = typeParams
@@ -926,13 +1078,14 @@ func rustRawReturnType(node *sitter.Node, src []byte) string {
 // extracted unambiguously.
 func rustErrorTypeFromResult(rt string) string {
 	rt = strings.TrimSpace(rt)
-	// Strip leading qualifier like `std::result::` to land on `Result`.
-	if i := strings.LastIndex(rt, "::"); i >= 0 {
-		head := rt[:i]
-		// Only strip qualifier when what follows starts with Result.
-		if strings.HasPrefix(rt[i+2:], "Result<") {
-			_ = head
-			rt = rt[i+2:]
+	// Strip a leading qualifier like `std::result::` to land on
+	// `Result`. Anchor on the "Result<" token rather than the last
+	// "::" in the string: for `std::result::Result<T, io::Error>` the
+	// last "::" sits inside the *error* type, so the old scan looked at
+	// "Error>", concluded there was no Result, and dropped the edge.
+	if i := strings.Index(rt, "Result<"); i > 0 {
+		if strings.HasSuffix(rt[:i], "::") {
+			rt = rt[i:]
 		}
 	}
 	if !strings.HasPrefix(rt, "Result<") {
@@ -940,25 +1093,11 @@ func rustErrorTypeFromResult(rt string) string {
 	}
 	inner := strings.TrimPrefix(rt, "Result<")
 	inner = strings.TrimSuffix(inner, ">")
-	// Split on the top-level comma — depth tracking for nested
-	// generics like Result<Vec<T>, MyError>.
-	depth := 0
-	parts := []string{}
-	start := 0
-	for i, r := range inner {
-		switch r {
-		case '<':
-			depth++
-		case '>':
-			depth--
-		case ',':
-			if depth == 0 {
-				parts = append(parts, inner[start:i])
-				start = i + 1
-			}
-		}
-	}
-	parts = append(parts, inner[start:])
+	// Split on the top-level comma. Depth tracking has to cover tuples
+	// and slices as well as generics: counting only <> made
+	// `Result<(u8, u16), MyError>` split inside the tuple and stamp a
+	// throws edge to the literal target "u16)".
+	parts := rustSplitTopLevel(inner, ',')
 	if len(parts) < 2 {
 		return ""
 	}
@@ -1001,6 +1140,13 @@ func rustCollectAttributes(item *sitter.Node) []*sitter.Node {
 	}
 	var out []*sitter.Node
 	for sib := item.PrevSibling(); sib != nil; sib = sib.PrevSibling() {
+		// A doc or explanatory comment interleaved with the attribute
+		// stack is ordinary Rust style. Breaking on it discarded every
+		// attribute above the comment — so a `#[derive(Serialize)]`
+		// separated from its struct by one `// note` line vanished.
+		if t := sib.Type(); t == "line_comment" || t == "block_comment" {
+			continue
+		}
 		if sib.Type() != "attribute_item" {
 			break
 		}
@@ -1032,11 +1178,26 @@ func emitRustAnnotationEdges(attrs []*sitter.Node, fromID, filePath string, src 
 		}
 		line := int(attr.StartPoint().Row) + 1
 		if name == "derive" && args != "" {
-			for _, t := range strings.Split(args, ",") {
+			for _, t := range rustSplitTopLevel(args, ',') {
 				traitName := strings.TrimSpace(t)
-				if traitName != "" {
-					EmitAnnotationEdge(fromID, "rust", traitName, "", filePath, line, result, seen)
+				if traitName == "" {
+					continue
 				}
+				EmitAnnotationEdge(fromID, "rust", traitName, "", filePath, line, result, seen)
+				// A derive really does implement the trait — it is how
+				// most Rust types acquire Debug, Clone, Serialize. The
+				// annotation edge alone left find_implementations and
+				// get_class_hierarchy blind to all of them.
+				base := rustTraitPathBaseName(traitName)
+				if base == "" {
+					continue
+				}
+				result.Edges = append(result.Edges, &graph.Edge{
+					From: fromID, To: "unresolved::" + base,
+					Kind: graph.EdgeImplements, FilePath: filePath, Line: line,
+					Origin: graph.OriginASTInferred,
+					Meta:   map[string]any{"via": "derive"},
+				})
 			}
 			continue
 		}
@@ -1107,6 +1268,11 @@ func (e *RustExtractor) recordTraitMethod(m parser.QueryResult, filePath, fileID
 	def := m.Captures["sig.def"]
 	traitNode := findEnclosingRustContainer(def.Node, "trait_item")
 	if traitNode == nil {
+		// Not a trait signature. The other producer of bodyless
+		// functions is an `extern "C" { .. }` block, whose declarations
+		// are the whole FFI surface of a -sys crate — 38,973 such
+		// blocks across the sample corpus produced no node at all.
+		e.emitForeignFunction(m, filePath, fileID, src, result, seen, annotationSeen)
 		return
 	}
 	traitName := rustDeclName(traitNode, src)
@@ -1121,15 +1287,67 @@ func (e *RustExtractor) recordTraitMethod(m parser.QueryResult, filePath, fileID
 	e.emitTraitMethodNode(traitName, name, def, filePath, fileID, src, result, seen, annotationSeen)
 }
 
-func (e *RustExtractor) emitStruct(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool) {
-	name := m.Captures["struct.name"].Text
-	def := m.Captures["struct.def"]
-	id := filePath + "::" + name
-	if seen[id] {
+// emitForeignFunction emits a node for a bodyless `fn` inside an
+// `extern "C" { .. }` block. These declare the foreign side of an FFI
+// boundary: they are the call targets of every unsafe call into C, and
+// an audit that asks "what does this crate link against" has nothing to
+// answer with unless they exist as nodes.
+func (e *RustExtractor) emitForeignFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool) {
+	def := m.Captures["sig.def"]
+	nameCap := m.Captures["sig.name"]
+	if def == nil || nameCap == nil {
 		return
 	}
-	seen[id] = true
+	abi, inForeign := rustForeignABI(def.Node, src)
+	if !inForeign {
+		return
+	}
+	name := nameCap.Text
+	startLine1 := def.StartLine + 1
+	id, ok := disambiguateID(seen, filePath+"::"+name, startLine1)
+	if !ok {
+		return
+	}
+	meta := map[string]any{
+		"signature":  buildRustSignature(def.Node, name, src),
+		"visibility": rustVisibility(def.Node, src),
+		"is_extern":  true,
+		"is_unsafe":  true,
+		"abi":        abi,
+		// The body lives in another language entirely, so mark the node
+		// as a declaration — a dead-code pass must not treat a missing
+		// body as a missing implementation.
+		"external": true,
+	}
+	applyRustScopeMod(meta, def.Node, src)
+	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+		meta["doc"] = doc
+	}
+	if rt := extractRustReturnType(def.Node, src); rt != "" {
+		meta["return_type"] = rt
+	}
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindFunction, Name: name,
+		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
+		Language: "rust", Meta: meta,
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
+	})
+	emitRustAnnotationEdges(rustCollectAttributes(def.Node), id, filePath, src, result, annotationSeen)
+	emitRustFunctionShape(id, def.Node, src, filePath, startLine1, result)
+}
+
+func (e *RustExtractor) emitStruct(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, containers rustContainerIDs) {
+	name := m.Captures["struct.name"].Text
+	def := m.Captures["struct.def"]
+	id, ok := disambiguateID(seen, filePath+"::"+name, def.StartLine+1)
+	if !ok {
+		return
+	}
+	containers.register(def.Node, id)
 	meta := map[string]any{"visibility": rustVisibility(def.Node, src)}
+	applyRustScopeMod(meta, def.Node, src)
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
 		meta["doc"] = doc
 	}
@@ -1147,19 +1365,20 @@ func (e *RustExtractor) emitStruct(m parser.QueryResult, filePath, fileID string
 	emitRustGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
 }
 
-func (e *RustExtractor) emitEnum(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool) {
+func (e *RustExtractor) emitEnum(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, containers rustContainerIDs) {
 	name := m.Captures["enum.name"].Text
 	def := m.Captures["enum.def"]
-	id := filePath + "::" + name
-	if seen[id] {
+	id, ok := disambiguateID(seen, filePath+"::"+name, def.StartLine+1)
+	if !ok {
 		return
 	}
-	seen[id] = true
+	containers.register(def.Node, id)
 	meta := map[string]any{
 		"kind":        "enum",
 		"type_flavor": "enum",
 		"visibility":  rustVisibility(def.Node, src),
 	}
+	applyRustScopeMod(meta, def.Node, src)
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
 		meta["doc"] = doc
 	}
@@ -1176,15 +1395,16 @@ func (e *RustExtractor) emitEnum(m parser.QueryResult, filePath, fileID string, 
 	emitRustGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
 }
 
-func (e *RustExtractor) emitTrait(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, traitMethods map[string][]string) {
+func (e *RustExtractor) emitTrait(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, traitMethods map[string][]string, containers rustContainerIDs) {
 	name := m.Captures["trait.name"].Text
 	def := m.Captures["trait.def"]
-	id := filePath + "::" + name
-	if seen[id] {
+	id, ok := disambiguateID(seen, filePath+"::"+name, def.StartLine+1)
+	if !ok {
 		return
 	}
-	seen[id] = true
+	containers.register(def.Node, id)
 	meta := map[string]any{"visibility": rustVisibility(def.Node, src)}
+	applyRustScopeMod(meta, def.Node, src)
 	if methods, ok := traitMethods[name]; ok {
 		meta["methods"] = methods
 	}
@@ -1222,7 +1442,7 @@ func (e *RustExtractor) emitTrait(m parser.QueryResult, filePath, fileID string,
 	emitRustGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
 }
 
-func (e *RustExtractor) emitVariant(m parser.QueryResult, filePath string, src []byte, result *parser.ExtractionResult) {
+func (e *RustExtractor) emitVariant(m parser.QueryResult, filePath string, src []byte, result *parser.ExtractionResult, containers rustContainerIDs) {
 	def := m.Captures["variant.def"]
 	enumNode := findEnclosingRustContainer(def.Node, "enum_item")
 	if enumNode == nil {
@@ -1233,7 +1453,7 @@ func (e *RustExtractor) emitVariant(m parser.QueryResult, filePath string, src [
 		return
 	}
 	variantName := m.Captures["variant.name"].Text
-	enumID := filePath + "::" + enumName
+	enumID := containers.lookup(enumNode, filePath+"::"+enumName)
 	variantID := enumID + "." + variantName
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: variantID, Kind: graph.KindVariable, Name: variantName,
@@ -1249,23 +1469,24 @@ func (e *RustExtractor) emitVariant(m parser.QueryResult, filePath string, src [
 	})
 }
 
-func (e *RustExtractor) emitField(m parser.QueryResult, filePath string, src []byte, result *parser.ExtractionResult) {
+func (e *RustExtractor) emitField(m parser.QueryResult, filePath string, src []byte, result *parser.ExtractionResult, containers rustContainerIDs) {
 	def := m.Captures["field.def"]
-	// Legacy only emitted struct fields. tree-sitter-rust also produces
-	// field_declaration nodes inside union_item; skip those.
-	structNode := findEnclosingRustContainer(def.Node, "struct_item")
-	if structNode == nil {
-		return
-	}
-	structName := rustDeclName(structNode, src)
-	if structName == "" {
+	// A named field can sit in a struct, a union, or a struct-shaped
+	// enum variant. Only the struct case used to be handled, so union
+	// fields and variant payloads were dropped outright.
+	ownerNode, ownerName, variant := rustFieldOwner(def.Node, src)
+	if ownerNode == nil || ownerName == "" {
 		return
 	}
 	fieldName := m.Captures["field.name"].Text
-	structID := filePath + "::" + structName
+	structID := containers.lookup(ownerNode, filePath+"::"+ownerName)
+	if variant != "" {
+		structID += "." + variant
+		ownerName += "." + variant
+	}
 	fieldID := structID + "." + fieldName
 	meta := map[string]any{
-		"receiver":   structName,
+		"receiver":   ownerName,
 		"visibility": rustVisibility(def.Node, src),
 	}
 	if t := def.Node.ChildByFieldName("type"); t != nil {
@@ -1291,26 +1512,69 @@ func (e *RustExtractor) emitField(m parser.QueryResult, filePath string, src []b
 // emitNamed handles const_item / static_item — they share the same
 // node shape so we collapse them into one helper that takes the
 // capture-name prefix.
-func (e *RustExtractor) emitNamed(m parser.QueryResult, kind, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+func (e *RustExtractor) emitNamed(m parser.QueryResult, kind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, containers rustContainerIDs) {
 	nameCap := m.Captures[kind+".name"]
 	def := m.Captures[kind+".def"]
 	if nameCap == nil || def == nil {
 		return
 	}
 	name := nameCap.Text
-	id := filePath + "::" + name
-	if seen[id] {
+	startLine1 := def.StartLine + 1
+
+	meta := map[string]any{
+		"decl":       kind,
+		"visibility": rustVisibility(def.Node, src),
+	}
+	applyRustScopeMod(meta, def.Node, src)
+	if t := def.Node.ChildByFieldName("type"); t != nil {
+		meta["declared_type"] = strings.TrimSpace(t.Content(src))
+	}
+	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+		meta["doc"] = doc
+	}
+
+	// An associated const belongs to its impl or trait. Emitting it at
+	// file scope meant `impl A { const MAX }` and `impl B { const MAX }`
+	// fought over one id and the loser was dropped entirely.
+	base := filePath + "::" + name
+	ownerNode, ownerName := rustAssociatedItemOwner(def.Node, src)
+	if ownerName != "" {
+		base = containers.lookup(ownerNode, filePath+"::"+ownerName) + "." + name
+		meta["receiver"] = ownerName
+	}
+	id, ok := disambiguateID(seen, base, startLine1)
+	if !ok {
 		return
 	}
-	seen[id] = true
+
+	// `static mut` is the one form that is actually mutable shared
+	// state, which is worth being able to query for on its own.
+	nodeKind := graph.KindConstant
+	if kind == "static" {
+		nodeKind = graph.KindVariable
+		for i, _nc := 0, int(def.Node.ChildCount()); i < _nc; i++ {
+			if c := def.Node.Child(i); c != nil && c.Content(src) == "mut" {
+				meta["mutable"] = true
+				break
+			}
+		}
+	}
+
 	result.Nodes = append(result.Nodes, &graph.Node{
-		ID: id, Kind: graph.KindVariable, Name: name,
-		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-		Language: "rust",
+		ID: id, Kind: nodeKind, Name: name,
+		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
+		Language: "rust", Meta: meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
-		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
 	})
+	if ownerName != "" {
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: id, To: containers.lookup(ownerNode, filePath+"::"+ownerName),
+			Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine1,
+		})
+	}
+	emitRustAnnotationEdges(rustCollectAttributes(def.Node), id, filePath, src, result, annotationSeen)
 }
 
 func (e *RustExtractor) emitUse(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
@@ -1370,7 +1634,55 @@ func rustImplMethodReceiver(fn *sitter.Node, src []byte) string {
 	if typeNode == nil {
 		return ""
 	}
-	return typeNode.Content(src)
+	return rustImplReceiverName(typeNode.Content(src))
+}
+
+// rustImplReceiverName reduces an impl target to the name a method node
+// can hang off. `impl Trait for &'a Buf` used to mint the method id
+// `<file>::&'a Buf.show` with a member_of edge to a node that never
+// exists; the same went for slice, array and raw-pointer impls.
+//
+// The generic spelling is deliberately preserved — `Replacer<M>.replace`
+// is the established id shape, and rebindRustLocalGenericMemberOwners
+// repairs the member_of target for it separately.
+func rustImplReceiverName(t string) string {
+	t = strings.TrimSpace(t)
+	for {
+		trimmed := t
+		// Reference: &T, &mut T, &'a T.
+		if strings.HasPrefix(trimmed, "&") {
+			trimmed = strings.TrimSpace(trimmed[1:])
+			if strings.HasPrefix(trimmed, "'") {
+				if i := strings.IndexAny(trimmed, " \t"); i > 0 {
+					trimmed = strings.TrimSpace(trimmed[i:])
+				}
+			}
+			trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "mut "))
+		}
+		// Raw pointer: *const T, *mut T.
+		if strings.HasPrefix(trimmed, "*") {
+			trimmed = strings.TrimSpace(trimmed[1:])
+			trimmed = strings.TrimPrefix(trimmed, "const ")
+			trimmed = strings.TrimPrefix(trimmed, "mut ")
+			trimmed = strings.TrimSpace(trimmed)
+		}
+		// Slice or array: [T] and [T; N].
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+			if parts := rustSplitTopLevel(inner, ';'); len(parts) > 0 {
+				inner = parts[0]
+			}
+			trimmed = strings.TrimSpace(inner)
+		}
+		if strings.HasPrefix(trimmed, "dyn ") {
+			trimmed = strings.TrimSpace(trimmed[4:])
+		}
+		if trimmed == t {
+			break
+		}
+		t = trimmed
+	}
+	return t
 }
 
 // rustTraitMethodOwner returns the trait name when fn is a direct member
@@ -1457,9 +1769,16 @@ func (e *RustExtractor) emitTraitMethodNode(traitName, name string, def *parser.
 	meta := map[string]any{
 		"receiver":   traitName,
 		"trait_decl": "true",
-		"signature":  "fn " + name + "(...)",
-		"visibility": rustVisibility(def.Node, src),
+		"signature":  buildRustSignature(def.Node, name, src),
+		// A trait member carries no visibility modifier of its own — it
+		// is exactly as reachable as the trait that declares it. Reading
+		// the absent modifier as "private" made every method of every
+		// public trait look private, which understates the public API
+		// surface and invites the dead-code pass to over-reach.
+		"visibility": rustEnclosingTraitVisibility(def.Node, src),
 	}
+	applyRustFnQualifiers(meta, def.Node, src)
+	applyRustScopeMod(meta, def.Node, src)
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
 		meta["doc"] = doc
 	}

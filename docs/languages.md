@@ -70,7 +70,7 @@ on interface nodes stores the expected method set for implementation matching.
 | TypeScript | Full | Full | Full | Full + Meta["methods"] | Full | Full | Full |
 | JavaScript | Full | Full | Full | - | Full | Full | Full |
 | Python | Full | Full | Full | - | Full | Full | Partial |
-| Rust | Full | Full (impl blocks) | Full | Full + Meta["methods"] | Full | Full | Full |
+| Rust | Full (+ `extern` blocks) | Full (impl blocks) | Structs/Enums/Unions/Aliases | Full + Meta["methods"] | Full (+ `extern crate`) | Full (+ macro bodies) | Consts/Statics |
 | Java | Full | Full | Full | Full + Meta["methods"] | Full | Full | Fields |
 | C# | Full | Full | Full | Full + Meta["methods"] | Full | Full | Fields |
 | Kotlin | Full | Full | Full | Full | Full | Full | Properties |
@@ -84,6 +84,27 @@ on interface nodes stores the expected method set for implementation matching.
 | Dart | Full | Full | Classes/Enums/Mixins/Extensions | Abstract interface | Full | Full | Full |
 | OCaml | Full | Full (class) | Types/Modules | Module types | open | Full | Full |
 | Lua | Full | Full (M.func/M:method) | - | - | require() | Full | Full |
+
+### Rust specifics
+
+`mod` is a namespace rather than a dependency, so it indexes as a package node
+(the C++/C# namespace precedent) and items inside it carry `Meta["scope_mod"]`
+while keeping flat ids. Two same-named types in one file both survive via the
+shared id-disambiguation helper.
+
+Rust does not parse macro arguments as expressions — every `macro_invocation`
+holds an opaque token tree — so calls written inside one are recovered by a
+token scan and labelled `Meta["via_macro"]`; filter on it to keep only
+grammar-certain call edges. Pattern and cfg-predicate macros (`matches!`,
+`cfg!`) are excluded, since their bodies hold patterns rather than calls. This
+matters most for tests, where the call a `#[test]` exercises normally sits
+inside an `assert*!`.
+
+Entry points are stamped for `fn main` in a Cargo binary target, async-runtime
+mains (`#[tokio::main]` and friends), test/bench harness attributes, and FFI
+exports (`#[no_mangle]`, `#[wasm_bindgen]`, pyo3, napi). Declarations inside an
+`extern` block are stamped `rust:ffi-import` — their body lives in another
+language, so a missing definition is not a missing implementation.
 
 Recent extraction refinements (each covered by a per-feature CI golden): Java `@interface` annotation types index as interfaces and participate in implementation matching; Java `new T(){…}` and C# `new { … }` anonymous classes/types become synthetic type nodes with an `extends` edge (to the instantiated type, or to `object` for C#); JS/TS arrow-valued class fields (`x = () => {…}`) are emitted as callable methods; JS/TS named imports emit one `imports` edge per binding (alias-aware via `Edge.Alias`) and barrel re-exports emit `re_exports` edges; JS/TS cross-file imports resolve onto the target file/symbol for relative specifiers (`./x`, `../x`) and for `tsconfig.json` / `jsconfig.json` `compilerOptions.paths` / `baseUrl` path aliases (`@/lib/x`), so callers / usages / blast-radius span aliased imports the same as relative ones; chained / factory-call receivers (`New().Build()`) carry an inferred `receiver_type`. See [features.md](features.md) and [architecture.md](architecture.md) for the edge semantics.
 

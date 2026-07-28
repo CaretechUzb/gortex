@@ -200,7 +200,7 @@ func emitRustParamNodes(ownerID string, params *sitter.Node, src []byte, filePat
 			Line:     startLine,
 			Origin:   graph.OriginASTResolved,
 		})
-		if canon := canonicalizeRustTypeRef(typeRaw); canon != "" && !isRustPrimitive(canon) {
+		for _, canon := range rustCanonicalTypeRefs(typeRaw) {
 			result.Edges = append(result.Edges, &graph.Edge{
 				From:     paramID,
 				To:       "unresolved::" + canon,
@@ -246,21 +246,21 @@ func emitRustReturnEdges(ownerID, returnText, filePath string, line int, result 
 	if returnText == "" {
 		return
 	}
-	t := canonicalizeRustTypeRef(returnText)
-	if t == "" || isRustPrimitive(t) {
-		return
+	// A tuple return names one type per slot, so each gets its own edge
+	// at its own position.
+	for i, t := range rustCanonicalTypeRefs(returnText) {
+		result.Edges = append(result.Edges, &graph.Edge{
+			From:     ownerID,
+			To:       "unresolved::" + t,
+			Kind:     graph.EdgeReturns,
+			FilePath: filePath,
+			Line:     line,
+			Origin:   graph.OriginASTInferred,
+			Meta: map[string]any{
+				"position": i,
+			},
+		})
 	}
-	result.Edges = append(result.Edges, &graph.Edge{
-		From:     ownerID,
-		To:       "unresolved::" + t,
-		Kind:     graph.EdgeReturns,
-		FilePath: filePath,
-		Line:     line,
-		Origin:   graph.OriginASTInferred,
-		Meta: map[string]any{
-			"position": 0,
-		},
-	})
 }
 
 // emitRustTypeUseEdges emits an EdgeTypedAs from ownerID to the named
@@ -276,18 +276,16 @@ func emitRustTypeUseEdges(ownerID, typeText, filePath string, line int, result *
 	if ownerID == "" || typeText == "" {
 		return
 	}
-	canon := canonicalizeRustTypeRef(typeText)
-	if canon == "" || isRustPrimitive(canon) {
-		return
+	for _, canon := range rustCanonicalTypeRefs(typeText) {
+		result.Edges = append(result.Edges, &graph.Edge{
+			From:     ownerID,
+			To:       "unresolved::" + canon,
+			Kind:     graph.EdgeTypedAs,
+			FilePath: filePath,
+			Line:     line,
+			Origin:   graph.OriginASTInferred,
+		})
 	}
-	result.Edges = append(result.Edges, &graph.Edge{
-		From:     ownerID,
-		To:       "unresolved::" + canon,
-		Kind:     graph.EdgeTypedAs,
-		FilePath: filePath,
-		Line:     line,
-		Origin:   graph.OriginASTInferred,
-	})
 }
 
 func emitRustGenericParamNodes(ownerID string, funcNode *sitter.Node, src []byte, filePath string, line int, result *parser.ExtractionResult) {
@@ -395,6 +393,21 @@ func canonicalizeRustTypeRef(t string) string {
 		t = strings.TrimSpace(t[4:])
 		return canonicalizeRustTypeRef(t)
 	}
+	// Raw pointers: *const T / *mut T.
+	if strings.HasPrefix(t, "*") {
+		t = strings.TrimSpace(t[1:])
+		t = strings.TrimPrefix(t, "const ")
+		t = strings.TrimPrefix(t, "mut ")
+		return canonicalizeRustTypeRef(strings.TrimSpace(t))
+	}
+	// Slices and arrays: [T] and [T; N] both carry T.
+	if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
+		inner := strings.TrimSpace(t[1 : len(t)-1])
+		if parts := rustSplitTopLevel(inner, ';'); len(parts) > 0 {
+			inner = parts[0]
+		}
+		return canonicalizeRustTypeRef(inner)
+	}
 	// Strip generic <...> tail.
 	if idx := strings.Index(t, "<"); idx > 0 {
 		t = t[:idx]
@@ -403,11 +416,49 @@ func canonicalizeRustTypeRef(t string) string {
 	for strings.HasPrefix(t, "(") && strings.HasSuffix(t, ")") {
 		t = strings.TrimSpace(t[1 : len(t)-1])
 	}
+	// A trait-object or bound list keeps only its first trait:
+	// `Error + Send + 'static` names Error.
+	if idx := strings.Index(t, "+"); idx > 0 {
+		t = strings.TrimSpace(t[:idx])
+	}
 	// Strip module path: crate::foo::Bar → Bar.
 	if idx := strings.LastIndex(t, "::"); idx >= 0 {
 		t = t[idx+2:]
 	}
-	return strings.TrimSpace(t)
+	t = strings.TrimSpace(t)
+	// Anything still carrying punctuation is not a type name. Emitting
+	// it anyway produced targets like "unresolved::u8, u16" and
+	// "unresolved::[Item]" — edges that can never resolve and that
+	// pollute every unresolved-reference report.
+	if !rustSimpleIdentifier(t) {
+		return ""
+	}
+	return t
+}
+
+// rustCanonicalTypeRefs expands a type expression into every named type
+// it mentions at the top level. A tuple names one type per element, so
+// `(Config, Sender)` must not be collapsed to a single garbage target
+// the way stripping its parens used to.
+func rustCanonicalTypeRefs(t string) []string {
+	t = strings.TrimSpace(t)
+	// Only a genuine tuple — parens wrapping a top-level comma list.
+	if strings.HasPrefix(t, "(") && strings.HasSuffix(t, ")") {
+		inner := strings.TrimSpace(t[1 : len(t)-1])
+		if parts := rustSplitTopLevel(inner, ','); len(parts) > 1 {
+			out := make([]string, 0, len(parts))
+			for _, p := range parts {
+				if canon := canonicalizeRustTypeRef(p); canon != "" && !isRustPrimitive(canon) {
+					out = append(out, canon)
+				}
+			}
+			return out
+		}
+	}
+	if canon := canonicalizeRustTypeRef(t); canon != "" && !isRustPrimitive(canon) {
+		return []string{canon}
+	}
+	return nil
 }
 
 func isRustPrimitive(t string) bool {
