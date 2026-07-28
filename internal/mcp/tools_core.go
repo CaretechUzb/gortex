@@ -524,6 +524,30 @@ func (s *Server) resolveRepoFilterArgs(repo, project, ref string, useActiveProje
 	return allowed, nil
 }
 
+// repoNarrowAdmits is the single definition of what a repo narrow does to a
+// node that carries no repo prefix. Every repo-scoping predicate in the
+// server must route through it.
+//
+// A prefix-less node is owned by no repository, so a narrow keyed on
+// registry prefixes can only ever exclude it vacuously. Admitting it is the
+// correct reading: synthetic global externals (dep::, external::, non-Go
+// module::) model third-party symbols visible from every repo by
+// construction, and workspace / project scoping still bounds them.
+//
+// The alternative — rejecting — does not narrow a result, it empties one.
+// That is exactly what the explore resilience ladder used to do: its
+// post-filter rejected prefix-less nodes while query/subgraph.go and
+// filterNodes admitted them, so a scoped session could relax into the
+// unscoped rungs and still be handed nothing.
+//
+// An empty or nil allow-set means "no narrow" and admits everything.
+func repoNarrowAdmits(allowed map[string]bool, repoPrefix string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	return repoPrefix == "" || allowed[repoPrefix]
+}
+
 // filterNodes returns only nodes whose RepoPrefix is in the allowed set.
 // If allowed is nil, returns the original slice unchanged.
 func filterNodes(nodes []*graph.Node, allowed map[string]bool) []*graph.Node {
@@ -532,8 +556,7 @@ func filterNodes(nodes []*graph.Node, allowed map[string]bool) []*graph.Node {
 	}
 	var out []*graph.Node
 	for _, n := range nodes {
-		// In single-repo mode, nodes have empty RepoPrefix — always include them.
-		if n.RepoPrefix == "" || allowed[n.RepoPrefix] {
+		if repoNarrowAdmits(allowed, n.RepoPrefix) {
 			out = append(out, n)
 		}
 	}
@@ -667,7 +690,7 @@ func filterSubGraph(sg *query.SubGraph, allowed map[string]bool) *query.SubGraph
 	nodeIDs := make(map[string]bool)
 	var nodes []*graph.Node
 	for _, n := range sg.Nodes {
-		if n.RepoPrefix == "" || allowed[n.RepoPrefix] {
+		if repoNarrowAdmits(allowed, n.RepoPrefix) {
 			nodes = append(nodes, n)
 			nodeIDs[n.ID] = true
 		}
