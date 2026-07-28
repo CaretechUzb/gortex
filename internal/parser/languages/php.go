@@ -23,8 +23,13 @@ func NewPHPExtractor() *PHPExtractor {
 func (e *PHPExtractor) Language() string { return "php" }
 func (e *PHPExtractor) Extensions() []string {
 	// Drupal module files (.module/.install/.inc/.theme/.profile/.engine) are
-	// PHP source whose function names follow the hook convention.
-	return []string{".php", ".module", ".install", ".inc", ".theme", ".profile", ".engine"}
+	// PHP source whose function names follow the hook convention. `.phtml` is
+	// the PHP-template extension Zend / Laminas / Magento use, and the grammar
+	// is the HTML-framing one, so a template parses as PHP already.
+	return []string{
+		".php", ".phtml",
+		".module", ".install", ".inc", ".theme", ".profile", ".engine",
+	}
 }
 
 func (e *PHPExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
@@ -749,6 +754,8 @@ func (e *PHPExtractor) extractFunction(
 	// receiver.
 	body := e.findChildByType(node, "compound_statement")
 	if body != nil {
+		cyc, cog, loop := BodyComplexityMetrics(body, "php")
+		ApplyComplexityMeta(meta, cyc, cog, loop)
 		e.extractCallSitesInScope(body, src, filePath, id, result,
 			newPHPReceiverEnv(node, src, "", nil))
 	}
@@ -819,6 +826,8 @@ func (e *PHPExtractor) extractMethod(
 	// type the resolver can bind exactly.
 	body := e.findChildByType(node, "compound_statement")
 	if body != nil {
+		cyc, cog, loop := BodyComplexityMetrics(body, "php")
+		ApplyComplexityMeta(meta, cyc, cog, loop)
 		e.extractCallSitesInScope(body, src, filePath, id, result,
 			newPHPReceiverEnv(node, src, className, props))
 	}
