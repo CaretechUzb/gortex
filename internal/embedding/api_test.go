@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -82,6 +83,276 @@ func TestAPIProvider_OllamaBoundsBatchSize(t *testing.T) {
 	for _, size := range batchSizes {
 		assert.LessOrEqual(t, size, maxOllamaBatchSize)
 	}
+}
+
+func TestAPIProvider_OllamaSplitsAfterTokenizerEOF(t *testing.T) {
+	texts := make([]string, 17)
+	ordinals := make(map[string]int, len(texts))
+	for i := range texts {
+		texts[i] = "input-" + strconv.Itoa(i)
+		ordinals[texts[i]] = i
+	}
+
+	var (
+		mu         sync.Mutex
+		batchSizes []int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ollamaRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		inputs, ok := req.Input.([]any)
+		if !ok {
+			http.Error(w, "expected input array", http.StatusBadRequest)
+			return
+		}
+
+		mu.Lock()
+		batchSizes = append(batchSizes, len(inputs))
+		mu.Unlock()
+
+		if len(inputs) > 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"Post \"http://127.0.0.1:51824/tokenize\": EOF"}`))
+			return
+		}
+
+		embeddings := make([][]float32, len(inputs))
+		for i, value := range inputs {
+			text, ok := value.(string)
+			if !ok {
+				http.Error(w, "expected string input", http.StatusBadRequest)
+				return
+			}
+			ordinal, ok := ordinals[text]
+			if !ok {
+				http.Error(w, "unexpected input", http.StatusBadRequest)
+				return
+			}
+			embeddings[i] = []float32{float32(ordinal)}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ollamaResponse{Embeddings: embeddings})
+	}))
+	defer srv.Close()
+
+	p := NewAPIProvider(srv.URL, "nomic-embed-text")
+	p.format = formatOllama
+	vecs, err := p.EmbedBatch(context.Background(), texts)
+	require.NoError(t, err)
+	require.Len(t, vecs, len(texts))
+	for i := range vecs {
+		assert.Equal(t, []float32{float32(i)}, vecs[i], "split responses must retain input order")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Len(t, batchSizes, 2*len(texts)-1,
+		"a backend accepting only singletons should exercise the complete bounded split tree")
+	assert.Equal(t, len(texts), countEqual(batchSizes, 1))
+}
+
+func TestAPIProvider_OllamaTokenizerEOFRetriesAreBounded(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"Post \"http://127.0.0.1:51824/tokenize\": EOF"}`))
+	}))
+	defer srv.Close()
+
+	p := NewAPIProvider(srv.URL, "nomic-embed-text")
+	p.format = formatOllama
+	texts := make([]string, maxOllamaBatchSize)
+	for i := range texts {
+		texts[i] = strings.Repeat("x", 16)
+	}
+	_, err := p.EmbedBatch(context.Background(), texts)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "after 3 recovery attempts")
+	assert.Equal(t, int32(10), atomic.LoadInt32(&calls),
+		"a persistent failure should follow one branch to a singleton, then stop after bounded retries")
+}
+
+func TestAPIProvider_OllamaRetriesSingletonBeforeShortening(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		received []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Input) != 1 {
+			http.Error(w, "invalid input", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		received = append(received, req.Input[0])
+		call := len(received)
+		mu.Unlock()
+
+		if call == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"Post \"http://127.0.0.1:51824/tokenize\": EOF"}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ollamaResponse{Embeddings: [][]float32{{1, 2}}})
+	}))
+	defer srv.Close()
+
+	p := NewAPIProvider(srv.URL, "nomic-embed-text")
+	p.format = formatOllama
+	vecs, err := p.EmbedBatch(context.Background(), []string{"unchanged retry"})
+	require.NoError(t, err)
+	assert.Equal(t, [][]float32{{1, 2}}, vecs)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"unchanged retry", "unchanged retry"}, received)
+}
+
+func TestAPIProvider_OllamaShortensCrashingSingleton(t *testing.T) {
+	text := strings.Repeat("x", 64)
+	var (
+		mu        sync.Mutex
+		byteSizes []int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Input) != 1 {
+			http.Error(w, "invalid input", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		byteSizes = append(byteSizes, len(req.Input[0]))
+		mu.Unlock()
+
+		if len(req.Input[0]) > 16 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"Post \"http://127.0.0.1:51824/tokenize\": EOF"}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ollamaResponse{Embeddings: [][]float32{{3, 4}}})
+	}))
+	defer srv.Close()
+
+	p := NewAPIProvider(srv.URL, "nomic-embed-text")
+	p.format = formatOllama
+	vecs, err := p.EmbedBatch(context.Background(), []string{text})
+	require.NoError(t, err)
+	assert.Equal(t, [][]float32{{3, 4}}, vecs)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []int{64, 64, 32, 16}, byteSizes)
+}
+
+func TestAPIProvider_OllamaDoesNotRetryUnrelated400(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"input validation failed with EOF"}`))
+	}))
+	defer srv.Close()
+
+	p := NewAPIProvider(srv.URL, "nomic-embed-text")
+	p.format = formatOllama
+	_, err := p.EmbedBatch(context.Background(), []string{"one", "two"})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "input validation failed")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&calls))
+}
+
+func TestAPIProvider_OllamaTokenizerEOFHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		cancel()
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"Post \"http://127.0.0.1:51824/tokenize\": EOF"}`))
+	}))
+	defer srv.Close()
+
+	p := NewAPIProvider(srv.URL, "nomic-embed-text")
+	p.format = formatOllama
+	_, err := p.EmbedBatch(ctx, []string{"one", "two"})
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&calls))
+}
+
+func TestIsOllamaRunnerTokenizerEOF(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "reported IPv4 runner failure",
+			err: &ollamaAPIError{
+				statusCode: http.StatusBadRequest,
+				body:       `{"error":"Post \"http://127.0.0.1:51824/tokenize\": EOF"}`,
+			},
+			want: true,
+		},
+		{
+			name: "localhost runner failure",
+			err: &ollamaAPIError{
+				statusCode: http.StatusBadRequest,
+				body:       `{"error":"Post \"http://localhost:51824/tokenize\": EOF"}`,
+			},
+			want: true,
+		},
+		{
+			name: "remote URL",
+			err: &ollamaAPIError{
+				statusCode: http.StatusBadRequest,
+				body:       `{"error":"Post \"http://example.com:51824/tokenize\": EOF"}`,
+			},
+		},
+		{
+			name: "other endpoint",
+			err: &ollamaAPIError{
+				statusCode: http.StatusBadRequest,
+				body:       `{"error":"Post \"http://127.0.0.1:51824/v1/embeddings\": EOF"}`,
+			},
+		},
+		{
+			name: "other status",
+			err: &ollamaAPIError{
+				statusCode: http.StatusInternalServerError,
+				body:       `{"error":"Post \"http://127.0.0.1:51824/tokenize\": EOF"}`,
+			},
+		},
+		{
+			name: "malformed body",
+			err:  &ollamaAPIError{statusCode: http.StatusBadRequest, body: "EOF"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isOllamaRunnerTokenizerEOF(tt.err))
+		})
+	}
+}
+
+func countEqual(values []int, want int) int {
+	count := 0
+	for _, value := range values {
+		if value == want {
+			count++
+		}
+	}
+	return count
 }
 
 // TestParseRetryAfter covers the delta-seconds Retry-After parser.
@@ -346,4 +617,8 @@ func TestTruncateEmbedInputs(t *testing.T) {
 
 	in := []string{"a", "b"}
 	assert.Equal(t, in, truncateEmbedInputs(in), "no oversize → same slice values")
+
+	multibyte := strings.Repeat("a", maxEmbedInputBytes-1) + "€"
+	assert.Equal(t, strings.Repeat("a", maxEmbedInputBytes-1), truncateEmbedInputs([]string{multibyte})[0],
+		"truncation must drop a partial UTF-8 rune")
 }
