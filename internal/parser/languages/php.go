@@ -974,19 +974,11 @@ func (e *PHPExtractor) extractRequireInclude(
 	}
 }
 
-func (e *PHPExtractor) extractCallSites(
-	node *sitter.Node, src []byte,
-	filePath string, callerID string,
-	result *parser.ExtractionResult,
-) {
-	e.extractCallSitesInScope(node, src, filePath, callerID, result, phpReceiverEnv{})
-}
-
-// extractCallSitesInScope is extractCallSites carrying the receiver-typing
-// environment of the function body being walked. Descending into a closure
-// derives a child scope rather than reusing the parent's, so a closure
-// parameter shadows an outer variable of the same name instead of inheriting
-// its type.
+// extractCallSitesInScope walks a function body emitting its call and access
+// edges, carrying the receiver-typing environment of that body. Descending into
+// a closure derives a child scope rather than reusing the parent's, so a
+// closure parameter shadows an outer variable of the same name instead of
+// inheriting its type.
 func (e *PHPExtractor) extractCallSitesInScope(
 	node *sitter.Node, src []byte,
 	filePath string, callerID string,

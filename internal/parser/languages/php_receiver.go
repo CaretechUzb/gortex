@@ -60,13 +60,6 @@ func (env phpReceiverEnv) lookupProp(name string) string {
 	return env.props[name]
 }
 
-// withClass returns a copy of env bound to a different enclosing class. Used
-// when descending into a `static` closure, which does not inherit $this.
-func (env phpReceiverEnv) withClass(class string) phpReceiverEnv {
-	env.class = class
-	return env
-}
-
 // childScope returns an environment for a nested closure / arrow function: the
 // enclosing bindings stay visible (PHP closures inherit $this, and `use (...)`
 // imports outer variables), extended with the closure's own parameters and
