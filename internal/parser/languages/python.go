@@ -29,8 +29,7 @@ const qPyAll = `
   (class_definition
     name: (identifier) @class.name) @class.def
 
-  (import_statement
-    name: (dotted_name) @import.name) @import.def
+  (import_statement) @import.def
 
   (import_from_statement
     module_name: (dotted_name) @import.module) @importfrom.def
@@ -62,6 +61,14 @@ const qPyAll = `
     left: (identifier) @uvar.name
     right: (call
       function: (identifier) @uvar.callee)) @uvar.def
+
+  (typed_parameter
+    (identifier) @tparam.name
+    type: (type) @tparam.type) @tparam.def
+
+  (typed_default_parameter
+    name: (identifier) @tdparam.name
+    type: (type) @tdparam.type) @tdparam.def
 ]
 `
 
@@ -100,6 +107,19 @@ type pyDeferredCall struct {
 	// (graph.ReturnUsage* label), classified at capture time and
 	// stamped as edge Meta on every EdgeCalls emitted for this site.
 	returnUsage string
+}
+
+// pyDeferredVar is a module-level `name = ...` binding held back until the
+// whole file has been walked, so real definitions win the shared id.
+// Values are copied out of the match rather than holding the
+// *parser.CapturedNode: EachMatch recycles those between matches, so a
+// retained pointer reads back another match's capture. Node pointers are
+// stable — they address the tree, which outlives the walk.
+type pyDeferredVar struct {
+	name      string
+	node      *sitter.Node
+	startLine int
+	endLine   int
 }
 
 // pyStringLiteralValue returns the unquoted value of a Python string-literal
@@ -147,11 +167,15 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	seen := make(map[string]bool)
 	annotationSeen := make(map[string]bool)
 	imports := map[string]string{} // alias → module path
-	tenv := make(typeEnv)
-	tenvHasExplicit := make(map[string]bool) // names with Tier 0 type, lock from Tier 1 overwrite
+	// Name→type bindings are collected flat here and bucketed into
+	// per-function scopes once the function ranges exist — the query walk
+	// runs in document order, before any function node is available to
+	// own them. See buildPyScopedTypeEnv.
+	var assigns []pyAssign
 
 	var calls []pyDeferredCall
 	var typeUses []deferredTypeUse
+	var topLevelVars []pyDeferredVar
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
@@ -211,43 +235,71 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 			calls = append(calls, dc)
 
 		case m.Captures["tvar.def"] != nil:
-			// Tier 0: explicit type annotation — overwrite tenv.
-			name := m.Captures["tvar.name"].Text
+			// Tier 0: a written annotation on an assignment.
 			rawType := m.Captures["tvar.type"].Text
-			typeName := normalizePyTypeName(rawType)
-			if typeName != "" {
-				tenv[name] = typeName
-				tenvHasExplicit[name] = true
+			line := m.Captures["tvar.def"].StartLine + 1
+			if typeName := normalizePyTypeName(rawType); typeName != "" {
+				assigns = append(assigns, pyAssign{
+					name: m.Captures["tvar.name"].Text, typeName: typeName,
+					line: line, explicit: true,
+				})
 			}
 			typeUses = append(typeUses, deferredTypeUse{
 				typeText: rawType,
-				line:     m.Captures["tvar.def"].StartLine + 1,
+				line:     line,
 			})
 
+		case m.Captures["tparam.def"] != nil:
+			// A written parameter annotation declares that parameter's
+			// type for the whole function body. Annotated parameters are
+			// the second-largest source of statically stated receivers
+			// after `self`, and were previously ignored entirely.
+			pyAppendParamAssign(&assigns, m.Captures["tparam.name"], m.Captures["tparam.type"])
+
+		case m.Captures["tdparam.def"] != nil:
+			pyAppendParamAssign(&assigns, m.Captures["tdparam.name"], m.Captures["tdparam.type"])
+
 		case m.Captures["uvar.def"] != nil:
-			// Tier 1: constructor-call inference. Only fills in keys
-			// that didn't get an explicit type — match the legacy
-			// `if _, exists := tenv[name]; exists { continue }` guard.
-			name := m.Captures["uvar.name"].Text
-			if tenvHasExplicit[name] {
-				return
-			}
-			if _, exists := tenv[name]; exists {
-				return
-			}
+			// Tier 1: constructor-call inference. Precedence against an
+			// explicit annotation, and the two-different-classes conflict
+			// rule, are both applied in buildPyScopedTypeEnv once the
+			// binding's scope is known.
 			callee := m.Captures["uvar.callee"].Text
 			if callee != "" && unicode.IsUpper(rune(callee[0])) {
-				tenv[name] = callee
+				assigns = append(assigns, pyAssign{
+					name: m.Captures["uvar.name"].Text, typeName: callee,
+					line: m.Captures["uvar.def"].StartLine + 1,
+				})
 			}
 
 		case m.Captures["var.def"] != nil:
-			e.emitTopLevelVar(m, filePath, fileID, result, seen)
+			if nameCap, defCap := m.Captures["var.name"], m.Captures["var.def"]; nameCap != nil && defCap != nil {
+				topLevelVars = append(topLevelVars, pyDeferredVar{
+					name:      nameCap.Text,
+					node:      defCap.Node,
+					startLine: defCap.StartLine,
+					endLine:   defCap.EndLine,
+				})
+			}
 		}
 	})
+
+	// Module-level variables are emitted only after the whole walk, so a
+	// class or function of the same name has already claimed the canonical
+	// `file::Name` id and the variable yields to it. `seen` is shared
+	// across all three emitters — emitting a variable inline would let
+	// `Config = load()` sitting above `class Config:` take the id and
+	// delete the class from the graph entirely.
+	for _, v := range topLevelVars {
+		e.emitTopLevelVar(v, filePath, fileID, result, seen)
+	}
 
 	// All function/method nodes have been emitted; map call sites to
 	// their enclosing definition.
 	funcRanges := buildFuncRanges(result)
+
+	// Bucket the name→type bindings into the scope that owns each one.
+	scoped := buildPyScopedTypeEnv(assigns, funcRanges)
 
 	// Type-use edges: a `x: T` annotation references type T. Attributed
 	// to the enclosing function (fallback: the file node) so find_usages(T)
@@ -266,9 +318,19 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	emitPythonReferenceForms(root, src, filePath, fileID, funcRanges, result)
 
 	for _, c := range calls {
-		callerID := findEnclosingFunc(funcRanges, c.line)
+		ownerFunc := findEnclosingFunc(funcRanges, c.line)
+		callerID := ownerFunc
 		if callerID == "" {
-			continue
+			// Module-level call (`app = Flask(__name__)`), a call in a
+			// class body (`name = Column(String)`), or a decorator
+			// expression — decorators sit above the `def` line, so they
+			// fall outside every function range. All three execute at
+			// import time and belong to the file. Attribute them to the
+			// file node rather than dropping them: dropping made every
+			// such callee invisible to find_usages / get_callers, which
+			// in Python costs the whole module-level configuration layer
+			// (routes, ORM columns, settings, registrations).
+			callerID = fileID
 		}
 		if c.dynShape != "" {
 			// Tagged dynamic-dispatch blind-spot call. The placeholder carries
@@ -306,10 +368,24 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 				From: callerID, To: "unresolved::*." + c.name,
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			}
-			if recvType, ok := tenv[c.receiver]; ok {
-				edge.Meta = map[string]any{"receiver_type": recvType}
-			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
-				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenv, result))
+			switch c.receiver {
+			case "self", "cls":
+				// `self`/`cls` name the class the call is written in.
+				// That is known exactly — no inference, no ambiguity —
+				// and it is the single most common typed receiver in
+				// idiomatic Python. It is also the shape an inherited
+				// method needs: the declaring class may be an ancestor,
+				// which a name-only match cannot find.
+				if cls := pyEnclosingClassName(c.expr, src); cls != "" {
+					edge.Meta = map[string]any{"receiver_type": cls}
+				}
+			default:
+				if recvType, ok := scoped.lookup(ownerFunc, c.receiver); ok {
+					edge.Meta = map[string]any{"receiver_type": recvType}
+				} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
+					stampFactoryChainReceiver(edge, c.receiver,
+						resolveChainType(c.receiver, scoped.flatten(ownerFunc), result))
+				}
 			}
 			stampReturnUsage(edge, c.returnUsage)
 			result.Edges = append(result.Edges, edge)
@@ -584,9 +660,96 @@ func (e *PythonExtractor) emitClass(m parser.QueryResult, filePath, fileID strin
 	// PEP-695 generic class declarations (`class Foo[T]:`) carry a
 	// `type_parameters` child same as functions; reuse the helper.
 	emitPyGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
+	// Base classes: `class A(B, mod.C, Generic[T])`.
+	pyEmitBaseClassEdges(def.Node, src, id, filePath, result)
 	// ORM model attribution: emit EdgeModelsTable when the class
 	// inherits from a known ORM base (SQLAlchemy / Django).
 	detectPythonORMModel(def.Node, src, id, name, filePath, result)
+}
+
+// pyEmitBaseClassEdges emits one EdgeExtends per declared base class.
+// Python was the only major language in the graph emitting no
+// inheritance edges at all — C#, Dart, Erlang, Go, Haskell, Java,
+// Kotlin, Pascal, PHP, R, Ruby, Rust and TypeScript all do — which left
+// every hierarchy-shaped query (relations hierarchy, override dispatch,
+// mixin reachability, abstract-base coverage) blind on Python. 83% of
+// classes in a 4,392-file corpus of Django, SQLAlchemy, pydantic, rich,
+// flask, httpx and requests declare at least one base: 21,290 of 25,576.
+//
+// The `superclasses` field is an argument_list, so besides real bases it
+// carries keyword arguments (`metaclass=ABCMeta`, PEP-487
+// `__init_subclass__` kwargs) and splats (`*bases`). Those are skipped
+// rather than minted as phantom parents — a wrong parent edge would
+// propagate through every inherited-member walk that trusts it.
+func pyEmitBaseClassEdges(classNode *sitter.Node, src []byte, typeID, filePath string, result *parser.ExtractionResult) {
+	if classNode == nil {
+		return
+	}
+	supers := classNode.ChildByFieldName("superclasses")
+	if supers == nil {
+		return
+	}
+	seen := map[string]bool{}
+	for i, _nc := 0, int(supers.NamedChildCount()); i < _nc; i++ {
+		arg := supers.NamedChild(i)
+		if arg == nil {
+			continue
+		}
+		name, qualified, generic := pyBaseClassName(arg, src)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		edge := &graph.Edge{
+			From: typeID, To: "unresolved::" + name, Kind: graph.EdgeExtends,
+			FilePath: filePath, Line: int(arg.StartPoint().Row) + 1,
+		}
+		meta := map[string]any{}
+		// Keep the written-out path (`models.Model`) alongside the bare
+		// name. 330 class names in the corpus are defined in more than one
+		// file, so the bare name alone cannot pick out the right base —
+		// the qualifier is what a resolver needs to disambiguate.
+		if qualified != "" && qualified != name {
+			meta["base_path"] = qualified
+		}
+		if generic {
+			meta["via"] = "generic"
+		}
+		if len(meta) > 0 {
+			edge.Meta = meta
+		}
+		result.Edges = append(result.Edges, edge)
+	}
+}
+
+// pyBaseClassName reduces one entry of a class's superclass list to its
+// bare base-class name, the written-out path, and whether it was written
+// as a generic subscript. Returns an empty name for entries that are not
+// base classes at all.
+func pyBaseClassName(arg *sitter.Node, src []byte) (name, qualified string, generic bool) {
+	switch arg.Type() {
+	case "identifier":
+		text := strings.TrimSpace(arg.Content(src))
+		return text, text, false
+	case "attribute":
+		// `models.Model`, `abc.ABC` — bind on the trailing name, the same
+		// reduction pyRaiseExceptionName uses for `raise mod.Err`.
+		text := strings.TrimSpace(arg.Content(src))
+		if i := strings.LastIndex(text, "."); i >= 0 {
+			return strings.TrimSpace(text[i+1:]), text, false
+		}
+		return text, text, false
+	case "subscript":
+		// `Generic[T]`, `Sequence[int]`, `Protocol[T]` — the base is the
+		// subscripted value; the type arguments are not parents.
+		if v := arg.ChildByFieldName("value"); v != nil {
+			n, q, _ := pyBaseClassName(v, src)
+			return n, q, true
+		}
+	}
+	// keyword_argument (`metaclass=…`), list_splat (`*bases`),
+	// dictionary_splat (`**kwargs`), call — not a base class.
+	return "", "", false
 }
 
 // pyDecoratorNodes returns the `decorator` AST nodes attached to a
@@ -698,32 +861,54 @@ func pyDocstringFromDef(defNode *sitter.Node, src []byte) string {
 // emitImport handles `import os`, `import os.path`, `import numpy as np`.
 // Walks the import_statement node to populate the alias→module map used
 // by attribute-call classification.
+//
+// The query deliberately matches `(import_statement)` with no `name:`
+// constraint. That field holds a `dotted_name` for `import os` but an
+// `aliased_import` for `import numpy as np`, so a pattern anchored on
+// `(dotted_name)` never fired for an aliased import — and `import x as y`
+// is how the entire numpy/pandas idiom is written. Walking the children
+// here covers both shapes, and every name in the statement.
 func (e *PythonExtractor) emitImport(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, imports map[string]string) {
-	name := m.Captures["import.name"]
-	pyEmitImportNode(filePath, fileID, name.Text, "", name.StartLine+1, result)
-	result.Edges = append(result.Edges, &graph.Edge{
-		From: fileID, To: "unresolved::import::" + name.Text,
-		Kind: graph.EdgeImports, FilePath: filePath, Line: name.StartLine + 1,
-	})
 	def, ok := m.Captures["import.def"]
 	if !ok || def.Node == nil {
 		return
 	}
 	stmt := def.Node
+	emit := func(modulePath, alias string, line int) {
+		if modulePath == "" {
+			return
+		}
+		pyEmitImportNode(filePath, fileID, modulePath, alias, line, result)
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileID, To: "unresolved::import::" + modulePath,
+			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
+		})
+	}
+	// One statement can bind several modules (`import os.path, numpy as
+	// np`), so every name child emits its own import node — the previous
+	// single-node-per-statement shape dropped the trailing names.
 	for i, _nc := 0, int(stmt.NamedChildCount()); i < _nc; i++ {
 		child := stmt.NamedChild(i)
+		if child == nil {
+			continue
+		}
+		line := int(child.StartPoint().Row) + 1
 		switch child.Type() {
 		case "dotted_name":
 			dotted := child.Content(src)
-			alias := dotted
+			bind := dotted
 			if j := strings.Index(dotted, "."); j >= 0 {
-				alias = dotted[:j] // `import os.path` binds `os`
+				bind = dotted[:j] // `import os.path` binds `os`
 			}
-			imports[alias] = dotted
+			imports[bind] = dotted
+			emit(dotted, "", line)
 		case "aliased_import":
 			var modulePath, alias string
-			for j, _nc := 0, int(child.NamedChildCount()); j < _nc; j++ {
+			for j, _jc := 0, int(child.NamedChildCount()); j < _jc; j++ {
 				cc := child.NamedChild(j)
+				if cc == nil {
+					continue
+				}
 				switch cc.Type() {
 				case "dotted_name":
 					modulePath = cc.Content(src)
@@ -731,9 +916,11 @@ func (e *PythonExtractor) emitImport(m parser.QueryResult, filePath, fileID stri
 					alias = cc.Content(src)
 				}
 			}
-			if alias != "" && modulePath != "" {
-				imports[alias] = modulePath
+			if alias == "" || modulePath == "" {
+				continue
 			}
+			imports[alias] = modulePath
+			emit(modulePath, alias, line)
 		}
 	}
 }
@@ -1027,10 +1214,22 @@ func pyImportDisplayName(path string) string {
 	return path
 }
 
-func (e *PythonExtractor) emitTopLevelVar(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
-	name := m.Captures["var.name"].Text
-	def := m.Captures["var.def"]
-	if def.Node == nil || def.Node.Parent() == nil || def.Node.Parent().Type() != "module" {
+func (e *PythonExtractor) emitTopLevelVar(v pyDeferredVar, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := v.name
+	if v.node == nil {
+		return
+	}
+	// An `assignment` is never a direct child of `module` — tree-sitter
+	// wraps every bare expression in an `expression_statement` first. The
+	// old check compared the assignment's immediate parent against
+	// "module", which no module-level assignment could ever satisfy, so
+	// this whole function was unreachable and Python emitted zero
+	// variable nodes for any file.
+	parent := v.node.Parent()
+	if parent != nil && parent.Type() == "expression_statement" {
+		parent = parent.Parent()
+	}
+	if parent == nil || parent.Type() != "module" {
 		return
 	}
 	id := filePath + "::" + name
@@ -1040,11 +1239,11 @@ func (e *PythonExtractor) emitTopLevelVar(m parser.QueryResult, filePath, fileID
 	seen[id] = true
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindVariable, Name: name,
-		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		FilePath: filePath, StartLine: v.startLine + 1, EndLine: v.endLine + 1,
 		Language: "python",
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
-		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: v.startLine + 1,
 	})
 }
 
