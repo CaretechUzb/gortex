@@ -800,37 +800,116 @@ func (e *PHPExtractor) extractUseImport(
 	filePath string, fileNode *graph.Node,
 	result *parser.ExtractionResult,
 ) {
-	// use_declaration children can be namespace_use_clause or namespace_name.
+	// A `use` statement carries an optional `function` / `const` qualifier and
+	// is either a flat list of clauses or a braced group sharing one prefix.
+	declKind := phpUseQualifier(node, src)
+
+	// Grouped form: `use App\Log\{Handler, Formatter as F, function make};`.
+	// The group's prefix is the declaration's own namespace_name; without
+	// joining the two, every imported member was dropped and only the shared
+	// prefix survived as an import.
+	if group := node.ChildByFieldName("body"); group != nil {
+		prefix := ""
+		if nn := e.findChildByType(node, "namespace_name"); nn != nil {
+			prefix = nn.Content(src)
+		}
+		for i, n := 0, int(group.NamedChildCount()); i < n; i++ {
+			clause := group.NamedChild(i)
+			if clause.Type() != "namespace_use_clause" {
+				continue
+			}
+			e.emitPHPUseClause(clause, src, filePath, fileNode, result, prefix, declKind)
+		}
+		return
+	}
+
 	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
 		child := node.NamedChild(i)
-		var importPath string
 		switch child.Type() {
 		case "namespace_use_clause":
-			nameNode := e.findChildByType(child, "qualified_name")
-			if nameNode == nil {
-				nameNode = e.findChildByType(child, "namespace_name")
-			}
-			if nameNode != nil {
-				importPath = nameNode.Content(src)
-			} else {
-				importPath = child.Content(src)
-			}
+			e.emitPHPUseClause(child, src, filePath, fileNode, result, "", declKind)
 		case "qualified_name", "namespace_name":
-			importPath = child.Content(src)
-		default:
-			continue
+			e.emitPHPImportEdge(child.Content(src), "", declKind, filePath, fileNode,
+				int(child.StartPoint().Row)+1, result)
 		}
-		if importPath == "" {
-			continue
-		}
-		importPath = strings.TrimLeft(importPath, "\\")
-		importPath = strings.ReplaceAll(importPath, "\\", "/")
-		line := int(child.StartPoint().Row) + 1
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: "unresolved::import::" + importPath,
-			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
-		})
 	}
+}
+
+// phpUseQualifier returns "function" / "const" for `use function ...` and
+// `use const ...`, or "" for an ordinary class import.
+func phpUseQualifier(node *sitter.Node, src []byte) string {
+	t := node.ChildByFieldName("type")
+	if t == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(t.Content(src)))
+}
+
+// emitPHPUseClause records one imported name, joining the group prefix when the
+// clause came from a braced group and preferring the clause's own
+// function/const qualifier over the declaration's.
+func (e *PHPExtractor) emitPHPUseClause(
+	clause *sitter.Node, src []byte,
+	filePath string, fileNode *graph.Node,
+	result *parser.ExtractionResult,
+	prefix, declKind string,
+) {
+	nameNode := e.findChildByType(clause, "qualified_name")
+	if nameNode == nil {
+		nameNode = e.findChildByType(clause, "namespace_name")
+	}
+	if nameNode == nil {
+		nameNode = e.findChildByType(clause, "name")
+	}
+	name := ""
+	if nameNode != nil {
+		name = nameNode.Content(src)
+	}
+	if name == "" {
+		return
+	}
+	if prefix != "" {
+		name = strings.TrimRight(prefix, `\`) + `\` + strings.TrimLeft(name, `\`)
+	}
+	kind := declKind
+	if k := phpUseQualifier(clause, src); k != "" {
+		kind = k
+	}
+	alias := ""
+	if a := clause.ChildByFieldName("alias"); a != nil {
+		alias = strings.TrimSpace(a.Content(src))
+	}
+	e.emitPHPImportEdge(name, alias, kind, filePath, fileNode,
+		int(clause.StartPoint().Row)+1, result)
+}
+
+// emitPHPImportEdge records one import. The target keeps the historical
+// slash-separated path shape; the imported symbol, its alias and whether the
+// import names a class, function or constant ride on the edge meta so a
+// consumer can recover the fully-qualified name the source wrote.
+func (e *PHPExtractor) emitPHPImportEdge(
+	name, alias, kind string,
+	filePath string, fileNode *graph.Node,
+	line int, result *parser.ExtractionResult,
+) {
+	name = strings.TrimLeft(strings.TrimSpace(name), `\`)
+	if name == "" {
+		return
+	}
+	edge := &graph.Edge{
+		From: fileNode.ID, To: "unresolved::import::" + strings.ReplaceAll(name, `\`, "/"),
+		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
+	}
+	meta := map[string]any{"fqn": name, "symbol": canonicalizePHPTypeRef(name)}
+	if alias != "" {
+		meta["alias"] = alias
+	}
+	switch kind {
+	case "function", "const":
+		meta["import_kind"] = kind
+	}
+	edge.Meta = meta
+	result.Edges = append(result.Edges, edge)
 }
 
 func (e *PHPExtractor) extractRequireInclude(
