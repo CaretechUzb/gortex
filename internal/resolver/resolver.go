@@ -3709,6 +3709,24 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		return
 	}
 
+	// PHP: a receiver typed as a class this repo DEFINES, whose type declares
+	// no method of this name, is calling something it INHERITS. The locality
+	// fallback below cannot express that — it picks by directory adjacency, and
+	// a PHP package is one directory holding every sibling implementation, so
+	// `$this->getFormatter()` inside AmqpHandler lands on whichever sibling
+	// handler sorts first rather than on the trait or interface that declares
+	// it. Leave the edge for resolvePHPOverrideDispatch, which walks the class
+	// hierarchy from the stated receiver and binds the nearest declaration.
+	//
+	// Gated on the receiver being in-repo: when it names a vendor class the
+	// hierarchy is not in the graph either, so withholding the locality pick
+	// would only lose the edge without anywhere better to put it.
+	if receiverType != "" && phpTypedReceiverCaller(callerNode) &&
+		r.hasInRepoType(phpBaseTypeName(receiverType), r.callerRepoPrefix(e)) {
+		stats.Unresolved++
+		return
+	}
+
 	// Locality fallback (replaces the previous alphabetical name-only
 	// pick). At this point candidates have survived Pass 0 — they all
 	// live in packages reachable from the caller. Prefer in this order:

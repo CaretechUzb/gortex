@@ -230,3 +230,184 @@ func TestResolvePHPOverrideDispatch_Idempotent(t *testing.T) {
 	assert.Equal(t, countAfterFirst, len(s.GetOutEdges(caller)),
 		"re-running the pass must not duplicate fan-out edges")
 }
+
+// A typed receiver whose class does not declare the method binds to the
+// nearest ancestor that does — the case a same-name match cannot see, because
+// the declaring class is not the receiver's class. `$this->getRecord()` inside
+// StreamHandlerTest resolves to TestCase.getRecord two levels up.
+func TestResolvePHPOverrideDispatch_ReceiverTypeBindsInheritedMethod(t *testing.T) {
+	var s graph.Store = graph.New()
+	base := "tests/TestCase.php"
+	mid := "tests/HandlerTestCase.php"
+	leaf := "tests/StreamHandlerTest.php"
+
+	phpType(s, base+"::TestCase", "TestCase", nil)
+	phpMethod(s, base+"::TestCase.getRecord", "getRecord", "TestCase")
+	phpType(s, mid+"::HandlerTestCase", "HandlerTestCase", map[string]any{MetaScopeParentClass: "TestCase"})
+	phpType(s, leaf+"::StreamHandlerTest", "StreamHandlerTest", map[string]any{MetaScopeParentClass: "HandlerTestCase"})
+
+	caller := leaf + "::StreamHandlerTest.testWrite"
+	phpMethod(s, caller, "testWrite", "StreamHandlerTest")
+	s.AddEdge(&graph.Edge{
+		From: caller, To: "unresolved::*.getRecord", Kind: graph.EdgeCalls,
+		FilePath: leaf, Line: 12,
+		Meta:     map[string]any{"receiver_type": "StreamHandlerTest"},
+	})
+
+	require.Positive(t, New(s).resolvePHPOverrideDispatch())
+
+	out := s.GetOutEdges(caller)
+	require.Len(t, out, 1)
+	assert.Equal(t, base+"::TestCase.getRecord", out[0].To)
+	assert.Equal(t, "receiver", out[0].Meta["dispatch"])
+	assert.Equal(t, graph.OriginASTInferred, out[0].Origin)
+}
+
+// The receiver's own class wins over an ancestor that also declares the
+// method — an override must not be attributed to the base it overrides.
+func TestResolvePHPOverrideDispatch_ReceiverTypePrefersOwnDeclaration(t *testing.T) {
+	var s graph.Store = graph.New()
+	base := "src/AbstractHandler.php"
+	leaf := "src/StreamHandler.php"
+	app := "src/app.php"
+
+	phpType(s, base+"::AbstractHandler", "AbstractHandler", nil)
+	phpMethod(s, base+"::AbstractHandler.handle", "handle", "AbstractHandler")
+	phpType(s, leaf+"::StreamHandler", "StreamHandler", map[string]any{MetaScopeParentClass: "AbstractHandler"})
+	phpMethod(s, leaf+"::StreamHandler.handle", "handle", "StreamHandler")
+
+	caller := app + "::run"
+	s.AddNode(&graph.Node{ID: caller, Kind: graph.KindFunction, Name: "run", FilePath: app, Language: "php"})
+	s.AddEdge(&graph.Edge{
+		From: caller, To: "unresolved::*.handle", Kind: graph.EdgeCalls,
+		FilePath: app, Line: 3,
+		Meta:     map[string]any{"receiver_type": "StreamHandler"},
+	})
+
+	require.Positive(t, New(s).resolvePHPOverrideDispatch())
+
+	out := s.GetOutEdges(caller)
+	require.Len(t, out, 1, "a typed receiver binds once — it must not fan out")
+	assert.Equal(t, leaf+"::StreamHandler.handle", out[0].To)
+}
+
+// A receiver typed as a class the graph does not know (a vendor dependency)
+// stays unresolved: fanning it out across every same-named method would
+// contradict the type the source states.
+func TestResolvePHPOverrideDispatch_UnknownReceiverTypeStaysUnresolved(t *testing.T) {
+	var s graph.Store = graph.New()
+	a := "src/A.php"
+	b := "src/B.php"
+	app := "src/app.php"
+
+	phpIface(s, a+"::Alpha", "Alpha", nil)
+	phpMethod(s, a+"::Alpha.send", "send", "Alpha")
+	phpType(s, b+"::Beta", "Beta", map[string]any{"scope_interfaces": "Alpha"})
+	phpMethod(s, b+"::Beta.send", "send", "Beta")
+
+	caller := app + "::run"
+	s.AddNode(&graph.Node{ID: caller, Kind: graph.KindFunction, Name: "run", FilePath: app, Language: "php"})
+	s.AddEdge(&graph.Edge{
+		From: caller, To: "unresolved::*.send", Kind: graph.EdgeCalls,
+		FilePath: app, Line: 7,
+		Meta:     map[string]any{"receiver_type": "GuzzleClient"},
+	})
+
+	New(s).resolvePHPOverrideDispatch()
+
+	out := s.GetOutEdges(caller)
+	require.Len(t, out, 1)
+	assert.Equal(t, "unresolved::*.send", out[0].To, "typed receiver must not fall back to a fan-out")
+}
+
+// A trait's method is reachable from the class that uses it: trait composition
+// is an extends-shaped edge, so the ancestor walk crosses it.
+func TestResolvePHPOverrideDispatch_ReceiverTypeBindsThroughTrait(t *testing.T) {
+	var s graph.Store = graph.New()
+	tr := "src/LogsMessages.php"
+	cls := "src/Worker.php"
+
+	phpType(s, tr+"::LogsMessages", "LogsMessages", nil)
+	phpMethod(s, tr+"::LogsMessages.logInfo", "logInfo", "LogsMessages")
+	phpType(s, cls+"::Worker", "Worker", nil)
+	s.AddEdge(&graph.Edge{From: cls + "::Worker", To: tr + "::LogsMessages", Kind: graph.EdgeExtends, FilePath: cls, Line: 2})
+
+	caller := cls + "::Worker.run"
+	phpMethod(s, caller, "run", "Worker")
+	s.AddEdge(&graph.Edge{
+		From: caller, To: "unresolved::*.logInfo", Kind: graph.EdgeCalls,
+		FilePath: cls, Line: 9,
+		Meta:     map[string]any{"receiver_type": "Worker"},
+	})
+
+	require.Positive(t, New(s).resolvePHPOverrideDispatch())
+	assert.Equal(t, tr+"::LogsMessages.logInfo", s.GetOutEdges(caller)[0].To)
+}
+
+// A PHP "package" is one directory holding every sibling implementation, so the
+// generic resolver's locality fallback — pick a same-directory method of the
+// same name — is exactly wrong for an inherited call: `$this->getFormatter()`
+// inside AmqpHandler landed on whichever sibling handler sorted first. When the
+// receiver names a type this repo defines, the locality pick is withheld so the
+// hierarchy walk can bind the declaration the receiver actually inherits.
+func TestResolveAll_PHPTypedReceiverBeatsSameDirectoryGuess(t *testing.T) {
+	var s graph.Store = graph.New()
+	dir := "src/Handler/"
+	iface := dir + "FormattableHandlerInterface.php"
+	sibling := dir + "BufferHandler.php"
+	caller := dir + "AmqpHandler.php"
+
+	phpIface(s, iface+"::FormattableHandlerInterface", "FormattableHandlerInterface", nil)
+	phpMethod(s, iface+"::FormattableHandlerInterface.getFormatter", "getFormatter", "FormattableHandlerInterface")
+	// A same-directory sibling declaring the same name — the decoy the
+	// locality fallback used to pick.
+	phpType(s, sibling+"::BufferHandler", "BufferHandler", nil)
+	phpMethod(s, sibling+"::BufferHandler.getFormatter", "getFormatter", "BufferHandler")
+
+	phpType(s, caller+"::AmqpHandler", "AmqpHandler",
+		map[string]any{"scope_interfaces": "FormattableHandlerInterface"})
+	callerID := caller + "::AmqpHandler.handleBatch"
+	phpMethod(s, callerID, "handleBatch", "AmqpHandler")
+	s.AddEdge(&graph.Edge{
+		From: callerID, To: "unresolved::*.getFormatter", Kind: graph.EdgeCalls,
+		FilePath: caller, Line: 124,
+		Meta:     map[string]any{"receiver_type": "AmqpHandler"},
+	})
+
+	New(s).ResolveAll()
+
+	out := s.GetOutEdges(callerID)
+	require.Len(t, out, 1)
+	assert.Equal(t, iface+"::FormattableHandlerInterface.getFormatter", out[0].To,
+		"an inherited call must bind through the hierarchy, not to a same-directory sibling")
+}
+
+// The gate is limited to receivers this repo defines. A vendor-typed receiver
+// has no hierarchy in the graph either, so withholding the locality pick would
+// lose the edge with nowhere better to put it.
+func TestResolveAll_PHPVendorTypedReceiverKeepsLocalityPick(t *testing.T) {
+	var s graph.Store = graph.New()
+	dir := "src/"
+	local := dir + "Local.php"
+	caller := dir + "Client.php"
+
+	phpType(s, local+"::Local", "Local", nil)
+	phpMethod(s, local+"::Local.send", "send", "Local")
+
+	phpType(s, caller+"::Client", "Client", nil)
+	callerID := caller + "::Client.run"
+	phpMethod(s, callerID, "run", "Client")
+	s.AddEdge(&graph.Edge{
+		From: callerID, To: "unresolved::*.send", Kind: graph.EdgeCalls,
+		FilePath: caller, Line: 9,
+		// GuzzleClient is not defined anywhere in this graph.
+		Meta: map[string]any{"receiver_type": "GuzzleClient"},
+	})
+
+	New(s).ResolveAll()
+
+	out := s.GetOutEdges(callerID)
+	require.Len(t, out, 1)
+	assert.Equal(t, local+"::Local.send", out[0].To,
+		"a vendor-typed receiver keeps the pre-existing locality behaviour")
+}

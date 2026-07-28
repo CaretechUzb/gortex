@@ -23,8 +23,13 @@ func NewPHPExtractor() *PHPExtractor {
 func (e *PHPExtractor) Language() string { return "php" }
 func (e *PHPExtractor) Extensions() []string {
 	// Drupal module files (.module/.install/.inc/.theme/.profile/.engine) are
-	// PHP source whose function names follow the hook convention.
-	return []string{".php", ".module", ".install", ".inc", ".theme", ".profile", ".engine"}
+	// PHP source whose function names follow the hook convention. `.phtml` is
+	// the PHP-template extension Zend / Laminas / Magento use, and the grammar
+	// is the HTML-framing one, so a template parses as PHP already.
+	return []string{
+		".php", ".phtml",
+		".module", ".install", ".inc", ".theme", ".profile", ".engine",
+	}
 }
 
 func (e *PHPExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
@@ -48,6 +53,10 @@ func (e *PHPExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 
 	// Walk the AST manually since PHP tree-sitter queries can be tricky.
 	e.walkNode(root, src, filePath, fileNode, result, seen, "")
+
+	// Statements outside every declaration — a script body, a bootstrap file,
+	// a routes file, a fixture returning a closure — belong to the file node.
+	e.extractPHPFileScope(root, src, filePath, fileNode, result)
 
 	captureValueRefCandidates(result, root, filePath, src)
 	captureFnValueCandidates(result, root, filePath, src)
@@ -93,8 +102,24 @@ func (e *PHPExtractor) walkNode(
 	case "function_definition":
 		e.extractFunction(node, src, filePath, fileNode, result, seen)
 
+	case "anonymous_class":
+		e.extractAnonymousClass(node, src, filePath, fileNode, result, seen)
+
 	case "namespace_use_declaration":
 		e.extractUseImport(node, src, filePath, fileNode, result)
+
+	case "const_declaration":
+		// Reached only at file scope: a class body's const_declaration is
+		// consumed by extractPhpMembers, which never recurses back here.
+		e.extractPHPFileConstant(node, src, filePath, fileNode, result, seen)
+		return
+
+	case "function_call_expression":
+		// `define('NAME', …)` is PHP's other constant declaration, and it is
+		// an ordinary call with no declaration node of its own.
+		e.extractPHPDefineConstant(node, src, filePath, fileNode, result, seen)
+		e.walkChildren(node, src, filePath, fileNode, result, seen, currentClass)
+		return
 
 	case "expression_statement":
 		// Check for require/include calls.
@@ -292,14 +317,25 @@ func (e *PHPExtractor) extractPhpMembers(
 	ownerName, ownerID string,
 ) map[string]*sitter.Node {
 	methodNodes := make(map[string]*sitter.Node)
+	// Property types are read once for the whole body so every method's call
+	// sites can type a `$this->prop->m()` receiver, including properties
+	// declared after the method that uses them.
+	props := phpClassPropertyTypes(body, src)
 	for i, _nc := 0, int(body.NamedChildCount()); i < _nc; i++ {
 		child := body.NamedChild(i)
 		switch child.Type() {
 		case "method_declaration":
+			name := ""
 			if n := e.findChildByFieldName(child, "name"); n != nil {
-				methodNodes[n.Content(src)] = child
+				name = n.Content(src)
+				methodNodes[name] = child
 			}
-			e.extractMethod(child, src, filePath, fileNode, result, seen, ownerName)
+			e.extractMethod(child, src, filePath, fileNode, result, seen, ownerName, props)
+			// PHP 8 promotion declares properties in the constructor's
+			// parameter list, so there is no property_declaration to find.
+			if strings.EqualFold(name, "__construct") {
+				e.extractPHPPromotedProperties(child, src, filePath, fileNode, result, seen, ownerName, ownerID)
+			}
 		case "const_declaration":
 			e.extractPhpClassConst(child, src, filePath, fileNode, result, seen, ownerName, ownerID)
 		case "property_declaration":
@@ -372,6 +408,12 @@ func (e *PHPExtractor) extractEnum(
 	meta := map[string]any{"visibility": VisibilityPublic, "kind": "enum", "type_flavor": "enum"}
 	if bt := e.findChildByType(node, "primitive_type"); bt != nil {
 		meta["backing_type"] = strings.TrimSpace(bt.Content(src))
+	}
+	// A PHP enum may implement interfaces. Without scope_interfaces the
+	// dispatch hierarchy cannot see the enum as an implementor, so a call
+	// through the interface never reaches the enum's methods.
+	if ifaces := phpTypeClauseNames(node, src, "class_interface_clause"); len(ifaces) > 0 {
+		meta["scope_interfaces"] = strings.Join(ifaces, ",")
 	}
 	if doc := ExtractDocAbove(src, int(node.StartPoint().Row), DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
@@ -456,6 +498,7 @@ func (e *PHPExtractor) extractPhpProperty(
 			continue
 		}
 		meta := map[string]any{"receiver": ownerName, "visibility": vis}
+		phpMemberModifiers(node, meta)
 		if propType != "" {
 			meta["field_type"] = propType
 		}
@@ -531,7 +574,7 @@ func phpPropertyType(node *sitter.Node, src []byte) string {
 	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
 		c := node.NamedChild(i)
 		switch c.Type() {
-		case "primitive_type", "named_type", "union_type", "nullable_type", "intersection_type", "optional_type", "qualified_name":
+		case "primitive_type", "named_type", "union_type", "disjunctive_normal_form_type", "intersection_type", "optional_type", "qualified_name":
 			return strings.TrimSpace(c.Content(src))
 		case "property_element":
 			return ""
@@ -581,7 +624,11 @@ func emitPHPTypeUseEdges(ownerID, typeText, filePath string, line int, result *p
 		return
 	}
 	seen := map[string]bool{}
-	for _, atom := range strings.FieldsFunc(typeText, func(r rune) bool { return r == '|' || r == '&' }) {
+	// PHP 8.2 disjunctive normal form — `(Countable&Traversable)|null` —
+	// parenthesises its intersection groups, so the parens are separators too;
+	// without them an atom reads as `(Countable` and mints a bogus target.
+	isSep := func(r rune) bool { return r == '|' || r == '&' || r == '(' || r == ')' }
+	for _, atom := range strings.FieldsFunc(typeText, isSep) {
 		t := canonicalizePHPTypeRef(atom)
 		if t == "" || phpBuiltinType(t) || seen[t] {
 			continue
@@ -613,7 +660,7 @@ func phpReturnType(node *sitter.Node, src []byte) string {
 			continue
 		}
 		switch t {
-		case "primitive_type", "named_type", "union_type", "nullable_type", "intersection_type", "optional_type", "qualified_name", "bottom_type":
+		case "primitive_type", "named_type", "union_type", "disjunctive_normal_form_type", "intersection_type", "optional_type", "qualified_name", "bottom_type":
 			return strings.TrimSpace(c.Content(src))
 		case "compound_statement":
 			return ""
@@ -653,7 +700,7 @@ func phpParameterType(node *sitter.Node, src []byte) string {
 	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
 		c := node.NamedChild(i)
 		switch c.Type() {
-		case "primitive_type", "named_type", "union_type", "nullable_type",
+		case "primitive_type", "named_type", "union_type", "disjunctive_normal_form_type",
 			"intersection_type", "optional_type", "qualified_name":
 			return strings.TrimSpace(c.Content(src))
 		case "variable_name":
@@ -705,10 +752,15 @@ func (e *PHPExtractor) extractFunction(
 	// Typed parameters → EdgeTypedAs usage edges on the function.
 	e.emitPHPParamTypeUseEdges(node, src, id, filePath, result)
 
-	// Extract call sites within the function body.
+	// Extract call sites within the function body. A free function has no
+	// `$this`, so only its typed parameters and local `new` bindings type a
+	// receiver.
 	body := e.findChildByType(node, "compound_statement")
 	if body != nil {
-		e.extractCallSites(body, src, filePath, id, result)
+		cyc, cog, loop := BodyComplexityMetrics(body, "php")
+		ApplyComplexityMeta(meta, cyc, cog, loop)
+		e.extractCallSitesInScope(body, src, filePath, id, result,
+			newPHPReceiverEnv(node, src, "", nil))
 	}
 }
 
@@ -716,7 +768,7 @@ func (e *PHPExtractor) extractMethod(
 	node *sitter.Node, src []byte,
 	filePath string, fileNode *graph.Node,
 	result *parser.ExtractionResult, seen map[string]bool,
-	className string,
+	className string, props map[string]string,
 ) {
 	nameNode := e.findChildByFieldName(node, "name")
 	if nameNode == nil {
@@ -738,6 +790,7 @@ func (e *PHPExtractor) extractMethod(
 		"scope_class": className,
 		"visibility":  phpMemberVisibility(node, src),
 	}
+	phpMemberModifiers(node, meta)
 	if doc := ExtractDocAbove(src, int(node.StartPoint().Row), DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
 	}
@@ -771,10 +824,15 @@ func (e *PHPExtractor) extractMethod(
 		From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine,
 	})
 
-	// Extract call sites within the method body.
+	// Extract call sites within the method body. `$this` is the declaring
+	// class, so every unqualified member call in the body carries a receiver
+	// type the resolver can bind exactly.
 	body := e.findChildByType(node, "compound_statement")
 	if body != nil {
-		e.extractCallSites(body, src, filePath, id, result)
+		cyc, cog, loop := BodyComplexityMetrics(body, "php")
+		ApplyComplexityMeta(meta, cyc, cog, loop)
+		e.extractCallSitesInScope(body, src, filePath, id, result,
+			newPHPReceiverEnv(node, src, className, props))
 	}
 }
 
@@ -783,37 +841,116 @@ func (e *PHPExtractor) extractUseImport(
 	filePath string, fileNode *graph.Node,
 	result *parser.ExtractionResult,
 ) {
-	// use_declaration children can be namespace_use_clause or namespace_name.
+	// A `use` statement carries an optional `function` / `const` qualifier and
+	// is either a flat list of clauses or a braced group sharing one prefix.
+	declKind := phpUseQualifier(node, src)
+
+	// Grouped form: `use App\Log\{Handler, Formatter as F, function make};`.
+	// The group's prefix is the declaration's own namespace_name; without
+	// joining the two, every imported member was dropped and only the shared
+	// prefix survived as an import.
+	if group := node.ChildByFieldName("body"); group != nil {
+		prefix := ""
+		if nn := e.findChildByType(node, "namespace_name"); nn != nil {
+			prefix = nn.Content(src)
+		}
+		for i, n := 0, int(group.NamedChildCount()); i < n; i++ {
+			clause := group.NamedChild(i)
+			if clause.Type() != "namespace_use_clause" {
+				continue
+			}
+			e.emitPHPUseClause(clause, src, filePath, fileNode, result, prefix, declKind)
+		}
+		return
+	}
+
 	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
 		child := node.NamedChild(i)
-		var importPath string
 		switch child.Type() {
 		case "namespace_use_clause":
-			nameNode := e.findChildByType(child, "qualified_name")
-			if nameNode == nil {
-				nameNode = e.findChildByType(child, "namespace_name")
-			}
-			if nameNode != nil {
-				importPath = nameNode.Content(src)
-			} else {
-				importPath = child.Content(src)
-			}
+			e.emitPHPUseClause(child, src, filePath, fileNode, result, "", declKind)
 		case "qualified_name", "namespace_name":
-			importPath = child.Content(src)
-		default:
-			continue
+			e.emitPHPImportEdge(child.Content(src), "", declKind, filePath, fileNode,
+				int(child.StartPoint().Row)+1, result)
 		}
-		if importPath == "" {
-			continue
-		}
-		importPath = strings.TrimLeft(importPath, "\\")
-		importPath = strings.ReplaceAll(importPath, "\\", "/")
-		line := int(child.StartPoint().Row) + 1
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: "unresolved::import::" + importPath,
-			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
-		})
 	}
+}
+
+// phpUseQualifier returns "function" / "const" for `use function ...` and
+// `use const ...`, or "" for an ordinary class import.
+func phpUseQualifier(node *sitter.Node, src []byte) string {
+	t := node.ChildByFieldName("type")
+	if t == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(t.Content(src)))
+}
+
+// emitPHPUseClause records one imported name, joining the group prefix when the
+// clause came from a braced group and preferring the clause's own
+// function/const qualifier over the declaration's.
+func (e *PHPExtractor) emitPHPUseClause(
+	clause *sitter.Node, src []byte,
+	filePath string, fileNode *graph.Node,
+	result *parser.ExtractionResult,
+	prefix, declKind string,
+) {
+	nameNode := e.findChildByType(clause, "qualified_name")
+	if nameNode == nil {
+		nameNode = e.findChildByType(clause, "namespace_name")
+	}
+	if nameNode == nil {
+		nameNode = e.findChildByType(clause, "name")
+	}
+	name := ""
+	if nameNode != nil {
+		name = nameNode.Content(src)
+	}
+	if name == "" {
+		return
+	}
+	if prefix != "" {
+		name = strings.TrimRight(prefix, `\`) + `\` + strings.TrimLeft(name, `\`)
+	}
+	kind := declKind
+	if k := phpUseQualifier(clause, src); k != "" {
+		kind = k
+	}
+	alias := ""
+	if a := clause.ChildByFieldName("alias"); a != nil {
+		alias = strings.TrimSpace(a.Content(src))
+	}
+	e.emitPHPImportEdge(name, alias, kind, filePath, fileNode,
+		int(clause.StartPoint().Row)+1, result)
+}
+
+// emitPHPImportEdge records one import. The target keeps the historical
+// slash-separated path shape; the imported symbol, its alias and whether the
+// import names a class, function or constant ride on the edge meta so a
+// consumer can recover the fully-qualified name the source wrote.
+func (e *PHPExtractor) emitPHPImportEdge(
+	name, alias, kind string,
+	filePath string, fileNode *graph.Node,
+	line int, result *parser.ExtractionResult,
+) {
+	name = strings.TrimLeft(strings.TrimSpace(name), `\`)
+	if name == "" {
+		return
+	}
+	edge := &graph.Edge{
+		From: fileNode.ID, To: "unresolved::import::" + strings.ReplaceAll(name, `\`, "/"),
+		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
+	}
+	meta := map[string]any{"fqn": name, "symbol": canonicalizePHPTypeRef(name)}
+	if alias != "" {
+		meta["alias"] = alias
+	}
+	switch kind {
+	case "function", "const":
+		meta["import_kind"] = kind
+	}
+	edge.Meta = meta
+	result.Edges = append(result.Edges, edge)
 }
 
 func (e *PHPExtractor) extractRequireInclude(
@@ -840,15 +977,51 @@ func (e *PHPExtractor) extractRequireInclude(
 	}
 }
 
-func (e *PHPExtractor) extractCallSites(
+// extractCallSitesInScope walks a function body emitting its call and access
+// edges, carrying the receiver-typing environment of that body. Descending into
+// a closure derives a child scope rather than reusing the parent's, so a
+// closure parameter shadows an outer variable of the same name instead of
+// inheriting its type.
+func (e *PHPExtractor) extractCallSitesInScope(
 	node *sitter.Node, src []byte,
 	filePath string, callerID string,
 	result *parser.ExtractionResult,
+	env phpReceiverEnv,
+) {
+	if node.Type() == "anonymous_function" || node.Type() == "anonymous_function_creation_expression" ||
+		node.Type() == "arrow_function" {
+		env = env.childScope(node, src)
+	}
+	e.emitPHPCallSiteEdges(node, src, filePath, callerID, result, env)
+
+	// Recurse into children.
+	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
+		child := node.NamedChild(i)
+		e.extractCallSitesInScope(child, src, filePath, callerID, result, env)
+	}
+}
+
+// emitPHPCallSiteEdges emits the call / access edges for one node, without
+// recursing. Both the in-function walker and the file-scope walker share it;
+// they differ only in where they stop descending.
+func (e *PHPExtractor) emitPHPCallSiteEdges(
+	node *sitter.Node, src []byte,
+	filePath string, callerID string,
+	result *parser.ExtractionResult,
+	env phpReceiverEnv,
 ) {
 	switch node.Type() {
+	case "member_access_expression", "nullsafe_member_access_expression",
+		"scoped_property_access_expression", "class_constant_access_expression":
+		e.emitPHPMemberAccess(node, src, filePath, callerID, result, env)
 	case "function_call_expression":
 		funcNode := node.ChildByFieldName("function")
-		if funcNode != nil {
+		// A computed callee — `$fn()`, `($this->resolver)()`, `$handlers[0]()`
+		// — names no symbol. Emitting its source text produced targets like
+		// `unresolved::*.$fn` and `unresolved::*.($this->resolver)` that can
+		// never bind (371 of them in guzzle alone); the receiver-typed member
+		// call inside such an expression is captured by the walk regardless.
+		if funcNode != nil && phpNamesACallee(funcNode) {
 			name := funcNode.Content(src)
 			if idx := strings.LastIndex(name, "\\"); idx >= 0 {
 				name = name[idx+1:]
@@ -859,9 +1032,9 @@ func (e *PHPExtractor) extractCallSites(
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
 			})
 		}
-	case "member_call_expression", "scoped_call_expression":
+	case "member_call_expression", "nullsafe_member_call_expression", "scoped_call_expression":
 		nameNode := node.ChildByFieldName("name")
-		if nameNode != nil {
+		if nameNode != nil && phpNamesACallee(nameNode) {
 			name := nameNode.Content(src)
 			line := int(node.StartPoint().Row) + 1
 			edge := &graph.Edge{
@@ -905,33 +1078,37 @@ func (e *PHPExtractor) extractCallSites(
 							}
 							edge.Meta["eloquent_model"] = model
 							edge.Meta["eloquent_method"] = name
+						} else if rt := env.phpScopeReceiverType(scope, src); rt != "" {
+							// `Utils::pick()` / `$cls::make()` — the scope names
+							// the class the static method belongs to, which is
+							// the strongest receiver evidence PHP offers.
+							edge.Meta = map[string]any{"receiver_type": rt}
 						}
 					}
 				}
 			}
-			// Chained-factory receiver: `make()->with()->build()` -- carry the
-			// receiver object (`->` normalised to `.`) so the shared walker can
-			// type the chain or preserve it for the graph-aware resolver.
-			if node.Type() == "member_call_expression" {
+			if node.Type() == "member_call_expression" || node.Type() == "nullsafe_member_call_expression" {
 				obj := node.ChildByFieldName("object")
 				if obj == nil && node.NamedChildCount() > 0 {
 					obj = node.NamedChild(0)
 				}
 				if obj != nil {
-					recv := strings.ReplaceAll(strings.TrimSpace(obj.Content(src)), "->", ".")
-					if strings.Contains(recv, ".") || strings.Contains(recv, "(") {
-						stampFactoryChainReceiver(edge, recv, resolveChainType(recv, nil, result))
+					if rt := env.phpReceiverTypeFor(obj, src); rt != "" {
+						edge.Meta = map[string]any{"receiver_type": rt}
+					} else {
+						// Chained-factory receiver: `make()->with()->build()` --
+						// carry the receiver object (`->` normalised to `.`) so
+						// the shared walker can type the chain or preserve it
+						// for the graph-aware resolver.
+						recv := strings.ReplaceAll(strings.TrimSpace(obj.Content(src)), "->", ".")
+						if strings.Contains(recv, ".") || strings.Contains(recv, "(") {
+							stampFactoryChainReceiver(edge, recv, resolveChainType(recv, env.vars, result))
+						}
 					}
 				}
 			}
 			result.Edges = append(result.Edges, edge)
 		}
-	}
-
-	// Recurse into children.
-	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
-		child := node.NamedChild(i)
-		e.extractCallSites(child, src, filePath, callerID, result)
 	}
 }
 

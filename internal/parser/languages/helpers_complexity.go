@@ -295,6 +295,46 @@ func MaxLoopDepth(body *sitter.Node, loopTypes, skipDescent map[string]bool) int
 	return maxDepth
 }
 
+// PHP. `else_if_clause` is a decision point but a bare `else_clause` is not;
+// a `match` arm (match_conditional_expression) counts like a switch case.
+// PHP has no separate ternary node — `conditional_expression` covers both
+// `?:` and the short form.
+var phpComplexityNodes = map[string]bool{
+	"if_statement":                 true,
+	"else_if_clause":               true,
+	"for_statement":                true,
+	"foreach_statement":            true,
+	"while_statement":              true,
+	"do_statement":                 true,
+	"case_statement":               true,
+	"match_conditional_expression": true,
+	"catch_clause":                 true,
+	"conditional_expression":       true,
+}
+
+var phpNestingTypes = map[string]bool{
+	"if_statement": true, "for_statement": true, "foreach_statement": true,
+	"while_statement": true, "do_statement": true, "switch_statement": true,
+	"match_expression": true, "catch_clause": true, "try_statement": true,
+}
+
+var phpLoopTypes = map[string]bool{
+	"for_statement": true, "foreach_statement": true,
+	"while_statement": true, "do_statement": true,
+}
+
+// A nested declaration owns its own metrics, so the walk stops there rather
+// than folding a closure's branches into its enclosing function's score.
+var phpComplexitySkip = map[string]bool{
+	"function_definition":                    true,
+	"method_declaration":                     true,
+	"anonymous_function":                     true,
+	"anonymous_function_creation_expression": true,
+	"arrow_function":                         true,
+	"class_declaration":                      true,
+	"anonymous_class":                        true,
+}
+
 // complexityTables bundles the per-language node-type tables so a single
 // stamping helper can serve every extractor.
 type complexityTables struct {
@@ -313,6 +353,7 @@ var langComplexityTables = map[string]complexityTables{
 	"python":     {pyComplexityNodes, pyNestingTypes, pyLoopTypes, pyComplexitySkip},
 	"rust":       {rustComplexityNodes, rustNestingTypes, rustLoopTypes, rustComplexitySkip},
 	"java":       {javaComplexityNodes, javaNestingTypes, javaLoopTypes, javaComplexitySkip},
+	"php":        {phpComplexityNodes, phpNestingTypes, phpLoopTypes, phpComplexitySkip},
 }
 
 // StampFunctionMetrics computes cyclomatic + cognitive complexity and max

@@ -47,9 +47,11 @@ class Svc {
 	}
 }
 
-// TestPHPFacade_NonFacadeStaticCallUnstamped pins that an ordinary static call
-// to a class that is not a registered facade carries no receiver_type hint.
-func TestPHPFacade_NonFacadeStaticCallUnstamped(t *testing.T) {
+// TestPHPFacade_NonFacadeStaticCallUsesScopeClass pins that an ordinary static
+// call to a class that is not a registered facade is typed by its own scope —
+// `Helper::frobnicate()` receives `Helper`, not a facade's backing class and
+// not the empty hint the facade pass leaves behind.
+func TestPHPFacade_NonFacadeStaticCallUsesScopeClass(t *testing.T) {
 	src := []byte(`<?php
 class Svc {
     public function run() {
@@ -65,8 +67,13 @@ class Svc {
 	if !found {
 		t.Fatal("no Helper::frobnicate() call edge emitted")
 	}
-	if ok && rt != "" {
-		t.Errorf("non-facade static call must not stamp receiver_type, got %q", rt)
+	if !ok || rt != "Helper" {
+		t.Errorf("non-facade static call receiver_type = %q (ok=%v), want Helper", rt, ok)
+	}
+	for _, e := range res.Edges {
+		if e.Meta != nil && e.Meta["facade"] != nil {
+			t.Errorf("non-facade static call must not carry facade meta: %v", e.Meta)
+		}
 	}
 }
 
