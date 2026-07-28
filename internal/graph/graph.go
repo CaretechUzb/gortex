@@ -3821,9 +3821,15 @@ func (g *Graph) Stats() GraphStats {
 }
 
 // GetRepoNodes returns all nodes belonging to the exact repository prefix.
-// Non-empty prefixes use each shard's compact byRepo bucket. Empty prefix is
-// the single-repository/shadow-graph case and scans shard maps directly so the
-// graph does not duplicate its entire node set in byRepo.
+// Non-empty prefixes use each shard's compact byRepo bucket.
+//
+// THE EMPTY-PREFIX BRANCH IS LIVE — do not delete it as single-repo-mode
+// residue. The daemon always prefixes now, but the STANDALONE Indexer
+// (indexer.New with no SetRepoPrefix) does not, and it backs `gortex init`,
+// the eval harnesses, bench, pkg/gortex's public API and serverstack's
+// embedded indexer. In that shape the whole graph is one unprefixed repo, so
+// this scans shard maps directly rather than duplicating every node into a
+// byRepo bucket. See TestStandaloneIndexerKeepsTheEmptyPrefix.
 func (g *Graph) GetRepoNodes(repoPrefix string) []*Node {
 	var out []*Node
 	for _, s := range g.shards {
@@ -3846,9 +3852,8 @@ func (g *Graph) GetRepoNodes(repoPrefix string) []*Node {
 }
 
 // GetRepoNodesByLanguage is the exact compound-predicate sibling of
-// GetRepoNodes. An empty prefix scans each shard's native node map directly,
-// avoiding both an AllNodes materialization and a duplicate byRepo index over
-// every single-repository shadow node.
+// GetRepoNodes, and its empty-prefix branch is live for the same reason —
+// the standalone Indexer. See GetRepoNodes.
 func (g *Graph) GetRepoNodesByLanguage(repoPrefix, language string) []*Node {
 	if language == "" {
 		return nil

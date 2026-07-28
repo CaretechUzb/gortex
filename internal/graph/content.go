@@ -70,9 +70,10 @@ func (g *Graph) GetRepoNonContentNodes(repoPrefix string) []*Node {
 
 // GetRepoContentNodes implements ContentNodeReader with the EXACT repository
 // predicate — unlike its GetRepoNonContentNodes sibling above, "" here selects
-// only nodes whose own RepoPrefix is empty, not every repo. Empty-prefix nodes
-// live outside byRepo, so that case reads shard maps directly and retains only
-// CONTENT sections.
+// only nodes whose own RepoPrefix is empty, not every repo. That branch is
+// live: the standalone Indexer never sets a prefix (see GetRepoNodes).
+// Empty-prefix nodes live outside byRepo, so the case reads shard maps
+// directly and retains only CONTENT sections.
 func (g *Graph) GetRepoContentNodes(repoPrefix string) []*Node {
 	var out []*Node
 	for _, s := range g.shards {
