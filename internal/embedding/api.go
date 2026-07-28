@@ -32,6 +32,13 @@ const maxRetryAfterWait = 60 * time.Second
 // generated symbols.
 const maxEmbedInputBytes = 8000
 
+// maxOllamaBatchSize bounds the number of inputs sent in one /api/embed
+// request. Ollama fans an input array out internally, so forwarding the
+// indexer's 500-item chunks unchanged can overwhelm or crash its runner.
+// Keeping the provider-level cap here also protects direct EmbedBatch
+// callers while preserving the indexer's configured outer concurrency.
+const maxOllamaBatchSize = 64
+
 // truncateEmbedInputs head-truncates any input over the byte cap, on a
 // UTF-8 rune boundary so the JSON payload stays valid. Returns the same
 // slice when nothing needed trimming (the common case).
@@ -257,8 +264,9 @@ func parseRetryAfter(v string) time.Duration {
 // --- Ollama API ---
 
 type ollamaRequest struct {
-	Model string `json:"model"`
-	Input any    `json:"input"` // string or []string
+	Model    string `json:"model"`
+	Input    any    `json:"input"` // string or []string
+	Truncate bool   `json:"truncate"`
 }
 
 type ollamaResponse struct {
@@ -266,9 +274,27 @@ type ollamaResponse struct {
 }
 
 func (p *APIProvider) embedOllama(ctx context.Context, texts []string) ([][]float32, error) {
+	if len(texts) <= maxOllamaBatchSize {
+		return p.embedOllamaOnce(ctx, texts)
+	}
+
+	vecs := make([][]float32, 0, len(texts))
+	for start := 0; start < len(texts); start += maxOllamaBatchSize {
+		end := min(start+maxOllamaBatchSize, len(texts))
+		batch, err := p.embedOllamaOnce(ctx, texts[start:end])
+		if err != nil {
+			return nil, err
+		}
+		vecs = append(vecs, batch...)
+	}
+	return vecs, nil
+}
+
+func (p *APIProvider) embedOllamaOnce(ctx context.Context, texts []string) ([][]float32, error) {
 	reqBody := ollamaRequest{
-		Model: p.model,
-		Input: truncateEmbedInputs(texts),
+		Model:    p.model,
+		Input:    truncateEmbedInputs(texts),
+		Truncate: true,
 	}
 
 	body, err := json.Marshal(reqBody)

@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +21,67 @@ import (
 func TestAPIProvider_Concurrent(t *testing.T) {
 	p := NewAPIProvider("http://localhost:11434", "")
 	assert.True(t, p.Concurrent(), "the API provider must opt into concurrent embedding")
+}
+
+func TestAPIProvider_OllamaBoundsBatchSize(t *testing.T) {
+	texts := make([]string, 500)
+	ordinals := make(map[string]int, len(texts))
+	for i := range texts {
+		texts[i] = "input-" + strconv.Itoa(i)
+		ordinals[texts[i]] = i
+	}
+
+	var (
+		mu         sync.Mutex
+		batchSizes []int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input    []string `json:"input"`
+			Truncate bool     `json:"truncate"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !req.Truncate {
+			http.Error(w, "truncate must be explicit", http.StatusBadRequest)
+			return
+		}
+
+		mu.Lock()
+		batchSizes = append(batchSizes, len(req.Input))
+		mu.Unlock()
+
+		embeddings := make([][]float32, len(req.Input))
+		for i, text := range req.Input {
+			ordinal, ok := ordinals[text]
+			if !ok {
+				http.Error(w, "unexpected input", http.StatusBadRequest)
+				return
+			}
+			embeddings[i] = []float32{float32(ordinal)}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ollamaResponse{Embeddings: embeddings})
+	}))
+	defer srv.Close()
+
+	p := NewAPIProvider(srv.URL, "nomic-embed-text")
+	p.format = formatOllama
+	vecs, err := p.EmbedBatch(context.Background(), texts)
+	require.NoError(t, err)
+	require.Len(t, vecs, len(texts))
+	for i := range vecs {
+		assert.Equal(t, []float32{float32(i)}, vecs[i], "output order must match input order")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, batchSizes, 8, "500 inputs should be sent as seven full batches and one remainder")
+	for _, size := range batchSizes {
+		assert.LessOrEqual(t, size, maxOllamaBatchSize)
+	}
 }
 
 // TestParseRetryAfter covers the delta-seconds Retry-After parser.
