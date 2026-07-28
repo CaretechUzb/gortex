@@ -30,28 +30,55 @@ type AuditSymbolScore struct {
 	Line  int     `json:"line"`
 }
 
+// auditHealthKinds is the callable kind set the complexity axis scores.
+// Declared once so the scoped-node pushdown and ComputeAuditReport's
+// defensive re-check agree on what "callable" means.
+var auditHealthKinds = []graph.NodeKind{graph.KindFunction, graph.KindMethod}
+
 func (s *Server) registerAuditTool() {
 	s.addTool(
 		mcp.NewTool("audit_health",
-			mcp.WithDescription("Compute a repo-level complexity-axis health grade (A-F) from the graph: per-callable fan-in/fan-out health, the mean grade, the per-grade distribution, and the worst-scored symbols. Backs `gortex audit` and its README badge."),
+			mcp.WithDescription("Compute a repo-level complexity-axis health grade (A-F) from the graph: per-callable fan-in/fan-out health, the mean grade, the per-grade distribution, and the worst-scored symbols. Backs `gortex audit` and its README badge. Scored symbols are clamped to the session workspace and narrowed further by repo/project/scope."),
+			mcp.WithString("repo", mcp.Description("Narrow the audit to a single repository prefix (tracked name or path), clamped to the session workspace.")),
+			mcp.WithString("project", mcp.Description("Narrow the audit to the repositories in a project, clamped to the session workspace.")),
+			mcp.WithString("workspace", mcp.Description("Restrict the audit to the active workspace slug; daemon sessions may only name their own workspace.")),
+			mcp.WithString("scope", mcp.Description("Name of a saved scope (see save_scope) — its repositories narrow the audit, clamped to the session workspace.")),
 		),
 		s.handleAuditHealth,
 	)
 }
 
-func (s *Server) handleAuditHealth(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+// handleAuditHealth grades the callable symbols the caller can actually
+// see. It resolves the uniform repo/project/workspace/scope narrowing
+// exactly like the analyze dispatcher does, then sources its symbols
+// through the scoped-node accessor so a workspace-bound session can
+// never be graded against another workspace's symbols — and so an
+// explicit repo selector narrows instead of being silently dropped.
+func (s *Server) handleAuditHealth(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	g := s.graph
 	if g == nil {
 		return mcp.NewToolResultError("audit: graph is not initialised"), nil
 	}
-	data, err := json.Marshal(ComputeAuditReport(g))
+	resolved, errResult := s.resolveScope(ctx, req, IntentAnalyze)
+	if errResult != nil {
+		return errResult, nil
+	}
+	ctx = withRepoAllow(ctx, resolved.RepoAllow)
+	data, err := json.Marshal(ComputeAuditReport(g, s.scopedNodesByKinds(ctx, auditHealthKinds)))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	return mcp.NewToolResultText(string(data)), nil
+	return withScopeResult(mcp.NewToolResultText(string(data)), nil, resolved)
 }
 
-// ComputeAuditReport walks the graph and produces the repo grade.
+// ComputeAuditReport grades the supplied callable nodes and produces the
+// repo grade. Callers pass the node set already narrowed to the scope
+// they may observe (see Server.scopedNodesByKinds) — this function never
+// widens beyond it. Fan-in / fan-out are still counted over the whole
+// graph, so a cross-repo caller still contributes to a symbol's score;
+// only which symbols get scored is scoped. That matches the health_score
+// analyzer, which likewise scopes candidates and counts edges globally.
+//
 // Complexity-axis-only math matching the health_score analyzer's
 // complexity component:
 //
@@ -59,14 +86,14 @@ func (s *Server) handleAuditHealth(_ context.Context, _ mcp.CallToolRequest) (*m
 //	complexity_health = 100 / (1 + raw/20)
 //	mean              = mean across callable symbols
 //	grade             = auditScoreGrade(mean)
-func ComputeAuditReport(g graph.Store) AuditReport {
+func ComputeAuditReport(g graph.Store, nodes []*graph.Node) AuditReport {
 	type entry struct {
 		id, file string
 		line     int
 		score    float64
 	}
 	var entries []entry
-	for _, n := range g.AllNodes() {
+	for _, n := range nodes {
 		if n == nil {
 			continue
 		}

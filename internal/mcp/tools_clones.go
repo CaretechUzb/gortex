@@ -25,7 +25,10 @@ func (s *Server) registerCloneTools() {
 			mcp.WithNumber("min_similarity", mcp.Description("Only report clone pairs at or above this estimated Jaccard similarity (0..1). Default 0 — every recorded EdgeSimilarTo edge.")),
 			mcp.WithBoolean("dead_only", mcp.Description("Only return clusters that contain at least one dead-code symbol — the \"dead duplicates of live code\" view. Default false.")),
 			mcp.WithString("path_prefix", mcp.Description("Restrict to symbols whose file path starts with this prefix.")),
-			mcp.WithString("repo", mcp.Description("Restrict to symbols in a specific repository (RepoPrefix exact match).")),
+			mcp.WithString("repo", mcp.Description("Narrow to a single repository prefix (tracked name or path), clamped to the session workspace.")),
+			mcp.WithString("project", mcp.Description("Narrow to the repositories in a project, clamped to the session workspace.")),
+			mcp.WithString("workspace", mcp.Description("Restrict to the active workspace slug; daemon sessions may only name their own workspace.")),
+			mcp.WithString("scope", mcp.Description("Name of a saved scope (see save_scope) — its repositories narrow the search, clamped to the session workspace.")),
 			mcp.WithNumber("limit", mcp.Description("Maximum clusters to return (default: 50). Clusters are ranked largest-first.")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
@@ -58,11 +61,23 @@ func (s *Server) handleFindClones(ctx context.Context, req mcp.CallToolRequest) 
 	minSim := req.GetFloat("min_similarity", 0)
 	deadOnly := req.GetBool("dead_only", false)
 	pathPrefix := strings.TrimSpace(stringArg(args, "path_prefix"))
-	repo := strings.TrimSpace(stringArg(args, "repo"))
 	limit := req.GetInt("limit", 50)
 	if limit <= 0 {
 		limit = 50
 	}
+
+	// Resolve the uniform repo/project/workspace/scope narrowing the way
+	// the analyze dispatcher does, then let analyzeNodeVisible enforce
+	// both the session-workspace ceiling and the resolved allow-set. The
+	// `repo` arg used to be matched here as a bare RepoPrefix equality,
+	// which honoured an exact tracked name but silently ignored the path
+	// form and never clamped an unnarrowed call to the session's own
+	// workspace — so a bound session saw sibling workspaces' clones.
+	resolved, errResult := s.resolveScope(ctx, req, IntentAnalyze)
+	if errResult != nil {
+		return errResult, nil
+	}
+	ctx = withRepoAllow(ctx, resolved.RepoAllow)
 
 	inScope := func(n *graph.Node) bool {
 		if n == nil {
@@ -74,10 +89,7 @@ func (s *Server) handleFindClones(ctx context.Context, req mcp.CallToolRequest) 
 		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
 			return false
 		}
-		if repo != "" && n.RepoPrefix != repo {
-			return false
-		}
-		return true
+		return s.analyzeNodeVisible(ctx, n)
 	}
 
 	// Walk EdgeSimilarTo edges. The graph holds them symmetrically

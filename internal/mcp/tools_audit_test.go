@@ -23,7 +23,8 @@ func TestAuditScoreGrade_Boundaries(t *testing.T) {
 }
 
 func TestComputeAuditReport_EmptyGraphReturnsF(t *testing.T) {
-	r := ComputeAuditReport(graph.New())
+	emptyG := graph.New()
+	r := ComputeAuditReport(emptyG, emptyG.AllNodes())
 	if r.SymbolCount != 0 {
 		t.Errorf("empty graph SymbolCount = %d, want 0", r.SymbolCount)
 	}
@@ -49,7 +50,7 @@ func TestComputeAuditReport_ScoresAndGradesPopulated(t *testing.T) {
 		g.AddEdge(&graph.Edge{From: "c.go::caller_" + strconv.Itoa(i), To: "f.go::med", Kind: graph.EdgeCalls})
 	}
 
-	r := ComputeAuditReport(g)
+	r := ComputeAuditReport(g, g.AllNodes())
 	if r.SymbolCount == 0 {
 		t.Fatalf("expected callable symbols in report, got 0")
 	}
@@ -69,7 +70,7 @@ func TestComputeAuditReport_GradeCountsSumToSymbolCount(t *testing.T) {
 	for i := range 20 {
 		g.AddNode(&graph.Node{ID: "f.go::F" + strconv.Itoa(i), Kind: graph.KindFunction})
 	}
-	r := ComputeAuditReport(g)
+	r := ComputeAuditReport(g, g.AllNodes())
 	sum := 0
 	for _, n := range r.GradeCounts {
 		sum += n
@@ -84,7 +85,7 @@ func TestComputeAuditReport_NonCallableKindsSkipped(t *testing.T) {
 	g.AddNode(&graph.Node{ID: "f.go::T", Name: "T", Kind: graph.KindType})
 	g.AddNode(&graph.Node{ID: "f.go::V", Name: "V", Kind: graph.KindVariable})
 	g.AddNode(&graph.Node{ID: "f.go::F", Name: "F", Kind: graph.KindFunction})
-	r := ComputeAuditReport(g)
+	r := ComputeAuditReport(g, g.AllNodes())
 	if r.SymbolCount != 1 {
 		t.Errorf("SymbolCount = %d, want 1 (only function counted)", r.SymbolCount)
 	}

@@ -74,7 +74,11 @@ func runAudit(cmd *cobra.Command, _ []string) error {
 	w := cmd.ErrOrStderr()
 	emitAuditBanner(w, abs)
 
-	out, err := requireDaemonTool(auditPath, "audit_health", map[string]any{})
+	// --path both selects the daemon connection and narrows the report.
+	// Passing it as the `repo` selector is what makes `gortex audit
+	// --path /tmp/myrepo` grade that tree rather than every repo the
+	// daemon happens to track.
+	out, err := requireDaemonTool(auditPath, "audit_health", map[string]any{"repo": abs})
 	if err != nil {
 		return err
 	}
