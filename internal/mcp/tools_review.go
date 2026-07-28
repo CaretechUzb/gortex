@@ -20,6 +20,7 @@ import (
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/review"
 	"github.com/zzet/gortex/internal/semantic/lsp"
+	"github.com/zzet/gortex/internal/testpath"
 )
 
 // registerReviewTools registers the review-engine tool group. Unlike most
@@ -672,34 +673,51 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 	return review.GroundReviewMatches(s.graph, collected)
 }
 
-// reviewImpact builds the per-changed-symbol blast-radius map review.Run uses to
-// rank per-file risk. A symbol whose impact analysis is empty is omitted.
-// testPatternsByExt maps a source-file extension to the path fragments its
-// covering tests conventionally carry. Only languages with a recognizable
-// convention are probed; a diff touching none of them reads as
-// coverage-unknown.
-var testPatternsByExt = map[string][]string{
-	".go":  {"_test.go"},
-	".ts":  {".test.ts", ".spec.ts", "__tests__/"},
-	".tsx": {".test.ts", ".spec.ts", "__tests__/"},
-	".js":  {".test.js", ".spec.js", "__tests__/"},
-	".jsx": {".test.js", ".spec.js", "__tests__/"},
-	".py":  {"test_"},
+// testLangByExt maps a source-file extension onto the language family its
+// covering tests share. The family is the probe's unit because a test file
+// carries the same extension family as the code it exercises — a `.tsx`
+// component is covered by a `.test.ts` or a `.test.tsx` — so asking "does the
+// index carry tests for this language?" is one lookup per changed file.
+// Extensions absent from the table have no convention to attest and are
+// skipped.
+var testLangByExt = map[string]string{
+	".go":    "go",
+	".ts":    "ts",
+	".tsx":   "ts",
+	".mts":   "ts",
+	".cts":   "ts",
+	".js":    "js",
+	".jsx":   "js",
+	".mjs":   "js",
+	".cjs":   "js",
+	".py":    "py",
+	".rb":    "rb",
+	".rs":    "rs",
+	".dart":  "dart",
+	".java":  "java",
+	".kt":    "kt",
+	".cs":    "cs",
+	".swift": "swift",
+	".php":   "php",
 }
 
-// testFragmentsIndexed reports, per test-path fragment, whether the repo's
-// graph carries any non-file symbol whose path contains it. One scan,
-// cached for the daemon's lifetime — the index's exclude set only changes
-// with a reindex.
-func (s *Server) testFragmentsIndexed(repoPrefix string) map[string]bool {
+// testLangsIndexed returns the language families this repo's graph carries
+// indexed test symbols for. One scan per analysis epoch, cached per repo
+// prefix and invalidated by RunAnalysis — the answer changes with a reindex,
+// and pinning it for the daemon's lifetime meant a probe that ran during
+// warmup (before the test-edge pass stamps its symbols) reported "no tests"
+// until the daemon was restarted.
+//
+// A node counts as evidence when the indexer stamped it a test symbol or its
+// path follows a recognised convention. The stamp is what makes this
+// runner-agnostic: an annotation-driven test (Rust #[test], JUnit @Test) or
+// a co-located vitest probe carries no distinguishing path fragment, and
+// probing for hardcoded fragments instead reported "the index carries no
+// test symbols" over a graph full of them. Every `tests` edge originates at
+// a stamped symbol, so scanning nodes covers the edge evidence too.
+func (s *Server) testLangsIndexed(repoPrefix string) map[string]bool {
 	if v, ok := s.testIndexProbe.Load(repoPrefix); ok {
 		return v.(map[string]bool)
-	}
-	fragments := map[string]bool{}
-	for _, pats := range testPatternsByExt {
-		for _, p := range pats {
-			fragments[p] = false
-		}
 	}
 	var nodes []*graph.Node
 	if repoPrefix != "" {
@@ -707,54 +725,53 @@ func (s *Server) testFragmentsIndexed(repoPrefix string) map[string]bool {
 	} else {
 		nodes = s.graph.AllNodes()
 	}
-	remaining := len(fragments)
+	langs := map[string]bool{}
 	for _, n := range nodes {
-		if n == nil || n.Kind == graph.KindFile || !analysis.IsTestFile(n.FilePath) {
+		if n == nil || n.Kind == graph.KindFile || !nodeIsTestSymbol(n) {
 			continue
 		}
-		for p, seen := range fragments {
-			if !seen && strings.Contains(n.FilePath, p) {
-				fragments[p] = true
-				remaining--
-			}
-		}
-		if remaining == 0 {
-			break
+		if lang, ok := testLangByExt[strings.ToLower(filepath.Ext(n.FilePath))]; ok {
+			langs[lang] = true
 		}
 	}
-	s.testIndexProbe.Store(repoPrefix, fragments)
-	return fragments
+	s.testIndexProbe.Store(repoPrefix, langs)
+	return langs
+}
+
+// nodeIsTestSymbol reports whether a node is test code, preferring the
+// indexer's own stamp over the path convention so a test the runner
+// discovers by attribute rather than by filename still counts.
+func nodeIsTestSymbol(n *graph.Node) bool {
+	if v, ok := n.Meta["is_test"].(bool); ok && v {
+		return true
+	}
+	return testpath.IsTestFile(n.FilePath)
 }
 
 // coverageKnownForDiff reports whether the graph can attest test coverage
 // for this changeset: every changed file whose language has a test
-// convention must have that convention present in the index. An index
-// config that excludes a language's test files (e.g. "**/*_test.go") makes
-// "no covering test" blindness, not a finding — the review then says
+// convention must have test symbols for that language present in the index.
+// An index config that excludes a language's test files (e.g. "**/*_test.go")
+// makes "no covering test" blindness, not a finding — the review then says
 // "coverage unknown" instead of "untested".
 func (s *Server) coverageKnownForDiff(repoPrefix string, changedFiles []string) bool {
-	fragments := s.testFragmentsIndexed(repoPrefix)
+	langs := s.testLangsIndexed(repoPrefix)
 	sawCode := false
 	for _, f := range changedFiles {
-		pats := testPatternsByExt[strings.ToLower(filepath.Ext(f))]
-		if len(pats) == 0 {
+		lang, ok := testLangByExt[strings.ToLower(filepath.Ext(f))]
+		if !ok {
 			continue
 		}
 		sawCode = true
-		ok := false
-		for _, p := range pats {
-			if fragments[p] {
-				ok = true
-				break
-			}
-		}
-		if !ok {
+		if !langs[lang] {
 			return false
 		}
 	}
 	return sawCode
 }
 
+// reviewImpact builds the per-changed-symbol blast-radius map review.Run uses to
+// rank per-file risk. A symbol whose impact analysis is empty is omitted.
 func (s *Server) reviewImpact(changed []analysis.ChangedSymbol) map[string]*analysis.ImpactResult {
 	if len(changed) == 0 {
 		return nil
@@ -1061,6 +1078,14 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 		}
 	}
 
+	// Impacted test targets → the concrete verification command, and the
+	// changeset's own coverage evidence. Resolved before the review runs
+	// because a non-empty target list is proof the index carries test
+	// symbols for this change: whatever the repo-wide probe concludes, the
+	// envelope must never pair these files with a summary claiming there
+	// are none.
+	testTargets := s.reviewTestTargets(ctx, ids)
+
 	// The review report (deterministic rulepack always; LLM phase gated).
 	useLLM := requestBoolDefault(req, "use_llm", false)
 	gen := s.reviewLLMGenWithUsage(useLLM)
@@ -1068,7 +1093,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	report, err := review.RunWithUsage(ctx, s.graph, gen, s.reviewPricing(), review.Options{
 		RepoRoot:        repoRoot,
 		RepoPrefix:      repoPrefix,
-		CoverageKnown:   diff != nil && s.coverageKnownForDiff(repoPrefix, diff.ChangedFiles),
+		CoverageKnown:   len(testTargets) > 0 || (diff != nil && s.coverageKnownForDiff(repoPrefix, diff.ChangedFiles)),
 		Scope:           scope,
 		BaseRef:         baseRef,
 		Diff:            diffText,
@@ -1105,8 +1130,6 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	// Per-symbol semantic classification, graph-grounded on the diff-hunk text.
 	changedSyms := s.classifyChangedSymbols(diff, impact)
 
-	// Impacted test targets → the concrete verification command.
-	testTargets := s.reviewTestTargets(ctx, ids)
 	verCmd := review.VerificationCommand(testTargets, reviewPackLang(diff))
 
 	// Cost bound: run a speculative preview_edit for the high-risk (d=1-heavy)

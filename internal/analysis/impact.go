@@ -8,6 +8,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/reach"
+	"github.com/zzet/gortex/internal/testpath"
 )
 
 // RiskLevel represents the severity of a change's impact.
@@ -549,29 +550,21 @@ func assessRisk(directDeps, transitiveDeps int) RiskLevel {
 }
 
 // IsTestFile reports whether path looks like a test source file — the same
-// suffix set the impact traversal uses to collect covering tests, exported
+// predicate the impact traversal uses to collect covering tests, exported
 // for callers that need to probe whether a graph indexes tests at all.
+//
+// It delegates to internal/testpath, the convention table the indexer's
+// test-edge pass classifies with. Before that, this was a seven-fragment
+// substring match of its own, and the two disagreed: a `_spec.rb`,
+// a `FooTest.java`, or anything under a `tests/` directory got a `tests`
+// edge from the indexer but was not counted as a covering test here, so the
+// same change read as untested in the review's per-file rows and covered in
+// the risk receipt. The old match was also too loose in the other
+// direction — "test_" anywhere in the path made `src/latest_release.go` a
+// test file.
 func IsTestFile(path string) bool { return isTestFile(path) }
 
-func isTestFile(path string) bool {
-	return containsAny(path,
-		"_test.go", ".test.ts", ".test.js", ".spec.ts", ".spec.js",
-		"__tests__/", "test_",
-	)
-}
-
-func containsAny(s string, patterns ...string) bool {
-	for _, p := range patterns {
-		if len(s) >= len(p) {
-			for i := 0; i <= len(s)-len(p); i++ {
-				if s[i:i+len(p)] == p {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
+func isTestFile(path string) bool { return testpath.IsTestFile(path) }
 
 func dedup(ss []string) []string {
 	seen := make(map[string]bool, len(ss))

@@ -307,19 +307,27 @@ func TestRankFileRiskCoverageUnknown(t *testing.T) {
 	require.Zero(t, rows[0].Uncovered)
 }
 
-// TestSummarizeCoveragePhrasing pins the three risk-driven headlines: untested
-// risk, fully covered risk, and unknown coverage.
+// TestSummarizeCoveragePhrasing pins the four risk-driven headlines: untested
+// risk, fully covered risk, unattestable coverage, and coverage that simply
+// was not evaluated.
 func TestSummarizeCoveragePhrasing(t *testing.T) {
 	critical := string(analysis.RiskCritical)
 
-	untested := summarize(VerdictBlock, nil, []FileRisk{{File: "a.go", Risk: critical, Symbols: 2, Uncovered: 1}})
+	untested := summarize(VerdictBlock, nil, []FileRisk{{File: "a.go", Risk: critical, Symbols: 2, Uncovered: 1}}, true)
 	require.Contains(t, untested, "1 without covering tests")
 
-	covered := summarize(VerdictReview, nil, []FileRisk{{File: "a.go", Risk: critical, Symbols: 2}})
+	covered := summarize(VerdictReview, nil, []FileRisk{{File: "a.go", Risk: critical, Symbols: 2}}, true)
 	require.Contains(t, covered, "all test-covered")
 
-	unknown := summarize(VerdictBlock, nil, []FileRisk{{File: "a.go", Risk: critical}})
+	unknown := summarize(VerdictBlock, nil, []FileRisk{{File: "a.go", Risk: critical}}, false)
 	require.Contains(t, unknown, "test coverage unknown")
+
+	// The index DOES carry test symbols; the changeset just mapped to no
+	// graph symbols to evaluate. Blaming the index here is the fabrication
+	// issue #350 reported, so the headline must not.
+	notEvaluated := summarize(VerdictBlock, nil, []FileRisk{{File: "a.go", Risk: critical}}, true)
+	require.Contains(t, notEvaluated, "coverage not evaluated")
+	require.NotContains(t, notEvaluated, "carries no test symbols")
 }
 
 // TestComputeVerdictCoverageCap pins the coverage temper: a critical-risk
