@@ -131,8 +131,10 @@ func normalizeLang(l string) string {
 // Language matching is exact (after alias folding); path matches as a
 // case-insensitive substring of the node's file path; repo matches
 // the node's repository prefix exactly. Empty clauses are skipped, and
-// a node with no repo prefix (single-repo mode) is never dropped by a
-// repo clause — mirroring filterNodes.
+// a node with no repo prefix is never dropped by a repo clause —
+// mirroring repoNarrowAdmits. Such a node is owned by no repository (a
+// synthetic global external), so a repo clause can only exclude it
+// vacuously.
 func applyFieldFilters(nodes []*graph.Node, fq fieldQuery) []*graph.Node {
 	lang := normalizeLang(fq.Lang)
 	path := strings.ToLower(strings.TrimSpace(fq.Path))
@@ -250,8 +252,9 @@ func pathMatchesAnyPrefix(path string, prefixes []string) bool {
 // a repo prefix (gortex/internal/...) while callers pass repo-relative
 // sub-paths (internal/...); expanding the filter lets the repo-relative
 // form still match without loosening the anchored, segment-boundary
-// matching of pathMatchesAnyPrefix. Returns norm unchanged when there
-// are no repo prefixes (single-repo mode, where paths are unprefixed).
+// matching of pathMatchesAnyPrefix. Returns norm unchanged when the
+// store reports no repo prefixes at all (the standalone Indexer, whose
+// paths are unprefixed).
 func expandPathPrefixesWithRepos(norm, repoPrefixes []string) []string {
 	if len(repoPrefixes) == 0 {
 		return norm

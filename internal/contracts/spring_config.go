@@ -40,8 +40,10 @@ func springConfigKeyID(key string) string {
 
 // SpringConfigScope identifies the repository boundary for one binding pass.
 // RepoRoot is the on-disk root used to resolve graph paths; RepoPrefix and
-// WorkspaceID are persisted on synthetic nodes and form their multi-repo ID
-// namespace. An empty RepoPrefix retains the legacy single-repository IDs.
+// WorkspaceID are persisted on synthetic nodes and form their repo-scoped ID
+// namespace. An empty RepoPrefix keeps the unscoped `cfg::spring::<key>` IDs
+// and is reached only by the standalone Indexer, which sets no prefix — every
+// repo the daemon tracks carries one.
 type SpringConfigScope struct {
 	RepoPrefix  string
 	RepoRoot    string

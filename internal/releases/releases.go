@@ -94,11 +94,11 @@ func FilesAtTag(repoRoot, tag string) []string {
 }
 
 // ReleaseNodeID returns the canonical KindRelease node ID for the
-// given tag, scoped to a repo prefix in multi-repo mode. ID convention
-// matches the schema docstring on graph.KindRelease: `release::<tag>`
-// in single-repo graphs and `release::<repo>::<tag>` once a prefix is
-// in play. Exported so the resolver / analyzers can construct the same
-// ID without re-deriving the convention.
+// given tag, scoped to its repo prefix. ID convention matches the schema
+// docstring on graph.KindRelease: `release::<repo>::<tag>` whenever a
+// prefix is in play, and the bare `release::<tag>` only for the
+// standalone Indexer, which has none. Exported so the resolver /
+// analyzers can construct the same ID without re-deriving the convention.
 func ReleaseNodeID(repoPrefix, tag string) string {
 	if repoPrefix == "" {
 		return "release::" + tag

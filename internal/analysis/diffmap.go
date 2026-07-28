@@ -41,8 +41,9 @@ type DiffResult struct {
 // baseRef: used when scope is "compare" (e.g., "main")
 // repoRoot: absolute path to the repository root
 // repoPrefix: the graph repo prefix anchoring repoRoot's indexed nodes.
-// Multi-repo daemons key file paths as "<prefix>/<rel>" while git emits
-// repo-relative paths; empty in single-repo / unprefixed mode.
+// The daemon keys every file path as "<prefix>/<rel>" while git emits
+// repo-relative paths; empty only for the standalone Indexer, which
+// mints unprefixed paths.
 func MapGitDiff(g graph.Store, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, error) {
 	args := buildDiffArgs(scope, baseRef)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
