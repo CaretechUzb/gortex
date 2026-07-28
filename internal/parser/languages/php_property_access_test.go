@@ -178,3 +178,27 @@ class Service {
 	require.True(t, ok, "nullsafe property read must emit an edge, got %v", got)
 	assert.Equal(t, "Config", rt)
 }
+
+// `self::` and `static::` name the enclosing class, so a static property or
+// class constant reached through them binds like any other typed access.
+// `parent::` deliberately stays untyped — the scope_kind path walks up from the
+// enclosing class rather than pinning to it.
+func TestPHPPropertyAccess_RelativeScopeTypedByEnclosingClass(t *testing.T) {
+	got := phpAccessEdges(t, `<?php
+class Registry extends BaseRegistry {
+    private static array $items = [];
+    public const LIMIT = 10;
+
+    public function add($x): void {
+        self::$items[] = $x;
+        $n = static::LIMIT;
+        $p = parent::DEFAULTS;
+    }
+}
+`)
+	assert.Equal(t, "Registry", got["writes unresolved::*.items"], "self::$prop is the enclosing class, got %v", got)
+	assert.Equal(t, "Registry", got["reads unresolved::*.LIMIT"], "static::CONST is the enclosing class, got %v", got)
+	_, ok := got["reads unresolved::*.DEFAULTS"]
+	require.True(t, ok, "parent:: access must still emit an edge, got %v", got)
+	assert.Equal(t, "", got["reads unresolved::*.DEFAULTS"], "parent:: must not pin to the enclosing class")
+}

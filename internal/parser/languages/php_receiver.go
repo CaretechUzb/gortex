@@ -340,11 +340,24 @@ func (env phpReceiverEnv) phpReceiverTypeFor(obj *sitter.Node, src []byte) strin
 	return ""
 }
 
-// phpScopeReceiverType types the scope of a `Foo::m()` scoped call. `parent`,
-// `self` and `static` are handled by the scope_kind path in extractCallSites
-// and return "" here; a `$var::m()` scope is typed through the environment.
+// phpScopeReceiverType types the scope of a `Foo::m()` scoped call or a
+// `Foo::$prop` / `Foo::CONST` access. A `$var::m()` scope is typed through the
+// environment.
+//
+// `self` / `static` resolve to the enclosing class — late static binding may
+// pick a subclass at runtime, but the enclosing class is where the member is
+// declared or inherited from, which is what the hierarchy walk needs. `parent`
+// returns "" so the existing scope_kind path walks up from the enclosing class
+// instead of pinning to it.
 func (env phpReceiverEnv) phpScopeReceiverType(scope *sitter.Node, src []byte) string {
 	if scope == nil {
+		return ""
+	}
+	if scope.Type() == "relative_scope" {
+		switch strings.ToLower(strings.TrimSpace(scope.Content(src))) {
+		case "self", "static":
+			return env.class
+		}
 		return ""
 	}
 	switch scope.Type() {
