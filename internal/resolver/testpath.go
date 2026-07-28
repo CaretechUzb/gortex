@@ -1,9 +1,6 @@
 package resolver
 
-import (
-	"path/filepath"
-	"strings"
-)
+import "github.com/zzet/gortex/internal/testpath"
 
 // isTestFilePath reports whether a source path follows a recognised test
 // convention.
@@ -13,54 +10,11 @@ import (
 // positive) without depending on Node.Meta test flags — which are not
 // re-stamped on the incremental-reindex path.
 //
-// RATIONALE: a verbatim port of internal/indexer.IsTestFile. The
-// resolver cannot import the indexer package (indexer → resolver is the
-// established import direction; the reverse would be a cycle), so the
-// predicate is duplicated here. It is intentionally identical in
-// behaviour; the canonical home is internal/indexer/testpattern.go and a
-// future refactor should consolidate both (plus the analysis/* copies)
-// into a leaf internal/pathutil package.
+// RATIONALE: the convention table lives in the stdlib-only leaf
+// internal/testpath. The resolver cannot import the indexer package
+// (indexer → resolver is the established import direction; the reverse
+// would be a cycle), so the predicate used to be duplicated here — and the
+// copies drifted. Both now delegate to the one definition.
 //
 // KEYWORDS: test-file, predicate, temporal, broken_dispatch, no-cycle
-func isTestFilePath(path string) bool {
-	if path == "" {
-		return false
-	}
-	// Directory-based hints first — covers projects that don't follow
-	// the per-file naming convention.
-	dir := filepath.ToSlash(path)
-	for _, marker := range []string{"/__tests__/", "/tests/", "/test/", "/spec/"} {
-		if strings.Contains(dir, marker) {
-			return true
-		}
-	}
-	if strings.HasPrefix(dir, "tests/") || strings.HasPrefix(dir, "test/") || strings.HasPrefix(dir, "spec/") {
-		return true
-	}
-
-	base := filepath.Base(path)
-	ext := strings.ToLower(filepath.Ext(base))
-	stem := strings.TrimSuffix(base, ext)
-
-	switch ext {
-	case ".go":
-		return strings.HasSuffix(stem, "_test")
-	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
-		return strings.HasSuffix(stem, ".test") || strings.HasSuffix(stem, ".spec")
-	case ".py":
-		return strings.HasPrefix(stem, "test_") || strings.HasSuffix(stem, "_test")
-	case ".dart":
-		return strings.HasSuffix(stem, "_test")
-	case ".rb":
-		return strings.HasSuffix(stem, "_spec") || strings.HasSuffix(stem, "_test")
-	case ".java", ".kt":
-		return strings.HasSuffix(stem, "Test") || strings.HasSuffix(stem, "Tests")
-	case ".cs":
-		return strings.HasSuffix(stem, "Tests") || strings.HasSuffix(stem, "Test")
-	case ".swift":
-		return strings.HasSuffix(stem, "Tests")
-	case ".php":
-		return strings.HasSuffix(stem, "Test") || strings.HasSuffix(stem, "test")
-	}
-	return false
-}
+func isTestFilePath(path string) bool { return testpath.IsTestFile(path) }
