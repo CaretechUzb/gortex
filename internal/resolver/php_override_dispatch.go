@@ -375,3 +375,12 @@ func phpEnsureMeta(e *graph.Edge) map[string]any {
 	}
 	return e.Meta
 }
+
+// phpTypedReceiverCaller reports whether a call came from PHP source, so the
+// resolver knows a stated receiver_type should be honoured by the hierarchy
+// walk instead of guessed at by directory adjacency. Scoped to PHP because the
+// locality fallback is correct for languages whose directory is a real package
+// boundary; PHP's is not.
+func phpTypedReceiverCaller(caller *graph.Node) bool {
+	return caller != nil && caller.Language == "php"
+}

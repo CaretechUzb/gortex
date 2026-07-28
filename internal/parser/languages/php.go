@@ -325,12 +325,15 @@ func (e *PHPExtractor) extractPhpMembers(
 		child := body.NamedChild(i)
 		switch child.Type() {
 		case "method_declaration":
+			name := ""
 			if n := e.findChildByFieldName(child, "name"); n != nil {
-				methodNodes[n.Content(src)] = child
+				name = n.Content(src)
+				methodNodes[name] = child
 			}
 			e.extractMethod(child, src, filePath, fileNode, result, seen, ownerName, props)
-			if n := e.findChildByFieldName(child, "name"); n != nil &&
-				strings.EqualFold(n.Content(src), "__construct") {
+			// PHP 8 promotion declares properties in the constructor's
+			// parameter list, so there is no property_declaration to find.
+			if strings.EqualFold(name, "__construct") {
 				e.extractPHPPromotedProperties(child, src, filePath, fileNode, result, seen, ownerName, ownerID)
 			}
 		case "const_declaration":

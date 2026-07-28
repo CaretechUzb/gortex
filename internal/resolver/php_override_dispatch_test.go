@@ -343,3 +343,71 @@ func TestResolvePHPOverrideDispatch_ReceiverTypeBindsThroughTrait(t *testing.T) 
 	require.Positive(t, New(s).resolvePHPOverrideDispatch())
 	assert.Equal(t, tr+"::LogsMessages.logInfo", s.GetOutEdges(caller)[0].To)
 }
+
+// A PHP "package" is one directory holding every sibling implementation, so the
+// generic resolver's locality fallback — pick a same-directory method of the
+// same name — is exactly wrong for an inherited call: `$this->getFormatter()`
+// inside AmqpHandler landed on whichever sibling handler sorted first. When the
+// receiver names a type this repo defines, the locality pick is withheld so the
+// hierarchy walk can bind the declaration the receiver actually inherits.
+func TestResolveAll_PHPTypedReceiverBeatsSameDirectoryGuess(t *testing.T) {
+	var s graph.Store = graph.New()
+	dir := "src/Handler/"
+	iface := dir + "FormattableHandlerInterface.php"
+	sibling := dir + "BufferHandler.php"
+	caller := dir + "AmqpHandler.php"
+
+	phpIface(s, iface+"::FormattableHandlerInterface", "FormattableHandlerInterface", nil)
+	phpMethod(s, iface+"::FormattableHandlerInterface.getFormatter", "getFormatter", "FormattableHandlerInterface")
+	// A same-directory sibling declaring the same name — the decoy the
+	// locality fallback used to pick.
+	phpType(s, sibling+"::BufferHandler", "BufferHandler", nil)
+	phpMethod(s, sibling+"::BufferHandler.getFormatter", "getFormatter", "BufferHandler")
+
+	phpType(s, caller+"::AmqpHandler", "AmqpHandler",
+		map[string]any{"scope_interfaces": "FormattableHandlerInterface"})
+	callerID := caller + "::AmqpHandler.handleBatch"
+	phpMethod(s, callerID, "handleBatch", "AmqpHandler")
+	s.AddEdge(&graph.Edge{
+		From: callerID, To: "unresolved::*.getFormatter", Kind: graph.EdgeCalls,
+		FilePath: caller, Line: 124,
+		Meta:     map[string]any{"receiver_type": "AmqpHandler"},
+	})
+
+	New(s).ResolveAll()
+
+	out := s.GetOutEdges(callerID)
+	require.Len(t, out, 1)
+	assert.Equal(t, iface+"::FormattableHandlerInterface.getFormatter", out[0].To,
+		"an inherited call must bind through the hierarchy, not to a same-directory sibling")
+}
+
+// The gate is limited to receivers this repo defines. A vendor-typed receiver
+// has no hierarchy in the graph either, so withholding the locality pick would
+// lose the edge with nowhere better to put it.
+func TestResolveAll_PHPVendorTypedReceiverKeepsLocalityPick(t *testing.T) {
+	var s graph.Store = graph.New()
+	dir := "src/"
+	local := dir + "Local.php"
+	caller := dir + "Client.php"
+
+	phpType(s, local+"::Local", "Local", nil)
+	phpMethod(s, local+"::Local.send", "send", "Local")
+
+	phpType(s, caller+"::Client", "Client", nil)
+	callerID := caller + "::Client.run"
+	phpMethod(s, callerID, "run", "Client")
+	s.AddEdge(&graph.Edge{
+		From: callerID, To: "unresolved::*.send", Kind: graph.EdgeCalls,
+		FilePath: caller, Line: 9,
+		// GuzzleClient is not defined anywhere in this graph.
+		Meta: map[string]any{"receiver_type": "GuzzleClient"},
+	})
+
+	New(s).ResolveAll()
+
+	out := s.GetOutEdges(callerID)
+	require.Len(t, out, 1)
+	assert.Equal(t, local+"::Local.send", out[0].To,
+		"a vendor-typed receiver keeps the pre-existing locality behaviour")
+}
