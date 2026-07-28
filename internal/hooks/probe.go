@@ -47,14 +47,24 @@ func probeViaDaemon(pattern string, timeout time.Duration) ([]grepSymbolHit, err
 		}
 		defer client.Close()
 
-		// Cap each socket op at the remaining budget so a stuck daemon
-		// can't pin the goroutine past timeout.
-		_ = client.Conn.SetDeadline(deadline)
-
-		resp, err := client.Control(daemon.ControlSearchSymbols, daemon.SearchSymbolsParams{
+		// Cap the round trip at the remaining budget so a stuck daemon
+		// can't pin the goroutine past timeout. Passed explicitly rather
+		// than left to Control's default: a hook runs on the agent's
+		// critical path and its budget is far tighter than the default.
+		//
+		// The clamp matters: a non-positive budget means "no bound" to
+		// ControlWithTimeout, so handing it a window the dial already
+		// consumed would turn the tightest caller in the tree into the
+		// only unbounded one.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			done <- probeResult{err: fmt.Errorf("daemon probe budget exhausted before the search rpc")}
+			return
+		}
+		resp, err := client.ControlWithTimeout(daemon.ControlSearchSymbols, daemon.SearchSymbolsParams{
 			Query: pattern,
 			Limit: 10,
-		})
+		}, remaining)
 		if err != nil {
 			done <- probeResult{err: fmt.Errorf("control rpc: %w", err)}
 			return

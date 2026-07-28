@@ -5,12 +5,31 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/pathkey"
 )
+
+// daemonRoutingProbeTimeout bounds the "does the daemon own this repo?" probe
+// that precedes every CLI graph query. Short on purpose: the answer only picks
+// an execution backend, and waiting on a busy daemon to learn it is strictly
+// worse than getting on with the query.
+const daemonRoutingProbeTimeout = 3 * time.Second
+
+// daemonProbeIndeterminate reports whether a control probe failed in a way
+// that means "the daemon is busy", as opposed to giving a real answer. Covers
+// both ends: the client's own deadline, and the daemon answering that it could
+// not finish in time.
+func daemonProbeIndeterminate(err error, resp daemon.ControlResponse) bool {
+	if errors.Is(err, daemon.ErrDaemonUnresponsive) {
+		return true
+	}
+	return err == nil && !resp.OK && resp.ErrorCode == daemon.ErrTimeout
+}
 
 // ErrNoExecutor signals that no warm daemon owns the repo and no explicit
 // daemonless path (--oneshot) was selected — the caller decides whether to
@@ -169,13 +188,34 @@ func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string) (cliExecu
 
 // daemonOwnsRepo reports whether the running daemon tracks a repo that
 // covers abs (so a daemon query won't answer empty for an untracked path).
+//
+// This runs ahead of every CLI graph query, which made it the single point
+// where a busy daemon stalled the whole CLI: Status serialises behind the
+// controller mutex that track / reload / enrichment hold for minutes, and the
+// call had no bound on either end.
+//
+// It gets a short budget, and when that budget expires it FAILS OPEN — the
+// answer is unknown, not "no". Treating an indeterminate probe as "not ours"
+// would be a lie with an actively harmful remedy: the caller would be told
+// "the daemon does not track <path> — add it with `gortex track <path>`",
+// when the daemon does track it and `track` is itself the unbounded operation
+// holding the lock. Proceeding to the MCP path costs nothing to be wrong
+// about: that path does not need the controller mutex, and a genuinely
+// untracked repo comes back as repo_not_tracked, which surfaces the same
+// message this probe would have produced.
 func daemonOwnsRepo(abs string) bool {
 	c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
 	if err != nil {
 		return false
 	}
 	defer c.Close()
-	resp, err := c.Control(daemon.ControlStatus, nil)
+	resp, err := c.ControlWithTimeout(daemon.ControlStatus, nil, daemonRoutingProbeTimeout)
+	if daemonProbeIndeterminate(err, resp) {
+		fmt.Fprintf(os.Stderr,
+			"[gortex] daemon did not answer within %s (a track / reload / enrichment may be holding it) — asking it anyway\n",
+			daemonRoutingProbeTimeout)
+		return true
+	}
 	if err != nil || !resp.OK {
 		return false
 	}

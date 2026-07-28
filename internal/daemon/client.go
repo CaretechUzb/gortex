@@ -51,6 +51,13 @@ func DialTo(socketPath string, h Handshake) (*Client, error) {
 	if h.PID == 0 {
 		h.PID = os.Getpid()
 	}
+	// Bound the handshake exchange. The daemon stamps warmup state onto the
+	// ack, so this is a real round trip through the server — a wedged daemon
+	// would otherwise park every dialler here forever, including the
+	// "is the daemon usable?" probes whose whole job is to degrade quickly.
+	// Cleared below: the connection that follows is long-lived (an MCP proxy
+	// relay streams on it for the life of the session).
+	_ = conn.SetDeadline(time.Now().Add(controlHandshakeTimeoutForTest))
 	if err := WriteJSONLine(conn, h); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("send handshake: %w", err)
@@ -59,8 +66,13 @@ func DialTo(socketPath string, h Handshake) (*Client, error) {
 	ackLine, err := reader.ReadBytes('\n')
 	if err != nil {
 		_ = conn.Close()
+		if isTimeoutErr(err) {
+			return nil, fmt.Errorf("%w: no handshake ack within %s (the daemon is up but not answering — it may be busy indexing; check `gortex daemon status`)",
+				ErrDaemonUnresponsive, controlHandshakeTimeoutForTest)
+		}
 		return nil, fmt.Errorf("read handshake ack: %w", err)
 	}
+	_ = conn.SetDeadline(time.Time{})
 	var ack HandshakeAck
 	if err := json.Unmarshal(ackLine, &ack); err != nil {
 		_ = conn.Close()
@@ -88,7 +100,30 @@ func (c *Client) Close() error {
 
 // Control sends one control request and returns the paired response.
 // Fails if the Client was opened in ModeMCP.
+//
+// The round trip is bounded by ControlTimeoutFor(kind) — status /
+// search_symbols and friends must answer promptly, while track / reload /
+// enrichment and shutdown are allowed to run as long as they need (see
+// ControlTimeoutFor for why shutdown is in that list, and note that
+// `gortex daemon stop` passes its own budget rather than relying on this
+// default). A bounded kind that overruns returns ErrDaemonUnresponsive rather
+// than blocking forever, which is what kept `gortex daemon stop` and
+// `gortex call` wedged behind a busy controller with nothing printed.
 func (c *Client) Control(kind string, params any) (ControlResponse, error) {
+	return c.ControlWithTimeout(kind, params, ControlTimeoutFor(kind))
+}
+
+// ControlWithTimeout is Control with an explicit round-trip budget. Callers on
+// a latency-sensitive path (advisory lookups whose result only decorates output
+// or picks a backend) should pass a short budget and degrade on
+// ErrDaemonUnresponsive instead of making the user wait for a busy daemon.
+//
+// A zero or negative timeout means "no bound", and in that case the connection's
+// own deadline is left untouched — so a caller that manages Conn deadlines
+// itself keeps full control. With a positive timeout the deadline is set for the
+// round trip and cleared afterwards, which would override any deadline the
+// caller had already installed; pass the budget here instead of setting one.
+func (c *Client) ControlWithTimeout(kind string, params any, timeout time.Duration) (ControlResponse, error) {
 	var raw json.RawMessage
 	if params != nil {
 		var err error
@@ -97,19 +132,34 @@ func (c *Client) Control(kind string, params any) (ControlResponse, error) {
 			return ControlResponse{}, fmt.Errorf("marshal params: %w", err)
 		}
 	}
+	if timeout > 0 {
+		_ = c.Conn.SetDeadline(time.Now().Add(timeout))
+		defer func() { _ = c.Conn.SetDeadline(time.Time{}) }()
+	}
 	req := ControlRequest{Kind: kind, Params: raw}
 	if err := WriteJSONLine(c.Conn, req); err != nil {
-		return ControlResponse{}, fmt.Errorf("send control request: %w", err)
+		return ControlResponse{}, c.controlErr(kind, timeout, "send control request", err)
 	}
 	line, err := c.reader.ReadBytes('\n')
 	if err != nil {
-		return ControlResponse{}, fmt.Errorf("read control response: %w", err)
+		return ControlResponse{}, c.controlErr(kind, timeout, "read control response", err)
 	}
 	var resp ControlResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
 		return ControlResponse{}, fmt.Errorf("parse control response: %w", err)
 	}
 	return resp, nil
+}
+
+// controlErr turns a deadline expiry into ErrDaemonUnresponsive with a
+// message that names the likely cause, so the failure is actionable instead
+// of a bare "i/o timeout".
+func (c *Client) controlErr(kind string, timeout time.Duration, stage string, err error) error {
+	if isTimeoutErr(err) {
+		return fmt.Errorf("%w: %q got no response within %s (the daemon is up but not answering — a long track / reload / enrichment may be holding it; check `gortex daemon status`)",
+			ErrDaemonUnresponsive, kind, timeout)
+	}
+	return fmt.Errorf("%s: %w", stage, err)
 }
 
 // WriteMCPFrame writes a raw MCP JSON-RPC frame to the daemon. Caller is
@@ -158,6 +208,23 @@ var ErrDaemonUnavailable = errors.New("daemon unavailable")
 // the embedded in-process server rather than fail, so an in-flight editor
 // session keeps working across a version skew.
 var ErrProtocolVersionMismatch = errors.New("daemon protocol version mismatch")
+
+// ErrDaemonUnresponsive is returned when the daemon accepted the connection
+// but did not answer inside the request's budget. It is deliberately distinct
+// from ErrDaemonUnavailable: the daemon is running and holding its store lock,
+// so falling back to an embedded server or a fresh start is *not* automatically
+// safe — the caller has to decide whether to degrade, retry, or report.
+var ErrDaemonUnresponsive = errors.New("daemon unresponsive")
+
+// controlHandshakeTimeoutForTest is ControlHandshakeTimeout as a var so the
+// liveness tests can exercise the stall path without a ten-second wait.
+var controlHandshakeTimeoutForTest = ControlHandshakeTimeout
+
+// isTimeoutErr reports whether err is a socket deadline expiry.
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
 
 // ShouldFallBackToEmbedded reports whether a Dial error is one the MCP proxy
 // can recover from by running the embedded in-process server instead: the

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 )
 
 // ProtocolVersion is the daemon wire-protocol version. Both ends of a
@@ -92,6 +93,12 @@ const (
 	ErrUnsupportedMode  = "unsupported_mode"
 	ErrRepoNotTracked   = "repo_not_tracked"
 	ErrInternal         = "internal"
+	// ErrTimeout means the daemon accepted the control request but did not
+	// finish it inside the kind's budget — almost always because a
+	// minutes-long track / reload / enrichment is holding the controller
+	// mutex. Distinct from ErrInternal so a caller can retry or degrade
+	// instead of treating a busy daemon as a broken one.
+	ErrTimeout = "timeout"
 )
 
 // ControlRequest is the envelope for every message sent in ModeControl.
@@ -147,6 +154,46 @@ const (
 	// co-change edge mining against the daemon's in-process graph.
 	ControlEnrichCochange = "enrich_cochange"
 )
+
+// DefaultControlTimeout bounds the control kinds that are supposed to answer
+// promptly. It is deliberately generous: a busy daemon can take seconds to
+// aggregate status over a 20-repo workspace, and a bound that fires during
+// normal load would be worse than none. What it rules out is the unbounded
+// case — a controller wedged behind a minutes-long track / reload / enrichment
+// leaving `gortex daemon stop`, `gortex daemon status` and every `gortex call`
+// blocked forever with no output and no error.
+const DefaultControlTimeout = 30 * time.Second
+
+// ControlHandshakeTimeout bounds the handshake exchange. The daemon stamps
+// warmup state onto the ack, so the ack read is a real round trip that a
+// wedged daemon can stall; without a bound every caller — including the
+// liveness probes that are supposed to degrade gracefully — blocks forever.
+const ControlHandshakeTimeout = 10 * time.Second
+
+// ControlTimeoutFor reports the round-trip budget for one control kind, or 0
+// for kinds with no bound. Client and daemon both consult it so the two ends
+// agree on which requests are allowed to run long.
+//
+// Track / untrack / reload / enrich_* legitimately run for many minutes on a
+// large workspace — bounding them would break the operations users start on
+// purpose. Everything else is a status/lifecycle call on the critical path of
+// ordinary commands and must never be able to hang.
+//
+// Shutdown is unbounded too, for a different reason: the daemon flushes and
+// closes its store *before* acking, and abandoning that flush half-done is
+// worse than a slow stop. The stop command bounds its own wait instead and
+// falls through to waiting for the process to exit, so the user is never left
+// blocked either way.
+func ControlTimeoutFor(kind string) time.Duration {
+	switch kind {
+	case ControlTrack, ControlUntrack, ControlReload, ControlShutdown,
+		ControlEnrichChurn, ControlEnrichReleases, ControlEnrichBlame,
+		ControlEnrichCoverage, ControlEnrichCochange:
+		return 0
+	default:
+		return DefaultControlTimeout
+	}
+}
 
 // TrackParams is the payload for ControlTrack.
 type TrackParams struct {

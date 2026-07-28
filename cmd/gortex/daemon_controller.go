@@ -42,8 +42,12 @@ type realController struct {
 	indexer       *indexer.Indexer
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
-	multiWatcher  *indexer.MultiWatcher
-	logger        *zap.Logger
+	// multiWatcher is an atomic pointer, not a mu-guarded field: the daemon's
+	// teardown hook reads it, and reading it under mu is what kept `daemon
+	// stop` queued behind a running track / reload / enrichment. One writer
+	// (AttachWatcher, during warmup); read via watcher().
+	multiWatcher atomic.Pointer[indexer.MultiWatcher]
+	logger       *zap.Logger
 
 	// liveRouter is the multi-server Router currently wired into the
 	// dispatch path (nil for a local-only daemon with no roster).
@@ -57,6 +61,14 @@ type realController struct {
 
 	// onShutdown is invoked by the Shutdown method. Used by the daemon
 	// main to flush savings, close the snapshot store, etc.
+	//
+	// Guarded by its own mutex, deliberately NOT by mu. Shutdown is the
+	// one control RPC that has to work when the daemon is at its least
+	// healthy, and mu is held for the entire duration of a track / reload /
+	// enrichment — minutes on a large workspace. Reading this field under
+	// mu made `gortex daemon stop` queue behind exactly the condition it
+	// exists to escape.
+	shutdownMu sync.Mutex
 	onShutdown func() error
 
 	// toolSurface reports the active tool-surface preset + mode and the
@@ -121,9 +133,9 @@ func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.
 	// flow back into the graph live without a manual reload. Failures
 	// here are logged but don't fail the track — an indexed-but-
 	// unwatched repo is still queryable, just stale if edited.
-	if c.multiWatcher != nil && c.configManager != nil {
+	if mw := c.watcher(); mw != nil && c.configManager != nil {
 		wcfg := c.configManager.GetRepoConfig(prefix).Watch
-		if err := c.multiWatcher.AddRepo(prefix, wcfg); err != nil {
+		if err := mw.AddRepo(prefix, wcfg); err != nil {
 			c.logger.Warn("track: attach watcher failed",
 				zap.String("prefix", prefix), zap.Error(err))
 		}
@@ -417,8 +429,8 @@ func (c *realController) Untrack(_ context.Context, p daemon.UntrackParams) (jso
 	// Detach the watcher before evicting from the graph — otherwise a
 	// late fsnotify event could race the eviction and try to re-index
 	// files whose nodes are already gone.
-	if c.multiWatcher != nil {
-		if err := c.multiWatcher.RemoveRepo(prefix); err != nil {
+	if mw := c.watcher(); mw != nil {
+		if err := mw.RemoveRepo(prefix); err != nil {
 			c.logger.Debug("untrack: detach watcher",
 				zap.String("prefix", prefix), zap.Error(err))
 		}
@@ -657,7 +669,16 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 // Status gathers per-repo stats and basic process metrics. Daemon-level
 // fields (PID, uptime, socket, session count) are filled in by the
 // daemon itself before the response goes out.
-func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error) {
+func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, error) {
+	// Bail before doing any work if the caller is already gone. Status sits
+	// on the critical path of `daemon stop`, `gortex call`, and the agent
+	// hooks, all of which now bound the round trip — once their budget has
+	// expired, finishing the aggregate only burns store reads that nobody
+	// will read.
+	if err := ctx.Err(); err != nil {
+		return daemon.StatusResponse{}, err
+	}
+
 	// Compute the per-repo memory estimate BEFORE taking the coarse
 	// controller mutex. On the SQLite backend AllRepoMemoryEstimates is a
 	// COUNT … GROUP BY scan that turns pathologically slow under
@@ -685,6 +706,13 @@ func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error
 	// every queued control request wait out the pause as well.
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
+
+	// Everything above is the slow half and c.mu below is the contended half.
+	// Re-check between them: a caller whose budget expired during the scans
+	// must not go on to queue behind a mutex held by a minutes-long track.
+	if err := ctx.Err(); err != nil {
+		return daemon.StatusResponse{}, err
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1254,9 +1282,28 @@ func probeSymbolHit(n *graph.Node) daemon.SymbolHit {
 // watcher when the warmup-constructed MultiWatcher iterates
 // mi.AllMetadata() at startup.
 func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.multiWatcher = mw
+	c.multiWatcher.Store(mw)
+}
+
+// watcher reads the attached MultiWatcher without touching the coarse mutex.
+// The teardown path needs it, and taking mu there would put the stop request
+// back behind the minutes-long track / reload / enrichment it is trying to end.
+func (c *realController) watcher() *indexer.MultiWatcher {
+	return c.multiWatcher.Load()
+}
+
+// StopWatcher halts filesystem watching. Called first during teardown so no
+// late event races the snapshot write — we want the snapshot to reflect a
+// quiescent graph, not one being mutated by an in-flight re-index.
+//
+// Deliberately lock-free: this is the first statement of the daemon's shutdown
+// hook, and it used to take the coarse controller mutex just to read the
+// watcher pointer, which meant `gortex daemon stop` queued behind whatever
+// long operation was holding it.
+func (c *realController) StopWatcher() {
+	if mw := c.watcher(); mw != nil {
+		_ = mw.Stop()
+	}
 }
 
 // MarkReady flips the ready flag once references are resolved and the graph
@@ -1294,12 +1341,22 @@ func (c *realController) IsEnriched() bool {
 
 // Shutdown gives the caller (the daemon main) a chance to flush any
 // per-instance stores. The actual socket teardown is the Server's job.
+//
+// Takes shutdownMu, never mu: a stop request must not queue behind the
+// long-running work it is trying to end.
 func (c *realController) Shutdown(_ context.Context) error {
-	c.mu.Lock()
+	c.shutdownMu.Lock()
 	hook := c.onShutdown
-	c.mu.Unlock()
+	c.shutdownMu.Unlock()
 	if hook != nil {
 		return hook()
 	}
 	return nil
+}
+
+// setShutdownHook installs the flush-and-close hook Shutdown invokes.
+func (c *realController) setShutdownHook(hook func() error) {
+	c.shutdownMu.Lock()
+	c.onShutdown = hook
+	c.shutdownMu.Unlock()
 }

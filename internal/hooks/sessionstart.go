@@ -94,9 +94,9 @@ func fetchDaemonStatus() (*daemon.StatusResponse, error) {
 	}
 	defer client.Close()
 
-	_ = client.Conn.SetDeadline(time.Now().Add(2 * time.Second))
-
-	resp, err := client.Control(daemon.ControlStatus, nil)
+	// Explicit budget: a session-start hook must degrade fast, well inside
+	// Control's default, so a busy daemon delays nothing the user sees.
+	resp, err := client.ControlWithTimeout(daemon.ControlStatus, nil, 2*time.Second)
 	if err != nil {
 		return nil, err
 	}
