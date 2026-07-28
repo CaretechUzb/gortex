@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -176,4 +177,29 @@ func phpNamesACallee(n *sitter.Node) bool {
 		return true
 	}
 	return false
+}
+
+// phpDocTestTagRe matches PHPUnit's docblock test marker. The tag must stand
+// alone on its line so `@testWith` and prose mentioning `@test` in a sentence
+// do not mark the method.
+var phpDocTestTagRe = regexp.MustCompile(`(?m)^\s*\*?\s*@test\s*$`)
+
+// emitPHPDocTestAnnotation mints the annotation edge for the `@test` docblock
+// marker, PHPUnit's pre-attribute way of declaring a test whose name does not
+// start with `test`. The `#[Test]` attribute form already reaches the graph
+// through collectPhpAttributes; this is the docblock twin, and it lands on the
+// same annotation node so AnnotationTestRole sees one shape.
+func (e *PHPExtractor) emitPHPDocTestAnnotation(
+	node *sitter.Node, src []byte,
+	filePath, ownerID string,
+	result *parser.ExtractionResult, seen map[string]bool,
+) {
+	doc := phpDocBlockAbove(node, src)
+	if doc == "" || !phpDocTestTagRe.MatchString(doc) {
+		return
+	}
+	emitPHPAnnotationEdgesFromAttrs(
+		[]phpAttribute{{name: "Test", line: int(node.StartPoint().Row) + 1}},
+		ownerID, filePath, result, seen,
+	)
 }

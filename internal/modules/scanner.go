@@ -1046,6 +1046,8 @@ func ecosystemLanguage(ecosystem string) string {
 		return "rust"
 	case "maven":
 		return "java"
+	case "composer":
+		return "php"
 	default:
 		return ""
 	}
@@ -1077,4 +1079,215 @@ func isMajorVersionSegment(s string) bool {
 		}
 	}
 	return true
+}
+
+// ParseComposerJSON reads a PHP composer.json into dependency Specs.
+//
+// composer.json's `require` block mixes real packages with PLATFORM
+// constraints — `php`, `hhvm`, the `ext-*` PHP extensions, `lib-*` system
+// libraries and the `composer-*` runtime pseudo-packages. Those name no
+// installable package and would mint module nodes nothing can ever depend on,
+// so they are skipped.
+//
+// `require-dev` follows the package.json convention: Indirect true with the
+// block tagged on Replace, so an agent can scope to production dependencies
+// without a second axis. Version constraints stay verbatim (`^3.0`, `~1.2.3`,
+// `>=2 <3`) — composer.lock carries the resolved versions.
+func ParseComposerJSON(source []byte) []Spec {
+	if len(source) == 0 {
+		return nil
+	}
+	var manifest struct {
+		Require    map[string]string `json:"require"`
+		RequireDev map[string]string `json:"require-dev"`
+	}
+	if err := json.Unmarshal(source, &manifest); err != nil {
+		return nil
+	}
+	var specs []Spec
+	specs = append(specs, composerBlock(manifest.Require, "")...)
+	specs = append(specs, composerBlock(manifest.RequireDev, "dev")...)
+	return specs
+}
+
+// ParseComposerLock reads the resolved package set from composer.lock. The
+// lockfile supersedes the manifest's version ranges with exact versions, the
+// same way package-lock.json supersedes package.json.
+func ParseComposerLock(source []byte) []Spec {
+	if len(source) == 0 {
+		return nil
+	}
+	var lock struct {
+		Packages    []composerLockEntry `json:"packages"`
+		PackagesDev []composerLockEntry `json:"packages-dev"`
+	}
+	if err := json.Unmarshal(source, &lock); err != nil {
+		return nil
+	}
+	var specs []Spec
+	specs = append(specs, composerLockBlock(lock.Packages, "")...)
+	specs = append(specs, composerLockBlock(lock.PackagesDev, "dev")...)
+	return specs
+}
+
+type composerLockEntry struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+func composerLockBlock(entries []composerLockEntry, kind string) []Spec {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]Spec, 0, len(entries))
+	for _, e := range entries {
+		if e.Name == "" || isComposerPlatformPackage(e.Name) {
+			continue
+		}
+		out = append(out, Spec{
+			Ecosystem: "composer",
+			Path:      e.Name,
+			Version:   e.Version,
+			Indirect:  kind != "",
+			Replace:   kind,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+func composerBlock(deps map[string]string, kind string) []Spec {
+	if len(deps) == 0 {
+		return nil
+	}
+	out := make([]Spec, 0, len(deps))
+	for name, version := range deps {
+		if isComposerPlatformPackage(name) {
+			continue
+		}
+		out = append(out, Spec{
+			Ecosystem: "composer",
+			Path:      name,
+			Version:   version,
+			Indirect:  kind != "",
+			Replace:   kind,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// isComposerPlatformPackage reports whether a composer requirement names the
+// runtime rather than an installable package.
+func isComposerPlatformPackage(name string) bool {
+	switch name {
+	case "php", "php-64bit", "php-ipv6", "php-zts", "php-debug", "hhvm":
+		return true
+	}
+	return strings.HasPrefix(name, "ext-") ||
+		strings.HasPrefix(name, "lib-") ||
+		strings.HasPrefix(name, "composer-") ||
+		name == "composer"
+}
+
+// ComposerAutoloadRoots reads composer.json's PSR-4 and PSR-0 autoload maps
+// into namespace-prefix → repo-relative-directory pairs, covering both the
+// `autoload` and `autoload-dev` blocks. A prefix may map to several
+// directories, and composer allows the value to be either a string or an array
+// of strings.
+//
+// This is what tells first-party namespaces from vendor ones: a `use` of a
+// namespace under one of these prefixes names code in this repo, anything else
+// comes from a dependency.
+func ComposerAutoloadRoots(source []byte) map[string][]string {
+	if len(source) == 0 {
+		return nil
+	}
+	var manifest struct {
+		Autoload    composerAutoload `json:"autoload"`
+		AutoloadDev composerAutoload `json:"autoload-dev"`
+	}
+	if err := json.Unmarshal(source, &manifest); err != nil {
+		return nil
+	}
+	out := map[string][]string{}
+	for _, block := range []composerAutoload{manifest.Autoload, manifest.AutoloadDev} {
+		for _, m := range []map[string]json.RawMessage{block.PSR4, block.PSR0} {
+			for prefix, raw := range m {
+				prefix = strings.TrimRight(strings.TrimSpace(prefix), `\`)
+				if prefix == "" {
+					continue // the catch-all "" prefix maps everything; not a root
+				}
+				for _, dir := range composerAutoloadDirs(raw) {
+					out[prefix] = appendUniqueString(out[prefix], dir)
+				}
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	for k := range out {
+		sort.Strings(out[k])
+	}
+	return out
+}
+
+type composerAutoload struct {
+	PSR4 map[string]json.RawMessage `json:"psr-4"`
+	PSR0 map[string]json.RawMessage `json:"psr-0"`
+}
+
+// composerAutoloadDirs normalises an autoload value, which composer allows to
+// be a bare string or an array of strings.
+func composerAutoloadDirs(raw json.RawMessage) []string {
+	var one string
+	if err := json.Unmarshal(raw, &one); err == nil {
+		if d := normalizeComposerDir(one); d != "" {
+			return []string{d}
+		}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(many))
+	for _, d := range many {
+		if d := normalizeComposerDir(d); d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func normalizeComposerDir(d string) string {
+	d = strings.TrimSpace(d)
+	d = strings.TrimPrefix(d, "./")
+	return strings.TrimRight(d, "/")
+}
+
+func appendUniqueString(list []string, v string) []string {
+	for _, x := range list {
+		if x == v {
+			return list
+		}
+	}
+	return append(list, v)
+}
+
+// ComposerOwnName returns the `name` a composer.json declares for itself
+// (`vendor/package`), used to keep a repo's own package out of its dependency
+// list.
+func ComposerOwnName(source []byte) string {
+	if len(source) == 0 {
+		return ""
+	}
+	var manifest struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(source, &manifest); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(manifest.Name)
 }

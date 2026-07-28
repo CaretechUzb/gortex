@@ -7885,6 +7885,17 @@ func (idx *Indexer) extractExternalModules() {
 			parse:          modules.ParsePomXML,
 			ownPathFromSrc: readPomXMLOwnName,
 		},
+		{
+			path:           "composer.json",
+			parse:          modules.ParseComposerJSON,
+			ownPathFromSrc: modules.ComposerOwnName,
+		},
+		{
+			path:  "composer.lock",
+			parse: modules.ParseComposerLock,
+			// The lockfile has no own-name notion separate from composer.json.
+			ownPathFromSrc: nil,
+		},
 	}
 
 	for _, m := range manifests {
@@ -7936,6 +7947,15 @@ func (idx *Indexer) extractOneModuleManifestSource(
 		FilePath: relPath,
 		Language: manifestLanguage(relPath),
 	}
+	// composer.json's autoload map is the only statement a PHP repo makes
+	// about which namespaces are its own. Carried on the manifest node so the
+	// resolver can tell a first-party `use` from a dependency's without
+	// re-reading the file.
+	if filepath.Base(relPath) == "composer.json" {
+		if roots := modules.ComposerAutoloadRoots(src); len(roots) > 0 {
+			manifestNode.Meta = map[string]any{"php_autoload_roots": encodeComposerAutoloadRoots(roots)}
+		}
+	}
 	allNodes := append([]*graph.Node{manifestNode}, nodes...)
 	idx.applyRepoPrefix(allNodes, edges)
 	idx.graph.AddBatch(allNodes, edges)
@@ -7966,6 +7986,22 @@ func (idx *Indexer) extractOneModuleManifestSource(
 	modules.LinkImportsIn(idx.graph, importNodes, specs, ownModulePath)
 }
 
+// encodeComposerAutoloadRoots flattens the PSR-4 / PSR-0 map into the
+// `Prefix=>dir,dir;Prefix=>dir` form graph Meta can hold (Meta is gob-encoded,
+// so a nested map costs a codec entry per shape). Sorted for determinism.
+func encodeComposerAutoloadRoots(roots map[string][]string) string {
+	prefixes := make([]string, 0, len(roots))
+	for p := range roots {
+		prefixes = append(prefixes, p)
+	}
+	sort.Strings(prefixes)
+	parts := make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		parts = append(parts, p+"=>"+strings.Join(roots[p], ","))
+	}
+	return strings.Join(parts, ";")
+}
+
 // manifestLanguage returns the language tag stamped on a manifest's
 // synthetic file node. Used purely for Brief listings — the kind
 // field carries the structural type.
@@ -7985,6 +8021,11 @@ func manifestLanguage(relPath string) string {
 		return "text"
 	case "pom.xml":
 		return "xml"
+	case "composer.json", "composer.lock":
+		// "json", never "php": the synthetic manifest node shares its ID with
+		// the JSON extractor's file node, and a php-tagged file would vouch
+		// for PHP presence in a repo that holds no PHP source.
+		return "json"
 	}
 	return ""
 }

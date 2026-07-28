@@ -607,6 +607,11 @@ func detectTestRunnerForFileEdges(fileNode *graph.Node, outEdges []*graph.Edge) 
 		case strings.HasSuffix(stem, "_test"):
 			return "minitest"
 		}
+	case "php":
+		// PHPUnit is the default when nothing more specific was imported.
+		// Pest reuses the same file layout, so it is only claimed when the
+		// import signal above actually saw it.
+		return "phpunit"
 	}
 	return ""
 }
@@ -643,6 +648,28 @@ func detectRunnerFromImportEdgeSlice(fileNode *graph.Node, edges []*graph.Edge) 
 			case path == "mocha" || strings.HasPrefix(path, "mocha/"),
 				path == "@types/mocha", path == "mochawesome":
 				return "mocha"
+			}
+		case "php":
+			// Read the namespace off the edge rather than its target: a PHP
+			// import that resolved to the class it names — or fell through to
+			// an external:: stub — no longer carries the specifier in e.To.
+			// Meta["fqn"] is stamped at extraction and survives both.
+			ns := path
+			if e.Meta != nil {
+				if fqn, _ := e.Meta["fqn"].(string); fqn != "" {
+					ns = fqn
+				}
+			}
+			ns = strings.ReplaceAll(ns, `\`, "/")
+			switch {
+			case ns == "Pest" || strings.HasPrefix(ns, "Pest/"):
+				return "pest"
+			case strings.HasPrefix(ns, "PHPUnit/"):
+				return "phpunit"
+			case strings.HasPrefix(ns, "Codeception/"):
+				return "codeception"
+			case strings.HasPrefix(ns, "Behat/"):
+				return "behat"
 			}
 		case "python":
 			switch {

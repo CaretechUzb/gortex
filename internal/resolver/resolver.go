@@ -3041,6 +3041,24 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 		}
 	}
 
+	// PHP: a `use App\Log\Handler;` names a CLASS, not a directory. The
+	// cascade below is package-directory-oriented, so every PHP import fell
+	// through to an external stub — which starved buildImportClosure and left
+	// the cross-package guard reverting cross-directory PHP calls as
+	// unreachable. The extractor records the fully-qualified name on the edge;
+	// binding it to the class node makes that class's directory reachable.
+	if fqn := phpEdgeMetaString(e, "fqn"); fqn != "" {
+		if matches := r.phpFindByFQN(fqn, callerRepo); len(matches) == 1 {
+			node := matches[0]
+			e.To = node.ID
+			if callerRepo != "" && node.RepoPrefix != "" && node.RepoPrefix != callerRepo {
+				e.CrossRepo = true
+			}
+			stats.Resolved++
+			return
+		}
+	}
+
 	// Look for a package node with matching qualified name.
 	node := r.cachedGetNodeByQualName(importPath)
 	if node != nil {
@@ -3420,6 +3438,14 @@ func (r *Resolver) resolveTypeOrFunc(e *graph.Edge, name string, stats *ResolveS
 
 	callerDir := r.dirFor(e.FilePath)
 
+	// PHP: narrow to the namespace the source actually names before ranking.
+	// `new User()` in a file that imports App\Models\User must not land on
+	// App\Entities\User just because it sorts better. See
+	// phpNarrowByTargetFQN — narrowing only, never a loss.
+	if narrowed := phpNarrowByTargetFQN(e, candidates); len(narrowed) > 0 {
+		candidates = narrowed
+	}
+
 	// Land the edge on the canonical type/interface definition (real,
 	// exported, top-level, non-test), preferring same-package only as a
 	// tiebreak. See bestTypeCandidate / resolveTypeRef for the rationale:
@@ -3472,6 +3498,16 @@ func (r *Resolver) resolveTypeRef(e *graph.Edge, name string, stats *ResolveStat
 		return
 	}
 	callerDir := r.dirFor(e.FilePath)
+
+	// PHP: the extractor recorded the fully-qualified name the source names,
+	// resolved through the file's `use` imports. Narrowing to the candidates
+	// declared under that namespace is the difference between `App\Models\User`
+	// and `App\Entities\User`, which the bare name cannot tell apart. Narrowing
+	// only — when no candidate matches, the full set is ranked as before, so
+	// this can sharpen a binding but never lose one.
+	if narrowed := phpNarrowByTargetFQN(e, candidates); len(narrowed) > 0 {
+		candidates = narrowed
+	}
 
 	// Land the edge on the canonical type/interface definition. The
 	// ranker prefers a real, exported, top-level, non-test definition
@@ -3669,6 +3705,32 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		}
 	}
 
+	// PHP: a receiver typed as a class this repo DEFINES, whose type declares
+	// no method of this name, is calling something it INHERITS. Neither
+	// fallback below can express that, and both actively mis-bind it.
+	//
+	// The caller-receiver fallback would answer `$this->handler->setFormatter()`
+	// inside BufferHandler::setFormatter with BufferHandler::setFormatter — the
+	// caller itself — because it only asks whether the CALLER's class has a
+	// method of that name, and the stated receiver (HandlerInterface) is a
+	// different type entirely. The locality fallback then picks by directory
+	// adjacency, and a PHP package is one directory holding every sibling
+	// implementation of an interface, so `$this->getFormatter()` inside
+	// AmqpHandler lands on whichever sibling handler sorts first.
+	//
+	// Leave the edge for resolvePHPOverrideDispatch, which walks the class
+	// hierarchy from the stated receiver and binds the nearest declaration.
+	// Gated on the receiver being in-repo: when it names a vendor class the
+	// hierarchy is not in the graph either, so withholding the fallbacks would
+	// only lose the edge without anywhere better to put it.
+	if receiverType != "" &&
+		r.hasInRepoType(phpBaseTypeName(receiverType), r.callerRepoPrefix(e)) {
+		if caller := r.cachedGetNode(e.From); phpTypedReceiverCaller(caller) {
+			stats.Unresolved++
+			return
+		}
+	}
+
 	// Fallback: infer receiver type from the caller node.
 	// If the caller is a method on type X and there's a candidate method on
 	// type X with the same name, prefer it.  This handles e.extractFunctions()
@@ -3706,24 +3768,6 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	// ambiguous stays unresolved rather than misattributing to a same-name
 	// method on an unrelated type.
 	if r.tryBindCSharpExtension(e, methodName, receiverType, rawCandidates, stats) {
-		return
-	}
-
-	// PHP: a receiver typed as a class this repo DEFINES, whose type declares
-	// no method of this name, is calling something it INHERITS. The locality
-	// fallback below cannot express that — it picks by directory adjacency, and
-	// a PHP package is one directory holding every sibling implementation, so
-	// `$this->getFormatter()` inside AmqpHandler lands on whichever sibling
-	// handler sorts first rather than on the trait or interface that declares
-	// it. Leave the edge for resolvePHPOverrideDispatch, which walks the class
-	// hierarchy from the stated receiver and binds the nearest declaration.
-	//
-	// Gated on the receiver being in-repo: when it names a vendor class the
-	// hierarchy is not in the graph either, so withholding the locality pick
-	// would only lose the edge without anywhere better to put it.
-	if receiverType != "" && phpTypedReceiverCaller(callerNode) &&
-		r.hasInRepoType(phpBaseTypeName(receiverType), r.callerRepoPrefix(e)) {
-		stats.Unresolved++
 		return
 	}
 
@@ -3795,8 +3839,8 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	// grounded inference, not a text-grade guess: there is nowhere else it
 	// could bind. Lift it to the ast_inferred tier so min_tier filtering and
 	// the cross-package guard treat it as the resolved target it is (the guard's
-	// lone-definition exception keeps it from being reverted). Statically-typed
-	// languages only (java, go) — see loneMemberLang.
+	// lone-definition exception keeps it from being reverted). Limited to the
+	// class-dispatch languages — see loneMemberLang.
 	if methodCount == 1 && anyMethod != nil && loneMemberLang(anyMethod.Language) && e.Origin == "" {
 		e.Origin = graph.OriginASTInferred
 		if e.Confidence == 0 {

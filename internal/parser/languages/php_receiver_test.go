@@ -276,23 +276,46 @@ function boot(array $all): void {
 	assert.Equal(t, "StreamHandler", rt)
 }
 
-// A union or intersection declaration names more than one possible runtime
-// class, so no single receiver_type is defensible.
-func TestPHPReceiver_UnionAndIntersectionStayUntyped(t *testing.T) {
-	for name, src := range map[string]string{
-		"union": `<?php
+// A union names ALTERNATIVES — the value is one of them, so picking a branch
+// would bind the call to the wrong class at the resolved tier.
+func TestPHPReceiver_UnionStaysUntyped(t *testing.T) {
+	rt, found := phpCallReceiver(t, `<?php
 function run(StreamHandler|NullHandler $h): void { $h->close(); }
-`,
-		"intersection": `<?php
-function run(Countable&Traversable $h): void { $h->close(); }
-`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			rt, found := phpCallReceiver(t, src, "close")
-			require.True(t, found)
-			assert.Equal(t, "", rt)
-		})
-	}
+`, "close")
+	require.True(t, found)
+	assert.Equal(t, "", rt)
+}
+
+// An intersection is the opposite: the value is EVERY branch at once, so any
+// branch is a true statement about it. `Foo&MockObject` is the idiomatic type
+// of a mocked collaborator in a modern PHP test suite, and leaving it untyped
+// gave up the whole call. If the method lives on a different branch the
+// hierarchy walk from this one finds nothing and the call stays unresolved —
+// never a wrong bind.
+func TestPHPReceiver_IntersectionTakesFirstBranch(t *testing.T) {
+	rt, found := phpCallReceiver(t, `<?php
+function run(PushoverHandler&MockObject $h): void { $h->handle(); }
+`, "handle")
+	require.True(t, found)
+	assert.Equal(t, "PushoverHandler", rt)
+}
+
+// A builtin branch names no graph node, so the first bindable one is taken.
+func TestPHPReceiver_IntersectionSkipsBuiltinBranch(t *testing.T) {
+	rt, found := phpCallReceiver(t, `<?php
+function run(iterable&Traversable $h): void { $h->rewind(); }
+`, "rewind")
+	require.True(t, found)
+	assert.Equal(t, "Traversable", rt)
+}
+
+// A nullable union is still a union.
+func TestPHPReceiver_NullableUnionStaysUntyped(t *testing.T) {
+	rt, found := phpCallReceiver(t, `<?php
+function run(StreamHandler|NullHandler|null $h): void { $h->close(); }
+`, "close")
+	require.True(t, found)
+	assert.Equal(t, "", rt)
 }
 
 // A builtin scalar type names no graph node, so it must not be stamped.
