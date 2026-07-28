@@ -592,9 +592,96 @@ func (e *PythonExtractor) emitClass(m parser.QueryResult, filePath, fileID strin
 	// PEP-695 generic class declarations (`class Foo[T]:`) carry a
 	// `type_parameters` child same as functions; reuse the helper.
 	emitPyGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
+	// Base classes: `class A(B, mod.C, Generic[T])`.
+	pyEmitBaseClassEdges(def.Node, src, id, filePath, result)
 	// ORM model attribution: emit EdgeModelsTable when the class
 	// inherits from a known ORM base (SQLAlchemy / Django).
 	detectPythonORMModel(def.Node, src, id, name, filePath, result)
+}
+
+// pyEmitBaseClassEdges emits one EdgeExtends per declared base class.
+// Python was the only major language in the graph emitting no
+// inheritance edges at all — C#, Dart, Erlang, Go, Haskell, Java,
+// Kotlin, Pascal, PHP, R, Ruby, Rust and TypeScript all do — which left
+// every hierarchy-shaped query (relations hierarchy, override dispatch,
+// mixin reachability, abstract-base coverage) blind on Python. 83% of
+// classes in a 4,392-file corpus of Django, SQLAlchemy, pydantic, rich,
+// flask, httpx and requests declare at least one base: 21,290 of 25,576.
+//
+// The `superclasses` field is an argument_list, so besides real bases it
+// carries keyword arguments (`metaclass=ABCMeta`, PEP-487
+// `__init_subclass__` kwargs) and splats (`*bases`). Those are skipped
+// rather than minted as phantom parents — a wrong parent edge would
+// propagate through every inherited-member walk that trusts it.
+func pyEmitBaseClassEdges(classNode *sitter.Node, src []byte, typeID, filePath string, result *parser.ExtractionResult) {
+	if classNode == nil {
+		return
+	}
+	supers := classNode.ChildByFieldName("superclasses")
+	if supers == nil {
+		return
+	}
+	seen := map[string]bool{}
+	for i, _nc := 0, int(supers.NamedChildCount()); i < _nc; i++ {
+		arg := supers.NamedChild(i)
+		if arg == nil {
+			continue
+		}
+		name, qualified, generic := pyBaseClassName(arg, src)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		edge := &graph.Edge{
+			From: typeID, To: "unresolved::" + name, Kind: graph.EdgeExtends,
+			FilePath: filePath, Line: int(arg.StartPoint().Row) + 1,
+		}
+		meta := map[string]any{}
+		// Keep the written-out path (`models.Model`) alongside the bare
+		// name. 330 class names in the corpus are defined in more than one
+		// file, so the bare name alone cannot pick out the right base —
+		// the qualifier is what a resolver needs to disambiguate.
+		if qualified != "" && qualified != name {
+			meta["base_path"] = qualified
+		}
+		if generic {
+			meta["via"] = "generic"
+		}
+		if len(meta) > 0 {
+			edge.Meta = meta
+		}
+		result.Edges = append(result.Edges, edge)
+	}
+}
+
+// pyBaseClassName reduces one entry of a class's superclass list to its
+// bare base-class name, the written-out path, and whether it was written
+// as a generic subscript. Returns an empty name for entries that are not
+// base classes at all.
+func pyBaseClassName(arg *sitter.Node, src []byte) (name, qualified string, generic bool) {
+	switch arg.Type() {
+	case "identifier":
+		text := strings.TrimSpace(arg.Content(src))
+		return text, text, false
+	case "attribute":
+		// `models.Model`, `abc.ABC` — bind on the trailing name, the same
+		// reduction pyRaiseExceptionName uses for `raise mod.Err`.
+		text := strings.TrimSpace(arg.Content(src))
+		if i := strings.LastIndex(text, "."); i >= 0 {
+			return strings.TrimSpace(text[i+1:]), text, false
+		}
+		return text, text, false
+	case "subscript":
+		// `Generic[T]`, `Sequence[int]`, `Protocol[T]` — the base is the
+		// subscripted value; the type arguments are not parents.
+		if v := arg.ChildByFieldName("value"); v != nil {
+			n, q, _ := pyBaseClassName(v, src)
+			return n, q, true
+		}
+	}
+	// keyword_argument (`metaclass=…`), list_splat (`*bases`),
+	// dictionary_splat (`**kwargs`), call — not a base class.
+	return "", "", false
 }
 
 // pyDecoratorNodes returns the `decorator` AST nodes attached to a
