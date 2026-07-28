@@ -50,10 +50,10 @@ func (s *Server) handleVerifyCitation(ctx context.Context, req mcp.CallToolReque
 		sha = "HEAD"
 	}
 
-	// Resolve the working tree this file lives in. Multi-repo mode
-	// uses the repo prefix on `file_path`; single-repo mode uses the
-	// indexer root. The shared resolveFilePath already encodes both
-	// rules and rejects escapes.
+	// Resolve the working tree this file lives in — via the repo prefix
+	// on `file_path`, or the sole tracked repo's root for an unqualified
+	// path. The shared resolveFilePath already encodes both rules and
+	// rejects escapes.
 	absPath, relPath, err := s.resolveFilePath(rawPath)
 	if err != nil {
 		return s.respondJSONOrTOON(ctx, req, citationFailure(sha, rawPath, fmt.Sprintf("resolve path: %v", err)))

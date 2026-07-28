@@ -613,10 +613,10 @@ func TestEnvConsumer_SymbolIDSet(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Single-repo mode skips RepoPrefix, so the SymbolID is unprefixed.
-	// The point is the anchor is set at all — that's what T1.2's bridge
-	// emission check requires.
-	want := "config.go::loadDatabase"
+	// The point is that the anchor is set at all — that's what the bridge
+	// emission check requires. The id carries the repo prefix like every
+	// other node's.
+	want := "svc/config.go::loadDatabase"
 	var found bool
 	for _, e := range g.AllEdges() {
 		if e.Kind == graph.EdgeConsumes && e.From == want && e.To == "env::DATABASE_URL" {

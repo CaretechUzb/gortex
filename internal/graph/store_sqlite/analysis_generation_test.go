@@ -334,7 +334,10 @@ func TestAnalysisGenerationV4MigrationPreservesGraphAndDropsProvisionalCache(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	store.AddNode(&graph.Node{ID: "kept", Kind: graph.KindFunction, Name: "Kept", FilePath: "kept.go"})
+	// An OWNED node. A file-backed node with an empty repo_prefix is
+	// single-repo-mode residue, which the v7 migration in this same chain
+	// purges by design.
+	store.AddNode(&graph.Node{ID: "repo/kept.go::Kept", Kind: graph.KindFunction, Name: "Kept", FilePath: "repo/kept.go", RepoPrefix: "repo"})
 	if _, err := store.writerDB.Exec(`CREATE TABLE analysis_cache(component TEXT PRIMARY KEY, format_version INTEGER NOT NULL, payload BLOB NOT NULL) WITHOUT ROWID; INSERT INTO analysis_cache(component,format_version,payload) VALUES('pagerank',1,'unreleased-v3')`); err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +368,7 @@ func TestAnalysisGenerationV4MigrationPreservesGraphAndDropsProvisionalCache(t *
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if store.GetNode("kept") == nil {
+	if store.GetNode("repo/kept.go::Kept") == nil {
 		t.Fatal("v4 in-place migration lost graph rows")
 	}
 	var version, tables, provisional int

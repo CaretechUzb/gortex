@@ -287,13 +287,21 @@ func (o QueryOptions) ScopeAllows(n *graph.Node) bool {
 			}
 		}
 	}
-	// A node with an empty RepoPrefix was minted in single-repo
-	// (unprefixed) mode — the RepoAllow keys are registry prefixes,
-	// which unprefixed nodes never carry, so a repo narrow can only
-	// ever be satisfied vacuously. Admit the node: the workspace /
-	// project checks above still bound it for scoped sessions. Same
-	// carve-out the MCP layer's filterNodes / field-query / API-impact
-	// filters already apply.
+	// A node with an empty RepoPrefix is not owned by any repository, so a
+	// repo narrow can only ever be satisfied vacuously — the RepoAllow keys
+	// are registry prefixes, which such nodes never carry. Admit it: the
+	// workspace / project checks above still bound it for scoped sessions.
+	//
+	// Two populations land here. Synthetic global externals (dep::,
+	// external::, non-Go module::) model third-party symbols owned by no
+	// repo and are visible from every scope by construction — that is the
+	// durable reason. Nodes minted in single-repo (unprefixed) mode are the
+	// historical one, and go away once prefixing is unconditional.
+	//
+	// This is the same carve-out the MCP layer's filterNodes / field-query /
+	// API-impact filters apply. Every repo-narrow predicate in the codebase
+	// must agree on it: one that rejects instead of admitting turns a scoped
+	// query into an empty result rather than a narrower one.
 	if len(o.RepoAllow) > 0 && n.RepoPrefix != "" && !o.RepoAllow[n.RepoPrefix] {
 		return false
 	}

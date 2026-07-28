@@ -1111,6 +1111,25 @@ func (cr *CrossRepoResolver) callerRepoPrefix(e *graph.Edge) string {
 	return ""
 }
 
+// isCrossRepoHop reports whether resolving from callerRepo to targetRepo
+// actually crosses a repository boundary.
+//
+// An empty targetRepo is NOT a crossing. Synthetic global externals —
+// `dep::…`, `external::…`, non-Go `module::…` — carry no repo prefix because
+// they model third-party symbols owned by no repository and visible from
+// every one. Stamping Edge.CrossRepo on them inflates cross-repo edge counts
+// and files them under stats.ByRepo[""], a key that names no repo, so
+// `analyze kind=cross_repo` reports boundary crossings that never happened.
+//
+// This was invisible while a lone repo indexed unprefixed: caller and
+// candidate were both "" so the same-repo tier claimed global externals
+// first. Once every repo carries a prefix they fall through to the
+// cross-repo fallback tier instead, where the reachability gate admits any
+// empty target unconditionally.
+func isCrossRepoHop(callerRepo, targetRepo string) bool {
+	return targetRepo != "" && targetRepo != callerRepo
+}
+
 func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *CrossRepoStats) {
 	candidates := cr.scopedCandidates(e, funcName)
 	if len(candidates) == 0 {
@@ -1151,10 +1170,12 @@ func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string,
 			continue
 		}
 		e.To = c.ID
-		e.CrossRepo = true
 		stats.Resolved++
-		stats.CrossRepoEdges++
-		stats.ByRepo[c.RepoPrefix]++
+		if isCrossRepoHop(callerRepo, c.RepoPrefix) {
+			e.CrossRepo = true
+			stats.CrossRepoEdges++
+			stats.ByRepo[c.RepoPrefix]++
+		}
 		return
 	}
 
@@ -1179,7 +1200,7 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	// the same treatment (issue #136).
 	if to := resolveJSTSImportTarget(cr.cachedGetNode, cr.pathAlias, jsTSImportCallerFile(e), importPath); to != "" {
 		e.To = to
-		if picked := cr.cachedGetNode(to); picked != nil && picked.RepoPrefix != callerRepo {
+		if picked := cr.cachedGetNode(to); picked != nil && isCrossRepoHop(callerRepo, picked.RepoPrefix) {
 			e.CrossRepo = true
 			stats.CrossRepoEdges++
 			stats.ByRepo[picked.RepoPrefix]++
@@ -1202,7 +1223,7 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 		}
 		if picked != nil {
 			e.To = picked.ID
-			if picked.RepoPrefix != callerRepo {
+			if isCrossRepoHop(callerRepo, picked.RepoPrefix) {
 				e.CrossRepo = true
 				stats.CrossRepoEdges++
 				stats.ByRepo[picked.RepoPrefix]++
@@ -1304,10 +1325,12 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	// appear later in the list.
 	if picked := cr.pickImportCandidate(callerWS, importPath, crossRepoAll); picked != nil {
 		e.To = picked.ID
-		e.CrossRepo = true
 		stats.Resolved++
-		stats.CrossRepoEdges++
-		stats.ByRepo[picked.RepoPrefix]++
+		if isCrossRepoHop(callerRepo, picked.RepoPrefix) {
+			e.CrossRepo = true
+			stats.CrossRepoEdges++
+			stats.ByRepo[picked.RepoPrefix]++
+		}
 		return
 	}
 
@@ -1328,7 +1351,7 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 			if node := cr.cachedGetNodeByQualName(pkg); node != nil &&
 				cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(node), pkg) {
 				e.To = node.ID
-				if node.RepoPrefix != callerRepo {
+				if isCrossRepoHop(callerRepo, node.RepoPrefix) {
 					e.CrossRepo = true
 					stats.CrossRepoEdges++
 					stats.ByRepo[node.RepoPrefix]++
@@ -1382,11 +1405,13 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 				continue
 			}
 			e.To = c.ID
-			e.CrossRepo = true
 			e.Confidence = 0.85
 			stats.Resolved++
-			stats.CrossRepoEdges++
-			stats.ByRepo[c.RepoPrefix]++
+			if isCrossRepoHop(callerRepo, c.RepoPrefix) {
+				e.CrossRepo = true
+				stats.CrossRepoEdges++
+				stats.ByRepo[c.RepoPrefix]++
+			}
 			return
 		}
 	}
@@ -1410,10 +1435,12 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 			continue
 		}
 		e.To = c.ID
-		e.CrossRepo = true
 		stats.Resolved++
-		stats.CrossRepoEdges++
-		stats.ByRepo[c.RepoPrefix]++
+		if isCrossRepoHop(callerRepo, c.RepoPrefix) {
+			e.CrossRepo = true
+			stats.CrossRepoEdges++
+			stats.ByRepo[c.RepoPrefix]++
+		}
 		return
 	}
 	for _, c := range candidates {
@@ -1434,10 +1461,12 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 			continue
 		}
 		e.To = c.ID
-		e.CrossRepo = true
 		stats.Resolved++
-		stats.CrossRepoEdges++
-		stats.ByRepo[c.RepoPrefix]++
+		if isCrossRepoHop(callerRepo, c.RepoPrefix) {
+			e.CrossRepo = true
+			stats.CrossRepoEdges++
+			stats.ByRepo[c.RepoPrefix]++
+		}
 		return
 	}
 

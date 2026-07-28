@@ -406,6 +406,21 @@ type surfaceResult struct {
 	Memories  []surfaceHit `json:"memories,omitempty"`
 	Anchors   []string     `json:"anchors,omitempty"`
 	Truncated bool         `json:"truncated,omitempty"`
+
+	// AnchorDiagnostic explains an empty result that anchors should have
+	// filled. Surfacing works by string-equality between the caller's
+	// symbol ids and the ids stored on each memory, so anything that
+	// changes symbol-id SHAPE — a repo prefix appearing or disappearing,
+	// a file move, a rename — silently severs every stored anchor and
+	// returns Total: 0 that reads identically to "nothing relevant".
+	// Populated only when there were anchors and no hits, so the happy
+	// path pays nothing.
+	AnchorDiagnostic string `json:"anchor_diagnostic,omitempty"`
+	// StaleAnchors counts stored anchor symbol ids that no longer name a
+	// live graph node. A high count against a healthy graph means the ids
+	// were written under a different id convention.
+	StaleAnchors       int      `json:"stale_anchors,omitempty"`
+	StaleAnchorSamples []string `json:"stale_anchor_samples,omitempty"`
 }
 
 type surfaceHit struct {
@@ -423,6 +438,70 @@ type surfaceHit struct {
 	Score        float32   `json:"score"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	MatchReasons []string  `json:"match_reasons,omitempty"`
+}
+
+// diagnoseEmptyAnchoredResult explains a surface that returned nothing
+// despite the caller supplying anchors and the store holding memories.
+//
+// The common cause is not "nothing relevant" but a symbol-id SHAPE change:
+// surfacing matches stored ids against caller ids by string equality, so a
+// repo prefix appearing (or disappearing) severs every stored anchor at
+// once. Counting the stored anchors that no longer name a live graph node
+// separates that from a genuine miss — a store full of ids the graph has
+// never heard of is a convention mismatch, not an empty topic.
+//
+// Bounded: at most staleAnchorProbeCap ids are probed, so a large store
+// cannot turn an empty result into an expensive one.
+func (res *surfaceResult) diagnoseEmptyAnchoredResult(
+	candidates []persistence.MemoryEntry,
+	resolveNode func(string) *graph.Node,
+) {
+	if resolveNode == nil {
+		return
+	}
+	const staleAnchorProbeCap = 200
+	const staleAnchorSampleCap = 3
+
+	probed, live := 0, 0
+	seen := make(map[string]struct{}, staleAnchorProbeCap)
+	for _, e := range candidates {
+		for _, sym := range e.SymbolIDs {
+			if sym == "" {
+				continue
+			}
+			if _, dup := seen[sym]; dup {
+				continue
+			}
+			seen[sym] = struct{}{}
+			if probed >= staleAnchorProbeCap {
+				break
+			}
+			probed++
+			if resolveNode(sym) != nil {
+				live++
+				continue
+			}
+			res.StaleAnchors++
+			if len(res.StaleAnchorSamples) < staleAnchorSampleCap {
+				res.StaleAnchorSamples = append(res.StaleAnchorSamples, sym)
+			}
+		}
+	}
+	if probed == 0 {
+		return
+	}
+	// Most stored anchors dangling is a convention mismatch. A few are
+	// ordinary drift (deleted or renamed symbols) and not worth alarming
+	// about, so the message differs by degree.
+	if res.StaleAnchors*2 > probed {
+		res.AnchorDiagnostic = "no memories matched, and most stored anchor symbol ids do not name a live graph node — " +
+			"these memories were written against a different symbol-id convention (e.g. before repo prefixes were added to node ids), " +
+			"so anchor matching cannot succeed until they are re-anchored"
+		return
+	}
+	if res.StaleAnchors > 0 {
+		res.AnchorDiagnostic = "no memories matched; some stored anchors no longer name a live graph node (renamed or deleted symbols)"
+	}
 }
 
 // Surface returns memories ranked by relevance to a set of anchor
@@ -605,6 +684,13 @@ func (mm *memoryManager) Surface(opts SurfaceOptions, resolveNode func(string) *
 		res.Truncated = true
 	}
 	res.Memories = scored
+
+	// Anchors supplied, memories present, nothing matched: explain it
+	// rather than returning a bare zero. Only runs on the empty path, so
+	// the resolveNode calls below cost nothing in the common case.
+	if len(res.Memories) == 0 && hasAnchor && len(candidates) > 0 {
+		res.diagnoseEmptyAnchoredResult(candidates, resolveNode)
+	}
 
 	if opts.MarkAccessed && len(res.Memories) > 0 {
 		ids := make([]string, 0, len(res.Memories))

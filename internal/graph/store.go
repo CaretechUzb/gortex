@@ -530,8 +530,8 @@ type SymbolFTSItem struct {
 //     repoPrefix is the per-repo namespace; the store wipes only
 //     rows owned by that prefix before COPYing the new items, so
 //     multiple repos sharing one store don't clobber each other's
-//     FTS corpus. Empty prefix means "single-repo mode" — the
-//     store wipes everything (the legacy behaviour).
+//     FTS corpus. An empty prefix is the standalone Indexer, which
+//     owns the whole store, so it wipes everything.
 //
 //   - BuildSymbolIndex finalises the index after the bulk parse
 //     phase. For backends whose FTS index updates automatically on

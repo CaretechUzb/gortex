@@ -710,20 +710,24 @@ func newLoneRepoServer(t *testing.T, flagOn bool) (*Server, string) {
 	return srv, dir
 }
 
-// TestIntentDefaults_SearchSymbols_LoneUnprefixedRepo is the
-// fresh-install zero-rows regression: with intent defaults ON, a
-// session bound inside the lone tracked repo runs search_symbols; the
-// Locate default narrows RepoAllow to the registry prefix
-// ("lone-repo") while every node carries RepoPrefix == "". The
-// RepoAllow filter must admit the lone repo's own unprefixed nodes.
-func TestIntentDefaults_SearchSymbols_LoneUnprefixedRepo(t *testing.T) {
+// TestIntentDefaults_SearchSymbols_LoneRepo is the fresh-install
+// zero-rows regression: with intent defaults ON, a session bound inside the
+// lone tracked repo runs search_symbols and the Locate default narrows
+// RepoAllow to the registry prefix ("lone-repo"). The narrow must not hide
+// the only repo's own symbols.
+//
+// The narrow used to be vacuous — every node carried RepoPrefix == "" while
+// RepoAllow was keyed on "lone-repo", so the filter could only match by the
+// prefix-less carve-out. Now the node's prefix IS the allowed key, so the
+// narrow matches directly.
+func TestIntentDefaults_SearchSymbols_LoneRepo(t *testing.T) {
 	srv, dir := newLoneRepoServer(t, true)
 	ctx := sessionCtx("s-lone", dir)
 
-	// Precondition: this fixture really is unprefixed single-repo mode.
-	sym := srv.graph.GetNode("main.go::LoneThing")
-	require.NotNil(t, sym, "single-repo indexing must mint unprefixed node IDs")
-	require.Empty(t, sym.RepoPrefix, "single-repo nodes must carry no RepoPrefix")
+	// Precondition: a lone repo's nodes carry its prefix like any other's.
+	sym := srv.graph.GetNode("lone-repo/main.go::LoneThing")
+	require.NotNil(t, sym, "a lone repo's node IDs carry its prefix")
+	require.Equal(t, "lone-repo", sym.RepoPrefix)
 
 	// And the Locate intent default really narrows to the registry prefix.
 	scope, errRes := srv.resolveScope(ctx, makeReq("search_symbols", nil), IntentLocate)
@@ -750,11 +754,10 @@ func TestIntentDefaults_SearchSymbols_LoneUnprefixedRepo(t *testing.T) {
 	assert.True(t, foundLone, "LoneThing must be in results")
 }
 
-// TestIntentDefaults_ExplicitRepoArg_LoneUnprefixedRepo covers the
-// explicit-narrowing variant of the same regression: `repo:` naming
-// the lone repo (what the CLI's inline field query lowers to) must
-// also admit the unprefixed nodes.
-func TestIntentDefaults_ExplicitRepoArg_LoneUnprefixedRepo(t *testing.T) {
+// TestIntentDefaults_ExplicitRepoArg_LoneRepo covers the
+// explicit-narrowing variant of the same regression: `repo:` naming the lone
+// repo (what the CLI's inline field query lowers to) must not hide its nodes.
+func TestIntentDefaults_ExplicitRepoArg_LoneRepo(t *testing.T) {
 	srv, dir := newLoneRepoServer(t, true)
 	ctx := sessionCtx("s-lone", dir)
 
@@ -769,16 +772,20 @@ func TestIntentDefaults_ExplicitRepoArg_LoneUnprefixedRepo(t *testing.T) {
 		"explicit repo narrowing must not hide the lone repo's own nodes")
 }
 
-// TestFilterTextMatches_LoneUnprefixedRepoAttribution covers the
-// search_text arm of the regression: GrepTextForRepos stamps the
-// registry prefix onto match paths ("lone-repo/main.go") while the
-// graph keys files unprefixed ("main.go"). Node attribution must
-// strip the stamped prefix for an Unprefixed repo instead of
-// fail-closed-dropping every match.
-func TestFilterTextMatches_LoneUnprefixedRepoAttribution(t *testing.T) {
+// TestFilterTextMatches_LoneRepoAttribution covers the search_text arm:
+// GrepTextForRepos stamps the registry prefix onto match paths
+// ("lone-repo/main.go"), and node attribution must find the graph node for
+// that path rather than fail-closed-dropping every match.
+//
+// The stamped path and the graph key now agree by construction. They used to
+// diverge for a lone repo — the graph keyed files unprefixed ("main.go")
+// while grep stamped the prefix — and attribution needed a provenance-gated
+// strip to reconcile them.
+func TestFilterTextMatches_LoneRepoAttribution(t *testing.T) {
 	srv, _ := newLoneRepoServer(t, true)
 
-	require.NotNil(t, srv.graph.GetNode("main.go"), "file node must exist unprefixed")
+	require.NotNil(t, srv.graph.GetNode("lone-repo/main.go"),
+		"the file node is keyed by its prefixed path")
 
 	matches := []trigram.Match{{Path: "lone-repo/main.go", Line: 3, Text: "func LoneThing() {}"}}
 	resolved := ResolvedScope{
@@ -787,7 +794,7 @@ func TestFilterTextMatches_LoneUnprefixedRepoAttribution(t *testing.T) {
 	}
 	kept := srv.filterTextMatchesByResolvedScope(matches, resolved)
 	require.Len(t, kept, 1,
-		"a stamped match in an unprefixed lone repo must attribute to its graph node")
+		"a stamped match in the lone repo must attribute to its graph node")
 }
 
 // newTwoRepoServer builds a server tracking two repos ("alpha" holding

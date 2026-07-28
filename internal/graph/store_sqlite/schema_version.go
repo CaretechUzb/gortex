@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 6
+const currentSchemaVersion = 7
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -65,6 +65,13 @@ var schemaMigrations = []schemaMigration{
 	{version: 4, name: "add normalized analysis generations", inPlace: createAnalysisGenerationTables},
 	{version: 5, name: "backfill flat graph ownership, provenance, and clone corpus", inPlace: backfillSyntheticNodeRepoPrefixes},
 	{version: 6, name: "compact resolver edge indexes", inPlace: compactResolverEdgeIndexes},
+	// Single-repo (unprefixed) mode is gone: every repo's nodes now carry
+	// its prefix. A store written before the flip holds a solo repo's
+	// file-backed nodes under repo_prefix='', which nothing else can reach
+	// or evict, and the first post-upgrade warmup writes a full prefixed
+	// copy beside them. Purge the old population here — see the function
+	// for why in-place beats rebuild and why global externals survive.
+	{version: 7, name: "purge unprefixed solo-repo rows", inPlace: purgeUnprefixedRepoRows},
 }
 
 // compactResolverEdgeIndexes removes the one-shot global Go receiver index and

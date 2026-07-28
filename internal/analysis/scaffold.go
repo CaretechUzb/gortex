@@ -12,8 +12,9 @@ import (
 )
 
 // SourceReader provides access to symbol source code for scaffolding.
-// ResolveFilePath maps a graph file path (repo-prefixed in multi-repo mode,
-// repo-relative in single-repo mode) to an absolute filesystem path. It
+// ResolveFilePath maps a graph file path (repo-prefixed under the daemon,
+// repo-relative under the standalone Indexer) to an absolute filesystem
+// path. It
 // returns "" when the path can't be anchored to any indexed repo, which
 // callers must surface as an error rather than silently opening a file
 // relative to the daemon's process CWD.

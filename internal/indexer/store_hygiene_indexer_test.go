@@ -68,30 +68,39 @@ func TestUntrackRepo_PurgesSidecarRows(t *testing.T) {
 	assert.NotEmpty(t, s.GetRepoNodes("repo-b"), "repo-b nodes intact")
 }
 
-// D3: when a second repo joins a lone single-repo daemon, the first repo's
-// nodes are re-minted under its prefix — and its sidecar residue must move
-// with them, or the next warm restart finds zero mtimes under the new prefix
-// and full-re-tracks a repo that never changed.
-func TestMigrateLoneUnprefixed_ReKeysMtimesToNewPrefix(t *testing.T) {
+// D3: a lone repo persists its file_mtimes under the SAME prefix the warm
+// restart will look them up by, and adding a second repo does not move them.
+//
+// This is the warm-restart bug in its most direct form. A lone repo used to
+// index unprefixed, writing its mtimes under the empty prefix while
+// EffectiveRepoPrefix returned the basename; the lookup found zero rows and
+// forced a full cold
+// re-index (with an API embedder, a paid re-embed) on every restart. A
+// re-mint migration fired when a second repo joined, moving the residue —
+// one more moving part that had to agree with the indexer's gate.
+//
+// Now there is one key from the first index onward and nothing to migrate,
+// which is what this asserts.
+func TestLoneRepo_PersistsMtimesUnderItsOwnPrefix(t *testing.T) {
 	repoA := setupRepoDir(t, "repo-a")
 	mi, s := newSqliteMultiIndexer(t, []config.RepoEntry{{Path: repoA, Name: "repo-a"}})
 	_, err := mi.IndexAll()
 	require.NoError(t, err)
-	require.False(t, mi.IsMultiRepo(), "one repo indexes unprefixed")
+	require.False(t, mi.IsMultiRepo(), "one tracked repo")
 
-	require.NotEmpty(t, s.LoadFileMtimes(""), "solo repo persists mtimes under ''")
-	require.Empty(t, s.LoadFileMtimes("repo-a"), "nothing under the basename prefix yet")
+	require.NotEmpty(t, s.LoadFileMtimes("repo-a"), "a lone repo persists mtimes under its own prefix")
+	require.Empty(t, s.LoadFileMtimes(""), "nothing is written under the empty prefix")
 
-	// Track a second repo -> migrateLoneUnprefixedRepoCtx fires.
+	// A second repo joining changes nothing about the first repo's keys —
+	// there is no migration to run.
 	repoB := setupRepoDir(t, "repo-b")
 	_, err = mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: repoB, Name: "repo-b"})
 	require.NoError(t, err)
 	require.True(t, mi.IsMultiRepo())
 
-	// The exact warm-restart bug: mtimes must now live under the new prefix,
-	// and '' must no longer carry the migrated repo's residue.
-	assert.NotEmpty(t, s.LoadFileMtimes("repo-a"), "migrated repo's mtimes now load under its prefix")
-	assert.Empty(t, s.LoadFileMtimes(""), "no '' file_mtimes residue survives the migration")
+	assert.NotEmpty(t, s.LoadFileMtimes("repo-a"), "repo-a's mtimes stay where they were written")
+	assert.NotEmpty(t, s.LoadFileMtimes("repo-b"), "repo-b persists under its own prefix too")
+	assert.Empty(t, s.LoadFileMtimes(""), "still nothing under the empty prefix")
 }
 
 // mtimeCountingStore counts BulkSetFileMtimes calls so a test can prove the

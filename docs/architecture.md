@@ -45,7 +45,7 @@ gortex binary
 - Workspace: `workspace_member` — links a package-manager workspace root (npm / pnpm / Cargo) to each of its members
 - Cross-repo: `cross_repo_calls` / `cross_repo_implements` / `cross_repo_extends` — materialised whenever a `calls` / `implements` / `extends` edge's endpoints live in different repos
 
-**Multi-repo fields:** Nodes carry `repo_prefix` (empty in single-repo mode). Edges carry `cross_repo` (true when connecting nodes in different repos). Node IDs use `<repo_prefix>/<path>::<Symbol>` format in multi-repo mode.
+**Multi-repo fields:** Every node the daemon indexes carries a `repo_prefix`, and node IDs are always `<repo_prefix>/<path>::<Symbol>` — a workspace tracking one repo uses the same shape as one tracking twenty. Edges carry `cross_repo` (true when connecting nodes in different repos). An empty `repo_prefix` means one of two things: a synthetic global external (`dep::`, `external::`, non-Go `module::`) that no repository owns, or a graph built by the standalone `Indexer` (`gortex init`, the eval harnesses, `pkg/gortex`), which sets no prefix.
 
 **Edge.Alias:** per-binding `imports` (`import { x as alias }`) and `re_exports` (`export { x as alias } from`) carry the renamed local / exported identifier on `Edge.Alias`; `To` still targets the upstream original name, so `Alias` is the only place the rename is recorded.
 

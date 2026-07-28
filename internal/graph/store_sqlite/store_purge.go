@@ -222,12 +222,12 @@ var rekeyMoveTables = []string{
 }
 
 // rekeyDropTables are the sidecar tables RekeyRepoPrefix DROPS (rather than
-// relabels) for old. Most are keyed by node_id, and the solo->multi re-mint
-// changes every node id (unprefixed `pkg::X` -> `<new>::pkg::X`), so their
-// old-id rows are already dangling against the evicted unprefixed nodes.
+// relabels) for old. Most are keyed by node_id, and a re-key accompanies a
+// re-mint that changes every node id (`<old>/pkg.go::X` -> `<new>/pkg.go::X`),
+// so their old-id rows are already dangling against the evicted nodes.
 // semantic_binding_types is the exception: it is keyed by repo_prefix and
-// file_path, but the migration scopes every file path (`main.go` becomes
-// `<new>/main.go`), so relabeling would preserve unusable stale keys.
+// file_path, but a re-mint rewrites every file path too, so relabeling would
+// preserve unusable stale keys.
 // Dropping these tables is correct: re-index rewrites index-time sidecars
 // and semantic bindings under the new IDs and paths, while enrichment
 // sidecars must re-run for the new IDs regardless. The FTS vtables sit here
@@ -248,20 +248,22 @@ var rekeyDropTables = []string{
 	"content_fts_rowid",
 }
 
-// RekeyRepoPrefix moves a repo's sidecar residue from old to new the moment a
-// solo (unprefixed) repo earns a real prefix because a second repo joined —
-// the migrateLoneUnprefixedRepoCtx path. The prefix/path-keyed provenance
-// tables (rekeyMoveTables) are relabeled so warm restart finds the repo's
-// mtimes + freshness under new instead of full-re-tracking it; stale
-// ID/path-keyed tables (rekeyDropTables) are dropped because the re-mint
-// changes every node ID and file path out from under them (see the two table
-// lists for the per-table rationale).
+// RekeyRepoPrefix moves a repo's sidecar residue from one prefix to another.
+// The prefix/path-keyed provenance tables (rekeyMoveTables) are relabeled so
+// warm restart finds the repo's mtimes + freshness under new instead of
+// full-re-tracking it; stale ID/path-keyed tables (rekeyDropTables) are
+// dropped because a re-mint changes every node ID and file path out from
+// under them (see the two table lists for the per-table rationale).
 //
-// Refuses new=="" (cannot rekey INTO the protected empty prefix). old=="" IS
-// allowed — that is the whole point, since solo repos index unprefixed — and
-// is safe here because this method touches SIDECAR tables ONLY; the synthetic
-// global externals that also carry repo_prefix=” live in the NODES table,
-// which RekeyRepoPrefix never writes.
+// It was written for the solo→multi transition, where a lone unprefixed repo
+// earned a real prefix the moment a second repo joined. Every repo is
+// prefixed from its first index now, so that caller is gone; this stays as
+// the general re-key primitive.
+//
+// Refuses new=="" (cannot rekey INTO the protected empty prefix). old=="" is
+// allowed, and is safe because this method touches SIDECAR tables ONLY — the
+// synthetic global externals that also carry an empty repo_prefix live in the
+// NODES table, which RekeyRepoPrefix never writes.
 func (s *Store) RekeyRepoPrefix(oldPrefix, newPrefix string) error {
 	if newPrefix == "" {
 		return fmt.Errorf("store_sqlite: RekeyRepoPrefix refuses empty destination prefix")

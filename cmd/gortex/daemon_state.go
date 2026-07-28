@@ -950,6 +950,46 @@ func logWarmupSummary(logger *zap.Logger, warmup *warmupTimings, queryable, tota
 		zap.Float64("total_s", total.Seconds()))
 }
 
+// logRepoOwnershipAudit reports the graph's repo-prefix ownership split once
+// warmup has settled.
+//
+// The prefix is the graph's ownership key — it keys the byRepo bucket, the
+// per-repo memory estimates, the `nodes_by_repo` partial index and every
+// repo-scoped query. When it is wrong nothing errors: the daemon serves a
+// subset, or two copies of one repo under different IDs, and every other
+// health signal stays green. This is the only place that says so out loud.
+//
+// A wholly-unowned graph is single-repo mode, not a defect, and logs at Info.
+// Both populations coexisting, or a stamped prefix the node ID does not
+// carry, is a real inconsistency and logs at Error with named samples.
+func logRepoOwnershipAudit(g graph.Store, logger *zap.Logger) {
+	if logger == nil || g == nil {
+		return
+	}
+	d, ok := graph.ReadPrefixDiagnostics(g, 5)
+	if !ok {
+		return
+	}
+	fields := []zap.Field{
+		zap.Int("owned_code_nodes", d.OwnedCodeNodes),
+		zap.Int("unowned_code_nodes", d.UnownedCodeNodes),
+		zap.Int("misprefixed_nodes", d.MisprefixedNodes),
+	}
+	if d.Clean() {
+		logger.Info("daemon: repo ownership audit clean", fields...)
+		return
+	}
+	if len(d.UnownedSamples) > 0 {
+		fields = append(fields, zap.Strings("unowned_samples", d.UnownedSamples))
+	}
+	if len(d.MisprefixedSamples) > 0 {
+		fields = append(fields, zap.Strings("misprefixed_samples", d.MisprefixedSamples))
+	}
+	logger.Error("daemon: repo ownership is inconsistent — repo-scoped reads will silently return a subset of the graph; "+
+		"the store holds both prefixed and unprefixed copies of the same code, or a node's stamped repo differs from its id",
+		fields...)
+}
+
 // publishReadinessPhase forwards a workspace_readiness phase
 // transition to the MCP server's readiness broadcaster. Safe to
 // call when the server isn't wired (single-process modes that
@@ -980,16 +1020,10 @@ func priorMtimesFromStore(g graph.Store, cm *config.ConfigManager, entry config.
 	// not the bare basename, so a plain ResolvePrefix would load the
 	// canonical checkout's mtimes and force a full re-index every restart.
 	effective := strings.TrimPrefix(indexer.EffectiveRepoPrefix(cm, entry), "/")
-	repoCount := 1
-	if cm != nil {
-		if g := cm.Global(); g != nil {
-			repoCount = len(g.Repos)
-		}
-	}
-	prefix, ok := warmMtimePrefix(effective, repoCount)
+	prefix, ok := warmMtimePrefix(effective)
 	if !ok {
 		if logger != nil {
-			logger.Info("daemon: priorMtimesFromStore: empty prefix",
+			logger.Warn("daemon: priorMtimesFromStore: no effective repo prefix — falling back to a cold index",
 				zap.String("entry_path", entry.Path),
 				zap.String("entry_name", entry.Name))
 		}
@@ -999,35 +1033,61 @@ func priorMtimesFromStore(g graph.Store, cm *config.ConfigManager, entry config.
 	if logger != nil {
 		logger.Info("daemon: priorMtimesFromStore loaded",
 			zap.String("prefix", prefix),
-			zap.Bool("single_repo", repoCount < 2),
 			zap.Int("count", len(mtimes)))
+	}
+	// Zero rows here is the difference between a warm restart and a full
+	// cold re-index (plus, with an API embedder, a full paid re-embed) —
+	// and it is invisible in the Info line above, which reports count=0 the
+	// same way for "fresh repo" and "we looked under the wrong key". Naming
+	// the prefixes the store DOES hold separates the two: an already-indexed
+	// repo whose rows sit under a different prefix is a keying bug, not a
+	// cold start.
+	if len(mtimes) == 0 && logger != nil {
+		stored := storedRepoPrefixes(g)
+		if len(stored) > 0 {
+			logger.Warn("daemon: no persisted file mtimes for this repo — falling back to a full cold re-index; "+
+				"the store holds mtimes under other prefixes, so this is a prefix-keying mismatch rather than a first index",
+				zap.String("looked_up_prefix", prefix),
+				zap.String("entry_path", entry.Path),
+				zap.Strings("store_repo_prefixes", stored))
+		}
 	}
 	return mtimes
 }
 
+// storedRepoPrefixes returns the repo prefixes the store actually holds
+// nodes under, for diagnostics that need to distinguish "nothing indexed"
+// from "indexed under a different key". Returns nil when the backend cannot
+// answer.
+func storedRepoPrefixes(g graph.Store) []string {
+	lister, ok := g.(interface{ RepoPrefixes() []string })
+	if !ok {
+		return nil
+	}
+	return lister.RepoPrefixes()
+}
+
 // warmMtimePrefix picks the repo_prefix to look up persisted file mtimes
 // (and, by extension, to decide whether the warm-restart reconcile can run)
-// for a repo whose EffectiveRepoPrefix is `effective` in a daemon tracking
-// `repoCount` repos total.
+// for a repo whose EffectiveRepoPrefix is `effective`.
 //
-// PURPOSE: single-repo daemons index WITHOUT a prefix — MultiIndexer.
-// indexSingleRepo / ReconcileRepoCtx only switch on a repo prefix once a
-// SECOND repo joins (the willBeMultiRepo gate). So a lone repo's nodes and
-// file_mtimes rows are persisted under "", while EffectiveRepoPrefix returns
-// the path basename (e.g. "drools"). Looking mtimes up under the basename
-// finds zero rows and forces a full cold re-index — and, with an API
-// embedder, a full (paid) re-embed — on every restart.
+// It must key mtimes exactly where the indexer wrote them. Since every repo
+// is prefixed — a lone repo included — that is always the effective prefix,
+// and this function is now a thin trust check rather than a mode decision.
 //
-// RATIONALE: mirror the indexer's own single-vs-multi decision here so the
-// warm path keys mtimes exactly where they were written. In multi-repo mode
-// an empty effective prefix is untrustworthy (it would collide across repos),
-// so report ok=false and let the caller fall back to a cold index.
+// It used to mirror the indexer's single-vs-multi gate, returning "" for a
+// lone repo because indexSingleRepo / ReconcileRepoCtx wrote that repo's
+// rows under the empty prefix. That mirror was load-bearing and fragile: the
+// two decisions had to agree exactly, and when they drifted the symptom was
+// not an error but a full cold re-index (plus, with an API embedder, a paid
+// re-embed) on every single restart.
 //
-// KEYWORDS: warm-restart, repo-prefix, single-repo, file_mtimes, re-embed
-func warmMtimePrefix(effective string, repoCount int) (prefix string, ok bool) {
-	if repoCount < 2 {
-		return "", true
-	}
+// An empty effective prefix is untrustworthy — it would collide across repos
+// and now names only the synthetic global externals — so report ok=false and
+// let the caller fall back to a cold index.
+//
+// KEYWORDS: warm-restart, repo-prefix, file_mtimes, re-embed
+func warmMtimePrefix(effective string) (prefix string, ok bool) {
 	if effective == "" {
 		return "", false
 	}

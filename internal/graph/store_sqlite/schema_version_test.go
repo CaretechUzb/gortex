@@ -588,14 +588,18 @@ func TestOpenV5CompactsResolverEdgeIndexesInPlace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create current store: %v", err)
 	}
-	if _, err := s.writerDB.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES
-		('source', 'function', 'source', 'a.go'),
-		('target', 'function', 'target', 'b.go')`); err != nil {
+	// Seed OWNED nodes. A file-backed node with an empty repo_prefix is
+	// single-repo-mode residue, which the v7 migration in this same chain
+	// purges by design — an unprefixed fixture would be deleted out from
+	// under the assertions below.
+	if _, err := s.writerDB.Exec(`INSERT INTO nodes (id, kind, name, file_path, repo_prefix) VALUES
+		('repo/a.go::source', 'function', 'source', 'repo/a.go', 'repo'),
+		('repo/b.go::target', 'function', 'target', 'repo/b.go', 'repo')`); err != nil {
 		t.Fatalf("seed nodes: %v", err)
 	}
 	if _, err := s.writerDB.Exec(`INSERT INTO edges (from_id, to_id, kind, file_path, line) VALUES
-		('source', 'unresolved::target', 'calls', 'a.go', 1),
-		('source', 'target', 'calls', 'a.go', 2)`); err != nil {
+		('repo/a.go::source', 'unresolved::target', 'calls', 'repo/a.go', 1),
+		('repo/a.go::source', 'repo/b.go::target', 'calls', 'repo/a.go', 2)`); err != nil {
 		t.Fatalf("seed edges: %v", err)
 	}
 	if err := s.Close(); err != nil {

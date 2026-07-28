@@ -80,10 +80,10 @@ func TestGraphRelPath_LoneRepoForwardSlash(t *testing.T) {
 	solo := setupNestedRepo(t, "solo", "shared", "package sub\n\nfunc SoloHandler() {}\n")
 	srv, g := nestedRepoServer(t, []config.RepoEntry{{Path: solo, Name: "solo", Project: "backend"}})
 
-	nodeKey := filepath.FromSlash("pkg/sub/main.go")
-	require.NotNil(t, g.GetNode(nodeKey), "fixture invariant: a lone repo mints unprefixed node ids")
+	nodeKey := "solo/" + filepath.FromSlash("pkg/sub/main.go")
+	require.NotNil(t, g.GetNode(nodeKey), "fixture invariant: a lone repo's node ids carry its prefix")
 
-	require.Equal(t, nodeKey, srv.graphRelPath("pkg/sub/main.go"),
+	require.Equal(t, nodeKey, srv.graphRelPath("solo/pkg/sub/main.go"),
 		"a forward-slash path must be normalised to the graph's spelling")
 	require.Equal(t, nodeKey, srv.graphRelPath(nodeKey),
 		"an already OS-spelled path is unchanged (idempotent)")
@@ -103,8 +103,7 @@ func TestGraphRelPath_LoneRepoForwardSlash(t *testing.T) {
 // The existing fail-closed fixture uses a root-level file, where the two
 // spellings coincide on every platform; these put the file in a
 // subdirectory, and cover both node-ID shapes: prefixed (several tracked
-// repos) and unprefixed (a lone repo, where the stamped prefix is stripped
-// before the retry).
+// repos) and a lone repo, whose ids carry its prefix too.
 func TestFilterTextMatchesByResolvedScope_BelowRepoRoot(t *testing.T) {
 	t.Run("prefixed node ids", func(t *testing.T) {
 		alpha := setupNestedRepo(t, "alpha", "shared", "package sub\n\n// marker\nfunc A() {}\n")
@@ -126,14 +125,14 @@ func TestFilterTextMatchesByResolvedScope_BelowRepoRoot(t *testing.T) {
 			"a node-backed match below the repo root must survive narrowing on every platform")
 	})
 
-	t.Run("unprefixed node ids", func(t *testing.T) {
+	t.Run("lone repo", func(t *testing.T) {
 		solo := setupNestedRepo(t, "solo", "shared", "package sub\n\n// marker\nfunc S() {}\n")
 		srv, g := nestedRepoServer(t, []config.RepoEntry{
 			{Path: solo, Name: "solo", Project: "backend"},
 		})
 
-		require.NotNil(t, g.GetNode(filepath.FromSlash("pkg/sub/main.go")),
-			"fixture invariant: a lone repo mints unprefixed node ids")
+		require.NotNil(t, g.GetNode("solo/"+filepath.FromSlash("pkg/sub/main.go")),
+			"fixture invariant: a lone repo's node ids carry its prefix")
 
 		got := srv.filterTextMatchesByResolvedScope(
 			[]trigram.Match{{Path: "solo/pkg/sub/main.go", Line: 3, Text: "// marker"}},

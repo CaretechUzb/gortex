@@ -19,8 +19,8 @@ import (
 
 // newSingleRepoServer indexes one repo through the MultiIndexer — the
 // daemon/serverstack shape where multiIndexer is always non-nil — and
-// returns the server plus the repo root. Nodes carry RepoPrefix=""
-// (single-repo mode indexes without prefixing).
+// returns the server plus the repo root. Its nodes carry RepoPrefix
+// "myrepo": a lone repo is the first tracked repo, not a special mode.
 func newSingleRepoServer(t *testing.T) (*Server, *graph.Graph, string) {
 	t.Helper()
 	dir := setupMiniRepo(t, "myrepo")
@@ -48,29 +48,43 @@ func newSingleRepoServer(t *testing.T) (*Server, *graph.Graph, string) {
 	return srv, g, dir
 }
 
-// A single tracked repo mints unprefixed nodes; resolving their source
-// path must anchor to the lone repo root rather than erroring with
-// `could not resolve repo root (repo_prefix="")`. This is the gate in
-// front of every source read — and of savings recording.
-func TestResolveNodePath_SingleRepoUnprefixedNode(t *testing.T) {
+// Resolving a node's source path is the gate in front of every source read
+// — and of savings recording — so it must work for the lone repo's own
+// nodes.
+func TestResolveNodePath_LoneRepoNode(t *testing.T) {
 	srv, g, dir := newSingleRepoServer(t)
 
-	node := g.GetNode("main.go::Hello")
-	require.NotNil(t, node, "single-repo node IDs are unprefixed")
-	require.Empty(t, node.RepoPrefix)
+	node := g.GetNode("myrepo/main.go::Hello")
+	require.NotNil(t, node, "a lone repo's node IDs carry its prefix")
+	require.Equal(t, "myrepo", node.RepoPrefix)
 
 	abs, err := srv.resolveNodePath(node)
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(dir, "main.go"), abs)
 }
 
-func TestResolveFilePath_SingleRepoBareRelative(t *testing.T) {
+// Bare repo-relative paths must keep resolving on a solo daemon. This is the
+// agent-facing compatibility guarantee of always-prefixed IDs: nothing
+// forces an agent to learn the prefix before it can name a file.
+func TestResolveFilePath_LoneRepoBareRelative(t *testing.T) {
 	srv, _, dir := newSingleRepoServer(t)
 
 	abs, rel, err := srv.resolveFilePath("main.go")
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(dir, "main.go"), abs)
-	assert.Equal(t, "main.go", rel)
+	// relPath comes back in the GRAPH's spelling, not the caller's. Every
+	// downstream node lookup keys on it, and graph file keys are prefixed —
+	// echoing the bare input back resolved the bytes and then reported
+	// file_not_indexed for a file that was indexed.
+	assert.Equal(t, "myrepo/main.go", rel)
+
+	// A file that does NOT exist yet — a write_file / edit_file create
+	// target — must resolve too. Existence-gated anchoring alone would
+	// refuse this, which is the regression the sole-repo lookup prevents.
+	abs, rel, err = srv.resolveFilePath("internal/brand_new.go")
+	require.NoError(t, err, "creating a new file by bare path must work in a solo workspace")
+	assert.Equal(t, filepath.Join(dir, "internal", "brand_new.go"), abs)
+	assert.Equal(t, "myrepo/internal/brand_new.go", rel)
 
 	// Containment still enforced: escaping the lone root is refused.
 	_, _, err = srv.resolveFilePath("../escape.go")

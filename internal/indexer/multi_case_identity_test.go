@@ -89,26 +89,3 @@ func TestScopeForCWD_UnrelatedCwdMisses(t *testing.T) {
 	_, _, _, ok := mi.ScopeForCWD(filepath.Join(filepath.Dir(dir), "somewhere-else"))
 	assert.False(t, ok)
 }
-
-func TestFoldDistinctRepoCount(t *testing.T) {
-	forceCaseInsensitive(t, true)
-	repos := []config.RepoEntry{
-		{Path: "/Users/me/Repo"},
-		{Path: "/Users/me/repo"}, // case variant of the first
-		{Path: "/Users/me/other"},
-	}
-	if got := foldDistinctRepoCount(repos); got != 2 {
-		t.Fatalf("foldDistinctRepoCount = %d, want 2 (case variants fold to one)", got)
-	}
-}
-
-func TestFoldDistinctRepoCount_CaseSensitive(t *testing.T) {
-	forceCaseInsensitive(t, false)
-	repos := []config.RepoEntry{
-		{Path: "/Users/me/Repo"},
-		{Path: "/Users/me/repo"},
-	}
-	if got := foldDistinctRepoCount(repos); got != 2 {
-		t.Fatalf("case-sensitive foldDistinctRepoCount = %d, want 2", got)
-	}
-}

@@ -116,8 +116,12 @@ func (s *Store) WipeContentFile(filePath string) error {
 // ContentRepoHasRows reports whether a repository owns any persisted content
 // rows. The repo-qualified form is one indexed EXISTS probe over
 // content_fts_rowid_by_repo_file; it never scans or materializes FTS bodies.
-// An empty prefix preserves the single-repository convention and checks the
-// sidecar as a whole.
+//
+// An empty prefix is a WILDCARD: it asks whether the sidecar holds ANY content
+// rows at all, across every repo. That is deliberate — the probe's callers use
+// it as a "is there content to search" gate — and it is not a single-repo
+// special case, so it must survive unchanged even once every repo carries a
+// prefix.
 func (s *Store) ContentRepoHasRows(repoPrefix string) (bool, error) {
 	var exists bool
 	if repoPrefix == "" {

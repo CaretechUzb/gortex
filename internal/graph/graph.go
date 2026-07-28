@@ -3033,13 +3033,20 @@ func (g *Graph) FindNodesByName(name string) []*Node {
 }
 
 // FindNodesByNameInRepo returns nodes matching the short name that are
-// either in the given repoPrefix or carry an empty RepoPrefix (synthetic
-// / stdlib nodes — kept same-repo by convention). Equivalent to
+// either in the given repoPrefix or carry an empty RepoPrefix. Equivalent to
 // filterSameRepo(repoPrefix, FindNodesByName(name)) but skips the
 // intermediate cross-repo candidate slice.
 //
-// In single-repo graphs (repoPrefix == ""), behaves identically to
-// FindNodesByName.
+// The `n.RepoPrefix == ""` disjunct is a CROSS-REPO VISIBILITY RULE, not a
+// single-repo accommodation. Synthetic global externals — `dep::…`,
+// `external::…` and non-Go `module::…` nodes — model third-party symbols
+// that no repository owns, so a service's external surface can aggregate
+// across repos. They are visible from EVERY repo by construction. Dropping
+// the disjunct would not narrow a scope; it would make every third-party
+// target unresolvable from every repo at once, with nothing reporting it.
+//
+// When repoPrefix is "" the caller has asked for no repo filter at all, so
+// this behaves identically to FindNodesByName.
 func (g *Graph) FindNodesByNameInRepo(name, repoPrefix string) []*Node {
 	if repoPrefix == "" {
 		return g.FindNodesByName(name)
@@ -3814,9 +3821,15 @@ func (g *Graph) Stats() GraphStats {
 }
 
 // GetRepoNodes returns all nodes belonging to the exact repository prefix.
-// Non-empty prefixes use each shard's compact byRepo bucket. Empty prefix is
-// the single-repository/shadow-graph case and scans shard maps directly so the
-// graph does not duplicate its entire node set in byRepo.
+// Non-empty prefixes use each shard's compact byRepo bucket.
+//
+// THE EMPTY-PREFIX BRANCH IS LIVE — do not delete it as single-repo-mode
+// residue. The daemon always prefixes now, but the STANDALONE Indexer
+// (indexer.New with no SetRepoPrefix) does not, and it backs `gortex init`,
+// the eval harnesses, bench, pkg/gortex's public API and serverstack's
+// embedded indexer. In that shape the whole graph is one unprefixed repo, so
+// this scans shard maps directly rather than duplicating every node into a
+// byRepo bucket. See TestStandaloneIndexerKeepsTheEmptyPrefix.
 func (g *Graph) GetRepoNodes(repoPrefix string) []*Node {
 	var out []*Node
 	for _, s := range g.shards {
@@ -3839,9 +3852,8 @@ func (g *Graph) GetRepoNodes(repoPrefix string) []*Node {
 }
 
 // GetRepoNodesByLanguage is the exact compound-predicate sibling of
-// GetRepoNodes. An empty prefix scans each shard's native node map directly,
-// avoiding both an AllNodes materialization and a duplicate byRepo index over
-// every single-repository shadow node.
+// GetRepoNodes, and its empty-prefix branch is live for the same reason —
+// the standalone Indexer. See GetRepoNodes.
 func (g *Graph) GetRepoNodesByLanguage(repoPrefix, language string) []*Node {
 	if language == "" {
 		return nil

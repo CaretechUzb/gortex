@@ -182,6 +182,13 @@ type Context struct {
 	communityCount map[string]int
 	// maxCommunityCount is the largest value in communityCount.
 	maxCommunityCount int
+	// multiRepoBatch records whether this candidate batch spans more than
+	// one repository (counting only owned candidates — synthetic global
+	// externals carry no prefix and belong to none). The same-repo affinity
+	// boost is only a discriminator when it is true; on a single-repo batch
+	// every first-party candidate would saturate identically and the boost
+	// would overwrite the community score that actually separates them.
+	multiRepoBatch bool
 
 	// fanInMax / fanOutMax cache the maximum fan counts across the
 	// current candidate set so the log-normalised contributions stay
@@ -424,9 +431,18 @@ func (c *Context) prepare(cands []*Candidate) {
 	}
 
 	// Populate the non-edge scratch fields from the candidate batch.
+	batchRepo := ""
+	c.multiRepoBatch = false
 	for _, cand := range cands {
 		if cand == nil || cand.Node == nil {
 			continue
+		}
+		if p := cand.Node.RepoPrefix; p != "" {
+			if batchRepo == "" {
+				batchRepo = p
+			} else if p != batchRepo {
+				c.multiRepoBatch = true
+			}
 		}
 		if nm := strings.ToLower(cand.Node.Name); nm != "" {
 			c.nameGroupCount[nm]++
