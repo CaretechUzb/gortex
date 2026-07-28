@@ -133,10 +133,14 @@ func newHugotProviderWithSpec(spec HugotVariant) (Provider, error) {
 	// Cap inputs at the model's positional budget before they reach the
 	// pipeline. The pure-Go tokenizer path does not honour
 	// max_position_embeddings, so an over-long text would otherwise abort the
-	// whole vector index with a tensor shape mismatch. A degraded truncator
-	// (missing config.json / corrupt tokenizer.json) still works via a rune
-	// clamp, so we warn and continue rather than fail the provider.
+	// whole vector index with a tensor shape mismatch. A missing config.json can
+	// use the conservative fallback budget, but an exact tokenizer is mandatory:
+	// without it there is no safe sequence-length check.
 	truncator, terr := newTokenTruncator(modelPath)
+	if truncator == nil {
+		_ = session.Destroy()
+		return nil, fmt.Errorf("hugot token truncator: %w", terr)
+	}
 	if terr != nil {
 		fmt.Fprintf(os.Stderr, "[gortex embedding] %v\n", terr)
 	}

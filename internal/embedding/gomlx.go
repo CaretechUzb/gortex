@@ -54,9 +54,13 @@ func newGoMLXProvider() (Provider, error) {
 	}
 
 	// Belt-and-suspenders token truncation: the XLA path's Rust tokenizer
-	// already truncates, but keeping the client-side cap here matches the
-	// pure-Go provider and covers a degraded tokenizer. See hugot.go.
+	// already truncates, but keeping the exact client-side cap here matches the
+	// pure-Go provider and preserves the same hard sequence bound. See hugot.go.
 	truncator, terr := newTokenTruncator(modelPath)
+	if truncator == nil {
+		_ = session.Destroy()
+		return nil, fmt.Errorf("gomlx token truncator: %w", terr)
+	}
 	if terr != nil {
 		fmt.Fprintf(os.Stderr, "[gortex embedding] %v\n", terr)
 	}
