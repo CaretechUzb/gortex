@@ -49,6 +49,10 @@ func (e *PHPExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	// Walk the AST manually since PHP tree-sitter queries can be tricky.
 	e.walkNode(root, src, filePath, fileNode, result, seen, "")
 
+	// Statements outside every declaration — a script body, a bootstrap file,
+	// a routes file, a fixture returning a closure — belong to the file node.
+	e.extractPHPFileScope(root, src, filePath, fileNode, result)
+
 	captureValueRefCandidates(result, root, filePath, src)
 	captureFnValueCandidates(result, root, filePath, src)
 	e.capturePHPStringCallables(result, root, filePath, src)
@@ -92,6 +96,9 @@ func (e *PHPExtractor) walkNode(
 
 	case "function_definition":
 		e.extractFunction(node, src, filePath, fileNode, result, seen)
+
+	case "anonymous_class":
+		e.extractAnonymousClass(node, src, filePath, fileNode, result, seen)
 
 	case "namespace_use_declaration":
 		e.extractUseImport(node, src, filePath, fileNode, result)
@@ -869,9 +876,29 @@ func (e *PHPExtractor) extractCallSitesInScope(
 	result *parser.ExtractionResult,
 	env phpReceiverEnv,
 ) {
-	switch node.Type() {
-	case "anonymous_function", "anonymous_function_creation_expression", "arrow_function":
+	if node.Type() == "anonymous_function" || node.Type() == "anonymous_function_creation_expression" ||
+		node.Type() == "arrow_function" {
 		env = env.childScope(node, src)
+	}
+	e.emitPHPCallSiteEdges(node, src, filePath, callerID, result, env)
+
+	// Recurse into children.
+	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
+		child := node.NamedChild(i)
+		e.extractCallSitesInScope(child, src, filePath, callerID, result, env)
+	}
+}
+
+// emitPHPCallSiteEdges emits the call / access edges for one node, without
+// recursing. Both the in-function walker and the file-scope walker share it;
+// they differ only in where they stop descending.
+func (e *PHPExtractor) emitPHPCallSiteEdges(
+	node *sitter.Node, src []byte,
+	filePath string, callerID string,
+	result *parser.ExtractionResult,
+	env phpReceiverEnv,
+) {
+	switch node.Type() {
 	case "member_access_expression", "nullsafe_member_access_expression",
 		"scoped_property_access_expression", "class_constant_access_expression":
 		e.emitPHPMemberAccess(node, src, filePath, callerID, result, env)
@@ -965,12 +992,6 @@ func (e *PHPExtractor) extractCallSitesInScope(
 			}
 			result.Edges = append(result.Edges, edge)
 		}
-	}
-
-	// Recurse into children.
-	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
-		child := node.NamedChild(i)
-		e.extractCallSitesInScope(child, src, filePath, callerID, result, env)
 	}
 }
 
