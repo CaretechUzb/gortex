@@ -28,11 +28,15 @@ type Options struct {
 	// multi-repo daemons key file paths as "<prefix>/<rel>" while git emits
 	// repo-relative paths. Empty in single-repo / unprefixed mode.
 	RepoPrefix string
-	// CoverageKnown reports whether the graph indexes test symbols for this
-	// repo at all. When false the per-file coverage evidence is unknowable —
-	// an index config that excludes "**/*_test.go" would otherwise make
-	// every change read as untested — so the rows carry no untested counts
-	// and the headline says "coverage unknown" instead.
+	// CoverageKnown reports whether the graph indexes test symbols for the
+	// changed languages. When false the per-file coverage evidence is
+	// unknowable — an index config that excludes "**/*_test.go" would
+	// otherwise make every change read as untested — so the rows carry no
+	// untested counts and the headline says "coverage unknown" instead.
+	//
+	// It is also the only thing that licenses the headline to blame the
+	// index for missing coverage. Empty rows are not evidence of an index
+	// without tests; see summarize.
 	CoverageKnown bool
 	// Scope selects the git diff range: "staged", "all", "compare", or
 	// "unstaged" (default). Ignored when Diff is set.
@@ -401,7 +405,7 @@ func compress(opts Options, plan *reviewPlan, llmFindings []Finding, dropped int
 		Verdict:  verdict,
 		Findings: merged,
 		FileRisk: fileRisk,
-		Summary:  summarize(verdict, merged, fileRisk),
+		Summary:  summarize(verdict, merged, fileRisk, opts.CoverageKnown),
 		Depth:    plan.depth.String(),
 		Stats: ReviewStats{
 			Rulepack:     len(plan.ruleFinds),
@@ -454,14 +458,22 @@ func sortFindings(findings []Finding) {
 // blast radius, tempered by test coverage), so the headline says which tier
 // earned it — and whether the risk is untested — instead of the
 // self-contradictory "BLOCK: no findings".
-func summarize(verdict Verdict, findings []Finding, fileRisk []FileRisk) string {
+//
+// coverageKnown is the caller's attestation that the index carries test
+// symbols for the changed languages, and it is the ONLY thing that licenses
+// blaming the index. The rows alone cannot: FileRisk.Symbols is zero both
+// when coverage was unattestable and when the changeset simply mapped to no
+// graph symbols to evaluate (a pasted diff, a brand-new file), and inferring
+// the first from the second made the headline assert "the index carries no
+// test symbols" over a graph full of them.
+func summarize(verdict Verdict, findings []Finding, fileRisk []FileRisk, coverageKnown bool) string {
 	if len(findings) == 0 {
 		if verdict != VerdictApprove && len(fileRisk) > 0 {
 			worst := fileRisk[0].Risk // sorted worst-first
-			n, untested, known := 0, 0, false
+			n, untested, evaluated := 0, 0, false
 			for _, fr := range fileRisk {
 				if fr.Symbols > 0 {
-					known = true
+					evaluated = true
 				}
 				if fr.Risk != worst {
 					continue
@@ -475,11 +487,14 @@ func summarize(verdict Verdict, findings []Finding, fileRisk []FileRisk) string 
 			case untested > 0:
 				return fmt.Sprintf("%s: no rule findings, but %d of %d changed file(s) carry %s blast-radius risk (%d without covering tests)",
 					verdict, n, len(fileRisk), worst, untested)
-			case known:
+			case evaluated:
 				return fmt.Sprintf("%s: no rule findings; %d of %d changed file(s) carry %s blast-radius risk, all test-covered",
 					verdict, n, len(fileRisk), worst)
+			case !coverageKnown:
+				return fmt.Sprintf("%s: no rule findings, but %d of %d changed file(s) carry %s blast-radius risk (test coverage unknown — the index carries no test symbols for the changed language(s))",
+					verdict, n, len(fileRisk), worst)
 			default:
-				return fmt.Sprintf("%s: no rule findings, but %d of %d changed file(s) carry %s blast-radius risk (test coverage unknown — the index carries no test symbols)",
+				return fmt.Sprintf("%s: no rule findings, but %d of %d changed file(s) carry %s blast-radius risk (coverage not evaluated — no changed symbol mapped to the graph)",
 					verdict, n, len(fileRisk), worst)
 			}
 		}
