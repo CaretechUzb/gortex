@@ -233,6 +233,7 @@ func (e *PHPExtractor) extractClass(
 	})
 	annotationSeen := map[string]bool{}
 	emitPHPAnnotationEdgesFromAttrs(collectPhpAttributes(node, src), id, filePath, result, annotationSeen)
+	e.emitPHPDocTestAnnotation(node, src, filePath, id, result, annotationSeen)
 
 	// Extract methods, constants, properties, and trait uses inside the body.
 	body := e.findChildByType(node, "declaration_list")

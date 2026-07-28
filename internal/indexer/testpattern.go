@@ -99,6 +99,13 @@ func TestRole(name, language string) string {
 		if strings.HasPrefix(name, "test_") {
 			return "test"
 		}
+	case "php":
+		// PHPUnit discovers `public function testFoo()`. The prefix must be
+		// followed by an uppercase letter or nothing, so `testing()` and
+		// `testable()` — ordinary methods — are not swept in.
+		if hasTestPrefix(name, "test") {
+			return "test"
+		}
 	}
 	return ""
 }
@@ -140,6 +147,20 @@ func AnnotationTestRole(language, name string) string {
 		case name == "rstest" || name == "test_case" || name == "googletest":
 			return "test"
 		}
+	case "php":
+		// PHPUnit 10+ marks tests with attributes under
+		// PHPUnit\Framework\Attributes, written either bare (`#[Test]`) or
+		// fully qualified; the docblock form (`@test`) reaches here through
+		// the same path. `#[DataProvider]` and `#[TestDox]` describe a test
+		// rather than declaring one, so they carry no role.
+		short := name
+		if i := strings.LastIndex(short, `\`); i >= 0 {
+			short = short[i+1:]
+		}
+		switch short {
+		case "Test", "test", "TestWith", "TestWithJson":
+			return "test"
+		}
 	case "java", "kotlin":
 		short := name
 		if i := strings.LastIndexByte(short, '.'); i >= 0 {
@@ -163,6 +184,8 @@ func AnnotationTestRunner(language string) string {
 		return "cargo-test"
 	case "java", "kotlin":
 		return "junit"
+	case "php":
+		return "phpunit"
 	}
 	return ""
 }
