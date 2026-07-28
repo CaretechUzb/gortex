@@ -872,6 +872,9 @@ func (e *PHPExtractor) extractCallSitesInScope(
 	switch node.Type() {
 	case "anonymous_function", "anonymous_function_creation_expression", "arrow_function":
 		env = env.childScope(node, src)
+	case "member_access_expression", "nullsafe_member_access_expression",
+		"scoped_property_access_expression", "class_constant_access_expression":
+		e.emitPHPMemberAccess(node, src, filePath, callerID, result, env)
 	case "function_call_expression":
 		funcNode := node.ChildByFieldName("function")
 		if funcNode != nil {
