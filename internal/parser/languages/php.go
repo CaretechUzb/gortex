@@ -103,6 +103,19 @@ func (e *PHPExtractor) walkNode(
 	case "namespace_use_declaration":
 		e.extractUseImport(node, src, filePath, fileNode, result)
 
+	case "const_declaration":
+		// Reached only at file scope: a class body's const_declaration is
+		// consumed by extractPhpMembers, which never recurses back here.
+		e.extractPHPFileConstant(node, src, filePath, fileNode, result, seen)
+		return
+
+	case "function_call_expression":
+		// `define('NAME', …)` is PHP's other constant declaration, and it is
+		// an ordinary call with no declaration node of its own.
+		e.extractPHPDefineConstant(node, src, filePath, fileNode, result, seen)
+		e.walkChildren(node, src, filePath, fileNode, result, seen, currentClass)
+		return
+
 	case "expression_statement":
 		// Check for require/include calls.
 		e.extractRequireInclude(node, src, filePath, fileNode, result)
@@ -311,6 +324,10 @@ func (e *PHPExtractor) extractPhpMembers(
 				methodNodes[n.Content(src)] = child
 			}
 			e.extractMethod(child, src, filePath, fileNode, result, seen, ownerName, props)
+			if n := e.findChildByFieldName(child, "name"); n != nil &&
+				strings.EqualFold(n.Content(src), "__construct") {
+				e.extractPHPPromotedProperties(child, src, filePath, fileNode, result, seen, ownerName, ownerID)
+			}
 		case "const_declaration":
 			e.extractPhpClassConst(child, src, filePath, fileNode, result, seen, ownerName, ownerID)
 		case "property_declaration":
@@ -383,6 +400,12 @@ func (e *PHPExtractor) extractEnum(
 	meta := map[string]any{"visibility": VisibilityPublic, "kind": "enum", "type_flavor": "enum"}
 	if bt := e.findChildByType(node, "primitive_type"); bt != nil {
 		meta["backing_type"] = strings.TrimSpace(bt.Content(src))
+	}
+	// A PHP enum may implement interfaces. Without scope_interfaces the
+	// dispatch hierarchy cannot see the enum as an implementor, so a call
+	// through the interface never reaches the enum's methods.
+	if ifaces := phpTypeClauseNames(node, src, "class_interface_clause"); len(ifaces) > 0 {
+		meta["scope_interfaces"] = strings.Join(ifaces, ",")
 	}
 	if doc := ExtractDocAbove(src, int(node.StartPoint().Row), DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
@@ -467,6 +490,7 @@ func (e *PHPExtractor) extractPhpProperty(
 			continue
 		}
 		meta := map[string]any{"receiver": ownerName, "visibility": vis}
+		phpMemberModifiers(node, meta)
 		if propType != "" {
 			meta["field_type"] = propType
 		}
@@ -542,7 +566,7 @@ func phpPropertyType(node *sitter.Node, src []byte) string {
 	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
 		c := node.NamedChild(i)
 		switch c.Type() {
-		case "primitive_type", "named_type", "union_type", "nullable_type", "intersection_type", "optional_type", "qualified_name":
+		case "primitive_type", "named_type", "union_type", "disjunctive_normal_form_type", "intersection_type", "optional_type", "qualified_name":
 			return strings.TrimSpace(c.Content(src))
 		case "property_element":
 			return ""
@@ -592,7 +616,11 @@ func emitPHPTypeUseEdges(ownerID, typeText, filePath string, line int, result *p
 		return
 	}
 	seen := map[string]bool{}
-	for _, atom := range strings.FieldsFunc(typeText, func(r rune) bool { return r == '|' || r == '&' }) {
+	// PHP 8.2 disjunctive normal form — `(Countable&Traversable)|null` —
+	// parenthesises its intersection groups, so the parens are separators too;
+	// without them an atom reads as `(Countable` and mints a bogus target.
+	isSep := func(r rune) bool { return r == '|' || r == '&' || r == '(' || r == ')' }
+	for _, atom := range strings.FieldsFunc(typeText, isSep) {
 		t := canonicalizePHPTypeRef(atom)
 		if t == "" || phpBuiltinType(t) || seen[t] {
 			continue
@@ -624,7 +652,7 @@ func phpReturnType(node *sitter.Node, src []byte) string {
 			continue
 		}
 		switch t {
-		case "primitive_type", "named_type", "union_type", "nullable_type", "intersection_type", "optional_type", "qualified_name", "bottom_type":
+		case "primitive_type", "named_type", "union_type", "disjunctive_normal_form_type", "intersection_type", "optional_type", "qualified_name", "bottom_type":
 			return strings.TrimSpace(c.Content(src))
 		case "compound_statement":
 			return ""
@@ -664,7 +692,7 @@ func phpParameterType(node *sitter.Node, src []byte) string {
 	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
 		c := node.NamedChild(i)
 		switch c.Type() {
-		case "primitive_type", "named_type", "union_type", "nullable_type",
+		case "primitive_type", "named_type", "union_type", "disjunctive_normal_form_type",
 			"intersection_type", "optional_type", "qualified_name":
 			return strings.TrimSpace(c.Content(src))
 		case "variable_name":
@@ -752,6 +780,7 @@ func (e *PHPExtractor) extractMethod(
 		"scope_class": className,
 		"visibility":  phpMemberVisibility(node, src),
 	}
+	phpMemberModifiers(node, meta)
 	if doc := ExtractDocAbove(src, int(node.StartPoint().Row), DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
 	}
