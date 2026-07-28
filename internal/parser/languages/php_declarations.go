@@ -161,3 +161,19 @@ func (e *PHPExtractor) emitPHPFileConstantNode(
 		From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: line,
 	})
 }
+
+// phpNamesACallee reports whether a call's callee node is a statically known
+// identifier. PHP allows the callee to be any expression — `$fn()`,
+// `$obj->$method()`, `Foo::$m()`, `($resolver)()`, `$handlers[0]()` — and the
+// extractor used to emit its raw source text as the edge target, minting
+// unbindable placeholders like `unresolved::*.$fn`.
+func phpNamesACallee(n *sitter.Node) bool {
+	if n == nil {
+		return false
+	}
+	switch n.Type() {
+	case "name", "qualified_name", "relative_name":
+		return true
+	}
+	return false
+}

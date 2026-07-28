@@ -1012,7 +1012,12 @@ func (e *PHPExtractor) emitPHPCallSiteEdges(
 		e.emitPHPMemberAccess(node, src, filePath, callerID, result, env)
 	case "function_call_expression":
 		funcNode := node.ChildByFieldName("function")
-		if funcNode != nil {
+		// A computed callee — `$fn()`, `($this->resolver)()`, `$handlers[0]()`
+		// — names no symbol. Emitting its source text produced targets like
+		// `unresolved::*.$fn` and `unresolved::*.($this->resolver)` that can
+		// never bind (371 of them in guzzle alone); the receiver-typed member
+		// call inside such an expression is captured by the walk regardless.
+		if funcNode != nil && phpNamesACallee(funcNode) {
 			name := funcNode.Content(src)
 			if idx := strings.LastIndex(name, "\\"); idx >= 0 {
 				name = name[idx+1:]
@@ -1025,7 +1030,7 @@ func (e *PHPExtractor) emitPHPCallSiteEdges(
 		}
 	case "member_call_expression", "nullsafe_member_call_expression", "scoped_call_expression":
 		nameNode := node.ChildByFieldName("name")
-		if nameNode != nil {
+		if nameNode != nil && phpNamesACallee(nameNode) {
 			name := nameNode.Content(src)
 			line := int(node.StartPoint().Row) + 1
 			edge := &graph.Edge{

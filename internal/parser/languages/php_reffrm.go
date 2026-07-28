@@ -121,6 +121,18 @@ func emitPHPReferenceForms(root *sitter.Node, src []byte, filePath, fileID strin
 			// variable) and `new class {}` (anonymous) have no name child.
 			if name := phpCreationTypeName(n, src); name != "" {
 				emit(name, line, "", graph.EdgeInstantiates, "")
+				emitPHPConstructorCall(name, line, ownerFor(line), filePath, result, seen)
+			}
+
+		case "catch_clause":
+			// `catch (IOException | NotFoundException $e)` names each caught
+			// type. Without this a class used only as an exception type looked
+			// unreferenced, and the handler was invisible to error-surface
+			// analysis.
+			if list := n.ChildByFieldName("type"); list != nil {
+				for i, c := 0, int(list.NamedChildCount()); i < c; i++ {
+					emit(list.NamedChild(i).Content(src), line, "", graph.EdgeReferences, graph.RefContextType)
+				}
 			}
 
 		case "base_clause":
@@ -308,4 +320,31 @@ func phpAttributeRefName(n *sitter.Node, src []byte) string {
 		}
 	}
 	return ""
+}
+
+// emitPHPConstructorCall lowers `new Foo(...)` to a call of Foo's constructor,
+// alongside the instantiation edge. Without it a PHP constructor showed no
+// callers at all — instantiating a class is the only way to call __construct,
+// and the instantiates edge points at the class, not at the method that runs.
+// The receiver type is stamped so the resolver binds it to Foo's own
+// __construct, or to the nearest ancestor's when Foo inherits one.
+func emitPHPConstructorCall(
+	typeName string, line int, owner, filePath string,
+	result *parser.ExtractionResult, seen map[string]bool,
+) {
+	canon := canonicalizePHPTypeRef(typeName)
+	if owner == "" || canon == "" || phpBuiltinType(canon) || !isPHPTypeNameCapitalized(canon) ||
+		isPHPRelativeScope(canon) {
+		return
+	}
+	key := owner + "\x00ctor\x00" + canon + "\x00" + strconv.Itoa(line)
+	if seen[key] {
+		return
+	}
+	seen[key] = true
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: owner, To: "unresolved::*.__construct",
+		Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
+		Meta: map[string]any{"receiver_type": canon, "via": "constructor"},
+	})
 }
