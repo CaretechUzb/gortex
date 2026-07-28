@@ -353,7 +353,7 @@ func (s *Server) lowerDiffSource(ctx context.Context, req mcp.CallToolRequest) (
 // family (events, taint) is a registration here, not a new pipeline branch.
 func (s *Server) ruleFamilies() []analysis.RuleFamily {
 	fams := []analysis.RuleFamily{
-		analysis.GuardsFamily{Rules: s.guardRules},
+		guardsFamily{srv: s},
 		analysis.ArchitectureFamily{Config: s.architecture},
 	}
 	fams = append(fams, s.extraRuleFamilies()...)

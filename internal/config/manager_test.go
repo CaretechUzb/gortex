@@ -528,3 +528,141 @@ func TestPropertyConfigLayeringSemantics(t *testing.T) {
 			"repo without workspace config should get global default guard rules")
 	})
 }
+
+// --- Reload re-reads per-repo `.gortex.yaml` (issue #320) ---
+
+// writeWorkspaceConfig writes a `.gortex.yaml` into repoDir.
+func writeWorkspaceConfig(t *testing.T, repoDir, body string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".gortex.yaml"), []byte(body), 0644))
+}
+
+func TestReload_RereadsWorkspaceConfigForTrackedRepos(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	writeWorkspaceConfig(t, repoDir, `
+exclude:
+  - "old-dir/**"
+guards:
+  rules:
+    - name: old-rule
+      kind: boundary
+      source: "pkg/a"
+      target: "pkg/b"
+      message: "boundary violation"
+`)
+	cm.LoadWorkspaceConfig("repo", repoDir)
+	require.Contains(t, cm.EffectiveExclude("repo"), "old-dir/**")
+
+	// The user edits the repo's config and asks the daemon to reload. No
+	// LoadWorkspaceConfig call follows — that is the whole point: nothing
+	// on the reload path used to make one for an already-tracked repo.
+	writeWorkspaceConfig(t, repoDir, `
+exclude:
+  - "new-dir/**"
+guards:
+  rules:
+    - name: new-rule
+      kind: boundary
+      source: "pkg/c"
+      target: "pkg/d"
+      message: "boundary violation"
+`)
+	require.NoError(t, cm.Reload())
+
+	got := cm.EffectiveExclude("repo")
+	assert.Contains(t, got, "new-dir/**", "reload must pick up the edited exclude list")
+	assert.NotContains(t, got, "old-dir/**", "reload must drop the superseded exclude list")
+
+	rules := cm.EffectiveGuardRules("repo")
+	require.Len(t, rules, 1)
+	assert.Equal(t, "new-rule", rules[0].Name, "reload must pick up the edited guard rules")
+}
+
+func TestReload_KeepsGitignoreLayerForTrackedRepos(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("tmp/\n"), 0644))
+	cm.LoadWorkspaceConfig("repo", repoDir)
+	require.Contains(t, cm.EffectiveExclude("repo"), "tmp/")
+
+	// Reload used to clear workspacePaths, which is how EffectiveExclude
+	// locates the repo's own `.gitignore` — so the whole gitignore layer
+	// died with the workspace config and the walk fell back to
+	// builtin-only admission.
+	require.NoError(t, cm.Reload())
+
+	assert.Contains(t, cm.EffectiveExclude("repo"), "tmp/",
+		"reload must not sever the repo's .gitignore layer")
+}
+
+func TestReload_DropsDeletedWorkspaceConfig(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	writeWorkspaceConfig(t, repoDir, "exclude:\n  - \"gone/**\"\n")
+	cm.LoadWorkspaceConfig("repo", repoDir)
+	require.Contains(t, cm.EffectiveExclude("repo"), "gone/**")
+
+	require.NoError(t, os.Remove(filepath.Join(repoDir, ".gortex.yaml")))
+	require.NoError(t, cm.Reload())
+
+	assert.NotContains(t, cm.EffectiveExclude("repo"), "gone/**",
+		"a deleted .gortex.yaml must stop applying")
+	assert.Nil(t, cm.getWorkspaceConfig("repo"))
+}
+
+func TestReload_KeepsLastGoodParseOnMalformedEdit(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	writeWorkspaceConfig(t, repoDir, "exclude:\n  - \"good/**\"\n")
+	cm.LoadWorkspaceConfig("repo", repoDir)
+	require.Contains(t, cm.EffectiveExclude("repo"), "good/**")
+
+	// A half-saved edit must not silently downgrade the repo to global
+	// defaults — that is indistinguishable from the bug being fixed here.
+	writeWorkspaceConfig(t, repoDir, ":::invalid yaml content")
+	require.NoError(t, cm.Reload())
+
+	assert.Contains(t, cm.EffectiveExclude("repo"), "good/**",
+		"a malformed edit must keep the last good parse")
+}
+
+func TestLoadWorkspaceConfig_DeletedFileDropsCachedConfig(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	writeWorkspaceConfig(t, repoDir, "exclude:\n  - \"gone/**\"\n")
+	cm.LoadWorkspaceConfig("repo", repoDir)
+	require.NotNil(t, cm.getWorkspaceConfig("repo"))
+
+	require.NoError(t, os.Remove(filepath.Join(repoDir, ".gortex.yaml")))
+	cm.LoadWorkspaceConfig("repo", repoDir)
+
+	assert.Nil(t, cm.getWorkspaceConfig("repo"),
+		"re-reading a repo whose .gortex.yaml was deleted must drop the cached config")
+}
+
+func TestLoadWorkspaceConfig_MalformedEditKeepsLastGoodParse(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	writeWorkspaceConfig(t, repoDir, "exclude:\n  - \"good/**\"\n")
+	cm.LoadWorkspaceConfig("repo", repoDir)
+
+	writeWorkspaceConfig(t, repoDir, ":::invalid yaml content")
+	cm.LoadWorkspaceConfig("repo", repoDir)
+
+	cfg := cm.getWorkspaceConfig("repo")
+	require.NotNil(t, cfg)
+	assert.Equal(t, []string{"good/**"}, cfg.Exclude)
+}

@@ -268,8 +268,8 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 	}
 
 	// --- guards gate (architecture + co-change / boundary rules) ---
-	if len(ids) > 0 && (len(s.guardRules) > 0 || !s.architecture.IsEmpty()) {
-		guards := analysis.EvaluateGuards(s.graph, s.guardRules, ids)
+	if len(ids) > 0 && (s.hasGuardRules(ids) || !s.architecture.IsEmpty()) {
+		guards := s.evaluateGuards(ids)
 		guards = append(guards, analysis.EvaluateArchitecture(s.graph, s.architecture, ids)...)
 		out.Guards = guards
 		out.Gates = append(out.Gates, prReviewGuardGate(guards))

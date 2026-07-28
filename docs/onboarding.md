@@ -223,6 +223,12 @@ gortex daemon reload          # re-read config, pick up new/removed repos
 gortex daemon logs -n 50      # tail the log
 ```
 
+`reload` re-reads the global `~/.gortex/config.yaml` *and* every tracked
+repo's own `.gortex.yaml`, so an edit to a repo's `exclude:`, `include:`,
+`guards:` or workspace slugs applies without restarting the daemon. The
+refreshed exclude list is pushed into each repo's live indexer, so the next
+walk — full or incremental — honours it.
+
 ### Auto-start at login (optional)
 
 Let the OS supervise the daemon so it starts at login and restarts on crash. No sudo required — the unit lives under `$HOME`.

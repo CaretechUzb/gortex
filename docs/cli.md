@@ -49,7 +49,7 @@ gortex daemon start --detach --http-addr 127.0.0.1:7411 --log-level debug
 gortex daemon status                # PID, uptime, memory, tracked repos, sessions, server roster, search backend, warmup + enrichment progress
 gortex daemon stop                  # graceful shutdown + final snapshot
 gortex daemon restart               # stop + start
-gortex daemon reload                # re-read config, pick up new/removed repos
+gortex daemon reload                # re-read the global config AND every tracked repo's .gortex.yaml, pick up new/removed repos
 gortex daemon logs -n 50            # tail the log file
 
 # Multi-server roster — let the daemon route to additional Gortex servers (local sockets or remote HTTPS):

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,13 +90,29 @@ func (cm *ConfigManager) Revision() uint64 {
 }
 
 // Reload re-reads the GlobalConfig from disk, keeping the same config
-// path. Workspace caches are preserved — individual `.gortex.yaml`
-// files are re-read lazily on demand. Used by the daemon's `reload`
-// control RPC to pick up manual edits to the global config without a
-// full process restart.
+// path, AND re-reads every per-repo `.gortex.yaml` this manager has seen.
+// Used by the daemon's `reload` control RPC to pick up manual edits to
+// either file without a full process restart.
+//
+// The per-repo re-read is not optional bookkeeping. This used to drop the
+// workspace caches and wait for a "lazy" re-read, but the only writer of
+// those caches is LoadWorkspaceConfig, which runs at track / index time
+// and never on this path — so the lazy re-read never happened. Worse,
+// workspacePaths is what EffectiveExclude uses to locate a repo's own
+// `.gitignore`, so dropping it left every tracked repo running with no
+// workspace config AND no gitignore layer (builtin-only admission) until
+// the process restarted: strictly worse than the stale state the drop was
+// meant to avoid.
+//
+// Every file is read before anything is published, so a concurrent
+// indexer walk never observes a config-less window.
 func (cm *ConfigManager) Reload() error {
 	cm.mu.Lock()
 	path := cm.global.ConfigPath()
+	known := make(map[string]string, len(cm.workspacePaths))
+	for prefix, repoPath := range cm.workspacePaths {
+		known[prefix] = repoPath
+	}
 	cm.mu.Unlock()
 
 	var fresh *GlobalConfig
@@ -109,64 +126,108 @@ func (cm *ConfigManager) Reload() error {
 		return fmt.Errorf("reload global config: %w", err)
 	}
 
+	reread := make(map[string]*Config, len(known))
+	var dropped []string
+	for prefix, repoPath := range known {
+		cfg, authoritative := cm.readWorkspaceConfig(prefix, repoPath)
+		switch {
+		case !authoritative:
+			// Present but unreadable / malformed — keep the last good
+			// parse rather than silently downgrading the repo to global
+			// defaults on a transient I/O error or a half-saved edit.
+		case cfg == nil:
+			// The `.gortex.yaml` is gone; so are its overrides.
+			dropped = append(dropped, prefix)
+		default:
+			reread[prefix] = cfg
+		}
+	}
+
+	// Apply per prefix rather than swapping the whole map: a repo tracked
+	// concurrently with this reload must not be erased by a map snapshot
+	// taken before it existed.
 	cm.mu.Lock()
 	cm.global = fresh
-	// Drop workspace cache so stale per-repo overrides don't linger;
-	// they'll be reloaded on the next LoadWorkspaceConfig call.
-	cm.workspace = make(map[string]*Config)
-	cm.workspacePaths = make(map[string]string)
+	for prefix, cfg := range reread {
+		cm.workspace[prefix] = cfg
+	}
+	for _, prefix := range dropped {
+		delete(cm.workspace, prefix)
+	}
 	cm.revision.Add(1)
 	cm.mu.Unlock()
 	return nil
 }
 
 // LoadWorkspaceConfig loads a .gortex.yaml from the given repo root
-// and caches it under the given repoPrefix. If the file is missing,
-// no entry is cached (global defaults will apply). If the file is
-// malformed, a warning is logged and no entry is cached.
+// and caches it under the given repoPrefix. If the file is missing, any
+// entry cached under that prefix is dropped (global defaults will
+// apply). If the file exists but is unreadable or malformed, a warning
+// is logged and the last good parse is kept.
 func (cm *ConfigManager) LoadWorkspaceConfig(repoPrefix, repoPath string) {
+	cfg, authoritative := cm.readWorkspaceConfig(repoPrefix, repoPath)
+	cm.publishWorkspaceConfig(repoPrefix, repoPath, cfg, authoritative)
+}
+
+// readWorkspaceConfig reads and parses a repo's `.gortex.yaml`. The second
+// return reports whether the result reflects what is on disk: it is false
+// only when the file exists but could not be read or parsed, in which case
+// the caller keeps whatever it had cached. A (nil, true) result means the
+// file genuinely does not exist.
+func (cm *ConfigManager) readWorkspaceConfig(repoPrefix, repoPath string) (*Config, bool) {
 	configPath := filepath.Join(repoPath, ".gortex.yaml")
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		cm.updateWorkspaceConfig(repoPrefix, repoPath, nil)
 		if os.IsNotExist(err) {
 			// No workspace config — global defaults will apply.
-			return
+			return nil, true
 		}
 		cm.logger.Warn("failed to read workspace config",
 			zap.String("repo", repoPrefix),
 			zap.String("path", configPath),
 			zap.Error(err))
-		return
+		return nil, false
 	}
 
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		cm.updateWorkspaceConfig(repoPrefix, repoPath, nil)
-		// Malformed workspace config — log warning, return global defaults.
-		cm.logger.Warn("malformed workspace config, using global defaults",
+		// Malformed workspace config — log warning, keep the last good parse.
+		cm.logger.Warn("malformed workspace config, keeping the last good parse",
 			zap.String("repo", repoPrefix),
 			zap.String("path", configPath),
 			zap.Error(err))
-		return
+		return nil, false
 	}
 
-	cm.updateWorkspaceConfig(repoPrefix, repoPath, &cfg)
+	return &cfg, true
 }
 
-// updateWorkspaceConfig publishes a per-repo state transition and advances
-// revision only when the cached state actually changes. A nil cfg updates the
-// remembered path without replacing an existing parsed config, preserving the
-// prior missing/malformed-file behavior.
-func (cm *ConfigManager) updateWorkspaceConfig(repoPrefix, repoPath string, cfg *Config) {
+// publishWorkspaceConfig publishes a per-repo state transition and advances
+// revision only when the cached state actually changes. authoritative says
+// whether cfg reflects what is on disk: a failed read/parse updates only the
+// remembered path and leaves the cached config alone, while an authoritative
+// nil (no `.gortex.yaml` on disk) drops it — deleting the file must stop its
+// overrides applying, without waiting for a daemon restart.
+//
+// The remembered path is never cleared: EffectiveExclude needs it to locate
+// the repo's own `.gitignore`, which is independent of `.gortex.yaml`.
+func (cm *ConfigManager) publishWorkspaceConfig(repoPrefix, repoPath string, cfg *Config, authoritative bool) {
 	cm.mu.Lock()
 	changed := false
 	if repoPath != "" && cm.workspacePaths[repoPrefix] != repoPath {
 		cm.workspacePaths[repoPrefix] = repoPath
 		changed = true
 	}
-	if cfg != nil && !reflect.DeepEqual(cm.workspace[repoPrefix], cfg) {
+	switch {
+	case !authoritative:
+		// Keep the last good parse.
+	case cfg == nil:
+		if _, ok := cm.workspace[repoPrefix]; ok {
+			delete(cm.workspace, repoPrefix)
+			changed = true
+		}
+	case !reflect.DeepEqual(cm.workspace[repoPrefix], cfg):
 		cm.workspace[repoPrefix] = cfg
 		changed = true
 	}
@@ -174,6 +235,25 @@ func (cm *ConfigManager) updateWorkspaceConfig(repoPrefix, repoPath string, cfg 
 		cm.revision.Add(1)
 	}
 	cm.mu.Unlock()
+}
+
+// WorkspacePrefixes returns the repo prefixes this manager has loaded a
+// workspace config for — i.e. every repo that has been tracked or indexed
+// in this process, whether or not it has a `.gortex.yaml`. Callers use it
+// to tell a real repo prefix from the leading path segment of an
+// unprefixed node ID.
+func (cm *ConfigManager) WorkspacePrefixes() []string {
+	if cm == nil {
+		return nil
+	}
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	out := make([]string, 0, len(cm.workspacePaths))
+	for prefix := range cm.workspacePaths {
+		out = append(out, prefix)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // getWorkspaceConfig returns the cached workspace config for a repo, or nil.

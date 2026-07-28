@@ -2053,6 +2053,48 @@ func (mi *MultiIndexer) IndexRepo(repoPrefix string) (*IndexResult, error) {
 	return result, nil
 }
 
+// RefreshRepoConfigs re-reads every tracked repo's `.gortex.yaml` and
+// pushes the refreshed effective exclude list into that repo's live
+// Indexer. Returns the number of repos whose config was re-read.
+//
+// This is the deterministic re-read path for an already-tracked repo.
+// Track and index both load the workspace config on their way in, but a
+// repo that is already tracked short-circuits before that — so an edit to
+// `.gortex.yaml` had no way to reach a running daemon. Pushing the
+// exclude list into the live Indexer matters just as much: it is reused
+// by every incremental and scoped re-index, and it froze its ignore list
+// at construction.
+func (mi *MultiIndexer) RefreshRepoConfigs() int {
+	if mi == nil || mi.configMgr == nil {
+		return 0
+	}
+
+	mi.mu.RLock()
+	roots := make(map[string]string, len(mi.repos))
+	for prefix, meta := range mi.repos {
+		if meta != nil && meta.RootPath != "" {
+			roots[prefix] = meta.RootPath
+		}
+	}
+	mi.mu.RUnlock()
+
+	for prefix, root := range roots {
+		mi.configMgr.LoadWorkspaceConfig(prefix, root)
+
+		cfg := mi.configMgr.GetRepoConfig(prefix)
+		if cfg == nil {
+			continue
+		}
+		mi.mu.RLock()
+		idx := mi.indexers[prefix]
+		mi.mu.RUnlock()
+		if idx != nil {
+			idx.SetExcludePatterns(cfg.Index.Exclude)
+		}
+	}
+	return len(roots)
+}
+
 // IncrementalReindexRepo incrementally re-indexes a single tracked repo
 // by prefix: only the files that changed since the last pass are
 // re-parsed and deleted files are evicted, against the repo's existing

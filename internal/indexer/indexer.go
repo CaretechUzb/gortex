@@ -157,14 +157,21 @@ type Indexer struct {
 	// them take the shadow path regardless of what sibling repos
 	// have already drained into the shared disk store. Per-repo-
 	// prefixed stub IDs make the concurrent drains conflict-free.
-	indexCount    atomic.Int32
-	registry      *parser.Registry
-	resolver      *resolver.Resolver
-	search        search.Backend
-	config        config.IndexConfig
-	transforms    *transformPipeline
-	excludes      *excludes.Matcher
-	excludeOnce   sync.Once
+	indexCount atomic.Int32
+	registry   *parser.Registry
+	resolver   *resolver.Resolver
+	search     search.Backend
+	config     config.IndexConfig
+	transforms *transformPipeline
+	// excludes is the compiled ignore matcher, built lazily from
+	// config.Exclude. It is hot-swappable rather than build-once: a
+	// per-repo Indexer outlives many `.gortex.yaml` edits, and without a
+	// swap every incremental / scoped re-index kept walking with the
+	// exclude list the Indexer was constructed with. excludeMu guards the
+	// build and the swap (and the config.Exclude read/write that goes with
+	// them); readers pay only the atomic load.
+	excludes      atomic.Pointer[excludes.Matcher]
+	excludeMu     sync.Mutex
 	dirIgnore     *excludes.Hierarchical
 	dirIgnoreOnce sync.Once
 	rootPath      string
@@ -5228,18 +5235,42 @@ func (idx *Indexer) dirIgnoreMatcher(root string) *excludes.Hierarchical {
 }
 
 func (idx *Indexer) excludeMatcher() *excludes.Matcher {
-	idx.excludeOnce.Do(func() {
-		patterns := idx.config.Exclude
-		// A nil/empty list from upstream means "no layering was applied"
-		// (e.g. a direct caller of indexer.New without ConfigManager).
-		// Fall back to the builtin baseline so the walk still skips the
-		// obvious non-source dirs.
-		if len(patterns) == 0 {
-			patterns = excludes.Builtin
-		}
-		idx.excludes = excludes.New(patterns)
-	})
-	return idx.excludes
+	if m := idx.excludes.Load(); m != nil {
+		return m
+	}
+	idx.excludeMu.Lock()
+	defer idx.excludeMu.Unlock()
+	if m := idx.excludes.Load(); m != nil {
+		return m
+	}
+	m := excludes.New(effectiveExcludePatterns(idx.config.Exclude))
+	idx.excludes.Store(m)
+	return m
+}
+
+// SetExcludePatterns installs a new effective ignore list on a live
+// Indexer and rebuilds the matcher, so the next walk honours it. Called
+// when a repo's `.gortex.yaml` is re-read (daemon reload / re-track):
+// the per-repo Indexer is long-lived and is reused by every incremental
+// and scoped re-index, so without this an exclude added after the repo
+// was tracked did not take effect until the daemon restarted.
+func (idx *Indexer) SetExcludePatterns(patterns []string) {
+	idx.excludeMu.Lock()
+	defer idx.excludeMu.Unlock()
+	idx.config.Exclude = patterns
+	idx.excludes.Store(excludes.New(effectiveExcludePatterns(patterns)))
+}
+
+// effectiveExcludePatterns falls back to the builtin baseline when the
+// list is empty. A nil/empty list from upstream means "no layering was
+// applied" (e.g. a direct caller of indexer.New without ConfigManager),
+// not "index everything" — the walk should still skip the obvious
+// non-source dirs.
+func effectiveExcludePatterns(patterns []string) []string {
+	if len(patterns) == 0 {
+		return excludes.Builtin
+	}
+	return patterns
 }
 
 // ParseErrors returns the parse errors from the last full index.

@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -40,9 +39,7 @@ func Dropped() {}
 	require.NotEmpty(t, g.FindNodesByName("Dropped"))
 
 	// Mid-flight exclusion: drop.go remains on disk but must leave the graph.
-	idx.config.Exclude = append(append([]string{}, excludes.Builtin...), "drop.go")
-	idx.excludes = nil
-	idx.excludeOnce = sync.Once{}
+	idx.SetExcludePatterns(append(append([]string{}, excludes.Builtin...), "drop.go"))
 
 	res, err := idx.IncrementalReindex(dir)
 	require.NoError(t, err)
