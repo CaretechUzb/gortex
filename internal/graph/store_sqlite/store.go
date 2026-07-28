@@ -1584,6 +1584,18 @@ func (s *Store) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
 
 // EvictRepo removes every node in repoPrefix and every edge that
 // touches one. Returns (nodesRemoved, edgesRemoved).
+//
+// DELIBERATE DIVERGENCE from the in-memory Graph.EvictRepo, which treats ""
+// as a no-op: here "" is an exact match and really does delete unprefixed
+// rows. That is load-bearing today. A single-repo daemon's nodes carry
+// repo_prefix="", and Indexer.IndexCtx evicts them by the indexer's own
+// (empty) prefix before a warm-restart bulk reload — without the delete,
+// the reload lands on top of the previous run's rows and duplicates the
+// graph. Aligning the two backends now would reintroduce that.
+//
+// The divergence expires once every repo carries a prefix: "" then names
+// only the synthetic global externals, which no caller should ever bulk
+// evict, and this can refuse "" the way PurgeRepo already does.
 func (s *Store) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
 	predicate := evictRepoPredicate
 	if repoPrefix != "" {

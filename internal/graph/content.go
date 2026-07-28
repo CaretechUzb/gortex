@@ -26,15 +26,26 @@ type NonContentNodeReader interface {
 }
 
 // ContentNodeReader is the inverse projection used by the content-link pass.
-// The repository predicate is exact, including the empty-prefix single-repo
-// case, and implementations must push data_class=content into the backend.
+// The repository predicate is EXACT — an empty prefix selects only nodes whose
+// RepoPrefix is itself empty — and implementations must push data_class=content
+// into the backend.
+//
+// NOTE the asymmetry with NonContentNodeReader above: the two are siblings in
+// this file and their empty-prefix argument means OPPOSITE things. "" is a
+// WILDCARD for GetRepoNonContentNodes ("every repo") and an EXACT MATCH for
+// GetRepoContentNodes ("the repo whose prefix is empty"). Neither is wrong —
+// the code passes want every repo, the content-link pass wants one — but
+// reading either signature as a guide to the other silently inverts the scope.
 type ContentNodeReader interface {
 	GetRepoContentNodes(repoPrefix string) []*Node
 }
 
 // GetRepoNonContentNodes implements NonContentNodeReader without allocating a
-// graph-wide snapshot. Empty prefix keeps the historical "all repos" semantics
-// used by global code/search passes; non-empty prefixes use the compact bucket.
+// graph-wide snapshot. Empty prefix is a WILDCARD — it keeps the historical
+// "all repos" semantics used by global code/search passes — while non-empty
+// prefixes use the compact bucket. Do not "tighten" the empty case to an exact
+// RepoPrefix == "" match: that would silently empty every global pass built on
+// it rather than failing.
 func (g *Graph) GetRepoNonContentNodes(repoPrefix string) []*Node {
 	var out []*Node
 	for _, s := range g.shards {
@@ -57,9 +68,11 @@ func (g *Graph) GetRepoNonContentNodes(repoPrefix string) []*Node {
 	return out
 }
 
-// GetRepoContentNodes implements ContentNodeReader with the exact repository
-// predicate. Empty-prefix nodes live outside byRepo, so that case reads shard
-// maps directly and retains only CONTENT sections.
+// GetRepoContentNodes implements ContentNodeReader with the EXACT repository
+// predicate — unlike its GetRepoNonContentNodes sibling above, "" here selects
+// only nodes whose own RepoPrefix is empty, not every repo. Empty-prefix nodes
+// live outside byRepo, so that case reads shard maps directly and retains only
+// CONTENT sections.
 func (g *Graph) GetRepoContentNodes(repoPrefix string) []*Node {
 	var out []*Node
 	for _, s := range g.shards {
