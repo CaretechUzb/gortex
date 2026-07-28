@@ -47,16 +47,6 @@ type RepoMetadata struct {
 	// needs this remembered flag to know a vanished root was a
 	// worktree and may be garbage-collected.
 	IsWorktree bool
-	// Unprefixed records that this repo was indexed in single-repo
-	// mode: its nodes carry RepoPrefix="" and raw relative file paths.
-	// The empty-prefix resolution fallback (RepoRoot, ResolveFilePath)
-	// honours only a lone repo that actually minted unprefixed nodes —
-	// without the provenance check, stale unprefixed nodes surviving a
-	// track/untrack transition would resolve against whatever repo
-	// happens to be the lone one. Eviction also branches on it:
-	// unprefixed nodes are invisible to the byRepo bucket EvictRepo
-	// walks, so UntrackRepo must evict them file-by-file.
-	Unprefixed bool
 }
 
 // MultiIndexer orchestrates indexing across multiple repositories.
@@ -1997,15 +1987,12 @@ func (mi *MultiIndexer) IncrementalReindexRepo(repoPrefix string, paths []string
 		EdgeCount:     result.EdgeCount,
 		ParseErrors:   result.Errors,
 		FileMtimes:    idx.FileMtimes(),
-		// Carried over from the prior metadata: this pass doesn't
-		// change either property, and dropping them here (both zero
-		// value on a fresh struct literal) used to silently flip a
-		// worktree or an Unprefixed solo repo back to their false
-		// defaults on the very first watcher-triggered incremental
-		// update, defeating callers that key behaviour off them (see
-		// the Unprefixed branch in cmd/gortex daemon status).
+		// Carried over from the prior metadata: this pass doesn't change
+		// it, and dropping it here (zero value on a fresh struct literal)
+		// used to silently flip a worktree back to its false default on
+		// the very first watcher-triggered incremental update, defeating
+		// callers that key behaviour off it.
 		IsWorktree: meta.IsWorktree,
-		Unprefixed: meta.Unprefixed,
 	}
 	mi.mu.Unlock()
 
@@ -2540,18 +2527,14 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 	delete(mi.indexers, repoPrefix)
 	mi.mu.Unlock()
 
+	// Every repo's nodes live in its byRepo bucket, so the sidecar-aware
+	// purge covers all of them. Single-repo-mode nodes used to carry an
+	// empty RepoPrefix, never entered that bucket, and needed a
+	// file-by-file EvictFile loop — which took the branch BELOW the
+	// capability probe and so skipped PurgeRepo entirely, leaking fifteen
+	// repo_prefix-keyed sidecar tables on every solo untrack.
 	var nodesRemoved, edgesRemoved int
-	if meta.Unprefixed {
-		// Single-repo-mode nodes carry RepoPrefix="" and never enter the
-		// byRepo bucket EvictRepo walks — evict them file-by-file off the
-		// recorded file set instead, or they linger in the graph and a
-		// later lone repo would mis-resolve them.
-		for path := range meta.FileMtimes {
-			n, e := mi.graph.EvictFile(path)
-			nodesRemoved += n
-			edgesRemoved += e
-		}
-	} else if purger, ok := mi.graph.(interface{ PurgeRepo(string) error }); ok {
+	if purger, ok := mi.graph.(interface{ PurgeRepo(string) error }); ok {
 		// Prefer the full sidecar-aware purge. EvictRepo drops only
 		// nodes+edges and leaves fifteen repo_prefix-keyed sidecar tables
 		// (file_mtimes, *_enrichment, symbol_fts, content_fts, ...) behind,

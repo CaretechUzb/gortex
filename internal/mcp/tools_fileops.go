@@ -80,20 +80,29 @@ func (s *Server) resolveFilePath(rawPath string) (absPath, relPath string, err e
 	}
 
 	if s.multiIndexer != nil {
-		// Multi-repo mode requires a repo-prefixed path. Bare-relative
-		// paths are ambiguous; refuse rather than fall through to the
-		// daemon process CWD. With exactly one tracked repo there is no
-		// ambiguity — single-repo mode indexes unprefixed paths, so a
-		// bare-relative path anchors to the lone repo's root.
+		// A repo-prefixed path resolves directly. A bare-relative path is
+		// ambiguous across several tracked repos and must be refused rather
+		// than fall through to the daemon process CWD — but with exactly one
+		// tracked repo there is nothing to be ambiguous about, so it anchors
+		// to that repo's root. This is what lets an agent (or a hook, or the
+		// review pack) name `internal/foo.go` in a solo workspace without
+		// first learning the prefix, including for a file it is about to
+		// create.
 		prefix := matchedRepoPrefix(s.multiIndexer, rawPath)
 		if prefix == "" {
-			if root, ok := s.multiIndexer.RepoRoot(""); ok {
+			if soleRepo, root, ok := soleTrackedRepo(s.multiIndexer); ok {
 				abs := filepath.Clean(filepath.Join(root, rawPath))
 				if !pathContainedIn(abs, root) {
 					return "", "", fmt.Errorf("%w: %q resolves to %q, outside repo root %q", errPathEscape, rawPath, abs, root)
 				}
 				abs = worktreeRootedPath(abs, root, s.multiIndexer)
-				return abs, rawPath, nil
+				// relPath is the GRAPH's spelling, not the caller's: it is
+				// what downstream node lookups (get_file_summary, savings
+				// recording, session bookkeeping) key on, and graph file
+				// keys are prefixed. Echoing the bare input back resolved
+				// the bytes correctly and then reported file_not_indexed
+				// for a file that was indexed.
+				return abs, soleRepo + "/" + rawPath, nil
 			}
 			// No matched prefix and no lone repo: an unprefixed path is
 			// normally ambiguous across tracked repos. But when it names
@@ -117,19 +126,14 @@ func (s *Server) resolveFilePath(rawPath string) (absPath, relPath string, err e
 		if !ok {
 			return "", "", fmt.Errorf("%w: repo prefix %q has no root path", errPathUnresolved, prefix)
 		}
-		// Collision guard for the lone unprefixed repo: its indexed
-		// paths are raw relative paths, so one whose first segment
-		// equals the repo's own prefix (repo "api" containing
-		// api/handlers.go) would be hijacked by the prefix-strip join.
-		// Prefer the raw join when that file actually exists.
-		if loneRoot, lok := s.multiIndexer.RepoRoot(""); lok && loneRoot == root {
-			raw := filepath.Clean(filepath.Join(loneRoot, rawPath))
-			if pathContainedIn(raw, loneRoot) {
-				if _, err := os.Stat(raw); err == nil {
-					return worktreeRootedPath(raw, loneRoot, s.multiIndexer), rawPath, nil
-				}
-			}
-		}
+		// A leading segment matching a tracked prefix IS that prefix, and
+		// stripping it is unambiguous. This used to need a stat()-based
+		// collision guard: a lone repo's indexed paths were raw relative
+		// paths, so for a repo "api" containing its own api/ directory,
+		// "api/handlers.go" could mean either the prefixed form or the raw
+		// one, and the guard picked whichever existed on disk. Against
+		// prefixed paths that guard inverts — it would return
+		// <root>/api/handlers.go where the caller meant <root>/handlers.go.
 		abs := filepath.Clean(filepath.Join(root, strings.TrimPrefix(rawPath, prefix+"/")))
 		if !pathContainedIn(abs, root) {
 			return "", "", fmt.Errorf("%w: %q resolves to %q, outside repo root %q", errPathEscape, rawPath, abs, root)
@@ -176,6 +180,28 @@ func matchedRepoPrefix(mi multiRepoLookup, rawPath string) string {
 		}
 	}
 	return best
+}
+
+// soleTrackedRepo returns the prefix and root of the only tracked repo, or
+// ok=false when zero or several are tracked.
+//
+// One tracked repo is what makes an unqualified path answerable: there is
+// nothing for `internal/foo.go` to be ambiguous between. Callers use it to
+// anchor bare repo-relative input — including paths naming files that do not
+// exist yet, which an existence check could not resolve.
+func soleTrackedRepo(mi multiRepoLookup) (prefix, root string, ok bool) {
+	if mi == nil {
+		return "", "", false
+	}
+	prefixes := mi.RepoPrefixes()
+	if len(prefixes) != 1 || prefixes[0] == "" {
+		return "", "", false
+	}
+	root, ok = mi.RepoRoot(prefixes[0])
+	if !ok || root == "" {
+		return "", "", false
+	}
+	return prefixes[0], root, true
 }
 
 // multiRepoLookup is the subset of *MultiIndexer that resolveFilePath

@@ -163,14 +163,14 @@ func (s *Server) filterTextMatchesByResolvedScope(matches []trigram.Match, resol
 	}
 	out := make([]trigram.Match, 0, len(matches))
 	for _, m := range matches {
-		repo, rest, ok := strings.Cut(m.Path, "/")
+		repo, _, ok := strings.Cut(m.Path, "/")
 		// Repo allow-set fast path: a match whose stamped repo prefix
 		// is outside the allow-set is dropped outright. Only applies
 		// when the first path segment actually names a tracked repo —
-		// on an unstamped (single-indexer / unprefixed) path the first
-		// segment is an ordinary directory and must not be mistaken
-		// for a repo prefix. The node-attribution check below stays
-		// authoritative either way.
+		// on an unstamped (standalone-indexer) path the first segment
+		// is an ordinary directory and must not be mistaken for a repo
+		// prefix. The node-attribution check below stays authoritative
+		// either way.
 		knownRepo := ok && repo != "" && s.multiIndexer != nil && s.multiIndexer.GetMetadata(repo) != nil
 		if len(resolved.RepoAllow) > 0 && knownRepo && !resolved.RepoAllow[repo] {
 			continue
@@ -195,21 +195,12 @@ func (s *Server) filterTextMatchesByResolvedScope(matches []trigram.Match, resol
 				n = s.graph.GetNode(key)
 			}
 		}
-		if n == nil && knownRepo {
-			// GrepTextForRepos stamps the registry prefix onto every
-			// match path, but a repo indexed in single-repo mode minted
-			// UNPREFIXED node IDs (RepoMetadata.Unprefixed) — the
-			// stamped path misses the graph key. Retry with the prefix
-			// stripped so attribution works in a lone-repo daemon.
-			if meta := s.multiIndexer.GetMetadata(repo); meta != nil && meta.Unprefixed {
-				n = s.graph.GetNode(rest)
-				if n == nil {
-					if key := graphMatchPathKey(rest, false); key != rest {
-						n = s.graph.GetNode(key)
-					}
-				}
-			}
-		}
+		// GrepTextForRepos stamps the registry prefix onto every match path,
+		// and graph file keys carry that same prefix, so the two agree by
+		// construction. They used to diverge for a lone repo — which minted
+		// unprefixed node IDs — and attribution needed a provenance-gated
+		// retry with the prefix stripped, or it fail-closed-dropped every
+		// match in a solo daemon.
 		if n == nil || !opts.ScopeAllows(n) {
 			continue
 		}
