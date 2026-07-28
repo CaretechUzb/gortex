@@ -140,10 +140,12 @@ type Server struct {
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
 	activeProject string
-	// testIndexProbe caches, per repo prefix, which test-path fragments the
-	// graph carries symbols for (see testFragmentsIndexed). The answer only
-	// changes with a reindex under a different exclude set, so
-	// daemon-lifetime caching is safe.
+	// testIndexProbe caches, per repo prefix, which language families the
+	// graph carries test symbols for (see testLangsIndexed). The answer
+	// changes with a reindex — and with the test-edge pass that stamps those
+	// symbols, which lands after the first files are indexed — so
+	// resetTestIndexProbe clears it on every analysis pass rather than
+	// pinning the first (possibly mid-warmup) answer for the daemon's life.
 	testIndexProbe sync.Map
 	// trackInFlight guards first-index runs by absolute repo path.
 	// track answers before the index finishes (#326), so without this a
@@ -2383,6 +2385,14 @@ func (s *Server) RunAnalysis() {
 	// idempotent.
 	s.resetConfirmedRefs()
 
+	// The test-symbol probe backing the review's coverage attestation is a
+	// property of the graph that was just rebuilt: a reindex under a new
+	// exclude set, or simply the test-edge pass finishing after a probe ran
+	// mid-warmup, changes the answer. Without this reset the first answer
+	// stuck for the daemon's lifetime and every review claimed the index
+	// carried no test symbols.
+	s.resetTestIndexProbe()
+
 	// Bootstrap-resource payloads (graph_stats, index_health, etc.)
 	// can change after re-warm even when the analysis itself didn't
 	// — node counts move on every reindex. Fire updates regardless.
@@ -2456,6 +2466,18 @@ func ScheduleMemoryReleaseAfterBurst(logger *zap.Logger, reason string) {
 func (s *Server) resetConfirmedRefs() {
 	s.refsConfirmed.Range(func(k, _ any) bool {
 		s.refsConfirmed.Delete(k)
+		return true
+	})
+}
+
+// resetTestIndexProbe clears the per-repo-prefix test-symbol probe (see the
+// testIndexProbe field) so the next review re-scans the rebuilt graph. Like
+// resetConfirmedRefs it ranges-and-deletes because sync.Map has no clear-all,
+// and it is safe against a concurrent testLangsIndexed reader: a racing miss
+// just re-scans, which is idempotent.
+func (s *Server) resetTestIndexProbe() {
+	s.testIndexProbe.Range(func(k, _ any) bool {
+		s.testIndexProbe.Delete(k)
 		return true
 	})
 }
