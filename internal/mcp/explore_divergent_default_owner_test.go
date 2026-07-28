@@ -408,11 +408,16 @@ func TestHandleExplorePromotesDivergentDefaultOwnerFromSQLitePHPIndex(t *testing
 	task := `StreamHandler::write reports "could not be opened: Permission denied" after a rotating handler applies chmod; find the divergent filePermission default and owning type`
 	direct := promoteExploreDivergentDefaultOwner(task, []exploreTarget{{node: write}, {node: baseType}, {node: baseCtor}}, store, 3, func(node *graph.Node) string {
 		return server.manifestSymbolSource(context.Background(), node)
-	})
+	}, pinnedDivergentDefaultFallbackSLO)
 	require.Equal(t, childCtor.ID, direct[0].node.ID, "real store projection did not promote child constructor")
+	// The fallback path is the one bounded by exploreDefaultOwnerFallbackSLO:
+	// with only `write` ranked there is no base constructor/type pair, so the
+	// ranked-callable projection runs and its batched SQLite reads must finish
+	// inside the slice. This assertion is about WHICH owner is promoted, not
+	// about how fast the machine is, so the slice is pinned.
 	fallback := promoteExploreDivergentDefaultOwner(task, []exploreTarget{{node: write}}, store, 3, func(node *graph.Node) string {
 		return server.manifestSymbolSource(context.Background(), node)
-	})
+	}, pinnedDivergentDefaultFallbackSLO)
 	require.Equal(t, childCtor.ID, fallback[0].node.ID, "real store callable-owner fallback did not promote child constructor")
 
 	req := mcpgo.CallToolRequest{}
@@ -515,7 +520,21 @@ class RotatingFileHandler extends StreamHandler {
 	_, err = idx.Index(root)
 	require.NoError(t, err)
 	server := NewServer(query.NewEngine(store), store, idx, nil, zap.NewNop(), nil)
-	return server, store
+	return pinExploreDivergentDefaultFallbackSLO(server), store
+}
+
+// pinnedDivergentDefaultFallbackSLO is the wall-clock slice tests give the
+// divergent-default-owner fallback. Generous on purpose: these tests assert
+// WHICH owner is promoted, and the production 25ms default makes that a
+// function of machine load rather than of the ranking under test.
+const pinnedDivergentDefaultFallbackSLO = 30 * time.Second
+
+// pinExploreDivergentDefaultFallbackSLO widens the fallback slice for a server
+// whose explore responses are asserted symbol-by-symbol. Mirrors
+// pinExploreSourceLiteralRecallBudget, for the same reason.
+func pinExploreDivergentDefaultFallbackSLO(s *Server) *Server {
+	s.divergentDefaultFallbackSLOOverride = pinnedDivergentDefaultFallbackSLO
+	return s
 }
 
 func requirePHPFixtureNode(t *testing.T, store graph.Store, fileSuffix, name string, kind graph.NodeKind) *graph.Node {

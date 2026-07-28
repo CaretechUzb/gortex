@@ -465,6 +465,15 @@ type Server struct {
 	// pinExploreSourceLiteralRecallBudget.
 	sourceLiteralRecallBudgetOverride time.Duration
 
+	// divergentDefaultFallbackSLOOverride replaces the wall-clock slice
+	// explore's divergent-default-owner fallback may spend. Test-only, same
+	// contract as sourceLiteralRecallBudgetOverride above: production leaves
+	// it zero and gets exploreDefaultOwnerFallbackSLO. A test that asserts
+	// WHICH owner the fallback promotes widens the slice so the answer cannot
+	// depend on how loaded the machine is. See
+	// pinExploreDivergentDefaultFallbackSLO.
+	divergentDefaultFallbackSLOOverride time.Duration
+
 	// critiqueLLMGenOverride substitutes the critique_review tool's LLM seam.
 	// Test-only: production leaves it nil and the handler builds the closure
 	// over llmService.Generate. A non-nil override stands in for the real
