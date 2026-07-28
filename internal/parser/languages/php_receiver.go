@@ -312,6 +312,7 @@ func phpClassPropertyTypes(body *sitter.Node, src []byte) map[string]string {
 			}
 		}
 	}
+	collectPHPAssignedPropertyTypes(body, src, props)
 	if len(props) == 0 {
 		return nil
 	}
@@ -386,4 +387,68 @@ func (env phpReceiverEnv) phpScopeReceiverType(scope *sitter.Node, src []byte) s
 		return env.lookupVar(strings.TrimPrefix(strings.TrimSpace(scope.Content(src)), "$"))
 	}
 	return ""
+}
+
+
+// collectPHPAssignedPropertyTypes types a property that carries no type
+// DECLARATION from `$this->prop = new Foo()` in the class body. PHP only got
+// typed properties in 7.4, so a large body of code declares `private $handler;`
+// and states the type solely by what it assigns — 7.1% of every member call
+// laravel/framework leaves untyped reads through such a property.
+//
+// A declared type always wins, and a property assigned two different classes
+// anywhere in the class is dropped, for the same reason a conflicting local
+// `new` is: a flow-insensitive answer that is sometimes wrong binds a call to
+// the wrong method at the resolved tier.
+func collectPHPAssignedPropertyTypes(body *sitter.Node, src []byte, props map[string]string) {
+	if body == nil || props == nil {
+		return
+	}
+	assigned := map[string]string{}
+	conflicted := map[string]bool{}
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type() == "assignment_expression" {
+			left := n.ChildByFieldName("left")
+			right := n.ChildByFieldName("right")
+			if left != nil && right != nil && left.Type() == "member_access_expression" {
+				if name := phpThisPropertyName(left, src); name != "" && !conflicted[name] {
+					if cls := phpNewExpressionClass(right, src); cls != "" {
+						if prev, ok := assigned[name]; ok && prev != cls {
+							delete(assigned, name)
+							conflicted[name] = true
+						} else {
+							assigned[name] = cls
+						}
+					}
+				}
+			}
+		}
+		for i, c := 0, int(n.NamedChildCount()); i < c; i++ {
+			walk(n.NamedChild(i))
+		}
+	}
+	walk(body)
+	for name, cls := range assigned {
+		if _, declared := props[name]; !declared {
+			props[name] = cls
+		}
+	}
+}
+
+// phpThisPropertyName returns the property name of a `$this->name` access, or
+// "" for any other receiver or a computed member.
+func phpThisPropertyName(access *sitter.Node, src []byte) string {
+	inner := access.ChildByFieldName("object")
+	nameNode := access.ChildByFieldName("name")
+	if inner == nil || nameNode == nil || nameNode.Type() != "name" {
+		return ""
+	}
+	if inner.Type() != "variable_name" || strings.TrimSpace(inner.Content(src)) != "$this" {
+		return ""
+	}
+	return strings.TrimSpace(nameNode.Content(src))
 }

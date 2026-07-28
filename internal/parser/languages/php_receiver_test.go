@@ -358,3 +358,125 @@ function run(string $cls): void {
 	require.True(t, found)
 	assert.Equal(t, "", rt)
 }
+
+// PHP only got typed properties in 7.4, so a large body of code declares
+// `private $handler;` and states the type solely by what it assigns.
+func TestPHPReceiver_UntypedPropertyTypedByConstructorAssignment(t *testing.T) {
+	rt, found := phpCallReceiver(t, `<?php
+class Service {
+    private $logger;
+
+    public function __construct() {
+        $this->logger = new FileLogger();
+    }
+
+    public function run(): void {
+        $this->logger->warning('x');
+    }
+}
+`, "warning")
+	require.True(t, found)
+	assert.Equal(t, "FileLogger", rt)
+}
+
+// The assignment may be anywhere in the class, not only the constructor —
+// a setUp() method is the same statement about the property.
+func TestPHPReceiver_UntypedPropertyTypedByAnyMethodAssignment(t *testing.T) {
+	rt, found := phpCallReceiver(t, `<?php
+class ServiceTest {
+    private $handler;
+
+    protected function setUp(): void {
+        $this->handler = new StreamHandler();
+    }
+
+    public function testWrites(): void {
+        $this->handler->close();
+    }
+}
+`, "close")
+	require.True(t, found)
+	assert.Equal(t, "StreamHandler", rt)
+}
+
+// A declaration always wins over an assignment: the declared type is the
+// contract, the assignment is one of possibly many values.
+func TestPHPReceiver_DeclaredPropertyTypeBeatsAssignment(t *testing.T) {
+	rt, found := phpCallReceiver(t, `<?php
+class Service {
+    private HandlerInterface $handler;
+
+    public function __construct() {
+        $this->handler = new StreamHandler();
+    }
+
+    public function run(): void {
+        $this->handler->close();
+    }
+}
+`, "close")
+	require.True(t, found)
+	assert.Equal(t, "HandlerInterface", rt)
+}
+
+// A property assigned two different classes cannot be typed
+// flow-insensitively, for the same reason a conflicting local `new` is dropped.
+func TestPHPReceiver_ConflictingPropertyAssignmentsStayUntyped(t *testing.T) {
+	rt, found := phpCallReceiver(t, `<?php
+class Service {
+    private $handler;
+
+    public function boot(bool $rotate): void {
+        $this->handler = new StreamHandler();
+        if ($rotate) {
+            $this->handler = new RotatingFileHandler();
+        }
+    }
+
+    public function run(): void {
+        $this->handler->close();
+    }
+}
+`, "close")
+	require.True(t, found)
+	assert.Equal(t, "", rt)
+}
+
+// Only `$this->prop` counts — an assignment through another object says
+// nothing about this class's property.
+func TestPHPReceiver_ForeignPropertyAssignmentIgnored(t *testing.T) {
+	rt, found := phpCallReceiver(t, `<?php
+class Service {
+    private $handler;
+
+    public function boot(Other $o): void {
+        $o->handler = new StreamHandler();
+    }
+
+    public function run(): void {
+        $this->handler->close();
+    }
+}
+`, "close")
+	require.True(t, found)
+	assert.Equal(t, "", rt)
+}
+
+// `new $cls` names no static class, so it types nothing.
+func TestPHPReceiver_DynamicPropertyAssignmentStaysUntyped(t *testing.T) {
+	rt, found := phpCallReceiver(t, `<?php
+class Service {
+    private $handler;
+
+    public function boot(string $cls): void {
+        $this->handler = new $cls();
+    }
+
+    public function run(): void {
+        $this->handler->close();
+    }
+}
+`, "close")
+	require.True(t, found)
+	assert.Equal(t, "", rt)
+}
