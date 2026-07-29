@@ -33,12 +33,35 @@ func (r *Resolver) csharpFileNamespaceSet(fileID string) csharpFileNS {
 	}
 
 	ns = csharpFileNS{enclosing: map[string]struct{}{}, imported: map[string]struct{}{}}
+	// Primary using evidence is the extractor's Meta["usings"] stamp —
+	// resolveImport rewrites the per-directive edges (a namespace tail
+	// matching any directory basename becomes a file-node target), so
+	// only the stamp is order-independent. The edge shapes below remain
+	// as a fallback for graphs extracted before the stamp existed.
+	if f := r.cachedGetNode(fileID); f != nil {
+		switch v := f.Meta["usings"].(type) {
+		case []string:
+			for _, u := range v {
+				ns.imported[u] = struct{}{}
+			}
+		case []any:
+			for _, u := range v {
+				if s, ok := u.(string); ok {
+					ns.imported[s] = struct{}{}
+				}
+			}
+		}
+	}
+	hasStamp := len(ns.imported) > 0
 	for _, e := range r.graph.GetOutEdges(fileID) {
 		if e == nil {
 			continue
 		}
 		switch e.Kind {
 		case graph.EdgeImports:
+			if hasStamp {
+				continue
+			}
 			imp := e.To
 			switch {
 			case strings.HasPrefix(imp, "unresolved::import::"):
@@ -77,6 +100,14 @@ func (r *Resolver) csharpFileNamespaceSet(fileID string) csharpFileNS {
 	return ns
 }
 
+// csharpNarrowEligible gates narrowing to type-shaped candidates in the
+// dotnet family. Methods carry scope_ns too — letting one match would
+// steal the bind from (or lose it for) the type the reference names.
+func csharpNarrowEligible(c *graph.Node) bool {
+	return c != nil && (c.Kind == graph.KindType || c.Kind == graph.KindInterface) &&
+		sameLanguageFamily("csharp", c.Language)
+}
+
 // csharpNarrowByNamespace filters same-named C# type candidates to the
 // namespaces the referencing file can see: written qualifier, then
 // enclosing namespaces (deepest wins), then using directives. Same
@@ -92,13 +123,14 @@ func (r *Resolver) csharpNarrowByNamespace(e *graph.Edge, candidates []*graph.No
 	qualified := candidates
 	if fqn, _ := e.Meta["target_fqn"].(string); strings.Contains(fqn, ".") {
 		q := fqn[:strings.LastIndex(fqn, ".")]
+		dotQ := "." + q
 		var m []*graph.Node
 		for _, c := range candidates {
-			if c == nil || c.Language != "csharp" {
+			if !csharpNarrowEligible(c) {
 				continue
 			}
 			ns, _ := c.Meta["scope_ns"].(string)
-			if ns == q || strings.HasSuffix(ns, "."+q) {
+			if ns == q || strings.HasSuffix(ns, dotQ) {
 				m = append(m, c)
 			}
 		}
@@ -120,7 +152,7 @@ func (r *Resolver) csharpNarrowByNamespace(e *graph.Edge, candidates []*graph.No
 	var enclosing, imported []*graph.Node
 	deepest := 0
 	for _, c := range qualified {
-		if c == nil || c.Language != "csharp" {
+		if !csharpNarrowEligible(c) {
 			continue
 		}
 		ns, _ := c.Meta["scope_ns"].(string)

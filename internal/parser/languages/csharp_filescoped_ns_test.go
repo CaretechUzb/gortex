@@ -7,6 +7,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestCSharpExtractor_NestedNamespaceBlocksJoin: nested block
+// namespaces join outer-to-inner — `B` alone would collide with any
+// other `B` in the graph and never match a `using A.B;`.
+func TestCSharpExtractor_NestedNamespaceBlocksJoin(t *testing.T) {
+	src := []byte(`namespace App {
+    namespace Core {
+        public class Widget {
+            public void Render() {}
+        }
+    }
+}
+`)
+	res, err := NewCSharpExtractor().Extract("w.cs", src)
+	require.NoError(t, err)
+
+	for _, n := range res.Nodes {
+		if n.Name == "Widget" || n.Name == "Render" {
+			assert.Equal(t, "App.Core", n.Meta["scope_ns"], "%s must carry the joined namespace", n.Name)
+		}
+	}
+}
+
 // TestCSharpExtractor_FileScopedNamespaceScopeNS: a C#10 file-scoped
 // namespace's declarations are AST siblings, not children — an
 // ancestor walk alone loses every such file's scope_ns.

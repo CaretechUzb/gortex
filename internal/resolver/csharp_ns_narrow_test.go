@@ -40,12 +40,22 @@ func csharpNSFixture() *graph.Graph {
 	return g
 }
 
+// stampUsings sets the extractor's Meta["usings"] shape on a fixture
+// file node — the primary using evidence the narrowing consumes.
+func stampUsings(g *graph.Graph, fileID string, usings ...string) {
+	n := g.GetNode(fileID)
+	if n.Meta == nil {
+		n.Meta = map[string]any{}
+	}
+	n.Meta["usings"] = usings
+}
+
 // TestCSharpNamespaceNarrow_UsingWins: the referencing file imports
 // App.Sales.Rules — the reference must bind there, not to the
 // lexicographically-smaller Billing rival.
 func TestCSharpNamespaceNarrow_UsingWins(t *testing.T) {
 	g := csharpNSFixture()
-	g.AddEdge(&graph.Edge{From: "app/Web/Startup.cs", To: "unresolved::import::App/Sales/Rules", Kind: graph.EdgeImports, FilePath: "app/Web/Startup.cs", Line: 1})
+	stampUsings(g, "app/Web/Startup.cs", "App.Sales.Rules")
 	ref := &graph.Edge{
 		From: "app/Web/Startup.cs::Startup.Configure", To: "unresolved::PricingRules",
 		Kind: graph.EdgeReferences, Origin: graph.OriginASTResolved, FilePath: "app/Web/Startup.cs", Line: 10,
@@ -63,7 +73,7 @@ func TestCSharpNamespaceNarrow_UsingWins(t *testing.T) {
 // the using directives too.
 func TestCSharpNamespaceNarrow_ExtendsPath(t *testing.T) {
 	g := csharpNSFixture()
-	g.AddEdge(&graph.Edge{From: "app/Web/Startup.cs", To: "unresolved::import::App/Sales/Rules", Kind: graph.EdgeImports, FilePath: "app/Web/Startup.cs", Line: 1})
+	stampUsings(g, "app/Web/Startup.cs", "App.Sales.Rules")
 	ext := &graph.Edge{
 		From: "app/Web/Startup.cs::Startup", To: "unresolved::PricingRules",
 		Kind: graph.EdgeExtends, FilePath: "app/Web/Startup.cs", Line: 3,
@@ -105,7 +115,7 @@ func TestCSharpNamespaceNarrow_OwnNamespaceChain(t *testing.T) {
 // the previous deterministic ranking stands and the edge stays resolved.
 func TestCSharpNamespaceNarrow_NoMatchKeepsOldPick(t *testing.T) {
 	g := csharpNSFixture()
-	g.AddEdge(&graph.Edge{From: "app/Web/Startup.cs", To: "unresolved::import::ThirdParty/Sdk", Kind: graph.EdgeImports, FilePath: "app/Web/Startup.cs", Line: 1})
+	stampUsings(g, "app/Web/Startup.cs", "ThirdParty.Sdk")
 	ref := &graph.Edge{
 		From: "app/Web/Startup.cs::Startup.Configure", To: "unresolved::PricingRules",
 		Kind: graph.EdgeReferences, Origin: graph.OriginASTResolved, FilePath: "app/Web/Startup.cs", Line: 10,
@@ -132,7 +142,7 @@ func TestCSharpNamespaceNarrow_EnclosingBeatsImported(t *testing.T) {
 		Meta: map[string]any{"scope_ns": "App.Billing", "visibility": "public"},
 	})
 	g.AddEdge(&graph.Edge{From: "app/Billing/Module.cs", To: "app/Billing/Module.cs::Module", Kind: graph.EdgeDefines, FilePath: "app/Billing/Module.cs", Line: 3})
-	g.AddEdge(&graph.Edge{From: "app/Billing/Module.cs", To: "unresolved::import::App/Shared/Lookup", Kind: graph.EdgeImports, FilePath: "app/Billing/Module.cs", Line: 1})
+	stampUsings(g, "app/Billing/Module.cs", "App.Shared.Lookup")
 	// Own-namespace candidate: internal (ranked below public by the
 	// canonical-definition ranker).
 	g.AddNode(&graph.Node{ID: "app/Billing/Rules.cs", Kind: graph.KindFile, Name: "Rules.cs", FilePath: "app/Billing/Rules.cs", Language: "csharp", RepoPrefix: "app"})
@@ -193,7 +203,7 @@ func TestCSharpNamespaceNarrow_PartialQualifier(t *testing.T) {
 		FilePath: "app/Shared/PricingRules.cs", Language: "csharp", RepoPrefix: "app",
 		Meta: map[string]any{"scope_ns": "App.Shared", "visibility": "public"},
 	})
-	g.AddEdge(&graph.Edge{From: "app/Web/Startup.cs", To: "unresolved::import::App/Shared", Kind: graph.EdgeImports, FilePath: "app/Web/Startup.cs", Line: 1})
+	stampUsings(g, "app/Web/Startup.cs", "App.Shared")
 	ref := &graph.Edge{
 		From: "app/Web/Startup.cs::Startup.Configure", To: "unresolved::PricingRules",
 		Kind: graph.EdgeReferences, Origin: graph.OriginASTResolved, FilePath: "app/Web/Startup.cs", Line: 10,
@@ -205,6 +215,60 @@ func TestCSharpNamespaceNarrow_PartialQualifier(t *testing.T) {
 
 	assert.Equal(t, "app/Sales/Rules/PricingRules.cs::PricingRules", ref.To,
 		"the qualifier suffix must beat the imported same-named rival")
+}
+
+// TestCSharpNamespaceNarrow_RewrittenImportEdge: resolveImport rewrites
+// a using edge to a file-node target when the namespace tail matches a
+// directory basename — the Meta["usings"] stamp must keep the evidence
+// alive regardless of what shape the edge is in.
+func TestCSharpNamespaceNarrow_RewrittenImportEdge(t *testing.T) {
+	g := csharpNSFixture()
+	stampUsings(g, "app/Web/Startup.cs", "App.Sales.Rules")
+	// The edge as resolveImport leaves it: a concrete file-node target.
+	g.AddEdge(&graph.Edge{From: "app/Web/Startup.cs", To: "app/Sales/Rules/PricingRules.cs", Kind: graph.EdgeImports, FilePath: "app/Web/Startup.cs", Line: 1})
+	ref := &graph.Edge{
+		From: "app/Web/Startup.cs::Startup.Configure", To: "unresolved::PricingRules",
+		Kind: graph.EdgeReferences, Origin: graph.OriginASTResolved, FilePath: "app/Web/Startup.cs", Line: 10,
+	}
+	g.AddEdge(ref)
+
+	New(g).ResolveAll()
+
+	assert.Equal(t, "app/Sales/Rules/PricingRules.cs::PricingRules", ref.To,
+		"a rewritten import edge must not erase the using evidence")
+}
+
+// TestCSharpNamespaceNarrow_MethodDecoyCannotStealOrLose: methods carry
+// scope_ns too — a same-named method in the caller's own namespace must
+// not narrow the set to itself (stealing the bind on the type-or-func
+// path, losing the edge outright on the type-only extends path).
+func TestCSharpNamespaceNarrow_MethodDecoyCannotStealOrLose(t *testing.T) {
+	g := csharpNSFixture()
+	stampUsings(g, "app/Web/Startup.cs", "App.Sales.Rules")
+	// A method named like the type, in the caller's own namespace — the
+	// enclosing tier would outrank the imported type if kinds were ignored.
+	g.AddNode(&graph.Node{
+		ID: "app/Web/Helpers.cs::Helpers.PricingRules", Kind: graph.KindMethod, Name: "PricingRules",
+		FilePath: "app/Web/Helpers.cs", Language: "csharp", RepoPrefix: "app",
+		Meta: map[string]any{"scope_ns": "App.Web"},
+	})
+	ext := &graph.Edge{
+		From: "app/Web/Startup.cs::Startup", To: "unresolved::PricingRules",
+		Kind: graph.EdgeExtends, FilePath: "app/Web/Startup.cs", Line: 3,
+	}
+	inst := &graph.Edge{
+		From: "app/Web/Startup.cs::Startup.Configure", To: "unresolved::PricingRules",
+		Kind: graph.EdgeInstantiates, Origin: graph.OriginASTResolved, FilePath: "app/Web/Startup.cs", Line: 10,
+	}
+	g.AddEdge(ext)
+	g.AddEdge(inst)
+
+	New(g).ResolveAll()
+
+	assert.Equal(t, "app/Sales/Rules/PricingRules.cs::PricingRules", ext.To,
+		"extends must not be lost to a same-named method decoy")
+	assert.Equal(t, "app/Sales/Rules/PricingRules.cs::PricingRules", inst.To,
+		"instantiates must bind the type, not the method decoy")
 }
 
 // TestCSharpNamespaceNarrow_ExternalImportShape: by the time a reference

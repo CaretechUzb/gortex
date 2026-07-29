@@ -391,13 +391,21 @@ func phpTypedReceiverCaller(caller *graph.Node) bool {
 // imports and its own namespace, which is precisely PHP's own class-name
 // resolution rule.
 //
-// Returns nil when the edge carries no fully-qualified target, when the caller
-// is not PHP, or when no candidate matches — callers treat nil as "keep the
-// candidates you had", so a reference into a vendor namespace the graph does
-// not hold degrades to the previous ranking instead of losing its edge.
+// Returns nil when the edge carries no fully-qualified target, when the
+// target_fqn is not PHP-shaped (the C# extractor stamps the same key with
+// dotted namespaces — see csharpNarrowByNamespace), or when no candidate
+// matches — callers treat nil as "keep the candidates you had", so a
+// reference into a vendor namespace the graph does not hold degrades to
+// the previous ranking instead of losing its edge.
 func phpNarrowByTargetFQN(e *graph.Edge, candidates []*graph.Node) []*graph.Node {
 	fqn := phpEdgeMetaString(e, "target_fqn")
 	if fqn == "" || len(candidates) < 2 {
+		return nil
+	}
+	// A dotted qualifier without a backslash is a C# spelling, never PHP —
+	// without this gate it would read as namespace "" and narrow onto a
+	// global-namespace PHP class of the same name.
+	if strings.Contains(fqn, ".") && !strings.Contains(fqn, `\`) {
 		return nil
 	}
 	ns := ""
