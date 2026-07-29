@@ -349,18 +349,6 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 			plan = schemaPlan{stamp: true}
 		}
 	}
-	// Some v6 stores predate nodes_by_qual and may contain duplicate non-empty
-	// qualified names. schemaSQL cannot create the unique index over those rows,
-	// so repair the ambiguity transactionally before applying DDL. All nodes and
-	// edges remain intact; the lexicographically smallest node ID keeps the name.
-	// Once the index exists this probe is constant time on normal warm opens.
-	if !plan.wipe {
-		if err := repairDuplicateNodeQualNamesWithoutIndex(db); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("sqlite repair qualified-name uniqueness: %w", err)
-		}
-	}
-
 	didWipe := false
 	if plan.wipe && !isMemoryPath(path) {
 		// Refuse the destructive rebuild unless the caller proved it holds
@@ -526,38 +514,6 @@ func hasGraphStoreTables(db *sql.DB) (bool, error) {
 	var count int
 	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('nodes','edges')`).Scan(&count)
 	return count > 0, err
-}
-
-func repairDuplicateNodeQualNamesWithoutIndex(db *sql.DB) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var nodesTable, qualIndex int
-	if err := tx.QueryRow(`SELECT
-		EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'nodes'),
-		EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'nodes_by_qual')`).Scan(&nodesTable, &qualIndex); err != nil {
-		return err
-	}
-	if nodesTable != 0 && qualIndex == 0 {
-		// Preserve every row and all ID-based topology. For each ambiguous
-		// qualified name, the stable smallest ID remains addressable by that
-		// name and every other node falls back to its ordinary ID/name lookups.
-		if _, err := tx.Exec(`UPDATE nodes AS duplicate
-SET qual_name = ''
-WHERE duplicate.qual_name <> ''
-  AND EXISTS (
-      SELECT 1
-      FROM nodes AS keeper
-      WHERE keeper.qual_name = duplicate.qual_name
-        AND keeper.id < duplicate.id
-  )`); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
 }
 
 // walCheckpointInterval is how often runCheckpointLoop passively drains WAL
@@ -801,7 +757,7 @@ func (s *Store) prepare() error {
 	// on resolver hot paths (measured against a production store). Every
 	// reader of a partial index must restate its predicate literally.
 	prep(&s.stmtGetNodeByQual,
-		`SELECT `+nodeCols+` FROM nodes WHERE qual_name = ? AND qual_name <> '' LIMIT 1`)
+		`SELECT `+nodeCols+` FROM nodes WHERE qual_name = ? AND qual_name <> '' ORDER BY id LIMIT 1`)
 	prep(&s.stmtFindByName,
 		`SELECT `+nodeCols+` FROM nodes WHERE name = ?`)
 	prep(&s.stmtFindByNameInRepo,

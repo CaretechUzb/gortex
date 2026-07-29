@@ -13,6 +13,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/search"
 )
 
@@ -229,5 +230,63 @@ func TestTrackRepoCtx_FirstOfManyStillGetsPrefix(t *testing.T) {
 	}
 	for id, found := range want {
 		assert.True(t, found, "expected prefixed node %s not found in graph", id)
+	}
+}
+
+func TestTrackRepoCtx_DuplicateKubernetesQualNamesAreRepoScoped(t *testing.T) {
+	manifest := func(repo, relPath, resource string) string {
+		t.Helper()
+		root := filepath.Join(t.TempDir(), repo)
+		path := filepath.Join(root, relPath)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(resource), 0o644))
+		return root
+	}
+
+	repoA := manifest("repo-a", "deploy/rbac.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+`)
+	repoB := manifest("repo-b", "manifests/roles.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+`)
+
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{
+		{Path: repoA, Name: "repo-a"},
+		{Path: repoB, Name: "repo-b"},
+	}}
+	gc.SetConfigPath(cfgPath)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(cfgPath)
+	require.NoError(t, err)
+
+	g := graph.New()
+	registry := newTestRegistry()
+	registry.Register(languages.NewYAMLExtractor())
+	mi := NewMultiIndexer(g, registry, search.NewBM25(), cm, zap.NewNop())
+	for _, entry := range cm.Global().Repos {
+		_, err := mi.TrackRepoCtx(context.Background(), entry)
+		require.NoError(t, err, "tracking %s", entry.Name)
+	}
+
+	for _, repo := range []string{"repo-a", "repo-b"} {
+		id := repo + "/k8s::ClusterRole::_default::prometheus"
+		n := g.GetNode(id)
+		require.NotNil(t, n, "resource node %s", id)
+		assert.Equal(t, repo, n.RepoPrefix)
+		assert.Equal(t, "ClusterRole/prometheus", n.QualName)
+		assert.True(t, strings.HasPrefix(n.FilePath, repo+"/"), "resource path %q must be owned by %s", n.FilePath, repo)
 	}
 }

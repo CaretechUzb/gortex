@@ -65,10 +65,9 @@ const coldFTSMergePages = 64
 // once, so they are dropped up front and rebuilt in one pass at the end.
 //
 // Deliberately excluded:
-//   - nodes_by_qual (UNIQUE): enforces qual_name dedup on every
-//     INSERT OR REPLACE. Dropping it would change insert conflict semantics
-//     (collapsed qual_name collisions would diverge from the non-bulk path)
-//     and a duplicate could make the recreate fail. It stays live.
+//   - nodes_by_qual: resolver lookups use INDEXED BY and must fail closed
+//     rather than scan the full nodes table. Keeping the compact partial index
+//     live preserves that contract during every bulk-load phase.
 //   - the edges UNIQUE(from_id, …) table constraint and every WITHOUT ROWID
 //     primary-key index: not standalone indexes; they cannot be dropped while
 //     the table/constraint exists.

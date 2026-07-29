@@ -157,22 +157,19 @@ func (s *Store) FindNodesByNameContaining(substr string, limit int) []*graph.Nod
 	return s.queryNodesSQL(q, pattern)
 }
 
-// GetNodesByQualNames returns a map qualName→*Node (first match per
-// qual_name) for the batch — the qual-name twin of FindNodesByNames, used to
-// pre-warm import resolution. Driven by the unique nodes_by_qual index.
-func (s *Store) GetNodesByQualNames(qualNames []string) map[string]*graph.Node {
+// GetNodesByQualNames returns every candidate for each requested qualified
+// name. The query orders by qual_name then ID, so each candidate slice is
+// deterministic and repository/workspace-aware callers can disambiguate it.
+func (s *Store) GetNodesByQualNames(qualNames []string) map[string][]*graph.Node {
 	uniq := dedupeNonEmpty(qualNames)
 	if len(uniq) == 0 {
 		return nil
 	}
 
-	out := make(map[string]*graph.Node, len(uniq))
+	out := make(map[string][]*graph.Node, len(uniq))
 	for _, n := range s.queryNodesSQL(nodesByQualNameLookupSQL, qualNameLookupPayload(uniq)) {
-		if n == nil {
-			continue
-		}
-		if _, ok := out[n.QualName]; !ok {
-			out[n.QualName] = n
+		if n != nil {
+			out[n.QualName] = append(out[n.QualName], n)
 		}
 	}
 	return out

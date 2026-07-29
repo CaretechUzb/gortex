@@ -226,13 +226,12 @@ func phpNamespaceScopedKind(k graph.NodeKind) bool {
 // lives in and records on each type-reference edge the fully-qualified name the
 // source names.
 //
-// Deliberately NOT Node.QualName. That field backs a UNIQUE SQLite index
-// (nodes_by_qual): a second node with the same non-empty qual_name fails the
-// insert outright, which would take the whole index down rather than degrade.
+// Deliberately NOT Node.QualName. Qualified-name persistence now tolerates
+// duplicates, but the compatibility lookup API still returns one representative.
 // PHP produces duplicate fully-qualified names in practice — indexing
 // laravel/framework mints six, where a class and the annotation stub for a
 // same-named attribute land in one namespace — so the FQN lives in scope_ns,
-// which is plain Meta and tolerates repetition. Everything that would have used
+// which preserves the complete candidate set. Everything that would have used
 // QualName (reference narrowing, import binding) matches on scope_ns instead.
 func applyPHPNamespaceIdentity(root *sitter.Node, src []byte, result *parser.ExtractionResult) {
 	if result == nil || root == nil {

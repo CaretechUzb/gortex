@@ -132,6 +132,97 @@ func TestCrossRepoResolveAll_ImportCrossRepo(t *testing.T) {
 	assert.True(t, edge.CrossRepo)
 }
 
+func TestCrossRepoResolveAll_ImportQualNamePrefersSameWorkspaceOverEligibleForeign(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		reverse bool
+	}{
+		{name: "forward_insert"},
+		{name: "reverse_insert", reverse: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := graph.New()
+			const qualName = "github.com/acme/shared"
+
+			caller := &graph.Node{ID: "consumer/main.go", Kind: graph.KindFile, Name: "main.go", FilePath: "consumer/main.go", Language: "go", RepoPrefix: "consumer", WorkspaceID: "consumer-ws"}
+			sameWorkspace := &graph.Node{ID: "z-local/shared.go::shared", Kind: graph.KindPackage, Name: "shared", QualName: qualName, FilePath: "z-local/shared.go", Language: "go", RepoPrefix: "z-local", WorkspaceID: "consumer-ws"}
+			eligibleForeign := &graph.Node{ID: "a-foreign/shared.go::shared", Kind: graph.KindPackage, Name: "shared", QualName: qualName, FilePath: "a-foreign/shared.go", Language: "go", RepoPrefix: "a-foreign", WorkspaceID: "foreign-ws"}
+
+			g.AddNode(caller)
+			candidates := []*graph.Node{eligibleForeign, sameWorkspace}
+			if tc.reverse {
+				candidates[0], candidates[1] = candidates[1], candidates[0]
+			}
+			for _, candidate := range candidates {
+				g.AddNode(candidate)
+			}
+
+			edge := &graph.Edge{From: caller.ID, To: "unresolved::import::" + qualName, Kind: graph.EdgeImports, FilePath: caller.FilePath, Line: 3}
+			g.AddEdge(edge)
+
+			cr := NewCrossRepo(g)
+			cr.SetCrossWorkspaceDepLookup(func(sourceWorkspaceID string) []CrossWorkspaceDepRule {
+				if sourceWorkspaceID != "consumer-ws" {
+					return nil
+				}
+				return []CrossWorkspaceDepRule{{Workspace: "foreign-ws", Modules: []string{qualName}}}
+			})
+			stats := cr.ResolveAll()
+
+			require.Equal(t, 1, stats.Resolved)
+			assert.Equal(t, sameWorkspace.ID, edge.To)
+			assert.True(t, edge.CrossRepo)
+			assert.Equal(t, 1, stats.CrossRepoEdges)
+		})
+	}
+}
+
+func TestCrossRepoResolveAll_ImportQualNameLeavesEquivalentForeignCandidatesUnresolved(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		reverse bool
+	}{
+		{name: "forward_insert"},
+		{name: "reverse_insert", reverse: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := graph.New()
+			const qualName = "github.com/acme/shared"
+
+			caller := &graph.Node{ID: "consumer/main.go", Kind: graph.KindFile, Name: "main.go", FilePath: "consumer/main.go", Language: "go", RepoPrefix: "consumer", WorkspaceID: "consumer-ws"}
+			candidateA := &graph.Node{ID: "a-foreign/shared.go::shared", Kind: graph.KindPackage, Name: "shared", QualName: qualName, FilePath: "a-foreign/shared.go", Language: "go", RepoPrefix: "a-foreign", WorkspaceID: "foreign-ws"}
+			candidateZ := &graph.Node{ID: "z-foreign/shared.go::shared", Kind: graph.KindPackage, Name: "shared", QualName: qualName, FilePath: "z-foreign/shared.go", Language: "go", RepoPrefix: "z-foreign", WorkspaceID: "foreign-ws"}
+
+			g.AddNode(caller)
+			candidates := []*graph.Node{candidateA, candidateZ}
+			if tc.reverse {
+				candidates[0], candidates[1] = candidates[1], candidates[0]
+			}
+			for _, candidate := range candidates {
+				g.AddNode(candidate)
+			}
+
+			unresolvedID := "unresolved::import::" + qualName
+			edge := &graph.Edge{From: caller.ID, To: unresolvedID, Kind: graph.EdgeImports, FilePath: caller.FilePath, Line: 3}
+			g.AddEdge(edge)
+
+			cr := NewCrossRepo(g)
+			cr.SetCrossWorkspaceDepLookup(func(sourceWorkspaceID string) []CrossWorkspaceDepRule {
+				if sourceWorkspaceID != "consumer-ws" {
+					return nil
+				}
+				return []CrossWorkspaceDepRule{{Workspace: "foreign-ws", Modules: []string{qualName}}}
+			})
+			stats := cr.ResolveAll()
+
+			require.Equal(t, 0, stats.Resolved)
+			assert.Equal(t, unresolvedID, edge.To)
+			assert.False(t, edge.CrossRepo)
+			assert.Equal(t, 0, stats.CrossRepoEdges)
+		})
+	}
+}
+
 func TestCrossRepoResolveAll_MethodCrossRepo(t *testing.T) {
 	g := graph.New()
 

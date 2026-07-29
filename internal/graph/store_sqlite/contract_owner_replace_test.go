@@ -75,14 +75,18 @@ func TestSQLiteReplaceContractOwnersRollsBackDeleteAndInsertTogether(t *testing.
 	}, []*graph.Edge{
 		{From: "repo-a::handler", To: "shared-contract", Kind: graph.EdgeProvides, FilePath: "repo-a/a.go", Line: 10},
 	})
+	_, err = store.writerDB.Exec(`CREATE TRIGGER fail_new_contract
+BEFORE INSERT ON nodes WHEN NEW.id = 'new-contract'
+BEGIN SELECT RAISE(ABORT, 'forced replacement failure'); END`)
+	require.NoError(t, err)
 
 	_, err = store.ReplaceContractOwners(graph.ContractOwnerReplacement{
 		RepoPrefix:     "repo-a",
 		FilePaths:      []string{"repo-a/a.go"},
 		TouchedNodeIDs: []string{"shared-contract"},
 		Nodes: []*graph.Node{
-			{ID: "shared-contract", Kind: graph.KindContract, Name: "shared-contract", QualName: "duplicate.qual", FilePath: "repo-a/a.go", RepoPrefix: "repo-a"},
-			{ID: "new-contract", Kind: graph.KindContract, Name: "new-contract", QualName: "duplicate.qual", FilePath: "repo-a/a.go", RepoPrefix: "repo-a"},
+			{ID: "shared-contract", Kind: graph.KindContract, Name: "shared-contract", QualName: "contract.shared", FilePath: "repo-a/a.go", RepoPrefix: "repo-a"},
+			{ID: "new-contract", Kind: graph.KindContract, Name: "new-contract", QualName: "contract.new", FilePath: "repo-a/a.go", RepoPrefix: "repo-a"},
 		},
 		Edges: []*graph.Edge{
 			{From: "repo-a::handler", To: "shared-contract", Kind: graph.EdgeConsumes, FilePath: "repo-a/a.go", Line: 11},

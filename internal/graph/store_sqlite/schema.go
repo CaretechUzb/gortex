@@ -454,8 +454,8 @@ CREATE TABLE IF NOT EXISTS analysis_blobs (
 //     (partial index -- empty repo_prefix is
 //     the common case and indexing it would
 //     be pure overhead)
-//     nodes_by_qual      -- GetNodeByQualName, unique so duplicate
-//     qual_names surface as constraint errors
+//     nodes_by_qual      -- GetNodeByQualName; non-unique because a
+//     language-level identity is not a global graph identity
 //     edges_by_from      -- GetOutEdges (kind included so RemoveEdge
 //     can probe by (from, kind) without a
 //     second hop)
@@ -493,9 +493,11 @@ CREATE TABLE IF NOT EXISTS nodes (
 -- nodes_by_name / _kind / _file / _repo are created from the shared
 -- bulkDroppableIndexes set (see bulk_load.go), not here, so the bulk-load
 -- fast path can drop and rebuild the EXACT same DDL without drift.
--- nodes_by_qual is UNIQUE — it enforces qual_name dedup on every
--- INSERT OR REPLACE, so it is never dropped and stays defined here.
-CREATE UNIQUE INDEX IF NOT EXISTS nodes_by_qual ON nodes(qual_name) WHERE qual_name <> '';
+-- Qualified names are language-level lookup labels, not graph identities:
+-- forks, worktrees, manifest overlays and independent repositories may emit
+-- the same value. Keep this index non-unique and let repository/workspace-aware
+-- callers disambiguate candidates.
+CREATE INDEX IF NOT EXISTS nodes_by_qual ON nodes(qual_name) WHERE qual_name <> '';
 
 CREATE TABLE IF NOT EXISTS edges (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -25,13 +25,17 @@ func TestSQLiteReplaceDerivedContractsRollsBackEntireFrontier(t *testing.T) {
 		{ID: "bridge::ws::project::contract", Kind: graph.KindContractBridge, Name: "contract", FilePath: "contracts://bridges", WorkspaceID: "ws", ProjectID: "project"},
 		{ID: "topic::kafka::orders", Kind: graph.KindTopic, Name: "orders", FilePath: "provider.go"},
 	}, []*graph.Edge{oldMatch, oldBridge, oldTopic})
+	_, err = store.writerDB.Exec(`CREATE TRIGGER fail_replacement_b
+BEFORE INSERT ON nodes WHEN NEW.id = 'replacement-b'
+BEGIN SELECT RAISE(ABORT, 'forced replacement failure'); END`)
+	require.NoError(t, err)
 
 	_, err = store.ReplaceDerivedContracts(graph.DerivedContractReplacement{
 		RemoveEdges:         []*graph.Edge{oldMatch, oldTopic},
 		RemoveBridgeNodeIDs: []string{"bridge::ws::project::contract"},
 		Nodes: []*graph.Node{
-			{ID: "replacement-a", Kind: graph.KindContractBridge, Name: "a", QualName: "duplicate.qual", FilePath: "contracts://bridges"},
-			{ID: "replacement-b", Kind: graph.KindContractBridge, Name: "b", QualName: "duplicate.qual", FilePath: "contracts://bridges"},
+			{ID: "replacement-a", Kind: graph.KindContractBridge, Name: "a", QualName: "contract.a", FilePath: "contracts://bridges"},
+			{ID: "replacement-b", Kind: graph.KindContractBridge, Name: "b", QualName: "contract.b", FilePath: "contracts://bridges"},
 		},
 		TouchedTopicNodeIDs: []string{"topic::kafka::orders"},
 	})
