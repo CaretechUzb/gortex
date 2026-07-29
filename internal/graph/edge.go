@@ -138,10 +138,11 @@ const (
 	// over.
 	EdgeCaptures EdgeKind = "captures"
 	// EdgeSpawns links a caller to a function it launches
-	// asynchronously (goroutine, async/await, Promise, worker pool).
-	// Emitted in addition to the corresponding EdgeCalls so synchronous
-	// reachability queries can scope by edge kind. Meta["mode"] ∈
-	// goroutine|async|promise|worker_pool.
+	// asynchronously (goroutine, async/await, Promise, worker pool,
+	// background scheduler). Emitted in addition to the corresponding
+	// EdgeCalls so synchronous reachability queries can scope by edge
+	// kind. Meta["mode"] ∈ goroutine|async|promise|worker_pool|task|
+	// thread|parallel|background.
 	EdgeSpawns EdgeKind = "spawns"
 	// EdgeSends / EdgeRecvs link a function to a channel-typed
 	// variable for channel I/O. The channel's element type is reachable
