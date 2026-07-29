@@ -89,13 +89,43 @@ func (r *Resolver) csharpNarrowByNamespace(e *graph.Edge, candidates []*graph.No
 	if len(candidates) < 2 || !strings.HasSuffix(e.FilePath, ".cs") {
 		return nil
 	}
+
+	// A qualifier written at the reference site (Meta["target_fqn"], from
+	// a qualified spelling like Shared.Reporting.Foo) is the strongest
+	// evidence: keep only candidates whose namespace ends in it. C#
+	// resolves partial qualifiers against visible namespaces, so a suffix
+	// match on a dot boundary covers both the full and partial forms.
+	qualified := candidates
+	if fqn, _ := e.Meta["target_fqn"].(string); strings.Contains(fqn, ".") {
+		q := fqn[:strings.LastIndex(fqn, ".")]
+		var m []*graph.Node
+		for _, c := range candidates {
+			if c == nil || c.Language != "csharp" {
+				continue
+			}
+			ns, _ := c.Meta["scope_ns"].(string)
+			if ns == q || strings.HasSuffix(ns, "."+q) {
+				m = append(m, c)
+			}
+		}
+		if len(m) == 1 {
+			return m
+		}
+		if len(m) > 1 {
+			qualified = m
+		}
+	}
+
 	visible := r.csharpFileNamespaceSet(e.FilePath)
 	if len(visible.enclosing) == 0 && len(visible.imported) == 0 {
+		if len(qualified) < len(candidates) {
+			return qualified
+		}
 		return nil
 	}
 	var enclosing, imported []*graph.Node
 	deepest := 0
-	for _, c := range candidates {
+	for _, c := range qualified {
 		if c == nil || c.Language != "csharp" {
 			continue
 		}
@@ -119,5 +149,13 @@ func (r *Resolver) csharpNarrowByNamespace(e *graph.Edge, candidates []*graph.No
 	if len(enclosing) > 0 {
 		return enclosing
 	}
-	return imported
+	if len(imported) > 0 {
+		return imported
+	}
+	// The qualifier narrowed but no visible-namespace tier confirmed —
+	// the written qualifier alone still beats a bare-name guess.
+	if len(qualified) < len(candidates) {
+		return qualified
+	}
+	return nil
 }

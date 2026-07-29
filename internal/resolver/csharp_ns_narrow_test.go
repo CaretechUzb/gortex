@@ -160,6 +160,53 @@ func TestCSharpNamespaceNarrow_EnclosingBeatsImported(t *testing.T) {
 		"the enclosing-namespace type wins over an imported one regardless of visibility rank")
 }
 
+// TestCSharpNamespaceNarrow_QualifiedReference: a fully qualified
+// spelling needs no using directive at all — the qualifier stamped as
+// Meta["target_fqn"] must pick its namespace exactly, even when the
+// referencing file imports nothing relevant.
+func TestCSharpNamespaceNarrow_QualifiedReference(t *testing.T) {
+	g := csharpNSFixture()
+	ref := &graph.Edge{
+		From: "app/Web/Startup.cs::Startup.Configure", To: "unresolved::PricingRules",
+		Kind: graph.EdgeReferences, Origin: graph.OriginASTResolved, FilePath: "app/Web/Startup.cs", Line: 10,
+		Meta: map[string]any{"target_fqn": "App.Sales.Rules.PricingRules"},
+	}
+	g.AddEdge(ref)
+
+	New(g).ResolveAll()
+
+	assert.Equal(t, "app/Sales/Rules/PricingRules.cs::PricingRules", ref.To,
+		"the written qualifier must pick the namespace without any using")
+}
+
+// TestCSharpNamespaceNarrow_PartialQualifier: C# resolves a partially
+// qualified spelling (`Rules.PricingRules`) against visible namespaces —
+// a qualifier suffix-match must narrow before the using tier can pick a
+// same-named type in a namespace that does not end in the qualifier.
+func TestCSharpNamespaceNarrow_PartialQualifier(t *testing.T) {
+	g := csharpNSFixture()
+	// A third rival whose namespace the file imports but which does not
+	// end in the written qualifier.
+	g.AddNode(&graph.Node{ID: "app/Shared/PricingRules.cs", Kind: graph.KindFile, Name: "PricingRules.cs", FilePath: "app/Shared/PricingRules.cs", Language: "csharp", RepoPrefix: "app"})
+	g.AddNode(&graph.Node{
+		ID: "app/Shared/PricingRules.cs::PricingRules", Kind: graph.KindType, Name: "PricingRules",
+		FilePath: "app/Shared/PricingRules.cs", Language: "csharp", RepoPrefix: "app",
+		Meta: map[string]any{"scope_ns": "App.Shared", "visibility": "public"},
+	})
+	g.AddEdge(&graph.Edge{From: "app/Web/Startup.cs", To: "unresolved::import::App/Shared", Kind: graph.EdgeImports, FilePath: "app/Web/Startup.cs", Line: 1})
+	ref := &graph.Edge{
+		From: "app/Web/Startup.cs::Startup.Configure", To: "unresolved::PricingRules",
+		Kind: graph.EdgeReferences, Origin: graph.OriginASTResolved, FilePath: "app/Web/Startup.cs", Line: 10,
+		Meta: map[string]any{"target_fqn": "Sales.Rules.PricingRules"},
+	}
+	g.AddEdge(ref)
+
+	New(g).ResolveAll()
+
+	assert.Equal(t, "app/Sales/Rules/PricingRules.cs::PricingRules", ref.To,
+		"the qualifier suffix must beat the imported same-named rival")
+}
+
 // TestCSharpNamespaceNarrow_ExternalImportShape: by the time a reference
 // resolves, the same-pass import resolution may already have rewritten
 // the using edge to its external:: form — both shapes must count.

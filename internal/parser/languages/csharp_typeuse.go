@@ -121,6 +121,14 @@ func emitCSharpReferenceForms(root *sitter.Node, src []byte, filePath, fileID st
 		if refContext != "" {
 			edge.Meta = map[string]any{"ref_context": refContext}
 		}
+		// A qualified spelling names its namespace in the source — keep it
+		// as evidence for the resolver's namespace narrowing.
+		if fqn := csharpQualifiedTypeRef(rawType); fqn != "" {
+			if edge.Meta == nil {
+				edge.Meta = map[string]any{}
+			}
+			edge.Meta["target_fqn"] = fqn
+		}
 		result.Edges = append(result.Edges, edge)
 	}
 
