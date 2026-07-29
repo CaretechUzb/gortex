@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"bytes"
 	"strconv"
 	"strings"
 
@@ -257,10 +258,11 @@ func emitCSharpTypeUseEdges(ownerID, typeText, filePath string, line int, result
 	})
 }
 
-// emitCSharpAsyncSpawns walks a C# method body for `await` expressions
-// and Task.Run / Task.Factory.StartNew / ThreadPool.QueueUserWorkItem
-// calls. Mode is "async" for await, "task" for Task.Run, "thread" for
-// thread-pool queues.
+// emitCSharpAsyncSpawns walks a C# method body for `await` expressions,
+// Task.Run / Task.Factory.StartNew / ThreadPool.QueueUserWorkItem
+// calls, and deferred-lambda registrations (csharpDeferredLambdaClients,
+// mode "background"). Mode is "async" for await, "task" for Task.Run,
+// "thread" for thread-pool queues.
 func emitCSharpAsyncSpawns(ownerID string, body *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult) {
 	if body == nil {
 		return
@@ -287,63 +289,261 @@ func emitCSharpAsyncSpawns(ownerID string, body *sitter.Node, src []byte, filePa
 			},
 		})
 	}
-	walkCSharpNodes(body, func(n *sitter.Node) bool {
-		switch n.Type() {
-		case "method_declaration", "lambda_expression", "anonymous_method_expression",
-			"local_function_statement":
-			return false
-		case "await_expression":
-			line := int(n.StartPoint().Row) + 1
-			// Look for an inner invocation_expression to grab the
-			// callee name.
-			for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
-				c := n.NamedChild(i)
-				if c == nil {
-					continue
+	// Lambdas are walked (registrations live inside configuration lambdas
+	// — services.AddHangfireServer(opts => { RecurringJob.AddOrUpdate… }))
+	// but only the deferred-client detection fires there; task/async
+	// spawns keep their original named-body-only attribution.
+	var walk func(n *sitter.Node, inLambda bool)
+	walk = func(n *sitter.Node, inLambda bool) {
+		if n == nil {
+			return
+		}
+		if !visitCSharpSpawnNode(n, inLambda, src, ownerID, filePath, seen, result, emit) {
+			return
+		}
+		if n.Type() == "lambda_expression" || n.Type() == "anonymous_method_expression" {
+			inLambda = true
+		}
+		for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
+			walk(n.NamedChild(i), inLambda)
+		}
+	}
+	walk(body, false)
+}
+
+// visitCSharpSpawnNode handles one node of the spawn walk; reports
+// whether to descend into it.
+func visitCSharpSpawnNode(n *sitter.Node, inLambda bool, src []byte, ownerID, filePath string, seen map[string]bool, result *parser.ExtractionResult, emit func(string, string, int)) bool {
+	switch n.Type() {
+	case "method_declaration", "local_function_statement":
+		return false
+	case "await_expression":
+		if inLambda {
+			return true
+		}
+		line := int(n.StartPoint().Row) + 1
+		// Look for an inner invocation_expression to grab the
+		// callee name.
+		for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
+			c := n.NamedChild(i)
+			if c == nil {
+				continue
+			}
+			if c.Type() == "invocation_expression" {
+				if name := csharpInvocationTargetName(c, src); name != "" {
+					emit(name, "async", line)
 				}
-				if c.Type() == "invocation_expression" {
-					if name := csharpInvocationTargetName(c, src); name != "" {
-						emit(name, "async", line)
+			}
+		}
+	case "invocation_expression":
+		fn := n.ChildByFieldName("function")
+		if fn == nil {
+			return true
+		}
+		line := int(n.StartPoint().Row) + 1
+		if fn.Type() == "member_access_expression" {
+			expr := fn.ChildByFieldName("expression")
+			name := fn.ChildByFieldName("name")
+			if expr != nil && name != nil {
+				// Byte-slice map index (no allocation — this path runs
+				// for every member call inside every lambda).
+				b := src[expr.StartByte():expr.EndByte()]
+				if mm := csharpDeferredLambdaClients[string(b[bytes.LastIndexByte(b, '.')+1:])]; mm != nil {
+					emitCSharpDeferredLambdaSpawn(n, name, mm, src, ownerID, filePath, line, seen, result)
+				}
+				if inLambda {
+					return true
+				}
+				obj := expr.Content(src)
+				meth := name.Content(src)
+				switch obj {
+				case "Task":
+					switch meth {
+					case "Run", "Factory":
+						emit("Task."+meth, "task", line)
 					}
-				}
-			}
-		case "invocation_expression":
-			fn := n.ChildByFieldName("function")
-			if fn == nil {
-				return true
-			}
-			line := int(n.StartPoint().Row) + 1
-			if fn.Type() == "member_access_expression" {
-				expr := fn.ChildByFieldName("expression")
-				name := fn.ChildByFieldName("name")
-				if expr != nil && name != nil {
-					obj := expr.Content(src)
-					meth := name.Content(src)
-					switch obj {
-					case "Task":
-						switch meth {
-						case "Run", "Factory":
-							emit("Task."+meth, "task", line)
-						}
-					case "Task.Factory":
-						if meth == "StartNew" {
-							emit("Task.Factory.StartNew", "task", line)
-						}
-					case "ThreadPool":
-						if meth == "QueueUserWorkItem" {
-							emit("ThreadPool.QueueUserWorkItem", "thread", line)
-						}
-					case "Parallel":
-						switch meth {
-						case "ForEach", "For", "Invoke":
-							emit("Parallel."+meth, "parallel", line)
-						}
+				case "Task.Factory":
+					if meth == "StartNew" {
+						emit("Task.Factory.StartNew", "task", line)
+					}
+				case "ThreadPool":
+					if meth == "QueueUserWorkItem" {
+						emit("ThreadPool.QueueUserWorkItem", "thread", line)
+					}
+				case "Parallel":
+					switch meth {
+					case "ForEach", "For", "Invoke":
+						emit("Parallel."+meth, "parallel", line)
 					}
 				}
 			}
 		}
+	}
+	return true
+}
+
+// csharpDeferredLambdaClients registers static-client methods whose
+// lambda argument a framework executes later, on a receiver typed by
+// the generic argument (Hangfire first). Per-API by necessity: whether
+// a generic arg types the lambda is a signature fact — List.ConvertAll's
+// TOutput, for one, does not.
+var csharpDeferredLambdaClients = map[string]map[string]bool{
+	"RecurringJob":  {"AddOrUpdate": true},
+	"BackgroundJob": {"Enqueue": true, "Schedule": true},
+}
+
+// emitCSharpDeferredLambdaSpawn emits the spawn for a registered
+// client's lambda: the framework runs it later, and its receiver type
+// exists only in the generic argument — carried as the receiver_type
+// hint the resolver's *.-target path binds exactly. Origin is left for
+// the resolver to stamp at the tier the binding actually earns.
+func emitCSharpDeferredLambdaSpawn(inv, nameNode *sitter.Node, methods map[string]bool, src []byte, ownerID, filePath string, line int, seen map[string]bool, result *parser.ExtractionResult) {
+	meth := nameNode.Content(src)
+	recv := ""
+	if nameNode.Type() == "generic_name" {
+		meth, recv = csharpGenericNameParts(nameNode, src)
+	}
+	if !methods[meth] {
+		return
+	}
+	// A type-parameter receiver (Enqueue<T> inside a generic wrapper)
+	// names no indexed type; a hint would only steer the resolver's
+	// fallback onto an arbitrary same-named method. Emit nothing.
+	if recv != "" && csharpRecvIsTypeParam(inv, recv, src) {
+		return
+	}
+	target, memberCall := csharpLambdaInvocationTarget(inv, src)
+	if target == "" {
+		return
+	}
+	// A captured-receiver call (() => job.Run()) without a generic hint
+	// carries no type evidence either — same fallback hazard, same skip.
+	if recv == "" && memberCall {
+		return
+	}
+	to := target
+	meta := map[string]any{"mode": "background"}
+	if recv != "" {
+		to = "*." + target
+		meta["receiver_type"] = recv
+	}
+	key := "background\x00" + recv + "\x00" + to
+	if seen[key] {
+		return
+	}
+	seen[key] = true
+	result.Edges = append(result.Edges, &graph.Edge{
+		From:     ownerID,
+		To:       "unresolved::" + to,
+		Kind:     graph.EdgeSpawns,
+		FilePath: filePath,
+		Line:     line,
+		Meta:     meta,
+	})
+}
+
+// csharpRecvIsTypeParam reports whether recv names a type parameter of
+// an enclosing method, local function, or type declaration — an AST
+// fact, not a naming-convention guess (TVShow is a class, TEntity in a
+// generic wrapper is not).
+func csharpRecvIsTypeParam(n *sitter.Node, recv string, src []byte) bool {
+	for p := n; p != nil; p = p.Parent() {
+		switch p.Type() {
+		case "method_declaration", "local_function_statement", "class_declaration",
+			"struct_declaration", "record_declaration", "interface_declaration":
+		default:
+			continue
+		}
+		tparams := p.ChildByFieldName("type_parameters")
+		if tparams == nil {
+			for i, _nc := 0, int(p.NamedChildCount()); i < _nc; i++ {
+				if c := p.NamedChild(i); c != nil && c.Type() == "type_parameter_list" {
+					tparams = c
+					break
+				}
+			}
+		}
+		if tparams == nil {
+			continue
+		}
+		for i, _nc := 0, int(tparams.NamedChildCount()); i < _nc; i++ {
+			tp := tparams.NamedChild(i)
+			if tp == nil || tp.Type() != "type_parameter" {
+				continue
+			}
+			for j, _jc := 0, int(tp.NamedChildCount()); j < _jc; j++ {
+				if c := tp.NamedChild(j); c != nil && c.Type() == "identifier" && c.Content(src) == recv {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// csharpGenericNameParts splits `Enqueue<SyncService>` into the bare
+// method name and the first type argument, shortened to the simple type
+// name the graph indexes.
+func csharpGenericNameParts(n *sitter.Node, src []byte) (name, firstTypeArg string) {
+	for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
+		c := n.NamedChild(i)
+		if c == nil {
+			continue
+		}
+		switch c.Type() {
+		case "identifier":
+			name = c.Content(src)
+		case "type_argument_list":
+			if c.NamedChildCount() > 0 && c.NamedChild(0) != nil {
+				arg := c.NamedChild(0).Content(src)
+				if i := strings.IndexByte(arg, '<'); i >= 0 {
+					arg = arg[:i]
+				}
+				firstTypeArg = diShortName(arg)
+			}
+		}
+	}
+	return name, firstTypeArg
+}
+
+// csharpLambdaInvocationTarget returns the callee name of the first
+// invocation inside the FIRST lambda argument — the method the deferred
+// lambda runs — and whether that callee is member-qualified. Later
+// lambdas (a cron callback, say) never substitute for an invocationless
+// first one.
+func csharpLambdaInvocationTarget(inv *sitter.Node, src []byte) (target string, memberCall bool) {
+	args := inv.ChildByFieldName("arguments")
+	if args == nil {
+		return "", false
+	}
+	var lambda *sitter.Node
+	walkCSharpNodes(args, func(n *sitter.Node) bool {
+		if lambda != nil {
+			return false
+		}
+		if n.Type() == "lambda_expression" {
+			lambda = n
+			return false
+		}
 		return true
 	})
+	if lambda == nil {
+		return "", false
+	}
+	walkCSharpNodes(lambda, func(b *sitter.Node) bool {
+		if target != "" {
+			return false
+		}
+		if b.Type() == "invocation_expression" {
+			target = csharpInvocationTargetName(b, src)
+			if fn := b.ChildByFieldName("function"); fn != nil && fn.Type() == "member_access_expression" {
+				memberCall = true
+			}
+			return false
+		}
+		return true
+	})
+	return target, memberCall
 }
 
 func walkCSharpNodes(n *sitter.Node, visit func(*sitter.Node) bool) {
