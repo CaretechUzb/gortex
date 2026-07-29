@@ -21,6 +21,9 @@ methodology against a tagged build.
   with canonical answers.
 - [`run.md`](run.md) — operational recipe: how to invoke the
   harness, where outputs land, how to publish results.
+- [`localization-quality-spec.md`](localization-quality-spec.md) —
+  benchmark-independent parser, resolver, retrieval, evidence, and validation
+  invariants for localization-quality work.
 
 ## Why this exists
 
