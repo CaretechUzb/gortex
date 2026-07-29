@@ -214,6 +214,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	}
 	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
+	stampCSharpUsings(root, src, fileNode)
 
 	seen := make(map[string]bool)
 	annotationSeen := make(map[string]bool)
@@ -613,21 +614,50 @@ func csharpExtensionReceiverType(methodNode *sitter.Node, src []byte) string {
 	return normalizeCSharpBaseName(t.Content(src))
 }
 
-// csharpEnclosingNamespace returns the dotted name of the nearest enclosing
-// namespace declaration (block or file-scoped), or "".
+// csharpEnclosingNamespace returns the dotted name of the enclosing
+// namespace scope, or "". Nested block declarations join outer-to-inner
+// (`namespace A { namespace B {` → "A.B").
 func csharpEnclosingNamespace(node *sitter.Node, src []byte) string {
+	var parts []string
+	root := node
 	for n := node; n != nil; n = n.Parent() {
 		t := n.Type()
 		if t == "namespace_declaration" || t == "file_scoped_namespace_declaration" {
-			if nm := n.ChildByFieldName("name"); nm != nil {
-				return strings.TrimSpace(nm.Content(src))
+			if nm := csharpNamespaceName(n, src); nm != "" {
+				parts = append(parts, nm)
 			}
-			for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
-				c := n.NamedChild(i)
-				if c.Type() == "identifier" || c.Type() == "qualified_name" {
-					return strings.TrimSpace(c.Content(src))
-				}
-			}
+		}
+		root = n
+	}
+	if len(parts) > 0 {
+		// Collected innermost-first — reverse into source order.
+		for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+			parts[i], parts[j] = parts[j], parts[i]
+		}
+		return strings.Join(parts, ".")
+	}
+	// File-scoped form: `namespace X;` spans only its own statement in the
+	// AST — the declarations it governs are later siblings under the
+	// compilation unit, so the ancestor walk above never sees it.
+	for i, _nc := 0, int(root.NamedChildCount()); i < _nc; i++ {
+		c := root.NamedChild(i)
+		if c.Type() == "file_scoped_namespace_declaration" && c.StartByte() <= node.StartByte() {
+			return csharpNamespaceName(c, src)
+		}
+	}
+	return ""
+}
+
+// csharpNamespaceName extracts the dotted name from a namespace_declaration
+// or file_scoped_namespace_declaration node.
+func csharpNamespaceName(n *sitter.Node, src []byte) string {
+	if nm := n.ChildByFieldName("name"); nm != nil {
+		return strings.TrimSpace(nm.Content(src))
+	}
+	for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
+		c := n.NamedChild(i)
+		if c.Type() == "identifier" || c.Type() == "qualified_name" {
+			return strings.TrimSpace(c.Content(src))
 		}
 	}
 	return ""
@@ -999,6 +1029,42 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 	emitCSharpTypeUseEdges(id, propTypeRaw, filePath, def.StartLine+1, result)
 }
 
+// stampCSharpUsings records the file's plain namespace usings (global
+// ones included) on the file node as Meta["usings"]. Aliases and
+// using-static grant no bare-name namespace visibility and are skipped.
+// Resolution rewrites the per-directive import edges, so the resolver's
+// namespace narrowing reads this shape, which nothing mutates.
+func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
+	var usings []string
+	seen := map[string]bool{}
+	walkNodes(root, func(n *sitter.Node) {
+		if n.Type() != "using_directive" {
+			return
+		}
+		var name string
+		for i, _nc := 0, int(n.ChildCount()); i < _nc; i++ {
+			c := n.Child(i)
+			switch c.Type() {
+			case "static", "name_equals", "=":
+				return
+			case "identifier", "qualified_name":
+				name = strings.TrimSpace(c.Content(src))
+			}
+		}
+		if name != "" && !seen[name] {
+			seen[name] = true
+			usings = append(usings, name)
+		}
+	})
+	if len(usings) == 0 {
+		return
+	}
+	if fileNode.Meta == nil {
+		fileNode.Meta = map[string]any{}
+	}
+	fileNode.Meta["usings"] = usings
+}
+
 func (e *CSharpExtractor) emitUsing(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
 	path := m.Captures["using.path"]
 	importPath := strings.ReplaceAll(path.Text, ".", "/")
@@ -1132,11 +1198,23 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 			kind = graph.EdgeExtends
 			extendsTaken = true
 		}
-		result.Edges = append(result.Edges, &graph.Edge{
+		edge := &graph.Edge{
 			From: typeID, To: "unresolved::" + name,
 			Kind: kind, FilePath: filePath, Line: line,
 			Origin: graph.OriginASTInferred,
-		})
+		}
+		// A qualified base spelling names its namespace — keep it for the
+		// resolver's namespace narrowing (same stamp as reference forms).
+		raw := entry.Content(src)
+		if isCtorBase {
+			if tn := entry.ChildByFieldName("type"); tn != nil {
+				raw = tn.Content(src)
+			}
+		}
+		if fqn := csharpQualifiedTypeRef(raw); fqn != "" {
+			edge.Meta = map[string]any{"target_fqn": fqn}
+		}
+		result.Edges = append(result.Edges, edge)
 	}
 }
 

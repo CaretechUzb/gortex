@@ -186,6 +186,37 @@ func emitCSharpGenericParamNodes(ownerID string, methodNode *sitter.Node, src []
 	}
 }
 
+// csharpContainerGenerics are wrapper types whose single type argument is
+// the type a reference is really about; canonicalisation unwraps them.
+var csharpContainerGenerics = []string{
+	"Task", "ValueTask", "List", "IList", "IEnumerable",
+	"ICollection", "IReadOnlyList", "IReadOnlyCollection",
+	"IAsyncEnumerable", "Nullable", "Span", "ReadOnlySpan",
+}
+
+// csharpQualifiedTypeRef mirrors canonicalizeCSharpTypeRef but keeps the
+// dotted qualifier ("Common.Lookup.Foo?" -> "Common.Lookup.Foo").
+// Returns "" when the spelling carries no qualifier.
+func csharpQualifiedTypeRef(t string) string {
+	t = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(t), "?"))
+	for strings.HasSuffix(t, "[]") {
+		t = strings.TrimSpace(strings.TrimSuffix(t, "[]"))
+	}
+	for _, wrapper := range csharpContainerGenerics {
+		prefix := wrapper + "<"
+		if strings.HasPrefix(t, prefix) && strings.HasSuffix(t, ">") {
+			return csharpQualifiedTypeRef(t[len(prefix) : len(t)-1])
+		}
+	}
+	if idx := strings.Index(t, "<"); idx > 0 {
+		t = t[:idx]
+	}
+	if !strings.Contains(t, ".") {
+		return ""
+	}
+	return t
+}
+
 func canonicalizeCSharpTypeRef(t string) string {
 	t = strings.TrimSpace(t)
 	if t == "" {
@@ -200,11 +231,7 @@ func canonicalizeCSharpTypeRef(t string) string {
 		t = strings.TrimSpace(t)
 	}
 	// Unwrap container generics.
-	for _, wrapper := range []string{
-		"Task", "ValueTask", "List", "IList", "IEnumerable",
-		"ICollection", "IReadOnlyList", "IReadOnlyCollection",
-		"IAsyncEnumerable", "Nullable", "Span", "ReadOnlySpan",
-	} {
+	for _, wrapper := range csharpContainerGenerics {
 		prefix := wrapper + "<"
 		if strings.HasPrefix(t, prefix) && strings.HasSuffix(t, ">") {
 			inner := t[len(prefix) : len(t)-1]

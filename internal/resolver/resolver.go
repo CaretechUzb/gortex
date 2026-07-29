@@ -298,6 +298,13 @@ type Resolver struct {
 	importFilesByCaller map[string]map[string]struct{}
 	importFilesMu       sync.RWMutex
 
+	// csharpNSByFile memoises each C# file's visible namespaces (usings
+	// + own namespace chain). Built lazily inside the parallel resolve
+	// workers — csharpNSMu guards it — and cleared with the per-pass
+	// lookup caches. See csharp_ns_narrow.go.
+	csharpNSByFile map[string]csharpFileNS
+	csharpNSMu     sync.RWMutex
+
 	// incrementalSkip holds the source-shapes of a single re-resolved file's
 	// out-edges that were already unresolved before the edit; the forward
 	// pass skips them. Set/cleared around ResolveFileAndIncoming by the
@@ -1918,6 +1925,9 @@ func (r *Resolver) clearLookupCache() {
 	r.importFilesMu.Lock()
 	r.importFilesByCaller = nil
 	r.importFilesMu.Unlock()
+	r.csharpNSMu.Lock()
+	r.csharpNSByFile = nil
+	r.csharpNSMu.Unlock()
 }
 
 // cachedGetNode returns the node for id, consulting the per-pass
@@ -3460,6 +3470,12 @@ func (r *Resolver) resolveTypeOrFunc(e *graph.Edge, name string, stats *ResolveS
 		candidates = narrowed
 	}
 
+	// C#: narrow to the namespaces the file imports or encloses — same
+	// narrowing-only contract as the PHP pass above. See csharp_ns_narrow.go.
+	if narrowed := r.csharpNarrowByNamespace(e, candidates); len(narrowed) > 0 {
+		candidates = narrowed
+	}
+
 	// Land the edge on the canonical type/interface definition (real,
 	// exported, top-level, non-test), preferring same-package only as a
 	// tiebreak. See bestTypeCandidate / resolveTypeRef for the rationale:
@@ -3520,6 +3536,12 @@ func (r *Resolver) resolveTypeRef(e *graph.Edge, name string, stats *ResolveStat
 	// only — when no candidate matches, the full set is ranked as before, so
 	// this can sharpen a binding but never lose one.
 	if narrowed := phpNarrowByTargetFQN(e, candidates); len(narrowed) > 0 {
+		candidates = narrowed
+	}
+
+	// C#: narrow to the namespaces the file imports or encloses — same
+	// narrowing-only contract as the PHP pass above. See csharp_ns_narrow.go.
+	if narrowed := r.csharpNarrowByNamespace(e, candidates); len(narrowed) > 0 {
 		candidates = narrowed
 	}
 
