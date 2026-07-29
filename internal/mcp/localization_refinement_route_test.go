@@ -338,11 +338,9 @@ func TestGenericCorrectionSharesOneRetryAcrossRouteHops(t *testing.T) {
 
 	requireRefinementSourceReservation(t, state, implementation)
 	completion = state.finishReservedRead(false)
-	requireRefinementCompletion(t, completion, localizationStateAnswerReady, "", 0)
-	if result, reserved := state.authorize("read", "source", refinementSourceArgs(implementation)); reserved {
-		t.Fatal("implementation hop received a second route-level retry")
-	} else {
-		requireLocalizationTerminalReplay(t, result, "read", "source")
+	requireRefinementCompletion(t, completion, localizationStateLocalized, "", 0)
+	if result, reserved := state.authorize("read", "source", refinementSourceArgs(implementation)); reserved || result != nil {
+		t.Fatalf("advisory release kept route authorization active: (%#v, %v)", result, reserved)
 	}
 }
 
@@ -371,11 +369,9 @@ func TestInitialRefinementFailureRestoresOnlyOnce(t *testing.T) {
 
 	requireRefinementSourceReservation(t, state, preferred)
 	completion = state.finishReservedRead(false)
-	requireRefinementCompletion(t, completion, localizationStateAnswerReady, "", 0)
-	if result, reserved := state.authorize("read", "source", refinementSourceArgs(preferred)); reserved {
-		t.Fatal("initial refinement failure restored more than once")
-	} else {
-		requireLocalizationTerminalReplay(t, result, "read", "source")
+	requireRefinementCompletion(t, completion, localizationStateLocalized, "", 0)
+	if result, reserved := state.authorize("read", "source", refinementSourceArgs(preferred)); reserved || result != nil {
+		t.Fatalf("advisory release kept refinement authorization active: (%#v, %v)", result, reserved)
 	}
 }
 
@@ -420,11 +416,9 @@ func TestWeakCorrectionFailureRestoresOnlyOnce(t *testing.T) {
 		t.Fatalf("restored correction read = (%+v, %d), want reservation", blocked, token)
 	}
 	completion = state.finishReservedReadToken(token, false)
-	requireRefinementCompletion(t, completion, localizationStateAnswerReady, "", 0)
-	if result, reserved := state.authorize("read", "source", refinementSourceArgs(alternate)); reserved {
-		t.Fatal("correction was restored more than once")
-	} else {
-		requireLocalizationTerminalReplay(t, result, "read", "source")
+	requireRefinementCompletion(t, completion, localizationStateLocalized, "", 0)
+	if result, reserved := state.authorize("read", "source", refinementSourceArgs(alternate)); reserved || result != nil {
+		t.Fatalf("advisory release kept correction authorization active: (%#v, %v)", result, reserved)
 	}
 }
 

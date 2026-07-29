@@ -142,11 +142,15 @@ func TestLocalizationDirectRelationsRequireRelevantOrProvenRoute(t *testing.T) {
 			implementation.ID: {proofSymbol: wrapper.ID, enforceable: true},
 		}
 		got := interleaveLocalizationDirectRelationsWithRoutes(task, "", targets, routes)
-		want := []string{wrapper.ID, implementation.ID, targets[1].node.ID, targets[2].node.ID}
-		for index, id := range want {
-			if got[index].node.ID != id {
-				t.Fatalf("proven route row %d = %q, want %q", index+1, got[index].node.ID, id)
+		// All four direct candidates fit inside the authorization floor, so the
+		// proven implementation stays visible without displacing their ranking.
+		for index, target := range targets {
+			if got[index].node.ID != target.node.ID {
+				t.Fatalf("proven route changed protected direct row %d: got %q want %q", index+1, got[index].node.ID, target.node.ID)
 			}
+		}
+		if got[len(got)-1].node.ID != implementation.ID {
+			t.Fatalf("proven implementation was not retained: %#v", got)
 		}
 	})
 
@@ -250,19 +254,23 @@ func TestRecoveryAllowsInferredConcreteIdentifierOnlyForScopedSymbolEvidence(t *
 		t.Fatalf("inferred exact identifier authorization = (%#v, %d)", blocked, firstToken)
 	}
 	zero := state.finishReservedReadTokenWithDigest(firstToken, true, nil, true)
-	if zero.State != localizationStateNeedsRecovery || zero.AllowedToolCalls != 1 || zero.digest != retained {
-		t.Fatalf("empty typed page consumed recovery: %#v", zero)
+	if zero.State != localizationStateLocalized || zero.AllowedToolCalls != 0 || zero.Enforceable {
+		t.Fatalf("empty typed page did not release an advisory completion: %#v", zero)
 	}
 
-	blocked, secondToken := state.authorizeWithToken("search", "symbols", args)
-	if blocked != nil || secondToken == 0 || secondToken == firstToken {
-		t.Fatalf("restored exact identifier authorization = (%#v, %d)", blocked, secondToken)
+	positiveState := newLocalizationTerminalState()
+	positiveCompletion := newLocalizationRecoveryCompletion()
+	positiveCompletion.digest = retained
+	positiveState.armForTask(positiveCompletion, "investigate registry configuration behavior")
+	blocked, secondToken := positiveState.authorizeWithToken("search", "symbols", args)
+	if blocked != nil || secondToken == 0 {
+		t.Fatalf("fresh exact identifier authorization = (%#v, %d)", blocked, secondToken)
 	}
 	captureCtx := withLocalizationPermittedEvidenceCapture(context.Background(), secondToken)
 	node := localizationV8Node("repo/policy.go::DerivedPolicy.ApplyRule", "ApplyRule", "repo/policy.go")
 	captureLocalizationSearchSymbols(captureCtx, []*graph.Node{node})
 	rows, recorded := localizationEvidenceForPermittedCall(captureCtx, "search", "symbols", secondToken)
-	ready := state.finishReservedReadTokenWithDigest(secondToken, true, rows, recorded)
+	ready := positiveState.finishReservedReadTokenWithDigest(secondToken, true, rows, recorded)
 	if ready.State != localizationStateAnswerReady || ready.digest == nil || ready.digest.Evidence[0].ID != node.ID {
 		t.Fatalf("nonempty typed symbol page did not terminalize current-first: %#v", ready)
 	}
@@ -575,7 +583,13 @@ func TestFacadeAuthArgumentIsStrippedAndPublishesTypedTerminalReceipts(t *testin
 	errorArgs := map[string]any{"operation": "unsupported_operation", "query": "Registry.Configure", localizationauth.ArgumentKey: errorToken}
 	terminalError, err := server.handleFacade(errorCtx, "search", mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{Name: "search", Arguments: errorArgs}})
 	if err != nil || terminalError == nil || !terminalError.IsError {
-		t.Fatalf("authenticated terminal error = (%#v, %v)", terminalError, err)
+		t.Fatalf("authenticated advisory rejection = (%#v, %v)", terminalError, err)
 	}
-	requireReceipt(t, errorToken, terminalError)
+	if _, published := localizationauth.Consume(errorToken); published {
+		t.Fatal("unproven advisory rejection published a terminal receipt")
+	}
+	host, ok := terminalError.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	if !ok || host.Contract.Terminal || host.Contract.Completion.State != localizationStateLocalized {
+		t.Fatalf("advisory rejection host contract = %#v", terminalError.Meta)
+	}
 }

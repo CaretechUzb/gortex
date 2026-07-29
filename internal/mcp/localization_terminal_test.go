@@ -674,7 +674,7 @@ func TestHandleFacadeExactReadCommitsOnlyOnSuccess(t *testing.T) {
 	requireLocalizationTerminalReplay(t, fourth, "read", "source")
 }
 
-func TestHandleFacadeExhaustedCorrectionFailureCarriesTerminalCompletion(t *testing.T) {
+func TestHandleFacadeExhaustedCorrectionFailureCarriesAdvisoryCompletion(t *testing.T) {
 	registry := newFacadeRegistry()
 	preferred := "repo/pkg/find.go::Find"
 	alternate := "repo/pkg/resolve.go::Resolve"
@@ -732,17 +732,12 @@ func TestHandleFacadeExhaustedCorrectionFailureCarriesTerminalCompletion(t *test
 	}
 	thirdBody, _ := singleTextContent(third)
 	if !strings.Contains(thirdBody, "persistent correction failure") ||
-		!strings.Contains(thirdBody, `"state":"answer_ready"`) ||
-		!strings.Contains(thirdBody, `"required_action":"respond"`) ||
-		!strings.Contains(thirdBody, `"terminal":true`) {
-		t.Fatalf("exhausted failure omitted terminal completion: %q", thirdBody)
+		!strings.Contains(thirdBody, `"state":"localized"`) ||
+		!strings.Contains(thirdBody, `"required_action":"continue_task"`) ||
+		!strings.Contains(thirdBody, `"terminal":false`) {
+		t.Fatalf("exhausted failure omitted advisory completion: %q", thirdBody)
 	}
 	requireFacadeIdentity(t, third, facadeOperationSpec{Facade: "read", Operation: "source", Legacy: "get_symbol_source"})
-	if blocked, err := read(alternate); err != nil {
-		t.Fatalf("post-terminal read returned transport error: %v", err)
-	} else {
-		requireLocalizationTerminalReplay(t, blocked, "read", "source")
-	}
 }
 
 func TestDecorateExhaustedLocalizationReadFailureKeepsErrorAndFacadeIdentity(t *testing.T) {
