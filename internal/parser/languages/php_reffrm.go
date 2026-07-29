@@ -198,7 +198,11 @@ func emitPHPReferenceForms(root *sitter.Node, src []byte, filePath, fileID strin
 func buildPHPTypeRanges(result *parser.ExtractionResult) []funcRange {
 	var ranges []funcRange
 	for _, n := range result.Nodes {
-		if n.Kind == graph.KindType || n.Kind == graph.KindInterface {
+		if (n.Kind == graph.KindType || n.Kind == graph.KindInterface) &&
+			!strings.HasPrefix(n.ID, "annotation::") {
+			// Attribute declarations also create synthetic type nodes at the
+			// attribute's exact line. They are reference targets, never lexical
+			// owners of the declaration they annotate.
 			ranges = append(ranges, funcRange{id: n.ID, startLine: n.StartLine, endLine: n.EndLine})
 		}
 	}

@@ -33,13 +33,14 @@ func (s *Server) buildFileSymbolIndex(targets []astquery.Target) map[string]*fil
 		if _, ok := wanted[n.FilePath]; !ok {
 			continue
 		}
-		// Functions, methods, closures are the meaningful
-		// "enclosing scope" candidates. KindType (struct/class)
-		// is included too so a match in a class-body declaration
-		// still gets a symbol_id (e.g. a Java field that's
-		// flagged by string-equality detection).
+		// Functions, methods, closures, and macros are meaningful
+		// "enclosing scope" candidates. Macro nodes are declaration-backed and
+		// already carry exact source ranges; token-tree contents are never parsed
+		// as declarations here. KindType (struct/class) is included too so a
+		// class-body match still gets a symbol identity.
 		switch n.Kind {
-		case graph.KindFunction, graph.KindMethod, graph.KindClosure, graph.KindType, graph.KindInterface:
+		case graph.KindFunction, graph.KindMethod, graph.KindClosure, graph.KindMacro,
+			graph.KindType, graph.KindInterface:
 			idx := out[n.FilePath]
 			if idx == nil {
 				idx = &fileSymbolIndex{}
@@ -69,10 +70,15 @@ func (i *fileSymbolIndex) finalise() {
 		if i.syms[a].StartLine != i.syms[b].StartLine {
 			return i.syms[a].StartLine < i.syms[b].StartLine
 		}
-		// For nodes at the same start line, narrowest-first so
-		// the deepest scope wins on ties.
-		return (i.syms[a].EndLine - i.syms[a].StartLine) <
-			(i.syms[b].EndLine - i.syms[b].StartLine)
+		// For nodes at the same start line, narrowest-first so the deepest
+		// scope wins. Equal line ranges are not distinguishable without byte
+		// positions, so canonical identity supplies a deterministic final tie.
+		spanA := i.syms[a].EndLine - i.syms[a].StartLine
+		spanB := i.syms[b].EndLine - i.syms[b].StartLine
+		if spanA != spanB {
+			return spanA < spanB
+		}
+		return i.syms[a].ID < i.syms[b].ID
 	})
 }
 
@@ -243,7 +249,7 @@ func (s *Server) buildFileSymbolIndexForOrderedPathsContext(ctx context.Context,
 		}
 		for _, n := range nodes {
 			switch n.Kind {
-			case graph.KindFunction, graph.KindMethod, graph.KindClosure,
+			case graph.KindFunction, graph.KindMethod, graph.KindClosure, graph.KindMacro,
 				graph.KindType, graph.KindInterface:
 				idx := out[n.FilePath]
 				if idx == nil {
