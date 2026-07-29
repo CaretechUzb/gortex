@@ -304,7 +304,7 @@ type Resolver struct {
 	// resolve workers — csharpNSMu guards it — and cleared with the
 	// per-pass lookup caches. Consulted by csharpNarrowByNamespace; see
 	// csharp_ns_narrow.go.
-	csharpNSByFile map[string]map[string]struct{}
+	csharpNSByFile map[string]csharpFileNS
 	csharpNSMu     sync.RWMutex
 
 	// incrementalSkip holds the source-shapes of a single re-resolved file's

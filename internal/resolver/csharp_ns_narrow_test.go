@@ -119,6 +119,47 @@ func TestCSharpNamespaceNarrow_NoMatchKeepsOldPick(t *testing.T) {
 		"without namespace evidence the previous deterministic pick stands")
 }
 
+// TestCSharpNamespaceNarrow_EnclosingBeatsImported: the compiler searches
+// enclosing namespaces before using directives — an internal type in the
+// file's own namespace wins over a public same-named type in an imported
+// one, even though the ranker prefers exported candidates.
+func TestCSharpNamespaceNarrow_EnclosingBeatsImported(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "app/Billing/Module.cs", Kind: graph.KindFile, Name: "Module.cs", FilePath: "app/Billing/Module.cs", Language: "csharp", RepoPrefix: "app"})
+	g.AddNode(&graph.Node{
+		ID: "app/Billing/Module.cs::Module", Kind: graph.KindType, Name: "Module",
+		FilePath: "app/Billing/Module.cs", Language: "csharp", RepoPrefix: "app",
+		Meta: map[string]any{"scope_ns": "App.Billing", "visibility": "public"},
+	})
+	g.AddEdge(&graph.Edge{From: "app/Billing/Module.cs", To: "app/Billing/Module.cs::Module", Kind: graph.EdgeDefines, FilePath: "app/Billing/Module.cs", Line: 3})
+	g.AddEdge(&graph.Edge{From: "app/Billing/Module.cs", To: "unresolved::import::App/Shared/Lookup", Kind: graph.EdgeImports, FilePath: "app/Billing/Module.cs", Line: 1})
+	// Own-namespace candidate: internal (ranked below public by the
+	// canonical-definition ranker).
+	g.AddNode(&graph.Node{ID: "app/Billing/Rules.cs", Kind: graph.KindFile, Name: "Rules.cs", FilePath: "app/Billing/Rules.cs", Language: "csharp", RepoPrefix: "app"})
+	g.AddNode(&graph.Node{
+		ID: "app/Billing/Rules.cs::Rules", Kind: graph.KindType, Name: "Rules",
+		FilePath: "app/Billing/Rules.cs", Language: "csharp", RepoPrefix: "app",
+		Meta: map[string]any{"scope_ns": "App.Billing", "visibility": "internal"},
+	})
+	// Imported-namespace candidate: public.
+	g.AddNode(&graph.Node{ID: "app/Shared/Lookup/Rules.cs", Kind: graph.KindFile, Name: "Rules.cs", FilePath: "app/Shared/Lookup/Rules.cs", Language: "csharp", RepoPrefix: "app"})
+	g.AddNode(&graph.Node{
+		ID: "app/Shared/Lookup/Rules.cs::Rules", Kind: graph.KindType, Name: "Rules",
+		FilePath: "app/Shared/Lookup/Rules.cs", Language: "csharp", RepoPrefix: "app",
+		Meta: map[string]any{"scope_ns": "App.Shared.Lookup", "visibility": "public"},
+	})
+	ref := &graph.Edge{
+		From: "app/Billing/Module.cs::Module", To: "unresolved::Rules",
+		Kind: graph.EdgeReferences, Origin: graph.OriginASTResolved, FilePath: "app/Billing/Module.cs", Line: 10,
+	}
+	g.AddEdge(ref)
+
+	New(g).ResolveAll()
+
+	assert.Equal(t, "app/Billing/Rules.cs::Rules", ref.To,
+		"the enclosing-namespace type wins over an imported one regardless of visibility rank")
+}
+
 // TestCSharpNamespaceNarrow_ExternalImportShape: by the time a reference
 // resolves, the same-pass import resolution may already have rewritten
 // the using edge to its external:: form — both shapes must count.
