@@ -616,18 +616,38 @@ func csharpExtensionReceiverType(methodNode *sitter.Node, src []byte) string {
 // csharpEnclosingNamespace returns the dotted name of the nearest enclosing
 // namespace declaration (block or file-scoped), or "".
 func csharpEnclosingNamespace(node *sitter.Node, src []byte) string {
+	root := node
 	for n := node; n != nil; n = n.Parent() {
 		t := n.Type()
 		if t == "namespace_declaration" || t == "file_scoped_namespace_declaration" {
-			if nm := n.ChildByFieldName("name"); nm != nil {
-				return strings.TrimSpace(nm.Content(src))
+			if nm := csharpNamespaceName(n, src); nm != "" {
+				return nm
 			}
-			for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
-				c := n.NamedChild(i)
-				if c.Type() == "identifier" || c.Type() == "qualified_name" {
-					return strings.TrimSpace(c.Content(src))
-				}
-			}
+		}
+		root = n
+	}
+	// File-scoped form: `namespace X;` spans only its own statement in the
+	// AST — the declarations it governs are later siblings under the
+	// compilation unit, so the ancestor walk above never sees it.
+	for i, _nc := 0, int(root.NamedChildCount()); i < _nc; i++ {
+		c := root.NamedChild(i)
+		if c.Type() == "file_scoped_namespace_declaration" && c.StartByte() <= node.StartByte() {
+			return csharpNamespaceName(c, src)
+		}
+	}
+	return ""
+}
+
+// csharpNamespaceName extracts the dotted name from a namespace_declaration
+// or file_scoped_namespace_declaration node.
+func csharpNamespaceName(n *sitter.Node, src []byte) string {
+	if nm := n.ChildByFieldName("name"); nm != nil {
+		return strings.TrimSpace(nm.Content(src))
+	}
+	for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
+		c := n.NamedChild(i)
+		if c.Type() == "identifier" || c.Type() == "qualified_name" {
+			return strings.TrimSpace(c.Content(src))
 		}
 	}
 	return ""
