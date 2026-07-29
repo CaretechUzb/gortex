@@ -9,11 +9,9 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// TestCSharpExtractor_QualifiedTypeRefKeepsFQN: a qualified type spelling
-// (`AddProfile<Shared.Reporting.SalesProfile>()`) names its namespace in
-// the source — canonicalisation must not silently discard it. The bare
-// name stays the target; the dotted spelling rides Meta["target_fqn"]
-// for the resolver's namespace narrowing.
+// TestCSharpExtractor_QualifiedTypeRefKeepsFQN: a qualified spelling
+// names its namespace in the source. The bare name stays the target;
+// the dotted spelling rides Meta["target_fqn"] for the resolver.
 func TestCSharpExtractor_QualifiedTypeRefKeepsFQN(t *testing.T) {
 	src := []byte(`public class Wiring {
     public void Configure(MapperConfig cfg) {

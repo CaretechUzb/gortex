@@ -8,9 +8,8 @@ import (
 )
 
 // TestCSharpExtractor_FileScopedNamespaceScopeNS: a C#10 file-scoped
-// namespace spans only its own line in the AST — the declarations it
-// governs are siblings, not children, so the ancestor walk alone never
-// finds it and every type in such a file loses its scope_ns.
+// namespace's declarations are AST siblings, not children — an
+// ancestor walk alone loses every such file's scope_ns.
 func TestCSharpExtractor_FileScopedNamespaceScopeNS(t *testing.T) {
 	src := []byte(`namespace App.Core.Metrics;
 

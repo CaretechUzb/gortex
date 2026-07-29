@@ -7,12 +7,10 @@ import (
 )
 
 // C# namespace narrowing. A using directive imports a whole namespace,
-// not a name — unlike PHP there is no per-reference FQN to stamp at
-// extraction. The evidence is already in the graph instead: using
-// directives are EdgeImports off the file node, and every C# type
-// carries Meta["scope_ns"]. Joining the two applies the compiler's own
-// lookup rule where the bare-name ranking would otherwise tie-break
-// same-named types by lexicographic ID — a sibling module's type.
+// not a name, so there is no per-reference FQN to stamp at extraction
+// (the PHP approach). Instead, join what the graph already holds — the
+// file's EdgeImports and each type's Meta["scope_ns"] — so a bare-name
+// tie no longer falls to lexicographic ID (a sibling module's type).
 
 // csharpFileNS is a C# file's visible-namespace evidence, split the way
 // the compiler consults it: enclosing namespaces are searched before
@@ -80,21 +78,17 @@ func (r *Resolver) csharpFileNamespaceSet(fileID string) csharpFileNS {
 }
 
 // csharpNarrowByNamespace filters same-named C# type candidates to the
-// ones declared in a namespace the referencing file can see, enclosing
-// namespaces first (deepest match wins, mirroring inner-to-outer scope
-// search) and using directives second. Same contract as
-// phpNarrowByTargetFQN: narrowing only — nil when no candidate
-// namespace is visible — so a binding can sharpen but never be lost.
+// namespaces the referencing file can see: written qualifier, then
+// enclosing namespaces (deepest wins), then using directives. Same
+// contract as phpNarrowByTargetFQN — narrowing only, never a loss.
 func (r *Resolver) csharpNarrowByNamespace(e *graph.Edge, candidates []*graph.Node) []*graph.Node {
 	if len(candidates) < 2 || !strings.HasSuffix(e.FilePath, ".cs") {
 		return nil
 	}
 
-	// A qualifier written at the reference site (Meta["target_fqn"], from
-	// a qualified spelling like Shared.Reporting.Foo) is the strongest
-	// evidence: keep only candidates whose namespace ends in it. C#
-	// resolves partial qualifiers against visible namespaces, so a suffix
-	// match on a dot boundary covers both the full and partial forms.
+	// A written qualifier (Meta["target_fqn"]) is the strongest evidence.
+	// C# resolves partial qualifiers against visible namespaces, so a
+	// dot-boundary suffix match covers the full and partial forms alike.
 	qualified := candidates
 	if fqn, _ := e.Meta["target_fqn"].(string); strings.Contains(fqn, ".") {
 		q := fqn[:strings.LastIndex(fqn, ".")]

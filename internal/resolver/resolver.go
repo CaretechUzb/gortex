@@ -298,12 +298,10 @@ type Resolver struct {
 	importFilesByCaller map[string]map[string]struct{}
 	importFilesMu       sync.RWMutex
 
-	// csharpNSByFile memoises, per C# file, the namespaces the file can
-	// see: its using-directive imports plus its own declared namespaces
-	// with every enclosing prefix. Built lazily inside the parallel
-	// resolve workers — csharpNSMu guards it — and cleared with the
-	// per-pass lookup caches. Consulted by csharpNarrowByNamespace; see
-	// csharp_ns_narrow.go.
+	// csharpNSByFile memoises each C# file's visible namespaces (usings
+	// + own namespace chain). Built lazily inside the parallel resolve
+	// workers — csharpNSMu guards it — and cleared with the per-pass
+	// lookup caches. See csharp_ns_narrow.go.
 	csharpNSByFile map[string]csharpFileNS
 	csharpNSMu     sync.RWMutex
 
