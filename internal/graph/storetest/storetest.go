@@ -50,6 +50,8 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("GetRepoNodes", func(t *testing.T) { testGetRepoNodes(t, factory) })
 	t.Run("GetRepoEdges", func(t *testing.T) { testGetRepoEdges(t, factory) })
 	t.Run("GetNodeByQualName", func(t *testing.T) { testGetNodeByQualName(t, factory) })
+	t.Run("DuplicateQualNameAcrossRepos", func(t *testing.T) { testDuplicateQualNameAcrossRepos(t, factory) })
+	t.Run("DuplicateQualNameWithinRepo", func(t *testing.T) { testDuplicateQualNameWithinRepo(t, factory) })
 	t.Run("Stats", func(t *testing.T) { testStats(t, factory) })
 	t.Run("RepoStats", func(t *testing.T) { testRepoStats(t, factory) })
 	t.Run("RepoPrefixes", func(t *testing.T) { testRepoPrefixes(t, factory) })
@@ -598,6 +600,92 @@ func testGetNodeByQualName(t *testing.T, factory Factory) {
 	}
 	if s.GetNodeByQualName("missing.Qual") != nil {
 		t.Fatalf("GetNodeByQualName missing should be nil")
+	}
+}
+
+func testDuplicateQualNameAcrossRepos(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+
+	const qualName = "ClusterRole/prometheus"
+	first := mkRepoNode(
+		"repo-a/k8s::ClusterRole::_default::prometheus",
+		"prometheus", "repo-a/deploy/rbac.yaml", "repo-a", graph.KindResource,
+	)
+	first.QualName = qualName
+	second := mkRepoNode(
+		"repo-b/k8s::ClusterRole::_default::prometheus",
+		"prometheus", "repo-b/manifests/roles.yaml", "repo-b", graph.KindResource,
+	)
+	second.QualName = qualName
+
+	s.AddNode(first)
+	s.AddNode(second)
+
+	for _, want := range []*graph.Node{first, second} {
+		got := s.GetNode(want.ID)
+		if got == nil {
+			t.Fatalf("GetNode(%q) = nil after adding the same qual_name in another repo", want.ID)
+		}
+		if got.RepoPrefix != want.RepoPrefix {
+			t.Fatalf("GetNode(%q).RepoPrefix = %q, want %q", want.ID, got.RepoPrefix, want.RepoPrefix)
+		}
+	}
+
+	gotByName := s.FindNodesByName("prometheus")
+	gotRepos := make(map[string]bool, len(gotByName))
+	for _, got := range gotByName {
+		if got != nil && got.QualName == qualName {
+			gotRepos[got.RepoPrefix] = true
+		}
+	}
+	for _, wantRepo := range []string{"repo-a", "repo-b"} {
+		if !gotRepos[wantRepo] {
+			t.Errorf("FindNodesByName(prometheus) repos = %v, missing %q", gotRepos, wantRepo)
+		}
+	}
+
+	gotByQual := s.GetNodesByQualNames([]string{qualName, qualName, "", "missing/qualified-name"})
+	hits := gotByQual[qualName]
+	wantIDs := []string{first.ID, second.ID}
+	if len(hits) != len(wantIDs) {
+		t.Fatalf("GetNodesByQualNames duplicate input returned %d nodes, want %d: %v", len(hits), len(wantIDs), sortNodeIDs(hits))
+	}
+	for i, wantID := range wantIDs {
+		if hits[i] == nil || hits[i].ID != wantID {
+			t.Fatalf("GetNodesByQualNames[%q][%d] = %#v, want ID %q (stable ID order)", qualName, i, hits[i], wantID)
+		}
+	}
+	for _, absent := range []string{"", "missing/qualified-name"} {
+		if _, ok := gotByQual[absent]; ok {
+			t.Errorf("GetNodesByQualNames unexpectedly returned absent key %q: %v", absent, sortNodeIDs(gotByQual[absent]))
+		}
+	}
+}
+
+func testDuplicateQualNameWithinRepo(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+
+	const qualName = "Deployment/api"
+	for _, namespace := range []string{"blue", "green"} {
+		n := mkRepoNode(
+			"repo-a/k8s::Deployment::"+namespace+"::api",
+			"api", "repo-a/manifests/"+namespace+".yaml", "repo-a", graph.KindResource,
+		)
+		n.QualName = qualName
+		s.AddNode(n)
+	}
+
+	got := s.FindNodesByName("api")
+	if len(got) != 2 {
+		t.Fatalf("FindNodesByName(api) returned %d nodes, want both namespace-specific resources", len(got))
+	}
+	for _, namespace := range []string{"blue", "green"} {
+		id := "repo-a/k8s::Deployment::" + namespace + "::api"
+		if s.GetNode(id) == nil {
+			t.Errorf("GetNode(%q) = nil after adding a duplicate qual_name in the same repo", id)
+		}
 	}
 }
 

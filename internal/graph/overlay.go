@@ -390,23 +390,73 @@ func (v *OverlaidView) GetNodeByQualName(qualName string) *Node {
 	return n
 }
 
-// GetNodesByQualNames resolves each name through GetNodeByQualName so the
-// overlay's layer-first / shadowed-file filtering applies — an inherited
-// base batch would bypass the overlay. Per-name is fine: an interactive
-// overlay's working set is small (the batch form exists for the
-// cold-warmup scale on the base store, not here). Returns only hits.
-func (v *OverlaidView) GetNodesByQualNames(qualNames []string) map[string]*Node {
-	out := make(map[string]*Node, len(qualNames))
+type qualifiedNameBatchReader interface {
+	GetNodesByQualNames(qualNames []string) map[string][]*Node
+}
+
+// GetNodesByQualNames merges every overlay and surviving base candidate.
+// Overlay-covered base files stay hidden, and each result slice is deduplicated
+// and sorted by ID so resolver selection is backend-independent.
+func (v *OverlaidView) GetNodesByQualNames(qualNames []string) map[string][]*Node {
+	requested := make(map[string]struct{}, len(qualNames))
 	for _, q := range qualNames {
-		if q == "" {
-			continue
+		if q != "" {
+			requested[q] = struct{}{}
 		}
-		if _, done := out[q]; done {
-			continue
+	}
+	if len(requested) == 0 {
+		return nil
+	}
+
+	out := make(map[string][]*Node, len(requested))
+	seen := make(map[string]map[string]struct{}, len(requested))
+	add := func(n *Node) {
+		if n == nil {
+			return
 		}
-		if n := v.GetNodeByQualName(q); n != nil {
-			out[q] = n
+		if _, ok := requested[n.QualName]; !ok {
+			return
 		}
+		ids := seen[n.QualName]
+		if ids == nil {
+			ids = make(map[string]struct{})
+			seen[n.QualName] = ids
+		}
+		if _, exists := ids[n.ID]; exists {
+			return
+		}
+		ids[n.ID] = struct{}{}
+		out[n.QualName] = append(out[n.QualName], n)
+	}
+
+	if v.layer != nil {
+		for _, n := range v.layer.nodeByID {
+			add(n)
+		}
+	}
+	if v.base != nil {
+		var baseHits map[string][]*Node
+		if batch, ok := v.base.(qualifiedNameBatchReader); ok {
+			baseHits = batch.GetNodesByQualNames(qualNames)
+		} else {
+			baseHits = make(map[string][]*Node, len(requested))
+			for q := range requested {
+				if n := v.base.GetNodeByQualName(q); n != nil {
+					baseHits[q] = []*Node{n}
+				}
+			}
+		}
+		for _, hits := range baseHits {
+			for _, n := range hits {
+				if n != nil && v.layer != nil && v.layer.HasFile(IDFile(n.ID)) {
+					continue
+				}
+				add(n)
+			}
+		}
+	}
+	for q := range out {
+		sort.Slice(out[q], func(i, j int) bool { return out[q][i].ID < out[q][j].ID })
 	}
 	return out
 }

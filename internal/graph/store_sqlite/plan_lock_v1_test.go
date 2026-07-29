@@ -27,7 +27,7 @@ func TestSweepPlanLocks(t *testing.T) {
 			// bound parameter alone cannot be proven non-empty and the
 			// statement scans all nodes (measured on a production store).
 			name:   "get_node_by_qual",
-			query:  `SELECT ` + lookupNodeCols + ` FROM nodes WHERE qual_name = ? AND qual_name <> '' LIMIT 1`,
+			query:  `SELECT ` + lookupNodeCols + ` FROM nodes WHERE qual_name = ? AND qual_name <> '' ORDER BY id LIMIT 1`,
 			args:   1,
 			want:   []string{"nodes_by_qual (qual_name=?)"},
 			forbid: []string{"SCAN nodes"},

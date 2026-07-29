@@ -94,7 +94,7 @@ type CrossRepoResolver struct {
 	placeholderSrcIdx placeholderSourceIndex
 	nodesByName       map[string][]*graph.Node
 	nodesByNameRepo   map[string]map[string][]*graph.Node
-	nodesByQualName   map[string]*graph.Node
+	nodesByQualName   map[string][]*graph.Node
 	dirIndex          map[string][]*graph.Node
 	lastDirIndex      map[string][]*graph.Node
 	// reachableReposByFile maps a caller file's ID to the set of repo
@@ -262,37 +262,37 @@ func (cr *CrossRepoResolver) pickImportCandidate(callerWS, importPath string, ca
 	return nil
 }
 
-// pickQualNameCandidate enumerates every node that shares qualName and
-// returns the one in the caller's own workspace, else the first the
-// cross-workspace policy permits, else nil. The graph's qual-name index
-// is single-valued, so when the same module is checked out twice (a
-// canonical checkout plus a worktree instance under its own prefix) only
-// one node is reachable by qual name; the two share a Name, so the
-// multi-valued by-name index recovers the full candidate set. `single`
-// is the node the single-valued lookup already returned — used to learn
-// the shared Name without a second qual-name probe.
-func (cr *CrossRepoResolver) pickQualNameCandidate(callerWS, qualName string, single *graph.Node) *graph.Node {
-	if single == nil || single.Name == "" {
-		return nil
+// pickQualNameCandidate applies repository/workspace policy to the complete
+// qualified-name candidate set. The boolean reports an ambiguous eligible
+// foreign set, which must stay unresolved rather than bind by row order.
+func (cr *CrossRepoResolver) pickQualNameCandidate(callerRepo, callerWS, qualName string, candidates []*graph.Node) (*graph.Node, bool) {
+	if candidate := lowestIDQualNameCandidate(candidates, func(n *graph.Node) bool {
+		return n.RepoPrefix == callerRepo && candidateWorkspaceID(n) == callerWS
+	}); candidate != nil {
+		return candidate, false
 	}
-	all := cr.graph.FindNodesByNames([]string{single.Name})[single.Name]
-	var cands []*graph.Node
-	for _, c := range all {
-		if c != nil && c.QualName == qualName {
-			cands = append(cands, c)
+	if candidate := lowestIDQualNameCandidate(candidates, func(n *graph.Node) bool {
+		return n.RepoPrefix == callerRepo
+	}); candidate != nil {
+		return candidate, false
+	}
+	if candidate := lowestIDQualNameCandidate(candidates, func(n *graph.Node) bool {
+		return candidateWorkspaceID(n) == callerWS
+	}); candidate != nil {
+		return candidate, false
+	}
+
+	var eligible *graph.Node
+	for _, candidate := range candidates {
+		if candidate == nil || !cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(candidate), qualName) {
+			continue
 		}
-	}
-	for _, c := range cands {
-		if candidateWorkspaceID(c) == callerWS {
-			return c
+		if eligible != nil {
+			return nil, true
 		}
+		eligible = candidate
 	}
-	for _, c := range cands {
-		if cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(c), qualName) {
-			return c
-		}
-	}
-	return nil
+	return eligible, false
 }
 
 // ResolveAll resolves all unresolved edges in the graph, trying same-repo
@@ -795,8 +795,8 @@ func (cr *CrossRepoResolver) warmLookupCache(pending []*graph.Edge) {
 			nameSet[bare] = struct{}{}
 		}
 		// Import targets: mirror resolveEdge's dispatch (TrimPrefix of the
-		// bare unresolved:: form) so the seeded qual-name matches what
-		// resolveImport looks up via GetNodeByQualName.
+		// bare unresolved:: form) so the seeded name matches the complete
+		// qualified-name candidate lookup used by resolveImport.
 		if t := strings.TrimPrefix(e.To, unresolvedPrefix); strings.HasPrefix(t, "import::") {
 			if qn := strings.TrimPrefix(t, "import::"); qn != "" {
 				qualNameSet[qn] = struct{}{}
@@ -858,9 +858,8 @@ func (cr *CrossRepoResolver) warmLookupCache(pending []*graph.Edge) {
 		}
 		cr.nodesByNameRepo[name] = byRepo
 	}
-	// Pre-warm the import qual-name cache + authoritative negatives, so
-	// resolveImport's GetNodeByQualName hits instead of scanning the
-	// unindexed qual_name column per cross-repo import edge.
+	// Pre-warm every import qualified-name candidate plus authoritative
+	// negatives, avoiding one indexed store probe per cross-repo import edge.
 	if len(qualNameSet) > 0 {
 		qns := make([]string, 0, len(qualNameSet))
 		for q := range qualNameSet {
@@ -868,7 +867,7 @@ func (cr *CrossRepoResolver) warmLookupCache(pending []*graph.Edge) {
 		}
 		cr.nodesByQualName = cr.graph.GetNodesByQualNames(qns)
 		if cr.nodesByQualName == nil {
-			cr.nodesByQualName = make(map[string]*graph.Node, len(qualNameSet))
+			cr.nodesByQualName = make(map[string][]*graph.Node, len(qualNameSet))
 		}
 		for q := range qualNameSet {
 			if _, ok := cr.nodesByQualName[q]; !ok {
@@ -964,19 +963,18 @@ func (cr *CrossRepoResolver) cachedFindNodesByName(name string) []*graph.Node {
 	return cr.graph.FindNodesByName(name)
 }
 
-// cachedGetNodeByQualName serves resolveImport's qual-name lookup from the
-// per-pass cache (authoritative negative for queried-but-absent import
-// paths), mirroring Resolver.cachedGetNodeByQualName.
-func (cr *CrossRepoResolver) cachedGetNodeByQualName(qualName string) *graph.Node {
+// cachedFindNodesByQualName serves resolveImport's complete candidate lookup
+// from the per-pass cache, including authoritative negative slices.
+func (cr *CrossRepoResolver) cachedFindNodesByQualName(qualName string) []*graph.Node {
 	if qualName == "" {
 		return nil
 	}
 	if cr.nodesByQualName != nil {
-		if n, ok := cr.nodesByQualName[qualName]; ok {
-			return n
+		if nodes, ok := cr.nodesByQualName[qualName]; ok {
+			return nodes
 		}
 	}
-	return cr.graph.GetNodeByQualName(qualName)
+	return cr.graph.GetNodesByQualNames([]string{qualName})[qualName]
 }
 
 func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, batch *[]graph.EdgeReindex) {
@@ -1185,6 +1183,7 @@ func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string,
 func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, stats *CrossRepoStats) {
 	callerRepo := cr.callerRepoPrefix(e)
 	callerWS := cr.callerWorkspaceID(e)
+	ambiguousQualName := false
 
 	// npm-alias rewrite: see Resolver.resolveImport. Applied here too
 	// so a JS/TS import of an alias key resolves cross-repo to a
@@ -1209,18 +1208,11 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 		return
 	}
 
-	// Look for a package node with matching qualified name.
-	if node := cr.cachedGetNodeByQualName(importPath); node != nil {
-		picked := node
-		if !cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(picked), importPath) {
-			// The qual-name index is single-valued, so a same-module
-			// instance in the caller's own workspace (a worktree of the
-			// imported module, tracked under its own prefix) can be
-			// shadowed by a copy in another workspace. Enumerate every
-			// node sharing this qual name and prefer the caller's
-			// workspace before giving up.
-			picked = cr.pickQualNameCandidate(callerWS, importPath, node)
-		}
+	// Look at every package node with this qualified name. Exact caller repo,
+	// then caller workspace, wins before cross-workspace dependency policy is
+	// consulted; an eligible foreign row can no longer shadow a local worktree.
+	if candidates := cr.cachedFindNodesByQualName(importPath); len(candidates) > 0 {
+		picked, ambiguous := cr.pickQualNameCandidate(callerRepo, callerWS, importPath, candidates)
 		if picked != nil {
 			e.To = picked.ID
 			if isCrossRepoHop(callerRepo, picked.RepoPrefix) {
@@ -1231,9 +1223,9 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 			stats.Resolved++
 			return
 		}
-		// A qual-name hit with no workspace-eligible instance falls
-		// through to the directory-match scan below rather than bailing
-		// straight to external.
+		ambiguousQualName = ambiguous
+		// No unique policy-eligible candidate: retain directory/dependency
+		// evidence fallbacks below before deciding that the import is ambiguous.
 	}
 
 	// Look for file nodes whose directory matches the import path. Two
@@ -1348,18 +1340,26 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	// package node itself. See Resolver.resolveImport.
 	if npmAliased {
 		if pkg := npmPackagePrefix(importPath); pkg != "" {
-			if node := cr.cachedGetNodeByQualName(pkg); node != nil &&
-				cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(node), pkg) {
-				e.To = node.ID
-				if isCrossRepoHop(callerRepo, node.RepoPrefix) {
-					e.CrossRepo = true
-					stats.CrossRepoEdges++
-					stats.ByRepo[node.RepoPrefix]++
+			if candidates := cr.cachedFindNodesByQualName(pkg); len(candidates) > 0 {
+				node, ambiguous := cr.pickQualNameCandidate(callerRepo, callerWS, pkg, candidates)
+				if node != nil {
+					e.To = node.ID
+					if isCrossRepoHop(callerRepo, node.RepoPrefix) {
+						e.CrossRepo = true
+						stats.CrossRepoEdges++
+						stats.ByRepo[node.RepoPrefix]++
+					}
+					stats.Resolved++
+					return
 				}
-				stats.Resolved++
-				return
+				ambiguousQualName = ambiguousQualName || ambiguous
 			}
 		}
+	}
+
+	if ambiguousQualName {
+		stats.Unresolved++
+		return
 	}
 
 	// External/unresolvable import.

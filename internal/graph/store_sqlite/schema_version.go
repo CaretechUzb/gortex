@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 7
+const currentSchemaVersion = 8
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -72,6 +72,20 @@ var schemaMigrations = []schemaMigration{
 	// copy beside them. Purge the old population here — see the function
 	// for why in-place beats rebuild and why global externals survive.
 	{version: 7, name: "purge unprefixed solo-repo rows", inPlace: purgeUnprefixedRepoRows},
+	{version: 8, name: "allow duplicate qualified names", inPlace: relaxNodeQualNameUniqueness},
+}
+
+// relaxNodeQualNameUniqueness removes the historical assumption that a
+// language-level qualified name is a global graph identity. Resource manifests,
+// forks, worktrees and overload-like constructs may legitimately repeat one.
+// The replacement keeps the same name, key and partial predicate so existing
+// point and batch lookups retain their indexed plans.
+func relaxNodeQualNameUniqueness(tx *sql.Tx) error {
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS nodes_by_qual`); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`CREATE INDEX nodes_by_qual ON nodes(qual_name) WHERE qual_name <> ''`)
+	return err
 }
 
 // compactResolverEdgeIndexes removes the one-shot global Go receiver index and

@@ -9,7 +9,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-func TestGetNodesByQualNamesUsesUniquePartialIndexAndReopens(t *testing.T) {
+func TestGetNodesByQualNamesUsesPartialIndexAndReopens(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "qual-name.sqlite")
 	store, err := Open(path)
 	if err != nil {
@@ -39,18 +39,18 @@ func TestGetNodesByQualNamesUsesUniquePartialIndexAndReopens(t *testing.T) {
 		}
 	}
 
-	// Preserve the existing qualified-name quality contract: the partial
-	// index is UNIQUE for non-empty values, even though empty qual_names may
-	// repeat freely.
+	// Qualified names are lookup labels, not identities. Preserve both rows and
+	// keep the legacy singleton API deterministic by returning the smallest ID.
 	if _, err := store.writerDB.Exec(
 		`INSERT INTO nodes(id, kind, name, qual_name, file_path) VALUES (?, ?, ?, ?, ?)`,
 		"node::duplicate", graph.KindFunction, "Duplicate", "pkg.Alpha", "duplicate.go",
-	); err == nil {
-		t.Fatal("duplicate non-empty qual_name unexpectedly bypassed nodes_by_qual uniqueness")
+	); err != nil {
+		t.Fatalf("insert duplicate non-empty qual_name: %v", err)
 	}
 	if got := store.GetNodeByQualName("pkg.Alpha"); got == nil || got.ID != "node::alpha" {
-		t.Fatalf("failed duplicate insert changed original qualified-name owner: %#v", got)
+		t.Fatalf("GetNodeByQualName(pkg.Alpha) = %#v, want deterministic smallest ID", got)
 	}
+	assertQualNameCandidateIDs(t, store, "pkg.Alpha", "node::alpha", "node::duplicate")
 
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -61,6 +61,7 @@ func TestGetNodesByQualNamesUsesUniquePartialIndexAndReopens(t *testing.T) {
 	}
 	assertQualNameLookupPlan(t, store)
 	assertQualNameLookupParity(t, store)
+	assertQualNameCandidateIDs(t, store, "pkg.Alpha", "node::alpha", "node::duplicate")
 }
 
 func TestGetNodesByQualNamesSingleJSONBindHandles40001Names(t *testing.T) {
@@ -97,8 +98,9 @@ func TestGetNodesByQualNamesSingleJSONBindHandles40001Names(t *testing.T) {
 		"hit.middle": "node::middle",
 		"hit.last":   "node::last",
 	} {
-		if node := got[qualName]; node == nil || node.ID != wantID {
-			t.Fatalf("large lookup[%q] = %#v, want id %q", qualName, node, wantID)
+		nodes := got[qualName]
+		if len(nodes) != 1 || nodes[0] == nil || nodes[0].ID != wantID {
+			t.Fatalf("large lookup[%q] = %#v, want one node with id %q", qualName, nodes, wantID)
 		}
 	}
 }
@@ -118,7 +120,8 @@ func TestGetNodesByQualNamesFailsClosedOnDecodeQueryAndClosedStoreErrors(t *test
 	}
 
 	got := store.GetNodesByQualNames([]string{"bad.qual", "good.qual"})
-	if len(got) != 1 || got["good.qual"] == nil || got["good.qual"].ID != "node::good" {
+	good := got["good.qual"]
+	if len(got) != 1 || len(good) != 1 || good[0] == nil || good[0].ID != "node::good" {
 		t.Fatalf("decode failure should skip only the corrupt row, got %#v", got)
 	}
 	if got["bad.qual"] != nil {
@@ -186,8 +189,9 @@ func assertQualNameLookupParity(t *testing.T, store *Store) {
 		if want == nil {
 			t.Fatalf("individual lookup unexpectedly missed %q", qualName)
 		}
-		if node := got[qualName]; node == nil || node.ID != want.ID {
-			t.Fatalf("batch lookup[%q] = %#v, individual lookup = %#v", qualName, node, want)
+		nodes := got[qualName]
+		if len(nodes) == 0 || nodes[0] == nil || nodes[0].ID != want.ID {
+			t.Fatalf("batch lookup[%q] = %#v, individual lookup = %#v", qualName, nodes, want)
 		}
 	}
 	if _, exists := got["missing.qual"]; exists {
@@ -195,5 +199,18 @@ func assertQualNameLookupParity(t *testing.T, store *Store) {
 	}
 	if _, exists := got[""]; exists {
 		t.Fatal("batched lookup retained an empty qualified name")
+	}
+}
+
+func assertQualNameCandidateIDs(t *testing.T, store *Store, qualName string, wantIDs ...string) {
+	t.Helper()
+	nodes := store.GetNodesByQualNames([]string{qualName, qualName})[qualName]
+	if len(nodes) != len(wantIDs) {
+		t.Fatalf("qualified-name candidates for %q = %#v, want IDs %v", qualName, nodes, wantIDs)
+	}
+	for i, wantID := range wantIDs {
+		if nodes[i] == nil || nodes[i].ID != wantID {
+			t.Fatalf("qualified-name candidate %d for %q = %#v, want ID %q", i, qualName, nodes[i], wantID)
+		}
 	}
 }

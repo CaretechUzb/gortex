@@ -87,6 +87,87 @@ func TestResolveAll_ExternalImport(t *testing.T) {
 	assert.Equal(t, "external::fmt", importEdge.To)
 }
 
+func TestResolveAll_ImportQualNamePrefersCallerRepoAcrossDuplicates(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		reverse bool
+	}{
+		{name: "forward_insert"},
+		{name: "reverse_insert", reverse: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := graph.New()
+			const qualName = "github.com/acme/shared"
+
+			callerA := &graph.Node{ID: "a-repo/main.go", Kind: graph.KindFile, Name: "main.go", FilePath: "a-repo/main.go", Language: "go", RepoPrefix: "a-repo", WorkspaceID: "ws-a"}
+			callerZ := &graph.Node{ID: "z-repo/main.go", Kind: graph.KindFile, Name: "main.go", FilePath: "z-repo/main.go", Language: "go", RepoPrefix: "z-repo", WorkspaceID: "ws-z"}
+			pkgA := &graph.Node{ID: "a-repo/shared/pkg.go::shared", Kind: graph.KindPackage, Name: "shared", QualName: qualName, FilePath: "a-repo/shared/pkg.go", Language: "go", RepoPrefix: "a-repo", WorkspaceID: "ws-a"}
+			pkgZ := &graph.Node{ID: "z-repo/shared/pkg.go::shared", Kind: graph.KindPackage, Name: "shared", QualName: qualName, FilePath: "z-repo/shared/pkg.go", Language: "go", RepoPrefix: "z-repo", WorkspaceID: "ws-z"}
+
+			g.AddNode(callerA)
+			g.AddNode(callerZ)
+			packages := []*graph.Node{pkgA, pkgZ}
+			if tc.reverse {
+				packages[0], packages[1] = packages[1], packages[0]
+			}
+			for _, pkg := range packages {
+				g.AddNode(pkg)
+			}
+
+			edgeA := &graph.Edge{From: callerA.ID, To: "unresolved::import::" + qualName, Kind: graph.EdgeImports, FilePath: callerA.FilePath, Line: 3}
+			edgeZ := &graph.Edge{From: callerZ.ID, To: "unresolved::import::" + qualName, Kind: graph.EdgeImports, FilePath: callerZ.FilePath, Line: 3}
+			g.AddEdge(edgeA)
+			g.AddEdge(edgeZ)
+
+			stats := New(g).ResolveAll()
+
+			require.Equal(t, 2, stats.Resolved)
+			assert.Equal(t, pkgA.ID, edgeA.To)
+			assert.Equal(t, pkgZ.ID, edgeZ.To)
+			assert.False(t, edgeA.CrossRepo)
+			assert.False(t, edgeZ.CrossRepo)
+		})
+	}
+}
+
+func TestResolveAll_ImportQualNameLeavesEquivalentForeignCandidatesUnresolved(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		reverse bool
+	}{
+		{name: "forward_insert"},
+		{name: "reverse_insert", reverse: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := graph.New()
+			const qualName = "github.com/acme/shared"
+
+			caller := &graph.Node{ID: "consumer/main.go", Kind: graph.KindFile, Name: "main.go", FilePath: "consumer/main.go", Language: "go", RepoPrefix: "consumer", WorkspaceID: "consumer-ws"}
+			candidateA := &graph.Node{ID: "a-foreign/shared.go::shared", Kind: graph.KindPackage, Name: "shared", QualName: qualName, FilePath: "a-foreign/shared.go", Language: "go", RepoPrefix: "a-foreign", WorkspaceID: "foreign-ws"}
+			candidateZ := &graph.Node{ID: "z-foreign/shared.go::shared", Kind: graph.KindPackage, Name: "shared", QualName: qualName, FilePath: "z-foreign/shared.go", Language: "go", RepoPrefix: "z-foreign", WorkspaceID: "foreign-ws"}
+
+			g.AddNode(caller)
+			candidates := []*graph.Node{candidateA, candidateZ}
+			if tc.reverse {
+				candidates[0], candidates[1] = candidates[1], candidates[0]
+			}
+			for _, candidate := range candidates {
+				g.AddNode(candidate)
+			}
+
+			unresolvedID := "unresolved::import::" + qualName
+			edge := &graph.Edge{From: caller.ID, To: unresolvedID, Kind: graph.EdgeImports, FilePath: caller.FilePath, Line: 3}
+			g.AddEdge(edge)
+
+			stats := New(g).ResolveAll()
+
+			require.Equal(t, 0, stats.Resolved)
+			assert.Equal(t, unresolvedID, edge.To)
+			assert.False(t, edge.CrossRepo)
+		})
+	}
+}
+
 func TestResolveAll_MethodCall(t *testing.T) {
 	g := graph.New()
 	g.AddNode(&graph.Node{ID: "pkg/a.go", Kind: graph.KindFile, Name: "a.go", FilePath: "pkg/a.go", Language: "go"})

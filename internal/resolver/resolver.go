@@ -273,7 +273,7 @@ type Resolver struct {
 	missingNodeByID map[string]struct{}
 
 	nodesByName     map[string][]*graph.Node
-	nodesByQualName map[string]*graph.Node
+	nodesByQualName map[string][]*graph.Node
 	// nodesByRepoLanguageName is the authoritative per-pending-page cache for
 	// normal resolution. It is keyed by exact repository plus compatible source
 	// language family, so a Go call never materialises or examines Python
@@ -1695,9 +1695,9 @@ func (r *Resolver) warmLookupCacheWithSources(pending []*graph.Edge, sources map
 			idSet[e.From] = struct{}{}
 		}
 		// Import targets resolve by qualified name: resolveImport's first
-		// lookup is GetNodeByQualName(importPath), an unindexed scan per
-		// import edge on a disk backend. Seed the import path so it hits the
-		// qual-name cache (or its authoritative negative) instead.
+		// lookup needs every qualified-name candidate. Seed the import path so
+		// the disk backend performs one indexed batch probe and the workers hit
+		// the complete candidate cache (or its authoritative negative).
 		if t := graph.UnresolvedName(e.To); strings.HasPrefix(t, "import::") {
 			if qn := strings.TrimPrefix(t, "import::"); qn != "" {
 				qualNameSet[qn] = struct{}{}
@@ -1777,9 +1777,8 @@ func (r *Resolver) warmLookupCacheWithSources(pending []*graph.Edge, sources map
 	}
 	foldElapsed := time.Since(foldStart)
 	qualStart := time.Now()
-	// Pre-warm the import qual-name cache + record authoritative negatives,
-	// so resolveImport's GetNodeByQualName hits the cache instead of
-	// scanning the unindexed qual_name column once per import edge.
+	// Pre-warm the complete import qualified-name candidate cache and record
+	// authoritative negatives, avoiding one indexed store probe per edge.
 	if len(qualNameSet) > 0 {
 		qns := make([]string, 0, len(qualNameSet))
 		for q := range qualNameSet {
@@ -1787,7 +1786,7 @@ func (r *Resolver) warmLookupCacheWithSources(pending []*graph.Edge, sources map
 		}
 		r.nodesByQualName = r.graph.GetNodesByQualNames(qns)
 		if r.nodesByQualName == nil {
-			r.nodesByQualName = make(map[string]*graph.Node, len(qualNameSet))
+			r.nodesByQualName = make(map[string][]*graph.Node, len(qualNameSet))
 		}
 		for q := range qualNameSet {
 			if _, ok := r.nodesByQualName[q]; !ok {
@@ -1959,22 +1958,19 @@ func (r *Resolver) cachedFindNodesByName(name string) []*graph.Node {
 	return r.graph.FindNodesByName(name)
 }
 
-// cachedGetNodeByQualName serves resolveImport's qual-name lookup from the
-// per-pass cache. A pre-warmed qual_name with no node returns nil
-// (authoritative negative — most import paths have no matching package
-// node, and the unindexed per-edge GetNodeByQualName scan for them was a
-// cold-warmup compute storm); a qual_name absent from the cache falls
-// through to the store.
-func (r *Resolver) cachedGetNodeByQualName(qualName string) *graph.Node {
+// cachedFindNodesByQualName serves resolveImport's complete candidate lookup
+// from the per-pass cache. A present nil slice is an authoritative negative;
+// an absent key falls through to one indexed batch probe.
+func (r *Resolver) cachedFindNodesByQualName(qualName string) []*graph.Node {
 	if qualName == "" {
 		return nil
 	}
 	if r.nodesByQualName != nil {
-		if n, ok := r.nodesByQualName[qualName]; ok {
-			return n
+		if nodes, ok := r.nodesByQualName[qualName]; ok {
+			return nodes
 		}
 	}
-	return r.graph.GetNodeByQualName(qualName)
+	return r.graph.GetNodesByQualNames([]string{qualName})[qualName]
 }
 
 // cachedFindNodesByNameInRepo is the repo-scoped twin of
@@ -2992,6 +2988,8 @@ func pendingShapeSummary(pending []*graph.Edge) string {
 
 func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *ResolveStats) {
 	callerRepo := r.callerRepoPrefix(e)
+	callerWorkspace := r.callerWorkspaceID(e)
+	ambiguousQualName := false
 
 	// JS/TS relative + tsconfig-path-alias / baseUrl import: resolve the
 	// specifier onto the in-repo file (or exported symbol) it names. The
@@ -3059,15 +3057,20 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 		}
 	}
 
-	// Look for a package node with matching qualified name.
-	node := r.cachedGetNodeByQualName(importPath)
-	if node != nil {
-		e.To = node.ID
-		if callerRepo != "" && node.RepoPrefix != "" && node.RepoPrefix != callerRepo {
-			e.CrossRepo = true
+	// Look for every package node with this qualified name. The same import
+	// path may legitimately exist in several tracked repositories/workspaces;
+	// bind the caller-local instance instead of whichever row sorted first.
+	if candidates := r.cachedFindNodesByQualName(importPath); len(candidates) > 0 {
+		node, ambiguous := pickResolverQualNameCandidate(candidates, callerRepo, callerWorkspace)
+		if node != nil {
+			e.To = node.ID
+			if callerRepo != "" && node.RepoPrefix != "" && node.RepoPrefix != callerRepo {
+				e.CrossRepo = true
+			}
+			stats.Resolved++
+			return
 		}
-		stats.Resolved++
-		return
+		ambiguousQualName = ambiguous
 	}
 
 	// Inverted-index lookup instead of a per-edge AllNodes() scan —
@@ -3177,15 +3180,26 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// sub-module the importer reached for.
 	if npmAliased {
 		if pkg := npmPackagePrefix(importPath); pkg != "" {
-			if node := r.cachedGetNodeByQualName(pkg); node != nil {
-				e.To = node.ID
-				if callerRepo != "" && node.RepoPrefix != "" && node.RepoPrefix != callerRepo {
-					e.CrossRepo = true
+			if candidates := r.cachedFindNodesByQualName(pkg); len(candidates) > 0 {
+				node, ambiguous := pickResolverQualNameCandidate(candidates, callerRepo, callerWorkspace)
+				if node != nil {
+					e.To = node.ID
+					if callerRepo != "" && node.RepoPrefix != "" && node.RepoPrefix != callerRepo {
+						e.CrossRepo = true
+					}
+					stats.Resolved++
+					return
 				}
-				stats.Resolved++
-				return
+				ambiguousQualName = ambiguousQualName || ambiguous
 			}
 		}
+	}
+
+	// Several policy-equivalent qualified-name candidates are not evidence for
+	// an arbitrary edge. Leave the import pending for the cross-repository pass.
+	if ambiguousQualName {
+		stats.Unresolved++
+		return
 	}
 
 	// External/unresolvable import — create a stub target ID.
@@ -4753,4 +4767,17 @@ func (r *Resolver) callerRepoPrefix(e *graph.Edge) string {
 		return fromNode.RepoPrefix
 	}
 	return ""
+}
+
+// callerWorkspaceID returns the source workspace, falling back to its exact
+// repository prefix just like candidateWorkspaceID.
+func (r *Resolver) callerWorkspaceID(e *graph.Edge) string {
+	fromNode := r.cachedGetNode(e.From)
+	if fromNode == nil {
+		return ""
+	}
+	if fromNode.WorkspaceID != "" {
+		return fromNode.WorkspaceID
+	}
+	return fromNode.RepoPrefix
 }

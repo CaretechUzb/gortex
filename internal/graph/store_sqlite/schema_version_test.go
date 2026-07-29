@@ -247,11 +247,10 @@ func TestOpenV2RequiresTopologyIntegrityRebuild(t *testing.T) {
 	}
 }
 
-// TestOpenV6RepairsDuplicateQualNamesWithoutRebuild covers the release upgrade
-// failure from issue #278. Open repairs ambiguous qualified names before
-// schemaSQL creates nodes_by_qual, preserving every node and edge without
-// requiring destructive-rebuild authority.
-func TestOpenV6RepairsDuplicateQualNamesWithoutRebuild(t *testing.T) {
+// TestOpenWithoutQualIndexPreservesDuplicateQualNames covers legacy or damaged
+// stores whose qualified-name index is absent. Reopening recreates the lookup
+// index without rewriting valid duplicate identities or requiring a rebuild.
+func TestOpenWithoutQualIndexPreservesDuplicateQualNames(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
 	seed, err := Open(path)
 	if err != nil {
@@ -297,8 +296,8 @@ func TestOpenV6RepairsDuplicateQualNamesWithoutRebuild(t *testing.T) {
 	if err := repaired.db.QueryRow(`SELECT qual_name FROM nodes WHERE id = 'b'`).Scan(&bQual); err != nil {
 		t.Fatalf("read repaired duplicate: %v", err)
 	}
-	if aQual != "pkg.Run" || bQual != "" {
-		t.Fatalf("repaired qualified names = a:%q b:%q, want a:%q b:%q", aQual, bQual, "pkg.Run", "")
+	if aQual != "pkg.Run" || bQual != "pkg.Run" {
+		t.Fatalf("qualified names after reopen = a:%q b:%q, want both %q", aQual, bQual, "pkg.Run")
 	}
 	var uniqueIndex int
 	if err := repaired.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'nodes_by_qual'`).Scan(&uniqueIndex); err != nil || uniqueIndex != 1 {
@@ -315,6 +314,62 @@ func TestOpenV6RepairsDuplicateQualNamesWithoutRebuild(t *testing.T) {
 	defer reopened.Close()
 	if n := nodeCount(t, reopened.db); n != 2 {
 		t.Fatalf("node count after warm reopen = %d, want 2", n)
+	}
+}
+
+func TestOpenV7RelaxesQualNameUniquenessInPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	seed, err := Open(path)
+	if err != nil {
+		t.Fatalf("create current store: %v", err)
+	}
+	if _, err := seed.writerDB.Exec(`INSERT INTO nodes
+		(id, kind, name, qual_name, file_path, repo_prefix)
+		VALUES ('repo-a/k8s::ClusterRole::_default::prometheus', 'resource', 'prometheus',
+		        'ClusterRole/prometheus', 'repo-a/deploy/rbac.yaml', 'repo-a')`); err != nil {
+		t.Fatalf("seed first resource: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`DROP INDEX nodes_by_qual`); err != nil {
+			t.Fatalf("drop current qualified-name index: %v", err)
+		}
+		if _, err := db.Exec(`CREATE UNIQUE INDEX nodes_by_qual ON nodes(qual_name) WHERE qual_name <> ''`); err != nil {
+			t.Fatalf("restore v7 qualified-name index: %v", err)
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 7`); err != nil {
+			t.Fatalf("stamp v7: %v", err)
+		}
+	})
+
+	migrated, err := Open(path)
+	if err != nil {
+		t.Fatalf("open v7 store: %v", err)
+	}
+	defer migrated.Close()
+	if migrated.NeedsRebuild() {
+		t.Fatal("qualified-name index migration unexpectedly requested a rebuild")
+	}
+	if _, err := migrated.writerDB.Exec(`INSERT INTO nodes
+		(id, kind, name, qual_name, file_path, repo_prefix)
+		VALUES ('repo-b/k8s::ClusterRole::_default::prometheus', 'resource', 'prometheus',
+		        'ClusterRole/prometheus', 'repo-b/manifests/roles.yaml', 'repo-b')`); err != nil {
+		t.Fatalf("insert duplicate qualified name after v7 migration: %v", err)
+	}
+
+	var duplicates int
+	if err := migrated.db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE qual_name = 'ClusterRole/prometheus'`).Scan(&duplicates); err != nil || duplicates != 2 {
+		t.Fatalf("duplicate qualified-name rows = %d (err %v), want 2", duplicates, err)
+	}
+	var unique int
+	if err := migrated.db.QueryRow(`SELECT "unique" FROM pragma_index_list('nodes') WHERE name = 'nodes_by_qual'`).Scan(&unique); err != nil || unique != 0 {
+		t.Fatalf("nodes_by_qual unique flag = %d (err %v), want 0", unique, err)
+	}
+	if version, err := readUserVersion(migrated.db); err != nil || version != currentSchemaVersion {
+		t.Fatalf("migrated user_version = %d (err %v), want %d", version, err, currentSchemaVersion)
 	}
 }
 

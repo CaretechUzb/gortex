@@ -2975,29 +2975,35 @@ func (g *Graph) GetNodeByQualName(qualName string) *Node {
 	return nil
 }
 
-// GetNodesByQualNames is the batch form of GetNodeByQualName — returns
-// only the qual_names that have a node (an absent key means "no node").
-// The in-memory byQual index makes each lookup O(1); the method exists
-// for Store-interface parity with the disk backend, where it collapses
-// N per-edge qual_name scans into a single IN-scan.
-func (g *Graph) GetNodesByQualNames(qualNames []string) map[string]*Node {
-	out := make(map[string]*Node, len(qualNames))
+// GetNodesByQualNames is the multi-valued batch form of
+// GetNodeByQualName. It scans each shard's canonical node map once because the
+// legacy byQual point index is intentionally single-valued and cannot represent
+// valid duplicate qualified names. Missing and empty names are absent.
+func (g *Graph) GetNodesByQualNames(qualNames []string) map[string][]*Node {
+	requested := make(map[string]struct{}, len(qualNames))
 	for _, q := range qualNames {
-		if q == "" {
-			continue
+		if q != "" {
+			requested[q] = struct{}{}
 		}
-		if _, done := out[q]; done {
-			continue
-		}
-		for _, s := range g.shards {
-			s.mu.RLock()
-			n, ok := s.byQual[q]
-			s.mu.RUnlock()
-			if ok {
-				out[q] = n
-				break
+	}
+	if len(requested) == 0 {
+		return nil
+	}
+
+	out := make(map[string][]*Node, len(requested))
+	for _, s := range g.shards {
+		s.mu.RLock()
+		for _, n := range s.nodes {
+			if n != nil {
+				if _, ok := requested[n.QualName]; ok {
+					out[n.QualName] = append(out[n.QualName], n)
+				}
 			}
 		}
+		s.mu.RUnlock()
+	}
+	for q := range out {
+		sort.Slice(out[q], func(i, j int) bool { return out[q][i].ID < out[q][j].ID })
 	}
 	return out
 }

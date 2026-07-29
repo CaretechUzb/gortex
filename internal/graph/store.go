@@ -152,14 +152,12 @@ type Store interface {
 	GetNode(id string) *Node
 	GetNodeByQualName(qualName string) *Node
 
-	// GetNodesByQualNames returns a map qualName→*Node (first match per
-	// qual_name) for the whole batch — the qual-name twin of
-	// FindNodesByNames. It pre-warms the resolver's import resolution so
-	// per-edge point lookups become one batched probe; both the batch and
-	// the point lookup ride the partial nodes_by_qual index (their SQL
-	// restates the index predicate literally, which is what makes a
-	// partial index usable against bound parameters).
-	GetNodesByQualNames(qualNames []string) map[string]*Node
+	// GetNodesByQualNames returns every node for each requested qualified
+	// name. Qualified names are lookup labels rather than global identities,
+	// so callers that need one target must disambiguate the candidate slice by
+	// repository/workspace context. Candidate order is deterministic by node ID.
+	// The batch pre-warms import resolution with one indexed store probe.
+	GetNodesByQualNames(qualNames []string) map[string][]*Node
 
 	// --- Name + scope queries --------------------------------------
 
