@@ -122,7 +122,7 @@ func init() {
 	daemonStartCmd.Flags().StringVar(&daemonEmbeddingsModel, "embeddings-model", "",
 		"embedding model for --embeddings-url (default: auto-detect — text-embedding-3-small for OpenAI, nomic-embed-text for Ollama)")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPAddr, "http-addr", "",
-		"also expose the session-bearing MCP Streamable HTTP transport on this TCP address (e.g. 127.0.0.1:7411); empty disables")
+		"also expose the MCP 2026 Streamable HTTP transport on this TCP address (e.g. 127.0.0.1:7411); empty disables")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPAuthToken, "http-auth-token", "",
 		"bearer token required on every Streamable HTTP request (default: read $GORTEX_DAEMON_HTTP_TOKEN; empty allows unauthenticated localhost binds)")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPCORSOrigin, "cors-origin", "*",
@@ -353,7 +353,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// files, leaving the REST surface short of the former `gortex server`.
 	var v1EventHub *hub.Hub
 
-	// Optional session-bearing MCP Streamable HTTP transport. Off by default
+	// Optional MCP 2026 Streamable HTTP transport. Off by default
 	// (--http-addr unset) so a fresh `gortex daemon start` keeps
 	// the unix-socket-only behaviour every existing client already
 	// expects. When set, the daemon mounts /mcp on the supplied

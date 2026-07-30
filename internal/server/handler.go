@@ -62,7 +62,7 @@ type Handler struct {
 	overlays      *daemon.OverlayManager // nil when overlay support is off
 	router        *daemon.Router         // nil when single-server (no servers.toml)
 	decision      *daemon.ProxyDecision  // shared peek→route→outcome helper; nil until SetRouter
-	streamable    *streamable.Transport  // nil when the session-bearing MCP HTTP path is off
+	streamable    *streamable.Transport  // nil when the MCP 2026 Streamable HTTP path is off
 	readOnly      bool                   // self-advertised /v1/health write posture
 	capabilities  []string               // self-advertised federation caps; nil => baseline
 
@@ -196,7 +196,7 @@ func (h *Handler) SetRouter(r *daemon.Router) {
 // /v1/tools/* surface and the new /mcp Streamable HTTP transport.
 func (h *Handler) Router() *daemon.Router { return h.router }
 
-// SetStreamableTransport wires the session-bearing MCP Streamable HTTP transport
+// SetStreamableTransport wires the MCP 2026 Streamable HTTP transport
 // onto /mcp (POST/GET/DELETE). The same Handler still serves the
 // legacy /v1/tools/<name> shape so existing clients keep working;
 // new clients negotiate the stateless transport on the canonical

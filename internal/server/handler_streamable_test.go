@@ -46,7 +46,7 @@ func TestHandler_StreamableTransportMountedOnMCP(t *testing.T) {
 		"id":      1,
 		"method":  "initialize",
 		"params": map[string]any{
-			"protocolVersion": streamable.DefaultProtocolVersion,
+			"protocolVersion": "2026-03-26",
 			"capabilities":    map[string]any{},
 			"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
 		},

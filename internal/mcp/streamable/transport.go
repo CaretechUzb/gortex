@@ -19,22 +19,21 @@ import (
 	"go.uber.org/zap"
 )
 
-// Header names defined by the session-bearing MCP Streamable HTTP transport
-// through protocol version 2025-11-25.
+// Header names defined by the MCP 2026 Streamable HTTP transport spec.
 // They are case-insensitive on the wire (Go's net/http handles that)
 // but are spelled here in the spec's canonical form so log output
 // stays grep-friendly.
 const (
 	HeaderSessionID       = "Mcp-Session-Id"
 	HeaderProtocolVersion = "Mcp-Protocol-Version"
-
-	errCodeSessionNotFound = -32001
 )
 
-// DefaultProtocolVersion follows the protocol revision implemented by the
-// compiled mcp-go dependency. mcp-go v0.57.0 implements released MCP
-// 2025-11-25, the latest revision with protocol-level HTTP sessions.
-const DefaultProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+// DefaultProtocolVersion is what the transport advertises in
+// `Mcp-Protocol-Version` when the client did not pin a version on the
+// initialize call. Bumped in lockstep with the underlying mcp-go
+// library — the 2026-03-26 spec is the current stable line, the
+// June-2026 spec will move it forward.
+const DefaultProtocolVersion = "2026-03-26"
 
 // Dispatcher is implemented by the in-process MCP server (and the
 // daemon's router-aware shim) to turn a JSON-RPC frame into a
@@ -130,9 +129,8 @@ type Config struct {
 // clientInfo carried in an initialize frame.
 type InitializeHook func(ctx context.Context, state *SessionState)
 
-// Transport is an http.Handler exposing a single POST/GET/DELETE endpoint
-// speaking the session-bearing MCP Streamable HTTP wire format through
-// protocol version 2025-11-25. One
+// Transport is an http.Handler exposing a single POST/GET/DELETE
+// endpoint speaking the MCP 2026 Streamable HTTP wire format. One
 // instance is safe to share across goroutines; the SessionStore is
 // the only shared mutable state and is itself goroutine-safe by
 // contract.
@@ -205,9 +203,9 @@ func New(cfg Config) *Transport {
 // surface.
 func (t *Transport) Store() SessionStore { return t.store }
 
-// ServeHTTP implements http.Handler. Gortex supports all three verbs used by
-// the session-bearing transport at the same path; routes split by method to
-// keep the dispatch logic in dedicated helpers.
+// ServeHTTP implements http.Handler. The spec mandates that the
+// transport surface ALL three verbs at the same path; routes split by
+// method to keep the dispatch logic in dedicated helpers.
 func (t *Transport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
@@ -294,7 +292,36 @@ func (t *Transport) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	replies := t.dispatchFrames(r, &state, sessionID, frames)
+	// Dispatch each frame in order and collect replies. We never
+	// fan-out across goroutines: JSON-RPC ordering matters when
+	// notifications mutate session state mid-batch.
+	replies := make([]json.RawMessage, 0, len(frames))
+	for _, frame := range frames {
+		replyBytes, status, err := t.dispatchFrame(r, &state, frame)
+		if err != nil {
+			t.logger.Warn("streamable: dispatch failed",
+				zap.String("session_id", sessionID), zap.Error(err))
+			id, _ := peekJSONRPCID(frame)
+			replyBytes = jsonRPCErrorBytes(id, -32603, err.Error())
+		}
+		if status != 0 && status != http.StatusOK {
+			// A remote upstream returned a non-2xx; surface that
+			// to the client as a JSON-RPC error frame so the
+			// batch shape stays intact.
+			if len(replyBytes) == 0 {
+				id, _ := peekJSONRPCID(frame)
+				replyBytes = jsonRPCErrorBytes(id, -32603,
+					fmt.Sprintf("upstream status %d", status))
+			}
+		}
+		if len(replyBytes) == 0 {
+			// Notifications have no reply; the frame still
+			// counts so a batch retains its slot ordering on
+			// the response side via skip semantics.
+			continue
+		}
+		replies = append(replies, replyBytes)
+	}
 
 	// Echo the known session id on successful responses. The specification
 	// assigns it during initialize; preserving it here also matches Gortex's
@@ -319,36 +346,6 @@ func (t *Transport) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 	_, _ = w.Write(replies[0])
 	_, _ = w.Write([]byte("\n"))
-}
-
-// dispatchFrames executes one POST's frames in order and normalizes dispatcher
-// and router failures into JSON-RPC replies. It stays sequential because
-// notifications may mutate session state between batch entries.
-func (t *Transport) dispatchFrames(r *http.Request, state *SessionState, sessionID string, frames [][]byte) []json.RawMessage {
-	replies := make([]json.RawMessage, 0, len(frames))
-	for _, frame := range frames {
-		replyBytes, status, err := t.dispatchFrame(r, state, frame)
-		if err != nil {
-			t.logger.Warn("streamable: dispatch failed",
-				zap.String("session_id", sessionID), zap.Error(err))
-			if id, hasID := peekJSONRPCRequestID(frame); hasID {
-				replyBytes = jsonRPCErrorBytes(id, -32603, "internal error")
-			} else {
-				replyBytes = nil
-			}
-		}
-		if status != 0 && status != http.StatusOK && len(replyBytes) == 0 {
-			// Preserve the JSON-RPC batch boundary for upstream HTTP errors.
-			if id, hasID := peekJSONRPCRequestID(frame); hasID {
-				replyBytes = jsonRPCErrorBytes(id, -32603,
-					fmt.Sprintf("upstream status %d", status))
-			}
-		}
-		if len(replyBytes) != 0 {
-			replies = append(replies, replyBytes)
-		}
-	}
-	return replies
 }
 
 // dispatchFrame runs the Router / InitializeHook / Dispatcher chain
@@ -500,10 +497,7 @@ func (t *Transport) tryRouteToolCall(r *http.Request, state SessionState, frame 
 	// The router returned an /v1/tools/<name>-shaped response;
 	// translate it into a JSON-RPC `result` frame so the client
 	// sees the same envelope every other tool/call produces.
-	id, hasID := peekJSONRPCRequestID(frame)
-	if !hasID {
-		return nil, status, true
-	}
+	id, _ := peekJSONRPCID(frame)
 	wrapped := wrapToolResultAsJSONRPC(id, out, status)
 	return wrapped, status, true
 }
@@ -564,10 +558,10 @@ func (t *Transport) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleDelete implements Gortex's session-termination verb. It is idempotent:
-// deleting an unknown session returns 204 just like deleting a known one. The
-// transport also tears down any in-flight SSE stream so the client's GET
-// unblocks immediately.
+// handleDelete is the spec's session-termination verb. Idempotent —
+// deleting an unknown session returns 204 just like deleting a known
+// one. The transport also tears down any in-flight SSE stream so the
+// client's GET unblocks immediately.
 func (t *Transport) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if !t.originAllowed(r) {
 		http.Error(w, "origin not allowed", http.StatusForbidden)
@@ -667,9 +661,6 @@ func splitJSONRPC(body []byte) ([][]byte, bool, error) {
 	}
 	switch trimmed[0] {
 	case '{':
-		if !json.Valid(body) {
-			return nil, false, errors.New("parse object: invalid JSON")
-		}
 		return [][]byte{body}, false, nil
 	case '[':
 		var raw []json.RawMessage
@@ -714,32 +705,37 @@ func peekJSONRPCMethod(frame []byte) (string, bool) {
 	return env.Method, env.Method != ""
 }
 
-// peekJSONRPCRequestID extracts the raw id from a JSON-RPC request. Responses
-// also carry ids but must not receive correlated error responses.
-func peekJSONRPCRequestID(frame []byte) (json.RawMessage, bool) {
+// peekJSONRPCID extracts the `id` raw value (number, string, or
+// null) from a frame so error responses can echo it back unchanged.
+func peekJSONRPCID(frame []byte) (json.RawMessage, bool) {
 	var env struct {
-		ID     json.RawMessage `json:"id"`
-		Method string          `json:"method"`
+		ID json.RawMessage `json:"id"`
 	}
 	if err := json.Unmarshal(frame, &env); err != nil {
 		return nil, false
 	}
-	if env.Method == "" || len(env.ID) == 0 {
+	if len(env.ID) == 0 {
 		return nil, false
 	}
 	return env.ID, true
+}
+
+// peekJSONRPCRequestID extracts the raw id from a JSON-RPC request. Responses
+// also carry ids but must not receive correlated session errors.
+func peekJSONRPCRequestID(frame []byte) (json.RawMessage, bool) {
+	if _, ok := peekJSONRPCMethod(frame); !ok {
+		return nil, false
+	}
+	return peekJSONRPCID(frame)
 }
 
 // jsonRPCErrorBytes returns a marshalled JSON-RPC 2.0 error envelope
 // suitable for inclusion in a batch reply. The id may be nil for
 // requests where parsing failed before the id could be recovered.
 func jsonRPCErrorBytes(id json.RawMessage, code int, message string) []byte {
-	if len(id) == 0 {
-		id = json.RawMessage("null")
-	}
 	env := struct {
 		JSONRPC string          `json:"jsonrpc"`
-		ID      json.RawMessage `json:"id"`
+		ID      json.RawMessage `json:"id,omitempty"`
 		Error   struct {
 			Code    int    `json:"code"`
 			Message string `json:"message"`
@@ -776,7 +772,7 @@ func writeSessionNotFound(w http.ResponseWriter, sessionID string, frames [][]by
 		if !ok {
 			continue
 		}
-		replies = append(replies, jsonRPCErrorBytes(id, errCodeSessionNotFound, message))
+		replies = append(replies, jsonRPCErrorBytes(id, -32001, message))
 	}
 
 	if len(replies) == 0 {

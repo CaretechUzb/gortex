@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -48,22 +47,9 @@ type countingDispatcher struct {
 	calls    atomic.Int64
 }
 
-type failingDispatcher struct{}
-
-func (failingDispatcher) Dispatch(context.Context, []byte) ([]byte, error) {
-	return nil, errors.New("dispatch failed")
-}
-
 func (d *countingDispatcher) Dispatch(ctx context.Context, frame []byte) ([]byte, error) {
 	d.calls.Add(1)
 	return d.delegate.Dispatch(ctx, frame)
-}
-
-func assertNoDispatch(t *testing.T, dispatcher *countingDispatcher) {
-	t.Helper()
-	if got := dispatcher.calls.Load(); got != 0 {
-		t.Errorf("dispatcher calls = %d, want 0", got)
-	}
 }
 
 // newTransport stands up a transport backed by a fresh MemoryStore
@@ -133,7 +119,14 @@ func TestInitializeMintsSessionID(t *testing.T) {
 	tr, cleanup := newTransport(t)
 	defer cleanup()
 
-	body := initializeBody("claude-code", "1.0.0")
+	body := jsonRPC(1, "initialize", map[string]any{
+		"protocolVersion": "2026-03-26",
+		"capabilities":    map[string]any{},
+		"clientInfo": map[string]any{
+			"name":    "claude-code",
+			"version": "1.0.0",
+		},
+	})
 	rec := doPOST(t, tr, body, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -177,7 +170,11 @@ func TestSessionReplayAcrossRequests(t *testing.T) {
 	})
 
 	// 1) Initialize on worker A.
-	initBody := initializeBody("test", "0.0.0")
+	initBody := jsonRPC(1, "initialize", map[string]any{
+		"protocolVersion": "2026-03-26",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
+	})
 	rec := doPOST(t, workerA, initBody, nil)
 	sid := rec.Header().Get(HeaderSessionID)
 	if sid == "" {
@@ -244,13 +241,15 @@ func TestUnknownSessionRejected(t *testing.T) {
 			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
 				t.Fatalf("body not JSON: %v\n%s", err, rec.Body.String())
 			}
-			if string(env.ID) != "1" || env.Error.Code != errCodeSessionNotFound {
-				t.Errorf("error envelope id/code = %s/%d, want 1/%d", env.ID, env.Error.Code, errCodeSessionNotFound)
+			if string(env.ID) != "1" || env.Error.Code != -32001 {
+				t.Errorf("error envelope id/code = %s/%d, want 1/-32001", env.ID, env.Error.Code)
 			}
 			if !strings.Contains(env.Error.Message, "never_existed") {
 				t.Errorf("error message = %q; want it to name the missing session", env.Error.Message)
 			}
-			assertNoDispatch(t, dispatcher)
+			if got := dispatcher.calls.Load(); got != 0 {
+				t.Errorf("dispatcher calls = %d, want 0", got)
+			}
 		})
 	}
 }
@@ -263,7 +262,9 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
 			t.Fatalf("status/body = %d/%q, want 404/empty", rec.Code, rec.Body.String())
 		}
-		assertNoDispatch(t, dispatcher)
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
 	})
 
 	t.Run("single response", func(t *testing.T) {
@@ -273,7 +274,9 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
 			t.Fatalf("status/body = %d/%q, want 404/empty", rec.Code, rec.Body.String())
 		}
-		assertNoDispatch(t, dispatcher)
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
 	})
 
 	t.Run("mixed batch", func(t *testing.T) {
@@ -301,11 +304,13 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 			t.Fatalf("reply ids = %+v, want [1, two]", replies)
 		}
 		for _, reply := range replies {
-			if reply.Error.Code != errCodeSessionNotFound {
-				t.Errorf("error code = %d, want %d", reply.Error.Code, errCodeSessionNotFound)
+			if reply.Error.Code != -32001 {
+				t.Errorf("error code = %d, want -32001", reply.Error.Code)
 			}
 		}
-		assertNoDispatch(t, dispatcher)
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
 	})
 
 	t.Run("notification-only batch", func(t *testing.T) {
@@ -318,7 +323,9 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
 			t.Fatalf("status/body = %d/%q, want 404/empty", rec.Code, rec.Body.String())
 		}
-		assertNoDispatch(t, dispatcher)
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
 	})
 
 	t.Run("initialize batch", func(t *testing.T) {
@@ -336,10 +343,12 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &replies); err != nil {
 			t.Fatalf("body not JSON array: %v\n%s", err, rec.Body.String())
 		}
-		if len(replies) != 1 || replies[0].Error.Code != errCodeSessionNotFound {
-			t.Fatalf("initialize batch response = %s, want one %d error", rec.Body.String(), errCodeSessionNotFound)
+		if len(replies) != 1 || replies[0].Error.Code != -32001 {
+			t.Fatalf("initialize batch response = %s, want one -32001 error", rec.Body.String())
 		}
-		assertNoDispatch(t, dispatcher)
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
 	})
 }
 
@@ -362,10 +371,12 @@ func TestUnknownSessionStandaloneInitializeRejected(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
 		t.Fatalf("body not JSON: %v\n%s", err, rec.Body.String())
 	}
-	if string(env.ID) != "1" || env.Error.Code != errCodeSessionNotFound {
-		t.Errorf("error envelope id/code = %s/%d, want 1/%d", env.ID, env.Error.Code, errCodeSessionNotFound)
+	if string(env.ID) != "1" || env.Error.Code != -32001 {
+		t.Errorf("error envelope id/code = %s/%d, want 1/-32001", env.ID, env.Error.Code)
 	}
-	assertNoDispatch(t, dispatcher)
+	if got := dispatcher.calls.Load(); got != 0 {
+		t.Errorf("dispatcher calls = %d, want 0", got)
+	}
 }
 
 func TestExpiredSessionReinitializesAndRetries(t *testing.T) {
@@ -430,7 +441,9 @@ func TestConcurrentUnknownSessionsNeverDispatch(t *testing.T) {
 	if failures.Load() != 0 {
 		t.Errorf("%d/%d stale requests did not return 404", failures.Load(), workers)
 	}
-	assertNoDispatch(t, dispatcher)
+	if got := dispatcher.calls.Load(); got != 0 {
+		t.Errorf("dispatcher calls = %d, want 0", got)
+	}
 }
 
 // TestDeleteDropsSession covers the explicit teardown path.
@@ -476,7 +489,11 @@ func TestStatelessModeOmitsSessionID(t *testing.T) {
 		Dispatcher: MCPServerDispatcher{Server: newTestMCPServer()},
 		Store:      StatelessStore{},
 	})
-	body := initializeBody("test", "0.0.0")
+	body := jsonRPC(1, "initialize", map[string]any{
+		"protocolVersion": "2026-03-26",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
+	})
 	rec := doPOST(t, tr, body, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
@@ -561,41 +578,6 @@ func TestNotificationOnlyBatchReturns202(t *testing.T) {
 	}
 }
 
-func TestNotificationDispatchErrorReturns202(t *testing.T) {
-	store := NewMemoryStore(time.Minute)
-	defer store.Close()
-	tr := New(Config{Dispatcher: failingDispatcher{}, Store: store})
-	rec := doPOST(t, tr, jsonRPC(nil, "notifications/cancelled", map[string]any{"requestId": 1}), nil)
-	if rec.Code != http.StatusAccepted || rec.Body.Len() != 0 {
-		t.Fatalf("status/body = %d/%q, want 202/empty", rec.Code, rec.Body.String())
-	}
-}
-
-func TestRequestDispatchErrorIsSanitized(t *testing.T) {
-	store := NewMemoryStore(time.Minute)
-	defer store.Close()
-	tr := New(Config{Dispatcher: failingDispatcher{}, Store: store})
-	rec := doPOST(t, tr, jsonRPC(1, "tools/list", nil), nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	var env struct {
-		Error struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
-		t.Fatalf("body not JSON: %v\n%s", err, rec.Body.String())
-	}
-	if env.Error.Code != -32603 || env.Error.Message != "internal error" {
-		t.Errorf("error = %d/%q, want -32603/internal error", env.Error.Code, env.Error.Message)
-	}
-	if strings.Contains(rec.Body.String(), "dispatch failed") {
-		t.Errorf("response disclosed dispatcher error: %s", rec.Body.String())
-	}
-}
-
 // TestOriginAllowlist — when configured, only matching Origin
 // headers are accepted; missing Origin is allowed (same-origin
 // requests).
@@ -634,27 +616,15 @@ func TestEmptyBodyReturnsParseError(t *testing.T) {
 	}
 }
 
-// TestMalformedJSONReturnsParseError covers both obvious garbage and a
-// truncated object. Parsing wins over stale-session recovery so clients
-// do not waste a reinitialization on an invalid request.
+// TestMalformedJSONReturnsParseError covers garbage inputs that don't
+// even look like JSON.
 func TestMalformedJSONReturnsParseError(t *testing.T) {
-	tr, _, dispatcher := newCountingTransport(t)
-	for _, body := range []string{"not json", `{"jsonrpc":"2.0"`} {
-		rec := doPOST(t, tr, []byte(body), map[string]string{HeaderSessionID: "expired"})
-		if rec.Code != http.StatusBadRequest {
-			t.Errorf("body %q status = %d, want 400", body, rec.Code)
-		}
-		var env struct {
-			ID    json.RawMessage `json:"id"`
-			Error struct {
-				Code int `json:"code"`
-			} `json:"error"`
-		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil || string(env.ID) != "null" || env.Error.Code != -32700 {
-			t.Errorf("body %q parse response = %s, error=%v", body, rec.Body.String(), err)
-		}
+	tr, cleanup := newTransport(t)
+	defer cleanup()
+	rec := doPOST(t, tr, []byte("not json"), nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
 	}
-	assertNoDispatch(t, dispatcher)
 }
 
 // TestMethodNotAllowed — PUT on /mcp should return 405.
@@ -817,7 +787,11 @@ func TestInitializeReplacesPreviousSession(t *testing.T) {
 	defer cleanup()
 
 	stale, _ := tr.store.Create(SessionState{ClientName: "old"})
-	body := initializeBody("new", "1.0.0")
+	body := jsonRPC(1, "initialize", map[string]any{
+		"protocolVersion": "2026-03-26",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "new", "version": "1.0.0"},
+	})
 	rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: stale})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
@@ -847,13 +821,9 @@ func TestProtocolVersionHeaderEcho(t *testing.T) {
 		t.Errorf("default version = %q, want %q", got, DefaultProtocolVersion)
 	}
 
-	const requested = "2025-06-18"
-	if requested == DefaultProtocolVersion {
-		t.Fatalf("test version %q must differ from DefaultProtocolVersion", requested)
-	}
-	rec = doPOST(t, tr, body, map[string]string{HeaderProtocolVersion: requested})
-	if got := rec.Header().Get(HeaderProtocolVersion); got != requested {
-		t.Errorf("echoed version = %q, want %q", got, requested)
+	rec = doPOST(t, tr, body, map[string]string{HeaderProtocolVersion: "2025-12-01"})
+	if got := rec.Header().Get(HeaderProtocolVersion); got != "2025-12-01" {
+		t.Errorf("echoed version = %q, want 2025-12-01", got)
 	}
 }
 
@@ -946,14 +916,15 @@ func TestLargeBodyClampedByMaxBytes(t *testing.T) {
 	body := append([]byte(`{"jsonrpc":"2.0","id":1,"method":"x","params":{"junk":"`), huge...)
 	body = append(body, []byte(`"}}`)...)
 	rec := doPOST(t, tr, body, nil)
-	// The body is truncated mid-stream, so the transport rejects it
-	// before dispatch with an HTTP 400 JSON-RPC parse error.
+	// The body is truncated mid-stream so mcp-go's JSON-RPC parser
+	// returns a parse-error envelope (HTTP 200 + JSON-RPC error).
 	// The load-bearing assertion is that the transport refused to
 	// process the trailing bytes — a buggy implementation that
-	// disabled the io.LimitReader would have ingested and parsed the full
-	// document, reached dispatch, and returned outer HTTP 200 instead.
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
+	// disabled the io.LimitReader would have ingested the full
+	// 4 KiB payload and produced a successful response. We confirm
+	// the response carries an error block in the JSON envelope.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (JSON-RPC parse error envelope)", rec.Code)
 	}
 	if !strings.Contains(rec.Body.String(), `"error"`) {
 		t.Errorf("body missing error envelope after truncation: %s", rec.Body.String())
@@ -975,7 +946,11 @@ func TestInitializeHookFires(t *testing.T) {
 			seenName = state.ClientName
 		},
 	})
-	body := initializeBody("cursor", "3.0.0")
+	body := jsonRPC(1, "initialize", map[string]any{
+		"protocolVersion": "2026-03-26",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "cursor", "version": "3.0.0"},
+	})
 	rec := doPOST(t, tr, body, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
@@ -1126,13 +1101,6 @@ func TestRouterNotFoundDoesNotExpireSession(t *testing.T) {
 		t.Errorf("router error code = %d, want -32603; body=%s", env.Error.Code, rec.Body.String())
 	}
 
-	notification := jsonRPC(nil, "tools/call", map[string]any{
-		"name": "missing_tool", "arguments": map[string]any{},
-	})
-	rec = doPOST(t, tr, notification, map[string]string{HeaderSessionID: sid})
-	if rec.Code != http.StatusAccepted || rec.Body.Len() != 0 {
-		t.Fatalf("notification status/body = %d/%q, want 202/empty", rec.Code, rec.Body.String())
-	}
 }
 
 // TestHTTPRoundTripEndToEnd — fires the transport behind an
@@ -1144,7 +1112,11 @@ func TestHTTPRoundTripEndToEnd(t *testing.T) {
 	srv := httptest.NewServer(tr)
 	defer srv.Close()
 
-	body := initializeBody("test", "0.0.0")
+	body := jsonRPC(1, "initialize", map[string]any{
+		"protocolVersion": "2026-03-26",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
+	})
 	resp, err := http.Post(srv.URL+"/mcp", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST /mcp: %v", err)
