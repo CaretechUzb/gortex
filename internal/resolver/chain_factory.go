@@ -40,8 +40,7 @@ func resolveFactoryChains(g graph.Store, cands *frameworkPassCandidates) int {
 	// fraction of the total edge count on a large multi-repo graph.
 	stream := edgesByKinds(g, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences})
 	if cands != nil {
-		merged := refetchFrameworkCandidates(g, cands.calls)
-		merged = append(merged, refetchFrameworkCandidates(g, cands.refs)...)
+		merged := append(append([]*graph.Edge(nil), cands.calls...), cands.refs...)
 		stream = frameworkEdgeSeq(merged)
 	}
 	resolved := 0

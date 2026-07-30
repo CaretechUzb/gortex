@@ -1154,9 +1154,10 @@ func runFrameworkSynthesizersScoped(
 	for _, s := range defaultFrameworkSynthesizers() {
 		start := time.Now()
 		var n int
+		var bundle *frameworkPassCandidates
 		if shouldRunFrameworkSynthesizer(s, scope, candidates) {
 			if sf, ok := s.(synthFunc); ok {
-				bundle := candidates.streams.passStreams(sf.name)
+				bundle = candidates.streams.passStreams(g, sf.name)
 				switch {
 				case sf.candFn != nil && bundle != nil:
 					// Shared-stream form. streams exist only on a full-census
@@ -1184,7 +1185,11 @@ func runFrameworkSynthesizersScoped(
 		}
 		rep.Per = append(rep.Per, SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds()})
 		rep.Total += n
+		candidates.streams.releasePass(s.Name(), bundle)
 	}
+	// The registry consumed or discarded every armed buffer. Release the
+	// shared node snapshot before the independent tail gates and claimers run.
+	candidates.streams = nil
 	// Drop coincidental cross-language-family reference/import results before
 	// the claiming resolvers run, so a gated edge cannot be mistaken for a
 	// resolved placeholder downstream. Bridge synthesizers are exempt.
