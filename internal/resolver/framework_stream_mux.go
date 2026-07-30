@@ -224,6 +224,22 @@ func (sc *frameworkStreamCandidates) passStreams(g graph.Store, name string) *fr
 	return refetchFrameworkCandidates(g, sc.perPass[name])
 }
 
+// releasePass drops both the compact census buffer and the pass-local live
+// edge slices as soon as the registry turn finishes. A skipped/gated pass has
+// no live bundle, but its armed census buffer is still released here.
+func (sc *frameworkStreamCandidates) releasePass(name string, bundle *frameworkPassCandidates) {
+	if sc != nil {
+		delete(sc.perPass, name)
+	}
+	if bundle == nil {
+		return
+	}
+	bundle.calls = nil
+	bundle.refs = nil
+	bundle.annotated = nil
+	bundle.nodes = nil
+}
+
 // collectCalls hands one census-walk EdgeCalls edge to every armed
 // collector. Edges without a source node are skipped: no pass can act on a
 // degenerate edge and the current-form re-read below is keyed by source.

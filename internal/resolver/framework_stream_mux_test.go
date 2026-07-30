@@ -95,6 +95,30 @@ func TestFrameworkPassCandidatesHydrateOnceByExactIdentity(t *testing.T) {
 	}
 }
 
+func TestFrameworkPassCandidatesReleaseDropsBufferedAndLiveEdges(t *testing.T) {
+	edge := &graph.Edge{From: "caller", To: "callee", Kind: graph.EdgeCalls}
+	snapshot := &frameworkNodeSnapshot{}
+	sc := &frameworkStreamCandidates{perPass: map[string]*frameworkPassCandidateIdentities{
+		"admitted": {calls: []graph.EdgeIdentity{graph.EdgeIdentityFor(edge)}, nodes: snapshot},
+		"gated":    {refs: []graph.EdgeIdentity{{From: "caller", To: "ref", Kind: graph.EdgeReferences}}, nodes: snapshot},
+	}}
+	bundle := &frameworkPassCandidates{
+		calls: []*graph.Edge{edge}, refs: []*graph.Edge{edge}, annotated: []*graph.Edge{edge}, nodes: snapshot,
+	}
+
+	sc.releasePass("admitted", bundle)
+	if _, retained := sc.perPass["admitted"]; retained {
+		t.Fatal("admitted census buffer was retained")
+	}
+	if bundle.calls != nil || bundle.refs != nil || bundle.annotated != nil || bundle.nodes != nil {
+		t.Fatalf("live pass bundle retained data: %#v", bundle)
+	}
+	sc.releasePass("gated", nil)
+	if len(sc.perPass) != 0 {
+		t.Fatalf("gated census buffers retained: %#v", sc.perPass)
+	}
+}
+
 func TestFrameworkPassCandidatesWithoutExactLookupUseLegacyPath(t *testing.T) {
 	g := graph.New()
 	edge := &graph.Edge{From: "caller", To: "callee", Kind: graph.EdgeCalls}
