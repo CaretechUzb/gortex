@@ -11,7 +11,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
-	"github.com/zzet/gortex/internal/resolver"
 )
 
 // MultiWatcher manages file watchers across multiple repositories.
@@ -20,7 +19,6 @@ type MultiWatcher struct {
 	gitWatchers map[string]*GitWatcher // repoPrefix → .git ref watcher
 	started     map[string]bool        // tracks which watchers have been started
 	multi       *MultiIndexer
-	resolver    *resolver.CrossRepoResolver
 	logger      *zap.Logger
 	events      chan GraphChangeEvent
 	done        chan struct{}
@@ -51,25 +49,10 @@ func NewMultiWatcher(
 		gitWatchers: make(map[string]*GitWatcher),
 		started:     make(map[string]bool),
 		multi:       mi,
-		resolver:    resolver.NewCrossRepo(mi.Graph()),
 		logger:      logger,
 		events:      make(chan GraphChangeEvent, 128),
 		done:        make(chan struct{}),
 	}
-	// Wire the cross-workspace boundary check into the resolver so
-	// cross-repo edges are only resolved when the source workspace
-	// declared the target via `cross_workspace_deps`.
-	mw.resolver.SetCrossWorkspaceDepLookup(mi.crossWorkspaceLookup())
-	// Resolve JS/TS imports declared through an npm alias to their
-	// locally-vendored real package.
-	mw.resolver.SetNpmAliasResolver(mi.npmAliasResolver())
-	mw.resolver.SetPathAliasResolver(mi.pathAliasResolver())
-	// Break same-named import collisions in favour of the importer's
-	// own package-manager workspace member.
-	mw.resolver.SetWorkspaceMembership(mi.workspaceMembershipResolver())
-	// Cross-daemon proxy-edge minting: mint proxy edges on incremental
-	// re-resolution too, when the daemon installed a prober (flag on).
-	mi.applyRemoteStitch(mw.resolver)
 
 	for prefix, cfg := range configs {
 		if err := mw.createWatcher(prefix, cfg); err != nil {
@@ -101,17 +84,39 @@ func (mw *MultiWatcher) createWatcher(prefix string, cfg config.WatchConfig) err
 	if idx == nil {
 		return fmt.Errorf("no indexer for repo: %s", prefix)
 	}
+	idx.attachRepositoryMutationCoordinator(mw.multi.repositoryMutationCoordinator(prefix))
 
 	w, err := NewWatcher(idx, cfg, mw.logger.With(zap.String("repo", prefix)))
 	if err != nil {
 		return fmt.Errorf("creating watcher for %s: %w", prefix, err)
 	}
+	// The watcher outlives an IndexRepo replacement. Its construction-time
+	// Indexer remains the stable lane carrier; graph work selects the current
+	// registry entry only after that lane admits it.
+	w.currentIndexer = func() *Indexer {
+		return mw.multi.GetIndexer(prefix)
+	}
 	w.batchReindex = func(paths []string) (*IndexResult, error) {
 		return mw.multi.IncrementalReindexRepo(prefix, paths)
+	}
+	w.discoverReindex = func(paths []string) (*IndexResult, error) {
+		return mw.multi.incrementalDiscoverRepo(prefix, paths)
+	}
+	w.pointReindexRaw = func(filePath string) (*IndexResult, error) {
+		return mw.multi.incrementalPointRepoRaw(prefix, filePath)
 	}
 
 	mw.watchers[prefix] = w
 	return nil
+}
+
+func (mw *MultiWatcher) configureGitWatcher(prefix string, gw *GitWatcher) {
+	gw.currentIndexer = func() *Indexer {
+		return mw.multi.GetIndexer(prefix)
+	}
+	gw.batchReindex = func(paths []string) (*IndexResult, error) {
+		return mw.multi.IncrementalReindexRepo(prefix, paths)
+	}
 }
 
 // Start begins watching all configured repos. Events from per-repo watchers
@@ -180,9 +185,7 @@ func (mw *MultiWatcher) Start() error {
 			if idx := mw.multi.GetIndexer(prefix); idx != nil {
 				gw, err := NewGitWatcher(rootPath, idx, mw.logger.With(zap.String("repo", prefix)))
 				if err == nil {
-					gw.batchReindex = func(paths []string) (*IndexResult, error) {
-						return mw.multi.IncrementalReindexRepo(prefix, paths)
-					}
+					mw.configureGitWatcher(prefix, gw)
 				}
 				if err != nil {
 					mw.logger.Debug("git-watcher: init failed",
@@ -215,10 +218,10 @@ func (mw *MultiWatcher) Start() error {
 	return nil
 }
 
-// forwardEvents reads events from a per-repo watcher and forwards them
-// to the merged events channel. After each event, it triggers cross-repo
-// resolution for the owning repo.
-func (mw *MultiWatcher) forwardEvents(prefix string, w *Watcher) {
+// forwardEvents reads events from a per-repo watcher and forwards them to the
+// merged events channel. Cross-repository resolution already completed inside
+// the originating watcher's coordinated mutation tail.
+func (mw *MultiWatcher) forwardEvents(_ string, w *Watcher) {
 	for {
 		select {
 		case <-mw.done:
@@ -227,31 +230,10 @@ func (mw *MultiWatcher) forwardEvents(prefix string, w *Watcher) {
 			if !ok {
 				return
 			}
-
-			// After re-indexing, trigger cross-repo resolution — scoped
-			// to the file that changed, not the whole repo. ResolveForRepo
-			// materialised the repo's entire edge set on every save (the
-			// per-edit allocation flood); ResolveForFile only re-resolves
-			// the changed file's out-edges. The watcher path is absolute,
-			// so convert it to the repo-relative graph key first.
-			if mw.multi.IsMultiRepo() {
-				relPath := ev.FilePath
-				if w.indexer != nil {
-					relPath = w.indexer.RelKey(ev.FilePath)
-				}
-				stats := mw.resolver.ResolveForFile(prefix, relPath)
-				if stats.CrossRepoEdges > 0 {
-					mw.logger.Debug("cross-repo edges updated after file change",
-						zap.String("repo", prefix),
-						zap.String("file", ev.FilePath),
-						zap.Int("cross_repo_edges", stats.CrossRepoEdges),
-					)
-				}
-			}
-
-			// Non-blocking send to merged channel.
 			select {
 			case mw.events <- ev:
+			case <-mw.done:
+				return
 			default:
 			}
 		}
@@ -452,6 +434,7 @@ func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error
 	mw.started[repoPrefix] = true
 	if idx := mw.multi.GetIndexer(repoPrefix); idx != nil {
 		if gw, err := NewGitWatcher(meta.RootPath, idx, mw.logger.With(zap.String("repo", repoPrefix))); err == nil {
+			mw.configureGitWatcher(repoPrefix, gw)
 			if err := gw.Start(); err == nil {
 				mw.gitWatchers[repoPrefix] = gw
 			} else {

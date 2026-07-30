@@ -2,8 +2,10 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +52,14 @@ type Poller struct {
 	lastSHA     string
 	loopStarted bool
 	stopCalled  bool
+
+	// pollMu guards dirty-generation singleflight admission. Timer and notify
+	// triggers never queue behind a running filesystem scan: they advance
+	// pollRequested and return. The active owner observes that generation after
+	// its sweep and performs one coalesced follow-up when necessary.
+	pollMu        sync.Mutex
+	pollRequested uint64
+	pollRunning   bool
 
 	// swept is a test hook fired after every poll cycle with the
 	// number of files the cycle re-dispatched. nil in production.
@@ -119,10 +129,10 @@ func newPoller(w *Watcher, idx *Indexer, logger *zap.Logger) *Poller {
 		lastSHA, _ = pollerHeadSHA(root)
 	}
 	return &Poller{
-		watcher:  w,
-		indexer:  idx,
-		rootPath: root,
-		logger:   logger,
+		watcher:    w,
+		indexer:    idx,
+		rootPath:   root,
+		logger:     logger,
 		interval:   pollInterval(nodeCount),
 		lastSHA:    lastSHA,
 		done:       make(chan struct{}),
@@ -194,144 +204,299 @@ func (p *Poller) loop() {
 	}
 }
 
-// poll runs one fallback cycle: detect git HEAD movement, then scan
-// tracked-file mtimes for changes the fsnotify backend may have
-// missed, dispatching each through the same per-file patch path the
-// live watcher uses. Best-effort throughout — a failed git call or an
-// unreadable file is logged and skipped, never fatal.
+// poll admits one fallback request. Timer and notify callers never wait behind
+// an active scan: they only dirty the generation and return. The active owner
+// folds every overlapping request into the minimum necessary follow-up sweep.
 func (p *Poller) poll() {
-	swept := 0
-	if p.pollGitHead() {
-		swept++
+	p.pollMu.Lock()
+	p.pollRequested++
+	generation := p.pollRequested
+	if p.pollRunning {
+		p.pollMu.Unlock()
+		return
 	}
-	swept += p.pollFilesystem()
-	if p.swept != nil {
-		p.swept(swept)
+	p.pollRunning = true
+	p.pollMu.Unlock()
+
+	for {
+		p.pollOnce()
+
+		p.pollMu.Lock()
+		if p.pollRequested == generation {
+			p.pollRunning = false
+			p.pollMu.Unlock()
+			return
+		}
+		generation = p.pollRequested
+		p.pollMu.Unlock()
 	}
 }
 
-// pollGitHead checks whether HEAD has moved since the last cycle. A
-// moved HEAD is the branch-switch / commit signal the GitWatcher's
-// fsnotify watch normally catches; the poller is the backstop for the
-// case where that watch missed the ref-file event. It dispatches the
-// reconcile through the indexer's existing per-file batch path by
-// re-indexing every changed path, mirroring GitWatcher.reconcile.
-// Returns true when a move was observed and reconciled.
-func (p *Poller) pollGitHead() bool {
+// pollOnce discovers Git and filesystem changes independently, unions their
+// exact paths, and submits one bounded watcher batch. Discovery never mutates
+// freshness bookkeeping; the indexing batch owns those stamps under the
+// repository mutation lane.
+func (p *Poller) pollOnce() {
+	git := p.observeGitHead()
+	pathSet := make(map[string]struct{}, len(git.paths))
+	for _, path := range git.paths {
+		if path != "" {
+			pathSet[filepath.Clean(path)] = struct{}{}
+		}
+	}
+	for _, path := range p.pollFilesystem() {
+		if path != "" {
+			pathSet[filepath.Clean(path)] = struct{}{}
+		}
+	}
+	paths := make([]string, 0, len(pathSet))
+	for path := range pathSet {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	reconciled := len(paths) == 0
+	var result *IndexResult
+	var reconcileErr error
+	if len(paths) > 0 {
+		if p.watcher == nil {
+			reconcileErr = fmt.Errorf("watcher: poller has no watcher for %d changed paths", len(paths))
+		} else {
+			result, reconcileErr = p.watcher.reindexStormPaths(paths)
+			if reconcileErr == nil && result != nil && len(result.FailedFiles) > 0 {
+				reconcileErr = fmt.Errorf("watcher: poller batch left %d failed files", len(result.FailedFiles))
+			}
+		}
+		reconciled = reconcileErr == nil
+		if reconcileErr != nil && p.logger != nil {
+			p.logger.Warn("watcher: poller batch reconcile failed",
+				zap.Int("paths", len(paths)), zap.Error(reconcileErr))
+		} else if p.logger != nil {
+			p.logger.Info("watcher: poller reconciled changes missed by live watchers",
+				zap.Int("paths", len(paths)))
+		}
+	}
+
+	// A changed Git range is committed only after all of its paths shared the
+	// successful batch above. An empty successful diff has no batch work and can
+	// enter the same lane-owned freshness finalization directly. Diff failures
+	// never reach this point, so the old range remains retryable.
+	if git.diffSucceeded && (len(git.paths) == 0 || reconciled) {
+		if err := p.finalizeGitHead(git); err != nil {
+			if p.logger != nil {
+				p.logger.Warn("watcher: poller Git freshness finalization failed",
+					zap.String("from", git.oldSHA), zap.String("to", git.newSHA),
+					zap.Error(err))
+			}
+		} else if git.oldSHA != "" && git.newSHA != "" && git.oldSHA != git.newSHA && p.logger != nil {
+			p.logger.Info("watcher: poller reconciled missed ref change",
+				zap.String("from", git.oldSHA[:min(len(git.oldSHA), 12)]),
+				zap.String("to", git.newSHA[:min(len(git.newSHA), 12)]),
+				zap.Int("paths", len(git.paths)))
+		}
+	}
+
+	if p.swept != nil {
+		p.swept(len(paths))
+	}
+}
+
+// pollGitObservation separates range discovery from freshness publication.
+// pollOnce can therefore union the range with filesystem evidence before one
+// repository batch, then advance lastSHA only when that batch succeeds.
+type pollGitObservation struct {
+	oldSHA        string
+	newSHA        string
+	paths         []string
+	diffSucceeded bool
+}
+
+func (p *Poller) observeGitHead() pollGitObservation {
 	newSHA, err := pollerHeadSHA(p.rootPath)
 	if err != nil || newSHA == "" {
-		return false
+		return pollGitObservation{}
 	}
 	p.mu.Lock()
 	oldSHA := p.lastSHA
 	p.mu.Unlock()
-	if oldSHA == "" {
-		// First observation: seed lastSHA and don't diff against a
-		// phantom range. There is no prior commit to reconcile from.
-		p.mu.Lock()
-		p.lastSHA = newSHA
-		p.mu.Unlock()
-		return false
-	}
 	if oldSHA == newSHA {
-		return false
+		return pollGitObservation{}
+	}
+	if oldSHA == "" {
+		// First observation has no range to reconcile. Return a successful
+		// zero-path observation so pollOnce commits the baseline uniformly.
+		return pollGitObservation{newSHA: newSHA, diffSucceeded: true}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	changes, err := pollerDiffNameStatus(ctx, p.rootPath, oldSHA, newSHA)
 	if err != nil {
-		// Leave lastSHA at oldSHA so the next cycle retries this exact
-		// range. Advancing it here would permanently skip the
-		// un-reconciled oldSHA..newSHA span on a transient diff failure.
+		// Leave lastSHA at oldSHA so the next cycle retries this exact range.
 		if p.logger != nil {
 			p.logger.Debug("watcher: poller git diff failed",
 				zap.String("from", oldSHA), zap.String("to", newSHA),
 				zap.Error(err))
 		}
-		return false
+		return pollGitObservation{}
 	}
 
-	// Diff succeeded — the range is now safe to mark reconciled. Advance
-	// lastSHA before dispatching so a concurrent poll doesn't re-diff the
-	// same span; dispatch failures of individual files are best-effort
-	// and don't warrant re-running the whole diff.
-	p.mu.Lock()
-	p.lastSHA = newSHA
-	p.mu.Unlock()
-
-	n := 0
-	for _, c := range changes {
-		switch c.Status {
-		case 'A', 'M', 'T', 'R', 'C':
-			abs := filepath.Join(p.rootPath, c.Path)
-			if _, statErr := os.Stat(abs); statErr != nil {
-				continue
-			}
-			if err := p.watcher.patchGraph(abs, ChangeModified); err != nil && p.logger != nil {
-				p.logger.Warn("watcher: poller patch failed", zap.String("path", abs), zap.Error(err))
-			}
-			n++
-		case 'D':
-			abs := filepath.Join(p.rootPath, c.Path)
-			if _, statErr := os.Stat(abs); statErr != nil {
-				if err := p.watcher.patchGraph(abs, ChangeDeleted); err != nil && p.logger != nil {
-					p.logger.Warn("watcher: poller patch failed", zap.String("path", abs), zap.Error(err))
-				}
-				n++
-			}
+	pathSet := make(map[string]struct{}, len(changes)+1)
+	add := func(relPath string) {
+		if relPath == "" {
+			return
+		}
+		pathSet[filepath.Clean(filepath.Join(p.rootPath, filepath.FromSlash(relPath)))] = struct{}{}
+	}
+	for _, change := range changes {
+		switch change.Status {
+		case 'A', 'M', 'T', 'C', 'D':
+			add(change.Path)
+		case 'R':
+			// Both sides matter: the new path is parsed and the old path is
+			// deletion-detected by the same bounded batch.
+			add(change.OldPath)
+			add(change.Path)
 		}
 	}
-	if p.logger != nil {
-		p.logger.Info("watcher: poller reconciled missed ref change",
-			zap.String("from", oldSHA[:min(len(oldSHA), 12)]),
-			zap.String("to", newSHA[:min(len(newSHA), 12)]),
-			zap.Int("paths", n))
+	paths := make([]string, 0, len(pathSet))
+	for path := range pathSet {
+		paths = append(paths, path)
 	}
-	return n > 0
+	sort.Strings(paths)
+	return pollGitObservation{
+		oldSHA: oldSHA, newSHA: newSHA, paths: paths, diffSucceeded: true,
+	}
 }
 
-// pollFilesystem walks the indexer's per-file mtime map and re-indexes
-// any tracked file whose on-disk mtime advanced past the recorded
-// value — the modification the fsnotify backend should have reported.
-// It also evicts files that have vanished from disk. The mtime map is
-// the indexer's own bookkeeping (it stamps every file it indexes), so
-// this reuses an existing source of truth instead of re-walking the
-// tree. Returns the number of files re-dispatched.
-func (p *Poller) pollFilesystem() int {
-	snapshot := p.indexer.FileMtimes()
-	if len(snapshot) == 0 {
-		return 0
+// pollGitHead is retained for focused in-package callers. Production sweeps use
+// observeGitHead so Git and filesystem paths can share one batch; this helper
+// still reconciles its Git-only observation as one bounded batch.
+func (p *Poller) pollGitHead() bool {
+	observation := p.observeGitHead()
+	if !observation.diffSucceeded {
+		return false
 	}
-	n := 0
+	if len(observation.paths) == 0 {
+		if err := p.finalizeGitHead(observation); err != nil && p.logger != nil {
+			p.logger.Warn("watcher: poller Git freshness finalization failed",
+				zap.String("from", observation.oldSHA), zap.String("to", observation.newSHA),
+				zap.Error(err))
+		}
+		return false
+	}
+	if p.watcher == nil {
+		return false
+	}
+	result, err := p.watcher.reindexStormPaths(observation.paths)
+	if err == nil && result != nil && len(result.FailedFiles) > 0 {
+		err = fmt.Errorf("watcher: poller batch left %d failed files", len(result.FailedFiles))
+	}
+	if err != nil {
+		if p.logger != nil {
+			p.logger.Warn("watcher: poller git reconcile failed",
+				zap.Int("paths", len(observation.paths)), zap.Error(err))
+		}
+		return false
+	}
+	if err := p.finalizeGitHead(observation); err != nil {
+		if p.logger != nil {
+			p.logger.Warn("watcher: poller Git freshness finalization failed",
+				zap.String("from", observation.oldSHA), zap.String("to", observation.newSHA),
+				zap.Error(err))
+		}
+		return false
+	}
+	return true
+}
+
+func (p *Poller) registeredIndexer() *Indexer {
+	if p.watcher != nil {
+		return p.watcher.currentMutationIndexer()
+	}
+	return p.indexer
+}
+
+// finalizeGitHead publishes Git and repository freshness together while
+// holding the construction-time Indexer's stable mutation lane. The current
+// registry entry is resolved only after admission, so IndexRepo replacement
+// cannot redirect the restamp to a retired Indexer. A fresh background context
+// keeps lane admission independent of the short-lived Git diff timeout.
+func (p *Poller) finalizeGitHead(observation pollGitObservation) error {
+	if observation.newSHA == "" {
+		return nil
+	}
+	if p.indexer == nil {
+		return fmt.Errorf("watcher: poller has no stable repository lane")
+	}
+	return p.indexer.coordinateRepositoryMutation(context.Background(), func() error {
+		idx := p.registeredIndexer()
+		if idx == nil {
+			return fmt.Errorf("watcher: poller repository indexer is no longer registered")
+		}
+
+		p.mu.Lock()
+		stillCurrent := p.lastSHA == observation.oldSHA
+		p.mu.Unlock()
+		if !stillCurrent {
+			return nil
+		}
+
+		idx.reconcileRepoIndexState(p.rootPath)
+		p.mu.Lock()
+		// Singleflight owns Git observations, but keep this conditional so a test
+		// or future explicit reset cannot be overwritten by an older completion.
+		if p.lastSHA == observation.oldSHA {
+			p.lastSHA = observation.newSHA
+		}
+		p.mu.Unlock()
+		return nil
+	})
+}
+
+// pollFilesystem snapshots the indexer's per-file mtime map and returns
+// changed or unreadable tracked paths. It performs discovery only: pollOnce
+// unions these paths with Git evidence and the repository batch owns every
+// freshness stamp and deletion decision.
+func (p *Poller) pollFilesystem() []string {
+	idx := p.indexer
+	if p.watcher != nil {
+		// MultiWatcher instances outlive IndexRepo replacement. Resolve the
+		// current registry entry for discovery too; the construction-time
+		// Indexer is retained only as the stable lane carrier.
+		idx = p.watcher.currentMutationIndexer()
+	}
+	if idx == nil {
+		return nil
+	}
+	snapshot := idx.FileMtimes()
+	if len(snapshot) == 0 {
+		return nil
+	}
+	paths := make([]string, 0)
 	for relPath, recorded := range snapshot {
-		abs := filepath.Join(p.rootPath, filepath.FromSlash(relPath))
+		abs := filepath.Clean(filepath.Join(p.rootPath, filepath.FromSlash(relPath)))
 		info, err := os.Stat(abs)
 		if err != nil {
-			// The file is gone — the delete event was missed.
-			if patchErr := p.watcher.patchGraph(abs, ChangeDeleted); patchErr != nil && p.logger != nil {
-				p.logger.Warn("watcher: poller patch failed", zap.String("path", abs), zap.Error(patchErr))
+			if os.IsNotExist(err) {
+				paths = append(paths, abs)
+			} else if p.logger != nil {
+				// A transient permission/I/O error must not abort the shared batch
+				// and prevent unrelated valid paths from converging.
+				p.logger.Debug("watcher: poller stat failed; preserving tracked path",
+					zap.String("path", abs), zap.Error(err))
 			}
-			n++
 			continue
 		}
 		if info.IsDir() {
 			continue
 		}
-		if info.ModTime().UnixNano() > recorded {
-			// The file changed on disk after we last indexed it —
-			// the modify event was missed.
-			if err := p.watcher.patchGraph(abs, ChangeModified); err != nil && p.logger != nil {
-				p.logger.Warn("watcher: poller patch failed", zap.String("path", abs), zap.Error(err))
-			}
-			n++
+		if info.ModTime().UnixNano() != recorded {
+			paths = append(paths, abs)
 		}
 	}
-	if n > 0 && p.logger != nil {
-		p.logger.Info("watcher: poller re-indexed files missed by fsnotify",
-			zap.Int("paths", n))
-	}
-	return n
+	sort.Strings(paths)
+	return paths
 }
 
 // pollerHeadSHA resolves the current HEAD commit SHA of a worktree.

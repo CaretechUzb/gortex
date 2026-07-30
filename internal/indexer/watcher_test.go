@@ -92,6 +92,67 @@ func TestWatcher_OverflowReconcileUsesBatchCoordinator(t *testing.T) {
 	w.asyncWork.Wait()
 }
 
+func TestWatcher_OverflowDuringReconcileSchedulesOneFollowUp(t *testing.T) {
+	_, _, w := setupWatcher(t)
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var stateMu sync.Mutex
+	calls, active, maxActive := 0, 0, 0
+	w.reconcileFn = func() {
+		stateMu.Lock()
+		active++
+		if active > maxActive {
+			maxActive = active
+		}
+		calls++
+		call := calls
+		stateMu.Unlock()
+		defer func() {
+			stateMu.Lock()
+			active--
+			stateMu.Unlock()
+		}()
+
+		switch call {
+		case 1:
+			close(firstStarted)
+			<-releaseFirst
+		case 2:
+			close(secondStarted)
+		}
+	}
+
+	w.triggerOverflowReconcile("first")
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first overflow reconcile did not start")
+	}
+
+	for range 3 {
+		w.triggerOverflowReconcile("during-walk")
+	}
+	select {
+	case <-secondStarted:
+		t.Fatal("overflow follow-up ran concurrently with the active reconcile")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("overflow during the active walk did not schedule a follow-up")
+	}
+	w.asyncWork.Wait()
+
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	require.Equal(t, 2, calls, "a burst during one walk must coalesce into one follow-up")
+	require.Equal(t, 1, maxActive, "overflow reconciliation must remain single-flight")
+}
+
 func TestWatcher_FileModify(t *testing.T) {
 	dir, idx, w := setupWatcher(t)
 
@@ -289,4 +350,68 @@ func Original() {}
 		t.Fatalf("duplicate delete event published: %+v", ev)
 	default:
 	}
+}
+
+func TestWatcher_DirScanWaitsForPointMutationRepositoryLane(t *testing.T) {
+	dir, idx, watcher := inertTestWatcher(t, "main.go", "package main\n\nfunc value() int { return 0 }\n")
+	path := filepath.Join(dir, "main.go")
+	writeTestFile(t, path, "package main\n\nfunc value() int { return 1 }\nfunc added() {}\n")
+
+	pointTailEntered := make(chan struct{})
+	releasePoint := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releasePoint)
+		}
+	}()
+	watcher.pointReindexRaw = func(filePath string) (*IndexResult, error) {
+		result, err := idx.incrementalPointWatcherPath(idx.rootPath, filePath)
+		close(pointTailEntered)
+		<-releasePoint
+		return result, err
+	}
+	pointDone := make(chan error, 1)
+	go func() {
+		pointDone <- watcher.patchGraph(path, ChangeModified)
+	}()
+	select {
+	case <-pointTailEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("point patch did not reach its coordinated tail")
+	}
+
+	newDir := filepath.Join(dir, "nested")
+	require.NoError(t, os.MkdirAll(newDir, 0o755))
+	writeTestFile(t, filepath.Join(newDir, "discovered.go"), "package nested\n\nfunc Discovered() {}\n")
+	scanStarted := make(chan struct{})
+	scanDone := make(chan struct{})
+	go func() {
+		close(scanStarted)
+		watcher.runDirScan(map[string]struct{}{newDir: {}}, nil)
+		close(scanDone)
+	}()
+	<-scanStarted
+
+	select {
+	case <-scanDone:
+		t.Fatal("directory discovery overlapped an admitted point patch")
+	case <-time.After(100 * time.Millisecond):
+	}
+	require.Empty(t, idx.graph.FindNodesByName("Discovered"))
+
+	close(releasePoint)
+	released = true
+	select {
+	case err := <-pointDone:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("point patch did not finish after releasing its tail")
+	}
+	select {
+	case <-scanDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("directory discovery did not acquire the repository lane")
+	}
+	require.NotEmpty(t, idx.graph.FindNodesByName("Discovered"))
 }

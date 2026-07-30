@@ -8,6 +8,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser"
+	"go.uber.org/zap"
 )
 
 func waitForRepositoryMutationStats(
@@ -31,13 +36,19 @@ func waitForRepositoryMutationStats(
 
 func TestRepositoryMutationScopeUnionAndFullEscalation(t *testing.T) {
 	var scope repositoryMutationScope
-	scope.merge([]string{"b.go", "a.go", "a.go"})
+	if err := scope.merge([]string{"b.go", "a.go", "a.go"}); err != nil {
+		t.Fatal(err)
+	}
 	if got, want := scope.take(), []string{"a.go", "b.go"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("union = %#v, want %#v", got, want)
 	}
 
-	scope.merge([]string{"one.go"})
-	scope.merge(nil)
+	if err := scope.merge([]string{"one.go"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := scope.merge(nil); err != nil {
+		t.Fatal(err)
+	}
 	if got := scope.take(); got != nil {
 		t.Fatalf("explicit full scope = %#v, want nil", got)
 	}
@@ -46,7 +57,9 @@ func TestRepositoryMutationScopeUnionAndFullEscalation(t *testing.T) {
 	for i := range paths {
 		paths[i] = time.Unix(int64(i), 0).Format("20060102150405.000000000")
 	}
-	scope.merge(paths)
+	if err := scope.merge(paths); err != nil {
+		t.Fatal(err)
+	}
 	if got := scope.take(); got != nil {
 		t.Fatalf("cap-escalated scope retained %d paths", len(got))
 	}
@@ -154,6 +167,51 @@ func TestRepositoryMutationCoordinatorFullDominatesQueuedPaths(t *testing.T) {
 	}
 }
 
+func TestRepositoryMutationCoordinatorRecoversPanicAndRunsDirtyFollowup(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	coordinator := newRepositoryMutationCoordinator(func(paths []string) (*IndexResult, error) {
+		call := calls.Add(1)
+		if call == 1 {
+			close(started)
+			<-release
+			panic("store failure")
+		}
+		return &IndexResult{FileCount: int(call)}, nil
+	})
+
+	type response struct {
+		result *IndexResult
+		err    error
+	}
+	first := make(chan response, 1)
+	second := make(chan response, 1)
+	go func() {
+		result, err := coordinator.reconcile(context.Background(), []string{"first.go"})
+		first <- response{result: result, err: err}
+	}()
+	<-started
+	go func() {
+		result, err := coordinator.reconcile(context.Background(), []string{"second.go"})
+		second <- response{result: result, err: err}
+	}()
+	waitForRepositoryMutationStats(t, coordinator, func(stats repositoryMutationCoordinatorStats) bool {
+		return stats.RequestedGeneration == 2 && stats.PendingPaths == 1
+	})
+	close(release)
+
+	if got := <-first; got.result != nil || got.err == nil {
+		t.Fatalf("panic outcome = result:%#v err:%v", got.result, got.err)
+	}
+	if got := <-second; got.err != nil || got.result == nil || got.result.FileCount != 2 {
+		t.Fatalf("dirty followup = result:%#v err:%v", got.result, got.err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("executor calls = %d, want 2", calls.Load())
+	}
+}
+
 func TestRepositoryMutationCoordinatorSerializesMixedWork(t *testing.T) {
 	var active atomic.Int32
 	var maximum atomic.Int32
@@ -194,6 +252,28 @@ func TestRepositoryMutationCoordinatorSerializesMixedWork(t *testing.T) {
 	}
 }
 
+func TestRepositoryMutationCoordinatorRejectsPreCanceledWork(t *testing.T) {
+	var executions atomic.Int32
+	coordinator := newRepositoryMutationCoordinator(func(paths []string) (*IndexResult, error) {
+		executions.Add(1)
+		return &IndexResult{}, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if result, err := coordinator.reconcile(ctx, []string{"a.go"}); result != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled reconcile = result:%#v err:%v", result, err)
+	}
+	if err := coordinator.runExclusive(ctx, func() error {
+		executions.Add(1)
+		return nil
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled exclusive error = %v", err)
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("pre-canceled executions = %d, want 0", executions.Load())
+	}
+}
+
 func TestRepositoryMutationCancellationDoesNotCancelAdmittedWork(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -229,5 +309,323 @@ func TestRepositoryMutationCancellationDoesNotCancelAdmittedWork(t *testing.T) {
 	}
 	if err := coordinator.runExclusive(context.Background(), func() error { return nil }); !errors.Is(err, errRepositoryMutationCoordinatorClosed) {
 		t.Fatalf("closed exclusive error = %v", err)
+	}
+}
+
+func TestIndexCtxWaitsForRepositoryMutationLane(t *testing.T) {
+	cfg := config.Default()
+	idx := New(graph.New(), parser.NewRegistry(), cfg.Index, zap.NewNop())
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- idx.coordinateRepositoryMutation(context.Background(), func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	root := t.TempDir()
+	indexDone := make(chan error, 1)
+	go func() {
+		_, err := idx.IndexCtx(ctx, root)
+		indexDone <- err
+	}()
+	select {
+	case err := <-indexDone:
+		t.Fatalf("full index bypassed repository mutation lane: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	if err := <-indexDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled full index error = %v, want context.Canceled", err)
+	}
+
+	close(release)
+	if err := <-holderDone; err != nil {
+		t.Fatalf("lane holder: %v", err)
+	}
+}
+
+func TestRepositoryMutationLaneSurvivesIndexerReplacement(t *testing.T) {
+	const prefix = "repo"
+	mi := &MultiIndexer{indexers: make(map[string]*Indexer)}
+
+	original := &Indexer{repositoryMutationOwner: mi}
+	original.SetRepoPrefix(prefix)
+	mi.indexers[prefix] = original
+
+	enteredOriginal := make(chan struct{})
+	releaseOriginal := make(chan struct{})
+	originalDone := make(chan error, 1)
+	go func() {
+		originalDone <- original.coordinateRepositoryMutation(context.Background(), func() error {
+			close(enteredOriginal)
+			<-releaseOriginal
+			return nil
+		})
+	}()
+	<-enteredOriginal
+
+	replacement := &Indexer{repositoryMutationOwner: mi}
+	replacement.SetRepoPrefix(prefix)
+	mi.mu.Lock()
+	mi.indexers[prefix] = replacement
+	mi.mu.Unlock()
+	if original.repositoryMutations() != replacement.repositoryMutations() {
+		t.Fatal("replacement Indexer attached a second repository mutation lane")
+	}
+
+	enteredReplacement := make(chan struct{})
+	replacementDone := make(chan error, 1)
+	go func() {
+		replacementDone <- replacement.coordinateRepositoryMutation(context.Background(), func() error {
+			close(enteredReplacement)
+			return nil
+		})
+	}()
+	select {
+	case <-enteredReplacement:
+		t.Fatal("replacement mutation overlapped the original Indexer mutation")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseOriginal)
+	if err := <-originalDone; err != nil {
+		t.Fatalf("original mutation: %v", err)
+	}
+	select {
+	case <-enteredReplacement:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement mutation did not enter the shared lane")
+	}
+	if err := <-replacementDone; err != nil {
+		t.Fatalf("replacement mutation: %v", err)
+	}
+}
+
+func TestRepositoryMutationKeepsExistingWatcherOnSharedLaneAfterReplacement(t *testing.T) {
+	const prefix = "repo"
+	mi := &MultiIndexer{indexers: make(map[string]*Indexer)}
+	existing := &Indexer{repositoryMutationOwner: mi}
+	existing.SetRepoPrefix(prefix)
+	replacement := &Indexer{repositoryMutationOwner: mi}
+	replacement.SetRepoPrefix(prefix)
+	mi.indexers[prefix] = replacement
+
+	var called atomic.Bool
+	err := existing.coordinateRepositoryMutation(context.Background(), func() error {
+		called.Store(true)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("existing watcher mutation after replacement: %v", err)
+	}
+	if !called.Load() {
+		t.Fatal("existing watcher stopped mutating after Indexer replacement")
+	}
+	if existing.repositoryMutations() != replacement.repositoryMutations() {
+		t.Fatal("existing watcher no longer shares the replacement repository lane")
+	}
+}
+
+func TestUntrackRepoWaitsForMutationLaneAndRejectsAdmission(t *testing.T) {
+	const prefix = "repo"
+	mi := &MultiIndexer{
+		graph:    graph.New(),
+		repos:    map[string]*RepoMetadata{prefix: {RepoPrefix: prefix}},
+		indexers: map[string]*Indexer{prefix: nil},
+		logger:   zap.NewNop(),
+	}
+	coordinator := mi.repositoryMutationCoordinator(prefix)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	mutationDone := make(chan error, 1)
+	go func() {
+		mutationDone <- coordinator.runExclusive(context.Background(), func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	type untrackResult struct {
+		nodes int
+		edges int
+	}
+	untrackDone := make(chan untrackResult, 1)
+	go func() {
+		nodes, edges := mi.UntrackRepo(prefix)
+		untrackDone <- untrackResult{nodes: nodes, edges: edges}
+	}()
+
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		coordinator.mu.Lock()
+		closed := coordinator.closed
+		coordinator.mu.Unlock()
+		if closed {
+			break
+		}
+		select {
+		case <-untrackDone:
+			t.Fatal("UntrackRepo returned before closing and draining the repository mutation lane")
+		case <-deadline.C:
+			t.Fatal("UntrackRepo did not close the repository mutation lane")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if current := mi.repositoryMutationCoordinator(prefix); current != coordinator {
+		t.Fatal("UntrackRepo detached the closed lane before repository teardown completed")
+	} else if err := current.runExclusive(context.Background(), func() error { return nil }); !errors.Is(err, errRepositoryMutationCoordinatorClosed) {
+		t.Fatalf("mutation admitted after untrack started: %v", err)
+	}
+	select {
+	case <-untrackDone:
+		t.Fatal("UntrackRepo returned before the active repository mutation completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-mutationDone; err != nil {
+		t.Fatalf("active mutation: %v", err)
+	}
+	select {
+	case <-untrackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("UntrackRepo did not finish after the active mutation drained")
+	}
+}
+
+func TestRepositoryMutationConditionalDetachPreservesRetrackedLane(t *testing.T) {
+	const prefix = "repo"
+	mi := &MultiIndexer{}
+
+	old := mi.repositoryMutationCoordinator(prefix)
+	if got := mi.existingRepositoryMutationCoordinator(prefix); got != old {
+		t.Fatalf("existing coordinator = %p, want old slot %p", got, old)
+	}
+	if !mi.detachRepositoryMutationCoordinator(prefix, old) {
+		t.Fatal("exact old coordinator was not detached")
+	}
+
+	replacement := mi.repositoryMutationCoordinator(prefix)
+	if replacement == old {
+		t.Fatal("retrack reused the detached coordinator")
+	}
+	// This is the delayed tail of the old teardown. It must not remove the
+	// replacement generation that now owns the same prefix.
+	if mi.detachRepositoryMutationCoordinator(prefix, old) {
+		t.Fatal("stale teardown detached the retracked coordinator")
+	}
+	if got := mi.existingRepositoryMutationCoordinator(prefix); got != replacement {
+		t.Fatalf("coordinator after stale detach = %p, want replacement %p", got, replacement)
+	}
+	if err := replacement.runExclusive(context.Background(), func() error { return nil }); err != nil {
+		t.Fatalf("replacement coordinator is not open: %v", err)
+	}
+}
+
+func TestConcurrentUntrackRepoLeavesFreshRetrackLaneOpen(t *testing.T) {
+	const prefix = "repo"
+	cfg := config.Default()
+	store := graph.New()
+	registry := parser.NewRegistry()
+	mi := &MultiIndexer{
+		graph:    store,
+		registry: registry,
+		repos: map[string]*RepoMetadata{
+			prefix: {RepoPrefix: prefix},
+		},
+		indexers: make(map[string]*Indexer),
+		logger:   zap.NewNop(),
+	}
+	oldIndexer := New(store, registry, cfg.Index, zap.NewNop())
+	oldIndexer.repositoryMutationOwner = mi
+	oldIndexer.SetRepoPrefix(prefix)
+	mi.indexers[prefix] = oldIndexer
+	old := mi.existingRepositoryMutationCoordinator(prefix)
+	if old == nil {
+		t.Fatal("old repository coordinator was not installed")
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- old.runExclusive(context.Background(), func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	start := make(chan struct{})
+	ready := make(chan struct{}, 2)
+	untracked := make(chan struct{}, 2)
+	for range 2 {
+		go func() {
+			ready <- struct{}{}
+			<-start
+			mi.UntrackRepo(prefix)
+			untracked <- struct{}{}
+		}()
+	}
+	<-ready
+	<-ready
+	close(start)
+
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		old.mu.Lock()
+		closed := old.closed
+		old.mu.Unlock()
+		if closed {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("concurrent untrack did not close the old coordinator")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	close(release)
+	if err := <-holderDone; err != nil {
+		t.Fatalf("lane holder: %v", err)
+	}
+	for range 2 {
+		select {
+		case <-untracked:
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent untrack did not finish")
+		}
+	}
+	if got := mi.existingRepositoryMutationCoordinator(prefix); got != nil {
+		t.Fatalf("double untrack stranded coordinator %p", got)
+	}
+
+	// Re-track the same prefix and prove the new generation is neither the old
+	// closed lane nor a closed lane manufactured by the losing untrack.
+	replacementIndexer := New(store, registry, cfg.Index, zap.NewNop())
+	replacementIndexer.repositoryMutationOwner = mi
+	replacementIndexer.SetRepoPrefix(prefix)
+	replacement := mi.existingRepositoryMutationCoordinator(prefix)
+	if replacement == nil || replacement == old {
+		t.Fatalf("replacement coordinator = %p, old = %p", replacement, old)
+	}
+	mi.mu.Lock()
+	mi.repos[prefix] = &RepoMetadata{RepoPrefix: prefix}
+	mi.indexers[prefix] = replacementIndexer
+	mi.mu.Unlock()
+	if err := replacement.runExclusive(context.Background(), func() error { return nil }); err != nil {
+		t.Fatalf("fresh retrack lane rejected mutation: %v", err)
 	}
 }

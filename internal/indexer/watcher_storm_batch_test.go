@@ -135,45 +135,70 @@ func TestWatcherStormTakeoverCompletesSupersededMutationTickets(t *testing.T) {
 }
 
 func TestWatcherStormDrainWaitsForClaimedPointPatchLane(t *testing.T) {
-	idx := newTestIndexer(graph.New())
-	idx.rootPath = t.TempDir()
-	watcher, err := NewWatcher(idx, config.WatchConfig{}, zap.NewNop())
-	require.NoError(t, err)
-	path := filepath.Join(idx.rootPath, "main.go")
-	watcher.stormBatch[path] = ChangeModified
+	dir, idx, watcher := inertTestWatcher(t, "main.go", "package main\n\nfunc value() int { return 0 }\n")
+	path := filepath.Join(dir, "main.go")
+	writeTestFile(t, path, "package main\n\nfunc value() int { return 1 }\nfunc added() {}\n")
 
-	beforeLock := make(chan bool, 1)
-	watcher.stormBeforeLock = func() {
-		available := watcher.patchMu.TryLock()
-		if available {
-			watcher.patchMu.Unlock()
-		}
-		beforeLock <- available
-	}
-	batchEntered := make(chan struct{})
-	watcher.batchReindex = func([]string) (*IndexResult, error) {
-		close(batchEntered)
-		return &IndexResult{}, nil
-	}
-	done := make(chan struct{})
-
-	watcher.patchMu.Lock()
-	locked := true
+	pointTailEntered := make(chan struct{})
+	releasePoint := make(chan struct{})
+	released := false
 	defer func() {
-		if locked {
-			watcher.patchMu.Unlock()
+		if !released {
+			close(releasePoint)
 		}
 	}()
+	watcher.pointReindexRaw = func(filePath string) (*IndexResult, error) {
+		result, err := idx.incrementalPointWatcherPath(idx.rootPath, filePath)
+		close(pointTailEntered)
+		<-releasePoint
+		return result, err
+	}
+	pointDone := make(chan error, 1)
+	go func() {
+		pointDone <- watcher.patchGraph(path, ChangeModified)
+	}()
+
+	select {
+	case <-pointTailEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("point patch did not reach its coordinated tail")
+	}
+
+	watcher.stormMu.Lock()
+	watcher.stormBatch[path] = ChangeModified
+	watcher.stormMu.Unlock()
+	stormAtAdmission := make(chan struct{})
+	watcher.stormBeforeLock = func() { close(stormAtAdmission) }
+	stormDone := make(chan struct{})
 	go func() {
 		watcher.drainStorm()
-		close(done)
+		close(stormDone)
 	}()
 
-	require.False(t, <-beforeLock, "a claimed point patch must own the patch lane")
-	watcher.patchMu.Unlock()
-	locked = false
-	<-batchEntered
-	<-done
+	select {
+	case <-stormAtAdmission:
+	case <-time.After(2 * time.Second):
+		t.Fatal("storm drain did not reach repository-lane admission")
+	}
+	select {
+	case <-stormDone:
+		t.Fatal("storm batch overlapped an admitted point patch")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releasePoint)
+	released = true
+	select {
+	case err := <-pointDone:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("point patch did not finish after releasing its tail")
+	}
+	select {
+	case <-stormDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("storm batch did not acquire the repository lane")
+	}
 }
 
 func TestWatcherStopCancelsQueuedStormAndFailsAdoptedTickets(t *testing.T) {
@@ -558,6 +583,38 @@ func TestGitWatcherLargeBranchReconcileBatchesOnceAndPreservesFailureRetry(t *te
 		require.Equal(t, 1, batchCalls)
 		require.Equal(t, baseSHA, gw.lastSHA,
 			"a failed batch must remain retryable from the prior commit")
+		require.Zero(t, drained)
+	})
+
+	t.Run("partial batch failure retains old sha", func(t *testing.T) {
+		batchCalls := 0
+		drained := 0
+		finalizeLookups := 0
+		gw := &GitWatcher{
+			repoPath: dir,
+			indexer:  idx,
+			currentIndexer: func() *Indexer {
+				finalizeLookups++
+				return idx
+			},
+			logger:  zap.NewNop(),
+			lastSHA: baseSHA,
+			batchReindex: func(paths []string) (*IndexResult, error) {
+				batchCalls++
+				return &IndexResult{
+					StaleFileCount: len(paths) - 1,
+					FailedFiles:    []string{paths[len(paths)-1]},
+				}, nil
+			},
+			drained: func(n int) { drained++ },
+		}
+
+		gw.reconcile("branch-switch-partial-failure-test")
+
+		require.Equal(t, 1, batchCalls)
+		require.Equal(t, baseSHA, gw.lastSHA,
+			"a partial batch failure must remain retryable from the prior commit")
+		require.Zero(t, finalizeLookups, "failed files must skip freshness finalization")
 		require.Zero(t, drained)
 	})
 }

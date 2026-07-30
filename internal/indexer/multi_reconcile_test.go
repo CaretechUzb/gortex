@@ -178,6 +178,49 @@ func Run() error { return exec.Command("true").Run() }
 		"janitor must consume the plan after the batched repository loop")
 }
 
+func TestReconcileAllCtx_PreservesExistingBatchFlags(t *testing.T) {
+	dir := t.TempDir()
+	repoAPath := filepath.Join(dir, "repo-a")
+	repoBPath := filepath.Join(dir, "repo-b")
+	require.NoError(t, os.MkdirAll(repoAPath, 0o755))
+	require.NoError(t, os.MkdirAll(repoBPath, 0o755))
+	writeFile(t, filepath.Join(repoAPath, "a.go"), "package a\nfunc A() {}\n")
+	writeFile(t, filepath.Join(repoBPath, "b.go"), "package b\nfunc B() {}\n")
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{
+		{Path: repoAPath, Name: "repo-a"},
+		{Path: repoBPath, Name: "repo-b"},
+	}}
+	gc.SetConfigPath(cfgPath)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(cfgPath)
+	require.NoError(t, err)
+
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+
+	idxA := mi.GetIndexer("repo-a")
+	idxB := mi.GetIndexer("repo-b")
+	require.NotNil(t, idxA)
+	require.NotNil(t, idxB)
+
+	// ReconcileAllCtx may run while an outer batch owns the shared flag. Give
+	// the second repository an intentionally independent value so this also
+	// catches per-repository state leaking across the reconciliation loop.
+	mi.BeginBatch()
+	t.Cleanup(mi.ResetBatch)
+	idxB.SetDeferGlobalPasses(false)
+
+	results := mi.ReconcileAllCtx(context.Background())
+	require.Contains(t, results, "repo-a")
+	require.Contains(t, results, "repo-b")
+	assert.True(t, mi.deferGlobalPasses, "reconciliation must preserve the outer batch state")
+	assert.True(t, idxA.deferGlobalPasses.Load(), "reconciliation must preserve repo-a's batch state")
+	assert.False(t, idxB.deferGlobalPasses.Load(), "reconciliation must not leak repo-a's state into repo-b")
+}
+
 func reconcileHasEdgeKind(g graph.Store, kind graph.EdgeKind) bool {
 	for _, edge := range g.AllEdges() {
 		if edge != nil && edge.Kind == kind {

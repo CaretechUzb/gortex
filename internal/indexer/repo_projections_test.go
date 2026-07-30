@@ -1,7 +1,6 @@
 package indexer
 
 import (
-	"context"
 	"reflect"
 	"testing"
 
@@ -69,11 +68,12 @@ func TestBatchLanguageSetsUsesOneNodeOnlyProjection(t *testing.T) {
 func TestRunGlobalGraphPassesProjectsScopedTypeIDsOnce(t *testing.T) {
 	store := &countingRepoProjectionStore{Store: graph.New()}
 	mi := &MultiIndexer{
-		graph:                store,
-		logger:               zap.NewNop(),
-		batchChangedPrefixes: map[string]struct{}{"b": {}, "a": {}},
+		graph:  store,
+		logger: zap.NewNop(),
 	}
-	mi.RunGlobalGraphPasses(context.Background())
+	mi.BeginBatch()
+	mi.ArmBatchScope(map[string]struct{}{"b": {}, "a": {}})
+	mi.EndBatch()
 
 	if store.kindIDCalls != 1 {
 		t.Fatalf("kind-ID projection calls = %d, want 1", store.kindIDCalls)

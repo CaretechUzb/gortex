@@ -87,7 +87,7 @@ func TestPartialNonGoReparseUsesOneLanguageBatchAndNoRepoPass(t *testing.T) {
 	store := graph.New()
 	idx := New(store, partialScopeRegistry(), config.IndexConfig{}, zap.NewNop())
 	idx.SetRootPath(root)
-	idx.deferGlobalPasses = true
+	idx.deferGlobalPasses.Store(true)
 	provider := &partialScopeBatchProvider{language: "python"}
 	manager := semantic.NewManager(semantic.Config{
 		Enabled: true,

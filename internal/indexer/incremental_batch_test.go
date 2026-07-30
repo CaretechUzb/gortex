@@ -174,7 +174,7 @@ func runIncrementalBatchScale(t *testing.T, fileCount int) incrementalBatchCount
 	idx := newTestIndexer(counting)
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
-	idx.deferGlobalPasses = true
+	idx.deferGlobalPasses.Store(true)
 	counting.resetCounts()
 
 	future := time.Now().Add(3 * time.Second)

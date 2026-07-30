@@ -98,7 +98,11 @@ func echo(s string) string { return s }
 	files := goFilesUnder(t, dir)
 	require.NotEmpty(t, files)
 	for _, f := range files {
-		require.NoError(t, idx.IndexFileNoResolve(f))
+		// This fixture deliberately stops before resolver/dataflow work. The
+		// public IndexFileNoResolve compatibility alias now owns the complete
+		// coordinated point-mutation pipeline, so use the package-private raw
+		// helper to preserve the test's pre-materialisation graph state.
+		require.NoError(t, idx.indexFile(f, false))
 	}
 	idx.resolver.ResolveAll()
 

@@ -20,7 +20,6 @@ import (
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/pathkey"
-	"github.com/zzet/gortex/internal/reach"
 )
 
 // ChangeKind describes the type of filesystem change.
@@ -66,12 +65,27 @@ type MutationResult struct {
 // It receives the file path, old symbols (before eviction), and new symbols (after re-index).
 type SymbolChangeCallback func(filePath string, oldSymbols, newSymbols []*graph.Node)
 
+// symbolChangeNotification freezes one callback and its payload while a graph
+// mutation is still admitted. The callback itself is dispatched only after the
+// repository lane has been released, so a callback may safely re-enter an
+// indexing API for the same repository.
+type symbolChangeNotification struct {
+	callback   SymbolChangeCallback
+	filePath   string
+	oldSymbols []*graph.Node
+	newSymbols []*graph.Node
+}
+
 // Watcher keeps the knowledge graph in live sync with the filesystem.
 type Watcher struct {
-	indexer  *Indexer
-	fsw      fswatcher.Watcher
-	fsCancel context.CancelFunc
-	config   config.WatchConfig
+	// indexer is the original lane carrier. MultiWatcher installs currentIndexer
+	// so a long-lived watcher selects the currently registered Indexer only after
+	// this stable per-repository lane admits the mutation.
+	indexer        *Indexer
+	currentIndexer func() *Indexer
+	fsw            fswatcher.Watcher
+	fsCancel       context.CancelFunc
+	config         config.WatchConfig
 	// degradedNoFsnotify is set when Start detected a slow mount (a WSL2
 	// 9p/drvfs Windows drive, an SMB share) and skipped the native fsnotify
 	// backend, relying on the adaptive poller + git hooks instead.
@@ -142,8 +156,12 @@ type Watcher struct {
 	stormStopped     bool                  // Stop has closed storm admission
 	stormWork        sync.WaitGroup        // scheduled/running timer callbacks
 	stormDrained     func(int)             // test hook: batch drained; batch size arg
-	stormBeforeLock  func()                // test hook: immediately before patchMu acquisition
+	stormBeforeLock  func()                // test hook: immediately before repository-lane admission
 	batchReindex     watcherBatchReindex   // one bounded batch; MultiWatcher installs shared catch-up
+	discoverReindex  watcherBatchReindex   // additive directory discovery with the same complete tail
+	// pointReindexRaw runs the complete exact-path pipeline after the watcher
+	// already owns the repository lane. MultiWatcher installs its raw tail here.
+	pointReindexRaw func(string) (*IndexResult, error)
 
 	// poller is the adaptive-interval fallback that re-checks git
 	// HEAD movement and tracked-file mtimes on a timer, catching the
@@ -154,18 +172,20 @@ type Watcher struct {
 	poller *Poller
 
 	// reconcileMu guards the overflow-driven full-tree reconcile.
-	// reconcilePending coalesces a burst of overflow / dropped-event
-	// signals into at most one reconcile in flight: the kernel inotify
-	// queue can overflow (EventOverflow) or the backend can drop events
+	// reconcilePending keeps one worker in flight; reconcileGeneration advances
+	// for every overflow / dropped-event signal so a signal arriving during a
+	// tree walk produces one coalesced follow-up pass. The kernel inotify queue
+	// can overflow (EventOverflow) or the backend can drop events
 	// under backpressure (the Dropped() channel), and either means we
 	// may have lost a create/modify with no path to re-index. macOS
 	// FSEvents self-heals (it re-scans on UserDropped/KernelDropped),
 	// but Linux inotify does not — without this the lost event waits on
 	// the up-to-1h janitor. reconcileFn is a test seam: nil in
 	// production (the real full-tree coordinator runs).
-	reconcileMu      sync.Mutex
-	reconcilePending bool
-	reconcileFn      func()
+	reconcileMu         sync.Mutex
+	reconcilePending    bool
+	reconcileGeneration uint64
+	reconcileFn         func()
 
 	// pendingScanDirs coalesces newly-created directories awaiting a
 	// scoped subtree re-index — the new-subdir race (see enqueueDirScan).
@@ -189,9 +209,10 @@ type Watcher struct {
 const maxHistory = 1000
 
 var (
-	errMutationSuperseded   = errors.New("mutation generation superseded")
-	errMutationPatchAborted = errors.New("mutation patch aborted")
-	errWatcherStopped       = errors.New("watcher stopped before mutation completed")
+	errMutationSuperseded    = errors.New("mutation generation superseded")
+	errMutationPatchAborted  = errors.New("mutation patch aborted")
+	errWatcherStopped        = errors.New("watcher stopped before mutation completed")
+	errWatcherIndexerMissing = errors.New("watcher repository indexer is no longer registered")
 )
 
 // probeMarker is the substring embedded in handshake-probe filenames
@@ -244,6 +265,98 @@ func NewWatcher(idx *Indexer, cfg config.WatchConfig, logger *zap.Logger) (*Watc
 		done:              make(chan struct{}),
 		stopped:           make(chan struct{}),
 	}, nil
+}
+
+// currentMutationIndexer returns the currently registered per-repository
+// Indexer for a MultiWatcher-owned watcher. Standalone watchers have no
+// registry indirection and continue to use their construction-time Indexer.
+func (w *Watcher) currentMutationIndexer() *Indexer {
+	if w.currentIndexer != nil {
+		return w.currentIndexer()
+	}
+	return w.indexer
+}
+
+// cloneSymbolChangeNodes detaches callback payloads from graph-owned node and
+// metadata maps. Graph swaps may reuse or update those objects as soon as the
+// repository lane opens for the next mutation.
+func cloneSymbolChangeNodes(nodes []*graph.Node) []*graph.Node {
+	if nodes == nil {
+		return nil
+	}
+	cloned := make([]*graph.Node, len(nodes))
+	for i, node := range nodes {
+		if node == nil {
+			continue
+		}
+		copyNode := *node
+		if node.Meta != nil {
+			copyNode.Meta = make(map[string]any, len(node.Meta))
+			for key, value := range node.Meta {
+				copyNode.Meta[key] = cloneSymbolChangeMeta(value)
+			}
+		}
+		cloned[i] = &copyNode
+	}
+	return cloned
+}
+
+func cloneSymbolChangeMeta(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(typed))
+		for key, nested := range typed {
+			cloned[key] = cloneSymbolChangeMeta(nested)
+		}
+		return cloned
+	case map[string]string:
+		cloned := make(map[string]string, len(typed))
+		for key, nested := range typed {
+			cloned[key] = nested
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(typed))
+		for i, nested := range typed {
+			cloned[i] = cloneSymbolChangeMeta(nested)
+		}
+		return cloned
+	case []string:
+		return append([]string(nil), typed...)
+	case []int:
+		return append([]int(nil), typed...)
+	default:
+		return value
+	}
+}
+
+func (w *Watcher) captureSymbolChange(
+	pending *symbolChangeNotification,
+	filePath string,
+	oldSymbols, newSymbols []*graph.Node,
+) {
+	if pending == nil {
+		return
+	}
+	w.symbolChangeCbMu.RLock()
+	callback := w.symbolChangeCb
+	w.symbolChangeCbMu.RUnlock()
+	if callback == nil {
+		return
+	}
+	*pending = symbolChangeNotification{
+		callback:   callback,
+		filePath:   filePath,
+		oldSymbols: cloneSymbolChangeNodes(oldSymbols),
+		newSymbols: cloneSymbolChangeNodes(newSymbols),
+	}
+}
+
+func (pending *symbolChangeNotification) dispatch() {
+	if pending == nil || pending.callback == nil {
+		return
+	}
+	pending.callback(pending.filePath, pending.oldSymbols, pending.newSymbols)
 }
 
 // Start begins watching the given paths recursively. The backend is
@@ -1079,20 +1192,21 @@ func (w *Watcher) beginReconcileWork() bool {
 // reconcile in response to a lost-event signal (a kernel inotify queue
 // overflow or a backpressure-dropped event). A burst of signals
 // collapses into at most one reconcile in flight: the first caller sets
-// reconcilePending and runs the reconcile off the event loop; concurrent
-// callers observe the flag and return immediately. Best-effort and
+// One worker drains reconcileGeneration off the event loop. Concurrent
+// callers only advance the dirty generation and return; the active worker
+// observes it after the current walk and runs one follow-up. Best-effort and
 // logged — the event loop is never blocked.
 func (w *Watcher) triggerOverflowReconcile(reason string) {
 	if !w.beginReconcileWork() {
 		return
 	}
+	w.reconcileGeneration++
 	if w.reconcilePending {
 		w.reconcileMu.Unlock()
 		w.asyncWork.Done()
 		return
 	}
 	w.reconcilePending = true
-	fn := w.reconcileFn
 	w.reconcileMu.Unlock()
 
 	if w.logger != nil {
@@ -1103,26 +1217,45 @@ func (w *Watcher) triggerOverflowReconcile(reason string) {
 
 	go func() {
 		defer w.asyncWork.Done()
+		normalExit := false
 		defer func() {
+			if normalExit {
+				return
+			}
 			w.reconcileMu.Lock()
 			w.reconcilePending = false
 			w.reconcileMu.Unlock()
 		}()
 		defer w.guardWatcherPanic("overflow-reconcile")
-		if fn != nil {
-			fn()
-			return
-		}
-		var err error
-		if w.batchReindex != nil {
-			_, err = w.batchReindex(nil)
-		} else {
-			_, err = w.indexer.IncrementalReindexPaths(w.indexer.rootPath, nil)
-		}
-		if err != nil && w.logger != nil {
-			w.logger.Warn("watcher: overflow reconcile failed",
-				zap.String("reason", reason),
-				zap.Error(err))
+
+		for {
+			w.reconcileMu.Lock()
+			generation := w.reconcileGeneration
+			fn := w.reconcileFn
+			w.reconcileMu.Unlock()
+
+			var err error
+			if fn != nil {
+				fn()
+			} else if w.batchReindex != nil {
+				_, err = w.batchReindex(nil)
+			} else {
+				_, err = w.indexer.IncrementalReindexPaths(w.indexer.rootPath, nil)
+			}
+			if err != nil && w.logger != nil {
+				w.logger.Warn("watcher: overflow reconcile failed",
+					zap.String("reason", reason),
+					zap.Error(err))
+			}
+
+			w.reconcileMu.Lock()
+			if w.reconcileGeneration == generation {
+				w.reconcilePending = false
+				normalExit = true
+				w.reconcileMu.Unlock()
+				return
+			}
+			w.reconcileMu.Unlock()
 		}
 	}()
 }
@@ -1189,23 +1322,37 @@ func (w *Watcher) runDirScan(dirs map[string]struct{}, fn func(map[string]struct
 		fn(dirs)
 		return
 	}
-	if len(dirs) > dirScanEscalateCap {
+
+	paths := make([]string, 0, len(dirs))
+	full := len(dirs) > dirScanEscalateCap
+	if full {
 		if w.logger != nil {
 			w.logger.Info("watcher: large new-directory burst — full-tree discovery",
 				zap.Int("dirs", len(dirs)), zap.String("root", w.indexer.rootPath))
 		}
-		if _, err := w.indexer.incrementalDiscoverPaths(w.indexer.rootPath, nil); err != nil && w.logger != nil {
-			w.logger.Warn("watcher: new-directory discovery failed", zap.Error(err))
+	} else {
+		for dir := range dirs {
+			paths = append(paths, dir)
 		}
-		return
+		sort.Strings(paths)
 	}
-	paths := make([]string, 0, len(dirs))
-	for d := range dirs {
-		paths = append(paths, d)
+
+	discoveryPaths := paths
+	if full {
+		discoveryPaths = nil
 	}
-	if _, err := w.indexer.incrementalDiscoverPaths(w.indexer.rootPath, paths); err != nil && w.logger != nil {
-		w.logger.Warn("watcher: new-directory scan failed",
-			zap.Strings("dirs", paths), zap.Error(err))
+	var err error
+	if w.discoverReindex != nil {
+		_, err = w.discoverReindex(discoveryPaths)
+	} else {
+		err = w.indexer.coordinateRepositoryMutation(context.Background(), func() error {
+			_, rawErr := w.indexer.incrementalDiscoverWatcherPaths(w.indexer.rootPath, discoveryPaths)
+			return rawErr
+		})
+	}
+	if err != nil && w.logger != nil {
+		w.logger.Warn("watcher: new-directory discovery failed",
+			zap.Strings("dirs", paths), zap.Bool("full", full), zap.Error(err))
 	}
 }
 
@@ -1633,14 +1780,13 @@ func (w *Watcher) drainStorm() {
 		w.completeStormMutationWaiters(generations, nil, errMutationPatchAborted)
 		return
 	}
-	// A pending point patch may already have left the debounce queue when storm
-	// mode took over, and the adaptive poller enters patchGraph directly. Keep
-	// the batch's snapshot/mutation boundary serialized with both producers.
+	// Point patches and the batch runner now meet at the repository lane. Keep
+	// the test hook at that admission boundary, but never take patchMu before a
+	// coordinated batch: point work acquires the repository lane first and
+	// nested lock ordering here would deadlock.
 	if w.stormBeforeLock != nil {
 		w.stormBeforeLock()
 	}
-	w.patchMu.Lock()
-	defer w.patchMu.Unlock()
 	var result *IndexResult
 	completionErr := errMutationPatchAborted
 	defer func() {
@@ -1654,23 +1800,12 @@ func (w *Watcher) drainStorm() {
 
 	start := time.Now()
 	w.logger.Info("watcher: storm drain starting", zap.Int("paths", len(paths)))
-	finishTopologyMutation := reach.BeginTopologyMutation(w.indexer.graph)
-	mutationFinished := false
-	defer func() {
-		if !mutationFinished {
-			// The batch is non-empty and may have partially applied before a
-			// panic. Invalidate conservatively before unblocking readers.
-			finishTopologyMutation(true)
-		}
-	}()
 
+	// reindexStormPaths enters the repository coordinator; its raw executor
+	// acquires the topology gate only after the repository lane is held.
 	var err error
 	result, err = w.reindexStormPaths(paths)
 	completionErr = err
-	// A batch-level error can arrive after sibling files committed. Invalidate
-	// conservatively and report it without retrying every path one-by-one.
-	finishTopologyMutation(true)
-	mutationFinished = true
 
 	reindexed, deleted, failed := 0, 0, 0
 	if result != nil {
@@ -1801,26 +1936,6 @@ func (w *Watcher) reconcileKindWithDisk(path string, kind ChangeKind) ChangeKind
 	return kind
 }
 
-// forgetDeletedFileMtime drops a just-evicted file's recorded mtime from
-// both the in-memory map and the store's FileMtime sidecar. EvictFile
-// removes the file's nodes but leaves its mtime behind, so without this the
-// persisted mtime row outlives the file: the next warm restart reads it
-// back, finds the path gone from disk, and treats it as a phantom deletion
-// — re-running a scoped reconcile for a file that is already correct on
-// every boot. Mirrors full-tree reconciliation's deletion handling: prune the
-// in-memory map first (pruneDeletedFileMtimes documents that its caller has
-// already done so, and a later snapshot persist would otherwise resurrect
-// the row from the stale in-memory entry), then the store, which self-skips
-// on a backend without the FileMtimeDeleter capability. relPath must be the
-// canonical relKey the mtime map and store are keyed on — the same key
-// EvictFile evicted the file's nodes under.
-func (w *Watcher) forgetDeletedFileMtime(relPath string) {
-	w.indexer.mtimeMu.Lock()
-	delete(w.indexer.fileMtimes, relPath)
-	w.indexer.mtimeMu.Unlock()
-	w.indexer.pruneDeletedFileMtimes([]string{relPath})
-}
-
 func (w *Watcher) generationCurrent(path string, generation uint64) bool {
 	if generation == 0 {
 		return true
@@ -1862,272 +1977,169 @@ func (w *Watcher) patchGraphWithReceiptState(path string, kind ChangeKind, gener
 		return errMutationSuperseded
 	}
 	defer w.finishGeneration(path, generation)
+
+	var pending symbolChangeNotification
+	// w.indexer carries the stable lane installed when this watcher was
+	// created. Select the registered Indexer only after admission, because an
+	// IndexRepo replacement uses the same lane and cannot change underneath
+	// the raw patch.
+	err := w.indexer.coordinateRepositoryMutation(context.Background(), func() error {
+		idx := w.currentMutationIndexer()
+		if idx == nil {
+			return errWatcherIndexerMissing
+		}
+		return w.patchGraphWithReceiptStateRawModern(idx, path, kind, generation, receiptChecked, &pending)
+	})
+	// User callbacks are deliberately outside the repository lane. Their
+	// payload was copied while the graph mutation still owned the lane.
+	pending.dispatch()
+	return err
+}
+
+func pointMutationClassification(
+	kind ChangeKind,
+	plan DerivedInvalidationPlan,
+	prior, fresh fileDeltaFingerprints,
+) string {
+	if kind == ChangeDeleted || kind == ChangeRenamed {
+		return "structural"
+	}
+	switch {
+	case plan.InertFiles > 0:
+		return "inert"
+	case plan.MetadataOnlyFiles > 0:
+		return "metadata_only"
+	case prior.core != "" && fresh.core != "" && prior.core == fresh.core:
+		return "artifact_only"
+	default:
+		return "structural"
+	}
+}
+
+// reindexPointPathRaw runs after the caller has acquired the repository lane.
+// MultiWatcher supplies the cross-repository resolver and derived tail; a
+// standalone Watcher falls back to the equivalent single-repository tail.
+func (w *Watcher) reindexPointPathRaw(idx *Indexer, path string) (*IndexResult, error) {
+	if w.pointReindexRaw != nil {
+		return w.pointReindexRaw(path)
+	}
+	if idx == nil || idx.rootPath == "" {
+		return nil, errWatcherIndexerMissing
+	}
+	return idx.incrementalPointWatcherPath(idx.rootPath, path)
+}
+
+// patchGraphWithReceiptStateRawModern replaces the historical hand-built point
+// patch with the same receipt, resolver, and exact derived-invalidation pipeline
+// used by bounded reconciliation. The caller already owns the repository lane.
+func (w *Watcher) patchGraphWithReceiptStateRawModern(
+	idx *Indexer,
+	path string,
+	kind ChangeKind,
+	generation uint64,
+	receiptChecked bool,
+	pending *symbolChangeNotification,
+) error {
+	if !w.generationCurrent(path, generation) {
+		return errMutationSuperseded
+	}
 	w.patchMu.Lock()
 	defer w.patchMu.Unlock()
 	if !w.generationCurrent(path, generation) {
 		return errMutationSuperseded
 	}
-	// A replace/revert (rename-over or unlink+recreate) reaches us as a
-	// delete/rename even though a file is right back at the same path;
-	// reconcile against disk so it takes the parse-then-swap + incoming-
-	// rebind modify path instead of a hard evict that would silently zero
-	// the definition's callers. A vanished create/modify becomes a delete.
-	kind = w.reconcileKindWithDisk(path, kind)
+
 	start := time.Now()
-	classification := "structural"
-	var nodesAdded, nodesRemoved, edgesAdded, edgesRemoved int
-	var finishTopologyMutation func(bool)
-	topologyChanged := false
-	// Keep a panic/error-safe release so no lookup can remain parked behind the
-	// reach topology gate if an incremental path exits early.
-	defer func() {
-		if finishTopologyMutation != nil {
-			finishTopologyMutation(topologyChanged)
-		}
-	}()
-	beginTopologyMutation := func() {
-		finishTopologyMutation = reach.BeginTopologyMutation(w.indexer.graph)
-		// Conservatively invalidate after every structural reindex attempt. Most
-		// parse failures leave the old graph untouched, but treating that as a
-		// cache miss is safer than trusting count-based telemetry to prove no
-		// resolver edge was retargeted.
-		topologyChanged = true
-	}
-	endTopologyMutation := func() {
-		if finishTopologyMutation == nil {
-			return
-		}
-		finishTopologyMutation(topologyChanged)
-		finishTopologyMutation = nil
+	kind = w.reconcileKindWithDisk(path, kind)
+	// This is the identity duplicate gate for native watcher events. A Darwin
+	// startup replay already checked the persisted receipt, so it bypasses this
+	// cheap in-memory mtime test and forces the exact observed path.
+	if kind == ChangeModified && !receiptChecked && idx.fileMtimeMatches(path) {
+		return nil
 	}
 
-	// Two keys for this file. relPath (RelKey: slash form + NFC) is the
-	// mtime-forget / change-callback key. graphKey (graphRelKey:
-	// OS-native separators + NFC, repo-prefixed) is what the graph
-	// stores the file's nodes under, so the GetFileNodes /
-	// snapshotSymbols lookups below MUST use it — a slash-form key
-	// misses the backslash-keyed nodes on Windows and would report every
-	// symbol as added/removed. Both fold an NFD (macOS) event path to
-	// NFC so a non-ASCII name still hits the indexed node. On POSIX the
-	// two keys coincide.
-	relPath := path
-	graphKey := path
-	if w.indexer.rootPath != "" {
-		relPath = w.indexer.RelKey(path)
-		graphKey = w.indexer.prefixPath(w.indexer.graphRelKey(path))
+	relPath := idx.graphRelKey(path)
+	callbackPath := idx.RelKey(path)
+	graphKey := idx.prefixPath(relPath)
+	priorNodes := idx.graph.GetFileNodes(graphKey)
+	priorFingerprint := storedExtractionGraphFingerprints(priorNodes)
+	priorEdges := w.countFileEdges(priorNodes)
+	priorResolved := 0
+	var priorIncoming map[string]int
+	if kind == ChangeModified {
+		priorResolved = w.countResolvedFileEdges(priorNodes)
+		priorIncoming = w.resolvedIncomingByNode(priorNodes)
+	}
+	// Freeze the before-image while the lane still owns the pre-mutation graph.
+	// Metadata-only refreshes may reuse and mutate the graph-owned node objects.
+	oldSymbols := cloneSymbolChangeNodes(callbackSymbols(priorNodes))
+
+	result, err := w.reindexPointPathRaw(idx, path)
+	if err != nil {
+		return err
+	}
+	if !w.generationCurrent(path, generation) {
+		return errMutationSuperseded
+	}
+	if result == nil {
+		return errors.New("watcher: exact-path reindex returned no result")
+	}
+	if len(result.FailedFiles) > 0 {
+		return fmt.Errorf("watcher: exact-path reindex failed for %s", strings.Join(result.FailedFiles, ", "))
+	}
+	// A second absent-file notification reaches a graph with neither source
+	// rows nor sidecar ownership. It is an identity duplicate, not a deletion.
+	if result.StaleFileCount == 0 && result.DeletedFileCount == 0 {
+		return nil
 	}
 
-	switch kind {
-	case ChangeCreated:
-		beginTopologyMutation()
-		if err := w.indexer.IndexFile(path); err != nil {
-			w.logger.Warn("index file failed", zap.String("path", path), zap.Error(err))
-			return err
-		}
-		newSymbols := w.indexer.graph.GetFileNodes(graphKey)
-		nodesAdded = len(newSymbols)
-		edgesAdded = w.countFileEdges(newSymbols)
-		endTopologyMutation()
-
-		// Notify callback: no old symbols, only new symbols.
-		w.symbolChangeCbMu.RLock()
-		cb := w.symbolChangeCb
-		w.symbolChangeCbMu.RUnlock()
-		if cb != nil {
-			cb(relPath, nil, newSymbols)
-		}
-
-	case ChangeModified:
-		// Native backends and the adaptive poller deliberately overlap. A late
-		// startup replay or duplicate report can therefore arrive after the file
-		// is already committed. Mtime is only the fast receipt gate: equal values
-		// are confirmed against the persisted content hash, so a timestamp-
-		// preserving real edit still enters the normal mutation lifecycle.
-		if !receiptChecked && w.indexer.fileMtimeMatches(path) {
-			return nil
-		}
-		// Read the prior file state once. It supplies the callback snapshot,
-		// gross change telemetry and the durable raw-extraction fingerprint;
-		// repeating GetFileNodes here is particularly costly when SQLite is
-		// under analysis load.
-		snapshotStarted := time.Now()
-		priorNodes := w.indexer.graph.GetFileNodes(graphKey)
-		oldSymbols := make([]*graph.Node, 0, len(priorNodes))
-		for _, n := range priorNodes {
-			if n == nil || n.Kind == graph.KindFile || n.Kind == graph.KindImport {
-				continue
-			}
-			cp := &graph.Node{ID: n.ID, Kind: n.Kind, Name: n.Name, QualName: n.QualName, FilePath: n.FilePath}
-			if sig, ok := n.Meta["signature"]; ok {
-				cp.Meta = map[string]any{"signature": sig}
-			}
-			oldSymbols = append(oldSymbols, cp)
-		}
-		snapshotDuration := time.Since(snapshotStarted)
-
-		// Parse once and compare the complete post-coverage extraction, not
-		// only declarations. A changed call target, doc, TODO, location,
-		// metadata field or edge changes this fingerprint and must patch the
-		// graph. Only a byte-for-byte-equivalent graph output is inert. The
-		// prepared extraction is consumed by IndexFile below, avoiding the old
-		// double parse on structural edits.
-		probe, probeOK := w.indexer.prepareFileDelta(path)
-		if !w.generationCurrent(path, generation) {
-			w.indexer.discardPreparedExtraction(path)
-			return errMutationSuperseded
-		}
-		stored := storedExtractionGraphFingerprints(priorNodes)
-		classification := "structural"
-		if probeOK && stored.semantic != "" {
-			switch {
-			case probe.fingerprints.semantic == stored.semantic && probe.fingerprints.metadata == stored.metadata:
-				w.indexer.discardPreparedExtraction(path)
-				w.logger.Info("watcher: inert delta phases",
-					zap.String("file", path), zap.String("delta_class", "inert"),
-					zap.Duration("snapshot", snapshotDuration), zap.Duration("read", probe.read),
-					zap.Duration("extract", probe.extract), zap.Duration("coverage", probe.coverage),
-					zap.Duration("fingerprint", probe.fingerprintTime))
-				fresh := w.recordInertModify(path, relPath, oldSymbols, start, probe.readVersion)
-				if !fresh {
-					return errFileVersionChanged
-				}
-				return nil
-			case probe.fingerprints.semantic == stored.semantic:
-				var refreshed []*graph.Node
-				var applied, fresh bool
-				if generation == 0 {
-					refreshed, applied, fresh = w.indexer.applyPreparedMetadataRefresh(path, priorNodes)
-				} else {
-					// Serialise generation validation with the bounded commit. A newer
-					// event cannot register between the byte check and fingerprint/mtime write.
-					w.mu.Lock()
-					if w.pendingGeneration[path] == generation {
-						refreshed, applied, fresh = w.indexer.applyPreparedMetadataRefresh(path, priorNodes)
-					}
-					w.mu.Unlock()
-				}
-				if applied {
-					w.logger.Info("watcher: metadata-only delta phases",
-						zap.String("file", path), zap.String("delta_class", "metadata_only"),
-						zap.Duration("snapshot", snapshotDuration), zap.Duration("read", probe.read),
-						zap.Duration("extract", probe.extract), zap.Duration("coverage", probe.coverage),
-						zap.Duration("fingerprint", probe.fingerprintTime))
-					w.recordMetadataModify(path, relPath, oldSymbols, refreshed, start)
-					if !fresh {
-						return errFileVersionChanged
-					}
-					return nil
-				}
-			case stored.core != "" && probe.fingerprints.core == stored.core:
-				classification = "artifact_only"
-			}
-		}
-
-		// Do NOT pre-evict. IndexFile parse-then-swaps internally and consumes
-		// the prepared extraction when its transformed bytes still match.
-		reindexStarted := time.Now()
-		fileEdgesBefore := w.countFileEdges(priorNodes)
-		resolvedBefore := w.countResolvedFileEdges(priorNodes)
-		incomingBeforeByID := w.resolvedIncomingByNode(priorNodes)
-		beginTopologyMutation()
-		if err := w.indexer.IndexFile(path); err != nil {
-			w.logger.Warn("reindex file failed", zap.String("path", path), zap.Error(err))
-			return err
-		}
-		nodesRemoved = len(priorNodes)
-		newSymbols := w.indexer.graph.GetFileNodes(graphKey)
-		nodesAdded = len(newSymbols)
-		// Edge churn scoped to this file's nodes. A graph-wide
-		// EdgeCount delta would also pick up edges landed by whatever
-		// else mutates the graph during this patch (concurrent
-		// reconciles, deferred passes), which made the edges+ figure
-		// meaningless noise on a busy daemon.
-		if fileEdgesAfter := w.countFileEdges(newSymbols); fileEdgesAfter >= fileEdgesBefore {
-			edgesAdded = fileEdgesAfter - fileEdgesBefore
-		} else {
-			edgesRemoved = fileEdgesBefore - fileEdgesAfter
-		}
-		// Shape-degradation guard: a modify that kept its symbols but lost
-		// most of its resolved edges is a transient resolution failure, not a
-		// real deletion — flag it and enqueue a forced scoped re-resolve so it
-		// self-heals instead of persisting the degraded shape.
-		incomingBefore, incomingAfter := w.incomingRegressionForSurvivors(incomingBeforeByID, newSymbols)
-		w.guardResolvedEdgeRegression(path, len(priorNodes), len(newSymbols), resolvedBefore, w.countResolvedFileEdges(newSymbols), incomingBefore, incomingAfter)
-		endTopologyMutation()
-		w.logger.Info("watcher: structural delta phases",
-			zap.String("file", path),
-			zap.String("delta_class", classification),
-			zap.Duration("snapshot", snapshotDuration),
-			zap.Duration("read", probe.read),
-			zap.Duration("extract", probe.extract),
-			zap.Duration("coverage", probe.coverage),
-			zap.Duration("fingerprint", probe.fingerprintTime),
-			zap.Duration("reindex", time.Since(reindexStarted)),
-			zap.Bool("probe_complete", probeOK),
-			zap.Bool("clone_pending", w.indexer.CloneIndexPending()))
-
-		// Notify callback with old and new symbols.
-		w.symbolChangeCbMu.RLock()
-		cb := w.symbolChangeCb
-		w.symbolChangeCbMu.RUnlock()
-		if cb != nil {
-			cb(relPath, oldSymbols, newSymbols)
-		}
-
-	case ChangeDeleted, ChangeRenamed:
-		// Snapshot old symbols before eviction.
-		oldSymbols := w.snapshotSymbols(graphKey)
-
-		beginTopologyMutation()
-		nr, er := w.indexer.EvictFile(path)
-		nodesRemoved = nr
-		edgesRemoved = er
-		topologyChanged = nr > 0 || er > 0
-		endTopologyMutation()
-
-		// The file is genuinely gone from disk here — reconcileKindWithDisk
-		// already downgraded a replace/revert (path still present) to
-		// ChangeModified. Drop its now-orphaned mtime so a warm restart does
-		// not re-discover the vanished path as a phantom deletion. relPath is
-		// the canonical relKey EvictFile evicted under.
-		w.forgetDeletedFileMtime(relPath)
-		// fsnotify and the adaptive poller are deliberately redundant. They
-		// may both report the same deletion, but only the producer that
-		// actually removed graph topology represents a semantic change. Do
-		// not publish a second empty callback/history/event: consumers would
-		// otherwise lose the pre-delete symbol snapshot or repeat downstream
-		// invalidation work. EvictFile's zero delta is authoritative even for
-		// source files that contain no symbols of their own.
-		if nr == 0 && er == 0 {
-			return nil
-		}
-
-		// Notify callback: old symbols removed, no new symbols.
-		w.symbolChangeCbMu.RLock()
-		cb := w.symbolChangeCb
-		w.symbolChangeCbMu.RUnlock()
-		if cb != nil {
-			cb(relPath, oldSymbols, nil)
-		}
-	}
+	freshNodes := idx.graph.GetFileNodes(graphKey)
+	freshFingerprint := storedExtractionGraphFingerprints(freshNodes)
+	classification := pointMutationClassification(kind, result.DerivedInvalidation, priorFingerprint, freshFingerprint)
+	freshEdges := w.countFileEdges(freshNodes)
 
 	ev := GraphChangeEvent{
 		FilePath:       path,
 		Kind:           kind,
 		Classification: classification,
-		NodesAdded:     nodesAdded,
-		NodesRemoved:   nodesRemoved,
-		EdgesAdded:     edgesAdded,
-		EdgesRemoved:   edgesRemoved,
 		Timestamp:      time.Now(),
 		DurationMs:     time.Since(start).Milliseconds(),
 	}
-
-	// Reach invalidation is published by endTopologyMutation before any
-	// callbacks or events can observe the new graph. The topology gate spans
-	// IndexFile's parse-then-swap and nested resolver work without taking the
-	// resolver's non-reentrant mutex twice; impact readers therefore see the
-	// complete old graph or the complete new graph, never the eviction gap.
+	switch kind {
+	case ChangeCreated:
+		ev.NodesAdded = len(freshNodes)
+		ev.EdgesAdded = freshEdges
+		w.captureSymbolChange(pending, callbackPath, nil, callbackSymbols(freshNodes))
+	case ChangeModified:
+		if classification == "structural" || classification == "artifact_only" {
+			ev.NodesRemoved = len(priorNodes)
+			ev.NodesAdded = len(freshNodes)
+			if freshEdges >= priorEdges {
+				ev.EdgesAdded = freshEdges - priorEdges
+			} else {
+				ev.EdgesRemoved = priorEdges - freshEdges
+			}
+			incomingBefore, incomingAfter := w.incomingRegressionForSurvivors(priorIncoming, freshNodes)
+			w.guardResolvedEdgeRegression(
+				path,
+				len(priorNodes),
+				len(freshNodes),
+				priorResolved,
+				w.countResolvedFileEdges(freshNodes),
+				incomingBefore,
+				incomingAfter,
+			)
+		}
+		if classification == "inert" {
+			w.captureSymbolChange(pending, callbackPath, oldSymbols, oldSymbols)
+		} else {
+			w.captureSymbolChange(pending, callbackPath, oldSymbols, callbackSymbols(freshNodes))
+		}
+	case ChangeDeleted, ChangeRenamed:
+		ev.NodesRemoved = len(priorNodes)
+		ev.EdgesRemoved = priorEdges
+		w.captureSymbolChange(pending, callbackPath, oldSymbols, nil)
+	}
 
 	w.historyMu.Lock()
 	w.history = append(w.history, ev)
@@ -2135,22 +2147,17 @@ func (w *Watcher) patchGraphWithReceiptState(path string, kind ChangeKind, gener
 		w.history = w.history[len(w.history)-maxHistory:]
 	}
 	w.historyMu.Unlock()
-
-	// Non-blocking send.
 	select {
 	case w.events <- ev:
 	default:
 	}
-
-	w.logger.Info("graph patch",
-		zap.String("kind", string(kind)),
-		zap.String("file", path),
-		zap.Int("nodes+", nodesAdded),
-		zap.Int("nodes-", nodesRemoved),
-		zap.Int("edges+", edgesAdded),
-		zap.Int("edges-", edgesRemoved),
-		zap.Int64("ms", ev.DurationMs),
-	)
+	if w.logger != nil {
+		w.logger.Info("graph patch complete",
+			zap.String("file", path),
+			zap.String("kind", string(kind)),
+			zap.String("delta_class", classification),
+			zap.Int64("ms", ev.DurationMs))
+	}
 	return nil
 }
 
@@ -2159,7 +2166,8 @@ func (w *Watcher) patchGraphWithReceiptState(path string, kind ChangeKind, gener
 // (an intra-file edge is already counted on its From side). Batched
 // so a disk backend pays two bulk lookups instead of 2N point queries.
 func (w *Watcher) countFileEdges(nodes []*graph.Node) int {
-	if len(nodes) == 0 {
+	idx := w.currentMutationIndexer()
+	if idx == nil || len(nodes) == 0 {
 		return 0
 	}
 	ids := make([]string, 0, len(nodes))
@@ -2169,10 +2177,10 @@ func (w *Watcher) countFileEdges(nodes []*graph.Node) int {
 		inFile[n.ID] = struct{}{}
 	}
 	total := 0
-	for _, edges := range w.indexer.graph.GetOutEdgesByNodeIDs(ids) {
+	for _, edges := range idx.graph.GetOutEdgesByNodeIDs(ids) {
 		total += len(edges)
 	}
-	for _, edges := range w.indexer.graph.GetInEdgesByNodeIDs(ids) {
+	for _, edges := range idx.graph.GetInEdgesByNodeIDs(ids) {
 		for _, e := range edges {
 			if _, ok := inFile[e.From]; !ok {
 				total++
@@ -2194,7 +2202,8 @@ const resolvedEdgeRegressionFloor = 4
 // cannot give: an edge demoted from a resolved target to a stub keeps the total
 // incident-edge count identical while losing a resolution.
 func (w *Watcher) countResolvedFileEdges(nodes []*graph.Node) int {
-	if len(nodes) == 0 {
+	idx := w.currentMutationIndexer()
+	if idx == nil || len(nodes) == 0 {
 		return 0
 	}
 	ids := make([]string, 0, len(nodes))
@@ -2202,7 +2211,7 @@ func (w *Watcher) countResolvedFileEdges(nodes []*graph.Node) int {
 		ids = append(ids, n.ID)
 	}
 	total := 0
-	for _, edges := range w.indexer.graph.GetOutEdgesByNodeIDs(ids) {
+	for _, edges := range idx.graph.GetOutEdgesByNodeIDs(ids) {
 		for _, e := range edges {
 			if e != nil && !graph.IsUnresolvedTarget(e.To) {
 				total++
@@ -2262,7 +2271,8 @@ func (w *Watcher) guardResolvedEdgeRegression(path string, nodesBefore, nodesAft
 // — this is the signal that catches an external revert zeroing a surviving
 // symbol's usages.
 func (w *Watcher) resolvedIncomingByNode(nodes []*graph.Node) map[string]int {
-	if len(nodes) == 0 {
+	idx := w.currentMutationIndexer()
+	if idx == nil || len(nodes) == 0 {
 		return nil
 	}
 	ids := make([]string, 0, len(nodes))
@@ -2275,7 +2285,7 @@ func (w *Watcher) resolvedIncomingByNode(nodes []*graph.Node) map[string]int {
 		return nil
 	}
 	byNode := make(map[string]int, len(ids))
-	for id, edges := range w.indexer.graph.GetInEdgesByNodeIDs(ids) {
+	for id, edges := range idx.graph.GetInEdgesByNodeIDs(ids) {
 		c := 0
 		for _, e := range edges {
 			if e != nil && graph.IsResolvableRefEdge(e.Kind) {
@@ -2354,83 +2364,54 @@ func (w *Watcher) enqueueReresolve(path string) {
 					fn(files)
 					return
 				}
-				for p := range files {
-					if err := w.indexer.ReresolveFileScoped(p); err != nil && w.logger != nil {
-						w.logger.Warn("watcher: forced scoped re-resolve failed",
-							zap.String("file", p), zap.Error(err))
+				paths := make([]string, 0, len(files))
+				for path := range files {
+					paths = append(paths, path)
+				}
+				sort.Strings(paths)
+				// Admit on the watcher's stable lane, then resolve the current
+				// registered Indexer. IndexRepo replacement cannot interleave
+				// between that lookup and the scoped re-resolve loop.
+				err := w.indexer.coordinateRepositoryMutation(context.Background(), func() error {
+					idx := w.currentMutationIndexer()
+					if idx == nil {
+						return errWatcherIndexerMissing
 					}
+					for _, path := range paths {
+						if err := idx.reresolveFileScopedRaw(path); err != nil && w.logger != nil {
+							w.logger.Warn("watcher: forced scoped re-resolve failed",
+								zap.String("file", path), zap.Error(err))
+						}
+					}
+					return nil
+				})
+				if err != nil && w.logger != nil {
+					w.logger.Warn("watcher: forced scoped re-resolve admission failed", zap.Error(err))
 				}
 			}()
 		}
 	}()
 }
 
-// recordInertModify finishes a ChangeModified patch that the
-// content-aware skip proved structurally inert. The graph already
-// holds the correct symbols, so the destructive evict + reindex is
-// skipped; this records the bookkeeping the skipped path would
-// otherwise have produced:
-//
-//   - the indexer's recorded mtime is restamped so the adaptive
-//     poller's mtime sweep does not keep re-flagging the file;
-//   - a zero-delta GraphChangeEvent is appended to history and
-//     published, so get_recent_changes still shows the save (with
-//     all node/edge counts zero — nothing structural moved);
-//   - the symbol-change callback fires with the unchanged symbol set
-//     on both sides, mirroring the no-op so consumers see a
-//     consistent before == after.
-//
-// The reachability index is intentionally not rebuilt — the topology
-// did not change, so the existing reach stamps stay valid.
-func (w *Watcher) recordInertModify(path, relPath string, symbols []*graph.Node, start time.Time, version fileReadVersion) bool {
-	// Claim only the exact byte version whose fingerprints were compared. A
-	// later write must stay dirty for the next poll/native event even though the
-	// earlier, real save still owns this inert event and callback.
-	fresh := w.indexer.recordFileReadVersion(relPath, path, version)
-	w.recordNonStructuralModify(path, relPath, symbols, symbols, "inert", start)
-	return fresh
-}
-
-func (w *Watcher) recordMetadataModify(path, relPath string, oldSymbols, refreshed []*graph.Node, start time.Time) {
-	newSymbols := make([]*graph.Node, 0, len(refreshed))
-	for _, node := range refreshed {
+func callbackSymbols(nodes []*graph.Node) []*graph.Node {
+	symbols := make([]*graph.Node, 0, len(nodes))
+	for _, node := range nodes {
 		if node == nil || node.Kind == graph.KindFile || node.Kind == graph.KindImport {
 			continue
 		}
-		newSymbols = append(newSymbols, node)
+		symbols = append(symbols, node)
 	}
-	w.recordNonStructuralModify(path, relPath, oldSymbols, newSymbols, "metadata_only", start)
-}
-
-func (w *Watcher) recordNonStructuralModify(path, relPath string, oldSymbols, newSymbols []*graph.Node, classification string, start time.Time) {
-	ev := GraphChangeEvent{
-		FilePath: path, Kind: ChangeModified, Classification: classification,
-		Timestamp: time.Now(), DurationMs: time.Since(start).Milliseconds(),
-	}
-	w.historyMu.Lock()
-	w.history = append(w.history, ev)
-	if len(w.history) > maxHistory {
-		w.history = w.history[len(w.history)-maxHistory:]
-	}
-	w.historyMu.Unlock()
-	select {
-	case w.events <- ev:
-	default:
-	}
-	w.symbolChangeCbMu.RLock()
-	cb := w.symbolChangeCb
-	w.symbolChangeCbMu.RUnlock()
-	if cb != nil {
-		cb(relPath, oldSymbols, newSymbols)
-	}
-	w.logger.Info("graph patch: non-structural change",
-		zap.String("file", path), zap.String("delta_class", classification), zap.Int64("ms", ev.DurationMs))
+	return symbols
 }
 
 // snapshotSymbols returns a deep copy of the symbols for a file, preserving
 // their signatures in Meta so they can be compared after re-indexing.
 func (w *Watcher) snapshotSymbols(graphKey string) []*graph.Node {
-	nodes := w.indexer.graph.GetFileNodes(graphKey)
+	idx := w.currentMutationIndexer()
+	if idx == nil {
+		return nil
+	}
+	nodes := idx.graph.GetFileNodes(graphKey)
 	snapshot := make([]*graph.Node, 0, len(nodes))
 	for _, n := range nodes {
 		// Skip file and import nodes — we only track code symbols.

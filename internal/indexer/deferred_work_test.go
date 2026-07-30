@@ -121,7 +121,7 @@ func TestDeferredIncrementalGoFrontierUsesOneBatchAndNoRepoPass(t *testing.T) {
 			languages.RegisterAll(registry)
 			idx := New(store, registry, config.IndexConfig{}, zap.NewNop())
 			idx.rootPath = root
-			idx.deferGlobalPasses = true
+			idx.deferGlobalPasses.Store(true)
 
 			provider := &deferredBatchProvider{}
 			manager := semantic.NewManager(semantic.Config{

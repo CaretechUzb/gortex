@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"sort"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/reach"
 )
 
 // watcherBatchReindex is the common large-change entry point used by both the
@@ -20,11 +23,22 @@ type watcherBatchReindex func(paths []string) (*IndexResult, error)
 func (idx *Indexer) incrementalReindexPathsWithReceipt(
 	root string,
 	paths []string,
+	detectDeletions bool,
+) (result *IndexResult, receipt *graph.MutationReceipt, batch *reparsePendingEnrichmentBatch, err error) {
+	return idx.incrementalReindexPathsWithReceiptMode(root, paths, incrementalPathMode{
+		detectDeletions: detectDeletions,
+	})
+}
+
+func (idx *Indexer) incrementalReindexPathsWithReceiptMode(
+	root string,
+	paths []string,
+	mode incrementalPathMode,
 ) (result *IndexResult, receipt *graph.MutationReceipt, batch *reparsePendingEnrichmentBatch, err error) {
 	batch = &reparsePendingEnrichmentBatch{deferResolverCatchup: true}
 	receiptStore, _ := idx.graph.(graph.MutationReceiptStore)
 	if receiptStore == nil {
-		result, err = idx.incrementalReindexPaths(root, paths, true, batch)
+		result, err = idx.incrementalReindexPathsMode(root, paths, mode, batch)
 		return result, nil, batch, err
 	}
 
@@ -33,7 +47,7 @@ func (idx *Indexer) incrementalReindexPathsWithReceipt(
 		observed := receiptStore.EndMutationReceipt(token)
 		receipt = &observed
 	}()
-	result, err = idx.incrementalReindexPaths(root, paths, true, batch)
+	result, err = idx.incrementalReindexPathsMode(root, paths, mode, batch)
 	return result, receipt, batch, err
 }
 
@@ -152,13 +166,122 @@ func (idx *Indexer) runIncrementalWatcherSemantic(graphPaths []string) {
 	idx.setReparsePendingEnrichments(pending)
 }
 
+// runIncrementalPointSemantic preserves IndexFile's exact single-save semantic
+// contract. Storm and reconciliation batches use runIncrementalWatcherSemantic
+// to amortize provider work; one explicit point mutation calls EnrichFile so
+// in-process type providers can confirm the new edges before IndexFile returns.
+func (idx *Indexer) runIncrementalPointSemantic(graphPaths []string) {
+	if idx == nil || idx.semanticMgr == nil || !idx.semanticMgr.Enabled() ||
+		!idx.semanticMgr.HasProviders() || !idx.semanticMgr.EnrichesOnWatch() {
+		return
+	}
+	paths := appendUniqueSorted(nil, graphPaths...)
+	if len(paths) == 0 {
+		return
+	}
+	idx.observeIncrementalCatchup("semantic", paths)
+	pending := make(map[string]bool, len(paths))
+	for _, graphPath := range paths {
+		pending[graphPath] = true
+		if _, err := idx.semanticMgr.EnrichFile(idx.graph, idx.rootPath, graphPath); err != nil {
+			idx.logger.Debug("indexer: exact point semantic enrichment failed",
+				zap.String("file", graphPath), zap.Error(err))
+			continue
+		}
+		pending[graphPath] = false
+	}
+	idx.setReparsePendingEnrichments(pending)
+}
+
 // incrementalReindexWatcherPaths is the complete direct-Indexer coordinator used
 // outside a MultiIndexer. It performs one bounded parse/evict batch, one exact
 // resolver/reference-fact catch-up, semantic refresh, and the precise standalone
 // derived passes. Shared-graph callers use MultiIndexer so cross-repository work
 // sees every sibling registry and indexer.
+func incrementalTopologyChanged(result *IndexResult) bool {
+	if result == nil {
+		return false
+	}
+	if result.DeletedFileCount > 0 || result.FullRetrack {
+		return true
+	}
+	plan := result.DerivedInvalidation
+	nonTopologyFiles := plan.InertFiles
+	// Metadata refreshes preserve node and edge identity. Files is populated for
+	// their exact derived frontier, so only the topology-bearing plan fields
+	// below disqualify them from the no-invalidation path.
+	metadataTopologyFree := plan.Flags == 0 &&
+		len(plan.TypeIDs) == 0 &&
+		len(plan.ContractGroups) == 0 &&
+		len(plan.ContractSymbolIDs) == 0 &&
+		len(plan.ContractBridgeNodeIDs) == 0 &&
+		!plan.LegacyFallback
+	if metadataTopologyFree {
+		nonTopologyFiles += plan.MetadataOnlyFiles
+	}
+	return result.StaleFileCount > nonTopologyFiles
+}
+
 func (idx *Indexer) incrementalReindexWatcherPaths(root string, paths []string) (*IndexResult, error) {
-	result, receipt, batch, err := idx.incrementalReindexPathsWithReceipt(root, paths)
+	return idx.incrementalWatcherPaths(root, paths, incrementalPathMode{detectDeletions: true})
+}
+
+func (idx *Indexer) incrementalDiscoverWatcherPaths(root string, paths []string) (*IndexResult, error) {
+	return idx.incrementalWatcherPaths(root, paths, incrementalPathMode{})
+}
+
+// incrementalEvictWatcherPath is the standalone already-held-lane forced
+// deletion executor. Unlike incrementalPointWatcherPath it never consults disk
+// presence to decide between reparse and deletion.
+func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edgesRemoved int, err error) {
+	finishTopologyMutation := reach.BeginTopologyMutation(idx.graph)
+	topologyChanged := true
+	defer func() { finishTopologyMutation(topologyChanged) }()
+
+	eviction := idx.evictFileIncrementalRaw(path)
+	result := eviction.result
+	files, needed, exact := incrementalResolutionFrontier(result, nil)
+	if needed && len(files) > 0 {
+		idx.runIncrementalResolutionCatchup(files, eviction.batch, func(frontier []string) {
+			if idx.incrementalResolveFilesHook != nil {
+				idx.incrementalResolveFilesHook(frontier)
+				return
+			}
+			idx.resolver.ResolveFilesAndIncoming(frontier)
+		})
+	} else if needed && !exact {
+		idx.observeIncrementalCatchup("resolve", nil)
+		idx.ResolveAll()
+	}
+	if result != nil && result.DeletedFileCount > 0 {
+		idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+		idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
+		idx.runStandaloneIncrementalDerivedPasses(result.DerivedInvalidation)
+	}
+	topologyChanged = incrementalTopologyChanged(result)
+	return eviction.nodesRemoved, eviction.edgesRemoved, nil
+}
+
+// incrementalPointWatcherPath is the standalone, already-held-lane point
+// executor. It forces the explicit path through content classification and the
+// complete resolver/semantic/derived tail without re-entering a public
+// coordinated API.
+func (idx *Indexer) incrementalPointWatcherPath(root, path string) (*IndexResult, error) {
+	return idx.incrementalWatcherPaths(root, []string{path}, incrementalPathMode{
+		detectDeletions:    true,
+		forceExplicitFiles: true,
+	})
+}
+
+func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode incrementalPathMode) (*IndexResult, error) {
+	// The coordinator owns the repository lane before invoking this executor.
+	// Take the reachability topology gate second and retain it through resolver
+	// and derived catch-up so readers observe the complete old or new graph.
+	finishTopologyMutation := reach.BeginTopologyMutation(idx.graph)
+	topologyChanged := true
+	defer func() { finishTopologyMutation(topologyChanged) }()
+
+	result, receipt, batch, err := idx.incrementalReindexPathsWithReceiptMode(root, paths, mode)
 	if err != nil {
 		return result, err
 	}
@@ -175,11 +298,16 @@ func (idx *Indexer) incrementalReindexWatcherPaths(root string, paths []string) 
 		idx.observeIncrementalCatchup("resolve", nil)
 		idx.ResolveAll()
 	}
-	if !idx.deferGlobalPasses {
-		idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+	if mode.forceExplicitFiles || !idx.deferGlobalPasses.Load() {
+		if mode.exactPointSemantic {
+			idx.runIncrementalPointSemantic(result.DerivedInvalidation.Files)
+		} else {
+			idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+		}
 		idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 		idx.runStandaloneIncrementalDerivedPasses(result.DerivedInvalidation)
 	}
+	topologyChanged = incrementalTopologyChanged(result)
 	return result, nil
 }
 
@@ -190,7 +318,7 @@ func (w *Watcher) reindexStormPaths(paths []string) (*IndexResult, error) {
 	if w.indexer == nil || w.indexer.rootPath == "" {
 		return nil, fmt.Errorf("watcher: index root is not initialized")
 	}
-	return w.indexer.incrementalReindexWatcherPaths(w.indexer.rootPath, paths)
+	return w.indexer.IncrementalReindexPaths(w.indexer.rootPath, paths)
 }
 
 func (gw *GitWatcher) reindexChangedPaths(paths []string) (*IndexResult, error) {
@@ -200,7 +328,7 @@ func (gw *GitWatcher) reindexChangedPaths(paths []string) (*IndexResult, error) 
 	if gw.indexer == nil {
 		return nil, fmt.Errorf("git-watcher: indexer is not initialized")
 	}
-	return gw.indexer.incrementalReindexWatcherPaths(gw.repoPath, paths)
+	return gw.indexer.IncrementalReindexPaths(gw.repoPath, paths)
 }
 
 // resolveIncrementalRepoMutation runs one shared resolver pass for a complete
@@ -212,6 +340,16 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutation(
 	result *IndexResult,
 	receipt *graph.MutationReceipt,
 	batch *reparsePendingEnrichmentBatch,
+) {
+	mi.resolveIncrementalRepoMutationMode(repoPrefix, result, receipt, batch, false)
+}
+
+func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
+	repoPrefix string,
+	result *IndexResult,
+	receipt *graph.MutationReceipt,
+	batch *reparsePendingEnrichmentBatch,
+	exactPointSemantic bool,
 ) {
 	files, needed, _ := incrementalResolutionFrontier(result, receipt)
 	idx := mi.GetIndexer(repoPrefix)
@@ -242,6 +380,10 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutation(
 		}
 	}
 	if idx != nil && result != nil {
-		idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+		if exactPointSemantic {
+			idx.runIncrementalPointSemantic(result.DerivedInvalidation.Files)
+		} else {
+			idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+		}
 	}
 }
