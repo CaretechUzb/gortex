@@ -279,6 +279,18 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 		}
 	})
 
+	t.Run("invalid request envelope", func(t *testing.T) {
+		tr, _, dispatcher := newCountingTransport(t)
+		rec := doPOST(t, tr, []byte(`{"method":"ping","id":1}`),
+			map[string]string{HeaderSessionID: "expired"})
+		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
+			t.Fatalf("status/body = %d/%q, want 404/empty", rec.Code, rec.Body.String())
+		}
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
+	})
+
 	t.Run("mixed batch", func(t *testing.T) {
 		tr, _, dispatcher := newCountingTransport(t)
 		body, _ := json.Marshal([]json.RawMessage{

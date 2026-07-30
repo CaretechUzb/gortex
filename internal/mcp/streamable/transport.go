@@ -723,10 +723,18 @@ func peekJSONRPCID(frame []byte) (json.RawMessage, bool) {
 // peekJSONRPCRequestID extracts the raw id from a JSON-RPC request. Responses
 // also carry ids but must not receive correlated session errors.
 func peekJSONRPCRequestID(frame []byte) (json.RawMessage, bool) {
-	if _, ok := peekJSONRPCMethod(frame); !ok {
+	var env struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Method  string          `json:"method"`
+	}
+	if err := json.Unmarshal(frame, &env); err != nil {
 		return nil, false
 	}
-	return peekJSONRPCID(frame)
+	if env.JSONRPC != "2.0" || env.Method == "" || len(env.ID) == 0 {
+		return nil, false
+	}
+	return env.ID, true
 }
 
 // jsonRPCErrorBytes returns a marshalled JSON-RPC 2.0 error envelope
