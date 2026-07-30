@@ -265,18 +265,17 @@ func (t *Transport) handlePost(w http.ResponseWriter, r *http.Request) {
 			"empty request body")
 		return
 	}
+	if !json.Valid(body) {
+		writeJSONRPCError(w, http.StatusBadRequest, nil, -32700,
+			"invalid JSON request body")
+		return
+	}
 
 	frames, batched, err := splitJSONRPC(body)
 	if err != nil {
 		writeJSONRPCError(w, http.StatusBadRequest, nil, -32700, err.Error())
 		return
 	}
-
-	// Resolve the session once for the whole request — every frame
-	// in a batch shares it, which is also how stdio and SSE
-	// transports behave.
-	sessionID := strings.TrimSpace(r.Header.Get(HeaderSessionID))
-	state, _ := t.store.Get(sessionID)
 
 	// Set the protocol version response header up-front so even
 	// error paths carry it. Clients use it to confirm they're
@@ -289,12 +288,24 @@ func (t *Transport) handlePost(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderProtocolVersion, t.protocolVersion)
 	}
 
+	// Resolve the session once for the whole request — every frame
+	// in a batch shares it, which is also how stdio and SSE
+	// transports behave.
+	sessionID := strings.TrimSpace(r.Header.Get(HeaderSessionID))
+	state, found := t.store.Get(sessionID)
+	method, _ := peekJSONRPCMethod(frames[0])
+	standaloneInitialize := !batched && len(frames) == 1 && method == "initialize"
+	if sessionID != "" && !found && !standaloneInitialize {
+		writeSessionNotFound(w, sessionID, frames, batched)
+		return
+	}
+
 	// Dispatch each frame in order and collect replies. We never
 	// fan-out across goroutines: JSON-RPC ordering matters when
 	// notifications mutate session state mid-batch.
 	replies := make([]json.RawMessage, 0, len(frames))
 	for _, frame := range frames {
-		replyBytes, status, err := t.dispatchFrame(r, &state, sessionID, frame)
+		replyBytes, status, err := t.dispatchFrame(r, &state, frame)
 		if err != nil {
 			t.logger.Warn("streamable: dispatch failed",
 				zap.String("session_id", sessionID), zap.Error(err))
@@ -350,7 +361,7 @@ func (t *Transport) handlePost(w http.ResponseWriter, r *http.Request) {
 // plus the upstream HTTP status when the router proxied the call.
 // state is updated in-place when the frame is an initialize request
 // or carries clientInfo metadata worth persisting.
-func (t *Transport) dispatchFrame(r *http.Request, state *SessionState, requestedID string, frame []byte) ([]byte, int, error) {
+func (t *Transport) dispatchFrame(r *http.Request, state *SessionState, frame []byte) ([]byte, int, error) {
 	method, _ := peekJSONRPCMethod(frame)
 
 	switch method {
@@ -386,16 +397,6 @@ func (t *Transport) dispatchFrame(r *http.Request, state *SessionState, requeste
 			_ = t.store.Update(*state)
 		}
 		return t.localDispatch(r, *state, frame)
-	}
-
-	// For non-initialize calls, reject when the client claimed an
-	// ID we don't know — protects against stale-session race when
-	// the store evicted while the client was idle. The spec calls
-	// for HTTP 404 + Mcp-Session-Id absent on the reply.
-	if requestedID != "" && state.ID == "" {
-		id, _ := peekJSONRPCID(frame)
-		return jsonRPCErrorBytes(id, -32001,
-			fmt.Sprintf("session %q not found", requestedID)), 0, nil
 	}
 
 	// Tool-call frames go through the multi-server router first.
@@ -733,9 +734,12 @@ func peekJSONRPCID(frame []byte) (json.RawMessage, bool) {
 // suitable for inclusion in a batch reply. The id may be nil for
 // requests where parsing failed before the id could be recovered.
 func jsonRPCErrorBytes(id json.RawMessage, code int, message string) []byte {
+	if len(id) == 0 {
+		id = json.RawMessage("null")
+	}
 	env := struct {
 		JSONRPC string          `json:"jsonrpc"`
-		ID      json.RawMessage `json:"id,omitempty"`
+		ID      json.RawMessage `json:"id"`
 		Error   struct {
 			Code    int    `json:"code"`
 			Message string `json:"message"`
@@ -758,6 +762,34 @@ func writeJSONRPCError(w http.ResponseWriter, status int, id json.RawMessage, co
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(jsonRPCErrorBytes(id, code, message))
+	_, _ = w.Write([]byte("\n"))
+}
+
+// writeSessionNotFound rejects an entire stale-session POST before dispatch.
+// Request IDs keep their batch order; notifications never receive JSON-RPC
+// replies, so notification-only input carries only the HTTP 404 signal.
+func writeSessionNotFound(w http.ResponseWriter, sessionID string, frames [][]byte, batched bool) {
+	message := fmt.Sprintf("session %q not found", sessionID)
+	replies := make([]json.RawMessage, 0, len(frames))
+	for _, frame := range frames {
+		id, ok := peekJSONRPCID(frame)
+		if !ok {
+			continue
+		}
+		replies = append(replies, jsonRPCErrorBytes(id, -32001, message))
+	}
+
+	if len(replies) == 0 {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	if batched {
+		_ = json.NewEncoder(w).Encode(replies)
+		return
+	}
+	_, _ = w.Write(replies[0])
 	_, _ = w.Write([]byte("\n"))
 }
 

@@ -45,12 +45,12 @@ gortex mcp --index /path/to/repo --server --port 8765
 
 | Verb | Path | Behaviour |
 |------|------|-----------|
-| `POST` | `/mcp` | One or more JSON-RPC frames in, one or a JSON-RPC array out. Notification-only batches return 202. |
+| `POST` | `/mcp` | One or more JSON-RPC frames in, one or a JSON-RPC array out. Notification-only batches with a valid or absent session return 202; an unknown session returns 404 before dispatch. |
 | `GET` | `/mcp` | Opens an SSE stream the server uses to push server-initiated notifications (progress, sampling) onto the bound session. |
 | `DELETE` | `/mcp` | Terminates a session. Idempotent — returns 204 even when the id is unknown. |
 | `OPTIONS` | `/mcp` | CORS preflight; advertises the allowed methods. |
 
-**Stateless per request.** Every POST carries `Mcp-Session-Id`; the transport replays the matching state out of a `streamable.SessionStore` (the default in-memory `MemoryStore` is TTL-evicted; swap for a Redis-backed adapter to share state across replicas behind a load balancer). `initialize` mints the id and returns it on the response header; an unknown id replies with a JSON-RPC `-32001 session not found` envelope. The `Mcp-Protocol-Version` header is echoed when provided; absent, the transport advertises its default. `tools/call` frames flow through the same multi-server router that serves `/v1/tools/<name>`, so workspace scoping carries over unchanged.
+**Stateless per request.** Every POST carries `Mcp-Session-Id`; the transport replays the matching state out of a `streamable.SessionStore` (the default in-memory `MemoryStore` is TTL-evicted; swap for a Redis-backed adapter to share state across replicas behind a load balancer). A standalone, non-batched `initialize` mints a fresh id and returns it on the response header. An unknown or expired id on any other request is rejected before dispatch with HTTP 404, JSON-RPC `-32001 session not found`, and no `Mcp-Session-Id` response header; notification-only input has no JSON-RPC response body. Clients may then reinitialize without an id and retry the rejected request once. The `Mcp-Protocol-Version` header is echoed when provided; absent, the transport advertises its default. `tools/call` frames flow through the same multi-server router that serves `/v1/tools/<name>`, so workspace scoping carries over unchanged.
 
 **Daemon enablement.** `gortex daemon start --http-addr 127.0.0.1:7411 [--http-auth-token <token>]` brings the transport up alongside the unix-socket dispatcher. Non-localhost binds require an auth token (or `$GORTEX_DAEMON_HTTP_TOKEN`). `/healthz` is exempt so liveness probes work. Once `--http-addr` is set, the daemon mounts `/mcp` alongside the `/v1/*` surface on the same address — no extra flag needed.
 
