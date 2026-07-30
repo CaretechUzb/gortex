@@ -288,11 +288,8 @@ func (t *Transport) handlePost(w http.ResponseWriter, r *http.Request) {
 	sessionID := strings.TrimSpace(r.Header.Get(HeaderSessionID))
 	state, found := t.store.Get(sessionID)
 	if sessionID != "" && !found {
-		method, _ := peekJSONRPCMethod(frames[0])
-		if batched || method != "initialize" {
-			writeSessionNotFound(w, sessionID, frames, batched)
-			return
-		}
+		writeSessionNotFound(w, sessionID, frames, batched)
+		return
 	}
 
 	replies := t.dispatchFrames(r, &state, sessionID, frames)
@@ -332,7 +329,7 @@ func (t *Transport) dispatchFrames(r *http.Request, state *SessionState, session
 		if err != nil {
 			t.logger.Warn("streamable: dispatch failed",
 				zap.String("session_id", sessionID), zap.Error(err))
-			if id, hasID := peekJSONRPCID(frame); hasID {
+			if id, hasID := peekJSONRPCRequestID(frame); hasID {
 				replyBytes = jsonRPCErrorBytes(id, -32603, err.Error())
 			} else {
 				replyBytes = nil
@@ -340,7 +337,7 @@ func (t *Transport) dispatchFrames(r *http.Request, state *SessionState, session
 		}
 		if status != 0 && status != http.StatusOK && len(replyBytes) == 0 {
 			// Preserve the JSON-RPC batch boundary for upstream HTTP errors.
-			if id, hasID := peekJSONRPCID(frame); hasID {
+			if id, hasID := peekJSONRPCRequestID(frame); hasID {
 				replyBytes = jsonRPCErrorBytes(id, -32603,
 					fmt.Sprintf("upstream status %d", status))
 			}
@@ -362,9 +359,8 @@ func (t *Transport) dispatchFrame(r *http.Request, state *SessionState, frame []
 
 	switch method {
 	case "initialize":
-		// Gortex mints a fresh session even when the client claimed an ID
-		// the store no longer knows about. Session assignment is optional
-		// in the specification, but this stateful transport always uses it.
+		// Gortex mints a fresh session for initialize. A known session ID is
+		// replaced; unknown IDs are rejected by handlePost before dispatch.
 		if state.ID != "" {
 			t.store.Delete(state.ID)
 			*state = SessionState{}
@@ -502,7 +498,7 @@ func (t *Transport) tryRouteToolCall(r *http.Request, state SessionState, frame 
 	// The router returned an /v1/tools/<name>-shaped response;
 	// translate it into a JSON-RPC `result` frame so the client
 	// sees the same envelope every other tool/call produces.
-	id, hasID := peekJSONRPCID(frame)
+	id, hasID := peekJSONRPCRequestID(frame)
 	if !hasID {
 		return nil, status, true
 	}
@@ -716,16 +712,17 @@ func peekJSONRPCMethod(frame []byte) (string, bool) {
 	return env.Method, env.Method != ""
 }
 
-// peekJSONRPCID extracts the `id` raw value (number, string, or
-// null) from a frame so error responses can echo it back unchanged.
-func peekJSONRPCID(frame []byte) (json.RawMessage, bool) {
+// peekJSONRPCRequestID extracts the raw id from a JSON-RPC request. Responses
+// also carry ids but must not receive correlated error responses.
+func peekJSONRPCRequestID(frame []byte) (json.RawMessage, bool) {
 	var env struct {
-		ID json.RawMessage `json:"id"`
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
 	}
 	if err := json.Unmarshal(frame, &env); err != nil {
 		return nil, false
 	}
-	if len(env.ID) == 0 {
+	if env.Method == "" || len(env.ID) == 0 {
 		return nil, false
 	}
 	return env.ID, true
@@ -767,13 +764,13 @@ func writeJSONRPCError(w http.ResponseWriter, status int, id json.RawMessage, co
 }
 
 // writeSessionNotFound rejects an entire stale-session POST before dispatch.
-// Request IDs keep their batch order; notifications never receive JSON-RPC
-// replies, so notification-only input carries only the HTTP 404 signal.
+// Request IDs keep their batch order. Responses and notifications never receive
+// JSON-RPC replies, so input containing only those carries only the HTTP 404.
 func writeSessionNotFound(w http.ResponseWriter, sessionID string, frames [][]byte, batched bool) {
 	message := fmt.Sprintf("session %q not found", sessionID)
 	replies := make([]json.RawMessage, 0, len(frames))
 	for _, frame := range frames {
-		id, ok := peekJSONRPCID(frame)
+		id, ok := peekJSONRPCRequestID(frame)
 		if !ok {
 			continue
 		}

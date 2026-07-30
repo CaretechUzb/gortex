@@ -263,11 +263,24 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 		}
 	})
 
+	t.Run("single response", func(t *testing.T) {
+		tr, _, dispatcher := newCountingTransport(t)
+		response := []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`)
+		rec := doPOST(t, tr, response, map[string]string{HeaderSessionID: "expired"})
+		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
+			t.Fatalf("status/body = %d/%q, want 404/empty", rec.Code, rec.Body.String())
+		}
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
+	})
+
 	t.Run("mixed batch", func(t *testing.T) {
 		tr, _, dispatcher := newCountingTransport(t)
 		body, _ := json.Marshal([]json.RawMessage{
 			jsonRPC(1, "ping", nil),
 			jsonRPC(nil, "notifications/cancelled", map[string]any{"requestId": 1}),
+			json.RawMessage(`{"jsonrpc":"2.0","id":99,"result":{}}`),
 			jsonRPC("two", "tools/list", nil),
 		})
 		rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: "expired"})
@@ -328,16 +341,30 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 	})
 }
 
-func TestUnknownSessionStandaloneInitializeMintsFreshSession(t *testing.T) {
-	tr, cleanup := newTransport(t)
-	defer cleanup()
+func TestUnknownSessionStandaloneInitializeRejected(t *testing.T) {
+	tr, _, dispatcher := newCountingTransport(t)
 	body := initializeBody("test", "1")
 	rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: "expired"})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
 	}
-	if fresh := rec.Header().Get(HeaderSessionID); fresh == "" || fresh == "expired" {
-		t.Errorf("fresh session id = %q, want a new non-empty id", fresh)
+	if got := rec.Header().Get(HeaderSessionID); got != "" {
+		t.Errorf("response session id = %q, want empty", got)
+	}
+	var env struct {
+		ID    json.RawMessage `json:"id"`
+		Error struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, rec.Body.String())
+	}
+	if string(env.ID) != "1" || env.Error.Code != -32001 {
+		t.Errorf("error envelope id/code = %s/%d, want 1/-32001", env.ID, env.Error.Code)
+	}
+	if got := dispatcher.calls.Load(); got != 0 {
+		t.Errorf("dispatcher calls = %d, want 0", got)
 	}
 }
 
