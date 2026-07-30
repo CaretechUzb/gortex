@@ -103,7 +103,7 @@ func resolveRustScopeCalls(g graph.Store, cands *frameworkPassCandidates) int {
 	fromIDs := make(map[string]struct{})
 	callStream := g.EdgesByKind(graph.EdgeCalls)
 	if cands != nil {
-		callStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.calls))
+		callStream = frameworkEdgeSeq(cands.calls)
 	}
 	for e := range callStream {
 		if e == nil {

@@ -140,7 +140,7 @@ func resolveMacroExpansionCalls(g graph.Store, cands *frameworkPassCandidates) i
 	}
 	useSiteStream := g.EdgesByKind(graph.EdgeCalls)
 	if cands != nil {
-		useSiteStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.calls))
+		useSiteStream = frameworkEdgeSeq(cands.calls)
 	}
 	var callEdges []*graph.Edge
 	var candidateCallerIDs []string

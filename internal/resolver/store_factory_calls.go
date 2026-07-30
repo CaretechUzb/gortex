@@ -65,7 +65,7 @@ func resolveStoreFactoryCalls(g graph.Store, cands *frameworkPassCandidates) int
 
 	stream := g.EdgesByKind(graph.EdgeCalls)
 	if cands != nil {
-		stream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.calls))
+		stream = frameworkEdgeSeq(cands.calls)
 	}
 	resolved := 0
 	var reindex []graph.EdgeReindex

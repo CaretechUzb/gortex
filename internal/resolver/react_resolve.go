@@ -54,8 +54,8 @@ func resolveReactHooksContext(g graph.Store, cands *frameworkPassCandidates) int
 	callsStream := g.EdgesByKind(graph.EdgeCalls)
 	refsStream := g.EdgesByKind(graph.EdgeReferences)
 	if cands != nil {
-		callsStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.calls))
-		refsStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.refs))
+		callsStream = frameworkEdgeSeq(cands.calls)
+		refsStream = frameworkEdgeSeq(cands.refs)
 	}
 	resolved := 0
 	var reindex []graph.EdgeReindex

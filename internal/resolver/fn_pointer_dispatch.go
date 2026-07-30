@@ -60,7 +60,7 @@ func resolveFnPointerDispatch(g graph.Store, cands *frameworkPassCandidates) int
 
 	regStream := g.EdgesByKind(graph.EdgeReferences)
 	if cands != nil {
-		regStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.refs))
+		regStream = frameworkEdgeSeq(cands.refs)
 	}
 	var regReindex []graph.EdgeReindex
 	for e := range regStream {
@@ -125,7 +125,7 @@ func resolveFnPointerDispatch(g graph.Store, cands *frameworkPassCandidates) int
 
 	dispatchStream := g.EdgesByKind(graph.EdgeCalls)
 	if cands != nil {
-		dispatchStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.calls))
+		dispatchStream = frameworkEdgeSeq(cands.calls)
 	}
 	resolved := 0
 	var reindex []graph.EdgeReindex
@@ -204,9 +204,9 @@ func fnPtrFanoutEdge(e *graph.Edge, target *graph.Node, st, field string) *graph
 		Confidence:      fnPointerConfidence,
 		ConfidenceLabel: graph.ConfidenceLabelFor(graph.EdgeCalls, fnPointerConfidence),
 		Meta: map[string]any{
-			"via":          fnPtrDispatchVia,
-			"fnptr_struct": st,
-			"fnptr_field":  field,
+			"via":             fnPtrDispatchVia,
+			"fnptr_struct":    st,
+			"fnptr_field":     field,
 			MetaSynthesizedBy: SynthFnPointerDispatch,
 			MetaProvenance:    ProvenanceHeuristic,
 		},
