@@ -1688,6 +1688,35 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 	nodes = applyAllPostFilters(nodes)
 
+	// Post-filter wipeout rescue: the fetch found candidates but the
+	// filters dropped every one — the real matches likely sit past the
+	// fetch horizon, outranked by rows the filters remove (doc/junk
+	// sections sharing the query's tokens; the classic case is a
+	// suffix-convention query like "Extensions"). Refetch deeper under
+	// the same scope BEFORE the filter-dropping fallbacks below.
+	fetchEscalated := false
+	if len(nodes) == 0 && candsAfterGather > 0 && q != "" {
+		for _, mult := range []int{5, 25} {
+			deepLimit := fetchLimit * mult
+			var refetched []*graph.Node
+			if len(expandedTerms) > 0 {
+				refetched, _ = fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, deepLimit, scope, timings)
+			} else {
+				refetched = s.engineFor(ctx).SearchSymbolsScoped(q, deepLimit, scope)
+			}
+			if kept := applyAllPostFilters(refetched); len(kept) > 0 {
+				nodes = kept
+				fetchEscalated = true
+				break
+			}
+			// A short page means the corpus is exhausted — a deeper
+			// fetch cannot surface anything new.
+			if len(refetched) < deepLimit {
+				break
+			}
+		}
+	}
+
 	// Fuzzy fallback: a field-qualified query that filtered down to
 	// nothing retries on the free text alone (still inside the
 	// caller's repo / project scope), so an over-narrow or typo'd
@@ -1914,6 +1943,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		wide.RepoAllow = nil
 		wideNodes, _ := fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, offset+limit, wide, timings)
 		resp["scope_note"] = scopeZeroNote(resolved, len(wideNodes))
+	}
+	if fetchEscalated {
+		resp["fetch_escalated"] = true
 	}
 	if filtersRelaxed {
 		resp["filters_relaxed"] = true
