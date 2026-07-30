@@ -27,6 +27,8 @@ import (
 const (
 	HeaderSessionID       = "Mcp-Session-Id"
 	HeaderProtocolVersion = "Mcp-Protocol-Version"
+
+	errCodeSessionNotFound = -32001
 )
 
 // DefaultProtocolVersion follows the protocol revision implemented by the
@@ -330,7 +332,7 @@ func (t *Transport) dispatchFrames(r *http.Request, state *SessionState, session
 			t.logger.Warn("streamable: dispatch failed",
 				zap.String("session_id", sessionID), zap.Error(err))
 			if id, hasID := peekJSONRPCRequestID(frame); hasID {
-				replyBytes = jsonRPCErrorBytes(id, -32603, err.Error())
+				replyBytes = jsonRPCErrorBytes(id, -32603, "internal error")
 			} else {
 				replyBytes = nil
 			}
@@ -774,7 +776,7 @@ func writeSessionNotFound(w http.ResponseWriter, sessionID string, frames [][]by
 		if !ok {
 			continue
 		}
-		replies = append(replies, jsonRPCErrorBytes(id, -32001, message))
+		replies = append(replies, jsonRPCErrorBytes(id, errCodeSessionNotFound, message))
 	}
 
 	if len(replies) == 0 {

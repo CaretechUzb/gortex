@@ -59,6 +59,13 @@ func (d *countingDispatcher) Dispatch(ctx context.Context, frame []byte) ([]byte
 	return d.delegate.Dispatch(ctx, frame)
 }
 
+func assertNoDispatch(t *testing.T, dispatcher *countingDispatcher) {
+	t.Helper()
+	if got := dispatcher.calls.Load(); got != 0 {
+		t.Errorf("dispatcher calls = %d, want 0", got)
+	}
+}
+
 // newTransport stands up a transport backed by a fresh MemoryStore
 // and the test mcp-go server. Returns the transport and a cleanup
 // func that releases the store's background sweeper.
@@ -237,15 +244,13 @@ func TestUnknownSessionRejected(t *testing.T) {
 			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
 				t.Fatalf("body not JSON: %v\n%s", err, rec.Body.String())
 			}
-			if string(env.ID) != "1" || env.Error.Code != -32001 {
-				t.Errorf("error envelope id/code = %s/%d, want 1/-32001", env.ID, env.Error.Code)
+			if string(env.ID) != "1" || env.Error.Code != errCodeSessionNotFound {
+				t.Errorf("error envelope id/code = %s/%d, want 1/%d", env.ID, env.Error.Code, errCodeSessionNotFound)
 			}
 			if !strings.Contains(env.Error.Message, "never_existed") {
 				t.Errorf("error message = %q; want it to name the missing session", env.Error.Message)
 			}
-			if got := dispatcher.calls.Load(); got != 0 {
-				t.Errorf("dispatcher calls = %d, want 0", got)
-			}
+			assertNoDispatch(t, dispatcher)
 		})
 	}
 }
@@ -258,9 +263,7 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
 			t.Fatalf("status/body = %d/%q, want 404/empty", rec.Code, rec.Body.String())
 		}
-		if got := dispatcher.calls.Load(); got != 0 {
-			t.Errorf("dispatcher calls = %d, want 0", got)
-		}
+		assertNoDispatch(t, dispatcher)
 	})
 
 	t.Run("single response", func(t *testing.T) {
@@ -270,9 +273,7 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
 			t.Fatalf("status/body = %d/%q, want 404/empty", rec.Code, rec.Body.String())
 		}
-		if got := dispatcher.calls.Load(); got != 0 {
-			t.Errorf("dispatcher calls = %d, want 0", got)
-		}
+		assertNoDispatch(t, dispatcher)
 	})
 
 	t.Run("mixed batch", func(t *testing.T) {
@@ -300,13 +301,11 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 			t.Fatalf("reply ids = %+v, want [1, two]", replies)
 		}
 		for _, reply := range replies {
-			if reply.Error.Code != -32001 {
-				t.Errorf("error code = %d, want -32001", reply.Error.Code)
+			if reply.Error.Code != errCodeSessionNotFound {
+				t.Errorf("error code = %d, want %d", reply.Error.Code, errCodeSessionNotFound)
 			}
 		}
-		if got := dispatcher.calls.Load(); got != 0 {
-			t.Errorf("dispatcher calls = %d, want 0", got)
-		}
+		assertNoDispatch(t, dispatcher)
 	})
 
 	t.Run("notification-only batch", func(t *testing.T) {
@@ -319,9 +318,7 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
 			t.Fatalf("status/body = %d/%q, want 404/empty", rec.Code, rec.Body.String())
 		}
-		if got := dispatcher.calls.Load(); got != 0 {
-			t.Errorf("dispatcher calls = %d, want 0", got)
-		}
+		assertNoDispatch(t, dispatcher)
 	})
 
 	t.Run("initialize batch", func(t *testing.T) {
@@ -335,9 +332,7 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &replies); err != nil || len(replies) != 1 {
 			t.Fatalf("initialize batch response = %s, want one error: %v", rec.Body.String(), err)
 		}
-		if got := dispatcher.calls.Load(); got != 0 {
-			t.Errorf("dispatcher calls = %d, want 0", got)
-		}
+		assertNoDispatch(t, dispatcher)
 	})
 }
 
@@ -360,12 +355,10 @@ func TestUnknownSessionStandaloneInitializeRejected(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
 		t.Fatalf("body not JSON: %v\n%s", err, rec.Body.String())
 	}
-	if string(env.ID) != "1" || env.Error.Code != -32001 {
-		t.Errorf("error envelope id/code = %s/%d, want 1/-32001", env.ID, env.Error.Code)
+	if string(env.ID) != "1" || env.Error.Code != errCodeSessionNotFound {
+		t.Errorf("error envelope id/code = %s/%d, want 1/%d", env.ID, env.Error.Code, errCodeSessionNotFound)
 	}
-	if got := dispatcher.calls.Load(); got != 0 {
-		t.Errorf("dispatcher calls = %d, want 0", got)
-	}
+	assertNoDispatch(t, dispatcher)
 }
 
 func TestExpiredSessionReinitializesAndRetries(t *testing.T) {
@@ -430,9 +423,7 @@ func TestConcurrentUnknownSessionsNeverDispatch(t *testing.T) {
 	if failures.Load() != 0 {
 		t.Errorf("%d/%d stale requests did not return 404", failures.Load(), workers)
 	}
-	if got := dispatcher.calls.Load(); got != 0 {
-		t.Errorf("dispatcher calls = %d, want 0", got)
-	}
+	assertNoDispatch(t, dispatcher)
 }
 
 // TestDeleteDropsSession covers the explicit teardown path.
@@ -573,6 +564,31 @@ func TestNotificationDispatchErrorReturns202(t *testing.T) {
 	}
 }
 
+func TestRequestDispatchErrorIsSanitized(t *testing.T) {
+	store := NewMemoryStore(time.Minute)
+	defer store.Close()
+	tr := New(Config{Dispatcher: failingDispatcher{}, Store: store})
+	rec := doPOST(t, tr, jsonRPC(1, "tools/list", nil), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var env struct {
+		Error struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, rec.Body.String())
+	}
+	if env.Error.Code != -32603 || env.Error.Message != "internal error" {
+		t.Errorf("error = %d/%q, want -32603/internal error", env.Error.Code, env.Error.Message)
+	}
+	if strings.Contains(rec.Body.String(), "dispatch failed") {
+		t.Errorf("response disclosed dispatcher error: %s", rec.Body.String())
+	}
+}
+
 // TestOriginAllowlist — when configured, only matching Origin
 // headers are accepted; missing Origin is allowed (same-origin
 // requests).
@@ -631,9 +647,7 @@ func TestMalformedJSONReturnsParseError(t *testing.T) {
 			t.Errorf("body %q parse response = %s, error=%v", body, rec.Body.String(), err)
 		}
 	}
-	if got := dispatcher.calls.Load(); got != 0 {
-		t.Errorf("dispatcher calls = %d, want 0", got)
-	}
+	assertNoDispatch(t, dispatcher)
 }
 
 // TestMethodNotAllowed — PUT on /mcp should return 405.
