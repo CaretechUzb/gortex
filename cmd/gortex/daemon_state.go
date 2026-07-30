@@ -48,7 +48,7 @@ type daemonState struct {
 	snapshotRepos map[string]*snapshotRepo
 	// snapshotContracts carries the per-repo contract entries restored
 	// from the snapshot. Warmup injects these into each indexer after
-	// ReconcileRepoCtx when IncrementalReindex skipped re-extraction (no
+	// ReconcileRepoCtx when IncrementalReindexPaths skipped re-extraction (no
 	// stale files). Without this the per-repo contracts.Registry stays
 	// nil for every quiescent repo, so `contracts` / `contracts check`
 	// return empty results even though the graph holds the nodes.
@@ -60,7 +60,7 @@ type daemonState struct {
 	// this, edges that the loader dropped never come back — every
 	// restart erodes the graph further until exported methods like
 	// (*Node).Type show zero callers despite having dozens of real
-	// callers in source. The IncrementalReindex path never re-resolves
+	// callers in source. The IncrementalReindexPaths path never re-resolves
 	// unchanged files, so the lost edges are invisible to it.
 	snapshotPartial bool
 	// snapshotVector carries the workspace-global semantic-search
@@ -456,7 +456,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 						}
 					}()
 					// Route repos whose nodes came from the snapshot through
-					// ReconcileRepoCtx — it calls IncrementalReindex, which
+					// ReconcileRepoCtx — it calls IncrementalReindexPaths, which
 					// evicts files deleted while the daemon was down and
 					// re-indexes only files whose mtime changed. Repos not in
 					// the snapshot (newly tracked, or first startup after a
@@ -748,7 +748,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 
 	// Rehydrate per-repo contract registries from the snapshot. Only
 	// target indexers whose registry is still nil — a non-nil registry
-	// means IncrementalReindex (or a fresh TrackRepoCtx) re-extracted
+	// means IncrementalReindexPaths (or a fresh TrackRepoCtx) re-extracted
 	// contracts from source, and that result is authoritative. Without
 	// this, every steady-state repo's ContractRegistry stays nil and
 	// MergedContractRegistry skips them, so `contracts` returns only
@@ -810,7 +810,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	}
 
 	// Run a cross-repo resolution pass once warmup has stamped the
-	// workspace slugs. Files touched by IncrementalReindex already
+	// workspace slugs. Files touched by IncrementalReindexPaths already
 	// re-resolve via the per-repo Resolver; this catches cross-repo
 	// edges in unchanged files plus stamps cross_workspace_deps
 	// eligibility on stubs. Mirrors what MultiIndexer.IndexAll does
@@ -1189,7 +1189,7 @@ func priorMtimesForEntry(repos map[string]*snapshotRepo, entry config.RepoEntry)
 // collectSnapshotRepos snapshots the per-repo metadata needed to
 // reconcile the next startup: RepoPrefix, RootPath, and FileMtimes.
 // Called from the shutdown and periodic-snapshot paths so restart
-// warmups can run IncrementalReindex instead of a full walk.
+// warmups can run IncrementalReindexPaths instead of a full walk.
 func collectSnapshotRepos(mi *indexer.MultiIndexer) []snapshotRepo {
 	if mi == nil {
 		return nil

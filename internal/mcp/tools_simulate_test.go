@@ -108,7 +108,7 @@ func TestPreviewEdit_RenameSymbol(t *testing.T) {
 	require.NoError(t, writeSeedFile(helperPath,
 		"package main\n\nfunc Encode(payload []byte) []byte { return payload }\n"))
 	srv.OverlayManager().Drop("seed")
-	_, err := srv.indexer.IncrementalReindex(dir)
+	_, err := srv.indexer.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 	srv.indexer.ResolveAll()
 

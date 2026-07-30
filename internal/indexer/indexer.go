@@ -57,7 +57,7 @@ type IndexResult struct {
 	// and incremental-reconcile paths.
 	FileCount int `json:"file_count"`
 	// StaleFileCount is the number of files that were actually
-	// re-indexed in this pass (only populated by IncrementalReindex
+	// re-indexed in this pass (only populated by IncrementalReindexPaths
 	// — full-index passes treat every file as stale and would
 	// duplicate FileCount). Used by the janitor / reconcile log to
 	// report "how much work did the snapshot delta require".
@@ -91,7 +91,7 @@ type IndexResult struct {
 	SkippedFiles int `json:"skipped_files,omitempty"`
 	// DeletedFileCount is the number of previously-indexed files that
 	// were evicted this pass because they no longer exist on disk (only
-	// populated by IncrementalReindex). Together with StaleFileCount it
+	// populated by IncrementalReindexPaths). Together with StaleFileCount it
 	// lets a batch caller — the daemon warmup loop in particular — decide
 	// whether a repo actually changed since the last shutdown: when both
 	// are zero across every repo, the persisted graph already carries
@@ -353,8 +353,8 @@ type Indexer struct {
 	deferredGoModDone bool
 
 	// pendingEnrich is raised by an index pass that did real work — IndexCtx
-	// that observed files (or a whole-repo re-track) and IncrementalReindex /
-	// IncrementalReindexPaths that re-indexed or evicted at least one file. It
+	// that observed files (or a whole-repo re-track) and any
+	// IncrementalReindexPaths pass that re-indexed or evicted at least one file. It
 	// is cleared only after runDeferredEnrich completes its queued file batch or
 	// repository pass without a partial result. The daemon warmup enriches every
 	// indexer it collected, so this gates the (multi-minute LSP hover) pass to
@@ -393,7 +393,7 @@ type Indexer struct {
 
 	// reparsedThisRun is the scoped analogue of fullReindexed: it is raised by a
 	// scoped incremental pass that re-parsed at least one stale file this run —
-	// IncrementalReindexPaths / IncrementalReindex with a non-zero
+	// IncrementalReindexPaths with a non-zero
 	// StaleFileCount. A scoped re-parse evicts and re-creates just the changed
 	// files' nodes, dropping THEIR hover-enrichment edges exactly as a whole-repo
 	// re-parse drops every node's, so the deferred pass must likewise run past
@@ -406,7 +406,7 @@ type Indexer struct {
 	// two claims distinct. A fresh Indexer per daemon run starts it false.
 	reparsedThisRun atomic.Bool
 
-	// deferGlobalPasses, when set, makes IndexCtx and IncrementalReindex
+	// deferGlobalPasses, when set, makes IndexCtx and IncrementalReindexPaths
 	// skip the graph-wide derivation passes (InferImplements,
 	// InferOverrides, markTestSymbolsAndEmitEdges). These passes walk the
 	// entire shared graph, so running them per-repo inside a batch loop
@@ -896,7 +896,7 @@ func (idx *Indexer) ContractRegistry() *contracts.Registry { return idx.contract
 
 // SetContractRegistry installs reg as the indexer's contract registry.
 // Used by the daemon warmup path to rehydrate the registry from a
-// snapshot when IncrementalReindex skipped extraction (no stale files
+// snapshot when incremental reconciliation skipped extraction (no stale files
 // → extractContracts never ran → idx.contractRegistry stays nil after
 // reconcile, which used to leave multi-repo `contracts` queries silently
 // empty). Callers should only install when ContractRegistry() is nil;
@@ -922,7 +922,7 @@ func (idx *Indexer) SetSkipResolveInDeferred(v bool) { idx.skipResolveInDeferred
 
 // SetDeferGlobalPasses toggles whether the graph-wide derivation passes
 // (InferImplements, InferOverrides, markTestSymbolsAndEmitEdges) run
-// inline at the end of IndexCtx / IncrementalReindex. Set true when the
+// inline at the end of IndexCtx / IncrementalReindexPaths. Set true when the
 // caller drives a batch (e.g. daemon warmup) and will invoke
 // RunGlobalGraphPasses once at the end. See the deferGlobalPasses field
 // comment.
@@ -933,7 +933,7 @@ func (idx *Indexer) SetDeferGlobalPasses(v bool) { idx.deferGlobalPasses = v }
 // already has these edges — InferImplements / InferOverrides skip
 // existing parents, and graph.AddEdge dedupes by edgeKey so EdgeTests
 // re-emission is a no-op. Logs counts for telemetry. Use when batching
-// multiple per-repo TrackRepoCtx / IncrementalReindex calls under
+// multiple per-repo TrackRepoCtx / IncrementalReindexPaths calls under
 // SetDeferGlobalPasses(true).
 func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 	if idx.graph == nil {
@@ -1435,7 +1435,7 @@ func (idx *Indexer) ResolveFilePath(graphPath string) string {
 // precomposed NFC. Keying the bulk walk under one form and an
 // incremental patch under the other would split a single file across
 // two graph keys: the watcher's evict would miss the walk's node,
-// IncrementalReindex would see the file as both deleted and freshly
+// incremental reconciliation would see the file as both deleted and freshly
 // created, and the daemon would carry a stale duplicate. Folding every
 // key through one form here removes that whole class of mismatch.
 //
@@ -3235,7 +3235,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 							localContracts = append(localContracts, c...)
 
 							// Populate the per-file contract cache so a
-							// later IncrementalReindex can skip this file
+							// later incremental reconciliation can skip this file
 							// on a cache hit. Mtime comes from the walk-
 							// time d.Info() — no extra stat here.
 							if wf.mtimeNano > 0 {
@@ -5392,7 +5392,7 @@ func (idx *Indexer) SetRootPath(root string) {
 // Each path may be absolute or relative to root, and may be a file or a
 // directory; directories are walked recursively with the same
 // exclude / language filters as a full pass. Within that scoped file
-// set the behaviour matches IncrementalReindex: only files that are
+// set, the behaviour is a full-tree reconcile: only files that are
 // stale (mtime or, in Merkle mode, content) are re-indexed, and a file
 // previously tracked under one of the scoped paths but now absent from
 // disk is evicted.
@@ -5423,7 +5423,7 @@ func (idx *Indexer) incrementalReindexPaths(
 	if fullRoot {
 		// An empty scope means the repository root. detectDeletions decides
 		// whether absent persisted paths are evicted; keeping that choice here
-		// lets IncrementalReindex share this bounded implementation without a
+		// lets full-tree and scoped callers share this bounded implementation without a
 		// recursive wrapper call.
 		paths = []string{root}
 	}
@@ -5570,7 +5570,7 @@ func (idx *Indexer) incrementalReindexPaths(
 			absPath := filepath.Join(absRoot, filepath.FromSlash(relPath))
 			_, statErr := os.Stat(absPath)
 			if statErr == nil {
-				// Present-but-excluded must be purged (same as full IncrementalReindex).
+				// Present-but-excluded must be purged (same as full-tree reconciliation).
 				if idx.shouldExclude(absPath, absRoot, false) {
 					deletedFiles = append(deletedFiles, relPath)
 				}
@@ -5686,262 +5686,6 @@ func relPathInScope(relPath string, scope map[string]bool) bool {
 		}
 	}
 	return false
-}
-
-// IncrementalReindex walks the file tree and re-indexes only files that changed
-// since the last snapshot. It also evicts nodes for deleted files.
-func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
-	start := time.Now()
-
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		return nil, err
-	}
-	idx.storeRootPath(absRoot)
-
-	// Collect files currently on disk.
-	diskFiles := make(map[string]bool)
-	var staleFiles []string
-
-	// Merkle mode replaces per-file mtime staleness with a
-	// content-addressed Merkle-tree diff computed after the walk.
-	merkleMode := idx.merkleEnabled()
-
-	err = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if idx.shouldPruneDir(path, absRoot) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if _, ok := idx.effectiveLanguage(path, nil); !ok && !idx.isIncrementalContractManifest(path) {
-			return nil
-		}
-		if idx.shouldExclude(path, absRoot, false) {
-			return nil
-		}
-
-		// relKey (slash + NFC) so the disk set is keyed identically
-		// to fileMtimes — otherwise a non-ASCII file the snapshot
-		// stored under one Unicode form and this walk observes under
-		// another would be seen as both deleted and newly created.
-		relPath := idx.relKey(path)
-		diskFiles[relPath] = true
-
-		if !merkleMode && idx.IsStale(relPath) {
-			staleFiles = append(staleFiles, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// In Merkle mode the per-file mtime check above is skipped; the
-	// stale set comes from a content-addressed tree diff instead.
-	if merkleMode {
-		staleFiles = idx.merkleStaleFiles(absRoot, diskFiles)
-	}
-
-	// Detect deleted files. A file that's tracked in fileMtimes but
-	// absent from the current discovery walk is a candidate, but
-	// "absent from discovery" is not always "absent from disk":
-	//
-	//   - Newly excluded (user/config intent): treat as deleted so the
-	//     graph does not retain permanent orphans (#321).
-	//   - Language extractor Extensions() shrank: file still on disk and
-	//     not excluded — preserve graph state.
-	//   - WalkDir swallowed a transient error (EACCES, EIO, NFS hiccup,
-	//     ELOOP) — preserve on non-ENOENT stat failures.
-	//
-	// Stat the candidate: ENOENT => deleted; exists+excluded => deleted;
-	// exists+not-excluded => preserve; other errors => preserve.
-	idx.mtimeMu.RLock()
-	var candidates []string
-	for relPath := range idx.fileMtimes {
-		if !diskFiles[relPath] {
-			candidates = append(candidates, relPath)
-		}
-	}
-	idx.mtimeMu.RUnlock()
-
-	var deletedFiles []string
-	for _, relPath := range candidates {
-		absPath := filepath.Join(absRoot, relPath)
-		_, err := os.Stat(absPath)
-		if err == nil {
-			// File still exists on disk but was not admitted by this walk.
-			// If the admission set now excludes it, treat it like a deletion
-			// so exclude-list refinements do not leave permanent orphans
-			// (file_count drops while node_count/search stay stale). See #321.
-			// If it is not excluded (e.g. extension no longer detected),
-			// preserve graph state.
-			if idx.shouldExclude(absPath, absRoot, false) {
-				deletedFiles = append(deletedFiles, relPath)
-			}
-			continue
-		}
-		if errors.Is(err, os.ErrNotExist) {
-			deletedFiles = append(deletedFiles, relPath)
-			continue
-		}
-		// Transient error — preserve to be safe.
-		idx.logger.Warn("incremental reindex: stat failed during deletion detection, preserving",
-			zap.String("rel", relPath), zap.Error(err))
-	}
-
-	// Capture surviving dependents while the deleted symbols and their incoming
-	// adjacency are still present. Keep the exact deleted paths too so contract
-	// registries can remove their stale entries after graph eviction.
-	deletedDependencyFiles := idx.semanticDependencyFrontierForDeletedFiles(deletedFiles)
-	partialFrontier := appendUniqueSorted(nil, deletedDependencyFiles...)
-	for _, relPath := range deletedFiles {
-		partialFrontier = append(partialFrontier, idx.prefixPath(filepath.FromSlash(relPath)))
-	}
-	partialFrontier = appendUniqueSorted(nil, partialFrontier...)
-
-	// Evict only files that are truly absent from disk.
-	for _, relPath := range deletedFiles {
-		// relPath is a fileMtimes key (relKey: slash + NFC); the graph
-		// keys nodes under OS-native separators, so convert before the
-		// evict or a deleted file's nodes leak on Windows. FromSlash is
-		// a no-op on POSIX.
-		graphPath := idx.prefixPath(filepath.FromSlash(relPath))
-		idx.restubIncomingRefs(graphPath)
-		idx.evictEnrichment(graphPath)
-		idx.graph.EvictFile(graphPath)
-		idx.mtimeMu.Lock()
-		delete(idx.fileMtimes, relPath)
-		idx.mtimeMu.Unlock()
-	}
-	// Prune the persisted mtime rows for deleted files too, so the next
-	// warm restart does not see them as phantom deletions (the in-memory
-	// delete above does not reach the store's sidecar table).
-	idx.pruneDeletedFileMtimes(deletedFiles)
-
-	// Re-index stale files. A file that fails — most often because it
-	// was locked or mid-write when the walk caught it — is collected
-	// and retried once below. A failure that survives the retry is
-	// surfaced on IndexResult.FailedFiles so the caller can replay it.
-	// A file whose bytes couldn't be read at all keeps no mtime
-	// recorded, so it stays stale for the next incremental pass; a
-	// file that read but failed to parse gets its mtime recorded (see
-	// indexFile's result==nil branch), so it stops being retried until
-	// its content changes again — see IndexResult.FailedFiles.
-	sourceStaleFiles, manifestFiles := splitIncrementalContractManifests(idx, staleFiles)
-	markerBatch := &reparsePendingEnrichmentBatch{}
-	var failedFiles []string
-	var reparsedFiles []string
-	for _, f := range sourceStaleFiles {
-		if err := idx.indexFile(f, true, markerBatch); err != nil {
-			idx.logger.Debug("incremental reindex: failed to index file",
-				zap.String("file", f), zap.Error(err))
-			failedFiles = append(failedFiles, f)
-		} else {
-			reparsedFiles = append(reparsedFiles, f)
-		}
-	}
-	if len(failedFiles) > 0 {
-		retry := failedFiles
-		failedFiles = nil
-		for _, f := range retry {
-			if err := idx.indexFile(f, true, markerBatch); err != nil {
-				idx.logger.Warn("incremental reindex: file failed after retry",
-					zap.String("file", f), zap.Error(err))
-				failedFiles = append(failedFiles, f)
-			} else {
-				reparsedFiles = append(reparsedFiles, f)
-			}
-		}
-	}
-
-	partialFrontier = appendUniqueSorted(partialFrontier, idx.graphFilePaths(reparsedFiles)...)
-	manifestPlan, manifestFailed := idx.refreshIncrementalContractManifests(manifestFiles)
-	failedFiles = appendUniqueSorted(failedFiles, manifestFailed...)
-	partialFrontier = appendUniqueSorted(partialFrontier, manifestPlan.Files...)
-	idx.flushReparsePendingEnrichment(markerBatch)
-
-	// Re-infer interface implementations (edges may have been lost
-	// during eviction). Skipped under deferGlobalPasses so a batch
-	// caller (ReconcileAll, warmup) can run a single global pass at
-	// the end instead of paying O(global) per repo.
-	if !idx.deferGlobalPasses {
-		// Scoped inference passes re-derive only the affected types/interfaces
-		// (add-parity with the full pass); fall back to whole-graph when off.
-		if !idx.runScopedInferencePasses(staleFiles) {
-			idx.resolver.InferImplements()
-			idx.resolver.InferOverrides()
-		}
-		// Capability edges (reads_env / executes_process / accesses_field)
-		// and framework dynamic-dispatch synthesis are whole-graph recomputes
-		// that derive edges only from structural nodes in the changed files.
-		// When nothing structural changed — no stale code file (a doc/config
-		// edit or a true zero-change reconcile) and no deletion — they can
-		// produce no new edge, so re-running them is pure cost: the dominant
-		// waste in a no-op IncrementalReindex, which the periodic janitor runs
-		// per repo per tick. Gate them on the same predicate the path-scoped
-		// IncrementalReindexPaths already uses. Deletions still trigger a
-		// re-run because an evicted file may have been a dispatch endpoint.
-		if len(deletedFiles) > 0 || idx.staleFilesAffectDerivedEdges(staleFiles) {
-			synthesizeCapabilityEdges(idx.graph)
-			resolver.RunFrameworkSynthesizers(idx.graph)
-		}
-		// External-call synthesis (opt-in) — file-scoped to the reindexed
-		// files (O(edited files)), not a full-graph recompute. Eviction
-		// already dropped a removed file's synthetic edges; a re-indexed
-		// file's fresh external terminals are re-materialised here.
-		resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), idx.graphFilePaths(staleFiles))
-		// Clone detection is not re-run here: each stale file was
-		// re-indexed through IndexFile above, whose resolve pass
-		// already recomputed EdgeSimilarTo against the fresh graph,
-		// and deleted files self-clean via EvictFile's bidirectional
-		// edge removal. Under deferGlobalPasses the batch caller runs
-		// the global clone pass once at the end.
-	}
-
-	// Rebuild search index to ensure consistency — but skip it on a
-	// zero-change reconcile against a backend that persists its search
-	// structures natively (the on-disk backend). See the matching guard
-	// in the other incremental path: re-embedding is wasted work and
-	// there is nothing to rebuild when no file changed.
-	if len(staleFiles) > 0 || len(deletedFiles) > 0 || !isSymbolSearcherBackend(idx.search) {
-		idx.buildSearchIndex()
-	}
-
-	// Update totalDetected so index_health reports correctly after cache restore.
-	if idx.totalDetected == 0 {
-		idx.totalDetected = len(diskFiles)
-	}
-
-	// Refresh contracts only for the changed/deleted/dependent frontier. The
-	// registry bootstrap and cross-file expansion remain contract-scoped; this
-	// path never scans the repository merely because one file changed.
-	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
-		idx.refreshContractsForFiles(partialFrontier)
-		idx.indexGen.Add(1) // files changed — invalidate the trigram cache
-	}
-
-	nodes, edges := idx.repoNodeEdgeCount()
-	result := &IndexResult{
-		NodeCount:        nodes,
-		EdgeCount:        edges,
-		FileCount:        len(diskFiles),
-		StaleFileCount:   len(staleFiles),
-		DeletedFileCount: len(deletedFiles),
-		FailedFiles:      failedFiles,
-		DurationMs:       time.Since(start).Milliseconds(),
-	}
-	idx.warnIfEdgeSanityViolated(result)
-	// Queue only the exact changed/deleted/dependent file frontier. The deferred
-	// runner handles all surviving languages in batches and clears this generation
-	// only after every selected provider succeeds.
-	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
-		idx.markPendingEnrichFiles(partialFrontier)
-	}
-	return result, nil
 }
 
 // LastIndexTime returns the timestamp of the last full index.
@@ -8190,7 +7934,7 @@ func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 // GraphQL, topics, etc.). Detected contracts are added as graph nodes
 // with provides/consumes edges.
 //
-// This full-walk path is used by IncrementalReindex (where many files
+// This full-walk path is used by full-tree reconciliation (where many files
 // are already cached). IndexCtx instead runs the per-file work inline
 // with parsing — see the worker loop — and skips this function.
 func (idx *Indexer) extractContracts() {
@@ -8339,13 +8083,13 @@ func (idx *Indexer) extractContracts() {
 // HasChangesSinceMtimes reports whether any indexable file under root
 // changed (mtime differs or is new) or was deleted, relative to the
 // indexer's currently-loaded fileMtimes. It runs the SAME walk +
-// staleness + deletion logic as IncrementalReindex but writes nothing.
+// staleness + deletion logic as full-tree reconciliation but writes nothing.
 //
 // The daemon warmup uses it to choose a reconcile strategy for a
 // reopened repo: a repo with zero changes takes the fast no-op
-// IncrementalReindex path, while a repo that changed while the daemon
+// incremental reconciliation path, while a repo that changed while the daemon
 // was down is routed through the shadow/bulk re-track path instead.
-// That routing matters because IncrementalReindex re-resolves changed
+// That routing matters because incremental reconciliation re-resolves changed
 // files through per-edge graph.ReindexEdges, and the per-edge write
 // path against a freshly reopened disk store is slow and unreliable.
 // The shadow path resolves entirely in an in-memory graph and commits

@@ -167,7 +167,7 @@ func TestIncrementalReindex_NonASCIIFileNoDuplicate(t *testing.T) {
 
 	// Modify and re-index incrementally.
 	bumpMtime(t, target, goSrc("After"))
-	_, err = idx.IncrementalReindex(dir)
+	_, err = idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 
 	fileNodesAfter := fileKindNodes(g, key)
@@ -194,7 +194,7 @@ func TestIncrementalReindex_NonASCIIFileNotSpuriouslyDeleted(t *testing.T) {
 	require.NotEmpty(t, g.FindNodesByName("Survivor"))
 
 	// Re-index with nothing changed on disk.
-	_, err = idx.IncrementalReindex(dir)
+	_, err = idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, g.FindNodesByName("Survivor"),

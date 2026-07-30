@@ -70,7 +70,7 @@ type MultiIndexer struct {
 	// evicts the prior EdgeMatches / topic / bridge generation and mints
 	// a fresh one across many independent graph-store writes — it is NOT
 	// atomic. Several goroutines drive it concurrently (the periodic
-	// janitor's ReconcileAll, the file-watcher's IncrementalReindex,
+	// janitor's ReconcileAll, the file-watcher's incremental reconciliation,
 	// MCP-triggered track / untrack / index), and mi.mu is only taken in
 	// fine-grained spots inside, not across the whole pass. Without this
 	// lock two overlapping reconciles can interleave evict and mint and
@@ -370,7 +370,7 @@ func (mi *MultiIndexer) SetOnRepoTracked(fn func(prefix, absPath string)) {
 // BeginBatch enables deferred-global-passes mode for every per-repo
 // Indexer that this MultiIndexer constructs after the call AND for
 // every Indexer already in mi.indexers (so ReconcileAll's per-repo
-// IncrementalReindex calls also skip the O(global) walks). Pair with
+// incremental reconciliation calls also skip the O(global) walks). Pair with
 // EndBatch.
 func (mi *MultiIndexer) BeginBatch() {
 	mi.mu.Lock()
@@ -1205,7 +1205,7 @@ func (mi *MultiIndexer) EndBatch() {
 // only recompute what's already on disk — the work that turns a warm
 // restart into a 30s–500s stall. The per-Indexer SetDeferGlobalPasses
 // flag is still restored so a later watch-triggered TrackRepoCtx /
-// IncrementalReindex runs its passes inline as normal.
+// incremental reconciliation runs its passes inline as normal.
 func (mi *MultiIndexer) ResetBatch() {
 	mi.mu.Lock()
 	defer mi.mu.Unlock()
@@ -2235,7 +2235,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 // (typically restored from a daemon snapshot) and brings it back into
 // agreement with the filesystem without a full re-index. priorMtimes
 // carries the mtimes recorded at the time the snapshot was taken;
-// IncrementalReindex uses them to detect files that changed offline
+// IncrementalReindexPaths uses them to detect files that changed offline
 // (re-indexes) and files that were deleted offline (evicts).
 //
 // Falls back to TrackRepoCtx when the repo is not yet tracked AND no
@@ -2281,7 +2281,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 
 	// Fall back to full TrackRepoCtx when we have no prior mtimes:
 	// there's nothing meaningful to reconcile against, and
-	// IncrementalReindex would treat every file as stale, producing
+	// an incremental pass would treat every file as stale, producing
 	// the same duplicate-writes problem we're fixing. entry.Name is
 	// already pinned by resolveTrackPrefix, so the fallback reproduces
 	// the same prefix.
@@ -2306,11 +2306,11 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	// is reserved for the cases where scoping is unsafe or not worth it: the
 	// census could not be taken, the churn is a large fraction of the repo,
 	// or an operator forced it via GORTEX_WARMUP_FULL_RETRACK. A repo with
-	// zero changes keeps the fast IncrementalReindex no-op (walk + 0 stale →
+	// zero changes keeps the fast full-tree incremental no-op (walk + 0 stale →
 	// return), which is what makes an unchanged warm restart near-instant.
 	//
 	// The in-memory backend (*graph.Graph) keeps its exact prior behaviour:
-	// IncrementalReindex is the authoritative path there — it evicts
+	// the full-tree modern pipeline is authoritative there — it evicts
 	// offline-deleted files in place, has no reopened disk store, and so no
 	// per-edge write to route around. Gate on the store type.
 	_, memoryBacked := mi.graph.(*graph.Graph)
@@ -2358,6 +2358,11 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	}
 	if err != nil {
 		return nil, fmt.Errorf("reconciling %s: %w", absPath, err)
+	}
+	// A scoped snapshot reconcile cannot derive its total from the walked
+	// scope. Its post-mutation tracked count is the repository-wide baseline.
+	if idx.totalDetected == 0 {
+		idx.totalDetected = result.FileCount
 	}
 	result.RepoPrefix = prefix
 
@@ -2428,7 +2433,7 @@ func firstNStrings(s []string, n int) []string {
 	return s[:n]
 }
 
-// ReconcileAll runs IncrementalReindex on every tracked repo. Used by
+// ReconcileAll runs the modern full-tree pipeline on every tracked repo. Used by
 // the daemon's periodic janitor to catch files whose mutations slipped
 // past fsnotify — inotify watch limits, NFS / SMB mounts, kernel event
 // queue overflow, or daemon downtime where edits happened while nobody
@@ -2454,7 +2459,7 @@ func (mi *MultiIndexer) ReconcileAllCtx(ctx context.Context) map[string]*IndexRe
 	}
 	mi.mu.RUnlock()
 
-	// Same batch trick as warmup: each per-repo IncrementalReindex
+	// Same batch trick as warmup: each per-repo full-tree incremental pass
 	// triggers an O(global) InferImplements/InferOverrides walk if we
 	// don't suppress it. With ~100 repos that's ~100× the work for the
 	// hourly janitor.
@@ -2605,7 +2610,7 @@ type WorktreeGC struct {
 // `git worktree remove` (or manual deletion) case. Each vanished
 // worktree's branch-keyed snapshot slot and graph nodes would otherwise
 // leak forever: a removed worktree never fires a per-file fsnotify
-// delete for its whole tree, and the janitor's IncrementalReindex just
+// delete for its whole tree, and the janitor's full-tree reconciliation just
 // errors out on the missing root without evicting anything.
 //
 // Only repos recorded as worktrees (RepoMetadata.IsWorktree) are

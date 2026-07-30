@@ -162,7 +162,7 @@ type Watcher struct {
 	// FSEvents self-heals (it re-scans on UserDropped/KernelDropped),
 	// but Linux inotify does not — without this the lost event waits on
 	// the up-to-1h janitor. reconcileFn is a test seam: nil in
-	// production (the real IncrementalReindex runs).
+	// production (the real full-tree coordinator runs).
 	reconcileMu      sync.Mutex
 	reconcilePending bool
 	reconcileFn      func()
@@ -1807,7 +1807,7 @@ func (w *Watcher) reconcileKindWithDisk(path string, kind ChangeKind) ChangeKind
 // persisted mtime row outlives the file: the next warm restart reads it
 // back, finds the path gone from disk, and treats it as a phantom deletion
 // — re-running a scoped reconcile for a file that is already correct on
-// every boot. Mirrors IncrementalReindex's deletion handling: prune the
+// every boot. Mirrors full-tree reconciliation's deletion handling: prune the
 // in-memory map first (pruneDeletedFileMtimes documents that its caller has
 // already done so, and a later snapshot persist would otherwise resurrect
 // the row from the stale in-memory entry), then the store, which self-skips

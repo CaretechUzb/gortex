@@ -541,7 +541,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	defer stopSnapshotter()
 
 	// Periodic reconciliation — the "janitor". Walks each tracked repo
-	// and runs IncrementalReindex to evict files deleted offline and
+	// and runs IncrementalReindexPaths to evict files deleted offline and
 	// re-index files whose mtime changed. Insurance against gaps in
 	// fsnotify coverage (inotify watch limits, NFS mounts, kernel
 	// event-queue overflow). Default interval 1 h; override via
@@ -680,7 +680,7 @@ func reconcileInterval() time.Duration {
 // function can be called unconditionally.
 //
 // The worktree GC runs *before* ReconcileAll on purpose: a removed
-// worktree's root no longer exists, so ReconcileAll's IncrementalReindex
+// worktree's root no longer exists, so ReconcileAll's IncrementalReindexPaths
 // would only error on the missing path without evicting anything.
 // Pruning the vanished worktrees first keeps the reconcile sweep
 // working on live repos and stops a deleted worktree's snapshot slot

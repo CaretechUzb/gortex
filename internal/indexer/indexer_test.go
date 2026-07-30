@@ -174,10 +174,11 @@ func TestIncrementalReindexPaths_MtimeBumpFlagsReparse(t *testing.T) {
 		"a scoped re-parse of an mtime-drifted file must force deferred enrichment")
 }
 
-// TestIncrementalReindex_MtimeBumpFlagsReparse is the whole-root sibling of the
-// scoped fingerprint no-op above: an mtime-stale but byte-identical file is
-// examined without eviction and therefore leaves reparsedThisRun clear.
-func TestIncrementalReindex_MtimeBumpFlagsReparse(t *testing.T) {
+// TestIncrementalReindexPaths_WholeRootMtimeBumpFlagsReparse proves the unified
+// modern pipeline preserves the enrichment marker contract for nil-path scans:
+// an mtime-stale file that is re-parsed must report that work just like an
+// explicitly scoped call.
+func TestIncrementalReindexPaths_WholeRootMtimeBumpFlagsReparse(t *testing.T) {
 	dir := t.TempDir()
 	main := filepath.Join(dir, "main.go")
 	const content = "package main\n\nfunc Hello() {}\n"
@@ -190,11 +191,11 @@ func TestIncrementalReindex_MtimeBumpFlagsReparse(t *testing.T) {
 	require.False(t, idx.reparsedThisRun.Load())
 
 	bumpMtime(t, main, content)
-	result, err := idx.IncrementalReindex(dir)
+	result, err := idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 	require.Positive(t, result.StaleFileCount)
-	assert.False(t, idx.reparsedThisRun.Load(),
-		"a whole-root content-identical fingerprint no-op must not force deferred enrichment")
+	assert.True(t, idx.reparsedThisRun.Load(),
+		"a whole-root re-parse must force deferred enrichment for the touched file")
 }
 
 // TestIncrementalReindex_NoChangeLeavesReparseClear guards the other side: a
@@ -209,7 +210,7 @@ func TestIncrementalReindex_NoChangeLeavesReparseClear(t *testing.T) {
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 
-	result, err := idx.IncrementalReindex(dir)
+	result, err := idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 	require.Zero(t, result.StaleFileCount, "nothing changed on disk")
 	assert.False(t, idx.reparsedThisRun.Load(),
@@ -312,7 +313,7 @@ func TestGrepText(t *testing.T) {
 	// freshly added literal is visible.
 	bumpMtime(t, filepath.Join(dir, "main.go"),
 		"package main\n\nfunc main() {}\n\nfunc BrandNew() {}\n")
-	_, err = idx.IncrementalReindex(dir)
+	_, err = idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 	assert.NotEmpty(t, idx.GrepText("func BrandNew", 0),
 		"GrepText must reflect content added by an incremental reindex")

@@ -287,7 +287,7 @@ func haveGit(t *testing.T) bool {
 // gap is closed: a pathless EventOverflow on the Events channel triggers
 // a coalesced full-tree reconcile (the signal the Linux inotify backend
 // raises when its queue overflows and events are lost). The reconcileFn
-// seam stands in for IncrementalReindex so the assertion is
+// seam stands in for full-tree reconciliation so the assertion is
 // deterministic and platform-independent.
 func TestWatcher_OverflowEventTriggersReconcile(t *testing.T) {
 	idx, _ := newToggleIndexer(t)
@@ -366,7 +366,7 @@ func TestWatcher_OverflowReconcileCoalesces(t *testing.T) {
 }
 
 // TestWatcher_OverflowReconcileIndexesMissedFile is the end-to-end proof
-// that the real reconcile path (IncrementalReindex) recovers a file
+// that the real IncrementalReindexPaths reconcile recovers a file
 // whose create/modify event was lost. We index a tree, drop a brand-new
 // file on disk (simulating a missed inotify create), then drive an
 // overflow through the real reconcile and assert the new file is now in
@@ -396,12 +396,12 @@ func TestWatcher_OverflowReconcileIndexesMissedFile(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "missed.fk"), "recovered body")
 	require.Empty(t, g.GetFileNodes("missed.fk"), "missed file must be absent before the reconcile")
 
-	// Drive the real IncrementalReindex through the overflow path, with
+	// Drive the real full-tree reconciliation through the overflow path, with
 	// a thin wrapper only to know when it finishes.
 	done := make(chan struct{}, 1)
 	w.reconcileMu.Lock()
 	w.reconcileFn = func() {
-		_, rerr := idx.IncrementalReindex(dir)
+		_, rerr := idx.IncrementalReindexPaths(dir, nil)
 		require.NoError(t, rerr)
 		done <- struct{}{}
 	}

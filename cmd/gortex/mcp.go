@@ -315,7 +315,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 						}
 					}
 
-					result, err := idx.IncrementalReindex(mcpIndex)
+					result, err := idx.IncrementalReindexPaths(mcpIndex, nil)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "[gortex] incremental reindex failed: %v\n", err)
 					} else {

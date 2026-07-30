@@ -2535,7 +2535,7 @@ func (g *Graph) addNodeLocked(s *shard, n *Node) {
 			// an empty-prefix re-add silently strip the node out of its
 			// byRepo bucket. The downgrade-to-empty case has no
 			// legitimate caller (contract nodes use distinct IDs that
-			// never collide with symbol IDs; the parse and IncrementalReindex
+			// never collide with symbol IDs; the parse and IncrementalReindexPaths
 			// paths route through applyRepoPrefix which always stamps
 			// the active idx.repoPrefix on the new node) and previously
 			// caused per-repo `byRepo[prefix]` to drain mid-warmup,

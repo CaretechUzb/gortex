@@ -140,16 +140,16 @@ func TestIncrementalReindex_ConvergesToFullIndex(t *testing.T) {
 
 	bumpMtime(t, filepath.Join(dir, "main.go"),
 		"package main\n\nfunc main() { helper(); helper() }\n\nfunc helper() {}\n")
-	_, err = idxA.IncrementalReindex(dir)
+	_, err = idxA.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 
 	bumpMtime(t, filepath.Join(dir, "pkg", "util.go"),
 		"package pkg\n\ntype Config struct{ Port int }\n\nfunc New() *Config { return &Config{} }\n\nfunc Reset(c *Config) {}\n")
-	_, err = idxA.IncrementalReindex(dir)
+	_, err = idxA.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 
 	require.NoError(t, os.Remove(filepath.Join(dir, "extra.go")))
-	_, err = idxA.IncrementalReindex(dir)
+	_, err = idxA.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 
 	// Path B: a single cold index of the same final disk state.

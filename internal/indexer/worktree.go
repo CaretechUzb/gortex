@@ -103,7 +103,7 @@ func ResolveWorktree(path string) WorktreeInfo {
 // error (EACCES on a mounted volume, an NFS hiccup) returns false so a
 // flaky filesystem can never trigger a destructive index eviction.
 //
-// This mirrors the deletion-detection rule IncrementalReindex already
+// This mirrors the deletion-detection rule IncrementalReindexPaths already
 // uses for individual files: only os.ErrNotExist counts as gone, every
 // other Stat error is treated as "preserve, can't verify."
 //
