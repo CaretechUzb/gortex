@@ -117,6 +117,17 @@ func (s *Swappable) SearchSymbolBundles(query string, limit int) []SymbolBundle 
 	return nil
 }
 
+// SearchSymbolBundlesScoped forwards the repo-narrowed bundle path the
+// same way; nil when the inner backend doesn't expose it.
+func (s *Swappable) SearchSymbolBundlesScoped(query string, repoAllow []string, limit int) []SymbolBundle {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if bs, ok := s.inner.(ScopedSymbolBundleSearcherBackend); ok {
+		return bs.SearchSymbolBundlesScoped(query, repoAllow, limit)
+	}
+	return nil
+}
+
 // VectorChannelOnly forwards to the inner backend when it implements
 // the vector-only channel pull (today: HybridBackend). Lets the
 // engine fetch the vector channel without re-running text BM25 —

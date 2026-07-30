@@ -608,6 +608,19 @@ func (e *Engine) SearchSymbolsScoped(query string, limit int, opts QueryOptions)
 	return out
 }
 
+// repoAllowList flattens a RepoAllow set into a sorted slice for the
+// scoped backend call — sorted so the generated SQL is deterministic.
+func repoAllowList(allow map[string]bool) []string {
+	out := make([]string, 0, len(allow))
+	for r, ok := range allow {
+		if ok {
+			out = append(out, r)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // gatherBackendCandidates fetches BM25 + (optional) vector results,
 // dedups them across channels, and supplements with exact-name /
 // substring / bigram-rescue matches. Each candidate carries its
@@ -656,7 +669,20 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		}
 		vectorOnlyBackend, vectorOnlyOK := backend.(vectorOnly)
 		bundleStart := time.Now()
-		bundles := bsb.SearchSymbolBundles(query, limit*2)
+		// Repo-narrowed sessions take the scoped bundle path when the
+		// backend can filter inside the FTS query. The post-fetch
+		// ScopeAllows pass below starves whenever another repo owns the
+		// whole BM25 head deeper than this fetch — only the backend can
+		// narrow without a depth limit.
+		var bundles []search.SymbolBundle
+		if len(opts.RepoAllow) > 0 {
+			if sb, ok := backend.(search.ScopedSymbolBundleSearcherBackend); ok {
+				bundles = sb.SearchSymbolBundlesScoped(query, repoAllowList(opts.RepoAllow), limit*2)
+			}
+		}
+		if bundles == nil {
+			bundles = bsb.SearchSymbolBundles(query, limit*2)
+		}
 		if timings != nil {
 			timings.BundleMS += time.Since(bundleStart).Milliseconds()
 		}

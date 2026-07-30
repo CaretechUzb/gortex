@@ -163,6 +163,19 @@ func (h *HybridBackend) SearchSymbolBundles(query string, limit int) []SymbolBun
 	return nil
 }
 
+// SearchSymbolBundlesScoped forwards the repo-narrowed bundle path to
+// the text backend; the vector channel does not participate, exactly
+// as in SearchSymbolBundles.
+func (h *HybridBackend) SearchSymbolBundlesScoped(query string, repoAllow []string, limit int) []SymbolBundle {
+	if h == nil || h.text == nil {
+		return nil
+	}
+	if bs, ok := h.text.(ScopedSymbolBundleSearcherBackend); ok {
+		return bs.SearchSymbolBundlesScoped(query, repoAllow, limit)
+	}
+	return nil
+}
+
 func (h *HybridBackend) searchChannels(query string, limit int) ([]SearchResult, []string, ChannelTimings) {
 	var stats ChannelTimings
 	tStart := time.Now()
