@@ -303,17 +303,22 @@ func (t *Transport) handlePost(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			t.logger.Warn("streamable: dispatch failed",
 				zap.String("session_id", sessionID), zap.Error(err))
-			id, _ := peekJSONRPCID(frame)
-			replyBytes = jsonRPCErrorBytes(id, -32603, err.Error())
+			id, hasID := peekJSONRPCID(frame)
+			if hasID {
+				replyBytes = jsonRPCErrorBytes(id, -32603, err.Error())
+			} else {
+				replyBytes = nil
+			}
 		}
 		if status != 0 && status != http.StatusOK {
 			// A remote upstream returned a non-2xx; surface that
 			// to the client as a JSON-RPC error frame so the
 			// batch shape stays intact.
 			if len(replyBytes) == 0 {
-				id, _ := peekJSONRPCID(frame)
-				replyBytes = jsonRPCErrorBytes(id, -32603,
-					fmt.Sprintf("upstream status %d", status))
+				if id, hasID := peekJSONRPCID(frame); hasID {
+					replyBytes = jsonRPCErrorBytes(id, -32603,
+						fmt.Sprintf("upstream status %d", status))
+				}
 			}
 		}
 		if len(replyBytes) == 0 {
@@ -501,7 +506,10 @@ func (t *Transport) tryRouteToolCall(r *http.Request, state SessionState, frame 
 	// The router returned an /v1/tools/<name>-shaped response;
 	// translate it into a JSON-RPC `result` frame so the client
 	// sees the same envelope every other tool/call produces.
-	id, _ := peekJSONRPCID(frame)
+	id, hasID := peekJSONRPCID(frame)
+	if !hasID {
+		return nil, status, true
+	}
 	wrapped := wrapToolResultAsJSONRPC(id, out, status)
 	return wrapped, status, true
 }

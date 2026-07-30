@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -45,6 +46,12 @@ func newTestMCPServer() *mcpserver.MCPServer {
 type countingDispatcher struct {
 	delegate Dispatcher
 	calls    atomic.Int64
+}
+
+type failingDispatcher struct{}
+
+func (failingDispatcher) Dispatch(context.Context, []byte) ([]byte, error) {
+	return nil, errors.New("dispatch failed")
 }
 
 func (d *countingDispatcher) Dispatch(ctx context.Context, frame []byte) ([]byte, error) {
@@ -554,6 +561,16 @@ func TestNotificationOnlyBatchReturns202(t *testing.T) {
 	}
 	if rec.Body.Len() > 0 {
 		t.Errorf("body not empty: %q", rec.Body.String())
+	}
+}
+
+func TestNotificationDispatchErrorReturns202(t *testing.T) {
+	store := NewMemoryStore(time.Minute)
+	defer store.Close()
+	tr := New(Config{Dispatcher: failingDispatcher{}, Store: store})
+	rec := doPOST(t, tr, jsonRPC(nil, "notifications/cancelled", map[string]any{"requestId": 1}), nil)
+	if rec.Code != http.StatusAccepted || rec.Body.Len() != 0 {
+		t.Fatalf("status/body = %d/%q, want 202/empty", rec.Code, rec.Body.String())
 	}
 }
 
@@ -1084,8 +1101,24 @@ func TestRouterNotFoundDoesNotExpireSession(t *testing.T) {
 	if got := rec.Header().Get(HeaderSessionID); got != sid {
 		t.Errorf("response session id = %q, want %q", got, sid)
 	}
-	if strings.Contains(rec.Body.String(), "session") || !strings.Contains(rec.Body.String(), "HTTP 404") {
-		t.Errorf("router error was misclassified as session expiry: %s", rec.Body.String())
+	var env struct {
+		Error struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, rec.Body.String())
+	}
+	if env.Error.Code != -32603 {
+		t.Errorf("router error code = %d, want -32603; body=%s", env.Error.Code, rec.Body.String())
+	}
+
+	notification := jsonRPC(nil, "tools/call", map[string]any{
+		"name": "missing_tool", "arguments": map[string]any{},
+	})
+	rec = doPOST(t, tr, notification, map[string]string{HeaderSessionID: sid})
+	if rec.Code != http.StatusAccepted || rec.Body.Len() != 0 {
+		t.Fatalf("notification status/body = %d/%q, want 202/empty", rec.Code, rec.Body.String())
 	}
 }
 

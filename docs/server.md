@@ -45,7 +45,7 @@ gortex mcp --index /path/to/repo --server --port 8765
 
 | Verb | Path | Behaviour |
 |------|------|-----------|
-| `POST` | `/mcp` | One or more JSON-RPC frames in, one or a JSON-RPC array out. Notification-only batches with a valid or absent session return 202; an unknown session returns 404 before dispatch. |
+| `POST` | `/mcp` | One or more JSON-RPC frames in, one JSON-RPC response or array out. Notification-only batches with a valid or absent session return 202; an unknown session returns 404 before dispatch, with an empty body for notification-only input. |
 | `GET` | `/mcp` | Opens an SSE stream the server uses to push server-initiated notifications (progress, sampling) onto the bound session. |
 | `DELETE` | `/mcp` | Terminates a session. Idempotent — returns 204 even when the id is unknown. |
 | `OPTIONS` | `/mcp` | CORS preflight; advertises the allowed methods. |
