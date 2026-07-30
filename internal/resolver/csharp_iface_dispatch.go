@@ -282,7 +282,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	callEdges := frameworkEdgesByKinds(g, graph.EdgeCalls)
 	if scope != nil {
 		callEdges = nil
-		callSeen := make(map[string]struct{})
+		callSeen := make(map[graph.EdgeIdentity]struct{})
 		callEdges = appendUniqueFrameworkEdges(callEdges, callSeen, scopedSourceCalls...)
 		familyMemberIDs := make([]string, 0, len(famsOfMember))
 		for id := range famsOfMember {
