@@ -412,7 +412,7 @@ func resolveTemporalCalls(g graph.Store, cands *frameworkPassCandidates) int {
 	shared := cands != nil
 	var wrapperSeed []*graph.Edge
 	if shared {
-		wrapperSeed = refetchFrameworkCandidates(g, cands.calls)
+		wrapperSeed = cands.calls
 	}
 	for i := 0; i < 16; i++ {
 		added := resolveTemporalWrapperCalls(g, wrapperSeed, shared)
@@ -431,7 +431,7 @@ func resolveTemporalCalls(g graph.Store, cands *frameworkPassCandidates) int {
 	// literal name supplied at the executor's construction site. Also runs
 	// before the sweep so the rewritten stubs resolve below.
 	if shared {
-		resolveTemporalExecutorFields(g, refetchFrameworkCandidates(g, cands.calls), true)
+		resolveTemporalExecutorFields(g, cands.calls, true)
 	} else {
 		resolveTemporalExecutorFields(g, nil, false)
 	}
@@ -452,7 +452,7 @@ func resolveTemporalCalls(g graph.Store, cands *frameworkPassCandidates) int {
 	if shared {
 		// The census candidates plus this pass's own staged wrapper stubs
 		// are exactly the overlay a fresh stream walk would surface here.
-		sweep := refetchFrameworkCandidates(g, cands.calls)
+		sweep := cands.calls
 		if bs, ok := g.(*frameworkEdgeBatchStore); ok {
 			sweep = append(sweep, bs.stagedEdgesMatching(func(e *graph.Edge) bool {
 				if e.Kind != graph.EdgeCalls || e.Meta == nil {
@@ -742,7 +742,7 @@ func resolveTemporalCalls(g graph.Store, cands *frameworkPassCandidates) int {
 	// sweep above and the via=temporal.handler edges emitted by the Go
 	// extractor. Additive — graph.AddEdge dedupes.
 	if shared {
-		resolveTemporalCrossLanguage(g, refetchFrameworkCandidates(g, cands.calls), true)
+		resolveTemporalCrossLanguage(g, cands.calls, true)
 	} else {
 		resolveTemporalCrossLanguage(g, nil, false)
 	}

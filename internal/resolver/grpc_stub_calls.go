@@ -66,7 +66,7 @@ func resolveGRPCStubCalls(g graph.Store, cands *frameworkPassCandidates) int {
 	callsStream := g.EdgesByKind(graph.EdgeCalls)
 	var sharedCalls []*graph.Edge
 	if cands != nil {
-		sharedCalls = refetchFrameworkCandidates(g, cands.calls)
+		sharedCalls = cands.calls
 		callsStream = frameworkEdgeSeq(sharedCalls)
 	}
 

@@ -24,16 +24,22 @@ import (
 // refetchFrameworkCandidates), so an edge retargeted by an earlier pass in
 // the same run drops out exactly as it would vanish from a fresh stream walk.
 
-// frameworkPassCandidates is the per-synthesizer bundle handed to a
-// converted pass in place of its own whole-stream scans.
+// frameworkPassCandidateIdentities is the compact census-time buffer for one
+// synthesizer. It retains only logical edge keys while the other passes run;
+// payloads and Meta are fetched exactly when this pass is about to start.
+type frameworkPassCandidateIdentities struct {
+	calls     []graph.EdgeIdentity
+	refs      []graph.EdgeIdentity
+	annotated []graph.EdgeIdentity
+	nodes     *frameworkNodeSnapshot
+}
+
+// frameworkPassCandidates is the live per-synthesizer bundle handed to a
+// converted pass in place of its own whole-stream scans. It exists only for
+// that pass invocation and reflects all mutations committed by earlier passes.
 type frameworkPassCandidates struct {
-	// calls / refs hold the pass's EdgeCalls / EdgeReferences candidates in
-	// census stream order. They are census-time reads: consult them through
-	// refetchFrameworkCandidates so mutations by earlier passes are honoured.
-	calls []*graph.Edge
-	refs  []*graph.Edge
-	// annotated holds the temporal-tagged EdgeAnnotated edges (temporal
-	// only). No pass mutates annotation edges, so they are used directly.
+	calls     []*graph.Edge
+	refs      []*graph.Edge
 	annotated []*graph.Edge
 	// nodes is the run-wide shared node snapshot (one decoded walk per node
 	// kind for the whole synthesizer loop).
@@ -88,7 +94,7 @@ func frameworkKindNodes(g graph.Store, snap *frameworkNodeSnapshot, kind graph.N
 // frameworkStreamCandidates owns the armed collectors and the per-pass
 // buffers for one full-census run.
 type frameworkStreamCandidates struct {
-	perPass map[string]*frameworkPassCandidates
+	perPass map[string]*frameworkPassCandidateIdentities
 	nodes   *frameworkNodeSnapshot
 
 	// macroNames / macroIDs pre-filter the macro-expansion use-site arm.
@@ -121,7 +127,7 @@ type frameworkCandidateCollector struct {
 // never correctness.
 func newFrameworkStreamCandidates(g graph.Store, present, markers map[string]int) *frameworkStreamCandidates {
 	sc := &frameworkStreamCandidates{
-		perPass: map[string]*frameworkPassCandidates{},
+		perPass: map[string]*frameworkPassCandidateIdentities{},
 		nodes:   &frameworkNodeSnapshot{},
 	}
 	armed := func(name string) bool {
@@ -199,22 +205,23 @@ func newFrameworkStreamCandidates(g graph.Store, present, markers map[string]int
 	return sc
 }
 
-func (sc *frameworkStreamCandidates) ensurePass(name string) *frameworkPassCandidates {
+func (sc *frameworkStreamCandidates) ensurePass(name string) *frameworkPassCandidateIdentities {
 	pc := sc.perPass[name]
 	if pc == nil {
-		pc = &frameworkPassCandidates{nodes: sc.nodes}
+		pc = &frameworkPassCandidateIdentities{nodes: sc.nodes}
 		sc.perPass[name] = pc
 	}
 	return pc
 }
 
-// passStreams returns the bundle for one pass, or nil when its collectors
-// were not armed (the pass then runs its legacy whole-stream form).
-func (sc *frameworkStreamCandidates) passStreams(name string) *frameworkPassCandidates {
+// passStreams materialises one pass's current edges with a single exact-key
+// batch read. Stores without the optional exact lookup fall back to the legacy
+// whole-stream form rather than issuing a broad adjacency query.
+func (sc *frameworkStreamCandidates) passStreams(g graph.Store, name string) *frameworkPassCandidates {
 	if sc == nil {
 		return nil
 	}
-	return sc.perPass[name]
+	return refetchFrameworkCandidates(g, sc.perPass[name])
 }
 
 // collectCalls hands one census-walk EdgeCalls edge to every armed
@@ -227,7 +234,7 @@ func (sc *frameworkStreamCandidates) collectCalls(e *graph.Edge) {
 	for _, c := range sc.callsCollectors {
 		if c.pred(e) {
 			pc := sc.perPass[c.name]
-			pc.calls = append(pc.calls, e)
+			pc.calls = append(pc.calls, graph.EdgeIdentityFor(e))
 		}
 	}
 }
@@ -240,7 +247,7 @@ func (sc *frameworkStreamCandidates) collectRefs(e *graph.Edge) {
 	for _, c := range sc.refsCollectors {
 		if c.pred(e) {
 			pc := sc.perPass[c.name]
-			pc.refs = append(pc.refs, e)
+			pc.refs = append(pc.refs, graph.EdgeIdentityFor(e))
 		}
 	}
 }
@@ -254,8 +261,11 @@ func (sc *frameworkStreamCandidates) wantsAnnotated() bool {
 }
 
 func (sc *frameworkStreamCandidates) addAnnotated(e *graph.Edge) {
+	if sc == nil || e == nil {
+		return
+	}
 	pc := sc.perPass[SynthTemporalStub]
-	pc.annotated = append(pc.annotated, e)
+	pc.annotated = append(pc.annotated, graph.EdgeIdentityFor(e))
 }
 
 func (sc *frameworkStreamCandidates) annotatedCount() int {
@@ -268,37 +278,36 @@ func (sc *frameworkStreamCandidates) annotatedCount() int {
 	return 0
 }
 
-// refetchFrameworkCandidates re-reads the CURRENT form of the collected
-// candidates, in collection order, through the pass's own store view. A
-// candidate whose (from, to, kind, file, line) identity no longer exists —
-// retargeted or removed by an earlier pass — is dropped, exactly as it
-// would no longer match a fresh predicate walk; one that survives is
-// returned in its live form (staged-overlay and Meta-current), so the
-// pass's own loop filters see the same state a fresh stream would yield.
-// One batched out-edge read replaces a whole-kind decode.
-func refetchFrameworkCandidates(g graph.Store, cands []*graph.Edge) []*graph.Edge {
-	if len(cands) == 0 {
+// refetchFrameworkCandidates re-reads one pass's CURRENT candidates in census
+// order. A candidate retargeted or removed by an earlier pass is absent from
+// the exact lookup and therefore drops out exactly as it would from a fresh
+// kind scan. The lookup happens once, immediately before the pass begins.
+func refetchFrameworkCandidates(g graph.Store, cands *frameworkPassCandidateIdentities) *frameworkPassCandidates {
+	if cands == nil {
 		return nil
 	}
-	fromIDs := make([]string, 0, len(cands))
-	for _, e := range cands {
-		fromIDs = append(fromIDs, e.From)
+	finder, ok := g.(graph.EdgeIdentityBatchFinder)
+	if !ok {
+		return nil
 	}
-	byKey := map[string]*graph.Edge{}
-	for _, edges := range g.GetOutEdgesByNodeIDs(dedupeFrameworkIDs(fromIDs)) {
-		for _, e := range edges {
-			if e != nil {
-				byKey[frameworkScopedEdgeKey(e)] = e
+	identities := make([]graph.EdgeIdentity, 0, len(cands.calls)+len(cands.refs)+len(cands.annotated))
+	identities = append(identities, cands.calls...)
+	identities = append(identities, cands.refs...)
+	identities = append(identities, cands.annotated...)
+	current := finder.FindEdgesByIdentities(identities)
+	materialize := func(ids []graph.EdgeIdentity) []*graph.Edge {
+		out := make([]*graph.Edge, 0, len(ids))
+		for _, identity := range ids {
+			if edge := current[identity]; edge != nil {
+				out = append(out, edge)
 			}
 		}
+		return out
 	}
-	out := make([]*graph.Edge, 0, len(cands))
-	for _, c := range cands {
-		if e := byKey[frameworkScopedEdgeKey(c)]; e != nil {
-			out = append(out, e)
-		}
+	return &frameworkPassCandidates{
+		calls: materialize(cands.calls), refs: materialize(cands.refs),
+		annotated: materialize(cands.annotated), nodes: cands.nodes,
 	}
-	return out
 }
 
 // frameworkEdgeSeq adapts a candidate slice to the iterator shape a kind

@@ -1156,7 +1156,7 @@ func runFrameworkSynthesizersScoped(
 		var n int
 		if shouldRunFrameworkSynthesizer(s, scope, candidates) {
 			if sf, ok := s.(synthFunc); ok {
-				bundle := candidates.streams.passStreams(sf.name)
+				bundle := candidates.streams.passStreams(g, sf.name)
 				switch {
 				case sf.candFn != nil && bundle != nil:
 					// Shared-stream form. streams exist only on a full-census

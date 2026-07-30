@@ -48,13 +48,12 @@ func resolveRailsRefs(g graph.Store, cands *frameworkPassCandidates) int {
 	}
 	stream := g.EdgesByKind(graph.EdgeCalls)
 	if cands != nil {
-		refetched := refetchFrameworkCandidates(g, cands.calls)
-		if len(refetched) == 0 {
+		if len(cands.calls) == 0 {
 			// The convention indexes below are pure reads consumed only by
 			// the loop; with no candidates the pass provably lands nothing.
 			return 0
 		}
-		stream = frameworkEdgeSeq(refetched)
+		stream = frameworkEdgeSeq(cands.calls)
 	}
 	models := railsModelClassSet(g)
 	methodsByClass := railsClassMethodIndex(g)
