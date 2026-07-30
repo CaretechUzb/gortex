@@ -42,6 +42,16 @@ func newTestMCPServer() *mcpserver.MCPServer {
 	return srv
 }
 
+type countingDispatcher struct {
+	delegate Dispatcher
+	calls    atomic.Int64
+}
+
+func (d *countingDispatcher) Dispatch(ctx context.Context, frame []byte) ([]byte, error) {
+	d.calls.Add(1)
+	return d.delegate.Dispatch(ctx, frame)
+}
+
 // newTransport stands up a transport backed by a fresh MemoryStore
 // and the test mcp-go server. Returns the transport and a cleanup
 // func that releases the store's background sweeper.
@@ -53,6 +63,14 @@ func newTransport(t *testing.T) (*Transport, func()) {
 		Store:      store,
 	})
 	return tr, func() { store.Close() }
+}
+
+func newCountingTransport(t *testing.T) (*Transport, *MemoryStore, *countingDispatcher) {
+	t.Helper()
+	store := NewMemoryStore(time.Minute)
+	t.Cleanup(store.Close)
+	dispatcher := &countingDispatcher{delegate: MCPServerDispatcher{Server: newTestMCPServer()}}
+	return New(Config{Dispatcher: dispatcher, Store: store}), store, dispatcher
 }
 
 // jsonRPC builds a single JSON-RPC request body. id may be a string,
@@ -70,6 +88,14 @@ func jsonRPC(id any, method string, params any) []byte {
 	}
 	out, _ := json.Marshal(env)
 	return out
+}
+
+func initializeBody(name, version string) []byte {
+	return jsonRPC(1, "initialize", map[string]any{
+		"protocolVersion": DefaultProtocolVersion,
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": name, "version": version},
+	})
 }
 
 // doPOST sends one request to the transport and returns the response
@@ -173,30 +199,262 @@ func TestSessionReplayAcrossRequests(t *testing.T) {
 }
 
 // TestUnknownSessionRejected covers the stale-session race: a client
-// reconnects with a session id the store no longer knows. The
-// transport returns a JSON-RPC error, not a silent fresh session.
+// reconnects with a session id the store no longer knows. The HTTP 404
+// lets the client reinitialize, while the pre-dispatch gate prevents a
+// retry from duplicating the original operation.
 func TestUnknownSessionRejected(t *testing.T) {
-	tr, cleanup := newTransport(t)
-	defer cleanup()
-
-	body := jsonRPC(1, "tools/call", map[string]any{
-		"name": "echo", "arguments": map[string]any{"message": "x"},
-	})
-	rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: "never_existed"})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (JSON-RPC error envelope is 200)", rec.Code)
+	tests := []struct {
+		name            string
+		protocolVersion string
+		wantVersion     string
+	}{
+		{name: "default protocol version", wantVersion: DefaultProtocolVersion},
+		{name: "echoed protocol version", protocolVersion: "2025-06-18", wantVersion: "2025-06-18"},
 	}
-	var env map[string]any
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tr, _, dispatcher := newCountingTransport(t)
+			body := jsonRPC(1, "tools/call", map[string]any{
+				"name": "echo", "arguments": map[string]any{"message": "x"},
+			})
+			headers := map[string]string{HeaderSessionID: "never_existed"}
+			if test.protocolVersion != "" {
+				headers[HeaderProtocolVersion] = test.protocolVersion
+			}
+			rec := doPOST(t, tr, body, headers)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", rec.Code)
+			}
+			if got := rec.Header().Get(HeaderProtocolVersion); got != test.wantVersion {
+				t.Errorf("protocol version = %q, want %q", got, test.wantVersion)
+			}
+			if got := rec.Header().Get(HeaderSessionID); got != "" {
+				t.Errorf("stale response session id = %q, want empty", got)
+			}
+			var env struct {
+				ID    json.RawMessage `json:"id"`
+				Error struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+				t.Fatalf("body not JSON: %v\n%s", err, rec.Body.String())
+			}
+			if string(env.ID) != "1" || env.Error.Code != -32001 {
+				t.Errorf("error envelope id/code = %s/%d, want 1/-32001", env.ID, env.Error.Code)
+			}
+			if !strings.Contains(env.Error.Message, "never_existed") {
+				t.Errorf("error message = %q; want it to name the missing session", env.Error.Message)
+			}
+			if got := dispatcher.calls.Load(); got != 0 {
+				t.Errorf("dispatcher calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestUnknownSessionRequestShapes(t *testing.T) {
+	t.Run("single notification", func(t *testing.T) {
+		tr, _, dispatcher := newCountingTransport(t)
+		rec := doPOST(t, tr, jsonRPC(nil, "notifications/cancelled", map[string]any{"requestId": 1}),
+			map[string]string{HeaderSessionID: "expired"})
+		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
+			t.Fatalf("status/body = %d/%q, want 404/empty", rec.Code, rec.Body.String())
+		}
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("single response", func(t *testing.T) {
+		tr, _, dispatcher := newCountingTransport(t)
+		response := []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`)
+		rec := doPOST(t, tr, response, map[string]string{HeaderSessionID: "expired"})
+		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
+			t.Fatalf("status/body = %d/%q, want 404/empty", rec.Code, rec.Body.String())
+		}
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("invalid request envelope", func(t *testing.T) {
+		tr, _, dispatcher := newCountingTransport(t)
+		rec := doPOST(t, tr, []byte(`{"method":"ping","id":1}`),
+			map[string]string{HeaderSessionID: "expired"})
+		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
+			t.Fatalf("status/body = %d/%q, want 404/empty", rec.Code, rec.Body.String())
+		}
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("mixed batch", func(t *testing.T) {
+		tr, _, dispatcher := newCountingTransport(t)
+		body, _ := json.Marshal([]json.RawMessage{
+			jsonRPC(1, "ping", nil),
+			jsonRPC(nil, "notifications/cancelled", map[string]any{"requestId": 1}),
+			json.RawMessage(`{"jsonrpc":"2.0","id":99,"result":{}}`),
+			jsonRPC("two", "tools/list", nil),
+		})
+		rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: "expired"})
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", rec.Code)
+		}
+		var replies []struct {
+			ID    json.RawMessage `json:"id"`
+			Error struct {
+				Code int `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &replies); err != nil {
+			t.Fatalf("body not JSON array: %v\n%s", err, rec.Body.String())
+		}
+		if len(replies) != 2 || string(replies[0].ID) != "1" || string(replies[1].ID) != `"two"` {
+			t.Fatalf("reply ids = %+v, want [1, two]", replies)
+		}
+		for _, reply := range replies {
+			if reply.Error.Code != -32001 {
+				t.Errorf("error code = %d, want -32001", reply.Error.Code)
+			}
+		}
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("notification-only batch", func(t *testing.T) {
+		tr, _, dispatcher := newCountingTransport(t)
+		body, _ := json.Marshal([]json.RawMessage{
+			jsonRPC(nil, "notifications/initialized", nil),
+			jsonRPC(nil, "notifications/cancelled", map[string]any{"requestId": 1}),
+		})
+		rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: "expired"})
+		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
+			t.Fatalf("status/body = %d/%q, want 404/empty", rec.Code, rec.Body.String())
+		}
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("initialize batch", func(t *testing.T) {
+		tr, _, dispatcher := newCountingTransport(t)
+		body, _ := json.Marshal([]json.RawMessage{initializeBody("test", "1")})
+		rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: "expired"})
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", rec.Code)
+		}
+		var replies []struct {
+			Error struct {
+				Code int `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &replies); err != nil {
+			t.Fatalf("body not JSON array: %v\n%s", err, rec.Body.String())
+		}
+		if len(replies) != 1 || replies[0].Error.Code != -32001 {
+			t.Fatalf("initialize batch response = %s, want one -32001 error", rec.Body.String())
+		}
+		if got := dispatcher.calls.Load(); got != 0 {
+			t.Errorf("dispatcher calls = %d, want 0", got)
+		}
+	})
+}
+
+func TestUnknownSessionStandaloneInitializeRejected(t *testing.T) {
+	tr, _, dispatcher := newCountingTransport(t)
+	body := initializeBody("test", "1")
+	rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: "expired"})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(HeaderSessionID); got != "" {
+		t.Errorf("response session id = %q, want empty", got)
+	}
+	var env struct {
+		ID    json.RawMessage `json:"id"`
+		Error struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
 		t.Fatalf("body not JSON: %v\n%s", err, rec.Body.String())
 	}
-	errBlock, ok := env["error"].(map[string]any)
-	if !ok {
-		t.Fatalf("response missing error block: %v", env)
+	if string(env.ID) != "1" || env.Error.Code != -32001 {
+		t.Errorf("error envelope id/code = %s/%d, want 1/-32001", env.ID, env.Error.Code)
 	}
-	msg, _ := errBlock["message"].(string)
-	if !strings.Contains(msg, "never_existed") {
-		t.Errorf("error message = %q; want it to name the missing session", msg)
+	if got := dispatcher.calls.Load(); got != 0 {
+		t.Errorf("dispatcher calls = %d, want 0", got)
+	}
+}
+
+func TestExpiredSessionReinitializesAndRetries(t *testing.T) {
+	tr, store, dispatcher := newCountingTransport(t)
+	initialize := initializeBody("opencode", "1")
+	first := doPOST(t, tr, initialize, nil)
+	oldID := first.Header().Get(HeaderSessionID)
+	if first.Code != http.StatusOK || oldID == "" {
+		t.Fatalf("first initialize status/id = %d/%q", first.Code, oldID)
+	}
+	if evicted := store.SweepNow(time.Now().Add(2 * time.Hour)); evicted != 1 {
+		t.Fatalf("evicted sessions = %d, want 1", evicted)
+	}
+
+	call := jsonRPC(2, "tools/call", map[string]any{
+		"name": "echo", "arguments": map[string]any{"message": "recovered"},
+	})
+	beforeStale := dispatcher.calls.Load()
+	stale := doPOST(t, tr, call, map[string]string{HeaderSessionID: oldID})
+	if stale.Code != http.StatusNotFound || dispatcher.calls.Load() != beforeStale {
+		t.Fatalf("stale status/calls = %d/%d, want 404/%d", stale.Code, dispatcher.calls.Load(), beforeStale)
+	}
+
+	second := doPOST(t, tr, initialize, nil)
+	newID := second.Header().Get(HeaderSessionID)
+	if second.Code != http.StatusOK || newID == "" || newID == oldID {
+		t.Fatalf("second initialize status/id = %d/%q; old=%q", second.Code, newID, oldID)
+	}
+	initialized := doPOST(t, tr, jsonRPC(nil, "notifications/initialized", nil),
+		map[string]string{HeaderSessionID: newID})
+	if initialized.Code != http.StatusAccepted {
+		t.Fatalf("initialized notification status = %d, want 202", initialized.Code)
+	}
+	beforeRetry := dispatcher.calls.Load()
+	retry := doPOST(t, tr, call, map[string]string{HeaderSessionID: newID})
+	if retry.Code != http.StatusOK || !strings.Contains(retry.Body.String(), "recovered") {
+		t.Fatalf("retry status/body = %d/%s", retry.Code, retry.Body.String())
+	}
+	if got := dispatcher.calls.Load(); got != beforeRetry+1 {
+		t.Errorf("dispatcher calls after retry = %d, want %d", got, beforeRetry+1)
+	}
+}
+
+func TestConcurrentUnknownSessionsNeverDispatch(t *testing.T) {
+	tr, _, dispatcher := newCountingTransport(t)
+	const workers = 25
+	var wg sync.WaitGroup
+	var failures atomic.Int32
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body := jsonRPC(i+1, "tools/call", map[string]any{
+				"name": "echo", "arguments": map[string]any{"message": "stale"},
+			})
+			if rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: "expired"}); rec.Code != http.StatusNotFound {
+				failures.Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if failures.Load() != 0 {
+		t.Errorf("%d/%d stale requests did not return 404", failures.Load(), workers)
+	}
+	if got := dispatcher.calls.Load(); got != 0 {
+		t.Errorf("dispatcher calls = %d, want 0", got)
 	}
 }
 
@@ -257,6 +515,18 @@ func TestStatelessModeOmitsSessionID(t *testing.T) {
 	}
 	if tr.store.Len() != 0 {
 		t.Errorf("stateless store got %d entries", tr.store.Len())
+	}
+
+	call := jsonRPC(2, "tools/call", map[string]any{
+		"name": "echo", "arguments": map[string]any{"message": "stateless"},
+	})
+	stale := doPOST(t, tr, call, map[string]string{HeaderSessionID: "expired"})
+	if stale.Code != http.StatusNotFound {
+		t.Fatalf("stale stateless status = %d, want 404", stale.Code)
+	}
+	retry := doPOST(t, tr, call, nil)
+	if retry.Code != http.StatusOK || !strings.Contains(retry.Body.String(), "stateless") {
+		t.Fatalf("sessionless retry status/body = %d/%s", retry.Code, retry.Body.String())
 	}
 }
 
@@ -798,6 +1068,51 @@ func TestRouterPreservesFullArguments(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "NewServer") {
 		t.Errorf("client response missing forwarded args: %s", rec.Body.String())
 	}
+}
+
+// TestRouterNotFoundDoesNotExpireSession keeps application-level 404s inside
+// the JSON-RPC result boundary. Only the transport's pre-dispatch session gate
+// may emit an HTTP 404 that causes a client to reinitialize and retry.
+func TestRouterNotFoundDoesNotExpireSession(t *testing.T) {
+	router := daemon.NewRouter(daemon.RouterConfig{
+		LocalExecute: func(_ context.Context, _ string, _ []byte) ([]byte, int, error) {
+			return []byte(`{"error":"missing"}`), http.StatusNotFound, nil
+		},
+		Logger: zap.NewNop(),
+	})
+	store := NewMemoryStore(time.Minute)
+	defer store.Close()
+	tr := New(Config{
+		Dispatcher: MCPServerDispatcher{Server: newTestMCPServer()},
+		Store:      store,
+		Router:     router,
+	})
+	sid, err := store.Create(SessionState{Initialized: true, ClientName: "test"})
+	if err != nil {
+		t.Fatalf("seed Create: %v", err)
+	}
+	body := jsonRPC(1, "tools/call", map[string]any{
+		"name": "missing_tool", "arguments": map[string]any{},
+	})
+	rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: sid})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("outer status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(HeaderSessionID); got != sid {
+		t.Errorf("response session id = %q, want %q", got, sid)
+	}
+	var env struct {
+		Error struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, rec.Body.String())
+	}
+	if env.Error.Code != -32603 {
+		t.Errorf("router error code = %d, want -32603; body=%s", env.Error.Code, rec.Body.String())
+	}
+
 }
 
 // TestHTTPRoundTripEndToEnd — fires the transport behind an
