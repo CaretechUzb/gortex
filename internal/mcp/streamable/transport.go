@@ -265,12 +265,6 @@ func (t *Transport) handlePost(w http.ResponseWriter, r *http.Request) {
 			"empty request body")
 		return
 	}
-	if !json.Valid(body) {
-		writeJSONRPCError(w, http.StatusBadRequest, nil, -32700,
-			"invalid JSON request body")
-		return
-	}
-
 	frames, batched, err := splitJSONRPC(body)
 	if err != nil {
 		writeJSONRPCError(w, http.StatusBadRequest, nil, -32700, err.Error())
@@ -294,7 +288,7 @@ func (t *Transport) handlePost(w http.ResponseWriter, r *http.Request) {
 	sessionID := strings.TrimSpace(r.Header.Get(HeaderSessionID))
 	state, found := t.store.Get(sessionID)
 	method, _ := peekJSONRPCMethod(frames[0])
-	standaloneInitialize := !batched && len(frames) == 1 && method == "initialize"
+	standaloneInitialize := !batched && method == "initialize"
 	if sessionID != "" && !found && !standaloneInitialize {
 		writeSessionNotFound(w, sessionID, frames, batched)
 		return
@@ -671,6 +665,9 @@ func splitJSONRPC(body []byte) ([][]byte, bool, error) {
 	}
 	switch trimmed[0] {
 	case '{':
+		if !json.Valid(body) {
+			return nil, false, errors.New("parse object: invalid JSON")
+		}
 		return [][]byte{body}, false, nil
 	case '[':
 		var raw []json.RawMessage

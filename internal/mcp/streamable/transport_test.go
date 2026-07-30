@@ -242,7 +242,7 @@ func TestUnknownSessionRejected(t *testing.T) {
 }
 
 func TestUnknownSessionRequestShapes(t *testing.T) {
-	newTransport := func(t *testing.T) (*Transport, *countingDispatcher) {
+	newCountingTransport := func(t *testing.T) (*Transport, *countingDispatcher) {
 		t.Helper()
 		store := NewMemoryStore(time.Minute)
 		t.Cleanup(store.Close)
@@ -251,7 +251,7 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 	}
 
 	t.Run("single notification", func(t *testing.T) {
-		tr, dispatcher := newTransport(t)
+		tr, dispatcher := newCountingTransport(t)
 		rec := doPOST(t, tr, jsonRPC(nil, "notifications/cancelled", map[string]any{"requestId": 1}),
 			map[string]string{HeaderSessionID: "expired"})
 		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
@@ -263,7 +263,7 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 	})
 
 	t.Run("mixed batch", func(t *testing.T) {
-		tr, dispatcher := newTransport(t)
+		tr, dispatcher := newCountingTransport(t)
 		body, _ := json.Marshal([]json.RawMessage{
 			jsonRPC(1, "ping", nil),
 			jsonRPC(nil, "notifications/cancelled", map[string]any{"requestId": 1}),
@@ -296,7 +296,7 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 	})
 
 	t.Run("notification-only batch", func(t *testing.T) {
-		tr, dispatcher := newTransport(t)
+		tr, dispatcher := newCountingTransport(t)
 		body, _ := json.Marshal([]json.RawMessage{
 			jsonRPC(nil, "notifications/initialized", nil),
 			jsonRPC(nil, "notifications/cancelled", map[string]any{"requestId": 1}),
@@ -311,7 +311,7 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 	})
 
 	t.Run("initialize batch", func(t *testing.T) {
-		tr, dispatcher := newTransport(t)
+		tr, dispatcher := newCountingTransport(t)
 		body, _ := json.Marshal([]json.RawMessage{jsonRPC(1, "initialize", map[string]any{
 			"protocolVersion": "2026-03-26",
 			"capabilities":    map[string]any{},
@@ -916,8 +916,8 @@ func TestLargeBodyClampedByMaxBytes(t *testing.T) {
 	// before dispatch with an HTTP 400 JSON-RPC parse error.
 	// The load-bearing assertion is that the transport refused to
 	// process the trailing bytes — a buggy implementation that
-	// disabled the io.LimitReader would have ingested the full 4 KiB
-	// payload and produced a successful response.
+	// disabled the io.LimitReader would have ingested and parsed the full
+	// document, reached dispatch, and returned outer HTTP 200 instead.
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
