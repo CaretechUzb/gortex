@@ -1228,21 +1228,34 @@ func (s *Server) recordIndexTelemetry(fileCount int) {
 	telemetry.RecordIndex(s.recorder, fileCount, langs)
 }
 
-// handleReindexRepository implements the reindex_repository tool: an
-// incremental re-index that re-parses only changed files (and evicts
-// deleted ones) instead of rebuilding the whole graph. The optional
-// `paths` argument scopes the pass to specific files / directories.
-func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	paths := req.GetStringSlice("paths", nil)
-	// Drop blank entries so a caller passing [""] doesn't accidentally
-	// degrade a scoped request into a whole-repo scan.
+// normalizeReindexPaths removes blank entries from a scoped reindex request.
+// Omitted, empty, and all-blank path lists all preserve the established
+// whole-repository meaning. Mixed lists retain only their non-blank scopes.
+func normalizeReindexPaths(paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
 	cleaned := make([]string, 0, len(paths))
 	for _, p := range paths {
 		if strings.TrimSpace(p) != "" {
 			cleaned = append(cleaned, p)
 		}
 	}
-	paths = cleaned
+	if len(cleaned) == 0 {
+		return nil, nil
+	}
+	return cleaned, nil
+}
+
+// handleReindexRepository implements the reindex_repository tool: an
+// incremental re-index that re-parses only changed files (and evicts
+// deleted ones) instead of rebuilding the whole graph. The optional
+// `paths` argument scopes the pass to specific files / directories.
+func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	paths, pathsErr := normalizeReindexPaths(req.GetStringSlice("paths", nil))
+	if pathsErr != nil {
+		return mcp.NewToolResultError(pathsErr.Error()), nil
+	}
 
 	pathArg := req.GetString("path", "")
 
