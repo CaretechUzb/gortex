@@ -284,17 +284,17 @@ func refetchFrameworkCandidates(g graph.Store, cands []*graph.Edge) []*graph.Edg
 	for _, e := range cands {
 		fromIDs = append(fromIDs, e.From)
 	}
-	byKey := map[string]*graph.Edge{}
+	byKey := map[graph.EdgeIdentity]*graph.Edge{}
 	for _, edges := range g.GetOutEdgesByNodeIDs(dedupeFrameworkIDs(fromIDs)) {
 		for _, e := range edges {
 			if e != nil {
-				byKey[frameworkScopedEdgeKey(e)] = e
+				byKey[graph.EdgeIdentityFor(e)] = e
 			}
 		}
 	}
 	out := make([]*graph.Edge, 0, len(cands))
 	for _, c := range cands {
-		if e := byKey[frameworkScopedEdgeKey(c)]; e != nil {
+		if e := byKey[graph.EdgeIdentityFor(c)]; e != nil {
 			out = append(out, e)
 		}
 	}

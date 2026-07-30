@@ -16,16 +16,16 @@ import (
 // duplicates use last-write-wins, matching Graph.AddEdge and Graph.AddBatch.
 type frameworkEdgeBatchStore struct {
 	graph.Store
-	staged    map[string]*graph.Edge
-	order     []string
-	orderSeen map[string]struct{}
+	staged    map[graph.EdgeIdentity]*graph.Edge
+	order     []graph.EdgeIdentity
+	orderSeen map[graph.EdgeIdentity]struct{}
 }
 
 func newFrameworkEdgeBatchStore(store graph.Store) *frameworkEdgeBatchStore {
 	return &frameworkEdgeBatchStore{
 		Store:     store,
-		staged:    make(map[string]*graph.Edge),
-		orderSeen: make(map[string]struct{}),
+		staged:    make(map[graph.EdgeIdentity]*graph.Edge),
+		orderSeen: make(map[graph.EdgeIdentity]struct{}),
 	}
 }
 
@@ -35,7 +35,7 @@ func (s *frameworkEdgeBatchStore) AllNodes() []*graph.Node {
 
 func (s *frameworkEdgeBatchStore) AddEdge(edge *graph.Edge) {
 	copy := cloneFrameworkEdge(edge)
-	key := frameworkScopedEdgeKey(copy)
+	key := graph.EdgeIdentityFor(copy)
 	if _, seen := s.orderSeen[key]; !seen {
 		s.orderSeen[key] = struct{}{}
 		s.order = append(s.order, key)
@@ -50,7 +50,7 @@ func (s *frameworkEdgeBatchStore) AddEdge(edge *graph.Edge) {
 func (s *frameworkEdgeBatchStore) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 	for _, edge := range edges {
 		if edge != nil {
-			delete(s.staged, frameworkScopedEdgeKey(edge))
+			delete(s.staged, graph.EdgeIdentityFor(edge))
 		}
 	}
 	s.Store.AddBatch(nodes, edges)
@@ -73,9 +73,9 @@ func (s *frameworkEdgeBatchStore) flush() {
 	// observable and no later synthesizer runs; mutation receipts/errors retain
 	// the backend's native AddBatch semantics.
 	s.Store.AddBatch(nil, edges)
-	s.staged = make(map[string]*graph.Edge)
+	s.staged = make(map[graph.EdgeIdentity]*graph.Edge)
 	s.order = nil
-	s.orderSeen = make(map[string]struct{})
+	s.orderSeen = make(map[graph.EdgeIdentity]struct{})
 }
 
 func runLegacyFrameworkSynth(store graph.Store, fn func(graph.Store) int) int {
@@ -380,12 +380,12 @@ func (s *frameworkEdgeBatchStore) mergeEdges(
 		return base
 	}
 	out := make([]*graph.Edge, 0, len(base)+len(s.staged))
-	seen := make(map[string]struct{}, len(s.staged))
+	seen := make(map[graph.EdgeIdentity]struct{}, len(s.staged))
 	for _, edge := range base {
 		if edge == nil {
 			continue
 		}
-		key := frameworkScopedEdgeKey(edge)
+		key := graph.EdgeIdentityFor(edge)
 		if staged := s.staged[key]; staged != nil {
 			seen[key] = struct{}{}
 			if include(staged) {
@@ -411,12 +411,12 @@ func (s *frameworkEdgeBatchStore) mergeEdgeSeq(
 	include func(*graph.Edge) bool,
 ) iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		seen := make(map[string]struct{}, len(s.staged))
+		seen := make(map[graph.EdgeIdentity]struct{}, len(s.staged))
 		for edge := range base {
 			if edge == nil {
 				continue
 			}
-			key := frameworkScopedEdgeKey(edge)
+			key := graph.EdgeIdentityFor(edge)
 			if staged := s.staged[key]; staged != nil {
 				seen[key] = struct{}{}
 				if include(staged) && !yield(staged) {
