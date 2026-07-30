@@ -2523,9 +2523,17 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 		mi.mu.Unlock()
 		return 0, 0
 	}
+	idx := mi.indexers[repoPrefix]
 	delete(mi.repos, repoPrefix)
 	delete(mi.indexers, repoPrefix)
 	mi.mu.Unlock()
+
+	// The process-wide trigram budget otherwise retains the removed Indexer
+	// (and its full-text cache) until an unrelated search happens to evict it.
+	if idx != nil {
+		idx.releaseTrigramSearcher()
+		idx.trigramBudget().forget(idx)
+	}
 
 	// Every repo's nodes live in its byRepo bucket, so the sidecar-aware
 	// purge covers all of them. Single-repo-mode nodes used to carry an

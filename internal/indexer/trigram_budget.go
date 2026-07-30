@@ -37,11 +37,13 @@ const (
 // than the searchers themselves so the owning Indexer keeps sole ownership
 // of its field and its own mutex discipline.
 type trigramBudget struct {
-	mu      sync.Mutex
-	ttl     time.Duration
-	maxLive int
-	entries map[*Indexer]*trigramEntry
-	now     func() time.Time // swappable in tests
+	mu        sync.Mutex
+	ttl       time.Duration
+	maxLive   int
+	entries   map[*Indexer]*trigramEntry
+	now       func() time.Time // swappable in tests
+	afterFunc func(time.Duration, func()) *time.Timer
+	timer     *time.Timer
 }
 
 type trigramEntry struct {
@@ -59,16 +61,19 @@ func newTrigramBudget(ttl time.Duration, maxLive int) *trigramBudget {
 		maxLive = defaultTrigramMaxLive
 	}
 	return &trigramBudget{
-		ttl:     ttl,
-		maxLive: maxLive,
-		entries: make(map[*Indexer]*trigramEntry),
-		now:     time.Now,
+		ttl:       ttl,
+		maxLive:   maxLive,
+		entries:   make(map[*Indexer]*trigramEntry),
+		now:       time.Now,
+		afterFunc: time.AfterFunc,
 	}
 }
 
 // touch records that owner's searcher is live and just used, then evicts
 // everything that has aged out and, if still over the cap, the
-// least-recently-used entries until it fits.
+// least-recently-used entries until it fits. It also arms the budget's one
+// reusable deadline timer, so a lone warm cache is reclaimed without waiting
+// for another grep to enter this method.
 //
 // Release callbacks run after the budget's own lock is dropped: each one
 // takes its Indexer's trigramMu, and holding both locks in one order here
@@ -95,7 +100,7 @@ func (b *trigramBudget) touch(owner *Indexer, release func()) {
 		if other == owner {
 			continue
 		}
-		if now.Sub(entry.lastUsed) >= b.ttl {
+		if !now.Before(entry.lastUsed.Add(b.ttl)) {
 			evictions = append(evictions, entry.release)
 			delete(b.entries, other)
 		}
@@ -120,9 +125,60 @@ func (b *trigramBudget) touch(owner *Indexer, release func()) {
 		evictions = append(evictions, b.entries[oldest].release)
 		delete(b.entries, oldest)
 	}
+	b.scheduleExpiryLocked(now)
 	b.mu.Unlock()
 
-	for _, release := range evictions {
+	runTrigramReleases(evictions)
+}
+
+// scheduleExpiryLocked maintains one timer for the earliest idle deadline.
+// A callback that loses a Stop/Reset race always re-checks current deadlines,
+// so it cannot evict an entry that was touched after the callback was queued.
+func (b *trigramBudget) scheduleExpiryLocked(now time.Time) {
+	if len(b.entries) == 0 || b.afterFunc == nil {
+		if b.timer != nil {
+			b.timer.Stop()
+		}
+		return
+	}
+
+	var next time.Time
+	for _, entry := range b.entries {
+		deadline := entry.lastUsed.Add(b.ttl)
+		if next.IsZero() || deadline.Before(next) {
+			next = deadline
+		}
+	}
+	delay := next.Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	if b.timer == nil {
+		b.timer = b.afterFunc(delay, b.expireIdle)
+		return
+	}
+	b.timer.Reset(delay)
+}
+
+func (b *trigramBudget) expireIdle() {
+	var evictions []func()
+
+	b.mu.Lock()
+	now := b.now()
+	for owner, entry := range b.entries {
+		if !now.Before(entry.lastUsed.Add(b.ttl)) {
+			evictions = append(evictions, entry.release)
+			delete(b.entries, owner)
+		}
+	}
+	b.scheduleExpiryLocked(now)
+	b.mu.Unlock()
+
+	runTrigramReleases(evictions)
+}
+
+func runTrigramReleases(releases []func()) {
+	for _, release := range releases {
 		if release != nil {
 			release()
 		}
@@ -138,6 +194,7 @@ func (b *trigramBudget) forget(owner *Indexer) {
 	}
 	b.mu.Lock()
 	delete(b.entries, owner)
+	b.scheduleExpiryLocked(b.now())
 	b.mu.Unlock()
 }
 

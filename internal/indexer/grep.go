@@ -31,34 +31,36 @@ func (idx *Indexer) GrepText(query string, limit int) []trigram.Match {
 func (idx *Indexer) warmTrigramSearcher() *trigram.Searcher {
 	gen := idx.indexGen.Load()
 
-	// Announce the use before taking trigramMu: touch may evict OTHER
-	// repos' searchers, and each eviction takes that repo's trigramMu.
-	// Doing it here keeps this goroutine holding at most one trigramMu at
-	// a time, so two repos warming concurrently cannot deadlock.
-	defer idx.trigramBudget().touch(idx, idx.releaseTrigramSearcher)
-
 	idx.trigramMu.Lock()
-	defer idx.trigramMu.Unlock()
-	if idx.trigramSearcher != nil && idx.trigramGen == gen {
-		return idx.trigramSearcher
-	}
+	if idx.trigramSearcher == nil || idx.trigramGen != gen {
+		root := idx.rootPath
+		if root != "" {
+			idx.mtimeMu.RLock()
+			rels := make([]string, 0, len(idx.fileMtimes))
+			for rel := range idx.fileMtimes {
+				rels = append(rels, rel)
+			}
+			idx.mtimeMu.RUnlock()
+			sort.Strings(rels)
 
-	root := idx.rootPath
-	if root == "" {
-		return idx.trigramSearcher
+			idx.trigramSearcher = trigram.Build(root, rels)
+			idx.trigramGen = gen
+		}
 	}
-
-	idx.mtimeMu.RLock()
-	rels := make([]string, 0, len(idx.fileMtimes))
-	for rel := range idx.fileMtimes {
-		rels = append(rels, rel)
+	searcher := idx.trigramSearcher
+	var release func()
+	if searcher != nil {
+		release = idx.trigramReleaseLocked()
 	}
-	idx.mtimeMu.RUnlock()
-	sort.Strings(rels)
+	idx.trigramMu.Unlock()
 
-	idx.trigramSearcher = trigram.Build(root, rels)
-	idx.trigramGen = gen
-	return idx.trigramSearcher
+	// Touch only after dropping trigramMu: an over-budget touch may release a
+	// different repo, whose callback takes that repo's trigramMu. The lease
+	// captured above prevents a delayed callback from racing a later re-touch.
+	if release != nil {
+		idx.trigramBudget().touch(idx, release)
+	}
+	return searcher
 }
 
 // trigramBudget returns the budget this Indexer participates in, defaulting
@@ -80,8 +82,27 @@ func (idx *Indexer) releaseTrigramSearcher() {
 		return
 	}
 	idx.trigramMu.Lock()
+	idx.trigramLease++
 	idx.trigramSearcher = nil
 	idx.trigramGen = 0
+	idx.trigramMu.Unlock()
+}
+
+// trigramReleaseLocked returns a callback tied to the current cache-use lease.
+// The caller must hold trigramMu. A re-touch advances the lease before the old
+// callback can take the mutex, making a delayed timer/LRU release a no-op.
+func (idx *Indexer) trigramReleaseLocked() func() {
+	idx.trigramLease++
+	lease := idx.trigramLease
+	return func() { idx.releaseTrigramSearcherLease(lease) }
+}
+
+func (idx *Indexer) releaseTrigramSearcherLease(lease uint64) {
+	idx.trigramMu.Lock()
+	if idx.trigramLease == lease {
+		idx.trigramSearcher = nil
+		idx.trigramGen = 0
+	}
 	idx.trigramMu.Unlock()
 }
 

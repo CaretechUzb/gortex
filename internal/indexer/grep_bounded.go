@@ -25,8 +25,13 @@ func (idx *Indexer) GrepTextBounded(
 	idx.trigramMu.Lock()
 	searcher := idx.trigramSearcher
 	warm := searcher != nil && idx.trigramGen == gen
+	var release func()
+	if warm {
+		release = idx.trigramReleaseLocked()
+	}
 	idx.trigramMu.Unlock()
 	if warm {
+		idx.trigramBudget().touch(idx, release)
 		matches, stats := searcher.GrepBounded(ctx, query, limit, maxFiles)
 		return matches, stats.Incomplete
 	}
@@ -59,8 +64,13 @@ func (idx *Indexer) GrepLiteralBounded(
 	idx.trigramMu.Lock()
 	searcher := idx.trigramSearcher
 	warm := searcher != nil && idx.trigramGen == gen
+	var release func()
+	if warm {
+		release = idx.trigramReleaseLocked()
+	}
 	idx.trigramMu.Unlock()
 	if warm {
+		idx.trigramBudget().touch(idx, release)
 		matches, stats := searcher.GrepLiteralBounded(
 			ctx, query, limit, maxFiles, isProductionSourcePath,
 		)
