@@ -1,5 +1,6 @@
-// Package streamable implements the MCP 2026 Streamable HTTP transport
-// on top of the existing in-process MCP server. The transport is
+// Package streamable implements the session-bearing MCP Streamable HTTP
+// transport through protocol version 2025-11-25 on top of the existing
+// in-process MCP server. The transport is
 // stateless from the network's perspective — every request carries a
 // `Mcp-Session-Id` header that the server uses to replay the matching
 // per-session state out of an in-memory store. Any worker can serve

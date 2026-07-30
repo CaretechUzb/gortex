@@ -19,7 +19,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// Header names defined by the MCP 2026 Streamable HTTP transport spec.
+// Header names defined by the session-bearing MCP Streamable HTTP transport
+// through protocol version 2025-11-25.
 // They are case-insensitive on the wire (Go's net/http handles that)
 // but are spelled here in the spec's canonical form so log output
 // stays grep-friendly.
@@ -28,12 +29,10 @@ const (
 	HeaderProtocolVersion = "Mcp-Protocol-Version"
 )
 
-// DefaultProtocolVersion is what the transport advertises in
-// `Mcp-Protocol-Version` when the client did not pin a version on the
-// initialize call. Bumped in lockstep with the underlying mcp-go
-// library — the 2026-03-26 spec is the current stable line, the
-// June-2026 spec will move it forward.
-const DefaultProtocolVersion = "2026-03-26"
+// DefaultProtocolVersion follows the protocol revision implemented by the
+// compiled mcp-go dependency. mcp-go v0.57.0 implements released MCP
+// 2025-11-25, the latest revision with protocol-level HTTP sessions.
+const DefaultProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 
 // Dispatcher is implemented by the in-process MCP server (and the
 // daemon's router-aware shim) to turn a JSON-RPC frame into a
@@ -129,8 +128,9 @@ type Config struct {
 // clientInfo carried in an initialize frame.
 type InitializeHook func(ctx context.Context, state *SessionState)
 
-// Transport is an http.Handler exposing a single POST/GET/DELETE
-// endpoint speaking the MCP 2026 Streamable HTTP wire format. One
+// Transport is an http.Handler exposing a single POST/GET/DELETE endpoint
+// speaking the session-bearing MCP Streamable HTTP wire format through
+// protocol version 2025-11-25. One
 // instance is safe to share across goroutines; the SessionStore is
 // the only shared mutable state and is itself goroutine-safe by
 // contract.
@@ -203,9 +203,9 @@ func New(cfg Config) *Transport {
 // surface.
 func (t *Transport) Store() SessionStore { return t.store }
 
-// ServeHTTP implements http.Handler. The spec mandates that the
-// transport surface ALL three verbs at the same path; routes split by
-// method to keep the dispatch logic in dedicated helpers.
+// ServeHTTP implements http.Handler. Gortex supports all three verbs used by
+// the session-bearing transport at the same path; routes split by method to
+// keep the dispatch logic in dedicated helpers.
 func (t *Transport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
@@ -287,52 +287,19 @@ func (t *Transport) handlePost(w http.ResponseWriter, r *http.Request) {
 	// transports behave.
 	sessionID := strings.TrimSpace(r.Header.Get(HeaderSessionID))
 	state, found := t.store.Get(sessionID)
-	method, _ := peekJSONRPCMethod(frames[0])
-	standaloneInitialize := !batched && method == "initialize"
-	if sessionID != "" && !found && !standaloneInitialize {
-		writeSessionNotFound(w, sessionID, frames, batched)
-		return
+	if sessionID != "" && !found {
+		method, _ := peekJSONRPCMethod(frames[0])
+		if batched || method != "initialize" {
+			writeSessionNotFound(w, sessionID, frames, batched)
+			return
+		}
 	}
 
-	// Dispatch each frame in order and collect replies. We never
-	// fan-out across goroutines: JSON-RPC ordering matters when
-	// notifications mutate session state mid-batch.
-	replies := make([]json.RawMessage, 0, len(frames))
-	for _, frame := range frames {
-		replyBytes, status, err := t.dispatchFrame(r, &state, frame)
-		if err != nil {
-			t.logger.Warn("streamable: dispatch failed",
-				zap.String("session_id", sessionID), zap.Error(err))
-			id, hasID := peekJSONRPCID(frame)
-			if hasID {
-				replyBytes = jsonRPCErrorBytes(id, -32603, err.Error())
-			} else {
-				replyBytes = nil
-			}
-		}
-		if status != 0 && status != http.StatusOK {
-			// A remote upstream returned a non-2xx; surface that
-			// to the client as a JSON-RPC error frame so the
-			// batch shape stays intact.
-			if len(replyBytes) == 0 {
-				if id, hasID := peekJSONRPCID(frame); hasID {
-					replyBytes = jsonRPCErrorBytes(id, -32603,
-						fmt.Sprintf("upstream status %d", status))
-				}
-			}
-		}
-		if len(replyBytes) == 0 {
-			// Notifications have no reply; the frame still
-			// counts so a batch retains its slot ordering on
-			// the response side via skip semantics.
-			continue
-		}
-		replies = append(replies, replyBytes)
-	}
+	replies := t.dispatchFrames(r, &state, sessionID, frames)
 
-	// Mint or refresh the session id on the response. The spec
-	// requires the header on every response, not just initialize,
-	// so clients that drop the cookie between calls can rebuild it.
+	// Echo the known session id on successful responses. The specification
+	// assigns it during initialize; preserving it here also matches Gortex's
+	// established response contract.
 	if id := state.ID; id != "" {
 		w.Header().Set(HeaderSessionID, id)
 	}
@@ -355,6 +322,36 @@ func (t *Transport) handlePost(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("\n"))
 }
 
+// dispatchFrames executes one POST's frames in order and normalizes dispatcher
+// and router failures into JSON-RPC replies. It stays sequential because
+// notifications may mutate session state between batch entries.
+func (t *Transport) dispatchFrames(r *http.Request, state *SessionState, sessionID string, frames [][]byte) []json.RawMessage {
+	replies := make([]json.RawMessage, 0, len(frames))
+	for _, frame := range frames {
+		replyBytes, status, err := t.dispatchFrame(r, state, frame)
+		if err != nil {
+			t.logger.Warn("streamable: dispatch failed",
+				zap.String("session_id", sessionID), zap.Error(err))
+			if id, hasID := peekJSONRPCID(frame); hasID {
+				replyBytes = jsonRPCErrorBytes(id, -32603, err.Error())
+			} else {
+				replyBytes = nil
+			}
+		}
+		if status != 0 && status != http.StatusOK && len(replyBytes) == 0 {
+			// Preserve the JSON-RPC batch boundary for upstream HTTP errors.
+			if id, hasID := peekJSONRPCID(frame); hasID {
+				replyBytes = jsonRPCErrorBytes(id, -32603,
+					fmt.Sprintf("upstream status %d", status))
+			}
+		}
+		if len(replyBytes) != 0 {
+			replies = append(replies, replyBytes)
+		}
+	}
+	return replies
+}
+
 // dispatchFrame runs the Router / InitializeHook / Dispatcher chain
 // for a single JSON-RPC frame and returns its (possibly empty) reply
 // plus the upstream HTTP status when the router proxied the call.
@@ -365,10 +362,9 @@ func (t *Transport) dispatchFrame(r *http.Request, state *SessionState, frame []
 
 	switch method {
 	case "initialize":
-		// Mint a session even when the client claimed an ID the
-		// store no longer knows about — the spec mandates that
-		// initialize always produces a fresh session id on the
-		// response.
+		// Gortex mints a fresh session even when the client claimed an ID
+		// the store no longer knows about. Session assignment is optional
+		// in the specification, but this stateful transport always uses it.
 		if state.ID != "" {
 			t.store.Delete(state.ID)
 			*state = SessionState{}
@@ -570,10 +566,10 @@ func (t *Transport) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleDelete is the spec's session-termination verb. Idempotent —
-// deleting an unknown session returns 204 just like deleting a known
-// one. The transport also tears down any in-flight SSE stream so the
-// client's GET unblocks immediately.
+// handleDelete implements Gortex's session-termination verb. It is idempotent:
+// deleting an unknown session returns 204 just like deleting a known one. The
+// transport also tears down any in-flight SSE stream so the client's GET
+// unblocks immediately.
 func (t *Transport) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if !t.originAllowed(r) {
 		http.Error(w, "origin not allowed", http.StatusForbidden)

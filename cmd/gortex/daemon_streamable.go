@@ -211,7 +211,7 @@ func buildDaemonStreamableHandler(disp daemon.MCPDispatcher, reg *daemon.Session
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok","transport":"streamable-http","spec":"mcp-2026-03-26"}`))
+		_, _ = w.Write([]byte(`{"status":"ok","transport":"streamable-http","spec":"mcp-` + streamable.DefaultProtocolVersion + `"}`))
 	})
 	// Always wrap: the middleware resolves the token per request, so a
 	// request with no configured token is served unauthenticated and the

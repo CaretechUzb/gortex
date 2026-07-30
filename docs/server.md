@@ -1,9 +1,9 @@
-# HTTP server, MCP 2026 transport, and Web UI
+# HTTP server, MCP transport, and Web UI
 
 Gortex exposes three transports — stdio MCP (the default `gortex mcp`), a Unix-socket daemon, and an HTTP API. The HTTP layer is what IDE plugins, CI, the web UI, and remote agents talk to.
 
 - [Server mode (`/v1/*` JSON API)](#server-mode-v1-json-api)
-- [MCP 2026 Streamable HTTP transport (`/mcp`)](#mcp-2026-streamable-http-transport-mcp)
+- [Session-bearing MCP Streamable HTTP transport (`/mcp`)](#session-bearing-mcp-streamable-http-transport-mcp)
 - [Web UI](#web-ui)
 
 ## Server mode (`/v1/*` JSON API)
@@ -39,9 +39,9 @@ gortex mcp --index /path/to/repo --server --port 8765
 
 **Multi-server roster.** When the daemon is running, it can route MCP traffic across multiple Gortex servers — a local Unix socket for the repos on this machine, plus one or more remote HTTPS servers for shared / cloud indexes. The roster lives at `~/.gortex/servers.toml`; manage it with `gortex daemon server list / add / remove`. Auth tokens can be embedded directly (`--auth-token`) or pulled from an env var the daemon reads at request time (`--auth-token-env`, preferred). Restart the daemon to pick up roster changes.
 
-## MCP 2026 Streamable HTTP transport (`/mcp`)
+## Session-bearing MCP Streamable HTTP transport (`/mcp`)
 
-`gortex daemon start --http-addr <addr>` exposes the **MCP 2026 Streamable HTTP transport** — the wire format the June 2026 MCP release locks in — on the same TCP address as the `/v1/*` JSON API.
+`gortex daemon start --http-addr <addr>` exposes the session-bearing Streamable HTTP transport defined through [MCP 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http) on the same TCP address as the `/v1/*` JSON API. The draft 2026-07-28 transport removes protocol-level sessions; Gortex currently implements the earlier compatibility shape with `initialize`, `Mcp-Session-Id`, GET/SSE, and DELETE.
 
 | Verb | Path | Behaviour |
 |------|------|-----------|

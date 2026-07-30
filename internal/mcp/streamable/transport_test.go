@@ -72,6 +72,14 @@ func newTransport(t *testing.T) (*Transport, func()) {
 	return tr, func() { store.Close() }
 }
 
+func newCountingTransport(t *testing.T) (*Transport, *MemoryStore, *countingDispatcher) {
+	t.Helper()
+	store := NewMemoryStore(time.Minute)
+	t.Cleanup(store.Close)
+	dispatcher := &countingDispatcher{delegate: MCPServerDispatcher{Server: newTestMCPServer()}}
+	return New(Config{Dispatcher: dispatcher, Store: store}), store, dispatcher
+}
+
 // jsonRPC builds a single JSON-RPC request body. id may be a string,
 // number, or nil (notification).
 func jsonRPC(id any, method string, params any) []byte {
@@ -87,6 +95,14 @@ func jsonRPC(id any, method string, params any) []byte {
 	}
 	out, _ := json.Marshal(env)
 	return out
+}
+
+func initializeBody(name, version string) []byte {
+	return jsonRPC(1, "initialize", map[string]any{
+		"protocolVersion": DefaultProtocolVersion,
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": name, "version": version},
+	})
 }
 
 // doPOST sends one request to the transport and returns the response
@@ -110,14 +126,7 @@ func TestInitializeMintsSessionID(t *testing.T) {
 	tr, cleanup := newTransport(t)
 	defer cleanup()
 
-	body := jsonRPC(1, "initialize", map[string]any{
-		"protocolVersion": "2026-03-26",
-		"capabilities":    map[string]any{},
-		"clientInfo": map[string]any{
-			"name":    "claude-code",
-			"version": "1.0.0",
-		},
-	})
+	body := initializeBody("claude-code", "1.0.0")
 	rec := doPOST(t, tr, body, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -161,11 +170,7 @@ func TestSessionReplayAcrossRequests(t *testing.T) {
 	})
 
 	// 1) Initialize on worker A.
-	initBody := jsonRPC(1, "initialize", map[string]any{
-		"protocolVersion": "2026-03-26",
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
-	})
+	initBody := initializeBody("test", "0.0.0")
 	rec := doPOST(t, workerA, initBody, nil)
 	sid := rec.Header().Get(HeaderSessionID)
 	if sid == "" {
@@ -200,14 +205,11 @@ func TestUnknownSessionRejected(t *testing.T) {
 		wantVersion     string
 	}{
 		{name: "default protocol version", wantVersion: DefaultProtocolVersion},
-		{name: "echoed protocol version", protocolVersion: "2025-12-01", wantVersion: "2025-12-01"},
+		{name: "echoed protocol version", protocolVersion: "2025-06-18", wantVersion: "2025-06-18"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			store := NewMemoryStore(time.Minute)
-			defer store.Close()
-			dispatcher := &countingDispatcher{delegate: MCPServerDispatcher{Server: newTestMCPServer()}}
-			tr := New(Config{Dispatcher: dispatcher, Store: store})
+			tr, _, dispatcher := newCountingTransport(t)
 			body := jsonRPC(1, "tools/call", map[string]any{
 				"name": "echo", "arguments": map[string]any{"message": "x"},
 			})
@@ -249,16 +251,8 @@ func TestUnknownSessionRejected(t *testing.T) {
 }
 
 func TestUnknownSessionRequestShapes(t *testing.T) {
-	newCountingTransport := func(t *testing.T) (*Transport, *countingDispatcher) {
-		t.Helper()
-		store := NewMemoryStore(time.Minute)
-		t.Cleanup(store.Close)
-		dispatcher := &countingDispatcher{delegate: MCPServerDispatcher{Server: newTestMCPServer()}}
-		return New(Config{Dispatcher: dispatcher, Store: store}), dispatcher
-	}
-
 	t.Run("single notification", func(t *testing.T) {
-		tr, dispatcher := newCountingTransport(t)
+		tr, _, dispatcher := newCountingTransport(t)
 		rec := doPOST(t, tr, jsonRPC(nil, "notifications/cancelled", map[string]any{"requestId": 1}),
 			map[string]string{HeaderSessionID: "expired"})
 		if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
@@ -270,7 +264,7 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 	})
 
 	t.Run("mixed batch", func(t *testing.T) {
-		tr, dispatcher := newCountingTransport(t)
+		tr, _, dispatcher := newCountingTransport(t)
 		body, _ := json.Marshal([]json.RawMessage{
 			jsonRPC(1, "ping", nil),
 			jsonRPC(nil, "notifications/cancelled", map[string]any{"requestId": 1}),
@@ -303,7 +297,7 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 	})
 
 	t.Run("notification-only batch", func(t *testing.T) {
-		tr, dispatcher := newCountingTransport(t)
+		tr, _, dispatcher := newCountingTransport(t)
 		body, _ := json.Marshal([]json.RawMessage{
 			jsonRPC(nil, "notifications/initialized", nil),
 			jsonRPC(nil, "notifications/cancelled", map[string]any{"requestId": 1}),
@@ -318,12 +312,8 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 	})
 
 	t.Run("initialize batch", func(t *testing.T) {
-		tr, dispatcher := newCountingTransport(t)
-		body, _ := json.Marshal([]json.RawMessage{jsonRPC(1, "initialize", map[string]any{
-			"protocolVersion": "2026-03-26",
-			"capabilities":    map[string]any{},
-			"clientInfo":      map[string]any{"name": "test", "version": "1"},
-		})})
+		tr, _, dispatcher := newCountingTransport(t)
+		body, _ := json.Marshal([]json.RawMessage{initializeBody("test", "1")})
 		rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: "expired"})
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404", rec.Code)
@@ -341,11 +331,7 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 func TestUnknownSessionStandaloneInitializeMintsFreshSession(t *testing.T) {
 	tr, cleanup := newTransport(t)
 	defer cleanup()
-	body := jsonRPC(1, "initialize", map[string]any{
-		"protocolVersion": "2026-03-26",
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "test", "version": "1"},
-	})
+	body := initializeBody("test", "1")
 	rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: "expired"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
@@ -356,15 +342,8 @@ func TestUnknownSessionStandaloneInitializeMintsFreshSession(t *testing.T) {
 }
 
 func TestExpiredSessionReinitializesAndRetries(t *testing.T) {
-	store := NewMemoryStore(time.Minute)
-	defer store.Close()
-	dispatcher := &countingDispatcher{delegate: MCPServerDispatcher{Server: newTestMCPServer()}}
-	tr := New(Config{Dispatcher: dispatcher, Store: store})
-	initialize := jsonRPC(1, "initialize", map[string]any{
-		"protocolVersion": "2026-03-26",
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "opencode", "version": "1"},
-	})
+	tr, store, dispatcher := newCountingTransport(t)
+	initialize := initializeBody("opencode", "1")
 	first := doPOST(t, tr, initialize, nil)
 	oldID := first.Header().Get(HeaderSessionID)
 	if first.Code != http.StatusOK || oldID == "" {
@@ -404,10 +383,7 @@ func TestExpiredSessionReinitializesAndRetries(t *testing.T) {
 }
 
 func TestConcurrentUnknownSessionsNeverDispatch(t *testing.T) {
-	store := NewMemoryStore(time.Minute)
-	defer store.Close()
-	dispatcher := &countingDispatcher{delegate: MCPServerDispatcher{Server: newTestMCPServer()}}
-	tr := New(Config{Dispatcher: dispatcher, Store: store})
+	tr, _, dispatcher := newCountingTransport(t)
 	const workers = 25
 	var wg sync.WaitGroup
 	var failures atomic.Int32
@@ -475,11 +451,7 @@ func TestStatelessModeOmitsSessionID(t *testing.T) {
 		Dispatcher: MCPServerDispatcher{Server: newTestMCPServer()},
 		Store:      StatelessStore{},
 	})
-	body := jsonRPC(1, "initialize", map[string]any{
-		"protocolVersion": "2026-03-26",
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
-	})
+	body := initializeBody("test", "0.0.0")
 	rec := doPOST(t, tr, body, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
@@ -616,10 +588,7 @@ func TestEmptyBodyReturnsParseError(t *testing.T) {
 // truncated object. Parsing wins over stale-session recovery so clients
 // do not waste a reinitialization on an invalid request.
 func TestMalformedJSONReturnsParseError(t *testing.T) {
-	store := NewMemoryStore(time.Minute)
-	defer store.Close()
-	dispatcher := &countingDispatcher{delegate: MCPServerDispatcher{Server: newTestMCPServer()}}
-	tr := New(Config{Dispatcher: dispatcher, Store: store})
+	tr, _, dispatcher := newCountingTransport(t)
 	for _, body := range []string{"not json", `{"jsonrpc":"2.0"`} {
 		rec := doPOST(t, tr, []byte(body), map[string]string{HeaderSessionID: "expired"})
 		if rec.Code != http.StatusBadRequest {
@@ -800,11 +769,7 @@ func TestInitializeReplacesPreviousSession(t *testing.T) {
 	defer cleanup()
 
 	stale, _ := tr.store.Create(SessionState{ClientName: "old"})
-	body := jsonRPC(1, "initialize", map[string]any{
-		"protocolVersion": "2026-03-26",
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "new", "version": "1.0.0"},
-	})
+	body := initializeBody("new", "1.0.0")
 	rec := doPOST(t, tr, body, map[string]string{HeaderSessionID: stale})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
@@ -834,9 +799,9 @@ func TestProtocolVersionHeaderEcho(t *testing.T) {
 		t.Errorf("default version = %q, want %q", got, DefaultProtocolVersion)
 	}
 
-	rec = doPOST(t, tr, body, map[string]string{HeaderProtocolVersion: "2025-12-01"})
-	if got := rec.Header().Get(HeaderProtocolVersion); got != "2025-12-01" {
-		t.Errorf("echoed version = %q, want 2025-12-01", got)
+	rec = doPOST(t, tr, body, map[string]string{HeaderProtocolVersion: "2025-06-18"})
+	if got := rec.Header().Get(HeaderProtocolVersion); got != "2025-06-18" {
+		t.Errorf("echoed version = %q, want 2025-06-18", got)
 	}
 }
 
@@ -958,11 +923,7 @@ func TestInitializeHookFires(t *testing.T) {
 			seenName = state.ClientName
 		},
 	})
-	body := jsonRPC(1, "initialize", map[string]any{
-		"protocolVersion": "2026-03-26",
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "cursor", "version": "3.0.0"},
-	})
+	body := initializeBody("cursor", "3.0.0")
 	rec := doPOST(t, tr, body, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
@@ -1131,11 +1092,7 @@ func TestHTTPRoundTripEndToEnd(t *testing.T) {
 	srv := httptest.NewServer(tr)
 	defer srv.Close()
 
-	body := jsonRPC(1, "initialize", map[string]any{
-		"protocolVersion": "2026-03-26",
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
-	})
+	body := initializeBody("test", "0.0.0")
 	resp, err := http.Post(srv.URL+"/mcp", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST /mcp: %v", err)

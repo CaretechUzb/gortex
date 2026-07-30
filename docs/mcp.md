@@ -1,6 +1,6 @@
 # MCP surface
 
-Gortex exposes a knowledge-graph query surface over the [Model Context Protocol](https://modelcontextprotocol.io): **100+ tools, 18 resources, 3 prompts**. Agents call the same surface from stdio, the daemon Unix socket, or the MCP 2026 Streamable HTTP endpoint.
+Gortex exposes a knowledge-graph query surface over the [Model Context Protocol](https://modelcontextprotocol.io): **100+ tools, 18 resources, 3 prompts**. Agents call the same surface from stdio, the daemon Unix socket, or the session-bearing MCP Streamable HTTP endpoint.
 
 - [Compact MCP surface](#compact-mcp-surface)
 - [Tool discovery (lazy mode)](#tool-discovery-lazy-mode)

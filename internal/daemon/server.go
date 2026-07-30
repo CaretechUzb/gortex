@@ -60,7 +60,7 @@ type Server struct {
 
 	// HTTPHandler, when non-nil, is mounted on a TCP listener at
 	// HTTPAddr alongside the unix-socket dispatcher. This is how the
-	// MCP 2026 Streamable HTTP transport reaches the daemon —
+	// The session-bearing MCP Streamable HTTP transport reaches the daemon —
 	// internal/mcp/streamable.Transport plugs in here. Nil disables
 	// the HTTP face entirely; the unix-socket transport keeps
 	// working unchanged. HTTPAddr accepts standard net.Listen
@@ -213,7 +213,7 @@ func (s *Server) Listen() error {
 	s.listener = l
 	s.started = time.Now()
 
-	// Optional HTTP listener for the MCP 2026 Streamable transport.
+	// Optional HTTP listener for the session-bearing MCP Streamable transport.
 	// We bring it up alongside the unix-socket listener so both
 	// transports share the same shutdown / lifecycle plumbing. A
 	// listen failure here is fatal — running the unix-socket
