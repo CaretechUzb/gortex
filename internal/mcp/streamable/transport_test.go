@@ -328,9 +328,16 @@ func TestUnknownSessionRequestShapes(t *testing.T) {
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404", rec.Code)
 		}
-		var replies []json.RawMessage
-		if err := json.Unmarshal(rec.Body.Bytes(), &replies); err != nil || len(replies) != 1 {
-			t.Fatalf("initialize batch response = %s, want one error: %v", rec.Body.String(), err)
+		var replies []struct {
+			Error struct {
+				Code int `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &replies); err != nil {
+			t.Fatalf("body not JSON array: %v\n%s", err, rec.Body.String())
+		}
+		if len(replies) != 1 || replies[0].Error.Code != errCodeSessionNotFound {
+			t.Fatalf("initialize batch response = %s, want one %d error", rec.Body.String(), errCodeSessionNotFound)
 		}
 		assertNoDispatch(t, dispatcher)
 	})
@@ -840,9 +847,13 @@ func TestProtocolVersionHeaderEcho(t *testing.T) {
 		t.Errorf("default version = %q, want %q", got, DefaultProtocolVersion)
 	}
 
-	rec = doPOST(t, tr, body, map[string]string{HeaderProtocolVersion: "2025-06-18"})
-	if got := rec.Header().Get(HeaderProtocolVersion); got != "2025-06-18" {
-		t.Errorf("echoed version = %q, want 2025-06-18", got)
+	const requested = "2025-06-18"
+	if requested == DefaultProtocolVersion {
+		t.Fatalf("test version %q must differ from DefaultProtocolVersion", requested)
+	}
+	rec = doPOST(t, tr, body, map[string]string{HeaderProtocolVersion: requested})
+	if got := rec.Header().Get(HeaderProtocolVersion); got != requested {
+		t.Errorf("echoed version = %q, want %q", got, requested)
 	}
 }
 
