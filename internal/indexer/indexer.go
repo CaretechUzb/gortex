@@ -461,6 +461,12 @@ type Indexer struct {
 	affectedByFilesResolved atomic.Int64
 	affectedByDropped       atomic.Int64
 
+	// repositoryMutation is the single discovery/parse/resolve/derived lane
+	// for this repository. It is lazy so focused Indexer fixtures do not need
+	// constructor changes, while every production entry point shares it.
+	repositoryMutationOnce sync.Once
+	repositoryMutation     *repositoryMutationCoordinator
+
 	// incrementalResolveFilesHook is a focused test seam for proving a
 	// multi-file watcher batch invokes the scoped resolver exactly once. nil in
 	// production; the real path calls resolver.ResolveFilesAndIncoming.
