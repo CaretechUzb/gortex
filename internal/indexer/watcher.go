@@ -1113,12 +1113,16 @@ func (w *Watcher) triggerOverflowReconcile(reason string) {
 			fn()
 			return
 		}
-		if _, err := w.indexer.IncrementalReindex(w.indexer.rootPath); err != nil {
-			if w.logger != nil {
-				w.logger.Warn("watcher: overflow reconcile failed",
-					zap.String("reason", reason),
-					zap.Error(err))
-			}
+		var err error
+		if w.batchReindex != nil {
+			_, err = w.batchReindex(nil)
+		} else {
+			_, err = w.indexer.IncrementalReindexPaths(w.indexer.rootPath, nil)
+		}
+		if err != nil && w.logger != nil {
+			w.logger.Warn("watcher: overflow reconcile failed",
+				zap.String("reason", reason),
+				zap.Error(err))
 		}
 	}()
 }

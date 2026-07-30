@@ -2316,6 +2316,8 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	_, memoryBacked := mi.graph.(*graph.Graph)
 	var (
 		result           *IndexResult
+		receipt          *graph.MutationReceipt
+		batch            *reparsePendingEnrichmentBatch
 		changed, deleted []string
 		route            = "incremental"
 	)
@@ -2332,7 +2334,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	}
 	switch {
 	case memoryBacked:
-		result, err = idx.IncrementalReindex(absPath)
+		result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil)
 	default:
 		var censusErr error
 		changed, deleted, censusErr = idx.ChangedSinceMtimes(absPath)
@@ -2345,13 +2347,13 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			result, err = fullRetrack()
 		case churn == 0:
 			route = "incremental"
-			result, err = idx.IncrementalReindex(absPath)
+			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil)
 		case priorCount > 0 && churn*100 > priorCount*40:
 			route = "full_retrack"
 			result, err = fullRetrack()
 		default:
 			route = "scoped"
-			result, err = idx.IncrementalReindexPaths(absPath, append(changed, deleted...))
+			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, append(changed, deleted...))
 		}
 	}
 	if err != nil {
@@ -2380,8 +2382,21 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		mi.logger.Warn("failed to add repo to config", zap.Error(err))
 	}
 
-	// See TrackRepoCtx for why this is skipped under deferGlobalPasses.
-	if !mi.deferGlobalPasses {
+	// A restored incremental route parsed against an Indexer that was not yet
+	// registered. Once registration makes it visible to the shared resolver,
+	// consume its receipt and exact derived plan through this MultiIndexer.
+	// Parallel warmup deliberately defers both tails to its later workspace
+	// resolve/global phases. A full retrack already ran its own resolve/derived
+	// pipeline and only needs the existing cross-repository contract reconcile.
+	if !result.FullRetrack && !mi.deferResolve {
+		mi.resolveIncrementalRepoMutation(prefix, result, receipt, batch)
+		if !mi.deferGlobalPasses {
+			idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
+			mi.RunIncrementalDerivedPasses(ctx, map[string]DerivedInvalidationPlan{
+				prefix: result.DerivedInvalidation,
+			})
+		}
+	} else if result.FullRetrack && !mi.deferGlobalPasses {
 		mi.ReconcileContractEdges()
 	}
 
@@ -2470,12 +2485,13 @@ func (mi *MultiIndexer) ReconcileAllCtx(ctx context.Context) map[string]*IndexRe
 		if !ok || !metaOK || meta == nil || meta.RootPath == "" {
 			continue
 		}
-		result, err := idx.IncrementalReindex(meta.RootPath)
+		result, receipt, batch, err := idx.incrementalReindexPathsWithReceipt(meta.RootPath, nil)
 		if err != nil {
 			mi.logger.Warn("janitor: reconcile failed",
 				zap.String("prefix", prefix), zap.Error(err))
 			continue
 		}
+		mi.resolveIncrementalRepoMutation(prefix, result, receipt, batch)
 		if result != nil && (result.StaleFileCount > 0 || result.DeletedFileCount > 0) {
 			mi.logger.Info("janitor: reconciled repo",
 				zap.String("prefix", prefix),

@@ -74,6 +74,24 @@ func waitForEvent(t *testing.T, w *Watcher, timeout time.Duration) GraphChangeEv
 	}
 }
 
+func TestWatcher_OverflowReconcileUsesBatchCoordinator(t *testing.T) {
+	_, _, w := setupWatcher(t)
+	called := make(chan []string, 1)
+	w.batchReindex = func(paths []string) (*IndexResult, error) {
+		called <- paths
+		return &IndexResult{}, nil
+	}
+
+	w.triggerOverflowReconcile("test")
+	select {
+	case paths := <-called:
+		assert.Nil(t, paths, "overflow must request a full-tree batch reconcile")
+	case <-time.After(2 * time.Second):
+		t.Fatal("overflow reconcile did not invoke the batch coordinator")
+	}
+	w.asyncWork.Wait()
+}
+
 func TestWatcher_FileModify(t *testing.T) {
 	dir, idx, w := setupWatcher(t)
 
