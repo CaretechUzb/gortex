@@ -1,11 +1,15 @@
 package indexer
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/search/trigram"
+	"go.uber.org/zap"
 )
 
 // The trigram searcher is a full-text in-memory index built per repo and
@@ -15,7 +19,35 @@ import (
 func newTestTrigramBudget(ttl time.Duration, maxLive int, clock *time.Time) *trigramBudget {
 	b := newTrigramBudget(ttl, maxLive)
 	b.now = func() time.Time { return *clock }
+	// Fake-clock tests drive expiry by touch; do not arm a real timer against
+	// an artificial wall clock.
+	b.afterFunc = nil
 	return b
+}
+
+func TestTrigramBudgetEvictsLoneIdleOwnerWithoutAnotherTouch(t *testing.T) {
+	b := newTrigramBudget(20*time.Millisecond, 10)
+	released := make(chan struct{})
+	b.touch(&Indexer{}, func() { close(released) })
+
+	select {
+	case <-released:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle trigram cache was not released at its own deadline")
+	}
+	require.Zero(t, b.live())
+}
+
+func TestTrigramBudgetReusesOneDeadlineTimer(t *testing.T) {
+	b := newTrigramBudget(time.Hour, 10)
+	owner := &Indexer{}
+	b.touch(owner, func() {})
+	first := b.timer
+	require.NotNil(t, first)
+
+	b.touch(owner, func() {})
+	require.Same(t, first, b.timer, "touches must reset one timer, not allocate one per query")
+	b.forget(owner)
 }
 
 func TestTrigramBudgetEvictsIdleOwners(t *testing.T) {
@@ -118,6 +150,76 @@ func TestReleaseTrigramSearcherIsSafeWhenNothingBuilt(t *testing.T) {
 	require.NotPanics(t, idx.releaseTrigramSearcher)
 	require.Nil(t, idx.trigramSearcher)
 	require.Zero(t, idx.trigramGen, "a released searcher must not keep a generation that would look warm")
+}
+
+func TestStaleTrigramLeaseCannotReleaseRetouchedSearcher(t *testing.T) {
+	idx := &Indexer{trigramSearcher: &trigram.Searcher{}, trigramGen: 7}
+	idx.trigramMu.Lock()
+	stale := idx.trigramReleaseLocked()
+	current := idx.trigramReleaseLocked()
+	idx.trigramMu.Unlock()
+
+	stale()
+	require.NotNil(t, idx.trigramSearcher)
+	require.Equal(t, uint64(7), idx.trigramGen)
+
+	current()
+	require.Nil(t, idx.trigramSearcher)
+	require.Zero(t, idx.trigramGen)
+}
+
+func TestBoundedWarmSearchRefreshesTrigramBudget(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	budget := newTestTrigramBudget(time.Minute, 1, &now)
+	dir := t.TempDir()
+	writeTestFile(t, dir+"/main.go", "package main\n\nfunc Warm() int { return 0 }\n")
+	idx := &Indexer{
+		rootPath:              dir,
+		fileMtimes:            map[string]int64{"main.go": 1},
+		trigramBudgetOverride: budget,
+	}
+	require.NotNil(t, idx.warmTrigramSearcher())
+
+	now = now.Add(30 * time.Second)
+	idx.GrepTextBounded(context.Background(), "Warm", 10, 10)
+
+	budget.mu.Lock()
+	lastUsed := budget.entries[idx].lastUsed
+	budget.mu.Unlock()
+	require.Equal(t, now, lastUsed, "bounded-only activity must keep a warm cache alive")
+
+	now = now.Add(10 * time.Second)
+	idx.GrepLiteralBounded(context.Background(), "Warm", 10, 10)
+	budget.mu.Lock()
+	lastUsed = budget.entries[idx].lastUsed
+	budget.mu.Unlock()
+	require.Equal(t, now, lastUsed, "bounded literal activity must also refresh the cache")
+}
+
+func TestUntrackRepoForgetsAndReleasesTrigramCache(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	budget := newTestTrigramBudget(time.Hour, 1, &now)
+	idx := &Indexer{
+		trigramSearcher:       &trigram.Searcher{},
+		trigramGen:            7,
+		trigramBudgetOverride: budget,
+	}
+	idx.trigramMu.Lock()
+	release := idx.trigramReleaseLocked()
+	idx.trigramMu.Unlock()
+	budget.touch(idx, release)
+
+	mi := &MultiIndexer{
+		graph:    graph.New(),
+		repos:    map[string]*RepoMetadata{"repo": {}},
+		indexers: map[string]*Indexer{"repo": idx},
+		logger:   zap.NewNop(),
+	}
+	mi.UntrackRepo("repo")
+
+	require.Zero(t, budget.live())
+	require.Nil(t, idx.trigramSearcher)
+	require.Zero(t, idx.trigramGen)
 }
 
 // End-to-end over the real warm path: building a searcher in one repo must

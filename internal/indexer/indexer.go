@@ -198,6 +198,10 @@ type Indexer struct {
 	trigramSearcher *trigram.Searcher
 	trigramGen      uint64
 	trigramMu       sync.Mutex
+	// trigramLease is protected by trigramMu. Every warm-cache use advances
+	// it so a delayed idle/LRU callback cannot release a searcher that was
+	// re-touched after the budget selected its previous lease for eviction.
+	trigramLease uint64
 	// trigramBudgetOverride scopes the idle/LRU eviction budget to one
 	// test rather than the process-wide default. Nil in production.
 	trigramBudgetOverride *trigramBudget
