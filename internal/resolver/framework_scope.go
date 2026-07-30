@@ -2,7 +2,6 @@ package resolver
 
 import (
 	"sort"
-	"strconv"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -53,20 +52,12 @@ func frameworkRepoEdges(g graph.Store, scope map[string]bool, kinds ...graph.Edg
 	return out
 }
 
-func frameworkEdgeIdentity(edge *graph.Edge) string {
-	if edge == nil {
-		return ""
-	}
-	return edge.From + "\x00" + edge.To + "\x00" + string(edge.Kind) + "\x00" +
-		edge.FilePath + "\x00" + strconv.Itoa(edge.Line)
-}
-
-func appendUniqueFrameworkEdges(dst []*graph.Edge, seen map[string]struct{}, edges ...*graph.Edge) []*graph.Edge {
+func appendUniqueFrameworkEdges(dst []*graph.Edge, seen map[graph.EdgeIdentity]struct{}, edges ...*graph.Edge) []*graph.Edge {
 	for _, edge := range edges {
-		key := frameworkEdgeIdentity(edge)
-		if key == "" {
+		if edge == nil {
 			continue
 		}
+		key := graph.EdgeIdentityFor(edge)
 		if _, duplicate := seen[key]; duplicate {
 			continue
 		}
@@ -84,7 +75,7 @@ func frameworkCallsForScope(g graph.Store, scope map[string]bool) []*graph.Edge 
 		return frameworkEdgesByKinds(g, graph.EdgeCalls)
 	}
 	prefixes := frameworkScopePrefixes(scope)
-	seen := make(map[string]struct{})
+	seen := make(map[graph.EdgeIdentity]struct{})
 	var out []*graph.Edge
 	for _, row := range graph.ReadRepoEdgesByKinds(g, prefixes, []graph.EdgeKind{graph.EdgeCalls}) {
 		out = appendUniqueFrameworkEdges(out, seen, row.Edge)

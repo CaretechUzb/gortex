@@ -120,7 +120,7 @@ func TestFrameworkEdgeBatchReadYourWritesAndOrdering(t *testing.T) {
 		}
 		seen := 0
 		for candidate := range store.EdgesByKind(graph.EdgeCalls) {
-			if candidate != nil && frameworkScopedEdgeKey(candidate) == frameworkScopedEdgeKey(edge) {
+			if candidate != nil && graph.EdgeIdentityFor(candidate) == graph.EdgeIdentityFor(edge) {
 				seen++
 			}
 		}
@@ -219,6 +219,53 @@ func TestMacroExpansionUsesConstantBatchReadsAndOneWrite(t *testing.T) {
 	}
 	if g.EdgeCount() != 201 {
 		t.Fatalf("stored edges = %d, want 201", g.EdgeCount())
+	}
+}
+
+func TestFrameworkIdentityMapKeysDoNotCollideOnNUL(t *testing.T) {
+	left := &graph.Edge{From: "a", To: "b\x00c", Kind: graph.EdgeCalls, FilePath: "x.go", Line: 7}
+	right := &graph.Edge{From: "a\x00b", To: "c", Kind: graph.EdgeCalls, FilePath: "x.go", Line: 7}
+	if graph.EdgeIdentityFor(left) == graph.EdgeIdentityFor(right) {
+		t.Fatal("distinct edge identities collided")
+	}
+
+	g := graph.New()
+	batch := newFrameworkEdgeBatchStore(g)
+	batch.AddEdge(left)
+	batch.AddEdge(right)
+	if len(batch.staged) != 2 || len(batch.order) != 2 {
+		t.Fatalf("batch identity entries = staged:%d ordered:%d, want 2/2", len(batch.staged), len(batch.order))
+	}
+	batch.flush()
+	if g.EdgeCount() != 2 {
+		t.Fatalf("stored edges = %d, want 2", g.EdgeCount())
+	}
+
+	view := &frameworkScopedStore{
+		incidentSeen:   make(map[graph.EdgeIdentity]struct{}),
+		incidentByKind: make(map[graph.EdgeKind][]*graph.Edge),
+	}
+	if !view.rememberEdge(left) || !view.rememberEdge(right) {
+		t.Fatal("scoped store rejected identity collision fixtures")
+	}
+	if view.retainedRows != 2 || len(view.incidentSeen) != 2 {
+		t.Fatalf("scoped retained identities = rows:%d seen:%d, want 2/2", view.retainedRows, len(view.incidentSeen))
+	}
+}
+
+var frameworkIdentityBenchmarkSink bool
+
+func BenchmarkFrameworkEdgeIdentityMapLookup(b *testing.B) {
+	edge := &graph.Edge{
+		From: "repo::internal/resolver.(*frameworkScopedStore).rememberEdge",
+		To:   "repo::internal/graph.EdgeIdentityFor",
+		Kind: graph.EdgeCalls, FilePath: "internal/resolver/framework_scoped_store.go", Line: 316,
+	}
+	index := map[graph.EdgeIdentity]struct{}{graph.EdgeIdentityFor(edge): {}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, frameworkIdentityBenchmarkSink = index[graph.EdgeIdentityFor(edge)]
 	}
 }
 

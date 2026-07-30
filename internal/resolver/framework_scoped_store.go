@@ -1,7 +1,6 @@
 package resolver
 
 import (
-	"fmt"
 	"iter"
 	"sort"
 	"strings"
@@ -81,7 +80,7 @@ type frameworkScopedStore struct {
 
 	nodes          map[string]*graph.Node
 	incidentByKind map[graph.EdgeKind][]*graph.Edge
-	incidentSeen   map[string]struct{}
+	incidentSeen   map[graph.EdgeIdentity]struct{}
 	inEdges        map[string][]*graph.Edge
 	outEdges       map[string][]*graph.Edge
 	inReady        map[string]struct{}
@@ -102,7 +101,7 @@ func newFrameworkScopedStore(
 		scope:          newFrameworkExecutionScope(repos, filePaths),
 		nodes:          make(map[string]*graph.Node),
 		incidentByKind: make(map[graph.EdgeKind][]*graph.Edge),
-		incidentSeen:   make(map[string]struct{}),
+		incidentSeen:   make(map[graph.EdgeIdentity]struct{}),
 		inEdges:        make(map[string][]*graph.Edge),
 		outEdges:       make(map[string][]*graph.Edge),
 		inReady:        make(map[string]struct{}),
@@ -313,7 +312,7 @@ func (v *frameworkScopedStore) rememberEdge(edge *graph.Edge) bool {
 	if edge == nil {
 		return false
 	}
-	key := frameworkScopedEdgeKey(edge)
+	key := graph.EdgeIdentityFor(edge)
 	if _, exists := v.incidentSeen[key]; exists {
 		return true
 	}
@@ -377,11 +376,6 @@ func frameworkValueBytes(value any) int {
 	default:
 		return 16
 	}
-}
-
-func frameworkScopedEdgeKey(edge *graph.Edge) string {
-	return edge.From + "\x00" + edge.To + "\x00" + string(edge.Kind) + "\x00" +
-		edge.FilePath + "\x00" + fmt.Sprint(edge.Line)
 }
 
 // seedChangedFileFrontier admits only exact changed-file nodes, their incident

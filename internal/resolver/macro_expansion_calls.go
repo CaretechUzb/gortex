@@ -204,11 +204,11 @@ func resolveMacroExpansionCalls(g graph.Store, cands *frameworkPassCandidates) i
 	for _, site := range sites {
 		callerIDs = append(callerIDs, site.caller)
 	}
-	existingCalls := make(map[string]*graph.Edge)
+	existingCalls := make(map[graph.EdgeIdentity]*graph.Edge)
 	for _, edges := range g.GetOutEdgesByNodeIDs(dedupeFrameworkIDs(callerIDs)) {
 		for _, edge := range edges {
 			if edge != nil && edge.Kind == graph.EdgeCalls {
-				existingCalls[frameworkScopedEdgeKey(edge)] = edge
+				existingCalls[graph.EdgeIdentityFor(edge)] = edge
 			}
 		}
 	}
@@ -235,7 +235,7 @@ func resolveMacroExpansionCalls(g graph.Store, cands *frameworkPassCandidates) i
 					MetaProvenance:    ProvenanceHeuristic,
 				},
 			}
-			key := frameworkScopedEdgeKey(edge)
+			key := graph.EdgeIdentityFor(edge)
 			if existing := existingCalls[key]; existing != nil {
 				if v, _ := existing.Meta["via"].(string); v != macroExpansionVia {
 					// A real edge already occupies this exact identity
