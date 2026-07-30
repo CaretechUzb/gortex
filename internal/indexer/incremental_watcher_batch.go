@@ -100,10 +100,9 @@ func (idx *Indexer) observeIncrementalCatchup(kind string, files []string) {
 }
 
 // runIncrementalResolutionCatchup owns every resolution-dependent tail for a
-// deferred watcher mutation. The changed-file resolver, dataflow rewrite,
+// deferred incremental mutation. The changed-file resolver, dataflow rewrite,
 // affected-by resolver and durable fact refresh each run at most once for the
-// complete batch; ordinary IncrementalReindexPaths callers never enter here and
-// retain their existing chunk-local behavior.
+// complete batch.
 func (idx *Indexer) runIncrementalResolutionCatchup(
 	files []string,
 	batch *reparsePendingEnrichmentBatch,
@@ -153,11 +152,11 @@ func (idx *Indexer) runIncrementalWatcherSemantic(graphPaths []string) {
 	idx.setReparsePendingEnrichments(pending)
 }
 
-// incrementalReindexWatcherPaths is the direct-Indexer fallback used outside a
-// MultiWatcher. It performs one bounded parse/evict batch, then one exact-file
-// resolver pass and one batched reference-fact refresh. The ordinary daemon path
-// uses MultiIndexer.IncrementalReindexRepo instead so shared-graph derived work
-// is also caught up exactly once.
+// incrementalReindexWatcherPaths is the complete direct-Indexer coordinator used
+// outside a MultiIndexer. It performs one bounded parse/evict batch, one exact
+// resolver/reference-fact catch-up, semantic refresh, and the precise standalone
+// derived passes. Shared-graph callers use MultiIndexer so cross-repository work
+// sees every sibling registry and indexer.
 func (idx *Indexer) incrementalReindexWatcherPaths(root string, paths []string) (*IndexResult, error) {
 	result, receipt, batch, err := idx.incrementalReindexPathsWithReceipt(root, paths)
 	if err != nil {
@@ -176,7 +175,11 @@ func (idx *Indexer) incrementalReindexWatcherPaths(root string, paths []string) 
 		idx.observeIncrementalCatchup("resolve", nil)
 		idx.ResolveAll()
 	}
-	idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+	if !idx.deferGlobalPasses {
+		idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+		idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
+		idx.runStandaloneIncrementalDerivedPasses(result.DerivedInvalidation)
+	}
 	return result, nil
 }
 

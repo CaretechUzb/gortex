@@ -41,7 +41,7 @@ func Dropped() {}
 	// Mid-flight exclusion: drop.go remains on disk but must leave the graph.
 	idx.SetExcludePatterns(append(append([]string{}, excludes.Builtin...), "drop.go"))
 
-	res, err := idx.IncrementalReindex(dir)
+	res, err := idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.Equal(t, 1, res.DeletedFileCount, "excluded-but-present file must count as deleted")
@@ -72,7 +72,7 @@ func Gone() {}
 
 	require.NoError(t, os.Remove(gonePath))
 
-	_, err = idx.IncrementalReindex(dir)
+	_, err = idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, g.FindNodesByName("Kept"))
@@ -140,16 +140,16 @@ func TestIncrementalReindex_ConvergesToFullIndex(t *testing.T) {
 
 	bumpMtime(t, filepath.Join(dir, "main.go"),
 		"package main\n\nfunc main() { helper(); helper() }\n\nfunc helper() {}\n")
-	_, err = idxA.IncrementalReindex(dir)
+	_, err = idxA.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 
 	bumpMtime(t, filepath.Join(dir, "pkg", "util.go"),
 		"package pkg\n\ntype Config struct{ Port int }\n\nfunc New() *Config { return &Config{} }\n\nfunc Reset(c *Config) {}\n")
-	_, err = idxA.IncrementalReindex(dir)
+	_, err = idxA.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 
 	require.NoError(t, os.Remove(filepath.Join(dir, "extra.go")))
-	_, err = idxA.IncrementalReindex(dir)
+	_, err = idxA.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 
 	// Path B: a single cold index of the same final disk state.
@@ -190,7 +190,7 @@ func TestIncrementalReindex_FailedFileSurfacedAndRetried(t *testing.T) {
 	future := time.Now().Add(2 * time.Second)
 	require.NoError(t, os.Chtimes(bad, future, future))
 
-	res, err := idx.IncrementalReindex(dir)
+	res, err := idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 	assert.Contains(t, res.FailedFiles, bad,
 		"an unreadable stale file must be surfaced on FailedFiles")
@@ -198,7 +198,7 @@ func TestIncrementalReindex_FailedFileSurfacedAndRetried(t *testing.T) {
 	// Readable again: the file is still stale (its failed pass never
 	// recorded an mtime), so the next incremental pass recovers it.
 	require.NoError(t, os.Chmod(bad, 0o644))
-	res2, err := idx.IncrementalReindex(dir)
+	res2, err := idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 	assert.Empty(t, res2.FailedFiles, "the file indexes cleanly once readable")
 	assert.NotEmpty(t, g.FindNodesByName("Bad"))
@@ -231,7 +231,7 @@ func TestIncrementalReindex_MerkleMode(t *testing.T) {
 	future := time.Now().Add(2 * time.Second)
 	require.NoError(t, os.Chtimes(filepath.Join(dir, "touched.go"), future, future))
 
-	res, err := idx.IncrementalReindex(dir)
+	res, err := idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, g.FindNodesByName("AlsoEdited"),

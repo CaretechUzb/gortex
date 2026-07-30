@@ -105,6 +105,88 @@ func TestReconcileRepoCtx_DoesNotDuplicateUnchanged(t *testing.T) {
 		"reconciling unchanged files must not grow edges (B1 regression)")
 }
 
+// TestReconcileRepoCtx_RunsDerivedPassesForOfflineChange proves a restored
+// repository consumes the modern pipeline's exact derived plan after an edit
+// that happened while the coordinator was offline.
+func TestReconcileRepoCtx_RunsDerivedPassesForOfflineChange(t *testing.T) {
+	dir := t.TempDir()
+	repoPath := filepath.Join(dir, "repo")
+	require.NoError(t, os.MkdirAll(repoPath, 0o755))
+	writeFile(t, filepath.Join(repoPath, "base.go"), "package main\nfunc main() {}\n")
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: repoPath, Name: "repo"}}}
+	gc.SetConfigPath(cfgPath)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(cfgPath)
+	require.NoError(t, err)
+
+	g := graph.New()
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+	priorMtimes := mi.GetMetadata("repo").FileMtimes
+
+	writeFile(t, filepath.Join(repoPath, "shell.go"), `package main
+import "os/exec"
+func Run() error { return exec.Command("true").Run() }
+`)
+
+	mi2 := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	result, err := mi2.ReconcileRepoCtx(
+		context.Background(), config.RepoEntry{Path: repoPath, Name: "repo"}, priorMtimes,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.DerivedInvalidation.Empty(), "offline edit must return its exact derived plan")
+	assert.True(t, result.DerivedInvalidation.Flags.Has(DerivedInvalidatesRuntime))
+	assert.True(t, reconcileHasEdgeKind(g, graph.EdgeExecutesProcess),
+		"snapshot reconciliation must consume the derived plan")
+	require.NotNil(t, mi2.GetIndexer("repo"))
+	assert.Equal(t, 2, mi2.GetIndexer("repo").TotalDetected())
+}
+
+func TestReconcileAll_RunsDerivedPassesForMissedChange(t *testing.T) {
+	dir := t.TempDir()
+	repoPath := filepath.Join(dir, "repo")
+	require.NoError(t, os.MkdirAll(repoPath, 0o755))
+	writeFile(t, filepath.Join(repoPath, "base.go"), "package main\nfunc main() {}\n")
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: repoPath, Name: "repo"}}}
+	gc.SetConfigPath(cfgPath)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(cfgPath)
+	require.NoError(t, err)
+
+	g := graph.New()
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+
+	writeFile(t, filepath.Join(repoPath, "shell.go"), `package main
+import "os/exec"
+func Run() error { return exec.Command("true").Run() }
+`)
+
+	results := mi.ReconcileAllCtx(context.Background())
+	require.Contains(t, results, "repo")
+	require.NotNil(t, results["repo"])
+	assert.False(t, results["repo"].DerivedInvalidation.Empty(),
+		"janitor must retain the modern pipeline's exact derived plan")
+	assert.True(t, reconcileHasEdgeKind(g, graph.EdgeExecutesProcess),
+		"janitor must consume the plan after the batched repository loop")
+}
+
+func reconcileHasEdgeKind(g graph.Store, kind graph.EdgeKind) bool {
+	for _, edge := range g.AllEdges() {
+		if edge != nil && edge.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
 // TestReconcileAll_CatchesJanitorTargets runs ReconcileAll directly —
 // the entry point the daemon's periodic janitor calls. Tests the same
 // B2 invariant but through the public janitor API rather than the

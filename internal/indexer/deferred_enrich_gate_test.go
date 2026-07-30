@@ -133,10 +133,10 @@ func TestIndexer_PendingEnrich_SetByIndexAndIncremental(t *testing.T) {
 
 	// A zero-change reconcile must not raise the marker.
 	idx.pendingEnrich.Store(false)
-	_, err = idx.IncrementalReindex(dir)
+	_, err = idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 	assert.False(t, idx.pendingEnrich.Load(),
-		"a no-op IncrementalReindex must leave pendingEnrich clear")
+		"a no-op IncrementalReindexPaths call must leave pendingEnrich clear")
 
 	// A scoped incremental pass that re-indexes a stale file sets it.
 	bumpMtime(t, filepath.Join(dir, "main.go"),

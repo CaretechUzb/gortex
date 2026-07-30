@@ -35,7 +35,7 @@ func init() {
 
 // snapshotRepo carries the per-repo metadata needed to reconcile a
 // restarting daemon with the filesystem: specifically, FileMtimes so
-// IncrementalReindex can skip unchanged files and evict deleted ones.
+// IncrementalReindexPaths can skip unchanged files and evict deleted ones.
 // Added additively — absent in v≤2 snapshots, where RepoCount decodes
 // as zero and the repo section is empty.
 type snapshotRepo struct {
@@ -53,7 +53,7 @@ type snapshotRepo struct {
 
 // snapshotContract is the wire form of contracts.Contract. Persisted so
 // per-repo contract registries survive daemon restarts without having to
-// re-run extractContracts during warmup — in steady state IncrementalReindex
+// re-run extractContracts during warmup — in steady state IncrementalReindexPaths
 // skips the extraction step entirely, which used to leave the registry nil
 // for every repo whose mtimes hadn't drifted. Isolates the wire schema from
 // unrelated evolution of the runtime Contract type: an additive field on
@@ -337,10 +337,10 @@ func migrateSnapshotFile(path string, fromVersion int) (io.Reader, error) {
 // snapshot path. Called from the daemon's shutdown hook. Errors are
 // logged but never propagated — a failed snapshot write should never
 // block clean shutdown. The repos slice carries per-repo FileMtimes so
-// the next warmup can use IncrementalReindex instead of a full re-scan.
+// the next warmup can use IncrementalReindexPaths instead of a full re-scan.
 // The contracts slice carries per-repo contract entries so the warmup
 // can rehydrate each indexer's contracts.Registry without re-running the
-// extractors — IncrementalReindex skips extraction in steady state, so
+// extractors — IncrementalReindexPaths skips extraction in steady state, so
 // without this the registries came back nil after every restart.
 // The vec argument carries the workspace-global vector-search index so
 // a default-on daemon does not re-embed the whole graph on restart.

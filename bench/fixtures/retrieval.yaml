@@ -56,7 +56,7 @@ cases:
   - { id: exact-MultiIndexer,        tier: exact, query: "MultiIndexer",                expected: [internal/indexer/multi.go::MultiIndexer] }
   - { id: exact-IndexFile,           tier: exact, query: "IndexFile",                   expected: [internal/indexer/indexer.go::Indexer.IndexFile] }
   - { id: exact-IndexFileNoResolve,  tier: exact, query: "IndexFileNoResolve",          expected: [internal/indexer/indexer.go::Indexer.IndexFileNoResolve] }
-  - { id: exact-IncrementalReindex,  tier: exact, query: "IncrementalReindex",          expected: [internal/indexer/indexer.go::Indexer.IncrementalReindex] }
+  - { id: exact-IncrementalReindexPaths, tier: exact, query: "IncrementalReindexPaths",          expected: [internal/indexer/indexer.go::Indexer.IncrementalReindexPaths] }
   - { id: exact-SetEmbedder,         tier: exact, query: "SetEmbedder",                 expected: [internal/indexer/indexer.go::Indexer.SetEmbedder] }
   - { id: exact-EvictFile,           tier: exact, query: "EvictFile",                   expected: [internal/graph/graph.go::Graph.EvictFile] }
   - { id: exact-EvictRepo,           tier: exact, query: "EvictRepo",                   expected: [internal/graph/graph.go::Graph.EvictRepo] }
@@ -164,7 +164,7 @@ cases:
   - { id: concept-set-embedder,      tier: concept, query: "attach embedding provider to the indexer",      expected: [internal/indexer/indexer.go::Indexer.SetEmbedder] }
   - { id: concept-new-server,        tier: concept, query: "construct a new MCP server instance",           expected: [internal/mcp/server.go::NewServer] }
   - { id: concept-new-hybrid,        tier: concept, query: "construct a hybrid BM25+vector backend",        expected: [internal/search/hybrid.go::NewHybrid] }
-  - { id: concept-reindex-all,       tier: concept, query: "incremental reindex after file changes",        expected: [internal/indexer/indexer.go::Indexer.IncrementalReindex] }
+  - { id: concept-reindex-all,       tier: concept, query: "incremental reindex after file changes",        expected: [internal/indexer/indexer.go::Indexer.IncrementalReindexPaths] }
   - { id: concept-new-vector,        tier: concept, query: "HNSW vector index backend",                     expected: [internal/search/vector.go::VectorBackend] }
   - { id: concept-api-embedder,      tier: concept, query: "OpenAI-compatible embeddings API provider",     expected: [internal/embedding/api.go::APIProvider] }
   - { id: concept-guard-rules,       tier: concept, query: "team convention guard rule evaluation",         expected: [internal/mcp/tools_enhancements.go::Server.handleCheckGuards] }
@@ -282,7 +282,7 @@ cases:
       - internal/indexer/indexer.go::Indexer.Index
       - internal/indexer/indexer.go::Indexer.IndexFile
       - internal/indexer/indexer.go::Indexer.IndexFileNoResolve
-      - internal/indexer/indexer.go::Indexer.IncrementalReindex
+      - internal/indexer/indexer.go::Indexer.IncrementalReindexPaths
       - internal/indexer/indexer.go::Indexer.Search
       - internal/indexer/indexer.go::Indexer.Graph
 

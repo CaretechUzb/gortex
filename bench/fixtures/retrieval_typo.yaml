@@ -49,7 +49,7 @@ cases:
       tier: exact
       query: IncrementalPeindex
       expected:
-        - internal/indexer/indexer.go::Indexer.IncrementalReindex
+        - internal/indexer/indexer.go::Indexer.IncrementalReindexPaths
     - id: exact-SetEmbedder-typo
       tier: exact
       query: SetEmbeeder
@@ -564,7 +564,7 @@ cases:
       tier: concept
       query: incremental reindex after file cwhanges
       expected:
-        - internal/indexer/indexer.go::Indexer.IncrementalReindex
+        - internal/indexer/indexer.go::Indexer.IncrementalReindexPaths
     - id: concept-new-vector-typo
       tier: concept
       query: HNSW vector indxe backend
@@ -720,7 +720,7 @@ cases:
         - internal/indexer/indexer.go::Indexer.Index
         - internal/indexer/indexer.go::Indexer.IndexFile
         - internal/indexer/indexer.go::Indexer.IndexFileNoResolve
-        - internal/indexer/indexer.go::Indexer.IncrementalReindex
+        - internal/indexer/indexer.go::Indexer.IncrementalReindexPaths
         - internal/indexer/indexer.go::Indexer.Search
         - internal/indexer/indexer.go::Indexer.Graph
     - id: mh-multi-repo-typo

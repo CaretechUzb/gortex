@@ -952,7 +952,7 @@ func safeUint64(v any) (uint64, bool) {
 // InvalidateIndex advances the global build counter so every future
 // Lookup recomputes against the new graph state. Call this whenever
 // the graph mutates in a way that could change reach sets — at the
-// end of every IndexCtx / IncrementalReindex / global-pass run.
+// end of every IndexCtx / IncrementalReindexPaths / global-pass run.
 //
 // The cached Meta entries on nodes that survived the mutation are
 // not deleted; they're simply tagged with a stale build counter, so

@@ -90,7 +90,7 @@ func TestWarmRestart_PrunesDeletedFileMtimes_FastPath(t *testing.T) {
 
 // TestIncrementalReindex_PrunesDeletedFileMtimes covers the watcher /
 // incremental path: a file deleted between scans must have its persisted
-// mtime row removed by IncrementalReindex (via DeleteFileMtimes), not just
+// mtime row removed by IncrementalReindexPaths (via DeleteFileMtimes), not just
 // its in-memory entry — otherwise the next warm restart re-discovers it as a
 // phantom deletion.
 func TestIncrementalReindex_PrunesDeletedFileMtimes(t *testing.T) {
@@ -115,7 +115,7 @@ func TestIncrementalReindex_PrunesDeletedFileMtimes(t *testing.T) {
 	// Delete drop.go and run the incremental path (the janitor / watcher
 	// route), not a full re-track.
 	require.NoError(t, os.Remove(filepath.Join(repoPath, "drop.go")))
-	res, err := idx.IncrementalReindex(repoPath)
+	res, err := idx.IncrementalReindexPaths(repoPath, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, res.DeletedFileCount, "incremental reindex must report the deletion")
 

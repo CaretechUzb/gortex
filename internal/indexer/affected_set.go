@@ -1,22 +1,6 @@
 package indexer
 
-import (
-	"os"
-	"strings"
-
-	"github.com/zzet/gortex/internal/graph"
-)
-
-// scopedGlobalPassesEnabled reports whether incremental reindex should scope
-// the global inference passes (InferImplements / InferOverrides) to the
-// changed-affected type set instead of re-running them over the whole graph.
-// GORTEX_INDEX_SCOPED_GLOBAL_PASSES overrides the config key. ON by default.
-func (idx *Indexer) scopedGlobalPassesEnabled() bool {
-	if v := os.Getenv("GORTEX_INDEX_SCOPED_GLOBAL_PASSES"); v != "" {
-		return v == "1" || strings.EqualFold(v, "true")
-	}
-	return idx.config.ScopedGlobalPassesEnabledOrDefault()
-}
+import "github.com/zzet/gortex/internal/graph"
 
 // affectedTypeSet computes the type/interface IDs whose inferred
 // implements/override edges a set of changed (stale) files can affect:
@@ -100,22 +84,4 @@ func (idx *Indexer) staleFilesAffectDerivedEdges(staleFiles []string) bool {
 		}
 	}
 	return false
-}
-
-// runScopedInferencePasses runs the implements/override inference passes scoped
-// to the types/interfaces a set of stale files can affect. Returns false when
-// scoping is disabled (caller should run the full passes). When nothing
-// type/interface-shaped changed, the passes are skipped entirely (the common
-// case for a function-body edit).
-func (idx *Indexer) runScopedInferencePasses(staleFiles []string) bool {
-	if !idx.scopedGlobalPassesEnabled() {
-		return false
-	}
-	types, ifaces := idx.affectedTypeSet(idx.graphFilePaths(staleFiles))
-	if len(types) == 0 && len(ifaces) == 0 {
-		return true // no type/interface change → no inferred edges to re-derive
-	}
-	idx.resolver.InferImplementsScoped(types, ifaces)
-	idx.resolver.InferOverridesScoped(types)
-	return true
 }

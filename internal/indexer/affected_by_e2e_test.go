@@ -70,7 +70,7 @@ func TestAffectedBy_SignatureChange_ReresolvesCaller(t *testing.T) {
 // changes only a function BODY produces no signature delta and must not
 // fan out — the whole point of delta detection is that the common case
 // (a body edit) costs nothing beyond the changed file itself. Driven
-// through whole-root IncrementalReindex to cover that sync route too.
+// through whole-root IncrementalReindexPaths to cover that sync route too.
 func TestAffectedBy_BodyOnlyEdit_NoFanout(t *testing.T) {
 	dir := t.TempDir()
 	aPath := filepath.Join(dir, "a.go")
@@ -84,7 +84,7 @@ func TestAffectedBy_BodyOnlyEdit_NoFanout(t *testing.T) {
 	callerID := fnNodeID(t, g, "b.go", "Caller")
 
 	bumpMtime(t, aPath, "package p\n\nfunc F(x int) int { return x + 1 }\n")
-	res, err := idx.IncrementalReindex(dir)
+	res, err := idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, res.StaleFileCount)
 
