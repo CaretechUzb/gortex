@@ -5397,10 +5397,11 @@ func (idx *Indexer) SetRootPath(root string) {
 // previously tracked under one of the scoped paths but now absent from
 // disk is evicted.
 //
-// When paths is empty the call degrades to IncrementalReindex(root) —
-// callers can therefore pass an optional path list unconditionally.
+// When paths is empty the call reconciles the whole repository tree. The
+// standalone entry point owns the complete parse, resolve, semantic, and exact
+// derived-pass pipeline; MultiIndexer uses the receipt-aware core directly.
 func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*IndexResult, error) {
-	return idx.incrementalReindexPaths(root, paths, true)
+	return idx.incrementalReindexWatcherPaths(root, paths)
 }
 
 // incrementalDiscoverPaths discovers and refreshes files beneath paths without
@@ -5418,7 +5419,8 @@ func (idx *Indexer) incrementalReindexPaths(
 	detectDeletions bool,
 	markerBatches ...*reparsePendingEnrichmentBatch,
 ) (*IndexResult, error) {
-	if len(paths) == 0 {
+	fullRoot := len(paths) == 0
+	if fullRoot {
 		// An empty scope means the repository root. detectDeletions decides
 		// whether absent persisted paths are evicted; keeping that choice here
 		// lets IncrementalReindex share this bounded implementation without a
@@ -5538,6 +5540,13 @@ func (idx *Indexer) incrementalReindexPaths(
 				staleFiles = append(staleFiles, abs)
 			}
 		}
+	}
+
+	// Restored snapshots populate fileMtimes without running IndexCtx. Preserve
+	// the full-tree health baseline that the retired reconciliation path set.
+	// Scoped calls cannot infer a repository-wide discovery total.
+	if fullRoot && idx.totalDetected == 0 {
+		idx.totalDetected = len(diskFiles)
 	}
 
 	var deletedFiles []string

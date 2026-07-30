@@ -52,7 +52,7 @@ func Run() error {
 }
 `)
 
-	_, err = idx.IncrementalReindex(dir)
+	_, err = idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 
 	assert.Positive(t, countExec(),

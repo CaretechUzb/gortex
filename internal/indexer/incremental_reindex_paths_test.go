@@ -39,6 +39,31 @@ func TestIncrementalReindexPaths_EmptyPathsFallsBackToWholeRoot(t *testing.T) {
 		"the whole-root pass must re-index the changed file")
 }
 
+func TestIncrementalReindexPaths_FullRootRestoresDetectedTotal(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "a.go"), "package main\n\nfunc A() {}\n")
+	writeFile(t, filepath.Join(dir, "b.go"), "package main\n\nfunc B() {}\n")
+
+	mtimes := make(map[string]int64, 2)
+	for _, name := range []string{"a.go", "b.go"} {
+		info, err := os.Stat(filepath.Join(dir, name))
+		require.NoError(t, err)
+		mtimes[name] = info.ModTime().UnixNano()
+	}
+
+	idx := newTestIndexer(graph.New())
+	idx.SetRootPath(dir)
+	idx.SetFileMtimes(mtimes)
+	require.Zero(t, idx.TotalDetected(), "snapshot restore starts without a discovery total")
+
+	res, err := idx.IncrementalReindexPaths(dir, nil)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Zero(t, res.StaleFileCount)
+	assert.Equal(t, 2, idx.TotalDetected(),
+		"a full-tree reconcile must restore the health discovery baseline")
+}
+
 // TestIncrementalReindexPaths_ScopesToDirectory checks that a directory
 // path scopes the pass: a stale file inside the scoped directory is
 // re-indexed, while a stale file outside it is left untouched.

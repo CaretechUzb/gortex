@@ -34,6 +34,30 @@ type IncrementalDerivedReport struct {
 	DurationMs          int64
 }
 
+// runStandaloneIncrementalDerivedPasses reuses the exact MultiIndexer derived
+// coordinator for a direct Indexer. The synthetic coordinator intentionally
+// contains only this repository; real shared-graph callers must use their owning
+// MultiIndexer so contract and cross-repository passes see every sibling.
+func (idx *Indexer) runStandaloneIncrementalDerivedPasses(plan DerivedInvalidationPlan) IncrementalDerivedReport {
+	if idx == nil || idx.graph == nil || idx.deferGlobalPasses || plan.Empty() {
+		return IncrementalDerivedReport{}
+	}
+	logger := idx.logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	prefix := idx.RepoPrefix()
+	mi := NewMultiIndexer(idx.graph, idx.registry, idx.search, nil, logger)
+	mi.indexers[prefix] = idx
+	mi.repos[prefix] = &RepoMetadata{
+		RepoPrefix: prefix,
+		RootPath:   idx.RootPath(),
+	}
+	return mi.RunIncrementalDerivedPasses(context.Background(), map[string]DerivedInvalidationPlan{
+		prefix: plan,
+	})
+}
+
 // RunIncrementalDerivedPasses executes only the derived families invalidated
 // by the exact per-file plans. A legacy database without persisted fingerprints
 // takes the old scoped-global path once; ordinary body/metadata edits never do.
