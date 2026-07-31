@@ -2703,11 +2703,12 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		// only the changed files and evict only the deleted ones, leaving the
 		// rest of the already-persisted graph untouched. A whole-repo re-track
 		// (IndexCtx — which evicts and re-parses every file, then bulk-drains)
-		// is reserved for the cases where scoping is unsafe or not worth it: the
-		// census could not be taken, the churn is a large fraction of the repo,
-		// or an operator forced it via GORTEX_WARMUP_FULL_RETRACK. A repo with
-		// zero changes keeps the fast full-tree incremental no-op (walk + 0 stale →
-		// return), which is what makes an unchanged warm restart near-instant.
+		// is reserved for cases where scoped replacement is not worth it: churn is
+		// a large fraction of the repo, or an operator forced it via
+		// GORTEX_WARMUP_FULL_RETRACK. A failed census falls back to the preserving
+		// full-root incremental path. A repo with zero changes returns directly
+		// from an authoritative non-Merkle census instead of repeating the same
+		// full-tree walk in the incremental pipeline.
 		//
 		// The in-memory backend (*graph.Graph) keeps its exact prior behaviour:
 		// the full-tree modern pipeline is authoritative there — it evicts
@@ -2718,6 +2719,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			receipt          *graph.MutationReceipt
 			batch            *reparsePendingEnrichmentBatch
 			changed, deleted []string
+			detected         int
 			route            = "incremental"
 		)
 		// fullRetrack is the whole-repo re-track — the ONE place FullRetrack is
@@ -2736,17 +2738,48 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
 		default:
 			var censusErr error
-			changed, deleted, censusErr = idx.ChangedSinceMtimes(absPath)
+			changed, deleted, detected, censusErr = idx.changedSinceMtimesCensus(absPath)
 			churn := len(changed) + len(deleted)
 			priorCount := len(priorMtimes)
 			forceFull := os.Getenv("GORTEX_WARMUP_FULL_RETRACK") == "1"
+			manifestOnly := churn > 0
+			for _, relPath := range append(append([]string(nil), changed...), deleted...) {
+				absChangedPath := filepath.Join(absPath, filepath.FromSlash(relPath))
+				if !idx.isIncrementalContractManifest(absChangedPath) {
+					manifestOnly = false
+					break
+				}
+			}
 			switch {
-			case censusErr != nil || forceFull:
-				route = "full_retrack"
-				result, err = fullRetrack()
-			case churn == 0:
+			case censusErr != nil:
+				// A partial filesystem census cannot safely authorize replacement:
+				// preserve rows below unreadable paths through the existing
+				// full-root incremental pipeline.
 				route = "incremental"
 				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
+			case forceFull:
+				route = "full_retrack"
+				result, err = fullRetrack()
+			case churn == 0 && !idx.merkleEnabled():
+				route = "census_noop"
+				result = idx.cleanCensusResult(detected, start)
+			case churn == 0:
+				// The mtime census cannot prove a Merkle-enabled repository clean:
+				// a missing baseline or extractor-salt change still requires the
+				// content-addressed full-tree incremental check.
+				route = "incremental"
+				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
+			case manifestOnly && idx.merkleEnabled():
+				// Keep the Merkle baseline repository-wide; a scoped tree would
+				// replace it with the manifest-only projection.
+				route = "incremental"
+				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
+			case manifestOnly:
+				// Root contract manifests are not part of the source-file count, so
+				// one changed go.mod must not look like >40% source churn in a tiny
+				// repository. The scoped refresh records its mtime and converges.
+				route = "scoped"
+				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, append(changed, deleted...), true)
 			case priorCount > 0 && churn*100 > priorCount*40:
 				route = "full_retrack"
 				result, err = fullRetrack()
