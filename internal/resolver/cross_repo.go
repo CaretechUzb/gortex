@@ -55,12 +55,12 @@ type CrossWorkspaceDepLookup func(sourceWorkspaceID string) []CrossWorkspaceDepR
 // passes so we don't pay the memory cost while idle.
 //
 // mu is the graph-wide resolver lock shared with every Resolver built
-// from the same Graph. Private to CrossRepoResolver wasn't enough:
-// MultiWatcher.forwardEvents calls ResolveForRepo while the per-repo
-// Watcher's debounce timer concurrently calls Resolver.ResolveFile,
-// and both paths iterate shared predicate projections and mutate Edge.To in
-// place. Sharing g.ResolveMutex() serialises both resolver
-// types against the same graph.
+// from the same Graph. Private to CrossRepoResolver is not enough: the
+// coordinated incremental tail and master resolution both iterate shared
+// predicate projections and mutate Edge.To in place. Sharing
+// g.ResolveMutex() serialises both resolver types against the same graph;
+// the incremental coordinator additionally keeps its repository lane and
+// topology-writer gate held around the one batched cross-repo pass.
 //
 // crossWorkspaceLookup is the workspace-boundary check. Empty (nil)
 // means the resolver is in legacy mode: cross-repo / cross-workspace
@@ -532,12 +532,11 @@ func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 // absolute watcher path via Indexer.RelKey first. A path matching no
 // nodes is a no-op.
 //
-// Scope note: this resolves edges the changed file OWNS. A new
-// definition in this file that would resolve some OTHER file's pending
-// unresolved edge (inbound resolution) is not re-checked here — that
-// case is rare, self-heals when the referencing file is next touched,
-// and is swept up by the periodic full ResolveAll. ResolveForRepo
-// remains for warmup / global recompute.
+// Scope note: this legacy API resolves only edges the changed file owns.
+// Coordinated MultiIndexer mutation paths use ResolveFilesAndIncoming instead,
+// so a complete Git/storm batch also re-checks other files' unresolved edges
+// that point at symbols newly defined by the changed files. ResolveForRepo
+// remains for callers that explicitly request a repository-wide recompute.
 func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRepoStats {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
@@ -566,23 +565,32 @@ func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRe
 
 // resolveScopedLocked lifts every unresolved target among edges to its
 // real cross-repo node, then materialises the cross_repo_* parallel-edge
-// layer. Shared by ResolveForRepo (whole-repo edge set) and
-// ResolveForFile (one changed file's out-edges). Caller holds cr.mu.
+// layer. Shared by repository, legacy file, and batched files-plus-incoming
+// scopes. Caller holds cr.mu.
 func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepoStats {
+	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
+	pending := make([]*graph.Edge, 0, len(edges))
+	for _, edge := range edges {
+		if edge != nil && graph.IsUnresolvedTarget(edge.To) {
+			pending = append(pending, edge)
+		}
+	}
+	if len(pending) == 0 {
+		return stats
+	}
+
 	cr.buildDirIndexes()
 	defer cr.clearDirIndexes()
 	cr.buildDepModuleIndex()
 	defer cr.clearDepModuleIndex()
 	cr.buildReachableReposIndex()
 	defer cr.clearReachableReposIndex()
+	cr.warmLookupCache(pending)
+	defer cr.clearLookupCache()
 
-	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
 	var reindexBatch []graph.EdgeReindex
-	for _, e := range edges {
-		if e == nil || !strings.HasPrefix(e.To, unresolvedPrefix) {
-			continue
-		}
-		cr.resolveEdge(e, stats, &reindexBatch)
+	for _, edge := range pending {
+		cr.resolveEdge(edge, stats, &reindexBatch)
 	}
 	if len(reindexBatch) > 0 {
 		cr.graph.ReindexEdges(reindexBatch)

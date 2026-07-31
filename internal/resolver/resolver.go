@@ -2189,7 +2189,18 @@ func (r *Resolver) pendingEdgesForFileAndIncoming(filePath string) []*graph.Edge
 // calls: one batched file-node read, one outgoing-adjacency read, and one
 // incoming-stub read. Backends may chunk each request at their bind limit.
 func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementalFileFrontier {
+	return collectIncrementalFileFrontier(r.graph, filePaths, r.incrementalSkipped)
+}
+
+func collectIncrementalFileFrontier(
+	g graph.Store,
+	filePaths []string,
+	skip func(*graph.Edge) bool,
+) incrementalFileFrontier {
 	var frontier incrementalFileFrontier
+	if g == nil {
+		return frontier
+	}
 	seenPaths := make(map[string]struct{}, len(filePaths))
 	for _, path := range filePaths {
 		if path == "" {
@@ -2205,7 +2216,7 @@ func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementa
 		return frontier
 	}
 
-	frontier.nodesByFile = r.graph.GetFileNodesByPaths(frontier.paths)
+	frontier.nodesByFile = g.GetFileNodesByPaths(frontier.paths)
 	var nodeIDs []string
 	for _, path := range frontier.paths {
 		for _, node := range frontier.nodesByFile[path] {
@@ -2214,7 +2225,7 @@ func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementa
 			}
 		}
 	}
-	frontier.outByNode = r.graph.GetOutEdgesByNodeIDs(nodeIDs)
+	frontier.outByNode = g.GetOutEdgesByNodeIDs(nodeIDs)
 
 	seenStubKeys := make(map[string]struct{})
 	appendStubKey := func(key string) {
@@ -2233,7 +2244,7 @@ func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementa
 				continue
 			}
 			for _, edge := range frontier.outByNode[node.ID] {
-				if graph.IsUnresolvedTarget(edge.To) && !r.incrementalSkipped(edge) {
+				if graph.IsUnresolvedTarget(edge.To) && (skip == nil || !skip(edge)) {
 					frontier.pending = append(frontier.pending, edge)
 				}
 			}
@@ -2248,7 +2259,7 @@ func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementa
 	}
 	// The unresolved target string is the incoming-edge bucket key even when
 	// no node with that ID exists.
-	inByStub := r.graph.GetInEdgesByNodeIDs(frontier.stubKeys)
+	inByStub := g.GetInEdgesByNodeIDs(frontier.stubKeys)
 	for _, key := range frontier.stubKeys {
 		for _, edge := range inByStub[key] {
 			if edge != nil && graph.IsUnresolvedTarget(edge.To) {

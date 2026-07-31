@@ -290,9 +290,9 @@ func (mi *MultiIndexer) RunGlobalResolve() {
 // only the changed repos' out-edges here left those inbound edges unbound until
 // the post-enrichment global resolve, so cross-repo queries returned incomplete
 // results for the whole enrichment window even though the daemon reported ready.
-func (mi *MultiIndexer) runCrossRepoResolve(reconcileContracts bool) {
+func (mi *MultiIndexer) newCrossRepoResolver() *resolver.CrossRepoResolver {
 	if mi == nil || mi.graph == nil {
-		return
+		return nil
 	}
 	cr := resolver.NewCrossRepo(mi.graph)
 	cr.SetLogger(mi.logger)
@@ -301,10 +301,33 @@ func (mi *MultiIndexer) runCrossRepoResolve(reconcileContracts bool) {
 	cr.SetPathAliasResolver(mi.pathAliasResolver())
 	cr.SetWorkspaceMembership(mi.workspaceMembershipResolver())
 	mi.applyRemoteStitch(cr)
+	return cr
+}
+
+func (mi *MultiIndexer) runCrossRepoResolve(reconcileContracts bool) {
+	cr := mi.newCrossRepoResolver()
+	if cr == nil {
+		return
+	}
 	cr.ResolveAll()
 	if reconcileContracts {
 		mi.ReconcileContractEdges()
 	}
+}
+
+// runCrossRepoResolveFiles binds both outgoing and incoming unresolved edges
+// for one coordinated mutation frontier. Its caller owns the repository lane
+// and global topology-writer gate, so the graph cannot expose a half-resolved
+// batch between same-repo, semantic, and cross-repository phases.
+func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) {
+	if len(filePaths) == 0 {
+		return
+	}
+	cr := mi.newCrossRepoResolver()
+	if cr == nil {
+		return
+	}
+	cr.ResolveFilesAndIncoming(filePaths)
 }
 
 // crossWorkspaceLookup builds a resolver.CrossWorkspaceDepLookup from
