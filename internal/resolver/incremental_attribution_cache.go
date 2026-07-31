@@ -89,9 +89,17 @@ func (r *Resolver) runFileAttributionPassesForFilesLocked(frontier incrementalFi
 }
 
 func (r *Resolver) flushIncrementalAttributionReindexes() {
-	if len(r.incrementalAttributionReindex) > 0 {
-		r.graph.ReindexEdges(r.incrementalAttributionReindex)
-		r.incrementalAttributionReindex = nil
+	batch := r.incrementalAttributionReindex
+	// Release the resolver-owned backing array before entering the store. Every
+	// emitted chunk is still referenced by batch until its write completes.
+	r.incrementalAttributionReindex = nil
+	for len(batch) > 0 {
+		n := attributionReindexBatchSize
+		if len(batch) < n {
+			n = len(batch)
+		}
+		r.graph.ReindexEdges(batch[:n])
+		batch = batch[n:]
 	}
 }
 
@@ -105,11 +113,33 @@ func (r *Resolver) persistAttributionReindexes(batch []graph.EdgeReindex) {
 	if len(batch) == 0 {
 		return
 	}
-	if r.incrementalNodesByFile != nil {
-		r.incrementalAttributionReindex = append(r.incrementalAttributionReindex, batch...)
+	if r.incrementalNodesByFile == nil {
+		for len(batch) > 0 {
+			n := attributionReindexBatchSize
+			if len(batch) < n {
+				n = len(batch)
+			}
+			r.graph.ReindexEdges(batch[:n])
+			batch = batch[n:]
+		}
 		return
 	}
-	r.graph.ReindexEdges(batch)
+
+	for len(batch) > 0 {
+		if len(r.incrementalAttributionReindex) >= attributionReindexBatchSize {
+			r.flushIncrementalAttributionReindexes()
+		}
+		room := attributionReindexBatchSize - len(r.incrementalAttributionReindex)
+		n := room
+		if len(batch) < n {
+			n = len(batch)
+		}
+		r.incrementalAttributionReindex = append(r.incrementalAttributionReindex, batch[:n]...)
+		batch = batch[n:]
+		if len(r.incrementalAttributionReindex) == attributionReindexBatchSize {
+			r.flushIncrementalAttributionReindexes()
+		}
+	}
 }
 
 func (r *Resolver) incrementalFileNodes(filePath string) []*graph.Node {

@@ -61,17 +61,12 @@ func (r *Resolver) bindDataflowCalleeRefs() {
 	if len(idx.byFile) == 0 && len(idx.bySite) == 0 {
 		return
 	}
-	var batch []graph.EdgeReindex
-	for _, ek := range []graph.EdgeKind{graph.EdgeArgOf, graph.EdgeValueFlow} {
-		for e := range r.graph.EdgesByKind(ek) {
-			if old := bindDataflowCalleeEdge(e, idx); old != "" {
-				batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: old})
-			}
-		}
-	}
-	if len(batch) > 0 {
-		r.graph.ReindexEdges(batch)
-	}
+	r.reindexAttributionEdgesBatched(
+		[]graph.EdgeKind{graph.EdgeArgOf, graph.EdgeValueFlow},
+		func(edge *graph.Edge) string {
+			return bindDataflowCalleeEdge(edge, idx)
+		},
+	)
 }
 
 // bindDataflowCalleeRefsForFile is the single-file scope of
@@ -108,16 +103,14 @@ func (r *Resolver) bindDataflowCalleeRefsForFile(filePath string) {
 			idx.indexCallSite(e)
 		}
 	}
-	var batch []graph.EdgeReindex
-	for _, e := range fileEdges {
-		if e == nil || (e.Kind != graph.EdgeArgOf && e.Kind != graph.EdgeValueFlow) {
+	collector := newAttributionReindexCollector(r)
+	for _, edge := range fileEdges {
+		if edge == nil || (edge.Kind != graph.EdgeArgOf && edge.Kind != graph.EdgeValueFlow) {
 			continue
 		}
-		if old := bindDataflowCalleeEdge(e, idx); old != "" {
-			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: old})
-		}
+		collector.add(edge, bindDataflowCalleeEdge(edge, idx))
 	}
-	r.persistAttributionReindexes(batch)
+	collector.flush()
 }
 
 // calleeIndex holds the per-pass lookup tables bindDataflowCallee* uses.

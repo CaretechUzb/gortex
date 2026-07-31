@@ -25,10 +25,14 @@ func newDataflowBatchCountingStore() *dataflowBatchCountingStore {
 	return &dataflowBatchCountingStore{Store: graph.New()}
 }
 
-func (s *dataflowBatchCountingStore) ScanDataflowEdgesBatched(batchSize int, yield func([]*graph.Edge) bool) {
+func (s *dataflowBatchCountingStore) ScanEdgesByKindsBatched(
+	kinds []graph.EdgeKind,
+	batchSize int,
+	yield func([]*graph.Edge) bool,
+) {
 	s.scanCalls++
 	var edges []*graph.Edge
-	for _, kind := range []graph.EdgeKind{graph.EdgeArgOf, graph.EdgeReturnsTo} {
+	for _, kind := range kinds {
 		for edge := range s.EdgesByKind(kind) {
 			if edge != nil {
 				edges = append(edges, edge)
