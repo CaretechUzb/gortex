@@ -1508,8 +1508,11 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		return ok
 	}
 	passStart("clone_detect")
-	cloneDetectStart := time.Now()
+	clonePassStart := time.Now()
+	cloneDetectElapsed := time.Duration(0)
+	cloneRebuildElapsed := time.Duration(0)
 	clonesDetected := 0
+	clonesRebuilt := 0
 	for _, idx := range cloneIdx {
 		if !inCloneScope(idx.repoPrefix) {
 			continue
@@ -1520,7 +1523,10 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		// (UpdateFuncs/Rebuild → idx.cloneThreshold()), or the batch and
 		// incremental edge sets diverge for any repo whose configured
 		// threshold differs from the workspace maximum.
-		if cs := detectClonesAndEmitEdgesCtx(ctx, mi.graph, idx.repoPrefix, idx.cloneThreshold()); cs.Items > 0 {
+		detectStart := time.Now()
+		cs, cloneBaseline := detectClonesAndEmitEdgesWithBaselineCtx(ctx, mi.graph, idx.repoPrefix, idx.cloneThreshold())
+		cloneDetectElapsed += time.Since(detectStart)
+		if cs.Items > 0 {
 			mi.logger.Info("clone edges emitted (global)",
 				zap.String("repo", idx.repoPrefix),
 				zap.Int("items", cs.Items),
@@ -1532,33 +1538,26 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 				zap.Int("diffused_edges", cs.DiffusedEdges),
 			)
 		}
-	}
-	// Seed each per-repo indexer's incremental clone index from the
-	// freshly-baselined signatures + sidecar (scoped to that repo's
-	// prefix) so steady-state single-file edits after this batch go
-	// incremental instead of re-running the whole-graph pass per file.
-	cloneRebuildStart := time.Now()
-	clonesRebuilt := 0
-	for _, idx := range cloneIdx {
-		if !inCloneScope(idx.repoPrefix) {
-			continue
-		}
+		// Adopt each repo's baseline immediately so the loop never retains
+		// every repository's raw-shingle corpus at once. Invalid or incomplete
+		// baselines take the existing bounded Rebuild fallback.
+		rebuildStart := time.Now()
 		if idx.cloneIndex != nil {
-			idx.cloneIndex.Rebuild(mi.graph, idx.repoPrefix)
+			idx.cloneIndex.AdoptBaselineOrRebuild(mi.graph, idx.repoPrefix, cloneBaseline)
 			clonesRebuilt++
 		}
+		cloneRebuildElapsed += time.Since(rebuildStart)
 	}
-	// Aggregate timing for the clone passes — previously the most expensive
-	// and least observable part of a warm restart (the per-repo logs above
-	// only fire when a repo actually has clone pairs, so a long run could
-	// pass with no breadcrumbs).
+	// Aggregate timing for the clone passes — the historical field names are
+	// retained for dashboards even though successful seeds are now adoptions.
 	mi.logger.Info("clone passes done (global)",
 		zap.Bool("scoped", scope != nil),
 		zap.Int("repos_total", len(cloneIdx)),
 		zap.Int("detected", clonesDetected),
 		zap.Int("rebuilt", clonesRebuilt),
-		zap.Duration("detect_elapsed", cloneRebuildStart.Sub(cloneDetectStart)),
-		zap.Duration("rebuild_elapsed", time.Since(cloneRebuildStart)),
+		zap.Duration("detect_elapsed", cloneDetectElapsed),
+		zap.Duration("rebuild_elapsed", cloneRebuildElapsed),
+		zap.Duration("elapsed", time.Since(clonePassStart)),
 	)
 	// Framework dynamic-dispatch synthesis (gRPC stubs, Temporal
 	// workflow→activity, in-process / native event channels, native

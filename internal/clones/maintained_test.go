@@ -1,6 +1,7 @@
 package clones
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
@@ -143,6 +144,43 @@ func TestStratifiedIndexEquivalence(t *testing.T) {
 
 	if !reflect.DeepEqual(batchSet, maintained) {
 		t.Fatalf("maintained query set != batch set\n  batch=%v\n  maintained=%v", batchSet, maintained)
+	}
+}
+
+func TestStratifiedIndexDetectPairsWithStatsEquivalence(t *testing.T) {
+	tests := []struct {
+		name  string
+		items func(*testing.T) []Item
+	}{
+		{name: "multiple length classes", items: fixtureItems},
+		{name: "capped bucket telemetry", items: func(t *testing.T) []Item {
+			t.Helper()
+			sig := sigFromShingles(t, makeShingleRange(1, 120))
+			items := make([]Item, maxBucketSize+1)
+			for i := range items {
+				items[i] = Item{ID: fmt.Sprintf("item-%03d", i), Sig: sig, TokenCount: 60}
+			}
+			return items
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			items := tt.items(t)
+			wantPairs, wantBuckets, wantBucketItems := DetectPairsStratifiedWithStats(items, DefaultThreshold)
+			index := NewStratifiedIndex()
+			for _, item := range items {
+				index.Add(item)
+			}
+			gotPairs, gotBuckets, gotBucketItems := index.DetectPairsWithStats(DefaultThreshold)
+			if !reflect.DeepEqual(wantPairs, gotPairs) {
+				t.Fatalf("retained detection differs from batch\nwant=%v\n got=%v", wantPairs, gotPairs)
+			}
+			if gotBuckets != wantBuckets || gotBucketItems != wantBucketItems {
+				t.Fatalf("bucket telemetry differs: got (%d, %d), want (%d, %d)",
+					gotBuckets, gotBucketItems, wantBuckets, wantBucketItems)
+			}
+		})
 	}
 }
 

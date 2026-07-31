@@ -2,7 +2,10 @@ package indexer
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -83,27 +86,147 @@ func TestSQLiteCloneCorpusSurvivesReloadAndWarmReplay(t *testing.T) {
 	require.True(t, maintained.built)
 	require.Equal(t, len(page), maintained.corpus)
 	require.Len(t, maintained.shingles, len(page))
-	seededPair := false
-	for _, row := range page {
-		probe, ok := clones.DecodeSignature(row.Signature)
-		require.True(t, ok)
-		if len(maintained.lsh.QueryPairs(clones.Item{
-			ID: row.NodeID, Sig: probe, TokenCount: row.TokenCount,
-		}, clones.DefaultThreshold)) > 0 {
-			seededPair = true
-			break
+
+	assertEquivalent := func(actual *incrementalCloneIndex) {
+		t.Helper()
+		require.True(t, actual.built)
+		require.Equal(t, maintained.corpus, actual.corpus)
+		require.Equal(t, maintained.shingles, actual.shingles)
+		seededPair := false
+		for _, row := range page {
+			probe, ok := clones.DecodeSignature(row.Signature)
+			require.True(t, ok)
+			item := clones.Item{ID: row.NodeID, Sig: probe, TokenCount: row.TokenCount}
+			expectedPairs := maintained.lsh.QueryPairs(item, clones.DefaultThreshold)
+			seededPair = seededPair || len(expectedPairs) > 0
+			require.ElementsMatch(t,
+				expectedPairs,
+				actual.lsh.QueryPairs(item, clones.DefaultThreshold),
+			)
+			for _, shingle := range row.Shingles {
+				require.Equal(t, maintained.cms.Count(shingle), actual.cms.Count(shingle))
+			}
 		}
+		require.True(t, seededPair, "incremental indexes must retain the persisted clone pair")
 	}
-	require.True(t, seededPair, "rebuild must seed the persisted signatures into LSH")
 
 	counted.pageCalls = 0
 	counted.writeCalls = 0
 	counted.writeRows = 0
 	beforeEdges := reopened.EdgeCount()
-	stats := detectClonesAndEmitEdgesCtx(context.Background(), counted, "", clones.DefaultThreshold)
-	require.Equal(t, len(page), stats.Items)
-	require.Equal(t, 1, counted.pageCalls, "warm finalized corpus needs one bounded page query")
+	replayed := newTestIndexer(counted)
+	replayed.RunGlobalGraphPasses(context.Background())
+	require.Equal(t, 1, counted.pageCalls, "warm global pass must scan the finalized corpus exactly once")
 	require.Zero(t, counted.writeCalls, "warm finalized corpus must not rewrite signatures")
 	require.Zero(t, counted.writeRows)
 	require.Equal(t, beforeEdges, reopened.EdgeCount(), "warm replay must be graph-idempotent")
+	assertEquivalent(replayed.cloneIndex)
+
+	counted.pageCalls = 0
+	fallback := newIncrementalCloneIndex()
+	fallback.AdoptBaselineOrRebuild(counted, "", nil)
+	require.Equal(t, 1, counted.pageCalls, "missing baseline must retain the bounded rebuild fallback")
+	assertEquivalent(fallback)
+}
+
+type cloneCorpusBenchmarkStore struct {
+	graph.Store
+	rows      []graph.CloneCorpusRow
+	pageCalls int
+	failAfter int
+}
+
+func (s *cloneCorpusBenchmarkStore) CloneCorpusPage(_ string, after string, limit int) ([]graph.CloneCorpusRow, error) {
+	s.pageCalls++
+	if s.failAfter > 0 && s.pageCalls > s.failAfter {
+		return nil, errors.New("injected clone corpus page failure")
+	}
+	start := sort.Search(len(s.rows), func(i int) bool { return s.rows[i].NodeID > after })
+	if start == len(s.rows) {
+		return nil, nil
+	}
+	end := min(start+limit, len(s.rows))
+	return s.rows[start:end], nil
+}
+
+func (s *cloneCorpusBenchmarkStore) BulkSetCloneCorpus(_ string, _ []graph.CloneCorpusRow) error {
+	return nil
+}
+
+func benchmarkCloneCorpus(size int) (*cloneCorpusBaseline, []graph.CloneCorpusRow) {
+	baseline := &cloneCorpusBaseline{
+		cms:       clones.NewCMS(65536, 4),
+		lsh:       clones.NewStratifiedIndex(),
+		shingles:  make(map[string][]uint64, size),
+		itemCount: size,
+		corpus:    size,
+		complete:  true,
+	}
+	rows := make([]graph.CloneCorpusRow, 0, size)
+	for i := 0; i < size; i++ {
+		id := fmt.Sprintf("node-%06d", i)
+		shingles := make([]uint64, 12)
+		for j := range shingles {
+			shingles[j] = uint64(i*32 + j + 1)
+			baseline.cms.Add(shingles[j])
+		}
+		sig, ok := clones.SignatureFromShingles(shingles, 0)
+		if !ok {
+			panic("benchmark corpus unexpectedly produced no signature")
+		}
+		item := clones.Item{ID: id, Sig: sig, TokenCount: 100}
+		baseline.shingles[id] = shingles
+		baseline.lsh.Add(item)
+		rows = append(rows, graph.CloneCorpusRow{
+			NodeID: id, Shingles: shingles, TokenCount: item.TokenCount,
+			Signature: clones.EncodeSignature(sig), Finalized: true,
+		})
+	}
+	return baseline, rows
+}
+
+func TestFinaliseCloneCorpusAbortReleasesBaseline(t *testing.T) {
+	_, rows := benchmarkCloneCorpus(cloneCorpusFinalizeBatch)
+	store := &cloneCorpusBenchmarkStore{rows: rows, failAfter: 1}
+	baseline := finaliseCloneCorpusCtx(context.Background(), store, "")
+
+	require.False(t, baseline.complete)
+	require.Nil(t, baseline.cms)
+	require.Nil(t, baseline.lsh)
+	require.Nil(t, baseline.shingles)
+	require.Nil(t, baseline.items)
+	require.Zero(t, baseline.itemCount)
+	require.Zero(t, baseline.corpus)
+}
+
+func BenchmarkIncrementalCloneIndexBaselineReuse(b *testing.B) {
+	baseline, rows := benchmarkCloneCorpus(2 * cloneCorpusFinalizeBatch)
+	store := &cloneCorpusBenchmarkStore{rows: rows}
+
+	b.Run("adopt_finalized_baseline", func(b *testing.B) {
+		b.ReportAllocs()
+		store.pageCalls = 0
+		for i := 0; i < b.N; i++ {
+			candidate := *baseline
+			ci := &incrementalCloneIndex{}
+			ci.AdoptBaselineOrRebuild(store, "", &candidate)
+			if !ci.Ready() {
+				b.Fatal("adopted index is not ready")
+			}
+		}
+		b.ReportMetric(float64(store.pageCalls)/float64(b.N), "corpus_pages/op")
+	})
+
+	b.Run("rebuild_from_pager", func(b *testing.B) {
+		b.ReportAllocs()
+		store.pageCalls = 0
+		for i := 0; i < b.N; i++ {
+			ci := &incrementalCloneIndex{}
+			ci.Rebuild(store, "")
+			if !ci.Ready() {
+				b.Fatal("rebuilt index is not ready")
+			}
+		}
+		b.ReportMetric(float64(store.pageCalls)/float64(b.N), "corpus_pages/op")
+	})
 }

@@ -983,7 +983,8 @@ func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 		)
 	}
 	reporter.Report("clone detection pass (global)", 0, 0)
-	if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold()); cs.Items > 0 {
+	cs, cloneBaseline := detectClonesAndEmitEdgesWithBaselineCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold())
+	if cs.Items > 0 {
 		idx.logger.Info("clone edges emitted (global)",
 			zap.Int("items", cs.Items),
 			zap.Int("clone_pairs", cs.Pairs),
@@ -994,11 +995,10 @@ func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 			zap.Int("diffused_edges", cs.DiffusedEdges),
 		)
 	}
-	// Seed the incremental clone index from the freshly-baselined
-	// signatures + sidecar so steady-state single-file edits after this
-	// batch go incremental instead of re-running the whole-graph pass.
+	// Adopt the freshly-finalized CMS/corpus seed so steady-state single-file
+	// edits go incremental without paging the same compact corpus again.
 	if idx.cloneIndex != nil {
-		idx.cloneIndex.Rebuild(idx.graph, idx.repoPrefix)
+		idx.cloneIndex.AdoptBaselineOrRebuild(idx.graph, idx.repoPrefix, cloneBaseline)
 	}
 	// Framework dynamic-dispatch synthesis (gRPC stubs, Temporal
 	// workflow→activity, in-process / native event channels, native
@@ -3696,7 +3696,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				)
 			}
 			reporter.Report("clone detection pass", 0, 0)
-			if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold()); cs.Items > 0 {
+			cs, cloneBaseline := detectClonesAndEmitEdgesWithBaselineCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold())
+			if cs.Items > 0 {
 				idx.logger.Info("clone edges emitted",
 					zap.Int("items", cs.Items),
 					zap.Int("clone_pairs", cs.Pairs),
@@ -3707,13 +3708,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					zap.Int("diffused_edges", cs.DiffusedEdges),
 				)
 			}
-			// Seed the incremental clone index from the freshly-baselined
-			// signatures + sidecar so steady-state single-file edits go
-			// incremental (EvictFuncs/UpdateFuncs) instead of re-running
-			// this whole-graph pass per file. The batch pass remains the
-			// re-baseline (corrects CMS drift) and owns diffusion.
+			// Adopt the freshly-finalized CMS/corpus seed so steady-state
+			// single-file edits go incremental without another corpus scan.
+			// The batch pass remains the re-baseline and owns diffusion.
 			if idx.cloneIndex != nil {
-				idx.cloneIndex.Rebuild(idx.graph, idx.repoPrefix)
+				idx.cloneIndex.AdoptBaselineOrRebuild(idx.graph, idx.repoPrefix, cloneBaseline)
 			}
 			// Framework dynamic-dispatch synthesis — runs once the call
 			// graph and interface inference are final. Skipped under
