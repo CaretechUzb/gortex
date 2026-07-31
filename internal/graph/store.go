@@ -1556,6 +1556,25 @@ type FileMetaPathReader interface {
 	FileMetasByPaths(repoPrefix string, filePaths []string) (map[string]FileMetaRow, error)
 }
 
+// FileReceipt is the compact polling projection joining one tracked path's
+// durable mtime with its optional content identity. ContentHash is empty for
+// tracked paths (such as contract manifests) that do not have a files row.
+type FileReceipt struct {
+	FilePath    string
+	MtimeNS     int64
+	ContentHash string
+	Size        int64
+}
+
+// FileReceiptPager reads tracked-file receipts through bounded keyset pages.
+// A caller freezes HighWater before a rotation, then advances AfterPath until
+// the returned page is short. Implementations must close their database cursor
+// before returning so filesystem work cannot pin a read transaction.
+type FileReceiptPager interface {
+	FileReceiptHighWater(repoPrefix string) (string, error)
+	FileReceiptPage(repoPrefix, afterPath, highWaterPath string, limit int, includeContent bool) ([]FileReceipt, error)
+}
+
 // RefFact is one durable resolved-reference fact: a reference edge from
 // FromID resolved TO ToID with the provenance tier that resolved it. Persisted
 // per source file so a reference's resolution is an auditable, diffable record
