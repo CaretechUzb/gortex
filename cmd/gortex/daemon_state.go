@@ -419,14 +419,26 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	if workers > len(repos) {
 		workers = len(repos)
 	}
+	parseBudget, currentMemory, budgetErr := currentWarmupMemoryBudgetBytes()
+	state.multiIndexer.SetSharedParseMemoryBudget(parseBudget)
+	if budgetErr != nil {
+		logger.Warn("daemon: invalid warmup memory budget; using automatic budget",
+			zap.String("env", warmupMemoryBudgetEnv),
+			zap.String("value", os.Getenv(warmupMemoryBudgetEnv)),
+			zap.Error(budgetErr))
+	}
 	logger.Info("daemon: warmup phase start",
 		zap.String("phase", "parallel_parse"),
 		zap.Int("repos", len(repos)),
 		zap.Int("workers", workers),
+		zap.Int64("shared_parse_budget_mb", parseBudget>>20),
+		zap.Uint64("managed_memory_mb", currentMemory>>20),
 		zap.Bool("snapshot_partial_forces_full_walk", state.snapshotPartial))
 	publishReadinessPhase(state, "parallel_parse", false, map[string]any{
-		"tracked_repos": len(repos),
-		"workers":       workers,
+		"tracked_repos":          len(repos),
+		"workers":                workers,
+		"shared_parse_budget_mb": parseBudget >> 20,
+		"managed_memory_mb":      currentMemory >> 20,
 	})
 	phaseStart := time.Now()
 
