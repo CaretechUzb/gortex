@@ -494,7 +494,7 @@ func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptio
 	}
 
 	var cands []*rerank.Candidate
-	if s := e.getSearch(); s != nil && s.Count() > 0 {
+	if s := e.getSearch(); s != nil && backendHasCorpus(s) {
 		cands = e.gatherBackendCandidates(query, fetchLimit, opts, gatherCtx)
 	} else {
 		start := time.Now()
@@ -606,6 +606,25 @@ func (e *Engine) SearchSymbolsScoped(query string, limit int, opts QueryOptions)
 		out = append(out, c.Node)
 	}
 	return out
+}
+
+// backendHasCorpus reports whether the search backend has anything to
+// answer with. Count() alone is wrong here: it is a delta of THIS
+// process's Add/Remove calls, so a daemon warm-started over a
+// populated disk FTS reads 0 and every search would silently divert
+// to the substring fallback until the first file edit. The
+// authoritative disk corpus size rides DocCount when the backend
+// exposes it (the SymbolSearcherBackend chain does).
+func backendHasCorpus(s search.Backend) bool {
+	if s.Count() > 0 {
+		return true
+	}
+	if dc, ok := s.(interface{ DocCount() (int, bool) }); ok {
+		if n, known := dc.DocCount(); known && n > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // repoAllowList flattens a RepoAllow set into a sorted slice for the

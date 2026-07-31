@@ -163,6 +163,18 @@ func (h *HybridBackend) SearchSymbolBundles(query string, limit int) []SymbolBun
 	return nil
 }
 
+// DocCount forwards the text backend's authoritative corpus size for
+// the engine's has-corpus gate, mirroring the Swappable forward.
+func (h *HybridBackend) DocCount() (int, bool) {
+	if h == nil || h.text == nil {
+		return 0, false
+	}
+	if dc, ok := h.text.(interface{ DocCount() (int, bool) }); ok {
+		return dc.DocCount()
+	}
+	return 0, false
+}
+
 // SearchSymbolBundlesScoped forwards the repo-narrowed bundle path to
 // the text backend; the vector channel does not participate, exactly
 // as in SearchSymbolBundles.

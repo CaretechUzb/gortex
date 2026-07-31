@@ -117,6 +117,19 @@ func (s *Swappable) SearchSymbolBundles(query string, limit int) []SymbolBundle 
 	return nil
 }
 
+// DocCount forwards the authoritative corpus size when the inner
+// backend exposes it — the engine's has-corpus gate reads this so a
+// warm-started daemon over a populated disk FTS isn't mistaken for an
+// empty backend.
+func (s *Swappable) DocCount() (int, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if dc, ok := s.inner.(interface{ DocCount() (int, bool) }); ok {
+		return dc.DocCount()
+	}
+	return 0, false
+}
+
 // SearchSymbolBundlesScoped forwards the repo-narrowed bundle path the
 // same way; nil when the inner backend doesn't expose it.
 func (s *Swappable) SearchSymbolBundlesScoped(query string, repoAllow []string, limit int) []SymbolBundle {
