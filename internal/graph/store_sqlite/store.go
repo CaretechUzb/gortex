@@ -586,29 +586,51 @@ func (s *Store) checkpointWALPassive() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.passiveCheckpointWindow())
 	defer cancel()
-	result, err := s.checkpointWALOnce(ctx, "PASSIVE")
+
+	// Acquire the writer connection separately from running the PRAGMA. A
+	// single QueryRowContext folds pool acquisition, execution and scanning
+	// into one call, so its deadline cannot tell "never started" from "was
+	// running". Only a failure to acquire proves the checkpoint never ran, and
+	// that is the case worth reporting as a deferral rather than a result.
+	conn, err := s.writerDB.Conn(ctx)
+	if err != nil {
+		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_busy error=%q", err)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+
+	result, err := checkpointWALOnceOn(ctx, conn, "PASSIVE")
 	if err == nil {
 		return
 	}
+	log.Print(passiveCheckpointReport(result, err, ctx.Err()))
+}
 
-	// An expired window means the writer pool was still pinned — typically by a
-	// bulk index — so `PRAGMA wal_checkpoint(PASSIVE)` never executed and
-	// result is the zero value. Reporting those unset fields as busy=0
-	// wal_frames=0 checkpointed_frames=0 states measurements SQLite never
-	// made, and "incomplete" describes a drain that ran and fell short. This
-	// is the third deferral shape, a sibling of the writer_gate and
-	// bulk_writer branches above; the WAL is drained on a later tick or by the
-	// final TRUNCATE checkpoint. Some drivers surface their own error on
-	// cancellation instead of wrapping the context one, so check both.
-	if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
-		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_busy")
-		return
+// passiveCheckpointReport renders the log line for a periodic checkpoint that
+// executed and failed. Split out from checkpointWALPassive because the
+// ordering it encodes is the whole point and racing a real deadline cannot
+// pin it: a checkpoint that returned counters and then blew its window must
+// be reported by its counters, not by the deadline.
+func passiveCheckpointReport(result walCheckpointResult, err, ctxErr error) string {
+	// Measured counters outrank the window. An incomplete checkpoint DID
+	// execute and SQLite reported real numbers; that stays a warning even if
+	// the window expired right after, because the measurement is trustworthy
+	// and the deadline is not what the operator needs to know.
+	if errors.Is(err, errSQLiteCheckpointIncomplete) {
+		return fmt.Sprintf("store_sqlite: wal checkpoint incomplete mode=PASSIVE busy=%d wal_frames=%d checkpointed_frames=%d error=%q",
+			result.Busy, result.WALFrames, result.CheckpointedFrames, err)
 	}
 
-	// The PRAGMA did run: result carries real counters and either frames were
-	// left behind (reader-limited) or the driver failed. That is a genuine
-	// measurement and stays a warning.
-	log.Printf("store_sqlite: wal checkpoint incomplete mode=PASSIVE busy=%d wal_frames=%d checkpointed_frames=%d error=%q", result.Busy, result.WALFrames, result.CheckpointedFrames, err)
+	// The PRAGMA started but did not return in the window. Unlike a failure to
+	// acquire the writer, it may well have drained frames, so this is not a
+	// deferral — and result holds nothing measured, so it must not be printed
+	// as counters either.
+	if errors.Is(err, context.DeadlineExceeded) || ctxErr != nil {
+		return fmt.Sprintf("store_sqlite: wal checkpoint timed out mode=PASSIVE phase=execute error=%q", err)
+	}
+
+	// Anything else is a driver/SQLite failure with no usable counters.
+	return fmt.Sprintf("store_sqlite: wal checkpoint failed mode=PASSIVE error=%q", err)
 }
 
 // CheckpointWAL runs `PRAGMA wal_checkpoint(TRUNCATE)`: it flushes the
@@ -655,9 +677,20 @@ func (s *Store) checkpointWALResult(ctx context.Context) (walCheckpointResult, e
 	return result, err
 }
 
+// walCheckpointQueryer is satisfied by both *sql.DB and *sql.Conn, so a caller
+// that needs to separate connection acquisition from checkpoint execution can
+// run the PRAGMA on a connection it already holds.
+type walCheckpointQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 func (s *Store) checkpointWALOnce(ctx context.Context, mode string) (walCheckpointResult, error) {
+	return checkpointWALOnceOn(ctx, s.writerDB, mode)
+}
+
+func checkpointWALOnceOn(ctx context.Context, q walCheckpointQueryer, mode string) (walCheckpointResult, error) {
 	var result walCheckpointResult
-	err := s.writerDB.QueryRowContext(ctx, "PRAGMA wal_checkpoint("+mode+")").Scan(
+	err := q.QueryRowContext(ctx, "PRAGMA wal_checkpoint("+mode+")").Scan(
 		&result.Busy,
 		&result.WALFrames,
 		&result.CheckpointedFrames,
