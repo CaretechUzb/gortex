@@ -169,7 +169,7 @@ func (h *HybridBackend) DocCount() (int, bool) {
 	if h == nil || h.text == nil {
 		return 0, false
 	}
-	if dc, ok := h.text.(interface{ DocCount() (int, bool) }); ok {
+	if dc, ok := h.text.(DocCounter); ok {
 		return dc.DocCount()
 	}
 	return 0, false

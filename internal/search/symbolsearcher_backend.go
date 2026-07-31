@@ -112,6 +112,13 @@ func (b *SymbolSearcherBackend) SearchSymbolBundlesScoped(query string, repoAllo
 	if err != nil {
 		return nil
 	}
+	if bundles == nil {
+		// Non-nil empty = "scoped path answered: nothing in scope".
+		// Callers fall back to the unscoped fetch only on nil — a
+		// genuine zero must not trigger a doomed cross-repo flood
+		// query whose head ScopeAllows would discard wholesale.
+		return []SymbolBundle{}
+	}
 	return bundles
 }
 
@@ -179,6 +186,14 @@ func (b *SymbolSearcherBackend) Count() int {
 		return 0
 	}
 	return int(b.count.Load())
+}
+
+// DocCounter is the capability interface for the authoritative corpus
+// size — distinct from Backend.Count(), which is a process-local
+// Add/Remove delta. The engine's has-corpus gate asserts this;
+// Swappable and HybridBackend forward it.
+type DocCounter interface {
+	DocCount() (int, bool)
 }
 
 // DocCount returns the authoritative number of indexed documents, straight

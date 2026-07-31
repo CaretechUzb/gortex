@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -71,7 +72,7 @@ func TestSearchSymbolsRepoScoped_ExactNameTierRespectsScope(t *testing.T) {
 		t.Fatalf("SearchSymbolsRepoScoped: %v", err)
 	}
 	for _, h := range hits {
-		if h.NodeID == "" || h.NodeID[:4] == "nois" {
+		if strings.HasPrefix(h.NodeID, "noise/") {
 			t.Fatalf("exact-name tier leaked out-of-scope hit %q", h.NodeID)
 		}
 	}
@@ -138,6 +139,32 @@ func TestSearchSymbols_ExactNameModuleDoesNotEclipseFTS(t *testing.T) {
 	if !found["app/widget.go::WidgetExtensions"] {
 		t.Fatalf("container-kind exact-name hits eclipsed the FTS tier; hits=%+v", hits)
 	}
+	// The containers are MERGED, not dropped — a kind:module caller
+	// post-filtering these hits must still find its module.
+	if !found["module::x:app/Core/Extensions"] {
+		t.Fatalf("exact-name container hits must ride along for kind-filtered callers; hits=%+v", hits)
+	}
+}
+
+// TestSearchSymbols_ExactTypeWinsOverSiblings pins the intended
+// tier-0 contract: a symbol-kind node named exactly like the query
+// short-circuits even when same-suffix siblings exist — "I typed the
+// name, give me the name". Sibling discovery is the prefix query's job.
+func TestSearchSymbols_ExactTypeWinsOverSiblings(t *testing.T) {
+	s := floodedScopeStore(t, 3)
+	exact := "app/exact.go::Extensions"
+	s.AddNode(&graph.Node{ID: exact, Kind: graph.KindType, Name: "Extensions", Language: "go", RepoPrefix: "app"})
+	if err := s.UpsertSymbolFTS(exact, "extensions"); err != nil {
+		t.Fatalf("UpsertSymbolFTS: %v", err)
+	}
+
+	hits, err := s.SearchSymbolsRepoScoped("Extensions", []string{"app"}, 20)
+	if err != nil {
+		t.Fatalf("SearchSymbolsRepoScoped: %v", err)
+	}
+	if len(hits) != 1 || hits[0].NodeID != exact || hits[0].Score != 100.0 {
+		t.Fatalf("exact symbol-kind hit must keep the short-circuit; hits=%+v", hits)
+	}
 }
 
 // TestSearchSymbols_ExactNameTypeStillShortCircuits: a genuine
@@ -169,6 +196,32 @@ func TestSearchSymbolsRepoScoped_EmptyScopeMatchesUnscoped(t *testing.T) {
 	}
 	if len(scoped) != len(unscoped) {
 		t.Fatalf("nil-scope hits = %d, unscoped = %d — must match", len(scoped), len(unscoped))
+	}
+}
+
+// TestSearchSymbolsRepoScoped_MultipleRepos: the IN-list arity above
+// one — both allowed repos' rows return, the third stays out.
+func TestSearchSymbolsRepoScoped_MultipleRepos(t *testing.T) {
+	s := floodedScopeStore(t, 3)
+	otherID := "beta/w.go::BetaWidgetExtensions"
+	s.AddNode(&graph.Node{ID: otherID, Kind: graph.KindType, Name: "BetaWidgetExtensions", Language: "go", RepoPrefix: "beta"})
+	if err := s.UpsertSymbolFTS(otherID, "beta widget extensions"); err != nil {
+		t.Fatalf("UpsertSymbolFTS: %v", err)
+	}
+
+	hits, err := s.SearchSymbolsRepoScoped("widget", []string{"app", "beta"}, 20)
+	if err != nil {
+		t.Fatalf("SearchSymbolsRepoScoped: %v", err)
+	}
+	found := map[string]bool{}
+	for _, h := range hits {
+		found[h.NodeID] = true
+		if strings.HasPrefix(h.NodeID, "noise/") {
+			t.Fatalf("multi-repo scope leaked %q", h.NodeID)
+		}
+	}
+	if !found["app/widget.go::WidgetExtensions"] || !found[otherID] {
+		t.Fatalf("both allowed repos must return; hits=%+v", hits)
 	}
 }
 

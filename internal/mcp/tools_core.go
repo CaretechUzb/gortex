@@ -1694,10 +1694,20 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// sections sharing the query's tokens; the classic case is a
 	// suffix-convention query like "Extensions"). Refetch deeper under
 	// the same scope BEFORE the filter-dropping fallbacks below.
+	// Content sections live only in content_fts — this channel cannot
+	// rescue them, so a content-corpus wipeout skips the refetch.
 	fetchEscalated := false
-	if len(nodes) == 0 && candsAfterGather > 0 && q != "" {
+	if len(nodes) == 0 && candsAfterGather > 0 && q != "" && corpus != corpusContent {
 		for _, mult := range []int{5, 25} {
+			if ctx.Err() != nil {
+				break
+			}
 			deepLimit := fetchLimit * mult
+			// Bound the deepest fetch: past this, bundle materialisation
+			// cost dwarfs any plausible rescue.
+			if deepLimit > 2000 {
+				deepLimit = 2000
+			}
 			var refetched []*graph.Node
 			if len(expandedTerms) > 0 {
 				refetched, _ = fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, deepLimit, scope, timings)

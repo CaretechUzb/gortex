@@ -122,9 +122,14 @@ func (s *Swappable) SearchSymbolBundles(query string, limit int) []SymbolBundle 
 // warm-started daemon over a populated disk FTS isn't mistaken for an
 // empty backend.
 func (s *Swappable) DocCount() (int, bool) {
+	// Snapshot the inner backend under the lock but run the count
+	// outside it — DocCount can be a real store query and holding
+	// the RLock across it would stall a pending Swap (and, behind
+	// it, every new reader).
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if dc, ok := s.inner.(interface{ DocCount() (int, bool) }); ok {
+	inner := s.inner
+	s.mu.RUnlock()
+	if dc, ok := inner.(DocCounter); ok {
 		return dc.DocCount()
 	}
 	return 0, false

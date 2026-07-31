@@ -42,12 +42,13 @@ import (
 // implements them, routing search_symbols through on-disk FTS5 instead
 // of the in-process BM25 index.
 var (
-	_ graph.SymbolSearcher         = (*Store)(nil)
-	_ graph.SymbolFTSBatchUpserter = (*Store)(nil)
-	_ graph.SymbolFTSRepoResetter  = (*Store)(nil)
-	_ graph.SymbolFTSBatchDeleter  = (*Store)(nil)
-	_ graph.SymbolBundleSearcher   = (*Store)(nil)
-	_ graph.BundleFingerprintSink  = (*Store)(nil)
+	_ graph.SymbolSearcher             = (*Store)(nil)
+	_ graph.SymbolFTSBatchUpserter     = (*Store)(nil)
+	_ graph.SymbolFTSRepoResetter      = (*Store)(nil)
+	_ graph.SymbolFTSBatchDeleter      = (*Store)(nil)
+	_ graph.SymbolBundleSearcher       = (*Store)(nil)
+	_ graph.ScopedSymbolBundleSearcher = (*Store)(nil)
+	_ graph.BundleFingerprintSink      = (*Store)(nil)
 )
 
 // ftsInsertChunkRows bounds the rows per multi-row INSERT. Each FTS row
@@ -522,9 +523,11 @@ func (s *Store) SearchSymbols(query string, limit int) ([]graph.SymbolHit, error
 // SearchSymbolsRepoScoped is SearchSymbols narrowed to the repoAllow
 // prefixes inside the queries themselves — a post-fetch scope filter
 // starves whenever another repo owns the whole BM25 head, which can
-// run deeper than any bounded over-fetch. repo_prefix is the same
-// UNINDEXED literal column the per-repo staleness wipe filters on.
-// A nil / empty repoAllow is the exact unscoped behaviour.
+// run deeper than any bounded over-fetch. Filtering the UNINDEXED
+// repo_prefix column here is free: the rows are already materialised
+// by the MATCH + bm25 ORDER BY (the plan is identical with and
+// without the IN). A nil / empty repoAllow is the exact unscoped
+// behaviour.
 func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit int) ([]graph.SymbolHit, error) {
 	if query == "" {
 		return nil, nil
