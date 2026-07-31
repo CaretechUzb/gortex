@@ -1,6 +1,52 @@
 package analysis
 
-import "testing"
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// The cases above spell their inputs with forward slashes, which is what a
+// POSIX graph stores — but graphRelKey keeps OS-native separators, so on
+// Windows a real graph path reads "gortex/internal\parser\languages\cpp.go":
+// the repo prefix is joined with "/" and the repo-relative remainder is not.
+// Feeding that shape in is what distinguishes "normalises first" from "happens
+// to work because the test used slashes". filepath.FromSlash makes the input
+// native on whichever platform runs it, so this is a real assertion on Windows
+// and an identity on POSIX rather than a skip.
+func TestClusterLabelsNormaliseOSNativeGraphPaths(t *testing.T) {
+	// Mirror the "<prefix>/<os-native remainder>" shape graph nodes carry.
+	native := func(prefix, rel string) string {
+		return prefix + "/" + filepath.FromSlash(rel)
+	}
+	files := []string{
+		native("gortex", "internal/parser/languages/cpp.go"),
+		native("gortex", "internal/parser/languages/dart.go"),
+		native("gortex", "internal/parser/languages/python.go"),
+	}
+
+	if got := pureClusterLabel(files); got != "parser/languages" {
+		t.Errorf("pureClusterLabel(%v) = %q; want %q", files, got, "parser/languages")
+	}
+
+	// A label must never leak the OS separator to the wire, whichever branch
+	// produced it.
+	for _, got := range []string{pureClusterLabel(files), mixedClusterLabel(files)} {
+		if filepath.Separator != '/' && strings.ContainsRune(got, filepath.Separator) {
+			t.Errorf("label %q carries the OS separator", got)
+		}
+	}
+
+	// Spread across sibling directories: the shared ancestor is still found,
+	// so the modal-directory branch reports a real prefix rather than "".
+	mixed := []string{
+		native("gortex", "internal/parser/languages/cpp.go"),
+		native("gortex", "internal/parser/golang/extract.go"),
+	}
+	if got := longestCommonDirPrefix(mixed); got != "gortex/internal/parser" {
+		t.Errorf("longestCommonDirPrefix(%v) = %q; want %q", mixed, got, "gortex/internal/parser")
+	}
+}
 
 func TestPureClusterLabel(t *testing.T) {
 	tests := []struct {
