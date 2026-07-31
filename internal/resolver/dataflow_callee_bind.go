@@ -42,19 +42,17 @@ import (
 // callee to its param node).
 func (r *Resolver) bindDataflowCalleeRefs() {
 	idx := newCalleeIndex()
-	for _, k := range []graph.NodeKind{graph.KindFunction, graph.KindMethod} {
-		for n := range r.graph.NodesByKind(k) {
-			if n == nil || n.Name == "" || n.FilePath == "" {
-				continue
-			}
-			indexName(idx.byFile, n.FilePath, n.Name, n.ID)
-			if k == graph.KindFunction {
-				indexName(idx.byDir, filepath.Dir(n.FilePath), n.Name, n.ID)
-			}
+	for node := range graph.CallableBindingNodesSeq(r.graph, graph.KindFunction, graph.KindMethod) {
+		if node.Name == "" || node.FilePath == "" {
+			continue
+		}
+		indexName(idx.byFile, node.FilePath, node.Name, node.ID)
+		if node.Kind == graph.KindFunction {
+			indexName(idx.byDir, filepath.Dir(node.FilePath), node.Name, node.ID)
 		}
 	}
 	for _, k := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
-		for e := range r.graph.EdgesByKind(k) {
+		for e := range graph.EdgesLightSeq(r.graph, k) {
 			idx.indexCallSite(e)
 		}
 	}

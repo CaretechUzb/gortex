@@ -30,7 +30,7 @@ func (r *Resolver) resolveRelativeImports() {
 		!r.graphHasLanguage("php") {
 		return
 	}
-	fileLang := r.collectFileLanguages()
+	fileLang := make(map[string]string, 1024)
 	var reindexBatch []graph.EdgeReindex
 
 	// Pre-build a map of every KindFile node's ID. The relative-
@@ -45,15 +45,17 @@ func (r *Resolver) resolveRelativeImports() {
 	// C-family include (`foo/bar.h`) can be resolved against an include root
 	// without enumerating the whole file set per include (the `-I` search).
 	filesByBase := make(map[string][]string, 1024)
-	for n := range r.graph.NodesByKind(graph.KindFile) {
-		if n != nil && n.ID != "" {
-			fileIDs[n.ID] = struct{}{}
-			base := n.ID
-			if i := strings.LastIndex(n.ID, "/"); i >= 0 {
-				base = n.ID[i+1:]
-			}
-			filesByBase[base] = append(filesByBase[base], n.ID)
+	for file := range graph.FileLanguageNodesSeq(r.graph) {
+		if file.ID == "" {
+			continue
 		}
+		fileLang[file.ID] = file.Language
+		fileIDs[file.ID] = struct{}{}
+		base := file.ID
+		if i := strings.LastIndex(file.ID, "/"); i >= 0 {
+			base = file.ID[i+1:]
+		}
+		filesByBase[base] = append(filesByBase[base], file.ID)
 	}
 	resolvePython := func(stem string) string {
 		if !strings.Contains(stem, "/") {

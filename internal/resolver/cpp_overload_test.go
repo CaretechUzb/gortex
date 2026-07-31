@@ -11,19 +11,19 @@ func TestCppConversionRank(t *testing.T) {
 	ptr := cppShape{isPointer: true}
 	ellipsis := cppShape{}
 	cases := []struct {
-		arg, param   string
-		ash, psh     cppShape
-		want         int
+		arg, param string
+		ash, psh   cppShape
+		want       int
 	}{
-		{"int", "int", v, v, 0},          // exact
-		{"int", "int", v, ptr, cppRankInf}, // value≠pointer (shape-aware)
-		{"int", "int", ptr, ptr, 0},      // pointer exact
-		{"char", "int", v, v, 1},         // integral promotion
-		{"bool", "int", v, v, 1},         // bool→int promotion
-		{"int", "double", v, v, 2},       // arithmetic standard
-		{"null", "int", v, ptr, 2},       // nullptr→T*
-		{"null", "bool", v, v, 3},        // nullptr→bool (worse than →T*)
-		{"int", "...", v, ellipsis, 5},   // ellipsis
+		{"int", "int", v, v, 0},             // exact
+		{"int", "int", v, ptr, cppRankInf},  // value≠pointer (shape-aware)
+		{"int", "int", ptr, ptr, 0},         // pointer exact
+		{"char", "int", v, v, 1},            // integral promotion
+		{"bool", "int", v, v, 1},            // bool→int promotion
+		{"int", "double", v, v, 2},          // arithmetic standard
+		{"null", "int", v, ptr, 2},          // nullptr→T*
+		{"null", "bool", v, v, 3},           // nullptr→bool (worse than →T*)
+		{"int", "...", v, ellipsis, 5},      // ellipsis
 		{"string", "int", v, v, cppRankInf}, // mismatch
 	}
 	for _, c := range cases {

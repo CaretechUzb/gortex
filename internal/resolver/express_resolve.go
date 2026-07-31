@@ -120,7 +120,7 @@ func expressResolveMember(g graph.Store, cls, method, fromFile string, classMeth
 // via the EdgeMemberOf edges.
 func expressClassMethodIndex(g graph.Store) map[string]map[string][]*graph.Node {
 	classOf := map[string]string{}
-	for e := range g.EdgesByKind(graph.EdgeMemberOf) {
+	for e := range graph.EdgesLightSeq(g, graph.EdgeMemberOf) {
 		if e != nil && e.From != "" && e.To != "" {
 			classOf[e.From] = expressSimpleName(e.To)
 		}

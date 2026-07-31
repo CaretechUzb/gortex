@@ -25,7 +25,7 @@ func (idx *placeholderSourceIndex) ensure(g graph.Store) {
 	}
 	idx.built = true
 	for _, kind := range []graph.EdgeKind{graph.EdgeArgOf, graph.EdgeValueFlow} {
-		for e := range g.EdgesByKind(kind) {
+		for e := range graph.EdgesLightSeq(g, kind) {
 			if e == nil || !strings.Contains(e.From, graph.UnresolvedMarker) {
 				continue
 			}

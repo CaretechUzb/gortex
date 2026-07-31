@@ -136,7 +136,7 @@ func springListenersFor(evType string, byType map[string][]*graph.Node, parents 
 func springTypeParents(g graph.Store) map[string][]string {
 	parents := map[string][]string{}
 	add := func(kind graph.EdgeKind) {
-		for e := range g.EdgesByKind(kind) {
+		for e := range graph.EdgesLightSeq(g, kind) {
 			if e == nil || e.From == "" || e.To == "" {
 				continue
 			}

@@ -103,7 +103,7 @@ func (r *Resolver) attributeNonGoModuleImports() {
 	// read on every backend, plus a Go-side map build that turns
 	// the per-rewrite check into a constant-time lookup.
 	existingDepends := make(map[string]map[string]struct{})
-	for e := range r.graph.EdgesByKind(graph.EdgeDependsOnModule) {
+	for e := range graph.EdgesLightSeq(r.graph, graph.EdgeDependsOnModule) {
 		// Only the rewrites' own callers (in scope) are queried below, so a
 		// scoped pass needs the dedupe index for just those repos.
 		if !r.edgeFromInScope(e.From) {
@@ -164,8 +164,8 @@ func (r *Resolver) attributeNonGoModuleImports() {
 // (file ID → language) for the per-edge dispatch above.
 func (r *Resolver) collectFileLanguages() map[string]string {
 	out := map[string]string{}
-	for n := range r.graph.NodesByKind(graph.KindFile) {
-		out[n.ID] = n.Language
+	for file := range graph.FileLanguageNodesSeq(r.graph) {
+		out[file.ID] = file.Language
 	}
 	return out
 }

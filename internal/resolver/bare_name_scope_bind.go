@@ -51,22 +51,13 @@ func (r *Resolver) bindBareNameScopeRefs() {
 	// once up front so the per-edge bind is an O(matching-name) walk
 	// rather than a graph-wide FindNodesByName.
 	owned := map[string][]scopeNode{}
-	for n := range r.graph.NodesByKind(graph.KindLocal) {
-		owner := enclosingFunctionForBinding(n.ID)
+	for node := range graph.ScopeBindingNodesSeq(r.graph, graph.KindLocal, graph.KindParam) {
+		owner := enclosingFunctionForBinding(node.ID)
 		if owner == "" {
 			continue
 		}
 		owned[owner] = append(owned[owner], scopeNode{
-			id: n.ID, name: n.Name, startLine: n.StartLine, kind: graph.KindLocal,
-		})
-	}
-	for n := range r.graph.NodesByKind(graph.KindParam) {
-		owner := enclosingFunctionForBinding(n.ID)
-		if owner == "" {
-			continue
-		}
-		owned[owner] = append(owned[owner], scopeNode{
-			id: n.ID, name: n.Name, startLine: n.StartLine, kind: graph.KindParam,
+			id: node.ID, name: node.Name, startLine: node.StartLine, kind: node.Kind,
 		})
 	}
 	if len(owned) == 0 {

@@ -123,7 +123,7 @@ func railsRefDirs(recv string) (isModel bool, dirs []string) {
 // ActiveRecord models — those with an outgoing EdgeModelsTable.
 func railsModelClassSet(g graph.Store) map[string]bool {
 	out := map[string]bool{}
-	for e := range g.EdgesByKind(graph.EdgeModelsTable) {
+	for e := range graph.EdgesLightSeq(g, graph.EdgeModelsTable) {
 		if e != nil && e.From != "" {
 			out[e.From] = true
 		}
@@ -135,7 +135,7 @@ func railsModelClassSet(g graph.Store) map[string]bool {
 // ID via the EdgeMemberOf edges.
 func railsClassMethodIndex(g graph.Store) map[string]map[string]string {
 	classOf := map[string]string{}
-	for e := range g.EdgesByKind(graph.EdgeMemberOf) {
+	for e := range graph.EdgesLightSeq(g, graph.EdgeMemberOf) {
 		if e != nil && e.From != "" && e.To != "" {
 			classOf[e.From] = e.To
 		}

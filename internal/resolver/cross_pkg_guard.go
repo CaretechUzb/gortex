@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"go.uber.org/zap"
@@ -391,15 +392,22 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 		}
 		set[dir] = struct{}{}
 	}
-	for n := range r.graph.NodesByKind(graph.KindFile) {
-		if n.FilePath != "" && inScope(n.ID) {
-			add(n.FilePath, filepath.Dir(n.FilePath))
+	var repoPrefixes []string
+	if repos != nil {
+		repoPrefixes = make([]string, 0, len(repos))
+		for prefix := range repos {
+			repoPrefixes = append(repoPrefixes, prefix)
+		}
+		sort.Strings(repoPrefixes)
+	}
+	for file := range graph.FileNodeIdentitiesSeq(r.graph, repoPrefixes) {
+		if file.FilePath != "" && inScope(file.ID) {
+			add(file.FilePath, filepath.Dir(file.FilePath))
 		}
 	}
-	// Materialise the resolved import edges and batch-load their endpoints
-	// (caller file + target) in one GetNodesByIDs — a per-edge GetNode here
-	// is a query round-trip per import on a disk backend. Inlines
-	// edgeCallerFile's cached-node logic against the batch map.
+	// Materialise metadata-free import projections and batch-load only the
+	// endpoint placement fields needed by the closure. A per-edge point lookup
+	// here would be a query round-trip per import on a disk backend.
 	//
 	// Re-export edges ride the same batch: an import that lands on a
 	// barrel (`import { persist } from 'zustand/middleware'` resolving to
@@ -425,7 +433,7 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 			ids[e.To] = struct{}{}
 		}
 	}
-	for e := range r.graph.EdgesByKind(graph.EdgeImports) {
+	for e := range graph.EdgesLightSeq(r.graph, graph.EdgeImports) {
 		// Skip imports still pointing at an unresolved placeholder or an
 		// out-of-repo stub — neither names an in-repo directory that a
 		// name-only call candidate could legitimately live in.
@@ -440,7 +448,7 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 		imports = append(imports, e)
 		collect(e)
 	}
-	for e := range r.graph.EdgesByKind(graph.EdgeReExports) {
+	for e := range graph.EdgesLightSeq(r.graph, graph.EdgeReExports) {
 		if skipTarget(e.To) {
 			continue
 		}
@@ -454,7 +462,7 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 	for id := range ids {
 		idList = append(idList, id)
 	}
-	nodes := r.graph.GetNodesByIDs(idList)
+	placements := graph.NodePlacementsByIDs(r.graph, idList)
 
 	// Direct barrel-file → re-export-target-file map, then a memoised
 	// transitive walk so chained barrels (src/index.ts → src/middleware.ts
@@ -462,11 +470,11 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 	reexpTargets := make(map[string][]string)
 	for _, e := range reexports {
 		barrel := e.FilePath
-		if n := nodes[e.From]; n != nil && n.FilePath != "" {
-			barrel = n.FilePath
+		if from, ok := placements[e.From]; ok && from.FilePath != "" {
+			barrel = from.FilePath
 		}
-		if t := nodes[e.To]; t != nil && t.FilePath != "" && barrel != "" {
-			reexpTargets[barrel] = append(reexpTargets[barrel], t.FilePath)
+		if to, ok := placements[e.To]; ok && to.FilePath != "" && barrel != "" {
+			reexpTargets[barrel] = append(reexpTargets[barrel], to.FilePath)
 		}
 	}
 	barrelDirCache := make(map[string][]string)
@@ -490,10 +498,10 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 
 	for _, e := range imports {
 		callerFile := e.FilePath
-		if n := nodes[e.From]; n != nil && n.FilePath != "" {
-			callerFile = n.FilePath
+		if from, ok := placements[e.From]; ok && from.FilePath != "" {
+			callerFile = from.FilePath
 		}
-		if target := nodes[e.To]; target != nil && target.FilePath != "" {
+		if target, ok := placements[e.To]; ok && target.FilePath != "" {
 			add(callerFile, filepath.Dir(target.FilePath))
 			for _, d := range barrelDirs(target.FilePath, map[string]bool{}) {
 				add(callerFile, d)

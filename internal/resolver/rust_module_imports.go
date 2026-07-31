@@ -46,9 +46,9 @@ func resolveRustModuleImports(g graph.Store) int {
 	}
 
 	fileIDs := make(map[string]struct{}, 1024)
-	for n := range g.NodesByKind(graph.KindFile) {
-		if n != nil && n.ID != "" {
-			fileIDs[n.ID] = struct{}{}
+	for _, id := range graph.NodeIDsForKinds(g, graph.KindFile) {
+		if id != "" {
+			fileIDs[id] = struct{}{}
 		}
 	}
 

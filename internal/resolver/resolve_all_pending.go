@@ -295,15 +295,15 @@ func (p *resolveAllPassIndexes) ensureDir(prefixes []string) {
 		return
 	}
 	if p.resolver.dirIndex == nil {
-		p.resolver.dirIndex = make(map[string][]*graph.Node, 128)
-		p.resolver.lastDirIndex = make(map[string][]*graph.Node, 128)
+		p.resolver.dirIndex = make(map[string][]graph.FileNodeIdentity, 128)
+		p.resolver.lastDirIndex = make(map[string][]graph.FileNodeIdentity, 128)
 	}
-	for node := range graph.NodesInScopeSeq(p.resolver.graph, missing, nil, graph.KindFile) {
-		dir := filepath.Dir(node.FilePath)
-		p.resolver.dirIndex[dir] = append(p.resolver.dirIndex[dir], node)
+	for file := range graph.FileNodeIdentitiesSeq(p.resolver.graph, missing) {
+		dir := filepath.Dir(file.FilePath)
+		p.resolver.dirIndex[dir] = append(p.resolver.dirIndex[dir], file)
 		last := lastPathComponent(dir)
 		if last != "" && last != dir {
-			p.resolver.lastDirIndex[last] = append(p.resolver.lastDirIndex[last], node)
+			p.resolver.lastDirIndex[last] = append(p.resolver.lastDirIndex[last], file)
 		}
 	}
 }
@@ -324,7 +324,7 @@ func (p *resolveAllPassIndexes) ensureDep(prefixes []string) {
 	if p.resolver.depModuleIndex == nil {
 		p.resolver.depModuleIndex = make(map[string][]depModuleEntry)
 	}
-	for node := range graph.NodesInScopeSeq(p.resolver.graph, missing, nil, graph.KindContract) {
+	for node := range graph.RepoNodeIdentitiesSeq(p.resolver.graph, missing, graph.KindContract) {
 		if !strings.HasPrefix(node.ID, "dep::") {
 			continue
 		}
@@ -334,7 +334,7 @@ func (p *resolveAllPassIndexes) ensureDep(prefixes []string) {
 		}
 		p.resolver.depModuleIndex[node.RepoPrefix] = append(
 			p.resolver.depModuleIndex[node.RepoPrefix],
-			depModuleEntry{modulePath: modulePath, node: node},
+			depModuleEntry{modulePath: modulePath, nodeID: node.ID},
 		)
 	}
 	for _, prefix := range missing {

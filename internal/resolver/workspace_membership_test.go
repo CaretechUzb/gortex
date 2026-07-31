@@ -114,24 +114,24 @@ func TestResolveImport_WorkspaceLookupNoMatchKeepsFirstHit(t *testing.T) {
 
 // TestPickSameWorkspaceFile_AmbiguousLeavesTieBreak pins the unit
 // contract: when several candidates share the importer's workspace the
-// helper returns nil so the caller's existing tie-break decides.
+// helper reports no unique match so the caller's existing tie-break decides.
 func TestPickSameWorkspaceFile_AmbiguousLeavesTieBreak(t *testing.T) {
 	caller := "packages/app/src/main.ts"
-	candidates := []*graph.Node{
-		{ID: "packages/app/a/logger.ts", Kind: graph.KindFile, FilePath: "packages/app/a/logger.ts"},
-		{ID: "packages/app/b/logger.ts", Kind: graph.KindFile, FilePath: "packages/app/b/logger.ts"},
+	candidates := []graph.FileNodeIdentity{
+		{ID: "packages/app/a/logger.ts", FilePath: "packages/app/a/logger.ts"},
+		{ID: "packages/app/b/logger.ts", FilePath: "packages/app/b/logger.ts"},
 	}
-	if got := pickSameWorkspaceFile(memberOf, caller, candidates); got != nil {
+	if got, ok := pickSameWorkspaceFile(memberOf, caller, candidates); ok {
 		t.Errorf("two candidates in the importer's workspace should be ambiguous, got %q", got.ID)
 	}
 
 	// A single same-workspace candidate among decoys resolves cleanly.
-	candidates = []*graph.Node{
-		{ID: "packages/admin/logger.ts", Kind: graph.KindFile, FilePath: "packages/admin/logger.ts"},
-		{ID: "packages/app/logger.ts", Kind: graph.KindFile, FilePath: "packages/app/logger.ts"},
+	candidates = []graph.FileNodeIdentity{
+		{ID: "packages/admin/logger.ts", FilePath: "packages/admin/logger.ts"},
+		{ID: "packages/app/logger.ts", FilePath: "packages/app/logger.ts"},
 	}
-	got := pickSameWorkspaceFile(memberOf, caller, candidates)
-	if got == nil || got.ID != "packages/app/logger.ts" {
+	got, ok := pickSameWorkspaceFile(memberOf, caller, candidates)
+	if !ok || got.ID != "packages/app/logger.ts" {
 		t.Errorf("expected the packages/app candidate, got %v", got)
 	}
 }

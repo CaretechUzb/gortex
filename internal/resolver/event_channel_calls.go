@@ -89,7 +89,7 @@ func ResolveEventChannelCalls(g graph.Store) int {
 	}
 
 	listenersByEvent := map[string][]string{}
-	for e := range g.EdgesByKind(graph.EdgeListensOn) {
+	for e := range graph.EdgesLightSeq(g, graph.EdgeListensOn) {
 		if e == nil || e.To == "" || e.From == "" {
 			continue
 		}

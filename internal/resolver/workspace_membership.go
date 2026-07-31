@@ -49,41 +49,39 @@ func (cr *CrossRepoResolver) SetWorkspaceMembership(fn WorkspaceMembership) {
 // when an import of a bare name (`logger`) matches a directory in two
 // different workspace members, the member that belongs to the
 // importer's own workspace wins.
-func (r *Resolver) preferSameWorkspaceFile(callerFile string, candidates []*graph.Node) *graph.Node {
+func (r *Resolver) preferSameWorkspaceFile(callerFile string, candidates []graph.FileNodeIdentity) (graph.FileNodeIdentity, bool) {
 	return pickSameWorkspaceFile(r.workspaceMembers, callerFile, candidates)
 }
 
 // preferSameWorkspaceFile is the CrossRepoResolver counterpart — same
 // rule, same contract.
-func (cr *CrossRepoResolver) preferSameWorkspaceFile(callerFile string, candidates []*graph.Node) *graph.Node {
+func (cr *CrossRepoResolver) preferSameWorkspaceFile(callerFile string, candidates []graph.FileNodeIdentity) (graph.FileNodeIdentity, bool) {
 	return pickSameWorkspaceFile(cr.workspaceMembers, callerFile, candidates)
 }
 
 // pickSameWorkspaceFile is the shared body of the two
 // preferSameWorkspaceFile methods.
-func pickSameWorkspaceFile(fn WorkspaceMembership, callerFile string, candidates []*graph.Node) *graph.Node {
+func pickSameWorkspaceFile(fn WorkspaceMembership, callerFile string, candidates []graph.FileNodeIdentity) (graph.FileNodeIdentity, bool) {
 	if fn == nil || callerFile == "" || len(candidates) < 2 {
-		return nil
+		return graph.FileNodeIdentity{}, false
 	}
 	callerWS := fn(callerFile)
 	if callerWS == "" {
-		return nil
+		return graph.FileNodeIdentity{}, false
 	}
-	var match *graph.Node
-	for _, n := range candidates {
-		if n == nil || n.Kind != graph.KindFile {
+	var match graph.FileNodeIdentity
+	found := false
+	for _, file := range candidates {
+		if fn(file.FilePath) != callerWS {
 			continue
 		}
-		if fn(n.FilePath) != callerWS {
-			continue
-		}
-		if match != nil {
+		if found {
 			// More than one candidate sits in the importer's
 			// workspace — the workspace does not disambiguate, so
 			// defer to the caller's existing tie-break.
-			return nil
+			return graph.FileNodeIdentity{}, false
 		}
-		match = n
+		match, found = file, true
 	}
-	return match
+	return match, found
 }
