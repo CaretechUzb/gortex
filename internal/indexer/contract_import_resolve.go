@@ -4,6 +4,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -20,12 +21,27 @@ func (mi *MultiIndexer) disambiguateBareTypesViaImportsBatch(registries []*contr
 	srcCache := map[string][]byte{}
 	importCache := map[string]map[string]string{}
 	nameSet := map[string]struct{}{}
+
+	// A bare type is resolved through the imports of the file that mentions
+	// it — the file defining the contract's symbol. For a route registered in
+	// one file and handled in another that is not c.FilePath, which names the
+	// registration site, so resolve the symbol's own file first. One batched
+	// node lookup, mirroring the FindNodesByNames projection below.
+	srcByContract := handlerSourceFiles(registries, g)
+	srcFile := func(c contracts.Contract) string {
+		if p := srcByContract[c.SymbolID]; p != "" {
+			return p
+		}
+		return c.FilePath
+	}
+
 	for _, cr := range registries {
 		if cr == nil {
 			continue
 		}
 		for _, c := range cr.All() {
-			if c.Meta == nil || !isImportResolvableLang(c.FilePath) {
+			src := srcFile(c)
+			if c.Meta == nil || !isImportResolvableLang(src) {
 				continue
 			}
 			for _, key := range []string{"response_type", "request_type"} {
@@ -34,8 +50,8 @@ func (mi *MultiIndexer) disambiguateBareTypesViaImportsBatch(registries []*contr
 					continue
 				}
 				nameSet[name] = struct{}{}
-				if isRustFile(c.FilePath) {
-					for _, candidateName := range mi.rustImportCandidateNames(c.FilePath, name, srcCache) {
+				if isRustFile(src) {
+					for _, candidateName := range mi.rustImportCandidateNames(src, name, srcCache) {
 						nameSet[candidateName] = struct{}{}
 					}
 				}
@@ -52,8 +68,40 @@ func (mi *MultiIndexer) disambiguateBareTypesViaImportsBatch(registries []*contr
 		if cr == nil {
 			continue
 		}
-		mi.disambiguateBareTypesViaImportsPrefetched(cr, srcCache, importCache, candidatesByName)
+		mi.disambiguateBareTypesViaImportsPrefetched(cr, srcCache, importCache, candidatesByName, srcByContract)
 	}
+}
+
+// handlerSourceFiles maps a contract's SymbolID to the file its symbol is
+// defined in. Contracts whose symbol is unknown or absent from the graph are
+// omitted; callers fall back to Contract.FilePath for those.
+func handlerSourceFiles(registries []*contracts.Registry, g graph.Store) map[string]string {
+	idSet := map[string]struct{}{}
+	for _, cr := range registries {
+		if cr == nil {
+			continue
+		}
+		for _, c := range cr.All() {
+			if c.SymbolID != "" {
+				idSet[c.SymbolID] = struct{}{}
+			}
+		}
+	}
+	if len(idSet) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make(map[string]string, len(ids))
+	for id, n := range g.GetNodesByIDs(ids) {
+		if n != nil && n.FilePath != "" {
+			out[id] = n.FilePath
+		}
+	}
+	return out
 }
 
 func (mi *MultiIndexer) disambiguateBareTypesViaImportsPrefetched(
@@ -61,17 +109,26 @@ func (mi *MultiIndexer) disambiguateBareTypesViaImportsPrefetched(
 	srcCache map[string][]byte,
 	importCache map[string]map[string]string,
 	candidatesByName map[string][]*graph.Node,
+	srcByContract map[string]string,
 ) {
 	for _, c := range cr.All() {
 		if c.Meta == nil {
 			continue
 		}
-		if !isImportResolvableLang(c.FilePath) {
+		// The imports to consult are the ones in the file defining this
+		// contract's symbol, not the file it was registered in.
+		src := c.FilePath
+		if p := srcByContract[c.SymbolID]; p != "" {
+			src = p
+		}
+		if !isImportResolvableLang(src) {
 			continue
 		}
 		patched := false
 		items := cr.ByID(c.ID)
 		for i := range items {
+			// FilePath still identifies which registry entry this is —
+			// registration site, unchanged.
 			if items[i].FilePath != c.FilePath || items[i].Meta == nil {
 				continue
 			}
@@ -80,7 +137,7 @@ func (mi *MultiIndexer) disambiguateBareTypesViaImportsPrefetched(
 				if name == "" || strings.Contains(name, "::") {
 					continue
 				}
-				resolved := mi.resolveBareTypeViaImportsPrefetched(c.FilePath, name, srcCache, importCache, candidatesByName)
+				resolved := mi.resolveBareTypeViaImportsPrefetched(src, name, srcCache, importCache, candidatesByName)
 				if resolved == "" {
 					continue
 				}

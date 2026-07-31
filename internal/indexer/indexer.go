@@ -6536,6 +6536,15 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 			}
 			// Operate on a copy; Registry entries are values.
 			patched := c
+			// FilePath is swapped to the handler's file only so the enricher
+			// can read that file's tree. Line is not swapped with it — it
+			// keeps describing the registration site — so leaving the
+			// handler's file in place would pair a file and a line that come
+			// from two different places, and every consumer citing file:line
+			// would point at unrelated code (issue #322). Restore it once
+			// enrichment is done. SymbolID stays re-pointed: the resolved
+			// handler is the answer that lookup exists to produce.
+			registrationFile := patched.FilePath
 			patched.SymbolID = handlerNode.ID
 			patched.FilePath = handlerNode.FilePath
 			if patched.Meta == nil {
@@ -6546,6 +6555,7 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 			// want the call-path to be identical to Stage 1).
 			lines := splitLines(src)
 			contracts.EnrichHTTPContractWithTree(&patched, lines, nodes, lang, tree)
+			patched.FilePath = registrationFile
 			delete(patched.Meta, "handler_ident")
 			delete(patched.Meta, "handler_trail")
 			matches[i] = patched
@@ -7095,7 +7105,18 @@ func (idx *Indexer) prepareContractTypeResolution(
 		if len(names) == 0 {
 			continue
 		}
-		bf := bfCache.For(handlers[c.SymbolID])
+		handlerNode := handlers[c.SymbolID]
+		bf := bfCache.For(handlerNode)
+		// binding.Line comes from the handler's body, and the compiler
+		// bindings this site is looked up against are stored under the
+		// handler's own source file. c.FilePath names the registration site,
+		// which for a cross-file route is a different file — pairing the two
+		// would query <registration file>:<handler line> and either miss the
+		// binding or hit an unrelated one at the same line.
+		siteFile := c.FilePath
+		if handlerNode != nil && handlerNode.FilePath != "" {
+			siteFile = handlerNode.FilePath
+		}
 		for _, name := range names {
 			key := contractBindingKeyFor(c, name)
 			if _, exists := resolution.bindings[key]; exists {
@@ -7108,7 +7129,7 @@ func (idx *Indexer) prepareContractTypeResolution(
 			}
 			site := graph.SemanticBindingSite{
 				RepoPrefix: c.RepoPrefix,
-				FilePath:   c.FilePath,
+				FilePath:   siteFile,
 				Line:       binding.Line,
 				Name:       name,
 			}
