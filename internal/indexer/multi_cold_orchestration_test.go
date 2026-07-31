@@ -225,7 +225,10 @@ func serialColdReference(t *testing.T, repos []config.RepoEntry) *MultiIndexer {
 		idx.SetWorkspaceID(prefix)
 		idx.SetProjectID(prefix)
 		idx.SetDeferResolve(true)
-		result, err := idx.Index(absPath)
+		// Match the production cold path: this Indexer is not live until the
+		// serial fixture publishes it below, so initialize it with the raw
+		// primitive while the fixture owns orchestration.
+		result, err := idx.indexCtxRaw(context.Background(), absPath)
 		require.NoError(t, err)
 		result.RepoPrefix = prefix
 		mi.indexers[prefix] = idx

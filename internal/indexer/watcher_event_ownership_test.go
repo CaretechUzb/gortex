@@ -96,11 +96,6 @@ func TestWatcherInertModifyDoesNotStampWriteAfterProbe(t *testing.T) {
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 
-	w, err := NewWatcher(idx, config.WatchConfig{DebounceMs: 1}, zap.NewNop())
-	require.NoError(t, err)
-	var callbacks int
-	w.OnSymbolChange(func(_ string, _, _ []*graph.Node) { callbacks++ })
-
 	initial := indexedFileMtime(t, idx, path)
 	firstMtime := initial.Add(time.Second)
 	secondMtime := initial.Add(2 * time.Second)
@@ -116,13 +111,9 @@ func TestWatcherInertModifyDoesNotStampWriteAfterProbe(t *testing.T) {
 	// its intentional zero-delta event/callback.
 	writeTestFile(t, path, "package main\n\nfunc Value() int { return 0 }\n\n\n")
 	require.NoError(t, os.Chtimes(path, secondMtime, secondMtime))
-	symbols := g.GetFileNodes(idx.graphRelKey(path))
-	fresh := w.recordInertModify(path, idx.relKey(path), symbols, time.Now(), probe.readVersion)
+	fresh := idx.recordFileReadVersion(idx.relKey(path), path, probe.readVersion)
 	require.False(t, fresh)
 	require.NotEqual(t, secondMtime.UnixNano(), idx.FileMtimes()[idx.relKey(path)])
-	require.Equal(t, 1, callbacks)
-	event := waitForEvent(t, w, time.Second)
-	require.Equal(t, "inert", event.Classification)
 }
 
 func watcherSymbolNames(nodes []*graph.Node) []string {

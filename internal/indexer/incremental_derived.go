@@ -7,6 +7,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/entrypoints"
+	"github.com/zzet/gortex/internal/reach"
 	"github.com/zzet/gortex/internal/resolver"
 )
 
@@ -39,7 +40,7 @@ type IncrementalDerivedReport struct {
 // contains only this repository; real shared-graph callers must use their owning
 // MultiIndexer so contract and cross-repository passes see every sibling.
 func (idx *Indexer) runStandaloneIncrementalDerivedPasses(plan DerivedInvalidationPlan) IncrementalDerivedReport {
-	if idx == nil || idx.graph == nil || idx.deferGlobalPasses || plan.Empty() {
+	if idx == nil || idx.graph == nil || idx.deferGlobalPasses.Load() || plan.Empty() {
 		return IncrementalDerivedReport{}
 	}
 	logger := idx.logger
@@ -53,7 +54,7 @@ func (idx *Indexer) runStandaloneIncrementalDerivedPasses(plan DerivedInvalidati
 		RepoPrefix: prefix,
 		RootPath:   idx.RootPath(),
 	}
-	return mi.RunIncrementalDerivedPasses(context.Background(), map[string]DerivedInvalidationPlan{
+	return mi.runIncrementalDerivedPassesTopologyHeld(context.Background(), map[string]DerivedInvalidationPlan{
 		prefix: plan,
 	})
 }
@@ -62,6 +63,46 @@ func (idx *Indexer) runStandaloneIncrementalDerivedPasses(plan DerivedInvalidati
 // by the exact per-file plans. A legacy database without persisted fingerprints
 // takes the old scoped-global path once; ordinary body/metadata edits never do.
 func (mi *MultiIndexer) RunIncrementalDerivedPasses(
+	ctx context.Context,
+	plans map[string]DerivedInvalidationPlan,
+) IncrementalDerivedReport {
+	if mi == nil || mi.graph == nil || len(plans) == 0 {
+		return IncrementalDerivedReport{}
+	}
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return IncrementalDerivedReport{}
+		default:
+		}
+	}
+	hasWork := false
+	for _, plan := range plans {
+		if !plan.Empty() {
+			hasWork = true
+			break
+		}
+	}
+	if !hasWork {
+		return IncrementalDerivedReport{}
+	}
+	mi.batchMutationGate.Lock()
+	defer mi.batchMutationGate.Unlock()
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return IncrementalDerivedReport{}
+		default:
+		}
+	}
+	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
+	defer finishTopologyMutation(true)
+	return mi.runIncrementalDerivedPassesTopologyHeld(ctx, plans)
+}
+
+// runIncrementalDerivedPassesTopologyHeld is the non-reentrant implementation
+// for mutation pipelines that already own the global topology writer.
+func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 	ctx context.Context,
 	plans map[string]DerivedInvalidationPlan,
 ) IncrementalDerivedReport {
@@ -99,8 +140,9 @@ func (mi *MultiIndexer) RunIncrementalDerivedPasses(
 	}
 
 	if merged.LegacyFallback {
-		mi.ArmBatchScope(prefixSet)
-		mi.RunGlobalGraphPasses(ctx)
+		// Legacy fingerprints need a scoped global rebuild, but this one-off
+		// fallback must not arm or consume an unrelated active batch.
+		mi.runGlobalGraphPassesTopologyHeld(ctx, prefixSet, false)
 		if merged.Flags.Has(DerivedInvalidatesContracts) {
 			report.Contracts = mi.ReconcileContractEdges()
 		}

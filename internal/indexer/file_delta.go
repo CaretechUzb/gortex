@@ -178,7 +178,11 @@ func (idx *Indexer) takePreparedExtraction(absPath, relPath, lang string, src []
 	return prepared.result, true
 }
 
-func (idx *Indexer) takePreparedRefresh(filePath string) (*preparedExtraction, bool) {
+// takePreparedSnapshot consumes the speculative parse without re-reading disk.
+// Direct IndexFile uses this to commit the exact accepted read and let its
+// original receipt report a concurrent write. Batch refreshes use
+// takePreparedRefresh below, which replaces a stale speculative parse instead.
+func (idx *Indexer) takePreparedSnapshot(filePath string) (*preparedExtraction, bool) {
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return nil, false
@@ -187,7 +191,16 @@ func (idx *Indexer) takePreparedRefresh(filePath string) (*preparedExtraction, b
 	prepared := idx.prepared[absPath]
 	delete(idx.prepared, absPath)
 	idx.preparedMu.Unlock()
-	if prepared == nil {
+	return prepared, prepared != nil
+}
+
+func (idx *Indexer) takePreparedRefresh(filePath string) (*preparedExtraction, bool) {
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return nil, false
+	}
+	prepared, ok := idx.takePreparedSnapshot(absPath)
+	if !ok {
 		return nil, false
 	}
 	current, readVersion, err := readFileWithVersion(absPath)

@@ -100,3 +100,53 @@ func TestWatcherEnqueueFileMutationUnchangedCompletesWithoutPublishing(t *testin
 	require.Empty(t, watcher.History())
 	requireNoWatcherEvent(t, watcher)
 }
+
+func TestWatcherEnqueueFileMutationWaitsForCompletePointTail(t *testing.T) {
+	dir, idx, watcher := inertTestWatcher(t, "main.go", "package main\n\nfunc value() int { return 0 }\n")
+	path := filepath.Join(dir, "main.go")
+	writeTestFile(t, path, "package main\n\nfunc value() int { return 1 }\nfunc added() {}\n")
+
+	resolveEntered := make(chan string, 1)
+	releaseResolve := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseResolve)
+		}
+	}()
+	watcher.pointReindexRaw = func(filePath string) (*IndexResult, error) {
+		result, err := idx.incrementalPointWatcherPath(idx.rootPath, filePath)
+		resolveEntered <- filePath
+		<-releaseResolve
+		return result, err
+	}
+
+	ticket, err := watcher.EnqueueFileMutation(context.Background(), path)
+	require.NoError(t, err)
+	require.NotNil(t, ticket)
+
+	select {
+	case resolvedPath := <-resolveEntered:
+		require.Equal(t, path, resolvedPath)
+	case <-time.After(2 * time.Second):
+		t.Fatal("point patch did not enter post-patch resolution")
+	}
+	select {
+	case result := <-ticket.Done:
+		t.Fatalf("mutation ticket completed before post-patch resolution: %+v", result)
+	default:
+	}
+	require.Empty(t, watcher.History(), "history must not publish before the coordinated tail")
+
+	close(releaseResolve)
+	released = true
+	select {
+	case result := <-ticket.Done:
+		require.NoError(t, result.Err)
+		require.True(t, result.Reindexed)
+		require.Equal(t, ticket.Generation, result.AppliedGeneration)
+	case <-time.After(2 * time.Second):
+		t.Fatal("mutation ticket did not complete after post-patch resolution")
+	}
+	require.Len(t, watcher.History(), 1)
+}

@@ -105,15 +105,18 @@ func TestIncrementalBatchDoesNotStampWriteDuringCommit(t *testing.T) {
 	require.NoError(t, os.Chtimes(path, firstMtime, firstMtime))
 
 	type chunkResult struct {
-		consumed int
-		reparsed []string
-		failed   []string
+		consumed      int
+		reparsed      []string
+		failed        []string
+		versionChange []string
 	}
 	store.armed.Store(true)
 	done := make(chan chunkResult, 1)
 	go func() {
-		consumed, _, reparsed, failed := idx.reindexIncrementalChunk([]string{path}, nil)
-		done <- chunkResult{consumed: consumed, reparsed: reparsed, failed: failed}
+		consumed, _, reparsed, failed, versionChange := idx.reindexIncrementalChunk([]string{path}, nil, false)
+		done <- chunkResult{
+			consumed: consumed, reparsed: reparsed, failed: failed, versionChange: versionChange,
+		}
 	}()
 	select {
 	case <-store.entered:
@@ -127,12 +130,14 @@ func TestIncrementalBatchDoesNotStampWriteDuringCommit(t *testing.T) {
 	result := <-done
 	require.Equal(t, 1, result.consumed)
 	require.Contains(t, result.failed, path)
+	require.Contains(t, result.versionChange, path)
 	require.NotContains(t, result.reparsed, path)
 	require.NotEqual(t, secondMtime.UnixNano(), idx.FileMtimes()[idx.relKey(path)])
 
 	store.armed.Store(false)
-	_, _, reparsed, failed := idx.reindexIncrementalChunk([]string{path}, nil)
+	_, _, reparsed, failed, versionChange := idx.reindexIncrementalChunk([]string{path}, nil, false)
 	require.Empty(t, failed)
+	require.Empty(t, versionChange)
 	require.Contains(t, reparsed, path)
 	require.Equal(t, secondMtime.UnixNano(), idx.FileMtimes()[idx.relKey(path)])
 	assertFileNodeName(t, base, idx.graphRelKey(path), "Second")

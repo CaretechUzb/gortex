@@ -1,9 +1,11 @@
 package indexer
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,10 +23,10 @@ import (
 // rarely. The interval must be monotonically non-decreasing in the
 // node count so adding code never makes the fallback more aggressive.
 func TestPollInterval_ScalesWithProjectSize(t *testing.T) {
-	small := pollInterval(100)              // a tiny service
-	medium := pollInterval(20 * 1000)       // a mid-size repo
-	large := pollInterval(500 * 1000)       // a large monorepo
-	huge := pollInterval(50 * 1000 * 1000)  // absurdly large
+	small := pollInterval(100)             // a tiny service
+	medium := pollInterval(20 * 1000)      // a mid-size repo
+	large := pollInterval(500 * 1000)      // a large monorepo
+	huge := pollInterval(50 * 1000 * 1000) // absurdly large
 
 	assert.LessOrEqual(t, small, medium,
 		"a small repo must not poll less often than a medium one")
@@ -365,4 +367,417 @@ func TestPoller_SweepHookReportsWork(t *testing.T) {
 	require.NoError(t, os.Chtimes(path, future, future))
 	p.poll()
 	assert.Equal(t, 1, swept, "the poll cycle must report the one file it re-indexed")
+}
+
+// TestPoller_ConcurrentPollsAreSingleFlight proves overlapping timer/notify
+// requests never block behind a scan. They dirty one generation and return;
+// the active owner performs exactly one coalesced follow-up.
+func TestPoller_ConcurrentPollsAreSingleFlight(t *testing.T) {
+	idx := newTestIndexer(graph.New())
+	idx.SetRootPath(t.TempDir())
+	p := newPoller(nil, idx, zap.NewNop())
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var hookMu sync.Mutex
+	hookCalls := 0
+	p.swept = func(int) {
+		hookMu.Lock()
+		hookCalls++
+		call := hookCalls
+		hookMu.Unlock()
+		if call == 1 {
+			close(firstEntered)
+			<-releaseFirst
+		}
+	}
+
+	ownerDone := make(chan struct{})
+	go func() {
+		p.poll()
+		close(ownerDone)
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first poll did not reach the scan hook")
+	}
+
+	const overlapping = 16
+	var callers sync.WaitGroup
+	callers.Add(overlapping)
+	for i := 0; i < overlapping; i++ {
+		go func() {
+			defer callers.Done()
+			p.poll()
+		}()
+	}
+	callersDone := make(chan struct{})
+	go func() {
+		callers.Wait()
+		close(callersDone)
+	}()
+	select {
+	case <-callersDone:
+		// Dirty requests returned without waiting for the active scan.
+	case <-time.After(2 * time.Second):
+		t.Fatal("overlapping poll callers queued behind the active scan")
+	}
+
+	hookMu.Lock()
+	assert.Equal(t, 1, hookCalls, "no follow-up may overlap the active scan")
+	hookMu.Unlock()
+	close(releaseFirst)
+	select {
+	case <-ownerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("poll owner did not finish its coalesced follow-up")
+	}
+
+	hookMu.Lock()
+	assert.Equal(t, 2, hookCalls, "all overlapping requests must collapse into one follow-up sweep")
+	hookMu.Unlock()
+	p.pollMu.Lock()
+	assert.False(t, p.pollRunning, "singleflight ownership must clear after the follow-up")
+	p.pollMu.Unlock()
+}
+
+func TestPoller_SweepUnionsGitAndFilesystemPathsIntoOneBatch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not available in PATH")
+	}
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init", "-q", "-b", "main")
+	runGit(t, repoDir, "config", "user.email", "test@example.com")
+	runGit(t, repoDir, "config", "user.name", "Test")
+	runGit(t, repoDir, "config", "commit.gpgsign", "false")
+
+	aPath := filepath.Join(repoDir, "a.go")
+	bPath := filepath.Join(repoDir, "b.go")
+	writeFile(t, aPath, "package main\nfunc Alpha() {}\n")
+	writeFile(t, bPath, "package main\nfunc Beta() {}\n")
+	runGit(t, repoDir, "add", ".")
+	runGit(t, repoDir, "commit", "-q", "-m", "initial")
+
+	g := graph.New()
+	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
+	idx.search = search.NewBM25()
+	idx.SetRootPath(repoDir)
+	_, err := idx.IndexCtx(testCtx(), repoDir)
+	require.NoError(t, err)
+	w, err := NewWatcher(idx, config.WatchConfig{Enabled: true, DebounceMs: 10}, zap.NewNop())
+	require.NoError(t, err)
+	p := newPoller(w, idx, zap.NewNop())
+
+	batchCalls := 0
+	var submitted []string
+	w.batchReindex = func(paths []string) (*IndexResult, error) {
+		batchCalls++
+		submitted = append([]string(nil), paths...)
+		return &IndexResult{}, nil
+	}
+
+	// A clean sweep has no work and must not call the batch coordinator.
+	p.poll()
+	assert.Equal(t, 0, batchCalls)
+
+	future := time.Now().Add(2 * time.Second)
+	writeFile(t, aPath, "package main\nfunc AlphaChanged() {}\n")
+	writeFile(t, bPath, "package main\nfunc BetaChanged() {}\n")
+	require.NoError(t, os.Chtimes(aPath, future, future))
+	require.NoError(t, os.Chtimes(bPath, future, future))
+	// Commit only a.go. It is visible to both Git and the mtime sweep, while
+	// b.go is filesystem-only; the union must contain each path exactly once.
+	runGit(t, repoDir, "add", "a.go")
+	runGit(t, repoDir, "commit", "-q", "-m", "change a")
+
+	p.poll()
+	require.Equal(t, 1, batchCalls, "one sweep must submit one repository batch")
+	assert.Equal(t, []string{aPath, bPath}, submitted, "Git/filesystem overlap must be sorted and deduplicated")
+	head, err := pollerHeadSHA(repoDir)
+	require.NoError(t, err)
+	p.mu.Lock()
+	settled := p.lastSHA
+	p.mu.Unlock()
+	assert.Equal(t, head, settled, "successful unified reconciliation advances Git freshness")
+}
+
+func TestPoller_GitSHAAdvancesOnlyAfterSuccessfulBatch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not available in PATH")
+	}
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init", "-q", "-b", "main")
+	runGit(t, repoDir, "config", "user.email", "test@example.com")
+	runGit(t, repoDir, "config", "user.name", "Test")
+	runGit(t, repoDir, "config", "commit.gpgsign", "false")
+
+	path := filepath.Join(repoDir, "main.go")
+	writeFile(t, path, "package main\nfunc Before() {}\n")
+	runGit(t, repoDir, "add", ".")
+	runGit(t, repoDir, "commit", "-q", "-m", "before")
+
+	g := graph.New()
+	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
+	idx.search = search.NewBM25()
+	idx.SetRootPath(repoDir)
+	_, err := idx.IndexCtx(testCtx(), repoDir)
+	require.NoError(t, err)
+	w, err := NewWatcher(idx, config.WatchConfig{Enabled: true, DebounceMs: 10}, zap.NewNop())
+	require.NoError(t, err)
+	p := newPoller(w, idx, zap.NewNop())
+	oldSHA := p.lastSHA
+
+	future := time.Now().Add(2 * time.Second)
+	writeFile(t, path, "package main\nfunc After() {}\n")
+	require.NoError(t, os.Chtimes(path, future, future))
+	runGit(t, repoDir, "add", "main.go")
+	runGit(t, repoDir, "commit", "-q", "-m", "after")
+	newSHA, err := pollerHeadSHA(repoDir)
+	require.NoError(t, err)
+
+	calls := 0
+	w.batchReindex = func(paths []string) (*IndexResult, error) {
+		calls++
+		require.Equal(t, []string{path}, paths)
+		switch calls {
+		case 1:
+			return nil, errors.New("transient batch failure")
+		case 2:
+			return &IndexResult{FailedFiles: []string{path}}, nil
+		default:
+			return &IndexResult{}, nil
+		}
+	}
+
+	p.poll()
+	p.mu.Lock()
+	first := p.lastSHA
+	p.mu.Unlock()
+	assert.Equal(t, oldSHA, first, "an errored batch must leave the Git range retryable")
+	p.poll()
+	p.mu.Lock()
+	second := p.lastSHA
+	p.mu.Unlock()
+	assert.Equal(t, oldSHA, second, "a partial batch must leave the Git range retryable")
+	closedCoordinator := newRepositoryMutationCoordinator(nil)
+	require.NoError(t, closedCoordinator.closeAndWait(testCtx()))
+	idx.attachRepositoryMutationCoordinator(closedCoordinator)
+	p.poll()
+	p.mu.Lock()
+	third := p.lastSHA
+	p.mu.Unlock()
+	assert.Equal(t, oldSHA, third, "failed lane admission must leave the Git range retryable")
+
+	idx.attachRepositoryMutationCoordinator(newRepositoryMutationCoordinator(nil))
+	p.poll()
+	p.mu.Lock()
+	fourth := p.lastSHA
+	p.mu.Unlock()
+	assert.Equal(t, newSHA, fourth, "Git freshness advances only after the batch and freshness tail succeed")
+	assert.Equal(t, 4, calls, "the same range must be retried until reconciliation and finalization succeed")
+}
+
+func TestPoller_EmptyGitDiffAdvancesWithoutBatch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not available in PATH")
+	}
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init", "-q", "-b", "main")
+	runGit(t, repoDir, "config", "user.email", "test@example.com")
+	runGit(t, repoDir, "config", "user.name", "Test")
+	runGit(t, repoDir, "config", "commit.gpgsign", "false")
+	writeFile(t, filepath.Join(repoDir, "main.go"), "package main\nfunc Main() {}\n")
+	runGit(t, repoDir, "add", ".")
+	runGit(t, repoDir, "commit", "-q", "-m", "initial")
+
+	idx := newTestIndexer(graph.New())
+	idx.SetRootPath(repoDir)
+	_, err := idx.Index(repoDir)
+	require.NoError(t, err)
+	w, err := NewWatcher(idx, config.WatchConfig{Enabled: true, DebounceMs: 10}, zap.NewNop())
+	require.NoError(t, err)
+	p := newPoller(w, idx, zap.NewNop())
+
+	runGit(t, repoDir, "commit", "-q", "--allow-empty", "-m", "empty")
+	newSHA, err := pollerHeadSHA(repoDir)
+	require.NoError(t, err)
+	batchCalls := 0
+	w.batchReindex = func([]string) (*IndexResult, error) {
+		batchCalls++
+		return &IndexResult{}, nil
+	}
+
+	p.poll()
+	assert.Equal(t, 0, batchCalls, "a successful zero-path diff must not reindex")
+	p.mu.Lock()
+	settled := p.lastSHA
+	p.mu.Unlock()
+	assert.Equal(t, newSHA, settled, "a successful zero-path diff advances Git freshness")
+}
+
+func TestPoller_GitFinalizationWaitsForLaneAndUsesReplacementIndexer(t *testing.T) {
+	repoPath, oldSHA := initGitWatcherRepo(t)
+	runGitWatcherGit(t, repoPath, "commit", "--allow-empty", "-m", "empty")
+	newSHA := runGitWatcherGit(t, repoPath, "rev-parse", "HEAD")
+	require.NotEqual(t, oldSHA, newSHA)
+
+	oldStore := &gitWatcherStateStore{Store: graph.New()}
+	newStore := &gitWatcherStateStore{Store: graph.New()}
+	oldIndexer := gitWatcherBoundaryIndexer(t, oldStore, repoPath, "repo")
+	newIndexer := gitWatcherBoundaryIndexer(t, newStore, repoPath, "repo")
+	coordinator := newRepositoryMutationCoordinator(nil)
+	oldIndexer.attachRepositoryMutationCoordinator(coordinator)
+	newIndexer.attachRepositoryMutationCoordinator(coordinator)
+
+	watcher, err := NewWatcher(oldIndexer, config.WatchConfig{Enabled: true, DebounceMs: 10}, zap.NewNop())
+	require.NoError(t, err)
+	poller := newPoller(watcher, oldIndexer, zap.NewNop())
+	poller.lastSHA = oldSHA
+
+	resolvedCurrent := make(chan struct{}, 1)
+	watcher.currentIndexer = func() *Indexer {
+		resolvedCurrent <- struct{}{}
+		return newIndexer
+	}
+
+	laneEntered := make(chan struct{})
+	releaseLane := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseLane) }) }
+	defer release()
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- oldIndexer.coordinateRepositoryMutation(testCtx(), func() error {
+			close(laneEntered)
+			<-releaseLane
+			return nil
+		})
+	}()
+	<-laneEntered
+
+	finalizeDone := make(chan error, 1)
+	go func() {
+		finalizeDone <- poller.finalizeGitHead(pollGitObservation{
+			oldSHA: oldSHA, newSHA: newSHA, diffSucceeded: true,
+		})
+	}()
+	select {
+	case err := <-finalizeDone:
+		t.Fatalf("freshness tail bypassed the occupied repository lane: %v", err)
+	case <-resolvedCurrent:
+		t.Error("current Indexer was resolved before repository-lane admission")
+	case <-time.After(100 * time.Millisecond):
+	}
+	poller.mu.Lock()
+	assert.Equal(t, oldSHA, poller.lastSHA)
+	poller.mu.Unlock()
+	assert.Empty(t, oldStore.snapshotStates())
+	assert.Empty(t, newStore.snapshotStates())
+
+	release()
+	require.NoError(t, <-holderDone)
+	require.NoError(t, <-finalizeDone)
+	select {
+	case <-resolvedCurrent:
+	case <-time.After(time.Second):
+		t.Fatal("freshness tail did not resolve the current Indexer after admission")
+	}
+	poller.mu.Lock()
+	assert.Equal(t, newSHA, poller.lastSHA)
+	poller.mu.Unlock()
+	assert.Empty(t, oldStore.snapshotStates(), "retired Indexer must not be restamped")
+	require.Len(t, newStore.snapshotStates(), 1, "replacement Indexer must receive the restamp")
+}
+
+func TestPoller_MultiWatcherUsesCurrentIndexerFileMtimesAfterReplacement(t *testing.T) {
+	dir := t.TempDir()
+	retiredPath := filepath.Join(dir, "retired.go")
+	currentPath := filepath.Join(dir, "current.go")
+	writeTestFile(t, retiredPath, "package main\nfunc Retired() {}\n")
+	writeTestFile(t, currentPath, "package main\nfunc Current() {}\n")
+
+	const prefix = "repo"
+	g := graph.New()
+	oldIndexer := newTestIndexer(g)
+	oldIndexer.SetRootPath(dir)
+	oldIndexer.mtimeMu.Lock()
+	oldIndexer.fileMtimes = map[string]int64{"retired.go": 1}
+	oldIndexer.mtimeMu.Unlock()
+
+	multi := NewMultiIndexer(g, newTestRegistry(), nil, nil, zap.NewNop())
+	multi.repos[prefix] = &RepoMetadata{RepoPrefix: prefix, RootPath: dir}
+	multi.indexers[prefix] = oldIndexer
+	multiWatcher, err := NewMultiWatcher(multi, map[string]config.WatchConfig{
+		prefix: {DebounceMs: 10},
+	}, zap.NewNop())
+	require.NoError(t, err)
+	watcher := multiWatcher.watchers[prefix]
+	require.NotNil(t, watcher)
+	poller := newPoller(watcher, oldIndexer, zap.NewNop())
+
+	currentIndexer := newTestIndexer(g)
+	currentIndexer.SetRootPath(dir)
+	currentIndexer.mtimeMu.Lock()
+	currentIndexer.fileMtimes = map[string]int64{"current.go": 1}
+	currentIndexer.mtimeMu.Unlock()
+	currentIndexer.attachRepositoryMutationCoordinator(multi.repositoryMutationCoordinator(prefix))
+	multi.mu.Lock()
+	multi.indexers[prefix] = currentIndexer
+	multi.mu.Unlock()
+
+	batchCalls := 0
+	var submitted []string
+	watcher.batchReindex = func(paths []string) (*IndexResult, error) {
+		batchCalls++
+		submitted = append([]string(nil), paths...)
+		return &IndexResult{}, nil
+	}
+	poller.poll()
+
+	require.Equal(t, 1, batchCalls)
+	assert.Equal(t, []string{currentPath}, submitted,
+		"poll discovery must use the replacement Indexer's FileMtimes, not the retired construction-time map")
+}
+
+func TestPoller_TransientStatErrorIsPreservedOutsideSharedBatch(t *testing.T) {
+	dir := t.TempDir()
+	loopPath := filepath.Join(dir, "loop.go")
+	if err := os.Symlink("loop.go", loopPath); err != nil {
+		t.Skipf("self-referential symlink unavailable on this platform: %v", err)
+	}
+	_, statErr := os.Stat(loopPath)
+	if statErr == nil || os.IsNotExist(statErr) {
+		t.Skipf("platform does not expose a deterministic non-ENOENT stat error for a symlink loop: %v", statErr)
+	}
+
+	idx := newTestIndexer(graph.New())
+	idx.SetRootPath(dir)
+	idx.mtimeMu.Lock()
+	idx.fileMtimes = map[string]int64{"loop.go": 1}
+	idx.mtimeMu.Unlock()
+	watcher, err := NewWatcher(idx, config.WatchConfig{Enabled: true, DebounceMs: 10}, zap.NewNop())
+	require.NoError(t, err)
+	poller := newPoller(watcher, idx, zap.NewNop())
+
+	batchCalls := 0
+	var submitted []string
+	watcher.batchReindex = func(paths []string) (*IndexResult, error) {
+		batchCalls++
+		submitted = append([]string(nil), paths...)
+		return &IndexResult{}, nil
+	}
+	poller.poll()
+	assert.Equal(t, 0, batchCalls,
+		"a transient stat failure alone must preserve the tracked path without entering the shared batch")
+
+	validPath := filepath.Join(dir, "valid.go")
+	writeTestFile(t, validPath, "package main\nfunc Valid() {}\n")
+	idx.mtimeMu.Lock()
+	idx.fileMtimes["valid.go"] = 1
+	idx.mtimeMu.Unlock()
+	poller.poll()
+	require.Equal(t, 1, batchCalls)
+	assert.Equal(t, []string{validPath}, submitted,
+		"the transiently unreadable path must not poison an unrelated valid batch")
 }

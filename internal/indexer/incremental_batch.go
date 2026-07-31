@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -67,18 +68,21 @@ type incrementalPriorView struct {
 	outByNode   map[string][]*graph.Edge
 }
 
-// reindexIncrementalFilesBatched owns the multi-file path only. IndexFile and
-// its single-save semantics stay unchanged; exceptional files that cannot be
-// prepared safely fall back to that exact implementation and retain its retry
-// behaviour.
+// reindexIncrementalFilesBatched owns the bounded multi-file engine. Normal
+// reconciliation retries first-pass failures once. A direct IndexFile request
+// can instead stop after a first-pass version race so its historical receipt
+// contract remains observable while watcher storms retain retry behaviour.
 func (idx *Indexer) reindexIncrementalFilesBatched(
 	staleFiles, deletedFiles []string,
 	markerBatch *reparsePendingEnrichmentBatch,
-) (DerivedInvalidationPlan, []string, []string) {
+	surfaceFirstVersionChange bool,
+) (DerivedInvalidationPlan, []string, []string, []string) {
 	var invalidation DerivedInvalidationPlan
 	idx.evictDeletedFilesBatched(deletedFiles, &invalidation)
 
-	passPlan, reparsed, failed := idx.reindexIncrementalStalePass(staleFiles, markerBatch)
+	passPlan, reparsed, failed, versionChanged := idx.reindexIncrementalStalePass(
+		staleFiles, markerBatch, surfaceFirstVersionChange,
+	)
 	invalidation.Merge(passPlan)
 	for _, filePath := range failed {
 		idx.logger.Debug("incremental reindex: failed to index file",
@@ -88,12 +92,24 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 		if len(reparsed) > 0 {
 			idx.reparsedThisRun.Store(true)
 		}
-		return invalidation, reparsed, nil
+		return invalidation, reparsed, nil, nil
+	}
+	if surfaceFirstVersionChange {
+		// Direct IndexFile is a single accepted-read operation. Do not let a
+		// retry hide any first-pass failure; its caller distinguishes an actual
+		// version race from parse/read failures after the complete mutation tail.
+		if len(reparsed) > 0 || len(invalidation.Files) > 0 {
+			idx.reparsedThisRun.Store(true)
+		}
+		return invalidation, reparsed, failed, versionChanged
 	}
 
-	retryPlan, retryReparsed, retryFailed := idx.reindexIncrementalStalePass(failed, markerBatch)
+	retryPlan, retryReparsed, retryFailed, retryVersionChanged := idx.reindexIncrementalStalePass(
+		failed, markerBatch, false,
+	)
 	invalidation.Merge(retryPlan)
 	reparsed = appendUniqueSorted(reparsed, retryReparsed...)
+	versionChanged = appendUniqueSorted(versionChanged, retryVersionChanged...)
 	for _, filePath := range retryFailed {
 		idx.logger.Warn("incremental reindex: file failed after retry",
 			zap.String("file", filePath))
@@ -101,19 +117,20 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	if len(reparsed) > 0 {
 		idx.reparsedThisRun.Store(true)
 	}
-	return invalidation, reparsed, retryFailed
+	return invalidation, reparsed, retryFailed, versionChanged
 }
 
 func (idx *Indexer) reindexIncrementalStalePass(
 	files []string,
 	markerBatch *reparsePendingEnrichmentBatch,
-) (DerivedInvalidationPlan, []string, []string) {
+	acceptPreparedSnapshot bool,
+) (DerivedInvalidationPlan, []string, []string, []string) {
 	var plan DerivedInvalidationPlan
-	var reparsed, failed []string
+	var reparsed, failed, versionChanged []string
 	for start := 0; start < len(files); {
 		end := min(start+incrementalBatchFiles, len(files))
-		consumed, chunkPlan, chunkReparsed, chunkFailed := idx.reindexIncrementalChunk(
-			files[start:end], markerBatch,
+		consumed, chunkPlan, chunkReparsed, chunkFailed, chunkVersionChanged := idx.reindexIncrementalChunk(
+			files[start:end], markerBatch, acceptPreparedSnapshot,
 		)
 		if consumed <= 0 {
 			consumed = 1
@@ -122,17 +139,22 @@ func (idx *Indexer) reindexIncrementalStalePass(
 		plan.Merge(chunkPlan)
 		reparsed = append(reparsed, chunkReparsed...)
 		failed = append(failed, chunkFailed...)
+		versionChanged = append(versionChanged, chunkVersionChanged...)
 	}
-	return plan, appendUniqueSorted(nil, reparsed...), appendUniqueSorted(nil, failed...)
+	return plan,
+		appendUniqueSorted(nil, reparsed...),
+		appendUniqueSorted(nil, failed...),
+		appendUniqueSorted(nil, versionChanged...)
 }
 
 func (idx *Indexer) reindexIncrementalChunk(
 	files []string,
 	markerBatch *reparsePendingEnrichmentBatch,
-) (int, DerivedInvalidationPlan, []string, []string) {
+	acceptPreparedSnapshot bool,
+) (int, DerivedInvalidationPlan, []string, []string, []string) {
 	var plan DerivedInvalidationPlan
 	if len(files) == 0 {
-		return 0, plan, nil, nil
+		return 0, plan, nil, nil, nil
 	}
 
 	graphPaths := make([]string, len(files))
@@ -184,7 +206,13 @@ func (idx *Indexer) reindexIncrementalChunk(
 			})
 			continue
 		}
-		prepared, ok := idx.takePreparedRefresh(filePath)
+		var prepared *preparedExtraction
+		var ok bool
+		if acceptPreparedSnapshot {
+			prepared, ok = idx.takePreparedSnapshot(filePath)
+		} else {
+			prepared, ok = idx.takePreparedRefresh(filePath)
+		}
 		if !ok || prepared == nil || prepared.result == nil {
 			fallbacks = append(fallbacks, incrementalFallback{
 				filePath: filePath, graphPath: graphPath, priorNodes: priorNodes,
@@ -231,10 +259,14 @@ func (idx *Indexer) reindexIncrementalChunk(
 
 	var reparsed []string
 	failed := append([]string(nil), stalePaths...)
+	versionChanged := append([]string(nil), stalePaths...)
 	for _, fallback := range fallbacks {
 		if err := idx.reindexIncrementalFallback(fallback, markerBatch, &plan); err != nil {
 			idx.discardPreparedExtraction(fallback.filePath)
 			failed = append(failed, fallback.filePath)
+			if errors.Is(err, errFileVersionChanged) {
+				versionChanged = append(versionChanged, fallback.filePath)
+			}
 			continue
 		}
 		reparsed = append(reparsed, fallback.filePath)
@@ -244,7 +276,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 			reparsed = append(reparsed, stage.absPath)
 		}
 	}
-	return consumed, plan, reparsed, failed
+	return consumed, plan, reparsed, failed, versionChanged
 }
 
 func (idx *Indexer) reindexIncrementalFallback(
@@ -438,7 +470,7 @@ func (idx *Indexer) commitIncrementalStages(
 	}
 	for _, stage := range structural {
 		applyResolvedOutEdgesFromView(stage.result.Edges, stage.reuse, existing)
-		if !idx.deferGlobalPasses {
+		if !idx.deferGlobalPasses.Load() {
 			stage.abSnap = snapshotAffectedByFromView(stage.priorNodes, view)
 		}
 	}
@@ -450,7 +482,7 @@ func (idx *Indexer) commitIncrementalStages(
 			stage.metadataOnly = false
 			structural = append(structural, stage)
 			applyResolvedOutEdgesFromView(stage.result.Edges, stage.reuse, existing)
-			if !idx.deferGlobalPasses {
+			if !idx.deferGlobalPasses.Load() {
 				stage.abSnap = snapshotAffectedByFromView(stage.priorNodes, view)
 			}
 			continue
@@ -746,7 +778,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		idx.materializeDataflowParamsForStages(stages)
 	}
 
-	if !idx.deferGlobalPasses {
+	if !idx.deferGlobalPasses.Load() {
 		freshFuncs := cloneFuncNodes(nodes)
 		if len(oldFuncIDs) > 0 || len(freshFuncs) > 0 {
 			if idx.cloneIndex != nil && idx.cloneIndex.Ready() {
@@ -761,10 +793,10 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	if !deferResolverCatchup {
 		idx.observeIncrementalCatchup("ref_facts", paths)
 		idx.persistRefFactsForFiles(paths)
-		if !idx.deferGlobalPasses {
+		if !idx.deferGlobalPasses.Load() {
 			idx.reresolveAffectedByStages(stages)
 		}
-	} else if !idx.deferGlobalPasses {
+	} else if !idx.deferGlobalPasses.Load() {
 		markerBatch.mergeDeferredAffected(idx.planAffectedByStages(stages))
 	}
 	idx.enrichAndMarkIncrementalStages(stages, markerBatch)
@@ -1054,7 +1086,7 @@ func (idx *Indexer) enrichAndMarkIncrementalStages(
 	for _, stage := range stages {
 		pending[stage.graphPath] = providersPresent
 	}
-	watchEnrichment := providersPresent && !idx.deferGlobalPasses && idx.semanticMgr.EnrichesOnWatch() &&
+	watchEnrichment := providersPresent && !idx.deferGlobalPasses.Load() && idx.semanticMgr.EnrichesOnWatch() &&
 		(markerBatch == nil || !markerBatch.deferResolverCatchup)
 	if watchEnrichment {
 		paths := make([]string, 0, len(stages))
@@ -1357,9 +1389,82 @@ func (idx *Indexer) reresolveAffectedByStages(stages []*incrementalBatchStage) {
 	}
 }
 
-func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInvalidationPlan) {
-	if len(deleted) == 0 {
+type forcedFileEviction struct {
+	result       *IndexResult
+	batch        *reparsePendingEnrichmentBatch
+	nodesRemoved int
+	edgesRemoved int
+}
+
+// evictFileIncrementalRaw forcibly removes one canonical repository-relative
+// path even when it still exists on disk. The caller already owns the stable
+// repository lane. It reuses the bounded deletion core so every graph/search
+// sidecar and mtime is removed and returns the exact invalidation frontier for
+// the resolver/semantic/derived tail.
+func (idx *Indexer) evictFileIncrementalRaw(relPath string) forcedFileEviction {
+	batch := &reparsePendingEnrichmentBatch{deferResolverCatchup: true}
+	result := &IndexResult{}
+	if idx == nil || relPath == "" {
+		return forcedFileEviction{result: result, batch: batch}
+	}
+	// Explicit eviction is intentionally unconditional. Ownership sidecars may
+	// be partially missing after an interrupted or older indexing pass; the
+	// bounded deletion core is idempotent and must still clear orphan mtimes,
+	// search content, ref facts, contracts, and enrichment state.
+	dependencyFiles := idx.semanticDependencyFrontierForDeletedFiles([]string{relPath})
+	var invalidation DerivedInvalidationPlan
+	nodesRemoved, edgesRemoved := idx.evictDeletedFilesBatched([]string{relPath}, &invalidation)
+	graphPath := idx.prefixPath(filepath.FromSlash(relPath))
+	idx.removeIncrementalContractsForFile(graphPath, &invalidation)
+	invalidation.Files = appendUniqueSorted(invalidation.Files, dependencyFiles...)
+
+	idx.indexGen.Add(1)
+	nodes, edges := idx.repoNodeEdgeCount()
+	result.NodeCount = nodes
+	result.EdgeCount = edges
+	result.FileCount = idx.trackedFileCount()
+	result.DeletedFileCount = 1
+	result.DerivedInvalidation = invalidation
+	idx.markPendingEnrichFiles(invalidation.Files)
+	return forcedFileEviction{
+		result:       result,
+		batch:        batch,
+		nodesRemoved: nodesRemoved,
+		edgesRemoved: edgesRemoved,
+	}
+}
+
+func (idx *Indexer) removeIncrementalContractsForFile(graphPath string, plan *DerivedInvalidationPlan) {
+	reg := idx.ensureIncrementalContractRegistry()
+	prior := reg.ByFile(graphPath)
+	idx.contractCacheMu.Lock()
+	delete(idx.contractCache, graphPath)
+	idx.contractCacheMu.Unlock()
+	if len(prior) == 0 {
 		return
+	}
+
+	priorIDs := make(map[string]struct{}, len(prior))
+	refresh := contractRefreshResult{Changed: true}
+	refresh.addFrontier(prior)
+	for _, contract := range prior {
+		if contract.ID != "" {
+			priorIDs[contract.ID] = struct{}{}
+		}
+	}
+	refresh.Groups = mergeContractGroups(nil, refresh.Groups...)
+	refresh.SymbolIDs = appendUniqueSorted(nil, refresh.SymbolIDs...)
+	reg.ReplaceFile(graphPath, nil)
+	idx.commitIncrementalContractFiles(reg, []string{graphPath}, priorIDs)
+
+	plan.Flags |= DerivedInvalidatesContracts
+	plan.ContractGroups = mergeContractGroups(plan.ContractGroups, refresh.Groups...)
+	plan.ContractSymbolIDs = appendUniqueSorted(plan.ContractSymbolIDs, refresh.SymbolIDs...)
+}
+
+func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInvalidationPlan) (nodesRemoved, edgesRemoved int) {
+	if len(deleted) == 0 {
+		return 0, 0
 	}
 	for start := 0; start < len(deleted); start += deletedBatchFiles {
 		end := min(start+deletedBatchFiles, len(deleted))
@@ -1401,13 +1506,16 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		idx.deleteRefFactsForFiles(idx.repoPrefix, graphPaths)
 		idx.deleteIncrementalSidecars(graphPaths)
 		idx.clearIncrementalContent(graphPaths)
-		evictFilesBatched(idx.graph, graphPaths)
+		nodes, edges := evictFilesBatched(idx.graph, graphPaths)
+		nodesRemoved += nodes
+		edgesRemoved += edges
 	}
 	idx.mtimeMu.Lock()
 	for _, relPath := range deleted {
 		delete(idx.fileMtimes, relPath)
 	}
 	idx.mtimeMu.Unlock()
+	return nodesRemoved, edgesRemoved
 }
 
 func (idx *Indexer) deleteEnrichmentByNodeIDs(nodeIDs []string) {

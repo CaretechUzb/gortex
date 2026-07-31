@@ -15,7 +15,6 @@ import (
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
-	"github.com/zzet/gortex/internal/reach"
 	"github.com/zzet/gortex/internal/tokens"
 )
 
@@ -650,28 +649,28 @@ func (s *Server) repoRelative(absPath string) string {
 	return absPath
 }
 
+func incrementalReindexSucceeded(result *indexer.IndexResult, err error) bool {
+	return err == nil && result != nil && len(result.FailedFiles) == 0
+}
+
 // reindexFile refreshes the graph for a single file after a write. Best-effort:
 // non-source files or files outside any indexed repo are silently skipped.
 func (s *Server) reindexFile(absPath string) bool {
-	reindex := func(idx *indexer.Indexer) bool {
-		finishTopologyMutation := reach.BeginTopologyMutation(s.graph)
-		// Conservatively invalidate reachability after every reindex attempt:
-		// an error may still follow a partial topology mutation.
-		defer finishTopologyMutation(true)
-		return idx.IndexFile(absPath) == nil
-	}
-
 	if s.multiIndexer != nil {
 		if prefix := s.multiIndexer.RepoForFile(absPath); prefix != "" {
-			if idx := s.multiIndexer.GetIndexer(prefix); idx != nil && reindex(idx) {
+			result, err := s.multiIndexer.IncrementalReindexRepo(prefix, []string{absPath})
+			if incrementalReindexSucceeded(result, err) {
 				return true
 			}
 		}
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil && !strings.HasPrefix(rel, "..") && reindex(s.indexer) {
-				return true
+			if rel, err := filepath.Rel(root, absPath); err == nil && !strings.HasPrefix(rel, "..") {
+				result, reindexErr := s.indexer.IncrementalReindexPaths(root, []string{absPath})
+				if incrementalReindexSucceeded(result, reindexErr) {
+					return true
+				}
 			}
 		}
 	}

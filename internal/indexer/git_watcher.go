@@ -30,18 +30,22 @@ import (
 // `git reset --mixed` leaving the working tree dirty) still fire
 // normal fsnotify events and flow through the per-file path.
 type GitWatcher struct {
-	repoPath    string
-	indexer     *Indexer
-	logger      *zap.Logger
-	fsw         *fsnotify.Watcher
-	debounce    time.Duration
-	done        chan struct{}
-	stopped     chan struct{}
-	mu          sync.Mutex
-	lastSHA     string
-	fireTimer   *time.Timer
-	loopStarted bool
-	stopCalled  bool
+	repoPath string
+	// indexer is the construction-time stable repository-lane carrier.
+	// MultiWatcher installs currentIndexer so the freshness tail resolves the
+	// currently registered Indexer only after that lane admits it.
+	indexer        *Indexer
+	currentIndexer func() *Indexer
+	logger         *zap.Logger
+	fsw            *fsnotify.Watcher
+	debounce       time.Duration
+	done           chan struct{}
+	stopped        chan struct{}
+	mu             sync.Mutex
+	lastSHA        string
+	fireTimer      *time.Timer
+	loopStarted    bool
+	stopCalled     bool
 	// reconciling single-flights reconcile: a ref event landing while
 	// one is in flight sets rerun instead of spawning a second
 	// concurrent reconcile from the same stale base (each AfterFunc
@@ -78,6 +82,32 @@ func NewGitWatcher(repoPath string, idx *Indexer, logger *zap.Logger) (*GitWatch
 		done:     make(chan struct{}),
 		stopped:  make(chan struct{}),
 	}, nil
+}
+
+func (gw *GitWatcher) registeredIndexer() *Indexer {
+	if gw.currentIndexer != nil {
+		return gw.currentIndexer()
+	}
+	return gw.indexer
+}
+
+// finalizeReconcile publishes commit freshness only while holding the stable
+// repository lane. IndexRepo replacement uses the same lane, so the registry
+// lookup and state restamp cannot land on a retired Indexer. lastSHA advances
+// after the restamp; failed lane admission therefore leaves the prior SHA for
+// the next ref notification to retry.
+func (gw *GitWatcher) finalizeReconcile(ctx context.Context, newSHA string) error {
+	return gw.indexer.coordinateRepositoryMutation(ctx, func() error {
+		idx := gw.registeredIndexer()
+		if idx == nil {
+			return fmt.Errorf("git-watcher: repository indexer is no longer registered")
+		}
+		idx.reconcileRepoIndexState(gw.repoPath)
+		gw.mu.Lock()
+		gw.lastSHA = newSHA
+		gw.mu.Unlock()
+		return nil
+	})
 }
 
 // Start sets up fsnotify watches on the repo's git control files and
@@ -259,12 +289,14 @@ func (gw *GitWatcher) reconcile(trigger string) {
 		return
 	}
 
-	// First observation (no prior SHA) — just record it without
-	// diffing. The caller warmed up with a full index already.
+	// First observation (no prior SHA) needs no diff because the caller
+	// warmed up with a full index already, but its SHA/restamp publication
+	// still uses the repository lane and current Indexer.
 	if oldSHA == "" {
-		gw.mu.Lock()
-		gw.lastSHA = newSHA
-		gw.mu.Unlock()
+		if err := gw.finalizeReconcile(context.Background(), newSHA); err != nil {
+			gw.logger.Warn("git-watcher: freshness finalization failed",
+				zap.String("trigger", trigger), zap.Error(err))
+		}
 		return
 	}
 
@@ -300,19 +332,31 @@ func (gw *GitWatcher) reconcile(trigger string) {
 		if res != nil {
 			patched = res.StaleFileCount + res.DeletedFileCount
 			failed = len(res.FailedFiles)
+			if failed > 0 {
+				gw.logger.Warn("git-watcher: batched reindex left failed files",
+					zap.String("trigger", trigger),
+					zap.Int("paths", len(changedPaths)),
+					zap.Int("failed", failed),
+					zap.Bool("large_batch", largeBatch))
+				return
+			}
 		}
 	}
 
+	// Publish the new SHA and on-disk freshness row together under the stable
+	// repository lane. Empty commits reach this tail without calling the batch
+	// reindexer; lane admission failure intentionally keeps oldSHA for retry.
+	if err := gw.finalizeReconcile(context.Background(), newSHA); err != nil {
+		gw.logger.Warn("git-watcher: freshness finalization failed",
+			zap.String("trigger", trigger),
+			zap.String("from", oldSHA),
+			zap.String("to", newSHA),
+			zap.Error(err))
+		return
+	}
 	gw.mu.Lock()
-	gw.lastSHA = newSHA
 	drained := gw.drained
 	gw.mu.Unlock()
-
-	// Re-stamp the on-disk freshness row at the new HEAD. The graph now
-	// reflects this commit, but the persisted repo_index_state row is
-	// otherwise written only by a full (re)index — leave it and
-	// `gortex repos` keeps reporting the repo stale after every commit.
-	gw.indexer.reconcileRepoIndexState(gw.repoPath)
 
 	gw.logger.Info("git-watcher: reconciled ref change",
 		zap.String("from", oldSHA[:min(len(oldSHA), 12)]),

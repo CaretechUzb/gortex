@@ -120,6 +120,12 @@ type IndexResult struct {
 	// incremental reconcile. A zero plan proves that no graph-wide derived
 	// pass is required; callers must not infer work merely from stale count.
 	DerivedInvalidation DerivedInvalidationPlan `json:"derived_invalidation,omitempty"`
+
+	// mutationErr carries a point-operation compatibility error through the
+	// resolver/semantic/derived tail. It is intentionally unexported and never
+	// serialized: coordinated callers surface it only after the committed graph
+	// has reached a coherent post-mutation state.
+	mutationErr error
 }
 
 // EdgeSanityViolated reports the post-reindex sanity-check failure: an
@@ -344,7 +350,7 @@ type Indexer struct {
 	// different repos into the shared graph race on Edge.Meta during the
 	// resolver's mutation phase vs. the contract pass's graph walk via
 	// AllEdges().
-	deferResolve       bool
+	deferResolve       atomic.Bool
 	pendingContractReg *contracts.Registry
 	// deferredGoModDone makes go.mod contract materialisation idempotent for
 	// one pending contract generation. Coordinated multi-repo cold/warmup runs
@@ -414,7 +420,7 @@ type Indexer struct {
 	// counts in the hundreds. The batch caller is responsible for invoking
 	// RunGlobalGraphPasses exactly once at the end. Has no effect on the
 	// deferResolve path (multi-repo IndexCtx already skips those passes).
-	deferGlobalPasses bool
+	deferGlobalPasses atomic.Bool
 
 	// skipResolveInDeferred, when set, makes RunDeferredPasses skip the
 	// per-repo resolver.ResolveAll() call. ResolveAll walks the entire
@@ -460,6 +466,13 @@ type Indexer struct {
 	affectedByPasses        atomic.Int64
 	affectedByFilesResolved atomic.Int64
 	affectedByDropped       atomic.Int64
+
+	// repositoryMutation is the single discovery/parse/resolve/derived lane
+	// for this repository. It is lazy so focused Indexer fixtures do not need
+	// constructor changes, while every production entry point shares it.
+	repositoryMutationMu    sync.Mutex
+	repositoryMutation      *repositoryMutationCoordinator
+	repositoryMutationOwner *MultiIndexer
 
 	// incrementalResolveFilesHook is a focused test seam for proving a
 	// multi-file watcher batch invokes the scoped resolver exactly once. nil in
@@ -911,7 +924,7 @@ func (idx *Indexer) SetTrackedRepoModules(m map[string]string) { idx.trackedRepo
 
 // SetDeferResolve toggles whether IndexCtx defers the cross-cutting passes
 // to a later RunDeferredPasses call. See the deferResolve field comment.
-func (idx *Indexer) SetDeferResolve(v bool) { idx.deferResolve = v }
+func (idx *Indexer) SetDeferResolve(v bool) { idx.deferResolve.Store(v) }
 
 // SetSkipResolveInDeferred toggles whether RunDeferredPasses calls
 // idx.resolver.ResolveAll. The MultiIndexer batch driver sets this so
@@ -926,7 +939,7 @@ func (idx *Indexer) SetSkipResolveInDeferred(v bool) { idx.skipResolveInDeferred
 // caller drives a batch (e.g. daemon warmup) and will invoke
 // RunGlobalGraphPasses once at the end. See the deferGlobalPasses field
 // comment.
-func (idx *Indexer) SetDeferGlobalPasses(v bool) { idx.deferGlobalPasses = v }
+func (idx *Indexer) SetDeferGlobalPasses(v bool) { idx.deferGlobalPasses.Store(v) }
 
 // RunGlobalGraphPasses runs the graph-wide derivation passes once
 // against the indexer's shared graph. Safe to call against a graph that
@@ -1480,7 +1493,12 @@ func (idx *Indexer) RelKey(absPath string) string { return idx.relKey(absPath) }
 
 // SetRepoPrefix sets the repository prefix for multi-repo mode.
 // When non-empty, all node IDs and file paths are prefixed with "<repoPrefix>/".
-func (idx *Indexer) SetRepoPrefix(prefix string) { idx.repoPrefix = prefix }
+func (idx *Indexer) SetRepoPrefix(prefix string) {
+	idx.repoPrefix = prefix
+	if idx.repositoryMutationOwner != nil && prefix != "" {
+		idx.attachRepositoryMutationCoordinator(idx.repositoryMutationOwner.repositoryMutationCoordinator(prefix))
+	}
+}
 
 // RepoPrefix returns the current repository prefix.
 func (idx *Indexer) RepoPrefix() string { return idx.repoPrefix }
@@ -2350,10 +2368,6 @@ func (idx *Indexer) Index(root string) (*IndexResult, error) {
 	return idx.IndexCtx(context.Background(), root)
 }
 
-// IndexCtx is Index with a context, enabling progress reporting. The reporter
-// is pulled from ctx via progress.FromContext — attach one with
-// progress.WithReporter to receive stage updates. If no reporter is attached,
-// stage calls are silently dropped.
 // clampParseWeight maps a file size to a parse-admission weight bounded to
 // [1, budget]. A file larger than the whole budget is admitted alone
 // (weight == budget) so the bytes-in-flight semaphore can never deadlock.
@@ -2367,7 +2381,69 @@ func clampParseWeight(size, budget int64) int64 {
 	return size
 }
 
-func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexResult, retErr error) {
+// IndexCtx is Index with a context, enabling progress reporting. The reporter
+// is pulled from ctx via progress.FromContext — attach one with
+// progress.WithReporter to receive stage updates. If no reporter is attached,
+// stage calls are silently dropped. Full-tree indexing shares the repository
+// mutation lane with watcher, polling, reconciliation, and MCP edits.
+func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, error) {
+	var result *IndexResult
+	err := idx.coordinateRepositoryMutation(ctx, func() error {
+		current, currentErr := idx.currentRepositoryMutationIndexer()
+		if currentErr != nil {
+			return currentErr
+		}
+		// A public handle may outlive IndexRepo replacement. Validate and store
+		// the root only on the live executor selected after lane admission.
+		if rootErr := current.ensureRepositoryMutationRoot(root); rootErr != nil {
+			return rootErr
+		}
+
+		finishTopologyMutation := reach.BeginTopologyMutation(current.graph)
+		defer finishTopologyMutation(true)
+
+		var rawErr error
+		result, rawErr = current.indexCtxRaw(ctx, root)
+		if rawErr != nil {
+			return rawErr
+		}
+		if result == nil {
+			return errors.New("full-tree indexing returned a nil result")
+		}
+
+		// Keep the owning MultiIndexer generation consistent with the graph
+		// replacement before releasing the stable lane. A stale receiver remains
+		// untouched; only the currently published Indexer and its metadata move.
+		owner := current.repositoryMutationOwner
+		prefix := current.repoPrefix
+		if owner != nil && prefix != "" {
+			rootPath := current.RootPath()
+			fileMtimes := current.FileMtimes()
+			owner.mu.Lock()
+			if meta := owner.repos[prefix]; meta != nil && owner.indexers[prefix] == current {
+				owner.repos[prefix] = &RepoMetadata{
+					RepoPrefix:    prefix,
+					RootPath:      rootPath,
+					Identity:      meta.Identity,
+					LastIndexTime: time.Now(),
+					FileCount:     result.FileCount,
+					NodeCount:     result.NodeCount,
+					EdgeCount:     result.EdgeCount,
+					ParseErrors:   result.Errors,
+					FileMtimes:    fileMtimes,
+					IsWorktree:    meta.IsWorktree,
+				}
+			}
+			owner.mu.Unlock()
+		}
+		return nil
+	})
+	return result, err
+}
+
+// indexCtxRaw performs full-tree indexing while the caller holds the
+// repository mutation lane.
+func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
 	start := time.Now()
 	reporter := progress.FromContext(ctx)
 
@@ -2384,7 +2460,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	if err != nil {
 		return nil, err
 	}
-	idx.rootPath = absRoot
+	idx.storeRootPath(absRoot)
 	idx.projectName = search.DetectProjectName(absRoot)
 
 	reporter.Report("walking files", 0, 0)
@@ -3518,7 +3594,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	idx.totalDetected = len(files)
 	idx.lastIndexTime = time.Now()
 
-	if idx.deferResolve {
+	if idx.deferResolve.Load() {
 		// Multi-repo orchestrator runs these serially after wg.Wait()
 		// to avoid races on the shared graph between this goroutine's
 		// ResolveAll mutation phase and a sibling goroutine's contract
@@ -3542,7 +3618,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		// the final shared graph instead of paying the O(global) walk
 		// per repo. InferOverrides depends on InferImplements running
 		// first.
-		if !idx.deferGlobalPasses {
+		if !idx.deferGlobalPasses.Load() {
 			reporter.Report("inferring interfaces", 0, 0)
 			idx.resolver.InferImplements()
 			idx.resolver.InferOverrides()
@@ -3583,7 +3659,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	// Build search index.
 	idx.buildSearchIndex()
 
-	if !idx.deferResolve {
+	if !idx.deferResolve.Load() {
 		// Contracts were already extracted inline during parse (per file,
 		// per worker). Here we just finish up. extractGoModContracts
 		// already ran (see the !deferResolve branch above) so dep
@@ -3597,7 +3673,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		// Test-edge pass — runs once the call graph is final. Skipped
 		// under deferGlobalPasses so a batch caller can fold this into
 		// one global pass after the per-repo loop.
-		if !idx.deferGlobalPasses {
+		if !idx.deferGlobalPasses.Load() {
 			reporter.Report("test edge pass", 0, 0)
 			marked, emitted := markTestSymbolsAndEmitEdges(idx.graph)
 			if marked > 0 || emitted > 0 {
@@ -3790,16 +3866,102 @@ func (idx *Indexer) warnIfEdgeSanityViolated(r *IndexResult) {
 // add), including per-file resolver work for cross-file references.
 // Use in the single-event fsnotify path where each edit is isolated.
 func (idx *Indexer) IndexFile(filePath string) error {
-	return idx.indexFile(filePath, true, nil)
+	root, err := idx.repositoryMutationRootPath()
+	if err != nil {
+		return err
+	}
+	canonical, err := canonicalRepositoryMutationPath(root, filePath)
+	if err != nil {
+		return err
+	}
+	if err := validateRepositoryMutationRegularFile(root, canonical); err != nil {
+		return err
+	}
+	return idx.coordinateRepositoryMutation(context.Background(), func() error {
+		// The path may be deleted or replaced while this call waits for the
+		// repository lane. Revalidate after admission so IndexFile preserves its
+		// existing-regular-file contract instead of turning a queued update into
+		// an implicit eviction.
+		currentRoot, rootErr := idx.repositoryMutationRootPath()
+		if rootErr != nil {
+			return rootErr
+		}
+		if validateErr := validateRepositoryMutationRegularFile(currentRoot, canonical); validateErr != nil {
+			return validateErr
+		}
+		absPath := filepath.Join(currentRoot, filepath.FromSlash(canonical))
+		acceptedVersion, versionErr := os.Stat(absPath)
+		if versionErr != nil {
+			return fmt.Errorf("index file %q: %w", canonical, versionErr)
+		}
+		result, reindexErr := idx.reindexPointMutationRaw(canonical)
+		if reindexErr != nil {
+			return reindexErr
+		}
+		currentVersion, versionErr := os.Stat(absPath)
+		if versionErr != nil || !sameFileVersion(acceptedVersion, currentVersion) {
+			return fmt.Errorf("%w: %s", errFileVersionChanged, canonical)
+		}
+		if result == nil {
+			return fmt.Errorf("indexing %q returned no result", canonical)
+		}
+		if result.mutationErr != nil {
+			return result.mutationErr
+		}
+		if len(result.FailedFiles) > 0 {
+			return fmt.Errorf("indexing %q failed after retry: %s", canonical, strings.Join(result.FailedFiles, ", "))
+		}
+		return nil
+	})
 }
 
-// IndexFileNoResolve is IndexFile minus the per-file resolver call.
-// Callers in batch paths (storm mode, branch-switch reconcile, git
-// diff dispatch) use this when they will run resolver.ResolveAll()
-// once at the end of the batch; otherwise a 500-file checkout pays
-// the per-file resolver cost 500 times instead of once.
+// IndexFileNoResolve is retained for source compatibility.
+//
+// Deprecated: use IndexFile. Modern batch paths own private already-held raw
+// helpers and one exact resolver/derived tail; exposing a partial public
+// mutation would leave graph quality dependent on an external follow-up pass.
 func (idx *Indexer) IndexFileNoResolve(filePath string) error {
-	return idx.indexFile(filePath, false, nil)
+	return idx.IndexFile(filePath)
+}
+
+// currentRepositoryMutationIndexer resolves the live per-repository Indexer
+// after the caller has acquired the stable mutation lane. A watcher or public
+// handle may outlive an IndexRepo replacement; raw graph work must never target
+// that stale instance.
+func (idx *Indexer) currentRepositoryMutationIndexer() (*Indexer, error) {
+	if idx == nil {
+		return nil, errors.New("repository mutation indexer is nil")
+	}
+	if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
+		current := owner.GetIndexer(idx.repoPrefix)
+		if current == nil {
+			return nil, fmt.Errorf("repository mutation executor has no live indexer: %s", idx.repoPrefix)
+		}
+		return current, nil
+	}
+	return idx, nil
+}
+
+// reindexPointMutationRaw is an already-held-lane executor. It must never call
+// a public coordinated API.
+func (idx *Indexer) reindexPointMutationRaw(path string) (*IndexResult, error) {
+	mode := incrementalPathMode{
+		detectDeletions:           true,
+		forceExplicitFiles:        true,
+		surfaceFirstVersionChange: true,
+		exactPointSemantic:        true,
+	}
+	if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
+		return owner.incrementalReindexRepoRawMode(idx.repoPrefix, []string{path}, mode)
+	}
+	current, err := idx.currentRepositoryMutationIndexer()
+	if err != nil {
+		return nil, err
+	}
+	if current.rootPath == "" {
+		return nil, errors.New("repository mutation root is unavailable")
+	}
+	return current.incrementalWatcherPaths(current.rootPath, []string{path}, mode)
 }
 
 func (idx *Indexer) indexFile(
@@ -3974,7 +4136,7 @@ func (idx *Indexer) indexFile(
 	var reuseIdx map[reuseKey]*reuseVal
 	var priorUnresolved []*graph.Edge
 	deferredResolverCatchup := markerBatch != nil && markerBatch.deferResolverCatchup
-	if (resolve || deferredResolverCatchup) && !idx.deferGlobalPasses && !skipped {
+	if (resolve || deferredResolverCatchup) && !idx.deferGlobalPasses.Load() && !skipped {
 		snapshotStarted := time.Now()
 		abSnap = idx.snapshotAffectedBy(graphPath)
 		// Snapshot the file's outgoing edges before eviction: resolved ones so
@@ -4102,7 +4264,7 @@ func (idx *Indexer) indexFile(
 		// the index (built=false) we fall back to the full recompute.
 		// Skipped under deferGlobalPasses — a batch caller (ReconcileAll,
 		// warmup) runs the global pass once at the end.
-		if !idx.deferGlobalPasses {
+		if !idx.deferGlobalPasses.Load() {
 			newCloneFuncs := cloneFuncNodes(result.Nodes)
 			// A file with no old or new function nodes cannot change clone
 			// topology. In particular, do not make the first JSON/Markdown/data
@@ -4146,7 +4308,7 @@ func (idx *Indexer) indexFile(
 			// their pre-enrichment tier until the next full reindex. This caller
 			// enforces Config.EnrichOnWatch; deferred batches use EnrichFiles.
 			providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
-			watchEnrichment := providersPresent && !idx.deferGlobalPasses && idx.semanticMgr.EnrichesOnWatch()
+			watchEnrichment := providersPresent && !idx.deferGlobalPasses.Load() && idx.semanticMgr.EnrichesOnWatch()
 			reEnriched := false
 			if watchEnrichment {
 				enrichStarted := time.Now()
@@ -4387,24 +4549,46 @@ func (idx *Indexer) ResolveAll() {
 // actually finds the file's nodes rather than silently no-opping and
 // leaving a stale subtree behind.
 func (idx *Indexer) EvictFile(filePath string) (int, int) {
-	absPath := filePath
-	if !filepath.IsAbs(absPath) {
-		absPath = filepath.Join(idx.rootPath, filePath)
+	root, err := idx.repositoryMutationRootPath()
+	if err != nil {
+		idx.logEvictFileError(filePath, err)
+		return 0, 0
 	}
-	// graphRelKey (OS-native + NFC), not relKey (slash + NFC): the graph
-	// stores nodes under OS-native separators, so a slash-form lookup
-	// would miss them on Windows and leave a stale subtree behind.
-	relPath := idx.graphRelKey(absPath)
-	// In multi-repo mode, the graph stores prefixed file paths.
-	graphPath := idx.prefixPath(relPath)
-	// Remove from search index.
-	for _, n := range idx.graph.GetFileNodes(graphPath) {
-		idx.removeFromSearch(n)
+	canonical, err := canonicalRepositoryMutationPath(root, filePath)
+	if err != nil {
+		idx.logEvictFileError(filePath, err)
+		return 0, 0
 	}
-	idx.restubIncomingRefs(graphPath)
-	idx.evictEnrichment(graphPath)
-	idx.deleteRefFactsForFiles(idx.repoPrefix, []string{graphPath})
-	return idx.graph.EvictFile(graphPath)
+	var nodesRemoved, edgesRemoved int
+	err = idx.coordinateRepositoryMutation(context.Background(), func() error {
+		var evictErr error
+		nodesRemoved, edgesRemoved, evictErr = idx.evictPointMutationRaw(canonical)
+		return evictErr
+	})
+	if err != nil {
+		idx.logEvictFileError(filePath, err)
+		return 0, 0
+	}
+	return nodesRemoved, edgesRemoved
+}
+
+func (idx *Indexer) logEvictFileError(filePath string, err error) {
+	if idx != nil && idx.logger != nil && err != nil {
+		idx.logger.Warn("indexer: file eviction failed", zap.String("file", filePath), zap.Error(err))
+	}
+}
+
+// evictPointMutationRaw is an already-held-lane executor. It preserves forced
+// removal semantics even when the canonical path still exists on disk.
+func (idx *Indexer) evictPointMutationRaw(path string) (int, int, error) {
+	if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
+		return owner.incrementalEvictRepoRaw(idx.repoPrefix, path)
+	}
+	current, err := idx.currentRepositoryMutationIndexer()
+	if err != nil {
+		return 0, 0, err
+	}
+	return current.incrementalEvictWatcherPath(path)
 }
 
 // ReresolveFileScoped forces the scoped re-resolution + LSP re-verify a normal
@@ -4416,6 +4600,26 @@ func (idx *Indexer) EvictFile(filePath string) (int, int) {
 // wired, its incremental enrichment. O(file), no whole-graph pass. No-op when
 // the file has no nodes (evicted since it was enqueued).
 func (idx *Indexer) ReresolveFileScoped(filePath string) error {
+	root, err := idx.repositoryMutationRootPath()
+	if err != nil {
+		return err
+	}
+	canonical, err := canonicalRepositoryMutationPath(root, filePath)
+	if err != nil {
+		return err
+	}
+	return idx.coordinateRepositoryMutation(context.Background(), func() error {
+		current, currentErr := idx.currentRepositoryMutationIndexer()
+		if currentErr != nil {
+			return currentErr
+		}
+		return current.reresolveFileScopedRaw(canonical)
+	})
+}
+
+// reresolveFileScopedRaw is the non-coordinating implementation used by
+// callers that already hold the repository lane.
+func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 	absPath := filePath
 	if !filepath.IsAbs(absPath) {
 		absPath = filepath.Join(idx.rootPath, filePath)
@@ -4461,34 +4665,6 @@ func (idx *Indexer) ReresolveFileScoped(filePath string) error {
 // agnostic: GetInEdges + ReindexEdges are the same Store primitives the
 // resolver uses, so this behaves identically on the in-memory and disk
 // stores.
-// evictEnrichment drops the per-node enrichment sidecar rows (churn,
-// coverage, release, blame — change A) for a file's nodes on the
-// delete/rename paths only, so a removed file leaves no orphan
-// enrichment. Capability-gated. A modify re-indexes the same node IDs
-// (enrichment stays valid) so it is NOT cascaded there.
-func (idx *Indexer) evictEnrichment(graphPath string) {
-	nodes := idx.graph.GetFileNodes(graphPath)
-	if len(nodes) == 0 {
-		return
-	}
-	ids := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		ids = append(ids, n.ID)
-	}
-	if w, ok := idx.graph.(graph.ChurnEnrichmentWriter); ok {
-		_ = w.DeleteChurn(ids)
-	}
-	if w, ok := idx.graph.(graph.CoverageEnrichmentWriter); ok {
-		_ = w.DeleteCoverage(ids)
-	}
-	if w, ok := idx.graph.(graph.ReleaseEnrichmentWriter); ok {
-		_ = w.DeleteReleases(ids)
-	}
-	if w, ok := idx.graph.(graph.BlameEnrichmentWriter); ok {
-		_ = w.DeleteBlame(ids)
-	}
-}
-
 func (idx *Indexer) restubIncomingRefs(graphPath string) {
 	nodes := idx.graph.GetFileNodes(graphPath)
 	if len(nodes) == 0 {
@@ -5401,7 +5577,14 @@ func (idx *Indexer) SetRootPath(root string) {
 // standalone entry point owns the complete parse, resolve, semantic, and exact
 // derived-pass pipeline; MultiIndexer uses the receipt-aware core directly.
 func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*IndexResult, error) {
-	return idx.incrementalReindexWatcherPaths(root, paths)
+	if err := idx.ensureRepositoryMutationRoot(root); err != nil {
+		return nil, err
+	}
+	canonical, err := canonicalRepositoryMutationPaths(root, paths)
+	if err != nil {
+		return nil, err
+	}
+	return idx.coordinateRepositoryReindex(context.Background(), canonical)
 }
 
 // incrementalDiscoverPaths discovers and refreshes files beneath paths without
@@ -5413,10 +5596,48 @@ func (idx *Indexer) incrementalDiscoverPaths(root string, paths []string) (*Inde
 	return idx.incrementalReindexPaths(root, paths, false)
 }
 
+// incrementalPathMode keeps forced point semantics private to the caller that
+// owns an explicit filesystem receipt. Reconcile, storm, and discovery callers
+// retain their historical mtime/Merkle filtering.
+type incrementalPathMode struct {
+	detectDeletions           bool
+	forceExplicitFiles        bool
+	surfaceFirstVersionChange bool
+	exactPointSemantic        bool
+}
+
+func (idx *Indexer) incrementalPathOwned(absPath string) bool {
+	graphPath := idx.prefixPath(idx.graphRelKey(absPath))
+	if len(idx.graph.GetFileNodes(graphPath)) > 0 {
+		return true
+	}
+	reader, ok := idx.graph.(graph.FileMetaPathReader)
+	if !ok {
+		return false
+	}
+	rows, err := reader.FileMetasByPaths(idx.repoPrefix, []string{graphPath})
+	if err != nil {
+		return false
+	}
+	_, ok = rows[graphPath]
+	return ok
+}
+
 func (idx *Indexer) incrementalReindexPaths(
 	root string,
 	paths []string,
 	detectDeletions bool,
+	markerBatches ...*reparsePendingEnrichmentBatch,
+) (*IndexResult, error) {
+	return idx.incrementalReindexPathsMode(root, paths, incrementalPathMode{
+		detectDeletions: detectDeletions,
+	}, markerBatches...)
+}
+
+func (idx *Indexer) incrementalReindexPathsMode(
+	root string,
+	paths []string,
+	mode incrementalPathMode,
 	markerBatches ...*reparsePendingEnrichmentBatch,
 ) (*IndexResult, error) {
 	fullRoot := len(paths) == 0
@@ -5445,6 +5666,7 @@ func (idx *Indexer) incrementalReindexPaths(
 	// disk; staleFiles is the subset that changed since the last pass.
 	diskFiles := make(map[string]bool)
 	var staleFiles []string
+	var forcedDeletedFiles []string
 
 	merkleMode := idx.merkleEnabled()
 
@@ -5472,6 +5694,9 @@ func (idx *Indexer) incrementalReindexPaths(
 			// a deleted file the caller still wants evicted. Deletion
 			// detection below handles it via scopeRels.
 			if errors.Is(statErr, os.ErrNotExist) {
+				if mode.forceExplicitFiles && idx.incrementalPathOwned(absPath) {
+					forcedDeletedFiles = append(forcedDeletedFiles, idx.relKey(absPath))
+				}
 				continue
 			}
 			return nil, fmt.Errorf("incremental reindex: stat %q: %w", p, statErr)
@@ -5522,7 +5747,7 @@ func (idx *Indexer) incrementalReindexPaths(
 		// regardless of the Unicode form the caller supplied.
 		relPath := idx.relKey(absPath)
 		diskFiles[relPath] = true
-		if !merkleMode && idx.IsStale(relPath) {
+		if mode.forceExplicitFiles || (!merkleMode && idx.IsStale(relPath)) {
 			staleFiles = append(staleFiles, absPath)
 		}
 	}
@@ -5541,6 +5766,7 @@ func (idx *Indexer) incrementalReindexPaths(
 			}
 		}
 	}
+	staleFiles = appendUniqueSorted(nil, staleFiles...)
 
 	// Restored snapshots populate fileMtimes without running IndexCtx. Preserve
 	// the full-tree health baseline that the retired reconciliation path set.
@@ -5550,21 +5776,31 @@ func (idx *Indexer) incrementalReindexPaths(
 	}
 
 	var deletedFiles []string
-	if detectDeletions {
+	if mode.detectDeletions {
 		// Deletion detection is deliberately opt-in. General scoped
 		// reconciles need it, while directory-create discovery must never
 		// consume a concurrent delete before the watcher can notify clients.
+		// Forced exact watcher paths additionally consult graph/file-meta
+		// ownership so a missing in-memory mtime cannot hide a real deletion.
+		candidateSet := make(map[string]struct{}, len(forcedDeletedFiles)+4)
+		for _, relPath := range forcedDeletedFiles {
+			candidateSet[relPath] = struct{}{}
+		}
 		idx.mtimeMu.RLock()
-		var candidates []string
 		for relPath := range idx.fileMtimes {
 			if diskFiles[relPath] {
 				continue
 			}
 			if relPathInScope(relPath, scopeRels) {
-				candidates = append(candidates, relPath)
+				candidateSet[relPath] = struct{}{}
 			}
 		}
 		idx.mtimeMu.RUnlock()
+		candidates := make([]string, 0, len(candidateSet))
+		for relPath := range candidateSet {
+			candidates = append(candidates, relPath)
+		}
+		sort.Strings(candidates)
 
 		for _, relPath := range candidates {
 			absPath := filepath.Join(absRoot, filepath.FromSlash(relPath))
@@ -5584,6 +5820,7 @@ func (idx *Indexer) incrementalReindexPaths(
 				zap.String("rel", relPath), zap.Error(statErr))
 		}
 	}
+	deletedFiles = appendUniqueSorted(nil, deletedFiles...)
 
 	// Capture surviving dependents before deletion evicts the target symbols and
 	// their incoming adjacency. The helper performs one batched node/edge
@@ -5594,8 +5831,8 @@ func (idx *Indexer) incrementalReindexPaths(
 	if len(markerBatches) > 0 && markerBatches[0] != nil {
 		markerBatch = markerBatches[0]
 	}
-	invalidation, reparsedFiles, failedFiles := idx.reindexIncrementalFilesBatched(
-		sourceStaleFiles, deletedFiles, markerBatch,
+	invalidation, reparsedFiles, failedFiles, versionChangedFiles := idx.reindexIncrementalFilesBatched(
+		sourceStaleFiles, deletedFiles, markerBatch, mode.surfaceFirstVersionChange,
 	)
 	manifestPlan, manifestFailed := idx.refreshIncrementalContractManifests(manifestFiles)
 	invalidation.Merge(manifestPlan)
@@ -5658,6 +5895,11 @@ func (idx *Indexer) incrementalReindexPaths(
 		FailedFiles:         failedFiles,
 		DurationMs:          time.Since(start).Milliseconds(),
 		DerivedInvalidation: invalidation,
+	}
+	if mode.surfaceFirstVersionChange && len(versionChangedFiles) > 0 {
+		result.mutationErr = fmt.Errorf(
+			"%w: %s", errFileVersionChanged, strings.Join(versionChangedFiles, ", "),
+		)
 	}
 	idx.warnIfEdgeSanityViolated(result)
 	// Partial work always queues the exact changed/deleted/dependent graph-file
