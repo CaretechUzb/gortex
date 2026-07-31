@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -391,11 +392,14 @@ func commonFilePrefix(files []string) string {
 	if len(files) == 0 {
 		return ""
 	}
-	prefix := filepath.Dir(filepath.ToSlash(files[0]))
+	// path.Dir, not filepath.Dir: the containment test below joins with "/",
+	// so a prefix cleaned to the OS separator could never match it on
+	// Windows and every cluster would report an empty prefix.
+	prefix := path.Dir(filepath.ToSlash(files[0]))
 	for _, f := range files[1:] {
-		dir := filepath.Dir(filepath.ToSlash(f))
+		dir := path.Dir(filepath.ToSlash(f))
 		for !strings.HasPrefix(dir+"/", prefix+"/") && prefix != "." && prefix != "/" {
-			prefix = filepath.Dir(prefix)
+			prefix = path.Dir(prefix)
 		}
 		if prefix == "." || prefix == "/" {
 			return ""

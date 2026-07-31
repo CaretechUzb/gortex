@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"hash/fnv"
+	"path"
 	"path/filepath"
 	"sort"
 
@@ -223,7 +224,11 @@ func packageKey(filePath string) string {
 	if filePath == "" {
 		return ""
 	}
-	dir := filepath.Dir(filepath.ToSlash(filePath))
+	// path.Dir, not filepath.Dir: these keys are compared against
+	// forward-slash keys elsewhere (the bundle cache mirrors this function),
+	// and filepath.Dir cleans to the OS separator, undoing the ToSlash on
+	// Windows.
+	dir := path.Dir(filepath.ToSlash(filePath))
 	if dir == "." {
 		return ""
 	}

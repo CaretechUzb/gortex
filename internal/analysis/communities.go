@@ -3,6 +3,7 @@ package analysis
 import (
 	"fmt"
 	"math"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -540,7 +541,7 @@ func inferCommunityLabel(members []string, nodeMap map[string]*graph.Node, files
 		return np
 	}
 
-	return filepath.Dir(files[0])
+	return path.Dir(filepath.ToSlash(files[0]))
 }
 
 // pureClusterLabel returns a name for clusters whose files share a
@@ -566,7 +567,10 @@ func pureClusterLabel(files []string) string {
 func mixedClusterLabel(files []string) string {
 	dirCount := make(map[string]int)
 	for _, f := range files {
-		dirCount[filepath.Dir(f)]++
+		// Graph file paths keep OS-native separators (see graphRelKey), so
+		// normalise before taking the directory: the result is rendered into
+		// the label and trimmed by helpers that split on "/".
+		dirCount[path.Dir(filepath.ToSlash(f))]++
 	}
 	if len(dirCount) == 0 {
 		return ""
@@ -603,9 +607,14 @@ func longestCommonDirPrefix(paths []string) string {
 	if len(paths) == 0 {
 		return ""
 	}
-	pfx := filepath.Dir(paths[0])
+	// Graph file paths keep OS-native separators (see graphRelKey), so
+	// normalise with ToSlash first, then take the directory with path.Dir —
+	// the trimming loop below cuts at "/", so a prefix carrying the OS
+	// separator could never be shortened and the function would bail out with
+	// "" on the first mismatch.
+	pfx := path.Dir(filepath.ToSlash(paths[0]))
 	for _, p := range paths[1:] {
-		dir := filepath.Dir(p)
+		dir := path.Dir(filepath.ToSlash(p))
 		for pfx != "" && !isPathPrefix(dir, pfx) {
 			cut := strings.LastIndex(pfx, "/")
 			if cut < 0 {

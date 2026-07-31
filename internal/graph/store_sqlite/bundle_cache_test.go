@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -97,6 +98,21 @@ func TestBundlePackageKey(t *testing.T) {
 	for in, want := range cases {
 		if got := bundlePackageKey(in); got != want {
 			t.Errorf("bundlePackageKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The key is looked up in a fingerprint map whose keys are forward-slash, so
+// it must never carry an OS separator. Stated separately from the table above
+// because the table only fails on a platform whose separator differs from "/",
+// and this spells out why that matters rather than leaving it to be rediscovered.
+func TestBundlePackageKeyNeverUsesOSSeparator(t *testing.T) {
+	if filepath.Separator == '/' {
+		t.Skip("separator matches the contract on this platform")
+	}
+	for _, in := range []string{"pkg/sub/x.go", "repoA/pkg/x.go", "a/b/c/d.go"} {
+		if got := bundlePackageKey(in); strings.ContainsRune(got, filepath.Separator) {
+			t.Errorf("bundlePackageKey(%q) = %q, must stay forward-slash", in, got)
 		}
 	}
 }
