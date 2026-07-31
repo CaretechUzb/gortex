@@ -6863,7 +6863,18 @@ func (idx *Indexer) prepareContractTypeResolution(
 		if len(names) == 0 {
 			continue
 		}
-		bf := bfCache.For(handlers[c.SymbolID])
+		handlerNode := handlers[c.SymbolID]
+		bf := bfCache.For(handlerNode)
+		// binding.Line comes from the handler's body, and the compiler
+		// bindings this site is looked up against are stored under the
+		// handler's own source file. c.FilePath names the registration site,
+		// which for a cross-file route is a different file — pairing the two
+		// would query <registration file>:<handler line> and either miss the
+		// binding or hit an unrelated one at the same line.
+		siteFile := c.FilePath
+		if handlerNode != nil && handlerNode.FilePath != "" {
+			siteFile = handlerNode.FilePath
+		}
 		for _, name := range names {
 			key := contractBindingKeyFor(c, name)
 			if _, exists := resolution.bindings[key]; exists {
@@ -6876,7 +6887,7 @@ func (idx *Indexer) prepareContractTypeResolution(
 			}
 			site := graph.SemanticBindingSite{
 				RepoPrefix: c.RepoPrefix,
-				FilePath:   c.FilePath,
+				FilePath:   siteFile,
 				Line:       binding.Line,
 				Name:       name,
 			}
