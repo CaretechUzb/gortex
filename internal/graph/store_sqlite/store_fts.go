@@ -543,14 +543,17 @@ func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit 
 	// Tier 0: exact-name lookup. Only engage for identifier-shaped
 	// queries (no whitespace / path separators); multi-word queries are
 	// concept searches that need BM25 ranking. We only short-circuit
-	// when the lookup hits at least one IN-SCOPE node — out-of-scope
-	// exact matches must not mask the scoped FTS tier below.
+	// when the lookup hits at least one IN-SCOPE, SYMBOL-LIKE node —
+	// out-of-scope exact matches must not mask the scoped FTS tier
+	// below, and neither may container/binding kinds: a .NET project
+	// module named "Extensions" would otherwise eclipse every
+	// `*Extensions` class the FTS ranks first.
 	if isIdentifierQuery(query) {
 		ns := s.FindNodesByName(query)
 		if len(ns) > 0 {
 			out := make([]graph.SymbolHit, 0, minInt(len(ns), limit))
 			for _, n := range ns {
-				if n == nil || n.ID == "" {
+				if n == nil || n.ID == "" || !tier0ShortCircuitKind(n.Kind) {
 					continue
 				}
 				// Unowned nodes (empty prefix) pass every repo narrow —
@@ -616,6 +619,22 @@ func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit 
 		return nil, err
 	}
 	return hits, nil
+}
+
+// tier0ShortCircuitKind reports whether an exact-name hit may
+// short-circuit the FTS tier. Container and binding kinds are excluded:
+// they share names with the symbols users actually search for (a
+// project/module named X vs the X* classes inside it) and a search page
+// of containers eclipses the ranked symbols outright. They remain
+// reachable through the FTS tier's own ranking.
+func tier0ShortCircuitKind(k graph.NodeKind) bool {
+	switch k {
+	case graph.KindModule, graph.KindPackage, graph.KindFile, graph.KindImport,
+		graph.KindLocal, graph.KindParam, graph.KindGenericParam, graph.KindClosure,
+		graph.KindBuiltin:
+		return false
+	}
+	return true
 }
 
 // buildFTSMatch tokenises the query with the write-side splitter and

@@ -108,6 +108,52 @@ func TestSearchSymbolsRepoScoped_AdmitsUnownedNodes(t *testing.T) {
 	}
 }
 
+// TestSearchSymbols_ExactNameModuleDoesNotEclipseFTS: an exact-name
+// tier-0 hit that is only a container node (module / package — e.g.
+// a .NET project named "Extensions") must not short-circuit the FTS
+// tier where the real classes rank. Observed live: two csproj module
+// nodes named "Extensions" eclipsed 63 `*Extensions` types.
+func TestSearchSymbols_ExactNameModuleDoesNotEclipseFTS(t *testing.T) {
+	s := floodedScopeStore(t, 3)
+
+	for i, id := range []string{"module::x:app/Core/Extensions", "app/pkgdecoy::Extensions"} {
+		kind := graph.KindModule
+		if i == 1 {
+			kind = graph.KindPackage
+		}
+		s.AddNode(&graph.Node{ID: id, Kind: kind, Name: "Extensions", Language: "go", RepoPrefix: "app"})
+		if err := s.UpsertSymbolFTS(id, "extensions"); err != nil {
+			t.Fatalf("UpsertSymbolFTS(%s): %v", id, err)
+		}
+	}
+
+	hits, err := s.SearchSymbolsRepoScoped("Extensions", []string{"app"}, 20)
+	if err != nil {
+		t.Fatalf("SearchSymbolsRepoScoped: %v", err)
+	}
+	found := map[string]bool{}
+	for _, h := range hits {
+		found[h.NodeID] = true
+	}
+	if !found["app/widget.go::WidgetExtensions"] {
+		t.Fatalf("container-kind exact-name hits eclipsed the FTS tier; hits=%+v", hits)
+	}
+}
+
+// TestSearchSymbols_ExactNameTypeStillShortCircuits: a genuine
+// exact-name symbol hit keeps the tier-0 fast path.
+func TestSearchSymbols_ExactNameTypeStillShortCircuits(t *testing.T) {
+	s := floodedScopeStore(t, 3)
+
+	hits, err := s.SearchSymbolsRepoScoped("WidgetExtensions", []string{"app"}, 20)
+	if err != nil {
+		t.Fatalf("SearchSymbolsRepoScoped: %v", err)
+	}
+	if len(hits) != 1 || hits[0].NodeID != "app/widget.go::WidgetExtensions" || hits[0].Score != 100.0 {
+		t.Fatalf("exact-name type must keep the tier-0 fast path; hits=%+v", hits)
+	}
+}
+
 // TestSearchSymbolsRepoScoped_EmptyScopeMatchesUnscoped: a nil allow
 // list means no repo narrowing — identical behaviour to SearchSymbols.
 func TestSearchSymbolsRepoScoped_EmptyScopeMatchesUnscoped(t *testing.T) {
