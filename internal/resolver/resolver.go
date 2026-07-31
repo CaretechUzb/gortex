@@ -2459,7 +2459,7 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 // check makes a second sweep a no-op). Caller holds r.mu.
 func (r *Resolver) runFileAttributionPassesLocked() {
 	// Announce each sub-pass up front: several run 30-90s on a large cold
-	// graph, and the retrospective breakdown below only lands after ALL six —
+	// graph, and the retrospective breakdown below only lands after ALL passes —
 	// until then the log was silent for the whole sweep.
 	sub := func(pass string) {
 		r.logger.Info("resolver: attribution sub-pass starting", zap.String("pass", pass))
@@ -2471,11 +2471,40 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 	sub("bind_bare_name_scope_refs")
 	r.bindBareNameScopeRefs()
 	t2 := time.Now()
+	sub("shared_dataflow_generic_census")
+	census, censusStats := r.buildPostBareAttributionCensus(defaultAttributionCensusLimits)
+	censusDone := time.Now()
+	censusUsed := census != nil
+	if census != nil {
+		defer census.close()
+	}
+	r.logger.Info("resolver: shared attribution census",
+		zap.Bool("used", censusUsed),
+		zap.String("fallback_reason", censusStats.fallbackReason),
+		zap.Int("rows_scanned", censusStats.rowsScanned),
+		zap.Int("dataflow_candidates", censusStats.dataflowCandidates),
+		zap.Int("generic_candidates", censusStats.genericCandidates),
+		zap.Int64("retained_bytes_estimate", censusStats.retainedBytes),
+		zap.Int("candidate_cap", defaultAttributionCensusLimits.maxCandidates),
+		zap.Int64("retained_bytes_cap", defaultAttributionCensusLimits.maxRetainedBytes),
+		zap.Duration("elapsed", censusDone.Sub(t2)))
 	sub("bind_dataflow_callee_refs")
-	r.bindDataflowCalleeRefs()
+	if census != nil {
+		r.bindDataflowCalleeRefsFromCensus(census)
+		// The callee index and dataflow identities are the largest retained
+		// census state. Drop both before generic-owner indexing starts.
+		census.releaseDataflow()
+	} else {
+		r.bindDataflowCalleeRefs()
+	}
 	t3 := time.Now()
 	sub("bind_generic_param_refs")
-	r.bindGenericParamRefs()
+	if census != nil {
+		r.bindGenericParamRefsFromCensus(census)
+		census.releaseGeneric()
+	} else {
+		r.bindGenericParamRefs()
+	}
 	t4 := time.Now()
 	sub("attribute_go_builtins")
 	r.attributeGoBuiltins()
@@ -2495,7 +2524,9 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 	r.logger.Info("resolver: attribution sub-passes",
 		zap.Duration("rebind_go_method_receivers", t1.Sub(t0)),
 		zap.Duration("bind_bare_name_scope_refs", t2.Sub(t1)),
-		zap.Duration("bind_dataflow_callee_refs", t3.Sub(t2)),
+		zap.Duration("shared_dataflow_generic_census", censusDone.Sub(t2)),
+		zap.Bool("shared_dataflow_generic_census_used", censusUsed),
+		zap.Duration("bind_dataflow_callee_refs", t3.Sub(censusDone)),
 		zap.Duration("bind_generic_param_refs", t4.Sub(t3)),
 		zap.Duration("attribute_go_builtins", t5.Sub(t4)),
 		zap.Duration("attribute_go_external_calls", t6.Sub(t5)),
