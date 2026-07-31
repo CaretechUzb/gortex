@@ -153,6 +153,133 @@ func TestIsCSharpExtension_LanguageGated(t *testing.T) {
 		"a Scala extension node must not be treated as a C# extension")
 }
 
+// TestResolveCSharpExtension_EnclosingNamespaceNarrows: two same-named,
+// same-receiver-type extensions in different module namespaces; the caller's
+// own enclosing namespace makes exactly one visible, so an untyped receiver
+// (a property — no receiver_type evidence) still binds to its module's copy.
+// This is the DI-configuration shape: every module defines its own
+// `ContainerExtensions.Validate(this IContainer)` and calls it from Startup.
+func TestResolveCSharpExtension_EnclosingNamespaceNarrows(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"ModA/Ext.cs": `namespace ModA {
+    public static class ContainerExtensions {
+        public static int Foo(this IBox b) { return 1; }
+    }
+}`,
+		"ModB/Ext.cs": `namespace ModB {
+    public static class ContainerExtensions {
+        public static int Foo(this IBox b) { return 2; }
+    }
+}`,
+		"ModB/Startup.cs": `namespace ModB {
+    public class Startup {
+        public IBox Container { get; set; }
+        public void Configure() {
+            Container.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "ModB/Startup.cs::Startup.Configure")
+	require.Equal(t, "ModB/Ext.cs::ContainerExtensions.Foo", target,
+		"caller in ModB must bind ModB's extension, not stay unresolved or cross modules")
+}
+
+// TestResolveCSharpExtension_UsingDirectiveBreaksTypedTie: a typed receiver
+// matches two same-named extensions on the same receiver type; the caller
+// file's using directive makes only one namespace visible, which breaks the
+// tie the typed pass alone refuses to guess on.
+func TestResolveCSharpExtension_UsingDirectiveBreaksTypedTie(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"LibA/Ext.cs": `namespace LibA {
+    public static class EA {
+        public static int Foo(this Widget w) { return 1; }
+    }
+}`,
+		"LibB/Ext.cs": `namespace LibB {
+    public static class EB {
+        public static int Foo(this Widget w) { return 2; }
+    }
+}`,
+		"Widget.cs": `namespace App {
+    public class Widget {}
+}`,
+		"Caller.cs": `using LibA;
+namespace App {
+    public class Runner {
+        public void Run() {
+            Widget w = new Widget();
+            w.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.Equal(t, "LibA/Ext.cs::EA.Foo", target,
+		"the using-visible extension must win the typed tie")
+	for _, e := range g.GetOutEdges("Caller.cs::Runner.Run") {
+		if e.Kind == graph.EdgeCalls && e.To == target {
+			assert.InDelta(t, 0.9, e.Confidence, 0.001, "typed+visible bind keeps the typed tier")
+		}
+	}
+}
+
+// TestResolveCSharpExtension_BothVisibleStaysUnresolved: visibility narrowing
+// must narrow, not guess — when the caller imports both candidate namespaces,
+// an untyped receiver still refuses to pick.
+func TestResolveCSharpExtension_BothVisibleStaysUnresolved(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"LibA/Ext.cs": `namespace LibA {
+    public static class EA { public static int Foo(this string s) { return 1; } }
+}`,
+		"LibB/Ext.cs": `namespace LibB {
+    public static class EB { public static int Foo(this int n) { return 2; } }
+}`,
+		"Caller.cs": `using LibA;
+using LibB;
+namespace App {
+    public class Runner {
+        public void Run(Thing t) {
+            t.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.NotEmpty(t, target)
+	assert.True(t, graph.IsUnresolvedTarget(target),
+		"two visible candidates must stay unresolved, got %q", target)
+}
+
+// TestResolveCSharpExtension_NothingVisibleFallsBackToUnique: narrowing is
+// narrowing-only — when no candidate namespace is visible from the caller
+// (stale or partial using data), the pre-existing unique-name bind survives.
+func TestResolveCSharpExtension_NothingVisibleFallsBackToUnique(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Lib/Ext.cs": `namespace LibX {
+    public static class E { public static int Foo(this string s) { return 1; } }
+}`,
+		"Caller.cs": `namespace App {
+    public class Runner {
+        public void Run() {
+            "a".Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.Equal(t, "Lib/Ext.cs::E.Foo", target,
+		"a repo-unique extension must still bind when nothing is visible")
+}
+
 // TestResolveCSharpExtension_InstanceWins: an instance method beats an extension
 // of the same name (C# member-lookup precedence).
 func TestResolveCSharpExtension_InstanceWins(t *testing.T) {
