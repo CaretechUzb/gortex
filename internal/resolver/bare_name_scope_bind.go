@@ -64,32 +64,19 @@ func (r *Resolver) bindBareNameScopeRefs() {
 		return
 	}
 
-	var batch []graph.EdgeReindex
-	for e := range r.graph.EdgesByKind(graph.EdgeReads) {
-		if rewrote := r.tryBindBareName(e, owned); rewrote != "" {
-			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: rewrote})
-		}
-	}
-	for e := range r.graph.EdgesByKind(graph.EdgeReferences) {
-		if rewrote := r.tryBindBareName(e, owned); rewrote != "" {
-			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: rewrote})
-		}
-	}
 	// EdgeArgOf and EdgeValueFlow carry the same shape — `unresolved::<name>`
 	// is the dataflow source/target the parser couldn't bind.
-	for e := range r.graph.EdgesByKind(graph.EdgeArgOf) {
-		if rewrote := r.tryBindBareName(e, owned); rewrote != "" {
-			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: rewrote})
-		}
-	}
-	for e := range r.graph.EdgesByKind(graph.EdgeValueFlow) {
-		if rewrote := r.tryBindBareName(e, owned); rewrote != "" {
-			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: rewrote})
-		}
-	}
-	if len(batch) > 0 {
-		r.graph.ReindexEdges(batch)
-	}
+	r.reindexAttributionEdgesBatched(
+		[]graph.EdgeKind{
+			graph.EdgeReads,
+			graph.EdgeReferences,
+			graph.EdgeArgOf,
+			graph.EdgeValueFlow,
+		},
+		func(edge *graph.Edge) string {
+			return r.tryBindBareName(edge, owned)
+		},
+	)
 }
 
 // bindBareNameScopeRefsForFile is the single-file scope of
@@ -119,16 +106,14 @@ func (r *Resolver) bindBareNameScopeRefsForFile(filePath string) {
 		return
 	}
 
-	var batch []graph.EdgeReindex
-	for _, e := range r.fileOutEdges(filePath) {
-		switch e.Kind {
+	collector := newAttributionReindexCollector(r)
+	for _, edge := range r.fileOutEdges(filePath) {
+		switch edge.Kind {
 		case graph.EdgeReads, graph.EdgeReferences, graph.EdgeArgOf, graph.EdgeValueFlow:
-			if rewrote := r.tryBindBareName(e, owned); rewrote != "" {
-				batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: rewrote})
-			}
+			collector.add(edge, r.tryBindBareName(edge, owned))
 		}
 	}
-	r.persistAttributionReindexes(batch)
+	collector.flush()
 }
 
 // tryBindBareName tries to rewrite e.To from `unresolved::<name>` to a
