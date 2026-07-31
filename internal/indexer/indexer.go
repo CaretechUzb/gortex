@@ -3852,6 +3852,32 @@ func (idx *Indexer) repoNodeEdgeCount() (int, int) {
 	return est.NodeCount, est.EdgeCount
 }
 
+// cleanCensusResult publishes the same zero-delta state as the full-root
+// incremental pipeline after ChangedSinceMtimes has already proved the tree
+// unchanged. It preserves the one necessary side effect for non-persistent
+// search backends without repeating filesystem discovery.
+func (idx *Indexer) cleanCensusResult(detected int, started time.Time) *IndexResult {
+	if idx.totalDetected == 0 {
+		idx.totalDetected = detected
+	}
+	if !isSymbolSearcherBackend(idx.search) {
+		idx.buildSearchIndex()
+	}
+	nodes, edges := idx.repoNodeEdgeCount()
+	fileCount := idx.trackedFileCount()
+	if fileCount == 0 {
+		fileCount = detected
+	}
+	result := &IndexResult{
+		NodeCount:  nodes,
+		EdgeCount:  edges,
+		FileCount:  fileCount,
+		DurationMs: time.Since(started).Milliseconds(),
+	}
+	idx.warnIfEdgeSanityViolated(result)
+	return result
+}
+
 // warnIfEdgeSanityViolated logs a loud warning when an index pass
 // produced files and symbol nodes but no edges — see
 // IndexResult.EdgeSanityViolated.
@@ -8467,16 +8493,29 @@ func (idx *Indexer) HasChangesSinceMtimes(root string) bool {
 // caller treats that as "unknown, do a full re-track", exactly as
 // HasChangesSinceMtimes conservatively returns true on the same condition.
 func (idx *Indexer) ChangedSinceMtimes(root string) (changed []string, deleted []string, err error) {
+	changed, deleted, _, err = idx.changedSinceMtimesCensus(root)
+	return changed, deleted, err
+}
+
+// changedSinceMtimesCensus also returns the complete tracked-source count from
+// the same walk. ReconcileRepoCtx uses that count to publish an honest clean
+// result without repeating the full-tree discovery in the incremental path.
+func (idx *Indexer) changedSinceMtimesCensus(root string) (
+	changed []string,
+	deleted []string,
+	detected int,
+	err error,
+) {
 	absRoot, absErr := filepath.Abs(root)
 	if absErr != nil {
-		return nil, nil, absErr
+		return nil, nil, 0, absErr
 	}
 	idx.storeRootPath(absRoot)
 
 	diskFiles := make(map[string]bool)
 	walkErr := filepath.WalkDir(absRoot, func(path string, d os.DirEntry, werr error) error {
 		if werr != nil {
-			return nil
+			return werr
 		}
 		if d.IsDir() {
 			if idx.shouldPruneDir(path, absRoot) {
@@ -8484,7 +8523,7 @@ func (idx *Indexer) ChangedSinceMtimes(root string) (changed []string, deleted [
 			}
 			return nil
 		}
-		if _, ok := idx.effectiveLanguage(path, nil); !ok {
+		if _, ok := idx.effectiveLanguage(path, nil); !ok && !idx.isIncrementalContractManifest(path) {
 			return nil
 		}
 		if idx.shouldExclude(path, absRoot, false) {
@@ -8498,25 +8537,31 @@ func (idx *Indexer) ChangedSinceMtimes(root string) (changed []string, deleted [
 		return nil
 	})
 	if walkErr != nil {
-		return nil, nil, walkErr
+		return nil, nil, 0, walkErr
 	}
 
-	// Deletion check: a previously-indexed file absent from the walk and
-	// confirmed gone from disk counts as a change (its edges must drop).
+	// Deletion check mirrors the modern incremental path: missing files and
+	// files that became excluded must both leave the restored graph.
 	idx.mtimeMu.RLock()
-	var candidates []string
+	candidates := make([]string, 0)
 	for rel := range idx.fileMtimes {
 		if !diskFiles[rel] {
 			candidates = append(candidates, rel)
 		}
 	}
 	idx.mtimeMu.RUnlock()
+	sort.Strings(candidates)
 	for _, rel := range candidates {
-		if _, statErr := os.Stat(filepath.Join(absRoot, filepath.FromSlash(rel))); errors.Is(statErr, os.ErrNotExist) {
+		absPath := filepath.Join(absRoot, filepath.FromSlash(rel))
+		_, statErr := os.Stat(absPath)
+		switch {
+		case statErr == nil && idx.shouldExclude(absPath, absRoot, false):
+			deleted = append(deleted, rel)
+		case errors.Is(statErr, os.ErrNotExist):
 			deleted = append(deleted, rel)
 		}
 	}
-	return changed, deleted, nil
+	return changed, deleted, len(diskFiles), nil
 }
 
 func (idx *Indexer) IsStale(relPath string) bool {
