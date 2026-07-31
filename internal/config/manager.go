@@ -190,8 +190,14 @@ func (cm *ConfigManager) readWorkspaceConfig(repoPrefix, repoPath string) (*Conf
 		return nil, false
 	}
 
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	// Seed with Default() and unmarshal the file OVER it — the same
+	// overlay semantics config.Load() applies. A zero-value seed turned
+	// the file's mere presence into a wholesale replacement: every field
+	// a partial .gortex.yaml didn't mention lost its documented default
+	// (unset index.workers → parse pool of 1, unset
+	// max_parse_bytes_in_flight → admission semaphore disabled).
+	cfg := Default()
+	if err := yaml.Unmarshal(data, cfg); err != nil {
 		// Malformed workspace config — log warning, keep the last good parse.
 		cm.logger.Warn("malformed workspace config, keeping the last good parse",
 			zap.String("repo", repoPrefix),
@@ -200,7 +206,7 @@ func (cm *ConfigManager) readWorkspaceConfig(repoPrefix, repoPath string) (*Conf
 		return nil, false
 	}
 
-	return &cfg, true
+	return cfg, true
 }
 
 // publishWorkspaceConfig publishes a per-repo state transition and advances
