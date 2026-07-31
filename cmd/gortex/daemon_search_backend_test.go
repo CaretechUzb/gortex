@@ -49,13 +49,14 @@ func TestResolveSearchBackend_SymbolSearcherBackend(t *testing.T) {
 }
 
 func TestResolveSearchBackend_SymbolSearcherBackend_CountFromIndex(t *testing.T) {
-	// Adds and removes move the adapter's delta; the reported figure must
-	// still be the index's own count, not that delta.
+	// Adds and removes move the adapter's delta. Count combines that delta
+	// with the persisted baseline, while status still reports the index's own
+	// authoritative count.
 	b := search.NewSymbolSearcherBackend(countingSymbolSearcher{count: 48572})
 	b.Add("node-1")
 	b.Remove("node-2")
 	b.Remove("node-3")
-	assert.Negative(t, b.Count(), "precondition: the delta is negative here")
+	assert.Equal(t, 48571, b.Count(), "Count must combine the persisted baseline with the adapter delta")
 
 	info := resolveSearchBackend(b)
 

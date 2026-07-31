@@ -552,11 +552,10 @@ type SymbolSearcher interface {
 	SearchSymbols(query string, limit int) ([]SymbolHit, error)
 }
 
-// SymbolFTSCounter is the optional authoritative document count. The
-// search.Backend Count() contract reports a since-construction delta of the
-// indexer's Add/Remove calls, which is not a corpus size and can legitimately
-// be negative; anything that wants to report how many documents are actually
-// indexed must ask the store instead of the adapter.
+// SymbolFTSCounter is the optional authoritative document count. Search
+// adapters use it to seed readiness lazily, while user-facing reporting reads
+// it directly because the adapter's cached snapshot plus incremental deltas can
+// drift from the current corpus size.
 type SymbolFTSCounter interface {
 	SymbolFTSCount() (int, error)
 }
