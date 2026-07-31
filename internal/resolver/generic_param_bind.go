@@ -22,29 +22,7 @@ import (
 // inside its body. The owner-keyed index built here lets each edge
 // resolve in O(1) without re-walking the graph.
 func (r *Resolver) bindGenericParamRefs() {
-	// owner-function ID → set of tparam-name → tparam-node-id.
-	owned := map[string]map[string]string{}
-	for n := range graph.NamedLanguageNodesSeq(r.graph, graph.KindGenericParam) {
-		if n.Language != "go" || n.Name == "" {
-			continue
-		}
-		owner := enclosingFunctionForBinding(n.ID)
-		if owner == "" || owner == n.ID {
-			continue
-		}
-		set, ok := owned[owner]
-		if !ok {
-			set = map[string]string{}
-			owned[owner] = set
-		}
-		// Don't overwrite — two tparams with the same name in the
-		// same function shouldn't happen in valid Go, but be defensive.
-		if _, dup := set[n.Name]; dup {
-			set[n.Name] = ""
-			continue
-		}
-		set[n.Name] = n.ID
-	}
+	owned := r.buildGenericParamOwnerIndex()
 	if len(owned) == 0 {
 		return
 	}
@@ -69,6 +47,50 @@ func (r *Resolver) bindGenericParamRefs() {
 	if len(batch) > 0 {
 		r.graph.ReindexEdges(batch)
 	}
+}
+
+func (r *Resolver) buildGenericParamOwnerIndex() map[string]map[string]string {
+	// owner-function ID → set of tparam-name → tparam-node-id.
+	owned := map[string]map[string]string{}
+	for n := range graph.NamedLanguageNodesSeq(r.graph, graph.KindGenericParam) {
+		if n.Language != "go" || n.Name == "" {
+			continue
+		}
+		owner := enclosingFunctionForBinding(n.ID)
+		if owner == "" || owner == n.ID {
+			continue
+		}
+		set, ok := owned[owner]
+		if !ok {
+			set = map[string]string{}
+			owned[owner] = set
+		}
+		// Don't overwrite — two tparams with the same name in the
+		// same function shouldn't happen in valid Go, but be defensive.
+		if _, dup := set[n.Name]; dup {
+			set[n.Name] = ""
+			continue
+		}
+		set[n.Name] = n.ID
+	}
+	return owned
+}
+
+func (r *Resolver) bindGenericParamRefsFromCensus(census *postBareAttributionCensus) {
+	if census == nil {
+		return
+	}
+	owned := r.buildGenericParamOwnerIndex()
+	if len(owned) == 0 {
+		return
+	}
+	r.reindexAttributionIdentitiesBatched(
+		census.finder,
+		census.genericCandidates,
+		func(edge *graph.Edge) string {
+			return r.tryBindGenericParam(edge, owned)
+		},
+	)
 }
 
 // bindGenericParamRefsForFile is the single-file-resolve form of
@@ -115,11 +137,11 @@ func (r *Resolver) bindGenericParamRefsForFile(filePath string) {
 // tryBindGenericParam returns the old To value (for batched reindex)
 // when the edge was rewritten, or "" when left alone.
 func (r *Resolver) tryBindGenericParam(e *graph.Edge, owned map[string]map[string]string) string {
-	if e == nil || !strings.HasPrefix(e.To, "unresolved::") {
+	if e == nil {
 		return ""
 	}
-	name := strings.TrimPrefix(e.To, "unresolved::")
-	if name == "" || strings.ContainsAny(name, ".*:#") {
+	name, ok := genericParamTargetName(e.To)
+	if !ok {
 		return ""
 	}
 	ownerID := enclosingFunctionForBinding(e.From)
@@ -137,4 +159,19 @@ func (r *Resolver) tryBindGenericParam(e *graph.Edge, owned map[string]map[strin
 	oldTo := e.To
 	e.To = target
 	return oldTo
+}
+
+// genericParamTargetName is the exact target-shape gate shared by the light
+// census and tryBindGenericParam. Repo-qualified unresolved targets remain
+// excluded: type parameters are owned by the source function and use the bare
+// unresolved::<name> representation.
+func genericParamTargetName(to string) (string, bool) {
+	if !strings.HasPrefix(to, "unresolved::") {
+		return "", false
+	}
+	name := strings.TrimPrefix(to, "unresolved::")
+	if name == "" || strings.ContainsAny(name, ".*:#") {
+		return "", false
+	}
+	return name, true
 }

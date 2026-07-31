@@ -55,3 +55,34 @@ func (r *Resolver) reindexAttributionEdgesBatched(
 	})
 	collector.flush()
 }
+
+// reindexAttributionIdentitiesBatched exact-refetches census candidates in
+// bounded pages. Re-fetching immediately before each pass preserves sequential
+// attribution semantics: an edge retargeted or removed after the census no
+// longer exists under its old logical identity and is therefore not
+// resurrected. The finder never receives more than the existing attribution
+// payload bound, and each page is persisted before its full rows are released.
+func (r *Resolver) reindexAttributionIdentitiesBatched(
+	finder graph.EdgeIdentityBatchFinder,
+	identities []graph.EdgeIdentity,
+	rewrite func(*graph.Edge) string,
+) {
+	if finder == nil || rewrite == nil {
+		return
+	}
+	for start := 0; start < len(identities); start += attributionReindexBatchSize {
+		end := start + attributionReindexBatchSize
+		if end > len(identities) {
+			end = len(identities)
+		}
+		page := identities[start:end]
+		current := finder.FindEdgesByIdentities(page)
+		collector := newAttributionReindexCollector(r)
+		for _, identity := range page {
+			if edge := current[identity]; edge != nil {
+				collector.add(edge, rewrite(edge))
+			}
+		}
+		collector.flush()
+	}
+}

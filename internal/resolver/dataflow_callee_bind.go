@@ -41,16 +41,7 @@ import (
 // materializeDataflowParams (which then refines a resolved function/method
 // callee to its param node).
 func (r *Resolver) bindDataflowCalleeRefs() {
-	idx := newCalleeIndex()
-	for node := range graph.CallableBindingNodesSeq(r.graph, graph.KindFunction, graph.KindMethod) {
-		if node.Name == "" || node.FilePath == "" {
-			continue
-		}
-		indexName(idx.byFile, node.FilePath, node.Name, node.ID)
-		if node.Kind == graph.KindFunction {
-			indexName(idx.byDir, filepath.Dir(node.FilePath), node.Name, node.ID)
-		}
-	}
+	idx := r.buildCalleeIndex()
 	for _, k := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
 		for e := range graph.EdgesLightSeq(r.graph, k) {
 			idx.indexCallSite(e)
@@ -61,6 +52,37 @@ func (r *Resolver) bindDataflowCalleeRefs() {
 	}
 	r.reindexAttributionEdgesBatched(
 		[]graph.EdgeKind{graph.EdgeArgOf, graph.EdgeValueFlow},
+		func(edge *graph.Edge) string {
+			return bindDataflowCalleeEdge(edge, idx)
+		},
+	)
+}
+
+func (r *Resolver) buildCalleeIndex() *calleeIndex {
+	idx := newCalleeIndex()
+	for node := range graph.CallableBindingNodesSeq(r.graph, graph.KindFunction, graph.KindMethod) {
+		if node.Name == "" || node.FilePath == "" {
+			continue
+		}
+		indexName(idx.byFile, node.FilePath, node.Name, node.ID)
+		if node.Kind == graph.KindFunction {
+			indexName(idx.byDir, filepath.Dir(node.FilePath), node.Name, node.ID)
+		}
+	}
+	return idx
+}
+
+func (r *Resolver) bindDataflowCalleeRefsFromCensus(census *postBareAttributionCensus) {
+	if census == nil || census.callee == nil {
+		return
+	}
+	idx := census.callee
+	if len(idx.byFile) == 0 && len(idx.bySite) == 0 {
+		return
+	}
+	r.reindexAttributionIdentitiesBatched(
+		census.finder,
+		census.dataflowCandidates,
 		func(edge *graph.Edge) string {
 			return bindDataflowCalleeEdge(edge, idx)
 		},
@@ -154,7 +176,7 @@ func indexName(m map[string]map[string][]string, key, name, id string) {
 // rewrite happened (for the batched reindex) or "" when the edge was left alone
 // (not an unresolved target, no unambiguous match, or a shape another pass owns).
 func bindDataflowCalleeEdge(e *graph.Edge, idx *calleeIndex) string {
-	if e == nil || !graph.IsUnresolvedTarget(e.To) {
+	if e == nil || !dataflowCalleeTargetShape(e.To) {
 		return ""
 	}
 	name := graph.UnresolvedName(e.To)
@@ -188,6 +210,23 @@ func bindDataflowCalleeEdge(e *graph.Edge, idx *calleeIndex) string {
 	oldTo := e.To
 	e.To = chosen
 	return oldTo
+}
+
+// dataflowCalleeTargetShape is the edge-only admission predicate shared by
+// the light census and the authoritative binder. It deliberately excludes
+// every shape bindDataflowCalleeEdge would reject before consulting an index,
+// so retaining an identity can over-collect only on graph evidence, never on
+// syntax; the exact-refetched edge still runs through the full binder.
+func dataflowCalleeTargetShape(to string) bool {
+	if !graph.IsUnresolvedTarget(to) {
+		return false
+	}
+	name := graph.UnresolvedName(to)
+	if strings.HasPrefix(name, "*.") {
+		method := name[2:]
+		return method != "" && !strings.ContainsAny(method, ".*:#")
+	}
+	return name != "" && !strings.ContainsAny(name, ".*:#")
 }
 
 // uniqueSiteCallee returns the sole resolved callee at a call site whose id
