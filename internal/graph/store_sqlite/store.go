@@ -55,6 +55,11 @@ type Store struct {
 	busyRetries        atomic.Uint64
 	busyRetryExhausted atomic.Uint64
 
+	// passiveCheckpointTimeout bounds one periodic PASSIVE checkpoint. The zero
+	// value selects walPassiveCheckpointTimeout; tests shorten it to exercise
+	// the writer-pool deadline deterministically.
+	passiveCheckpointTimeout time.Duration
+
 	// dbPath is the on-disk SQLite file path, retained for size
 	// telemetry — the WAL high-water mark surfaces in daemon_health so a
 	// runaway -wal is observable rather than silently filling the disk.
@@ -561,6 +566,13 @@ func (s *Store) runCheckpointLoop(interval time.Duration) {
 	}
 }
 
+func (s *Store) passiveCheckpointWindow() time.Duration {
+	if s.passiveCheckpointTimeout > 0 {
+		return s.passiveCheckpointTimeout
+	}
+	return walPassiveCheckpointTimeout
+}
+
 func (s *Store) checkpointWALPassive() {
 	if !s.writeMu.TryLock() {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_gate")
@@ -572,12 +584,31 @@ func (s *Store) checkpointWALPassive() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), walPassiveCheckpointTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.passiveCheckpointWindow())
 	defer cancel()
 	result, err := s.checkpointWALOnce(ctx, "PASSIVE")
-	if err != nil {
-		log.Printf("store_sqlite: wal checkpoint incomplete mode=PASSIVE busy=%d wal_frames=%d checkpointed_frames=%d error=%q", result.Busy, result.WALFrames, result.CheckpointedFrames, err)
+	if err == nil {
+		return
 	}
+
+	// An expired window means the writer pool was still pinned — typically by a
+	// bulk index — so `PRAGMA wal_checkpoint(PASSIVE)` never executed and
+	// result is the zero value. Reporting those unset fields as busy=0
+	// wal_frames=0 checkpointed_frames=0 states measurements SQLite never
+	// made, and "incomplete" describes a drain that ran and fell short. This
+	// is the third deferral shape, a sibling of the writer_gate and
+	// bulk_writer branches above; the WAL is drained on a later tick or by the
+	// final TRUNCATE checkpoint. Some drivers surface their own error on
+	// cancellation instead of wrapping the context one, so check both.
+	if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
+		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_busy")
+		return
+	}
+
+	// The PRAGMA did run: result carries real counters and either frames were
+	// left behind (reader-limited) or the driver failed. That is a genuine
+	// measurement and stays a warning.
+	log.Printf("store_sqlite: wal checkpoint incomplete mode=PASSIVE busy=%d wal_frames=%d checkpointed_frames=%d error=%q", result.Busy, result.WALFrames, result.CheckpointedFrames, err)
 }
 
 // CheckpointWAL runs `PRAGMA wal_checkpoint(TRUNCATE)`: it flushes the

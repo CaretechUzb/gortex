@@ -11,6 +11,7 @@ terms (Apache 2.0, Section 5).
 | Name | GitHub | Added |
 |------|--------|-------|
 | Andrey Kumanyaev | [@zzet](https://github.com/zzet) | 2024-01-01 |
+| Tien Dung Dao | [@tiendungdev](https://github.com/tiendungdev) | 2026-07-31 |
 
 ## Past Contributors
 
