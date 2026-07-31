@@ -1203,13 +1203,10 @@ func collectSnapshotRepos(mi *indexer.MultiIndexer) []snapshotRepo {
 		if m == nil {
 			continue
 		}
-		// Copy the mtimes map — saveSnapshot encodes asynchronously
-		// on shutdown and we don't want a late watcher event mutating
-		// the live map mid-encode.
-		mtimes := make(map[string]int64, len(m.FileMtimes))
-		for k, v := range m.FileMtimes {
-			mtimes[k] = v
-		}
+		// RepoMetadata publishes an immutable snapshot. Later indexer writes
+		// detach first, so asynchronous encoding can safely share this map
+		// without retaining a second repository-sized copy.
+		mtimes := m.FileMtimes
 		out = append(out, snapshotRepo{
 			RepoPrefix: prefix,
 			RootPath:   m.RootPath,

@@ -47,7 +47,7 @@ func TestReconcileRepoCtx_Sqlite_FullRetrackFlag(t *testing.T) {
 
 	meta := mi.GetMetadata("repo")
 	require.NotNil(t, meta)
-	priorMtimes := meta.FileMtimes
+	priorMtimes := mi.FileMtimes("repo")
 
 	// While the daemon is "down", a new file appears on disk. This is
 	// enough to trip HasChangesSinceMtimes and route ReconcileRepoCtx
@@ -68,7 +68,7 @@ func TestReconcileRepoCtx_Sqlite_FullRetrackFlag(t *testing.T) {
 	// so ReconcileRepoCtx must report neither flag.
 	meta2 := mi2.GetMetadata("repo")
 	require.NotNil(t, meta2)
-	unchangedMtimes := meta2.FileMtimes
+	unchangedMtimes := mi2.FileMtimes("repo")
 
 	mi3 := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
 	result2, err := mi3.ReconcileRepoCtx(context.Background(), config.RepoEntry{Path: repoPath, Name: "repo"}, unchangedMtimes)

@@ -43,7 +43,7 @@ func TestReconcileRepoCtx_EvictsOfflineDeletions(t *testing.T) {
 
 	meta := mi.GetMetadata("repo")
 	require.NotNil(t, meta)
-	priorMtimes := meta.FileMtimes
+	priorMtimes := mi.FileMtimes("repo")
 
 	// Before we "restart", delete b.go from disk. This mirrors the
 	// user editing offline while the daemon is stopped.
@@ -91,7 +91,7 @@ func TestReconcileRepoCtx_DoesNotDuplicateUnchanged(t *testing.T) {
 	require.NoError(t, err)
 
 	want := g.Stats()
-	priorMtimes := mi.GetMetadata("repo").FileMtimes
+	priorMtimes := mi.FileMtimes("repo")
 
 	// Simulate restart: fresh MultiIndexer on the same graph, reconcile.
 	mi2 := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
@@ -125,7 +125,7 @@ func TestReconcileRepoCtx_RunsDerivedPassesForOfflineChange(t *testing.T) {
 	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
-	priorMtimes := mi.GetMetadata("repo").FileMtimes
+	priorMtimes := mi.FileMtimes("repo")
 
 	writeFile(t, filepath.Join(repoPath, "shell.go"), `package main
 import "os/exec"

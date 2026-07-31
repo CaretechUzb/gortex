@@ -454,7 +454,7 @@ func (p *Poller) finalizeGitHead(observation pollGitObservation) error {
 	})
 }
 
-// pollFilesystem snapshots the indexer's per-file mtime map and returns
+// pollFilesystem reads the indexer's immutable per-file mtime snapshot and returns
 // changed or unreadable tracked paths. It performs discovery only: pollOnce
 // unions these paths with Git evidence and the repository batch owns every
 // freshness stamp and deletion decision.
@@ -469,12 +469,12 @@ func (p *Poller) pollFilesystem() []string {
 	if idx == nil {
 		return nil
 	}
-	snapshot := idx.FileMtimes()
+	snapshot := idx.publishFileMtimes()
 	if len(snapshot) == 0 {
 		return nil
 	}
 	paths := make([]string, 0)
-	for relPath, recorded := range snapshot {
+	for relPath, recordedMtime := range snapshot {
 		abs := filepath.Clean(filepath.Join(p.rootPath, filepath.FromSlash(relPath)))
 		info, err := os.Stat(abs)
 		if err != nil {
@@ -491,7 +491,7 @@ func (p *Poller) pollFilesystem() []string {
 		if info.IsDir() {
 			continue
 		}
-		if info.ModTime().UnixNano() != recorded {
+		if info.ModTime().UnixNano() != recordedMtime {
 			paths = append(paths, abs)
 		}
 	}
