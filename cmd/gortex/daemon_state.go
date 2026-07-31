@@ -265,8 +265,33 @@ func healDuplicateRepos(gc *config.GlobalConfig, logger *zap.Logger) int {
 	return len(removed)
 }
 
+// takeWarmupSnapshotPayloads moves one-use restart data out of daemonState.
+// The warmup owns the returned values and drops each after its final consumer;
+// clearing the long-lived fields here prevents successful and failed warmups
+// from retaining serialized repository, contract, or vector payloads.
+func (state *daemonState) takeWarmupSnapshotPayloads() (
+	map[string]*snapshotRepo,
+	map[string][]contracts.Contract,
+	snapshotVector,
+) {
+	if state == nil {
+		return nil, nil, snapshotVector{}
+	}
+	repos := state.snapshotRepos
+	contractEntries := state.snapshotContracts
+	vector := state.snapshotVector
+	state.snapshotRepos = nil
+	state.snapshotContracts = nil
+	state.snapshotVector = snapshotVector{}
+	return repos, contractEntries, vector
+}
+
 func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) (*indexer.MultiWatcher, *warmupTimings) {
 	timings := &warmupTimings{}
+	if state == nil {
+		return nil, timings
+	}
+	snapshotRepos, snapshotContracts, restoredVector := state.takeWarmupSnapshotPayloads()
 	if state.multiIndexer == nil || state.configManager == nil {
 		return nil, timings
 	}
@@ -484,7 +509,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 					// hasn't seen this repo yet.
 					priorMtimes := priorMtimesFromStore(state.graph, state.configManager, entry, logger)
 					if len(priorMtimes) == 0 {
-						priorMtimes = priorMtimesForEntry(state.snapshotRepos, entry)
+						priorMtimes = priorMtimesForEntry(snapshotRepos, entry)
 					}
 					if state.snapshotPartial {
 						priorMtimes = nil
@@ -537,7 +562,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 							// run for it instead of silently serving the shrunken
 							// graph, and surface the event so a ratchet can't hide
 							// behind an all-green index_health.
-							if res != nil && bootShapeShortfall(state.snapshotRepos, res.RepoPrefix, res.NodeCount, res.EdgeCount) {
+							if res != nil && bootShapeShortfall(snapshotRepos, res.RepoPrefix, res.NodeCount, res.EdgeCount) {
 								indexer.RecordResolutionRegression()
 								logger.Warn("daemon: boot shape-degradation guard — repo graph materially short of snapshot; re-running resolution",
 									zap.String("prefix", res.RepoPrefix),
@@ -584,6 +609,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	}
 	close(jobs)
 	wg.Wait()
+	// Every reconcile and shape guard has finished; release the restored
+	// per-repository mtime maps before the later resolver/enrichment phases.
+	snapshotRepos = nil
 	if coordinatedBulkActive {
 		flushStart := time.Now()
 		if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
@@ -773,7 +801,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 				// daemons upgrading across this change. The
 				// snapshot copy is read-only by this point so the
 				// two sources can't drift mid-flight.
-				cs, ok := state.snapshotContracts[prefix]
+				cs, ok := snapshotContracts[prefix]
 				if !ok || len(cs) == 0 {
 					continue
 				}
@@ -793,6 +821,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 				zap.Duration("elapsed", time.Since(phaseStart)))
 		}
 	}
+	// Contract registries now own decoded entries; the legacy snapshot
+	// fallback is no longer needed for the rest of the daemon lifetime.
+	snapshotContracts = nil
 
 	// Backfill `WorkspaceID` / `ProjectID` onto nodes and contracts
 	// loaded from a legacy snapshot. Old snapshots have these fields
@@ -880,7 +911,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// step that lets a default-on daemon avoid re-embedding the whole
 	// graph on every restart. SetSkipVectorBuild(false) afterwards means
 	// any later file-change re-index rebuilds vectors normally.
-	if vec := state.snapshotVector; len(vec.Index) > 0 {
+	if vec := restoredVector; len(vec.Index) > 0 {
 		phaseStart = time.Now()
 		if err := state.multiIndexer.ImportVectorIndex(vec.Index, vec.Dims, vec.Count); err != nil {
 			logger.Warn("daemon: vector index restore failed — semantic search will rebuild on next index",
@@ -893,6 +924,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		}
 		state.multiIndexer.SetSkipVectorBuild(false)
 	}
+	// ImportVectorIndex has consumed the serialized bytes (or there were none).
+	// Drop the final local reference before watcher setup and steady state.
+	restoredVector = snapshotVector{}
 
 	watchCfgs := make(map[string]config.WatchConfig)
 	for prefix := range state.multiIndexer.AllMetadata() {
