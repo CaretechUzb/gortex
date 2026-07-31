@@ -228,7 +228,7 @@ func buildGRPCHandlerIndex(g graph.Store, shared bool, sharedCalls []*graph.Edge
 	// later impl filter (Unimplemented*).
 	implementorsByIface := map[string][]string{}
 	var registrations []*graph.Edge
-	for e := range g.EdgesByKind(graph.EdgeImplements) {
+	for e := range graph.EdgesLightSeq(g, graph.EdgeImplements) {
 		if e == nil {
 			continue
 		}

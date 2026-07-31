@@ -26,12 +26,9 @@ func ResolvePascalForms(g graph.Store) int {
 	if g == nil {
 		return 0
 	}
-	units := map[string]*graph.Node{}
-	forms := map[string]*graph.Node{}
-	for _, n := range nodesByKindsOrAll(g, graph.KindFile) {
-		if n == nil {
-			continue
-		}
+	units := map[string]graph.FileNodeIdentity{}
+	forms := map[string]graph.FileNodeIdentity{}
+	for n := range graph.FileNodeIdentitiesSeq(g, nil) {
 		switch strings.ToLower(filepath.Ext(n.FilePath)) {
 		case ".pas", ".pp", ".dpr", ".lpr":
 			units[pascalFormKey(n.FilePath)] = n
@@ -52,7 +49,7 @@ func ResolvePascalForms(g graph.Store) int {
 	for _, key := range keys {
 		unit := units[key]
 		form, ok := forms[key]
-		if !ok || !sameDispatchBoundary(unit, form) {
+		if !ok || unit.WorkspaceID != form.WorkspaceID {
 			continue
 		}
 		batch = append(batch, &graph.Edge{

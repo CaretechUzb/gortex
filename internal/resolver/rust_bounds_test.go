@@ -145,7 +145,10 @@ func TestRustTraitTargetIndexConservativeResolution(t *testing.T) {
 	idx := &rustTraitTargetIndex{
 		exact:    make(map[rustTraitTargetKey]rustTraitTargetEntry),
 		basename: make(map[rustTraitTargetKey]rustTraitTargetEntry),
-		nodes:    map[string]*graph.Node{child.ID: child},
+		nodes: map[string]graph.QualifiedNodeIdentity{child.ID: {
+			ID: child.ID, Name: child.Name, Language: child.Language,
+			FilePath: child.FilePath, RepoPrefix: child.RepoPrefix,
+		}},
 	}
 	addRustTraitTarget(idx.exact, rustTraitTargetKey{repo: repo, crateRoot: root, path: "crate::nested::child::Local"}, "local-id")
 	addRustTraitTarget(idx.exact, rustTraitTargetKey{repo: repo, crateRoot: root, path: "crate::nested::Parent"}, "parent-id")

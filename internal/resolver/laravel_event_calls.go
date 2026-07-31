@@ -27,7 +27,7 @@ func ResolveLaravelEventCalls(g graph.Store) int {
 	handleByClass := map[string][]*graph.Node{}
 	listenersByType := map[string][]*graph.Node{}
 	classByMethod := map[string]string{}
-	for e := range g.EdgesByKind(graph.EdgeMemberOf) {
+	for e := range graph.EdgesLightSeq(g, graph.EdgeMemberOf) {
 		if e != nil && e.From != "" && e.To != "" {
 			classByMethod[e.From] = laravelSimpleName(e.To)
 		}

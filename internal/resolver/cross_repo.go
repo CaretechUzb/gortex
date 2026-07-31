@@ -95,8 +95,8 @@ type CrossRepoResolver struct {
 	nodesByName       map[string][]*graph.Node
 	nodesByNameRepo   map[string]map[string][]*graph.Node
 	nodesByQualName   map[string][]*graph.Node
-	dirIndex          map[string][]*graph.Node
-	lastDirIndex      map[string][]*graph.Node
+	dirIndex          map[string][]graph.FileNodeIdentity
+	lastDirIndex      map[string][]graph.FileNodeIdentity
 	// reachableReposByFile maps a caller file's ID to the set of repo
 	// prefixes that file imports (derived from resolved EdgeImports
 	// edges). It is the import-reachability evidence gate: a name-only
@@ -203,6 +203,13 @@ func candidateWorkspaceID(n *graph.Node) string {
 	return n.RepoPrefix
 }
 
+func fileCandidateWorkspaceID(file graph.FileNodeIdentity) string {
+	if file.WorkspaceID != "" {
+		return file.WorkspaceID
+	}
+	return file.RepoPrefix
+}
+
 // crossWorkspaceEligible reports whether sourceWS is permitted to
 // reach a candidate in targetWS, optionally constrained by the
 // candidate's import path. importPath == "" means "any module"
@@ -248,18 +255,18 @@ func (cr *CrossRepoResolver) crossWorkspaceEligible(sourceWS, targetWS, importPa
 // modules live in different workspaces — the worktree-instance case,
 // where the importer's workspace has its own copy of the imported module
 // but the canonical copy (in another workspace) sorted first.
-func (cr *CrossRepoResolver) pickImportCandidate(callerWS, importPath string, candidates []*graph.Node) *graph.Node {
-	for _, c := range candidates {
-		if candidateWorkspaceID(c) == callerWS {
-			return c
+func (cr *CrossRepoResolver) pickImportCandidate(callerWS, importPath string, candidates []graph.FileNodeIdentity) (graph.FileNodeIdentity, bool) {
+	for _, candidate := range candidates {
+		if fileCandidateWorkspaceID(candidate) == callerWS {
+			return candidate, true
 		}
 	}
-	for _, c := range candidates {
-		if cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(c), importPath) {
-			return c
+	for _, candidate := range candidates {
+		if cr.crossWorkspaceEligible(callerWS, fileCandidateWorkspaceID(candidate), importPath) {
+			return candidate, true
 		}
 	}
-	return nil
+	return graph.FileNodeIdentity{}, false
 }
 
 // pickQualNameCandidate applies repository/workspace policy to the complete
@@ -599,14 +606,14 @@ func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepo
 // These maps are torn down via clearDirIndexes when the pass completes
 // so we don't keep ~N pointers alive between resolves.
 func (cr *CrossRepoResolver) buildDirIndexes() {
-	cr.dirIndex = make(map[string][]*graph.Node, 128)
-	cr.lastDirIndex = make(map[string][]*graph.Node, 128)
-	for n := range cr.graph.NodesByKind(graph.KindFile) {
-		dir := filepath.Dir(n.FilePath)
-		cr.dirIndex[dir] = append(cr.dirIndex[dir], n)
+	cr.dirIndex = make(map[string][]graph.FileNodeIdentity, 128)
+	cr.lastDirIndex = make(map[string][]graph.FileNodeIdentity, 128)
+	for file := range graph.FileNodeIdentitiesSeq(cr.graph, nil) {
+		dir := filepath.Dir(file.FilePath)
+		cr.dirIndex[dir] = append(cr.dirIndex[dir], file)
 		last := lastPathComponent(dir)
 		if last != "" && last != dir {
-			cr.lastDirIndex[last] = append(cr.lastDirIndex[last], n)
+			cr.lastDirIndex[last] = append(cr.lastDirIndex[last], file)
 		}
 	}
 }
@@ -617,7 +624,7 @@ func (cr *CrossRepoResolver) buildDirIndexes() {
 // importing file's own go.mod.
 func (cr *CrossRepoResolver) buildDepModuleIndex() {
 	by := make(map[string][]depModuleEntry)
-	for n := range cr.graph.NodesByKind(graph.KindContract) {
+	for n := range graph.RepoNodeIdentitiesSeq(cr.graph, nil, graph.KindContract) {
 		if !strings.HasPrefix(n.ID, "dep::") {
 			continue
 		}
@@ -627,7 +634,7 @@ func (cr *CrossRepoResolver) buildDepModuleIndex() {
 		}
 		by[n.RepoPrefix] = append(by[n.RepoPrefix], depModuleEntry{
 			modulePath: mp,
-			node:       n,
+			nodeID:     n.ID,
 		})
 	}
 	for k := range by {
@@ -643,15 +650,15 @@ func (cr *CrossRepoResolver) clearDepModuleIndex() {
 	cr.depModuleIndex = nil
 }
 
-// lookupDepModule returns the dep::<module> contract node whose
-// module path is a prefix of importPath, scoped to callerRepo.
-func (cr *CrossRepoResolver) lookupDepModule(callerRepo, importPath string) *graph.Node {
+// lookupDepModule returns the dep::<module> contract ID whose module path is a
+// prefix of importPath, scoped to callerRepo. Empty means no match.
+func (cr *CrossRepoResolver) lookupDepModule(callerRepo, importPath string) string {
 	for _, entry := range cr.depModuleIndex[callerRepo] {
 		if importPath == entry.modulePath || strings.HasPrefix(importPath, entry.modulePath+"/") {
-			return entry.node
+			return entry.nodeID
 		}
 	}
-	return nil
+	return ""
 }
 
 func (cr *CrossRepoResolver) clearDirIndexes() {
@@ -669,14 +676,13 @@ func (cr *CrossRepoResolver) clearDirIndexes() {
 // graph is settled enough to be trustworthy evidence.
 func (cr *CrossRepoResolver) buildReachableReposIndex() {
 	idx := make(map[string]map[string]struct{})
-	// Materialise the import edges and batch-load their targets in one
-	// GetNodesByIDs — a per-edge GetNode(e.To) here is a query round-trip
-	// per import on a disk backend, which under the cross-repo pass's
-	// import population was a multi-minute cold-warmup stall (it runs
-	// before the pass even logs "pass start").
+	// Materialise metadata-free import projections and batch-load only target
+	// placement fields. A per-edge point lookup here is a query round-trip per
+	// import on a disk backend, which under the cross-repo pass's import
+	// population was a multi-minute cold-warmup stall.
 	var imports []*graph.Edge
 	ids := make(map[string]struct{})
-	for e := range cr.graph.EdgesByKind(graph.EdgeImports) {
+	for e := range graph.EdgesLightSeq(cr.graph, graph.EdgeImports) {
 		imports = append(imports, e)
 		if e.To != "" {
 			ids[e.To] = struct{}{}
@@ -690,12 +696,12 @@ func (cr *CrossRepoResolver) buildReachableReposIndex() {
 	for id := range ids {
 		idList = append(idList, id)
 	}
-	nodes := cr.graph.GetNodesByIDs(idList)
+	placements := graph.NodePlacementsByIDs(cr.graph, idList)
 	for _, e := range imports {
 		// Only resolved imports carry evidence — an unresolved import
 		// target tells us nothing about which repo the caller reaches.
-		to := nodes[e.To]
-		if to == nil || to.RepoPrefix == "" {
+		to, ok := placements[e.To]
+		if !ok || to.RepoPrefix == "" {
 			continue
 		}
 		set := idx[e.From]
@@ -1246,18 +1252,16 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	// own workspace; otherwise the first same-repo hit short-circuits
 	// the scan as before.
 	collectAll := cr.workspaceMembers != nil
-	var sameRepo *graph.Node
-	var sameRepoAll, crossRepoAll []*graph.Node
-	consider := func(n *graph.Node) {
-		if n.Kind != graph.KindFile {
-			return
-		}
-		if n.RepoPrefix == callerRepo {
-			if sameRepo == nil {
-				sameRepo = n
+	var sameRepo graph.FileNodeIdentity
+	var sameRepoFound bool
+	var sameRepoAll, crossRepoAll []graph.FileNodeIdentity
+	consider := func(file graph.FileNodeIdentity) {
+		if file.RepoPrefix == callerRepo {
+			if !sameRepoFound {
+				sameRepo, sameRepoFound = file, true
 			}
 			if collectAll {
-				sameRepoAll = append(sameRepoAll, n)
+				sameRepoAll = append(sameRepoAll, file)
 			}
 			return
 		}
@@ -1268,31 +1272,31 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 		// `*/bindings/go` directory sorts first. Collect every match so
 		// the workspace-aware pick below can prefer the importer's own
 		// workspace instead of the first one encountered.
-		if dirMatchesImport(filepath.Dir(n.FilePath), importPath) {
-			crossRepoAll = append(crossRepoAll, n)
+		if dirMatchesImport(filepath.Dir(file.FilePath), importPath) {
+			crossRepoAll = append(crossRepoAll, file)
 		}
 	}
-	stop := func() bool { return sameRepo != nil && !collectAll }
+	stop := func() bool { return sameRepoFound && !collectAll }
 	if cr.dirIndex != nil {
-		for _, n := range cr.dirIndex[importPath] {
-			consider(n)
+		for _, file := range cr.dirIndex[importPath] {
+			consider(file)
 			if stop() {
 				break
 			}
 		}
-		if sameRepo == nil || collectAll {
-			for _, n := range cr.lastDirIndex[lastPathComponent(importPath)] {
-				consider(n)
+		if !sameRepoFound || collectAll {
+			for _, file := range cr.lastDirIndex[lastPathComponent(importPath)] {
+				consider(file)
 				if stop() {
 					break
 				}
 			}
 		}
 	} else {
-		for n := range cr.graph.NodesByKind(graph.KindFile) {
-			dir := filepath.Dir(n.FilePath)
+		for file := range graph.FileNodeIdentitiesSeq(cr.graph, nil) {
+			dir := filepath.Dir(file.FilePath)
 			if strings.HasSuffix(dir, lastPathComponent(importPath)) || dir == importPath {
-				consider(n)
+				consider(file)
 				if stop() {
 					break
 				}
@@ -1300,11 +1304,11 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 		}
 	}
 
-	if sameRepo != nil {
+	if sameRepoFound {
 		// Name-collision tie-break: prefer the same-repo file in the
 		// importing file's own package-manager workspace.
-		if ws := cr.preferSameWorkspaceFile(e.FilePath, sameRepoAll); ws != nil {
-			sameRepo = ws
+		if workspaceFile, ok := cr.preferSameWorkspaceFile(e.FilePath, sameRepoAll); ok {
+			sameRepo = workspaceFile
 		}
 		e.To = sameRepo.ID
 		stats.Resolved++
@@ -1315,7 +1319,7 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	// on the first ineligible candidate — a same-workspace instance (a
 	// worktree of the imported module tracked under its own prefix) may
 	// appear later in the list.
-	if picked := cr.pickImportCandidate(callerWS, importPath, crossRepoAll); picked != nil {
+	if picked, ok := cr.pickImportCandidate(callerWS, importPath, crossRepoAll); ok {
 		e.To = picked.ID
 		stats.Resolved++
 		if isCrossRepoHop(callerRepo, picked.RepoPrefix) {
@@ -1329,8 +1333,8 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	// No file node matched. Try the dep::<module> contract from the
 	// caller's go.mod before giving up. The dep node lives in the
 	// caller's own repo, so this is a same-repo edge.
-	if depNode := cr.lookupDepModule(callerRepo, importPath); depNode != nil {
-		e.To = depNode.ID
+	if depNodeID := cr.lookupDepModule(callerRepo, importPath); depNodeID != "" {
+		e.To = depNodeID
 		stats.Resolved++
 		return
 	}

@@ -26,21 +26,21 @@ func (r *Resolver) resolveLuaRequires() {
 	if !r.graphHasLanguage("lua") && !r.graphHasLanguage("luau") {
 		return
 	}
-	fileLang := r.collectFileLanguages()
-
+	fileLang := make(map[string]string, 1024)
 	fileIDs := make(map[string]struct{}, 1024)
 	// filesByBase indexes every KindFile by basename for the suffix nets.
 	filesByBase := make(map[string][]string, 1024)
-	for n := range r.graph.NodesByKind(graph.KindFile) {
-		if n == nil || n.ID == "" {
+	for file := range graph.FileLanguageNodesSeq(r.graph) {
+		if file.ID == "" {
 			continue
 		}
-		fileIDs[n.ID] = struct{}{}
-		base := n.ID
-		if i := strings.LastIndex(n.ID, "/"); i >= 0 {
-			base = n.ID[i+1:]
+		fileLang[file.ID] = file.Language
+		fileIDs[file.ID] = struct{}{}
+		base := file.ID
+		if i := strings.LastIndex(file.ID, "/"); i >= 0 {
+			base = file.ID[i+1:]
 		}
-		filesByBase[base] = append(filesByBase[base], n.ID)
+		filesByBase[base] = append(filesByBase[base], file.ID)
 	}
 
 	var reindexBatch []graph.EdgeReindex

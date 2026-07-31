@@ -146,8 +146,8 @@ type ResolveStats struct {
 type Resolver struct {
 	graph        graph.Store
 	logger       *zap.Logger
-	dirIndex     map[string][]*graph.Node
-	lastDirIndex map[string][]*graph.Node
+	dirIndex     map[string][]graph.FileNodeIdentity
+	lastDirIndex map[string][]graph.FileNodeIdentity
 	// OnComputeDone, when set, fires once per ResolveAll immediately after
 	// the parallel compute loop has committed — BEFORE the deferred LSP
 	// batch and the serial refinement tail (guard, attribution, dispatch
@@ -422,11 +422,10 @@ type lspLocKey struct {
 }
 
 // depModuleEntry pairs a Go module path (parsed from a dep:: contract
-// node ID) with the node itself, so import-path prefix matches can
-// jump straight to the target.
+// node ID) with the compact target identity used by import resolution.
 type depModuleEntry struct {
 	modulePath string
-	node       *graph.Node
+	nodeID     string
 }
 
 // New creates a Resolver for the given store. The returned Resolver
@@ -1608,9 +1607,6 @@ func (r *Resolver) scopedTailExceedsFileBudget() bool {
 	perRepo := make(map[string]int, len(r.scope))
 	for _, nodes := range r.dirIndex {
 		for _, n := range nodes {
-			if n == nil {
-				continue
-			}
 			prefix := n.RepoPrefix
 			if prefix == "" {
 				prefix = graph.RepoPrefixOfID(n.ID)
@@ -1651,16 +1647,14 @@ func (r *Resolver) scopedFiles() []string {
 //   - lastDirIndex keys on the last path component of that directory
 //     so an import of "logger" matches any file under .../logger/.
 func (r *Resolver) buildDirIndexes() {
-	r.dirIndex = make(map[string][]*graph.Node, 128)
-	r.lastDirIndex = make(map[string][]*graph.Node, 128)
-	// NodesByKind pushes the file-kind filter into the store; disk
-	// backends iterate just the file nodes instead of every node.
-	for n := range r.graph.NodesByKind(graph.KindFile) {
-		dir := filepath.Dir(n.FilePath)
-		r.dirIndex[dir] = append(r.dirIndex[dir], n)
+	r.dirIndex = make(map[string][]graph.FileNodeIdentity, 128)
+	r.lastDirIndex = make(map[string][]graph.FileNodeIdentity, 128)
+	for file := range graph.FileNodeIdentitiesSeq(r.graph, nil) {
+		dir := filepath.Dir(file.FilePath)
+		r.dirIndex[dir] = append(r.dirIndex[dir], file)
 		last := lastPathComponent(dir)
 		if last != "" && last != dir {
-			r.lastDirIndex[last] = append(r.lastDirIndex[last], n)
+			r.lastDirIndex[last] = append(r.lastDirIndex[last], file)
 		}
 	}
 }
@@ -2023,7 +2017,7 @@ func (r *Resolver) cachedFindNodesByNameInRepo(name, repo string) []*graph.Node 
 // have no module path embedded in the ID.
 func (r *Resolver) buildDepModuleIndex() {
 	by := make(map[string][]depModuleEntry)
-	for n := range r.graph.NodesByKind(graph.KindContract) {
+	for n := range graph.RepoNodeIdentitiesSeq(r.graph, nil, graph.KindContract) {
 		if !strings.HasPrefix(n.ID, "dep::") {
 			continue
 		}
@@ -2033,7 +2027,7 @@ func (r *Resolver) buildDepModuleIndex() {
 		}
 		by[n.RepoPrefix] = append(by[n.RepoPrefix], depModuleEntry{
 			modulePath: mp,
-			node:       n,
+			nodeID:     n.ID,
 		})
 	}
 	for k := range by {
@@ -2049,16 +2043,15 @@ func (r *Resolver) clearDepModuleIndex() {
 	r.depModuleIndex = nil
 }
 
-// lookupDepModule returns the dep::<module> contract node whose
-// module path is a prefix of importPath, scoped to the caller's repo.
-// Returns nil if no dep declaration covers this import.
-func (r *Resolver) lookupDepModule(callerRepo, importPath string) *graph.Node {
+// lookupDepModule returns the dep::<module> contract ID whose module path is a
+// prefix of importPath, scoped to the caller's repo. Empty means no match.
+func (r *Resolver) lookupDepModule(callerRepo, importPath string) string {
 	for _, entry := range r.depModuleIndex[callerRepo] {
 		if importPath == entry.modulePath || strings.HasPrefix(importPath, entry.modulePath+"/") {
-			return entry.node
+			return entry.nodeID
 		}
 	}
-	return nil
+	return ""
 }
 
 // buildPassIndexes builds the four per-pass lookup indexes every
@@ -3097,18 +3090,16 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// the first same-repo hit short-circuits the scan, preserving the
 	// pre-feature cost.
 	collectAll := r.workspaceMembers != nil
-	var sameRepo, crossRepoNode *graph.Node
-	var sameRepoAll []*graph.Node
-	consider := func(n *graph.Node) {
-		if n.Kind != graph.KindFile {
-			return
-		}
-		if callerRepo == "" || n.RepoPrefix == callerRepo {
-			if sameRepo == nil {
-				sameRepo = n
+	var sameRepo, crossRepoFile graph.FileNodeIdentity
+	var sameRepoFound, crossRepoFound bool
+	var sameRepoAll []graph.FileNodeIdentity
+	consider := func(file graph.FileNodeIdentity) {
+		if callerRepo == "" || file.RepoPrefix == callerRepo {
+			if !sameRepoFound {
+				sameRepo, sameRepoFound = file, true
 			}
 			if collectAll {
-				sameRepoAll = append(sameRepoAll, n)
+				sameRepoAll = append(sameRepoAll, file)
 			}
 			return
 		}
@@ -3117,34 +3108,34 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 		// the last path component only, so without this gate an import
 		// of `.../tree-sitter-c/bindings/go` would resolve to whichever
 		// `*/bindings/go` directory sorts first.
-		if crossRepoNode == nil && dirMatchesImport(filepath.Dir(n.FilePath), importPath) {
-			crossRepoNode = n
+		if !crossRepoFound && dirMatchesImport(filepath.Dir(file.FilePath), importPath) {
+			crossRepoFile, crossRepoFound = file, true
 		}
 	}
 	// stop reports whether the candidate scan can short-circuit: once a
 	// same-repo hit is found and we are not collecting every candidate
 	// for workspace disambiguation.
-	stop := func() bool { return sameRepo != nil && !collectAll }
+	stop := func() bool { return sameRepoFound && !collectAll }
 	if r.dirIndex != nil {
-		for _, n := range r.dirIndex[importPath] {
-			consider(n)
+		for _, file := range r.dirIndex[importPath] {
+			consider(file)
 			if stop() {
 				break
 			}
 		}
-		if sameRepo == nil || collectAll {
-			for _, n := range r.lastDirIndex[lastPathComponent(importPath)] {
-				consider(n)
+		if !sameRepoFound || collectAll {
+			for _, file := range r.lastDirIndex[lastPathComponent(importPath)] {
+				consider(file)
 				if stop() {
 					break
 				}
 			}
 		}
 	} else {
-		for n := range r.graph.NodesByKind(graph.KindFile) {
-			dir := filepath.Dir(n.FilePath)
+		for file := range graph.FileNodeIdentitiesSeq(r.graph, nil) {
+			dir := filepath.Dir(file.FilePath)
 			if strings.HasSuffix(dir, lastPathComponent(importPath)) || dir == importPath {
-				consider(n)
+				consider(file)
 				if stop() {
 					break
 				}
@@ -3152,20 +3143,20 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 		}
 	}
 
-	if sameRepo != nil {
+	if sameRepoFound {
 		// Name-collision tie-break: when several same-repo files match
 		// a bare import name, prefer the one in the importing file's
 		// own package-manager workspace.
-		if ws := r.preferSameWorkspaceFile(e.FilePath, sameRepoAll); ws != nil {
-			sameRepo = ws
+		if workspaceFile, ok := r.preferSameWorkspaceFile(e.FilePath, sameRepoAll); ok {
+			sameRepo = workspaceFile
 		}
 		e.To = sameRepo.ID
 		stats.Resolved++
 		return
 	}
-	if crossRepoNode != nil {
-		e.To = crossRepoNode.ID
-		if callerRepo != "" && crossRepoNode.RepoPrefix != "" && crossRepoNode.RepoPrefix != callerRepo {
+	if crossRepoFound {
+		e.To = crossRepoFile.ID
+		if callerRepo != "" && crossRepoFile.RepoPrefix != "" && crossRepoFile.RepoPrefix != callerRepo {
 			e.CrossRepo = true
 		}
 		stats.Resolved++
@@ -3177,8 +3168,8 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// caller's go.mod — that bridge is what gives third-party imports
 	// like "github.com/foo/bar/sub/pkg" an incoming edge on the
 	// dep::github.com/foo/bar node.
-	if depNode := r.lookupDepModule(callerRepo, importPath); depNode != nil {
-		e.To = depNode.ID
+	if depNodeID := r.lookupDepModule(callerRepo, importPath); depNodeID != "" {
+		e.To = depNodeID
 		stats.Resolved++
 		return
 	}
@@ -4092,14 +4083,25 @@ func (r *Resolver) buildReachabilityIndex() {
 	// Seed with each indexed file's own directory, and memoise the per-file
 	// dir so filterByReachability never recomputes filepath.Dir per edge.
 	dirByPath := make(map[string]string)
-	for n := range r.graph.NodesByKind(graph.KindFile) {
-		dir := filepath.Dir(n.FilePath)
-		dirByPath[n.FilePath] = dir
-		addDir(n.ID, dir)
+	seedFile := func(file graph.FileNodeIdentity) {
+		dir := filepath.Dir(file.FilePath)
+		dirByPath[file.FilePath] = dir
+		addDir(file.ID, dir)
+	}
+	if r.dirIndex != nil {
+		for _, files := range r.dirIndex {
+			for _, file := range files {
+				seedFile(file)
+			}
+		}
+	} else {
+		for file := range graph.FileNodeIdentitiesSeq(r.graph, nil) {
+			seedFile(file)
+		}
 	}
 
 	// Materialise the import edges and batch-load the endpoints of the
-	// resolved ones (e.To naming a concrete node) in one GetNodesByIDs.
+	// resolved ones (e.To naming a concrete node) in one placement projection.
 	// A per-edge GetNode here is a query round-trip per import on a disk
 	// backend — the same batching buildImportClosure already applies.
 	// Unresolved / external targets never name an in-repo file node, so
@@ -4107,20 +4109,20 @@ func (r *Resolver) buildReachabilityIndex() {
 	// or not at all).
 	var imports []*graph.Edge
 	ids := make(map[string]struct{})
-	for e := range r.graph.EdgesByKind(graph.EdgeImports) {
+	for e := range graph.EdgesLightSeq(r.graph, graph.EdgeImports) {
 		imports = append(imports, e)
 		if e.To == "" || graph.IsUnresolvedTarget(e.To) || strings.HasPrefix(e.To, "external::") {
 			continue
 		}
 		ids[e.To] = struct{}{}
 	}
-	var nodes map[string]*graph.Node
+	var placements map[string]graph.NodePlacement
 	if len(ids) > 0 {
 		idList := make([]string, 0, len(ids))
 		for id := range ids {
 			idList = append(idList, id)
 		}
-		nodes = r.graph.GetNodesByIDs(idList)
+		placements = graph.NodePlacementsByIDs(r.graph, idList)
 	}
 
 	for _, e := range imports {
@@ -4138,8 +4140,8 @@ func (r *Resolver) buildReachabilityIndex() {
 		case strings.HasPrefix(e.To, "external::"):
 			// External / unindexed package — nothing to add.
 		default:
-			if n := nodes[e.To]; n != nil && n.Kind == graph.KindFile {
-				importedDir = filepath.Dir(n.FilePath)
+			if placement, ok := placements[e.To]; ok && placement.Kind == graph.KindFile {
+				importedDir = filepath.Dir(placement.FilePath)
 			}
 		}
 		if importedDir != "" {
@@ -4188,9 +4190,17 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 	for id := range missingCallerSet {
 		missingCallerIDs = append(missingCallerIDs, id)
 	}
-	missingCallers := sources
-	if missingCallers == nil && len(missingCallerIDs) > 0 {
-		missingCallers = r.graph.GetNodesByIDs(missingCallerIDs)
+	missingCallerPaths := make(map[string]string, len(missingCallerIDs))
+	if sources != nil {
+		for _, id := range missingCallerIDs {
+			if source := sources[id]; source != nil {
+				missingCallerPaths[id] = source.FilePath
+			}
+		}
+	} else {
+		for id, placement := range graph.NodePlacementsByIDs(r.graph, missingCallerIDs) {
+			missingCallerPaths[id] = placement.FilePath
+		}
 	}
 	for _, edge := range pending {
 		if edge == nil {
@@ -4198,9 +4208,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 		}
 		callerPath := edge.FilePath
 		if callerPath == "" {
-			if from := missingCallers[edge.From]; from != nil {
-				callerPath = from.FilePath
-			}
+			callerPath = missingCallerPaths[edge.From]
 		}
 		if callerPath != "" {
 			callerPaths[callerPath] = struct{}{}
@@ -4265,7 +4273,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 	for id := range targetSet {
 		targetIDs = append(targetIDs, id)
 	}
-	targets := r.graph.GetNodesByIDs(targetIDs)
+	targets := graph.NodePlacementsByIDs(r.graph, targetIDs)
 
 	for _, filePath := range missingFiles {
 		stable := true
@@ -4289,7 +4297,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 				stable = false
 			case strings.HasPrefix(targetID, "external::"):
 			default:
-				if target := targets[targetID]; target != nil && target.FilePath != "" {
+				if target, ok := targets[targetID]; ok && target.FilePath != "" {
 					importedDir = filepath.Dir(target.FilePath)
 					dirs[target.FilePath] = importedDir
 				}

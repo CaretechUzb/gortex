@@ -23,7 +23,7 @@ func (r *Resolver) prepareIncrementalAttributionCache(frontier incrementalFileFr
 	missingSet := make(map[string]struct{})
 	for _, path := range frontier.paths {
 		for _, fileNode := range r.dirIndex[filepath.Dir(path)] {
-			if fileNode == nil || fileNode.FilePath == "" {
+			if fileNode.FilePath == "" {
 				continue
 			}
 			if _, cached := r.incrementalNodesByFile[fileNode.FilePath]; !cached {

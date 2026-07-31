@@ -24,7 +24,7 @@ import (
 func (r *Resolver) bindGenericParamRefs() {
 	// owner-function ID → set of tparam-name → tparam-node-id.
 	owned := map[string]map[string]string{}
-	for n := range r.graph.NodesByKind(graph.KindGenericParam) {
+	for n := range graph.NamedLanguageNodesSeq(r.graph, graph.KindGenericParam) {
 		if n.Language != "go" || n.Name == "" {
 			continue
 		}

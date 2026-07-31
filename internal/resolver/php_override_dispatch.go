@@ -210,7 +210,7 @@ func (r *Resolver) phpTypeHierarchy() (direct, closure map[string]map[string]boo
 		}
 	}
 	// Trait `use` (and any other extends-shaped) relationship is a graph edge.
-	for e := range g.EdgesByKind(graph.EdgeExtends) {
+	for e := range graph.EdgesLightSeq(g, graph.EdgeExtends) {
 		if e == nil {
 			continue
 		}

@@ -240,7 +240,7 @@ type rustTraitTargetEntry struct {
 type rustTraitTargetIndex struct {
 	exact    map[rustTraitTargetKey]rustTraitTargetEntry
 	basename map[rustTraitTargetKey]rustTraitTargetEntry
-	nodes    map[string]*graph.Node
+	nodes    map[string]graph.QualifiedNodeIdentity
 }
 
 func resolveRustTraitExtendsWithIndex(g graph.Store, idx *rustTraitTargetIndex, aliases *rustTypeAliasIndex) int {
@@ -252,8 +252,8 @@ func resolveRustTraitExtendsWithIndex(g graph.Store, idx *rustTraitTargetIndex, 
 		if edge == nil || !strings.HasPrefix(edge.To, "unresolved::extends::") {
 			continue
 		}
-		child := idx.nodes[edge.From]
-		if child == nil {
+		child, ok := idx.nodes[edge.From]
+		if !ok {
 			continue
 		}
 		raw := strings.TrimPrefix(edge.To, "unresolved::extends::")
@@ -263,13 +263,13 @@ func resolveRustTraitExtendsWithIndex(g graph.Store, idx *rustTraitTargetIndex, 
 			}
 		}
 		if aliases != nil {
-			resolvedPath, _, ok := aliases.resolve(child, raw)
+			resolvedPath, _, ok := aliases.resolveAt(child.RepoPrefix, child.FilePath, raw)
 			if !ok {
 				continue
 			}
 			raw = resolvedPath
 		}
-		target := idx.resolve(child, raw)
+		target := idx.resolveAt(child.FilePath, child.RepoPrefix, raw)
 		if target == "" || target == edge.From {
 			continue
 		}
@@ -294,10 +294,10 @@ func newRustTraitTargetIndex(g graph.Store) *rustTraitTargetIndex {
 	idx := &rustTraitTargetIndex{
 		exact:    make(map[rustTraitTargetKey]rustTraitTargetEntry),
 		basename: make(map[rustTraitTargetKey]rustTraitTargetEntry),
-		nodes:    make(map[string]*graph.Node),
+		nodes:    make(map[string]graph.QualifiedNodeIdentity),
 	}
-	for node := range g.NodesByKind(graph.KindInterface) {
-		if node == nil || node.Language != "rust" || node.ID == "" || node.Name == "" {
+	for node := range graph.QualifiedNodeIdentitiesSeq(g, graph.KindInterface) {
+		if node.Language != "rust" || node.ID == "" || node.Name == "" {
 			continue
 		}
 		crateRoot, module := rustTraitCrateAndModule(node.FilePath)
@@ -330,6 +330,14 @@ func newRustTraitTargetIndex(g graph.Store) *rustTraitTargetIndex {
 	return idx
 }
 
+func (idx *rustTraitTargetIndex) has(id string) bool {
+	if idx == nil {
+		return false
+	}
+	_, ok := idx.nodes[id]
+	return ok
+}
+
 func addRustTraitTarget(index map[rustTraitTargetKey]rustTraitTargetEntry, key rustTraitTargetKey, id string) {
 	if key.path == "" || id == "" {
 		return
@@ -346,17 +354,24 @@ func addRustTraitTarget(index map[rustTraitTargetKey]rustTraitTargetEntry, key r
 }
 
 func (idx *rustTraitTargetIndex) resolve(child *graph.Node, raw string) string {
-	if idx == nil || child == nil {
+	if child == nil {
+		return ""
+	}
+	return idx.resolveAt(child.FilePath, child.RepoPrefix, raw)
+}
+
+func (idx *rustTraitTargetIndex) resolveAt(filePath, repoPrefix, raw string) string {
+	if idx == nil {
 		return ""
 	}
 	path := normalizeRustTraitPath(raw)
 	if path == "" || strings.HasPrefix(strings.TrimSpace(raw), "?") {
 		return ""
 	}
-	crateRoot, module := rustTraitCrateAndModule(child.FilePath)
+	crateRoot, module := rustTraitCrateAndModule(filePath)
 	lookupExact := func(candidate string) string {
 		entry, ok := idx.exact[rustTraitTargetKey{
-			repo: child.RepoPrefix, crateRoot: crateRoot, path: candidate,
+			repo: repoPrefix, crateRoot: crateRoot, path: candidate,
 		}]
 		if !ok || entry.ambiguous {
 			return ""
@@ -400,7 +415,7 @@ func (idx *rustTraitTargetIndex) resolve(child *graph.Node, raw string) string {
 		return id
 	}
 	entry, ok := idx.basename[rustTraitTargetKey{
-		repo: child.RepoPrefix, crateRoot: crateRoot, path: path,
+		repo: repoPrefix, crateRoot: crateRoot, path: path,
 	}]
 	if !ok || entry.ambiguous {
 		return ""
@@ -470,8 +485,8 @@ func (idx *rustTraitTargetIndex) ownerAliases(id string) []string {
 	if idx == nil {
 		return nil
 	}
-	node := idx.nodes[id]
-	if node == nil {
+	node, ok := idx.nodes[id]
+	if !ok {
 		return nil
 	}
 	crateRoot, module := rustTraitCrateAndModule(node.FilePath)
@@ -514,8 +529,8 @@ func inheritRustTraitMethods(g graph.Store, scope *rustScopeIndex, targets *rust
 
 	directByTrait := make(map[string][]*graph.Node)
 	assigned := make(map[string]bool)
-	for edge := range g.EdgesByKind(graph.EdgeMemberOf) {
-		if edge == nil || targets.nodes[edge.To] == nil {
+	for edge := range graph.EdgesLightSeq(g, graph.EdgeMemberOf) {
+		if edge == nil || !targets.has(edge.To) {
 			continue
 		}
 		method := methodByID[edge.From]
@@ -541,8 +556,8 @@ func inheritRustTraitMethods(g graph.Store, scope *rustScopeIndex, targets *rust
 	}
 
 	supers := make(map[string][]string)
-	for edge := range g.EdgesByKind(graph.EdgeExtends) {
-		if edge == nil || edge.From == edge.To || targets.nodes[edge.From] == nil || targets.nodes[edge.To] == nil {
+	for edge := range graph.EdgesLightSeq(g, graph.EdgeExtends) {
+		if edge == nil || edge.From == edge.To || !targets.has(edge.From) || !targets.has(edge.To) {
 			continue
 		}
 		supers[edge.From] = append(supers[edge.From], edge.To)

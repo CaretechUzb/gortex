@@ -181,6 +181,19 @@ func (s *frameworkEdgeBatchStore) EdgesByKinds(kinds []graph.EdgeKind) iter.Seq[
 	})
 }
 
+func (s *frameworkEdgeBatchStore) EdgesLightSeq(kinds ...graph.EdgeKind) iter.Seq[*graph.Edge] {
+	wanted := make(map[graph.EdgeKind]struct{}, len(kinds))
+	for _, kind := range kinds {
+		if kind != "" {
+			wanted[kind] = struct{}{}
+		}
+	}
+	return s.mergeEdgeSeq(graph.EdgesLightSeq(s.Store, kinds...), func(edge *graph.Edge) bool {
+		_, ok := wanted[edge.Kind]
+		return ok
+	})
+}
+
 func (s *frameworkEdgeBatchStore) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
 	return s.mergeEdgeSeq(s.Store.EdgesWithUnresolvedTarget(), func(edge *graph.Edge) bool {
 		return graph.IsUnresolvedTarget(edge.To) && !graph.IsFnValuePlaceholder(edge.To)
@@ -226,6 +239,42 @@ func (s *frameworkEdgeBatchStore) NodesByKinds(kinds []graph.NodeKind) []*graph.
 		}
 	}
 	return out
+}
+
+func (s *frameworkEdgeBatchStore) ScopeBindingNodesSeq(kinds ...graph.NodeKind) iter.Seq[graph.ScopeBindingNode] {
+	return graph.ScopeBindingNodesSeq(s.Store, kinds...)
+}
+
+func (s *frameworkEdgeBatchStore) CallableBindingNodesSeq(kinds ...graph.NodeKind) iter.Seq[graph.CallableBindingNode] {
+	return graph.CallableBindingNodesSeq(s.Store, kinds...)
+}
+
+func (s *frameworkEdgeBatchStore) FileLanguageNodesSeq() iter.Seq[graph.FileLanguageNode] {
+	return graph.FileLanguageNodesSeq(s.Store)
+}
+
+func (s *frameworkEdgeBatchStore) RepoNodeIdentitiesSeq(repoPrefixes []string, kinds ...graph.NodeKind) iter.Seq[graph.RepoNodeIdentity] {
+	return graph.RepoNodeIdentitiesSeq(s.Store, repoPrefixes, kinds...)
+}
+
+func (s *frameworkEdgeBatchStore) NamedLanguageNodesSeq(kinds ...graph.NodeKind) iter.Seq[graph.NamedLanguageNode] {
+	return graph.NamedLanguageNodesSeq(s.Store, kinds...)
+}
+
+func (s *frameworkEdgeBatchStore) QualifiedNodeIdentitiesSeq(kinds ...graph.NodeKind) iter.Seq[graph.QualifiedNodeIdentity] {
+	return graph.QualifiedNodeIdentitiesSeq(s.Store, kinds...)
+}
+
+func (s *frameworkEdgeBatchStore) FileNodeIdentitiesSeq(repoPrefixes []string) iter.Seq[graph.FileNodeIdentity] {
+	return graph.FileNodeIdentitiesSeq(s.Store, repoPrefixes)
+}
+
+func (s *frameworkEdgeBatchStore) NodePlacementsByIDs(ids []string) map[string]graph.NodePlacement {
+	return graph.NodePlacementsByIDs(s.Store, ids)
+}
+
+func (s *frameworkEdgeBatchStore) NodeIDsByKinds(kinds []graph.NodeKind) []string {
+	return graph.NodeIDsForKinds(s.Store, kinds...)
 }
 
 // ConstantValuesByNodeIDs preserves the Temporal pass's sidecar projection.

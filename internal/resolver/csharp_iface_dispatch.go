@@ -427,7 +427,7 @@ func csharpMemberMethodsAllByType(g graph.Store) map[string]map[string][]*graph.
 	}
 	var edges []*graph.Edge
 	methodIDs := make([]string, 0)
-	for e := range g.EdgesByKind(graph.EdgeMemberOf) {
+	for e := range graph.EdgesLightSeq(g, graph.EdgeMemberOf) {
 		if e == nil {
 			continue
 		}

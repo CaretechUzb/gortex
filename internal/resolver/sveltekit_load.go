@@ -25,9 +25,10 @@ func ResolveSvelteKitLoad(g graph.Store) int {
 	// Per route dir: the page node and the server module file, plus the load
 	// function declared in the server module.
 	type routeDir struct {
-		pageNode     *graph.Node
-		serverFile   *graph.Node
-		serverLoadID string
+		pageNode      *graph.Node
+		serverFile    graph.FileNodeIdentity
+		hasServerFile bool
+		serverLoadID  string
 	}
 	dirs := map[string]*routeDir{}
 	get := func(dir string) *routeDir {
@@ -38,13 +39,12 @@ func ResolveSvelteKitLoad(g graph.Store) int {
 	}
 
 	// First pass over file + component nodes to populate the page / server file.
-	for n := range g.NodesByKind(graph.KindFile) {
-		if n == nil {
-			continue
-		}
-		base, dir := pathBaseDir(n.FilePath)
+	for file := range graph.FileNodeIdentitiesSeq(g, nil) {
+		base, dir := pathBaseDir(file.FilePath)
 		if isSvelteKitServerFile(base) {
-			get(dir).serverFile = n
+			route := get(dir)
+			route.serverFile = file
+			route.hasServerFile = true
 		}
 	}
 	for _, kind := range []graph.NodeKind{graph.KindType, graph.KindFunction} {
@@ -79,17 +79,15 @@ func ResolveSvelteKitLoad(g graph.Store) int {
 		}
 		// Prefer the explicit load function; fall back to the server module file.
 		to := rd.serverLoadID
-		var toNode *graph.Node
+		sameBoundary := false
 		if to != "" {
-			toNode = g.GetNode(to)
-		} else if rd.serverFile != nil {
+			toNode := g.GetNode(to)
+			sameBoundary = sameDispatchBoundary(rd.pageNode, toNode)
+		} else if rd.hasServerFile {
 			to = rd.serverFile.ID
-			toNode = rd.serverFile
+			sameBoundary = rd.pageNode.WorkspaceID == rd.serverFile.WorkspaceID
 		}
-		if to == "" || toNode == nil {
-			continue
-		}
-		if !sameDispatchBoundary(rd.pageNode, toNode) {
+		if to == "" || !sameBoundary {
 			continue
 		}
 		batch = append(batch, &graph.Edge{
