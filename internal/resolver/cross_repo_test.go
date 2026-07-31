@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"iter"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -435,4 +436,94 @@ func TestCrossRepoResolveAll_BindsInboundEdgeIntoChangedRepo(t *testing.T) {
 	assert.Equal(t, "repoB/b.go::Foo", inbound.To,
 		"the whole-graph cross-repo resolve must bind the unchanged consumer's inbound reference into the changed provider")
 	assert.True(t, inbound.CrossRepo)
+}
+
+type crossRepoPassCountingStore struct {
+	graph.Store
+	directoryIndexBuilds    int
+	dependencyIndexBuilds   int
+	reachabilityIndexBuilds int
+}
+
+func (s *crossRepoPassCountingStore) FileNodeIdentitiesSeq(repoPrefixes []string) iter.Seq[graph.FileNodeIdentity] {
+	s.directoryIndexBuilds++
+	return graph.FileNodeIdentitiesSeq(s.Store, repoPrefixes)
+}
+
+func (s *crossRepoPassCountingStore) RepoNodeIdentitiesSeq(
+	repoPrefixes []string,
+	kinds ...graph.NodeKind,
+) iter.Seq[graph.RepoNodeIdentity] {
+	s.dependencyIndexBuilds++
+	return graph.RepoNodeIdentitiesSeq(s.Store, repoPrefixes, kinds...)
+}
+
+func (s *crossRepoPassCountingStore) EdgesLightSeq(kinds ...graph.EdgeKind) iter.Seq[*graph.Edge] {
+	if len(kinds) == 1 && kinds[0] == graph.EdgeImports {
+		s.reachabilityIndexBuilds++
+	}
+	return graph.EdgesLightSeq(s.Store, kinds...)
+}
+
+func TestCrossRepoResolveFilesAndIncoming_BatchesBothDirectionsWithOneIndexBuild(t *testing.T) {
+	g := &crossRepoPassCountingStore{Store: graph.New()}
+	const (
+		changedCallerFile   = "repoA/pkg/caller.go"
+		outgoingTargetFile  = "repoB/lib/helper.go"
+		incomingCallerFile  = "repoC/pkg/caller.go"
+		changedProviderFile = "repoD/lib/added.go"
+	)
+
+	g.AddNode(&graph.Node{
+		ID: "repoA/pkg/caller.go::Caller", Kind: graph.KindFunction, Name: "Caller",
+		FilePath: changedCallerFile, Language: "go", RepoPrefix: "repoA",
+	})
+	g.AddNode(&graph.Node{
+		ID: "repoB/lib/helper.go::Helper", Kind: graph.KindFunction, Name: "Helper",
+		FilePath: outgoingTargetFile, Language: "go", RepoPrefix: "repoB",
+	})
+	wireImport(g, changedCallerFile, "repoB", outgoingTargetFile)
+	outgoing := &graph.Edge{
+		From: "repoA/pkg/caller.go::Caller", To: "unresolved::Helper",
+		Kind: graph.EdgeCalls, FilePath: changedCallerFile, Line: 7,
+	}
+	g.AddEdge(outgoing)
+
+	g.AddNode(&graph.Node{
+		ID: "repoC/pkg/caller.go::Caller", Kind: graph.KindFunction, Name: "Caller",
+		FilePath: incomingCallerFile, Language: "go", RepoPrefix: "repoC",
+	})
+	g.AddNode(&graph.Node{
+		ID: "repoD/lib/added.go::Added", Kind: graph.KindFunction, Name: "Added",
+		FilePath: changedProviderFile, Language: "go", RepoPrefix: "repoD",
+	})
+	wireImport(g, incomingCallerFile, "repoD", changedProviderFile)
+	incoming := &graph.Edge{
+		From: "repoC/pkg/caller.go::Caller", To: "repoD::unresolved::Added",
+		Kind: graph.EdgeCalls, FilePath: incomingCallerFile, Line: 11,
+	}
+	g.AddEdge(incoming)
+
+	cr := NewCrossRepo(g)
+	emptyStats := cr.ResolveFilesAndIncoming([]string{"missing.go"})
+	require.Zero(t, emptyStats.Resolved)
+	require.Zero(t, g.directoryIndexBuilds)
+	require.Zero(t, g.dependencyIndexBuilds)
+	require.Zero(t, g.reachabilityIndexBuilds)
+
+	stats := cr.ResolveFilesAndIncoming([]string{
+		changedProviderFile,
+		changedCallerFile,
+		changedCallerFile,
+	})
+
+	require.Equal(t, 2, stats.Resolved)
+	require.Equal(t, 2, stats.CrossRepoEdges)
+	assert.Equal(t, "repoB/lib/helper.go::Helper", outgoing.To)
+	assert.True(t, outgoing.CrossRepo)
+	assert.Equal(t, "repoD/lib/added.go::Added", incoming.To)
+	assert.True(t, incoming.CrossRepo)
+	require.Equal(t, 1, g.directoryIndexBuilds)
+	require.Equal(t, 1, g.dependencyIndexBuilds)
+	require.Equal(t, 1, g.reachabilityIndexBuilds)
 }

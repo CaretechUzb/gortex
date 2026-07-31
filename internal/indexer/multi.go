@@ -2300,10 +2300,11 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 		return nil, fmt.Errorf("reindexing %s: %w", meta.RootPath, err)
 	}
 
-	// Resolve exactly once after the bounded parse/evict batch. Complete
-	// mutation receipts provide the precise changed/definition file frontier;
-	// only an incomplete receipt falls back to the conservative scoped-global
-	// resolver. Derived invalidations run once below after bindings are current.
+	// Run the same-repo and cross-repo resolver tails exactly once after the
+	// bounded parse/evict batch. Complete mutation receipts provide the precise
+	// changed/definition file frontier; only an incomplete receipt falls back to
+	// conservative scoped-global resolution. Derived invalidations run once
+	// below after both binding layers are current.
 	mi.resolveIncrementalRepoMutationMode(
 		repoPrefix, result, receipt, batch, mode.exactPointSemantic,
 	)

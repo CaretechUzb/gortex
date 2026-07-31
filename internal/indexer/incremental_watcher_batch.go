@@ -121,10 +121,10 @@ func (idx *Indexer) runIncrementalResolutionCatchup(
 	files []string,
 	batch *reparsePendingEnrichmentBatch,
 	resolveFiles func([]string),
-) {
+) []string {
 	files = appendUniqueSorted(nil, files...)
 	if len(files) == 0 {
-		return
+		return nil
 	}
 	idx.observeIncrementalCatchup("resolve", files)
 	resolveFiles(files)
@@ -141,12 +141,13 @@ func (idx *Indexer) runIncrementalResolutionCatchup(
 	factFiles := appendUniqueSorted(files, affected.files...)
 	idx.observeIncrementalCatchup("ref_facts", factFiles)
 	idx.persistRefFactsForFiles(factFiles)
+	return factFiles
 }
 
-func (idx *Indexer) runIncrementalWatcherSemantic(graphPaths []string) {
+func (idx *Indexer) runIncrementalWatcherSemantic(graphPaths []string) []string {
 	if idx == nil || idx.semanticMgr == nil || !idx.semanticMgr.Enabled() ||
 		!idx.semanticMgr.HasProviders() || !idx.semanticMgr.EnrichesOnWatch() {
-		return
+		return nil
 	}
 	pendingFiles, _, _ := idx.deferredEnrichScope()
 	if len(pendingFiles) == 0 {
@@ -155,7 +156,7 @@ func (idx *Indexer) runIncrementalWatcherSemantic(graphPaths []string) {
 	idx.observeIncrementalCatchup("semantic", pendingFiles)
 	idx.runDeferredEnrich()
 	if idx.pendingEnrich.Load() {
-		return
+		return pendingFiles
 	}
 	pending := make(map[string]bool, len(graphPaths))
 	for _, graphPath := range graphPaths {
@@ -164,20 +165,21 @@ func (idx *Indexer) runIncrementalWatcherSemantic(graphPaths []string) {
 		}
 	}
 	idx.setReparsePendingEnrichments(pending)
+	return pendingFiles
 }
 
 // runIncrementalPointSemantic preserves IndexFile's exact single-save semantic
 // contract. Storm and reconciliation batches use runIncrementalWatcherSemantic
 // to amortize provider work; one explicit point mutation calls EnrichFile so
 // in-process type providers can confirm the new edges before IndexFile returns.
-func (idx *Indexer) runIncrementalPointSemantic(graphPaths []string) {
+func (idx *Indexer) runIncrementalPointSemantic(graphPaths []string) []string {
 	if idx == nil || idx.semanticMgr == nil || !idx.semanticMgr.Enabled() ||
 		!idx.semanticMgr.HasProviders() || !idx.semanticMgr.EnrichesOnWatch() {
-		return
+		return nil
 	}
 	paths := appendUniqueSorted(nil, graphPaths...)
 	if len(paths) == 0 {
-		return
+		return nil
 	}
 	idx.observeIncrementalCatchup("semantic", paths)
 	pending := make(map[string]bool, len(paths))
@@ -191,6 +193,7 @@ func (idx *Indexer) runIncrementalPointSemantic(graphPaths []string) {
 		pending[graphPath] = false
 	}
 	idx.setReparsePendingEnrichments(pending)
+	return paths
 }
 
 // incrementalReindexWatcherPaths is the complete direct-Indexer coordinator used
@@ -331,10 +334,11 @@ func (gw *GitWatcher) reindexChangedPaths(paths []string) (*IndexResult, error) 
 	return gw.indexer.IncrementalReindexPaths(gw.repoPath, paths)
 }
 
-// resolveIncrementalRepoMutation runs one shared resolver pass for a complete
-// receipt frontier or, when the store cannot certify its eviction shape, the
-// indexer's conservative successful-file frontier. A whole-graph fallback is
-// reserved for the exceptional case where neither source yields any scope.
+// resolveIncrementalRepoMutation runs one same-repo pass and one coordinated
+// cross-repo outgoing-plus-incoming pass for a complete receipt frontier or,
+// when the store cannot certify its eviction shape, the indexer's conservative
+// successful-file frontier. A whole-graph fallback is reserved for the
+// exceptional case where neither source yields any safe scope.
 func (mi *MultiIndexer) resolveIncrementalRepoMutation(
 	repoPrefix string,
 	result *IndexResult,
@@ -352,15 +356,20 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 	exactPointSemantic bool,
 ) {
 	files, needed, _ := incrementalResolutionFrontier(result, receipt)
+	crossRepoFiles := appendUniqueSorted(nil, files...)
+	if result != nil {
+		crossRepoFiles = appendUniqueSorted(crossRepoFiles, result.DerivedInvalidation.Files...)
+	}
 	idx := mi.GetIndexer(repoPrefix)
 	if needed && len(files) > 0 && idx != nil {
-		idx.runIncrementalResolutionCatchup(files, batch, func(frontier []string) {
+		resolvedFiles := idx.runIncrementalResolutionCatchup(files, batch, func(frontier []string) {
 			if idx.incrementalResolveFilesHook != nil {
 				idx.incrementalResolveFilesHook(frontier)
 				return
 			}
 			mi.runMasterResolveFiles(frontier, false)
 		})
+		crossRepoFiles = appendUniqueSorted(crossRepoFiles, resolvedFiles...)
 	} else if needed && len(files) > 0 {
 		mi.runMasterResolveFiles(files, false)
 	} else if needed {
@@ -373,17 +382,31 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		// second graph-wide dataflow or durable-fact scan.
 		if idx != nil && result != nil {
 			known := appendUniqueSorted(nil, result.DerivedInvalidation.Files...)
+			crossRepoFiles = appendUniqueSorted(crossRepoFiles, known...)
 			idx.observeIncrementalCatchup("dataflow", known)
 			idx.materializeDataflowParamsForFiles(known)
 			idx.observeIncrementalCatchup("ref_facts", known)
 			idx.persistRefFactsForFiles(known)
 		}
 	}
+
+	var semanticFiles []string
 	if idx != nil && result != nil {
 		if exactPointSemantic {
-			idx.runIncrementalPointSemantic(result.DerivedInvalidation.Files)
+			semanticFiles = idx.runIncrementalPointSemantic(result.DerivedInvalidation.Files)
 		} else {
-			idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+			semanticFiles = idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+		}
+		crossRepoFiles = appendUniqueSorted(crossRepoFiles, semanticFiles...)
+	}
+	if needed || len(semanticFiles) > 0 {
+		if idx != nil {
+			idx.observeIncrementalCatchup("cross_repo", crossRepoFiles)
+		}
+		if len(crossRepoFiles) > 0 {
+			mi.runCrossRepoResolveFiles(crossRepoFiles)
+		} else {
+			mi.runCrossRepoResolve(false)
 		}
 	}
 }
