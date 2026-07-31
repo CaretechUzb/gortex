@@ -2,6 +2,7 @@ package search
 
 import (
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -35,14 +36,12 @@ import (
 type SymbolSearcherBackend struct {
 	s graph.SymbolSearcher
 
-	// count tracks the indexer's incremental Add / Remove deltas
-	// only — it does NOT report the actual size of the backend
-	// FTS index (which lives in the disk store and is queryable
-	// via the SymbolSearcher's own primitives). Used for the
-	// search.Backend.Count() contract by callers that just want a
-	// rough magnitude (no caller currently treats this as
-	// authoritative).
-	count atomic.Int64
+	// count is lazily seeded from the authoritative persisted FTS count on its
+	// first read, then follows the indexer's incremental Add/Remove deltas. Lazy
+	// initialization avoids a discarded global count query for each per-repo
+	// Indexer constructed by MultiIndexer.
+	countInit sync.Once
+	count     atomic.Int64
 }
 
 // NewSymbolSearcherBackend wraps a SymbolSearcher in the
@@ -120,10 +119,9 @@ func (b *SymbolSearcherBackend) Search(query string, limit int) []SearchResult {
 }
 
 // Add is a no-op — the indexer drives UpsertSymbolFTS on the wrapped
-// SymbolSearcher directly. count is bumped so the Count() figure
-// tracks the deltas-since-construction (best-effort, not
-// authoritative — the disk index may be larger from a prior cold
-// load).
+// SymbolSearcher directly. count is bumped immediately so deltas that arrive
+// before the first Count call are preserved when the persisted snapshot is
+// added.
 func (b *SymbolSearcherBackend) Add(id string, _ ...string) {
 	if b == nil || id == "" {
 		return
@@ -142,25 +140,30 @@ func (b *SymbolSearcherBackend) Remove(id string) {
 	b.count.Add(-1)
 }
 
-// Count returns the running delta-since-construction. Used for
-// observability / "is the index populated?" gates — never as a
-// load-bearing decision input. The authoritative size lives in
-// the disk FTS index, which is queryable via the
-// SymbolSearcher's native primitives if needed.
+// Count returns the persisted corpus snapshot observed on its first call plus
+// subsequent Add/Remove deltas. It is suitable for readiness gates and rough
+// magnitude only; DocCount reads the authoritative current size.
 func (b *SymbolSearcherBackend) Count() int {
 	if b == nil {
 		return 0
 	}
+	b.countInit.Do(func() {
+		if counter, ok := b.s.(graph.SymbolFTSCounter); ok {
+			if count, err := counter.SymbolFTSCount(); err == nil && count > 0 {
+				b.count.Add(int64(count))
+			}
+		}
+	})
 	return int(b.count.Load())
 }
 
 // DocCount returns the authoritative number of indexed documents, straight
 // from the underlying index, and reports whether it could be obtained.
 //
-// Count() must not be used for this: it is a delta of the indexer's Add and
-// Remove calls since construction, so it is not a corpus size and can be
-// negative. Anything user-facing asks here and omits the figure when the
-// answer is unavailable, rather than printing the delta.
+// Count() must not be used for this: its cached readiness snapshot can drift as
+// direct store maintenance and best-effort Add/Remove deltas diverge. Anything
+// user-facing asks here and omits the figure when the authoritative answer is
+// unavailable.
 func (b *SymbolSearcherBackend) DocCount() (int, bool) {
 	if b == nil || b.s == nil {
 		return 0, false
