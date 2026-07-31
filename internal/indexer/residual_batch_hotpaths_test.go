@@ -114,7 +114,11 @@ func TestResolveProviderHandlersUsesOneNameAndFileBatch(t *testing.T) {
 		if len(items) != 1 {
 			t.Fatalf("contract %s count=%d", id, len(items))
 		}
-		if items[0].SymbolID != handlerID || items[0].FilePath != "repo/handlers.go" {
+		// SymbolID is the resolution this pass exists to produce. FilePath
+		// stays on the registration site the contract was extracted from:
+		// Line still describes that site, so re-homing the file would pair a
+		// file and a line from two different places (issue #322).
+		if items[0].SymbolID != handlerID || items[0].FilePath != "repo/router.go" {
 			t.Fatalf("contract %s resolved to symbol=%q file=%q", id, items[0].SymbolID, items[0].FilePath)
 		}
 		if _, ok := items[0].Meta["handler_ident"]; ok {

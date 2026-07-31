@@ -6294,6 +6294,15 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 			}
 			// Operate on a copy; Registry entries are values.
 			patched := c
+			// FilePath is swapped to the handler's file only so the enricher
+			// can read that file's tree. Line is not swapped with it — it
+			// keeps describing the registration site — so leaving the
+			// handler's file in place would pair a file and a line that come
+			// from two different places, and every consumer citing file:line
+			// would point at unrelated code (issue #322). Restore it once
+			// enrichment is done. SymbolID stays re-pointed: the resolved
+			// handler is the answer that lookup exists to produce.
+			registrationFile := patched.FilePath
 			patched.SymbolID = handlerNode.ID
 			patched.FilePath = handlerNode.FilePath
 			if patched.Meta == nil {
@@ -6304,6 +6313,7 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 			// want the call-path to be identical to Stage 1).
 			lines := splitLines(src)
 			contracts.EnrichHTTPContractWithTree(&patched, lines, nodes, lang, tree)
+			patched.FilePath = registrationFile
 			delete(patched.Meta, "handler_ident")
 			delete(patched.Meta, "handler_trail")
 			matches[i] = patched
