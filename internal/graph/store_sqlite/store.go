@@ -910,13 +910,29 @@ func (s *Store) prepare() error {
 
 // -- row scanners ---------------------------------------------------------
 
-func scanNode(scanner interface {
+type rowScanner interface {
 	Scan(...any) error
-}) (*graph.Node, error) {
+}
+
+// scanNode is reserved for point lookups backed by sql.Row. database/sql
+// rejects sql.RawBytes for Row.Scan because Row closes its cursor before Scan
+// returns, so these callers must retain the driver's defensive []byte copy.
+func scanNode(scanner rowScanner) (*graph.Node, error) {
+	var metaBlob []byte
+	return scanNodeWithMeta(scanner, &metaBlob)
+}
+
+// scanNodeCursor decodes metadata while the Rows cursor still owns the bytes.
+// The decoded map never retains the RawBytes slice beyond Rows.Next.
+func scanNodeCursor(scanner rowScanner) (*graph.Node, error) {
+	var metaBlob sql.RawBytes
+	return scanNodeWithMeta(scanner, &metaBlob)
+}
+
+func scanNodeWithMeta[B ~[]byte](scanner rowScanner, metaBlob *B) (*graph.Node, error) {
 	var (
-		n        graph.Node
-		metaBlob []byte
-		p        promotedNodeMeta
+		n graph.Node
+		p promotedNodeMeta
 	)
 	err := scanner.Scan(
 		&n.ID, &n.Kind, &n.Name, &n.QualName, &n.FilePath,
@@ -925,14 +941,14 @@ func scanNode(scanner interface {
 		&p.sig, &p.vis, &p.doc, &p.external, &p.returnType,
 		&p.isAsync, &p.isStatic, &p.isAbstract, &p.isExported, &p.updatedAt,
 		&p.dataClass, &p.semanticType, &p.semanticSource, &p.cloneSig,
-		&p.entryPoint, &p.entryPointKind, &metaBlob,
+		&p.entryPoint, &p.entryPointKind, metaBlob,
 		&p.searchSig, &p.searchQualName, &p.searchDoc, &p.searchSuppressed, &p.sectionText,
 	)
 	if err != nil {
 		return nil, err
 	}
-	if len(metaBlob) > 0 {
-		m, derr := decodeMeta(metaBlob)
+	if len(*metaBlob) > 0 {
+		m, derr := decodeMeta([]byte(*metaBlob))
 		if derr != nil {
 			return nil, derr
 		}
@@ -995,26 +1011,30 @@ func scanNodeSummary(scanner interface {
 	return &n, nil
 }
 
-func scanEdge(scanner interface {
-	Scan(...any) error
-}) (*graph.Edge, error) {
+// scanEdgeCursor is cursor-only: metadata is decoded before Rows.Next, so the
+// driver-owned RawBytes never escapes into the returned edge.
+func scanEdgeCursor(scanner rowScanner) (*graph.Edge, error) {
+	var metaBlob sql.RawBytes
+	return scanEdgeWithMeta(scanner, &metaBlob)
+}
+
+func scanEdgeWithMeta[B ~[]byte](scanner rowScanner, metaBlob *B) (*graph.Edge, error) {
 	var (
 		e         graph.Edge
-		metaBlob  []byte
 		crossRepo int64
 		p         promotedEdgeMeta
 	)
 	err := scanner.Scan(
 		&e.From, &e.To, &e.Kind, &e.FilePath, &e.Line,
 		&e.Confidence, &e.ConfidenceLabel, &e.Origin, &e.Tier,
-		&crossRepo, &metaBlob, &p.resolveTerminal, &p.resolveTerminalReason, &p.semanticSource,
+		&crossRepo, metaBlob, &p.resolveTerminal, &p.resolveTerminalReason, &p.semanticSource,
 	)
 	if err != nil {
 		return nil, err
 	}
 	e.CrossRepo = crossRepo != 0
-	if len(metaBlob) > 0 {
-		m, derr := decodeMeta(metaBlob)
+	if len(*metaBlob) > 0 {
+		m, derr := decodeMeta([]byte(*metaBlob))
 		if derr != nil {
 			return nil, derr
 		}
@@ -1710,7 +1730,7 @@ func (s *Store) queryNodesContext(ctx context.Context, stmt *sql.Stmt, args ...a
 	defer rows.Close()
 	var out []*graph.Node
 	for rows.Next() {
-		n, err := scanNode(rows)
+		n, err := scanNodeCursor(rows)
 		if err != nil {
 			if ctx.Err() != nil {
 				return out
@@ -1802,7 +1822,7 @@ func (s *Store) scanNodeQuery(query string, args ...any) []*graph.Node {
 	defer rows.Close()
 	var out []*graph.Node
 	for rows.Next() {
-		n, err := scanNode(rows)
+		n, err := scanNodeCursor(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out
@@ -1913,7 +1933,7 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		e, err := scanEdge(rows)
+		e, err := scanEdgeCursor(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out
@@ -2347,7 +2367,7 @@ func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		e, err := scanEdge(rows)
+		e, err := scanEdgeCursor(rows)
 		if err != nil || e == nil {
 			continue
 		}
@@ -2365,7 +2385,7 @@ func (s *Store) queryNodesSQL(q string, args ...any) []*graph.Node {
 	defer rows.Close()
 	var out []*graph.Node
 	for rows.Next() {
-		n, err := scanNode(rows)
+		n, err := scanNodeCursor(rows)
 		if err != nil || n == nil {
 			continue
 		}

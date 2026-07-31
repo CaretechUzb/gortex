@@ -2,6 +2,7 @@ package store_sqlite
 
 import (
 	"context"
+	"database/sql"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -112,7 +113,7 @@ func scanDataflowEdge(scanner interface{ Scan(...any) error }) (int64, *graph.Ed
 	var (
 		rowID     int64
 		edge      graph.Edge
-		metaBlob  []byte
+		metaBlob  sql.RawBytes
 		crossRepo int64
 		promoted  promotedEdgeMeta
 	)

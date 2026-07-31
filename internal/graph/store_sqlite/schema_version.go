@@ -226,7 +226,7 @@ LIMIT ?`, afterID, []byte(edgeSemanticSourceMetaMarker), limits.pageRows)
 		updates := make([]edgeSemanticSourceMigrationRow, 0, min(limits.pageRows, limits.updateRows))
 		for rows.Next() {
 			var id int64
-			var blob []byte
+			var blob sql.RawBytes
 			if err := rows.Scan(&id, &blob); err != nil {
 				_ = rows.Close()
 				return stats, err

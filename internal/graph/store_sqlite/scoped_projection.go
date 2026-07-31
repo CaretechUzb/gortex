@@ -100,7 +100,7 @@ func (s *Store) streamScopedNodes(query string, args []any, summary bool, yield 
 			if summary {
 				node, scanErr = scanNodeSummary(rows)
 			} else {
-				node, scanErr = scanNode(rows)
+				node, scanErr = scanNodeCursor(rows)
 			}
 			if scanErr != nil {
 				_ = rows.Close()
@@ -175,7 +175,7 @@ func (s *Store) streamScopedEdges(query string, args []any, maxID int64, yield f
 		page := make([]*graph.Edge, 0, scopedProjectionPage)
 		for rows.Next() {
 			var edgeID int64
-			edge, scanErr := scanEdge(edgeIDScanner{scanner: rows, id: &edgeID})
+			edge, scanErr := scanEdgeCursor(edgeIDScanner{scanner: rows, id: &edgeID})
 			if scanErr != nil {
 				_ = rows.Close()
 				panicOnFatal(scanErr)
