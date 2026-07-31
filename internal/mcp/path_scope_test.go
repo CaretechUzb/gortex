@@ -63,7 +63,7 @@ func TestApplyPathFilter_StripsRepoPrefix(t *testing.T) {
 }
 
 func TestSavedScope_PathsJSONRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "scopes.json")
+	path := filepath.Join(tempSidecarDir(t), "scopes.json")
 	st := newScopeStore(path)
 	require.NoError(t, st.put(SavedScope{
 		Name:  "billing",
@@ -83,7 +83,7 @@ func TestSavedScope_PathsJSONRoundTrip(t *testing.T) {
 }
 
 func TestResolvePathFilter_Sources(t *testing.T) {
-	t.Setenv("GORTEX_SCOPES_PATH", filepath.Join(t.TempDir(), "scopes.json"))
+	t.Setenv("GORTEX_SCOPES_PATH", filepath.Join(tempSidecarDir(t), "scopes.json"))
 	g := graph.New()
 	eng := query.NewEngine(g)
 	eng.SetSearch(search.NewBM25())

@@ -169,6 +169,7 @@ func TestMemoryManager_PersistenceRoundTrip(t *testing.T) {
 	repoPath := filepath.Join(tmp, "fake-repo")
 	require.NoError(t, os.MkdirAll(repoPath, 0o755))
 	cacheDir := filepath.Join(tmp, "cache")
+	closeSidecarOnCleanup(t, cacheDir)
 
 	mm := newMemoryManager(cacheDir, repoPath)
 	_, err := mm.Save(persistence.MemoryEntry{

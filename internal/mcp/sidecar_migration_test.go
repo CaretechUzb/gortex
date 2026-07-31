@@ -15,7 +15,7 @@ import (
 // notes.gob.gz is imported into the sidecar on first manager open and
 // the legacy file is renamed to *.bak (never deleted).
 func TestNotesManager_MigratesLegacyGobGz(t *testing.T) {
-	cache := t.TempDir()
+	cache := tempSidecarDir(t)
 	repo := "/tmp/migrate-notes-repo"
 	legacyDir := persistence.NotesDir(cache, repo)
 	require.NoError(t, persistence.SaveNotes(legacyDir, &persistence.NoteStore{
@@ -45,7 +45,7 @@ func TestNotesManager_MigratesLegacyGobGz(t *testing.T) {
 
 // TestMemoryManager_MigratesLegacyGobGz proves the same for memories.
 func TestMemoryManager_MigratesLegacyGobGz(t *testing.T) {
-	cache := t.TempDir()
+	cache := tempSidecarDir(t)
 	repo := "/tmp/migrate-mem-repo"
 	legacyDir := persistence.MemoriesDir(cache, repo)
 	require.NoError(t, persistence.SaveMemories(legacyDir, &persistence.MemoryStore{
@@ -67,7 +67,7 @@ func TestMemoryManager_MigratesLegacyGobGz(t *testing.T) {
 // TestScopeStore_MigratesLegacyJSON proves a pre-existing scopes.json
 // is imported into the sidecar and renamed to *.bak.
 func TestScopeStore_MigratesLegacyJSON(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempSidecarDir(t)
 	legacyPath := filepath.Join(dir, "scopes.json")
 	require.NoError(t, os.WriteFile(legacyPath,
 		[]byte(`[{"name":"backend","description":"be","repos":["api","core"]}]`), 0o644))
@@ -90,7 +90,7 @@ func TestScopeStore_MigratesLegacyJSON(t *testing.T) {
 // <repo>/.gortex/notebook/<id>.md files are imported into the sidecar
 // and renamed to *.bak.
 func TestNotebookManager_MigratesLegacyMarkdown(t *testing.T) {
-	repo := t.TempDir()
+	repo := tempNotebookRepo(t)
 	mdDir := filepath.Join(repo, ".gortex", "notebook")
 	require.NoError(t, os.MkdirAll(mdDir, 0o755))
 	md := notebookMarshal(notebookEntry{
@@ -115,7 +115,7 @@ func TestNotebookManager_MigratesLegacyMarkdown(t *testing.T) {
 // TestNotebookManager_PersistsAcrossRestart proves notebook entries
 // survive a manager restart (the sidecar is the durable store).
 func TestNotebookManager_PersistsAcrossRestart(t *testing.T) {
-	repo := t.TempDir()
+	repo := tempNotebookRepo(t)
 	nm1 := newNotebookManager(repo)
 	saved, err := nm1.Save(notebookEntry{Title: "t1", Body: "b1", Tags: []string{"x"}})
 	require.NoError(t, err)
