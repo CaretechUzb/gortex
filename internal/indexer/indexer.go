@@ -157,6 +157,11 @@ type Indexer struct {
 	// directly through the bounded graph accumulator.
 	shadowAdmission *shadowAdmissionBudget
 
+	// parseAdmission is the optional daemon-wide bytes-in-flight gate shared by
+	// every repository. Each Indexer keeps its private configured gate too; a
+	// file must satisfy both before its bytes and parse tree are materialised.
+	parseAdmission atomic.Pointer[parseAdmissionBudget]
+
 	// indexCount tracks how many IndexCtx calls this Indexer has
 	// completed. Gates the cold-start shadow-swap: each per-repo
 	// Indexer in MultiIndexer is fresh (indexCount==0), so all of
@@ -2982,11 +2987,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// serialises instead of all workers materialising whole files and
 	// their parse trees at once. Code files are tiny and flow freely;
 	// only genuinely large inputs queue. budget <= 0 disables the cap.
-	parseBudget := idx.config.MaxParseBytesInFlight
-	var parseSem *semaphore.Weighted
-	if parseBudget > 0 {
-		parseSem = semaphore.NewWeighted(parseBudget)
+	localParseBudget := idx.config.MaxParseBytesInFlight
+	var localParseSem *semaphore.Weighted
+	if localParseBudget > 0 {
+		localParseSem = semaphore.NewWeighted(localParseBudget)
 	}
+	sharedParseAdmission := idx.parseAdmission.Load()
 
 	// In addition to the bytes-in-flight budget above, cap how many
 	// genuinely large files are *read* concurrently: a few huge PDFs /
@@ -3095,13 +3101,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// bytes-in-flight budget before reading it, so large
 					// content files serialise instead of all workers
 					// materialising whole files at once.
-					var weight int64
-					if parseSem != nil {
-						weight = clampParseWeight(wf.size, parseBudget)
-						semStart := time.Now()
-						if aerr := parseSem.Acquire(ctx, weight); aerr != nil {
-							return
-						}
+					semStart := time.Now()
+					parseLease, aerr := acquireParseAdmission(
+						ctx, wf.size, localParseBudget, localParseSem, sharedParseAdmission,
+					)
+					if aerr != nil {
+						return
+					}
+					if parseLease != nil {
 						atomic.AddInt64(&parseSemWaitNS, int64(time.Since(semStart)))
 					}
 
@@ -3113,9 +3120,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					if walkExt, found := idx.registry.GetByLanguage(wf.lang); found && parsePool == nil {
 						if se, ok := walkExt.(parser.StreamingExtractor); ok {
 							result, serr := idx.extractStreaming(se, path, relPath)
-							if parseSem != nil {
-								parseSem.Release(weight)
-							}
 							if serr != nil {
 								errMu.Lock()
 								errors = append(errors, IndexError{FilePath: path, Error: serr.Error()})
@@ -3125,6 +3129,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 								errMu.Unlock()
 							}
 							if result == nil {
+								parseLease.Release()
 								continue
 							}
 							idx.applyRepoPrefix(result.Nodes, result.Edges)
@@ -3152,6 +3157,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 								}
 							}
 							sidecars.addConstValues(result)
+							parseLease.Release()
 							continue
 						}
 					}
@@ -3163,9 +3169,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
 						errMu.Unlock()
-						if parseSem != nil {
-							parseSem.Release(weight)
-						}
+						parseLease.Release()
 						continue
 					}
 
@@ -3188,9 +3192,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						}
 					}
 					if ext == nil {
-						if parseSem != nil {
-							parseSem.Release(weight)
-						}
+						parseLease.Release()
 						continue
 					}
 
@@ -3202,15 +3204,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					extractStart := time.Now()
 					result, skipped, err := idx.extractFile(parsePool, quarantine, path, relPath, lang, ext, src)
 					atomic.AddInt64(&parseExtractNS, int64(time.Since(extractStart)))
-					if parseSem != nil {
-						parseSem.Release(weight)
-					}
 					if err != nil {
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
 						errMu.Unlock()
 					}
 					if result == nil {
+						parseLease.Release()
 						// A full-index parse failure that produced no nodes:
 						// record it for a skip-node post-pass so the file
 						// stays visible instead of vanishing. (The live-modify
@@ -3333,6 +3333,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// long-lived worker goroutine, so a defer would pin
 					// every tree in the chunk until the worker exits.
 					result.ReleaseTree()
+					parseLease.Release()
 					atomic.AddInt64(&fileCount, 1)
 				}
 				if len(localContracts) > 0 {
@@ -4051,69 +4052,96 @@ func (idx *Indexer) indexFile(
 		idx.graph.EvictFile(graphPath)
 	}
 
-	src, readVersion, err := readFileWithVersion(absPath)
-	if err != nil {
-		return err
+	// A delta probe already owns a shared admission lease together with its
+	// transformed source and parse tree. Validate and consume that snapshot
+	// before acquiring another lease; acquiring first can self-deadlock when
+	// one oversized prepared file owns the entire shared budget.
+	preparedEntry, prepared := idx.takePreparedRefresh(absPath)
+	if prepared && preparedEntry.relPath != relPath {
+		preparedEntry.release()
+		preparedEntry = nil
+		prepared = false
 	}
+	var (
+		parseLease  *parseAdmissionLease
+		src         []byte
+		readVersion fileReadVersion
+		lang        string
+		result      *parser.ExtractionResult
+		skipped     bool
+	)
+	defer func() { parseLease.Release() }()
 
-	lang, ok := idx.effectiveLanguage(absPath, src)
-	if !ok {
-		return nil
-	}
-	ext, _ := idx.registry.GetByLanguage(lang)
-	if ext == nil {
-		return nil
-	}
-
-	// Honour the size cap on the incremental path too: an over-cap
-	// file gets a synthetic skip node, not a parse — matching the
-	// bulk IndexCtx walk. This IS a successful result, so it evicts the
-	// prior state and installs the synthetic node, same as before.
-	if maxSize := idx.config.MaxFileSize; maxSize > 0 && int64(len(src)) > maxSize {
-		n := sizeSkipNode(skippedFile{
-			relPath: relPath, lang: lang, size: int64(len(src)),
-		}, maxSize)
-		idx.applyRepoPrefix([]*graph.Node{n}, nil)
-		evictExisting()
-		idx.graph.AddBatch([]*graph.Node{n}, nil)
-		if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-			return errFileVersionChanged
+	if prepared {
+		parseLease = preparedEntry.parseLease
+		src = preparedEntry.src
+		readVersion = preparedEntry.readVersion
+		lang = preparedEntry.lang
+		result = preparedEntry.result
+	} else {
+		parseLease, err = idx.acquireSharedParsePath(absPath)
+		if err != nil {
+			return err
 		}
-		return nil
-	}
-
-	// Honour the content-admission gate on the incremental path too, so a
-	// document over its cap (or a data asset, by default) the cold walk
-	// would skip doesn't get parsed back in when the watcher re-indexes it
-	// — same synthetic-skip-node treatment as the size cap above.
-	if reason, skip := idx.newContentAdmissionGate().skip(lang, int64(len(src))); skip {
-		n := contentSkipNode(skippedFile{
-			relPath: relPath, lang: lang, size: int64(len(src)), reason: reason,
-		})
-		idx.applyRepoPrefix([]*graph.Node{n}, nil)
-		evictExisting()
-		idx.graph.AddBatch([]*graph.Node{n}, nil)
-		if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-			return errFileVersionChanged
+		src, readVersion, err = readFileWithVersion(absPath)
+		if err != nil {
+			return err
 		}
-		return nil
-	}
 
-	// Pre-ingestion transforms — same pipeline as the bulk path.
-	src = idx.transforms.run(relPath, src)
+		var ok bool
+		lang, ok = idx.effectiveLanguage(absPath, src)
+		if !ok {
+			return nil
+		}
+		ext, _ := idx.registry.GetByLanguage(lang)
+		if ext == nil {
+			return nil
+		}
 
-	// Crash isolation for the incremental path: a file the user just
-	// saved that SIGSEGVs the parser is quarantined instead of taking
-	// the daemon down with it. The pool is long-lived and shared, so
-	// the watcher hot path never forks a worker subprocess per file.
-	var pool *crashpool.Pool
-	var quarantine *crashpool.Quarantine
-	if idx.crashIsolationEnabled() {
-		pool, quarantine = idx.sharedParsePool()
-	}
-	result, prepared := idx.takePreparedExtraction(absPath, relPath, lang, src)
-	skipped := false
-	if !prepared {
+		// Honour the size cap on the incremental path too: an over-cap
+		// file gets a synthetic skip node, not a parse — matching the
+		// bulk IndexCtx walk. This IS a successful result, so it evicts the
+		// prior state and installs the synthetic node, same as before.
+		if maxSize := idx.config.MaxFileSize; maxSize > 0 && int64(len(src)) > maxSize {
+			n := sizeSkipNode(skippedFile{
+				relPath: relPath, lang: lang, size: int64(len(src)),
+			}, maxSize)
+			idx.applyRepoPrefix([]*graph.Node{n}, nil)
+			evictExisting()
+			idx.graph.AddBatch([]*graph.Node{n}, nil)
+			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
+				return errFileVersionChanged
+			}
+			return nil
+		}
+
+		// Honour the content-admission gate on the incremental path too,
+		// so a document over its cap (or a data asset, by default) the cold
+		// walk would skip does not get parsed back in after a watcher event.
+		if reason, skip := idx.newContentAdmissionGate().skip(lang, int64(len(src))); skip {
+			n := contentSkipNode(skippedFile{
+				relPath: relPath, lang: lang, size: int64(len(src)), reason: reason,
+			})
+			idx.applyRepoPrefix([]*graph.Node{n}, nil)
+			evictExisting()
+			idx.graph.AddBatch([]*graph.Node{n}, nil)
+			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
+				return errFileVersionChanged
+			}
+			return nil
+		}
+
+		// Pre-ingestion transforms — same pipeline as the bulk path.
+		src = idx.transforms.run(relPath, src)
+
+		// Crash isolation for the incremental path: a file the user just
+		// saved that SIGSEGVs the parser is quarantined instead of taking
+		// the daemon down with it. The pool is long-lived and shared.
+		var pool *crashpool.Pool
+		var quarantine *crashpool.Quarantine
+		if idx.crashIsolationEnabled() {
+			pool, quarantine = idx.sharedParsePool()
+		}
 		result, skipped, err = idx.extractFile(pool, quarantine, absPath, relPath, lang, ext, src)
 		if quarantine != nil && quarantine.Len() > 0 {
 			_ = quarantine.Save()
@@ -4223,6 +4251,11 @@ func (idx *Indexer) indexFile(
 	idx.graph.AddBatch(result.Nodes, result.Edges)
 	idx.persistConstValues(result)
 	idx.persistFileMeta(relPath, src, result)
+	// No subsequent stage reads source bytes or the parse tree. Release both
+	// here instead of retaining them through resolver/enrichment work; the
+	// deferred calls above remain as idempotent guards for every early return.
+	result.ReleaseTree()
+	parseLease.Release()
 
 	// Add new symbols to search index. shouldIndexForSearch enforces
 	// the same SkipSearch filter used by the bulk and upgrade paths.
