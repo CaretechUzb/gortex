@@ -223,6 +223,42 @@ func (ci *incrementalCloneIndex) Rebuild(g graph.Store, repoPrefix string) {
 	ci.pending = false
 }
 
+// AdoptBaselineOrRebuild seeds the steady-state clone index from the complete
+// compact corpus that the immediately preceding global detector already read.
+// This transfers the CMS, retained LSH and raw-shingle cache without a second
+// CloneCorpusPage scan or LSH build. Legacy stores, incomplete/error or
+// cancelled finalization, prefix mismatches, and malformed baselines retain the
+// exact Rebuild fallback.
+func (ci *incrementalCloneIndex) AdoptBaselineOrRebuild(g graph.Store, repoPrefix string, baseline *cloneCorpusBaseline) {
+	if ci == nil {
+		return
+	}
+	if baseline == nil || !baseline.complete || baseline.repoPrefix != repoPrefix ||
+		baseline.cms == nil || baseline.lsh == nil || baseline.shingles == nil ||
+		baseline.corpus <= 0 || baseline.corpus < baseline.itemCount {
+		ci.Rebuild(g, repoPrefix)
+		return
+	}
+
+	ci.mu.Lock()
+	ci.cms = baseline.cms
+	ci.lsh = baseline.lsh
+	ci.shingles = baseline.shingles
+	ci.corpus = baseline.corpus
+	ci.built = true
+	ci.pending = false
+	// A baseline is a single-consumer handoff. Clearing the large fields both
+	// documents that ownership transfer and prevents accidental double use.
+	baseline.cms = nil
+	baseline.lsh = nil
+	baseline.shingles = nil
+	baseline.items = nil
+	baseline.itemCount = 0
+	baseline.corpus = 0
+	baseline.complete = false
+	ci.mu.Unlock()
+}
+
 // Ready reports whether one-file clone maintenance can run without a
 // graph-wide seed.
 func (ci *incrementalCloneIndex) Ready() bool {

@@ -44,6 +44,41 @@ func NewStratifiedIndex() *StratifiedIndex {
 	}
 }
 
+// DetectPairsWithStats runs the batch clone detector over the live per-class
+// indexes already held by s. It preserves the same bucket-cap telemetry,
+// cross-class pair deduplication, and deterministic ordering as
+// DetectPairsStratifiedWithStats, but does not repartition items or rebuild
+// temporary LSH indexes.
+func (s *StratifiedIndex) DetectPairsWithStats(threshold float64) (pairs []Pair, skippedBuckets, skippedBucketItems int) {
+	if s == nil {
+		return nil, 0, 0
+	}
+	seen := make(map[[2]string]struct{})
+	for _, ix := range s.classes {
+		classPairs, sb, sbi := ix.detectPairsWithStats(threshold)
+		skippedBuckets += sb
+		skippedBucketItems += sbi
+		for _, p := range classPairs {
+			key := [2]string{p.A, p.B}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			pairs = append(pairs, p)
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Similarity != pairs[j].Similarity {
+			return pairs[i].Similarity > pairs[j].Similarity
+		}
+		if pairs[i].A != pairs[j].A {
+			return pairs[i].A < pairs[j].A
+		}
+		return pairs[i].B < pairs[j].B
+	})
+	return pairs, skippedBuckets, skippedBucketItems
+}
+
 // Add banks an item into every length class its TokenCount falls in
 // (lengthClassesOf), recording the TokenCount so a later Remove can
 // recover the same class set. Adding an id that is already present
