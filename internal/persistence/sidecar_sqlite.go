@@ -334,6 +334,41 @@ func (s *SidecarStore) Close() error {
 	return s.db.Close()
 }
 
+// CloseSidecar closes the cached sidecar rooted at path, if one is open, and
+// drops it from the shared cache. Unlike OpenSidecar(path).Close() — the idiom
+// a test otherwise has to reach for — it never creates the file or its parent
+// directory when nothing was open, so a caller can release a path
+// unconditionally without leaving a database behind.
+//
+// The daemon holds its sidecar for the process lifetime; this exists for
+// teardown, where a still-open handle keeps the file locked on Windows and
+// makes an otherwise-passing test fail in RemoveAll.
+func CloseSidecar(path string) error {
+	if path == "" {
+		return nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	// Evict under the same lock that found it. Releasing between the lookup
+	// and the close would let a concurrent OpenSidecar hand out the handle
+	// this call is about to close; dropping the entry first makes that lookup
+	// miss and open a fresh one instead. Close still runs outside the lock —
+	// it takes sidecarMu itself to clear any other keys pointing at the same
+	// store.
+	sidecarMu.Lock()
+	st, ok := sidecarCache[abs]
+	if ok {
+		delete(sidecarCache, abs)
+	}
+	sidecarMu.Unlock()
+	if !ok || st == nil {
+		return nil
+	}
+	return st.Close()
+}
+
 // ---------------------------------------------------------------------------
 // JSON helpers for []string columns.
 // ---------------------------------------------------------------------------

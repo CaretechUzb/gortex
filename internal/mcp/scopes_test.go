@@ -12,7 +12,7 @@ import (
 )
 
 func TestScopeStore_PersistsRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "scopes.json")
+	path := filepath.Join(tempSidecarDir(t), "scopes.json")
 	st := newScopeStore(path)
 	require.NoError(t, st.put(SavedScope{Name: "backend", Description: "be", Repos: []string{"api", "core"}}))
 
@@ -31,7 +31,7 @@ func TestScopeStore_PersistsRoundTrip(t *testing.T) {
 // TestSavedScope_FiltersSearchResults drives save_scope + a scoped
 // search_symbols end-to-end and confirms the scope confines results.
 func TestSavedScope_FiltersSearchResults(t *testing.T) {
-	t.Setenv("GORTEX_SCOPES_PATH", filepath.Join(t.TempDir(), "scopes.json"))
+	t.Setenv("GORTEX_SCOPES_PATH", filepath.Join(tempSidecarDir(t), "scopes.json"))
 	srv, _, _ := newIsolationServer(t)
 	ctx := context.Background() // unbound session — the scope is the only filter
 
@@ -52,7 +52,7 @@ func TestSavedScope_FiltersSearchResults(t *testing.T) {
 }
 
 func TestSavedScope_UnknownScopeErrors(t *testing.T) {
-	t.Setenv("GORTEX_SCOPES_PATH", filepath.Join(t.TempDir(), "scopes.json"))
+	t.Setenv("GORTEX_SCOPES_PATH", filepath.Join(tempSidecarDir(t), "scopes.json"))
 	srv, _, _ := newIsolationServer(t)
 	req := mcplib.CallToolRequest{}
 	req.Params.Name = "search_symbols"

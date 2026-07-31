@@ -37,8 +37,8 @@ jobs:
     # CGO build smoke-test on native Windows. tree-sitter needs a C/C++
     # compiler — the GitHub windows runner ships mingw-w64 on PATH, so no
     # extra toolchain setup is required. `go build ./...` compiles every
-    # production package; the focused agents test also exercises Windows-only
-    # integration paths without opting into the unsupported full test suite.
+    # production package; the focused agents and sidecar tests also exercise
+    # Windows-only paths without opting into the unsupported full test suite.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -55,6 +55,13 @@ jobs:
 
       - name: Test Windows agent integrations
         run: go test -timeout=5m -count=1 ./internal/agents
+
+      # Windows refuses to unlink an open file, so a leaked sidecar handle
+      # pins its directory and fails the enclosing t.TempDir() cleanup. That
+      # asymmetry is invisible on the linux/macos matrix, which is why this
+      # one test runs here rather than only there.
+      - name: Test sidecar handle release
+        run: go test -timeout=5m -count=1 -run TestCloseSidecar ./internal/persistence
 
   build-linux-static:
     # The linux release ships a statically linked binary so it runs on any

@@ -18,8 +18,8 @@ import (
 // a promotion persists across "restarts" (fresh managers over the same
 // store) and is demoted once it has gone unused past the hysteresis window.
 func TestPromotedToolsManager_PersistAndDemote(t *testing.T) {
-	cacheDir := t.TempDir()
-	repo := filepath.Join(t.TempDir(), "repo")
+	cacheDir := tempSidecarDir(t)
+	repo := filepath.Join(tempSidecarDir(t), "repo")
 
 	// Session 1 (epoch 1): promote a deferred tool.
 	m1 := newPromotedToolsManager(cacheDir, repo)
@@ -40,8 +40,8 @@ func TestPromotedToolsManager_PersistAndDemote(t *testing.T) {
 // TestPromotedToolsManager_UseResetsClock: re-using a promotion resets its
 // demotion clock, so it outlives what would otherwise be its window.
 func TestPromotedToolsManager_UseResetsClock(t *testing.T) {
-	cacheDir := t.TempDir()
-	repo := filepath.Join(t.TempDir(), "repo")
+	cacheDir := tempSidecarDir(t)
+	repo := filepath.Join(tempSidecarDir(t), "repo")
 
 	// Promote at epoch 1, then re-use at epoch 2 (resets last_used to 2).
 	m1 := newPromotedToolsManager(cacheDir, repo)
@@ -77,8 +77,8 @@ func buildLearnedServer(t *testing.T, cacheDir, dir string) *Server {
 // in one session is re-promoted into the cold agent surface on the next
 // server startup — the learned surface persists across restarts.
 func TestLearnedSurface_SurvivesRestart(t *testing.T) {
-	cacheDir := t.TempDir()
-	dir := t.TempDir()
+	cacheDir := tempSidecarDir(t)
+	dir := tempSidecarDir(t)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"),
 		[]byte("package app\n\nfunc Main() {}\n"), 0o644))
 

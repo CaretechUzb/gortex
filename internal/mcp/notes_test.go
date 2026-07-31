@@ -98,7 +98,7 @@ func TestNotesManager_UpdateMissingID(t *testing.T) {
 }
 
 func TestNotesManager_PersistenceRoundTrip(t *testing.T) {
-	cache := t.TempDir()
+	cache := tempSidecarDir(t)
 	repo := "/tmp/notes-test-repo"
 
 	nm1 := newNotesManager(cache, repo)

@@ -19,7 +19,7 @@ func TestIndexHealth_SurfacesToolPreset(t *testing.T) {
 	require.False(t, hasLearned)
 
 	// After a learned promotion, the count + names surface.
-	srv.InitLearnedTools(t.TempDir(), t.TempDir())
+	srv.InitLearnedTools(tempSidecarDir(t), tempSidecarDir(t))
 	srv.RecordLearnedPromotion("get_architecture", "")
 	payload = srv.buildIndexHealthPayload()
 	require.Equal(t, 1, payload["learned_tools"])

@@ -16,7 +16,7 @@ import (
 
 func newNotebookTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := tempNotebookRepo(t)
 	s := &Server{
 		graph:      graph.New(),
 		session:    newSessionState(),
@@ -227,7 +227,7 @@ func TestNotebook_NoDirManagerStillSafe(t *testing.T) {
 }
 
 func TestNotebook_PrunesByTTL(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempNotebookRepo(t)
 	nm := newNotebookManager(dir)
 	// TTL must comfortably exceed the Save→prune latency. pruneLocked's
 	// cutoff is computed *after* the fresh entry's Updated stamp is
@@ -256,7 +256,7 @@ func TestNotebook_PrunesByTTL(t *testing.T) {
 }
 
 func TestNotebook_DeleteIdempotent(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempNotebookRepo(t)
 	nm := newNotebookManager(dir)
 	_, _ = nm.Save(notebookEntry{ID: "x", Title: "x"})
 	require.NoError(t, nm.Delete("x"))
