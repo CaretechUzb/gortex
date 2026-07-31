@@ -821,10 +821,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 				zap.Duration("elapsed", time.Since(phaseStart)))
 		}
 	}
-	// Contract registries now own decoded entries; the legacy snapshot
-	// fallback is no longer needed for the rest of the daemon lifetime.
-	snapshotContracts = nil
-
 	// Backfill `WorkspaceID` / `ProjectID` onto nodes and contracts
 	// loaded from a legacy snapshot. Old snapshots have these fields
 	// as zero (gob decodes unknown fields silently); without this
@@ -924,10 +920,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		}
 		state.multiIndexer.SetSkipVectorBuild(false)
 	}
-	// ImportVectorIndex has consumed the serialized bytes (or there were none).
-	// Drop the final local reference before watcher setup and steady state.
-	restoredVector = snapshotVector{}
-
 	watchCfgs := make(map[string]config.WatchConfig)
 	for prefix := range state.multiIndexer.AllMetadata() {
 		watchCfgs[prefix] = state.configManager.GetRepoConfig(prefix).Watch
