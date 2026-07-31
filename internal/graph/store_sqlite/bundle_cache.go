@@ -2,6 +2,7 @@ package store_sqlite
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -244,7 +245,12 @@ func bundlePackageKey(filePath string) string {
 	if filePath == "" {
 		return ""
 	}
-	dir := filepath.Dir(filepath.ToSlash(filePath))
+	// path.Dir, not filepath.Dir: stored file paths are forward-slash by
+	// contract, and so are the keys of the fingerprint map this key is looked
+	// up in. filepath.Dir cleans to the OS separator, which on Windows undoes
+	// the ToSlash and yields "repoA\pkg" for a map keyed "repoA/pkg" — every
+	// entry then reads as unfingerprinted and the cache never serves a hit.
+	dir := path.Dir(filepath.ToSlash(filePath))
 	if dir == "." {
 		return ""
 	}
