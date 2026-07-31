@@ -351,8 +351,17 @@ func CloseSidecar(path string) error {
 	if err != nil {
 		abs = path
 	}
+	// Evict under the same lock that found it. Releasing between the lookup
+	// and the close would let a concurrent OpenSidecar hand out the handle
+	// this call is about to close; dropping the entry first makes that lookup
+	// miss and open a fresh one instead. Close still runs outside the lock —
+	// it takes sidecarMu itself to clear any other keys pointing at the same
+	// store.
 	sidecarMu.Lock()
 	st, ok := sidecarCache[abs]
+	if ok {
+		delete(sidecarCache, abs)
+	}
 	sidecarMu.Unlock()
 	if !ok || st == nil {
 		return nil
