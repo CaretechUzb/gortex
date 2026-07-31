@@ -315,11 +315,12 @@ type Indexer struct {
 	workspaceMembers     *workspaceMembershipIndex
 
 	// Mtime tracking and parse error retention for index health diagnostics.
-	parseErrors   []IndexError
-	fileMtimes    map[string]int64
-	lastIndexTime time.Time
-	totalDetected int
-	mtimeMu       sync.RWMutex
+	parseErrors      []IndexError
+	fileMtimes       map[string]int64
+	fileMtimesShared bool
+	lastIndexTime    time.Time
+	totalDetected    int
+	mtimeMu          sync.RWMutex
 
 	// contractCache memoizes the contract-extractor output per file.
 	// Keyed by graph file path (with repo prefix); value is the file's
@@ -2418,7 +2419,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 		prefix := current.repoPrefix
 		if owner != nil && prefix != "" {
 			rootPath := current.RootPath()
-			fileMtimes := current.FileMtimes()
+			fileMtimes := current.publishFileMtimes()
 			owner.mu.Lock()
 			if meta := owner.repos[prefix]; meta != nil && owner.indexers[prefix] == current {
 				owner.repos[prefix] = &RepoMetadata{
@@ -3489,15 +3490,16 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// captured via d.Info(); no per-file os.Stat round-trip here.
 	idx.mtimeMu.Lock()
 	idx.fileMtimes = make(map[string]int64, len(files))
+	idx.fileMtimesShared = false
 	for _, f := range files {
 		if f.mtimeNano > 0 {
 			idx.fileMtimes[idx.relKey(f.path)] = f.mtimeNano
 		}
 	}
-	mtimeSnapshot := make(map[string]int64, len(idx.fileMtimes))
-	for k, v := range idx.fileMtimes {
-		mtimeSnapshot[k] = v
-	}
+	// Bulk persistence consumes the snapshot after mtimeMu is released.
+	// Publish it immutably so later mutations detach before writing.
+	idx.fileMtimesShared = true
+	mtimeSnapshot := idx.fileMtimes
 	idx.mtimeMu.Unlock()
 
 	// Persist the per-file mtimes through the store's optional
@@ -4406,6 +4408,7 @@ func (idx *Indexer) recordFileReadVersion(relPath, absPath string, version fileR
 
 func (idx *Indexer) recordFileMtimeValue(relPath string, mtime int64) {
 	idx.mtimeMu.Lock()
+	idx.ensureFileMtimesWritableLocked()
 	idx.fileMtimes[relPath] = mtime
 	idx.mtimeMu.Unlock()
 	if w, ok := idx.graph.(graph.FileMtimeWriter); ok {
@@ -5469,6 +5472,31 @@ func (idx *Indexer) FileMtimes() map[string]int64 {
 	return out
 }
 
+// publishFileMtimes returns the current map as an immutable committed
+// snapshot. Every later element mutation must call
+// ensureFileMtimesWritableLocked first; that copy-on-write boundary lets the
+// Indexer, RepoMetadata, poller, and daemon snapshot share one map safely.
+func (idx *Indexer) publishFileMtimes() map[string]int64 {
+	idx.mtimeMu.Lock()
+	defer idx.mtimeMu.Unlock()
+	idx.fileMtimesShared = true
+	return idx.fileMtimes
+}
+
+// ensureFileMtimesWritableLocked detaches the working map from any published
+// snapshot. The caller must hold mtimeMu for writing.
+func (idx *Indexer) ensureFileMtimesWritableLocked() {
+	if !idx.fileMtimesShared {
+		return
+	}
+	writable := make(map[string]int64, len(idx.fileMtimes))
+	for path, mtime := range idx.fileMtimes {
+		writable[path] = mtime
+	}
+	idx.fileMtimes = writable
+	idx.fileMtimesShared = false
+}
+
 // trackedFileCount reports how many files this indexer currently holds
 // mtime records for — the repo's whole file set, independent of any one
 // pass's scope. A scoped pass adds and evicts its own files within scope
@@ -5511,6 +5539,7 @@ func (idx *Indexer) RefreshFileMtime(filePath string) {
 	idx.mtimeMu.Lock()
 	_, tracked := idx.fileMtimes[key]
 	if tracked {
+		idx.ensureFileMtimesWritableLocked()
 		idx.fileMtimes[key] = mtime
 	}
 	idx.mtimeMu.Unlock()
@@ -5548,6 +5577,7 @@ func (idx *Indexer) SetFileMtimes(mtimes map[string]int64) {
 	idx.mtimeMu.Lock()
 	defer idx.mtimeMu.Unlock()
 	idx.fileMtimes = make(map[string]int64, len(mtimes))
+	idx.fileMtimesShared = false
 	for k, v := range mtimes {
 		idx.fileMtimes[k] = v
 	}

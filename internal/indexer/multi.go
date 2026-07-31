@@ -40,7 +40,10 @@ type RepoMetadata struct {
 	NodeCount     int
 	EdgeCount     int
 	ParseErrors   []IndexError
-	FileMtimes    map[string]int64
+	// FileMtimes is the immutable committed snapshot shared with the owning
+	// Indexer. Treat it as read-only: later indexer mutations detach through
+	// copy-on-write, so this map never observes a partially applied batch.
+	FileMtimes map[string]int64
 	// IsWorktree records whether RootPath was a linked git worktree
 	// (as opposed to a main checkout) at the time the repo was
 	// tracked. Captured here because once the worktree directory is
@@ -1889,8 +1892,9 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 						NodeCount:     result.NodeCount,
 						EdgeCount:     result.EdgeCount,
 						ParseErrors:   result.Errors,
-						FileMtimes:    idx.FileMtimes(),
-						IsWorktree:    ResolveWorktree(r.absPath).IsWorktree,
+						FileMtimes:    idx.publishFileMtimes(),
+
+						IsWorktree: ResolveWorktree(r.absPath).IsWorktree,
 					}
 
 					resultCh <- repoResult{prefix: r.prefix, result: result, idx: idx, meta: meta}
@@ -2056,6 +2060,7 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 		return nil, fmt.Errorf("indexing %s returned a nil result", meta.RootPath)
 	}
 
+	fileMtimes := idx.publishFileMtimes()
 	mi.mu.Lock()
 	mi.repos[repoPrefix] = &RepoMetadata{
 		RepoPrefix:    repoPrefix,
@@ -2066,8 +2071,9 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 		NodeCount:     result.NodeCount,
 		EdgeCount:     result.EdgeCount,
 		ParseErrors:   result.Errors,
-		FileMtimes:    idx.FileMtimes(),
-		IsWorktree:    meta.IsWorktree,
+		FileMtimes:    fileMtimes,
+
+		IsWorktree: meta.IsWorktree,
 	}
 	mi.indexers[repoPrefix] = idx
 	mi.mu.Unlock()
@@ -2243,6 +2249,7 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 		mi.resolveIncrementalRepoMutation(repoPrefix, result, nil, eviction.batch)
 	}
 
+	fileMtimes := idx.publishFileMtimes()
 	mi.mu.Lock()
 	mi.repos[repoPrefix] = &RepoMetadata{
 		RepoPrefix:    repoPrefix,
@@ -2253,8 +2260,9 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 		NodeCount:     result.NodeCount,
 		EdgeCount:     result.EdgeCount,
 		ParseErrors:   result.Errors,
-		FileMtimes:    idx.FileMtimes(),
-		IsWorktree:    meta.IsWorktree,
+		FileMtimes:    fileMtimes,
+
+		IsWorktree: meta.IsWorktree,
 	}
 	mi.mu.Unlock()
 
@@ -2300,6 +2308,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 		repoPrefix, result, receipt, batch, mode.exactPointSemantic,
 	)
 
+	fileMtimes := idx.publishFileMtimes()
 	mi.mu.Lock()
 	mi.repos[repoPrefix] = &RepoMetadata{
 		RepoPrefix:    repoPrefix,
@@ -2310,7 +2319,8 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 		NodeCount:     result.NodeCount,
 		EdgeCount:     result.EdgeCount,
 		ParseErrors:   result.Errors,
-		FileMtimes:    idx.FileMtimes(),
+		FileMtimes:    fileMtimes,
+
 		// Carried over from the prior metadata: this pass doesn't change
 		// it, and dropping it here (zero value on a fresh struct literal)
 		// used to silently flip a worktree back to its false default on
@@ -2553,6 +2563,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 		}
 		result.RepoPrefix = prefix
 
+		fileMtimes := idx.publishFileMtimes()
 		mi.mu.Lock()
 		mi.repos[prefix] = &RepoMetadata{
 			RepoPrefix:    prefix,
@@ -2563,8 +2574,9 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 			NodeCount:     result.NodeCount,
 			EdgeCount:     result.EdgeCount,
 			ParseErrors:   result.Errors,
-			FileMtimes:    idx.FileMtimes(),
-			IsWorktree:    ResolveWorktree(absPath).IsWorktree,
+			FileMtimes:    fileMtimes,
+
+			IsWorktree: ResolveWorktree(absPath).IsWorktree,
 		}
 		mi.indexers[prefix] = idx
 		mi.mu.Unlock()
@@ -2756,6 +2768,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		}
 		result.RepoPrefix = prefix
 
+		fileMtimes := idx.publishFileMtimes()
 		mi.mu.Lock()
 		mi.repos[prefix] = &RepoMetadata{
 			RepoPrefix:    prefix,
@@ -2766,8 +2779,9 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			NodeCount:     result.NodeCount,
 			EdgeCount:     result.EdgeCount,
 			ParseErrors:   result.Errors,
-			FileMtimes:    idx.FileMtimes(),
-			IsWorktree:    ResolveWorktree(absPath).IsWorktree,
+			FileMtimes:    fileMtimes,
+
+			IsWorktree: ResolveWorktree(absPath).IsWorktree,
 		}
 		mi.indexers[prefix] = idx
 		mi.mu.Unlock()
@@ -3085,6 +3099,26 @@ func (mi *MultiIndexer) GetMetadata(repoPrefix string) *RepoMetadata {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	return mi.repos[repoPrefix]
+}
+
+// FileMtimes returns an owned copy of the repository's committed mtime
+// snapshot. Internal poller and daemon paths use the immutable RepoMetadata
+// snapshot directly; this public accessor keeps callers from mutating it.
+func (mi *MultiIndexer) FileMtimes(repoPrefix string) map[string]int64 {
+	mi.mu.RLock()
+	meta := mi.repos[repoPrefix]
+	if meta == nil {
+		mi.mu.RUnlock()
+		return nil
+	}
+	published := meta.FileMtimes
+	mi.mu.RUnlock()
+
+	out := make(map[string]int64, len(published))
+	for path, mtime := range published {
+		out[path] = mtime
+	}
+	return out
 }
 
 // AllMetadata returns a copy of all repo metadata.

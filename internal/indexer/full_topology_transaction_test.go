@@ -67,7 +67,7 @@ func TestIndexCtxStaleHandleUsesCurrentIndexerAndMetadata(t *testing.T) {
 	require.Equal(t, result.FileCount, meta.FileCount)
 	require.Equal(t, result.NodeCount, meta.NodeCount)
 	require.Equal(t, result.EdgeCount, meta.EdgeCount)
-	_, metadataHasNewFile := meta.FileMtimes[newKey]
+	_, metadataHasNewFile := mi.FileMtimes("repo")[newKey]
 	require.True(t, metadataHasNewFile)
 }
 
