@@ -1019,6 +1019,7 @@ func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (f
 	idx.mtimeMu.Unlock()
 	if writer, ok := idx.graph.(graph.FileMtimeWriter); ok {
 		if err := writer.BulkSetFileMtimes(idx.repoPrefix, mtimes); err != nil {
+			idx.markFileMtimePersistenceDirty()
 			idx.logger.Warn("persist file mtimes failed",
 				zap.String("repo", idx.repoPrefix), zap.Int("files", len(mtimes)), zap.Error(err))
 		}

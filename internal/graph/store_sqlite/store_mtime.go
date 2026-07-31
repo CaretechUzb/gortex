@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -16,6 +17,23 @@ var (
 	_ graph.FileMtimeReader   = (*Store)(nil)
 	_ graph.FileMtimeReplacer = (*Store)(nil)
 	_ graph.FileMtimeDeleter  = (*Store)(nil)
+	_ graph.FileReceiptPager  = (*Store)(nil)
+)
+
+const (
+	fileReceiptHighWaterQuery = `SELECT file_path
+FROM file_mtimes
+WHERE repo_prefix = ?
+ORDER BY file_path DESC
+LIMIT 1`
+
+	fileReceiptPageQuery = `SELECT file_path, mtime_ns
+FROM file_mtimes
+WHERE repo_prefix = ?
+  AND file_path > ?
+  AND file_path <= ?
+ORDER BY file_path
+LIMIT ?`
 )
 
 // mtimeChunk bounds how many (repo_prefix, file_path, mtime_ns) tuples
@@ -241,4 +259,119 @@ func (s *Store) FileMtimes(repoPrefix string) (map[string]int64, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// FileReceiptHighWater freezes the lexicographically greatest tracked path
+// for one bounded polling rotation. Rows added above it wait for the next
+// rotation instead of extending the current one indefinitely.
+func (s *Store) FileReceiptHighWater(repoPrefix string) (string, error) {
+	var highWater string
+	err := s.db.QueryRow(fileReceiptHighWaterQuery, repoPrefix).Scan(&highWater)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return highWater, err
+}
+
+// FileReceiptPage returns one compact mtime-keyset page and closes that cursor
+// before optionally fetching the page's content identities. No result cursor
+// survives this call, so the poller's filesystem reads never pin a SQLite read
+// transaction or reader connection.
+func (s *Store) FileReceiptPage(
+	repoPrefix, afterPath, highWaterPath string,
+	limit int,
+	includeContent bool,
+) ([]graph.FileReceipt, error) {
+	if limit <= 0 || highWaterPath == "" || afterPath >= highWaterPath {
+		return nil, nil
+	}
+	rows, err := s.db.Query(
+		fileReceiptPageQuery,
+		repoPrefix, afterPath, highWaterPath, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	receipts := make([]graph.FileReceipt, 0, limit)
+	for rows.Next() {
+		var receipt graph.FileReceipt
+		if err := rows.Scan(&receipt.FilePath, &receipt.MtimeNS); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		receipts = append(receipts, receipt)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if !includeContent || len(receipts) == 0 {
+		return receipts, nil
+	}
+	if err := s.fillFileReceiptContent(repoPrefix, receipts); err != nil {
+		return nil, err
+	}
+	return receipts, nil
+}
+
+// fillFileReceiptContent reads only content_hash + size for a bounded mtime
+// page. file_mtimes uses slash-form unprefixed keys, while files uses the
+// graph's prefixed, OS-native path, so map the keys in Go rather than baking a
+// platform-specific path expression into the SQL lookup.
+func (s *Store) fillFileReceiptContent(repoPrefix string, receipts []graph.FileReceipt) error {
+	byGraphPath := make(map[string]int, len(receipts))
+	graphPaths := make([]string, len(receipts))
+	for i, receipt := range receipts {
+		graphPath := filepath.FromSlash(receipt.FilePath)
+		if repoPrefix != "" {
+			graphPath = repoPrefix + "/" + graphPath
+		}
+		graphPaths[i] = graphPath
+		byGraphPath[graphPath] = i
+	}
+
+	for start := 0; start < len(graphPaths); start += fileMetaChunk {
+		end := min(start+fileMetaChunk, len(graphPaths))
+		chunk := graphPaths[start:end]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repoPrefix)
+		stmt := make([]byte, 0, 96+len(chunk)*2)
+		stmt = append(stmt, "SELECT file_path, content_hash, size FROM files WHERE repo_prefix = ? AND file_path IN ("...)
+		for i, filePath := range chunk {
+			if i > 0 {
+				stmt = append(stmt, ',')
+			}
+			stmt = append(stmt, '?')
+			args = append(args, filePath)
+		}
+		stmt = append(stmt, ')')
+
+		rows, err := s.db.Query(string(stmt), args...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var filePath, contentHash string
+			var size int64
+			if err := rows.Scan(&filePath, &contentHash, &size); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if i, ok := byGraphPath[filePath]; ok {
+				receipts[i].ContentHash = contentHash
+				receipts[i].Size = size
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
 }

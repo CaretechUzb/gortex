@@ -323,9 +323,13 @@ type Indexer struct {
 	parseErrors      []IndexError
 	fileMtimes       map[string]int64
 	fileMtimesShared bool
-	lastIndexTime    time.Time
-	totalDetected    int
-	mtimeMu          sync.RWMutex
+	// Any failed sidecar write can leave the durable keyset incomplete even
+	// while the immutable in-memory snapshot is current. Receipt paging must
+	// fall back to that snapshot until a full authoritative replace repairs it.
+	fileMtimePersistenceDirty atomic.Bool
+	lastIndexTime             time.Time
+	totalDetected             int
+	mtimeMu                   sync.RWMutex
 
 	// contractCache memoizes the contract-extractor output per file.
 	// Keyed by graph file path (with repo prefix); value is the file's
@@ -3050,6 +3054,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		streamMtimeMu.Unlock()
 		if flush != nil {
 			if err := w.BulkSetFileMtimes(idx.repoPrefix, flush); err != nil {
+				idx.markFileMtimePersistenceDirty()
 				idx.logger.Warn("indexer: incremental mtime batch persist failed",
 					zap.String("repo", idx.repoPrefix), zap.Error(err))
 			}
@@ -3068,6 +3073,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			return
 		}
 		if err := w.BulkSetFileMtimes(idx.repoPrefix, flush); err != nil {
+			idx.markFileMtimePersistenceDirty()
 			idx.logger.Warn("indexer: final incremental mtime batch persist failed",
 				zap.String("repo", idx.repoPrefix), zap.Error(err))
 		}
@@ -3443,6 +3449,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				}
 				if len(batch) > 0 {
 					if err := w.BulkSetFileMtimes(idx.repoPrefix, batch); err != nil {
+						idx.markFileMtimePersistenceDirty()
 						idx.logger.Warn("indexer: streaming-flush chunk mtime persist failed",
 							zap.String("repo", idx.repoPrefix), zap.Error(err))
 					}
@@ -3541,16 +3548,21 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	if len(mtimeSnapshot) > 0 {
 		var perr error
 		persisted := false
+		authoritative := false
 		if r, ok := mtimeTarget.(graph.FileMtimeReplacer); ok {
-			perr, persisted = r.ReplaceFileMtimes(idx.repoPrefix, mtimeSnapshot), true
+			perr, persisted, authoritative = r.ReplaceFileMtimes(idx.repoPrefix, mtimeSnapshot), true, true
 		} else if w, ok := mtimeTarget.(graph.FileMtimeWriter); ok {
 			perr, persisted = w.BulkSetFileMtimes(idx.repoPrefix, mtimeSnapshot), true
 		}
 		if persisted {
 			if perr != nil {
+				idx.markFileMtimePersistenceDirty()
 				idx.logger.Warn("persist file mtimes failed",
 					zap.String("repo", idx.repoPrefix), zap.Error(perr))
 			} else {
+				if authoritative {
+					idx.fileMtimePersistenceDirty.Store(false)
+				}
 				idx.logger.Info("persisted file mtimes",
 					zap.String("repo", idx.repoPrefix),
 					zap.Int("count", len(mtimeSnapshot)))
@@ -4471,6 +4483,7 @@ func (idx *Indexer) recordFileMtimeValue(relPath string, mtime int64) {
 	idx.mtimeMu.Unlock()
 	if w, ok := idx.graph.(graph.FileMtimeWriter); ok {
 		if err := w.BulkSetFileMtimes(idx.repoPrefix, map[string]int64{relPath: mtime}); err != nil {
+			idx.markFileMtimePersistenceDirty()
 			idx.logger.Warn("persist file mtime failed",
 				zap.String("repo", idx.repoPrefix), zap.String("file", relPath), zap.Error(err))
 		}
@@ -5541,6 +5554,14 @@ func (idx *Indexer) publishFileMtimes() map[string]int64 {
 	return idx.fileMtimes
 }
 
+func (idx *Indexer) markFileMtimePersistenceDirty() {
+	idx.fileMtimePersistenceDirty.Store(true)
+}
+
+func (idx *Indexer) fileReceiptPagingReliable() bool {
+	return !idx.fileMtimePersistenceDirty.Load()
+}
+
 // ensureFileMtimesWritableLocked detaches the working map from any published
 // snapshot. The caller must hold mtimeMu for writing.
 func (idx *Indexer) ensureFileMtimesWritableLocked() {
@@ -5606,6 +5627,7 @@ func (idx *Indexer) RefreshFileMtime(filePath string) {
 	}
 	if w, ok := idx.graph.(graph.FileMtimeWriter); ok {
 		if err := w.BulkSetFileMtimes(idx.repoPrefix, map[string]int64{key: mtime}); err != nil {
+			idx.markFileMtimePersistenceDirty()
 			idx.logger.Warn("persist file mtime failed",
 				zap.String("repo", idx.repoPrefix), zap.String("file", key), zap.Error(err))
 		}
@@ -5624,6 +5646,7 @@ func (idx *Indexer) pruneDeletedFileMtimes(deleted []string) {
 	}
 	if d, ok := idx.graph.(graph.FileMtimeDeleter); ok {
 		if err := d.DeleteFileMtimes(idx.repoPrefix, deleted); err != nil {
+			idx.markFileMtimePersistenceDirty()
 			idx.logger.Warn("prune deleted file mtimes failed",
 				zap.String("repo", idx.repoPrefix), zap.Error(err))
 		}
