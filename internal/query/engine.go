@@ -1,6 +1,8 @@
 package query
 
 import (
+	"container/heap"
+	"context"
 	"sort"
 	"strconv"
 	"strings"
@@ -946,67 +948,184 @@ type bigramProvider interface {
 	BigramCandidates(query string, minOverlap int) []string
 }
 
-func (e *Engine) searchSubstring(query string, limit int) []*graph.Node {
-	lower := strings.ToLower(query)
+const substringSearchPageSize = 256
 
-	exact := e.g.FindNodesByName(query)
+type substringCandidate struct {
+	id      string
+	nameLen int
+	score   int
+}
 
-	type scored struct {
+func substringCandidateBetter(a, b substringCandidate) bool {
+	if a.score != b.score {
+		return a.score < b.score
+	}
+	if a.nameLen != b.nameLen {
+		return a.nameLen < b.nameLen
+	}
+	return a.id < b.id
+}
+
+// substringCandidateHeap keeps the worst retained candidate at its root.
+type substringCandidateHeap []substringCandidate
+
+func (h substringCandidateHeap) Len() int { return len(h) }
+func (h substringCandidateHeap) Less(i, j int) bool {
+	return substringCandidateBetter(h[j], h[i])
+}
+func (h substringCandidateHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *substringCandidateHeap) Push(x any) {
+	*h = append(*h, x.(substringCandidate))
+}
+func (h *substringCandidateHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+type nodeSearchMutationRevisioner interface {
+	SearchMutationRevision() (uint64, bool)
+}
+
+type nodeMutationRevisioner interface {
+	MutationRevision() uint64
+}
+
+func nodeMutationRevision(r graph.Reader) (uint64, bool) {
+	if revisioned, ok := r.(nodeSearchMutationRevisioner); ok {
+		return revisioned.SearchMutationRevision()
+	}
+	if revisioned, ok := r.(nodeMutationRevisioner); ok {
+		return revisioned.MutationRevision(), true
+	}
+	return 0, false
+}
+
+func nodeMutationChanged(r graph.Reader, before uint64, known bool) bool {
+	if !known {
+		return false
+	}
+	after, ok := nodeMutationRevision(r)
+	return ok && after != before
+}
+
+func substringScore(id, name string, kind graph.NodeKind, query, lower string) (int, bool) {
+	if kind == graph.KindFile || kind == graph.KindImport {
+		return 0, false
+	}
+	switch {
+	case name == query:
+		return 0, true
+	case hasPrefixFold(name, lower):
+		return 1, true
+	case containsFold(name, lower):
+		return 2, true
+	case containsFold(id, lower):
+		return 3, true
+	default:
+		return 0, false
+	}
+}
+
+func (e *Engine) scanSubstringCandidates(query, lower string, limit int) ([]substringCandidate, error) {
+	top := make(substringCandidateHeap, 0, limit)
+	err := graph.ScanNodeSearchKeys(context.Background(), e.g, substringSearchPageSize, func(page []graph.NodeSearchKey) bool {
+		for _, key := range page {
+			score, ok := substringScore(key.ID, key.Name, key.Kind, query, lower)
+			if !ok {
+				continue
+			}
+			candidate := substringCandidate{id: key.ID, nameLen: len(key.Name), score: score}
+			if len(top) < limit {
+				candidate.id = strings.Clone(candidate.id)
+				heap.Push(&top, candidate)
+				continue
+			}
+			if substringCandidateBetter(candidate, top[0]) {
+				candidate.id = strings.Clone(candidate.id)
+				top[0] = candidate
+				heap.Fix(&top, 0)
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(top, func(i, j int) bool {
+		return substringCandidateBetter(top[i], top[j])
+	})
+	return top, nil
+}
+
+func (e *Engine) hydrateSubstringCandidates(candidates []substringCandidate, query, lower string, limit int) []*graph.Node {
+	ids := make([]string, len(candidates))
+	for i := range candidates {
+		ids[i] = candidates[i].id
+	}
+	nodeByID := e.g.GetNodesByIDs(ids)
+
+	type hydratedCandidate struct {
 		node  *graph.Node
 		score int
 	}
-	var results []scored
-	seen := make(map[string]bool)
-
-	for _, n := range exact {
-		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+	hydrated := make([]hydratedCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		node := nodeByID[candidate.id]
+		if node == nil {
 			continue
 		}
-		seen[n.ID] = true
-		results = append(results, scored{n, 0})
+		score, ok := substringScore(node.ID, node.Name, node.Kind, query, lower)
+		if !ok {
+			continue
+		}
+		hydrated = append(hydrated, hydratedCandidate{node: node, score: score})
 	}
-
-	// Fold-matching instead of lowering every candidate: ToLower on both the
-	// name and the ID of every node allocated two strings per node per query
-	// — a quarter-million allocations per call on a mid-size graph, on the
-	// degraded-mode path a stale search index falls back to.
-	allNodes := e.g.AllNodes()
-	for _, n := range allNodes {
-		if seen[n.ID] || n.Kind == graph.KindFile || n.Kind == graph.KindImport {
-			continue
+	sort.Slice(hydrated, func(i, j int) bool {
+		if hydrated[i].score != hydrated[j].score {
+			return hydrated[i].score < hydrated[j].score
 		}
-		if hasPrefixFold(n.Name, lower) {
-			results = append(results, scored{n, 1})
-		} else if containsFold(n.Name, lower) {
-			results = append(results, scored{n, 2})
-		} else if containsFold(n.ID, lower) {
-			results = append(results, scored{n, 3})
-		} else {
-			continue
+		if len(hydrated[i].node.Name) != len(hydrated[j].node.Name) {
+			return len(hydrated[i].node.Name) < len(hydrated[j].node.Name)
 		}
-		seen[n.ID] = true
-	}
-
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].score != results[j].score {
-			return results[i].score < results[j].score
-		}
-		if len(results[i].node.Name) != len(results[j].node.Name) {
-			return len(results[i].node.Name) < len(results[j].node.Name)
-		}
-		// Final tie-break on node ID — equal (score, name-length)
-		// pairs would otherwise resolve in random map-iteration order.
-		return results[i].node.ID < results[j].node.ID
+		return hydrated[i].node.ID < hydrated[j].node.ID
 	})
-
-	out := make([]*graph.Node, 0, limit)
-	for i, r := range results {
-		if i >= limit {
-			break
-		}
-		out = append(out, r.node)
+	if len(hydrated) > limit {
+		hydrated = hydrated[:limit]
+	}
+	out := make([]*graph.Node, len(hydrated))
+	for i := range hydrated {
+		out[i] = hydrated[i].node
 	}
 	return out
+}
+
+func (e *Engine) searchSubstring(query string, limit int) []*graph.Node {
+	if limit <= 0 {
+		return nil
+	}
+	lower := strings.ToLower(query)
+	for attempt := 0; attempt < 2; attempt++ {
+		before, revisionKnown := nodeMutationRevision(e.g)
+		candidates, err := e.scanSubstringCandidates(query, lower, limit)
+		if err != nil {
+			// SearchSymbols cannot return an error. Preserve the Reader contract:
+			// unexpected storage failures must remain visible, not look like an
+			// ordinary empty result.
+			panic(err)
+		}
+		if attempt == 0 && nodeMutationChanged(e.g, before, revisionKnown) {
+			continue
+		}
+		out := e.hydrateSubstringCandidates(candidates, query, lower, limit)
+		if attempt == 0 && nodeMutationChanged(e.g, before, revisionKnown) {
+			continue
+		}
+		return out
+	}
+	return nil
 }
 
 // SearchSymbolsInRepo performs full-text search filtered to a specific repository.
