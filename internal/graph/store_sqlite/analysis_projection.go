@@ -84,7 +84,7 @@ func (s *Store) NodesByKindsSeq(kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
 		}
 		defer rows.Close()
 		for rows.Next() {
-			node, scanErr := scanNode(rows)
+			node, scanErr := scanNodeCursor(rows)
 			if scanErr != nil {
 				panicOnFatal(scanErr)
 				return

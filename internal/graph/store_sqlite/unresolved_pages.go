@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"database/sql"
 	"fmt"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -135,7 +136,7 @@ func scanUnresolvedEdge(scanner interface{ Scan(...any) error }) (int64, *graph.
 	var (
 		id        int64
 		edge      graph.Edge
-		metaBlob  []byte
+		metaBlob  sql.RawBytes
 		crossRepo int64
 		promoted  promotedEdgeMeta
 	)

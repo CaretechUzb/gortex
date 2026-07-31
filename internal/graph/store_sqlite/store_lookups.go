@@ -221,7 +221,7 @@ func (s *Store) GetNodesByIDsContext(ctx context.Context, ids []string) (map[str
 			return out, fmt.Errorf("get nodes by ids: %w", err)
 		}
 		for rows.Next() {
-			n, scanErr := scanNode(rows)
+			n, scanErr := scanNodeCursor(rows)
 			if scanErr != nil {
 				_ = rows.Close()
 				return out, fmt.Errorf("scan node by id: %w", scanErr)
@@ -556,7 +556,7 @@ func (s *Store) queryEdgeCandidatesSQL(query string, args ...any) ([]*graph.Edge
 	}
 	var out []*graph.Edge
 	for rows.Next() {
-		edge, scanErr := scanEdge(rows)
+		edge, scanErr := scanEdgeCursor(rows)
 		if scanErr != nil {
 			_ = rows.Close()
 			return nil, scanErr

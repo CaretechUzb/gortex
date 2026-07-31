@@ -220,7 +220,7 @@ LIMIT ?`, repoPrefix, afterNodeID, limit)
 	for rows.Next() {
 		var (
 			row  graph.CloneCorpusRow
-			blob []byte
+			blob sql.RawBytes
 			sig  sql.NullString
 		)
 		if err := rows.Scan(&row.NodeID, &blob, &sig, &row.TokenCount); err != nil {

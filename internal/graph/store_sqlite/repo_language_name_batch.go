@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -154,7 +155,7 @@ func scanResolverNameScopeNode(scanner interface {
 		scopeID            int
 		sortRepo, sortLang string
 		n                  graph.Node
-		metaBlob           []byte
+		metaBlob           sql.RawBytes
 		p                  promotedNodeMeta
 	)
 	err := scanner.Scan(

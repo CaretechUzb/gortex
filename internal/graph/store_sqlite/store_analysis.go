@@ -12,6 +12,7 @@ package store_sqlite
 // created in schema.go (edges_by_from / edges_by_to / nodes_by_kind).
 
 import (
+	"database/sql"
 	"fmt"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -116,7 +117,7 @@ WHERE e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL`
 	var out []graph.IfaceImplementsRow
 	for rows.Next() {
 		var fromID, ifaceID string
-		var metaBlob []byte
+		var metaBlob sql.RawBytes
 		if err := rows.Scan(&fromID, &ifaceID, &metaBlob); err != nil {
 			continue
 		}
@@ -558,7 +559,7 @@ ORDER BY e.id`
 		}
 		for mrows.Next() {
 			var name string
-			var metaBlob []byte
+			var metaBlob sql.RawBytes
 			if err := mrows.Scan(&name, &metaBlob); err != nil {
 				continue
 			}
