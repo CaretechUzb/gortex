@@ -110,9 +110,12 @@ type warmupState struct {
 	// daemon that has not yet reached its first phase. Callers treat
 	// !known as "not warming, proceed normally".
 	known bool
-	// ready is true once the daemon published the terminal `ready`
-	// phase. When ready, the fast path is a pass-through.
+	// ready is true once the daemon has made the graph queryable. Expensive
+	// whole-graph work remains deferred until enriched is also true.
 	ready bool
+	// enriched is true only after the daemon publishes its terminal
+	// enrichment_complete phase.
+	enriched bool
 	// phase is the last-published warmup phase name.
 	phase string
 	// percent is the cost-proportional completion percentage in
@@ -124,6 +127,12 @@ type warmupState struct {
 // with the warming envelope — true only when a phase is known and the
 // daemon has not yet reached `ready`.
 func (w warmupState) warming() bool { return w.known && !w.ready }
+
+// enrichmentIncomplete is intentionally stricter than warming: queryable
+// `ready` is published before deferred/global startup passes finish. Only
+// whole-graph consumers use this predicate; ordinary graph lookups remain
+// available as soon as ready is true.
+func (w warmupState) enrichmentIncomplete() bool { return w.known && !w.enriched }
 
 // warmupStateFromSnapshot derives a warmupState from a readiness
 // broadcaster payload (the `{phase, ready, ...}` map the broadcaster
@@ -139,6 +148,14 @@ func warmupStateFromSnapshot(snap map[string]any) warmupState {
 	}
 	if ready, ok := snap["ready"].(bool); ok {
 		st.ready = ready
+	}
+	if enriched, ok := snap["enriched"].(bool); ok {
+		st.enriched = enriched
+	}
+	// The phase name is the compatibility source for publishers that omit the
+	// explicit enriched flag from their terminal payload.
+	if st.phase == "enrichment_complete" {
+		st.enriched = true
 	}
 	// Percentage is derived from the published phase. An unrecognised
 	// phase (forward-compatibility: the daemon added a phase this
@@ -217,6 +234,39 @@ func newWarmupEnvelope(w warmupState, partial bool) warmupEnvelope {
 		PartialResults: partial,
 		Message:        msg,
 	}
+}
+
+var enrichmentDeferredResources = map[string]struct{}{
+	"gortex://report":    {},
+	"gortex://god-nodes": {},
+	"gortex://surprises": {},
+	"gortex://audit":     {},
+	"gortex://questions": {},
+}
+
+func newEnrichmentPendingEnvelope(w warmupState) warmupEnvelope {
+	env := newWarmupEnvelope(w, false)
+	env.Message = fmt.Sprintf(
+		"daemon startup enrichment is still running (phase %q); this whole-graph operation is deferred to protect indexing; retry after workspace readiness reaches enrichment_complete",
+		w.phase)
+	return env
+}
+
+func enrichmentPendingToolResult(w warmupState) *mcp.CallToolResult {
+	env := newEnrichmentPendingEnvelope(w)
+	body, err := json.Marshal(map[string]any{"warming": env})
+	if err != nil {
+		return mcp.NewToolResultError(env.Message)
+	}
+	return mcp.NewToolResultText(string(body))
+}
+
+func (s *Server) deferAnalyzerResource(uri string) (warmupState, bool) {
+	if _, wholeGraph := enrichmentDeferredResources[uri]; !wholeGraph {
+		return warmupState{}, false
+	}
+	w := s.warmupSnapshot()
+	return w, w.enrichmentIncomplete()
 }
 
 // checkWarmupFastPath is the pre-handler hook wired into

@@ -269,6 +269,10 @@ func trimToTokens(s string, maxTokens int) string {
 }
 
 func (s *Server) handleGortexWakeup(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if w := s.warmupSnapshot(); w.enrichmentIncomplete() {
+		return enrichmentPendingToolResult(w), nil
+	}
+
 	opts := DefaultWakeupOptions()
 	if v := req.GetInt("max_tokens", 0); v > 0 {
 		opts.MaxTokens = v
