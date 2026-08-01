@@ -220,6 +220,62 @@ type warmupTimings struct {
 	enrichScheduled int
 }
 
+// warmupDeltaFrontier carries the exact file/derived frontier out of the
+// parallel reconcile pool. Any incomplete result fails closed to the existing
+// repo/global pipeline; an ordinary warm delta stays file-scoped end to end.
+type warmupDeltaFrontier struct {
+	mu    sync.Mutex
+	exact bool
+	plans map[string]indexer.DerivedInvalidationPlan
+}
+
+func newWarmupDeltaFrontier() *warmupDeltaFrontier {
+	return &warmupDeltaFrontier{
+		exact: true,
+		plans: make(map[string]indexer.DerivedInvalidationPlan),
+	}
+}
+
+func (frontier *warmupDeltaFrontier) invalidate() {
+	frontier.mu.Lock()
+	frontier.exact = false
+	frontier.mu.Unlock()
+}
+
+func (frontier *warmupDeltaFrontier) record(result *indexer.IndexResult) {
+	frontier.mu.Lock()
+	defer frontier.mu.Unlock()
+	if result == nil || result.RepoPrefix == "" || result.FullRetrack || len(result.FailedFiles) > 0 {
+		frontier.exact = false
+		return
+	}
+	plan := frontier.plans[result.RepoPrefix]
+	plan.Merge(result.DerivedInvalidation)
+	frontier.plans[result.RepoPrefix] = plan
+}
+
+func (frontier *warmupDeltaFrontier) snapshot(changedRepos int, scopeUnknown bool) (map[string]indexer.DerivedInvalidationPlan, []string, bool) {
+	frontier.mu.Lock()
+	defer frontier.mu.Unlock()
+	plans := make(map[string]indexer.DerivedInvalidationPlan, len(frontier.plans))
+	fileSet := make(map[string]struct{})
+	for prefix, plan := range frontier.plans {
+		plans[prefix] = plan
+		for _, file := range plan.Files {
+			if file != "" {
+				fileSet[file] = struct{}{}
+			}
+		}
+	}
+	files := make([]string, 0, len(fileSet))
+	for file := range fileSet {
+		files = append(files, file)
+	}
+	sort.Strings(files)
+	exact := frontier.exact && !scopeUnknown && changedRepos > 0 && len(plans) == changedRepos
+	return plans, files, exact
+}
+
 // warmupDaemonState performs the per-repo parse loop, resolves references,
 // runs the background enrichment, and brings up the MultiWatcher. Split out
 // from buildDaemonState so the daemon can open its socket and accept
@@ -466,6 +522,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// whole-workspace clone pass runs, degrading toward correctness.
 	var changedPrefixes sync.Map
 	var scopeUnknown atomic.Bool
+	deltaFrontier := newWarmupDeltaFrontier()
 	coordinatedBulk, _ := state.graph.(graph.CoordinatedBulkLoader)
 	coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
 	defer func() {
@@ -490,6 +547,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 							logger.Error("daemon: warmup repo panic recovered",
 								zap.String("path", entry.Path),
 								zap.Any("panic", r))
+							changedRepos.Add(1)
+							scopeUnknown.Store(true)
+							deltaFrontier.invalidate()
 						}
 					}()
 					// Route repos whose nodes came from the snapshot through
@@ -554,9 +614,11 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 							// toward the fast path, when we can't trust the delta.
 							changedRepos.Add(1)
 							scopeUnknown.Store(true)
+							deltaFrontier.invalidate()
 						case res != nil && (res.StaleFileCount > 0 || res.DeletedFileCount > 0 || len(res.FailedFiles) > 0 || res.FullRetrack):
 							changedRepos.Add(1)
 							filesReindexed.Add(int64(reconcileFileCount(res)))
+							deltaFrontier.record(res)
 							if res.RepoPrefix != "" {
 								changedPrefixes.Store(res.RepoPrefix, struct{}{})
 							} else {
@@ -581,6 +643,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 									zap.Int("live_nodes", res.NodeCount),
 									zap.Int("live_edges", res.EdgeCount))
 								changedRepos.Add(1)
+								deltaFrontier.invalidate()
 								if res.RepoPrefix != "" {
 									changedPrefixes.Store(res.RepoPrefix, struct{}{})
 								} else {
@@ -591,6 +654,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 					} else {
 						// No prior mtimes → full cold (re)index of this repo,
 						// which is "changed" by definition.
+						deltaFrontier.invalidate()
 						changedRepos.Add(1)
 						if res, err := state.multiIndexer.TrackRepoCtx(ctx, entry); err != nil {
 							logger.Warn("daemon: startup track failed",
@@ -674,6 +738,13 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		}
 		return true
 	})
+	deltaPlans, deltaFiles, exactWarmDelta := deltaFrontier.snapshot(
+		int(changedRepos.Load()), scopeUnknown.Load(),
+	)
+	logger.Info("daemon: warmup delta frontier",
+		zap.Bool("exact", exactWarmDelta),
+		zap.Int("repos", len(deltaPlans)),
+		zap.Int("files", len(deltaFiles)))
 
 	// Resolve scope: restrict the warm-restart master resolve to the repos
 	// that re-indexed, but only when every whole-graph-safety precondition
@@ -728,6 +799,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// cross-repo resolver. On the warm-restart fast path nothing changed, so
 	// the persisted graph already carries resolved edges and we skip straight
 	// to marking ready.
+	resolveOK := true
 	if anyChanged {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "resolve", false, nil)
@@ -741,7 +813,18 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		// and cross-repo passes starved cross-repo to a standstill
 		// (measured: 1,049s for a pass that runs in ~38s uncontended). The
 		// gate opens right after this call returns.
-		state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope, markReady)
+		var resolveErr error
+		if exactWarmDelta {
+			resolveErr = state.multiIndexer.RunPreEnrichResolveFiles(ctx, deltaFiles, markReady)
+		} else {
+			resolveErr = state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope, markReady)
+		}
+		if resolveErr != nil {
+			resolveOK = false
+			exactWarmDelta = false
+			scopeUnknown.Store(true)
+			logger.Error("daemon: warmup resolve failed", zap.Error(resolveErr))
+		}
 		timings.resolve = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "resolve"),
@@ -759,7 +842,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// path): the graph is queryable. Flip ready before the multi-minute
 	// enrichment so clients can start issuing queries immediately. Everything
 	// below runs in the background after ready and finishes at MarkEnriched.
-	if markReady != nil {
+	if markReady != nil && resolveOK {
 		markReady()
 	}
 
@@ -883,7 +966,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// (scopeUnknown) so a repo whose clones genuinely need recomputing is
 	// never skipped. ArmBatchScope is a no-op when scoped global passes are
 	// disabled or the set is empty (run every repo, the prior behaviour).
-	if anyChanged && !scopeUnknown.Load() {
+	if anyChanged && !exactWarmDelta && !scopeUnknown.Load() {
 		state.multiIndexer.ArmBatchScope(changed)
 		// Full-coverage attestation: every tracked repository re-indexed in
 		// this warmup (a cold index, or a warm restart that reconciled the
@@ -899,10 +982,17 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 
 	phaseStart = time.Now()
 	publishReadinessPhase(state, "end_batch", true, nil)
-	if anyChanged {
-		state.multiIndexer.EndBatch()
-	} else {
+	switch {
+	case !anyChanged:
 		state.multiIndexer.ResetBatch()
+	case exactWarmDelta:
+		// Clear the outer batch flags first, then execute only the exact
+		// invalidation families carried by the reconciled files.
+		state.multiIndexer.ResetBatch()
+		report := state.multiIndexer.RunIncrementalDerivedPasses(ctx, deltaPlans)
+		logger.Info("daemon: exact warm derived passes complete", zap.Any("report", report))
+	default:
+		state.multiIndexer.EndBatch()
 	}
 	timings.endBatch = time.Since(phaseStart)
 	logger.Info("daemon: warmup phase done",
