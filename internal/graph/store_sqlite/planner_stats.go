@@ -26,7 +26,10 @@ func (s *Store) refreshPlannerStatsLocked(ctx context.Context) error {
 	if _, err := s.execActiveWriteLocked(ctx, fmt.Sprintf(`PRAGMA analysis_limit=%d`, plannerStatsAnalysisLimit)); err != nil {
 		return err
 	}
-	_, err := s.execActiveWriteLocked(ctx, `ANALYZE`)
+	if _, err := s.execActiveWriteLocked(ctx, `ANALYZE nodes`); err != nil {
+		return err
+	}
+	_, err := s.execActiveWriteLocked(ctx, `ANALYZE edges`)
 	return err
 }
 
@@ -64,7 +67,11 @@ func healPlannerStats(db *sql.DB) {
 		log.Printf("store_sqlite: planner stats heal failed error=%q", err)
 		return
 	}
-	if _, err := conn.ExecContext(ctx, `ANALYZE`); err != nil {
+	if _, err := conn.ExecContext(ctx, `ANALYZE nodes`); err != nil {
+		log.Printf("store_sqlite: planner stats heal failed error=%q", err)
+		return
+	}
+	if _, err := conn.ExecContext(ctx, `ANALYZE edges`); err != nil {
 		log.Printf("store_sqlite: planner stats heal failed error=%q", err)
 		return
 	}

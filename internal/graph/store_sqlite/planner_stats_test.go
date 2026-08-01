@@ -58,6 +58,25 @@ func TestCoordinatedBulkFinalizeRefreshesPlannerStats(t *testing.T) {
 	if rows := plannerStatRows(t, s); rows == 0 {
 		t.Fatal("bulk finalize left no sqlite_stat1 rows")
 	}
+	statsRows, err := s.db.Query(`SELECT DISTINCT tbl FROM sqlite_stat1 ORDER BY tbl`)
+	if err != nil {
+		t.Fatalf("list analyzed tables: %v", err)
+	}
+	defer statsRows.Close()
+	var tables []string
+	for statsRows.Next() {
+		var table string
+		if err := statsRows.Scan(&table); err != nil {
+			t.Fatalf("scan analyzed table: %v", err)
+		}
+		tables = append(tables, table)
+	}
+	if err := statsRows.Err(); err != nil {
+		t.Fatalf("iterate analyzed tables: %v", err)
+	}
+	if got, want := fmt.Sprint(tables), "[edges nodes]"; got != want {
+		t.Fatalf("analyzed tables = %s, want %s", got, want)
+	}
 }
 
 // A populated store written before the engine kept planner statistics must

@@ -719,5 +719,8 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	if changed {
 		s.mergeMutationReceiptLocked(receiptDelta)
 	}
-	return stats, nil
+	// The transaction is durable before index sealing. If the bounded cold
+	// threshold was reached, build the dense indexes now on the same pinned
+	// connection; a failure remains retryable at the repository/final boundary.
+	return stats, s.noteBulkRowsLocked(stats.nodeRowsChanged, stats.edgeRowsInserted)
 }

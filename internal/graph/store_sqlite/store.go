@@ -152,14 +152,17 @@ type Store struct {
 	// cache and routes every bulk write through it; bulkPrevSync /
 	// bulkPrevCacheSize hold the values FlushBulk restores before the
 	// connection returns to the pool. coordinatedBulkLoad is true while a
-	// multi-repository cold parse owns the outer load window; nested per-repo
-	// BeginBulkLoad/FlushBulk calls then leave that window open so indexes are
-	// rebuilt only after the final repository drains. All fields are guarded by
-	// writeMu.
-	bulkConn            *sql.Conn
-	bulkPrevSync        int64
-	bulkPrevCacheSize   int64
-	coordinatedBulkLoad bool
+	// multi-repository cold parse owns the outer load window. Dense indexes are
+	// sealed once at bounded row counts (or the first nested repo boundary),
+	// while the pinned durability/FTS window stays open. All fields are guarded
+	// by writeMu.
+	bulkConn             *sql.Conn
+	bulkPrevSync         int64
+	bulkPrevCacheSize    int64
+	coordinatedBulkLoad  bool
+	bulkIndexesDeferred  bool
+	bulkDeferredNodeRows int64
+	bulkDeferredEdgeRows int64
 	// These flags mean "bounded FTS maintenance requested" during a
 	// coordinated cold load. The historical names are retained to keep the
 	// cancellation/Close path stable; normal cold finalization never runs a
@@ -383,9 +386,8 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	}
 	// Add the promoted node columns to databases created before they
 	// existed (CREATE TABLE IF NOT EXISTS won't alter an existing table).
-	// Must run before the droppable-index loop below — nodes_semantic_pending
-	// references a promoted column — and before prepare(), whose node INSERT
-	// references them too.
+	// Must run before prepare(), whose node INSERT references the promoted
+	// columns too.
 	if err := ensureNodeColumns(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite node columns: %w", err)
@@ -417,6 +419,14 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	// recreates them — see bulk_load.go). Kept out of schemaSQL so the two
 	// sites cannot drift.
 	for _, idx := range bulkDroppableIndexes {
+		if _, err := db.Exec(idx.ddl); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite create index %s: %w", idx.name, err)
+		}
+	}
+	// Sparse partial indexes remain live through a cold load, but share the
+	// same explicit DDL ownership rather than drifting into schemaSQL.
+	for _, idx := range bulkAlwaysLiveIndexes {
 		if _, err := db.Exec(idx.ddl); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite create index %s: %w", idx.name, err)
@@ -739,7 +749,8 @@ func (s *Store) Close() error {
 		s.deferredFTSOptimize = false
 		s.deferredContentFTS = false
 		s.coordinatedBulkLoad = false
-		bulkErr = s.flushBulkLocked()
+		sealErr := s.sealBulkIndexesLocked("close")
+		bulkErr = errors.Join(sealErr, s.closeBulkConnectionLocked())
 	}
 	s.writeMu.Unlock()
 
