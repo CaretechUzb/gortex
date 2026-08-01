@@ -169,8 +169,15 @@ func (mi *MultiIndexer) ReposInWorkspace(workspaceID string) map[string]bool {
 // Returns the count of nodes and contracts updated for telemetry.
 // Idempotent: re-running on an already-stamped graph is a no-op.
 func (mi *MultiIndexer) BackfillWorkspaceSlugs() (nodesStamped, contractsStamped int) {
+	nodesStamped, contractsStamped, _ = mi.backfillWorkspaceSlugsWithImpact()
+	return nodesStamped, contractsStamped
+}
+
+// backfillWorkspaceSlugsWithImpact retains public changed-row telemetry and
+// separately reports stamps that can alter cross-workspace eligibility.
+func (mi *MultiIndexer) backfillWorkspaceSlugsWithImpact() (nodesStamped, contractsStamped, resolutionAffected int) {
 	if mi == nil || mi.graph == nil || mi.configMgr == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	mi.mu.RLock()
 	repoMeta := make(map[string]string, len(mi.repos))
@@ -222,8 +229,15 @@ func (mi *MultiIndexer) BackfillWorkspaceSlugs() (nodesStamped, contractsStamped
 		})
 	}
 	sort.Slice(slugRows, func(i, j int) bool { return slugRows[i].RepoPrefix < slugRows[j].RepoPrefix })
-	if backfiller, ok := mi.graph.(graph.WorkspaceSlugBackfiller); ok {
+	if backfiller, ok := mi.graph.(graph.WorkspaceSlugImpactBackfiller); ok {
+		result := backfiller.BackfillWorkspaceSlugsWithImpact(slugRows)
+		nodesStamped = result.Changed
+		resolutionAffected = result.ResolutionAffected
+	} else if backfiller, ok := mi.graph.(graph.WorkspaceSlugBackfiller); ok {
 		nodesStamped = backfiller.BackfillWorkspaceSlugs(slugRows)
+		// Unknown implementations do not expose the effective-boundary delta;
+		// fail closed and preserve the former full-resolve behavior.
+		resolutionAffected = nodesStamped
 	}
 
 	// Per-repo contract registries: rehydrated from snapshot they
@@ -266,7 +280,7 @@ func (mi *MultiIndexer) BackfillWorkspaceSlugs() (nodesStamped, contractsStamped
 			}
 		}
 	}
-	return nodesStamped, contractsStamped
+	return nodesStamped, contractsStamped, resolutionAffected
 }
 
 // RunGlobalResolve runs a cross-repo + cross-workspace resolution

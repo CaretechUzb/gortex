@@ -1008,14 +1008,15 @@ func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []st
 		onComputeDone()
 	}
 	// A legacy workspace stamp may change the eligibility of unresolved edges
-	// anywhere in the graph, not only in this exact file frontier. Escalate the
-	// cross-repo phase only for that one-time migration; an already-stamped
-	// graph retains the bounded outgoing/incoming file pass.
-	nodesStamped, _ := mi.BackfillWorkspaceSlugs()
+	// anywhere in the graph, not only in this exact file frontier. Project-only
+	// fills and WorkspaceID=RepoPrefix fills preserve the resolver's existing
+	// fallback semantics, so only an effective workspace-boundary change needs
+	// to escalate this exact frontier to a graph-wide pass.
+	_, _, resolutionAffected := mi.backfillWorkspaceSlugsWithImpact()
 	if err := context.Cause(ctx); err != nil {
 		return err
 	}
-	if nodesStamped > 0 {
+	if resolutionAffected > 0 {
 		return mi.runCrossRepoResolveContext(ctx, false)
 	}
 	mi.runCrossRepoResolveFiles(files)
