@@ -139,17 +139,12 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 		scopedPrefixes = nil
 	}
 
-	if merged.LegacyFallback {
-		// Legacy fingerprints need a scoped global rebuild, but this one-off
-		// fallback must not arm or consume an unrelated active batch.
-		mi.runGlobalGraphPassesTopologyHeld(ctx, prefixSet, false)
-		if merged.Flags.Has(DerivedInvalidatesContracts) {
-			report.Contracts = mi.ReconcileContractEdges()
-		}
-		report.DurationMs = time.Since(started).Milliseconds()
-		mi.logIncrementalDerived(report, merged)
-		return report
-	}
+	// A pre-fingerprint row cannot classify which derived family changed, so
+	// its producer conservatively sets every relevant flag. The file/type/
+	// contract frontiers are still exact: escalating that first edit to a
+	// repository-wide global pass made an upgraded warm daemon spend minutes
+	// rebuilding unrelated framework edges. Run the exact coordinator below
+	// with the conservative flags and retain LegacyFallback as telemetry.
 	if ctx != nil {
 		select {
 		case <-ctx.Done():
