@@ -74,16 +74,6 @@ func nativeParsePressureLanguage(language string) bool {
 	}
 }
 
-// afterTreeRelease makes the pressure-ordering contract explicit: allocator
-// relief is never attempted while the completed parse tree is still live.
-// releaseTree runs even when relief is unsupported and r is nil.
-func (r *nativeParsePressureRelief) afterTreeRelease(language string, sourceBytes int64, releaseTree func()) {
-	if releaseTree != nil {
-		releaseTree()
-	}
-	r.afterParse(language, sourceBytes)
-}
-
 // afterParse records one in-process tree-sitter parse after its extractor has
 // returned and closed the native tree. Only C-family grammars participate: the
 // measured cold-index high-water came from their large generated syntax trees,
