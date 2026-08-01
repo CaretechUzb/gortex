@@ -42,19 +42,45 @@ func TestIndexFileRevalidatesAfterWaitingForRepositoryLane(t *testing.T) {
 
 	coordinator := newRepositoryMutationCoordinator(nil)
 	var batchGate sync.RWMutex
-	batchGate.Lock()
 	coordinator.batchMutationGate = &batchGate
 	idx := &Indexer{rootPath: root}
 	idx.attachRepositoryMutationCoordinator(coordinator)
 
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- coordinator.runExclusive(context.Background(), func() error {
+			close(firstEntered)
+			<-releaseFirst
+			return nil
+		})
+	}()
+	require.Eventually(t, func() bool {
+		select {
+		case <-firstEntered:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond, "first mutation never acquired the repository lane")
+
+	admitted := make(chan struct{})
+	coordinator.batchAdmissionHook = sync.OnceFunc(func() { close(admitted) })
 	done := make(chan error, 1)
 	go func() { done <- idx.IndexFile(filePath) }()
 	require.Eventually(t, func() bool {
-		return len(coordinator.lane) == 0
-	}, time.Second, time.Millisecond, "IndexFile never acquired the repository lane")
+		select {
+		case <-admitted:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond, "IndexFile never acquired batch admission")
 	require.NoError(t, os.Remove(filePath))
-	batchGate.Unlock()
+	close(releaseFirst)
 
+	require.NoError(t, <-firstDone)
 	require.ErrorContains(t, <-done, "queued.go")
 }
 
