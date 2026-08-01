@@ -5959,6 +5959,16 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		}
 	}
 
+	projectionCandidates := make([]string, 0, 1)
+	for relPath := range diskFiles {
+		if filepath.Base(filepath.FromSlash(relPath)) == "parser.c" {
+			projectionCandidates = append(projectionCandidates, relPath)
+		}
+	}
+	for _, relPath := range idx.staleGeneratedParserProjectionPaths(projectionCandidates) {
+		staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(relPath)))
+	}
+
 	// In Merkle mode the per-file mtime check is skipped; the stale set
 	// comes from a content-addressed tree diff over the whole repo,
 	// then intersected back down to the requested scope.
@@ -6115,6 +6125,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	// A partial pass never publishes or requires a whole-repository marker.
 	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
 		idx.markPendingEnrichFiles(invalidation.Files)
+	}
+	if len(failedFiles) == 0 && !idx.hasStaleGeneratedParserProjections() {
+		idx.persistExtractorVersion("c")
 	}
 	return result, nil
 }
@@ -8664,6 +8677,7 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 	idx.storeRootPath(absRoot)
 
 	diskFiles := make(map[string]bool)
+	projectionCandidates := make([]string, 0, 1)
 	walkErr := filepath.WalkDir(absRoot, func(path string, d os.DirEntry, werr error) error {
 		if werr != nil {
 			return werr
@@ -8682,6 +8696,9 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		}
 		rel := idx.relKey(path)
 		diskFiles[rel] = true
+		if filepath.Base(filepath.FromSlash(rel)) == "parser.c" {
+			projectionCandidates = append(projectionCandidates, rel)
+		}
 		if idx.IsStale(rel) {
 			changed = append(changed, rel)
 		}
@@ -8689,6 +8706,12 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 	})
 	if walkErr != nil {
 		return nil, nil, 0, walkErr
+	}
+
+	projectionRefresh := idx.staleGeneratedParserProjectionPaths(projectionCandidates)
+	changed = appendUniqueSorted(changed, projectionRefresh...)
+	if len(projectionRefresh) == 0 && !idx.merkleEnabled() {
+		idx.persistExtractorVersion("c")
 	}
 
 	// Deletion check mirrors the modern incremental path: missing files and

@@ -88,6 +88,7 @@ func TestGeneratedTreeSitterParserProjectionRetainsPublicAPI(t *testing.T) {
 		"skip_reason":                           "generated_parser_table",
 		"skipped_due_to_generated_parser_table": true,
 		"generated_parser_projection":           true,
+		"generated_parser_projection_version":   generatedParserProjectionPolicyVersion,
 		"generated_parser_internals_omitted":    true,
 		"projection":                            "tree_sitter_public_entry",
 		"source_bytes":                          len(src),
@@ -112,11 +113,14 @@ func TestGeneratedTreeSitterParserProjectionRetainsPublicAPI(t *testing.T) {
 	if got := fn.Meta["signature"]; got != "TS_PUBLIC const TSLanguage *tree_sitter_demo(void)" {
 		t.Errorf("signature = %#v", got)
 	}
-	if fn.Meta["generated"] != true || fn.Meta["codegen_tool"] != "tree-sitter" || fn.Meta["generated_parser_projection"] != true {
+	if fn.Meta["generated"] != true || fn.Meta["codegen_tool"] != "tree-sitter" ||
+		fn.Meta["generated_parser_projection"] != true ||
+		metaInt(fn.Meta, generatedParserProjectionVersionMetaKey) != generatedParserProjectionPolicyVersion {
 		t.Errorf("unexpected function metadata: %#v", fn.Meta)
 	}
 	retrieval := fn.RetrievalMetadata()
-	if retrieval.Signature != "TS_PUBLIC const TSLanguage *tree_sitter_demo(void)" || retrieval.QualName != "tree_sitter_demo" {
+	if retrieval.Signature != "TS_PUBLIC const TSLanguage *tree_sitter_demo(void)" ||
+		retrieval.QualName != "vendor.demo.src.parser.tree_sitter_demo" {
 		t.Errorf("unexpected retrieval metadata: %#v", retrieval)
 	}
 
@@ -130,6 +134,65 @@ func TestGeneratedTreeSitterParserProjectionRetainsPublicAPI(t *testing.T) {
 	if definesEdge.From != file.ID || definesEdge.To != fn.ID || definesEdge.Kind != graph.EdgeDefines ||
 		definesEdge.FilePath != file.ID || definesEdge.Line != wantStart {
 		t.Fatalf("unexpected defines edge: %#v", definesEdge)
+	}
+}
+
+func TestGeneratedTreeSitterParserProjectionAccountsForWholeFile(t *testing.T) {
+	late := "\nTS_PUBLIC const TSLanguage *tree_sitter_late(void) { return &language; }\n"
+	src := generatedParserTestSource(late)
+	early := []byte("\nextern const TSLanguage *tree_sitter_early(void) { return &language; }\n")
+	earlyOffset := generatedTreeSitterParserHeadBytes + 1024
+	copy(src[earlyOffset:], early)
+	if earlyOffset >= len(src)-(1<<20) {
+		t.Fatal("fixture entry must remain outside the former tail-only window")
+	}
+
+	result, ok := generatedTreeSitterParserProjection("vendor/demo/src/parser.c", "c", src)
+	if !ok {
+		t.Fatal("expected projection")
+	}
+	if len(result.Nodes) != 3 || len(result.Edges) != 3 {
+		t.Fatalf("projection shape = %d nodes, %d edges; want 3 nodes, 3 edges", len(result.Nodes), len(result.Edges))
+	}
+	got := map[string]*graph.Node{}
+	for _, node := range result.Nodes[1:] {
+		got[node.Name] = node
+	}
+	if got["tree_sitter_early"] == nil || got["tree_sitter_late"] == nil {
+		t.Fatalf("whole-file entries = %#v", got)
+	}
+	if got["tree_sitter_early"].StartLine >= got["tree_sitter_late"].StartLine {
+		t.Fatalf("entry ordering/locations are wrong: early=%d late=%d", got["tree_sitter_early"].StartLine, got["tree_sitter_late"].StartLine)
+	}
+}
+
+func TestGeneratedTreeSitterParserProjectionFailsClosedOnUncertainCandidate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tail string
+	}{
+		{
+			name: "unexpected parameters",
+			tail: "\nTS_PUBLIC const TSLanguage *tree_sitter_demo(int state) { return &language; }\n",
+		},
+		{
+			name: "duplicate exported identity",
+			tail: "\nTS_PUBLIC const TSLanguage *tree_sitter_demo(void) { return &language; }\n" +
+				"extern const TSLanguage *tree_sitter_demo(void) { return &language; }\n",
+		},
+		{
+			name: "oversized exported body",
+			tail: "\nTS_PUBLIC const TSLanguage *tree_sitter_demo(void) {\n" +
+				string(bytes.Repeat([]byte{' '}, generatedTreeSitterPublicBodyMaxBytes)) +
+				"\nreturn &language;\n}\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, ok := generatedTreeSitterParserProjection("vendor/demo/src/parser.c", "c", generatedParserTestSource(tc.tail))
+			if ok || result != nil {
+				t.Fatalf("projection = %#v, %v; want fail-closed full extraction", result, ok)
+			}
+		})
 	}
 }
 
@@ -160,6 +223,58 @@ func TestGeneratedTreeSitterParserProjectionFailsClosedWithoutPublicEntry(t *tes
 		if ok || result != nil {
 			t.Fatalf("projection = %#v, %v; want fail-closed normal extraction", result, ok)
 		}
+	}
+}
+
+func TestGeneratedParserProjectionPolicyInvalidatesUnchangedWarmFile(t *testing.T) {
+	if got := extractorVersionsSnapshot()["c"]; got != generatedParserProjectionPolicyVersion {
+		t.Fatalf("persisted C extractor version = %d; want %d", got, generatedParserProjectionPolicyVersion)
+	}
+
+	root := t.TempDir()
+	path := filepath.Join(root, "parser.c")
+	if err := os.WriteFile(path, []byte("int main(void) { return 0; }\n"), 0o600); err != nil {
+		t.Fatalf("write parser fixture: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat parser fixture: %v", err)
+	}
+
+	registry := parser.NewRegistry()
+	registry.Register(&generatedParserSpyExtractor{})
+	g := graph.New()
+	idx := New(g, registry, config.IndexConfig{}, zap.NewNop())
+	idx.SetRepoPrefix("demo")
+	idx.SetFileMtimes(map[string]int64{"parser.c": info.ModTime().UnixNano()})
+	fileNode := &graph.Node{
+		ID:         "demo/parser.c",
+		Kind:       graph.KindFile,
+		Name:       "parser.c",
+		FilePath:   "demo/parser.c",
+		Language:   "c",
+		RepoPrefix: "demo",
+		Meta: map[string]any{
+			generatedParserProjectionMetaKey: true,
+		},
+	}
+	g.AddNode(fileNode)
+
+	changed, deleted, detected, err := idx.changedSinceMtimesCensus(root)
+	if err != nil {
+		t.Fatalf("changedSinceMtimesCensus: %v", err)
+	}
+	if detected != 1 || len(deleted) != 0 || len(changed) != 1 || changed[0] != "parser.c" {
+		t.Fatalf("old policy census changed=%v deleted=%v detected=%d", changed, deleted, detected)
+	}
+
+	fileNode.Meta[generatedParserProjectionVersionMetaKey] = generatedParserProjectionPolicyVersion
+	changed, deleted, detected, err = idx.changedSinceMtimesCensus(root)
+	if err != nil {
+		t.Fatalf("current policy census: %v", err)
+	}
+	if detected != 1 || len(deleted) != 0 || len(changed) != 0 {
+		t.Fatalf("current policy census changed=%v deleted=%v detected=%d", changed, deleted, detected)
 	}
 }
 
