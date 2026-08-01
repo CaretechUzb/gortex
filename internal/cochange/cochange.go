@@ -223,12 +223,17 @@ func AddEdges(g graph.Store, pairs []Pair, repoPrefix string) int {
 	if g == nil || len(pairs) == 0 {
 		return 0
 	}
-	// Map repo-relative path -> file node ID. A file node's FilePath
-	// carries the multi-repo prefix; key on the prefix-stripped path
-	// so a git-relative path matches.
+	// Map repo-relative path -> file node ID. Ask the store for file nodes
+	// directly: the SQLite implementation pushes KindFile into its indexed
+	// query and closes the read cursor before this function starts writing
+	// co-change edges. Pulling AllNodes here decoded every symbol and its
+	// metadata once per repository during lazy co-change mining.
+	//
+	// A file node's FilePath carries the multi-repo prefix; key on the
+	// prefix-stripped path so a git-relative path matches.
 	idByPath := make(map[string]string)
-	for _, n := range g.AllNodes() {
-		if n.Kind != graph.KindFile || n.FilePath == "" {
+	for n := range g.NodesByKind(graph.KindFile) {
+		if n == nil || n.Kind != graph.KindFile || n.FilePath == "" {
 			continue
 		}
 		if repoPrefix != "" {
