@@ -492,11 +492,48 @@ func externalModuleNodeID(pkg *packages.Package) string {
 	return goModuleNodeID(mod.Path, mod.Version)
 }
 
+// drainPendingAdds performs the final missing-node recheck immediately before
+// the caller's AddBatch. enrichRepoContext holds Store.ResolveMutex across this
+// recheck and apply, so a canonical module/external node created after the
+// initial prefetch cannot be rewritten by a stale synthetic identity. Edges are
+// deliberately retained: the reused node may still need this pass's module or
+// call/reference edges.
 func (e *externalsAttribution) drainPendingAdds() (nodes []*graph.Node, edges []*graph.Edge) {
 	nodes, edges = e.pendingNodes, e.pendingEdges
 	e.pendingNodes = nil
 	e.pendingEdges = nil
-	return nodes, edges
+	if len(nodes) == 0 || e.g == nil {
+		return nodes, edges
+	}
+
+	ids := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		if node != nil && node.ID != "" {
+			ids = append(ids, node.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nodes, edges
+	}
+	existing := graph.LookupExistingNodeIDs(e.g, ids)
+	if len(existing) == 0 {
+		return nodes, edges
+	}
+
+	kept := nodes[:0]
+	reused := 0
+	for _, node := range nodes {
+		if node != nil {
+			if _, ok := existing[node.ID]; ok {
+				reused++
+				continue
+			}
+		}
+		kept = append(kept, node)
+	}
+	clear(nodes[len(kept):])
+	e.nodesAdded -= reused
+	return kept, edges
 }
 
 func (e *externalsAttribution) drainPendingReindexes() []graph.EdgeReindex {

@@ -754,8 +754,8 @@ func TestProviderEnrichRepoBatchesExternalSQLiteMutations(t *testing.T) {
 	_, err = provider.Enrich(counting, root)
 	require.NoError(t, err)
 
-	require.Equal(t, 1, counting.existingNodeIDCalls,
-		"external prefetch must use one lightweight ID-existence batch")
+	require.Equal(t, 2, counting.existingNodeIDCalls,
+		"external prefetch and final apply recheck must each use one lightweight ID-existence batch")
 	require.Zero(t, counting.getNodesByIDsCalls,
 		"external prefetch and SQLite stamps must not materialize full nodes")
 	require.Equal(t, 1, counting.repoSummaryCalls)
