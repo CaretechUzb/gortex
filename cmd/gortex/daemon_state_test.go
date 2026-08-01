@@ -104,27 +104,21 @@ func TestWarmMtimePrefix(t *testing.T) {
 	}
 }
 
-func TestCanSkipWarmGlobalResolveRequiresEveryExactSafetySignal(t *testing.T) {
+func TestCanSkipWarmGlobalResolveRequiresCompletionProof(t *testing.T) {
 	base := warmGlobalResolveSafety{
-		exactDelta:                     true,
 		resolveOK:                      true,
 		deferredExactCrossRepoComplete: true,
 	}
 	if !canSkipWarmGlobalResolve(base) {
-		t.Fatal("fully exact warm delta should elide the duplicate full cross-repo sweep")
+		t.Fatal("complete initial and deferred cross-repo passes should elide the duplicate full sweep")
 	}
 
 	cases := []struct {
 		name   string
 		mutate func(*warmGlobalResolveSafety)
 	}{
-		{"initial frontier not exact", func(s *warmGlobalResolveSafety) { s.exactDelta = false }},
 		{"pre-enrichment resolve failed", func(s *warmGlobalResolveSafety) { s.resolveOK = false }},
 		{"deferred catch-up fell back", func(s *warmGlobalResolveSafety) { s.deferredExactCrossRepoComplete = false }},
-		{"repository scope unknown", func(s *warmGlobalResolveSafety) { s.scopeUnknown = true }},
-		{"snapshot partial", func(s *warmGlobalResolveSafety) { s.snapshotPartial = true }},
-		{"store needs rebuild", func(s *warmGlobalResolveSafety) { s.needsRebuild = true }},
-		{"operator forced full resolve", func(s *warmGlobalResolveSafety) { s.forcedFull = true }},
 		{"workspace slug stamped nodes", func(s *warmGlobalResolveSafety) { s.backfilledNodes = 1 }},
 	}
 	for _, tc := range cases {
@@ -132,7 +126,36 @@ func TestCanSkipWarmGlobalResolveRequiresEveryExactSafetySignal(t *testing.T) {
 			safety := base
 			tc.mutate(&safety)
 			if canSkipWarmGlobalResolve(safety) {
-				t.Fatal("unsafe warmup shape elided the full cross-repo sweep")
+				t.Fatal("incomplete cross-repo proof elided the full sweep")
+			}
+		})
+	}
+}
+
+func TestSelectWarmGlobalResolveAction(t *testing.T) {
+	complete := warmGlobalResolveSafety{
+		resolveOK:                      true,
+		deferredExactCrossRepoComplete: true,
+	}
+	cases := []struct {
+		name                string
+		anyChanged          bool
+		safety              warmGlobalResolveSafety
+		backfilledContracts int
+		want                warmGlobalResolveAction
+	}{
+		{"changed exact frontier", true, complete, 0, warmGlobalResolveContracts},
+		{"changed failed initial resolve", true, warmGlobalResolveSafety{}, 0, warmGlobalResolveFull},
+		{"changed incomplete deferred catch-up", true, warmGlobalResolveSafety{resolveOK: true}, 0, warmGlobalResolveFull},
+		{"changed late node stamp", true, warmGlobalResolveSafety{resolveOK: true, deferredExactCrossRepoComplete: true, backfilledNodes: 1}, 0, warmGlobalResolveFull},
+		{"unchanged legacy node stamp", false, warmGlobalResolveSafety{backfilledNodes: 1}, 0, warmGlobalResolveFull},
+		{"unchanged legacy contract stamp", false, warmGlobalResolveSafety{}, 1, warmGlobalResolveContracts},
+		{"unchanged clean snapshot", false, warmGlobalResolveSafety{}, 0, warmGlobalResolveNone},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := selectWarmGlobalResolveAction(tc.anyChanged, tc.safety, tc.backfilledContracts); got != tc.want {
+				t.Fatalf("action = %v, want %v", got, tc.want)
 			}
 		})
 	}

@@ -952,35 +952,33 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// slugs. An exact pre-enrichment frontier plus an exact deferred receipt has
 	// already completed outgoing, incoming, and parallel-edge catch-up; when no
 	// node slug changed, only contract bridges need reconciliation. Every
-	// uncertain lifecycle shape retains the historical full safety sweep.
-	if anyChanged {
+	// missing completion proof or any node slug stamp retains the historical
+	// full safety sweep.
+	globalResolveAction := selectWarmGlobalResolveAction(anyChanged, warmGlobalResolveSafety{
+		resolveOK:                      resolveOK,
+		deferredExactCrossRepoComplete: deferredExactCrossRepoComplete,
+		backfilledNodes:                backfilledNodes,
+	}, backfilledContracts)
+	if globalResolveAction != warmGlobalResolveNone {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "global_resolve", true, nil)
-		skipFullCrossRepo := canSkipWarmGlobalResolve(warmGlobalResolveSafety{
-			exactDelta:                     exactWarmDelta,
-			resolveOK:                      resolveOK,
-			deferredExactCrossRepoComplete: deferredExactCrossRepoComplete,
-			scopeUnknown:                   scopeUnknown.Load(),
-			snapshotPartial:                state.snapshotPartial,
-			needsRebuild:                   needsRebuild,
-			forcedFull:                     forcedFullResolve,
-			backfilledNodes:                backfilledNodes,
-		})
-		if skipFullCrossRepo {
+		switch globalResolveAction {
+		case warmGlobalResolveContracts:
 			reconciled := state.multiIndexer.ReconcileContractEdges()
-			logger.Info("daemon: exact warm cross-repo catch-up complete; skipped full sweep",
+			logger.Info("daemon: contract-edge catch-up complete; skipped full cross-repo sweep",
 				zap.Int("contract_edges", reconciled))
-		} else {
+		case warmGlobalResolveFull:
 			state.multiIndexer.RunGlobalResolve()
 		}
+		fullCrossRepo := globalResolveAction == warmGlobalResolveFull
 		timings.globalResolve = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "global_resolve"),
-			zap.Bool("full_cross_repo", !skipFullCrossRepo),
+			zap.Bool("full_cross_repo", fullCrossRepo),
 			zap.Duration("elapsed", time.Since(phaseStart)))
 		publishReadinessPhase(state, "global_resolve_done", true, map[string]any{
 			"elapsed_ms":      time.Since(phaseStart).Milliseconds(),
-			"full_cross_repo": !skipFullCrossRepo,
+			"full_cross_repo": fullCrossRepo,
 		})
 	}
 
@@ -1025,6 +1023,23 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		logger.Info("daemon: exact warm derived passes complete", zap.Any("report", report))
 	default:
 		state.multiIndexer.EndBatch()
+	}
+	postBatchNodes, postBatchContracts := state.multiIndexer.BackfillWorkspaceSlugs()
+	if postBatchNodes+postBatchContracts > 0 {
+		logger.Info("daemon: backfilled workspace/project slugs after derived passes",
+			zap.Int("nodes", postBatchNodes),
+			zap.Int("contracts", postBatchContracts))
+	}
+	switch selectWarmGlobalResolveAction(false, warmGlobalResolveSafety{
+		backfilledNodes: postBatchNodes,
+	}, postBatchContracts) {
+	case warmGlobalResolveContracts:
+		reconciled := state.multiIndexer.ReconcileContractEdges()
+		logger.Info("daemon: reconciled post-batch contract edges",
+			zap.Int("contract_edges", reconciled))
+	case warmGlobalResolveFull:
+		state.multiIndexer.RunGlobalResolve()
+		logger.Info("daemon: post-batch node migration forced full cross-repo catch-up")
 	}
 	timings.endBatch = time.Since(phaseStart)
 	logger.Info("daemon: warmup phase done",
@@ -1284,29 +1299,42 @@ func storeNeedsRebuild(g any) bool {
 }
 
 type warmGlobalResolveSafety struct {
-	exactDelta                     bool
 	resolveOK                      bool
 	deferredExactCrossRepoComplete bool
-	scopeUnknown                   bool
-	snapshotPartial                bool
-	needsRebuild                   bool
-	forcedFull                     bool
 	backfilledNodes                int
 }
 
-// canSkipWarmGlobalResolve is deliberately conjunctive: only a fully exact
-// initial frontier and deferred tail may replace the final full cross-repo
-// safety sweep. Workspace-slug node stamps happen after those passes and can
-// change cross-workspace eligibility, so any stamp forces the full sweep.
+type warmGlobalResolveAction uint8
+
+const (
+	warmGlobalResolveNone warmGlobalResolveAction = iota
+	warmGlobalResolveContracts
+	warmGlobalResolveFull
+)
+
+// canSkipWarmGlobalResolve requires the three facts that prove the earlier
+// cross-repository work is complete. Branch-selection flags do not strengthen
+// that proof; a node stamp does invalidate it by changing workspace eligibility.
 func canSkipWarmGlobalResolve(s warmGlobalResolveSafety) bool {
-	return s.exactDelta &&
-		s.resolveOK &&
+	return s.resolveOK &&
 		s.deferredExactCrossRepoComplete &&
-		!s.scopeUnknown &&
-		!s.snapshotPartial &&
-		!s.needsRebuild &&
-		!s.forcedFull &&
 		s.backfilledNodes == 0
+}
+
+func selectWarmGlobalResolveAction(anyChanged bool, safety warmGlobalResolveSafety, backfilledContracts int) warmGlobalResolveAction {
+	if safety.backfilledNodes > 0 {
+		return warmGlobalResolveFull
+	}
+	if anyChanged {
+		if canSkipWarmGlobalResolve(safety) {
+			return warmGlobalResolveContracts
+		}
+		return warmGlobalResolveFull
+	}
+	if backfilledContracts > 0 {
+		return warmGlobalResolveContracts
+	}
+	return warmGlobalResolveNone
 }
 
 // warmupFullResolveForced reports whether the operator pinned the warm-restart
