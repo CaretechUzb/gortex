@@ -31,19 +31,26 @@ func captureCFnPointerDispatch(result *parser.ExtractionResult, root *sitter.Nod
 		return
 	}
 	// Pass 1: fn-pointer typedefs.
-	typedefs := cFnPtrTypedefs(root, src)
+	var typedefs map[string]bool
+	root.WithScratch(func() { typedefs = cFnPtrTypedefs(root, src) })
 	// Pass 2: struct fn-pointer fields (ordered fields + fn-ptr set).
-	fields := cStructFnPtrFields(root, src, typedefs)
+	var fields map[string]*structFields
+	root.WithScratch(func() { fields = cStructFnPtrFields(root, src, typedefs) })
 	if len(fields) == 0 {
 		return
 	}
 	// Variable → struct type (file scope), for dispatch receiver inference.
-	varTypes := cVarStructTypes(root, src)
+	var varTypes map[string]string
+	root.WithScratch(func() { varTypes = cVarStructTypes(root, src) })
 
 	// Pass 3: registrations (initializers + assignments).
-	cEmitRegistrations(result, root, filePath, src, fields, varTypes)
+	root.WithScratch(func() {
+		cEmitRegistrations(result, root, filePath, src, fields, varTypes)
+	})
 	// Pass 4: dispatch sites.
-	cEmitDispatch(result, root, filePath, src, fields, varTypes)
+	root.WithScratch(func() {
+		cEmitDispatch(result, root, filePath, src, fields, varTypes)
+	})
 }
 
 // structFields holds a struct's ordered field names and its fn-pointer set.

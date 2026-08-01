@@ -126,51 +126,55 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	seen := make(map[string]bool)
 	var calls []cppDeferredCall
 
-	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
-		switch {
+	// The query and inline class/body walks emit graph values and scalar
+	// deferred calls only; no tree-sitter wrapper escapes this pass.
+	root.WithScratch(func() {
+		parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
+			switch {
 
-		case m.Captures["ns.def"] != nil:
-			e.emitNamespace(m, filePath, fileID, result)
+			case m.Captures["ns.def"] != nil:
+				e.emitNamespace(m, filePath, fileID, result)
 
-		case m.Captures["class.def"] != nil:
-			e.emitClass(m, filePath, fileID, src, result, seen)
+			case m.Captures["class.def"] != nil:
+				e.emitClass(m, filePath, fileID, src, result, seen)
 
-		case m.Captures["struct.def"] != nil:
-			e.emitStruct(m, filePath, fileID, src, result, seen)
+			case m.Captures["struct.def"] != nil:
+				e.emitStruct(m, filePath, fileID, src, result, seen)
 
-		case m.Captures["enum.def"] != nil:
-			e.emitEnum(m, filePath, fileID, result, seen)
+			case m.Captures["enum.def"] != nil:
+				e.emitEnum(m, filePath, fileID, result, seen)
 
-		case m.Captures["func.def"] != nil:
-			e.emitFunction(m, filePath, fileID, src, result, seen)
+			case m.Captures["func.def"] != nil:
+				e.emitFunction(m, filePath, fileID, src, result, seen)
 
-		case m.Captures["include.def"] != nil:
-			e.emitInclude(m, filePath, fileID, result)
+			case m.Captures["include.def"] != nil:
+				e.emitInclude(m, filePath, fileID, result)
 
-		case m.Captures["macro.def"] != nil:
-			emitCMacro(m.Captures["macro.def"].Node, false, filePath, fileID, "cpp", src, result, seen)
+			case m.Captures["macro.def"] != nil:
+				emitCMacro(m.Captures["macro.def"].Node, false, filePath, fileID, "cpp", src, result, seen)
 
-		case m.Captures["macrofn.def"] != nil:
-			emitCMacro(m.Captures["macrofn.def"].Node, true, filePath, fileID, "cpp", src, result, seen)
+			case m.Captures["macrofn.def"] != nil:
+				emitCMacro(m.Captures["macrofn.def"].Node, true, filePath, fileID, "cpp", src, result, seen)
 
-		case m.Captures["callm.expr"] != nil:
-			expr := m.Captures["callm.expr"]
-			calls = append(calls, cppDeferredCall{
-				name:     m.Captures["callm.method"].Text,
-				line:     expr.StartLine + 1,
-				isMember: true,
-				receiver: cppCallReceiverText(expr.Node, src),
-				argTypes: extractCppCallArgTypes(expr.Node, src),
-			})
+			case m.Captures["callm.expr"] != nil:
+				expr := m.Captures["callm.expr"]
+				calls = append(calls, cppDeferredCall{
+					name:     m.Captures["callm.method"].Text,
+					line:     expr.StartLine + 1,
+					isMember: true,
+					receiver: cppCallReceiverText(expr.Node, src),
+					argTypes: extractCppCallArgTypes(expr.Node, src),
+				})
 
-		case m.Captures["call.expr"] != nil:
-			expr := m.Captures["call.expr"]
-			calls = append(calls, cppDeferredCall{
-				name:     m.Captures["call.name"].Text,
-				line:     expr.StartLine + 1,
-				argTypes: extractCppCallArgTypes(expr.Node, src),
-			})
-		}
+			case m.Captures["call.expr"] != nil:
+				expr := m.Captures["call.expr"]
+				calls = append(calls, cppDeferredCall{
+					name:     m.Captures["call.name"].Text,
+					line:     expr.StartLine + 1,
+					argTypes: extractCppCallArgTypes(expr.Node, src),
+				})
+			}
+		})
 	})
 
 	// Resolve call edges against funcRanges.
@@ -182,14 +186,18 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	// enclosing function/method via funcRanges. Member/field type-uses
 	// are attributed to the owning class/struct node during the body
 	// walk above, so they're already in result.Edges.
-	collectCppTypeUseEdges(root, funcRanges, filePath, src, result)
+	root.WithScratch(func() {
+		collectCppTypeUseEdges(root, funcRanges, filePath, src, result)
+	})
 
 	// Emit the remaining reference forms a type can appear in beyond a
 	// declaration position: construction (new / stack), base-class
 	// inheritance, casts, and Capitalized scope/static access. These are
 	// EdgeInstantiates (construction) and EdgeReferences with a
 	// ref_context subkind (inherit / cast / static_access).
-	emitCppReferenceForms(root, src, filePath, fileID, funcRanges, result)
+	root.WithScratch(func() {
+		emitCppReferenceForms(root, src, filePath, fileID, funcRanges, result)
+	})
 
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
@@ -217,7 +225,7 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	}
 
 	captureCFnPointerDispatch(result, root, filePath, src)
-	captureFnValueCandidates(result, root, filePath, src)
+	root.WithScratch(func() { captureFnValueCandidates(result, root, filePath, src) })
 
 	return result, nil
 }
