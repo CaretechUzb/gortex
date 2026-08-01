@@ -2,12 +2,46 @@ package store_sqlite
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
 )
+
+func openScopedProjectionTestStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), "scoped.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func scopedProjectionPlan(t *testing.T, store *Store, query string, args ...any) string {
+	t.Helper()
+	rows, err := store.db.Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(detail)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return plan.String()
+}
 
 func TestScopedProjectionKeysetPagesRepositoryAndFileRows(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "scoped-projection.sqlite"))
@@ -228,5 +262,118 @@ func TestScopedProjectionMultiKindStreamsEveryKind(t *testing.T) {
 	}
 	if empty != 0 {
 		t.Fatalf("all-empty kinds yielded %d rows, want none", empty)
+	}
+}
+
+func TestScopedEdgeProjectionPlansStayInsideRequestedFiles(t *testing.T) {
+	store := openScopedProjectionTestStore(t)
+	for _, tc := range []struct {
+		name     string
+		query    string
+		args     []any
+		required []string
+	}{
+		func() struct {
+			name     string
+			query    string
+			args     []any
+			required []string
+		} {
+			query, args, ok := scopedEdgeProjectionQuery(
+				[]string{"repo"}, []string{"pkg/caller.go"}, string(graph.EdgeCalls),
+			)
+			if !ok {
+				t.Fatal("canonical file query was not built")
+			}
+			return struct {
+				name     string
+				query    string
+				args     []any
+				required []string
+			}{"canonical", query, args, []string{"edges_by_file"}}
+		}(),
+		func() struct {
+			name     string
+			query    string
+			args     []any
+			required []string
+		} {
+			query, args, ok := scopedEdgeSourceProjectionQuery(
+				[]string{"repo"}, []string{"pkg/caller.go"}, string(graph.EdgeCalls),
+			)
+			if !ok {
+				t.Fatal("source fallback query was not built")
+			}
+			return struct {
+				name     string
+				query    string
+				args     []any
+				required []string
+			}{"source fallback", query, args, []string{"nodes_by_file", "edges_by_from"}}
+		}(),
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append(append([]any(nil), tc.args...), int64(0), int64(math.MaxInt64), scopedProjectionPage)
+			plan := scopedProjectionPlan(t, store, tc.query, args...)
+			for _, required := range tc.required {
+				if !strings.Contains(plan, required) {
+					t.Fatalf("query plan missing %s:\n%s", required, plan)
+				}
+			}
+			if strings.Contains(plan, "SCAN e") || strings.Contains(plan, "SCAN n") {
+				t.Fatalf("query plan contains an unbounded table scan:\n%s", plan)
+			}
+		})
+	}
+}
+
+func TestScopedEdgeProjectionFallsBackForMalformedFileProvenance(t *testing.T) {
+	store := openScopedProjectionTestStore(t)
+	const (
+		repo       = "repo"
+		callerPath = "pkg/caller.go"
+		otherPath  = "pkg/other.go"
+		callerID   = "repo/pkg/caller.go::Caller"
+		otherID    = "repo/pkg/other.go::Other"
+	)
+	store.AddBatch([]*graph.Node{
+		{ID: callerID, Kind: graph.KindFunction, Name: "Caller", FilePath: callerPath, RepoPrefix: repo},
+		{ID: otherID, Kind: graph.KindFunction, Name: "Other", FilePath: otherPath, RepoPrefix: repo},
+	}, []*graph.Edge{
+		{From: callerID, To: "unresolved::Canonical", Kind: graph.EdgeCalls, FilePath: callerPath, Line: 1},
+		{From: callerID, To: "unresolved::Malformed", Kind: graph.EdgeReferences, FilePath: "", Line: 2},
+	})
+
+	noise := make([]*graph.Edge, 0, 1024)
+	for i := 0; i < cap(noise); i++ {
+		noise = append(noise, &graph.Edge{
+			From: otherID, To: fmt.Sprintf("unresolved::Noise%04d", i),
+			Kind: graph.EdgeCalls, FilePath: otherPath, Line: i + 1,
+		})
+	}
+	store.AddBatch(nil, noise)
+
+	var maxID int64
+	if err := store.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM edges`).Scan(&maxID); err != nil {
+		t.Fatal(err)
+	}
+	if store.scopedEdgeFileProvenanceCanonical(
+		[]string{repo}, []string{callerPath},
+		[]string{string(graph.EdgeCalls), string(graph.EdgeReferences)}, maxID,
+	) {
+		t.Fatal("malformed edge provenance was accepted as canonical")
+	}
+
+	got := make(map[string]bool)
+	for row := range store.EdgesInScopeSeq(
+		[]string{repo}, []string{callerPath}, graph.EdgeCalls, graph.EdgeReferences,
+	) {
+		if row.Edge == nil || row.Source == nil {
+			t.Fatalf("incomplete scoped row: %#v", row)
+		}
+		got[row.Edge.To] = true
+	}
+	if len(got) != 2 || !got["unresolved::Canonical"] || !got["unresolved::Malformed"] {
+		t.Fatalf("scoped targets = %v, want canonical and malformed", got)
 	}
 }
