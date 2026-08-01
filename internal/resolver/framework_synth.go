@@ -1199,7 +1199,7 @@ func runFrameworkSynthesizersScoped(
 	// resolved placeholder downstream. Bridge synthesizers are exempt.
 	gateStart := time.Now()
 	if frameworkFamilyGateNeeded(executionScope, candidates) {
-		rep.Gated = applyFrameworkFamilyGateScoped(g, executionScope)
+		rep.Gated = applyFrameworkFamilyGateScopedForFiles(g, executionScope, filePaths)
 	}
 	rep.GateMillis = time.Since(gateStart).Milliseconds()
 	// Claiming resolvers run last — after every framework synthesizer has

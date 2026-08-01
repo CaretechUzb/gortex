@@ -18,21 +18,23 @@ import (
 // edge-source hydration and changed-file adjacency batching.
 type frameworkScopeTrapStore struct {
 	graph.Store
-	globalNodeScans int
-	globalEdgeScans int
-	allNodeScans    int
-	allEdgeScans    int
-	repoEdgeScans   int
-	scopedNodeScans int
-	scopedEdgeScans int
-	scopedLightScan int
-	pointNodes      int
-	pointInEdges    int
-	pointOutEdges   int
-	batchNodes      int
-	batchInEdges    int
-	batchOutEdges   int
-	batchNames      int
+	globalNodeScans   int
+	globalEdgeScans   int
+	allNodeScans      int
+	allEdgeScans      int
+	repoEdgeScans     int
+	repoKindEdgeScans int
+	repoKindNodeScans int
+	scopedNodeScans   int
+	scopedEdgeScans   int
+	scopedLightScan   int
+	pointNodes        int
+	pointInEdges      int
+	pointOutEdges     int
+	batchNodes        int
+	batchInEdges      int
+	batchOutEdges     int
+	batchNames        int
 }
 
 func (s *frameworkScopeTrapStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
@@ -122,6 +124,7 @@ func (s *frameworkScopeTrapStore) RepoEdgesByKinds(
 	repos []string,
 	kinds []graph.EdgeKind,
 ) []graph.RepoEdgeRow {
+	s.repoKindEdgeScans++
 	return graph.ReadRepoEdgesByKinds(s.Store, repos, kinds)
 }
 
@@ -129,6 +132,7 @@ func (s *frameworkScopeTrapStore) RepoNodeIDsByKinds(
 	repos []string,
 	kinds []graph.NodeKind,
 ) []string {
+	s.repoKindNodeScans++
 	return graph.ReadRepoNodeIDsByKinds(s.Store, repos, kinds)
 }
 
@@ -297,6 +301,34 @@ func TestRunFrameworkSynthesizersScopedForFilesHasNoLegacyGlobalFallback(t *test
 
 	requireNoFrameworkGlobalScans(t, trap)
 	require.Equal(t, 1, trap.scopedLightScan, "candidate census must be one scoped stream")
+}
+
+func TestFrameworkFamilyGateForFilesUsesExactFrontier(t *testing.T) {
+	g := graph.New()
+	dropSource := frameworkTestNode("a", "a/changed.java", "a::drop", graph.KindMethod, "drop", "java", nil)
+	keepSource := frameworkTestNode("a", "a/changed.java", "a::keep", graph.KindMethod, "keep", "java", nil)
+	unrelatedSource := frameworkTestNode("a", "a/unrelated.java", "a::unrelated", graph.KindMethod, "unrelated", "java", nil)
+	webTarget := frameworkTestNode("a", "a/web.ts", "a::web", graph.KindFunction, "web", "typescript", nil)
+	jvmTarget := frameworkTestNode("a", "a/jvm.kt", "a::jvm", graph.KindMethod, "jvm", "kotlin", nil)
+	g.AddBatch([]*graph.Node{dropSource, keepSource, unrelatedSource, webTarget, jvmTarget}, []*graph.Edge{
+		{From: dropSource.ID, To: webTarget.ID, Kind: graph.EdgeReferences, FilePath: dropSource.FilePath, Meta: map[string]any{MetaSynthesizedBy: "test"}},
+		{From: keepSource.ID, To: jvmTarget.ID, Kind: graph.EdgeReferences, FilePath: keepSource.FilePath, Meta: map[string]any{MetaSynthesizedBy: "test"}},
+		{From: unrelatedSource.ID, To: webTarget.ID, Kind: graph.EdgeReferences, FilePath: unrelatedSource.FilePath, Meta: map[string]any{MetaSynthesizedBy: "test"}},
+	})
+	trap := &frameworkScopeTrapStore{Store: g}
+
+	require.Equal(t, 1, applyFrameworkFamilyGateScopedForFiles(
+		trap,
+		map[string]bool{"a": true},
+		[]string{"a/changed.java"},
+	))
+
+	require.Empty(t, g.GetOutEdges(dropSource.ID), "changed cross-family result must be removed")
+	require.Len(t, g.GetOutEdges(keepSource.ID), 1, "same-family result must remain")
+	require.Len(t, g.GetOutEdges(unrelatedSource.ID), 1, "unrelated file must not be rescanned")
+	require.Equal(t, 1, trap.scopedEdgeScans, "gate must use one exact scoped projection")
+	require.Zero(t, trap.repoKindEdgeScans, "exact frontier must not scan repository edge kinds")
+	requireNoFrameworkGlobalScans(t, trap)
 }
 
 func TestFrameworkScopedStoreLargeRepoOneFileRetainsBoundedRows(t *testing.T) {
