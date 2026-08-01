@@ -279,20 +279,22 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	if len(families) == 0 {
 		return 0
 	}
-	callEdges := frameworkEdgesByKinds(g, graph.EdgeCalls)
+	// Every call that can affect interface dispatch targets a known family
+	// member. Read only those incoming adjacency lists, even for a full pass,
+	// instead of decoding the repository's entire calls corpus.
+	callSeen := make(map[graph.EdgeIdentity]struct{})
+	var callEdges []*graph.Edge
 	if scope != nil {
-		callEdges = nil
-		callSeen := make(map[graph.EdgeIdentity]struct{})
 		callEdges = appendUniqueFrameworkEdges(callEdges, callSeen, scopedSourceCalls...)
-		familyMemberIDs := make([]string, 0, len(famsOfMember))
-		for id := range famsOfMember {
-			familyMemberIDs = append(familyMemberIDs, id)
-		}
-		for _, incoming := range g.GetInEdgesByNodeIDs(familyMemberIDs) {
-			for _, edge := range incoming {
-				if edge != nil && edge.Kind == graph.EdgeCalls {
-					callEdges = appendUniqueFrameworkEdges(callEdges, callSeen, edge)
-				}
+	}
+	familyMemberIDs := make([]string, 0, len(famsOfMember))
+	for id := range famsOfMember {
+		familyMemberIDs = append(familyMemberIDs, id)
+	}
+	for _, incoming := range g.GetInEdgesByNodeIDs(familyMemberIDs) {
+		for _, edge := range incoming {
+			if edge != nil && edge.Kind == graph.EdgeCalls {
+				callEdges = appendUniqueFrameworkEdges(callEdges, callSeen, edge)
 			}
 		}
 	}
