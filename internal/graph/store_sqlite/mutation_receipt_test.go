@@ -71,18 +71,132 @@ func TestSQLiteMutationReceiptIdempotentAndAttributeOnlyWritesAreNeutral(t *test
 	}
 }
 
-func TestSQLiteMutationReceiptIdentityChangingUpsertFailsClosed(t *testing.T) {
+func TestSQLiteMutationReceiptIdentityChangingUpsertCapturesExactFrontier(t *testing.T) {
+	const id = "repo/a.go::A"
+	tests := []struct {
+		name      string
+		before    graph.Node
+		after     graph.Node
+		wantFiles []string
+		wantNames []string
+	}{
+		{
+			name:      "rename",
+			before:    graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			after:     graph.Node{ID: id, Kind: graph.KindFunction, Name: "Renamed", QualName: "pkg.Renamed", FilePath: "a.go", RepoPrefix: "repo"},
+			wantFiles: []string{"a.go"},
+			wantNames: []string{"A", "pkg.A", "Renamed", "pkg.Renamed"},
+		},
+		{
+			name:      "move",
+			before:    graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			after:     graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "b.go", RepoPrefix: "repo"},
+			wantFiles: []string{"a.go", "b.go"},
+			wantNames: []string{"A", "pkg.A"},
+		},
+		{
+			name:      "referenceable kind transition",
+			before:    graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			after:     graph.Node{ID: id, Kind: graph.KindMethod, Name: "A", QualName: "pkg.T.A", FilePath: "a.go", RepoPrefix: "repo"},
+			wantFiles: []string{"a.go"},
+			wantNames: []string{"A", "pkg.A", "pkg.T.A"},
+		},
+		{
+			name:      "gains referenceability",
+			before:    graph.Node{ID: id, Kind: graph.KindFile, Name: "source", FilePath: "a.go", RepoPrefix: "repo"},
+			after:     graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			wantFiles: []string{"a.go"},
+			wantNames: []string{"source", "A", "pkg.A"},
+		},
+		{
+			name:      "loses referenceability",
+			before:    graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			after:     graph.Node{ID: id, Kind: graph.KindFile, Name: "source", FilePath: "a.go", RepoPrefix: "repo"},
+			wantFiles: []string{"a.go"},
+			wantNames: []string{"A", "pkg.A", "source"},
+		},
+		{
+			name:      "repository transition",
+			before:    graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "old/a.go", RepoPrefix: "old"},
+			after:     graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "new/a.go", RepoPrefix: "new"},
+			wantFiles: []string{"new/a.go", "old/a.go"},
+			wantNames: []string{"A", "pkg.A"},
+		},
+		{
+			name:      "missing nonreferenceable side file remains exact",
+			before:    graph.Node{ID: id, Kind: graph.KindFile, Name: "source", RepoPrefix: "repo"},
+			after:     graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			wantFiles: []string{"a.go"},
+			wantNames: []string{"source", "A", "pkg.A"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := openMutationReceiptStore(t)
+			store.AddNode(&tt.before)
+
+			token := store.BeginMutationReceipt()
+			store.AddNode(&tt.after)
+			receipt := store.EndMutationReceipt(token)
+			if !receipt.Complete || !receipt.ResolutionRelevant {
+				t.Fatalf("identity-changing UPSERT receipt = %+v, want complete resolution delta", receipt)
+			}
+			if !slices.Equal(receipt.ResolutionFiles(), tt.wantFiles) {
+				t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), tt.wantFiles)
+			}
+			assertSQLiteReceiptContains(t, "target ids", receipt.TargetIDs, id)
+			assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, tt.wantNames...)
+		})
+	}
+}
+
+func TestSQLiteMutationReceiptNonreferenceableIdentityChangeIsNeutral(t *testing.T) {
 	store := openMutationReceiptStore(t)
-	store.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"})
+	const id = "repo/a.go"
+	store.AddNode(&graph.Node{ID: id, Kind: graph.KindFile, Name: "old", FilePath: "a.go", RepoPrefix: "repo"})
 
 	token := store.BeginMutationReceipt()
-	store.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "Renamed", QualName: "pkg.Renamed", FilePath: "a.go", RepoPrefix: "repo"})
+	store.AddNode(&graph.Node{ID: id, Kind: graph.KindFile, Name: "new", FilePath: "b.go", RepoPrefix: "other"})
 	receipt := store.EndMutationReceipt(token)
-	if receipt.Complete {
-		t.Fatalf("identity-changing UPSERT returned complete receipt: %+v", receipt)
+	if !receipt.Complete || receipt.ResolutionRelevant || len(receipt.ResolutionFiles()) != 0 {
+		t.Fatalf("nonreferenceable identity change receipt = %+v, want complete and resolution-irrelevant", receipt)
 	}
-	if receipt.IncompleteReason != "node_identity_changed" {
-		t.Fatalf("incomplete reason = %q, want node_identity_changed", receipt.IncompleteReason)
+}
+
+func TestSQLiteMutationReceiptIdentityChangeMissingReferenceableFileFailsClosed(t *testing.T) {
+	const id = "repo/a.go::A"
+	tests := []struct {
+		name   string
+		before graph.Node
+		after  graph.Node
+	}{
+		{
+			name:   "old identity file missing",
+			before: graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", RepoPrefix: "repo"},
+			after:  graph.Node{ID: id, Kind: graph.KindFunction, Name: "Renamed", QualName: "pkg.Renamed", FilePath: "a.go", RepoPrefix: "repo"},
+		},
+		{
+			name:   "final identity file missing",
+			before: graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			after:  graph.Node{ID: id, Kind: graph.KindFunction, Name: "Renamed", QualName: "pkg.Renamed", RepoPrefix: "repo"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := openMutationReceiptStore(t)
+			store.AddNode(&tt.before)
+			token := store.BeginMutationReceipt()
+			store.AddNode(&tt.after)
+			receipt := store.EndMutationReceipt(token)
+			if receipt.Complete || !receipt.ResolutionRelevant {
+				t.Fatalf("missing-file identity change receipt = %+v, want incomplete resolution delta", receipt)
+			}
+			if receipt.IncompleteReason != "node_identity_change_without_exact_file" {
+				t.Fatalf("incomplete reason = %q, want node_identity_change_without_exact_file", receipt.IncompleteReason)
+			}
+		})
 	}
 }
 

@@ -668,7 +668,7 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 				if inputCounts[id] > 1 {
 					receiptDelta.noteIncomplete("duplicate_node_batch")
 				} else {
-					receiptDelta.noteIncomplete("node_identity_changed")
+					recordSQLiteChangedNodeIdentity(receiptDelta, oldIdentity, node)
 				}
 			}
 		}
