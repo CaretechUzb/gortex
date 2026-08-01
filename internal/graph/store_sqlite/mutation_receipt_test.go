@@ -77,8 +77,31 @@ func TestSQLiteMutationReceiptIdentityChangingUpsertFailsClosed(t *testing.T) {
 
 	token := store.BeginMutationReceipt()
 	store.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "Renamed", QualName: "pkg.Renamed", FilePath: "a.go", RepoPrefix: "repo"})
-	if receipt := store.EndMutationReceipt(token); receipt.Complete {
+	receipt := store.EndMutationReceipt(token)
+	if receipt.Complete {
 		t.Fatalf("identity-changing UPSERT returned complete receipt: %+v", receipt)
+	}
+	if receipt.IncompleteReason != "node_identity_changed" {
+		t.Fatalf("incomplete reason = %q, want node_identity_changed", receipt.IncompleteReason)
+	}
+}
+
+func TestSQLiteMutationReceiptDuplicateNodeBatchNamesIncompleteReason(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	const id = "repo/a.go::A"
+	store.AddNode(&graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"})
+
+	token := store.BeginMutationReceipt()
+	store.AddBatch([]*graph.Node{
+		{ID: id, Kind: graph.KindFunction, Name: "FirstRename", QualName: "pkg.FirstRename", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: id, Kind: graph.KindFunction, Name: "FinalRename", QualName: "pkg.FinalRename", FilePath: "a.go", RepoPrefix: "repo"},
+	}, nil)
+	receipt := store.EndMutationReceipt(token)
+	if receipt.Complete {
+		t.Fatalf("identity-changing duplicate batch returned complete receipt: %+v", receipt)
+	}
+	if receipt.IncompleteReason != "duplicate_node_batch" {
+		t.Fatalf("incomplete reason = %q, want duplicate_node_batch", receipt.IncompleteReason)
 	}
 }
 

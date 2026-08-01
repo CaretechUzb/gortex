@@ -661,17 +661,17 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 				// RETURNING identifies every changed ID but cannot identify which
 				// duplicate occurrence was a no-op. Fail closed while retaining the
 				// useful final definition frontier.
-				receiptDelta.complete = false
+				receiptDelta.noteIncomplete("duplicate_node_batch")
 				receiptDelta.resolutionRelevant = true
 				if !oldFound && changedCount > 0 {
 					recordSQLiteAddedNode(receiptDelta, node)
 				}
 			} else if !identityExact {
-				receiptDelta.complete = false
+				receiptDelta.noteIncomplete("node_identity_preload_failed")
 			} else if !oldFound {
 				recordSQLiteAddedNode(receiptDelta, node)
 			} else if !oldIdentity.equalsNode(node) {
-				receiptDelta.complete = false
+				receiptDelta.noteIncomplete("node_identity_changed")
 			}
 		}
 		for id, node := range lastNodes {
@@ -703,7 +703,7 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 				if source, found := identities[edge.From]; found {
 					file = source.filePath
 				} else if !identityExact {
-					receiptDelta.complete = false
+					receiptDelta.noteIncomplete("edge_source_identity_preload_failed")
 				}
 			}
 			recordSQLiteAddedEdge(receiptDelta, edge, file)
