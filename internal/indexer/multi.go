@@ -1921,13 +1921,16 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 	for _, repo := range resolved {
 		prefixes = append(prefixes, repo.prefix)
 	}
+	// Freeze one batch-mode generation before acquiring any stable repository
+	// lane. This global gate -> sorted lanes order prevents a queued transition
+	// writer from owning the gate while waiting for a lane held by this batch.
+	mi.batchMutationGate.RLock()
+	defer mi.batchMutationGate.RUnlock()
+
 	var finalResults map[string]*IndexResult
 	laneErr := mi.withRepositoryMutationLanes(context.Background(), prefixes, func() error {
-		// Freeze one batch-mode generation only after every stable repository
-		// lane is held. The one topology writer then covers parse, publication,
-		// deferred/cross-repo tails, ref-facts, and global derivation.
-		mi.batchMutationGate.RLock()
-		defer mi.batchMutationGate.RUnlock()
+		// The one topology writer covers parse, publication, deferred/cross-repo
+		// tails, ref-facts, and global derivation.
 		batchMode := mi.currentBatchMode()
 		finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 		defer finishTopologyMutation(true)
@@ -3068,11 +3071,11 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 		return 0, 0
 	}
 
-	// The lane is now closed and drained, so taking the transition read side
-	// cannot invert the usual lane -> gate order. Retain it through exact-
-	// generation validation, graph/config purge, contract reconciliation, and
-	// conditional detach; EndBatch and direct global passes see either the
-	// complete repository or its complete absence.
+	// The lane is now closed and drained, so no new admission can cross this
+	// teardown while it takes the transition read side. Retain that admission
+	// through exact-generation validation, graph/config purge, contract
+	// reconciliation, and conditional detach; EndBatch and direct global passes
+	// see either the complete repository or its complete absence.
 	mi.batchMutationGate.RLock()
 	defer mi.batchMutationGate.RUnlock()
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
