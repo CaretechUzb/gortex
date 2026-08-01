@@ -11,12 +11,13 @@ import (
 
 const largeDirectAdmissionCapacity int64 = 1
 
-// largeDirectAdmissionBudget bounds complete repository parse phases. The
-// existing parseAdmissionBudget controls live source bytes per file, but it
-// cannot see graph batches, native parser high-water, or allocator retention
-// accumulated across a whole repository. Every full-tree parse therefore takes
-// the one process-wide slot; its internal parser workers still run concurrently.
-// Scoped incremental reconciliation never enters this gate.
+// largeDirectAdmissionBudget bounds intrinsically large repository parses that
+// stream directly into a durable store. The existing parseAdmissionBudget
+// controls live source bytes per file, but it cannot see graph batches, native
+// parser high-water, or allocator retention accumulated across a whole large
+// repository. Small repositories, in-memory shadows, and bounded streaming
+// parses remain concurrent. Scoped incremental reconciliation never enters this
+// gate.
 type largeDirectAdmissionBudget struct {
 	capacity int64
 	gate     *semaphore.Weighted
@@ -50,18 +51,24 @@ func newLargeDirectAdmissionBudget(capacity int64) *largeDirectAdmissionBudget {
 	return budget
 }
 
-// largeDirectParseAdmissionWeight admits every non-empty full-repository parse.
-// Store shape, streaming mode, and intrinsic size no longer bypass this gate:
-// even an individually ordinary shadow retains graph and native-parser state
-// that amplifies when several repositories overlap. Per-file parser admission
-// remains independent inside the admitted repository.
+// largeDirectParseAdmissionWeight admits only full parses whose store and
+// intrinsic size can accumulate a repository-scale retained heap. In-memory
+// shadows are already covered by shadow admission, and streaming flushes bound
+// their graph batches, so both stay parallel. Small repositories also remain
+// parallel to preserve cold-start throughput.
 func largeDirectParseAdmissionWeight(
-	_ graph.Store,
-	_ bool,
+	store graph.Store,
+	streaming bool,
 	files int,
-	_ int64,
+	inputBytes int64,
 ) int64 {
-	if files <= 0 {
+	if files <= 0 || streaming {
+		return 0
+	}
+	if _, directStore := store.(graph.BulkLoader); !directStore {
+		return 0
+	}
+	if !largeDirectParseNeedsHeapRelease(true, files, inputBytes) {
 		return 0
 	}
 	return largeDirectAdmissionCapacity

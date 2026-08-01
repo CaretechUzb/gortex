@@ -12,22 +12,16 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-type directAdmissionTestStore struct {
+type admissionBulkStore struct {
 	graph.Store
 }
 
-func (*directAdmissionTestStore) BulkSetFileMtimes(string, map[string]int64) error {
-	return nil
-}
+func (*admissionBulkStore) BeginBulkLoad()   {}
+func (*admissionBulkStore) FlushBulk() error { return nil }
 
-func TestLargeDirectParseAdmissionWeightSerializesEveryFullRepository(t *testing.T) {
-	direct := &directAdmissionTestStore{Store: graph.New()}
-	inMemory := graph.New()
-
-	// Store shape, streaming mode, and operator shadow thresholds must not let
-	// a non-empty full-tree parse overlap another repository's parse phase.
-	t.Setenv("GORTEX_SHADOW_MAX_FILES", "1")
-	t.Setenv("GORTEX_SHADOW_MAX_BYTES", "1")
+func TestLargeDirectParseAdmissionWeightPreservesBoundedParallelism(t *testing.T) {
+	memoryStore := graph.New()
+	durableStore := &admissionBulkStore{Store: graph.New()}
 
 	tests := []struct {
 		name       string
@@ -37,42 +31,12 @@ func TestLargeDirectParseAdmissionWeightSerializesEveryFullRepository(t *testing
 		inputBytes int64
 		want       int64
 	}{
-		{
-			name:       "ordinary direct repository takes capacity",
-			store:      direct,
-			files:      defaultShadowMaxFileCount - 1,
-			inputBytes: defaultShadowMaxBytes - 1,
-			want:       largeDirectAdmissionCapacity,
-		},
-		{
-			name:       "large direct repository takes capacity",
-			store:      direct,
-			files:      defaultShadowMaxFileCount,
-			inputBytes: defaultShadowMaxBytes,
-			want:       largeDirectAdmissionCapacity,
-		},
-		{
-			name:  "in-memory shadow takes capacity",
-			store: inMemory,
-			files: 1,
-			want:  largeDirectAdmissionCapacity,
-		},
-		{
-			name:      "streaming shadow takes capacity",
-			store:     direct,
-			streaming: true,
-			files:     1,
-			want:      largeDirectAdmissionCapacity,
-		},
-		{
-			name:  "nil store still takes capacity",
-			files: 1,
-			want:  largeDirectAdmissionCapacity,
-		},
-		{
-			name:  "empty repository bypasses",
-			store: direct,
-		},
+		{name: "empty durable parse", store: durableStore},
+		{name: "small durable parse", store: durableStore, files: 1, inputBytes: 1},
+		{name: "large in-memory shadow", store: memoryStore, files: defaultShadowMaxFileCount, inputBytes: defaultShadowMaxBytes},
+		{name: "large streaming parse", store: durableStore, streaming: true, files: defaultShadowMaxFileCount, inputBytes: defaultShadowMaxBytes},
+		{name: "large durable file count", store: durableStore, files: defaultShadowMaxFileCount, want: largeDirectAdmissionCapacity},
+		{name: "large durable byte count", store: durableStore, files: 1, inputBytes: defaultShadowMaxBytes, want: largeDirectAdmissionCapacity},
 	}
 
 	for _, tt := range tests {
