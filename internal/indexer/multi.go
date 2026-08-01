@@ -945,6 +945,9 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 	if err := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone); err != nil {
 		return err
 	}
+	// Stamp legacy nodes after master resolution so synthetic nodes created by
+	// attribution participate in the cross-workspace boundary check below.
+	mi.BackfillWorkspaceSlugs()
 	// Cross-repo references resolve here so a multi-repo workspace is fully
 	// resolved, not just within each repo. Whole-graph so inbound references
 	// from unchanged repos into the changed repos bind too.
@@ -967,6 +970,17 @@ func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []st
 	}
 	if onComputeDone != nil {
 		onComputeDone()
+	}
+	// A legacy workspace stamp may change the eligibility of unresolved edges
+	// anywhere in the graph, not only in this exact file frontier. Escalate the
+	// cross-repo phase only for that one-time migration; an already-stamped
+	// graph retains the bounded outgoing/incoming file pass.
+	nodesStamped, _ := mi.BackfillWorkspaceSlugs()
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if nodesStamped > 0 {
+		return mi.runCrossRepoResolveContext(ctx, false)
 	}
 	mi.runCrossRepoResolveFiles(files)
 	return context.Cause(ctx)
