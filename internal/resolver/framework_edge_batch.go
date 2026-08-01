@@ -232,6 +232,44 @@ func (s *frameworkEdgeBatchStore) GetInEdgesByNodeIDs(ids []string) map[string][
 	return out
 }
 
+func (s *frameworkEdgeBatchStore) GetInEdgeIdentitiesByNodeIDs(
+	ids []string,
+) map[string][]graph.EdgeIdentity {
+	base := graph.InEdgeIdentitiesByNodeIDs(s.Store, ids)
+	out := make(map[string][]graph.EdgeIdentity, len(ids))
+	for _, id := range dedupeFrameworkIDs(ids) {
+		seen := make(map[graph.EdgeIdentity]struct{}, len(base[id])+len(s.staged))
+		for _, identity := range base[id] {
+			if _, duplicate := seen[identity]; duplicate {
+				continue
+			}
+			seen[identity] = struct{}{}
+			if staged, exists := s.staged[identity]; exists {
+				if staged != nil && staged.To == id && graph.EdgeIdentityFor(staged) == identity {
+					out[id] = append(out[id], identity)
+				}
+				continue
+			}
+			if identity.To == id {
+				out[id] = append(out[id], identity)
+			}
+		}
+		for _, identity := range s.order {
+			if _, duplicate := seen[identity]; duplicate {
+				continue
+			}
+			seen[identity] = struct{}{}
+			if staged := s.staged[identity]; staged != nil && staged.To == id && graph.EdgeIdentityFor(staged) == identity {
+				out[id] = append(out[id], identity)
+			}
+		}
+		if len(out[id]) == 0 {
+			delete(out, id)
+		}
+	}
+	return out
+}
+
 func (s *frameworkEdgeBatchStore) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
 	return s.mergeEdgeSeq(s.Store.EdgesByKind(kind), func(edge *graph.Edge) bool {
 		return edge.Kind == kind
@@ -649,4 +687,5 @@ var (
 	_ graph.ConstantValueReader       = (*frameworkEdgeBatchStore)(nil)
 	_ graph.MemberMethodsByType       = (*frameworkEdgeBatchStore)(nil)
 	_ graph.EdgeIdentityBatchFinder   = (*frameworkEdgeBatchStore)(nil)
+	_ graph.InEdgeIdentityBatchReader = (*frameworkEdgeBatchStore)(nil)
 )

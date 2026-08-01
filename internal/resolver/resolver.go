@@ -2295,13 +2295,30 @@ func (r *Resolver) pendingEdgesForFileAndIncoming(filePath string) []*graph.Edge
 // calls: one batched file-node read, one outgoing-adjacency read, and one
 // incoming-stub read. Backends may chunk each request at their bind limit.
 func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementalFileFrontier {
-	return collectIncrementalFileFrontier(r.graph, filePaths, r.incrementalSkipped)
+	return collectIncrementalFileFrontierForPreparation(r.graph, filePaths, r.incrementalSkipped)
 }
 
 func collectIncrementalFileFrontier(
 	g graph.Store,
 	filePaths []string,
 	skip func(*graph.Edge) bool,
+) incrementalFileFrontier {
+	return collectIncrementalFileFrontierMode(g, filePaths, skip, false)
+}
+
+func collectIncrementalFileFrontierForPreparation(
+	g graph.Store,
+	filePaths []string,
+	skip func(*graph.Edge) bool,
+) incrementalFileFrontier {
+	return collectIncrementalFileFrontierMode(g, filePaths, skip, true)
+}
+
+func collectIncrementalFileFrontierMode(
+	g graph.Store,
+	filePaths []string,
+	skip func(*graph.Edge) bool,
+	lightweightIncoming bool,
 ) incrementalFileFrontier {
 	var frontier incrementalFileFrontier
 	if g == nil {
@@ -2365,11 +2382,28 @@ func collectIncrementalFileFrontier(
 	}
 	// The unresolved target string is the incoming-edge bucket key even when
 	// no node with that ID exists.
-	inByStub := g.GetInEdgesByNodeIDs(frontier.stubKeys)
-	for _, key := range frontier.stubKeys {
-		for _, edge := range inByStub[key] {
-			if edge != nil && graph.IsUnresolvedTarget(edge.To) {
-				frontier.pending = append(frontier.pending, edge)
+	if lightweightIncoming {
+		inByStub := graph.InEdgeIdentitiesByNodeIDs(g, frontier.stubKeys)
+		for _, key := range frontier.stubKeys {
+			for _, identity := range inByStub[key] {
+				if !graph.IsUnresolvedTarget(identity.To) {
+					continue
+				}
+				// Preparation needs only the logical identity. Resolution performs a
+				// fresh full-edge read after forward reindexing has settled.
+				frontier.pending = append(frontier.pending, &graph.Edge{
+					From: identity.From, To: identity.To, Kind: identity.Kind,
+					FilePath: identity.FilePath, Line: identity.Line,
+				})
+			}
+		}
+	} else {
+		inByStub := g.GetInEdgesByNodeIDs(frontier.stubKeys)
+		for _, key := range frontier.stubKeys {
+			for _, edge := range inByStub[key] {
+				if edge != nil && graph.IsUnresolvedTarget(edge.To) {
+					frontier.pending = append(frontier.pending, edge)
+				}
 			}
 		}
 	}

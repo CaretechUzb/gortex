@@ -116,6 +116,19 @@ func (s *lazyResolveCountingStore) ResolveCrossRepo() (int, error)         { ret
 func (s *lazyResolveCountingStore) ResolveUniqueNames() (int, error)       { return 0, nil }
 func (s *lazyResolveCountingStore) ResolveExternalCallStubs() (int, error) { return 0, nil }
 
+func TestPendingNeedsProvidesIndexAcceptsSparsePreparationEdge(t *testing.T) {
+	sparse := &graph.Edge{
+		From: "repo::caller", To: "unresolved::*.Run", Kind: graph.EdgeCalls,
+		FilePath: "repo/caller.cs", Line: 7,
+	}
+	if !pendingNeedsProvidesIndex([]*graph.Edge{sparse}) {
+		t.Fatal("wildcard identity-only preparation edge did not enable provides index")
+	}
+	if pendingNeedsProvidesIndex([]*graph.Edge{{To: "unresolved::Run"}}) {
+		t.Fatal("bare target unexpectedly enabled provides index")
+	}
+}
+
 func TestResolveAllZeroWorkSkipsGlobalIndexesAndBackendBulk(t *testing.T) {
 	store := newLazyResolveCountingStore(graph.New())
 	stats := New(store).ResolveAll()

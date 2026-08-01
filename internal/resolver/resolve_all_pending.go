@@ -149,10 +149,14 @@ func pendingNeedsDepIndex(pending []*graph.Edge) bool {
 
 func pendingNeedsProvidesIndex(pending []*graph.Edge) bool {
 	for _, edge := range pending {
-		if edge == nil || edgeReceiverType(edge) == "" {
+		if edge == nil {
 			continue
 		}
-		if strings.HasPrefix(graph.UnresolvedName(edge.To), "*.") {
+		// Incremental preparation may carry only EdgeIdentity fields. Treat a
+		// wildcard member target as sufficient evidence even when receiver_type
+		// metadata is intentionally deferred to the fresh resolution read.
+		if strings.HasPrefix(graph.UnresolvedName(edge.To), "*.") &&
+			(edge.Meta == nil || edgeReceiverType(edge) != "") {
 			return true
 		}
 	}

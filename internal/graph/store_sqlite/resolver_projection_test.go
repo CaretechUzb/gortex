@@ -128,6 +128,58 @@ func TestNodePlacementsByIDsChunksAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestInEdgeIdentitiesByNodeIDsChunksAndIgnoresMetadata(t *testing.T) {
+	store := openResolverProjectionTestStore(t)
+	const (
+		firstSource  = "repo::first.go::source"
+		firstTarget  = "unresolved::first"
+		secondSource = "repo::second.go::source"
+		secondTarget = "unresolved::second"
+	)
+	store.AddBatch([]*graph.Node{
+		{ID: firstSource, Kind: graph.KindFunction, Name: "first", FilePath: "repo::first.go", RepoPrefix: "repo"},
+		{ID: secondSource, Kind: graph.KindFunction, Name: "second", FilePath: "repo::second.go", RepoPrefix: "repo"},
+	}, []*graph.Edge{
+		{From: firstSource, To: firstTarget, Kind: graph.EdgeCalls, FilePath: "repo::first.go", Line: 7, Meta: map[string]any{"large": make([]byte, 1<<20)}},
+		{From: firstSource, To: firstTarget, Kind: graph.EdgeReferences, FilePath: "repo::first.go", Line: 8, Meta: map[string]any{"large": make([]byte, 1<<20)}},
+		{From: secondSource, To: secondTarget, Kind: graph.EdgeCalls, FilePath: "repo::second.go", Line: 9, Meta: map[string]any{"large": make([]byte, 1<<20)}},
+	})
+	if _, err := store.writerDB.Exec(`UPDATE edges SET meta = ?`, []byte{0xff, 0x00, 0x7f}); err != nil {
+		t.Fatalf("corrupt residual edge metadata fixture: %v", err)
+	}
+
+	ids := make([]string, lookupChunkSize+1)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("missing-%04d", i)
+	}
+	ids[0] = firstTarget
+	ids[lookupChunkSize] = secondTarget
+	ids = append(ids, firstTarget, "", "missing")
+	got := store.GetInEdgeIdentitiesByNodeIDs(ids)
+	want := map[string]map[graph.EdgeIdentity]struct{}{
+		firstTarget: {
+			{From: firstSource, To: firstTarget, Kind: graph.EdgeCalls, FilePath: "repo::first.go", Line: 7}:      {},
+			{From: firstSource, To: firstTarget, Kind: graph.EdgeReferences, FilePath: "repo::first.go", Line: 8}: {},
+		},
+		secondTarget: {
+			{From: secondSource, To: secondTarget, Kind: graph.EdgeCalls, FilePath: "repo::second.go", Line: 9}: {},
+		},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("incoming identity buckets = %d, want %d", len(got), len(want))
+	}
+	for target, wanted := range want {
+		if len(got[target]) != len(wanted) {
+			t.Fatalf("incoming identities[%q] = %#v, want %d rows", target, got[target], len(wanted))
+		}
+		for _, identity := range got[target] {
+			if _, ok := wanted[identity]; !ok {
+				t.Fatalf("unexpected incoming identity for %q: %#v", target, identity)
+			}
+		}
+	}
+}
+
 func TestResolverProjectionYieldCanReenterStore(t *testing.T) {
 	store := openResolverProjectionTestStore(t)
 	store.AddBatch([]*graph.Node{

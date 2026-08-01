@@ -113,6 +113,46 @@ type NodePlacementBatchReader interface {
 	NodePlacementsByIDs(ids []string) map[string]NodePlacement
 }
 
+// InEdgeIdentityBatchReader projects only the complete logical identities of
+// edges targeting an explicit node-ID batch. Payload, provenance, and metadata
+// stay behind the storage boundary until a caller deliberately refetches them.
+type InEdgeIdentityBatchReader interface {
+	GetInEdgeIdentitiesByNodeIDs(ids []string) map[string][]EdgeIdentity
+}
+
+// InEdgeIdentitiesByNodeIDs selects the compact capability when available. The
+// compatibility fallback converts the ordinary incoming adjacency result.
+func InEdgeIdentitiesByNodeIDs(s Store, ids []string) map[string][]EdgeIdentity {
+	if s == nil || len(ids) == 0 {
+		return nil
+	}
+	if reader, ok := s.(InEdgeIdentityBatchReader); ok {
+		return reader.GetInEdgeIdentitiesByNodeIDs(ids)
+	}
+	return incomingEdgeIdentityMap(ids, s.GetInEdgesByNodeIDs(ids))
+}
+
+func incomingEdgeIdentityMap(ids []string, edgesByTarget map[string][]*Edge) map[string][]EdgeIdentity {
+	out := make(map[string][]EdgeIdentity)
+	seenTargets := make(map[string]struct{}, len(ids))
+	for _, targetID := range ids {
+		if targetID == "" {
+			continue
+		}
+		if _, duplicate := seenTargets[targetID]; duplicate {
+			continue
+		}
+		seenTargets[targetID] = struct{}{}
+		for _, edge := range edgesByTarget[targetID] {
+			if edge == nil || edge.To != targetID {
+				continue
+			}
+			out[targetID] = append(out[targetID], EdgeIdentityFor(edge))
+		}
+	}
+	return out
+}
+
 // ScopeBindingNodesSeq selects the compact capability when available. The
 // compatibility fallback preserves third-party Store behavior.
 func ScopeBindingNodesSeq(s Store, kinds ...NodeKind) iter.Seq[ScopeBindingNode] {
@@ -396,6 +436,10 @@ func (g *Graph) FileNodeIdentitiesSeq(repoPrefixes []string) iter.Seq[FileNodeId
 	}
 }
 
+func (g *Graph) GetInEdgeIdentitiesByNodeIDs(ids []string) map[string][]EdgeIdentity {
+	return incomingEdgeIdentityMap(ids, g.GetInEdgesByNodeIDs(ids))
+}
+
 func (g *Graph) NodePlacementsByIDs(ids []string) map[string]NodePlacement {
 	nodes := g.GetNodesByIDs(ids)
 	out := make(map[string]NodePlacement, len(nodes))
@@ -434,4 +478,5 @@ var (
 	_ QualifiedNodeIdentitySequencer = (*Graph)(nil)
 	_ FileNodeIdentitySequencer      = (*Graph)(nil)
 	_ NodePlacementBatchReader       = (*Graph)(nil)
+	_ InEdgeIdentityBatchReader      = (*Graph)(nil)
 )
