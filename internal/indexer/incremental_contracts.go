@@ -593,18 +593,20 @@ func (idx *Indexer) extractContractsForGraphFileFromBatch(
 	if err != nil {
 		return nil, 0, true, true
 	}
-	src, err := os.ReadFile(absPath)
-	if err != nil {
-		return nil, 0, true, true
-	}
-
 	fileEdges := edgesByNode[fileNode.ID]
-	tree := contracts.ParseTreeForLang(fileNode.Language, src)
-	fresh := idx.runContractExtractorsForFile(
-		graphPath, src, fileNodes, fileEdges, byLang[fileNode.Language], tree,
-	)
-	if tree != nil {
-		tree.Release()
+	var fresh []contracts.Contract
+	if extractors := byLang[fileNode.Language]; len(extractors) > 0 {
+		src, err := os.ReadFile(absPath)
+		if err != nil {
+			return nil, 0, true, true
+		}
+		tree := contracts.ParseTreeForLang(fileNode.Language, src)
+		fresh = idx.runContractExtractorsForFile(
+			graphPath, src, fileNodes, fileEdges, extractors, tree,
+		)
+		if tree != nil {
+			tree.Release()
+		}
 	}
 
 	// DI contracts are normally appended by the repo-wide post-pass. Rebuild
