@@ -162,6 +162,14 @@ type Indexer struct {
 	// file must satisfy both before its bytes and parse tree are materialised.
 	parseAdmission atomic.Pointer[parseAdmissionBudget]
 
+	// largeDirectAdmission serializes only intrinsically large full-repository
+	// parses that stream directly into the durable store. It complements the
+	// per-file parseAdmission gate by covering repository-level graph batches,
+	// native allocator high-water, and the post-parse heap-release boundary.
+	// Nil selects the process-wide production gate; tests may inject a private
+	// budget without changing other Indexers.
+	largeDirectAdmission *largeDirectAdmissionBudget
+
 	// indexCount tracks how many IndexCtx calls this Indexer has
 	// completed. Gates the cold-start shadow-swap: each per-repo
 	// Indexer in MultiIndexer is fresh (indexCount==0), so all of
@@ -2878,6 +2886,52 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		}
 	}
 
+	// Repository-level admission for intrinsically large direct parses. The
+	// per-file parse budget remains active inside this lane, so the admitted
+	// repository still uses its normal worker pool and native-parser lanes; only
+	// a second large direct repository waits. Small direct repositories and
+	// bounded streaming shadows carry zero weight and continue concurrently.
+	streamingParse := diskTarget == nil && streamingFlushActive(idx.graph, len(files))
+	largeDirectWeight := largeDirectParseAdmissionWeight(
+		idx.graph, streamingParse, len(files), totalFileBytes,
+	)
+	largeDirectBudget := idx.largeDirectAdmission
+	if largeDirectBudget == nil {
+		largeDirectBudget = processLargeDirectAdmission
+	}
+	admissionStarted := time.Now()
+	largeDirectLease, err := largeDirectBudget.acquire(ctx, largeDirectWeight)
+	if err != nil {
+		return nil, err
+	}
+	var releaseLargeDirectAdmission func()
+	if largeDirectLease != nil {
+		admittedAt := time.Now()
+		stats := largeDirectBudget.snapshot()
+		idx.logger.Info("indexer: large direct parse admitted",
+			zap.String("repo", idx.repoPrefix),
+			zap.Int("files", len(files)),
+			zap.Int64("input_bytes", totalFileBytes),
+			zap.Duration("waited", admittedAt.Sub(admissionStarted)),
+			zap.Int64("capacity", stats.capacity),
+			zap.Int64("used", stats.used),
+			zap.Int64("peak", stats.peak),
+			zap.Int("waiters", stats.waiters))
+		var releaseOnce sync.Once
+		releaseLargeDirectAdmission = func() {
+			releaseOnce.Do(func() {
+				largeDirectLease.Release()
+				after := largeDirectBudget.snapshot()
+				idx.logger.Info("indexer: large direct parse released",
+					zap.String("repo", idx.repoPrefix),
+					zap.Duration("held", time.Since(admittedAt)),
+					zap.Int64("used", after.used),
+					zap.Int("waiters", after.waiters))
+			})
+		}
+		defer releaseLargeDirectAdmission()
+	}
+
 	// Content-index rebuild strategy. The crash-safe path (on-disk store)
 	// deletes each file's prior content rows as that file re-streams
 	// (contentWipeFile, invoked at the per-file AddBatch sites below) and
@@ -3423,7 +3477,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// by default since it requires the disk-only resolver path
 	// (~tens of minutes on huge repos) that we haven't yet
 	// optimised end-to-end.
-	if diskTarget == nil && streamingFlushActive(idx.graph, len(files)) {
+	if streamingParse {
 		bl, _ := idx.graph.(graph.BulkLoader)
 		streamingDisk := idx.graph
 		chunkSize := streamingChunkSize()
@@ -3509,6 +3563,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		if err := cs.BuildContentIndex(); err != nil {
 			idx.logger.Warn("indexer: content index build failed", zap.Error(err))
 		}
+	}
+	// parseChunk has joined every worker, flushed the direct graph/content/
+	// sidecar batches, and run the large-direct heap-release check. Keep the
+	// repository lane through content-index finalisation, then let the next
+	// intrinsically large direct parse enter. The defer remains as the
+	// cancellation/panic/error backstop.
+	if releaseLargeDirectAdmission != nil {
+		releaseLargeDirectAdmission()
 	}
 
 	if processed > 0 {
