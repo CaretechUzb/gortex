@@ -17,8 +17,8 @@ import (
 )
 
 var (
-	// globalConfigMu serialises Save() so concurrent writers can't
-	// truncate each other's payload.
+	// globalConfigMu serialises in-memory repository-list mutations with Save,
+	// so concurrent tracker workers cannot race each other or YAML snapshots.
 	globalConfigMu sync.Mutex
 
 	// projectNameRe matches valid project names: alphanumeric, hyphens, underscores.
@@ -436,6 +436,9 @@ func normalizePath(p string) string {
 // AddRepo adds a repository entry to the top-level repos list.
 // Relative paths are resolved to absolute. Duplicate paths are skipped.
 func (gc *GlobalConfig) AddRepo(entry RepoEntry) error {
+	globalConfigMu.Lock()
+	defer globalConfigMu.Unlock()
+
 	absPath, err := filepath.Abs(entry.Path)
 	if err != nil {
 		return fmt.Errorf("resolving path %s: %w", entry.Path, err)
@@ -461,6 +464,9 @@ func (gc *GlobalConfig) AddRepo(entry RepoEntry) error {
 // RemoveRepo removes a repository entry from the top-level repos list by path.
 // The path is resolved to absolute for comparison.
 func (gc *GlobalConfig) RemoveRepo(path string) error {
+	globalConfigMu.Lock()
+	defer globalConfigMu.Unlock()
+
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("resolving path %s: %w", path, err)
