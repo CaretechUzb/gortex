@@ -128,11 +128,15 @@ func testPrefixDiagnostics(t *testing.T, factory Factory) {
 
 	// One owned code node, one unowned (single-repo-mode) code node, one
 	// misprefixed node whose stamped repo its identity does not carry, and
-	// one synthetic global external that must not be audited at all.
+	// every intentional namespace/path exception that must not be audited.
 	s.AddNode(mkRepoNode("r1/a.go::Owned", "Owned", "r1/a.go", "r1", graph.KindFunction))
 	s.AddNode(mkNode("b.go::Unowned", "Unowned", "b.go", graph.KindFunction))
 	s.AddNode(mkRepoNode("c.go::Misprefixed", "Misprefixed", "c.go", "r1", graph.KindFunction))
 	s.AddNode(mkNode("dep::go.uber.org/zap::Logger", "Logger", "", graph.KindFunction))
+	s.AddNode(mkNode("external::go:crypto/sha256::Size", "Size", "external::go:crypto/sha256", graph.KindConstant))
+	s.AddNode(mkNode("external-call::npm:lodash", "lodash", "external-call::npm:lodash", graph.KindModule))
+	s.AddNode(mkRepoNode("contract::http::GET::/health", "GET /health", "r1/api.go", "r1", graph.KindContract))
+	s.AddNode(mkRepoNode("contract-bridge::request::response", "request → response", "contracts://bridges", "r1", graph.KindContractBridge))
 
 	d, ok := graph.ReadPrefixDiagnostics(s, 5)
 	if !ok {
@@ -143,7 +147,7 @@ func testPrefixDiagnostics(t *testing.T, factory Factory) {
 		t.Errorf("OwnedCodeNodes = %d, want 1 (%s)", d.OwnedCodeNodes, d.Summary())
 	}
 	if d.UnownedCodeNodes != 1 {
-		t.Errorf("UnownedCodeNodes = %d, want 1 — the synthetic dep:: node must not count (%s)",
+		t.Errorf("UnownedCodeNodes = %d, want 1 — synthetic virtual paths must not count (%s)",
 			d.UnownedCodeNodes, d.Summary())
 	}
 	if d.MisprefixedNodes != 1 {
