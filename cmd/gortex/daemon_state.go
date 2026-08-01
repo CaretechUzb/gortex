@@ -777,16 +777,15 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			zap.Int("repos_pending_enrich", enrichPending))
 	}
 
-	// Overlap the enrichment pool with the resolve phase: the pool's COMPUTE
-	// (go/packages loads, tree-sitter parses) reads no graph state, so it
-	// runs on the cores the resolver leaves idle; every provider's graph
-	// APPLY parks on the apply gate until the resolve phase completes, so no
-	// giant apply can starve the resolver on the shared ResolveMutex
-	// (measured: an ungated overlap stretched the resolve compute loop 289s →
-	// 2,193s). GORTEX_ENRICH_OVERLAP=0 restores strictly-sequential ordering.
+	// Keep enrichment sequential by default. The resolver already saturates
+	// the host on a cold workspace, while overlapped Go enrichment can retain
+	// complete compiler programs behind this apply gate for the duration of
+	// resolution. That measured as several GiB of extra footprint for at most
+	// a few seconds of useful compute overlap. Operators can explicitly opt in
+	// with GORTEX_ENRICH_OVERLAP=1 while comparing unusual workloads.
 	var deferredRun *indexer.DeferredPassesRun
 	openApplyGate := func() {}
-	if (anyChanged || enrichPending > 0) && os.Getenv("GORTEX_ENRICH_OVERLAP") != "0" {
+	if (anyChanged || enrichPending > 0) && enrichmentOverlapEnabled() {
 		applyGate := make(chan struct{})
 		openApplyGate = sync.OnceFunc(func() {
 			// Open the mutation receipt only after pre-enrichment resolution has
@@ -1335,6 +1334,14 @@ func selectWarmGlobalResolveAction(anyChanged bool, safety warmGlobalResolveSafe
 		return warmGlobalResolveContracts
 	}
 	return warmGlobalResolveNone
+}
+
+// enrichmentOverlapEnabled reports whether the operator explicitly enabled
+// cold-warmup enrichment compute during the resolver phase. Sequential is the
+// safe default: on a saturated workspace overlap increases both resolver time
+// and retained compiler-program memory.
+func enrichmentOverlapEnabled() bool {
+	return os.Getenv("GORTEX_ENRICH_OVERLAP") == "1"
 }
 
 // warmupFullResolveForced reports whether the operator pinned the warm-restart
