@@ -863,18 +863,16 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// re-runs the master resolver to lift placeholder edges the enrichment +
 	// contract passes add. When the pool was started ahead of resolve, this
 	// block only joins the surviving lanes and runs the tail.
-	deferredExactCrossRepoComplete := false
+	var deferredResult indexer.DeferredPassesResult
 	if anyChanged || enrichPending > 0 {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "deferred_passes_all", true, nil)
-		var deferredResult indexer.DeferredPassesResult
 		if deferredRun != nil {
 			deferredResult = deferredRun.FinishTailResult()
 		} else {
 			deferredResult = state.multiIndexer.RunDeferredPassesAllResult(ctx)
 		}
 		timings.enrichScheduled = deferredResult.EnrichScheduled
-		deferredExactCrossRepoComplete = deferredResult.ExactCrossRepoComplete
 		timings.enrich = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "deferred_passes_all"),
@@ -948,15 +946,21 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	}
 
 	// Run a cross-repo resolution pass once warmup has stamped the workspace
-	// slugs. An exact pre-enrichment frontier plus an exact deferred receipt has
-	// already completed outgoing, incoming, and parallel-edge catch-up; when no
-	// node slug changed, only contract bridges need reconciliation. Every
-	// missing completion proof or any node slug stamp retains the historical
-	// full safety sweep.
+	// slugs. The deferred tail may have completed catch-up either from an exact
+	// receipt frontier or through its fail-closed full fallback. In both cases
+	// the later full sweep is redundant only while the graph remains at the
+	// revision captured at completion. Unsupported revisions, an interleaving
+	// writer, a failed pass, or any node slug stamp retain the historical full
+	// safety sweep; contract bridges are reconciled separately.
+	currentMutationRevision, currentMutationRevisionKnown := state.multiIndexer.GraphMutationRevision()
 	globalResolveAction := selectWarmGlobalResolveAction(anyChanged, warmGlobalResolveSafety{
-		resolveOK:                      resolveOK,
-		deferredExactCrossRepoComplete: deferredExactCrossRepoComplete,
-		backfilledNodes:                backfilledNodes,
+		resolveOK:                     resolveOK,
+		deferredCrossRepoComplete:     deferredResult.CrossRepoComplete,
+		deferredMutationRevision:      deferredResult.CrossRepoMutationRevision,
+		deferredMutationRevisionKnown: deferredResult.CrossRepoMutationRevisionKnown,
+		currentMutationRevision:       currentMutationRevision,
+		currentMutationRevisionKnown:  currentMutationRevisionKnown,
+		backfilledNodes:               backfilledNodes,
 	}, backfilledContracts)
 	if globalResolveAction != warmGlobalResolveNone {
 		phaseStart = time.Now()
@@ -1298,9 +1302,13 @@ func storeNeedsRebuild(g any) bool {
 }
 
 type warmGlobalResolveSafety struct {
-	resolveOK                      bool
-	deferredExactCrossRepoComplete bool
-	backfilledNodes                int
+	resolveOK                     bool
+	deferredCrossRepoComplete     bool
+	deferredMutationRevision      uint64
+	deferredMutationRevisionKnown bool
+	currentMutationRevision       uint64
+	currentMutationRevisionKnown  bool
+	backfilledNodes               int
 }
 
 type warmGlobalResolveAction uint8
@@ -1311,12 +1319,17 @@ const (
 	warmGlobalResolveFull
 )
 
-// canSkipWarmGlobalResolve requires the three facts that prove the earlier
-// cross-repository work is complete. Branch-selection flags do not strengthen
-// that proof; a node stamp does invalidate it by changing workspace eligibility.
+// canSkipWarmGlobalResolve requires both successful earlier resolution and a
+// generation proof that no graph writer interleaved after deferred catch-up.
+// Branch-selection flags do not strengthen that proof. Unknown revision
+// capability fails closed, while a node stamp independently invalidates the
+// proof by changing cross-workspace eligibility.
 func canSkipWarmGlobalResolve(s warmGlobalResolveSafety) bool {
 	return s.resolveOK &&
-		s.deferredExactCrossRepoComplete &&
+		s.deferredCrossRepoComplete &&
+		s.deferredMutationRevisionKnown &&
+		s.currentMutationRevisionKnown &&
+		s.deferredMutationRevision == s.currentMutationRevision &&
 		s.backfilledNodes == 0
 }
 

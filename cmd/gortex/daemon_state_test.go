@@ -104,13 +104,17 @@ func TestWarmMtimePrefix(t *testing.T) {
 	}
 }
 
-func TestCanSkipWarmGlobalResolveRequiresCompletionProof(t *testing.T) {
+func TestCanSkipWarmGlobalResolveRequiresCompletionAndStableRevision(t *testing.T) {
 	base := warmGlobalResolveSafety{
-		resolveOK:                      true,
-		deferredExactCrossRepoComplete: true,
+		resolveOK:                     true,
+		deferredCrossRepoComplete:     true,
+		deferredMutationRevision:      42,
+		deferredMutationRevisionKnown: true,
+		currentMutationRevision:       42,
+		currentMutationRevisionKnown:  true,
 	}
 	if !canSkipWarmGlobalResolve(base) {
-		t.Fatal("complete initial and deferred cross-repo passes should elide the duplicate full sweep")
+		t.Fatal("completed deferred catch-up at the current revision should elide the duplicate full sweep")
 	}
 
 	cases := []struct {
@@ -118,7 +122,10 @@ func TestCanSkipWarmGlobalResolveRequiresCompletionProof(t *testing.T) {
 		mutate func(*warmGlobalResolveSafety)
 	}{
 		{"pre-enrichment resolve failed", func(s *warmGlobalResolveSafety) { s.resolveOK = false }},
-		{"deferred catch-up fell back", func(s *warmGlobalResolveSafety) { s.deferredExactCrossRepoComplete = false }},
+		{"deferred catch-up failed", func(s *warmGlobalResolveSafety) { s.deferredCrossRepoComplete = false }},
+		{"completion revision unsupported", func(s *warmGlobalResolveSafety) { s.deferredMutationRevisionKnown = false }},
+		{"current revision unsupported", func(s *warmGlobalResolveSafety) { s.currentMutationRevisionKnown = false }},
+		{"writer interleaved after catch-up", func(s *warmGlobalResolveSafety) { s.currentMutationRevision++ }},
 		{"workspace slug stamped nodes", func(s *warmGlobalResolveSafety) { s.backfilledNodes = 1 }},
 	}
 	for _, tc := range cases {
@@ -126,7 +133,7 @@ func TestCanSkipWarmGlobalResolveRequiresCompletionProof(t *testing.T) {
 			safety := base
 			tc.mutate(&safety)
 			if canSkipWarmGlobalResolve(safety) {
-				t.Fatal("incomplete cross-repo proof elided the full sweep")
+				t.Fatal("incomplete or stale cross-repo proof elided the full sweep")
 			}
 		})
 	}
@@ -134,9 +141,17 @@ func TestCanSkipWarmGlobalResolveRequiresCompletionProof(t *testing.T) {
 
 func TestSelectWarmGlobalResolveAction(t *testing.T) {
 	complete := warmGlobalResolveSafety{
-		resolveOK:                      true,
-		deferredExactCrossRepoComplete: true,
+		resolveOK:                     true,
+		deferredCrossRepoComplete:     true,
+		deferredMutationRevision:      17,
+		deferredMutationRevisionKnown: true,
+		currentMutationRevision:       17,
+		currentMutationRevisionKnown:  true,
 	}
+	interleaved := complete
+	interleaved.currentMutationRevision++
+	lateNodeStamp := complete
+	lateNodeStamp.backfilledNodes = 1
 	cases := []struct {
 		name                string
 		anyChanged          bool
@@ -144,10 +159,11 @@ func TestSelectWarmGlobalResolveAction(t *testing.T) {
 		backfilledContracts int
 		want                warmGlobalResolveAction
 	}{
-		{"changed exact frontier", true, complete, 0, warmGlobalResolveContracts},
+		{"changed completed deferred catch-up", true, complete, 0, warmGlobalResolveContracts},
 		{"changed failed initial resolve", true, warmGlobalResolveSafety{}, 0, warmGlobalResolveFull},
-		{"changed incomplete deferred catch-up", true, warmGlobalResolveSafety{resolveOK: true}, 0, warmGlobalResolveFull},
-		{"changed late node stamp", true, warmGlobalResolveSafety{resolveOK: true, deferredExactCrossRepoComplete: true, backfilledNodes: 1}, 0, warmGlobalResolveFull},
+		{"changed failed deferred catch-up", true, warmGlobalResolveSafety{resolveOK: true}, 0, warmGlobalResolveFull},
+		{"changed interleaving graph writer", true, interleaved, 0, warmGlobalResolveFull},
+		{"changed late node stamp", true, lateNodeStamp, 0, warmGlobalResolveFull},
 		{"unchanged legacy node stamp", false, warmGlobalResolveSafety{backfilledNodes: 1}, 0, warmGlobalResolveFull},
 		{"unchanged legacy contract stamp", false, warmGlobalResolveSafety{}, 1, warmGlobalResolveContracts},
 		{"unchanged clean snapshot", false, warmGlobalResolveSafety{}, 0, warmGlobalResolveNone},

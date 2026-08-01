@@ -23,7 +23,7 @@ func TestResolveDeferredMutationsSkipsCompleteEmptyReceiptWithoutScanning(t *tes
 	store, edge := deferredReceiptFixture()
 	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
 
-	mode := mi.resolveDeferredMutations(&graph.MutationReceipt{Complete: true}, true, nil, false)
+	mode, _ := mi.resolveDeferredMutations(&graph.MutationReceipt{Complete: true}, true, nil, false)
 	if mode != deferredResolveSkipped {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveSkipped)
 	}
@@ -46,7 +46,7 @@ func TestResolveDeferredMutationsUsesExactDefinitionFrontier(t *testing.T) {
 		TargetIDs:          []string{"b.go::Target"},
 	}
 
-	mode := mi.resolveDeferredMutations(receipt, true, nil, false)
+	mode, _ := mi.resolveDeferredMutations(receipt, true, nil, false)
 	if mode != deferredResolveExact {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveExact)
 	}
@@ -68,7 +68,7 @@ func TestResolveDeferredMutationsUsesExactChangedFileFrontier(t *testing.T) {
 		TargetNames:        []string{"Target"},
 	}
 
-	mode := mi.resolveDeferredMutations(receipt, false, nil, false)
+	mode, _ := mi.resolveDeferredMutations(receipt, false, nil, false)
 	if mode != deferredResolveExact {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveExact)
 	}
@@ -84,7 +84,7 @@ func TestResolveDeferredMutationsIncompleteReceiptFallsBackToFullScan(t *testing
 	store, edge := deferredReceiptFixture()
 	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
 
-	mode := mi.resolveDeferredMutations(&graph.MutationReceipt{Complete: false}, false, map[string]struct{}{"repo": {}}, false)
+	mode, _ := mi.resolveDeferredMutations(&graph.MutationReceipt{Complete: false}, false, map[string]struct{}{"repo": {}}, false)
 	if mode != deferredResolveFallback {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveFallback)
 	}
@@ -101,7 +101,7 @@ func TestResolveDeferredMutationsMissingExactPathFailsClosed(t *testing.T) {
 	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
 	receipt := &graph.MutationReceipt{Complete: true, ResolutionRelevant: true, TargetNames: []string{"Target"}}
 
-	mode := mi.resolveDeferredMutations(receipt, false, nil, false)
+	mode, _ := mi.resolveDeferredMutations(receipt, false, nil, false)
 	if mode != deferredResolveFallback {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveFallback)
 	}
@@ -120,7 +120,7 @@ func TestResolveDeferredMutationsExactReceiptCompletesCrossRepoFrontier(t *testi
 		TargetIDs:          []string{"b/b.go::Serve"},
 	}
 
-	mode := mi.resolveDeferredMutations(receipt, true, nil, false)
+	mode, _ := mi.resolveDeferredMutations(receipt, true, nil, false)
 	if mode != deferredResolveExact {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveExact)
 	}
@@ -143,12 +143,15 @@ func TestResolveDeferredMutationsIncompleteReceiptCompletesFullCrossRepoFallback
 	store := deferredCrossRepoReceiptFixture()
 	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
 
-	mode := mi.resolveDeferredMutations(&graph.MutationReceipt{
+	mode, complete := mi.resolveDeferredMutations(&graph.MutationReceipt{
 		Complete:         false,
 		IncompleteReason: "overlapping_resolver_write",
 	}, false, map[string]struct{}{"b": {}}, false)
 	if mode != deferredResolveFallback {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveFallback)
+	}
+	if !complete {
+		t.Fatal("successful full fallback did not report cross-repository completion")
 	}
 	if got := store.unresolvedScans.Load(); got == 0 {
 		t.Fatal("incomplete receipt did not use the full unresolved fallback")
@@ -164,6 +167,31 @@ func TestResolveDeferredMutationsIncompleteReceiptCompletesFullCrossRepoFallback
 		if !deferredHasEdgeKindTo(store.GetOutEdges(want.from), crossKind, want.to) {
 			t.Fatalf("full fallback did not materialize cross-repo edge %s -> %s", want.from, want.to)
 		}
+	}
+}
+
+func TestFinishTailResultPublishesFullFallbackCompletionRevision(t *testing.T) {
+	store := deferredCrossRepoReceiptFixture()
+	done := make(chan struct{})
+	close(done)
+	run := &DeferredPassesRun{
+		mi:            &MultiIndexer{graph: store, logger: zap.NewNop()},
+		catchupNeeded: true,
+		poolDone:      done,
+	}
+
+	result := run.FinishTailResult()
+	if !result.CrossRepoComplete {
+		t.Fatal("successful full fallback did not publish a completion proof")
+	}
+	if result.ExactCrossRepoComplete {
+		t.Fatal("full fallback was incorrectly reported as an exact receipt frontier")
+	}
+	if !result.CrossRepoMutationRevisionKnown {
+		t.Fatal("revision-capable graph did not publish a completion revision")
+	}
+	if got := store.MutationRevision(); result.CrossRepoMutationRevision != got {
+		t.Fatalf("completion revision = %d, current graph revision = %d", result.CrossRepoMutationRevision, got)
 	}
 }
 
@@ -213,7 +241,7 @@ func TestResolveDeferredMutationsIncompleteReceiptFallsBackWhenNoUnresolvedWrite
 	store, edge := deferredReceiptFixture()
 	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
 
-	mode := mi.resolveDeferredMutations(&graph.MutationReceipt{Complete: false}, false, nil, true)
+	mode, _ := mi.resolveDeferredMutations(&graph.MutationReceipt{Complete: false}, false, nil, true)
 	if mode != deferredResolveFallback {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveFallback)
 	}
