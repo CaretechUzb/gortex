@@ -126,32 +126,41 @@ func ComputeBetweenness(g graph.Store) *BetweennessResult {
 	// ever materialized. Falls back to EdgesByKinds (and then
 	// EdgesByKind per kind) on backends that don't implement the
 	// adjacency capability.
-	adj := make(map[string][]string, n)
+	// Convert stable string IDs to compact integer slots once. Brandes runs one
+	// BFS per pivot; keeping strings in its inner loop previously rebuilt four
+	// large string-keyed maps per pivot and allocated 4.5 GiB during one daemon
+	// wakeup on the production graph.
+	idIndex := make(map[string]int, n)
+	for i, id := range ids {
+		idIndex[id] = i
+	}
+	adjacency := make([][]int, n)
+	appendPair := func(from, to string) {
+		fromIdx, fromOK := idIndex[from]
+		toIdx, toOK := idIndex[to]
+		if !fromOK || !toOK {
+			return
+		}
+		adjacency[fromIdx] = append(adjacency[fromIdx], toIdx)
+	}
 	if adjScan, ok := g.(graph.EdgeAdjacencyForKinds); ok {
 		for pair := range adjScan.EdgeAdjacencyForKinds(betweennessKinds, bcNodeKinds) {
-			adj[pair[0]] = append(adj[pair[0]], pair[1])
+			appendPair(pair[0], pair[1])
 		}
 	} else if es, ok := g.(graph.EdgesByKindsScanner); ok {
 		for e := range es.EdgesByKinds(betweennessKinds) {
-			if e == nil {
-				continue
+			if e != nil {
+				appendPair(e.From, e.To)
 			}
-			adj[e.From] = append(adj[e.From], e.To)
 		}
 	} else {
 		for _, kind := range betweennessKinds {
 			for e := range g.EdgesByKind(kind) {
-				if e == nil {
-					continue
+				if e != nil {
+					appendPair(e.From, e.To)
 				}
-				adj[e.From] = append(adj[e.From], e.To)
 			}
 		}
-	}
-
-	score := make(map[string]float64, n)
-	for _, id := range ids {
-		score[id] = 0
 	}
 
 	// Adaptive fast path: exact for small graphs, sampled otherwise.
@@ -162,21 +171,23 @@ func ComputeBetweenness(g graph.Store) *BetweennessResult {
 		sources = samplePivots(ids, betweennessPivots)
 	}
 
+	scoreDense := make([]float64, n)
+	scratch := newBrandesScratch(n)
 	for _, src := range sources {
-		brandesAccumulate(src, ids, adj, score)
+		brandesAccumulate(idIndex[src], adjacency, scoreDense, &scratch)
 	}
 
-	// Rescale the sampled estimate up to a full-source equivalent so
-	// the magnitude is comparable to the exact path.
+	// Rescale the sampled estimate up to a full-source equivalent and convert
+	// back to the public string-keyed result only once, after every pivot.
+	scale := 1.0
 	if sampled && len(sources) > 0 {
-		scale := float64(n) / float64(len(sources))
-		for id := range score {
-			score[id] *= scale
-		}
+		scale = float64(n) / float64(len(sources))
 	}
-
+	score := make(map[string]float64, n)
 	var max float64
-	for _, v := range score {
+	for i, id := range ids {
+		v := scoreDense[i] * scale
+		score[id] = v
 		if v > max {
 			max = v
 		}
@@ -216,59 +227,73 @@ func samplePivots(ids []string, k int) []string {
 // into score. Intermediate vertices (everything but src and the
 // target) collect the credit, which is exactly betweenness.
 //
-// The graph is unweighted, so a plain BFS yields shortest paths and
-// the per-source cost is O(V+E); summed over all sources this is the
-// O(V*E) exact bound, or O(k*E) when only k sources feed it.
-func brandesAccumulate(src string, ids []string, adj map[string][]string, score map[string]float64) {
-	// sigma: number of shortest paths from src to a node.
-	// dist:  hop distance from src (-1 = unreached).
-	// preds: shortest-path predecessors of a node.
-	// order: nodes in non-decreasing distance — the BFS visitation
-	//        order, replayed in reverse for the accumulation sweep.
-	sigma := make(map[string]float64, len(ids))
-	dist := make(map[string]int, len(ids))
-	preds := make(map[string][]string, len(ids))
-	for _, id := range ids {
-		dist[id] = -1
-	}
-	sigma[src] = 1
-	dist[src] = 0
+// brandesScratch owns the dense per-source state. Its backing arrays and
+// predecessor lists are reused across pivots, so sampled analysis allocates in
+// proportion to the graph once rather than once per pivot.
+type brandesScratch struct {
+	sigma []float64
+	dist  []int
+	delta []float64
+	preds [][]int
+	queue []int
+	order []int
+}
 
-	queue := []string{src}
-	order := make([]string, 0, len(ids))
-	for len(queue) > 0 {
-		v := queue[0]
-		queue = queue[1:]
-		order = append(order, v)
-		for _, w := range adj[v] {
-			// First time w is reached — record its distance and
-			// enqueue it.
-			if dist[w] < 0 {
-				dist[w] = dist[v] + 1
-				queue = append(queue, w)
+func newBrandesScratch(nodes int) brandesScratch {
+	return brandesScratch{
+		sigma: make([]float64, nodes),
+		dist:  make([]int, nodes),
+		delta: make([]float64, nodes),
+		preds: make([][]int, nodes),
+		queue: make([]int, 0, nodes),
+		order: make([]int, 0, nodes),
+	}
+}
+
+func (s *brandesScratch) reset() {
+	for i := range s.dist {
+		s.sigma[i] = 0
+		s.dist[i] = -1
+		s.delta[i] = 0
+		s.preds[i] = s.preds[i][:0]
+	}
+	s.queue = s.queue[:0]
+	s.order = s.order[:0]
+}
+
+// The graph is unweighted, so a plain BFS yields shortest paths. Node IDs have
+// already been lowered to dense integer slots by ComputeBetweenness; no maps
+// are allocated in the per-pivot loop.
+func brandesAccumulate(src int, adjacency [][]int, score []float64, scratch *brandesScratch) {
+	scratch.reset()
+	scratch.sigma[src] = 1
+	scratch.dist[src] = 0
+	scratch.queue = append(scratch.queue, src)
+
+	for head := 0; head < len(scratch.queue); head++ {
+		v := scratch.queue[head]
+		scratch.order = append(scratch.order, v)
+		for _, w := range adjacency[v] {
+			if scratch.dist[w] < 0 {
+				scratch.dist[w] = scratch.dist[v] + 1
+				scratch.queue = append(scratch.queue, w)
 			}
-			// w found again along another shortest path — add v's
-			// path count and register v as a predecessor.
-			if dist[w] == dist[v]+1 {
-				sigma[w] += sigma[v]
-				preds[w] = append(preds[w], v)
+			if scratch.dist[w] == scratch.dist[v]+1 {
+				scratch.sigma[w] += scratch.sigma[v]
+				scratch.preds[w] = append(scratch.preds[w], v)
 			}
 		}
 	}
 
-	// Reverse sweep: pop nodes farthest-first and push their
-	// accumulated dependency back onto their predecessors.
-	delta := make(map[string]float64, len(ids))
-	for i := len(order) - 1; i >= 0; i-- {
-		w := order[i]
-		for _, v := range preds[w] {
-			if sigma[w] != 0 {
-				delta[v] += (sigma[v] / sigma[w]) * (1 + delta[w])
+	for i := len(scratch.order) - 1; i >= 0; i-- {
+		w := scratch.order[i]
+		if scratch.sigma[w] != 0 {
+			for _, v := range scratch.preds[w] {
+				scratch.delta[v] += (scratch.sigma[v] / scratch.sigma[w]) * (1 + scratch.delta[w])
 			}
 		}
-		// The source itself is never an intermediate vertex.
 		if w != src {
-			score[w] += delta[w]
+			score[w] += scratch.delta[w]
 		}
 	}
 }
