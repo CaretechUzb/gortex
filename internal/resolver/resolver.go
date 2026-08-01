@@ -363,12 +363,11 @@ type Resolver struct {
 	// mutated only from the pass's serial phases — page prepare, lookup warm,
 	// and guard warm — never from parallel resolve workers.
 	hotCache *resolveHotCache
-	// placeholderSrcIdx caches, for one ResolveAll pass, which dataflow
-	// (arg_of / value_flow) source IDs are unresolved placeholders, so the
-	// per-batch source reconciliation probes only froms that can match
-	// instead of point-looking-up every resolved placeholder (see
-	// placeholder_sources.go). Reset at pass start; touched only from the
-	// pass's serial apply phases.
+	// placeholderSrcIdx caches, for one ResolveAll pass, the exact identities
+	// of dataflow edges sourced from unresolved placeholders. Each compute
+	// chunk refetches only its matching sites instead of decoding a shared
+	// placeholder's complete adjacency again (see placeholder_sources.go).
+	// Reset at pass start; touched only from the pass's serial apply phases.
 	placeholderSrcIdx placeholderSourceIndex
 	// lspDeferredRetry preserves only budget-skipped LSP work across
 	// ResolveAll calls. This is required for heuristic-resolved edges: after

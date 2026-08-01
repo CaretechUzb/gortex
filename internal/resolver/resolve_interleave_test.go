@@ -230,9 +230,11 @@ func TestResolveAllRefreshesCurrentPageAfterSameResolverInterleave(t *testing.T)
 	// Only the chunk after the real mutation interleave validates in the main
 	// loop. One remaining-page batch covers every later chunk from the old
 	// page; the second phase-bounded call is the independent cross-package
-	// guard validation and must retain its exact stale-job semantics.
-	if store.getEdgeCandidatesCalls != 2 {
-		t.Fatalf("batched liveness calls=%d, want main-page + guard validation", store.getEdgeCandidatesCalls)
+	// guard validation. Exact-site placeholder-source reconciliation shares
+	// the candidate API and contributes one more batch; the old implementation
+	// performed that probe through the wider adjacency API instead.
+	if store.getEdgeCandidatesCalls != 3 {
+		t.Fatalf("batched candidate calls=%d, want main-page + guard + placeholder-site validation", store.getEdgeCandidatesCalls)
 	}
 }
 

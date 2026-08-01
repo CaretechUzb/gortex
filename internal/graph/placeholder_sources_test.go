@@ -7,12 +7,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type placeholderCandidateTrackingStore struct {
+	*Graph
+	candidateCalls int
+	adjacencyCalls int
+	sites          []EdgeSite
+}
+
+func (s *placeholderCandidateTrackingStore) GetEdgeCandidates(endpoints []EdgeEndpoint, sites []EdgeSite) EdgeCandidateSet {
+	s.candidateCalls++
+	s.sites = append(s.sites, sites...)
+	return s.Graph.GetEdgeCandidates(endpoints, sites)
+}
+
+func (s *placeholderCandidateTrackingStore) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
+	s.adjacencyCalls++
+	return s.Graph.GetOutEdgesByNodeIDs(ids)
+}
+
 // Resolving a placeholder reference at a site must re-point the dataflow
 // edges keyed FROM that placeholder at the SAME site only — placeholder
 // strings are shared across sites, and a different-line sibling must stay
 // pending for its own resolution.
 func TestReconcilePlaceholderSourcesExactSite(t *testing.T) {
 	g := New()
+	tracked := &placeholderCandidateTrackingStore{Graph: g}
 	// Mirrors production exactly: the reference target stays in the BARE
 	// unresolved form while applyRepoPrefix gave the dataflow sources the
 	// repo-slash-prefixed form — two strings for one conceptual placeholder.
@@ -38,8 +57,11 @@ func TestReconcilePlaceholderSourcesExactSite(t *testing.T) {
 
 	repoints := PlaceholderSourceRepoints(batch)
 	require.Len(t, repoints, 2, "bare and repo-prefixed source forms are both candidates")
-	moved := ReconcilePlaceholderSources(g, repoints)
+	moved := ReconcilePlaceholderSources(tracked, repoints)
 	assert.Equal(t, 1, moved)
+	assert.Equal(t, 1, tracked.candidateCalls)
+	assert.Zero(t, tracked.adjacencyCalls, "reconciliation must not decode full placeholder adjacency")
+	assert.Len(t, tracked.sites, 4, "two source forms times two eligible edge kinds")
 
 	fromResolved := g.GetOutEdges(resolved)
 	require.Len(t, fromResolved, 1, "same-site dataflow edge must move under the resolved node")
