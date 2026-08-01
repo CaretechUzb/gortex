@@ -20,12 +20,12 @@ func (*directAdmissionTestStore) BulkSetFileMtimes(string, map[string]int64) err
 	return nil
 }
 
-func TestLargeDirectParseAdmissionWeightUsesIntrinsicThresholds(t *testing.T) {
+func TestLargeDirectParseAdmissionWeightSerializesEveryFullRepository(t *testing.T) {
 	direct := &directAdmissionTestStore{Store: graph.New()}
 	inMemory := graph.New()
 
-	// Operator shadow overrides route more repositories to SQLite but must not
-	// redefine which repositories are intrinsically large enough to serialize.
+	// Store shape, streaming mode, and operator shadow thresholds must not let
+	// a non-empty full-tree parse overlap another repository's parse phase.
 	t.Setenv("GORTEX_SHADOW_MAX_FILES", "1")
 	t.Setenv("GORTEX_SHADOW_MAX_BYTES", "1")
 
@@ -38,42 +38,40 @@ func TestLargeDirectParseAdmissionWeightUsesIntrinsicThresholds(t *testing.T) {
 		want       int64
 	}{
 		{
-			name:       "ordinary direct repository bypasses",
+			name:       "ordinary direct repository takes capacity",
 			store:      direct,
 			files:      defaultShadowMaxFileCount - 1,
-			inputBytes: defaultShadowMaxBytes - 1,
-		},
-		{
-			name:       "file threshold takes full capacity",
-			store:      direct,
-			files:      defaultShadowMaxFileCount,
 			inputBytes: defaultShadowMaxBytes - 1,
 			want:       largeDirectAdmissionCapacity,
 		},
 		{
-			name:       "byte threshold takes full capacity",
+			name:       "large direct repository takes capacity",
 			store:      direct,
-			files:      defaultShadowMaxFileCount - 1,
+			files:      defaultShadowMaxFileCount,
 			inputBytes: defaultShadowMaxBytes,
 			want:       largeDirectAdmissionCapacity,
 		},
 		{
-			name:       "in-memory shadow bypasses",
-			store:      inMemory,
-			files:      defaultShadowMaxFileCount,
-			inputBytes: defaultShadowMaxBytes,
+			name:  "in-memory shadow takes capacity",
+			store: inMemory,
+			files: 1,
+			want:  largeDirectAdmissionCapacity,
 		},
 		{
-			name:       "bounded streaming shadow bypasses",
-			store:      direct,
-			streaming:  true,
-			files:      defaultShadowMaxFileCount,
-			inputBytes: defaultShadowMaxBytes,
+			name:      "streaming shadow takes capacity",
+			store:     direct,
+			streaming: true,
+			files:     1,
+			want:      largeDirectAdmissionCapacity,
 		},
 		{
-			name:       "nil store bypasses",
-			files:      defaultShadowMaxFileCount,
-			inputBytes: defaultShadowMaxBytes,
+			name:  "nil store still takes capacity",
+			files: 1,
+			want:  largeDirectAdmissionCapacity,
+		},
+		{
+			name:  "empty repository bypasses",
+			store: direct,
 		},
 	}
 

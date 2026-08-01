@@ -11,12 +11,12 @@ import (
 
 const largeDirectAdmissionCapacity int64 = 1
 
-// largeDirectAdmissionBudget bounds repository-level direct parses. The
+// largeDirectAdmissionBudget bounds complete repository parse phases. The
 // existing parseAdmissionBudget controls live source bytes per file, but it
 // cannot see graph batches, native parser high-water, or allocator retention
-// accumulated across a whole repository. Intrinsically large direct parses
-// therefore take the full one-slot process capacity while ordinary direct and
-// shadow parses have zero weight and bypass this gate.
+// accumulated across a whole repository. Every full-tree parse therefore takes
+// the one process-wide slot; its internal parser workers still run concurrently.
+// Scoped incremental reconciliation never enters this gate.
 type largeDirectAdmissionBudget struct {
 	capacity int64
 	gate     *semaphore.Weighted
@@ -50,22 +50,18 @@ func newLargeDirectAdmissionBudget(capacity int64) *largeDirectAdmissionBudget {
 	return budget
 }
 
-// largeDirectParseAdmissionWeight deliberately uses the intrinsic shadow
-// ceilings, not operator overrides. Lowering GORTEX_SHADOW_MAX_* or merely
-// losing the non-blocking shadow-budget race must not serialize an ordinary
-// repository. Streaming shadows are already bounded by their chunk size and
-// likewise bypass the direct-store lane.
+// largeDirectParseAdmissionWeight admits every non-empty full-repository parse.
+// Store shape, streaming mode, and intrinsic size no longer bypass this gate:
+// even an individually ordinary shadow retains graph and native-parser state
+// that amplifies when several repositories overlap. Per-file parser admission
+// remains independent inside the admitted repository.
 func largeDirectParseAdmissionWeight(
-	store graph.Store,
-	streaming bool,
+	_ graph.Store,
+	_ bool,
 	files int,
-	inputBytes int64,
+	_ int64,
 ) int64 {
-	if streaming || store == nil {
-		return 0
-	}
-	_, directStore := store.(graph.FileMtimeWriter)
-	if !largeDirectParseNeedsHeapRelease(directStore, files, inputBytes) {
+	if files <= 0 {
 		return 0
 	}
 	return largeDirectAdmissionCapacity
