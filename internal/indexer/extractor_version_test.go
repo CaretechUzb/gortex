@@ -47,6 +47,13 @@ func TestStaleLangsDetection(t *testing.T) {
 		if got := ExtractorVersionStaleLangs(`{"go":1,"php":1}`); !reflect.DeepEqual(got, []string{"php"}) {
 			t.Errorf("stored PHP structural-edge version = %v, want [php]", got)
 		}
+		// A store extracted before the C# usings-scope/builtin-receiver
+		// stamps must re-extract its .cs files on upgrade — the stamps
+		// only exist post-extraction, so without the bump the extension
+		// visibility features stay dormant on existing stores.
+		if got := ExtractorVersionStaleLangs(`{"csharp":2}`); !reflect.DeepEqual(got, []string{"csharp"}) {
+			t.Errorf("stored C# usings-stamp version = %v, want [csharp]", got)
+		}
 		if got := merkleSaltFor("src/Handler.php"); got != "php@2" {
 			t.Errorf("PHP extractor salt = %q, want php@2", got)
 		}

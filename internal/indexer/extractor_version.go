@@ -27,7 +27,7 @@ var extractorVersions = map[string]int{
 	// the same change that alters a language's extraction logic, e.g.
 	//   "go": 2,
 	"php":    2, // class/interface inheritance now emits typed structural edges
-	"csharp": 2, // null-conditional call edges; reference forms for caseless type names
+	"csharp": 3, // global/static using stamps + builtin receiver stamp for extension binding (was: null-conditional call edges; caseless reference forms)
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
