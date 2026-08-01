@@ -205,11 +205,21 @@ func stringMeta(meta map[string]any, key string) string {
 	return value
 }
 
+func derivedFingerprintSideExists(nodes []*graph.Node) bool {
+	for _, node := range nodes {
+		if node != nil && node.Kind == graph.KindFile {
+			return true
+		}
+	}
+	return false
+}
+
 func derivedPlanForDelta(prior, fresh derivedFingerprints, semanticChanged bool, graphPath string, priorNodes, freshNodes []*graph.Node) DerivedInvalidationPlan {
 	plan := DerivedInvalidationPlan{Files: []string{graphPath}}
 	if !prior.complete() || !fresh.complete() {
 		plan.Flags = DerivedInvalidatesDeclarations | DerivedInvalidatesImports | DerivedInvalidatesRuntime | DerivedInvalidatesArtifacts
-		plan.LegacyFallback = true
+		plan.LegacyFallback = (derivedFingerprintSideExists(priorNodes) && !prior.complete()) ||
+			(derivedFingerprintSideExists(freshNodes) && !fresh.complete())
 	} else {
 		if prior.declarations != fresh.declarations {
 			plan.Flags |= DerivedInvalidatesDeclarations
