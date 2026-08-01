@@ -1136,26 +1136,28 @@ func runFrameworkSynthesizersScoped(
 	censusStart := time.Now()
 	candidates := summarizeFrameworkCandidatesCensus(g, scope, filePaths, censusEligible)
 	rep.CensusMillis = time.Since(censusStart).Milliseconds()
+
+	// A full-census attestation means the supplied repository scope covers the
+	// entire store. Execute it through the established nil-scope paths: bespoke
+	// scoped synthesizers and tail passes otherwise turn the all-repository set
+	// into repeated repo -> node -> edge probes. True partial runs retain their
+	// repository and file frontier unchanged.
+	executionScope := scope
+	if candidates.fullCensus {
+		executionScope = nil
+	}
+
 	scopeStart := time.Now()
 	var genericScope graph.Store
-	if scope != nil {
-		if censusEligible && len(filePaths) == 0 {
-			// Full-coverage attestation: the scoped view of every tracked
-			// repository IS the store. The wrapper exists to bound a partial
-			// run's reads (per-row scope checks, incident retention, frontier
-			// seeding); on a cold / full-reconciliation batch it is pure
-			// per-row overhead paid by every legacy synthesizer stream.
-			genericScope = g
-		} else {
-			genericScope = newFrameworkScopedStore(g, scope, filePaths)
-		}
+	if executionScope != nil {
+		genericScope = newFrameworkScopedStore(g, executionScope, filePaths)
 	}
 	rep.ScopeMillis = time.Since(scopeStart).Milliseconds()
 	for _, s := range defaultFrameworkSynthesizers() {
 		start := time.Now()
 		var n int
 		var bundle *frameworkPassCandidates
-		if shouldRunFrameworkSynthesizer(s, scope, candidates) {
+		if shouldRunFrameworkSynthesizer(s, executionScope, candidates) {
 			if sf, ok := s.(synthFunc); ok {
 				bundle = candidates.streams.passStreams(g, sf.name)
 				switch {
@@ -1166,18 +1168,18 @@ func runFrameworkSynthesizersScoped(
 					n = runLegacyFrameworkSynth(g, func(store graph.Store) int {
 						return sf.candFn(store, bundle)
 					})
-				case scope == nil:
+				case executionScope == nil:
 					n = runLegacyFrameworkSynth(g, sf.fn)
 				case sf.scopedFn != nil:
-					n = sf.scopedFn(g, scope)
+					n = sf.scopedFn(g, executionScope)
 				default:
 					n = runLegacyFrameworkSynth(genericScope, sf.fn)
 				}
 			} else if ss, ok := s.(scopedSynthesizer); ok {
 				n = runLegacyFrameworkSynth(g, func(store graph.Store) int {
-					return ss.synthesizeScoped(store, scope)
+					return ss.synthesizeScoped(store, executionScope)
 				})
-			} else if scope == nil {
+			} else if executionScope == nil {
 				n = runLegacyFrameworkSynth(g, s.Synthesize)
 			} else {
 				panic("framework partial run has an unscoped synthesizer: " + s.Name())
@@ -1194,8 +1196,8 @@ func runFrameworkSynthesizersScoped(
 	// the claiming resolvers run, so a gated edge cannot be mistaken for a
 	// resolved placeholder downstream. Bridge synthesizers are exempt.
 	gateStart := time.Now()
-	if frameworkFamilyGateNeeded(scope, candidates) {
-		rep.Gated = applyFrameworkFamilyGateScoped(g, scope)
+	if frameworkFamilyGateNeeded(executionScope, candidates) {
+		rep.Gated = applyFrameworkFamilyGateScoped(g, executionScope)
 	}
 	rep.GateMillis = time.Since(gateStart).Milliseconds()
 	// Claiming resolvers run last — after every framework synthesizer has
@@ -1203,7 +1205,7 @@ func runFrameworkSynthesizersScoped(
 	// external-call synthesis classifies the residual unresolved refs as
 	// external. Reported in registration order for determinism.
 	claimStart := time.Now()
-	claimed := RunClaimingResolversScoped(g, scope)
+	claimed := RunClaimingResolversScoped(g, executionScope)
 	rep.ClaimMillis = time.Since(claimStart).Milliseconds()
 	for _, r := range defaultClaimingResolvers() {
 		n := claimed[r.Name()]
@@ -1213,8 +1215,8 @@ func runFrameworkSynthesizersScoped(
 	// Receiver-type gate runs last: it corrects (demotes) already-bound C#
 	// member calls, so it must see the settled call graph.
 	demoteStart := time.Now()
-	if frameworkReceiverGateNeeded(scope, candidates) {
-		rep.ReceiverGated = demoteCSharpMisattributedMemberCallsScoped(g, scope)
+	if frameworkReceiverGateNeeded(executionScope, candidates) {
+		rep.ReceiverGated = demoteCSharpMisattributedMemberCallsScoped(g, executionScope)
 	}
 	rep.DemoteMillis = time.Since(demoteStart).Milliseconds()
 	return rep
