@@ -169,8 +169,16 @@ func (mi *MultiIndexer) ReposInWorkspace(workspaceID string) map[string]bool {
 // Returns the count of nodes and contracts updated for telemetry.
 // Idempotent: re-running on an already-stamped graph is a no-op.
 func (mi *MultiIndexer) BackfillWorkspaceSlugs() (nodesStamped, contractsStamped int) {
-	nodesStamped, contractsStamped, _ = mi.backfillWorkspaceSlugsWithImpact()
+	nodesStamped, contractsStamped, _ = mi.BackfillWorkspaceSlugsWithImpact()
 	return nodesStamped, contractsStamped
+}
+
+// BackfillWorkspaceSlugsWithImpact preserves BackfillWorkspaceSlugs' changed-row
+// telemetry and separately reports node stamps that can alter effective
+// workspace eligibility. Backends without the exact-impact capability fail
+// closed by reporting every changed node as resolution-affecting.
+func (mi *MultiIndexer) BackfillWorkspaceSlugsWithImpact() (nodesStamped, contractsStamped, resolutionAffected int) {
+	return mi.backfillWorkspaceSlugsWithImpact()
 }
 
 // backfillWorkspaceSlugsWithImpact retains public changed-row telemetry and

@@ -937,11 +937,14 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// every file is touched. Idempotent — re-running on a stamped
 	// graph is a no-op.
 	phaseStart = time.Now()
-	backfilledNodes, backfilledContracts := state.multiIndexer.BackfillWorkspaceSlugs()
+	backfillRevisionBefore, backfillRevisionBeforeKnown := state.multiIndexer.GraphMutationRevision()
+	backfilledNodes, backfilledContracts, backfillResolutionAffected := state.multiIndexer.BackfillWorkspaceSlugsWithImpact()
+	backfillRevisionAfter, backfillRevisionAfterKnown := state.multiIndexer.GraphMutationRevision()
 	if backfilledNodes+backfilledContracts > 0 {
 		logger.Info("daemon: backfilled workspace/project slugs from .gortex.yaml",
 			zap.Int("nodes", backfilledNodes),
 			zap.Int("contracts", backfilledContracts),
+			zap.Int("resolution_affected", backfillResolutionAffected),
 			zap.Duration("elapsed", time.Since(phaseStart)))
 	}
 
@@ -950,8 +953,10 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// receipt frontier or through its fail-closed full fallback. In both cases
 	// the later full sweep is redundant only while the graph remains at the
 	// revision captured at completion. Unsupported revisions, an interleaving
-	// writer, a failed pass, or any node slug stamp retain the historical full
-	// safety sweep; contract bridges are reconciled separately.
+	// writer outside the bounded backfill, a failed pass, or a slug stamp that
+	// changes effective workspace eligibility retain the historical full safety
+	// sweep; physical-only stamps are rebased and contract bridges reconcile
+	// separately.
 	currentMutationRevision, currentMutationRevisionKnown := state.multiIndexer.GraphMutationRevision()
 	globalResolveAction := selectWarmGlobalResolveAction(anyChanged, warmGlobalResolveSafety{
 		resolveOK:                     resolveOK,
@@ -960,7 +965,11 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		deferredMutationRevisionKnown: deferredResult.CrossRepoMutationRevisionKnown,
 		currentMutationRevision:       currentMutationRevision,
 		currentMutationRevisionKnown:  currentMutationRevisionKnown,
-		backfilledNodes:               backfilledNodes,
+		backfillRevisionBefore:        backfillRevisionBefore,
+		backfillRevisionBeforeKnown:   backfillRevisionBeforeKnown,
+		backfillRevisionAfter:         backfillRevisionAfter,
+		backfillRevisionAfterKnown:    backfillRevisionAfterKnown,
+		backfillResolutionAffected:    backfillResolutionAffected,
 	}, backfilledContracts)
 	if globalResolveAction != warmGlobalResolveNone {
 		phaseStart = time.Now()
@@ -1027,14 +1036,15 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	default:
 		state.multiIndexer.EndBatch()
 	}
-	postBatchNodes, postBatchContracts := state.multiIndexer.BackfillWorkspaceSlugs()
+	postBatchNodes, postBatchContracts, postBatchResolutionAffected := state.multiIndexer.BackfillWorkspaceSlugsWithImpact()
 	if postBatchNodes+postBatchContracts > 0 {
 		logger.Info("daemon: backfilled workspace/project slugs after derived passes",
 			zap.Int("nodes", postBatchNodes),
-			zap.Int("contracts", postBatchContracts))
+			zap.Int("contracts", postBatchContracts),
+			zap.Int("resolution_affected", postBatchResolutionAffected))
 	}
 	switch selectWarmGlobalResolveAction(false, warmGlobalResolveSafety{
-		backfilledNodes: postBatchNodes,
+		backfillResolutionAffected: postBatchResolutionAffected,
 	}, postBatchContracts) {
 	case warmGlobalResolveContracts:
 		reconciled := state.multiIndexer.ReconcileContractEdges()
@@ -1042,7 +1052,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			zap.Int("contract_edges", reconciled))
 	case warmGlobalResolveFull:
 		state.multiIndexer.RunGlobalResolve()
-		logger.Info("daemon: post-batch node migration forced full cross-repo catch-up")
+		logger.Info("daemon: post-batch workspace eligibility change forced full cross-repo catch-up")
 	}
 	timings.endBatch = time.Since(phaseStart)
 	logger.Info("daemon: warmup phase done",
@@ -1308,7 +1318,11 @@ type warmGlobalResolveSafety struct {
 	deferredMutationRevisionKnown bool
 	currentMutationRevision       uint64
 	currentMutationRevisionKnown  bool
-	backfilledNodes               int
+	backfillRevisionBefore        uint64
+	backfillRevisionBeforeKnown   bool
+	backfillRevisionAfter         uint64
+	backfillRevisionAfterKnown    bool
+	backfillResolutionAffected    int
 }
 
 type warmGlobalResolveAction uint8
@@ -1320,21 +1334,25 @@ const (
 )
 
 // canSkipWarmGlobalResolve requires both successful earlier resolution and a
-// generation proof that no graph writer interleaved after deferred catch-up.
-// Branch-selection flags do not strengthen that proof. Unknown revision
-// capability fails closed, while a node stamp independently invalidates the
-// proof by changing cross-workspace eligibility.
+// generation proof around the bounded workspace-slug backfill. Physical
+// project/default-workspace stamps may advance a backend's coarse revision but
+// preserve cross-repo eligibility, so the deferred frontier must match the
+// pre-backfill revision and the post-backfill revision must still be current.
+// Unknown revision capability and any writer outside that interval fail closed.
 func canSkipWarmGlobalResolve(s warmGlobalResolveSafety) bool {
 	return s.resolveOK &&
 		s.deferredCrossRepoComplete &&
 		s.deferredMutationRevisionKnown &&
 		s.currentMutationRevisionKnown &&
-		s.deferredMutationRevision == s.currentMutationRevision &&
-		s.backfilledNodes == 0
+		s.backfillRevisionBeforeKnown &&
+		s.backfillRevisionAfterKnown &&
+		s.deferredMutationRevision == s.backfillRevisionBefore &&
+		s.backfillRevisionAfter == s.currentMutationRevision &&
+		s.backfillResolutionAffected == 0
 }
 
 func selectWarmGlobalResolveAction(anyChanged bool, safety warmGlobalResolveSafety, backfilledContracts int) warmGlobalResolveAction {
-	if safety.backfilledNodes > 0 {
+	if safety.backfillResolutionAffected > 0 {
 		return warmGlobalResolveFull
 	}
 	if anyChanged {
