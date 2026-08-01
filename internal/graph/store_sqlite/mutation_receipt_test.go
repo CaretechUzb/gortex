@@ -219,6 +219,42 @@ func TestSQLiteMutationReceiptDuplicateNodeBatchNamesIncompleteReason(t *testing
 	}
 }
 
+func TestSQLiteMutationReceiptDuplicateContractOwnersRemainExact(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	const (
+		contractID = "ws::error"
+		providerID = "trellis/provider.go::serveError"
+		consumerID = "axonhub/consumer.js::syncError"
+	)
+	store.AddBatch([]*graph.Node{
+		{ID: contractID, Kind: graph.KindContract, Name: contractID, FilePath: "old/socket.go", RepoPrefix: "trellis", Meta: map[string]any{"role": "provider"}},
+		{ID: providerID, Kind: graph.KindFunction, Name: "serveError", FilePath: "provider.go", RepoPrefix: "trellis"},
+		{ID: consumerID, Kind: graph.KindFunction, Name: "syncError", FilePath: "consumer.js", RepoPrefix: "axonhub"},
+	}, nil)
+
+	token := store.BeginMutationReceipt()
+	store.AddBatch([]*graph.Node{
+		{ID: contractID, Kind: graph.KindContract, Name: contractID, FilePath: "provider.go", RepoPrefix: "trellis", Meta: map[string]any{"role": "provider"}},
+		{ID: contractID, Kind: graph.KindContract, Name: contractID, FilePath: "consumer.js", RepoPrefix: "axonhub", Meta: map[string]any{"role": "consumer"}},
+	}, []*graph.Edge{
+		{From: providerID, To: contractID, Kind: graph.EdgeProvides, FilePath: "provider.go", Line: 10},
+		{From: consumerID, To: contractID, Kind: graph.EdgeConsumes, FilePath: "consumer.js", Line: 20},
+	})
+	receipt := store.EndMutationReceipt(token)
+	if !receipt.Complete || receipt.ResolutionRelevant || receipt.IncompleteReason != "" {
+		t.Fatalf("duplicate contract receipt = %+v, want complete and resolution-irrelevant", receipt)
+	}
+	if got := store.GetNode(contractID); got == nil || got.FilePath != "consumer.js" || got.RepoPrefix != "axonhub" || got.Meta["role"] != "consumer" {
+		t.Fatalf("final contract node = %+v, want last owner representation", got)
+	}
+	if edges := store.GetOutEdges(providerID); len(edges) != 1 || edges[0].To != contractID || edges[0].Kind != graph.EdgeProvides {
+		t.Fatalf("provider edges = %+v, want retained provides edge", edges)
+	}
+	if edges := store.GetOutEdges(consumerID); len(edges) != 1 || edges[0].To != contractID || edges[0].Kind != graph.EdgeConsumes {
+		t.Fatalf("consumer edges = %+v, want retained consumes edge", edges)
+	}
+}
+
 func TestSQLiteMutationReceiptDuplicateSemanticEnrichmentKeepsExactReceipt(t *testing.T) {
 	store := openMutationReceiptStore(t)
 	const id = "repo/a.go::A"

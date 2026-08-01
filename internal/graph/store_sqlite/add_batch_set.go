@@ -665,7 +665,8 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 				// occurrences of the same ID carried enrichment-only differences.
 				recordSQLiteAddedNode(receiptDelta, node)
 			} else if !oldIdentity.equalsNode(node) {
-				if inputCounts[id] > 1 {
+				if inputCounts[id] > 1 &&
+					(graph.IsReferenceableSymbol(graph.NodeKind(oldIdentity.kind)) || graph.IsReferenceableSymbol(node.Kind)) {
 					receiptDelta.noteIncomplete("duplicate_node_batch")
 				} else {
 					recordSQLiteChangedNodeIdentity(receiptDelta, oldIdentity, node)
