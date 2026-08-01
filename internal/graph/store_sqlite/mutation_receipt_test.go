@@ -105,6 +105,48 @@ func TestSQLiteMutationReceiptDuplicateNodeBatchNamesIncompleteReason(t *testing
 	}
 }
 
+func TestSQLiteMutationReceiptDuplicateSemanticEnrichmentKeepsExactReceipt(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	const id = "repo/a.go::A"
+	store.AddNode(&graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"})
+
+	token := store.BeginMutationReceipt()
+	store.AddBatch([]*graph.Node{
+		{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo", Meta: map[string]any{"semantic_type": "string", "semantic_source": "lsp"}},
+		{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo", Meta: map[string]any{"semantic_type": "number", "semantic_source": "lsp"}},
+	}, nil)
+	receipt := store.EndMutationReceipt(token)
+	if !receipt.Complete || receipt.ResolutionRelevant {
+		t.Fatalf("enrichment-only duplicate batch receipt = %+v, want complete and resolution-irrelevant", receipt)
+	}
+	if got := store.GetNode(id); got == nil || got.Meta["semantic_type"] != "number" {
+		t.Fatalf("final enriched node = %+v, want semantic_type number", got)
+	}
+}
+
+func TestSQLiteMutationReceiptNewDuplicateNodeRecordsFinalIdentity(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	const id = "repo/a.go::A"
+
+	token := store.BeginMutationReceipt()
+	store.AddBatch([]*graph.Node{
+		{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo", Meta: map[string]any{"semantic_type": "string"}},
+		{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo", Meta: map[string]any{"semantic_type": "number"}},
+	}, nil)
+	receipt := store.EndMutationReceipt(token)
+	if !receipt.Complete || !receipt.ResolutionRelevant {
+		t.Fatalf("new duplicate batch receipt = %+v, want complete resolution delta", receipt)
+	}
+	if want := []string{"a.go"}; !slices.Equal(receipt.ResolutionFiles(), want) {
+		t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), want)
+	}
+	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "A", "pkg.A")
+	assertSQLiteReceiptContains(t, "target ids", receipt.TargetIDs, id)
+	if got := store.GetNode(id); got == nil || got.Meta["semantic_type"] != "number" {
+		t.Fatalf("final new node = %+v, want semantic_type number", got)
+	}
+}
+
 func TestSQLiteMutationReceiptBatchRollbackPublishesNothing(t *testing.T) {
 	store := openMutationReceiptStore(t)
 	token := store.BeginMutationReceipt()

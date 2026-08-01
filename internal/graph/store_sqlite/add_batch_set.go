@@ -654,24 +654,22 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 			inputCounts[node.ID]++
 			lastNodes[node.ID] = node
 		}
-		for id, changedCount := range changedNodeIDs {
+		for id := range changedNodeIDs {
 			node := lastNodes[id]
 			oldIdentity, oldFound := identities[id]
-			if inputCounts[id] > 1 {
-				// RETURNING identifies every changed ID but cannot identify which
-				// duplicate occurrence was a no-op. Fail closed while retaining the
-				// useful final definition frontier.
-				receiptDelta.noteIncomplete("duplicate_node_batch")
-				receiptDelta.resolutionRelevant = true
-				if !oldFound && changedCount > 0 {
-					recordSQLiteAddedNode(receiptDelta, node)
-				}
-			} else if !identityExact {
+			if !identityExact {
 				receiptDelta.noteIncomplete("node_identity_preload_failed")
 			} else if !oldFound {
+				// The transaction exposes only the final duplicate occurrence. A
+				// newly created final identity is therefore exact even when earlier
+				// occurrences of the same ID carried enrichment-only differences.
 				recordSQLiteAddedNode(receiptDelta, node)
 			} else if !oldIdentity.equalsNode(node) {
-				receiptDelta.noteIncomplete("node_identity_changed")
+				if inputCounts[id] > 1 {
+					receiptDelta.noteIncomplete("duplicate_node_batch")
+				} else {
+					receiptDelta.noteIncomplete("node_identity_changed")
+				}
 			}
 		}
 		for id, node := range lastNodes {
