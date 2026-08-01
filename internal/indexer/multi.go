@@ -522,8 +522,35 @@ func (mi *MultiIndexer) SeedPendingEnrichAll() int {
 	return pending
 }
 
+// DeferredPassesResult reports whether the deferred tail stayed on an exact
+// mutation frontier. ExactCrossRepoComplete is deliberately false after any
+// fail-closed fallback, even though that fallback performs a full pass: daemon
+// warmup may use true to elide its later safety sweep, while every uncertain
+// receipt shape retains the historical second check.
+type DeferredPassesResult struct {
+	EnrichScheduled        int
+	ExactCrossRepoComplete bool
+}
+
 func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) int {
-	return mi.BeginDeferredPasses(ctx, nil).FinishTail()
+	return mi.RunDeferredPassesAllResult(ctx).EnrichScheduled
+}
+
+// RunDeferredPassesAllResult is the result-bearing orchestration form used by
+// lifecycle callers that must decide whether a later global safety sweep is
+// still required. RunDeferredPassesAll preserves the compatibility surface.
+func (mi *MultiIndexer) RunDeferredPassesAllResult(ctx context.Context) DeferredPassesResult {
+	return mi.BeginDeferredPasses(ctx, nil).FinishTailResult()
+}
+
+// finishColdDeferredPasses completes the cold-index deferred tail without
+// repeating the whole-graph cross-repository resolver. The receipt-guided tail
+// already performs either exact cross-repository catch-up or a fail-closed full
+// pass; only contract-bridge reconciliation remains afterward.
+func (mi *MultiIndexer) finishColdDeferredPasses(ctx context.Context) DeferredPassesResult {
+	result := mi.RunDeferredPassesAllResult(ctx)
+	mi.ReconcileContractEdges()
+	return result
 }
 
 // DeferredPassesRun is one in-flight execution of the deferred pass pipeline,
@@ -543,15 +570,14 @@ type DeferredPassesRun struct {
 	indexerCount    int
 	receiptStore    graph.MutationReceiptStore
 	receiptToken    graph.MutationReceiptToken
+	receiptOpen     bool
 	poolDone        chan struct{}
 	restoreGCTune   func()
 	// unresolvedCounter/-Base bound the deferred window's unresolved-target
-	// writes. When the counter is unchanged at FinishTail, the incomplete-
-	// receipt whole-graph fallback resolve is provably a no-op and is
-	// skipped. The base is re-snapshotted at apply-gate open (before any
-	// parked apply can run) so the master resolver's own in-window writes —
-	// e.g. guard reverts, already handled by that same pass — don't defeat
-	// the skip.
+	// writes for diagnostics. The base is re-snapshotted at apply-gate open
+	// (before any parked apply can run), so resolver writes are excluded. A
+	// flat counter is not exact evidence by itself: new definitions and
+	// already-resolved cross-repo edges still require receipt-guided catch-up.
 	unresolvedCounter graph.UnresolvedInsertionCounter
 	unresolvedBase    uint64
 }
@@ -566,19 +592,33 @@ func (r *DeferredPassesRun) SnapshotUnresolvedBase() {
 	}
 }
 
-// BeginDeferredPasses selects the repos with deferred work, opens the
+// BeginApplyMutationReceipt opens the exact observation window for semantic
+// applies and contract commits. Warmup calls it after pre-enrichment resolution
+// has completed and before closing the apply gate, so resolver writes cannot
+// void the receipt and no parked apply can escape it. It is idempotent.
+func (r *DeferredPassesRun) BeginApplyMutationReceipt() {
+	if r == nil {
+		return
+	}
+	r.SnapshotUnresolvedBase()
+	if r.receiptStore == nil || r.receiptOpen {
+		return
+	}
+	r.receiptToken = r.receiptStore.BeginMutationReceipt()
+	r.receiptOpen = true
+}
+
+// BeginDeferredPasses selects the repos with deferred work, prepares the
 // mutation-receipt window, materialises go.mod dependencies, and launches the
 // enrichment pool on its own goroutine. The caller must call FinishTail (which
 // joins the pool) exactly once. applyGate, when non-nil, parks every
 // provider's graph-apply phase until the caller closes it — the caller MUST
-// close it (typically when its resolve phase completes) or FinishTail
-// deadlocks.
+// first call BeginApplyMutationReceipt after its resolve phase, then close the
+// gate, or FinishTail deadlocks.
 //
-// When the pool is overlapped with a resolve phase, the resolver's writes land
-// inside the receipt window and void it, so the tail's catch-up resolve takes
-// the whole-graph fallback — the fail-closed path it already had — instead of
-// the exact-files fast path. That trade is the overlap's cost and is bounded
-// by terminal-stamping (the fallback scans only the surviving pending set).
+// Without an apply gate the receipt opens here. With overlap, delaying it until
+// the apply boundary excludes resolver writes while still observing every
+// semantic apply and contract commit, preserving an exact file frontier.
 func (mi *MultiIndexer) BeginDeferredPasses(_ context.Context, applyGate <-chan struct{}) *DeferredPassesRun {
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
@@ -631,24 +671,18 @@ func (mi *MultiIndexer) BeginDeferredPasses(_ context.Context, applyGate <-chan 
 	}
 
 	// Keep the receipt window exact: only go.mod materialisation, semantic
-	// enrichment, and contract commits are observed (plus, under overlap, the
-	// resolver — which voids it, see above). The capability is optional;
-	// unsupported stores retain the conservative scheduled-work fallback.
-	// Under overlap (applyGate != nil) the resolver runs inside the receipt
-	// window and ALWAYS voids it — the receipt is discarded as incomplete on
-	// every such run, yet its per-write identity bookkeeping
-	// (mutationNodeIdentitiesTx: one identity SELECT per batched ID) taxes
-	// every enrichment apply in the window. Don't open a doomed receipt;
-	// the unresolved-insertion counter below carries the skip/fallback
-	// decision instead.
-	if applyGate == nil {
-		run.receiptStore, _ = mi.graph.(graph.MutationReceiptStore)
-		if run.receiptStore != nil {
-			run.receiptToken = run.receiptStore.BeginMutationReceipt()
-		}
-	}
+	// enrichment, and contract commits are observed. Without an apply gate the
+	// deferred pipeline starts after base resolution, so the window may open
+	// now and include go.mod work. With overlap, warmup opens it later — after
+	// pre-enrichment resolution and immediately before releasing parked applies.
+	// Unsupported stores retain the conservative scheduled-work fallback.
+	run.receiptStore, _ = mi.graph.(graph.MutationReceiptStore)
 	run.unresolvedCounter, _ = mi.graph.(graph.UnresolvedInsertionCounter)
-	run.SnapshotUnresolvedBase()
+	if applyGate == nil {
+		run.BeginApplyMutationReceipt()
+	} else {
+		run.SnapshotUnresolvedBase()
+	}
 
 	// Per-repo deferred work starts with serial go.mod materialisation.
 	// Semantic enrichment then runs in bounded parallel lanes on its own
@@ -666,10 +700,14 @@ func (mi *MultiIndexer) BeginDeferredPasses(_ context.Context, applyGate <-chan 
 // Wait blocks until every enrichment lane has drained.
 func (r *DeferredPassesRun) Wait() { <-r.poolDone }
 
-// FinishTail joins the enrichment pool, runs the contract passes, closes the
-// receipt window, and performs the deferred-mutation catch-up resolve. It
-// returns the number of repos that had enrichment scheduled.
+// FinishTail preserves the compatibility result used by existing callers.
 func (r *DeferredPassesRun) FinishTail() int {
+	return r.FinishTailResult().EnrichScheduled
+}
+
+// FinishTailResult joins the enrichment pool, runs the contract passes, closes
+// the receipt window, and performs the deferred-mutation catch-up resolve.
+func (r *DeferredPassesRun) FinishTailResult() DeferredPassesResult {
 	r.Wait()
 	// Contract passes run serially only after every enrichment lane has
 	// drained: the "no contract mutation overlaps enrichment" invariant
@@ -680,9 +718,10 @@ func (r *DeferredPassesRun) FinishTail() int {
 		idx.runDeferredContractsAndReleaseSemanticState()
 	}
 	var mutationReceipt *graph.MutationReceipt
-	if r.receiptStore != nil {
+	if r.receiptStore != nil && r.receiptOpen {
 		receipt := r.receiptStore.EndMutationReceipt(r.receiptToken)
 		mutationReceipt = &receipt
+		r.receiptOpen = false
 	}
 	for _, idx := range r.workIndexers {
 		idx.SetSkipResolveInDeferred(false)
@@ -691,11 +730,14 @@ func (r *DeferredPassesRun) FinishTail() int {
 	scope := normalizeDeferredCatchupScope(r.catchupScope, r.catchupKnown, r.indexerCount)
 	noNewUnresolved := r.unresolvedCounter != nil &&
 		r.unresolvedCounter.UnresolvedEdgeInsertions() == r.unresolvedBase
-	r.mi.resolveDeferredMutations(mutationReceipt, r.catchupNeeded, scope, noNewUnresolved)
+	mode := r.mi.resolveDeferredMutations(mutationReceipt, r.catchupNeeded, scope, noNewUnresolved)
 	if r.restoreGCTune != nil {
 		r.restoreGCTune()
 	}
-	return r.enrichScheduled
+	return DeferredPassesResult{
+		EnrichScheduled:        r.enrichScheduled,
+		ExactCrossRepoComplete: mode != deferredResolveFallback,
+	}
 }
 
 // normalizeDeferredCatchupScope preserves the resolver's full-pass semantics
@@ -2008,16 +2050,12 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 			if err := mi.RunPreEnrichResolve(deferCtx, nil, nil); err != nil {
 				return results, fmt.Errorf("multi-repo pre-enrichment resolve: %w", err)
 			}
-			enrichScheduled := mi.RunDeferredPassesAll(deferCtx)
+			deferredResult := mi.finishColdDeferredPasses(deferCtx)
 			mi.logger.Info("multi-repo coordinated deferred passes complete",
 				zap.Int("repos_indexed", len(results)),
 				zap.Int("repos_failed", len(indexErrors)),
-				zap.Int("enrich_scheduled", enrichScheduled))
-
-			// Semantic and contract passes can add new cross-repository candidates.
-			// Refresh them once after the receipt-scoped same-repo catch-up and reconcile
-			// contract bridges before graph-wide derivation consumes the final graph.
-			mi.runCrossRepoResolve(true)
+				zap.Int("enrich_scheduled", deferredResult.EnrichScheduled),
+				zap.Bool("exact_cross_repo_complete", deferredResult.ExactCrossRepoComplete))
 
 			// ResolveAll normally seeds ref_facts after a full resolve. The coordinated
 			// cold path intentionally bypasses per-repository ResolveAll, so seed the

@@ -103,3 +103,37 @@ func TestWarmMtimePrefix(t *testing.T) {
 		})
 	}
 }
+
+func TestCanSkipWarmGlobalResolveRequiresEveryExactSafetySignal(t *testing.T) {
+	base := warmGlobalResolveSafety{
+		exactDelta:                     true,
+		resolveOK:                      true,
+		deferredExactCrossRepoComplete: true,
+	}
+	if !canSkipWarmGlobalResolve(base) {
+		t.Fatal("fully exact warm delta should elide the duplicate full cross-repo sweep")
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*warmGlobalResolveSafety)
+	}{
+		{"initial frontier not exact", func(s *warmGlobalResolveSafety) { s.exactDelta = false }},
+		{"pre-enrichment resolve failed", func(s *warmGlobalResolveSafety) { s.resolveOK = false }},
+		{"deferred catch-up fell back", func(s *warmGlobalResolveSafety) { s.deferredExactCrossRepoComplete = false }},
+		{"repository scope unknown", func(s *warmGlobalResolveSafety) { s.scopeUnknown = true }},
+		{"snapshot partial", func(s *warmGlobalResolveSafety) { s.snapshotPartial = true }},
+		{"store needs rebuild", func(s *warmGlobalResolveSafety) { s.needsRebuild = true }},
+		{"operator forced full resolve", func(s *warmGlobalResolveSafety) { s.forcedFull = true }},
+		{"workspace slug stamped nodes", func(s *warmGlobalResolveSafety) { s.backfilledNodes = 1 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			safety := base
+			tc.mutate(&safety)
+			if canSkipWarmGlobalResolve(safety) {
+				t.Fatal("unsafe warmup shape elided the full cross-repo sweep")
+			}
+		})
+	}
+}

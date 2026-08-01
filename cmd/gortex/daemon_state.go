@@ -738,11 +738,18 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		}
 		return true
 	})
+	needsRebuild := storeNeedsRebuild(state.graph)
+	forcedFullResolve := warmupFullResolveForced()
 	deltaPlans, deltaFiles, exactWarmDelta := deltaFrontier.snapshot(
 		int(changedRepos.Load()), scopeUnknown.Load(),
 	)
+	// The exact file frontier must not bypass lifecycle-wide safety signals or
+	// the operator override. These conditions already force a full master
+	// scope below; apply them to the branch selector too.
+	exactWarmDelta = exactWarmDelta && len(deltaFiles) > 0 && !state.snapshotPartial && !needsRebuild && !forcedFullResolve
 	logger.Info("daemon: warmup delta frontier",
 		zap.Bool("exact", exactWarmDelta),
+		zap.Bool("forced_full_resolve", forcedFullResolve),
 		zap.Int("repos", len(deltaPlans)),
 		zap.Int("files", len(deltaFiles)))
 
@@ -753,7 +760,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// global passes switch is honoured downstream in runMasterResolve,
 	// matching ArmBatchScope.
 	resolveScope := warmupResolveScope(changed, len(repos), anyChanged,
-		scopeUnknown.Load(), state.snapshotPartial, storeNeedsRebuild(state.graph))
+		scopeUnknown.Load(), state.snapshotPartial, needsRebuild)
 
 	// Resume enrichment for any repo a prior process left partial / abandoned.
 	// Seeded BEFORE the resolve phase so the overlapped enrichment pool below
@@ -777,11 +784,11 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	if (anyChanged || enrichPending > 0) && os.Getenv("GORTEX_ENRICH_OVERLAP") != "0" {
 		applyGate := make(chan struct{})
 		openApplyGate = sync.OnceFunc(func() {
-			// Re-base the deferred window's unresolved-write counter before
-			// any parked apply can run: the resolve phase's own in-window
-			// writes (guard reverts, cross-repo binds) are its own to handle
-			// and must not force the post-enrichment fallback resolve.
-			deferredRun.SnapshotUnresolvedBase()
+			// Open the mutation receipt only after pre-enrichment resolution has
+			// settled and strictly before any parked semantic apply can run. This
+			// excludes resolver writes that used to void every overlap receipt,
+			// while retaining exact coverage of applies and contract commits.
+			deferredRun.BeginApplyMutationReceipt()
 			logger.Info("daemon: enrichment apply gate opened")
 			close(applyGate)
 		})
@@ -852,14 +859,18 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// re-runs the master resolver to lift placeholder edges the enrichment +
 	// contract passes add. When the pool was started ahead of resolve, this
 	// block only joins the surviving lanes and runs the tail.
+	deferredExactCrossRepoComplete := false
 	if anyChanged || enrichPending > 0 {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "deferred_passes_all", true, nil)
+		var deferredResult indexer.DeferredPassesResult
 		if deferredRun != nil {
-			timings.enrichScheduled = deferredRun.FinishTail()
+			deferredResult = deferredRun.FinishTailResult()
 		} else {
-			timings.enrichScheduled = state.multiIndexer.RunDeferredPassesAll(ctx)
+			deferredResult = state.multiIndexer.RunDeferredPassesAllResult(ctx)
 		}
+		timings.enrichScheduled = deferredResult.EnrichScheduled
+		deferredExactCrossRepoComplete = deferredResult.ExactCrossRepoComplete
 		timings.enrich = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "deferred_passes_all"),
@@ -924,31 +935,47 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// every file is touched. Idempotent — re-running on a stamped
 	// graph is a no-op.
 	phaseStart = time.Now()
-	if nodes, conts := state.multiIndexer.BackfillWorkspaceSlugs(); nodes+conts > 0 {
+	backfilledNodes, backfilledContracts := state.multiIndexer.BackfillWorkspaceSlugs()
+	if backfilledNodes+backfilledContracts > 0 {
 		logger.Info("daemon: backfilled workspace/project slugs from .gortex.yaml",
-			zap.Int("nodes", nodes),
-			zap.Int("contracts", conts),
+			zap.Int("nodes", backfilledNodes),
+			zap.Int("contracts", backfilledContracts),
 			zap.Duration("elapsed", time.Since(phaseStart)))
 	}
 
-	// Run a cross-repo resolution pass once warmup has stamped the
-	// workspace slugs. Files touched by IncrementalReindexPaths already
-	// re-resolve via the per-repo Resolver; this catches cross-repo
-	// edges in unchanged files plus stamps cross_workspace_deps
-	// eligibility on stubs. Mirrors what MultiIndexer.IndexAll does
-	// for a fresh-start daemon (where there's no snapshot to reconcile
-	// against). After resolution, contract bridge edges may have
-	// changed too, so ReconcileContractEdges runs again.
+	// Run a cross-repo resolution pass once warmup has stamped the workspace
+	// slugs. An exact pre-enrichment frontier plus an exact deferred receipt has
+	// already completed outgoing, incoming, and parallel-edge catch-up; when no
+	// node slug changed, only contract bridges need reconciliation. Every
+	// uncertain lifecycle shape retains the historical full safety sweep.
 	if anyChanged {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "global_resolve", true, nil)
-		state.multiIndexer.RunGlobalResolve()
+		skipFullCrossRepo := canSkipWarmGlobalResolve(warmGlobalResolveSafety{
+			exactDelta:                     exactWarmDelta,
+			resolveOK:                      resolveOK,
+			deferredExactCrossRepoComplete: deferredExactCrossRepoComplete,
+			scopeUnknown:                   scopeUnknown.Load(),
+			snapshotPartial:                state.snapshotPartial,
+			needsRebuild:                   needsRebuild,
+			forcedFull:                     forcedFullResolve,
+			backfilledNodes:                backfilledNodes,
+		})
+		if skipFullCrossRepo {
+			reconciled := state.multiIndexer.ReconcileContractEdges()
+			logger.Info("daemon: exact warm cross-repo catch-up complete; skipped full sweep",
+				zap.Int("contract_edges", reconciled))
+		} else {
+			state.multiIndexer.RunGlobalResolve()
+		}
 		timings.globalResolve = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "global_resolve"),
+			zap.Bool("full_cross_repo", !skipFullCrossRepo),
 			zap.Duration("elapsed", time.Since(phaseStart)))
 		publishReadinessPhase(state, "global_resolve_done", true, map[string]any{
-			"elapsed_ms": time.Since(phaseStart).Milliseconds(),
+			"elapsed_ms":      time.Since(phaseStart).Milliseconds(),
+			"full_cross_repo": !skipFullCrossRepo,
 		})
 	}
 
@@ -1249,6 +1276,32 @@ func reconcileFileCount(res *indexer.IndexResult) int {
 func storeNeedsRebuild(g any) bool {
 	rb, ok := g.(interface{ NeedsRebuild() bool })
 	return ok && rb.NeedsRebuild()
+}
+
+type warmGlobalResolveSafety struct {
+	exactDelta                     bool
+	resolveOK                      bool
+	deferredExactCrossRepoComplete bool
+	scopeUnknown                   bool
+	snapshotPartial                bool
+	needsRebuild                   bool
+	forcedFull                     bool
+	backfilledNodes                int
+}
+
+// canSkipWarmGlobalResolve is deliberately conjunctive: only a fully exact
+// initial frontier and deferred tail may replace the final full cross-repo
+// safety sweep. Workspace-slug node stamps happen after those passes and can
+// change cross-workspace eligibility, so any stamp forces the full sweep.
+func canSkipWarmGlobalResolve(s warmGlobalResolveSafety) bool {
+	return s.exactDelta &&
+		s.resolveOK &&
+		s.deferredExactCrossRepoComplete &&
+		!s.scopeUnknown &&
+		!s.snapshotPartial &&
+		!s.needsRebuild &&
+		!s.forcedFull &&
+		s.backfilledNodes == 0
 }
 
 // warmupFullResolveForced reports whether the operator pinned the warm-restart
