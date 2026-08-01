@@ -725,54 +725,56 @@ const (
 // heuristic predicted mutations; an incomplete receipt always fails closed to
 // a whole-graph pass. nil means the store does not support receipts yet.
 func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt, fallbackNeeded bool, fallbackScope map[string]struct{}, noNewUnresolved bool) deferredResolveMode {
-	// The counter's verdict holds regardless of receipt availability: zero
-	// unresolved-target writes in the window means the catch-up resolve —
-	// receipt-scoped, heuristic-scoped, or whole-graph — has provably
-	// nothing to bind.
-	if noNewUnresolved {
-		mi.logger.Info("DEFERRED-TIMING no unresolved-target writes in deferred window; skipping catch-up resolve")
-		return deferredResolveSkipped
+	fullFallback := func(masterScope map[string]struct{}, reason string) deferredResolveMode {
+		// A flat unresolved-insertion counter cannot prove that cross-repository
+		// catch-up is empty: enrichment may add a definition that binds an old
+		// incoming stub, or add an already-resolved base edge whose parallel
+		// cross_repo_* edge still needs materialising. Only a complete receipt
+		// with an exact file frontier may avoid this fail-closed pass.
+		if noNewUnresolved {
+			mi.logger.Info("DEFERRED-TIMING unresolved-target counter unchanged; retaining fallback for definitions and resolved cross-repo edges",
+				zap.String("reason", reason))
+		}
+		mi.runMasterResolve(masterScope, false)
+		mi.runCrossRepoResolve(false)
+		resolver.DetectCrossRepoEdges(mi.graph)
+		return deferredResolveFallback
 	}
+
 	if receipt != nil {
 		if !receipt.Complete {
-			if noNewUnresolved {
-				// The receipt was voided (overlap does this by design), but
-				// the store counted zero unresolved-target edge writes since
-				// the apply gate opened — nothing exists for a whole-graph
-				// fallback to resolve that the master pass hasn't already
-				// seen. Measured cost of the blind fallback: 68.8s to
-				// resolve 0 of 282,669 pending.
-				mi.logger.Info("DEFERRED-TIMING mutation receipt incomplete but no unresolved-target writes in window; skipping fallback resolve",
-					zap.String("incomplete_reason", receipt.IncompleteReason))
-				return deferredResolveSkipped
-			}
 			mi.logger.Info("DEFERRED-TIMING mutation receipt incomplete; resolving all",
 				zap.String("incomplete_reason", receipt.IncompleteReason))
-			mi.runMasterResolve(nil, false)
-			return deferredResolveFallback
+			return fullFallback(nil, receipt.IncompleteReason)
 		}
-		if !receipt.ResolutionRelevant {
-			mi.logger.Info("DEFERRED-TIMING mutation receipt has no resolution delta",
+
+		files := receipt.ResolutionFiles()
+		if receipt.ResolutionRelevant && len(files) == 0 {
+			// Completeness implementations should already reject this shape, but
+			// keep the consumer fail-closed if a future backend gets it wrong.
+			mi.logger.Warn("DEFERRED-TIMING resolution delta lacks exact files; resolving all")
+			return fullFallback(nil, "resolution_delta_without_files")
+		}
+		if len(files) == 0 {
+			mi.logger.Info("DEFERRED-TIMING mutation receipt has no file-scoped resolution or cross-repo delta",
 				zap.Int("changed_files", len(receipt.ChangedFiles)),
 				zap.Int("target_ids", len(receipt.TargetIDs)))
 			return deferredResolveSkipped
 		}
-		files := receipt.ResolutionFiles()
-		if len(files) == 0 {
-			// Completeness implementations should already reject this shape, but
-			// keep the consumer fail-closed if a future backend gets it wrong.
-			mi.logger.Warn("DEFERRED-TIMING resolution delta lacks exact files; resolving all")
-			mi.runMasterResolve(nil, false)
-			return deferredResolveFallback
+
+		if receipt.ResolutionRelevant {
+			mi.runMasterResolveFiles(files, false)
 		}
-		mi.runMasterResolveFiles(files, false)
+		// Resolve both outgoing edges from the changed files and incoming stubs
+		// that name definitions in those files, then materialise the parallel
+		// cross_repo_* edge generation for already-resolved base edges too.
+		mi.runCrossRepoResolveFiles(files)
 		return deferredResolveExact
 	}
 	if !fallbackNeeded {
 		return deferredResolveSkipped
 	}
-	mi.runMasterResolve(fallbackScope, false)
-	return deferredResolveFallback
+	return fullFallback(fallbackScope, "mutation_receipt_unavailable")
 }
 
 // runMasterResolve runs one same-repo resolver over the whole shared graph,
