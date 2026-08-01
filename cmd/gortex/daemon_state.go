@@ -523,180 +523,185 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	var changedPrefixes sync.Map
 	var scopeUnknown atomic.Bool
 	deltaFrontier := newWarmupDeltaFrontier()
-	coordinatedBulk, _ := state.graph.(graph.CoordinatedBulkLoader)
-	coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
-	defer func() {
-		if coordinatedBulkActive {
-			if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
-				logger.Error("daemon: coordinated cold bulk-load cleanup failed", zap.Error(err))
+	if err := state.multiIndexer.RunRepositoryTopologyBatch(ctx, func(batchCtx context.Context) error {
+		coordinatedBulk, _ := state.graph.(graph.CoordinatedBulkLoader)
+		coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
+		defer func() {
+			if coordinatedBulkActive {
+				if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+					logger.Error("daemon: coordinated cold bulk-load cleanup failed", zap.Error(err))
+				}
 			}
-		}
-	}()
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for entry := range jobs {
-				// Per-entry panic guard so one repo's crash during
-				// reindex doesn't kill the worker — the bad repo logs
-				// and skips, the worker proceeds to the next job, and
-				// warmup completes.
-				func(entry config.RepoEntry) {
-					defer func() {
-						if r := recover(); r != nil {
-							logger.Error("daemon: warmup repo panic recovered",
-								zap.String("path", entry.Path),
-								zap.Any("panic", r))
-							changedRepos.Add(1)
-							scopeUnknown.Store(true)
-							deltaFrontier.invalidate()
-						}
-					}()
-					// Route repos whose nodes came from the snapshot through
-					// ReconcileRepoCtx — it calls IncrementalReindexPaths, which
-					// evicts files deleted while the daemon was down and
-					// re-indexes only files whose mtime changed. Repos not in
-					// the snapshot (newly tracked, or first startup after a
-					// schema bump) fall back to TrackRepoCtx, which does a
-					// full walk. Both paths end with the repo registered on
-					// the MultiIndexer; contract reconciliation is deferred
-					// to the single RunGlobalResolve call below.
-					//
-					// snapshotPartial == true forces the full-walk path even
-					// when prior mtimes exist: the partial-load signal means
-					// the persisted resolution state is no longer trustworthy
-					// (stale edges were dropped because their targets vanished),
-					// and the incremental path only re-resolves files whose
-					// mtime changed — so the dropped edges would never come
-					// back. Without this override every restart progressively
-					// erodes the graph until exported methods show zero
-					// callers despite having dozens of real call sites.
-					repoStart := time.Now()
-					// Prefer mtimes stored in the backend's FileMtime
-					// sidecar table — that lifts the persistence off the
-					// gob snapshot for disk-backed backends, which is the
-					// path that actually rebuilds across restarts. Falls
-					// back to the snapshot's per-repo FileMtimes when the
-					// backend doesn't implement the reader (memory) or
-					// hasn't seen this repo yet.
-					priorMtimes := priorMtimesFromStore(state.graph, state.configManager, entry, logger)
-					if len(priorMtimes) == 0 {
-						priorMtimes = priorMtimesForEntry(snapshotRepos, entry)
-					}
-					if state.snapshotPartial {
-						priorMtimes = nil
-					}
-					// A backend that crossed a schema-rebuild migration rung
-					// (NeedsRebuild) has on-disk rows in the old shape that an
-					// incremental reconcile cannot fix. Drop prior mtimes so every
-					// file re-indexes into the new schema (the nil branch below
-					// runs a full TrackRepoCtx and marks the repo changed, so the
-					// global resolve/derivation passes re-run too). No-op for
-					// backends without the capability and whenever no rebuild rung
-					// was crossed — the common case.
-					if storeNeedsRebuild(state.graph) {
-						if len(priorMtimes) > 0 {
-							logger.Info("daemon: backend signalled schema rebuild; forcing full re-index",
-								zap.String("path", entry.Path))
-						}
-						priorMtimes = nil
-					}
-					pathFn := "track"
-					if priorMtimes != nil {
-						pathFn = "reconcile"
-						res, err := state.multiIndexer.ReconcileRepoCtx(ctx, entry, priorMtimes)
-						switch {
-						case err != nil:
-							logger.Warn("daemon: startup reconcile failed",
-								zap.String("path", entry.Path), zap.Error(err))
-							// Treat a failed reconcile as "changed" so the global
-							// passes still run — degrade toward correctness, not
-							// toward the fast path, when we can't trust the delta.
-							changedRepos.Add(1)
-							scopeUnknown.Store(true)
-							deltaFrontier.invalidate()
-						case res != nil && (res.StaleFileCount > 0 || res.DeletedFileCount > 0 || len(res.FailedFiles) > 0 || res.FullRetrack):
-							changedRepos.Add(1)
-							filesReindexed.Add(int64(reconcileFileCount(res)))
-							deltaFrontier.record(res)
-							if res.RepoPrefix != "" {
-								changedPrefixes.Store(res.RepoPrefix, struct{}{})
-							} else {
-								scopeUnknown.Store(true)
-							}
-						default:
-							// Warm no-op path: the repo re-indexed nothing, so its
-							// graph is served straight from the persisted store.
-							// Vet the freshly-recomputed per-repo counts against
-							// what the snapshot recorded — a material shortfall
-							// means the store came back shape-degraded relative to
-							// the snapshot metadata (a persisted resolution
-							// regression). Mark the repo changed so the
-							// end-of-warmup global re-resolve + derivation passes
-							// run for it instead of silently serving the shrunken
-							// graph, and surface the event so a ratchet can't hide
-							// behind an all-green index_health.
-							if res != nil && bootShapeShortfall(snapshotRepos, res.RepoPrefix, res.NodeCount, res.EdgeCount) {
-								indexer.RecordResolutionRegression()
-								logger.Warn("daemon: boot shape-degradation guard — repo graph materially short of snapshot; re-running resolution",
-									zap.String("prefix", res.RepoPrefix),
-									zap.Int("live_nodes", res.NodeCount),
-									zap.Int("live_edges", res.EdgeCount))
+		}()
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for entry := range jobs {
+					// Per-entry panic guard so one repo's crash during
+					// reindex doesn't kill the worker — the bad repo logs
+					// and skips, the worker proceeds to the next job, and
+					// warmup completes.
+					func(entry config.RepoEntry) {
+						defer func() {
+							if r := recover(); r != nil {
+								logger.Error("daemon: warmup repo panic recovered",
+									zap.String("path", entry.Path),
+									zap.Any("panic", r))
 								changedRepos.Add(1)
+								scopeUnknown.Store(true)
 								deltaFrontier.invalidate()
+							}
+						}()
+						// Route repos whose nodes came from the snapshot through
+						// ReconcileRepoCtx — it calls IncrementalReindexPaths, which
+						// evicts files deleted while the daemon was down and
+						// re-indexes only files whose mtime changed. Repos not in
+						// the snapshot (newly tracked, or first startup after a
+						// schema bump) fall back to TrackRepoCtx, which does a
+						// full walk. Both paths end with the repo registered on
+						// the MultiIndexer; contract reconciliation is deferred
+						// to the single RunGlobalResolve call below.
+						//
+						// snapshotPartial == true forces the full-walk path even
+						// when prior mtimes exist: the partial-load signal means
+						// the persisted resolution state is no longer trustworthy
+						// (stale edges were dropped because their targets vanished),
+						// and the incremental path only re-resolves files whose
+						// mtime changed — so the dropped edges would never come
+						// back. Without this override every restart progressively
+						// erodes the graph until exported methods show zero
+						// callers despite having dozens of real call sites.
+						repoStart := time.Now()
+						// Prefer mtimes stored in the backend's FileMtime
+						// sidecar table — that lifts the persistence off the
+						// gob snapshot for disk-backed backends, which is the
+						// path that actually rebuilds across restarts. Falls
+						// back to the snapshot's per-repo FileMtimes when the
+						// backend doesn't implement the reader (memory) or
+						// hasn't seen this repo yet.
+						priorMtimes := priorMtimesFromStore(state.graph, state.configManager, entry, logger)
+						if len(priorMtimes) == 0 {
+							priorMtimes = priorMtimesForEntry(snapshotRepos, entry)
+						}
+						if state.snapshotPartial {
+							priorMtimes = nil
+						}
+						// A backend that crossed a schema-rebuild migration rung
+						// (NeedsRebuild) has on-disk rows in the old shape that an
+						// incremental reconcile cannot fix. Drop prior mtimes so every
+						// file re-indexes into the new schema (the nil branch below
+						// runs a full TrackRepoCtx and marks the repo changed, so the
+						// global resolve/derivation passes re-run too). No-op for
+						// backends without the capability and whenever no rebuild rung
+						// was crossed — the common case.
+						if storeNeedsRebuild(state.graph) {
+							if len(priorMtimes) > 0 {
+								logger.Info("daemon: backend signalled schema rebuild; forcing full re-index",
+									zap.String("path", entry.Path))
+							}
+							priorMtimes = nil
+						}
+						pathFn := "track"
+						if priorMtimes != nil {
+							pathFn = "reconcile"
+							res, err := state.multiIndexer.ReconcileRepoCtx(batchCtx, entry, priorMtimes)
+							switch {
+							case err != nil:
+								logger.Warn("daemon: startup reconcile failed",
+									zap.String("path", entry.Path), zap.Error(err))
+								// Treat a failed reconcile as "changed" so the global
+								// passes still run — degrade toward correctness, not
+								// toward the fast path, when we can't trust the delta.
+								changedRepos.Add(1)
+								scopeUnknown.Store(true)
+								deltaFrontier.invalidate()
+							case res != nil && (res.StaleFileCount > 0 || res.DeletedFileCount > 0 || len(res.FailedFiles) > 0 || res.FullRetrack):
+								changedRepos.Add(1)
+								filesReindexed.Add(int64(reconcileFileCount(res)))
+								deltaFrontier.record(res)
 								if res.RepoPrefix != "" {
 									changedPrefixes.Store(res.RepoPrefix, struct{}{})
 								} else {
 									scopeUnknown.Store(true)
 								}
+							default:
+								// Warm no-op path: the repo re-indexed nothing, so its
+								// graph is served straight from the persisted store.
+								// Vet the freshly-recomputed per-repo counts against
+								// what the snapshot recorded — a material shortfall
+								// means the store came back shape-degraded relative to
+								// the snapshot metadata (a persisted resolution
+								// regression). Mark the repo changed so the
+								// end-of-warmup global re-resolve + derivation passes
+								// run for it instead of silently serving the shrunken
+								// graph, and surface the event so a ratchet can't hide
+								// behind an all-green index_health.
+								if res != nil && bootShapeShortfall(snapshotRepos, res.RepoPrefix, res.NodeCount, res.EdgeCount) {
+									indexer.RecordResolutionRegression()
+									logger.Warn("daemon: boot shape-degradation guard — repo graph materially short of snapshot; re-running resolution",
+										zap.String("prefix", res.RepoPrefix),
+										zap.Int("live_nodes", res.NodeCount),
+										zap.Int("live_edges", res.EdgeCount))
+									changedRepos.Add(1)
+									deltaFrontier.invalidate()
+									if res.RepoPrefix != "" {
+										changedPrefixes.Store(res.RepoPrefix, struct{}{})
+									} else {
+										scopeUnknown.Store(true)
+									}
+								}
+							}
+						} else {
+							// No prior mtimes → full cold (re)index of this repo,
+							// which is "changed" by definition.
+							deltaFrontier.invalidate()
+							changedRepos.Add(1)
+							if res, err := state.multiIndexer.TrackRepoCtx(batchCtx, entry); err != nil {
+								logger.Warn("daemon: startup track failed",
+									zap.String("path", entry.Path), zap.Error(err))
+								scopeUnknown.Store(true)
+							} else if res != nil && res.RepoPrefix != "" {
+								// A cold TrackRepoCtx is itself a full retrack — its
+								// FileCount is the whole repo's file-level work.
+								filesReindexed.Add(int64(res.FileCount))
+								changedPrefixes.Store(res.RepoPrefix, struct{}{})
+							} else {
+								scopeUnknown.Store(true)
 							}
 						}
-					} else {
-						// No prior mtimes → full cold (re)index of this repo,
-						// which is "changed" by definition.
-						deltaFrontier.invalidate()
-						changedRepos.Add(1)
-						if res, err := state.multiIndexer.TrackRepoCtx(ctx, entry); err != nil {
-							logger.Warn("daemon: startup track failed",
-								zap.String("path", entry.Path), zap.Error(err))
-							scopeUnknown.Store(true)
-						} else if res != nil && res.RepoPrefix != "" {
-							// A cold TrackRepoCtx is itself a full retrack — its
-							// FileCount is the whole repo's file-level work.
-							filesReindexed.Add(int64(res.FileCount))
-							changedPrefixes.Store(res.RepoPrefix, struct{}{})
-						} else {
-							scopeUnknown.Store(true)
+						elapsed := time.Since(repoStart)
+						if elapsed > 2*time.Second {
+							logger.Info("daemon: warmup repo elapsed",
+								zap.String("path", entry.Path),
+								zap.String("path_fn", pathFn),
+								zap.Duration("elapsed", elapsed))
 						}
-					}
-					elapsed := time.Since(repoStart)
-					if elapsed > 2*time.Second {
-						logger.Info("daemon: warmup repo elapsed",
-							zap.String("path", entry.Path),
-							zap.String("path_fn", pathFn),
-							zap.Duration("elapsed", elapsed))
-					}
-				}(entry)
-			}
-		}()
-	}
-	for _, entry := range repos {
-		jobs <- entry
-	}
-	close(jobs)
-	wg.Wait()
-	// Every reconcile and shape guard has finished; release the restored
-	// per-repository mtime maps before the later resolver/enrichment phases.
-	snapshotRepos = nil
-	if coordinatedBulkActive {
-		flushStart := time.Now()
-		if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
-			logger.Error("daemon: coordinated cold bulk-load finalize failed", zap.Error(err))
-		} else {
-			logger.Info("daemon: coordinated cold bulk-load complete",
-				zap.Duration("elapsed", time.Since(flushStart)))
+					}(entry)
+				}
+			}()
 		}
-		coordinatedBulkActive = false
+		for _, entry := range repos {
+			jobs <- entry
+		}
+		close(jobs)
+		wg.Wait()
+		// Every reconcile and shape guard has finished; release the restored
+		// per-repository mtime maps before the later resolver/enrichment phases.
+		snapshotRepos = nil
+		if coordinatedBulkActive {
+			flushStart := time.Now()
+			if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+				logger.Error("daemon: coordinated cold bulk-load finalize failed", zap.Error(err))
+			} else {
+				logger.Info("daemon: coordinated cold bulk-load complete",
+					zap.Duration("elapsed", time.Since(flushStart)))
+			}
+			coordinatedBulkActive = false
+		}
+		return nil
+	}); err != nil {
+		logger.Error("daemon: repository topology batch failed", zap.Error(err))
 	}
 	timings.parse = time.Since(phaseStart)
 	timings.filesReindexed = int(filesReindexed.Load())

@@ -2602,7 +2602,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	// one graph, and every consumer that keyed on ownership — per-repo
 	// counters, scope filters, the nodes_by_repo partial index, warm-restart
 	// mtime lookups — had to carry a branch for the unprefixed shape.
-	idx := mi.newPerRepoIndexer(cfg.Index)
+	idx := mi.newPerRepoIndexerForMutation(ctx, cfg.Index)
 	idx.SetRepoPrefix(prefix)
 	// Workspace / project slugs stamped on every node. Resolution
 	// order (highest priority first): RepoEntry.Workspace from the
@@ -2616,11 +2616,11 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	idx.SetProjectID(resolveProjectID(&entryCopy, cfg, prefix))
 
 	var result *IndexResult
-	err = idx.coordinateRepositoryMutation(ctx, func() error {
+	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
-		// lane and transition read gate are held, reapply the authoritative mode.
+		// lane and transition generation are held, reapply the authoritative mode.
 		batchMode := mi.reapplyBatchModeForMutation(idx)
-		finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
+		finishTopologyMutation := mi.beginRepositoryTopologyMutation(ctx)
 		topologyChanged := false
 		defer func() { finishTopologyMutation(topologyChanged) }()
 
@@ -2752,7 +2752,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	}
 
 	// Prefix unconditionally, as TrackRepoCtx does — see the note there.
-	idx := mi.newPerRepoIndexer(cfg.Index)
+	idx := mi.newPerRepoIndexerForMutation(ctx, cfg.Index)
 	idx.SetRepoPrefix(prefix)
 	entryCopy := entry
 	idx.SetWorkspaceID(resolveWorkspaceID(&entryCopy, cfg, prefix))
@@ -2761,11 +2761,11 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	idx.SetFileMtimes(priorMtimes)
 
 	var result *IndexResult
-	err = idx.coordinateRepositoryMutation(ctx, func() error {
+	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
-		// lane and transition read gate are held, reapply the authoritative mode.
+		// lane and transition generation are held, reapply the authoritative mode.
 		batchMode := mi.reapplyBatchModeForMutation(idx)
-		finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
+		finishTopologyMutation := mi.beginRepositoryTopologyMutation(ctx)
 		topologyChanged := false
 		defer func() { finishTopologyMutation(topologyChanged) }()
 
