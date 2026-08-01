@@ -274,6 +274,14 @@ func (v *frameworkScopedStore) GetOutEdgesByNodeIDs(ids []string) map[string][]*
 	return rows
 }
 
+// FindEdgesByIdentities preserves exact candidate refetch through the scoped
+// view without retaining broad adjacency or widening the execution scope.
+func (v *frameworkScopedStore) FindEdgesByIdentities(
+	identities []graph.EdgeIdentity,
+) map[graph.EdgeIdentity]*graph.Edge {
+	return findFrameworkEdgesByIdentities(v.Store, identities)
+}
+
 func (v *frameworkScopedStore) inBaseScope(node *graph.Node) bool {
 	if node == nil {
 		return false
@@ -538,4 +546,7 @@ func addFrameworkToken(tokens map[string]struct{}, value any) {
 	}
 }
 
-var _ graph.Store = (*frameworkScopedStore)(nil)
+var (
+	_ graph.Store                   = (*frameworkScopedStore)(nil)
+	_ graph.EdgeIdentityBatchFinder = (*frameworkScopedStore)(nil)
+)

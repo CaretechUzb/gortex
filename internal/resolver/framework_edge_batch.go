@@ -56,6 +56,99 @@ func (s *frameworkEdgeBatchStore) AddBatch(nodes []*graph.Node, edges []*graph.E
 	s.Store.AddBatch(nodes, edges)
 }
 
+// FindEdgesByIdentities preserves the exact-key projection through the staged
+// write overlay. A staged edge shadows the durable row with the same identity,
+// including when a defensive exact-key check rejects a corrupted staged value.
+func (s *frameworkEdgeBatchStore) FindEdgesByIdentities(
+	identities []graph.EdgeIdentity,
+) map[graph.EdgeIdentity]*graph.Edge {
+	out := make(map[graph.EdgeIdentity]*graph.Edge, len(identities))
+	seen := make(map[graph.EdgeIdentity]struct{}, len(identities))
+	durableKeys := make([]graph.EdgeIdentity, 0, len(identities))
+	for _, identity := range identities {
+		if _, duplicate := seen[identity]; duplicate {
+			continue
+		}
+		seen[identity] = struct{}{}
+		if staged, exists := s.staged[identity]; exists {
+			if staged != nil && graph.EdgeIdentityFor(staged) == identity {
+				out[identity] = staged
+			}
+			continue
+		}
+		durableKeys = append(durableKeys, identity)
+	}
+	for identity, edge := range findFrameworkEdgesByIdentities(s.Store, durableKeys) {
+		out[identity] = edge
+	}
+	return out
+}
+
+// findFrameworkEdgesByIdentities keeps framework adapters exact even when an
+// intermediate Store wrapper hides the optional batch finder. The fallback
+// performs one batched source-adjacency read and filters the complete logical
+// key; it never falls back to AllEdges or one read per identity.
+func findFrameworkEdgesByIdentities(
+	store graph.Store,
+	identities []graph.EdgeIdentity,
+) map[graph.EdgeIdentity]*graph.Edge {
+	out := make(map[graph.EdgeIdentity]*graph.Edge)
+	if len(identities) == 0 {
+		return out
+	}
+
+	requested := make(map[graph.EdgeIdentity]struct{}, len(identities))
+	unique := make([]graph.EdgeIdentity, 0, len(identities))
+	for _, identity := range identities {
+		if _, duplicate := requested[identity]; duplicate {
+			continue
+		}
+		requested[identity] = struct{}{}
+		unique = append(unique, identity)
+	}
+
+	if finder, ok := store.(graph.EdgeIdentityBatchFinder); ok {
+		for identity, edge := range finder.FindEdgesByIdentities(unique) {
+			if _, wanted := requested[identity]; !wanted || edge == nil {
+				continue
+			}
+			if graph.EdgeIdentityFor(edge) == identity {
+				out[identity] = edge
+			}
+		}
+		return out
+	}
+
+	fromIDs := make([]string, 0, len(unique))
+	seenFrom := make(map[string]struct{}, len(unique))
+	for _, identity := range unique {
+		if identity.From == "" {
+			continue
+		}
+		if _, duplicate := seenFrom[identity.From]; duplicate {
+			continue
+		}
+		seenFrom[identity.From] = struct{}{}
+		fromIDs = append(fromIDs, identity.From)
+	}
+	if len(fromIDs) == 0 {
+		return out
+	}
+
+	for _, edges := range store.GetOutEdgesByNodeIDs(fromIDs) {
+		for _, edge := range edges {
+			if edge == nil {
+				continue
+			}
+			identity := graph.EdgeIdentityFor(edge)
+			if _, wanted := requested[identity]; wanted {
+				out[identity] = edge
+			}
+		}
+	}
+	return out
+}
+
 func (s *frameworkEdgeBatchStore) flush() {
 	if len(s.staged) == 0 {
 		return
@@ -555,4 +648,5 @@ var (
 	_ graph.RepoEdgeKindReader        = (*frameworkEdgeBatchStore)(nil)
 	_ graph.ConstantValueReader       = (*frameworkEdgeBatchStore)(nil)
 	_ graph.MemberMethodsByType       = (*frameworkEdgeBatchStore)(nil)
+	_ graph.EdgeIdentityBatchFinder   = (*frameworkEdgeBatchStore)(nil)
 )
