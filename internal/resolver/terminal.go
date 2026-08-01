@@ -20,10 +20,10 @@ import (
 const (
 	// metaResolveTerminal marks an unresolved edge the resolver has concluded
 	// is permanently unbindable. Read by the scoped pending-scan skip.
-	metaResolveTerminal = "resolve_terminal"
+	metaResolveTerminal = graph.EdgeMetaResolveTerminal
 	// metaResolveTerminalReason carries a short human-readable reason for the
 	// stamp (aligned by string value with internal/analyzer's outcome vocab).
-	metaResolveTerminalReason = "resolve_terminal_reason"
+	metaResolveTerminalReason = graph.EdgeMetaResolveTerminalReason
 )
 
 // Terminal reasons. These deliberately match internal/analyzer's resolution-
@@ -216,9 +216,10 @@ func terminalEdgeAnchoredToScope(e *graph.Edge, scope map[string]struct{}) bool 
 // stamping the newly-terminal, un-stamping any edge that used to be terminal
 // but now has a real candidate (self-healing). Edges already in the right state
 // are left untouched, so a converged graph performs no writes on later full
-// passes. Persisted via the batched EdgePersister capability; the in-memory
-// backend's in-place Meta mutation is already durable, so its missing
-// capability is a no-op. Returns the counts stamped / un-stamped.
+// passes. Disk backends may persist only the two terminal columns through
+// EdgeTerminalStampPersister; stores without it retain the full-attribute
+// EdgeMetaBatchPersister fallback. The in-memory backend's live edge pointers
+// need neither capability. Returns the counts stamped / un-stamped.
 //
 // Classification itself takes the bulk path (reconcileTerminalStampsBulk)
 // when the backend implements graph.NodeNameClassCounter, falling back to
@@ -280,7 +281,9 @@ func (r *Resolver) reconcileTerminalStampsExcluding(excluded map[deferredLSPWork
 	}
 
 	if len(changed) > 0 {
-		if p, ok := r.graph.(graph.EdgeMetaBatchPersister); ok {
+		if p, ok := r.graph.(graph.EdgeTerminalStampPersister); ok {
+			p.PersistEdgeTerminalStamps(changed)
+		} else if p, ok := r.graph.(graph.EdgeMetaBatchPersister); ok {
 			p.PersistEdgeAttributesBatch(changed)
 		}
 	}
