@@ -3089,6 +3089,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		sidecars := newParseSidecarBatch(idx)
 		contentBatch := newParseContentBatch(idx)
 		graphBatch := newParseGraphBatch(idx.graph)
+		nativePressure := newNativeParsePressureRelief()
 		fileCh := make(chan walkedFile, workers*4)
 		var wg sync.WaitGroup
 		for range workers {
@@ -3210,6 +3211,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					extractStart := time.Now()
 					result, skipped, err := idx.extractFile(parsePool, quarantine, path, relPath, lang, ext, src)
 					atomic.AddInt64(&parseExtractNS, int64(time.Since(extractStart)))
+					if parsePool == nil {
+						nativePressure.afterParse(lang, int64(len(src)))
+					}
 					if err != nil {
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
@@ -3362,6 +3366,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		}
 		close(fileCh)
 		wg.Wait()
+		nativePressure.flush()
+		if nativeStats := nativePressure.stats(); nativeStats.calls > 0 {
+			idx.logger.Info("indexer: native parser pressure relief",
+				zap.String("repo", idx.repoPrefix),
+				zap.Int64("calls", nativeStats.calls),
+				zap.Uint64("released_bytes", nativeStats.releasedBytes),
+				zap.Duration("elapsed", nativeStats.elapsed))
+		}
 		// Flush every successfully parsed file even when ctx was cancelled
 		// while another worker waited for admission. This preserves the old
 		// per-file durability boundary and makes the next cold attempt resume
