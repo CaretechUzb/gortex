@@ -26,46 +26,80 @@ func ResolveUIKitRefs(g graph.Store) int {
 	if g == nil {
 		return 0
 	}
+
+	// The candidate census deliberately projects no edge metadata. SQLite keeps
+	// metadata BLOBs on disk while we reject the overwhelming majority of edges.
+	// Scan each kind separately to preserve the legacy pass order exactly, and
+	// finish every cursor before point-reading nodes or writing rewritten edges.
+	var candidateIDs []graph.EdgeIdentity
+	var sourceIDs []string
+	for _, kind := range []graph.EdgeKind{graph.EdgeInstantiates, graph.EdgeReferences, graph.EdgeTypedAs, graph.EdgeCalls} {
+		for edge := range graph.EdgesLightSeq(g, kind) {
+			if !isUIKitCandidateEdge(edge) {
+				continue
+			}
+			candidateIDs = append(candidateIDs, graph.EdgeIdentityFor(edge))
+			sourceIDs = append(sourceIDs, edge.From)
+		}
+	}
+	if len(candidateIDs) == 0 {
+		return 0
+	}
+
+	placements := graph.NodePlacementsByIDs(g, dedupeFrameworkIDs(sourceIDs))
+	appleCandidates := candidateIDs[:0]
+	for _, identity := range candidateIDs {
+		if placement, ok := placements[identity.From]; ok && isAppleSourceFile(placement.FilePath) {
+			appleCandidates = append(appleCandidates, identity)
+		}
+	}
+	if len(appleCandidates) == 0 {
+		return 0
+	}
+
+	// Refetch the exact surviving logical edges only after every scan cursor has
+	// closed. This preserves metadata and provenance without retaining full Edge
+	// values for the census.
+	current := findFrameworkEdgesByIdentities(g, appleCandidates)
 	resolved := 0
 	var reindex []graph.EdgeReindex
-	for _, kind := range []graph.EdgeKind{graph.EdgeInstantiates, graph.EdgeReferences, graph.EdgeTypedAs, graph.EdgeCalls} {
-		for e := range g.EdgesByKind(kind) {
-			if e == nil || !graph.IsUnresolvedTarget(e.To) {
-				continue
-			}
-			name := graph.UnresolvedName(e.To)
-			if name == "" || strings.ContainsRune(name, '.') {
-				continue
-			}
-			dirs, ok := uikitDirsFor(name)
-			if !ok {
-				continue
-			}
-			fromFile := ""
-			if n := g.GetNode(e.From); n != nil {
-				fromFile = n.FilePath
-			}
-			if !isAppleSourceFile(fromFile) {
-				continue
-			}
-			targetID, conf := ResolveByConvention(g, name, "", dirs, fromFile)
-			if targetID == "" {
-				continue
-			}
-			oldTo := e.To
-			e.To = targetID
-			e.Origin = graph.OriginASTInferred
-			e.Confidence = conf
-			e.ConfidenceLabel = graph.ConfidenceLabelFor(e.Kind, conf)
-			StampSynthesized(e, SynthUIKitResolve)
-			reindex = append(reindex, graph.EdgeReindex{Edge: e, OldTo: oldTo})
-			resolved++
+	for _, identity := range appleCandidates {
+		edge := current[identity]
+		if !isUIKitCandidateEdge(edge) {
+			continue
 		}
+		name := graph.UnresolvedName(edge.To)
+		dirs, _ := uikitDirsFor(name)
+		fromFile := placements[edge.From].FilePath
+		targetID, conf := ResolveByConvention(g, name, "", dirs, fromFile)
+		if targetID == "" {
+			continue
+		}
+		oldTo := edge.To
+		edge.To = targetID
+		edge.Origin = graph.OriginASTInferred
+		edge.Confidence = conf
+		edge.ConfidenceLabel = graph.ConfidenceLabelFor(edge.Kind, conf)
+		StampSynthesized(edge, SynthUIKitResolve)
+		reindex = append(reindex, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
+		resolved++
 	}
 	if len(reindex) > 0 {
 		g.ReindexEdges(reindex)
 	}
 	return resolved
+}
+
+func isUIKitCandidateEdge(edge *graph.Edge) bool {
+	if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
+		return false
+	}
+	name := graph.UnresolvedName(edge.To)
+	if name == "" || strings.ContainsRune(name, '.') {
+		return false
+	}
+	_, ok := uikitDirsFor(name)
+	return ok
 }
 
 // uikitDirsFor classifies a UIKit reference name into its convention dirs.
