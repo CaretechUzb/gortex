@@ -47,13 +47,17 @@ func (r *Resolver) csharpFileNamespaceSet(fileID string) csharpFileNS {
 			ns.statics[u] = struct{}{}
 		}
 	}
+	// The stamp gate must reflect the file's OWN usings only: inherited
+	// globals say nothing about whether THIS file was extracted by a
+	// stamp-era binary, and a pre-stamp file still needs the edge
+	// fallback below for its real usings.
+	hasStamp := len(ns.imported) > 0
 	// Project-scoped `global using`s from the directory chain (the
 	// Usings.cs convention) join the imported tier exactly like a local
 	// directive would.
 	for _, u := range r.csharpGlobalUsingsFor(fileID) {
 		ns.imported[u] = struct{}{}
 	}
-	hasStamp := len(ns.imported) > 0
 	for _, e := range r.graph.GetOutEdges(fileID) {
 		if e == nil {
 			continue
@@ -120,38 +124,67 @@ func csharpMetaStrings(v any) []string {
 }
 
 // csharpGlobalUsingsFor returns the global-using namespaces visible to
-// fileID: those declared by C# files in its own directory or any
-// ancestor. The declaring file's directory subtree approximates the
-// compilation unit (there are no file→project edges; SDK projects glob
-// **/*.cs under the csproj dir). The Usings.cs convention keeps the
-// declaring file at the project root, so the approximation is exact for
-// the layouts that use the feature; a nested project could theoretically
-// over-share, which narrowing-only consumers keep harmless short of a
-// same-name tie.
+// fileID. A `global using` is compilation-scoped, and the compilation
+// unit is approximated by the nearest-ancestor directory owning a
+// .csproj file node: globals declared anywhere in that unit apply to
+// every file of the unit — including sibling subtrees — while a nested
+// project with its own csproj is a separate unit that inherits nothing.
+// Files outside any csproj directory degrade to the declaring file's
+// directory subtree (better a narrower scope than a leak).
 func (r *Resolver) csharpGlobalUsingsFor(fileID string) []string {
-	r.csharpNSMu.Lock()
-	if r.csharpGlobalByDir == nil {
-		idx := map[string][]string{}
-		for n := range r.graph.NodesByKind(graph.KindFile) {
-			if n == nil || n.Meta == nil {
-				continue
+	r.csharpNSMu.RLock()
+	idx, projDirs := r.csharpGlobalByDir, r.csharpProjDirs
+	r.csharpNSMu.RUnlock()
+	if idx == nil {
+		r.csharpNSMu.Lock()
+		if r.csharpGlobalByDir == nil {
+			type decl struct {
+				dir     string
+				globals []string
 			}
-			if globals := csharpMetaStrings(n.Meta["global_usings"]); len(globals) > 0 {
-				d := csharpDirOf(n.ID)
-				idx[d] = append(idx[d], globals...)
+			var decls []decl
+			projSet := map[string]struct{}{}
+			for n := range r.graph.NodesByKind(graph.KindFile) {
+				if n == nil {
+					continue
+				}
+				if strings.HasSuffix(strings.ToLower(n.ID), ".csproj") {
+					projSet[csharpDirOf(n.ID)] = struct{}{}
+					continue
+				}
+				if n.Meta == nil {
+					continue
+				}
+				if globals := csharpMetaStrings(n.Meta["global_usings"]); len(globals) > 0 {
+					decls = append(decls, decl{csharpDirOf(n.ID), globals})
+				}
 			}
+			built := map[string][]string{}
+			for _, d := range decls {
+				key := csharpNearestProjDir(projSet, d.dir)
+				if key == "" {
+					key = d.dir
+				}
+				built[key] = append(built[key], d.globals...)
+			}
+			r.csharpGlobalByDir = built
+			r.csharpProjDirs = projSet
 		}
-		r.csharpGlobalByDir = idx
+		idx, projDirs = r.csharpGlobalByDir, r.csharpProjDirs
+		r.csharpNSMu.Unlock()
 	}
-	idx := r.csharpGlobalByDir
-	r.csharpNSMu.Unlock()
 	if len(idx) == 0 {
 		return nil
+	}
+	// A caller owned by a csproj sees exactly its unit's globals —
+	// walking further up would inherit an OUTER project's globals.
+	if key := csharpNearestProjDir(projDirs, csharpDirOf(fileID)); key != "" {
+		return idx[key]
 	}
 	var out []string
 	dir := fileID
 	for {
-		i := strings.LastIndex(dir, "/")
+		i := csharpLastSep(dir)
 		if i < 0 {
 			out = append(out, idx["."]...)
 			break
@@ -162,10 +195,39 @@ func (r *Resolver) csharpGlobalUsingsFor(fileID string) []string {
 	return out
 }
 
-// csharpDirOf is path.Dir over the forward-slash node IDs the index
-// writes, with "." for a root-level file.
+// csharpNearestProjDir walks from dir upward (dir included) and returns
+// the deepest directory that owns a .csproj — "" when none does.
+func csharpNearestProjDir(projDirs map[string]struct{}, dir string) string {
+	if len(projDirs) == 0 {
+		return ""
+	}
+	for {
+		if _, ok := projDirs[dir]; ok {
+			return dir
+		}
+		i := csharpLastSep(dir)
+		if i < 0 {
+			if _, ok := projDirs["."]; ok {
+				return "."
+			}
+			return ""
+		}
+		dir = dir[:i]
+	}
+}
+
+// csharpLastSep is the index of the last path separator. Windows stores
+// join the repo prefix with "/" but keep OS-native "\" below it
+// (the indexer's graphRelKey shape) — both must count, or every
+// project collapses to the repo-root key and globals leak repo-wide.
+func csharpLastSep(p string) int {
+	return strings.LastIndexAny(p, `/\`)
+}
+
+// csharpDirOf is path.Dir over node IDs in either separator shape,
+// with "." for a root-level file.
 func csharpDirOf(p string) string {
-	if i := strings.LastIndex(p, "/"); i >= 0 {
+	if i := csharpLastSep(p); i >= 0 {
 		return p[:i]
 	}
 	return "."

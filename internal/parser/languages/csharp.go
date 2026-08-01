@@ -323,10 +323,13 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	//   Tier 0 — explicit type annotations (skip "var" placeholder)
 	//   Tier 1 — `var x = new Foo()` walk for `var`-keyed locals only
 	tenv := make(typeEnv)
+	builtins := make(typeEnv)
 	for _, l := range locals {
 		typeName := normalizeCSharpTypeName(l.rawType)
 		if typeName != "" && typeName != "var" {
 			tenv[l.name] = typeName
+		} else if bt := csharpBuiltinTypeName(l.rawType); bt != "" {
+			builtins[l.name] = bt
 		}
 	}
 	for _, l := range locals {
@@ -383,6 +386,12 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			}
 			if recvType, ok := tenv[c.receiver]; ok {
 				edge.Meta = map[string]any{"receiver_type": recvType}
+			} else if bt, ok := builtins[c.receiver]; ok {
+				// Builtins stay out of receiver_type (the receiver-gate
+				// passes key on user types); extension eligibility still
+				// needs them — `n.Foo()` on an int must match
+				// `Foo(this int)` and refuse `Foo(this string)`.
+				edge.Meta = map[string]any{"receiver_builtin": bt}
 			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
 				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenv, result))
 			}
@@ -1355,6 +1364,24 @@ func extractCSharpMethodReturnType(methodNode *sitter.Node, src []byte, methodNa
 }
 
 // normalizeCSharpTypeName strips generics and nullable markers from a C# type name.
+// csharpBuiltinTypeName returns the C# builtin keyword named by a local
+// declaration type, nullable/array suffixes stripped — "" when the type
+// is not a builtin. normalizeCSharpTypeName deliberately drops these;
+// this is the parallel lookup for the receiver_builtin stamp.
+func csharpBuiltinTypeName(t string) string {
+	t = strings.TrimSpace(t)
+	t = strings.TrimSuffix(t, "?")
+	if idx := strings.Index(t, "["); idx > 0 {
+		t = t[:idx]
+	}
+	switch t {
+	case "int", "long", "short", "byte", "sbyte", "uint", "ulong", "ushort",
+		"float", "double", "decimal", "bool", "char", "string", "object":
+		return t
+	}
+	return ""
+}
+
 func normalizeCSharpTypeName(t string) string {
 	t = strings.TrimSpace(t)
 	// Remove nullable suffix.

@@ -152,6 +152,11 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 			j.edge.Meta = map[string]any{}
 		}
 		j.edge.Meta["guard_reverted"] = true
+		// The abandoned bind's provenance must not shadow a later
+		// rebind — the receiver gate exempts resolution shapes like
+		// extension_method, and a stale tag would carry that exemption
+		// to whatever the edge binds to next.
+		delete(j.edge.Meta, "resolution")
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: oldResolved})
 		spoolReverts = append(spoolReverts, lspSpoolRevert{edge: j.edge, oldBoundTo: oldResolved})
 	}

@@ -93,3 +93,29 @@ func TestCSharpExtractor_UsingsMeta_NoUsings(t *testing.T) {
 		}
 	}
 }
+
+// TestCSharpExtractor_BuiltinReceiverStamp: primitive receivers are
+// deliberately absent from receiver_type (the receiver-gate passes key
+// on user types), but extension eligibility still needs them — the
+// member-call edge carries the builtin under its own key.
+func TestCSharpExtractor_BuiltinReceiverStamp(t *testing.T) {
+	src := []byte(`namespace App {
+    public class C {
+        public void M() {
+            int n = 0;
+            n.Foo();
+        }
+    }
+}
+`)
+	res, err := NewCSharpExtractor().Extract("C.cs", src)
+	require.NoError(t, err)
+	for _, e := range res.Edges {
+		if e.Kind == graph.EdgeCalls && e.To == "unresolved::*.Foo" {
+			require.Nil(t, e.Meta["receiver_type"], "primitives must stay out of receiver_type")
+			require.Equal(t, "int", e.Meta["receiver_builtin"], "builtin receiver must be stamped")
+			return
+		}
+	}
+	t.Fatal("no member-call edge to unresolved::*.Foo found")
+}

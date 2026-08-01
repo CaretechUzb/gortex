@@ -305,13 +305,17 @@ type Resolver struct {
 	csharpNSByFile map[string]csharpFileNS
 	csharpNSMu     sync.RWMutex
 
-	// csharpGlobalByDir maps a directory to the namespaces its files'
-	// `global using` directives import. A global using is compilation-
-	// scoped; without file→project edges the declaring file's directory
-	// subtree approximates the project (SDK projects glob **/*.cs under
-	// the csproj dir). nil = not built; built lazily under csharpNSMu
-	// and cleared with the per-pass lookup caches.
+	// csharpGlobalByDir maps a compilation-unit key (nearest-ancestor
+	// csproj directory, else the declaring file's directory) to the
+	// namespaces its files' `global using` directives import;
+	// csharpProjDirs is the csproj-owning directory set the keying
+	// uses. nil = not built; built lazily under csharpNSMu with PASS
+	// lifetime — the stamps only change on re-extraction, never
+	// mid-pass, and an O(graph) rebuild per pending page would stall
+	// every C# worker (cleared in clearPassIndexes + the incremental
+	// entry points, NOT in the per-page clearLookupCache).
 	csharpGlobalByDir map[string][]string
+	csharpProjDirs    map[string]struct{}
 
 	// incrementalSkip holds the source-shapes of a single re-resolved file's
 	// out-edges that were already unresolved before the edit; the forward
@@ -1935,7 +1939,16 @@ func (r *Resolver) clearLookupCache() {
 	r.importFilesMu.Unlock()
 	r.csharpNSMu.Lock()
 	r.csharpNSByFile = nil
+	r.csharpNSMu.Unlock()
+}
+
+// clearCSharpGlobalIndex drops the pass-lifetime global-usings index.
+// Separate from clearLookupCache: that runs per pending page, and the
+// index costs an O(graph) file scan to rebuild.
+func (r *Resolver) clearCSharpGlobalIndex() {
+	r.csharpNSMu.Lock()
 	r.csharpGlobalByDir = nil
+	r.csharpProjDirs = nil
 	r.csharpNSMu.Unlock()
 }
 
@@ -2091,6 +2104,7 @@ func (r *Resolver) clearPassIndexes() {
 	r.clearProvidesForIndex()
 	r.clearReachabilityIndex()
 	r.clearLSPIndex()
+	r.clearCSharpGlobalIndex()
 }
 
 // buildPassIndexesForPending bounds the interactive path to the caller files
@@ -2125,6 +2139,9 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	started := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// The edited file may have (re)stamped global usings — rebuild the
+	// pass-lifetime index from the current graph.
+	r.clearCSharpGlobalIndex()
 
 	// Establish whether this edit left any work before building the four
 	// graph-wide pass indexes. Generated assets and source saves that carry
@@ -2289,6 +2306,9 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 	started := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// The edited files may have (re)stamped global usings — rebuild the
+	// pass-lifetime index from the current graph.
+	r.clearCSharpGlobalIndex()
 
 	pendingStarted := time.Now()
 	frontier := r.collectIncrementalFileFrontier(filePaths)

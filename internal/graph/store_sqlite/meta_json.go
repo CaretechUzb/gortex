@@ -126,6 +126,7 @@ var metaInt64Keys = map[string]bool{
 var metaStringSliceKeys = map[string]bool{
 	"path_param_names": true, "query_params": true, "status_codes": true,
 	"notes": true, "methods": true, "arg_names": true, "repos": true,
+	"usings": true, "global_usings": true, "using_static": true,
 }
 
 // metaMapSliceKeys are keys whose array value must be []map[string]any.
