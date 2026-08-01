@@ -46,6 +46,24 @@ func (r *Resolver) reindexAttributionEdgesBatched(
 	kinds []graph.EdgeKind,
 	rewrite func(*graph.Edge) string,
 ) {
+	// Both whole-graph callers reject resolved targets before consulting their
+	// attribution indexes. Production stores can therefore discover only compact
+	// unresolved identities, then reuse the exact bounded refetch path. Adapter
+	// stores retain the established full-edge scanner fallback.
+	scanner, scanOK := r.graph.(graph.UnresolvedEdgeIdentityBatchScanner)
+	finder, findOK := r.graph.(graph.EdgeIdentityBatchFinder)
+	if scanOK && findOK {
+		scanner.ScanUnresolvedEdgeIdentitiesBatched(
+			kinds,
+			attributionReindexBatchSize,
+			func(identities []graph.EdgeIdentity) bool {
+				r.reindexAttributionIdentitiesBatched(finder, identities, rewrite)
+				return true
+			},
+		)
+		return
+	}
+
 	collector := newAttributionReindexCollector(r)
 	graph.ScanEdgesByKindsBatched(r.graph, kinds, attributionReindexBatchSize, func(edges []*graph.Edge) bool {
 		for _, edge := range edges {
