@@ -41,22 +41,24 @@ type ContractGroupFrontier struct {
 // through reconcile. Files, TypeIDs, contract groups, and contract symbols are
 // exact frontiers, not repo-wide hints.
 type DerivedInvalidationPlan struct {
-	Flags                 DerivedInvalidationFlags `json:"flags,omitempty"`
-	Files                 []string                 `json:"files,omitempty"`
-	TypeIDs               []string                 `json:"type_ids,omitempty"`
-	ContractGroups        []ContractGroupFrontier  `json:"contract_groups,omitempty"`
-	ContractSymbolIDs     []string                 `json:"contract_symbol_ids,omitempty"`
-	ContractBridgeNodeIDs []string                 `json:"contract_bridge_node_ids,omitempty"`
-	BodyOnlyFiles         int                      `json:"body_only_files,omitempty"`
-	MetadataOnlyFiles     int                      `json:"metadata_only_files,omitempty"`
-	InertFiles            int                      `json:"inert_files,omitempty"`
-	LegacyFallback        bool                     `json:"legacy_fallback,omitempty"`
+	Flags                  DerivedInvalidationFlags `json:"flags,omitempty"`
+	Files                  []string                 `json:"files,omitempty"`
+	TypeIDs                []string                 `json:"type_ids,omitempty"`
+	ContractGroups         []ContractGroupFrontier  `json:"contract_groups,omitempty"`
+	ContractSymbolIDs      []string                 `json:"contract_symbol_ids,omitempty"`
+	ContractBridgeNodeIDs  []string                 `json:"contract_bridge_node_ids,omitempty"`
+	BodyOnlyFiles          int                      `json:"body_only_files,omitempty"`
+	MetadataOnlyFiles      int                      `json:"metadata_only_files,omitempty"`
+	InertFiles             int                      `json:"inert_files,omitempty"`
+	LegacyFallback         bool                     `json:"legacy_fallback,omitempty"`
+	CSharpHierarchyChanged bool                     `json:"csharp_hierarchy_changed,omitempty"`
 }
 
 func (p DerivedInvalidationPlan) Empty() bool {
 	return p.Flags == 0 && len(p.Files) == 0 && len(p.ContractGroups) == 0 &&
 		len(p.ContractSymbolIDs) == 0 && len(p.ContractBridgeNodeIDs) == 0 &&
-		p.BodyOnlyFiles == 0 && p.MetadataOnlyFiles == 0 && p.InertFiles == 0
+		p.BodyOnlyFiles == 0 && p.MetadataOnlyFiles == 0 && p.InertFiles == 0 &&
+		!p.CSharpHierarchyChanged
 }
 
 func (p *DerivedInvalidationPlan) Merge(other DerivedInvalidationPlan) {
@@ -68,6 +70,7 @@ func (p *DerivedInvalidationPlan) Merge(other DerivedInvalidationPlan) {
 	p.MetadataOnlyFiles += other.MetadataOnlyFiles
 	p.InertFiles += other.InertFiles
 	p.LegacyFallback = p.LegacyFallback || other.LegacyFallback
+	p.CSharpHierarchyChanged = p.CSharpHierarchyChanged || other.CSharpHierarchyChanged
 	p.Files = appendUniqueSorted(p.Files, other.Files...)
 	p.TypeIDs = appendUniqueSorted(p.TypeIDs, other.TypeIDs...)
 	p.ContractGroups = mergeContractGroups(p.ContractGroups, other.ContractGroups...)
@@ -214,6 +217,18 @@ func derivedFingerprintSideExists(nodes []*graph.Node) bool {
 	return false
 }
 
+func containsCSharpHierarchyNode(nodes []*graph.Node) bool {
+	for _, node := range nodes {
+		if node == nil || !strings.EqualFold(node.Language, "csharp") {
+			continue
+		}
+		if node.Kind == graph.KindType || node.Kind == graph.KindInterface {
+			return true
+		}
+	}
+	return false
+}
+
 func derivedPlanForDelta(prior, fresh derivedFingerprints, semanticChanged bool, graphPath string, priorNodes, freshNodes []*graph.Node) DerivedInvalidationPlan {
 	plan := DerivedInvalidationPlan{Files: []string{graphPath}}
 	if !prior.complete() || !fresh.complete() {
@@ -248,6 +263,8 @@ func derivedPlanForDelta(prior, fresh derivedFingerprints, semanticChanged bool,
 		}
 	}
 	plan.TypeIDs = appendUniqueSorted(nil, plan.TypeIDs...)
+	plan.CSharpHierarchyChanged = plan.Flags.Has(DerivedInvalidatesDeclarations) &&
+		(containsCSharpHierarchyNode(priorNodes) || containsCSharpHierarchyNode(freshNodes))
 	return plan
 }
 

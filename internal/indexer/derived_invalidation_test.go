@@ -70,6 +70,55 @@ func TestDerivedPlanForDeltaTreatsPresentUnfingerprintedSideAsLegacy(t *testing.
 	assertAllDerivedFamiliesInvalidated(t, plan)
 }
 
+func TestDerivedPlanForDeltaMarksCSharpHierarchyChanges(t *testing.T) {
+	prior := completeDerivedFingerprints("prior")
+	fresh := completeDerivedFingerprints("fresh")
+	plan := derivedPlanForDelta(
+		prior, fresh, true, "repo/model.cs",
+		hierarchyTestNodes("repo/model.cs", "csharp", graph.KindType),
+		hierarchyTestNodes("repo/model.cs", "csharp", graph.KindType),
+	)
+	if !plan.CSharpHierarchyChanged {
+		t.Fatal("C# declaration change must mark the hierarchy frontier")
+	}
+}
+
+func TestDerivedPlanForDeltaMarksDeletedCSharpHierarchy(t *testing.T) {
+	plan := derivedPlanForDelta(
+		completeDerivedFingerprints("prior"), derivedFingerprints{}, true, "repo/model.cs",
+		hierarchyTestNodes("repo/model.cs", "csharp", graph.KindInterface), nil,
+	)
+	if !plan.CSharpHierarchyChanged {
+		t.Fatal("deleted C# type/interface must mark the hierarchy frontier from prior nodes")
+	}
+}
+
+func TestDerivedPlanForDeltaDoesNotMarkNonCSharpHierarchy(t *testing.T) {
+	plan := derivedPlanForDelta(
+		derivedFingerprints{}, completeDerivedFingerprints("fresh"), true, "repo/model.go", nil,
+		hierarchyTestNodes("repo/model.go", "go", graph.KindType),
+	)
+	if plan.CSharpHierarchyChanged {
+		t.Fatal("non-C# type changes must not widen the C# demotion frontier")
+	}
+}
+
+func TestDerivedInvalidationPlanMergePreservesCSharpHierarchyChange(t *testing.T) {
+	var merged DerivedInvalidationPlan
+	merged.Merge(DerivedInvalidationPlan{CSharpHierarchyChanged: true})
+	merged.Merge(DerivedInvalidationPlan{})
+	if !merged.CSharpHierarchyChanged {
+		t.Fatal("merged plan lost C# hierarchy invalidation")
+	}
+}
+
+func hierarchyTestNodes(path, language string, kind graph.NodeKind) []*graph.Node {
+	return []*graph.Node{
+		{ID: path, Kind: graph.KindFile, FilePath: path, Language: language},
+		{ID: path + "::declaration", Kind: kind, FilePath: path, Language: language},
+	}
+}
+
 func completeDerivedFingerprints(prefix string) derivedFingerprints {
 	return derivedFingerprints{
 		declarations: prefix + "-declarations",
