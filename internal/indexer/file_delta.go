@@ -146,9 +146,11 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 		return probe, false, false
 	}
 
-	started = time.Now()
-	idx.applyCoverageDomains(relPath, lang, src, result)
-	probe.coverage = time.Since(started)
+	if !extractionDispositionFor(result).omitSecondarySourceScans() {
+		started = time.Now()
+		idx.applyCoverageDomains(relPath, lang, src, result)
+		probe.coverage = time.Since(started)
+	}
 
 	started = time.Now()
 	fingerprints, derived, ok := extractionFingerprints(result)

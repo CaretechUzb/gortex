@@ -223,6 +223,18 @@ func (idx *Indexer) extractFile(
 			return minifiedSkipResult(relPath, lang, reason), true, nil
 		}
 	}
+	if !idx.config.IndexGeneratedParsers {
+		if projected, ok := generatedTreeSitterParserProjection(relPath, lang, src); ok {
+			if q != nil {
+				q.Forget(relPath)
+			}
+			idx.logger.Info("indexer: projected generated tree-sitter parser table",
+				zap.String("file", relPath),
+				zap.Int("source_bytes", len(src)),
+				zap.Int("projected_symbols", len(projected.Nodes)-1))
+			return projected, false, nil
+		}
+	}
 	if pool == nil {
 		r, eerr := idx.extractWithTimeout(ext, relPath, src)
 		if errors.Is(eerr, errExtractTimeout) {

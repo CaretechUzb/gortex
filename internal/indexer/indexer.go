@@ -3272,7 +3272,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					extractStart := time.Now()
 					result, skipped, err := idx.extractFile(parsePool, quarantine, path, relPath, lang, ext, src)
 					atomic.AddInt64(&parseExtractNS, int64(time.Since(extractStart)))
-					if parsePool == nil {
+					omitSecondarySourceScans := extractionDispositionFor(result).omitSecondarySourceScans()
+					if parsePool == nil && shouldRecordNativeParsePressure(result) {
 						nativePressure.afterParse(lang, int64(len(src)))
 					}
 					if err != nil {
@@ -3309,7 +3310,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// language-extractor output. Skipped for quarantined /
 					// timed-out files — the coverage scanners would re-read
 					// a source the parser could not survive.
-					if !skipped {
+					if !skipped && !omitSecondarySourceScans {
 						idx.applyCoverageDomains(relPath, lang, src, result)
 					}
 
@@ -3375,7 +3376,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					}
 					sidecars.add(relPath, src, result)
 
-					if !skipped && fileGraphPath != "" {
+					if !skipped && !omitSecondarySourceScans && fileGraphPath != "" {
 						exts := contractExtractorsByLang[lang]
 						if len(exts) > 0 {
 							c := idx.runContractExtractorsForFile(
@@ -4278,6 +4279,7 @@ func (idx *Indexer) indexFile(
 		}
 		return err
 	}
+	omitSecondarySourceScans := extractionDispositionFor(result).omitSecondarySourceScans()
 
 	// Affected-by snapshot: the symbol shapes and reverse-reference
 	// sources the post-resolve signature-delta pass compares against,
@@ -4317,7 +4319,7 @@ func (idx *Indexer) indexFile(
 	// delta already ran this exact pipeline; reusing it avoids both a second
 	// parse and duplicate coverage artifacts.
 	if !skipped {
-		if !prepared {
+		if !prepared && !omitSecondarySourceScans {
 			idx.applyCoverageDomains(relPath, lang, src, result)
 		}
 		// Persist the canonical raw-extraction identity on the file node.
@@ -4473,7 +4475,8 @@ func (idx *Indexer) indexFile(
 			// their pre-enrichment tier until the next full reindex. This caller
 			// enforces Config.EnrichOnWatch; deferred batches use EnrichFiles.
 			providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
-			watchEnrichment := providersPresent && !idx.deferGlobalPasses.Load() && idx.semanticMgr.EnrichesOnWatch()
+			watchEnrichment := providersPresent && !omitSecondarySourceScans &&
+				!idx.deferGlobalPasses.Load() && idx.semanticMgr.EnrichesOnWatch()
 			reEnriched := false
 			if watchEnrichment {
 				enrichStarted := time.Now()
@@ -4493,7 +4496,7 @@ func (idx *Indexer) indexFile(
 			// suppression as re-verification-pending so a hidden-but-real usage
 			// is diagnosable rather than silently dropped. Cleared when
 			// enrichment did re-run for the file.
-			pendingReparseEnrichment := providersPresent && !reEnriched
+			pendingReparseEnrichment := providersPresent && !omitSecondarySourceScans && !reEnriched
 			if markerBatch == nil {
 				idx.setReparsePendingEnrichment(graphPath, pendingReparseEnrichment)
 			} else if markerBatch.add(graphPath, pendingReparseEnrichment) {
@@ -4511,7 +4514,7 @@ func (idx *Indexer) indexFile(
 			abSnap:    abSnap,
 		}}))
 		providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
-		if markerBatch.add(graphPath, providersPresent) {
+		if markerBatch.add(graphPath, providersPresent && !omitSecondarySourceScans) {
 			idx.flushReparsePendingEnrichment(markerBatch)
 		}
 	}

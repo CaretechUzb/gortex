@@ -637,6 +637,12 @@ type IndexConfig struct {
 	// content and skipped with a synthetic telemetry node. Set true to
 	// index such files anyway. Configured under `index.index_minified`.
 	IndexMinified bool `mapstructure:"index_minified" yaml:"index_minified,omitempty"`
+	// IndexGeneratedParsers controls whether very large generated tree-sitter
+	// parser.c parse tables receive a full C AST. Off by default: the compact
+	// projection retains the file and public tree_sitter_* entry point while
+	// omitting generated table internals. Set true to request full parsing.
+	// Configured under `index.index_generated_parsers`.
+	IndexGeneratedParsers bool `mapstructure:"index_generated_parsers" yaml:"index_generated_parsers,omitempty"`
 	// CrashIsolation runs tree-sitter extraction in worker
 	// subprocesses so a grammar SIGSEGV / OOM / hang on one
 	// pathological file is contained: the bad file is quarantined
@@ -1690,6 +1696,7 @@ func Default() *Config {
 		Index: IndexConfig{
 			Workers:               runtime.NumCPU(),
 			MaxParseBytesInFlight: defaultMaxParseBytesInFlight,
+			IndexGeneratedParsers: false,
 			// MaxFileSize: 0 = no cap. Opt-in knob for users who want
 			// to skip large generated/minified files.
 			// Prose indexing is on by default; the ConfigManager
