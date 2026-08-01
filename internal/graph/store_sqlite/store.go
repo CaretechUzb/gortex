@@ -153,8 +153,8 @@ type Store struct {
 	// bulkPrevCacheSize hold the values FlushBulk restores before the
 	// connection returns to the pool. coordinatedBulkLoad is true while a
 	// multi-repository cold parse owns the outer load window. Dense indexes are
-	// sealed once at bounded row counts (or the first nested repo boundary),
-	// while the pinned durability/FTS window stays open. All fields are guarded
+	// sealed once at bounded row counts (or the outer final boundary), while
+	// the pinned durability/FTS window stays open. All fields are guarded
 	// by writeMu.
 	bulkConn             *sql.Conn
 	bulkPrevSync         int64

@@ -325,12 +325,14 @@ func (s *Store) beginBulkLoadLocked() {
 func (s *Store) FlushBulk() error {
 	s.writeMu.Lock()
 	if s.coordinatedBulkLoad {
-		sealErr := s.sealBulkIndexesLocked("repo_flush")
-		if sealErr == nil {
-			s.checkpointBulkWALPassiveLocked("repo_flush")
-		}
+		// A nested repository boundary is a WAL-pressure checkpoint, not an
+		// index boundary. The deterministic row limits in noteBulkRowsLocked
+		// seal dense indexes when enough corpus has actually accumulated;
+		// sealing here lets the first tiny repository re-enable per-row index
+		// maintenance for the rest of a cold workspace.
+		s.checkpointBulkWALPassiveLocked("repo_flush")
 		s.writeMu.Unlock()
-		return sealErr
+		return nil
 	}
 	hadBulk := s.bulkConn != nil
 	sealErr := s.sealBulkIndexesLocked("flush")

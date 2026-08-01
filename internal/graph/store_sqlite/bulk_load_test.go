@@ -291,7 +291,7 @@ func TestCoordinatedBulkLoadRequiresFreshGraphAndWarmSidecars(t *testing.T) {
 	})
 }
 
-func TestCoordinatedBulkLoadSealsIndexesAtFirstNestedRepoFlush(t *testing.T) {
+func TestCoordinatedBulkLoadKeepsIndexesDeferredAcrossNestedRepoFlushes(t *testing.T) {
 	s, _ := openTempStore(t)
 	if !s.BeginCoordinatedBulkLoad() {
 		t.Fatal("coordinated fast path did not engage on empty store")
@@ -318,45 +318,32 @@ func TestCoordinatedBulkLoadSealsIndexesAtFirstNestedRepoFlush(t *testing.T) {
 		}
 	}
 
-	// Mirror two repository shadow drains. The first boundary seals the dense
-	// indexes, but must not close the outer synchronous=OFF / FTS window.
-	s.BeginBulkLoad()
-	s.AddBatch([]*graph.Node{{
-		ID: "repo-a/a.go::A", Kind: graph.KindFunction, Name: "A",
-		FilePath: "repo-a/a.go", RepoPrefix: "repo-a", Language: "go",
-	}}, nil)
-	if err := s.FlushBulk(); err != nil {
-		t.Fatalf("nested repo-a FlushBulk: %v", err)
-	}
-	if s.bulkConn == nil || !s.coordinatedBulkLoad {
-		t.Fatal("first repo flush closed the coordinated bulk window")
-	}
-	if s.bulkIndexesDeferred {
-		t.Fatal("dense indexes still deferred after first repo boundary")
-	}
-	for _, idx := range bulkDroppableIndexes {
-		if !indexNames(t, &connQuerier{ctx: context.Background(), c: s.bulkConn})[idx.name] {
-			t.Fatalf("index %s not sealed at first repo boundary", idx.name)
+	// Mirror two small repository shadow drains. Nested boundaries may
+	// checkpoint WAL pressure, but they must leave the dense indexes deferred
+	// until the deterministic row limit or the outer final boundary.
+	for _, repo := range []string{"repo-a", "repo-b"} {
+		s.BeginBulkLoad()
+		s.AddBatch([]*graph.Node{{
+			ID: repo + "/a.go::A", Kind: graph.KindFunction, Name: "A",
+			FilePath: repo + "/a.go", RepoPrefix: repo, Language: "go",
+		}}, nil)
+		if err := s.FlushBulk(); err != nil {
+			t.Fatalf("nested %s FlushBulk: %v", repo, err)
 		}
+		if s.bulkConn == nil || !s.coordinatedBulkLoad || !s.bulkIndexesDeferred {
+			t.Fatalf("nested %s flush ended the deferred coordinated window", repo)
+		}
+		assertIndexesDropped(repo + " flush")
 	}
-
-	s.BeginBulkLoad()
-	s.AddBatch([]*graph.Node{{
-		ID: "repo-b/b.go::B", Kind: graph.KindFunction, Name: "B",
-		FilePath: "repo-b/b.go", RepoPrefix: "repo-b", Language: "go",
-	}}, nil)
-	if err := s.FlushBulk(); err != nil {
-		t.Fatalf("nested repo-b FlushBulk: %v", err)
-	}
-	if len(sealEvents) != 1 {
-		t.Fatalf("successful seal events = %d, want exactly 1", len(sealEvents))
-	}
-	if sealEvents[0].Name != "repo_flush" || sealEvents[0].NodeRows != 1 {
-		t.Fatalf("unexpected seal event: %+v", sealEvents[0])
+	if len(sealEvents) != 0 {
+		t.Fatalf("nested repository flushes sealed indexes: %+v", sealEvents)
 	}
 
 	if err := s.EndCoordinatedBulkLoad(); err != nil {
 		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
+	}
+	if len(sealEvents) != 1 || sealEvents[0].Name != "final" || sealEvents[0].NodeRows != 2 {
+		t.Fatalf("seal events = %+v, want one final event for two rows", sealEvents)
 	}
 	if s.coordinatedBulkLoad || s.bulkConn != nil {
 		t.Fatal("coordinated bulk state not released")
@@ -430,9 +417,11 @@ func TestCoordinatedBulkSealFailureRetriesAtFinalBoundary(t *testing.T) {
 	if !s.BeginCoordinatedBulkLoad() {
 		t.Fatal("coordinated fast path did not engage")
 	}
-	s.AddBatch([]*graph.Node{{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"}}, nil)
-	if err := s.FlushBulk(); err == nil {
-		t.Fatal("forced repository-boundary seal unexpectedly succeeded")
+	s.bulkDeferredNodeRows = bulkIndexSealNodeLimit - 1
+	if _, err := s.addBatchSetOriented([]*graph.Node{{
+		ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A",
+	}}, nil); err == nil {
+		t.Fatal("forced row-limit seal unexpectedly succeeded")
 	}
 	if s.bulkConn == nil || !s.bulkIndexesDeferred {
 		t.Fatal("failed seal did not retain retryable bulk state")
