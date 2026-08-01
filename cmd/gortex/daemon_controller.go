@@ -679,19 +679,20 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		return daemon.StatusResponse{}, err
 	}
 
-	// Compute the per-repo memory estimate BEFORE taking the coarse
-	// controller mutex. On the SQLite backend AllRepoMemoryEstimates is a
-	// COUNT … GROUP BY scan that turns pathologically slow under
-	// enrichment write load; holding c.mu across it stalls every other
-	// control request (status / track / reload) queued on the mutex — the
-	// daemon-looks-crashed symptom. Snapshot the graph handle under a
-	// brief lock, then run the (store-memoised) estimate lock-free.
+	// Compute exact per-repo estimates only after enrichment. On SQLite,
+	// AllRepoMemoryEstimates plus NodeCount/EdgeCount are four corpus-wide
+	// scans; status and health polling must not compete with warmup for the
+	// four-reader pool. While warming, RepoMetadata below supplies stable
+	// advisory counts and byte estimates intentionally remain zero. Once
+	// enriched, snapshot the graph handle under a brief lock and run the
+	// exact (store-memoised) estimates without holding the controller mutex.
 	c.mu.Lock()
 	g := c.graph
 	c.mu.Unlock()
+	enriched := c.enriched.Load()
 	var memEstimates map[string]graph.RepoMemoryEstimate
 	var wholeStoreNodes, wholeStoreEdges int
-	if g != nil {
+	if g != nil && enriched {
 		memEstimates = g.AllRepoMemoryEstimates()
 		// NodeCount/EdgeCount share that profile: COUNT(*) on the SQLite
 		// backend, a walk of every shard in memory. They were computed
@@ -755,7 +756,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		// underlying nodes. The meta fallback below keeps the table usable
 		// in the meantime. There is no longer an expected shortfall to
 		// exempt: a bucket short of the tracked count is always a defect.
-		if c.logger != nil {
+		if enriched && c.logger != nil {
 			tracked := len(allMeta)
 			counted := len(memEstimates)
 			if tracked > 0 && counted < tracked {
@@ -778,7 +779,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		// every counter is empty, fall back to per-repo meta so the share
 		// denominator stays nonzero and the search budget gets attributed
 		// instead of falling on the floor.
-		if soleRepo {
+		if soleRepo && enriched {
 			totalNodes = wholeStoreNodes
 		} else {
 			for _, est := range memEstimates {
@@ -798,7 +799,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 			edges := meta.EdgeCount
 			var mem daemon.MemoryBreakdown
 			switch {
-			case soleRepo:
+			case soleRepo && enriched:
 				// A single tracked repo owns the entire store — including
 				// the handful of synthetic global externals that belong to
 				// no repo — so reporting whole-store totals keeps `daemon
@@ -915,7 +916,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		PProfAddr:          daemonPProfAddr(),
 		Ready:              c.ready.Load(),
 		WarmupSeconds:      c.warmupSeconds.Load(),
-		EnrichmentComplete: c.enriched.Load(),
+		EnrichmentComplete: enriched,
 		EnrichSeconds:      c.enrichSeconds.Load(),
 		Workspaces:         workspaces,
 		ConfiguredServers:  c.collectConfiguredServers(),

@@ -85,6 +85,13 @@ func TestStatus_TrackedRepoRowFollowsTheLiveGraph(t *testing.T) {
 	})
 
 	c := &realController{graph: g, multiIndexer: mi, configManager: cm, logger: zap.NewNop()}
+	warmingResp, err := c.Status(context.Background())
+	require.NoError(t, err)
+	require.Len(t, warmingResp.TrackedRepos, 1)
+	assert.Equal(t, frozenNodes, warmingResp.TrackedRepos[0].Nodes,
+		"warming status must retain metadata counts instead of overwriting them with unavailable exact totals")
+
+	c.enriched.Store(true)
 	resp, err := c.Status(context.Background())
 	require.NoError(t, err)
 	require.Len(t, resp.TrackedRepos, 1)
@@ -161,6 +168,7 @@ func TestStatus_TwoReposEachReportTheirOwnBucket(t *testing.T) {
 	require.Positive(t, bucketB, "B's per-prefix bucket must be populated")
 
 	c := &realController{graph: g, multiIndexer: mi2, configManager: cm, logger: zap.NewNop()}
+	c.enriched.Store(true)
 	resp, err := c.Status(context.Background())
 	require.NoError(t, err)
 	require.Len(t, resp.TrackedRepos, 2)
