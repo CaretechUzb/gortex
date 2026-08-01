@@ -2652,14 +2652,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		defer shadowLease.Release()
 	}
 	shadowBudgetCapacity, shadowBudgetUsed, shadowBudgetPeak := admission.snapshot()
-	preNodes := idx.graph.NodeCount()
-	preEdges := idx.graph.EdgeCount()
 	idx.logger.Info("indexer: shadow-swap decision",
 		zap.String("repo", idx.RepoPrefix()),
 		zap.Bool("bulk_loader", blOK),
 		zap.Bool("first_index", firstIndex),
-		zap.Int("pre_nodes", preNodes),
-		zap.Int("pre_edges", preEdges),
 		zap.Int("files", len(files)),
 		zap.Int("shadow_max_files", shadowMaxFileCount()),
 		zap.Bool("below_shadow_max", belowShadowMax),
@@ -2674,29 +2670,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		zap.Bool("shadow_taken", shadowTaken),
 	)
 	if shadowTaken {
-		// Warm-restart safety. `firstIndex` is a PER-INDEXER sentinel, and
-		// a fresh per-repo Indexer is constructed on every daemon restart,
-		// so firstIndex is true on every restart — even when the
-		// persistent disk store already holds this repo's nodes from a
-		// prior run. The shadow drain below ends in BulkLoad's INSERT-only
-		// COPY, which (per this function's own contract) "running against a
-		// non-empty store would corrupt or duplicate". A duplicate-primary-
-		// key bulk load against the persisted rows would fail warmup, and
-		// because the repo's mtimes never get persisted when warmup dies
-		// first, the failure re-fires on the next restart: a crash loop.
-		// Evicting the repo's existing rows first makes the bulk load land
-		// on a clean slate. EvictRepo self-guards with a count query, so this is a
-		// cheap no-op for the genuine first-index cases (true cold start,
-		// a newly-tracked repo) where the disk store has no rows for this
-		// prefix. preNodes>0 short-circuits the call entirely on the
-		// first repo of a cold start (empty store).
-		if preNodes > 0 {
-			if n, e := idx.graph.EvictRepo(idx.RepoPrefix()); n > 0 || e > 0 {
-				idx.logger.Info("indexer: evicted stale repo rows before bulk reload (warm restart)",
-					zap.String("repo", idx.RepoPrefix()),
-					zap.Int("nodes", n), zap.Int("edges", e))
-			}
-		}
+		// Keep the persisted repository queryable while the replacement graph is
+		// parsed in memory. Warm-restart rows are evicted only after parsing has
+		// succeeded, immediately before the INSERT-only bulk drain. Besides
+		// shortening the stale-data window, this keeps the shadow decision free
+		// of store reads that queue behind an unrelated repository's bulk writer.
 		idx.indexCount.Add(1)
 		diskTarget = idx.graph
 		inMemShadow = graph.New()
@@ -2744,6 +2722,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			)
 			finishDrainPressure := drainPressure.begin()
 			defer finishDrainPressure()
+			// BulkLoad is INSERT-only. A fresh per-repository Indexer also has
+			// firstIndex=true on warm restart, so remove any persisted rows for
+			// this prefix after the replacement parse succeeds and before its
+			// first disk write. EvictRepo is a no-op on a genuine cold/new repo.
+			if n, e := diskTarget.EvictRepo(idx.RepoPrefix()); n > 0 || e > 0 {
+				idx.logger.Info("indexer: evicted stale repo rows before shadow drain",
+					zap.String("repo", idx.RepoPrefix()),
+					zap.Int("nodes", n), zap.Int("edges", e))
+			}
 			bl.BeginBulkLoad()
 			// Transfer the shadow in explicit row/byte-capped batches. The
 			// process-wide shadow admission caps all live shadows at 1 GiB; these
