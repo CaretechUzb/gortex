@@ -3301,15 +3301,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					atomic.AddInt64(&parseExtractNS, int64(time.Since(extractStart)))
 					omitSecondarySourceScans := extractionDispositionFor(result).omitSecondarySourceScans()
 					recordNativePressure := parsePool == nil && shouldRecordNativeParsePressure(result)
+					if recordNativePressure {
+						nativePressure.afterParse(lang, int64(len(src)))
+					}
 					if err != nil {
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
 						errMu.Unlock()
 					}
 					if result == nil {
-						if recordNativePressure {
-							nativePressure.afterParse(lang, int64(len(src)))
-						}
 						parseLease.Release()
 						// A full-index parse failure that produced no nodes:
 						// record it for a skip-node post-pass so the file
@@ -3433,9 +3433,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// long-lived worker goroutine, so a defer would pin
 					// every tree in the chunk until the worker exits.
 					result.ReleaseTree()
-					if recordNativePressure {
-						nativePressure.afterParse(lang, int64(len(src)))
-					}
 					parseLease.Release()
 					atomic.AddInt64(&fileCount, 1)
 				}
