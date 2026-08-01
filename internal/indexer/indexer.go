@@ -2733,11 +2733,17 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			drainStart := time.Now()
 			shadowNodeCount := inMemShadow.NodeCount()
 			shadowEdgeCount := inMemShadow.EdgeCount()
+			shadowEstimate := inMemShadow.RepoMemoryEstimate(idx.RepoPrefix())
+			drainPressure := newShadowDrainPressure(shadowEstimate, idx.RepoPrefix(), idx.logger)
 			idx.logger.Info("indexer: drain start (shadow → disk)",
 				zap.String("repo", idx.RepoPrefix()),
 				zap.Int("shadow_nodes", shadowNodeCount),
 				zap.Int("shadow_edges", shadowEdgeCount),
+				zap.Uint64("shadow_estimated_bytes", shadowEstimate.Total()),
+				zap.Bool("pressure_guard", drainPressure.enabled),
 			)
+			finishDrainPressure := drainPressure.begin()
+			defer finishDrainPressure()
 			bl.BeginBulkLoad()
 			// Transfer the shadow in explicit row/byte-capped batches. The
 			// process-wide shadow admission caps all live shadows at 1 GiB; these
@@ -2771,6 +2777,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			for nodes := range inMemShadow.DrainNodeBatches(persistChunkRows, persistChunkBytes) {
 				diskTarget.AddBatch(nodes, nil)
 				if !ftsReady || retErr != nil {
+					nodeRows := len(nodes)
+					nodes = nil
+					drainPressure.afterNodeBatch(nodeRows)
 					continue
 				}
 				ftsItems := make([]graph.SymbolFTSItem, 0, min(len(nodes), persistFTSChunkRows))
@@ -2811,9 +2820,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				if ftsReady {
 					flushFTS()
 				}
+				nodeRows := len(nodes)
+				nodes = nil
+				drainPressure.afterNodeBatch(nodeRows)
 			}
 			for edges := range inMemShadow.DrainEdgeBatches(persistChunkRows, persistChunkBytes) {
 				diskTarget.AddBatch(nil, edges)
+				edgeRows := len(edges)
+						drainPressure.afterEdgeBatch(edgeRows)
 			}
 
 			flushStart := time.Now()
@@ -2832,6 +2846,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				zap.Int("edges", shadowEdgeCount),
 				zap.Int("fts_items", ftsItemCount),
 			)
+			finishDrainPressure()
 			if retErr == nil {
 				if serr := persistShadowCompactSidecars(
 					inMemShadow, diskTarget, idx.RepoPrefix(),
