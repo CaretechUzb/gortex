@@ -280,6 +280,91 @@ func TestResolveCSharpExtension_NothingVisibleFallsBackToUnique(t *testing.T) {
 		"a repo-unique extension must still bind when nothing is visible")
 }
 
+// TestResolveCSharpExtension_GlobalUsingPropagates: a `global using` declared
+// in a sibling file (the Usings.cs convention) applies to every file under the
+// declaring file's directory — the caller file itself has no usings at all.
+func TestResolveCSharpExtension_GlobalUsingPropagates(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Proj/Usings.cs": `global using LibA;
+`,
+		"Proj/Caller.cs": `namespace App {
+    public class Runner {
+        public void Run(Thing t) {
+            t.Foo();
+        }
+    }
+}`,
+		"LibA/Ext.cs": `namespace LibA {
+    public static class EA { public static int Foo(this string s) { return 1; } }
+}`,
+		"LibB/Ext.cs": `namespace LibB {
+    public static class EB { public static int Foo(this int n) { return 2; } }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Proj/Caller.cs::Runner.Run")
+	require.Equal(t, "LibA/Ext.cs::EA.Foo", target,
+		"the sibling file's global using must make LibA visible to the caller")
+}
+
+// TestResolveCSharpExtension_GlobalUsingDoesNotLeakAcrossProjects: a global
+// using is scoped to its compilation — a sibling project's Usings.cs must not
+// grant visibility, or every module's globals would cross-contaminate the
+// per-module disambiguation.
+func TestResolveCSharpExtension_GlobalUsingDoesNotLeakAcrossProjects(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"ProjA/Usings.cs": `global using LibA;
+`,
+		"ProjB/Caller.cs": `namespace App {
+    public class Runner {
+        public void Run(Thing t) {
+            t.Foo();
+        }
+    }
+}`,
+		"LibA/Ext.cs": `namespace LibA {
+    public static class EA { public static int Foo(this string s) { return 1; } }
+}`,
+		"LibB/Ext.cs": `namespace LibB {
+    public static class EB { public static int Foo(this int n) { return 2; } }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "ProjB/Caller.cs::Runner.Run")
+	require.NotEmpty(t, target)
+	assert.True(t, graph.IsUnresolvedTarget(target),
+		"ProjA's global using must not leak into ProjB, got %q", target)
+}
+
+// TestResolveCSharpExtension_UsingStaticMakesExtensionVisible: `using static
+// LibA.EA;` brings EA's extension methods into scope even though namespace
+// LibA itself is never imported.
+func TestResolveCSharpExtension_UsingStaticMakesExtensionVisible(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"LibA/Ext.cs": `namespace LibA {
+    public static class EA { public static int Foo(this string s) { return 1; } }
+}`,
+		"LibB/Ext.cs": `namespace LibB {
+    public static class EB { public static int Foo(this int n) { return 2; } }
+}`,
+		"Caller.cs": `using static LibA.EA;
+namespace App {
+    public class Runner {
+        public void Run(Thing t) {
+            t.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.Equal(t, "LibA/Ext.cs::EA.Foo", target,
+		"using static of the declaring class must make its extensions visible")
+}
+
 // TestResolveCSharpExtension_InstanceWins: an instance method beats an extension
 // of the same name (C# member-lookup precedence).
 func TestResolveCSharpExtension_InstanceWins(t *testing.T) {

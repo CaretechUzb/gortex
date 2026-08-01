@@ -305,6 +305,14 @@ type Resolver struct {
 	csharpNSByFile map[string]csharpFileNS
 	csharpNSMu     sync.RWMutex
 
+	// csharpGlobalByDir maps a directory to the namespaces its files'
+	// `global using` directives import. A global using is compilation-
+	// scoped; without file→project edges the declaring file's directory
+	// subtree approximates the project (SDK projects glob **/*.cs under
+	// the csproj dir). nil = not built; built lazily under csharpNSMu
+	// and cleared with the per-pass lookup caches.
+	csharpGlobalByDir map[string][]string
+
 	// incrementalSkip holds the source-shapes of a single re-resolved file's
 	// out-edges that were already unresolved before the edit; the forward
 	// pass skips them. Set/cleared around ResolveFileAndIncoming by the
@@ -1927,6 +1935,7 @@ func (r *Resolver) clearLookupCache() {
 	r.importFilesMu.Unlock()
 	r.csharpNSMu.Lock()
 	r.csharpNSByFile = nil
+	r.csharpGlobalByDir = nil
 	r.csharpNSMu.Unlock()
 }
 

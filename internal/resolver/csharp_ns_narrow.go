@@ -17,7 +17,8 @@ import (
 // using directives, so an own-namespace type shadows an imported one.
 type csharpFileNS struct {
 	enclosing map[string]struct{} // declared namespaces + their prefixes
-	imported  map[string]struct{} // using-directive namespaces
+	imported  map[string]struct{} // using-directive namespaces (incl. project-scoped globals)
+	statics   map[string]struct{} // using-static class FQNs — members in scope, not the namespace
 }
 
 // csharpFileNamespaceSet returns the namespaces visible to a C# file:
@@ -32,25 +33,25 @@ func (r *Resolver) csharpFileNamespaceSet(fileID string) csharpFileNS {
 		return ns
 	}
 
-	ns = csharpFileNS{enclosing: map[string]struct{}{}, imported: map[string]struct{}{}}
+	ns = csharpFileNS{enclosing: map[string]struct{}{}, imported: map[string]struct{}{}, statics: map[string]struct{}{}}
 	// Primary using evidence is the extractor's Meta["usings"] stamp —
 	// resolveImport rewrites the per-directive edges (a namespace tail
 	// matching any directory basename becomes a file-node target), so
 	// only the stamp is order-independent. The edge shapes below remain
 	// as a fallback for graphs extracted before the stamp existed.
 	if f := r.cachedGetNode(fileID); f != nil {
-		switch v := f.Meta["usings"].(type) {
-		case []string:
-			for _, u := range v {
-				ns.imported[u] = struct{}{}
-			}
-		case []any:
-			for _, u := range v {
-				if s, ok := u.(string); ok {
-					ns.imported[s] = struct{}{}
-				}
-			}
+		for _, u := range csharpMetaStrings(f.Meta["usings"]) {
+			ns.imported[u] = struct{}{}
 		}
+		for _, u := range csharpMetaStrings(f.Meta["using_static"]) {
+			ns.statics[u] = struct{}{}
+		}
+	}
+	// Project-scoped `global using`s from the directory chain (the
+	// Usings.cs convention) join the imported tier exactly like a local
+	// directive would.
+	for _, u := range r.csharpGlobalUsingsFor(fileID) {
+		ns.imported[u] = struct{}{}
 	}
 	hasStamp := len(ns.imported) > 0
 	for _, e := range r.graph.GetOutEdges(fileID) {
@@ -98,6 +99,76 @@ func (r *Resolver) csharpFileNamespaceSet(fileID string) csharpFileNS {
 	r.csharpNSByFile[fileID] = ns
 	r.csharpNSMu.Unlock()
 	return ns
+}
+
+// csharpMetaStrings reads a []string-shaped meta value in either of the
+// shapes a graph round-trip produces (in-memory []string, JSON []any).
+func csharpMetaStrings(v any) []string {
+	switch v := v.(type) {
+	case []string:
+		return v
+	case []any:
+		var out []string
+		for _, u := range v {
+			if s, ok := u.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// csharpGlobalUsingsFor returns the global-using namespaces visible to
+// fileID: those declared by C# files in its own directory or any
+// ancestor. The declaring file's directory subtree approximates the
+// compilation unit (there are no file→project edges; SDK projects glob
+// **/*.cs under the csproj dir). The Usings.cs convention keeps the
+// declaring file at the project root, so the approximation is exact for
+// the layouts that use the feature; a nested project could theoretically
+// over-share, which narrowing-only consumers keep harmless short of a
+// same-name tie.
+func (r *Resolver) csharpGlobalUsingsFor(fileID string) []string {
+	r.csharpNSMu.Lock()
+	if r.csharpGlobalByDir == nil {
+		idx := map[string][]string{}
+		for n := range r.graph.NodesByKind(graph.KindFile) {
+			if n == nil || n.Meta == nil {
+				continue
+			}
+			if globals := csharpMetaStrings(n.Meta["global_usings"]); len(globals) > 0 {
+				d := csharpDirOf(n.ID)
+				idx[d] = append(idx[d], globals...)
+			}
+		}
+		r.csharpGlobalByDir = idx
+	}
+	idx := r.csharpGlobalByDir
+	r.csharpNSMu.Unlock()
+	if len(idx) == 0 {
+		return nil
+	}
+	var out []string
+	dir := fileID
+	for {
+		i := strings.LastIndex(dir, "/")
+		if i < 0 {
+			out = append(out, idx["."]...)
+			break
+		}
+		dir = dir[:i]
+		out = append(out, idx[dir]...)
+	}
+	return out
+}
+
+// csharpDirOf is path.Dir over the forward-slash node IDs the index
+// writes, with "." for a root-level file.
+func csharpDirOf(p string) string {
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		return p[:i]
+	}
+	return "."
 }
 
 // csharpNarrowEligible gates narrowing to type-shaped candidates in the

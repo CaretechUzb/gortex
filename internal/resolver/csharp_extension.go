@@ -116,13 +116,27 @@ func (r *Resolver) narrowCSharpExtensionsByVisibility(e *graph.Edge, exts []*gra
 		return nil
 	}
 	visible := r.csharpFileNamespaceSet(e.FilePath)
-	if len(visible.enclosing) == 0 && len(visible.imported) == 0 {
+	if len(visible.enclosing) == 0 && len(visible.imported) == 0 && len(visible.statics) == 0 {
 		return nil
 	}
 	var enclosing, imported []*graph.Node
 	deepest := 0
 	for _, c := range exts {
 		ns, _ := c.Meta["scope_ns"].(string)
+		// `using static Ns.Class;` admits the class's extensions directly,
+		// namespace visibility notwithstanding — rank with the imports.
+		if len(visible.statics) > 0 {
+			if cls, _ := c.Meta["receiver"].(string); cls != "" {
+				fqn := cls
+				if ns != "" {
+					fqn = ns + "." + cls
+				}
+				if _, ok := visible.statics[fqn]; ok {
+					imported = append(imported, c)
+					continue
+				}
+			}
+		}
 		if ns == "" {
 			continue
 		}
@@ -143,6 +157,49 @@ func (r *Resolver) narrowCSharpExtensionsByVisibility(e *graph.Edge, exts []*gra
 		return enclosing
 	}
 	return imported
+}
+
+// csharpExtensionVisible reports whether an extension method's declaring
+// namespace is visible from the calling file — via the enclosing-namespace
+// chain, a using directive (project-scoped globals included), or a
+// using-static of the declaring class.
+func (r *Resolver) csharpExtensionVisible(fileID string, c *graph.Node) bool {
+	visible := r.csharpFileNamespaceSet(fileID)
+	ns, _ := c.Meta["scope_ns"].(string)
+	if cls, _ := c.Meta["receiver"].(string); cls != "" && len(visible.statics) > 0 {
+		fqn := cls
+		if ns != "" {
+			fqn = ns + "." + cls
+		}
+		if _, ok := visible.statics[fqn]; ok {
+			return true
+		}
+	}
+	if ns == "" {
+		return false
+	}
+	if _, ok := visible.enclosing[ns]; ok {
+		return true
+	}
+	_, ok := visible.imported[ns]
+	return ok
+}
+
+// csharpExtensionGuardKeep is the cross-package guard's keep-rule for
+// extension binds: visibility, not imports, is what makes an extension
+// callable, so a bind whose declaring namespace the calling file can see
+// must survive the import-reachability revert.
+func (r *Resolver) csharpExtensionGuardKeep(e *graph.Edge, callerFile string, target *graph.Node) bool {
+	if e == nil || e.Meta == nil || callerFile == "" {
+		return false
+	}
+	if res, _ := e.Meta["resolution"].(string); res != "extension_method" {
+		return false
+	}
+	if !isCSharpExtension(target) {
+		return false
+	}
+	return r.csharpExtensionVisible(callerFile, target)
 }
 
 // bindCSharpExtension points a member-call edge at a resolved extension method

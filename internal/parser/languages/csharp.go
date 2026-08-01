@@ -1030,39 +1030,70 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 }
 
 // stampCSharpUsings records the file's plain namespace usings (global
-// ones included) on the file node as Meta["usings"]. Aliases and
-// using-static grant no bare-name namespace visibility and are skipped.
-// Resolution rewrites the per-directive import edges, so the resolver's
-// namespace narrowing reads this shape, which nothing mutates.
+// ones included) on the file node as Meta["usings"]. Aliases grant no
+// bare-name namespace visibility and are skipped. Two side stamps carry
+// the forms the plain shape cannot: Meta["global_usings"] (project-scoped
+// — the resolver propagates them beyond the declaring file) and
+// Meta["using_static"] (class targets whose extension methods stay
+// callable in extension form). Resolution rewrites the per-directive
+// import edges, so the resolver's namespace narrowing reads these
+// shapes, which nothing mutates.
 func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
-	var usings []string
+	var usings, globals, statics []string
 	seen := map[string]bool{}
+	seenStatic := map[string]bool{}
 	walkNodes(root, func(n *sitter.Node) {
 		if n.Type() != "using_directive" {
 			return
 		}
 		var name string
+		isGlobal, isStatic := false, false
 		for i, _nc := 0, int(n.ChildCount()); i < _nc; i++ {
 			c := n.Child(i)
 			switch c.Type() {
-			case "static", "name_equals", "=":
+			case "global":
+				isGlobal = true
+			case "static":
+				isStatic = true
+			case "name_equals", "=":
 				return
 			case "identifier", "qualified_name":
 				name = strings.TrimSpace(c.Content(src))
 			}
 		}
-		if name != "" && !seen[name] {
+		if name == "" {
+			return
+		}
+		if isStatic {
+			if !seenStatic[name] {
+				seenStatic[name] = true
+				statics = append(statics, name)
+			}
+			return
+		}
+		if !seen[name] {
 			seen[name] = true
 			usings = append(usings, name)
+			if isGlobal {
+				globals = append(globals, name)
+			}
 		}
 	})
-	if len(usings) == 0 {
+	if len(usings) == 0 && len(statics) == 0 {
 		return
 	}
 	if fileNode.Meta == nil {
 		fileNode.Meta = map[string]any{}
 	}
-	fileNode.Meta["usings"] = usings
+	if len(usings) > 0 {
+		fileNode.Meta["usings"] = usings
+	}
+	if len(globals) > 0 {
+		fileNode.Meta["global_usings"] = globals
+	}
+	if len(statics) > 0 {
+		fileNode.Meta["using_static"] = statics
+	}
 }
 
 func (e *CSharpExtractor) emitUsing(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {

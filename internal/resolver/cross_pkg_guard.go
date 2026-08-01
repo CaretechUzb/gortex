@@ -123,6 +123,16 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		if r.loneMemberDefnKeep(target, j.edge, j.oldTo) {
 			continue
 		}
+		// A C# extension-method bind is corroborated by namespace
+		// visibility, not imports: the extension enters scope via the
+		// caller's enclosing namespace or a project-scoped `global using`
+		// declared in a sibling file (or `using static` of the declaring
+		// class) — none of which leaves an import edge on the calling
+		// file for the reachability closure to see. Re-check the same
+		// visibility evidence the bind used and keep it when it holds.
+		if r.csharpExtensionGuardKeep(j.edge, callerFile, target) {
+			continue
+		}
 		// Not reachable — revert to the unresolved placeholder and
 		// re-index against the resolved target we are abandoning.
 		// SetEdgeProvenance("") drops the resolution provenance so
