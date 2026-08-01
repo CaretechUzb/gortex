@@ -20,9 +20,10 @@ type cloneProjectionCountingStore struct {
 	pager  graph.CloneCorpusPager
 	writer graph.CloneCorpusWriter
 
-	pageCalls  int
-	writeCalls int
-	writeRows  int
+	pageCalls     int
+	repoNodeCalls int
+	writeCalls    int
+	writeRows     int
 }
 
 func newCloneProjectionCountingStore(store graph.Store) *cloneProjectionCountingStore {
@@ -31,6 +32,11 @@ func newCloneProjectionCountingStore(store graph.Store) *cloneProjectionCounting
 		pager:  store.(graph.CloneCorpusPager),
 		writer: store.(graph.CloneCorpusWriter),
 	}
+}
+
+func (s *cloneProjectionCountingStore) GetRepoNodes(repoPrefix string) []*graph.Node {
+	s.repoNodeCalls++
+	return s.Store.GetRepoNodes(repoPrefix)
 }
 
 func (s *cloneProjectionCountingStore) CloneCorpusPage(repoPrefix, after string, limit int) ([]graph.CloneCorpusRow, error) {
@@ -129,6 +135,49 @@ func TestSQLiteCloneCorpusSurvivesReloadAndWarmReplay(t *testing.T) {
 	assertEquivalent(fallback)
 }
 
+func emptyCloneCorpusStore(size int, repoPrefix string) *cloneProjectionCountingStore {
+	store := graph.New()
+	nodes := make([]*graph.Node, 0, size)
+	for i := 0; i < size; i++ {
+		nodes = append(nodes, &graph.Node{
+			ID:         fmt.Sprintf("empty-%06d", i),
+			Kind:       graph.KindFunction,
+			RepoPrefix: repoPrefix,
+		})
+	}
+	store.AddBatch(nodes, nil)
+	return newCloneProjectionCountingStore(store)
+}
+
+func TestEmptyCloneCorpusBaselineAvoidsDuplicateLegacyScan(t *testing.T) {
+	const repoPrefix = "empty-repo"
+	store := emptyCloneCorpusStore(2*cloneCorpusFinalizeBatch, repoPrefix)
+
+	baseline := finaliseCloneCorpusCtx(context.Background(), store, repoPrefix)
+	require.True(t, baseline.complete)
+	require.Zero(t, baseline.corpus)
+	require.Zero(t, baseline.itemCount)
+	require.NotNil(t, baseline.cms)
+	require.NotNil(t, baseline.lsh)
+	require.NotNil(t, baseline.shingles)
+	require.Empty(t, baseline.shingles)
+	require.Nil(t, baseline.items)
+	require.Equal(t, 1, store.pageCalls, "empty compact corpus needs one bounded probe")
+	require.Equal(t, 1, store.repoNodeCalls, "one compatibility scan must prove the corpus is structurally empty")
+
+	maintained := newIncrementalCloneIndex()
+	maintained.AdoptBaselineOrRebuild(store, repoPrefix, baseline)
+	require.True(t, maintained.Ready())
+	require.Zero(t, maintained.corpus)
+	require.Empty(t, maintained.shingles)
+	require.Equal(t, 1, store.pageCalls, "adoption must not repeat the compact probe")
+	require.Equal(t, 1, store.repoNodeCalls, "adoption must not repeat the full repository scan")
+	require.Nil(t, baseline.cms, "the empty seed must retain single-consumer ownership semantics")
+	require.Nil(t, baseline.lsh)
+	require.Nil(t, baseline.shingles)
+	require.False(t, baseline.complete)
+}
+
 type cloneCorpusBenchmarkStore struct {
 	graph.Store
 	rows      []graph.CloneCorpusRow
@@ -197,6 +246,44 @@ func TestFinaliseCloneCorpusAbortReleasesBaseline(t *testing.T) {
 	require.Nil(t, baseline.items)
 	require.Zero(t, baseline.itemCount)
 	require.Zero(t, baseline.corpus)
+}
+
+func BenchmarkIncrementalCloneIndexEmptyBaselineReuse(b *testing.B) {
+	const repoPrefix = "empty-repo"
+	store := emptyCloneCorpusStore(8*cloneCorpusFinalizeBatch, repoPrefix)
+	template := &cloneCorpusBaseline{repoPrefix: repoPrefix}
+	completeEmptyCloneBaseline(template)
+
+	b.Run("adopt_proven_empty_baseline", func(b *testing.B) {
+		b.ReportAllocs()
+		store.pageCalls = 0
+		store.repoNodeCalls = 0
+		for i := 0; i < b.N; i++ {
+			candidate := *template
+			ci := &incrementalCloneIndex{}
+			ci.AdoptBaselineOrRebuild(store, repoPrefix, &candidate)
+			if !ci.Ready() {
+				b.Fatal("adopted empty index is not ready")
+			}
+		}
+		b.ReportMetric(float64(store.pageCalls)/float64(b.N), "corpus_pages/op")
+		b.ReportMetric(float64(store.repoNodeCalls)/float64(b.N), "repo_scans/op")
+	})
+
+	b.Run("rebuild_empty_corpus", func(b *testing.B) {
+		b.ReportAllocs()
+		store.pageCalls = 0
+		store.repoNodeCalls = 0
+		for i := 0; i < b.N; i++ {
+			ci := &incrementalCloneIndex{}
+			ci.AdoptBaselineOrRebuild(store, repoPrefix, nil)
+			if !ci.Ready() {
+				b.Fatal("rebuilt empty index is not ready")
+			}
+		}
+		b.ReportMetric(float64(store.pageCalls)/float64(b.N), "corpus_pages/op")
+		b.ReportMetric(float64(store.repoNodeCalls)/float64(b.N), "repo_scans/op")
+	})
 }
 
 func BenchmarkIncrementalCloneIndexBaselineReuse(b *testing.B) {

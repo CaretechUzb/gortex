@@ -235,7 +235,8 @@ func (ci *incrementalCloneIndex) AdoptBaselineOrRebuild(g graph.Store, repoPrefi
 	}
 	if baseline == nil || !baseline.complete || baseline.repoPrefix != repoPrefix ||
 		baseline.cms == nil || baseline.lsh == nil || baseline.shingles == nil ||
-		baseline.corpus <= 0 || baseline.corpus < baseline.itemCount {
+		baseline.corpus < 0 || baseline.itemCount < 0 || baseline.corpus < baseline.itemCount ||
+		(baseline.corpus == 0 && len(baseline.shingles) != 0) {
 		ci.Rebuild(g, repoPrefix)
 		return
 	}
