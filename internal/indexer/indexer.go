@@ -3216,15 +3216,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					extractStart := time.Now()
 					result, skipped, err := idx.extractFile(parsePool, quarantine, path, relPath, lang, ext, src)
 					atomic.AddInt64(&parseExtractNS, int64(time.Since(extractStart)))
-					if parsePool == nil {
-						nativePressure.afterParse(lang, int64(len(src)))
-					}
 					if err != nil {
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
 						errMu.Unlock()
 					}
 					if result == nil {
+						if parsePool == nil {
+							nativePressure.afterTreeRelease(lang, int64(len(src)), nil)
+						}
 						parseLease.Release()
 						// A full-index parse failure that produced no nodes:
 						// record it for a skip-node post-pass so the file
@@ -3347,7 +3347,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// defer: this is a per-file loop body inside a
 					// long-lived worker goroutine, so a defer would pin
 					// every tree in the chunk until the worker exits.
-					result.ReleaseTree()
+					if parsePool == nil {
+						nativePressure.afterTreeRelease(lang, int64(len(src)), result.ReleaseTree)
+					} else {
+						result.ReleaseTree()
+					}
 					parseLease.Release()
 					atomic.AddInt64(&fileCount, 1)
 				}

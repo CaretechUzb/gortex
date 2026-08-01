@@ -45,6 +45,36 @@ func TestNativeParsePressureReliefThresholdAndFlush(t *testing.T) {
 	}
 }
 
+func TestNativeParsePressureReliefRunsAfterTreeRelease(t *testing.T) {
+	treeReleased := false
+	nativeCalls := 0
+	r := &nativeParsePressureRelief{
+		release: func() uintptr {
+			if !treeReleased {
+				t.Error("native allocator relief ran before tree release")
+			}
+			nativeCalls++
+			return 0
+		},
+	}
+
+	r.afterTreeRelease("c", nativeParsePressureThresholdBytes, func() {
+		treeReleased = true
+	})
+	if !treeReleased || nativeCalls != 1 {
+		t.Fatalf("treeReleased=%v nativeCalls=%d, want true and 1", treeReleased, nativeCalls)
+	}
+
+	var unavailable *nativeParsePressureRelief
+	nilReceiverReleased := false
+	unavailable.afterTreeRelease("c", nativeParsePressureThresholdBytes, func() {
+		nilReceiverReleased = true
+	})
+	if !nilReceiverReleased {
+		t.Fatal("nil pressure relief skipped tree release")
+	}
+}
+
 func TestNativeParseAdmissionWeight(t *testing.T) {
 	const (
 		sourceBytes int64 = 1024
