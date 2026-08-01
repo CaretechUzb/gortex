@@ -181,6 +181,37 @@ func TestBulkLoadDropsAndRebuildsIndexes(t *testing.T) {
 	integrityOK(t, s.db)
 }
 
+func TestBulkLoadDisablesAndRestoresWALAutocheckpoint(t *testing.T) {
+	s, _ := openTempStore(t)
+	const previous = int64(37)
+	if _, err := s.writerDB.Exec(fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", previous)); err != nil {
+		t.Fatalf("set prior wal_autocheckpoint: %v", err)
+	}
+	if got := pragmaIntDB(t, s.writerDB, "wal_autocheckpoint"); got != previous {
+		t.Fatalf("wal_autocheckpoint before = %d, want %d", got, previous)
+	}
+
+	s.BeginBulkLoad()
+	if s.bulkConn == nil {
+		t.Fatal("fast path did not engage on empty store")
+	}
+	got, err := pragmaInt(context.Background(), s.bulkConn, "wal_autocheckpoint")
+	if err != nil {
+		t.Fatalf("read pinned wal_autocheckpoint: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("bulk wal_autocheckpoint = %d, want disabled", got)
+	}
+
+	s.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"})
+	if err := s.FlushBulk(); err != nil {
+		t.Fatalf("FlushBulk: %v", err)
+	}
+	if got := pragmaIntDB(t, s.writerDB, "wal_autocheckpoint"); got != previous {
+		t.Fatalf("wal_autocheckpoint after = %d, want restored %d", got, previous)
+	}
+}
+
 // connQuerier adapts *sql.Conn to the Query signature indexNames expects.
 type connQuerier struct {
 	ctx context.Context

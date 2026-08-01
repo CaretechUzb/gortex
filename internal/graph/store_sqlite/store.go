@@ -148,21 +148,22 @@ type Store struct {
 	// Bulk-load fast path (graph.BulkLoader). Non-nil only between
 	// BeginBulkLoad and FlushBulk, and only on a first/empty cold index.
 	// database/sql PRAGMAs are connection-local, so the fast path pins one
-	// connection (bulkConn) carrying synchronous=OFF + an enlarged page
-	// cache and routes every bulk write through it; bulkPrevSync /
-	// bulkPrevCacheSize hold the values FlushBulk restores before the
-	// connection returns to the pool. coordinatedBulkLoad is true while a
+	// connection (bulkConn) carrying synchronous=OFF, wal_autocheckpoint=0,
+	// and an enlarged page cache and routes every bulk write through it;
+	// bulkPrev* hold the values FlushBulk restores before the connection
+	// returns to the pool. coordinatedBulkLoad is true while a
 	// multi-repository cold parse owns the outer load window. Dense indexes are
 	// sealed once at bounded row counts (or the outer final boundary), while
 	// the pinned durability/FTS window stays open. All fields are guarded
 	// by writeMu.
-	bulkConn             *sql.Conn
-	bulkPrevSync         int64
-	bulkPrevCacheSize    int64
-	coordinatedBulkLoad  bool
-	bulkIndexesDeferred  bool
-	bulkDeferredNodeRows int64
-	bulkDeferredEdgeRows int64
+	bulkConn               *sql.Conn
+	bulkPrevSync           int64
+	bulkPrevCacheSize      int64
+	bulkPrevAutoCheckpoint int64
+	coordinatedBulkLoad    bool
+	bulkIndexesDeferred    bool
+	bulkDeferredNodeRows   int64
+	bulkDeferredEdgeRows   int64
 	// These flags mean "bounded FTS maintenance requested" during a
 	// coordinated cold load. The historical names are retained to keep the
 	// cancellation/Close path stable; normal cold finalization never runs a

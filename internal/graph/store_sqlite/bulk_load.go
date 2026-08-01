@@ -285,6 +285,11 @@ func (s *Store) beginBulkLoadLocked() {
 		_ = conn.Close()
 		return
 	}
+	prevAutoCheckpoint, err := pragmaInt(ctx, conn, "wal_autocheckpoint")
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
 
 	// synchronous=OFF drops crash durability for the load window —
 	// acceptable only because a crash on a fresh index just re-indexes.
@@ -294,6 +299,16 @@ func (s *Store) beginBulkLoadLocked() {
 	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", bulkCacheSizeKiB)); err != nil {
 		// Roll the durability change back before bailing.
+		_, _ = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA synchronous = %d", prevSync))
+		_ = conn.Close()
+		return
+	}
+	// Automatic checkpoints can make one large drain unpredictably pay the
+	// accumulated WAL cost mid-transaction. Coordinated checkpoints below are
+	// explicit and bounded; the prior connection-local cadence is restored at
+	// every exit from the proven-fresh bulk window.
+	if _, err := conn.ExecContext(ctx, "PRAGMA wal_autocheckpoint = 0"); err != nil {
+		_, _ = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
 		_, _ = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA synchronous = %d", prevSync))
 		_ = conn.Close()
 		return
@@ -309,6 +324,7 @@ func (s *Store) beginBulkLoadLocked() {
 	s.bulkConn = conn
 	s.bulkPrevSync = prevSync
 	s.bulkPrevCacheSize = prevCache
+	s.bulkPrevAutoCheckpoint = prevAutoCheckpoint
 	s.bulkIndexesDeferred = true
 	s.bulkDeferredNodeRows = 0
 	s.bulkDeferredEdgeRows = 0
@@ -318,7 +334,7 @@ func (s *Store) beginBulkLoadLocked() {
 }
 
 // FlushBulk exits the bulk-load fast path: it rebuilds every dropped index,
-// restores synchronous + cache_size, releases the pinned writer and write gate,
+// restores synchronous + cache_size + wal_autocheckpoint, releases the pinned writer and write gate,
 // then performs one bounded TRUNCATE checkpoint. The ordering matters: the
 // durability checkpoint must run on a NORMAL connection, and it must not wait
 // for a second writer slot while the bulk connection is still pinned.
@@ -450,13 +466,18 @@ func (s *Store) closeBulkConnectionLocked() error {
 	ctx := context.Background()
 	_, syncErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA synchronous = %d", s.bulkPrevSync))
 	_, cacheErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", s.bulkPrevCacheSize))
+	_, autoCheckpointErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", s.bulkPrevAutoCheckpoint))
 	closeErr := conn.Close()
 	s.bulkIndexesDeferred = false
 	s.bulkDeferredNodeRows = 0
 	s.bulkDeferredEdgeRows = 0
+	s.bulkPrevSync = 0
+	s.bulkPrevCacheSize = 0
+	s.bulkPrevAutoCheckpoint = 0
 	return errors.Join(
 		wrapBulkRestoreError("synchronous", syncErr),
 		wrapBulkRestoreError("cache_size", cacheErr),
+		wrapBulkRestoreError("wal_autocheckpoint", autoCheckpointErr),
 		closeErr,
 	)
 }
@@ -517,7 +538,7 @@ SELECT NOT EXISTS(SELECT 1 FROM nodes)
 	return err == nil && empty == 1
 }
 
-// pragmaInt reads a single-integer PRAGMA (synchronous, cache_size) off the
+// pragmaInt reads a single-integer PRAGMA (synchronous, cache_size, wal_autocheckpoint) off the
 // given connection.
 func pragmaInt(ctx context.Context, conn *sql.Conn, pragma string) (int64, error) {
 	var v int64
