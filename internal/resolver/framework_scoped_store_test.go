@@ -22,6 +22,7 @@ type frameworkScopeTrapStore struct {
 	globalEdgeScans int
 	allNodeScans    int
 	allEdgeScans    int
+	repoEdgeScans   int
 	scopedNodeScans int
 	scopedEdgeScans int
 	scopedLightScan int
@@ -52,6 +53,11 @@ func (s *frameworkScopeTrapStore) AllNodes() []*graph.Node {
 func (s *frameworkScopeTrapStore) AllEdges() []*graph.Edge {
 	s.allEdgeScans++
 	return s.Store.AllEdges()
+}
+
+func (s *frameworkScopeTrapStore) GetRepoEdges(repoPrefix string) []*graph.Edge {
+	s.repoEdgeScans++
+	return s.Store.GetRepoEdges(repoPrefix)
 }
 
 func (s *frameworkScopeTrapStore) GetNode(id string) *graph.Node {
@@ -140,6 +146,7 @@ func requireNoFrameworkGlobalScans(t *testing.T, store *frameworkScopeTrapStore)
 	require.Zero(t, store.globalEdgeScans, "partial synth used global EdgesByKind")
 	require.Zero(t, store.allNodeScans, "partial synth used AllNodes")
 	require.Zero(t, store.allEdgeScans, "partial synth used AllEdges")
+	require.Zero(t, store.repoEdgeScans, "partial synth used broad GetRepoEdges")
 }
 
 func frameworkTestNode(repo, file, id string, kind graph.NodeKind, name, language string, meta map[string]any) *graph.Node {

@@ -107,6 +107,6 @@ func TestFrameworkPartialRunKeepsRepositoryExecution(t *testing.T) {
 	require.Zero(t, ifaceDispatchCount(g, families["second"][0], families["second"][1]))
 	require.Zero(t, counting.allNodesLight)
 	require.Positive(t, counting.repoNodesLight, "partial census remains repository-scoped")
-	require.Positive(t, counting.getRepoEdges, "bespoke partial passes retain repository scans")
+	require.Zero(t, counting.getRepoEdges, "partial passes must use typed edge projections")
 	require.Positive(t, counting.repoEdgesByKinds, "partial edge projections retain their repository frontier")
 }

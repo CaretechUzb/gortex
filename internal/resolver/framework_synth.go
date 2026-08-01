@@ -1017,12 +1017,12 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// value-position function identifier to its same-file definition and
 		// drops unbound candidates. The per-language capture feeds it via
 		// placeholder edges; the pass is inert until those land.
-		synthFunc{name: SynthFnValue, fn: ResolveFnValueCallbacks, scopedFn: ResolveFnValueCallbacksScoped},
+		synthFunc{name: SynthFnValue, fn: ResolveFnValueCallbacks},
 		// Pascal unit ↔ form (.pas/.dfm) pairing by same-dir basename.
 		synthFunc{name: SynthPascalFormName, fn: ResolvePascalForms},
 		// Same-file distinctive value references → EdgeReads to the constant,
 		// so a config constant's blast radius reaches every reader.
-		synthFunc{name: SynthValueRefName, fn: ResolveValueRefs, scopedFn: ResolveValueRefsScoped},
+		synthFunc{name: SynthValueRefName, fn: ResolveValueRefs},
 	}
 }
 
