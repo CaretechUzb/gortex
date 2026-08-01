@@ -465,7 +465,8 @@ func TestResolveCSharpExtension_QualifiedReceiverTypeMatches(t *testing.T) {
 		"Models/Widget.cs": `namespace Models {
     public class Widget {}
 }`,
-		"LibA/Ext.cs": `namespace LibA {
+		"LibA/Ext.cs": `using Models;
+namespace LibA {
     public static class EA { public static int Foo(this Widget w) { return 1; } }
 }`,
 		"LibB/Ext.cs": `namespace LibB {
@@ -546,11 +547,11 @@ namespace App {
 	noMeta := &graph.Edge{From: edge.From, FilePath: edge.FilePath}
 	assert.False(t, r.csharpExtensionGuardKeep(noMeta, "Caller.cs", target),
 		"an edge without the extension_method resolution must refuse")
-	instance := &graph.Node{ID: "zz::inst", Kind: graph.KindMethod, Language: "csharp",
+	instance := &graph.Node{ID: "Other/Inst.cs::Api.Foo", Kind: graph.KindMethod, Language: "csharp",
 		Meta: map[string]any{"scope_ns": "LibA"}}
 	assert.False(t, r.csharpExtensionGuardKeep(edge, "Caller.cs", instance),
 		"a non-extension target must refuse")
-	invisible := &graph.Node{ID: "zz::inv", Kind: graph.KindMethod, Language: "csharp",
+	invisible := &graph.Node{ID: "LibZ/Ext.cs::EZ.Foo", Kind: graph.KindMethod, Language: "csharp",
 		Meta: map[string]any{"extension": true, "this_param_type": "string", "scope_ns": "LibZ"}}
 	assert.False(t, r.csharpExtensionGuardKeep(edge, "Caller.cs", invisible),
 		"an invisible namespace must refuse")
@@ -610,4 +611,186 @@ public class Startup {
 	target := fooCallTarget(g, "ModB/Startup.cs::Startup.Configure")
 	require.Equal(t, "ModB/Ext.cs::ContainerExtensions.Foo", target,
 		"file-scoped namespaces must narrow identically to block form")
+}
+
+// TestResolveCSharpExtension_CanonKeyNoFalseTypedMatch: a qualified
+// receiver (`Data.Inner`) must not typed-match an unrelated extension
+// on `Vendor.Inner` just because the bare names collide — a
+// last-segment match only counts when the receiver's namespace is
+// visible from the extension's OWN file (where the bare this-param
+// name gets its meaning).
+func TestResolveCSharpExtension_CanonKeyNoFalseTypedMatch(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Data/Inner.cs": `namespace Data {
+    public class Inner {}
+}`,
+		"Vendor/Types.cs": `namespace Vendor {
+    public class Inner {}
+}`,
+		"Vendor/Ext.cs": `namespace Vendor {
+    public static class VE { public static int Foo(this Inner x) { return 1; } }
+}`,
+		"Other/Api.cs": `namespace Other {
+    public class Api { public int Foo() { return 2; } }
+}`,
+		"Caller.cs": `using Vendor;
+namespace App {
+    public class Runner {
+        public void Run() {
+            Data.Inner x = new Data.Inner();
+            x.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.NotEmpty(t, target)
+	assert.True(t, graph.IsUnresolvedTarget(target),
+		"Data.Inner must not bind Vendor's Inner extension, got %q", target)
+}
+
+// TestResolveCSharpExtension_InterfaceReceiverBinds: a receiver typed
+// as a concrete class must reach an extension on an interface it
+// implements — the exact-match veto must not lose the idiomatic
+// `AddX(this IServiceCollection)` shape.
+func TestResolveCSharpExtension_InterfaceReceiverBinds(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Types.cs": `namespace App {
+    public interface IBox {}
+    public class Crate : IBox {}
+}`,
+		"Ext.cs": `namespace App {
+    public static class BoxExt { public static int Foo(this IBox b) { return 1; } }
+}`,
+		"Caller.cs": `namespace App {
+    public class Runner {
+        public void Run() {
+            Crate c = new Crate();
+            c.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.Equal(t, "Ext.cs::BoxExt.Foo", target,
+		"a concrete receiver must reach the extension on its implemented interface")
+}
+
+// TestResolveCSharpExtension_GenericCatchAllBinds: `Foo<T>(this T v)`
+// matches any receiver — typed evidence must not veto the generic
+// catch-all shape.
+func TestResolveCSharpExtension_GenericCatchAllBinds(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Types.cs": `namespace App {
+    public class Widget {}
+}`,
+		"Ext.cs": `namespace App {
+    public static class AnyExt { public static T Foo<T>(this T v) { return v; } }
+}`,
+		"Caller.cs": `namespace App {
+    public class Runner {
+        public void Run() {
+            Widget w = new Widget();
+            w.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.Equal(t, "Ext.cs::AnyExt.Foo", target,
+		"the generic catch-all must bind for any typed receiver")
+}
+
+// TestResolveCSharpExtension_AliasReceiverMatches: a `String`-declared
+// receiver must match `this string` — BCL aliases normalise to their
+// keyword forms on both comparison sides.
+func TestResolveCSharpExtension_AliasReceiverMatches(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Ext.cs": `namespace App {
+    public static class E {
+        public static int Foo(this string s) { return 1; }
+        public static int Foo(this int n) { return 2; }
+    }
+}`,
+		"Caller.cs": `namespace App {
+    public class Runner {
+        public void Run() {
+            String s = "x";
+            s.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.NotEmpty(t, target)
+	require.False(t, graph.IsUnresolvedTarget(target), "String receiver must typed-match this string")
+	n := g.GetNode(target)
+	require.NotNil(t, n)
+	assert.Equal(t, "string", n.Meta["this_param_type"], "must bind the string extension, not int")
+}
+
+// TestResolveCSharpExtension_UnrelatedInRepoReceiverStillRefuses: both
+// types in-repo with fully-known hierarchies and no relation — the
+// veto holds even for a repo-unique extension. This is the precision
+// line: the receiver evidence genuinely contradicts the candidate.
+func TestResolveCSharpExtension_UnrelatedInRepoReceiverStillRefuses(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Types.cs": `namespace App {
+    public class Widget {}
+    public class Gadget {}
+}`,
+		"Ext.cs": `namespace App {
+    public static class E { public static int Foo(this Gadget x) { return 1; } }
+}`,
+		"Caller.cs": `namespace App {
+    public class Runner {
+        public void Run() {
+            Widget w = new Widget();
+            w.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.NotEmpty(t, target)
+	assert.True(t, graph.IsUnresolvedTarget(target),
+		"an unrelated in-repo receiver must refuse the unique extension, got %q", target)
+}
+
+// TestResolveCSharpExtension_IncompleteHierarchyFallsBack: the receiver
+// extends a base the index cannot resolve (external assembly) — an
+// "unrelated" verdict is unreliable, so the unique-name fallback
+// survives instead of the veto.
+func TestResolveCSharpExtension_IncompleteHierarchyFallsBack(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Types.cs": `namespace App {
+    public class Crate : VendorBase {}
+}`,
+		"Ext.cs": `namespace App {
+    public static class E { public static int Foo(this IBox b) { return 1; } }
+}`,
+		"Caller.cs": `namespace App {
+    public class Runner {
+        public void Run() {
+            Crate c = new Crate();
+            c.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.Equal(t, "Ext.cs::E.Foo", target,
+		"an incomplete receiver hierarchy must fall back to the unique-name bind")
 }

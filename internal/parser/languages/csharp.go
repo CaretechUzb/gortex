@@ -323,13 +323,10 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	//   Tier 0 — explicit type annotations (skip "var" placeholder)
 	//   Tier 1 — `var x = new Foo()` walk for `var`-keyed locals only
 	tenv := make(typeEnv)
-	builtins := make(typeEnv)
 	for _, l := range locals {
 		typeName := normalizeCSharpTypeName(l.rawType)
 		if typeName != "" && typeName != "var" {
 			tenv[l.name] = typeName
-		} else if bt := csharpBuiltinTypeName(l.rawType); bt != "" {
-			builtins[l.name] = bt
 		}
 	}
 	for _, l := range locals {
@@ -354,6 +351,31 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 
 	// Resolve calls against funcRanges + tenv.
 	funcRanges := buildFuncRanges(result)
+
+	// Builtin locals key per enclosing method: a same-named local of a
+	// different type in a sibling method must not bleed into this
+	// method's receiver stamp (a file-scoped last-wins map mis-typed
+	// the receiver and the extension binder would act on it).
+	builtinsByOwner := map[string]map[string]string{}
+	for _, l := range locals {
+		if l.defNode == nil {
+			continue
+		}
+		bt := csharpBuiltinTypeName(l.rawType)
+		if bt == "" {
+			continue
+		}
+		owner := findEnclosingFunc(funcRanges, int(l.defNode.StartPoint().Row)+1)
+		if owner == "" {
+			continue
+		}
+		m := builtinsByOwner[owner]
+		if m == nil {
+			m = map[string]string{}
+			builtinsByOwner[owner] = m
+		}
+		m[l.name] = bt
+	}
 
 	// Local-variable type annotations → EdgeTypedAs from the enclosing
 	// function (file node as fallback). Mirrors the parameter/return
@@ -386,7 +408,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			}
 			if recvType, ok := tenv[c.receiver]; ok {
 				edge.Meta = map[string]any{"receiver_type": recvType}
-			} else if bt, ok := builtins[c.receiver]; ok {
+			} else if bt := builtinsByOwner[callerID][c.receiver]; bt != "" {
 				// Builtins stay out of receiver_type (the receiver-gate
 				// passes key on user types); extension eligibility still
 				// needs them — `n.Foo()` on an int must match
@@ -857,6 +879,12 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	if extType := csharpExtensionReceiverType(def.Node, src); extType != "" {
 		meta["extension"] = true
 		meta["this_param_type"] = extType
+		// `Foo<T>(this T v)` — the this-param names the method's own
+		// type parameter, i.e. it matches any receiver; the binder must
+		// not treat it as a concrete type named "T".
+		if csharpMethodTypeParamNames(def.Node, src)[extType] {
+			meta["this_param_generic"] = true
+		}
 	}
 	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
 		meta["scope_ns"] = ns
@@ -1363,7 +1391,43 @@ func extractCSharpMethodReturnType(methodNode *sitter.Node, src []byte, methodNa
 	return ""
 }
 
-// normalizeCSharpTypeName strips generics and nullable markers from a C# type name.
+// csharpMethodTypeParamNames returns the method's declared generic
+// type-parameter names (the `<T, U>` list), for telling a generic
+// this-param apart from a concrete type of the same spelling.
+func csharpMethodTypeParamNames(methodNode *sitter.Node, src []byte) map[string]bool {
+	if methodNode == nil {
+		return nil
+	}
+	tparams := methodNode.ChildByFieldName("type_parameters")
+	if tparams == nil {
+		for i, _nc := 0, int(methodNode.NamedChildCount()); i < _nc; i++ {
+			c := methodNode.NamedChild(i)
+			if c != nil && c.Type() == "type_parameter_list" {
+				tparams = c
+				break
+			}
+		}
+	}
+	if tparams == nil {
+		return nil
+	}
+	names := map[string]bool{}
+	for i, _nc := 0, int(tparams.NamedChildCount()); i < _nc; i++ {
+		tp := tparams.NamedChild(i)
+		if tp == nil || tp.Type() != "type_parameter" {
+			continue
+		}
+		for j, _jc := 0, int(tp.NamedChildCount()); j < _jc; j++ {
+			c := tp.NamedChild(j)
+			if c != nil && c.Type() == "identifier" {
+				names[c.Content(src)] = true
+				break
+			}
+		}
+	}
+	return names
+}
+
 // csharpBuiltinTypeName returns the C# builtin keyword named by a local
 // declaration type, nullable/array suffixes stripped — "" when the type
 // is not a builtin. normalizeCSharpTypeName deliberately drops these;
@@ -1382,6 +1446,7 @@ func csharpBuiltinTypeName(t string) string {
 	return ""
 }
 
+// normalizeCSharpTypeName strips generics and nullable markers from a C# type name.
 func normalizeCSharpTypeName(t string) string {
 	t = strings.TrimSpace(t)
 	// Remove nullable suffix.

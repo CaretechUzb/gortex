@@ -217,6 +217,13 @@ func edgeReceiverType(e *graph.Edge) string {
 	if rt, ok := e.Meta["receiver_type"].(string); ok {
 		return rt
 	}
+	// Builtin receivers ride their own stamp (kept out of receiver_type
+	// for the receiver-gate passes). The reuse key must see the same
+	// evidence fresh resolution acts on — blind reuse would re-pin a
+	// stale typed bind after an edit changes the local's builtin type.
+	if rb, ok := e.Meta["receiver_builtin"].(string); ok {
+		return rb
+	}
 	return ""
 }
 

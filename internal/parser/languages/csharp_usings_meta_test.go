@@ -119,3 +119,60 @@ func TestCSharpExtractor_BuiltinReceiverStamp(t *testing.T) {
 	}
 	t.Fatal("no member-call edge to unresolved::*.Foo found")
 }
+
+// TestCSharpExtractor_BuiltinReceiverStampMethodScoped: locals are
+// method-scoped — a same-named local of a different type in a SIBLING
+// method must not bleed into this method's receiver stamp (the
+// file-scoped last-declaration-wins shape mis-typed the receiver).
+func TestCSharpExtractor_BuiltinReceiverStampMethodScoped(t *testing.T) {
+	src := []byte(`namespace App {
+    public class C {
+        public void A() {
+            int n = 0;
+            n.Foo();
+        }
+        public void B() {
+            string n = "x";
+        }
+    }
+}
+`)
+	res, err := NewCSharpExtractor().Extract("C.cs", src)
+	require.NoError(t, err)
+	for _, e := range res.Edges {
+		if e.Kind == graph.EdgeCalls && e.To == "unresolved::*.Foo" {
+			require.Equal(t, "int", e.Meta["receiver_builtin"],
+				"method A's int local must win, not method B's string")
+			return
+		}
+	}
+	t.Fatal("no member-call edge to unresolved::*.Foo found")
+}
+
+// TestCSharpExtractor_GenericThisParamStamp: `Foo<T>(this T v)` marks
+// the this-param as a generic type parameter — the binder treats it as
+// matching any receiver rather than a concrete type named "T".
+func TestCSharpExtractor_GenericThisParamStamp(t *testing.T) {
+	src := []byte(`namespace App {
+    public static class E {
+        public static T Any<T>(this T v) { return v; }
+        public static int Conc(this string s) { return 1; }
+    }
+}
+`)
+	res, err := NewCSharpExtractor().Extract("E.cs", src)
+	require.NoError(t, err)
+	var anyM, concM *graph.Node
+	for _, n := range res.Nodes {
+		switch n.Name {
+		case "Any":
+			anyM = n
+		case "Conc":
+			concM = n
+		}
+	}
+	require.NotNil(t, anyM)
+	require.NotNil(t, concM)
+	assert.Equal(t, true, anyM.Meta["this_param_generic"], "generic this-param must be stamped")
+	assert.Nil(t, concM.Meta["this_param_generic"], "concrete this-param must not be stamped")
+}

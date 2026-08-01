@@ -961,6 +961,12 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 						pageMutationRevision = currentRevision
 					}
 				}
+				if forceRefresh {
+					// The shared-store generation changed under us — the
+					// pass-lifetime C# global-usings index may describe
+					// the old generation; rebuild it with the rest.
+					r.clearCSharpGlobalIndex()
+				}
 				passIndexes.refreshAfterInterleave(pending, forceRefresh)
 				r.bulkMode = true
 			}
