@@ -13,24 +13,38 @@ import (
 // the scoped call — narrowing inside the query — reaches the in-scope
 // symbol.
 type scopedBundleBackend struct {
-	flood       []search.SymbolBundle
-	scoped      []search.SymbolBundle
-	scopedCalls int
+	flood         []search.SymbolBundle
+	scoped        []search.SymbolBundle
+	scopedCalls   int
+	unscopedCalls int
+	searchCalls   int
 }
 
-func (b *scopedBundleBackend) Add(string, ...string)                    {}
-func (b *scopedBundleBackend) Remove(string)                            {}
-func (b *scopedBundleBackend) Search(string, int) []search.SearchResult { return nil }
-func (b *scopedBundleBackend) Count() int                               { return len(b.flood) }
-func (b *scopedBundleBackend) Close()                                   {}
+func (b *scopedBundleBackend) Add(string, ...string) {}
+func (b *scopedBundleBackend) Remove(string)         {}
+func (b *scopedBundleBackend) Search(string, int) []search.SearchResult {
+	b.searchCalls++
+	return nil
+}
+func (b *scopedBundleBackend) Count() int { return len(b.flood) }
+func (b *scopedBundleBackend) Close()     {}
 
 func (b *scopedBundleBackend) SearchSymbolBundles(string, int) []search.SymbolBundle {
+	b.unscopedCalls++
 	return append([]search.SymbolBundle(nil), b.flood...)
 }
 
 func (b *scopedBundleBackend) SearchSymbolBundlesScoped(_ string, _ []string, _ int) []search.SymbolBundle {
 	b.scopedCalls++
-	return append([]search.SymbolBundle(nil), b.scoped...)
+	// Preserve nil-vs-empty: a non-nil empty scoped answer is the
+	// sentinel contract the engine must honour (append would flatten
+	// it back to nil).
+	if b.scoped == nil {
+		return nil
+	}
+	out := make([]search.SymbolBundle, len(b.scoped))
+	copy(out, b.scoped)
+	return out
 }
 
 // TestGatherSymbolCandidates_RepoScopeUsesScopedBundles: with a repo
@@ -60,6 +74,34 @@ func TestGatherSymbolCandidates_RepoScopeUsesScopedBundles(t *testing.T) {
 	}
 	if backend.scopedCalls != 1 {
 		t.Fatalf("scoped backend path used %d times, want 1", backend.scopedCalls)
+	}
+}
+
+// TestGatherSymbolCandidates_ScopedZeroDoesNotFloodFetch: a scoped
+// query that legitimately answers zero IS the answer — the engine must
+// not fall back to the unscoped bundle fetch (the cross-repo flood cost
+// the scoped path exists to remove) nor the channel/Search path.
+func TestGatherSymbolCandidates_ScopedZeroDoesNotFloodFetch(t *testing.T) {
+	g := graph.New()
+	noise := &graph.Node{ID: "noise/f.go::Extensions", Name: "Extensions", Kind: graph.KindFunction, RepoPrefix: "noise"}
+	g.AddNode(noise)
+	backend := &scopedBundleBackend{
+		flood:  []search.SymbolBundle{{Node: noise, Score: 10}},
+		scoped: []search.SymbolBundle{}, // non-nil empty: scoped answered zero
+	}
+	engine := NewEngine(g)
+	engine.SetSearch(backend)
+
+	opts := QueryOptions{RepoAllow: map[string]bool{"app": true}, SkipInnerRerank: true, SkipVectorChannel: true}
+	got := engine.GatherSymbolCandidates("Extensions", 5, opts, nil)
+	if len(got) != 0 {
+		t.Fatalf("scoped zero answer must yield no candidates, got %#v", got)
+	}
+	if backend.unscopedCalls != 0 {
+		t.Fatalf("unscoped bundle fetch ran %d times after a scoped zero answer", backend.unscopedCalls)
+	}
+	if backend.searchCalls != 0 {
+		t.Fatalf("fallback Search ran %d times after a scoped zero answer", backend.searchCalls)
 	}
 }
 

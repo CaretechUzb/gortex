@@ -1698,6 +1698,14 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// rescue them, so a content-corpus wipeout skips the refetch.
 	fetchEscalated := false
 	if len(nodes) == 0 && candsAfterGather > 0 && q != "" && corpus != corpusContent {
+		// The requested cursor window must be reachable: a shallow
+		// rescue that survives the filters but ends before offset+limit
+		// would slice to an empty later page (with no next cursor) even
+		// though a deeper fetch fills it. So a partial rescue keeps the
+		// best set so far and keeps escalating until the window is
+		// reachable or the corpus is exhausted.
+		want := offset + limit
+		prevDepth := 0
 		for _, mult := range []int{5, 25} {
 			if ctx.Err() != nil {
 				break
@@ -1708,20 +1716,28 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			if deepLimit > 2000 {
 				deepLimit = 2000
 			}
+			// The cap can collapse successive multipliers into the same
+			// effective depth — an identical re-query cannot change the
+			// outcome, so don't pay it twice.
+			if deepLimit == prevDepth {
+				break
+			}
+			prevDepth = deepLimit
 			var refetched []*graph.Node
 			if len(expandedTerms) > 0 {
 				refetched, _ = fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, deepLimit, scope, timings)
 			} else {
 				refetched = s.engineFor(ctx).SearchSymbolsScoped(q, deepLimit, scope)
 			}
-			if kept := applyAllPostFilters(refetched); len(kept) > 0 {
+			kept := applyAllPostFilters(refetched)
+			if len(kept) > 0 {
 				nodes = kept
 				fetchEscalated = true
-				break
 			}
-			// A short page means the corpus is exhausted — a deeper
-			// fetch cannot surface anything new.
-			if len(refetched) < deepLimit {
+			// Done when the window is reachable, or the corpus is
+			// exhausted — a short raw page means a deeper fetch cannot
+			// surface anything new.
+			if len(kept) >= want || len(refetched) < deepLimit {
 				break
 			}
 		}

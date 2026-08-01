@@ -723,9 +723,13 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		// Gate on the flattened list, not the map: an all-false map is
 		// "deny everything" under ScopeAllows and must not select the
 		// scoped path with an empty (= unscoped!) allow list.
+		scopedAnswered := false
 		if allow := repoAllowList(opts.RepoAllow); len(allow) > 0 {
 			if sb, ok := backend.(search.ScopedSymbolBundleSearcherBackend); ok {
 				bundles = sb.SearchSymbolBundlesScoped(query, allow, limit*2)
+				// nil = no scoped support (or error); anything non-nil —
+				// an empty slice included — is the scoped path's answer.
+				scopedAnswered = bundles != nil
 			}
 		}
 		// nil = no scoped support (or error); a non-nil empty slice is
@@ -762,6 +766,12 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 			if rctx != nil {
 				rctx.SeedEdgeCaches(inSeed, outSeed, true)
 			}
+		} else if scopedAnswered {
+			// A scoped query that answered zero IS the answer. Leaving
+			// bundleHandled false here would send the miss down the
+			// unscoped channel fallback — re-running the very cross-repo
+			// flood fetch the scoped path exists to remove.
+			bundleHandled = true
 		}
 		// Vector channel: only when the bundle path took the BM25
 		// branch. Otherwise the fallback path below pulls both.
