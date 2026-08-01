@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -13,10 +12,11 @@ import (
 const (
 	// Reindex transactions are simulated as one ordered set so intermediate
 	// writes that cancel do not invalidate analysis or inflate receipts. SQL is
-	// still issued in bounded VALUES relations below SQLite's conservative
-	// 999-variable limit.
-	reindexSetChunkSize = 70  // 70*14 = 980 parameters for edge inserts.
-	reindexKeyChunkSize = 140 // 140*5 = 700 parameters for identity relations.
+	// issued in VALUES relations bounded by the probed connection variable
+	// limit and the shared argument-byte budget.
+	reindexKeyParamsPerRow = 5
+	reindexRowParamsPerRow = edgeInsertParams
+	reindexRowMaxChunkSize = edgeInsertMaxChunkSize
 )
 
 type sqliteReindexKey struct {
@@ -124,6 +124,16 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 		return stats, false, false, nil, err
 	}
 
+	// Probe before beginWriteContext checks out the writer connection. A fresh
+	// single-connection Store cannot discover its limit while its own
+	// transaction is holding that connection.
+	variableLimit := s.sqliteBatchVariableLimitLocked()
+	defer func() {
+		// Persist a connection-specific fallback discovered while preparing any
+		// of the three bounded reindex statement shapes.
+		s.batchVariableLimit = variableLimit
+	}()
+
 	tx, err := s.beginWriteContext(ctx)
 	if err != nil {
 		return stats, false, false, nil, err
@@ -136,18 +146,18 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	}()
 	receipt = s.prepareSQLiteReindexReceiptTx(tx, batch)
 
-	initial, selectStatements, err := sqliteReindexRowsTx(tx, keys)
+	initial, selectStatements, err := sqliteReindexRowsTxLimited(tx, keys, &variableLimit)
 	if err != nil {
 		return stats, false, false, nil, err
 	}
 	stats.selectStatements = selectStatements
 	deletes, inserts := simulateSQLiteReindexSet(initial, keys, mutations)
 
-	stats.deletedRows, stats.deleteStatements, err = deleteSQLiteReindexRowsTx(tx, deletes)
+	stats.deletedRows, stats.deleteStatements, err = deleteSQLiteReindexRowsTxLimited(tx, deletes, &variableLimit)
 	if err != nil {
 		return stats, false, false, nil, err
 	}
-	stats.insertedRows, stats.insertStatements, err = insertSQLiteReindexRowsTx(tx, inserts)
+	stats.insertedRows, stats.insertStatements, err = insertSQLiteReindexRowsTxLimited(tx, inserts, &variableLimit)
 	if err != nil {
 		return stats, false, false, nil, err
 	}
@@ -248,23 +258,38 @@ func sqliteReindexRowForEdge(edge *graph.Edge) (sqliteReindexRow, error) {
 	}, nil
 }
 
-func sqliteReindexRowsTx(tx *sql.Tx, keys []sqliteReindexKey) (map[sqliteReindexKey]sqliteReindexRow, int, error) {
+func sqliteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, variableLimit *int) (map[sqliteReindexKey]sqliteReindexRow, int, error) {
 	out := make(map[sqliteReindexKey]sqliteReindexRow, len(keys))
+	if len(keys) == 0 {
+		return out, 0, nil
+	}
+	if variableLimit == nil || *variableLimit <= 0 {
+		fallback := sqliteFallbackVariableLimit
+		variableLimit = &fallback
+	}
+
+	rowLimit := batchRowsForVariableLimit(*variableLimit, reindexKeyParamsPerRow, len(keys))
 	statements := 0
-	for start := 0; start < len(keys); start += reindexKeyChunkSize {
-		end := minInt(start+reindexKeyChunkSize, len(keys))
-		chunk := keys[start:end]
-		var values strings.Builder
-		values.Grow(len(chunk) * len("(?,?,?,?,?),"))
-		args := make([]any, 0, len(chunk)*5)
-		for i, key := range chunk {
-			if i > 0 {
-				values.WriteByte(',')
-			}
-			values.WriteString("(?,?,?,?,?)")
+	for pos := 0; pos < len(keys); {
+		chunkStart := pos
+		args := make([]any, 0, rowLimit*reindexKeyParamsPerRow)
+		argBytes := 0
+		rowCount := 0
+		for pos < len(keys) && rowCount < rowLimit {
+			key := keys[pos]
+			argStart := len(args)
 			args = append(args, key.fromID, key.toID, key.kind, key.filePath, key.line)
+			rowBytes := sqliteBoundArgsBytes(args[argStart:])
+			if rowCount > 0 && argBytes+rowBytes > sqliteBatchMaxBoundBytes {
+				args = args[:argStart]
+				break
+			}
+			pos++
+			rowCount++
+			argBytes += rowBytes
 		}
-		query := `WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES ` + values.String() + `)
+
+		query := `WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES ` + multiValues(rowCount, reindexKeyParamsPerRow) + `)
 		SELECT e.from_id, e.to_id, e.kind, e.file_path, e.line,
 			e.confidence, e.confidence_label, e.origin, e.tier, e.cross_repo,
 			e.meta, e.resolve_terminal, e.resolve_terminal_reason, e.semantic_source
@@ -276,6 +301,11 @@ func sqliteReindexRowsTx(tx *sql.Tx, keys []sqliteReindexKey) (map[sqliteReindex
 		 AND e.file_path = w.file_path
 		 AND e.line = w.line`
 		rows, err := tx.Query(query, args...)
+		if tooManySQLVariables(err) && rowCount > 1 {
+			rowLimit = lowerBatchVariableLimit(variableLimit, reindexKeyParamsPerRow, rowCount)
+			pos = chunkStart
+			continue
+		}
 		if err != nil {
 			return nil, statements, err
 		}
@@ -348,23 +378,38 @@ func equalSQLiteReindexRows(left, right sqliteReindexRow) bool {
 		left.semanticSource == right.semanticSource
 }
 
-func deleteSQLiteReindexRowsTx(tx *sql.Tx, keys []sqliteReindexKey) (int, int, error) {
+func deleteSQLiteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, variableLimit *int) (int, int, error) {
+	if len(keys) == 0 {
+		return 0, 0, nil
+	}
+	if variableLimit == nil || *variableLimit <= 0 {
+		fallback := sqliteFallbackVariableLimit
+		variableLimit = &fallback
+	}
+
+	rowLimit := batchRowsForVariableLimit(*variableLimit, reindexKeyParamsPerRow, len(keys))
 	changed := 0
 	statements := 0
-	for start := 0; start < len(keys); start += reindexKeyChunkSize {
-		end := minInt(start+reindexKeyChunkSize, len(keys))
-		chunk := keys[start:end]
-		var values strings.Builder
-		values.Grow(len(chunk) * len("(?,?,?,?,?),"))
-		args := make([]any, 0, len(chunk)*5)
-		for i, key := range chunk {
-			if i > 0 {
-				values.WriteByte(',')
-			}
-			values.WriteString("(?,?,?,?,?)")
+	for pos := 0; pos < len(keys); {
+		chunkStart := pos
+		args := make([]any, 0, rowLimit*reindexKeyParamsPerRow)
+		argBytes := 0
+		rowCount := 0
+		for pos < len(keys) && rowCount < rowLimit {
+			key := keys[pos]
+			argStart := len(args)
 			args = append(args, key.fromID, key.toID, key.kind, key.filePath, key.line)
+			rowBytes := sqliteBoundArgsBytes(args[argStart:])
+			if rowCount > 0 && argBytes+rowBytes > sqliteBatchMaxBoundBytes {
+				args = args[:argStart]
+				break
+			}
+			pos++
+			rowCount++
+			argBytes += rowBytes
 		}
-		query := `WITH doomed(from_id, to_id, kind, file_path, line) AS (VALUES ` + values.String() + `)
+
+		query := `WITH doomed(from_id, to_id, kind, file_path, line) AS (VALUES ` + multiValues(rowCount, reindexKeyParamsPerRow) + `)
 		DELETE FROM edges
 		WHERE id IN (
 			SELECT e.id
@@ -377,6 +422,11 @@ func deleteSQLiteReindexRowsTx(tx *sql.Tx, keys []sqliteReindexKey) (int, int, e
 			 AND e.line = d.line
 		)`
 		result, err := tx.Exec(query, args...)
+		if tooManySQLVariables(err) && rowCount > 1 {
+			rowLimit = lowerBatchVariableLimit(variableLimit, reindexKeyParamsPerRow, rowCount)
+			pos = chunkStart
+			continue
+		}
 		if err != nil {
 			return changed, statements, err
 		}
@@ -390,32 +440,48 @@ func deleteSQLiteReindexRowsTx(tx *sql.Tx, keys []sqliteReindexKey) (int, int, e
 	return changed, statements, nil
 }
 
-func insertSQLiteReindexRowsTx(tx *sql.Tx, rows []sqliteReindexRow) (int, int, error) {
+func insertSQLiteReindexRowsTxLimited(tx *sql.Tx, rows []sqliteReindexRow, variableLimit *int) (int, int, error) {
+	if len(rows) == 0 {
+		return 0, 0, nil
+	}
+	if variableLimit == nil || *variableLimit <= 0 {
+		fallback := sqliteFallbackVariableLimit
+		variableLimit = &fallback
+	}
+
+	rowLimit := batchRowsForVariableLimit(*variableLimit, reindexRowParamsPerRow, reindexRowMaxChunkSize)
 	changed := 0
 	statements := 0
-	for start := 0; start < len(rows); start += reindexSetChunkSize {
-		end := minInt(start+reindexSetChunkSize, len(rows))
-		chunk := rows[start:end]
-		var values strings.Builder
-		values.Grow(len(chunk) * len("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,),"))
-		args := make([]any, 0, len(chunk)*14)
-		for i, row := range chunk {
-			if i > 0 {
-				values.WriteByte(',')
-			}
-			values.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+	for pos := 0; pos < len(rows); {
+		chunkStart := pos
+		args := make([]any, 0, rowLimit*reindexRowParamsPerRow)
+		argBytes := 0
+		rowCount := 0
+		for pos < len(rows) && rowCount < rowLimit {
+			row := rows[pos]
+			argStart := len(args)
 			args = append(args,
 				row.key.fromID, row.key.toID, row.key.kind, row.key.filePath, row.key.line,
 				row.confidence, row.confidenceLabel, row.origin, row.tier,
 				row.crossRepo, row.meta, row.resolveTerminal, row.resolveTerminalReason, row.semanticSource,
 			)
+			rowBytes := sqliteBoundArgsBytes(args[argStart:])
+			if rowCount > 0 && argBytes+rowBytes > sqliteBatchMaxBoundBytes {
+				args = args[:argStart]
+				break
+			}
+			pos++
+			rowCount++
+			argBytes += rowBytes
 		}
-		query := `INSERT OR IGNORE INTO edges (
-			from_id, to_id, kind, file_path, line,
-			confidence, confidence_label, origin, tier, cross_repo, meta,
-			resolve_terminal, resolve_terminal_reason, semantic_source
-		) VALUES ` + values.String()
+
+		query := `INSERT OR IGNORE INTO edges (` + edgeInsertColumns + `) VALUES ` + multiValues(rowCount, reindexRowParamsPerRow)
 		result, err := tx.Exec(query, args...)
+		if tooManySQLVariables(err) && rowCount > 1 {
+			rowLimit = lowerBatchVariableLimit(variableLimit, reindexRowParamsPerRow, rowCount)
+			pos = chunkStart
+			continue
+		}
 		if err != nil {
 			return changed, statements, err
 		}

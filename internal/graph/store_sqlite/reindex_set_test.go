@@ -1,15 +1,24 @@
 package store_sqlite
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	modernsqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/zzet/gortex/internal/graph"
 )
+
+// Keep the legacy conservative statement boundary in collision/order tests;
+// production reindexing now derives statement sizes from SQLite's live limit.
+const reindexCompatibilityChunkSize = 70
 
 func TestReindexEdgesUsesBoundedSetStatementsAndFirstDuplicateWins(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
@@ -20,9 +29,9 @@ func TestReindexEdgesUsesBoundedSetStatementsAndFirstDuplicateWins(t *testing.T)
 		fromID = "repo/caller.go::Caller"
 		newTo  = "repo/target.go::Target"
 	)
-	oldEdges := make([]*graph.Edge, 0, reindexSetChunkSize+1)
-	batch := make([]graph.EdgeReindex, 0, reindexSetChunkSize+1)
-	for i := 0; i < reindexSetChunkSize+1; i++ {
+	oldEdges := make([]*graph.Edge, 0, reindexCompatibilityChunkSize+1)
+	batch := make([]graph.EdgeReindex, 0, reindexCompatibilityChunkSize+1)
+	for i := 0; i < reindexCompatibilityChunkSize+1; i++ {
 		oldTo := fmt.Sprintf("repo/old-%03d.go::Target", i)
 		oldEdges = append(oldEdges, &graph.Edge{
 			From: fromID, To: oldTo, Kind: graph.EdgeCalls,
@@ -165,11 +174,11 @@ func TestReindexEdgesNetCancellationAcrossSQLChunksIsNoop(t *testing.T) {
 	buildMinimalAnalysisGeneration(t, store, "set-reindex-net-noop", 0, true)
 	beforeRevision := store.AnalysisMutationRevision()
 
-	batch := make([]graph.EdgeReindex, 0, reindexSetChunkSize+1)
+	batch := make([]graph.EdgeReindex, 0, reindexCompatibilityChunkSize+1)
 	intermediateEdge := *original
 	intermediateEdge.To = intermediate
 	batch = append(batch, graph.EdgeReindex{Edge: &intermediateEdge, OldTo: originalTo})
-	for i := 0; i < reindexSetChunkSize-1; i++ {
+	for i := 0; i < reindexCompatibilityChunkSize-1; i++ {
 		fillerCandidate := *filler
 		batch = append(batch, graph.EdgeReindex{
 			Edge:  &fillerCandidate,
@@ -199,4 +208,143 @@ func TestReindexEdgesNetCancellationAcrossSQLChunksIsNoop(t *testing.T) {
 	require.Len(t, persisted, 1)
 	assert.Equal(t, originalTo, persisted[0].To)
 	assert.Equal(t, "preserve", persisted[0].Meta["opaque"])
+}
+
+func TestReindexEdgesUsesRuntimeVariableBudget(t *testing.T) {
+	const edgeCount = 2000
+	for _, variableLimit := range []int{sqliteFallbackVariableLimit, sqliteBatchVariableHardCap} {
+		t.Run(fmt.Sprintf("limit_%d", variableLimit), func(t *testing.T) {
+			store := openReindexReceiptTestStore(t)
+			oldEdges := make([]*graph.Edge, 0, edgeCount)
+			batch := make([]graph.EdgeReindex, 0, edgeCount)
+			for i := 0; i < edgeCount; i++ {
+				from := fmt.Sprintf("repo/caller-%04d.go::Caller", i)
+				oldTo := fmt.Sprintf("unresolved::Old%04d", i)
+				oldEdges = append(oldEdges, &graph.Edge{
+					From: from, To: oldTo, Kind: graph.EdgeCalls,
+					FilePath: "repo/callers.go", Line: i + 1,
+				})
+				batch = append(batch, graph.EdgeReindex{
+					OldTo: oldTo,
+					Edge: &graph.Edge{
+						From: from, To: fmt.Sprintf("repo/target-%04d.go::Target", i),
+						Kind: graph.EdgeCalls, FilePath: "repo/callers.go", Line: i + 1,
+					},
+				})
+			}
+			store.AddBatch(nil, oldEdges)
+			store.batchVariableLimit = variableLimit
+
+			stats, err := store.reindexEdgesSetOriented(batch)
+			require.NoError(t, err)
+			keyRows := batchRowsForVariableLimit(variableLimit, reindexKeyParamsPerRow, edgeCount*2)
+			insertRows := batchRowsForVariableLimit(variableLimit, reindexRowParamsPerRow, reindexRowMaxChunkSize)
+			assert.Equal(t, (edgeCount*2+keyRows-1)/keyRows, stats.selectStatements)
+			assert.Equal(t, (edgeCount+keyRows-1)/keyRows, stats.deleteStatements)
+			assert.Equal(t, (edgeCount+insertRows-1)/insertRows, stats.insertStatements)
+			assert.Equal(t, edgeCount, stats.deletedRows)
+			assert.Equal(t, edgeCount, stats.insertedRows)
+			assert.Equal(t, edgeCount, store.EdgeCount())
+		})
+	}
+}
+
+func TestReindexInsertChunksRespectBoundArgumentBytes(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	tx, err := store.beginWrite()
+	require.NoError(t, err)
+	largeMeta := bytes.Repeat([]byte("x"), 3<<20)
+	rows := make([]sqliteReindexRow, 3)
+	for i := range rows {
+		rows[i] = sqliteReindexRow{
+			key: sqliteReindexKey{
+				fromID: fmt.Sprintf("repo/caller-%d.go::Caller", i),
+				toID:   fmt.Sprintf("repo/target-%d.go::Target", i),
+				kind:   string(graph.EdgeCalls), filePath: "repo/callers.go", line: i + 1,
+			},
+			meta: largeMeta,
+		}
+	}
+	variableLimit := sqliteBatchVariableHardCap
+	inserted, statements, err := insertSQLiteReindexRowsTxLimited(tx, rows, &variableLimit)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	assert.Equal(t, len(rows), inserted)
+	assert.Equal(t, len(rows), statements, "each 3 MiB row must stay below the 4 MiB statement budget")
+}
+
+func TestReindexEdgesDownshiftsConnectionVariableLimit(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	oldEdges := make([]*graph.Edge, 0, 120)
+	batch := make([]graph.EdgeReindex, 0, 120)
+	for i := 0; i < 120; i++ {
+		from := fmt.Sprintf("repo/caller-%03d.go::Caller", i)
+		oldTo := fmt.Sprintf("unresolved::Old%03d", i)
+		oldEdges = append(oldEdges, &graph.Edge{
+			From: from, To: oldTo, Kind: graph.EdgeCalls,
+			FilePath: "repo/callers.go", Line: i + 1,
+		})
+		batch = append(batch, graph.EdgeReindex{
+			OldTo: oldTo,
+			Edge: &graph.Edge{
+				From: from, To: fmt.Sprintf("repo/target-%03d.go::Target", i),
+				Kind: graph.EdgeCalls, FilePath: "repo/callers.go", Line: i + 1,
+			},
+		})
+	}
+	store.AddBatch(nil, oldEdges)
+
+	conn, err := store.writerDB.Conn(context.Background())
+	require.NoError(t, err)
+	const connectionLimit = 220
+	_, err = modernsqlite.Limit(conn, int(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER), connectionLimit)
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	store.batchVariableLimit = sqliteBatchVariableHardCap
+
+	stats, err := store.reindexEdgesSetOriented(batch)
+	require.NoError(t, err)
+	assert.Equal(t, len(batch), stats.deletedRows)
+	assert.Equal(t, len(batch), stats.insertedRows)
+	assert.LessOrEqual(t, store.batchVariableLimit, connectionLimit)
+	assert.Greater(t, stats.selectStatements, 1, "the first oversized prepare must downshift and retry")
+	assert.Equal(t, len(batch), store.EdgeCount())
+}
+
+func TestReindexEdgesProbesVariableLimitBeforeWriterCheckout(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	store.writerDB.SetMaxOpenConns(1)
+	old := &graph.Edge{
+		From: "repo/caller.go::Caller", To: "unresolved::Target", Kind: graph.EdgeCalls,
+		FilePath: "repo/caller.go", Line: 7,
+	}
+	store.AddBatch(nil, []*graph.Edge{old})
+	store.batchVariableLimit = 0 // exercise the fresh-store probe path
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.reindexEdgesSetOriented([]graph.EdgeReindex{{
+			OldTo: old.To,
+			Edge: &graph.Edge{
+				From: old.From, To: "repo/target.go::Target", Kind: old.Kind,
+				FilePath: old.FilePath, Line: old.Line,
+			},
+		}})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		// Let an implementation that checked out the sole connection before
+		// probing its limit unwind, so test cleanup cannot remain wedged.
+		store.writerDB.SetMaxOpenConns(2)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+		t.Fatal("ReindexEdges waited for its own writer connection while probing SQLite limits")
+	}
+	assert.Positive(t, store.batchVariableLimit)
 }
