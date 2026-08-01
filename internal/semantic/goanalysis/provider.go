@@ -445,16 +445,12 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	// The heavy gate has done its job once the load is complete: under the
-	// export-data mode the program holds only the ROOT packages (the
-	// dependency closure types come from compiled export data), and the
-	// enrichment pool's bounded lanes already cap how many repos can be
-	// in-flight here at once — so releasing the gate now lets every lane's
-	// load run during the resolve phase instead of queueing serially behind
-	// this pass's park + apply (measured: a 178-package repo queued 767s on
-	// the gate to run a 3.6s load). The gate still serializes the loads
-	// themselves, which is the memory- and go-list-heavy part.
-	releaseHeavy()
+	// Keep the heavyweight admission lease for the complete lifetime of pkgs
+	// and fset, including any warmup apply-barrier park. Releasing it here let
+	// every enrichment-pool lane accumulate a completed compiler program while
+	// the resolver held the apply gate; four such programs retained several
+	// GiB for more than twelve minutes in a measured cold workspace. The
+	// deferred release above remains cancellation-safe on every exit path.
 
 	// Warmup apply barrier: everything below reads or writes graph state, and
 	// a giant apply landing mid-resolve starves the resolver on the shared
