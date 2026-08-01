@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"context"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -412,14 +413,21 @@ func (r *Resolver) resolveScopePrefixes() []string {
 // workspace index is built. When a backend bulk pass applies, its mutations
 // precede the returned high-water snapshot so the Go resolver sees exactly the
 // remaining (and any backend-created) unresolved work.
-func (r *Resolver) prepareResolveAllStream() *unresolvedEdgeStream {
-	stream := newUnresolvedEdgeStream(r.graph)
+func (r *Resolver) prepareResolveAllStream(ctx context.Context) *unresolvedEdgeStream {
+	stream := newUnresolvedEdgeStreamContext(ctx, r.graph)
 	if stream.initErr != nil || !backendResolverEnabled() {
+		return stream
+	}
+	if err := ctx.Err(); err != nil {
+		stream.initErr = err
 		return stream
 	}
 
 	prefixes := r.resolveScopePrefixes()
-	hasWork := stream.scan.PendingBefore > 0
+	// Native pagers may deliberately omit the exact pre-count to avoid a
+	// whole-frontier census. A positive high-water mark is sufficient to prove
+	// that unresolved work existed at the pass boundary.
+	hasWork := stream.scan.HighWaterID > 0 || stream.scan.PendingBefore > 0
 	if !hasWork {
 		if indicator, ok := r.graph.(backendResolveWorkIndicator); ok {
 			pending, err := indicator.BackendResolveWorkPending(prefixes)
@@ -456,5 +464,8 @@ func (r *Resolver) prepareResolveAllStream() *unresolvedEdgeStream {
 		zap.Bool("scoped", len(prefixes) > 0),
 		zap.Duration("elapsed", time.Since(bulkStart)),
 		zap.Error(err))
-	return newUnresolvedEdgeStream(r.graph)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return &unresolvedEdgeStream{ctx: ctx, initErr: ctxErr}
+	}
+	return newUnresolvedEdgeStreamContext(ctx, r.graph)
 }

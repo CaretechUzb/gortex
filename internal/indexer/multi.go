@@ -814,12 +814,21 @@ func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}, useLSP bool)
 // runMasterResolveHooked is runMasterResolve with an optional compute-done
 // hook threaded into the resolver (see Resolver.OnComputeDone).
 func (mi *MultiIndexer) runMasterResolveHooked(scope map[string]struct{}, useLSP bool, onComputeDone func()) {
+	if err := mi.runMasterResolveHookedContext(context.Background(), scope, useLSP, onComputeDone); err != nil {
+		mi.logger.Error("DEFERRED-TIMING master.ResolveAll", zap.Error(err))
+	}
+}
+
+func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope map[string]struct{}, useLSP bool, onComputeDone func()) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	master := mi.newMasterResolver(useLSP)
 	if master == nil {
-		if onComputeDone != nil {
+		if onComputeDone != nil && ctx.Err() == nil {
 			onComputeDone()
 		}
-		return
+		return ctx.Err()
 	}
 	master.OnComputeDone = onComputeDone
 	scoped := len(scope) > 0 && mi.scopedGlobalPassesEnabled()
@@ -827,7 +836,7 @@ func (mi *MultiIndexer) runMasterResolveHooked(scope map[string]struct{}, useLSP
 		master.SetScope(scope)
 	}
 	mt := time.Now()
-	stats := master.ResolveAll()
+	stats, err := master.ResolveAllContext(ctx)
 	mi.logger.Info("DEFERRED-TIMING master.ResolveAll",
 		zap.Duration("elapsed", time.Since(mt)),
 		zap.Bool("scoped", scoped),
@@ -838,7 +847,9 @@ func (mi *MultiIndexer) runMasterResolveHooked(scope map[string]struct{}, useLSP
 		// pass (see ResolveStats). A 666k-conversion pass with these two
 		// nearly equal is a pass that admitted nearly everything it scanned.
 		zap.Int("pending_scanned", stats.PendingBefore),
-		zap.Int("pending_admitted", stats.PendingAfter))
+		zap.Int("pending_admitted", stats.PendingAfter),
+		zap.Error(err))
+	return err
 }
 
 func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
@@ -885,7 +896,39 @@ func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
 // in multi-minute stretches and admitting applies between the master and
 // cross-repo passes starved cross-repo to a standstill (measured: 1,049s for
 // a pass that runs in ~38s uncontended on the same workspace).
-func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}, onComputeDone func()) {
+func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}, onComputeDone func()) error {
+	mi.runDeferredGoModAll()
+	if err := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone); err != nil {
+		return err
+	}
+	// Cross-repo references resolve here so a multi-repo workspace is fully
+	// resolved, not just within each repo. Whole-graph so inbound references
+	// from unchanged repos into the changed repos bind too.
+	return mi.runCrossRepoResolveContext(ctx, false)
+}
+
+// RunPreEnrichResolveFiles preserves an exact warm-reconcile frontier through
+// same-repository and cross-repository resolution. A restart that reparsed one
+// file must not promote that delta to every unresolved edge in its repository.
+func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []string, onComputeDone func()) error {
+	mi.runDeferredGoModAll()
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if len(files) > 0 {
+		mi.runMasterResolveFiles(files, true)
+	}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if onComputeDone != nil {
+		onComputeDone()
+	}
+	mi.runCrossRepoResolveFiles(files)
+	return context.Cause(ctx)
+}
+
+func (mi *MultiIndexer) runDeferredGoModAll() {
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
 	for _, idx := range mi.indexers {
@@ -898,11 +941,6 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 	for _, idx := range indexers {
 		idx.runDeferredGoMod()
 	}
-	mi.runMasterResolveHooked(scope, true, onComputeDone)
-	// Cross-repo references resolve here so a multi-repo workspace is fully
-	// resolved, not just within each repo. Whole-graph so inbound references
-	// from unchanged repos into the changed repos bind too.
-	mi.runCrossRepoResolve(false)
 }
 
 // runDeferredEnrichParallel runs each indexer's semantic enrichment in a
@@ -1965,7 +2003,9 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 			// was the dominant cold-index regression. runDeferredGoMod is generation-
 			// idempotent, so RunDeferredPassesAll does not repeat the pre-resolve work.
 			deferCtx := context.Background()
-			mi.RunPreEnrichResolve(deferCtx, nil, nil)
+			if err := mi.RunPreEnrichResolve(deferCtx, nil, nil); err != nil {
+				return results, fmt.Errorf("multi-repo pre-enrichment resolve: %w", err)
+			}
 			enrichScheduled := mi.RunDeferredPassesAll(deferCtx)
 			mi.logger.Info("multi-repo coordinated deferred passes complete",
 				zap.Int("repos_indexed", len(results)),

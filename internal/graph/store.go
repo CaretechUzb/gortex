@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"iter"
 	"sync"
 )
@@ -43,7 +44,8 @@ type EdgeProvenanceUpdate struct {
 // HighWaterID is backend-owned and opaque to callers; SQLite uses the edge
 // rowid so rows inserted or reinserted while a chunked resolver yields cannot
 // leak into the pass. PendingBefore is the exact number of eligible rows at
-// that boundary and is diagnostic only.
+// that boundary when non-negative; -1 means the backend intentionally skipped
+// a pre-count and the consumer must derive the diagnostic count while paging.
 type UnresolvedEdgeScan struct {
 	HighWaterID   int64
 	PendingBefore int
@@ -84,10 +86,13 @@ type UnresolvedEdgePage struct {
 // UnresolvedEdgePager is an optional disk-backend capability used by the
 // resolver's cold pass. Implementations must keyset-page a stable high-water
 // snapshot and honour both bounds (an individually oversized row may exceed
-// maxBytes so the cursor can still make progress).
+// maxBytes so the cursor can still make progress). PendingBefore may be -1
+// when the backend deliberately avoids an exact pre-count; consumers then
+// derive the diagnostic count while paging. A zero high-water mark still
+// means the frontier is known to be empty.
 type UnresolvedEdgePager interface {
-	BeginUnresolvedEdgeScan() (UnresolvedEdgeScan, error)
-	ReadUnresolvedEdgePage(scan UnresolvedEdgeScan, afterID int64, maxRows, maxBytes int) (UnresolvedEdgePage, error)
+	BeginUnresolvedEdgeScan(ctx context.Context) (UnresolvedEdgeScan, error)
+	ReadUnresolvedEdgePage(ctx context.Context, scan UnresolvedEdgeScan, afterID int64, maxRows, maxBytes int) (UnresolvedEdgePage, error)
 }
 
 // Store is the persistence-and-query backend the rest of gortex sees

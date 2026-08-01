@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -306,10 +307,29 @@ func (cr *CrossRepoResolver) pickQualNameCandidate(callerRepo, callerWS, qualNam
 // matches first, then cross-repo search. Sets Edge.CrossRepo = true for
 // cross-repo matches.
 func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
+	stats, err := cr.ResolveAllContext(context.Background())
+	if err != nil {
+		cr.logger.Error("cross-repo resolve: ResolveAll", zap.Error(err))
+	}
+	return stats
+}
+
+// ResolveAllContext is ResolveAll with cancellation propagated through the
+// unresolved-edge pager. The compatibility wrapper above preserves the
+// historical best-effort API for non-lifecycle callers.
+func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoStats, error) {
+	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
-
-	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	// Fresh placeholder-source set per pass — same rationale as ResolveAll
 	// on the master resolver.
 	cr.placeholderSrcIdx = placeholderSourceIndex{}
@@ -317,21 +337,26 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 	// residual can exceed 200k edges; retaining it plus the cross-repo name,
 	// raw-name, repo and qualified-name caches was the second whole-corpus heap
 	// spike after Resolver.ResolveAll itself.
-	pendingStream := newUnresolvedEdgeStream(cr.graph)
+	pendingStream := newUnresolvedEdgeStreamContext(ctx, cr.graph)
 	defer pendingStream.close()
 	pendingBefore := pendingStream.scan.PendingBefore
+	if !pendingStream.countKnown {
+		pendingBefore = 0
+	}
+	var pendingTotal atomic.Int64
+	pendingTotal.Store(int64(pendingBefore))
 	var pendingLoaded atomic.Int64
 	pending, streamDone, err := pendingStream.nextPage()
 	if err != nil {
-		cr.logger.Error("cross-repo resolve: unresolved edge stream", zap.Error(err))
-		return stats
+		return stats, err
 	}
 	if !pendingStream.countKnown {
 		pendingBefore = len(pending)
+		pendingTotal.Store(int64(pendingBefore))
 	}
 	pendingLoaded.Store(int64(len(pending)))
 	if len(pending) == 0 && streamDone {
-		return stats
+		return stats, nil
 	}
 
 	cr.buildDirIndexes()
@@ -361,6 +386,11 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 		zap.Int("first_page", len(pending)))
 	var processed atomic.Int64
 	progressDone := make(chan struct{})
+	var progressOnce sync.Once
+	stopProgress := func() {
+		progressOnce.Do(func() { close(progressDone) })
+	}
+	defer stopProgress()
 	go func() {
 		t := time.NewTicker(3 * time.Second)
 		defer t.Stop()
@@ -372,7 +402,7 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 				cr.logger.Info("cross-repo resolve: compute progress",
 					zap.Int64("processed", processed.Load()),
 					zap.Int64("pending_loaded", pendingLoaded.Load()),
-					zap.Int("pending_total", pendingBefore),
+					zap.Int64("pending_total", pendingTotal.Load()),
 					zap.Duration("elapsed", time.Since(passStart)))
 			}
 		}
@@ -391,6 +421,9 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 	}
 	reindexTotal := 0
 	for {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		cr.warmLookupCache(pending)
 		if len(pending) > stats.peakPendingPage {
 			stats.peakPendingPage = len(pending)
@@ -400,6 +433,9 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 			stats.peakLookupKeys = lookupKeys
 		}
 		for base := 0; base < len(pending); base += superChunk {
+			if err := ctx.Err(); err != nil {
+				return stats, err
+			}
 			hi := base + superChunk
 			if hi > len(pending) {
 				hi = len(pending)
@@ -432,6 +468,9 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 					ws := &CrossRepoStats{ByRepo: make(map[string]int)}
 					var batch []graph.EdgeReindex
 					for _, edge := range slice {
+						if ctx.Err() != nil {
+							break
+						}
 						cr.resolveEdge(edge, ws, &batch)
 						processed.Add(1)
 					}
@@ -440,6 +479,9 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 				}(w, sc[start:end])
 			}
 			wg.Wait()
+			if err := ctx.Err(); err != nil {
+				return stats, err
+			}
 
 			var scBatch []graph.EdgeReindex
 			for i := range perWorkerBatch {
@@ -470,6 +512,9 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 				cr.mu.Unlock()
 				runtime.Gosched()
 				cr.mu.Lock()
+				if err := ctx.Err(); err != nil {
+					return stats, err
+				}
 				if revKnown {
 					if revAfter, _ := loadMutationRevision(cr.graph); revAfter != revBefore {
 						// An interleaving writer may have created nodes or
@@ -485,21 +530,21 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 		}
 		pending, streamDone, err = pendingStream.nextPage()
 		if err != nil {
-			cr.logger.Error("cross-repo resolve: unresolved edge stream", zap.Error(err))
-			break
+			return stats, err
 		}
 		if !pendingStream.countKnown {
 			pendingBefore += len(pending)
+			pendingTotal.Store(int64(pendingBefore))
 		}
 		pendingLoaded.Add(int64(len(pending)))
 	}
-	close(progressDone)
+	stopProgress()
 	cr.logger.Info("cross-repo resolve: compute done",
 		zap.Int64("pending", pendingLoaded.Load()),
 		zap.Int("reindex_batch", reindexTotal),
 		zap.Int("super_chunk", superChunk),
 		zap.Duration("elapsed", time.Since(passStart)))
-	return stats
+	return stats, nil
 }
 
 // ResolveForRepo resolves only unresolved edges originating from nodes

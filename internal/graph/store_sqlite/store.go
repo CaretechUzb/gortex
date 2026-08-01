@@ -2340,13 +2340,13 @@ func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 // is dropped by the NOT LIKE, matching IsFnValuePlaceholder's infix shape.
 func (s *Store) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		scan, err := s.BeginUnresolvedEdgeScan()
+		scan, err := s.BeginUnresolvedEdgeScan(context.Background())
 		if err != nil {
 			return
 		}
 		var afterID int64
 		for {
-			page, err := s.ReadUnresolvedEdgePage(scan, afterID, 2048, 16<<20)
+			page, err := s.ReadUnresolvedEdgePage(context.Background(), scan, afterID, 2048, 16<<20)
 			if err != nil {
 				return
 			}

@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"context"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -34,7 +35,7 @@ func (s *resolveInterleavePagingStore) MutationRevision() uint64 {
 	return s.resolverBatchCountingStore.Store.(mutationRevisioner).MutationRevision()
 }
 
-func (s *resolveInterleavePagingStore) BeginUnresolvedEdgeScan() (graph.UnresolvedEdgeScan, error) {
+func (s *resolveInterleavePagingStore) BeginUnresolvedEdgeScan(context.Context) (graph.UnresolvedEdgeScan, error) {
 	s.beginCalls++
 	return graph.UnresolvedEdgeScan{
 		HighWaterID:   int64(len(s.pageEdges)),
@@ -43,7 +44,7 @@ func (s *resolveInterleavePagingStore) BeginUnresolvedEdgeScan() (graph.Unresolv
 }
 
 func (s *resolveInterleavePagingStore) ReadUnresolvedEdgePage(
-	_ graph.UnresolvedEdgeScan, afterID int64, _, _ int,
+	_ context.Context, _ graph.UnresolvedEdgeScan, afterID int64, _, _ int,
 ) (graph.UnresolvedEdgePage, error) {
 	s.pageCalls++
 	if afterID >= int64(len(s.pageEdges)) {

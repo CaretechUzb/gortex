@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"bufio"
+	"context"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -44,9 +45,19 @@ type unresolvedLegacySpool struct {
 	count   int
 }
 
-func newUnresolvedLegacySpool(store graph.Store) (*unresolvedLegacySpool, error) {
+func newUnresolvedLegacySpoolContext(ctx context.Context, store graph.Store) (*unresolvedLegacySpool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	spool := &unresolvedLegacySpool{store: store}
 	for edge := range store.EdgesWithUnresolvedTarget() {
+		if err := ctx.Err(); err != nil {
+			spool.close()
+			return nil, err
+		}
 		if edge == nil {
 			continue
 		}

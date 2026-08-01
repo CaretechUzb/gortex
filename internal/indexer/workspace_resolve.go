@@ -1,10 +1,13 @@
 package indexer
 
 import (
+	"context"
 	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
@@ -305,14 +308,23 @@ func (mi *MultiIndexer) newCrossRepoResolver() *resolver.CrossRepoResolver {
 }
 
 func (mi *MultiIndexer) runCrossRepoResolve(reconcileContracts bool) {
+	if err := mi.runCrossRepoResolveContext(context.Background(), reconcileContracts); err != nil {
+		mi.logger.Error("cross-repo resolve", zap.Error(err))
+	}
+}
+
+func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcileContracts bool) error {
 	cr := mi.newCrossRepoResolver()
 	if cr == nil {
-		return
+		return nil
 	}
-	cr.ResolveAll()
+	if _, err := cr.ResolveAllContext(ctx); err != nil {
+		return err
+	}
 	if reconcileContracts {
 		mi.ReconcileContractEdges()
 	}
+	return nil
 }
 
 // runCrossRepoResolveFiles binds both outgoing and incoming unresolved edges

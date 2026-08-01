@@ -35,6 +35,7 @@ const (
 // retained heap. SQLite uses a stable rowid high-water/keyset scan; legacy
 // stores use the early-stoppable iterator and retain at most one bounded page.
 type unresolvedEdgeStream struct {
+	ctx        context.Context
 	pager      graph.UnresolvedEdgePager
 	scan       graph.UnresolvedEdgeScan
 	legacy     *unresolvedLegacySpool
@@ -45,17 +46,31 @@ type unresolvedEdgeStream struct {
 }
 
 func newUnresolvedEdgeStream(store graph.Store) *unresolvedEdgeStream {
-	stream := &unresolvedEdgeStream{}
+	return newUnresolvedEdgeStreamContext(context.Background(), store)
+}
+
+func newUnresolvedEdgeStreamContext(ctx context.Context, store graph.Store) *unresolvedEdgeStream {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stream := &unresolvedEdgeStream{ctx: ctx}
 	if pager, ok := store.(graph.UnresolvedEdgePager); ok {
-		if scan, err := pager.BeginUnresolvedEdgeScan(); err == nil {
-			stream.pager = pager
-			stream.scan = scan
-			stream.countKnown = true
-			stream.exhausted = scan.PendingBefore == 0
+		scan, err := pager.BeginUnresolvedEdgeScan(ctx)
+		if err != nil {
+			// A store advertising a native pager never falls back to the legacy
+			// spool on pager failure. Besides masking the real database error, that
+			// fallback walks the complete unresolved corpus; on cancellation it
+			// turned a prompt warmup stop into minutes of extra work.
+			stream.initErr = err
 			return stream
 		}
+		stream.pager = pager
+		stream.scan = scan
+		stream.countKnown = scan.PendingBefore >= 0
+		stream.exhausted = scan.HighWaterID == 0
+		return stream
 	}
-	legacy, err := newUnresolvedLegacySpool(store)
+	legacy, err := newUnresolvedLegacySpoolContext(ctx, store)
 	if err != nil {
 		stream.initErr = err
 		return stream
@@ -82,7 +97,7 @@ func (s *unresolvedEdgeStream) nextPage() ([]*graph.Edge, bool, error) {
 	}
 	if s.pager != nil {
 		page, err := s.pager.ReadUnresolvedEdgePage(
-			s.scan, s.afterID, resolvePendingScanPageRows, resolvePendingPageBytes,
+			s.ctx, s.scan, s.afterID, resolvePendingScanPageRows, resolvePendingPageBytes,
 		)
 		if err != nil {
 			return nil, false, err
@@ -523,8 +538,30 @@ func (r *Resolver) SetGraph(g graph.Store) {
 // `Resolved++` etc. don't race. r.mu serialises ResolveAll calls
 // against each other; nothing inside this function takes that lock.
 func (r *Resolver) ResolveAll() *ResolveStats {
+	stats, err := r.ResolveAllContext(context.Background())
+	if err != nil {
+		r.logger.Error("resolver: ResolveAll", zap.Error(err))
+	}
+	return stats
+}
+
+// ResolveAllContext is ResolveAll with cancellation propagated through the
+// native unresolved-edge pager. On error it returns the counts accumulated up
+// to the failure and does not publish compute readiness or run refinement
+// tails. ResolveAll retains the historical best-effort API for callers that do
+// not own a lifecycle context.
+func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return &ResolveStats{}, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return &ResolveStats{}, err
+	}
 
 	r.logUnresolvedFrontier("start")
 	defer r.logUnresolvedFrontier("end")
@@ -539,7 +576,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// applied to each page before any lookup cache is built. The initial scan
 	// deliberately precedes every workspace index and backend bulk pass: a warm
 	// no-op pays one indexed pending query, not several whole-graph scans.
-	pendingStream := r.prepareResolveAllStream()
+	pendingStream := r.prepareResolveAllStream(ctx)
 	defer pendingStream.close()
 	// Push the scoped pass's row filters into the store: ScopeFilter drops
 	// rows edgeInResolveScope provably never reconsiders, and SkipTerminal
@@ -558,6 +595,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		pendingStream.scan.SkipTerminal = !warmupFullResolve()
 	}
 	pendingBefore := pendingStream.scan.PendingBefore
+	if !pendingStream.countKnown {
+		pendingBefore = 0
+	}
 	pendingAfter := 0
 	var pendingTotal atomic.Int64
 	var pendingLoaded atomic.Int64
@@ -566,6 +606,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	streamDone := false
 	loadPendingPage := func() ([]*graph.Edge, error) {
 		for {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			raw, done, err := pendingStream.nextPage()
 			if err != nil {
 				return nil, err
@@ -593,11 +636,10 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	}
 	pending, pendingErr := loadPendingPage()
 	if pendingErr != nil {
-		r.logger.Error("resolver: unresolved edge stream", zap.Error(pendingErr))
-		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}
+		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, pendingErr
 	}
 	if len(pending) == 0 && streamDone && !r.hasDeferredLSPRetryForScope() {
-		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}
+		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, nil
 	}
 
 	passIndexes := newResolveAllPassIndexes(r)
@@ -641,6 +683,11 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	}
 	var processed atomic.Int64
 	progressDone := make(chan struct{})
+	var progressOnce sync.Once
+	stopProgress := func() {
+		progressOnce.Do(func() { close(progressDone) })
+	}
+	defer stopProgress()
 	go func() {
 		t := time.NewTicker(3 * time.Second)
 		defer t.Stop()
@@ -680,9 +727,8 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		var err error
 		r.lspDeferredSpool, err = newDeferredLSPSpool()
 		if err != nil {
-			close(progressDone)
 			r.logger.Error("resolver: create deferred LSP spool", zap.Error(err))
-			return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}
+			return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, err
 		}
 		if len(r.lspDeferredRetry) > 0 {
 			carried := make([]deferredLSPEdge, 0, len(r.lspDeferredRetry))
@@ -691,9 +737,8 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 				carried = append(carried, deferred)
 			}
 			if err := r.lspDeferredSpool.append(carried); err != nil {
-				close(progressDone)
 				r.logger.Error("resolver: migrate deferred LSP retries", zap.Error(err))
-				return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}
+				return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, err
 			}
 			r.lspDeferredRetry = nil
 		}
@@ -708,12 +753,16 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	guardSpool, guardSpoolErr := newResolveGuardSpool()
 	if guardSpoolErr != nil {
 		r.logger.Error("resolver: create guard spool", zap.Error(guardSpoolErr))
-		close(progressDone)
-		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}
+		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, guardSpoolErr
 	}
 	defer guardSpool.close()
 	guardRepos := make(map[string]struct{})
 	total := &ResolveStats{}
+	resolveError := func(err error) (*ResolveStats, error) {
+		total.PendingBefore = pendingBefore
+		total.PendingAfter = pendingAfter
+		return total, err
+	}
 	reindexTotal := 0
 	// Conversion-vs-churn split of the reindex volume. A pass once applied a
 	// 666k-entry reindex batch while net pending moved only 30k — without
@@ -724,6 +773,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	reindexChurn := 0
 	warmElapsed := time.Duration(0)
 	for {
+		if err := ctx.Err(); err != nil {
+			return resolveError(err)
+		}
 		// The pending page is a stable edge snapshot taken while mu is held.
 		// Production stores expose a cheap edge mutation revision. As long as
 		// it stays unchanged across yields, no edge in this page can have been
@@ -744,6 +796,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 			warmElapsed += time.Since(warmStart)
 		}
 		for base := 0; base < len(pending); base += superChunk {
+			if err := ctx.Err(); err != nil {
+				return resolveError(err)
+			}
 			hi := base + superChunk
 			if hi > len(pending) {
 				hi = len(pending)
@@ -790,6 +845,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 					jobs := make([]reindexJob, 0, len(slice))
 					var deferred []deferredLSPEdge
 					for _, e := range slice {
+						if ctx.Err() != nil {
+							break
+						}
 						// Capture LSP eligibility + the pre-heuristic identifier
 						// BEFORE resolveEdge runs: e.To is still the `unresolved::`
 						// stub here (the real edge is rewritten only in the apply
@@ -847,6 +905,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 				}(w, scPending[start:end])
 			}
 			wg.Wait()
+			if err := ctx.Err(); err != nil {
+				return resolveError(err)
+			}
 
 			// Apply this chunk's mutations under the lock. An edit during a PRIOR
 			// inter-chunk yield may have evicted an edge this chunk resolved;
@@ -937,6 +998,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 				}
 				runtime.Gosched()
 				r.mu.Lock()
+				if err := ctx.Err(); err != nil {
+					return resolveError(err)
+				}
 				forceRefresh := false
 				if pageMutationRevisionKnown {
 					currentRevision, _ := loadMutationRevision(r.graph)
@@ -965,12 +1029,14 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		var err error
 		pending, err = loadPendingPage()
 		if err != nil {
-			r.logger.Error("resolver: unresolved edge stream", zap.Error(err))
-			break
+			return resolveError(err)
 		}
 	}
-	close(progressDone)
+	stopProgress()
 	loopElapsed := time.Since(passStart) - warmElapsed
+	if err := ctx.Err(); err != nil {
+		return resolveError(err)
+	}
 
 	// Publish compute readiness BEFORE the deferred LSP batch. The batch is
 	// verification/override work whose store-standing yield measured 2,409
@@ -989,7 +1055,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	lspDeferred := 0
 	lspResult := deferredLSPBatchResult{}
 	lspStart := time.Now()
-	lspCtx := context.Background()
+	lspCtx := ctx
 	lspPassBudget := &deferredLSPPassBudget{duration: r.lspResolvePassBudget}
 	// The attempt budget bounds helper calls only. Every other per-page cost —
 	// spool reads, edge hydration, liveness projection, bookkeeping — runs
@@ -1280,6 +1346,14 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// guard and tail attribution passes below run identically to the single-
 	// file path. (The deferred defer() is the panic-safety net.)
 	r.bulkMode = false
+	total.LSPDeferred = lspDeferred
+	total.LSPAttempted = lspResult.attempted
+	total.LSPResolved = lspResult.resolved
+	total.LSPBudgetSkipped = lspResult.skipped
+	total.LSPBudgetExhausted = lspResult.budgetExhausted
+	if err := ctx.Err(); err != nil {
+		return resolveError(err)
+	}
 
 	computeElapsed := time.Since(passStart)
 	r.logger.Info("resolver: compute done",
@@ -1344,6 +1418,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		guardJobs := 0
 		lastGuardLog := time.Now()
 		for done := false; !done; {
+			if err := ctx.Err(); err != nil {
+				return resolveError(err)
+			}
 			records, exhausted, err := guardSpool.nextPage(resolvePendingPageRows)
 			if err != nil {
 				r.logger.Error("resolver: read guard spool", zap.Error(err))
@@ -1366,6 +1443,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		}
 	}
 	tAfterGuard := time.Now()
+	if err := ctx.Err(); err != nil {
+		return resolveError(err)
+	}
 
 	// Post-resolution Go attribution passes: method-receiver rebind, bare-name
 	// and generic-param binding, builtin + external-call materialisation. Each
@@ -1392,10 +1472,16 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		r.runFileAttributionPassesLocked()
 	} else {
 		for _, fp := range r.scopedFiles() {
+			if err := ctx.Err(); err != nil {
+				return resolveError(err)
+			}
 			r.runFileAttributionPassesForFileLocked(fp)
 		}
 	}
 	tAfterAttrib := time.Now()
+	if err := ctx.Err(); err != nil {
+		return resolveError(err)
+	}
 
 	// Relative-import resolution for Python and Dart files. Runs
 	// before module attribution so internal-target stems never get
@@ -1404,17 +1490,26 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	ldStart := time.Now()
 	r.resolveRelativeImports()
 	ld1 := time.Now()
+	if err := ctx.Err(); err != nil {
+		return resolveError(err)
+	}
 
 	// Lua / Luau `require(...)` binding. Same settle window as the relative
 	// imports above; resolveRelativeImports never touches Lua, so this lands
 	// the Lua module/instance requires onto their indexed file nodes.
 	r.resolveLuaRequires()
 	ld2 := time.Now()
+	if err := ctx.Err(); err != nil {
+		return resolveError(err)
+	}
 
 	// Razor / Blazor `@using` namespace-cascade binding. Same settle window;
 	// binds simple-type references reachable only via an imported namespace.
 	r.resolveRazorUsings()
 	ld3 := time.Now()
+	if err := ctx.Err(); err != nil {
+		return resolveError(err)
+	}
 
 	// Module attribution for ecosystems without a CGO type-checker
 	// path (Python, Dart, …). Runs serially on the post-resolution
@@ -1422,6 +1517,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// dep-module bridge has had its chance.
 	r.attributeNonGoModuleImports()
 	ld4 := time.Now()
+	if err := ctx.Err(); err != nil {
+		return resolveError(err)
+	}
 
 	// Java override-dispatch fan-out. An ambiguous member call on a
 	// supertype-typed receiver (`x.toString()` with two candidate
@@ -1431,6 +1529,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// Runs after the guard so its ast_inferred edges are never reverted.
 	r.resolveJavaOverrideDispatch()
 	ld5 := time.Now()
+	if err := ctx.Err(); err != nil {
+		return resolveError(err)
+	}
 
 	// PHP dispatch resolution: bind ambiguous member/scoped calls the guard
 	// left unresolved via the class hierarchy — parent::/self:: up the extends
@@ -1438,6 +1539,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// every implementation. Same post-guard placement as the Java pass.
 	r.resolvePHPOverrideDispatch()
 	ld6 := time.Now()
+	if err := ctx.Err(); err != nil {
+		return resolveError(err)
+	}
 	// Diagnostic sub-phase breakdown of lang_dispatch_reconcile. Several of
 	// these passes independently EdgesByKind-scan the SAME kind (EdgeImports:
 	// relative_imports, lua_imports, razor_using, module_attribution all scan
@@ -1464,6 +1568,9 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// full pass re-paged ~300k edges that the first pass had already proven
 	// unbindable.
 	if r.stampTerminal && len(r.scope) == 0 {
+		if err := ctx.Err(); err != nil {
+			return resolveError(err)
+		}
 		tailPhase("terminal_stamping")
 		stamped, unstamped := r.reconcileTerminalStampsExcluding(lspResult.terminalityExcluded)
 		if stamped > 0 || unstamped > 0 {
@@ -1520,7 +1627,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	total.LSPBudgetExhausted = lspResult.budgetExhausted
 	total.PendingBefore = pendingBefore
 	total.PendingAfter = pendingAfter
-	return total
+	return total, nil
 }
 
 // filterPendingByScope keeps only the pending edges a scoped ResolveAll must
