@@ -3388,6 +3388,18 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		graphBatch.flush()
 		contentBatch.flush()
 		sidecars.flush()
+
+		// All parse workers have joined, their native trees are released, and
+		// every direct-store graph/content/sidecar batch is durable. Only now
+		// may a large direct SQLite parse return its transient Go high-water;
+		// shadow and streaming parses have no graphBatch and stay untouched.
+		var chunkInputBytes int64
+		for i := range chunkFiles {
+			chunkInputBytes += chunkFiles[i].size
+		}
+		maybeReleaseHeapAfterLargeDirectParse(
+			graphBatch != nil, idx.repoPrefix, len(chunkFiles), chunkInputBytes, idx.logger,
+		)
 	}
 
 	// Dispatch the largest files first. Both dispatch paths below
