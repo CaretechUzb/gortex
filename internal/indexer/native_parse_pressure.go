@@ -12,6 +12,37 @@ import (
 // generated C/C++ corpora.
 const nativeParsePressureThresholdBytes int64 = 64 << 20
 
+// nativeParseAdmissionMultiplier accounts for the measured native syntax-tree
+// expansion that the raw-source semaphore cannot see. The multiplier handles
+// unusually large sources; nativeParseAdmissionWeight also applies a budget
+// floor so small C-family files cannot recreate the same concurrency high-water.
+const nativeParseAdmissionMultiplier int64 = 4
+
+func nativeParseAdmissionWeight(language string, sourceBytes, budget int64) int64 {
+	if sourceBytes <= 0 || !nativeParsePressureLanguage(language) {
+		return sourceBytes
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	weighted := maxInt64
+	if sourceBytes <= maxInt64/nativeParseAdmissionMultiplier {
+		weighted = sourceBytes * nativeParseAdmissionMultiplier
+	}
+	if budget <= 0 {
+		return weighted
+	}
+
+	// A raw-byte multiplier alone becomes ineffective in the small-file tail:
+	// enough individually cheap C-family trees can overlap to rebuild the same
+	// native allocator high-water. Reserving at least half of the active parse
+	// budget caps the process at two live C-family trees, while the multiplier
+	// still makes an unusually large source parse alone.
+	floor := budget/2 + budget%2
+	if weighted < floor {
+		return floor
+	}
+	return weighted
+}
+
 type nativeParsePressureStats struct {
 	calls         int64
 	releasedBytes uint64

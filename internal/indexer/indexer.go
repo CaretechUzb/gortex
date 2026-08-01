@@ -2997,6 +2997,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		localParseSem = semaphore.NewWeighted(localParseBudget)
 	}
 	sharedParseAdmission := idx.parseAdmission.Load()
+	nativeParseBudget := localParseBudget
+	if sharedParseAdmission != nil {
+		nativeParseBudget = sharedParseAdmission.capacity
+	}
 
 	// In addition to the bytes-in-flight budget above, cap how many
 	// genuinely large files are *read* concurrently: a few huge PDFs /
@@ -3110,7 +3114,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// materialising whole files at once.
 					semStart := time.Now()
 					parseLease, aerr := acquireParseAdmission(
-						ctx, wf.size, localParseBudget, localParseSem, sharedParseAdmission,
+						ctx, nativeParseAdmissionWeight(wf.lang, wf.size, nativeParseBudget),
+						localParseBudget, localParseSem, sharedParseAdmission,
 					)
 					if aerr != nil {
 						return

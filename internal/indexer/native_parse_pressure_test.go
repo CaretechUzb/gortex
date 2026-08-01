@@ -45,6 +45,34 @@ func TestNativeParsePressureReliefThresholdAndFlush(t *testing.T) {
 	}
 }
 
+func TestNativeParseAdmissionWeight(t *testing.T) {
+	const (
+		sourceBytes int64 = 1024
+		budget      int64 = 512 << 20
+	)
+	for _, language := range []string{"c", "cpp", "cuda", "objc"} {
+		if got, want := nativeParseAdmissionWeight(language, sourceBytes, budget), budget/2; got != want {
+			t.Errorf("nativeParseAdmissionWeight(%q) = %d, want half-budget floor %d", language, got, want)
+		}
+	}
+	for _, language := range []string{"go", "typescript", ""} {
+		if got := nativeParseAdmissionWeight(language, sourceBytes, budget); got != sourceBytes {
+			t.Errorf("nativeParseAdmissionWeight(%q) = %d, want unchanged %d", language, got, sourceBytes)
+		}
+	}
+	const largeSource int64 = 100 << 20
+	if got, want := nativeParseAdmissionWeight("c", largeSource, budget), largeSource*nativeParseAdmissionMultiplier; got != want {
+		t.Errorf("large native admission weight = %d, want %d", got, want)
+	}
+	if got, want := nativeParseAdmissionWeight("c", sourceBytes, 0), sourceBytes*nativeParseAdmissionMultiplier; got != want {
+		t.Errorf("unbudgeted native admission weight = %d, want %d", got, want)
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if got := nativeParseAdmissionWeight("c", maxInt64, budget); got != maxInt64 {
+		t.Fatalf("overflowing admission weight = %d, want saturation at %d", got, maxInt64)
+	}
+}
+
 func TestNativeParsePressureReliefIgnoresInvalidInputs(t *testing.T) {
 	var releases atomic.Int64
 	r := &nativeParsePressureRelief{
