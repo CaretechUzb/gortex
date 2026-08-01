@@ -42,8 +42,9 @@ type sqliteReindexRow struct {
 }
 
 type sqliteReindexMutation struct {
-	oldKey sqliteReindexKey
-	newRow sqliteReindexRow
+	oldKey             sqliteReindexKey
+	newRow             sqliteReindexRow
+	resolvedConversion bool
 }
 
 type sqliteReindexSetStats struct {
@@ -146,12 +147,15 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	}()
 	receipt = s.prepareSQLiteReindexReceiptTx(tx, batch)
 
-	initial, selectStatements, err := sqliteReindexRowsTxLimited(tx, keys, &variableLimit)
-	if err != nil {
-		return stats, false, false, nil, err
+	deletes, inserts, resolvedConversionFastPath := sqliteResolvedConversionSet(mutations)
+	if !resolvedConversionFastPath {
+		initial, selectStatements, selectErr := sqliteReindexRowsTxLimited(tx, keys, &variableLimit)
+		if selectErr != nil {
+			return stats, false, false, nil, selectErr
+		}
+		stats.selectStatements = selectStatements
+		deletes, inserts = simulateSQLiteReindexSet(initial, keys, mutations)
 	}
-	stats.selectStatements = selectStatements
-	deletes, inserts := simulateSQLiteReindexSet(initial, keys, mutations)
 
 	stats.deletedRows, stats.deleteStatements, err = deleteSQLiteReindexRowsTxLimited(tx, deletes, &variableLimit)
 	if err != nil {
@@ -161,12 +165,15 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	if err != nil {
 		return stats, false, false, nil, err
 	}
-	if stats.insertedRows != len(inserts) {
+	if !resolvedConversionFastPath && stats.insertedRows != len(inserts) {
 		return stats, false, false, nil, fmt.Errorf(
 			"store_sqlite: set reindex inserted %d of %d simulated rows",
 			stats.insertedRows, len(inserts),
 		)
 	}
+	// The fast path deliberately submits every converging destination row.
+	// INSERT OR IGNORE collisions are part of its proven first-wins semantics;
+	// all destinations are resolved, so ignored rows cannot affect receipts.
 	changed = stats.deletedRows > 0 || stats.insertedRows > 0
 	if changed && s.analysisGenerationPresent {
 		if err := invalidateAnalysisGenerationTx(tx); err != nil {
@@ -223,11 +230,50 @@ func sqliteReindexMutations(batch []graph.EdgeReindex) ([]sqliteReindexMutation,
 			fromID: oldFrom, toID: reindex.OldTo, kind: string(oldKind),
 			filePath: oldFilePath, line: oldLine,
 		}
-		mutations = append(mutations, sqliteReindexMutation{oldKey: oldKey, newRow: newRow})
+		mutations = append(mutations, sqliteReindexMutation{
+			oldKey: oldKey,
+			newRow: newRow,
+			resolvedConversion: !reindex.RefreshIdentity &&
+				graph.IsUnresolvedTarget(oldKey.toID) &&
+				!graph.IsUnresolvedTarget(newRow.key.toID),
+		})
 		addKey(oldKey)
 		addKey(newRow.key)
 	}
 	return mutations, keys, nil
+}
+
+// sqliteResolvedConversionSet recognizes the dominant full-resolve mutation
+// shape. Every old identity is in the unresolved target namespace and every
+// new identity is outside it, so the old and new key domains are disjoint.
+// Ordered set simulation therefore reduces exactly to deleting each old key
+// once and INSERT OR IGNORE-ing new rows in input order: existing destinations
+// win, and the first of several converging candidates wins. Mixed, refresh, and
+// unresolved-destination batches retain the generic prefetch + simulation path.
+func sqliteResolvedConversionSet(mutations []sqliteReindexMutation) (
+	deletes []sqliteReindexKey,
+	inserts []sqliteReindexRow,
+	ok bool,
+) {
+	if len(mutations) == 0 {
+		return nil, nil, false
+	}
+	seenOld := make(map[sqliteReindexKey]struct{}, len(mutations))
+	deletes = make([]sqliteReindexKey, 0, len(mutations))
+	inserts = make([]sqliteReindexRow, 0, len(mutations))
+	for _, mutation := range mutations {
+		if !mutation.resolvedConversion {
+			return nil, nil, false
+		}
+		if _, seen := seenOld[mutation.oldKey]; !seen {
+			seenOld[mutation.oldKey] = struct{}{}
+			deletes = append(deletes, mutation.oldKey)
+		}
+		// Do not deduplicate destinations: INSERT OR IGNORE preserves the
+		// generic simulator's input-order, first-candidate-wins contract.
+		inserts = append(inserts, mutation.newRow)
+	}
+	return deletes, inserts, true
 }
 
 func sqliteReindexRowForEdge(edge *graph.Edge) (sqliteReindexRow, error) {

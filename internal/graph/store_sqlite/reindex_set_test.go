@@ -237,9 +237,9 @@ func TestReindexEdgesUsesRuntimeVariableBudget(t *testing.T) {
 
 			stats, err := store.reindexEdgesSetOriented(batch)
 			require.NoError(t, err)
-			keyRows := batchRowsForVariableLimit(variableLimit, reindexKeyParamsPerRow, edgeCount*2)
+			keyRows := batchRowsForVariableLimit(variableLimit, reindexKeyParamsPerRow, edgeCount)
 			insertRows := batchRowsForVariableLimit(variableLimit, reindexRowParamsPerRow, reindexRowMaxChunkSize)
-			assert.Equal(t, (edgeCount*2+keyRows-1)/keyRows, stats.selectStatements)
+			assert.Zero(t, stats.selectStatements, "resolved conversions must not prefetch full edge rows")
 			assert.Equal(t, (edgeCount+keyRows-1)/keyRows, stats.deleteStatements)
 			assert.Equal(t, (edgeCount+insertRows-1)/insertRows, stats.insertStatements)
 			assert.Equal(t, edgeCount, stats.deletedRows)
@@ -307,7 +307,8 @@ func TestReindexEdgesDownshiftsConnectionVariableLimit(t *testing.T) {
 	assert.Equal(t, len(batch), stats.deletedRows)
 	assert.Equal(t, len(batch), stats.insertedRows)
 	assert.LessOrEqual(t, store.batchVariableLimit, connectionLimit)
-	assert.Greater(t, stats.selectStatements, 1, "the first oversized prepare must downshift and retry")
+	assert.Zero(t, stats.selectStatements, "resolved conversions must not prefetch full edge rows")
+	assert.Greater(t, stats.deleteStatements, 1, "the first oversized delete must downshift and retry")
 	assert.Equal(t, len(batch), store.EdgeCount())
 }
 
@@ -347,4 +348,133 @@ func TestReindexEdgesProbesVariableLimitBeforeWriterCheckout(t *testing.T) {
 		t.Fatal("ReindexEdges waited for its own writer connection while probing SQLite limits")
 	}
 	assert.Positive(t, store.batchVariableLimit)
+}
+
+func TestReindexEdgesResolvedConversionFastPathPreservesSetSemantics(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	const (
+		fromID          = "repo/caller.go::Caller"
+		filePath        = "repo/caller.go"
+		sharedTarget    = "repo/shared.go::Target"
+		existingTarget  = "repo/existing.go::Target"
+		firstOldTarget  = "unresolved::First"
+		secondOldTarget = "unresolved::Second"
+		thirdOldTarget  = "unresolved::Third"
+	)
+	oldEdges := []*graph.Edge{
+		{From: fromID, To: firstOldTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 7, Origin: "old-first"},
+		{From: fromID, To: secondOldTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 7, Origin: "old-second"},
+		{From: fromID, To: thirdOldTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 8, Origin: "old-third"},
+		{From: fromID, To: existingTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 8, Origin: "existing"},
+	}
+	store.AddBatch(nil, oldEdges)
+	buildMinimalAnalysisGeneration(t, store, "resolved-conversion-fast-path", 0, true)
+	beforeRevision := store.AnalysisMutationRevision()
+
+	batch := []graph.EdgeReindex{
+		{OldTo: firstOldTarget, Edge: &graph.Edge{
+			From: fromID, To: sharedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 7,
+			Confidence: 0.9, ConfidenceLabel: "confirmed", Origin: "first", Tier: "semantic",
+			Meta: map[string]any{"winner": "first"},
+		}},
+		{OldTo: secondOldTarget, Edge: &graph.Edge{
+			From: fromID, To: sharedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 7,
+			Confidence: 0.4, ConfidenceLabel: "heuristic", Origin: "second", Tier: "syntax",
+			Meta: map[string]any{"winner": "second"},
+		}},
+		{OldTo: thirdOldTarget, Edge: &graph.Edge{
+			From: fromID, To: existingTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 8,
+			Confidence: 1, ConfidenceLabel: "confirmed", Origin: "replacement", Tier: "compiler",
+		}},
+	}
+
+	token := store.BeginMutationReceipt()
+	stats, err := store.reindexEdgesSetOriented(batch)
+	require.NoError(t, err)
+	receipt := store.EndMutationReceipt(token)
+	assert.Zero(t, stats.selectStatements, "resolved conversions must not prefetch full edge rows")
+	assert.Equal(t, 1, stats.deleteStatements)
+	assert.Equal(t, 1, stats.insertStatements)
+	assert.Equal(t, len(batch), stats.deletedRows)
+	assert.Equal(t, 1, stats.insertedRows, "one duplicate and one existing destination must be ignored")
+	assert.Equal(t, beforeRevision+1, store.AnalysisMutationRevision())
+	assert.True(t, receipt.Complete)
+	assert.False(t, receipt.ResolutionRelevant, "resolved destinations cannot create pending resolver work")
+
+	persisted := store.GetOutEdges(fromID)
+	require.Len(t, persisted, 2)
+	byTarget := make(map[string]*graph.Edge, len(persisted))
+	for _, edge := range persisted {
+		byTarget[edge.To] = edge
+	}
+	shared := byTarget[sharedTarget]
+	require.NotNil(t, shared)
+	assert.Equal(t, "first", shared.Origin, "input order must preserve first-candidate-wins semantics")
+	assert.Equal(t, "semantic", shared.Tier)
+	assert.Equal(t, "first", shared.Meta["winner"])
+	existing := byTarget[existingTarget]
+	require.NotNil(t, existing)
+	assert.Equal(t, "existing", existing.Origin, "a pre-existing destination must win over a conversion")
+
+	buildMinimalAnalysisGeneration(t, store, "resolved-conversion-replay", 0, true)
+	replayRevision := store.AnalysisMutationRevision()
+	token = store.BeginMutationReceipt()
+	replayStats, err := store.reindexEdgesSetOriented(batch)
+	require.NoError(t, err)
+	replayReceipt := store.EndMutationReceipt(token)
+	assert.Zero(t, replayStats.selectStatements)
+	assert.Zero(t, replayStats.deletedRows)
+	assert.Zero(t, replayStats.insertedRows)
+	assert.Equal(t, replayRevision, store.AnalysisMutationRevision(), "an idempotent replay must not invalidate analysis")
+	assert.True(t, replayReceipt.Complete)
+	assert.False(t, replayReceipt.ResolutionRelevant)
+	_, found, err := store.LoadActiveAnalysisHeader(77)
+	require.NoError(t, err)
+	assert.True(t, found, "an idempotent replay must preserve active warm analysis")
+}
+
+func BenchmarkReindexEdgesResolvedConversions50K(b *testing.B) {
+	const edgeCount = 50_000
+	b.StopTimer()
+	oldEdges := make([]*graph.Edge, 0, edgeCount)
+	batch := make([]graph.EdgeReindex, 0, edgeCount)
+	for i := 0; i < edgeCount; i++ {
+		from := fmt.Sprintf("repo/caller-%05d.go::Caller", i)
+		oldTo := fmt.Sprintf("unresolved::Target%05d", i)
+		oldEdges = append(oldEdges, &graph.Edge{
+			From: from, To: oldTo, Kind: graph.EdgeCalls,
+			FilePath: "repo/callers.go", Line: i + 1,
+		})
+		batch = append(batch, graph.EdgeReindex{
+			OldTo: oldTo,
+			Edge: &graph.Edge{
+				From: from, To: fmt.Sprintf("repo/target-%05d.go::Target", i),
+				Kind: graph.EdgeCalls, FilePath: "repo/callers.go", Line: i + 1,
+			},
+		})
+	}
+	b.ReportAllocs()
+	b.ReportMetric(edgeCount, "edges/op")
+	benchDir := b.TempDir()
+	for i := 0; i < b.N; i++ {
+		store, err := Open(filepath.Join(benchDir, fmt.Sprintf("graph-%d.sqlite", i)))
+		if err != nil {
+			b.Fatal(err)
+		}
+		store.AddBatch(nil, oldEdges)
+		b.StartTimer()
+		stats, err := store.reindexEdgesSetOriented(batch)
+		b.StopTimer()
+		if err != nil {
+			_ = store.Close()
+			b.Fatal(err)
+		}
+		if stats.selectStatements != 0 || stats.deletedRows != edgeCount || stats.insertedRows != edgeCount {
+			_ = store.Close()
+			b.Fatalf("unexpected fast-path stats: %+v", stats)
+		}
+		if err := store.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
