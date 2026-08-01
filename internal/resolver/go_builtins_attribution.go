@@ -210,11 +210,21 @@ func tryAttributeGoBuiltin(e *graph.Edge, sourceNodes map[string]*graph.Node, ma
 	if !strings.HasSuffix(e.FilePath, ".go") && !sourceIsGo(e.From, sourceNodes) {
 		return ""
 	}
+	// Builtins are repository-owned synthetic nodes. Carry the same boundary
+	// identity as their source so a file-scoped resolve cannot overwrite a
+	// previously stamped builtin with empty workspace/project columns. That
+	// empty rewrite made warm-start backfill repeat on every changed Go file.
+	boundarySource := sourceNodes[e.From]
+	if boundarySource == nil {
+		boundarySource = sourceNodes[enclosingFunctionForBinding(e.From)]
+	}
 	repoPrefix := ""
-	if fromNode := sourceNodes[e.From]; fromNode != nil {
-		repoPrefix = fromNode.RepoPrefix
-	} else if owner := sourceNodes[enclosingFunctionForBinding(e.From)]; owner != nil {
-		repoPrefix = owner.RepoPrefix
+	workspaceID := ""
+	projectID := ""
+	if boundarySource != nil {
+		repoPrefix = boundarySource.RepoPrefix
+		workspaceID = boundarySource.WorkspaceID
+		projectID = boundarySource.ProjectID
 	}
 	newID, kind, builtinKind := goBuiltinTarget(repoPrefix, name)
 	if newID == "" {
@@ -222,11 +232,13 @@ func tryAttributeGoBuiltin(e *graph.Edge, sourceNodes map[string]*graph.Node, ma
 	}
 	if _, ok := materialised[newID]; !ok {
 		materialised[newID] = &graph.Node{
-			ID:         newID,
-			Kind:       kind,
-			Name:       name,
-			Language:   "go",
-			RepoPrefix: repoPrefix,
+			ID:          newID,
+			Kind:        kind,
+			Name:        name,
+			Language:    "go",
+			RepoPrefix:  repoPrefix,
+			WorkspaceID: workspaceID,
+			ProjectID:   projectID,
 			Meta: map[string]any{
 				"builtin":      true,
 				"builtin_kind": builtinKind,

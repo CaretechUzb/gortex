@@ -75,7 +75,10 @@ func TestAttributeGoBuiltins_Type(t *testing.T) {
 func TestAttributeGoBuiltinsUsesEnclosingOwnerRepo(t *testing.T) {
 	g := graph.New()
 	owner := "pkg/foo.go::Handler"
-	g.AddNode(&graph.Node{ID: owner, Kind: graph.KindFunction, Name: "Handler", FilePath: "pkg/foo.go", Language: "go", RepoPrefix: "repo"})
+	g.AddNode(&graph.Node{
+		ID: owner, Kind: graph.KindFunction, Name: "Handler", FilePath: "pkg/foo.go",
+		Language: "go", RepoPrefix: "repo", WorkspaceID: "workspace", ProjectID: "project",
+	})
 	edge := &graph.Edge{From: owner + "#param:synthetic", To: "unresolved::len", Kind: graph.EdgeArgOf, Line: 1}
 	g.AddEdge(edge)
 
@@ -85,6 +88,8 @@ func TestAttributeGoBuiltinsUsesEnclosingOwnerRepo(t *testing.T) {
 	n := g.GetNode(edge.To)
 	require.NotNil(t, n)
 	assert.Equal(t, "repo", n.RepoPrefix, "per-repo builtin node must participate in purge/scoping")
+	assert.Equal(t, "workspace", n.WorkspaceID, "builtin must inherit the source workspace boundary")
+	assert.Equal(t, "project", n.ProjectID, "builtin must inherit the source project boundary")
 }
 
 func TestAttributeGoBuiltins_DedupedAcrossManyEdges(t *testing.T) {
