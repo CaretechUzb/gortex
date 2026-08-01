@@ -1094,7 +1094,7 @@ func RunFrameworkSynthesizers(g graph.Store) FrameworkSynthReport {
 // passes use the changed repositories plus their exact reverse dependency
 // frontier; nil scope retains full/cold whole-graph reconciliation.
 func RunFrameworkSynthesizersScoped(g graph.Store, scope map[string]bool) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, nil, false)
+	return runFrameworkSynthesizersScoped(g, scope, nil, false, true)
 }
 
 // RunFrameworkSynthesizersScopedWithCensus is the full-coverage batch form:
@@ -1108,7 +1108,7 @@ func RunFrameworkSynthesizersScopedWithCensus(
 	scope map[string]bool,
 	censusEligible bool,
 ) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, nil, censusEligible)
+	return runFrameworkSynthesizersScoped(g, scope, nil, censusEligible, true)
 }
 
 // RunFrameworkSynthesizersScopedForFiles is the exact incremental form. The
@@ -1119,8 +1119,9 @@ func RunFrameworkSynthesizersScopedForFiles(
 	g graph.Store,
 	scope map[string]bool,
 	filePaths []string,
+	csharpHierarchyChanged bool,
 ) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, filePaths, false)
+	return runFrameworkSynthesizersScoped(g, scope, filePaths, false, csharpHierarchyChanged)
 }
 
 func runFrameworkSynthesizersScoped(
@@ -1128,6 +1129,7 @@ func runFrameworkSynthesizersScoped(
 	scope map[string]bool,
 	filePaths []string,
 	censusEligible bool,
+	csharpHierarchyChanged bool,
 ) FrameworkSynthReport {
 	rep := FrameworkSynthReport{}
 	if g == nil {
@@ -1216,7 +1218,9 @@ func runFrameworkSynthesizersScoped(
 	// member calls, so it must see the settled call graph.
 	demoteStart := time.Now()
 	if frameworkReceiverGateNeeded(executionScope, candidates) {
-		rep.ReceiverGated = demoteCSharpMisattributedMemberCallsScoped(g, executionScope)
+		rep.ReceiverGated = demoteCSharpMisattributedMemberCallsScopedForFiles(
+			g, executionScope, filePaths, csharpHierarchyChanged,
+		)
 	}
 	rep.DemoteMillis = time.Since(demoteStart).Milliseconds()
 	return rep

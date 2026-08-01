@@ -292,6 +292,7 @@ func TestRunFrameworkSynthesizersScopedForFilesHasNoLegacyGlobalFallback(t *test
 		trap,
 		map[string]bool{"a": true},
 		[]string{"a/main.go"},
+		false,
 	)
 
 	requireNoFrameworkGlobalScans(t, trap)

@@ -192,7 +192,9 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 	if merged.Flags.Has(DerivedInvalidatesDeclarations) ||
 		merged.Flags.Has(DerivedInvalidatesImports) ||
 		merged.Flags.Has(DerivedInvalidatesRuntime) {
-		framework := resolver.RunFrameworkSynthesizersScopedForFiles(mi.graph, scopedPrefixes, merged.Files)
+		framework := resolver.RunFrameworkSynthesizersScopedForFiles(
+			mi.graph, scopedPrefixes, merged.Files, merged.CSharpHierarchyChanged,
+		)
 		report.Framework = framework.Total
 		report.ExternalCalls = resolver.SynthesizeExternalCallsForFiles(
 			mi.graph, mi.externalCallSynthesisEnabled(), merged.Files,

@@ -238,6 +238,93 @@ func TestCSharpReceiverGateScopedMatchesFullAndBatchesMutation(t *testing.T) {
 	require.Equal(t, 1, counting.reindexEdges)
 }
 
+func addExactReceiverGateCall(
+	g *graph.Graph,
+	callerRepo, targetRepo, receiver, targetReceiver string,
+) (caller, target, callerFile, targetFile, receiverType, targetType string) {
+	callerFile = callerRepo + "/Caller.cs"
+	targetFile = targetRepo + "/Target.cs"
+	caller = callerRepo + "::Caller.Run"
+	target = targetRepo + "::" + targetReceiver + ".Do"
+	receiverType = callerRepo + "::" + receiver
+	targetType = targetRepo + "::" + targetReceiver
+	g.AddBatch([]*graph.Node{
+		{ID: caller, Kind: graph.KindMethod, Name: "Run", FilePath: callerFile, Language: "csharp", RepoPrefix: callerRepo, Meta: map[string]any{"receiver": "Caller"}},
+		{ID: target, Kind: graph.KindMethod, Name: "Do", FilePath: targetFile, Language: "csharp", RepoPrefix: targetRepo, Meta: map[string]any{"receiver": targetReceiver}},
+		{ID: receiverType, Kind: graph.KindType, Name: receiver, FilePath: callerRepo + "/Types.cs", Language: "csharp", RepoPrefix: callerRepo},
+		{ID: targetType, Kind: graph.KindType, Name: targetReceiver, FilePath: targetRepo + "/Types.cs", Language: "csharp", RepoPrefix: targetRepo},
+	}, []*graph.Edge{{
+		From: caller, To: target, Kind: graph.EdgeCalls, FilePath: callerFile,
+		Origin: graph.OriginTextMatched, Meta: map[string]any{"receiver_type": receiver},
+	}})
+	return caller, target, callerFile, targetFile, receiverType, targetType
+}
+
+func TestCSharpReceiverGateForFilesUsesExactSourceFrontier(t *testing.T) {
+	g := graph.New()
+	caller, target, callerFile, _, _, _ := addExactReceiverGateCall(g, "changed", "changed", "Receiver", "Other")
+	counting := &frameworkTailCountingStore{Store: g}
+
+	require.Equal(t, 1, demoteCSharpMisattributedMemberCallsScopedForFiles(
+		counting, map[string]bool{"changed": true}, []string{callerFile}, false,
+	))
+	require.True(t, findCallEdge(g, caller, target).IsSpeculative())
+	require.Zero(t, counting.repoEdgesByKinds)
+	require.Zero(t, counting.repoNodeIDsByKind)
+}
+
+func TestCSharpReceiverGateForFilesIncludesIncomingChangedMethodCalls(t *testing.T) {
+	g := graph.New()
+	caller, target, _, targetFile, _, _ := addExactReceiverGateCall(g, "caller", "changed", "Receiver", "Other")
+	counting := &frameworkTailCountingStore{Store: g}
+
+	require.Equal(t, 1, demoteCSharpMisattributedMemberCallsScopedForFiles(
+		counting, map[string]bool{"changed": true}, []string{targetFile}, false,
+	))
+	require.True(t, findCallEdge(g, caller, target).IsSpeculative())
+	require.Zero(t, counting.repoEdgesByKinds)
+	require.Zero(t, counting.repoNodeIDsByKind)
+}
+
+func TestCSharpReceiverGateForFilesWalksExactTransitiveHierarchy(t *testing.T) {
+	g := graph.New()
+	caller, target, callerFile, _, receiverType, targetType := addExactReceiverGateCall(g, "changed", "changed", "Derived", "Base")
+	middle := "changed::Middle"
+	g.AddNode(&graph.Node{ID: middle, Kind: graph.KindType, Name: "Middle", FilePath: "changed/Types.cs", Language: "csharp", RepoPrefix: "changed"})
+	g.AddBatch(nil, []*graph.Edge{
+		{From: receiverType, To: middle, Kind: graph.EdgeExtends},
+		{From: middle, To: targetType, Kind: graph.EdgeExtends},
+	})
+
+	require.Zero(t, demoteCSharpMisattributedMemberCallsScopedForFiles(
+		g, map[string]bool{"changed": true}, []string{callerFile}, false,
+	))
+	require.False(t, findCallEdge(g, caller, target).IsSpeculative())
+}
+
+func TestCSharpReceiverGateForFilesKeepsIncompleteHierarchy(t *testing.T) {
+	g := graph.New()
+	caller, target, callerFile, _, receiverType, _ := addExactReceiverGateCall(g, "changed", "changed", "Derived", "Other")
+	g.AddEdge(&graph.Edge{From: receiverType, To: "unresolved::ExternalBase", Kind: graph.EdgeExtends})
+
+	require.Zero(t, demoteCSharpMisattributedMemberCallsScopedForFiles(
+		g, map[string]bool{"changed": true}, []string{callerFile}, false,
+	))
+	require.False(t, findCallEdge(g, caller, target).IsSpeculative())
+}
+
+func TestCSharpReceiverGateForFilesFallsBackForHierarchyChanges(t *testing.T) {
+	g := graph.New()
+	_, _, callerFile, _, _, _ := addExactReceiverGateCall(g, "changed", "changed", "Receiver", "Other")
+	counting := &frameworkTailCountingStore{Store: g}
+
+	require.Equal(t, 1, demoteCSharpMisattributedMemberCallsScopedForFiles(
+		counting, map[string]bool{"changed": true}, []string{callerFile}, true,
+	))
+	require.Positive(t, counting.repoEdgesByKinds)
+	require.Positive(t, counting.repoNodeIDsByKind)
+}
+
 func TestFrameworkFamilyGateScopedDeletesExactChangedEdgesInOneBatch(t *testing.T) {
 	g := graph.New()
 	for _, repo := range []string{"changed", "untouched"} {

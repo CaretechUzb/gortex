@@ -35,8 +35,35 @@ func demoteCSharpMisattributedMemberCallsScoped(g graph.Store, scope map[string]
 	if g == nil {
 		return 0
 	}
-	calls := frameworkCallsForScope(g, scope)
-	if len(calls) == 0 {
+	return demoteCSharpMisattributedMemberCallCandidates(
+		g, frameworkCallsForScope(g, scope), scope, false,
+	)
+}
+
+func demoteCSharpMisattributedMemberCallsScopedForFiles(
+	g graph.Store,
+	scope map[string]bool,
+	filePaths []string,
+	csharpHierarchyChanged bool,
+) int {
+	if g == nil {
+		return 0
+	}
+	if len(filePaths) == 0 || csharpHierarchyChanged {
+		return demoteCSharpMisattributedMemberCallsScoped(g, scope)
+	}
+	return demoteCSharpMisattributedMemberCallCandidates(
+		g, csharpCallCandidatesForFiles(g, scope, filePaths), scope, true,
+	)
+}
+
+func demoteCSharpMisattributedMemberCallCandidates(
+	g graph.Store,
+	calls []*graph.Edge,
+	scope map[string]bool,
+	exactHierarchy bool,
+) int {
+	if g == nil || len(calls) == 0 {
 		return 0
 	}
 	endpointIDs := make([]string, 0, len(calls)*2)
@@ -69,6 +96,7 @@ func demoteCSharpMisattributedMemberCallsScoped(g graph.Store, scope map[string]
 	byName := g.FindNodesByNames(typeNames)
 	nameToTypeIDs := map[string][]string{}
 	hierarchyRepos := map[string]bool{}
+	hierarchyRoots := make([]*graph.Node, 0)
 	for name, matches := range byName {
 		for _, node := range matches {
 			if node == nil || node.Language != "csharp" ||
@@ -77,33 +105,44 @@ func demoteCSharpMisattributedMemberCallsScoped(g graph.Store, scope map[string]
 			}
 			nameToTypeIDs[name] = append(nameToTypeIDs[name], node.ID)
 			hierarchyRepos[node.RepoPrefix] = true
+			hierarchyRoots = append(hierarchyRoots, node)
 		}
 	}
 	if len(nameToTypeIDs) == 0 {
 		return 0
 	}
-	hierarchyEdges := frameworkRepoEdges(
-		g,
-		func() map[string]bool {
-			if scope == nil {
-				return nil
-			}
-			return hierarchyRepos
-		}(),
-		graph.EdgeExtends,
-		graph.EdgeImplements,
-	)
-	hierarchyNodeIDs := make([]string, 0, len(hierarchyEdges)*2)
-	for _, edge := range hierarchyEdges {
-		if edge != nil {
-			hierarchyNodeIDs = append(hierarchyNodeIDs, edge.From)
-			if !graph.IsUnresolvedTarget(edge.To) {
-				hierarchyNodeIDs = append(hierarchyNodeIDs, edge.To)
+
+	var hierarchyEdges []*graph.Edge
+	if exactHierarchy {
+		var hierarchyNodes map[string]*graph.Node
+		hierarchyEdges, hierarchyNodes = csharpHierarchyClosure(g, hierarchyRoots)
+		for id, node := range hierarchyNodes {
+			nodes[id] = node
+		}
+	} else {
+		hierarchyEdges = frameworkRepoEdges(
+			g,
+			func() map[string]bool {
+				if scope == nil {
+					return nil
+				}
+				return hierarchyRepos
+			}(),
+			graph.EdgeExtends,
+			graph.EdgeImplements,
+		)
+		hierarchyNodeIDs := make([]string, 0, len(hierarchyEdges)*2)
+		for _, edge := range hierarchyEdges {
+			if edge != nil {
+				hierarchyNodeIDs = append(hierarchyNodeIDs, edge.From)
+				if !graph.IsUnresolvedTarget(edge.To) {
+					hierarchyNodeIDs = append(hierarchyNodeIDs, edge.To)
+				}
 			}
 		}
-	}
-	for id, node := range g.GetNodesByIDs(hierarchyNodeIDs) {
-		nodes[id] = node
+		for id, node := range g.GetNodesByIDs(hierarchyNodeIDs) {
+			nodes[id] = node
+		}
 	}
 
 	up := map[string][]string{}
@@ -145,6 +184,111 @@ func demoteCSharpMisattributedMemberCallsScoped(g graph.Store, scope map[string]
 		g.ReindexEdges(reindex)
 	}
 	return len(reindex)
+}
+
+func csharpCallCandidatesForFiles(g graph.Store, scope map[string]bool, filePaths []string) []*graph.Edge {
+	prefixes := frameworkScopePrefixes(scope)
+	seen := make(map[graph.EdgeIdentity]struct{})
+	var projected []*graph.Edge
+	for row := range graph.EdgesInScopeSeq(g, prefixes, filePaths, graph.EdgeCalls) {
+		projected = appendUniqueFrameworkEdges(projected, seen, row.Edge)
+	}
+
+	methodIDs := make([]string, 0)
+	for node := range graph.NodesInScopeSeq(g, prefixes, filePaths, graph.KindMethod) {
+		if node != nil {
+			methodIDs = append(methodIDs, node.ID)
+		}
+	}
+	incoming := g.GetInEdgesByNodeIDs(methodIDs)
+	for _, methodID := range methodIDs {
+		for _, edge := range incoming[methodID] {
+			if edge != nil && edge.Kind == graph.EdgeCalls {
+				projected = appendUniqueFrameworkEdges(projected, seen, edge)
+			}
+		}
+	}
+
+	identities := make([]graph.EdgeIdentity, 0, len(projected))
+	for _, edge := range projected {
+		identities = append(identities, graph.EdgeIdentityFor(edge))
+	}
+	current := findFrameworkEdgesByIdentities(g, identities)
+	calls := make([]*graph.Edge, 0, len(identities))
+	for _, identity := range identities {
+		if edge := current[identity]; edge != nil && edge.Kind == graph.EdgeCalls {
+			calls = append(calls, edge)
+		}
+	}
+	return calls
+}
+
+func csharpHierarchyClosure(g graph.Store, roots []*graph.Node) ([]*graph.Edge, map[string]*graph.Node) {
+	nodes := make(map[string]*graph.Node, len(roots))
+	seenNodes := make(map[string]struct{}, len(roots))
+	queue := make([]string, 0, len(roots))
+	for _, node := range roots {
+		if node == nil || node.ID == "" {
+			continue
+		}
+		if _, duplicate := seenNodes[node.ID]; duplicate {
+			continue
+		}
+		seenNodes[node.ID] = struct{}{}
+		nodes[node.ID] = node
+		queue = append(queue, node.ID)
+	}
+
+	seenEdges := make(map[graph.EdgeIdentity]struct{})
+	var edges []*graph.Edge
+	for len(queue) > 0 {
+		batch := queue
+		queue = nil
+		bySource := g.GetOutEdgesByNodeIDs(batch)
+		targetIDs := make([]string, 0)
+		requestedTargets := make(map[string]struct{})
+		for _, sourceID := range batch {
+			for _, edge := range bySource[sourceID] {
+				if edge == nil || (edge.Kind != graph.EdgeExtends && edge.Kind != graph.EdgeImplements) {
+					continue
+				}
+				identity := graph.EdgeIdentityFor(edge)
+				if _, duplicate := seenEdges[identity]; !duplicate {
+					seenEdges[identity] = struct{}{}
+					edges = append(edges, edge)
+				}
+				if edge.To == "" || graph.IsUnresolvedTarget(edge.To) {
+					continue
+				}
+				if _, visited := seenNodes[edge.To]; visited {
+					continue
+				}
+				if _, requested := requestedTargets[edge.To]; requested {
+					continue
+				}
+				requestedTargets[edge.To] = struct{}{}
+				targetIDs = append(targetIDs, edge.To)
+			}
+		}
+		if len(targetIDs) == 0 {
+			continue
+		}
+		fetched := g.GetNodesByIDs(targetIDs)
+		for _, targetID := range targetIDs {
+			node := fetched[targetID]
+			if node == nil || node.Language != "csharp" ||
+				(node.Kind != graph.KindType && node.Kind != graph.KindInterface) {
+				continue
+			}
+			if _, visited := seenNodes[targetID]; visited {
+				continue
+			}
+			seenNodes[targetID] = struct{}{}
+			nodes[targetID] = node
+			queue = append(queue, targetID)
+		}
+	}
+	return edges, nodes
 }
 
 // csharpShouldDemote reports whether a resolved C# member-call edge is a
