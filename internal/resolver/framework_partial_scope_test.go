@@ -106,7 +106,11 @@ func addDjangoRepo(g *graph.Graph, repo string, count int) {
 		methodID := fmt.Sprintf("%s::query.py::QuerySet.iterator%d", repo, i)
 		g.AddNode(&graph.Node{ID: methodID, Kind: graph.KindMethod, Name: "iterator", FilePath: repo + "/query.py", Language: "python", RepoPrefix: repo,
 			Meta: map[string]any{"receiver": "QuerySet"}})
-		g.AddEdge(&graph.Edge{From: methodID, To: "unresolved::*._iterable_class", Kind: graph.EdgeCalls, FilePath: repo + "/query.py", Line: i + 1})
+		target := "unresolved::*._iterable_class"
+		if i%2 != 0 {
+			target = repo + "::" + target
+		}
+		g.AddEdge(&graph.Edge{From: methodID, To: target, Kind: graph.EdgeCalls, FilePath: repo + "/query.py", Line: i + 1})
 	}
 }
 
@@ -122,7 +126,8 @@ func TestRunClaimingResolversScopedBatchesAndBoundsRepoFrontier(t *testing.T) {
 	require.Zero(t, counting.findByName, "no per-edge name lookup")
 	require.Equal(t, 2, counting.findByNames, "one admission probe + one batch bind")
 	require.Equal(t, 1, counting.reindexEdges)
-	require.Equal(t, 1, counting.repoEdgesByKinds)
+	require.Equal(t, 1, counting.getInEdgesByIDs, "one indexed reverse-vocabulary lookup")
+	require.Zero(t, counting.repoEdgesByKinds, "scoped claiming must not scan repository edge kinds")
 
 	untouched := 0
 	for edge := range g.EdgesByKind(graph.EdgeCalls) {

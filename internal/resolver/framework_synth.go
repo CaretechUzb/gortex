@@ -1299,10 +1299,21 @@ type claimTargetVocabulary interface {
 	AdmitsTarget(n *graph.Node) bool
 }
 
+// claimEdgeVocabulary enumerates the exact unresolved names a resolver can
+// claim. Scoped runs use these names for reverse-index lookups instead of
+// decoding every call/reference edge in each changed repository.
+type claimEdgeVocabulary interface {
+	ClaimedUnresolvedNames() []string
+}
+
 // RequiredTargetNames: a Django descriptor claim binds only to an indexed
 // __iter__ method; without one, ResolveBatch resolves nothing.
 func (DjangoDescriptorResolver) RequiredTargetNames() []string {
 	return []string{"__iter__"}
+}
+
+func (DjangoDescriptorResolver) ClaimedUnresolvedNames() []string {
+	return []string{"_iterable_class", "*._iterable_class"}
 }
 
 // AdmitsTarget reports whether an __iter__ candidate has the method shape
@@ -1328,6 +1339,104 @@ func claimingResolverAdmissible(g graph.Store, r ClaimingResolver) bool {
 			if n != nil && vocab.AdmitsTarget(n) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func scopedClaimingCandidates(g graph.Store, scope map[string]bool, resolvers []ClaimingResolver) []*graph.Edge {
+	if scope == nil {
+		return unresolvedClaimingCandidates(g, scope)
+	}
+
+	names := make([]string, 0, len(resolvers))
+	seenNames := make(map[string]struct{}, len(resolvers))
+	for _, resolver := range resolvers {
+		vocabulary, ok := resolver.(claimEdgeVocabulary)
+		if !ok {
+			return unresolvedClaimingCandidates(g, scope)
+		}
+		for _, name := range vocabulary.ClaimedUnresolvedNames() {
+			if name == "" {
+				continue
+			}
+			if _, duplicate := seenNames[name]; duplicate {
+				continue
+			}
+			seenNames[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+
+	prefixes := frameworkScopePrefixes(scope)
+	targetIDs := make([]string, 0, len(names)*(len(prefixes)+1))
+	for _, name := range names {
+		targetIDs = append(targetIDs, graph.UnresolvedMarker+name)
+		for _, prefix := range prefixes {
+			targetIDs = append(targetIDs, prefix+"::"+graph.UnresolvedMarker+name)
+		}
+	}
+
+	incoming := g.GetInEdgesByNodeIDs(targetIDs)
+	identities := make([]graph.EdgeIdentity, 0)
+	seen := make(map[graph.EdgeIdentity]struct{})
+	for _, targetID := range targetIDs {
+		for _, edge := range incoming[targetID] {
+			if !claimingCandidateInScope(edge, scope, resolvers) {
+				continue
+			}
+			identity := graph.EdgeIdentityFor(edge)
+			if _, duplicate := seen[identity]; duplicate {
+				continue
+			}
+			seen[identity] = struct{}{}
+			identities = append(identities, identity)
+		}
+	}
+
+	current := findFrameworkEdgesByIdentities(g, identities)
+	pending := make([]*graph.Edge, 0, len(identities))
+	for _, identity := range identities {
+		edge := current[identity]
+		if claimingCandidateInScope(edge, scope, resolvers) {
+			pending = append(pending, edge)
+		}
+	}
+	return pending
+}
+
+func unresolvedClaimingCandidates(g graph.Store, scope map[string]bool) []*graph.Edge {
+	var pending []*graph.Edge
+	for _, edge := range frameworkRepoEdges(g, scope, graph.EdgeCalls, graph.EdgeReferences) {
+		if edge != nil && edge.To != "" && graph.IsUnresolvedTarget(edge.To) {
+			pending = append(pending, edge)
+		}
+	}
+	return pending
+}
+
+func claimingCandidateInScope(edge *graph.Edge, scope map[string]bool, resolvers []ClaimingResolver) bool {
+	if edge == nil || edge.To == "" || !graph.IsUnresolvedTarget(edge.To) {
+		return false
+	}
+	if edge.Kind != graph.EdgeCalls && edge.Kind != graph.EdgeReferences {
+		return false
+	}
+	if scope != nil {
+		prefix := graph.RepoPrefixOfID(edge.From)
+		if !scope[prefix] {
+			prefix = graph.RepoPrefixOfID(edge.FilePath)
+			if !scope[prefix] {
+				return false
+			}
+		}
+	}
+	for _, resolver := range resolvers {
+		if resolver.Claims(edge) {
+			return true
 		}
 	}
 	return false
@@ -1371,12 +1480,7 @@ func RunClaimingResolversScoped(g graph.Store, scope map[string]bool) map[string
 	if len(admissible) == 0 {
 		return out
 	}
-	var pending []*graph.Edge
-	for _, e := range frameworkRepoEdges(g, scope, graph.EdgeCalls, graph.EdgeReferences) {
-		if e != nil && e.To != "" && graph.IsUnresolvedTarget(e.To) {
-			pending = append(pending, e)
-		}
-	}
+	pending := scopedClaimingCandidates(g, scope, admissible)
 	claimed := make(map[*graph.Edge]bool)
 	for _, r := range admissible {
 		candidates := make([]*graph.Edge, 0, len(pending))
