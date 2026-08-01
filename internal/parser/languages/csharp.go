@@ -319,38 +319,58 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		}
 	}
 
-	// Build type environment in legacy precedence:
+	// Resolve calls against funcRanges + the per-method type environments.
+	funcRanges := buildFuncRanges(result)
+
+	// Build type environments in legacy precedence, scoped per enclosing
+	// method — a same-named local of a different type in a sibling method
+	// must not bleed into this method's receiver stamps (a file-scoped
+	// last-wins map mis-typed the receiver and both the extension binder
+	// and the receiver gate act on that evidence):
 	//   Tier 0 — explicit type annotations (skip "var" placeholder)
 	//   Tier 1 — `var x = new Foo()` walk for `var`-keyed locals only
-	tenv := make(typeEnv)
+	localOwner := func(l csharpDeferredLocal) string {
+		if l.defNode == nil {
+			return ""
+		}
+		return findEnclosingFunc(funcRanges, int(l.defNode.StartPoint().Row)+1)
+	}
+	tenvByOwner := map[string]typeEnv{}
+	setLocalType := func(owner, name, typeName string) {
+		env := tenvByOwner[owner]
+		if env == nil {
+			env = make(typeEnv)
+			tenvByOwner[owner] = env
+		}
+		env[name] = typeName
+	}
 	for _, l := range locals {
+		owner := localOwner(l)
+		if owner == "" {
+			continue
+		}
 		typeName := normalizeCSharpTypeName(l.rawType)
 		if typeName != "" && typeName != "var" {
-			tenv[l.name] = typeName
+			setLocalType(owner, l.name, typeName)
 		}
 	}
 	for _, l := range locals {
-		if _, exists := tenv[l.name]; exists {
+		owner := localOwner(l)
+		if owner == "" || l.rawType != "var" || l.defNode == nil {
 			continue
 		}
-		if l.rawType != "var" {
-			continue
-		}
-		if l.defNode == nil {
+		if _, exists := tenvByOwner[owner][l.name]; exists {
 			continue
 		}
 		walkNodes(l.defNode, func(n *sitter.Node) {
 			if n.Type() == "object_creation_expression" {
 				typeName := inferTypeFromCSharpNew(n, src)
 				if typeName != "" {
-					tenv[l.name] = typeName
+					setLocalType(owner, l.name, typeName)
 				}
 			}
 		})
 	}
-
-	// Resolve calls against funcRanges + tenv.
-	funcRanges := buildFuncRanges(result)
 
 	// Builtin locals key per enclosing method: a same-named local of a
 	// different type in a sibling method must not bleed into this
@@ -406,7 +426,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				From: callerID, To: "unresolved::*." + c.name,
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			}
-			if recvType, ok := tenv[c.receiver]; ok {
+			if recvType, ok := tenvByOwner[callerID][c.receiver]; ok {
 				edge.Meta = map[string]any{"receiver_type": recvType}
 			} else if bt := builtinsByOwner[callerID][c.receiver]; bt != "" {
 				// Builtins stay out of receiver_type (the receiver-gate
@@ -415,8 +435,15 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				// `Foo(this int)` and refuse `Foo(this string)`.
 				edge.Meta = map[string]any{"receiver_builtin": bt}
 			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
-				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenv, result))
+				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenvByOwner[callerID], result))
 			}
+			// Eviction restubs a member call to a bare unresolved name; the
+			// marker is what lets the resolver still route the rebind through
+			// the extension rule instead of a locality guess.
+			if edge.Meta == nil {
+				edge.Meta = map[string]any{}
+			}
+			edge.Meta["member_call"] = true
 			stampReturnUsage(edge, c.returnUsage)
 			result.Edges = append(result.Edges, edge)
 			continue
@@ -1434,9 +1461,17 @@ func csharpMethodTypeParamNames(methodNode *sitter.Node, src []byte) map[string]
 // this is the parallel lookup for the receiver_builtin stamp.
 func csharpBuiltinTypeName(t string) string {
 	t = strings.TrimSpace(t)
-	t = strings.TrimSuffix(t, "?")
-	if idx := strings.Index(t, "["); idx > 0 {
-		t = t[:idx]
+	// Strip nullable/array suffixes to fixpoint — `int?[]` and `int[]?`
+	// spell the same evidence, and the resolver's suffix trim agrees.
+	for {
+		trimmed := strings.TrimSuffix(t, "?")
+		if idx := strings.Index(trimmed, "["); idx > 0 {
+			trimmed = trimmed[:idx]
+		}
+		if trimmed == t {
+			break
+		}
+		t = trimmed
 	}
 	switch t {
 	case "int", "long", "short", "byte", "sbyte", "uint", "ulong", "ushort",

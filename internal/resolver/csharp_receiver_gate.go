@@ -157,12 +157,6 @@ func csharpShouldDemote(nodes map[string]*graph.Node, e *graph.Edge, nameToTypeI
 	if rt == "" {
 		return false
 	}
-	// A valid extension binding names the extension's static host class as the
-	// target receiver, which is by definition unrelated to the receiver it
-	// extends — never demote those.
-	if res, _ := e.Meta["resolution"].(string); res == "extension_method" {
-		return false
-	}
 	// Only the weak tiers are gated; never demote ast_resolved / lsp evidence.
 	// An empty Origin resolves to its confidence-derived tier.
 	eff := e.Origin
@@ -180,8 +174,13 @@ func csharpShouldDemote(nodes map[string]*graph.Node, e *graph.Edge, nameToTypeI
 	if target == nil || target.Kind != graph.KindMethod || target.Language != "csharp" || target.Meta == nil {
 		return false
 	}
-	// An extension target reached without the extension_method resolution tag
-	// (e.g. a locality pick) is still a legitimate extension — keep it.
+	// A valid extension binding names the extension's static host class as
+	// the target receiver, which is by definition unrelated to the receiver
+	// it extends — never demote an extension target, however it was
+	// reached. The exemption belongs to the TARGET, not to the edge's
+	// resolution tag: a stale `extension_method` tag can survive a restub
+	// onto a plain method, and exempting on the tag alone would disable
+	// the gate for exactly the edges most likely to be misattributed.
 	if isCSharpExtension(target) {
 		return false
 	}

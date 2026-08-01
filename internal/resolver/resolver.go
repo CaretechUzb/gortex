@@ -317,6 +317,15 @@ type Resolver struct {
 	csharpGlobalByDir map[string][]string
 	csharpProjDirs    map[string]struct{}
 
+	// csharpTypeNodesByName memoises the repo-scoped type/interface
+	// lookup the extension binder's eligibility rules repeat per call
+	// edge, and csharpAncestorsByType the transitive base/interface
+	// closure per type node — one hierarchy walk per unique receiver
+	// type per pass instead of one per call site. Same lifetime and
+	// lock as csharpGlobalByDir above.
+	csharpTypeNodesByName map[string][]*graph.Node
+	csharpAncestorsByType map[string]*csharpAncestors
+
 	// incrementalSkip holds the source-shapes of a single re-resolved file's
 	// out-edges that were already unresolved before the edit; the forward
 	// pass skips them. Set/cleared around ResolveFileAndIncoming by the
@@ -965,7 +974,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 					// The shared-store generation changed under us — the
 					// pass-lifetime C# global-usings index may describe
 					// the old generation; rebuild it with the rest.
-					r.clearCSharpGlobalIndex()
+					r.clearCSharpVisibilityCaches()
 				}
 				passIndexes.refreshAfterInterleave(pending, forceRefresh)
 				r.bulkMode = true
@@ -1948,13 +1957,20 @@ func (r *Resolver) clearLookupCache() {
 	r.csharpNSMu.Unlock()
 }
 
-// clearCSharpGlobalIndex drops the pass-lifetime global-usings index.
-// Separate from clearLookupCache: that runs per pending page, and the
-// index costs an O(graph) file scan to rebuild.
-func (r *Resolver) clearCSharpGlobalIndex() {
+// clearCSharpVisibilityCaches drops the pass-lifetime C# caches — the
+// global-usings index, the per-file namespace sets (they bake the
+// propagated globals in, so a rebuilt index behind stale per-file sets
+// would keep serving the old store generation), and the type-lookup /
+// ancestor memos the extension eligibility walk uses. Separate from
+// clearLookupCache: that runs per pending page, and these cost an
+// O(graph) scan or one hierarchy walk per type to rebuild.
+func (r *Resolver) clearCSharpVisibilityCaches() {
 	r.csharpNSMu.Lock()
 	r.csharpGlobalByDir = nil
 	r.csharpProjDirs = nil
+	r.csharpNSByFile = nil
+	r.csharpTypeNodesByName = nil
+	r.csharpAncestorsByType = nil
 	r.csharpNSMu.Unlock()
 }
 
@@ -2110,7 +2126,7 @@ func (r *Resolver) clearPassIndexes() {
 	r.clearProvidesForIndex()
 	r.clearReachabilityIndex()
 	r.clearLSPIndex()
-	r.clearCSharpGlobalIndex()
+	r.clearCSharpVisibilityCaches()
 }
 
 // buildPassIndexesForPending bounds the interactive path to the caller files
@@ -2147,7 +2163,7 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	defer r.mu.Unlock()
 	// The edited file may have (re)stamped global usings — rebuild the
 	// pass-lifetime index from the current graph.
-	r.clearCSharpGlobalIndex()
+	r.clearCSharpVisibilityCaches()
 
 	// Establish whether this edit left any work before building the four
 	// graph-wide pass indexes. Generated assets and source saves that carry
@@ -2314,7 +2330,7 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 	defer r.mu.Unlock()
 	// The edited files may have (re)stamped global usings — rebuild the
 	// pass-lifetime index from the current graph.
-	r.clearCSharpGlobalIndex()
+	r.clearCSharpVisibilityCaches()
 
 	pendingStarted := time.Now()
 	frontier := r.collectIncrementalFileFrontier(filePaths)
@@ -3283,6 +3299,36 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		return
 	}
 
+	// A restubbed C# member call (`x.Pack()` evicted to `unresolved::Pack`)
+	// loses its member shape but keeps its evidence in Meta: the receiver
+	// stamps, the member_call marker, or the extension tag of the bind it
+	// lost. Route it back through the type-directed extension rule — and
+	// once the edge is known to be a member call, never let a locality
+	// tier below pick an extension: that would bypass the eligibility
+	// veto, and the restub provenance restore re-applies the original
+	// confidence verbatim, freezing a stale bind nothing re-validates.
+	csharpMember := false
+	if e.Meta != nil {
+		recvEvidence, _ := e.Meta["receiver_type"].(string)
+		if recvEvidence == "" {
+			recvEvidence, _ = e.Meta["receiver_builtin"].(string)
+		}
+		mc, _ := e.Meta["member_call"].(bool)
+		res, _ := e.Meta["resolution"].(string)
+		if recvEvidence != "" || mc || res == "extension_method" {
+			csharpMember = true
+			if r.tryBindCSharpExtension(e, funcName, recvEvidence, candidates, stats) {
+				return
+			}
+			if res == "extension_method" {
+				// The rule refused what the tag says it once bound — a
+				// stale tag must not exempt whatever binds next from
+				// the receiver gate.
+				delete(e.Meta, "resolution")
+			}
+		}
+	}
+
 	// File-local candidates outrank everything below: a symbol defined in
 	// the caller's own file is strictly more local than a same-directory
 	// neighbour in every language (in Go both are package scope, so the
@@ -3295,6 +3341,9 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	var sameFile *graph.Node
 	sameFileCount := 0
 	for _, c := range candidates {
+		if csharpMember && isCSharpExtension(c) {
+			continue
+		}
 		if (c.Kind == graph.KindFunction || c.Kind == graph.KindMethod) &&
 			c.FilePath != "" && c.FilePath == e.FilePath {
 			if sameFile == nil {
@@ -3357,6 +3406,9 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	var samePkg *graph.Node
 	samePkgCount := 0
 	for _, c := range candidates {
+		if csharpMember && isCSharpExtension(c) {
+			continue
+		}
 		if (c.Kind == graph.KindFunction || c.Kind == graph.KindMethod) &&
 			r.dirFor(c.FilePath) == callerDir {
 			if samePkg == nil {
@@ -3382,6 +3434,9 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	// guard can revert it when unreachable. Same-file / same-directory picks
 	// above stay untagged (structural locality evidence) and survive.
 	for _, c := range candidates {
+		if csharpMember && isCSharpExtension(c) {
+			continue
+		}
 		if c.Kind == graph.KindFunction || c.Kind == graph.KindMethod {
 			e.To = c.ID
 			if e.Origin == "" {

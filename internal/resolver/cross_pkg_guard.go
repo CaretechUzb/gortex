@@ -144,6 +144,10 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		provBatch = append(provBatch, graph.EdgeProvenanceUpdate{Edge: j.edge, NewOrigin: ""})
 		j.edge.To = j.oldTo
 		j.edge.Confidence = 0
+		// The label travels with the confidence — agents act on it, and an
+		// unresolved edge advertising the abandoned bind's EXTRACTED label
+		// would out-rank evidence that actually survived.
+		j.edge.ConfidenceLabel = ""
 		// Durable revert stamp: the guard's verdicts are otherwise invisible
 		// after the provenance drop, which blocks any selective replay — a
 		// future pass cannot learn which speculative shapes never survive
