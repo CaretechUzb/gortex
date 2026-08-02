@@ -825,6 +825,59 @@ func TestReindexEdgesResolvedConversionReverseConvergencePreservesFirstCandidate
 	assert.Equal(t, "first", persisted[0].Meta["winner"])
 }
 
+func TestSQLiteResolvedConversionUpdatePlanDefersFallbackBuffers(t *testing.T) {
+	mutations := []sqliteReindexMutation{
+		{
+			oldKey:             sqliteReindexKey{fromID: "repo/a.go::A", toID: "unresolved::A", kind: string(graph.EdgeCalls)},
+			newRow:             sqliteReindexRow{key: sqliteReindexKey{fromID: "repo/a.go::A", toID: "repo/target.go::A", kind: string(graph.EdgeCalls)}},
+			resolvedConversion: true,
+		},
+		{
+			oldKey:             sqliteReindexKey{fromID: "repo/b.go::B", toID: "unresolved::B", kind: string(graph.EdgeCalls)},
+			newRow:             sqliteReindexRow{key: sqliteReindexKey{fromID: "repo/b.go::B", toID: "repo/target.go::B", kind: string(graph.EdgeReferences)}},
+			resolvedConversion: true,
+		},
+	}
+
+	plan, ok := sqliteResolvedConversionUpdatePlan(mutations)
+	require.True(t, ok)
+	assert.True(t, plan.oldUnresolved)
+	assert.Len(t, plan.oldCounts, len(mutations))
+	assert.Len(t, plan.newCounts, len(mutations))
+	assert.Nil(t, plan.fallbackDeletes, "unique conversions must not allocate fallback key storage")
+	assert.Nil(t, plan.fallbackInserts, "unique conversions must not copy full rows into fallback storage")
+	assert.True(t, plan.updateCandidate(mutations[0], false))
+	assert.True(t, plan.updateCandidate(mutations[1], true))
+}
+
+func BenchmarkSQLiteResolvedConversionPlanning50K(b *testing.B) {
+	const edgeCount = 50_000
+	mutations := make([]sqliteReindexMutation, edgeCount)
+	for i := range mutations {
+		from := fmt.Sprintf("repo/caller-%05d.go::Caller", i)
+		mutations[i] = sqliteReindexMutation{
+			oldKey: sqliteReindexKey{
+				fromID: from, toID: fmt.Sprintf("unresolved::Target%05d", i), kind: string(graph.EdgeCalls),
+			},
+			newRow: sqliteReindexRow{key: sqliteReindexKey{
+				fromID: from, toID: fmt.Sprintf("repo/target-%05d.go::Target", i), kind: string(graph.EdgeCalls),
+			}},
+			resolvedConversion: true,
+		}
+	}
+	b.ReportAllocs()
+	b.ReportMetric(edgeCount, "edges/op")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		plan, ok := sqliteResolvedConversionUpdatePlan(mutations)
+		if !ok || len(plan.oldCounts) != edgeCount || len(plan.newCounts) != edgeCount ||
+			plan.fallbackDeletes != nil || plan.fallbackInserts != nil {
+			b.Fatalf("unexpected conversion plan: ok=%t old=%d new=%d fallback_deletes=%d fallback_inserts=%d",
+				ok, len(plan.oldCounts), len(plan.newCounts), len(plan.fallbackDeletes), len(plan.fallbackInserts))
+		}
+	}
+}
+
 func BenchmarkReindexEdgesResolvedConversions50K(b *testing.B) {
 	const edgeCount = 50_000
 	b.StopTimer()

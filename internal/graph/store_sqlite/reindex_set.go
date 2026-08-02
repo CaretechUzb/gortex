@@ -49,6 +49,21 @@ type sqliteReindexMutation struct {
 	resolvedConversion bool
 }
 
+type sqliteResolvedConversionPlan struct {
+	oldUnresolved   bool
+	oldCounts       map[sqliteReindexKey]int
+	newCounts       map[sqliteReindexKey]int
+	fallbackDeletes []sqliteReindexKey
+	fallbackInserts []sqliteReindexRow
+}
+
+func (p sqliteResolvedConversionPlan) updateCandidate(mutation sqliteReindexMutation, updateKind bool) bool {
+	if p.oldCounts[mutation.oldKey] != 1 || p.newCounts[mutation.newRow.key] != 1 {
+		return false
+	}
+	return (mutation.oldKey.kind != mutation.newRow.key.kind) == updateKind
+}
+
 type sqliteReindexSetStats struct {
 	selectStatements int
 	updateStatements int
@@ -126,7 +141,7 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	receipt *sqliteReindexReceipt,
 	err error,
 ) {
-	mutations, keys, err := sqliteReindexMutations(batch)
+	mutations, err := sqliteReindexMutations(batch)
 	if err != nil || len(mutations) == 0 {
 		return stats, false, false, nil, err
 	}
@@ -153,21 +168,24 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	}()
 	receipt = s.prepareSQLiteReindexReceiptTx(tx, batch)
 
-	sameKindUpdates, kindChangingUpdates, deletes, inserts, resolvedConversionFastPath :=
-		sqliteResolvedConversionUpdatePlan(mutations)
+	conversionPlan, resolvedConversionFastPath := sqliteResolvedConversionUpdatePlan(mutations)
 	// A reverse conversion creates a new unresolved edge. While a mutation
 	// receipt is active, retain the generic simulator's exact insert accounting:
 	// UPDATE OR IGNORE reports only an aggregate row count and cannot distinguish
 	// successful updates from destination collisions. Cold guard passes run
 	// outside the receipt window and keep the in-place fast path.
-	if resolvedConversionFastPath && receipt != nil &&
-		!graph.IsUnresolvedTarget(mutations[0].oldKey.toID) &&
-		graph.IsUnresolvedTarget(mutations[0].newRow.key.toID) {
+	if resolvedConversionFastPath && receipt != nil && !conversionPlan.oldUnresolved {
 		resolvedConversionFastPath = false
 	}
+
+	var deletes []sqliteReindexKey
+	var inserts []sqliteReindexRow
 	if resolvedConversionFastPath {
+		deletes = conversionPlan.fallbackDeletes
+		inserts = conversionPlan.fallbackInserts
+
 		updated, statements, repairDeletes, repairInserts, updateErr :=
-			updateSQLiteResolvedConversionsTxLimited(tx, sameKindUpdates, false, &variableLimit)
+			updateSQLiteResolvedConversionsTxLimited(tx, mutations, conversionPlan, false, &variableLimit)
 		if updateErr != nil {
 			return stats, false, false, nil, updateErr
 		}
@@ -177,7 +195,7 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 		inserts = append(inserts, repairInserts...)
 
 		updated, statements, repairDeletes, repairInserts, updateErr =
-			updateSQLiteResolvedConversionsTxLimited(tx, kindChangingUpdates, true, &variableLimit)
+			updateSQLiteResolvedConversionsTxLimited(tx, mutations, conversionPlan, true, &variableLimit)
 		if updateErr != nil {
 			return stats, false, false, nil, updateErr
 		}
@@ -186,6 +204,7 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 		deletes = append(deletes, repairDeletes...)
 		inserts = append(inserts, repairInserts...)
 	} else {
+		keys := sqliteReindexKeys(mutations)
 		initial, selectStatements, selectErr := sqliteReindexRowsTxLimited(tx, keys, &variableLimit)
 		if selectErr != nil {
 			return stats, false, false, nil, selectErr
@@ -230,18 +249,8 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	return stats, changed, invalidatedAnalysis, receipt, nil
 }
 
-func sqliteReindexMutations(batch []graph.EdgeReindex) ([]sqliteReindexMutation, []sqliteReindexKey, error) {
+func sqliteReindexMutations(batch []graph.EdgeReindex) ([]sqliteReindexMutation, error) {
 	mutations := make([]sqliteReindexMutation, 0, len(batch))
-	keys := make([]sqliteReindexKey, 0, len(batch)*2)
-	seen := make(map[sqliteReindexKey]struct{}, len(batch)*2)
-	addKey := func(key sqliteReindexKey) {
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		keys = append(keys, key)
-	}
-
 	for _, reindex := range batch {
 		edge := reindex.Edge
 		if edge == nil {
@@ -263,7 +272,7 @@ func sqliteReindexMutations(batch []graph.EdgeReindex) ([]sqliteReindexMutation,
 		}
 		newRow, err := sqliteReindexRowForEdge(edge)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		oldKey := sqliteReindexKey{
 			fromID: oldFrom, toID: reindex.OldTo, kind: string(oldKind),
@@ -275,94 +284,80 @@ func sqliteReindexMutations(batch []graph.EdgeReindex) ([]sqliteReindexMutation,
 			resolvedConversion: !reindex.RefreshIdentity &&
 				graph.IsUnresolvedTarget(oldKey.toID) != graph.IsUnresolvedTarget(newRow.key.toID),
 		})
-		addKey(oldKey)
-		addKey(newRow.key)
 	}
-	return mutations, keys, nil
+	return mutations, nil
 }
 
-// sqliteResolvedConversionSet recognizes uniform transitions across the
-// unresolved-target namespace boundary. The whole batch must move in one
-// direction, so the old and new key domains are disjoint for both resolution
-// and guard-driven reversion. Ordered set simulation therefore reduces exactly
-// to deleting each old key once and INSERT OR IGNORE-ing new rows in input
-// order: existing destinations win, and the first of several converging
-// candidates wins. Mixed-direction, refresh, and same-namespace batches retain
-// the generic prefetch + simulation path.
-func sqliteResolvedConversionSet(mutations []sqliteReindexMutation) (
-	deletes []sqliteReindexKey,
-	inserts []sqliteReindexRow,
-	ok bool,
-) {
+// sqliteReindexKeys materializes the generic simulator's affected identity set.
+// Namespace conversions avoid this allocation entirely; it is built only after
+// the conversion planner rejects (or receipt safety disables) the fast path.
+func sqliteReindexKeys(mutations []sqliteReindexMutation) []sqliteReindexKey {
+	keys := make([]sqliteReindexKey, 0, len(mutations)*2)
+	seen := make(map[sqliteReindexKey]struct{}, len(mutations)*2)
+	add := func(key sqliteReindexKey) {
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	for _, mutation := range mutations {
+		add(mutation.oldKey)
+		add(mutation.newRow.key)
+	}
+	return keys
+}
+
+// sqliteResolvedConversionUpdatePlan recognizes uniform transitions across the
+// unresolved-target namespace boundary. It validates direction before building
+// any count maps, then retains only the counts needed to identify one-to-one
+// in-place updates. Duplicate old keys and converging destinations preserve the
+// ordered delete/insert path; its map and slices stay nil on the common unique
+// conversion path.
+func sqliteResolvedConversionUpdatePlan(mutations []sqliteReindexMutation) (sqliteResolvedConversionPlan, bool) {
 	if len(mutations) == 0 {
-		return nil, nil, false
+		return sqliteResolvedConversionPlan{}, false
 	}
 	oldUnresolved := graph.IsUnresolvedTarget(mutations[0].oldKey.toID)
 	newUnresolved := graph.IsUnresolvedTarget(mutations[0].newRow.key.toID)
 	if oldUnresolved == newUnresolved {
-		return nil, nil, false
+		return sqliteResolvedConversionPlan{}, false
 	}
-	seenOld := make(map[sqliteReindexKey]struct{}, len(mutations))
-	deletes = make([]sqliteReindexKey, 0, len(mutations))
-	inserts = make([]sqliteReindexRow, 0, len(mutations))
 	for _, mutation := range mutations {
 		if !mutation.resolvedConversion ||
 			graph.IsUnresolvedTarget(mutation.oldKey.toID) != oldUnresolved ||
 			graph.IsUnresolvedTarget(mutation.newRow.key.toID) != newUnresolved {
-			return nil, nil, false
+			return sqliteResolvedConversionPlan{}, false
 		}
-		if _, seen := seenOld[mutation.oldKey]; !seen {
-			seenOld[mutation.oldKey] = struct{}{}
-			deletes = append(deletes, mutation.oldKey)
-		}
-		// Do not deduplicate destinations: INSERT OR IGNORE preserves the
-		// generic simulator's input-order, first-candidate-wins contract.
-		inserts = append(inserts, mutation.newRow)
-	}
-	return deletes, inserts, true
-}
-
-// sqliteResolvedConversionUpdatePlan peels off only one-to-one conversions for
-// in-place updates. Duplicate old keys and converging destinations retain the
-// ordered delete/insert path returned by sqliteResolvedConversionSet.
-func sqliteResolvedConversionUpdatePlan(mutations []sqliteReindexMutation) (
-	sameKind []sqliteReindexMutation,
-	kindChanging []sqliteReindexMutation,
-	fallbackDeletes []sqliteReindexKey,
-	fallbackInserts []sqliteReindexRow,
-	ok bool,
-) {
-	allDeletes, allInserts, ok := sqliteResolvedConversionSet(mutations)
-	if !ok {
-		return nil, nil, nil, nil, false
 	}
 
-	oldCounts := make(map[sqliteReindexKey]int, len(mutations))
-	newCounts := make(map[sqliteReindexKey]int, len(mutations))
+	plan := sqliteResolvedConversionPlan{
+		oldUnresolved: oldUnresolved,
+		oldCounts:     make(map[sqliteReindexKey]int, len(mutations)),
+		newCounts:     make(map[sqliteReindexKey]int, len(mutations)),
+	}
 	for _, mutation := range mutations {
-		oldCounts[mutation.oldKey]++
-		newCounts[mutation.newRow.key]++
+		plan.oldCounts[mutation.oldKey]++
+		plan.newCounts[mutation.newRow.key]++
 	}
 
-	fallbackOld := make(map[sqliteReindexKey]struct{}, len(allDeletes))
-	fallbackDeletes = make([]sqliteReindexKey, 0, len(allDeletes))
-	fallbackInserts = make([]sqliteReindexRow, 0, len(allInserts))
+	var fallbackOld map[sqliteReindexKey]struct{}
 	for _, mutation := range mutations {
-		if oldCounts[mutation.oldKey] == 1 && newCounts[mutation.newRow.key] == 1 {
-			if mutation.oldKey.kind == mutation.newRow.key.kind {
-				sameKind = append(sameKind, mutation)
-			} else {
-				kindChanging = append(kindChanging, mutation)
-			}
+		if plan.updateCandidate(mutation, mutation.oldKey.kind != mutation.newRow.key.kind) {
 			continue
+		}
+		if fallbackOld == nil {
+			fallbackOld = make(map[sqliteReindexKey]struct{})
 		}
 		if _, seen := fallbackOld[mutation.oldKey]; !seen {
 			fallbackOld[mutation.oldKey] = struct{}{}
-			fallbackDeletes = append(fallbackDeletes, mutation.oldKey)
+			plan.fallbackDeletes = append(plan.fallbackDeletes, mutation.oldKey)
 		}
-		fallbackInserts = append(fallbackInserts, mutation.newRow)
+		// Do not deduplicate destinations: INSERT OR IGNORE preserves the
+		// generic simulator's input-order, first-candidate-wins contract.
+		plan.fallbackInserts = append(plan.fallbackInserts, mutation.newRow)
 	}
-	return sameKind, kindChanging, fallbackDeletes, fallbackInserts, true
+	return plan, true
 }
 
 func sqliteReindexRowForEdge(edge *graph.Edge) (sqliteReindexRow, error) {
@@ -396,6 +391,7 @@ func sqliteReindexRowForEdge(edge *graph.Edge) (sqliteReindexRow, error) {
 func updateSQLiteResolvedConversionsTxLimited(
 	tx *sql.Tx,
 	mutations []sqliteReindexMutation,
+	plan sqliteResolvedConversionPlan,
 	updateKind bool,
 	variableLimit *int,
 ) (
@@ -425,6 +421,10 @@ func updateSQLiteResolvedConversionsTxLimited(
 		rowCount := 0
 		for pos < len(mutations) && rowCount < rowLimit {
 			mutation := mutations[pos]
+			if !plan.updateCandidate(mutation, updateKind) {
+				pos++
+				continue
+			}
 			row := mutation.newRow
 			argStart := len(args)
 			args = append(args,
@@ -446,6 +446,9 @@ func updateSQLiteResolvedConversionsTxLimited(
 			pos++
 			rowCount++
 			argBytes += rowBytes
+		}
+		if rowCount == 0 {
+			continue
 		}
 
 		query := sqliteResolvedConversionUpdateStatement(rowCount, updateKind)
@@ -477,6 +480,9 @@ func updateSQLiteResolvedConversionsTxLimited(
 			// exact: successful rows already occupy their destination, while
 			// missing sources and destination collisions are repaired below.
 			for _, mutation := range mutations[chunkStart:pos] {
+				if !plan.updateCandidate(mutation, updateKind) {
+					continue
+				}
 				repairDeletes = append(repairDeletes, mutation.oldKey)
 				repairInserts = append(repairInserts, mutation.newRow)
 			}
