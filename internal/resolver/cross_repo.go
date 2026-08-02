@@ -1151,10 +1151,20 @@ func resolveChunkEnabled() bool {
 // default 2048 — large enough to amortise the per-chunk worker barrier, small
 // enough that a waiting edit is delayed by at most one chunk's compute.
 func resolveChunkSize() int {
+	return resolveChunkSizeForDefault(2048)
+}
+
+// resolveChunkSizeForDefault preserves the operator override while allowing
+// the startup master resolver to use its already-bounded SQLite scan-page size
+// as the fallback. Ordinary and cross-repository passes keep the 2,048 default.
+func resolveChunkSizeForDefault(defaultSize int) int {
 	if v := os.Getenv("GORTEX_RESOLVE_CHUNK_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}
+	}
+	if defaultSize > 0 {
+		return defaultSize
 	}
 	return 2048
 }

@@ -813,7 +813,7 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 			mi.logger.Info("DEFERRED-TIMING unresolved-target counter unchanged; retaining fallback for definitions and resolved cross-repo edges",
 				zap.String("reason", reason))
 		}
-		if err := mi.runMasterResolveHookedContext(context.Background(), masterScope, false, nil); err != nil {
+		if err := mi.runMasterResolveHookedContext(context.Background(), masterScope, false, nil, false); err != nil {
 			mi.logger.Error("DEFERRED-TIMING fallback master resolve failed", zap.Error(err))
 			return deferredResolveFailed, false
 		}
@@ -900,12 +900,12 @@ func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}, useLSP bool)
 // runMasterResolveHooked is runMasterResolve with an optional compute-done
 // hook threaded into the resolver (see Resolver.OnComputeDone).
 func (mi *MultiIndexer) runMasterResolveHooked(scope map[string]struct{}, useLSP bool, onComputeDone func()) {
-	if err := mi.runMasterResolveHookedContext(context.Background(), scope, useLSP, onComputeDone); err != nil {
+	if err := mi.runMasterResolveHookedContext(context.Background(), scope, useLSP, onComputeDone, false); err != nil {
 		mi.logger.Error("DEFERRED-TIMING master.ResolveAll", zap.Error(err))
 	}
 }
 
-func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope map[string]struct{}, useLSP bool, onComputeDone func()) error {
+func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope map[string]struct{}, useLSP bool, onComputeDone func(), startupBulkApply bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -917,6 +917,7 @@ func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope
 		return ctx.Err()
 	}
 	master.OnComputeDone = onComputeDone
+	master.SetStartupBulkApply(startupBulkApply)
 	scoped := len(scope) > 0 && mi.scopedGlobalPassesEnabled()
 	if scoped {
 		master.SetScope(scope)
@@ -984,7 +985,7 @@ func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
 // a pass that runs in ~38s uncontended on the same workspace).
 func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}, onComputeDone func()) error {
 	mi.runDeferredGoModAll()
-	if err := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone); err != nil {
+	if err := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone, true); err != nil {
 		return err
 	}
 	// Stamp legacy nodes after master resolution so synthetic nodes created by

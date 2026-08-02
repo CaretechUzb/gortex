@@ -425,6 +425,13 @@ type Resolver struct {
 	// a partially-indexed graph never stamps a false "no definition". Set via
 	// SetStampTerminal.
 	stampTerminal bool
+
+	// startupBulkApply lets the pre-enrichment startup coordinator amortise
+	// resolver compute/apply barriers across the complete bounded SQLite scan
+	// page. It is opt-in: watcher, deferred-mutation, and direct Resolver users
+	// retain the ordinary 2,048-edge yield cadence. The pending stream's 16 MiB
+	// byte cap remains the hard live-payload bound.
+	startupBulkApply bool
 }
 
 // lspLocKey identifies a node by (filePath, 1-based line) and is the
@@ -482,6 +489,15 @@ func (r *Resolver) SetScope(prefixes map[string]struct{}) {
 // enable it.
 func (r *Resolver) SetStampTerminal(on bool) {
 	r.stampTerminal = on
+}
+
+// SetStartupBulkApply enables page-sized compute/apply batches for the startup
+// pre-enrichment master resolve. It must not be enabled for steady-state
+// watcher or deferred-mutation passes, which need the ordinary 2,048-edge
+// mutex-yield cadence for interactive fairness. The pending stream remains
+// bounded independently by resolvePendingPageBytes.
+func (r *Resolver) SetStartupBulkApply(on bool) {
+	r.startupBulkApply = on
 }
 
 // SetGraph retargets the Resolver at a different Store. The indexer's
@@ -668,6 +684,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		zap.Int("first_page", len(pending)),
 		zap.Int("terminal_skipped", terminalSkipped),
 		zap.Bool("backend_bulk", backendResolverEnabled()),
+		zap.Bool("startup_bulk_apply", r.startupBulkApply),
 		zap.String("first_page_shapes", pendingShapeSummary(pending)))
 	// Diagnostic: capture a CPU profile of the first full (unscoped) resolve
 	// pass when GORTEX_RESOLVE_CPUPROFILE names a path. Env-gated and one-shot
@@ -743,8 +760,17 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		}
 	}
 	superChunk := resolvePendingPageRows
-	if r.validateLiveness && resolveChunkSize() < superChunk {
-		superChunk = resolveChunkSize()
+	if r.startupBulkApply {
+		// Native SQLite paging already holds at most this many rows (and at
+		// most resolvePendingPageBytes). Applying the whole page collapses the
+		// former eight 2,048-edge worker/apply barriers without retaining any
+		// additional page payload. Legacy stores still return 2,048-row pages.
+		superChunk = resolvePendingScanPageRows
+	}
+	if r.validateLiveness {
+		if configured := resolveChunkSizeForDefault(superChunk); configured < superChunk {
+			superChunk = configured
+		}
 	}
 	if superChunk < 1 {
 		superChunk = 1
