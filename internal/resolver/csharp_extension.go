@@ -100,6 +100,17 @@ func (r *Resolver) tryBindCSharpExtension(e *graph.Edge, methodName, receiverTyp
 		recvTrim := csharpTypeSuffixTrim(receiverType)
 		recvKey := csharpExtTypeKey(receiverType)
 		recvNS := csharpNSPrefix(recvTrim)
+		// Effective receiver shape: the explicit stamp when extraction saw
+		// structure, else the core spelling standing in as a bare claim.
+		recvShape := receiverType
+		if e.Meta != nil {
+			if s, _ := e.Meta["receiver_shape"].(string); s != "" {
+				recvShape = s
+			}
+		}
+		// Shape-conflicted candidates are provably inapplicable — they are
+		// excluded from the name tiers AND from the reach/waiver pools.
+		conflicted := map[string]bool{}
 		var typed, universal []*graph.Node
 		for _, c := range exts {
 			tp, _ := c.Meta["this_param_type"].(string)
@@ -109,8 +120,21 @@ func (r *Resolver) tryBindCSharpExtension(e *graph.Edge, methodName, receiverTyp
 			// `this T` (the method's own type parameter) and
 			// `this object` match any receiver — they are exempt from
 			// the contradiction veto but earn no typed-tier confidence.
+			// A `where T : X` clause bounds the type parameter: a
+			// receiver that provably fails every constraint is out.
 			if g, _ := c.Meta["this_param_generic"].(bool); g || csharpTypeSuffixTrim(tp) == "object" {
+				if g && r.csharpConstraintExcludes(e, recvTrim, c, repo) {
+					conflicted[c.ID] = true
+					continue
+				}
 				universal = append(universal, c)
+				continue
+			}
+			// Shape — array/nullable suffixes, generic arguments — is
+			// part of applicability: same core, different structure is a
+			// contradiction (`string[]` never fits `this string`).
+			if csharpShapesConflict(recvShape, csharpNodeShape(c, tp), csharpNodeTypeParams(c)) {
+				conflicted[c.ID] = true
 				continue
 			}
 			tpTrim := csharpTypeSuffixTrim(tp)
@@ -134,8 +158,19 @@ func (r *Resolver) tryBindCSharpExtension(e *graph.Edge, methodName, receiverTyp
 		if len(typed) == 0 {
 			// No name-level match: the receiver may still REACH a
 			// candidate's this-param through its base/interface chain
-			// (`Crate : IBox` calling `Foo(this IBox)`).
-			reached, waive := r.csharpExtensionReachableMatches(e, recvTrim, exts)
+			// (`Crate : IBox` calling `Foo(this IBox)`). Shape-conflicted
+			// candidates stay out — reachability cannot repair a
+			// structural contradiction.
+			eligible := exts
+			if len(conflicted) > 0 {
+				eligible = make([]*graph.Node, 0, len(exts))
+				for _, c := range exts {
+					if !conflicted[c.ID] {
+						eligible = append(eligible, c)
+					}
+				}
+			}
+			reached, waive := r.csharpExtensionReachableMatches(e, recvTrim, eligible)
 			typed = reached
 			if len(typed) == 0 {
 				// The any-receiver candidates stay eligible; an
@@ -150,7 +185,7 @@ func (r *Resolver) tryBindCSharpExtension(e *graph.Edge, methodName, receiverTyp
 				// (`xs.Add(1)`). A missing edge, never a wrong one.
 				pool := append([]*graph.Node(nil), universal...)
 				if waive {
-					pool = append(pool, r.csharpWaiverEligible(exts, universal, repo)...)
+					pool = append(pool, r.csharpWaiverEligible(eligible, universal, repo)...)
 				}
 				if len(pool) > 0 {
 					return r.bindCSharpExtensionUntyped(e, pool, candidates, stats)
@@ -683,6 +718,208 @@ func (r *Resolver) csharpCallerEnclosing(e *graph.Edge, visible csharpFileNS) ma
 		}
 	}
 	return visible.enclosing
+}
+
+// csharpShape is the parsed structure of a type spelling: core name,
+// generic arguments, and the array/nullable suffix chain in written
+// order. Shape is compared only when the cores already agree — core
+// naming (qualification, denotation, visibility) stays with the name
+// tiers.
+type csharpShape struct {
+	core   string
+	args   []csharpShape
+	suffix string
+}
+
+// csharpNodeShape returns a candidate's effective this-param shape: the
+// explicit stamp when extraction saw structure the core spelling drops
+// (generic arguments), else the core stamp itself — which for arrays
+// and nullables already carries its suffixes.
+func csharpNodeShape(c *graph.Node, tp string) string {
+	if s, _ := c.Meta["this_param_shape"].(string); s != "" {
+		return s
+	}
+	return tp
+}
+
+// csharpNodeTypeParams returns the method's own generic type-parameter
+// names — the tokens that unify with anything during shape comparison.
+func csharpNodeTypeParams(c *graph.Node) map[string]bool {
+	s, _ := c.Meta["method_type_params"].(string)
+	if s == "" {
+		return nil
+	}
+	m := map[string]bool{}
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			m[p] = true
+		}
+	}
+	return m
+}
+
+// csharpShapesConflict reports a PROVABLE structural contradiction
+// between the receiver's shape and a candidate's this-param shape:
+// same core, different structure (`string[]` vs `this string`,
+// `List<int>` vs `this List<string>`). Unparseable or absent evidence
+// never conflicts, and a core-name mismatch is not a shape verdict.
+func csharpShapesConflict(recv, tp string, tparams map[string]bool) bool {
+	if recv == "" || tp == "" {
+		return false
+	}
+	a, okA := csharpParseShape(recv)
+	b, okB := csharpParseShape(tp)
+	if !okA || !okB {
+		return false
+	}
+	return !csharpShapeUnifies(a, b, tparams, false)
+}
+
+func csharpShapeUnifies(recv, tp csharpShape, tparams map[string]bool, arg bool) bool {
+	// A method type parameter unifies with any receiver core; its own
+	// suffix structure still has to line up (`T[]` is not scalar `T`).
+	if tparams[tp.core] && len(tp.args) == 0 {
+		return tp.suffix == "" || tp.suffix == recv.suffix
+	}
+	coresAgree := csharpTypeSuffixTrim(recv.core) == csharpTypeSuffixTrim(tp.core) ||
+		csharpLastSegment(recv.core) == csharpLastSegment(tp.core)
+	if !coresAgree {
+		// Top level, differing cores: naming is the name tiers'
+		// business — no shape verdict. ARGUMENT position: C# generics
+		// are invariant, so a core mismatch there IS the contradiction
+		// (`List<int>` never fits `this List<string>`).
+		return !arg
+	}
+	if recv.suffix != tp.suffix || len(recv.args) != len(tp.args) {
+		return false
+	}
+	for i := range recv.args {
+		if !csharpShapeUnifies(recv.args[i], tp.args[i], tparams, true) {
+			return false
+		}
+	}
+	return true
+}
+
+func csharpLastSegment(s string) string {
+	if i := strings.LastIndex(s, "."); i >= 0 {
+		return s[i+1:]
+	}
+	return s
+}
+
+// csharpParseShape parses a canonical type spelling into its shape.
+// ok=false on anything it cannot account for — the caller treats that
+// as no evidence, never as a conflict.
+func csharpParseShape(s string) (csharpShape, bool) {
+	var sh csharpShape
+	s = strings.TrimSpace(s)
+	for {
+		if strings.HasSuffix(s, "?") {
+			sh.suffix = "?" + sh.suffix
+			s = s[:len(s)-1]
+			continue
+		}
+		if strings.HasSuffix(s, "]") {
+			i := strings.LastIndex(s, "[")
+			if i <= 0 {
+				return sh, false
+			}
+			if strings.Trim(s[i+1:len(s)-1], ",") != "" {
+				return sh, false
+			}
+			sh.suffix = s[i:] + sh.suffix
+			s = s[:i]
+			continue
+		}
+		break
+	}
+	if i := strings.Index(s, "<"); i > 0 {
+		if !strings.HasSuffix(s, ">") {
+			return sh, false
+		}
+		for _, part := range csharpSplitTopLevel(s[i+1 : len(s)-1]) {
+			p, ok := csharpParseShape(part)
+			if !ok {
+				return sh, false
+			}
+			sh.args = append(sh.args, p)
+		}
+		s = s[:i]
+	}
+	sh.core = s
+	return sh, s != "" && !strings.ContainsAny(s, "<>[]()")
+}
+
+// csharpSplitTopLevel splits a generic-argument list on the commas at
+// nesting depth zero.
+func csharpSplitTopLevel(s string) []string {
+	var parts []string
+	depth, last := 0, 0
+	for i, r := range s {
+		switch r {
+		case '<':
+			depth++
+		case '>':
+			depth--
+		case ',':
+			if depth == 0 {
+				parts = append(parts, s[last:i])
+				last = i + 1
+			}
+		}
+	}
+	return append(parts, s[last:])
+}
+
+// csharpConstraintExcludes reports whether a constrained generic
+// this-param (`where T : X`) provably cannot accept the receiver: every
+// constraint core name is declared in-repo, and the receiver is a
+// builtin (builtins never derive from repo types) or its COMPLETE
+// declared hierarchy reaches none of them. External constraints,
+// unknown receivers, and incomplete hierarchies keep the candidate —
+// missing evidence never excludes.
+func (r *Resolver) csharpConstraintExcludes(e *graph.Edge, recvTrim string, c *graph.Node, repo string) bool {
+	cons, _ := c.Meta["this_param_constraints"].(string)
+	if cons == "" {
+		return false
+	}
+	wanted := map[string]bool{}
+	for _, w := range strings.Split(cons, ",") {
+		if w = strings.TrimSpace(w); w != "" {
+			wanted[w] = true
+		}
+	}
+	if len(wanted) == 0 {
+		return false
+	}
+	for w := range wanted {
+		if len(r.csharpTypeNodesNamed(csharpExtTypeKey(w), repo)) == 0 {
+			return false
+		}
+	}
+	if csharpIsBuiltinTypeName(recvTrim) {
+		return true
+	}
+	seeds := r.csharpReceiverTypeNodes(e, recvTrim, repo)
+	if len(seeds) == 0 {
+		return false
+	}
+	for _, s := range seeds {
+		if wanted[s.Name] {
+			return false
+		}
+		anc := r.csharpAncestorsOf(s, repo)
+		if anc.incomplete {
+			return false
+		}
+		for id := range anc.ids {
+			if n := r.cachedGetNode(id); n != nil && wanted[n.Name] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // csharpTypeSuffixTrim canonicalises a type name's suffixes — nullable,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -372,6 +373,39 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		})
 	}
 
+	// Type SHAPE rides in a parallel per-method map: the core stamps keep
+	// their bare spelling (every downstream consumer stays valid), while
+	// array/nullable suffixes and generic arguments — which are part of
+	// applicability — survive in a receiver_shape stamp.
+	shapesByOwner := map[string]map[string]string{}
+	setLocalShape := func(owner, name, shape string) {
+		m := shapesByOwner[owner]
+		if m == nil {
+			m = map[string]string{}
+			shapesByOwner[owner] = m
+		}
+		m[name] = shape
+	}
+	for _, l := range locals {
+		owner := localOwner(l)
+		if owner == "" {
+			continue
+		}
+		if shape := csharpCanonTypeShape(l.rawType); shape != "" {
+			setLocalShape(owner, l.name, shape)
+		} else if l.rawType == "var" && l.defNode != nil {
+			walkNodes(l.defNode, func(n *sitter.Node) {
+				if n.Type() == "object_creation_expression" {
+					if tn := n.ChildByFieldName("type"); tn != nil {
+						if s := csharpCanonTypeShape(tn.Content(src)); s != "" {
+							setLocalShape(owner, l.name, s)
+						}
+					}
+				}
+			})
+		}
+	}
+
 	// Builtin locals key per enclosing method: a same-named local of a
 	// different type in a sibling method must not bleed into this
 	// method's receiver stamp (a file-scoped last-wins map mis-typed
@@ -428,12 +462,18 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			}
 			if recvType, ok := tenvByOwner[callerID][c.receiver]; ok {
 				edge.Meta = map[string]any{"receiver_type": recvType}
+				if shape := shapesByOwner[callerID][c.receiver]; shape != "" && shape != recvType {
+					edge.Meta["receiver_shape"] = shape
+				}
 			} else if bt := builtinsByOwner[callerID][c.receiver]; bt != "" {
 				// Builtins stay out of receiver_type (the receiver-gate
 				// passes key on user types); extension eligibility still
 				// needs them — `n.Foo()` on an int must match
 				// `Foo(this int)` and refuse `Foo(this string)`.
 				edge.Meta = map[string]any{"receiver_builtin": bt}
+				if shape := shapesByOwner[callerID][c.receiver]; shape != "" && shape != bt {
+					edge.Meta["receiver_shape"] = shape
+				}
 			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
 				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenvByOwner[callerID], result))
 			}
@@ -626,12 +666,31 @@ func csharpHasModifier(decl *sitter.Node, src []byte, mod string) bool {
 // normalizeCSharpTypeName it keeps primitive receivers (string / int), since
 // extension methods commonly extend them.
 func csharpExtensionReceiverType(methodNode *sitter.Node, src []byte) string {
+	if t := csharpExtensionReceiverTypeNode(methodNode, src); t != nil {
+		return normalizeCSharpBaseName(t.Content(src))
+	}
+	return ""
+}
+
+// csharpExtensionReceiverRaw returns the this-param's type as written —
+// qualification, generic arguments, and array/nullable suffixes intact.
+// "" for a non-extension method.
+func csharpExtensionReceiverRaw(methodNode *sitter.Node, src []byte) string {
+	if t := csharpExtensionReceiverTypeNode(methodNode, src); t != nil {
+		return t.Content(src)
+	}
+	return ""
+}
+
+// csharpExtensionReceiverTypeNode finds the type node of a method's
+// `this`-marked first parameter — nil for a non-extension method.
+func csharpExtensionReceiverTypeNode(methodNode *sitter.Node, src []byte) *sitter.Node {
 	if methodNode == nil {
-		return ""
+		return nil
 	}
 	params := methodNode.ChildByFieldName("parameters")
 	if params == nil {
-		return ""
+		return nil
 	}
 	var first *sitter.Node
 	for i, _nc := 0, int(params.NamedChildCount()); i < _nc; i++ {
@@ -642,7 +701,7 @@ func csharpExtensionReceiverType(methodNode *sitter.Node, src []byte) string {
 		}
 	}
 	if first == nil {
-		return ""
+		return nil
 	}
 	hasThis := false
 	for i, _nc := 0, int(first.ChildCount()); i < _nc; i++ {
@@ -663,13 +722,9 @@ func csharpExtensionReceiverType(methodNode *sitter.Node, src []byte) string {
 		}
 	}
 	if !hasThis {
-		return ""
+		return nil
 	}
-	t := first.ChildByFieldName("type")
-	if t == nil {
-		return ""
-	}
-	return normalizeCSharpBaseName(t.Content(src))
+	return first.ChildByFieldName("type")
 }
 
 // csharpEnclosingNamespace returns the dotted name of the enclosing
@@ -906,11 +961,32 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	if extType := csharpExtensionReceiverType(def.Node, src); extType != "" {
 		meta["extension"] = true
 		meta["this_param_type"] = extType
+		tparams := csharpMethodTypeParamNames(def.Node, src)
 		// `Foo<T>(this T v)` — the this-param names the method's own
 		// type parameter, i.e. it matches any receiver; the binder must
-		// not treat it as a concrete type named "T".
-		if csharpMethodTypeParamNames(def.Node, src)[extType] {
+		// not treat it as a concrete type named "T". A `where T : X`
+		// clause bounds that: the constraint core names ride along so
+		// the binder can exclude receivers that provably fail them.
+		if tparams[extType] {
 			meta["this_param_generic"] = true
+			if cons := csharpTypeParamConstraints(def.Node, src, extType); len(cons) > 0 {
+				meta["this_param_constraints"] = strings.Join(cons, ",")
+			}
+		}
+		// Shape (generic args, array/nullable suffixes) is part of
+		// applicability — it rides beside the bare core stamp.
+		if raw := csharpExtensionReceiverRaw(def.Node, src); raw != "" {
+			if shape := csharpCanonTypeShape(raw); shape != "" && shape != extType {
+				meta["this_param_shape"] = shape
+			}
+		}
+		if len(tparams) > 0 {
+			names := make([]string, 0, len(tparams))
+			for n := range tparams {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			meta["method_type_params"] = strings.Join(names, ",")
 		}
 	}
 	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
@@ -1393,6 +1469,68 @@ func normalizeCSharpBaseName(raw string) string {
 		raw = raw[idx+1:]
 	}
 	return strings.TrimSpace(raw)
+}
+
+// csharpCanonTypeShape collapses a raw type spelling to its canonical
+// shape — whitespace dropped, structure (generic arguments, array /
+// nullable suffixes, qualification) kept verbatim. "" for empty input
+// and for the `var` placeholder (no declared shape).
+func csharpCanonTypeShape(raw string) string {
+	s := strings.Join(strings.Fields(raw), "")
+	if s == "" || s == "var" {
+		return ""
+	}
+	return s
+}
+
+// csharpTypeParamConstraints returns the core names of the type
+// constraints declared for the given method type parameter (`where T :
+// ITagged, IOther` → [ITagged, IOther]). Primary-kind constraints
+// (class / struct / notnull / unmanaged / new()) carry no type identity
+// and are skipped.
+func csharpTypeParamConstraints(methodNode *sitter.Node, src []byte, param string) []string {
+	if methodNode == nil {
+		return nil
+	}
+	var out []string
+	for i, _nc := 0, int(methodNode.NamedChildCount()); i < _nc; i++ {
+		clause := methodNode.NamedChild(i)
+		if clause == nil || clause.Type() != "type_parameter_constraints_clause" {
+			continue
+		}
+		target := ""
+		if n := clause.ChildByFieldName("target"); n != nil {
+			target = strings.TrimSpace(n.Content(src))
+		} else {
+			for j, _jc := 0, int(clause.NamedChildCount()); j < _jc; j++ {
+				c := clause.NamedChild(j)
+				if c != nil && c.Type() == "identifier" {
+					target = strings.TrimSpace(c.Content(src))
+					break
+				}
+			}
+		}
+		if target != param {
+			continue
+		}
+		walkNodes(clause, func(n *sitter.Node) {
+			if n.Type() != "type_parameter_constraint" {
+				return
+			}
+			txt := strings.TrimSpace(n.Content(src))
+			switch txt {
+			case "class", "class?", "struct", "notnull", "unmanaged":
+				return
+			}
+			if strings.Contains(txt, "(") { // new()
+				return
+			}
+			if name := normalizeCSharpBaseName(txt); name != "" && name != param {
+				out = append(out, name)
+			}
+		})
+	}
+	return out
 }
 
 // extractCSharpMethodReturnType walks a method_declaration node for

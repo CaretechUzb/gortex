@@ -50,7 +50,6 @@ func TestResolveCSharpExtension_InstanceMemberPrecedence(t *testing.T) {
 // the array overload must win even though the scalar one sits in the caller's
 // own enclosing namespace.
 func TestResolveCSharpExtension_ArrayReceiverPrefersArrayOverload(t *testing.T) {
-	t.Skip("pending R2: lossless receiver type shape (fails today — verified)")
 	g := buildCSharpResolverGraph(t, map[string]string{
 		"AppExt.cs": `namespace App {
     public static class ScalarExt { public static int Foo(this string value) { return 1; } }
@@ -80,7 +79,6 @@ namespace App {
 // where T : ITagged is applicable only to receivers satisfying the
 // constraint — a plain class must not bind it.
 func TestResolveCSharpExtension_ConstrainedGenericNotUniversal(t *testing.T) {
-	t.Skip("pending R2: generic constraints in applicability (fails today — verified)")
 	g := buildCSharpResolverGraph(t, map[string]string{
 		"Ext.cs": `namespace App {
     public interface ITagged {}
@@ -110,7 +108,6 @@ func TestResolveCSharpExtension_ConstrainedGenericNotUniversal(t *testing.T) {
 // not typed-match Foo(this List<string>) — generic arguments are part of the
 // receiver's identity.
 func TestResolveCSharpExtension_GenericArgsDistinguishReceivers(t *testing.T) {
-	t.Skip("pending R2: generic-argument identity (fails today — verified)")
 	g := buildCSharpResolverGraph(t, map[string]string{
 		"Ext.cs": `using System.Collections.Generic;
 namespace App {
