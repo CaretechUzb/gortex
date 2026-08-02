@@ -24,28 +24,75 @@ func TestLargeDirectParseAdmissionWeightPreservesBoundedParallelism(t *testing.T
 	durableStore := &admissionBulkStore{Store: graph.New()}
 
 	tests := []struct {
-		name       string
-		store      graph.Store
-		streaming  bool
-		files      int
-		inputBytes int64
-		want       int64
+		name                string
+		store               graph.Store
+		streaming           bool
+		files               int
+		inputBytes          int64
+		nativePressureFiles int
+		nativePressureBytes int64
+		want                int64
 	}{
 		{name: "empty durable parse", store: durableStore},
 		{name: "small durable parse", store: durableStore, files: 1, inputBytes: 1},
 		{name: "large in-memory shadow", store: memoryStore, files: defaultShadowMaxFileCount, inputBytes: defaultShadowMaxBytes},
 		{name: "large streaming parse", store: durableStore, streaming: true, files: defaultShadowMaxFileCount, inputBytes: defaultShadowMaxBytes},
-		{name: "large durable file count", store: durableStore, files: defaultShadowMaxFileCount, want: largeDirectAdmissionCapacity},
-		{name: "large durable byte count", store: durableStore, files: 1, inputBytes: defaultShadowMaxBytes, want: largeDirectAdmissionCapacity},
+		{name: "large lightweight file count", store: durableStore, files: defaultShadowMaxFileCount, want: largeDirectLightweightParseWeight},
+		{name: "large lightweight byte count", store: durableStore, files: 1, inputBytes: defaultShadowMaxBytes, want: largeDirectLightweightParseWeight},
+		{name: "large native byte pressure", store: durableStore, files: 1, inputBytes: defaultShadowMaxBytes, nativePressureBytes: nativeParsePressureThresholdBytes, want: largeDirectNativePressureWeight},
+		{name: "large native file pressure", store: durableStore, files: defaultShadowMaxFileCount, nativePressureFiles: defaultShadowMaxFileCount, want: largeDirectNativePressureWeight},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := largeDirectParseAdmissionWeight(tt.store, tt.streaming, tt.files, tt.inputBytes)
+			got := largeDirectParseAdmissionWeight(
+				tt.store, tt.streaming, tt.files, tt.inputBytes,
+				tt.nativePressureFiles, tt.nativePressureBytes,
+			)
 			if got != tt.want {
 				t.Fatalf("largeDirectParseAdmissionWeight() = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLargeDirectAdmissionAllowsOneLightAlongsideNativePressure(t *testing.T) {
+	budget := newLargeDirectAdmissionBudget(largeDirectAdmissionCapacity)
+	pressure, err := budget.acquire(t.Context(), largeDirectNativePressureWeight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pressure.Release()
+
+	light, err := budget.acquire(t.Context(), largeDirectLightweightParseWeight)
+	if err != nil {
+		t.Fatalf("light parse did not overlap native pressure: %v", err)
+	}
+
+	blocked := make(chan *largeDirectAdmissionLease, 1)
+	go func() {
+		lease, _ := budget.acquire(t.Context(), largeDirectLightweightParseWeight)
+		blocked <- lease
+	}()
+	waitForLargeDirectAdmission(t, budget, func(stats largeDirectAdmissionStats) bool {
+		return stats.used == largeDirectAdmissionCapacity && stats.waiters == 1
+	})
+	select {
+	case lease := <-blocked:
+		lease.Release()
+		t.Fatal("second light parse exceeded bounded overlap")
+	default:
+	}
+
+	light.Release()
+	select {
+	case lease := <-blocked:
+		if lease == nil {
+			t.Fatal("queued light parse was not granted")
+		}
+		lease.Release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued light parse did not enter after permit release")
 	}
 }
 

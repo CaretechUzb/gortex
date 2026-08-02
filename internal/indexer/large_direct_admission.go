@@ -9,7 +9,15 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-const largeDirectAdmissionCapacity int64 = 1
+const (
+	// One native-pressure parse costs two permits and one lightweight large
+	// direct parse costs one. Capacity three therefore keeps native-pressure
+	// repositories mutually exclusive while allowing exactly one bounded light
+	// parse to overlap; at most three light parses can coexist.
+	largeDirectAdmissionCapacity      int64 = 3
+	largeDirectNativePressureWeight   int64 = 2
+	largeDirectLightweightParseWeight int64 = 1
+)
 
 // largeDirectAdmissionBudget bounds intrinsically large repository parses that
 // stream directly into a durable store. The existing parseAdmissionBudget
@@ -61,6 +69,8 @@ func largeDirectParseAdmissionWeight(
 	streaming bool,
 	files int,
 	inputBytes int64,
+	nativePressureFiles int,
+	nativePressureBytes int64,
 ) int64 {
 	if files <= 0 || streaming {
 		return 0
@@ -71,7 +81,11 @@ func largeDirectParseAdmissionWeight(
 	if !largeDirectParseNeedsHeapRelease(true, files, inputBytes) {
 		return 0
 	}
-	return largeDirectAdmissionCapacity
+	if nativePressureFiles >= defaultShadowMaxFileCount ||
+		nativePressureBytes >= nativeParsePressureThresholdBytes {
+		return largeDirectNativePressureWeight
+	}
+	return largeDirectLightweightParseWeight
 }
 
 func (budget *largeDirectAdmissionBudget) acquire(

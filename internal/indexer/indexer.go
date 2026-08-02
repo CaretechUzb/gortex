@@ -2653,8 +2653,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// the bounded per-call disk path instead of pinning the whole
 	// post-parse graph in RAM and OOMing (see #120).
 	var totalFileBytes int64
+	var nativePressureFileBytes int64
+	var nativePressureFiles int
 	for i := range files {
 		totalFileBytes = saturatingAddByteCount(totalFileBytes, files[i].size)
+		if nativeParsePressureLanguage(files[i].lang) {
+			nativePressureFiles++
+			nativePressureFileBytes = saturatingAddByteCount(nativePressureFileBytes, files[i].size)
+		}
 	}
 	maxShadowBytes := shadowMaxBytes()
 	belowShadowBytes := totalFileBytes <= maxShadowBytes
@@ -2668,6 +2674,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// parser/batch tail; shadows keep the lease through the deferred drain below.
 	// This is intentionally separate from the nested raw/native per-file gates.
 	memoryWeight := indexMemoryAdmissionWeight(len(files), totalFileBytes)
+	if !shadowLocallyEligible {
+		memoryWeight = directIndexMemoryAdmissionWeight(nativePressureFiles, nativePressureFileBytes)
+	}
 	memoryBudget := idx.indexMemoryAdmission
 	if memoryBudget == nil {
 		memoryBudget = processIndexMemoryAdmission
@@ -2685,6 +2694,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			zap.String("repo", idx.RepoPrefix()),
 			zap.Int("files", len(files)),
 			zap.Int64("input_bytes", totalFileBytes),
+			zap.Int("native_pressure_files", nativePressureFiles),
+			zap.Int64("native_pressure_bytes", nativePressureFileBytes),
 			zap.Bool("shadow_eligible", shadowLocallyEligible),
 			zap.Int64("requested_weight_bytes", memoryWeight),
 			zap.Int64("weight_bytes", memoryLease.weight),
@@ -2971,6 +2982,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	streamingParse := diskTarget == nil && streamingFlushActive(idx.graph, len(files))
 	largeDirectWeight := largeDirectParseAdmissionWeight(
 		idx.graph, streamingParse, len(files), totalFileBytes,
+		nativePressureFiles, nativePressureFileBytes,
 	)
 	largeDirectBudget := idx.largeDirectAdmission
 	if largeDirectBudget == nil {
@@ -2989,6 +3001,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			zap.String("repo", idx.repoPrefix),
 			zap.Int("files", len(files)),
 			zap.Int64("input_bytes", totalFileBytes),
+			zap.Int("native_pressure_files", nativePressureFiles),
+			zap.Int64("native_pressure_bytes", nativePressureFileBytes),
+			zap.Int64("weight", largeDirectLease.weight),
 			zap.Duration("waited", admittedAt.Sub(admissionStarted)),
 			zap.Int64("capacity", stats.capacity),
 			zap.Int64("used", stats.used),

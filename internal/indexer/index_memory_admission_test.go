@@ -12,42 +12,45 @@ import (
 )
 
 func TestIndexMemoryAdmissionWeightSeparatesPressureShadowFromLargeDirect(t *testing.T) {
-	// This reproduces the live cold-start shape that drove the envelope:
-	// codebase-memory-mcp was a 1.30 GiB direct parse while axonhub held a
-	// pressure-sized shadow. Their uncoordinated overlap produced a 6.27 GiB
-	// heap high-water and 14 one-second passive-checkpoint timeouts, versus zero
-	// checkpoint timeouts in the sealed run.
+	// This reproduces the measured cold-start shape. codebase-memory-mcp has
+	// 1.2917 GiB of C/C++ source whose native allocator high-water accumulates;
+	// gortex-bench has 2.17 GiB of JSON/config input but no C-family source and
+	// increased RSS by only about 0.35 GiB because its direct graph batches are
+	// bounded. The pressure direct parse may overlap the light direct parse, but
+	// must still exclude axonhub's pressure-sized in-memory shadow.
 	const (
-		directFiles        = 1776
-		directBytes        = int64(1_297_649_391)
-		observedAxonWeight = int64(346_946_586)
+		nativePressureFiles = 1505
+		nativePressureBytes = int64(1_291_747_571)
+		observedAxonWeight  = int64(346_946_586)
 	)
 
-	directWeight := indexMemoryAdmissionWeight(directFiles, directBytes)
+	directWeight := directIndexMemoryAdmissionWeight(nativePressureFiles, nativePressureBytes)
+	lightDirectWeight := directIndexMemoryAdmissionWeight(0, 0)
 	pressureWeight := observedAxonWeight + indexMemoryAdmissionRepoOverhead
-	if directWeight != 2_895_191_518 {
-		t.Fatalf("direct weight = %d, want 2895191518", directWeight)
+	if directWeight != 2_847_867_366 {
+		t.Fatalf("pressure direct weight = %d, want 2847867366", directWeight)
+	}
+	if lightDirectWeight != directIndexMemoryAdmissionFloorBytes {
+		t.Fatalf("light direct weight = %d, want floor %d", lightDirectWeight, directIndexMemoryAdmissionFloorBytes)
 	}
 	if pressureWeight != 414_055_450 {
 		t.Fatalf("pressure weight = %d, want 414055450", pressureWeight)
 	}
 	if directWeight+pressureWeight <= defaultIndexMemoryAdmissionBytes {
-		t.Fatalf("large direct + pressure shadow unexpectedly fit: %d + %d <= %d",
+		t.Fatalf("pressure direct + pressure shadow unexpectedly fit: %d + %d <= %d",
 			directWeight, pressureWeight, defaultIndexMemoryAdmissionBytes)
 	}
-
-	smallWeight := indexMemoryAdmissionWeight(1, 1)
-	if directWeight+smallWeight > defaultIndexMemoryAdmissionBytes {
-		t.Fatalf("large direct should retain headroom for small overlap: %d + %d > %d",
-			directWeight, smallWeight, defaultIndexMemoryAdmissionBytes)
+	if directWeight+lightDirectWeight > defaultIndexMemoryAdmissionBytes {
+		t.Fatalf("pressure and light direct parses should fit: %d + %d > %d",
+			directWeight, lightDirectWeight, defaultIndexMemoryAdmissionBytes)
 	}
 }
 
 func TestIndexMemoryAdmissionQueuedPressureAllowsBoundedSmallOverlap(t *testing.T) {
 	budget := newIndexMemoryAdmissionBudget(defaultIndexMemoryAdmissionBytes)
-	directWeight := indexMemoryAdmissionWeight(1776, 1_297_649_391)
+	directWeight := directIndexMemoryAdmissionWeight(1505, 1_291_747_571)
 	pressureWeight := int64(346_946_586) + indexMemoryAdmissionRepoOverhead
-	smallWeight := indexMemoryAdmissionWeight(1, 1)
+	smallWeight := directIndexMemoryAdmissionWeight(0, 0)
 
 	direct, err := budget.acquire(t.Context(), directWeight)
 	if err != nil {
@@ -60,8 +63,9 @@ func TestIndexMemoryAdmissionQueuedPressureAllowsBoundedSmallOverlap(t *testing.
 	}()
 	waitForIndexMemoryWaiters(t, budget, 1)
 
-	// The later small repository fits in the direct parse's remaining 326 MiB.
-	// It must bypass the queued pressure shadow instead of being stranded behind
+	// The later lightweight direct repository fits in the native-pressure
+	// parse's remaining 356 MiB. It must bypass the queued pressure shadow
+	// instead of being stranded behind
 	// the FIFO head as semaphore.Weighted did.
 	smallCtx, cancelSmall := context.WithTimeout(t.Context(), time.Second)
 	defer cancelSmall()
