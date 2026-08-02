@@ -31,6 +31,12 @@ type resolveGuardRecord struct {
 	Payload    persistedEdgeSpoolSnapshot
 }
 
+type resolveGuardWorkSpool interface {
+	appendJobs([][]reindexJob) error
+	nextPage(int) ([]resolveGuardRecord, bool, error)
+	close()
+}
+
 type resolveGuardSpool struct {
 	records []resolveGuardRecord
 	readAt  int

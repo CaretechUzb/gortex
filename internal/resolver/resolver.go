@@ -246,6 +246,9 @@ type Resolver struct {
 	// chunkYieldHook is a deterministic same-instance interleave seam used by
 	// resolver tests. Nil in production.
 	chunkYieldHook func()
+	// guardSpoolFactory is a deterministic failure-injection seam for tests.
+	// Production uses newResolveGuardSpool directly.
+	guardSpoolFactory func() (resolveGuardWorkSpool, error)
 	// validateLiveness turns on the concurrent-edit guard on the chunked
 	// ResolveAll path: it releases mu between chunks so an interactive edit
 	// can interleave and evict an edge the pass already resolved. With it on,
@@ -642,7 +645,12 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	if pendingErr != nil {
 		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, pendingErr
 	}
-	if len(pending) == 0 && streamDone && !r.hasDeferredLSPRetryForScope() {
+	hasDeferredLSP, err := r.hasDeferredLSPRetryForScope()
+	if err != nil {
+		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter},
+			fmt.Errorf("resolver: inspect deferred LSP spool: %w", err)
+	}
+	if len(pending) == 0 && streamDone && !hasDeferredLSP {
 		stats := &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}
 		if err := graph.CompleteOwnedResolvePass(r.graph, resolveState); err != nil {
 			return stats, fmt.Errorf("resolver: clear completed pass: %w", err)
@@ -758,10 +766,15 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	if superChunk < 1 {
 		superChunk = 1
 	}
-	guardSpool, guardSpoolErr := newResolveGuardSpool()
-	if guardSpoolErr != nil {
-		r.logger.Error("resolver: create guard spool", zap.Error(guardSpoolErr))
-		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, guardSpoolErr
+	var guardSpool resolveGuardWorkSpool
+	if r.guardSpoolFactory != nil {
+		guardSpool, err = r.guardSpoolFactory()
+	} else {
+		guardSpool, err = newResolveGuardSpool()
+	}
+	if err != nil {
+		r.logger.Error("resolver: create guard spool", zap.Error(err))
+		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, err
 	}
 	defer guardSpool.close()
 	guardRepos := make(map[string]struct{})
@@ -972,11 +985,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 					pageMutationRevision, _ = loadMutationRevision(r.graph)
 				}
 			}
-			if guardSpoolErr == nil {
-				guardSpoolErr = guardSpool.appendJobs(perWorkerJobs)
-				if guardSpoolErr != nil {
-					r.logger.Error("resolver: append guard spool", zap.Error(guardSpoolErr))
-				}
+			if err := guardSpool.appendJobs(perWorkerJobs); err != nil {
+				r.logger.Error("resolver: append guard spool", zap.Error(err))
+				return resolveError(fmt.Errorf("resolver: append guard spool: %w", err))
 			}
 			for i := range perWorkerJobs {
 				for j := range perWorkerJobs[i] {
@@ -1027,6 +1038,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		if r.lspDeferredSpool != nil && len(pageDeferredLSP) > 0 {
 			if err := r.lspDeferredSpool.append(pageDeferredLSP); err != nil {
 				r.logger.Error("resolver: append deferred LSP spool", zap.Error(err))
+				return resolveError(fmt.Errorf("resolver: append deferred LSP spool: %w", err))
 			}
 		}
 		r.clearLookupCache()
@@ -1107,7 +1119,21 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		lspRecordsDrained int
 		lspSpoolReadDur   time.Duration
 		lspHydrateDur     time.Duration
+		lspSpoolErr       error
 	)
+	recordLSPSpoolError := func(operation string, err error) {
+		if err == nil {
+			return
+		}
+		wrapped := fmt.Errorf("%s: %w", operation, err)
+		if lspSpoolErr == nil {
+			lspSpoolErr = wrapped
+			return
+		}
+		// Preserve every cleanup failure in the returned diagnostic while
+		// retaining errors.Is support for the most recently observed cause.
+		lspSpoolErr = fmt.Errorf("%v; %w", lspSpoolErr, wrapped)
+	}
 	if r.lspDeferredSpool != nil {
 		var start *deferredLSPWorkKey
 		if r.lspDeferredCursorSet {
@@ -1157,6 +1183,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				}
 				if err := r.lspDeferredSpool.deleteKeys(staleKeys); err != nil {
 					r.logger.Error("resolver: delete stale deferred LSP work", zap.Error(err))
+					recordLSPSpoolError("delete stale deferred LSP work", err)
 					return false
 				}
 			} else {
@@ -1167,6 +1194,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			excludeDrained(keys)
 			if err := r.lspDeferredSpool.markCarried(keys); err != nil {
 				r.logger.Error("resolver: mark drained deferred LSP work", zap.Error(err))
+				recordLSPSpoolError("mark drained deferred LSP work", err)
 				return false
 			}
 			lspPagesDrained++
@@ -1180,6 +1208,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				lspSpoolReadDur += time.Since(readStart)
 				if err != nil {
 					r.logger.Error("resolver: drain deferred LSP spool keys", zap.Error(err))
+					recordLSPSpoolError("drain deferred LSP spool keys", err)
 					return false
 				}
 				if len(keys) == 0 {
@@ -1208,6 +1237,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				if drainKeySegment(from, to) {
 					if err := r.lspDeferredSpool.markCarriedRange(from, to); err != nil {
 						r.logger.Error("resolver: mark drained deferred LSP range", zap.Error(err))
+						recordLSPSpoolError("mark drained deferred LSP range", err)
 					}
 				}
 				return
@@ -1219,11 +1249,13 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			}
 			if err := r.lspDeferredSpool.markCarriedRange(from, nil); err != nil {
 				r.logger.Error("resolver: mark drained deferred LSP range", zap.Error(err))
+				recordLSPSpoolError("mark drained deferred LSP tail", err)
 				return
 			}
 			if drainKeySegment(nil, iterator.start) {
 				if err := r.lspDeferredSpool.markCarriedRange(nil, iterator.start); err != nil {
 					r.logger.Error("resolver: mark drained deferred LSP range", zap.Error(err))
+					recordLSPSpoolError("mark drained deferred LSP head", err)
 				}
 			}
 		}
@@ -1233,6 +1265,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			lspSpoolReadDur += time.Since(spoolReadStart)
 			if err != nil {
 				r.logger.Error("resolver: read deferred LSP spool", zap.Error(err))
+				recordLSPSpoolError("read deferred LSP spool", err)
 				break
 			}
 			if len(records) == 0 && done {
@@ -1321,17 +1354,26 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			}
 			if err := r.lspDeferredSpool.markCarried(carried); err != nil {
 				r.logger.Error("resolver: mark deferred LSP retries", zap.Error(err))
+				recordLSPSpoolError("mark deferred LSP retries", err)
 				break
 			}
 			if err := r.lspDeferredSpool.deleteKeys(completed); err != nil {
 				r.logger.Error("resolver: delete completed deferred LSP work", zap.Error(err))
+				recordLSPSpoolError("delete completed deferred LSP work", err)
 				break
 			}
 			if done {
 				break
 			}
 		}
-		if r.lspDeferredSpool.count() == 0 {
+		if lspSpoolErr != nil {
+			return resolveError(fmt.Errorf("resolver: deferred LSP spool: %w", lspSpoolErr))
+		}
+		remaining, err := r.lspDeferredSpool.countExact()
+		if err != nil {
+			return resolveError(fmt.Errorf("resolver: inspect deferred LSP spool after replay: %w", err))
+		}
+		if remaining == 0 {
 			r.lspDeferredSpool.close()
 			r.lspDeferredSpool = nil
 		}
@@ -1421,7 +1463,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	} else {
 		guardClosure = r.buildImportClosureFiltered(guardRepos)
 	}
-	if guardSpoolErr == nil && len(guardClosure) > 0 {
+	if len(guardClosure) > 0 {
 		guardPages := 0
 		guardJobs := 0
 		lastGuardLog := time.Now()
@@ -1432,11 +1474,16 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			records, exhausted, err := guardSpool.nextPage(resolvePendingPageRows)
 			if err != nil {
 				r.logger.Error("resolver: read guard spool", zap.Error(err))
-				break
+				return resolveError(fmt.Errorf("resolver: read guard spool: %w", err))
 			}
 			jobs := guardJobsFromRecords(r.graph, records)
 			r.warmGuardLookupCache(jobs)
-			guarded += r.guardCrossPackageCallEdges(jobs, guardClosure)
+			pageGuarded, err := r.guardCrossPackageCallEdges(jobs, guardClosure)
+			guarded += pageGuarded
+			if err != nil {
+				r.clearLookupCache()
+				return resolveError(fmt.Errorf("resolver: cross-package guard: %w", err))
+			}
 			r.clearLookupCache()
 			guardPages++
 			guardJobs += len(jobs)
@@ -2590,7 +2637,11 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 		return
 	}
 	if closure := r.buildImportClosure(); len(closure) > 0 {
-		if guarded := r.guardCrossPackageCallEdges(jobs, closure); guarded > 0 {
+		guarded, err := r.guardCrossPackageCallEdges(jobs, closure)
+		if err != nil {
+			r.logger.Error("resolver: refresh incremental guard spool records", zap.Error(err))
+		}
+		if guarded > 0 {
 			if stats.Resolved >= guarded {
 				stats.Resolved -= guarded
 			} else {
