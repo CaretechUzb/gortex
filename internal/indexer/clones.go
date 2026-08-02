@@ -343,6 +343,7 @@ func finaliseCloneCorpusCtx(ctx context.Context, g graph.Store, repoPrefix strin
 	baseline := &cloneCorpusBaseline{repoPrefix: repoPrefix}
 	pager, paged := g.(graph.CloneCorpusPager)
 	writer, writable := g.(graph.CloneCorpusWriter)
+	signatureWriter, signatureOnly := g.(graph.CloneCorpusSignatureWriter)
 	initialization, stateful := g.(graph.CloneCorpusInitialization)
 	if !paged || !writable {
 		baseline.items, baseline.corpus = finaliseCloneSignaturesFromNodes(g, repoPrefix)
@@ -470,6 +471,10 @@ func finaliseCloneCorpusCtx(ctx context.Context, g graph.Store, repoPrefix strin
 		if len(page) == 0 {
 			break
 		}
+		var signatureUpdates []graph.CloneCorpusSignatureUpdate
+		if signatureOnly {
+			signatureUpdates = make([]graph.CloneCorpusSignatureUpdate, 0, len(page))
+		}
 		for i := range page {
 			row := &page[i]
 			sig, ok := computeCloneSigFromShingles(baseline.cms, threshold, useFilter, row.Shingles)
@@ -479,8 +484,18 @@ func finaliseCloneCorpusCtx(ctx context.Context, g graph.Store, repoPrefix strin
 				row.Signature = clones.EncodeSignature(sig)
 				addItem(clones.Item{ID: row.NodeID, Sig: sig, TokenCount: row.TokenCount})
 			}
+			if signatureOnly {
+				signatureUpdates = append(signatureUpdates, graph.CloneCorpusSignatureUpdate{
+					NodeID: row.NodeID, Signature: row.Signature,
+				})
+			}
 		}
-		if err := writer.BulkSetCloneCorpus(repoPrefix, page); err != nil {
+		if signatureOnly {
+			err = signatureWriter.BulkSetCloneSignatures(repoPrefix, signatureUpdates)
+		} else {
+			err = writer.BulkSetCloneCorpus(repoPrefix, page)
+		}
+		if err != nil {
 			return abort()
 		}
 		after = page[len(page)-1].NodeID

@@ -866,6 +866,26 @@ func (g *Graph) BulkSetCloneCorpus(repoPrefix string, rows []CloneCorpusRow) err
 	return nil
 }
 
+// BulkSetCloneSignatures finalizes existing in-memory corpus entries without
+// copying their unchanged shingle slices.
+func (g *Graph) BulkSetCloneSignatures(repoPrefix string, updates []CloneCorpusSignatureUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	g.cloneShinglesMu.Lock()
+	defer g.cloneShinglesMu.Unlock()
+	for _, update := range updates {
+		entry, ok := g.cloneShingles[update.NodeID]
+		if !ok || entry.repoPrefix != repoPrefix {
+			continue
+		}
+		entry.signature = update.Signature
+		entry.finalized = true
+		g.cloneShingles[update.NodeID] = entry
+	}
+	return nil
+}
+
 // CloneCorpusPage is the in-memory CloneCorpusPager: one repo's projection
 // in stable node-id order, afterNodeID exclusive. Serving the paged corpus
 // here flips the clone finalise / warm-rebuild paths onto sidecar TokenCount

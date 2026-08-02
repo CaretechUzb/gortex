@@ -9,10 +9,11 @@ import (
 )
 
 var (
-	_ graph.CloneCorpusWriter         = (*Store)(nil)
-	_ graph.CloneCorpusPager          = (*Store)(nil)
-	_ graph.CloneCorpusRepoReplacer   = (*Store)(nil)
-	_ graph.CloneCorpusInitialization = (*Store)(nil)
+	_ graph.CloneCorpusWriter          = (*Store)(nil)
+	_ graph.CloneCorpusSignatureWriter = (*Store)(nil)
+	_ graph.CloneCorpusPager           = (*Store)(nil)
+	_ graph.CloneCorpusRepoReplacer    = (*Store)(nil)
+	_ graph.CloneCorpusInitialization  = (*Store)(nil)
 )
 
 const cloneCorpusPageSize = 1024
@@ -103,6 +104,76 @@ func (s *Store) BulkSetCloneCorpus(repoPrefix string, rows []graph.CloneCorpusRo
 		return err
 	}
 	return tx.Commit()
+}
+
+// BulkSetCloneSignatures finalizes existing clone-corpus rows without encoding
+// or rewriting their unchanged shingle BLOBs. Both sidecar and promoted node
+// signatures are updated in the same transaction.
+func (s *Store) BulkSetCloneSignatures(repoPrefix string, updates []graph.CloneCorpusSignatureUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := updateCloneSignaturesTx(tx, repoPrefix, updates); err != nil {
+		return err
+	}
+	if err := markCloneCorpusInitializedTx(tx, repoPrefix); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func updateCloneSignaturesTx(tx *sql.Tx, repoPrefix string, updates []graph.CloneCorpusSignatureUpdate) error {
+	for start := 0; start < len(updates); start += shingleChunk {
+		end := min(start+shingleChunk, len(updates))
+		batch := updates[start:end]
+		ids := make([]string, 0, len(batch))
+		args := make([]any, 0, len(batch)*3+1)
+		var cases strings.Builder
+		cases.WriteString("CASE node_id")
+		for _, update := range batch {
+			if update.NodeID == "" {
+				continue
+			}
+			cases.WriteString(" WHEN ? THEN ?")
+			args = append(args, update.NodeID, update.Signature)
+			ids = append(ids, update.NodeID)
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		cases.WriteString(" ELSE signature END")
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+		args = append(args, repoPrefix)
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		query := `UPDATE clone_shingles SET signature = ` + cases.String() + `
+WHERE repo_prefix = ? AND node_id IN (` + placeholders + `)`
+		if _, err := tx.Exec(query, args...); err != nil {
+			return err
+		}
+
+		nodeArgs := make([]any, 0, len(ids)+1)
+		for _, id := range ids {
+			nodeArgs = append(nodeArgs, id)
+		}
+		nodeArgs = append(nodeArgs, repoPrefix)
+		updateNodes := `UPDATE nodes
+SET clone_sig = NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id), '')
+WHERE id IN (` + placeholders + `) AND repo_prefix = ?
+  AND clone_sig IS NOT NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id), '')`
+		if _, err := tx.Exec(updateNodes, nodeArgs...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ReplaceCloneCorpus atomically resets one repository's projection. It is the

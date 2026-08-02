@@ -1466,6 +1466,21 @@ type CloneCorpusWriter interface {
 	BulkSetCloneCorpus(repoPrefix string, rows []CloneCorpusRow) error
 }
 
+// CloneCorpusSignatureUpdate is the finalized signature projection for one
+// existing clone-corpus row. An empty Signature is authoritative and means the
+// body was filtered out after CMS boilerplate removal.
+type CloneCorpusSignatureUpdate struct {
+	NodeID    string
+	Signature string
+}
+
+// CloneCorpusSignatureWriter updates finalized signatures without rewriting
+// the unchanged raw-shingle BLOB. Backends may omit this optimization; callers
+// then fall back to CloneCorpusWriter with complete rows.
+type CloneCorpusSignatureWriter interface {
+	BulkSetCloneSignatures(repoPrefix string, updates []CloneCorpusSignatureUpdate) error
+}
+
 // CloneCorpusRepoReplacer resets one repository's authoritative clone
 // projection before a full shadow drain. The empty replacement must clear
 // stale rows left by a prior index.
