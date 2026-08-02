@@ -1147,12 +1147,21 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 // of declared modules to their dep contract node instead of an external::
 // stub. Split out of RunDeferredPasses so the batch driver can run it
 // serially across repos ahead of the parallel enrichment phase.
-func (idx *Indexer) runDeferredGoMod() {
-	if idx.pendingContractReg == nil || idx.deferredGoModDone {
-		return
+func runDeferredGoModOnce(pending bool, done *bool, drain func()) bool {
+	if !pending || done == nil || *done {
+		return false
 	}
-	idx.extractGoModContracts(idx.pendingContractReg)
-	idx.deferredGoModDone = true
+	if drain != nil {
+		drain()
+	}
+	*done = true
+	return true
+}
+
+func (idx *Indexer) runDeferredGoMod() {
+	runDeferredGoModOnce(idx.pendingContractReg != nil, &idx.deferredGoModDone, func() {
+		idx.extractGoModContracts(idx.pendingContractReg)
+	})
 }
 
 // runDeferredEnrich runs semantic enrichment for this repo. The manager fetches

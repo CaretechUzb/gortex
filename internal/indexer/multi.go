@@ -909,7 +909,13 @@ func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	setupStart := time.Now()
 	master := mi.newMasterResolver(useLSP)
+	mi.logger.Info("DEFERRED-TIMING master setup",
+		zap.Duration("elapsed", time.Since(setupStart)),
+		zap.Bool("initialized", master != nil),
+		zap.Bool("lsp_enabled", useLSP && mi.resolverLSPHelper != nil),
+		zap.Int("scope_repos", len(scope)))
 	if master == nil {
 		if onComputeDone != nil && ctx.Err() == nil {
 			onComputeDone()
@@ -1030,6 +1036,10 @@ func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []st
 }
 
 func (mi *MultiIndexer) runDeferredGoModAll() {
+	var memBefore runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
+	started := time.Now()
+
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
 	for _, idx := range mi.indexers {
@@ -1039,9 +1049,47 @@ func (mi *MultiIndexer) runDeferredGoModAll() {
 	sort.Slice(indexers, func(i, j int) bool {
 		return indexers[i].repoPrefix < indexers[j].repoPrefix
 	})
+
+	pending := 0
 	for _, idx := range indexers {
+		wasPending := idx.pendingContractReg != nil && !idx.deferredGoModDone
+		repoStart := time.Now()
 		idx.runDeferredGoMod()
+		elapsed := time.Since(repoStart)
+		if wasPending {
+			pending++
+		}
+		if wasPending && elapsed > 250*time.Millisecond && mi.logger != nil {
+			mi.logger.Info("DEFERRED-TIMING deferred go.mod repo",
+				zap.String("repo_prefix", idx.repoPrefix),
+				zap.Duration("elapsed", elapsed))
+		}
 	}
+
+	var memAfter runtime.MemStats
+	runtime.ReadMemStats(&memAfter)
+	if mi.logger != nil {
+		mi.logger.Info("DEFERRED-TIMING deferred go.mod drain",
+			zap.Duration("elapsed", time.Since(started)),
+			zap.Int("repos", len(indexers)),
+			zap.Int("pending_repos", pending),
+			zap.Uint64("heap_alloc_before", memBefore.HeapAlloc),
+			zap.Uint64("heap_alloc_after", memAfter.HeapAlloc),
+			zap.Uint64("heap_inuse_before", memBefore.HeapInuse),
+			zap.Uint64("heap_inuse_after", memAfter.HeapInuse),
+			zap.Uint64("heap_released_before", memBefore.HeapReleased),
+			zap.Uint64("heap_released_after", memAfter.HeapReleased),
+			zap.Uint32("gc_before", memBefore.NumGC),
+			zap.Uint32("gc_after", memAfter.NumGC))
+	}
+}
+
+// RunDeferredGoModAll materializes deferred dependency contract nodes for all
+// repositories. Each per-repository drain is idempotent, so warmup can run it
+// while a coordinated bulk load is still open and the normal pre-enrichment
+// path remains a safe fallback for every other caller.
+func (mi *MultiIndexer) RunDeferredGoModAll() {
+	mi.runDeferredGoModAll()
 }
 
 // runDeferredEnrichParallel runs each indexer's semantic enrichment in a

@@ -342,6 +342,23 @@ func (state *daemonState) takeWarmupSnapshotPayloads() (
 	return repos, contractEntries, vector
 }
 
+// drainGoModAndFinalizeWarmupBulk keeps the dependency-contract drain and the
+// coordinated bulk finalizer in one explicitly ordered operation. The closures
+// make that ordering testable without constructing a daemon or SQLite store.
+func drainGoModAndFinalizeWarmupBulk(drain func(), finalize func() error) (drainElapsed, finalizeElapsed time.Duration, err error) {
+	drainStart := time.Now()
+	if drain != nil {
+		drain()
+	}
+	drainElapsed = time.Since(drainStart)
+	if finalize == nil {
+		return drainElapsed, 0, nil
+	}
+	finalizeStart := time.Now()
+	err = finalize()
+	return drainElapsed, time.Since(finalizeStart), err
+}
+
 func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) (*indexer.MultiWatcher, *warmupTimings) {
 	timings := &warmupTimings{}
 	if state == nil {
@@ -686,16 +703,34 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		}
 		close(jobs)
 		wg.Wait()
+
+		// Materialize go.mod dependency contract nodes while the coordinated
+		// bulk connection is still pinned. The per-indexer drain is idempotent,
+		// so RunPreEnrichResolve retains the same fallback for non-warmup paths
+		// and becomes a cheap no-op here. Keeping these writes ahead of the
+		// final seal includes them in bulk index creation, checkpointing, and
+		// planner statistics instead of reopening ordinary write transactions
+		// immediately after a large cold load.
+		var finalizeBulk func() error
+		if coordinatedBulkActive {
+			finalizeBulk = coordinatedBulk.EndCoordinatedBulkLoad
+		}
+		goModElapsed, flushElapsed, finalizeErr := drainGoModAndFinalizeWarmupBulk(
+			state.multiIndexer.RunDeferredGoModAll,
+			finalizeBulk,
+		)
+		logger.Info("daemon: warmup pre-bulk go.mod drain complete",
+			zap.Duration("elapsed", goModElapsed))
+
 		// Every reconcile and shape guard has finished; release the restored
 		// per-repository mtime maps before the later resolver/enrichment phases.
 		snapshotRepos = nil
 		if coordinatedBulkActive {
-			flushStart := time.Now()
-			if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
-				logger.Error("daemon: coordinated cold bulk-load finalize failed", zap.Error(err))
+			if finalizeErr != nil {
+				logger.Error("daemon: coordinated cold bulk-load finalize failed", zap.Error(finalizeErr))
 			} else {
 				logger.Info("daemon: coordinated cold bulk-load complete",
-					zap.Duration("elapsed", time.Since(flushStart)))
+					zap.Duration("elapsed", flushElapsed))
 			}
 			coordinatedBulkActive = false
 		}
@@ -813,7 +848,10 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	resolveOK := true
 	if anyChanged {
 		phaseStart = time.Now()
+		publishStart := time.Now()
 		publishReadinessPhase(state, "resolve", false, nil)
+		logger.Info("daemon: resolve readiness phase published",
+			zap.Duration("elapsed", time.Since(publishStart)))
 		// markReady fires at the master resolver's compute-done point — the
 		// earliest moment same-repo references are queryable — instead of
 		// after the refinement tail + cross-repo pass (minutes on a large
