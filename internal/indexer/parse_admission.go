@@ -240,8 +240,10 @@ func (idx *Indexer) tryAcquireSharedParsePath(path string) (*parseAdmissionLease
 // preventing independent repository lanes from recreating the startup peak.
 // A non-positive value disables the shared gate while retaining per-repo caps.
 func (mi *MultiIndexer) SetSharedParseMemoryBudget(capacity int64) {
-	admission := newParseAdmissionBudget(capacity)
-	mi.parseAdmission.Store(admission)
+	rawAdmission := newParseAdmissionBudget(capacity)
+	nativeAdmission := newParseAdmissionBudget(capacity)
+	mi.parseAdmission.Store(rawAdmission)
+	mi.nativeParseAdmission.Store(nativeAdmission)
 
 	mi.mu.RLock()
 	live := make([]*Indexer, 0, len(mi.indexers))
@@ -250,6 +252,7 @@ func (mi *MultiIndexer) SetSharedParseMemoryBudget(capacity int64) {
 	}
 	mi.mu.RUnlock()
 	for _, idx := range live {
-		idx.parseAdmission.Store(admission)
+		idx.parseAdmission.Store(rawAdmission)
+		idx.nativeParseAdmission.Store(nativeAdmission)
 	}
 }

@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -214,6 +215,18 @@ func (idx *Indexer) extractFile(
 	pool *crashpool.Pool, q *crashpool.Quarantine,
 	path, relPath, lang string, ext parser.Extractor, src []byte,
 ) (result *parser.ExtractionResult, skipped bool, err error) {
+	return idx.extractFileCtx(
+		context.Background(), nil,
+		pool, q, path, relPath, lang, ext, src,
+	)
+}
+
+func (idx *Indexer) extractFileCtx(
+	ctx context.Context,
+	nativeAdmission *nativeParseExtractionAdmission,
+	pool *crashpool.Pool, q *crashpool.Quarantine,
+	path, relPath, lang string, ext parser.Extractor, src []byte,
+) (result *parser.ExtractionResult, skipped bool, err error) {
 	// Bundled / minified build artifacts are synthetic source — a
 	// minified bundle or a sourcemap has no meaningful symbols and
 	// only pollutes the graph. Detect by content and skip with
@@ -236,7 +249,13 @@ func (idx *Indexer) extractFile(
 		}
 	}
 	if pool == nil {
-		r, eerr := idx.extractWithTimeout(ext, relPath, src)
+		nativeLease, admissionErr := nativeAdmission.acquire(ctx, lang, int64(len(src)))
+		if admissionErr != nil {
+			return nil, false, fmt.Errorf("native parse admission: %w", admissionErr)
+		}
+		r, eerr := idx.extractWithTimeoutDone(ext, relPath, src, func() {
+			nativeLease.Release()
+		})
 		if errors.Is(eerr, errExtractTimeout) {
 			budget := effectiveExtractBudget(idx.config.MaxExtractMillis, len(src))
 			idx.logger.Warn("indexer: file extraction exceeded budget; skipped",

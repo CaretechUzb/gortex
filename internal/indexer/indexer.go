@@ -157,10 +157,16 @@ type Indexer struct {
 	// directly through the bounded graph accumulator.
 	shadowAdmission *shadowAdmissionBudget
 
-	// parseAdmission is the optional daemon-wide bytes-in-flight gate shared by
-	// every repository. Each Indexer keeps its private configured gate too; a
-	// file must satisfy both before its bytes and parse tree are materialised.
+	// parseAdmission is the optional daemon-wide raw bytes-in-flight gate shared
+	// by every repository. Each Indexer keeps its private configured gate too; a
+	// file must satisfy both before its source bytes are materialised.
 	parseAdmission atomic.Pointer[parseAdmissionBudget]
+
+	// nativeParseAdmission is a distinct daemon-wide budget for actual
+	// in-process C-family extraction. Keeping it separate lets generated-parser
+	// projections bypass native-tree admission without weakening the raw-source
+	// memory bound.
+	nativeParseAdmission atomic.Pointer[parseAdmissionBudget]
 
 	// largeDirectAdmission serializes only intrinsically large full-repository
 	// parses that stream directly into the durable store. It complements the
@@ -2847,7 +2853,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			for edges := range inMemShadow.DrainEdgeBatches(persistChunkRows, persistChunkBytes) {
 				diskTarget.AddBatch(nil, edges)
 				edgeRows := len(edges)
-						drainPressure.afterEdgeBatch(edgeRows)
+				drainPressure.afterEdgeBatch(edgeRows)
 			}
 
 			flushStart := time.Now()
@@ -3075,15 +3081,16 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// their parse trees at once. Code files are tiny and flow freely;
 	// only genuinely large inputs queue. budget <= 0 disables the cap.
 	localParseBudget := idx.config.MaxParseBytesInFlight
-	var localParseSem *semaphore.Weighted
+	var localParseSem, localNativeParseSem *semaphore.Weighted
 	if localParseBudget > 0 {
 		localParseSem = semaphore.NewWeighted(localParseBudget)
+		localNativeParseSem = semaphore.NewWeighted(localParseBudget)
 	}
 	sharedParseAdmission := idx.parseAdmission.Load()
-	nativeParseBudget := localParseBudget
-	if sharedParseAdmission != nil {
-		nativeParseBudget = sharedParseAdmission.capacity
-	}
+	sharedNativeParseAdmission := idx.nativeParseAdmission.Load()
+	nativeParseAdmission := newNativeParseExtractionAdmission(
+		localParseBudget, localNativeParseSem, sharedNativeParseAdmission,
+	)
 
 	// In addition to the bytes-in-flight budget above, cap how many
 	// genuinely large files are *read* concurrently: a few huge PDFs /
@@ -3197,7 +3204,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// materialising whole files at once.
 					semStart := time.Now()
 					parseLease, aerr := acquireParseAdmission(
-						ctx, nativeParseAdmissionWeight(wf.lang, wf.size, nativeParseBudget),
+						ctx, wf.size,
 						localParseBudget, localParseSem, sharedParseAdmission,
 					)
 					if aerr != nil {
@@ -3297,7 +3304,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					src = idx.transforms.run(relPath, src)
 
 					extractStart := time.Now()
-					result, skipped, err := idx.extractFile(parsePool, quarantine, path, relPath, lang, ext, src)
+					result, skipped, err := idx.extractFileCtx(
+						ctx, nativeParseAdmission,
+						parsePool, quarantine, path, relPath, lang, ext, src,
+					)
 					atomic.AddInt64(&parseExtractNS, int64(time.Since(extractStart)))
 					omitSecondarySourceScans := extractionDispositionFor(result).omitSecondarySourceScans()
 					recordNativePressure := parsePool == nil && shouldRecordNativeParsePressure(result)

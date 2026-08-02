@@ -84,11 +84,16 @@ type MultiIndexer struct {
 	// immediately stream to SQLite instead of waiting or overcommitting RAM.
 	shadowAdmission *shadowAdmissionBudget
 
-	// parseAdmission is the daemon-wide bytes-in-flight gate propagated to
+	// parseAdmission is the daemon-wide raw bytes-in-flight gate propagated to
 	// every per-repo Indexer. Unlike the shadow gate it blocks briefly instead
 	// of falling back, because parsing must happen somewhere; sharing one gate
 	// prevents N parallel repos from each consuming their full private budget.
 	parseAdmission atomic.Pointer[parseAdmissionBudget]
+
+	// nativeParseAdmission independently bounds actual in-process C-family
+	// extraction. It must not share accounting with parseAdmission: projected
+	// generated parsers retain raw bytes but never construct native trees.
+	nativeParseAdmission atomic.Pointer[parseAdmissionBudget]
 
 	// reconcileMu serialises ReconcileContractEdges end-to-end. The pass
 	// evicts the prior EdgeMatches / topic / bridge generation and mints
@@ -302,6 +307,7 @@ func (mi *MultiIndexer) newPerRepoIndexerGuardedWithMode(
 	idx := New(mi.graph, mi.registry, cfg, mi.logger)
 	idx.shadowAdmission = mi.shadowAdmission
 	idx.parseAdmission.Store(mi.parseAdmission.Load())
+	idx.nativeParseAdmission.Store(mi.nativeParseAdmission.Load())
 	idx.repositoryMutationOwner = mi
 	idx.search = mi.search
 	if mi.embedder != nil {

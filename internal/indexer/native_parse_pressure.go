@@ -1,8 +1,11 @@
 package indexer
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
 // nativeParsePressureThresholdBytes amortises a native allocator sweep across
@@ -13,9 +16,9 @@ import (
 const nativeParsePressureThresholdBytes int64 = 64 << 20
 
 // nativeParseAdmissionMultiplier accounts for the measured native syntax-tree
-// expansion that the raw-source semaphore cannot see. The multiplier handles
-// unusually large sources; nativeParseAdmissionWeight also applies a budget
-// floor so small C-family files cannot recreate the same concurrency high-water.
+// expansion that the raw-source semaphore cannot see. Native extraction uses a
+// separate budget so generated/minified shortcuts and ordinary source readers
+// do not consume these deliberately scarce native-tree slots.
 const nativeParseAdmissionMultiplier int64 = 4
 
 func nativeParseAdmissionWeight(language string, sourceBytes, budget int64) int64 {
@@ -33,7 +36,7 @@ func nativeParseAdmissionWeight(language string, sourceBytes, budget int64) int6
 
 	// A raw-byte multiplier alone becomes ineffective in the small-file tail:
 	// enough individually cheap C-family trees can overlap to rebuild the same
-	// native allocator high-water. Reserving at least half of the active parse
+	// native allocator high-water. Reserving at least half of the active native
 	// budget caps the process at two live C-family trees, while the multiplier
 	// still makes an unusually large source parse alone.
 	floor := budget/2 + budget%2
@@ -41,6 +44,55 @@ func nativeParseAdmissionWeight(language string, sourceBytes, budget int64) int6
 		return floor
 	}
 	return weighted
+}
+
+// nativeParseExtractionAdmission is the per-full-index view of the native-tree
+// gates. Its local and shared budgets are distinct from the raw-source gates:
+// workers retain raw bytes while graph/contract consumers finish, whereas this
+// lease covers only the actual in-process C-family extractor.
+type nativeParseExtractionAdmission struct {
+	weightBudget int64
+	localBudget  int64
+	local        *semaphore.Weighted
+	shared       *parseAdmissionBudget
+}
+
+func newNativeParseExtractionAdmission(
+	localBudget int64,
+	local *semaphore.Weighted,
+	shared *parseAdmissionBudget,
+) *nativeParseExtractionAdmission {
+	if local == nil && shared == nil {
+		return nil
+	}
+	weightBudget := localBudget
+	if shared != nil {
+		weightBudget = shared.capacity
+	}
+	return &nativeParseExtractionAdmission{
+		weightBudget: weightBudget,
+		localBudget:  localBudget,
+		local:        local,
+		shared:       shared,
+	}
+}
+
+func (admission *nativeParseExtractionAdmission) acquire(
+	ctx context.Context,
+	language string,
+	sourceBytes int64,
+) (*parseAdmissionLease, error) {
+	if admission == nil || sourceBytes <= 0 || !nativeParsePressureLanguage(language) {
+		return nil, nil
+	}
+	weight := nativeParseAdmissionWeight(language, sourceBytes, admission.weightBudget)
+	if weight <= 0 {
+		return nil, nil
+	}
+	return acquireParseAdmission(
+		ctx, weight,
+		admission.localBudget, admission.local, admission.shared,
+	)
 }
 
 type nativeParsePressureStats struct {
