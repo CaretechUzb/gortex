@@ -124,20 +124,54 @@ func TestSharedParseAdmissionSerializesAcrossPrivateRepoBudgets(t *testing.T) {
 	shared.release(shared.capacity)
 }
 
-func TestParseAdmissionCancellationReturnsSharedCapacity(t *testing.T) {
-	const mib = int64(1 << 20)
-	shared := newParseAdmissionBudget(64 * mib)
+func TestParseAdmissionLocalWaitDoesNotReserveSharedCapacity(t *testing.T) {
+	shared := newParseAdmissionBudget(2)
 	local := semaphore.NewWeighted(1)
-	require.NoError(t, local.Acquire(t.Context(), 1))
-	defer local.Release(1)
+	first, err := acquireParseAdmission(t.Context(), 1, 1, local, shared)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	secondDone := make(chan error, 1)
+	go func() {
+		lease, acquireErr := acquireParseAdmission(ctx, 1, 1, local, shared)
+		if lease != nil {
+			lease.Release()
+		}
+		secondDone <- acquireErr
+	}()
+
+	// The second worker is blocked by this Indexer's one-unit local gate. It
+	// must not consume the remaining process-wide unit while it waits.
+	require.Never(t, func() bool {
+		shared.mu.Lock()
+		defer shared.mu.Unlock()
+		return shared.used != 1
+	}, 50*time.Millisecond, time.Millisecond)
+	sharedOnly, err := acquireParseAdmission(t.Context(), 1, 0, nil, shared)
+	require.NoError(t, err, "another repository must use unstranded shared capacity")
+
+	cancel()
+	require.ErrorIs(t, <-secondDone, context.Canceled)
+	sharedOnly.Release()
+	first.Release()
+	require.True(t, shared.tryAcquire(shared.capacity))
+	shared.release(shared.capacity)
+}
+
+func TestParseAdmissionSharedCancellationReturnsLocalCapacity(t *testing.T) {
+	shared := newParseAdmissionBudget(1)
+	sharedHeld, err := acquireParseAdmission(t.Context(), 1, 0, nil, shared)
+	require.NoError(t, err)
+	local := semaphore.NewWeighted(1)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
 	defer cancel()
-	lease, err := acquireParseAdmission(ctx, 32*mib, 1, local, shared)
+	lease, err := acquireParseAdmission(ctx, 1, 1, local, shared)
 	assert.Nil(t, lease)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
-	require.True(t, shared.tryAcquire(shared.capacity), "cancelled local admission leaked shared capacity")
-	shared.release(shared.capacity)
+	require.True(t, local.TryAcquire(1), "cancelled shared admission leaked local capacity")
+	local.Release(1)
+	sharedHeld.Release()
 }
 
 func TestSharedParseAdmissionCancellationWhileWaiting(t *testing.T) {

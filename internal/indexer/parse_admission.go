@@ -150,10 +150,12 @@ type parseAdmissionLease struct {
 	once         sync.Once
 }
 
-// acquireParseAdmission takes the process-wide lease first and the private
-// per-Indexer lease second. Every caller uses that order, so cross-repository
-// parsing cannot deadlock. If local admission is cancelled, the already-held
-// shared capacity is returned before the error escapes.
+// acquireParseAdmission takes the private per-Indexer lease before the shared
+// process lease. A repository whose local worker budget is full must not reserve
+// scarce shared capacity while it waits; every combined caller uses this same
+// local→shared order, and shared-only callers never acquire a local lease, so
+// the order cannot form a cycle. If shared admission is cancelled, the already-
+// held local capacity is returned before the error escapes.
 func acquireParseAdmission(
 	ctx context.Context,
 	fileSize int64,
@@ -165,17 +167,17 @@ func acquireParseAdmission(
 		return nil, nil
 	}
 	lease := &parseAdmissionLease{shared: shared, local: local}
-	if shared != nil {
-		lease.sharedWeight = clampParseWeight(fileSize, shared.capacity)
-		if err := shared.acquire(ctx, lease.sharedWeight); err != nil {
-			return nil, err
-		}
-	}
 	if local != nil {
 		lease.localWeight = clampParseWeight(fileSize, localBudget)
 		if err := local.Acquire(ctx, lease.localWeight); err != nil {
-			if shared != nil {
-				shared.release(lease.sharedWeight)
+			return nil, err
+		}
+	}
+	if shared != nil {
+		lease.sharedWeight = clampParseWeight(fileSize, shared.capacity)
+		if err := shared.acquire(ctx, lease.sharedWeight); err != nil {
+			if local != nil {
+				local.Release(lease.localWeight)
 			}
 			return nil, err
 		}
@@ -188,11 +190,13 @@ func (lease *parseAdmissionLease) Release() {
 		return
 	}
 	lease.once.Do(func() {
-		if lease.local != nil {
-			lease.local.Release(lease.localWeight)
-		}
+		// Release in reverse acquisition order: global capacity becomes visible
+		// before this repository admits another local worker.
 		if lease.shared != nil {
 			lease.shared.release(lease.sharedWeight)
+		}
+		if lease.local != nil {
+			lease.local.Release(lease.localWeight)
 		}
 	})
 }

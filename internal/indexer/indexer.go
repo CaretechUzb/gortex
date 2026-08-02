@@ -2693,6 +2693,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			zap.Int64("used_bytes", stats.used),
 			zap.Int64("peak_bytes", stats.peak),
 			zap.Int("waiters", stats.waiters),
+			zap.Int("bounded_bypasses", stats.bypasses),
 			zap.Uint64("admissions", stats.admissions),
 			zap.Uint64("queued_admissions", stats.queued))
 		var releaseOnce sync.Once
@@ -2707,6 +2708,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					zap.Int64("weight_bytes", memoryLease.weight),
 					zap.Int64("used_bytes", after.used),
 					zap.Int("waiters", after.waiters),
+					zap.Int("bounded_bypasses", after.bypasses),
 					zap.Uint64("queued_admissions", after.queued))
 			})
 		}

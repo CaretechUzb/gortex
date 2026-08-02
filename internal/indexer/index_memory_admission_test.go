@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"math"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -40,69 +43,56 @@ func TestIndexMemoryAdmissionWeightSeparatesPressureShadowFromLargeDirect(t *tes
 	}
 }
 
-func TestIndexMemoryAdmissionBudgetPreservesSmallOverlapAndQueuesPressureWork(t *testing.T) {
+func TestIndexMemoryAdmissionQueuedPressureAllowsBoundedSmallOverlap(t *testing.T) {
 	budget := newIndexMemoryAdmissionBudget(defaultIndexMemoryAdmissionBytes)
 	directWeight := indexMemoryAdmissionWeight(1776, 1_297_649_391)
 	pressureWeight := int64(346_946_586) + indexMemoryAdmissionRepoOverhead
 	smallWeight := indexMemoryAdmissionWeight(1, 1)
 
-	direct, err := budget.acquire(context.Background(), directWeight)
+	direct, err := budget.acquire(t.Context(), directWeight)
 	if err != nil {
 		t.Fatal(err)
 	}
-	small, err := budget.acquire(context.Background(), smallWeight)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	granted := make(chan *indexMemoryAdmissionLease, 1)
-	errs := make(chan error, 1)
+	pressureGranted := make(chan *indexMemoryAdmissionLease, 1)
 	go func() {
-		lease, acquireErr := budget.acquire(context.Background(), pressureWeight)
-		if acquireErr != nil {
-			errs <- acquireErr
-			return
-		}
-		granted <- lease
+		lease, _ := budget.acquire(t.Context(), pressureWeight)
+		pressureGranted <- lease
 	}()
 	waitForIndexMemoryWaiters(t, budget, 1)
 
+	// The later small repository fits in the direct parse's remaining 326 MiB.
+	// It must bypass the queued pressure shadow instead of being stranded behind
+	// the FIFO head as semaphore.Weighted did.
+	smallCtx, cancelSmall := context.WithTimeout(t.Context(), time.Second)
+	defer cancelSmall()
+	small, err := budget.acquire(smallCtx, smallWeight)
+	if err != nil {
+		t.Fatalf("fitting small repository failed to bypass pressure waiter: %v", err)
+	}
 	select {
-	case lease := <-granted:
+	case lease := <-pressureGranted:
 		lease.Release()
 		t.Fatal("pressure shadow admitted while large direct parse was live")
-	case err := <-errs:
-		t.Fatalf("pressure admission failed: %v", err)
 	default:
 	}
 
-	// Releasing only the small overlap still leaves insufficient capacity for
-	// the pressure shadow at the FIFO head.
 	small.Release()
-	select {
-	case lease := <-granted:
-		lease.Release()
-		t.Fatal("pressure shadow admitted before large direct release")
-	case err := <-errs:
-		t.Fatalf("pressure admission failed: %v", err)
-	default:
-	}
-
 	direct.Release()
 	select {
-	case lease := <-granted:
-		lease.Release()
-	case err := <-errs:
-		t.Fatalf("pressure admission failed: %v", err)
+	case pressure := <-pressureGranted:
+		if pressure == nil {
+			t.Fatal("pressure admission unexpectedly failed")
+		}
+		pressure.Release()
 	case <-time.After(2 * time.Second):
 		t.Fatal("pressure shadow did not enter after large direct release")
 	}
 
 	stats := budget.snapshot()
-	if stats.used != 0 || stats.waiters != 0 {
+	if stats.used != 0 || stats.waiters != 0 || stats.bypasses != 0 {
 		t.Fatalf("budget not drained: %+v", stats)
 	}
-	if stats.admissions != 3 || stats.queued != 1 {
+	if stats.admissions != 3 || stats.queued != 2 {
 		t.Fatalf("unexpected admission telemetry: %+v", stats)
 	}
 	if stats.peak > stats.capacity {
@@ -110,14 +100,77 @@ func TestIndexMemoryAdmissionBudgetPreservesSmallOverlapAndQueuesPressureWork(t 
 	}
 }
 
-func TestIndexMemoryAdmissionCancellationAndIdempotentRelease(t *testing.T) {
-	budget := newIndexMemoryAdmissionBudget(100)
-	full, err := budget.acquire(context.Background(), 100)
+func TestIndexMemoryAdmissionBypassBoundGuaranteesHeadProgress(t *testing.T) {
+	budget := newIndexMemoryAdmissionBudget(4)
+	held, err := budget.acquire(t.Context(), 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	headDone := make(chan *indexMemoryAdmissionLease, 1)
+	go func() {
+		lease, _ := budget.acquire(t.Context(), 4)
+		headDone <- lease
+	}()
+	waitForIndexMemoryWaiters(t, budget, 1)
+
+	for range maxIndexMemoryAdmissionBypasses {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		small, acquireErr := budget.acquire(ctx, 1)
+		cancel()
+		if acquireErr != nil {
+			t.Fatalf("bounded fitting bypass failed: %v", acquireErr)
+		}
+		small.Release()
+	}
+	if got := budget.snapshot().bypasses; got != maxIndexMemoryAdmissionBypasses {
+		t.Fatalf("bypasses = %d, want %d", got, maxIndexMemoryAdmissionBypasses)
+	}
+
+	lateDone := make(chan *indexMemoryAdmissionLease, 1)
+	go func() {
+		lease, _ := budget.acquire(t.Context(), 1)
+		lateDone <- lease
+	}()
+	waitForIndexMemoryWaiters(t, budget, 2)
+	select {
+	case lease := <-lateDone:
+		lease.Release()
+		t.Fatal("small repository bypassed after starvation bound was spent")
+	default:
+	}
+
+	held.Release()
+	head := <-headDone
+	if head == nil {
+		t.Fatal("FIFO head did not acquire after capacity release")
+	}
+	select {
+	case lease := <-lateDone:
+		lease.Release()
+		t.Fatal("later small repository passed the active capacity-sized head")
+	default:
+	}
+	head.Release()
+	select {
+	case late := <-lateDone:
+		if late == nil {
+			t.Fatal("later small admission unexpectedly failed")
+		}
+		late.Release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("later small repository did not progress after FIFO head")
+	}
+}
+
+func TestIndexMemoryAdmissionCancellationAndIdempotentRelease(t *testing.T) {
+	budget := newIndexMemoryAdmissionBudget(100)
+	full, err := budget.acquire(t.Context(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
 	result := make(chan error, 1)
 	go func() {
 		_, acquireErr := budget.acquire(ctx, 60)
@@ -141,10 +194,76 @@ func TestIndexMemoryAdmissionCancellationAndIdempotentRelease(t *testing.T) {
 		t.Fatalf("unexpected final telemetry: %+v", stats)
 	}
 
-	cancelled, cancelNow := context.WithCancel(context.Background())
+	cancelled, cancelNow := context.WithCancel(t.Context())
 	cancelNow()
 	if _, err := budget.acquire(cancelled, 1); !errors.Is(err, context.Canceled) {
 		t.Fatalf("pre-cancelled acquire error = %v, want context cancellation", err)
+	}
+}
+
+func TestIndexMemoryAdmissionCancellationWinsGrantRace(t *testing.T) {
+	for range 50 {
+		budget := newIndexMemoryAdmissionBudget(1)
+		held, err := budget.acquire(t.Context(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		result := make(chan error, 1)
+		go func() {
+			lease, acquireErr := budget.acquire(ctx, 1)
+			if lease != nil {
+				lease.Release()
+			}
+			result <- acquireErr
+		}()
+		waitForIndexMemoryWaiters(t, budget, 1)
+		cancel()
+		held.Release()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel/grant race error = %v, want cancellation", err)
+		}
+		probe, err := budget.acquire(t.Context(), 1)
+		if err != nil {
+			t.Fatalf("cancel/grant race leaked capacity: %v", err)
+		}
+		probe.Release()
+	}
+}
+
+func TestIndexMemoryAdmissionConcurrentInvariant(t *testing.T) {
+	const capacity = int64(8)
+	budget := newIndexMemoryAdmissionBudget(capacity)
+	var active atomic.Int64
+	var violated atomic.Bool
+	var wg sync.WaitGroup
+	for worker := range 12 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for iteration := range 100 {
+				weight := int64(1 + (worker+iteration)%3)
+				lease, err := budget.acquire(t.Context(), weight)
+				if err != nil {
+					violated.Store(true)
+					return
+				}
+				if active.Add(weight) > capacity {
+					violated.Store(true)
+				}
+				runtime.Gosched()
+				active.Add(-weight)
+				lease.Release()
+			}
+		}()
+	}
+	wg.Wait()
+	if violated.Load() || active.Load() != 0 {
+		t.Fatalf("concurrent admission invariant violated: active=%d stats=%+v", active.Load(), budget.snapshot())
+	}
+	stats := budget.snapshot()
+	if stats.used != 0 || stats.waiters != 0 || stats.peak > capacity {
+		t.Fatalf("invalid final budget state: %+v", stats)
 	}
 }
 
