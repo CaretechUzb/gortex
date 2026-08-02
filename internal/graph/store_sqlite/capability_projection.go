@@ -2,21 +2,30 @@ package store_sqlite
 
 import "github.com/zzet/gortex/internal/graph"
 
-// ScanRepoCapabilityEdges reads only the source repository and logical edge
-// identity needed by capability synthesis. The id keyset freezes the generation
-// and bounds every allocation; each cursor is closed before yield runs so the
+// ScanRepoCapabilityEdges reads only source repository and logical identity
+// columns needed by capability synthesis. nil repoPrefixes scans all sources;
+// a non-nil empty slice scans none. The id keyset freezes the generation and
+// bounds every allocation; each cursor is closed before yield runs so the
 // callback may safely re-enter the store.
 func (s *Store) ScanRepoCapabilityEdges(
 	repoPrefixes []string,
 	pageSize int,
 	yield func([]graph.RepoCapabilityEdge) bool,
 ) {
-	reposJSON, ok := projectionJSON(repoPrefixes)
-	if !ok || yield == nil {
+	if yield == nil || (repoPrefixes != nil && len(repoPrefixes) == 0) {
 		return
 	}
+	allRepos := repoPrefixes == nil
+	var reposJSON string
+	if !allRepos {
+		var ok bool
+		reposJSON, ok = projectionJSON(repoPrefixes)
+		if !ok {
+			return
+		}
+	}
 	if pageSize <= 0 {
-		pageSize = 256
+		pageSize = 4096
 	}
 
 	var highWater int64
@@ -28,7 +37,7 @@ func (s *Store) ScanRepoCapabilityEdges(
 		return
 	}
 
-	const query = `
+	const scopedQuery = `
 WITH requested_repos(repo_prefix) AS (
     SELECT CAST(value AS TEXT) FROM json_each(?)
 )
@@ -43,17 +52,42 @@ WHERE e.id > ? AND e.id <= ?
   AND (e.kind NOT IN (?, ?) OR target.kind = ?)
 ORDER BY e.id
 LIMIT ?`
+	const allQuery = `
+SELECT e.id, n.repo_prefix,
+       e.from_id, e.to_id, e.kind, e.file_path, e.line
+FROM edges AS e NOT INDEXED
+JOIN nodes AS n ON n.id = e.from_id
+LEFT JOIN nodes AS target ON target.id = e.to_id
+WHERE e.id > ? AND e.id <= ?
+  AND e.kind IN (?, ?, ?, ?)
+  AND (e.kind NOT IN (?, ?) OR target.kind = ?)
+ORDER BY e.id
+LIMIT ?`
+	query := scopedQuery
+	if allRepos {
+		query = allQuery
+	}
+	stmt, err := s.db.Prepare(query)
+	if err != nil {
+		panicOnFatal(err)
+		return
+	}
+	defer stmt.Close()
 
 	lastID := int64(0)
 	for lastID < highWater {
-		rows, err := s.db.Query(
-			query,
-			reposJSON, lastID, highWater,
+		args := make([]any, 0, 12)
+		if !allRepos {
+			args = append(args, reposJSON)
+		}
+		args = append(args,
+			lastID, highWater,
 			string(graph.EdgeReadsConfig), string(graph.EdgeReads),
 			string(graph.EdgeWrites), string(graph.EdgeCalls),
 			string(graph.EdgeReads), string(graph.EdgeWrites), string(graph.KindField),
 			pageSize,
 		)
+		rows, err := stmt.Query(args...)
 		if err != nil {
 			panicOnFatal(err)
 			return

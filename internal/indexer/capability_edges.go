@@ -125,117 +125,7 @@ func processExecMechanism(callee string) string {
 // idempotent — AddEdge dedupes by edge key and a reindex re-derives from
 // the current base edges. Returns per-kind counts for telemetry.
 func synthesizeCapabilityEdges(g graph.Store) (readsEnv, execProc, fieldAccess int) {
-	if g == nil {
-		return 0, 0, 0
-	}
-	g.ResolveMutex().Lock()
-	defer g.ResolveMutex().Unlock()
-
-	type edgeSpec struct {
-		from, to, origin, file string
-		line                   int
-		kind                   graph.EdgeKind
-		meta                   map[string]any
-	}
-	var pending []edgeSpec
-	seen := map[string]bool{}
-	add := func(from, to string, kind graph.EdgeKind, origin, file string, line int, meta map[string]any) bool {
-		key := string(kind) + "\x00" + from + "\x00" + to
-		// Indirect mutations carry a `via`; key on it so a direct and an
-		// indirect write to the same field from the same method coexist as
-		// distinct-provenance edges.
-		if v, _ := meta["via"].(string); v != "" {
-			key += "\x00" + v
-		}
-		if seen[key] {
-			return false
-		}
-		seen[key] = true
-		pending = append(pending, edgeSpec{from, to, origin, file, line, kind, meta})
-		return true
-	}
-
-	// reads_env — parallel to reads_config edges that target an env key.
-	for e := range g.EdgesByKind(graph.EdgeReadsConfig) {
-		if e == nil || !strings.Contains(e.To, "cfg::env::") {
-			continue
-		}
-		if add(e.From, e.To, graph.EdgeReadsEnv, graph.OriginASTResolved, e.FilePath, e.Line, nil) {
-			readsEnv++
-		}
-	}
-
-	// accesses_field — reads / writes that land on a struct field. Build
-	// the KindField id set once instead of a GetNode per edge (cheap on
-	// the disk-backed store).
-	fieldIDs := map[string]bool{}
-	for n := range g.NodesByKind(graph.KindField) {
-		if n != nil {
-			fieldIDs[n.ID] = true
-		}
-	}
-	for _, base := range []graph.EdgeKind{graph.EdgeReads, graph.EdgeWrites} {
-		mode := "read"
-		if base == graph.EdgeWrites {
-			mode = "write"
-		}
-		for e := range g.EdgesByKind(base) {
-			if e == nil || !fieldIDs[e.To] {
-				continue
-			}
-			if add(e.From, e.To, graph.EdgeAccessesField, graph.OriginASTResolved, e.FilePath, e.Line, map[string]any{"access": mode}) {
-				fieldAccess++
-			}
-		}
-	}
-
-	// Indirect field mutations: `s.counter.Increment()` mutates counter, and
-	// `s.helper()` mutates whatever helper mutates — attributed transitively.
-	// Lower (ast_inferred) tier than the direct writes above; tagged indirect
-	// + via so it's distinguishable and downgradeable.
-	for _, s := range indirectMutationEdges(g) {
-		if add(s.from, s.to, graph.EdgeAccessesField, graph.OriginASTInferred, s.file, s.line,
-			map[string]any{"access": "write", "indirect": true, "via": s.via}) {
-			fieldAccess++
-		}
-	}
-
-	// executes_process — calls to a known process-exec API, pointed at a
-	// shared synthetic process node per mechanism.
-	procNodes := map[string]*graph.Node{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if e == nil {
-			continue
-		}
-		mech := processExecMechanism(e.To)
-		if mech == "" {
-			continue
-		}
-		procID := "string::process::" + mech
-		if procNodes[procID] == nil {
-			procNodes[procID] = &graph.Node{
-				ID: procID, Kind: graph.KindString, Name: mech,
-				Meta: map[string]any{"context": "process", "mechanism": mech},
-			}
-		}
-		if add(e.From, procID, graph.EdgeExecutesProcess, graph.OriginASTInferred, e.FilePath, e.Line, nil) {
-			execProc++
-		}
-	}
-
-	nodes := make([]*graph.Node, 0, len(procNodes))
-	for _, n := range procNodes {
-		nodes = append(nodes, n)
-	}
-	edges := make([]*graph.Edge, 0, len(pending))
-	for _, s := range pending {
-		edges = append(edges, &graph.Edge{
-			From: s.from, To: s.to, Kind: s.kind,
-			FilePath: s.file, Line: s.line, Origin: s.origin, Meta: s.meta,
-		})
-	}
-	g.AddBatch(nodes, edges)
-	return readsEnv, execProc, fieldAccess
+	return synthesizeCapabilityEdgesScoped(g, nil)
 }
 
 // synthesizeCapabilityEdgesScoped is synthesizeCapabilityEdges restricted to the
@@ -257,9 +147,6 @@ func synthesizeCapabilityEdges(g graph.Store) (readsEnv, execProc, fieldAccess i
 func synthesizeCapabilityEdgesScoped(g graph.Store, changedPrefixes map[string]bool, changedFiles ...string) (readsEnv, execProc, fieldAccess int) {
 	if g == nil {
 		return 0, 0, 0
-	}
-	if changedPrefixes == nil && len(changedFiles) == 0 {
-		return synthesizeCapabilityEdges(g)
 	}
 	g.ResolveMutex().Lock()
 	defer g.ResolveMutex().Unlock()
@@ -322,7 +209,12 @@ func synthesizeCapabilityEdgesScoped(g graph.Store, changedPrefixes map[string]b
 		return a.Line < b.Line
 	}
 
-	repoPrefixes := make([]string, 0, len(changedPrefixes))
+	// nil means an unscoped whole-graph scan; a non-nil empty slice means an
+	// exact empty scope and must remain a no-op.
+	var repoPrefixes []string
+	if changedPrefixes != nil {
+		repoPrefixes = make([]string, 0, len(changedPrefixes))
+	}
 	for prefix := range changedPrefixes {
 		repoPrefixes = append(repoPrefixes, prefix)
 	}

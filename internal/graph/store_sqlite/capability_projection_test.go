@@ -121,4 +121,17 @@ func BenchmarkSQLiteCapabilityProjection(b *testing.B) {
 			}
 		}
 	})
+	b.Run("whole-graph-default-projection", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			count := 0
+			graph.ScanRepoCapabilityEdges(store, nil, 0, func(page []graph.RepoCapabilityEdge) bool {
+				count += len(page)
+				return true
+			})
+			if count != edgeCount {
+				b.Fatalf("rows = %d, want %d", count, edgeCount)
+			}
+		}
+	})
 }

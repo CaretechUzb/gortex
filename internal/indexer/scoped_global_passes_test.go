@@ -211,8 +211,8 @@ func TestSynthesizeCapabilityEdgesScoped_ParityAndFewerReads(t *testing.T) {
 	if scoped.getNodesBatchCalls != 3 {
 		t.Errorf("scoped capability endpoint batches = %d, want 3 bounded batches", scoped.getNodesBatchCalls)
 	}
-	if scoped.nodesReturned >= full.nodesReturned {
-		t.Errorf("scoped capability should materialise fewer nodes than unscoped: scoped=%d full=%d",
+	if scoped.nodesReturned > full.nodesReturned {
+		t.Errorf("scoped capability must not materialise more nodes than optimized unscoped: scoped=%d full=%d",
 			scoped.nodesReturned, full.nodesReturned)
 	}
 }
