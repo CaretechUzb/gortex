@@ -40,6 +40,8 @@ func TestGoTypesHeavyGateHeldAcrossApplyBarrier(t *testing.T) {
 
 func TestGoTypesHeavyGateReleasedOnApplyGateCancellation(t *testing.T) {
 	provider, root, loads := newApplyGateTestProvider(t)
+	gcCalls := make(chan struct{}, 1)
+	provider.compilerGC = func() { gcCalls <- struct{}{} }
 	applyGate := make(chan struct{})
 	blockedCtx, cancelBlocked := context.WithCancel(semantic.WithApplyGate(context.Background(), applyGate))
 	blocked := runApplyGateTestEnrichment(provider, blockedCtx, "blocked", root)
@@ -47,6 +49,11 @@ func TestGoTypesHeavyGateReleasedOnApplyGateCancellation(t *testing.T) {
 	waitForGoTypesTestLoad(t, loads)
 	cancelBlocked()
 	waitForGoTypesTestResult(t, blocked, context.Canceled)
+	select {
+	case <-gcCalls:
+	default:
+		t.Fatal("canceled post-load compiler was not reclaimed before enrichment returned")
+	}
 
 	nextCtx, cancelNext := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelNext()

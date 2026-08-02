@@ -73,12 +73,12 @@ type externalsAttribution struct {
 	// processing Uses. It replaces the former GetNode call per unique external
 	// symbol/module and is updated as this pass creates nodes.
 	knownNodeIDs map[string]struct{}
-	// Pending mutations are drained once per loaded package. Keeping these
-	// bounded avoids one SQLite transaction per external symbol, module link,
-	// or stub rebind while preserving the exact edge payloads.
-	pendingNodes     []*graph.Node
-	pendingEdges     []*graph.Edge
-	pendingReindexes []graph.EdgeReindex
+	// Pending graph mutations are projected without store re-entry, then drained
+	// in fixed pages after compiler state is released.
+	pendingNodes           []*graph.Node
+	pendingEdges           []*graph.Edge
+	pendingDependencyEdges map[string]*graph.Edge
+	pendingReindexes       []graph.EdgeReindex
 
 	nodesAdded     int
 	edgesAdded     int
@@ -230,12 +230,16 @@ func (e *externalsAttribution) resolveSymbol(obj types.Object) string {
 		e.pendingNodes = append(e.pendingNodes, buildExternalNode(nodeID, kind, importPath, moduleID, pkg, obj, e.provider))
 		e.knownNodeIDs[nodeID] = struct{}{}
 		e.nodesAdded++
+	}
 
-		// Attribute the symbol to its module via EdgeDependsOnModule. The
-		// schema's existing convention is "file/package/import →
-		// KindModule"; an external symbol is morally equivalent — it's
-		// a first-class entity that depends on the module providing it.
-		e.pendingEdges = append(e.pendingEdges, &graph.Edge{
+	// Schedule module attribution even when the canonical symbol already exists.
+	// New symbols commit with this link in one AddBatch; a retry still repairs
+	// legacy/partial state whose node exists without the exact dependency edge.
+	// AddBatch is identity-idempotent, and drainPendingEdges filters edges already
+	// present so result counters remain exact on ordinary warm runs.
+	e.ensurePendingDependencyEdges()
+	if _, scheduled := e.pendingDependencyEdges[nodeID]; !scheduled {
+		edge := &graph.Edge{
 			From:            nodeID,
 			To:              moduleID,
 			Kind:            graph.EdgeDependsOnModule,
@@ -247,7 +251,9 @@ func (e *externalsAttribution) resolveSymbol(obj types.Object) string {
 			Meta: map[string]any{
 				"semantic_source": e.provider,
 			},
-		})
+		}
+		e.pendingEdges = append(e.pendingEdges, edge)
+		e.pendingDependencyEdges[nodeID] = edge
 		e.edgesAdded++
 		e.modulesLinked++
 	}
@@ -557,7 +563,10 @@ func externalModuleNodeID(pkg *packages.Package) string {
 // deliberately retained: the reused node may still need this pass's module or
 // call/reference edges.
 func (e *externalsAttribution) drainPendingAdds() (nodes []*graph.Node, edges []*graph.Edge) {
-	return e.drainPendingNodes(0), e.drainPendingEdges(0)
+	nodes = e.drainPendingNodes(0)
+	edges = e.drainPendingEdgesForNodes(nodes)
+	edges = append(edges, e.drainPendingEdges(0)...)
+	return nodes, edges
 }
 
 // drainPendingNodes returns at most limit nodes (all when limit <= 0), with the
@@ -611,7 +620,46 @@ func (e *externalsAttribution) drainPendingNodes(limit int) []*graph.Node {
 	return kept
 }
 
+// drainPendingEdgesForNodes pairs each genuinely new external symbol with its
+// module edge in the same AddBatch transaction. Module nodes are projected
+// before their symbols, so the target is already committed or in this page.
+func (e *externalsAttribution) drainPendingEdgesForNodes(nodes []*graph.Node) []*graph.Edge {
+	e.ensurePendingDependencyEdges()
+	edges := make([]*graph.Edge, 0, len(nodes))
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		if edge := e.pendingDependencyEdges[node.ID]; edge != nil {
+			edges = append(edges, edge)
+			delete(e.pendingDependencyEdges, node.ID)
+		}
+	}
+	return edges
+}
+
+func (e *externalsAttribution) ensurePendingDependencyEdges() {
+	if e.pendingDependencyEdges != nil {
+		return
+	}
+	e.pendingDependencyEdges = make(map[string]*graph.Edge, len(e.pendingEdges))
+	for _, edge := range e.pendingEdges {
+		if edge != nil {
+			e.pendingDependencyEdges[edge.From] = edge
+		}
+	}
+}
+
+// drainPendingEdges returns remaining retry/legacy repair links. Full logical
+// identities are checked in one batch because SQLite uniqueness includes
+// FilePath and Line in addition to endpoints and kind.
 func (e *externalsAttribution) drainPendingEdges(limit int) []*graph.Edge {
+	e.ensurePendingDependencyEdges()
+	defer func() {
+		if len(e.pendingEdges) == 0 && len(e.pendingDependencyEdges) == 0 {
+			e.pendingDependencyEdges = nil
+		}
+	}()
 	take := len(e.pendingEdges)
 	if limit > 0 && take > limit {
 		take = limit
@@ -619,13 +667,48 @@ func (e *externalsAttribution) drainPendingEdges(limit int) []*graph.Edge {
 	if take == 0 {
 		return nil
 	}
-	edges := append([]*graph.Edge(nil), e.pendingEdges[:take]...)
+	raw := append([]*graph.Edge(nil), e.pendingEdges[:take]...)
 	clear(e.pendingEdges[:take])
 	e.pendingEdges = e.pendingEdges[take:]
 	if len(e.pendingEdges) == 0 {
 		e.pendingEdges = nil
 	}
-	return edges
+
+	edges := raw[:0]
+	for _, edge := range raw {
+		if edge == nil || e.pendingDependencyEdges[edge.From] != edge {
+			continue
+		}
+		delete(e.pendingDependencyEdges, edge.From)
+		edges = append(edges, edge)
+	}
+	clear(raw[len(edges):])
+	if len(edges) == 0 || e.g == nil {
+		return edges
+	}
+
+	identities := make([]graph.EdgeIdentity, 0, len(edges))
+	for _, edge := range edges {
+		identities = append(identities, graph.EdgeIdentityFor(edge))
+	}
+	finder, ok := e.g.(graph.EdgeIdentityBatchFinder)
+	if !ok {
+		return edges
+	}
+	existing := finder.FindEdgesByIdentities(identities)
+	kept := edges[:0]
+	reused := 0
+	for _, edge := range edges {
+		if existing[graph.EdgeIdentityFor(edge)] != nil {
+			reused++
+			continue
+		}
+		kept = append(kept, edge)
+	}
+	clear(edges[len(kept):])
+	e.edgesAdded -= reused
+	e.modulesLinked -= reused
+	return kept
 }
 
 func (e *externalsAttribution) drainPendingReindexes() []graph.EdgeReindex {

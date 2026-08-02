@@ -1,8 +1,12 @@
 package goanalysis
 
 import (
+	"go/token"
+	"go/types"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/tools/go/packages"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -109,6 +113,73 @@ func TestDrainPendingAddsRechecksExistingNodeAndKeepsEdges(t *testing.T) {
 				t.Fatalf("module edge not applied: %+v", out)
 			}
 		})
+	}
+}
+
+func TestExternalModuleLinkRepairsPartialSQLiteStateAndRerunIsIdempotent(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	if err != nil {
+		t.Fatalf("open SQLite store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close SQLite store: %v", err)
+		}
+	})
+
+	const importPath = "example.com/dep/pkg"
+	pkg := &packages.Package{
+		PkgPath: importPath,
+		Module:  &packages.Module{Path: "example.com/dep", Version: "v1.0.0"},
+	}
+	typesPkg := types.NewPackage(importPath, "pkg")
+	obj := types.NewFunc(token.NoPos, typesPkg, "Use", types.NewSignatureType(nil, nil, nil, nil, nil, false))
+	moduleID := goModuleNodeID(pkg.Module.Path, pkg.Module.Version)
+	nodeID := externalNodeID(importPath, obj)
+	store.AddBatch([]*graph.Node{
+		{ID: moduleID, Kind: graph.KindModule},
+		{ID: nodeID, Kind: graph.KindFunction},
+	}, []*graph.Edge{{
+		From: nodeID, To: moduleID, Kind: graph.EdgeDependsOnModule,
+		FilePath: "wrong-logical-identity", Line: 7,
+	}})
+
+	newAttribution := func() *externalsAttribution {
+		return &externalsAttribution{
+			g:            store,
+			pkgByPath:    map[string]*packages.Package{importPath: pkg},
+			moduleByPath: map[string]string{importPath: moduleID},
+			extByObj:     make(map[types.Object]string),
+			useByNodeID:  make(map[string]*externalUseIdentity),
+			knownNodeIDs: map[string]struct{}{moduleID: {}, nodeID: {}},
+			provider:     "go-types",
+		}
+	}
+
+	first := newAttribution()
+	if got := first.resolveSymbol(obj); got != nodeID {
+		t.Fatalf("resolved node=%q, want %q", got, nodeID)
+	}
+	nodes, edges := first.drainPendingAdds()
+	if len(nodes) != 0 || len(edges) != 1 {
+		t.Fatalf("partial-state repair nodes=%d edges=%d, want 0/1", len(nodes), len(edges))
+	}
+	if graph.EdgeIdentityFor(edges[0]).FilePath != externalFilePath(importPath) {
+		t.Fatalf("repair used wrong logical identity: %+v", graph.EdgeIdentityFor(edges[0]))
+	}
+	store.AddBatch(nodes, edges)
+
+	second := newAttribution()
+	if got := second.resolveSymbol(obj); got != nodeID {
+		t.Fatalf("second resolved node=%q, want %q", got, nodeID)
+	}
+	nodes, edges = second.drainPendingAdds()
+	if len(nodes) != 0 || len(edges) != 0 {
+		t.Fatalf("idempotent rerun nodes=%d edges=%d, want 0/0", len(nodes), len(edges))
+	}
+	if second.nodesAdded != 0 || second.edgesAdded != 0 || second.modulesLinked != 0 {
+		t.Fatalf("idempotent rerun counters nodes=%d edges=%d modules=%d, want zero",
+			second.nodesAdded, second.edgesAdded, second.modulesLinked)
 	}
 }
 

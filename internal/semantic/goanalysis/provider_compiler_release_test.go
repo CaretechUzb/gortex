@@ -14,6 +14,42 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+func TestReclaimAndReleaseGoCompilerOrdersCleanupBeforeAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		forceGC bool
+		want    []string
+	}{
+		{name: "abnormal exit", forceGC: true, want: []string{"sever", "gc", "sample", "release"}},
+		{name: "small successful exit", forceGC: false, want: []string{"sever", "sample", "release"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pkg := &packages.Package{
+				Syntax:    []*ast.File{{Name: ast.NewIdent("p")}},
+				TypesInfo: &types.Info{Uses: map[*ast.Ident]types.Object{}},
+			}
+			events := make([]string, 0, 4)
+			reclaimAndReleaseGoCompiler(func() {
+				releaseGoPackageCompilerState(pkg)
+				events = append(events, "sever")
+			}, tc.forceGC, func() {
+				assert.Nil(t, pkg.Syntax)
+				assert.Nil(t, pkg.TypesInfo)
+				events = append(events, "gc")
+			}, func() {
+				assert.Nil(t, pkg.Syntax)
+				assert.Nil(t, pkg.TypesInfo)
+				events = append(events, "sample")
+			}, func() {
+				assert.Nil(t, pkg.Syntax)
+				assert.Nil(t, pkg.TypesInfo)
+				events = append(events, "release")
+			})
+			assert.Equal(t, tc.want, events)
+		})
+	}
+}
+
 func TestShouldReclaimLargeCompiler(t *testing.T) {
 	assert.False(t, shouldReclaimLargeCompiler(false, 1<<30, 1<<20), "non-exclusive incremental loads never force process GC")
 	assert.False(t, shouldReclaimLargeCompiler(true, goTypesCompilerReclaimMinGrowth-1, goTypesCompilerReclaimMinUses-1))
@@ -99,35 +135,41 @@ func TestProjectedExternalUseInternsStringOnlyIdentity(t *testing.T) {
 	}
 }
 
-func TestProjectedExternalAddsDrainInBoundedNodeThenEdgePages(t *testing.T) {
+func TestProjectedExternalAddsPairNewNodesWithModuleEdges(t *testing.T) {
 	g := graph.New()
-	g.AddNode(&graph.Node{ID: "existing"})
+	g.AddBatch([]*graph.Node{{ID: "module"}, {ID: "existing"}}, nil)
 	externals := &externalsAttribution{g: g, nodesAdded: 5}
 	for i, id := range []string{"existing", "n1", "n2", "n3", "n4"} {
 		externals.pendingNodes = append(externals.pendingNodes, &graph.Node{ID: id})
 		externals.pendingEdges = append(externals.pendingEdges, &graph.Edge{
-			From: id,
-			To:   "module",
-			Kind: graph.EdgeDependsOnModule,
-			Line: i,
+			From:     id,
+			To:       "module",
+			Kind:     graph.EdgeDependsOnModule,
+			FilePath: "external::go:test",
+			Line:     i,
 		})
 	}
 
-	firstNodes := externals.drainPendingNodes(2)
-	secondNodes := externals.drainPendingNodes(2)
-	thirdNodes := externals.drainPendingNodes(2)
-	assert.Len(t, firstNodes, 1, "the existing node is filtered within its page")
-	assert.Equal(t, "n1", firstNodes[0].ID)
-	assert.Len(t, secondNodes, 2)
-	assert.Len(t, thirdNodes, 1)
-	assert.Nil(t, externals.pendingNodes)
-	assert.Equal(t, 4, externals.nodesAdded)
+	for len(externals.pendingNodes) > 0 {
+		nodes := externals.drainPendingNodes(2)
+		edges := externals.drainPendingEdgesForNodes(nodes)
+		nodeIDs := make(map[string]struct{}, len(nodes))
+		for _, node := range nodes {
+			nodeIDs[node.ID] = struct{}{}
+		}
+		for _, edge := range edges {
+			_, paired := nodeIDs[edge.From]
+			assert.True(t, paired, "new symbol and module link must share an AddBatch page")
+		}
+		g.AddBatch(nodes, edges)
+	}
 
-	firstEdges := externals.drainPendingEdges(2)
-	secondEdges := externals.drainPendingEdges(2)
-	thirdEdges := externals.drainPendingEdges(2)
-	assert.Len(t, firstEdges, 2)
-	assert.Len(t, secondEdges, 2)
-	assert.Len(t, thirdEdges, 1)
+	assert.Nil(t, externals.pendingNodes)
+	assert.Equal(t, 4, externals.nodesAdded, "the pre-existing node is filtered")
+	repairs := externals.drainPendingEdges(0)
+	require.Len(t, repairs, 1, "the filtered existing node keeps its exact repair edge")
+	assert.Equal(t, "existing", repairs[0].From)
+	g.AddBatch(nil, repairs)
 	assert.Nil(t, externals.pendingEdges)
+	assert.Nil(t, externals.pendingDependencyEdges)
 }

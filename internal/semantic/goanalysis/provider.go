@@ -44,6 +44,7 @@ type Provider struct {
 	includeTest  bool
 	logger       *zap.Logger
 	packagesLoad func(*packages.Config, ...string) ([]*packages.Package, error)
+	compilerGC   func()
 
 	// The compiler program is intentionally never retained after EnrichRepo.
 	// Contract extraction needs only a compact (file,line,name) -> bare type
@@ -130,6 +131,7 @@ func NewProvider(mode LoadMode, includeTest bool, logger *zap.Logger) *Provider 
 		includeTest:       includeTest,
 		logger:            logger,
 		packagesLoad:      packages.Load,
+		compilerGC:        runtime.GC,
 		bindingTypes:      make(map[bindingLookupKey]string),
 		bindingOwners:     make(map[bindingLookupKey]string),
 		bindingKeysByRoot: make(map[string][]bindingLookupKey),
@@ -496,16 +498,88 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 
 	gateWaitStart := time.Now()
 	largeAdmission := largeGoTypesAdmission(ctx, true)
-	release, err := p.acquireHeavy(ctx, largeAdmission)
+	releaseAdmission, err := p.acquireHeavy(ctx, largeAdmission)
 	if err != nil {
 		return nil, err
 	}
-	releaseHeavy := sync.OnceFunc(release)
-	defer releaseHeavy()
+	var (
+		pkgs                       []*packages.Package
+		fset                       *token.FileSet
+		externals                  *externalsAttribution
+		objToNode                  map[types.Object]string
+		repoNodes                  []*graph.Node
+		nodesByFile                map[string][]*graph.Node
+		funcIndexByFile            map[string]*fileFuncIndex
+		loadAttempted              bool
+		compilerProjectionComplete bool
+		projectedUseCount          int
+	)
 	var compilerHeapBaseline runtime.MemStats
 	if largeAdmission {
 		runtime.ReadMemStats(&compilerHeapBaseline)
 	}
+
+	// This is the only path that returns the heavy/large admission token. Every
+	// success, error, and cancellation first severs compiler roots. Abnormal
+	// post-load exits collect unconditionally so a canceled multi-GiB program
+	// cannot overlap the next admitted compiler even when heap-growth sampling
+	// was obscured by a concurrent process GC.
+	releaseCompiler := sync.OnceFunc(func() {
+		releaseStart := time.Now()
+		heapBeforeRelease := compilerHeapBaseline
+		if largeAdmission {
+			runtime.ReadMemStats(&heapBeforeRelease)
+		}
+		heapGrowth := uint64(0)
+		if heapBeforeRelease.HeapAlloc > compilerHeapBaseline.HeapAlloc {
+			heapGrowth = heapBeforeRelease.HeapAlloc - compilerHeapBaseline.HeapAlloc
+		}
+		forceGC := loadAttempted && !compilerProjectionComplete
+		if !forceGC {
+			forceGC = shouldReclaimLargeCompiler(largeAdmission, heapGrowth, projectedUseCount)
+		}
+		heapAfterRelease := heapBeforeRelease
+
+		collectCompiler := p.compilerGC
+		if collectCompiler == nil {
+			collectCompiler = runtime.GC
+		}
+		reclaimAndReleaseGoCompiler(func() {
+			clearGoPackageCompilerRoots(pkgs)
+			pkgs = nil
+			fset = nil
+			if externals != nil {
+				externals.releaseCompilerReferences()
+				externals.moduleByPath = nil
+				externals.knownNodeIDs = nil
+				externals.useByNodeID = nil
+			}
+			clear(objToNode)
+			objToNode = nil
+			depIndex = nil
+			repoNodes = nil
+			nodesByFile = nil
+			funcIndexByFile = nil
+		}, forceGC, collectCompiler, func() {
+			if forceGC {
+				runtime.ReadMemStats(&heapAfterRelease)
+			}
+		}, releaseAdmission)
+		if p.logger != nil {
+			p.logger.Info("go-types: compiler state released before graph apply",
+				zap.String("repo_prefix", repoPrefix),
+				zap.Bool("large_exclusive", largeAdmission),
+				zap.Bool("projection_complete", compilerProjectionComplete),
+				zap.Bool("forced_gc", forceGC),
+				zap.Int("projected_uses", projectedUseCount),
+				zap.Uint64("heap_alloc_before_load", compilerHeapBaseline.HeapAlloc),
+				zap.Uint64("heap_alloc_before_release", heapBeforeRelease.HeapAlloc),
+				zap.Uint64("heap_growth", heapGrowth),
+				zap.Uint64("heap_alloc_after_release", heapAfterRelease.HeapAlloc),
+				zap.Duration("elapsed", time.Since(releaseStart)))
+		}
+	})
+	defer releaseCompiler()
 	if wait := time.Since(gateWaitStart); wait > 5*time.Second && p.logger != nil {
 		p.logger.Info("go-types: admission gate acquired after queueing",
 			zap.String("repo_prefix", repoPrefix),
@@ -527,7 +601,8 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	}
 	// absRoot stays the relativization base for every graph path below; only
 	// the directory go/packages runs in follows the module.
-	pkgs, fset, err := p.loadPackagesContext(ctx, loadDir, "./...")
+	loadAttempted = true
+	pkgs, fset, err = p.loadPackagesContext(ctx, loadDir, "./...")
 	if err != nil {
 		return nil, fmt.Errorf("load packages: %w", err)
 	}
@@ -626,14 +701,13 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// shallow detached so the CPU-only matching walks never retain or observe
 	// mutable backend-owned node objects after the lock slice ends.
 	projectionStart := time.Now()
-	var repoNodes []*graph.Node
 	if err := resolveSlices.with(ctx, func() error {
 		repoNodes = detachGoNodeProjection(repoGoNodes(g, repoPrefix))
 		return nil
 	}); err != nil {
 		return nil, err
 	}
-	nodesByFile := make(map[string][]*graph.Node)
+	nodesByFile = make(map[string][]*graph.Node)
 	nodesByID := make(map[string]*graph.Node, len(repoNodes))
 	for _, node := range repoNodes {
 		if node == nil {
@@ -648,11 +722,11 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// Per-file containing-function indexes for the two use walks below: the
 	// per-use linear scan over a file's node slice was a flat 28.8s per
 	// profiling window on a large module.
-	funcIndexByFile := buildFileFuncIndexes(nodesByFile)
+	funcIndexByFile = buildFileFuncIndexes(nodesByFile)
 	applyProjectionDur = time.Since(projectionStart)
 
 	// Build the compiler-object → graph-node map used by later phases.
-	objToNode := make(map[types.Object]string)
+	objToNode = make(map[types.Object]string)
 
 	// Phase 1: Map definitions.
 	defsStart := time.Now()
@@ -726,7 +800,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	implementsPlanDur := time.Since(implementsPlanStart)
 
 	refsStart := time.Now()
-	externals := newExternalsAttribution(g, pkgs, p.Name(), repoPrefix, depIndex)
+	externals = newExternalsAttribution(g, pkgs, p.Name(), repoPrefix, depIndex)
 	externalNodeIDs := externals.existingNodeIDs(pkgs, objToNode)
 	if err := resolveSlices.with(ctx, func() error {
 		externals.prefetchExistingNodeIDs(externalNodeIDs)
@@ -740,73 +814,36 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// external string identities only. Clearing each packages.Package afterwards
 	// breaks AST/types/import closures while preserving Name/PkgPath/Module for
 	// the externals metadata map.
-	usePlans, err := projectGoUsesAndReleaseCompilerState(
+	usePlan, err := projectGoUsesAndReleaseCompilerState(
 		ctx, pkgs, fset, absRoot, repoPrefix, funcIndexByFile, objToNode, externals,
 	)
 	if err != nil {
 		return nil, err
 	}
-	// Explicitly sever every caller-frame root after the projection helper has
-	// returned; large programs receive one deliberate collection below.
-	externals.releaseCompilerReferences()
+	defer usePlan.release()
+	projectedUseCount = usePlan.len()
+	compilerProjectionComplete = true
 	externalNodeIDs = nil
 	bindings = nil
-	depIndex = nil
-	objToNode = nil
-	fset = nil
-	pkgs = nil
-	funcIndexByFile = nil
-	nodesByFile = nil
 
-	// The helper stack has returned and every explicit compiler root is nil.
-	// Large admission alone does not justify a stop-the-world collection: pay it
-	// only for material heap growth or a large Use projection, then release both
-	// admission gates before detached graph apply.
-	compilerReleaseStart := time.Now()
-	projectedUseCount := 0
-	for _, plan := range usePlans {
-		projectedUseCount += len(plan)
-	}
-	heapBeforeRelease := compilerHeapBaseline
-	if largeAdmission {
-		runtime.ReadMemStats(&heapBeforeRelease)
-	}
-	heapGrowth := uint64(0)
-	if heapBeforeRelease.HeapAlloc > compilerHeapBaseline.HeapAlloc {
-		heapGrowth = heapBeforeRelease.HeapAlloc - compilerHeapBaseline.HeapAlloc
-	}
-	forcedCompilerGC := shouldReclaimLargeCompiler(largeAdmission, heapGrowth, projectedUseCount)
-	heapAfterRelease := heapBeforeRelease
-	if forcedCompilerGC {
-		runtime.GC()
-		runtime.ReadMemStats(&heapAfterRelease)
-	}
-	releaseHeavy()
-	compilerReleaseDur := time.Since(compilerReleaseStart)
-	if p.logger != nil {
-		p.logger.Info("go-types: compiler state released before graph apply",
-			zap.String("repo_prefix", repoPrefix),
-			zap.Bool("large_exclusive", largeAdmission),
-			zap.Bool("forced_gc", forcedCompilerGC),
-			zap.Int("projected_uses", projectedUseCount),
-			zap.Uint64("heap_alloc_before_load", compilerHeapBaseline.HeapAlloc),
-			zap.Uint64("heap_alloc_before_release", heapBeforeRelease.HeapAlloc),
-			zap.Uint64("heap_growth", heapGrowth),
-			zap.Uint64("heap_alloc_after_release", heapAfterRelease.HeapAlloc),
-			zap.Duration("elapsed", compilerReleaseDur))
-	}
+	// Every compiler-only consumer has returned. The shared cleanup severs all
+	// aliases, conditionally reclaims the normal success path, and only then
+	// returns the admission token. Its deferred invocation covers every earlier
+	// error and cancellation with unconditional post-load reclamation.
+	releaseCompiler()
 
 	// Projection may discover every external symbol before the first Use page.
-	// Insert all canonical nodes first, then their module edges, in fixed pages.
-	// This preserves referential visibility between lock slices and prevents one
-	// repository-wide pending buffer from creating an unbounded first mutex hold.
+	// Fixed pages commit each genuinely new symbol together with its module link;
+	// remaining exact-identity pages repair links whose node survived an earlier
+	// canceled pass without creating an unbounded first mutex hold.
 	const projectedExternalApplyChunkSize = 512
 	for len(externals.pendingNodes) > 0 {
 		if err := resolveSlices.with(ctx, func() error {
 			nodes := externals.drainPendingNodes(projectedExternalApplyChunkSize)
-			if len(nodes) > 0 {
+			edges := externals.drainPendingEdgesForNodes(nodes)
+			if len(nodes) > 0 || len(edges) > 0 {
 				addBatchStart := time.Now()
-				g.AddBatch(nodes, nil)
+				g.AddBatch(nodes, edges)
 				applyAddBatchDur += time.Since(addBatchStart)
 			}
 			return nil
@@ -833,7 +870,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// types.Object, AST, or packages.Package.
 	applyStart := time.Now()
 	lastApplyLog := applyStart
-	for pkgIndex, resolvedUses := range usePlans {
+	for pkgIndex, resolvedUses := range usePlan.packages {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -842,7 +879,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			p.logger.Info("go-types: apply progress",
 				zap.String("repo_prefix", repoPrefix),
 				zap.Int("packages_done", pkgIndex),
-				zap.Int("packages_total", len(usePlans)),
+				zap.Int("packages_total", len(usePlan.packages)),
 				zap.Int("confirmed", result.EdgesConfirmed),
 				zap.Int("added", result.EdgesAdded),
 				zap.Duration("elapsed", time.Since(applyStart)))
@@ -956,9 +993,9 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				return nil, err
 			}
 		}
-		usePlans[pkgIndex] = nil
+		usePlan.packages[pkgIndex] = nil
 	}
-	usePlans = nil
+	usePlan.release()
 
 	// Stitch the externals counters into the standard result. NodesEnriched
 	// previously only incremented for in-repo type-meta enrichment; here
@@ -1860,6 +1897,27 @@ type resolvedGoUse struct {
 }
 
 // projectGoUsesAndReleaseCompilerState creates a stack boundary around the last
+func clearGoPackageCompilerRoots(pkgs []*packages.Package) {
+	for i, pkg := range pkgs {
+		releaseGoPackageCompilerState(pkg)
+		pkgs[i] = nil
+	}
+}
+
+// reclaimAndReleaseGoCompiler centralizes the ordering invariant: roots are
+// severed first, optional reclamation completes second, and admission is
+// returned last. Tests inject callbacks to prove cancellation cannot invert it.
+func reclaimAndReleaseGoCompiler(sever func(), forceGC bool, collect, afterCollect, release func()) {
+	sever()
+	if forceGC {
+		collect()
+	}
+	if afterCollect != nil {
+		afterCollect()
+	}
+	release()
+}
+
 // ast/types walk. Returning from this helper, in addition to clearing every
 // packages.Package, guarantees range temporaries cannot remain GC roots when
 // the caller performs its one large-program reclamation cycle.
@@ -1871,8 +1929,8 @@ func projectGoUsesAndReleaseCompilerState(
 	funcIndex map[string]*fileFuncIndex,
 	objToNode map[types.Object]string,
 	externals *externalsAttribution,
-) ([][]resolvedGoUse, error) {
-	plans := make([][]resolvedGoUse, len(pkgs))
+) (*goUsePlan, error) {
+	plan := newGoUsePlan(len(pkgs))
 	for pkgIndex, pkg := range pkgs {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -1882,18 +1940,18 @@ func projectGoUsesAndReleaseCompilerState(
 			pkgs[pkgIndex] = nil
 			continue
 		}
-		plan := make([]resolvedGoUse, 0, len(pkg.TypesInfo.Uses))
+		packageUses := make([]resolvedGoUse, 0, len(pkg.TypesInfo.Uses))
 		for ident, obj := range pkg.TypesInfo.Uses {
 			use, ok := resolveGoUse(ident, obj, fset, absRoot, repoPrefix, funcIndex, objToNode, externals)
 			if ok {
-				plan = append(plan, use)
+				packageUses = append(packageUses, use)
 			}
 		}
-		plans[pkgIndex] = plan
+		plan.setPackage(pkgIndex, packageUses)
 		releaseGoPackageCompilerState(pkg)
 		pkgs[pkgIndex] = nil
 	}
-	return plans, nil
+	return plan, nil
 }
 
 // resolveGoUse is the query-free normalization shared by both package walks
