@@ -164,9 +164,104 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 		}
 		r.graph.AddBatch(nodes, nil)
 	}
-	if len(batch) > 0 {
-		r.graph.ReindexEdges(batch)
+	if len(batch) == 0 {
+		return
 	}
+	targeter, ok := r.graph.(graph.UnresolvedEdgeTargetBatchReindexer)
+	if !ok {
+		r.graph.ReindexEdges(batch)
+		return
+	}
+
+	// This pass changes only the target identity. Production stores can apply
+	// that as a compact to_id update instead of deleting, decoding, and
+	// re-inserting every edge payload. Compact only when the entire batch meets
+	// the optional interface contract. Any unsafe or converging shape keeps the
+	// original order and goes through one legacy full-edge mutation, avoiding
+	// partial application across two independent write windows.
+	direct, compactOK := compactGoBuiltinTargetReindexes(batch)
+	if !compactOK {
+		r.graph.ReindexEdges(batch)
+		return
+	}
+	targeter.ReindexUnresolvedEdgeTargets(direct)
+}
+
+// compactGoBuiltinTargetReindexes validates the already-mutated batch without
+// changing its order. The compact interface requires unique old and destination
+// identities, so an index slice is sorted twice for validation while the
+// mutations themselves remain in legacy input order. This costs one machine
+// word per edge instead of retaining corpus-sized identity-count maps.
+func compactGoBuiltinTargetReindexes(batch []graph.EdgeReindex) (
+	[]graph.UnresolvedEdgeTargetReindex,
+	bool,
+) {
+	if len(batch) == 0 {
+		return nil, false
+	}
+
+	direct := make([]graph.UnresolvedEdgeTargetReindex, len(batch))
+	order := make([]int, len(batch))
+	for i, mutation := range batch {
+		if mutation.Edge == nil {
+			return nil, false
+		}
+		destination := graph.EdgeIdentityFor(mutation.Edge)
+		if destination.To == "" || !graph.IsUnresolvedTarget(mutation.OldTo) ||
+			graph.IsUnresolvedTarget(destination.To) || mutation.OldFrom != "" ||
+			mutation.OldKind != "" || mutation.OldFilePath != "" ||
+			mutation.OldLine != 0 || mutation.RefreshIdentity {
+			return nil, false
+		}
+		old := destination
+		old.To = mutation.OldTo
+		direct[i] = graph.UnresolvedEdgeTargetReindex{
+			Old: old, NewTo: destination.To,
+		}
+		order[i] = i
+	}
+
+	sort.Slice(order, func(i, j int) bool {
+		return goBuiltinEdgeIdentityLess(direct[order[i]].Old, direct[order[j]].Old)
+	})
+	for i := 1; i < len(order); i++ {
+		if direct[order[i-1]].Old == direct[order[i]].Old {
+			return nil, false
+		}
+	}
+
+	destination := func(mutation graph.UnresolvedEdgeTargetReindex) graph.EdgeIdentity {
+		identity := mutation.Old
+		identity.To = mutation.NewTo
+		return identity
+	}
+	sort.Slice(order, func(i, j int) bool {
+		return goBuiltinEdgeIdentityLess(
+			destination(direct[order[i]]), destination(direct[order[j]]),
+		)
+	})
+	for i := 1; i < len(order); i++ {
+		if destination(direct[order[i-1]]) == destination(direct[order[i]]) {
+			return nil, false
+		}
+	}
+	return direct, true
+}
+
+func goBuiltinEdgeIdentityLess(a, b graph.EdgeIdentity) bool {
+	if a.From != b.From {
+		return a.From < b.From
+	}
+	if a.To != b.To {
+		return a.To < b.To
+	}
+	if a.Kind != b.Kind {
+		return a.Kind < b.Kind
+	}
+	if a.FilePath != b.FilePath {
+		return a.FilePath < b.FilePath
+	}
+	return a.Line < b.Line
 }
 
 // tryAttributeGoBuiltin checks if e.To is `unresolved::<bareName>`
