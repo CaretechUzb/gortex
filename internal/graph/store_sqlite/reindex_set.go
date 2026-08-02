@@ -263,8 +263,7 @@ func sqliteReindexMutations(batch []graph.EdgeReindex) ([]sqliteReindexMutation,
 			oldKey: oldKey,
 			newRow: newRow,
 			resolvedConversion: !reindex.RefreshIdentity &&
-				graph.IsUnresolvedTarget(oldKey.toID) &&
-				!graph.IsUnresolvedTarget(newRow.key.toID),
+				graph.IsUnresolvedTarget(oldKey.toID) != graph.IsUnresolvedTarget(newRow.key.toID),
 		})
 		addKey(oldKey)
 		addKey(newRow.key)
@@ -272,13 +271,14 @@ func sqliteReindexMutations(batch []graph.EdgeReindex) ([]sqliteReindexMutation,
 	return mutations, keys, nil
 }
 
-// sqliteResolvedConversionSet recognizes the dominant full-resolve mutation
-// shape. Every old identity is in the unresolved target namespace and every
-// new identity is outside it, so the old and new key domains are disjoint.
-// Ordered set simulation therefore reduces exactly to deleting each old key
-// once and INSERT OR IGNORE-ing new rows in input order: existing destinations
-// win, and the first of several converging candidates wins. Mixed, refresh, and
-// unresolved-destination batches retain the generic prefetch + simulation path.
+// sqliteResolvedConversionSet recognizes uniform transitions across the
+// unresolved-target namespace boundary. The whole batch must move in one
+// direction, so the old and new key domains are disjoint for both resolution
+// and guard-driven reversion. Ordered set simulation therefore reduces exactly
+// to deleting each old key once and INSERT OR IGNORE-ing new rows in input
+// order: existing destinations win, and the first of several converging
+// candidates wins. Mixed-direction, refresh, and same-namespace batches retain
+// the generic prefetch + simulation path.
 func sqliteResolvedConversionSet(mutations []sqliteReindexMutation) (
 	deletes []sqliteReindexKey,
 	inserts []sqliteReindexRow,
@@ -287,11 +287,18 @@ func sqliteResolvedConversionSet(mutations []sqliteReindexMutation) (
 	if len(mutations) == 0 {
 		return nil, nil, false
 	}
+	oldUnresolved := graph.IsUnresolvedTarget(mutations[0].oldKey.toID)
+	newUnresolved := graph.IsUnresolvedTarget(mutations[0].newRow.key.toID)
+	if oldUnresolved == newUnresolved {
+		return nil, nil, false
+	}
 	seenOld := make(map[sqliteReindexKey]struct{}, len(mutations))
 	deletes = make([]sqliteReindexKey, 0, len(mutations))
 	inserts = make([]sqliteReindexRow, 0, len(mutations))
 	for _, mutation := range mutations {
-		if !mutation.resolvedConversion {
+		if !mutation.resolvedConversion ||
+			graph.IsUnresolvedTarget(mutation.oldKey.toID) != oldUnresolved ||
+			graph.IsUnresolvedTarget(mutation.newRow.key.toID) != newUnresolved {
 			return nil, nil, false
 		}
 		if _, seen := seenOld[mutation.oldKey]; !seen {

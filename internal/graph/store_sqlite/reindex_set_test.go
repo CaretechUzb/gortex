@@ -617,6 +617,140 @@ func TestReindexEdgesResolvedConversionFastPathPreservesSetSemantics(t *testing.
 	assert.True(t, found, "an idempotent replay must preserve active warm analysis")
 }
 
+func TestReindexEdgesResolvedConversionReverseUpdatesInPlace(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	const (
+		fromID           = "repo/caller.go::Caller"
+		resolvedTarget   = "repo/target.go::Target"
+		unresolvedTarget = "unresolved::Target"
+		filePath         = "repo/caller.go"
+	)
+	store.AddBatch(nil, []*graph.Edge{{
+		From: fromID, To: resolvedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 41,
+		Confidence: 0.7, ConfidenceLabel: "heuristic", Origin: "syntax", Tier: "syntax",
+		Meta: map[string]any{"payload": "old"},
+	}})
+	oldKey := sqliteReindexKey{
+		fromID: fromID, toID: resolvedTarget, kind: string(graph.EdgeCalls), filePath: filePath, line: 41,
+	}
+	beforeID := reindexStoredEdgeID(t, store, oldKey)
+
+	stats, err := store.reindexEdgesSetOriented([]graph.EdgeReindex{{
+		OldTo: resolvedTarget,
+		Edge: &graph.Edge{
+			From: fromID, To: unresolvedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 41,
+			Confidence: 0,
+			Meta: map[string]any{
+				"guard_reverted": true,
+			},
+		},
+	}})
+	require.NoError(t, err)
+	assert.Zero(t, stats.selectStatements)
+	assert.Equal(t, 1, stats.updateStatements)
+	assert.Equal(t, 1, stats.updatedRows)
+	assert.Zero(t, stats.deleteStatements)
+	assert.Zero(t, stats.insertStatements)
+
+	newKey := sqliteReindexKey{
+		fromID: fromID, toID: unresolvedTarget, kind: string(graph.EdgeCalls), filePath: filePath, line: 41,
+	}
+	assert.Equal(t, beforeID, reindexStoredEdgeID(t, store, newKey), "reverse conversion must preserve the SQLite row id")
+	persisted := store.GetOutEdges(fromID)
+	require.Len(t, persisted, 1)
+	assert.Equal(t, unresolvedTarget, persisted[0].To)
+	assert.Zero(t, persisted[0].Confidence)
+	assert.Equal(t, true, persisted[0].Meta["guard_reverted"])
+}
+
+func TestReindexEdgesResolvedConversionRejectsMixedDirections(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	const filePath = "repo/caller.go"
+	store.AddBatch(nil, []*graph.Edge{
+		{From: "repo/caller.go::Forward", To: "unresolved::Forward", Kind: graph.EdgeCalls, FilePath: filePath, Line: 51},
+		{From: "repo/caller.go::Reverse", To: "repo/target.go::Reverse", Kind: graph.EdgeCalls, FilePath: filePath, Line: 52},
+	})
+
+	stats, err := store.reindexEdgesSetOriented([]graph.EdgeReindex{
+		{OldTo: "unresolved::Forward", Edge: &graph.Edge{
+			From: "repo/caller.go::Forward", To: "repo/target.go::Forward", Kind: graph.EdgeCalls, FilePath: filePath, Line: 51,
+		}},
+		{OldTo: "repo/target.go::Reverse", Edge: &graph.Edge{
+			From: "repo/caller.go::Reverse", To: "unresolved::Reverse", Kind: graph.EdgeCalls, FilePath: filePath, Line: 52,
+		}},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, stats.selectStatements)
+	assert.Zero(t, stats.updateStatements)
+	assert.Equal(t, 2, stats.deletedRows)
+	assert.Equal(t, 2, stats.insertedRows)
+}
+
+func TestReindexEdgesResolvedConversionRefreshIdentityUsesGenericPath(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	const (
+		fromID           = "repo/caller.go::Refresh"
+		resolvedTarget   = "repo/target.go::Refresh"
+		unresolvedTarget = "unresolved::Refresh"
+		filePath         = "repo/caller.go"
+	)
+	store.AddBatch(nil, []*graph.Edge{{
+		From: fromID, To: resolvedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 61,
+	}})
+
+	stats, err := store.reindexEdgesSetOriented([]graph.EdgeReindex{{
+		OldFrom: fromID, OldTo: resolvedTarget, OldKind: graph.EdgeCalls,
+		OldFilePath: filePath, OldLine: 61, RefreshIdentity: true,
+		Edge: &graph.Edge{
+			From: fromID, To: unresolvedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 61,
+		},
+	}})
+	require.NoError(t, err)
+	assert.NotZero(t, stats.selectStatements)
+	assert.Zero(t, stats.updateStatements)
+	assert.Equal(t, 1, stats.deletedRows)
+	assert.Equal(t, 1, stats.insertedRows)
+}
+
+func TestReindexEdgesResolvedConversionReverseConvergencePreservesFirstCandidate(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	const (
+		fromID           = "repo/caller.go::Caller"
+		firstResolved    = "repo/first.go::Target"
+		secondResolved   = "repo/second.go::Target"
+		unresolvedTarget = "unresolved::Target"
+		filePath         = "repo/caller.go"
+	)
+	store.AddBatch(nil, []*graph.Edge{
+		{From: fromID, To: firstResolved, Kind: graph.EdgeCalls, FilePath: filePath, Line: 71, Origin: "old-first"},
+		{From: fromID, To: secondResolved, Kind: graph.EdgeCalls, FilePath: filePath, Line: 71, Origin: "old-second"},
+	})
+
+	stats, err := store.reindexEdgesSetOriented([]graph.EdgeReindex{
+		{OldTo: firstResolved, Edge: &graph.Edge{
+			From: fromID, To: unresolvedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 71,
+			Origin: "first", Meta: map[string]any{"winner": "first"},
+		}},
+		{OldTo: secondResolved, Edge: &graph.Edge{
+			From: fromID, To: unresolvedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 71,
+			Origin: "second", Meta: map[string]any{"winner": "second"},
+		}},
+	})
+	require.NoError(t, err)
+	assert.Zero(t, stats.selectStatements)
+	assert.Zero(t, stats.updateStatements)
+	assert.Equal(t, 1, stats.deleteStatements)
+	assert.Equal(t, 2, stats.deletedRows)
+	assert.Equal(t, 1, stats.insertStatements)
+	assert.Equal(t, 1, stats.insertedRows)
+
+	persisted := store.GetOutEdges(fromID)
+	require.Len(t, persisted, 1)
+	assert.Equal(t, unresolvedTarget, persisted[0].To)
+	assert.Equal(t, "first", persisted[0].Origin)
+	assert.Equal(t, "first", persisted[0].Meta["winner"])
+}
+
 func BenchmarkReindexEdgesResolvedConversions50K(b *testing.B) {
 	const edgeCount = 50_000
 	b.StopTimer()
