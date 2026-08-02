@@ -60,10 +60,11 @@ func TestWarmupClearsSnapshotPayloadsBeforeDependencyGuard(t *testing.T) {
 		snapshotVector: snapshotVector{Index: []byte{1}, Dims: 1, Count: 1},
 	}
 
-	watcher, timings := warmupDaemonState(state, zap.NewNop(), nil)
+	watcher, timings, err := warmupDaemonState(state, zap.NewNop(), nil)
 
 	assert.Nil(t, watcher)
 	require.NotNil(t, timings)
+	require.Error(t, err)
 	assert.Nil(t, state.snapshotRepos)
 	assert.Nil(t, state.snapshotContracts)
 	assert.Empty(t, state.snapshotVector.Index)

@@ -2,9 +2,17 @@ package main
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/parser"
 )
 
 type warmupResolveStateStore struct {
@@ -70,4 +78,71 @@ func TestProbeWarmupResolveRecoveryPreservesObservedGeneration(t *testing.T) {
 	if !recovery.required || recovery.token.Generation != 91 || recovery.token.Owned {
 		t.Fatalf("recovery = %+v, want required observed generation 91", recovery)
 	}
+}
+
+func TestWarmupDaemonStateProbeFailureFailsClosed(t *testing.T) {
+	probeErr := errors.New("injected resolve-state probe failure")
+	store := &warmupResolveStateStore{Store: graph.New(), err: probeErr}
+	state := &daemonState{
+		graph:         store,
+		multiIndexer:  &indexer.MultiIndexer{},
+		configManager: &config.ConfigManager{},
+	}
+	controller := &realController{}
+	readyCalls := 0
+
+	watcher, timings, err := warmupDaemonState(state, zap.NewNop(), func() {
+		readyCalls++
+		controller.MarkReady(0)
+	})
+
+	require.ErrorIs(t, err, probeErr)
+	assert.Nil(t, watcher)
+	require.NotNil(t, timings)
+	assert.Zero(t, readyCalls)
+	assert.False(t, controller.IsReady())
+	assert.False(t, controller.IsEnriched())
+	assert.Nil(t, controller.watcher())
+}
+
+func TestWarmupDaemonStateRecoveryTrackFailureFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	cm, err := config.NewConfigManager(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	require.NoError(t, cm.Global().AddRepo(config.RepoEntry{
+		Path: filepath.Join(dir, "missing-repository"),
+	}))
+
+	store := &warmupResolveStateStore{
+		Store: graph.New(),
+		token: graph.ResolveStateToken{Generation: 117},
+	}
+	reg := parser.NewRegistry()
+	idx := indexer.New(store, reg, config.Default().Index, zap.NewNop())
+	mi := indexer.NewMultiIndexer(store, reg, idx.Search(), cm, zap.NewNop())
+	state := &daemonState{
+		graph:         store,
+		indexer:       idx,
+		multiIndexer:  mi,
+		configManager: cm,
+	}
+	controller := &realController{}
+	readyCalls := 0
+
+	watcher, timings, err := warmupDaemonState(state, zap.NewNop(), func() {
+		readyCalls++
+		controller.MarkReady(0)
+	})
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "repository reconstruction failed")
+	assert.Nil(t, watcher)
+	require.NotNil(t, timings)
+	assert.Zero(t, readyCalls)
+	assert.False(t, controller.IsReady())
+	assert.False(t, controller.IsEnriched())
+	assert.Nil(t, controller.watcher())
+	_, incomplete, probeErr := store.ResolvePassIncomplete()
+	require.NoError(t, probeErr)
+	assert.True(t, incomplete, "failed recovery must retain its durable generation")
 }
