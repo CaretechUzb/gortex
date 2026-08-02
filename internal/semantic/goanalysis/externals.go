@@ -557,11 +557,28 @@ func externalModuleNodeID(pkg *packages.Package) string {
 // deliberately retained: the reused node may still need this pass's module or
 // call/reference edges.
 func (e *externalsAttribution) drainPendingAdds() (nodes []*graph.Node, edges []*graph.Edge) {
-	nodes, edges = e.pendingNodes, e.pendingEdges
-	e.pendingNodes = nil
-	e.pendingEdges = nil
-	if len(nodes) == 0 || e.g == nil {
-		return nodes, edges
+	return e.drainPendingNodes(0), e.drainPendingEdges(0)
+}
+
+// drainPendingNodes returns at most limit nodes (all when limit <= 0), with the
+// final store recheck applied to that page only. Copying and clearing the source
+// slots prevents a suffix slice from keeping already-applied node pointers live.
+func (e *externalsAttribution) drainPendingNodes(limit int) []*graph.Node {
+	take := len(e.pendingNodes)
+	if limit > 0 && take > limit {
+		take = limit
+	}
+	if take == 0 {
+		return nil
+	}
+	nodes := append([]*graph.Node(nil), e.pendingNodes[:take]...)
+	clear(e.pendingNodes[:take])
+	e.pendingNodes = e.pendingNodes[take:]
+	if len(e.pendingNodes) == 0 {
+		e.pendingNodes = nil
+	}
+	if e.g == nil {
+		return nodes
 	}
 
 	ids := make([]string, 0, len(nodes))
@@ -571,11 +588,11 @@ func (e *externalsAttribution) drainPendingAdds() (nodes []*graph.Node, edges []
 		}
 	}
 	if len(ids) == 0 {
-		return nodes, edges
+		return nodes
 	}
 	existing := graph.LookupExistingNodeIDs(e.g, ids)
 	if len(existing) == 0 {
-		return nodes, edges
+		return nodes
 	}
 
 	kept := nodes[:0]
@@ -591,7 +608,24 @@ func (e *externalsAttribution) drainPendingAdds() (nodes []*graph.Node, edges []
 	}
 	clear(nodes[len(kept):])
 	e.nodesAdded -= reused
-	return kept, edges
+	return kept
+}
+
+func (e *externalsAttribution) drainPendingEdges(limit int) []*graph.Edge {
+	take := len(e.pendingEdges)
+	if limit > 0 && take > limit {
+		take = limit
+	}
+	if take == 0 {
+		return nil
+	}
+	edges := append([]*graph.Edge(nil), e.pendingEdges[:take]...)
+	clear(e.pendingEdges[:take])
+	e.pendingEdges = e.pendingEdges[take:]
+	if len(e.pendingEdges) == 0 {
+		e.pendingEdges = nil
+	}
+	return edges
 }
 
 func (e *externalsAttribution) drainPendingReindexes() []graph.EdgeReindex {

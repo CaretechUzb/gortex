@@ -10,7 +10,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/tools/go/packages"
+
+	"github.com/zzet/gortex/internal/graph"
 )
+
+func TestShouldReclaimLargeCompiler(t *testing.T) {
+	assert.False(t, shouldReclaimLargeCompiler(false, 1<<30, 1<<20), "non-exclusive incremental loads never force process GC")
+	assert.False(t, shouldReclaimLargeCompiler(true, goTypesCompilerReclaimMinGrowth-1, goTypesCompilerReclaimMinUses-1))
+	assert.True(t, shouldReclaimLargeCompiler(true, goTypesCompilerReclaimMinGrowth, 1))
+	assert.True(t, shouldReclaimLargeCompiler(true, 1, goTypesCompilerReclaimMinUses))
+}
 
 func TestReleaseGoPackageCompilerStateKeepsExternalMetadata(t *testing.T) {
 	module := &packages.Module{Path: "example.com/mod", Version: "v1.2.3"}
@@ -88,4 +97,37 @@ func TestProjectedExternalUseInternsStringOnlyIdentity(t *testing.T) {
 		field := planType.Field(i)
 		assert.False(t, field.Type.Implements(compilerObject), "field %s retains types.Object", field.Name)
 	}
+}
+
+func TestProjectedExternalAddsDrainInBoundedNodeThenEdgePages(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "existing"})
+	externals := &externalsAttribution{g: g, nodesAdded: 5}
+	for i, id := range []string{"existing", "n1", "n2", "n3", "n4"} {
+		externals.pendingNodes = append(externals.pendingNodes, &graph.Node{ID: id})
+		externals.pendingEdges = append(externals.pendingEdges, &graph.Edge{
+			From: id,
+			To:   "module",
+			Kind: graph.EdgeDependsOnModule,
+			Line: i,
+		})
+	}
+
+	firstNodes := externals.drainPendingNodes(2)
+	secondNodes := externals.drainPendingNodes(2)
+	thirdNodes := externals.drainPendingNodes(2)
+	assert.Len(t, firstNodes, 1, "the existing node is filtered within its page")
+	assert.Equal(t, "n1", firstNodes[0].ID)
+	assert.Len(t, secondNodes, 2)
+	assert.Len(t, thirdNodes, 1)
+	assert.Nil(t, externals.pendingNodes)
+	assert.Equal(t, 4, externals.nodesAdded)
+
+	firstEdges := externals.drainPendingEdges(2)
+	secondEdges := externals.drainPendingEdges(2)
+	thirdEdges := externals.drainPendingEdges(2)
+	assert.Len(t, firstEdges, 2)
+	assert.Len(t, secondEdges, 2)
+	assert.Len(t, thirdEdges, 1)
+	assert.Nil(t, externals.pendingEdges)
 }
