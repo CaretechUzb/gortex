@@ -1482,6 +1482,14 @@ func (mi *MultiIndexer) runGlobalGraphPasses(
 	mi.runGlobalGraphPassesTopologyHeld(ctx, scope, censusEligible)
 }
 
+// fullCoverageGlobalPass reports whether the pass frontier covers the complete
+// tracked graph. A nil scope is the historical whole-graph form; a detached
+// census attestation makes an explicit all-repository scope equivalent while
+// preserving that scope for passes with per-repository state (notably clones).
+func fullCoverageGlobalPass(scope map[string]struct{}, censusEligible bool) bool {
+	return scope == nil || censusEligible
+}
+
 // runGlobalGraphPassesTopologyHeld runs with caller-owned topology and
 // scope/census state. It never reads or consumes armed batch fields; EndBatch
 // is their sole consumer.
@@ -1495,6 +1503,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	if mi.graph == nil {
 		return
 	}
+	fullCoverage := fullCoverageGlobalPass(scope, censusEligible)
 	reporter := progress.FromContext(ctx)
 	r := resolver.New(mi.graph)
 	// Unconditional per-sub-pass timing. These global passes run serially and
@@ -1532,14 +1541,27 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 			}
 		}
 		sort.Strings(scopedRepoPrefixes)
-		scopedTypeIfaceIDs = make(map[string]bool)
-		for _, id := range graph.ReadRepoNodeIDsByKinds(
-			mi.graph,
-			scopedRepoPrefixes,
-			[]graph.NodeKind{graph.KindType, graph.KindInterface},
-		) {
-			scopedTypeIfaceIDs[id] = true
+		if !fullCoverage {
+			scopedTypeIfaceIDs = make(map[string]bool)
+			for _, id := range graph.ReadRepoNodeIDsByKinds(
+				mi.graph,
+				scopedRepoPrefixes,
+				[]graph.NodeKind{graph.KindType, graph.KindInterface},
+			) {
+				scopedTypeIfaceIDs[id] = true
+			}
 		}
+	}
+
+	// Full-coverage batches retain their explicit repository scope for
+	// per-repository state and framework census ownership, but graph scans use
+	// nil so SQLite can select its whole-store partial indexes instead of
+	// materialising an all-repository join table.
+	scanPrefixes := changedPrefixes
+	scanRepoPrefixes := scopedRepoPrefixes
+	if fullCoverage {
+		scanPrefixes = nil
+		scanRepoPrefixes = nil
 	}
 
 	// Start breadcrumb per pass: completion-only logging left every slow pass
@@ -1547,7 +1569,8 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	passStart := func(pass string) {
 		mi.logger.Info("global pass starting",
 			zap.String("pass", pass),
-			zap.Bool("scoped", scope != nil))
+			zap.Bool("scoped", scope != nil),
+			zap.Bool("full_coverage", fullCoverage))
 	}
 
 	// The global passes below are the first big read sweeps after the
@@ -1568,7 +1591,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	implStart := time.Now()
 	implAdded := 0
 	switch {
-	case scope == nil:
+	case fullCoverage:
 		implAdded = r.InferImplements()
 	case len(scopedTypeIfaceIDs) > 0:
 		// Empty set => no type/interface changed in the batch => no inferred
@@ -1583,7 +1606,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	overStart := time.Now()
 	overAdded := 0
 	switch {
-	case scope == nil:
+	case fullCoverage:
 		overAdded = r.InferOverrides()
 	case len(scopedTypeIfaceIDs) > 0:
 		overAdded = r.InferOverridesScoped(scopedTypeIfaceIDs)
@@ -1594,7 +1617,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		zap.Duration("elapsed", time.Since(overStart)))
 	passStart("test_edges")
 	testStart := time.Now()
-	marked, emitted := markTestSymbolsAndEmitEdgesScoped(mi.graph, changedPrefixes)
+	marked, emitted := markTestSymbolsAndEmitEdgesScoped(mi.graph, scanPrefixes)
 	mi.logger.Info("global pass: test edges",
 		zap.Int("test_symbols", marked),
 		zap.Int("edges", emitted),
@@ -1611,7 +1634,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	}
 	passStart("capability_edges")
 	capStart := time.Now()
-	capRe, capEp, capFa := synthesizeCapabilityEdgesScoped(mi.graph, changedPrefixes)
+	capRe, capEp, capFa := synthesizeCapabilityEdgesScoped(mi.graph, scanPrefixes)
 	mi.logger.Info("global pass: capability edges",
 		zap.Int("reads_env", capRe),
 		zap.Int("executes_process", capEp),
@@ -1729,10 +1752,10 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	extStart := time.Now()
 	extEnabled := mi.externalCallSynthesisEnabled()
 	extCalls := 0
-	if scope != nil {
-		extCalls = resolver.SynthesizeExternalCallsForRepos(mi.graph, extEnabled, changedPrefixes)
-	} else {
+	if fullCoverage {
 		extCalls = resolver.SynthesizeExternalCalls(mi.graph, extEnabled)
+	} else {
+		extCalls = resolver.SynthesizeExternalCallsForRepos(mi.graph, extEnabled, scanPrefixes)
 	}
 	mi.logger.Info("global pass: external-call synthesis",
 		zap.Int("edges", extCalls),
@@ -1745,10 +1768,10 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	passStart("cross_repo_edges")
 	crStart := time.Now()
 	crossRepoEdges := 0
-	if scope != nil {
-		crossRepoEdges = resolver.DetectCrossRepoEdgesForRepos(mi.graph, scopedRepoPrefixes)
-	} else {
+	if fullCoverage {
 		crossRepoEdges = resolver.DetectCrossRepoEdges(mi.graph)
+	} else {
+		crossRepoEdges = resolver.DetectCrossRepoEdgesForRepos(mi.graph, scanRepoPrefixes)
 	}
 	mi.logger.Info("global pass: cross-repo edges",
 		zap.Int("edges", crossRepoEdges),
