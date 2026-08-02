@@ -10,7 +10,10 @@ import (
 // Keep graph reads bounded without falling back to one backend query per file
 // or annotation. SQLite applies its own lower SQL-variable chunks inside each
 // call; this cap bounds the Go-side adjacency retained by this whole-graph pass.
-const testMetadataLookupBatchSize = 512
+const (
+	testMetadataLookupBatchSize = 512
+	testProjectionPageSize      = 256
+)
 
 // markTestSymbolsAndEmitEdges runs after the resolver and before
 // community detection. It performs two passes over the graph:
@@ -331,6 +334,167 @@ func markTestSymbolsAndEmitEdgesForFilesLocked(g graph.Store, changedFiles []str
 	return markedTests, len(edges)
 }
 
+func setTestMetadata(n *graph.Node, key string, value any) bool {
+	if n.Meta == nil {
+		n.Meta = map[string]any{}
+	}
+	switch want := value.(type) {
+	case bool:
+		if got, ok := n.Meta[key].(bool); ok && got == want {
+			return false
+		}
+	case string:
+		if got, ok := n.Meta[key].(string); ok && got == want {
+			return false
+		}
+	}
+	n.Meta[key] = value
+	return true
+}
+
+// markTestSymbolsProjectedLocked is the SQLite/global fast path. Its scanner
+// yields metadata-free pages with every cursor already closed, so the callback
+// may safely fetch the small set of test files, annotation targets, and symbols
+// that actually need full metadata. Production symbols never cross the driver
+// as full graph.Node values.
+func markTestSymbolsProjectedLocked(g graph.Store, scanner graph.TestProjectionScanner) (testNodes map[string]bool, markedTests int, changedNodes []*graph.Node) {
+	testFiles := make(map[string]bool)
+	fileRunners := make(map[string]string)
+	scanner.ScanTestNodeProjections([]graph.NodeKind{graph.KindFile}, testProjectionPageSize, func(rows []graph.TestNodeProjection) bool {
+		ids := make([]string, 0, len(rows))
+		for _, row := range rows {
+			if !IsTestFile(row.FilePath) {
+				continue
+			}
+			testFiles[row.ID] = true
+			testFiles[row.FilePath] = true
+			ids = append(ids, row.ID)
+		}
+		if len(ids) == 0 {
+			return true
+		}
+		fullNodes := g.GetNodesByIDs(ids)
+		outEdges := g.GetOutEdgesByNodeIDs(ids)
+		for _, id := range ids {
+			node := fullNodes[id]
+			if node == nil {
+				continue
+			}
+			changed := setTestMetadata(node, "is_test_file", true)
+			if runner := detectTestRunnerForFileEdges(node, outEdges[id]); runner != "" {
+				changed = setTestMetadata(node, "test_runner", runner) || changed
+				fileRunners[node.ID] = runner
+				fileRunners[node.FilePath] = runner
+			}
+			if changed {
+				changedNodes = append(changedNodes, node)
+			}
+		}
+		return true
+	})
+
+	// Resolve annotation targets in bounded batches. Only endpoint IDs cross
+	// the whole-edge scan; annotation node metadata is fetched on demand.
+	annoTestRole := make(map[string]string)
+	annoNodeRole := make(map[string]string)
+	type annotationRef struct{ from, to string }
+	annotationBatch := make([]annotationRef, 0, testMetadataLookupBatchSize)
+	flushAnnotations := func() {
+		if len(annotationBatch) == 0 {
+			return
+		}
+		missingSet := make(map[string]struct{})
+		for _, ref := range annotationBatch {
+			if _, cached := annoNodeRole[ref.to]; !cached {
+				missingSet[ref.to] = struct{}{}
+			}
+		}
+		if len(missingSet) > 0 {
+			missing := make([]string, 0, len(missingSet))
+			for id := range missingSet {
+				missing = append(missing, id)
+			}
+			nodes := g.GetNodesByIDs(missing)
+			for id := range missingSet {
+				role := ""
+				if annotation := nodes[id]; annotation != nil {
+					role = AnnotationTestRole(annotation.Language, annotation.Name)
+				}
+				annoNodeRole[id] = role
+			}
+		}
+		for _, ref := range annotationBatch {
+			role := annoNodeRole[ref.to]
+			if role == "" {
+				continue
+			}
+			if current := annoTestRole[ref.from]; current == "" || (current == "benchmark" && role == "test") {
+				annoTestRole[ref.from] = role
+			}
+		}
+		annotationBatch = annotationBatch[:0]
+	}
+	scanner.ScanTestEdgeProjections([]graph.EdgeKind{graph.EdgeAnnotated}, testProjectionPageSize, func(rows []graph.TestEdgeProjection) bool {
+		for _, row := range rows {
+			annotationBatch = append(annotationBatch, annotationRef{from: row.From, to: row.To})
+			if len(annotationBatch) == cap(annotationBatch) {
+				flushAnnotations()
+			}
+		}
+		return true
+	})
+	flushAnnotations()
+
+	testNodes = make(map[string]bool)
+	scanner.ScanTestNodeProjections([]graph.NodeKind{graph.KindFunction, graph.KindMethod}, testProjectionPageSize, func(rows []graph.TestNodeProjection) bool {
+		type plannedStamp struct {
+			id, role, runner string
+		}
+		plans := make([]plannedStamp, 0, len(rows))
+		ids := make([]string, 0, len(rows))
+		for _, row := range rows {
+			var role, runner string
+			switch {
+			case testFiles[row.FilePath]:
+				role = TestRole(row.Name, row.Language)
+				if role == "" {
+					role = "test"
+				}
+				runner = fileRunners[row.FilePath]
+			case annoTestRole[row.ID] != "":
+				role = annoTestRole[row.ID]
+				runner = AnnotationTestRunner(row.Language)
+			default:
+				continue
+			}
+			plans = append(plans, plannedStamp{id: row.ID, role: role, runner: runner})
+			ids = append(ids, row.ID)
+		}
+		if len(ids) == 0 {
+			return true
+		}
+		fullNodes := g.GetNodesByIDs(ids)
+		for _, plan := range plans {
+			node := fullNodes[plan.id]
+			if node == nil {
+				continue
+			}
+			changed := setTestMetadata(node, "is_test", true)
+			changed = setTestMetadata(node, "test_role", plan.role) || changed
+			if plan.runner != "" {
+				changed = setTestMetadata(node, "test_runner", plan.runner) || changed
+			}
+			if changed {
+				changedNodes = append(changedNodes, node)
+			}
+			testNodes[node.ID] = true
+			markedTests++
+		}
+		return true
+	})
+	return testNodes, markedTests, changedNodes
+}
+
 // markTestSymbolsLocked runs Pass 1: it stamps test Meta on every test symbol
 // and returns the complete test-node membership set, marked count, and every
 // node whose test metadata changed. The caller persists changedNodes through
@@ -338,6 +502,9 @@ func markTestSymbolsAndEmitEdgesForFilesLocked(g graph.Store, changedFiles []str
 // g.ResolveMutex(). Always whole-graph — see the scoped entry point for why the
 // set must be complete.
 func markTestSymbolsLocked(g graph.Store) (testNodes map[string]bool, markedTests int, changedNodes []*graph.Node) {
+	if scanner, ok := g.(graph.TestProjectionScanner); ok {
+		return markTestSymbolsProjectedLocked(g, scanner)
+	}
 	setMeta := func(n *graph.Node, key string, value any) bool {
 		if n.Meta == nil {
 			n.Meta = map[string]any{}
@@ -521,32 +688,45 @@ func emitTestEdgesLocked(g graph.Store, testNodes map[string]bool, changedPrefix
 // emitTestEdgesAndPersistLocked additionally persists changedNodes in the same
 // AddBatch as the derived edges so disk-backed stores retain the classification.
 func emitTestEdgesAndPersistLocked(g graph.Store, testNodes map[string]bool, changedNodes []*graph.Node, changedPrefixes map[string]bool) int {
-	seen := map[string]bool{}
+	seen := make(map[graph.EdgeEndpoint]struct{})
 	type pending struct {
 		from, to, file string
 		line           int
 	}
 	var out []pending
-	process := func(e *graph.Edge) {
-		if e == nil || e.Kind != graph.EdgeCalls {
+	processFields := func(from, to, file string, line int) {
+		if !testNodes[from] {
 			return
 		}
-		if !testNodes[e.From] {
-			return
-		}
-		if testNodes[e.To] {
+		if testNodes[to] {
 			return // test → test calls are infrastructure, not subject coverage
 		}
-		key := e.From + "\x00" + e.To
-		if seen[key] {
+		key := graph.EdgeEndpoint{From: from, To: to}
+		if _, duplicate := seen[key]; duplicate {
 			return
 		}
-		seen[key] = true
-		out = append(out, pending{from: e.From, to: e.To, file: e.FilePath, line: e.Line})
+		seen[key] = struct{}{}
+		out = append(out, pending{from: from, to: to, file: file, line: line})
+	}
+	process := func(e *graph.Edge) {
+		if e != nil && e.Kind == graph.EdgeCalls {
+			processFields(e.From, e.To, e.FilePath, e.Line)
+		}
 	}
 	if changedPrefixes == nil {
-		for e := range g.EdgesByKind(graph.EdgeCalls) {
-			process(e)
+		if scanner, ok := g.(graph.TestProjectionScanner); ok {
+			scanner.ScanTestEdgeProjections([]graph.EdgeKind{graph.EdgeCalls}, testProjectionPageSize, func(rows []graph.TestEdgeProjection) bool {
+				for _, row := range rows {
+					if row.Kind == graph.EdgeCalls {
+						processFields(row.From, row.To, row.FilePath, row.Line)
+					}
+				}
+				return true
+			})
+		} else {
+			for e := range g.EdgesByKind(graph.EdgeCalls) {
+				process(e)
+			}
 		}
 	} else {
 		prefixes := make([]string, 0, len(changedPrefixes))
