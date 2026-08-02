@@ -28,11 +28,24 @@ type IncrementalDerivedReport struct {
 	// today) propagated down resolved extends chains on declaration-shape
 	// changes.
 	EntryPointHierarchy int
-	Framework           int
-	ExternalCalls       int
-	CrossRepo           int
-	Contracts           int
-	DurationMs          int64
+	// Framework preserves the legacy attempted/landed count. It is not an
+	// inserted-edge delta; FrameworkPer and the phase timings expose the actual
+	// owner of a slow incremental settle without changing that compatibility.
+	Framework              int
+	FrameworkPer           []resolver.SynthCount
+	FrameworkGated         int
+	FrameworkReceiverGated int
+	FrameworkCensusMs      int64
+	FrameworkScopeMs       int64
+	FrameworkGateMs        int64
+	FrameworkClaimMs       int64
+	FrameworkDemoteMs      int64
+	FrameworkScopeRows     int
+	FrameworkScopeBytes    int
+	ExternalCalls          int
+	CrossRepo              int
+	Contracts              int
+	DurationMs             int64
 }
 
 // runStandaloneIncrementalDerivedPasses reuses the exact MultiIndexer derived
@@ -196,6 +209,16 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 			mi.graph, scopedPrefixes, merged.Files, merged.CSharpHierarchyChanged,
 		)
 		report.Framework = framework.Total
+		report.FrameworkPer = framework.Per
+		report.FrameworkGated = framework.Gated
+		report.FrameworkReceiverGated = framework.ReceiverGated
+		report.FrameworkCensusMs = framework.CensusMillis
+		report.FrameworkScopeMs = framework.ScopeMillis
+		report.FrameworkGateMs = framework.GateMillis
+		report.FrameworkClaimMs = framework.ClaimMillis
+		report.FrameworkDemoteMs = framework.DemoteMillis
+		report.FrameworkScopeRows = framework.ScopeRows
+		report.FrameworkScopeBytes = framework.ScopeBytes
 		report.ExternalCalls = resolver.SynthesizeExternalCallsForFiles(
 			mi.graph, mi.externalCallSynthesisEnabled(), merged.Files,
 		)
@@ -222,7 +245,21 @@ func (mi *MultiIndexer) logIncrementalDerived(report IncrementalDerivedReport, p
 		zap.Int("test_edges", report.TestEdges),
 		zap.Int("entrypoint_hierarchy", report.EntryPointHierarchy),
 		zap.Int("capability_edges", report.Capability),
+		// Keep framework_edges for log consumers, and add the accurate label:
+		// synthesizers report attempted/landed candidates, including idempotent
+		// rows that may already be durable.
 		zap.Int("framework_edges", report.Framework),
+		zap.Int("framework_attempted", report.Framework),
+		zap.Any("framework_per_synth", report.FrameworkPer),
+		zap.Int("framework_gated", report.FrameworkGated),
+		zap.Int("framework_receiver_gated", report.FrameworkReceiverGated),
+		zap.Int64("framework_census_ms", report.FrameworkCensusMs),
+		zap.Int64("framework_scope_ms", report.FrameworkScopeMs),
+		zap.Int64("framework_gate_ms", report.FrameworkGateMs),
+		zap.Int64("framework_claim_ms", report.FrameworkClaimMs),
+		zap.Int64("framework_demote_ms", report.FrameworkDemoteMs),
+		zap.Int("framework_scope_rows", report.FrameworkScopeRows),
+		zap.Int("framework_scope_bytes", report.FrameworkScopeBytes),
 		zap.Int("external_calls", report.ExternalCalls),
 		zap.Int("cross_repo_edges", report.CrossRepo),
 		zap.Int("contract_edges", report.Contracts),

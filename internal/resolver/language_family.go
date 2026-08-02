@@ -87,7 +87,7 @@ func applyFrameworkFamilyGateScopedForFiles(
 		return 0
 	}
 	var edges []*graph.Edge
-	if scope != nil && len(filePaths) > 0 {
+	if len(filePaths) > 0 {
 		edges = frameworkFamilyGateEdgesForFiles(g, scope, filePaths)
 	} else {
 		edges = frameworkRepoEdges(g, scope, graph.EdgeReferences, graph.EdgeImports)

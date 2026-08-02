@@ -453,16 +453,15 @@ func summarizeFrameworkCandidatesCensus(
 		allMarkers:    map[string]int{},
 		scopedMarkers: map[string]int{},
 	}
-	// fullCensus: the summary may treat the store as fully covered. True on a
-	// nil scope (the classic cold form) or under the daemon's full-coverage
-	// attestation. filePaths narrows an incremental frontier and is never
-	// combined with the attestation.
-	fullCensus := scope == nil || (censusEligible && len(filePaths) == 0)
+	// fullCensus: the summary may treat the store as fully covered only when
+	// there is no exact changed-file frontier. A nil repository scope can mean
+	// the empty-prefix single-repository shape; filePaths must still win.
+	fullCensus := len(filePaths) == 0 && (scope == nil || censusEligible)
 	summary.fullCensus = fullCensus
 	var observerRoles map[string]uint8
 	observerRolesOverflow := false
 	var nodes iter.Seq[*graph.Node]
-	if scope != nil && !fullCensus {
+	if !fullCensus {
 		nodes = graph.NodesLightInScopeSeq(g, frameworkScopePrefixes(scope), filePaths)
 	} else {
 		nodes = graph.NodesLightSeq(g)
@@ -485,14 +484,14 @@ func summarizeFrameworkCandidatesCensus(
 				observerRolesOverflow = true
 			}
 		}
-		if scope != nil {
+		if !fullCensus {
 			recordFrameworkNodeCandidates(summary.scopedMarkers, n, family)
 		}
 		if family == "" {
 			continue
 		}
 		summary.all[family]++
-		if scope != nil {
+		if !fullCensus {
 			summary.scoped[family]++
 		}
 	}
@@ -577,7 +576,7 @@ func summarizeFrameworkCandidatesCensus(
 		// admission further), then run the census edge walks as the single
 		// candidate dispatcher for every armed pass.
 		present, markers := summary.all, summary.allMarkers
-		if scope != nil {
+		if !fullCensus {
 			present, markers = summary.scoped, summary.scopedMarkers
 		}
 		summary.streams = newFrameworkStreamCandidates(g, present, markers)
@@ -1028,18 +1027,28 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 
 // SynthCount is the per-synthesizer result row in a FrameworkSynthReport.
 type SynthCount struct {
-	Name  string `json:"name"`
-	Edges int    `json:"edges"`
+	Name string `json:"name"`
+	// Edges is the synthesizer's legacy attempted/landed count. Some passes
+	// include already-persisted idempotent results, so it is not an inserted-row
+	// count; the name remains for API compatibility.
+	Edges int `json:"edges"`
 	// Millis is how long this synthesizer's Synthesize call took. Named
 	// passes that land 0 edges are not free — many scan a shared edge/node
 	// kind across the whole graph before concluding there is nothing to
 	// bind — so this rides on every row, not just the ones with edges.
 	Millis int64 `json:"ms,omitempty"`
+	// ScopeRows/ScopeBytes expose the bounded seed plus this pass's private
+	// dependency expansion. They make accidental cross-pass widening visible
+	// without retaining candidate objects after the pass completes.
+	ScopeRows  int `json:"scope_rows,omitempty"`
+	ScopeBytes int `json:"scope_bytes,omitempty"`
 }
 
 // FrameworkSynthReport is the aggregate result of one
 // RunFrameworkSynthesizers invocation.
 type FrameworkSynthReport struct {
+	// Total preserves the legacy sum of per-pass attempted/landed counts. It is
+	// not a durable inserted-edge delta; callers should label it accordingly.
 	Total int          `json:"total"`
 	Per   []SynthCount `json:"per_synthesizer"`
 	// Gated counts synthesized reference/import edges dropped by the
@@ -1062,12 +1071,12 @@ type FrameworkSynthReport struct {
 	// here with every synthesizer gated to zero — the census, not the
 	// synthesizers, owned the pass. It must never be silent again.
 	CensusMillis int64 `json:"census_ms,omitempty"`
-	// ScopeMillis times the scoped-store view construction between the
-	// census and the loop — the last untimed sliver of the pass. A measured
-	// run on a swap-crushed host showed ~437s of pass wall the timed
-	// sections could not account for; every section now reports, so a
-	// recurrence names its owner.
+	// ScopeMillis times the scoped-store seed construction between the census
+	// and the loop. ScopeRows/ScopeBytes describe that immutable seed; each
+	// SynthCount then reports the seed plus only its private expansion.
 	ScopeMillis int64 `json:"scope_ms,omitempty"`
+	ScopeRows   int   `json:"scope_rows,omitempty"`
+	ScopeBytes  int   `json:"scope_bytes,omitempty"`
 }
 
 // scopedSynthesizer is the optional capability a FrameworkSynthesizer exposes
@@ -1124,6 +1133,25 @@ func RunFrameworkSynthesizersScopedForFiles(
 	return runFrameworkSynthesizersScoped(g, scope, filePaths, false, csharpHierarchyChanged)
 }
 
+func frameworkScopeForFiles(
+	g graph.Store,
+	scope map[string]bool,
+	filePaths []string,
+) map[string]bool {
+	if scope != nil || g == nil || len(filePaths) == 0 {
+		return scope
+	}
+	recovered := map[string]bool{}
+	for _, nodes := range g.GetFileNodesByPaths(filePaths) {
+		for _, node := range nodes {
+			if node != nil {
+				recovered[node.RepoPrefix] = true
+			}
+		}
+	}
+	return recovered
+}
+
 func runFrameworkSynthesizersScoped(
 	g graph.Store,
 	scope map[string]bool,
@@ -1135,8 +1163,13 @@ func runFrameworkSynthesizersScoped(
 	if g == nil {
 		return rep
 	}
+	// A changed-file frontier is always partial, even when a legacy caller lost
+	// its repository prefix (notably the empty-prefix single-repository shape).
+	// Recover the owning prefixes from the exact file rows so tail claimers keep
+	// their repository boundary without promoting the census to a global scan.
+	effectiveScope := frameworkScopeForFiles(g, scope, filePaths)
 	censusStart := time.Now()
-	candidates := summarizeFrameworkCandidatesCensus(g, scope, filePaths, censusEligible)
+	candidates := summarizeFrameworkCandidatesCensus(g, effectiveScope, filePaths, censusEligible)
 	rep.CensusMillis = time.Since(censusStart).Milliseconds()
 
 	// A full-census attestation means the supplied repository scope covers the
@@ -1144,21 +1177,24 @@ func runFrameworkSynthesizersScoped(
 	// scoped synthesizers and tail passes otherwise turn the all-repository set
 	// into repeated repo -> node -> edge probes. True partial runs retain their
 	// repository and file frontier unchanged.
-	executionScope := scope
+	executionScope := effectiveScope
 	if candidates.fullCensus {
 		executionScope = nil
 	}
 
 	scopeStart := time.Now()
-	var genericScope graph.Store
+	var genericSeed *frameworkScopedSeed
 	if executionScope != nil {
-		genericScope = newFrameworkScopedStore(g, executionScope, filePaths)
+		genericSeed = newFrameworkScopedSeed(g, executionScope, filePaths)
+		rep.ScopeRows = genericSeed.retainedRows
+		rep.ScopeBytes = genericSeed.retainedBytes
 	}
 	rep.ScopeMillis = time.Since(scopeStart).Milliseconds()
 	for _, s := range defaultFrameworkSynthesizers() {
 		start := time.Now()
 		var n int
 		var bundle *frameworkPassCandidates
+		var passScope *frameworkScopedStore
 		if shouldRunFrameworkSynthesizer(s, executionScope, candidates) {
 			if sf, ok := s.(synthFunc); ok {
 				bundle = candidates.streams.passStreams(g, sf.name)
@@ -1175,7 +1211,8 @@ func runFrameworkSynthesizersScoped(
 				case sf.scopedFn != nil:
 					n = sf.scopedFn(g, executionScope)
 				default:
-					n = runLegacyFrameworkSynth(genericScope, sf.fn)
+					passScope = genericSeed.newPassStore()
+					n = runLegacyFrameworkSynth(passScope, sf.fn)
 				}
 			} else if ss, ok := s.(scopedSynthesizer); ok {
 				n = runLegacyFrameworkSynth(g, func(store graph.Store) int {
@@ -1187,7 +1224,13 @@ func runFrameworkSynthesizersScoped(
 				panic("framework partial run has an unscoped synthesizer: " + s.Name())
 			}
 		}
-		rep.Per = append(rep.Per, SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds()})
+		count := SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds()}
+		if passScope != nil {
+			stats := passScope.stats()
+			count.ScopeRows = stats.RetainedRows
+			count.ScopeBytes = stats.RetainedBytes
+		}
+		rep.Per = append(rep.Per, count)
 		rep.Total += n
 		candidates.streams.releasePass(s.Name(), bundle)
 	}

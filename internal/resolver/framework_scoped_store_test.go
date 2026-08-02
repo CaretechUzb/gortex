@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
+	"path/filepath"
 	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 // frameworkScopeTrapStore makes an accidental whole-store predicate scan
@@ -366,3 +368,154 @@ var (
 	_ graph.RepoLightNodeReader       = (*frameworkScopeTrapStore)(nil)
 	_ graph.ExactEdgeBatchRemover     = (*frameworkScopeTrapStore)(nil)
 )
+
+func TestFrameworkScopedStorePassIsolation(t *testing.T) {
+	for _, backend := range []struct {
+		name string
+		open func(*testing.T) graph.Store
+	}{
+		{name: "memory", open: func(*testing.T) graph.Store { return graph.New() }},
+		{name: "sqlite", open: openFrameworkScopedSQLiteStore},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			store := backend.open(t)
+			changed := &graph.Node{
+				ID: "repo::changed", Kind: graph.KindFunction, Name: "changed",
+				FilePath: "changed.go", Language: "go", RepoPrefix: "repo",
+			}
+			seedDependency := &graph.Node{
+				ID: "repo::seed-dependency", Kind: graph.KindMethod, Name: "seedDependency",
+				FilePath: "dependency.go", Language: "go", RepoPrefix: "repo",
+			}
+			dynamicDependency := &graph.Node{
+				ID: "repo::dynamic-dependency", Kind: graph.KindFunction, Name: "dynamicDependency",
+				FilePath: "dynamic.go", Language: "go", RepoPrefix: "repo",
+			}
+			unrelated := &graph.Node{
+				ID: "repo::unrelated", Kind: graph.KindFunction, Name: "unrelated",
+				FilePath: "unrelated.py", Language: "python", RepoPrefix: "repo",
+			}
+			store.AddBatch(
+				[]*graph.Node{changed, seedDependency, dynamicDependency, unrelated},
+				[]*graph.Edge{{
+					From: changed.ID, To: seedDependency.ID, Kind: graph.EdgeCalls,
+					FilePath: changed.FilePath, Line: 3,
+				}},
+			)
+
+			seed := newFrameworkScopedSeed(
+				store,
+				map[string]bool{"repo": true},
+				[]string{changed.FilePath},
+			)
+			passA := seed.newPassStore()
+			if got := passA.FindNodesByName(dynamicDependency.Name); len(got) != 1 {
+				t.Fatalf("pass A dynamic lookup returned %d nodes, want 1", len(got))
+			}
+			if !frameworkNodeSeqContains(passA.NodesByKind(graph.KindFunction), dynamicDependency.ID) {
+				t.Fatal("pass A did not retain its own dynamic dependency")
+			}
+			if passA.stats().RetainedRows <= seed.retainedRows {
+				t.Fatal("pass A did not report its private frontier expansion")
+			}
+
+			// Model a synthesized edge whose source is an admitted dependency,
+			// not the changed file. It must be visible to the next pass even
+			// though pass A's read-only dynamic node expansion is discarded.
+			persisted := &graph.Edge{
+				From: seedDependency.ID, To: dynamicDependency.ID, Kind: graph.EdgeCalls,
+				FilePath: seedDependency.FilePath, Line: 7,
+			}
+			runLegacyFrameworkSynth(passA, func(g graph.Store) int {
+				g.AddEdge(persisted)
+				return 1
+			})
+
+			passB := seed.newPassStore()
+			if frameworkNodeSeqContains(passB.NodesByKind(graph.KindFunction), dynamicDependency.ID) {
+				t.Fatal("pass A read expansion leaked into pass B")
+			}
+			if !frameworkNodeSeqContains(passB.NodesByKind(graph.KindMethod), seedDependency.ID) {
+				t.Fatal("immutable changed-file seed was not retained for pass B")
+			}
+			if !frameworkEdgeSeqContains(passB.EdgesByKind(graph.EdgeCalls), persisted) {
+				t.Fatal("pass B could not observe pass A's persisted synthesized edge")
+			}
+		})
+	}
+}
+
+func TestFrameworkFileFrontierWinsWithoutRepoScope(t *testing.T) {
+	for _, backend := range []struct {
+		name string
+		open func(*testing.T) graph.Store
+	}{
+		{name: "memory", open: func(*testing.T) graph.Store { return graph.New() }},
+		{name: "sqlite", open: openFrameworkScopedSQLiteStore},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			store := backend.open(t)
+			changed := &graph.Node{
+				ID: "repo::changed", Kind: graph.KindFunction, Name: "changed",
+				FilePath: "changed.go", Language: "go", RepoPrefix: "repo",
+			}
+			unrelated := &graph.Node{
+				ID: "other::unrelated", Kind: graph.KindFunction, Name: "unrelated",
+				FilePath: "unrelated.py", Language: "python", RepoPrefix: "other",
+			}
+			store.AddBatch([]*graph.Node{changed, unrelated}, nil)
+
+			summary := summarizeFrameworkCandidatesCensus(
+				store, nil, []string{changed.FilePath}, false,
+			)
+			if summary.fullCensus {
+				t.Fatal("nil repository scope promoted an exact file frontier to a full census")
+			}
+			if summary.all["go"] != 1 || summary.all["python"] != 0 {
+				t.Fatalf("file census widened beyond changed.go: families=%v", summary.all)
+			}
+
+			effective := frameworkScopeForFiles(store, nil, []string{changed.FilePath})
+			if !effective["repo"] || len(effective) != 1 {
+				t.Fatalf("recovered scope = %v, want only repo", effective)
+			}
+			view := newFrameworkScopedSeed(store, nil, []string{changed.FilePath}).newPassStore()
+			if frameworkNodeSeqContains(view.NodesByKind(graph.KindFunction), unrelated.ID) {
+				t.Fatal("nil repository scope widened the scoped store beyond changed.go")
+			}
+		})
+	}
+}
+
+func openFrameworkScopedSQLiteStore(t *testing.T) graph.Store {
+	t.Helper()
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open sqlite graph: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close sqlite graph: %v", err)
+		}
+	})
+	return store
+}
+
+func frameworkNodeSeqContains(nodes func(func(*graph.Node) bool), id string) bool {
+	for node := range nodes {
+		if node != nil && node.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func frameworkEdgeSeqContains(edges func(func(*graph.Edge) bool), want *graph.Edge) bool {
+	wantIdentity := graph.EdgeIdentityFor(want)
+	for edge := range edges {
+		if graph.EdgeIdentityFor(edge) == wantIdentity {
+			return true
+		}
+	}
+	return false
+}
