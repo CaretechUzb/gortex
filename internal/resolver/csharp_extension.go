@@ -63,8 +63,12 @@ func (r *Resolver) tryBindCSharpExtension(e *graph.Edge, methodName, receiverTyp
 	// Builtin receivers ride a separate stamp — kept out of
 	// receiver_type so the receiver-gate passes stay keyed on user
 	// types — but they are receiver evidence all the same.
+	builtinRecv := false
 	if receiverType == "" && e.Meta != nil {
-		receiverType, _ = e.Meta["receiver_builtin"].(string)
+		if b, _ := e.Meta["receiver_builtin"].(string); b != "" {
+			receiverType = b
+			builtinRecv = true
+		}
 	}
 	var exts []*graph.Node
 	for _, c := range candidates {
@@ -73,6 +77,18 @@ func (r *Resolver) tryBindCSharpExtension(e *graph.Edge, methodName, receiverTyp
 		}
 	}
 	if len(exts) == 0 {
+		return false
+	}
+
+	// C# spec §12.8.10.3: extension method invocation is considered only
+	// when normal member lookup finds no applicable method — a same-name
+	// member anywhere in the receiver's declared hierarchy claims the
+	// call, so every extension bind is refused and the ordinary member
+	// tiers attribute it. Builtin receivers are exempt: their member
+	// surface lives outside the repo, so absence of in-graph proof
+	// proves nothing.
+	if receiverType != "" && !builtinRecv &&
+		r.csharpInstanceMemberClaims(e, csharpTypeSuffixTrim(receiverType), methodName) {
 		return false
 	}
 
@@ -303,6 +319,42 @@ func (r *Resolver) csharpReceiverTypeNodes(e *graph.Edge, recv, repo string) []*
 		scope, _ = cn.Meta["scope_ns"].(string)
 	}
 	return r.csharpDenoteBareType(recv, scope, e.FilePath, repo)
+}
+
+// csharpInstanceMemberClaims reports whether the receiver's denotable
+// type — or any ancestor in its declared hierarchy — declares a member
+// with the call's name. Per the C# spec (§12.8.10.3) extension method
+// invocation is considered only when normal member lookup finds nothing,
+// so such a member claims the call outright. Any member kind counts: in
+// compiling code an invocation whose name member lookup CAN see must be
+// that member (a same-name field/property would otherwise not compile).
+// Only in-graph proof claims — an external base that might declare the
+// member changes nothing here, matching the veto's missing-not-wrong
+// stance.
+func (r *Resolver) csharpInstanceMemberClaims(e *graph.Edge, recv, method string) bool {
+	repo := r.callerRepoPrefix(e)
+	seeds := r.csharpReceiverTypeNodes(e, recv, repo)
+	if len(seeds) == 0 {
+		return false
+	}
+	typeIDs := make(map[string]struct{}, len(seeds)*2)
+	for _, s := range seeds {
+		typeIDs[s.ID] = struct{}{}
+		for id := range r.csharpAncestorsOf(s, repo).ids {
+			typeIDs[id] = struct{}{}
+		}
+	}
+	for id := range typeIDs {
+		for _, in := range r.graph.GetInEdges(id) {
+			if in.Kind != graph.EdgeMemberOf {
+				continue
+			}
+			if m := r.cachedGetNode(in.From); m != nil && m.Name == method {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // csharpDenoteBareType resolves what a bare type name denotes from a
