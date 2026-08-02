@@ -82,11 +82,22 @@ func (r *Resolver) attributeGoBuiltins() {
 	if !r.graphHasLanguage("go") {
 		return
 	}
-	var candidates []*graph.Edge
 
-	// The pass can only act on the finite bare builtin target set. Batch those
-	// exact target IDs through the store's to_id index instead of decoding the
-	// graph's entire unresolved slice and discarding nearly every row.
+	// SQLite can project the complete logical identities for this finite target
+	// set without decoding confidence, provenance, or metadata. When paired with
+	// its identity-only target updater, the whole pass stays compact end-to-end.
+	// Adapter stores retain the established full-edge path below.
+	reader, readOK := r.graph.(graph.InEdgeIdentityBatchReader)
+	targeter, targetOK := r.graph.(graph.UnresolvedEdgeTargetBatchReindexer)
+	if readOK && targetOK {
+		byTarget := reader.GetInEdgeIdentitiesByNodeIDs(goBuiltinUnresolvedTargets)
+		if r.attributeGoBuiltinIdentityCandidates(targeter, byTarget) {
+			return
+		}
+	}
+
+	var candidates []*graph.Edge
+	// The compatibility path still limits discovery to exact builtin targets.
 	byTarget := r.graph.GetInEdgesByNodeIDs(goBuiltinUnresolvedTargets)
 	for _, target := range goBuiltinUnresolvedTargets {
 		candidates = append(candidates, byTarget[target]...)
@@ -185,6 +196,122 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 		return
 	}
 	targeter.ReindexUnresolvedEdgeTargets(direct)
+}
+
+// attributeGoBuiltinIdentityCandidates evaluates compact logical rows and, when
+// every destination remains unique, persists only the target-column changes.
+// Returning false asks the caller to repeat the pass through the full-edge
+// compatibility path; no nodes or edges have been written in that case.
+func (r *Resolver) attributeGoBuiltinIdentityCandidates(
+	targeter graph.UnresolvedEdgeTargetBatchReindexer,
+	byTarget map[string][]graph.EdgeIdentity,
+) bool {
+	if targeter == nil {
+		return false
+	}
+
+	candidateCount := 0
+	ids := make(map[string]struct{})
+	for _, target := range goBuiltinUnresolvedTargets {
+		for _, identity := range byTarget[target] {
+			if _, candidate := attributeGoBuiltinCandidateKinds[identity.Kind]; !candidate {
+				continue
+			}
+			candidateCount++
+			if identity.From != "" {
+				ids[identity.From] = struct{}{}
+			}
+			if owner := enclosingFunctionForBinding(identity.From); owner != "" {
+				ids[owner] = struct{}{}
+			}
+		}
+	}
+	if candidateCount == 0 {
+		return true
+	}
+	idList := make([]string, 0, len(ids))
+	for id := range ids {
+		idList = append(idList, id)
+	}
+	sourceNodes := r.graph.GetNodesByIDs(idList)
+
+	materialised := make(map[string]*graph.Node)
+	direct := make([]graph.UnresolvedEdgeTargetReindex, 0, candidateCount)
+	for _, target := range goBuiltinUnresolvedTargets {
+		for _, identity := range byTarget[target] {
+			if _, candidate := attributeGoBuiltinCandidateKinds[identity.Kind]; !candidate {
+				continue
+			}
+			edge := graph.Edge{
+				From: identity.From, To: identity.To, Kind: identity.Kind,
+				FilePath: identity.FilePath, Line: identity.Line,
+			}
+			oldTo := tryAttributeGoBuiltin(&edge, sourceNodes, materialised)
+			if oldTo == "" {
+				continue
+			}
+			if oldTo != identity.To || edge.From != identity.From ||
+				edge.Kind != identity.Kind || edge.FilePath != identity.FilePath ||
+				edge.Line != identity.Line {
+				return false
+			}
+			direct = append(direct, graph.UnresolvedEdgeTargetReindex{
+				Old: identity, NewTo: edge.To,
+			})
+		}
+	}
+	if !validGoBuiltinTargetReindexes(direct) {
+		return false
+	}
+	if len(materialised) > 0 {
+		nodes := make([]*graph.Node, 0, len(materialised))
+		for _, node := range materialised {
+			nodes = append(nodes, node)
+		}
+		r.graph.AddBatch(nodes, nil)
+	}
+	if len(direct) > 0 {
+		targeter.ReindexUnresolvedEdgeTargets(direct)
+	}
+	return true
+}
+
+func validGoBuiltinTargetReindexes(batch []graph.UnresolvedEdgeTargetReindex) bool {
+	if len(batch) == 0 {
+		return true
+	}
+	order := make([]int, len(batch))
+	for i, mutation := range batch {
+		if mutation.NewTo == "" || !graph.IsUnresolvedTarget(mutation.Old.To) ||
+			graph.IsUnresolvedTarget(mutation.NewTo) {
+			return false
+		}
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool {
+		return goBuiltinEdgeIdentityLess(batch[order[i]].Old, batch[order[j]].Old)
+	})
+	for i := 1; i < len(order); i++ {
+		if batch[order[i-1]].Old == batch[order[i]].Old {
+			return false
+		}
+	}
+	destination := func(mutation graph.UnresolvedEdgeTargetReindex) graph.EdgeIdentity {
+		identity := mutation.Old
+		identity.To = mutation.NewTo
+		return identity
+	}
+	sort.Slice(order, func(i, j int) bool {
+		return goBuiltinEdgeIdentityLess(
+			destination(batch[order[i]]), destination(batch[order[j]]),
+		)
+	})
+	for i := 1; i < len(order); i++ {
+		if destination(batch[order[i-1]]) == destination(batch[order[i]]) {
+			return false
+		}
+	}
+	return true
 }
 
 // compactGoBuiltinTargetReindexes validates the already-mutated batch without
