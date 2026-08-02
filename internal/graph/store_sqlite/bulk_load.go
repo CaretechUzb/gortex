@@ -401,11 +401,31 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 		s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "planner_stats", Name: "nodes_edges", Elapsed: time.Since(statsStarted), Err: statsErr})
 	}
 	closeErr := s.closeBulkConnectionLocked()
+	// Keep the final durability checkpoint in the same writer-gate ownership
+	// as index sealing and bulk-connection close. Unlocking and reacquiring here
+	// lets queued writers consume the entire checkpoint deadline, leaving a
+	// large cold WAL behind even though finalization itself already held the
+	// exclusive gate.
+	var checkpointErr error
+	if hadBulk {
+		ctx, cancel := context.WithTimeout(context.Background(), walCheckpointTimeout)
+		started := time.Now()
+		result, err := s.checkpointWALResult(ctx)
+		cancel()
+		s.emitBulkFinalizeEvent(bulkFinalizeEvent{
+			Stage: "checkpoint", Name: "wal_truncate", Elapsed: time.Since(started),
+			Busy: result.Busy, WALFrames: result.WALFrames,
+			CheckpointedFrames: result.CheckpointedFrames, Err: err,
+		})
+		if err != nil {
+			checkpointErr = fmt.Errorf("store_sqlite: bulk checkpoint: %w", err)
+		}
+	}
 	s.writeMu.Unlock()
 	if !hadBulk {
 		return errors.Join(sealErr, statsErr, closeErr)
 	}
-	return errors.Join(sealErr, statsErr, closeErr, s.checkpointBulkWAL())
+	return errors.Join(sealErr, statsErr, closeErr, checkpointErr)
 }
 
 // noteBulkRowsLocked advances independent index-seal and WAL-checkpoint budgets
