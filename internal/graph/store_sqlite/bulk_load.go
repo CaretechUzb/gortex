@@ -141,6 +141,17 @@ const (
 
 	bulkCheckpointNodeInterval = int64(64 << 10)
 	bulkCheckpointEdgeInterval = int64(256 << 10)
+
+	// Once dense indexes are live, one inserted row dirties several more
+	// B-trees. Keep the post-seal unit smaller so the same one-second PASSIVE
+	// window remains a useful work bound instead of timing out on every attempt.
+	bulkIndexedCheckpointNodeInterval = int64(16 << 10)
+	bulkIndexedCheckpointEdgeInterval = int64(32 << 10)
+
+	// The final pre-ANALYZE checkpoint is allowed one longer, still-bounded
+	// window. It runs once after all graph writes and avoids making every
+	// planner-stat traversal page through a large live WAL.
+	bulkPlannerStatsCheckpointTimeout = 5 * time.Second
 )
 
 // bulkCacheSizeKiB is the page cache the fast path requests on its pinned
@@ -392,8 +403,16 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 	}
 	hadBulk := s.bulkConn != nil
 	sealErr := s.sealBulkIndexesLocked("final")
-	// Target only graph tables: ANALYZE over every FTS/sidecar table made a
-	// tiny delta pay unrelated corpus scans.
+	// Give the accumulated WAL one longer, still-bounded PASSIVE drain before
+	// planner statistics traverse the large graph indexes. This runs on the
+	// pinned writer under writeMu, so no mutation can race it; PASSIVE still
+	// returns immediately at an old read snapshot instead of waiting for it.
+	if sealErr == nil && hadBulk {
+		s.checkpointBulkWALPassiveLockedWithin("planner_stats_before", bulkPlannerStatsCheckpointTimeout)
+	}
+	// Target only the graph indexes whose statistics alter competing plans:
+	// ANALYZE over every FTS/sidecar or forced graph index pays unrelated B-tree
+	// page counts without changing a query choice.
 	var statsErr error
 	if sealErr == nil && hadBulk {
 		statsStarted := time.Now()
@@ -454,11 +473,30 @@ func (s *Store) noteBulkRowsLocked(nodeRows, edgeRows int) error {
 	if sealReason != "" {
 		return s.sealBulkIndexesLocked(sealReason)
 	}
-	if s.bulkCheckpointNodeRows >= bulkCheckpointNodeInterval ||
-		s.bulkCheckpointEdgeRows >= bulkCheckpointEdgeInterval {
+	nodeInterval, edgeInterval := s.bulkCheckpointIntervalsLocked()
+	if s.bulkCheckpointNodeRows >= nodeInterval ||
+		s.bulkCheckpointEdgeRows >= edgeInterval {
 		s.checkpointBulkWALPassiveLocked("row_limit")
 	}
 	return nil
+}
+
+func (s *Store) bulkCheckpointIntervalsLocked() (nodeRows, edgeRows int64) {
+	if s.bulkIndexesDeferred {
+		return bulkCheckpointNodeInterval, bulkCheckpointEdgeInterval
+	}
+	return bulkIndexedCheckpointNodeInterval, bulkIndexedCheckpointEdgeInterval
+}
+
+func boundedCheckpointRetryDebt(rows, interval int64) int64 {
+	if rows <= 0 || interval <= 1 {
+		return 0
+	}
+	debt := interval / 2
+	if rows < debt {
+		return rows
+	}
+	return debt
 }
 
 // sealBulkIndexesLocked rebuilds the deferred dense indexes without restoring
@@ -561,20 +599,33 @@ func (s *Store) checkpointBulkWAL() error {
 // is telemetry-only; the NORMAL-connection TRUNCATE at final close remains the
 // durability boundary.
 func (s *Store) checkpointBulkWALPassiveLocked(boundary string) {
+	s.checkpointBulkWALPassiveLockedWithin(boundary, s.passiveCheckpointWindow())
+}
+
+func (s *Store) checkpointBulkWALPassiveLockedWithin(boundary string, window time.Duration) {
 	if s.bulkConn == nil {
 		return
 	}
-	// Clear cadence pressure per attempt, including busy/error attempts. A
-	// pinned reader must not turn one blocked checkpoint into an attempt after
-	// every subsequent AddBatch.
 	nodeRows, edgeRows := s.bulkCheckpointNodeRows, s.bulkCheckpointEdgeRows
-	s.bulkCheckpointNodeRows = 0
-	s.bulkCheckpointEdgeRows = 0
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.passiveCheckpointWindow())
+	ctx, cancel := context.WithTimeout(context.Background(), window)
 	defer cancel()
 	started := time.Now()
 	result, err := checkpointWALOnceOn(ctx, s.bulkConn, "PASSIVE")
+	if err == nil || errors.Is(err, errSQLiteCheckpointIncomplete) {
+		// A complete checkpoint or a reader-limited result returned real
+		// counters. Both consumed this cadence attempt; new writes should build
+		// the next unit instead of retrying the same reader-limited prefix.
+		s.bulkCheckpointNodeRows = 0
+		s.bulkCheckpointEdgeRows = 0
+	} else {
+		// A deadline/driver error returned no trustworthy progress counters.
+		// Preserve half an interval as bounded retry debt: the next attempt comes
+		// sooner, but one slow checkpoint cannot run after every tiny AddBatch.
+		nodeInterval, edgeInterval := s.bulkCheckpointIntervalsLocked()
+		s.bulkCheckpointNodeRows = boundedCheckpointRetryDebt(nodeRows, nodeInterval)
+		s.bulkCheckpointEdgeRows = boundedCheckpointRetryDebt(edgeRows, edgeInterval)
+	}
 	s.emitBulkFinalizeEvent(bulkFinalizeEvent{
 		Stage: "checkpoint_passive", Name: boundary, Elapsed: time.Since(started),
 		NodeRows: nodeRows, EdgeRows: edgeRows,

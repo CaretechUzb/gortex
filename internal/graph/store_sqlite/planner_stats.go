@@ -16,20 +16,35 @@ import (
 // file projection from nodes_by_kind instead of the selective file index.
 const plannerStatsAnalysisLimit = 1000
 
-// plannerStatsIndexQuery deliberately excludes SQLite's automatic indexes and
-// the nodes/edges table b-trees themselves. ANALYZE nodes/edges visits those
-// broad surfaces as well as every secondary index and took 51 seconds on a
-// production cold store even with analysis_limit set. The named indexes are
-// the planner alternatives whose relative cardinalities matter to graph reads.
-// Discovering them from sqlite_schema keeps a future named graph index covered
-// without coupling this path to every DDL declaration site.
+// plannerStatsIndexQuery is the synchronous, query-plan-critical subset of the
+// graph indexes. Approximate ANALYZE still counts B-tree pages, so sampling all
+// 17 named indexes traversed about 1.64 GiB and consumed 35 seconds on a cold
+// production store. Most graph indexes either have no competing left-prefix
+// access path or are explicitly selected with INDEXED BY; statistics do not
+// change those plans. The exceptions below participate in real planner choices:
+// node lookup/join order, edge-kind join order, and exact-site lookups where
+// edges_by_from_line must beat the from_id-leading table key.
+//
+// Keep this list paired with the EXPLAIN plan locks in
+// planner_stats_checkpoint_test.go. A new index belongs here only when a plan
+// test demonstrates that its statistics change a production query choice.
 const plannerStatsIndexQuery = `
-SELECT name
-FROM sqlite_schema
-WHERE type = 'index'
-  AND tbl_name IN ('nodes', 'edges')
-  AND sql IS NOT NULL
-ORDER BY name`
+WITH critical(name) AS (VALUES
+  ('edges_by_from_line'),
+  ('edges_by_kind'),
+  ('nodes_by_file'),
+  ('nodes_by_kind'),
+  ('nodes_by_name'),
+  ('nodes_by_repo'),
+  ('nodes_by_repo_kind'),
+  ('nodes_by_repo_language_name')
+)
+SELECT schema_index.name
+FROM sqlite_schema AS schema_index
+JOIN critical ON critical.name = schema_index.name
+WHERE schema_index.type = 'index'
+  AND schema_index.sql IS NOT NULL
+ORDER BY schema_index.name`
 
 // refreshPlannerStatsLocked recomputes sqlite_stat1 for the named graph
 // indexes on the active write connection. Callers hold writeMu. PRAGMA optimize

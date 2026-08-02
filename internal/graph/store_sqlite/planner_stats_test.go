@@ -52,6 +52,12 @@ func TestCoordinatedBulkFinalizeRefreshesPlannerStats(t *testing.T) {
 		t.Fatal("BeginCoordinatedBulkLoad refused")
 	}
 	seedPlannerStatsNodes(s)
+	s.AddEdge(&graph.Edge{
+		From:     "pkg/a.go::sym00",
+		To:       "pkg/a.go::sym01",
+		Kind:     graph.EdgeCalls,
+		FilePath: "pkg/a.go",
+	})
 	if err := s.EndCoordinatedBulkLoad(); err != nil {
 		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
 	}
