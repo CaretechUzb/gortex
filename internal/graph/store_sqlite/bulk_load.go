@@ -401,31 +401,32 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 		s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "planner_stats", Name: "nodes_edges", Elapsed: time.Since(statsStarted), Err: statsErr})
 	}
 	closeErr := s.closeBulkConnectionLocked()
-	// Keep the final durability checkpoint in the same writer-gate ownership
-	// as index sealing and bulk-connection close. Unlocking and reacquiring here
-	// lets queued writers consume the entire checkpoint deadline, leaving a
-	// large cold WAL behind even though finalization itself already held the
-	// exclusive gate.
-	var checkpointErr error
+	// The writer gate prevents a competing writer, but it cannot retire a
+	// snapshot held by the read-only pool. RESTART/TRUNCATE invokes SQLite's
+	// busy handler until every such reader leaves the WAL, which made cold
+	// finalization spend its full 10-second deadline while the daemon was
+	// already queryable. PASSIVE copies every currently safe frame without
+	// waiting for readers. Committed WAL frames are durable either way; later
+	// passive checkpoints plus SQLite's next WAL reset/journal_size_limit reclaim
+	// the file after the reader leaves.
 	if hadBulk {
-		ctx, cancel := context.WithTimeout(context.Background(), walCheckpointTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), s.passiveCheckpointWindow())
 		started := time.Now()
-		result, err := s.checkpointWALResult(ctx)
+		result, err := s.checkpointWALOnce(ctx, "PASSIVE")
 		cancel()
+		// A reader-limited partial PASSIVE checkpoint is expected telemetry, not
+		// a bulk-load failure. Preserve counters in the ordinary checkpoint log.
+		if errors.Is(err, errSQLiteCheckpointIncomplete) {
+			err = nil
+		}
 		s.emitBulkFinalizeEvent(bulkFinalizeEvent{
-			Stage: "checkpoint", Name: "wal_truncate", Elapsed: time.Since(started),
+			Stage: "checkpoint", Name: "wal_passive", Elapsed: time.Since(started),
 			Busy: result.Busy, WALFrames: result.WALFrames,
 			CheckpointedFrames: result.CheckpointedFrames, Err: err,
 		})
-		if err != nil {
-			checkpointErr = fmt.Errorf("store_sqlite: bulk checkpoint: %w", err)
-		}
 	}
 	s.writeMu.Unlock()
-	if !hadBulk {
-		return errors.Join(sealErr, statsErr, closeErr)
-	}
-	return errors.Join(sealErr, statsErr, closeErr, checkpointErr)
+	return errors.Join(sealErr, statsErr, closeErr)
 }
 
 // noteBulkRowsLocked advances independent index-seal and WAL-checkpoint budgets
