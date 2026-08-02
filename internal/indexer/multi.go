@@ -1059,10 +1059,11 @@ func (mi *MultiIndexer) runDeferredEnrichParallel(indexers []*Indexer) {
 // an exclusive batch, which serialized that repo's ENTIRE provider chain —
 // a whale's LSP sweep rode the critical path behind its own type-check.
 // Exclusivity for the genuinely heavyweight resource is enforced where the
-// resource lives: the go/types provider's heavy gate admits one full
-// go/packages program at a time (GORTEX_GOTYPES_CONCURRENCY overrides), and
-// that provider runs under the manager's outer window, so a queued heavy
-// repo waits on the gate without burning a lane or a per-repo deadline.
+// resource lives: the go/types provider admits at most one large full-repo
+// compiler program while allowing a small repo or file-bounded load to use a
+// spare total-capacity lane (GORTEX_GOTYPES_CONCURRENCY controls that cap).
+// The provider runs under the manager's outer window, so a queued heavy repo
+// waits on admission without burning a per-repo deadline.
 // Everything else — LSP sweeps, tree-sitter type providers, the other
 // languages of the same repo — flows through the pool lanes.
 func (mi *MultiIndexer) runDeferredEnrichPool(indexers []*Indexer) {

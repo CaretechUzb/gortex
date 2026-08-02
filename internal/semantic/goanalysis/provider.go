@@ -54,11 +54,15 @@ type Provider struct {
 	bindingKeysByRoot map[string][]bindingLookupKey
 	retained          map[string]int
 
-	// heavyGate bounds simultaneous full go/packages programs. The graph phase
-	// is already serialized by ResolveMutex, so admitting more than one large
-	// program only raises memory pressure while it waits. The gate is held for
-	// the complete lifetime of pkgs and is context-cancellable.
+	// heavyGate bounds the total number of live go/packages programs. A second
+	// one can still overlap useful compute on high-memory hosts.
 	heavyGate chan struct{}
+	// largeGate admits at most one large full-repository program. Large passes
+	// retain the compiler graph through graph apply, so allowing two of them to
+	// coexist multiplies go/types/go/parser heap and then makes one wait on the
+	// serialized ResolveMutex. Small repos and file-bounded incremental loads do
+	// not take this gate and may use the remaining heavyGate lane.
+	largeGate chan struct{}
 }
 
 type bindingLookupKey struct {
@@ -69,6 +73,11 @@ type bindingLookupKey struct {
 }
 
 const defaultGoTypesConcurrency = 1
+
+// goTypesLargeNodeThreshold is the repository census point at which a full
+// compiler program takes exclusive large-program admission. It matches the
+// heavy-Go scheduling class used by the multi-repository enrichment queue.
+const goTypesLargeNodeThreshold = 8192
 
 // goTypesConcurrencyRAMFloor is the host RAM at or above which the gate
 // defaults to two concurrent programs: a multi-repo workspace's enrichment
@@ -90,6 +99,17 @@ func goTypesConcurrency(hostRAM uint64) int {
 	return envPositiveInt("GORTEX_GOTYPES_CONCURRENCY", fallback)
 }
 
+// largeGoTypesAdmission classifies only full-repository work. An absent census
+// is conservative because direct Provider calls can otherwise admit two
+// unmeasured compiler closures. File-bounded incremental loads stay shareable.
+func largeGoTypesAdmission(ctx context.Context, fullRepo bool) bool {
+	if !fullRepo {
+		return false
+	}
+	nodes, ok := semantic.EnrichmentAdmissionNodes(ctx)
+	return !ok || nodes >= goTypesLargeNodeThreshold
+}
+
 // NewProvider creates a go/types provider.
 func NewProvider(mode LoadMode, includeTest bool, logger *zap.Logger) *Provider {
 	return &Provider{
@@ -102,6 +122,7 @@ func NewProvider(mode LoadMode, includeTest bool, logger *zap.Logger) *Provider 
 		bindingKeysByRoot: make(map[string][]bindingLookupKey),
 		retained:          make(map[string]int),
 		heavyGate:         make(chan struct{}, goTypesConcurrency(platform.HostPhysicalMemoryBytes())),
+		largeGate:         make(chan struct{}, 1),
 	}
 }
 
@@ -163,17 +184,40 @@ func (p *Provider) ReleaseRepoState(repoRoot string) bool {
 	return removed
 }
 
-func (p *Provider) acquireHeavy(ctx context.Context) (func(), error) {
+func (p *Provider) acquireHeavy(ctx context.Context, large bool) (func(), error) {
 	p.stateMu.Lock()
 	if p.heavyGate == nil {
 		p.heavyGate = make(chan struct{}, defaultGoTypesConcurrency)
 	}
+	if p.largeGate == nil {
+		p.largeGate = make(chan struct{}, 1)
+	}
 	gate := p.heavyGate
+	largeGate := p.largeGate
 	p.stateMu.Unlock()
+
+	largeHeld := false
+	if large {
+		select {
+		case largeGate <- struct{}{}:
+			largeHeld = true
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
 	select {
 	case gate <- struct{}{}:
-		return func() { <-gate }, nil
+		return func() {
+			<-gate
+			if largeHeld {
+				<-largeGate
+			}
+		}, nil
 	case <-ctx.Done():
+		if largeHeld {
+			<-largeGate
+		}
 		return nil, ctx.Err()
 	}
 }
@@ -438,7 +482,8 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	}
 
 	gateWaitStart := time.Now()
-	release, err := p.acquireHeavy(ctx)
+	largeAdmission := largeGoTypesAdmission(ctx, true)
+	release, err := p.acquireHeavy(ctx, largeAdmission)
 	if err != nil {
 		return nil, err
 	}
@@ -447,6 +492,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	if wait := time.Since(gateWaitStart); wait > 5*time.Second && p.logger != nil {
 		p.logger.Info("go-types: admission gate acquired after queueing",
 			zap.String("repo_prefix", repoPrefix),
+			zap.Bool("large_exclusive", largeAdmission),
 			zap.Duration("queued", wait))
 	}
 
@@ -458,6 +504,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	if p.logger != nil {
 		p.logger.Info("go-types: package load starting",
 			zap.String("repo_prefix", repoPrefix),
+			zap.Bool("large_exclusive", largeAdmission),
 			zap.String("root", absRoot),
 			zap.String("module_dir", loadDir))
 	}
@@ -996,7 +1043,7 @@ func (p *Provider) EnrichFilesContext(ctx context.Context, g graph.Store, repoPr
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	release, err := p.acquireHeavy(ctx)
+	release, err := p.acquireHeavy(ctx, false)
 	if err != nil {
 		return nil, err
 	}

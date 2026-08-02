@@ -951,15 +951,15 @@ func TestGoTypesHeavyGateDefaultsToOneAndHonorsCancellation(t *testing.T) {
 	provider := newTestProvider(t)
 	require.Equal(t, defaultGoTypesConcurrency, cap(provider.heavyGate))
 
-	release, err := provider.acquireHeavy(context.Background())
+	release, err := provider.acquireHeavy(context.Background(), false)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = provider.acquireHeavy(ctx)
+	_, err = provider.acquireHeavy(ctx, false)
 	require.ErrorIs(t, err, context.Canceled)
 	release()
 
-	release, err = provider.acquireHeavy(context.Background())
+	release, err = provider.acquireHeavy(context.Background(), false)
 	require.NoError(t, err, "the cancelled waiter must not consume the slot")
 	release()
 }
