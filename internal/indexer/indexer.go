@@ -2623,7 +2623,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	var inMemShadow *graph.Graph
 	var shadowEstimate graph.RepoMemoryEstimate
 	var shadowEstimateReady bool
-	var shadowDrainReservation *indexPhaseReservation
 	bl, blOK := idx.graph.(graph.BulkLoader)
 	// Per-Indexer sentinel: each *Indexer is constructed fresh
 	// (per-repo in MultiIndexer, once in single-repo daemons), so
@@ -2716,7 +2715,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		}
 		defer func() {
 			if retErr != nil {
-				shadowDrainReservation.Cancel()
 				idx.graph = diskTarget
 				idx.bulkVectorSink = nil
 				idx.contentSink = nil
@@ -2741,24 +2739,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				zap.Uint64("shadow_estimated_bytes", shadowEstimate.Total()),
 				zap.Bool("pressure_guard", drainPressure.enabled),
 			)
-			phaseWaitStarted := time.Now()
-			drainPhaseLease, phaseErr := shadowDrainReservation.Begin(ctx)
-			if phaseErr != nil {
-				retErr = fmt.Errorf("indexer: wait for pressure shadow drain phase: %w", phaseErr)
-				idx.graph = diskTarget
-				idx.bulkVectorSink = nil
-				idx.contentSink = nil
-				if idx.resolver != nil {
-					idx.resolver.SetGraph(diskTarget)
-				}
-				return
-			}
-			if drainPhaseLease != nil {
-				idx.logger.Info("indexer: pressure shadow drain phase admitted",
-					zap.String("repo", idx.RepoPrefix()),
-					zap.Duration("waited", time.Since(phaseWaitStarted)))
-				defer drainPhaseLease.Release()
-			}
 			finishDrainPressure := drainPressure.begin()
 			defer finishDrainPressure()
 			// BulkLoad is INSERT-only. A fresh per-repository Indexer also has
@@ -2931,14 +2911,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		largeDirectBudget = processLargeDirectAdmission
 	}
 	admissionStarted := time.Now()
-	largeDirectPhaseLease, err := acquireLargeDirectParsePhase(
-		ctx, largeDirectBudget, processIndexPhaseCoordinator, largeDirectWeight,
-	)
+	largeDirectLease, err := largeDirectBudget.acquire(ctx, largeDirectWeight)
 	if err != nil {
 		return nil, err
 	}
 	var releaseLargeDirectAdmission func()
-	if largeDirectPhaseLease != nil {
+	if largeDirectLease != nil {
 		admittedAt := time.Now()
 		stats := largeDirectBudget.snapshot()
 		idx.logger.Info("indexer: large direct parse admitted",
@@ -2953,7 +2931,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		var releaseOnce sync.Once
 		releaseLargeDirectAdmission = func() {
 			releaseOnce.Do(func() {
-				largeDirectPhaseLease.Release()
+				largeDirectLease.Release()
 				after := largeDirectBudget.snapshot()
 				idx.logger.Info("indexer: large direct parse released",
 					zap.String("repo", idx.repoPrefix),
@@ -3604,9 +3582,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	if inMemShadow != nil {
 		shadowEstimate = inMemShadow.RepoMemoryEstimate(idx.RepoPrefix())
 		shadowEstimateReady = true
-		shadowDrainReservation = processIndexPhaseCoordinator.reserveShadowDrain(
-			largeShadowDrainNeedsRelief(shadowEstimate),
-		)
 	}
 
 	// Finalise the content index after the per-file streaming appends so

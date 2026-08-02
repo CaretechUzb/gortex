@@ -132,6 +132,54 @@ func TestLargeDirectAdmissionCancellationReturnsPermit(t *testing.T) {
 	}
 }
 
+func TestLargeDirectAdmissionDoesNotBlockPressureShadowDrain(t *testing.T) {
+	budget := newLargeDirectAdmissionBudget(largeDirectAdmissionCapacity)
+	direct, err := budget.acquire(context.Background(), largeDirectAdmissionCapacity)
+	if err != nil {
+		t.Fatalf("acquire direct lease: %v", err)
+	}
+	defer direct.Release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	queued := make(chan error, 1)
+	go func() {
+		lease, err := budget.acquire(ctx, largeDirectAdmissionCapacity)
+		if lease != nil {
+			lease.Release()
+		}
+		queued <- err
+	}()
+	waitForLargeDirectAdmission(t, budget, func(stats largeDirectAdmissionStats) bool {
+		return stats.used == largeDirectAdmissionCapacity && stats.waiters == 1
+	})
+
+	drainStarted := make(chan func(), 1)
+	go func() {
+		drain := &shadowDrainPressure{enabled: true, release: func() {}}
+		drainStarted <- drain.begin()
+	}()
+	select {
+	case finishDrain := <-drainStarted:
+		finishDrain()
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("pressure shadow drain was blocked by large direct admission")
+	}
+
+	cancel()
+	select {
+	case err := <-queued:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled direct waiter error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled direct waiter did not return")
+	}
+	waitForLargeDirectAdmission(t, budget, func(stats largeDirectAdmissionStats) bool {
+		return stats.used == largeDirectAdmissionCapacity && stats.waiters == 0
+	})
+}
+
 func TestLargeDirectAdmissionRaceStress(t *testing.T) {
 	budget := newLargeDirectAdmissionBudget(largeDirectAdmissionCapacity)
 	var active atomic.Int64
