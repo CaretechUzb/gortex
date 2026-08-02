@@ -8,22 +8,22 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-const startupBulkApplyFixtureEdges = 4096
+const resolveApplyFixtureEdges = 4096
 
-type startupBulkApplyPagerStore struct {
+type resolveApplyPagerStore struct {
 	*graph.Graph
 	pending           []*graph.Edge
 	reindexBatchSizes []int
 }
 
-func (s *startupBulkApplyPagerStore) BeginUnresolvedEdgeScan(context.Context) (graph.UnresolvedEdgeScan, error) {
+func (s *resolveApplyPagerStore) BeginUnresolvedEdgeScan(context.Context) (graph.UnresolvedEdgeScan, error) {
 	return graph.UnresolvedEdgeScan{
 		HighWaterID:   int64(len(s.pending)),
 		PendingBefore: len(s.pending),
 	}, nil
 }
 
-func (s *startupBulkApplyPagerStore) ReadUnresolvedEdgePage(
+func (s *resolveApplyPagerStore) ReadUnresolvedEdgePage(
 	_ context.Context,
 	_ graph.UnresolvedEdgeScan,
 	afterID int64,
@@ -44,12 +44,12 @@ func (s *startupBulkApplyPagerStore) ReadUnresolvedEdgePage(
 	}, nil
 }
 
-func (s *startupBulkApplyPagerStore) ReindexEdges(batch []graph.EdgeReindex) {
+func (s *resolveApplyPagerStore) ReindexEdges(batch []graph.EdgeReindex) {
 	s.reindexBatchSizes = append(s.reindexBatchSizes, len(batch))
 	s.Graph.ReindexEdges(batch)
 }
 
-func runStartupBulkApplyFixture(t *testing.T, startup bool) (*ResolveStats, []int, []string) {
+func runResolveApplyFixture(t *testing.T) (*ResolveStats, []int) {
 	t.Helper()
 
 	base := graph.New()
@@ -72,8 +72,8 @@ func runStartupBulkApplyFixture(t *testing.T, startup bool) (*ResolveStats, []in
 	base.AddNode(source)
 	base.AddNode(target)
 
-	pending := make([]*graph.Edge, 0, startupBulkApplyFixtureEdges)
-	for i := 0; i < startupBulkApplyFixtureEdges; i++ {
+	pending := make([]*graph.Edge, 0, resolveApplyFixtureEdges)
+	for i := 0; i < resolveApplyFixtureEdges; i++ {
 		edge := &graph.Edge{
 			From:     source.ID,
 			To:       "unresolved::foo",
@@ -86,50 +86,41 @@ func runStartupBulkApplyFixture(t *testing.T, startup bool) (*ResolveStats, []in
 		pending = append(pending, edge)
 	}
 
-	store := &startupBulkApplyPagerStore{Graph: base, pending: pending}
-	resolver := New(store)
-	resolver.SetStartupBulkApply(startup)
-	stats := resolver.ResolveAll()
+	store := &resolveApplyPagerStore{Graph: base, pending: pending}
+	stats := New(store).ResolveAll()
 
-	targets := make([]string, len(pending))
 	for i, edge := range pending {
-		targets[i] = edge.To
 		if edge.To != target.ID {
 			t.Fatalf("edge %d target = %q, want %q", i, edge.To, target.ID)
 		}
 	}
-	return stats, append([]int(nil), store.reindexBatchSizes...), targets
+	return stats, append([]int(nil), store.reindexBatchSizes...)
 }
 
-func TestResolveAllStartupBulkApplyUsesOneBoundedPage(t *testing.T) {
+func TestResolveAllUsesBoundedApplySlices(t *testing.T) {
+	t.Setenv("GORTEX_BACKEND_RESOLVER", "0")
 	t.Setenv("GORTEX_RESOLVE_CHUNK", "1")
 	t.Setenv("GORTEX_RESOLVE_CHUNK_SIZE", "")
 
-	ordinaryStats, ordinaryBatches, ordinaryTargets := runStartupBulkApplyFixture(t, false)
-	startupStats, startupBatches, startupTargets := runStartupBulkApplyFixture(t, true)
-
-	if fmt.Sprint(ordinaryBatches) != "[2048 2048]" {
-		t.Fatalf("ordinary reindex batches = %v, want [2048 2048]", ordinaryBatches)
+	stats, batches := runResolveApplyFixture(t)
+	if stats.Resolved != resolveApplyFixtureEdges {
+		t.Fatalf("resolved = %d, want %d", stats.Resolved, resolveApplyFixtureEdges)
 	}
-	if fmt.Sprint(startupBatches) != "[4096]" {
-		t.Fatalf("startup reindex batches = %v, want [4096]", startupBatches)
-	}
-	if *ordinaryStats != *startupStats {
-		t.Fatalf("stats differ: ordinary=%+v startup=%+v", ordinaryStats, startupStats)
-	}
-	for i := range ordinaryTargets {
-		if ordinaryTargets[i] != startupTargets[i] {
-			t.Fatalf("target %d differs: ordinary=%q startup=%q", i, ordinaryTargets[i], startupTargets[i])
-		}
+	if fmt.Sprint(batches) != "[2048 2048]" {
+		t.Fatalf("reindex batches = %v, want [2048 2048]", batches)
 	}
 }
 
-func TestResolveAllStartupBulkApplyHonorsSmallerOperatorChunk(t *testing.T) {
+func TestResolveAllHonorsSmallerOperatorChunk(t *testing.T) {
+	t.Setenv("GORTEX_BACKEND_RESOLVER", "0")
 	t.Setenv("GORTEX_RESOLVE_CHUNK", "1")
 	t.Setenv("GORTEX_RESOLVE_CHUNK_SIZE", "1024")
 
-	_, batches, _ := runStartupBulkApplyFixture(t, true)
+	stats, batches := runResolveApplyFixture(t)
+	if stats.Resolved != resolveApplyFixtureEdges {
+		t.Fatalf("resolved = %d, want %d", stats.Resolved, resolveApplyFixtureEdges)
+	}
 	if fmt.Sprint(batches) != "[1024 1024 1024 1024]" {
-		t.Fatalf("startup reindex batches = %v, want four 1024-edge batches", batches)
+		t.Fatalf("reindex batches = %v, want four 1024-edge batches", batches)
 	}
 }
