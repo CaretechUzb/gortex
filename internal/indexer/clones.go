@@ -343,6 +343,7 @@ func finaliseCloneCorpusCtx(ctx context.Context, g graph.Store, repoPrefix strin
 	baseline := &cloneCorpusBaseline{repoPrefix: repoPrefix}
 	pager, paged := g.(graph.CloneCorpusPager)
 	writer, writable := g.(graph.CloneCorpusWriter)
+	initialization, stateful := g.(graph.CloneCorpusInitialization)
 	if !paged || !writable {
 		baseline.items, baseline.corpus = finaliseCloneSignaturesFromNodes(g, repoPrefix)
 		if baseline.corpus == 0 && len(baseline.items) == 0 {
@@ -410,16 +411,29 @@ func finaliseCloneCorpusCtx(ctx context.Context, g graph.Store, repoPrefix strin
 	}
 	baseline.corpus = corpus
 	if corpus == 0 {
+		// An explicit initialization row makes an empty page authoritative. This
+		// is the common genuinely-empty repository path and avoids decoding every
+		// node merely to prove the absence of clone bodies again.
+		if stateful {
+			initialized, err := initialization.CloneCorpusInitialized(repoPrefix)
+			if err == nil && initialized {
+				completeEmptyCloneBaseline(baseline)
+				return baseline
+			}
+		}
+
 		// Compatibility for a pre-projection store: one legacy scoped read
 		// populates the sidecar, after which every restart takes the paged path.
 		baseline.itemCount = 0
 		baseline.items, baseline.corpus = finaliseCloneSignaturesFromNodes(g, repoPrefix)
 		if baseline.corpus == 0 && len(baseline.items) == 0 {
-			// An empty sidecar alone is ambiguous (it may predate clone-corpus
-			// persistence). The compatibility scan above proves this repository
-			// has neither pending bodies nor finalized signatures, so hand a
-			// complete empty seed to the maintainer instead of scanning it again.
+			// The compatibility scan proves this repository has neither pending
+			// bodies nor finalized signatures. Persist that fact when supported;
+			// adapters without the optional capability preserve the old fallback.
 			completeEmptyCloneBaseline(baseline)
+			if stateful {
+				_ = initialization.MarkCloneCorpusInitialized(repoPrefix)
+			}
 		} else {
 			// Non-empty compatibility data still needs the exact Rebuild path.
 			// Release the speculative compact seed before returning it.

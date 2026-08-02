@@ -1491,6 +1491,15 @@ type CloneCorpusPager interface {
 	CloneCorpusPage(repoPrefix, afterNodeID string, limit int) ([]CloneCorpusRow, error)
 }
 
+// CloneCorpusInitialization is an optional capability for stores that can
+// distinguish an authoritative empty clone projection from a store created
+// before clone-corpus persistence existed. Backends without this capability
+// retain the compatibility node scan.
+type CloneCorpusInitialization interface {
+	CloneCorpusInitialized(repoPrefix string) (bool, error)
+	MarkCloneCorpusInitialized(repoPrefix string) error
+}
+
 // ConstantValueWriter is an optional capability backends MAY implement
 // to persist a KindConstant node's literal value (string / numeric)
 // keyed by node id, in a queryable sidecar rather than the gob-encoded

@@ -9,9 +9,10 @@ import (
 )
 
 var (
-	_ graph.CloneCorpusWriter       = (*Store)(nil)
-	_ graph.CloneCorpusPager        = (*Store)(nil)
-	_ graph.CloneCorpusRepoReplacer = (*Store)(nil)
+	_ graph.CloneCorpusWriter         = (*Store)(nil)
+	_ graph.CloneCorpusPager          = (*Store)(nil)
+	_ graph.CloneCorpusRepoReplacer   = (*Store)(nil)
+	_ graph.CloneCorpusInitialization = (*Store)(nil)
 )
 
 const cloneCorpusPageSize = 1024
@@ -98,6 +99,9 @@ func (s *Store) BulkSetCloneCorpus(repoPrefix string, rows []graph.CloneCorpusRo
 	if err := upsertCloneCorpusTx(tx, repoPrefix, rows); err != nil {
 		return err
 	}
+	if err := markCloneCorpusInitializedTx(tx, repoPrefix); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -119,6 +123,9 @@ func (s *Store) ReplaceCloneCorpus(repoPrefix string, rows []graph.CloneCorpusRo
 		return err
 	}
 	if err := upsertCloneCorpusTx(tx, repoPrefix, rows); err != nil {
+		return err
+	}
+	if err := markCloneCorpusInitializedTx(tx, repoPrefix); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -197,6 +204,39 @@ WHERE id IN (` + placeholders + `)
 		}
 	}
 	return nil
+}
+
+// CloneCorpusInitialized reports whether this repository's clone sidecar has
+// been authoritatively initialized. The single-row primary-key probe remains
+// cheap for a genuinely empty corpus.
+func (s *Store) CloneCorpusInitialized(repoPrefix string) (bool, error) {
+	var initialized bool
+	if err := s.db.QueryRow(`SELECT EXISTS(
+SELECT 1 FROM clone_corpus_state WHERE repo_prefix = ?)`, repoPrefix).Scan(&initialized); err != nil {
+		return false, err
+	}
+	return initialized, nil
+}
+
+// MarkCloneCorpusInitialized records a successful legacy-empty compatibility
+// scan so future restarts can trust the empty sidecar.
+func (s *Store) MarkCloneCorpusInitialized(repoPrefix string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := markCloneCorpusInitializedTx(tx, repoPrefix); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func markCloneCorpusInitializedTx(tx *sql.Tx, repoPrefix string) error {
+	_, err := tx.Exec(`INSERT OR IGNORE INTO clone_corpus_state (repo_prefix) VALUES (?)`, repoPrefix)
+	return err
 }
 
 // CloneCorpusPage returns a stable, bounded projection page. The composite

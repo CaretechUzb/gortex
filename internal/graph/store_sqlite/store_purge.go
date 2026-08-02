@@ -39,6 +39,7 @@ var purgeSidecarTables = []string{
 	"enrichment_state",
 	"semantic_binding_types",
 	"clone_shingles",
+	"clone_corpus_state",
 	"constant_values",
 	"files",
 	"ref_facts",
@@ -152,6 +153,7 @@ var orphanScanTables = []string{
 	"enrichment_state",
 	"files",
 	"semantic_binding_types",
+	"clone_corpus_state",
 }
 
 // OrphanRepoPrefixes returns every repo_prefix present in the store but
@@ -236,6 +238,7 @@ var rekeyMoveTables = []string{
 var rekeyDropTables = []string{
 	"semantic_binding_types",
 	"clone_shingles",
+	"clone_corpus_state",
 	"constant_values",
 	"ref_facts",
 	"churn_enrichment",
