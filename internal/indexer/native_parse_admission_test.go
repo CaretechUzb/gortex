@@ -211,16 +211,10 @@ func TestSetSharedParseMemoryBudgetSeparatesNativeAdmission(t *testing.T) {
 }
 
 func generatedParserAdmissionFixture() []byte {
-	prefix := []byte(
+	return []byte(
 		"#include \"tree_sitter/parser.h\"\n" +
 			"#define LANGUAGE_VERSION 14\n" +
 			"#define STATE_COUNT 1\n" +
 			"TS_PUBLIC const TSLanguage *tree_sitter_fixture(void) { return &language; }\n",
 	)
-	src := make([]byte, generatedTreeSitterParserMinBytes)
-	copy(src, prefix)
-	for i := len(prefix); i < len(src); i++ {
-		src[i] = '\n'
-	}
-	return src
 }

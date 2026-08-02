@@ -637,8 +637,8 @@ type IndexConfig struct {
 	// content and skipped with a synthetic telemetry node. Set true to
 	// index such files anyway. Configured under `index.index_minified`.
 	IndexMinified bool `mapstructure:"index_minified" yaml:"index_minified,omitempty"`
-	// IndexGeneratedParsers controls whether very large generated tree-sitter
-	// parser.c parse tables receive a full C AST. Off by default: the compact
+	// IndexGeneratedParsers controls whether generated tree-sitter parser.c
+	// parse tables receive a full C AST. Off by default: the compact
 	// projection retains the file and public tree_sitter_* entry point while
 	// omitting generated table internals. Set true to request full parsing.
 	// Configured under `index.index_generated_parsers`.

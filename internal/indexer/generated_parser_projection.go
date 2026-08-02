@@ -11,7 +11,6 @@ import (
 )
 
 const (
-	generatedTreeSitterParserMinBytes       = 8 << 20
 	generatedTreeSitterParserHeadBytes      = 256 << 10
 	generatedTreeSitterPublicHeaderMaxBytes = 8 << 10
 	generatedTreeSitterPublicBodyMaxBytes   = 64 << 10
@@ -20,7 +19,7 @@ const (
 	generatedTreeSitterParserInclude        = `#include "tree_sitter/parser.h"`
 	generatedParserProjectionMetaKey        = "generated_parser_projection"
 	generatedParserProjectionVersionMetaKey = "generated_parser_projection_version"
-	generatedParserProjectionPolicyVersion  = 2
+	generatedParserProjectionPolicyVersion  = 3
 )
 
 var (
@@ -182,11 +181,11 @@ func (idx *Indexer) hasStaleGeneratedParserProjections() bool {
 	return len(idx.staleGeneratedParserProjectionPaths(candidates)) > 0
 }
 
-// generatedTreeSitterParserProjection recognizes only the pathological,
-// generated parser tables emitted by tree-sitter and returns a compact graph
-// projection for them. The multi-megabyte parse tables contain implementation
-// data rather than useful declarations; retaining the file and its public
-// tree_sitter_* entry point preserves the generated parser's queryable API
+// generatedTreeSitterParserProjection recognizes only generated parser tables
+// emitted by tree-sitter and returns a compact graph projection for them. The
+// parse tables contain implementation data rather than useful declarations;
+// retaining the file and its public tree_sitter_* entry point preserves the
+// generated parser's queryable API
 // without constructing a full C syntax tree.
 func generatedTreeSitterParserProjection(relPath, lang string, src []byte) (*parser.ExtractionResult, bool) {
 	if !isGeneratedTreeSitterParserTable(relPath, lang, src) {
@@ -266,8 +265,8 @@ func generatedTreeSitterParserProjection(relPath, lang string, src []byte) (*par
 	}
 
 	// Keep the compact projection on the same metadata contract as every full
-	// extractor. Passing nil source avoids copying/splitting a multi-megabyte
-	// generated table; the explicit signature is already sufficient for the
+	// extractor. Passing nil source avoids copying/splitting a generated parser
+	// table; the explicit signature is already sufficient for the
 	// shared normalizer to derive the canonical retrieval QualName.
 	normalizeExtractionMetadata(result, nil)
 	return result, true
@@ -281,7 +280,7 @@ func shouldRecordNativeParsePressure(result *parser.ExtractionResult) bool {
 }
 
 func isGeneratedTreeSitterParserTable(relPath, lang string, src []byte) bool {
-	if lang != "c" || filepath.Base(relPath) != "parser.c" || len(src) < generatedTreeSitterParserMinBytes {
+	if lang != "c" || filepath.Base(relPath) != "parser.c" {
 		return false
 	}
 	headEnd := len(src)

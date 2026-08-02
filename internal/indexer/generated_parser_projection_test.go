@@ -13,55 +13,72 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 )
 
-func TestGeneratedTreeSitterParserDetectorIsConservative(t *testing.T) {
-	src := generatedParserTestSource("\nTS_PUBLIC const TSLanguage *tree_sitter_demo(void) {\n  return &language;\n}\n")
-	if !isGeneratedTreeSitterParserTable("vendor/demo/src/parser.c", "c", src) {
-		t.Fatal("expected exact generated parser fixture to be detected")
+func TestGeneratedTreeSitterParserProjectionStrictSmallFixture(t *testing.T) {
+	valid := generatedParserTestSource("\nTS_PUBLIC const TSLanguage *tree_sitter_demo(void) {\n  return &language;\n}\n")
+	if len(valid) > 256 {
+		t.Fatalf("strict generated parser fixture = %d bytes; want a small regression fixture", len(valid))
+	}
+	if result, ok := generatedTreeSitterParserProjection("vendor/demo/src/parser.c", "c", valid); !ok || result == nil {
+		t.Fatal("expected strict small generated parser fixture to be projected")
 	}
 
-	for _, tc := range []struct {
+	type projectionCase struct {
 		name string
 		path string
 		lang string
 		data []byte
-	}{
-		{name: "different language", path: "vendor/demo/src/parser.c", lang: "cpp", data: src},
-		{name: "different basename", path: "vendor/demo/src/parser.cc", lang: "c", data: src},
-		{name: "case changed basename", path: "vendor/demo/src/Parser.c", lang: "c", data: src},
-		{name: "below size floor", path: "vendor/demo/src/parser.c", lang: "c", data: src[:generatedTreeSitterParserMinBytes-1]},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if isGeneratedTreeSitterParserTable(tc.path, tc.lang, tc.data) {
-				t.Fatal("unexpected generated parser match")
-			}
+	}
+	cases := []projectionCase{
+		{name: "wrong basename", path: "vendor/demo/src/parser.cc", lang: "c", data: valid},
+		{name: "wrong language", path: "vendor/demo/src/parser.c", lang: "cpp", data: valid},
+		{
+			name: "missing valid public entry",
+			path: "vendor/demo/src/parser.c",
+			lang: "c",
+			data: generatedParserTestSource("\nstatic const TSLanguage *tree_sitter_demo(void) { return &language; }\n"),
+		},
+	}
+	markerNames := []string{"parser include", "language version", "state count"}
+	for i, marker := range generatedTreeSitterParserMarkers {
+		missingMarker := append([]byte(nil), valid...)
+		markerOffset := bytes.Index(missingMarker, marker)
+		if markerOffset < 0 {
+			t.Fatalf("fixture is missing marker %q", marker)
+		}
+		missingMarker[markerOffset+len(marker)-1] = '!'
+		cases = append(cases, projectionCase{
+			name: "missing " + markerNames[i],
+			path: "vendor/demo/src/parser.c",
+			lang: "c",
+			data: missingMarker,
 		})
 	}
 
-	head := src[:generatedTreeSitterParserHeadBytes]
-	for _, marker := range generatedTreeSitterParserMarkers {
-		pos := bytes.Index(head, marker)
-		if pos < 0 {
-			t.Fatalf("fixture is missing marker %q", marker)
-		}
-		mutateAt := pos + len(marker) - 1
-		original := src[mutateAt]
-		src[mutateAt] = '!'
-		if isGeneratedTreeSitterParserTable("vendor/demo/src/parser.c", "c", src) {
-			t.Errorf("detected fixture with altered marker %q", marker)
-		}
-		src[mutateAt] = original
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, ok := generatedTreeSitterParserProjection(tc.path, tc.lang, tc.data)
+			if ok || result != nil {
+				t.Fatalf("projection = %#v, %v; want fail-closed full extraction", result, ok)
+			}
+		})
 	}
+}
 
+func TestGeneratedTreeSitterParserDetectorRequiresMarkersInBoundedHead(t *testing.T) {
+	tail := "\nTS_PUBLIC const TSLanguage *tree_sitter_demo(void) { return &language; }\n"
+	src := paddedGeneratedParserTestSource(tail, generatedTreeSitterParserHeadBytes+1024)
+	head := src[:generatedTreeSitterParserHeadBytes]
 	marker := generatedTreeSitterParserMarkers[len(generatedTreeSitterParserMarkers)-1]
 	pos := bytes.Index(head, marker)
+	if pos < 0 {
+		t.Fatalf("fixture is missing marker %q", marker)
+	}
 	mutateAt := pos + len(marker) - 1
-	original := src[mutateAt]
 	src[mutateAt] = '!'
 	copy(src[generatedTreeSitterParserHeadBytes+64:], marker)
 	if isGeneratedTreeSitterParserTable("vendor/demo/src/parser.c", "c", src) {
 		t.Error("marker outside the bounded source head must not trigger projection")
 	}
-	src[mutateAt] = original
 }
 
 func TestGeneratedTreeSitterParserProjectionRetainsPublicAPI(t *testing.T) {
@@ -139,7 +156,7 @@ func TestGeneratedTreeSitterParserProjectionRetainsPublicAPI(t *testing.T) {
 
 func TestGeneratedTreeSitterParserProjectionAccountsForWholeFile(t *testing.T) {
 	late := "\nTS_PUBLIC const TSLanguage *tree_sitter_late(void) { return &language; }\n"
-	src := generatedParserTestSource(late)
+	src := paddedGeneratedParserTestSource(late, generatedTreeSitterParserHeadBytes+(2<<20))
 	early := []byte("\nextern const TSLanguage *tree_sitter_early(void) { return &language; }\n")
 	earlyOffset := generatedTreeSitterParserHeadBytes + 1024
 	copy(src[earlyOffset:], early)
@@ -397,7 +414,17 @@ func (e *generatedParserSpyExtractor) Extract(string, []byte) (*parser.Extractio
 
 func generatedParserTestSource(tail string) []byte {
 	header := []byte("#include \"tree_sitter/parser.h\"\n#define LANGUAGE_VERSION 14\n#define STATE_COUNT 321\n")
-	src := bytes.Repeat([]byte{' '}, generatedTreeSitterParserMinBytes+len(tail)+1)
+	src := make([]byte, 0, len(header)+len(tail))
+	src = append(src, header...)
+	return append(src, tail...)
+}
+
+func paddedGeneratedParserTestSource(tail string, size int) []byte {
+	header := []byte("#include \"tree_sitter/parser.h\"\n#define LANGUAGE_VERSION 14\n#define STATE_COUNT 321\n")
+	if size < len(header)+len(tail)+1 {
+		size = len(header) + len(tail) + 1
+	}
+	src := bytes.Repeat([]byte{' '}, size)
 	copy(src, header)
 	tailStart := len(src) - len(tail)
 	src[tailStart-1] = '\n'
