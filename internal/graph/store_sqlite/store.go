@@ -164,6 +164,8 @@ type Store struct {
 	bulkIndexesDeferred    bool
 	bulkDeferredNodeRows   int64
 	bulkDeferredEdgeRows   int64
+	bulkCheckpointNodeRows int64
+	bulkCheckpointEdgeRows int64
 	// These flags mean "bounded FTS maintenance requested" during a
 	// coordinated cold load. The historical names are retained to keep the
 	// cancellation/Close path stable; normal cold finalization never runs a

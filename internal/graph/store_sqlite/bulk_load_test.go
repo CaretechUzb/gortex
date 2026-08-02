@@ -394,6 +394,64 @@ func TestCoordinatedBulkLoadKeepsIndexesDeferredAcrossNestedRepoFlushes(t *testi
 	}
 }
 
+func TestBulkLoadRowCadenceCheckpointsBeforeSeal(t *testing.T) {
+	s, _ := openTempStore(t)
+	if !s.BeginCoordinatedBulkLoad() {
+		t.Fatal("coordinated fast path did not engage")
+	}
+	s.bulkCheckpointNodeRows = bulkCheckpointNodeInterval - 1
+
+	var checkpoints []bulkFinalizeEvent
+	s.bulkFinalizeObserver = func(event bulkFinalizeEvent) {
+		if event.Stage == "checkpoint_passive" && event.Name == "row_limit" {
+			checkpoints = append(checkpoints, event)
+		}
+	}
+	s.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"})
+	if len(checkpoints) != 1 || checkpoints[0].NodeRows != bulkCheckpointNodeInterval {
+		t.Fatalf("row checkpoints = %+v, want one at %d node rows", checkpoints, bulkCheckpointNodeInterval)
+	}
+	if s.bulkCheckpointNodeRows != 0 || s.bulkCheckpointEdgeRows != 0 {
+		t.Fatalf("checkpoint counters not reset: nodes=%d edges=%d", s.bulkCheckpointNodeRows, s.bulkCheckpointEdgeRows)
+	}
+	if !s.bulkIndexesDeferred {
+		t.Fatal("checkpoint cadence sealed dense indexes")
+	}
+	if err := s.EndCoordinatedBulkLoad(); err != nil {
+		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
+	}
+}
+
+func TestBulkLoadCheckpointCadenceContinuesAfterSeal(t *testing.T) {
+	s, _ := openTempStore(t)
+	if !s.BeginCoordinatedBulkLoad() {
+		t.Fatal("coordinated fast path did not engage")
+	}
+	s.bulkDeferredNodeRows = bulkIndexSealNodeLimit - 1
+	s.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"})
+	if s.bulkIndexesDeferred {
+		t.Fatal("node threshold did not seal dense indexes")
+	}
+
+	var checkpoints []bulkFinalizeEvent
+	s.bulkFinalizeObserver = func(event bulkFinalizeEvent) {
+		if event.Stage == "checkpoint_passive" && event.Name == "row_limit" {
+			checkpoints = append(checkpoints, event)
+		}
+	}
+	s.bulkCheckpointEdgeRows = bulkCheckpointEdgeInterval - 1
+	s.AddEdge(&graph.Edge{From: "repo/a.go::A", To: "repo/b.go::B", Kind: graph.EdgeCalls, FilePath: "a.go"})
+	if len(checkpoints) != 1 || checkpoints[0].EdgeRows != bulkCheckpointEdgeInterval {
+		t.Fatalf("post-seal row checkpoints = %+v, want one at %d edge rows", checkpoints, bulkCheckpointEdgeInterval)
+	}
+	if s.bulkCheckpointNodeRows != 0 || s.bulkCheckpointEdgeRows != 0 {
+		t.Fatalf("post-seal checkpoint counters not reset: nodes=%d edges=%d", s.bulkCheckpointNodeRows, s.bulkCheckpointEdgeRows)
+	}
+	if err := s.EndCoordinatedBulkLoad(); err != nil {
+		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
+	}
+}
+
 func TestCoordinatedBulkLoadSealsOnceAtDeterministicRowLimit(t *testing.T) {
 	s, _ := openTempStore(t)
 	if !s.BeginCoordinatedBulkLoad() {

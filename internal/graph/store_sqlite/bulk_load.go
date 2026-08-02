@@ -131,13 +131,16 @@ var bulkAlwaysLiveIndexes = []bulkDroppableIndex{
 	{"nodes_go_receiver_type", `CREATE INDEX IF NOT EXISTS nodes_go_receiver_type ON nodes(repo_prefix, file_dir, name, id) WHERE language = 'go' AND kind IN ('type', 'interface') AND name <> '' AND file_path <> ''`},
 }
 
-// A cold load gets a cheap unindexed head, but never accumulates a whole
-// workspace for one serial CREATE INDEX tail. The first bound reached seals
-// every dense index exactly once; the pinned synchronous=OFF connection stays
-// open for the remaining ingest and coordinated FTS deferral.
+// A cold load gets a substantial unindexed head, but never accumulates an
+// unbounded serial CREATE INDEX tail. WAL pressure is checkpointed at smaller
+// independent intervals, so index-seal thresholds can reflect rebuild cost
+// instead of doubling as checkpoint cadence.
 const (
-	bulkIndexSealNodeLimit = int64(64 << 10)
-	bulkIndexSealEdgeLimit = int64(256 << 10)
+	bulkIndexSealNodeLimit = int64(512 << 10)
+	bulkIndexSealEdgeLimit = int64(1 << 20)
+
+	bulkCheckpointNodeInterval = int64(64 << 10)
+	bulkCheckpointEdgeInterval = int64(256 << 10)
 )
 
 // bulkCacheSizeKiB is the page cache the fast path requests on its pinned
@@ -328,6 +331,8 @@ func (s *Store) beginBulkLoadLocked() {
 	s.bulkIndexesDeferred = true
 	s.bulkDeferredNodeRows = 0
 	s.bulkDeferredEdgeRows = 0
+	s.bulkCheckpointNodeRows = 0
+	s.bulkCheckpointEdgeRows = 0
 	// The bulk path changes durability and secondary-index maintenance outside
 	// the ordinary row mutation protocol. Active receipts therefore fail closed.
 	s.markMutationReceiptsIncompleteLocked()
@@ -403,23 +408,36 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 	return errors.Join(sealErr, statsErr, closeErr, s.checkpointBulkWAL())
 }
 
-// noteBulkRowsLocked advances the deterministic deferred-index budget after a
-// committed AddBatch. The caller holds writeMu. A failed seal remains pending
-// and is retried by the next repository/final boundary.
+// noteBulkRowsLocked advances independent index-seal and WAL-checkpoint budgets
+// after a committed AddBatch. The caller holds writeMu. A failed seal remains
+// pending and is retried by the next repository/final boundary.
 func (s *Store) noteBulkRowsLocked(nodeRows, edgeRows int) error {
-	if s.bulkConn == nil || !s.bulkIndexesDeferred {
+	if s.bulkConn == nil {
 		return nil
 	}
-	s.bulkDeferredNodeRows += int64(nodeRows)
-	s.bulkDeferredEdgeRows += int64(edgeRows)
-	switch {
-	case s.bulkDeferredNodeRows >= bulkIndexSealNodeLimit:
-		return s.sealBulkIndexesLocked("node_limit")
-	case s.bulkDeferredEdgeRows >= bulkIndexSealEdgeLimit:
-		return s.sealBulkIndexesLocked("edge_limit")
-	default:
-		return nil
+	nodeDelta, edgeDelta := int64(nodeRows), int64(edgeRows)
+	s.bulkCheckpointNodeRows += nodeDelta
+	s.bulkCheckpointEdgeRows += edgeDelta
+
+	var sealReason string
+	if s.bulkIndexesDeferred {
+		s.bulkDeferredNodeRows += nodeDelta
+		s.bulkDeferredEdgeRows += edgeDelta
+		switch {
+		case s.bulkDeferredNodeRows >= bulkIndexSealNodeLimit:
+			sealReason = "node_limit"
+		case s.bulkDeferredEdgeRows >= bulkIndexSealEdgeLimit:
+			sealReason = "edge_limit"
+		}
 	}
+	if sealReason != "" {
+		return s.sealBulkIndexesLocked(sealReason)
+	}
+	if s.bulkCheckpointNodeRows >= bulkCheckpointNodeInterval ||
+		s.bulkCheckpointEdgeRows >= bulkCheckpointEdgeInterval {
+		s.checkpointBulkWALPassiveLocked("row_limit")
+	}
+	return nil
 }
 
 // sealBulkIndexesLocked rebuilds the deferred dense indexes without restoring
@@ -435,12 +453,22 @@ func (s *Store) sealBulkIndexesLocked(reason string) error {
 	ctx := context.Background()
 	started := time.Now()
 	var sealErr error
+	// Keep index DDL from repeatedly searching a large uncheckpointed WAL.
+	// The group checkpoints are best-effort telemetry boundaries; DDL errors
+	// still keep the seal retryable.
+	s.checkpointBulkWALPassiveLocked("index_seal_before")
 	for _, idx := range bulkDroppableIndexes {
 		indexStarted := time.Now()
 		_, err := conn.ExecContext(ctx, idx.ddl)
 		s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "index", Name: idx.name, Elapsed: time.Since(indexStarted), Err: err})
 		if err != nil {
 			sealErr = errors.Join(sealErr, fmt.Errorf("store_sqlite: rebuild index %s: %w", idx.name, err))
+		}
+		switch idx.name {
+		case "nodes_by_repo_language_name":
+			s.checkpointBulkWALPassiveLocked("index_seal_nodes")
+		case "edges_by_file":
+			s.checkpointBulkWALPassiveLocked("index_seal_edges")
 		}
 	}
 	s.emitBulkFinalizeEvent(bulkFinalizeEvent{
@@ -471,6 +499,8 @@ func (s *Store) closeBulkConnectionLocked() error {
 	s.bulkIndexesDeferred = false
 	s.bulkDeferredNodeRows = 0
 	s.bulkDeferredEdgeRows = 0
+	s.bulkCheckpointNodeRows = 0
+	s.bulkCheckpointEdgeRows = 0
 	s.bulkPrevSync = 0
 	s.bulkPrevCacheSize = 0
 	s.bulkPrevAutoCheckpoint = 0
@@ -513,12 +543,20 @@ func (s *Store) checkpointBulkWALPassiveLocked(boundary string) {
 	if s.bulkConn == nil {
 		return
 	}
+	// Clear cadence pressure per attempt, including busy/error attempts. A
+	// pinned reader must not turn one blocked checkpoint into an attempt after
+	// every subsequent AddBatch.
+	nodeRows, edgeRows := s.bulkCheckpointNodeRows, s.bulkCheckpointEdgeRows
+	s.bulkCheckpointNodeRows = 0
+	s.bulkCheckpointEdgeRows = 0
+
 	ctx, cancel := context.WithTimeout(context.Background(), s.passiveCheckpointWindow())
 	defer cancel()
 	started := time.Now()
 	result, err := checkpointWALOnceOn(ctx, s.bulkConn, "PASSIVE")
 	s.emitBulkFinalizeEvent(bulkFinalizeEvent{
 		Stage: "checkpoint_passive", Name: boundary, Elapsed: time.Since(started),
+		NodeRows: nodeRows, EdgeRows: edgeRows,
 		Busy: result.Busy, WALFrames: result.WALFrames,
 		CheckpointedFrames: result.CheckpointedFrames, Err: err,
 	})
