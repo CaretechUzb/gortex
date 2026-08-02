@@ -108,13 +108,19 @@ func workspaceSlugValues(slugs []graph.WorkspaceSlug) (string, []any) {
 
 func workspaceSlugResolutionImpact(slugs []graph.WorkspaceSlug) (string, []any) {
 	values, args := workspaceSlugValues(slugs)
+	// Builtin stubs are target-only synthetic sentinels. They are physically
+	// stamped like every repository node, but the cross-repository resolver
+	// never selects KindBuiltin as a function, method, file, or import target;
+	// filling their boundary columns therefore cannot change resolution.
+	args = append(args, graph.KindBuiltin)
 	query := `WITH updates(repo_prefix, workspace_id, project_id) AS (VALUES ` + values + `)
 	SELECT COUNT(*)
 	FROM nodes AS n
 	JOIN updates AS u ON n.repo_prefix = u.repo_prefix
 	WHERE n.workspace_id = ''
 		AND u.workspace_id <> ''
-		AND u.workspace_id <> n.repo_prefix`
+		AND u.workspace_id <> n.repo_prefix
+		AND n.kind <> ?`
 	return query, args
 }
 

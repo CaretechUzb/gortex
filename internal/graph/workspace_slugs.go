@@ -68,7 +68,11 @@ func (g *Graph) BackfillWorkspaceSlugsWithImpact(slugs []WorkspaceSlug) Workspac
 				}
 				dirty := false
 				if node.WorkspaceID == "" && slug.Workspace != "" {
-					if WorkspaceSlugChangesResolution(node.RepoPrefix, node.WorkspaceID, slug.Workspace) {
+					// Builtin stubs are target-only synthetic sentinels. The
+					// cross-repository resolver never considers KindBuiltin as a
+					// function, method, file, or import candidate, so filling its
+					// physical boundary columns cannot change resolution.
+					if node.Kind != KindBuiltin && WorkspaceSlugChangesResolution(node.RepoPrefix, node.WorkspaceID, slug.Workspace) {
 						result.ResolutionAffected++
 					}
 					node.WorkspaceID = slug.Workspace

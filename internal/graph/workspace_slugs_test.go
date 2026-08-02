@@ -37,3 +37,24 @@ func TestGraphBackfillWorkspaceSlugsReportsOnlyEffectiveBoundaryChanges(t *testi
 		{RepoPrefix: "project", Workspace: "ignored", Project: "project-id"},
 	}))
 }
+
+func TestBackfillWorkspaceSlugsWithImpactIgnoresBuiltinResolutionImpact(t *testing.T) {
+	g := New()
+	g.AddBatch([]*Node{
+		{ID: "repo::builtin::go::type::error", Kind: KindBuiltin, Name: "error", RepoPrefix: "repo"},
+		{ID: "repo::function", Kind: KindFunction, Name: "function", RepoPrefix: "repo"},
+	}, nil)
+
+	result := g.BackfillWorkspaceSlugsWithImpact([]WorkspaceSlug{{
+		RepoPrefix: "repo",
+		Workspace:  "shared",
+		Project:    "project",
+	}})
+	require.Equal(t, WorkspaceSlugBackfillResult{Changed: 2, ResolutionAffected: 1}, result)
+	for _, id := range []string{"repo::builtin::go::type::error", "repo::function"} {
+		node := g.GetNode(id)
+		require.NotNil(t, node)
+		require.Equal(t, "shared", node.WorkspaceID)
+		require.Equal(t, "project", node.ProjectID)
+	}
+}

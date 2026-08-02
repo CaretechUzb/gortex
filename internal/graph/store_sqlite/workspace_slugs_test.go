@@ -58,3 +58,27 @@ func TestBackfillWorkspaceSlugsIsDurableAndIdempotent(t *testing.T) {
 	require.Equal(t, "project-a", a.ProjectID)
 	require.Equal(t, "keep", a.Meta["opaque"])
 }
+
+func TestBackfillWorkspaceSlugsWithImpactIgnoresBuiltinResolutionImpact(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	store.AddBatch([]*graph.Node{
+		{ID: "repo::builtin::go::type::error", Kind: graph.KindBuiltin, Name: "error", RepoPrefix: "repo"},
+		{ID: "repo::function", Kind: graph.KindFunction, Name: "function", RepoPrefix: "repo"},
+	}, nil)
+
+	result := store.BackfillWorkspaceSlugsWithImpact([]graph.WorkspaceSlug{{
+		RepoPrefix: "repo",
+		Workspace:  "shared",
+		Project:    "project",
+	}})
+	require.Equal(t, graph.WorkspaceSlugBackfillResult{Changed: 2, ResolutionAffected: 1}, result)
+	for _, id := range []string{"repo::builtin::go::type::error", "repo::function"} {
+		node := store.GetNode(id)
+		require.NotNil(t, node)
+		require.Equal(t, "shared", node.WorkspaceID)
+		require.Equal(t, "project", node.ProjectID)
+	}
+}
