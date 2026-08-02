@@ -1,8 +1,12 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -211,13 +215,201 @@ func TestResolveStateMigrationIsIdempotentAndAtomic(t *testing.T) {
 	})
 }
 
-func synchronousMode(t *testing.T, conn *sql.Conn) int {
+const (
+	resolveStateAbruptModeEnv = "GORTEX_RESOLVE_STATE_ABRUPT_MODE"
+	resolveStateAbruptPathEnv = "GORTEX_RESOLVE_STATE_ABRUPT_PATH"
+
+	resolveStateAbruptBeginMode    = "begin"
+	resolveStateAbruptCompleteMode = "complete"
+)
+
+func TestResolveStateDurabilityAcrossAbruptProcessExit(t *testing.T) {
+	if mode := os.Getenv(resolveStateAbruptModeEnv); mode != "" {
+		if err := runResolveStateAbruptChild(mode, os.Getenv(resolveStateAbruptPathEnv)); err != nil {
+			fmt.Fprintf(os.Stderr, "resolve-state abrupt child: %v\n", err)
+			os.Exit(2)
+		}
+		// Deliberately bypass Store.Close, the bulk-load teardown, and SQLite
+		// checkpoints. The parent must observe only state made durable by the
+		// FULL-synchronous resolve-state transactions themselves.
+		os.Exit(0)
+	}
+
+	t.Run("interrupted marker flushes preceding graph frame", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "graph.db")
+		prepareResolveStateAbruptDB(t, path)
+		runResolveStateAbruptSubprocess(t, resolveStateAbruptBeginMode, path)
+
+		store, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		if node := store.GetNode("repo/before-begin.go"); node == nil {
+			t.Fatal("graph frame committed before durable begin did not survive abrupt exit")
+		}
+
+		observed, incomplete, err := store.ResolvePassIncomplete()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !incomplete || observed.Generation <= 0 || observed.Owned {
+			t.Fatalf("reopened state = (%+v, %v), want positive interrupted generation", observed, incomplete)
+		}
+		joined, err := store.BeginResolvePass()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if joined.Owned || joined.Generation != observed.Generation {
+			t.Fatalf("begin after abrupt exit = %+v, want join generation %d", joined, observed.Generation)
+		}
+
+		wrong := graph.ResolveStateToken{Generation: observed.Generation + 1}
+		if err := store.CompleteResolvePass(wrong); err == nil {
+			t.Fatal("stale generation unexpectedly cleared abruptly persisted resolve state")
+		}
+		stillActive, incomplete, err := store.ResolvePassIncomplete()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !incomplete || stillActive.Generation != observed.Generation {
+			t.Fatalf("CAS failure changed abrupt state to (%+v, %v)", stillActive, incomplete)
+		}
+		if err := store.CompleteResolvePass(observed); err != nil {
+			t.Fatal(err)
+		}
+		if _, incomplete, err := store.ResolvePassIncomplete(); err != nil || incomplete {
+			t.Fatalf("completed abrupt state = (incomplete=%v, err=%v), want clean", incomplete, err)
+		}
+	})
+
+	t.Run("completed marker flushes preceding graph frame", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "graph.db")
+		prepareResolveStateAbruptDB(t, path)
+		runResolveStateAbruptSubprocess(t, resolveStateAbruptCompleteMode, path)
+
+		store, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		if node := store.GetNode("repo/before-complete.go"); node == nil {
+			t.Fatal("bulk graph frame committed before durable completion did not survive abrupt exit")
+		}
+		if _, incomplete, err := store.ResolvePassIncomplete(); err != nil || incomplete {
+			t.Fatalf("reopened completed state = (incomplete=%v, err=%v), want clean", incomplete, err)
+		}
+
+		owner, err := store.BeginResolvePass()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !owner.Owned || owner.Generation <= 0 {
+			t.Fatalf("begin after durable abrupt completion = %+v, want new owner", owner)
+		}
+		if err := store.CompleteResolvePass(owner); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func prepareResolveStateAbruptDB(t *testing.T, path string) {
 	t.Helper()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runResolveStateAbruptSubprocess(t *testing.T, mode, path string) {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestResolveStateDurabilityAcrossAbruptProcessExit$")
+	cmd.Env = append(os.Environ(),
+		resolveStateAbruptModeEnv+"="+mode,
+		resolveStateAbruptPathEnv+"="+path,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("abrupt child %q failed: %v\n%s", mode, err, output)
+	}
+}
+
+func runResolveStateAbruptChild(mode, path string) error {
+	if path == "" {
+		return errors.New("missing abrupt-child database path")
+	}
+	store, err := Open(path)
+	if err != nil {
+		return err
+	}
+	if !store.BeginCoordinatedBulkLoad() {
+		return errors.New("abrupt child did not enter coordinated bulk mode")
+	}
+	if got, err := resolveStateSynchronousMode(store.bulkConn); err != nil {
+		return err
+	} else if got != 0 {
+		return fmt.Errorf("initial bulk synchronous mode = %d, want OFF", got)
+	}
+
+	switch mode {
+	case resolveStateAbruptBeginMode:
+		store.AddNode(&graph.Node{
+			ID:       "repo/before-begin.go",
+			Kind:     graph.KindFile,
+			Name:     "before-begin.go",
+			FilePath: "repo/before-begin.go",
+		})
+		token, err := store.BeginResolvePass()
+		if err != nil {
+			return err
+		}
+		if !token.Owned || token.Generation <= 0 {
+			return fmt.Errorf("begin token = %+v, want owned positive generation", token)
+		}
+	case resolveStateAbruptCompleteMode:
+		token, err := store.BeginResolvePass()
+		if err != nil {
+			return err
+		}
+		if !token.Owned || token.Generation <= 0 {
+			return fmt.Errorf("begin token = %+v, want owned positive generation", token)
+		}
+		store.AddNode(&graph.Node{
+			ID:       "repo/before-complete.go",
+			Kind:     graph.KindFile,
+			Name:     "before-complete.go",
+			FilePath: "repo/before-complete.go",
+		})
+		if err := store.CompleteResolvePass(token); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown abrupt-child mode %q", mode)
+	}
+
+	if got, err := resolveStateSynchronousMode(store.bulkConn); err != nil {
+		return err
+	} else if got != 0 {
+		return fmt.Errorf("bulk synchronous mode after %s = %d, want restored OFF", mode, got)
+	}
+	return nil
+}
+
+func resolveStateSynchronousMode(conn *sql.Conn) (int, error) {
 	if conn == nil {
-		t.Fatal("expected pinned bulk connection")
+		return 0, errors.New("expected pinned bulk connection")
 	}
 	var mode int
-	if err := conn.QueryRowContext(t.Context(), `PRAGMA synchronous`).Scan(&mode); err != nil {
+	err := conn.QueryRowContext(context.Background(), `PRAGMA synchronous`).Scan(&mode)
+	return mode, err
+}
+
+func synchronousMode(t *testing.T, conn *sql.Conn) int {
+	t.Helper()
+	mode, err := resolveStateSynchronousMode(conn)
+	if err != nil {
 		t.Fatal(err)
 	}
 	return mode
