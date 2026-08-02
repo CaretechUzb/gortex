@@ -64,6 +64,11 @@ type Provider struct {
 	// before detached graph apply. Small repos and file-bounded incremental loads do
 	// not take this gate and may use the remaining heavyGate lane.
 	largeGate chan struct{}
+	// fullApplyGate serializes only detached full-repository Go graph apply. It
+	// is deliberately distinct from compiler admission: a completed compiler
+	// program is projected, reclaimed, and releases heavyGate/largeGate before
+	// waiting here. File-bounded incremental enrichment never takes this gate.
+	fullApplyGate chan struct{}
 }
 
 type bindingLookupKey struct {
@@ -138,6 +143,7 @@ func NewProvider(mode LoadMode, includeTest bool, logger *zap.Logger) *Provider 
 		retained:          make(map[string]int),
 		heavyGate:         make(chan struct{}, goTypesConcurrency(platform.HostPhysicalMemoryBytes())),
 		largeGate:         make(chan struct{}, 1),
+		fullApplyGate:     make(chan struct{}, 1),
 	}
 }
 
@@ -235,6 +241,43 @@ func (p *Provider) acquireHeavy(ctx context.Context, large bool) (func(), error)
 		}
 		return nil, ctx.Err()
 	}
+}
+
+// acquireFullRepoApply serializes detached full-repository Go mutation plans.
+// It must be called only after every compiler root has been severed and the
+// heavyweight admission lease has been returned. The returned release is
+// idempotent so error paths can safely defer it at the transition point.
+func (p *Provider) acquireFullRepoApply(ctx context.Context) (func(), error) {
+	p.stateMu.Lock()
+	if p.fullApplyGate == nil {
+		p.fullApplyGate = make(chan struct{}, 1)
+	}
+	gate := p.fullApplyGate
+	p.stateMu.Unlock()
+
+	select {
+	case gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-gate
+			return nil, err
+		}
+		return sync.OnceFunc(func() { <-gate }), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// transitionToFullRepoApply makes the compiler/apply ownership order explicit:
+// compiler cleanup (including any forced GC and admission release) always
+// completes before this pass can queue behind another repository's graph apply.
+func (p *Provider) transitionToFullRepoApply(
+	ctx context.Context,
+	releaseCompiler func(),
+) (releaseApply func(), queued time.Duration, err error) {
+	releaseCompiler()
+	queueStart := time.Now()
+	releaseApply, err = p.acquireFullRepoApply(ctx)
+	return releaseApply, time.Since(queueStart), err
 }
 
 func lockResolveContext(ctx context.Context, mu *sync.Mutex) error {
@@ -659,20 +702,6 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			zap.Duration("parked", applyGateParked))
 	}
 	_, persistentBindings := g.(graph.SemanticBindingTypeStore)
-	if writer, ok := g.(graph.SemanticBindingTypeWriter); ok {
-		if err := writer.ReplaceSemanticBindingTypes(repoPrefix, bindings); err != nil {
-			return nil, fmt.Errorf("persist semantic binding types: %w", err)
-		}
-	}
-	// A cancellation after the atomic SQLite replace may leave these compact,
-	// compiler-valid rows available, but it must not publish transient provider
-	// state or a completion marker. The retry replaces the repo atomically.
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if !persistentBindings {
-		p.replaceBindingIndex(absRoot, nil, bindings)
-	}
 
 	result := &semantic.EnrichResult{
 		Provider: p.Name(),
@@ -828,8 +857,38 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// Every compiler-only consumer has returned. The shared cleanup severs all
 	// aliases, conditionally reclaims the normal success path, and only then
 	// returns the admission token. Its deferred invocation covers every earlier
-	// error and cancellation with unconditional post-load reclamation.
-	releaseCompiler()
+	// error and cancellation with unconditional post-load reclamation. A full
+	// apply can queue only after that release, so compiler programs never pile up
+	// behind SQLite work from another repository.
+	releaseApply, fullApplyQueued, err := p.transitionToFullRepoApply(ctx, releaseCompiler)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseApply()
+	if fullApplyQueued > 2*time.Second && p.logger != nil {
+		p.logger.Info("go-types: full-repository graph apply admitted after queueing",
+			zap.String("repo_prefix", repoPrefix),
+			zap.Duration("queued", fullApplyQueued))
+	}
+
+	// Binding rows are a compact compiler projection, but their replacement is
+	// still a SQLite mutation. Publish it under the same full-apply lease as all
+	// following edge and stamp writes; file-bounded replacements remain outside
+	// this gate in EnrichFilesContext.
+	if writer, ok := g.(graph.SemanticBindingTypeWriter); ok {
+		if err := writer.ReplaceSemanticBindingTypes(repoPrefix, bindings); err != nil {
+			return nil, fmt.Errorf("persist semantic binding types: %w", err)
+		}
+	}
+	// A cancellation after the atomic SQLite replace may leave these compact,
+	// compiler-valid rows available, but it must not publish transient provider
+	// state or a completion marker. The retry replaces the repo atomically.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !persistentBindings {
+		p.replaceBindingIndex(absRoot, nil, bindings)
+	}
 
 	// Projection may discover every external symbol before the first Use page.
 	// Fixed pages commit each genuinely new symbol together with its module link;
@@ -1052,6 +1111,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		p.logger.Info("go-types: apply subphases",
 			zap.String("repo_prefix", repoPrefix),
 			zap.Duration("gate_parked", applyGateParked),
+			zap.Duration("full_apply_queued", fullApplyQueued),
 			zap.Duration("apply_wall", time.Since(applyStarted)),
 			zap.Duration("mutex_waited", resolveSlices.waited),
 			zap.Duration("mutex_held", resolveSlices.held),
