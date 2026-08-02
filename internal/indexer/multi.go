@@ -989,6 +989,10 @@ func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
 // cross-repo passes starved cross-repo to a standstill (measured: 1,049s for
 // a pass that runs in ~38s uncontended on the same workspace).
 func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}, onComputeDone func()) error {
+	resolveState, err := graph.BeginResolvePass(mi.graph)
+	if err != nil {
+		return fmt.Errorf("pre-enrichment resolve: persist incomplete pass: %w", err)
+	}
 	mi.runDeferredGoModAll()
 	if err := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone); err != nil {
 		return err
@@ -999,13 +1003,23 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 	// Cross-repo references resolve here so a multi-repo workspace is fully
 	// resolved, not just within each repo. Whole-graph so inbound references
 	// from unchanged repos into the changed repos bind too.
-	return mi.runCrossRepoResolveContext(ctx, false)
+	if err := mi.runCrossRepoResolveContext(ctx, false); err != nil {
+		return err
+	}
+	if err := graph.CompleteOwnedResolvePass(mi.graph, resolveState); err != nil {
+		return fmt.Errorf("pre-enrichment resolve: clear completed pass: %w", err)
+	}
+	return nil
 }
 
 // RunPreEnrichResolveFiles preserves an exact warm-reconcile frontier through
 // same-repository and cross-repository resolution. A restart that reparsed one
 // file must not promote that delta to every unresolved edge in its repository.
 func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []string, onComputeDone func()) error {
+	resolveState, err := graph.BeginResolvePass(mi.graph)
+	if err != nil {
+		return fmt.Errorf("file-scoped pre-enrichment resolve: persist incomplete pass: %w", err)
+	}
 	mi.runDeferredGoModAll()
 	if err := context.Cause(ctx); err != nil {
 		return err
@@ -1029,10 +1043,19 @@ func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []st
 		return err
 	}
 	if resolutionAffected > 0 {
-		return mi.runCrossRepoResolveContext(ctx, false)
+		if err := mi.runCrossRepoResolveContext(ctx, false); err != nil {
+			return err
+		}
+	} else {
+		mi.runCrossRepoResolveFiles(files)
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
 	}
-	mi.runCrossRepoResolveFiles(files)
-	return context.Cause(ctx)
+	if err := graph.CompleteOwnedResolvePass(mi.graph, resolveState); err != nil {
+		return fmt.Errorf("file-scoped pre-enrichment resolve: clear completed pass: %w", err)
+	}
+	return nil
 }
 
 func (mi *MultiIndexer) runDeferredGoModAll() {

@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 9
+const currentSchemaVersion = 10
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -74,6 +74,15 @@ var schemaMigrations = []schemaMigration{
 	{version: 7, name: "purge unprefixed solo-repo rows", inPlace: purgeUnprefixedRepoRows},
 	{version: 8, name: "allow duplicate qualified names", inPlace: relaxNodeQualNameUniqueness},
 	{version: 9, name: "drop unused semantic pending index", inPlace: dropUnusedSemanticPendingIndex},
+	{version: 10, name: "add durable resolve recovery state", inPlace: createResolveStateTable},
+}
+
+// createResolveStateTable is the idempotent v10 migration. The table is a
+// singleton and contains no derived corpus data, so creating it transactionally
+// upgrades a populated store without forcing a source rebuild.
+func createResolveStateTable(tx *sql.Tx) error {
+	_, err := tx.Exec(resolveStateSchemaSQL)
+	return err
 }
 
 // dropUnusedSemanticPendingIndex removes an experimental index for a query

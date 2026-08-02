@@ -421,6 +421,18 @@ CREATE TABLE IF NOT EXISTS analysis_blobs (
 ) WITHOUT ROWID;
 `
 
+// resolveStateSchemaSQL is the singleton crash-recovery journal for the
+// whole resolution pipeline. Its generation is deliberately independent of
+// graph row IDs: recovery may clear only the exact generation observed before
+// reparsing, never a newer pass that began meanwhile.
+const resolveStateSchemaSQL = `
+CREATE TABLE IF NOT EXISTS resolve_state (
+    slot            INTEGER PRIMARY KEY CHECK (slot = 1),
+    generation      INTEGER NOT NULL CHECK (generation > 0),
+    started_at_unix INTEGER NOT NULL
+) WITHOUT ROWID;
+`
+
 // schemaSQL is the canonical DDL applied on Open. Statements are
 // idempotent (IF NOT EXISTS) so they run cleanly against a fresh DB
 // and against an existing one.
@@ -790,4 +802,4 @@ CREATE INDEX IF NOT EXISTS content_fts_rowid_by_repo_file
     ON content_fts_rowid(repo_prefix, file_path, fts_rowid);
 CREATE INDEX IF NOT EXISTS content_fts_rowid_by_file
     ON content_fts_rowid(file_path, fts_rowid);
-` + analysisGenerationSchemaSQL
+` + analysisGenerationSchemaSQL + resolveStateSchemaSQL

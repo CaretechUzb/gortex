@@ -562,6 +562,11 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		return &ResolveStats{}, err
 	}
 
+	resolveState, err := graph.BeginResolvePass(r.graph)
+	if err != nil {
+		return &ResolveStats{}, fmt.Errorf("resolver: persist incomplete pass: %w", err)
+	}
+
 	r.logUnresolvedFrontier("start")
 	defer r.logUnresolvedFrontier("end")
 
@@ -638,7 +643,11 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, pendingErr
 	}
 	if len(pending) == 0 && streamDone && !r.hasDeferredLSPRetryForScope() {
-		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, nil
+		stats := &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}
+		if err := graph.CompleteOwnedResolvePass(r.graph, resolveState); err != nil {
+			return stats, fmt.Errorf("resolver: clear completed pass: %w", err)
+		}
+		return stats, nil
 	}
 
 	passIndexes := newResolveAllPassIndexes(r)
@@ -1626,6 +1635,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	total.LSPBudgetExhausted = lspResult.budgetExhausted
 	total.PendingBefore = pendingBefore
 	total.PendingAfter = pendingAfter
+	if err := graph.CompleteOwnedResolvePass(r.graph, resolveState); err != nil {
+		return total, fmt.Errorf("resolver: clear completed pass: %w", err)
+	}
 	return total, nil
 }
 
