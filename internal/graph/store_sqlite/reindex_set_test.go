@@ -663,6 +663,80 @@ func TestReindexEdgesResolvedConversionReverseUpdatesInPlace(t *testing.T) {
 	assert.Equal(t, true, persisted[0].Meta["guard_reverted"])
 }
 
+func TestReindexEdgesResolvedConversionReverseUsesReceiptSafeGenericPath(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	const (
+		fromID           = "repo/caller.go::ReceiptCaller"
+		resolvedTarget   = "repo/target.go::ReceiptTarget"
+		unresolvedTarget = "unresolved::ReceiptTarget"
+		filePath         = "repo/caller.go"
+	)
+	store.AddBatch(nil, []*graph.Edge{{
+		From: fromID, To: resolvedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 45,
+	}})
+
+	token := store.BeginMutationReceipt()
+	stats, err := store.reindexEdgesSetOriented([]graph.EdgeReindex{{
+		OldTo: resolvedTarget,
+		Edge: &graph.Edge{
+			From: fromID, To: unresolvedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 45,
+			Origin: "guard",
+		},
+	}})
+	require.NoError(t, err)
+	receipt := store.EndMutationReceipt(token)
+
+	assert.Equal(t, 1, stats.selectStatements)
+	assert.Zero(t, stats.updateStatements, "active receipts require exact per-edge insert accounting")
+	assert.Equal(t, 1, stats.deleteStatements)
+	assert.Equal(t, 1, stats.deletedRows)
+	assert.Equal(t, 1, stats.insertStatements)
+	assert.Equal(t, 1, stats.insertedRows)
+	assert.True(t, receipt.Complete)
+	assert.True(t, receipt.ResolutionRelevant)
+	assert.Equal(t, []string{filePath}, receipt.ChangedFiles)
+	assert.Equal(t, []string{filePath}, receipt.ResolutionFiles())
+	assert.Equal(t, []string{"ReceiptTarget"}, receipt.TargetNames)
+	assert.Equal(t, []string{unresolvedTarget}, receipt.TargetIDs)
+}
+
+func TestReindexEdgesResolvedConversionReverseReceiptIgnoresExistingDestination(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	const (
+		fromID           = "repo/caller.go::CollisionCaller"
+		resolvedTarget   = "repo/target.go::CollisionTarget"
+		unresolvedTarget = "unresolved::CollisionTarget"
+		filePath         = "repo/caller.go"
+	)
+	store.AddBatch(nil, []*graph.Edge{
+		{From: fromID, To: resolvedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 47, Origin: "resolved"},
+		{From: fromID, To: unresolvedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 47, Origin: "existing"},
+	})
+
+	token := store.BeginMutationReceipt()
+	stats, err := store.reindexEdgesSetOriented([]graph.EdgeReindex{{
+		OldTo: resolvedTarget,
+		Edge: &graph.Edge{
+			From: fromID, To: unresolvedTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 47,
+			Origin: "replacement",
+		},
+	}})
+	require.NoError(t, err)
+	receipt := store.EndMutationReceipt(token)
+
+	assert.Equal(t, 1, stats.selectStatements)
+	assert.Zero(t, stats.updateStatements)
+	assert.Equal(t, 1, stats.deletedRows)
+	assert.Zero(t, stats.insertedRows, "the pre-existing unresolved destination is not new resolver work")
+	assert.True(t, receipt.Complete)
+	assert.False(t, receipt.ResolutionRelevant)
+	assert.Empty(t, receipt.ResolutionFiles())
+	persisted := store.GetOutEdges(fromID)
+	require.Len(t, persisted, 1)
+	assert.Equal(t, unresolvedTarget, persisted[0].To)
+	assert.Equal(t, "existing", persisted[0].Origin)
+}
+
 func TestReindexEdgesResolvedConversionRejectsMixedDirections(t *testing.T) {
 	store := openReindexReceiptTestStore(t)
 	const filePath = "repo/caller.go"

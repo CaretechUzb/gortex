@@ -155,6 +155,16 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 
 	sameKindUpdates, kindChangingUpdates, deletes, inserts, resolvedConversionFastPath :=
 		sqliteResolvedConversionUpdatePlan(mutations)
+	// A reverse conversion creates a new unresolved edge. While a mutation
+	// receipt is active, retain the generic simulator's exact insert accounting:
+	// UPDATE OR IGNORE reports only an aggregate row count and cannot distinguish
+	// successful updates from destination collisions. Cold guard passes run
+	// outside the receipt window and keep the in-place fast path.
+	if resolvedConversionFastPath && receipt != nil &&
+		!graph.IsUnresolvedTarget(mutations[0].oldKey.toID) &&
+		graph.IsUnresolvedTarget(mutations[0].newRow.key.toID) {
+		resolvedConversionFastPath = false
+	}
 	if resolvedConversionFastPath {
 		updated, statements, repairDeletes, repairInserts, updateErr :=
 			updateSQLiteResolvedConversionsTxLimited(tx, sameKindUpdates, false, &variableLimit)
