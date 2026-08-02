@@ -173,42 +173,6 @@ func TestEndCoordinatedBulkLoadDoesNotWaitForReadSnapshot(t *testing.T) {
 	}
 }
 
-func TestBulkCheckpointCadenceTightensAfterIndexSeal(t *testing.T) {
-	store := &Store{bulkIndexesDeferred: true}
-	nodeRows, edgeRows := store.bulkCheckpointIntervalsLocked()
-	if nodeRows != bulkCheckpointNodeInterval || edgeRows != bulkCheckpointEdgeInterval {
-		t.Fatalf("deferred-index cadence = (%d, %d), want (%d, %d)",
-			nodeRows, edgeRows, bulkCheckpointNodeInterval, bulkCheckpointEdgeInterval)
-	}
-
-	store.bulkIndexesDeferred = false
-	nodeRows, edgeRows = store.bulkCheckpointIntervalsLocked()
-	if nodeRows != bulkIndexedCheckpointNodeInterval || edgeRows != bulkIndexedCheckpointEdgeInterval {
-		t.Fatalf("live-index cadence = (%d, %d), want (%d, %d)",
-			nodeRows, edgeRows, bulkIndexedCheckpointNodeInterval, bulkIndexedCheckpointEdgeInterval)
-	}
-}
-
-func TestBoundedCheckpointRetryDebt(t *testing.T) {
-	for _, test := range []struct {
-		name     string
-		rows     int64
-		interval int64
-		want     int64
-	}{
-		{name: "none", rows: 0, interval: 100, want: 0},
-		{name: "small pressure", rows: 20, interval: 100, want: 20},
-		{name: "large pressure", rows: 400, interval: 100, want: 50},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := boundedCheckpointRetryDebt(test.rows, test.interval); got != test.want {
-				t.Fatalf("boundedCheckpointRetryDebt(%d, %d) = %d, want %d",
-					test.rows, test.interval, got, test.want)
-			}
-		})
-	}
-}
-
 func explainPlannerQueryPlan(t *testing.T, db *sql.DB, query string, args ...any) string {
 	t.Helper()
 	rows, err := db.QueryContext(t.Context(), `EXPLAIN QUERY PLAN `+query, args...)
