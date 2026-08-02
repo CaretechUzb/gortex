@@ -193,6 +193,59 @@ func lockResolveContext(ctx context.Context, mu *sync.Mutex) error {
 	return nil
 }
 
+// resolveLockSlices records the actual graph-lock cost of a provider pass.
+// It deliberately owns no compiler state: callers build detached projections
+// and mutation plans outside the lock, then use with for the bounded store
+// read/write slice only.
+type resolveLockSlices struct {
+	mu      *sync.Mutex
+	waited  time.Duration
+	held    time.Duration
+	maxHeld time.Duration
+	count   int
+}
+
+func (s *resolveLockSlices) with(ctx context.Context, fn func() error) error {
+	waitStart := time.Now()
+	if err := lockResolveContext(ctx, s.mu); err != nil {
+		s.waited += time.Since(waitStart)
+		return err
+	}
+	acquired := time.Now()
+	s.waited += acquired.Sub(waitStart)
+	s.count++
+	defer func() {
+		held := time.Since(acquired)
+		s.held += held
+		if held > s.maxHeld {
+			s.maxHeld = held
+		}
+		s.mu.Unlock()
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fn()
+}
+
+// detachGoNodeProjection protects the in-memory backend as well as SQLite.
+// SQLite projections are already reconstructed values, but Graph returns its
+// resident pointers. The apply phase only needs structural fields, so shallow
+// copies with Meta detached remain stable while another lock slice mutates the
+// live graph and avoid retaining opaque metadata with the compiler program.
+func detachGoNodeProjection(nodes []*graph.Node) []*graph.Node {
+	out := make([]*graph.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		clone := *node
+		clone.Meta = nil
+		out = append(out, &clone)
+	}
+	return out
+}
+
 func (p *Provider) replaceBindingIndex(absRoot string, files []string, rows []graph.SemanticBindingType) {
 	fileSet := make(map[string]struct{}, len(files))
 	for _, filePath := range files {
@@ -487,41 +540,35 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		Language: "go",
 	}
 
-	// Serialize graph-touching work on the backend resolve mutex. The heavy
-	// admission gate remains held through this phase, so another full Go program
-	// cannot accumulate in memory while waiting for the same graph lock.
-	rmu := g.ResolveMutex()
-	mutexWaitStart := time.Now()
-	if err := lockResolveContext(ctx, rmu); err != nil {
-		return nil, err
-	}
-	defer rmu.Unlock()
-	mutexWaited := time.Since(mutexWaitStart)
-	if mutexWaited > 5*time.Second && p.logger != nil {
-		p.logger.Info("go-types: resolve mutex acquired after wait",
-			zap.String("repo_prefix", repoPrefix),
-			zap.Duration("waited", mutexWaited))
-	}
+	// Keep compiler/heavy admission for the complete lifetime of pkgs, but hold
+	// the graph resolve mutex only for bounded store-dependent slices. CPU-only
+	// compiler walks use detached projections between slices, allowing other
+	// repositories and resolvers to make forward progress.
+	resolveSlices := &resolveLockSlices{mu: g.ResolveMutex()}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	// Apply-subphase instrumentation: one summary line per repo at apply
-	// completion splits the mutex-serialized section the drain-phase wall
-	// otherwise reports as a single number. refs_walk INCLUDES its inner
-	// write times (add_batch / reindex / confirm) — use-matching cost is
-	// refs_walk minus those three.
-	applyMutexHeld := time.Now()
+	// completion separates total apply wall time from actual graph-lock wait,
+	// aggregate hold time, longest hold, and slice count. refs_walk INCLUDES
+	// its inner write times (add_batch / reindex / confirm).
+	applyStarted := time.Now()
 	var applyProjectionDur, applyDefsDur, applyRefsDur time.Duration
 	var applyAddBatchDur, applyReindexDur, applyConfirmDur time.Duration
 	var applyImplementsDur, applyStampsDur time.Duration
 
 	// Materialize this repository's Go nodes once and reuse them across every
-	// compiler definition/use. On SQLite, MatchNodeByFileLine and
-	// findContainingFunc otherwise issue one GetFileNodes query per go/types
-	// object, repeatedly decoding the same retrieval metadata hundreds of
-	// thousands of times on a large module.
+	// compiler definition/use. The read is serialized with graph mutation, then
+	// shallow detached so the CPU-only matching walks never retain or observe
+	// mutable backend-owned node objects after the lock slice ends.
 	projectionStart := time.Now()
-	repoNodes := repoGoNodes(g, repoPrefix)
+	var repoNodes []*graph.Node
+	if err := resolveSlices.with(ctx, func() error {
+		repoNodes = detachGoNodeProjection(repoGoNodes(g, repoPrefix))
+		return nil
+	}); err != nil {
+		return nil, err
+	}
 	nodesByFile := make(map[string][]*graph.Node)
 	nodesByID := make(map[string]*graph.Node, len(repoNodes))
 	for _, node := range repoNodes {
@@ -601,7 +648,13 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	applyDefsDur = time.Since(defsStart)
 	refsStart := time.Now()
 	externals := newExternalsAttribution(g, pkgs, p.Name(), repoPrefix, depIndex)
-	externals.prefetchExistingNodes(pkgs, objToNode)
+	externalNodeIDs := externals.existingNodeIDs(pkgs, objToNode)
+	if err := resolveSlices.with(ctx, func() error {
+		externals.prefetchExistingNodeIDs(externalNodeIDs)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
 
 	// Phase 2: Process references package by package. Each package is walked
 	// twice: the first walk deduplicates exact endpoint/use-site keys, SQLite
@@ -628,113 +681,129 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			continue
 		}
 
-		endpointSet := make(map[graph.EdgeEndpoint]struct{}, len(pkg.TypesInfo.Uses))
-		siteSet := make(map[graph.EdgeSite]struct{})
+		// Resolve compiler uses once into a package-bounded detached plan. The
+		// previous implementation repeated this walk while holding ResolveMutex;
+		// only candidate lookup and mutation require graph serialization.
+		resolvedUses := make([]resolvedGoUse, 0, len(pkg.TypesInfo.Uses))
 		for ident, obj := range pkg.TypesInfo.Uses {
 			use, ok := resolveGoUse(ident, obj, fset, absRoot, repoPrefix, funcIndexByFile, objToNode, externals)
-			if !ok {
-				continue
+			if ok {
+				resolvedUses = append(resolvedUses, use)
 			}
-			endpointSet[graph.EdgeEndpoint{From: use.caller.ID, To: use.targetNodeID}] = struct{}{}
-			if !use.external {
-				continue
-			}
-			importPath := use.obj.Pkg().Path()
-			for _, target := range stubEdgeTargets(repoPrefix, importPath, use.obj) {
-				endpointSet[graph.EdgeEndpoint{From: use.caller.ID, To: target}] = struct{}{}
-			}
-			siteSet[graph.EdgeSite{
-				From: use.caller.ID,
-				Line: use.line,
-				Kind: wantedEdgeKind(use.obj),
-			}] = struct{}{}
 		}
 
-		endpoints := make([]graph.EdgeEndpoint, 0, len(endpointSet))
-		for key := range endpointSet {
-			endpoints = append(endpoints, key)
-		}
-		sites := make([]graph.EdgeSite, 0, len(siteSet))
-		for key := range siteSet {
-			sites = append(sites, key)
-		}
-		candidates := graph.LookupEdgeCandidates(g, endpoints, sites)
-		externals.edgeCandidates = &candidates
-
-		var confirmedEdges []*graph.Edge
-		var newEdges []*graph.Edge
-		for ident, obj := range pkg.TypesInfo.Uses {
-			use, ok := resolveGoUse(ident, obj, fset, absRoot, repoPrefix, funcIndexByFile, objToNode, externals)
-			if !ok {
-				continue
+		const goUseApplyChunkSize = 512
+		for chunkStart := 0; chunkStart < len(resolvedUses); chunkStart += goUseApplyChunkSize {
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
-
-			// External: claim a resolver-stub edge if one exists, else add a
-			// fresh edge. Internal: confirm or add as before.
-			if use.external {
+			chunkEnd := min(chunkStart+goUseApplyChunkSize, len(resolvedUses))
+			chunk := resolvedUses[chunkStart:chunkEnd]
+			endpointSet := make(map[graph.EdgeEndpoint]struct{}, len(chunk))
+			siteSet := make(map[graph.EdgeSite]struct{})
+			for _, use := range chunk {
+				endpointSet[graph.EdgeEndpoint{From: use.caller.ID, To: use.targetNodeID}] = struct{}{}
+				if !use.external {
+					continue
+				}
 				importPath := use.obj.Pkg().Path()
-				if upgraded := externals.claimAndUpgradeStub(use.caller.ID, importPath, use.obj, use.targetNodeID, use.line); upgraded != nil {
-					result.EdgesConfirmed++
-					continue
+				for _, target := range stubEdgeTargets(repoPrefix, importPath, use.obj) {
+					endpointSet[graph.EdgeEndpoint{From: use.caller.ID, To: target}] = struct{}{}
 				}
-				existing := candidates.EndpointKind(use.caller.ID, use.targetNodeID, inferEdgeKindFromObj(use.obj))
-				if existing != nil {
-					if existing.Confidence < 1.0 {
-						semantic.ConfirmEdge(existing, p.Name())
-						confirmedEdges = append(confirmedEdges, existing)
-						result.EdgesConfirmed++
+				siteSet[graph.EdgeSite{
+					From: use.caller.ID,
+					Line: use.line,
+					Kind: wantedEdgeKind(use.obj),
+				}] = struct{}{}
+			}
+
+			endpoints := make([]graph.EdgeEndpoint, 0, len(endpointSet))
+			for key := range endpointSet {
+				endpoints = append(endpoints, key)
+			}
+			sites := make([]graph.EdgeSite, 0, len(siteSet))
+			for key := range siteSet {
+				sites = append(sites, key)
+			}
+
+			if err := resolveSlices.with(ctx, func() error {
+				candidates := graph.LookupEdgeCandidates(g, endpoints, sites)
+				externals.edgeCandidates = &candidates
+				defer func() { externals.edgeCandidates = nil }()
+
+				var confirmedEdges []*graph.Edge
+				var newEdges []*graph.Edge
+				for _, use := range chunk {
+					// External: claim a resolver-stub edge if one exists, else add
+					// a fresh edge. Internal: confirm or add as before.
+					if use.external {
+						importPath := use.obj.Pkg().Path()
+						if upgraded := externals.claimAndUpgradeStub(use.caller.ID, importPath, use.obj, use.targetNodeID, use.line); upgraded != nil {
+							result.EdgesConfirmed++
+							continue
+						}
+						existing := candidates.EndpointKind(use.caller.ID, use.targetNodeID, inferEdgeKindFromObj(use.obj))
+						if existing != nil {
+							if existing.Confidence < 1.0 {
+								semantic.ConfirmEdge(existing, p.Name())
+								confirmedEdges = append(confirmedEdges, existing)
+								result.EdgesConfirmed++
+							}
+							continue
+						}
+						kind := inferEdgeKindFromObj(use.obj)
+						if kind != "" {
+							edge := semantic.NewSemanticEdge(use.caller.ID, use.targetNodeID, kind,
+								use.graphPath, use.line, p.Name())
+							candidates.Add(edge)
+							newEdges = append(newEdges, edge)
+							result.EdgesAdded++
+						}
+						continue
 					}
-					continue
+
+					existing := candidates.EndpointKind(use.caller.ID, use.targetNodeID, inferEdgeKindFromObj(use.obj))
+					if existing != nil {
+						if existing.Confidence < 1.0 {
+							semantic.ConfirmEdge(existing, p.Name())
+							confirmedEdges = append(confirmedEdges, existing)
+							result.EdgesConfirmed++
+						}
+					} else {
+						kind := inferEdgeKindFromObj(use.obj)
+						if kind != "" {
+							edge := semantic.NewSemanticEdge(use.caller.ID, use.targetNodeID, kind,
+								use.graphPath, use.line, p.Name())
+							candidates.Add(edge)
+							newEdges = append(newEdges, edge)
+							result.EdgesAdded++
+						}
+					}
 				}
-				kind := inferEdgeKindFromObj(use.obj)
-				if kind != "" {
-					edge := semantic.NewSemanticEdge(use.caller.ID, use.targetNodeID, kind,
-						use.graphPath, use.line, p.Name())
-					candidates.Add(edge)
-					newEdges = append(newEdges, edge)
-					result.EdgesAdded++
+
+				externalNodes, externalEdges := externals.drainPendingAdds()
+				allNewEdges := make([]*graph.Edge, 0, len(externalEdges)+len(newEdges))
+				allNewEdges = append(allNewEdges, externalEdges...)
+				allNewEdges = append(allNewEdges, newEdges...)
+				if len(externalNodes) > 0 || len(allNewEdges) > 0 {
+					addBatchStart := time.Now()
+					g.AddBatch(externalNodes, allNewEdges)
+					applyAddBatchDur += time.Since(addBatchStart)
 				}
-				continue
+				if reindexes := externals.drainPendingReindexes(); len(reindexes) > 0 {
+					reindexStart := time.Now()
+					g.ReindexEdges(reindexes)
+					applyReindexDur += time.Since(reindexStart)
+				}
+
+				confirmStart := time.Now()
+				persistConfirmedEdges(g, confirmedEdges)
+				applyConfirmDur += time.Since(confirmStart)
+				return nil
+			}); err != nil {
+				return nil, err
 			}
-
-			existing := candidates.EndpointKind(use.caller.ID, use.targetNodeID, inferEdgeKindFromObj(use.obj))
-			if existing != nil {
-				if existing.Confidence < 1.0 {
-					semantic.ConfirmEdge(existing, p.Name())
-					confirmedEdges = append(confirmedEdges, existing)
-					result.EdgesConfirmed++
-				}
-			} else {
-				kind := inferEdgeKindFromObj(use.obj)
-				if kind != "" {
-					edge := semantic.NewSemanticEdge(use.caller.ID, use.targetNodeID, kind,
-						use.graphPath, use.line, p.Name())
-					candidates.Add(edge)
-					newEdges = append(newEdges, edge)
-					result.EdgesAdded++
-				}
-			}
 		}
-
-		externalNodes, externalEdges := externals.drainPendingAdds()
-		allNewEdges := make([]*graph.Edge, 0, len(externalEdges)+len(newEdges))
-		allNewEdges = append(allNewEdges, externalEdges...)
-		allNewEdges = append(allNewEdges, newEdges...)
-		if len(externalNodes) > 0 || len(allNewEdges) > 0 {
-			addBatchStart := time.Now()
-			g.AddBatch(externalNodes, allNewEdges)
-			applyAddBatchDur += time.Since(addBatchStart)
-		}
-		if reindexes := externals.drainPendingReindexes(); len(reindexes) > 0 {
-			reindexStart := time.Now()
-			g.ReindexEdges(reindexes)
-			applyReindexDur += time.Since(reindexStart)
-		}
-
-		confirmStart := time.Now()
-		persistConfirmedEdges(g, confirmedEdges)
-		applyConfirmDur += time.Since(confirmStart)
-		externals.edgeCandidates = nil
 	}
 
 	// Stitch the externals counters into the standard result. NodesEnriched
@@ -746,10 +815,37 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 
 	applyRefsDur = time.Since(refsStart)
 
-	// Phase 3: Interface implementations via go/types.
+	// Phase 3: Interface implementations via go/types. Keep the existing and
+	// missing-edge operations in separate lock slices so unrelated graph work
+	// can interleave between their bounded reads and writes.
 	implementsStart := time.Now()
-	result.EdgesConfirmed += p.enrichImplements(g, objToNode, nodesByID)
-	result.EdgesAdded += p.addMissingImplements(g, objToNode, nodesByID)
+	const goImplementsApplyChunkSize = 512
+	interfaceIDs := implementationInterfaceIDs(objToNode, nodesByID)
+	for start := 0; start < len(interfaceIDs); start += goImplementsApplyChunkSize {
+		end := min(start+goImplementsApplyChunkSize, len(interfaceIDs))
+		chunk := interfaceIDs[start:end]
+		var implementsConfirmed int
+		if err := resolveSlices.with(ctx, func() error {
+			implementsConfirmed = p.enrichImplementsByIDs(g, chunk)
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		result.EdgesConfirmed += implementsConfirmed
+	}
+	missingPairs := missingImplementationPairs(objToNode, nodesByID)
+	for start := 0; start < len(missingPairs); start += goImplementsApplyChunkSize {
+		end := min(start+goImplementsApplyChunkSize, len(missingPairs))
+		chunk := missingPairs[start:end]
+		var implementsAdded int
+		if err := resolveSlices.with(ctx, func() error {
+			implementsAdded = p.addMissingImplementationPairs(g, chunk, nodesByID)
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		result.EdgesAdded += implementsAdded
+	}
 	applyImplementsDur = time.Since(implementsStart)
 	stampsStart := time.Now()
 
@@ -844,19 +940,23 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// hold only strings from here on; frame liveness already lets the GC
 	// collect the program while the graph-write persistence below runs.
 
-	persistedStamps, err := persistGoNodeStamps(ctx, g, stamps, p.Name())
+	persistedStamps, err := persistGoNodeStampsSliced(ctx, g, stamps, p.Name(), resolveSlices)
 	if err != nil {
 		return nil, err
 	}
 	result.NodesEnriched += persistedStamps
 	applyStampsDur = time.Since(stampsStart)
 
+	result.LockWaitMs = resolveSlices.waited.Milliseconds()
 	if p.logger != nil {
 		p.logger.Info("go-types: apply subphases",
 			zap.String("repo_prefix", repoPrefix),
 			zap.Duration("gate_parked", applyGateParked),
-			zap.Duration("mutex_waited", mutexWaited),
-			zap.Duration("mutex_held", time.Since(applyMutexHeld)),
+			zap.Duration("apply_wall", time.Since(applyStarted)),
+			zap.Duration("mutex_waited", resolveSlices.waited),
+			zap.Duration("mutex_held", resolveSlices.held),
+			zap.Duration("mutex_max_held", resolveSlices.maxHeld),
+			zap.Int("mutex_slices", resolveSlices.count),
 			zap.Duration("graph_projection", applyProjectionDur),
 			zap.Duration("defs_walk", applyDefsDur),
 			zap.Duration("refs_walk", applyRefsDur),
@@ -1495,27 +1595,53 @@ func persistGoNodeStamps(
 	stamps map[string]goNodeStamp,
 	providerName string,
 ) (int, error) {
+	return persistGoNodeStampsSliced(ctx, g, stamps, providerName, nil)
+}
+
+func persistGoNodeStampsSliced(
+	ctx context.Context,
+	g graph.Store,
+	stamps map[string]goNodeStamp,
+	providerName string,
+	resolveSlices *resolveLockSlices,
+) (int, error) {
 	ids := make([]string, 0, len(stamps))
 	for id := range stamps {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 
-	if writer, ok := g.(graph.SemanticNodeStampWriter); ok {
+	withStore := func(fn func() error) error {
+		if resolveSlices != nil {
+			return resolveSlices.with(ctx, fn)
+		}
 		if err := ctx.Err(); err != nil {
-			return 0, err
+			return err
 		}
-		updates := make([]graph.SemanticNodeStamp, 0, len(ids))
-		for _, id := range ids {
-			stamp := stamps[id]
-			updates = append(updates, graph.SemanticNodeStamp{
-				NodeID:         id,
-				SemanticType:   stamp.semanticType,
-				ReturnType:     stamp.returnType,
-				SemanticSource: providerName,
-			})
+		return fn()
+	}
+
+	if writer, ok := g.(graph.SemanticNodeStampWriter); ok {
+		changed := 0
+		for start := 0; start < len(ids); start += goNodeStampChunkSize {
+			end := min(start+goNodeStampChunkSize, len(ids))
+			updates := make([]graph.SemanticNodeStamp, 0, end-start)
+			for _, id := range ids[start:end] {
+				stamp := stamps[id]
+				updates = append(updates, graph.SemanticNodeStamp{
+					NodeID:         id,
+					SemanticType:   stamp.semanticType,
+					ReturnType:     stamp.returnType,
+					SemanticSource: providerName,
+				})
+			}
+			if err := withStore(func() error {
+				changed += writer.PersistSemanticNodeStamps(updates)
+				return nil
+			}); err != nil {
+				return changed, err
+			}
 		}
-		changed := writer.PersistSemanticNodeStamps(updates)
 		if err := ctx.Err(); err != nil {
 			return changed, err
 		}
@@ -1524,33 +1650,32 @@ func persistGoNodeStamps(
 
 	enriched := 0
 	for start := 0; start < len(ids); start += goNodeStampChunkSize {
-		if err := ctx.Err(); err != nil {
-			return enriched, err
-		}
 		end := min(start+goNodeStampChunkSize, len(ids))
 		chunk := ids[start:end]
-		fullNodes := g.GetNodesByIDs(chunk)
-		updated := make([]*graph.Node, 0, len(fullNodes))
-		for _, id := range chunk {
-			node := fullNodes[id]
-			if node == nil {
-				continue
+		if err := withStore(func() error {
+			fullNodes := g.GetNodesByIDs(chunk)
+			updated := make([]*graph.Node, 0, len(fullNodes))
+			for _, id := range chunk {
+				node := fullNodes[id]
+				if node == nil {
+					continue
+				}
+				stamp := stamps[id]
+				if stamp.semanticType != "" {
+					semantic.EnrichNodeMeta(node, "semantic_type", stamp.semanticType, providerName)
+					enriched++
+				}
+				if stamp.returnType != "" {
+					semantic.EnrichNodeMeta(node, "return_type", stamp.returnType, providerName)
+				}
+				updated = append(updated, node)
 			}
-			stamp := stamps[id]
-			if stamp.semanticType != "" {
-				semantic.EnrichNodeMeta(node, "semantic_type", stamp.semanticType, providerName)
-				enriched++
+			if len(updated) > 0 {
+				g.AddBatch(updated, nil)
 			}
-			if stamp.returnType != "" {
-				semantic.EnrichNodeMeta(node, "return_type", stamp.returnType, providerName)
-			}
-			updated = append(updated, node)
-		}
-		if err := ctx.Err(); err != nil {
+			return nil
+		}); err != nil {
 			return enriched, err
-		}
-		if len(updated) > 0 {
-			g.AddBatch(updated, nil)
 		}
 	}
 	return enriched, nil
@@ -1634,28 +1759,30 @@ func implementsConcreteNode(nodesByID map[string]*graph.Node, nodeID string) boo
 	return node != nil && node.Kind == graph.KindType
 }
 
-func (p *Provider) enrichImplements(g graph.Store, objToNode map[types.Object]string, nodesByID map[string]*graph.Node) int {
-	// Collect all interfaces from the loaded packages.
-	ifaceTypes := make(map[string]*types.Interface) // Gortex node ID → interface type
+func implementationInterfaceIDs(objToNode map[types.Object]string, nodesByID map[string]*graph.Node) []string {
+	interfaceSet := make(map[string]struct{})
 	for obj, nodeID := range objToNode {
 		if tn, ok := obj.(*types.TypeName); ok {
-			if iface, ok := tn.Type().Underlying().(*types.Interface); ok && implementsInterfaceNode(nodesByID, nodeID) {
-				ifaceTypes[nodeID] = iface
+			if _, ok := tn.Type().Underlying().(*types.Interface); ok && implementsInterfaceNode(nodesByID, nodeID) {
+				interfaceSet[nodeID] = struct{}{}
 			}
 		}
 	}
-	if len(ifaceTypes) == 0 {
-		return 0
-	}
-
-	// Fetch inbound edges for every loaded interface in one predicate-shaped
-	// batch. This preserves cross-repo concrete sources without scanning the
-	// graph-wide EdgeImplements set once per repository.
-	interfaceIDs := make([]string, 0, len(ifaceTypes))
-	for id := range ifaceTypes {
+	interfaceIDs := make([]string, 0, len(interfaceSet))
+	for id := range interfaceSet {
 		interfaceIDs = append(interfaceIDs, id)
 	}
 	sort.Strings(interfaceIDs)
+	return interfaceIDs
+}
+
+func (p *Provider) enrichImplementsByIDs(g graph.Store, interfaceIDs []string) int {
+	if len(interfaceIDs) == 0 {
+		return 0
+	}
+	// Fetch inbound edges for every loaded interface in one predicate-shaped
+	// batch. This preserves cross-repo concrete sources without scanning the
+	// graph-wide EdgeImplements set once per repository.
 	inbound := g.GetInEdgesByNodeIDs(interfaceIDs)
 
 	var pending []*graph.Edge
@@ -1687,6 +1814,10 @@ func (p *Provider) enrichImplements(g graph.Store, objToNode map[types.Object]st
 	return len(confirmedEdges)
 }
 
+func (p *Provider) enrichImplements(g graph.Store, objToNode map[types.Object]string, nodesByID map[string]*graph.Node) int {
+	return p.enrichImplementsByIDs(g, implementationInterfaceIDs(objToNode, nodesByID))
+}
+
 func implementationMethodNames(typ, pointer types.Type) map[string]struct{} {
 	methodNames := make(map[string]struct{})
 	for _, candidateType := range []types.Type{typ, pointer} {
@@ -1699,7 +1830,12 @@ func implementationMethodNames(typ, pointer types.Type) map[string]struct{} {
 }
 
 // addMissingImplements discovers interface implementations that tree-sitter missed.
-func (p *Provider) addMissingImplements(g graph.Store, objToNode map[types.Object]string, nodesByID map[string]*graph.Node) int {
+type implementationPair struct {
+	from string
+	to   string
+}
+
+func missingImplementationPairs(objToNode map[types.Object]string, nodesByID map[string]*graph.Node) []implementationPair {
 	// Collect interfaces and concrete types. Concrete method names form a cheap,
 	// lossless prefilter: exact go/types checks still decide every edge.
 	type ifaceEntry struct {
@@ -1757,12 +1893,7 @@ func (p *Provider) addMissingImplements(g graph.Store, objToNode map[types.Objec
 		}
 	}
 
-	type implementationPair struct {
-		from string
-		to   string
-	}
 	var pairs []implementationPair
-	var endpoints []graph.EdgeEndpoint
 	for _, ifaceEntry := range ifaces {
 		requiredNames := make([]string, 0, ifaceEntry.iface.NumMethods())
 		candidateIndexes := allConcreteIndexes
@@ -1796,13 +1927,19 @@ func (p *Provider) addMissingImplements(g graph.Store, objToNode map[types.Objec
 			}
 			if types.Implements(concrete.typ, ifaceEntry.iface) || types.Implements(concrete.pointer, ifaceEntry.iface) {
 				pairs = append(pairs, implementationPair{from: concrete.nodeID, to: ifaceEntry.nodeID})
-				endpoints = append(endpoints, graph.EdgeEndpoint{From: concrete.nodeID, To: ifaceEntry.nodeID})
 			}
 		}
 	}
+	return pairs
+}
 
+func (p *Provider) addMissingImplementationPairs(g graph.Store, pairs []implementationPair, nodesByID map[string]*graph.Node) int {
 	if len(pairs) == 0 {
 		return 0
+	}
+	endpoints := make([]graph.EdgeEndpoint, 0, len(pairs))
+	for _, pair := range pairs {
+		endpoints = append(endpoints, graph.EdgeEndpoint{From: pair.from, To: pair.to})
 	}
 	candidates := graph.LookupEdgeCandidates(g, endpoints, nil)
 	newEdges := make([]*graph.Edge, 0, len(pairs))
@@ -1823,6 +1960,10 @@ func (p *Provider) addMissingImplements(g graph.Store, objToNode map[types.Objec
 		g.AddBatch(nil, newEdges)
 	}
 	return len(newEdges)
+}
+
+func (p *Provider) addMissingImplements(g graph.Store, objToNode map[types.Object]string, nodesByID map[string]*graph.Node) int {
+	return p.addMissingImplementationPairs(g, missingImplementationPairs(objToNode, nodesByID), nodesByID)
 }
 
 func persistConfirmedEdges(g graph.Store, edges []*graph.Edge) {

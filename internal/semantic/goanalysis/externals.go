@@ -122,7 +122,7 @@ func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider,
 // prefetchExistingNodes collects every external symbol/module ID this repo's
 // Uses can touch and tests their existence in one batched store operation.
 // Only IDs stay resident; decoded nodes are discarded immediately.
-func (e *externalsAttribution) prefetchExistingNodes(pkgs []*packages.Package, objToNode map[types.Object]string) {
+func (e *externalsAttribution) existingNodeIDs(pkgs []*packages.Package, objToNode map[types.Object]string) []string {
 	ids := make(map[string]struct{})
 	for _, root := range pkgs {
 		if root == nil || root.TypesInfo == nil {
@@ -148,12 +148,16 @@ func (e *externalsAttribution) prefetchExistingNodes(pkgs []*packages.Package, o
 			ids[nodeID] = struct{}{}
 		}
 	}
-	if len(ids) == 0 {
-		return
-	}
 	batch := make([]string, 0, len(ids))
 	for id := range ids {
 		batch = append(batch, id)
+	}
+	return batch
+}
+
+func (e *externalsAttribution) prefetchExistingNodeIDs(batch []string) {
+	if len(batch) == 0 {
+		return
 	}
 	for id := range graph.LookupExistingNodeIDs(e.g, batch) {
 		e.knownNodeIDs[id] = struct{}{}
