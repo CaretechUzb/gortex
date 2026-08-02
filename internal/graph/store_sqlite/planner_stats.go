@@ -36,6 +36,7 @@ WITH critical(name) AS (VALUES
   ('nodes_by_kind'),
   ('nodes_by_name'),
   ('nodes_by_repo'),
+  ('nodes_go_receiver_type'),
   ('nodes_by_repo_kind'),
   ('nodes_by_repo_language_name')
 )

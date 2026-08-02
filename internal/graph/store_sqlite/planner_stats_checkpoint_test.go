@@ -24,7 +24,9 @@ seq(x) AS (
 INSERT INTO nodes(id, kind, name, file_path)
 SELECT printf('node-%05d', x), 'function', printf('fn%d', x),
        CASE WHEN x = 1 THEN 'target.go' ELSE printf('file-%05d.go', x) END
-FROM seq`)
+FROM seq;
+INSERT INTO nodes(id, kind, name, file_path, repo_prefix, language)
+VALUES ('repo/types/model.go::Widget', 'type', 'Widget', 'types/model.go', 'repo', 'go')`)
 	if err != nil {
 		t.Fatalf("populate planner fixture: %v", err)
 	}
@@ -78,6 +80,7 @@ FROM seq`)
 		"nodes_by_repo",
 		"nodes_by_repo_kind",
 		"nodes_by_repo_language_name",
+		"nodes_go_receiver_type",
 	}
 	if !reflect.DeepEqual(gotIndexes, wantIndexes) {
 		t.Fatalf("synchronous graph stats = %v, want %v", gotIndexes, wantIndexes)
