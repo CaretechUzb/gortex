@@ -1077,6 +1077,10 @@ type FrameworkSynthReport struct {
 	ScopeMillis int64 `json:"scope_ms,omitempty"`
 	ScopeRows   int   `json:"scope_rows,omitempty"`
 	ScopeBytes  int   `json:"scope_bytes,omitempty"`
+	// FullReadCache reports the bounded immutable node/member projection cache
+	// used only by cold/full executions. Scoped incremental passes keep their
+	// exact frontier store and leave this zero-valued.
+	FullReadCache FrameworkFullReadCacheStats `json:"full_read_cache,omitempty"`
 }
 
 // scopedSynthesizer is the optional capability a FrameworkSynthesizer exposes
@@ -1184,10 +1188,17 @@ func runFrameworkSynthesizersScoped(
 
 	scopeStart := time.Now()
 	var genericSeed *frameworkScopedSeed
+	var fullReadCache *frameworkFullReadCache
 	if executionScope != nil {
 		genericSeed = newFrameworkScopedSeed(g, executionScope, filePaths)
 		rep.ScopeRows = genericSeed.retainedRows
 		rep.ScopeBytes = genericSeed.retainedBytes
+	} else {
+		// Node declarations are immutable throughout the framework registry.
+		// Share their decoded projections across passes under a hard run-local
+		// budget; the per-pass edge facade invalidates on any future node/member
+		// mutation so this optimization cannot return stale declaration state.
+		fullReadCache = newFrameworkFullReadCache()
 	}
 	rep.ScopeMillis = time.Since(scopeStart).Milliseconds()
 	for _, s := range defaultFrameworkSynthesizers() {
@@ -1203,11 +1214,11 @@ func runFrameworkSynthesizersScoped(
 					// Shared-stream form. streams exist only on a full-census
 					// run, where the execution store is the raw g for both
 					// the nil-scope and the attested full-coverage shapes.
-					n = runLegacyFrameworkSynth(g, func(store graph.Store) int {
+					n = runLegacyFrameworkSynthWithCache(g, fullReadCache, func(store graph.Store) int {
 						return sf.candFn(store, bundle)
 					})
 				case executionScope == nil:
-					n = runLegacyFrameworkSynth(g, sf.fn)
+					n = runLegacyFrameworkSynthWithCache(g, fullReadCache, sf.fn)
 				case sf.scopedFn != nil:
 					n = sf.scopedFn(g, executionScope)
 				default:
@@ -1215,11 +1226,11 @@ func runFrameworkSynthesizersScoped(
 					n = runLegacyFrameworkSynth(passScope, sf.fn)
 				}
 			} else if ss, ok := s.(scopedSynthesizer); ok {
-				n = runLegacyFrameworkSynth(g, func(store graph.Store) int {
+				n = runLegacyFrameworkSynthWithCache(g, fullReadCache, func(store graph.Store) int {
 					return ss.synthesizeScoped(store, executionScope)
 				})
 			} else if executionScope == nil {
-				n = runLegacyFrameworkSynth(g, s.Synthesize)
+				n = runLegacyFrameworkSynthWithCache(g, fullReadCache, s.Synthesize)
 			} else {
 				panic("framework partial run has an unscoped synthesizer: " + s.Name())
 			}
@@ -1234,6 +1245,11 @@ func runFrameworkSynthesizersScoped(
 		rep.Total += n
 		candidates.streams.releasePass(s.Name(), bundle)
 	}
+	// Capture observability before dropping the run-local cache. Tail gates and
+	// claiming resolvers use different projections and must not prolong its
+	// lifetime beyond the serial framework registry.
+	rep.FullReadCache = fullReadCache.stats()
+	fullReadCache = nil
 	// The registry consumed or discarded every armed buffer. Release the
 	// shared node snapshot before the independent tail gates and claimers run.
 	candidates.streams = nil

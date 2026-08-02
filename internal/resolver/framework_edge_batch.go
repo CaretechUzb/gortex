@@ -16,14 +16,23 @@ import (
 // duplicates use last-write-wins, matching Graph.AddEdge and Graph.AddBatch.
 type frameworkEdgeBatchStore struct {
 	graph.Store
+	readCache *frameworkFullReadCache
 	staged    map[graph.EdgeIdentity]*graph.Edge
 	order     []graph.EdgeIdentity
 	orderSeen map[graph.EdgeIdentity]struct{}
 }
 
 func newFrameworkEdgeBatchStore(store graph.Store) *frameworkEdgeBatchStore {
+	return newFrameworkEdgeBatchStoreWithCache(store, nil)
+}
+
+func newFrameworkEdgeBatchStoreWithCache(
+	store graph.Store,
+	readCache *frameworkFullReadCache,
+) *frameworkEdgeBatchStore {
 	return &frameworkEdgeBatchStore{
 		Store:     store,
+		readCache: readCache,
 		staged:    make(map[graph.EdgeIdentity]*graph.Edge),
 		orderSeen: make(map[graph.EdgeIdentity]struct{}),
 	}
@@ -43,17 +52,60 @@ func (s *frameworkEdgeBatchStore) AddEdge(edge *graph.Edge) {
 	s.staged[key] = copy
 }
 
+func (s *frameworkEdgeBatchStore) AddNode(node *graph.Node) {
+	if node != nil {
+		s.readCache.invalidateNodes()
+	}
+	s.Store.AddNode(node)
+}
+
 // AddBatch is already set-oriented and may include nodes whose visibility is
 // required immediately by the rest of the synthesizer. Forward it unchanged.
 // If it supersedes an earlier staged AddEdge at the same identity, the later
 // AddBatch wins exactly as it did before this boundary existed.
 func (s *frameworkEdgeBatchStore) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+	if len(nodes) > 0 {
+		s.readCache.invalidateNodes()
+	}
+	if frameworkEdgesContainKind(edges, graph.EdgeMemberOf) {
+		s.readCache.invalidateMemberMethods()
+	}
 	for _, edge := range edges {
 		if edge != nil {
 			delete(s.staged, graph.EdgeIdentityFor(edge))
 		}
 	}
 	s.Store.AddBatch(nodes, edges)
+}
+
+func (s *frameworkEdgeBatchStore) ReindexEdge(edge *graph.Edge, oldTo string) {
+	if edge != nil && edge.Kind == graph.EdgeMemberOf {
+		s.readCache.invalidateMemberMethods()
+	}
+	s.Store.ReindexEdge(edge, oldTo)
+}
+
+func (s *frameworkEdgeBatchStore) ReindexEdges(batch []graph.EdgeReindex) {
+	for _, mutation := range batch {
+		if mutation.OldKind == graph.EdgeMemberOf ||
+			(mutation.Edge != nil && mutation.Edge.Kind == graph.EdgeMemberOf) {
+			s.readCache.invalidateMemberMethods()
+			break
+		}
+	}
+	s.Store.ReindexEdges(batch)
+}
+
+func (s *frameworkEdgeBatchStore) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
+	// A file eviction can remove declarations and member_of edges together.
+	// Clear before forwarding; a failed/no-op eviction merely loses cache hits.
+	s.readCache.invalidateNodes()
+	return s.Store.EvictFile(filePath)
+}
+
+func (s *frameworkEdgeBatchStore) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	s.readCache.invalidateNodes()
+	return s.Store.EvictRepo(repoPrefix)
 }
 
 // FindEdgesByIdentities preserves the exact-key projection through the staged
@@ -165,6 +217,9 @@ func (s *frameworkEdgeBatchStore) flush() {
 	// Do not clear before the call. If the backend panics, the panic remains
 	// observable and no later synthesizer runs; mutation receipts/errors retain
 	// the backend's native AddBatch semantics.
+	if frameworkEdgesContainKind(edges, graph.EdgeMemberOf) {
+		s.readCache.invalidateMemberMethods()
+	}
 	s.Store.AddBatch(nil, edges)
 	s.staged = make(map[graph.EdgeIdentity]*graph.Edge)
 	s.order = nil
@@ -172,7 +227,15 @@ func (s *frameworkEdgeBatchStore) flush() {
 }
 
 func runLegacyFrameworkSynth(store graph.Store, fn func(graph.Store) int) int {
-	batch := newFrameworkEdgeBatchStore(store)
+	return runLegacyFrameworkSynthWithCache(store, nil, fn)
+}
+
+func runLegacyFrameworkSynthWithCache(
+	store graph.Store,
+	readCache *frameworkFullReadCache,
+	fn func(graph.Store) int,
+) int {
+	batch := newFrameworkEdgeBatchStoreWithCache(store, readCache)
 	count := fn(batch)
 	batch.flush()
 	return count
@@ -343,33 +406,49 @@ func (s *frameworkEdgeBatchStore) FnValuePlaceholderEdges() iter.Seq[*graph.Edge
 	})
 }
 
+func (s *frameworkEdgeBatchStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
+	if s.readCache == nil {
+		return s.Store.NodesByKind(kind)
+	}
+	nodes := s.readCache.nodesByKinds([]graph.NodeKind{kind}, func(_ []graph.NodeKind) []*graph.Node {
+		var out []*graph.Node
+		for node := range s.Store.NodesByKind(kind) {
+			if node != nil {
+				out = append(out, node)
+			}
+		}
+		return out
+	})
+	return func(yield func(*graph.Node) bool) {
+		for _, node := range nodes {
+			if !yield(node) {
+				return
+			}
+		}
+	}
+}
+
 func (s *frameworkEdgeBatchStore) NodesByKinds(kinds []graph.NodeKind) []*graph.Node {
-	if scanner, ok := s.Store.(graph.NodesByKindsScanner); ok {
-		return scanner.NodesByKinds(kinds)
-	}
-	wanted := make(map[graph.NodeKind]struct{}, len(kinds))
-	seen := make(map[string]struct{})
-	var out []*graph.Node
-	for _, kind := range kinds {
-		if kind == "" {
-			continue
+	return s.readCache.nodesByKinds(kinds, func(normalized []graph.NodeKind) []*graph.Node {
+		if scanner, ok := s.Store.(graph.NodesByKindsScanner); ok {
+			return scanner.NodesByKinds(normalized)
 		}
-		if _, duplicate := wanted[kind]; duplicate {
-			continue
-		}
-		wanted[kind] = struct{}{}
-		for node := range s.NodesByKind(kind) {
-			if node == nil {
-				continue
+		seen := make(map[string]struct{})
+		var out []*graph.Node
+		for _, kind := range normalized {
+			for node := range s.Store.NodesByKind(kind) {
+				if node == nil {
+					continue
+				}
+				if _, duplicate := seen[node.ID]; duplicate {
+					continue
+				}
+				seen[node.ID] = struct{}{}
+				out = append(out, node)
 			}
-			if _, duplicate := seen[node.ID]; duplicate {
-				continue
-			}
-			seen[node.ID] = struct{}{}
-			out = append(out, node)
 		}
-	}
-	return out
+		return out
+	})
 }
 
 func (s *frameworkEdgeBatchStore) ScopeBindingNodesSeq(kinds ...graph.NodeKind) iter.Seq[graph.ScopeBindingNode] {
@@ -430,6 +509,9 @@ func (s *frameworkEdgeBatchStore) MemberMethodsByType() map[string][]graph.Membe
 		}
 	}
 	if !stagedMemberOf {
+		if methods, ok := s.readCache.memberMethodsByType(s.Store); ok {
+			return methods
+		}
 		if reader, ok := s.Store.(graph.MemberMethodsByType); ok {
 			return reader.MemberMethodsByType()
 		}
@@ -549,7 +631,11 @@ func (s *frameworkEdgeBatchStore) RemoveEdge(from, to string, kind graph.EdgeKin
 			removedStaged = true
 		}
 	}
-	return s.Store.RemoveEdge(from, to, kind) || removedStaged
+	removed := s.Store.RemoveEdge(from, to, kind) || removedStaged
+	if removed && kind == graph.EdgeMemberOf {
+		s.readCache.invalidateMemberMethods()
+	}
+	return removed
 }
 
 func (s *frameworkEdgeBatchStore) mergeEdges(
@@ -617,6 +703,15 @@ func (s *frameworkEdgeBatchStore) mergeEdgeSeq(
 			}
 		}
 	}
+}
+
+func frameworkEdgesContainKind(edges []*graph.Edge, kind graph.EdgeKind) bool {
+	for _, edge := range edges {
+		if edge != nil && edge.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func dedupeFrameworkIDs(ids []string) []string {

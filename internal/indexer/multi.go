@@ -1716,6 +1716,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		zap.Any("per_synthesizer", fwRep.Per),
 		zap.Int64("census_ms", fwRep.CensusMillis),
 		zap.Int64("scope_ms", fwRep.ScopeMillis),
+		zap.Any("full_read_cache", fwRep.FullReadCache),
 		zap.Int64("gate_ms", fwRep.GateMillis),
 		zap.Int64("claim_ms", fwRep.ClaimMillis),
 		zap.Int64("demote_ms", fwRep.DemoteMillis),
