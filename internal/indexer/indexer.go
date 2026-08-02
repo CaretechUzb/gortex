@@ -157,6 +157,14 @@ type Indexer struct {
 	// directly through the bounded graph accumulator.
 	shadowAdmission *shadowAdmissionBudget
 
+	// indexMemoryAdmission is the process-wide weighted envelope shared by full
+	// direct parses and in-memory shadows. Unlike shadowAdmission, its lease
+	// remains attached to a shadow through the disk drain, so a source-heavy
+	// direct parse cannot enter while that graph still occupies its working set.
+	// Nil selects the process-wide production budget; tests may inject a private
+	// envelope without affecting sibling Indexers.
+	indexMemoryAdmission *indexMemoryAdmissionBudget
+
 	// parseAdmission is the optional daemon-wide raw bytes-in-flight gate shared
 	// by every repository. Each Indexer keeps its private configured gate too; a
 	// file must satisfy both before its source bytes are materialised.
@@ -521,10 +529,11 @@ type contractCacheEntry struct {
 // callers.
 func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *zap.Logger) *Indexer {
 	idx := &Indexer{
-		graph:           g,
-		shadowAdmission: processShadowAdmission,
-		registry:        reg,
-		resolver:        resolver.New(g),
+		graph:                g,
+		shadowAdmission:      processShadowAdmission,
+		indexMemoryAdmission: processIndexMemoryAdmission,
+		registry:             reg,
+		resolver:             resolver.New(g),
 		// Wrap in Swappable so the auto-upgrade to Bleve at large
 		// corpus sizes can happen in a background goroutine without
 		// racing with concurrent searches. Subsequent reassignments to
@@ -2651,6 +2660,61 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	belowShadowBytes := totalFileBytes <= maxShadowBytes
 	shadowWeight := shadowAdmissionWeight(len(files), totalFileBytes)
 	shadowLocallyEligible := blOK && firstIndex && belowShadowMax && belowShadowBytes
+
+	// Reserve one process-wide, repository-scale working-set envelope before
+	// either parse path starts. The same source/structure estimate charges a
+	// direct parse and a shadow, while a fixed per-repository allowance covers
+	// parser workers and SQLite buffers. Direct parses release after their
+	// parser/batch tail; shadows keep the lease through the deferred drain below.
+	// This is intentionally separate from the nested raw/native per-file gates.
+	memoryWeight := indexMemoryAdmissionWeight(len(files), totalFileBytes)
+	memoryBudget := idx.indexMemoryAdmission
+	if memoryBudget == nil {
+		memoryBudget = processIndexMemoryAdmission
+	}
+	memoryAdmissionStarted := time.Now()
+	memoryLease, err := memoryBudget.acquire(ctx, memoryWeight)
+	if err != nil {
+		return nil, err
+	}
+	var releaseIndexMemoryAdmission func(reason string)
+	if memoryLease != nil {
+		memoryAdmittedAt := time.Now()
+		stats := memoryBudget.snapshot()
+		idx.logger.Info("indexer: memory envelope admitted",
+			zap.String("repo", idx.RepoPrefix()),
+			zap.Int("files", len(files)),
+			zap.Int64("input_bytes", totalFileBytes),
+			zap.Bool("shadow_eligible", shadowLocallyEligible),
+			zap.Int64("requested_weight_bytes", memoryWeight),
+			zap.Int64("weight_bytes", memoryLease.weight),
+			zap.Duration("waited", memoryAdmittedAt.Sub(memoryAdmissionStarted)),
+			zap.Int64("capacity_bytes", stats.capacity),
+			zap.Int64("used_bytes", stats.used),
+			zap.Int64("peak_bytes", stats.peak),
+			zap.Int("waiters", stats.waiters),
+			zap.Uint64("admissions", stats.admissions),
+			zap.Uint64("queued_admissions", stats.queued))
+		var releaseOnce sync.Once
+		releaseIndexMemoryAdmission = func(reason string) {
+			releaseOnce.Do(func() {
+				memoryLease.Release()
+				after := memoryBudget.snapshot()
+				idx.logger.Info("indexer: memory envelope released",
+					zap.String("repo", idx.RepoPrefix()),
+					zap.String("reason", reason),
+					zap.Duration("held", time.Since(memoryAdmittedAt)),
+					zap.Int64("weight_bytes", memoryLease.weight),
+					zap.Int64("used_bytes", after.used),
+					zap.Int("waiters", after.waiters),
+					zap.Uint64("queued_admissions", after.queued))
+			})
+		}
+		// Registered before the shadow drain defer. Reverse defer order keeps a
+		// successful shadow charged until every destructive batch is durable.
+		defer releaseIndexMemoryAdmission("index_exit")
+	}
+
 	admission := idx.shadowAdmission
 	if admission == nil {
 		admission = processShadowAdmission
@@ -3598,6 +3662,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// cancellation/panic/error backstop.
 	if releaseLargeDirectAdmission != nil {
 		releaseLargeDirectAdmission()
+	}
+	if releaseIndexMemoryAdmission != nil && !shadowTaken {
+		// Direct parse batches and native arenas have reached their release
+		// boundary. Returning the repository-scale weight here restores useful
+		// overlap with a shadow drain while avoiding the sustained concurrent
+		// writer pressure that starves periodic WAL checkpoints.
+		releaseIndexMemoryAdmission("direct_parse_complete")
 	}
 
 	if processed > 0 {
