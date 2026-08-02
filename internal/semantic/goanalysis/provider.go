@@ -824,7 +824,6 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	projectedUseCount = usePlan.len()
 	compilerProjectionComplete = true
 	externalNodeIDs = nil
-	bindings = nil
 
 	// Every compiler-only consumer has returned. The shared cleanup severs all
 	// aliases, conditionally reclaims the normal success path, and only then

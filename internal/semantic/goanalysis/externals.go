@@ -285,37 +285,6 @@ func (e *externalsAttribution) projectedUse(obj types.Object, nodeID string) *ex
 	return identity
 }
 
-// claimAndUpgradeStub looks for an existing edge from caller to one of the
-// resolver's stub targets for this external symbol (stdlib::, dep::, or
-// unresolved::extern::) and rewrites its To to point at the new external
-// node. Returns the rewritten edge for the caller to confirm, or nil
-// when no stub is found.
-//
-// Two passes:
-//
-//  1. Exact stub-string lookup. The parser+resolver shape for direct
-//     package calls like `fmt.Println(...)` lands as `stdlib::fmt::Println`
-//     after the resolver runs (or `unresolved::extern::fmt::Println` if
-//     resolution didn't happen yet). We replace the To with the real
-//     external node ID.
-//  2. Fuzzy line-and-name match. Method calls on external types (e.g.
-//     `os.Stdout.Write(...)`) land as `unresolved::*.Write` because the
-//     parser doesn't know `os.Stdout` resolves to the os.File receiver.
-//     The fuzzy pass scans the caller's outgoing edges at the same line
-//     and matches by trailing-name, which is enough to correctly claim
-//     the stub without bringing in line-unrelated false positives.
-//
-// Why this matters: previously the resolver wrote stub-string targets like
-// "stdlib::fmt::Println" that no node holds. Once goanalysis materialises
-// the real ext::go:fmt::Println node, leaving the stub edge in place
-// would double-count the call (one stub, one real). ReindexEdge migrates
-// the byTo bucket so find_usages on the new node returns the correct
-// caller and the stub bucket drains.
-func (e *externalsAttribution) claimAndUpgradeStub(callerID string, importPath string, obj types.Object, newTarget string, line int) *graph.Edge {
-	identity := externalUseIdentityFor(e.repoPrefix, importPath, obj)
-	return e.claimAndUpgradeProjectedStub(callerID, identity, newTarget, line)
-}
-
 func (e *externalsAttribution) claimAndUpgradeProjectedStub(callerID string, identity *externalUseIdentity, newTarget string, line int) *graph.Edge {
 	if identity == nil {
 		return nil
@@ -357,22 +326,6 @@ func (e *externalsAttribution) claimByExactTargets(callerID string, targets [3]s
 		return edge
 	}
 	return nil
-}
-
-// claimByLineAndName scans the caller's outgoing edges at line `line` for
-// any edge whose target is still a stub-string (`unresolved::`, `external::`,
-// `stdlib::`, `dep::`) and whose trailing-name matches obj.Name(). Used
-// for method calls on external types where the parser's `unresolved::*.M`
-// shape doesn't carry the import path.
-//
-// Conservative — only matches stub targets so we never overwrite a
-// resolver-confirmed real edge — and only when both line and trailing
-// name match, which together pin the use-site uniquely.
-func (e *externalsAttribution) claimByLineAndName(callerID string, obj types.Object, newTarget string, line int) *graph.Edge {
-	if obj == nil {
-		return nil
-	}
-	return e.claimByLineAndNameKind(callerID, obj.Name(), wantedEdgeKind(obj), newTarget, line)
 }
 
 func (e *externalsAttribution) claimByLineAndNameKind(callerID, name string, expected graph.EdgeKind, newTarget string, line int) *graph.Edge {
