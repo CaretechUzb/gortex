@@ -52,6 +52,18 @@ func (r *Resolver) reindexAttributionEdgesBatched(
 	// stores retain the established full-edge scanner fallback.
 	scanner, scanOK := r.graph.(graph.UnresolvedEdgeIdentityBatchScanner)
 	finder, findOK := r.graph.(graph.EdgeIdentityBatchFinder)
+	targeter, targetOK := r.graph.(graph.UnresolvedEdgeTargetBatchReindexer)
+	if scanOK && findOK && targetOK {
+		scanner.ScanUnresolvedEdgeIdentitiesBatched(
+			kinds,
+			attributionReindexBatchSize,
+			func(identities []graph.EdgeIdentity) bool {
+				r.reindexAttributionTargetsBatched(targeter, finder, identities, rewrite)
+				return true
+			},
+		)
+		return
+	}
 	if scanOK && findOK {
 		scanner.ScanUnresolvedEdgeIdentitiesBatched(
 			kinds,
@@ -72,6 +84,71 @@ func (r *Resolver) reindexAttributionEdgesBatched(
 		return true
 	})
 	collector.flush()
+}
+
+type attributionTargetCandidate struct {
+	old         graph.EdgeIdentity
+	destination graph.EdgeIdentity
+	direct      bool
+}
+
+// reindexAttributionTargetsBatched evaluates the two whole-graph attribution
+// callbacks against an identity-only edge projection. Both callbacks depend
+// only on From, To, Kind, FilePath, and Line. Unique resolved destinations can
+// therefore update only SQLite's to_id column without materializing Meta or any
+// other payload. Unsafe shapes and same-page convergence retain the exact
+// full-edge refetch path, preserving the established rewrite contract.
+func (r *Resolver) reindexAttributionTargetsBatched(
+	targeter graph.UnresolvedEdgeTargetBatchReindexer,
+	finder graph.EdgeIdentityBatchFinder,
+	identities []graph.EdgeIdentity,
+	rewrite func(*graph.Edge) string,
+) {
+	if targeter == nil || finder == nil || rewrite == nil || len(identities) == 0 {
+		return
+	}
+
+	candidates := make([]attributionTargetCandidate, 0, len(identities))
+	destinationCounts := make(map[graph.EdgeIdentity]int, len(identities))
+	for _, identity := range identities {
+		edge := graph.Edge{
+			From: identity.From, To: identity.To, Kind: identity.Kind,
+			FilePath: identity.FilePath, Line: identity.Line,
+		}
+		oldTo := rewrite(&edge)
+		if oldTo == "" {
+			continue
+		}
+		destination := graph.EdgeIdentityFor(&edge)
+		direct := oldTo == identity.To &&
+			edge.From == identity.From &&
+			edge.Kind == identity.Kind &&
+			edge.FilePath == identity.FilePath &&
+			edge.Line == identity.Line &&
+			!graph.IsUnresolvedTarget(edge.To)
+		candidates = append(candidates, attributionTargetCandidate{
+			old: identity, destination: destination, direct: direct,
+		})
+		destinationCounts[destination]++
+	}
+
+	direct := make([]graph.UnresolvedEdgeTargetReindex, 0, len(candidates))
+	fallback := make([]graph.EdgeIdentity, 0)
+	for _, candidate := range candidates {
+		if candidate.direct && destinationCounts[candidate.destination] == 1 {
+			direct = append(direct, graph.UnresolvedEdgeTargetReindex{
+				Old: candidate.old, NewTo: candidate.destination.To,
+			})
+			continue
+		}
+		fallback = append(fallback, candidate.old)
+	}
+	if len(direct) > 0 {
+		targeter.ReindexUnresolvedEdgeTargets(direct)
+	}
+	if len(fallback) > 0 {
+		r.reindexAttributionIdentitiesBatched(finder, fallback, rewrite)
+	}
 }
 
 // reindexAttributionIdentitiesBatched exact-refetches census candidates in
