@@ -1997,10 +1997,10 @@ func stripConfigArtifacts(result *parser.ExtractionResult) {
 }
 
 // isInfraOriginConfigKey reports whether a KindConfigKey node was
-// emitted by the K8s / Kustomize / Dockerfile extractors. These
-// nodes carry Meta["origin"] = "k8s" or "dockerfile" by convention.
-// The code-side extractors (Go os.Getenv, Python os.environ, viper,
-// struct-tag, …) leave Meta["origin"] empty.
+// emitted by the K8s / Kustomize / Dockerfile / Terraform extractors.
+// These nodes carry Meta["origin"] = "k8s", "dockerfile", or
+// "terraform" by convention. The code-side extractors (Go os.Getenv,
+// Python os.environ, viper, struct-tag, …) leave Meta["origin"] empty.
 // isMigrationOriginNode reports whether a node was emitted by migration /
 // live-DB DDL extraction (Meta["origin"]=="migration"). These schema nodes
 // are high-signal and survive the sql-domain strip — the gate only removes
@@ -2018,7 +2018,7 @@ func isInfraOriginConfigKey(n *graph.Node) bool {
 		return false
 	}
 	origin, _ := n.Meta["origin"].(string)
-	return origin == "k8s" || origin == "dockerfile"
+	return origin == "k8s" || origin == "dockerfile" || origin == "terraform"
 }
 
 // isDocFrontmatterConfigKey reports whether a KindConfigKey node is a

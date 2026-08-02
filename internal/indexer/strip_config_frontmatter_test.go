@@ -23,6 +23,7 @@ func TestStripConfigArtifacts_PreservesDocFrontmatter(t *testing.T) {
 			{ID: "cfg::env::AWS_SECRET", Kind: graph.KindConfigKey, Name: "AWS_SECRET", Meta: map[string]any{"source": "env"}},
 			{ID: "report.qmd::cfg:title", Kind: graph.KindConfigKey, Name: "title", Meta: map[string]any{"source": "quarto_frontmatter"}},
 			{ID: "k8s::cfg::REPLICAS", Kind: graph.KindConfigKey, Name: "REPLICAS", Meta: map[string]any{"origin": "k8s"}},
+			{ID: "cfg::env::MAX_BATCH_SIZE", Kind: graph.KindConfigKey, Name: "MAX_BATCH_SIZE", Meta: map[string]any{"origin": "terraform", "source": "env"}},
 			{ID: "report.qmd", Kind: graph.KindFile, Name: "report.qmd"},
 		},
 		Edges: []*graph.Edge{
@@ -48,6 +49,9 @@ func TestStripConfigArtifacts_PreservesDocFrontmatter(t *testing.T) {
 	}
 	if !has("k8s::cfg::REPLICAS") {
 		t.Error("infra-origin config key must survive the strip")
+	}
+	if !has("cfg::env::MAX_BATCH_SIZE") {
+		t.Error("terraform-origin config key must survive the strip")
 	}
 
 	defines, reads := 0, 0
@@ -96,5 +100,36 @@ Some prose.
 	}
 	if len(g.FindNodesByName("format")) == 0 {
 		t.Error("quarto frontmatter key 'format' missing from default-config index")
+	}
+}
+
+// TestIndex_TerraformConfigKeySurvivesDefaultConfig is the end-to-end guard
+// for U2: indexing a .tf file with the default config (configs domain off)
+// still yields the Terraform-origin config-key node, the same way K8s- and
+// Dockerfile-origin nodes already do.
+func TestIndex_TerraformConfigKeySurvivesDefaultConfig(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "lambda.tf"), `resource "aws_lambda_function" "processor" {
+  function_name = "processor"
+
+  environment {
+    variables = {
+      MAX_BATCH_SIZE = "100"
+    }
+  }
+}
+`)
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewHCLExtractor())
+	cfg := config.Default().Index
+	cfg.Workers = 2
+
+	g := graph.New()
+	idx := New(g, reg, cfg, zap.NewNop())
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	if len(g.FindNodesByName("MAX_BATCH_SIZE")) == 0 {
+		t.Error("terraform-origin config key 'MAX_BATCH_SIZE' missing from default-config index")
 	}
 }
