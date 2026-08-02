@@ -4033,8 +4033,20 @@ type RepoMemoryEstimate struct {
 	EdgeCount int    `json:"edge_count"`
 }
 
-// Total returns the sum of NodeBytes and EdgeBytes.
-func (e RepoMemoryEstimate) Total() uint64 { return e.NodeBytes + e.EdgeBytes }
+// Total returns the saturating sum of NodeBytes and EdgeBytes. Saturation keeps
+// an extreme or synthetic estimate conservative instead of wrapping back to a
+// small value and bypassing memory-pressure admission.
+func (e RepoMemoryEstimate) Total() uint64 {
+	return saturatingAddUint64(e.NodeBytes, e.EdgeBytes)
+}
+
+func saturatingAddUint64(total, next uint64) uint64 {
+	const maxUint64 = ^uint64(0)
+	if total > maxUint64-next {
+		return maxUint64
+	}
+	return total + next
+}
 
 // per-node fixed overhead: the struct header plus the amortised cost
 // of the pointers held by byRepo/byFile/byName/byQual secondary
@@ -4063,9 +4075,9 @@ func (g *Graph) RepoMemoryEstimate(repoPrefix string) RepoMemoryEstimate {
 
 	var est RepoMemoryEstimate
 	for _, s := range g.shards {
-		est.NodeBytes += s.repoNodeBytes[repoPrefix]
+		est.NodeBytes = saturatingAddUint64(est.NodeBytes, s.repoNodeBytes[repoPrefix])
 		est.NodeCount += s.repoNodeCount[repoPrefix]
-		est.EdgeBytes += s.repoEdgeBytes[repoPrefix]
+		est.EdgeBytes = saturatingAddUint64(est.EdgeBytes, s.repoEdgeBytes[repoPrefix])
 		est.EdgeCount += s.repoEdgeCount[repoPrefix]
 	}
 	return est
@@ -4083,13 +4095,13 @@ func (g *Graph) AllRepoMemoryEstimates() map[string]RepoMemoryEstimate {
 	for _, s := range g.shards {
 		for prefix, bytes := range s.repoNodeBytes {
 			est := out[prefix]
-			est.NodeBytes += bytes
+			est.NodeBytes = saturatingAddUint64(est.NodeBytes, bytes)
 			est.NodeCount += s.repoNodeCount[prefix]
 			out[prefix] = est
 		}
 		for prefix, bytes := range s.repoEdgeBytes {
 			est := out[prefix]
-			est.EdgeBytes += bytes
+			est.EdgeBytes = saturatingAddUint64(est.EdgeBytes, bytes)
 			est.EdgeCount += s.repoEdgeCount[prefix]
 			out[prefix] = est
 		}

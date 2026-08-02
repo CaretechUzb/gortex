@@ -91,6 +91,22 @@ func indexMemoryAdmissionWeight(fileCount int, inputBytes int64) int64 {
 	return weight + indexMemoryAdmissionRepoOverhead
 }
 
+// saturatingAddByteCount accumulates non-negative byte counts without allowing
+// an extreme corpus to wrap an admission estimate back to a small value.
+func saturatingAddByteCount(total, next int64) int64 {
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if total < 0 {
+		total = 0
+	}
+	if next <= 0 {
+		return total
+	}
+	if total > maxInt64-next {
+		return maxInt64
+	}
+	return total + next
+}
+
 func (budget *indexMemoryAdmissionBudget) acquire(
 	ctx context.Context,
 	weight int64,

@@ -167,6 +167,12 @@ func TestIndexMemoryAdmissionConfigurationAndSaturation(t *testing.T) {
 	if got := indexMemoryAdmissionWeight(math.MaxInt, math.MaxInt64); got != math.MaxInt64 {
 		t.Fatalf("saturated weight = %d, want %d", got, int64(math.MaxInt64))
 	}
+	if got := saturatingAddByteCount(math.MaxInt64-1, 2); got != math.MaxInt64 {
+		t.Fatalf("saturated byte sum = %d, want %d", got, int64(math.MaxInt64))
+	}
+	if got := saturatingAddByteCount(-1, 7); got != 7 {
+		t.Fatalf("negative byte sum recovery = %d, want 7", got)
+	}
 	if got := newIndexMemoryAdmissionBudget(-1).snapshot().capacity; got != 0 {
 		t.Fatalf("negative capacity = %d, want 0", got)
 	}

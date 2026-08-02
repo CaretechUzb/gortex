@@ -2654,7 +2654,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// post-parse graph in RAM and OOMing (see #120).
 	var totalFileBytes int64
 	for i := range files {
-		totalFileBytes += files[i].size
+		totalFileBytes = saturatingAddByteCount(totalFileBytes, files[i].size)
 	}
 	maxShadowBytes := shadowMaxBytes()
 	belowShadowBytes := totalFileBytes <= maxShadowBytes
