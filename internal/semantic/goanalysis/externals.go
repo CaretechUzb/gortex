@@ -33,17 +33,30 @@ const modulePathStdlib = "stdlib"
 //     packages too.
 //   - moduleByPath: import path → KindModule node ID. Cached so the
 //     stdlib (and each dep module) materialises at most once per pass.
-//   - extByObj: types.Object → external node ID. Caches lookups across
-//     multiple Uses of the same external symbol.
+//   - knownNodeIDs: canonical external node IDs, avoiding retention of
+//     go/types objects (and their package/type graphs) across the long apply.
 //
 // Statistics counters surface back through ExternalsResult so the caller
 // can report nodes/edges added.
+// externalUseIdentity is the string-only projection needed while applying one
+// external compiler use. A pass interns it by canonical external node ID, so
+// hundreds of thousands of Uses neither retain types.Object package graphs nor
+// repeatedly allocate the same three resolver-stub targets.
+type externalUseIdentity struct {
+	name        string
+	kind        graph.EdgeKind
+	stubTargets [3]string
+}
+
 type externalsAttribution struct {
 	g            graph.Store
 	pkgByPath    map[string]*packages.Package
 	moduleByPath map[string]string
-	extByObj     map[types.Object]string
-	provider     string
+	// extByObj is a projection-only accelerator. It is cleared together with
+	// pkgByPath before graph apply, so types.Object never crosses that boundary.
+	extByObj    map[types.Object]string
+	useByNodeID map[string]*externalUseIdentity
+	provider    string
 
 	// repoPrefix is the owning repo's prefix, used to namespace stub
 	// IDs (graph.StubID). Empty when the caller doesn't supply one
@@ -113,6 +126,7 @@ func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider,
 		pkgByPath:    pkgByPath,
 		moduleByPath: make(map[string]string),
 		extByObj:     make(map[types.Object]string),
+		useByNodeID:  make(map[string]*externalUseIdentity),
 		provider:     provider,
 		repoPrefix:   repoPrefix,
 		knownNodeIDs: make(map[string]struct{}),
@@ -241,6 +255,30 @@ func (e *externalsAttribution) resolveSymbol(obj types.Object) string {
 	return nodeID
 }
 
+// releaseCompilerReferences ends the projection lifetime. The graph apply uses
+// only interned string identities and pending graph mutations from this point.
+func (e *externalsAttribution) releaseCompilerReferences() {
+	e.extByObj = nil
+	e.pkgByPath = nil
+}
+
+// projectedUse interns the compact, string-only facts needed by the graph
+// apply. The cache key is the canonical external node ID, never types.Object,
+// so it cannot pin dependency package scopes after compiler projection.
+func (e *externalsAttribution) projectedUse(obj types.Object, nodeID string) *externalUseIdentity {
+	if identity := e.useByNodeID[nodeID]; identity != nil {
+		return identity
+	}
+	if obj == nil || obj.Pkg() == nil {
+		return nil
+	}
+	identity := externalUseIdentityFor(e.repoPrefix, obj.Pkg().Path(), obj)
+	if identity != nil {
+		e.useByNodeID[nodeID] = identity
+	}
+	return identity
+}
+
 // claimAndUpgradeStub looks for an existing edge from caller to one of the
 // resolver's stub targets for this external symbol (stdlib::, dep::, or
 // unresolved::extern::) and rewrites its To to point at the new external
@@ -268,10 +306,18 @@ func (e *externalsAttribution) resolveSymbol(obj types.Object) string {
 // the byTo bucket so find_usages on the new node returns the correct
 // caller and the stub bucket drains.
 func (e *externalsAttribution) claimAndUpgradeStub(callerID string, importPath string, obj types.Object, newTarget string, line int) *graph.Edge {
-	if edge := e.claimByExactStub(callerID, importPath, obj, newTarget); edge != nil {
+	identity := externalUseIdentityFor(e.repoPrefix, importPath, obj)
+	return e.claimAndUpgradeProjectedStub(callerID, identity, newTarget, line)
+}
+
+func (e *externalsAttribution) claimAndUpgradeProjectedStub(callerID string, identity *externalUseIdentity, newTarget string, line int) *graph.Edge {
+	if identity == nil {
+		return nil
+	}
+	if edge := e.claimByExactTargets(callerID, identity.stubTargets, identity.kind, newTarget); edge != nil {
 		return edge
 	}
-	if edge := e.claimByLineAndName(callerID, obj, newTarget, line); edge != nil {
+	if edge := e.claimByLineAndNameKind(callerID, identity.name, identity.kind, newTarget, line); edge != nil {
 		return edge
 	}
 	return nil
@@ -280,12 +326,18 @@ func (e *externalsAttribution) claimAndUpgradeStub(callerID string, importPath s
 // claimByExactStub handles the canonical resolver-shaped targets. Pulled
 // out so the fuzzy pass can layer on top.
 func (e *externalsAttribution) claimByExactStub(callerID string, importPath string, obj types.Object, newTarget string) *graph.Edge {
+	identity := externalUseIdentityFor(e.repoPrefix, importPath, obj)
+	if identity == nil {
+		return nil
+	}
+	return e.claimByExactTargets(callerID, identity.stubTargets, identity.kind, newTarget)
+}
+
+func (e *externalsAttribution) claimByExactTargets(callerID string, targets [3]string, kind graph.EdgeKind, newTarget string) *graph.Edge {
 	if e.edgeCandidates == nil {
 		return nil
 	}
-	candidates := stubEdgeTargets(e.repoPrefix, importPath, obj)
-	kind := wantedEdgeKind(obj)
-	for _, target := range candidates {
+	for _, target := range targets {
 		edge := e.edgeCandidates.EndpointKind(callerID, target, kind)
 		if edge == nil {
 			continue
@@ -311,14 +363,16 @@ func (e *externalsAttribution) claimByExactStub(callerID string, importPath stri
 // resolver-confirmed real edge — and only when both line and trailing
 // name match, which together pin the use-site uniquely.
 func (e *externalsAttribution) claimByLineAndName(callerID string, obj types.Object, newTarget string, line int) *graph.Edge {
-	if line <= 0 || e.edgeCandidates == nil {
+	if obj == nil {
 		return nil
 	}
-	name := obj.Name()
-	if name == "" {
+	return e.claimByLineAndNameKind(callerID, obj.Name(), wantedEdgeKind(obj), newTarget, line)
+}
+
+func (e *externalsAttribution) claimByLineAndNameKind(callerID, name string, expected graph.EdgeKind, newTarget string, line int) *graph.Edge {
+	if line <= 0 || name == "" || e.edgeCandidates == nil {
 		return nil
 	}
-	expected := wantedEdgeKind(obj)
 	candidates := e.edgeCandidates.Site(callerID, line, expected)
 	for _, edge := range candidates {
 		if edge.Line != line {
@@ -556,17 +610,26 @@ func (e *externalsAttribution) drainPendingReindexes() []graph.EdgeReindex {
 // `stdlib::fmt::Errorf` node. An empty repoPrefix yields the legacy
 // un-prefixed form, which the resolver still emits today.
 func stubEdgeTargets(repoPrefix, importPath string, obj types.Object) []string {
-	if obj == nil {
+	identity := externalUseIdentityFor(repoPrefix, importPath, obj)
+	if identity == nil {
+		return nil
+	}
+	return identity.stubTargets[:]
+}
+
+func externalUseIdentityFor(repoPrefix, importPath string, obj types.Object) *externalUseIdentity {
+	if obj == nil || importPath == "" || obj.Name() == "" {
 		return nil
 	}
 	name := obj.Name()
-	if name == "" {
-		return nil
-	}
-	return []string{
-		graph.StubID(repoPrefix, graph.StubKindStdlib, importPath, name),
-		"dep::" + importPath + "::" + name,
-		"unresolved::extern::" + importPath + "::" + name,
+	return &externalUseIdentity{
+		name: name,
+		kind: wantedEdgeKind(obj),
+		stubTargets: [3]string{
+			graph.StubID(repoPrefix, graph.StubKindStdlib, importPath, name),
+			"dep::" + importPath + "::" + name,
+			"unresolved::extern::" + importPath + "::" + name,
+		},
 	}
 }
 
