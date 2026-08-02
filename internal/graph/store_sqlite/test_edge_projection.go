@@ -2,20 +2,40 @@ package store_sqlite
 
 import (
 	"database/sql"
+	"encoding/json"
+	"sort"
 
 	"github.com/zzet/gortex/internal/graph"
 )
 
-const defaultTestProjectionPageSize = scopedProjectionPage
+const (
+	// Projection rows contain only identifiers and source locations. A 4096-row
+	// page stays bounded while amortizing cursor setup across the whole-graph
+	// node and annotation censuses.
+	defaultTestProjectionPageSize = 4096
+	maxTestProjectionPageSize     = 4096
+	defaultTestCallSourceBatch    = 512
+	maxTestCallSourceBatch        = 4096
+)
 
 func boundedTestProjectionPageSize(pageSize int) int {
-	if pageSize <= 0 || pageSize > scopedProjectionPage {
+	if pageSize <= 0 {
 		return defaultTestProjectionPageSize
 	}
-	return pageSize
+	return min(pageSize, maxTestProjectionPageSize)
 }
 
-var _ graph.TestProjectionScanner = (*Store)(nil)
+func boundedTestCallSourceBatchSize(batchSize int) int {
+	if batchSize <= 0 {
+		return defaultTestCallSourceBatch
+	}
+	return min(batchSize, maxTestCallSourceBatch)
+}
+
+var (
+	_ graph.TestProjectionScanner     = (*Store)(nil)
+	_ graph.TestCallProjectionScanner = (*Store)(nil)
+)
 
 // ScanTestNodeProjections pages metadata-free node rows by the WITHOUT ROWID
 // primary key. For a fixed kind, nodes_by_kind implicitly carries the primary
@@ -90,8 +110,8 @@ LIMIT ?`, kind, after, highWater.String, pageSize)
 }
 
 // ScanTestEdgeProjections pages only the endpoint/location columns consumed by
-// annotation classification and EdgeTests synthesis. The frozen integer
-// high-water mark excludes rows inserted by a callback from the current pass.
+// annotation classification. The frozen integer high-water mark excludes rows
+// inserted by a callback from the current pass.
 func (s *Store) ScanTestEdgeProjections(kinds []graph.EdgeKind, pageSize int, yield func([]graph.TestEdgeProjection) bool) {
 	if yield == nil {
 		return
@@ -154,6 +174,95 @@ LIMIT ?`, kind, after, highWater.Int64, pageSize)
 				break
 			}
 			after = last
+		}
+	}
+}
+
+const testCallProjectionSQL = `
+WITH requested(from_id) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+)
+SELECT e.from_id, e.to_id, e.file_path, e.line
+FROM requested AS r
+CROSS JOIN edges AS e INDEXED BY edges_by_from
+WHERE e.from_id = r.from_id
+  AND e.kind = ?
+  AND e.id <= ?
+ORDER BY e.from_id, e.id`
+
+// ScanTestCallProjections projects calls only from known test symbols. Source
+// IDs are deduplicated and queried in bounded batches through
+// edges_by_from(from_id, kind); no edge metadata crosses the driver. Each
+// cursor is fully closed before its compact results are yielded, and a frozen
+// high-water mark keeps callback writes out of the current scan.
+func (s *Store) ScanTestCallProjections(sourceIDs []string, sourceBatchSize, pageSize int, yield func([]graph.TestEdgeProjection) bool) {
+	if yield == nil || len(sourceIDs) == 0 {
+		return
+	}
+	sourceBatchSize = boundedTestCallSourceBatchSize(sourceBatchSize)
+	pageSize = boundedTestProjectionPageSize(pageSize)
+
+	seen := make(map[string]struct{}, len(sourceIDs))
+	sources := make([]string, 0, len(sourceIDs))
+	for _, sourceID := range sourceIDs {
+		if sourceID == "" {
+			continue
+		}
+		if _, duplicate := seen[sourceID]; duplicate {
+			continue
+		}
+		seen[sourceID] = struct{}{}
+		sources = append(sources, sourceID)
+	}
+	if len(sources) == 0 {
+		return
+	}
+	sort.Strings(sources)
+
+	var highWater sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MAX(id) FROM edges WHERE kind = ?`, graph.EdgeCalls).Scan(&highWater); err != nil {
+		panicOnFatal(err)
+		return
+	}
+	if !highWater.Valid || highWater.Int64 <= 0 {
+		return
+	}
+
+	for start := 0; start < len(sources); start += sourceBatchSize {
+		end := min(start+sourceBatchSize, len(sources))
+		payload, err := json.Marshal(sources[start:end])
+		if err != nil {
+			panicOnFatal(err)
+			return
+		}
+		rows, err := s.db.Query(testCallProjectionSQL, string(payload), graph.EdgeCalls, highWater.Int64)
+		if err != nil {
+			panicOnFatal(err)
+			return
+		}
+		projected := make([]graph.TestEdgeProjection, 0, pageSize)
+		for rows.Next() {
+			var row graph.TestEdgeProjection
+			if err := rows.Scan(&row.From, &row.To, &row.FilePath, &row.Line); err != nil {
+				_ = rows.Close()
+				panicOnFatal(err)
+				return
+			}
+			row.Kind = graph.EdgeCalls
+			projected = append(projected, row)
+		}
+		rowsErr := rows.Err()
+		_ = rows.Close()
+		if rowsErr != nil {
+			panicOnFatal(rowsErr)
+			return
+		}
+
+		for pageStart := 0; pageStart < len(projected); pageStart += pageSize {
+			pageEnd := min(pageStart+pageSize, len(projected))
+			if !yield(projected[pageStart:pageEnd]) {
+				return
+			}
 		}
 	}
 }

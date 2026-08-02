@@ -12,7 +12,11 @@ import (
 // call; this cap bounds the Go-side adjacency retained by this whole-graph pass.
 const (
 	testMetadataLookupBatchSize = 512
-	testProjectionPageSize      = 256
+	// Projection rows are compact identifiers/source locations. 4096 amortizes
+	// cursor setup while bounding callback working sets; call-source batches stay
+	// lower because a single source may have high fan-out.
+	testProjectionPageSize  = 4096
+	testCallSourceBatchSize = 512
 )
 
 // markTestSymbolsAndEmitEdges runs after the resolver and before
@@ -714,7 +718,18 @@ func emitTestEdgesAndPersistLocked(g graph.Store, testNodes map[string]bool, cha
 		}
 	}
 	if changedPrefixes == nil {
-		if scanner, ok := g.(graph.TestProjectionScanner); ok {
+		if scanner, ok := g.(graph.TestCallProjectionScanner); ok {
+			sourceIDs := make([]string, 0, len(testNodes))
+			for sourceID := range testNodes {
+				sourceIDs = append(sourceIDs, sourceID)
+			}
+			scanner.ScanTestCallProjections(sourceIDs, testCallSourceBatchSize, testProjectionPageSize, func(rows []graph.TestEdgeProjection) bool {
+				for _, row := range rows {
+					processFields(row.From, row.To, row.FilePath, row.Line)
+				}
+				return true
+			})
+		} else if scanner, ok := g.(graph.TestProjectionScanner); ok {
 			scanner.ScanTestEdgeProjections([]graph.EdgeKind{graph.EdgeCalls}, testProjectionPageSize, func(rows []graph.TestEdgeProjection) bool {
 				for _, row := range rows {
 					if row.Kind == graph.EdgeCalls {

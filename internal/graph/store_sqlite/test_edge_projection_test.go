@@ -3,7 +3,10 @@ package store_sqlite
 import (
 	"fmt"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 
@@ -11,10 +14,18 @@ import (
 )
 
 func TestBoundedTestProjectionPageSize(t *testing.T) {
-	for _, input := range []int{-1, 0, scopedProjectionPage + 1, 1 << 30} {
+	for _, input := range []int{-1, 0} {
 		if got := boundedTestProjectionPageSize(input); got != defaultTestProjectionPageSize {
 			t.Fatalf("bounded page size(%d) = %d, want %d", input, got, defaultTestProjectionPageSize)
 		}
+	}
+	for _, input := range []int{maxTestProjectionPageSize + 1, 1 << 30} {
+		if got := boundedTestProjectionPageSize(input); got != maxTestProjectionPageSize {
+			t.Fatalf("bounded page size(%d) = %d, want %d", input, got, maxTestProjectionPageSize)
+		}
+	}
+	if got := boundedTestProjectionPageSize(scopedProjectionPage + 1); got != scopedProjectionPage+1 {
+		t.Fatalf("bounded page size(%d) = %d, want independent test-projection cap", scopedProjectionPage+1, got)
 	}
 	if got := boundedTestProjectionPageSize(17); got != 17 {
 		t.Fatalf("bounded page size(17) = %d, want 17", got)
@@ -94,6 +105,106 @@ func TestScanTestProjectionsPageAndFreezeHighWater(t *testing.T) {
 	}
 }
 
+func newTestProjectionStore(tb testing.TB) *Store {
+	tb.Helper()
+	store, err := Open(filepath.Join(tb.TempDir(), "graph.db"))
+	if err != nil {
+		tb.Fatalf("open sqlite store: %v", err)
+	}
+	tb.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			tb.Errorf("close sqlite store: %v", err)
+		}
+	})
+	return store
+}
+
+func sortTestEdgeProjections(rows []graph.TestEdgeProjection) {
+	sort.Slice(rows, func(i, j int) bool {
+		left, right := rows[i], rows[j]
+		if left.From != right.From {
+			return left.From < right.From
+		}
+		if left.To != right.To {
+			return left.To < right.To
+		}
+		if left.FilePath != right.FilePath {
+			return left.FilePath < right.FilePath
+		}
+		if left.Line != right.Line {
+			return left.Line < right.Line
+		}
+		return left.Kind < right.Kind
+	})
+}
+
+func TestScanTestCallProjectionsMatchesWholeCallFilter(t *testing.T) {
+	store := newTestProjectionStore(t)
+	store.AddBatch(nil, []*graph.Edge{
+		{From: "test/a", To: "prod/one", Kind: graph.EdgeCalls, FilePath: "a_test.go", Line: 10},
+		{From: "prod/helper", To: "prod/one", Kind: graph.EdgeCalls, FilePath: "helper.go", Line: 20},
+		{From: "test/b", To: "test/a", Kind: graph.EdgeCalls, FilePath: "b_test.go", Line: 30},
+		{From: "test/a", To: "prod/two", Kind: graph.EdgeCalls, FilePath: "a_test.go", Line: 40},
+		{From: "test/b", To: "prod/two", Kind: graph.EdgeCalls, FilePath: "b_test.go", Line: 50},
+		{From: "test/a", To: "annotation", Kind: graph.EdgeAnnotated, FilePath: "a_test.go", Line: 60},
+	})
+
+	testSources := map[string]bool{"test/a": true, "test/b": true}
+	var want []graph.TestEdgeProjection
+	store.ScanTestEdgeProjections([]graph.EdgeKind{graph.EdgeCalls}, 2, func(rows []graph.TestEdgeProjection) bool {
+		for _, row := range rows {
+			if testSources[row.From] {
+				want = append(want, row)
+			}
+		}
+		return true
+	})
+
+	var got []graph.TestEdgeProjection
+	store.ScanTestCallProjections([]string{"test/b", "", "missing", "test/a", "test/b"}, 1, 1, func(rows []graph.TestEdgeProjection) bool {
+		if len(rows) > 1 {
+			t.Fatalf("projection page has %d rows, want at most 1", len(rows))
+		}
+		got = append(got, rows...)
+		return true
+	})
+
+	sortTestEdgeProjections(want)
+	sortTestEdgeProjections(got)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("source projection differs from whole-kind filter:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestScanTestCallProjectionsFreezesHighWaterAndAllowsReentry(t *testing.T) {
+	store := newTestProjectionStore(t)
+	store.AddBatch(nil, []*graph.Edge{
+		{From: "test/a", To: "prod/one", Kind: graph.EdgeCalls, FilePath: "a_test.go", Line: 10},
+		{From: "test/b", To: "prod/two", Kind: graph.EdgeCalls, FilePath: "b_test.go", Line: 20},
+	})
+
+	firstPage := true
+	var got []graph.TestEdgeProjection
+	store.ScanTestCallProjections([]string{"test/b", "test/a"}, 1, 1, func(rows []graph.TestEdgeProjection) bool {
+		got = append(got, rows...)
+		if firstPage {
+			firstPage = false
+			if out := store.GetOutEdges("test/a"); len(out) != 1 {
+				t.Fatalf("re-entrant adjacency read returned %d edges, want 1", len(out))
+			}
+			store.AddBatch(nil, []*graph.Edge{{
+				From: "test/b", To: "prod/late", Kind: graph.EdgeCalls, FilePath: "b_test.go", Line: 99,
+			}})
+		}
+		return true
+	})
+
+	sortTestEdgeProjections(got)
+	if len(got) != 2 || got[0].Line != 10 || got[1].Line != 20 {
+		t.Fatalf("scan observed callback write or lost initial rows: %#v", got)
+	}
+}
+
 func BenchmarkTestCallEdgeProjection(b *testing.B) {
 	store, err := Open(filepath.Join(b.TempDir(), "projection-bench.sqlite"))
 	if err != nil {
@@ -149,5 +260,67 @@ func BenchmarkTestCallEdgeProjection(b *testing.B) {
 			}
 		}
 		b.ReportMetric(rowCount-1, "rows/op")
+	})
+}
+
+func BenchmarkTestCallSourceProjection(b *testing.B) {
+	store := newTestProjectionStore(b)
+	const (
+		sourceCount  = 10_000
+		callsPerNode = 5
+		selected     = 64
+	)
+	edges := make([]*graph.Edge, 0, sourceCount*callsPerNode)
+	for source := 0; source < sourceCount; source++ {
+		from := fmt.Sprintf("source/%05d", source)
+		for call := 0; call < callsPerNode; call++ {
+			edges = append(edges, &graph.Edge{
+				From: from, To: fmt.Sprintf("target/%02d", call), Kind: graph.EdgeCalls,
+				FilePath: fmt.Sprintf("repo/file_%05d.go", source), Line: call + 1,
+			})
+		}
+	}
+	store.AddBatch(nil, edges)
+
+	sourceIDs := make([]string, 0, selected)
+	selectedSet := make(map[string]bool, selected)
+	for source := 0; source < selected; source++ {
+		id := fmt.Sprintf("source/%05d", source)
+		sourceIDs = append(sourceIDs, id)
+		selectedSet[id] = true
+	}
+
+	b.Run("whole_calls_then_filter", func(b *testing.B) {
+		b.ReportAllocs()
+		var candidates, matched int
+		b.ResetTimer()
+		for range b.N {
+			store.ScanTestEdgeProjections([]graph.EdgeKind{graph.EdgeCalls}, 4096, func(rows []graph.TestEdgeProjection) bool {
+				candidates += len(rows)
+				for _, row := range rows {
+					if selectedSet[row.From] {
+						matched++
+					}
+				}
+				return true
+			})
+		}
+		b.ReportMetric(float64(candidates)/float64(b.N), "candidate_rows/op")
+		b.ReportMetric(float64(matched)/float64(b.N), "matched_rows/op")
+		runtime.KeepAlive(matched)
+	})
+
+	b.Run("known_test_sources", func(b *testing.B) {
+		b.ReportAllocs()
+		var candidates int
+		b.ResetTimer()
+		for range b.N {
+			store.ScanTestCallProjections(sourceIDs, 512, 4096, func(rows []graph.TestEdgeProjection) bool {
+				candidates += len(rows)
+				return true
+			})
+		}
+		b.ReportMetric(float64(candidates)/float64(b.N), "candidate_rows/op")
+		runtime.KeepAlive(candidates)
 	})
 }

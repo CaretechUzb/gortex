@@ -30,3 +30,12 @@ type TestProjectionScanner interface {
 	ScanTestNodeProjections(kinds []NodeKind, pageSize int, yield func([]TestNodeProjection) bool)
 	ScanTestEdgeProjections(kinds []EdgeKind, pageSize int, yield func([]TestEdgeProjection) bool)
 }
+
+// TestCallProjectionScanner is the optional source-driven fast path for
+// EdgeCalls -> EdgeTests synthesis. Implementations must freeze a high-water
+// mark before scanning, bound both source and output pages, and close each
+// backing cursor before invoking yield so callbacks may safely re-enter the
+// store.
+type TestCallProjectionScanner interface {
+	ScanTestCallProjections(sourceIDs []string, sourceBatchSize, pageSize int, yield func([]TestEdgeProjection) bool)
+}
