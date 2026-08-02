@@ -19,7 +19,7 @@ type admissionBulkStore struct {
 func (*admissionBulkStore) BeginBulkLoad()   {}
 func (*admissionBulkStore) FlushBulk() error { return nil }
 
-func TestLargeDirectParseAdmissionWeightPreservesBoundedParallelism(t *testing.T) {
+func TestLargeDirectParseAdmissionWeightClassifiesLargeWork(t *testing.T) {
 	memoryStore := graph.New()
 	durableStore := &admissionBulkStore{Store: graph.New()}
 
@@ -56,43 +56,40 @@ func TestLargeDirectParseAdmissionWeightPreservesBoundedParallelism(t *testing.T
 	}
 }
 
-func TestLargeDirectAdmissionAllowsOneLightAlongsideNativePressure(t *testing.T) {
+func TestLargeDirectAdmissionSerializesLightBehindNativePressure(t *testing.T) {
 	budget := newLargeDirectAdmissionBudget(largeDirectAdmissionCapacity)
 	pressure, err := budget.acquire(t.Context(), largeDirectNativePressureWeight)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pressure.Release()
 
-	light, err := budget.acquire(t.Context(), largeDirectLightweightParseWeight)
-	if err != nil {
-		t.Fatalf("light parse did not overlap native pressure: %v", err)
-	}
-
-	blocked := make(chan *largeDirectAdmissionLease, 1)
+	lightResult := make(chan *largeDirectAdmissionLease, 1)
 	go func() {
 		lease, _ := budget.acquire(t.Context(), largeDirectLightweightParseWeight)
-		blocked <- lease
+		lightResult <- lease
 	}()
 	waitForLargeDirectAdmission(t, budget, func(stats largeDirectAdmissionStats) bool {
 		return stats.used == largeDirectAdmissionCapacity && stats.waiters == 1
 	})
 	select {
-	case lease := <-blocked:
+	case lease := <-lightResult:
 		lease.Release()
-		t.Fatal("second light parse exceeded bounded overlap")
+		t.Fatal("light parse overlapped native-pressure direct parse")
 	default:
 	}
 
-	light.Release()
+	pressure.Release()
 	select {
-	case lease := <-blocked:
+	case lease := <-lightResult:
 		if lease == nil {
 			t.Fatal("queued light parse was not granted")
 		}
 		lease.Release()
 	case <-time.After(2 * time.Second):
-		t.Fatal("queued light parse did not enter after permit release")
+		t.Fatal("queued light parse did not enter after pressure release")
+	}
+	if stats := budget.snapshot(); stats.used != 0 || stats.waiters != 0 || stats.peak != largeDirectAdmissionCapacity {
+		t.Fatalf("unexpected final stats: %+v", stats)
 	}
 }
 

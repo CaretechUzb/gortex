@@ -20,14 +20,6 @@ const (
 	// bytes, so reserve a small fixed amount for that unmodelled phase state.
 	indexMemoryAdmissionRepoOverhead int64 = 64 << 20
 
-	// Direct-to-durable-store parses retain only bounded raw/native worker state
-	// and a 32 MiB graph batch; cumulative non-native source bytes are never
-	// resident together. Keep a conservative repository floor for SQLite,
-	// parser workers, and batch buffers, then add corpus-scale C-family pressure
-	// below. The sealed cold profile measured a 0.35 GiB RSS increment for the
-	// 2.17 GiB JSON/config corpus this floor is intended to represent.
-	directIndexMemoryAdmissionFloorBytes int64 = 320 << 20
-
 	// A pressure-sized head waiter may be temporarily bypassed by fitting small
 	// repositories, but only this many times. Once spent, new work queues until
 	// the head can enter, bounding starvation while preserving otherwise-idle
@@ -105,17 +97,13 @@ func indexMemoryAdmissionWeight(fileCount int, inputBytes int64) int64 {
 	return weight + indexMemoryAdmissionRepoOverhead
 }
 
-// directIndexMemoryAdmissionWeight charges only C-family source that can
-// accumulate native allocator high-water across a direct parse. Every other
-// source/result is bounded by the per-file gates and parseGraphBatch limits, so
-// charging cumulative repository bytes would serialize large but lightweight
-// corpora even though those bytes are never resident together.
-func directIndexMemoryAdmissionWeight(nativeFileCount int, nativeInputBytes int64) int64 {
-	weight := indexMemoryAdmissionWeight(nativeFileCount, nativeInputBytes)
-	if weight < directIndexMemoryAdmissionFloorBytes {
-		return directIndexMemoryAdmissionFloorBytes
-	}
-	return weight
+// directIndexMemoryAdmissionWeight keeps direct parses in the same weighted
+// repository envelope as shadows. Their row buffers are bounded, but parser
+// high-water and concurrent SQLite work still scale with the complete corpus;
+// charging only native-language bytes let medium repositories bypass queued
+// pressure-sized work and increased cold-start contention.
+func directIndexMemoryAdmissionWeight(fileCount int, inputBytes int64) int64 {
+	return indexMemoryAdmissionWeight(fileCount, inputBytes)
 }
 
 // saturatingAddByteCount accumulates non-negative byte counts without allowing

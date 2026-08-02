@@ -2675,7 +2675,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// This is intentionally separate from the nested raw/native per-file gates.
 	memoryWeight := indexMemoryAdmissionWeight(len(files), totalFileBytes)
 	if !shadowLocallyEligible {
-		memoryWeight = directIndexMemoryAdmissionWeight(nativePressureFiles, nativePressureFileBytes)
+		memoryWeight = directIndexMemoryAdmissionWeight(len(files), totalFileBytes)
 	}
 	memoryBudget := idx.indexMemoryAdmission
 	if memoryBudget == nil {

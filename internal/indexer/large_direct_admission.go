@@ -10,12 +10,12 @@ import (
 )
 
 const (
-	// One native-pressure parse costs two permits and one lightweight large
-	// direct parse costs one. Capacity three therefore keeps native-pressure
-	// repositories mutually exclusive while allowing exactly one bounded light
-	// parse to overlap; at most three light parses can coexist.
-	largeDirectAdmissionCapacity      int64 = 3
-	largeDirectNativePressureWeight   int64 = 2
+	// Intrinsically large direct parses remain repository-serial. Their graph
+	// batches are bounded, but allowing a nominally lightweight parse to overlap
+	// still increased SQLite drain contention and delayed pressure-sized work in
+	// the measured cold-start corpus.
+	largeDirectAdmissionCapacity      int64 = 1
+	largeDirectNativePressureWeight   int64 = 1
 	largeDirectLightweightParseWeight int64 = 1
 )
 
