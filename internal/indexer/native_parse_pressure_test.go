@@ -29,19 +29,52 @@ func TestNativeParsePressureReliefThresholdAndFlush(t *testing.T) {
 		t.Fatalf("stats after threshold = %+v, want one call and 17 released bytes", stats)
 	}
 
+	// Even though the threshold sweep consumed pending to zero, flush must
+	// perform one post-worker sweep. Sibling native parses may still have been
+	// live during the threshold call, so this is the first quiescent boundary.
 	r.flush()
-	if got := releases.Load(); got != 1 {
-		t.Fatalf("empty flush releases = %d, want 1", got)
+	if got := releases.Load(); got != 2 {
+		t.Fatalf("post-threshold flush releases = %d, want 2", got)
+	}
+	stats = r.stats()
+	if stats.calls != 2 || stats.releasedBytes != 34 {
+		t.Fatalf("stats after post-threshold flush = %+v, want two calls and 34 reported bytes", stats)
+	}
+
+	// A second flush without another completed parse must remain a no-op.
+	r.flush()
+	if got := releases.Load(); got != 2 {
+		t.Fatalf("duplicate flush releases = %d, want 2", got)
 	}
 
 	r.afterParse("objc", 1024)
 	r.flush()
-	if got := releases.Load(); got != 2 {
-		t.Fatalf("tail flush releases = %d, want 2", got)
+	if got := releases.Load(); got != 3 {
+		t.Fatalf("tail flush releases = %d, want 3", got)
 	}
 	stats = r.stats()
-	if stats.calls != 2 || stats.releasedBytes != 34 {
-		t.Fatalf("stats after tail flush = %+v, want two calls and 34 released bytes", stats)
+	if stats.calls != 3 || stats.releasedBytes != 51 {
+		t.Fatalf("stats after tail flush = %+v, want three calls and 51 reported bytes", stats)
+	}
+}
+
+func TestNativeParsePressureZeroReportedBytesStillFlushes(t *testing.T) {
+	var releases atomic.Int64
+	r := &nativeParsePressureRelief{
+		release: func() uintptr {
+			releases.Add(1)
+			return 0
+		},
+	}
+
+	r.afterParse("c", nativeParsePressureThresholdBytes)
+	r.flush()
+	if got := releases.Load(); got != 2 {
+		t.Fatalf("zero-report releases = %d, want threshold plus final sweep", got)
+	}
+	stats := r.stats()
+	if stats.calls != 2 || stats.releasedBytes != 0 {
+		t.Fatalf("zero-report stats = %+v, want two calls and zero reported bytes", stats)
 	}
 }
 

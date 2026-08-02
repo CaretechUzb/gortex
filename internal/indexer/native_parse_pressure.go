@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -102,19 +103,41 @@ type nativeParsePressureStats struct {
 }
 
 type nativeParsePressureRelief struct {
-	pending  atomic.Int64
-	sweeping atomic.Bool
-	calls    atomic.Int64
-	released atomic.Uint64
-	elapsed  atomic.Int64
-	release  func() uintptr
+	pending   atomic.Int64
+	completed atomic.Uint64
+	sweeping  atomic.Bool
+	calls     atomic.Int64
+	released  atomic.Uint64
+	elapsed   atomic.Int64
+	release   func() uintptr
+}
+
+var (
+	// nativeParseCompletionGeneration advances only after a C-family extractor
+	// has returned and closed its tree. The cold-index GC window snapshots it
+	// to avoid sweeping every incremental index that did not touch native parsers.
+	nativeParseCompletionGeneration atomic.Uint64
+
+	// malloc_zone_pressure_relief walks every registered allocator zone. Keep
+	// process-wide calls serialized: each parse chunk has its own coordinator,
+	// but concurrent repository indexing must not run redundant zone walks.
+	nativeAllocatorPressureReliefMu sync.Mutex
+)
+
+func runNativeAllocatorPressureRelief() uintptr {
+	if !nativeAllocatorPressureReliefSupported {
+		return 0
+	}
+	nativeAllocatorPressureReliefMu.Lock()
+	defer nativeAllocatorPressureReliefMu.Unlock()
+	return nativeAllocatorPressureRelief()
 }
 
 func newNativeParsePressureRelief() *nativeParsePressureRelief {
 	if !nativeAllocatorPressureReliefSupported {
 		return nil
 	}
-	return &nativeParsePressureRelief{release: nativeAllocatorPressureRelief}
+	return &nativeParsePressureRelief{release: runNativeAllocatorPressureRelief}
 }
 
 func nativeParsePressureLanguage(language string) bool {
@@ -135,17 +158,22 @@ func (r *nativeParsePressureRelief) afterParse(language string, sourceBytes int6
 	if r == nil || sourceBytes <= 0 || !nativeParsePressureLanguage(language) {
 		return
 	}
-	if r.pending.Add(sourceBytes) < nativeParsePressureThresholdBytes {
+	pending := r.pending.Add(sourceBytes)
+	r.completed.Add(1)
+	nativeParseCompletionGeneration.Add(1)
+	if pending < nativeParsePressureThresholdBytes {
 		return
 	}
 	r.relieve(false)
 }
 
-// flush releases the final under-threshold tail once every parser worker has
-// exited. It is deliberately called at the parse boundary, not on an idle
-// timer, so steady-state query latency is unaffected.
+// flush performs one final allocator sweep after every parser worker has
+// exited, even when threshold sweeps already consumed the pending-byte tail.
+// Those earlier sweeps can run while sibling workers still own native trees;
+// the post-worker sweep is the first reliably quiescent release point. The
+// completion counter also makes repeated flushes without new parses a no-op.
 func (r *nativeParsePressureRelief) flush() {
-	if r == nil || r.pending.Load() <= 0 {
+	if r == nil || r.completed.Swap(0) == 0 {
 		return
 	}
 	r.relieve(true)
@@ -164,7 +192,7 @@ func (r *nativeParsePressureRelief) relieve(force bool) {
 	defer r.sweeping.Store(false)
 
 	pending := r.pending.Swap(0)
-	if pending <= 0 {
+	if !force && pending <= 0 {
 		return
 	}
 	if !force && pending < nativeParsePressureThresholdBytes {
@@ -175,6 +203,10 @@ func (r *nativeParsePressureRelief) relieve(force bool) {
 	}
 
 	started := time.Now()
+	// On Darwin this return value is only an allocator-reported lower bound:
+	// libmalloc can madvise tiny/small regions without adding those bytes to
+	// malloc_zone_pressure_relief's result. A zero result is therefore still a
+	// completed and potentially useful zone sweep.
 	released := r.release()
 	r.elapsed.Add(int64(time.Since(started)))
 	r.calls.Add(1)
