@@ -160,13 +160,11 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	// Convert_L39, ...) sharing the same Name, and real call sites bind to any
 	// of them — a single-node-per-name projection would silently drop the
 	// overload the corpus actually calls through.
-	var memberEdges []*graph.Edge
-	var memberNodes map[string]*graph.Node
-	var anchorNodes map[string]*graph.Node
-	projected := false
-	if scope != nil {
-		memberEdges, memberNodes, anchorNodes, projected = csharpScopedMemberProjection(g, familyScope, children)
-	}
+	// The compact projection is valid for both partial and full-census runs.
+	// On a full run a nil familyScope means every repository; using the same
+	// light EdgeMemberOf and qualified-method streams avoids decoding every
+	// member edge and method metadata blob merely to discover C# anchors.
+	memberEdges, memberNodes, anchorNodes, projected := csharpScopedMemberProjection(g, familyScope, children)
 	if !projected {
 		memberEdges = frameworkRepoEdges(g, familyScope, graph.EdgeMemberOf)
 		memberNodeIDs := make([]string, 0, len(memberEdges))
@@ -179,9 +177,14 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		anchorNodes = memberNodes
 	}
 	var membersByType map[string]map[string][]*graph.Node
-	if scope == nil {
+	switch {
+	case projected:
+		// Reuse the compact nodes already read for anchor discovery. This is
+		// the full-census fast path as well as the normal scoped path.
+		membersByType = csharpMemberMethodsAllByTypeFromEdges(memberEdges, memberNodes)
+	case scope == nil:
 		membersByType = csharpMemberMethodsAllByType(g)
-	} else {
+	default:
 		membersByType = csharpMemberMethodsAllByTypeFromEdges(memberEdges, memberNodes)
 	}
 	if len(membersByType) == 0 {
@@ -377,10 +380,11 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	return len(batch)
 }
 
-// csharpScopedMemberProjection replaces the scoped pass's full EdgeMemberOf and
-// full-node materialisation with metadata-free identities. Only C# methods on
-// owners with descendants can seed a dispatch family, so those are exact-refetched
-// after both cursors close; every other family member stays a compact Node value.
+// csharpScopedMemberProjection replaces full EdgeMemberOf and full-node
+// materialisation with metadata-free identities. A nil scope admits every
+// repository for a full-census run. Only C# methods on owners with descendants
+// can seed a dispatch family, so those are exact-refetched after both cursors
+// close; every other family member stays a compact Node value.
 // The final sort mirrors graph.ReadRepoEdgesByKinds so anchor/family and
 // provenance order are unchanged.
 func csharpScopedMemberProjection(
@@ -403,7 +407,8 @@ func csharpScopedMemberProjection(
 	}
 	memberNodes = make(map[string]*graph.Node)
 	for node := range sequencer.QualifiedNodeIdentitiesSeq(graph.KindMethod) {
-		if _, needed := wanted[node.ID]; !needed || !scope[node.RepoPrefix] {
+		_, needed := wanted[node.ID]
+		if !needed || (scope != nil && !scope[node.RepoPrefix]) {
 			continue
 		}
 		memberNodes[node.ID] = &graph.Node{
