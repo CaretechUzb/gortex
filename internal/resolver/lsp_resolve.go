@@ -227,22 +227,19 @@ func (b *deferredLSPPassBudget) allowAttempt(now time.Time) bool {
 	return now.Before(b.deadline)
 }
 
-func (r *Resolver) hasDeferredLSPRetryForScope() (bool, error) {
+func (r *Resolver) hasDeferredLSPRetryForScope() bool {
 	if r.lspHelper == nil {
-		return false, nil
+		return false
 	}
-	if r.lspDeferredSpool != nil {
-		has, err := r.lspDeferredSpool.hasForScope(r.scope)
-		if err != nil || has {
-			return has, err
-		}
+	if r.lspDeferredSpool != nil && r.lspDeferredSpool.hasForScope(r.scope) {
+		return true
 	}
 	for _, de := range r.lspDeferredRetry {
 		if de.edge != nil && (len(r.scope) == 0 || edgeInResolveScope(de.edge, r.scope)) {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 func (r *Resolver) deferredLSPRetryCount() int {

@@ -138,8 +138,7 @@ func TestWarmupDaemonState_TimingsAggregation(t *testing.T) {
 		configManager: cm,
 	}
 
-	_, timings, err := warmupDaemonState(state, zap.NewNop(), func() {})
-	require.NoError(t, err)
+	_, timings := warmupDaemonState(state, zap.NewNop(), func() {})
 	require.NotNil(t, timings)
 
 	assert.Equal(t, 2, timings.reposChanged, "both freshly-tracked repos count as changed")

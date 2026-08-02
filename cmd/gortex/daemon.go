@@ -542,19 +542,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 				"warmup_ms":      elapsed.Milliseconds(),
 			})
 		})
-		mw, warmup, warmupErr := warmupDaemonState(state, logger, markReady)
-		if warmupErr != nil {
-			// Fail closed: recovery and watcher setup errors must not fall
-			// through to watcher attachment, deferred analysis, or enriched
-			// readiness. The socket stays up so status/health can expose the
-			// failure while controller readiness remains false.
-			logger.Error("daemon: warmup failed; daemon remains unready", zap.Error(warmupErr))
-			publishReadinessPhase(state, "warmup_failed", false, map[string]any{
-				"error": warmupErr.Error(),
-			})
-			logWarmupSummary(logger, warmup, queryableElapsed, time.Since(start))
-			return
-		}
+		mw, warmup := warmupDaemonState(state, logger, markReady)
 		controller.AttachWatcher(mw)
 		// Drive the /v1/events SSE stream from the MultiWatcher. The hub is
 		// the only consumer of mw.Events() (SetWatcher reads History(), not

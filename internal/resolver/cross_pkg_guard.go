@@ -1,10 +1,11 @@
 package resolver
 
 import (
-	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -42,9 +43,9 @@ import (
 // phase; each carries the edge's pre-resolution target in oldTo, so a
 // reverted edge is restored exactly. closure is the import-reachability
 // map from buildImportClosure. Returns the number of edges reverted.
-func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[string]map[string]struct{}) (int, error) {
+func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[string]map[string]struct{}) int {
 	if len(jobs) == 0 {
-		return 0, nil
+		return 0
 	}
 	var liveJobs resolveJobLiveness
 	if r.validateLiveness {
@@ -158,10 +159,10 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 	// liveness matching declares them stale and deletes the queued retry.
 	if len(spoolReverts) > 0 && r.lspDeferredSpool != nil {
 		if err := r.lspDeferredSpool.refreshRevertedEdges(spoolReverts); err != nil {
-			return len(reindexBatch), fmt.Errorf("refresh reverted LSP spool records: %w", err)
+			r.logger.Error("resolver: refresh reverted LSP spool records", zap.Error(err))
 		}
 	}
-	return len(reindexBatch), nil
+	return len(reindexBatch)
 }
 
 // isBareNameCallTarget reports whether an unresolved edge target is a

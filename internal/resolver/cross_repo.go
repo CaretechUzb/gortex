@@ -2,7 +2,6 @@ package resolver
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -331,10 +330,6 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
-	resolveState, err := graph.BeginResolvePass(cr.graph)
-	if err != nil {
-		return stats, fmt.Errorf("cross-repo resolver: persist incomplete pass: %w", err)
-	}
 	// Fresh placeholder-source set per pass — same rationale as ResolveAll
 	// on the master resolver.
 	cr.placeholderSrcIdx = placeholderSourceIndex{}
@@ -361,9 +356,6 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	}
 	pendingLoaded.Store(int64(len(pending)))
 	if len(pending) == 0 && streamDone {
-		if err := graph.CompleteOwnedResolvePass(cr.graph, resolveState); err != nil {
-			return stats, fmt.Errorf("cross-repo resolver: clear completed pass: %w", err)
-		}
 		return stats, nil
 	}
 
@@ -552,9 +544,6 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 		zap.Int("reindex_batch", reindexTotal),
 		zap.Int("super_chunk", superChunk),
 		zap.Duration("elapsed", time.Since(passStart)))
-	if err := graph.CompleteOwnedResolvePass(cr.graph, resolveState); err != nil {
-		return stats, fmt.Errorf("cross-repo resolver: clear completed pass: %w", err)
-	}
 	return stats, nil
 }
 

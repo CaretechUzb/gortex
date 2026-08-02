@@ -803,47 +803,7 @@ const (
 // mutations; an incomplete receipt always fails closed to a whole-graph pass.
 // nil means the store does not support receipts yet.
 func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt, fallbackNeeded bool, fallbackScope map[string]struct{}, noNewUnresolved bool) (deferredResolveMode, bool) {
-	mode, complete, err := mi.resolveDeferredMutationsContext(
-		context.Background(), receipt, fallbackNeeded, fallbackScope, noNewUnresolved,
-	)
-	if err != nil {
-		mi.logger.Error("DEFERRED-TIMING durable catch-up resolve failed", zap.Error(err))
-	}
-	return mode, complete
-}
-
-// resolveDeferredMutationsContext owns one durable generation across the whole
-// post-enrichment catch-up. Full resolvers join this generation, so neither the
-// master nor cross-repository stage can clear it before edge materialisation is
-// complete. Exact file passes do not own markers themselves and are covered by
-// this same boundary. True no-op receipts deliberately avoid the marker/fsync.
-func (mi *MultiIndexer) resolveDeferredMutationsContext(ctx context.Context, receipt *graph.MutationReceipt, fallbackNeeded bool, fallbackScope map[string]struct{}, noNewUnresolved bool) (deferredResolveMode, bool, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return deferredResolveFailed, false, err
-	}
-
-	runDurable := func(run func() (deferredResolveMode, error)) (deferredResolveMode, bool, error) {
-		token, err := graph.BeginResolvePass(mi.graph)
-		if err != nil {
-			return deferredResolveFailed, false, fmt.Errorf("deferred resolve: persist incomplete pass: %w", err)
-		}
-		mode, err := run()
-		if err != nil {
-			return deferredResolveFailed, false, err
-		}
-		if err := ctx.Err(); err != nil {
-			return deferredResolveFailed, false, err
-		}
-		if err := graph.CompleteOwnedResolvePass(mi.graph, token); err != nil {
-			return deferredResolveFailed, false, fmt.Errorf("deferred resolve: clear completed pass: %w", err)
-		}
-		return mode, true, nil
-	}
-
-	fullFallback := func(masterScope map[string]struct{}, reason string) (deferredResolveMode, bool, error) {
+	fullFallback := func(masterScope map[string]struct{}, reason string) (deferredResolveMode, bool) {
 		// A flat unresolved-insertion counter cannot prove that cross-repository
 		// catch-up is empty: enrichment may add a definition that binds an old
 		// incoming stub, or add an already-resolved base edge whose parallel
@@ -853,25 +813,16 @@ func (mi *MultiIndexer) resolveDeferredMutationsContext(ctx context.Context, rec
 			mi.logger.Info("DEFERRED-TIMING unresolved-target counter unchanged; retaining fallback for definitions and resolved cross-repo edges",
 				zap.String("reason", reason))
 		}
-		return runDurable(func() (deferredResolveMode, error) {
-			if err := mi.runMasterResolveHookedContext(ctx, masterScope, false, nil); err != nil {
-				return deferredResolveFailed, fmt.Errorf("deferred resolve: fallback master: %w", err)
-			}
-			if err := ctx.Err(); err != nil {
-				return deferredResolveFailed, err
-			}
-			if err := mi.runCrossRepoResolveContext(ctx, false); err != nil {
-				return deferredResolveFailed, fmt.Errorf("deferred resolve: fallback cross-repo: %w", err)
-			}
-			if err := ctx.Err(); err != nil {
-				return deferredResolveFailed, err
-			}
-			resolver.DetectCrossRepoEdges(mi.graph)
-			if err := ctx.Err(); err != nil {
-				return deferredResolveFailed, err
-			}
-			return deferredResolveFallback, nil
-		})
+		if err := mi.runMasterResolveHookedContext(context.Background(), masterScope, false, nil); err != nil {
+			mi.logger.Error("DEFERRED-TIMING fallback master resolve failed", zap.Error(err))
+			return deferredResolveFailed, false
+		}
+		if err := mi.runCrossRepoResolveContext(context.Background(), false); err != nil {
+			mi.logger.Error("DEFERRED-TIMING fallback cross-repo resolve failed", zap.Error(err))
+			return deferredResolveFailed, false
+		}
+		resolver.DetectCrossRepoEdges(mi.graph)
+		return deferredResolveFallback, true
 	}
 
 	if receipt != nil {
@@ -892,28 +843,20 @@ func (mi *MultiIndexer) resolveDeferredMutationsContext(ctx context.Context, rec
 			mi.logger.Info("DEFERRED-TIMING mutation receipt has no file-scoped resolution or cross-repo delta",
 				zap.Int("changed_files", len(receipt.ChangedFiles)),
 				zap.Int("target_ids", len(receipt.TargetIDs)))
-			return deferredResolveSkipped, true, nil
+			return deferredResolveSkipped, true
 		}
 
-		return runDurable(func() (deferredResolveMode, error) {
-			if receipt.ResolutionRelevant {
-				mi.runMasterResolveFiles(files, false)
-				if err := ctx.Err(); err != nil {
-					return deferredResolveFailed, err
-				}
-			}
-			// Resolve both outgoing edges from the changed files and incoming
-			// stubs that name definitions in those files. The cross-repo file
-			// pass also materialises parallel cross_repo_* edges before returning.
-			mi.runCrossRepoResolveFiles(files)
-			if err := ctx.Err(); err != nil {
-				return deferredResolveFailed, err
-			}
-			return deferredResolveExact, nil
-		})
+		if receipt.ResolutionRelevant {
+			mi.runMasterResolveFiles(files, false)
+		}
+		// Resolve both outgoing edges from the changed files and incoming stubs
+		// that name definitions in those files, then materialise the parallel
+		// cross_repo_* edge generation for already-resolved base edges too.
+		mi.runCrossRepoResolveFiles(files)
+		return deferredResolveExact, true
 	}
 	if !fallbackNeeded {
-		return deferredResolveSkipped, true, nil
+		return deferredResolveSkipped, true
 	}
 	return fullFallback(fallbackScope, "mutation_receipt_unavailable")
 }
@@ -1046,10 +989,6 @@ func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
 // cross-repo passes starved cross-repo to a standstill (measured: 1,049s for
 // a pass that runs in ~38s uncontended on the same workspace).
 func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}, onComputeDone func()) error {
-	resolveState, err := graph.BeginResolvePass(mi.graph)
-	if err != nil {
-		return fmt.Errorf("pre-enrichment resolve: persist incomplete pass: %w", err)
-	}
 	mi.runDeferredGoModAll()
 	if err := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone); err != nil {
 		return err
@@ -1060,23 +999,13 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 	// Cross-repo references resolve here so a multi-repo workspace is fully
 	// resolved, not just within each repo. Whole-graph so inbound references
 	// from unchanged repos into the changed repos bind too.
-	if err := mi.runCrossRepoResolveContext(ctx, false); err != nil {
-		return err
-	}
-	if err := graph.CompleteOwnedResolvePass(mi.graph, resolveState); err != nil {
-		return fmt.Errorf("pre-enrichment resolve: clear completed pass: %w", err)
-	}
-	return nil
+	return mi.runCrossRepoResolveContext(ctx, false)
 }
 
 // RunPreEnrichResolveFiles preserves an exact warm-reconcile frontier through
 // same-repository and cross-repository resolution. A restart that reparsed one
 // file must not promote that delta to every unresolved edge in its repository.
 func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []string, onComputeDone func()) error {
-	resolveState, err := graph.BeginResolvePass(mi.graph)
-	if err != nil {
-		return fmt.Errorf("file-scoped pre-enrichment resolve: persist incomplete pass: %w", err)
-	}
 	mi.runDeferredGoModAll()
 	if err := context.Cause(ctx); err != nil {
 		return err
@@ -1100,19 +1029,10 @@ func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []st
 		return err
 	}
 	if resolutionAffected > 0 {
-		if err := mi.runCrossRepoResolveContext(ctx, false); err != nil {
-			return err
-		}
-	} else {
-		mi.runCrossRepoResolveFiles(files)
-		if err := context.Cause(ctx); err != nil {
-			return err
-		}
+		return mi.runCrossRepoResolveContext(ctx, false)
 	}
-	if err := graph.CompleteOwnedResolvePass(mi.graph, resolveState); err != nil {
-		return fmt.Errorf("file-scoped pre-enrichment resolve: clear completed pass: %w", err)
-	}
-	return nil
+	mi.runCrossRepoResolveFiles(files)
+	return context.Cause(ctx)
 }
 
 func (mi *MultiIndexer) runDeferredGoModAll() {

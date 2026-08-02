@@ -2,7 +2,6 @@ package resolver
 
 import (
 	"database/sql"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -127,57 +126,39 @@ ON CONFLICT(file_path,line,from_id,kind,target) DO UPDATE SET
 	return tx.Commit()
 }
 
-func (s *deferredLSPSpool) countExact() (int, error) {
+func (s *deferredLSPSpool) count() int {
 	if s == nil {
-		return 0, nil
+		return 0
 	}
 	var count int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM work`).Scan(&count); err != nil {
-		return 0, fmt.Errorf("count deferred LSP spool: %w", err)
-	}
-	return count, nil
-}
-
-// count is retained for diagnostics and tests whose callers cannot affect
-// resolver completion. ResolveAll uses countExact so an unreadable spool can
-// never be mistaken for an empty continuation queue.
-func (s *deferredLSPSpool) count() int {
-	count, _ := s.countExact()
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM work`).Scan(&count)
 	return count
 }
 
-func (s *deferredLSPSpool) hasForScope(scope map[string]struct{}) (bool, error) {
+func (s *deferredLSPSpool) hasForScope(scope map[string]struct{}) bool {
 	if s == nil {
-		return false, nil
+		return false
 	}
 	if len(scope) == 0 {
-		count, err := s.countExact()
-		return count > 0, err
+		return s.count() > 0
 	}
 	rows, err := s.db.Query(`SELECT from_id, current_to, kind, file_path, line FROM work`)
 	if err != nil {
-		return false, fmt.Errorf("query deferred LSP scope: %w", err)
+		return false
 	}
-	found := false
+	defer rows.Close()
 	for rows.Next() {
 		var from, to, kind, filePath string
 		var line int
-		if err := rows.Scan(&from, &to, &kind, &filePath, &line); err != nil {
-			_ = rows.Close()
-			return false, fmt.Errorf("scan deferred LSP scope: %w", err)
+		if rows.Scan(&from, &to, &kind, &filePath, &line) != nil {
+			continue
 		}
 		edge := &graph.Edge{From: from, To: to, Kind: graph.EdgeKind(kind), FilePath: filePath, Line: line}
 		if edgeInResolveScope(edge, scope) {
-			found = true
-			break
+			return true
 		}
 	}
-	iterErr := rows.Err()
-	closeErr := rows.Close()
-	if err := errors.Join(iterErr, closeErr); err != nil {
-		return false, fmt.Errorf("iterate deferred LSP scope: %w", err)
-	}
-	return found, nil
+	return false
 }
 
 type deferredLSPSpoolIter struct {

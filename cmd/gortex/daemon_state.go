@@ -283,9 +283,7 @@ func (frontier *warmupDeltaFrontier) snapshot(changedRepos int, scopeUnknown boo
 // are resolved and the graph is queryable — ahead of the slow enrichment pass
 // — so the daemon reports ready as soon as find_usages / get_callers return
 // complete results, not after enrichment finishes. The returned *warmupTimings
-// is never nil — daemon.go uses it to emit a one-line warmup summary. Any
-// returned error means the caller must leave readiness false and skip watcher
-// attachment and enriched publication.
+// is never nil — daemon.go uses it to emit a one-line warmup summary.
 // healDuplicateRepos drops tracked-repo entries that name the same
 // directory as an earlier entry under a different path spelling — letter
 // case or Unicode normalisation on a case-insensitive filesystem — logs
@@ -361,64 +359,14 @@ func drainGoModAndFinalizeWarmupBulk(drain func(), finalize func() error) (drain
 	return drainElapsed, time.Since(finalizeStart), err
 }
 
-type warmupResolveRecovery struct {
-	token    graph.ResolveStateToken
-	required bool
-}
-
-func probeWarmupResolveRecovery(store graph.Store) (warmupResolveRecovery, error) {
-	token, required, err := graph.IncompleteResolvePass(store)
-	if err != nil {
-		return warmupResolveRecovery{}, err
-	}
-	return warmupResolveRecovery{token: token, required: required}, nil
-}
-
-func (recovery warmupResolveRecovery) priorMtimes(prior map[string]int64) map[string]int64 {
-	if recovery.required {
-		return nil
-	}
-	return prior
-}
-
-func (recovery warmupResolveRecovery) anyChanged(changed int64) bool {
-	return recovery.required || changed > 0
-}
-
-func (recovery warmupResolveRecovery) exactDelta(exact bool) bool {
-	return exact && !recovery.required
-}
-
-func (recovery warmupResolveRecovery) resolveScope(scope map[string]struct{}) map[string]struct{} {
-	if recovery.required {
-		return nil
-	}
-	return scope
-}
-
-func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) (*indexer.MultiWatcher, *warmupTimings, error) {
+func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) (*indexer.MultiWatcher, *warmupTimings) {
 	timings := &warmupTimings{}
 	if state == nil {
-		return nil, timings, fmt.Errorf("warm up daemon: nil state")
+		return nil, timings
 	}
 	snapshotRepos, snapshotContracts, restoredVector := state.takeWarmupSnapshotPayloads()
 	if state.multiIndexer == nil || state.configManager == nil {
-		return nil, timings, fmt.Errorf("warm up daemon: missing indexer or config manager")
-	}
-	resolveRecovery, err := probeWarmupResolveRecovery(state.graph)
-	if err != nil {
-		// A failed probe cannot distinguish a clean store from an interrupted
-		// resolver generation. Abort before orphan purge, compaction, tracking,
-		// or any other recovery write; readiness must remain false.
-		logger.Error("daemon: durable resolve recovery probe failed; warmup aborted", zap.Error(err))
-		publishReadinessPhase(state, "resolve_recovery_probe_failed", false, map[string]any{
-			"error": err.Error(),
-		})
-		return nil, timings, fmt.Errorf("probe durable resolve recovery: %w", err)
-	}
-	if resolveRecovery.required {
-		logger.Warn("daemon: interrupted durable resolve generation detected; forcing full repository recovery",
-			zap.Int64("generation", resolveRecovery.token.Generation))
+		return nil, timings
 	}
 
 	ctx := progress.WithReporter(context.Background(), progress.Nop{})
@@ -592,21 +540,12 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	var changedPrefixes sync.Map
 	var scopeUnknown atomic.Bool
 	deltaFrontier := newWarmupDeltaFrontier()
-	var recoveryTracksOK atomic.Bool
-	recoveryTracksOK.Store(true)
-	if resolveRecovery.required {
-		// Recovery must reconstruct every source-derived edge; it can never use
-		// the exact-delta or repository-scoped resolver fast paths.
-		scopeUnknown.Store(true)
-		deltaFrontier.invalidate()
-	}
-	topologyErr := state.multiIndexer.RunRepositoryTopologyBatch(ctx, func(batchCtx context.Context) error {
+	if err := state.multiIndexer.RunRepositoryTopologyBatch(ctx, func(batchCtx context.Context) error {
 		coordinatedBulk, _ := state.graph.(graph.CoordinatedBulkLoader)
 		coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
 		defer func() {
 			if coordinatedBulkActive {
 				if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
-					recoveryTracksOK.Store(false)
 					logger.Error("daemon: coordinated cold bulk-load cleanup failed", zap.Error(err))
 				}
 			}
@@ -627,7 +566,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 									zap.String("path", entry.Path),
 									zap.Any("panic", r))
 								changedRepos.Add(1)
-								recoveryTracksOK.Store(false)
 								scopeUnknown.Store(true)
 								deltaFrontier.invalidate()
 							}
@@ -681,7 +619,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 							}
 							priorMtimes = nil
 						}
-						priorMtimes = resolveRecovery.priorMtimes(priorMtimes)
 						pathFn := "track"
 						if priorMtimes != nil {
 							pathFn = "reconcile"
@@ -694,7 +631,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 								// passes still run — degrade toward correctness, not
 								// toward the fast path, when we can't trust the delta.
 								changedRepos.Add(1)
-								recoveryTracksOK.Store(false)
 								scopeUnknown.Store(true)
 								deltaFrontier.invalidate()
 							case res != nil && (res.StaleFileCount > 0 || res.DeletedFileCount > 0 || len(res.FailedFiles) > 0 || res.FullRetrack):
@@ -741,15 +677,13 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 							if res, err := state.multiIndexer.TrackRepoCtx(batchCtx, entry); err != nil {
 								logger.Warn("daemon: startup track failed",
 									zap.String("path", entry.Path), zap.Error(err))
-								recoveryTracksOK.Store(false)
 								scopeUnknown.Store(true)
-							} else if res != nil && res.RepoPrefix != "" && len(res.FailedFiles) == 0 {
+							} else if res != nil && res.RepoPrefix != "" {
 								// A cold TrackRepoCtx is itself a full retrack — its
 								// FileCount is the whole repo's file-level work.
 								filesReindexed.Add(int64(res.FileCount))
 								changedPrefixes.Store(res.RepoPrefix, struct{}{})
 							} else {
-								recoveryTracksOK.Store(false)
 								scopeUnknown.Store(true)
 							}
 						}
@@ -793,7 +727,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		snapshotRepos = nil
 		if coordinatedBulkActive {
 			if finalizeErr != nil {
-				recoveryTracksOK.Store(false)
 				logger.Error("daemon: coordinated cold bulk-load finalize failed", zap.Error(finalizeErr))
 			} else {
 				logger.Info("daemon: coordinated cold bulk-load complete",
@@ -802,10 +735,8 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			coordinatedBulkActive = false
 		}
 		return nil
-	})
-	if topologyErr != nil {
-		recoveryTracksOK.Store(false)
-		logger.Error("daemon: repository topology batch failed", zap.Error(topologyErr))
+	}); err != nil {
+		logger.Error("daemon: repository topology batch failed", zap.Error(err))
 	}
 	timings.parse = time.Since(phaseStart)
 	timings.filesReindexed = int(filesReindexed.Load())
@@ -819,20 +750,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		"elapsed_human": parseStats.Elapsed,
 		"repos_per_sec": parseStats.ItemsPerSec,
 	})
-	if resolveRecovery.required && !recoveryTracksOK.Load() {
-		// Recovery is all-or-nothing: a partial repository reconstruction
-		// cannot safely proceed to resolution, derived passes, or watcher
-		// startup. Clear only the in-process batch flags; retain the durable
-		// generation so the next startup retries the full reconstruction.
-		state.multiIndexer.ResetBatch()
-		recoveryErr := fmt.Errorf("recover durable resolve generation %d: repository reconstruction failed", resolveRecovery.token.Generation)
-		publishReadinessPhase(state, "resolve_recovery_failed", false, map[string]any{
-			"generation": resolveRecovery.token.Generation,
-			"stage":      "track",
-			"error":      recoveryErr.Error(),
-		})
-		return nil, timings, recoveryErr
-	}
 
 	// Warm-restart fast path. When the reconcile loop above re-indexed
 	// nothing, the persistent backend already carries every resolved and
@@ -843,12 +760,11 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// near-instant "open store, reconcile zero files, start watching".
 	// The in-memory backend reaches here too, but its snapshot replay
 	// already restored the derived edges, so the skip is equally safe.
-	anyChanged := resolveRecovery.anyChanged(changedRepos.Load())
+	anyChanged := changedRepos.Load() > 0
 	timings.reposChanged = int(changedRepos.Load())
 	logger.Info("daemon: warmup change detection",
 		zap.Int64("changed_repos", changedRepos.Load()),
 		zap.Int("tracked_repos", len(repos)),
-		zap.Bool("resolve_recovery", resolveRecovery.required),
 		zap.Bool("global_passes", anyChanged))
 
 	// Materialize the changed-repo prefix set once. It feeds two consumers:
@@ -871,7 +787,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// the operator override. These conditions already force a full master
 	// scope below; apply them to the branch selector too.
 	exactWarmDelta = exactWarmDelta && len(deltaFiles) > 0 && !state.snapshotPartial && !needsRebuild && !forcedFullResolve
-	exactWarmDelta = resolveRecovery.exactDelta(exactWarmDelta)
 	logger.Info("daemon: warmup delta frontier",
 		zap.Bool("exact", exactWarmDelta),
 		zap.Bool("forced_full_resolve", forcedFullResolve),
@@ -886,7 +801,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// matching ArmBatchScope.
 	resolveScope := warmupResolveScope(changed, len(repos), anyChanged,
 		scopeUnknown.Load(), state.snapshotPartial, needsRebuild)
-	resolveScope = resolveRecovery.resolveScope(resolveScope)
 
 	// Resume enrichment for any repo a prior process left partial / abandoned.
 	// Seeded BEFORE the resolve phase so the overlapped enrichment pool below
@@ -906,7 +820,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// with GORTEX_ENRICH_OVERLAP=1 while comparing unusual workloads.
 	var deferredRun *indexer.DeferredPassesRun
 	openApplyGate := func() {}
-	if (anyChanged || enrichPending > 0) && !resolveRecovery.required && enrichmentOverlapEnabled() {
+	if (anyChanged || enrichPending > 0) && enrichmentOverlapEnabled() {
 		applyGate := make(chan struct{})
 		openApplyGate = sync.OnceFunc(func() {
 			// Open the mutation receipt only after pre-enrichment resolution has
@@ -931,9 +845,8 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// cross-repo resolver. On the warm-restart fast path nothing changed, so
 	// the persisted graph already carries resolved edges and we skip straight
 	// to marking ready.
-	resolveOK := !resolveRecovery.required || recoveryTracksOK.Load()
-	var resolveFailure error
-	if anyChanged && resolveOK {
+	resolveOK := true
+	if anyChanged {
 		phaseStart = time.Now()
 		publishStart := time.Now()
 		publishReadinessPhase(state, "resolve", false, nil)
@@ -950,38 +863,16 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		// (measured: 1,049s for a pass that runs in ~38s uncontended). The
 		// gate opens right after this call returns.
 		var resolveErr error
-		resolveComputeDone := markReady
-		if resolveRecovery.required {
-			// Recovery is not queryable at the master compute boundary: the
-			// cross-repository tail and generation CAS must both finish first.
-			resolveComputeDone = nil
-		}
 		if exactWarmDelta {
-			resolveErr = state.multiIndexer.RunPreEnrichResolveFiles(ctx, deltaFiles, resolveComputeDone)
+			resolveErr = state.multiIndexer.RunPreEnrichResolveFiles(ctx, deltaFiles, markReady)
 		} else {
-			resolveErr = state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope, resolveComputeDone)
+			resolveErr = state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope, markReady)
 		}
 		if resolveErr != nil {
 			resolveOK = false
-			resolveFailure = fmt.Errorf("run warmup resolve: %w", resolveErr)
 			exactWarmDelta = false
 			scopeUnknown.Store(true)
 			logger.Error("daemon: warmup resolve failed", zap.Error(resolveErr))
-		} else if resolveRecovery.required {
-			// The nested master/cross resolvers joined the pre-existing token and
-			// deliberately left it active. Clear only the generation observed by
-			// the initial probe, after every full track, bulk finalization, and
-			// nil-scope resolver tail has succeeded.
-			if err := graph.CompleteResolvePass(state.graph, resolveRecovery.token); err != nil {
-				resolveOK = false
-				resolveFailure = fmt.Errorf("complete durable resolve generation %d: %w", resolveRecovery.token.Generation, err)
-				logger.Error("daemon: durable resolve recovery completion failed; readiness withheld",
-					zap.Int64("generation", resolveRecovery.token.Generation),
-					zap.Error(err))
-			} else {
-				logger.Info("daemon: durable resolve recovery complete",
-					zap.Int64("generation", resolveRecovery.token.Generation))
-			}
 		}
 		timings.resolve = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
@@ -990,23 +881,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		publishReadinessPhase(state, "resolve_done", false, map[string]any{
 			"elapsed_ms": time.Since(phaseStart).Milliseconds(),
 		})
-	}
-	if resolveRecovery.required && !resolveOK {
-		// Recovery never exposes the master-resolver compute boundary as
-		// queryable, so no ready publication can have happened here. Restore
-		// batch flags, keep the durable generation active, and return before
-		// enrichment, global passes, or watcher startup.
-		openApplyGate()
-		state.multiIndexer.ResetBatch()
-		if resolveFailure == nil {
-			resolveFailure = fmt.Errorf("recover durable resolve generation %d: resolve did not complete", resolveRecovery.token.Generation)
-		}
-		publishReadinessPhase(state, "resolve_recovery_failed", false, map[string]any{
-			"generation": resolveRecovery.token.Generation,
-			"stage":      "resolve",
-			"error":      resolveFailure.Error(),
-		})
-		return nil, timings, resolveFailure
 	}
 
 	// The resolve phase is over: parked enrichment applies may now take the
@@ -1253,11 +1127,11 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	mw, err := indexer.NewMultiWatcher(state.multiIndexer, watchCfgs, logger)
 	if err != nil {
 		logger.Warn("daemon: multi-watcher init failed", zap.Error(err))
-		return nil, timings, fmt.Errorf("initialize multi-watcher: %w", err)
+		return nil, timings
 	}
 	if err := mw.Start(); err != nil {
 		logger.Warn("daemon: multi-watcher start failed", zap.Error(err))
-		return nil, timings, fmt.Errorf("start multi-watcher: %w", err)
+		return nil, timings
 	}
 	// Attach the live watcher before publishing watcher_started. This makes
 	// readiness truthful: once clients observe the phase, mutation handlers
@@ -1274,7 +1148,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	publishReadinessPhase(state, "watcher_started", true, map[string]any{
 		"watched_repos": len(watchCfgs),
 	})
-	return mw, timings, nil
+	return mw, timings
 }
 
 // logWarmupSummary emits the one-line warmup recap: reconstructing what a
