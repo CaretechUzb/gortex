@@ -237,13 +237,14 @@ func TestReindexEdgesUsesRuntimeVariableBudget(t *testing.T) {
 
 			stats, err := store.reindexEdgesSetOriented(batch)
 			require.NoError(t, err)
-			keyRows := batchRowsForVariableLimit(variableLimit, reindexKeyParamsPerRow, edgeCount)
-			insertRows := batchRowsForVariableLimit(variableLimit, reindexRowParamsPerRow, reindexRowMaxChunkSize)
+			updateRows := batchRowsForVariableLimit(variableLimit, reindexResolvedUpdateParamsPerRow, reindexRowMaxChunkSize)
 			assert.Zero(t, stats.selectStatements, "resolved conversions must not prefetch full edge rows")
-			assert.Equal(t, (edgeCount+keyRows-1)/keyRows, stats.deleteStatements)
-			assert.Equal(t, (edgeCount+insertRows-1)/insertRows, stats.insertStatements)
-			assert.Equal(t, edgeCount, stats.deletedRows)
-			assert.Equal(t, edgeCount, stats.insertedRows)
+			assert.Equal(t, (edgeCount+updateRows-1)/updateRows, stats.updateStatements)
+			assert.Equal(t, edgeCount, stats.updatedRows)
+			assert.Zero(t, stats.deleteStatements)
+			assert.Zero(t, stats.insertStatements)
+			assert.Zero(t, stats.deletedRows)
+			assert.Zero(t, stats.insertedRows)
 			assert.Equal(t, edgeCount, store.EdgeCount())
 		})
 	}
@@ -304,11 +305,14 @@ func TestReindexEdgesDownshiftsConnectionVariableLimit(t *testing.T) {
 
 	stats, err := store.reindexEdgesSetOriented(batch)
 	require.NoError(t, err)
-	assert.Equal(t, len(batch), stats.deletedRows)
-	assert.Equal(t, len(batch), stats.insertedRows)
+	assert.Equal(t, len(batch), stats.updatedRows)
+	assert.Zero(t, stats.deletedRows)
+	assert.Zero(t, stats.insertedRows)
 	assert.LessOrEqual(t, store.batchVariableLimit, connectionLimit)
 	assert.Zero(t, stats.selectStatements, "resolved conversions must not prefetch full edge rows")
-	assert.Greater(t, stats.deleteStatements, 1, "the first oversized delete must downshift and retry")
+	assert.Greater(t, stats.updateStatements, 1, "the first oversized update must downshift and retry")
+	assert.Zero(t, stats.deleteStatements)
+	assert.Zero(t, stats.insertStatements)
 	assert.Equal(t, len(batch), store.EdgeCount())
 }
 
@@ -348,6 +352,182 @@ func TestReindexEdgesProbesVariableLimitBeforeWriterCheckout(t *testing.T) {
 		t.Fatal("ReindexEdges waited for its own writer connection while probing SQLite limits")
 	}
 	assert.Positive(t, store.batchVariableLimit)
+}
+
+func TestReindexEdgesResolvedConversionUpdatesInPlace(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	const (
+		fromID    = "repo/caller.go::Caller"
+		oldTarget = "unresolved::Target"
+		newTarget = "repo/target.go::Target"
+		filePath  = "repo/caller.go"
+	)
+	store.AddBatch(nil, []*graph.Edge{{
+		From: fromID, To: oldTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 17,
+		Confidence: 0.2, ConfidenceLabel: "heuristic", Origin: "syntax", Tier: "syntax",
+		Meta: map[string]any{"payload": "old"},
+	}})
+	oldKey := sqliteReindexKey{
+		fromID: fromID, toID: oldTarget, kind: string(graph.EdgeCalls), filePath: filePath, line: 17,
+	}
+	beforeID := reindexStoredEdgeID(t, store, oldKey)
+	beforeAnalysisRevision := store.AnalysisMutationRevision()
+	beforeMutationRevision := store.MutationRevision()
+
+	batch := []graph.EdgeReindex{{
+		OldTo: oldTarget,
+		Edge: &graph.Edge{
+			From: fromID, To: newTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 17,
+			Confidence: 0.95, ConfidenceLabel: "confirmed", Origin: "compiler", Tier: "semantic",
+			CrossRepo: true,
+			Meta: map[string]any{
+				"payload":                 "new",
+				"resolve_terminal":        true,
+				"resolve_terminal_reason": "bound",
+				"semantic_source":         "lsp",
+			},
+		},
+	}}
+
+	token := store.BeginMutationReceipt()
+	stats, err := store.reindexEdgesSetOriented(batch)
+	require.NoError(t, err)
+	receipt := store.EndMutationReceipt(token)
+	assert.Zero(t, stats.selectStatements)
+	assert.Equal(t, 1, stats.updateStatements)
+	assert.Equal(t, 1, stats.updatedRows)
+	assert.Zero(t, stats.deleteStatements)
+	assert.Zero(t, stats.insertStatements)
+	assert.Zero(t, stats.deletedRows)
+	assert.Zero(t, stats.insertedRows)
+	assert.Equal(t, 1, stats.writeStatements())
+	assert.Equal(t, beforeAnalysisRevision+1, store.AnalysisMutationRevision())
+	assert.Equal(t, beforeMutationRevision+1, store.MutationRevision())
+	assert.True(t, receipt.Complete)
+	assert.False(t, receipt.ResolutionRelevant)
+
+	newKey := sqliteReindexKey{
+		fromID: fromID, toID: newTarget, kind: string(graph.EdgeCalls), filePath: filePath, line: 17,
+	}
+	assert.Equal(t, beforeID, reindexStoredEdgeID(t, store, newKey), "in-place conversion must preserve the SQLite row id")
+	persisted := store.GetOutEdges(fromID)
+	require.Len(t, persisted, 1)
+	edge := persisted[0]
+	assert.Equal(t, newTarget, edge.To)
+	assert.Equal(t, 0.95, edge.Confidence)
+	assert.Equal(t, "confirmed", edge.ConfidenceLabel)
+	assert.Equal(t, "compiler", edge.Origin)
+	assert.Equal(t, "semantic", edge.Tier)
+	assert.True(t, edge.CrossRepo)
+	assert.Equal(t, "new", edge.Meta["payload"])
+	assert.Equal(t, true, edge.Meta["resolve_terminal"])
+	assert.Equal(t, "bound", edge.Meta["resolve_terminal_reason"])
+	assert.Equal(t, "lsp", edge.Meta["semantic_source"])
+}
+
+func TestReindexEdgesResolvedConversionKindChangeUpdatesInPlace(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	const (
+		fromID    = "repo/caller.go::Caller"
+		oldTarget = "unresolved::Target"
+		newTarget = "repo/target.go::Target"
+		filePath  = "repo/caller.go"
+	)
+	store.AddBatch(nil, []*graph.Edge{{
+		From: fromID, To: oldTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 23,
+	}})
+	oldKey := sqliteReindexKey{
+		fromID: fromID, toID: oldTarget, kind: string(graph.EdgeCalls), filePath: filePath, line: 23,
+	}
+	beforeID := reindexStoredEdgeID(t, store, oldKey)
+
+	stats, err := store.reindexEdgesSetOriented([]graph.EdgeReindex{{
+		OldTo: oldTarget, OldKind: graph.EdgeCalls,
+		Edge: &graph.Edge{
+			From: fromID, To: newTarget, Kind: graph.EdgeReferences, FilePath: filePath, Line: 23,
+			Confidence: 0.8, ConfidenceLabel: "confirmed", Origin: "kind-change", Tier: "semantic",
+		},
+	}})
+	require.NoError(t, err)
+	assert.Zero(t, stats.selectStatements)
+	assert.Equal(t, 1, stats.updateStatements)
+	assert.Equal(t, 1, stats.updatedRows)
+	assert.Zero(t, stats.deleteStatements)
+	assert.Zero(t, stats.insertStatements)
+
+	newKey := sqliteReindexKey{
+		fromID: fromID, toID: newTarget, kind: string(graph.EdgeReferences), filePath: filePath, line: 23,
+	}
+	assert.Equal(t, beforeID, reindexStoredEdgeID(t, store, newKey))
+	persisted := store.GetOutEdges(fromID)
+	require.Len(t, persisted, 1)
+	assert.Equal(t, graph.EdgeReferences, persisted[0].Kind)
+	assert.Equal(t, "kind-change", persisted[0].Origin)
+}
+
+func TestReindexEdgesResolvedConversionShortUpdateRepairsWholeChunk(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	const (
+		filePath      = "repo/caller.go"
+		presentFrom   = "repo/caller.go::Present"
+		missingFrom   = "repo/caller.go::Missing"
+		presentOld    = "unresolved::Present"
+		missingOld    = "unresolved::Missing"
+		presentTarget = "repo/present.go::Target"
+		missingTarget = "repo/missing.go::Target"
+	)
+	store.AddBatch(nil, []*graph.Edge{{
+		From: presentFrom, To: presentOld, Kind: graph.EdgeCalls, FilePath: filePath, Line: 31,
+	}})
+	beforeAnalysisRevision := store.AnalysisMutationRevision()
+	beforeMutationRevision := store.MutationRevision()
+	batch := []graph.EdgeReindex{
+		{OldTo: presentOld, Edge: &graph.Edge{
+			From: presentFrom, To: presentTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 31,
+			Origin: "updated-before-repair",
+		}},
+		{OldTo: missingOld, Edge: &graph.Edge{
+			From: missingFrom, To: missingTarget, Kind: graph.EdgeCalls, FilePath: filePath, Line: 32,
+			Origin: "inserted-by-repair",
+		}},
+	}
+
+	token := store.BeginMutationReceipt()
+	stats, err := store.reindexEdgesSetOriented(batch)
+	require.NoError(t, err)
+	receipt := store.EndMutationReceipt(token)
+	assert.Zero(t, stats.selectStatements)
+	assert.Equal(t, 1, stats.updateStatements)
+	assert.Equal(t, 1, stats.updatedRows, "only the stored source can update before repair")
+	assert.Equal(t, 1, stats.deleteStatements)
+	assert.Zero(t, stats.deletedRows, "the successful update already removed its old identity")
+	assert.Equal(t, 1, stats.insertStatements)
+	assert.Equal(t, 1, stats.insertedRows, "repair must insert only the missing destination")
+	assert.Equal(t, 3, stats.writeStatements())
+	assert.Equal(t, beforeAnalysisRevision+1, store.AnalysisMutationRevision())
+	assert.Equal(t, beforeMutationRevision+1, store.MutationRevision())
+	assert.True(t, receipt.Complete)
+	assert.False(t, receipt.ResolutionRelevant)
+
+	present := store.GetOutEdges(presentFrom)
+	require.Len(t, present, 1)
+	assert.Equal(t, presentTarget, present[0].To)
+	assert.Equal(t, "updated-before-repair", present[0].Origin)
+	missing := store.GetOutEdges(missingFrom)
+	require.Len(t, missing, 1)
+	assert.Equal(t, missingTarget, missing[0].To)
+	assert.Equal(t, "inserted-by-repair", missing[0].Origin)
+}
+
+func reindexStoredEdgeID(t *testing.T, store *Store, key sqliteReindexKey) int64 {
+	t.Helper()
+	var id int64
+	err := store.db.QueryRow(
+		`SELECT id FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`,
+		key.fromID, key.toID, key.kind, key.filePath, key.line,
+	).Scan(&id)
+	require.NoError(t, err)
+	return id
 }
 
 func TestReindexEdgesResolvedConversionFastPathPreservesSetSemantics(t *testing.T) {
@@ -393,6 +573,8 @@ func TestReindexEdgesResolvedConversionFastPathPreservesSetSemantics(t *testing.
 	require.NoError(t, err)
 	receipt := store.EndMutationReceipt(token)
 	assert.Zero(t, stats.selectStatements, "resolved conversions must not prefetch full edge rows")
+	assert.Equal(t, 1, stats.updateStatements)
+	assert.Zero(t, stats.updatedRows, "the pre-existing destination must force exact chunk repair")
 	assert.Equal(t, 1, stats.deleteStatements)
 	assert.Equal(t, 1, stats.insertStatements)
 	assert.Equal(t, len(batch), stats.deletedRows)
@@ -423,6 +605,8 @@ func TestReindexEdgesResolvedConversionFastPathPreservesSetSemantics(t *testing.
 	require.NoError(t, err)
 	replayReceipt := store.EndMutationReceipt(token)
 	assert.Zero(t, replayStats.selectStatements)
+	assert.Equal(t, 1, replayStats.updateStatements)
+	assert.Zero(t, replayStats.updatedRows)
 	assert.Zero(t, replayStats.deletedRows)
 	assert.Zero(t, replayStats.insertedRows)
 	assert.Equal(t, replayRevision, store.AnalysisMutationRevision(), "an idempotent replay must not invalidate analysis")
@@ -469,7 +653,7 @@ func BenchmarkReindexEdgesResolvedConversions50K(b *testing.B) {
 			_ = store.Close()
 			b.Fatal(err)
 		}
-		if stats.selectStatements != 0 || stats.deletedRows != edgeCount || stats.insertedRows != edgeCount {
+		if stats.selectStatements != 0 || stats.updatedRows != edgeCount || stats.deletedRows != 0 || stats.insertedRows != 0 {
 			_ = store.Close()
 			b.Fatalf("unexpected fast-path stats: %+v", stats)
 		}

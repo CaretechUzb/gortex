@@ -14,9 +14,11 @@ const (
 	// writes that cancel do not invalidate analysis or inflate receipts. SQL is
 	// issued in VALUES relations bounded by the probed connection variable
 	// limit and the shared argument-byte budget.
-	reindexKeyParamsPerRow = 5
-	reindexRowParamsPerRow = edgeInsertParams
-	reindexRowMaxChunkSize = edgeInsertMaxChunkSize
+	reindexKeyParamsPerRow                = 5
+	reindexRowParamsPerRow                = edgeInsertParams
+	reindexRowMaxChunkSize                = edgeInsertMaxChunkSize
+	reindexResolvedUpdateParamsPerRow     = 15
+	reindexResolvedKindUpdateParamsPerRow = 16
 )
 
 type sqliteReindexKey struct {
@@ -49,20 +51,24 @@ type sqliteReindexMutation struct {
 
 type sqliteReindexSetStats struct {
 	selectStatements int
+	updateStatements int
 	deleteStatements int
 	insertStatements int
+	updatedRows      int
 	deletedRows      int
 	insertedRows     int
 }
 
 func (s sqliteReindexSetStats) writeStatements() int {
-	return s.deleteStatements + s.insertStatements
+	return s.updateStatements + s.deleteStatements + s.insertStatements
 }
 
 func (s *sqliteReindexSetStats) add(other sqliteReindexSetStats) {
 	s.selectStatements += other.selectStatements
+	s.updateStatements += other.updateStatements
 	s.deleteStatements += other.deleteStatements
 	s.insertStatements += other.insertStatements
+	s.updatedRows += other.updatedRows
 	s.deletedRows += other.deletedRows
 	s.insertedRows += other.insertedRows
 }
@@ -147,8 +153,29 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	}()
 	receipt = s.prepareSQLiteReindexReceiptTx(tx, batch)
 
-	deletes, inserts, resolvedConversionFastPath := sqliteResolvedConversionSet(mutations)
-	if !resolvedConversionFastPath {
+	sameKindUpdates, kindChangingUpdates, deletes, inserts, resolvedConversionFastPath :=
+		sqliteResolvedConversionUpdatePlan(mutations)
+	if resolvedConversionFastPath {
+		updated, statements, repairDeletes, repairInserts, updateErr :=
+			updateSQLiteResolvedConversionsTxLimited(tx, sameKindUpdates, false, &variableLimit)
+		if updateErr != nil {
+			return stats, false, false, nil, updateErr
+		}
+		stats.updatedRows += updated
+		stats.updateStatements += statements
+		deletes = append(deletes, repairDeletes...)
+		inserts = append(inserts, repairInserts...)
+
+		updated, statements, repairDeletes, repairInserts, updateErr =
+			updateSQLiteResolvedConversionsTxLimited(tx, kindChangingUpdates, true, &variableLimit)
+		if updateErr != nil {
+			return stats, false, false, nil, updateErr
+		}
+		stats.updatedRows += updated
+		stats.updateStatements += statements
+		deletes = append(deletes, repairDeletes...)
+		inserts = append(inserts, repairInserts...)
+	} else {
 		initial, selectStatements, selectErr := sqliteReindexRowsTxLimited(tx, keys, &variableLimit)
 		if selectErr != nil {
 			return stats, false, false, nil, selectErr
@@ -171,10 +198,12 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 			stats.insertedRows, len(inserts),
 		)
 	}
-	// The fast path deliberately submits every converging destination row.
-	// INSERT OR IGNORE collisions are part of its proven first-wins semantics;
-	// all destinations are resolved, so ignored rows cannot affect receipts.
-	changed = stats.deletedRows > 0 || stats.insertedRows > 0
+	// Every in-place candidate is unique across both its old and new logical
+	// key. UPDATE OR IGNORE completes the common case in one write; a short
+	// RowsAffected count repairs the whole bounded chunk through the existing
+	// ordered delete/insert path. Converging and duplicate-old mutations always
+	// take that fallback directly, preserving first-candidate-wins semantics.
+	changed = stats.updatedRows > 0 || stats.deletedRows > 0 || stats.insertedRows > 0
 	if changed && s.analysisGenerationPresent {
 		if err := invalidateAnalysisGenerationTx(tx); err != nil {
 			return stats, false, false, nil, err
@@ -276,6 +305,49 @@ func sqliteResolvedConversionSet(mutations []sqliteReindexMutation) (
 	return deletes, inserts, true
 }
 
+// sqliteResolvedConversionUpdatePlan peels off only one-to-one conversions for
+// in-place updates. Duplicate old keys and converging destinations retain the
+// ordered delete/insert path returned by sqliteResolvedConversionSet.
+func sqliteResolvedConversionUpdatePlan(mutations []sqliteReindexMutation) (
+	sameKind []sqliteReindexMutation,
+	kindChanging []sqliteReindexMutation,
+	fallbackDeletes []sqliteReindexKey,
+	fallbackInserts []sqliteReindexRow,
+	ok bool,
+) {
+	allDeletes, allInserts, ok := sqliteResolvedConversionSet(mutations)
+	if !ok {
+		return nil, nil, nil, nil, false
+	}
+
+	oldCounts := make(map[sqliteReindexKey]int, len(mutations))
+	newCounts := make(map[sqliteReindexKey]int, len(mutations))
+	for _, mutation := range mutations {
+		oldCounts[mutation.oldKey]++
+		newCounts[mutation.newRow.key]++
+	}
+
+	fallbackOld := make(map[sqliteReindexKey]struct{}, len(allDeletes))
+	fallbackDeletes = make([]sqliteReindexKey, 0, len(allDeletes))
+	fallbackInserts = make([]sqliteReindexRow, 0, len(allInserts))
+	for _, mutation := range mutations {
+		if oldCounts[mutation.oldKey] == 1 && newCounts[mutation.newRow.key] == 1 {
+			if mutation.oldKey.kind == mutation.newRow.key.kind {
+				sameKind = append(sameKind, mutation)
+			} else {
+				kindChanging = append(kindChanging, mutation)
+			}
+			continue
+		}
+		if _, seen := fallbackOld[mutation.oldKey]; !seen {
+			fallbackOld[mutation.oldKey] = struct{}{}
+			fallbackDeletes = append(fallbackDeletes, mutation.oldKey)
+		}
+		fallbackInserts = append(fallbackInserts, mutation.newRow)
+	}
+	return sameKind, kindChanging, fallbackDeletes, fallbackInserts, true
+}
+
 func sqliteReindexRowForEdge(edge *graph.Edge) (sqliteReindexRow, error) {
 	promoted, blobMeta := extractPromotedEdgeMeta(edge.Meta)
 	meta, err := encodeMeta(blobMeta)
@@ -302,6 +374,148 @@ func sqliteReindexRowForEdge(edge *graph.Edge) (sqliteReindexRow, error) {
 		semanticSource:        promoted.semanticSource,
 		receiptEdge:           edge,
 	}, nil
+}
+
+func updateSQLiteResolvedConversionsTxLimited(
+	tx *sql.Tx,
+	mutations []sqliteReindexMutation,
+	updateKind bool,
+	variableLimit *int,
+) (
+	updatedRows int,
+	statements int,
+	repairDeletes []sqliteReindexKey,
+	repairInserts []sqliteReindexRow,
+	err error,
+) {
+	if len(mutations) == 0 {
+		return 0, 0, nil, nil, nil
+	}
+	if variableLimit == nil || *variableLimit <= 0 {
+		fallback := sqliteFallbackVariableLimit
+		variableLimit = &fallback
+	}
+
+	paramsPerRow := reindexResolvedUpdateParamsPerRow
+	if updateKind {
+		paramsPerRow = reindexResolvedKindUpdateParamsPerRow
+	}
+	rowLimit := batchRowsForVariableLimit(*variableLimit, paramsPerRow, reindexRowMaxChunkSize)
+	for pos := 0; pos < len(mutations); {
+		chunkStart := pos
+		args := make([]any, 0, rowLimit*paramsPerRow)
+		argBytes := 0
+		rowCount := 0
+		for pos < len(mutations) && rowCount < rowLimit {
+			mutation := mutations[pos]
+			row := mutation.newRow
+			argStart := len(args)
+			args = append(args,
+				mutation.oldKey.fromID, mutation.oldKey.toID, mutation.oldKey.kind,
+				mutation.oldKey.filePath, mutation.oldKey.line, row.key.toID,
+			)
+			if updateKind {
+				args = append(args, row.key.kind)
+			}
+			args = append(args,
+				row.confidence, row.confidenceLabel, row.origin, row.tier,
+				row.crossRepo, row.meta, row.resolveTerminal, row.resolveTerminalReason, row.semanticSource,
+			)
+			rowBytes := sqliteBoundArgsBytes(args[argStart:])
+			if rowCount > 0 && argBytes+rowBytes > sqliteBatchMaxBoundBytes {
+				args = args[:argStart]
+				break
+			}
+			pos++
+			rowCount++
+			argBytes += rowBytes
+		}
+
+		query := sqliteResolvedConversionUpdateStatement(rowCount, updateKind)
+		result, execErr := tx.Exec(query, args...)
+		if tooManySQLVariables(execErr) && rowCount > 1 {
+			rowLimit = lowerBatchVariableLimit(variableLimit, paramsPerRow, rowCount)
+			pos = chunkStart
+			continue
+		}
+		if execErr != nil {
+			return updatedRows, statements, repairDeletes, repairInserts, execErr
+		}
+		statements++
+		affected64, affectedErr := result.RowsAffected()
+		if affectedErr != nil {
+			return updatedRows, statements, repairDeletes, repairInserts, affectedErr
+		}
+		affected := int(affected64)
+		if affected < 0 || affected > rowCount {
+			return updatedRows, statements, repairDeletes, repairInserts, fmt.Errorf(
+				"store_sqlite: resolved conversion update affected %d of %d rows",
+				affected, rowCount,
+			)
+		}
+		updatedRows += affected
+		if affected != rowCount {
+			// UPDATE OR IGNORE cannot identify which rows were skipped without
+			// materializing RETURNING rows. Replaying the whole bounded chunk is
+			// exact: successful rows already occupy their destination, while
+			// missing sources and destination collisions are repaired below.
+			for _, mutation := range mutations[chunkStart:pos] {
+				repairDeletes = append(repairDeletes, mutation.oldKey)
+				repairInserts = append(repairInserts, mutation.newRow)
+			}
+		}
+	}
+	return updatedRows, statements, repairDeletes, repairInserts, nil
+}
+
+func sqliteResolvedConversionUpdateStatement(rowCount int, updateKind bool) string {
+	if updateKind {
+		return `WITH patch(
+		old_from_id, old_to_id, old_kind, file_path, line, new_to_id, new_kind,
+		confidence, confidence_label, origin, tier, cross_repo, meta,
+		resolve_terminal, resolve_terminal_reason, semantic_source
+	) AS (VALUES ` + multiValues(rowCount, reindexResolvedKindUpdateParamsPerRow) + `)
+	UPDATE OR IGNORE edges AS e
+	SET to_id = p.new_to_id,
+		kind = p.new_kind,
+		confidence = p.confidence,
+		confidence_label = p.confidence_label,
+		origin = p.origin,
+		tier = p.tier,
+		cross_repo = p.cross_repo,
+		meta = p.meta,
+		resolve_terminal = p.resolve_terminal,
+		resolve_terminal_reason = p.resolve_terminal_reason,
+		semantic_source = p.semantic_source
+	FROM patch AS p
+	WHERE e.from_id = p.old_from_id
+		AND e.to_id = p.old_to_id
+		AND e.kind = p.old_kind
+		AND e.file_path = p.file_path
+		AND e.line = p.line`
+	}
+	return `WITH patch(
+		old_from_id, old_to_id, kind, file_path, line, new_to_id,
+		confidence, confidence_label, origin, tier, cross_repo, meta,
+		resolve_terminal, resolve_terminal_reason, semantic_source
+	) AS (VALUES ` + multiValues(rowCount, reindexResolvedUpdateParamsPerRow) + `)
+	UPDATE OR IGNORE edges AS e
+	SET to_id = p.new_to_id,
+		confidence = p.confidence,
+		confidence_label = p.confidence_label,
+		origin = p.origin,
+		tier = p.tier,
+		cross_repo = p.cross_repo,
+		meta = p.meta,
+		resolve_terminal = p.resolve_terminal,
+		resolve_terminal_reason = p.resolve_terminal_reason,
+		semantic_source = p.semantic_source
+	FROM patch AS p
+	WHERE e.from_id = p.old_from_id
+		AND e.to_id = p.old_to_id
+		AND e.kind = p.kind
+		AND e.file_path = p.file_path
+		AND e.line = p.line`
 }
 
 func sqliteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, variableLimit *int) (map[sqliteReindexKey]sqliteReindexRow, int, error) {
