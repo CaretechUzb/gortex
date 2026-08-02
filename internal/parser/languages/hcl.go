@@ -18,7 +18,11 @@ import (
 // KindConstant node addressed `local.<key>`. Cross-block value
 // expressions (var.x, local.y, module.m, data.t.n, aws_instance.web.id)
 // produce EdgeReferences edges so a change-impact walk can answer "what
-// breaks if this resource/variable changes?". Block node IDs are scoped
+// breaks if this resource/variable changes?". Config values a config
+// declares — variable/output names, and the keys an allow-listed
+// resource type declares (see tfConfigKeySites) — additionally yield
+// KindConfigKey nodes on the shared cfg::env::<NAME> ID plus an
+// EdgeUsesEnv edge from the declaring block. Block node IDs are scoped
 // to the file's directory — the Terraform module boundary — so a
 // reference in one .tf file resolves to a block defined in a sibling .tf
 // file of the same module by exact ID match.
@@ -53,7 +57,8 @@ func (e *HCLExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	dir := hclModuleDir(filePath)
 	seen := make(map[string]bool)    // block-name dedup, per file
 	refSeen := make(map[string]bool) // (from\x00to) reference dedup
-	e.walkTopLevel(root, src, filePath, dir, fileNode.ID, result, seen, refSeen)
+	cfgSeen := make(map[string]bool) // config-key node + edge dedup
+	e.walkTopLevel(root, src, filePath, dir, fileNode.ID, result, seen, refSeen, cfgSeen)
 
 	return result, nil
 }
@@ -78,7 +83,7 @@ func hclNodeID(dir, address string) string { return "hcl::" + dir + "::" + addre
 // Nested blocks (ingress, lifecycle, dynamic, …) are not separate
 // definition nodes — their value expressions are attributed to the
 // enclosing top-level block as references.
-func (e *HCLExtractor) walkTopLevel(node *sitter.Node, src []byte, filePath, dir, fileID string, result *parser.ExtractionResult, seen, refSeen map[string]bool) {
+func (e *HCLExtractor) walkTopLevel(node *sitter.Node, src []byte, filePath, dir, fileID string, result *parser.ExtractionResult, seen, refSeen, cfgSeen map[string]bool) {
 	if node == nil {
 		return
 	}
@@ -89,14 +94,14 @@ func (e *HCLExtractor) walkTopLevel(node *sitter.Node, src []byte, filePath, dir
 		}
 		switch child.Type() {
 		case "block":
-			e.extractBlock(child, src, filePath, dir, fileID, result, seen, refSeen)
+			e.extractBlock(child, src, filePath, dir, fileID, result, seen, refSeen, cfgSeen)
 		case "config_file", "body":
-			e.walkTopLevel(child, src, filePath, dir, fileID, result, seen, refSeen)
+			e.walkTopLevel(child, src, filePath, dir, fileID, result, seen, refSeen, cfgSeen)
 		}
 	}
 }
 
-func (e *HCLExtractor) extractBlock(node *sitter.Node, src []byte, filePath, dir, fileID string, result *parser.ExtractionResult, seen, refSeen map[string]bool) {
+func (e *HCLExtractor) extractBlock(node *sitter.Node, src []byte, filePath, dir, fileID string, result *parser.ExtractionResult, seen, refSeen, cfgSeen map[string]bool) {
 	// A block is: identifier (block type), string_lit labels, then body.
 	// E.g. resource "aws_instance" "web" { ... }
 	var blockType string
@@ -152,6 +157,8 @@ func (e *HCLExtractor) extractBlock(node *sitter.Node, src []byte, filePath, dir
 			FilePath: filePath, Line: startLine,
 		})
 	}
+
+	e.extractConfigKeys(blockType, labels, body, src, filePath, id, startLine, result, cfgSeen)
 
 	// A locals block declares N independently-addressable values
 	// (local.<key>); emit one KindConstant per key and resolve each
@@ -213,6 +220,217 @@ func (e *HCLExtractor) extractLocals(body *sitter.Node, src []byte, filePath, di
 			e.collectReferences(expr, src, filePath, dir, id, result, refSeen)
 		}
 	}
+}
+
+// tfConfigKeySite names, for one allowlisted Terraform resource type,
+// where that type's declared config values live: an attribute holding an
+// object literal, optionally inside a single nested block.
+type tfConfigKeySite struct {
+	block  string // enclosing nested block, "" when attr sits in the resource body
+	attr   string // attribute whose object literal declares the keys
+	source string // Meta["source"] tag for the emitted config-key nodes
+}
+
+// tfConfigKeySites is the v1 allowlist of resource types whose declared
+// config values become KindConfigKey nodes. It is deliberately an
+// allowlist of exact attribute paths rather than a general nested-block
+// traversal — every entry here is a shape where the declared key is
+// known to name a config value, which is not true of Terraform block
+// attributes in general.
+var tfConfigKeySites = map[string]tfConfigKeySite{
+	"aws_lambda_function":   {block: "environment", attr: "variables", source: "env"},
+	"kubernetes_config_map": {attr: "data", source: "k8s_cm"},
+	"kubernetes_secret":     {attr: "data", source: "k8s_secret"},
+}
+
+// extractConfigKeys emits the KindConfigKey nodes a block declares:
+// the name of a variable/output block, and each key of the object
+// literal an allowlisted resource type declares its config values in.
+// Every key lands on the shared cfg::env::<NAME> ID so a code-side
+// os.Getenv read resolves to the same node.
+func (e *HCLExtractor) extractConfigKeys(blockType string, labels []string, body *sitter.Node, src []byte, filePath, blockID string, startLine int, result *parser.ExtractionResult, cfgSeen map[string]bool) {
+	if len(labels) == 0 {
+		return
+	}
+	switch blockType {
+	case "variable", "output":
+		emitHCLConfigKey(result, blockID, labels[0], "tf_"+blockType, filePath, startLine, cfgSeen)
+		return
+	case "resource":
+	default:
+		return
+	}
+	site, ok := tfConfigKeySites[labels[0]]
+	if !ok || body == nil {
+		return
+	}
+	scope := body
+	if site.block != "" {
+		if scope = hclNestedBlockBody(body, site.block, src); scope == nil {
+			return
+		}
+	}
+	obj := hclAttrObject(scope, site.attr, src)
+	if obj == nil {
+		return
+	}
+	for i, _nc := 0, int(obj.ChildCount()); i < _nc; i++ {
+		elem := obj.Child(i)
+		if elem == nil || elem.Type() != "object_elem" {
+			continue
+		}
+		key := hclObjectElemKey(elem, src)
+		if key == "" {
+			continue
+		}
+		emitHCLConfigKey(result, blockID, key, site.source, filePath,
+			int(elem.StartPoint().Row)+1, cfgSeen)
+	}
+}
+
+// emitHCLConfigKey materialises one KindConfigKey node plus the
+// EdgeUsesEnv edge from the declaring block, mirroring the Kubernetes
+// and Dockerfile extractors. Both are deduped per file so a name
+// declared twice yields one node and one edge per declaring block.
+func emitHCLConfigKey(result *parser.ExtractionResult, fromID, name, source, filePath string, line int, cfgSeen map[string]bool) {
+	if name == "" {
+		return
+	}
+	keyID := configKeyEnvID(name)
+	if !cfgSeen[keyID] {
+		cfgSeen[keyID] = true
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: keyID, Kind: graph.KindConfigKey, Name: name,
+			FilePath: filePath, StartLine: line, EndLine: line,
+			Language: "hcl",
+			Meta: map[string]any{
+				"source": source,
+				"origin": "terraform",
+			},
+		})
+	}
+	edgeKey := fromID + "\x00" + keyID
+	if cfgSeen[edgeKey] {
+		return
+	}
+	cfgSeen[edgeKey] = true
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fromID, To: keyID, Kind: graph.EdgeUsesEnv,
+		FilePath: filePath, Line: line,
+		Meta: map[string]any{"scope": "runtime"},
+	})
+}
+
+// hclNestedBlockBody returns the body of the first nested block named
+// `name` inside body, or nil when absent. Scoped to one named block on
+// purpose — this is not a general nested-block traversal.
+func hclNestedBlockBody(body *sitter.Node, name string, src []byte) *sitter.Node {
+	for i, _nc := 0, int(body.ChildCount()); i < _nc; i++ {
+		child := body.Child(i)
+		if child == nil || child.Type() != "block" {
+			continue
+		}
+		var blockType string
+		var inner *sitter.Node
+		for j, _jc := 0, int(child.ChildCount()); j < _jc; j++ {
+			c := child.Child(j)
+			if c == nil {
+				continue
+			}
+			switch c.Type() {
+			case "identifier":
+				if blockType == "" {
+					blockType = c.Content(src)
+				}
+			case "body":
+				inner = c
+			}
+		}
+		if blockType == name {
+			return inner
+		}
+	}
+	return nil
+}
+
+// hclAttrObject returns the object node of `<name> = { … }` inside body,
+// or nil when the attribute is absent or its value isn't a literal
+// object. A map built by merge(…), a for-expression, or a reference to a
+// local has no statically enumerable keys, so those are skipped rather
+// than guessed at.
+func hclAttrObject(body *sitter.Node, name string, src []byte) *sitter.Node {
+	for i, _nc := 0, int(body.ChildCount()); i < _nc; i++ {
+		attr := body.Child(i)
+		if attr == nil || attr.Type() != "attribute" {
+			continue
+		}
+		var key string
+		var expr *sitter.Node
+		for j, _jc := 0, int(attr.ChildCount()); j < _jc; j++ {
+			c := attr.Child(j)
+			if c == nil {
+				continue
+			}
+			switch c.Type() {
+			case "identifier":
+				if key == "" {
+					key = c.Content(src)
+				}
+			case "expression":
+				expr = c
+			}
+		}
+		if key != name || expr == nil {
+			continue
+		}
+		return hclObjectOf(expr)
+	}
+	return nil
+}
+
+// hclObjectOf unwraps expression → collection_value → object. Only
+// direct children are inspected, so an object nested inside a function
+// call or for-expression is not mistaken for the attribute's own value.
+func hclObjectOf(expr *sitter.Node) *sitter.Node {
+	for i, _nc := 0, int(expr.ChildCount()); i < _nc; i++ {
+		coll := expr.Child(i)
+		if coll == nil || coll.Type() != "collection_value" {
+			continue
+		}
+		for j, _jc := 0, int(coll.ChildCount()); j < _jc; j++ {
+			if o := coll.Child(j); o != nil && o.Type() == "object" {
+				return o
+			}
+		}
+	}
+	return nil
+}
+
+// hclObjectElemKey returns the literal key of an object_elem — the bare
+// form (KEY = "v") or the quoted form ("KEY" = "v"). A computed key
+// ((var.x) = "v") has no static name and yields "".
+func hclObjectElemKey(elem *sitter.Node, src []byte) string {
+	for i, _nc := 0, int(elem.ChildCount()); i < _nc; i++ {
+		expr := elem.Child(i)
+		if expr == nil || expr.Type() != "expression" {
+			continue
+		}
+		// The first expression child is the key; the second is the value.
+		for j, _jc := 0, int(expr.ChildCount()); j < _jc; j++ {
+			c := expr.Child(j)
+			if c == nil {
+				continue
+			}
+			switch c.Type() {
+			case "variable_expr":
+				return hclIdentText(c, src)
+			case "literal_value":
+				return trimQuotes(strings.TrimSpace(c.Content(src)))
+			}
+		}
+		return ""
+	}
+	return ""
 }
 
 // collectReferences walks an expression subtree and emits an
