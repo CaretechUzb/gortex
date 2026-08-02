@@ -104,7 +104,12 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 			parseLease.Release()
 		}
 	}()
-	relPath := idx.relKey(absPath)
+	// graphRelKey, not relKey: this path is stamped onto node IDs by the
+	// extractor below and becomes the graph key at prefixPath(). relKey
+	// slash-normalises, which on Windows mints "repo/a/b.go" while the
+	// cold walk already stored "repo/a\b.go" — a second node for the
+	// same file rather than an update of the first.
+	relPath := idx.graphRelKey(absPath)
 
 	started := time.Now()
 	src, readVersion, err := readFileWithVersion(absPath)
