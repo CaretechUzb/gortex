@@ -94,6 +94,40 @@ type SymbolBundleSearcherBackend interface {
 	SearchSymbolBundles(query string, limit int) []SymbolBundle
 }
 
+// SearchSymbolBundlesScoped is the repo-narrowed bundle path — the
+// narrowing runs inside the wrapped store's FTS query (see
+// graph.ScopedSymbolBundleSearcher for why a post-fetch filter can't
+// substitute). Returns nil when the store has no scoped support;
+// callers fall back to the unscoped bundle path.
+func (b *SymbolSearcherBackend) SearchSymbolBundlesScoped(query string, repoAllow []string, limit int) []SymbolBundle {
+	if b == nil || b.s == nil || strings.TrimSpace(query) == "" {
+		return nil
+	}
+	bs, ok := b.s.(graph.ScopedSymbolBundleSearcher)
+	if !ok {
+		return nil
+	}
+	bundles, err := bs.SearchSymbolBundlesRepoScoped(query, repoAllow, limit)
+	if err != nil {
+		return nil
+	}
+	if bundles == nil {
+		// Non-nil empty = "scoped path answered: nothing in scope".
+		// Callers fall back to the unscoped fetch only on nil — a
+		// genuine zero must not trigger a doomed cross-repo flood
+		// query whose head ScopeAllows would discard wholesale.
+		return []SymbolBundle{}
+	}
+	return bundles
+}
+
+// ScopedSymbolBundleSearcherBackend is the engine's detection
+// interface for the repo-narrowed bundle path. *SymbolSearcherBackend
+// implements it; Swappable and HybridBackend forward.
+type ScopedSymbolBundleSearcherBackend interface {
+	SearchSymbolBundlesScoped(query string, repoAllow []string, limit int) []SymbolBundle
+}
+
 // Search forwards to SymbolSearcher.SearchSymbols and translates
 // the per-hit (NodeID, Score) into search.SearchResult so callers
 // don't see the graph package at all.
@@ -155,6 +189,14 @@ func (b *SymbolSearcherBackend) Count() int {
 		}
 	})
 	return int(b.count.Load())
+}
+
+// DocCounter is the capability interface for the authoritative corpus
+// size — distinct from Backend.Count(), which is a process-local
+// Add/Remove delta. The engine's has-corpus gate asserts this;
+// Swappable and HybridBackend forward it.
+type DocCounter interface {
+	DocCount() (int, bool)
 }
 
 // DocCount returns the authoritative number of indexed documents, straight

@@ -723,6 +723,16 @@ type SymbolBundleSearcher interface {
 	SearchSymbolBundles(query string, limit int) ([]SymbolBundle, error)
 }
 
+// ScopedSymbolBundleSearcher is the repo-narrowed variant of
+// SymbolBundleSearcher: repoAllow filters inside the FTS query, not
+// over a bounded fetched head — a post-fetch filter starves when
+// out-of-scope rows outrank every in-scope one deeper than any
+// over-fetch. Unowned rows (empty repo prefix) always pass, the
+// ScopeAllows carve-out.
+type ScopedSymbolBundleSearcher interface {
+	SearchSymbolBundlesRepoScoped(query string, repoAllow []string, limit int) ([]SymbolBundle, error)
+}
+
 // VectorItem is the payload BulkUpsertEmbeddings takes per node:
 // the node's ID and its embedding vector. Length of Vec must
 // match the dim the corresponding BuildVectorIndex call declared

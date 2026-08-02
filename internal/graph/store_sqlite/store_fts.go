@@ -42,12 +42,13 @@ import (
 // implements them, routing search_symbols through on-disk FTS5 instead
 // of the in-process BM25 index.
 var (
-	_ graph.SymbolSearcher         = (*Store)(nil)
-	_ graph.SymbolFTSBatchUpserter = (*Store)(nil)
-	_ graph.SymbolFTSRepoResetter  = (*Store)(nil)
-	_ graph.SymbolFTSBatchDeleter  = (*Store)(nil)
-	_ graph.SymbolBundleSearcher   = (*Store)(nil)
-	_ graph.BundleFingerprintSink  = (*Store)(nil)
+	_ graph.SymbolSearcher             = (*Store)(nil)
+	_ graph.SymbolFTSBatchUpserter     = (*Store)(nil)
+	_ graph.SymbolFTSRepoResetter      = (*Store)(nil)
+	_ graph.SymbolFTSBatchDeleter      = (*Store)(nil)
+	_ graph.SymbolBundleSearcher       = (*Store)(nil)
+	_ graph.ScopedSymbolBundleSearcher = (*Store)(nil)
+	_ graph.BundleFingerprintSink      = (*Store)(nil)
 )
 
 // ftsInsertChunkRows bounds the rows per multi-row INSERT. Each FTS row
@@ -516,25 +517,54 @@ func (s *Store) BuildSymbolIndex() error {
 // SQLite's bm25() returns lower-is-better, so the stored Score is its
 // negation (higher-is-better, matching the SymbolHit contract).
 func (s *Store) SearchSymbols(query string, limit int) ([]graph.SymbolHit, error) {
+	return s.SearchSymbolsRepoScoped(query, nil, limit)
+}
+
+// SearchSymbolsRepoScoped is SearchSymbols narrowed to the repoAllow
+// prefixes inside the queries themselves — a post-fetch scope filter
+// starves whenever another repo owns the whole BM25 head, which can
+// run deeper than any bounded over-fetch. Filtering the UNINDEXED
+// repo_prefix column here is free: the rows are already materialised
+// by the MATCH + bm25 ORDER BY (the plan is identical with and
+// without the IN). A nil / empty repoAllow is the exact unscoped
+// behaviour.
+func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit int) ([]graph.SymbolHit, error) {
 	if query == "" {
 		return nil, nil
 	}
 	if limit <= 0 {
 		limit = 20
 	}
+	var allowed map[string]struct{}
+	if len(repoAllow) > 0 {
+		allowed = make(map[string]struct{}, len(repoAllow))
+		for _, r := range repoAllow {
+			allowed[r] = struct{}{}
+		}
+	}
 
 	// Tier 0: exact-name lookup. Only engage for identifier-shaped
 	// queries (no whitespace / path separators); multi-word queries are
 	// concept searches that need BM25 ranking. We only short-circuit
-	// when the lookup hits at least one node — misses fall through so a
-	// partial-identifier query still reaches FTS.
+	// when the lookup hits at least one IN-SCOPE, SYMBOL-LIKE node —
+	// out-of-scope exact matches must not mask the scoped FTS tier
+	// below, and neither may container/binding kinds: a .NET project
+	// module named "Extensions" would otherwise eclipse every
+	// `*Extensions` class the FTS ranks first.
 	if isIdentifierQuery(query) {
 		ns := s.FindNodesByName(query)
 		if len(ns) > 0 {
 			out := make([]graph.SymbolHit, 0, minInt(len(ns), limit))
 			for _, n := range ns {
-				if n == nil || n.ID == "" {
+				if n == nil || n.ID == "" || !tier0ShortCircuitKind(n.Kind) {
 					continue
+				}
+				// Unowned nodes (empty prefix) pass every repo narrow —
+				// the ScopeAllows carve-out.
+				if allowed != nil && n.RepoPrefix != "" {
+					if _, ok := allowed[n.RepoPrefix]; !ok {
+						continue
+					}
 				}
 				out = append(out, graph.SymbolHit{NodeID: n.ID, Score: 100.0})
 				if len(out) >= limit {
@@ -552,8 +582,20 @@ func (s *Store) SearchSymbols(query string, limit int) ([]graph.SymbolHit, error
 		return nil, nil
 	}
 
-	const q = `SELECT node_id, bm25(symbol_fts) FROM symbol_fts WHERE symbol_fts MATCH ? ORDER BY bm25(symbol_fts) LIMIT ?`
-	rows, err := s.db.Query(q, match, limit)
+	q := `SELECT node_id, bm25(symbol_fts) FROM symbol_fts WHERE symbol_fts MATCH ?`
+	args := []any{match}
+	if len(repoAllow) > 0 {
+		// The empty prefix always passes: unowned rows (synthetic
+		// externals) are admitted by every repo-narrow predicate — see
+		// QueryOptions.ScopeAllows for the invariant.
+		q += ` AND repo_prefix IN ('', ?` + strings.Repeat(`,?`, len(repoAllow)-1) + `)`
+		for _, r := range repoAllow {
+			args = append(args, r)
+		}
+	}
+	q += ` ORDER BY bm25(symbol_fts) LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -580,6 +622,22 @@ func (s *Store) SearchSymbols(query string, limit int) ([]graph.SymbolHit, error
 		return nil, err
 	}
 	return hits, nil
+}
+
+// tier0ShortCircuitKind reports whether an exact-name hit may
+// short-circuit the FTS tier. Container and binding kinds are excluded:
+// they share names with the symbols users actually search for (a
+// project/module named X vs the X* classes inside it) and a search page
+// of containers eclipses the ranked symbols outright. They remain
+// reachable through the FTS tier's own ranking.
+func tier0ShortCircuitKind(k graph.NodeKind) bool {
+	switch k {
+	case graph.KindModule, graph.KindPackage, graph.KindFile, graph.KindImport,
+		graph.KindLocal, graph.KindParam, graph.KindGenericParam, graph.KindClosure,
+		graph.KindBuiltin:
+		return false
+	}
+	return true
 }
 
 // buildFTSMatch tokenises the query with the write-side splitter and
@@ -627,6 +685,23 @@ func (s *Store) SearchSymbolBundles(query string, limit int) ([]graph.SymbolBund
 	if err != nil {
 		return nil, err
 	}
+	return s.bundlesForHits(hits)
+}
+
+// SearchSymbolBundlesRepoScoped is SearchSymbolBundles over the
+// repo-scoped hit query — see SearchSymbolsRepoScoped for why the
+// narrowing must happen inside the FTS query.
+func (s *Store) SearchSymbolBundlesRepoScoped(query string, repoAllow []string, limit int) ([]graph.SymbolBundle, error) {
+	hits, err := s.SearchSymbolsRepoScoped(query, repoAllow, limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.bundlesForHits(hits)
+}
+
+// bundlesForHits materialises ranked hits into SymbolBundles through
+// the content-addressed cache + batched node/edge fetches.
+func (s *Store) bundlesForHits(hits []graph.SymbolHit) ([]graph.SymbolBundle, error) {
 	if len(hits) == 0 {
 		return nil, nil
 	}

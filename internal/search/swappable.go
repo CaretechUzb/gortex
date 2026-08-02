@@ -117,6 +117,35 @@ func (s *Swappable) SearchSymbolBundles(query string, limit int) []SymbolBundle 
 	return nil
 }
 
+// DocCount forwards the authoritative corpus size when the inner
+// backend exposes it — the engine's has-corpus gate reads this so a
+// warm-started daemon over a populated disk FTS isn't mistaken for an
+// empty backend.
+func (s *Swappable) DocCount() (int, bool) {
+	// Snapshot the inner backend under the lock but run the count
+	// outside it — DocCount can be a real store query and holding
+	// the RLock across it would stall a pending Swap (and, behind
+	// it, every new reader).
+	s.mu.RLock()
+	inner := s.inner
+	s.mu.RUnlock()
+	if dc, ok := inner.(DocCounter); ok {
+		return dc.DocCount()
+	}
+	return 0, false
+}
+
+// SearchSymbolBundlesScoped forwards the repo-narrowed bundle path the
+// same way; nil when the inner backend doesn't expose it.
+func (s *Swappable) SearchSymbolBundlesScoped(query string, repoAllow []string, limit int) []SymbolBundle {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if bs, ok := s.inner.(ScopedSymbolBundleSearcherBackend); ok {
+		return bs.SearchSymbolBundlesScoped(query, repoAllow, limit)
+	}
+	return nil
+}
+
 // VectorChannelOnly forwards to the inner backend when it implements
 // the vector-only channel pull (today: HybridBackend). Lets the
 // engine fetch the vector channel without re-running text BM25 —

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -31,6 +32,14 @@ type Engine struct {
 	g              graph.Reader
 	searchProvider SearchProvider
 	rerank         *rerank.Pipeline
+	// corpusSeen memoises a positive backendHasCorpus answer. The
+	// DocCount fallback is a real COUNT(*) on the disk store and the
+	// warm-restart window (delta Count 0, populated disk FTS) would
+	// otherwise pay it on every gather; a corpus never un-populates
+	// within a backend's lifetime. Reset by SetSearch/SetSearchProvider.
+	// Pointer so WithReader clones share it (same backend, same corpus)
+	// and the shallow copy stays vet-clean.
+	corpusSeen *atomic.Bool
 }
 
 // WithReader returns a shallow clone of the engine that reads
@@ -56,7 +65,7 @@ func (e *Engine) Reader() graph.Reader { return e.g }
 // default 11-signal rerank.Pipeline is wired in; callers wanting a
 // custom signal set / weights override via SetRerank.
 func NewEngine(g graph.Store) *Engine {
-	return &Engine{g: g, rerank: rerank.NewDefault()}
+	return &Engine{g: g, rerank: rerank.NewDefault(), corpusSeen: &atomic.Bool{}}
 }
 
 // SetRerank installs a custom rerank pipeline. Pass nil to disable
@@ -83,11 +92,13 @@ func (e *Engine) ApplyRerankWeights(weights map[string]float64) {
 // SetSearch sets a static search backend (for backward compatibility).
 func (e *Engine) SetSearch(s search.Backend) {
 	e.searchProvider = func() search.Backend { return s }
+	e.corpusSeen.Store(false)
 }
 
 // SetSearchProvider sets a dynamic search provider that is called on every query.
 func (e *Engine) SetSearchProvider(p SearchProvider) {
 	e.searchProvider = p
+	e.corpusSeen.Store(false)
 }
 
 // getSearch returns the current search backend.
@@ -484,9 +495,17 @@ func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptio
 	}
 	fetchLimit := limit
 	if opts.hasScopeFilter() {
+		// Over-fetch so the post-fetch scope filter still fills the
+		// page, but never clamp below the caller's own ask — an
+		// explicit deep limit (the wipeout-escalation refetch) exists
+		// precisely to dig past this cap, and flattening it turns the
+		// deeper iterations into byte-identical re-queries.
 		fetchLimit = limit * 4
 		if fetchLimit > 200 {
 			fetchLimit = 200
+		}
+		if fetchLimit < limit {
+			fetchLimit = limit
 		}
 	}
 
@@ -496,7 +515,7 @@ func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptio
 	}
 
 	var cands []*rerank.Candidate
-	if s := e.getSearch(); s != nil && s.Count() > 0 {
+	if s := e.getSearch(); s != nil && e.backendHasCorpus(s) {
 		cands = e.gatherBackendCandidates(query, fetchLimit, opts, gatherCtx)
 	} else {
 		start := time.Now()
@@ -610,6 +629,45 @@ func (e *Engine) SearchSymbolsScoped(query string, limit int, opts QueryOptions)
 	return out
 }
 
+// backendHasCorpus reports whether the search backend has anything to
+// answer with. Count() alone is wrong here: it is a delta of THIS
+// process's Add/Remove calls, so a daemon warm-started over a
+// populated disk FTS reads 0 and every search would silently divert
+// to the substring fallback until the first file edit. The
+// authoritative disk corpus size rides DocCount when the backend
+// exposes it (the SymbolSearcherBackend chain does); a positive
+// answer is memoised — see Engine.corpusSeen.
+func (e *Engine) backendHasCorpus(s search.Backend) bool {
+	if e.corpusSeen != nil && e.corpusSeen.Load() {
+		return true
+	}
+	has := false
+	if s.Count() > 0 {
+		has = true
+	} else if dc, ok := s.(search.DocCounter); ok {
+		if n, known := dc.DocCount(); known && n > 0 {
+			has = true
+		}
+	}
+	if has && e.corpusSeen != nil {
+		e.corpusSeen.Store(true)
+	}
+	return has
+}
+
+// repoAllowList flattens a RepoAllow set into a sorted slice for the
+// scoped backend call — sorted so the generated SQL is deterministic.
+func repoAllowList(allow map[string]bool) []string {
+	out := make([]string, 0, len(allow))
+	for r, ok := range allow {
+		if ok {
+			out = append(out, r)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // gatherBackendCandidates fetches BM25 + (optional) vector results,
 // dedups them across channels, and supplements with exact-name /
 // substring / bigram-rescue matches. Each candidate carries its
@@ -658,7 +716,30 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		}
 		vectorOnlyBackend, vectorOnlyOK := backend.(vectorOnly)
 		bundleStart := time.Now()
-		bundles := bsb.SearchSymbolBundles(query, limit*2)
+		// Repo-narrowed sessions take the scoped bundle path when the
+		// backend can filter inside the FTS query. The post-fetch
+		// ScopeAllows pass below starves whenever another repo owns the
+		// whole BM25 head deeper than this fetch — only the backend can
+		// narrow without a depth limit.
+		var bundles []search.SymbolBundle
+		// Gate on the flattened list, not the map: an all-false map is
+		// "deny everything" under ScopeAllows and must not select the
+		// scoped path with an empty (= unscoped!) allow list.
+		scopedAnswered := false
+		if allow := repoAllowList(opts.RepoAllow); len(allow) > 0 {
+			if sb, ok := backend.(search.ScopedSymbolBundleSearcherBackend); ok {
+				bundles = sb.SearchSymbolBundlesScoped(query, allow, limit*2)
+				// nil = no scoped support (or error); anything non-nil —
+				// an empty slice included — is the scoped path's answer.
+				scopedAnswered = bundles != nil
+			}
+		}
+		// nil = no scoped support (or error); a non-nil empty slice is
+		// the scoped path's real answer and must NOT trigger the
+		// unscoped flood fetch its emptiness proves useless.
+		if bundles == nil {
+			bundles = bsb.SearchSymbolBundles(query, limit*2)
+		}
 		if timings != nil {
 			timings.BundleMS += time.Since(bundleStart).Milliseconds()
 		}
@@ -687,6 +768,12 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 			if rctx != nil {
 				rctx.SeedEdgeCaches(inSeed, outSeed, true)
 			}
+		} else if scopedAnswered {
+			// A scoped query that answered zero IS the answer. Leaving
+			// bundleHandled false here would send the miss down the
+			// unscoped channel fallback — re-running the very cross-repo
+			// flood fetch the scoped path exists to remove.
+			bundleHandled = true
 		}
 		// Vector channel: only when the bundle path took the BM25
 		// branch. Otherwise the fallback path below pulls both.
