@@ -111,11 +111,11 @@ func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
 	}
 
 	sameFileTarget := newFnValueSameFileTargetLookup(g, candidates)
-	// Collapse globally-scoped callback lookups into the store's bounded batched
-	// name query. Same-file-only candidates stay out of this memo so a large
-	// callback census does not retain unrelated node payloads. No nodes mutate
-	// before the AddBatch tail, so the prefetched rows remain valid for the pass.
-	nameMemo := prefetchFnValueNameMemo(g, candidates, sameFileTarget)
+	// Resolve global names lazily. Most candidates bind within their file, so a
+	// pass-wide FindNodesByNames prefetch decodes and retains a much larger node
+	// set than the gate uses. The memo still collapses repeated positive and
+	// negative lookups to one bounded store query per distinct global name.
+	nameMemo := make(map[string][]*graph.Node)
 	var landed []*graph.Edge
 	for _, edge := range candidates {
 		name, _ := edge.Meta[metaFnValueName].(string)
@@ -193,62 +193,6 @@ func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
 		g.AddBatch(nil, landed[start:end])
 	}
 	return len(landed)
-}
-
-// prefetchFnValueNameMemo batches only names whose resolution can leave the
-// candidate's file. FindNodesByNames chunks internally, and the pass-level memo
-// remains bounded by the distinct globally-shaped candidate names. Missing
-// names are recorded explicitly so the compatibility helper never falls back
-// to one query per miss.
-func prefetchFnValueNameMemo(
-	g graph.Store,
-	candidates []*graph.Edge,
-	sameFileTarget func(filePath, name string) string,
-) map[string][]*graph.Node {
-	memo := make(map[string][]*graph.Node)
-	if g == nil || len(candidates) == 0 {
-		return memo
-	}
-
-	names := make([]string, 0)
-	seen := make(map[string]struct{})
-	for _, edge := range candidates {
-		if edge == nil || edge.Meta == nil {
-			continue
-		}
-		name, _ := edge.Meta[metaFnValueName].(string)
-		if name == "" {
-			continue
-		}
-		recvHint, _ := edge.Meta["fn_ref_recv_hint"].(string)
-		skipGate, _ := edge.Meta["skip_gate"].(bool)
-		ungated, _ := edge.Meta["fn_value_ungated"].(bool)
-		needsGlobal := skipGate || recvHint != ""
-		if !needsGlobal && ungated &&
-			(sameFileTarget == nil || sameFileTarget(edge.FilePath, name) == "") {
-			needsGlobal = true
-		}
-		if !needsGlobal {
-			continue
-		}
-		if _, duplicate := seen[name]; duplicate {
-			continue
-		}
-		seen[name] = struct{}{}
-		names = append(names, name)
-	}
-	if len(names) == 0 {
-		return memo
-	}
-	for name, nodes := range g.FindNodesByNames(names) {
-		memo[name] = nodes
-	}
-	for _, name := range names {
-		if _, found := memo[name]; !found {
-			memo[name] = nil
-		}
-	}
-	return memo
 }
 
 type fnValueFileName struct {

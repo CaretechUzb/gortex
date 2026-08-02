@@ -10,11 +10,13 @@ type fnValueNameBatchRecordingStore struct {
 	graph.Store
 	findByNameCalls  int
 	findByNamesCalls int
+	exactNames       []string
 	batchedNames     []string
 }
 
 func (s *fnValueNameBatchRecordingStore) FindNodesByName(name string) []*graph.Node {
 	s.findByNameCalls++
+	s.exactNames = append(s.exactNames, name)
 	return s.Store.FindNodesByName(name)
 }
 
@@ -24,7 +26,7 @@ func (s *fnValueNameBatchRecordingStore) FindNodesByNames(names []string) map[st
 	return s.Store.FindNodesByNames(names)
 }
 
-func TestResolveFnValueCallbacksBatchesOnlyGlobalNameLookups(t *testing.T) {
+func TestResolveFnValueCallbacksLazilyMemoizesGlobalNameLookups(t *testing.T) {
 	base := graph.New()
 	source := &graph.Node{
 		ID: "src.go::register", Kind: graph.KindFunction, Name: "register",
@@ -52,6 +54,9 @@ func TestResolveFnValueCallbacksBatchesOnlyGlobalNameLookups(t *testing.T) {
 		candidate("handlerA", 1, map[string]any{"skip_gate": true}),
 		candidate("handlerB", 2, map[string]any{"skip_gate": true}),
 		candidate("missingHandler", 3, map[string]any{"skip_gate": true}),
+		// A repeated miss must reuse the negative memo entry instead of querying
+		// the store again.
+		candidate("missingHandler", 5, map[string]any{"skip_gate": true}),
 		// This candidate may fall back globally, but its same-file definition
 		// wins, so it must not inflate the global name batch.
 		candidate("localHandler", 4, map[string]any{"fn_value_ungated": true}),
@@ -62,19 +67,19 @@ func TestResolveFnValueCallbacksBatchesOnlyGlobalNameLookups(t *testing.T) {
 	if got := ResolveFnValueCallbacks(store); got != 3 {
 		t.Fatalf("resolved callbacks = %d, want 3", got)
 	}
-	if store.findByNamesCalls != 1 {
-		t.Fatalf("FindNodesByNames calls = %d, want 1", store.findByNamesCalls)
-	}
-	if store.findByNameCalls != 0 {
-		t.Fatalf("FindNodesByName calls = %d, want 0 (including missing-name negative cache)", store.findByNameCalls)
+	if store.findByNamesCalls != 0 {
+		t.Fatalf("FindNodesByNames calls = %d, want 0", store.findByNamesCalls)
 	}
 	wantNames := []string{"handlerA", "handlerB", "missingHandler"}
-	if len(store.batchedNames) != len(wantNames) {
-		t.Fatalf("batched names = %v, want %v", store.batchedNames, wantNames)
+	if store.findByNameCalls != len(wantNames) {
+		t.Fatalf("FindNodesByName calls = %d, want %d (including one memoized miss)", store.findByNameCalls, len(wantNames))
+	}
+	if len(store.exactNames) != len(wantNames) {
+		t.Fatalf("exact names = %v, want %v", store.exactNames, wantNames)
 	}
 	for i := range wantNames {
-		if store.batchedNames[i] != wantNames[i] {
-			t.Fatalf("batched names = %v, want %v", store.batchedNames, wantNames)
+		if store.exactNames[i] != wantNames[i] {
+			t.Fatalf("exact names = %v, want %v", store.exactNames, wantNames)
 		}
 	}
 	for _, target := range []string{
