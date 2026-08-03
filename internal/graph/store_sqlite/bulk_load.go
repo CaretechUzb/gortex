@@ -356,12 +356,12 @@ func (s *Store) beginBulkLoadLocked() {
 func (s *Store) FlushBulk() error {
 	s.writeMu.Lock()
 	if s.coordinatedBulkLoad {
-		// A nested repository boundary is a WAL-pressure checkpoint, not an
-		// index boundary. The deterministic row limits in noteBulkRowsLocked
-		// seal dense indexes when enough corpus has actually accumulated;
-		// sealing here lets the first tiny repository re-enable per-row index
-		// maintenance for the rest of a cold workspace.
-		s.checkpointBulkWALPassiveLocked("repo_flush")
+		// The outer coordinated window owns index sealing and its final
+		// durability checkpoint. WAL pressure inside that window is already
+		// bounded by noteBulkRowsLocked's deterministic row intervals. A nested
+		// repository boundary can coincide with an unrelated read snapshot and
+		// spend the full passive-checkpoint timeout without advancing the WAL;
+		// repeating that timeout once per repository only stalls the cold path.
 		s.writeMu.Unlock()
 		return nil
 	}

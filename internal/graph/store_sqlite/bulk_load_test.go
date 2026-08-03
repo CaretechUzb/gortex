@@ -342,16 +342,21 @@ func TestCoordinatedBulkLoadKeepsIndexesDeferredAcrossNestedRepoFlushes(t *testi
 	}
 	assertIndexesDropped("outer begin")
 
-	var sealEvents []bulkFinalizeEvent
+	var sealEvents, checkpointEvents, finalCheckpointEvents []bulkFinalizeEvent
 	s.bulkFinalizeObserver = func(event bulkFinalizeEvent) {
-		if event.Stage == "index_seal" && event.Err == nil {
+		switch {
+		case event.Stage == "index_seal" && event.Err == nil:
 			sealEvents = append(sealEvents, event)
+		case event.Stage == "checkpoint_passive":
+			checkpointEvents = append(checkpointEvents, event)
+		case event.Stage == "checkpoint" && event.Name == "wal_passive":
+			finalCheckpointEvents = append(finalCheckpointEvents, event)
 		}
 	}
 
-	// Mirror two small repository shadow drains. Nested boundaries may
-	// checkpoint WAL pressure, but they must leave the dense indexes deferred
-	// until the deterministic row limit or the outer final boundary.
+	// Mirror two small repository shadow drains. Nested boundaries neither
+	// checkpoint nor seal: deterministic row limits own WAL pressure inside the
+	// coordinated window, and the outer final boundary owns index durability.
 	for _, repo := range []string{"repo-a", "repo-b"} {
 		s.BeginBulkLoad()
 		s.AddBatch([]*graph.Node{{
@@ -369,12 +374,18 @@ func TestCoordinatedBulkLoadKeepsIndexesDeferredAcrossNestedRepoFlushes(t *testi
 	if len(sealEvents) != 0 {
 		t.Fatalf("nested repository flushes sealed indexes: %+v", sealEvents)
 	}
+	if len(checkpointEvents) != 0 {
+		t.Fatalf("nested repository flushes checkpointed WAL: %+v", checkpointEvents)
+	}
 
 	if err := s.EndCoordinatedBulkLoad(); err != nil {
 		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
 	}
 	if len(sealEvents) != 1 || sealEvents[0].Name != "final" || sealEvents[0].NodeRows != 2 {
 		t.Fatalf("seal events = %+v, want one final event for two rows", sealEvents)
+	}
+	if len(finalCheckpointEvents) != 1 {
+		t.Fatalf("final checkpoint events = %+v, want one wal_passive event", finalCheckpointEvents)
 	}
 	if s.coordinatedBulkLoad || s.bulkConn != nil {
 		t.Fatal("coordinated bulk state not released")
@@ -391,6 +402,48 @@ func TestCoordinatedBulkLoadKeepsIndexesDeferredAcrossNestedRepoFlushes(t *testi
 	integrityOK(t, s.db)
 	if s.BeginCoordinatedBulkLoad() {
 		t.Fatal("coordinated fast path engaged on populated warm store")
+	}
+}
+
+func TestCoordinatedBulkLoadCarriesCheckpointCadenceAcrossNestedFlushes(t *testing.T) {
+	s, _ := openTempStore(t)
+	if !s.BeginCoordinatedBulkLoad() {
+		t.Fatal("coordinated fast path did not engage")
+	}
+	s.bulkCheckpointNodeRows = bulkCheckpointNodeInterval - 2
+
+	var checkpoints []bulkFinalizeEvent
+	s.bulkFinalizeObserver = func(event bulkFinalizeEvent) {
+		if event.Stage == "checkpoint_passive" && event.Name == "row_limit" {
+			checkpoints = append(checkpoints, event)
+		}
+	}
+
+	for i, repo := range []string{"repo-a", "repo-b"} {
+		s.BeginBulkLoad()
+		s.AddNode(&graph.Node{
+			ID: repo + "/a.go::A", Kind: graph.KindFunction, Name: "A",
+			FilePath: repo + "/a.go", RepoPrefix: repo,
+		})
+		if err := s.FlushBulk(); err != nil {
+			t.Fatalf("nested %s FlushBulk: %v", repo, err)
+		}
+		switch i {
+		case 0:
+			if len(checkpoints) != 0 || s.bulkCheckpointNodeRows != bulkCheckpointNodeInterval-1 {
+				t.Fatalf("first nested flush changed cadence: events=%+v rows=%d", checkpoints, s.bulkCheckpointNodeRows)
+			}
+		case 1:
+			if len(checkpoints) != 1 || checkpoints[0].NodeRows != bulkCheckpointNodeInterval {
+				t.Fatalf("row checkpoints = %+v, want one at %d node rows", checkpoints, bulkCheckpointNodeInterval)
+			}
+			if s.bulkCheckpointNodeRows != 0 || s.bulkCheckpointEdgeRows != 0 {
+				t.Fatalf("checkpoint counters not reset: nodes=%d edges=%d", s.bulkCheckpointNodeRows, s.bulkCheckpointEdgeRows)
+			}
+		}
+	}
+	if err := s.EndCoordinatedBulkLoad(); err != nil {
+		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
 	}
 }
 
