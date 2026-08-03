@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 // extractorVersions records the logic version of each language's
@@ -27,7 +29,7 @@ var extractorVersions = map[string]int{
 	// the same change that alters a language's extraction logic, e.g.
 	//   "go": 2,
 	"php":    2, // class/interface inheritance now emits typed structural edges
-	"csharp": 3, // global/static using stamps + builtin receiver stamp for extension binding (was: null-conditional call edges; caseless reference forms)
+	"csharp": 3, // scoped/global using + receiver/param shape stamps for extension binding (was: null-conditional call edges; caseless reference forms)
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
@@ -141,6 +143,41 @@ func staleLangsBetween(stored, current map[string]int) []string {
 	}
 	sort.Strings(stale)
 	return stale
+}
+
+// extractorVersionStaleLangSet reads the repo's persisted extractor
+// versions and returns the languages the running binary has bumped
+// since. nil when the backend has no durable index state (the
+// in-memory graph), no row was recorded, or nothing is stale — the
+// non-Merkle upgrade path is then inert, exactly the pre-feature
+// behaviour.
+func (idx *Indexer) extractorVersionStaleLangSet() map[string]struct{} {
+	r, ok := graph.Store(idx.graph).(graph.RepoIndexStateReader)
+	if !ok {
+		return nil
+	}
+	st, found, err := r.GetRepoIndexState(idx.repoPrefix)
+	if err != nil || !found {
+		return nil
+	}
+	langs := ExtractorVersionStaleLangs(st.ExtractorVersions)
+	if len(langs) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(langs))
+	for _, lang := range langs {
+		set[lang] = struct{}{}
+	}
+	return set
+}
+
+// extractorLangStale reports whether rel belongs to a language in set.
+func extractorLangStale(set map[string]struct{}, rel string) bool {
+	if len(set) == 0 {
+		return false
+	}
+	_, ok := set[ExtractorLangForFile(rel)]
+	return ok
 }
 
 // extractorVersionsSnapshot returns a copy of the current per-language

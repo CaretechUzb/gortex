@@ -219,3 +219,34 @@ namespace App {
 	assert.True(t, graph.IsUnresolvedTarget(fooCallEdgeTarget(t, g, mID)),
 		"with the global using deleted neither extension namespace is visible — the stale LibA bind must not survive the eviction")
 }
+
+// TestIncrementalSave_GlobalUsingStaticEditReresolvesDependents: the
+// static form of a global using is compilation-scoped too — swapping
+// its target class must re-price every dependent's extension binds.
+func TestIncrementalSave_GlobalUsingStaticEditReresolvesDependents(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "W.cs"), csVisCrate)
+	writeFile(t, filepath.Join(dir, "E1.cs"), csVisExtA)
+	writeFile(t, filepath.Join(dir, "E2.cs"), csVisExtB)
+	usingsPath := filepath.Join(dir, "Usings.cs")
+	writeFile(t, usingsPath, "global using static LibA.E1;\n")
+	writeFile(t, filepath.Join(dir, "Caller.cs"), `using W;
+namespace App {
+    public class R {
+        public void M() {
+            Crate c = new Crate();
+            c.Foo();
+        }
+    }
+}
+`)
+	g, idx := newCSVisIndexer(t, dir)
+	mID := fnNodeID(t, g, "Caller.cs", "M")
+	require.Contains(t, fooCallEdgeTarget(t, g, mID), "E1.Foo",
+		"baseline: the global using static admits E1's extensions unit-wide")
+
+	writeFile(t, usingsPath, "global using static LibB.E2;\n")
+	require.NoError(t, idx.IndexFile(usingsPath))
+	assert.Contains(t, fooCallEdgeTarget(t, g, mID), "E2.Foo",
+		"the global-using-static swap changed every dependent's visibility — Caller.cs must re-bind to E2")
+}

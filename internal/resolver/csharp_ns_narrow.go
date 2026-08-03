@@ -86,6 +86,12 @@ func (r *Resolver) csharpFileNamespaceSet(fileID string) csharpFileNS {
 			ns.scoped[""][u] = struct{}{}
 		}
 	}
+	// Project-scoped `global using static` targets join the statics set
+	// the same way — their extension methods are in scope for the whole
+	// unit, not just the declaring file.
+	for _, s := range r.csharpGlobalStaticsFor(fileID) {
+		ns.statics[s] = struct{}{}
+	}
 	for _, e := range r.graph.GetOutEdges(fileID) {
 		if e == nil {
 			continue
@@ -160,8 +166,24 @@ func csharpMetaStrings(v any) []string {
 // Files outside any csproj directory degrade to the declaring file's
 // directory subtree (better a narrower scope than a leak).
 func (r *Resolver) csharpGlobalUsingsFor(fileID string) []string {
+	idx, _, projDirs := r.csharpEnsureGlobalIndexes()
+	return csharpUnitGlobalsFor(idx, projDirs, fileID)
+}
+
+// csharpGlobalStaticsFor is the `global using static` counterpart:
+// the target class FQNs whose members — extension methods included —
+// are in scope for every file of fileID's compilation unit.
+func (r *Resolver) csharpGlobalStaticsFor(fileID string) []string {
+	_, statics, projDirs := r.csharpEnsureGlobalIndexes()
+	return csharpUnitGlobalsFor(statics, projDirs, fileID)
+}
+
+// csharpEnsureGlobalIndexes returns the derived unit indexes, seeding
+// the sources (one workspace scan, first time only) and re-deriving
+// (cheap) when a reconcile dropped them.
+func (r *Resolver) csharpEnsureGlobalIndexes() (idx, statics map[string][]string, projDirs map[string]struct{}) {
 	r.csharpNSMu.RLock()
-	idx, projDirs := r.csharpGlobalByDir, r.csharpProjDirs
+	idx, statics, projDirs = r.csharpGlobalByDir, r.csharpGlobalStaticByDir, r.csharpProjDirs
 	r.csharpNSMu.RUnlock()
 	if idx == nil {
 		r.csharpNSMu.Lock()
@@ -171,9 +193,16 @@ func (r *Resolver) csharpGlobalUsingsFor(fileID string) []string {
 			}
 			r.deriveCSharpGlobalIndexLocked()
 		}
-		idx, projDirs = r.csharpGlobalByDir, r.csharpProjDirs
+		idx, statics, projDirs = r.csharpGlobalByDir, r.csharpGlobalStaticByDir, r.csharpProjDirs
 		r.csharpNSMu.Unlock()
 	}
+	return idx, statics, projDirs
+}
+
+// csharpUnitGlobalsFor resolves one file's unit-scoped entries from a
+// derived index: the nearest-csproj unit's list, else the walk-up
+// collection for files outside any csproj.
+func csharpUnitGlobalsFor(idx map[string][]string, projDirs map[string]struct{}, fileID string) []string {
 	if len(idx) == 0 {
 		return nil
 	}
@@ -204,6 +233,7 @@ func (r *Resolver) csharpGlobalUsingsFor(fileID string) []string {
 // the scan again (the per-save O(all files) rebuild the review flagged).
 func (r *Resolver) seedCSharpVisSourcesLocked() {
 	decls := map[string][]string{}
+	staticDecls := map[string][]string{}
 	projs := map[string]struct{}{}
 	for n := range r.graph.NodesByKind(graph.KindFile) {
 		if n == nil {
@@ -219,8 +249,12 @@ func (r *Resolver) seedCSharpVisSourcesLocked() {
 		if globals := csharpMetaStrings(n.Meta["global_usings"]); len(globals) > 0 {
 			decls[n.ID] = globals
 		}
+		if statics := csharpMetaStrings(n.Meta["global_using_static"]); len(statics) > 0 {
+			staticDecls[n.ID] = statics
+		}
 	}
 	r.csharpGlobalDecls = decls
+	r.csharpGlobalStaticDecls = staticDecls
 	r.csharpProjFiles = projs
 	r.csharpVisSeeded = true
 }
@@ -232,15 +266,24 @@ func (r *Resolver) deriveCSharpGlobalIndexLocked() {
 	for f := range r.csharpProjFiles {
 		projSet[csharpDirOf(f)] = struct{}{}
 	}
+	unitKey := func(f string) string {
+		if key := csharpNearestProjDir(projSet, csharpDirOf(f)); key != "" {
+			return key
+		}
+		return csharpDirOf(f)
+	}
 	built := map[string][]string{}
 	for f, globals := range r.csharpGlobalDecls {
-		key := csharpNearestProjDir(projSet, csharpDirOf(f))
-		if key == "" {
-			key = csharpDirOf(f)
-		}
+		key := unitKey(f)
 		built[key] = append(built[key], globals...)
 	}
+	builtStatics := map[string][]string{}
+	for f, statics := range r.csharpGlobalStaticDecls {
+		key := unitKey(f)
+		builtStatics[key] = append(builtStatics[key], statics...)
+	}
 	r.csharpGlobalByDir = built
+	r.csharpGlobalStaticByDir = builtStatics
 	r.csharpProjDirs = projSet
 }
 
@@ -276,6 +319,12 @@ func (r *Resolver) scopedCSharpVisibilityInvalidate(files []string) {
 			changed = true
 		}
 	}
+	for f := range r.csharpGlobalStaticDecls {
+		if r.graph.GetNode(f) == nil {
+			delete(r.csharpGlobalStaticDecls, f)
+			changed = true
+		}
+	}
 	for f := range r.csharpProjFiles {
 		if r.graph.GetNode(f) == nil {
 			delete(r.csharpProjFiles, f)
@@ -284,6 +333,7 @@ func (r *Resolver) scopedCSharpVisibilityInvalidate(files []string) {
 	}
 	if changed {
 		r.csharpGlobalByDir = nil
+		r.csharpGlobalStaticByDir = nil
 		r.csharpProjDirs = nil
 		r.csharpNSByFile = nil
 		return
@@ -311,20 +361,29 @@ func (r *Resolver) reconcileCSharpVisFileLocked(fileID string) bool {
 		}
 		return true
 	}
-	var globals []string
+	var globals, statics []string
 	if n := r.graph.GetNode(fileID); n != nil && n.Meta != nil {
 		globals = csharpMetaStrings(n.Meta["global_usings"])
+		statics = csharpMetaStrings(n.Meta["global_using_static"])
 	}
-	prior := r.csharpGlobalDecls[fileID]
-	if csharpSameStringSet(prior, globals) {
-		return false
+	changed := false
+	if !csharpSameStringSet(r.csharpGlobalDecls[fileID], globals) {
+		if len(globals) == 0 {
+			delete(r.csharpGlobalDecls, fileID)
+		} else {
+			r.csharpGlobalDecls[fileID] = globals
+		}
+		changed = true
 	}
-	if len(globals) == 0 {
-		delete(r.csharpGlobalDecls, fileID)
-	} else {
-		r.csharpGlobalDecls[fileID] = globals
+	if !csharpSameStringSet(r.csharpGlobalStaticDecls[fileID], statics) {
+		if len(statics) == 0 {
+			delete(r.csharpGlobalStaticDecls, fileID)
+		} else {
+			r.csharpGlobalStaticDecls[fileID] = statics
+		}
+		changed = true
 	}
-	return true
+	return changed
 }
 
 // csharpSameStringSet is an order-insensitive slice comparison — the

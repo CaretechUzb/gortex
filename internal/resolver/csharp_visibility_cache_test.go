@@ -123,3 +123,35 @@ func TestResolveCSharp_GlobalUsingIndexReconcilesEditedFile(t *testing.T) {
 	assert.Contains(t, target, "E1.Foo",
 		"the reconciled global using makes exactly LibA visible — the call must bind")
 }
+
+// TestResolveCSharp_GlobalUsingStaticPropagates: `global using static
+// LibA.E1;` is compilation-scoped — E1's extension methods are in scope
+// for EVERY file of the unit, not just the declaring one.
+func TestResolveCSharp_GlobalUsingStaticPropagates(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"W.cs": `namespace W {
+    public class Crate {}
+}`,
+		"E1.cs": `using W;
+namespace LibA {
+    public static class E1 { public static int Foo(this Crate c) { return 1; } }
+}`,
+		"Usings.cs": `global using static LibA.E1;
+`,
+		"Caller.cs": `using W;
+namespace App {
+    public class Runner {
+        public void Run() {
+            Crate c = new Crate();
+            c.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.NotEmpty(t, target)
+	assert.Contains(t, target, "E1.Foo",
+		"the global using static puts E1's extensions in scope for the whole unit, got %q", target)
+}

@@ -77,6 +77,9 @@ namespace App.Web
 	statics, _ := file.Meta["using_static"].([]string)
 	assert.ElementsMatch(t, []string{"System.Math", "App.Shared.Helpers"}, statics,
 		"using-static targets, plain and global forms alike")
+	globalStatics, _ := file.Meta["global_using_static"].([]string)
+	assert.ElementsMatch(t, []string{"App.Shared.Helpers"}, globalStatics,
+		"a global using static is compilation-scoped — the resolver propagates it beyond the file")
 	usings, _ := file.Meta["usings"].([]string)
 	assert.ElementsMatch(t, []string{"App.Billing", "App.Platform"}, usings,
 		"the plain stamp keeps its shape: namespace usings incl. global, no static/alias")

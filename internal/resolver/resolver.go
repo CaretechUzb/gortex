@@ -316,14 +316,19 @@ type Resolver struct {
 	csharpGlobalByDir map[string][]string
 	csharpProjDirs    map[string]struct{}
 
-	// csharpGlobalDecls / csharpProjFiles are the SOURCES the derived
-	// index above is built from: fileID → its global_usings stamp, and
-	// the csproj file IDs. Seeded by ONE workspace scan and then
-	// maintained by scopedCSharpVisibilityInvalidate, so the scoped
-	// resolve entries stop paying an O(all files) rebuild per save.
-	csharpGlobalDecls map[string][]string
-	csharpProjFiles   map[string]struct{}
-	csharpVisSeeded   bool
+	// csharpGlobalDecls / csharpGlobalStaticDecls / csharpProjFiles are
+	// the SOURCES the derived index above is built from: fileID → its
+	// global_usings / global_using_static stamps, and the csproj file
+	// IDs. Seeded by ONE workspace scan and then maintained by
+	// scopedCSharpVisibilityInvalidate, so the scoped resolve entries
+	// stop paying an O(all files) rebuild per save.
+	// csharpGlobalStaticByDir is the static form's derived unit index —
+	// same keying and lifetime as csharpGlobalByDir.
+	csharpGlobalDecls       map[string][]string
+	csharpGlobalStaticDecls map[string][]string
+	csharpGlobalStaticByDir map[string][]string
+	csharpProjFiles         map[string]struct{}
+	csharpVisSeeded         bool
 
 	// csharpTypeNodesByName memoises the repo-scoped type/interface
 	// lookup the extension binder's eligibility rules repeat per call
@@ -1985,6 +1990,8 @@ func (r *Resolver) clearCSharpVisibilityCaches() {
 	r.csharpTypeNodesByName = nil
 	r.csharpAncestorsByType = nil
 	r.csharpGlobalDecls = nil
+	r.csharpGlobalStaticDecls = nil
+	r.csharpGlobalStaticByDir = nil
 	r.csharpProjFiles = nil
 	r.csharpVisSeeded = false
 	r.csharpNSMu.Unlock()

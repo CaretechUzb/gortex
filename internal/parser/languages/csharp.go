@@ -320,8 +320,11 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		}
 	}
 
-	// Resolve calls against funcRanges + the per-method type environments.
-	funcRanges := buildFuncRanges(result)
+	// Resolve calls against the function-range lookup + the per-method
+	// type environments. Owner attribution runs once per local, call and
+	// type use — the sorted lookup keeps that from multiplying into an
+	// O(locals×functions) linear-scan product on member-heavy files.
+	funcRanges := newCSharpFuncLookup(buildFuncRanges(result))
 
 	// Build type environments in legacy precedence, scoped per enclosing
 	// method — a same-named local of a different type in a sibling method
@@ -334,7 +337,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		if l.defNode == nil {
 			return ""
 		}
-		return findEnclosingFunc(funcRanges, int(l.defNode.StartPoint().Row)+1)
+		return funcRanges.enclosing(int(l.defNode.StartPoint().Row) + 1)
 	}
 	tenvByOwner := map[string]typeEnv{}
 	setLocalType := func(owner, name, typeName string) {
@@ -419,7 +422,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		if bt == "" {
 			continue
 		}
-		owner := findEnclosingFunc(funcRanges, int(l.defNode.StartPoint().Row)+1)
+		owner := funcRanges.enclosing(int(l.defNode.StartPoint().Row) + 1)
 		if owner == "" {
 			continue
 		}
@@ -436,7 +439,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// type-use emission so a type referenced only in a local body
 	// declaration is still a navigable reference without an LSP.
 	for _, tu := range typeUses {
-		ownerID := findEnclosingFunc(funcRanges, tu.line)
+		ownerID := funcRanges.enclosing(tu.line)
 		if ownerID == "" {
 			ownerID = fileID
 		}
@@ -451,7 +454,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	emitCSharpReferenceForms(root, src, filePath, fileID, result)
 
 	for _, c := range calls {
-		callerID := findEnclosingFunc(funcRanges, c.line)
+		callerID := funcRanges.enclosing(c.line)
 		if callerID == "" {
 			continue
 		}
@@ -1185,7 +1188,7 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 // as Meta["scoped_usings"] ("scope|name", empty scope = compilation
 // unit). Additive: the flat keys keep their exact legacy shape.
 func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
-	var usings, globals, statics, scoped []string
+	var usings, globals, statics, scoped, globalStatics []string
 	seen := map[string]bool{}
 	seenStatic := map[string]bool{}
 	seenScoped := map[string]bool{}
@@ -1215,6 +1218,12 @@ func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
 			if !seenStatic[name] {
 				seenStatic[name] = true
 				statics = append(statics, name)
+				// A `global using static` is compilation-scoped like its
+				// namespace sibling — its own stamp lets the resolver
+				// propagate it beyond the declaring file.
+				if isGlobal {
+					globalStatics = append(globalStatics, name)
+				}
 			}
 			return
 		}
@@ -1250,6 +1259,9 @@ func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
 	if len(scoped) > 0 {
 		fileNode.Meta["scoped_usings"] = scoped
 	}
+	if len(globalStatics) > 0 {
+		fileNode.Meta["global_using_static"] = globalStatics
+	}
 }
 
 func (e *CSharpExtractor) emitUsing(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
@@ -1262,6 +1274,49 @@ func (e *CSharpExtractor) emitUsing(m parser.QueryResult, filePath, fileID strin
 }
 
 // --- Helpers --------------------------------------------------------
+
+// csharpFuncLookup answers "which function owns this line" by binary
+// search instead of the linear scan findEnclosingFunc pays per query —
+// the extractor asks once per local, call and type use, an
+// O(locals×functions) product on member-heavy files. Ranges are sorted
+// by start line with a running max-end, so a stabbing query walks back
+// only while an overlap is still possible; overlapping ranges (a local
+// function inside a method) pick the innermost.
+type csharpFuncLookup struct {
+	ranges []funcRange
+	maxEnd []int
+}
+
+func newCSharpFuncLookup(ranges []funcRange) *csharpFuncLookup {
+	sorted := append([]funcRange(nil), ranges...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].startLine < sorted[j].startLine })
+	maxEnd := make([]int, len(sorted))
+	running := 0
+	for i, r := range sorted {
+		if r.endLine > running {
+			running = r.endLine
+		}
+		maxEnd[i] = running
+	}
+	return &csharpFuncLookup{ranges: sorted, maxEnd: maxEnd}
+}
+
+func (l *csharpFuncLookup) enclosing(line int) string {
+	i := sort.Search(len(l.ranges), func(j int) bool { return l.ranges[j].startLine > line }) - 1
+	best := ""
+	bestSpan := int(^uint(0) >> 1)
+	for ; i >= 0; i-- {
+		if l.maxEnd[i] < line {
+			break
+		}
+		if r := l.ranges[i]; line <= r.endLine {
+			if span := r.endLine - r.startLine; span < bestSpan {
+				best, bestSpan = r.id, span
+			}
+		}
+	}
+	return best
+}
 
 type csharpOwner struct {
 	kind string // class_declaration / struct_declaration / interface_declaration

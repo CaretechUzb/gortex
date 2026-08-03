@@ -5687,6 +5687,17 @@ func (idx *Indexer) incrementalReindexPathsMode(
 
 	merkleMode := idx.merkleEnabled()
 
+	// Non-Merkle upgrade path: Merkle mixes the extractor version into
+	// the leaf salt, so a bump restages stale-language files on its own.
+	// The mtime ledger knows nothing of versions — on a full-tree pass,
+	// files of a version-stale language count stale even when their
+	// mtime is unchanged, and a clean pass re-stamps the stored versions
+	// below so the restage happens exactly once.
+	var extractorStaleLangs map[string]struct{}
+	if !merkleMode && fullRoot {
+		extractorStaleLangs = idx.extractorVersionStaleLangSet()
+	}
+
 	for _, p := range paths {
 		absPath := p
 		if !filepath.IsAbs(absPath) {
@@ -5740,7 +5751,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 				// consistently with fileMtimes for non-ASCII names.
 				relPath := idx.relKey(path)
 				diskFiles[relPath] = true
-				if !merkleMode && idx.IsStale(relPath) {
+				if !merkleMode && (idx.IsStale(relPath) || extractorLangStale(extractorStaleLangs, relPath)) {
 					staleFiles = append(staleFiles, path)
 				}
 				return nil
@@ -5764,7 +5775,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		// regardless of the Unicode form the caller supplied.
 		relPath := idx.relKey(absPath)
 		diskFiles[relPath] = true
-		if mode.forceExplicitFiles || (!merkleMode && idx.IsStale(relPath)) {
+		if mode.forceExplicitFiles ||
+			(!merkleMode && (idx.IsStale(relPath) || extractorLangStale(extractorStaleLangs, relPath))) {
 			staleFiles = append(staleFiles, absPath)
 		}
 	}
@@ -5917,6 +5929,12 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		result.mutationErr = fmt.Errorf(
 			"%w: %s", errFileVersionChanged, strings.Join(versionChangedFiles, ", "),
 		)
+	}
+	// A clean version-driven restage re-stamps the stored extractor
+	// versions; a failed file keeps the old row so the next full pass
+	// retries the language.
+	if len(extractorStaleLangs) > 0 && len(failedFiles) == 0 {
+		idx.reconcileRepoIndexState(absRoot)
 	}
 	idx.warnIfEdgeSanityViolated(result)
 	// Partial work always queues the exact changed/deleted/dependent graph-file

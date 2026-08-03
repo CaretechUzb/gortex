@@ -237,7 +237,12 @@ func csharpVisibilityStampFromMeta(meta map[string]any) csharpVisibilityStamp {
 		sort.Strings(vals)
 		return strings.Join(vals, "\x1f")
 	}
+	// Both compilation-scoped forms ride the globals component — an edit
+	// to either re-prices every dependent file of the unit.
 	globals := section("global_usings")
+	if gs := section("global_using_static"); gs != "" {
+		globals += "\x1e" + gs
+	}
 	all := strings.Join([]string{
 		section("usings"), globals, section("using_static"), section("scoped_usings"),
 	}, "\x1e")
