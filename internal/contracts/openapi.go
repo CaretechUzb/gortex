@@ -47,11 +47,11 @@ func (e *OpenAPIExtractor) SupportedLanguages() []string {
 }
 
 func (e *OpenAPIExtractor) Extract(filePath string, src []byte, nodes []*graph.Node, edges []*graph.Edge) []Contract {
-	text := string(src)
-
-	// Quick check: must contain either "openapi" or "swagger" key.
-	lower := strings.ToLower(text)
-	if !strings.Contains(lower, "openapi") && !strings.Contains(lower, "swagger") {
+	// Most JSON/YAML files are not API specifications. Keep this rejection
+	// path on the caller-owned byte slice: converting a multi-megabyte source
+	// to string and lower-casing it made two full-size copies merely to look
+	// for these ASCII keys.
+	if !containsOpenAPIMarker(src) {
 		return nil
 	}
 
@@ -59,6 +59,45 @@ func (e *OpenAPIExtractor) Extract(filePath string, src []byte, nodes []*graph.N
 		return e.extractJSON(filePath, src)
 	}
 	return e.extractYAML(filePath, src)
+}
+
+func containsOpenAPIMarker(src []byte) bool {
+	const (
+		openapi = "openapi"
+		swagger = "swagger"
+	)
+	for start, c := range src {
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		switch c {
+		case 'o':
+			if hasFoldASCIIPrefix(src[start:], openapi) {
+				return true
+			}
+		case 's':
+			if hasFoldASCIIPrefix(src[start:], swagger) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasFoldASCIIPrefix(src []byte, keyword string) bool {
+	if len(src) < len(keyword) {
+		return false
+	}
+	for i := 0; i < len(keyword); i++ {
+		c := src[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != keyword[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *OpenAPIExtractor) extractYAML(filePath string, src []byte) []Contract {
