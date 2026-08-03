@@ -105,6 +105,7 @@ func integrityOK(t *testing.T, db *sql.DB) {
 // pins a synchronous=OFF connection, then on FlushBulk rebuilds every index,
 // restores synchronous, releases the connection, and leaves the DB intact.
 func TestBulkLoadDropsAndRebuildsIndexes(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_JSONB_INGEST", "1")
 	s, _ := openTempStore(t)
 	ctx := context.Background()
 
@@ -159,12 +160,18 @@ func TestBulkLoadDropsAndRebuildsIndexes(t *testing.T) {
 
 	nodes, edges := bulkFixture(2000, 4000)
 	s.AddBatch(nodes, edges)
+	if s.jsonbIngestBuffers.payload.Cap() == 0 || s.jsonbIngestBuffers.blobs.Cap() == 0 {
+		t.Fatal("bulk AddBatch did not retain reusable JSONB arenas")
+	}
 
 	if err := s.FlushBulk(); err != nil {
 		t.Fatalf("FlushBulk: %v", err)
 	}
 	if s.bulkConn != nil {
 		t.Fatal("bulkConn not released after FlushBulk")
+	}
+	if s.jsonbIngestBuffers.payload.Cap() != 0 || s.jsonbIngestBuffers.blobs.Cap() != 0 || s.jsonbIngestBuffers.args != nil {
+		t.Fatal("FlushBulk retained idle JSONB ingest buffers")
 	}
 
 	// Every dropped index is back.
@@ -323,6 +330,7 @@ func TestCoordinatedBulkLoadRequiresFreshGraphAndWarmSidecars(t *testing.T) {
 }
 
 func TestCoordinatedBulkLoadKeepsIndexesDeferredAcrossNestedRepoFlushes(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_JSONB_INGEST", "1")
 	s, _ := openTempStore(t)
 	if !s.BeginCoordinatedBulkLoad() {
 		t.Fatal("coordinated fast path did not engage on empty store")
@@ -371,6 +379,9 @@ func TestCoordinatedBulkLoadKeepsIndexesDeferredAcrossNestedRepoFlushes(t *testi
 		}
 		assertIndexesDropped(repo + " flush")
 	}
+	if s.jsonbIngestBuffers.payload.Cap() == 0 || s.jsonbIngestBuffers.blobs.Cap() == 0 {
+		t.Fatal("nested coordinated flush discarded reusable JSONB arenas")
+	}
 	if len(sealEvents) != 0 {
 		t.Fatalf("nested repository flushes sealed indexes: %+v", sealEvents)
 	}
@@ -389,6 +400,9 @@ func TestCoordinatedBulkLoadKeepsIndexesDeferredAcrossNestedRepoFlushes(t *testi
 	}
 	if s.coordinatedBulkLoad || s.bulkConn != nil {
 		t.Fatal("coordinated bulk state not released")
+	}
+	if s.jsonbIngestBuffers.payload.Cap() != 0 || s.jsonbIngestBuffers.blobs.Cap() != 0 || s.jsonbIngestBuffers.args != nil {
+		t.Fatal("coordinated finalization retained idle JSONB ingest buffers")
 	}
 	rebuilt := indexNames(t, s.db)
 	for _, idx := range bulkDroppableIndexes {

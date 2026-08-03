@@ -368,6 +368,7 @@ func (s *Store) FlushBulk() error {
 	hadBulk := s.bulkConn != nil
 	sealErr := s.sealBulkIndexesLocked("flush")
 	closeErr := s.closeBulkConnectionLocked()
+	s.jsonbIngestBuffers.release()
 	s.writeMu.Unlock()
 	if !hadBulk {
 		return errors.Join(sealErr, closeErr)
@@ -452,6 +453,7 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 			CheckpointedFrames: result.CheckpointedFrames, Err: err,
 		})
 	}
+	s.jsonbIngestBuffers.release()
 	s.writeMu.Unlock()
 	return errors.Join(sealErr, statsErr, closeErr)
 }

@@ -630,9 +630,18 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	// receipts collect exact identities through bounded RETURNING result sets;
 	// the placeholder writer remains the kill-switch/compatibility fallback.
 	useJSONB := jsonbIngestEnabled() && jsonbIngestSupported(tx)
+	if useJSONB {
+		defer func() {
+			if s.bulkConn == nil && !s.coordinatedBulkLoad {
+				s.jsonbIngestBuffers.release()
+				return
+			}
+			s.jsonbIngestBuffers.trim()
+		}()
+	}
 	var changedNodeIDs map[string]int
 	if useJSONB {
-		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksJSONBTx(tx, nodes, receiptDelta != nil)
+		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksJSONBTxWithBuffers(tx, nodes, receiptDelta != nil, &s.jsonbIngestBuffers)
 	} else {
 		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksTxLimited(tx, nodes, receiptDelta != nil, &variableLimit)
 	}
@@ -680,7 +689,7 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 
 	var insertedEdgeKeys map[sqliteEdgeIdentity]int
 	if useJSONB {
-		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksJSONBTx(tx, edges, receiptDelta != nil)
+		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksJSONBTxWithBuffers(tx, edges, receiptDelta != nil, &s.jsonbIngestBuffers)
 	} else {
 		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksTxLimited(tx, edges, receiptDelta != nil, &variableLimit)
 	}

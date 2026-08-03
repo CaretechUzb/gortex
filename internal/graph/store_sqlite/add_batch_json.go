@@ -27,10 +27,68 @@ import (
 // exact changed identities from the same JSONB statements. The runtime must
 // expose jsonb(); GORTEX_SQLITE_JSONB_INGEST=0 forces the placeholder path.
 const (
-	jsonbIngestMaxPayload = sqliteBatchMaxBoundBytes
-	jsonbIngestNodeRows   = 4096
-	jsonbIngestEdgeRows   = 8192
+	jsonbIngestMaxPayload       = sqliteBatchMaxBoundBytes
+	jsonbIngestNodeRows         = 4096
+	jsonbIngestEdgeRows         = 8192
+	jsonbIngestRetainedCapacity = 2 * jsonbIngestMaxPayload
 )
+
+// jsonbIngestBuffers reuses the bounded payload arena and row scratch across
+// AddBatch calls. Store.writeMu protects the production instance; tests and
+// compatibility helpers may use a stack-local zero value.
+type jsonbIngestBuffers struct {
+	payload bytes.Buffer
+	blobs   bytes.Buffer
+	args    []any
+	encoder *json.Encoder
+}
+
+func (buffers *jsonbIngestBuffers) reset(argsCapacity int) {
+	buffers.trim()
+	buffers.payload.Reset()
+	buffers.blobs.Reset()
+	buffers.payload.Grow(256 << 10)
+	buffers.blobs.Grow(128 << 10)
+	if cap(buffers.args) < argsCapacity {
+		buffers.args = make([]any, 0, argsCapacity)
+	} else {
+		buffers.args = buffers.args[:0]
+	}
+	if buffers.encoder == nil {
+		buffers.encoder = json.NewEncoder(&buffers.payload)
+	}
+	buffers.payload.WriteByte('[')
+	// Keep the raw-BLOB bind non-NULL even for a valid zero-length blob. Row
+	// offsets are zero-based into this buffer; SQLite substr is one-based.
+	buffers.blobs.WriteByte(0)
+}
+
+// trim prevents one exceptional first row from becoming a retained arena and
+// releases references held by the interface scratch. Normal bounded payload
+// growth is kept so later cold-load chunks avoid reallocating.
+func (buffers *jsonbIngestBuffers) trim() {
+	if cap(buffers.args) > 0 {
+		clear(buffers.args[:cap(buffers.args)])
+		buffers.args = buffers.args[:0]
+	}
+	if buffers.payload.Cap() > jsonbIngestRetainedCapacity {
+		buffers.payload = bytes.Buffer{}
+		buffers.encoder = nil
+	}
+	if buffers.blobs.Cap() > jsonbIngestRetainedCapacity {
+		buffers.blobs = bytes.Buffer{}
+	}
+}
+
+// release drops reusable arenas at an idle boundary. Keeping them during a
+// coordinated cold load saves allocation churn; retaining them after the load
+// would turn a transient optimization into permanent daemon RSS.
+func (buffers *jsonbIngestBuffers) release() {
+	if cap(buffers.args) > 0 {
+		clear(buffers.args[:cap(buffers.args)])
+	}
+	*buffers = jsonbIngestBuffers{}
+}
 
 const jsonbNodeIngestSQL = `INSERT INTO nodes (` + nodeInsertColumns + `)
 SELECT
@@ -129,13 +187,13 @@ func jsonbIngestValue(value any) any {
 // raw blob arena. Returns false (without consuming the row) when adding it
 // would exceed the bounded payload; a first row is always admitted so cursor
 // progress is guaranteed.
-func appendJSONBIngestRow(payload, blobs *bytes.Buffer, row []any, metaIndex, rows int) (bool, error) {
+func appendJSONBIngestRow(buffers *jsonbIngestBuffers, row []any, metaIndex, rows int) (bool, error) {
 	meta, ok := row[metaIndex].([]byte)
 	if row[metaIndex] != nil && !ok {
 		return false, fmt.Errorf("metadata argument %d has type %T, want []byte", metaIndex, row[metaIndex])
 	}
 	metaPresent := meta != nil
-	metaOffset := blobs.Len()
+	metaOffset := buffers.blobs.Len()
 
 	row = append(row, nil)
 	copy(row[metaIndex+2:], row[metaIndex+1:len(row)-1])
@@ -152,36 +210,35 @@ func appendJSONBIngestRow(payload, blobs *bytes.Buffer, row []any, metaIndex, ro
 		}
 		row[i] = jsonbIngestValue(row[i])
 	}
-	encoded, err := json.Marshal(row)
-	if err != nil {
+
+	rowStart := buffers.payload.Len()
+	if rows > 0 {
+		buffers.payload.WriteByte(',')
+	}
+	if err := buffers.encoder.Encode(row); err != nil {
+		buffers.payload.Truncate(rowStart)
 		return false, err
 	}
-	separator := 0
-	if rows > 0 {
-		separator = 1
+	encodedEnd := buffers.payload.Len()
+	if encodedEnd <= rowStart || buffers.payload.Bytes()[encodedEnd-1] != '\n' {
+		buffers.payload.Truncate(rowStart)
+		return false, fmt.Errorf("JSONB row encoder omitted trailing newline")
 	}
-	boundBytes := payload.Len() + separator + len(encoded) + 1 + blobs.Len() + len(meta)
+	buffers.payload.Truncate(encodedEnd - 1)
+
+	boundBytes := buffers.payload.Len() + 1 + buffers.blobs.Len() + len(meta)
 	if rows > 0 && boundBytes > jsonbIngestMaxPayload {
+		buffers.payload.Truncate(rowStart)
 		return false, nil
 	}
-	if rows > 0 {
-		payload.WriteByte(',')
-	}
-	payload.Write(encoded)
 	if metaPresent {
-		blobs.Write(meta)
+		buffers.blobs.Write(meta)
 	}
 	return true, nil
 }
 
-func nextJSONBNodePayload(nodes []*graph.Node, start int) (jsonPayload, blobPayload []byte, next, rows int, err error) {
-	var payload, blobs bytes.Buffer
-	payload.Grow(256 << 10)
-	blobs.Grow(128 << 10)
-	payload.WriteByte('[')
-	// Keep the raw-BLOB bind non-NULL even for a valid zero-length blob. Row
-	// offsets are zero-based into this buffer; SQLite substr is one-based.
-	blobs.WriteByte(0)
+func nextJSONBNodePayload(buffers *jsonbIngestBuffers, nodes []*graph.Node, start int) (jsonPayload, blobPayload []byte, next, rows int, err error) {
+	buffers.reset(nodeInsertParams + 1)
 	pos := start
 	for pos < len(nodes) && rows < jsonbIngestNodeRows {
 		node := nodes[pos]
@@ -189,11 +246,12 @@ func nextJSONBNodePayload(nodes []*graph.Node, start int) (jsonPayload, blobPayl
 			pos++
 			continue
 		}
-		args, appendErr := appendNodeInsertArgs(nil, node)
+		args, appendErr := appendNodeInsertArgs(buffers.args[:0], node)
 		if appendErr != nil {
 			return nil, nil, start, 0, appendErr
 		}
-		added, appendErr := appendJSONBIngestRow(&payload, &blobs, args, 29, rows)
+		buffers.args = args
+		added, appendErr := appendJSONBIngestRow(buffers, args, 29, rows)
 		if appendErr != nil {
 			return nil, nil, start, 0, appendErr
 		}
@@ -203,16 +261,12 @@ func nextJSONBNodePayload(nodes []*graph.Node, start int) (jsonPayload, blobPayl
 		pos++
 		rows++
 	}
-	payload.WriteByte(']')
-	return payload.Bytes(), blobs.Bytes(), pos, rows, nil
+	buffers.payload.WriteByte(']')
+	return buffers.payload.Bytes(), buffers.blobs.Bytes(), pos, rows, nil
 }
 
-func nextJSONBEdgePayload(edges []*graph.Edge, start int) (jsonPayload, blobPayload []byte, next, rows int, err error) {
-	var payload, blobs bytes.Buffer
-	payload.Grow(256 << 10)
-	blobs.Grow(128 << 10)
-	payload.WriteByte('[')
-	blobs.WriteByte(0)
+func nextJSONBEdgePayload(buffers *jsonbIngestBuffers, edges []*graph.Edge, start int) (jsonPayload, blobPayload []byte, next, rows int, err error) {
+	buffers.reset(edgeInsertParams + 1)
 	pos := start
 	for pos < len(edges) && rows < jsonbIngestEdgeRows {
 		edge := edges[pos]
@@ -220,11 +274,12 @@ func nextJSONBEdgePayload(edges []*graph.Edge, start int) (jsonPayload, blobPayl
 			pos++
 			continue
 		}
-		args, appendErr := appendEdgeInsertArgs(nil, edge)
+		args, appendErr := appendEdgeInsertArgs(buffers.args[:0], edge)
 		if appendErr != nil {
 			return nil, nil, start, 0, appendErr
 		}
-		added, appendErr := appendJSONBIngestRow(&payload, &blobs, args, 10, rows)
+		buffers.args = args
+		added, appendErr := appendJSONBIngestRow(buffers, args, 10, rows)
 		if appendErr != nil {
 			return nil, nil, start, 0, appendErr
 		}
@@ -234,8 +289,8 @@ func nextJSONBEdgePayload(edges []*graph.Edge, start int) (jsonPayload, blobPayl
 		pos++
 		rows++
 	}
-	payload.WriteByte(']')
-	return payload.Bytes(), blobs.Bytes(), pos, rows, nil
+	buffers.payload.WriteByte(']')
+	return buffers.payload.Bytes(), buffers.blobs.Bytes(), pos, rows, nil
 }
 
 // insertNodeChunksJSONBTx is the JSONB counterpart of
@@ -246,6 +301,16 @@ func insertNodeChunksJSONBTx(
 	tx *sql.Tx,
 	nodes []*graph.Node,
 	returnChanged bool,
+) (rowsChanged, statements int, changedIDs map[string]int, err error) {
+	var buffers jsonbIngestBuffers
+	return insertNodeChunksJSONBTxWithBuffers(tx, nodes, returnChanged, &buffers)
+}
+
+func insertNodeChunksJSONBTxWithBuffers(
+	tx *sql.Tx,
+	nodes []*graph.Node,
+	returnChanged bool,
+	buffers *jsonbIngestBuffers,
 ) (rowsChanged, statements int, changedIDs map[string]int, err error) {
 	query := jsonbNodeIngestSQL
 	if returnChanged {
@@ -258,7 +323,7 @@ func insertNodeChunksJSONBTx(
 	}
 	defer stmt.Close()
 	for pos := 0; pos < len(nodes); {
-		payload, blobs, next, rows, encodeErr := nextJSONBNodePayload(nodes, pos)
+		payload, blobs, next, rows, encodeErr := nextJSONBNodePayload(buffers, nodes, pos)
 		if encodeErr != nil {
 			return rowsChanged, statements, changedIDs, encodeErr
 		}
@@ -313,6 +378,16 @@ func insertEdgeChunksJSONBTx(
 	edges []*graph.Edge,
 	returnInserted bool,
 ) (rowsInserted, statements int, insertedKeys map[sqliteEdgeIdentity]int, err error) {
+	var buffers jsonbIngestBuffers
+	return insertEdgeChunksJSONBTxWithBuffers(tx, edges, returnInserted, &buffers)
+}
+
+func insertEdgeChunksJSONBTxWithBuffers(
+	tx *sql.Tx,
+	edges []*graph.Edge,
+	returnInserted bool,
+	buffers *jsonbIngestBuffers,
+) (rowsInserted, statements int, insertedKeys map[sqliteEdgeIdentity]int, err error) {
 	query := jsonbEdgeIngestSQL
 	if returnInserted {
 		query += " RETURNING from_id, to_id, kind, file_path, line"
@@ -324,7 +399,7 @@ func insertEdgeChunksJSONBTx(
 	}
 	defer stmt.Close()
 	for pos := 0; pos < len(edges); {
-		payload, blobs, next, rows, encodeErr := nextJSONBEdgePayload(edges, pos)
+		payload, blobs, next, rows, encodeErr := nextJSONBEdgePayload(buffers, edges, pos)
 		if encodeErr != nil {
 			return rowsInserted, statements, insertedKeys, encodeErr
 		}

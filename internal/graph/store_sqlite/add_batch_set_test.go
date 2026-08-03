@@ -2,6 +2,8 @@ package store_sqlite
 
 import (
 	"fmt"
+	"math"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -157,4 +159,83 @@ func TestAddBatchLaterChunkEncodingFailureRollsBackEarlierChunks(t *testing.T) {
 	nodes[len(nodes)-1].Meta = map[string]any{"unsupported": make(chan int)}
 	require.Panics(t, func() { store.AddBatch(nodes, nil) })
 	require.Zero(t, store.NodeCount(), "the first multi-row statement must roll back with the later failure")
+}
+
+func TestAddBatchJSONBChunksAtRowBoundaries(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_JSONB_INGEST", "1")
+	store := openReindexReceiptTestStore(t)
+	nodes, edges := addBatchFixture(jsonbIngestNodeRows+1, jsonbIngestEdgeRows+1)
+
+	stats, err := store.addBatchSetOriented(nodes, edges)
+	require.NoError(t, err)
+	require.Equal(t, len(nodes), stats.nodeRowsChanged)
+	require.Equal(t, len(edges), stats.edgeRowsInserted)
+	require.Equal(t, 2, stats.nodeStatements)
+	require.Equal(t, 2, stats.edgeStatements)
+	require.Equal(t, len(nodes), store.NodeCount())
+	require.Equal(t, len(edges), store.EdgeCount())
+
+	// A second call reuses the same workspace after both node and edge chunk
+	// resets while preserving the upsert/no-op contract.
+	stats, err = store.addBatchSetOriented(nodes, edges)
+	require.NoError(t, err)
+	require.Zero(t, stats.nodeRowsChanged)
+	require.Zero(t, stats.edgeRowsInserted)
+	require.Equal(t, 2, stats.nodeStatements)
+	require.Equal(t, 2, stats.edgeStatements)
+}
+
+func TestAddBatchJSONBLaterChunkEncodingFailureRollsBackEarlierChunks(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_JSONB_INGEST", "1")
+	store := openReindexReceiptTestStore(t)
+	nodes, _ := addBatchFixture(jsonbIngestNodeRows+1, 0)
+	nodes[len(nodes)-1].Meta = map[string]any{"unsupported": make(chan int)}
+
+	require.Panics(t, func() { store.AddBatch(nodes, nil) })
+	require.Zero(t, store.NodeCount(), "the first JSONB statement must roll back with the later failure")
+}
+
+func TestAddBatchJSONBLaterChunkEncoderFailureRollsBackEarlierChunks(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_JSONB_INGEST", "1")
+	store := openReindexReceiptTestStore(t)
+	nodes, edges := addBatchFixture(2, jsonbIngestEdgeRows+1)
+	edges[len(edges)-1].Confidence = math.NaN()
+
+	require.Panics(t, func() { store.AddBatch(nodes, edges) })
+	require.Zero(t, store.NodeCount(), "node and first edge statements must roll back with the encoder failure")
+	require.Zero(t, store.EdgeCount(), "the first edge statement must roll back with the encoder failure")
+}
+
+func TestAddBatchJSONBChunksAtByteBoundaryAndReleasesIdleBuffers(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_JSONB_INGEST", "1")
+	store := openReindexReceiptTestStore(t)
+	nodes, _ := addBatchFixture(2, 0)
+	large := strings.Repeat("x", jsonbIngestMaxPayload/2+1024)
+	for i := range nodes {
+		nodes[i].Meta = map[string]any{"doc": large}
+	}
+
+	stats, err := store.addBatchSetOriented(nodes, nil)
+	require.NoError(t, err)
+	require.Equal(t, 2, stats.nodeStatements, "the second row must move to a new byte-bounded payload")
+	require.Equal(t, 2, stats.nodeRowsChanged)
+	require.Equal(t, 2, store.NodeCount())
+	require.Zero(t, store.jsonbIngestBuffers.payload.Cap())
+	require.Zero(t, store.jsonbIngestBuffers.blobs.Cap())
+	require.Nil(t, store.jsonbIngestBuffers.args)
+	require.Nil(t, store.jsonbIngestBuffers.encoder)
+}
+
+func TestJSONBIngestBuffersTrimClearsScratchReferences(t *testing.T) {
+	var buffers jsonbIngestBuffers
+	buffers.args = make([]any, nodeInsertParams+1)
+	for i := range buffers.args {
+		buffers.args[i] = strings.Repeat("x", 1024)
+	}
+
+	buffers.trim()
+	require.Empty(t, buffers.args)
+	for i, value := range buffers.args[:cap(buffers.args)] {
+		require.Nilf(t, value, "scratch slot %d retained its last row value", i)
+	}
 }

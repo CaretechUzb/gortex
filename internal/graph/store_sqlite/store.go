@@ -179,6 +179,11 @@ type Store struct {
 	// cached value so later batches do not repeat an oversized prepare.
 	batchVariableLimit int
 
+	// jsonbIngestBuffers reuses the bounded JSONB and metadata arenas across
+	// AddBatch calls. It is guarded by writeMu and trimmed after every batch so
+	// one exceptional first row cannot become retained heap.
+	jsonbIngestBuffers jsonbIngestBuffers
+
 	// bulkFinalizeObserver is a package-private test/diagnostic hook. It runs
 	// synchronously under writeMu and therefore must not call back into Store.
 	bulkFinalizeObserver func(bulkFinalizeEvent)
