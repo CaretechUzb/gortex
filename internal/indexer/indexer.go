@@ -3391,8 +3391,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					src = idx.transforms.run(relPath, src)
 
 					extractStart := time.Now()
-					result, skipped, err := idx.extractFileCtx(
-						ctx, nativeParseAdmission,
+					result, skipped, err := idx.extractFileCtxWithRawLease(
+						ctx, nativeParseAdmission, parseLease,
 						parsePool, quarantine, path, relPath, lang, ext, src,
 					)
 					atomic.AddInt64(&parseExtractNS, int64(time.Since(extractStart)))
@@ -4389,7 +4389,9 @@ func (idx *Indexer) indexFile(
 		if idx.crashIsolationEnabled() {
 			pool, quarantine = idx.sharedParsePool()
 		}
-		result, skipped, err = idx.extractFile(pool, quarantine, absPath, relPath, lang, ext, src)
+		result, skipped, err = idx.extractFileWithRawLease(
+			parseLease, pool, quarantine, absPath, relPath, lang, ext, src,
+		)
 		if quarantine != nil && quarantine.Len() > 0 {
 			_ = quarantine.Save()
 		}

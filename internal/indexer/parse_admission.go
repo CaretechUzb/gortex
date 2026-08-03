@@ -147,7 +147,11 @@ type parseAdmissionLease struct {
 	sharedWeight int64
 	local        *semaphore.Weighted
 	localWeight  int64
-	once         sync.Once
+
+	holdMu         sync.Mutex
+	holds          int
+	releasePending bool
+	once           sync.Once
 }
 
 // acquireParseAdmission takes the private per-Indexer lease before the shared
@@ -185,10 +189,47 @@ func acquireParseAdmission(
 	return lease, nil
 }
 
+// retain returns an idempotent callback that keeps this lease live until the
+// callback runs. The caller's Release may happen first; in that case capacity
+// stays reserved until the final retained user has actually stopped touching
+// the admitted source bytes.
+func (lease *parseAdmissionLease) retain() func() {
+	if lease == nil {
+		return func() {}
+	}
+	lease.holdMu.Lock()
+	lease.holds++
+	lease.holdMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			lease.holdMu.Lock()
+			lease.holds--
+			release := lease.holds == 0 && lease.releasePending
+			lease.holdMu.Unlock()
+			if release {
+				lease.releaseNow()
+			}
+		})
+	}
+}
+
 func (lease *parseAdmissionLease) Release() {
 	if lease == nil {
 		return
 	}
+	lease.holdMu.Lock()
+	if lease.holds > 0 {
+		lease.releasePending = true
+		lease.holdMu.Unlock()
+		return
+	}
+	lease.holdMu.Unlock()
+	lease.releaseNow()
+}
+
+func (lease *parseAdmissionLease) releaseNow() {
 	lease.once.Do(func() {
 		// Release in reverse acquisition order: global capacity becomes visible
 		// before this repository admits another local worker.

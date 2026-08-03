@@ -215,8 +215,18 @@ func (idx *Indexer) extractFile(
 	pool *crashpool.Pool, q *crashpool.Quarantine,
 	path, relPath, lang string, ext parser.Extractor, src []byte,
 ) (result *parser.ExtractionResult, skipped bool, err error) {
-	return idx.extractFileCtx(
-		context.Background(), nil,
+	return idx.extractFileWithRawLease(
+		nil, pool, q, path, relPath, lang, ext, src,
+	)
+}
+
+func (idx *Indexer) extractFileWithRawLease(
+	rawLease *parseAdmissionLease,
+	pool *crashpool.Pool, q *crashpool.Quarantine,
+	path, relPath, lang string, ext parser.Extractor, src []byte,
+) (result *parser.ExtractionResult, skipped bool, err error) {
+	return idx.extractFileCtxWithRawLease(
+		context.Background(), nil, rawLease,
 		pool, q, path, relPath, lang, ext, src,
 	)
 }
@@ -224,6 +234,19 @@ func (idx *Indexer) extractFile(
 func (idx *Indexer) extractFileCtx(
 	ctx context.Context,
 	nativeAdmission *nativeParseExtractionAdmission,
+	pool *crashpool.Pool, q *crashpool.Quarantine,
+	path, relPath, lang string, ext parser.Extractor, src []byte,
+) (result *parser.ExtractionResult, skipped bool, err error) {
+	return idx.extractFileCtxWithRawLease(
+		ctx, nativeAdmission, nil,
+		pool, q, path, relPath, lang, ext, src,
+	)
+}
+
+func (idx *Indexer) extractFileCtxWithRawLease(
+	ctx context.Context,
+	nativeAdmission *nativeParseExtractionAdmission,
+	rawLease *parseAdmissionLease,
 	pool *crashpool.Pool, q *crashpool.Quarantine,
 	path, relPath, lang string, ext parser.Extractor, src []byte,
 ) (result *parser.ExtractionResult, skipped bool, err error) {
@@ -253,8 +276,14 @@ func (idx *Indexer) extractFileCtx(
 		if admissionErr != nil {
 			return nil, false, fmt.Errorf("native parse admission: %w", admissionErr)
 		}
+		// The caller still owns the raw-source lease for coverage and graph
+		// construction after a successful parse. Add one extractor-owned hold
+		// so a timeout can return immediately without admitting replacement
+		// bytes while the background extractor still retains src.
+		releaseRawHold := rawLease.retain()
 		r, eerr := idx.extractWithTimeoutDone(ext, relPath, src, func() {
 			nativeLease.Release()
+			releaseRawHold()
 		})
 		if errors.Is(eerr, errExtractTimeout) {
 			budget := effectiveExtractBudget(idx.config.MaxExtractMillis, len(src))

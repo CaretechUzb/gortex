@@ -192,6 +192,79 @@ func TestTimedOutNativeExtractionRetainsAdmission(t *testing.T) {
 	}
 }
 
+func TestTimedOutRawExtractionRetainsAdmission(t *testing.T) {
+	const capacity = int64(4)
+	shared := newParseAdmissionBudget(capacity)
+	rawLease, err := acquireParseAdmission(
+		context.Background(), capacity, 0, nil, shared,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := &Indexer{
+		config: config.IndexConfig{MaxExtractMillis: 20},
+		logger: zap.NewNop(),
+	}
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	exited := make(chan struct{})
+	blocking := &nativeAdmissionTestExtractor{
+		entered: entered,
+		release: release,
+		exited:  exited,
+	}
+	type extractionOutcome struct {
+		result  *parser.ExtractionResult
+		skipped bool
+		err     error
+	}
+	outcome := make(chan extractionOutcome, 1)
+	go func() {
+		result, skipped, err := idx.extractFileCtxWithRawLease(
+			context.Background(), nil, rawLease, nil, nil,
+			"/tmp/blocked.c", "blocked.c", "c", blocking, []byte("int x;"),
+		)
+		outcome <- extractionOutcome{result: result, skipped: skipped, err: err}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("blocking extractor did not enter")
+	}
+	first := <-outcome
+	if first.result == nil || !first.skipped || first.err == nil {
+		t.Fatalf("timeout result = (%v, skipped=%v, err=%v)", first.result, first.skipped, first.err)
+	}
+
+	// Model the indexing worker finishing its timeout-node work. The
+	// extractor-owned hold must keep the raw capacity unavailable even
+	// though the caller has released its ownership.
+	rawLease.Release()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	second, err := acquireParseAdmission(ctx, capacity, 0, nil, shared)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		second.Release()
+		t.Fatalf("second raw admission error = %v, want deadline exceeded", err)
+	}
+
+	close(release)
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("timed-out extractor did not exit")
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	third, err := acquireParseAdmission(ctx, capacity, 0, nil, shared)
+	if err != nil {
+		t.Fatalf("raw admission after extractor completion: %v", err)
+	}
+	third.Release()
+}
+
 func TestSetSharedParseMemoryBudgetSeparatesNativeAdmission(t *testing.T) {
 	idx := &Indexer{}
 	mi := &MultiIndexer{indexers: map[string]*Indexer{"repo": idx}}

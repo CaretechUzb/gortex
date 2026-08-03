@@ -134,7 +134,9 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 		pool, quarantine = idx.sharedParsePool()
 	}
 	started = time.Now()
-	result, skipped, err = idx.extractFile(pool, quarantine, absPath, relPath, lang, ext, src)
+	result, skipped, err = idx.extractFileWithRawLease(
+		parseLease, pool, quarantine, absPath, relPath, lang, ext, src,
+	)
 	probe.extract = time.Since(started)
 	if quarantine != nil && quarantine.Len() > 0 {
 		_ = quarantine.Save()
