@@ -8,27 +8,30 @@ import (
 	"unicode/utf8"
 )
 
-// loadRepoGitignore reads the `.gitignore` file at the repo root and
-// returns its entries as gitignore-syntax patterns ready to feed into
-// the excludes matcher. Blank lines and `#` comments are stripped.
+// loadRepoGitignore reads the `.gitignore` file in dir and returns its
+// entries as gitignore-syntax patterns ready to feed into the excludes
+// matcher. Blank lines and `#` comments are stripped.
 //
-// We deliberately do NOT walk the per-directory hierarchy here:
-//   - The repo-root file already covers ~95% of the value (build
-//     output, dependency caches, generated code).
-//   - Per-directory `.gitignore` semantics (path anchoring relative to
-//     the file's location) would require either nested matchers or a
-//     pattern-rewrite pass; both add complexity for marginal coverage.
+// Callers pass one directory at a time. gitignoreChain assembles the
+// upward chain — every `.gitignore` from the enclosing git root down to
+// the tracked root — and re-anchors ancestor patterns; this function only
+// parses one file.
+//
+// We deliberately do NOT walk *downward* into per-directory `.gitignore`
+// files here:
+//   - The files at and above the tracked root already cover ~95% of the
+//     value (build output, dependency caches, generated code).
 //   - Users with sub-directory ignores can list them in `.gortex.yaml`
-//     `excludes` until/unless we add hierarchy support.
+//     `excludes` until/unless we add downward hierarchy support.
 //
 // Returns nil when the file is absent or unreadable — gitignore reading
 // is a convenience, never a hard requirement, so a missing or
 // permission-denied file silently no-ops.
-func loadRepoGitignore(repoPath string) []string {
-	if repoPath == "" {
+func loadRepoGitignore(dir string) []string {
+	if dir == "" {
 		return nil
 	}
-	f, err := os.Open(filepath.Join(repoPath, ".gitignore"))
+	f, err := os.Open(filepath.Join(dir, ".gitignore"))
 	if err != nil {
 		return nil
 	}

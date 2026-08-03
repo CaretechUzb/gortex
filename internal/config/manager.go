@@ -219,6 +219,11 @@ func (cm *ConfigManager) readWorkspaceConfig(repoPrefix, repoPath string) (*Conf
 // The remembered path is never cleared: EffectiveExclude needs it to locate
 // the repo's own `.gitignore`, which is independent of `.gortex.yaml`.
 func (cm *ConfigManager) publishWorkspaceConfig(repoPrefix, repoPath string, cfg *Config, authoritative bool) {
+	// Publishing a path is the one moment we know a repo was just tracked,
+	// reindexed, or refreshed — re-discover where its git root is rather
+	// than trusting a shape memoized before the repo existed in this form.
+	cm.excludeCache.forgetChain(repoPath)
+
 	cm.mu.Lock()
 	changed := false
 	if repoPath != "" && cm.workspacePaths[repoPrefix] != repoPath {
@@ -314,7 +319,9 @@ func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
 // layered in precedence order (later layers can re-include via !pattern):
 //
 //  1. Builtin baseline (excludes.Builtin)
-//  2. Repo's own `.gitignore` (read from disk; opt out with
+//  2. Every `.gitignore` from the enclosing git root down to the tracked
+//     root, outermost first, with ancestor patterns re-anchored relative to
+//     the tracked root (read from disk; opt out with
 //     `respect_gitignore: false` in `.gortex.yaml`)
 //  3. Global Exclude from ~/.gortex/config.yaml
 //  4. Matching RepoEntry.Exclude (first match in Repos, then Projects)
@@ -323,11 +330,11 @@ func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
 //
 // This runs on a firehose of calls (every indexer walk and per-file
 // reconcile), so the layered result is memoized per repo and returned
-// shared: a steady-state call does one os.Stat of the repo's `.gitignore`
-// and returns the cached slice without re-reading or re-merging. The cache
-// invalidates on config changes (the global and workspace configs are
+// shared: a steady-state call does one os.Stat per `.gitignore` in the
+// chain and returns the cached slice without re-reading or re-merging. The
+// cache invalidates on config changes (the global and workspace configs are
 // swapped, never mutated in place, so pointer identity is the version) and
-// on a `.gitignore` mtime/size change.
+// on any chain member's mtime/size change.
 //
 // The returned slice is SHARED and IMMUTABLE: callers MUST NOT mutate its
 // elements. It is clipped (len == cap), so appending to it is safe —
@@ -340,23 +347,25 @@ func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 	cm.mu.RUnlock()
 
 	respect := shouldRespectGitignore(ws)
-	var st gitignoreStat
+	var chain []gitignoreLayer
 	if respect && repoPath != "" {
-		st = statGitignore(repoPath)
+		chain = cm.excludeCache.chain(repoPath)
 	}
-	if m, ok := cm.excludeCache.lookupMerged(repoPrefix, gc, ws, repoPath, respect, st); ok {
+	if m, ok := cm.excludeCache.lookupMerged(repoPrefix, gc, ws, repoPath, respect, chain); ok {
 		return m
 	}
 
 	out := make([]string, 0, 32)
 	out = append(out, excludes.Builtin...)
 
-	// Layer 2: repo `.gitignore`, unless the workspace config explicitly
-	// opts out. The parse is cached per repo path and refreshed only when
-	// the file's mtime/size changes (see excludeCache), so a mid-session
-	// edit is still picked up on the next call.
-	if respect && repoPath != "" {
-		out = append(out, cm.excludeCache.patterns(repoPath, st)...)
+	// Layer 2: the repo's `.gitignore` chain, unless the workspace config
+	// explicitly opts out. Layers arrive outermost first so a deeper file
+	// overrides a shallower one, as git does. Each parse is cached per
+	// directory and refreshed only when that file's mtime/size changes (see
+	// excludeCache), so a mid-session edit is still picked up on the next
+	// call.
+	for _, layer := range chain {
+		out = append(out, reanchorGitignore(cm.excludeCache.patterns(layer.dir, layer.stat), layer.sub)...)
 	}
 
 	if gc != nil {
@@ -396,7 +405,7 @@ func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 	// forced to reallocate and can never write through the shared backing
 	// array the cache hands to every reader.
 	out = out[:len(out):len(out)]
-	cm.excludeCache.storeMerged(repoPrefix, gc, ws, repoPath, respect, st, out)
+	cm.excludeCache.storeMerged(repoPrefix, gc, ws, repoPath, respect, chain, out)
 	return out
 }
 
