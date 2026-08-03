@@ -210,3 +210,46 @@ public class Wrapper {
 		}
 	}
 }
+
+// TestJavaMethodRef_ClassLevelPosition pins a method reference in a field
+// initializer — a constant handler table or `Comparator` field, one of the
+// commonest places the syntax appears. It sits outside every method body, so
+// the enclosing-function lookup finds no owner; the reference is anchored to
+// the file node rather than dropped.
+func TestJavaMethodRef_ClassLevelPosition(t *testing.T) {
+	g := javaMethodRefGraph(t, map[string]string{
+		"app/Registry.java": `package app;
+
+import java.util.function.Consumer;
+
+public class Registry {
+	private static final Consumer<In> HANDLER = ExampleType::transform;
+	static final Runnable BOOT = Statics::configure;
+}
+`,
+		"app/ExampleType.java": `package app;
+public class ExampleType {
+	public void transform(In in) {}
+}
+`,
+		"app/Statics.java": `package app;
+public class Statics {
+	public static void configure() {}
+}
+`,
+	})
+
+	for _, target := range []string{
+		"app/ExampleType.java::ExampleType.transform",
+		"app/Statics.java::Statics.configure",
+	} {
+		srcs := methodRefSources(g, target)
+		if len(srcs) == 0 {
+			t.Errorf("expected a reference edge on %s from a field initializer", target)
+			continue
+		}
+		if srcs[0] != "app/Registry.java" {
+			t.Errorf("class-level reference to %s anchored to %q, want the file node app/Registry.java", target, srcs[0])
+		}
+	}
+}
