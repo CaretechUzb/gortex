@@ -354,14 +354,18 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 // and global topology-writer gate, so the graph cannot expose a half-resolved
 // batch between same-repo, semantic, and cross-repository phases.
 func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) {
-	if len(filePaths) == 0 {
+	mi.runCrossRepoResolveMutationFiles(filePaths, filePaths)
+}
+
+func (mi *MultiIndexer) runCrossRepoResolveMutationFiles(resolutionFiles, materializationFiles []string) {
+	if len(resolutionFiles) == 0 && len(materializationFiles) == 0 {
 		return
 	}
 	cr := mi.newCrossRepoResolver()
 	if cr == nil {
 		return
 	}
-	cr.ResolveFilesAndIncoming(filePaths)
+	cr.ResolveMutationFiles(resolutionFiles, materializationFiles)
 }
 
 // crossWorkspaceLookup builds a resolver.CrossWorkspaceDepLookup from

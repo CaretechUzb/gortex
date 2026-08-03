@@ -21,6 +21,7 @@ type sqliteMutationReceiptAccumulator struct {
 	incompleteReason   string
 	resolutionRelevant bool
 	changedFiles       map[string]struct{}
+	unresolvedFiles    map[string]struct{}
 	definitionFiles    map[string]struct{}
 	targetNames        map[string]struct{}
 	targetIDs          map[string]struct{}
@@ -47,6 +48,7 @@ func newSQLiteMutationReceiptAccumulator() *sqliteMutationReceiptAccumulator {
 	return &sqliteMutationReceiptAccumulator{
 		complete:         true,
 		changedFiles:     make(map[string]struct{}),
+		unresolvedFiles:  make(map[string]struct{}),
 		definitionFiles:  make(map[string]struct{}),
 		targetNames:      make(map[string]struct{}),
 		targetIDs:        make(map[string]struct{}),
@@ -60,6 +62,7 @@ func (a *sqliteMutationReceiptAccumulator) receipt() graph.MutationReceipt {
 		IncompleteReason:   a.incompleteReason,
 		ResolutionRelevant: a.resolutionRelevant,
 		ChangedFiles:       sortedSQLiteReceiptKeys(a.changedFiles),
+		UnresolvedFiles:    sortedSQLiteReceiptKeys(a.unresolvedFiles),
 		DefinitionFiles:    sortedSQLiteReceiptKeys(a.definitionFiles),
 		TargetNames:        sortedSQLiteReceiptKeys(a.targetNames),
 		TargetIDs:          sortedSQLiteReceiptKeys(a.targetIDs),
@@ -142,6 +145,7 @@ func (s *Store) mergeMutationReceiptLocked(delta *sqliteMutationReceiptAccumulat
 		}
 		acc.resolutionRelevant = acc.resolutionRelevant || delta.resolutionRelevant
 		mergeSQLiteReceiptSet(acc.changedFiles, delta.changedFiles)
+		mergeSQLiteReceiptSet(acc.unresolvedFiles, delta.unresolvedFiles)
 		mergeSQLiteReceiptSet(acc.definitionFiles, delta.definitionFiles)
 		mergeSQLiteReceiptSet(acc.targetNames, delta.targetNames)
 		mergeSQLiteReceiptSet(acc.targetIDs, delta.targetIDs)
@@ -244,7 +248,9 @@ func recordSQLiteAddedEdge(acc *sqliteMutationReceiptAccumulator, e *graph.Edge,
 		return
 	}
 	acc.resolutionRelevant = true
-	if exactFile == "" {
+	if exactFile != "" {
+		acc.unresolvedFiles[exactFile] = struct{}{}
+	} else {
 		acc.noteIncomplete("edge_write_without_exact_file")
 	}
 }

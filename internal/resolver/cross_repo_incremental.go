@@ -8,32 +8,42 @@ import "github.com/zzet/gortex/internal/graph"
 // directions share one resolver lock and one build of the directory,
 // dependency, reachability, and lookup indexes.
 func (cr *CrossRepoResolver) ResolveFilesAndIncoming(filePaths []string) *CrossRepoStats {
+	return cr.ResolveMutationFiles(filePaths, filePaths)
+}
+
+// ResolveMutationFiles separates files that can create or bind unresolved
+// edges from files whose resolved base edges only need cross-repository
+// materialization. Keeping both roles under one lock still shares the expensive
+// workspace indexes without feeding every semantic edge back through resolution.
+func (cr *CrossRepoResolver) ResolveMutationFiles(resolutionFiles, materializationFiles []string) *CrossRepoStats {
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
-	if cr == nil || cr.graph == nil || len(filePaths) == 0 {
+	if cr == nil || cr.graph == nil || len(resolutionFiles) == 0 && len(materializationFiles) == 0 {
 		return stats
 	}
 
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 
-	frontier := collectIncrementalFileFrontier(cr.graph, filePaths, nil)
-	pending := make([]*graph.Edge, 0, len(frontier.pending))
-	seen := make(map[graph.EdgeIdentity]struct{}, len(frontier.pending))
-	for _, edge := range frontier.pending {
-		if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
-			continue
+	if len(resolutionFiles) > 0 {
+		frontier := collectIncrementalFileFrontier(cr.graph, resolutionFiles, nil)
+		pending := make([]*graph.Edge, 0, len(frontier.pending))
+		seen := make(map[graph.EdgeIdentity]struct{}, len(frontier.pending))
+		for _, edge := range frontier.pending {
+			if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
+				continue
+			}
+			identity := graph.EdgeIdentityFor(edge)
+			if _, duplicate := seen[identity]; duplicate {
+				continue
+			}
+			seen[identity] = struct{}{}
+			pending = append(pending, edge)
 		}
-		identity := graph.EdgeIdentityFor(edge)
-		if _, duplicate := seen[identity]; duplicate {
-			continue
+		if len(pending) > 0 {
+			stats = cr.resolveScopedLocked(pending)
 		}
-		seen[identity] = struct{}{}
-		pending = append(pending, edge)
 	}
-	if len(pending) > 0 {
-		stats = cr.resolveScopedLocked(pending)
-	}
-	DetectCrossRepoEdgesForFiles(cr.graph, frontier.paths)
+	DetectCrossRepoEdgesForFiles(cr.graph, materializationFiles)
 	return stats
 }
 

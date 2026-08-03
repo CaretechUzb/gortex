@@ -42,6 +42,12 @@ func TestSQLiteMutationReceiptCapturesExactResolutionDelta(t *testing.T) {
 	if want := []string{"src/a.go", "src/b.go"}; !slices.Equal(receipt.ResolutionFiles(), want) {
 		t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), want)
 	}
+	if want := []string{"src/a.go"}; !slices.Equal(receipt.UnresolvedFiles, want) {
+		t.Fatalf("unresolved files = %v, want %v", receipt.UnresolvedFiles, want)
+	}
+	if want := []string{"src/a.go", "src/b.go"}; !slices.Equal(receipt.CrossRepoFiles(), want) {
+		t.Fatalf("cross-repo files = %v, want %v", receipt.CrossRepoFiles(), want)
+	}
 	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "Caller", "Load", "pkg.Caller", "pkg.Load")
 	assertSQLiteReceiptContains(t, "target ids", receipt.TargetIDs,
 		"repo/src/a.go::Caller", "repo/src/b.go::Load", "repo::"+graph.UnresolvedMarker+"Load")
@@ -69,6 +75,12 @@ func TestSQLiteMutationReceiptCapturesResolvedEdgeFrontier(t *testing.T) {
 		t.Fatalf("receipt = %+v, want complete resolved-edge frontier", receipt)
 	}
 	assertSQLiteReceiptContains(t, "changed files", receipt.ChangedFiles, "src/a.go")
+	if len(receipt.UnresolvedFiles) != 0 || len(receipt.ResolutionFiles()) != 0 {
+		t.Fatalf("resolved edge entered unresolved frontier: %+v", receipt)
+	}
+	if want := []string{"src/a.go"}; !slices.Equal(receipt.CrossRepoFiles(), want) {
+		t.Fatalf("cross-repo files = %v, want %v", receipt.CrossRepoFiles(), want)
+	}
 	assertSQLiteReceiptContains(t, "target ids", receipt.TargetIDs, targetID)
 	assertSQLiteReceiptContains(t, "import candidates", receipt.ImportCandidates, targetID, "dependency")
 }
@@ -91,8 +103,8 @@ func TestSQLiteMutationReceiptIdempotentAndAttributeOnlyWritesAreNeutral(t *test
 	if !receipt.Complete {
 		t.Fatalf("neutral receipt unexpectedly incomplete: %+v", receipt)
 	}
-	if receipt.ResolutionRelevant || len(receipt.ResolutionFiles()) != 0 {
-		t.Fatalf("neutral writes produced resolution delta: %+v", receipt)
+	if receipt.ResolutionRelevant || len(receipt.UnresolvedFiles) != 0 || len(receipt.ResolutionFiles()) != 0 || len(receipt.CrossRepoFiles()) != 0 {
+		t.Fatalf("neutral writes produced mutation frontiers: %+v", receipt)
 	}
 }
 
@@ -294,6 +306,9 @@ func TestSQLiteMutationReceiptDuplicateSemanticEnrichmentKeepsExactReceipt(t *te
 	if !receipt.Complete || receipt.ResolutionRelevant {
 		t.Fatalf("enrichment-only duplicate batch receipt = %+v, want complete and resolution-irrelevant", receipt)
 	}
+	if len(receipt.UnresolvedFiles) != 0 || len(receipt.ResolutionFiles()) != 0 || len(receipt.CrossRepoFiles()) != 0 {
+		t.Fatalf("enrichment-only duplicate batch produced mutation frontiers: %+v", receipt)
+	}
 	if got := store.GetNode(id); got == nil || got.Meta["semantic_type"] != "number" {
 		t.Fatalf("final enriched node = %+v, want semantic_type number", got)
 	}
@@ -442,7 +457,8 @@ func TestSQLiteMutationReceiptEdgeSourceFileFallback(t *testing.T) {
 	token := store.BeginMutationReceipt()
 	store.AddEdge(&graph.Edge{From: "repo/a.go::A", To: "repo::" + graph.UnresolvedMarker + "B", Kind: graph.EdgeCalls})
 	receipt := store.EndMutationReceipt(token)
-	if !receipt.Complete || !receipt.ResolutionRelevant || !slices.Contains(receipt.ChangedFiles, "a.go") {
+	if !receipt.Complete || !receipt.ResolutionRelevant || !slices.Contains(receipt.ChangedFiles, "a.go") ||
+		!slices.Contains(receipt.UnresolvedFiles, "a.go") || !slices.Contains(receipt.CrossRepoFiles(), "a.go") {
 		t.Fatalf("source-file fallback receipt = %+v", receipt)
 	}
 

@@ -65,6 +65,7 @@ func TestResolveDeferredMutationsUsesExactChangedFileFrontier(t *testing.T) {
 		Complete:           true,
 		ResolutionRelevant: true,
 		ChangedFiles:       []string{"a.go"},
+		UnresolvedFiles:    []string{"a.go"},
 		TargetNames:        []string{"Target"},
 	}
 
@@ -116,7 +117,7 @@ func TestResolveDeferredMutationsExactReceiptCompletesCrossRepoFrontier(t *testi
 	receipt := &graph.MutationReceipt{
 		Complete:           true,
 		ResolutionRelevant: true,
-		ChangedFiles:       []string{"b/b.go"},
+		DefinitionFiles:    []string{"b/b.go"},
 		TargetIDs:          []string{"b/b.go::Serve"},
 	}
 
@@ -136,6 +137,33 @@ func TestResolveDeferredMutationsExactReceiptCompletesCrossRepoFrontier(t *testi
 	}
 	if deferredHasEdgeKindTo(store.GetOutEdges("c/c.go::Call"), crossKind, "d/d.go::Serve") {
 		t.Fatal("exact receipt leaked cross-repo materialization outside its file frontier")
+	}
+}
+
+func TestResolveDeferredMutationsResolvedEdgeSkipsMasterButMaterializesCrossRepo(t *testing.T) {
+	store := deferredCrossRepoReceiptFixture()
+	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
+	receipt := &graph.MutationReceipt{
+		Complete:     true,
+		ChangedFiles: []string{"a/a.go"},
+	}
+
+	mode, _ := mi.resolveDeferredMutations(receipt, true, nil, false)
+	if mode != deferredResolveExact {
+		t.Fatalf("mode = %q, want %q", mode, deferredResolveExact)
+	}
+	if got := store.unresolvedScans.Load(); got != 0 {
+		t.Fatalf("resolved-only receipt performed %d unresolved scans", got)
+	}
+	crossKind, ok := graph.CrossRepoKindFor(graph.EdgeCalls)
+	if !ok {
+		t.Fatal("calls has no cross-repo kind")
+	}
+	if !deferredHasEdgeKindTo(store.GetOutEdges("a/a.go::Call"), crossKind, "b/b.go::Serve") {
+		t.Fatal("resolved-only receipt did not materialize its cross-repo edge")
+	}
+	if deferredHasEdgeKindTo(store.GetOutEdges("c/c.go::Call"), crossKind, "d/d.go::Serve") {
+		t.Fatal("resolved-only receipt leaked outside its edge-source frontier")
 	}
 }
 

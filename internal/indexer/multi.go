@@ -832,14 +832,15 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 			return fullFallback(nil, receipt.IncompleteReason)
 		}
 
-		files := receipt.ResolutionFiles()
-		if receipt.ResolutionRelevant && len(files) == 0 {
+		resolutionFiles := receipt.ResolutionFiles()
+		crossRepoFiles := receipt.CrossRepoFiles()
+		if receipt.ResolutionRelevant && len(resolutionFiles) == 0 {
 			// Completeness implementations should already reject this shape, but
 			// keep the consumer fail-closed if a future backend gets it wrong.
 			mi.logger.Warn("DEFERRED-TIMING resolution delta lacks exact files; resolving all")
 			return fullFallback(nil, "resolution_delta_without_files")
 		}
-		if len(files) == 0 {
+		if len(resolutionFiles) == 0 && len(crossRepoFiles) == 0 {
 			mi.logger.Info("DEFERRED-TIMING mutation receipt has no file-scoped resolution or cross-repo delta",
 				zap.Int("changed_files", len(receipt.ChangedFiles)),
 				zap.Int("target_ids", len(receipt.TargetIDs)))
@@ -847,12 +848,12 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 		}
 
 		if receipt.ResolutionRelevant {
-			mi.runMasterResolveFiles(files, false)
+			mi.runMasterResolveFiles(resolutionFiles, false)
 		}
-		// Resolve both outgoing edges from the changed files and incoming stubs
-		// that name definitions in those files, then materialise the parallel
-		// cross_repo_* edge generation for already-resolved base edges too.
-		mi.runCrossRepoResolveFiles(files)
+		// Resolve only files that can create or bind unresolved edges. Resolved
+		// edge sources still materialise their cross_repo_* generation without
+		// repeating the substantially larger name-resolution frontier.
+		mi.runCrossRepoResolveMutationFiles(resolutionFiles, crossRepoFiles)
 		return deferredResolveExact, true
 	}
 	if !fallbackNeeded {
