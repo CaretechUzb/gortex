@@ -48,6 +48,28 @@ var Builtin = []string{
 	".bundle/",    // Ruby Bundler cache
 	".dart_tool/", // Dart/Flutter build cache
 	".pub-cache/", // Dart global pub cache, occasionally vendored
+	// Visual Studio / MSBuild artifacts.
+	".vs/",         // Visual Studio per-solution cache
+	"TestResults/", // Visual Studio / `dotnet test` output
+	// MSBuild's intermediate output. `obj/` itself is deliberately NOT
+	// excluded wholesale: it is first-party source elsewhere (Go's own
+	// toolchain ships `cmd/internal/obj`), and a silent blanket drop is the
+	// same failure this list exists to prevent. These entries name what
+	// MSBuild actually writes — the per-configuration trees holding
+	// regenerated C# (`*.AssemblyInfo.cs`, `*.GlobalUsings.g.cs`,
+	// `*.csproj.FileListAbsolute.txt`) and the NuGet restore metadata —
+	// so a first-party `obj` package stays indexed.
+	//
+	// `bin/` is likewise absent: MSBuild's output directory, but also
+	// committed source in other ecosystems (Rails' `bin/rails`, an npm
+	// package's `bin/cli.js`). .NET repos ignore both in `.gitignore`,
+	// which Gortex layers from the git root down, so this list only has to
+	// cover the repo that forgot to.
+	"obj/[Dd]ebug/",
+	"obj/[Rr]elease/",
+	"obj/project.assets.json",
+	"obj/project.nuget.cache",
+	"**/obj/*.nuget.*", // *.csproj.nuget.{dgspec.json,g.props,g.targets}
 	"*.tmp",
 	// Editor scratch/backup files. Vim cycles swap suffixes backward
 	// through the alphabet (.swp → .swo → .swn → ...); neovim writes a
