@@ -344,40 +344,28 @@ type frameworkEdgeCensus struct {
 // walked once here for their consumers instead of once per pass.
 func collectFrameworkEdgeCensus(g graph.Store, streams *frameworkStreamCandidates) frameworkEdgeCensus {
 	census := frameworkEdgeCensus{valid: true, via: map[string]bool{}}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if e == nil {
-			continue
-		}
+	for e := range graph.FrameworkCensusEdgesSeq(g, graph.EdgeCalls) {
 		streams.collectCalls(e)
 		if isSetStateTarget(e.To) {
 			census.setStateTarget = true
 		}
-		if e.Meta == nil {
-			continue
-		}
-		if via, _ := e.Meta["via"].(string); via != "" {
-			census.via[via] = true
-			if via == objectRegistryVia && !census.objectRegistryValue {
-				if value, _ := e.Meta["registry_value"].(string); value != "" {
-					census.objectRegistryValue = true
-				}
+		if e.Via != "" {
+			census.via[e.Via] = true
+			if e.Via == objectRegistryVia && !census.objectRegistryValue && e.RegistryValue != "" {
+				census.objectRegistryValue = true
 			}
-			if via == "grpc.stub" && !census.grpcStub {
-				service, _ := e.Meta["grpc_service"].(string)
-				method, _ := e.Meta["grpc_method"].(string)
-				if service != "" && method != "" {
-					census.grpcStub = true
-				}
+			if e.Via == "grpc.stub" && !census.grpcStub && e.GRPCService != "" && e.GRPCMethod != "" {
+				census.grpcStub = true
 			}
-			if !census.temporalVia && strings.HasPrefix(via, "temporal.") {
+			if !census.temporalVia && strings.HasPrefix(e.Via, "temporal.") {
 				census.temporalVia = true
 			}
 		}
 		if graph.IsUnresolvedTarget(e.To) {
-			if _, ok := e.Meta["express_handler_ref"]; ok {
+			if e.HasExpressHandlerRef {
 				census.expressHandlerRef = true
 			}
-			if recv, _ := e.Meta["recv_const"].(string); recv != "" {
+			if e.RecvConst != "" {
 				census.recvConst = true
 			}
 		}
@@ -387,10 +375,7 @@ func collectFrameworkEdgeCensus(g graph.Store, streams *frameworkStreamCandidate
 		// themselves, so the presence probe's break-on-first-hit walk
 		// becomes one full collection walk of this small kind — replacing
 		// the pass's own EdgeAnnotated scan.
-		for e := range g.EdgesByKind(graph.EdgeAnnotated) {
-			if e == nil {
-				continue
-			}
+		for e := range graph.FrameworkCensusEdgesSeq(g, graph.EdgeAnnotated) {
 			if role, member := temporalRoleForJavaAnnotation(e.To); role != "" || member != "" {
 				streams.addAnnotated(e)
 			}
@@ -399,10 +384,7 @@ func collectFrameworkEdgeCensus(g graph.Store, streams *frameworkStreamCandidate
 			census.temporalAnnotation = streams.annotatedCount() > 0
 		}
 	} else if !census.temporalVia {
-		for e := range g.EdgesByKind(graph.EdgeAnnotated) {
-			if e == nil {
-				continue
-			}
+		for e := range graph.FrameworkCensusEdgesSeq(g, graph.EdgeAnnotated) {
 			if role, member := temporalRoleForJavaAnnotation(e.To); role != "" || member != "" {
 				census.temporalAnnotation = true
 				break
@@ -410,10 +392,7 @@ func collectFrameworkEdgeCensus(g graph.Store, streams *frameworkStreamCandidate
 		}
 	}
 	if streams.wantsRefs() {
-		for e := range g.EdgesByKind(graph.EdgeReferences) {
-			if e == nil {
-				continue
-			}
+		for e := range graph.FrameworkCensusEdgesSeq(g, graph.EdgeReferences) {
 			streams.collectRefs(e)
 		}
 	}

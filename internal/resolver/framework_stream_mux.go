@@ -116,7 +116,7 @@ type frameworkStreamCandidates struct {
 // under-collection is the only bug class.
 type frameworkCandidateCollector struct {
 	name string
-	pred func(*graph.Edge) bool
+	pred func(graph.FrameworkCensusEdge) bool
 }
 
 // newFrameworkStreamCandidates arms a collector for every convertible pass
@@ -133,10 +133,10 @@ func newFrameworkStreamCandidates(g graph.Store, present, markers map[string]int
 	armed := func(name string) bool {
 		return frameworkSynthNodeGatesPass(name, present, markers)
 	}
-	addCalls := func(name string, pred func(*graph.Edge) bool) {
+	addCalls := func(name string, pred func(graph.FrameworkCensusEdge) bool) {
 		sc.callsCollectors = append(sc.callsCollectors, frameworkCandidateCollector{name: name, pred: pred})
 	}
-	addRefs := func(name string, pred func(*graph.Edge) bool) {
+	addRefs := func(name string, pred func(graph.FrameworkCensusEdge) bool) {
 		sc.refsCollectors = append(sc.refsCollectors, frameworkCandidateCollector{name: name, pred: pred})
 	}
 
@@ -243,27 +243,27 @@ func (sc *frameworkStreamCandidates) releasePass(name string, bundle *frameworkP
 // collectCalls hands one census-walk EdgeCalls edge to every armed
 // collector. Edges without a source node are skipped: no pass can act on a
 // degenerate edge and the current-form re-read below is keyed by source.
-func (sc *frameworkStreamCandidates) collectCalls(e *graph.Edge) {
-	if sc == nil || e == nil || e.From == "" {
+func (sc *frameworkStreamCandidates) collectCalls(e graph.FrameworkCensusEdge) {
+	if sc == nil || e.From == "" {
 		return
 	}
 	for _, c := range sc.callsCollectors {
 		if c.pred(e) {
 			pc := sc.perPass[c.name]
-			pc.calls = append(pc.calls, graph.EdgeIdentityFor(e))
+			pc.calls = append(pc.calls, e.EdgeIdentity)
 		}
 	}
 }
 
 // collectRefs is collectCalls for the EdgeReferences walk.
-func (sc *frameworkStreamCandidates) collectRefs(e *graph.Edge) {
-	if sc == nil || e == nil || e.From == "" {
+func (sc *frameworkStreamCandidates) collectRefs(e graph.FrameworkCensusEdge) {
+	if sc == nil || e.From == "" {
 		return
 	}
 	for _, c := range sc.refsCollectors {
 		if c.pred(e) {
 			pc := sc.perPass[c.name]
-			pc.refs = append(pc.refs, graph.EdgeIdentityFor(e))
+			pc.refs = append(pc.refs, e.EdgeIdentity)
 		}
 	}
 }
@@ -276,12 +276,12 @@ func (sc *frameworkStreamCandidates) wantsAnnotated() bool {
 	return sc != nil && sc.wantAnnotated
 }
 
-func (sc *frameworkStreamCandidates) addAnnotated(e *graph.Edge) {
-	if sc == nil || e == nil {
+func (sc *frameworkStreamCandidates) addAnnotated(e graph.FrameworkCensusEdge) {
+	if sc == nil {
 		return
 	}
 	pc := sc.perPass[SynthTemporalStub]
-	pc.annotated = append(pc.annotated, graph.EdgeIdentityFor(e))
+	pc.annotated = append(pc.annotated, e.EdgeIdentity)
 }
 
 func (sc *frameworkStreamCandidates) annotatedCount() int {
@@ -346,55 +346,32 @@ func frameworkEdgeSeq(edges []*graph.Edge) iter.Seq[*graph.Edge] {
 // language, node lookups, index membership) stay in the pass, which
 // re-applies its full filter over the re-fetched candidates.
 
-func grpcCandidateEdge(e *graph.Edge) bool {
-	if e.Meta == nil {
-		return false
-	}
+func grpcCandidateEdge(e graph.FrameworkCensusEdge) bool {
 	// Both arms of the pass read EdgeCalls: the stub arm keys on the via,
 	// the handler-index arm on the registration marker.
-	if v, _ := e.Meta["via"].(string); v == "grpc.stub" {
-		return true
-	}
-	svc, _ := e.Meta["grpc_register_service"].(string)
-	return svc != ""
+	return e.Via == "grpc.stub" || e.GRPCRegisterService != ""
 }
 
-func temporalCandidateEdge(e *graph.Edge) bool {
-	if e.Meta == nil {
-		return false
-	}
+func temporalCandidateEdge(e graph.FrameworkCensusEdge) bool {
 	// The prefix covers every phase input: register / stub / start for the
 	// sweep, executor-field markers for the pre-pass, handler edges for the
 	// cross-language join — mirroring the pass's own presence probe.
-	v, _ := e.Meta["via"].(string)
-	return strings.HasPrefix(v, "temporal.")
+	return strings.HasPrefix(e.Via, "temporal.")
 }
 
-func storeFactoryCandidateEdge(e *graph.Edge) bool {
-	if e.Meta == nil {
-		return false
-	}
-	v, _ := e.Meta["via"].(string)
-	return v == storeFactoryVia
+func storeFactoryCandidateEdge(e graph.FrameworkCensusEdge) bool {
+	return e.Via == storeFactoryVia
 }
 
-func fnPtrDispatchCandidateEdge(e *graph.Edge) bool {
-	if e.Meta == nil {
-		return false
-	}
-	v, _ := e.Meta["via"].(string)
-	return v == fnPtrDispatchVia
+func fnPtrDispatchCandidateEdge(e graph.FrameworkCensusEdge) bool {
+	return e.Via == fnPtrDispatchVia
 }
 
-func fnPtrRegCandidateEdge(e *graph.Edge) bool {
-	if e.Meta == nil {
-		return false
-	}
-	v, _ := e.Meta["via"].(string)
-	return v == fnPtrRegVia
+func fnPtrRegCandidateEdge(e graph.FrameworkCensusEdge) bool {
+	return e.Via == fnPtrRegVia
 }
 
-func (sc *frameworkStreamCandidates) macroCandidateEdge(e *graph.Edge) bool {
+func (sc *frameworkStreamCandidates) macroCandidateEdge(e graph.FrameworkCensusEdge) bool {
 	if e.To == "" {
 		return false
 	}
@@ -406,15 +383,11 @@ func (sc *frameworkStreamCandidates) macroCandidateEdge(e *graph.Edge) bool {
 	return ok
 }
 
-func railsCandidateEdge(e *graph.Edge) bool {
-	if e.Meta == nil || !graph.IsUnresolvedTarget(e.To) {
-		return false
-	}
-	recv, _ := e.Meta["recv_const"].(string)
-	return recv != ""
+func railsCandidateEdge(e graph.FrameworkCensusEdge) bool {
+	return graph.IsUnresolvedTarget(e.To) && e.RecvConst != ""
 }
 
-func reactCandidateEdge(e *graph.Edge) bool {
+func reactCandidateEdge(e graph.FrameworkCensusEdge) bool {
 	if !graph.IsUnresolvedTarget(e.To) {
 		return false
 	}
@@ -422,30 +395,30 @@ func reactCandidateEdge(e *graph.Edge) bool {
 	if i := strings.IndexByte(head, '.'); i >= 0 {
 		head = head[:i]
 	}
-	via, _ := e.Meta["via"].(string)
-	_, _, ok := reactResolveShape(head, via)
+	_, _, ok := reactResolveShape(head, e.Via)
 	return ok
 }
 
-func fastapiCandidateEdge(e *graph.Edge) bool {
-	if e.Meta == nil || !graph.IsUnresolvedTarget(e.To) {
+func fastapiCandidateEdge(e graph.FrameworkCensusEdge) bool {
+	if !graph.IsUnresolvedTarget(e.To) {
 		return false
 	}
-	switch v, _ := e.Meta["via"].(string); v {
+	switch e.Via {
 	case "fastapi.Depends", "fastapi.router":
 		return true
 	}
 	return false
 }
 
-func factoryChainCandidateEdge(e *graph.Edge) bool {
-	if e.Meta == nil || !graph.IsUnresolvedTarget(e.To) {
-		return false
-	}
-	expr, _ := e.Meta["receiver_expr"].(string)
-	return expr != ""
+func factoryChainCandidateEdge(e graph.FrameworkCensusEdge) bool {
+	return graph.IsUnresolvedTarget(e.To) && e.ReceiverExpr != ""
 }
 
-func rustCandidateEdge(e *graph.Edge) bool {
-	return graph.IsUnresolvedTarget(e.To) && rustScopeEdgeCandidate(e)
+func rustCandidateEdge(e graph.FrameworkCensusEdge) bool {
+	if !graph.IsUnresolvedTarget(e.To) {
+		return false
+	}
+	return strings.Contains(e.RustPath, "::") ||
+		e.RustRecv == "self" || e.RustRecv == "Self" ||
+		e.ReceiverType != "" || strings.HasPrefix(e.RustRecvExpr, "self.")
 }
