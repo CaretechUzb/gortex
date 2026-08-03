@@ -345,8 +345,19 @@ func (idx *Indexer) reresolveCSharpGlobalUsingDependents(changed []string, exclu
 	}
 	sort.Strings(deps)
 	idx.restubCSharpExtensionBinds(deps)
+	// The changed files ride along so the resolve entry reconciles THEIR
+	// stamps before the dependents re-narrow — on a deferred batch the
+	// main catch-up naming them runs only after this. Their own pending
+	// edges resolve there; here they mostly hit the no-pending early
+	// return.
+	resolveList := deps
+	for _, f := range changed {
+		if _, dup := depSet[f]; !dup {
+			resolveList = append(resolveList, f)
+		}
+	}
 	idx.observeIncrementalCatchup("resolve", deps)
-	idx.resolver.ResolveFilesAndIncoming(deps)
+	idx.resolver.ResolveFilesAndIncoming(resolveList)
 }
 
 func reusableResolvedEdge(e *graph.Edge) bool {

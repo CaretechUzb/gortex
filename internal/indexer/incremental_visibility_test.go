@@ -188,3 +188,34 @@ namespace App {
 	assert.Contains(t, fooCallEdgeTarget(t, g, mID), "E2.Foo",
 		"the global-using swap changed every dependent's visibility — Caller.cs must re-bind to LibB")
 }
+
+// TestIncrementalEvict_GlobalUsingsFileReresolvesDependents: deleting
+// the global-usings file removes the visibility every dependent's
+// extension bind was narrowed under. Eviction must re-price them —
+// with the visibility gone the two-way tie is the correct verdict.
+func TestIncrementalEvict_GlobalUsingsFileReresolvesDependents(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "W.cs"), csVisCrate)
+	writeFile(t, filepath.Join(dir, "E1.cs"), csVisExtA)
+	writeFile(t, filepath.Join(dir, "E2.cs"), csVisExtB)
+	usingsPath := filepath.Join(dir, "Usings.cs")
+	writeFile(t, usingsPath, "global using LibA;\n")
+	writeFile(t, filepath.Join(dir, "Caller.cs"), `using W;
+namespace App {
+    public class R {
+        public void M() {
+            Crate c = new Crate();
+            c.Foo();
+        }
+    }
+}
+`)
+	g, idx := newCSVisIndexer(t, dir)
+	mID := fnNodeID(t, g, "Caller.cs", "M")
+	require.Contains(t, fooCallEdgeTarget(t, g, mID), "E1.Foo",
+		"baseline: the global using narrows the call to LibA's extension")
+
+	idx.EvictFile(usingsPath)
+	assert.True(t, graph.IsUnresolvedTarget(fooCallEdgeTarget(t, g, mID)),
+		"with the global using deleted neither extension namespace is visible — the stale LibA bind must not survive the eviction")
+}

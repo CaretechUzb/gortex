@@ -2,7 +2,9 @@ package indexer
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
+	"strings"
 
 	"go.uber.org/zap"
 
@@ -238,6 +240,13 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 	topologyChanged := true
 	defer func() { finishTopologyMutation(topologyChanged) }()
 
+	// Captured BEFORE eviction: deleting a global-usings file (or a
+	// csproj, which draws the unit boundaries) removes visibility every
+	// dependent's extension bind was narrowed under.
+	graphPath := idx.prefixPath(filepath.FromSlash(path))
+	evictedGlobals := csharpVisibilityStampForNodes(idx.graph.GetFileNodes(graphPath)).globals != "" ||
+		strings.HasSuffix(strings.ToLower(graphPath), ".csproj")
+
 	eviction := idx.evictFileIncrementalRaw(path)
 	result := eviction.result
 	files, needed, exact := incrementalResolutionFrontier(result, nil)
@@ -252,6 +261,10 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 	} else if needed && !exact {
 		idx.observeIncrementalCatchup("resolve", nil)
 		idx.ResolveAll()
+	}
+	if evictedGlobals {
+		idx.reresolveCSharpGlobalUsingDependents(
+			[]string{graphPath}, map[string]struct{}{graphPath: {}})
 	}
 	if result != nil && result.DeletedFileCount > 0 {
 		idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)

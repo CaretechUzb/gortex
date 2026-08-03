@@ -309,13 +309,21 @@ type Resolver struct {
 	// csproj directory, else the declaring file's directory) to the
 	// namespaces its files' `global using` directives import;
 	// csharpProjDirs is the csproj-owning directory set the keying
-	// uses. nil = not built; built lazily under csharpNSMu with PASS
-	// lifetime — the stamps only change on re-extraction, never
-	// mid-pass, and an O(graph) rebuild per pending page would stall
-	// every C# worker (cleared in clearPassIndexes + the incremental
-	// entry points, NOT in the per-page clearLookupCache).
+	// uses. nil = not built; derived lazily under csharpNSMu from the
+	// persistent sources below — NOT rebuilt by a workspace scan per
+	// scoped resolve (see scopedCSharpVisibilityInvalidate), and NOT
+	// cleared by the per-page clearLookupCache.
 	csharpGlobalByDir map[string][]string
 	csharpProjDirs    map[string]struct{}
+
+	// csharpGlobalDecls / csharpProjFiles are the SOURCES the derived
+	// index above is built from: fileID → its global_usings stamp, and
+	// the csproj file IDs. Seeded by ONE workspace scan and then
+	// maintained by scopedCSharpVisibilityInvalidate, so the scoped
+	// resolve entries stop paying an O(all files) rebuild per save.
+	csharpGlobalDecls map[string][]string
+	csharpProjFiles   map[string]struct{}
+	csharpVisSeeded   bool
 
 	// csharpTypeNodesByName memoises the repo-scoped type/interface
 	// lookup the extension binder's eligibility rules repeat per call
@@ -550,6 +558,11 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 
 	r.logUnresolvedFrontier("start")
 	defer r.logUnresolvedFrontier("end")
+
+	// A full pass follows wholesale graph mutation (bulk index, retrack)
+	// no scoped reconcile ever named — rebuild the C# visibility state
+	// from scratch. Scoped resolves maintain it incrementally instead.
+	r.clearCSharpVisibilityCaches()
 
 	// Fresh placeholder-source set per pass: dataflow edges indexed since the
 	// previous pass must be visible, and a moved source must not linger.
@@ -1971,6 +1984,9 @@ func (r *Resolver) clearCSharpVisibilityCaches() {
 	r.csharpNSByFile = nil
 	r.csharpTypeNodesByName = nil
 	r.csharpAncestorsByType = nil
+	r.csharpGlobalDecls = nil
+	r.csharpProjFiles = nil
+	r.csharpVisSeeded = false
 	r.csharpNSMu.Unlock()
 }
 
@@ -2126,7 +2142,11 @@ func (r *Resolver) clearPassIndexes() {
 	r.clearProvidesForIndex()
 	r.clearReachabilityIndex()
 	r.clearLSPIndex()
-	r.clearCSharpVisibilityCaches()
+	// The C# visibility state is deliberately NOT pass-lifetime any
+	// more: the global-using sources persist across scoped resolves
+	// (each entry reconciles the files it names), and wholesale
+	// invalidation lives at the ResolveAll entry — clearing here would
+	// re-introduce the per-save workspace rescan.
 }
 
 // buildPassIndexesForPending bounds the interactive path to the caller files
@@ -2142,6 +2162,7 @@ func (r *Resolver) buildPassIndexesForPending(pending []*graph.Edge) (clear func
 func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.scopedCSharpVisibilityInvalidate([]string{filePath})
 
 	clear := r.buildPassIndexes()
 	defer clear()
@@ -2161,9 +2182,9 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	started := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// The edited file may have (re)stamped global usings — rebuild the
-	// pass-lifetime index from the current graph.
-	r.clearCSharpVisibilityCaches()
+	// The edited file may have (re)stamped global usings — reconcile the
+	// persistent index instead of paying the workspace rescan per save.
+	r.scopedCSharpVisibilityInvalidate([]string{filePath})
 
 	// Establish whether this edit left any work before building the four
 	// graph-wide pass indexes. Generated assets and source saves that carry
@@ -2328,9 +2349,9 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 	started := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// The edited files may have (re)stamped global usings — rebuild the
-	// pass-lifetime index from the current graph.
-	r.clearCSharpVisibilityCaches()
+	// The edited files may have (re)stamped global usings — reconcile the
+	// persistent index instead of paying the workspace rescan per save.
+	r.scopedCSharpVisibilityInvalidate(filePaths)
 
 	pendingStarted := time.Now()
 	frontier := r.collectIncrementalFileFrontier(filePaths)
@@ -2584,6 +2605,7 @@ func (r *Resolver) runFileAttributionPassesForFileLocked(filePath string) {
 func (r *Resolver) ResolveIncomingForFile(filePath string) *ResolveStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.scopedCSharpVisibilityInvalidate([]string{filePath})
 
 	clear := r.buildPassIndexes()
 	defer clear()

@@ -166,37 +166,10 @@ func (r *Resolver) csharpGlobalUsingsFor(fileID string) []string {
 	if idx == nil {
 		r.csharpNSMu.Lock()
 		if r.csharpGlobalByDir == nil {
-			type decl struct {
-				dir     string
-				globals []string
+			if !r.csharpVisSeeded {
+				r.seedCSharpVisSourcesLocked()
 			}
-			var decls []decl
-			projSet := map[string]struct{}{}
-			for n := range r.graph.NodesByKind(graph.KindFile) {
-				if n == nil {
-					continue
-				}
-				if strings.HasSuffix(strings.ToLower(n.ID), ".csproj") {
-					projSet[csharpDirOf(n.ID)] = struct{}{}
-					continue
-				}
-				if n.Meta == nil {
-					continue
-				}
-				if globals := csharpMetaStrings(n.Meta["global_usings"]); len(globals) > 0 {
-					decls = append(decls, decl{csharpDirOf(n.ID), globals})
-				}
-			}
-			built := map[string][]string{}
-			for _, d := range decls {
-				key := csharpNearestProjDir(projSet, d.dir)
-				if key == "" {
-					key = d.dir
-				}
-				built[key] = append(built[key], d.globals...)
-			}
-			r.csharpGlobalByDir = built
-			r.csharpProjDirs = projSet
+			r.deriveCSharpGlobalIndexLocked()
 		}
 		idx, projDirs = r.csharpGlobalByDir, r.csharpProjDirs
 		r.csharpNSMu.Unlock()
@@ -221,6 +194,159 @@ func (r *Resolver) csharpGlobalUsingsFor(fileID string) []string {
 		out = append(out, idx[dir]...)
 	}
 	return out
+}
+
+// seedCSharpVisSourcesLocked is the ONE workspace scan: it records each
+// global-using declaration and csproj location. After the seed the
+// sources are maintained by scopedCSharpVisibilityInvalidate — the
+// files a scoped resolve names re-read their stamps, and decl/proj
+// existence is re-verified per entry — so no later scoped resolve pays
+// the scan again (the per-save O(all files) rebuild the review flagged).
+func (r *Resolver) seedCSharpVisSourcesLocked() {
+	decls := map[string][]string{}
+	projs := map[string]struct{}{}
+	for n := range r.graph.NodesByKind(graph.KindFile) {
+		if n == nil {
+			continue
+		}
+		if strings.HasSuffix(strings.ToLower(n.ID), ".csproj") {
+			projs[n.ID] = struct{}{}
+			continue
+		}
+		if n.Meta == nil {
+			continue
+		}
+		if globals := csharpMetaStrings(n.Meta["global_usings"]); len(globals) > 0 {
+			decls[n.ID] = globals
+		}
+	}
+	r.csharpGlobalDecls = decls
+	r.csharpProjFiles = projs
+	r.csharpVisSeeded = true
+}
+
+// deriveCSharpGlobalIndexLocked rebuilds the derived unit-key index
+// from the maintained sources — O(|decls| + |projs|), no graph scan.
+func (r *Resolver) deriveCSharpGlobalIndexLocked() {
+	projSet := map[string]struct{}{}
+	for f := range r.csharpProjFiles {
+		projSet[csharpDirOf(f)] = struct{}{}
+	}
+	built := map[string][]string{}
+	for f, globals := range r.csharpGlobalDecls {
+		key := csharpNearestProjDir(projSet, csharpDirOf(f))
+		if key == "" {
+			key = csharpDirOf(f)
+		}
+		built[key] = append(built[key], globals...)
+	}
+	r.csharpGlobalByDir = built
+	r.csharpProjDirs = projSet
+}
+
+// scopedCSharpVisibilityInvalidate replaces the wholesale visibility
+// clear at the scoped-resolve entry points. The graph-content memos
+// (type lookup, ancestor closures) rebuild lazily and cheaply, so they
+// still drop per entry; the global-using sources persist and only
+// RECONCILE: each named file re-reads its stamps, and the (few) decl /
+// csproj files are verified to still exist so a deletion through any
+// mutation path invalidates without indexer wiring. Only an actual
+// change drops the derived index and the per-file namespace sets
+// (those bake the propagated globals in).
+func (r *Resolver) scopedCSharpVisibilityInvalidate(files []string) {
+	r.csharpNSMu.Lock()
+	defer r.csharpNSMu.Unlock()
+	r.csharpTypeNodesByName = nil
+	r.csharpAncestorsByType = nil
+	if !r.csharpVisSeeded {
+		r.csharpGlobalByDir = nil
+		r.csharpProjDirs = nil
+		r.csharpNSByFile = nil
+		return
+	}
+	changed := false
+	for _, f := range files {
+		if r.reconcileCSharpVisFileLocked(f) {
+			changed = true
+		}
+	}
+	for f := range r.csharpGlobalDecls {
+		if r.graph.GetNode(f) == nil {
+			delete(r.csharpGlobalDecls, f)
+			changed = true
+		}
+	}
+	for f := range r.csharpProjFiles {
+		if r.graph.GetNode(f) == nil {
+			delete(r.csharpProjFiles, f)
+			changed = true
+		}
+	}
+	if changed {
+		r.csharpGlobalByDir = nil
+		r.csharpProjDirs = nil
+		r.csharpNSByFile = nil
+		return
+	}
+	// Unchanged globals: only the named files' own using stamps could
+	// have moved — drop just their per-file sets.
+	for _, f := range files {
+		delete(r.csharpNSByFile, f)
+	}
+}
+
+// reconcileCSharpVisFileLocked folds one file's current global-using /
+// csproj state into the maintained sources; true when it changed.
+func (r *Resolver) reconcileCSharpVisFileLocked(fileID string) bool {
+	if strings.HasSuffix(strings.ToLower(fileID), ".csproj") {
+		_, had := r.csharpProjFiles[fileID]
+		exists := r.graph.GetNode(fileID) != nil
+		if had == exists {
+			return false
+		}
+		if exists {
+			r.csharpProjFiles[fileID] = struct{}{}
+		} else {
+			delete(r.csharpProjFiles, fileID)
+		}
+		return true
+	}
+	var globals []string
+	if n := r.graph.GetNode(fileID); n != nil && n.Meta != nil {
+		globals = csharpMetaStrings(n.Meta["global_usings"])
+	}
+	prior := r.csharpGlobalDecls[fileID]
+	if csharpSameStringSet(prior, globals) {
+		return false
+	}
+	if len(globals) == 0 {
+		delete(r.csharpGlobalDecls, fileID)
+	} else {
+		r.csharpGlobalDecls[fileID] = globals
+	}
+	return true
+}
+
+// csharpSameStringSet is an order-insensitive slice comparison — the
+// stamp order is extraction-stable, but the decl map round-trips
+// through map iteration.
+func csharpSameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	as := append([]string(nil), a...)
+	bs := append([]string(nil), b...)
+	sort.Strings(as)
+	sort.Strings(bs)
+	for i := range as {
+		if as[i] != bs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // CSharpGlobalUsingDependents returns the C# files whose global-using
