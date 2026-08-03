@@ -2489,15 +2489,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	start := time.Now()
 	reporter := progress.FromContext(ctx)
 
-	// Cold/full-index GC tuning: raise the GC percent window and install a
-	// cgroup-aware soft memory limit for the duration of the index, then
-	// restore the prior settings on every exit path. The knobs affect only GC
-	// timing and peak RSS during the allocation burst of a full index — the
-	// graph content is identical with them on or off. Disable for A/B runs
-	// with GORTEX_INDEX_GC_TUNE=0; see gc_tune.go.
-	restoreGCTuning := applyIndexGCTuning(idx.logger)
-	defer restoreGCTuning()
-
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
@@ -2782,10 +2773,21 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					zap.Uint64("queued_admissions", after.queued))
 			})
 		}
-		// Registered before the shadow drain defer. Reverse defer order keeps a
-		// successful shadow charged until every destructive batch is durable.
+		// Registered before the GC restore and shadow drain defers. Reverse
+		// defer order keeps this repository charged through both durable drain
+		// and post-burst heap scavenging.
 		defer releaseIndexMemoryAdmission("index_exit")
 	}
+
+	// Install cold/full-index GC tuning only after this repository owns its
+	// process admission. Repositories queued on either gate must not keep the
+	// shared GOGC/memory-limit window open. This defer is registered after both
+	// admission defers, so settings restore and any final heap/native release
+	// finish before a slot admits the next repository. The shadow-drain defer is
+	// registered below and therefore still runs first.
+	restoreGCTuning := applyIndexGCTuning(idx.logger)
+	defer restoreGCTuning()
+
 	if shadowTaken {
 		// Keep the persisted repository queryable while the replacement graph is
 		// parsed in memory. Warm-restart rows are evicted only after parsing has
