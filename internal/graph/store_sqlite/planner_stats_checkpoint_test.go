@@ -176,6 +176,80 @@ func TestEndCoordinatedBulkLoadDoesNotWaitForReadSnapshot(t *testing.T) {
 	}
 }
 
+func TestEndCoordinatedBulkLoadFinalCheckpointGetsDedicatedDrainWindow(t *testing.T) {
+	store := openPlannerStatsTestStore(t)
+	// Make every routine PASSIVE attempt expire immediately. The final handoff
+	// must ignore this routine policy and use bulkFinalCheckpointTimeout.
+	store.passiveCheckpointTimeout = time.Nanosecond
+	if !store.BeginCoordinatedBulkLoad() {
+		t.Fatal("cold store did not enter coordinated bulk load")
+	}
+	store.AddNode(&graph.Node{ID: "snapshot", Kind: graph.KindFunction, Name: "snapshot", FilePath: "snapshot.go"})
+
+	readTx, err := store.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin read snapshot: %v", err)
+	}
+	readOpen := true
+	defer func() {
+		if readOpen {
+			_ = readTx.Rollback()
+		}
+	}()
+	var count int
+	if err := readTx.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&count); err != nil {
+		t.Fatalf("establish read snapshot: %v", err)
+	}
+
+	nodes, edges := bulkFixture(4096, 32768)
+	store.AddBatch(nodes, edges)
+
+	var final bulkFinalizeEvent
+	store.bulkFinalizeObserver = func(event bulkFinalizeEvent) {
+		// Keep the snapshot through the pre-stats drain, then retire it before
+		// the terminal handoff so the final PASSIVE can prove a complete copy.
+		if event.Stage == "planner_stats" && readOpen {
+			if err := readTx.Rollback(); err != nil {
+				t.Errorf("release read snapshot: %v", err)
+			}
+			readOpen = false
+		}
+		if event.Stage == "checkpoint" && event.Name == "wal_passive" {
+			final = event
+		}
+	}
+	if err := store.EndCoordinatedBulkLoad(); err != nil {
+		t.Fatalf("end coordinated bulk load: %v", err)
+	}
+	if readOpen {
+		t.Fatal("planner-stats boundary did not release read snapshot")
+	}
+	if final.Name != "wal_passive" {
+		t.Fatalf("missing final wal_passive event: %+v", final)
+	}
+	if final.Err != nil {
+		t.Fatalf("final passive checkpoint failed: %v", final.Err)
+	}
+	if final.WALFrames == 0 {
+		t.Fatalf("final passive checkpoint reported no WAL frames: %+v", final)
+	}
+	if final.Busy != 0 || final.CheckpointedFrames != final.WALFrames {
+		t.Fatalf("final passive checkpoint incomplete: %+v", final)
+	}
+}
+
+func TestBulkCheckpointTimeoutPolicy(t *testing.T) {
+	if walPassiveCheckpointTimeout != time.Second {
+		t.Fatalf("routine PASSIVE timeout = %s, want 1s", walPassiveCheckpointTimeout)
+	}
+	if bulkPlannerStatsCheckpointTimeout != 5*time.Second {
+		t.Fatalf("pre-stats PASSIVE timeout = %s, want 5s", bulkPlannerStatsCheckpointTimeout)
+	}
+	if bulkFinalCheckpointTimeout != 30*time.Second {
+		t.Fatalf("final PASSIVE timeout = %s, want 30s", bulkFinalCheckpointTimeout)
+	}
+}
+
 func explainPlannerQueryPlan(t *testing.T, db *sql.DB, query string, args ...any) string {
 	t.Helper()
 	rows, err := db.QueryContext(t.Context(), `EXPLAIN QUERY PLAN `+query, args...)

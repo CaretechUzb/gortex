@@ -151,6 +151,10 @@ const (
 	// window. It runs once after all graph writes and avoids making every
 	// planner-stat traversal page through a large live WAL.
 	bulkPlannerStatsCheckpointTimeout = 5 * time.Second
+	// The cold-load handoff must finish copying a multi-gigabyte WAL before
+	// resolver-heavy random reads begin. Routine checkpoints stay at one second;
+	// this one terminal PASSIVE drain gets a larger, still-bounded I/O window.
+	bulkFinalCheckpointTimeout = 30 * time.Second
 )
 
 // bulkCacheSizeKiB is the page cache the fast path requests on its pinned
@@ -438,7 +442,7 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 	// passive checkpoints plus SQLite's next WAL reset/journal_size_limit reclaim
 	// the file after the reader leaves.
 	if hadBulk {
-		ctx, cancel := context.WithTimeout(context.Background(), s.passiveCheckpointWindow())
+		ctx, cancel := context.WithTimeout(context.Background(), bulkFinalCheckpointTimeout)
 		started := time.Now()
 		result, err := s.checkpointWALOnce(ctx, "PASSIVE")
 		cancel()
