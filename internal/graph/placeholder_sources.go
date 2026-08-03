@@ -73,64 +73,70 @@ func PlaceholderSourceRepoints(reindexes []EdgeReindex) []PlaceholderRepoint {
 }
 
 // ReconcilePlaceholderSources applies the repoints through the store's
-// existing contracts: ONE batched adjacency fetch for every distinct
-// placeholder (point lookups are forbidden inside a resolver pass — the
-// interleave cache contract counts them as leaks), then a from-side
-// ReindexEdges batch (EdgeReindex.OldFrom exists precisely for source
-// moves), so both backends inherit correct index/bucket maintenance.
+// exact-site candidate contract. The SQLite backend probes its from/kind
+// index and decodes only matching rows; it closes every read cursor before
+// this function starts the ReindexEdges write. The in-memory backend filters
+// its adjacency buckets without copying edge payloads. Point lookups remain
+// forbidden inside resolver passes.
 // Returns the number of dataflow edges re-pointed.
 func ReconcilePlaceholderSources(g Store, repoints []PlaceholderRepoint) int {
 	if g == nil || len(repoints) == 0 {
 		return 0
 	}
-	froms := make([]string, 0, len(repoints))
-	seen := make(map[string]struct{}, len(repoints))
+	candidateKinds := [...]EdgeKind{EdgeArgOf, EdgeValueFlow}
+	sites := make([]EdgeSite, 0, len(repoints)*len(candidateKinds))
+	seenSites := make(map[EdgeSite]struct{}, cap(sites))
 	for _, rp := range repoints {
 		if rp.OldFrom == "" || rp.NewFrom == "" || rp.OldFrom == rp.NewFrom {
 			continue
 		}
-		if _, dup := seen[rp.OldFrom]; dup {
-			continue
+		for _, kind := range candidateKinds {
+			site := EdgeSite{From: rp.OldFrom, Line: rp.Line, Kind: kind}
+			if _, dup := seenSites[site]; dup {
+				continue
+			}
+			seenSites[site] = struct{}{}
+			sites = append(sites, site)
 		}
-		seen[rp.OldFrom] = struct{}{}
-		froms = append(froms, rp.OldFrom)
 	}
-	if len(froms) == 0 {
+	if len(sites) == 0 {
 		return 0
 	}
-	outByFrom := OutEdgesForNodes(g, froms)
+	candidates := LookupEdgeCandidates(g, nil, sites)
 	var batch []EdgeReindex
 	for _, rp := range repoints {
 		if rp.OldFrom == "" || rp.NewFrom == "" || rp.OldFrom == rp.NewFrom {
 			continue
 		}
-		for _, e := range outByFrom[rp.OldFrom] {
-			if e == nil || !PlaceholderSourceKind(e.Kind) {
-				continue
+		for _, kind := range candidateKinds {
+			for _, e := range candidates.Site(rp.OldFrom, rp.Line, kind) {
+				if e == nil || !PlaceholderSourceKind(e.Kind) {
+					continue
+				}
+				// A duplicate repoint (two references at one site resolving in
+				// the same batch) must not double-move an edge the first
+				// repoint already claimed.
+				if e.From != rp.OldFrom {
+					continue
+				}
+				if e.FilePath != rp.FilePath || e.Line != rp.Line {
+					continue
+				}
+				oldTo, oldKind := e.To, e.Kind
+				e.From = rp.NewFrom
+				// RefreshIdentity routes both backends through their from-aware
+				// identity repair — the default reindex path only handles
+				// target moves.
+				batch = append(batch, EdgeReindex{
+					Edge:            e,
+					OldFrom:         rp.OldFrom,
+					OldTo:           oldTo,
+					OldKind:         oldKind,
+					OldFilePath:     e.FilePath,
+					OldLine:         e.Line,
+					RefreshIdentity: true,
+				})
 			}
-			// A duplicate repoint (two references at one site resolving in
-			// the same batch) must not double-move an edge the first
-			// repoint already claimed.
-			if e.From != rp.OldFrom {
-				continue
-			}
-			if e.FilePath != rp.FilePath || e.Line != rp.Line {
-				continue
-			}
-			oldTo, oldKind := e.To, e.Kind
-			e.From = rp.NewFrom
-			// RefreshIdentity routes both backends through their from-aware
-			// identity repair — the default reindex path only handles
-			// target moves.
-			batch = append(batch, EdgeReindex{
-				Edge:            e,
-				OldFrom:         rp.OldFrom,
-				OldTo:           oldTo,
-				OldKind:         oldKind,
-				OldFilePath:     e.FilePath,
-				OldLine:         e.Line,
-				RefreshIdentity: true,
-			})
 		}
 	}
 	if len(batch) == 0 {

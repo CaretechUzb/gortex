@@ -29,6 +29,16 @@ func boundaryFixtureGraph(names []string) *graph.Graph {
 	return g
 }
 
+type countingNgramReader struct {
+	graph.Reader
+	allNodesCalls int
+}
+
+func (r *countingNgramReader) AllNodes() []*graph.Node {
+	r.allNodesCalls++
+	return r.Reader.AllNodes()
+}
+
 func TestBuildNgramBoundaries_NilAndEmpty(t *testing.T) {
 	// nil graph -> empty table -> tokenizer degrades to fixed behavior.
 	require.True(t, BuildNgramBoundaries(nil).Empty())
@@ -158,6 +168,24 @@ func TestInstallNgramBoundaries_BM25Chain(t *testing.T) {
 	require.NoError(t, err)
 	defer blv.Close()
 	assert.False(t, InstallNgramBoundaries(blv, tbl))
+}
+
+func TestBuildAndInstallNgramBoundaries_ChecksCapabilityBeforeGraphScan(t *testing.T) {
+	g := &countingNgramReader{Reader: boundaryFixtureGraph([]string{
+		"tokenAlpha", "tokenBeta", "tokenGamma", "tokenDelta",
+		"alphaToken", "betaToken", "tokenize", "tokenizer",
+	})}
+
+	blv, err := NewBleve()
+	require.NoError(t, err)
+	defer blv.Close()
+	assert.False(t, BuildAndInstallNgramBoundaries(blv, g))
+	assert.Zero(t, g.allNodesCalls, "a backend without BM25 must not enumerate the graph")
+
+	bm := NewBM25()
+	defer bm.Close()
+	assert.True(t, BuildAndInstallNgramBoundaries(bm, g))
+	assert.Equal(t, 1, g.allNodesCalls, "BM25 must mine exactly one graph census")
 }
 
 // TestSparseNgram_TableDrivenVsFixed proves the learned table actually

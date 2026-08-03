@@ -87,6 +87,15 @@ type nodeArena struct {
 	used   int      // slots used in chunks[ci]
 }
 
+// nodeArenaMark identifies one allocation cursor within an arena. Marks are
+// deliberately private: only Node.WithScratch may expose the lifetime boundary
+// they create, so callers cannot rewind an arena while live wrappers still
+// escape from it.
+type nodeArenaMark struct {
+	ci   int
+	used int
+}
+
 const (
 	// arenaFirstChunk keeps the first backing array small so a file with a
 	// handful of nodes (the common case in a many-small-files repo) wastes
@@ -94,6 +103,14 @@ const (
 	// ends up with only a few large objects.
 	arenaFirstChunk = 64
 	arenaMaxChunk   = 4096
+
+	// arenaPoolRetainBytes bounds the high-water capacity a single outlier
+	// parse may leave in the process-wide sync.Pool. Scratch scopes normally
+	// make the high-water mark one traversal instead of the sum of every
+	// traversal; an exceptionally large single traversal is still useful only
+	// to similarly large files, so keeping it would turn transient work into an
+	// idle heap floor.
+	arenaPoolRetainBytes = 8 << 20
 )
 
 func newNodeArena() *nodeArena { return &nodeArena{} }
@@ -126,6 +143,67 @@ func (a *nodeArena) alloc() *Node {
 	return n
 }
 
+func (a *nodeArena) mark() nodeArenaMark {
+	return nodeArenaMark{ci: a.ci, used: a.used}
+}
+
+// rewind releases every wrapper allocated after mark while preserving older
+// wrappers. Clearing the released slots is required: a Node contains both the
+// underlying tree-sitter node and an arena pointer, either of which would keep
+// the parse tree or the arena graph reachable if a high-water chunk were
+// reused later. The cursor can move backwards across any number of chunks, so
+// nested scratch scopes work naturally.
+func (a *nodeArena) rewind(mark nodeArenaMark) {
+	if a == nil || len(a.chunks) == 0 {
+		return
+	}
+	for i := mark.ci; i <= a.ci && i < len(a.chunks); i++ {
+		start := 0
+		if i == mark.ci {
+			start = mark.used
+		}
+		end := len(a.chunks[i])
+		if i == a.ci {
+			end = a.used
+		}
+		if start < end {
+			clear(a.chunks[i][start:end])
+		}
+	}
+	a.ci, a.used = mark.ci, mark.used
+}
+
+func (a *nodeArena) retainedBytes() uintptr {
+	var total uintptr
+	nodeBytes := unsafe.Sizeof(Node{})
+	for _, chunk := range a.chunks {
+		total += uintptr(cap(chunk)) * nodeBytes
+	}
+	return total
+}
+
+// trimRetained caps the chunk prefix kept for reuse and clears every discarded
+// slice header before shortening chunks. Keeping the bounded prefix preserves
+// the allocation win for ordinary files after an outlier, while the full-slice
+// expression prevents the backing header array from pinning discarded slabs.
+func (a *nodeArena) trimRetained(limit uintptr) {
+	var retained uintptr
+	keep := 0
+	for keep < len(a.chunks) {
+		chunkBytes := uintptr(cap(a.chunks[keep])) * unsafe.Sizeof(Node{})
+		if retained+chunkBytes > limit {
+			break
+		}
+		retained += chunkBytes
+		keep++
+	}
+	if keep == len(a.chunks) {
+		return
+	}
+	clear(a.chunks[keep:])
+	a.chunks = a.chunks[:keep:keep]
+}
+
 // reset rewinds the allocation cursor to the start while retaining the
 // backing chunks for reuse. It clears the slots touched since the last
 // reset so a stale Node value — whose embedded ts.Node pins its now-closed
@@ -133,14 +211,7 @@ func (a *nodeArena) alloc() *Node {
 // used prefix keeps the cost proportional to the file just processed, not
 // the high-water capacity.
 func (a *nodeArena) reset() {
-	for i := 0; i <= a.ci && i < len(a.chunks); i++ {
-		end := len(a.chunks[i])
-		if i == a.ci {
-			end = a.used
-		}
-		clear(a.chunks[i][:end])
-	}
-	a.ci, a.used = 0, 0
+	a.rewind(nodeArenaMark{})
 }
 
 // arenaPool recycles per-tree arenas — with their retained chunks — across
@@ -157,6 +228,7 @@ func putArena(a *nodeArena) {
 		return
 	}
 	a.reset()
+	a.trimRetained(arenaPoolRetainBytes)
 	arenaPool.Put(a)
 }
 
@@ -186,6 +258,30 @@ func (n *Node) WrapVal(c ts.Node) *Node {
 	nn.langKey = n.langKey
 	nn.arena = n.arena
 	return nn
+}
+
+// WithScratch runs fn with a temporary lifetime for Node wrappers allocated by
+// navigation from n. When fn returns -- or panics -- every wrapper allocated
+// after entry is cleared and the arena cursor is rewound, so the next pass can
+// reuse the same slabs instead of growing the tree's arena monotonically.
+// Scratch scopes may be nested.
+//
+// The callback MUST NOT retain a *Node allocated inside the scope, directly or
+// inside another value, after the callback returns. Such wrappers become
+// invalid at scope exit and may be overwritten by the next traversal. Nodes
+// that existed before entry, including n itself, remain valid. A Node without
+// an arena still runs fn, but cannot reclaim individual wrappers early.
+func (n *Node) WithScratch(fn func()) {
+	if fn == nil {
+		return
+	}
+	if n == nil || n.arena == nil {
+		fn()
+		return
+	}
+	mark := n.arena.mark()
+	defer n.arena.rewind(mark)
+	fn()
 }
 
 // SetInner overwrites the receiver's wrapped ts.Node and marks it

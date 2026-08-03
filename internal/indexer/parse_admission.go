@@ -147,13 +147,19 @@ type parseAdmissionLease struct {
 	sharedWeight int64
 	local        *semaphore.Weighted
 	localWeight  int64
-	once         sync.Once
+
+	holdMu         sync.Mutex
+	holds          int
+	releasePending bool
+	once           sync.Once
 }
 
-// acquireParseAdmission takes the process-wide lease first and the private
-// per-Indexer lease second. Every caller uses that order, so cross-repository
-// parsing cannot deadlock. If local admission is cancelled, the already-held
-// shared capacity is returned before the error escapes.
+// acquireParseAdmission takes the private per-Indexer lease before the shared
+// process lease. A repository whose local worker budget is full must not reserve
+// scarce shared capacity while it waits; every combined caller uses this same
+// local→shared order, and shared-only callers never acquire a local lease, so
+// the order cannot form a cycle. If shared admission is cancelled, the already-
+// held local capacity is returned before the error escapes.
 func acquireParseAdmission(
 	ctx context.Context,
 	fileSize int64,
@@ -165,17 +171,17 @@ func acquireParseAdmission(
 		return nil, nil
 	}
 	lease := &parseAdmissionLease{shared: shared, local: local}
-	if shared != nil {
-		lease.sharedWeight = clampParseWeight(fileSize, shared.capacity)
-		if err := shared.acquire(ctx, lease.sharedWeight); err != nil {
-			return nil, err
-		}
-	}
 	if local != nil {
 		lease.localWeight = clampParseWeight(fileSize, localBudget)
 		if err := local.Acquire(ctx, lease.localWeight); err != nil {
-			if shared != nil {
-				shared.release(lease.sharedWeight)
+			return nil, err
+		}
+	}
+	if shared != nil {
+		lease.sharedWeight = clampParseWeight(fileSize, shared.capacity)
+		if err := shared.acquire(ctx, lease.sharedWeight); err != nil {
+			if local != nil {
+				local.Release(lease.localWeight)
 			}
 			return nil, err
 		}
@@ -183,16 +189,55 @@ func acquireParseAdmission(
 	return lease, nil
 }
 
+// retain returns an idempotent callback that keeps this lease live until the
+// callback runs. The caller's Release may happen first; in that case capacity
+// stays reserved until the final retained user has actually stopped touching
+// the admitted source bytes.
+func (lease *parseAdmissionLease) retain() func() {
+	if lease == nil {
+		return func() {}
+	}
+	lease.holdMu.Lock()
+	lease.holds++
+	lease.holdMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			lease.holdMu.Lock()
+			lease.holds--
+			release := lease.holds == 0 && lease.releasePending
+			lease.holdMu.Unlock()
+			if release {
+				lease.releaseNow()
+			}
+		})
+	}
+}
+
 func (lease *parseAdmissionLease) Release() {
 	if lease == nil {
 		return
 	}
+	lease.holdMu.Lock()
+	if lease.holds > 0 {
+		lease.releasePending = true
+		lease.holdMu.Unlock()
+		return
+	}
+	lease.holdMu.Unlock()
+	lease.releaseNow()
+}
+
+func (lease *parseAdmissionLease) releaseNow() {
 	lease.once.Do(func() {
-		if lease.local != nil {
-			lease.local.Release(lease.localWeight)
-		}
+		// Release in reverse acquisition order: global capacity becomes visible
+		// before this repository admits another local worker.
 		if lease.shared != nil {
 			lease.shared.release(lease.sharedWeight)
+		}
+		if lease.local != nil {
+			lease.local.Release(lease.localWeight)
 		}
 	})
 }
@@ -240,8 +285,10 @@ func (idx *Indexer) tryAcquireSharedParsePath(path string) (*parseAdmissionLease
 // preventing independent repository lanes from recreating the startup peak.
 // A non-positive value disables the shared gate while retaining per-repo caps.
 func (mi *MultiIndexer) SetSharedParseMemoryBudget(capacity int64) {
-	admission := newParseAdmissionBudget(capacity)
-	mi.parseAdmission.Store(admission)
+	rawAdmission := newParseAdmissionBudget(capacity)
+	nativeAdmission := newParseAdmissionBudget(capacity)
+	mi.parseAdmission.Store(rawAdmission)
+	mi.nativeParseAdmission.Store(nativeAdmission)
 
 	mi.mu.RLock()
 	live := make([]*Indexer, 0, len(mi.indexers))
@@ -250,6 +297,7 @@ func (mi *MultiIndexer) SetSharedParseMemoryBudget(capacity int64) {
 	}
 	mi.mu.RUnlock()
 	for _, idx := range live {
-		idx.parseAdmission.Store(admission)
+		idx.parseAdmission.Store(rawAdmission)
+		idx.nativeParseAdmission.Store(nativeAdmission)
 	}
 }

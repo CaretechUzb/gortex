@@ -33,7 +33,16 @@ func TestResolverProjectionFallbacks(t *testing.T) {
 			ID: "b::lib.go", Kind: KindFile, Name: "lib.go", FilePath: "b::lib.go",
 			RepoPrefix: "b", WorkspaceID: "workspace-b", Meta: map[string]any{"large": make([]byte, 4096)},
 		},
-	}, nil)
+	}, []*Edge{
+		{
+			From: "a::main.go::run", To: "unresolved::run", Kind: EdgeCalls,
+			FilePath: "a::main.go", Line: 11, Meta: map[string]any{"large": make([]byte, 4096)},
+		},
+		{
+			From: "a::main.go::run", To: "unresolved::run", Kind: EdgeReferences,
+			FilePath: "a::main.go", Line: 12, Meta: map[string]any{"large": make([]byte, 4096)},
+		},
+	})
 	store := resolverProjectionStoreOnly{Store: memory}
 
 	entries := collectResolverProjectionRows(CallableBindingNodesSeq(store, KindFunction, KindFunction, ""))
@@ -70,5 +79,19 @@ func TestResolverProjectionFallbacks(t *testing.T) {
 	}
 	if got := NodePlacementsByIDs(store, nil); len(got) != 0 {
 		t.Fatalf("nil ID batch returned %d rows", len(got))
+	}
+
+	identities := InEdgeIdentitiesByNodeIDs(store, []string{"", "unresolved::run", "missing", "unresolved::run"})
+	wantIdentities := map[string][]EdgeIdentity{
+		"unresolved::run": {
+			{From: "a::main.go::run", To: "unresolved::run", Kind: EdgeCalls, FilePath: "a::main.go", Line: 11},
+			{From: "a::main.go::run", To: "unresolved::run", Kind: EdgeReferences, FilePath: "a::main.go", Line: 12},
+		},
+	}
+	if !reflect.DeepEqual(identities, wantIdentities) {
+		t.Fatalf("incoming identities = %#v, want %#v", identities, wantIdentities)
+	}
+	if got := InEdgeIdentitiesByNodeIDs(store, nil); len(got) != 0 {
+		t.Fatalf("nil incoming ID batch returned %d rows", len(got))
 	}
 }

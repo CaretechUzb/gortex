@@ -91,7 +91,8 @@ func TestFindEdgesByIdentitiesSQLiteUsesExistingUniqueIndexWithoutTempTree(t *te
 	}
 	require.NoError(t, rows.Err())
 	plan := strings.Join(details, "\n")
-	require.Contains(t, plan, uniqueIndex, "exact lookup must seek through the existing five-column UNIQUE index")
+	require.Contains(t, plan, uniqueIndex, "identity matching must seek through the existing five-column UNIQUE index")
+	require.Contains(t, plan, "INTEGER PRIMARY KEY", "full rows must be re-fetched through ordered row-id seeks")
 	require.NotContains(t, strings.ToUpper(plan), "TEMP B-TREE")
 }
 

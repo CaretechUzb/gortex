@@ -197,6 +197,29 @@ func TestParseGraphBatchDurabilityCallbacksFollowCommit(t *testing.T) {
 	}
 }
 
+func TestParseGraphBatchFlushClearsStagedPointers(t *testing.T) {
+	store := newRecordingParseGraphStore()
+	batch := newParseGraphBatchWithLimits(store, parseGraphBatchLimits{
+		files: 2,
+		nodes: 10,
+		edges: 10,
+		bytes: 1 << 20,
+	})
+	node := &graph.Node{ID: "retained"}
+	if !batch.add([]*graph.Node{node}, nil, func() {}) {
+		t.Fatal("durable store did not accept staged graph")
+	}
+	batch.flush()
+	if len(batch.pending) != 0 {
+		t.Fatalf("pending length after flush = %d, want 0", len(batch.pending))
+	}
+	for i, entry := range batch.pending[:cap(batch.pending)] {
+		if entry.nodes != nil || entry.edges != nil || entry.onDurable != nil {
+			t.Fatalf("pending backing entry %d retained graph pointers: %+v", i, entry)
+		}
+	}
+}
+
 func TestNewParseGraphBatchFallsBackWithoutDurableStore(t *testing.T) {
 	if batch := newParseGraphBatch(graph.New()); batch != nil {
 		t.Fatal("in-memory store unexpectedly enabled direct-disk graph batching")

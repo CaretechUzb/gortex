@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,6 +45,9 @@ type Provider struct {
 	includeTest  bool
 	logger       *zap.Logger
 	packagesLoad func(*packages.Config, ...string) ([]*packages.Package, error)
+	// compilerGC is injectable for ordering tests; production uses a full GC
+	// plus synchronous scavenging at pressure-sized compiler boundaries.
+	compilerGC func()
 
 	// The compiler program is intentionally never retained after EnrichRepo.
 	// Contract extraction needs only a compact (file,line,name) -> bare type
@@ -54,11 +59,14 @@ type Provider struct {
 	bindingKeysByRoot map[string][]bindingLookupKey
 	retained          map[string]int
 
-	// heavyGate bounds simultaneous full go/packages programs. The graph phase
-	// is already serialized by ResolveMutex, so admitting more than one large
-	// program only raises memory pressure while it waits. The gate is held for
-	// the complete lifetime of pkgs and is context-cancellable.
+	// heavyGate bounds the total number of live go/packages programs. A second
+	// one can still overlap useful compute on high-memory hosts.
 	heavyGate chan struct{}
+	// largeGate admits at most one large full-repository compiler program. The
+	// lease ends after string/ID projection plus one large-program collection,
+	// before detached graph apply. Small repos and file-bounded incremental loads do
+	// not take this gate and may use the remaining heavyGate lane.
+	largeGate chan struct{}
 }
 
 type bindingLookupKey struct {
@@ -69,6 +77,24 @@ type bindingLookupKey struct {
 }
 
 const defaultGoTypesConcurrency = 1
+
+// goTypesLargeNodeThreshold is the repository census point at which a full
+// compiler program takes exclusive large-program admission. It matches the
+// heavy-Go scheduling class used by the multi-repository enrichment queue.
+const goTypesLargeNodeThreshold = 8192
+
+// Large admission is broader than forced reclamation: repositories just over
+// the census threshold still serialize compiler programs, but a stop-the-world
+// GC is paid only when the detached program grew the heap materially or its Use
+// projection proves a large closure despite noisy process-wide heap samples.
+const (
+	goTypesCompilerReclaimMinGrowth = 256 << 20
+	goTypesCompilerReclaimMinUses   = 131072
+)
+
+func shouldReclaimLargeCompiler(large bool, heapGrowth uint64, projectedUses int) bool {
+	return large && (heapGrowth >= goTypesCompilerReclaimMinGrowth || projectedUses >= goTypesCompilerReclaimMinUses)
+}
 
 // goTypesConcurrencyRAMFloor is the host RAM at or above which the gate
 // defaults to two concurrent programs: a multi-repo workspace's enrichment
@@ -90,6 +116,17 @@ func goTypesConcurrency(hostRAM uint64) int {
 	return envPositiveInt("GORTEX_GOTYPES_CONCURRENCY", fallback)
 }
 
+// largeGoTypesAdmission classifies only full-repository work. An absent census
+// is conservative because direct Provider calls can otherwise admit two
+// unmeasured compiler closures. File-bounded incremental loads stay shareable.
+func largeGoTypesAdmission(ctx context.Context, fullRepo bool) bool {
+	if !fullRepo {
+		return false
+	}
+	nodes, ok := semantic.EnrichmentAdmissionNodes(ctx)
+	return !ok || nodes >= goTypesLargeNodeThreshold
+}
+
 // NewProvider creates a go/types provider.
 func NewProvider(mode LoadMode, includeTest bool, logger *zap.Logger) *Provider {
 	return &Provider{
@@ -97,11 +134,13 @@ func NewProvider(mode LoadMode, includeTest bool, logger *zap.Logger) *Provider 
 		includeTest:       includeTest,
 		logger:            logger,
 		packagesLoad:      packages.Load,
+		compilerGC:        debug.FreeOSMemory,
 		bindingTypes:      make(map[bindingLookupKey]string),
 		bindingOwners:     make(map[bindingLookupKey]string),
 		bindingKeysByRoot: make(map[string][]bindingLookupKey),
 		retained:          make(map[string]int),
 		heavyGate:         make(chan struct{}, goTypesConcurrency(platform.HostPhysicalMemoryBytes())),
+		largeGate:         make(chan struct{}, 1),
 	}
 }
 
@@ -163,17 +202,40 @@ func (p *Provider) ReleaseRepoState(repoRoot string) bool {
 	return removed
 }
 
-func (p *Provider) acquireHeavy(ctx context.Context) (func(), error) {
+func (p *Provider) acquireHeavy(ctx context.Context, large bool) (func(), error) {
 	p.stateMu.Lock()
 	if p.heavyGate == nil {
 		p.heavyGate = make(chan struct{}, defaultGoTypesConcurrency)
 	}
+	if p.largeGate == nil {
+		p.largeGate = make(chan struct{}, 1)
+	}
 	gate := p.heavyGate
+	largeGate := p.largeGate
 	p.stateMu.Unlock()
+
+	largeHeld := false
+	if large {
+		select {
+		case largeGate <- struct{}{}:
+			largeHeld = true
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
 	select {
 	case gate <- struct{}{}:
-		return func() { <-gate }, nil
+		return func() {
+			<-gate
+			if largeHeld {
+				<-largeGate
+			}
+		}, nil
 	case <-ctx.Done():
+		if largeHeld {
+			<-largeGate
+		}
 		return nil, ctx.Err()
 	}
 }
@@ -191,6 +253,59 @@ func lockResolveContext(ctx context.Context, mu *sync.Mutex) error {
 		}
 	}
 	return nil
+}
+
+// resolveLockSlices records the actual graph-lock cost of a provider pass.
+// It deliberately owns no compiler state: callers build detached projections
+// and mutation plans outside the lock, then use with for the bounded store
+// read/write slice only.
+type resolveLockSlices struct {
+	mu      *sync.Mutex
+	waited  time.Duration
+	held    time.Duration
+	maxHeld time.Duration
+	count   int
+}
+
+func (s *resolveLockSlices) with(ctx context.Context, fn func() error) error {
+	waitStart := time.Now()
+	if err := lockResolveContext(ctx, s.mu); err != nil {
+		s.waited += time.Since(waitStart)
+		return err
+	}
+	acquired := time.Now()
+	s.waited += acquired.Sub(waitStart)
+	s.count++
+	defer func() {
+		held := time.Since(acquired)
+		s.held += held
+		if held > s.maxHeld {
+			s.maxHeld = held
+		}
+		s.mu.Unlock()
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fn()
+}
+
+// detachGoNodeProjection protects the in-memory backend as well as SQLite.
+// SQLite projections are already reconstructed values, but Graph returns its
+// resident pointers. The apply phase only needs structural fields, so shallow
+// copies with Meta detached remain stable while another lock slice mutates the
+// live graph and avoid retaining opaque metadata with the compiler program.
+func detachGoNodeProjection(nodes []*graph.Node) []*graph.Node {
+	out := make([]*graph.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		clone := *node
+		clone.Meta = nil
+		out = append(out, &clone)
+	}
+	return out
 }
 
 func (p *Provider) replaceBindingIndex(absRoot string, files []string, rows []graph.SemanticBindingType) {
@@ -385,15 +500,93 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	}
 
 	gateWaitStart := time.Now()
-	release, err := p.acquireHeavy(ctx)
+	largeAdmission := largeGoTypesAdmission(ctx, true)
+	releaseAdmission, err := p.acquireHeavy(ctx, largeAdmission)
 	if err != nil {
 		return nil, err
 	}
-	releaseHeavy := sync.OnceFunc(release)
-	defer releaseHeavy()
+	var (
+		pkgs                       []*packages.Package
+		fset                       *token.FileSet
+		externals                  *externalsAttribution
+		objToNode                  map[types.Object]string
+		repoNodes                  []*graph.Node
+		nodesByFile                map[string][]*graph.Node
+		funcIndexByFile            map[string]*fileFuncIndex
+		loadAttempted              bool
+		compilerProjectionComplete bool
+		projectedUseCount          int
+	)
+	var compilerHeapBaseline runtime.MemStats
+	if largeAdmission {
+		runtime.ReadMemStats(&compilerHeapBaseline)
+	}
+
+	// This is the only path that returns the heavy/large admission token. Every
+	// success, error, and cancellation first severs compiler roots. Abnormal
+	// post-load exits collect unconditionally so a canceled multi-GiB program
+	// cannot overlap the next admitted compiler even when heap-growth sampling
+	// was obscured by a concurrent process GC.
+	releaseCompiler := sync.OnceFunc(func() {
+		releaseStart := time.Now()
+		heapBeforeRelease := compilerHeapBaseline
+		if largeAdmission {
+			runtime.ReadMemStats(&heapBeforeRelease)
+		}
+		heapGrowth := uint64(0)
+		if heapBeforeRelease.HeapAlloc > compilerHeapBaseline.HeapAlloc {
+			heapGrowth = heapBeforeRelease.HeapAlloc - compilerHeapBaseline.HeapAlloc
+		}
+		forceGC := loadAttempted && !compilerProjectionComplete
+		if !forceGC {
+			forceGC = shouldReclaimLargeCompiler(largeAdmission, heapGrowth, projectedUseCount)
+		}
+		heapAfterRelease := heapBeforeRelease
+
+		collectCompiler := p.compilerGC
+		if collectCompiler == nil {
+			collectCompiler = debug.FreeOSMemory
+		}
+		reclaimAndReleaseGoCompiler(func() {
+			clearGoPackageCompilerRoots(pkgs)
+			pkgs = nil
+			fset = nil
+			if externals != nil {
+				externals.releaseCompilerReferences()
+				externals.moduleByPath = nil
+				externals.knownNodeIDs = nil
+				externals.useByNodeID = nil
+			}
+			clear(objToNode)
+			objToNode = nil
+			depIndex = nil
+			repoNodes = nil
+			nodesByFile = nil
+			funcIndexByFile = nil
+		}, forceGC, collectCompiler, func() {
+			if forceGC {
+				runtime.ReadMemStats(&heapAfterRelease)
+			}
+		}, releaseAdmission)
+		if p.logger != nil {
+			p.logger.Info("go-types: compiler state released before graph apply",
+				zap.String("repo_prefix", repoPrefix),
+				zap.Bool("large_exclusive", largeAdmission),
+				zap.Bool("projection_complete", compilerProjectionComplete),
+				zap.Bool("forced_gc", forceGC),
+				zap.Int("projected_uses", projectedUseCount),
+				zap.Uint64("heap_alloc_before_load", compilerHeapBaseline.HeapAlloc),
+				zap.Uint64("heap_alloc_before_release", heapBeforeRelease.HeapAlloc),
+				zap.Uint64("heap_growth", heapGrowth),
+				zap.Uint64("heap_alloc_after_release", heapAfterRelease.HeapAlloc),
+				zap.Duration("elapsed", time.Since(releaseStart)))
+		}
+	})
+	defer releaseCompiler()
 	if wait := time.Since(gateWaitStart); wait > 5*time.Second && p.logger != nil {
 		p.logger.Info("go-types: admission gate acquired after queueing",
 			zap.String("repo_prefix", repoPrefix),
+			zap.Bool("large_exclusive", largeAdmission),
 			zap.Duration("queued", wait))
 	}
 
@@ -405,12 +598,14 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	if p.logger != nil {
 		p.logger.Info("go-types: package load starting",
 			zap.String("repo_prefix", repoPrefix),
+			zap.Bool("large_exclusive", largeAdmission),
 			zap.String("root", absRoot),
 			zap.String("module_dir", loadDir))
 	}
 	// absRoot stays the relativization base for every graph path below; only
 	// the directory go/packages runs in follows the module.
-	pkgs, fset, err := p.loadPackagesContext(ctx, loadDir, "./...")
+	loadAttempted = true
+	pkgs, fset, err = p.loadPackagesContext(ctx, loadDir, "./...")
 	if err != nil {
 		return nil, fmt.Errorf("load packages: %w", err)
 	}
@@ -445,16 +640,12 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	// The heavy gate has done its job once the load is complete: under the
-	// export-data mode the program holds only the ROOT packages (the
-	// dependency closure types come from compiled export data), and the
-	// enrichment pool's bounded lanes already cap how many repos can be
-	// in-flight here at once — so releasing the gate now lets every lane's
-	// load run during the resolve phase instead of queueing serially behind
-	// this pass's park + apply (measured: a 178-package repo queued 767s on
-	// the gate to run a 3.6s load). The gate still serializes the loads
-	// themselves, which is the memory- and go-list-heavy part.
-	releaseHeavy()
+	// Keep the heavyweight admission lease for the complete lifetime of pkgs
+	// and fset, including any warmup apply-barrier park. Releasing it here let
+	// every enrichment-pool lane accumulate a completed compiler program while
+	// the resolver held the apply gate; four such programs retained several
+	// GiB for more than twelve minutes in a measured cold workspace. The
+	// deferred release above remains cancellation-safe on every exit path.
 
 	// Warmup apply barrier: everything below reads or writes graph state, and
 	// a giant apply landing mid-resolve starves the resolver on the shared
@@ -471,62 +662,41 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			zap.Duration("parked", applyGateParked))
 	}
 	_, persistentBindings := g.(graph.SemanticBindingTypeStore)
-	if writer, ok := g.(graph.SemanticBindingTypeWriter); ok {
-		if err := writer.ReplaceSemanticBindingTypes(repoPrefix, bindings); err != nil {
-			return nil, fmt.Errorf("persist semantic binding types: %w", err)
-		}
-	}
-	// A cancellation after the atomic SQLite replace may leave these compact,
-	// compiler-valid rows available, but it must not publish transient provider
-	// state or a completion marker. The retry replaces the repo atomically.
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if !persistentBindings {
-		p.replaceBindingIndex(absRoot, nil, bindings)
-	}
 
 	result := &semantic.EnrichResult{
 		Provider: p.Name(),
 		Language: "go",
 	}
 
-	// Serialize graph-touching work on the backend resolve mutex. The heavy
-	// admission gate remains held through this phase, so another full Go program
-	// cannot accumulate in memory while waiting for the same graph lock.
-	rmu := g.ResolveMutex()
-	mutexWaitStart := time.Now()
-	if err := lockResolveContext(ctx, rmu); err != nil {
-		return nil, err
-	}
-	defer rmu.Unlock()
-	mutexWaited := time.Since(mutexWaitStart)
-	if mutexWaited > 5*time.Second && p.logger != nil {
-		p.logger.Info("go-types: resolve mutex acquired after wait",
-			zap.String("repo_prefix", repoPrefix),
-			zap.Duration("waited", mutexWaited))
-	}
+	// Keep compiler/heavy admission for the complete lifetime of pkgs, but hold
+	// the graph resolve mutex only for bounded store-dependent slices. CPU-only
+	// compiler walks use detached projections between slices, allowing other
+	// repositories and resolvers to make forward progress.
+	resolveSlices := &resolveLockSlices{mu: g.ResolveMutex()}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	// Apply-subphase instrumentation: one summary line per repo at apply
-	// completion splits the mutex-serialized section the drain-phase wall
-	// otherwise reports as a single number. refs_walk INCLUDES its inner
-	// write times (add_batch / reindex / confirm) — use-matching cost is
-	// refs_walk minus those three.
-	applyMutexHeld := time.Now()
+	// completion separates total apply wall time from actual graph-lock wait,
+	// aggregate hold time, longest hold, and slice count. refs_walk INCLUDES
+	// its inner write times (add_batch / reindex / confirm).
+	applyStarted := time.Now()
 	var applyProjectionDur, applyDefsDur, applyRefsDur time.Duration
 	var applyAddBatchDur, applyReindexDur, applyConfirmDur time.Duration
 	var applyImplementsDur, applyStampsDur time.Duration
 
 	// Materialize this repository's Go nodes once and reuse them across every
-	// compiler definition/use. On SQLite, MatchNodeByFileLine and
-	// findContainingFunc otherwise issue one GetFileNodes query per go/types
-	// object, repeatedly decoding the same retrieval metadata hundreds of
-	// thousands of times on a large module.
+	// compiler definition/use. The read is serialized with graph mutation, then
+	// shallow detached so the CPU-only matching walks never retain or observe
+	// mutable backend-owned node objects after the lock slice ends.
 	projectionStart := time.Now()
-	repoNodes := repoGoNodes(g, repoPrefix)
-	nodesByFile := make(map[string][]*graph.Node)
+	if err := resolveSlices.with(ctx, func() error {
+		repoNodes = detachGoNodeProjection(repoGoNodes(g, repoPrefix))
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	nodesByFile = make(map[string][]*graph.Node)
 	nodesByID := make(map[string]*graph.Node, len(repoNodes))
 	for _, node := range repoNodes {
 		if node == nil {
@@ -541,11 +711,11 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// Per-file containing-function indexes for the two use walks below: the
 	// per-use linear scan over a file's node slice was a flat 28.8s per
 	// profiling window on a large module.
-	funcIndexByFile := buildFileFuncIndexes(nodesByFile)
+	funcIndexByFile = buildFileFuncIndexes(nodesByFile)
 	applyProjectionDur = time.Since(projectionStart)
 
 	// Build the compiler-object → graph-node map used by later phases.
-	objToNode := make(map[types.Object]string)
+	objToNode = make(map[types.Object]string)
 
 	// Phase 1: Map definitions.
 	defsStart := time.Now()
@@ -603,18 +773,114 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// node holds; goanalysis upgrades them to real graph nodes with
 	// LSP-grade origin.
 	applyDefsDur = time.Since(defsStart)
-	refsStart := time.Now()
-	externals := newExternalsAttribution(g, pkgs, p.Name(), repoPrefix, depIndex)
-	externals.prefetchExistingNodes(pkgs, objToNode)
 
-	// Phase 2: Process references package by package. Each package is walked
-	// twice: the first walk deduplicates exact endpoint/use-site keys, SQLite
-	// resolves those keys with a handful of indexed joins, and the second walk
-	// applies confirmations/additions. This bounds memory to one package and
-	// avoids both the old per-Use GetOutEdges storm and a full-repo edge cache.
+	// The remaining compiler-only consumers are projected before graph writes.
+	// Once Uses are detached below, packages.Package can release every AST/type
+	// field instead of pinning the compiler heap for the full SQLite apply.
+	stampPlanStart := time.Now()
+	stamps, err := buildGoNodeStamps(ctx, pkgs, fset, absRoot, repoPrefix, nodesByFile)
+	if err != nil {
+		return nil, err
+	}
+	stampPlanDur := time.Since(stampPlanStart)
+	implementsPlanStart := time.Now()
+	interfaceIDs := implementationInterfaceIDs(objToNode, nodesByID)
+	missingPairs := missingImplementationPairs(objToNode, nodesByID)
+	implementsPlanDur := time.Since(implementsPlanStart)
+
+	refsStart := time.Now()
+	externals = newExternalsAttribution(g, pkgs, p.Name(), repoPrefix, depIndex)
+	externalNodeIDs := externals.existingNodeIDs(pkgs, objToNode)
+	if err := resolveSlices.with(ctx, func() error {
+		externals.prefetchExistingNodeIDs(externalNodeIDs)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	// Detach every compiler Use package by package before the first graph write.
+	// The compact plans retain graph IDs, locations, inferred kinds, and interned
+	// external string identities only. Clearing each packages.Package afterwards
+	// breaks AST/types/import closures while preserving Name/PkgPath/Module for
+	// the externals metadata map.
+	usePlan, err := projectGoUsesAndReleaseCompilerState(
+		ctx, pkgs, fset, absRoot, repoPrefix, funcIndexByFile, objToNode, externals,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer usePlan.release()
+	projectedUseCount = usePlan.len()
+	compilerProjectionComplete = true
+	externalNodeIDs = nil
+
+	// Every compiler-only consumer has returned. The shared cleanup severs all
+	// aliases, conditionally reclaims the normal success path, and only then
+	// returns the heavy/large admission token. Its deferred invocation covers
+	// every earlier error and cancellation with unconditional post-load
+	// reclamation. Detached graph work can overlap only after that release;
+	// individual store mutations remain serialized by ResolveMutex/writeMu.
+	releaseCompiler()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Binding rows are a compact compiler projection. Their repository-scoped
+	// replacement is atomic and serialized by the store's own write gate.
+	if writer, ok := g.(graph.SemanticBindingTypeWriter); ok {
+		if err := writer.ReplaceSemanticBindingTypes(repoPrefix, bindings); err != nil {
+			return nil, fmt.Errorf("persist semantic binding types: %w", err)
+		}
+	}
+	// A cancellation after the atomic SQLite replace may leave these compact,
+	// compiler-valid rows available, but it must not publish transient provider
+	// state or a completion marker. The retry replaces the repo atomically.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !persistentBindings {
+		p.replaceBindingIndex(absRoot, nil, bindings)
+	}
+
+	// Projection may discover every external symbol before the first Use page.
+	// Fixed pages commit each genuinely new symbol together with its module link;
+	// remaining exact-identity pages repair links whose node survived an earlier
+	// canceled pass without creating an unbounded first mutex hold.
+	const projectedExternalApplyChunkSize = 512
+	for len(externals.pendingNodes) > 0 {
+		if err := resolveSlices.with(ctx, func() error {
+			nodes := externals.drainPendingNodes(projectedExternalApplyChunkSize)
+			edges := externals.drainPendingEdgesForNodes(nodes)
+			if len(nodes) > 0 || len(edges) > 0 {
+				addBatchStart := time.Now()
+				g.AddBatch(nodes, edges)
+				applyAddBatchDur += time.Since(addBatchStart)
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+	for len(externals.pendingEdges) > 0 {
+		if err := resolveSlices.with(ctx, func() error {
+			edges := externals.drainPendingEdges(projectedExternalApplyChunkSize)
+			if len(edges) > 0 {
+				addBatchStart := time.Now()
+				g.AddBatch(nil, edges)
+				applyAddBatchDur += time.Since(addBatchStart)
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	// Phase 2: Apply the detached package plans. Candidate lookup and mutation
+	// remain bounded; unlike the former interleaved walk, no page can retain a
+	// types.Object, AST, or packages.Package.
 	applyStart := time.Now()
 	lastApplyLog := applyStart
-	for pkgIndex, pkg := range pkgs {
+	for pkgIndex, resolvedUses := range usePlan.packages {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -623,123 +889,123 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			p.logger.Info("go-types: apply progress",
 				zap.String("repo_prefix", repoPrefix),
 				zap.Int("packages_done", pkgIndex),
-				zap.Int("packages_total", len(pkgs)),
+				zap.Int("packages_total", len(usePlan.packages)),
 				zap.Int("confirmed", result.EdgesConfirmed),
 				zap.Int("added", result.EdgesAdded),
 				zap.Duration("elapsed", time.Since(applyStart)))
 		}
-		if pkg.TypesInfo == nil {
-			continue
-		}
 
-		endpointSet := make(map[graph.EdgeEndpoint]struct{}, len(pkg.TypesInfo.Uses))
-		siteSet := make(map[graph.EdgeSite]struct{})
-		for ident, obj := range pkg.TypesInfo.Uses {
-			use, ok := resolveGoUse(ident, obj, fset, absRoot, repoPrefix, funcIndexByFile, objToNode, externals)
-			if !ok {
-				continue
+		const goUseApplyChunkSize = 512
+		for chunkStart := 0; chunkStart < len(resolvedUses); chunkStart += goUseApplyChunkSize {
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
-			endpointSet[graph.EdgeEndpoint{From: use.caller.ID, To: use.targetNodeID}] = struct{}{}
-			if !use.external {
-				continue
-			}
-			importPath := use.obj.Pkg().Path()
-			for _, target := range stubEdgeTargets(repoPrefix, importPath, use.obj) {
-				endpointSet[graph.EdgeEndpoint{From: use.caller.ID, To: target}] = struct{}{}
-			}
-			siteSet[graph.EdgeSite{
-				From: use.caller.ID,
-				Line: use.line,
-				Kind: wantedEdgeKind(use.obj),
-			}] = struct{}{}
-		}
-
-		endpoints := make([]graph.EdgeEndpoint, 0, len(endpointSet))
-		for key := range endpointSet {
-			endpoints = append(endpoints, key)
-		}
-		sites := make([]graph.EdgeSite, 0, len(siteSet))
-		for key := range siteSet {
-			sites = append(sites, key)
-		}
-		candidates := graph.LookupEdgeCandidates(g, endpoints, sites)
-		externals.edgeCandidates = &candidates
-
-		var confirmedEdges []*graph.Edge
-		var newEdges []*graph.Edge
-		for ident, obj := range pkg.TypesInfo.Uses {
-			use, ok := resolveGoUse(ident, obj, fset, absRoot, repoPrefix, funcIndexByFile, objToNode, externals)
-			if !ok {
-				continue
-			}
-
-			// External: claim a resolver-stub edge if one exists, else add a
-			// fresh edge. Internal: confirm or add as before.
-			if use.external {
-				importPath := use.obj.Pkg().Path()
-				if upgraded := externals.claimAndUpgradeStub(use.caller.ID, importPath, use.obj, use.targetNodeID, use.line); upgraded != nil {
-					result.EdgesConfirmed++
+			chunkEnd := min(chunkStart+goUseApplyChunkSize, len(resolvedUses))
+			chunk := resolvedUses[chunkStart:chunkEnd]
+			endpointSet := make(map[graph.EdgeEndpoint]struct{}, len(chunk))
+			siteSet := make(map[graph.EdgeSite]struct{})
+			for _, use := range chunk {
+				endpointSet[graph.EdgeEndpoint{From: use.callerID, To: use.targetNodeID}] = struct{}{}
+				if use.external == nil {
 					continue
 				}
-				existing := candidates.EndpointKind(use.caller.ID, use.targetNodeID, inferEdgeKindFromObj(use.obj))
-				if existing != nil {
-					if existing.Confidence < 1.0 {
-						semantic.ConfirmEdge(existing, p.Name())
-						confirmedEdges = append(confirmedEdges, existing)
-						result.EdgesConfirmed++
+				for _, target := range use.external.stubTargets {
+					endpointSet[graph.EdgeEndpoint{From: use.callerID, To: target}] = struct{}{}
+				}
+				siteSet[graph.EdgeSite{
+					From: use.callerID,
+					Line: use.line,
+					Kind: use.kind,
+				}] = struct{}{}
+			}
+
+			endpoints := make([]graph.EdgeEndpoint, 0, len(endpointSet))
+			for key := range endpointSet {
+				endpoints = append(endpoints, key)
+			}
+			sites := make([]graph.EdgeSite, 0, len(siteSet))
+			for key := range siteSet {
+				sites = append(sites, key)
+			}
+
+			if err := resolveSlices.with(ctx, func() error {
+				candidates := graph.LookupEdgeCandidates(g, endpoints, sites)
+				externals.edgeCandidates = &candidates
+				defer func() { externals.edgeCandidates = nil }()
+
+				var confirmedEdges []*graph.Edge
+				var newEdges []*graph.Edge
+				for _, use := range chunk {
+					// External: claim a resolver-stub edge if one exists, else add
+					// a fresh edge. Internal: confirm or add as before.
+					if use.external != nil {
+						if upgraded := externals.claimAndUpgradeProjectedStub(use.callerID, use.external, use.targetNodeID, use.line); upgraded != nil {
+							result.EdgesConfirmed++
+							continue
+						}
+						existing := candidates.EndpointKind(use.callerID, use.targetNodeID, use.kind)
+						if existing != nil {
+							if existing.Confidence < 1.0 {
+								semantic.ConfirmEdge(existing, p.Name())
+								confirmedEdges = append(confirmedEdges, existing)
+								result.EdgesConfirmed++
+							}
+							continue
+						}
+						if use.kind != "" {
+							edge := semantic.NewSemanticEdge(use.callerID, use.targetNodeID, use.kind,
+								use.graphPath, use.line, p.Name())
+							candidates.Add(edge)
+							newEdges = append(newEdges, edge)
+							result.EdgesAdded++
+						}
+						continue
 					}
-					continue
+
+					existing := candidates.EndpointKind(use.callerID, use.targetNodeID, use.kind)
+					if existing != nil {
+						if existing.Confidence < 1.0 {
+							semantic.ConfirmEdge(existing, p.Name())
+							confirmedEdges = append(confirmedEdges, existing)
+							result.EdgesConfirmed++
+						}
+					} else {
+						if use.kind != "" {
+							edge := semantic.NewSemanticEdge(use.callerID, use.targetNodeID, use.kind,
+								use.graphPath, use.line, p.Name())
+							candidates.Add(edge)
+							newEdges = append(newEdges, edge)
+							result.EdgesAdded++
+						}
+					}
 				}
-				kind := inferEdgeKindFromObj(use.obj)
-				if kind != "" {
-					edge := semantic.NewSemanticEdge(use.caller.ID, use.targetNodeID, kind,
-						use.graphPath, use.line, p.Name())
-					candidates.Add(edge)
-					newEdges = append(newEdges, edge)
-					result.EdgesAdded++
+
+				externalNodes, externalEdges := externals.drainPendingAdds()
+				allNewEdges := make([]*graph.Edge, 0, len(externalEdges)+len(newEdges))
+				allNewEdges = append(allNewEdges, externalEdges...)
+				allNewEdges = append(allNewEdges, newEdges...)
+				if len(externalNodes) > 0 || len(allNewEdges) > 0 {
+					addBatchStart := time.Now()
+					g.AddBatch(externalNodes, allNewEdges)
+					applyAddBatchDur += time.Since(addBatchStart)
 				}
-				continue
+				if reindexes := externals.drainPendingReindexes(); len(reindexes) > 0 {
+					reindexStart := time.Now()
+					g.ReindexEdges(reindexes)
+					applyReindexDur += time.Since(reindexStart)
+				}
+
+				confirmStart := time.Now()
+				persistConfirmedEdges(g, confirmedEdges)
+				applyConfirmDur += time.Since(confirmStart)
+				return nil
+			}); err != nil {
+				return nil, err
 			}
-
-			existing := candidates.EndpointKind(use.caller.ID, use.targetNodeID, inferEdgeKindFromObj(use.obj))
-			if existing != nil {
-				if existing.Confidence < 1.0 {
-					semantic.ConfirmEdge(existing, p.Name())
-					confirmedEdges = append(confirmedEdges, existing)
-					result.EdgesConfirmed++
-				}
-			} else {
-				kind := inferEdgeKindFromObj(use.obj)
-				if kind != "" {
-					edge := semantic.NewSemanticEdge(use.caller.ID, use.targetNodeID, kind,
-						use.graphPath, use.line, p.Name())
-					candidates.Add(edge)
-					newEdges = append(newEdges, edge)
-					result.EdgesAdded++
-				}
-			}
 		}
-
-		externalNodes, externalEdges := externals.drainPendingAdds()
-		allNewEdges := make([]*graph.Edge, 0, len(externalEdges)+len(newEdges))
-		allNewEdges = append(allNewEdges, externalEdges...)
-		allNewEdges = append(allNewEdges, newEdges...)
-		if len(externalNodes) > 0 || len(allNewEdges) > 0 {
-			addBatchStart := time.Now()
-			g.AddBatch(externalNodes, allNewEdges)
-			applyAddBatchDur += time.Since(addBatchStart)
-		}
-		if reindexes := externals.drainPendingReindexes(); len(reindexes) > 0 {
-			reindexStart := time.Now()
-			g.ReindexEdges(reindexes)
-			applyReindexDur += time.Since(reindexStart)
-		}
-
-		confirmStart := time.Now()
-		persistConfirmedEdges(g, confirmedEdges)
-		applyConfirmDur += time.Since(confirmStart)
-		externals.edgeCandidates = nil
+		usePlan.packages[pkgIndex] = nil
 	}
+	usePlan.release()
 
 	// Stitch the externals counters into the standard result. NodesEnriched
 	// previously only incremented for in-repo type-meta enrichment; here
@@ -750,117 +1016,58 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 
 	applyRefsDur = time.Since(refsStart)
 
-	// Phase 3: Interface implementations via go/types.
+	// Phase 3: Interface implementations via go/types. Keep the existing and
+	// missing-edge operations in separate lock slices so unrelated graph work
+	// can interleave between their bounded reads and writes.
 	implementsStart := time.Now()
-	result.EdgesConfirmed += p.enrichImplements(g, objToNode, nodesByID)
-	result.EdgesAdded += p.addMissingImplements(g, objToNode, nodesByID)
-	applyImplementsDur = time.Since(implementsStart)
-	stampsStart := time.Now()
-
-	// Phase 4: node-driven type stamping. go/types has a Def — hence an exact
-	// type — for every function, method, field, parameter and local variable.
-	// The bottleneck is attaching each Def to its graph node. Phase 1 maps a
-	// Def with MatchNodeByFileLine, which returns the innermost node whose
-	// RANGE contains the ident line, so a function's params and locals collapse
-	// onto the enclosing function node and never receive their own type — that
-	// is why the old Defs→node stamping reached only ~20% of locals and ~24% of
-	// params. Here we index every named Def by (file, name) and, for each graph
-	// node, pick the same-named Def whose ident sits closest to the node's own
-	// declaration line (within its range). That attaches a local/param to ITS
-	// node rather than its enclosing function, lifting coverage to what go/types
-	// actually knows (every named symbol).
-	//
-	// SQLite supplies a light node projection for matching, so never mutate or
-	// write those projection rows: their opaque Meta blobs were intentionally
-	// not decoded. Collect compact stamps, then fetch full nodes by ID in bounded
-	// batches before EnrichNodeMeta/AddBatch. This preserves every existing Meta
-	// key without retaining the repository's full metadata in memory.
-	type defEntry struct {
-		line int
-		obj  types.Object
-	}
-	defsByName := make(map[string][]defEntry) // key: rel \x00 name
-	relSet := make(map[string]struct{})
-	for _, pkg := range pkgs {
-		if err := ctx.Err(); err != nil {
+	const goImplementsApplyChunkSize = 512
+	for start := 0; start < len(interfaceIDs); start += goImplementsApplyChunkSize {
+		end := min(start+goImplementsApplyChunkSize, len(interfaceIDs))
+		chunk := interfaceIDs[start:end]
+		var implementsConfirmed int
+		if err := resolveSlices.with(ctx, func() error {
+			implementsConfirmed = p.enrichImplementsByIDs(g, chunk)
+			return nil
+		}); err != nil {
 			return nil, err
 		}
-		if pkg.TypesInfo == nil {
-			continue
-		}
-		for ident, obj := range pkg.TypesInfo.Defs {
-			if obj == nil || ident.Pos() == token.NoPos || ident.Name == "" || ident.Name == "_" {
-				continue
-			}
-			pos := fset.Position(ident.Pos())
-			rel := relativePath(pos.Filename, absRoot)
-			if rel == "" {
-				continue
-			}
-			defsByName[rel+"\x00"+ident.Name] = append(defsByName[rel+"\x00"+ident.Name], defEntry{pos.Line, obj})
-			relSet[rel] = struct{}{}
-		}
+		result.EdgesConfirmed += implementsConfirmed
 	}
-	stamps := make(map[string]goNodeStamp)
-	for rel := range relSet {
-		for _, node := range nodesByFile[scopedGraphPath(repoPrefix, rel)] {
-			if node.Kind == graph.KindFile || node.Kind == graph.KindImport || node.Name == "" {
-				continue
-			}
-			// Among same-named Defs in this file, pick the one whose ident line
-			// is closest to the node's start line and falls within its range —
-			// this distinguishes two locals of the same name in one function.
-			best := types.Object(nil)
-			bestDist := 1 << 30
-			for _, e := range defsByName[rel+"\x00"+node.Name] {
-				if e.line < node.StartLine-1 || e.line > node.EndLine+1 {
-					continue
-				}
-				d := e.line - node.StartLine
-				if d < 0 {
-					d = -d
-				}
-				if d < bestDist {
-					bestDist = d
-					best = e.obj
-				}
-			}
-			if best == nil {
-				continue
-			}
-
-			stamp := goNodeStamp{}
-			if typeStr := types.TypeString(best.Type(), nil); typeStr != "" && typeStr != "invalid type" {
-				stamp.semanticType = typeStr
-			}
-			// Add return type for functions.
-			if fn, ok := best.(*types.Func); ok {
-				if sig, ok := fn.Type().(*types.Signature); ok && sig.Results().Len() > 0 {
-					stamp.returnType = types.TypeString(sig.Results(), nil)
-				}
-			}
-			if stamp.semanticType != "" || stamp.returnType != "" {
-				stamps[node.ID] = stamp
-			}
+	for start := 0; start < len(missingPairs); start += goImplementsApplyChunkSize {
+		end := min(start+goImplementsApplyChunkSize, len(missingPairs))
+		chunk := missingPairs[start:end]
+		var implementsAdded int
+		if err := resolveSlices.with(ctx, func() error {
+			implementsAdded = p.addMissingImplementationPairs(g, chunk, nodesByID)
+			return nil
+		}); err != nil {
+			return nil, err
 		}
+		result.EdgesAdded += implementsAdded
 	}
-	// The compiler program's last consumer was the stamps loop above — stamps
-	// hold only strings from here on; frame liveness already lets the GC
-	// collect the program while the graph-write persistence below runs.
+	applyImplementsDur = implementsPlanDur + time.Since(implementsStart)
+	stampsPersistStart := time.Now()
 
-	persistedStamps, err := persistGoNodeStamps(ctx, g, stamps, p.Name())
+	// Phase 4 persists the string-only stamp plan projected before compiler
+	// release. SQLite still refetches full nodes in bounded batches, preserving
+	// opaque metadata exactly as before.
+	persistedStamps, err := persistGoNodeStampsSliced(ctx, g, stamps, p.Name(), resolveSlices)
 	if err != nil {
 		return nil, err
 	}
 	result.NodesEnriched += persistedStamps
-	applyStampsDur = time.Since(stampsStart)
+	applyStampsDur = stampPlanDur + time.Since(stampsPersistStart)
 
+	result.LockWaitMs = resolveSlices.waited.Milliseconds()
 	if p.logger != nil {
 		p.logger.Info("go-types: apply subphases",
 			zap.String("repo_prefix", repoPrefix),
 			zap.Duration("gate_parked", applyGateParked),
-			zap.Duration("mutex_waited", mutexWaited),
-			zap.Duration("mutex_held", time.Since(applyMutexHeld)),
+			zap.Duration("apply_wall", time.Since(applyStarted)),
+			zap.Duration("mutex_waited", resolveSlices.waited),
+			zap.Duration("mutex_held", resolveSlices.held),
+			zap.Duration("mutex_max_held", resolveSlices.maxHeld),
+			zap.Int("mutex_slices", resolveSlices.count),
 			zap.Duration("graph_projection", applyProjectionDur),
 			zap.Duration("defs_walk", applyDefsDur),
 			zap.Duration("refs_walk", applyRefsDur),
@@ -900,7 +1107,7 @@ func (p *Provider) EnrichFilesContext(ctx context.Context, g graph.Store, repoPr
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	release, err := p.acquireHeavy(ctx)
+	release, err := p.acquireHeavy(ctx, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1489,6 +1696,108 @@ type goNodeStamp struct {
 	returnType   string
 }
 
+// buildGoNodeStamps projects the final compiler consumer to strings before the
+// graph apply. Keeping this node-driven matching policy byte-for-byte equivalent
+// to the former phase-4 loop preserves local/parameter precision while letting
+// the package AST/type graphs die before SQLite mutation begins.
+func buildGoNodeStamps(
+	ctx context.Context,
+	pkgs []*packages.Package,
+	fset *token.FileSet,
+	absRoot, repoPrefix string,
+	nodesByFile map[string][]*graph.Node,
+) (map[string]goNodeStamp, error) {
+	type defEntry struct {
+		line int
+		obj  types.Object
+	}
+	defsByName := make(map[string][]defEntry) // key: rel \x00 name
+	relSet := make(map[string]struct{})
+	for _, pkg := range pkgs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if pkg == nil || pkg.TypesInfo == nil {
+			continue
+		}
+		for ident, obj := range pkg.TypesInfo.Defs {
+			if obj == nil || ident.Pos() == token.NoPos || ident.Name == "" || ident.Name == "_" {
+				continue
+			}
+			pos := fset.Position(ident.Pos())
+			rel := relativePath(pos.Filename, absRoot)
+			if rel == "" {
+				continue
+			}
+			defsByName[rel+"\x00"+ident.Name] = append(defsByName[rel+"\x00"+ident.Name], defEntry{pos.Line, obj})
+			relSet[rel] = struct{}{}
+		}
+	}
+
+	stamps := make(map[string]goNodeStamp)
+	for rel := range relSet {
+		for _, node := range nodesByFile[scopedGraphPath(repoPrefix, rel)] {
+			if node.Kind == graph.KindFile || node.Kind == graph.KindImport || node.Name == "" {
+				continue
+			}
+			best := types.Object(nil)
+			bestDist := 1 << 30
+			for _, entry := range defsByName[rel+"\x00"+node.Name] {
+				if entry.line < node.StartLine-1 || entry.line > node.EndLine+1 {
+					continue
+				}
+				distance := entry.line - node.StartLine
+				if distance < 0 {
+					distance = -distance
+				}
+				if distance < bestDist {
+					bestDist = distance
+					best = entry.obj
+				}
+			}
+			if best == nil {
+				continue
+			}
+
+			stamp := goNodeStamp{}
+			if typeStr := types.TypeString(best.Type(), nil); typeStr != "" && typeStr != "invalid type" {
+				stamp.semanticType = typeStr
+			}
+			if fn, ok := best.(*types.Func); ok {
+				if sig, ok := fn.Type().(*types.Signature); ok && sig.Results().Len() > 0 {
+					stamp.returnType = types.TypeString(sig.Results(), nil)
+				}
+			}
+			if stamp.semanticType != "" || stamp.returnType != "" {
+				stamps[node.ID] = stamp
+			}
+		}
+	}
+	return stamps, nil
+}
+
+// releaseGoPackageCompilerState retains only package/module metadata used by
+// externals attribution. Called after every Use has been detached to strings;
+// clearing both directions of packages.Package breaks the AST/types/import
+// closure before the long graph-write phase without a forced GC pause.
+func releaseGoPackageCompilerState(pkg *packages.Package) {
+	if pkg == nil {
+		return
+	}
+	pkg.GoFiles = nil
+	pkg.CompiledGoFiles = nil
+	pkg.OtherFiles = nil
+	pkg.EmbedFiles = nil
+	pkg.EmbedPatterns = nil
+	pkg.IgnoredFiles = nil
+	pkg.Imports = nil
+	pkg.Types = nil
+	pkg.Fset = nil
+	pkg.Syntax = nil
+	pkg.TypesInfo = nil
+	pkg.TypesSizes = nil
+}
+
 // persistGoNodeStamps uses the SQLite backend's set-oriented promoted-column
 // writer when available. Other stores fetch only the full rows that will be
 // mutated, in bounded ID batches. Summary/light projection rows are never
@@ -1499,27 +1808,53 @@ func persistGoNodeStamps(
 	stamps map[string]goNodeStamp,
 	providerName string,
 ) (int, error) {
+	return persistGoNodeStampsSliced(ctx, g, stamps, providerName, nil)
+}
+
+func persistGoNodeStampsSliced(
+	ctx context.Context,
+	g graph.Store,
+	stamps map[string]goNodeStamp,
+	providerName string,
+	resolveSlices *resolveLockSlices,
+) (int, error) {
 	ids := make([]string, 0, len(stamps))
 	for id := range stamps {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 
-	if writer, ok := g.(graph.SemanticNodeStampWriter); ok {
+	withStore := func(fn func() error) error {
+		if resolveSlices != nil {
+			return resolveSlices.with(ctx, fn)
+		}
 		if err := ctx.Err(); err != nil {
-			return 0, err
+			return err
 		}
-		updates := make([]graph.SemanticNodeStamp, 0, len(ids))
-		for _, id := range ids {
-			stamp := stamps[id]
-			updates = append(updates, graph.SemanticNodeStamp{
-				NodeID:         id,
-				SemanticType:   stamp.semanticType,
-				ReturnType:     stamp.returnType,
-				SemanticSource: providerName,
-			})
+		return fn()
+	}
+
+	if writer, ok := g.(graph.SemanticNodeStampWriter); ok {
+		changed := 0
+		for start := 0; start < len(ids); start += goNodeStampChunkSize {
+			end := min(start+goNodeStampChunkSize, len(ids))
+			updates := make([]graph.SemanticNodeStamp, 0, end-start)
+			for _, id := range ids[start:end] {
+				stamp := stamps[id]
+				updates = append(updates, graph.SemanticNodeStamp{
+					NodeID:         id,
+					SemanticType:   stamp.semanticType,
+					ReturnType:     stamp.returnType,
+					SemanticSource: providerName,
+				})
+			}
+			if err := withStore(func() error {
+				changed += writer.PersistSemanticNodeStamps(updates)
+				return nil
+			}); err != nil {
+				return changed, err
+			}
 		}
-		changed := writer.PersistSemanticNodeStamps(updates)
 		if err := ctx.Err(); err != nil {
 			return changed, err
 		}
@@ -1528,45 +1863,105 @@ func persistGoNodeStamps(
 
 	enriched := 0
 	for start := 0; start < len(ids); start += goNodeStampChunkSize {
-		if err := ctx.Err(); err != nil {
-			return enriched, err
-		}
 		end := min(start+goNodeStampChunkSize, len(ids))
 		chunk := ids[start:end]
-		fullNodes := g.GetNodesByIDs(chunk)
-		updated := make([]*graph.Node, 0, len(fullNodes))
-		for _, id := range chunk {
-			node := fullNodes[id]
-			if node == nil {
-				continue
+		if err := withStore(func() error {
+			fullNodes := g.GetNodesByIDs(chunk)
+			updated := make([]*graph.Node, 0, len(fullNodes))
+			for _, id := range chunk {
+				node := fullNodes[id]
+				if node == nil {
+					continue
+				}
+				stamp := stamps[id]
+				if stamp.semanticType != "" {
+					semantic.EnrichNodeMeta(node, "semantic_type", stamp.semanticType, providerName)
+					enriched++
+				}
+				if stamp.returnType != "" {
+					semantic.EnrichNodeMeta(node, "return_type", stamp.returnType, providerName)
+				}
+				updated = append(updated, node)
 			}
-			stamp := stamps[id]
-			if stamp.semanticType != "" {
-				semantic.EnrichNodeMeta(node, "semantic_type", stamp.semanticType, providerName)
-				enriched++
+			if len(updated) > 0 {
+				g.AddBatch(updated, nil)
 			}
-			if stamp.returnType != "" {
-				semantic.EnrichNodeMeta(node, "return_type", stamp.returnType, providerName)
-			}
-			updated = append(updated, node)
-		}
-		if err := ctx.Err(); err != nil {
+			return nil
+		}); err != nil {
 			return enriched, err
-		}
-		if len(updated) > 0 {
-			g.AddBatch(updated, nil)
 		}
 	}
 	return enriched, nil
 }
 
+// resolvedGoUse is deliberately detached from go/types and backend-owned graph
+// nodes. A full-repository pass can project compiler Uses to these compact facts,
+// release AST/type graphs, and then spend its long SQLite apply on bounded pages.
 type resolvedGoUse struct {
-	caller       *graph.Node
-	obj          types.Object
+	callerID     string
 	targetNodeID string
 	graphPath    string
 	line         int
-	external     bool
+	kind         graph.EdgeKind
+	external     *externalUseIdentity
+}
+
+// projectGoUsesAndReleaseCompilerState creates a stack boundary around the last
+func clearGoPackageCompilerRoots(pkgs []*packages.Package) {
+	for i, pkg := range pkgs {
+		releaseGoPackageCompilerState(pkg)
+		pkgs[i] = nil
+	}
+}
+
+// reclaimAndReleaseGoCompiler centralizes the ordering invariant: roots are
+// severed first, optional reclamation completes second, and admission is
+// returned last. Tests inject callbacks to prove cancellation cannot invert it.
+func reclaimAndReleaseGoCompiler(sever func(), forceGC bool, collect, afterCollect, release func()) {
+	sever()
+	if forceGC {
+		collect()
+	}
+	if afterCollect != nil {
+		afterCollect()
+	}
+	release()
+}
+
+// ast/types walk. Returning from this helper, in addition to clearing every
+// packages.Package, guarantees range temporaries cannot remain GC roots when
+// the caller performs its one large-program reclamation cycle.
+func projectGoUsesAndReleaseCompilerState(
+	ctx context.Context,
+	pkgs []*packages.Package,
+	fset *token.FileSet,
+	absRoot, repoPrefix string,
+	funcIndex map[string]*fileFuncIndex,
+	objToNode map[types.Object]string,
+	externals *externalsAttribution,
+) (*goUsePlan, error) {
+	plan := newGoUsePlan(len(pkgs))
+	for pkgIndex, pkg := range pkgs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if pkg == nil || pkg.TypesInfo == nil {
+			releaseGoPackageCompilerState(pkg)
+			pkgs[pkgIndex] = nil
+			continue
+		}
+		packageUses := make([]resolvedGoUse, 0, len(pkg.TypesInfo.Uses))
+		for ident, obj := range pkg.TypesInfo.Uses {
+			use, ok := resolveGoUse(ident, obj, fset, absRoot, repoPrefix, funcIndex, objToNode, externals)
+			if ok {
+				packageUses = append(packageUses, use)
+			}
+		}
+		plan.setPackage(pkgIndex, packageUses)
+		releaseGoPackageCompilerState(pkg)
+		pkgs[pkgIndex] = nil
+	}
+	return plan, nil
 }
 
 // resolveGoUse is the query-free normalization shared by both package walks
@@ -1607,14 +2002,20 @@ func resolveGoUse(
 	if caller.ID == targetNodeID {
 		return resolvedGoUse{}, false
 	}
-	return resolvedGoUse{
-		caller:       caller,
-		obj:          obj,
+	use := resolvedGoUse{
+		callerID:     caller.ID,
 		targetNodeID: targetNodeID,
 		graphPath:    graphPath,
 		line:         pos.Line,
-		external:     external,
-	}, true
+		kind:         inferEdgeKindFromObj(obj),
+	}
+	if external {
+		use.external = externals.projectedUse(obj, targetNodeID)
+		if use.external == nil {
+			return resolvedGoUse{}, false
+		}
+	}
+	return use, true
 }
 
 // enrichImplements confirms existing EdgeImplements edges using go/types.
@@ -1638,28 +2039,30 @@ func implementsConcreteNode(nodesByID map[string]*graph.Node, nodeID string) boo
 	return node != nil && node.Kind == graph.KindType
 }
 
-func (p *Provider) enrichImplements(g graph.Store, objToNode map[types.Object]string, nodesByID map[string]*graph.Node) int {
-	// Collect all interfaces from the loaded packages.
-	ifaceTypes := make(map[string]*types.Interface) // Gortex node ID → interface type
+func implementationInterfaceIDs(objToNode map[types.Object]string, nodesByID map[string]*graph.Node) []string {
+	interfaceSet := make(map[string]struct{})
 	for obj, nodeID := range objToNode {
 		if tn, ok := obj.(*types.TypeName); ok {
-			if iface, ok := tn.Type().Underlying().(*types.Interface); ok && implementsInterfaceNode(nodesByID, nodeID) {
-				ifaceTypes[nodeID] = iface
+			if _, ok := tn.Type().Underlying().(*types.Interface); ok && implementsInterfaceNode(nodesByID, nodeID) {
+				interfaceSet[nodeID] = struct{}{}
 			}
 		}
 	}
-	if len(ifaceTypes) == 0 {
-		return 0
-	}
-
-	// Fetch inbound edges for every loaded interface in one predicate-shaped
-	// batch. This preserves cross-repo concrete sources without scanning the
-	// graph-wide EdgeImplements set once per repository.
-	interfaceIDs := make([]string, 0, len(ifaceTypes))
-	for id := range ifaceTypes {
+	interfaceIDs := make([]string, 0, len(interfaceSet))
+	for id := range interfaceSet {
 		interfaceIDs = append(interfaceIDs, id)
 	}
 	sort.Strings(interfaceIDs)
+	return interfaceIDs
+}
+
+func (p *Provider) enrichImplementsByIDs(g graph.Store, interfaceIDs []string) int {
+	if len(interfaceIDs) == 0 {
+		return 0
+	}
+	// Fetch inbound edges for every loaded interface in one predicate-shaped
+	// batch. This preserves cross-repo concrete sources without scanning the
+	// graph-wide EdgeImplements set once per repository.
 	inbound := g.GetInEdgesByNodeIDs(interfaceIDs)
 
 	var pending []*graph.Edge
@@ -1691,6 +2094,10 @@ func (p *Provider) enrichImplements(g graph.Store, objToNode map[types.Object]st
 	return len(confirmedEdges)
 }
 
+func (p *Provider) enrichImplements(g graph.Store, objToNode map[types.Object]string, nodesByID map[string]*graph.Node) int {
+	return p.enrichImplementsByIDs(g, implementationInterfaceIDs(objToNode, nodesByID))
+}
+
 func implementationMethodNames(typ, pointer types.Type) map[string]struct{} {
 	methodNames := make(map[string]struct{})
 	for _, candidateType := range []types.Type{typ, pointer} {
@@ -1703,7 +2110,12 @@ func implementationMethodNames(typ, pointer types.Type) map[string]struct{} {
 }
 
 // addMissingImplements discovers interface implementations that tree-sitter missed.
-func (p *Provider) addMissingImplements(g graph.Store, objToNode map[types.Object]string, nodesByID map[string]*graph.Node) int {
+type implementationPair struct {
+	from string
+	to   string
+}
+
+func missingImplementationPairs(objToNode map[types.Object]string, nodesByID map[string]*graph.Node) []implementationPair {
 	// Collect interfaces and concrete types. Concrete method names form a cheap,
 	// lossless prefilter: exact go/types checks still decide every edge.
 	type ifaceEntry struct {
@@ -1761,12 +2173,7 @@ func (p *Provider) addMissingImplements(g graph.Store, objToNode map[types.Objec
 		}
 	}
 
-	type implementationPair struct {
-		from string
-		to   string
-	}
 	var pairs []implementationPair
-	var endpoints []graph.EdgeEndpoint
 	for _, ifaceEntry := range ifaces {
 		requiredNames := make([]string, 0, ifaceEntry.iface.NumMethods())
 		candidateIndexes := allConcreteIndexes
@@ -1800,13 +2207,19 @@ func (p *Provider) addMissingImplements(g graph.Store, objToNode map[types.Objec
 			}
 			if types.Implements(concrete.typ, ifaceEntry.iface) || types.Implements(concrete.pointer, ifaceEntry.iface) {
 				pairs = append(pairs, implementationPair{from: concrete.nodeID, to: ifaceEntry.nodeID})
-				endpoints = append(endpoints, graph.EdgeEndpoint{From: concrete.nodeID, To: ifaceEntry.nodeID})
 			}
 		}
 	}
+	return pairs
+}
 
+func (p *Provider) addMissingImplementationPairs(g graph.Store, pairs []implementationPair, nodesByID map[string]*graph.Node) int {
 	if len(pairs) == 0 {
 		return 0
+	}
+	endpoints := make([]graph.EdgeEndpoint, 0, len(pairs))
+	for _, pair := range pairs {
+		endpoints = append(endpoints, graph.EdgeEndpoint{From: pair.from, To: pair.to})
 	}
 	candidates := graph.LookupEdgeCandidates(g, endpoints, nil)
 	newEdges := make([]*graph.Edge, 0, len(pairs))
@@ -1827,6 +2240,10 @@ func (p *Provider) addMissingImplements(g graph.Store, objToNode map[types.Objec
 		g.AddBatch(nil, newEdges)
 	}
 	return len(newEdges)
+}
+
+func (p *Provider) addMissingImplements(g graph.Store, objToNode map[types.Object]string, nodesByID map[string]*graph.Node) int {
+	return p.addMissingImplementationPairs(g, missingImplementationPairs(objToNode, nodesByID), nodesByID)
 }
 
 func persistConfirmedEdges(g graph.Store, edges []*graph.Edge) {

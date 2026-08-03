@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 8
+const currentSchemaVersion = 9
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -73,6 +73,15 @@ var schemaMigrations = []schemaMigration{
 	// for why in-place beats rebuild and why global externals survive.
 	{version: 7, name: "purge unprefixed solo-repo rows", inPlace: purgeUnprefixedRepoRows},
 	{version: 8, name: "allow duplicate qualified names", inPlace: relaxNodeQualNameUniqueness},
+	{version: 9, name: "drop unused semantic pending index", inPlace: dropUnusedSemanticPendingIndex},
+}
+
+// dropUnusedSemanticPendingIndex removes an experimental index for a query
+// shape that was never shipped. It was dense throughout parsing (semantic_type
+// starts NULL), adding write and cold-finalization cost without a consumer.
+func dropUnusedSemanticPendingIndex(tx *sql.Tx) error {
+	_, err := tx.Exec(`DROP INDEX IF EXISTS nodes_semantic_pending`)
+	return err
 }
 
 // relaxNodeQualNameUniqueness removes the historical assumption that a

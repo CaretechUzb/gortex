@@ -1109,19 +1109,25 @@ func (idx *Indexer) enrichAndMarkIncrementalStages(
 ) {
 	providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
 	pending := make(map[string]bool, len(stages))
+	eligible := make([]*incrementalBatchStage, 0, len(stages))
 	for _, stage := range stages {
-		pending[stage.graphPath] = providersPresent
+		omitSecondarySourceScans := extractionDispositionFor(stage.result).omitSecondarySourceScans()
+		pending[stage.graphPath] = providersPresent && !omitSecondarySourceScans
+		if !omitSecondarySourceScans {
+			eligible = append(eligible, stage)
+		}
 	}
-	watchEnrichment := providersPresent && !idx.deferGlobalPasses.Load() && idx.semanticMgr.EnrichesOnWatch() &&
+	watchEnrichment := providersPresent && len(eligible) > 0 &&
+		!idx.deferGlobalPasses.Load() && idx.semanticMgr.EnrichesOnWatch() &&
 		(markerBatch == nil || !markerBatch.deferResolverCatchup)
 	if watchEnrichment {
-		paths := make([]string, 0, len(stages))
-		for _, stage := range stages {
+		paths := make([]string, 0, len(eligible))
+		for _, stage := range eligible {
 			paths = append(paths, stage.graphPath)
 		}
 		idx.observeIncrementalCatchup("semantic", paths)
 		byLanguage := make(map[string][]string)
-		for _, stage := range stages {
+		for _, stage := range eligible {
 			language := ""
 			for _, node := range stage.result.Nodes {
 				if node != nil && node.Kind == graph.KindFile {

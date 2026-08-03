@@ -318,7 +318,8 @@ func TestIncrementalResolutionFrontierOnlySkipsAuthoritativeIrrelevantReceipt(t 
 
 	files, needed, exact = incrementalResolutionFrontier(result, &graph.MutationReceipt{
 		Complete: true, ResolutionRelevant: true,
-		ChangedFiles: []string{"repo/changed.go"},
+		ChangedFiles:    []string{"repo/changed.go"},
+		UnresolvedFiles: []string{"repo/changed.go"},
 	})
 	require.True(t, needed)
 	require.True(t, exact)

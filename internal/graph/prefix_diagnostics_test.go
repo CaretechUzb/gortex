@@ -43,6 +43,22 @@ func TestClassifyNodePrefix(t *testing.T) {
 		node: &Node{ID: "dep::go.uber.org/zap::Logger", Kind: KindFunction},
 		want: "",
 	}, {
+		name: "semantic external virtual path is not audited",
+		node: &Node{ID: "external::go:crypto/sha256::Size", Kind: KindConstant, FilePath: "external::go:crypto/sha256"},
+		want: "",
+	}, {
+		name: "external-call module virtual path is not audited",
+		node: &Node{ID: "external-call::npm:lodash", Kind: KindModule, FilePath: "external-call::npm:lodash"},
+		want: "",
+	}, {
+		name: "contract identity namespace is not audited",
+		node: &Node{ID: "contract::http::GET::/health", Kind: KindContract, FilePath: "gortex/api.go", RepoPrefix: "gortex"},
+		want: "",
+	}, {
+		name: "contract bridge virtual identity is not audited",
+		node: &Node{ID: "contract-bridge::request::response", Kind: KindContractBridge, FilePath: "contracts://bridges", RepoPrefix: "gortex"},
+		want: "",
+	}, {
 		name: "repo-scoped stub carries no file and is not audited",
 		node: &Node{ID: "gortex::builtin::go::make", Kind: KindBuiltin, RepoPrefix: "gortex"},
 		want: "",

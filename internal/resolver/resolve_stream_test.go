@@ -1,12 +1,88 @@
 package resolver
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"unsafe"
 
 	"github.com/zzet/gortex/internal/graph"
 )
+
+type cancelingUnresolvedPager struct {
+	graph.Store
+	edge      *graph.Edge
+	cancel    context.CancelFunc
+	pageCalls int
+}
+
+func (s *cancelingUnresolvedPager) BeginUnresolvedEdgeScan(context.Context) (graph.UnresolvedEdgeScan, error) {
+	return graph.UnresolvedEdgeScan{HighWaterID: 2, PendingBefore: -1}, nil
+}
+
+func (s *cancelingUnresolvedPager) ReadUnresolvedEdgePage(
+	ctx context.Context, _ graph.UnresolvedEdgeScan, afterID int64, _, _ int,
+) (graph.UnresolvedEdgePage, error) {
+	s.pageCalls++
+	if afterID == 0 {
+		return graph.UnresolvedEdgePage{Edges: []*graph.Edge{s.edge}, NextID: 1}, nil
+	}
+	s.cancel()
+	<-ctx.Done()
+	return graph.UnresolvedEdgePage{}, ctx.Err()
+}
+
+func TestResolveAllContextStopsBeforeReadinessAndTailsOnPagerCancel(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "caller", Kind: graph.KindFunction, Name: "caller", FilePath: "x.go", Language: "go"})
+	g.AddEdge(&graph.Edge{From: "caller", To: graph.UnresolvedMarker + "missing", Kind: graph.EdgeCalls, FilePath: "x.go", Line: 1})
+	ctx, cancel := context.WithCancel(t.Context())
+	store := &cancelingUnresolvedPager{Store: g, edge: g.GetOutEdges("caller")[0], cancel: cancel}
+	r := New(store)
+	ready := false
+	r.OnComputeDone = func() { ready = true }
+
+	stats, err := r.ResolveAllContext(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ResolveAllContext error = %v, want context.Canceled", err)
+	}
+	if ready {
+		t.Fatal("canceled resolve published compute readiness")
+	}
+	if store.pageCalls != 2 {
+		t.Fatalf("pager calls = %d, want 2", store.pageCalls)
+	}
+	if stats == nil || stats.PendingBefore != 1 {
+		t.Fatalf("partial stats = %+v, want one dynamically counted pending edge", stats)
+	}
+}
+
+type failedUnresolvedPager struct {
+	graph.Store
+	err error
+}
+
+func (s *failedUnresolvedPager) BeginUnresolvedEdgeScan(context.Context) (graph.UnresolvedEdgeScan, error) {
+	return graph.UnresolvedEdgeScan{}, s.err
+}
+
+func (s *failedUnresolvedPager) ReadUnresolvedEdgePage(context.Context, graph.UnresolvedEdgeScan, int64, int, int) (graph.UnresolvedEdgePage, error) {
+	panic("page read after failed begin")
+}
+
+func TestCanceledNativePagerNeverFallsBackToLegacySpool(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	stream := newUnresolvedEdgeStreamContext(ctx, &failedUnresolvedPager{Store: graph.New(), err: context.Canceled})
+	defer stream.close()
+	if !errors.Is(stream.initErr, context.Canceled) {
+		t.Fatalf("stream error = %v, want context.Canceled", stream.initErr)
+	}
+	if stream.legacy != nil {
+		t.Fatal("canceled native pager fell back to legacy whole-corpus spool")
+	}
+}
 
 func TestResolveGuardRecordSizeCoversFixedMemory(t *testing.T) {
 	fixed := resolveGuardRecordSize(resolveGuardRecord{})

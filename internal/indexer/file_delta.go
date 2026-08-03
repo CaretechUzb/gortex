@@ -134,7 +134,9 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 		pool, quarantine = idx.sharedParsePool()
 	}
 	started = time.Now()
-	result, skipped, err = idx.extractFile(pool, quarantine, absPath, relPath, lang, ext, src)
+	result, skipped, err = idx.extractFileWithRawLease(
+		parseLease, pool, quarantine, absPath, relPath, lang, ext, src,
+	)
 	probe.extract = time.Since(started)
 	if quarantine != nil && quarantine.Len() > 0 {
 		_ = quarantine.Save()
@@ -146,9 +148,11 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 		return probe, false, false
 	}
 
-	started = time.Now()
-	idx.applyCoverageDomains(relPath, lang, src, result)
-	probe.coverage = time.Since(started)
+	if !extractionDispositionFor(result).omitSecondarySourceScans() {
+		started = time.Now()
+		idx.applyCoverageDomains(relPath, lang, src, result)
+		probe.coverage = time.Since(started)
+	}
 
 	started = time.Now()
 	fingerprints, derived, ok := extractionFingerprints(result)

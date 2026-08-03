@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -447,56 +446,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		stateCapture := state
 		controllerCapture := controller
 		state.mcpServer.AttachHealthSnapshot(func() map[string]any {
-			runtimeactivity.Begin("health_snapshot")
-			defer runtimeactivity.End("health_snapshot")
-
-			out := map[string]any{
-				"uptime_seconds": int64(time.Since(daemonStart).Seconds()),
-				"ready":          controllerCapture.IsReady(),
-				"enriched":       controllerCapture.IsEnriched(),
-				"warmup_seconds": int64(0),
-			}
-			if st, statusErr := controllerCapture.Status(context.Background()); statusErr == nil {
-				out["warmup_seconds"] = st.WarmupSeconds
-				out["tracked_repos"] = len(st.TrackedRepos)
-				out["alloc_bytes"] = st.Runtime.Alloc
-				out["sys_bytes"] = st.Runtime.Sys
-				out["heap_inuse_bytes"] = st.Runtime.HeapInuse
-				out["heap_idle_bytes"] = st.Runtime.HeapIdle
-				out["heap_released_bytes"] = st.Runtime.HeapReleased
-				out["stack_inuse_bytes"] = st.Runtime.StackInuse
-				out["num_goroutine"] = st.Runtime.NumGoroutine
-				out["num_gc"] = st.Runtime.NumGC
-				if st.LSPRouter != nil {
-					out["lsp_alive"] = len(st.LSPRouter.ActiveProviders)
-					out["lsp_specs_registered"] = len(st.LSPRouter.EnabledSpecs)
-				}
-			}
-			activity := runtimeactivity.Current()
-			out["activity_active"] = activity.Active
-			out["activity_epoch"] = activity.Epoch
-			out["activity_quiet_ms"] = activity.QuietFor(time.Now()).Milliseconds()
-			if len(activity.ByKind) > 0 {
-				out["activity_by_kind"] = activity.ByKind
-			}
-			if sessions := srvCapture.Sessions(); sessions != nil {
-				out["sessions"] = sessions.Count()
-			}
-			if stateCapture.graph != nil {
-				out["graph_nodes"] = stateCapture.graph.NodeCount()
-				out["graph_edges"] = stateCapture.graph.EdgeCount()
-				if r, ok := stateCapture.graph.(graph.DBStatReporter); ok {
-					dbBytes, walBytes := r.DBStats()
-					if dbBytes > 0 || walBytes > 0 {
-						out["db_bytes"] = dbBytes
-						out["wal_bytes"] = walBytes
-						if dbBytes > 0 {
-							out["wal_db_ratio"] = float64(walBytes) / float64(dbBytes)
-						}
-					}
-				}
-			}
-			return out
+			return buildDaemonHealthSnapshot(daemonStart, controllerCapture, stateCapture, srvCapture)
 		})
 	}
 	defer func() {

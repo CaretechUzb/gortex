@@ -55,6 +55,9 @@ func indirectMutationEdges(g graph.Store) []indirectMutSpec {
 	if g == nil {
 		return nil
 	}
+	if scanner, ok := g.(graph.ReceiverMutationScanner); ok {
+		return indirectMutationEdgesProjected(scanner)
+	}
 	recvType := map[string]string{} // methodID → its receiver type
 	for n := range g.NodesByKind(graph.KindMethod) {
 		if n == nil || n.Meta == nil {

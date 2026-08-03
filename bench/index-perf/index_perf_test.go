@@ -9,12 +9,12 @@
 //
 // Run it:
 //
-//	go test ./bench/index-perf/                 # measure + gate
-//	go test -run ColdIndex -v ./bench/index-perf/   # see the printed numbers
+//	go test ./bench/index-perf/ // skipped: wall-clock gates need isolation
+//	GORTEX_BENCH_INDEX_GATE=1 go test -count=1 -run '^TestColdIndexNoWallClockRegression$' -v ./bench/index-perf/
 //
-// Regenerate the committed baseline on the current machine:
+// Regenerate the committed baseline on the target machine:
 //
-//	GORTEX_BENCH_INDEX_UPDATE_BASELINE=1 go test ./bench/index-perf/
+//	GORTEX_BENCH_INDEX_GATE=1 GORTEX_BENCH_INDEX_UPDATE_BASELINE=1 go test -count=1 -run '^TestColdIndexNoWallClockRegression$' -v ./bench/index-perf/
 //
 // Other knobs:
 //
@@ -49,13 +49,14 @@ import (
 // may exceed the committed baseline before the harness reports a regression.
 const regressionTolerance = 0.15
 
-// defaultRuns is how many cold-index passes the harness times. The minimum
-// across passes is the representative figure: scheduler and allocator jitter
-// only ever add time, so the minimum is the most stable estimator of the true
-// cost and keeps the +15% gate from flapping on a loaded machine.
-const defaultRuns = 8
+// defaultRuns is how many cold-index passes the isolated gate times. The
+// minimum across passes is the representative figure: scheduler and allocator
+// jitter only ever add time, so the minimum is the most stable estimator of
+// the true cost.
+const defaultRuns = 16
 
 const (
+	gateEnv           = "GORTEX_BENCH_INDEX_GATE"
 	updateBaselineEnv = "GORTEX_BENCH_INDEX_UPDATE_BASELINE"
 	fixtureDirEnv     = "GORTEX_BENCH_INDEX_FIXTURE"
 	runsEnv           = "GORTEX_BENCH_INDEX_RUNS"
@@ -95,10 +96,16 @@ type baseline struct {
 // three headline numbers, and fails when the best wall-clock regresses past
 // the committed baseline by more than regressionTolerance.
 func TestColdIndexNoWallClockRegression(t *testing.T) {
+	if os.Getenv(gateEnv) != "1" {
+		t.Skipf("wall-clock gate requires an isolated run; use %s=1 go test -count=1 -run '^TestColdIndexNoWallClockRegression$' -v ./bench/index-perf/", gateEnv)
+	}
+
 	fixture := fixtureDir(t)
 	runs := runCount()
+	reg := parser.NewRegistry()
+	languages.RegisterAll(reg)
 
-	best := measureColdIndexes(t, fixture, runs)
+	best := measureColdIndexes(t, fixture, runs, reg)
 
 	wallMs := float64(best.WallClockNs) / 1e6
 	t.Logf("cold-index wall-clock:      %.2f ms (best of %d runs)", wallMs, runs)
@@ -145,14 +152,25 @@ func TestColdIndexNoWallClockRegression(t *testing.T) {
 	}
 }
 
-// measureColdIndexes runs runs cold-index passes and returns the pass with the
-// smallest wall-clock.
-func measureColdIndexes(t *testing.T, fixture string, runs int) measurement {
+// measureColdIndexes runs sequential cold-index passes through one registered
+// parser registry and returns the pass with the smallest wall-clock. Production
+// likewise shares one registry across indexers; keeping it live here prevents
+// repeated native query construction and finalizers from perturbing later runs.
+func measureColdIndexes(t *testing.T, fixture string, runs int, reg *parser.Registry) measurement {
 	t.Helper()
-	var best measurement
+	var best, expected measurement
 	for i := 0; i < runs; i++ {
-		m := measureOnce(t, fixture)
-		if i == 0 || m.WallClockNs < best.WallClockNs {
+		m := measureOnce(t, fixture, reg)
+		if i == 0 {
+			best = m
+			expected = m
+			continue
+		}
+		if m.Nodes != expected.Nodes || m.Edges != expected.Edges || m.Files != expected.Files {
+			t.Fatalf("cold index run %d graph mismatch: got %d nodes, %d edges, %d files; first run had %d nodes, %d edges, %d files",
+				i+1, m.Nodes, m.Edges, m.Files, expected.Nodes, expected.Edges, expected.Files)
+		}
+		if m.WallClockNs < best.WallClockNs {
 			best = m
 		}
 	}
@@ -162,12 +180,10 @@ func measureColdIndexes(t *testing.T, fixture string, runs int) measurement {
 // measureOnce performs one full cold index over fixture against a fresh graph
 // and indexer, timing the Index call and capturing allocation and GC deltas
 // across it.
-func measureOnce(t *testing.T, fixture string) measurement {
+func measureOnce(t *testing.T, fixture string, reg *parser.Registry) measurement {
 	t.Helper()
 
 	g := graph.New()
-	reg := parser.NewRegistry()
-	languages.RegisterAll(reg)
 	idx := indexer.New(g, reg, config.Config{}.Index, zap.NewNop())
 
 	// Settle the heap so the deltas attribute allocation and pauses to the

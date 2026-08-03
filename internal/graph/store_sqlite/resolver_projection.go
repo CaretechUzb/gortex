@@ -423,6 +423,49 @@ func (s *Store) FileNodeIdentitiesSeq(repoPrefixes []string) iter.Seq[graph.File
 	)
 }
 
+// GetInEdgeIdentitiesByNodeIDs resolves an explicit incoming-adjacency batch
+// without transferring or decoding edge payload, provenance, or metadata.
+func (s *Store) GetInEdgeIdentitiesByNodeIDs(ids []string) map[string][]graph.EdgeIdentity {
+	uniq := dedupeNonEmpty(ids)
+	out := make(map[string][]graph.EdgeIdentity, len(uniq))
+	for start := 0; start < len(uniq); start += lookupChunkSize {
+		end := minInt(start+lookupChunkSize, len(uniq))
+		chunk := uniq[start:end]
+		query := `SELECT from_id, to_id, kind, file_path, line FROM edges WHERE to_id IN (` +
+			inPlaceholders(len(chunk)) + `)`
+		rows, err := s.db.Query(query, toAnyArgs(chunk)...)
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		for rows.Next() {
+			var identity graph.EdgeIdentity
+			if err := rows.Scan(
+				&identity.From,
+				&identity.To,
+				&identity.Kind,
+				&identity.FilePath,
+				&identity.Line,
+			); err != nil {
+				_ = rows.Close()
+				panicOnFatal(err)
+				return out
+			}
+			out[identity.To] = append(out[identity.To], identity)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			panicOnFatal(err)
+			return out
+		}
+		if err := rows.Close(); err != nil {
+			panicOnFatal(err)
+			return out
+		}
+	}
+	return out
+}
+
 // NodePlacementsByIDs resolves an explicit endpoint batch without decoding
 // names, text, promoted metadata, or the residual metadata blob.
 func (s *Store) NodePlacementsByIDs(ids []string) map[string]graph.NodePlacement {
@@ -470,4 +513,5 @@ var (
 	_ graph.QualifiedNodeIdentitySequencer = (*Store)(nil)
 	_ graph.FileNodeIdentitySequencer      = (*Store)(nil)
 	_ graph.NodePlacementBatchReader       = (*Store)(nil)
+	_ graph.InEdgeIdentityBatchReader      = (*Store)(nil)
 )

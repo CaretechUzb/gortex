@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/intern"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/platform"
@@ -220,6 +221,62 @@ type warmupTimings struct {
 	enrichScheduled int
 }
 
+// warmupDeltaFrontier carries the exact file/derived frontier out of the
+// parallel reconcile pool. Any incomplete result fails closed to the existing
+// repo/global pipeline; an ordinary warm delta stays file-scoped end to end.
+type warmupDeltaFrontier struct {
+	mu    sync.Mutex
+	exact bool
+	plans map[string]indexer.DerivedInvalidationPlan
+}
+
+func newWarmupDeltaFrontier() *warmupDeltaFrontier {
+	return &warmupDeltaFrontier{
+		exact: true,
+		plans: make(map[string]indexer.DerivedInvalidationPlan),
+	}
+}
+
+func (frontier *warmupDeltaFrontier) invalidate() {
+	frontier.mu.Lock()
+	frontier.exact = false
+	frontier.mu.Unlock()
+}
+
+func (frontier *warmupDeltaFrontier) record(result *indexer.IndexResult) {
+	frontier.mu.Lock()
+	defer frontier.mu.Unlock()
+	if result == nil || result.RepoPrefix == "" || result.FullRetrack || len(result.FailedFiles) > 0 {
+		frontier.exact = false
+		return
+	}
+	plan := frontier.plans[result.RepoPrefix]
+	plan.Merge(result.DerivedInvalidation)
+	frontier.plans[result.RepoPrefix] = plan
+}
+
+func (frontier *warmupDeltaFrontier) snapshot(changedRepos int, scopeUnknown bool) (map[string]indexer.DerivedInvalidationPlan, []string, bool) {
+	frontier.mu.Lock()
+	defer frontier.mu.Unlock()
+	plans := make(map[string]indexer.DerivedInvalidationPlan, len(frontier.plans))
+	fileSet := make(map[string]struct{})
+	for prefix, plan := range frontier.plans {
+		plans[prefix] = plan
+		for _, file := range plan.Files {
+			if file != "" {
+				fileSet[file] = struct{}{}
+			}
+		}
+	}
+	files := make([]string, 0, len(fileSet))
+	for file := range fileSet {
+		files = append(files, file)
+	}
+	sort.Strings(files)
+	exact := frontier.exact && !scopeUnknown && changedRepos > 0 && len(plans) == changedRepos
+	return plans, files, exact
+}
+
 // warmupDaemonState performs the per-repo parse loop, resolves references,
 // runs the background enrichment, and brings up the MultiWatcher. Split out
 // from buildDaemonState so the daemon can open its socket and accept
@@ -284,6 +341,39 @@ func (state *daemonState) takeWarmupSnapshotPayloads() (
 	state.snapshotContracts = nil
 	state.snapshotVector = snapshotVector{}
 	return repos, contractEntries, vector
+}
+
+// drainGoModAndFinalizeWarmupBulk keeps the dependency-contract drain and the
+// coordinated bulk finalizer in one explicitly ordered operation. The closures
+// make that ordering testable without constructing a daemon or SQLite store.
+func drainGoModAndFinalizeWarmupBulk(drain func(), finalize func() error) (drainElapsed, finalizeElapsed time.Duration, err error) {
+	drainStart := time.Now()
+	if drain != nil {
+		drain()
+	}
+	drainElapsed = time.Since(drainStart)
+	if finalize == nil {
+		return drainElapsed, 0, nil
+	}
+	finalizeStart := time.Now()
+	err = finalize()
+	return drainElapsed, time.Since(finalizeStart), err
+}
+
+// rotateColdInternGeneration releases the process-wide canonical-string table
+// after a cold producer phase has joined. Returned strings remain valid; the
+// SQLite backend has already copied their values into durable rows, so keeping
+// the table would only pin transient prefixed IDs and paths for process life.
+// Reset does not force a collection — it merely makes the old generation
+// eligible for the runtime's ordinary phase GC and scavenging.
+func rotateColdInternGeneration(logger *zap.Logger, phase string) int {
+	released := intern.Reset()
+	if released > 0 && logger != nil {
+		logger.Info("daemon: released cold intern generation",
+			zap.String("phase", phase),
+			zap.Int("strings", released))
+	}
+	return released
 }
 
 func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) (*indexer.MultiWatcher, *warmupTimings) {
@@ -466,174 +556,209 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// whole-workspace clone pass runs, degrading toward correctness.
 	var changedPrefixes sync.Map
 	var scopeUnknown atomic.Bool
-	coordinatedBulk, _ := state.graph.(graph.CoordinatedBulkLoader)
-	coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
-	defer func() {
-		if coordinatedBulkActive {
-			if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
-				logger.Error("daemon: coordinated cold bulk-load cleanup failed", zap.Error(err))
+	deltaFrontier := newWarmupDeltaFrontier()
+	if err := state.multiIndexer.RunRepositoryTopologyBatch(ctx, func(batchCtx context.Context) error {
+		coordinatedBulk, _ := state.graph.(graph.CoordinatedBulkLoader)
+		coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
+		defer func() {
+			if coordinatedBulkActive {
+				if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+					logger.Error("daemon: coordinated cold bulk-load cleanup failed", zap.Error(err))
+				}
 			}
-		}
-	}()
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for entry := range jobs {
-				// Per-entry panic guard so one repo's crash during
-				// reindex doesn't kill the worker — the bad repo logs
-				// and skips, the worker proceeds to the next job, and
-				// warmup completes.
-				func(entry config.RepoEntry) {
-					defer func() {
-						if r := recover(); r != nil {
-							logger.Error("daemon: warmup repo panic recovered",
-								zap.String("path", entry.Path),
-								zap.Any("panic", r))
-						}
-					}()
-					// Route repos whose nodes came from the snapshot through
-					// ReconcileRepoCtx — it calls IncrementalReindexPaths, which
-					// evicts files deleted while the daemon was down and
-					// re-indexes only files whose mtime changed. Repos not in
-					// the snapshot (newly tracked, or first startup after a
-					// schema bump) fall back to TrackRepoCtx, which does a
-					// full walk. Both paths end with the repo registered on
-					// the MultiIndexer; contract reconciliation is deferred
-					// to the single RunGlobalResolve call below.
-					//
-					// snapshotPartial == true forces the full-walk path even
-					// when prior mtimes exist: the partial-load signal means
-					// the persisted resolution state is no longer trustworthy
-					// (stale edges were dropped because their targets vanished),
-					// and the incremental path only re-resolves files whose
-					// mtime changed — so the dropped edges would never come
-					// back. Without this override every restart progressively
-					// erodes the graph until exported methods show zero
-					// callers despite having dozens of real call sites.
-					repoStart := time.Now()
-					// Prefer mtimes stored in the backend's FileMtime
-					// sidecar table — that lifts the persistence off the
-					// gob snapshot for disk-backed backends, which is the
-					// path that actually rebuilds across restarts. Falls
-					// back to the snapshot's per-repo FileMtimes when the
-					// backend doesn't implement the reader (memory) or
-					// hasn't seen this repo yet.
-					priorMtimes := priorMtimesFromStore(state.graph, state.configManager, entry, logger)
-					if len(priorMtimes) == 0 {
-						priorMtimes = priorMtimesForEntry(snapshotRepos, entry)
-					}
-					if state.snapshotPartial {
-						priorMtimes = nil
-					}
-					// A backend that crossed a schema-rebuild migration rung
-					// (NeedsRebuild) has on-disk rows in the old shape that an
-					// incremental reconcile cannot fix. Drop prior mtimes so every
-					// file re-indexes into the new schema (the nil branch below
-					// runs a full TrackRepoCtx and marks the repo changed, so the
-					// global resolve/derivation passes re-run too). No-op for
-					// backends without the capability and whenever no rebuild rung
-					// was crossed — the common case.
-					if storeNeedsRebuild(state.graph) {
-						if len(priorMtimes) > 0 {
-							logger.Info("daemon: backend signalled schema rebuild; forcing full re-index",
-								zap.String("path", entry.Path))
-						}
-						priorMtimes = nil
-					}
-					pathFn := "track"
-					if priorMtimes != nil {
-						pathFn = "reconcile"
-						res, err := state.multiIndexer.ReconcileRepoCtx(ctx, entry, priorMtimes)
-						switch {
-						case err != nil:
-							logger.Warn("daemon: startup reconcile failed",
-								zap.String("path", entry.Path), zap.Error(err))
-							// Treat a failed reconcile as "changed" so the global
-							// passes still run — degrade toward correctness, not
-							// toward the fast path, when we can't trust the delta.
-							changedRepos.Add(1)
-							scopeUnknown.Store(true)
-						case res != nil && (res.StaleFileCount > 0 || res.DeletedFileCount > 0 || len(res.FailedFiles) > 0 || res.FullRetrack):
-							changedRepos.Add(1)
-							filesReindexed.Add(int64(reconcileFileCount(res)))
-							if res.RepoPrefix != "" {
-								changedPrefixes.Store(res.RepoPrefix, struct{}{})
-							} else {
-								scopeUnknown.Store(true)
-							}
-						default:
-							// Warm no-op path: the repo re-indexed nothing, so its
-							// graph is served straight from the persisted store.
-							// Vet the freshly-recomputed per-repo counts against
-							// what the snapshot recorded — a material shortfall
-							// means the store came back shape-degraded relative to
-							// the snapshot metadata (a persisted resolution
-							// regression). Mark the repo changed so the
-							// end-of-warmup global re-resolve + derivation passes
-							// run for it instead of silently serving the shrunken
-							// graph, and surface the event so a ratchet can't hide
-							// behind an all-green index_health.
-							if res != nil && bootShapeShortfall(snapshotRepos, res.RepoPrefix, res.NodeCount, res.EdgeCount) {
-								indexer.RecordResolutionRegression()
-								logger.Warn("daemon: boot shape-degradation guard — repo graph materially short of snapshot; re-running resolution",
-									zap.String("prefix", res.RepoPrefix),
-									zap.Int("live_nodes", res.NodeCount),
-									zap.Int("live_edges", res.EdgeCount))
+		}()
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for entry := range jobs {
+					// Per-entry panic guard so one repo's crash during
+					// reindex doesn't kill the worker — the bad repo logs
+					// and skips, the worker proceeds to the next job, and
+					// warmup completes.
+					func(entry config.RepoEntry) {
+						defer func() {
+							if r := recover(); r != nil {
+								logger.Error("daemon: warmup repo panic recovered",
+									zap.String("path", entry.Path),
+									zap.Any("panic", r))
 								changedRepos.Add(1)
+								scopeUnknown.Store(true)
+								deltaFrontier.invalidate()
+							}
+						}()
+						// Route repos whose nodes came from the snapshot through
+						// ReconcileRepoCtx — it calls IncrementalReindexPaths, which
+						// evicts files deleted while the daemon was down and
+						// re-indexes only files whose mtime changed. Repos not in
+						// the snapshot (newly tracked, or first startup after a
+						// schema bump) fall back to TrackRepoCtx, which does a
+						// full walk. Both paths end with the repo registered on
+						// the MultiIndexer; contract reconciliation is deferred
+						// to the single RunGlobalResolve call below.
+						//
+						// snapshotPartial == true forces the full-walk path even
+						// when prior mtimes exist: the partial-load signal means
+						// the persisted resolution state is no longer trustworthy
+						// (stale edges were dropped because their targets vanished),
+						// and the incremental path only re-resolves files whose
+						// mtime changed — so the dropped edges would never come
+						// back. Without this override every restart progressively
+						// erodes the graph until exported methods show zero
+						// callers despite having dozens of real call sites.
+						repoStart := time.Now()
+						// Prefer mtimes stored in the backend's FileMtime
+						// sidecar table — that lifts the persistence off the
+						// gob snapshot for disk-backed backends, which is the
+						// path that actually rebuilds across restarts. Falls
+						// back to the snapshot's per-repo FileMtimes when the
+						// backend doesn't implement the reader (memory) or
+						// hasn't seen this repo yet.
+						priorMtimes := priorMtimesFromStore(state.graph, state.configManager, entry, logger)
+						if len(priorMtimes) == 0 {
+							priorMtimes = priorMtimesForEntry(snapshotRepos, entry)
+						}
+						if state.snapshotPartial {
+							priorMtimes = nil
+						}
+						// A backend that crossed a schema-rebuild migration rung
+						// (NeedsRebuild) has on-disk rows in the old shape that an
+						// incremental reconcile cannot fix. Drop prior mtimes so every
+						// file re-indexes into the new schema (the nil branch below
+						// runs a full TrackRepoCtx and marks the repo changed, so the
+						// global resolve/derivation passes re-run too). No-op for
+						// backends without the capability and whenever no rebuild rung
+						// was crossed — the common case.
+						if storeNeedsRebuild(state.graph) {
+							if len(priorMtimes) > 0 {
+								logger.Info("daemon: backend signalled schema rebuild; forcing full re-index",
+									zap.String("path", entry.Path))
+							}
+							priorMtimes = nil
+						}
+						pathFn := "track"
+						if priorMtimes != nil {
+							pathFn = "reconcile"
+							res, err := state.multiIndexer.ReconcileRepoCtx(batchCtx, entry, priorMtimes)
+							switch {
+							case err != nil:
+								logger.Warn("daemon: startup reconcile failed",
+									zap.String("path", entry.Path), zap.Error(err))
+								// Treat a failed reconcile as "changed" so the global
+								// passes still run — degrade toward correctness, not
+								// toward the fast path, when we can't trust the delta.
+								changedRepos.Add(1)
+								scopeUnknown.Store(true)
+								deltaFrontier.invalidate()
+							case res != nil && (res.StaleFileCount > 0 || res.DeletedFileCount > 0 || len(res.FailedFiles) > 0 || res.FullRetrack):
+								changedRepos.Add(1)
+								filesReindexed.Add(int64(reconcileFileCount(res)))
+								deltaFrontier.record(res)
 								if res.RepoPrefix != "" {
 									changedPrefixes.Store(res.RepoPrefix, struct{}{})
 								} else {
 									scopeUnknown.Store(true)
 								}
+							default:
+								// Warm no-op path: the repo re-indexed nothing, so its
+								// graph is served straight from the persisted store.
+								// Vet the freshly-recomputed per-repo counts against
+								// what the snapshot recorded — a material shortfall
+								// means the store came back shape-degraded relative to
+								// the snapshot metadata (a persisted resolution
+								// regression). Mark the repo changed so the
+								// end-of-warmup global re-resolve + derivation passes
+								// run for it instead of silently serving the shrunken
+								// graph, and surface the event so a ratchet can't hide
+								// behind an all-green index_health.
+								if res != nil && bootShapeShortfall(snapshotRepos, res.RepoPrefix, res.NodeCount, res.EdgeCount) {
+									indexer.RecordResolutionRegression()
+									logger.Warn("daemon: boot shape-degradation guard — repo graph materially short of snapshot; re-running resolution",
+										zap.String("prefix", res.RepoPrefix),
+										zap.Int("live_nodes", res.NodeCount),
+										zap.Int("live_edges", res.EdgeCount))
+									changedRepos.Add(1)
+									deltaFrontier.invalidate()
+									if res.RepoPrefix != "" {
+										changedPrefixes.Store(res.RepoPrefix, struct{}{})
+									} else {
+										scopeUnknown.Store(true)
+									}
+								}
+							}
+						} else {
+							// No prior mtimes → full cold (re)index of this repo,
+							// which is "changed" by definition.
+							deltaFrontier.invalidate()
+							changedRepos.Add(1)
+							if res, err := state.multiIndexer.TrackRepoCtx(batchCtx, entry); err != nil {
+								logger.Warn("daemon: startup track failed",
+									zap.String("path", entry.Path), zap.Error(err))
+								scopeUnknown.Store(true)
+							} else if res != nil && res.RepoPrefix != "" {
+								// A cold TrackRepoCtx is itself a full retrack — its
+								// FileCount is the whole repo's file-level work.
+								filesReindexed.Add(int64(res.FileCount))
+								changedPrefixes.Store(res.RepoPrefix, struct{}{})
+							} else {
+								scopeUnknown.Store(true)
 							}
 						}
-					} else {
-						// No prior mtimes → full cold (re)index of this repo,
-						// which is "changed" by definition.
-						changedRepos.Add(1)
-						if res, err := state.multiIndexer.TrackRepoCtx(ctx, entry); err != nil {
-							logger.Warn("daemon: startup track failed",
-								zap.String("path", entry.Path), zap.Error(err))
-							scopeUnknown.Store(true)
-						} else if res != nil && res.RepoPrefix != "" {
-							// A cold TrackRepoCtx is itself a full retrack — its
-							// FileCount is the whole repo's file-level work.
-							filesReindexed.Add(int64(res.FileCount))
-							changedPrefixes.Store(res.RepoPrefix, struct{}{})
-						} else {
-							scopeUnknown.Store(true)
+						elapsed := time.Since(repoStart)
+						if elapsed > 2*time.Second {
+							logger.Info("daemon: warmup repo elapsed",
+								zap.String("path", entry.Path),
+								zap.String("path_fn", pathFn),
+								zap.Duration("elapsed", elapsed))
 						}
-					}
-					elapsed := time.Since(repoStart)
-					if elapsed > 2*time.Second {
-						logger.Info("daemon: warmup repo elapsed",
-							zap.String("path", entry.Path),
-							zap.String("path_fn", pathFn),
-							zap.Duration("elapsed", elapsed))
-					}
-				}(entry)
-			}
-		}()
-	}
-	for _, entry := range repos {
-		jobs <- entry
-	}
-	close(jobs)
-	wg.Wait()
-	// Every reconcile and shape guard has finished; release the restored
-	// per-repository mtime maps before the later resolver/enrichment phases.
-	snapshotRepos = nil
-	if coordinatedBulkActive {
-		flushStart := time.Now()
-		if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
-			logger.Error("daemon: coordinated cold bulk-load finalize failed", zap.Error(err))
-		} else {
-			logger.Info("daemon: coordinated cold bulk-load complete",
-				zap.Duration("elapsed", time.Since(flushStart)))
+					}(entry)
+				}
+			}()
 		}
-		coordinatedBulkActive = false
+		for _, entry := range repos {
+			jobs <- entry
+		}
+		close(jobs)
+		wg.Wait()
+
+		// Materialize go.mod dependency contract nodes while the coordinated
+		// bulk connection is still pinned. The per-indexer drain is idempotent,
+		// so RunPreEnrichResolve retains the same fallback for non-warmup paths
+		// and becomes a cheap no-op here. Keeping these writes ahead of the
+		// final seal includes them in bulk index creation, checkpointing, and
+		// planner statistics instead of reopening ordinary write transactions
+		// immediately after a large cold load.
+		var finalizeBulk func() error
+		if coordinatedBulkActive {
+			finalizeBulk = coordinatedBulk.EndCoordinatedBulkLoad
+		}
+		goModElapsed, flushElapsed, finalizeErr := drainGoModAndFinalizeWarmupBulk(
+			state.multiIndexer.RunDeferredGoModAll,
+			finalizeBulk,
+		)
+		logger.Info("daemon: warmup pre-bulk go.mod drain complete",
+			zap.Duration("elapsed", goModElapsed))
+
+		// Every reconcile and shape guard has finished; release the restored
+		// per-repository mtime maps before the later resolver/enrichment phases.
+		snapshotRepos = nil
+		if coordinatedBulkActive {
+			if finalizeErr != nil {
+				logger.Error("daemon: coordinated cold bulk-load finalize failed", zap.Error(finalizeErr))
+			} else {
+				logger.Info("daemon: coordinated cold bulk-load complete",
+					zap.Duration("elapsed", flushElapsed))
+			}
+			coordinatedBulkActive = false
+		}
+		return nil
+	}); err != nil {
+		logger.Error("daemon: repository topology batch failed", zap.Error(err))
 	}
+	// RunRepositoryTopologyBatch has joined every parse worker and finalized
+	// the coordinated bulk loader. No producer still needs the canonical
+	// prefixed strings retained by the cold interner generation.
+	rotateColdInternGeneration(logger, "parallel_parse")
 	timings.parse = time.Since(phaseStart)
 	timings.filesReindexed = int(filesReindexed.Load())
 	logger.Info("daemon: warmup phase done",
@@ -674,6 +799,20 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		}
 		return true
 	})
+	needsRebuild := storeNeedsRebuild(state.graph)
+	forcedFullResolve := warmupFullResolveForced()
+	deltaPlans, deltaFiles, exactWarmDelta := deltaFrontier.snapshot(
+		int(changedRepos.Load()), scopeUnknown.Load(),
+	)
+	// The exact file frontier must not bypass lifecycle-wide safety signals or
+	// the operator override. These conditions already force a full master
+	// scope below; apply them to the branch selector too.
+	exactWarmDelta = exactWarmDelta && len(deltaFiles) > 0 && !state.snapshotPartial && !needsRebuild && !forcedFullResolve
+	logger.Info("daemon: warmup delta frontier",
+		zap.Bool("exact", exactWarmDelta),
+		zap.Bool("forced_full_resolve", forcedFullResolve),
+		zap.Int("repos", len(deltaPlans)),
+		zap.Int("files", len(deltaFiles)))
 
 	// Resolve scope: restrict the warm-restart master resolve to the repos
 	// that re-indexed, but only when every whole-graph-safety precondition
@@ -682,7 +821,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// global passes switch is honoured downstream in runMasterResolve,
 	// matching ArmBatchScope.
 	resolveScope := warmupResolveScope(changed, len(repos), anyChanged,
-		scopeUnknown.Load(), state.snapshotPartial, storeNeedsRebuild(state.graph))
+		scopeUnknown.Load(), state.snapshotPartial, needsRebuild)
 
 	// Resume enrichment for any repo a prior process left partial / abandoned.
 	// Seeded BEFORE the resolve phase so the overlapped enrichment pool below
@@ -694,23 +833,22 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			zap.Int("repos_pending_enrich", enrichPending))
 	}
 
-	// Overlap the enrichment pool with the resolve phase: the pool's COMPUTE
-	// (go/packages loads, tree-sitter parses) reads no graph state, so it
-	// runs on the cores the resolver leaves idle; every provider's graph
-	// APPLY parks on the apply gate until the resolve phase completes, so no
-	// giant apply can starve the resolver on the shared ResolveMutex
-	// (measured: an ungated overlap stretched the resolve compute loop 289s →
-	// 2,193s). GORTEX_ENRICH_OVERLAP=0 restores strictly-sequential ordering.
+	// Keep enrichment sequential by default. The resolver already saturates
+	// the host on a cold workspace, while overlapped Go enrichment can retain
+	// complete compiler programs behind this apply gate for the duration of
+	// resolution. That measured as several GiB of extra footprint for at most
+	// a few seconds of useful compute overlap. Operators can explicitly opt in
+	// with GORTEX_ENRICH_OVERLAP=1 while comparing unusual workloads.
 	var deferredRun *indexer.DeferredPassesRun
 	openApplyGate := func() {}
-	if (anyChanged || enrichPending > 0) && os.Getenv("GORTEX_ENRICH_OVERLAP") != "0" {
+	if (anyChanged || enrichPending > 0) && enrichmentOverlapEnabled() {
 		applyGate := make(chan struct{})
 		openApplyGate = sync.OnceFunc(func() {
-			// Re-base the deferred window's unresolved-write counter before
-			// any parked apply can run: the resolve phase's own in-window
-			// writes (guard reverts, cross-repo binds) are its own to handle
-			// and must not force the post-enrichment fallback resolve.
-			deferredRun.SnapshotUnresolvedBase()
+			// Open the mutation receipt only after pre-enrichment resolution has
+			// settled and strictly before any parked semantic apply can run. This
+			// excludes resolver writes that used to void every overlap receipt,
+			// while retaining exact coverage of applies and contract commits.
+			deferredRun.BeginApplyMutationReceipt()
 			logger.Info("daemon: enrichment apply gate opened")
 			close(applyGate)
 		})
@@ -728,9 +866,13 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// cross-repo resolver. On the warm-restart fast path nothing changed, so
 	// the persisted graph already carries resolved edges and we skip straight
 	// to marking ready.
+	resolveOK := true
 	if anyChanged {
 		phaseStart = time.Now()
+		publishStart := time.Now()
 		publishReadinessPhase(state, "resolve", false, nil)
+		logger.Info("daemon: resolve readiness phase published",
+			zap.Duration("elapsed", time.Since(publishStart)))
 		// markReady fires at the master resolver's compute-done point — the
 		// earliest moment same-repo references are queryable — instead of
 		// after the refinement tail + cross-repo pass (minutes on a large
@@ -741,7 +883,18 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		// and cross-repo passes starved cross-repo to a standstill
 		// (measured: 1,049s for a pass that runs in ~38s uncontended). The
 		// gate opens right after this call returns.
-		state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope, markReady)
+		var resolveErr error
+		if exactWarmDelta {
+			resolveErr = state.multiIndexer.RunPreEnrichResolveFiles(ctx, deltaFiles, markReady)
+		} else {
+			resolveErr = state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope, markReady)
+		}
+		if resolveErr != nil {
+			resolveOK = false
+			exactWarmDelta = false
+			scopeUnknown.Store(true)
+			logger.Error("daemon: warmup resolve failed", zap.Error(resolveErr))
+		}
 		timings.resolve = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "resolve"),
@@ -759,7 +912,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// path): the graph is queryable. Flip ready before the multi-minute
 	// enrichment so clients can start issuing queries immediately. Everything
 	// below runs in the background after ready and finishes at MarkEnriched.
-	if markReady != nil {
+	if markReady != nil && resolveOK {
 		markReady()
 	}
 
@@ -769,14 +922,20 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// re-runs the master resolver to lift placeholder edges the enrichment +
 	// contract passes add. When the pool was started ahead of resolve, this
 	// block only joins the surviving lanes and runs the tail.
+	var deferredResult indexer.DeferredPassesResult
 	if anyChanged || enrichPending > 0 {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "deferred_passes_all", true, nil)
 		if deferredRun != nil {
-			timings.enrichScheduled = deferredRun.FinishTail()
+			deferredResult = deferredRun.FinishTailResult()
 		} else {
-			timings.enrichScheduled = state.multiIndexer.RunDeferredPassesAll(ctx)
+			deferredResult = state.multiIndexer.RunDeferredPassesAllResult(ctx)
 		}
+		// Deferred module/contract extraction can mint a small second wave of
+		// prefixed strings after the main parse generation was released. Every
+		// deferred lane is joined here, so rotate that tail generation too.
+		rotateColdInternGeneration(logger, "deferred_passes_all")
+		timings.enrichScheduled = deferredResult.EnrichScheduled
 		timings.enrich = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "deferred_passes_all"),
@@ -841,31 +1000,60 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// every file is touched. Idempotent — re-running on a stamped
 	// graph is a no-op.
 	phaseStart = time.Now()
-	if nodes, conts := state.multiIndexer.BackfillWorkspaceSlugs(); nodes+conts > 0 {
+	backfillRevisionBefore, backfillRevisionBeforeKnown := state.multiIndexer.GraphMutationRevision()
+	backfilledNodes, backfilledContracts, backfillResolutionAffected := state.multiIndexer.BackfillWorkspaceSlugsWithImpact()
+	backfillRevisionAfter, backfillRevisionAfterKnown := state.multiIndexer.GraphMutationRevision()
+	if backfilledNodes+backfilledContracts > 0 {
 		logger.Info("daemon: backfilled workspace/project slugs from .gortex.yaml",
-			zap.Int("nodes", nodes),
-			zap.Int("contracts", conts),
+			zap.Int("nodes", backfilledNodes),
+			zap.Int("contracts", backfilledContracts),
+			zap.Int("resolution_affected", backfillResolutionAffected),
 			zap.Duration("elapsed", time.Since(phaseStart)))
 	}
 
-	// Run a cross-repo resolution pass once warmup has stamped the
-	// workspace slugs. Files touched by IncrementalReindexPaths already
-	// re-resolve via the per-repo Resolver; this catches cross-repo
-	// edges in unchanged files plus stamps cross_workspace_deps
-	// eligibility on stubs. Mirrors what MultiIndexer.IndexAll does
-	// for a fresh-start daemon (where there's no snapshot to reconcile
-	// against). After resolution, contract bridge edges may have
-	// changed too, so ReconcileContractEdges runs again.
-	if anyChanged {
+	// Run a cross-repo resolution pass once warmup has stamped the workspace
+	// slugs. The deferred tail may have completed catch-up either from an exact
+	// receipt frontier or through its fail-closed full fallback. In both cases
+	// the later full sweep is redundant only while the graph remains at the
+	// revision captured at completion. Unsupported revisions, an interleaving
+	// writer outside the bounded backfill, a failed pass, or a slug stamp that
+	// changes effective workspace eligibility retain the historical full safety
+	// sweep; physical-only stamps are rebased and contract bridges reconcile
+	// separately.
+	currentMutationRevision, currentMutationRevisionKnown := state.multiIndexer.GraphMutationRevision()
+	globalResolveAction := selectWarmGlobalResolveAction(anyChanged, warmGlobalResolveSafety{
+		resolveOK:                     resolveOK,
+		deferredCrossRepoComplete:     deferredResult.CrossRepoComplete,
+		deferredMutationRevision:      deferredResult.CrossRepoMutationRevision,
+		deferredMutationRevisionKnown: deferredResult.CrossRepoMutationRevisionKnown,
+		currentMutationRevision:       currentMutationRevision,
+		currentMutationRevisionKnown:  currentMutationRevisionKnown,
+		backfillRevisionBefore:        backfillRevisionBefore,
+		backfillRevisionBeforeKnown:   backfillRevisionBeforeKnown,
+		backfillRevisionAfter:         backfillRevisionAfter,
+		backfillRevisionAfterKnown:    backfillRevisionAfterKnown,
+		backfillResolutionAffected:    backfillResolutionAffected,
+	}, backfilledContracts)
+	if globalResolveAction != warmGlobalResolveNone {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "global_resolve", true, nil)
-		state.multiIndexer.RunGlobalResolve()
+		switch globalResolveAction {
+		case warmGlobalResolveContracts:
+			reconciled := state.multiIndexer.ReconcileContractEdges()
+			logger.Info("daemon: contract-edge catch-up complete; skipped full cross-repo sweep",
+				zap.Int("contract_edges", reconciled))
+		case warmGlobalResolveFull:
+			state.multiIndexer.RunGlobalResolve()
+		}
+		fullCrossRepo := globalResolveAction == warmGlobalResolveFull
 		timings.globalResolve = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "global_resolve"),
+			zap.Bool("full_cross_repo", fullCrossRepo),
 			zap.Duration("elapsed", time.Since(phaseStart)))
 		publishReadinessPhase(state, "global_resolve_done", true, map[string]any{
-			"elapsed_ms": time.Since(phaseStart).Milliseconds(),
+			"elapsed_ms":      time.Since(phaseStart).Milliseconds(),
+			"full_cross_repo": fullCrossRepo,
 		})
 	}
 
@@ -883,7 +1071,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// (scopeUnknown) so a repo whose clones genuinely need recomputing is
 	// never skipped. ArmBatchScope is a no-op when scoped global passes are
 	// disabled or the set is empty (run every repo, the prior behaviour).
-	if anyChanged && !scopeUnknown.Load() {
+	if anyChanged && !exactWarmDelta && !scopeUnknown.Load() {
 		state.multiIndexer.ArmBatchScope(changed)
 		// Full-coverage attestation: every tracked repository re-indexed in
 		// this warmup (a cold index, or a warm restart that reconciled the
@@ -899,10 +1087,35 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 
 	phaseStart = time.Now()
 	publishReadinessPhase(state, "end_batch", true, nil)
-	if anyChanged {
-		state.multiIndexer.EndBatch()
-	} else {
+	switch {
+	case !anyChanged:
 		state.multiIndexer.ResetBatch()
+	case exactWarmDelta:
+		// Clear the outer batch flags first, then execute only the exact
+		// invalidation families carried by the reconciled files.
+		state.multiIndexer.ResetBatch()
+		report := state.multiIndexer.RunIncrementalDerivedPasses(ctx, deltaPlans)
+		logger.Info("daemon: exact warm derived passes complete", zap.Any("report", report))
+	default:
+		state.multiIndexer.EndBatch()
+	}
+	postBatchNodes, postBatchContracts, postBatchResolutionAffected := state.multiIndexer.BackfillWorkspaceSlugsWithImpact()
+	if postBatchNodes+postBatchContracts > 0 {
+		logger.Info("daemon: backfilled workspace/project slugs after derived passes",
+			zap.Int("nodes", postBatchNodes),
+			zap.Int("contracts", postBatchContracts),
+			zap.Int("resolution_affected", postBatchResolutionAffected))
+	}
+	switch selectWarmGlobalResolveAction(false, warmGlobalResolveSafety{
+		backfillResolutionAffected: postBatchResolutionAffected,
+	}, postBatchContracts) {
+	case warmGlobalResolveContracts:
+		reconciled := state.multiIndexer.ReconcileContractEdges()
+		logger.Info("daemon: reconciled post-batch contract edges",
+			zap.Int("contract_edges", reconciled))
+	case warmGlobalResolveFull:
+		state.multiIndexer.RunGlobalResolve()
+		logger.Info("daemon: post-batch workspace eligibility change forced full cross-repo catch-up")
 	}
 	timings.endBatch = time.Since(phaseStart)
 	logger.Info("daemon: warmup phase done",
@@ -1159,6 +1372,70 @@ func reconcileFileCount(res *indexer.IndexResult) int {
 func storeNeedsRebuild(g any) bool {
 	rb, ok := g.(interface{ NeedsRebuild() bool })
 	return ok && rb.NeedsRebuild()
+}
+
+type warmGlobalResolveSafety struct {
+	resolveOK                     bool
+	deferredCrossRepoComplete     bool
+	deferredMutationRevision      uint64
+	deferredMutationRevisionKnown bool
+	currentMutationRevision       uint64
+	currentMutationRevisionKnown  bool
+	backfillRevisionBefore        uint64
+	backfillRevisionBeforeKnown   bool
+	backfillRevisionAfter         uint64
+	backfillRevisionAfterKnown    bool
+	backfillResolutionAffected    int
+}
+
+type warmGlobalResolveAction uint8
+
+const (
+	warmGlobalResolveNone warmGlobalResolveAction = iota
+	warmGlobalResolveContracts
+	warmGlobalResolveFull
+)
+
+// canSkipWarmGlobalResolve requires both successful earlier resolution and a
+// generation proof around the bounded workspace-slug backfill. Physical
+// project/default-workspace stamps may advance a backend's coarse revision but
+// preserve cross-repo eligibility, so the deferred frontier must match the
+// pre-backfill revision and the post-backfill revision must still be current.
+// Unknown revision capability and any writer outside that interval fail closed.
+func canSkipWarmGlobalResolve(s warmGlobalResolveSafety) bool {
+	return s.resolveOK &&
+		s.deferredCrossRepoComplete &&
+		s.deferredMutationRevisionKnown &&
+		s.currentMutationRevisionKnown &&
+		s.backfillRevisionBeforeKnown &&
+		s.backfillRevisionAfterKnown &&
+		s.deferredMutationRevision == s.backfillRevisionBefore &&
+		s.backfillRevisionAfter == s.currentMutationRevision &&
+		s.backfillResolutionAffected == 0
+}
+
+func selectWarmGlobalResolveAction(anyChanged bool, safety warmGlobalResolveSafety, backfilledContracts int) warmGlobalResolveAction {
+	if safety.backfillResolutionAffected > 0 {
+		return warmGlobalResolveFull
+	}
+	if anyChanged {
+		if canSkipWarmGlobalResolve(safety) {
+			return warmGlobalResolveContracts
+		}
+		return warmGlobalResolveFull
+	}
+	if backfilledContracts > 0 {
+		return warmGlobalResolveContracts
+	}
+	return warmGlobalResolveNone
+}
+
+// enrichmentOverlapEnabled reports whether the operator explicitly enabled
+// cold-warmup enrichment compute during the resolver phase. Sequential is the
+// safe default: on a saturated workspace overlap increases both resolver time
+// and retained compiler-program memory.
+func enrichmentOverlapEnabled() bool {
+	return os.Getenv("GORTEX_ENRICH_OVERLAP") == "1"
 }
 
 // warmupFullResolveForced reports whether the operator pinned the warm-restart

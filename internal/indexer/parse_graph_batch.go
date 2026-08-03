@@ -133,6 +133,7 @@ func (b *parseGraphBatch) flushLocked() {
 			entry.onDurable()
 		}
 	}
+	clear(b.pending)
 	b.pending = b.pending[:0]
 	b.nodeCount = 0
 	b.edgeCount = 0

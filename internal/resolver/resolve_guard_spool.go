@@ -255,6 +255,12 @@ func (r *Resolver) warmGuardLookupCache(jobs []reindexJob) {
 			namesByRepo[source.RepoPrefix] = names
 		}
 		names[target.Name] = struct{}{}
+		// loneMemberDefnKeep also probes the receiver's declared type through
+		// hasInRepoType. Preload that name in the same repository batch so the
+		// guard never degrades into one SQLite point lookup per member edge.
+		if receiverType := edgeReceiverType(jobs[i].edge); receiverType != "" {
+			names[receiverType] = struct{}{}
+		}
 	}
 	repos := make([]string, 0, len(namesByRepo))
 	for repo := range namesByRepo {

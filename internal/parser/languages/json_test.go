@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -24,6 +25,8 @@ func TestJSONExtractor_Basics(t *testing.T) {
 
 	res, err := e.Extract("package.json", src)
 	require.NoError(t, err)
+	require.NotEmpty(t, res.Nodes)
+	assert.Equal(t, 9, res.Nodes[0].EndLine)
 
 	var gotName, gotVersion, gotScripts, gotBuildLeak bool
 	for _, n := range res.Nodes {
@@ -53,4 +56,42 @@ func TestJSONExtractor_EmptyInput(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, res.Nodes, 1)
 	assert.Equal(t, graph.KindFile, res.Nodes[0].Kind)
+	assert.Equal(t, 1, res.Nodes[0].EndLine)
+}
+
+func TestJSONExtractor_LineCountingDoesNotCopySource(t *testing.T) {
+	extractor := NewJSONExtractor()
+	small := []byte("\n")
+	large := bytes.Repeat([]byte("\n"), 1<<20)
+
+	smallAllocs := testing.AllocsPerRun(5, func() {
+		_, err := extractor.Extract("small.json", small)
+		require.NoError(t, err)
+	})
+	largeAllocs := testing.AllocsPerRun(5, func() {
+		_, err := extractor.Extract("large.json", large)
+		require.NoError(t, err)
+	})
+
+	assert.LessOrEqual(t, largeAllocs, smallAllocs+1,
+		"line counting allocations must not scale with source size")
+}
+
+func TestJSONExtractor_NestedValuesDoNotAllocateStrings(t *testing.T) {
+	extractor := NewJSONExtractor()
+	small := []byte(`{"items":["value"]}`)
+	large := append([]byte(`{"items":[`), bytes.Repeat([]byte(`"value",`), 1<<15)...)
+	large = append(large, []byte(`null]}`)...)
+
+	smallAllocs := testing.AllocsPerRun(5, func() {
+		_, err := extractor.Extract("small.json", small)
+		require.NoError(t, err)
+	})
+	largeAllocs := testing.AllocsPerRun(5, func() {
+		_, err := extractor.Extract("large.json", large)
+		require.NoError(t, err)
+	})
+
+	assert.LessOrEqual(t, largeAllocs, smallAllocs+1,
+		"nested JSON values must remain byte windows rather than allocated strings")
 }

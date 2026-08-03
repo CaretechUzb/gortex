@@ -125,117 +125,7 @@ func processExecMechanism(callee string) string {
 // idempotent — AddEdge dedupes by edge key and a reindex re-derives from
 // the current base edges. Returns per-kind counts for telemetry.
 func synthesizeCapabilityEdges(g graph.Store) (readsEnv, execProc, fieldAccess int) {
-	if g == nil {
-		return 0, 0, 0
-	}
-	g.ResolveMutex().Lock()
-	defer g.ResolveMutex().Unlock()
-
-	type edgeSpec struct {
-		from, to, origin, file string
-		line                   int
-		kind                   graph.EdgeKind
-		meta                   map[string]any
-	}
-	var pending []edgeSpec
-	seen := map[string]bool{}
-	add := func(from, to string, kind graph.EdgeKind, origin, file string, line int, meta map[string]any) bool {
-		key := string(kind) + "\x00" + from + "\x00" + to
-		// Indirect mutations carry a `via`; key on it so a direct and an
-		// indirect write to the same field from the same method coexist as
-		// distinct-provenance edges.
-		if v, _ := meta["via"].(string); v != "" {
-			key += "\x00" + v
-		}
-		if seen[key] {
-			return false
-		}
-		seen[key] = true
-		pending = append(pending, edgeSpec{from, to, origin, file, line, kind, meta})
-		return true
-	}
-
-	// reads_env — parallel to reads_config edges that target an env key.
-	for e := range g.EdgesByKind(graph.EdgeReadsConfig) {
-		if e == nil || !strings.Contains(e.To, "cfg::env::") {
-			continue
-		}
-		if add(e.From, e.To, graph.EdgeReadsEnv, graph.OriginASTResolved, e.FilePath, e.Line, nil) {
-			readsEnv++
-		}
-	}
-
-	// accesses_field — reads / writes that land on a struct field. Build
-	// the KindField id set once instead of a GetNode per edge (cheap on
-	// the disk-backed store).
-	fieldIDs := map[string]bool{}
-	for n := range g.NodesByKind(graph.KindField) {
-		if n != nil {
-			fieldIDs[n.ID] = true
-		}
-	}
-	for _, base := range []graph.EdgeKind{graph.EdgeReads, graph.EdgeWrites} {
-		mode := "read"
-		if base == graph.EdgeWrites {
-			mode = "write"
-		}
-		for e := range g.EdgesByKind(base) {
-			if e == nil || !fieldIDs[e.To] {
-				continue
-			}
-			if add(e.From, e.To, graph.EdgeAccessesField, graph.OriginASTResolved, e.FilePath, e.Line, map[string]any{"access": mode}) {
-				fieldAccess++
-			}
-		}
-	}
-
-	// Indirect field mutations: `s.counter.Increment()` mutates counter, and
-	// `s.helper()` mutates whatever helper mutates — attributed transitively.
-	// Lower (ast_inferred) tier than the direct writes above; tagged indirect
-	// + via so it's distinguishable and downgradeable.
-	for _, s := range indirectMutationEdges(g) {
-		if add(s.from, s.to, graph.EdgeAccessesField, graph.OriginASTInferred, s.file, s.line,
-			map[string]any{"access": "write", "indirect": true, "via": s.via}) {
-			fieldAccess++
-		}
-	}
-
-	// executes_process — calls to a known process-exec API, pointed at a
-	// shared synthetic process node per mechanism.
-	procNodes := map[string]*graph.Node{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if e == nil {
-			continue
-		}
-		mech := processExecMechanism(e.To)
-		if mech == "" {
-			continue
-		}
-		procID := "string::process::" + mech
-		if procNodes[procID] == nil {
-			procNodes[procID] = &graph.Node{
-				ID: procID, Kind: graph.KindString, Name: mech,
-				Meta: map[string]any{"context": "process", "mechanism": mech},
-			}
-		}
-		if add(e.From, procID, graph.EdgeExecutesProcess, graph.OriginASTInferred, e.FilePath, e.Line, nil) {
-			execProc++
-		}
-	}
-
-	nodes := make([]*graph.Node, 0, len(procNodes))
-	for _, n := range procNodes {
-		nodes = append(nodes, n)
-	}
-	edges := make([]*graph.Edge, 0, len(pending))
-	for _, s := range pending {
-		edges = append(edges, &graph.Edge{
-			From: s.from, To: s.to, Kind: s.kind,
-			FilePath: s.file, Line: s.line, Origin: s.origin, Meta: s.meta,
-		})
-	}
-	g.AddBatch(nodes, edges)
-	return readsEnv, execProc, fieldAccess
+	return synthesizeCapabilityEdgesScoped(g, nil)
 }
 
 // synthesizeCapabilityEdgesScoped is synthesizeCapabilityEdges restricted to the
@@ -258,114 +148,159 @@ func synthesizeCapabilityEdgesScoped(g graph.Store, changedPrefixes map[string]b
 	if g == nil {
 		return 0, 0, 0
 	}
-	if changedPrefixes == nil && len(changedFiles) == 0 {
-		return synthesizeCapabilityEdges(g)
-	}
 	g.ResolveMutex().Lock()
 	defer g.ResolveMutex().Unlock()
 	if len(changedFiles) > 0 {
 		return synthesizeCapabilityEdgesForFiles(g, changedFiles)
 	}
 
+	type edgeKey struct {
+		from, to, via string
+		kind          graph.EdgeKind
+	}
 	type edgeSpec struct {
 		from, to, origin, file string
 		line                   int
 		kind                   graph.EdgeKind
 		meta                   map[string]any
 	}
+	type sourceOrder struct {
+		repo     string
+		identity graph.EdgeIdentity
+	}
+	type baseSpec struct {
+		edgeSpec
+		source        sourceOrder
+		access        string
+		procMechanism string
+	}
+
 	var pending []edgeSpec
-	seen := map[string]bool{}
+	seen := map[edgeKey]bool{}
 	add := func(from, to string, kind graph.EdgeKind, origin, file string, line int, meta map[string]any) bool {
-		key := string(kind) + "\x00" + from + "\x00" + to
-		if v, _ := meta["via"].(string); v != "" {
-			key += "\x00" + v
+		key := edgeKey{from: from, to: to, kind: kind}
+		if via, _ := meta["via"].(string); via != "" {
+			key.via = via
 		}
 		if seen[key] {
 			return false
 		}
 		seen[key] = true
-		pending = append(pending, edgeSpec{from, to, origin, file, line, kind, meta})
+		pending = append(pending, edgeSpec{from: from, to: to, origin: origin, file: file, line: line, kind: kind, meta: meta})
 		return true
 	}
+	lessSource := func(left, right sourceOrder) bool {
+		if left.repo != right.repo {
+			return left.repo < right.repo
+		}
+		a, b := left.identity, right.identity
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		if a.To != b.To {
+			return a.To < b.To
+		}
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		if a.FilePath != b.FilePath {
+			return a.FilePath < b.FilePath
+		}
+		return a.Line < b.Line
+	}
 
-	// Field targets: seed one ID-only projection across all changed repos.
-	// Cross-repo field targets are resolved lazily and cached, so the pass never
-	// materialises full field nodes or the whole-graph KindField map.
-	fieldRepoPrefixes := make([]string, 0, len(changedPrefixes))
+	// nil means an unscoped whole-graph scan; a non-nil empty slice means an
+	// exact empty scope and must remain a no-op.
+	var repoPrefixes []string
+	if changedPrefixes != nil {
+		repoPrefixes = make([]string, 0, len(changedPrefixes))
+	}
 	for prefix := range changedPrefixes {
-		fieldRepoPrefixes = append(fieldRepoPrefixes, prefix)
+		repoPrefixes = append(repoPrefixes, prefix)
 	}
-	sort.Strings(fieldRepoPrefixes)
-	fieldIDs := make(map[string]bool)
-	for _, id := range graph.ReadRepoNodeIDsByKinds(g, fieldRepoPrefixes, []graph.NodeKind{graph.KindField}) {
-		fieldIDs[id] = true
-	}
-	baseRows := graph.ReadRepoEdgesByKinds(g, fieldRepoPrefixes, []graph.EdgeKind{
-		graph.EdgeReadsConfig,
-		graph.EdgeReads,
-		graph.EdgeWrites,
-		graph.EdgeCalls,
+	sort.Strings(repoPrefixes)
+
+	// The production SQLite scanner keyset-pages a seven-column projection and
+	// filters non-field reads/writes in SQL. It deliberately does not decode
+	// confidence, provenance, or Meta. The fallback preserves adapter behavior.
+	baseByKey := make(map[edgeKey]baseSpec)
+	graph.ScanRepoCapabilityEdges(g, repoPrefixes, 0, func(page []graph.RepoCapabilityEdge) bool {
+		for _, row := range page {
+			input := row.Identity
+			candidate := baseSpec{
+				edgeSpec: edgeSpec{
+					from: input.From, to: input.To,
+					file: input.FilePath, line: input.Line,
+				},
+				source: sourceOrder{repo: row.RepoPrefix, identity: input},
+			}
+			switch input.Kind {
+			case graph.EdgeReadsConfig:
+				if !strings.Contains(input.To, "cfg::env::") {
+					continue
+				}
+				candidate.kind = graph.EdgeReadsEnv
+				candidate.origin = graph.OriginASTResolved
+			case graph.EdgeReads:
+				candidate.kind = graph.EdgeAccessesField
+				candidate.origin = graph.OriginASTResolved
+				candidate.access = "read"
+			case graph.EdgeWrites:
+				candidate.kind = graph.EdgeAccessesField
+				candidate.origin = graph.OriginASTResolved
+				candidate.access = "write"
+			case graph.EdgeCalls:
+				mechanism := processExecMechanism(input.To)
+				if mechanism == "" {
+					continue
+				}
+				candidate.to = "string::process::" + mechanism
+				candidate.kind = graph.EdgeExecutesProcess
+				candidate.origin = graph.OriginASTInferred
+				candidate.procMechanism = mechanism
+			default:
+				continue
+			}
+
+			key := edgeKey{from: candidate.from, to: candidate.to, kind: candidate.kind}
+			current, exists := baseByKey[key]
+			if !exists || lessSource(candidate.source, current.source) {
+				baseByKey[key] = candidate
+			}
+		}
+		return true
 	})
-	// A changed source may access a field defined in an unchanged sibling repo.
-	// Collect every such target and confirm the whole set in one point batch,
-	// rather than one GetNode round-trip per distinct target.
-	var crossFieldTargets []string
-	for _, row := range baseRows {
-		e := row.Edge
-		if e == nil || (e.Kind != graph.EdgeReads && e.Kind != graph.EdgeWrites) || fieldIDs[e.To] {
-			continue
-		}
-		crossFieldTargets = append(crossFieldTargets, e.To)
+
+	base := make([]baseSpec, 0, len(baseByKey))
+	for _, candidate := range baseByKey {
+		base = append(base, candidate)
 	}
-	for id, node := range g.GetNodesByIDs(crossFieldTargets) {
-		if node != nil && node.Kind == graph.KindField {
-			fieldIDs[id] = true
-		}
-	}
+	sort.Slice(base, func(i, j int) bool {
+		return lessSource(base[i].source, base[j].source)
+	})
 
 	procNodes := map[string]*graph.Node{}
-	for _, row := range baseRows {
-		e := row.Edge
-		if e == nil {
+	for _, candidate := range base {
+		var meta map[string]any
+		if candidate.access != "" {
+			meta = map[string]any{"access": candidate.access}
+		}
+		if candidate.procMechanism != "" && procNodes[candidate.to] == nil {
+			procNodes[candidate.to] = &graph.Node{
+				ID: candidate.to, Kind: graph.KindString, Name: candidate.procMechanism,
+				Meta: map[string]any{"context": "process", "mechanism": candidate.procMechanism},
+			}
+		}
+		if !add(candidate.from, candidate.to, candidate.kind, candidate.origin, candidate.file, candidate.line, meta) {
 			continue
 		}
-		switch e.Kind {
-		case graph.EdgeReadsConfig:
-			if !strings.Contains(e.To, "cfg::env::") {
-				continue
-			}
-			if add(e.From, e.To, graph.EdgeReadsEnv, graph.OriginASTResolved, e.FilePath, e.Line, nil) {
-				readsEnv++
-			}
-		case graph.EdgeReads:
-			if !fieldIDs[e.To] {
-				continue
-			}
-			if add(e.From, e.To, graph.EdgeAccessesField, graph.OriginASTResolved, e.FilePath, e.Line, map[string]any{"access": "read"}) {
-				fieldAccess++
-			}
-		case graph.EdgeWrites:
-			if !fieldIDs[e.To] {
-				continue
-			}
-			if add(e.From, e.To, graph.EdgeAccessesField, graph.OriginASTResolved, e.FilePath, e.Line, map[string]any{"access": "write"}) {
-				fieldAccess++
-			}
-		case graph.EdgeCalls:
-			mech := processExecMechanism(e.To)
-			if mech == "" {
-				continue
-			}
-			procID := "string::process::" + mech
-			if procNodes[procID] == nil {
-				procNodes[procID] = &graph.Node{
-					ID: procID, Kind: graph.KindString, Name: mech,
-					Meta: map[string]any{"context": "process", "mechanism": mech},
-				}
-			}
-			if add(e.From, procID, graph.EdgeExecutesProcess, graph.OriginASTInferred, e.FilePath, e.Line, nil) {
-				execProc++
-			}
+		switch candidate.kind {
+		case graph.EdgeReadsEnv:
+			readsEnv++
+		case graph.EdgeExecutesProcess:
+			execProc++
+		case graph.EdgeAccessesField:
+			fieldAccess++
 		}
 	}
 

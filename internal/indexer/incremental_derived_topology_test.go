@@ -36,6 +36,10 @@ func newIncrementalDerivedTestMultiIndexer(store graph.Store) *MultiIndexer {
 func incrementalDerivedLegacyPlan() map[string]DerivedInvalidationPlan {
 	return map[string]DerivedInvalidationPlan{
 		"repo": {
+			Flags: DerivedInvalidatesDeclarations |
+				DerivedInvalidatesImports |
+				DerivedInvalidatesRuntime |
+				DerivedInvalidatesArtifacts,
 			Files:          []string{"repo/main.go"},
 			LegacyFallback: true,
 		},
@@ -57,7 +61,7 @@ func waitForIncrementalDerivedBatchWriter(t *testing.T, mi *MultiIndexer) {
 	}
 }
 
-func TestRunIncrementalDerivedPassesLegacyFallbackDoesNotReenterTopology(t *testing.T) {
+func TestRunIncrementalDerivedPassesLegacyFallbackStaysExactWithoutGlobalEscalation(t *testing.T) {
 	if os.Getenv(incrementalDerivedLegacyChildEnv) == "1" {
 		store := &incrementalDerivedProbeStore{Store: graph.New()}
 		mi := newIncrementalDerivedTestMultiIndexer(store)
@@ -68,7 +72,7 @@ func TestRunIncrementalDerivedPassesLegacyFallbackDoesNotReenterTopology(t *test
 		require.True(t, report.LegacyFallback)
 		require.Equal(t, 1, report.Repos)
 		require.Equal(t, 1, report.Files)
-		require.Positive(t, store.checkpoints.Load(), "legacy fallback did not enter global passes")
+		require.Zero(t, store.checkpoints.Load(), "legacy exact frontier entered global passes")
 		require.Greater(t, reach.BuildCounter(), before)
 		return
 	}
@@ -76,15 +80,15 @@ func TestRunIncrementalDerivedPassesLegacyFallbackDoesNotReenterTopology(t *test
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0],
-		"-test.run=^TestRunIncrementalDerivedPassesLegacyFallbackDoesNotReenterTopology$",
+		"-test.run=^TestRunIncrementalDerivedPassesLegacyFallbackStaysExactWithoutGlobalEscalation$",
 		"-test.count=1",
 	)
 	cmd.Env = append(os.Environ(), incrementalDerivedLegacyChildEnv+"=1")
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
-		t.Fatalf("legacy fallback deadlocked while re-entering the topology gate:\n%s", output)
+		t.Fatalf("legacy exact frontier deadlocked in the topology transaction:\n%s", output)
 	}
-	require.NoErrorf(t, err, "legacy fallback subprocess failed:\n%s", output)
+	require.NoErrorf(t, err, "legacy exact-frontier subprocess failed:\n%s", output)
 }
 
 func TestRunIncrementalDerivedPassesTakesBatchWriteGate(t *testing.T) {

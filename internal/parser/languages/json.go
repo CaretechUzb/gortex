@@ -1,8 +1,6 @@
 package languages
 
 import (
-	"strings"
-
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 )
@@ -19,12 +17,11 @@ func (e *JSONExtractor) Language() string     { return "json" }
 func (e *JSONExtractor) Extensions() []string { return []string{".json", ".json5", ".jsonc"} }
 
 func (e *JSONExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
-	lines := strings.Split(string(src), "\n")
 	result := &parser.ExtractionResult{}
 
 	fileNode := &graph.Node{
 		ID: filePath, Kind: graph.KindFile, Name: filePath,
-		FilePath: filePath, StartLine: 1, EndLine: len(lines),
+		FilePath: filePath, StartLine: 1, EndLine: 1,
 		Language: "json",
 	}
 	result.Nodes = append(result.Nodes, fileNode)
@@ -116,8 +113,9 @@ func (e *JSONExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 				i = n
 				break
 			}
-			key := string(src[keyStart:j])
-			// Move past closing quote.
+			// Move past closing quote. Keep the key as a byte window until
+			// the structural checks prove it is a top-level object key; JSON
+			// values and nested keys vastly outnumber emitted symbols.
 			i = j + 1
 			// Look ahead past whitespace/comments for `:` — if present at
 			// depth 1 inside an object, it's a top-level key.
@@ -132,7 +130,7 @@ func (e *JSONExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			if k < n && src[k] == ':' {
 				// At depth 1 means stack length is exactly 1 and top is '{'.
 				if len(stack) == 1 && stack[0] == '{' {
-					add(key, line)
+					add(string(src[keyStart:j]), line)
 				}
 			}
 		default:
@@ -140,6 +138,7 @@ func (e *JSONExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		}
 	}
 
+	fileNode.EndLine = line
 	return result, nil
 }
 

@@ -72,6 +72,21 @@ type Tree struct {
 // re-read, since the content hash is reused. A nil saltFor (or one
 // returning "") leaves every leaf equal to its content hash.
 func Build(rootAbs string, relPaths []string, prior *Tree, saltFor func(rel string) string) *Tree {
+	return BuildWithKnownFiles(rootAbs, relPaths, prior, saltFor, nil)
+}
+
+// BuildWithKnownFiles builds the same tree as Build while accepting content
+// identities captured by the caller's authoritative file read. A valid known
+// node is used before any stat or read, so a full index can persist the exact
+// bytes it parsed without rereading the repository or racing a later mutation.
+// Paths absent from knownFiles retain Build's stat/prior/read fallback.
+func BuildWithKnownFiles(
+	rootAbs string,
+	relPaths []string,
+	prior *Tree,
+	saltFor func(rel string) string,
+	knownFiles map[string]FileNode,
+) *Tree {
 	salt := func(rel string) string {
 		if saltFor == nil {
 			return ""
@@ -84,6 +99,11 @@ func Build(rootAbs string, relPaths []string, prior *Tree, saltFor func(rel stri
 	}
 	for _, rel := range relPaths {
 		rel = filepath.ToSlash(rel)
+		if known, ok := knownFiles[rel]; ok && known.Hash != "" {
+			known.Salt = salt(rel)
+			t.Files[rel] = known
+			continue
+		}
 		abs := filepath.Join(rootAbs, filepath.FromSlash(rel))
 		info, err := os.Stat(abs)
 		if err != nil {

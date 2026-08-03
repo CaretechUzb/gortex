@@ -4,7 +4,10 @@ import (
 	"reflect"
 	"testing"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/intern"
 )
 
 // TestLSPDisabledSet_ConfigOnly — a `semantic.providers` entry with
@@ -101,5 +104,107 @@ func TestWarmMtimePrefix(t *testing.T) {
 					tc.effective, gotPrefix, gotOK, tc.wantPrefix, tc.wantOK)
 			}
 		})
+	}
+}
+
+func TestCanSkipWarmGlobalResolveRequiresCompletionAndStableRevision(t *testing.T) {
+	base := warmGlobalResolveSafety{
+		resolveOK:                     true,
+		deferredCrossRepoComplete:     true,
+		deferredMutationRevision:      42,
+		deferredMutationRevisionKnown: true,
+		backfillRevisionBefore:        42,
+		backfillRevisionBeforeKnown:   true,
+		backfillRevisionAfter:         43,
+		backfillRevisionAfterKnown:    true,
+		currentMutationRevision:       43,
+		currentMutationRevisionKnown:  true,
+		backfillResolutionAffected:    0,
+	}
+	if !canSkipWarmGlobalResolve(base) {
+		t.Fatal("physical-only backfill at a bounded revision should elide the duplicate full sweep")
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*warmGlobalResolveSafety)
+	}{
+		{"pre-enrichment resolve failed", func(s *warmGlobalResolveSafety) { s.resolveOK = false }},
+		{"deferred catch-up failed", func(s *warmGlobalResolveSafety) { s.deferredCrossRepoComplete = false }},
+		{"completion revision unsupported", func(s *warmGlobalResolveSafety) { s.deferredMutationRevisionKnown = false }},
+		{"pre-backfill revision unsupported", func(s *warmGlobalResolveSafety) { s.backfillRevisionBeforeKnown = false }},
+		{"post-backfill revision unsupported", func(s *warmGlobalResolveSafety) { s.backfillRevisionAfterKnown = false }},
+		{"current revision unsupported", func(s *warmGlobalResolveSafety) { s.currentMutationRevisionKnown = false }},
+		{"writer interleaved before backfill", func(s *warmGlobalResolveSafety) { s.backfillRevisionBefore++ }},
+		{"writer interleaved after backfill", func(s *warmGlobalResolveSafety) { s.currentMutationRevision++ }},
+		{"workspace eligibility changed", func(s *warmGlobalResolveSafety) { s.backfillResolutionAffected = 1 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			safety := base
+			tc.mutate(&safety)
+			if canSkipWarmGlobalResolve(safety) {
+				t.Fatal("incomplete or stale cross-repo proof elided the full sweep")
+			}
+		})
+	}
+}
+
+func TestSelectWarmGlobalResolveAction(t *testing.T) {
+	complete := warmGlobalResolveSafety{
+		resolveOK:                     true,
+		deferredCrossRepoComplete:     true,
+		deferredMutationRevision:      17,
+		deferredMutationRevisionKnown: true,
+		backfillRevisionBefore:        17,
+		backfillRevisionBeforeKnown:   true,
+		backfillRevisionAfter:         18,
+		backfillRevisionAfterKnown:    true,
+		currentMutationRevision:       18,
+		currentMutationRevisionKnown:  true,
+	}
+	interleaved := complete
+	interleaved.currentMutationRevision++
+	eligibilityChanged := complete
+	eligibilityChanged.backfillResolutionAffected = 1
+	cases := []struct {
+		name                string
+		anyChanged          bool
+		safety              warmGlobalResolveSafety
+		backfilledContracts int
+		want                warmGlobalResolveAction
+	}{
+		{"changed completed deferred catch-up across physical stamps", true, complete, 0, warmGlobalResolveContracts},
+		{"changed failed initial resolve", true, warmGlobalResolveSafety{}, 0, warmGlobalResolveFull},
+		{"changed failed deferred catch-up", true, warmGlobalResolveSafety{resolveOK: true}, 0, warmGlobalResolveFull},
+		{"changed interleaving graph writer", true, interleaved, 0, warmGlobalResolveFull},
+		{"changed workspace eligibility", true, eligibilityChanged, 0, warmGlobalResolveFull},
+		{"unchanged physical-only node stamps", false, warmGlobalResolveSafety{}, 0, warmGlobalResolveNone},
+		{"unchanged workspace eligibility", false, warmGlobalResolveSafety{backfillResolutionAffected: 1}, 0, warmGlobalResolveFull},
+		{"unchanged legacy contract stamp", false, warmGlobalResolveSafety{}, 1, warmGlobalResolveContracts},
+		{"unchanged physical and contract stamps", false, warmGlobalResolveSafety{}, 1, warmGlobalResolveContracts},
+		{"unchanged clean snapshot", false, warmGlobalResolveSafety{}, 0, warmGlobalResolveNone},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := selectWarmGlobalResolveAction(tc.anyChanged, tc.safety, tc.backfilledContracts); got != tc.want {
+				t.Fatalf("action = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRotateColdInternGeneration(t *testing.T) {
+	intern.Reset()
+	t.Cleanup(func() { intern.Reset() })
+
+	for _, phase := range []string{"parallel_parse", "deferred_passes_all"} {
+		intern.String("daemon-warmup/" + phase)
+		if got := rotateColdInternGeneration(zap.NewNop(), phase); got != 1 {
+			t.Fatalf("rotateColdInternGeneration(%q) released %d strings, want 1", phase, got)
+		}
+		if got := intern.Len(); got != 0 {
+			t.Fatalf("interner length after %q rotation = %d, want 0", phase, got)
+		}
 	}
 }

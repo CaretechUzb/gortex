@@ -154,6 +154,126 @@ type RepoEdgeKindReader interface {
 	RepoEdgesByKinds(repoPrefixes []string, kinds []EdgeKind) []RepoEdgeRow
 }
 
+// RepoCapabilityEdge is the complete base-edge projection needed to derive
+// reads_env, executes_process, and accesses_field edges. Reads and writes are
+// included only when their target is currently a field; payload columns such as
+// confidence, origin, and Meta are deliberately absent.
+type RepoCapabilityEdge struct {
+	RepoPrefix string
+	Identity   EdgeIdentity
+}
+
+// RepoCapabilityEdgeScanner streams bounded pages of capability-producing base
+// edges owned by the requested repositories. A nil repoPrefixes slice requests
+// the whole graph; a non-nil empty slice is an exact empty scope. Implementations
+// must close each backend cursor before invoking yield so the callback may safely
+// re-enter the Store. Page order is unspecified; consumers that select
+// provenance must apply their own deterministic ordering rule.
+type RepoCapabilityEdgeScanner interface {
+	ScanRepoCapabilityEdges(repoPrefixes []string, pageSize int, yield func([]RepoCapabilityEdge) bool)
+}
+
+// Four thousand identities stay comfortably bounded while avoiding thousands
+// of prepare/step/finalize cycles on multi-million-edge cold stores.
+const defaultRepoCapabilityEdgePageSize = 4096
+
+// ScanRepoCapabilityEdges uses the compact production projection when
+// available. The adapter fallback preserves exact behavior for in-memory and
+// decorated stores; it may materialize full edges because those stores do not
+// own a backend cursor or duplicated SQLite payload buffers.
+func ScanRepoCapabilityEdges(
+	s Store,
+	repoPrefixes []string,
+	pageSize int,
+	yield func([]RepoCapabilityEdge) bool,
+) {
+	if s == nil || yield == nil || (repoPrefixes != nil && len(repoPrefixes) == 0) {
+		return
+	}
+	if pageSize <= 0 {
+		pageSize = defaultRepoCapabilityEdgePageSize
+	}
+	if scanner, ok := s.(RepoCapabilityEdgeScanner); ok {
+		scanner.ScanRepoCapabilityEdges(repoPrefixes, pageSize, yield)
+		return
+	}
+
+	// Adapter stores do not own a cursor projection. Their graph is already
+	// resident, so preserve whole-graph semantics (including legacy empty-prefix
+	// nodes) with the constant number of kind walks the old pass performed.
+	kinds := []EdgeKind{EdgeReadsConfig, EdgeReads, EdgeWrites, EdgeCalls}
+	var rows []RepoEdgeRow
+	if repoPrefixes != nil {
+		rows = ReadRepoEdgesByKinds(s, repoPrefixes, kinds)
+	} else {
+		var candidates []*Edge
+		if scanner, ok := s.(EdgesByKindsScanner); ok {
+			for edge := range scanner.EdgesByKinds(kinds) {
+				if edge != nil {
+					candidates = append(candidates, edge)
+				}
+			}
+		} else {
+			for _, kind := range kinds {
+				for edge := range s.EdgesByKind(kind) {
+					if edge != nil {
+						candidates = append(candidates, edge)
+					}
+				}
+			}
+		}
+		rows = make([]RepoEdgeRow, 0, len(candidates))
+		for _, edge := range candidates {
+			// The unscoped consumer needs only deterministic identity order; a
+			// repository lookup for every source would recreate the very node
+			// materialization this projection removes.
+			rows = append(rows, RepoEdgeRow{Edge: edge})
+		}
+		sortRepoEdgeRows(rows)
+	}
+	fieldTargetIDs := make([]string, 0)
+	seenTargets := make(map[string]struct{})
+	for _, row := range rows {
+		edge := row.Edge
+		if edge == nil || (edge.Kind != EdgeReads && edge.Kind != EdgeWrites) {
+			continue
+		}
+		if _, seen := seenTargets[edge.To]; seen {
+			continue
+		}
+		seenTargets[edge.To] = struct{}{}
+		fieldTargetIDs = append(fieldTargetIDs, edge.To)
+	}
+	fieldTargets := s.GetNodesByIDs(fieldTargetIDs)
+
+	page := make([]RepoCapabilityEdge, 0, pageSize)
+	for _, row := range rows {
+		edge := row.Edge
+		if edge == nil {
+			continue
+		}
+		if edge.Kind == EdgeReads || edge.Kind == EdgeWrites {
+			target := fieldTargets[edge.To]
+			if target == nil || target.Kind != KindField {
+				continue
+			}
+		}
+		page = append(page, RepoCapabilityEdge{
+			RepoPrefix: row.RepoPrefix,
+			Identity:   EdgeIdentityFor(edge),
+		})
+		if len(page) == pageSize {
+			if !yield(page) {
+				return
+			}
+			page = make([]RepoCapabilityEdge, 0, pageSize)
+		}
+	}
+	if len(page) > 0 {
+		yield(page)
+	}
+}
+
 // ReadRepoLanguageFileCounts uses the compact capability when available. The
 // aggregate fallback keeps adapter stores functional without loading nodes or
 // metadata; production Graph and SQLite stores implement the exact file-aware

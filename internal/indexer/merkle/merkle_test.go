@@ -194,6 +194,48 @@ func TestDiff_SaltChangeReExtractsOnlyThatLanguage(t *testing.T) {
 	}
 }
 
+func TestBuildWithKnownFiles_UsesParsedSnapshotBeforeDisk(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "known.go", "package old")
+	knownPath := filepath.Join(root, "known.go")
+	info, err := os.Stat(knownPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	knownHash, err := hashFile(knownPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	known := FileNode{Hash: knownHash, Mtime: info.ModTime().UnixNano(), Salt: "stale"}
+
+	// Change the file after the caller captured the bytes it parsed. The tree
+	// must describe that parsed snapshot, not the later disk contents.
+	write(t, root, "known.go", "package new")
+	write(t, root, "fallback.go", "package fallback")
+	tree := BuildWithKnownFiles(
+		root,
+		[]string{"known.go", "fallback.go"},
+		nil,
+		func(string) string { return "extractor-v2" },
+		map[string]FileNode{"known.go": known},
+	)
+
+	got := tree.Files["known.go"]
+	if got.Hash != knownHash || got.Mtime != known.Mtime {
+		t.Fatalf("known node = %+v, want captured hash/mtime %+v", got, known)
+	}
+	if got.Salt != "extractor-v2" {
+		t.Fatalf("known salt = %q, want current extractor salt", got.Salt)
+	}
+	fallbackHash, err := hashFile(filepath.Join(root, "fallback.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tree.Files["fallback.go"].Hash; got != fallbackHash {
+		t.Fatalf("fallback hash = %q, want %q", got, fallbackHash)
+	}
+}
+
 func TestSalt_EmptyEqualsLegacyContentOnly(t *testing.T) {
 	root := t.TempDir()
 	write(t, root, "a.go", "package a\n")

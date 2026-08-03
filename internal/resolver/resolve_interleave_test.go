@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"context"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -34,7 +35,7 @@ func (s *resolveInterleavePagingStore) MutationRevision() uint64 {
 	return s.resolverBatchCountingStore.Store.(mutationRevisioner).MutationRevision()
 }
 
-func (s *resolveInterleavePagingStore) BeginUnresolvedEdgeScan() (graph.UnresolvedEdgeScan, error) {
+func (s *resolveInterleavePagingStore) BeginUnresolvedEdgeScan(context.Context) (graph.UnresolvedEdgeScan, error) {
 	s.beginCalls++
 	return graph.UnresolvedEdgeScan{
 		HighWaterID:   int64(len(s.pageEdges)),
@@ -43,7 +44,7 @@ func (s *resolveInterleavePagingStore) BeginUnresolvedEdgeScan() (graph.Unresolv
 }
 
 func (s *resolveInterleavePagingStore) ReadUnresolvedEdgePage(
-	_ graph.UnresolvedEdgeScan, afterID int64, _, _ int,
+	_ context.Context, _ graph.UnresolvedEdgeScan, afterID int64, _, _ int,
 ) (graph.UnresolvedEdgePage, error) {
 	s.pageCalls++
 	if afterID >= int64(len(s.pageEdges)) {
@@ -229,9 +230,11 @@ func TestResolveAllRefreshesCurrentPageAfterSameResolverInterleave(t *testing.T)
 	// Only the chunk after the real mutation interleave validates in the main
 	// loop. One remaining-page batch covers every later chunk from the old
 	// page; the second phase-bounded call is the independent cross-package
-	// guard validation and must retain its exact stale-job semantics.
-	if store.getEdgeCandidatesCalls != 2 {
-		t.Fatalf("batched liveness calls=%d, want main-page + guard validation", store.getEdgeCandidatesCalls)
+	// guard validation. Exact-site placeholder-source reconciliation shares
+	// the candidate API and contributes one more batch; the old implementation
+	// performed that probe through the wider adjacency API instead.
+	if store.getEdgeCandidatesCalls != 3 {
+		t.Fatalf("batched candidate calls=%d, want main-page + guard + placeholder-site validation", store.getEdgeCandidatesCalls)
 	}
 }
 

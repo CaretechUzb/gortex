@@ -42,10 +42,47 @@ func TestSQLiteMutationReceiptCapturesExactResolutionDelta(t *testing.T) {
 	if want := []string{"src/a.go", "src/b.go"}; !slices.Equal(receipt.ResolutionFiles(), want) {
 		t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), want)
 	}
+	if want := []string{"src/a.go"}; !slices.Equal(receipt.UnresolvedFiles, want) {
+		t.Fatalf("unresolved files = %v, want %v", receipt.UnresolvedFiles, want)
+	}
+	if want := []string{"src/a.go", "src/b.go"}; !slices.Equal(receipt.CrossRepoFiles(), want) {
+		t.Fatalf("cross-repo files = %v, want %v", receipt.CrossRepoFiles(), want)
+	}
 	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "Caller", "Load", "pkg.Caller", "pkg.Load")
 	assertSQLiteReceiptContains(t, "target ids", receipt.TargetIDs,
 		"repo/src/a.go::Caller", "repo/src/b.go::Load", "repo::"+graph.UnresolvedMarker+"Load")
 	assertSQLiteReceiptContains(t, "import candidates", receipt.ImportCandidates, "Load", "loader")
+}
+
+func TestSQLiteMutationReceiptCapturesResolvedEdgeFrontier(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	const (
+		sourceID = "repo/src/a.go::Caller"
+		targetID = "other/pkg::Target"
+	)
+	store.AddBatch([]*graph.Node{
+		{ID: sourceID, Kind: graph.KindFunction, Name: "Caller", FilePath: "src/a.go", RepoPrefix: "repo"},
+		{ID: targetID, Kind: graph.KindFunction, Name: "Target", FilePath: "target.go", RepoPrefix: "other"},
+	}, nil)
+
+	token := store.BeginMutationReceipt()
+	store.AddEdge(&graph.Edge{
+		From: sourceID, To: targetID, Kind: graph.EdgeImports, Alias: "dependency",
+	})
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete || receipt.ResolutionRelevant {
+		t.Fatalf("receipt = %+v, want complete resolved-edge frontier", receipt)
+	}
+	assertSQLiteReceiptContains(t, "changed files", receipt.ChangedFiles, "src/a.go")
+	if len(receipt.UnresolvedFiles) != 0 || len(receipt.ResolutionFiles()) != 0 {
+		t.Fatalf("resolved edge entered unresolved frontier: %+v", receipt)
+	}
+	if want := []string{"src/a.go"}; !slices.Equal(receipt.CrossRepoFiles(), want) {
+		t.Fatalf("cross-repo files = %v, want %v", receipt.CrossRepoFiles(), want)
+	}
+	assertSQLiteReceiptContains(t, "target ids", receipt.TargetIDs, targetID)
+	assertSQLiteReceiptContains(t, "import candidates", receipt.ImportCandidates, targetID, "dependency")
 }
 
 func TestSQLiteMutationReceiptIdempotentAndAttributeOnlyWritesAreNeutral(t *testing.T) {
@@ -66,19 +103,237 @@ func TestSQLiteMutationReceiptIdempotentAndAttributeOnlyWritesAreNeutral(t *test
 	if !receipt.Complete {
 		t.Fatalf("neutral receipt unexpectedly incomplete: %+v", receipt)
 	}
-	if receipt.ResolutionRelevant || len(receipt.ResolutionFiles()) != 0 {
-		t.Fatalf("neutral writes produced resolution delta: %+v", receipt)
+	if receipt.ResolutionRelevant || len(receipt.UnresolvedFiles) != 0 || len(receipt.ResolutionFiles()) != 0 || len(receipt.CrossRepoFiles()) != 0 {
+		t.Fatalf("neutral writes produced mutation frontiers: %+v", receipt)
 	}
 }
 
-func TestSQLiteMutationReceiptIdentityChangingUpsertFailsClosed(t *testing.T) {
+func TestSQLiteMutationReceiptIdentityChangingUpsertCapturesExactFrontier(t *testing.T) {
+	const id = "repo/a.go::A"
+	tests := []struct {
+		name      string
+		before    graph.Node
+		after     graph.Node
+		wantFiles []string
+		wantNames []string
+	}{
+		{
+			name:      "rename",
+			before:    graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			after:     graph.Node{ID: id, Kind: graph.KindFunction, Name: "Renamed", QualName: "pkg.Renamed", FilePath: "a.go", RepoPrefix: "repo"},
+			wantFiles: []string{"a.go"},
+			wantNames: []string{"A", "pkg.A", "Renamed", "pkg.Renamed"},
+		},
+		{
+			name:      "move",
+			before:    graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			after:     graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "b.go", RepoPrefix: "repo"},
+			wantFiles: []string{"a.go", "b.go"},
+			wantNames: []string{"A", "pkg.A"},
+		},
+		{
+			name:      "referenceable kind transition",
+			before:    graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			after:     graph.Node{ID: id, Kind: graph.KindMethod, Name: "A", QualName: "pkg.T.A", FilePath: "a.go", RepoPrefix: "repo"},
+			wantFiles: []string{"a.go"},
+			wantNames: []string{"A", "pkg.A", "pkg.T.A"},
+		},
+		{
+			name:      "gains referenceability",
+			before:    graph.Node{ID: id, Kind: graph.KindFile, Name: "source", FilePath: "a.go", RepoPrefix: "repo"},
+			after:     graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			wantFiles: []string{"a.go"},
+			wantNames: []string{"source", "A", "pkg.A"},
+		},
+		{
+			name:      "loses referenceability",
+			before:    graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			after:     graph.Node{ID: id, Kind: graph.KindFile, Name: "source", FilePath: "a.go", RepoPrefix: "repo"},
+			wantFiles: []string{"a.go"},
+			wantNames: []string{"A", "pkg.A", "source"},
+		},
+		{
+			name:      "repository transition",
+			before:    graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "old/a.go", RepoPrefix: "old"},
+			after:     graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "new/a.go", RepoPrefix: "new"},
+			wantFiles: []string{"new/a.go", "old/a.go"},
+			wantNames: []string{"A", "pkg.A"},
+		},
+		{
+			name:      "missing nonreferenceable side file remains exact",
+			before:    graph.Node{ID: id, Kind: graph.KindFile, Name: "source", RepoPrefix: "repo"},
+			after:     graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			wantFiles: []string{"a.go"},
+			wantNames: []string{"source", "A", "pkg.A"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := openMutationReceiptStore(t)
+			store.AddNode(&tt.before)
+
+			token := store.BeginMutationReceipt()
+			store.AddNode(&tt.after)
+			receipt := store.EndMutationReceipt(token)
+			if !receipt.Complete || !receipt.ResolutionRelevant {
+				t.Fatalf("identity-changing UPSERT receipt = %+v, want complete resolution delta", receipt)
+			}
+			if !slices.Equal(receipt.ResolutionFiles(), tt.wantFiles) {
+				t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), tt.wantFiles)
+			}
+			assertSQLiteReceiptContains(t, "target ids", receipt.TargetIDs, id)
+			assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, tt.wantNames...)
+		})
+	}
+}
+
+func TestSQLiteMutationReceiptNonreferenceableIdentityChangeIsNeutral(t *testing.T) {
 	store := openMutationReceiptStore(t)
-	store.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"})
+	const id = "repo/a.go"
+	store.AddNode(&graph.Node{ID: id, Kind: graph.KindFile, Name: "old", FilePath: "a.go", RepoPrefix: "repo"})
 
 	token := store.BeginMutationReceipt()
-	store.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "Renamed", QualName: "pkg.Renamed", FilePath: "a.go", RepoPrefix: "repo"})
-	if receipt := store.EndMutationReceipt(token); receipt.Complete {
-		t.Fatalf("identity-changing UPSERT returned complete receipt: %+v", receipt)
+	store.AddNode(&graph.Node{ID: id, Kind: graph.KindFile, Name: "new", FilePath: "b.go", RepoPrefix: "other"})
+	receipt := store.EndMutationReceipt(token)
+	if !receipt.Complete || receipt.ResolutionRelevant || len(receipt.ResolutionFiles()) != 0 {
+		t.Fatalf("nonreferenceable identity change receipt = %+v, want complete and resolution-irrelevant", receipt)
+	}
+}
+
+func TestSQLiteMutationReceiptIdentityChangeMissingReferenceableFileFailsClosed(t *testing.T) {
+	const id = "repo/a.go::A"
+	tests := []struct {
+		name   string
+		before graph.Node
+		after  graph.Node
+	}{
+		{
+			name:   "old identity file missing",
+			before: graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", RepoPrefix: "repo"},
+			after:  graph.Node{ID: id, Kind: graph.KindFunction, Name: "Renamed", QualName: "pkg.Renamed", FilePath: "a.go", RepoPrefix: "repo"},
+		},
+		{
+			name:   "final identity file missing",
+			before: graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+			after:  graph.Node{ID: id, Kind: graph.KindFunction, Name: "Renamed", QualName: "pkg.Renamed", RepoPrefix: "repo"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := openMutationReceiptStore(t)
+			store.AddNode(&tt.before)
+			token := store.BeginMutationReceipt()
+			store.AddNode(&tt.after)
+			receipt := store.EndMutationReceipt(token)
+			if receipt.Complete || !receipt.ResolutionRelevant {
+				t.Fatalf("missing-file identity change receipt = %+v, want incomplete resolution delta", receipt)
+			}
+			if receipt.IncompleteReason != "node_identity_change_without_exact_file" {
+				t.Fatalf("incomplete reason = %q, want node_identity_change_without_exact_file", receipt.IncompleteReason)
+			}
+		})
+	}
+}
+
+func TestSQLiteMutationReceiptDuplicateNodeBatchNamesIncompleteReason(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	const id = "repo/a.go::A"
+	store.AddNode(&graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"})
+
+	token := store.BeginMutationReceipt()
+	store.AddBatch([]*graph.Node{
+		{ID: id, Kind: graph.KindFunction, Name: "FirstRename", QualName: "pkg.FirstRename", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: id, Kind: graph.KindFunction, Name: "FinalRename", QualName: "pkg.FinalRename", FilePath: "a.go", RepoPrefix: "repo"},
+	}, nil)
+	receipt := store.EndMutationReceipt(token)
+	if receipt.Complete {
+		t.Fatalf("identity-changing duplicate batch returned complete receipt: %+v", receipt)
+	}
+	if receipt.IncompleteReason != "duplicate_node_batch" {
+		t.Fatalf("incomplete reason = %q, want duplicate_node_batch", receipt.IncompleteReason)
+	}
+}
+
+func TestSQLiteMutationReceiptDuplicateContractOwnersRemainExact(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	const (
+		contractID = "ws::error"
+		providerID = "trellis/provider.go::serveError"
+		consumerID = "axonhub/consumer.js::syncError"
+	)
+	store.AddBatch([]*graph.Node{
+		{ID: contractID, Kind: graph.KindContract, Name: contractID, FilePath: "old/socket.go", RepoPrefix: "trellis", Meta: map[string]any{"role": "provider"}},
+		{ID: providerID, Kind: graph.KindFunction, Name: "serveError", FilePath: "provider.go", RepoPrefix: "trellis"},
+		{ID: consumerID, Kind: graph.KindFunction, Name: "syncError", FilePath: "consumer.js", RepoPrefix: "axonhub"},
+	}, nil)
+
+	token := store.BeginMutationReceipt()
+	store.AddBatch([]*graph.Node{
+		{ID: contractID, Kind: graph.KindContract, Name: contractID, FilePath: "provider.go", RepoPrefix: "trellis", Meta: map[string]any{"role": "provider"}},
+		{ID: contractID, Kind: graph.KindContract, Name: contractID, FilePath: "consumer.js", RepoPrefix: "axonhub", Meta: map[string]any{"role": "consumer"}},
+	}, []*graph.Edge{
+		{From: providerID, To: contractID, Kind: graph.EdgeProvides, FilePath: "provider.go", Line: 10},
+		{From: consumerID, To: contractID, Kind: graph.EdgeConsumes, FilePath: "consumer.js", Line: 20},
+	})
+	receipt := store.EndMutationReceipt(token)
+	if !receipt.Complete || receipt.ResolutionRelevant || receipt.IncompleteReason != "" {
+		t.Fatalf("duplicate contract receipt = %+v, want complete and resolution-irrelevant", receipt)
+	}
+	if got := store.GetNode(contractID); got == nil || got.FilePath != "consumer.js" || got.RepoPrefix != "axonhub" || got.Meta["role"] != "consumer" {
+		t.Fatalf("final contract node = %+v, want last owner representation", got)
+	}
+	if edges := store.GetOutEdges(providerID); len(edges) != 1 || edges[0].To != contractID || edges[0].Kind != graph.EdgeProvides {
+		t.Fatalf("provider edges = %+v, want retained provides edge", edges)
+	}
+	if edges := store.GetOutEdges(consumerID); len(edges) != 1 || edges[0].To != contractID || edges[0].Kind != graph.EdgeConsumes {
+		t.Fatalf("consumer edges = %+v, want retained consumes edge", edges)
+	}
+}
+
+func TestSQLiteMutationReceiptDuplicateSemanticEnrichmentKeepsExactReceipt(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	const id = "repo/a.go::A"
+	store.AddNode(&graph.Node{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"})
+
+	token := store.BeginMutationReceipt()
+	store.AddBatch([]*graph.Node{
+		{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo", Meta: map[string]any{"semantic_type": "string", "semantic_source": "lsp"}},
+		{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo", Meta: map[string]any{"semantic_type": "number", "semantic_source": "lsp"}},
+	}, nil)
+	receipt := store.EndMutationReceipt(token)
+	if !receipt.Complete || receipt.ResolutionRelevant {
+		t.Fatalf("enrichment-only duplicate batch receipt = %+v, want complete and resolution-irrelevant", receipt)
+	}
+	if len(receipt.UnresolvedFiles) != 0 || len(receipt.ResolutionFiles()) != 0 || len(receipt.CrossRepoFiles()) != 0 {
+		t.Fatalf("enrichment-only duplicate batch produced mutation frontiers: %+v", receipt)
+	}
+	if got := store.GetNode(id); got == nil || got.Meta["semantic_type"] != "number" {
+		t.Fatalf("final enriched node = %+v, want semantic_type number", got)
+	}
+}
+
+func TestSQLiteMutationReceiptNewDuplicateNodeRecordsFinalIdentity(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	const id = "repo/a.go::A"
+
+	token := store.BeginMutationReceipt()
+	store.AddBatch([]*graph.Node{
+		{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo", Meta: map[string]any{"semantic_type": "string"}},
+		{ID: id, Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo", Meta: map[string]any{"semantic_type": "number"}},
+	}, nil)
+	receipt := store.EndMutationReceipt(token)
+	if !receipt.Complete || !receipt.ResolutionRelevant {
+		t.Fatalf("new duplicate batch receipt = %+v, want complete resolution delta", receipt)
+	}
+	if want := []string{"a.go"}; !slices.Equal(receipt.ResolutionFiles(), want) {
+		t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), want)
+	}
+	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "A", "pkg.A")
+	assertSQLiteReceiptContains(t, "target ids", receipt.TargetIDs, id)
+	if got := store.GetNode(id); got == nil || got.Meta["semantic_type"] != "number" {
+		t.Fatalf("final new node = %+v, want semantic_type number", got)
 	}
 }
 
@@ -202,7 +457,8 @@ func TestSQLiteMutationReceiptEdgeSourceFileFallback(t *testing.T) {
 	token := store.BeginMutationReceipt()
 	store.AddEdge(&graph.Edge{From: "repo/a.go::A", To: "repo::" + graph.UnresolvedMarker + "B", Kind: graph.EdgeCalls})
 	receipt := store.EndMutationReceipt(token)
-	if !receipt.Complete || !receipt.ResolutionRelevant || !slices.Contains(receipt.ChangedFiles, "a.go") {
+	if !receipt.Complete || !receipt.ResolutionRelevant || !slices.Contains(receipt.ChangedFiles, "a.go") ||
+		!slices.Contains(receipt.UnresolvedFiles, "a.go") || !slices.Contains(receipt.CrossRepoFiles(), "a.go") {
 		t.Fatalf("source-file fallback receipt = %+v", receipt)
 	}
 

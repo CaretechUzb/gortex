@@ -21,6 +21,7 @@ type sqliteMutationReceiptAccumulator struct {
 	incompleteReason   string
 	resolutionRelevant bool
 	changedFiles       map[string]struct{}
+	unresolvedFiles    map[string]struct{}
 	definitionFiles    map[string]struct{}
 	targetNames        map[string]struct{}
 	targetIDs          map[string]struct{}
@@ -47,6 +48,7 @@ func newSQLiteMutationReceiptAccumulator() *sqliteMutationReceiptAccumulator {
 	return &sqliteMutationReceiptAccumulator{
 		complete:         true,
 		changedFiles:     make(map[string]struct{}),
+		unresolvedFiles:  make(map[string]struct{}),
 		definitionFiles:  make(map[string]struct{}),
 		targetNames:      make(map[string]struct{}),
 		targetIDs:        make(map[string]struct{}),
@@ -60,6 +62,7 @@ func (a *sqliteMutationReceiptAccumulator) receipt() graph.MutationReceipt {
 		IncompleteReason:   a.incompleteReason,
 		ResolutionRelevant: a.resolutionRelevant,
 		ChangedFiles:       sortedSQLiteReceiptKeys(a.changedFiles),
+		UnresolvedFiles:    sortedSQLiteReceiptKeys(a.unresolvedFiles),
 		DefinitionFiles:    sortedSQLiteReceiptKeys(a.definitionFiles),
 		TargetNames:        sortedSQLiteReceiptKeys(a.targetNames),
 		TargetIDs:          sortedSQLiteReceiptKeys(a.targetIDs),
@@ -142,6 +145,7 @@ func (s *Store) mergeMutationReceiptLocked(delta *sqliteMutationReceiptAccumulat
 		}
 		acc.resolutionRelevant = acc.resolutionRelevant || delta.resolutionRelevant
 		mergeSQLiteReceiptSet(acc.changedFiles, delta.changedFiles)
+		mergeSQLiteReceiptSet(acc.unresolvedFiles, delta.unresolvedFiles)
 		mergeSQLiteReceiptSet(acc.definitionFiles, delta.definitionFiles)
 		mergeSQLiteReceiptSet(acc.targetNames, delta.targetNames)
 		mergeSQLiteReceiptSet(acc.targetIDs, delta.targetIDs)
@@ -178,8 +182,47 @@ func recordSQLiteAddedNode(acc *sqliteMutationReceiptAccumulator, n *graph.Node)
 	}
 }
 
+// recordSQLiteChangedNodeIdentity records both sides of a single-ID node
+// upsert. The old and final rows are known exactly, so their file frontier is
+// sufficient for ResolveFilesAndIncoming to rebuild the current definition's
+// incoming unresolved buckets without a whole-graph fallback. Missing files
+// remain fail-closed only for referenceable sides; changes confined to
+// non-referenceable nodes cannot affect name resolution.
+func recordSQLiteChangedNodeIdentity(
+	acc *sqliteMutationReceiptAccumulator,
+	old sqliteMutationNodeIdentity,
+	final *graph.Node,
+) {
+	if acc == nil || final == nil {
+		return
+	}
+	oldReferenceable := graph.IsReferenceableSymbol(graph.NodeKind(old.kind))
+	finalReferenceable := graph.IsReferenceableSymbol(final.Kind)
+	if !oldReferenceable && !finalReferenceable {
+		return
+	}
+
+	acc.resolutionRelevant = true
+	if final.ID != "" {
+		acc.targetIDs[final.ID] = struct{}{}
+	}
+	for _, name := range []string{old.name, old.qualName, final.Name, final.QualName} {
+		if name != "" {
+			acc.targetNames[name] = struct{}{}
+		}
+	}
+	for _, filePath := range []string{old.filePath, final.FilePath} {
+		if filePath != "" {
+			acc.definitionFiles[filePath] = struct{}{}
+		}
+	}
+	if oldReferenceable && old.filePath == "" || finalReferenceable && final.FilePath == "" {
+		acc.noteIncomplete("node_identity_change_without_exact_file")
+	}
+}
+
 func recordSQLiteAddedEdge(acc *sqliteMutationReceiptAccumulator, e *graph.Edge, exactFile string) {
-	if acc == nil || e == nil || !graph.IsUnresolvedTarget(e.To) {
+	if acc == nil || e == nil {
 		return
 	}
 	if e.To != "" {
@@ -198,9 +241,15 @@ func recordSQLiteAddedEdge(acc *sqliteMutationReceiptAccumulator, e *graph.Edge,
 			acc.importCandidates[e.Alias] = struct{}{}
 		}
 	}
-	acc.resolutionRelevant = true
 	if exactFile != "" {
 		acc.changedFiles[exactFile] = struct{}{}
+	}
+	if !graph.IsUnresolvedTarget(e.To) {
+		return
+	}
+	acc.resolutionRelevant = true
+	if exactFile != "" {
+		acc.unresolvedFiles[exactFile] = struct{}{}
 	} else {
 		acc.noteIncomplete("edge_write_without_exact_file")
 	}

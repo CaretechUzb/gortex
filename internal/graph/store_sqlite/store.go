@@ -148,18 +148,28 @@ type Store struct {
 	// Bulk-load fast path (graph.BulkLoader). Non-nil only between
 	// BeginBulkLoad and FlushBulk, and only on a first/empty cold index.
 	// database/sql PRAGMAs are connection-local, so the fast path pins one
-	// connection (bulkConn) carrying synchronous=OFF + an enlarged page
-	// cache and routes every bulk write through it; bulkPrevSync /
-	// bulkPrevCacheSize hold the values FlushBulk restores before the
-	// connection returns to the pool. coordinatedBulkLoad is true while a
-	// multi-repository cold parse owns the outer load window; nested per-repo
-	// BeginBulkLoad/FlushBulk calls then leave that window open so indexes are
-	// rebuilt only after the final repository drains. All fields are guarded by
-	// writeMu.
-	bulkConn            *sql.Conn
-	bulkPrevSync        int64
-	bulkPrevCacheSize   int64
-	coordinatedBulkLoad bool
+	// connection (bulkConn) carrying synchronous=OFF, wal_autocheckpoint=0,
+	// and an enlarged page cache and routes every bulk write through it;
+	// bulkPrev* hold the values FlushBulk restores before the connection
+	// returns to the pool. coordinatedBulkLoad is true while a
+	// multi-repository cold parse owns the outer load window. Dense indexes are
+	// sealed once at bounded row counts (or the outer final boundary), while
+	// the pinned durability/FTS window stays open. All fields are guarded
+	// by writeMu.
+	bulkConn               *sql.Conn
+	bulkPrevSync           int64
+	bulkPrevCacheSize      int64
+	bulkPrevAutoCheckpoint int64
+	coordinatedBulkLoad    bool
+	bulkIndexesDeferred    bool
+	bulkDeferredNodeRows   int64
+	bulkDeferredEdgeRows   int64
+	bulkCheckpointNodeRows int64
+	bulkCheckpointEdgeRows int64
+	// bulkRowCheckpointBackoff suppresses only automatic row-cadence attempts
+	// after contention makes one bounded checkpoint unproductive. Explicit
+	// seal/planner/final checkpoints remain active. Reset at bulk begin/close.
+	bulkRowCheckpointBackoff bool
 	// These flags mean "bounded FTS maintenance requested" during a
 	// coordinated cold load. The historical names are retained to keep the
 	// cancellation/Close path stable; normal cold finalization never runs a
@@ -172,6 +182,11 @@ type Store struct {
 	// It is guarded by writeMu. A variable-limit execution failure lowers the
 	// cached value so later batches do not repeat an oversized prepare.
 	batchVariableLimit int
+
+	// jsonbIngestBuffers reuses the bounded JSONB and metadata arenas across
+	// AddBatch calls. It is guarded by writeMu and trimmed after every batch so
+	// one exceptional first row cannot become retained heap.
+	jsonbIngestBuffers jsonbIngestBuffers
 
 	// bulkFinalizeObserver is a package-private test/diagnostic hook. It runs
 	// synchronously under writeMu and therefore must not call back into Store.
@@ -383,9 +398,8 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	}
 	// Add the promoted node columns to databases created before they
 	// existed (CREATE TABLE IF NOT EXISTS won't alter an existing table).
-	// Must run before the droppable-index loop below — nodes_semantic_pending
-	// references a promoted column — and before prepare(), whose node INSERT
-	// references them too.
+	// Must run before prepare(), whose node INSERT references the promoted
+	// columns too.
 	if err := ensureNodeColumns(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite node columns: %w", err)
@@ -417,6 +431,14 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	// recreates them — see bulk_load.go). Kept out of schemaSQL so the two
 	// sites cannot drift.
 	for _, idx := range bulkDroppableIndexes {
+		if _, err := db.Exec(idx.ddl); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite create index %s: %w", idx.name, err)
+		}
+	}
+	// Sparse partial indexes remain live through a cold load, but share the
+	// same explicit DDL ownership rather than drifting into schemaSQL.
+	for _, idx := range bulkAlwaysLiveIndexes {
 		if _, err := db.Exec(idx.ddl); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite create index %s: %w", idx.name, err)
@@ -739,7 +761,8 @@ func (s *Store) Close() error {
 		s.deferredFTSOptimize = false
 		s.deferredContentFTS = false
 		s.coordinatedBulkLoad = false
-		bulkErr = s.flushBulkLocked()
+		sealErr := s.sealBulkIndexesLocked("close")
+		bulkErr = errors.Join(sealErr, s.closeBulkConnectionLocked())
 	}
 	s.writeMu.Unlock()
 
@@ -2329,13 +2352,13 @@ func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 // is dropped by the NOT LIKE, matching IsFnValuePlaceholder's infix shape.
 func (s *Store) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		scan, err := s.BeginUnresolvedEdgeScan()
+		scan, err := s.BeginUnresolvedEdgeScan(context.Background())
 		if err != nil {
 			return
 		}
 		var afterID int64
 		for {
-			page, err := s.ReadUnresolvedEdgePage(scan, afterID, 2048, 16<<20)
+			page, err := s.ReadUnresolvedEdgePage(context.Background(), scan, afterID, 2048, 16<<20)
 			if err != nil {
 				return
 			}

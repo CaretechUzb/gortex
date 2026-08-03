@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -34,7 +35,7 @@ func TestUnresolvedPageSkipTerminal(t *testing.T) {
 		got := make(map[string]bool)
 		var afterID int64
 		for {
-			page, err := s.ReadUnresolvedEdgePage(scan, afterID, 64, 1<<20)
+			page, err := s.ReadUnresolvedEdgePage(context.Background(), scan, afterID, 64, 1<<20)
 			require.NoError(t, err)
 			for _, e := range page.Edges {
 				got[e.To] = true
@@ -46,7 +47,7 @@ func TestUnresolvedPageSkipTerminal(t *testing.T) {
 		}
 	}
 
-	scan, err := s.BeginUnresolvedEdgeScan()
+	scan, err := s.BeginUnresolvedEdgeScan(context.Background())
 	require.NoError(t, err)
 
 	all := collect(scan)

@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"testing"
@@ -67,12 +68,12 @@ func TestUnresolvedPageScopeFilterPushdown(t *testing.T) {
 		s.AddNode(&graph.Node{ID: from, Kind: graph.KindFunction, Name: "f", FilePath: from, Language: "go"})
 		s.AddEdge(&graph.Edge{From: from, To: to, Kind: graph.EdgeCalls, FilePath: from, Line: 1})
 	}
-	add("repo-b/x.go::InScopeSource", "repo-z::unresolved::Out")   // kept: from in scope
-	add("repo-a/x.go::BareTarget", "unresolved::Bare")             // kept: bare target
-	add("repo-a/x.go::TargetInScope", "repo-b::unresolved::Hit")   // kept: target repo in scope
-	add("repo-a/x.go::Droppable", "repo-z::unresolved::Miss")      // dropped: both out of scope
+	add("repo-b/x.go::InScopeSource", "repo-z::unresolved::Out") // kept: from in scope
+	add("repo-a/x.go::BareTarget", "unresolved::Bare")           // kept: bare target
+	add("repo-a/x.go::TargetInScope", "repo-b::unresolved::Hit") // kept: target repo in scope
+	add("repo-a/x.go::Droppable", "repo-z::unresolved::Miss")    // dropped: both out of scope
 
-	scan, err := s.BeginUnresolvedEdgeScan()
+	scan, err := s.BeginUnresolvedEdgeScan(context.Background())
 	require.NoError(t, err)
 	scan.ScopeFilter = true
 	scan.ScopeAnchors = []string{"repo-b"}
@@ -80,7 +81,7 @@ func TestUnresolvedPageScopeFilterPushdown(t *testing.T) {
 	got := make(map[string]bool)
 	var afterID int64
 	for {
-		page, err := s.ReadUnresolvedEdgePage(scan, afterID, 64, 1<<20)
+		page, err := s.ReadUnresolvedEdgePage(context.Background(), scan, afterID, 64, 1<<20)
 		require.NoError(t, err)
 		for _, e := range page.Edges {
 			got[e.From] = true

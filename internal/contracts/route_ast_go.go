@@ -73,6 +73,19 @@ func goRouteFromCall(call *sitter.Node, src []byte, filePath, repoPrefix string,
 		return goRouteMatch{}, false
 	}
 	methodTok := field.Content(src)
+	// Reject non-route selector calls before inspecting or dereferencing their
+	// first argument. detectGoRoutesAST visits every Go call expression, so
+	// resolving an identifier here before the method switch turns ordinary
+	// calls (fmt.Sprintf, strings.Contains, database methods, and so on) into
+	// graph-wide constant lookups that can allocate large candidate slices.
+	// Keep this token set exactly aligned with the accepted switch cases below.
+	switch methodTok {
+	case "Handle", "HandleFunc",
+		"Get", "Post", "Put", "Delete", "Patch", "Head", "Options",
+		"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS":
+	default:
+		return goRouteMatch{}, false
+	}
 
 	args := call.ChildByFieldName("arguments")
 	if args == nil {

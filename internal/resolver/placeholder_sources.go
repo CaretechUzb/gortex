@@ -7,53 +7,133 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// placeholderSourceIndex is the per-pass set of from-IDs that dataflow edges
-// (arg_of, value_flow) actually key from unresolved placeholders. Built with
-// ONE EdgesByKind stream per pass and consulted before any adjacency probe:
-// a cold pass resolves hundreds of thousands of placeholders while only a
-// few thousand ever carry dataflow sources, so probing unconditionally would
-// be a point-lookup storm (and would violate the compute loop's interleave
-// cache contract, which the no-op-yield test pins).
+// placeholderSourceIndex is the per-pass exact-site identity census for
+// unresolved dataflow sources. The light scan transfers no Meta blobs. Keeping
+// identities by site matters because one wildcard placeholder can be shared by
+// thousands of source locations resolved across many compute chunks: decoding
+// that placeholder's complete adjacency once per chunk caused quadratic churn.
 type placeholderSourceIndex struct {
-	built bool
-	froms map[string]struct{}
+	built  bool
+	bySite map[placeholderSourceSite][]graph.EdgeIdentity
 }
+
+type placeholderSourceSite struct {
+	from     string
+	filePath string
+	line     int
+}
+
+type placeholderSourceMove struct {
+	identity graph.EdgeIdentity
+	newFrom  string
+}
+
+const placeholderSourceReindexBatchSize = 256
 
 func (idx *placeholderSourceIndex) ensure(g graph.Store) {
 	if idx.built {
 		return
 	}
 	idx.built = true
-	for _, kind := range []graph.EdgeKind{graph.EdgeArgOf, graph.EdgeValueFlow} {
-		for e := range graph.EdgesLightSeq(g, kind) {
-			if e == nil || !strings.Contains(e.From, graph.UnresolvedMarker) {
-				continue
-			}
-			if idx.froms == nil {
-				idx.froms = make(map[string]struct{})
-			}
-			idx.froms[e.From] = struct{}{}
+	for e := range graph.EdgesLightSeq(g, graph.EdgeArgOf, graph.EdgeValueFlow) {
+		if e == nil || !strings.Contains(e.From, graph.UnresolvedMarker) {
+			continue
 		}
+		if idx.bySite == nil {
+			idx.bySite = make(map[placeholderSourceSite][]graph.EdgeIdentity)
+		}
+		site := placeholderSourceSite{from: e.From, filePath: e.FilePath, line: e.Line}
+		idx.bySite[site] = append(idx.bySite[site], graph.EdgeIdentityFor(e))
 	}
 }
 
-// filter keeps only repoints whose source form actually exists in the
-// dataflow placeholder set.
+// filter keeps only repoints whose exact source site exists in the dataflow
+// placeholder census. It is used only by stores without exact identity lookup.
 func (idx *placeholderSourceIndex) filter(repoints []graph.PlaceholderRepoint) []graph.PlaceholderRepoint {
-	if len(idx.froms) == 0 {
+	if len(idx.bySite) == 0 {
 		return nil
 	}
 	kept := repoints[:0]
 	for _, rp := range repoints {
-		if _, ok := idx.froms[rp.OldFrom]; ok {
+		site := placeholderSourceSite{from: rp.OldFrom, filePath: rp.FilePath, line: rp.Line}
+		if len(idx.bySite[site]) != 0 {
 			kept = append(kept, rp)
-			// A moved source will not match again; keep the set honest so
-			// repeated resolutions of the same shared placeholder at other
-			// sites still probe (the site match decides), but a fully moved
-			// site costs at most one empty probe.
 		}
 	}
 	return kept
+}
+
+// take returns each exact edge identity at most once, preserving repoint order
+// so conflicting resolutions retain the legacy first-wins behaviour. Claimed
+// sites leave the census immediately; a later compute chunk cannot decode or
+// attempt to move them again.
+func (idx *placeholderSourceIndex) take(repoints []graph.PlaceholderRepoint) []placeholderSourceMove {
+	if len(idx.bySite) == 0 {
+		return nil
+	}
+	var moves []placeholderSourceMove
+	for _, rp := range repoints {
+		if rp.OldFrom == "" || rp.NewFrom == "" || rp.OldFrom == rp.NewFrom {
+			continue
+		}
+		site := placeholderSourceSite{from: rp.OldFrom, filePath: rp.FilePath, line: rp.Line}
+		identities := idx.bySite[site]
+		if len(identities) == 0 {
+			continue
+		}
+		delete(idx.bySite, site)
+		for _, identity := range identities {
+			moves = append(moves, placeholderSourceMove{identity: identity, newFrom: rp.NewFrom})
+		}
+	}
+	return moves
+}
+
+// reconcileIndexedPlaceholderSources exact-refetches only claimed identities
+// in bounded pages. Each backend closes its read cursor (or releases graph
+// locks) before ReindexEdges runs, so the SQLite one-connection contract and
+// in-memory mutation safety are both preserved.
+func reconcileIndexedPlaceholderSources(
+	g graph.Store,
+	finder graph.EdgeIdentityBatchFinder,
+	moves []placeholderSourceMove,
+) int {
+	moved := 0
+	for start := 0; start < len(moves); start += placeholderSourceReindexBatchSize {
+		end := start + placeholderSourceReindexBatchSize
+		if end > len(moves) {
+			end = len(moves)
+		}
+		page := moves[start:end]
+		identities := make([]graph.EdgeIdentity, len(page))
+		for i := range page {
+			identities[i] = page[i].identity
+		}
+		current := finder.FindEdgesByIdentities(identities)
+		batch := make([]graph.EdgeReindex, 0, len(page))
+		for _, move := range page {
+			e := current[move.identity]
+			if e == nil || graph.EdgeIdentityFor(e) != move.identity {
+				continue
+			}
+			e.From = move.newFrom
+			batch = append(batch, graph.EdgeReindex{
+				Edge:            e,
+				OldFrom:         move.identity.From,
+				OldTo:           move.identity.To,
+				OldKind:         move.identity.Kind,
+				OldFilePath:     move.identity.FilePath,
+				OldLine:         move.identity.Line,
+				RefreshIdentity: true,
+			})
+		}
+		if len(batch) == 0 {
+			continue
+		}
+		g.ReindexEdges(batch)
+		moved += len(batch)
+	}
+	return moved
 }
 
 // reconcilePlaceholderSources re-points dataflow edges keyed FROM an
@@ -74,6 +154,9 @@ func reconcilePlaceholderSources(g graph.Store, idx *placeholderSourceIndex, rei
 	}
 	if idx != nil {
 		idx.ensure(g)
+		if finder, ok := g.(graph.EdgeIdentityBatchFinder); ok {
+			return reconcileIndexedPlaceholderSources(g, finder, idx.take(repoints))
+		}
 		repoints = idx.filter(repoints)
 		if len(repoints) == 0 {
 			return 0

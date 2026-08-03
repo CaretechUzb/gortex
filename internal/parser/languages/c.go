@@ -140,49 +140,54 @@ func (e *CExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRes
 	var calls []cDeferredCall
 	var vars []cDeferredVar
 
-	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
-		switch {
+	// Query captures and every wrapper reached from them are consumed
+	// synchronously below; only graph values and scalar deferred records
+	// escape. Rewind the traversal wrappers before the later whole-tree passes.
+	root.WithScratch(func() {
+		parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
+			switch {
 
-		case m.Captures["func.def"] != nil:
-			e.emitFunction(m, filePath, fileID, src, result, seen)
+			case m.Captures["func.def"] != nil:
+				e.emitFunction(m, filePath, fileID, src, result, seen)
 
-		case m.Captures["proto.def"] != nil:
-			e.emitPrototype(m, filePath, fileID, result, seen)
+			case m.Captures["proto.def"] != nil:
+				e.emitPrototype(m, filePath, fileID, result, seen)
 
-		case m.Captures["struct.def"] != nil:
-			e.emitKindType(m, "struct", filePath, fileID, result, seen)
+			case m.Captures["struct.def"] != nil:
+				e.emitKindType(m, "struct", filePath, fileID, result, seen)
 
-		case m.Captures["enum.def"] != nil:
-			e.emitKindType(m, "enum", filePath, fileID, result, seen)
+			case m.Captures["enum.def"] != nil:
+				e.emitKindType(m, "enum", filePath, fileID, result, seen)
 
-		case m.Captures["typedef.def"] != nil:
-			e.emitKindType(m, "typedef", filePath, fileID, result, seen)
+			case m.Captures["typedef.def"] != nil:
+				e.emitKindType(m, "typedef", filePath, fileID, result, seen)
 
-		case m.Captures["include.def"] != nil:
-			e.emitInclude(m, filePath, fileID, result)
+			case m.Captures["include.def"] != nil:
+				e.emitInclude(m, filePath, fileID, result)
 
-		case m.Captures["macro.def"] != nil:
-			emitCMacro(m.Captures["macro.def"].Node, false, filePath, fileID, "c", src, result, seen)
+			case m.Captures["macro.def"] != nil:
+				emitCMacro(m.Captures["macro.def"].Node, false, filePath, fileID, "c", src, result, seen)
 
-		case m.Captures["macrofn.def"] != nil:
-			emitCMacro(m.Captures["macrofn.def"].Node, true, filePath, fileID, "c", src, result, seen)
+			case m.Captures["macrofn.def"] != nil:
+				emitCMacro(m.Captures["macrofn.def"].Node, true, filePath, fileID, "c", src, result, seen)
 
-		case m.Captures["call.expr"] != nil:
-			expr := m.Captures["call.expr"]
-			calls = append(calls, cDeferredCall{
-				name: m.Captures["call.name"].Text,
-				line: expr.StartLine + 1,
-			})
+			case m.Captures["call.expr"] != nil:
+				expr := m.Captures["call.expr"]
+				calls = append(calls, cDeferredCall{
+					name: m.Captures["call.name"].Text,
+					line: expr.StartLine + 1,
+				})
 
-		case m.Captures["var.def"] != nil:
-			def := m.Captures["var.def"]
-			vars = append(vars, cDeferredVar{
-				name:    m.Captures["var.name"].Text,
-				line:    def.StartLine + 1,
-				endLine: def.EndLine + 1,
-				isConst: cDeclIsConst(def.Node, src),
-			})
-		}
+			case m.Captures["var.def"] != nil:
+				def := m.Captures["var.def"]
+				vars = append(vars, cDeferredVar{
+					name:    m.Captures["var.name"].Text,
+					line:    def.StartLine + 1,
+					endLine: def.EndLine + 1,
+					isConst: cDeclIsConst(def.Node, src),
+				})
+			}
+		})
 	})
 
 	// Globals and call edges both need funcRanges; build once.
@@ -225,8 +230,8 @@ func (e *CExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRes
 		})
 	}
 
-	captureValueRefCandidates(result, root, filePath, src)
-	captureFnValueCandidates(result, root, filePath, src)
+	root.WithScratch(func() { captureValueRefCandidates(result, root, filePath, src) })
+	root.WithScratch(func() { captureFnValueCandidates(result, root, filePath, src) })
 	captureCFnPointerDispatch(result, root, filePath, src)
 	captureCFnAddressRefs(result, root, filePath, fileID, src)
 	return result, nil

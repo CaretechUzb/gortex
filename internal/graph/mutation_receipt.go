@@ -21,13 +21,17 @@ type MutationReceiptToken uint64
 // receipt with ResolutionRelevant false proves that no added definition or
 // unresolved reference can change name/import resolution.
 type MutationReceipt struct {
-	Complete           bool     `json:"complete"`
-	ResolutionRelevant bool     `json:"resolution_relevant"`
-	ChangedFiles       []string `json:"changed_files,omitempty"`
-	DefinitionFiles    []string `json:"definition_files,omitempty"`
-	TargetNames        []string `json:"target_names,omitempty"`
-	TargetIDs          []string `json:"target_ids,omitempty"`
-	ImportCandidates   []string `json:"import_candidates,omitempty"`
+	Complete           bool `json:"complete"`
+	ResolutionRelevant bool `json:"resolution_relevant"`
+	// ChangedFiles contains exact source files for added edges. Resolved edges
+	// belong here so cross-repository materialization still observes them, but
+	// they must not trigger another same-repository unresolved-edge pass.
+	ChangedFiles     []string `json:"changed_files,omitempty"`
+	UnresolvedFiles  []string `json:"unresolved_files,omitempty"`
+	DefinitionFiles  []string `json:"definition_files,omitempty"`
+	TargetNames      []string `json:"target_names,omitempty"`
+	TargetIDs        []string `json:"target_ids,omitempty"`
+	ImportCandidates []string `json:"import_candidates,omitempty"`
 	// IncompleteReason names the FIRST mutation shape that voided the
 	// receipt (a writer call site, or a semantic slug like
 	// "edge_missing_file"). An incomplete receipt forces a whole-graph
@@ -46,12 +50,27 @@ func ReceiptIncompleteCallerReason() string {
 	return "unknown_writer"
 }
 
-// ResolutionFiles returns the deduplicated exact file frontier needed by
-// Resolver.ResolveFilesAndIncoming.
+// ResolutionFiles returns the exact frontier that can create or bind unresolved
+// edges: files containing newly-added unresolved edges plus changed definitions.
 func (r MutationReceipt) ResolutionFiles() []string {
-	seen := make(map[string]struct{}, len(r.ChangedFiles)+len(r.DefinitionFiles))
-	out := make([]string, 0, len(seen))
-	for _, files := range [][]string{r.ChangedFiles, r.DefinitionFiles} {
+	return receiptFileUnion(r.UnresolvedFiles, r.DefinitionFiles)
+}
+
+// CrossRepoFiles returns the exact frontier whose resolved base-edge layer may
+// need cross-repository materialization. It deliberately includes resolved edge
+// sources without feeding them back through same-repository name resolution.
+func (r MutationReceipt) CrossRepoFiles() []string {
+	return receiptFileUnion(r.ChangedFiles, r.DefinitionFiles)
+}
+
+func receiptFileUnion(groups ...[]string) []string {
+	capacity := 0
+	for _, files := range groups {
+		capacity += len(files)
+	}
+	seen := make(map[string]struct{}, capacity)
+	out := make([]string, 0, capacity)
+	for _, files := range groups {
 		for _, file := range files {
 			if file == "" {
 				continue
@@ -82,6 +101,7 @@ type mutationReceiptAccumulator struct {
 	incompleteReason   string
 	resolutionRelevant bool
 	changedFiles       map[string]struct{}
+	unresolvedFiles    map[string]struct{}
 	definitionFiles    map[string]struct{}
 	targetNames        map[string]struct{}
 	targetIDs          map[string]struct{}
@@ -100,6 +120,7 @@ func newMutationReceiptAccumulator() *mutationReceiptAccumulator {
 	return &mutationReceiptAccumulator{
 		complete:         true,
 		changedFiles:     make(map[string]struct{}),
+		unresolvedFiles:  make(map[string]struct{}),
 		definitionFiles:  make(map[string]struct{}),
 		targetNames:      make(map[string]struct{}),
 		targetIDs:        make(map[string]struct{}),
@@ -113,6 +134,7 @@ func (a *mutationReceiptAccumulator) receipt() MutationReceipt {
 		IncompleteReason:   a.incompleteReason,
 		ResolutionRelevant: a.resolutionRelevant,
 		ChangedFiles:       sortedReceiptKeys(a.changedFiles),
+		UnresolvedFiles:    sortedReceiptKeys(a.unresolvedFiles),
 		DefinitionFiles:    sortedReceiptKeys(a.definitionFiles),
 		TargetNames:        sortedReceiptKeys(a.targetNames),
 		TargetIDs:          sortedReceiptKeys(a.targetIDs),
@@ -221,9 +243,6 @@ func (g *Graph) recordAddedNodeForReceipts(n *Node, definition, exact bool) {
 		if n.QualName != "" {
 			acc.targetNames[n.QualName] = struct{}{}
 		}
-		if n.FilePath != "" {
-			acc.changedFiles[n.FilePath] = struct{}{}
-		}
 		if !definition {
 			continue
 		}
@@ -267,7 +286,9 @@ func (g *Graph) recordAddedEdgeForReceipts(e *Edge, exactFile string) {
 			continue
 		}
 		acc.resolutionRelevant = true
-		if exactFile == "" {
+		if exactFile != "" {
+			acc.unresolvedFiles[exactFile] = struct{}{}
+		} else {
 			acc.noteIncomplete("edge_write_without_exact_file")
 		}
 	}

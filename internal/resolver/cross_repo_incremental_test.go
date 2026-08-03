@@ -37,6 +37,57 @@ func TestDetectCrossRepoEdgesForFilesUsesExactIncidentFrontier(t *testing.T) {
 	}
 }
 
+func TestDetectCrossRepoEdgesForMutationFilesSeparatesRoles(t *testing.T) {
+	newFixture := func() *graph.Graph {
+		g := graph.New()
+		nodes := []*graph.Node{
+			{ID: "repoA/a.go::A", Kind: graph.KindFunction, FilePath: "repoA/a.go", RepoPrefix: "repoA"},
+			{ID: "repoB/b.go::B", Kind: graph.KindFunction, FilePath: "repoB/b.go", RepoPrefix: "repoB"},
+			{ID: "repoD/definition.go::D", Kind: graph.KindFunction, FilePath: "repoD/definition.go", RepoPrefix: "repoD"},
+			{ID: "repoE/e.go::E", Kind: graph.KindFunction, FilePath: "repoE/e.go", RepoPrefix: "repoE"},
+			{ID: "repoF/edge-source.go::F", Kind: graph.KindFunction, FilePath: "repoF/edge-source.go", RepoPrefix: "repoF"},
+			{ID: "repoG/g.go::G", Kind: graph.KindFunction, FilePath: "repoG/g.go", RepoPrefix: "repoG"},
+		}
+		g.AddBatch(nodes, []*graph.Edge{
+			{From: nodes[0].ID, To: nodes[1].ID, Kind: graph.EdgeCalls, FilePath: "repoF/edge-source.go", Line: 1},
+			{From: nodes[4].ID, To: nodes[5].ID, Kind: graph.EdgeCalls, FilePath: "elsewhere.go", Line: 2},
+			{From: nodes[2].ID, To: nodes[3].ID, Kind: graph.EdgeCalls, FilePath: "elsewhere.go", Line: 3},
+			{From: nodes[0].ID, To: nodes[1].ID, Kind: graph.EdgeCalls, FilePath: "repoD/definition.go", Line: 4},
+		})
+		return g
+	}
+	crossKind, ok := graph.CrossRepoKindFor(graph.EdgeCalls)
+	if !ok {
+		t.Fatal("calls has no cross-repo kind")
+	}
+
+	t.Run("edge source", func(t *testing.T) {
+		g := newFixture()
+		if got := DetectCrossRepoEdgesForMutationFiles(g, []string{"repoF/edge-source.go"}, nil); got != 1 {
+			t.Fatalf("emitted = %d, want edge-source edge only", got)
+		}
+		if !hasEdgeKindTo(g.GetOutEdges("repoA/a.go::A"), crossKind, "repoB/b.go::B") {
+			t.Fatal("edge stamped with changed source file was not materialized")
+		}
+		if hasEdgeKindTo(g.GetOutEdges("repoF/edge-source.go::F"), crossKind, "repoG/g.go::G") {
+			t.Fatal("edge-source role broadened into endpoint incidence")
+		}
+	})
+
+	t.Run("definition", func(t *testing.T) {
+		g := newFixture()
+		if got := DetectCrossRepoEdgesForMutationFiles(g, nil, []string{"repoD/definition.go"}); got != 1 {
+			t.Fatalf("emitted = %d, want definition-incident edge only", got)
+		}
+		if !hasEdgeKindTo(g.GetOutEdges("repoD/definition.go::D"), crossKind, "repoE/e.go::E") {
+			t.Fatal("edge incident to changed definition was not materialized")
+		}
+		if hasEdgeKindTo(g.GetOutEdges("repoA/a.go::A"), crossKind, "repoB/b.go::B") {
+			t.Fatal("definition role broadened into edge source stamps")
+		}
+	})
+}
+
 func TestResolveForFilePrefixesMultiRepoGraphPath(t *testing.T) {
 	g := graph.New()
 	g.AddBatch([]*graph.Node{

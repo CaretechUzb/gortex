@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"iter"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -157,4 +158,118 @@ func TestValueRefConditionalDef(t *testing.T) {
 	e := readsEdge(g, "cfg.py::use", "cfg.py::API_URL@6")
 	require.NotNil(t, e, "binds to the nearest preceding conditional declarator")
 	assert.Equal(t, true, e.Meta["conditional_def"])
+}
+
+type valueRefProjectionTestStore struct {
+	graph.Store
+	candidates        []*graph.Edge
+	scanCalls         int
+	edgesByKindCalls  int
+	reindexOldTargets []string
+}
+
+func (s *valueRefProjectionTestStore) ValueRefPlaceholderEdges() iter.Seq[*graph.Edge] {
+	s.scanCalls++
+	return func(yield func(*graph.Edge) bool) {
+		for _, edge := range s.candidates {
+			if !yield(edge) {
+				return
+			}
+		}
+	}
+}
+
+func (s *valueRefProjectionTestStore) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
+	s.edgesByKindCalls++
+	return s.Store.EdgesByKind(kind)
+}
+
+func (s *valueRefProjectionTestStore) ReindexEdges(batch []graph.EdgeReindex) {
+	for _, mutation := range batch {
+		s.reindexOldTargets = append(s.reindexOldTargets, mutation.OldTo)
+	}
+	s.Store.ReindexEdges(batch)
+}
+
+type valueRefProjectionFixture struct {
+	graph               *graph.Graph
+	first, second       *graph.Edge
+	staleVia, wrongKind *graph.Edge
+}
+
+func newValueRefProjectionFixture() valueRefProjectionFixture {
+	g := graph.New()
+	for _, node := range []*graph.Node{
+		{ID: "cfg.go::ALPHA_LIMIT", Kind: graph.KindConstant, Name: "ALPHA_LIMIT", FilePath: "cfg.go", StartLine: 2, Language: "go"},
+		{ID: "cfg.go::BETA_LIMIT", Kind: graph.KindConstant, Name: "BETA_LIMIT", FilePath: "cfg.go", StartLine: 3, Language: "go"},
+		{ID: "cfg.go::First", Kind: graph.KindFunction, Name: "First", FilePath: "cfg.go", StartLine: 10, Language: "go"},
+		{ID: "cfg.go::Second", Kind: graph.KindFunction, Name: "Second", FilePath: "cfg.go", StartLine: 20, Language: "go"},
+		{ID: "cfg.go::Stale", Kind: graph.KindFunction, Name: "Stale", FilePath: "cfg.go", StartLine: 30, Language: "go"},
+		{ID: "cfg.go::WrongKind", Kind: graph.KindFunction, Name: "WrongKind", FilePath: "cfg.go", StartLine: 40, Language: "go"},
+	} {
+		g.AddNode(node)
+	}
+	first := &graph.Edge{
+		From: "cfg.go::First", To: "unresolved::valueref::ALPHA_LIMIT", Kind: graph.EdgeReads,
+		FilePath: "cfg.go", Line: 12, Origin: graph.OriginSpeculative,
+		Meta: map[string]any{"via": valueRefCandidateVia, "name": "ALPHA_LIMIT"},
+	}
+	second := &graph.Edge{
+		From: "cfg.go::Second", To: "unresolved::valueref::BETA_LIMIT", Kind: graph.EdgeReads,
+		FilePath: "cfg.go", Line: 22, Origin: graph.OriginSpeculative,
+		Meta: map[string]any{"via": valueRefCandidateVia, "name": "BETA_LIMIT"},
+	}
+	staleVia := &graph.Edge{
+		From: "cfg.go::Stale", To: "unresolved::valueref::ALPHA_LIMIT", Kind: graph.EdgeReads,
+		FilePath: "cfg.go", Line: 32, Origin: graph.OriginSpeculative,
+		Meta: map[string]any{"via": valueRefVia, "name": "ALPHA_LIMIT"},
+	}
+	wrongKind := &graph.Edge{
+		From: "cfg.go::WrongKind", To: "unresolved::valueref::ALPHA_LIMIT", Kind: graph.EdgeCalls,
+		FilePath: "cfg.go", Line: 42, Origin: graph.OriginSpeculative,
+		Meta: map[string]any{"via": valueRefCandidateVia, "name": "ALPHA_LIMIT"},
+	}
+	for _, edge := range []*graph.Edge{first, second, staleVia, wrongKind} {
+		g.AddEdge(edge)
+	}
+	return valueRefProjectionFixture{
+		graph: g, first: first, second: second, staleVia: staleVia, wrongKind: wrongKind,
+	}
+}
+
+// TestValueRefProjectionParityStaleAndOrder proves the optional candidate scan
+// is semantics-identical to the EdgeReads fallback, stale/wrong-kind rows are
+// revalidated away, and the framework adapter preserves the scanner's order.
+func TestValueRefProjectionParityStaleAndOrder(t *testing.T) {
+	fallback := newValueRefProjectionFixture()
+	require.Equal(t, 2, ResolveValueRefs(fallback.graph))
+
+	projectedFixture := newValueRefProjectionFixture()
+	projected := &valueRefProjectionTestStore{
+		Store: projectedFixture.graph,
+		// Deliberately reverse the live candidates and interleave stale rows.
+		candidates: []*graph.Edge{
+			projectedFixture.wrongKind,
+			projectedFixture.staleVia,
+			projectedFixture.second,
+			projectedFixture.first,
+		},
+	}
+	batchStore := newFrameworkEdgeBatchStore(projected)
+	require.Equal(t, 2, ResolveValueRefs(batchStore))
+	assert.Equal(t, 1, projected.scanCalls)
+	assert.Zero(t, projected.edgesByKindCalls, "projected path must not decode the whole EdgeReads kind")
+	assert.Equal(t, []string{
+		"unresolved::valueref::BETA_LIMIT",
+		"unresolved::valueref::ALPHA_LIMIT",
+	}, projected.reindexOldTargets, "projection and framework adapter must preserve candidate order")
+
+	for _, store := range []graph.Store{fallback.graph, projectedFixture.graph} {
+		require.NotNil(t, readsEdge(store, "cfg.go::First", "cfg.go::ALPHA_LIMIT"))
+		require.NotNil(t, readsEdge(store, "cfg.go::Second", "cfg.go::BETA_LIMIT"))
+	}
+	assert.Equal(t, "unresolved::valueref::ALPHA_LIMIT", projectedFixture.staleVia.To)
+	assert.Equal(t, valueRefVia, projectedFixture.staleVia.Meta["via"])
+	assert.Equal(t, "unresolved::valueref::ALPHA_LIMIT", projectedFixture.wrongKind.To)
+	assert.Equal(t, graph.EdgeCalls, projectedFixture.wrongKind.Kind)
 }

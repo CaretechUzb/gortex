@@ -9,7 +9,7 @@ const maxConcurrentExpensiveAnalyses = 1
 
 var (
 	errAnalysisBusy        = errors.New("expensive analysis already running; retry after it completes")
-	errAnalysisWarmup      = errors.New("expensive analysis unavailable while graph warmup is running; retry after workspace readiness")
+	errAnalysisWarmup      = errors.New("expensive analysis unavailable until daemon enrichment completes; retry after workspace readiness reaches enrichment_complete")
 	expensiveAnalysisSlots = make(chan struct{}, maxConcurrentExpensiveAnalyses)
 )
 
@@ -37,7 +37,7 @@ func (s *Server) acquireAnalyzeAdmission(ctx context.Context, kind string) (func
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if s != nil && s.warmupSnapshot().warming() {
+	if s != nil && s.warmupSnapshot().enrichmentIncomplete() {
 		return nil, errAnalysisWarmup
 	}
 	select {

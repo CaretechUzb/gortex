@@ -147,6 +147,33 @@ func TestFrameworkEdgeBatchReadYourWritesAndOrdering(t *testing.T) {
 	}
 }
 
+func TestFrameworkEdgeBatchIncomingIdentityProjectionMergesStaged(t *testing.T) {
+	g := graph.New()
+	shadowed := &graph.Edge{From: "one", To: "unresolved::target", Kind: graph.EdgeCalls, FilePath: "x.go", Line: 7}
+	g.AddEdge(shadowed)
+	batch := newFrameworkEdgeBatchStore(g)
+	batch.AddEdge(&graph.Edge{
+		From: shadowed.From, To: shadowed.To, Kind: shadowed.Kind,
+		FilePath: shadowed.FilePath, Line: shadowed.Line, Meta: map[string]any{"staged": true},
+	})
+	staged := &graph.Edge{From: "two", To: shadowed.To, Kind: graph.EdgeReferences, FilePath: "y.go", Line: 8}
+	batch.AddEdge(staged)
+
+	got := batch.GetInEdgeIdentitiesByNodeIDs([]string{"", shadowed.To, shadowed.To, "missing"})[shadowed.To]
+	want := map[graph.EdgeIdentity]struct{}{
+		graph.EdgeIdentityFor(shadowed): {},
+		graph.EdgeIdentityFor(staged):   {},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("incoming staged identities = %#v, want %d unique rows", got, len(want))
+	}
+	for _, identity := range got {
+		if _, ok := want[identity]; !ok {
+			t.Fatalf("unexpected incoming staged identity: %#v", identity)
+		}
+	}
+}
+
 func TestFrameworkPartialLegacyPathBatchesWrites(t *testing.T) {
 	g := graph.New()
 	counting := &frameworkBatchTestStore{Store: g}

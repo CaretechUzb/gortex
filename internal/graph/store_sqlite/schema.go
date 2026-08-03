@@ -69,7 +69,7 @@ const (
 // adds to a table created before they existed — which, since none of them are
 // in schemaSQL's CREATE TABLE, includes a freshly created table too.
 // fromRepoColumnDDL mirrors graph.RepoPrefixOfID exactly: the substring
-// before the first '/' when that slash is past position 1, else '' (bare
+// before the first '/' when that slash is past position 1, else ” (bare
 // unresolved sentinels and single-repo-mode ids). Same rationale as
 // isUnresolvedColumnDDL: computed by SQLite from from_id, no Go call site
 // can forget to keep it in sync, and the scoped resolver pushdown can test
@@ -81,7 +81,7 @@ const fromRepoColumnDDL = `from_repo TEXT GENERATED ALWAYS AS (
 
 // toRepoUnresolvedColumnDDL mirrors graph.UnresolvedRepoPrefix exactly for
 // the shapes the pending scan can see (is_unresolved = 1 guarantees one of
-// the two unresolved encodings): '' for the bare `unresolved::` prefix form,
+// the two unresolved encodings): ” for the bare `unresolved::` prefix form,
 // the leading `<repo>` for the `<repo>::unresolved::` infix form, NULL for
 // anything else. NULL is deliberately fail-open — a consumer predicate must
 // treat it as "load the row and let the Go filter decide".
@@ -584,6 +584,14 @@ CREATE TABLE IF NOT EXISTS clone_shingles (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS clone_shingles_by_repo
     ON clone_shingles(repo_prefix, node_id);
+
+-- clone_corpus_state records that one repository's clone sidecar is
+-- authoritative even when it contains zero rows. Without this marker an empty
+-- page is indistinguishable from a database written before clone_shingles
+-- existed, forcing a full GetRepoNodes compatibility scan on every restart.
+CREATE TABLE IF NOT EXISTS clone_corpus_state (
+    repo_prefix TEXT PRIMARY KEY
+) WITHOUT ROWID;
 
 -- constant_values is the per-KindConstant literal-value sidecar: one row
 -- per constant whose RHS is a string / numeric literal, keyed by node_id

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zzet/gortex/internal/graph"
 	_ "modernc.org/sqlite"
 )
 
@@ -43,6 +44,43 @@ func TestOpenStampsFreshDB(t *testing.T) {
 	defer s.Close()
 	if v, err := readUserVersion(s.db); err != nil || v != currentSchemaVersion {
 		t.Fatalf("fresh user_version = %d (err %v), want %d", v, err, currentSchemaVersion)
+	}
+}
+
+func TestOpenV8DropsUnusedSemanticPendingIndexInPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	s.AddBatch([]*graph.Node{{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"}}, nil)
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`CREATE INDEX nodes_semantic_pending ON nodes(repo_prefix) WHERE semantic_type IS NULL`); err != nil {
+			t.Fatalf("create legacy index: %v", err)
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 8`); err != nil {
+			t.Fatalf("stamp v8: %v", err)
+		}
+	})
+
+	migrated, err := Open(path)
+	if err != nil {
+		t.Fatalf("open v8 store: %v", err)
+	}
+	defer migrated.Close()
+	var obsolete int
+	if err := migrated.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'nodes_semantic_pending'`).Scan(&obsolete); err != nil {
+		t.Fatalf("probe obsolete index: %v", err)
+	}
+	if obsolete != 0 {
+		t.Fatalf("obsolete semantic pending index count = %d, want 0", obsolete)
+	}
+	if migrated.NodeCount() != 1 || migrated.NeedsRebuild() {
+		t.Fatalf("v8 migration changed graph or requested rebuild: nodes=%d rebuild=%v", migrated.NodeCount(), migrated.NeedsRebuild())
 	}
 }
 

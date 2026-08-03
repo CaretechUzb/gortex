@@ -1,6 +1,8 @@
 package store_sqlite
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -8,6 +10,29 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 )
+
+func TestUnresolvedEdgePagerHonorsCancellation(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "unresolved-cancel.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	store.AddEdge(&graph.Edge{From: "caller", To: "unresolved::target", Kind: graph.EdgeCalls})
+
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := store.BeginUnresolvedEdgeScan(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("BeginUnresolvedEdgeScan error = %v, want context.Canceled", err)
+	}
+
+	scan, err := store.BeginUnresolvedEdgeScan(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReadUnresolvedEdgePage(canceled, scan, 0, 16, 1<<20); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadUnresolvedEdgePage error = %v, want context.Canceled", err)
+	}
+}
 
 func TestUnresolvedEdgePagesStableHighWaterAndBounds(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "unresolved.sqlite"))
@@ -30,23 +55,23 @@ func TestUnresolvedEdgePagesStableHighWaterAndBounds(t *testing.T) {
 	}
 	store.AddBatch(nodes, edges)
 
-	scan, err := store.BeginUnresolvedEdgeScan()
+	scan, err := store.BeginUnresolvedEdgeScan(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scan.PendingBefore != 5 {
-		t.Fatalf("PendingBefore = %d, want 5", scan.PendingBefore)
+	if scan.PendingBefore != -1 {
+		t.Fatalf("PendingBefore = %d, want -1 (not pre-counted)", scan.PendingBefore)
 	}
 	for label, plan := range map[string]string{
-		"count": queryPlan(t, store, `SELECT COALESCE(MAX(id), 0), COUNT(*) FROM edges WHERE `+unresolvedEdgePredicate),
-		"page":  queryPlan(t, store, `SELECT id FROM edges WHERE id > ? AND id <= ? AND `+unresolvedEdgePredicate+` ORDER BY id LIMIT ?`, 0, scan.HighWaterID, 2),
+		"high_water": queryPlan(t, store, `SELECT id FROM edges INDEXED BY edges_by_unresolved WHERE `+unresolvedEdgePredicate+` ORDER BY id DESC LIMIT 1`),
+		"page":       queryPlan(t, store, `SELECT id FROM edges WHERE id > ? AND id <= ? AND `+unresolvedEdgePredicate+` ORDER BY id LIMIT ?`, 0, scan.HighWaterID, 2),
 	} {
 		plan = strings.ToLower(plan)
 		if !strings.Contains(plan, "edges_by_unresolved") || strings.Contains(plan, "scan edges") {
 			t.Fatalf("%s unresolved plan is not a bounded index search:\n%s", label, plan)
 		}
 	}
-	first, err := store.ReadUnresolvedEdgePage(scan, 0, 2, 1<<20)
+	first, err := store.ReadUnresolvedEdgePage(t.Context(), scan, 0, 2, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +93,7 @@ func TestUnresolvedEdgePagesStableHighWaterAndBounds(t *testing.T) {
 	}
 	after := first.NextID
 	for !first.Exhausted {
-		page, err := store.ReadUnresolvedEdgePage(scan, after, 2, 1<<20)
+		page, err := store.ReadUnresolvedEdgePage(t.Context(), scan, after, 2, 1<<20)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -127,7 +152,7 @@ func TestPartialUnresolvedIndexTracksTargetTransitions(t *testing.T) {
 	if got := indexCount(); got != 0 {
 		t.Fatalf("resolved transition left %d partial-index rows, want 0", got)
 	}
-	resolvedScan, err := store.BeginUnresolvedEdgeScan()
+	resolvedScan, err := store.BeginUnresolvedEdgeScan(t.Context())
 	if err != nil || resolvedScan.PendingBefore != 0 {
 		t.Fatalf("resolved scan pending=%d err=%v, want 0,nil", resolvedScan.PendingBefore, err)
 	}
@@ -143,11 +168,11 @@ func TestPartialUnresolvedIndexTracksTargetTransitions(t *testing.T) {
 	if got := indexCount(); got != 1 {
 		t.Fatalf("unresolved transition produced %d partial-index rows, want 1", got)
 	}
-	unresolvedScan, err := store.BeginUnresolvedEdgeScan()
-	if err != nil || unresolvedScan.PendingBefore != 1 {
-		t.Fatalf("unresolved scan pending=%d err=%v, want 1,nil", unresolvedScan.PendingBefore, err)
+	unresolvedScan, err := store.BeginUnresolvedEdgeScan(t.Context())
+	if err != nil || unresolvedScan.PendingBefore != -1 {
+		t.Fatalf("unresolved scan pending=%d err=%v, want -1,nil", unresolvedScan.PendingBefore, err)
 	}
-	page, err := store.ReadUnresolvedEdgePage(unresolvedScan, 0, 10, 1<<20)
+	page, err := store.ReadUnresolvedEdgePage(t.Context(), unresolvedScan, 0, 10, 1<<20)
 	if err != nil || len(page.Edges) != 1 || page.Edges[0].To != "repo::unresolved::again" || !page.Exhausted {
 		t.Fatalf("unresolved page=%+v err=%v, want one terminal transitioned edge", page, err)
 	}
@@ -171,18 +196,18 @@ func TestUnresolvedEdgePageByteBoundMakesProgress(t *testing.T) {
 		{From: "b", To: "unresolved::b", Kind: graph.EdgeCalls},
 	})
 
-	scan, err := store.BeginUnresolvedEdgeScan()
+	scan, err := store.BeginUnresolvedEdgeScan(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	page, err := store.ReadUnresolvedEdgePage(scan, 0, 100, 1024)
+	page, err := store.ReadUnresolvedEdgePage(t.Context(), scan, 0, 100, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(page.Edges) != 1 || page.NextID == 0 || page.Exhausted {
 		t.Fatalf("oversized page = len %d next %d exhausted %v; want one advancing non-terminal row", len(page.Edges), page.NextID, page.Exhausted)
 	}
-	next, err := store.ReadUnresolvedEdgePage(scan, page.NextID, 100, 1024)
+	next, err := store.ReadUnresolvedEdgePage(t.Context(), scan, page.NextID, 100, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}

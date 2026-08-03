@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"context"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -13,12 +14,12 @@ type unresolvedPageRecordingStore struct {
 	calls    int
 }
 
-func (s *unresolvedPageRecordingStore) BeginUnresolvedEdgeScan() (graph.UnresolvedEdgeScan, error) {
+func (s *unresolvedPageRecordingStore) BeginUnresolvedEdgeScan(context.Context) (graph.UnresolvedEdgeScan, error) {
 	return graph.UnresolvedEdgeScan{HighWaterID: 1, PendingBefore: 1}, nil
 }
 
 func (s *unresolvedPageRecordingStore) ReadUnresolvedEdgePage(
-	_ graph.UnresolvedEdgeScan, _ int64, maxRows, maxBytes int,
+	_ context.Context, _ graph.UnresolvedEdgeScan, _ int64, maxRows, maxBytes int,
 ) (graph.UnresolvedEdgePage, error) {
 	s.calls++
 	s.maxRows = maxRows

@@ -1,10 +1,13 @@
 package indexer
 
 import (
+	"context"
 	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
@@ -166,8 +169,23 @@ func (mi *MultiIndexer) ReposInWorkspace(workspaceID string) map[string]bool {
 // Returns the count of nodes and contracts updated for telemetry.
 // Idempotent: re-running on an already-stamped graph is a no-op.
 func (mi *MultiIndexer) BackfillWorkspaceSlugs() (nodesStamped, contractsStamped int) {
+	nodesStamped, contractsStamped, _ = mi.BackfillWorkspaceSlugsWithImpact()
+	return nodesStamped, contractsStamped
+}
+
+// BackfillWorkspaceSlugsWithImpact preserves BackfillWorkspaceSlugs' changed-row
+// telemetry and separately reports node stamps that can alter effective
+// workspace eligibility. Backends without the exact-impact capability fail
+// closed by reporting every changed node as resolution-affecting.
+func (mi *MultiIndexer) BackfillWorkspaceSlugsWithImpact() (nodesStamped, contractsStamped, resolutionAffected int) {
+	return mi.backfillWorkspaceSlugsWithImpact()
+}
+
+// backfillWorkspaceSlugsWithImpact retains public changed-row telemetry and
+// separately reports stamps that can alter cross-workspace eligibility.
+func (mi *MultiIndexer) backfillWorkspaceSlugsWithImpact() (nodesStamped, contractsStamped, resolutionAffected int) {
 	if mi == nil || mi.graph == nil || mi.configMgr == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	mi.mu.RLock()
 	repoMeta := make(map[string]string, len(mi.repos))
@@ -219,8 +237,15 @@ func (mi *MultiIndexer) BackfillWorkspaceSlugs() (nodesStamped, contractsStamped
 		})
 	}
 	sort.Slice(slugRows, func(i, j int) bool { return slugRows[i].RepoPrefix < slugRows[j].RepoPrefix })
-	if backfiller, ok := mi.graph.(graph.WorkspaceSlugBackfiller); ok {
+	if backfiller, ok := mi.graph.(graph.WorkspaceSlugImpactBackfiller); ok {
+		result := backfiller.BackfillWorkspaceSlugsWithImpact(slugRows)
+		nodesStamped = result.Changed
+		resolutionAffected = result.ResolutionAffected
+	} else if backfiller, ok := mi.graph.(graph.WorkspaceSlugBackfiller); ok {
 		nodesStamped = backfiller.BackfillWorkspaceSlugs(slugRows)
+		// Unknown implementations do not expose the effective-boundary delta;
+		// fail closed and preserve the former full-resolve behavior.
+		resolutionAffected = nodesStamped
 	}
 
 	// Per-repo contract registries: rehydrated from snapshot they
@@ -263,7 +288,7 @@ func (mi *MultiIndexer) BackfillWorkspaceSlugs() (nodesStamped, contractsStamped
 			}
 		}
 	}
-	return nodesStamped, contractsStamped
+	return nodesStamped, contractsStamped, resolutionAffected
 }
 
 // RunGlobalResolve runs a cross-repo + cross-workspace resolution
@@ -305,14 +330,23 @@ func (mi *MultiIndexer) newCrossRepoResolver() *resolver.CrossRepoResolver {
 }
 
 func (mi *MultiIndexer) runCrossRepoResolve(reconcileContracts bool) {
+	if err := mi.runCrossRepoResolveContext(context.Background(), reconcileContracts); err != nil {
+		mi.logger.Error("cross-repo resolve", zap.Error(err))
+	}
+}
+
+func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcileContracts bool) error {
 	cr := mi.newCrossRepoResolver()
 	if cr == nil {
-		return
+		return nil
 	}
-	cr.ResolveAll()
+	if _, err := cr.ResolveAllContext(ctx); err != nil {
+		return err
+	}
 	if reconcileContracts {
 		mi.ReconcileContractEdges()
 	}
+	return nil
 }
 
 // runCrossRepoResolveFiles binds both outgoing and incoming unresolved edges
@@ -320,14 +354,22 @@ func (mi *MultiIndexer) runCrossRepoResolve(reconcileContracts bool) {
 // and global topology-writer gate, so the graph cannot expose a half-resolved
 // batch between same-repo, semantic, and cross-repository phases.
 func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) {
-	if len(filePaths) == 0 {
+	mi.runCrossRepoResolveMutationFiles(filePaths, filePaths)
+}
+
+func (mi *MultiIndexer) runCrossRepoResolveMutationFiles(resolutionFiles, materializationFiles []string) {
+	mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, materializationFiles, materializationFiles)
+}
+
+func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) {
+	if len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
 		return
 	}
 	cr := mi.newCrossRepoResolver()
 	if cr == nil {
 		return
 	}
-	cr.ResolveFilesAndIncoming(filePaths)
+	cr.ResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles)
 }
 
 // crossWorkspaceLookup builds a resolver.CrossWorkspaceDepLookup from

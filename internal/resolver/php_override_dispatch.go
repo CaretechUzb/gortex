@@ -30,6 +30,10 @@ const phpOverrideDispatchCap = 8
 // ancestor is left unresolved rather than sprayed repo-wide. Runs AFTER the
 // cross-package guard so its edges are never reverted. PHP-only.
 func (r *Resolver) resolvePHPOverrideDispatch() int {
+	return r.resolvePHPOverrideDispatchCandidates(r.collectOverrideDispatchCandidates())
+}
+
+func (r *Resolver) resolvePHPOverrideDispatchCandidates(candidates overrideDispatchCandidates) int {
 	g := r.graph
 	if g == nil {
 		return 0
@@ -48,8 +52,8 @@ func (r *Resolver) resolvePHPOverrideDispatch() int {
 	var jobs []job
 
 	// Collect first — mutating the graph while ranging EdgesByKind is unsafe.
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if e == nil || e.IsSpeculative() {
+	for e := range candidates.phpEdges(g) {
+		if e == nil || e.Kind != graph.EdgeCalls || e.IsSpeculative() {
 			continue
 		}
 		// Scoped warm pass: an unchanged repo's calls were already dispatched (or
@@ -62,15 +66,27 @@ func (r *Resolver) resolvePHPOverrideDispatch() int {
 		if name == "" || strings.HasSuffix(name, ".<init>") {
 			continue
 		}
-		caller := r.cachedGetNode(e.From)
-		if caller == nil || caller.Language != "php" {
-			continue
+		// SQLite joined caller language in the compact census. Only scope-chain
+		// binding needs the full caller node; adapters without exact lookup retain
+		// the historical language gate here.
+		var caller *graph.Node
+		if !candidates.exact {
+			caller = r.cachedGetNode(e.From)
+			if caller == nil || caller.Language != "php" {
+				continue
+			}
 		}
 		repo := r.callerRepoPrefix(e)
 
 		// Scope path: parent:: / self:: / static:: bind precisely up the
 		// enclosing class's ancestor chain.
 		if sk := phpEdgeMetaString(e, "scope_kind"); sk == "parent" || sk == "self" {
+			if caller == nil {
+				caller = r.cachedGetNode(e.From)
+			}
+			if caller == nil || caller.Language != "php" {
+				continue
+			}
 			encloser := phpEnclosingClass(caller)
 			if encloser == "" {
 				continue
@@ -86,7 +102,7 @@ func (r *Resolver) resolvePHPOverrideDispatch() int {
 			if len(start) == 0 {
 				continue
 			}
-			if target := r.nearestPHPMethod(name, start, direct, repo); target != nil && target.ID != caller.ID {
+			if target := r.nearestPHPMethod(name, start, direct, repo); target != nil && target.ID != e.From {
 				jobs = append(jobs, job{edge: e, single: target})
 			}
 			continue
@@ -103,7 +119,7 @@ func (r *Resolver) resolvePHPOverrideDispatch() int {
 		// which a same-receiver name match cannot see.
 		if rt := edgeReceiverType(e); rt != "" {
 			if base := phpBaseTypeName(rt); base != "" {
-				if target := r.nearestPHPMethod(name, []string{base}, direct, repo); target != nil && target.ID != caller.ID {
+				if target := r.nearestPHPMethod(name, []string{base}, direct, repo); target != nil && target.ID != e.From {
 					jobs = append(jobs, job{edge: e, single: target})
 				}
 			}

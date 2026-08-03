@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"bytes"
 	"reflect"
 	"strings"
 	"testing"
@@ -17,6 +18,68 @@ func (e metadataFixtureExtractor) Language() string     { return "rust" }
 func (e metadataFixtureExtractor) Extensions() []string { return []string{".rs"} }
 func (e metadataFixtureExtractor) Extract(string, []byte) (*parser.ExtractionResult, error) {
 	return e.result, nil
+}
+
+func TestNormalizeExtractionMetadataFileOnlyDoesNotCopySource(t *testing.T) {
+	small := []byte("{}")
+	large := bytes.Repeat([]byte("file-only payload\n"), 1<<20)
+	run := func(src []byte) {
+		node := &graph.Node{ID: "data.json", Kind: graph.KindFile, Name: "data.json"}
+		normalizeExtractionMetadata(&parser.ExtractionResult{Nodes: []*graph.Node{node}}, src)
+		if got := node.RetrievalMetadata(); got != (graph.RetrievalMetadata{}) {
+			t.Fatalf("file metadata = %#v", got)
+		}
+	}
+
+	smallAllocs := testing.AllocsPerRun(5, func() { run(small) })
+	largeAllocs := testing.AllocsPerRun(5, func() { run(large) })
+	if largeAllocs > smallAllocs+1 {
+		t.Fatalf("file-only normalization allocations scale with source size: small=%v large=%v", smallAllocs, largeAllocs)
+	}
+}
+
+func BenchmarkNormalizeExtractionMetadataFileOnly(b *testing.B) {
+	src := bytes.Repeat([]byte("file-only payload\n"), 1<<20)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		node := &graph.Node{ID: "data.json", Kind: graph.KindFile, Name: "data.json"}
+		normalizeExtractionMetadata(&parser.ExtractionResult{Nodes: []*graph.Node{node}}, src)
+	}
+}
+
+func TestNormalizeExtractionMetadataBoundsHugeDeclarationLine(t *testing.T) {
+	src := append([]byte("var key = "), bytes.Repeat([]byte("value"), 1<<20)...)
+	node := &graph.Node{
+		ID: "data.json::key", Kind: graph.KindVariable, Name: "key",
+		FilePath: "data.json", StartLine: 1, EndLine: 1, Language: "json",
+	}
+	normalizeExtractionMetadata(&parser.ExtractionResult{Nodes: []*graph.Node{node}}, src)
+
+	got := node.RetrievalMetadata().Signature
+	if !strings.HasPrefix(got, "var key = value") || len(got) > 512 {
+		t.Fatalf("signature len=%d value=%q", len(got), got)
+	}
+	before := got
+	src[4] = 'X'
+	if after := node.RetrievalMetadata().Signature; after != before {
+		t.Fatalf("bounded metadata aliases source: before=%q after=%q", before, after)
+	}
+}
+
+func BenchmarkNormalizeExtractionMetadataHugeDeclaration(b *testing.B) {
+	src := append([]byte("var key = "), bytes.Repeat([]byte("value"), 1<<20)...)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		node := &graph.Node{
+			ID: "data.json::key", Kind: graph.KindVariable, Name: "key",
+			FilePath: "data.json", StartLine: 1, EndLine: 1, Language: "json",
+		}
+		normalizeExtractionMetadata(&parser.ExtractionResult{Nodes: []*graph.Node{node}}, src)
+	}
 }
 
 func TestExtractFileNormalizesMetadataAtSharedBoundary(t *testing.T) {

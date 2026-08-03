@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
 	"sort"
@@ -48,6 +49,62 @@ func coldOrchestrationRepos(t *testing.T, count int) []config.RepoEntry {
 
 func newColdOrchestrationMulti(store graph.Store, logger *zap.Logger) *MultiIndexer {
 	return NewMultiIndexer(store, coldOrchestrationRegistry(), search.NewAuto(), nil, logger)
+}
+
+type coldOrchestrationProbeStore struct {
+	*graph.Graph
+	unresolvedScans atomic.Int64
+	receiptBegins   atomic.Int64
+	receiptEnds     atomic.Int64
+}
+
+func (s *coldOrchestrationProbeStore) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
+	s.unresolvedScans.Add(1)
+	return s.Graph.EdgesWithUnresolvedTarget()
+}
+
+func (s *coldOrchestrationProbeStore) BeginMutationReceipt() graph.MutationReceiptToken {
+	s.receiptBegins.Add(1)
+	return s.Graph.BeginMutationReceipt()
+}
+
+func (s *coldOrchestrationProbeStore) EndMutationReceipt(token graph.MutationReceiptToken) graph.MutationReceipt {
+	s.receiptEnds.Add(1)
+	return s.Graph.EndMutationReceipt(token)
+}
+
+func TestBeginDeferredPassesOverlapOpensReceiptAtApplyBoundary(t *testing.T) {
+	store := &coldOrchestrationProbeStore{Graph: graph.New()}
+	mi := newColdOrchestrationMulti(store, zap.NewNop())
+	applyGate := make(chan struct{})
+	run := mi.BeginDeferredPasses(t.Context(), applyGate)
+
+	// Model pre-enrichment resolver writes: no receipt exists yet, so they
+	// cannot void the exact apply/contract window.
+	store.AddNode(&graph.Node{ID: "pre-resolve", Kind: graph.KindFile, FilePath: "pre.go"})
+	assert.Zero(t, store.receiptBegins.Load())
+
+	run.BeginApplyMutationReceipt()
+	run.BeginApplyMutationReceipt()
+	assert.Equal(t, int64(1), store.receiptBegins.Load(), "apply receipt must open exactly once")
+	close(applyGate)
+
+	result := run.FinishTailResult()
+	assert.True(t, result.ExactCrossRepoComplete)
+	assert.Equal(t, int64(1), store.receiptEnds.Load(), "the late receipt must close in FinishTail")
+}
+
+func TestFinishColdDeferredPassesDoesNotRepeatFullCrossRepoResolve(t *testing.T) {
+	store := &coldOrchestrationProbeStore{Graph: graph.New()}
+	mi := newColdOrchestrationMulti(store, zap.NewNop())
+
+	result := mi.finishColdDeferredPasses(t.Context())
+
+	assert.True(t, result.ExactCrossRepoComplete)
+	assert.Zero(t, store.unresolvedScans.Load(),
+		"cold deferred completion must not repeat the full unresolved-edge scan already run before enrichment")
+	assert.Equal(t, int64(1), store.receiptBegins.Load())
+	assert.Equal(t, int64(1), store.receiptEnds.Load())
 }
 
 func TestIndexMultiRepoUsesOneCoordinatedBaseResolve(t *testing.T) {
