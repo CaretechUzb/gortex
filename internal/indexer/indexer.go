@@ -2601,6 +2601,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			zap.Int64("total_bytes", skippedContentBytes))
 	}
 	reporter.Report("walking files", len(files), len(files))
+	// Capture raw content identities while the parser already owns each source
+	// buffer. A nil collector keeps the disabled path allocation-free.
+	merkleBaseline := newMerkleBaselineCollector(idx.merkleEnabled(), len(files))
 
 	// In-memory shadow for cold-start indexing on disk-backed stores.
 	// Disk backends pay ms-level per-call cost on every read; running
@@ -3361,6 +3364,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						parseLease.Release()
 						continue
 					}
+					merkleBaseline.record(relPath, src, wf.mtimeNano)
 
 					// Reuse the walk-time language. The walk's
 					// effectiveLanguage call already consulted shebang
@@ -4050,12 +4054,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// Persist the Merkle baseline so the next incremental pass diffs
 	// against content hashes rather than re-indexing the whole repo.
 	workspaceFP := ""
-	if idx.merkleEnabled() {
+	if merkleBaseline != nil {
 		paths := make([]string, len(files))
 		for i, wf := range files {
 			paths[i] = wf.path
 		}
-		workspaceFP = idx.saveMerkleBaseline(absRoot, paths)
+		workspaceFP = idx.saveMerkleBaselineWithKnownFiles(absRoot, paths, merkleBaseline.take())
 	}
 	idx.indexGen.Add(1) // invalidate the trigram search cache
 
