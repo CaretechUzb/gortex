@@ -48,6 +48,31 @@ func TestSQLiteMutationReceiptCapturesExactResolutionDelta(t *testing.T) {
 	assertSQLiteReceiptContains(t, "import candidates", receipt.ImportCandidates, "Load", "loader")
 }
 
+func TestSQLiteMutationReceiptCapturesResolvedEdgeFrontier(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	const (
+		sourceID = "repo/src/a.go::Caller"
+		targetID = "other/pkg::Target"
+	)
+	store.AddBatch([]*graph.Node{
+		{ID: sourceID, Kind: graph.KindFunction, Name: "Caller", FilePath: "src/a.go", RepoPrefix: "repo"},
+		{ID: targetID, Kind: graph.KindFunction, Name: "Target", FilePath: "target.go", RepoPrefix: "other"},
+	}, nil)
+
+	token := store.BeginMutationReceipt()
+	store.AddEdge(&graph.Edge{
+		From: sourceID, To: targetID, Kind: graph.EdgeImports, Alias: "dependency",
+	})
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete || receipt.ResolutionRelevant {
+		t.Fatalf("receipt = %+v, want complete resolved-edge frontier", receipt)
+	}
+	assertSQLiteReceiptContains(t, "changed files", receipt.ChangedFiles, "src/a.go")
+	assertSQLiteReceiptContains(t, "target ids", receipt.TargetIDs, targetID)
+	assertSQLiteReceiptContains(t, "import candidates", receipt.ImportCandidates, targetID, "dependency")
+}
+
 func TestSQLiteMutationReceiptIdempotentAndAttributeOnlyWritesAreNeutral(t *testing.T) {
 	store := openMutationReceiptStore(t)
 	node := &graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", FilePath: "a.go", RepoPrefix: "repo"}

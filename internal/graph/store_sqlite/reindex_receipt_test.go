@@ -175,7 +175,7 @@ func TestSQLiteRefreshUnresolvedIdentityRecordsNewFile(t *testing.T) {
 	}
 }
 
-func TestSQLiteReceiptIgnoresResolvedEdgeAndNonDefinitionNoise(t *testing.T) {
+func TestSQLiteReceiptCapturesResolvedEdgeAndIgnoresNonDefinitionNoise(t *testing.T) {
 	store := openReindexReceiptTestStore(t)
 	store.AddBatch([]*graph.Node{
 		{ID: "caller", Kind: graph.KindFunction, Name: "caller", FilePath: "repo/caller.go"},
@@ -194,7 +194,7 @@ func TestSQLiteReceiptIgnoresResolvedEdgeAndNonDefinitionNoise(t *testing.T) {
 	if !receipt.Complete || !receipt.ResolutionRelevant {
 		t.Fatalf("mixed receipt = %#v, want complete and relevant", receipt)
 	}
-	if want := []string{"repo/needed.go"}; !reflect.DeepEqual(receipt.ResolutionFiles(), want) {
+	if want := []string{"repo/needed.go", "repo/noise.go"}; !reflect.DeepEqual(receipt.ResolutionFiles(), want) {
 		t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), want)
 	}
 }

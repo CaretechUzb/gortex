@@ -218,7 +218,7 @@ func recordSQLiteChangedNodeIdentity(
 }
 
 func recordSQLiteAddedEdge(acc *sqliteMutationReceiptAccumulator, e *graph.Edge, exactFile string) {
-	if acc == nil || e == nil || !graph.IsUnresolvedTarget(e.To) {
+	if acc == nil || e == nil {
 		return
 	}
 	if e.To != "" {
@@ -237,10 +237,14 @@ func recordSQLiteAddedEdge(acc *sqliteMutationReceiptAccumulator, e *graph.Edge,
 			acc.importCandidates[e.Alias] = struct{}{}
 		}
 	}
-	acc.resolutionRelevant = true
 	if exactFile != "" {
 		acc.changedFiles[exactFile] = struct{}{}
-	} else {
+	}
+	if !graph.IsUnresolvedTarget(e.To) {
+		return
+	}
+	acc.resolutionRelevant = true
+	if exactFile == "" {
 		acc.noteIncomplete("edge_write_without_exact_file")
 	}
 }
