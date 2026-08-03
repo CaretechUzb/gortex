@@ -101,6 +101,20 @@ func applyCloneSignatures(src []byte, result *parser.ExtractionResult) {
 	if result == nil || len(result.Nodes) == 0 {
 		return
 	}
+	// Most data/config files contain no callable bodies. Check that before
+	// building an O(lines) offset table, which can otherwise dominate
+	// allocation for large generated JSON and other non-code sources.
+	hasCallable := false
+	for _, n := range result.Nodes {
+		if n != nil && (n.Kind == graph.KindFunction || n.Kind == graph.KindMethod) {
+			hasCallable = true
+			break
+		}
+	}
+	if !hasCallable {
+		return
+	}
+
 	// Compute newline offsets once per file rather than splitting the
 	// source into N Go strings. offsets[i] is the byte index where
 	// line i+1 (1-indexed) starts; the sentinel offsets[len(offsets)-1]
