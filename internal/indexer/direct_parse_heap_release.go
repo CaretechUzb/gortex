@@ -9,17 +9,14 @@ import (
 	"go.uber.org/zap"
 )
 
-const (
-	// A direct parse must be large independently of operator shadow overrides.
-	// This keeps an intentionally lowered shadow threshold from forcing GC for
-	// ordinary repositories that merely lost the process-wide shadow race.
-	// Reclaim before a second pressure-sized direct parse stacks on the first
-	// parse's idle spans. The previous 2 GiB threshold missed a measured 4.9 GiB
-	// physical-footprint peak despite only 186 MiB of live heap. Eligibility,
-	// serialization, and the cooldown below keep this 512 MiB boundary narrow.
-	directParseHeapReleaseMinRetained uint64 = 512 << 20
-	directParseHeapReleaseCooldown           = 30 * time.Second
-)
+// A direct parse must be large independently of operator shadow overrides.
+// This keeps an intentionally lowered shadow threshold from forcing GC for
+// ordinary repositories that merely lost the process-wide shadow race.
+// Reclaim before a second pressure-sized direct parse stacks on the first
+// parse's idle spans. The previous 2 GiB threshold missed a measured 4.9 GiB
+// physical-footprint peak despite only 186 MiB of live heap. Eligibility,
+// retained-heap rechecks, and serialization keep this 512 MiB boundary narrow.
+const directParseHeapReleaseMinRetained uint64 = 512 << 20
 
 type directParseHeapReleaseRequest struct {
 	directStore bool
@@ -31,14 +28,12 @@ type directParseHeapReleaseRequest struct {
 
 // directParseHeapReleaser serializes the expensive GC+scavenge across every
 // repository in the process. Only large, direct-to-durable-store parses reach
-// this controller; the retained-heap check and cooldown run again under the
-// lock so concurrent completions cannot issue redundant releases.
+// this controller; the retained-heap check runs again under the lock so
+// concurrent completions cannot issue redundant releases.
 type directParseHeapReleaser struct {
-	mu          sync.Mutex
-	lastRelease time.Time
+	mu sync.Mutex
 
 	minRetained uint64
-	cooldown    time.Duration
 	now         func() time.Time
 	readStats   func(*runtime.MemStats)
 	release     func()
@@ -49,7 +44,6 @@ var processDirectParseHeapReleaser = newDirectParseHeapReleaser()
 func newDirectParseHeapReleaser() *directParseHeapReleaser {
 	return &directParseHeapReleaser{
 		minRetained: directParseHeapReleaseMinRetained,
-		cooldown:    directParseHeapReleaseCooldown,
 		now:         time.Now,
 		readStats:   runtime.ReadMemStats,
 		release:     debug.FreeOSMemory,
@@ -91,11 +85,6 @@ func (r *directParseHeapReleaser) maybeRelease(req directParseHeapReleaseRequest
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	now := r.now()
-	if !r.lastRelease.IsZero() && now.Before(r.lastRelease.Add(r.cooldown)) {
-		return false
-	}
-
 	var before runtime.MemStats
 	r.readStats(&before)
 	retainedBefore := retainedGoHeap(before)
@@ -103,10 +92,9 @@ func (r *directParseHeapReleaser) maybeRelease(req directParseHeapReleaseRequest
 		return false
 	}
 
-	started := now
+	started := r.now()
 	r.release()
 	finished := r.now()
-	r.lastRelease = finished
 
 	var after runtime.MemStats
 	r.readStats(&after)

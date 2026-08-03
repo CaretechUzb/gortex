@@ -83,7 +83,6 @@ func TestDirectParseHeapReleaserGuardsOrdinaryAndLowRetainedHeap(t *testing.T) {
 			var releases atomic.Int32
 			r := &directParseHeapReleaser{
 				minRetained: 100,
-				cooldown:    time.Minute,
 				now:         func() time.Time { return time.Unix(100, 0) },
 				readStats: func(ms *runtime.MemStats) {
 					reads.Add(1)
@@ -120,7 +119,6 @@ func TestDirectParseHeapReleaserProductionRetainedBoundary(t *testing.T) {
 			var releases atomic.Int32
 			r := &directParseHeapReleaser{
 				minRetained: directParseHeapReleaseMinRetained,
-				cooldown:    directParseHeapReleaseCooldown,
 				now:         func() time.Time { return time.Unix(100, 0) },
 				readStats: func(ms *runtime.MemStats) {
 					*ms = runtime.MemStats{HeapSys: tt.retained}
@@ -145,16 +143,16 @@ func TestDirectParseHeapReleaserProductionRetainedBoundary(t *testing.T) {
 	}
 }
 
-func TestDirectParseHeapReleaserCooldown(t *testing.T) {
+func TestDirectParseHeapReleaserDoesNotSuppressConsecutiveEligibleCompletions(t *testing.T) {
 	t.Parallel()
 
-	now := time.Unix(100, 0)
+	var reads int
 	var releases int
 	r := &directParseHeapReleaser{
 		minRetained: 100,
-		cooldown:    30 * time.Second,
-		now:         func() time.Time { return now },
+		now:         func() time.Time { return time.Unix(100, 0) },
 		readStats: func(ms *runtime.MemStats) {
+			reads++
 			*ms = runtime.MemStats{HeapSys: 100}
 		},
 		release: func() { releases++ },
@@ -164,15 +162,14 @@ func TestDirectParseHeapReleaserCooldown(t *testing.T) {
 	if !r.maybeRelease(req) {
 		t.Fatal("first eligible completion did not release")
 	}
-	if r.maybeRelease(req) {
-		t.Fatal("completion inside cooldown released again")
-	}
-	now = now.Add(30 * time.Second)
 	if !r.maybeRelease(req) {
-		t.Fatal("completion at cooldown boundary did not release")
+		t.Fatal("second eligible completion was suppressed")
 	}
 	if releases != 2 {
 		t.Fatalf("heap releases = %d, want 2", releases)
+	}
+	if reads != 4 {
+		t.Fatalf("ReadMemStats calls = %d, want 4", reads)
 	}
 }
 
@@ -187,7 +184,6 @@ func TestDirectParseHeapReleaserSerializesConcurrentCompletions(t *testing.T) {
 	allowFirst := make(chan struct{})
 	r := &directParseHeapReleaser{
 		minRetained: 100,
-		cooldown:    0,
 		now:         time.Now,
 		readStats: func(ms *runtime.MemStats) {
 			*ms = runtime.MemStats{HeapSys: retained.Load()}
