@@ -301,8 +301,10 @@ func (r *Resolver) scopedCSharpVisibilityInvalidate(files []string) {
 	defer r.csharpNSMu.Unlock()
 	r.csharpTypeNodesByName = nil
 	r.csharpAncestorsByType = nil
+	r.csharpMemberNamesByType = nil
 	if !r.csharpVisSeeded {
 		r.csharpGlobalByDir = nil
+		r.csharpGlobalStaticByDir = nil
 		r.csharpProjDirs = nil
 		r.csharpNSByFile = nil
 		return

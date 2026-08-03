@@ -110,6 +110,8 @@ func (r *Resolver) tryBindCSharpExtension(e *graph.Edge, methodName, receiverTyp
 		}
 		// Shape-conflicted candidates are provably inapplicable — they are
 		// excluded from the name tiers AND from the reach/waiver pools.
+		// The receiver's shape parses once, not once per candidate.
+		recvSh, recvShOK := csharpParseShape(recvShape)
 		conflicted := map[string]bool{}
 		var typed, universal []*graph.Node
 		for _, c := range exts {
@@ -133,7 +135,7 @@ func (r *Resolver) tryBindCSharpExtension(e *graph.Edge, methodName, receiverTyp
 			// Shape — array/nullable suffixes, generic arguments — is
 			// part of applicability: same core, different structure is a
 			// contradiction (`string[]` never fits `this string`).
-			if csharpShapesConflict(recvShape, csharpNodeShape(c, tp), csharpNodeTypeParams(c)) {
+			if csharpShapesConflictParsed(recvSh, recvShOK, csharpNodeShape(c, tp), csharpNodeTypeParams(c)) {
 				conflicted[c.ID] = true
 				continue
 			}
@@ -380,16 +382,34 @@ func (r *Resolver) csharpInstanceMemberClaims(e *graph.Edge, recv, method string
 		}
 	}
 	for id := range typeIDs {
-		for _, in := range r.graph.GetInEdges(id) {
-			if in.Kind != graph.EdgeMemberOf {
-				continue
-			}
-			if m := r.cachedGetNode(in.From); m != nil && m.Name == method {
-				return true
-			}
+		if _, ok := r.csharpMemberNamesOf(id)[method]; ok {
+			return true
 		}
 	}
 	return false
+}
+
+// csharpMemberNamesOf memoizes a type's declared member-name set per
+// pass — GetInEdges returns every reference to a popular receiver type,
+// and the claims gate runs once per candidate-bearing call edge.
+func (r *Resolver) csharpMemberNamesOf(typeID string) map[string]struct{} {
+	if names, ok := r.csharpMemberNamesByType[typeID]; ok {
+		return names
+	}
+	names := map[string]struct{}{}
+	for _, in := range r.graph.GetInEdges(typeID) {
+		if in.Kind != graph.EdgeMemberOf {
+			continue
+		}
+		if m := r.cachedGetNode(in.From); m != nil {
+			names[m.Name] = struct{}{}
+		}
+	}
+	if r.csharpMemberNamesByType == nil {
+		r.csharpMemberNamesByType = map[string]map[string]struct{}{}
+	}
+	r.csharpMemberNamesByType[typeID] = names
+	return names
 }
 
 // csharpDenoteBareType resolves what a bare type name denotes from a
@@ -832,22 +852,32 @@ func csharpNodeTypeParams(c *graph.Node) map[string]bool {
 // `List<int>` vs `this List<string>`). Unparseable or absent evidence
 // never conflicts, and a core-name mismatch is not a shape verdict.
 func csharpShapesConflict(recv, tp string, tparams map[string]bool) bool {
-	if recv == "" || tp == "" {
+	if recv == "" {
 		return false
 	}
 	a, okA := csharpParseShape(recv)
-	b, okB := csharpParseShape(tp)
-	if !okA || !okB {
+	return csharpShapesConflictParsed(a, okA, tp, tparams)
+}
+
+// csharpShapesConflictParsed is csharpShapesConflict with the receiver
+// side already parsed — the binder parses it once per call edge, not
+// once per candidate.
+func csharpShapesConflictParsed(recv csharpShape, recvOK bool, tp string, tparams map[string]bool) bool {
+	if !recvOK || tp == "" {
 		return false
 	}
-	return !csharpShapeUnifies(a, b, tparams, false)
+	b, okB := csharpParseShape(tp)
+	if !okB {
+		return false
+	}
+	return !csharpShapeUnifies(recv, b, tparams, false)
 }
 
 func csharpShapeUnifies(recv, tp csharpShape, tparams map[string]bool, arg bool) bool {
 	// A method type parameter unifies with any receiver core; its own
 	// suffix structure still has to line up (`T[]` is not scalar `T`).
 	if tparams[tp.core] && len(tp.args) == 0 {
-		return tp.suffix == "" || tp.suffix == recv.suffix
+		return tp.suffix == "" || csharpShapeSuffix(tp) == csharpShapeSuffix(recv)
 	}
 	coresAgree := csharpTypeSuffixTrim(recv.core) == csharpTypeSuffixTrim(tp.core) ||
 		csharpLastSegment(recv.core) == csharpLastSegment(tp.core)
@@ -858,7 +888,7 @@ func csharpShapeUnifies(recv, tp csharpShape, tparams map[string]bool, arg bool)
 		// (`List<int>` never fits `this List<string>`).
 		return !arg
 	}
-	if recv.suffix != tp.suffix || len(recv.args) != len(tp.args) {
+	if csharpShapeSuffix(recv) != csharpShapeSuffix(tp) || len(recv.args) != len(tp.args) {
 		return false
 	}
 	for i := range recv.args {
@@ -867,6 +897,31 @@ func csharpShapeUnifies(recv, tp csharpShape, tparams map[string]bool, arg bool)
 		}
 	}
 	return true
+}
+
+// csharpShapeSuffix is the shape's suffix as compared for unification.
+// A `?` on a reference type is identity-convertible annotation, not
+// structure — only on a builtin VALUE type does `T?` mean the distinct
+// Nullable<T> (a user struct would too, but without in-graph proof of
+// struct-ness the annotation reading wins: refusing every annotated
+// class receiver is the worse error).
+func csharpShapeSuffix(sh csharpShape) string {
+	s := sh.suffix
+	if !strings.Contains(s, "?") {
+		return s
+	}
+	keep := strings.HasPrefix(s, "?") && !csharpIsBuiltinRefTypeName(sh.core) && csharpIsBuiltinTypeName(sh.core)
+	s = strings.ReplaceAll(s, "?", "")
+	if keep {
+		s = "?" + s
+	}
+	return s
+}
+
+// csharpIsBuiltinRefTypeName: the builtin names that are REFERENCE
+// types — for these `T?` is annotation-only.
+func csharpIsBuiltinRefTypeName(t string) bool {
+	return t == "string" || t == "object" || t == "dynamic"
 }
 
 func csharpLastSegment(s string) string {

@@ -229,6 +229,178 @@ namespace B {
 	}
 }
 
+// TestResolveCSharpExtension_ConstructorCallerScopeWalk: a call inside a
+// CONSTRUCTOR body walks the same namespace levels as one inside a method —
+// the enclosing namespace's own extension is considered before an outer
+// using-imported one. Pins the caller-kind gap: ctor nodes must carry the
+// scope stamp, or the walk would mistake them for global-namespace code.
+func TestResolveCSharpExtension_ConstructorCallerScopeWalk(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"W.cs": `namespace W {
+    public class Widget {}
+}`,
+		"BExt.cs": `using W;
+namespace B {
+    public static class BE { public static int Foo(this Widget w) { return 2; } }
+}`,
+		"Caller.cs": `using W;
+using B;
+namespace A {
+    public static class AE { public static int Foo(this Widget w) { return 1; } }
+    public class Runner {
+        public Runner() {
+            Widget w = new Widget();
+            w.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.<init>")
+	require.NotEmpty(t, target)
+	assert.True(t, strings.Contains(target, "AE.Foo"),
+		"namespace A's own extension is level 1 of the ctor's scope walk, got %q", target)
+}
+
+// TestResolveCSharpExtension_NullableAnnotatedReceiverBinds: a `Crate?`
+// receiver is identity-convertible to `Crate` — the nullable annotation
+// on a reference type is not a shape contradiction.
+func TestResolveCSharpExtension_NullableAnnotatedReceiverBinds(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Ext.cs": `namespace App {
+    public class Crate {}
+    public static class E { public static int Foo(this Crate c) { return 1; } }
+}`,
+		"Caller.cs": `namespace App {
+    public class Runner {
+        public void Run() {
+            Crate? c = null;
+            c.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.NotEmpty(t, target)
+	assert.True(t, strings.Contains(target, "E.Foo"),
+		"Crate? is identity-convertible to Crate — nullable annotation must not refuse the bind, got %q", target)
+}
+
+// TestResolveCSharpExtension_NullableValueReceiverStaysRefused: `int?` is
+// Nullable<int>, a genuinely different type from `int` — the value-type
+// nullable suffix keeps its veto.
+func TestResolveCSharpExtension_NullableValueReceiverStaysRefused(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Ext.cs": `namespace App {
+    public static class E { public static int Foo(this int n) { return 1; } }
+}`,
+		"Caller.cs": `namespace App {
+    public class Runner {
+        public void Run() {
+            int? n = 3;
+            n.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.NotEmpty(t, target)
+	assert.True(t, graph.IsUnresolvedTarget(target),
+		"int? is Nullable<int>, not int — the extension stays inapplicable, got %q", target)
+}
+
+// TestResolveCSharpExtension_VarShapeFromOutermostCreation: a `var`
+// initializer's receiver shape comes from the OUTERMOST object creation —
+// a nested `new` inside a collection initializer must not override it.
+func TestResolveCSharpExtension_VarShapeFromOutermostCreation(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Ext.cs": `using System.Collections.Generic;
+namespace App {
+    public static class E { public static int Foo(this List<List<string>> xs) { return 1; } }
+}`,
+		"Caller.cs": `using System.Collections.Generic;
+namespace App {
+    public class Runner {
+        public void Run() {
+            var xs = new List<List<string>> { new List<string>() };
+            xs.Foo();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	target := fooCallTarget(g, "Caller.cs::Runner.Run")
+	require.NotEmpty(t, target)
+	assert.True(t, strings.Contains(target, "E.Foo"),
+		"the var's shape is the outer List<List<string>>, not the nested initializer's, got %q", target)
+}
+
+// TestCrossRepo_RestubbedCSharpMemberCallStaysUnresolved: eviction
+// restubs a refused member call to a BARE name (`unresolved::Foo`), which
+// routes through the function-call fallback instead of the member one —
+// the member_call evidence in edge Meta still marks it as a member-gate
+// verdict, and the name-only tier must decline it too.
+func TestCrossRepo_RestubbedCSharpMemberCallStaysUnresolved(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "repoA/Caller.cs::Runner.Run", Kind: graph.KindMethod, Name: "Run",
+		FilePath: "repoA/Caller.cs", Language: "csharp", RepoPrefix: "repoA"})
+	g.AddNode(&graph.Node{ID: "repoA/Ext.cs::E.Foo", Kind: graph.KindMethod, Name: "Foo",
+		FilePath: "repoA/Ext.cs", Language: "csharp", RepoPrefix: "repoA"})
+	edge := &graph.Edge{From: "repoA/Caller.cs::Runner.Run", To: "unresolved::Foo",
+		Kind: graph.EdgeCalls, FilePath: "repoA/Caller.cs", Line: 5,
+		Meta: map[string]any{"member_call": true}}
+	g.AddEdge(edge)
+
+	NewCrossRepo(g).ResolveAll()
+	assert.Equal(t, "unresolved::Foo", edge.To,
+		"a restubbed member call keeps the member-gate verdict — bare-name fallback must decline")
+}
+
+// TestCrossRepo_RazorCallerKeepsNameFallback: only csharp-language callers
+// run the main resolver's member gates; a razor caller never gets a
+// verdict there, so blocking its name-only fallback would just lose the
+// edge. The gate is keyed to the exact language, not the family.
+// (Cross-language razor→csharp binds are already refused by the
+// scopedCandidates language filter — the fallback at stake is
+// razor→razor, e.g. a symbol from another @code block.)
+func TestCrossRepo_RazorCallerKeepsNameFallback(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "repoA/Page.razor::Page.OnInit", Kind: graph.KindMethod, Name: "OnInit",
+		FilePath: "repoA/Page.razor", Language: "razor", RepoPrefix: "repoA"})
+	g.AddNode(&graph.Node{ID: "repoA/Shared.razor::Shared.Foo", Kind: graph.KindMethod, Name: "Foo",
+		FilePath: "repoA/Shared.razor", Language: "razor", RepoPrefix: "repoA"})
+	edge := &graph.Edge{From: "repoA/Page.razor::Page.OnInit", To: "unresolved::*.Foo",
+		Kind: graph.EdgeCalls, FilePath: "repoA/Page.razor", Line: 8}
+	g.AddEdge(edge)
+
+	NewCrossRepo(g).ResolveAll()
+	assert.Equal(t, "repoA/Shared.razor::Shared.Foo", edge.To,
+		"razor callers have no member-gate verdict — the name fallback stays available")
+}
+
+// TestCrossRepo_MissingCSharpCallerNodeFailsClosed: when the caller node
+// is gone (the eviction window — exactly when resurrecting a refused
+// bind matters most), the .cs file path is still proof enough that the
+// member gates own this call.
+func TestCrossRepo_MissingCSharpCallerNodeFailsClosed(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "repoA/Ext.cs::E.Foo", Kind: graph.KindMethod, Name: "Foo",
+		FilePath: "repoA/Ext.cs", Language: "csharp", RepoPrefix: "repoA"})
+	edge := &graph.Edge{From: "repoA/Caller.cs::Runner.Run", To: "unresolved::*.Foo",
+		Kind: graph.EdgeCalls, FilePath: "repoA/Caller.cs", Line: 5}
+	g.AddEdge(edge)
+
+	NewCrossRepo(g).ResolveAll()
+	assert.Equal(t, "unresolved::*.Foo", edge.To,
+		"no caller node + .cs path: the gate fails closed, not open")
+}
+
 // TestResolveCSharpExtension_SiblingNamespaceUsingNotVisible: a using
 // declared inside namespace A is scoped to A — a sibling namespace B in the
 // same file must not see it.
