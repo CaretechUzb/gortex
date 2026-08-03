@@ -406,6 +406,19 @@ func (s *frameworkEdgeBatchStore) FnValuePlaceholderEdges() iter.Seq[*graph.Edge
 	})
 }
 
+func (s *frameworkEdgeBatchStore) ValueRefPlaceholderEdges() iter.Seq[*graph.Edge] {
+	var base iter.Seq[*graph.Edge]
+	if scanner, ok := s.Store.(graph.ValueRefPlaceholderScanner); ok {
+		base = scanner.ValueRefPlaceholderEdges()
+	} else {
+		base = s.Store.EdgesByKind(graph.EdgeReads)
+	}
+	return s.mergeEdgeSeq(base, func(edge *graph.Edge) bool {
+		return edge.Kind == graph.EdgeReads &&
+			edge.To >= "unresolved::valueref::" && edge.To < "unresolved::valueref:;"
+	})
+}
+
 func (s *frameworkEdgeBatchStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 	if s.readCache == nil {
 		return s.Store.NodesByKind(kind)
@@ -774,13 +787,14 @@ func cloneFrameworkMetaValue(value any) any {
 }
 
 var (
-	_ graph.Store                     = (*frameworkEdgeBatchStore)(nil)
-	_ graph.EdgesByKindsScanner       = (*frameworkEdgeBatchStore)(nil)
-	_ graph.NodesByKindsScanner       = (*frameworkEdgeBatchStore)(nil)
-	_ graph.FnValuePlaceholderScanner = (*frameworkEdgeBatchStore)(nil)
-	_ graph.RepoEdgeKindReader        = (*frameworkEdgeBatchStore)(nil)
-	_ graph.ConstantValueReader       = (*frameworkEdgeBatchStore)(nil)
-	_ graph.MemberMethodsByType       = (*frameworkEdgeBatchStore)(nil)
-	_ graph.EdgeIdentityBatchFinder   = (*frameworkEdgeBatchStore)(nil)
-	_ graph.InEdgeIdentityBatchReader = (*frameworkEdgeBatchStore)(nil)
+	_ graph.Store                      = (*frameworkEdgeBatchStore)(nil)
+	_ graph.EdgesByKindsScanner        = (*frameworkEdgeBatchStore)(nil)
+	_ graph.NodesByKindsScanner        = (*frameworkEdgeBatchStore)(nil)
+	_ graph.FnValuePlaceholderScanner  = (*frameworkEdgeBatchStore)(nil)
+	_ graph.ValueRefPlaceholderScanner = (*frameworkEdgeBatchStore)(nil)
+	_ graph.RepoEdgeKindReader         = (*frameworkEdgeBatchStore)(nil)
+	_ graph.ConstantValueReader        = (*frameworkEdgeBatchStore)(nil)
+	_ graph.MemberMethodsByType        = (*frameworkEdgeBatchStore)(nil)
+	_ graph.EdgeIdentityBatchFinder    = (*frameworkEdgeBatchStore)(nil)
+	_ graph.InEdgeIdentityBatchReader  = (*frameworkEdgeBatchStore)(nil)
 )

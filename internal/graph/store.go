@@ -1367,6 +1367,16 @@ type FnValuePlaceholderScanner interface {
 	FnValuePlaceholderEdges() iter.Seq[*Edge]
 }
 
+// ValueRefPlaceholderScanner is an optional disk-backend capability for the
+// value-reference gate. It yields EdgeReads whose targets occupy the extractor's
+// bare `unresolved::valueref::` namespace, with Meta populated for the gate's
+// exact `via == value_ref_candidate` revalidation. Value-ref extraction was
+// introduced after repository prefixing already preserved unresolved targets,
+// so every current or restorable value-ref placeholder uses the bare form.
+type ValueRefPlaceholderScanner interface {
+	ValueRefPlaceholderEdges() iter.Seq[*Edge]
+}
+
 // EdgePersister is an optional capability backends MAY implement to
 // durably rewrite the mutable attribute columns (Confidence,
 // ConfidenceLabel, Origin, Tier, Meta) of an edge already present in the

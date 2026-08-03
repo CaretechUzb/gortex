@@ -70,6 +70,7 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("NodesByKind", func(t *testing.T) { testNodesByKind(t, factory) })
 	t.Run("EdgesWithUnresolvedTarget", func(t *testing.T) { testEdgesWithUnresolvedTarget(t, factory) })
 	t.Run("FnValuePlaceholderEdges", func(t *testing.T) { testFnValuePlaceholderEdges(t, factory) })
+	t.Run("ValueRefPlaceholderEdges", func(t *testing.T) { testValueRefPlaceholderEdges(t, factory) })
 	t.Run("NodeLightScanner", func(t *testing.T) { testNodeLightScanner(t, factory) })
 	t.Run("LightEdgeScanner", func(t *testing.T) { testLightEdgeScanner(t, factory) })
 	t.Run("GetNodesByIDs", func(t *testing.T) { testGetNodesByIDs(t, factory) })
@@ -1188,6 +1189,54 @@ func testFnValuePlaceholderEdges(t *testing.T, factory Factory) {
 	}
 	if !seen["gortex::unresolved::fnvalue::handler"] {
 		t.Fatalf("FnValuePlaceholderEdges missed the multi-repo COPY-rewrite form; got %v", seen)
+	}
+}
+
+// testValueRefPlaceholderEdges proves the optional value-reference projection
+// narrows by the extractor-owned target namespace and EdgeReads kind while
+// retaining metadata for the resolver's exact live-candidate revalidation.
+func testValueRefPlaceholderEdges(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scanner, ok := s.(graph.ValueRefPlaceholderScanner)
+	if !ok {
+		t.Skip("backend does not implement ValueRefPlaceholderScanner")
+	}
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddEdge(mkEdge("a", "resolved", graph.EdgeReads))
+
+	candidate := mkEdge("a", "unresolved::valueref::MAX_RETRIES", graph.EdgeReads)
+	candidate.Line = 6
+	candidate.Meta = map[string]any{"via": "value_ref_candidate", "name": "MAX_RETRIES"}
+	s.AddEdge(candidate)
+	stale := mkEdge("a", "unresolved::valueref::STALE", graph.EdgeReads)
+	stale.Line = 7
+	stale.Meta = map[string]any{"via": "value_ref", "name": "STALE"}
+	s.AddEdge(stale)
+	wrongKind := mkEdge("a", "unresolved::valueref::NOT_A_READ", graph.EdgeCalls)
+	wrongKind.Line = 8
+	wrongKind.Meta = map[string]any{"via": "value_ref_candidate", "name": "NOT_A_READ"}
+	s.AddEdge(wrongKind)
+
+	seen := map[string]*graph.Edge{}
+	for edge := range scanner.ValueRefPlaceholderEdges() {
+		if edge.Kind != graph.EdgeReads {
+			t.Fatalf("ValueRefPlaceholderEdges yielded kind %s, want reads", edge.Kind)
+		}
+		if edge.To < "unresolved::valueref::" || edge.To >= "unresolved::valueref:;" {
+			t.Fatalf("ValueRefPlaceholderEdges yielded target outside namespace: %s", edge.To)
+		}
+		seen[edge.To] = edge
+	}
+	if len(seen) != 2 {
+		t.Fatalf("ValueRefPlaceholderEdges yielded %d targets, want candidate + stale namespace row; got %v", len(seen), seen)
+	}
+	got := seen[candidate.To]
+	if got == nil || got.Meta == nil || got.Meta["name"] != "MAX_RETRIES" {
+		t.Fatalf("ValueRefPlaceholderEdges lost candidate metadata: %#v", got)
+	}
+	if seen[stale.To] == nil {
+		t.Fatalf("ValueRefPlaceholderEdges must leave stale-via filtering to the resolver; got %v", seen)
 	}
 }
 
