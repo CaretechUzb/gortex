@@ -3,6 +3,7 @@ package languages
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
@@ -366,11 +367,16 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		if _, exists := tenvByOwner[owner][l.name]; exists {
 			continue
 		}
+		// First creation in document order = the outermost one; a
+		// nested `new` inside a collection/object initializer must
+		// not override it.
+		done := false
 		walkNodes(l.defNode, func(n *sitter.Node) {
-			if n.Type() == "object_creation_expression" {
+			if !done && n.Type() == "object_creation_expression" {
 				typeName := inferTypeFromCSharpNew(n, src)
 				if typeName != "" {
 					setLocalType(owner, l.name, typeName)
+					done = true
 				}
 			}
 		})
@@ -394,14 +400,21 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		if owner == "" {
 			continue
 		}
+		if _, exists := shapesByOwner[owner][l.name]; exists {
+			continue
+		}
 		if shape := csharpCanonTypeShape(l.rawType); shape != "" {
 			setLocalShape(owner, l.name, shape)
 		} else if l.rawType == "var" && l.defNode != nil {
+			// Same first-creation rule as the type walk above — the
+			// two stamps must describe the same creation expression.
+			done := false
 			walkNodes(l.defNode, func(n *sitter.Node) {
-				if n.Type() == "object_creation_expression" {
+				if !done && n.Type() == "object_creation_expression" {
 					if tn := n.ChildByFieldName("type"); tn != nil {
 						if s := csharpCanonTypeShape(tn.Content(src)); s != "" {
 							setLocalShape(owner, l.name, s)
+							done = true
 						}
 					}
 				}
@@ -1033,11 +1046,18 @@ func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID
 		return
 	}
 	seen[id] = true
+	// Ctors own call edges the same way methods do — without the scope
+	// stamp the resolver's namespace walk would read a ctor caller as
+	// global-namespace code.
+	meta := map[string]any{"receiver": owner.name}
+	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
+		meta["scope_ns"] = ns
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindMethod, Name: owner.name + ".<init>",
 		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
 		Language: "csharp",
-		Meta:     map[string]any{"receiver": owner.name},
+		Meta:     meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
@@ -1285,11 +1305,19 @@ func (e *CSharpExtractor) emitUsing(m parser.QueryResult, filePath, fileID strin
 type csharpFuncLookup struct {
 	ranges []funcRange
 	maxEnd []int
+	ord    []int // original extraction order — the deterministic tie-break
 }
 
 func newCSharpFuncLookup(ranges []funcRange) *csharpFuncLookup {
 	sorted := append([]funcRange(nil), ranges...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].startLine < sorted[j].startLine })
+	ord := make([]int, len(sorted))
+	for i := range ord {
+		ord[i] = i
+	}
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].startLine < sorted[j].startLine })
+	// SliceStable keeps equal start lines in extraction order, so ord
+	// still needs the same permutation applied.
+	sort.SliceStable(ord, func(i, j int) bool { return ranges[ord[i]].startLine < ranges[ord[j]].startLine })
 	maxEnd := make([]int, len(sorted))
 	running := 0
 	for i, r := range sorted {
@@ -1298,20 +1326,24 @@ func newCSharpFuncLookup(ranges []funcRange) *csharpFuncLookup {
 		}
 		maxEnd[i] = running
 	}
-	return &csharpFuncLookup{ranges: sorted, maxEnd: maxEnd}
+	return &csharpFuncLookup{ranges: sorted, maxEnd: maxEnd, ord: ord}
 }
 
 func (l *csharpFuncLookup) enclosing(line int) string {
 	i := sort.Search(len(l.ranges), func(j int) bool { return l.ranges[j].startLine > line }) - 1
 	best := ""
-	bestSpan := int(^uint(0) >> 1)
+	bestSpan := math.MaxInt
+	bestOrd := math.MaxInt
 	for ; i >= 0; i-- {
 		if l.maxEnd[i] < line {
 			break
 		}
 		if r := l.ranges[i]; line <= r.endLine {
-			if span := r.endLine - r.startLine; span < bestSpan {
-				best, bestSpan = r.id, span
+			span := r.endLine - r.startLine
+			// Innermost wins; identical ranges (expression-bodied
+			// members sharing a line) go to the first extracted.
+			if span < bestSpan || (span == bestSpan && l.ord[i] < bestOrd) {
+				best, bestSpan, bestOrd = r.id, span, l.ord[i]
 			}
 		}
 	}

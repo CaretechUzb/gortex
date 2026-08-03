@@ -32,3 +32,14 @@ func TestCSharpFuncLookup(t *testing.T) {
 	assert.Equal(t, "", l.enclosing(100), "after every range")
 	assert.Equal(t, "", newCSharpFuncLookup(nil).enclosing(1), "empty set")
 }
+
+// Two expression-bodied members on one line produce identical ranges —
+// the tie must go to the first in extraction order, deterministically
+// (findEnclosingFunc's behavior), not to whatever the sort left last.
+func TestCSharpFuncLookup_EqualRangeTieIsFirstInOrder(t *testing.T) {
+	l := newCSharpFuncLookup([]funcRange{
+		{id: "f.cs::A.First", startLine: 12, endLine: 12},
+		{id: "f.cs::A.Second", startLine: 12, endLine: 12},
+	})
+	assert.Equal(t, "f.cs::A.First", l.enclosing(12))
+}
