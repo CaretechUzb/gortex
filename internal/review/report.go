@@ -41,7 +41,9 @@ type FileRisk struct {
 	// (total transitively affected symbols from the impact analysis).
 	Affected int `json:"affected,omitempty"`
 	// Symbols counts the changed symbols in this file with impact data;
-	// Uncovered counts how many of them have no covering test.
+	// Uncovered counts how many of them have no covering test. A test
+	// file's own symbols are never counted as uncovered — they are the
+	// coverage.
 	Symbols   int `json:"symbols,omitempty"`
 	Uncovered int `json:"uncovered,omitempty"`
 }
@@ -121,7 +123,9 @@ func worseVerdict(a, b Verdict) Verdict {
 // coverageKnown gates the coverage evidence: when the graph indexes no test
 // symbols at all, "no covering test" is blindness, not a finding — the rows
 // then carry no untested counts and the verdict keeps the conservative
-// ladder.
+// ladder. Test files are exempt from the coverage debt for the same reason:
+// a test function needs no test of its own, so counting one as missing is a
+// demand that can never be met.
 func rankFileRisk(diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult, findings []Finding, repoPrefix string, coverageKnown bool) []FileRisk {
 	norm := func(file string) string {
 		file = cleanPath(file)
@@ -173,7 +177,14 @@ func rankFileRisk(diff *analysis.DiffResult, impact map[string]*analysis.ImpactR
 				}
 				if coverageKnown {
 					cov.symbols++
-					if ir == nil || len(ir.TestFiles) == 0 {
+					// A test file's own symbols need no covering test of
+					// their own, so "uncovered" is unsatisfiable for them:
+					// every changeset touching tests pinned those files at
+					// CRITICAL forever and blocked the branch with nothing
+					// actionable to fix. The detectors already exclude test
+					// files; the risk ranking now agrees. The row keeps its
+					// blast-radius tier — only the coverage debt is dropped.
+					if !analysis.IsTestFile(file) && (ir == nil || len(ir.TestFiles) == 0) {
 						cov.uncovered++
 					}
 				}

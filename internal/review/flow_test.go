@@ -307,6 +307,47 @@ func TestRankFileRiskCoverageUnknown(t *testing.T) {
 	require.Zero(t, rows[0].Uncovered)
 }
 
+// TestRankFileRiskExemptsTestFilesFromCoverageDebt pins the exemption: a test
+// file's own symbols have no covering test by construction, so counting them
+// as uncovered was an unsatisfiable demand that pinned every branch touching
+// tests at BLOCK with nothing to fix. The blast-radius tier survives; only the
+// coverage debt is dropped, which caps the file's verdict contribution.
+func TestRankFileRiskExemptsTestFilesFromCoverageDebt(t *testing.T) {
+	diff := &analysis.DiffResult{
+		ChangedSymbols: []analysis.ChangedSymbol{
+			{ID: "tests/test_svc.py::test_a", FilePath: "tests/test_svc.py", Line: 1},
+			{ID: "pkg/svc_test.go::TestB", FilePath: "pkg/svc_test.go", Line: 1},
+			{ID: "pkg/svc.go::C", FilePath: "pkg/svc.go", Line: 1},
+		},
+		ChangedFiles: []string{"tests/test_svc.py", "pkg/svc_test.go", "pkg/svc.go"},
+	}
+	impact := map[string]*analysis.ImpactResult{
+		"tests/test_svc.py::test_a": {Risk: analysis.RiskCritical, TotalAffected: 80},
+		"pkg/svc_test.go::TestB":    {Risk: analysis.RiskCritical, TotalAffected: 40},
+		"pkg/svc.go::C":             {Risk: analysis.RiskCritical, TotalAffected: 12},
+	}
+	rows := rankFileRisk(diff, impact, nil, "", true)
+
+	byFile := map[string]FileRisk{}
+	for _, r := range rows {
+		byFile[r.File] = r
+	}
+	for _, f := range []string{"tests/test_svc.py", "pkg/svc_test.go"} {
+		require.Equal(t, 1, byFile[f].Symbols, "%s: the changed symbol is still counted", f)
+		require.Zero(t, byFile[f].Uncovered, "%s: a test file owes no covering test", f)
+		require.Equal(t, string(analysis.RiskCritical), byFile[f].Risk,
+			"%s: the blast-radius tier is a graph fact and stays", f)
+	}
+	require.Equal(t, 1, byFile["pkg/svc.go"].Uncovered, "production code still owes a covering test")
+
+	// The whole point: without the exemption the test files alone would block.
+	require.Equal(t, VerdictReview,
+		computeVerdict(nil, []FileRisk{byFile["tests/test_svc.py"], byFile["pkg/svc_test.go"]}),
+		"a changeset of test files alone must not BLOCK on unsatisfiable coverage debt")
+	require.Equal(t, VerdictBlock, computeVerdict(nil, []FileRisk{byFile["pkg/svc.go"]}),
+		"genuinely untested critical-risk production code still blocks")
+}
+
 // TestSummarizeCoveragePhrasing pins the four risk-driven headlines: untested
 // risk, fully covered risk, unattestable coverage, and coverage that simply
 // was not evaluated.

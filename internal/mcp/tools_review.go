@@ -562,7 +562,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, allowedRepos)
+		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, repoPrefix, allowedRepos)
 		impact = s.reviewImpact(diff.ChangedSymbols)
 		changedFiles = diff.ChangedFiles
 	}
@@ -609,7 +609,12 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 // the changed files and returns the surviving matches. It mirrors the analyze
 // review path (DetectorsByCategory("review") + GroundReviewMatches) but narrows
 // the AST targets to the changeset so the review tool only flags changed code.
-func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []string, allowedRepos map[string]bool) []astquery.Match {
+//
+// repoPrefix bridges the two path vocabularies the narrowing spans: git names
+// changed files relative to the working tree while the graph keys every file
+// node "<prefix>/<rel>". Matches come back repo-relative — the spelling that
+// rule resolution, the per-file risk ranking, and the forge comment API speak.
+func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []string, repoPrefix string, allowedRepos map[string]bool) []astquery.Match {
 	bundle := astquery.DetectorsByCategory("review")
 	if len(bundle) == 0 {
 		return nil
@@ -620,15 +625,9 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 		return nil
 	}
 
-	// Narrow to the changed-file set (graph-relative paths) so the rulepack only
-	// scans the changeset, not the whole repository.
-	changed := make(map[string]bool, len(changedFiles))
-	for _, f := range changedFiles {
-		f = filepath.Clean(strings.TrimSpace(f))
-		if f != "" && f != "." {
-			changed[f] = true
-		}
-	}
+	// Narrow to the changed-file set so the rulepack only scans the changeset,
+	// not the whole repository.
+	changed := reviewChangedGraphPaths(changedFiles, repoPrefix)
 	if len(changed) == 0 {
 		return nil
 	}
@@ -669,8 +668,49 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 
 	// Graph-grounding post-pass: drop the N+1 / check-then-act rows the resolved
 	// call / loop metadata refutes. This is the same FP-reduction the analyze
-	// review path applies.
-	return review.GroundReviewMatches(s.graph, collected)
+	// review path applies. Grounding keys off the match's symbol id, so the
+	// path is only rewritten once the rows that survive are known.
+	kept := review.GroundReviewMatches(s.graph, collected)
+	for i := range kept {
+		kept[i].File = reviewRepoRelPath(kept[i].File, repoPrefix)
+	}
+	return kept
+}
+
+// reviewChangedGraphPaths maps a changeset's file paths onto the vocabulary the
+// graph keys file nodes in. `git diff` names files relative to the working tree
+// while a multi-repo daemon keys every node "<prefix>/<rel>", so intersecting
+// the two spellings raw matched nothing: `review` reported zero findings on the
+// very code its own detector bundle flags under `analyze --kind review`.
+//
+// Only the prefixed spelling is admitted once a prefix applies — a bare
+// relative path would also match a same-named file in a sibling tracked repo.
+// Paths that already carry the prefix pass through unchanged, so a caller
+// holding graph-keyed paths (a changed symbol's FilePath) joins too.
+func reviewChangedGraphPaths(changedFiles []string, repoPrefix string) map[string]bool {
+	changed := make(map[string]bool, len(changedFiles))
+	for _, f := range changedFiles {
+		f = filepath.Clean(strings.TrimSpace(f))
+		if f == "" || f == "." {
+			continue
+		}
+		if repoPrefix != "" && !strings.HasPrefix(f, repoPrefix+"/") {
+			f = repoPrefix + "/" + f
+		}
+		changed[f] = true
+	}
+	return changed
+}
+
+// reviewRepoRelPath strips the graph repo prefix off a file path, returning the
+// repo-relative spelling the rest of the review pipeline speaks: the rule
+// resolver matches `.gortex.yaml` globs against it, rankFileRisk keys its rows
+// on it, and post_review hands it to the forge's comment API.
+func reviewRepoRelPath(path, repoPrefix string) string {
+	if repoPrefix == "" {
+		return path
+	}
+	return strings.TrimPrefix(path, repoPrefix+"/")
 }
 
 // testLangByExt maps a source-file extension onto the language family its
@@ -1069,7 +1109,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, allowedRepos)
+		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, repoPrefix, allowedRepos)
 		impact = s.reviewImpact(diff.ChangedSymbols)
 		for _, cs := range diff.ChangedSymbols {
 			if cs.ID != "" {
