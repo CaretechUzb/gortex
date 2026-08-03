@@ -21,7 +21,7 @@ func captureTestRow(id, file string) localizationDigestRow {
 	}
 }
 
-func TestMergeLocalizationEvidenceDigestIsCurrentFirstAlignedAndBounded(t *testing.T) {
+func TestMergeLocalizationEvidenceDigestReservesPriorWindowAndStaysAligned(t *testing.T) {
 	retained := mergeLocalizationEvidenceDigest([]localizationDigestRow{
 		captureTestRow("repo/storage/base.go::Storage.Load", "repo/storage/base.go"),
 		captureTestRow("repo/storage/cloud.go::CloudStorage.Load", "repo/storage/cloud.go"),
@@ -43,10 +43,10 @@ func TestMergeLocalizationEvidenceDigestIsCurrentFirstAlignedAndBounded(t *testi
 	wantIDs := []string{
 		"repo/storage/disk.go::DiskStorage.Load",
 		"repo/storage/base.go::Storage.Load",
-		"repo/storage/mirror.go::Mirror.Load",
 		"repo/storage/cloud.go::CloudStorage.Load",
 		"repo/storage/cache.go::Cache.Load",
 		"repo/storage/archive.go::Archive.Load",
+		"repo/storage/mirror.go::Mirror.Load",
 	}
 	for index, want := range wantIDs {
 		row := merged.Evidence[index]
@@ -194,7 +194,7 @@ func TestFinishReservedReadWithDigestMergesOnlyOnAnswerReady(t *testing.T) {
 	}
 }
 
-func TestFinishReservedReadWithDigestRetriesRecordedZeroThenPreservesCurrentTaskDigest(t *testing.T) {
+func TestFinishReservedReadWithDigestEmptySuccessReleasesAdvisoryAndPreservesCurrentTaskDigest(t *testing.T) {
 	retained := mergeLocalizationEvidenceDigest([]localizationDigestRow{
 		captureTestRow("repo/storage/base.go::Storage.Load", "repo/storage/base.go"),
 	}, nil)
@@ -207,25 +207,17 @@ func TestFinishReservedReadWithDigestRetriesRecordedZeroThenPreservesCurrentTask
 		digest:                   retained,
 	}
 	completion := state.finishReservedReadTokenWithDigest(21, true, nil, true)
-	if completion.State != localizationStateNeedsRecovery || completion.AllowedToolCalls != 1 {
-		t.Fatalf("first zero-result completion = %#v", completion)
+	if completion.State != localizationStateLocalized || completion.AllowedToolCalls != 0 || completion.Enforceable {
+		t.Fatalf("empty accepted recovery did not release an advisory result: %#v", completion)
 	}
-	if state.digest == nil {
-		t.Fatal("bounded retry discarded digest before exhaustion")
+	if state.state != localizationStateInactive {
+		t.Fatalf("empty accepted recovery left state restricted: %q", state.state)
 	}
-
-	state.state = localizationStateRecoveryInFlight
-	state.readReservationToken = 22
-	state.readReservationGen = state.generation
-	completion = state.finishReservedReadTokenWithDigest(22, true, nil, true)
-	if completion.State != localizationStateAnswerReady {
-		t.Fatalf("exhausted zero-result state = %q", completion.State)
-	}
-	if state.digest != retained || completion.digest != retained {
-		t.Fatalf("same-task exhaustion discarded retained evidence: state=%#v completion=%#v", state.digest, completion.digest)
+	if state.digest != nil || completion.digest != retained {
+		t.Fatalf("advisory release did not return retained evidence and clear internal authorization: state=%#v completion=%#v", state.digest, completion.digest)
 	}
 	if got := completion.digest.Evidence[0].ID; got != "repo/storage/base.go::Storage.Load" {
-		t.Fatalf("same-task exhaustion changed retained identity: %q", got)
+		t.Fatalf("same-task advisory release changed retained identity: %q", got)
 	}
 }
 

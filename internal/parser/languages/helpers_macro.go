@@ -41,6 +41,21 @@ var cKeywordsInMacroBody = map[string]bool{
 // ordinary call_expression and already resolves against the macro by
 // name, so caller -> macro -> body-call forms a two-hop path through the
 // expansion.
+// macroEndLine reports the 1-based line that last carries the definition's
+// source. A preprocessor definition is terminated by its newline, and the
+// grammar includes that newline in the node, so tree-sitter reports the end
+// point at column 0 of the following row. Converting that row directly would
+// extend the macro over the next declaration: a one-line `#define` above a
+// function would own the function's own signature line, and every enclosing
+// -symbol lookup on that line would answer with the macro.
+func macroEndLine(defNode *sitter.Node) int {
+	end := defNode.EndPoint()
+	if end.Column == 0 && end.Row > defNode.StartPoint().Row {
+		return int(end.Row)
+	}
+	return int(end.Row) + 1
+}
+
 func emitCMacro(defNode *sitter.Node, isFunc bool, filePath, fileID, lang string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	if defNode == nil {
 		return
@@ -95,7 +110,7 @@ func emitCMacro(defNode *sitter.Node, isFunc bool, filePath, fileID, lang string
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindMacro, Name: name,
-		FilePath: filePath, StartLine: line, EndLine: int(defNode.EndPoint().Row) + 1,
+		FilePath: filePath, StartLine: line, EndLine: macroEndLine(defNode),
 		Language: lang, Meta: meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{

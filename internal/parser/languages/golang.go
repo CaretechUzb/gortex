@@ -2484,13 +2484,33 @@ func buildFuncRanges(result *parser.ExtractionResult) []funcRange {
 	return ranges
 }
 
+// findEnclosingFunc returns the deepest declared function or method covering
+// line. Parser emission order is not a scope order, so nested declarations are
+// selected by span with a stable identity tie-break. Closures are deliberately
+// excluded from buildFuncRanges: line-only references cannot distinguish an
+// outer registration call from an inner same-line closure call; extractors that
+// retain AST positions must resolve those through syntax ancestry instead.
 func findEnclosingFunc(ranges []funcRange, line int) string {
+	bestID := ""
+	bestStart := -1
+	bestSpan := int(^uint(0) >> 1)
 	for _, r := range ranges {
-		if line >= r.startLine && line <= r.endLine {
-			return r.id
+		if line < r.startLine || line > r.endLine {
+			continue
+		}
+		span := r.endLine - r.startLine
+		if span < 0 {
+			continue
+		}
+		if bestID == "" || span < bestSpan ||
+			(span == bestSpan && r.startLine > bestStart) ||
+			(span == bestSpan && r.startLine == bestStart && r.id < bestID) {
+			bestID = r.id
+			bestStart = r.startLine
+			bestSpan = span
 		}
 	}
-	return ""
+	return bestID
 }
 
 // splitReceiverFields splits a receiver's text on top-level whitespace
