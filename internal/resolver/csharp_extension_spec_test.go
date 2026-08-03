@@ -136,7 +136,6 @@ namespace App {
 // supplies candidates at the A.B scope, which are considered before the outer
 // enclosing namespace A's own extension.
 func TestResolveCSharpExtension_InnerScopeUsingBeatsOuterEnclosing(t *testing.T) {
-	t.Skip("pending R3: scope-by-scope using lookup (fails today — verified)")
 	g := buildCSharpResolverGraph(t, map[string]string{
 		"W.cs": `namespace W {
     public class Widget {}
@@ -172,7 +171,6 @@ namespace X {
 // declared inside namespace A is scoped to A — a sibling namespace B in the
 // same file must not see it.
 func TestResolveCSharpExtension_SiblingNamespaceUsingNotVisible(t *testing.T) {
-	t.Skip("pending R3: per-scope using visibility (fails today — verified)")
 	g := buildCSharpResolverGraph(t, map[string]string{
 		"W.cs": `namespace W {
     public class Widget {}

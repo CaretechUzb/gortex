@@ -654,6 +654,13 @@ func (r *Resolver) narrowCSharpExtensionsByVisibility(e *graph.Edge, exts []*gra
 		return nil
 	}
 	visible := r.csharpFileNamespaceSet(e.FilePath)
+	// Scope-aware graphs walk the caller's namespace levels innermost-out
+	// (C# spec §12.8.10.3) instead of the flat two-tier flatten below —
+	// an inner scope's using out-ranks an outer namespace's declaration,
+	// and a sibling namespace's using grants nothing.
+	if levels, ok := r.csharpCallerScopeLevels(e, visible); ok {
+		return csharpScopeByScopeNarrow(levels, visible, exts)
+	}
 	enclosingSet := r.csharpCallerEnclosing(e, visible)
 	if len(enclosingSet) == 0 && len(visible.imported) == 0 && len(visible.statics) == 0 {
 		return nil
@@ -718,6 +725,67 @@ func (r *Resolver) csharpCallerEnclosing(e *graph.Edge, visible csharpFileNS) ma
 		}
 	}
 	return visible.enclosing
+}
+
+// csharpCallerScopeLevels is the call site's namespace lookup chain,
+// innermost first and ending with "" (the compilation unit) — the
+// level order C# walks for extension lookup. ok=false when the calling
+// file predates the scoped-usings stamp or the caller node is missing:
+// verdicts then stay with the flat legacy tiers.
+func (r *Resolver) csharpCallerScopeLevels(e *graph.Edge, visible csharpFileNS) ([]string, bool) {
+	if visible.scoped == nil {
+		return nil, false
+	}
+	cn := r.cachedGetNode(e.From)
+	if cn == nil {
+		return nil, false
+	}
+	var levels []string
+	if scope, _ := cn.Meta["scope_ns"].(string); scope != "" {
+		for scope != "" {
+			levels = append(levels, scope)
+			i := strings.LastIndex(scope, ".")
+			if i < 0 {
+				break
+			}
+			scope = scope[:i]
+		}
+	}
+	return append(levels, ""), true
+}
+
+// csharpScopeByScopeNarrow walks the caller's namespace levels innermost
+// out; at each level the candidate set is the extensions DECLARED in
+// that namespace plus the ones imported by that level's own using
+// directives, and the first non-empty set is the verdict (the standard
+// words these as two successive attempts per level; the compiler merges
+// them into one set, and merging is also the refusal-safe reading — a
+// declared/imported tie surfaces as ambiguity instead of a guess).
+// Using-static admissions join the compilation-unit level: the static
+// stamp is not scope-split, and the rare narrower placement can only
+// defer a candidate, never invent one. Returns nil when no level admits
+// a candidate: narrowing only, never a loss.
+func csharpScopeByScopeNarrow(levels []string, visible csharpFileNS, exts []*graph.Node) []*graph.Node {
+	for _, level := range levels {
+		var set []*graph.Node
+		for _, c := range exts {
+			ns, _ := c.Meta["scope_ns"].(string)
+			switch {
+			case ns != "" && ns == level:
+				set = append(set, c)
+			case level == "" && csharpUsingStaticAdmits(visible, c, ns):
+				set = append(set, c)
+			case ns != "":
+				if _, ok := visible.scoped[level][ns]; ok {
+					set = append(set, c)
+				}
+			}
+		}
+		if len(set) > 0 {
+			return set
+		}
+	}
+	return nil
 }
 
 // csharpShape is the parsed structure of a type spelling: core name,
@@ -1050,6 +1118,17 @@ func (r *Resolver) csharpExtensionVisible(e *graph.Edge, fileID string, c *graph
 	}
 	if _, ok := r.csharpCallerEnclosing(e, visible)[ns]; ok {
 		return true
+	}
+	// Scope-aware graphs: an import counts only when a level of the
+	// caller's own chain declares it — a using inside a SIBLING
+	// namespace of the same file grants nothing.
+	if levels, ok := r.csharpCallerScopeLevels(e, visible); ok {
+		for _, l := range levels {
+			if _, hit := visible.scoped[l][ns]; hit {
+				return true
+			}
+		}
+		return false
 	}
 	_, ok := visible.imported[ns]
 	return ok

@@ -19,6 +19,12 @@ type csharpFileNS struct {
 	enclosing map[string]struct{} // declared namespaces + their prefixes
 	imported  map[string]struct{} // using-directive namespaces (incl. project-scoped globals)
 	statics   map[string]struct{} // using-static class FQNs — members in scope, not the namespace
+	// scoped splits the imports by the namespace scope declaring them
+	// ("" = compilation unit) — C# using visibility is scope-by-scope,
+	// and a using inside namespace A grants nothing to a sibling B in
+	// the same file. nil on graphs extracted before the scoped stamp:
+	// consumers must then fall back to the flat imported set.
+	scoped map[string]map[string]struct{}
 }
 
 // csharpFileNamespaceSet returns the namespaces visible to a C# file:
@@ -46,6 +52,20 @@ func (r *Resolver) csharpFileNamespaceSet(fileID string) csharpFileNS {
 		for _, u := range csharpMetaStrings(f.Meta["using_static"]) {
 			ns.statics[u] = struct{}{}
 		}
+		for _, su := range csharpMetaStrings(f.Meta["scoped_usings"]) {
+			i := strings.Index(su, "|")
+			if i < 0 || su[i+1:] == "" {
+				continue
+			}
+			scope, name := su[:i], su[i+1:]
+			if ns.scoped == nil {
+				ns.scoped = map[string]map[string]struct{}{}
+			}
+			if ns.scoped[scope] == nil {
+				ns.scoped[scope] = map[string]struct{}{}
+			}
+			ns.scoped[scope][name] = struct{}{}
+		}
 	}
 	// The stamp gate must reflect the file's OWN usings only: inherited
 	// globals say nothing about whether THIS file was extracted by a
@@ -54,9 +74,16 @@ func (r *Resolver) csharpFileNamespaceSet(fileID string) csharpFileNS {
 	hasStamp := len(ns.imported) > 0
 	// Project-scoped `global using`s from the directory chain (the
 	// Usings.cs convention) join the imported tier exactly like a local
-	// directive would.
+	// directive would — at the compilation-unit scope, where the
+	// language puts a global using.
 	for _, u := range r.csharpGlobalUsingsFor(fileID) {
 		ns.imported[u] = struct{}{}
+		if ns.scoped != nil {
+			if ns.scoped[""] == nil {
+				ns.scoped[""] = map[string]struct{}{}
+			}
+			ns.scoped[""][u] = struct{}{}
+		}
 	}
 	for _, e := range r.graph.GetOutEdges(fileID) {
 		if e == nil {

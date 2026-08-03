@@ -82,6 +82,89 @@ namespace App.Web
 		"the plain stamp keeps its shape: namespace usings incl. global, no static/alias")
 }
 
+// TestCSharpExtractor_ScopedUsingsMeta: R3 (PR #432 review) — C# using
+// visibility is scope-by-scope, so each plain namespace using is also
+// stamped WITH the namespace scope it is declared in ("scope|name",
+// empty scope = compilation unit). Additive: the flat legacy keys keep
+// their exact shape for every existing consumer.
+func TestCSharpExtractor_ScopedUsingsMeta(t *testing.T) {
+	src := []byte(`using W;
+
+namespace A
+{
+    using X;
+
+    namespace B
+    {
+        using Y;
+
+        public class Runner {}
+    }
+}
+`)
+	res, err := NewCSharpExtractor().Extract("Caller.cs", src)
+	require.NoError(t, err)
+
+	var file *graph.Node
+	for _, n := range res.Nodes {
+		if n.Kind == graph.KindFile {
+			file = n
+		}
+	}
+	require.NotNil(t, file)
+
+	scoped, _ := file.Meta["scoped_usings"].([]string)
+	assert.ElementsMatch(t, []string{"|W", "A|X", "A.B|Y"}, scoped,
+		"each using rides with its declaring namespace scope")
+	usings, _ := file.Meta["usings"].([]string)
+	assert.ElementsMatch(t, []string{"W", "X", "Y"}, usings,
+		"the flat legacy stamp keeps every using, scope-blind as before")
+}
+
+// TestCSharpExtractor_ScopedUsingsMeta_QualifiedAndFileScoped: a using
+// inside `namespace A.B { }` belongs to the A.B scope; usings BEFORE a
+// file-scoped `namespace N;` stay at the compilation-unit scope.
+// Aliases and using-static stay out, matching the flat stamp.
+func TestCSharpExtractor_ScopedUsingsMeta_QualifiedAndFileScoped(t *testing.T) {
+	res, err := NewCSharpExtractor().Extract("Q.cs", []byte(`namespace A.B
+{
+    using X;
+    using Alias = Legacy.Old;
+    using static Helpers.Math;
+
+    public class Runner {}
+}
+`))
+	require.NoError(t, err)
+	var file *graph.Node
+	for _, n := range res.Nodes {
+		if n.Kind == graph.KindFile {
+			file = n
+		}
+	}
+	require.NotNil(t, file)
+	scoped, _ := file.Meta["scoped_usings"].([]string)
+	assert.ElementsMatch(t, []string{"A.B|X"}, scoped,
+		"qualified namespace blocks scope their usings under the full dotted name")
+
+	res, err = NewCSharpExtractor().Extract("F.cs", []byte(`using W;
+namespace N;
+
+public class Runner {}
+`))
+	require.NoError(t, err)
+	file = nil
+	for _, n := range res.Nodes {
+		if n.Kind == graph.KindFile {
+			file = n
+		}
+	}
+	require.NotNil(t, file)
+	scoped, _ = file.Meta["scoped_usings"].([]string)
+	assert.ElementsMatch(t, []string{"|W"}, scoped,
+		"usings preceding a file-scoped namespace are compilation-unit scoped")
+}
+
 // TestCSharpExtractor_UsingsMeta_NoUsings: a file without using
 // directives must not grow an empty Meta entry.
 func TestCSharpExtractor_UsingsMeta_NoUsings(t *testing.T) {

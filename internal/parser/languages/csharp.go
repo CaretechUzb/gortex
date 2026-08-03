@@ -1178,10 +1178,17 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 // callable in extension form). Resolution rewrites the per-directive
 // import edges, so the resolver's namespace narrowing reads these
 // shapes, which nothing mutates.
+//
+// C# using visibility is scope-by-scope — a using inside `namespace A`
+// applies within A only, invisible to a sibling namespace in the same
+// file — so each plain using is ALSO stamped with its declaring scope
+// as Meta["scoped_usings"] ("scope|name", empty scope = compilation
+// unit). Additive: the flat keys keep their exact legacy shape.
 func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
-	var usings, globals, statics []string
+	var usings, globals, statics, scoped []string
 	seen := map[string]bool{}
 	seenStatic := map[string]bool{}
+	seenScoped := map[string]bool{}
 	walkNodes(root, func(n *sitter.Node) {
 		if n.Type() != "using_directive" {
 			return
@@ -1218,6 +1225,12 @@ func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
 				globals = append(globals, name)
 			}
 		}
+		// The scoped entry dedups per (scope, name) — the same namespace
+		// imported at two scopes is two distinct visibility facts.
+		if key := csharpEnclosingNamespace(n, src) + "|" + name; !seenScoped[key] {
+			seenScoped[key] = true
+			scoped = append(scoped, key)
+		}
 	})
 	if len(usings) == 0 && len(statics) == 0 {
 		return
@@ -1233,6 +1246,9 @@ func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
 	}
 	if len(statics) > 0 {
 		fileNode.Meta["using_static"] = statics
+	}
+	if len(scoped) > 0 {
+		fileNode.Meta["scoped_usings"] = scoped
 	}
 }
 
