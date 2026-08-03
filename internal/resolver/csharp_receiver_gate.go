@@ -132,6 +132,7 @@ func demoteCSharpMisattributedMemberCallCandidates(
 	}
 	byName := g.FindNodesByNames(typeNames)
 	nameToTypeIDs := map[string][]string{}
+	typeNameByID := map[string]string{}
 	hierarchyRepos := map[string]bool{}
 	hierarchyRoots := make([]*graph.Node, 0)
 	for name, matches := range byName {
@@ -141,6 +142,7 @@ func demoteCSharpMisattributedMemberCallCandidates(
 				continue
 			}
 			nameToTypeIDs[name] = append(nameToTypeIDs[name], node.ID)
+			typeNameByID[node.ID] = node.Name
 			hierarchyRepos[node.RepoPrefix] = true
 			hierarchyRoots = append(hierarchyRoots, node)
 		}
@@ -149,24 +151,48 @@ func demoteCSharpMisattributedMemberCallCandidates(
 		return 0
 	}
 
-	var hierarchyEdges []*graph.Edge
-	if exactHierarchy {
-		var hierarchyNodes map[string]*graph.Node
-		hierarchyEdges, hierarchyNodes = csharpHierarchyClosure(g, hierarchyRoots)
+	up := map[string][]string{}
+	// incompleteHier[name] marks a C# type that declares a base or interface the
+	// index could not resolve (an external assembly, a generic type parameter) —
+	// its hierarchy is only partially known, so an "unrelated to the target"
+	// verdict for a receiver of that type is unreliable.
+	incompleteHier := map[string]bool{}
+	recordHierarchyEdge := func(edge *graph.Edge) {
+		if edge == nil || edge.From == "" {
+			return
+		}
+		if graph.IsUnresolvedTarget(edge.To) {
+			if name := typeNameByID[edge.From]; name != "" {
+				incompleteHier[name] = true
+				return
+			}
+			if from := nodes[edge.From]; from != nil && from.Language == "csharp" && from.Name != "" {
+				incompleteHier[from.Name] = true
+			}
+			return
+		}
+		up[edge.From] = append(up[edge.From], edge.To)
+	}
+
+	switch {
+	case exactHierarchy:
+		hierarchyEdges, hierarchyNodes := csharpHierarchyClosure(g, hierarchyRoots)
 		for id, node := range hierarchyNodes {
 			nodes[id] = node
 		}
-	} else {
-		hierarchyEdges = frameworkRepoEdges(
-			g,
-			func() map[string]bool {
-				if scope == nil {
-					return nil
-				}
-				return hierarchyRepos
-			}(),
-			graph.EdgeExtends,
-			graph.EdgeImplements,
+		for _, edge := range hierarchyEdges {
+			recordHierarchyEdge(edge)
+		}
+	case scope == nil:
+		// Full reconciliation needs only hierarchy identities. Stream the
+		// metadata-free projection to completion before any later store re-entry;
+		// relevant unresolved sources are named by the already-hydrated type set.
+		for edge := range graph.EdgesLightSeq(g, graph.EdgeExtends, graph.EdgeImplements) {
+			recordHierarchyEdge(edge)
+		}
+	default:
+		hierarchyEdges := frameworkRepoEdges(
+			g, hierarchyRepos, graph.EdgeExtends, graph.EdgeImplements,
 		)
 		hierarchyNodeIDs := make([]string, 0, len(hierarchyEdges)*2)
 		for _, edge := range hierarchyEdges {
@@ -180,25 +206,9 @@ func demoteCSharpMisattributedMemberCallCandidates(
 		for id, node := range g.GetNodesByIDs(hierarchyNodeIDs) {
 			nodes[id] = node
 		}
-	}
-
-	up := map[string][]string{}
-	// incompleteHier[name] marks a C# type that declares a base or interface the
-	// index could not resolve (an external assembly, a generic type parameter) —
-	// its hierarchy is only partially known, so an "unrelated to the target"
-	// verdict for a receiver of that type is unreliable.
-	incompleteHier := map[string]bool{}
-	for _, edge := range hierarchyEdges {
-		if edge == nil || edge.From == "" {
-			continue
+		for _, edge := range hierarchyEdges {
+			recordHierarchyEdge(edge)
 		}
-		if graph.IsUnresolvedTarget(edge.To) {
-			if from := nodes[edge.From]; from != nil && from.Language == "csharp" && from.Name != "" {
-				incompleteHier[from.Name] = true
-			}
-			continue
-		}
-		up[edge.From] = append(up[edge.From], edge.To)
 	}
 
 	reindex := make([]graph.EdgeReindex, 0)

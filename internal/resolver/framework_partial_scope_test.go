@@ -3,11 +3,13 @@ package resolver
 import (
 	"fmt"
 	"iter"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 type frameworkTailCountingStore struct {
@@ -20,7 +22,7 @@ type frameworkTailCountingStore struct {
 	repoEdgesByKinds, repoNodeIDsByKind   int
 	allNodesLight, repoNodesLight         int
 	repoPrefixes, unresolvedIdentityScans int
-	frameworkCensusScans                  int
+	frameworkCensusScans, lightEdgeScans  int
 }
 
 func (s *frameworkTailCountingStore) GetNode(id string) *graph.Node {
@@ -117,6 +119,13 @@ func (s *frameworkTailCountingStore) FrameworkCensusEdgesSeq(
 ) iter.Seq[graph.FrameworkCensusEdge] {
 	s.frameworkCensusScans++
 	return graph.FrameworkCensusEdgesSeq(s.Store, kinds...)
+}
+
+func (s *frameworkTailCountingStore) EdgesLightSeq(
+	kinds ...graph.EdgeKind,
+) iter.Seq[*graph.Edge] {
+	s.lightEdgeScans++
+	return graph.EdgesLightSeq(s.Store, kinds...)
 }
 
 func addDjangoRepo(g *graph.Graph, repo string, count int) {
@@ -264,7 +273,7 @@ func TestCSharpInterfaceDispatchScopedMatchesFullAndUsesBatchFrontier(t *testing
 	require.Equal(t, 1, counting.addBatch)
 }
 
-func addReceiverGateRepo(g *graph.Graph, repo string) (caller, target string) {
+func addReceiverGateRepo(g graph.Store, repo string) (caller, target string) {
 	caller = repo + "::Caller.Run"
 	target = repo + "::Other.Do"
 	g.AddBatch([]*graph.Node{
@@ -284,6 +293,8 @@ func TestCSharpReceiverGateScopedMatchesFullAndBatchesMutation(t *testing.T) {
 	fullCounting := &frameworkTailCountingStore{Store: full}
 	require.Equal(t, 2, demoteCSharpMisattributedMemberCalls(fullCounting))
 	require.Equal(t, 1, fullCounting.frameworkCensusScans, "full gate should project receiver_type identities")
+	require.Equal(t, 1, fullCounting.lightEdgeScans, "full gate should stream a metadata-free hierarchy")
+	require.Equal(t, 1, fullCounting.getNodesByIDs, "full gate should hydrate only call endpoints, not the hierarchy corpus")
 	fullEdge := findCallEdge(full, fullCaller, fullTarget)
 	require.True(t, fullEdge.IsSpeculative())
 	require.Equal(t, "preserved", fullEdge.Meta["opaque"], "exact refetch must retain opaque metadata")
@@ -300,6 +311,19 @@ func TestCSharpReceiverGateScopedMatchesFullAndBatchesMutation(t *testing.T) {
 	require.Zero(t, counting.addEdge)
 	require.Zero(t, counting.removeEdge)
 	require.Equal(t, 1, counting.reindexEdges)
+}
+
+func TestCSharpReceiverGateFullSQLiteUsesProjectedCallsAndLightHierarchy(t *testing.T) {
+	g, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, g.Close()) })
+
+	caller, target := addReceiverGateRepo(g, "repo")
+	require.Equal(t, 1, demoteCSharpMisattributedMemberCalls(g))
+	edge := findCallEdge(g, caller, target)
+	require.NotNil(t, edge)
+	require.True(t, edge.IsSpeculative())
+	require.Equal(t, "preserved", edge.Meta["opaque"])
 }
 
 func addExactReceiverGateCall(
