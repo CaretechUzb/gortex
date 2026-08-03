@@ -49,6 +49,39 @@ func BenchmarkNormalizeExtractionMetadataFileOnly(b *testing.B) {
 	}
 }
 
+func TestNormalizeExtractionMetadataBoundsHugeDeclarationLine(t *testing.T) {
+	src := append([]byte("var key = "), bytes.Repeat([]byte("value"), 1<<20)...)
+	node := &graph.Node{
+		ID: "data.json::key", Kind: graph.KindVariable, Name: "key",
+		FilePath: "data.json", StartLine: 1, EndLine: 1, Language: "json",
+	}
+	normalizeExtractionMetadata(&parser.ExtractionResult{Nodes: []*graph.Node{node}}, src)
+
+	got := node.RetrievalMetadata().Signature
+	if !strings.HasPrefix(got, "var key = value") || len(got) > 512 {
+		t.Fatalf("signature len=%d value=%q", len(got), got)
+	}
+	before := got
+	src[4] = 'X'
+	if after := node.RetrievalMetadata().Signature; after != before {
+		t.Fatalf("bounded metadata aliases source: before=%q after=%q", before, after)
+	}
+}
+
+func BenchmarkNormalizeExtractionMetadataHugeDeclaration(b *testing.B) {
+	src := append([]byte("var key = "), bytes.Repeat([]byte("value"), 1<<20)...)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		node := &graph.Node{
+			ID: "data.json::key", Kind: graph.KindVariable, Name: "key",
+			FilePath: "data.json", StartLine: 1, EndLine: 1, Language: "json",
+		}
+		normalizeExtractionMetadata(&parser.ExtractionResult{Nodes: []*graph.Node{node}}, src)
+	}
+}
+
 func TestExtractFileNormalizesMetadataAtSharedBoundary(t *testing.T) {
 	src := []byte("fn resolve(value: Input) -> Output { value.into() }\n")
 	n := &graph.Node{

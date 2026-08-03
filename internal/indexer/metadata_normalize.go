@@ -1,9 +1,11 @@
 package indexer
 
 import (
+	"bytes"
 	"path"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
@@ -16,19 +18,7 @@ func normalizeExtractionMetadata(result *parser.ExtractionResult, src []byte) {
 	if result == nil {
 		return
 	}
-	var (
-		sourceLines      []string
-		sourceLinesReady bool
-	)
-	getSourceLines := func() []string {
-		if !sourceLinesReady {
-			sourceLinesReady = true
-			if len(src) > 0 {
-				sourceLines = strings.Split(string(src), "\n")
-			}
-		}
-		return sourceLines
-	}
+	sourceLines := newMetadataSourceLines(src)
 
 	nodesByID := make(map[string]*graph.Node, len(result.Nodes))
 	for _, n := range result.Nodes {
@@ -77,7 +67,7 @@ func normalizeExtractionMetadata(result *parser.ExtractionResult, src []byte) {
 		}
 		sig := compactSignature(normalizedMetaString(n.Meta, "signature"), n.Language)
 		if sig == "" || syntheticSignature(sig, n.Name) {
-			if derived := declarationSignature(getSourceLines(), n); derived != "" {
+			if derived := declarationSignatureFromSource(&sourceLines, n); derived != "" {
 				sig = derived
 			}
 		}
@@ -92,7 +82,7 @@ func normalizeExtractionMetadata(result *parser.ExtractionResult, src []byte) {
 			metaString(n.Meta, "comment"),
 		))
 		if doc == "" {
-			doc = docAbove(getSourceLines(), n.StartLine)
+			doc = docAboveSource(&sourceLines, n.StartLine)
 		}
 
 		qual := retrievalQualName(n, ownerNodes, ownerNames, qualNames, make(map[*graph.Node]bool))
@@ -358,6 +348,148 @@ func syntheticSignature(sig, name string) bool {
 	return strings.Contains(compact, name+"(...)") ||
 		compact == "function"+name+"()" ||
 		compact == "fn"+name+"(...)"
+}
+
+type metadataSourceLines struct {
+	src     []byte
+	starts  []int
+	indexed bool
+}
+
+func newMetadataSourceLines(src []byte) metadataSourceLines {
+	return metadataSourceLines{src: src}
+}
+
+func (s *metadataSourceLines) ensureIndexed() {
+	if s == nil || s.indexed {
+		return
+	}
+	s.indexed = true
+	if len(s.src) == 0 {
+		return
+	}
+	s.starts = append(s.starts, 0)
+	for i, c := range s.src {
+		if c == '\n' {
+			s.starts = append(s.starts, i+1)
+		}
+	}
+}
+
+func (s *metadataSourceLines) len() int {
+	s.ensureIndexed()
+	return len(s.starts)
+}
+
+func (s *metadataSourceLines) line(index int) []byte {
+	s.ensureIndexed()
+	if index < 0 || index >= len(s.starts) {
+		return nil
+	}
+	start := s.starts[index]
+	end := len(s.src)
+	if index+1 < len(s.starts) {
+		end = s.starts[index+1] - 1
+	}
+	return s.src[start:end]
+}
+
+func (s *metadataSourceLines) materialize(start, end int) []string {
+	count := s.len()
+	if start < 0 {
+		start = 0
+	}
+	if end > count {
+		end = count
+	}
+	if start >= end {
+		return nil
+	}
+	lines := make([]string, 0, end-start)
+	for i := start; i < end; i++ {
+		lines = append(lines, string(s.line(i)))
+	}
+	return lines
+}
+
+func declarationSignatureFromSource(lines *metadataSourceLines, n *graph.Node) string {
+	if lines == nil || n == nil || n.StartLine < 1 || lines.len() == 0 {
+		return ""
+	}
+	if n.EndColumn > 0 && n.EndLine >= n.StartLine && n.EndLine-n.StartLine < 12 {
+		if signature := declarationHeader(declarationCandidateFromSource(lines, n, true), n.Name, n.Language); signature != "" {
+			return signature
+		}
+	}
+	return declarationHeader(declarationCandidateFromSource(lines, n, false), n.Name, n.Language)
+}
+
+func declarationCandidateFromSource(lines *metadataSourceLines, n *graph.Node, exactSpan bool) string {
+	start := n.StartLine - 1
+	if start < 0 || start >= lines.len() {
+		return ""
+	}
+	end := start + 12
+	if exactSpan {
+		end = n.EndLine
+	} else if n.EndLine > n.StartLine && n.EndLine < end {
+		end = n.EndLine
+	}
+	if end <= start {
+		end = start + 1
+	}
+	if end > lines.len() {
+		end = lines.len()
+	}
+
+	const candidateBufferBytes = 2048 + 4
+	candidate := make([]byte, 0, candidateBufferBytes)
+	started := false
+	for lineIndex := start; lineIndex < end && len(candidate) < candidateBufferBytes; lineIndex++ {
+		line := lines.line(lineIndex)
+		if lineIndex == start && n.StartColumn > 0 {
+			if n.StartColumn >= len(line) {
+				return ""
+			}
+			line = line[n.StartColumn:]
+		}
+		if exactSpan && lineIndex == end-1 && n.EndColumn > 0 && n.EndColumn < len(line) {
+			line = line[:n.EndColumn]
+		}
+		if !started {
+			line = bytes.TrimLeftFunc(line, unicode.IsSpace)
+			if len(line) == 0 {
+				continue
+			}
+			started = true
+		} else {
+			candidate = append(candidate, '\n')
+		}
+		remaining := candidateBufferBytes - len(candidate)
+		if len(line) > remaining {
+			line = line[:remaining]
+		}
+		candidate = append(candidate, line...)
+	}
+	return boundedMetadata(string(candidate), 2048)
+}
+
+func docAboveSource(lines *metadataSourceLines, startLine int) string {
+	if lines == nil || startLine <= 1 {
+		return ""
+	}
+	count := lines.len()
+	end := startLine - 1
+	if end > count {
+		return ""
+	}
+	const maxDocScanLines = 96
+	start := end - maxDocScanLines
+	if start < 0 {
+		start = 0
+	}
+	window := lines.materialize(start, end)
+	return docAbove(window, len(window)+1)
 }
 
 // declarationSignature extracts only a declaration header from the node's
