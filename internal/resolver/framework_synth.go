@@ -1341,9 +1341,12 @@ type claimTargetVocabulary interface {
 	AdmitsTarget(n *graph.Node) bool
 }
 
-// claimEdgeVocabulary enumerates the exact unresolved names a resolver can
-// claim. Scoped runs use these names for reverse-index lookups instead of
-// decoding every call/reference edge in each changed repository.
+// claimEdgeVocabulary exhaustively enumerates the unresolved names a resolver
+// can claim. Scoped runs use these names for reverse-index lookups; full runs
+// filter the bounded unresolved-identity scan before exact row refetch. Neither
+// path decodes unrelated call/reference payloads. Resolvers with an unbounded
+// vocabulary must omit this interface so discovery fails open to the complete
+// unresolved-edge scan.
 type claimEdgeVocabulary interface {
 	ClaimedUnresolvedNames() []string
 }
@@ -1387,10 +1390,6 @@ func claimingResolverAdmissible(g graph.Store, r ClaimingResolver) bool {
 }
 
 func scopedClaimingCandidates(g graph.Store, scope map[string]bool, resolvers []ClaimingResolver) []*graph.Edge {
-	if scope == nil {
-		return unresolvedClaimingCandidates(g, scope)
-	}
-
 	names := make([]string, 0, len(resolvers))
 	seenNames := make(map[string]struct{}, len(resolvers))
 	for _, resolver := range resolvers {
@@ -1411,6 +1410,38 @@ func scopedClaimingCandidates(g graph.Store, scope map[string]bool, resolvers []
 	}
 	if len(names) == 0 {
 		return nil
+	}
+
+	materialize := func(identities []graph.EdgeIdentity) []*graph.Edge {
+		current := findFrameworkEdgesByIdentities(g, identities)
+		pending := make([]*graph.Edge, 0, len(identities))
+		for _, identity := range identities {
+			edge := current[identity]
+			if claimingCandidateInScope(edge, scope, resolvers) {
+				pending = append(pending, edge)
+			}
+		}
+		return pending
+	}
+
+	if scope == nil {
+		scanner, ok := g.(graph.UnresolvedEdgeIdentityBatchScanner)
+		if !ok {
+			return unresolvedClaimingCandidates(g, scope)
+		}
+		identities := make([]graph.EdgeIdentity, 0)
+		scanner.ScanUnresolvedEdgeIdentitiesBatched(
+			[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}, 512,
+			func(batch []graph.EdgeIdentity) bool {
+				for _, identity := range batch {
+					if _, claimedName := seenNames[graph.UnresolvedName(identity.To)]; claimedName {
+						identities = append(identities, identity)
+					}
+				}
+				return true
+			},
+		)
+		return materialize(identities)
 	}
 
 	prefixes := frameworkScopePrefixes(scope)
@@ -1439,15 +1470,7 @@ func scopedClaimingCandidates(g graph.Store, scope map[string]bool, resolvers []
 		}
 	}
 
-	current := findFrameworkEdgesByIdentities(g, identities)
-	pending := make([]*graph.Edge, 0, len(identities))
-	for _, identity := range identities {
-		edge := current[identity]
-		if claimingCandidateInScope(edge, scope, resolvers) {
-			pending = append(pending, edge)
-		}
-	}
-	return pending
+	return materialize(identities)
 }
 
 func unresolvedClaimingCandidates(g graph.Store, scope map[string]bool) []*graph.Edge {

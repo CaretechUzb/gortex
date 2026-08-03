@@ -11,13 +11,14 @@ import (
 
 type frameworkTailCountingStore struct {
 	graph.Store
-	getNode, getNodesByIDs              int
-	findByName, findByNames             int
-	getInEdges, getInEdgesByIDs         int
-	addEdge, addBatch, reindexEdges     int
-	removeEdge, removeEdgesExact        int
-	repoEdgesByKinds, repoNodeIDsByKind int
-	allNodesLight, repoNodesLight       int
+	getNode, getNodesByIDs                int
+	findByName, findByNames               int
+	getInEdges, getInEdgesByIDs           int
+	addEdge, addBatch, reindexEdges       int
+	removeEdge, removeEdgesExact          int
+	repoEdgesByKinds, repoNodeIDsByKind   int
+	allNodesLight, repoNodesLight         int
+	repoPrefixes, unresolvedIdentityScans int
 }
 
 func (s *frameworkTailCountingStore) GetNode(id string) *graph.Node {
@@ -95,6 +96,20 @@ func (s *frameworkTailCountingStore) RepoNodesLight(prefixes []string) []*graph.
 	return s.Store.(graph.RepoLightNodeReader).RepoNodesLight(prefixes)
 }
 
+func (s *frameworkTailCountingStore) RepoPrefixes() []string {
+	s.repoPrefixes++
+	return s.Store.RepoPrefixes()
+}
+
+func (s *frameworkTailCountingStore) ScanUnresolvedEdgeIdentitiesBatched(
+	kinds []graph.EdgeKind,
+	batchSize int,
+	yield func([]graph.EdgeIdentity) bool,
+) {
+	s.unresolvedIdentityScans++
+	s.Store.(graph.UnresolvedEdgeIdentityBatchScanner).ScanUnresolvedEdgeIdentitiesBatched(kinds, batchSize, yield)
+}
+
 func addDjangoRepo(g *graph.Graph, repo string, count int) {
 	iterID := repo + "::models.py::ModelIterable.__iter__"
 	g.AddNode(&graph.Node{ID: iterID, Kind: graph.KindMethod, Name: "__iter__", FilePath: repo + "/models.py", Language: "python", RepoPrefix: repo,
@@ -136,6 +151,42 @@ func TestRunClaimingResolversScopedBatchesAndBoundsRepoFrontier(t *testing.T) {
 		}
 	}
 	require.Equal(t, 40, untouched, "partial claiming must not touch another repository")
+}
+
+func TestRunClaimingResolversUsesExactVocabularyForFullScope(t *testing.T) {
+	g := graph.New()
+	addDjangoRepo(g, "alpha", 40)
+	addDjangoRepo(g, "beta", 40)
+	g.AddEdge(&graph.Edge{
+		From: "alpha::query.py::QuerySet.iterator0", To: "alpha::" + graph.UnresolvedMarker + "*._iterable_class",
+		Kind: graph.EdgeReferences, FilePath: "alpha/query.py", Line: 100,
+	})
+	g.AddEdge(&graph.Edge{
+		From: "alpha::query.py::QuerySet.iterator0", To: "alpha::" + graph.UnresolvedMarker + "*._iterable_class",
+		Kind: graph.EdgeExtends, FilePath: "alpha/query.py", Line: 101,
+	})
+	g.AddEdge(&graph.Edge{
+		From: "alpha::query.py::QuerySet.iterator0", To: "legacy-only::" + graph.UnresolvedMarker + "*._iterable_class",
+		Kind: graph.EdgeReferences, FilePath: "alpha/query.py", Line: 102,
+	})
+	counting := &frameworkTailCountingStore{Store: g}
+
+	claimed := RunClaimingResolvers(counting)
+	require.Equal(t, 82, claimed[SynthDjangoDescriptor], "calls and references are candidates; unrelated kinds are not")
+	require.Equal(t, 1, counting.unresolvedIdentityScans, "full claiming should use one bounded identity scan")
+	require.Zero(t, counting.repoPrefixes, "edge-only legacy prefixes must not depend on the node-backed prefix census")
+	require.Zero(t, counting.getInEdgesByIDs, "full claiming should not synthesize target IDs from node prefixes")
+	require.Zero(t, counting.repoEdgesByKinds, "full claiming must not decode all calls and references")
+}
+
+func TestScopedClaimingCandidatesFallsBackForUnboundedResolver(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "alpha::caller", Kind: graph.KindMethod, RepoPrefix: "alpha"})
+	g.AddEdge(&graph.Edge{From: "alpha::caller", To: graph.UnresolvedMarker + "widget", Kind: graph.EdgeCalls})
+	g.AddEdge(&graph.Edge{From: "alpha::caller", To: "alpha::" + graph.UnresolvedMarker + "other", Kind: graph.EdgeReferences})
+
+	pending := scopedClaimingCandidates(g, nil, []ClaimingResolver{fakeClaimingResolver{target: "alpha::resolved"}})
+	require.Len(t, pending, 2, "an unbounded resolver must retain the complete-scan fallback")
 }
 
 func TestFrameworkCandidateSummaryScopedUsesOnlyRepoLightProjection(t *testing.T) {
