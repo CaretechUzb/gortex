@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -220,6 +221,61 @@ func (r *Resolver) csharpGlobalUsingsFor(fileID string) []string {
 		out = append(out, idx[dir]...)
 	}
 	return out
+}
+
+// CSharpGlobalUsingDependents returns the C# files whose global-using
+// visibility includes fileID's declarations — the same compilation-unit
+// approximation csharpGlobalUsingsFor reads from (nearest-csproj unit,
+// else the declaring file's directory subtree). A global-using edit in
+// fileID must re-resolve exactly these: their extension binds were
+// narrowed under the old visibility and nothing else touches them.
+// fileID itself is excluded (its own save re-resolves it).
+func (r *Resolver) CSharpGlobalUsingDependents(fileID string) []string {
+	projSet := map[string]struct{}{}
+	for n := range r.graph.NodesByKind(graph.KindFile) {
+		if n != nil && strings.HasSuffix(strings.ToLower(n.ID), ".csproj") {
+			projSet[csharpDirOf(n.ID)] = struct{}{}
+		}
+	}
+	declKey := csharpNearestProjDir(projSet, csharpDirOf(fileID))
+	var files []string
+	for n := range r.graph.NodesByKind(graph.KindFile) {
+		if n == nil || n.ID == fileID || !strings.HasSuffix(strings.ToLower(n.ID), ".cs") {
+			continue
+		}
+		unit := csharpNearestProjDir(projSet, csharpDirOf(n.ID))
+		if declKey != "" {
+			if unit == declKey {
+				files = append(files, n.ID)
+			}
+			continue
+		}
+		// No-csproj fallback: a caller outside any unit collects globals
+		// from every ancestor directory, so the dependents are the files
+		// whose ancestor chain reaches the declaring directory.
+		if unit == "" && csharpDirChainContains(n.ID, csharpDirOf(fileID)) {
+			files = append(files, n.ID)
+		}
+	}
+	sort.Strings(files)
+	return files
+}
+
+// csharpDirChainContains reports whether walking up from fileID's
+// directory reaches dir — the reverse of csharpGlobalUsingsFor's
+// caller-side ancestor walk.
+func csharpDirChainContains(fileID, dir string) bool {
+	d := fileID
+	for {
+		i := csharpLastSep(d)
+		if i < 0 {
+			return dir == "."
+		}
+		d = d[:i]
+		if d == dir {
+			return true
+		}
+	}
 }
 
 // csharpNearestProjDir walks from dir upward (dir included) and returns

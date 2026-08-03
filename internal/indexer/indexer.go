@@ -4135,6 +4135,8 @@ func (idx *Indexer) indexFile(
 	var abSnap *affectedBySnapshot
 	var reuseIdx map[reuseKey]*reuseVal
 	var priorUnresolved []*graph.Edge
+	var priorVis csharpVisibilityStamp
+	visCaptured := false
 	deferredResolverCatchup := markerBatch != nil && markerBatch.deferResolverCatchup
 	if (resolve || deferredResolverCatchup) && !idx.deferGlobalPasses.Load() && !skipped {
 		snapshotStarted := time.Now()
@@ -4144,7 +4146,8 @@ func (idx *Indexer) indexFile(
 		// still unresolved so the forward pass can skip re-trying them
 		// (priorUnresolved). Together this makes a save re-resolve only the
 		// references it actually changed instead of the whole file.
-		reuseIdx, priorUnresolved = captureIncrementalState(idx.graph, graphPath)
+		reuseIdx, priorUnresolved, priorVis = captureIncrementalState(idx.graph, graphPath)
+		visCaptured = true
 		snapshotDuration = time.Since(snapshotStarted)
 	}
 
@@ -4180,6 +4183,13 @@ func (idx *Indexer) indexFile(
 		if n != nil {
 			newNodeIDs[n.ID] = struct{}{}
 		}
+	}
+	// A using-stamp change re-prices every visibility-narrowed verdict in
+	// the file — the reuse key carries no visibility evidence, so both the
+	// captured resolutions and the prior-unresolved skip are stale.
+	freshVis := csharpVisibilityStampForNodes(result.Nodes)
+	if visCaptured && priorVis != freshVis {
+		reuseIdx, priorUnresolved = nil, nil
 	}
 	if reused := applyResolvedOutEdges(idx.graph, result.Edges, reuseIdx, newNodeIDs); reused > 0 {
 		idx.logger.Debug("indexer: reused prior resolutions",
@@ -4247,6 +4257,13 @@ func (idx *Indexer) indexFile(
 		idx.resolver.ResolveFileAndIncoming(graphPath)
 		resolveDuration = time.Since(resolveStarted)
 		idx.resolver.SetIncrementalSkip(nil)
+		// A global-using edit changes every dependent file's visibility
+		// without touching the files themselves — nothing above re-resolves
+		// them.
+		if visCaptured && priorVis.globals != freshVis.globals {
+			idx.reresolveCSharpGlobalUsingDependents(
+				[]string{graphPath}, map[string]struct{}{graphPath: {}})
+		}
 		// CPG-lite dataflow placeholders for this file: inter-
 		// procedural callees may have just been lifted by
 		// ResolveFile, so re-run the dataflow materialisation pass

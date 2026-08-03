@@ -405,6 +405,15 @@ func (idx *Indexer) commitIncrementalStages(
 		stage.reuse, stage.priorPending = captureIncrementalStateFromView(
 			stage.priorNodes, view.outByNode, view.nodesByID,
 		)
+		// A using-stamp change re-prices every visibility-narrowed verdict
+		// in the file: reuse would restore an extension target the new
+		// usings refuse, and the prior-unresolved skip would park a call
+		// the new usings can bind. Drop the snapshot and force the full
+		// structural path — resolutions may legitimately change.
+		if csharpVisibilityStampForNodes(stage.priorNodes) != csharpVisibilityStampForNodes(stage.result.Nodes) {
+			stage.reuse, stage.priorPending = nil, nil
+			stage.metadataOnly = false
+		}
 	}
 
 	// A metadata-only edge refresh cannot safely race a sibling structural
@@ -776,6 +785,25 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		idx.resolver.SetIncrementalSkip(nil)
 		idx.observeIncrementalCatchup("dataflow", paths)
 		idx.materializeDataflowParamsForStages(stages)
+	}
+
+	// A global-using edit changes every dependent file's visibility
+	// without touching the files themselves — nothing above re-resolves
+	// them. Re-price their extension binds now; the fresh stamps are
+	// already committed by the AddBatch above.
+	var globalChanged []string
+	for _, stage := range stages {
+		if csharpVisibilityStampForNodes(stage.priorNodes).globals !=
+			csharpVisibilityStampForNodes(stage.result.Nodes).globals {
+			globalChanged = append(globalChanged, stage.graphPath)
+		}
+	}
+	if len(globalChanged) > 0 {
+		own := make(map[string]struct{}, len(paths))
+		for _, p := range paths {
+			own[p] = struct{}{}
+		}
+		idx.reresolveCSharpGlobalUsingDependents(globalChanged, own)
 	}
 
 	if !idx.deferGlobalPasses.Load() {

@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -48,12 +49,17 @@ type reuseVal struct {
 //   - priorUnresolved: shallow copies of the edges that were still unresolved,
 //     so the resolver's forward pass can skip re-trying them (they point at
 //     stubs the incoming pass binds when a target appears).
+//   - vis: the file's using-visibility stamp at snapshot time — callers must
+//     drop BOTH captures when the re-parsed file's stamp differs (the key
+//     carries no visibility evidence, so reuse across a using edit would
+//     restore verdicts the new visibility refuses).
 //
 // external:: edges are neither reused nor skipped here: they are not
 // IsUnresolvedTarget, so the resolver already leaves them alone.
-func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKey]*reuseVal, priorUnresolved []*graph.Edge) {
+func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKey]*reuseVal, priorUnresolved []*graph.Edge, vis csharpVisibilityStamp) {
 	reuse = map[reuseKey]*reuseVal{}
 	nodes := g.GetFileNodes(graphPath)
+	vis = csharpVisibilityStampForNodes(nodes)
 	ids := make([]string, 0, len(nodes))
 	for _, n := range nodes {
 		if n != nil {
@@ -120,7 +126,7 @@ func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKe
 			}
 		}
 	}
-	return reuse, priorUnresolved
+	return reuse, priorUnresolved, vis
 }
 
 // applyResolvedOutEdges pre-resolves freshly extracted unresolved edges that
@@ -198,6 +204,149 @@ func applyResolvedOutEdges(g graph.Store, edges []*graph.Edge, idx map[reuseKey]
 		reused++
 	}
 	return reused
+}
+
+// csharpVisibilityStamp canonicalises the file-node using stamps that
+// price C# visibility verdicts. The reuse key is source-side shape only
+// — it carries no evidence about the usings a captured extension bind
+// was narrowed under — so a stamp change must drop the whole snapshot:
+// reuse would restore a target the new usings refuse, and the prior-
+// unresolved skip would park a call the new usings can bind. Non-C#
+// files carry none of these keys and always stamp to the zero value.
+type csharpVisibilityStamp struct {
+	all     string // every using stamp, canonicalised
+	globals string // the global_usings component alone (compilation-scoped)
+}
+
+func csharpVisibilityStampFromMeta(meta map[string]any) csharpVisibilityStamp {
+	if len(meta) == 0 {
+		return csharpVisibilityStamp{}
+	}
+	section := func(key string) string {
+		var vals []string
+		switch v := meta[key].(type) {
+		case []string:
+			vals = append(vals, v...)
+		case []any:
+			for _, u := range v {
+				if s, ok := u.(string); ok {
+					vals = append(vals, s)
+				}
+			}
+		}
+		sort.Strings(vals)
+		return strings.Join(vals, "\x1f")
+	}
+	globals := section("global_usings")
+	all := strings.Join([]string{
+		section("usings"), globals, section("using_static"), section("scoped_usings"),
+	}, "\x1e")
+	if all == "\x1e\x1e\x1e" {
+		all = ""
+	}
+	return csharpVisibilityStamp{all: all, globals: globals}
+}
+
+// csharpVisibilityStampForNodes stamps the file node of an extraction
+// result (or a prior-nodes snapshot).
+func csharpVisibilityStampForNodes(nodes []*graph.Node) csharpVisibilityStamp {
+	for _, n := range nodes {
+		if n != nil && n.Kind == graph.KindFile {
+			return csharpVisibilityStampFromMeta(n.Meta)
+		}
+	}
+	return csharpVisibilityStamp{}
+}
+
+// restubCSharpExtensionBinds rewrites the resolved extension-method
+// out-edges of the given files back to unresolved member stubs so a
+// scoped re-resolve re-runs the type-directed extension rule under the
+// CURRENT visibility. Only extension binds are priced on using
+// visibility this way; ordinary binds key on symbol identity and
+// survive a using edit. The edges keep their receiver stamps and the
+// extension tag, which routes them straight back through the rule.
+func (idx *Indexer) restubCSharpExtensionBinds(files []string) int {
+	var batch []graph.EdgeReindex
+	for _, f := range files {
+		nodes := idx.graph.GetFileNodes(f)
+		if len(nodes) == 0 {
+			continue
+		}
+		ids := make([]string, 0, len(nodes))
+		for _, n := range nodes {
+			if n != nil {
+				ids = append(ids, n.ID)
+			}
+		}
+		byNode := graph.OutEdgesForNodes(idx.graph, ids)
+		var extEdges []*graph.Edge
+		targetIDSet := map[string]struct{}{}
+		for _, id := range ids {
+			for _, e := range byNode[id] {
+				if e == nil || e.Meta == nil || e.To == "" || graph.IsUnresolvedTarget(e.To) {
+					continue
+				}
+				if res, _ := e.Meta["resolution"].(string); res != "extension_method" {
+					continue
+				}
+				extEdges = append(extEdges, e)
+				targetIDSet[e.To] = struct{}{}
+			}
+		}
+		if len(extEdges) == 0 {
+			continue
+		}
+		targetIDs := make([]string, 0, len(targetIDSet))
+		for id := range targetIDSet {
+			targetIDs = append(targetIDs, id)
+		}
+		targets := idx.graph.GetNodesByIDs(targetIDs)
+		for _, e := range extEdges {
+			tgt := targets[e.To]
+			if tgt == nil || tgt.Name == "" {
+				continue
+			}
+			oldTo := e.To
+			graph.StashRestubProvenance(e)
+			e.To = graph.UnresolvedMarker + tgt.Name
+			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+		}
+	}
+	if len(batch) > 0 {
+		idx.graph.ReindexEdges(batch)
+	}
+	return len(batch)
+}
+
+// reresolveCSharpGlobalUsingDependents re-resolves the files a
+// global-using edit is visible to: a `global using` is compilation-
+// scoped, so editing one changes every dependent file's visibility
+// without touching the files themselves — nothing else re-prices their
+// extension binds. Rare by nature (a Usings.cs edit), so the unit-wide
+// re-resolve is the correctness cost, not a hot path.
+func (idx *Indexer) reresolveCSharpGlobalUsingDependents(changed []string, exclude map[string]struct{}) {
+	if len(changed) == 0 {
+		return
+	}
+	depSet := map[string]struct{}{}
+	for _, f := range changed {
+		for _, dep := range idx.resolver.CSharpGlobalUsingDependents(f) {
+			if _, own := exclude[dep]; !own {
+				depSet[dep] = struct{}{}
+			}
+		}
+	}
+	if len(depSet) == 0 {
+		return
+	}
+	deps := make([]string, 0, len(depSet))
+	for dep := range depSet {
+		deps = append(deps, dep)
+	}
+	sort.Strings(deps)
+	idx.restubCSharpExtensionBinds(deps)
+	idx.observeIncrementalCatchup("resolve", deps)
+	idx.resolver.ResolveFilesAndIncoming(deps)
 }
 
 func reusableResolvedEdge(e *graph.Edge) bool {

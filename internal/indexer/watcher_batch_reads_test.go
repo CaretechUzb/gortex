@@ -163,7 +163,7 @@ func TestIncrementalReusePrefetchesTargetsOnce(t *testing.T) {
 		{From: "a.go::B", To: "lib.go::Target", Kind: graph.EdgeReferences, Origin: graph.OriginLSPResolved, Tier: graph.ResolvedBy(graph.OriginLSPResolved), Confidence: 1},
 	})
 	counted := &watcherReadCountingStore{Store: g}
-	reuse, unresolved := captureIncrementalState(counted, "a.go")
+	reuse, unresolved, _ := captureIncrementalState(counted, "a.go")
 	if len(unresolved) != 0 || len(reuse) != 2 {
 		t.Fatalf("capture sizes: reuse=%d unresolved=%d, want 2/0", len(reuse), len(unresolved))
 	}
