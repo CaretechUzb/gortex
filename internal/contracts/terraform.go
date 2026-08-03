@@ -6,7 +6,6 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
-	hclgrammar "github.com/zzet/gortex/internal/parser/tsitter/hcl"
 )
 
 // TerraformExtractor turns Terraform-declared environment values into
@@ -33,15 +32,12 @@ var terraformPrefilterMarkers = [][]byte{[]byte(terraformLambdaResource)}
 
 func (e *TerraformExtractor) SupportedLanguages() []string { return []string{"hcl"} }
 
-// Extract parses src with the HCL grammar itself. The HCL language
-// extractor closes its own tree rather than handing it back on the
-// ExtractionResult, so the indexer has no tree to pass for .tf files —
-// same lazy-parse shape HTTPExtractor.Extract uses.
+// Extract parses src with the HCL grammar itself, the same lazy-parse
+// shape HTTPExtractor.Extract uses when the caller has no tree to hand
+// it. ParseTreeForLang is the shared helper the indexer's incremental
+// re-walk path also uses to get a tree for .tf files.
 func (e *TerraformExtractor) Extract(filePath string, src []byte, nodes []*graph.Node, _ []*graph.Edge) []Contract {
-	if !srcHasAnyMarker(src, terraformPrefilterMarkers) {
-		return nil
-	}
-	tree := parseHCLTree(src)
+	tree := ParseTreeForLang("hcl", src)
 	defer tree.Release()
 	return e.extract(filePath, src, nodes, tree)
 }
@@ -55,13 +51,13 @@ func (e *TerraformExtractor) ExtractWithTree(
 	_ []*graph.Edge,
 	tree *parser.ParseTree,
 ) []Contract {
-	if !srcHasAnyMarker(src, terraformPrefilterMarkers) {
-		return nil
-	}
 	return e.extract(filePath, src, nodes, tree)
 }
 
 func (e *TerraformExtractor) extract(filePath string, src []byte, nodes []*graph.Node, tree *parser.ParseTree) []Contract {
+	if !srcHasAnyMarker(src, terraformPrefilterMarkers) {
+		return nil
+	}
 	st := tree.Tree()
 	if st == nil {
 		return nil
@@ -104,19 +100,6 @@ func (e *TerraformExtractor) extract(filePath string, src []byte, nodes []*graph
 		}
 	}
 	return out
-}
-
-// parseHCLTree parses src with the HCL grammar. The caller owns the
-// returned handle and must Release it; nil on a parse failure.
-func parseHCLTree(src []byte) *parser.ParseTree {
-	if len(src) == 0 {
-		return nil
-	}
-	tree, err := parser.ParseFile(src, hclgrammar.GetLanguage())
-	if err != nil || tree == nil {
-		return nil
-	}
-	return parser.NewParseTree(tree, src, "hcl")
 }
 
 // hclBlockSymbolID returns the ID of the graph node the HCL language
@@ -206,9 +189,6 @@ func hclNestedBlockBodies(body *sitter.Node, name string, src []byte) []*sitter.
 // hclAttrExpr returns the value expression of the attribute named name
 // declared directly inside body, or nil when there is none.
 func hclAttrExpr(body *sitter.Node, name string, src []byte) *sitter.Node {
-	if body == nil {
-		return nil
-	}
 	for i, nc := 0, int(body.ChildCount()); i < nc; i++ {
 		attr := body.Child(i)
 		if attr == nil || attr.Type() != "attribute" {

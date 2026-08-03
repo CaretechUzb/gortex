@@ -224,11 +224,10 @@ func TestTerraformExtractor_SkipsNonLiteralVariableMaps(t *testing.T) {
 	}
 }
 
-// merge(local.base, { EXTRA = "1" }) is skipped wholesale above; this
-// pins that a Lambda whose map is partly literal doesn't leak the inline
-// object's keys while dropping the rest, which would report a partial
-// env set as if it were complete.
-func TestTerraformExtractor_MixedLiteralAndDynamicLambdas(t *testing.T) {
+// Two Lambdas in one file are attributed independently: the skipped
+// one contributes nothing, and the literal one's contract carries its
+// own tf_address rather than leaking the other's.
+func TestTerraformExtractor_ResourcesAreAttributedIndependently(t *testing.T) {
 	src := []byte(`resource "aws_lambda_function" "dynamic" {
   environment {
     variables = merge(local.base_env, { EXTRA = "1" })
@@ -270,7 +269,7 @@ func TestTerraformExtractor_ExtractWithTreeMatchesExtract(t *testing.T) {
 }
 `)
 	ext := &TerraformExtractor{}
-	tree := parseHCLTree(src)
+	tree := ParseTreeForLang("hcl", src)
 	defer tree.Release()
 
 	withTree := ext.ExtractWithTree("infra/lambda.tf", src, nil, nil, tree)
