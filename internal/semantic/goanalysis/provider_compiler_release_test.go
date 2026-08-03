@@ -1,11 +1,13 @@
 package goanalysis
 
 import (
+	"context"
 	"go/ast"
 	"go/token"
 	"go/types"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,6 +49,72 @@ func TestReclaimAndReleaseGoCompilerOrdersCleanupBeforeAdmission(t *testing.T) {
 			})
 			assert.Equal(t, tc.want, events)
 		})
+	}
+}
+
+func TestForcedCompilerScavengeCompletesBeforeNextLargeAdmission(t *testing.T) {
+	provider := &Provider{
+		heavyGate: make(chan struct{}, 2),
+		largeGate: make(chan struct{}, 1),
+	}
+	firstRelease, err := provider.acquireHeavy(context.Background(), true)
+	require.NoError(t, err)
+
+	collectStarted := make(chan struct{})
+	finishCollect := make(chan struct{})
+	firstReleased := make(chan struct{})
+	go func() {
+		reclaimAndReleaseGoCompiler(
+			func() {},
+			true,
+			func() {
+				close(collectStarted)
+				<-finishCollect
+			},
+			func() {},
+			firstRelease,
+		)
+		close(firstReleased)
+	}()
+	<-collectStarted
+
+	type admissionResult struct {
+		release func()
+		err     error
+	}
+	secondStarted := make(chan struct{})
+	secondResult := make(chan admissionResult, 1)
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), time.Second)
+	defer cancelSecond()
+	go func() {
+		close(secondStarted)
+		release, acquireErr := provider.acquireHeavy(secondCtx, true)
+		secondResult <- admissionResult{release: release, err: acquireErr}
+	}()
+	<-secondStarted
+
+	select {
+	case result := <-secondResult:
+		if result.release != nil {
+			result.release()
+		}
+		t.Fatalf("second large compiler acquired before scavenging completed: %v", result.err)
+	default:
+	}
+
+	close(finishCollect)
+	select {
+	case <-firstReleased:
+	case <-time.After(time.Second):
+		t.Fatal("first compiler admission was not released after scavenging")
+	}
+	select {
+	case result := <-secondResult:
+		require.NoError(t, result.err)
+		require.NotNil(t, result.release)
+		result.release()
+	case <-time.After(time.Second):
+		t.Fatal("second large compiler did not acquire after scavenging completed")
 	}
 }
 

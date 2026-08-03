@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,7 +45,9 @@ type Provider struct {
 	includeTest  bool
 	logger       *zap.Logger
 	packagesLoad func(*packages.Config, ...string) ([]*packages.Package, error)
-	compilerGC   func()
+	// compilerGC is injectable for ordering tests; production uses a full GC
+	// plus synchronous scavenging at pressure-sized compiler boundaries.
+	compilerGC func()
 
 	// The compiler program is intentionally never retained after EnrichRepo.
 	// Contract extraction needs only a compact (file,line,name) -> bare type
@@ -131,7 +134,7 @@ func NewProvider(mode LoadMode, includeTest bool, logger *zap.Logger) *Provider 
 		includeTest:       includeTest,
 		logger:            logger,
 		packagesLoad:      packages.Load,
-		compilerGC:        runtime.GC,
+		compilerGC:        debug.FreeOSMemory,
 		bindingTypes:      make(map[bindingLookupKey]string),
 		bindingOwners:     make(map[bindingLookupKey]string),
 		bindingKeysByRoot: make(map[string][]bindingLookupKey),
@@ -542,7 +545,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 
 		collectCompiler := p.compilerGC
 		if collectCompiler == nil {
-			collectCompiler = runtime.GC
+			collectCompiler = debug.FreeOSMemory
 		}
 		reclaimAndReleaseGoCompiler(func() {
 			clearGoPackageCompilerRoots(pkgs)
