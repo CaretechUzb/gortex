@@ -347,6 +347,7 @@ func (s *Store) beginBulkLoadLocked() {
 	s.bulkDeferredEdgeRows = 0
 	s.bulkCheckpointNodeRows = 0
 	s.bulkCheckpointEdgeRows = 0
+	s.bulkRowCheckpointBackoff = false
 	// The bulk path changes durability and secondary-index maintenance outside
 	// the ordinary row mutation protocol. Active receipts therefore fail closed.
 	s.markMutationReceiptsIncompleteLocked()
@@ -421,7 +422,7 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 	// pinned writer under writeMu, so no mutation can race it; PASSIVE still
 	// returns immediately at an old read snapshot instead of waiting for it.
 	if sealErr == nil && hadBulk {
-		s.checkpointBulkWALPassiveLockedWithin("planner_stats_before", bulkPlannerStatsCheckpointTimeout)
+		_ = s.checkpointBulkWALPassiveLockedWithin("planner_stats_before", bulkPlannerStatsCheckpointTimeout)
 	}
 	// Target only the graph indexes whose statistics alter competing plans:
 	// ANALYZE over every FTS/sidecar or forced graph index pays unrelated B-tree
@@ -470,8 +471,10 @@ func (s *Store) noteBulkRowsLocked(nodeRows, edgeRows int) error {
 		return nil
 	}
 	nodeDelta, edgeDelta := int64(nodeRows), int64(edgeRows)
-	s.bulkCheckpointNodeRows += nodeDelta
-	s.bulkCheckpointEdgeRows += edgeDelta
+	if !s.bulkRowCheckpointBackoff {
+		s.bulkCheckpointNodeRows += nodeDelta
+		s.bulkCheckpointEdgeRows += edgeDelta
+	}
 
 	var sealReason string
 	if s.bulkIndexesDeferred {
@@ -495,10 +498,14 @@ func (s *Store) noteBulkRowsLocked(nodeRows, edgeRows int) error {
 	if sealReason != "" {
 		return s.sealBulkIndexesLocked(sealReason)
 	}
+	if s.bulkRowCheckpointBackoff {
+		return nil
+	}
 	nodeInterval, edgeInterval := s.bulkCheckpointIntervalsLocked()
 	if s.bulkCheckpointNodeRows >= nodeInterval ||
 		s.bulkCheckpointEdgeRows >= edgeInterval {
-		s.checkpointBulkWALPassiveLocked("row_limit")
+		err := s.checkpointBulkWALPassiveLocked("row_limit")
+		s.noteBulkRowCheckpointResultLocked(err)
 	}
 	return nil
 }
@@ -523,7 +530,7 @@ func (s *Store) sealBulkIndexesLocked(reason string) error {
 	// Keep index DDL from repeatedly searching a large uncheckpointed WAL.
 	// The group checkpoints are best-effort telemetry boundaries; DDL errors
 	// still keep the seal retryable.
-	s.checkpointBulkWALPassiveLocked("index_seal_before")
+	_ = s.checkpointBulkWALPassiveLocked("index_seal_before")
 	for _, idx := range bulkDroppableIndexes {
 		indexStarted := time.Now()
 		_, err := conn.ExecContext(ctx, idx.ddl)
@@ -533,9 +540,9 @@ func (s *Store) sealBulkIndexesLocked(reason string) error {
 		}
 		switch idx.name {
 		case "nodes_by_repo_language_name":
-			s.checkpointBulkWALPassiveLocked("index_seal_nodes")
+			_ = s.checkpointBulkWALPassiveLocked("index_seal_nodes")
 		case "edges_by_file":
-			s.checkpointBulkWALPassiveLocked("index_seal_edges")
+			_ = s.checkpointBulkWALPassiveLocked("index_seal_edges")
 		}
 	}
 	s.emitBulkFinalizeEvent(bulkFinalizeEvent{
@@ -568,6 +575,7 @@ func (s *Store) closeBulkConnectionLocked() error {
 	s.bulkDeferredEdgeRows = 0
 	s.bulkCheckpointNodeRows = 0
 	s.bulkCheckpointEdgeRows = 0
+	s.bulkRowCheckpointBackoff = false
 	s.bulkPrevSync = 0
 	s.bulkPrevCacheSize = 0
 	s.bulkPrevAutoCheckpoint = 0
@@ -606,13 +614,13 @@ func (s *Store) checkpointBulkWAL() error {
 // the bulk writer remains pinned. PASSIVE never waits for readers and failure
 // is telemetry-only; the NORMAL-connection TRUNCATE at final close remains the
 // durability boundary.
-func (s *Store) checkpointBulkWALPassiveLocked(boundary string) {
-	s.checkpointBulkWALPassiveLockedWithin(boundary, s.passiveCheckpointWindow())
+func (s *Store) checkpointBulkWALPassiveLocked(boundary string) error {
+	return s.checkpointBulkWALPassiveLockedWithin(boundary, s.passiveCheckpointWindow())
 }
 
-func (s *Store) checkpointBulkWALPassiveLockedWithin(boundary string, window time.Duration) {
+func (s *Store) checkpointBulkWALPassiveLockedWithin(boundary string, window time.Duration) error {
 	if s.bulkConn == nil {
-		return
+		return nil
 	}
 	nodeRows, edgeRows := s.bulkCheckpointNodeRows, s.bulkCheckpointEdgeRows
 
@@ -620,11 +628,10 @@ func (s *Store) checkpointBulkWALPassiveLockedWithin(boundary string, window tim
 	defer cancel()
 	started := time.Now()
 	result, err := checkpointWALOnceOn(ctx, s.bulkConn, "PASSIVE")
-	// Every bounded attempt consumes one cadence unit. A timeout has no reliable
-	// progress counters, but retaining row debt makes the next small AddBatch
-	// immediately spend the same one-second window again. The final checkpoint
-	// still provides the durability boundary, while a fresh full interval keeps
-	// routine WAL pressure bounded without creating a timeout feedback loop.
+	// Every bounded attempt consumes one cadence unit, so its counters reset even
+	// when timeout/contention provides no reliable progress. Coordinated loads
+	// then back off later automatic row-limit attempts; the explicit final
+	// checkpoint remains the durability and WAL-drain boundary.
 	s.bulkCheckpointNodeRows = 0
 	s.bulkCheckpointEdgeRows = 0
 	s.emitBulkFinalizeEvent(bulkFinalizeEvent{
@@ -633,6 +640,27 @@ func (s *Store) checkpointBulkWALPassiveLockedWithin(boundary string, window tim
 		Busy: result.Busy, WALFrames: result.WALFrames,
 		CheckpointedFrames: result.CheckpointedFrames, Err: err,
 	})
+	return err
+}
+
+// noteBulkRowCheckpointResultLocked backs off repeated automatic attempts only
+// within the current coordinated lifecycle. Explicit checkpoint boundaries do
+// not call it and therefore remain independent of the automatic cadence.
+func (s *Store) noteBulkRowCheckpointResultLocked(err error) {
+	if s.coordinatedBulkLoad && shouldBackoffBulkRowCheckpoint(err) {
+		s.bulkRowCheckpointBackoff = true
+	}
+}
+
+func shouldBackoffBulkRowCheckpoint(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || isSQLiteBusyErr(err) {
+		return true
+	}
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &timeout) && timeout.Timeout()
 }
 
 // coldGraphStoreEmpty proves this is a fresh, never-indexed store. Nodes and

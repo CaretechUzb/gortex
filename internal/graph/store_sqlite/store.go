@@ -166,6 +166,10 @@ type Store struct {
 	bulkDeferredEdgeRows   int64
 	bulkCheckpointNodeRows int64
 	bulkCheckpointEdgeRows int64
+	// bulkRowCheckpointBackoff suppresses only automatic row-cadence attempts
+	// after contention makes one bounded checkpoint unproductive. Explicit
+	// seal/planner/final checkpoints remain active. Reset at bulk begin/close.
+	bulkRowCheckpointBackoff bool
 	// These flags mean "bounded FTS maintenance requested" during a
 	// coordinated cold load. The historical names are retained to keep the
 	// cancellation/Close path stable; normal cold finalization never runs a
