@@ -23,9 +23,9 @@ import (
 // clauses, and skip predicates, so the resulting rows are byte-identical to
 // the placeholder writer's (asserted by the reopen-parity test).
 //
-// Engaged only when no mutation receipt needs per-row RETURNING (receipts
-// stay on the placeholder path) and the runtime SQLite exposes jsonb().
-// GORTEX_SQLITE_JSONB_INGEST=0 forces the placeholder path everywhere.
+// When mutation receipts are active, bounded RETURNING clauses collect the
+// exact changed identities from the same JSONB statements. The runtime must
+// expose jsonb(); GORTEX_SQLITE_JSONB_INGEST=0 forces the placeholder path.
 const (
 	jsonbIngestMaxPayload = sqliteBatchMaxBoundBytes
 	jsonbIngestNodeRows   = 4096
@@ -239,63 +239,133 @@ func nextJSONBEdgePayload(edges []*graph.Edge, start int) (jsonPayload, blobPayl
 }
 
 // insertNodeChunksJSONBTx is the JSONB counterpart of
-// insertNodeChunksTxLimited for callers that do not need per-row RETURNING.
-func insertNodeChunksJSONBTx(tx *sql.Tx, nodes []*graph.Node) (rowsChanged, statements int, err error) {
-	stmt, err := tx.Prepare(jsonbNodeIngestSQL)
+// insertNodeChunksTxLimited. When returnChanged is true, RETURNING supplies the
+// exact per-ID multiplicities needed by mutation receipts without abandoning
+// the bounded two-bind JSONB statements.
+func insertNodeChunksJSONBTx(
+	tx *sql.Tx,
+	nodes []*graph.Node,
+	returnChanged bool,
+) (rowsChanged, statements int, changedIDs map[string]int, err error) {
+	query := jsonbNodeIngestSQL
+	if returnChanged {
+		query += " RETURNING id"
+		changedIDs = make(map[string]int)
+	}
+	stmt, err := tx.Prepare(query)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, changedIDs, err
 	}
 	defer stmt.Close()
 	for pos := 0; pos < len(nodes); {
 		payload, blobs, next, rows, encodeErr := nextJSONBNodePayload(nodes, pos)
 		if encodeErr != nil {
-			return rowsChanged, statements, encodeErr
+			return rowsChanged, statements, changedIDs, encodeErr
 		}
 		pos = next
 		if rows == 0 {
 			continue
 		}
+		if returnChanged {
+			returned, queryErr := stmt.Query(payload, blobs)
+			statements++
+			if queryErr != nil {
+				return rowsChanged, statements, changedIDs, queryErr
+			}
+			for returned.Next() {
+				var id string
+				if scanErr := returned.Scan(&id); scanErr != nil {
+					_ = returned.Close()
+					return rowsChanged, statements, changedIDs, scanErr
+				}
+				rowsChanged++
+				changedIDs[id]++
+			}
+			if rowsErr := returned.Err(); rowsErr != nil {
+				_ = returned.Close()
+				return rowsChanged, statements, changedIDs, rowsErr
+			}
+			if closeErr := returned.Close(); closeErr != nil {
+				return rowsChanged, statements, changedIDs, closeErr
+			}
+			continue
+		}
 		result, execErr := stmt.Exec(payload, blobs)
 		statements++
 		if execErr != nil {
-			return rowsChanged, statements, execErr
+			return rowsChanged, statements, changedIDs, execErr
 		}
 		changed, rowsErr := result.RowsAffected()
 		if rowsErr != nil {
-			return rowsChanged, statements, rowsErr
+			return rowsChanged, statements, changedIDs, rowsErr
 		}
 		rowsChanged += int(changed)
 	}
-	return rowsChanged, statements, nil
+	return rowsChanged, statements, changedIDs, nil
 }
 
 // insertEdgeChunksJSONBTx is the JSONB counterpart of
-// insertEdgeChunksTxLimited for callers that do not need per-row RETURNING.
-func insertEdgeChunksJSONBTx(tx *sql.Tx, edges []*graph.Edge) (rowsInserted, statements int, err error) {
-	stmt, err := tx.Prepare(jsonbEdgeIngestSQL)
+// insertEdgeChunksTxLimited. When returnInserted is true, RETURNING supplies
+// exact edge identities for mutation receipts while retaining bounded JSONB
+// payloads and INSERT OR IGNORE semantics.
+func insertEdgeChunksJSONBTx(
+	tx *sql.Tx,
+	edges []*graph.Edge,
+	returnInserted bool,
+) (rowsInserted, statements int, insertedKeys map[sqliteEdgeIdentity]int, err error) {
+	query := jsonbEdgeIngestSQL
+	if returnInserted {
+		query += " RETURNING from_id, to_id, kind, file_path, line"
+		insertedKeys = make(map[sqliteEdgeIdentity]int)
+	}
+	stmt, err := tx.Prepare(query)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, insertedKeys, err
 	}
 	defer stmt.Close()
 	for pos := 0; pos < len(edges); {
 		payload, blobs, next, rows, encodeErr := nextJSONBEdgePayload(edges, pos)
 		if encodeErr != nil {
-			return rowsInserted, statements, encodeErr
+			return rowsInserted, statements, insertedKeys, encodeErr
 		}
 		pos = next
 		if rows == 0 {
 			continue
 		}
+		if returnInserted {
+			returned, queryErr := stmt.Query(payload, blobs)
+			statements++
+			if queryErr != nil {
+				return rowsInserted, statements, insertedKeys, queryErr
+			}
+			for returned.Next() {
+				var key sqliteEdgeIdentity
+				if scanErr := returned.Scan(&key.from, &key.to, &key.kind, &key.filePath, &key.line); scanErr != nil {
+					_ = returned.Close()
+					return rowsInserted, statements, insertedKeys, scanErr
+				}
+				rowsInserted++
+				insertedKeys[key]++
+			}
+			if rowsErr := returned.Err(); rowsErr != nil {
+				_ = returned.Close()
+				return rowsInserted, statements, insertedKeys, rowsErr
+			}
+			if closeErr := returned.Close(); closeErr != nil {
+				return rowsInserted, statements, insertedKeys, closeErr
+			}
+			continue
+		}
 		result, execErr := stmt.Exec(payload, blobs)
 		statements++
 		if execErr != nil {
-			return rowsInserted, statements, execErr
+			return rowsInserted, statements, insertedKeys, execErr
 		}
 		inserted, rowsErr := result.RowsAffected()
 		if rowsErr != nil {
-			return rowsInserted, statements, rowsErr
+			return rowsInserted, statements, insertedKeys, rowsErr
 		}
 		rowsInserted += int(inserted)
 	}
-	return rowsInserted, statements, nil
+	return rowsInserted, statements, insertedKeys, nil
 }

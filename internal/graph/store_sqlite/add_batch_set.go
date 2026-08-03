@@ -626,13 +626,13 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	}
 
 	// JSONB bulk fast path: two bounded payload binds per statement instead
-	// of thousands of per-row variable binds (see add_batch_json.go). Only
-	// when no active receipt needs per-row RETURNING; the placeholder writer
-	// remains the receipt path and the fallback.
-	useJSONB := receiptDelta == nil && jsonbIngestEnabled() && jsonbIngestSupported(tx)
+	// of thousands of per-row variable binds (see add_batch_json.go). Active
+	// receipts collect exact identities through bounded RETURNING result sets;
+	// the placeholder writer remains the kill-switch/compatibility fallback.
+	useJSONB := jsonbIngestEnabled() && jsonbIngestSupported(tx)
 	var changedNodeIDs map[string]int
 	if useJSONB {
-		stats.nodeRowsChanged, stats.nodeStatements, err = insertNodeChunksJSONBTx(tx, nodes)
+		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksJSONBTx(tx, nodes, receiptDelta != nil)
 	} else {
 		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksTxLimited(tx, nodes, receiptDelta != nil, &variableLimit)
 	}
@@ -680,7 +680,7 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 
 	var insertedEdgeKeys map[sqliteEdgeIdentity]int
 	if useJSONB {
-		stats.edgeRowsInserted, stats.edgeStatements, err = insertEdgeChunksJSONBTx(tx, edges)
+		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksJSONBTx(tx, edges, receiptDelta != nil)
 	} else {
 		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksTxLimited(tx, edges, receiptDelta != nil, &variableLimit)
 	}

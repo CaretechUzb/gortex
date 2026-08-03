@@ -29,6 +29,7 @@ func addBatchFixture(nodeCount, edgeCount int) ([]*graph.Node, []*graph.Edge) {
 }
 
 func TestAddBatchUsesBoundedMultiRowStatements(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_JSONB_INGEST", "0")
 	store := openReindexReceiptTestStore(t)
 	nodes, edges := addBatchFixture(100, 200)
 	stats, err := store.addBatchSetOriented(nodes, edges)
@@ -57,6 +58,52 @@ func TestAddBatchUsesBoundedMultiRowStatements(t *testing.T) {
 	require.Zero(t, warm.edgeRowsInserted)
 	require.Equal(t, expectedNodeStatements, warm.nodeStatements)
 	require.Equal(t, expectedEdgeStatements, warm.edgeStatements)
+}
+
+func TestAddBatchJSONBReturningMatchesPlaceholderReceipt(t *testing.T) {
+	nodes, edges := addBatchFixture(nodeInsertMaxChunkSize+1, edgeInsertMaxChunkSize+1)
+
+	t.Setenv("GORTEX_SQLITE_JSONB_INGEST", "0")
+	placeholder := openMutationReceiptStore(t)
+	placeholderToken := placeholder.BeginMutationReceipt()
+	placeholderStats, err := placeholder.addBatchSetOriented(nodes, edges)
+	require.NoError(t, err)
+	placeholderReceipt := placeholder.EndMutationReceipt(placeholderToken)
+	require.Greater(t, placeholderStats.nodeStatements, 1)
+	require.Greater(t, placeholderStats.edgeStatements, 1)
+
+	t.Setenv("GORTEX_SQLITE_JSONB_INGEST", "1")
+	jsonbStore := openMutationReceiptStore(t)
+	jsonbToken := jsonbStore.BeginMutationReceipt()
+	jsonbStats, err := jsonbStore.addBatchSetOriented(nodes, edges)
+	require.NoError(t, err)
+	jsonbReceipt := jsonbStore.EndMutationReceipt(jsonbToken)
+
+	require.Equal(t, placeholderStats.nodeRowsChanged, jsonbStats.nodeRowsChanged)
+	require.Equal(t, placeholderStats.edgeRowsInserted, jsonbStats.edgeRowsInserted)
+	require.Equal(t, 1, jsonbStats.nodeStatements)
+	require.Equal(t, 1, jsonbStats.edgeStatements)
+	require.Equal(t, placeholderReceipt, jsonbReceipt)
+	require.True(t, jsonbReceipt.Complete)
+	require.True(t, jsonbReceipt.ResolutionRelevant)
+	require.Equal(t, placeholder.GetNode(nodes[3].ID), jsonbStore.GetNode(nodes[3].ID))
+	require.Equal(t, placeholder.GetOutEdges(nodes[4].ID), jsonbStore.GetOutEdges(nodes[4].ID))
+
+	warmToken := jsonbStore.BeginMutationReceipt()
+	warmStats, err := jsonbStore.addBatchSetOriented(nodes, edges)
+	require.NoError(t, err)
+	warmReceipt := jsonbStore.EndMutationReceipt(warmToken)
+	require.Zero(t, warmStats.nodeRowsChanged)
+	require.Zero(t, warmStats.edgeRowsInserted)
+	require.Equal(t, 1, warmStats.nodeStatements)
+	require.Equal(t, 1, warmStats.edgeStatements)
+	require.True(t, warmReceipt.Complete)
+	require.False(t, warmReceipt.ResolutionRelevant)
+	require.Empty(t, warmReceipt.ChangedFiles)
+	require.Empty(t, warmReceipt.DefinitionFiles)
+	require.Empty(t, warmReceipt.TargetNames)
+	require.Empty(t, warmReceipt.TargetIDs)
+	require.Empty(t, warmReceipt.ImportCandidates)
 }
 
 func TestAddBatchMatchesOrderedSingleRowSemantics(t *testing.T) {
@@ -104,6 +151,7 @@ func TestAddBatchAnalysisPreflightIsBatched(t *testing.T) {
 }
 
 func TestAddBatchLaterChunkEncodingFailureRollsBackEarlierChunks(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_JSONB_INGEST", "0")
 	store := openReindexReceiptTestStore(t)
 	nodes, _ := addBatchFixture(nodeInsertChunkSize+1, 0)
 	nodes[len(nodes)-1].Meta = map[string]any{"unsupported": make(chan int)}

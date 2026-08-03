@@ -105,11 +105,20 @@ func ingestCurrentExperiment(tx *sql.Tx, nodes []*graph.Node, edges []*graph.Edg
 }
 
 func ingestJSONExperiment(tx *sql.Tx, nodes []*graph.Node, edges []*graph.Edge) (int, int, error) {
-	_, nodeStatements, err := insertNodeChunksJSONBTx(tx, nodes)
+	_, nodeStatements, _, err := insertNodeChunksJSONBTx(tx, nodes, false)
 	if err != nil {
 		return nodeStatements, 0, err
 	}
-	_, edgeStatements, err := insertEdgeChunksJSONBTx(tx, edges)
+	_, edgeStatements, _, err := insertEdgeChunksJSONBTx(tx, edges, false)
+	return nodeStatements, edgeStatements, err
+}
+
+func ingestJSONReturningExperiment(tx *sql.Tx, nodes []*graph.Node, edges []*graph.Edge) (int, int, error) {
+	_, nodeStatements, _, err := insertNodeChunksJSONBTx(tx, nodes, true)
+	if err != nil {
+		return nodeStatements, 0, err
+	}
+	_, edgeStatements, _, err := insertEdgeChunksJSONBTx(tx, edges, true)
 	return nodeStatements, edgeStatements, err
 }
 
@@ -371,6 +380,7 @@ func BenchmarkSQLiteIngestBindingStrategies(b *testing.B) {
 	}{
 		{name: "current_placeholders", run: ingestCurrentExperiment},
 		{name: "jsonb_bounded", run: ingestJSONExperiment},
+		{name: "jsonb_bounded_returning", run: ingestJSONReturningExperiment},
 	}
 	for _, strategy := range strategies {
 		strategy := strategy
