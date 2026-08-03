@@ -722,7 +722,7 @@ func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTe
 // was successfully read. It never reconstructs identity from serialized output.
 func captureLocalizationReadSource(ctx context.Context, node *graph.Node) {
 	rows := make([]localizationDigestRow, 0, 1)
-	if row, ok := localizationDigestRowFromNode(node, "permitted_read_source"); ok {
+	if row, ok := localizationDigestRowFromNode(node, localizationProvenancePermittedReadSource); ok {
 		rows = append(rows, row)
 	}
 	captureLocalizationRows(ctx, rows)

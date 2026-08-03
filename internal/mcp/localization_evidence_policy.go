@@ -16,6 +16,10 @@ const (
 	localizationProvenanceImplementationRoute   = "implementation_route"
 	localizationProvenanceImplementationTarget  = "implementation_target"
 	localizationProvenanceTypedAnchorProjection = "typed_anchor_projection"
+	// localizationProvenancePermittedReadSource marks the declaration returned
+	// by the exact read the contract itself prescribed. It is proof, not
+	// arrival order: the session named that symbol before the read happened.
+	localizationProvenancePermittedReadSource = "permitted_read_source"
 )
 
 type localizationEvidenceProof struct {

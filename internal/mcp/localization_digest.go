@@ -510,7 +510,8 @@ func localizationFinalResponsePrimaryProvenance(provenance string) bool {
 	case localizationProvenanceSourceLiteralCallee,
 		localizationProvenanceDivergentDefault,
 		localizationProvenanceImplementationTarget,
-		localizationProvenanceTypedAnchorProjection:
+		localizationProvenanceTypedAnchorProjection,
+		localizationProvenancePermittedReadSource:
 		return true
 	default:
 		return false
