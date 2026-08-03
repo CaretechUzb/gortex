@@ -4,7 +4,10 @@ import (
 	"reflect"
 	"testing"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/intern"
 )
 
 // TestLSPDisabledSet_ConfigOnly — a `semantic.providers` entry with
@@ -188,5 +191,20 @@ func TestSelectWarmGlobalResolveAction(t *testing.T) {
 				t.Fatalf("action = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRotateColdInternGeneration(t *testing.T) {
+	intern.Reset()
+	t.Cleanup(func() { intern.Reset() })
+
+	for _, phase := range []string{"parallel_parse", "deferred_passes_all"} {
+		intern.String("daemon-warmup/" + phase)
+		if got := rotateColdInternGeneration(zap.NewNop(), phase); got != 1 {
+			t.Fatalf("rotateColdInternGeneration(%q) released %d strings, want 1", phase, got)
+		}
+		if got := intern.Len(); got != 0 {
+			t.Fatalf("interner length after %q rotation = %d, want 0", phase, got)
+		}
 	}
 }

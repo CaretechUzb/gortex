@@ -72,3 +72,74 @@ func TestString_Concurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestResetStartsFreshGeneration(t *testing.T) {
+	Reset()
+	t.Cleanup(func() { Reset() })
+
+	firstInput := fmt.Sprintf("reset/%s", "same-value")
+	first := String(firstInput)
+	if removed := Reset(); removed != 1 {
+		t.Fatalf("Reset removed %d strings, want 1", removed)
+	}
+	if first != "reset/same-value" {
+		t.Fatalf("pre-reset string changed: %q", first)
+	}
+
+	secondInput := fmt.Sprintf("reset/%s", "same-value")
+	second := String(secondInput)
+	if backing(first) == backing(second) {
+		t.Fatal("equal strings unexpectedly retained one canonical backing across reset")
+	}
+	third := String(fmt.Sprintf("reset/%s", "same-value"))
+	if backing(second) != backing(third) {
+		t.Fatal("new generation did not canonicalize equal strings")
+	}
+}
+
+func TestResetConcurrentWithString(t *testing.T) {
+	Reset()
+	t.Cleanup(func() { Reset() })
+
+	const workers = 16
+	const rounds = 256
+	start := make(chan struct{})
+	errCh := make(chan string, 1)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < rounds; i++ {
+				want := fmt.Sprintf("reset-concurrent/%d/%d", worker, i%32)
+				if got := String(want); got != want {
+					select {
+					case errCh <- fmt.Sprintf("String(%q) = %q", want, got):
+					default:
+					}
+					return
+				}
+			}
+		}(worker)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < rounds; i++ {
+			Reset()
+		}
+	}()
+	close(start)
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+	Reset()
+	if got := Len(); got != 0 {
+		t.Fatalf("Len after final Reset = %d, want 0", got)
+	}
+}

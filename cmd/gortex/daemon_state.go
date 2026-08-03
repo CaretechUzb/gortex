@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/intern"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/platform"
@@ -357,6 +358,22 @@ func drainGoModAndFinalizeWarmupBulk(drain func(), finalize func() error) (drain
 	finalizeStart := time.Now()
 	err = finalize()
 	return drainElapsed, time.Since(finalizeStart), err
+}
+
+// rotateColdInternGeneration releases the process-wide canonical-string table
+// after a cold producer phase has joined. Returned strings remain valid; the
+// SQLite backend has already copied their values into durable rows, so keeping
+// the table would only pin transient prefixed IDs and paths for process life.
+// Reset does not force a collection — it merely makes the old generation
+// eligible for the runtime's ordinary phase GC and scavenging.
+func rotateColdInternGeneration(logger *zap.Logger, phase string) int {
+	released := intern.Reset()
+	if released > 0 && logger != nil {
+		logger.Info("daemon: released cold intern generation",
+			zap.String("phase", phase),
+			zap.Int("strings", released))
+	}
+	return released
 }
 
 func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) (*indexer.MultiWatcher, *warmupTimings) {
@@ -738,6 +755,10 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	}); err != nil {
 		logger.Error("daemon: repository topology batch failed", zap.Error(err))
 	}
+	// RunRepositoryTopologyBatch has joined every parse worker and finalized
+	// the coordinated bulk loader. No producer still needs the canonical
+	// prefixed strings retained by the cold interner generation.
+	rotateColdInternGeneration(logger, "parallel_parse")
 	timings.parse = time.Since(phaseStart)
 	timings.filesReindexed = int(filesReindexed.Load())
 	logger.Info("daemon: warmup phase done",
@@ -910,6 +931,10 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		} else {
 			deferredResult = state.multiIndexer.RunDeferredPassesAllResult(ctx)
 		}
+		// Deferred module/contract extraction can mint a small second wave of
+		// prefixed strings after the main parse generation was released. Every
+		// deferred lane is joined here, so rotate that tail generation too.
+		rotateColdInternGeneration(logger, "deferred_passes_all")
 		timings.enrichScheduled = deferredResult.EnrichScheduled
 		timings.enrich = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
