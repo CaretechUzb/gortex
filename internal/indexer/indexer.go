@@ -2676,14 +2676,63 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	shadowWeight := shadowAdmissionWeight(len(files), totalFileBytes)
 	shadowLocallyEligible := blOK && firstIndex && belowShadowMax && belowShadowBytes
 
-	// Reserve one process-wide, repository-scale working-set envelope before
-	// either parse path starts. The same source/structure estimate charges a
+	// Acquire a queued shadow slot before the shared repository-memory envelope.
+	// Waiting candidates therefore hold no general memory reservation. Every
+	// path uses the same shadow -> memory lock order, while direct/oversized
+	// candidates acquire only memory, so the two process gates cannot cycle.
+	admission := idx.shadowAdmission
+	if admission == nil {
+		admission = processShadowAdmission
+	}
+	shadowAdmissionStarted := time.Now()
+	var shadowLease *shadowAdmissionLease
+	if shadowLocallyEligible {
+		shadowLease, err = admission.acquire(ctx, shadowWeight)
+		if err != nil {
+			return nil, err
+		}
+	}
+	shadowTaken := shadowLease != nil
+	if shadowLease != nil {
+		// Registered before both the memory lease and shadow-drain defer below.
+		// Reverse defer order retains the shadow slot through all parsing, durable
+		// drain, FTS finalization, cancellation, and graph-restoration paths.
+		defer shadowLease.Release()
+	}
+	shadowStats := admission.snapshot()
+	idx.logger.Info("indexer: shadow-swap decision",
+		zap.String("repo", idx.RepoPrefix()),
+		zap.Bool("bulk_loader", blOK),
+		zap.Bool("first_index", firstIndex),
+		zap.Int("files", len(files)),
+		zap.Int("shadow_max_files", shadowMaxFileCount()),
+		zap.Bool("below_shadow_max", belowShadowMax),
+		zap.Int64("total_file_bytes", totalFileBytes),
+		zap.Int64("shadow_max_bytes", maxShadowBytes),
+		zap.Bool("below_shadow_bytes", belowShadowBytes),
+		zap.Int64("shadow_weight_bytes", shadowWeight),
+		zap.Int64("shadow_process_budget_bytes", shadowStats.capacity),
+		zap.Int64("shadow_process_used_bytes", shadowStats.used),
+		zap.Int64("shadow_process_peak_bytes", shadowStats.peak),
+		zap.Int("shadow_max_concurrent", shadowStats.maxConcurrent),
+		zap.Int("shadow_active", shadowStats.active),
+		zap.Int("shadow_peak_active", shadowStats.peakActive),
+		zap.Int("shadow_waiters", shadowStats.waiters),
+		zap.Uint64("shadow_admissions", shadowStats.admissions),
+		zap.Uint64("shadow_queued_admissions", shadowStats.queued),
+		zap.Duration("shadow_waited", time.Since(shadowAdmissionStarted)),
+		zap.Bool("shadow_budget_granted", shadowTaken),
+		zap.Bool("shadow_taken", shadowTaken),
+	)
+
+	// Reserve one process-wide, repository-scale working-set envelope after the
+	// shadow choice is settled. The same source/structure estimate charges a
 	// direct parse and a shadow, while a fixed per-repository allowance covers
 	// parser workers and SQLite buffers. Direct parses release after their
 	// parser/batch tail; shadows keep the lease through the deferred drain below.
 	// This is intentionally separate from the nested raw/native per-file gates.
 	memoryWeight := indexMemoryAdmissionWeight(len(files), totalFileBytes)
-	if !shadowLocallyEligible {
+	if !shadowTaken {
 		memoryWeight = directIndexMemoryAdmissionWeight(len(files), totalFileBytes)
 	}
 	memoryBudget := idx.indexMemoryAdmission
@@ -2706,6 +2755,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			zap.Int("native_pressure_files", nativePressureFiles),
 			zap.Int64("native_pressure_bytes", nativePressureFileBytes),
 			zap.Bool("shadow_eligible", shadowLocallyEligible),
+			zap.Bool("shadow_taken", shadowTaken),
 			zap.Int64("requested_weight_bytes", memoryWeight),
 			zap.Int64("weight_bytes", memoryLease.weight),
 			zap.Duration("waited", memoryAdmittedAt.Sub(memoryAdmissionStarted)),
@@ -2736,41 +2786,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// successful shadow charged until every destructive batch is durable.
 		defer releaseIndexMemoryAdmission("index_exit")
 	}
-
-	admission := idx.shadowAdmission
-	if admission == nil {
-		admission = processShadowAdmission
-	}
-	var shadowLease *shadowAdmissionLease
-	shadowBudgetGranted := false
-	if shadowLocallyEligible {
-		shadowLease, shadowBudgetGranted = admission.tryAcquire(shadowWeight)
-	}
-	shadowTaken := shadowLocallyEligible && shadowBudgetGranted
-	if shadowLease != nil {
-		// Registered before the shadow-drain defer below. Defers execute in
-		// reverse order, so the lease remains charged through every success,
-		// error, and cancellation drain/restore path and releases afterwards.
-		defer shadowLease.Release()
-	}
-	shadowBudgetCapacity, shadowBudgetUsed, shadowBudgetPeak := admission.snapshot()
-	idx.logger.Info("indexer: shadow-swap decision",
-		zap.String("repo", idx.RepoPrefix()),
-		zap.Bool("bulk_loader", blOK),
-		zap.Bool("first_index", firstIndex),
-		zap.Int("files", len(files)),
-		zap.Int("shadow_max_files", shadowMaxFileCount()),
-		zap.Bool("below_shadow_max", belowShadowMax),
-		zap.Int64("total_file_bytes", totalFileBytes),
-		zap.Int64("shadow_max_bytes", maxShadowBytes),
-		zap.Bool("below_shadow_bytes", belowShadowBytes),
-		zap.Int64("shadow_weight_bytes", shadowWeight),
-		zap.Int64("shadow_process_budget_bytes", shadowBudgetCapacity),
-		zap.Int64("shadow_process_used_bytes", shadowBudgetUsed),
-		zap.Int64("shadow_process_peak_bytes", shadowBudgetPeak),
-		zap.Bool("shadow_budget_granted", shadowBudgetGranted),
-		zap.Bool("shadow_taken", shadowTaken),
-	)
 	if shadowTaken {
 		// Keep the persisted repository queryable while the replacement graph is
 		// parsed in memory. Warm-restart rows are evicted only after parsing has
@@ -2968,7 +2983,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 		}()
 	} else if diskTarget == nil && idx.graph.NodeCount() == 0 && idx.graph.EdgeCount() == 0 {
-		if _, isBulk := idx.graph.(graph.BulkLoader); isBulk && firstIndex && (!belowShadowMax || !belowShadowBytes || !shadowBudgetGranted) {
+		if _, isBulk := idx.graph.(graph.BulkLoader); isBulk && firstIndex && (!belowShadowMax || !belowShadowBytes || !shadowTaken) {
 			idx.logger.Info("indexer: skipping in-memory shadow; building against disk store (bounded RAM)",
 				zap.Int("files", len(files)),
 				zap.Int("file_threshold", shadowMaxFileCount()),
@@ -2977,9 +2992,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				zap.Int64("byte_threshold", maxShadowBytes),
 				zap.Bool("over_byte_budget", !belowShadowBytes),
 				zap.Int64("shadow_weight_bytes", shadowWeight),
-				zap.Int64("shadow_process_budget_bytes", shadowBudgetCapacity),
-				zap.Int64("shadow_process_used_bytes", shadowBudgetUsed),
-				zap.Bool("shadow_budget_unavailable", shadowLocallyEligible && !shadowBudgetGranted))
+				zap.Int64("shadow_process_budget_bytes", shadowStats.capacity),
+				zap.Int64("shadow_process_used_bytes", shadowStats.used),
+				zap.Bool("shadow_disabled_or_oversized", shadowLocallyEligible && !shadowTaken))
 		}
 	}
 

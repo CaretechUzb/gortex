@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"os"
 	"strconv"
 	"sync"
@@ -12,6 +13,12 @@ const (
 	// override the process-wide ceiling before daemon start.
 	defaultShadowProcessBudgetBytes int64 = 1 << 30 // 1 GiB
 
+	// One shadow already drives its own parser worker pool and retains the
+	// decoded graph through the destructive drain. Queue additional eligible
+	// repositories instead of multiplying both CPU pressure and resident graph
+	// state. Operators can raise this only after measuring their workload.
+	defaultShadowMaxConcurrent = 1
+
 	// A source file expands into nodes, edges, indexes, and drain buffers. Raw
 	// input bytes alone badly undercount source-heavy repositories, so admission
 	// charges both input expansion and a per-file structural estimate.
@@ -20,14 +27,26 @@ const (
 	shadowMinimumChargeBytes    int64 = 32 << 20
 )
 
-// shadowAdmissionBudget is a non-blocking, weighted process admission gate.
-// Repositories that do not fit immediately use SQLite directly; they never wait
-// behind another in-memory shadow and never create an unbudgeted fallback.
+// shadowAdmissionBudget is a context-aware FIFO process admission gate. Local
+// shadow candidates wait for both the weighted byte ceiling and the hard slot
+// cap. Only disabled or individually oversized candidates fall back to SQLite.
 type shadowAdmissionBudget struct {
-	mu       sync.Mutex
-	capacity int64
-	used     int64
-	peak     int64
+	mu            sync.Mutex
+	capacity      int64
+	maxConcurrent int
+	used          int64
+	peak          int64
+	active        int
+	peakActive    int
+	waiters       []*shadowAdmissionWaiter
+	admissions    uint64
+	queued        uint64
+}
+
+type shadowAdmissionWaiter struct {
+	weight  int64
+	ready   chan struct{}
+	granted bool
 }
 
 type shadowAdmissionLease struct {
@@ -36,13 +55,34 @@ type shadowAdmissionLease struct {
 	once   sync.Once
 }
 
-var processShadowAdmission = newShadowAdmissionBudget(shadowProcessBudgetBytes())
+type shadowAdmissionStats struct {
+	capacity      int64
+	used          int64
+	peak          int64
+	maxConcurrent int
+	active        int
+	peakActive    int
+	waiters       int
+	admissions    uint64
+	queued        uint64
+}
 
-func newShadowAdmissionBudget(capacity int64) *shadowAdmissionBudget {
+var processShadowAdmission = newShadowAdmissionBudget(
+	shadowProcessBudgetBytes(),
+	shadowMaxConcurrent(),
+)
+
+func newShadowAdmissionBudget(capacity int64, maxConcurrent int) *shadowAdmissionBudget {
 	if capacity < 0 {
 		capacity = 0
 	}
-	return &shadowAdmissionBudget{capacity: capacity}
+	if maxConcurrent < 0 {
+		maxConcurrent = 0
+	}
+	return &shadowAdmissionBudget{
+		capacity:      capacity,
+		maxConcurrent: maxConcurrent,
+	}
 }
 
 // shadowProcessBudgetBytes returns the process-wide in-memory shadow budget.
@@ -56,6 +96,18 @@ func shadowProcessBudgetBytes() int64 {
 		}
 	}
 	return defaultShadowProcessBudgetBytes
+}
+
+// shadowMaxConcurrent returns the process-wide hard slot cap. Zero explicitly
+// disables shadows; invalid and negative values retain the conservative default.
+func shadowMaxConcurrent() int {
+	if raw := os.Getenv("GORTEX_SHADOW_MAX_CONCURRENT"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err == nil && value >= 0 {
+			return value
+		}
+	}
+	return defaultShadowMaxConcurrent
 }
 
 func shadowAdmissionWeight(fileCount int, inputBytes int64) int64 {
@@ -90,41 +142,157 @@ func shadowAdmissionWeight(fileCount int, inputBytes int64) int64 {
 	return weight
 }
 
-func (b *shadowAdmissionBudget) tryAcquire(weight int64) (*shadowAdmissionLease, bool) {
-	if b == nil || weight <= 0 {
-		return nil, false
+func (b *shadowAdmissionBudget) acquire(
+	ctx context.Context,
+	weight int64,
+) (*shadowAdmissionLease, error) {
+	if b == nil || weight <= 0 || b.capacity <= 0 || b.maxConcurrent <= 0 || weight > b.capacity {
+		return nil, nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.capacity <= 0 || weight > b.capacity-b.used {
-		return nil, false
+	select {
+	case <-ctx.Done():
+		b.mu.Unlock()
+		return nil, ctx.Err()
+	default:
 	}
+	if len(b.waiters) == 0 && b.canGrantLocked(weight) {
+		b.chargeLocked(weight)
+		b.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			b.release(weight)
+			return nil, ctx.Err()
+		default:
+			return &shadowAdmissionLease{budget: b, weight: weight}, nil
+		}
+	}
+
+	waiter := &shadowAdmissionWaiter{weight: weight, ready: make(chan struct{})}
+	b.waiters = append(b.waiters, waiter)
+	b.queued++
+	b.grantWaitersLocked()
+	b.mu.Unlock()
+
+	select {
+	case <-waiter.ready:
+		select {
+		case <-ctx.Done():
+			b.release(weight)
+			return nil, ctx.Err()
+		default:
+			return &shadowAdmissionLease{budget: b, weight: weight}, nil
+		}
+	case <-ctx.Done():
+		b.mu.Lock()
+		if waiter.granted {
+			b.unchargeLocked(weight)
+		} else {
+			for i, queued := range b.waiters {
+				if queued != waiter {
+					continue
+				}
+				b.removeWaiterLocked(i)
+				break
+			}
+		}
+		b.grantWaitersLocked()
+		b.mu.Unlock()
+		return nil, ctx.Err()
+	}
+}
+
+// canGrantLocked reports whether a shadow can enter. Caller holds b.mu.
+func (b *shadowAdmissionBudget) canGrantLocked(weight int64) bool {
+	return b.active < b.maxConcurrent && weight <= b.capacity-b.used
+}
+
+// chargeLocked records one granted shadow. Caller holds b.mu.
+func (b *shadowAdmissionBudget) chargeLocked(weight int64) {
 	b.used += weight
+	b.active++
+	b.admissions++
 	if b.used > b.peak {
 		b.peak = b.used
 	}
-	return &shadowAdmissionLease{budget: b, weight: weight}, true
+	if b.active > b.peakActive {
+		b.peakActive = b.active
+	}
+}
+
+// unchargeLocked releases one granted shadow. Caller holds b.mu.
+func (b *shadowAdmissionBudget) unchargeLocked(weight int64) {
+	b.used -= weight
+	if b.used < 0 {
+		b.used = 0
+	}
+	b.active--
+	if b.active < 0 {
+		b.active = 0
+	}
+}
+
+// grantWaitersLocked admits strictly from the FIFO head. Caller holds b.mu.
+func (b *shadowAdmissionBudget) grantWaitersLocked() {
+	for len(b.waiters) > 0 && b.canGrantLocked(b.waiters[0].weight) {
+		waiter := b.waiters[0]
+		b.removeWaiterLocked(0)
+		b.chargeLocked(waiter.weight)
+		waiter.granted = true
+		close(waiter.ready)
+	}
+}
+
+func (b *shadowAdmissionBudget) removeWaiterLocked(index int) {
+	copy(b.waiters[index:], b.waiters[index+1:])
+	last := len(b.waiters) - 1
+	b.waiters[last] = nil
+	b.waiters = b.waiters[:last]
+}
+
+func (b *shadowAdmissionBudget) release(weight int64) {
+	if b == nil || weight <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.unchargeLocked(weight)
+	b.grantWaitersLocked()
+	b.mu.Unlock()
 }
 
 func (l *shadowAdmissionLease) Release() {
-	if l == nil || l.budget == nil {
+	if l == nil || l.budget == nil || l.weight <= 0 {
 		return
 	}
 	l.once.Do(func() {
-		l.budget.mu.Lock()
-		l.budget.used -= l.weight
-		if l.budget.used < 0 {
-			l.budget.used = 0
-		}
-		l.budget.mu.Unlock()
+		l.budget.release(l.weight)
 	})
 }
 
-func (b *shadowAdmissionBudget) snapshot() (capacity, used, peak int64) {
+func (b *shadowAdmissionBudget) snapshot() shadowAdmissionStats {
 	if b == nil {
-		return 0, 0, 0
+		return shadowAdmissionStats{}
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.capacity, b.used, b.peak
+	return shadowAdmissionStats{
+		capacity:      b.capacity,
+		used:          b.used,
+		peak:          b.peak,
+		maxConcurrent: b.maxConcurrent,
+		active:        b.active,
+		peakActive:    b.peakActive,
+		waiters:       len(b.waiters),
+		admissions:    b.admissions,
+		queued:        b.queued,
+	}
 }
