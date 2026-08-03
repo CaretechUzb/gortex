@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"bytes"
 	"reflect"
 	"strings"
 	"testing"
@@ -17,6 +18,35 @@ func (e metadataFixtureExtractor) Language() string     { return "rust" }
 func (e metadataFixtureExtractor) Extensions() []string { return []string{".rs"} }
 func (e metadataFixtureExtractor) Extract(string, []byte) (*parser.ExtractionResult, error) {
 	return e.result, nil
+}
+
+func TestNormalizeExtractionMetadataFileOnlyDoesNotCopySource(t *testing.T) {
+	small := []byte("{}")
+	large := bytes.Repeat([]byte("file-only payload\n"), 1<<20)
+	run := func(src []byte) {
+		node := &graph.Node{ID: "data.json", Kind: graph.KindFile, Name: "data.json"}
+		normalizeExtractionMetadata(&parser.ExtractionResult{Nodes: []*graph.Node{node}}, src)
+		if got := node.RetrievalMetadata(); got != (graph.RetrievalMetadata{}) {
+			t.Fatalf("file metadata = %#v", got)
+		}
+	}
+
+	smallAllocs := testing.AllocsPerRun(5, func() { run(small) })
+	largeAllocs := testing.AllocsPerRun(5, func() { run(large) })
+	if largeAllocs > smallAllocs+1 {
+		t.Fatalf("file-only normalization allocations scale with source size: small=%v large=%v", smallAllocs, largeAllocs)
+	}
+}
+
+func BenchmarkNormalizeExtractionMetadataFileOnly(b *testing.B) {
+	src := bytes.Repeat([]byte("file-only payload\n"), 1<<20)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		node := &graph.Node{ID: "data.json", Kind: graph.KindFile, Name: "data.json"}
+		normalizeExtractionMetadata(&parser.ExtractionResult{Nodes: []*graph.Node{node}}, src)
+	}
 }
 
 func TestExtractFileNormalizesMetadataAtSharedBoundary(t *testing.T) {

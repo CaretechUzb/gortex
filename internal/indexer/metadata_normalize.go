@@ -16,9 +16,18 @@ func normalizeExtractionMetadata(result *parser.ExtractionResult, src []byte) {
 	if result == nil {
 		return
 	}
-	var sourceLines []string
-	if len(src) > 0 {
-		sourceLines = strings.Split(string(src), "\n")
+	var (
+		sourceLines      []string
+		sourceLinesReady bool
+	)
+	getSourceLines := func() []string {
+		if !sourceLinesReady {
+			sourceLinesReady = true
+			if len(src) > 0 {
+				sourceLines = strings.Split(string(src), "\n")
+			}
+		}
+		return sourceLines
 	}
 
 	nodesByID := make(map[string]*graph.Node, len(result.Nodes))
@@ -68,7 +77,7 @@ func normalizeExtractionMetadata(result *parser.ExtractionResult, src []byte) {
 		}
 		sig := compactSignature(normalizedMetaString(n.Meta, "signature"), n.Language)
 		if sig == "" || syntheticSignature(sig, n.Name) {
-			if derived := declarationSignature(sourceLines, n); derived != "" {
+			if derived := declarationSignature(getSourceLines(), n); derived != "" {
 				sig = derived
 			}
 		}
@@ -83,7 +92,7 @@ func normalizeExtractionMetadata(result *parser.ExtractionResult, src []byte) {
 			metaString(n.Meta, "comment"),
 		))
 		if doc == "" {
-			doc = docAbove(sourceLines, n.StartLine)
+			doc = docAbove(getSourceLines(), n.StartLine)
 		}
 
 		qual := retrievalQualName(n, ownerNodes, ownerNames, qualNames, make(map[*graph.Node]bool))
