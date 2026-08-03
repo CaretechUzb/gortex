@@ -125,61 +125,74 @@ func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
 		recvHint, _ := edge.Meta["fn_ref_recv_hint"].(string)
 		ungated, _ := edge.Meta["fn_value_ungated"].(bool)
 		skipGate, _ := edge.Meta["skip_gate"].(bool)
-		target := ""
+		var targets []string
 		conf := 0.6
 		origin := graph.OriginASTInferred
 		switch {
 		case skipGate:
+			target := ""
 			if recvHint != "" {
 				target = resolveMemberByTypeMemo(g, recvHint, name, nameMemo)
 			}
 			if target == "" {
 				target = resolveUniqueFnValueMemo(g, name, nameMemo)
 			}
-			conf = 0.5
+			targets, conf = appendTarget(nil, target), 0.5
 		case recvHint == "<self>":
-			if target = resolveFnValueSelfMemberMemo(g, edge.From, name, nameMemo); target != "" {
+			if targets = resolveFnValueSelfMembersMemo(g, edge.From, name, nameMemo); len(targets) > 0 {
 				conf, origin = 0.85, graph.OriginASTResolved
 			} else {
-				target = sameFileTarget(edge.FilePath, name)
+				targets = appendTarget(nil, sameFileTarget(edge.FilePath, name))
 			}
 		case recvHint != "":
-			if target = resolveMemberByTypeMemo(g, recvHint, name, nameMemo); target != "" {
+			if targets = resolveMembersByTypeMemo(g, recvHint, name, nameMemo); len(targets) > 0 {
 				conf, origin = 0.85, graph.OriginASTResolved
 			} else if ungated {
-				target = resolveFnValueCrossModuleMemo(g, name, nameMemo)
+				targets = appendTarget(nil, resolveFnValueCrossModuleMemo(g, name, nameMemo))
 				conf = 0.45
 			}
 		default:
-			target = sameFileTarget(edge.FilePath, name)
-			if target == "" && ungated {
-				target = resolveFnValueCrossModuleMemo(g, name, nameMemo)
+			targets = appendTarget(nil, sameFileTarget(edge.FilePath, name))
+			if len(targets) == 0 && ungated {
+				targets = appendTarget(nil, resolveFnValueCrossModuleMemo(g, name, nameMemo))
 				conf = 0.45
 			}
 		}
-		if target == "" || target == edge.From {
-			continue
+		// An overload set is a genuine ambiguity — exactly one member is the
+		// real target and the graph cannot say which — so each edge in the set
+		// rides the inferred tier at reduced confidence rather than claiming
+		// the resolved-match certainty a lone hit earns.
+		if len(targets) > 1 {
+			conf, origin = 0.6, graph.OriginASTInferred
 		}
-		meta := map[string]any{
-			"via":             fnValueRegistrationVia,
-			metaFnValueName:   name,
-			MetaSynthesizedBy: SynthFnValueCallback,
-			MetaProvenance:    ProvenanceHeuristic,
+		for _, target := range targets {
+			if target == "" || target == edge.From {
+				continue
+			}
+			meta := map[string]any{
+				"via":             fnValueRegistrationVia,
+				metaFnValueName:   name,
+				MetaSynthesizedBy: SynthFnValueCallback,
+				MetaProvenance:    ProvenanceHeuristic,
+			}
+			if form, _ := edge.Meta["fn_ref_form"].(string); form != "" {
+				meta["fn_ref_form"] = form
+			}
+			if len(targets) > 1 {
+				meta["overload_set"] = len(targets)
+			}
+			landed = append(landed, &graph.Edge{
+				From:            edge.From,
+				To:              target,
+				Kind:            graph.EdgeReferences,
+				FilePath:        edge.FilePath,
+				Line:            edge.Line,
+				Confidence:      conf,
+				ConfidenceLabel: graph.ConfidenceLabelFor(graph.EdgeReferences, conf),
+				Origin:          origin,
+				Meta:            meta,
+			})
 		}
-		if form, _ := edge.Meta["fn_ref_form"].(string); form != "" {
-			meta["fn_ref_form"] = form
-		}
-		landed = append(landed, &graph.Edge{
-			From:            edge.From,
-			To:              target,
-			Kind:            graph.EdgeReferences,
-			FilePath:        edge.FilePath,
-			Line:            edge.Line,
-			Confidence:      conf,
-			ConfidenceLabel: graph.ConfidenceLabelFor(graph.EdgeReferences, conf),
-			Origin:          origin,
-			Meta:            meta,
-		})
 	}
 
 	// One bounded AddBatch per chunk instead of an AddEdge per edge: on a
@@ -426,20 +439,64 @@ func resolveMemberByTypeMemo(g graph.Store, typeName, member string, memo map[st
 	return match
 }
 
-// resolveFnValueSelfMemberMemo binds a `this.m` / `self.m` member reference
+// resolveMembersByTypeMemo returns every method of typeName named member —
+// the complete overload set, not the unique-or-drop single match
+// resolveMemberByTypeMemo yields.
+//
+// In Java (and C#, Kotlin, C++) a type may declare one name several times, and
+// a method reference such as `Type::handle` names the whole set: which overload
+// applies is decided by the target functional interface's shape, which the
+// graph does not model. Unique-or-drop therefore discarded the reference
+// outright the moment a target was overloaded, leaving every overload with no
+// incoming reference at all — so an overloaded method reached only through a
+// method reference was reported dead. Binding the set keeps each overload
+// reachable; the caller reduces confidence to mark the ambiguity.
+func resolveMembersByTypeMemo(g graph.Store, typeName, member string, memo map[string][]*graph.Node) []string {
+	if typeName == "" || member == "" {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, n := range findNodesByNameMemo(g, member, memo) {
+		if n == nil || n.Kind != graph.KindMethod {
+			continue
+		}
+		if recv, _ := n.Meta["receiver"].(string); recv != typeName {
+			continue
+		}
+		if seen[n.ID] {
+			continue
+		}
+		seen[n.ID] = true
+		out = append(out, n.ID)
+	}
+	return out
+}
+
+// resolveFnValueSelfMembersMemo binds a `this.m` / `self.m` member reference
 // against the methods of the registration site's enclosing type, so it can
-// never bind a coincidentally-named top-level function. A shared per-pass
-// FindNodesByName memo collapses repeated lookups (nil disables memoization).
-func resolveFnValueSelfMemberMemo(g graph.Store, fromID, member string, memo map[string][]*graph.Node) string {
+// never bind a coincidentally-named top-level function. Returns the full
+// overload set. A shared per-pass FindNodesByName memo collapses repeated
+// lookups (nil disables memoization).
+func resolveFnValueSelfMembersMemo(g graph.Store, fromID, member string, memo map[string][]*graph.Node) []string {
 	from := g.GetNode(fromID)
 	if from == nil || from.Meta == nil {
-		return ""
+		return nil
 	}
 	recv, _ := from.Meta["receiver"].(string)
 	if recv == "" {
-		return ""
+		return nil
 	}
-	return resolveMemberByTypeMemo(g, recv, member, memo)
+	return resolveMembersByTypeMemo(g, recv, member, memo)
+}
+
+// appendTarget appends a resolved target ID to a list, skipping the empty
+// "unresolved" sentinel so single-match paths compose with the set-valued ones.
+func appendTarget(dst []string, target string) []string {
+	if target == "" {
+		return dst
+	}
+	return append(dst, target)
 }
 
 // isFnValueNonTarget reports whether name is a literal/keyword/builtin that
