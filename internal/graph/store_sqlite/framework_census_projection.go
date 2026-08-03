@@ -24,6 +24,7 @@ const (
 	frameworkCensusMetaRustRecv
 	frameworkCensusMetaReceiverType
 	frameworkCensusMetaRustRecvExpr
+	frameworkCensusMetaSynthesizedBy
 )
 
 var frameworkCensusMetaKeys = [...]struct {
@@ -43,6 +44,7 @@ var frameworkCensusMetaKeys = [...]struct {
 	{name: "rust_recv", raw: []byte("rust_recv"), field: frameworkCensusMetaRustRecv},
 	{name: "receiver_type", raw: []byte("receiver_type"), field: frameworkCensusMetaReceiverType},
 	{name: "rust_recv_expr", raw: []byte("rust_recv_expr"), field: frameworkCensusMetaRustRecvExpr},
+	{name: "synthesized_by", raw: []byte("synthesized_by"), field: frameworkCensusMetaSynthesizedBy},
 }
 
 // FrameworkCensusEdgesSeq keeps the full metadata blob cursor-local and emits
@@ -183,9 +185,13 @@ func frameworkCensusField(kind graph.EdgeKind, key []byte) frameworkCensusMetaFi
 func frameworkCensusFieldAllowed(kind graph.EdgeKind, field frameworkCensusMetaField) bool {
 	switch kind {
 	case graph.EdgeCalls:
-		return true
+		return field != frameworkCensusMetaSynthesizedBy
 	case graph.EdgeReferences:
-		return field == frameworkCensusMetaVia || field == frameworkCensusMetaReceiverExpr
+		return field == frameworkCensusMetaVia ||
+			field == frameworkCensusMetaReceiverExpr ||
+			field == frameworkCensusMetaSynthesizedBy
+	case graph.EdgeImports:
+		return field == frameworkCensusMetaSynthesizedBy
 	default:
 		return false
 	}
@@ -220,6 +226,8 @@ func assignFrameworkCensusMeta(
 		row.ReceiverType = text
 	case frameworkCensusMetaRustRecvExpr:
 		row.RustRecvExpr = text
+	case frameworkCensusMetaSynthesizedBy:
+		row.SynthesizedBy = text
 	}
 }
 

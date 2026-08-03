@@ -86,13 +86,16 @@ func applyFrameworkFamilyGateScopedForFiles(
 	if g == nil {
 		return 0
 	}
-	var edges []*graph.Edge
 	if len(filePaths) > 0 {
-		edges = frameworkFamilyGateEdgesForFiles(g, scope, filePaths)
-	} else {
-		edges = frameworkRepoEdges(g, scope, graph.EdgeReferences, graph.EdgeImports)
+		return applyFrameworkFamilyGateCandidates(g, frameworkFamilyGateEdgesForFiles(g, scope, filePaths))
 	}
-	return applyFrameworkFamilyGateCandidates(g, edges)
+	if scope == nil {
+		return applyFrameworkFamilyGateIdentities(g, frameworkFamilyGateProjectedIdentities(g))
+	}
+	return applyFrameworkFamilyGateCandidates(
+		g,
+		frameworkRepoEdges(g, scope, graph.EdgeReferences, graph.EdgeImports),
+	)
 }
 
 func frameworkFamilyGateEdgesForFiles(
@@ -129,14 +132,53 @@ func frameworkFamilyGateEdgesForFiles(
 	return edges
 }
 
+func frameworkFamilyGateProjectedIdentities(g graph.Store) []graph.EdgeIdentity {
+	identities := make([]graph.EdgeIdentity, 0)
+	seen := make(map[graph.EdgeIdentity]struct{})
+	for row := range graph.FrameworkCensusEdgesSeq(g, graph.EdgeReferences, graph.EdgeImports) {
+		if row.SynthesizedBy == "" || frameworkBridgeSynths[row.SynthesizedBy] {
+			continue
+		}
+		if _, duplicate := seen[row.EdgeIdentity]; duplicate {
+			continue
+		}
+		seen[row.EdgeIdentity] = struct{}{}
+		identities = append(identities, row.EdgeIdentity)
+	}
+	return identities
+}
+
 func applyFrameworkFamilyGateCandidates(g graph.Store, edges []*graph.Edge) int {
+	identities := make([]graph.EdgeIdentity, 0, len(edges))
+	seen := make(map[graph.EdgeIdentity]struct{}, len(edges))
+	for _, edge := range edges {
+		if edge == nil || edge.Meta == nil {
+			continue
+		}
+		synth, _ := edge.Meta[MetaSynthesizedBy].(string)
+		if synth == "" || frameworkBridgeSynths[synth] {
+			continue
+		}
+		identity := graph.EdgeIdentityFor(edge)
+		if _, duplicate := seen[identity]; duplicate {
+			continue
+		}
+		seen[identity] = struct{}{}
+		identities = append(identities, identity)
+	}
+	return applyFrameworkFamilyGateIdentities(g, identities)
+}
+
+func applyFrameworkFamilyGateIdentities(g graph.Store, identities []graph.EdgeIdentity) int {
 	type cand struct {
 		edge  *graph.Edge
 		synth string
 	}
-	cands := make([]cand, 0, len(edges))
+	current := findFrameworkEdgesByIdentities(g, identities)
+	cands := make([]cand, 0, len(identities))
 	endpointIDs := map[string]struct{}{}
-	for _, edge := range edges {
+	for _, identity := range identities {
+		edge := current[identity]
 		if edge == nil || edge.Meta == nil {
 			continue
 		}

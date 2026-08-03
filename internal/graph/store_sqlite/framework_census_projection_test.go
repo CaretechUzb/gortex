@@ -26,6 +26,7 @@ func TestDecodeFrameworkCensusMetaFormatsAndMasks(t *testing.T) {
 		"rust_recv":             "self",
 		"receiver_type":         "Service",
 		"rust_recv_expr":        "self.inner",
+		"synthesized_by":        "rust-scope",
 		"unrelated":             []string{"a", "b"},
 	}
 	flat, err := encodeMeta(meta)
@@ -82,13 +83,26 @@ func TestDecodeFrameworkCensusMetaFormatsAndMasks(t *testing.T) {
 	if err := decodeFrameworkCensusMeta(graph.EdgeReferences, flat, &reference); err != nil {
 		t.Fatal(err)
 	}
-	if reference.Via != "grpc.stub" || reference.ReceiverExpr != "factory()" {
+	if reference.Via != "grpc.stub" || reference.ReceiverExpr != "factory()" || reference.SynthesizedBy != "rust-scope" {
 		t.Fatalf("reference projection lost required fields: %#v", reference)
 	}
 	reference.Via = ""
 	reference.ReceiverExpr = ""
+	reference.SynthesizedBy = ""
 	if reference != (graph.FrameworkCensusEdge{}) {
 		t.Fatalf("reference projection retained unrelated fields: %#v", reference)
+	}
+
+	var imported graph.FrameworkCensusEdge
+	if err := decodeFrameworkCensusMeta(graph.EdgeImports, flat, &imported); err != nil {
+		t.Fatal(err)
+	}
+	if imported.SynthesizedBy != "rust-scope" {
+		t.Fatalf("import projection lost synthesized_by: %#v", imported)
+	}
+	imported.SynthesizedBy = ""
+	if imported != (graph.FrameworkCensusEdge{}) {
+		t.Fatalf("import projection retained unrelated fields: %#v", imported)
 	}
 
 	wrongTypes, err := encodeMeta(map[string]any{
@@ -121,17 +135,19 @@ func TestFrameworkCensusEdgesSeqPreservesKindOrderAndClosesCursor(t *testing.T) 
 
 	s.AddBatch(nil, []*graph.Edge{
 		{From: "call-a", To: "unresolved::A", Kind: graph.EdgeCalls, FilePath: "a.go", Line: 1, Meta: map[string]any{"via": "grpc.stub", "ignored": strings.Repeat("x", 1024)}},
-		{From: "ref-a", To: "unresolved::R", Kind: graph.EdgeReferences, FilePath: "r.go", Line: 2, Meta: map[string]any{"via": "fnptr.reg", "receiver_expr": "make()", "receiver_type": "drop"}},
+		{From: "ref-a", To: "unresolved::R", Kind: graph.EdgeReferences, FilePath: "r.go", Line: 2, Meta: map[string]any{"via": "fnptr.reg", "receiver_expr": "make()", "receiver_type": "drop", "synthesized_by": "rust-scope"}},
 		{From: "call-b", To: "unresolved::B", Kind: graph.EdgeCalls, FilePath: "b.go", Line: 3, Meta: map[string]any{"recv_const": "User"}},
 		{From: "annotation", To: "java::WorkflowInterface", Kind: graph.EdgeAnnotated, FilePath: "w.java", Line: 4, Meta: map[string]any{"ignored": strings.Repeat("y", 1024)}},
+		{From: "import-a", To: "pkg", Kind: graph.EdgeImports, FilePath: "i.go", Line: 5, Meta: map[string]any{"via": "drop", "synthesized_by": "rails"}},
 	})
 
 	var got []graph.FrameworkCensusEdge
-	for row := range s.FrameworkCensusEdgesSeq(graph.EdgeReferences, graph.EdgeCalls) {
+	for row := range s.FrameworkCensusEdgesSeq(graph.EdgeReferences, graph.EdgeImports, graph.EdgeCalls) {
 		got = append(got, row)
 	}
 	wantIDs := []graph.EdgeIdentity{
 		{From: "ref-a", To: "unresolved::R", Kind: graph.EdgeReferences, FilePath: "r.go", Line: 2},
+		{From: "import-a", To: "pkg", Kind: graph.EdgeImports, FilePath: "i.go", Line: 5},
 		{From: "call-a", To: "unresolved::A", Kind: graph.EdgeCalls, FilePath: "a.go", Line: 1},
 		{From: "call-b", To: "unresolved::B", Kind: graph.EdgeCalls, FilePath: "b.go", Line: 3},
 	}
@@ -143,10 +159,13 @@ func TestFrameworkCensusEdgesSeqPreservesKindOrderAndClosesCursor(t *testing.T) 
 			t.Fatalf("row %d identity=%#v, want %#v", i, got[i].EdgeIdentity, wantIDs[i])
 		}
 	}
-	if got[0].Via != "fnptr.reg" || got[0].ReceiverExpr != "make()" || got[0].ReceiverType != "" {
+	if got[0].Via != "fnptr.reg" || got[0].ReceiverExpr != "make()" || got[0].ReceiverType != "" || got[0].SynthesizedBy != "rust-scope" {
 		t.Fatalf("reference mask mismatch: %#v", got[0])
 	}
-	if got[1].Via != "grpc.stub" || got[2].RecvConst != "User" {
+	if got[1].SynthesizedBy != "rails" || got[1].Via != "" {
+		t.Fatalf("import mask mismatch: %#v", got[1])
+	}
+	if got[2].Via != "grpc.stub" || got[3].RecvConst != "User" {
 		t.Fatalf("call projection mismatch: %#v", got)
 	}
 

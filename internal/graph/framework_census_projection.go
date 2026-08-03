@@ -19,6 +19,7 @@ type FrameworkCensusEdge struct {
 	RustRecv             string
 	ReceiverType         string
 	RustRecvExpr         string
+	SynthesizedBy        string
 }
 
 // FrameworkCensusEdgeSequencer streams typed census projections. A consumer
@@ -59,6 +60,9 @@ func FrameworkCensusEdgesSeq(s Store, kinds ...EdgeKind) iter.Seq[FrameworkCensu
 					row.RustRecv, _ = edge.Meta["rust_recv"].(string)
 					row.ReceiverType, _ = edge.Meta["receiver_type"].(string)
 					row.RustRecvExpr, _ = edge.Meta["rust_recv_expr"].(string)
+					if edge.Kind == EdgeReferences || edge.Kind == EdgeImports {
+						row.SynthesizedBy, _ = edge.Meta["synthesized_by"].(string)
+					}
 				}
 				if !yield(row) {
 					return

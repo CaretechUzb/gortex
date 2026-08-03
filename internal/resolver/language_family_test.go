@@ -1,10 +1,13 @@
 package resolver
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 func TestLanguageFamily(t *testing.T) {
@@ -58,6 +61,26 @@ func TestApplyFrameworkFamilyGate_DropsCrossFamilyRef(t *testing.T) {
 	assert.Equal(t, 1, applyFrameworkFamilyGate(g))
 	assert.False(t, g.RemoveEdge("a.razor::Page", "b.tsx::Counter", graph.EdgeReferences),
 		"edge already removed by the gate")
+}
+
+func TestApplyFrameworkFamilyGate_SQLiteProjectsThenExactRefetches(t *testing.T) {
+	g, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, g.Close()) })
+
+	g.AddBatch([]*graph.Node{
+		{ID: "page", Kind: graph.KindType, Language: "razor"},
+		{ID: "component", Kind: graph.KindType, Language: "typescript"},
+	}, []*graph.Edge{
+		{From: "page", To: "component", Kind: graph.EdgeReferences, FilePath: "a", Line: 1, Meta: map[string]any{MetaSynthesizedBy: SynthRustScope}},
+		{From: "page", To: "component", Kind: graph.EdgeImports, FilePath: "a", Line: 2, Meta: map[string]any{MetaSynthesizedBy: SynthRustScope}},
+		{From: "page", To: "component", Kind: graph.EdgeReferences, FilePath: "a", Line: 3},
+	})
+
+	require.Equal(t, 2, applyFrameworkFamilyGate(g))
+	remaining := g.GetOutEdges("page")
+	require.Len(t, remaining, 1)
+	require.Equal(t, 3, remaining[0].Line, "the exact refetch must not remove an unowned edge")
 }
 
 // TestApplyFrameworkFamilyGate_KeepsBridge pins that a bridge-synthesizer edge
