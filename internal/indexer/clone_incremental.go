@@ -260,6 +260,10 @@ func (ci *incrementalCloneIndex) AdoptBaselineOrRebuild(g graph.Store, repoPrefi
 	ci.mu.Unlock()
 }
 
+func (ci *incrementalCloneIndex) readyLocked() bool {
+	return ci.built && ci.cms != nil && ci.lsh != nil && ci.shingles != nil
+}
+
 // Ready reports whether one-file clone maintenance can run without a
 // graph-wide seed.
 func (ci *incrementalCloneIndex) Ready() bool {
@@ -268,7 +272,7 @@ func (ci *incrementalCloneIndex) Ready() bool {
 	}
 	ci.mu.Lock()
 	defer ci.mu.Unlock()
-	return ci.built
+	return ci.readyLocked()
 }
 
 // MarkPending records that clone edges may be incomplete after a bounded
@@ -310,6 +314,10 @@ func (ci *incrementalCloneIndex) EvictFuncs(g graph.Store, ids []string) {
 	}
 	ci.mu.Lock()
 	defer ci.mu.Unlock()
+	if !ci.readyLocked() {
+		ci.pending = true
+		return
+	}
 	for _, id := range ids {
 		sh, ok := ci.shingles[id]
 		if !ok {
@@ -351,6 +359,12 @@ func (ci *incrementalCloneIndex) UpdateFuncs(g graph.Store, repoPrefix string, f
 	}
 	ci.mu.Lock()
 	defer ci.mu.Unlock()
+	if !ci.readyLocked() {
+		if len(funcNodes) > 0 {
+			ci.pending = true
+		}
+		return
+	}
 
 	// Phase 1: fold every new body into the CMS + cache + sidecar and
 	// bump the corpus count, so the boilerplate gate below sees the same

@@ -76,6 +76,32 @@ func TestLazyIncrementalCloneIndexAdoptsBaseline(t *testing.T) {
 	}
 }
 
+func TestLazyIncrementalCloneIndexDefersDirectMutationUntilReady(t *testing.T) {
+	funcNode := &graph.Node{
+		ID:   "file.go::pending",
+		Kind: graph.KindFunction,
+		Meta: map[string]any{cloneShinglesMetaKey: []uint64{1}},
+	}
+
+	updateIndex := newIncrementalCloneIndex()
+	updateIndex.UpdateFuncs(graph.New(), "", []*graph.Node{funcNode}, 0)
+	if !updateIndex.Pending() || updateIndex.Ready() {
+		t.Fatal("unready clone update was not deferred")
+	}
+	if updateIndex.cms != nil || updateIndex.lsh != nil || updateIndex.shingles != nil {
+		t.Fatal("deferred clone update eagerly allocated corpus state")
+	}
+
+	evictIndex := newIncrementalCloneIndex()
+	evictIndex.EvictFuncs(graph.New(), []string{"file.go::old"})
+	if !evictIndex.Pending() || evictIndex.Ready() {
+		t.Fatal("unready clone eviction was not deferred")
+	}
+	if evictIndex.cms != nil || evictIndex.lsh != nil || evictIndex.shingles != nil {
+		t.Fatal("deferred clone eviction eagerly allocated corpus state")
+	}
+}
+
 var benchmarkIncrementalCloneIndex *incrementalCloneIndex
 
 func BenchmarkNewIncrementalCloneIndexLazy(b *testing.B) {
