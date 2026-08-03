@@ -13,7 +13,11 @@ const (
 	// A direct parse must be large independently of operator shadow overrides.
 	// This keeps an intentionally lowered shadow threshold from forcing GC for
 	// ordinary repositories that merely lost the process-wide shadow race.
-	directParseHeapReleaseMinRetained uint64 = 2 << 30
+	// Reclaim before a second pressure-sized direct parse stacks on the first
+	// parse's idle spans. The previous 2 GiB threshold missed a measured 4.9 GiB
+	// physical-footprint peak despite only 186 MiB of live heap. Eligibility,
+	// serialization, and the cooldown below keep this 512 MiB boundary narrow.
+	directParseHeapReleaseMinRetained uint64 = 512 << 20
 	directParseHeapReleaseCooldown           = 30 * time.Second
 )
 

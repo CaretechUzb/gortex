@@ -104,6 +104,47 @@ func TestDirectParseHeapReleaserGuardsOrdinaryAndLowRetainedHeap(t *testing.T) {
 	}
 }
 
+func TestDirectParseHeapReleaserProductionRetainedBoundary(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name     string
+		retained uint64
+		wantRun  bool
+	}{
+		{name: "one byte below", retained: directParseHeapReleaseMinRetained - 1},
+		{name: "at boundary", retained: directParseHeapReleaseMinRetained, wantRun: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var releases atomic.Int32
+			r := &directParseHeapReleaser{
+				minRetained: directParseHeapReleaseMinRetained,
+				cooldown:    directParseHeapReleaseCooldown,
+				now:         func() time.Time { return time.Unix(100, 0) },
+				readStats: func(ms *runtime.MemStats) {
+					*ms = runtime.MemStats{HeapSys: tt.retained}
+				},
+				release: func() { releases.Add(1) },
+			}
+			got := r.maybeRelease(directParseHeapReleaseRequest{
+				directStore: true,
+				inputBytes:  defaultShadowMaxBytes,
+			})
+			if got != tt.wantRun {
+				t.Fatalf("maybeRelease() = %v, want %v", got, tt.wantRun)
+			}
+			wantReleases := int32(0)
+			if tt.wantRun {
+				wantReleases = 1
+			}
+			if got := releases.Load(); got != wantReleases {
+				t.Fatalf("heap releases = %d, want %d", got, wantReleases)
+			}
+		})
+	}
+}
+
 func TestDirectParseHeapReleaserCooldown(t *testing.T) {
 	t.Parallel()
 
