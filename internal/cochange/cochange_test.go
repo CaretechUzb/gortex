@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -198,5 +200,119 @@ func TestEnrichGraph_NotAGitRepo(t *testing.T) {
 	}
 	if added != 0 {
 		t.Errorf("added = %d, want 0 for non-git dir", added)
+	}
+}
+
+type recordingBatchStore struct {
+	graph.Store
+	addEdgeCalls int
+	batchSizes   []int
+}
+
+func (s *recordingBatchStore) AddEdge(edge *graph.Edge) {
+	s.addEdgeCalls++
+	s.Store.AddEdge(edge)
+}
+
+func (s *recordingBatchStore) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+	s.batchSizes = append(s.batchSizes, len(edges))
+	s.Store.AddBatch(nodes, edges)
+}
+
+func coChangeEdgeSet(store graph.Store) map[string]*graph.Edge {
+	edges := make(map[string]*graph.Edge)
+	for _, edge := range store.AllEdges() {
+		if edge != nil && edge.Kind == graph.EdgeCoChange {
+			edges[edge.From+"\x00"+edge.To] = edge
+		}
+	}
+	return edges
+}
+
+func TestAddEdges_BatchedParityAndDuplicates(t *testing.T) {
+	actual := graph.New()
+	expected := graph.New()
+	for _, path := range []string{"a.go", "b.go", "c.go"} {
+		node := &graph.Node{ID: path, Kind: graph.KindFile, Name: path, FilePath: path}
+		actual.AddNode(node)
+		expected.AddNode(node)
+	}
+	pairs := []Pair{
+		{FileA: "a.go", FileB: "b.go", Count: 7, Score: 0.75},
+		{FileA: "b.go", FileB: "c.go", Count: 3, Score: 0.5},
+		{FileA: "missing.go", FileB: "a.go", Count: 9, Score: 0.9},
+		{FileA: "a.go", FileB: "a.go", Count: 2, Score: 1},
+	}
+
+	store := &recordingBatchStore{Store: actual}
+	if added := AddEdges(store, pairs, ""); added != 4 {
+		t.Fatalf("added = %d, want 4", added)
+	}
+	expected.AddEdge(coChangeEdge("a.go", "b.go", "a.go", pairs[0]))
+	expected.AddEdge(coChangeEdge("b.go", "a.go", "b.go", pairs[0]))
+	expected.AddEdge(coChangeEdge("b.go", "c.go", "b.go", pairs[1]))
+	expected.AddEdge(coChangeEdge("c.go", "b.go", "c.go", pairs[1]))
+
+	if store.addEdgeCalls != 0 {
+		t.Fatalf("AddEdge calls = %d, want 0", store.addEdgeCalls)
+	}
+	if want := []int{4}; !reflect.DeepEqual(store.batchSizes, want) {
+		t.Fatalf("batch sizes = %v, want %v", store.batchSizes, want)
+	}
+	if got, want := coChangeEdgeSet(actual), coChangeEdgeSet(expected); !reflect.DeepEqual(got, want) {
+		t.Fatalf("batched edges differ from per-edge semantics:\n got: %#v\nwant: %#v", got, want)
+	}
+
+	if added := AddEdges(store, pairs, ""); added != 4 {
+		t.Fatalf("duplicate added count = %d, want 4", added)
+	}
+	if actual.EdgeCount() != 4 {
+		t.Fatalf("edge count after duplicate insert = %d, want 4", actual.EdgeCount())
+	}
+	if want := []int{4, 4}; !reflect.DeepEqual(store.batchSizes, want) {
+		t.Fatalf("batch sizes after duplicate insert = %v, want %v", store.batchSizes, want)
+	}
+}
+
+func TestAddEdges_BoundedChunking(t *testing.T) {
+	pairCount := coChangeEdgeBatchSize/2 + 1
+	pairs := make([]Pair, 0, pairCount)
+	nodes := make([]*graph.Node, 0, pairCount*2)
+	for i := 0; i < pairCount; i++ {
+		suffix := strconv.Itoa(i) + ".go"
+		fileA := "a-" + suffix
+		fileB := "b-" + suffix
+		pairs = append(pairs, Pair{FileA: fileA, FileB: fileB, Count: i + 1, Score: 0.8})
+		nodes = append(nodes,
+			&graph.Node{ID: fileA, Kind: graph.KindFile, Name: fileA, FilePath: fileA},
+			&graph.Node{ID: fileB, Kind: graph.KindFile, Name: fileB, FilePath: fileB},
+		)
+	}
+
+	base := graph.New()
+	base.AddBatch(nodes, nil)
+	store := &recordingBatchStore{Store: base}
+	wantEdges := pairCount * 2
+	if added := AddEdges(store, pairs, ""); added != wantEdges {
+		t.Fatalf("added = %d, want %d", added, wantEdges)
+	}
+	if want := []int{coChangeEdgeBatchSize, 2}; !reflect.DeepEqual(store.batchSizes, want) {
+		t.Fatalf("batch sizes = %v, want %v", store.batchSizes, want)
+	}
+	if store.addEdgeCalls != 0 {
+		t.Fatalf("AddEdge calls = %d, want 0", store.addEdgeCalls)
+	}
+	if base.EdgeCount() != wantEdges {
+		t.Fatalf("edge count = %d, want %d", base.EdgeCount(), wantEdges)
+	}
+
+	if added := AddEdges(store, pairs, ""); added != wantEdges {
+		t.Fatalf("duplicate added count = %d, want %d", added, wantEdges)
+	}
+	if base.EdgeCount() != wantEdges {
+		t.Fatalf("edge count after duplicate insert = %d, want %d", base.EdgeCount(), wantEdges)
+	}
+	if want := []int{coChangeEdgeBatchSize, 2, coChangeEdgeBatchSize, 2}; !reflect.DeepEqual(store.batchSizes, want) {
+		t.Fatalf("batch sizes after duplicate insert = %v, want %v", store.batchSizes, want)
 	}
 }

@@ -197,7 +197,7 @@ func orderedPair(a, b string) [2]string {
 // path. Pass "" for a single-repo graph.
 //
 // Best-effort: returns (0, nil) when root is not a git repository.
-// Idempotent — graph.AddEdge dedupes, so repeated runs converge.
+// Idempotent — stores dedupe exact edge identities, so repeated runs converge.
 func EnrichGraph(g graph.Store, root, repoPrefix string) (int, error) {
 	return EnrichGraphWith(g, root, repoPrefix, Options{})
 }
@@ -211,6 +211,12 @@ func EnrichGraphWith(g graph.Store, root, repoPrefix string, opts Options) (int,
 	return AddEdges(g, res.Pairs, repoPrefix), nil
 }
 
+// coChangeEdgeBatchSize bounds the temporary edge set while filling one large
+// SQLite JSONB ingest payload per store call. Keeping this package-owned avoids
+// coupling co-change semantics to a specific backend; Graph.AddBatch uses the
+// same bounded slices without special handling.
+const coChangeEdgeBatchSize = 8 * 1024
+
 // AddEdges projects already-mined co-change pairs onto the graph as
 // symmetric EdgeCoChange edges between the matching KindFile nodes,
 // returning the number of directed edges added.
@@ -218,7 +224,7 @@ func EnrichGraphWith(g graph.Store, root, repoPrefix string, opts Options) (int,
 // repoPrefix scopes the file-node match: when set, only file nodes
 // carrying that RepoPrefix are matched, against the prefix-stripped
 // node path (the pairs hold git-relative paths). Pass "" for a
-// single-repo graph. Idempotent — graph.AddEdge dedupes.
+// single-repo graph. Idempotent — graph.AddBatch dedupes.
 func AddEdges(g graph.Store, pairs []Pair, repoPrefix string) int {
 	if g == nil || len(pairs) == 0 {
 		return 0
@@ -246,6 +252,15 @@ func AddEdges(g graph.Store, pairs []Pair, repoPrefix string) int {
 		}
 	}
 
+	edgeBatch := make([]*graph.Edge, 0, coChangeEdgeBatchSize)
+	flush := func() {
+		if len(edgeBatch) == 0 {
+			return
+		}
+		g.AddBatch(nil, edgeBatch)
+		edgeBatch = edgeBatch[:0]
+	}
+
 	added := 0
 	for _, p := range pairs {
 		idA, okA := idByPath[p.FileA]
@@ -253,10 +268,16 @@ func AddEdges(g graph.Store, pairs []Pair, repoPrefix string) int {
 		if !okA || !okB || idA == idB {
 			continue
 		}
-		g.AddEdge(coChangeEdge(idA, idB, p.FileA, p))
-		g.AddEdge(coChangeEdge(idB, idA, p.FileB, p))
+		edgeBatch = append(edgeBatch,
+			coChangeEdge(idA, idB, p.FileA, p),
+			coChangeEdge(idB, idA, p.FileB, p),
+		)
 		added += 2
+		if len(edgeBatch) >= coChangeEdgeBatchSize {
+			flush()
+		}
 	}
+	flush()
 	return added
 }
 
