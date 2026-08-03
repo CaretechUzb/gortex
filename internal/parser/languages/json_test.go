@@ -76,3 +76,22 @@ func TestJSONExtractor_LineCountingDoesNotCopySource(t *testing.T) {
 	assert.LessOrEqual(t, largeAllocs, smallAllocs+1,
 		"line counting allocations must not scale with source size")
 }
+
+func TestJSONExtractor_NestedValuesDoNotAllocateStrings(t *testing.T) {
+	extractor := NewJSONExtractor()
+	small := []byte(`{"items":["value"]}`)
+	large := append([]byte(`{"items":[`), bytes.Repeat([]byte(`"value",`), 1<<15)...)
+	large = append(large, []byte(`null]}`)...)
+
+	smallAllocs := testing.AllocsPerRun(5, func() {
+		_, err := extractor.Extract("small.json", small)
+		require.NoError(t, err)
+	})
+	largeAllocs := testing.AllocsPerRun(5, func() {
+		_, err := extractor.Extract("large.json", large)
+		require.NoError(t, err)
+	})
+
+	assert.LessOrEqual(t, largeAllocs, smallAllocs+1,
+		"nested JSON values must remain byte windows rather than allocated strings")
+}
