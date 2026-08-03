@@ -16,8 +16,14 @@ func (cr *CrossRepoResolver) ResolveFilesAndIncoming(filePaths []string) *CrossR
 // materialization. Keeping both roles under one lock still shares the expensive
 // workspace indexes without feeding every semantic edge back through resolution.
 func (cr *CrossRepoResolver) ResolveMutationFiles(resolutionFiles, materializationFiles []string) *CrossRepoStats {
+	return cr.ResolveMutationFrontiers(resolutionFiles, materializationFiles, materializationFiles)
+}
+
+// ResolveMutationFrontiers preserves the distinct edge-source and changed-
+// definition roles through candidate selection.
+func (cr *CrossRepoResolver) ResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) *CrossRepoStats {
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
-	if cr == nil || cr.graph == nil || len(resolutionFiles) == 0 && len(materializationFiles) == 0 {
+	if cr == nil || cr.graph == nil || len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
 		return stats
 	}
 
@@ -43,7 +49,7 @@ func (cr *CrossRepoResolver) ResolveMutationFiles(resolutionFiles, materializati
 			stats = cr.resolveScopedLocked(pending)
 		}
 	}
-	DetectCrossRepoEdgesForFiles(cr.graph, materializationFiles)
+	DetectCrossRepoEdgesForMutationFiles(cr.graph, edgeSourceFiles, definitionFiles)
 	return stats
 }
 
@@ -52,8 +58,14 @@ func (cr *CrossRepoResolver) ResolveMutationFiles(resolutionFiles, materializati
 // incoming and outgoing edges covers unchanged callers rebound to a changed
 // target as well as new calls emitted by the changed source file.
 func DetectCrossRepoEdgesForFiles(g graph.Store, filePaths []string) int {
-	if g == nil || len(filePaths) == 0 {
+	return DetectCrossRepoEdgesForMutationFiles(g, filePaths, filePaths)
+}
+
+// DetectCrossRepoEdgesForMutationFiles materializes resolved base edges using
+// the narrow query shape for each mutation role.
+func DetectCrossRepoEdgesForMutationFiles(g graph.Store, edgeSourceFiles, definitionFiles []string) int {
+	if g == nil || len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
 		return 0
 	}
-	return materializeCrossRepoCandidates(g, crossRepoCandidatesForFiles(g, filePaths))
+	return materializeCrossRepoCandidates(g, crossRepoCandidatesForMutationFiles(g, edgeSourceFiles, definitionFiles))
 }

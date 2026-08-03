@@ -2194,6 +2194,14 @@ type ScopedCrossRepoCandidates interface {
 	CrossRepoCandidatesForFiles(baseKinds []EdgeKind, filePaths []string) []CrossRepoCandidateRow
 }
 
+// MutationScopedCrossRepoCandidates is an optional role-aware refinement for a
+// coordinated mutation receipt. Edge-source files need only edges stamped with
+// those files; changed definitions need edges incident to nodes they contain.
+// Keeping the roles separate avoids three broad query arms for every file.
+type MutationScopedCrossRepoCandidates interface {
+	CrossRepoCandidatesForMutation(baseKinds []EdgeKind, edgeSourceFiles, incidentNodeFiles []string) []CrossRepoCandidateRow
+}
+
 // CrossRepoFlagMarker persists the CrossRepo flag on existing base edges in
 // one or more set-oriented backend statements. DetectCrossRepoEdges mutates
 // the returned Edge pointers for the in-memory backend; disk backends return

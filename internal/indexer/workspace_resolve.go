@@ -358,14 +358,18 @@ func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) {
 }
 
 func (mi *MultiIndexer) runCrossRepoResolveMutationFiles(resolutionFiles, materializationFiles []string) {
-	if len(resolutionFiles) == 0 && len(materializationFiles) == 0 {
+	mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, materializationFiles, materializationFiles)
+}
+
+func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) {
+	if len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
 		return
 	}
 	cr := mi.newCrossRepoResolver()
 	if cr == nil {
 		return
 	}
-	cr.ResolveMutationFiles(resolutionFiles, materializationFiles)
+	cr.ResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles)
 }
 
 // crossWorkspaceLookup builds a resolver.CrossWorkspaceDepLookup from

@@ -853,7 +853,7 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 		// Resolve only files that can create or bind unresolved edges. Resolved
 		// edge sources still materialise their cross_repo_* generation without
 		// repeating the substantially larger name-resolution frontier.
-		mi.runCrossRepoResolveMutationFiles(resolutionFiles, crossRepoFiles)
+		mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, receipt.ChangedFiles, receipt.DefinitionFiles)
 		return deferredResolveExact, true
 	}
 	if !fallbackNeeded {
