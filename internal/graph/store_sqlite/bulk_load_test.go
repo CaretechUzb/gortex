@@ -749,9 +749,18 @@ func TestCoordinatedBulkFinalSealFailureRemainsRetryable(t *testing.T) {
 	if !s.BeginCoordinatedBulkLoad() {
 		t.Fatal("coordinated fast path did not engage")
 	}
+	var failedSealCheckpoints int
+	s.bulkFinalizeObserver = func(event bulkFinalizeEvent) {
+		if event.Stage == "checkpoint_passive" && event.Name == "index_seal_edges" {
+			failedSealCheckpoints++
+		}
+	}
 	s.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"})
 	if err := s.EndCoordinatedBulkLoad(); err == nil {
 		t.Fatal("forced final seal unexpectedly succeeded")
+	}
+	if failedSealCheckpoints != 1 {
+		t.Fatalf("failed seal checkpoints = %d, want one post-edge drain", failedSealCheckpoints)
 	}
 	if s.bulkConn == nil || !s.bulkIndexesDeferred || !s.coordinatedBulkLoad {
 		t.Fatalf("failed final seal lost retry state: conn=%v deferred=%v coordinated=%v", s.bulkConn != nil, s.bulkIndexesDeferred, s.coordinatedBulkLoad)
@@ -767,6 +776,9 @@ func TestCoordinatedBulkFinalSealFailureRemainsRetryable(t *testing.T) {
 	bulkDroppableIndexes = originalIndexes
 	if err := s.EndCoordinatedBulkLoad(); err != nil {
 		t.Fatalf("final seal retry: %v", err)
+	}
+	if failedSealCheckpoints != 1 {
+		t.Fatalf("successful retry added an adjacent edge checkpoint: got %d events", failedSealCheckpoints)
 	}
 	if s.bulkConn != nil || s.bulkIndexesDeferred || s.coordinatedBulkLoad {
 		t.Fatalf("successful retry retained bulk state: conn=%v deferred=%v coordinated=%v", s.bulkConn != nil, s.bulkIndexesDeferred, s.coordinatedBulkLoad)

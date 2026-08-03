@@ -147,10 +147,11 @@ const (
 	bulkCheckpointNodeInterval = int64(64 << 10)
 	bulkCheckpointEdgeInterval = int64(256 << 10)
 
-	// The final pre-ANALYZE checkpoint is allowed one longer, still-bounded
-	// window. It runs once after all graph writes and avoids making every
-	// planner-stat traversal page through a large live WAL.
-	bulkPlannerStatsCheckpointTimeout = 5 * time.Second
+	// The final pre-ANALYZE checkpoint coalesces the former one-second
+	// post-edge attempt with the five-second planner window. One continuous
+	// attempt preserves the same total drain budget without restarting the WAL
+	// scan between two adjacent boundaries that have no intervening write.
+	bulkPlannerStatsCheckpointTimeout = 6 * time.Second
 	// The cold-load handoff must finish copying a multi-gigabyte WAL before
 	// resolver-heavy random reads begin. Routine checkpoints stay at one second;
 	// this one terminal PASSIVE drain gets a larger, still-bounded I/O window.
@@ -538,12 +539,15 @@ func (s *Store) sealBulkIndexesLocked(reason string) error {
 		if err != nil {
 			sealErr = errors.Join(sealErr, fmt.Errorf("store_sqlite: rebuild index %s: %w", idx.name, err))
 		}
-		switch idx.name {
-		case "nodes_by_repo_language_name":
+		if idx.name == "nodes_by_repo_language_name" {
 			_ = s.checkpointBulkWALPassiveLocked("index_seal_nodes")
-		case "edges_by_file":
-			_ = s.checkpointBulkWALPassiveLocked("index_seal_edges")
 		}
+	}
+	if sealErr != nil {
+		// A failed seal returns before the coalesced pre-ANALYZE checkpoint.
+		// Preserve the former post-edge drain so a retry does not inherit every
+		// frame emitted by this attempt.
+		_ = s.checkpointBulkWALPassiveLocked("index_seal_edges")
 	}
 	s.emitBulkFinalizeEvent(bulkFinalizeEvent{
 		Stage: "index_seal", Name: reason, Elapsed: time.Since(started),

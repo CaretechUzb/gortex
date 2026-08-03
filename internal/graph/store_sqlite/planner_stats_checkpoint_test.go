@@ -156,17 +156,24 @@ func TestEndCoordinatedBulkLoadDoesNotWaitForReadSnapshot(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("reader snapshot delayed cold finalization by %s", elapsed)
 	}
-	preStats, plannerStats := -1, -1
+	edgeIndex, edgeCheckpoint, preStats, plannerStats := -1, -1, -1, -1
 	for i, event := range events {
 		switch {
+		case event.Stage == "index" && event.Name == "edges_by_file":
+			edgeIndex = i
+		case event.Stage == "checkpoint_passive" && event.Name == "index_seal_edges":
+			edgeCheckpoint = i
 		case event.Stage == "checkpoint_passive" && event.Name == "planner_stats_before":
 			preStats = i
 		case event.Stage == "planner_stats":
 			plannerStats = i
 		}
 	}
-	if preStats < 0 || plannerStats < 0 || preStats >= plannerStats {
-		t.Fatalf("bulk finalization event order missing pre-stats checkpoint: %+v", events)
+	if edgeIndex < 0 || preStats < 0 || plannerStats < 0 || edgeIndex >= preStats || preStats >= plannerStats {
+		t.Fatalf("bulk finalization event order missing coalesced pre-stats checkpoint: %+v", events)
+	}
+	if edgeCheckpoint >= 0 {
+		t.Fatalf("successful seal retained adjacent edge checkpoint at event %d: %+v", edgeCheckpoint, events)
 	}
 	if checkpoint.Name != "wal_passive" {
 		t.Fatalf("final checkpoint = %q, want wal_passive", checkpoint.Name)
@@ -242,8 +249,8 @@ func TestBulkCheckpointTimeoutPolicy(t *testing.T) {
 	if walPassiveCheckpointTimeout != time.Second {
 		t.Fatalf("routine PASSIVE timeout = %s, want 1s", walPassiveCheckpointTimeout)
 	}
-	if bulkPlannerStatsCheckpointTimeout != 5*time.Second {
-		t.Fatalf("pre-stats PASSIVE timeout = %s, want 5s", bulkPlannerStatsCheckpointTimeout)
+	if bulkPlannerStatsCheckpointTimeout != 6*time.Second {
+		t.Fatalf("coalesced pre-stats PASSIVE timeout = %s, want 6s", bulkPlannerStatsCheckpointTimeout)
 	}
 	if bulkFinalCheckpointTimeout != 30*time.Second {
 		t.Fatalf("final PASSIVE timeout = %s, want 30s", bulkFinalCheckpointTimeout)
