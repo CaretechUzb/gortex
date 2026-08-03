@@ -5381,7 +5381,7 @@ func (idx *Indexer) buildSearchIndex() {
 	// table must be in place before the first Add for postings and
 	// queries to agree; it is a no-op for non-BM25 backends and a no-op
 	// for search overall unless GORTEX_SPARSE_NGRAM is set.
-	search.InstallNgramBoundaries(idx.search, search.BuildNgramBoundaries(idx.graph))
+	search.BuildAndInstallNgramBoundaries(idx.search, idx.graph)
 
 	// Build text index. The SkipSearch filter (wired through
 	// idx.shouldIndexForSearch) drops config-key-style variable nodes

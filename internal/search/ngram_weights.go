@@ -155,6 +155,19 @@ func InstallNgramBoundaries(backend Backend, table NgramBoundaries) bool {
 	return true
 }
 
+// BuildAndInstallNgramBoundaries mines and installs a boundary table only
+// when backend actually contains a BM25 layer. Capability detection must
+// precede BuildNgramBoundaries: native SQLite FTS and Bleve never consume the
+// table, and walking the whole graph for them is pure allocation and I/O.
+func BuildAndInstallNgramBoundaries(backend Backend, g graph.Reader) bool {
+	bm := bm25Of(backend)
+	if bm == nil {
+		return false
+	}
+	bm.SetNgramBoundaries(BuildNgramBoundaries(g))
+	return true
+}
+
 // bm25Of unwraps a backend down to its *BM25Backend, or returns nil
 // when the backend has no BM25 layer. Mirrors the unwrap chain the
 // engine uses for the bundle fast path: Swappable → HybridBackend →
