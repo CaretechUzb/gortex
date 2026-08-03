@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -218,6 +219,74 @@ namespace App {
 	idx.EvictFile(usingsPath)
 	assert.True(t, graph.IsUnresolvedTarget(fooCallEdgeTarget(t, g, mID)),
 		"with the global using deleted neither extension namespace is visible — the stale LibA bind must not survive the eviction")
+}
+
+// TestIncrementalBatchDelete_GlobalUsingsFileReresolvesDependents: the
+// BATCHED deletion path — the one fsnotify deletes and git branch
+// switches actually take (IncrementalReindexPaths over a file gone from
+// disk) — must re-price global-using dependents exactly like the
+// single-file eviction API does.
+func TestIncrementalBatchDelete_GlobalUsingsFileReresolvesDependents(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "W.cs"), csVisCrate)
+	writeFile(t, filepath.Join(dir, "E1.cs"), csVisExtA)
+	writeFile(t, filepath.Join(dir, "E2.cs"), csVisExtB)
+	usingsPath := filepath.Join(dir, "Usings.cs")
+	writeFile(t, usingsPath, "global using LibA;\n")
+	writeFile(t, filepath.Join(dir, "Caller.cs"), `using W;
+namespace App {
+    public class R {
+        public void M() {
+            Crate c = new Crate();
+            c.Foo();
+        }
+    }
+}
+`)
+	g, idx := newCSVisIndexer(t, dir)
+	mID := fnNodeID(t, g, "Caller.cs", "M")
+	require.Contains(t, fooCallEdgeTarget(t, g, mID), "E1.Foo",
+		"baseline: the global using narrows the call to LibA's extension")
+
+	require.NoError(t, os.Remove(usingsPath))
+	_, err := idx.IncrementalReindexPaths(dir, []string{usingsPath})
+	require.NoError(t, err)
+	assert.True(t, graph.IsUnresolvedTarget(fooCallEdgeTarget(t, g, mID)),
+		"the batched deletion path removed the unit's visibility — the stale LibA bind must not survive")
+}
+
+// TestIncrementalDeferredFallback_GlobalUsingEditReresolvesDependents:
+// a file that cannot enter the prepared structural batch falls back to
+// indexFile(resolve=false) under a deferred batch — the deferred
+// catch-up re-resolves only the file's own frontier, so the unit-wide
+// dependents re-price must still run on this exceptional path.
+func TestIncrementalDeferredFallback_GlobalUsingEditReresolvesDependents(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "W.cs"), csVisCrate)
+	writeFile(t, filepath.Join(dir, "E1.cs"), csVisExtA)
+	writeFile(t, filepath.Join(dir, "E2.cs"), csVisExtB)
+	usingsPath := filepath.Join(dir, "Usings.cs")
+	writeFile(t, usingsPath, "global using LibA;\n")
+	writeFile(t, filepath.Join(dir, "Caller.cs"), `using W;
+namespace App {
+    public class R {
+        public void M() {
+            Crate c = new Crate();
+            c.Foo();
+        }
+    }
+}
+`)
+	g, idx := newCSVisIndexer(t, dir)
+	mID := fnNodeID(t, g, "Caller.cs", "M")
+	require.Contains(t, fooCallEdgeTarget(t, g, mID), "E1.Foo",
+		"baseline: the global using narrows the call to LibA's extension")
+
+	writeFile(t, usingsPath, "global using LibB;\n")
+	require.NoError(t, idx.indexFile(usingsPath, false,
+		&reparsePendingEnrichmentBatch{deferResolverCatchup: true}))
+	assert.Contains(t, fooCallEdgeTarget(t, g, mID), "E2.Foo",
+		"the fallback path changed unit-wide visibility — dependents must re-bind to E2")
 }
 
 // TestIncrementalSave_GlobalUsingStaticEditReresolvesDependents: the

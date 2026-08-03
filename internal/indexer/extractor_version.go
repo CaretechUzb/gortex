@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -157,7 +159,14 @@ func (idx *Indexer) extractorVersionStaleLangSet() map[string]struct{} {
 		return nil
 	}
 	st, found, err := r.GetRepoIndexState(idx.repoPrefix)
-	if err != nil || !found {
+	if err != nil {
+		// Fail-safe (no restage this pass) but not silent: the ledger
+		// would otherwise report the tree clean while stale extractions
+		// persist until an unrelated edit.
+		idx.logger.Warn("extractor version state read failed; skipping restage check", zap.Error(err))
+		return nil
+	}
+	if !found {
 		return nil
 	}
 	langs := ExtractorVersionStaleLangs(st.ExtractorVersions)

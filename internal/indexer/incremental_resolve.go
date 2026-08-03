@@ -266,10 +266,13 @@ func csharpVisibilityStampForNodes(nodes []*graph.Node) csharpVisibilityStamp {
 // restubCSharpExtensionBinds rewrites the resolved extension-method
 // out-edges of the given files back to unresolved member stubs so a
 // scoped re-resolve re-runs the type-directed extension rule under the
-// CURRENT visibility. Only extension binds are priced on using
-// visibility this way; ordinary binds key on symbol identity and
-// survive a using edit. The edges keep their receiver stamps and the
-// extension tag, which routes them straight back through the rule.
+// CURRENT visibility. Extension binds are the re-priced set here;
+// visibility also feeds type-reference narrowing, whose already-
+// resolved edges are NOT restubbed (known simplification — a global
+// using swap between same-named types keeps the old type-ref target
+// until the referencing file is next edited). The edges keep their
+// receiver stamps and the extension tag, which routes them straight
+// back through the rule.
 func (idx *Indexer) restubCSharpExtensionBinds(files []string) int {
 	var batch []graph.EdgeReindex
 	for _, f := range files {
@@ -351,17 +354,17 @@ func (idx *Indexer) reresolveCSharpGlobalUsingDependents(changed []string, exclu
 	sort.Strings(deps)
 	idx.restubCSharpExtensionBinds(deps)
 	// The changed files ride along so the resolve entry reconciles THEIR
-	// stamps before the dependents re-narrow — on a deferred batch the
-	// main catch-up naming them runs only after this. Their own pending
-	// edges resolve there; here they mostly hit the no-pending early
-	// return.
+	// stamps before the dependents re-narrow. On a non-deferred save
+	// their pending edges were already resolved and they hit the
+	// no-pending early return; on a deferred batch they resolve here,
+	// and the later catch-up naming them becomes the cheap no-op.
 	resolveList := deps
 	for _, f := range changed {
 		if _, dup := depSet[f]; !dup {
 			resolveList = append(resolveList, f)
 		}
 	}
-	idx.observeIncrementalCatchup("resolve", deps)
+	idx.observeIncrementalCatchup("resolve", resolveList)
 	idx.resolver.ResolveFilesAndIncoming(resolveList)
 }
 
