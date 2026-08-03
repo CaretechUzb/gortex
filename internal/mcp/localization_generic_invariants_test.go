@@ -239,6 +239,46 @@ func TestRecoveryInterceptionCannotInvalidateConcurrentNewUserLocalizeReservatio
 	})
 }
 
+// A reserved read that ends in the advisory release commits, and committing
+// bumps the generation that a concurrently reserved localize staged against.
+// The newer request owns the session's next contract; the finishing read must
+// not silently discard it.
+func TestAdvisoryReleaseCannotInvalidateConcurrentLocalizeReservation(t *testing.T) {
+	state := newLocalizationTerminalState()
+	state.armForTask(newLocalizationRecoveryCompletion(), "old task")
+
+	blocked, readToken := state.authorizeWithToken("search", "text",
+		map[string]any{"query": "old task"})
+	if blocked != nil || readToken == 0 {
+		t.Fatalf("recovery authorization = (%#v, %d), want a reserved read token", blocked, readToken)
+	}
+
+	localizeToken, refused := state.beginLocalize("replacement task", true)
+	if localizeToken == 0 || refused != nil {
+		t.Fatalf("replacement reservation = (%d, %#v)", localizeToken, refused)
+	}
+	state.armForTask(newLocalizationCompletion(true, ""), "replacement task")
+
+	// The recovery page returns evidence that does not prove a task-aligned
+	// declaration, so the bounded workflow ends advisory, not answer_ready.
+	completion := state.finishReservedReadTokenWithDigest(readToken, true,
+		[]localizationDigestRow{{ID: "fixture/other.go::Other.Run", File: "fixture/other.go", Name: "Run"}},
+		true)
+	if completion.State == localizationStateAnswerReady {
+		t.Fatalf("weak recovery terminalized: %#v", completion)
+	}
+
+	if !state.finishLocalize(localizeToken, true) {
+		t.Fatal("advisory release invalidated the concurrently reserved localize")
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.state != localizationStateAnswerReady || state.reservation != nil {
+		t.Fatalf("replacement completion was not committed: state=%q reservation=%#v",
+			state.state, state.reservation)
+	}
+}
+
 func TestAcceptedEmptyRecoveryReleasesAdvisorySession(t *testing.T) {
 	state := newLocalizationTerminalState()
 	completion := newLocalizationRecoveryCompletion()

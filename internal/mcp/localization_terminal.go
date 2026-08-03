@@ -566,7 +566,15 @@ func (s *localizationTerminalState) releaseLocalizationAdvisoryLocked(
 		digest = s.digest
 	}
 	taskLead := s.taskLead
-	s.commitLocalizationLocked(newLocalizationOpenCompletion(), "")
+	// Releasing commits, and committing bumps the generation. A localize that
+	// is already in flight staged its contract against the generation it
+	// reserved, so bumping here would make finishLocalize discard the newer
+	// request in favour of this finishing call's advisory state. The reserved
+	// localize owns the session's next contract; leave the state for it to
+	// replace and return the advisory page for this response only.
+	if s.reservation == nil {
+		s.commitLocalizationLocked(newLocalizationOpenCompletion(), "")
+	}
 	completion := newLocalizationAdvisoryCompletion()
 	completion.taskLead = taskLead
 	completion.digest = digest
