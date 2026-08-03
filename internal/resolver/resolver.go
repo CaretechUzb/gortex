@@ -1526,7 +1526,8 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// the name-only guess; this pass fans it out to every override in the
 	// hierarchy, the call-hierarchy semantics the language server presents.
 	// Runs after the guard so its ast_inferred edges are never reverted.
-	r.resolveJavaOverrideDispatch()
+	overrideDispatchCandidates := r.collectOverrideDispatchCandidates()
+	r.resolveJavaOverrideDispatchCandidates(overrideDispatchCandidates)
 	ld5 := time.Now()
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
@@ -1536,7 +1537,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// left unresolved via the class hierarchy — parent::/self:: up the extends
 	// chain, and interface/abstract/trait override families fanned out to
 	// every implementation. Same post-guard placement as the Java pass.
-	r.resolvePHPOverrideDispatch()
+	r.resolvePHPOverrideDispatchCandidates(overrideDispatchCandidates)
 	ld6 := time.Now()
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)

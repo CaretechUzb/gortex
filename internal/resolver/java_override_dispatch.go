@@ -29,6 +29,10 @@ const javaOverrideDispatchCap = 8
 // `unresolved::*` state also clears the ambiguous_multi_match classification.
 // Scoped to Java so Go/TS/Python dispatch presentation is unchanged.
 func (r *Resolver) resolveJavaOverrideDispatch() int {
+	return r.resolveJavaOverrideDispatchCandidates(r.collectOverrideDispatchCandidates())
+}
+
+func (r *Resolver) resolveJavaOverrideDispatchCandidates(candidates overrideDispatchCandidates) int {
 	g := r.graph
 	if g == nil {
 		return 0
@@ -44,8 +48,8 @@ func (r *Resolver) resolveJavaOverrideDispatch() int {
 		others []*graph.Node
 	}
 	var jobs []fanout
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if e == nil || e.IsSpeculative() {
+	for e := range candidates.javaEdges(g) {
+		if e == nil || e.Kind != graph.EdgeCalls || e.IsSpeculative() {
 			continue
 		}
 		// Scoped warm pass: an unchanged repo's calls were already dispatched (or
@@ -58,9 +62,13 @@ func (r *Resolver) resolveJavaOverrideDispatch() int {
 		if name == "" || strings.HasSuffix(name, ".<init>") {
 			continue
 		}
-		caller := r.cachedGetNode(e.From)
-		if caller == nil || caller.Language != "java" {
-			continue
+		// SQLite joined caller language in the compact census. Adapters without
+		// exact identity lookup retain the historical hydration gate.
+		if !candidates.exact {
+			caller := r.cachedGetNode(e.From)
+			if caller == nil || caller.Language != "java" {
+				continue
+			}
 		}
 		cands := javaOverrideCandidates(r.cachedFindNodesByNameInRepo(name, r.callerRepoPrefix(e)))
 		if len(cands) < 2 || len(cands) > javaOverrideDispatchCap {
