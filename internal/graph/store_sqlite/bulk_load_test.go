@@ -422,15 +422,16 @@ func TestBulkLoadRowCadenceCheckpointsBeforeSeal(t *testing.T) {
 	}
 }
 
-func TestBulkLoadCheckpointCadenceContinuesAfterSeal(t *testing.T) {
+func TestUncoordinatedBulkLoadSealsAtRowLimitAndKeepsCheckpointing(t *testing.T) {
 	s, _ := openTempStore(t)
-	if !s.BeginCoordinatedBulkLoad() {
-		t.Fatal("coordinated fast path did not engage")
+	s.BeginBulkLoad()
+	if s.bulkConn == nil {
+		t.Fatal("ordinary bulk fast path did not engage")
 	}
 	s.bulkDeferredNodeRows = bulkIndexSealNodeLimit - 1
 	s.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"})
 	if s.bulkIndexesDeferred {
-		t.Fatal("node threshold did not seal dense indexes")
+		t.Fatal("ordinary bulk load did not seal dense indexes at node threshold")
 	}
 
 	var checkpoints []bulkFinalizeEvent
@@ -447,12 +448,13 @@ func TestBulkLoadCheckpointCadenceContinuesAfterSeal(t *testing.T) {
 	if s.bulkCheckpointNodeRows != 0 || s.bulkCheckpointEdgeRows != 0 {
 		t.Fatalf("post-seal checkpoint counters not reset: nodes=%d edges=%d", s.bulkCheckpointNodeRows, s.bulkCheckpointEdgeRows)
 	}
-	if err := s.EndCoordinatedBulkLoad(); err != nil {
-		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
+	if err := s.FlushBulk(); err != nil {
+		t.Fatalf("FlushBulk: %v", err)
 	}
+	integrityOK(t, s.db)
 }
 
-func TestCoordinatedBulkLoadSealsOnceAtDeterministicRowLimit(t *testing.T) {
+func TestCoordinatedBulkLoadDefersSealPastDeterministicRowLimit(t *testing.T) {
 	s, _ := openTempStore(t)
 	if !s.BeginCoordinatedBulkLoad() {
 		t.Fatal("coordinated fast path did not engage")
@@ -465,36 +467,107 @@ func TestCoordinatedBulkLoadSealsOnceAtDeterministicRowLimit(t *testing.T) {
 			seals = append(seals, event)
 		}
 	}
+	batchReceipt := s.BeginMutationReceipt()
 	s.AddBatch([]*graph.Node{{
 		ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A",
 		FilePath: "repo/a.go", RepoPrefix: "repo",
 	}}, nil)
-	if s.bulkIndexesDeferred {
-		t.Fatal("node threshold did not seal dense indexes")
+	if receipt := s.EndMutationReceipt(batchReceipt); !receipt.Complete {
+		t.Fatalf("deferred batch receipt unexpectedly incomplete: %+v", receipt)
+	}
+	if !s.bulkIndexesDeferred {
+		t.Fatal("coordinated bulk load sealed dense indexes at inner row threshold")
 	}
 	if s.bulkConn == nil || !s.coordinatedBulkLoad {
-		t.Fatal("threshold seal closed the coordinated writer window")
+		t.Fatal("row threshold closed the coordinated writer window")
 	}
-	gotSync, err := pragmaInt(context.Background(), s.bulkConn, "synchronous")
-	if err != nil {
-		t.Fatalf("read synchronous after early seal: %v", err)
+	if len(seals) != 0 {
+		t.Fatalf("coordinated row threshold sealed indexes: %+v", seals)
 	}
-	if got := gotSync; got != 0 {
-		t.Fatalf("synchronous after early seal = %d, want OFF", got)
+	present := indexNames(t, &connQuerier{ctx: context.Background(), c: s.bulkConn})
+	for _, idx := range bulkDroppableIndexes {
+		if present[idx.name] {
+			t.Fatalf("index %s rebuilt at coordinated row threshold", idx.name)
+		}
 	}
 	if err := s.FlushBulk(); err != nil {
 		t.Fatalf("nested FlushBulk after threshold: %v", err)
 	}
+	if !s.bulkIndexesDeferred || len(seals) != 0 {
+		t.Fatalf("nested flush sealed coordinated indexes: deferred=%v seals=%+v", s.bulkIndexesDeferred, seals)
+	}
+
+	// Final index DDL deliberately fails active receipts closed. Deferral must
+	// move that invalidation to the outer boundary, not silently omit it.
+	finalReceipt := s.BeginMutationReceipt()
 	if err := s.EndCoordinatedBulkLoad(); err != nil {
 		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
 	}
-	if len(seals) != 1 || seals[0].Name != "node_limit" || seals[0].NodeRows != bulkIndexSealNodeLimit {
-		t.Fatalf("seal events = %+v, want one node_limit event at %d", seals, bulkIndexSealNodeLimit)
+	if receipt := s.EndMutationReceipt(finalReceipt); receipt.Complete {
+		t.Fatalf("final index seal returned complete receipt: %+v", receipt)
+	}
+	if len(seals) != 1 || seals[0].Name != "final" || seals[0].NodeRows != bulkIndexSealNodeLimit {
+		t.Fatalf("seal events = %+v, want one final event at %d rows", seals, bulkIndexSealNodeLimit)
+	}
+	if s.bulkIndexesDeferred || s.bulkConn != nil || s.coordinatedBulkLoad {
+		t.Fatalf("final boundary retained bulk state: deferred=%v conn=%v coordinated=%v", s.bulkIndexesDeferred, s.bulkConn != nil, s.coordinatedBulkLoad)
+	}
+	for _, idx := range bulkDroppableIndexes {
+		if !indexNames(t, s.db)[idx.name] {
+			t.Fatalf("index %s missing after final coordinated seal", idx.name)
+		}
 	}
 	integrityOK(t, s.db)
 }
 
-func TestCoordinatedBulkSealFailureRetriesAtFinalBoundary(t *testing.T) {
+func TestCoordinatedBulkLoadDeferralIsDurableAfterReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "coordinated.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			_ = s.Close()
+		}
+	})
+	if !s.BeginCoordinatedBulkLoad() {
+		t.Fatal("coordinated fast path did not engage")
+	}
+	nodes, edges := bulkFixture(128, 256)
+	s.bulkDeferredEdgeRows = bulkIndexSealEdgeLimit - int64(len(edges))
+	s.AddBatch(nodes, edges)
+	if !s.bulkIndexesDeferred {
+		t.Fatal("coordinated edge threshold sealed indexes before outer end")
+	}
+	if err := s.EndCoordinatedBulkLoad(); err != nil {
+		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
+	}
+	wantNodes, wantEdges := s.NodeCount(), s.EdgeCount()
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	closed = true
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if gotNodes, gotEdges := reopened.NodeCount(), reopened.EdgeCount(); gotNodes != wantNodes || gotEdges != wantEdges {
+		t.Fatalf("reopened counts (%d, %d), want (%d, %d)", gotNodes, gotEdges, wantNodes, wantEdges)
+	}
+	present := indexNames(t, reopened.db)
+	for _, idx := range bulkDroppableIndexes {
+		if !present[idx.name] {
+			t.Fatalf("index %s missing after coordinated reopen", idx.name)
+		}
+	}
+	integrityOK(t, reopened.db)
+}
+
+func TestCoordinatedBulkFinalSealFailureRemainsRetryable(t *testing.T) {
 	s, _ := openTempStore(t)
 	originalIndexes := bulkDroppableIndexes
 	bulkDroppableIndexes = append(append([]bulkDroppableIndex(nil), originalIndexes...), bulkDroppableIndex{
@@ -506,6 +579,53 @@ func TestCoordinatedBulkSealFailureRetriesAtFinalBoundary(t *testing.T) {
 	if !s.BeginCoordinatedBulkLoad() {
 		t.Fatal("coordinated fast path did not engage")
 	}
+	s.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"})
+	if err := s.EndCoordinatedBulkLoad(); err == nil {
+		t.Fatal("forced final seal unexpectedly succeeded")
+	}
+	if s.bulkConn == nil || !s.bulkIndexesDeferred || !s.coordinatedBulkLoad {
+		t.Fatalf("failed final seal lost retry state: conn=%v deferred=%v coordinated=%v", s.bulkConn != nil, s.bulkIndexesDeferred, s.coordinatedBulkLoad)
+	}
+	gotSync, err := pragmaInt(context.Background(), s.bulkConn, "synchronous")
+	if err != nil {
+		t.Fatalf("read synchronous after failed final seal: %v", err)
+	}
+	if gotSync != 0 {
+		t.Fatalf("synchronous after failed final seal = %d, want OFF", gotSync)
+	}
+
+	bulkDroppableIndexes = originalIndexes
+	if err := s.EndCoordinatedBulkLoad(); err != nil {
+		t.Fatalf("final seal retry: %v", err)
+	}
+	if s.bulkConn != nil || s.bulkIndexesDeferred || s.coordinatedBulkLoad {
+		t.Fatalf("successful retry retained bulk state: conn=%v deferred=%v coordinated=%v", s.bulkConn != nil, s.bulkIndexesDeferred, s.coordinatedBulkLoad)
+	}
+	present := indexNames(t, s.db)
+	for _, idx := range originalIndexes {
+		if !present[idx.name] {
+			t.Fatalf("index %s missing after final seal retry", idx.name)
+		}
+	}
+	if got := s.NodeCount(); got != 1 {
+		t.Fatalf("node count after final seal retry = %d, want 1", got)
+	}
+	integrityOK(t, s.db)
+}
+
+func TestUncoordinatedBulkSealFailureRetriesAtFlushBoundary(t *testing.T) {
+	s, _ := openTempStore(t)
+	originalIndexes := bulkDroppableIndexes
+	bulkDroppableIndexes = append(append([]bulkDroppableIndex(nil), originalIndexes...), bulkDroppableIndex{
+		name: "forced_bad_index",
+		ddl:  `CREATE INDEX forced_bad_index ON definitely_missing_table(id)`,
+	})
+	defer func() { bulkDroppableIndexes = originalIndexes }()
+
+	s.BeginBulkLoad()
+	if s.bulkConn == nil {
+		t.Fatal("ordinary bulk fast path did not engage")
+	}
 	s.bulkDeferredNodeRows = bulkIndexSealNodeLimit - 1
 	if _, err := s.addBatchSetOriented([]*graph.Node{{
 		ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A",
@@ -516,18 +636,19 @@ func TestCoordinatedBulkSealFailureRetriesAtFinalBoundary(t *testing.T) {
 		t.Fatal("failed seal did not retain retryable bulk state")
 	}
 
-	// Remove the injected failure. End must retry, close the pinned connection,
+	// Remove the injected failure. Flush must retry, close the pinned connection,
 	// restore durability and leave every production index present.
 	bulkDroppableIndexes = originalIndexes
-	if err := s.EndCoordinatedBulkLoad(); err != nil {
-		t.Fatalf("final retry: %v", err)
+	if err := s.FlushBulk(); err != nil {
+		t.Fatalf("flush retry: %v", err)
 	}
 	if s.bulkConn != nil || s.bulkIndexesDeferred {
-		t.Fatal("final retry did not clean bulk state")
+		t.Fatal("flush retry did not clean bulk state")
 	}
+	present := indexNames(t, s.db)
 	for _, idx := range originalIndexes {
-		if !indexNames(t, s.db)[idx.name] {
-			t.Fatalf("index %s missing after final retry", idx.name)
+		if !present[idx.name] {
+			t.Fatalf("index %s missing after flush retry", idx.name)
 		}
 	}
 	integrityOK(t, s.db)

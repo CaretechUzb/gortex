@@ -131,10 +131,12 @@ var bulkAlwaysLiveIndexes = []bulkDroppableIndex{
 	{"nodes_go_receiver_type", `CREATE INDEX IF NOT EXISTS nodes_go_receiver_type ON nodes(repo_prefix, file_dir, name, id) WHERE language = 'go' AND kind IN ('type', 'interface') AND name <> '' AND file_path <> ''`},
 }
 
-// A cold load gets a substantial unindexed head, but never accumulates an
-// unbounded serial CREATE INDEX tail. WAL pressure is checkpointed at smaller
-// independent intervals, so index-seal thresholds can reflect rebuild cost
-// instead of doubling as checkpoint cadence.
+// An ordinary cold load gets a substantial unindexed head, but never accumulates
+// an unbounded serial CREATE INDEX tail. A coordinated multi-repository cold
+// load defers the dense-index rebuild to its explicit outer boundary so later
+// repository drains do not pay per-row maintenance on already-dense indexes.
+// WAL pressure is checkpointed at smaller independent intervals in both modes,
+// so index-seal thresholds do not double as checkpoint cadence.
 const (
 	bulkIndexSealNodeLimit = int64(512 << 10)
 	bulkIndexSealEdgeLimit = int64(1 << 20)
@@ -400,6 +402,15 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 	}
 	hadBulk := s.bulkConn != nil
 	sealErr := s.sealBulkIndexesLocked("final")
+	if sealErr != nil {
+		// Keep the pinned connection, deferred-index state, and outer boundary
+		// live so an explicit retry can finish the same durable load. Closing the
+		// connection here would make the failed DDL impossible to retry because
+		// sealBulkIndexesLocked intentionally requires the pinned bulk writer.
+		s.coordinatedBulkLoad = true
+		s.writeMu.Unlock()
+		return sealErr
+	}
 	// Give the accumulated WAL one longer, still-bounded PASSIVE drain before
 	// planner statistics traverse the large graph indexes. This runs on the
 	// pinned writer under writeMu, so no mutation can race it; PASSIVE still
@@ -460,11 +471,19 @@ func (s *Store) noteBulkRowsLocked(nodeRows, edgeRows int) error {
 	if s.bulkIndexesDeferred {
 		s.bulkDeferredNodeRows += nodeDelta
 		s.bulkDeferredEdgeRows += edgeDelta
-		switch {
-		case s.bulkDeferredNodeRows >= bulkIndexSealNodeLimit:
-			sealReason = "node_limit"
-		case s.bulkDeferredEdgeRows >= bulkIndexSealEdgeLimit:
-			sealReason = "edge_limit"
+		// The coordinated window is itself a bounded lifecycle: its outer end
+		// is the only dense-index boundary. Sealing at an inner row threshold
+		// makes every later repository maintain the full index set per row,
+		// defeating the point of coordinating the cold load. Ordinary one-shot
+		// bulk loads retain the threshold as protection against an unbounded
+		// final CREATE INDEX tail.
+		if !s.coordinatedBulkLoad {
+			switch {
+			case s.bulkDeferredNodeRows >= bulkIndexSealNodeLimit:
+				sealReason = "node_limit"
+			case s.bulkDeferredEdgeRows >= bulkIndexSealEdgeLimit:
+				sealReason = "edge_limit"
+			}
 		}
 	}
 	if sealReason != "" {
@@ -483,9 +502,9 @@ func (s *Store) bulkCheckpointIntervalsLocked() (nodeRows, edgeRows int64) {
 }
 
 // sealBulkIndexesLocked rebuilds the deferred dense indexes without restoring
-// pragmas or releasing the pinned writer. A cold load therefore pays one
-// bounded rebuild early, then retains synchronous=OFF and FTS deferral for the
-// remaining ingest. A failed attempt remains pending and can be retried.
+// pragmas or releasing the pinned writer. Ordinary bulk loads may pay one
+// bounded rebuild at a row threshold; coordinated loads rebuild only at their
+// explicit outer boundary. A failed attempt remains pending and can be retried.
 func (s *Store) sealBulkIndexesLocked(reason string) error {
 	conn := s.bulkConn
 	if conn == nil || !s.bulkIndexesDeferred {
