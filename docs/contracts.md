@@ -18,7 +18,7 @@ contracts {action: "check"}      # find mismatches and orphans
 | **GraphQL** | Schema type/field definitions | Schema | Query/mutation strings |
 | **Message topics** | Pub/sub patterns across Kafka, RabbitMQ, NATS, and Redis (`KindTopic` nodes, `produces_topic` / `consumes_topic` edges); dynamic topic names suppressed | Publish calls | Subscribe calls |
 | **WebSocket** | Event emit/listen patterns | `emit()` | `on()` |
-| **Env vars** | `os.Getenv`, `process.env`, `.env` files | `Setenv` / `.env` | `Getenv` / `process.env` |
+| **Env vars** | `os.Getenv`, `process.env`, `.env` files, Terraform `aws_lambda_function` `environment.variables` | `Setenv` / `.env` / Terraform `environment.variables` key | `Getenv` / `process.env` |
 | **OpenAPI** | Swagger/OpenAPI spec files | Spec paths | (linked to HTTP routes) |
 | **Temporal workflows** | Go SDK `worker.RegisterActivity(WithOptions)` / `RegisterActivities` / Java `@ActivityInterface` / `@WorkflowInterface` annotations | Activity / workflow function (carries `temporal_role` Meta) | `workflow.ExecuteActivity` / `ExecuteChildWorkflow` / `client.ExecuteWorkflow` / handler & signal/query calls |
 
