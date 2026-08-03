@@ -1,7 +1,7 @@
 package languages
 
 import (
-	"strings"
+	"bytes"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
@@ -19,12 +19,12 @@ func (e *JSONExtractor) Language() string     { return "json" }
 func (e *JSONExtractor) Extensions() []string { return []string{".json", ".json5", ".jsonc"} }
 
 func (e *JSONExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
-	lines := strings.Split(string(src), "\n")
+	endLine := bytes.Count(src, []byte{'\n'}) + 1
 	result := &parser.ExtractionResult{}
 
 	fileNode := &graph.Node{
 		ID: filePath, Kind: graph.KindFile, Name: filePath,
-		FilePath: filePath, StartLine: 1, EndLine: len(lines),
+		FilePath: filePath, StartLine: 1, EndLine: endLine,
 		Language: "json",
 	}
 	result.Nodes = append(result.Nodes, fileNode)
