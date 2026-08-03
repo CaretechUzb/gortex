@@ -92,15 +92,6 @@ func (idx *Indexer) merkleStaleFiles(rootAbs string, diskFiles map[string]bool) 
 	return stale
 }
 
-// saveMerkleBaseline builds and persists the Merkle tree after a full
-// index, so the next incremental pass diffs against a content-addressed
-// baseline rather than treating every file as changed. It returns the
-// tree root — the workspace fingerprint recorded in repo_index_state and
-// used to short-circuit the global derivation passes when nothing moved.
-func (idx *Indexer) saveMerkleBaseline(rootAbs string, absFiles []string) string {
-	return idx.saveMerkleBaselineWithKnownFiles(rootAbs, absFiles, nil)
-}
-
 func (idx *Indexer) saveMerkleBaselineWithKnownFiles(
 	rootAbs string,
 	absFiles []string,
