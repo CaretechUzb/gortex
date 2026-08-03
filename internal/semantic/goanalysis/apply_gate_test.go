@@ -2,234 +2,166 @@ package goanalysis
 
 import (
 	"context"
-	"runtime"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/tools/go/packages"
 
 	"github.com/zzet/gortex/internal/graph"
 )
 
-func TestFullRepoApplyGateCancellationDoesNotConsumeSlot(t *testing.T) {
-	provider := newTestProvider(t)
-	firstRelease, err := provider.acquireFullRepoApply(context.Background())
-	require.NoError(t, err)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err = provider.acquireFullRepoApply(ctx)
-	require.ErrorIs(t, err, context.Canceled)
-
-	firstRelease()
-	finalRelease, err := provider.acquireFullRepoApply(context.Background())
-	require.NoError(t, err, "a cancelled waiter must not consume the apply slot")
-	finalRelease()
+// detachedApplyStore exposes the repository binding replacement as a precise
+// apply boundary. Its embedded store still supplies the real ResolveMutex and
+// graph operations used by the rest of enrichment.
+type detachedApplyStore struct {
+	graph.Store
+	entered       chan struct{}
+	release       <-chan struct{}
+	beforeReplace func()
+	enteredOnce   sync.Once
 }
 
-func TestCompilerAdmissionReleasesBeforeFullApplyWait(t *testing.T) {
-	provider := newTestProvider(t)
-	blockApply, err := provider.acquireFullRepoApply(context.Background())
-	require.NoError(t, err)
-	defer blockApply()
+func (s *detachedApplyStore) ReplaceSemanticBindingTypes(string, []graph.SemanticBindingType) error {
+	if s.beforeReplace != nil {
+		s.beforeReplace()
+	}
+	s.enteredOnce.Do(func() { close(s.entered) })
+	<-s.release
+	return nil
+}
 
-	releaseCompilerAdmission, err := provider.acquireHeavy(context.Background(), true)
-	require.NoError(t, err)
-	compilerReleased := make(chan struct{})
-	transitionDone := make(chan error, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func (*detachedApplyStore) ReplaceSemanticBindingTypesForFiles(
+	string,
+	[]string,
+	[]graph.SemanticBindingType,
+) error {
+	return nil
+}
 
-	go func() {
-		releaseApply, _, transitionErr := provider.transitionToFullRepoApply(ctx, func() {
-			releaseCompilerAdmission()
-			close(compilerReleased)
-		})
-		if releaseApply != nil {
-			releaseApply()
-		}
-		transitionDone <- transitionErr
-	}()
+func (*detachedApplyStore) DeleteSemanticBindingTypesByFiles(string, []string) error {
+	return nil
+}
 
-	select {
-	case <-compilerReleased:
-	case <-time.After(time.Second):
-		t.Fatal("compiler admission remained held while the apply gate was queued")
+func TestCanceledDetachedApplyDoesNotSerializeAnotherStore(t *testing.T) {
+	provider := newDetachedApplyTestProvider(t)
+	firstRoot := newDetachedApplyTestRoot(t, "example.com/first")
+	secondRoot := newDetachedApplyTestRoot(t, "example.com/second")
+	firstRelease := make(chan struct{})
+	secondRelease := make(chan struct{})
+	firstStore := &detachedApplyStore{
+		Store:   graph.New(),
+		entered: make(chan struct{}),
+		release: firstRelease,
+	}
+	secondStore := &detachedApplyStore{
+		Store:   graph.New(),
+		entered: make(chan struct{}),
+		release: secondRelease,
 	}
 
-	admissionCtx, admissionCancel := context.WithTimeout(context.Background(), time.Second)
-	defer admissionCancel()
-	nextCompilerRelease, err := provider.acquireHeavy(admissionCtx, true)
-	require.NoError(t, err, "the next compiler must be admitted while detached apply is queued")
-	nextCompilerRelease()
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstResult := runDetachedApplyTestEnrichment(
+		provider, firstCtx, firstStore, "first", firstRoot,
+	)
+	waitForDetachedApplyStore(t, firstStore.entered)
+	cancelFirst()
 
-	cancel()
-	require.ErrorIs(t, <-transitionDone, context.Canceled)
+	secondResult := runDetachedApplyTestEnrichment(
+		provider, context.Background(), secondStore, "second", secondRoot,
+	)
+	waitForDetachedApplyStore(t, secondStore.entered)
+
+	close(secondRelease)
+	close(firstRelease)
+	require.ErrorIs(t, waitForDetachedApplyResult(t, firstResult), context.Canceled)
+	require.NoError(t, waitForDetachedApplyResult(t, secondResult))
 }
 
-func TestFullRepoApplyGatePreventsApplyOverlap(t *testing.T) {
-	provider := newTestProvider(t)
-	var active atomic.Int32
-	var maximum atomic.Int32
-	firstEntered := make(chan struct{})
-	secondAttempting := make(chan struct{})
-	secondEntered := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	var workers sync.WaitGroup
-	workers.Add(2)
-
-	go func() {
-		defer workers.Done()
-		release, err := provider.acquireFullRepoApply(context.Background())
-		require.NoError(t, err)
-		defer release()
-		now := active.Add(1)
-		maximum.CompareAndSwap(0, now)
-		close(firstEntered)
-		<-releaseFirst
-		active.Add(-1)
-	}()
-
-	<-firstEntered
-	go func() {
-		defer workers.Done()
-		close(secondAttempting)
-		release, err := provider.acquireFullRepoApply(context.Background())
-		require.NoError(t, err)
-		defer release()
-		now := active.Add(1)
-		for old := maximum.Load(); now > old && !maximum.CompareAndSwap(old, now); old = maximum.Load() {
-		}
-		close(secondEntered)
-		active.Add(-1)
-	}()
-
-	<-secondAttempting
-	select {
-	case <-secondEntered:
-		t.Fatal("two full-repository apply sections overlapped")
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(releaseFirst)
-	workers.Wait()
-	require.Equal(t, int32(1), maximum.Load())
-}
-
-func TestFullRepoApplyWaitDoesNotHoldResolveMutex(t *testing.T) {
-	provider := newTestProvider(t)
-	blockApply, err := provider.acquireFullRepoApply(context.Background())
-	require.NoError(t, err)
-	defer blockApply()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	waiterStarted := make(chan struct{})
-	waiterDone := make(chan error, 1)
-	go func() {
-		close(waiterStarted)
-		release, waitErr := provider.acquireFullRepoApply(ctx)
-		if release != nil {
-			release()
-		}
-		waiterDone <- waitErr
-	}()
-	<-waiterStarted
-
-	resolveMu := graph.New().ResolveMutex()
-	locked := make(chan struct{})
-	go func() {
-		resolveMu.Lock()
-		close(locked)
-		resolveMu.Unlock()
-	}()
-	select {
-	case <-locked:
-	case <-time.After(time.Second):
-		t.Fatal("waiting for full apply blocked the graph resolve mutex")
-	}
-
-	cancel()
-	require.ErrorIs(t, <-waiterDone, context.Canceled)
-}
-
-func TestIncrementalEnrichmentDoesNotWaitForFullRepoApply(t *testing.T) {
-	provider := newTestProvider(t)
-	blockApply, err := provider.acquireFullRepoApply(context.Background())
-	require.NoError(t, err)
-	defer blockApply()
-
-	root := resolvedTempDir(t)
-	writeGoMod(t, root, "example.com/incremental")
-	writeFile(t, root, "main.go", "package incremental\n\nfunc Changed() {}\n")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_, err = provider.EnrichFilesContext(ctx, graph.New(), "", root, []string{"main.go"})
-	require.NoError(t, err)
-}
-
-// BenchmarkFullRepoApplyContention models two repositories repeatedly handing
-// ResolveMutex/SQLite ownership back and forth. The yield burst represents the
-// scheduler and hot-state disruption at an ownership change; steady work inside
-// one repository has no artificial delay. This is a coordination benchmark, not
-// a substitute for the end-to-end cold-index gate.
-func BenchmarkFullRepoApplyContention(b *testing.B) {
-	for _, coordinated := range []bool{false, true} {
-		name := "uncoordinated"
-		if coordinated {
-			name = "coordinated"
-		}
-		b.Run(name, func(b *testing.B) {
-			provider := NewProvider(ModeTypeCheck, false, nil)
-			b.ReportAllocs()
-			var totalWait atomic.Int64
-			var totalHandoffs atomic.Int64
-			b.ResetTimer()
-			for iteration := 0; iteration < b.N; iteration++ {
-				var resolveMu sync.Mutex
-				lastOwner := -1
-				start := make(chan struct{})
-				var workers sync.WaitGroup
-				workers.Add(2)
-				for owner := 0; owner < 2; owner++ {
-					owner := owner
-					go func() {
-						defer workers.Done()
-						<-start
-						var release func()
-						if coordinated {
-							var err error
-							release, err = provider.acquireFullRepoApply(context.Background())
-							if err != nil {
-								b.Error(err)
-								return
-							}
-							defer release()
-						}
-						for slice := 0; slice < 128; slice++ {
-							waitStart := time.Now()
-							resolveMu.Lock()
-							totalWait.Add(int64(time.Since(waitStart)))
-							if lastOwner != owner {
-								totalHandoffs.Add(1)
-								lastOwner = owner
-								for spin := 0; spin < 32; spin++ {
-									runtime.Gosched()
-								}
-							}
-							resolveMu.Unlock()
-							runtime.Gosched()
-						}
-					}()
-				}
-				close(start)
-				workers.Wait()
+func TestCompilerAdmissionReleasedBeforeDetachedStoreMutation(t *testing.T) {
+	provider := newDetachedApplyTestProvider(t)
+	root := newDetachedApplyTestRoot(t, "example.com/compiler-release")
+	storeRelease := make(chan struct{})
+	admissionResult := make(chan error, 1)
+	store := &detachedApplyStore{
+		Store:   graph.New(),
+		entered: make(chan struct{}),
+		release: storeRelease,
+		beforeReplace: func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			release, err := provider.acquireHeavy(ctx, true)
+			if release != nil {
+				release()
 			}
-			b.StopTimer()
-			b.ReportMetric(float64(totalWait.Load())/float64(b.N), "resolve-wait-ns/op")
-			b.ReportMetric(float64(totalHandoffs.Load())/float64(b.N), "handoffs/op")
-		})
+			admissionResult <- err
+		},
+	}
+
+	result := runDetachedApplyTestEnrichment(
+		provider, context.Background(), store, "compiler-release", root,
+	)
+	select {
+	case err := <-admissionResult:
+		require.NoError(t, err, "compiler admission must be returned before graph mutation")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out checking compiler admission at the graph mutation boundary")
+	}
+	close(storeRelease)
+	require.NoError(t, waitForDetachedApplyResult(t, result))
+}
+
+func newDetachedApplyTestProvider(t *testing.T) *Provider {
+	t.Helper()
+	t.Setenv("GORTEX_GOTYPES_NEEDDEPS", "1")
+	provider := NewProvider(ModeTypeCheck, false, nil)
+	provider.heavyGate = make(chan struct{}, 1)
+	provider.largeGate = make(chan struct{}, 1)
+	provider.compilerGC = func() {}
+	provider.packagesLoad = func(*packages.Config, ...string) ([]*packages.Package, error) {
+		return nil, nil
+	}
+	return provider
+}
+
+func newDetachedApplyTestRoot(t *testing.T, module string) string {
+	t.Helper()
+	root := resolvedTempDir(t)
+	writeGoMod(t, root, module)
+	return root
+}
+
+func runDetachedApplyTestEnrichment(
+	provider *Provider,
+	ctx context.Context,
+	store graph.Store,
+	prefix, root string,
+) <-chan error {
+	result := make(chan error, 1)
+	go func() {
+		_, err := provider.enrichRepoContext(ctx, store, prefix, root)
+		result <- err
+	}()
+	return result
+}
+
+func waitForDetachedApplyStore(t *testing.T, entered <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for detached graph mutation")
+	}
+}
+
+func waitForDetachedApplyResult(t *testing.T, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for detached enrichment")
+		return nil
 	}
 }
