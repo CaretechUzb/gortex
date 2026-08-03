@@ -42,11 +42,11 @@ type incrementalCloneIndex struct {
 // false until a batch pass or Rebuild seeds it from the graph / sidecar;
 // while un-built the indexer falls back to the whole-graph clone pass.
 func newIncrementalCloneIndex() *incrementalCloneIndex {
-	return &incrementalCloneIndex{
-		cms:      clones.NewCMS(65536, 4),
-		lsh:      clones.NewStratifiedIndex(),
-		shingles: make(map[string][]uint64),
-	}
+	// Rebuild and AdoptBaselineOrRebuild initialize the heavy CMS/LSH state
+	// before setting built. Incremental mutation callers check Ready first, so
+	// an index that has not completed a global clone pass needs only this small
+	// state holder.
+	return &incrementalCloneIndex{}
 }
 
 // tokensFromMeta reads a node's stamped normalised-token count, tolerating
