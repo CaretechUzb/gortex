@@ -1,6 +1,7 @@
 package blame
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -337,6 +338,65 @@ func TestShouldEnrichBlame(t *testing.T) {
 		if got := shouldEnrichBlame(c.kind); got != c.want {
 			t.Errorf("shouldEnrichBlame(%q) = %v, want %v", c.kind, got, c.want)
 		}
+	}
+}
+
+func TestEnrichGraph_CachesPathNormalization(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repoDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	g := graph.New()
+	for _, id := range []string{"repo/main.go::First", "repo/main.go::Second"} {
+		g.AddNode(&graph.Node{
+			ID:        id,
+			Kind:      graph.KindFunction,
+			FilePath:  "repo/main.go",
+			StartLine: 1,
+			EndLine:   1,
+		})
+	}
+
+	originalFileExists := fileExists
+	statCalls := 0
+	fileExists = func(path string) bool {
+		statCalls++
+		return originalFileExists(path)
+	}
+	t.Cleanup(func() { fileExists = originalFileExists })
+
+	if _, err := EnrichGraph(g, repoDir); err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+	if statCalls != 2 {
+		t.Fatalf("file existence checks = %d, want 2 for one distinct prefixed path", statCalls)
+	}
+}
+
+func TestFileExists_MatchesTestF(t *testing.T) {
+	dir := t.TempDir()
+	regular := filepath.Join(dir, "regular")
+	if err := os.WriteFile(regular, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !fileExists(regular) {
+		t.Error("regular file reported missing")
+	}
+	if fileExists(dir) {
+		t.Error("directory reported as a regular file")
+	}
+	if fileExists(filepath.Join(dir, "missing")) {
+		t.Error("missing path reported as a regular file")
+	}
+
+	link := filepath.Join(dir, "regular-link")
+	if err := os.Symlink(regular, link); err == nil && !fileExists(link) {
+		t.Error("symlink to a regular file reported missing")
 	}
 }
 

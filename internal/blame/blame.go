@@ -31,6 +31,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -209,8 +210,13 @@ func EnrichGraph(g graph.Store, repoRoot string) (int, error) {
 		return 0, nil
 	}
 	// Group nodes by relative file path so we shell out to git
-	// once per file — repo walk dominates blame cost.
+	// once per file — repo walk dominates blame cost. Path normalization
+	// is likewise done once per distinct raw path: symbol-dense files can
+	// contribute thousands of nodes, but their on-disk path is identical.
 	byPath := make(map[string][]*graph.Node)
+	normalizedPaths := make(map[string]string)
+	_, gitErr := exec.LookPath("git")
+	gitAvailable := gitErr == nil
 	for _, n := range g.AllNodes() {
 		if !shouldEnrichBlame(n.Kind) {
 			continue
@@ -218,11 +224,18 @@ func EnrichGraph(g graph.Store, repoRoot string) (int, error) {
 		if n.FilePath == "" || n.StartLine == 0 {
 			continue
 		}
-		// Strip multi-repo prefix when present — the prefix is the
-		// repo name, not part of the on-disk path. The caller
-		// passes a per-repo root, so the file path we pass to git
-		// must be repo-relative.
-		path := stripRepoPrefix(n.FilePath, repoRoot)
+		path, ok := normalizedPaths[n.FilePath]
+		if !ok {
+			path = n.FilePath
+			if gitAvailable {
+				// Strip multi-repo prefix when present — the prefix is the
+				// repo name, not part of the on-disk path. The caller
+				// passes a per-repo root, so the file path we pass to git
+				// must be repo-relative.
+				path = stripRepoPrefix(n.FilePath, repoRoot)
+			}
+			normalizedPaths[n.FilePath] = path
+		}
 		byPath[path] = append(byPath[path], n)
 	}
 
@@ -385,11 +398,6 @@ func stripRepoPrefix(filePath, repoRoot string) string {
 	if !strings.Contains(filePath, "/") {
 		return filePath
 	}
-	if _, err := exec.LookPath("git"); err != nil {
-		// Without git the caller can't run blame anyway; return
-		// the path unchanged.
-		return filePath
-	}
 	// Try untrimmed first.
 	abs := filepath.Join(repoRoot, filePath)
 	if fileExists(abs) {
@@ -405,10 +413,10 @@ func stripRepoPrefix(filePath, repoRoot string) string {
 	return filePath
 }
 
-// fileExists is split out so tests can stub it; production calls
-// through to os.Stat indirectly via the exec layer (we only need
-// existence-check, not metadata).
+// fileExists is split out so tests can stub it. os.Stat follows symlinks,
+// and Mode().IsRegular matches the previous `test -f` semantics without
+// spawning a process for every lookup.
 var fileExists = func(path string) bool {
-	cmd := exec.Command("test", "-f", path)
-	return cmd.Run() == nil
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
