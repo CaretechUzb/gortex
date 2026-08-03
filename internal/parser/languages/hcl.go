@@ -57,8 +57,7 @@ func (e *HCLExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	dir := hclModuleDir(filePath)
 	seen := make(map[string]bool)    // block-name dedup, per file
 	refSeen := make(map[string]bool) // (from\x00to) reference dedup
-	cfgSeen := make(map[string]bool) // config-key node + edge dedup
-	e.walkTopLevel(root, src, filePath, dir, fileNode.ID, result, seen, refSeen, cfgSeen)
+	e.walkTopLevel(root, src, filePath, dir, fileNode.ID, result, seen, refSeen)
 
 	return result, nil
 }
@@ -83,7 +82,7 @@ func hclNodeID(dir, address string) string { return "hcl::" + dir + "::" + addre
 // Nested blocks (ingress, lifecycle, dynamic, …) are not separate
 // definition nodes — their value expressions are attributed to the
 // enclosing top-level block as references.
-func (e *HCLExtractor) walkTopLevel(node *sitter.Node, src []byte, filePath, dir, fileID string, result *parser.ExtractionResult, seen, refSeen, cfgSeen map[string]bool) {
+func (e *HCLExtractor) walkTopLevel(node *sitter.Node, src []byte, filePath, dir, fileID string, result *parser.ExtractionResult, seen, refSeen map[string]bool) {
 	if node == nil {
 		return
 	}
@@ -94,14 +93,14 @@ func (e *HCLExtractor) walkTopLevel(node *sitter.Node, src []byte, filePath, dir
 		}
 		switch child.Type() {
 		case "block":
-			e.extractBlock(child, src, filePath, dir, fileID, result, seen, refSeen, cfgSeen)
+			e.extractBlock(child, src, filePath, dir, fileID, result, seen, refSeen)
 		case "config_file", "body":
-			e.walkTopLevel(child, src, filePath, dir, fileID, result, seen, refSeen, cfgSeen)
+			e.walkTopLevel(child, src, filePath, dir, fileID, result, seen, refSeen)
 		}
 	}
 }
 
-func (e *HCLExtractor) extractBlock(node *sitter.Node, src []byte, filePath, dir, fileID string, result *parser.ExtractionResult, seen, refSeen, cfgSeen map[string]bool) {
+func (e *HCLExtractor) extractBlock(node *sitter.Node, src []byte, filePath, dir, fileID string, result *parser.ExtractionResult, seen, refSeen map[string]bool) {
 	// A block is: identifier (block type), string_lit labels, then body.
 	// E.g. resource "aws_instance" "web" { ... }
 	var blockType string
@@ -158,7 +157,7 @@ func (e *HCLExtractor) extractBlock(node *sitter.Node, src []byte, filePath, dir
 		})
 	}
 
-	e.extractConfigKeys(blockType, labels, body, src, filePath, id, startLine, result, cfgSeen)
+	e.extractConfigKeys(blockType, labels, body, src, filePath, id, startLine, result)
 
 	// A locals block declares N independently-addressable values
 	// (local.<key>); emit one KindConstant per key and resolve each
@@ -184,22 +183,7 @@ func (e *HCLExtractor) extractLocals(body *sitter.Node, src []byte, filePath, di
 		if attr == nil || attr.Type() != "attribute" {
 			continue
 		}
-		var key string
-		var expr *sitter.Node
-		for j, _nc := 0, int(attr.ChildCount()); j < _nc; j++ {
-			c := attr.Child(j)
-			if c == nil {
-				continue
-			}
-			switch c.Type() {
-			case "identifier":
-				if key == "" {
-					key = c.Content(src)
-				}
-			case "expression":
-				expr = c
-			}
-		}
+		key, expr := hclAttrKeyExpr(attr, src)
 		if key == "" {
 			continue
 		}
@@ -248,16 +232,15 @@ var tfConfigKeySites = map[string]tfConfigKeySite{
 // literal an allowlisted resource type declares its config values in.
 // Every key lands on the shared cfg::env::<NAME> ID so a code-side
 // os.Getenv read resolves to the same node.
-func (e *HCLExtractor) extractConfigKeys(blockType string, labels []string, body *sitter.Node, src []byte, filePath, blockID string, startLine int, result *parser.ExtractionResult, cfgSeen map[string]bool) {
+func (e *HCLExtractor) extractConfigKeys(blockType string, labels []string, body *sitter.Node, src []byte, filePath, blockID string, startLine int, result *parser.ExtractionResult) {
 	if len(labels) == 0 {
 		return
 	}
-	switch blockType {
-	case "variable", "output":
-		emitHCLConfigKey(result, blockID, labels[0], "tf_"+blockType, filePath, startLine, cfgSeen)
+	if blockType == "variable" || blockType == "output" {
+		emitHCLConfigKey(result, blockID, labels[0], "tf_"+blockType, filePath, startLine)
 		return
-	case "resource":
-	default:
+	}
+	if blockType != "resource" {
 		return
 	}
 	site, ok := tfConfigKeySites[labels[0]]
@@ -283,42 +266,46 @@ func (e *HCLExtractor) extractConfigKeys(blockType string, labels []string, body
 		if key == "" {
 			continue
 		}
-		emitHCLConfigKey(result, blockID, key, site.source, filePath,
-			int(elem.StartPoint().Row)+1, cfgSeen)
+		emitHCLConfigKey(result, blockID, key, site.source, filePath, int(elem.StartPoint().Row)+1)
 	}
 }
 
 // emitHCLConfigKey materialises one KindConfigKey node plus the
 // EdgeUsesEnv edge from the declaring block, mirroring the Kubernetes
-// and Dockerfile extractors. Both are deduped per file so a name
-// declared twice yields one node and one edge per declaring block.
-func emitHCLConfigKey(result *parser.ExtractionResult, fromID, name, source, filePath string, line int, cfgSeen map[string]bool) {
+// and Dockerfile extractors. Not deduped, matching dockerfile.go's own
+// config-key extractor: AddNode dedupes by ID and edges dedupe by
+// {From,To,Kind,FilePath,Line} once committed to the graph, so a second
+// identical emission here is a harmless no-op downstream.
+func emitHCLConfigKey(result *parser.ExtractionResult, fromID, name, source, filePath string, line int) {
 	if name == "" {
 		return
 	}
 	keyID := configKeyEnvID(name)
-	if !cfgSeen[keyID] {
-		cfgSeen[keyID] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: keyID, Kind: graph.KindConfigKey, Name: name,
-			FilePath: filePath, StartLine: line, EndLine: line,
-			Language: "hcl",
-			Meta: map[string]any{
-				"source": source,
-				"origin": "terraform",
-			},
-		})
-	}
-	edgeKey := fromID + "\x00" + keyID
-	if cfgSeen[edgeKey] {
-		return
-	}
-	cfgSeen[edgeKey] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: keyID, Kind: graph.KindConfigKey, Name: name,
+		FilePath: filePath, StartLine: line, EndLine: line,
+		Language: "hcl",
+		Meta: map[string]any{
+			"source": source,
+			"origin": "terraform",
+		},
+	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fromID, To: keyID, Kind: graph.EdgeUsesEnv,
 		FilePath: filePath, Line: line,
 		Meta: map[string]any{"scope": "runtime"},
 	})
+}
+
+// hclAttrKeyExpr splits an "attribute" node (`key = expr`) into its
+// identifier key and expression value. Shared by extractLocals (which
+// wants every attribute) and hclAttrObject (which wants one by name).
+func hclAttrKeyExpr(attr *sitter.Node, src []byte) (string, *sitter.Node) {
+	var key string
+	if id := findChildByType(attr, "identifier"); id != nil {
+		key = id.Content(src)
+	}
+	return key, findChildByType(attr, "expression")
 }
 
 // hclNestedBlockBody returns the body of the first nested block named
@@ -330,25 +317,11 @@ func hclNestedBlockBody(body *sitter.Node, name string, src []byte) *sitter.Node
 		if child == nil || child.Type() != "block" {
 			continue
 		}
-		var blockType string
-		var inner *sitter.Node
-		for j, _jc := 0, int(child.ChildCount()); j < _jc; j++ {
-			c := child.Child(j)
-			if c == nil {
-				continue
-			}
-			switch c.Type() {
-			case "identifier":
-				if blockType == "" {
-					blockType = c.Content(src)
-				}
-			case "body":
-				inner = c
-			}
+		id := findChildByType(child, "identifier")
+		if id == nil || id.Content(src) != name {
+			continue
 		}
-		if blockType == name {
-			return inner
-		}
+		return findChildByType(child, "body")
 	}
 	return nil
 }
@@ -364,22 +337,7 @@ func hclAttrObject(body *sitter.Node, name string, src []byte) *sitter.Node {
 		if attr == nil || attr.Type() != "attribute" {
 			continue
 		}
-		var key string
-		var expr *sitter.Node
-		for j, _jc := 0, int(attr.ChildCount()); j < _jc; j++ {
-			c := attr.Child(j)
-			if c == nil {
-				continue
-			}
-			switch c.Type() {
-			case "identifier":
-				if key == "" {
-					key = c.Content(src)
-				}
-			case "expression":
-				expr = c
-			}
-		}
+		key, expr := hclAttrKeyExpr(attr, src)
 		if key != name || expr == nil {
 			continue
 		}
@@ -392,43 +350,33 @@ func hclAttrObject(body *sitter.Node, name string, src []byte) *sitter.Node {
 // direct children are inspected, so an object nested inside a function
 // call or for-expression is not mistaken for the attribute's own value.
 func hclObjectOf(expr *sitter.Node) *sitter.Node {
-	for i, _nc := 0, int(expr.ChildCount()); i < _nc; i++ {
-		coll := expr.Child(i)
-		if coll == nil || coll.Type() != "collection_value" {
-			continue
-		}
-		for j, _jc := 0, int(coll.ChildCount()); j < _jc; j++ {
-			if o := coll.Child(j); o != nil && o.Type() == "object" {
-				return o
-			}
-		}
+	coll := findChildByType(expr, "collection_value")
+	if coll == nil {
+		return nil
 	}
-	return nil
+	return findChildByType(coll, "object")
 }
 
 // hclObjectElemKey returns the literal key of an object_elem — the bare
 // form (KEY = "v") or the quoted form ("KEY" = "v"). A computed key
 // ((var.x) = "v") has no static name and yields "".
 func hclObjectElemKey(elem *sitter.Node, src []byte) string {
-	for i, _nc := 0, int(elem.ChildCount()); i < _nc; i++ {
-		expr := elem.Child(i)
-		if expr == nil || expr.Type() != "expression" {
+	expr := findChildByType(elem, "expression")
+	if expr == nil {
+		return ""
+	}
+	// The first expression child is the key; the second is the value.
+	for j, _jc := 0, int(expr.ChildCount()); j < _jc; j++ {
+		c := expr.Child(j)
+		if c == nil {
 			continue
 		}
-		// The first expression child is the key; the second is the value.
-		for j, _jc := 0, int(expr.ChildCount()); j < _jc; j++ {
-			c := expr.Child(j)
-			if c == nil {
-				continue
-			}
-			switch c.Type() {
-			case "variable_expr":
-				return hclIdentText(c, src)
-			case "literal_value":
-				return trimQuotes(strings.TrimSpace(c.Content(src)))
-			}
+		switch c.Type() {
+		case "variable_expr":
+			return hclIdentText(c, src)
+		case "literal_value":
+			return trimQuotes(strings.TrimSpace(c.Content(src)))
 		}
-		return ""
 	}
 	return ""
 }

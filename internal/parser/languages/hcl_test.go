@@ -340,6 +340,42 @@ resource "aws_lambda_function" "processor" {
 	}
 }
 
+// Two resources declaring the same env var name each get their own
+// EdgeUsesEnv edge to the shared cfg::env::<NAME> node — this extractor
+// does not dedup within a file (the graph's AddNode/edge-key dedup
+// handles collapsing identical nodes/edges downstream), so a second
+// declaration must not silently disappear here.
+func TestHCLExtractor_SharedKeyNameAcrossResourcesEachGetsAnEdge(t *testing.T) {
+	src := []byte(`resource "aws_lambda_function" "a" {
+  environment {
+    variables = {
+      TIMEOUT_SECONDS = "30"
+    }
+  }
+}
+
+resource "aws_lambda_function" "b" {
+  environment {
+    variables = {
+      TIMEOUT_SECONDS = "60"
+    }
+  }
+}
+`)
+	e := NewHCLExtractor()
+	result, err := e.Extract("lambdas.tf", src)
+	require.NoError(t, err)
+
+	id := "cfg::env::TIMEOUT_SECONDS"
+	nodes := nodesByID(result.Nodes)
+	require.Contains(t, nodes, id)
+
+	for _, from := range []string{"hcl::.::aws_lambda_function.a", "hcl::.::aws_lambda_function.b"} {
+		assert.True(t, hasEdgeBetween(result.Edges, graph.EdgeUsesEnv, from, id),
+			"missing EdgeUsesEnv %s -> %s", from, id)
+	}
+}
+
 func TestHCLExtractor_FileNode(t *testing.T) {
 	src := []byte(`variable "name" {}
 `)
