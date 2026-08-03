@@ -64,3 +64,114 @@ func TestResolveUIKitRefs_NonAppleLeftAlone(t *testing.T) {
 
 	require.Equal(t, 0, ResolveUIKitRefs(g))
 }
+
+type uikitReindexOrderStore struct {
+	graph.Store
+	kinds []graph.EdgeKind
+}
+
+func (s *uikitReindexOrderStore) FindEdgesByIdentities(
+	identities []graph.EdgeIdentity,
+) map[graph.EdgeIdentity]*graph.Edge {
+	return s.Store.(graph.EdgeIdentityBatchFinder).FindEdgesByIdentities(identities)
+}
+
+func (s *uikitReindexOrderStore) ReindexEdges(reindexes []graph.EdgeReindex) {
+	for _, reindex := range reindexes {
+		if reindex.Edge != nil {
+			s.kinds = append(s.kinds, reindex.Edge.Kind)
+		}
+	}
+	s.Store.ReindexEdges(reindexes)
+}
+
+func newUIKitFourKindGraph() *graph.Graph {
+	g := graph.New()
+	const source = "App/Controllers/Use.swift::Use"
+	g.AddNode(&graph.Node{ID: source, Kind: graph.KindFunction, Name: "Use", FilePath: "App/Controllers/Use.swift", Language: "swift"})
+	convNode(g, "App/ViewControllers/AlphaViewController.swift::AlphaViewController", "App/ViewControllers/AlphaViewController.swift", "AlphaViewController")
+	convNode(g, "App/Cells/BetaCell.swift::BetaCell", "App/Cells/BetaCell.swift", "BetaCell")
+	convNode(g, "App/Delegates/GammaDelegate.swift::GammaDelegate", "App/Delegates/GammaDelegate.swift", "GammaDelegate")
+	convNode(g, "App/DataSources/DeltaDataSource.swift::DeltaDataSource", "App/DataSources/DeltaDataSource.swift", "DeltaDataSource")
+	g.AddBatch(nil, []*graph.Edge{
+		{From: source, To: "unresolved::AlphaViewController", Kind: graph.EdgeInstantiates, FilePath: "App/Controllers/Use.swift", Line: 1},
+		{From: source, To: "unresolved::BetaCell", Kind: graph.EdgeReferences, FilePath: "App/Controllers/Use.swift", Line: 2},
+		{From: source, To: "unresolved::GammaDelegate", Kind: graph.EdgeTypedAs, FilePath: "App/Controllers/Use.swift", Line: 3},
+		{From: source, To: "unresolved::DeltaDataSource", Kind: graph.EdgeCalls, FilePath: "App/Controllers/Use.swift", Line: 4},
+	})
+	return g
+}
+
+func uikitSharedCandidates(g graph.Store) (*frameworkStreamCandidates, *frameworkPassCandidates) {
+	streams := newFrameworkStreamCandidates(
+		g,
+		map[string]int{"apple": 1},
+		map[string]int{SynthUIKitResolve: 1},
+	)
+	collectFrameworkEdgeCensus(g, streams)
+	return streams, streams.passStreams(g, SynthUIKitResolve)
+}
+
+func TestResolveUIKitRefs_SharedCandidatesMatchLegacyAndPreserveKindOrder(t *testing.T) {
+	legacy := newUIKitFourKindGraph()
+	require.Equal(t, 4, ResolveUIKitRefs(legacy))
+
+	sharedGraph := newUIKitFourKindGraph()
+	streams, bundle := uikitSharedCandidates(sharedGraph)
+	require.NotNil(t, bundle)
+	require.Len(t, bundle.refs, 1)
+	require.Len(t, bundle.calls, 1)
+
+	ordered := &uikitReindexOrderStore{Store: sharedGraph}
+	require.Equal(t, 4, resolveUIKitRefs(ordered, bundle))
+	assert.Equal(t, []graph.EdgeKind{
+		graph.EdgeInstantiates,
+		graph.EdgeReferences,
+		graph.EdgeTypedAs,
+		graph.EdgeCalls,
+	}, ordered.kinds)
+
+	const source = "App/Controllers/Use.swift::Use"
+	for _, tc := range []struct {
+		kind   graph.EdgeKind
+		target string
+	}{
+		{graph.EdgeInstantiates, "App/ViewControllers/AlphaViewController.swift::AlphaViewController"},
+		{graph.EdgeReferences, "App/Cells/BetaCell.swift::BetaCell"},
+		{graph.EdgeTypedAs, "App/Delegates/GammaDelegate.swift::GammaDelegate"},
+		{graph.EdgeCalls, "App/DataSources/DeltaDataSource.swift::DeltaDataSource"},
+	} {
+		assert.NotNil(t, synthUIKitEdge(legacy, tc.kind, source, tc.target))
+		assert.NotNil(t, synthUIKitEdge(sharedGraph, tc.kind, source, tc.target))
+	}
+	streams.releasePass(SynthUIKitResolve, bundle)
+}
+
+func TestResolveUIKitRefs_SharedCandidatesDropRetargetedEdge(t *testing.T) {
+	g := graph.New()
+	const source = "App/Controllers/Use.swift::Use"
+	const stableTarget = "App/Existing.swift::Existing"
+	g.AddNode(&graph.Node{ID: source, Kind: graph.KindFunction, Name: "Use", FilePath: "App/Controllers/Use.swift", Language: "swift"})
+	g.AddNode(&graph.Node{ID: stableTarget, Kind: graph.KindFunction, Name: "Existing", FilePath: "App/Existing.swift", Language: "swift"})
+	convNode(g, "App/DataSources/DeltaDataSource.swift::DeltaDataSource", "App/DataSources/DeltaDataSource.swift", "DeltaDataSource")
+	call := &graph.Edge{From: source, To: "unresolved::DeltaDataSource", Kind: graph.EdgeCalls, FilePath: "App/Controllers/Use.swift", Line: 7}
+	g.AddEdge(call)
+
+	streams := newFrameworkStreamCandidates(
+		g,
+		map[string]int{"apple": 1},
+		map[string]int{SynthUIKitResolve: 1},
+	)
+	collectFrameworkEdgeCensus(g, streams)
+	require.Len(t, streams.perPass[SynthUIKitResolve].calls, 1, "census must retain the pre-pass identity")
+
+	live := *call
+	live.To = stableTarget
+	g.ReindexEdges([]graph.EdgeReindex{{Edge: &live, OldTo: call.To}})
+	bundle := streams.passStreams(g, SynthUIKitResolve)
+	require.NotNil(t, bundle)
+	require.Empty(t, bundle.calls, "exact refetch must drop the stale unresolved identity")
+	require.Equal(t, 0, resolveUIKitRefs(g, bundle))
+	assert.Nil(t, synthUIKitEdge(g, graph.EdgeCalls, source, "App/DataSources/DeltaDataSource.swift::DeltaDataSource"))
+	streams.releasePass(SynthUIKitResolve, bundle)
+}

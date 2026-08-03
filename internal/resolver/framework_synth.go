@@ -972,7 +972,7 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// UIKit directory-convention fallback: a residual `*ViewController` /
 		// `*Cell` / `*Delegate` / `*DataSource` reference binds to its
 		// /ViewControllers/ /Cells/ /Delegates/ definition.
-		synthFunc{name: SynthUIKitResolve, fn: ResolveUIKitRefs},
+		synthFunc{name: SynthUIKitResolve, fn: ResolveUIKitRefs, candFn: resolveUIKitRefs},
 		// Vapor directory-convention fallback: a residual `*Controller` /
 		// `*Middleware` reference binds to its /Controllers/ /Middleware/
 		// definition. After UIKit so `*ViewController` binds there first.

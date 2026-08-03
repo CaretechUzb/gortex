@@ -177,6 +177,10 @@ func newFrameworkStreamCandidates(g graph.Store, present, markers map[string]int
 	if armed(SynthRailsResolve) {
 		addCalls(SynthRailsResolve, railsCandidateEdge)
 	}
+	if armed(SynthUIKitResolve) {
+		addCalls(SynthUIKitResolve, uikitCandidateEdge)
+		addRefs(SynthUIKitResolve, uikitCandidateEdge)
+	}
 	if armed(SynthReactResolve) {
 		addCalls(SynthReactResolve, reactCandidateEdge)
 		addRefs(SynthReactResolve, reactCandidateEdge)
@@ -385,6 +389,10 @@ func (sc *frameworkStreamCandidates) macroCandidateEdge(e graph.FrameworkCensusE
 
 func railsCandidateEdge(e graph.FrameworkCensusEdge) bool {
 	return graph.IsUnresolvedTarget(e.To) && e.RecvConst != ""
+}
+
+func uikitCandidateEdge(e graph.FrameworkCensusEdge) bool {
+	return isUIKitCandidateTarget(e.To)
 }
 
 func reactCandidateEdge(e graph.FrameworkCensusEdge) bool {

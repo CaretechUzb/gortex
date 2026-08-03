@@ -23,48 +23,93 @@ var (
 // ResolveUIKitRefs binds residual unresolved UIKit references to their
 // directory-located definitions. Returns the count bound.
 func ResolveUIKitRefs(g graph.Store) int {
+	return resolveUIKitRefs(g, nil)
+}
+
+// resolveUIKitRefs is the census-multiplexed form. Calls and references use
+// candidates exact-refetched immediately before this pass begins; instantiates
+// and typed-as edges retain their local scans. Candidate assembly deliberately
+// preserves the legacy kind order: Instantiates, References, TypedAs, Calls.
+func resolveUIKitRefs(g graph.Store, cands *frameworkPassCandidates) int {
 	if g == nil {
 		return 0
 	}
 
-	// The candidate census deliberately projects no edge metadata. SQLite keeps
-	// metadata BLOBs on disk while we reject the overwhelming majority of edges.
-	// Scan each kind separately to preserve the legacy pass order exactly, and
-	// finish every cursor before point-reading nodes or writing rewritten edges.
-	var candidateIDs []graph.EdgeIdentity
+	type candidate struct {
+		identity graph.EdgeIdentity
+		edge     *graph.Edge
+	}
+	var candidates []candidate
+	var localIDs []graph.EdgeIdentity
 	var sourceIDs []string
-	for _, kind := range []graph.EdgeKind{graph.EdgeInstantiates, graph.EdgeReferences, graph.EdgeTypedAs, graph.EdgeCalls} {
+	appendLocal := func(kind graph.EdgeKind) {
 		for edge := range graph.EdgesLightSeq(g, kind) {
 			if !isUIKitCandidateEdge(edge) {
 				continue
 			}
-			candidateIDs = append(candidateIDs, graph.EdgeIdentityFor(edge))
+			identity := graph.EdgeIdentityFor(edge)
+			candidates = append(candidates, candidate{identity: identity})
+			localIDs = append(localIDs, identity)
 			sourceIDs = append(sourceIDs, edge.From)
 		}
 	}
-	if len(candidateIDs) == 0 {
+	appendShared := func(edges []*graph.Edge) {
+		for _, edge := range edges {
+			if !isUIKitCandidateEdge(edge) {
+				continue
+			}
+			identity := graph.EdgeIdentityFor(edge)
+			candidates = append(candidates, candidate{identity: identity, edge: edge})
+			sourceIDs = append(sourceIDs, edge.From)
+		}
+	}
+
+	appendLocal(graph.EdgeInstantiates)
+	if cands == nil {
+		appendLocal(graph.EdgeReferences)
+	} else {
+		appendShared(cands.refs)
+	}
+	appendLocal(graph.EdgeTypedAs)
+	if cands == nil {
+		appendLocal(graph.EdgeCalls)
+	} else {
+		appendShared(cands.calls)
+	}
+	if len(candidates) == 0 {
 		return 0
 	}
 
+	// Shared candidates were exact-refetched by passStreams. Local candidates
+	// receive the same exact current-row check here after their cursors close.
 	placements := graph.NodePlacementsByIDs(g, dedupeFrameworkIDs(sourceIDs))
-	appleCandidates := candidateIDs[:0]
-	for _, identity := range candidateIDs {
-		if placement, ok := placements[identity.From]; ok && isAppleSourceFile(placement.FilePath) {
-			appleCandidates = append(appleCandidates, identity)
+	currentLocal := findFrameworkEdgesByIdentities(g, localIDs)
+	appleCandidates := candidates[:0]
+	for _, cand := range candidates {
+		edge := cand.edge
+		if edge == nil {
+			edge = currentLocal[cand.identity]
 		}
+		if !isUIKitCandidateEdge(edge) || graph.EdgeIdentityFor(edge) != cand.identity {
+			continue
+		}
+		placement, ok := placements[edge.From]
+		if !ok || !isAppleSourceFile(placement.FilePath) {
+			continue
+		}
+		cand.edge = edge
+		appleCandidates = append(appleCandidates, cand)
 	}
 	if len(appleCandidates) == 0 {
 		return 0
 	}
 
-	// Refetch the exact surviving logical edges only after every scan cursor has
-	// closed. This preserves metadata and provenance without retaining full Edge
-	// values for the census.
-	current := findFrameworkEdgesByIdentities(g, appleCandidates)
 	resolved := 0
 	var reindex []graph.EdgeReindex
-	for _, identity := range appleCandidates {
-		edge := current[identity]
+	for _, cand := range appleCandidates {
+		edge := cand.edge
+		// Re-apply the full pass predicate to the authoritative edge. The shared
+		// census predicate is intentionally only a cheap necessary condition.
 		if !isUIKitCandidateEdge(edge) {
 			continue
 		}
@@ -91,10 +136,14 @@ func ResolveUIKitRefs(g graph.Store) int {
 }
 
 func isUIKitCandidateEdge(edge *graph.Edge) bool {
-	if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
+	return edge != nil && isUIKitCandidateTarget(edge.To)
+}
+
+func isUIKitCandidateTarget(target string) bool {
+	if !graph.IsUnresolvedTarget(target) {
 		return false
 	}
-	name := graph.UnresolvedName(edge.To)
+	name := graph.UnresolvedName(target)
 	if name == "" || strings.ContainsRune(name, '.') {
 		return false
 	}
