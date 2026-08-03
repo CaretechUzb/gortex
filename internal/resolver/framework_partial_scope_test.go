@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"fmt"
+	"iter"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -19,6 +20,7 @@ type frameworkTailCountingStore struct {
 	repoEdgesByKinds, repoNodeIDsByKind   int
 	allNodesLight, repoNodesLight         int
 	repoPrefixes, unresolvedIdentityScans int
+	frameworkCensusScans                  int
 }
 
 func (s *frameworkTailCountingStore) GetNode(id string) *graph.Node {
@@ -108,6 +110,13 @@ func (s *frameworkTailCountingStore) ScanUnresolvedEdgeIdentitiesBatched(
 ) {
 	s.unresolvedIdentityScans++
 	s.Store.(graph.UnresolvedEdgeIdentityBatchScanner).ScanUnresolvedEdgeIdentitiesBatched(kinds, batchSize, yield)
+}
+
+func (s *frameworkTailCountingStore) FrameworkCensusEdgesSeq(
+	kinds ...graph.EdgeKind,
+) iter.Seq[graph.FrameworkCensusEdge] {
+	s.frameworkCensusScans++
+	return graph.FrameworkCensusEdgesSeq(s.Store, kinds...)
 }
 
 func addDjangoRepo(g *graph.Graph, repo string, count int) {
@@ -264,7 +273,7 @@ func addReceiverGateRepo(g *graph.Graph, repo string) (caller, target string) {
 		{ID: repo + "::Receiver", Kind: graph.KindType, Name: "Receiver", Language: "csharp", RepoPrefix: repo},
 		{ID: repo + "::Other", Kind: graph.KindType, Name: "Other", Language: "csharp", RepoPrefix: repo},
 	}, []*graph.Edge{{From: caller, To: target, Kind: graph.EdgeCalls, Origin: graph.OriginTextMatched,
-		Meta: map[string]any{"receiver_type": "Receiver"}}})
+		Meta: map[string]any{"receiver_type": "Receiver", "opaque": "preserved"}}})
 	return caller, target
 }
 
@@ -272,8 +281,12 @@ func TestCSharpReceiverGateScopedMatchesFullAndBatchesMutation(t *testing.T) {
 	full := graph.New()
 	fullCaller, fullTarget := addReceiverGateRepo(full, "changed")
 	addReceiverGateRepo(full, "untouched")
-	require.Equal(t, 2, demoteCSharpMisattributedMemberCalls(full))
-	require.True(t, findCallEdge(full, fullCaller, fullTarget).IsSpeculative())
+	fullCounting := &frameworkTailCountingStore{Store: full}
+	require.Equal(t, 2, demoteCSharpMisattributedMemberCalls(fullCounting))
+	require.Equal(t, 1, fullCounting.frameworkCensusScans, "full gate should project receiver_type identities")
+	fullEdge := findCallEdge(full, fullCaller, fullTarget)
+	require.True(t, fullEdge.IsSpeculative())
+	require.Equal(t, "preserved", fullEdge.Meta["opaque"], "exact refetch must retain opaque metadata")
 
 	partial := graph.New()
 	partialCaller, partialTarget := addReceiverGateRepo(partial, "changed")

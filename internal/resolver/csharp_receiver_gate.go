@@ -35,9 +35,46 @@ func demoteCSharpMisattributedMemberCallsScoped(g graph.Store, scope map[string]
 	if g == nil {
 		return 0
 	}
-	return demoteCSharpMisattributedMemberCallCandidates(
-		g, frameworkCallsForScope(g, scope), scope, false,
-	)
+	var calls []*graph.Edge
+	if scope == nil {
+		calls = csharpReceiverGateProjectedCalls(g)
+	} else {
+		calls = frameworkCallsForScope(g, scope)
+	}
+	return demoteCSharpMisattributedMemberCallCandidates(g, calls, scope, false)
+}
+
+// csharpReceiverGateProjectedCalls selects only call identities carrying the
+// receiver_type marker used by the gate. The projection cursor is exhausted
+// before exact-refetching current full edges, so SQLite store re-entry is safe
+// and opaque edge metadata is preserved for mutation.
+func csharpReceiverGateProjectedCalls(g graph.Store) []*graph.Edge {
+	identities := make([]graph.EdgeIdentity, 0)
+	seen := make(map[graph.EdgeIdentity]struct{})
+	for row := range graph.FrameworkCensusEdgesSeq(g, graph.EdgeCalls) {
+		if row.ReceiverType == "" {
+			continue
+		}
+		if _, duplicate := seen[row.EdgeIdentity]; duplicate {
+			continue
+		}
+		seen[row.EdgeIdentity] = struct{}{}
+		identities = append(identities, row.EdgeIdentity)
+	}
+
+	current := findFrameworkEdgesByIdentities(g, identities)
+	calls := make([]*graph.Edge, 0, len(identities))
+	for _, identity := range identities {
+		edge := current[identity]
+		if edge == nil || edge.Kind != graph.EdgeCalls || edge.Meta == nil {
+			continue
+		}
+		receiverType, _ := edge.Meta["receiver_type"].(string)
+		if receiverType != "" {
+			calls = append(calls, edge)
+		}
+	}
+	return calls
 }
 
 func demoteCSharpMisattributedMemberCallsScopedForFiles(
