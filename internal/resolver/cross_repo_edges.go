@@ -209,10 +209,6 @@ func crossRepoCandidatesForRepos(g graph.Store, repoPrefixes []string) []graph.C
 	return crossRepoCandidatesFallback(g, baseKinds, stringSet(repoPrefixes), nil)
 }
 
-func crossRepoCandidatesForFiles(g graph.Store, filePaths []string) []graph.CrossRepoCandidateRow {
-	return crossRepoCandidatesForMutationFiles(g, filePaths, filePaths)
-}
-
 func crossRepoCandidatesForMutationFiles(g graph.Store, edgeSourceFiles, incidentNodeFiles []string) []graph.CrossRepoCandidateRow {
 	baseKinds := graph.BaseKindsForCrossRepo()
 	if cap, ok := g.(graph.MutationScopedCrossRepoCandidates); ok {
