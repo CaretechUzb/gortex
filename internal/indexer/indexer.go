@@ -696,14 +696,16 @@ func initialSearchBackend(g graph.Store) search.Backend {
 // defeating the FTS path and pinning the ~100MB heap the FTS
 // integration was meant to release.
 func isSymbolSearcherBackend(b search.Backend) bool {
-	if b == nil {
+	switch backend := b.(type) {
+	case *search.SymbolSearcherBackend:
+		return true
+	case *search.Swappable:
+		return isSymbolSearcherBackend(backend.Inner())
+	case *search.HybridBackend:
+		return isSymbolSearcherBackend(backend.TextBackend())
+	default:
 		return false
 	}
-	if sw, ok := b.(*search.Swappable); ok {
-		b = sw.Inner()
-	}
-	_, ok := b.(*search.SymbolSearcherBackend)
-	return ok
 }
 
 // ftsTokensFor produces the pre-tokenised text the backend FTS path
@@ -5366,6 +5368,20 @@ func (idx *Indexer) buildSearchIndex() {
 	// leaves it nil, so LastVectorBuildError always reflects the current pass.
 	idx.lastVectorBuildErr = nil
 
+	// Install the learned sub-word boundary table before populating an
+	// in-process BM25 backend. Capability detection happens before graph
+	// enumeration, so native SQLite FTS and Bleve do no boundary census.
+	search.BuildAndInstallNgramBoundaries(idx.search, idx.graph)
+
+	nativeText := isSymbolSearcherBackend(idx.search)
+	buildVectors := idx.embedder != nil && !idx.skipVectorBuild
+	if nativeText && !buildVectors {
+		// SQLite maintains symbol_fts in the graph mutation path. Backend.Add
+		// only adjusts a process-local approximate counter, so walking and
+		// decoding every node here cannot add searchable data.
+		return
+	}
+
 	// Code-only enumeration: content (data_class=content) sections live in
 	// the content index, never the symbol search or the vector store, so the
 	// FTS loop below and collectEmbedTexts both skip them anyway. Fetching
@@ -5374,36 +5390,21 @@ func (idx *Indexer) buildSearchIndex() {
 	// them in SQL), instead of being materialised only to be skipped.
 	nodes := graph.RepoCodeNodes(idx.graph, idx.repoPrefix)
 
-	// Install the learned sub-word boundary table on the BM25 layer
-	// before populating postings, so the optional sparse-ngram
-	// tokenizer's split points are data-driven and — crucially —
-	// identical on the index path here and the query path later. The
-	// table must be in place before the first Add for postings and
-	// queries to agree; it is a no-op for non-BM25 backends and a no-op
-	// for search overall unless GORTEX_SPARSE_NGRAM is set.
-	search.BuildAndInstallNgramBoundaries(idx.search, idx.graph)
-
-	// Build text index. The SkipSearch filter (wired through
-	// idx.shouldIndexForSearch) drops config-key-style variable nodes
-	// that would only pad the index — see docs on IndexConfig.SkipSearch.
-	for _, n := range nodes {
-		if !idx.shouldIndexForSearch(n) {
-			continue
+	// Build the text index only for in-process backends. Native SQLite FTS is
+	// already updated transactionally by graph mutations; its Add method is a
+	// counting compatibility shim rather than an indexing operation.
+	if !nativeText {
+		for _, n := range nodes {
+			if !idx.shouldIndexForSearch(n) {
+				continue
+			}
+			idx.search.Add(n.ID, searchIndexFields(n, idx.projectName)...)
 		}
-		idx.search.Add(n.ID, searchIndexFields(n, idx.projectName)...)
 	}
 
-	// Build vector index if embedder is available.
-	if idx.embedder == nil {
-		return
-	}
-
-	// skipVectorBuild short-circuits the embedding pass: the text index
-	// above is fully populated, but a caller (the daemon warmup loop
-	// after a snapshot restore) has signalled that the workspace vector
-	// index will be supplied separately, so re-embedding here would be
-	// wasted work immediately overwritten by the cached index.
-	if idx.skipVectorBuild {
+	// With no requested vector build, text indexing is complete. This covers
+	// both a missing embedder and snapshot warmup's skipVectorBuild path.
+	if !buildVectors {
 		return
 	}
 
