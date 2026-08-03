@@ -1417,6 +1417,19 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 	}
 
 	// Fallback: name-only matching (methods first, then functions for pkg.Func() calls).
+	//
+	// C# member calls never take it: the main resolver owns C# member
+	// semantics (instance-member precedence, receiver shape, using
+	// visibility) and leaves a call unresolved as a VERDICT — ambiguity
+	// or provable inapplicability. A name-only bind here would resurrect
+	// exactly the misbinds those gates refuse (an extension from an
+	// invisible namespace, a shape-conflicted overload) with no
+	// confidence and no origin. The exact-receiver tiers above remain
+	// available to C#.
+	if cn := cr.graph.GetNode(e.From); cn != nil && sameLanguageFamily("csharp", cn.Language) {
+		stats.Unresolved++
+		return
+	}
 	for _, c := range candidates {
 		if c.Kind == graph.KindMethod && c.RepoPrefix == callerRepo {
 			e.To = c.ID

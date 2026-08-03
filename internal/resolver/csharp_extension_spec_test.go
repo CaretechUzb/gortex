@@ -167,6 +167,68 @@ namespace X {
 		"using X at the A.B scope is considered before outer namespace A, got %q", target)
 }
 
+// TestCrossRepo_RefusedCSharpMemberCallStaysUnresolved: the main
+// resolver leaves a C# member call unresolved as a VERDICT (a
+// constraint the receiver fails, a using another scope owns). The
+// cross-repo pass's name-only fallback must not overturn it — it
+// carries no C# evidence and would resurrect exactly the misbinds the
+// member gates refuse, with no confidence and no origin.
+func TestCrossRepo_RefusedCSharpMemberCallStaysUnresolved(t *testing.T) {
+	cases := map[string]map[string]string{
+		"constraint": {
+			"Ext.cs": `namespace App {
+    public interface ITagged {}
+    public static class E {
+        public static int Foo<T>(this T x) where T : ITagged { return 1; }
+    }
+}`,
+			"Caller.cs": `namespace App {
+    public class Plain {}
+    public class Runner {
+        public void Run() {
+            Plain p = new Plain();
+            p.Foo();
+        }
+    }
+}`,
+		},
+		"sibling-using": {
+			"W.cs": `namespace W {
+    public class Widget {}
+}`,
+			"XExt.cs": `using W;
+namespace X {
+    public static class XE { public static int Foo(this Widget w) { return 2; } }
+}`,
+			"Caller.cs": `using W;
+namespace A {
+    using X;
+}
+namespace B {
+    public class Runner {
+        public void Run() {
+            Widget w = new Widget();
+            w.Foo();
+        }
+    }
+}`,
+		},
+	}
+	for name, files := range cases {
+		t.Run(name, func(t *testing.T) {
+			g := buildCSharpResolverGraph(t, files)
+			New(g).ResolveAll()
+			require.True(t, graph.IsUnresolvedTarget(fooCallTarget(g, "Caller.cs::Runner.Run")),
+				"precondition: the main resolver refuses this bind")
+
+			NewCrossRepo(g).ResolveAll()
+			target := fooCallTarget(g, "Caller.cs::Runner.Run")
+			assert.True(t, graph.IsUnresolvedTarget(target),
+				"the cross-repo name-only fallback must not overturn the member gates, got %q", target)
+		})
+	}
+}
+
 // TestResolveCSharpExtension_SiblingNamespaceUsingNotVisible: a using
 // declared inside namespace A is scoped to A — a sibling namespace B in the
 // same file must not see it.
