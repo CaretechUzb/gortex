@@ -566,6 +566,23 @@ CREATE TABLE IF NOT EXISTS enrichment_state (
     PRIMARY KEY (repo_prefix, provider)
 ) WITHOUT ROWID;
 
+-- contract_state records, per repo, that a WHOLE-REPO contract pass committed
+-- against this store: the revision it ran at, when it finished, and how many
+-- contracts it wrote. Contracts are committed all-at-once by the tail of a
+-- full index while re-index admission is per-file mtime, so a run whose tail
+-- is lost leaves the contract tier empty and every later warm restart sees
+-- unchanged mtimes and re-extracts nothing. Absent this row the empty tier is
+-- indistinguishable from a repo that genuinely declares no contracts; the
+-- contract / route query path reads it to say which one it is answering. One
+-- row per repo_prefix; WITHOUT ROWID — the PK index IS the table, like
+-- file_mtimes / repo_index_state.
+CREATE TABLE IF NOT EXISTS contract_state (
+    repo_prefix    TEXT PRIMARY KEY,
+    indexed_sha    TEXT NOT NULL DEFAULT '',
+    completed_at   INTEGER NOT NULL DEFAULT 0,
+    contract_count INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
 -- clone_shingles is the per-symbol MinHash shingle-set sidecar. Each
 -- function/method node's []uint64 shingle set is stored as a little-
 -- endian BLOB (8 bytes/elem) keyed by node_id so the maintained clone-

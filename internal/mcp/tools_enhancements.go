@@ -3840,7 +3840,15 @@ func (s *Server) handleContracts(ctx context.Context, req mcp.CallToolRequest) (
 func (s *Server) handleGetContracts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	registry := s.effectiveContractRegistry()
 	if registry == nil {
-		return mcp.NewToolResultError("no contract registry available — index a repository first"), nil
+		// A repository indexed with a lost contract tail reaches here too:
+		// nothing ever committed the tier, so no registry was retained. Name
+		// that possibility instead of sending the caller off to re-index a
+		// repository that is already indexed.
+		msg := "no contract registry available — index a repository first"
+		if unbuilt := s.contractTierUnbuiltRepos(ctx, nil); len(unbuilt) > 0 {
+			msg += "; " + contractTierCaveatLine(unbuilt)
+		}
+		return mcp.NewToolResultError(msg), nil
 	}
 
 	contractType := req.GetString("type", "")
@@ -3923,6 +3931,16 @@ func (s *Server) handleGetContracts(ctx context.Context, req mcp.CallToolRequest
 		contractsNextCursor = encodeCursor(contractsEnd)
 	}
 
+	// An in-scope total of zero is ambiguous: these repositories may declare
+	// no contracts, or their contract tier may never have been built (a lost
+	// index tail commits nothing, and per-file mtime admission never
+	// re-extracts it). Qualify the empty answer when the graph knows — see
+	// contract_tier.go.
+	var unbuiltTier []string
+	if contractsTotal == 0 {
+		unbuiltTier = s.contractTierUnbuiltRepos(ctx, contractRepoAllow)
+	}
+
 	if isCompact(req) {
 		var b strings.Builder
 		// Group by repo for readability in multi-repo mode.
@@ -3952,6 +3970,9 @@ func (s *Server) handleGetContracts(ctx context.Context, req mcp.CallToolRequest
 		if depsSkipped > 0 {
 			fmt.Fprintf(&b, "dependencies_skipped: %d (pass include_deps=true to include)\n", depsSkipped)
 		}
+		if len(unbuiltTier) > 0 {
+			b.WriteString(contractTierCaveatLine(unbuiltTier))
+		}
 		res := mcp.NewToolResultText(b.String())
 		if !allRepos {
 			res = decorateResultWithScope(res, resolved)
@@ -3969,6 +3990,9 @@ func (s *Server) handleGetContracts(ctx context.Context, req mcp.CallToolRequest
 			extra = append(extra, "dependencies_skipped", fmt.Sprintf("%d", depsSkipped))
 		}
 		res, err := s.gcxResponseWithBudget(req)(encodeContractsList(filtered, len(filtered), extra...))
+		if err == nil {
+			stampContractTierCaveat(res, unbuiltTier)
+		}
 		if !allRepos {
 			return withScopeResult(res, err, resolved)
 		}
@@ -4017,6 +4041,9 @@ func (s *Server) handleGetContracts(ctx context.Context, req mcp.CallToolRequest
 			"total": depsSkipped,
 			"hint":  "pass include_deps=true to include type=dependency and vendor-pathed contracts",
 		}
+	}
+	if len(unbuiltTier) > 0 {
+		payload["contract_tier"] = contractTierCaveat(unbuiltTier)
 	}
 	if !allRepos {
 		return s.respondScopedJSONOrTOON(ctx, req, payload, resolved)

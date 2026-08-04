@@ -1286,6 +1286,45 @@ type EnrichmentStateStore interface {
 	SetEnrichmentState(state EnrichmentState) error
 }
 
+// ContractState is the per-repo completion marker for the contract tier: the
+// git revision the whole-repo contract pass last committed at, when it
+// finished, and how many contracts it wrote.
+//
+// Contracts are committed all-at-once by the tail of a full index (the
+// deferred contract pass, or its inline equivalent), while re-index admission
+// is per-file mtime. Those two policies disagree: a run whose tail never
+// completes leaves the contract tier EMPTY — not degraded, empty — and every
+// later warm restart sees unchanged mtimes, re-extracts nothing, and keeps it
+// empty for the life of the index. Nothing on disk recorded that the pass was
+// owed, so nothing could tell an unbuilt tier from a repo that genuinely
+// declares no contracts.
+//
+// This row is that record. A repo with no ContractState row has never had a
+// whole-repo contract pass commit against this store, so a zero-row answer
+// from a contract / route query is unbuilt rather than empty.
+type ContractState struct {
+	RepoPrefix    string
+	IndexedSHA    string
+	CompletedAt   int64 // unix seconds
+	ContractCount int
+}
+
+// ContractStateStore is an optional capability backends MAY implement to
+// persist and read back the per-repo contract-tier completion marker.
+// Backends without durable state (the in-memory graph) simply do not
+// implement it — callers type-assert and, when the assertion fails, report no
+// signal at all rather than a false "unbuilt" (an in-memory graph rebuilds
+// its contract tier from scratch on every start, so the failure mode this
+// marker exists to catch cannot occur there).
+//
+// GetContractState's bool is false when no row has been recorded yet: either
+// the repo's contract pass never completed, or the store predates the marker.
+// Both are "not known to be built", which is what the query path reports.
+type ContractStateStore interface {
+	GetContractState(repoPrefix string) (ContractState, bool, error)
+	SetContractState(state ContractState) error
+}
+
 // LightNodeReader is an optional store capability: a repo-scoped node scan
 // that skips decoding each row's opaque meta blob, populating only struct
 // columns and the already-promoted meta keys (signature/visibility/doc/
