@@ -311,8 +311,12 @@ type ClaudeCLIConfig struct {
 	// pick its own default.
 	Model string `mapstructure:"model" yaml:"model,omitempty"`
 	// Args is a list of extra arguments appended after the provider's
-	// own flags. Useful for `--allowed-tools ""` to disable tools, or
-	// `--permission-mode plan` for a read-only profile.
+	// own flags. It also overrides them: the provider skips any of its
+	// headless defaults (`--tools ""`, `--strict-mcp-config`,
+	// `--settings '{"disableAllHooks":true}'`, `--system-prompt`) whose
+	// flag appears here. `["--tools", "default"]` restores the built-in
+	// toolset; `["--permission-mode", "plan"]` picks a read-only
+	// profile.
 	Args []string `mapstructure:"args" yaml:"args,omitempty"`
 	// TimeoutSeconds caps one Complete call. 0 → 120s.
 	TimeoutSeconds int `mapstructure:"timeout_seconds" yaml:"timeout_seconds,omitempty"`

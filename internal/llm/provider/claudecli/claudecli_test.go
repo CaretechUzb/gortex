@@ -35,9 +35,11 @@ func fakeClaude(t *testing.T, dir string, opts fakeOpts) string {
 	stderrPayload := strings.ReplaceAll(opts.stderr, "'", "'\\''")
 	stdoutPayload := strings.ReplaceAll(opts.stdout, "'", "'\\''")
 
+	// NUL-separated so an argument carrying newlines (the JSON-Schema
+	// rider does) still round-trips as exactly one argv entry.
 	body := "#!/bin/sh\n" +
 		"set -e\n" +
-		"printf '%s\\n' \"$@\" > '" + argsLog + "'\n" +
+		"printf '%s\\0' \"$@\" > '" + argsLog + "'\n" +
 		"cat > '" + stdinLog + "'\n"
 	if opts.sleep > 0 {
 		body += fmt.Sprintf("sleep %d\n", int(opts.sleep.Seconds()+1))
@@ -72,6 +74,41 @@ func readSidecar(t *testing.T, scriptPath, name string) string {
 		t.Fatalf("read %s: %v", name, err)
 	}
 	return string(b)
+}
+
+// argv reconstructs the exact argument vector the fake CLI received.
+func argv(t *testing.T, scriptPath string) []string {
+	t.Helper()
+	raw := readSidecar(t, scriptPath, "args.txt")
+	raw = strings.TrimSuffix(raw, "\x00")
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, "\x00")
+}
+
+// flagValue returns the argument following flag, and whether flag was
+// passed at all (a trailing flag reports "" plus true).
+func flagValue(args []string, flag string) (string, bool) {
+	for i, a := range args {
+		if a != flag {
+			continue
+		}
+		if i+1 < len(args) {
+			return args[i+1], true
+		}
+		return "", true
+	}
+	return "", false
+}
+
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestNew_BinaryNotFound(t *testing.T) {
@@ -121,18 +158,181 @@ func TestComplete_FreeformSuccess(t *testing.T) {
 		t.Errorf("text=%q want hello world", resp.Text)
 	}
 
-	gotArgs := readSidecar(t, script, "args.txt")
-	for _, want := range []string{"--print", "--output-format", "text", "--append-system-prompt", "be terse"} {
-		if !strings.Contains(gotArgs, want) {
-			t.Errorf("args missing %q\nargs=\n%s", want, gotArgs)
+	args := argv(t, script)
+	for _, want := range []string{"--print", "--output-format", "text"} {
+		if !hasArg(args, want) {
+			t.Errorf("args missing %q\nargs=%q", want, args)
 		}
+	}
+	if got, ok := flagValue(args, "--system-prompt"); !ok || got != "be terse" {
+		t.Errorf("--system-prompt=%q present=%v, want %q", got, ok, "be terse")
 	}
 	stdin := readSidecar(t, script, "stdin.txt")
 	if !strings.Contains(stdin, "User: hi") {
 		t.Errorf("stdin missing user turn:\n%s", stdin)
 	}
 	if strings.Contains(stdin, "be terse") {
-		t.Error("system content must travel via --append-system-prompt, not stdin")
+		t.Error("system content must travel via --system-prompt, not stdin")
+	}
+}
+
+// The provider must REPLACE Claude Code's default system prompt rather
+// than append to it: appending leaves the interactive agent persona,
+// the discovered CLAUDE.md files and the injected cwd/environment block
+// in force, and that context beats the structured-output instruction.
+func TestComplete_ReplacesDefaultSystemPrompt(t *testing.T) {
+	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
+
+	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
+	defer p.Close()
+
+	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
+	}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	args := argv(t, script)
+	if hasArg(args, "--append-system-prompt") {
+		t.Errorf("must not append to the default system prompt; args=%q", args)
+	}
+	// Emitted even with no system messages — an empty replacement is
+	// what strips the default agentic prompt.
+	got, ok := flagValue(args, "--system-prompt")
+	if !ok || got != "" {
+		t.Errorf("--system-prompt=%q present=%v, want an empty replacement", got, ok)
+	}
+}
+
+// The headless defaults: hooks off (the reported failure — a user's
+// SessionEnd hook exiting nonzero failed the whole call), no native
+// toolset, no MCP servers.
+func TestComplete_HeadlessDefaults(t *testing.T) {
+	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
+
+	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
+	defer p.Close()
+
+	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
+	}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	args := argv(t, script)
+
+	if got, ok := flagValue(args, "--settings"); !ok || !strings.Contains(got, `"disableAllHooks":true`) {
+		t.Errorf("--settings=%q present=%v, want disableAllHooks", got, ok)
+	}
+	if got, ok := flagValue(args, "--tools"); !ok || got != "" {
+		t.Errorf("--tools=%q present=%v, want an empty toolset", got, ok)
+	}
+	if !hasArg(args, "--strict-mcp-config") {
+		t.Errorf("args missing --strict-mcp-config; args=%q", args)
+	}
+}
+
+// --tools is variadic: it swallows every following argument up to the
+// next flag. The value must therefore always be followed by one.
+func TestComplete_ToolsFlagIsFollowedByAFlag(t *testing.T) {
+	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
+
+	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
+	defer p.Close()
+
+	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
+	}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	args := argv(t, script)
+	i := -1
+	for n, a := range args {
+		if a == "--tools" {
+			i = n
+			break
+		}
+	}
+	if i < 0 {
+		t.Fatalf("no --tools in args=%q", args)
+	}
+	if i+2 >= len(args) {
+		t.Fatalf("--tools value is the last argument; a variadic flag must be followed by another flag: args=%q", args)
+	}
+	if next := args[i+2]; !strings.HasPrefix(next, "-") {
+		t.Errorf("argument after --tools value is %q, want a flag (it would be swallowed); args=%q", next, args)
+	}
+}
+
+// Any flag in llm.claudecli.args wins over the matching headless
+// default — the config file stays the final word.
+func TestComplete_ArgsOverrideHeadlessDefaults(t *testing.T) {
+	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
+
+	p, _ := New(llm.ClaudeCLIConfig{
+		Binary: script,
+		Args:   []string{"--tools", "default", "--settings=/etc/claude.json"},
+	})
+	defer p.Close()
+
+	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
+	}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	args := argv(t, script)
+
+	var tools, settings int
+	for _, a := range args {
+		switch {
+		case a == "--tools":
+			tools++
+		case a == "--settings" || strings.HasPrefix(a, "--settings="):
+			settings++
+		}
+	}
+	if tools != 1 {
+		t.Errorf("--tools appears %d times, want 1 (the user's); args=%q", tools, args)
+	}
+	if settings != 1 {
+		t.Errorf("--settings appears %d times, want 1 (the user's); args=%q", settings, args)
+	}
+	if got, _ := flagValue(args, "--tools"); got != "default" {
+		t.Errorf("--tools=%q, want the user's %q", got, "default")
+	}
+	// Untouched defaults still apply.
+	if !hasArg(args, "--strict-mcp-config") {
+		t.Errorf("args missing --strict-mcp-config; args=%q", args)
+	}
+}
+
+// A user-supplied --system-prompt replaces the base prompt, so the
+// provider's own instruction (which carries the JSON-Schema rider) must
+// survive as an append rather than be dropped.
+func TestComplete_UserSystemPromptKeepsSchemaRider(t *testing.T) {
+	script := fakeClaude(t, "", fakeOpts{stdout: `{"terms":["a"]}`})
+
+	p, _ := New(llm.ClaudeCLIConfig{
+		Binary: script,
+		Args:   []string{"--system-prompt", "you are terse"},
+	})
+	defer p.Close()
+
+	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "expand 'x'"}},
+		Shape:    llm.ShapeExpandTerms,
+	}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	args := argv(t, script)
+
+	if got, ok := flagValue(args, "--system-prompt"); !ok || got != "you are terse" {
+		t.Errorf("--system-prompt=%q present=%v, want the user's", got, ok)
+	}
+	appended, ok := flagValue(args, "--append-system-prompt")
+	if !ok {
+		t.Fatalf("schema rider dropped; args=%q", args)
+	}
+	if !strings.Contains(appended, "JSON Schema") {
+		t.Errorf("--append-system-prompt=%q, want the JSON-Schema rider", appended)
 	}
 }
 
@@ -147,9 +347,8 @@ func TestComplete_PassesModel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	args := readSidecar(t, script, "args.txt")
-	if !strings.Contains(args, "--model\nsonnet") && !strings.Contains(args, "--model sonnet") {
-		t.Errorf("args missing --model sonnet:\n%s", args)
+	if got, ok := flagValue(argv(t, script), "--model"); !ok || got != "sonnet" {
+		t.Errorf("--model=%q present=%v, want sonnet", got, ok)
 	}
 }
 
@@ -171,9 +370,9 @@ func TestComplete_StructuredExtractsJSON(t *testing.T) {
 		t.Errorf("text=%q want the unwrapped JSON object", resp.Text)
 	}
 
-	args := readSidecar(t, script, "args.txt")
-	if !strings.Contains(args, "JSON Schema") {
-		t.Errorf("structured request must inject a JSON Schema rider; args=\n%s", args)
+	rider, ok := flagValue(argv(t, script), "--system-prompt")
+	if !ok || !strings.Contains(rider, "JSON Schema") {
+		t.Errorf("structured request must inject a JSON Schema rider; got %q", rider)
 	}
 }
 
@@ -208,6 +407,26 @@ func TestComplete_NonZeroExit(t *testing.T) {
 	}
 }
 
+// `claude -p` prints its terminal errors on stdout and leaves stderr
+// empty, so a stderr-only error message collapses a real diagnosis into
+// an opaque "exit status 1".
+func TestComplete_NonZeroExitFallsBackToStdout(t *testing.T) {
+	script := fakeClaude(t, "", fakeOpts{exitCode: 1, stdout: "Error: Reached max turns (1)"})
+
+	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
+	defer p.Close()
+
+	_, err := p.Complete(context.Background(), llm.CompletionRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
+	})
+	if err == nil {
+		t.Fatal("expected error for non-zero exit")
+	}
+	if !strings.Contains(err.Error(), "Reached max turns") {
+		t.Errorf("error should fall back to the stdout snippet; got: %v", err)
+	}
+}
+
 func TestComplete_EmptyResponseErrors(t *testing.T) {
 	script := fakeClaude(t, "", fakeOpts{stdout: ""})
 
@@ -237,7 +456,7 @@ func TestComplete_ContextCancellation(t *testing.T) {
 func TestComplete_ExtraArgsForwarded(t *testing.T) {
 	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
 
-	p, _ := New(llm.ClaudeCLIConfig{Binary: script, Args: []string{"--allowed-tools", ""}})
+	p, _ := New(llm.ClaudeCLIConfig{Binary: script, Args: []string{"--permission-mode", "plan"}})
 	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
@@ -245,9 +464,8 @@ func TestComplete_ExtraArgsForwarded(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	args := readSidecar(t, script, "args.txt")
-	if !strings.Contains(args, "--allowed-tools") {
-		t.Errorf("args missing --allowed-tools:\n%s", args)
+	if got, ok := flagValue(argv(t, script), "--permission-mode"); !ok || got != "plan" {
+		t.Errorf("--permission-mode=%q present=%v, want plan", got, ok)
 	}
 }
 
