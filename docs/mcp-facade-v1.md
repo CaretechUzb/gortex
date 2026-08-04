@@ -601,6 +601,7 @@ Success and regression dashboards SHOULD track:
 - `edit` and `refactor` retain stale-write guards and dry-run behavior where supported.
 - Applying external mutations follows the same `change` pipeline: `detect`, then `tests`, `guards`, and `contract` using the detected symbol IDs. The Codex `apply_patch` PostToolUse adapter runs this pipeline automatically; other harnesses can call the public operations directly.
 - `change(operation="impact", target={symbol:...})` and its `target.symbols` batch form produce the same result as the canonical impact handler selector.
+- `analyze(kind="impact", target={symbol:...})` ranks that symbol's dependency closure — the target itself plus its transitive dependents — and the target MUST appear in its own result. Its filters narrow the dependents only. Without a target the kind keeps its repo-wide ranking. A target the server cannot resolve MUST return a structured error (`symbol_not_found` / `file_not_indexed`); silently answering with the repo-wide ranking is a fail-open the caller cannot detect.
 - A reach-index entry is usable only after its generation and completeness marker are published with all distance tiers. An incomplete or concurrently replaced entry MUST fall back to a live graph walk; repeated identical impact queries MUST NOT decrease to a false-safe zero result while the graph is unchanged.
 
 ### 15.6 Observability

@@ -2214,16 +2214,22 @@ func analyzeFacadeCapabilitySchema(spec facadeOperationSpec, legacyProperties ma
 	if len(output) > 0 {
 		properties["output"] = map[string]any{"type": "object", "properties": output, "additionalProperties": false}
 	}
-	if spec.Operation == "def_use" || spec.Operation == "co_change" {
+	// def_use and co_change are target-only. impact's target is optional:
+	// with one it ranks that symbol's blast radius, without one it keeps
+	// its repo-wide ranking.
+	switch spec.Operation {
+	case "def_use", "co_change", "impact":
 		targetProperties := map[string]any{"symbol": map[string]any{"type": "string"}}
-		if spec.Operation == "co_change" {
+		if spec.Operation != "def_use" {
 			targetProperties["file"] = map[string]any{"type": "string"}
 		}
 		properties["target"] = map[string]any{
 			"type": "object", "properties": targetProperties,
 			"minProperties": 1, "maxProperties": 1, "additionalProperties": false,
 		}
-		topRequired = append(topRequired, "target")
+		if spec.Operation != "impact" {
+			topRequired = append(topRequired, "target")
+		}
 	}
 	return map[string]any{
 		"type": "object", "properties": properties,
@@ -2364,9 +2370,7 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 		switch spec.Operation {
 		case "citation":
 			args["options"] = map[string]any{"span": "<verbatim code>", "file_path": "<file>"}
-		case "co_change":
-			args["target"] = placeholder("symbol")
-		case "def_use":
+		case "co_change", "def_use", "impact":
 			args["target"] = placeholder("symbol")
 		case "would_create_cycle":
 			args["options"] = map[string]any{"from_id": "<source symbol>", "to_id": "<target symbol>"}

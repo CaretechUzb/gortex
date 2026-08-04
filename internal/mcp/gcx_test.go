@@ -315,6 +315,46 @@ func TestEncodeAnalyze_DeadCode(t *testing.T) {
 	require.Equal(t, "no incoming edges", rows[0]["reason"])
 }
 
+// The GCX header carries the closure metadata: rows alone cannot tell a
+// complete blast radius from a bounded one.
+func TestEncodeAnalyze_ImpactTargetHeaderCarriesTheClosure(t *testing.T) {
+	target := &impactTargetScope{
+		Symbol: "core.go::Hub", Seeds: []string{"core.go::Hub"},
+		Depth:   map[string]int{"core.go::Hub": 0, "callers.go::a": 1},
+		ByDepth: map[int]int{1: 1}, Total: 1,
+	}
+	rows := []impactRow{
+		{ID: "core.go::Hub", Name: "Hub", Kind: "function", File: "core.go", Line: 10, Score: 42.5, Risk: "MEDIUM", Target: true},
+		{ID: "callers.go::a", Name: "a", Kind: "function", File: "callers.go", Line: 1, Score: 3.5, Risk: "LOW", Depth: 1},
+	}
+	payload, err := encodeAnalyze("impact.target", impactTargetPayload{Target: target, Rows: rows})
+	require.NoError(t, err)
+	dec := wire.NewDecoder(strings.NewReader(string(payload)))
+	h, err := dec.Header()
+	require.NoError(t, err)
+	require.Equal(t, "analyze.impact.target", h.Tool)
+	require.Equal(t, "core.go::Hub", h.Meta["target"])
+	require.Equal(t, "1", h.Meta["dependents"])
+	decoded, err := dec.All()
+	require.NoError(t, err)
+	require.Len(t, decoded, 2)
+	require.Equal(t, "core.go::Hub", decoded[0]["id"])
+	require.Equal(t, "1", decoded[1]["depth"])
+}
+
+func TestEncodeAnalyze_ImpactTargetZeroDependentsCarriesCaveat(t *testing.T) {
+	target := &impactTargetScope{Symbol: "leaf.go::Leaf", Seeds: []string{"leaf.go::Leaf"}, Depth: map[string]int{"leaf.go::Leaf": 0}, ByDepth: map[int]int{}}
+	payload, err := encodeAnalyze("impact.target", impactTargetPayload{
+		Target: target,
+		Rows:   []impactRow{{ID: "leaf.go::Leaf", Target: true}},
+	})
+	require.NoError(t, err)
+	dec := wire.NewDecoder(strings.NewReader(string(payload)))
+	h, err := dec.Header()
+	require.NoError(t, err)
+	require.Equal(t, "true", h.Meta["zero_dependents_unproven"])
+}
+
 func TestEncodeAnalyze_UnknownKindFallsBackToGeneric(t *testing.T) {
 	payload, err := encodeAnalyze("weird", map[string]any{"x": 1})
 	require.NoError(t, err)

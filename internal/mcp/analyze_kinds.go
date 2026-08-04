@@ -260,7 +260,7 @@ var analyzeKindDescriptions = map[string]string{
 	"hotspots":                    "Over-coupled symbols ranked by fan-in, fan-out, and community crossings",
 	"hygiene":                     "SAST hygiene scan (alias of sast) — CWE/OWASP-tagged rules across 8 languages",
 	"images":                      "Container images (Dockerfile FROM / K8s container.image) with consumer count",
-	"impact":                      "Composite 0-100 change-impact score + risk label over 5 axes (PageRank, reach, complexity, co-change, span)",
+	"impact":                      "Composite 0-100 change-impact score + risk label over 5 axes (PageRank, reach, complexity, co-change, span); pass target:{symbol} to rank that symbol's blast radius instead of the whole repo",
 	"indirect_mutations":          "Fields mutated indirectly via a method/sibling call on the receiver — surfaces the via method",
 	"k8s_resources":               "Kubernetes resource fan-out (depends_on/configures/mounts/exposes/uses_env); k8s_kind/namespace filters",
 	"kcore":                       "k-core decomposition — the densely-connected graph core by k-degree (the infrastructure every layer leans on)",
