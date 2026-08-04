@@ -1,9 +1,11 @@
 package graph
 
-// ZeroEdgeClass classifies why a symbol's graph query came back empty.
-// An empty result has two very different causes that an agent cannot
-// otherwise tell apart, and a pre-edit safety check that trusts a
-// false "0 usages" is silently disarmed.
+// ZeroEdgeClass classifies why a symbol's graph query returned nothing an
+// agent can act on. A thin result has several very different causes that
+// an agent cannot otherwise tell apart — genuinely unused code, a symbol
+// the extractor never processed, and resolution that landed too weakly to
+// prove anything — and a pre-edit safety check that trusts a false
+// "0 usages" is silently disarmed.
 type ZeroEdgeClass string
 
 const (
@@ -72,9 +74,9 @@ const TierFilteredClass = "tier_filtered"
 // always TierFilteredClass; EdgesBelowMinTier counts the edges dropped by the
 // filter and MaxAvailableTier names the best tier actually present.
 type TierFilteredCaveat struct {
-	Class            string `json:"class" toon:"class"`
-	EdgesBelowMinTier int   `json:"edges_below_min_tier" toon:"edges_below_min_tier"`
-	MaxAvailableTier string `json:"max_available_tier" toon:"max_available_tier"`
+	Class             string `json:"class" toon:"class"`
+	EdgesBelowMinTier int    `json:"edges_below_min_tier" toon:"edges_below_min_tier"`
+	MaxAvailableTier  string `json:"max_available_tier" toon:"max_available_tier"`
 }
 
 // usageEdgeKinds are the incoming edge kinds that count as a symbol
