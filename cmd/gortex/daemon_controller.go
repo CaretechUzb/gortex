@@ -708,6 +708,12 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 
+	// Stat every configured repo path before taking c.mu. A stat is cheap
+	// on a live path and on a deleted one, but an unresponsive network
+	// mount can block for seconds, and no status caller should be able to
+	// wedge track / untrack / reload behind a dead NFS handle.
+	configRepos, repoMissing := c.trackedRepoLiveness()
+
 	// Everything above is the slow half and c.mu below is the contended half.
 	// Re-check between them: a caller whose budget expired during the scans
 	// must not go on to queue behind a mutex held by a minutes-long track.
@@ -851,6 +857,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 				Edges:            edges,
 				LastIndex:        meta.LastIndexTime.Unix(),
 				Memory:           mem,
+				Missing:          lookupRepoMissing(repoMissing, meta.RootPath),
 			})
 		}
 		searchBackendForResponse = backendStats.SearchBackendStats
@@ -896,6 +903,16 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		workspaces = append(workspaces, *wsAgg[k])
 	}
 
+	// Reconcile the live indexer registry against the tracked-repo registry
+	// in the global config, so `daemon status` and `gortex repos` report one
+	// inventory instead of two that can drift apart (#312). A repo whose
+	// directory was deleted while the daemon was down fails startup indexing
+	// and never reaches AllMetadata — it would silently vanish from this
+	// response while `gortex repos`, which reads the config, kept listing it.
+	// Synthesised rows carry zero counts and are appended AFTER the workspace
+	// rollup above, which summarises indexed content only.
+	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, tracked)...)
+
 	// mem was sampled before the mutex was taken — see the note at the top
 	// of Status.
 
@@ -931,6 +948,83 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 	// MCPSessions is populated by the daemon Server (it owns the
 	// SessionRegistry — the controller doesn't have a back-pointer).
 	// See internal/daemon/server.go around the ControlStatus handler.
+}
+
+// trackedRepoLiveness snapshots the configured repo registry and stats
+// every entry's path, returning the entries alongside a path-keyed
+// "directory is gone" map. Called before Status takes c.mu so a wedged
+// filesystem can't block the control mutex.
+func (c *realController) trackedRepoLiveness() ([]config.RepoEntry, map[string]bool) {
+	if c.configManager == nil {
+		return nil, nil
+	}
+	gc := c.configManager.Global()
+	if gc == nil {
+		return nil, nil
+	}
+	entries := append([]config.RepoEntry(nil), gc.Repos...)
+	missing := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		missing[e.Path] = config.RepoPathMissing(e.Path)
+	}
+	return entries, missing
+}
+
+// lookupRepoMissing answers the liveness question for one repo root,
+// preferring the pre-stat'd map. A root the map doesn't cover (an
+// indexer registration with no matching config entry) is stat'd
+// directly rather than assumed live — reporting a deleted repo as
+// present is the bug, so the fallback errs toward answering.
+func lookupRepoMissing(missing map[string]bool, root string) bool {
+	if root == "" {
+		return false
+	}
+	if gone, ok := missing[root]; ok {
+		return gone
+	}
+	for path, gone := range missing {
+		if pathkey.EqualPaths(path, root) {
+			return gone
+		}
+	}
+	return config.RepoPathMissing(root)
+}
+
+// reconcileUnloadedRepos returns a synthetic row for every configured
+// repo the daemon holds no index for. Matching is by path first (what
+// track resolves and persists) and by resolved prefix second, so a repo
+// registered under a derived worktree-instance prefix still matches its
+// config entry.
+func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool, loaded []daemon.TrackedRepoStatus) []daemon.TrackedRepoStatus {
+	if len(entries) == 0 {
+		return nil
+	}
+	var out []daemon.TrackedRepoStatus
+	for _, e := range entries {
+		prefix := config.ResolvePrefix(e)
+		isLoaded := false
+		for _, r := range loaded {
+			if (e.Path != "" && pathkey.EqualPaths(r.Path, e.Path)) || (prefix != "" && r.Prefix == prefix) {
+				isLoaded = true
+				break
+			}
+		}
+		if isLoaded {
+			continue
+		}
+		out = append(out, daemon.TrackedRepoStatus{
+			Prefix:           prefix,
+			Path:             e.Path,
+			Name:             e.Name,
+			Workspace:        prefix,
+			WorkspaceProject: prefix,
+			Ref:              e.Ref,
+			Unloaded:         true,
+			Missing:          lookupRepoMissing(missing, e.Path),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Prefix < out[j].Prefix })
+	return out
 }
 
 // collectConfiguredServers reads `~/.gortex/servers.toml` (best

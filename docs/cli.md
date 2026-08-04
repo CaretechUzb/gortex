@@ -16,7 +16,7 @@ gortex gain [flags]          Forward-looking per-call USD savings projection fro
 gortex context [flags]       Generate portable context briefing for a task
 gortex savings [flags]       Token-savings dashboard (Today / Last 7 days / All time + USD avoided)
 gortex status [flags]        Show index status (per-repo and per-project in multi-repo mode)
-gortex repos [--json]        List every tracked repo with git head-commit SHA, last-indexed time, and a staleness flag
+gortex repos [--json]        List every tracked repo with git head-commit SHA, last-indexed time, and a freshness flag (MISSING when the path is gone)
 gortex track <path>          Add a repository to the tracked workspace
 gortex untrack <path>        Remove a repository from the tracked workspace
 gortex workspace <sub>       list [--json] / set / set-all — manage workspace + project slugs across tracked repos

@@ -543,6 +543,18 @@ type TrackedRepoStatus struct {
 	Edges            int             `json:"edges"`
 	LastIndex        int64           `json:"last_index_unix"`
 	Memory           MemoryBreakdown `json:"memory"`
+	// Missing is true when Path no longer names a directory on disk —
+	// the checkout was deleted, renamed, or unmounted while the entry
+	// stayed in `~/.gortex/config.yaml`. Such a repo can never be
+	// re-indexed, so it is reported rather than silently carried.
+	Missing bool `json:"missing,omitempty"`
+	// Unloaded is true for a repo that is registered in the tracked-repo
+	// config but that the daemon holds no index for — typically because
+	// startup could not index it (its path had already been deleted).
+	// The row is synthesised from the config registry so `daemon status`
+	// and `gortex repos` report the same inventory instead of one view
+	// dropping a repo the other still lists. Counts are zero.
+	Unloaded bool `json:"unloaded,omitempty"`
 }
 
 // WorkspaceSummary aggregates per-workspace stats so `gortex daemon
