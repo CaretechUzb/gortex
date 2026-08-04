@@ -9,8 +9,8 @@ import (
 
 // This file adds the repo-scoped store hygiene the base eviction path lacks.
 // EvictRepo (store.go) deletes ONLY nodes+edges, but a repo owns fifteen
-// other sidecar tables (file_mtimes, repo_index_state,
-// enrichment_state, semantic_binding_types, clone_shingles, constant_values,
+// other sidecar tables (file_mtimes, repo_index_state, enrichment_state,
+// contract_state, semantic_binding_types, clone_shingles, constant_values,
 // files, ref_facts, vectors, churn/coverage/release/blame_enrichment,
 // symbol_fts, symbol_fts_rowid, content_fts — see schema.go). Untracking a repo through
 // EvictRepo leaks every one of them, so a long-lived store accumulates
@@ -37,6 +37,7 @@ var purgeSidecarTables = []string{
 	"file_mtimes",
 	"repo_index_state",
 	"enrichment_state",
+	"contract_state",
 	"semantic_binding_types",
 	"clone_shingles",
 	"clone_corpus_state",
@@ -209,18 +210,19 @@ func (s *Store) OrphanRepoPrefixes(known []string) []string {
 // rekeyMoveTables are the sidecar tables RekeyRepoPrefix relabels from old
 // to new. Every one is keyed by repo_prefix (+ file_path or provider), NOT
 // by node_id, so its row content survives a node-id change: file_mtimes /
-// files by (repo_prefix, file_path); repo_index_state / enrichment_state by
-// repo_prefix (+ provider). At a solo->multi migration every ” row in these
-// belongs to the one migrating repo — global externals live in the NODES
-// table and hold NO rows here — so moving them wholesale is safe. UPDATE OR
-// REPLACE folds any row the re-mint re-index already wrote under new
-// (identical content: same files, same mtimes, same commit) instead of
-// tripping the primary-key conflict a plain UPDATE would.
+// files by (repo_prefix, file_path); repo_index_state / contract_state /
+// enrichment_state by repo_prefix (+ provider). At a solo->multi migration
+// every ” row in these belongs to the one migrating repo — global externals
+// live in the NODES table and hold NO rows here — so moving them wholesale
+// is safe. UPDATE OR REPLACE folds any row the re-mint re-index already wrote
+// under new (identical content: same files, same mtimes, same commit) instead
+// of tripping the primary-key conflict a plain UPDATE would.
 var rekeyMoveTables = []string{
 	"file_mtimes",
 	"files",
 	"repo_index_state",
 	"enrichment_state",
+	"contract_state",
 }
 
 // rekeyDropTables are the sidecar tables RekeyRepoPrefix DROPS (rather than

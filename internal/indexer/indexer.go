@@ -294,6 +294,16 @@ type Indexer struct {
 	// Set during the shadow swap, cleared when idx.graph is restored.
 	contentSink graph.ContentSearcher
 
+	// contractStateSink mirrors bulkVectorSink for the contract-tier
+	// completion marker: the disk store captured at the shadow swap, so the
+	// inline contract pass records the marker on the backend even while
+	// idx.graph points at the in-memory shadow (which does not implement
+	// graph.ContractStateStore). Without it a shadow-backed full index would
+	// drain its contract nodes to disk while its marker died with the shadow,
+	// and every later query would call that healthy tier unbuilt.
+	// Set during the shadow swap, cleared when idx.graph is restored.
+	contractStateSink graph.ContractStateStore
+
 	// embedChunkOpts tunes the AST sub-chunking buildSearchIndex applies
 	// to large symbols before embedding. The zero value makes the
 	// chunker fall back to its package defaults.
@@ -2828,6 +2838,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// Same capture for the content index: the per-file content stream
 		// must reach content_fts on disk while idx.graph is the shadow.
 		idx.contentSink, _ = diskTarget.(graph.ContentSearcher)
+		// Same capture for the contract-tier marker: the inline contract
+		// pass commits while idx.graph is the shadow, and the marker must
+		// describe the disk store the drained contract nodes land in.
+		idx.contractStateSink, _ = diskTarget.(graph.ContractStateStore)
 		// The resolver was constructed at indexer.New with the disk
 		// Store. Redirect it at the shadow too, otherwise ResolveAll
 		// reads from the empty disk Store, finds no pending edges,
@@ -2842,6 +2856,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				idx.graph = diskTarget
 				idx.bulkVectorSink = nil
 				idx.contentSink = nil
+				idx.contractStateSink = nil
 				if idx.resolver != nil {
 					idx.resolver.SetGraph(diskTarget)
 				}
@@ -2996,6 +3011,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			idx.graph = diskTarget
 			idx.bulkVectorSink = nil
 			idx.contentSink = nil
+			idx.contractStateSink = nil
 			// Mirror of the SetGraph(inMemShadow) above: the resolver
 			// must follow the graph pointer back to the disk store, or
 			// every post-index per-file resolve (the watcher save path,
@@ -6693,10 +6709,54 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 	if idx.repoPrefix != "" {
 		repo = idx.repoPrefix
 	}
+	idx.recordContractStateMarker(len(all))
 	idx.logger.Info("contracts extracted",
 		zap.String("repo", repo),
 		zap.Int("count", len(all)),
 		zap.Duration("commit_bulk_elapsed", bulkElapsed))
+}
+
+// recordContractStateMarker persists this repo's contract-tier completion
+// marker once a whole-repo contract pass has committed.
+//
+// commitContracts is the only writer of the whole-repo contract tier — the
+// deferred tail (runDeferredContracts), the inline full-index path, and the
+// full-walk extractContracts all funnel through it, while the incremental
+// per-file path (refreshContractsForFiles) deliberately does not. So a run
+// that reaches here committed the tier for the repo, and a repo with no
+// marker never did: its tier is unbuilt, and per-file mtime admission will
+// never re-extract it on its own. That asymmetry is exactly what the query
+// path needs to tell an unbuilt tier from a repo with no contracts.
+//
+// The marker records presence, not freshness: it is written even on a dirty
+// tree or a non-git root (indexed_sha stays empty), because "this repo's
+// contract pass has completed at least once against this store" is the fact
+// callers need, and refusing to write it on a dirty tree would report a false
+// unbuilt tier for every repo with uncommitted work. A backend that does not
+// persist contract state (the in-memory graph, which rebuilds the tier from
+// scratch on every start) is a no-op.
+func (idx *Indexer) recordContractStateMarker(count int) {
+	// contractStateSink is set only while idx.graph is the in-memory shadow
+	// of a bulk-load index; it is the disk store the shadow drains into, and
+	// the marker must describe that store rather than die with the shadow.
+	store := idx.contractStateSink
+	if store == nil {
+		capable, ok := idx.graph.(graph.ContractStateStore)
+		if !ok {
+			return
+		}
+		store = capable
+	}
+	if err := store.SetContractState(graph.ContractState{
+		RepoPrefix:    idx.repoPrefix,
+		IndexedSHA:    repoHead(idx.rootPath),
+		CompletedAt:   time.Now().Unix(),
+		ContractCount: count,
+	}); err != nil {
+		idx.logger.Warn("persist contract-tier marker failed",
+			zap.String("repo", idx.repoPrefix),
+			zap.Error(err))
+	}
 }
 
 // bulkCommit writes nodes + edges in one AddBatch call. The bulk

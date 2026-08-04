@@ -93,12 +93,26 @@ func (s *Server) handleAnalyzeRoutes(ctx context.Context, req mcp.CallToolReques
 		}
 		return rows[i].Handler < rows[j].Handler
 	})
+	// A zero-row answer here is ambiguous: this repository may register no
+	// routes, or its contract tier may never have been built (a lost index
+	// tail commits nothing, and per-file mtime admission never re-extracts
+	// it). Say which one when the graph knows — see contract_tier.go. Only
+	// an empty answer is qualified; rows on the table are their own proof
+	// that the tier was built.
+	var unbuilt []string
+	if len(rows) == 0 {
+		unbuilt = s.contractTierUnbuiltRepos(ctx, repoAllowFromContext(ctx))
+	}
 	if s.isGCX(ctx, req) {
 		items := make([]routeItem, 0, len(rows))
 		for _, r := range rows {
 			items = append(items, routeItem(*r))
 		}
-		return s.gcxResponseWithBudget(req)(encodeAnalyze("routes", items))
+		res, err := s.gcxResponseWithBudget(req)(encodeAnalyze("routes", items))
+		if err == nil {
+			stampContractTierCaveat(res, unbuilt)
+		}
+		return res, err
 	}
 	if isCompact(req) {
 		var b strings.Builder
@@ -108,12 +122,19 @@ func (s *Server) handleAnalyzeRoutes(ctx context.Context, req mcp.CallToolReques
 		if len(rows) == 0 {
 			b.WriteString("no routes\n")
 		}
+		if len(unbuilt) > 0 {
+			b.WriteString(contractTierCaveatLine(unbuilt))
+		}
 		return mcp.NewToolResultText(b.String()), nil
 	}
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	payload := map[string]any{
 		"routes": rows,
 		"total":  len(rows),
-	})
+	}
+	if len(unbuilt) > 0 {
+		payload["contract_tier"] = contractTierCaveat(unbuilt)
+	}
+	return s.respondJSONOrTOON(ctx, req, payload)
 }
 
 // handleAnalyzeRouteFrameworks lists the registered structural route passes
