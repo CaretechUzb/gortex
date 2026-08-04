@@ -221,6 +221,42 @@ func TestResolveImport_NilDependencyLookupKeepsEntryPointRule(t *testing.T) {
 	assert.Equal(t, "packages/logger/index.ts", e.To)
 }
 
+// TestImportedDirForSpec_BareSpecifierGatesReachability pins the second
+// cascade site: reachableDirsByFile must not gain a directory just because
+// its name matches a bare npm specifier. A bogus entry there survives into
+// filterByReachability, where it lets a same-named call candidate defined in
+// that directory win a call edge.
+func TestImportedDirForSpec_BareSpecifierGatesReachability(t *testing.T) {
+	g := graph.New()
+	seedFile(g, "src/app.ts", "typescript")
+	seedFile(g, "src/feature/graphql/create.mutation.gql", "graphql")
+	seedFile(g, "packages/logger/index.ts", "typescript")
+	seedFile(g, "app/main.py", "python")
+	// A distinct name so the Python assertions can't collide with the
+	// `logger` candidates above — for non-JS/TS callers the cascade keeps
+	// its pre-existing first-hit-among-many behaviour, which would make a
+	// shared name ambiguous rather than wrong.
+	seedFile(g, "app/pylog/handler.py", "python")
+
+	r := New(g)
+	r.buildDirIndexes()
+
+	assert.Equal(t, "", r.importedDirForSpec("src/app.ts", "graphql"),
+		"a non-entry-point file must not make its directory reachable")
+	assert.Equal(t, "packages/logger", r.importedDirForSpec("src/app.ts", "logger"),
+		"an entry point still contributes reachability")
+	assert.Equal(t, "app/pylog", r.importedDirForSpec("app/main.py", "pylog"),
+		"non-JS/TS callers keep the unfiltered cascade")
+
+	r.SetNpmDependencyLookup(func(callerFile, specifier string) bool {
+		return specifier == "logger" || specifier == "pylog"
+	})
+	assert.Equal(t, "", r.importedDirForSpec("src/app.ts", "logger"),
+		"a declared external dependency contributes no in-repo directory")
+	assert.Equal(t, "app/pylog", r.importedDirForSpec("app/main.py", "pylog"),
+		"the dependency gate is JS/TS-only")
+}
+
 func TestIsJSTSDirEntryPoint(t *testing.T) {
 	cases := []struct {
 		path string
