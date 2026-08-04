@@ -126,6 +126,13 @@ Locate, reach, and analyze query tools uniformly accept `repo`, `project`, `work
 
 For `analyze`, the overrides genuinely narrow its **graph-node** kinds — `dead_code`, `hotspots`, `cycles`, `health_score`, `todos`, `stale_code`, `ownership`, `coverage_gaps`, `coverage_summary`, `impact`, `bottlenecks`, `role`, `k8s_resources`, `images`, `kustomize`, `dbt_models`, `external_calls`, and the like — and, since v1, its **edge-walk / graph-algorithm / framework / file-AST-scan** kinds too (`channel_ops`, `pubsub`, `routes`, `models`, `pagerank`, `kcore`, `edge_audit`, `tests_as_edges`, `sast`, `review`, …), which prune their rows / re-tally their counts against the same workspace + repo allow-set. The narrowing also resolves the two kind-specific collisions: `kind=cross_repo` keeps `repo` as its boundary filter and `kind=cycles` keeps `scope` as a file-path / package prefix (both are stripped from the uniform scope-resolution view). **v1 caveat:** the remaining long-tail kinds — community detection (`clusters`, `concepts`, `suggest_boundaries`), git/disk-mining (`blame`, `coverage`, `fixes_history`, `retrieval_log`, `temporal_verify`), per-id (`would_create_cycle`, `def_use`), `synthesizers` / `resolution_outcomes`, and `sql_rebuild` — remain workspace-bound but are **not** repo-narrowed — passing a narrowing arg on such a kind stamps a `scope_note` on the response disclosing the no-op.
 
+Some `analyze` operation names are not dispatcher kinds at all: the facade maps them to a separate legacy tool, which the dispatcher — and so `resolveScope` — never sees. Those tools carry the clamp themselves, and they split the same two ways:
+
+- **Workspace-clamped and repo-narrowed:** `health` (`audit_health`), `clones` (`find_clones`), `inspections` (`run_inspections`), `processes` (`get_processes`), `recent_changes` (`get_recent_changes`). Their rows are per-node, per-pair, or per-file, so a `repo` / `project` / `scope` selector narrows them for real.
+- **Workspace-clamped only:** `communities` (`get_communities`), for the same reason as the `clusters` / `concepts` kinds — one partition is computed over the whole index, so a narrowing arg is resolved for `scope_applied` and then widened to the workspace, with the response disclosing it.
+
+Their by-id lookups (`get_communities id:`, `get_processes id:`) resolve against the clamped set, so an out-of-scope id reports the same miss as one that never existed.
+
 ## Tool scoping by intent
 
 Tools are split by intent — each group has a different default scope:
@@ -161,7 +168,7 @@ When intent defaults are on, you can still widen or narrow explicitly:
 
 ### Uniform parameter set
 
-Every locate/reach/analyze tool now uniformly accepts `repo`, `project`, `workspace`, and `scope` parameters. All are clamped to the session workspace (the hard isolation boundary). For `analyze` this narrows the graph-node, edge-walk, graph-algorithm, framework, and file/AST-scan kinds; the remaining community / git-mining / per-id / synthesizer kinds are workspace-bound but not repo-narrowed in v1 (see the [MCP tools](#mcp-tools) caveat above).
+Every locate/reach/analyze tool now uniformly accepts `repo`, `project`, `workspace`, and `scope` parameters — including the legacy tools the `analyze` facade forwards to (`audit_health`, `find_clones`, `run_inspections`, `get_communities`, `get_processes`, `get_recent_changes`). All are clamped to the session workspace (the hard isolation boundary). For `analyze` this narrows the graph-node, edge-walk, graph-algorithm, framework, and file/AST-scan kinds; the remaining community / git-mining / per-id / synthesizer kinds are workspace-bound but not repo-narrowed in v1 (see the [MCP tools](#mcp-tools) caveat above).
 
 ### Response metadata
 

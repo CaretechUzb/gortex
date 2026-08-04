@@ -33,8 +33,15 @@ const (
 )
 
 // GraphChangeEvent is emitted after a successful graph patch.
+//
+// RepoPrefix names the repository whose watcher produced the event.
+// MultiWatcher merges the per-repo histories into one feed, and FilePath is
+// absolute, so without this field a merged row carries no attribution a
+// consumer can filter on. It is empty in single-repo mode, where the lone
+// Indexer keeps an empty prefix.
 type GraphChangeEvent struct {
 	FilePath       string     `json:"file_path"`
+	RepoPrefix     string     `json:"repo_prefix,omitempty"`
 	Kind           ChangeKind `json:"kind"`
 	Classification string     `json:"classification,omitempty"`
 	NodesAdded     int        `json:"nodes_added"`
@@ -2099,7 +2106,11 @@ func (w *Watcher) patchGraphWithReceiptStateRawModern(
 	freshEdges := w.countFileEdges(freshNodes)
 
 	ev := GraphChangeEvent{
-		FilePath:       path,
+		FilePath: path,
+		// The per-repo Indexer's prefix IS the key this watcher is
+		// registered under in MultiWatcher, so stamping it here is what
+		// makes a merged history row attributable to its repository.
+		RepoPrefix:     idx.RepoPrefix(),
 		Kind:           kind,
 		Classification: classification,
 		Timestamp:      time.Now(),

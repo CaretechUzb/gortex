@@ -15,6 +15,7 @@ import (
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/rerank"
 	"github.com/zzet/gortex/internal/tokens"
@@ -226,8 +227,12 @@ func (s *Server) registerCodingTools() {
 
 	s.addTool(
 		mcp.NewTool("get_recent_changes",
-			mcp.WithDescription("Returns files and symbols that changed since the last call (watch mode only). Use to re-orient after the user edits files outside of Claude Code's view, without re-reading anything."),
+			mcp.WithDescription("Returns files and symbols that changed since the last call (watch mode only). Use to re-orient after the user edits files outside of Claude Code's view, without re-reading anything. Rows are clamped to the session workspace and narrowed further by repo/project/scope."),
 			mcp.WithString("since", mcp.Description("ISO 8601 timestamp (omit for all changes since index)")),
+			mcp.WithString("repo", mcp.Description("Narrow to a single repository prefix (tracked name or path), clamped to the session workspace.")),
+			mcp.WithString("project", mcp.Description("Narrow to the repositories in a project, clamped to the session workspace.")),
+			mcp.WithString("workspace", mcp.Description("Restrict to the active workspace slug; daemon sessions may only name their own workspace.")),
+			mcp.WithString("scope", mcp.Description("Name of a saved scope (see save_scope) — its repositories narrow the feed, clamped to the session workspace.")),
 		),
 		s.handleGetRecentChanges,
 	)
@@ -734,45 +739,63 @@ func (s *Server) handleFindImportPath(ctx context.Context, req mcp.CallToolReque
 	})
 }
 
+// handleGetRecentChanges returns the watcher's change feed, narrowed to the
+// repositories the caller may see.
+//
+// Under the daemon the watcher is a MultiWatcher whose History merges the
+// per-repo feeds of every tracked repo — across workspaces — and each row's
+// `file` is an absolute path. `analyze kind=recent_changes` is a facade alias
+// that forwards straight to this tool, so nothing upstream narrows it: the
+// clamp belongs here. Rows are attributed by the repo prefix the emitting
+// watcher stamps on the event.
 func (s *Server) handleGetRecentChanges(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	watcher := s.currentWatcher()
 	if watcher == nil {
 		return mcp.NewToolResultError("watch mode is not active"), nil
 	}
+	resolved, errResult := s.resolveScope(ctx, req, IntentAnalyze)
+	if errResult != nil {
+		return errResult, nil
+	}
+	ctx = withRepoAllow(ctx, resolved.RepoAllow)
 
-	sinceStr := req.GetString("since", "")
-	var changes []map[string]any
-
-	if sinceStr != "" {
+	// Exactly one of the two reads runs: each copies every tracked repo's
+	// ring buffer under its own lock, and the merged form sorts the union.
+	var events []indexer.GraphChangeEvent
+	if sinceStr := req.GetString("since", ""); sinceStr != "" {
 		t, err := time.Parse(time.RFC3339, sinceStr)
 		if err != nil {
 			return mcp.NewToolResultError("invalid timestamp: " + sinceStr), nil
 		}
-		for _, ev := range watcher.HistorySince(t) {
-			changes = append(changes, map[string]any{
-				"file":          ev.FilePath,
-				"kind":          ev.Kind,
-				"nodes_added":   ev.NodesAdded,
-				"nodes_removed": ev.NodesRemoved,
-				"timestamp":     ev.Timestamp.Format(time.RFC3339),
-			})
-		}
+		events = watcher.HistorySince(t)
 	} else {
-		for _, ev := range watcher.History() {
-			changes = append(changes, map[string]any{
-				"file":          ev.FilePath,
-				"kind":          ev.Kind,
-				"nodes_added":   ev.NodesAdded,
-				"nodes_removed": ev.NodesRemoved,
-				"timestamp":     ev.Timestamp.Format(time.RFC3339),
-			})
-		}
+		events = watcher.History()
 	}
 
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	var changes []map[string]any
+	for _, ev := range events {
+		if !s.repoPrefixVisible(ctx, ev.RepoPrefix) {
+			continue
+		}
+		row := map[string]any{
+			"file":          ev.FilePath,
+			"kind":          ev.Kind,
+			"nodes_added":   ev.NodesAdded,
+			"nodes_removed": ev.NodesRemoved,
+			"timestamp":     ev.Timestamp.Format(time.RFC3339),
+		}
+		// Only present in multi-repo mode; a single-repo watcher leaves the
+		// prefix empty and the row shape is unchanged.
+		if ev.RepoPrefix != "" {
+			row["repo"] = ev.RepoPrefix
+		}
+		changes = append(changes, row)
+	}
+
+	return s.respondScopedJSONOrTOON(ctx, req, map[string]any{
 		"changes":             changes,
 		"graph_current_as_of": time.Now().Format(time.RFC3339),
-	})
+	}, resolved)
 }
 
 // suggestSymbolIDs builds a short "did you mean" hint for a symbol id that

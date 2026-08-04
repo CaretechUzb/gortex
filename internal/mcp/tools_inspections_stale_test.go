@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -14,7 +15,7 @@ func TestRunStaleCodeInspection(t *testing.T) {
 	addBlameEnrichedNode(srv.graph, "f.go::Stale", "f.go", 5, "bob@x", "bbb", 400)
 	addBlameEnrichedNode(srv.graph, "f.go::Ancient", "f.go", 9, "carol@x", "ccc", 800)
 
-	got := runStaleCodeInspection(srv, inspectionScope{})
+	got := runStaleCodeInspection(context.Background(), srv, inspectionScope{})
 	if len(got) != 2 {
 		t.Fatalf("want 2 stale violations (Stale+Ancient, 365d default), got %d: %+v", len(got), got)
 	}

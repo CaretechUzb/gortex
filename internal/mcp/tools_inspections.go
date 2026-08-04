@@ -10,6 +10,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -45,7 +46,11 @@ func (s *Server) registerInspectionsTools() {
 		mcp.NewTool("run_inspections",
 			mcp.WithDescription("Run one or more inspections and return uniform violation rows: {inspection, severity, file, line, message, symbol_id?}. Set `inspections=all` to run every inspector, or pass a CSV of ids from list_inspections. Aggregated under a summary {by_inspection, total_violations} so the caller can present a punch list. Composes existing analyzers (dead_code, cycles, todos, unsafe_patterns, coverage_gaps, stale_code), guards, and contract checks — no JetBrains dependency."),
 			mcp.WithString("inspections", mcp.Description("Comma-separated inspection IDs to run, or `all` for the full catalog. Required.")),
-			mcp.WithString("path_prefix", mcp.Description("Scope every inspector to nodes under this file-path prefix.")),
+			mcp.WithString("path_prefix", mcp.Description("Scope every inspector to nodes under this file-path prefix. Orthogonal to repo/project/scope — it filters paths, not repositories.")),
+			mcp.WithString("repo", mcp.Description("Narrow every inspector to a single repository prefix (tracked name or path), clamped to the session workspace.")),
+			mcp.WithString("project", mcp.Description("Narrow every inspector to the repositories in a project, clamped to the session workspace.")),
+			mcp.WithString("workspace", mcp.Description("Restrict to the active workspace slug; daemon sessions may only name their own workspace.")),
+			mcp.WithString("scope", mcp.Description("Name of a saved scope (see save_scope) — its repositories narrow every inspector, clamped to the session workspace.")),
 			mcp.WithString("severity", mcp.Description("Filter results to this severity (error / warning / info). Empty = no filter.")),
 			mcp.WithNumber("max_per_inspection", mcp.Description("Cap on violations per inspector (default: 50).")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx, or toon")),
@@ -67,13 +72,22 @@ type inspectionViolation struct {
 // inspectionSpec is the registry entry. run returns the inspector's
 // violations bounded by the scope predicate (which may be nil for
 // "no filter").
+//
+// ctx carries the session workspace and the resolved repo allow-set: every
+// inspector reads the whole graph, so each one is responsible for narrowing
+// its own rows through the scoped-node accessors or analyzeNodeVisible.
 type inspectionSpec struct {
 	ID          string
 	Category    string
 	Description string
 	Severity    string
-	Run         func(s *Server, scope inspectionScope) []inspectionViolation
+	Run         func(ctx context.Context, s *Server, scope inspectionScope) []inspectionViolation
 }
+
+// inspectionCallableKinds is the callable kind set the coverage and
+// staleness inspectors walk. Declared once so the scoped-node pushdown
+// agrees with what those inspectors mean by "callable".
+var inspectionCallableKinds = []graph.NodeKind{graph.KindFunction, graph.KindMethod}
 
 // inspectionScope is the call-side filter passed to every inspector.
 // Keep it minimal — adding fields here forces every inspector to
@@ -155,11 +169,26 @@ func (s *Server) handleListInspections(ctx context.Context, req mcp.CallToolRequ
 	})
 }
 
+// handleRunInspections runs the requested inspectors over the nodes the
+// caller may actually see.
+//
+// `analyze kind=inspections` is a facade alias that forwards straight to
+// this tool, so the analyze dispatcher's resolveScope never runs here and
+// the clamp has to be applied by the handler. Every inspector is a
+// whole-graph rollup over first-party symbols — the same shape as the
+// health_score / dead_code / hotspots analyze kinds — so this resolves the
+// uniform repo/project/workspace/scope narrowing and each inspector sources
+// its rows through the scoped accessors.
 func (s *Server) handleRunInspections(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	idsArg, err := req.RequireString("inspections")
 	if err != nil {
 		return mcp.NewToolResultError("`inspections` is required (CSV of ids, or `all`)"), nil
 	}
+	resolved, errResult := s.resolveScope(ctx, req, IntentAnalyze)
+	if errResult != nil {
+		return errResult, nil
+	}
+	ctx = withRepoAllow(ctx, resolved.RepoAllow)
 	scope := inspectionScope{
 		PathPrefix: strings.TrimSpace(req.GetString("path_prefix", "")),
 	}
@@ -185,7 +214,7 @@ func (s *Server) handleRunInspections(ctx context.Context, req mcp.CallToolReque
 		if !want[sp.ID] {
 			continue
 		}
-		raw := sp.Run(s, scope)
+		raw := sp.Run(ctx, s, scope)
 		// Apply per-call filters: severity + cap.
 		filtered := make([]inspectionViolation, 0, len(raw))
 		for _, v := range raw {
@@ -215,7 +244,7 @@ func (s *Server) handleRunInspections(ctx context.Context, req mcp.CallToolReque
 		return results[i]["inspection"].(string) < results[j]["inspection"].(string)
 	})
 
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	return s.respondScopedJSONOrTOON(ctx, req, map[string]any{
 		"results": results,
 		"summary": map[string]any{
 			"by_inspection":    byInspection,
@@ -223,16 +252,24 @@ func (s *Server) handleRunInspections(ctx context.Context, req mcp.CallToolReque
 		},
 		"path_prefix":        scope.PathPrefix,
 		"max_per_inspection": maxPer,
-	})
+	}, resolved)
 }
 
 // --- Inspector implementations --------------------------------------
 
-func runDeadCodeInspection(s *Server, scope inspectionScope) []inspectionViolation {
+func runDeadCodeInspection(ctx context.Context, s *Server, scope inspectionScope) []inspectionViolation {
+	// FindDeadCode reads the whole store and the global process snapshot —
+	// both are the analyzer's inputs and stay global so an entry point in
+	// another repo still keeps a symbol alive. Only the rows are narrowed,
+	// matching handleFindDeadCode.
 	entries := analysis.FindDeadCode(s.graph, s.getProcesses(), nil)
+	scoped := s.scopeFiltersActive(ctx)
 	out := make([]inspectionViolation, 0, len(entries))
 	for _, e := range entries {
 		if !scope.keep(e.FilePath) {
+			continue
+		}
+		if scoped && !s.analyzeNodeVisible(ctx, s.graph.GetNode(e.ID)) {
 			continue
 		}
 		out = append(out, inspectionViolation{
@@ -247,10 +284,21 @@ func runDeadCodeInspection(s *Server, scope inspectionScope) []inspectionViolati
 	return out
 }
 
-func runCyclesInspection(s *Server, scope inspectionScope) []inspectionViolation {
+func runCyclesInspection(ctx context.Context, s *Server, scope inspectionScope) []inspectionViolation {
+	// DetectCycles' own scope argument stays empty on purpose: it drops
+	// out-of-prefix nodes before Tarjan runs, which splits or dissolves
+	// SCCs rather than filtering rows. Narrow the results instead.
 	cycles := analysis.DetectCycles(s.graph, s.getCommunities(), "")
+	scoped := s.scopeFiltersActive(ctx)
 	out := make([]inspectionViolation, 0, len(cycles))
 	for _, c := range cycles {
+		// A cycle is kept only when EVERY node on its path is visible: the
+		// message below rolls the whole path into one string, so a partly
+		// visible chain would leak the rest of its members. This runs
+		// before the join for that reason.
+		if scoped && !s.cycleVisible(ctx, c) {
+			continue
+		}
 		// Cycle path is a list of node IDs; surface the first as the
 		// anchor and roll the chain into the message so the agent
 		// sees the loop without an extra round-trip.
@@ -280,12 +328,9 @@ func runCyclesInspection(s *Server, scope inspectionScope) []inspectionViolation
 	return out
 }
 
-func runTodosInspection(s *Server, scope inspectionScope) []inspectionViolation {
+func runTodosInspection(ctx context.Context, s *Server, scope inspectionScope) []inspectionViolation {
 	out := make([]inspectionViolation, 0)
-	for _, n := range s.graph.AllNodes() {
-		if n.Kind != graph.KindTodo {
-			continue
-		}
+	for _, n := range s.scopedNodesByKinds(ctx, []graph.NodeKind{graph.KindTodo}) {
 		if !scope.keep(n.FilePath) {
 			continue
 		}
@@ -313,13 +358,10 @@ func runTodosInspection(s *Server, scope inspectionScope) []inspectionViolation 
 	return out
 }
 
-func runCoverageGapsInspection(s *Server, scope inspectionScope) []inspectionViolation {
+func runCoverageGapsInspection(ctx context.Context, s *Server, scope inspectionScope) []inspectionViolation {
 	out := make([]inspectionViolation, 0)
 	covRows := s.coverageByID()
-	for _, n := range s.graph.AllNodes() {
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
-		}
+	for _, n := range s.scopedNodesByKinds(ctx, inspectionCallableKinds) {
 		if !scope.keep(n.FilePath) {
 			continue
 		}
@@ -344,15 +386,12 @@ func runCoverageGapsInspection(s *Server, scope inspectionScope) []inspectionVio
 // surfaced as a stale_code inspection.
 const staleInspectionDays = 365
 
-func runStaleCodeInspection(s *Server, scope inspectionScope) []inspectionViolation {
+func runStaleCodeInspection(ctx context.Context, s *Server, scope inspectionScope) []inspectionViolation {
 	out := make([]inspectionViolation, 0)
 	now := time.Now().Unix()
 	cutoff := now - staleInspectionDays*24*3600
 	blame := blameRowsByID(s.graph)
-	for _, n := range s.graph.AllNodes() {
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
-		}
+	for _, n := range s.scopedNodesByKinds(ctx, inspectionCallableKinds) {
 		if !scope.keep(n.FilePath) {
 			continue
 		}
@@ -381,7 +420,7 @@ func runStaleCodeInspection(s *Server, scope inspectionScope) []inspectionViolat
 	return out
 }
 
-func runGuardsInspection(s *Server, scope inspectionScope) []inspectionViolation {
+func runGuardsInspection(ctx context.Context, s *Server, scope inspectionScope) []inspectionViolation {
 	// Evaluate against every node in scope. check_guards' substrate
 	// accepts a slice of IDs; we pass the scoped set.
 	if !s.anyGuardRulesConfigured() {
@@ -392,7 +431,10 @@ func runGuardsInspection(s *Server, scope inspectionScope) []inspectionViolation
 	rulesByRepo := make(map[string][]config.GuardRule, 2)
 	resolver := s.newRepoScopeResolver()
 	out := make([]inspectionViolation, 0)
-	for _, n := range s.graph.AllNodes() {
+	// newRepoScopeResolver answers "whose .gortex.yaml governs this node",
+	// not "may this session see it" — the visibility narrowing is the
+	// scoped node set.
+	for _, n := range s.scopedNodes(ctx) {
 		if !scope.keep(n.FilePath) {
 			continue
 		}
@@ -426,12 +468,22 @@ func runGuardsInspection(s *Server, scope inspectionScope) []inspectionViolation
 	return out
 }
 
-func runContractOrphansInspection(s *Server, scope inspectionScope) []inspectionViolation {
+func runContractOrphansInspection(ctx context.Context, s *Server, scope inspectionScope) []inspectionViolation {
 	if s.contractRegistry == nil {
 		return nil
 	}
 	out := make([]inspectionViolation, 0)
-	all := s.contractRegistry.All()
+	// Narrow BEFORE the provider/consumer pairing below. Pairing is a
+	// two-sided join: a provider whose only consumer lives outside the
+	// caller's scope must still be reported as an orphan, which it would
+	// not be if the counterpart were counted first and filtered after.
+	all := make([]contracts.Contract, 0, len(s.contractRegistry.All()))
+	for _, c := range s.contractRegistry.All() {
+		if !s.repoPrefixVisible(ctx, c.RepoPrefix) {
+			continue
+		}
+		all = append(all, c)
+	}
 	byID := map[string]int{}
 	roleByID := map[string]map[string]int{}
 	for _, c := range all {
