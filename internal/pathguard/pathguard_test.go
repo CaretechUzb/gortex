@@ -3,8 +3,30 @@ package pathguard
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
+
+// mustSymlink creates a symlink, skipping the test when the platform will
+// not make one. Windows grants symlink creation only with
+// SeCreateSymbolicLinkPrivilege — an elevated process or Developer Mode —
+// so an unprivileged run there would otherwise report a platform
+// limitation as a defect. Everywhere else a failure is a real error.
+//
+// The confinement logic this package implements is platform-sensitive
+// (Windows maps a symlink reparse point to ModeSymlink but a directory
+// junction to ModeIrregular, and evalSymlinks normalises path case), which
+// is why these tests are worth running on Windows at all rather than
+// assuming the Unix result carries over.
+func mustSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation unavailable on this Windows host: %v", err)
+		}
+		t.Fatal(err)
+	}
+}
 
 func TestWithinRoot(t *testing.T) {
 	root := filepath.FromSlash("/repo")
@@ -55,17 +77,11 @@ func TestSymlinkEscapes(t *testing.T) {
 	}
 
 	escaping := filepath.Join(root, "escaping.go")
-	if err := os.Symlink(outsideFile, escaping); err != nil {
-		t.Fatal(err)
-	}
+	mustSymlink(t, outsideFile, escaping)
 	internal := filepath.Join(root, "pkg", "internal.go")
-	if err := os.Symlink(realFile, internal); err != nil {
-		t.Fatal(err)
-	}
+	mustSymlink(t, realFile, internal)
 	broken := filepath.Join(root, "broken.go")
-	if err := os.Symlink(filepath.Join(outside, "does-not-exist"), broken); err != nil {
-		t.Fatal(err)
-	}
+	mustSymlink(t, filepath.Join(outside, "does-not-exist"), broken)
 
 	cases := []struct {
 		name string
@@ -103,18 +119,14 @@ func TestSymlinkEscapesUnderSymlinkedRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	linkedRoot := filepath.Join(base, "linked-root")
-	if err := os.Symlink(realRoot, linkedRoot); err != nil {
-		t.Fatal(err)
-	}
+	mustSymlink(t, realRoot, linkedRoot)
 
 	target := filepath.Join(realRoot, "target.go")
 	if err := os.WriteFile(target, []byte("package app\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	link := filepath.Join(realRoot, "link.go")
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatal(err)
-	}
+	mustSymlink(t, target, link)
 
 	if SymlinkEscapes(filepath.Join(linkedRoot, "link.go"), linkedRoot) {
 		t.Fatal("an in-repo link under a symlinked root must not be treated as an escape")
