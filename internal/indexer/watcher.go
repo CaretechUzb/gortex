@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
 )
 
@@ -2523,8 +2524,19 @@ func pickKind(types []fswatcher.EventType) ChangeKind {
 }
 
 // isExcluded reports whether path is excluded by the effective pattern list.
+//
+// It is also where the watcher enforces symlink confinement. The live path
+// does not route through Indexer.shouldExclude, so without this a link that
+// escapes the repo would be kept out of a cold index yet walk straight back
+// in the moment it were created or touched while the daemon was watching —
+// the fix would hold on startup and silently regress on the next edit.
+// Every admission site (startup replay, native events, direct daemon
+// mutations) funnels through here, so one check covers them all.
 func (w *Watcher) isExcluded(path string) bool {
 	root := w.indexer.rootPath
+	if pathguard.SymlinkEscapes(path, root) {
+		return true
+	}
 	if root == "" {
 		return w.excludes.MatchRel(filepath.Base(path))
 	}

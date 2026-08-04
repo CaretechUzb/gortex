@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/zzet/gortex/internal/pathguard"
 )
 
 // Match is one line of one file that contains the query literal.
@@ -20,31 +22,60 @@ type Match struct {
 // set of files. Build it once against a repo's file list, then Grep it
 // repeatedly. It is safe for concurrent Grep calls.
 type Searcher struct {
-	root  string
-	ix    *Index
-	paths []string // docID -> forward-slash repo-relative path
+	root         string
+	resolvedRoot string // root with symlinks evaluated, for confinement tests
+	ix           *Index
+	paths        []string // docID -> forward-slash repo-relative path
 }
 
 // Build reads every file — forward-slash repo-relative paths under
 // root — and indexes its content. A file that cannot be read is left
 // unindexed (it never matches) but keeps its docID slot so the rest
 // stay aligned.
+//
+// A path that is a symlink out of root is treated as unreadable. The
+// indexer walk already refuses to admit one, so this is the second of two
+// independent barriers: it keeps a corpus assembled by some other route
+// (a stale on-disk file list, a caller building its own relPaths) from
+// turning this searcher into an arbitrary-file-read primitive.
 func Build(root string, relPaths []string) *Searcher {
 	s := &Searcher{
-		root:  root,
-		ix:    New(),
-		paths: make([]string, len(relPaths)),
+		root:         root,
+		resolvedRoot: pathguard.ResolveRoot(root),
+		ix:           New(),
+		paths:        make([]string, len(relPaths)),
 	}
 	for i, rel := range relPaths {
 		rel = filepath.ToSlash(rel)
 		s.paths[i] = rel
-		content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+		abs := filepath.Join(root, filepath.FromSlash(rel))
+		if pathguard.EscapesResolvedRoot(abs, s.resolvedRoot) {
+			continue
+		}
+		content, err := os.ReadFile(abs)
 		if err != nil {
 			continue
 		}
 		s.ix.Add(uint32(i), content)
 	}
 	return s
+}
+
+// openConfined opens the indexed file at rel for scanning, refusing one
+// whose real location escapes the searcher's root.
+//
+// Only the leaf is Lstat'd. That is sufficient rather than sloppy: an
+// intermediate directory cannot be a symlink, because filepath.WalkDir
+// never descends one, so no path in the corpus reaches through a linked
+// directory. Checking the leaf costs one Lstat per scanned file; fully
+// resolving every component would cost several per file on the hot search
+// path and buy nothing given that provenance.
+func (s *Searcher) openConfined(rel string) (*os.File, error) {
+	abs := filepath.Join(s.root, filepath.FromSlash(rel))
+	if pathguard.EscapesResolvedRoot(abs, s.resolvedRoot) {
+		return nil, os.ErrPermission
+	}
+	return os.Open(abs)
 }
 
 // Grep returns up to limit lines, across the indexed files, that
@@ -62,7 +93,7 @@ func (s *Searcher) Grep(query string, limit int) []Match {
 			continue
 		}
 		rel := s.paths[docID]
-		f, err := os.Open(filepath.Join(s.root, filepath.FromSlash(rel)))
+		f, err := s.openConfined(rel)
 		if err != nil {
 			continue
 		}
@@ -152,7 +183,7 @@ func (s *Searcher) GrepRegexp(re *regexp.Regexp, requiredLiterals []string, path
 		if pathPrefix != "" && !strings.HasPrefix(rel, pathPrefix) {
 			continue
 		}
-		f, err := os.Open(filepath.Join(s.root, filepath.FromSlash(rel)))
+		f, err := s.openConfined(rel)
 		if err != nil {
 			continue
 		}
