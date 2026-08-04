@@ -73,6 +73,19 @@ func ExtractJSON(text string) (string, bool) {
 	return "", false
 }
 
+// FailureSnippet picks the most informative blob to attach to a failed
+// CLI spawn. stderr comes first — that is where a well-behaved CLI puts
+// its diagnostics — but the coding-agent CLIs print terminal errors on
+// stdout in print mode (`claude -p` reports "Error: Reached max turns
+// (1)" there and exits 1 with an empty stderr), and an empty stderr
+// must not collapse a real message into a bare "exit status 1".
+func FailureSnippet(stdout, stderr []byte) string {
+	if s := Snippet(stderr); s != "" {
+		return s
+	}
+	return Snippet(stdout)
+}
+
 // Snippet truncates a stderr / stdout blob for inclusion in an error
 // message. Operates on runes so multi-byte characters at the cut point
 // stay intact.

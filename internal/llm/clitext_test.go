@@ -5,6 +5,26 @@ import (
 	"testing"
 )
 
+func TestFailureSnippet(t *testing.T) {
+	cases := []struct {
+		name           string
+		stdout, stderr string
+		want           string
+	}{
+		{"prefers stderr", "some output", "auth required", "auth required"},
+		{"falls back to stdout", "Error: Reached max turns (1)", "", "Error: Reached max turns (1)"},
+		{"whitespace-only stderr is empty", "Error: boom", "  \n", "Error: boom"},
+		{"both empty", "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := FailureSnippet([]byte(tc.stdout), []byte(tc.stderr)); got != tc.want {
+				t.Errorf("FailureSnippet=%q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestExtractJSON_Variants(t *testing.T) {
 	cases := []struct {
 		name  string

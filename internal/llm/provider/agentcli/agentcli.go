@@ -163,9 +163,9 @@ func (p *Provider) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 
 	if err := cmd.Run(); err != nil {
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			return llm.CompletionResponse{}, fmt.Errorf("%s: timed out after %s: %s", p.spec.ProviderID, p.spec.Timeout, llm.Snippet(stderr.Bytes()))
+			return llm.CompletionResponse{}, fmt.Errorf("%s: timed out after %s: %s", p.spec.ProviderID, p.spec.Timeout, llm.FailureSnippet(stdout.Bytes(), stderr.Bytes()))
 		}
-		if msg := llm.Snippet(stderr.Bytes()); msg != "" {
+		if msg := llm.FailureSnippet(stdout.Bytes(), stderr.Bytes()); msg != "" {
 			return llm.CompletionResponse{}, fmt.Errorf("%s: %w: %s", p.spec.ProviderID, err, msg)
 		}
 		return llm.CompletionResponse{}, fmt.Errorf("%s: %w", p.spec.ProviderID, err)

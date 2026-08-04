@@ -143,9 +143,9 @@ func (p *Provider) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 
 	if err := cmd.Run(); err != nil {
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			return llm.CompletionResponse{}, fmt.Errorf("codex: timed out after %s: %s", p.timeout, llm.Snippet(stderr.Bytes()))
+			return llm.CompletionResponse{}, fmt.Errorf("codex: timed out after %s: %s", p.timeout, llm.FailureSnippet(stdout.Bytes(), stderr.Bytes()))
 		}
-		if msg := llm.Snippet(stderr.Bytes()); msg != "" {
+		if msg := llm.FailureSnippet(stdout.Bytes(), stderr.Bytes()); msg != "" {
 			return llm.CompletionResponse{}, fmt.Errorf("codex: %w: %s", err, msg)
 		}
 		return llm.CompletionResponse{}, fmt.Errorf("codex: %w", err)
