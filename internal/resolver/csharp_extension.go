@@ -846,22 +846,13 @@ func csharpNodeTypeParams(c *graph.Node) map[string]bool {
 	return m
 }
 
-// csharpShapesConflict reports a PROVABLE structural contradiction
-// between the receiver's shape and a candidate's this-param shape:
-// same core, different structure (`string[]` vs `this string`,
-// `List<int>` vs `this List<string>`). Unparseable or absent evidence
-// never conflicts, and a core-name mismatch is not a shape verdict.
-func csharpShapesConflict(recv, tp string, tparams map[string]bool) bool {
-	if recv == "" {
-		return false
-	}
-	a, okA := csharpParseShape(recv)
-	return csharpShapesConflictParsed(a, okA, tp, tparams)
-}
-
-// csharpShapesConflictParsed is csharpShapesConflict with the receiver
-// side already parsed — the binder parses it once per call edge, not
-// once per candidate.
+// csharpShapesConflictParsed reports a PROVABLE structural
+// contradiction between the receiver's shape and a candidate's
+// this-param shape: same core, different structure (`string[]` vs
+// `this string`, `List<int>` vs `this List<string>`). Unparseable or
+// absent evidence never conflicts, and a core-name mismatch is not a
+// shape verdict. The receiver side arrives pre-parsed — the binder
+// parses it once per call edge, not once per candidate.
 func csharpShapesConflictParsed(recv csharpShape, recvOK bool, tp string, tparams map[string]bool) bool {
 	if !recvOK || tp == "" {
 		return false
