@@ -70,7 +70,7 @@ llm:
   claudecli:                 # provider: claudecli — spawns the `claude` CLI per call
     # binary: claude          # binary name or absolute path (resolved via $PATH; default "claude")
     model: sonnet             # optional — forwarded as `--model`; empty = CLI default
-    # args: ["--allowed-tools", ""]   # extra args appended after our flags (disable tools, etc.)
+    # args: ["--permission-mode", "plan"]   # extra args appended after our flags; a flag here overrides the matching headless default
     # timeout_seconds: 180    # cap per Complete call; 0 → 120s
 
   codex:                     # provider: codex — spawns the OpenAI `codex` CLI per call
@@ -114,6 +114,17 @@ llm:
     simple_model: claude-haiku-4-5    # low-complexity runs (empty = configured model)
     complex_model: claude-opus-4-7    # multi-hop / refactor-scale runs
 ```
+
+**`claudecli` headless defaults.** A `claude -p` spawn otherwise loads the user's whole interactive configuration, none of which a one-shot completion wants. The provider therefore passes, by default:
+
+| Flag | Why |
+|---|---|
+| `--settings '{"disableAllHooks":true}'` | The user's hooks run inside the spawn. A `SessionEnd` hook that fails in a headless context exits the CLI nonzero — and that failed the entire call. |
+| `--tools ""` | Even under `--print` the CLI exposes `Bash` / `Read` / `Grep` / …, and a model that opens with a native tool call spends the single `--max-turns 1` turn on it: the run dies with `Reached max turns (1)`. `--allowed-tools` is **not** a substitute — it governs auto-approval, not availability, so the call is still attempted. |
+| `--strict-mcp-config` | Skip the user's MCP servers: startup latency, plus more tools to be tempted by. |
+| `--system-prompt` (instead of `--append-system-prompt`) | Appending leaves Claude Code's agentic persona, the discovered `CLAUDE.md` files and the injected environment block (“you are in `<cwd>`, which is not a git repository”) in force, and that context routinely beats the structured-output instruction — the reply comes back as a clarifying question instead of JSON. |
+
+Every one of these is skipped when `llm.claudecli.args` already carries the same flag, so the config file is the final word: `args: ["--tools", "default"]` restores the built-in toolset, and a custom `--system-prompt` keeps gortex's schema instruction as an `--append-system-prompt` rider rather than dropping it.
 
 **Local provider idle unload.** The in-process llama.cpp model is unloaded after sitting idle (freeing its memory), and reloaded lazily on the next call. Default idle TTL is 10 minutes; override with `GORTEX_LLM_IDLE_TTL` (a verbatim Go duration, e.g. `5m`); `0` / `off` / `none` disables idle unloading, keeping the model resident once loaded.
 

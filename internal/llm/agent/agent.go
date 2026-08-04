@@ -254,6 +254,8 @@ func (a *Agent) systemPrompt(extras string) string {
 	sys.WriteString("You are a tool-using agent. ")
 	sys.WriteString("On each turn, emit ONE JSON object: ")
 	sys.WriteString(`{"tool": "<name>", "args": {...}}.`)
+	sys.WriteString(" Emit that object on its own — never wrapped in an array, ")
+	sys.WriteString("never inside markdown fences, with no prose around it.")
 	sys.WriteString(" Available tools:\n")
 	for _, n := range a.names {
 		fmt.Fprintf(&sys, "- %s: %s\n", n, a.tools[n].Description)
@@ -274,9 +276,30 @@ type toolCall struct {
 	Args map[string]any `json:"args"`
 }
 
+// parseToolCall decodes one step's payload into a tool call. It is
+// deliberately lenient about the *envelope*: the subprocess providers
+// have no native structured output, so the shape they return is only
+// as reliable as the model tier behind them. Smaller models routinely
+// wrap the single call in a one-element array however firmly the
+// system prompt says not to — decoding that strictly would make whole
+// model tiers unable to drive the agent loop at all. The contents are
+// still validated strictly.
 func parseToolCall(s string) (toolCall, error) {
+	payload := strings.TrimSpace(s)
+	if strings.HasPrefix(payload, "[") {
+		var arr []json.RawMessage
+		if err := json.Unmarshal([]byte(payload), &arr); err != nil {
+			return toolCall{}, err
+		}
+		if len(arr) == 0 {
+			return toolCall{}, errors.New("empty tool-call array")
+		}
+		// Take the first call; the loop asks for the next one on the
+		// following step anyway.
+		payload = string(arr[0])
+	}
 	var c toolCall
-	if err := json.Unmarshal([]byte(s), &c); err != nil {
+	if err := json.Unmarshal([]byte(payload), &c); err != nil {
 		return c, err
 	}
 	if c.Tool == "" {
