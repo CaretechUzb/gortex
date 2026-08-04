@@ -350,11 +350,7 @@ func csharpShouldDemote(nodes map[string]*graph.Node, e *graph.Edge, nameToTypeI
 	}
 	// Only the weak tiers are gated; never demote ast_resolved / lsp evidence.
 	// An empty Origin resolves to its confidence-derived tier.
-	eff := e.Origin
-	if eff == "" {
-		eff = graph.DefaultOriginFor(e.Kind, e.Confidence, "")
-	}
-	if graph.OriginRank(eff) > graph.OriginRank(graph.OriginASTInferred) {
+	if graph.OriginRank(e.EffectiveOrigin()) > graph.OriginRank(graph.OriginASTInferred) {
 		return false
 	}
 	caller := nodes[e.From]

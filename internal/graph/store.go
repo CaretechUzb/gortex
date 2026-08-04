@@ -1066,9 +1066,13 @@ type IfaceImplementsScanner interface {
 // "usage" set (Calls, References, Instantiates, Implements, Extends,
 // Reads, Writes, Tests). The split exists because connectivity_health
 // needs the totals (for isolated / leaf classification) AND the
-// usage-edge presence (to fold ClassifyZeroEdge's logic in
-// server-side); pulling them in one row saves a second cgo trip per
-// node.
+// usage-edge presence; pulling them in one row saves a second cgo trip
+// per node.
+//
+// UsageInCount is a kind-only count and is NOT a substitute for
+// ClassifyZeroEdge, which also weighs each usage edge's provenance —
+// a name-only match does not prove use. A caller that needs the
+// classification must ask ClassifyZeroEdge for it.
 type NodeDegreeRow struct {
 	NodeID       string
 	InCount      int
@@ -1086,8 +1090,9 @@ type NodeDegreeRow struct {
 // classify isolated / leaf / source-only / sink-only / extraction-gap
 // without ever materialising the underlying edge structs.
 //
-// The usageKinds slice MUST mirror graph.usageEdgeKinds (the set
-// ClassifyZeroEdge consults). Empty usageKinds means UsageInCount is
+// The usageKinds slice MUST mirror graph.usageEdgeKinds (the kind set
+// ClassifyZeroEdge consults; it applies a provenance test on top that
+// this count cannot express). Empty usageKinds means UsageInCount is
 // always 0; an empty input ids slice returns nil.
 //
 // Optional capability — GraphConnectivity falls back to the per-node

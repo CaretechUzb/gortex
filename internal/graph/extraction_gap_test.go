@@ -30,10 +30,16 @@ func buildClassifyGraph() *Graph {
 	g.AddEdge(&Edge{From: "svc.go", To: "svc.go::Unused", Kind: EdgeDefines})
 	g.AddEdge(&Edge{From: "svc.go", To: "svc.go::Helper", Kind: EdgeDefines})
 
-	// Used has an incoming call edge.
-	g.AddEdge(&Edge{From: "svc.go::Caller", To: "svc.go::Used", Kind: EdgeCalls})
+	// Used has an incoming call edge the resolver bound unambiguously.
+	// The provenance is load-bearing: classification weighs incoming
+	// usage edges by tier, and an unstamped zero-confidence call edge
+	// backfills to text_matched — the weak tier — so leaving it off
+	// would make this fixture assert coverage_incomplete, not none.
+	g.AddEdge(&Edge{From: "svc.go::Caller", To: "svc.go::Used", Kind: EdgeCalls,
+		Origin: OriginASTResolved, Confidence: 0.9})
 	// Unused has only an outgoing call — no incoming usage edge.
-	g.AddEdge(&Edge{From: "svc.go::Unused", To: "svc.go::Helper", Kind: EdgeCalls})
+	g.AddEdge(&Edge{From: "svc.go::Unused", To: "svc.go::Helper", Kind: EdgeCalls,
+		Origin: OriginASTResolved, Confidence: 0.9})
 	return g
 }
 
