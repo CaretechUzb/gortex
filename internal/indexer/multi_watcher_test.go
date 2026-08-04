@@ -300,13 +300,20 @@ func ChangedB() {}
 	require.NotEmpty(t, hist, "history should contain both repo edits")
 
 	// At minimum: one event per repo from each modify burst.
+	//
+	// FilePath is absolute, so the merged feed carries no attribution of
+	// its own — RepoPrefix is what lets a consumer tell which repo (and so
+	// which workspace) a row belongs to, and it must agree with the root
+	// the path falls under.
 	repoSeen := map[string]bool{}
 	for _, ev := range hist {
 		if strings.HasPrefix(ev.FilePath, repoADir) {
 			repoSeen["a"] = true
+			assert.Equal(t, "repo-a", ev.RepoPrefix, "repo-a event must be stamped with its repo prefix")
 		}
 		if strings.HasPrefix(ev.FilePath, repoBDir) {
 			repoSeen["b"] = true
+			assert.Equal(t, "repo-b", ev.RepoPrefix, "repo-b event must be stamped with its repo prefix")
 		}
 	}
 	assert.True(t, repoSeen["a"], "history must include repo-a event")
