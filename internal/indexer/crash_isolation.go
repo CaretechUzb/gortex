@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -214,6 +215,41 @@ func (idx *Indexer) extractFile(
 	pool *crashpool.Pool, q *crashpool.Quarantine,
 	path, relPath, lang string, ext parser.Extractor, src []byte,
 ) (result *parser.ExtractionResult, skipped bool, err error) {
+	return idx.extractFileWithRawLease(
+		nil, pool, q, path, relPath, lang, ext, src,
+	)
+}
+
+func (idx *Indexer) extractFileWithRawLease(
+	rawLease *parseAdmissionLease,
+	pool *crashpool.Pool, q *crashpool.Quarantine,
+	path, relPath, lang string, ext parser.Extractor, src []byte,
+) (result *parser.ExtractionResult, skipped bool, err error) {
+	return idx.extractFileCtxWithRawLease(
+		context.Background(), nil, rawLease,
+		pool, q, path, relPath, lang, ext, src,
+	)
+}
+
+func (idx *Indexer) extractFileCtx(
+	ctx context.Context,
+	nativeAdmission *nativeParseExtractionAdmission,
+	pool *crashpool.Pool, q *crashpool.Quarantine,
+	path, relPath, lang string, ext parser.Extractor, src []byte,
+) (result *parser.ExtractionResult, skipped bool, err error) {
+	return idx.extractFileCtxWithRawLease(
+		ctx, nativeAdmission, nil,
+		pool, q, path, relPath, lang, ext, src,
+	)
+}
+
+func (idx *Indexer) extractFileCtxWithRawLease(
+	ctx context.Context,
+	nativeAdmission *nativeParseExtractionAdmission,
+	rawLease *parseAdmissionLease,
+	pool *crashpool.Pool, q *crashpool.Quarantine,
+	path, relPath, lang string, ext parser.Extractor, src []byte,
+) (result *parser.ExtractionResult, skipped bool, err error) {
 	// Bundled / minified build artifacts are synthetic source — a
 	// minified bundle or a sourcemap has no meaningful symbols and
 	// only pollutes the graph. Detect by content and skip with
@@ -223,8 +259,32 @@ func (idx *Indexer) extractFile(
 			return minifiedSkipResult(relPath, lang, reason), true, nil
 		}
 	}
+	if !idx.config.IndexGeneratedParsers {
+		if projected, ok := generatedTreeSitterParserProjection(relPath, lang, src); ok {
+			if q != nil {
+				q.Forget(relPath)
+			}
+			idx.logger.Info("indexer: projected generated tree-sitter parser table",
+				zap.String("file", relPath),
+				zap.Int("source_bytes", len(src)),
+				zap.Int("projected_symbols", len(projected.Nodes)-1))
+			return projected, false, nil
+		}
+	}
 	if pool == nil {
-		r, eerr := idx.extractWithTimeout(ext, relPath, src)
+		nativeLease, admissionErr := nativeAdmission.acquire(ctx, lang, int64(len(src)))
+		if admissionErr != nil {
+			return nil, false, fmt.Errorf("native parse admission: %w", admissionErr)
+		}
+		// The caller still owns the raw-source lease for coverage and graph
+		// construction after a successful parse. Add one extractor-owned hold
+		// so a timeout can return immediately without admitting replacement
+		// bytes while the background extractor still retains src.
+		releaseRawHold := rawLease.retain()
+		r, eerr := idx.extractWithTimeoutDone(ext, relPath, src, func() {
+			nativeLease.Release()
+			releaseRawHold()
+		})
 		if errors.Is(eerr, errExtractTimeout) {
 			budget := effectiveExtractBudget(idx.config.MaxExtractMillis, len(src))
 			idx.logger.Warn("indexer: file extraction exceeded budget; skipped",

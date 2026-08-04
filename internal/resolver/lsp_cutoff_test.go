@@ -34,12 +34,12 @@ func (c *switchedClock) now() time.Time {
 // clock after its first successful answer, so the expensive-path cutoff
 // trips deterministically at the next per-page check site.
 type flippingLSPHelper struct {
-	clock      *switchedClock
-	flipAfter  int
-	defPath    string
-	defLine    int
-	mu         sync.Mutex
-	calls      []string
+	clock     *switchedClock
+	flipAfter int
+	defPath   string
+	defLine   int
+	mu        sync.Mutex
+	calls     []string
 }
 
 func (h *flippingLSPHelper) SupportsPath(string) bool { return true }

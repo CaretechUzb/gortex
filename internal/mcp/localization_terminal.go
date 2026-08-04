@@ -182,6 +182,21 @@ func newLocalizationSingleResultCompletion() localizationCompletion {
 	}
 }
 
+// newLocalizationAdvisoryCompletion closes the bounded localization workflow
+// without converting missing, weak, or failed evidence into answer_ready. The
+// wire response keeps its provisional candidate page, while armForTask treats
+// localized as inactive so later coding and navigation work remains available.
+func newLocalizationAdvisoryCompletion() localizationCompletion {
+	return localizationCompletion{
+		State:            localizationStateLocalized,
+		Scope:            "localization",
+		RequiredAction:   "continue_task",
+		Instruction:      "The bounded localization workflow ended without enough declaration-backed evidence for a confident answer. Treat the retained candidates as provisional and continue the task; navigation is no longer restricted by this localization request.",
+		AllowedToolCalls: 0,
+		ContractVersion:  localizationTerminalContractV2,
+	}
+}
+
 func newLocalizationExactReadCompletion(exactSymbol string, correction bool) localizationCompletion {
 	instruction := fmt.Sprintf(`Call Gortex MCP read(operation:"source", target:{symbol:%q}); then respond.`, exactSymbol)
 	if correction {
@@ -490,6 +505,11 @@ func (s *localizationTerminalState) commitLocalizationLocked(completion localiza
 	if completion.State == localizationStateNeedsRecovery {
 		s.recoveryRetriesRemaining = 1
 	}
+	if completion.State == localizationStateNeedsExactRead {
+		// A handler failure may be transient, but the exact-read contract must
+		// remain bounded. One retry is shared by ordinary and corrective reads.
+		s.correctionRetriesRemaining = 1
+	}
 	s.taskFingerprint = fingerprint
 	s.taskLead = completion.taskLead
 	// The digest follows the contract: an inactive commit (keepOpenForTask)
@@ -534,6 +554,33 @@ func (s *localizationTerminalState) completionLocked() localizationCompletion {
 	return localizationCompletionWithDigest(completion, s.digest)
 }
 
+// releaseLocalizationAdvisoryLocked returns the retained candidates as an
+// explicitly provisional wire page and atomically releases the session's
+// localization authorization. Callers hold s.mu. Missing evidence, a weak
+// recovery, or an exhausted handler retry can end the bounded workflow, but it
+// cannot manufacture answer_ready confidence.
+func (s *localizationTerminalState) releaseLocalizationAdvisoryLocked(
+	digest *localizationEvidenceDigest,
+) localizationCompletion {
+	if digest == nil {
+		digest = s.digest
+	}
+	taskLead := s.taskLead
+	// Releasing commits, and committing bumps the generation. A localize that
+	// is already in flight staged its contract against the generation it
+	// reserved, so bumping here would make finishLocalize discard the newer
+	// request in favour of this finishing call's advisory state. The reserved
+	// localize owns the session's next contract; leave the state for it to
+	// replace and return the advisory page for this response only.
+	if s.reservation == nil {
+		s.commitLocalizationLocked(newLocalizationOpenCompletion(), "")
+	}
+	completion := newLocalizationAdvisoryCompletion()
+	completion.taskLead = taskLead
+	completion.digest = digest
+	return localizationCompletionWithDigest(completion, digest)
+}
+
 // interceptAnswerReady is the cheap pre-validation gate used by facade
 // dispatch. It makes localization terminality independent of operation
 // validity, and consumes an unsupported advisory recovery attempt before a
@@ -545,6 +592,9 @@ func (s *localizationTerminalState) interceptAnswerReady(facade, operation strin
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.reservation != nil {
+		return localizationInProgressResult(), 0
+	}
 	switch s.state {
 	case localizationStateAnswerReady:
 		return localizationTerminalResult(s.completionLocked(), facade, operation), 0
@@ -563,9 +613,8 @@ func (s *localizationTerminalState) interceptAnswerReady(facade, operation strin
 			// better evidence instead of terminalizing the localization session.
 			return localizationRecoveryMisalignedResult(s.completionLocked(), facade, operation), 0
 		}
-		s.state = localizationStateAnswerReady
-		s.recoveryRetriesRemaining = 0
-		return localizationRecoveryRejectedResult(s.completionLocked(), facade, operation), 0
+		completion := s.releaseLocalizationAdvisoryLocked(nil)
+		return localizationRecoveryRejectedResult(completion, facade, operation), 0
 	default:
 		return nil, 0
 	}
@@ -1182,12 +1231,10 @@ func (s *localizationTerminalState) consumeInvalidRecovery(facade, operation str
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.state != localizationStateNeedsRecovery || s.generation != generation {
+	if s.reservation != nil || s.state != localizationStateNeedsRecovery || s.generation != generation {
 		return newLocalizationOpenCompletion(), false
 	}
-	s.state = localizationStateAnswerReady
-	s.recoveryRetriesRemaining = 0
-	return s.completionLocked(), true
+	return s.releaseLocalizationAdvisoryLocked(nil), true
 }
 
 func localizationPlannedRecoveryMismatchResult(completion localizationCompletion, facade, operation string) *mcpgo.CallToolResult {
@@ -1219,17 +1266,22 @@ func localizationRecoveryMisalignedResult(completion localizationCompletion, fac
 }
 
 func localizationRecoveryRejectedResult(completion localizationCompletion, facade, operation string) *mcpgo.CallToolResult {
+	contract := localizationContractFor(completion)
 	result := newStructuredErrorResult(StructuredError{
-		ErrorCode: ErrCodeLocalizationTerminal,
-		Message:   "the one bounded localization recovery call must be search.text or search.symbols with a task-aligned query, or read.source with a concrete symbol; localization is now terminal",
+		ErrorCode: ErrCodeLocalizationComplete,
+		Message:   "the bounded localization recovery call was not valid; no confident answer was inferred, retained candidates remain provisional, and localization navigation is released",
 		Retriable: false,
 		Data: map[string]any{
-			"contract":           localizationContractFor(completion),
+			"contract":           contract,
 			"facade":             facade,
 			"operation":          operation,
 			"allowed_operations": append([]string(nil), localizationRecoveryOperations...),
 		},
 	}, true)
+	// This is a synthetic localization response, not an underlying tool payload.
+	// Project the advisory contract on the structured wire as well as metadata so
+	// hosts that prefer structured content observe the same released state.
+	result.StructuredContent = localizationTerminalStructuredContent(nil, contract)
 	return attachLocalizationHostEnvelope(result, completion, completion.digest)
 }
 
@@ -1255,9 +1307,8 @@ func (s *localizationTerminalState) beginLocalize(task string, newUserTask bool)
 	if s.state != localizationStateInactive && !newUserTask {
 		completion := s.completionLocked()
 		if s.state == localizationStateNeedsRecovery {
-			s.state = localizationStateAnswerReady
-			s.recoveryRetriesRemaining = 0
-			return 0, localizationRecoveryRejectedResult(s.completionLocked(), "explore", "localize")
+			completion = s.releaseLocalizationAdvisoryLocked(nil)
+			return 0, localizationRecoveryRejectedResult(completion, "explore", "localize")
 		}
 		// A repeat localize against a terminal contract gets the same compact,
 		// typed non-retriable signal as every other post-terminal navigation
@@ -1393,9 +1444,8 @@ func (s *localizationTerminalState) authorizeWithToken(facade, operation string,
 		if localizationRecoveryAllows(facade, operation, arguments) {
 			return localizationRecoveryMisalignedResult(s.completionLocked(), facade, operation), 0
 		}
-		s.state = localizationStateAnswerReady
-		s.recoveryRetriesRemaining = 0
-		return localizationRecoveryRejectedResult(s.completionLocked(), facade, operation), 0
+		completion := s.releaseLocalizationAdvisoryLocked(nil)
+		return localizationRecoveryRejectedResult(completion, facade, operation), 0
 	}
 	if s.state == localizationStateNeedsExactRead && facade == "read" && operation == "source" && exactLocalizationSymbol(arguments) == s.exactSymbol {
 		s.inFlightImplementationSymbol = s.exactReadRoute.implementationSymbol
@@ -1530,7 +1580,6 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 	case localizationStateRecoveryInFlight:
 		requested := s.inFlightRecoveryAnchor
 		operation := s.inFlightRecoveryOperation
-		plannedRecovery := s.localizationRecoveryPlannedLocked()
 		s.inFlightRecoveryAnchor = ""
 		s.inFlightRecoveryOperation = ""
 		legacyRecovery := !captureRequired || (wireSuccess && !evidenceRecorded) ||
@@ -1544,26 +1593,19 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 			s.recoveryRetriesRemaining = 0
 			return s.completionLocked()
 		}
-		if success || (plannedRecovery && zeroResult) {
-			// A successful but structurally weak page is not an accepted recovery.
-			// A planned weak or empty page clears only the plan and returns to the
-			// byte-identical generic recovery contract with its allowance intact.
-			if plannedRecovery {
-				s.recoveryOperation = ""
-				s.recoveryAnchor = ""
-			}
-			s.state = localizationStateNeedsRecovery
-			return s.completionLocked()
+		if wireSuccess {
+			// The one accepted recovery call completed but did not prove a
+			// declaration aligned with the task. Preserve everything it surfaced,
+			// then release the contract as advisory instead of opening a loop or
+			// manufacturing terminal confidence.
+			return s.releaseLocalizationAdvisoryLocked(mergedDigest)
 		}
 		if s.recoveryRetriesRemaining > 0 {
 			s.recoveryRetriesRemaining--
 			s.state = localizationStateNeedsRecovery
 			return s.completionLocked()
 		}
-		s.recoveryOperation = ""
-		s.recoveryAnchor = ""
-		s.state = localizationStateAnswerReady
-		return s.completionLocked()
+		return s.releaseLocalizationAdvisoryLocked(nil)
 	case localizationStateExactReadInFlight:
 		implementationSymbol := s.inFlightImplementationSymbol
 		routeEnforceable := s.inFlightEnforceable
@@ -1598,20 +1640,12 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 			return s.completionLocked()
 		}
 		s.enforceableOnAnswerReady = false
-		if s.exactReadIsCorrection {
-			if s.correctionRetriesRemaining > 0 {
-				s.correctionRetriesRemaining--
-				s.state = localizationStateNeedsExactRead
-				return s.completionLocked()
-			}
-			s.state = localizationStateAnswerReady
-			s.exactSymbol = ""
-			s.exactReadIsCorrection = false
-			s.exactReadRoute = localizationRefinementRoute{}
-			s.correctionRetriesRemaining = 0
+		if s.correctionRetriesRemaining > 0 {
+			s.correctionRetriesRemaining--
+			s.state = localizationStateNeedsExactRead
 			return s.completionLocked()
 		}
-		s.state = localizationStateNeedsExactRead
+		return s.releaseLocalizationAdvisoryLocked(nil)
 	case localizationStateRefineInFlight:
 		confidentRead := capturedResult && mergedDigest != nil && len(mergedDigest.Evidence) > 0 &&
 			localizationReservedReadEvidenceAlignedWithLead(s.taskFingerprint, s.taskLead, s.refinementSymbol, currentEvidence)
@@ -1669,12 +1703,7 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 			s.state = localizationStateNeedsRefinement
 			return s.completionLocked()
 		}
-		s.state = localizationStateAnswerReady
-		s.refinementSymbol = ""
-		s.refinementSymbols = nil
-		s.refinementRoutes = nil
-		s.correctionSymbol = ""
-		s.correctionRoute = localizationRefinementRoute{}
+		return s.releaseLocalizationAdvisoryLocked(nil)
 	}
 	return s.completionLocked()
 }

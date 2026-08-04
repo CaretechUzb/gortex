@@ -409,3 +409,12 @@ func TestFindHotspots_BetweennessRaisesRank(t *testing.T) {
 		t.Errorf("bottleneck node (%.2f) should outrank inert padding (%.2f)", viaScore, padScore)
 	}
 }
+
+func BenchmarkComputeBetweennessSampled(b *testing.B) {
+	g := pathGraph(betweennessExactThreshold + 1500)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ComputeBetweenness(g)
+	}
+}

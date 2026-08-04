@@ -721,8 +721,13 @@ func FindHotspots(g graph.Store, communities *CommunityResult, threshold float64
 	var crossings map[string]int
 	if cc, ok := g.(graph.CommunityCrossingsByKind); ok {
 		crossings = cc.CommunityCrossingsByKind(crossingKinds, nodeToComm)
-	}
-	if crossings == nil {
+		if crossings == nil {
+			// A nil map is the capability's valid zero-row result. Capability
+			// presence, not map allocation, determines whether the backend can
+			// aggregate crossings without hydrating full edges.
+			crossings = make(map[string]int)
+		}
+	} else {
 		crossings = make(map[string]int)
 		countCrossings := func(kind graph.EdgeKind) {
 			for e := range g.EdgesByKind(kind) {

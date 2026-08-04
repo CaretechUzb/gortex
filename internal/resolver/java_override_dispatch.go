@@ -12,23 +12,13 @@ import (
 // across the graph.
 const javaOverrideDispatchCap = 8
 
-// resolveJavaOverrideDispatch fans out an ambiguous Java member call whose
-// same-name candidates are overrides related through the class hierarchy into
-// one call edge per override — the call-hierarchy semantics jdtls and gopls
-// present, where a call on a supertype-typed receiver is a usage of every
-// override in that hierarchy. Without this, a `x.toString()` site whose static
-// type is a base class stays unresolved (two candidate overrides, no exact
-// type match) and reports as a usage of neither override.
-//
-// Because the picked target set is a best guess over legal runtime targets that
-// no receiver type disambiguated, the edges land at the speculative tier
-// (OriginSpeculative + Meta["speculative"]): hidden from default find_usages so
-// they never inflate a code symbol's usage set, surfaced on demand with
-// include_speculative and via analyze kind=speculative, and marked
-// Meta["dispatch"]="override". Resolving the primary out of the
-// `unresolved::*` state also clears the ambiguous_multi_match classification.
-// Scoped to Java so Go/TS/Python dispatch presentation is unchanged.
-func (r *Resolver) resolveJavaOverrideDispatch() int {
+// resolveJavaOverrideDispatchCandidates fans out an ambiguous Java member call
+// whose same-name candidates are overrides related through the class hierarchy.
+// Because no receiver type disambiguated the legal runtime targets, emitted
+// edges remain speculative and are hidden from default usage queries. The
+// caller supplies the already-scoped candidate census so full and warm passes
+// share the same dispatch semantics without repeating a corpus scan.
+func (r *Resolver) resolveJavaOverrideDispatchCandidates(candidates overrideDispatchCandidates) int {
 	g := r.graph
 	if g == nil {
 		return 0
@@ -44,8 +34,8 @@ func (r *Resolver) resolveJavaOverrideDispatch() int {
 		others []*graph.Node
 	}
 	var jobs []fanout
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if e == nil || e.IsSpeculative() {
+	for e := range candidates.javaEdges(g) {
+		if e == nil || e.Kind != graph.EdgeCalls || e.IsSpeculative() {
 			continue
 		}
 		// Scoped warm pass: an unchanged repo's calls were already dispatched (or
@@ -58,9 +48,13 @@ func (r *Resolver) resolveJavaOverrideDispatch() int {
 		if name == "" || strings.HasSuffix(name, ".<init>") {
 			continue
 		}
-		caller := r.cachedGetNode(e.From)
-		if caller == nil || caller.Language != "java" {
-			continue
+		// SQLite joined caller language in the compact census. Adapters without
+		// exact identity lookup retain the historical hydration gate.
+		if !candidates.exact {
+			caller := r.cachedGetNode(e.From)
+			if caller == nil || caller.Language != "java" {
+				continue
+			}
 		}
 		cands := javaOverrideCandidates(r.cachedFindNodesByNameInRepo(name, r.callerRepoPrefix(e)))
 		if len(cands) < 2 || len(cands) > javaOverrideDispatchCap {

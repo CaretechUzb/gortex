@@ -148,18 +148,28 @@ type Store struct {
 	// Bulk-load fast path (graph.BulkLoader). Non-nil only between
 	// BeginBulkLoad and FlushBulk, and only on a first/empty cold index.
 	// database/sql PRAGMAs are connection-local, so the fast path pins one
-	// connection (bulkConn) carrying synchronous=OFF + an enlarged page
-	// cache and routes every bulk write through it; bulkPrevSync /
-	// bulkPrevCacheSize hold the values FlushBulk restores before the
-	// connection returns to the pool. coordinatedBulkLoad is true while a
-	// multi-repository cold parse owns the outer load window; nested per-repo
-	// BeginBulkLoad/FlushBulk calls then leave that window open so indexes are
-	// rebuilt only after the final repository drains. All fields are guarded by
-	// writeMu.
-	bulkConn            *sql.Conn
-	bulkPrevSync        int64
-	bulkPrevCacheSize   int64
-	coordinatedBulkLoad bool
+	// connection (bulkConn) carrying synchronous=OFF, wal_autocheckpoint=0,
+	// and an enlarged page cache and routes every bulk write through it;
+	// bulkPrev* hold the values FlushBulk restores before the connection
+	// returns to the pool. coordinatedBulkLoad is true while a
+	// multi-repository cold parse owns the outer load window. Dense indexes are
+	// sealed once at bounded row counts (or the outer final boundary), while
+	// the pinned durability/FTS window stays open. All fields are guarded
+	// by writeMu.
+	bulkConn               *sql.Conn
+	bulkPrevSync           int64
+	bulkPrevCacheSize      int64
+	bulkPrevAutoCheckpoint int64
+	coordinatedBulkLoad    bool
+	bulkIndexesDeferred    bool
+	bulkDeferredNodeRows   int64
+	bulkDeferredEdgeRows   int64
+	bulkCheckpointNodeRows int64
+	bulkCheckpointEdgeRows int64
+	// bulkRowCheckpointBackoff suppresses only automatic row-cadence attempts
+	// after contention makes one bounded checkpoint unproductive. Explicit
+	// seal/planner/final checkpoints remain active. Reset at bulk begin/close.
+	bulkRowCheckpointBackoff bool
 	// These flags mean "bounded FTS maintenance requested" during a
 	// coordinated cold load. The historical names are retained to keep the
 	// cancellation/Close path stable; normal cold finalization never runs a
@@ -172,6 +182,11 @@ type Store struct {
 	// It is guarded by writeMu. A variable-limit execution failure lowers the
 	// cached value so later batches do not repeat an oversized prepare.
 	batchVariableLimit int
+
+	// jsonbIngestBuffers reuses the bounded JSONB and metadata arenas across
+	// AddBatch calls. It is guarded by writeMu and trimmed after every batch so
+	// one exceptional first row cannot become retained heap.
+	jsonbIngestBuffers jsonbIngestBuffers
 
 	// bulkFinalizeObserver is a package-private test/diagnostic hook. It runs
 	// synchronously under writeMu and therefore must not call back into Store.
@@ -383,9 +398,8 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	}
 	// Add the promoted node columns to databases created before they
 	// existed (CREATE TABLE IF NOT EXISTS won't alter an existing table).
-	// Must run before the droppable-index loop below — nodes_semantic_pending
-	// references a promoted column — and before prepare(), whose node INSERT
-	// references them too.
+	// Must run before prepare(), whose node INSERT references the promoted
+	// columns too.
 	if err := ensureNodeColumns(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite node columns: %w", err)
@@ -417,6 +431,14 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	// recreates them — see bulk_load.go). Kept out of schemaSQL so the two
 	// sites cannot drift.
 	for _, idx := range bulkDroppableIndexes {
+		if _, err := db.Exec(idx.ddl); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite create index %s: %w", idx.name, err)
+		}
+	}
+	// Sparse partial indexes remain live through a cold load, but share the
+	// same explicit DDL ownership rather than drifting into schemaSQL.
+	for _, idx := range bulkAlwaysLiveIndexes {
 		if _, err := db.Exec(idx.ddl); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite create index %s: %w", idx.name, err)
@@ -739,7 +761,8 @@ func (s *Store) Close() error {
 		s.deferredFTSOptimize = false
 		s.deferredContentFTS = false
 		s.coordinatedBulkLoad = false
-		bulkErr = s.flushBulkLocked()
+		sealErr := s.sealBulkIndexesLocked("close")
+		bulkErr = errors.Join(sealErr, s.closeBulkConnectionLocked())
 	}
 	s.writeMu.Unlock()
 
@@ -910,13 +933,29 @@ func (s *Store) prepare() error {
 
 // -- row scanners ---------------------------------------------------------
 
-func scanNode(scanner interface {
+type rowScanner interface {
 	Scan(...any) error
-}) (*graph.Node, error) {
+}
+
+// scanNode is reserved for point lookups backed by sql.Row. database/sql
+// rejects sql.RawBytes for Row.Scan because Row closes its cursor before Scan
+// returns, so these callers must retain the driver's defensive []byte copy.
+func scanNode(scanner rowScanner) (*graph.Node, error) {
+	var metaBlob []byte
+	return scanNodeWithMeta(scanner, &metaBlob)
+}
+
+// scanNodeCursor decodes metadata while the Rows cursor still owns the bytes.
+// The decoded map never retains the RawBytes slice beyond Rows.Next.
+func scanNodeCursor(scanner rowScanner) (*graph.Node, error) {
+	var metaBlob sql.RawBytes
+	return scanNodeWithMeta(scanner, &metaBlob)
+}
+
+func scanNodeWithMeta[B ~[]byte](scanner rowScanner, metaBlob *B) (*graph.Node, error) {
 	var (
-		n        graph.Node
-		metaBlob []byte
-		p        promotedNodeMeta
+		n graph.Node
+		p promotedNodeMeta
 	)
 	err := scanner.Scan(
 		&n.ID, &n.Kind, &n.Name, &n.QualName, &n.FilePath,
@@ -925,14 +964,14 @@ func scanNode(scanner interface {
 		&p.sig, &p.vis, &p.doc, &p.external, &p.returnType,
 		&p.isAsync, &p.isStatic, &p.isAbstract, &p.isExported, &p.updatedAt,
 		&p.dataClass, &p.semanticType, &p.semanticSource, &p.cloneSig,
-		&p.entryPoint, &p.entryPointKind, &metaBlob,
+		&p.entryPoint, &p.entryPointKind, metaBlob,
 		&p.searchSig, &p.searchQualName, &p.searchDoc, &p.searchSuppressed, &p.sectionText,
 	)
 	if err != nil {
 		return nil, err
 	}
-	if len(metaBlob) > 0 {
-		m, derr := decodeMeta(metaBlob)
+	if len(*metaBlob) > 0 {
+		m, derr := decodeMeta([]byte(*metaBlob))
 		if derr != nil {
 			return nil, derr
 		}
@@ -995,26 +1034,30 @@ func scanNodeSummary(scanner interface {
 	return &n, nil
 }
 
-func scanEdge(scanner interface {
-	Scan(...any) error
-}) (*graph.Edge, error) {
+// scanEdgeCursor is cursor-only: metadata is decoded before Rows.Next, so the
+// driver-owned RawBytes never escapes into the returned edge.
+func scanEdgeCursor(scanner rowScanner) (*graph.Edge, error) {
+	var metaBlob sql.RawBytes
+	return scanEdgeWithMeta(scanner, &metaBlob)
+}
+
+func scanEdgeWithMeta[B ~[]byte](scanner rowScanner, metaBlob *B) (*graph.Edge, error) {
 	var (
 		e         graph.Edge
-		metaBlob  []byte
 		crossRepo int64
 		p         promotedEdgeMeta
 	)
 	err := scanner.Scan(
 		&e.From, &e.To, &e.Kind, &e.FilePath, &e.Line,
 		&e.Confidence, &e.ConfidenceLabel, &e.Origin, &e.Tier,
-		&crossRepo, &metaBlob, &p.resolveTerminal, &p.resolveTerminalReason, &p.semanticSource,
+		&crossRepo, metaBlob, &p.resolveTerminal, &p.resolveTerminalReason, &p.semanticSource,
 	)
 	if err != nil {
 		return nil, err
 	}
 	e.CrossRepo = crossRepo != 0
-	if len(metaBlob) > 0 {
-		m, derr := decodeMeta(metaBlob)
+	if len(*metaBlob) > 0 {
+		m, derr := decodeMeta([]byte(*metaBlob))
 		if derr != nil {
 			return nil, derr
 		}
@@ -1710,7 +1753,7 @@ func (s *Store) queryNodesContext(ctx context.Context, stmt *sql.Stmt, args ...a
 	defer rows.Close()
 	var out []*graph.Node
 	for rows.Next() {
-		n, err := scanNode(rows)
+		n, err := scanNodeCursor(rows)
 		if err != nil {
 			if ctx.Err() != nil {
 				return out
@@ -1802,7 +1845,7 @@ func (s *Store) scanNodeQuery(query string, args ...any) []*graph.Node {
 	defer rows.Close()
 	var out []*graph.Node
 	for rows.Next() {
-		n, err := scanNode(rows)
+		n, err := scanNodeCursor(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out
@@ -1913,7 +1956,7 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		e, err := scanEdge(rows)
+		e, err := scanEdgeCursor(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out
@@ -2309,13 +2352,13 @@ func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 // is dropped by the NOT LIKE, matching IsFnValuePlaceholder's infix shape.
 func (s *Store) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		scan, err := s.BeginUnresolvedEdgeScan()
+		scan, err := s.BeginUnresolvedEdgeScan(context.Background())
 		if err != nil {
 			return
 		}
 		var afterID int64
 		for {
-			page, err := s.ReadUnresolvedEdgePage(scan, afterID, 2048, 16<<20)
+			page, err := s.ReadUnresolvedEdgePage(context.Background(), scan, afterID, 2048, 16<<20)
 			if err != nil {
 				return
 			}
@@ -2347,7 +2390,7 @@ func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		e, err := scanEdge(rows)
+		e, err := scanEdgeCursor(rows)
 		if err != nil || e == nil {
 			continue
 		}
@@ -2365,7 +2408,7 @@ func (s *Store) queryNodesSQL(q string, args ...any) []*graph.Node {
 	defer rows.Close()
 	var out []*graph.Node
 	for rows.Next() {
-		n, err := scanNode(rows)
+		n, err := scanNodeCursor(rows)
 		if err != nil || n == nil {
 			continue
 		}

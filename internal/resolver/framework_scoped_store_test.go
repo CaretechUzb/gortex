@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
+	"path/filepath"
 	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 // frameworkScopeTrapStore makes an accidental whole-store predicate scan
@@ -18,20 +20,23 @@ import (
 // edge-source hydration and changed-file adjacency batching.
 type frameworkScopeTrapStore struct {
 	graph.Store
-	globalNodeScans int
-	globalEdgeScans int
-	allNodeScans    int
-	allEdgeScans    int
-	scopedNodeScans int
-	scopedEdgeScans int
-	scopedLightScan int
-	pointNodes      int
-	pointInEdges    int
-	pointOutEdges   int
-	batchNodes      int
-	batchInEdges    int
-	batchOutEdges   int
-	batchNames      int
+	globalNodeScans   int
+	globalEdgeScans   int
+	allNodeScans      int
+	allEdgeScans      int
+	repoEdgeScans     int
+	repoKindEdgeScans int
+	repoKindNodeScans int
+	scopedNodeScans   int
+	scopedEdgeScans   int
+	scopedLightScan   int
+	pointNodes        int
+	pointInEdges      int
+	pointOutEdges     int
+	batchNodes        int
+	batchInEdges      int
+	batchOutEdges     int
+	batchNames        int
 }
 
 func (s *frameworkScopeTrapStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
@@ -52,6 +57,11 @@ func (s *frameworkScopeTrapStore) AllNodes() []*graph.Node {
 func (s *frameworkScopeTrapStore) AllEdges() []*graph.Edge {
 	s.allEdgeScans++
 	return s.Store.AllEdges()
+}
+
+func (s *frameworkScopeTrapStore) GetRepoEdges(repoPrefix string) []*graph.Edge {
+	s.repoEdgeScans++
+	return s.Store.GetRepoEdges(repoPrefix)
 }
 
 func (s *frameworkScopeTrapStore) GetNode(id string) *graph.Node {
@@ -116,6 +126,7 @@ func (s *frameworkScopeTrapStore) RepoEdgesByKinds(
 	repos []string,
 	kinds []graph.EdgeKind,
 ) []graph.RepoEdgeRow {
+	s.repoKindEdgeScans++
 	return graph.ReadRepoEdgesByKinds(s.Store, repos, kinds)
 }
 
@@ -123,6 +134,7 @@ func (s *frameworkScopeTrapStore) RepoNodeIDsByKinds(
 	repos []string,
 	kinds []graph.NodeKind,
 ) []string {
+	s.repoKindNodeScans++
 	return graph.ReadRepoNodeIDsByKinds(s.Store, repos, kinds)
 }
 
@@ -140,6 +152,7 @@ func requireNoFrameworkGlobalScans(t *testing.T, store *frameworkScopeTrapStore)
 	require.Zero(t, store.globalEdgeScans, "partial synth used global EdgesByKind")
 	require.Zero(t, store.allNodeScans, "partial synth used AllNodes")
 	require.Zero(t, store.allEdgeScans, "partial synth used AllEdges")
+	require.Zero(t, store.repoEdgeScans, "partial synth used broad GetRepoEdges")
 }
 
 func frameworkTestNode(repo, file, id string, kind graph.NodeKind, name, language string, meta map[string]any) *graph.Node {
@@ -285,10 +298,39 @@ func TestRunFrameworkSynthesizersScopedForFilesHasNoLegacyGlobalFallback(t *test
 		trap,
 		map[string]bool{"a": true},
 		[]string{"a/main.go"},
+		false,
 	)
 
 	requireNoFrameworkGlobalScans(t, trap)
 	require.Equal(t, 1, trap.scopedLightScan, "candidate census must be one scoped stream")
+}
+
+func TestFrameworkFamilyGateForFilesUsesExactFrontier(t *testing.T) {
+	g := graph.New()
+	dropSource := frameworkTestNode("a", "a/changed.java", "a::drop", graph.KindMethod, "drop", "java", nil)
+	keepSource := frameworkTestNode("a", "a/changed.java", "a::keep", graph.KindMethod, "keep", "java", nil)
+	unrelatedSource := frameworkTestNode("a", "a/unrelated.java", "a::unrelated", graph.KindMethod, "unrelated", "java", nil)
+	webTarget := frameworkTestNode("a", "a/web.ts", "a::web", graph.KindFunction, "web", "typescript", nil)
+	jvmTarget := frameworkTestNode("a", "a/jvm.kt", "a::jvm", graph.KindMethod, "jvm", "kotlin", nil)
+	g.AddBatch([]*graph.Node{dropSource, keepSource, unrelatedSource, webTarget, jvmTarget}, []*graph.Edge{
+		{From: dropSource.ID, To: webTarget.ID, Kind: graph.EdgeReferences, FilePath: dropSource.FilePath, Meta: map[string]any{MetaSynthesizedBy: "test"}},
+		{From: keepSource.ID, To: jvmTarget.ID, Kind: graph.EdgeReferences, FilePath: keepSource.FilePath, Meta: map[string]any{MetaSynthesizedBy: "test"}},
+		{From: unrelatedSource.ID, To: webTarget.ID, Kind: graph.EdgeReferences, FilePath: unrelatedSource.FilePath, Meta: map[string]any{MetaSynthesizedBy: "test"}},
+	})
+	trap := &frameworkScopeTrapStore{Store: g}
+
+	require.Equal(t, 1, applyFrameworkFamilyGateScopedForFiles(
+		trap,
+		map[string]bool{"a": true},
+		[]string{"a/changed.java"},
+	))
+
+	require.Empty(t, g.GetOutEdges(dropSource.ID), "changed cross-family result must be removed")
+	require.Len(t, g.GetOutEdges(keepSource.ID), 1, "same-family result must remain")
+	require.Len(t, g.GetOutEdges(unrelatedSource.ID), 1, "unrelated file must not be rescanned")
+	require.Equal(t, 1, trap.scopedEdgeScans, "gate must use one exact scoped projection")
+	require.Zero(t, trap.repoKindEdgeScans, "exact frontier must not scan repository edge kinds")
+	requireNoFrameworkGlobalScans(t, trap)
 }
 
 func TestFrameworkScopedStoreLargeRepoOneFileRetainsBoundedRows(t *testing.T) {
@@ -326,3 +368,154 @@ var (
 	_ graph.RepoLightNodeReader       = (*frameworkScopeTrapStore)(nil)
 	_ graph.ExactEdgeBatchRemover     = (*frameworkScopeTrapStore)(nil)
 )
+
+func TestFrameworkScopedStorePassIsolation(t *testing.T) {
+	for _, backend := range []struct {
+		name string
+		open func(*testing.T) graph.Store
+	}{
+		{name: "memory", open: func(*testing.T) graph.Store { return graph.New() }},
+		{name: "sqlite", open: openFrameworkScopedSQLiteStore},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			store := backend.open(t)
+			changed := &graph.Node{
+				ID: "repo::changed", Kind: graph.KindFunction, Name: "changed",
+				FilePath: "changed.go", Language: "go", RepoPrefix: "repo",
+			}
+			seedDependency := &graph.Node{
+				ID: "repo::seed-dependency", Kind: graph.KindMethod, Name: "seedDependency",
+				FilePath: "dependency.go", Language: "go", RepoPrefix: "repo",
+			}
+			dynamicDependency := &graph.Node{
+				ID: "repo::dynamic-dependency", Kind: graph.KindFunction, Name: "dynamicDependency",
+				FilePath: "dynamic.go", Language: "go", RepoPrefix: "repo",
+			}
+			unrelated := &graph.Node{
+				ID: "repo::unrelated", Kind: graph.KindFunction, Name: "unrelated",
+				FilePath: "unrelated.py", Language: "python", RepoPrefix: "repo",
+			}
+			store.AddBatch(
+				[]*graph.Node{changed, seedDependency, dynamicDependency, unrelated},
+				[]*graph.Edge{{
+					From: changed.ID, To: seedDependency.ID, Kind: graph.EdgeCalls,
+					FilePath: changed.FilePath, Line: 3,
+				}},
+			)
+
+			seed := newFrameworkScopedSeed(
+				store,
+				map[string]bool{"repo": true},
+				[]string{changed.FilePath},
+			)
+			passA := seed.newPassStore()
+			if got := passA.FindNodesByName(dynamicDependency.Name); len(got) != 1 {
+				t.Fatalf("pass A dynamic lookup returned %d nodes, want 1", len(got))
+			}
+			if !frameworkNodeSeqContains(passA.NodesByKind(graph.KindFunction), dynamicDependency.ID) {
+				t.Fatal("pass A did not retain its own dynamic dependency")
+			}
+			if passA.stats().RetainedRows <= seed.retainedRows {
+				t.Fatal("pass A did not report its private frontier expansion")
+			}
+
+			// Model a synthesized edge whose source is an admitted dependency,
+			// not the changed file. It must be visible to the next pass even
+			// though pass A's read-only dynamic node expansion is discarded.
+			persisted := &graph.Edge{
+				From: seedDependency.ID, To: dynamicDependency.ID, Kind: graph.EdgeCalls,
+				FilePath: seedDependency.FilePath, Line: 7,
+			}
+			runLegacyFrameworkSynth(passA, func(g graph.Store) int {
+				g.AddEdge(persisted)
+				return 1
+			})
+
+			passB := seed.newPassStore()
+			if frameworkNodeSeqContains(passB.NodesByKind(graph.KindFunction), dynamicDependency.ID) {
+				t.Fatal("pass A read expansion leaked into pass B")
+			}
+			if !frameworkNodeSeqContains(passB.NodesByKind(graph.KindMethod), seedDependency.ID) {
+				t.Fatal("immutable changed-file seed was not retained for pass B")
+			}
+			if !frameworkEdgeSeqContains(passB.EdgesByKind(graph.EdgeCalls), persisted) {
+				t.Fatal("pass B could not observe pass A's persisted synthesized edge")
+			}
+		})
+	}
+}
+
+func TestFrameworkFileFrontierWinsWithoutRepoScope(t *testing.T) {
+	for _, backend := range []struct {
+		name string
+		open func(*testing.T) graph.Store
+	}{
+		{name: "memory", open: func(*testing.T) graph.Store { return graph.New() }},
+		{name: "sqlite", open: openFrameworkScopedSQLiteStore},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			store := backend.open(t)
+			changed := &graph.Node{
+				ID: "repo::changed", Kind: graph.KindFunction, Name: "changed",
+				FilePath: "changed.go", Language: "go", RepoPrefix: "repo",
+			}
+			unrelated := &graph.Node{
+				ID: "other::unrelated", Kind: graph.KindFunction, Name: "unrelated",
+				FilePath: "unrelated.py", Language: "python", RepoPrefix: "other",
+			}
+			store.AddBatch([]*graph.Node{changed, unrelated}, nil)
+
+			summary := summarizeFrameworkCandidatesCensus(
+				store, nil, []string{changed.FilePath}, false,
+			)
+			if summary.fullCensus {
+				t.Fatal("nil repository scope promoted an exact file frontier to a full census")
+			}
+			if summary.all["go"] != 1 || summary.all["python"] != 0 {
+				t.Fatalf("file census widened beyond changed.go: families=%v", summary.all)
+			}
+
+			effective := frameworkScopeForFiles(store, nil, []string{changed.FilePath})
+			if !effective["repo"] || len(effective) != 1 {
+				t.Fatalf("recovered scope = %v, want only repo", effective)
+			}
+			view := newFrameworkScopedSeed(store, nil, []string{changed.FilePath}).newPassStore()
+			if frameworkNodeSeqContains(view.NodesByKind(graph.KindFunction), unrelated.ID) {
+				t.Fatal("nil repository scope widened the scoped store beyond changed.go")
+			}
+		})
+	}
+}
+
+func openFrameworkScopedSQLiteStore(t *testing.T) graph.Store {
+	t.Helper()
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open sqlite graph: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close sqlite graph: %v", err)
+		}
+	})
+	return store
+}
+
+func frameworkNodeSeqContains(nodes func(func(*graph.Node) bool), id string) bool {
+	for node := range nodes {
+		if node != nil && node.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func frameworkEdgeSeqContains(edges func(func(*graph.Edge) bool), want *graph.Edge) bool {
+	wantIdentity := graph.EdgeIdentityFor(want)
+	for edge := range edges {
+		if graph.EdgeIdentityFor(edge) == wantIdentity {
+			return true
+		}
+	}
+	return false
+}

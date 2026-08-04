@@ -138,10 +138,14 @@ func TestResolveAll_ScopedEqualsFull(t *testing.T) {
 	full := New(twinStore)
 	fullStats := full.ResolveAll()
 
-	// The scope filter must actually have dropped the foreign repo-B stub —
-	// otherwise this test would pass trivially without exercising the filter.
-	require.Less(t, scopedStats.PendingAfter, scopedStats.PendingBefore,
-		"scoped pass must drop at least one pending edge")
+	// SQLite pushes the scope predicate into the pager, so an intentionally
+	// uncounted scan observes only the scoped rows it actually decodes. Compare
+	// with the full twin to prove the foreign repo-B stub was dropped without a
+	// whole-frontier pre-count.
+	require.Less(t, scopedStats.PendingBefore, fullStats.PendingBefore,
+		"scoped pager must load fewer pending edges than a full pass")
+	require.Equal(t, scopedStats.PendingBefore, scopedStats.PendingAfter,
+		"all rows admitted by the scoped pager survive the exact Go filter")
 	require.Equal(t, fullStats.PendingBefore, fullStats.PendingAfter,
 		"full pass must not drop any pending edge")
 

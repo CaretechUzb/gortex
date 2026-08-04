@@ -194,6 +194,47 @@ func collectImplementationTypes(store graph.Store, repos []string, ifacesByRepo 
 	return byRepo
 }
 
+// collectImplementationTypesProjected uses the compact member-method join on
+// whole-workspace runs. Only owner type nodes are hydrated, once in an ID batch;
+// method edge payloads and method Meta never cross the storage boundary.
+func collectImplementationTypesProjected(
+	store graph.Store,
+	ifacesByRepo map[string][]implementationInterface,
+) (map[string]map[string]*implementationType, bool) {
+	projector, ok := store.(graph.MemberMethodsByType)
+	if !ok {
+		return nil, false
+	}
+	rowsByType := projector.MemberMethodsByType()
+	typeIDs := make([]string, 0, len(rowsByType))
+	for typeID := range rowsByType {
+		typeIDs = append(typeIDs, typeID)
+	}
+	sort.Strings(typeIDs)
+	owners := store.GetNodesByIDs(typeIDs)
+	byRepo := make(map[string]map[string]*implementationType)
+	for _, typeID := range typeIDs {
+		owner := owners[typeID]
+		if owner == nil || (owner.Kind != graph.KindType && owner.Kind != graph.KindInterface) {
+			continue
+		}
+		if len(ifacesByRepo[owner.RepoPrefix]) == 0 {
+			continue
+		}
+		types := byRepo[owner.RepoPrefix]
+		if types == nil {
+			types = make(map[string]*implementationType)
+			byRepo[owner.RepoPrefix] = types
+		}
+		typeInfo := &implementationType{node: owner, methods: make(map[string]struct{})}
+		for _, method := range rowsByType[typeID] {
+			typeInfo.methods[method.Name] = struct{}{}
+		}
+		types[typeID] = typeInfo
+	}
+	return byRepo, true
+}
+
 func collectExistingImplementationPairs(store graph.Store, repos []string) map[string]struct{} {
 	existing := make(map[string]struct{})
 	for row := range graph.EdgesInScopeSeq(store, repos, nil, graph.EdgeImplements) {
@@ -299,7 +340,16 @@ func (r *Resolver) inferImplementationsByRepo(scopeTypes, scopeIfaces map[string
 	if len(ifacesByRepo) == 0 {
 		return 0
 	}
-	typesByRepo := collectImplementationTypes(r.graph, repos, ifacesByRepo)
+	var typesByRepo map[string]map[string]*implementationType
+	if scopeTypes == nil && scopeIfaces == nil {
+		if projected, ok := collectImplementationTypesProjected(r.graph, ifacesByRepo); ok {
+			typesByRepo = projected
+		} else {
+			typesByRepo = collectImplementationTypes(r.graph, repos, ifacesByRepo)
+		}
+	} else {
+		typesByRepo = collectImplementationTypes(r.graph, repos, ifacesByRepo)
+	}
 	if len(typesByRepo) == 0 {
 		return 0
 	}
@@ -398,6 +448,34 @@ func collectOverrideMethods(store graph.Store, repos []string) map[string]map[st
 		methods[method.Name] = method
 	}
 	return byType
+}
+
+// collectOverrideMethodsProjected builds the same stable last-name-winner map
+// from the compact member-method projection. The lightweight nodes carry every
+// field override emission consumes and omit the unused declaration payload.
+func collectOverrideMethodsProjected(store graph.Store) (map[string]map[string]*graph.Node, bool) {
+	projector, ok := store.(graph.MemberMethodsByType)
+	if !ok {
+		return nil, false
+	}
+	rowsByType := projector.MemberMethodsByType()
+	byType := make(map[string]map[string]*graph.Node, len(rowsByType))
+	for typeID, rows := range rowsByType {
+		methods := make(map[string]*graph.Node)
+		for _, row := range rows {
+			if row.MethodID == "" {
+				continue
+			}
+			methods[row.Name] = &graph.Node{
+				ID: row.MethodID, Kind: graph.KindMethod, Name: row.Name,
+				FilePath: row.FilePath, StartLine: row.StartLine, RepoPrefix: row.RepoPrefix,
+			}
+		}
+		if len(methods) > 0 {
+			byType[typeID] = methods
+		}
+	}
+	return byType, true
 }
 
 func (r *Resolver) flushOverrideCandidates(candidates []overrideCandidate) int {
@@ -499,7 +577,16 @@ func (r *Resolver) inferOverridesByRepo(scope map[string]bool) int {
 	if scope != nil {
 		methodRepos = overrideMethodRepos(r.graph, repos, scope)
 	}
-	methodsByType := collectOverrideMethods(r.graph, methodRepos)
+	var methodsByType map[string]map[string]*graph.Node
+	if scope == nil {
+		if projected, ok := collectOverrideMethodsProjected(r.graph); ok {
+			methodsByType = projected
+		} else {
+			methodsByType = collectOverrideMethods(r.graph, methodRepos)
+		}
+	} else {
+		methodsByType = collectOverrideMethods(r.graph, methodRepos)
+	}
 	if len(methodsByType) == 0 {
 		return 0
 	}
@@ -509,25 +596,24 @@ func (r *Resolver) inferOverridesByRepo(scope map[string]bool) int {
 		added += r.flushOverrideCandidates(candidates)
 		candidates = make([]overrideCandidate, 0, inferenceMutationBatchSize)
 	}
-	for row := range graph.EdgesInScopeSeq(r.graph, repos, nil,
-		graph.EdgeExtends, graph.EdgeImplements, graph.EdgeComposes) {
-		if !relevantOverrideParent(row, scope) {
-			continue
+	visitParent := func(fromID, toID, parentOrigin string) {
+		if fromID == toID {
+			return
 		}
-		childMethods := methodsByType[row.Edge.From]
-		parentMethods := methodsByType[row.Edge.To]
+		childMethods := methodsByType[fromID]
+		parentMethods := methodsByType[toID]
 		if len(childMethods) == 0 || len(parentMethods) == 0 {
-			continue
+			return
 		}
 		names := make([]string, 0, len(childMethods))
 		for name := range childMethods {
 			names = append(names, name)
 		}
 		sort.Strings(names)
-		origin := overrideOrigin(row.Edge.Origin)
+		origin := overrideOrigin(parentOrigin)
 		for _, name := range names {
 			child, parent := childMethods[name], parentMethods[name]
-			if parent == nil || parent.ID == child.ID {
+			if child == nil || parent == nil || parent.ID == child.ID {
 				continue
 			}
 			candidates = append(candidates, overrideCandidate{from: child, to: parent, origin: origin})
@@ -535,6 +621,26 @@ func (r *Resolver) inferOverridesByRepo(scope map[string]bool) int {
 				flush()
 			}
 		}
+	}
+	if scope == nil {
+		if projector, ok := r.graph.(graph.StructuralParentEdges); ok {
+			for _, row := range projector.StructuralParentEdges() {
+				if (row.FromKind != graph.KindType && row.FromKind != graph.KindInterface) ||
+					(row.ToKind != graph.KindType && row.ToKind != graph.KindInterface) {
+					continue
+				}
+				visitParent(row.FromID, row.ToID, row.Origin)
+			}
+			flush()
+			return added
+		}
+	}
+	for row := range graph.EdgesInScopeSeq(r.graph, repos, nil,
+		graph.EdgeExtends, graph.EdgeImplements, graph.EdgeComposes) {
+		if !relevantOverrideParent(row, scope) {
+			continue
+		}
+		visitParent(row.Edge.From, row.Edge.To, row.Edge.Origin)
 	}
 	flush()
 	return added

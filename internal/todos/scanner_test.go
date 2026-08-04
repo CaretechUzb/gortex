@@ -1,6 +1,8 @@
 package todos
 
 import (
+	"bytes"
+	"reflect"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -91,6 +93,84 @@ func TestScan_RespectsMaxText(t *testing.T) {
 	}
 	if len(got[0].Text) != 50 {
 		t.Errorf("len(text) = %d, want 50", len(got[0].Text))
+	}
+}
+
+func TestScan_BytePrefilterPreservesCandidateSemantics(t *testing.T) {
+	src := []byte(`value := "// TODO: marker inside a string"
+	// TODO(alice)[2026-05-01]: fix parser #123
+# FIXME: fix shell PROJ-42
+`)
+	got := Scan(src, []string{" TODO ", "FIXME"}, 200)
+	want := []Finding{
+		{
+			Tag:      "TODO",
+			Assignee: "alice",
+			Due:      "2026-05-01",
+			Ticket:   "#123",
+			Text:     "fix parser #123",
+			Line:     2,
+		},
+		{
+			Tag:    "FIXME",
+			Ticket: "PROJ-42",
+			Text:   "fix shell PROJ-42",
+			Line:   3,
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("findings changed:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestScan_CandidateStringsOwnTheirStorage(t *testing.T) {
+	source := []byte("// TODO(alice)[2026-05-01]: preserve this text PROJ-42\n")
+	got := Scan(source, defaultTags(), 200)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(got))
+	}
+	want := got[0]
+
+	// Neither caller mutation nor a subsequent scan reusing the pooled
+	// scanner buffer may alter strings retained by the first Finding.
+	for i := range source {
+		source[i] = 'x'
+	}
+	_ = Scan([]byte("// FIXME(bob): overwrite pooled scanner storage #456\n"), defaultTags(), 200)
+	if got[0] != want {
+		t.Fatalf("finding aliases mutable scanner storage: got %#v, want %#v", got[0], want)
+	}
+}
+
+func TestScan_TaglessAllocationsDoNotScaleWithLines(t *testing.T) {
+	tags := defaultTags()
+	small := []byte("var ordinaryValue = 42\n")
+	large := bytes.Repeat(small, 4096)
+
+	// Warm any package-level pools before measuring.
+	_ = Scan(small, tags, 200)
+	_ = Scan(large, tags, 200)
+	smallAllocs := testing.AllocsPerRun(20, func() {
+		_ = Scan(small, tags, 200)
+	})
+	largeAllocs := testing.AllocsPerRun(20, func() {
+		_ = Scan(large, tags, 200)
+	})
+	if largeAllocs > smallAllocs+1 {
+		t.Fatalf("tagless allocations scale with lines: small=%.1f large=%.1f", smallAllocs, largeAllocs)
+	}
+}
+
+func BenchmarkScanTaglessLarge(b *testing.B) {
+	source := bytes.Repeat([]byte("var ordinaryValue = 42\n"), 64*1024)
+	tags := defaultTags()
+	b.ReportAllocs()
+	b.SetBytes(int64(len(source)))
+	b.ResetTimer()
+	for range b.N {
+		if got := Scan(source, tags, 200); got != nil {
+			b.Fatalf("unexpected findings: %#v", got)
+		}
 	}
 }
 

@@ -52,11 +52,36 @@ func TestCoordinatedBulkFinalizeRefreshesPlannerStats(t *testing.T) {
 		t.Fatal("BeginCoordinatedBulkLoad refused")
 	}
 	seedPlannerStatsNodes(s)
+	s.AddEdge(&graph.Edge{
+		From:     "pkg/a.go::sym00",
+		To:       "pkg/a.go::sym01",
+		Kind:     graph.EdgeCalls,
+		FilePath: "pkg/a.go",
+	})
 	if err := s.EndCoordinatedBulkLoad(); err != nil {
 		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
 	}
 	if rows := plannerStatRows(t, s); rows == 0 {
 		t.Fatal("bulk finalize left no sqlite_stat1 rows")
+	}
+	statsRows, err := s.db.Query(`SELECT DISTINCT tbl FROM sqlite_stat1 ORDER BY tbl`)
+	if err != nil {
+		t.Fatalf("list analyzed tables: %v", err)
+	}
+	defer statsRows.Close()
+	var tables []string
+	for statsRows.Next() {
+		var table string
+		if err := statsRows.Scan(&table); err != nil {
+			t.Fatalf("scan analyzed table: %v", err)
+		}
+		tables = append(tables, table)
+	}
+	if err := statsRows.Err(); err != nil {
+		t.Fatalf("iterate analyzed tables: %v", err)
+	}
+	if got, want := fmt.Sprint(tables), "[edges nodes]"; got != want {
+		t.Fatalf("analyzed tables = %s, want %s", got, want)
 	}
 }
 

@@ -19,9 +19,9 @@ const (
 	// localizationDigestMaxBytes bounds retained session state independently of
 	// the original envelope budget.
 	localizationDigestMaxBytes = 4096
-	// localizationReplayEvidenceLimit preserves the five strongest direct rows
-	// plus at most one graph-validated direct relationship for each. The retained
-	// byte cap remains authoritative when long identities cannot all fit.
+	// localizationReplayEvidenceLimit preserves the complete eight-symbol
+	// refinement window plus two graph-relationship slots. The retained byte cap
+	// remains authoritative when long identities cannot all fit.
 	localizationReplayEvidenceLimit = 10
 	// localizationFinalResponseMaxBytes bounds the ready-to-emit answer that
 	// accompanies the retained digest on terminal responses and replays.
@@ -120,7 +120,7 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 			return digest
 		}
 		last := len(digest.Evidence) - 1
-		if shedLocalizationDigestRowOptionalFields(&digest.Evidence[last]) {
+		if shedLocalizationDigestOptionalFields(digest.Evidence) {
 			continue
 		}
 		// The identity and file are the irreducible row. If even one pathological
@@ -180,14 +180,66 @@ func cloneLocalizationDigestRows(rows []localizationDigestRow) []localizationDig
 	return cloned
 }
 
+const localizationMergedRelationCap = exploreRingCap * 2
+
+func mergeLocalizationDigestStrings(primary, supplementary []string) []string {
+	merged := make([]string, 0, min(localizationMergedRelationCap, len(primary)+len(supplementary)))
+	seen := make(map[string]struct{}, cap(merged))
+	for _, values := range [][]string{primary, supplementary} {
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			if _, exists := seen[value]; exists {
+				continue
+			}
+			seen[value] = struct{}{}
+			merged = append(merged, value)
+			if len(merged) == localizationMergedRelationCap {
+				return merged
+			}
+		}
+	}
+	return merged
+}
+
+// mergeLocalizationDigestRowEvidence preserves the first-ranked identity while
+// filling metadata and unioning bounded graph evidence from a later observation.
+// File disagreement is deliberately not repaired here: one ID cannot authorize
+// two declaration files, so the first tuple remains authoritative.
+func mergeLocalizationDigestRowEvidence(primary, supplementary localizationDigestRow) localizationDigestRow {
+	if strings.TrimSpace(primary.File) != strings.TrimSpace(supplementary.File) {
+		return primary
+	}
+	if primary.Name == "" {
+		primary.Name = supplementary.Name
+	}
+	if primary.QualName == "" {
+		primary.QualName = supplementary.QualName
+	}
+	if primary.Kind == "" {
+		primary.Kind = supplementary.Kind
+	}
+	if primary.Line == 0 {
+		primary.Line = supplementary.Line
+	}
+	if primary.Signature == "" {
+		primary.Signature = supplementary.Signature
+	}
+	if primary.Provenance == "" {
+		primary.Provenance = supplementary.Provenance
+	}
+	primary.Callers = mergeLocalizationDigestStrings(primary.Callers, supplementary.Callers)
+	primary.Callees = mergeLocalizationDigestStrings(primary.Callees, supplementary.Callees)
+	return primary
+}
+
 // localizationFreshEvidenceReserve bounds how much of the retained digest the
-// terminalizing call's own output may claim. A targeted read returns one row and
-// deserves to lead; a broad search returns a whole page of its own and would
-// otherwise evict every ranked localization row — including a rank-one ground
-// truth the caller has already read — leaving an answer built entirely from the
-// caller's last query. The localization evidence is what the session exists to
-// deliver, so it keeps the majority of the bounded digest.
-const localizationFreshEvidenceReserve = 3
+// terminalizing call's own output may claim. The remainder is exactly the full
+// refinement authorization window, so one broad recovery page cannot evict a
+// candidate that the preceding contract said was safe to inspect.
+const localizationFreshEvidenceReserve = localizationReplayEvidenceLimit - localizationRefinementAllowedSymbolCap
 
 // mergeLocalizationEvidenceDigest puts evidence returned by the terminalizing
 // permitted call first, then fills the bounded tail from the retained localize
@@ -196,24 +248,25 @@ const localizationFreshEvidenceReserve = 3
 // retained ranking out of its own answer.
 func mergeLocalizationEvidenceDigest(current []localizationDigestRow, retained *localizationEvidenceDigest) *localizationEvidenceDigest {
 	digest := &localizationEvidenceDigest{}
-	seen := make(map[string]struct{}, localizationReplayEvidenceLimit)
+	seen := make(map[string]int, localizationReplayEvidenceLimit)
 	appendRows := func(rows []localizationDigestRow, limit int) {
 		if limit > localizationReplayEvidenceLimit {
 			limit = localizationReplayEvidenceLimit
 		}
 		for _, row := range rows {
-			if len(digest.Evidence) >= limit {
-				return
-			}
 			row.ID = strings.TrimSpace(row.ID)
 			row.File = strings.TrimSpace(row.File)
 			if row.ID == "" || row.File == "" {
 				continue
 			}
-			if _, exists := seen[row.ID]; exists {
+			if index, exists := seen[row.ID]; exists {
+				digest.Evidence[index] = mergeLocalizationDigestRowEvidence(digest.Evidence[index], row)
 				continue
 			}
-			seen[row.ID] = struct{}{}
+			if len(digest.Evidence) >= limit {
+				return
+			}
+			seen[row.ID] = len(digest.Evidence)
 			row.Callers = append([]string(nil), row.Callers...)
 			row.Callees = append([]string(nil), row.Callees...)
 			digest.Evidence = append(digest.Evidence, row)
@@ -240,7 +293,7 @@ func mergeLocalizationEvidenceDigest(current []localizationDigestRow, retained *
 			return digest
 		}
 		last := len(digest.Evidence) - 1
-		if shedLocalizationDigestRowOptionalFields(&digest.Evidence[last]) {
+		if shedLocalizationDigestOptionalFields(digest.Evidence) {
 			continue
 		}
 		if last == 0 {
@@ -403,6 +456,19 @@ func shedLocalizationDigestRowOptionalFields(row *localizationDigestRow) bool {
 	return false
 }
 
+// shedLocalizationDigestOptionalFields compacts supplementary detail across the
+// complete retained window before any declaration identity is removed. Walking
+// from the tail preserves richer metadata on higher-ranked rows when the byte
+// cap can be met without stripping the whole page.
+func shedLocalizationDigestOptionalFields(rows []localizationDigestRow) bool {
+	for index := len(rows) - 1; index >= 0; index-- {
+		if shedLocalizationDigestRowOptionalFields(&rows[index]) {
+			return true
+		}
+	}
+	return false
+}
+
 func rebuildLocalizationDigestSkeleton(digest *localizationEvidenceDigest) {
 	digest.Files = digest.Files[:0]
 	digest.Symbols = digest.Symbols[:0]
@@ -444,7 +510,8 @@ func localizationFinalResponsePrimaryProvenance(provenance string) bool {
 	case localizationProvenanceSourceLiteralCallee,
 		localizationProvenanceDivergentDefault,
 		localizationProvenanceImplementationTarget,
-		localizationProvenanceTypedAnchorProjection:
+		localizationProvenanceTypedAnchorProjection,
+		localizationProvenancePermittedReadSource:
 		return true
 	default:
 		return false
@@ -550,13 +617,9 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 	for _, row := range rows {
 		rowsByID[strings.TrimSpace(row.ID)] = row
 	}
-	// A successful authorized read is the freshest bounded evidence and leads
-	// the presentation even when its retained predecessor carried more metadata.
-	for _, row := range current {
-		if retained, exists := rowsByID[strings.TrimSpace(row.ID)]; exists {
-			appendRow(&primaries, localizationFinalResponsePrimaryLimit, retained)
-		}
-	}
+	// Fresh rows already lead the merged evidence order. Primary status is earned
+	// from proof, task alignment, or owner coherence below; arrival time alone
+	// must not displace stronger retained evidence.
 	for _, row := range rows {
 		if localizationFinalResponsePrimaryProvenance(row.Provenance) {
 			appendRow(&primaries, localizationFinalResponsePrimaryLimit, row)
@@ -841,7 +904,7 @@ func localizationCompletionBoundedByDigest(completion localizationCompletion, di
 	}
 	retained := localizationDigestRowsByID(digest)
 	advisory := func() localizationCompletion {
-		bounded := newLocalizationCompletion(true, "")
+		bounded := newLocalizationAdvisoryCompletion()
 		bounded.taskLead = completion.taskLead
 		return bounded
 	}
@@ -906,6 +969,18 @@ func localizationCompletionBoundedByDigest(completion localizationCompletion, di
 		return bounded
 	}
 	return completion
+}
+
+// localizationContractReconciledWithDigest is the only projection boundary
+// from retained evidence to a wire contract. Call it after every digest reshape:
+// byte shedding may remove an authorized identity or one of its proof rows.
+func localizationContractReconciledWithDigest(
+	completion localizationCompletion,
+	digest *localizationEvidenceDigest,
+) localizationTerminalContract {
+	completion = localizationCompletionBoundedByDigest(completion, digest)
+	completion = localizationCompletionWithDigest(completion, digest)
+	return localizationContractFor(completion)
 }
 
 // localizationStateCarriesEvidence reports whether a state is inside a

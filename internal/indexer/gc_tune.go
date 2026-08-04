@@ -305,11 +305,12 @@ func clampWorkersToCPUQuota(configured, quotaCores int) int {
 // are reference-counted: the first concurrent applier captures the prior
 // settings and installs the tuned ones; the last to finish restores them.
 var (
-	gcTuneMu      sync.Mutex
-	gcTuneDepth   int
-	gcTunePrevPct int
-	gcTunePctSet  bool
-	gcTunePrevLim int64
+	gcTuneMu          sync.Mutex
+	gcTuneDepth       int
+	gcTunePrevPct     int
+	gcTunePctSet      bool
+	gcTunePrevLim     int64
+	gcTuneNativeStart uint64
 )
 
 // shouldRaiseGCPercent decides whether the cold-index window may relax the
@@ -348,6 +349,11 @@ func applyIndexGCTuning(logger *zap.Logger) func() {
 
 	gcTuneMu.Lock()
 	if gcTuneDepth == 0 {
+		// Capture native-parser progress for this shared indexing window. The
+		// last restore uses the delta to avoid a process-wide allocator walk
+		// after ordinary incremental indexes that did not parse C-family code.
+		gcTuneNativeStart = nativeParseCompletionGeneration.Load()
+
 		// SetMemoryLimit(-1) reads the current limit without changing it.
 		// Capture it before mutating so the restore is exact.
 		calculated := budget
@@ -389,20 +395,24 @@ func applyIndexGCTuning(logger *zap.Logger) func() {
 			gcTuneMu.Lock()
 			gcTuneDepth--
 			closed := gcTuneDepth == 0
+			releaseNative := false
 			if closed {
 				if gcTunePctSet {
 					debug.SetGCPercent(gcTunePrevPct)
 					gcTunePctSet = false
 				}
 				debug.SetMemoryLimit(gcTunePrevLim)
+				releaseNative = nativeParseCompletionGeneration.Load() != gcTuneNativeStart
 			}
 			gcTuneMu.Unlock()
 			// Scavenge the cold-index burst's heap high-water once the
 			// window is fully closed — outside the lock, since FreeOSMemory
 			// is a full GC cycle that must not serialise sibling index
-			// calls waiting on gcTuneMu.
+			// calls waiting on gcTuneMu. Native zone walks use their own
+			// process-wide lock and only run for a window that parsed C-family
+			// code.
 			if closed {
-				freeOSMemoryAfterColdIndex(logger)
+				freeOSMemoryAfterColdIndex(logger, releaseNative)
 			}
 		})
 	}
@@ -417,12 +427,11 @@ func memReleaseEnabled() bool {
 	return v != "0" && !strings.EqualFold(v, "false")
 }
 
-// freeOSMemoryAfterColdIndex returns the cold-index burst's heap high-water
-// to the OS once the tuning window has fully closed. A cold index churns
-// multi-GB of parse / node / edge allocation; debug.FreeOSMemory forces a GC
-// + scavenge so that peak does not stay resident on the daemon's footprint
-// until some later collection happens to reclaim it.
-func freeOSMemoryAfterColdIndex(logger *zap.Logger) {
+// freeOSMemoryAfterColdIndex returns the cold-index burst's Go and native
+// allocator high-water to the OS once the shared tuning window has fully
+// closed. debug.FreeOSMemory handles Go heap pages; a dirty-gated libmalloc
+// pressure-relief pass handles freed tree-sitter pages that Go cannot see.
+func freeOSMemoryAfterColdIndex(logger *zap.Logger, releaseNative bool) {
 	if !memReleaseEnabled() {
 		return
 	}
@@ -444,6 +453,21 @@ func freeOSMemoryAfterColdIndex(logger *zap.Logger) {
 			ran, forced = true, true
 		}
 	}
+
+	// Go's scavenger cannot return pages retained by tree-sitter/libmalloc.
+	// Sweep native zones once the shared index window is closed, but only when
+	// its generation proves that C-family parsing actually occurred. Darwin's
+	// reported byte count is a lower bound: tiny/small regions may be madvised
+	// without contributing to malloc_zone_pressure_relief's return value.
+	nativeRan := releaseNative && nativeAllocatorPressureReliefSupported
+	var nativeReported uintptr
+	var nativeElapsed time.Duration
+	if nativeRan {
+		nativeStart := time.Now()
+		nativeReported = runNativeAllocatorPressureRelief()
+		nativeElapsed = time.Since(nativeStart)
+	}
+
 	if logger == nil {
 		return
 	}
@@ -451,11 +475,17 @@ func freeOSMemoryAfterColdIndex(logger *zap.Logger) {
 		snapshot := runtimeactivity.Current()
 		logger.Debug("indexer: deferred cold-index heap release until process idle",
 			zap.Int64("active_work", snapshot.Active),
-			zap.Any("active_by_kind", snapshot.ByKind))
+			zap.Any("active_by_kind", snapshot.ByKind),
+			zap.Bool("native_pressure_relief_ran", nativeRan),
+			zap.Uint64("native_reported_released_bytes", uint64(nativeReported)),
+			zap.Duration("native_elapsed", nativeElapsed))
 		return
 	}
 	logger.Debug("indexer: released heap to OS after cold index",
 		zap.Bool("forced_by_pressure", forced),
+		zap.Bool("native_pressure_relief_ran", nativeRan),
+		zap.Uint64("native_reported_released_bytes", uint64(nativeReported)),
+		zap.Duration("native_elapsed", nativeElapsed),
 		zap.Duration("elapsed", time.Since(start)))
 }
 

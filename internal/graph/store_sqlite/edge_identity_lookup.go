@@ -1,6 +1,11 @@
 package store_sqlite
 
-import "github.com/zzet/gortex/internal/graph"
+import (
+	"cmp"
+	"slices"
+
+	"github.com/zzet/gortex/internal/graph"
+)
 
 const (
 	exactEdgeIdentityParamsPerRow = 5
@@ -50,6 +55,14 @@ func (s *Store) findEdgesByIdentities(identities []graph.EdgeIdentity) (map[grap
 		unique = append(unique, identity)
 	}
 
+	// The UNIQUE edge identity index has this exact key order. Sorting the
+	// compact keys turns the inner exact-match probes from corpus-order random
+	// walks into a forward B-tree walk. The query below independently restores
+	// row-id order before decoding full rows, so index locality does not trade
+	// away table-page locality and callers still recover their own order from
+	// the result map.
+	slices.SortFunc(unique, compareEdgeIdentityLookupKey)
+
 	variableLimit := s.edgeIdentityVariableLimit()
 	for start := 0; start < len(unique); {
 		maxRows := batchRowsForVariableLimit(variableLimit, exactEdgeIdentityParamsPerRow, exactEdgeIdentityMaxRows)
@@ -95,7 +108,7 @@ func (s *Store) findEdgesByIdentities(identities []graph.EdgeIdentity) (map[grap
 		}
 
 		for rows.Next() {
-			edge, scanErr := scanEdge(rows)
+			edge, scanErr := scanEdgeCursor(rows)
 			if scanErr != nil {
 				_ = rows.Close()
 				panicOnFatal(scanErr)
@@ -117,17 +130,43 @@ func (s *Store) findEdgesByIdentities(identities []graph.EdgeIdentity) (map[grap
 	return found, stats
 }
 
+func compareEdgeIdentityLookupKey(left, right graph.EdgeIdentity) int {
+	if order := cmp.Compare(left.From, right.From); order != 0 {
+		return order
+	}
+	if order := cmp.Compare(left.To, right.To); order != 0 {
+		return order
+	}
+	if order := cmp.Compare(left.Kind, right.Kind); order != 0 {
+		return order
+	}
+	if order := cmp.Compare(left.FilePath, right.FilePath); order != 0 {
+		return order
+	}
+	return cmp.Compare(left.Line, right.Line)
+}
+
+// exactEdgeIdentityQuery separates identity-index locality from payload-page
+// locality in one SQLite snapshot. The bounded IN subquery materializes only
+// integer row IDs; the outer primary-key walk then decodes full rows in table
+// order. ORDER BY is satisfied by that row-ID walk (the plan test forbids a
+// full-row temp sort).
 func exactEdgeIdentityQuery(rows int) string {
 	return `WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES ` +
 		multiValues(rows, exactEdgeIdentityParamsPerRow) + `)
 SELECT ` + lookupQualifiedEdgeCols + `
-FROM wanted AS w
-JOIN edges AS e
-  ON e.from_id = w.from_id
- AND e.to_id = w.to_id
- AND e.kind = w.kind
- AND e.file_path = w.file_path
- AND e.line = w.line`
+FROM edges AS e
+WHERE e.id IN (
+      SELECT matched.id
+      FROM wanted AS w
+      JOIN edges AS matched
+        ON matched.from_id = w.from_id
+       AND matched.to_id = w.to_id
+       AND matched.kind = w.kind
+       AND matched.file_path = w.file_path
+       AND matched.line = w.line
+)
+ORDER BY e.id`
 }
 
 func (s *Store) edgeIdentityVariableLimit() int {

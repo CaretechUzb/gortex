@@ -266,7 +266,7 @@ func (s *Server) addPrompt(prompt mcp.Prompt, handler mcpserver.PromptHandlerFun
 }
 
 func (s *Server) boundResourceHandler(uri string, h mcpserver.ResourceHandlerFunc) mcpserver.ResourceHandlerFunc {
-	return boundHandler(s, "resource", uri, (func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error))(h),
+	bounded := boundHandler(s, "resource", uri, (func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error))(h),
 		func(stuck int64, timeout time.Duration) ([]mcp.ResourceContents, error) {
 			return nil, errors.New(busyMessage("resource reads", stuck, timeout))
 		},
@@ -277,6 +277,12 @@ func (s *Server) boundResourceHandler(uri string, h mcpserver.ResourceHandlerFun
 			return nil, fmt.Errorf("resource %s internal error: %v", uri, r)
 		},
 	)
+	return func(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+		if w, deferred := s.deferAnalyzerResource(uri); deferred {
+			return jsonResource(uri, map[string]any{"warming": newEnrichmentPendingEnvelope(w)})
+		}
+		return bounded(ctx, req)
+	}
 }
 
 func (s *Server) boundPromptHandler(name string, h mcpserver.PromptHandlerFunc) mcpserver.PromptHandlerFunc {

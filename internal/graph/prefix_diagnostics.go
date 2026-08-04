@@ -15,25 +15,20 @@ import (
 // index_health, so they need an explicit detector rather than an assertion
 // that would never fire.
 //
-// Two distinct populations legitimately carry RepoPrefix == "":
+// The audit applies only to repository source nodes. Some synthetic nodes
+// retain a FilePath as attribution rather than as an on-disk source path:
+// semantic externals use `external::…`, synthesized external calls use
+// `external-call::…`, and contracts use identity namespaces that deliberately
+// do not mirror their source path. Those populations are outside the ownership
+// invariant even when FilePath is non-empty.
 //
-//   - WILDCARD arguments. Passing "" to ChurnRows / GetRepoNonContentNodes /
-//     NodeIDNamesByKindsSeq means "no repo filter". That is an argument
-//     convention, not a node property, and is out of scope here.
-//   - SYNTHETIC GLOBAL EXTERNALS. `dep::…`, `external::…` and non-Go
-//     `module::…` nodes model third-party symbols owned by no repository, so
-//     a service's external surface aggregates across repos. These carry an
-//     empty FilePath, because they have no source on disk.
-//
-// Everything else with an empty prefix is an UNOWNED CODE NODE: a real
-// symbol, extracted from a real file, that no repository claims. That is the
-// signature this file detects, and `FilePath != ""` is what separates it from
-// the synthetic population above.
+// Every other file-backed node with an empty prefix is an UNOWNED CODE NODE:
+// a real symbol, extracted from a real file, that no repository claims.
 
 // PrefixDiagnostics is a bounded ownership audit of the node set.
 type PrefixDiagnostics struct {
-	// OwnedCodeNodes / UnownedCodeNodes split the file-backed node set by
-	// whether a repository claims it.
+	// OwnedCodeNodes / UnownedCodeNodes split the auditable repository-source
+	// node set by whether a repository claims it.
 	//
 	// While single-repo mode exists, a lone-repo daemon legitimately reports
 	// the whole graph as unowned — that IS single-repo mode. What is never
@@ -118,18 +113,43 @@ const (
 	PrefixIssueMisprefixed = "misprefixed_identity"
 )
 
-// ClassifyNodePrefix returns "" when n's ownership is consistent (or n is a
-// synthetic node, whose identity is not path-shaped), and one of the
-// PrefixIssue* constants otherwise.
-//
-// FilePath is the discriminator. Synthetic nodes — global (`dep::x`) and
-// repo-scoped (`gortex::builtin::go::make`) alike — carry no file path and
-// mint IDs in a `<kind>::…` namespace that the path-prefix rule below does
-// not describe. Only file-backed nodes are audited, and for those both the
-// ID and the FilePath are produced by Indexer.applyRepoPrefix concatenating
-// `repoPrefix + "/"`, so both must carry it.
+const (
+	externalSemanticFilePathPrefix = "external::"
+	externalCallFilePathPrefix     = "external-call::"
+)
+
+// IsAuditableRepoSourcePath reports whether filePath names repository source
+// rather than a synthetic attribution bucket. The exact same path prefixes
+// are excluded by the SQLite ownership predicates.
+func IsAuditableRepoSourcePath(filePath string) bool {
+	return filePath != "" &&
+		!strings.HasPrefix(filePath, externalSemanticFilePathPrefix) &&
+		!strings.HasPrefix(filePath, externalCallFilePathPrefix)
+}
+
+// IsAuditableRepoSourceNode reports whether n participates in the repository
+// ownership invariant. Contract identities intentionally live in contract
+// namespaces rather than below their source repository prefix; contract bridge
+// nodes likewise use the virtual contracts://bridges path.
+func IsAuditableRepoSourceNode(n *Node) bool {
+	if n == nil || !IsAuditableRepoSourcePath(n.FilePath) {
+		return false
+	}
+	switch n.Kind {
+	case KindContract, KindContractBridge:
+		return false
+	default:
+		return true
+	}
+}
+
+// ClassifyNodePrefix returns "" when n's ownership is consistent or outside
+// the repository-source audit, and one of the PrefixIssue* constants otherwise.
+// For audited nodes, both ID and FilePath are produced by
+// Indexer.applyRepoPrefix concatenating `repoPrefix + "/"`, so both must carry
+// it.
 func ClassifyNodePrefix(n *Node) string {
-	if n == nil || n.FilePath == "" {
+	if !IsAuditableRepoSourceNode(n) {
 		return ""
 	}
 	if n.RepoPrefix == "" {
@@ -160,9 +180,10 @@ func (d *PrefixDiagnostics) accumulate(n *Node, sampleLimit int) {
 			d.MisprefixedSamples = append(d.MisprefixedSamples, n.ID)
 		}
 	default:
-		// Healthy. Only file-backed nodes count toward ownership —
-		// synthetic namespaces have no owner to report.
-		if n.FilePath != "" {
+		// Healthy. Only audited repository-source nodes count toward
+		// ownership; synthetic attribution paths and identity namespaces do
+		// not belong to either population.
+		if IsAuditableRepoSourceNode(n) {
 			d.OwnedCodeNodes++
 		}
 	}

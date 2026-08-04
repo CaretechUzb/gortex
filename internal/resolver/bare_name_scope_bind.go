@@ -51,54 +51,32 @@ func (r *Resolver) bindBareNameScopeRefs() {
 	// once up front so the per-edge bind is an O(matching-name) walk
 	// rather than a graph-wide FindNodesByName.
 	owned := map[string][]scopeNode{}
-	for n := range r.graph.NodesByKind(graph.KindLocal) {
-		owner := enclosingFunctionForBinding(n.ID)
+	for node := range graph.ScopeBindingNodesSeq(r.graph, graph.KindLocal, graph.KindParam) {
+		owner := enclosingFunctionForBinding(node.ID)
 		if owner == "" {
 			continue
 		}
 		owned[owner] = append(owned[owner], scopeNode{
-			id: n.ID, name: n.Name, startLine: n.StartLine, kind: graph.KindLocal,
-		})
-	}
-	for n := range r.graph.NodesByKind(graph.KindParam) {
-		owner := enclosingFunctionForBinding(n.ID)
-		if owner == "" {
-			continue
-		}
-		owned[owner] = append(owned[owner], scopeNode{
-			id: n.ID, name: n.Name, startLine: n.StartLine, kind: graph.KindParam,
+			id: node.ID, name: node.Name, startLine: node.StartLine, kind: node.Kind,
 		})
 	}
 	if len(owned) == 0 {
 		return
 	}
 
-	var batch []graph.EdgeReindex
-	for e := range r.graph.EdgesByKind(graph.EdgeReads) {
-		if rewrote := r.tryBindBareName(e, owned); rewrote != "" {
-			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: rewrote})
-		}
-	}
-	for e := range r.graph.EdgesByKind(graph.EdgeReferences) {
-		if rewrote := r.tryBindBareName(e, owned); rewrote != "" {
-			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: rewrote})
-		}
-	}
 	// EdgeArgOf and EdgeValueFlow carry the same shape — `unresolved::<name>`
 	// is the dataflow source/target the parser couldn't bind.
-	for e := range r.graph.EdgesByKind(graph.EdgeArgOf) {
-		if rewrote := r.tryBindBareName(e, owned); rewrote != "" {
-			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: rewrote})
-		}
-	}
-	for e := range r.graph.EdgesByKind(graph.EdgeValueFlow) {
-		if rewrote := r.tryBindBareName(e, owned); rewrote != "" {
-			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: rewrote})
-		}
-	}
-	if len(batch) > 0 {
-		r.graph.ReindexEdges(batch)
-	}
+	r.reindexAttributionEdgesBatched(
+		[]graph.EdgeKind{
+			graph.EdgeReads,
+			graph.EdgeReferences,
+			graph.EdgeArgOf,
+			graph.EdgeValueFlow,
+		},
+		func(edge *graph.Edge) string {
+			return r.tryBindBareName(edge, owned)
+		},
+	)
 }
 
 // bindBareNameScopeRefsForFile is the single-file scope of
@@ -128,16 +106,14 @@ func (r *Resolver) bindBareNameScopeRefsForFile(filePath string) {
 		return
 	}
 
-	var batch []graph.EdgeReindex
-	for _, e := range r.fileOutEdges(filePath) {
-		switch e.Kind {
+	collector := newAttributionReindexCollector(r)
+	for _, edge := range r.fileOutEdges(filePath) {
+		switch edge.Kind {
 		case graph.EdgeReads, graph.EdgeReferences, graph.EdgeArgOf, graph.EdgeValueFlow:
-			if rewrote := r.tryBindBareName(e, owned); rewrote != "" {
-				batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: rewrote})
-			}
+			collector.add(edge, r.tryBindBareName(edge, owned))
 		}
 	}
-	r.persistAttributionReindexes(batch)
+	collector.flush()
 }
 
 // tryBindBareName tries to rewrite e.To from `unresolved::<name>` to a

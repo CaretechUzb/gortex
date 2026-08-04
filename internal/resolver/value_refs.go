@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"iter"
 	"sort"
 	"strings"
 
@@ -166,14 +167,15 @@ func resolveValueRefs(g graph.Store, scope map[string]bool) int {
 }
 
 // valueRefCandidateEdges returns the extractor-emitted placeholder read edges
-// (Meta via == value_ref_candidate) the pass resolves. With a nil scope it
-// scans every EdgeReads edge in the graph; with a scope it walks only the
+// (Meta via == value_ref_candidate) the pass resolves. With a nil scope it uses
+// the backend's target-namespace projection when available, falling back to the
+// complete EdgeReads kind for other stores. With a scope it walks only the
 // out-edges of the changed repos' nodes (GetRepoEdges is one backend query per
 // repo), since a candidate read always originates in the repo that declared it.
 func valueRefCandidateEdges(g graph.Store, scope map[string]bool) []*graph.Edge {
 	var out []*graph.Edge
 	keep := func(e *graph.Edge) {
-		if e == nil || e.Meta == nil {
+		if e == nil || e.Kind != graph.EdgeReads || e.Meta == nil {
 			return
 		}
 		if via, _ := e.Meta["via"].(string); via != valueRefCandidateVia {
@@ -182,7 +184,13 @@ func valueRefCandidateEdges(g graph.Store, scope map[string]bool) []*graph.Edge 
 		out = append(out, e)
 	}
 	if scope == nil {
-		for e := range g.EdgesByKind(graph.EdgeReads) {
+		var edges iter.Seq[*graph.Edge]
+		if scanner, ok := g.(graph.ValueRefPlaceholderScanner); ok {
+			edges = scanner.ValueRefPlaceholderEdges()
+		} else {
+			edges = g.EdgesByKind(graph.EdgeReads)
+		}
+		for e := range edges {
 			keep(e)
 		}
 		return out

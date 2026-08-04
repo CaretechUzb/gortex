@@ -2,22 +2,27 @@ package resolver
 
 import (
 	"fmt"
+	"iter"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 type frameworkTailCountingStore struct {
 	graph.Store
-	getNode, getNodesByIDs              int
-	findByName, findByNames             int
-	getInEdges, getInEdgesByIDs         int
-	addEdge, addBatch, reindexEdges     int
-	removeEdge, removeEdgesExact        int
-	repoEdgesByKinds, repoNodeIDsByKind int
-	allNodesLight, repoNodesLight       int
+	getNode, getNodesByIDs                int
+	findByName, findByNames               int
+	getInEdges, getInEdgesByIDs           int
+	addEdge, addBatch, reindexEdges       int
+	removeEdge, removeEdgesExact          int
+	repoEdgesByKinds, repoNodeIDsByKind   int
+	allNodesLight, repoNodesLight         int
+	repoPrefixes, unresolvedIdentityScans int
+	frameworkCensusScans, lightEdgeScans  int
 }
 
 func (s *frameworkTailCountingStore) GetNode(id string) *graph.Node {
@@ -95,6 +100,34 @@ func (s *frameworkTailCountingStore) RepoNodesLight(prefixes []string) []*graph.
 	return s.Store.(graph.RepoLightNodeReader).RepoNodesLight(prefixes)
 }
 
+func (s *frameworkTailCountingStore) RepoPrefixes() []string {
+	s.repoPrefixes++
+	return s.Store.RepoPrefixes()
+}
+
+func (s *frameworkTailCountingStore) ScanUnresolvedEdgeIdentitiesBatched(
+	kinds []graph.EdgeKind,
+	batchSize int,
+	yield func([]graph.EdgeIdentity) bool,
+) {
+	s.unresolvedIdentityScans++
+	s.Store.(graph.UnresolvedEdgeIdentityBatchScanner).ScanUnresolvedEdgeIdentitiesBatched(kinds, batchSize, yield)
+}
+
+func (s *frameworkTailCountingStore) FrameworkCensusEdgesSeq(
+	kinds ...graph.EdgeKind,
+) iter.Seq[graph.FrameworkCensusEdge] {
+	s.frameworkCensusScans++
+	return graph.FrameworkCensusEdgesSeq(s.Store, kinds...)
+}
+
+func (s *frameworkTailCountingStore) EdgesLightSeq(
+	kinds ...graph.EdgeKind,
+) iter.Seq[*graph.Edge] {
+	s.lightEdgeScans++
+	return graph.EdgesLightSeq(s.Store, kinds...)
+}
+
 func addDjangoRepo(g *graph.Graph, repo string, count int) {
 	iterID := repo + "::models.py::ModelIterable.__iter__"
 	g.AddNode(&graph.Node{ID: iterID, Kind: graph.KindMethod, Name: "__iter__", FilePath: repo + "/models.py", Language: "python", RepoPrefix: repo,
@@ -106,7 +139,11 @@ func addDjangoRepo(g *graph.Graph, repo string, count int) {
 		methodID := fmt.Sprintf("%s::query.py::QuerySet.iterator%d", repo, i)
 		g.AddNode(&graph.Node{ID: methodID, Kind: graph.KindMethod, Name: "iterator", FilePath: repo + "/query.py", Language: "python", RepoPrefix: repo,
 			Meta: map[string]any{"receiver": "QuerySet"}})
-		g.AddEdge(&graph.Edge{From: methodID, To: "unresolved::*._iterable_class", Kind: graph.EdgeCalls, FilePath: repo + "/query.py", Line: i + 1})
+		target := "unresolved::*._iterable_class"
+		if i%2 != 0 {
+			target = repo + "::" + target
+		}
+		g.AddEdge(&graph.Edge{From: methodID, To: target, Kind: graph.EdgeCalls, FilePath: repo + "/query.py", Line: i + 1})
 	}
 }
 
@@ -122,7 +159,8 @@ func TestRunClaimingResolversScopedBatchesAndBoundsRepoFrontier(t *testing.T) {
 	require.Zero(t, counting.findByName, "no per-edge name lookup")
 	require.Equal(t, 2, counting.findByNames, "one admission probe + one batch bind")
 	require.Equal(t, 1, counting.reindexEdges)
-	require.Equal(t, 1, counting.repoEdgesByKinds)
+	require.Equal(t, 1, counting.getInEdgesByIDs, "one indexed reverse-vocabulary lookup")
+	require.Zero(t, counting.repoEdgesByKinds, "scoped claiming must not scan repository edge kinds")
 
 	untouched := 0
 	for edge := range g.EdgesByKind(graph.EdgeCalls) {
@@ -131,6 +169,42 @@ func TestRunClaimingResolversScopedBatchesAndBoundsRepoFrontier(t *testing.T) {
 		}
 	}
 	require.Equal(t, 40, untouched, "partial claiming must not touch another repository")
+}
+
+func TestRunClaimingResolversUsesExactVocabularyForFullScope(t *testing.T) {
+	g := graph.New()
+	addDjangoRepo(g, "alpha", 40)
+	addDjangoRepo(g, "beta", 40)
+	g.AddEdge(&graph.Edge{
+		From: "alpha::query.py::QuerySet.iterator0", To: "alpha::" + graph.UnresolvedMarker + "*._iterable_class",
+		Kind: graph.EdgeReferences, FilePath: "alpha/query.py", Line: 100,
+	})
+	g.AddEdge(&graph.Edge{
+		From: "alpha::query.py::QuerySet.iterator0", To: "alpha::" + graph.UnresolvedMarker + "*._iterable_class",
+		Kind: graph.EdgeExtends, FilePath: "alpha/query.py", Line: 101,
+	})
+	g.AddEdge(&graph.Edge{
+		From: "alpha::query.py::QuerySet.iterator0", To: "legacy-only::" + graph.UnresolvedMarker + "*._iterable_class",
+		Kind: graph.EdgeReferences, FilePath: "alpha/query.py", Line: 102,
+	})
+	counting := &frameworkTailCountingStore{Store: g}
+
+	claimed := RunClaimingResolvers(counting)
+	require.Equal(t, 82, claimed[SynthDjangoDescriptor], "calls and references are candidates; unrelated kinds are not")
+	require.Equal(t, 1, counting.unresolvedIdentityScans, "full claiming should use one bounded identity scan")
+	require.Zero(t, counting.repoPrefixes, "edge-only legacy prefixes must not depend on the node-backed prefix census")
+	require.Zero(t, counting.getInEdgesByIDs, "full claiming should not synthesize target IDs from node prefixes")
+	require.Zero(t, counting.repoEdgesByKinds, "full claiming must not decode all calls and references")
+}
+
+func TestScopedClaimingCandidatesFallsBackForUnboundedResolver(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "alpha::caller", Kind: graph.KindMethod, RepoPrefix: "alpha"})
+	g.AddEdge(&graph.Edge{From: "alpha::caller", To: graph.UnresolvedMarker + "widget", Kind: graph.EdgeCalls})
+	g.AddEdge(&graph.Edge{From: "alpha::caller", To: "alpha::" + graph.UnresolvedMarker + "other", Kind: graph.EdgeReferences})
+
+	pending := scopedClaimingCandidates(g, nil, []ClaimingResolver{fakeClaimingResolver{target: "alpha::resolved"}})
+	require.Len(t, pending, 2, "an unbounded resolver must retain the complete-scan fallback")
 }
 
 func TestFrameworkCandidateSummaryScopedUsesOnlyRepoLightProjection(t *testing.T) {
@@ -199,7 +273,7 @@ func TestCSharpInterfaceDispatchScopedMatchesFullAndUsesBatchFrontier(t *testing
 	require.Equal(t, 1, counting.addBatch)
 }
 
-func addReceiverGateRepo(g *graph.Graph, repo string) (caller, target string) {
+func addReceiverGateRepo(g graph.Store, repo string) (caller, target string) {
 	caller = repo + "::Caller.Run"
 	target = repo + "::Other.Do"
 	g.AddBatch([]*graph.Node{
@@ -208,7 +282,7 @@ func addReceiverGateRepo(g *graph.Graph, repo string) (caller, target string) {
 		{ID: repo + "::Receiver", Kind: graph.KindType, Name: "Receiver", Language: "csharp", RepoPrefix: repo},
 		{ID: repo + "::Other", Kind: graph.KindType, Name: "Other", Language: "csharp", RepoPrefix: repo},
 	}, []*graph.Edge{{From: caller, To: target, Kind: graph.EdgeCalls, Origin: graph.OriginTextMatched,
-		Meta: map[string]any{"receiver_type": "Receiver"}}})
+		Meta: map[string]any{"receiver_type": "Receiver", "opaque": "preserved"}}})
 	return caller, target
 }
 
@@ -216,8 +290,14 @@ func TestCSharpReceiverGateScopedMatchesFullAndBatchesMutation(t *testing.T) {
 	full := graph.New()
 	fullCaller, fullTarget := addReceiverGateRepo(full, "changed")
 	addReceiverGateRepo(full, "untouched")
-	require.Equal(t, 2, demoteCSharpMisattributedMemberCalls(full))
-	require.True(t, findCallEdge(full, fullCaller, fullTarget).IsSpeculative())
+	fullCounting := &frameworkTailCountingStore{Store: full}
+	require.Equal(t, 2, demoteCSharpMisattributedMemberCalls(fullCounting))
+	require.Equal(t, 1, fullCounting.frameworkCensusScans, "full gate should project receiver_type identities")
+	require.Equal(t, 1, fullCounting.lightEdgeScans, "full gate should stream a metadata-free hierarchy")
+	require.Equal(t, 1, fullCounting.getNodesByIDs, "full gate should hydrate only call endpoints, not the hierarchy corpus")
+	fullEdge := findCallEdge(full, fullCaller, fullTarget)
+	require.True(t, fullEdge.IsSpeculative())
+	require.Equal(t, "preserved", fullEdge.Meta["opaque"], "exact refetch must retain opaque metadata")
 
 	partial := graph.New()
 	partialCaller, partialTarget := addReceiverGateRepo(partial, "changed")
@@ -231,6 +311,106 @@ func TestCSharpReceiverGateScopedMatchesFullAndBatchesMutation(t *testing.T) {
 	require.Zero(t, counting.addEdge)
 	require.Zero(t, counting.removeEdge)
 	require.Equal(t, 1, counting.reindexEdges)
+}
+
+func TestCSharpReceiverGateFullSQLiteUsesProjectedCallsAndLightHierarchy(t *testing.T) {
+	g, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, g.Close()) })
+
+	caller, target := addReceiverGateRepo(g, "repo")
+	require.Equal(t, 1, demoteCSharpMisattributedMemberCalls(g))
+	edge := findCallEdge(g, caller, target)
+	require.NotNil(t, edge)
+	require.True(t, edge.IsSpeculative())
+	require.Equal(t, "preserved", edge.Meta["opaque"])
+}
+
+func addExactReceiverGateCall(
+	g *graph.Graph,
+	callerRepo, targetRepo, receiver, targetReceiver string,
+) (caller, target, callerFile, targetFile, receiverType, targetType string) {
+	callerFile = callerRepo + "/Caller.cs"
+	targetFile = targetRepo + "/Target.cs"
+	caller = callerRepo + "::Caller.Run"
+	target = targetRepo + "::" + targetReceiver + ".Do"
+	receiverType = callerRepo + "::" + receiver
+	targetType = targetRepo + "::" + targetReceiver
+	g.AddBatch([]*graph.Node{
+		{ID: caller, Kind: graph.KindMethod, Name: "Run", FilePath: callerFile, Language: "csharp", RepoPrefix: callerRepo, Meta: map[string]any{"receiver": "Caller"}},
+		{ID: target, Kind: graph.KindMethod, Name: "Do", FilePath: targetFile, Language: "csharp", RepoPrefix: targetRepo, Meta: map[string]any{"receiver": targetReceiver}},
+		{ID: receiverType, Kind: graph.KindType, Name: receiver, FilePath: callerRepo + "/Types.cs", Language: "csharp", RepoPrefix: callerRepo},
+		{ID: targetType, Kind: graph.KindType, Name: targetReceiver, FilePath: targetRepo + "/Types.cs", Language: "csharp", RepoPrefix: targetRepo},
+	}, []*graph.Edge{{
+		From: caller, To: target, Kind: graph.EdgeCalls, FilePath: callerFile,
+		Origin: graph.OriginTextMatched, Meta: map[string]any{"receiver_type": receiver},
+	}})
+	return caller, target, callerFile, targetFile, receiverType, targetType
+}
+
+func TestCSharpReceiverGateForFilesUsesExactSourceFrontier(t *testing.T) {
+	g := graph.New()
+	caller, target, callerFile, _, _, _ := addExactReceiverGateCall(g, "changed", "changed", "Receiver", "Other")
+	counting := &frameworkTailCountingStore{Store: g}
+
+	require.Equal(t, 1, demoteCSharpMisattributedMemberCallsScopedForFiles(
+		counting, map[string]bool{"changed": true}, []string{callerFile}, false,
+	))
+	require.True(t, findCallEdge(g, caller, target).IsSpeculative())
+	require.Zero(t, counting.repoEdgesByKinds)
+	require.Zero(t, counting.repoNodeIDsByKind)
+}
+
+func TestCSharpReceiverGateForFilesIncludesIncomingChangedMethodCalls(t *testing.T) {
+	g := graph.New()
+	caller, target, _, targetFile, _, _ := addExactReceiverGateCall(g, "caller", "changed", "Receiver", "Other")
+	counting := &frameworkTailCountingStore{Store: g}
+
+	require.Equal(t, 1, demoteCSharpMisattributedMemberCallsScopedForFiles(
+		counting, map[string]bool{"changed": true}, []string{targetFile}, false,
+	))
+	require.True(t, findCallEdge(g, caller, target).IsSpeculative())
+	require.Zero(t, counting.repoEdgesByKinds)
+	require.Zero(t, counting.repoNodeIDsByKind)
+}
+
+func TestCSharpReceiverGateForFilesWalksExactTransitiveHierarchy(t *testing.T) {
+	g := graph.New()
+	caller, target, callerFile, _, receiverType, targetType := addExactReceiverGateCall(g, "changed", "changed", "Derived", "Base")
+	middle := "changed::Middle"
+	g.AddNode(&graph.Node{ID: middle, Kind: graph.KindType, Name: "Middle", FilePath: "changed/Types.cs", Language: "csharp", RepoPrefix: "changed"})
+	g.AddBatch(nil, []*graph.Edge{
+		{From: receiverType, To: middle, Kind: graph.EdgeExtends},
+		{From: middle, To: targetType, Kind: graph.EdgeExtends},
+	})
+
+	require.Zero(t, demoteCSharpMisattributedMemberCallsScopedForFiles(
+		g, map[string]bool{"changed": true}, []string{callerFile}, false,
+	))
+	require.False(t, findCallEdge(g, caller, target).IsSpeculative())
+}
+
+func TestCSharpReceiverGateForFilesKeepsIncompleteHierarchy(t *testing.T) {
+	g := graph.New()
+	caller, target, callerFile, _, receiverType, _ := addExactReceiverGateCall(g, "changed", "changed", "Derived", "Other")
+	g.AddEdge(&graph.Edge{From: receiverType, To: "unresolved::ExternalBase", Kind: graph.EdgeExtends})
+
+	require.Zero(t, demoteCSharpMisattributedMemberCallsScopedForFiles(
+		g, map[string]bool{"changed": true}, []string{callerFile}, false,
+	))
+	require.False(t, findCallEdge(g, caller, target).IsSpeculative())
+}
+
+func TestCSharpReceiverGateForFilesFallsBackForHierarchyChanges(t *testing.T) {
+	g := graph.New()
+	_, _, callerFile, _, _, _ := addExactReceiverGateCall(g, "changed", "changed", "Receiver", "Other")
+	counting := &frameworkTailCountingStore{Store: g}
+
+	require.Equal(t, 1, demoteCSharpMisattributedMemberCallsScopedForFiles(
+		counting, map[string]bool{"changed": true}, []string{callerFile}, true,
+	))
+	require.Positive(t, counting.repoEdgesByKinds)
+	require.Positive(t, counting.repoNodeIDsByKind)
 }
 
 func TestFrameworkFamilyGateScopedDeletesExactChangedEdgesInOneBatch(t *testing.T) {

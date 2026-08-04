@@ -115,7 +115,7 @@ func (r *Resolver) rebindGoMethodReceiversForFile(filePath string) {
 		// per package or issuing one file query per package member.
 		var packageFiles []string
 		for _, fileNode := range r.dirIndex[dir] {
-			if fileNode != nil && fileNode.RepoPrefix == repoPrefix && fileNode.FilePath != "" {
+			if fileNode.RepoPrefix == repoPrefix && fileNode.FilePath != "" {
 				packageFiles = append(packageFiles, fileNode.FilePath)
 			}
 		}

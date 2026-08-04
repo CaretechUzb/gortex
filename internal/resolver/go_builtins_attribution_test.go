@@ -75,7 +75,10 @@ func TestAttributeGoBuiltins_Type(t *testing.T) {
 func TestAttributeGoBuiltinsUsesEnclosingOwnerRepo(t *testing.T) {
 	g := graph.New()
 	owner := "pkg/foo.go::Handler"
-	g.AddNode(&graph.Node{ID: owner, Kind: graph.KindFunction, Name: "Handler", FilePath: "pkg/foo.go", Language: "go", RepoPrefix: "repo"})
+	g.AddNode(&graph.Node{
+		ID: owner, Kind: graph.KindFunction, Name: "Handler", FilePath: "pkg/foo.go",
+		Language: "go", RepoPrefix: "repo", WorkspaceID: "workspace", ProjectID: "project",
+	})
 	edge := &graph.Edge{From: owner + "#param:synthetic", To: "unresolved::len", Kind: graph.EdgeArgOf, Line: 1}
 	g.AddEdge(edge)
 
@@ -85,6 +88,8 @@ func TestAttributeGoBuiltinsUsesEnclosingOwnerRepo(t *testing.T) {
 	n := g.GetNode(edge.To)
 	require.NotNil(t, n)
 	assert.Equal(t, "repo", n.RepoPrefix, "per-repo builtin node must participate in purge/scoping")
+	assert.Equal(t, "workspace", n.WorkspaceID, "builtin must inherit the source workspace boundary")
+	assert.Equal(t, "project", n.ProjectID, "builtin must inherit the source project boundary")
 }
 
 func TestAttributeGoBuiltins_DedupedAcrossManyEdges(t *testing.T) {
@@ -170,4 +175,176 @@ func TestAttributeGoBuiltins_QualifiedShapeLeftAlone(t *testing.T) {
 	New(g).attributeGoBuiltins()
 
 	assert.Equal(t, "unresolved::*.len", edge.To, "qualified `*.len` shape must be left alone")
+}
+
+type recordingGoBuiltinStore struct {
+	*graph.Graph
+	compact []graph.UnresolvedEdgeTargetReindex
+	full    []graph.EdgeReindex
+}
+
+func (s *recordingGoBuiltinStore) ReindexUnresolvedEdgeTargets(batch []graph.UnresolvedEdgeTargetReindex) {
+	s.compact = append(s.compact, batch...)
+}
+
+func (s *recordingGoBuiltinStore) ReindexEdges(batch []graph.EdgeReindex) {
+	s.full = append(s.full, batch...)
+}
+
+func TestAttributeGoBuiltinCandidatesUsesCompactTargetReindex(t *testing.T) {
+	base := graph.New()
+	store := &recordingGoBuiltinStore{Graph: base}
+	source := &graph.Node{
+		ID:          "repo/pkg/file.go::callBuiltin",
+		Kind:        graph.KindFunction,
+		Language:    "go",
+		RepoPrefix:  "repo",
+		WorkspaceID: "workspace",
+		ProjectID:   "project",
+	}
+	base.AddBatch([]*graph.Node{source}, nil)
+
+	edge := &graph.Edge{
+		From:     source.ID,
+		To:       "unresolved::len",
+		Kind:     graph.EdgeCalls,
+		FilePath: "pkg/file.go",
+		Line:     17,
+	}
+	resolver := &Resolver{graph: store}
+	resolver.attributeGoBuiltinCandidates([]*graph.Edge{edge})
+
+	target, _, _ := goBuiltinTarget("repo", "len")
+	if edge.To != target {
+		t.Fatalf("edge target = %q, want %q", edge.To, target)
+	}
+	if len(store.full) != 0 {
+		t.Fatalf("full edge reindexes = %d, want 0", len(store.full))
+	}
+	if len(store.compact) != 1 {
+		t.Fatalf("compact target reindexes = %d, want 1", len(store.compact))
+	}
+	wantOld := graph.EdgeIdentity{
+		From: source.ID, To: "unresolved::len", Kind: graph.EdgeCalls,
+		FilePath: edge.FilePath, Line: edge.Line,
+	}
+	if store.compact[0].Old != wantOld || store.compact[0].NewTo != target {
+		t.Fatalf("compact mutation = %+v, want old=%+v new_to=%q", store.compact[0], wantOld, target)
+	}
+	if builtin := base.GetNode(target); builtin == nil {
+		t.Fatalf("builtin node %q was not materialised before retargeting", target)
+	} else if builtin.WorkspaceID != source.WorkspaceID || builtin.ProjectID != source.ProjectID {
+		t.Fatalf("builtin boundary = (%q, %q), want (%q, %q)",
+			builtin.WorkspaceID, builtin.ProjectID, source.WorkspaceID, source.ProjectID)
+	}
+}
+
+func TestAttributeGoBuiltinCandidatesFallsBackWholeMixedBatchInOrder(t *testing.T) {
+	base := graph.New()
+	store := &recordingGoBuiltinStore{Graph: base}
+	source := &graph.Node{
+		ID: "repo/pkg/file.go::callBuiltin", Kind: graph.KindFunction,
+		Language: "go", RepoPrefix: "repo",
+	}
+	base.AddBatch([]*graph.Node{source}, nil)
+
+	unique := &graph.Edge{
+		From: source.ID, To: "unresolved::cap", Kind: graph.EdgeCalls,
+		FilePath: "pkg/file.go", Line: 2,
+	}
+	firstCollision := &graph.Edge{
+		From: source.ID, To: "unresolved::len", Kind: graph.EdgeCalls,
+		FilePath: "pkg/file.go", Line: 1,
+	}
+	secondCollision := &graph.Edge{
+		From: source.ID, To: "unresolved::len", Kind: graph.EdgeCalls,
+		FilePath: "pkg/file.go", Line: 1,
+	}
+
+	resolver := &Resolver{graph: store}
+	resolver.attributeGoBuiltinCandidates([]*graph.Edge{unique, firstCollision, secondCollision})
+
+	if len(store.compact) != 0 {
+		t.Fatalf("compact target reindexes = %d, want 0 for mixed unsafe batch", len(store.compact))
+	}
+	if len(store.full) != 3 {
+		t.Fatalf("full edge reindexes = %d, want 3", len(store.full))
+	}
+	if store.full[0].Edge != unique || store.full[1].Edge != firstCollision ||
+		store.full[2].Edge != secondCollision {
+		t.Fatalf("full fallback order changed: %+v", store.full)
+	}
+}
+
+func TestCompactGoBuiltinTargetReindexesRejectsCollisionWithoutReordering(t *testing.T) {
+	const target = "repo::builtin::go::len"
+	first := &graph.Edge{From: "a.go::f", To: target, Kind: graph.EdgeCalls, FilePath: "a.go", Line: 1}
+	second := &graph.Edge{From: "a.go::f", To: target, Kind: graph.EdgeCalls, FilePath: "a.go", Line: 1}
+	batch := []graph.EdgeReindex{
+		{Edge: first, OldTo: "unresolved::len"},
+		{Edge: second, OldTo: "unresolved::cap"},
+	}
+
+	direct, ok := compactGoBuiltinTargetReindexes(batch)
+	if ok || direct != nil {
+		t.Fatalf("collision accepted: ok=%v direct=%v", ok, direct)
+	}
+	if batch[0].Edge != first || batch[0].OldTo != "unresolved::len" ||
+		batch[1].Edge != second || batch[1].OldTo != "unresolved::cap" {
+		t.Fatalf("fallback batch order changed: %+v", batch)
+	}
+}
+
+func TestCompactGoBuiltinTargetReindexesPreservesDirectOrder(t *testing.T) {
+	batch := []graph.EdgeReindex{
+		{
+			Edge:  &graph.Edge{From: "z.go::f", To: "repo::builtin::go::len", Kind: graph.EdgeCalls, FilePath: "z.go", Line: 2},
+			OldTo: "unresolved::len",
+		},
+		{
+			Edge:  &graph.Edge{From: "a.go::f", To: "repo::builtin::go::cap", Kind: graph.EdgeCalls, FilePath: "a.go", Line: 1},
+			OldTo: "unresolved::cap",
+		},
+	}
+	wantFirst := graph.EdgeIdentityFor(batch[0].Edge)
+	wantFirst.To = batch[0].OldTo
+	wantSecond := graph.EdgeIdentityFor(batch[1].Edge)
+	wantSecond.To = batch[1].OldTo
+
+	direct, ok := compactGoBuiltinTargetReindexes(batch)
+	if !ok {
+		t.Fatal("unique target-only batch unexpectedly rejected")
+	}
+	if len(direct) != 2 || direct[0].Old != wantFirst || direct[1].Old != wantSecond {
+		t.Fatalf("compact mutation order = %+v, want old identities [%+v, %+v]", direct, wantFirst, wantSecond)
+	}
+}
+
+func TestCompactGoBuiltinTargetReindexesRejectsNonTargetIdentityChanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*graph.EdgeReindex)
+	}{
+		{name: "empty destination", mutate: func(m *graph.EdgeReindex) { m.Edge.To = "" }},
+		{name: "old source", mutate: func(m *graph.EdgeReindex) { m.OldFrom = "old.go::f" }},
+		{name: "old kind", mutate: func(m *graph.EdgeReindex) { m.OldKind = graph.EdgeReads }},
+		{name: "old file", mutate: func(m *graph.EdgeReindex) { m.OldFilePath = "old.go" }},
+		{name: "old line", mutate: func(m *graph.EdgeReindex) { m.OldLine = 7 }},
+		{name: "refresh identity", mutate: func(m *graph.EdgeReindex) { m.RefreshIdentity = true }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mutation := graph.EdgeReindex{
+				Edge: &graph.Edge{
+					From: "a.go::f", To: "repo::builtin::go::len", Kind: graph.EdgeCalls,
+					FilePath: "a.go", Line: 1,
+				},
+				OldTo: "unresolved::len",
+			}
+			test.mutate(&mutation)
+			if direct, ok := compactGoBuiltinTargetReindexes([]graph.EdgeReindex{mutation}); ok || direct != nil {
+				t.Fatalf("unsafe identity change accepted: ok=%v direct=%v", ok, direct)
+			}
+		})
+	}
 }

@@ -42,11 +42,11 @@ type incrementalCloneIndex struct {
 // false until a batch pass or Rebuild seeds it from the graph / sidecar;
 // while un-built the indexer falls back to the whole-graph clone pass.
 func newIncrementalCloneIndex() *incrementalCloneIndex {
-	return &incrementalCloneIndex{
-		cms:      clones.NewCMS(65536, 4),
-		lsh:      clones.NewStratifiedIndex(),
-		shingles: make(map[string][]uint64),
-	}
+	// Rebuild and AdoptBaselineOrRebuild initialize the heavy CMS/LSH state
+	// before setting built. Incremental mutation callers check Ready first, so
+	// an index that has not completed a global clone pass needs only this small
+	// state holder.
+	return &incrementalCloneIndex{}
 }
 
 // tokensFromMeta reads a node's stamped normalised-token count, tolerating
@@ -223,6 +223,47 @@ func (ci *incrementalCloneIndex) Rebuild(g graph.Store, repoPrefix string) {
 	ci.pending = false
 }
 
+// AdoptBaselineOrRebuild seeds the steady-state clone index from the complete
+// compact corpus that the immediately preceding global detector already read.
+// This transfers the CMS, retained LSH and raw-shingle cache without a second
+// CloneCorpusPage scan or LSH build. Legacy stores, incomplete/error or
+// cancelled finalization, prefix mismatches, and malformed baselines retain the
+// exact Rebuild fallback.
+func (ci *incrementalCloneIndex) AdoptBaselineOrRebuild(g graph.Store, repoPrefix string, baseline *cloneCorpusBaseline) {
+	if ci == nil {
+		return
+	}
+	if baseline == nil || !baseline.complete || baseline.repoPrefix != repoPrefix ||
+		baseline.cms == nil || baseline.lsh == nil || baseline.shingles == nil ||
+		baseline.corpus < 0 || baseline.itemCount < 0 || baseline.corpus < baseline.itemCount ||
+		(baseline.corpus == 0 && len(baseline.shingles) != 0) {
+		ci.Rebuild(g, repoPrefix)
+		return
+	}
+
+	ci.mu.Lock()
+	ci.cms = baseline.cms
+	ci.lsh = baseline.lsh
+	ci.shingles = baseline.shingles
+	ci.corpus = baseline.corpus
+	ci.built = true
+	ci.pending = false
+	// A baseline is a single-consumer handoff. Clearing the large fields both
+	// documents that ownership transfer and prevents accidental double use.
+	baseline.cms = nil
+	baseline.lsh = nil
+	baseline.shingles = nil
+	baseline.items = nil
+	baseline.itemCount = 0
+	baseline.corpus = 0
+	baseline.complete = false
+	ci.mu.Unlock()
+}
+
+func (ci *incrementalCloneIndex) readyLocked() bool {
+	return ci.built && ci.cms != nil && ci.lsh != nil && ci.shingles != nil
+}
+
 // Ready reports whether one-file clone maintenance can run without a
 // graph-wide seed.
 func (ci *incrementalCloneIndex) Ready() bool {
@@ -231,7 +272,7 @@ func (ci *incrementalCloneIndex) Ready() bool {
 	}
 	ci.mu.Lock()
 	defer ci.mu.Unlock()
-	return ci.built
+	return ci.readyLocked()
 }
 
 // MarkPending records that clone edges may be incomplete after a bounded
@@ -273,6 +314,10 @@ func (ci *incrementalCloneIndex) EvictFuncs(g graph.Store, ids []string) {
 	}
 	ci.mu.Lock()
 	defer ci.mu.Unlock()
+	if !ci.readyLocked() {
+		ci.pending = true
+		return
+	}
 	for _, id := range ids {
 		sh, ok := ci.shingles[id]
 		if !ok {
@@ -314,6 +359,12 @@ func (ci *incrementalCloneIndex) UpdateFuncs(g graph.Store, repoPrefix string, f
 	}
 	ci.mu.Lock()
 	defer ci.mu.Unlock()
+	if !ci.readyLocked() {
+		if len(funcNodes) > 0 {
+			ci.pending = true
+		}
+		return
+	}
 
 	// Phase 1: fold every new body into the CMS + cache + sidecar and
 	// bump the corpus count, so the boilerplate gate below sees the same

@@ -88,13 +88,16 @@ type repositoryMutationCoordinator struct {
 	work sync.WaitGroup
 
 	// batchMutationGate is shared by every stable repository lane owned by a
-	// MultiIndexer. The lane is acquired first; the read side is held only
-	// around actual mutation execution so batch transitions can wait for a
-	// complete pipeline without blocking or racing admission.
+	// MultiIndexer. Admission takes the read side before a lane: a queued batch
+	// writer can then never own the gate while a mutation owns a lane and waits
+	// for that same gate. The read side stays held through the complete pipeline.
 	batchMutationGate *sync.RWMutex
-	executor          repositoryMutationExecutor
-	closed            bool
-	running           bool
+	// batchAdmissionHook is a deterministic test observation point. Production
+	// coordinators leave it nil; tests set it before admitting concurrent work.
+	batchAdmissionHook func()
+	executor           repositoryMutationExecutor
+	closed             bool
+	running            bool
 
 	requestedGeneration uint64
 	completedGeneration uint64
@@ -151,15 +154,26 @@ func (c *repositoryMutationCoordinator) reconcile(
 func (c *repositoryMutationCoordinator) drain() {
 	defer c.work.Done()
 	for {
-		// Acquire the mutation lane before snapshotting pending scope. Requests
-		// admitted while a point mutation owns the lane therefore coalesce into
-		// one batch instead of being split merely because the worker was queued.
+		// Admit through the shared batch generation before taking the stable
+		// repository lane. Requests admitted while a point mutation owns the lane
+		// still coalesce below, but a queued batch writer can no longer take the
+		// gate and then deadlock waiting for a lane held by this drain.
+		c.mu.Lock()
+		batchMutationGate := c.batchMutationGate
+		c.mu.Unlock()
+		if batchMutationGate != nil {
+			batchMutationGate.RLock()
+		}
 		<-c.lane
+
 		c.mu.Lock()
 		if len(c.waiters) == 0 {
 			c.running = false
 			c.mu.Unlock()
 			c.lane <- struct{}{}
+			if batchMutationGate != nil {
+				batchMutationGate.RUnlock()
+			}
 			return
 		}
 		generation := c.requestedGeneration
@@ -167,17 +181,13 @@ func (c *repositoryMutationCoordinator) drain() {
 		waiters := c.waiters
 		c.waiters = nil
 		executor := c.executor
-		batchMutationGate := c.batchMutationGate
 		c.mu.Unlock()
 
-		if batchMutationGate != nil {
-			batchMutationGate.RLock()
-		}
 		outcome := executeRepositoryMutation(executor, paths)
+		c.lane <- struct{}{}
 		if batchMutationGate != nil {
 			batchMutationGate.RUnlock()
 		}
-		c.lane <- struct{}{}
 
 		c.mu.Lock()
 		if generation > c.completedGeneration {
@@ -236,9 +246,27 @@ func (c *repositoryMutationCoordinator) runExclusiveMode(
 		c.mu.Unlock()
 		return errRepositoryMutationCoordinatorClosed
 	}
+	var batchMutationGate *sync.RWMutex
+	if acquireBatchGate {
+		batchMutationGate = c.batchMutationGate
+	}
 	c.work.Add(1)
 	c.mu.Unlock()
 	defer c.work.Done()
+
+	// Batch admission precedes the repository lane. Otherwise a queued writer
+	// can acquire the batch gate while this call owns the lane, then wait for
+	// that lane itself — a gate/lane cycle that prevents either side advancing.
+	if batchMutationGate != nil {
+		batchMutationGate.RLock()
+		defer batchMutationGate.RUnlock()
+	}
+	if hook := c.batchAdmissionHook; hook != nil {
+		hook()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	select {
 	case <-ctx.Done():
@@ -246,19 +274,6 @@ func (c *repositoryMutationCoordinator) runExclusiveMode(
 	case <-c.lane:
 	}
 	defer func() { c.lane <- struct{}{} }()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	if acquireBatchGate {
-		c.mu.Lock()
-		batchMutationGate := c.batchMutationGate
-		c.mu.Unlock()
-		if batchMutationGate != nil {
-			batchMutationGate.RLock()
-			defer batchMutationGate.RUnlock()
-		}
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -325,9 +340,9 @@ func (mi *MultiIndexer) repositoryMutationCoordinator(repoPrefix string) *reposi
 	return coordinator
 }
 
-// withRepositoryMutationLanes acquires a deterministic set of stable lanes
-// without touching the shared batch gate. The callback must acquire that gate
-// once after every lane is held. Recursive defers release lanes in reverse
+// withRepositoryMutationLanes acquires a deterministic set of stable lanes.
+// The caller must already hold the shared batch gate's read side so batch
+// admission precedes every lane. Recursive defers release lanes in reverse
 // order, preserving the global sorted-prefix lock order on every exit path.
 func (mi *MultiIndexer) withRepositoryMutationLanes(
 	ctx context.Context,

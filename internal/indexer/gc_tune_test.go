@@ -535,7 +535,7 @@ func TestMemReleaseEnabled(t *testing.T) {
 func TestFreeOSMemoryAfterColdIndex(t *testing.T) {
 	// Kill-switch: a no-op that must not panic (logger is nil-safe).
 	t.Setenv("GORTEX_DAEMON_MEMRELEASE", "0")
-	freeOSMemoryAfterColdIndex(nil)
+	freeOSMemoryAfterColdIndex(nil, false)
 
 	// Enabled: forces a scavenge; HeapReleased must not go backwards.
 	t.Setenv("GORTEX_DAEMON_MEMRELEASE", "1")
@@ -550,7 +550,7 @@ func TestFreeOSMemoryAfterColdIndex(t *testing.T) {
 
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	freeOSMemoryAfterColdIndex(nil)
+	freeOSMemoryAfterColdIndex(nil, false)
 	runtime.ReadMemStats(&after)
 	if after.HeapReleased < before.HeapReleased {
 		t.Fatalf("HeapReleased went backwards: before=%d after=%d",
@@ -565,7 +565,7 @@ func TestFreeOSMemoryAfterColdIndexDefersWhileTrackedWorkActive(t *testing.T) {
 
 	runtimeactivity.Begin("mcp")
 	defer runtimeactivity.End("mcp")
-	freeOSMemoryAfterColdIndex(logger)
+	freeOSMemoryAfterColdIndex(logger, false)
 
 	if got := logs.FilterMessage("indexer: deferred cold-index heap release until process idle").Len(); got != 1 {
 		t.Fatalf("deferred-release logs = %d, want 1", got)

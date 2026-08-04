@@ -9,29 +9,38 @@ import (
 // PrefixDiagnostics answers graph.PrefixDiagnosticsReader natively.
 //
 // The predicates below are the SQL transcription of
-// graph.ClassifyNodePrefix, and the two must be changed together. Both key
-// off a non-empty file_path, which is what separates real code nodes from the
-// synthetic `dep::` / `external::` / `module::` / `builtin::` namespaces
-// that carry no source file and are not path-prefixed.
+// graph.IsAuditableRepoSourceNode and graph.ClassifyNodePrefix, and the two
+// must be changed together. The auditable predicate admits repository source
+// while excluding exact virtual external paths and the contract identity
+// namespaces whose IDs deliberately are not path-prefixed.
 //
 // Each population is answered by one aggregate plus one bounded sample
 // query rather than a node pull: on a warm multi-repo store the node table
 // runs to millions of rows, and this is called from health and boot paths
 // that must not materialise it.
 const (
+	// Keep this exact predicate in lockstep with
+	// graph.IsAuditableRepoSourceNode. Prefix checks use instr(...)=1 instead
+	// of a broad punctuation/URI heuristic so real parser nodes cannot escape
+	// the audit merely because their path contains punctuation.
+	auditableRepoSourceNodePredicate = `file_path <> '' AND ` +
+		`kind NOT IN ('contract', 'contract_bridge') AND ` +
+		`instr(file_path, 'external::') <> 1 AND ` +
+		`instr(file_path, 'external-call::') <> 1`
+
 	// A code node no repository claims. Post-flip this must be zero;
 	// a non-zero count is the ghost-graph signature.
-	unownedCodeNodePredicate = `repo_prefix = '' AND file_path <> ''`
+	unownedCodeNodePredicate = `repo_prefix = '' AND (` + auditableRepoSourceNodePredicate + `)`
 
 	// An owned node whose minted identity does not carry the prefix its
 	// repo_prefix column claims. instr(x, y) is 1 when y starts x.
-	misprefixedNodePredicate = `repo_prefix <> '' AND file_path <> '' AND (` +
+	misprefixedNodePredicate = `repo_prefix <> '' AND (` + auditableRepoSourceNodePredicate + `) AND (` +
 		`instr(file_path, repo_prefix || '/') <> 1 OR instr(id, repo_prefix || '/') <> 1)`
 
 	// A code node whose repository claim and minted identity agree. The
 	// negation of misprefixedNodePredicate over the same owned population,
-	// so owned + misprefixed + unowned partitions every file-backed node.
-	ownedCodeNodePredicate = `repo_prefix <> '' AND file_path <> '' AND ` +
+	// so owned + misprefixed + unowned partitions every audited source node.
+	ownedCodeNodePredicate = `repo_prefix <> '' AND (` + auditableRepoSourceNodePredicate + `) AND ` +
 		`instr(file_path, repo_prefix || '/') = 1 AND instr(id, repo_prefix || '/') = 1`
 )
 

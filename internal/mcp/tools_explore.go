@@ -1223,6 +1223,14 @@ func exploreLocalizationCompletion(
 	return newLocalizationCompletion(answerReady, exactSymbol)
 }
 
+// exploreLocalizationUsesConceptRefinement distinguishes an anchor mentioned as
+// evidence inside prose from a compact lookup target. A graph-proven causal
+// identity remains exact because its exclusivity comes from a complete route,
+// not merely from text that happened to contain a declaration name.
+func exploreLocalizationUsesConceptRefinement(answerReady bool, task, exactSymbol, causalExactSymbol string) bool {
+	return !answerReady && causalExactSymbol == "" && exactSymbol != "" && exploreQueryIsConceptTask(task)
+}
+
 // exploreAnswerReady decides whether the ranked head is strong enough to end
 // localization. A result is terminal only when its symbols visibly align with
 // the shaped query; rank alone is not enough because broad review/audit prompts
@@ -2623,18 +2631,30 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// an issue author's downstream symbol anchor. Read that proven constructor,
 	// while retaining the explicitly named consumer immediately after it in the
 	// evidence projection.
-	if causalSymbol := exploreDivergentDefaultOwnerSymbol(symbolTargets); causalSymbol != "" {
-		exactSymbol = causalSymbol
+	causalExactSymbol := exploreDivergentDefaultOwnerSymbol(symbolTargets)
+	if causalExactSymbol != "" {
+		exactSymbol = causalExactSymbol
 	}
-	if !answerReady && exactSymbol == "" {
+	// An identifier embedded in a natural-language concept task is evidence, not
+	// an exclusivity instruction. Keep compact path/symbol/signature lookups as
+	// exact reads, but let concept tasks choose among the full bounded candidate
+	// window with the explicit declaration as their preferred seed.
+	conceptAnchor := exploreLocalizationUsesConceptRefinement(answerReady, task, exactSymbol, causalExactSymbol)
+	if !answerReady && (exactSymbol == "" || conceptAnchor) {
 		// Uncertain localization is still useful evidence. Returning it as an
 		// MCP error makes hosts discard the ranked candidates and restart broad
 		// exploration, multiplying turns and payloads. Name one concrete ranked
 		// target for the only permitted refinement read; source-literal evidence
 		// wins because it is absent from ordinary symbol metadata.
 		routes := exploreLocalizationRefinementRoutes(symbolTargets)
+		preferred := explorePreferredRefinementSymbol(task, symbolTargets)
+		if conceptAnchor {
+			if _, authorized := routes[exactSymbol]; authorized {
+				preferred = exactSymbol
+			}
+		}
 		preferredSymbol := explorePreferredRoutedRefinementSymbol(
-			explorePreferredRefinementSymbol(task, symbolTargets), symbolTargets, routes,
+			preferred, symbolTargets, routes,
 		)
 		result, refinement, boundedRoutes, digest := buildLocalizationRefinementResultForTask(
 			preferredSymbol, task, targets, budget, routes,
@@ -3189,7 +3209,7 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 
 const (
 	localizationDirectRelationSourceLimit = 5
-	localizationDirectEvidenceReserve     = 3
+	localizationDirectEvidenceReserve     = localizationRefinementAllowedSymbolCap
 )
 
 // interleaveLocalizationDirectRelations promotes one already-hydrated direct
@@ -3793,12 +3813,11 @@ func buildLocalizationExploreResultForTaskFinalized(
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal
 	digest := newLocalizationEvidenceDigestForTask(task, envelope)
-	envelope.Completion = localizationCompletionBoundedByDigest(envelope.Completion, digest)
 	// The serialized completion, returned state, structuredContent, and host
-	// metadata must carry the same final_response. Build the digest first, then
-	// enrich the one completion value before any wire representation is made.
-	envelope.Completion = localizationCompletionWithDigest(envelope.Completion, digest)
-	contract = localizationContractFor(envelope.Completion)
+	// metadata must be derived from the exact retained rows. This same helper is
+	// called again after any later byte shedding so authorization cannot outlive
+	// its identity or proof dependency.
+	contract = localizationContractReconciledWithDigest(envelope.Completion, digest)
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal
 	// The ready-to-emit answer is derived from the retained rows, so it lands
@@ -3817,7 +3836,9 @@ func buildLocalizationExploreResultForTaskFinalized(
 			digest.Evidence = digest.Evidence[:len(digest.Evidence)-1]
 			rebuildLocalizationDigestSkeleton(digest)
 			refreshLocalizationDigestResponses(digest, task, nil)
-			envelope.Completion = localizationCompletionWithDigest(envelope.Completion, digest)
+			contract = localizationContractReconciledWithDigest(envelope.Completion, digest)
+			envelope.Completion = contract.Completion
+			envelope.Terminal = contract.Terminal
 			continue
 		}
 		shed := -1

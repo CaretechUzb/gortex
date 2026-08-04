@@ -74,10 +74,43 @@ type frameworkScopedStoreStats struct {
 // framework synthesizers actually use are overridden below. Whole-corpus
 // snapshots fail closed so adding one to a synthesizer cannot silently turn a
 // one-file edit into a workspace scan.
+// frameworkScopedSeed is the immutable changed-file frontier shared by every
+// synthesizer in one settle. Only the initial exact-file nodes, their incident
+// edges/endpoints, and exact-name dependencies live here. Reads discovered by
+// one synthesizer belong to its pass-local overlay and must not become input to
+// a later, unrelated synthesizer.
+type frameworkScopedSeed struct {
+	store graph.Store
+	scope frameworkExecutionScope
+
+	nodes          map[string]*graph.Node
+	incidentByKind map[graph.EdgeKind][]*graph.Edge
+	incidentSeen   map[graph.EdgeIdentity]struct{}
+
+	// outputs is deliberately separate from the immutable read seed. It records
+	// only durable mutations produced by earlier synthesizers, which later
+	// passes must observe; pass-local read expansion never enters this overlay.
+	outputs *frameworkScopedOutputs
+
+	retainedRows  int
+	retainedBytes int
+}
+
+type frameworkScopedOutputs struct {
+	nodes   map[string]*graph.Node
+	edges   map[graph.EdgeIdentity]*graph.Edge
+	order   []graph.EdgeIdentity
+	removed map[graph.EdgeIdentity]struct{}
+}
+
 type frameworkScopedStore struct {
 	graph.Store
 	scope frameworkExecutionScope
+	seed  *frameworkScopedSeed
 
+	// These maps are a pass-local read-through overlay. A fresh view is created
+	// for every synthesizer so dynamic name and adjacency expansion remains
+	// available within the pass without widening later passes.
 	nodes          map[string]*graph.Node
 	incidentByKind map[graph.EdgeKind][]*graph.Edge
 	incidentSeen   map[graph.EdgeIdentity]struct{}
@@ -91,14 +124,49 @@ type frameworkScopedStore struct {
 	lastNode      *graph.Node
 }
 
-func newFrameworkScopedStore(
+func newFrameworkScopedSeed(
 	store graph.Store,
 	repos map[string]bool,
 	filePaths []string,
+) *frameworkScopedSeed {
+	seedView := newFrameworkScopedPassStore(
+		store,
+		newFrameworkExecutionScope(repos, filePaths),
+		nil,
+	)
+	seedView.seedChangedFileFrontier()
+	return &frameworkScopedSeed{
+		store:          store,
+		scope:          seedView.scope,
+		nodes:          seedView.nodes,
+		incidentByKind: seedView.incidentByKind,
+		incidentSeen:   seedView.incidentSeen,
+		outputs: &frameworkScopedOutputs{
+			nodes:   make(map[string]*graph.Node),
+			edges:   make(map[graph.EdgeIdentity]*graph.Edge),
+			removed: make(map[graph.EdgeIdentity]struct{}),
+		},
+		retainedRows:  seedView.retainedRows,
+		retainedBytes: seedView.retainedBytes,
+	}
+}
+
+func (s *frameworkScopedSeed) newPassStore() *frameworkScopedStore {
+	if s == nil {
+		return nil
+	}
+	return newFrameworkScopedPassStore(s.store, s.scope, s)
+}
+
+func newFrameworkScopedPassStore(
+	store graph.Store,
+	scope frameworkExecutionScope,
+	seed *frameworkScopedSeed,
 ) *frameworkScopedStore {
-	view := &frameworkScopedStore{
+	return &frameworkScopedStore{
 		Store:          store,
-		scope:          newFrameworkExecutionScope(repos, filePaths),
+		scope:          scope,
+		seed:           seed,
 		nodes:          make(map[string]*graph.Node),
 		incidentByKind: make(map[graph.EdgeKind][]*graph.Edge),
 		incidentSeen:   make(map[graph.EdgeIdentity]struct{}),
@@ -107,16 +175,138 @@ func newFrameworkScopedStore(
 		inReady:        make(map[string]struct{}),
 		outReady:       make(map[string]struct{}),
 	}
-	view.seedChangedFileFrontier()
-	return view
+}
+
+func newFrameworkScopedStore(
+	store graph.Store,
+	repos map[string]bool,
+	filePaths []string,
+) *frameworkScopedStore {
+	return newFrameworkScopedSeed(store, repos, filePaths).newPassStore()
 }
 
 func (v *frameworkScopedStore) stats() frameworkScopedStoreStats {
+	rows, bytes := v.retainedRows, v.retainedBytes
+	if v.seed != nil {
+		rows += v.seed.retainedRows
+		bytes += v.seed.retainedBytes
+	}
 	return frameworkScopedStoreStats{
-		RetainedRows:  v.retainedRows,
-		RetainedBytes: v.retainedBytes,
+		RetainedRows:  rows,
+		RetainedBytes: bytes,
 		RowCap:        frameworkScopeRetainedRowCap,
 		ByteCap:       frameworkScopeRetainedByteCap,
+	}
+}
+
+func (v *frameworkScopedStore) AddNode(node *graph.Node) {
+	v.Store.AddNode(node)
+	v.recordOutputNode(node)
+}
+
+func (v *frameworkScopedStore) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+	v.Store.AddBatch(nodes, edges)
+	for _, node := range nodes {
+		v.recordOutputNode(node)
+	}
+	for _, edge := range edges {
+		v.recordOutputEdge(edge)
+	}
+}
+
+func (v *frameworkScopedStore) AddEdge(edge *graph.Edge) {
+	v.Store.AddEdge(edge)
+	v.recordOutputEdge(edge)
+}
+
+func (v *frameworkScopedStore) ReindexEdge(edge *graph.Edge, oldTo string) {
+	v.Store.ReindexEdge(edge, oldTo)
+	old := graph.EdgeIdentityFor(edge)
+	old.To = oldTo
+	v.removeOutputIdentity(old)
+	v.recordOutputEdge(edge)
+}
+
+func (v *frameworkScopedStore) ReindexEdges(batch []graph.EdgeReindex) {
+	v.Store.ReindexEdges(batch)
+	for _, mutation := range batch {
+		if mutation.Edge == nil {
+			continue
+		}
+		old := graph.EdgeIdentityFor(mutation.Edge)
+		if mutation.OldFrom != "" {
+			old.From = mutation.OldFrom
+		}
+		if mutation.OldTo != "" {
+			old.To = mutation.OldTo
+		}
+		if mutation.OldKind != "" {
+			old.Kind = mutation.OldKind
+		}
+		if mutation.RefreshIdentity {
+			old.FilePath = mutation.OldFilePath
+			old.Line = mutation.OldLine
+		}
+		v.removeOutputIdentity(old)
+		v.recordOutputEdge(mutation.Edge)
+	}
+}
+
+func (v *frameworkScopedStore) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
+	removed := v.Store.RemoveEdge(from, to, kind)
+	if removed && v.seed != nil && v.seed.outputs != nil {
+		v.seed.outputs.removeMatching(from, to, kind, v.seed.incidentByKind[kind])
+	}
+	return removed
+}
+
+func (v *frameworkScopedStore) recordOutputNode(node *graph.Node) {
+	if v.seed == nil || v.seed.outputs == nil || node == nil || node.ID == "" {
+		return
+	}
+	copyNode := *node
+	copyNode.Meta = cloneFrameworkMeta(node.Meta)
+	v.seed.outputs.nodes[node.ID] = &copyNode
+}
+
+func (v *frameworkScopedStore) recordOutputEdge(edge *graph.Edge) {
+	if v.seed == nil || v.seed.outputs == nil || edge == nil {
+		return
+	}
+	key := graph.EdgeIdentityFor(edge)
+	if _, exists := v.seed.outputs.edges[key]; !exists {
+		v.seed.outputs.order = append(v.seed.outputs.order, key)
+	}
+	delete(v.seed.outputs.removed, key)
+	v.seed.outputs.edges[key] = cloneFrameworkEdge(edge)
+}
+
+func (v *frameworkScopedStore) removeOutputIdentity(identity graph.EdgeIdentity) {
+	if v.seed == nil || v.seed.outputs == nil {
+		return
+	}
+	v.seed.outputs.removed[identity] = struct{}{}
+	delete(v.seed.outputs.edges, identity)
+}
+
+func (o *frameworkScopedOutputs) removeMatching(
+	from, to string,
+	kind graph.EdgeKind,
+	seedEdges []*graph.Edge,
+) {
+	if o == nil {
+		return
+	}
+	for _, edge := range seedEdges {
+		if edge != nil && edge.From == from && edge.To == to && edge.Kind == kind {
+			o.removed[graph.EdgeIdentityFor(edge)] = struct{}{}
+		}
+	}
+	for identity := range o.edges {
+		if identity.From == from && identity.To == to && identity.Kind == kind {
+			o.removed[identity] = struct{}{}
+			delete(o.edges, identity)
+		}
 	}
 }
 
@@ -138,15 +328,17 @@ func (v *frameworkScopedStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.
 				return
 			}
 		}
-		ids := make([]string, 0, len(v.nodes))
-		for id, node := range v.nodes {
-			if node != nil && node.Kind == kind && !v.inBaseScope(node) {
-				ids = append(ids, id)
-			}
+		ids := make(map[string]struct{}, len(v.nodes)+v.seedNodeCount())
+		v.collectOffBaseNodeIDs(ids, kind, v.seedNodes())
+		v.collectOffBaseNodeIDs(ids, kind, v.outputNodes())
+		v.collectOffBaseNodeIDs(ids, kind, v.nodes)
+		ordered := make([]string, 0, len(ids))
+		for id := range ids {
+			ordered = append(ordered, id)
 		}
-		sort.Strings(ids)
-		for _, id := range ids {
-			node := v.nodes[id]
+		sort.Strings(ordered)
+		for _, id := range ordered {
+			node := v.rememberedNode(id)
 			v.lastNode = node
 			if !yield(node) {
 				return
@@ -158,35 +350,132 @@ func (v *frameworkScopedStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.
 func (v *frameworkScopedStore) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
 	base := graph.EdgesInScopeSeq(v.Store, v.scope.repoPrefixes, v.scope.filePaths, kind)
 	return func(yield func(*graph.Edge) bool) {
+		yielded := make(map[graph.EdgeIdentity]struct{})
 		for row := range base {
 			v.lastNode = row.Source
 			v.rememberNode(row.Source)
 			v.rememberNode(row.Target)
-			if row.Edge != nil && !yield(row.Edge) {
+			if row.Edge == nil {
+				continue
+			}
+			identity := graph.EdgeIdentityFor(row.Edge)
+			yielded[identity] = struct{}{}
+			if !yield(row.Edge) {
 				return
 			}
 		}
-		for _, edge := range v.incidentByKind[kind] {
-			if edge == nil {
-				continue
-			}
-			source := v.nodes[edge.From]
-			if source != nil && v.inBaseScope(source) {
-				continue // already yielded by the source-owned projection
-			}
-			v.lastNode = source
-			if !yield(edge) {
-				return
+		for _, edges := range [][]*graph.Edge{
+			v.seedIncidentEdges(kind),
+			v.outputEdges(kind),
+			v.incidentByKind[kind],
+		} {
+			for _, edge := range edges {
+				if edge == nil {
+					continue
+				}
+				identity := graph.EdgeIdentityFor(edge)
+				if v.outputRemoved(identity) {
+					continue
+				}
+				if _, duplicate := yielded[identity]; duplicate {
+					continue
+				}
+				source := v.rememberedNode(edge.From)
+				if source != nil && v.inBaseScope(source) {
+					continue // already yielded by the source-owned projection
+				}
+				yielded[identity] = struct{}{}
+				v.lastNode = source
+				if !yield(edge) {
+					return
+				}
 			}
 		}
 	}
 }
 
-func (v *frameworkScopedStore) GetNode(id string) *graph.Node {
+func (v *frameworkScopedStore) seedNodes() map[string]*graph.Node {
+	if v.seed == nil {
+		return nil
+	}
+	return v.seed.nodes
+}
+
+func (v *frameworkScopedStore) seedNodeCount() int {
+	if v.seed == nil {
+		return 0
+	}
+	return len(v.seed.nodes)
+}
+
+func (v *frameworkScopedStore) seedIncidentEdges(kind graph.EdgeKind) []*graph.Edge {
+	if v.seed == nil {
+		return nil
+	}
+	return v.seed.incidentByKind[kind]
+}
+
+func (v *frameworkScopedStore) outputNodes() map[string]*graph.Node {
+	if v.seed == nil || v.seed.outputs == nil {
+		return nil
+	}
+	return v.seed.outputs.nodes
+}
+
+func (v *frameworkScopedStore) outputEdges(kind graph.EdgeKind) []*graph.Edge {
+	if v.seed == nil || v.seed.outputs == nil {
+		return nil
+	}
+	out := make([]*graph.Edge, 0)
+	for _, identity := range v.seed.outputs.order {
+		edge := v.seed.outputs.edges[identity]
+		if edge != nil && edge.Kind == kind {
+			out = append(out, edge)
+		}
+	}
+	return out
+}
+
+func (v *frameworkScopedStore) outputRemoved(identity graph.EdgeIdentity) bool {
+	if v.seed == nil || v.seed.outputs == nil {
+		return false
+	}
+	_, removed := v.seed.outputs.removed[identity]
+	return removed
+}
+
+func (v *frameworkScopedStore) collectOffBaseNodeIDs(
+	ids map[string]struct{},
+	kind graph.NodeKind,
+	nodes map[string]*graph.Node,
+) {
+	for id, node := range nodes {
+		if node != nil && node.Kind == kind && !v.inBaseScope(node) {
+			ids[id] = struct{}{}
+		}
+	}
+}
+
+func (v *frameworkScopedStore) rememberedNode(id string) *graph.Node {
 	if v.lastNode != nil && v.lastNode.ID == id {
 		return v.lastNode
 	}
 	if node := v.nodes[id]; node != nil {
+		return node
+	}
+	if v.seed != nil {
+		if v.seed.outputs != nil {
+			if node := v.seed.outputs.nodes[id]; node != nil {
+				return node
+			}
+		}
+		return v.seed.nodes[id]
+	}
+	return nil
+}
+
+func (v *frameworkScopedStore) GetNode(id string) *graph.Node {
+	if node := v.rememberedNode(id); node != nil {
 		return node
 	}
 	node := v.Store.GetNode(id)
@@ -200,12 +489,8 @@ func (v *frameworkScopedStore) GetNodesByIDs(ids []string) map[string]*graph.Nod
 	missing := make([]string, 0, len(ids))
 	seenMissing := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
-		if node := v.nodes[id]; node != nil {
+		if node := v.rememberedNode(id); node != nil {
 			out[id] = node
-			continue
-		}
-		if v.lastNode != nil && v.lastNode.ID == id {
-			out[id] = v.lastNode
 			continue
 		}
 		if _, seen := seenMissing[id]; !seen && id != "" {
@@ -274,6 +559,14 @@ func (v *frameworkScopedStore) GetOutEdgesByNodeIDs(ids []string) map[string][]*
 	return rows
 }
 
+// FindEdgesByIdentities preserves exact candidate refetch through the scoped
+// view without retaining broad adjacency or widening the execution scope.
+func (v *frameworkScopedStore) FindEdgesByIdentities(
+	identities []graph.EdgeIdentity,
+) map[graph.EdgeIdentity]*graph.Edge {
+	return findFrameworkEdgesByIdentities(v.Store, identities)
+}
+
 func (v *frameworkScopedStore) inBaseScope(node *graph.Node) bool {
 	if node == nil {
 		return false
@@ -298,6 +591,16 @@ func (v *frameworkScopedStore) rememberNode(node *graph.Node) bool {
 	if _, exists := v.nodes[node.ID]; exists {
 		return true
 	}
+	if v.seed != nil {
+		if v.seed.outputs != nil {
+			if _, exists := v.seed.outputs.nodes[node.ID]; exists {
+				return true
+			}
+		}
+		if _, exists := v.seed.nodes[node.ID]; exists {
+			return true
+		}
+	}
 	size := frameworkNodeBytes(node)
 	if !v.canRetain(size) {
 		return false
@@ -316,6 +619,16 @@ func (v *frameworkScopedStore) rememberEdge(edge *graph.Edge) bool {
 	if _, exists := v.incidentSeen[key]; exists {
 		return true
 	}
+	if v.seed != nil {
+		if v.seed.outputs != nil {
+			if _, exists := v.seed.outputs.edges[key]; exists {
+				return true
+			}
+		}
+		if _, exists := v.seed.incidentSeen[key]; exists {
+			return true
+		}
+	}
 	size := frameworkEdgeBytes(edge)
 	if !v.canRetain(size) {
 		return false
@@ -328,8 +641,13 @@ func (v *frameworkScopedStore) rememberEdge(edge *graph.Edge) bool {
 }
 
 func (v *frameworkScopedStore) canRetain(size int) bool {
-	return v.retainedRows < frameworkScopeRetainedRowCap &&
-		v.retainedBytes+size <= frameworkScopeRetainedByteCap
+	rows, bytes := v.retainedRows, v.retainedBytes
+	if v.seed != nil {
+		rows += v.seed.retainedRows
+		bytes += v.seed.retainedBytes
+	}
+	return rows < frameworkScopeRetainedRowCap &&
+		bytes+size <= frameworkScopeRetainedByteCap
 }
 
 func frameworkNodeBytes(node *graph.Node) int {
@@ -538,4 +856,7 @@ func addFrameworkToken(tokens map[string]struct{}, value any) {
 	}
 }
 
-var _ graph.Store = (*frameworkScopedStore)(nil)
+var (
+	_ graph.Store                   = (*frameworkScopedStore)(nil)
+	_ graph.EdgeIdentityBatchFinder = (*frameworkScopedStore)(nil)
+)

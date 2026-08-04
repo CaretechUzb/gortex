@@ -138,7 +138,7 @@ func TestMultiIndexer_RunPreEnrichResolve_BindsInboundCrossRepoEdge(t *testing.T
 	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
 
 	// Scoped warm restart: only the provider repo-b re-indexed.
-	mi.RunPreEnrichResolve(context.Background(), map[string]struct{}{"repo-b": {}}, nil)
+	require.NoError(t, mi.RunPreEnrichResolve(context.Background(), map[string]struct{}{"repo-b": {}}, nil))
 
 	assert.Equal(t, "repo-b/b.go::Foo", inbound.To,
 		"pre-enrich resolve must bind the unchanged consumer's inbound edge into the changed provider before ready")

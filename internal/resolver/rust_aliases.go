@@ -98,14 +98,20 @@ func addRustAlias[K comparable](aliases map[K]rustAliasEntry, key K, entry rustA
 // aliases at the crate boundary. It returns the canonical Rust path, whether an
 // alias was traversed, and false when the alias set is ambiguous or cyclic.
 func (idx *rustTypeAliasIndex) resolve(node *graph.Node, name string) (string, bool, bool) {
+	if node == nil {
+		name = normalizeRustUsePath(name)
+		return name, false, name != ""
+	}
+	return idx.resolveAt(node.RepoPrefix, node.FilePath, name)
+}
+
+func (idx *rustTypeAliasIndex) resolveAt(repo, file, name string) (string, bool, bool) {
 	name = normalizeRustUsePath(name)
-	if idx == nil || node == nil || name == "" {
+	if idx == nil || name == "" {
 		return name, false, name != ""
 	}
 
-	repo := node.RepoPrefix
-	crate := rustAliasCrate(node.FilePath)
-	file := node.FilePath
+	crate := rustAliasCrate(file)
 	current := name
 	changed := false
 	seen := make(map[string]struct{}, rustAliasDepthLimit)

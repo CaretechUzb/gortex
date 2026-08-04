@@ -1064,6 +1064,10 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	if d > 0 {
 		ctx, cancel = context.WithTimeout(baseCtx, d)
 	}
+	// Compiler-backed providers use the repository census only to choose an
+	// admission class. Keeping the hint on this pass-owned context avoids
+	// shared mutable scheduling state on Manager or Provider.
+	ctx = WithEnrichmentAdmissionNodes(ctx, nodeCount)
 	if applyGate != nil {
 		ctx = WithApplyGate(ctx, applyGate)
 	}

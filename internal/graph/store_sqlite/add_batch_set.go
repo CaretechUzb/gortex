@@ -626,13 +626,22 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	}
 
 	// JSONB bulk fast path: two bounded payload binds per statement instead
-	// of thousands of per-row variable binds (see add_batch_json.go). Only
-	// when no active receipt needs per-row RETURNING; the placeholder writer
-	// remains the receipt path and the fallback.
-	useJSONB := receiptDelta == nil && jsonbIngestEnabled() && jsonbIngestSupported(tx)
+	// of thousands of per-row variable binds (see add_batch_json.go). Active
+	// receipts collect exact identities through bounded RETURNING result sets;
+	// the placeholder writer remains the kill-switch/compatibility fallback.
+	useJSONB := jsonbIngestEnabled() && jsonbIngestSupported(tx)
+	if useJSONB {
+		defer func() {
+			if s.bulkConn == nil && !s.coordinatedBulkLoad {
+				s.jsonbIngestBuffers.release()
+				return
+			}
+			s.jsonbIngestBuffers.trim()
+		}()
+	}
 	var changedNodeIDs map[string]int
 	if useJSONB {
-		stats.nodeRowsChanged, stats.nodeStatements, err = insertNodeChunksJSONBTx(tx, nodes)
+		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksJSONBTxWithBuffers(tx, nodes, receiptDelta != nil, &s.jsonbIngestBuffers)
 	} else {
 		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksTxLimited(tx, nodes, receiptDelta != nil, &variableLimit)
 	}
@@ -654,24 +663,23 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 			inputCounts[node.ID]++
 			lastNodes[node.ID] = node
 		}
-		for id, changedCount := range changedNodeIDs {
+		for id := range changedNodeIDs {
 			node := lastNodes[id]
 			oldIdentity, oldFound := identities[id]
-			if inputCounts[id] > 1 {
-				// RETURNING identifies every changed ID but cannot identify which
-				// duplicate occurrence was a no-op. Fail closed while retaining the
-				// useful final definition frontier.
-				receiptDelta.complete = false
-				receiptDelta.resolutionRelevant = true
-				if !oldFound && changedCount > 0 {
-					recordSQLiteAddedNode(receiptDelta, node)
-				}
-			} else if !identityExact {
-				receiptDelta.complete = false
+			if !identityExact {
+				receiptDelta.noteIncomplete("node_identity_preload_failed")
 			} else if !oldFound {
+				// The transaction exposes only the final duplicate occurrence. A
+				// newly created final identity is therefore exact even when earlier
+				// occurrences of the same ID carried enrichment-only differences.
 				recordSQLiteAddedNode(receiptDelta, node)
 			} else if !oldIdentity.equalsNode(node) {
-				receiptDelta.complete = false
+				if inputCounts[id] > 1 &&
+					(graph.IsReferenceableSymbol(graph.NodeKind(oldIdentity.kind)) || graph.IsReferenceableSymbol(node.Kind)) {
+					receiptDelta.noteIncomplete("duplicate_node_batch")
+				} else {
+					recordSQLiteChangedNodeIdentity(receiptDelta, oldIdentity, node)
+				}
 			}
 		}
 		for id, node := range lastNodes {
@@ -681,7 +689,7 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 
 	var insertedEdgeKeys map[sqliteEdgeIdentity]int
 	if useJSONB {
-		stats.edgeRowsInserted, stats.edgeStatements, err = insertEdgeChunksJSONBTx(tx, edges)
+		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksJSONBTxWithBuffers(tx, edges, receiptDelta != nil, &s.jsonbIngestBuffers)
 	} else {
 		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksTxLimited(tx, edges, receiptDelta != nil, &variableLimit)
 	}
@@ -703,7 +711,7 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 				if source, found := identities[edge.From]; found {
 					file = source.filePath
 				} else if !identityExact {
-					receiptDelta.complete = false
+					receiptDelta.noteIncomplete("edge_source_identity_preload_failed")
 				}
 			}
 			recordSQLiteAddedEdge(receiptDelta, edge, file)
@@ -719,5 +727,8 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	if changed {
 		s.mergeMutationReceiptLocked(receiptDelta)
 	}
-	return stats, nil
+	// The transaction is durable before index sealing. If the bounded cold
+	// threshold was reached, build the dense indexes now on the same pinned
+	// connection; a failure remains retryable at the repository/final boundary.
+	return stats, s.noteBulkRowsLocked(stats.nodeRowsChanged, stats.edgeRowsInserted)
 }

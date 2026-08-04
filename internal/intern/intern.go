@@ -8,11 +8,11 @@
 // concatenation alone. Interning collapses every duplicate of a string
 // to a single shared backing array.
 //
-// The table is process-global and never shrinks: an interned string
-// lives until process exit even if every repo referencing it is later
-// evicted. This is a deliberate trade — node IDs and file paths are
-// low-cardinality and heavily duplicated, so the bounded table costs
-// far less than the duplication it removes.
+// The table is process-global within one generation. Long-lived callers may
+// explicitly rotate generations with Reset after every producer using the old
+// canonical set has joined. Strings already returned remain valid; the reset
+// only drops the table's references, allowing otherwise-unreferenced IDs and
+// paths to be collected while preserving deduplication inside each generation.
 package intern
 
 import "sync"
@@ -68,6 +68,32 @@ func String(s string) string {
 	}
 	sh.mu.Unlock()
 	return c
+}
+
+// Reset starts a fresh process-wide intern generation and returns the number
+// of canonical strings released from the table. Strings returned before the
+// reset remain valid and keep their backing arrays for as long as callers hold
+// them; equal strings interned after the reset may use a different backing
+// array. Callers must therefore rely on string value equality, never backing
+// identity, across a reset boundary.
+//
+// Lock every shard before swapping any map so concurrent String calls observe
+// either side of one generation boundary, not a partially-rotated table. A
+// String call holds at most one shard lock, so the fixed acquisition order
+// cannot introduce a lock cycle.
+func Reset() int {
+	for _, sh := range shards {
+		sh.mu.Lock()
+	}
+	removed := 0
+	for _, sh := range shards {
+		removed += len(sh.m)
+		sh.m = make(map[string]string)
+	}
+	for i := len(shards) - 1; i >= 0; i-- {
+		shards[i].mu.Unlock()
+	}
+	return removed
 }
 
 // Len reports the number of distinct strings currently interned.

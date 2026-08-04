@@ -39,8 +39,8 @@ func TestRunPreEnrichResolveFiresComputeDoneHook(t *testing.T) {
 	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
 
 	var order []string
-	mi.RunPreEnrichResolve(context.Background(), nil,
-		func() { order = append(order, "compute_done") })
+	require.NoError(t, mi.RunPreEnrichResolve(context.Background(), nil,
+		func() { order = append(order, "compute_done") }))
 
 	assert.Equal(t, []string{"compute_done"}, order,
 		"queryable must be declarable exactly once, before the stage returns")

@@ -8,14 +8,6 @@ import (
 
 const dataflowRewriteBatchSize = 2048
 
-// dataflowBatchScanner is implemented by disk stores that can close each
-// bounded read cursor before the callback mutates edge identities. The SQLite
-// implementation also captures a row-id high-water mark, so rewritten rows
-// cannot re-enter the same pass under their newly inserted row id.
-type dataflowBatchScanner interface {
-	ScanDataflowEdgesBatched(batchSize int, yield func([]*graph.Edge) bool)
-}
-
 // materializeDataflowParams runs after the regular call resolver
 // pass to lift the placeholder targets carried by EdgeArgOf and
 // EdgeReturnsTo edges to concrete graph IDs. The Go dataflow
@@ -57,37 +49,12 @@ func (idx *Indexer) materializeDataflowParams() {
 }
 
 func forEachDataflowEdgeBatch(g graph.Store, batchSize int, yield func([]*graph.Edge) bool) {
-	if scanner, ok := g.(dataflowBatchScanner); ok {
-		scanner.ScanDataflowEdgesBatched(batchSize, yield)
-		return
-	}
-	if batchSize <= 0 {
-		batchSize = 1
-	}
-	batch := make([]*graph.Edge, 0, batchSize)
-	keepGoing := true
-	flush := func() {
-		if len(batch) == 0 || !keepGoing {
-			return
-		}
-		keepGoing = yield(batch)
-		batch = make([]*graph.Edge, 0, batchSize)
-	}
-	for _, kind := range []graph.EdgeKind{graph.EdgeArgOf, graph.EdgeReturnsTo} {
-		for edge := range g.EdgesByKind(kind) {
-			if edge == nil {
-				continue
-			}
-			batch = append(batch, edge)
-			if len(batch) == batchSize {
-				flush()
-				if !keepGoing {
-					return
-				}
-			}
-		}
-	}
-	flush()
+	graph.ScanEdgesByKindsBatched(
+		g,
+		[]graph.EdgeKind{graph.EdgeArgOf, graph.EdgeReturnsTo},
+		batchSize,
+		yield,
+	)
 }
 
 // materializeDataflowParamsForFile is the single-file equivalent of

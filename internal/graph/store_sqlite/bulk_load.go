@@ -28,6 +28,8 @@ type bulkFinalizeEvent struct {
 	Stage              string
 	Name               string
 	Elapsed            time.Duration
+	NodeRows           int64
+	EdgeRows           int64
 	Busy               int
 	WALFrames          int
 	CheckpointedFrames int
@@ -39,11 +41,15 @@ func (s *Store) emitBulkFinalizeEvent(event bulkFinalizeEvent) {
 		s.bulkFinalizeObserver(event)
 	}
 	if event.Err != nil {
-		log.Printf("store_sqlite: bulk finalize stage=%s name=%s elapsed=%s error=%q", event.Stage, event.Name, event.Elapsed, event.Err)
+		log.Printf("store_sqlite: bulk finalize stage=%s name=%s elapsed=%s nodes=%d edges=%d error=%q", event.Stage, event.Name, event.Elapsed, event.NodeRows, event.EdgeRows, event.Err)
 		return
 	}
-	if event.Stage == "checkpoint" {
+	if event.Stage == "checkpoint" || event.Stage == "checkpoint_passive" {
 		log.Printf("store_sqlite: bulk finalize stage=%s name=%s elapsed=%s busy=%d wal_frames=%d checkpointed_frames=%d", event.Stage, event.Name, event.Elapsed, event.Busy, event.WALFrames, event.CheckpointedFrames)
+		return
+	}
+	if event.Stage == "index_seal" {
+		log.Printf("store_sqlite: bulk finalize stage=%s reason=%s elapsed=%s nodes=%d edges=%d", event.Stage, event.Name, event.Elapsed, event.NodeRows, event.EdgeRows)
 		return
 	}
 	log.Printf("store_sqlite: bulk finalize stage=%s name=%s elapsed=%s", event.Stage, event.Name, event.Elapsed)
@@ -54,10 +60,10 @@ func (s *Store) emitBulkFinalizeEvent(event bulkFinalizeEvent) {
 // not depend on either command because every FTS row is already transactional.
 const coldFTSMergePages = 64
 
-// bulkDroppableIndexes is the single source of truth for these index
-// definitions. Open creates them (so the initial DB has them), BeginBulkLoad
-// drops them by name, and FlushBulk recreates them from the exact same ddl —
-// keeping the initial and post-bulk shapes from drifting.
+// bulkDroppableIndexes is the single source of truth for the dense secondary
+// indexes whose per-row maintenance is worth deferring for the bounded head of
+// a proven cold load. Open creates them, BeginBulkLoad drops them by name, and
+// the first deterministic seal recreates them from the exact same DDL.
 //
 // These are exactly the standalone, NON-UNIQUE CREATE INDEX statements over
 // the large nodes / edges tables. Maintaining them per-row across a
@@ -98,10 +104,6 @@ var bulkDroppableIndexes = []bulkDroppableIndex{
 	// is not a query predicate and WITHOUT ROWID secondary indexes already
 	// carry the primary-key id. The partial predicate excludes nameless nodes.
 	{"nodes_by_repo_language_name", `CREATE INDEX IF NOT EXISTS nodes_by_repo_language_name ON nodes(repo_prefix, language, name) WHERE name <> ''`},
-	// Repository-scoped contract/router discovery reads only file-node paths.
-	// This partial covering index avoids scanning every symbol in the repo and
-	// remains small enough to rebuild cheaply at the end of a cold bulk load.
-	{"nodes_repo_files", `CREATE INDEX IF NOT EXISTS nodes_repo_files ON nodes(repo_prefix, workspace_id, language, file_path, id) WHERE kind = 'file'`},
 	{"edges_by_from", `CREATE INDEX IF NOT EXISTS edges_by_from ON edges(from_id, kind)`},
 	// Site-shaped candidate probes (guard rehydration, resolve-job liveness,
 	// edge identity lookups) constrain (from_id, line). Without a line-bearing
@@ -117,36 +119,44 @@ var bulkDroppableIndexes = []bulkDroppableIndex{
 	// Exact changed-file frontiers (watcher and partial indexing) must not
 	// scan every edge merely to find source sites owned by one file.
 	{"edges_by_file", `CREATE INDEX IF NOT EXISTS edges_by_file ON edges(file_path, kind)`},
-	// Backs EdgesWithUnresolvedTarget — the resolver's main pending-edge
-	// collector, called on every full resolve. is_unresolved is a VIRTUAL
-	// generated column (see isUnresolvedColumnDDL); indexing it turns a
-	// full-table scan (the prior to_id-based OR query forced SQLite to
-	// abandon its index) into an index search whose bookmark lookups land
-	// in ascending rowid order (see isUnresolvedColumnDDL's doc comment for
-	// why that beats an equivalent-looking to_id-based index).
-	// Only unresolved rows belong in the resolver frontier. A dense Boolean
-	// index stored one entry for every resolved edge and made cold finalization
-	// sort the full edge corpus; the partial index preserves rowid ordering while
-	// shrinking rebuild and steady-state maintenance to the pending frontier.
-	{"edges_by_unresolved", `CREATE INDEX IF NOT EXISTS edges_by_unresolved ON edges(is_unresolved) WHERE is_unresolved = 1`},
-	// The repo-prefixed fn-value placeholder namespace is read once per
-	// framework-synthesis pass through a leading-wildcard LIKE that no
-	// general index can serve — without this partial index the reader
-	// walked every unresolved edge. The reader states the predicate
-	// verbatim as its only WHERE clause (the OR-arm implication prover
-	// will not bind it otherwise). Near-empty at rest; populated only
-	// mid-pass while placeholders await the fn-value gate.
-	{"edges_fnvalue_prefixed", `CREATE INDEX IF NOT EXISTS edges_fnvalue_prefixed ON edges(to_id) WHERE to_id LIKE '%::unresolved::fnvalue::%'`},
-	// Canonical Go receiver types remain indexed for the SQLite-native repair.
-	// The edge side reuses edges_by_kind for its one global cold pass; scoped
-	// warm/partial passes continue to seek member_of edges through edges_by_from.
-	{"nodes_go_receiver_type", `CREATE INDEX IF NOT EXISTS nodes_go_receiver_type ON nodes(repo_prefix, file_dir, name, id) WHERE language = 'go' AND kind IN ('type', 'interface') AND name <> '' AND file_path <> ''`},
-	// Partial index over exactly the not-yet-semantically-stamped nodes per
-	// repo. Stays small in steady state (most nodes end up stamped), so a
-	// future "unstamped nodes in this repo" query is an index scan over the
-	// residual few instead of a full-table decode of every node's meta.
-	{"nodes_semantic_pending", `CREATE INDEX IF NOT EXISTS nodes_semantic_pending ON nodes(repo_prefix) WHERE semantic_type IS NULL`},
 }
+
+// bulkAlwaysLiveIndexes are sparse partial indexes. Their predicates keep
+// maintenance bounded, while leaving them live preserves resolver and
+// repository projections as soon as the first repository publishes.
+var bulkAlwaysLiveIndexes = []bulkDroppableIndex{
+	{"nodes_repo_files", `CREATE INDEX IF NOT EXISTS nodes_repo_files ON nodes(repo_prefix, workspace_id, language, file_path, id) WHERE kind = 'file'`},
+	{"edges_by_unresolved", `CREATE INDEX IF NOT EXISTS edges_by_unresolved ON edges(is_unresolved) WHERE is_unresolved = 1`},
+	{"edges_fnvalue_prefixed", `CREATE INDEX IF NOT EXISTS edges_fnvalue_prefixed ON edges(to_id) WHERE to_id LIKE '%::unresolved::fnvalue::%'`},
+	{"nodes_go_receiver_type", `CREATE INDEX IF NOT EXISTS nodes_go_receiver_type ON nodes(repo_prefix, file_dir, name, id) WHERE language = 'go' AND kind IN ('type', 'interface') AND name <> '' AND file_path <> ''`},
+}
+
+// An ordinary cold load gets a substantial unindexed head, but never accumulates
+// an unbounded serial CREATE INDEX tail. A coordinated multi-repository cold
+// load defers the dense-index rebuild to its explicit outer boundary so later
+// repository drains do not pay per-row maintenance on already-dense indexes.
+// WAL pressure is checkpointed at smaller independent intervals in both modes,
+// so index-seal thresholds do not double as checkpoint cadence.
+const (
+	bulkIndexSealNodeLimit = int64(512 << 10)
+	bulkIndexSealEdgeLimit = int64(1 << 20)
+
+	// Keep routine checkpoints coarse enough that their bounded scan cost stays
+	// amortized during active ingestion. Dense indexes amplify dirty pages, but
+	// reducing the row interval only makes a timed-out checkpoint recur sooner.
+	bulkCheckpointNodeInterval = int64(64 << 10)
+	bulkCheckpointEdgeInterval = int64(256 << 10)
+
+	// The final pre-ANALYZE checkpoint coalesces the former one-second
+	// post-edge attempt with the five-second planner window. One continuous
+	// attempt preserves the same total drain budget without restarting the WAL
+	// scan between two adjacent boundaries that have no intervening write.
+	bulkPlannerStatsCheckpointTimeout = 6 * time.Second
+	// The cold-load handoff must finish copying a multi-gigabyte WAL before
+	// resolver-heavy random reads begin. Routine checkpoints stay at one second;
+	// this one terminal PASSIVE drain gets a larger, still-bounded I/O window.
+	bulkFinalCheckpointTimeout = 30 * time.Second
+)
 
 // bulkCacheSizeKiB is the page cache the fast path requests on its pinned
 // connection. SQLite reads a negative cache_size as a KiB budget, so this is
@@ -225,12 +235,10 @@ func (s *Store) activeWriteConnLocked(ctx context.Context) (*sql.Conn, func(), e
 // skips per-row B-tree maintenance and per-commit fsync. FlushBulk reverses
 // all of it: restore the pragmas, rebuild the indexes, and checkpoint.
 //
-// Gated: it engages ONLY when the nodes table is empty. On a populated store
-// (incremental reindex, warm restart, or a later repo in a multi-repo cold
-// start that shares the disk store) it is a safe no-op — dropping indexes or
-// disabling crash durability under live, concurrently-readable rows would be
-// unsafe. In-memory stores have no WAL / on-disk B-tree pressure, so it is a
-// no-op there too.
+// Gated: it engages ONLY when both graph tables and the durable warm-restart
+// sidecars prove this is a fresh store. On an incremental/warm store it is a
+// safe no-op — even if corruption left nodes empty while edges survived.
+// In-memory stores have no WAL / on-disk B-tree pressure, so it is a no-op.
 func (s *Store) BeginBulkLoad() {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -274,8 +282,10 @@ func (s *Store) beginBulkLoadLocked() {
 		return
 	}
 
-	// Gate to a genuinely first/empty index.
-	if !nodesTableEmpty(ctx, conn) {
+	// Nodes alone are not a cold-store proof. A degraded warm store can have
+	// zero nodes while retaining millions of edges, and sidecar receipts prove
+	// an incremental lifecycle even when both graph tables happen to be empty.
+	if !coldGraphStoreEmpty(ctx, conn) {
 		_ = conn.Close()
 		return
 	}
@@ -293,6 +303,11 @@ func (s *Store) beginBulkLoadLocked() {
 		_ = conn.Close()
 		return
 	}
+	prevAutoCheckpoint, err := pragmaInt(ctx, conn, "wal_autocheckpoint")
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
 
 	// synchronous=OFF drops crash durability for the load window —
 	// acceptable only because a crash on a fresh index just re-indexes.
@@ -302,6 +317,16 @@ func (s *Store) beginBulkLoadLocked() {
 	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", bulkCacheSizeKiB)); err != nil {
 		// Roll the durability change back before bailing.
+		_, _ = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA synchronous = %d", prevSync))
+		_ = conn.Close()
+		return
+	}
+	// Automatic checkpoints can make one large drain unpredictably pay the
+	// accumulated WAL cost mid-transaction. Coordinated checkpoints below are
+	// explicit and bounded; the prior connection-local cadence is restored at
+	// every exit from the proven-fresh bulk window.
+	if _, err := conn.ExecContext(ctx, "PRAGMA wal_autocheckpoint = 0"); err != nil {
+		_, _ = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
 		_, _ = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA synchronous = %d", prevSync))
 		_ = conn.Close()
 		return
@@ -317,29 +342,44 @@ func (s *Store) beginBulkLoadLocked() {
 	s.bulkConn = conn
 	s.bulkPrevSync = prevSync
 	s.bulkPrevCacheSize = prevCache
+	s.bulkPrevAutoCheckpoint = prevAutoCheckpoint
+	s.bulkIndexesDeferred = true
+	s.bulkDeferredNodeRows = 0
+	s.bulkDeferredEdgeRows = 0
+	s.bulkCheckpointNodeRows = 0
+	s.bulkCheckpointEdgeRows = 0
+	s.bulkRowCheckpointBackoff = false
 	// The bulk path changes durability and secondary-index maintenance outside
 	// the ordinary row mutation protocol. Active receipts therefore fail closed.
 	s.markMutationReceiptsIncompleteLocked()
 }
 
 // FlushBulk exits the bulk-load fast path: it rebuilds every dropped index,
-// restores synchronous + cache_size, releases the pinned writer and write gate,
+// restores synchronous + cache_size + wal_autocheckpoint, releases the pinned writer and write gate,
 // then performs one bounded TRUNCATE checkpoint. The ordering matters: the
 // durability checkpoint must run on a NORMAL connection, and it must not wait
 // for a second writer slot while the bulk connection is still pinned.
 func (s *Store) FlushBulk() error {
 	s.writeMu.Lock()
 	if s.coordinatedBulkLoad {
+		// The outer coordinated window owns index sealing and its final
+		// durability checkpoint. WAL pressure inside that window is already
+		// bounded by noteBulkRowsLocked's deterministic row intervals. A nested
+		// repository boundary can coincide with an unrelated read snapshot and
+		// spend the full passive-checkpoint timeout without advancing the WAL;
+		// repeating that timeout once per repository only stalls the cold path.
 		s.writeMu.Unlock()
 		return nil
 	}
 	hadBulk := s.bulkConn != nil
-	flushErr := s.flushBulkLocked()
+	sealErr := s.sealBulkIndexesLocked("flush")
+	closeErr := s.closeBulkConnectionLocked()
+	s.jsonbIngestBuffers.release()
 	s.writeMu.Unlock()
 	if !hadBulk {
-		return flushErr
+		return errors.Join(sealErr, closeErr)
 	}
-	return errors.Join(flushErr, s.checkpointBulkWAL())
+	return errors.Join(sealErr, closeErr, s.checkpointBulkWAL())
 }
 
 // EndCoordinatedBulkLoad closes an outer multi-repository cold-load window.
@@ -368,61 +408,187 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 		s.deferredContentFTS = false
 	}
 	hadBulk := s.bulkConn != nil
-	flushErr := s.flushBulkLocked()
-	// Refresh planner statistics while the write lock is still held and the
-	// droppable indexes are freshly rebuilt: every post-load phase (resolver,
-	// enrichment, global passes) plans against this store, and a store
-	// without sqlite_stat1 rows plans blind (see refreshPlannerStatsLocked).
-	statsStarted := time.Now()
-	statsErr := s.refreshPlannerStatsLocked(context.Background())
-	s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "planner_stats", Name: "analyze", Elapsed: time.Since(statsStarted), Err: statsErr})
-	s.writeMu.Unlock()
-	if !hadBulk {
-		return flushErr
+	sealErr := s.sealBulkIndexesLocked("final")
+	if sealErr != nil {
+		// Keep the pinned connection, deferred-index state, and outer boundary
+		// live so an explicit retry can finish the same durable load. Closing the
+		// connection here would make the failed DDL impossible to retry because
+		// sealBulkIndexesLocked intentionally requires the pinned bulk writer.
+		s.coordinatedBulkLoad = true
+		s.writeMu.Unlock()
+		return sealErr
 	}
-	return errors.Join(flushErr, s.checkpointBulkWAL())
+	// Give the accumulated WAL one longer, still-bounded PASSIVE drain before
+	// planner statistics traverse the large graph indexes. This runs on the
+	// pinned writer under writeMu, so no mutation can race it; PASSIVE still
+	// returns immediately at an old read snapshot instead of waiting for it.
+	if sealErr == nil && hadBulk {
+		_ = s.checkpointBulkWALPassiveLockedWithin("planner_stats_before", bulkPlannerStatsCheckpointTimeout)
+	}
+	// Target only the graph indexes whose statistics alter competing plans:
+	// ANALYZE over every FTS/sidecar or forced graph index pays unrelated B-tree
+	// page counts without changing a query choice.
+	var statsErr error
+	if sealErr == nil && hadBulk {
+		statsStarted := time.Now()
+		statsErr = s.refreshPlannerStatsLocked(context.Background())
+		s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "planner_stats", Name: "nodes_edges", Elapsed: time.Since(statsStarted), Err: statsErr})
+	}
+	closeErr := s.closeBulkConnectionLocked()
+	// The writer gate prevents a competing writer, but it cannot retire a
+	// snapshot held by the read-only pool. RESTART/TRUNCATE invokes SQLite's
+	// busy handler until every such reader leaves the WAL, which made cold
+	// finalization spend its full 10-second deadline while the daemon was
+	// already queryable. PASSIVE copies every currently safe frame without
+	// waiting for readers. Committed WAL frames are durable either way; later
+	// passive checkpoints plus SQLite's next WAL reset/journal_size_limit reclaim
+	// the file after the reader leaves.
+	if hadBulk {
+		ctx, cancel := context.WithTimeout(context.Background(), bulkFinalCheckpointTimeout)
+		started := time.Now()
+		result, err := s.checkpointWALOnce(ctx, "PASSIVE")
+		cancel()
+		// A reader-limited partial PASSIVE checkpoint is expected telemetry, not
+		// a bulk-load failure. Preserve counters in the ordinary checkpoint log.
+		if errors.Is(err, errSQLiteCheckpointIncomplete) {
+			err = nil
+		}
+		s.emitBulkFinalizeEvent(bulkFinalizeEvent{
+			Stage: "checkpoint", Name: "wal_passive", Elapsed: time.Since(started),
+			Busy: result.Busy, WALFrames: result.WALFrames,
+			CheckpointedFrames: result.CheckpointedFrames, Err: err,
+		})
+	}
+	s.jsonbIngestBuffers.release()
+	s.writeMu.Unlock()
+	return errors.Join(sealErr, statsErr, closeErr)
 }
 
-// flushBulkLocked rebuilds indexes and restores the pinned connection. It does
-// not checkpoint: callers must first release both the physical connection and
-// writeMu, then call checkpointBulkWAL.
-func (s *Store) flushBulkLocked() (retErr error) {
+// noteBulkRowsLocked advances independent index-seal and WAL-checkpoint budgets
+// after a committed AddBatch. The caller holds writeMu. A failed seal remains
+// pending and is retried by the next repository/final boundary.
+func (s *Store) noteBulkRowsLocked(nodeRows, edgeRows int) error {
+	if s.bulkConn == nil {
+		return nil
+	}
+	nodeDelta, edgeDelta := int64(nodeRows), int64(edgeRows)
+	if !s.bulkRowCheckpointBackoff {
+		s.bulkCheckpointNodeRows += nodeDelta
+		s.bulkCheckpointEdgeRows += edgeDelta
+	}
+
+	var sealReason string
+	if s.bulkIndexesDeferred {
+		s.bulkDeferredNodeRows += nodeDelta
+		s.bulkDeferredEdgeRows += edgeDelta
+		// The coordinated window is itself a bounded lifecycle: its outer end
+		// is the only dense-index boundary. Sealing at an inner row threshold
+		// makes every later repository maintain the full index set per row,
+		// defeating the point of coordinating the cold load. Ordinary one-shot
+		// bulk loads retain the threshold as protection against an unbounded
+		// final CREATE INDEX tail.
+		if !s.coordinatedBulkLoad {
+			switch {
+			case s.bulkDeferredNodeRows >= bulkIndexSealNodeLimit:
+				sealReason = "node_limit"
+			case s.bulkDeferredEdgeRows >= bulkIndexSealEdgeLimit:
+				sealReason = "edge_limit"
+			}
+		}
+	}
+	if sealReason != "" {
+		return s.sealBulkIndexesLocked(sealReason)
+	}
+	if s.bulkRowCheckpointBackoff {
+		return nil
+	}
+	nodeInterval, edgeInterval := s.bulkCheckpointIntervalsLocked()
+	if s.bulkCheckpointNodeRows >= nodeInterval ||
+		s.bulkCheckpointEdgeRows >= edgeInterval {
+		err := s.checkpointBulkWALPassiveLocked("row_limit")
+		s.noteBulkRowCheckpointResultLocked(err)
+	}
+	return nil
+}
+
+func (s *Store) bulkCheckpointIntervalsLocked() (nodeRows, edgeRows int64) {
+	return bulkCheckpointNodeInterval, bulkCheckpointEdgeInterval
+}
+
+// sealBulkIndexesLocked rebuilds the deferred dense indexes without restoring
+// pragmas or releasing the pinned writer. Ordinary bulk loads may pay one
+// bounded rebuild at a row threshold; coordinated loads rebuild only at their
+// explicit outer boundary. A failed attempt remains pending and can be retried.
+func (s *Store) sealBulkIndexesLocked(reason string) error {
+	conn := s.bulkConn
+	if conn == nil || !s.bulkIndexesDeferred {
+		return nil
+	}
+	s.markMutationReceiptsIncompleteLocked()
+	ctx := context.Background()
+	started := time.Now()
+	var sealErr error
+	// Keep index DDL from repeatedly searching a large uncheckpointed WAL.
+	// The group checkpoints are best-effort telemetry boundaries; DDL errors
+	// still keep the seal retryable.
+	_ = s.checkpointBulkWALPassiveLocked("index_seal_before")
+	for _, idx := range bulkDroppableIndexes {
+		indexStarted := time.Now()
+		_, err := conn.ExecContext(ctx, idx.ddl)
+		s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "index", Name: idx.name, Elapsed: time.Since(indexStarted), Err: err})
+		if err != nil {
+			sealErr = errors.Join(sealErr, fmt.Errorf("store_sqlite: rebuild index %s: %w", idx.name, err))
+		}
+		if idx.name == "nodes_by_repo_language_name" {
+			_ = s.checkpointBulkWALPassiveLocked("index_seal_nodes")
+		}
+	}
+	if sealErr != nil {
+		// A failed seal returns before the coalesced pre-ANALYZE checkpoint.
+		// Preserve the former post-edge drain so a retry does not inherit every
+		// frame emitted by this attempt.
+		_ = s.checkpointBulkWALPassiveLocked("index_seal_edges")
+	}
+	s.emitBulkFinalizeEvent(bulkFinalizeEvent{
+		Stage: "index_seal", Name: reason, Elapsed: time.Since(started),
+		NodeRows: s.bulkDeferredNodeRows, EdgeRows: s.bulkDeferredEdgeRows, Err: sealErr,
+	})
+	if sealErr != nil {
+		return sealErr
+	}
+	s.bulkIndexesDeferred = false
+	return nil
+}
+
+// closeBulkConnectionLocked restores connection-local pragmas and releases the
+// pinned writer. Dense-index rebuilding deliberately lives in
+// sealBulkIndexesLocked so an early seal cannot end the outer window.
+func (s *Store) closeBulkConnectionLocked() error {
 	conn := s.bulkConn
 	if conn == nil {
 		return nil
 	}
-	// Detach first: the fast path is over regardless of the outcome below.
 	s.bulkConn = nil
-	// A receipt may have started after BeginBulkLoad. Rebuilding the dropped
-	// indexes is outside the ordinary row protocol, so that window also fails
-	// closed even when restoration later returns an error.
-	s.markMutationReceiptsIncompleteLocked()
-
 	ctx := context.Background()
-	defer func() {
-		// Restore durability before the connection can return to the max-one
-		// writer pool. The final checkpoint only starts after this defer closes
-		// the pinned handle and the caller releases writeMu.
-		_, syncErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA synchronous = %d", s.bulkPrevSync))
-		_, cacheErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", s.bulkPrevCacheSize))
-		closeErr := conn.Close()
-		retErr = errors.Join(
-			retErr,
-			wrapBulkRestoreError("synchronous", syncErr),
-			wrapBulkRestoreError("cache_size", cacheErr),
-			closeErr,
-		)
-	}()
-
-	for _, idx := range bulkDroppableIndexes {
-		started := time.Now()
-		_, err := conn.ExecContext(ctx, idx.ddl)
-		s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "index", Name: idx.name, Elapsed: time.Since(started), Err: err})
-		if err != nil {
-			return fmt.Errorf("store_sqlite: rebuild index %s: %w", idx.name, err)
-		}
-	}
-	return nil
+	_, syncErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA synchronous = %d", s.bulkPrevSync))
+	_, cacheErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", s.bulkPrevCacheSize))
+	_, autoCheckpointErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", s.bulkPrevAutoCheckpoint))
+	closeErr := conn.Close()
+	s.bulkIndexesDeferred = false
+	s.bulkDeferredNodeRows = 0
+	s.bulkDeferredEdgeRows = 0
+	s.bulkCheckpointNodeRows = 0
+	s.bulkCheckpointEdgeRows = 0
+	s.bulkRowCheckpointBackoff = false
+	s.bulkPrevSync = 0
+	s.bulkPrevCacheSize = 0
+	s.bulkPrevAutoCheckpoint = 0
+	return errors.Join(
+		wrapBulkRestoreError("synchronous", syncErr),
+		wrapBulkRestoreError("cache_size", cacheErr),
+		wrapBulkRestoreError("wal_autocheckpoint", autoCheckpointErr),
+		closeErr,
+	)
 }
 
 func wrapBulkRestoreError(pragma string, err error) error {
@@ -448,15 +614,74 @@ func (s *Store) checkpointBulkWAL() error {
 	return nil
 }
 
-// nodesTableEmpty reports whether the nodes table holds no rows. Used to gate
-// the bulk-load fast path to a genuinely first/empty cold index.
-func nodesTableEmpty(ctx context.Context, conn *sql.Conn) bool {
-	var one int
-	err := conn.QueryRowContext(ctx, "SELECT 1 FROM nodes LIMIT 1").Scan(&one)
-	return errors.Is(err, sql.ErrNoRows)
+// checkpointBulkWALPassiveLocked is a best-effort repository boundary while
+// the bulk writer remains pinned. PASSIVE never waits for readers and failure
+// is telemetry-only; the NORMAL-connection TRUNCATE at final close remains the
+// durability boundary.
+func (s *Store) checkpointBulkWALPassiveLocked(boundary string) error {
+	return s.checkpointBulkWALPassiveLockedWithin(boundary, s.passiveCheckpointWindow())
 }
 
-// pragmaInt reads a single-integer PRAGMA (synchronous, cache_size) off the
+func (s *Store) checkpointBulkWALPassiveLockedWithin(boundary string, window time.Duration) error {
+	if s.bulkConn == nil {
+		return nil
+	}
+	nodeRows, edgeRows := s.bulkCheckpointNodeRows, s.bulkCheckpointEdgeRows
+
+	ctx, cancel := context.WithTimeout(context.Background(), window)
+	defer cancel()
+	started := time.Now()
+	result, err := checkpointWALOnceOn(ctx, s.bulkConn, "PASSIVE")
+	// Every bounded attempt consumes one cadence unit, so its counters reset even
+	// when timeout/contention provides no reliable progress. Coordinated loads
+	// then back off later automatic row-limit attempts; the explicit final
+	// checkpoint remains the durability and WAL-drain boundary.
+	s.bulkCheckpointNodeRows = 0
+	s.bulkCheckpointEdgeRows = 0
+	s.emitBulkFinalizeEvent(bulkFinalizeEvent{
+		Stage: "checkpoint_passive", Name: boundary, Elapsed: time.Since(started),
+		NodeRows: nodeRows, EdgeRows: edgeRows,
+		Busy: result.Busy, WALFrames: result.WALFrames,
+		CheckpointedFrames: result.CheckpointedFrames, Err: err,
+	})
+	return err
+}
+
+// noteBulkRowCheckpointResultLocked backs off repeated automatic attempts only
+// within the current coordinated lifecycle. Explicit checkpoint boundaries do
+// not call it and therefore remain independent of the automatic cadence.
+func (s *Store) noteBulkRowCheckpointResultLocked(err error) {
+	if s.coordinatedBulkLoad && shouldBackoffBulkRowCheckpoint(err) {
+		s.bulkRowCheckpointBackoff = true
+	}
+}
+
+func shouldBackoffBulkRowCheckpoint(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || isSQLiteBusyErr(err) {
+		return true
+	}
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &timeout) && timeout.Timeout()
+}
+
+// coldGraphStoreEmpty proves this is a fresh, never-indexed store. Nodes and
+// edges must both be empty, and neither durable warm-restart sidecar may carry
+// prior lifecycle state. Any query error fails closed to the ordinary indexed
+// writer path.
+func coldGraphStoreEmpty(ctx context.Context, conn *sql.Conn) bool {
+	var empty int
+	err := conn.QueryRowContext(ctx, `
+SELECT NOT EXISTS(SELECT 1 FROM nodes)
+   AND NOT EXISTS(SELECT 1 FROM edges)
+   AND NOT EXISTS(SELECT 1 FROM file_mtimes)
+   AND NOT EXISTS(SELECT 1 FROM repo_index_state)`).Scan(&empty)
+	return err == nil && empty == 1
+}
+
+// pragmaInt reads a single-integer PRAGMA (synchronous, cache_size, wal_autocheckpoint) off the
 // given connection.
 func pragmaInt(ctx context.Context, conn *sql.Conn, pragma string) (int64, error) {
 	var v int64

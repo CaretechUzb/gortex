@@ -344,40 +344,28 @@ type frameworkEdgeCensus struct {
 // walked once here for their consumers instead of once per pass.
 func collectFrameworkEdgeCensus(g graph.Store, streams *frameworkStreamCandidates) frameworkEdgeCensus {
 	census := frameworkEdgeCensus{valid: true, via: map[string]bool{}}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if e == nil {
-			continue
-		}
+	for e := range graph.FrameworkCensusEdgesSeq(g, graph.EdgeCalls) {
 		streams.collectCalls(e)
 		if isSetStateTarget(e.To) {
 			census.setStateTarget = true
 		}
-		if e.Meta == nil {
-			continue
-		}
-		if via, _ := e.Meta["via"].(string); via != "" {
-			census.via[via] = true
-			if via == objectRegistryVia && !census.objectRegistryValue {
-				if value, _ := e.Meta["registry_value"].(string); value != "" {
-					census.objectRegistryValue = true
-				}
+		if e.Via != "" {
+			census.via[e.Via] = true
+			if e.Via == objectRegistryVia && !census.objectRegistryValue && e.RegistryValue != "" {
+				census.objectRegistryValue = true
 			}
-			if via == "grpc.stub" && !census.grpcStub {
-				service, _ := e.Meta["grpc_service"].(string)
-				method, _ := e.Meta["grpc_method"].(string)
-				if service != "" && method != "" {
-					census.grpcStub = true
-				}
+			if e.Via == "grpc.stub" && !census.grpcStub && e.GRPCService != "" && e.GRPCMethod != "" {
+				census.grpcStub = true
 			}
-			if !census.temporalVia && strings.HasPrefix(via, "temporal.") {
+			if !census.temporalVia && strings.HasPrefix(e.Via, "temporal.") {
 				census.temporalVia = true
 			}
 		}
 		if graph.IsUnresolvedTarget(e.To) {
-			if _, ok := e.Meta["express_handler_ref"]; ok {
+			if e.HasExpressHandlerRef {
 				census.expressHandlerRef = true
 			}
-			if recv, _ := e.Meta["recv_const"].(string); recv != "" {
+			if e.RecvConst != "" {
 				census.recvConst = true
 			}
 		}
@@ -387,10 +375,7 @@ func collectFrameworkEdgeCensus(g graph.Store, streams *frameworkStreamCandidate
 		// themselves, so the presence probe's break-on-first-hit walk
 		// becomes one full collection walk of this small kind — replacing
 		// the pass's own EdgeAnnotated scan.
-		for e := range g.EdgesByKind(graph.EdgeAnnotated) {
-			if e == nil {
-				continue
-			}
+		for e := range graph.FrameworkCensusEdgesSeq(g, graph.EdgeAnnotated) {
 			if role, member := temporalRoleForJavaAnnotation(e.To); role != "" || member != "" {
 				streams.addAnnotated(e)
 			}
@@ -399,10 +384,7 @@ func collectFrameworkEdgeCensus(g graph.Store, streams *frameworkStreamCandidate
 			census.temporalAnnotation = streams.annotatedCount() > 0
 		}
 	} else if !census.temporalVia {
-		for e := range g.EdgesByKind(graph.EdgeAnnotated) {
-			if e == nil {
-				continue
-			}
+		for e := range graph.FrameworkCensusEdgesSeq(g, graph.EdgeAnnotated) {
 			if role, member := temporalRoleForJavaAnnotation(e.To); role != "" || member != "" {
 				census.temporalAnnotation = true
 				break
@@ -410,10 +392,7 @@ func collectFrameworkEdgeCensus(g graph.Store, streams *frameworkStreamCandidate
 		}
 	}
 	if streams.wantsRefs() {
-		for e := range g.EdgesByKind(graph.EdgeReferences) {
-			if e == nil {
-				continue
-			}
+		for e := range graph.FrameworkCensusEdgesSeq(g, graph.EdgeReferences) {
 			streams.collectRefs(e)
 		}
 	}
@@ -453,16 +432,15 @@ func summarizeFrameworkCandidatesCensus(
 		allMarkers:    map[string]int{},
 		scopedMarkers: map[string]int{},
 	}
-	// fullCensus: the summary may treat the store as fully covered. True on a
-	// nil scope (the classic cold form) or under the daemon's full-coverage
-	// attestation. filePaths narrows an incremental frontier and is never
-	// combined with the attestation.
-	fullCensus := scope == nil || (censusEligible && len(filePaths) == 0)
+	// fullCensus: the summary may treat the store as fully covered only when
+	// there is no exact changed-file frontier. A nil repository scope can mean
+	// the empty-prefix single-repository shape; filePaths must still win.
+	fullCensus := len(filePaths) == 0 && (scope == nil || censusEligible)
 	summary.fullCensus = fullCensus
 	var observerRoles map[string]uint8
 	observerRolesOverflow := false
 	var nodes iter.Seq[*graph.Node]
-	if scope != nil && !fullCensus {
+	if !fullCensus {
 		nodes = graph.NodesLightInScopeSeq(g, frameworkScopePrefixes(scope), filePaths)
 	} else {
 		nodes = graph.NodesLightSeq(g)
@@ -485,14 +463,14 @@ func summarizeFrameworkCandidatesCensus(
 				observerRolesOverflow = true
 			}
 		}
-		if scope != nil {
+		if !fullCensus {
 			recordFrameworkNodeCandidates(summary.scopedMarkers, n, family)
 		}
 		if family == "" {
 			continue
 		}
 		summary.all[family]++
-		if scope != nil {
+		if !fullCensus {
 			summary.scoped[family]++
 		}
 	}
@@ -577,7 +555,7 @@ func summarizeFrameworkCandidatesCensus(
 		// admission further), then run the census edge walks as the single
 		// candidate dispatcher for every armed pass.
 		present, markers := summary.all, summary.allMarkers
-		if scope != nil {
+		if !fullCensus {
 			present, markers = summary.scoped, summary.scopedMarkers
 		}
 		summary.streams = newFrameworkStreamCandidates(g, present, markers)
@@ -994,7 +972,7 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// UIKit directory-convention fallback: a residual `*ViewController` /
 		// `*Cell` / `*Delegate` / `*DataSource` reference binds to its
 		// /ViewControllers/ /Cells/ /Delegates/ definition.
-		synthFunc{name: SynthUIKitResolve, fn: ResolveUIKitRefs},
+		synthFunc{name: SynthUIKitResolve, fn: ResolveUIKitRefs, candFn: resolveUIKitRefs},
 		// Vapor directory-convention fallback: a residual `*Controller` /
 		// `*Middleware` reference binds to its /Controllers/ /Middleware/
 		// definition. After UIKit so `*ViewController` binds there first.
@@ -1017,29 +995,39 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// value-position function identifier to its same-file definition and
 		// drops unbound candidates. The per-language capture feeds it via
 		// placeholder edges; the pass is inert until those land.
-		synthFunc{name: SynthFnValue, fn: ResolveFnValueCallbacks, scopedFn: ResolveFnValueCallbacksScoped},
+		synthFunc{name: SynthFnValue, fn: ResolveFnValueCallbacks},
 		// Pascal unit ↔ form (.pas/.dfm) pairing by same-dir basename.
 		synthFunc{name: SynthPascalFormName, fn: ResolvePascalForms},
 		// Same-file distinctive value references → EdgeReads to the constant,
 		// so a config constant's blast radius reaches every reader.
-		synthFunc{name: SynthValueRefName, fn: ResolveValueRefs, scopedFn: ResolveValueRefsScoped},
+		synthFunc{name: SynthValueRefName, fn: ResolveValueRefs},
 	}
 }
 
 // SynthCount is the per-synthesizer result row in a FrameworkSynthReport.
 type SynthCount struct {
-	Name  string `json:"name"`
-	Edges int    `json:"edges"`
+	Name string `json:"name"`
+	// Edges is the synthesizer's legacy attempted/landed count. Some passes
+	// include already-persisted idempotent results, so it is not an inserted-row
+	// count; the name remains for API compatibility.
+	Edges int `json:"edges"`
 	// Millis is how long this synthesizer's Synthesize call took. Named
 	// passes that land 0 edges are not free — many scan a shared edge/node
 	// kind across the whole graph before concluding there is nothing to
 	// bind — so this rides on every row, not just the ones with edges.
 	Millis int64 `json:"ms,omitempty"`
+	// ScopeRows/ScopeBytes expose the bounded seed plus this pass's private
+	// dependency expansion. They make accidental cross-pass widening visible
+	// without retaining candidate objects after the pass completes.
+	ScopeRows  int `json:"scope_rows,omitempty"`
+	ScopeBytes int `json:"scope_bytes,omitempty"`
 }
 
 // FrameworkSynthReport is the aggregate result of one
 // RunFrameworkSynthesizers invocation.
 type FrameworkSynthReport struct {
+	// Total preserves the legacy sum of per-pass attempted/landed counts. It is
+	// not a durable inserted-edge delta; callers should label it accordingly.
 	Total int          `json:"total"`
 	Per   []SynthCount `json:"per_synthesizer"`
 	// Gated counts synthesized reference/import edges dropped by the
@@ -1062,12 +1050,16 @@ type FrameworkSynthReport struct {
 	// here with every synthesizer gated to zero — the census, not the
 	// synthesizers, owned the pass. It must never be silent again.
 	CensusMillis int64 `json:"census_ms,omitempty"`
-	// ScopeMillis times the scoped-store view construction between the
-	// census and the loop — the last untimed sliver of the pass. A measured
-	// run on a swap-crushed host showed ~437s of pass wall the timed
-	// sections could not account for; every section now reports, so a
-	// recurrence names its owner.
+	// ScopeMillis times the scoped-store seed construction between the census
+	// and the loop. ScopeRows/ScopeBytes describe that immutable seed; each
+	// SynthCount then reports the seed plus only its private expansion.
 	ScopeMillis int64 `json:"scope_ms,omitempty"`
+	ScopeRows   int   `json:"scope_rows,omitempty"`
+	ScopeBytes  int   `json:"scope_bytes,omitempty"`
+	// FullReadCache reports the bounded immutable node/member projection cache
+	// used only by cold/full executions. Scoped incremental passes keep their
+	// exact frontier store and leave this zero-valued.
+	FullReadCache FrameworkFullReadCacheStats `json:"full_read_cache,omitempty"`
 }
 
 // scopedSynthesizer is the optional capability a FrameworkSynthesizer exposes
@@ -1094,7 +1086,7 @@ func RunFrameworkSynthesizers(g graph.Store) FrameworkSynthReport {
 // passes use the changed repositories plus their exact reverse dependency
 // frontier; nil scope retains full/cold whole-graph reconciliation.
 func RunFrameworkSynthesizersScoped(g graph.Store, scope map[string]bool) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, nil, false)
+	return runFrameworkSynthesizersScoped(g, scope, nil, false, true)
 }
 
 // RunFrameworkSynthesizersScopedWithCensus is the full-coverage batch form:
@@ -1108,7 +1100,7 @@ func RunFrameworkSynthesizersScopedWithCensus(
 	scope map[string]bool,
 	censusEligible bool,
 ) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, nil, censusEligible)
+	return runFrameworkSynthesizersScoped(g, scope, nil, censusEligible, true)
 }
 
 // RunFrameworkSynthesizersScopedForFiles is the exact incremental form. The
@@ -1119,8 +1111,28 @@ func RunFrameworkSynthesizersScopedForFiles(
 	g graph.Store,
 	scope map[string]bool,
 	filePaths []string,
+	csharpHierarchyChanged bool,
 ) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, filePaths, false)
+	return runFrameworkSynthesizersScoped(g, scope, filePaths, false, csharpHierarchyChanged)
+}
+
+func frameworkScopeForFiles(
+	g graph.Store,
+	scope map[string]bool,
+	filePaths []string,
+) map[string]bool {
+	if scope != nil || g == nil || len(filePaths) == 0 {
+		return scope
+	}
+	recovered := map[string]bool{}
+	for _, nodes := range g.GetFileNodesByPaths(filePaths) {
+		for _, node := range nodes {
+			if node != nil {
+				recovered[node.RepoPrefix] = true
+			}
+		}
+	}
+	return recovered
 }
 
 func runFrameworkSynthesizersScoped(
@@ -1128,34 +1140,52 @@ func runFrameworkSynthesizersScoped(
 	scope map[string]bool,
 	filePaths []string,
 	censusEligible bool,
+	csharpHierarchyChanged bool,
 ) FrameworkSynthReport {
 	rep := FrameworkSynthReport{}
 	if g == nil {
 		return rep
 	}
+	// A changed-file frontier is always partial, even when a legacy caller lost
+	// its repository prefix (notably the empty-prefix single-repository shape).
+	// Recover the owning prefixes from the exact file rows so tail claimers keep
+	// their repository boundary without promoting the census to a global scan.
+	effectiveScope := frameworkScopeForFiles(g, scope, filePaths)
 	censusStart := time.Now()
-	candidates := summarizeFrameworkCandidatesCensus(g, scope, filePaths, censusEligible)
+	candidates := summarizeFrameworkCandidatesCensus(g, effectiveScope, filePaths, censusEligible)
 	rep.CensusMillis = time.Since(censusStart).Milliseconds()
+
+	// A full-census attestation means the supplied repository scope covers the
+	// entire store. Execute it through the established nil-scope paths: bespoke
+	// scoped synthesizers and tail passes otherwise turn the all-repository set
+	// into repeated repo -> node -> edge probes. True partial runs retain their
+	// repository and file frontier unchanged.
+	executionScope := effectiveScope
+	if candidates.fullCensus {
+		executionScope = nil
+	}
+
 	scopeStart := time.Now()
-	var genericScope graph.Store
-	if scope != nil {
-		if censusEligible && len(filePaths) == 0 {
-			// Full-coverage attestation: the scoped view of every tracked
-			// repository IS the store. The wrapper exists to bound a partial
-			// run's reads (per-row scope checks, incident retention, frontier
-			// seeding); on a cold / full-reconciliation batch it is pure
-			// per-row overhead paid by every legacy synthesizer stream.
-			genericScope = g
-		} else {
-			genericScope = newFrameworkScopedStore(g, scope, filePaths)
-		}
+	var genericSeed *frameworkScopedSeed
+	var fullReadCache *frameworkFullReadCache
+	if executionScope != nil {
+		genericSeed = newFrameworkScopedSeed(g, executionScope, filePaths)
+		rep.ScopeRows = genericSeed.retainedRows
+		rep.ScopeBytes = genericSeed.retainedBytes
+	} else {
+		// Node declarations are immutable throughout the framework registry.
+		// Share their decoded projections across passes under a hard run-local
+		// budget; the per-pass edge facade invalidates on any future node/member
+		// mutation so this optimization cannot return stale declaration state.
+		fullReadCache = newFrameworkFullReadCache()
 	}
 	rep.ScopeMillis = time.Since(scopeStart).Milliseconds()
 	for _, s := range defaultFrameworkSynthesizers() {
 		start := time.Now()
 		var n int
 		var bundle *frameworkPassCandidates
-		if shouldRunFrameworkSynthesizer(s, scope, candidates) {
+		var passScope *frameworkScopedStore
+		if shouldRunFrameworkSynthesizer(s, executionScope, candidates) {
 			if sf, ok := s.(synthFunc); ok {
 				bundle = candidates.streams.passStreams(g, sf.name)
 				switch {
@@ -1163,30 +1193,42 @@ func runFrameworkSynthesizersScoped(
 					// Shared-stream form. streams exist only on a full-census
 					// run, where the execution store is the raw g for both
 					// the nil-scope and the attested full-coverage shapes.
-					n = runLegacyFrameworkSynth(g, func(store graph.Store) int {
+					n = runLegacyFrameworkSynthWithCache(g, fullReadCache, func(store graph.Store) int {
 						return sf.candFn(store, bundle)
 					})
-				case scope == nil:
-					n = runLegacyFrameworkSynth(g, sf.fn)
+				case executionScope == nil:
+					n = runLegacyFrameworkSynthWithCache(g, fullReadCache, sf.fn)
 				case sf.scopedFn != nil:
-					n = sf.scopedFn(g, scope)
+					n = sf.scopedFn(g, executionScope)
 				default:
-					n = runLegacyFrameworkSynth(genericScope, sf.fn)
+					passScope = genericSeed.newPassStore()
+					n = runLegacyFrameworkSynth(passScope, sf.fn)
 				}
 			} else if ss, ok := s.(scopedSynthesizer); ok {
-				n = runLegacyFrameworkSynth(g, func(store graph.Store) int {
-					return ss.synthesizeScoped(store, scope)
+				n = runLegacyFrameworkSynthWithCache(g, fullReadCache, func(store graph.Store) int {
+					return ss.synthesizeScoped(store, executionScope)
 				})
-			} else if scope == nil {
-				n = runLegacyFrameworkSynth(g, s.Synthesize)
+			} else if executionScope == nil {
+				n = runLegacyFrameworkSynthWithCache(g, fullReadCache, s.Synthesize)
 			} else {
 				panic("framework partial run has an unscoped synthesizer: " + s.Name())
 			}
 		}
-		rep.Per = append(rep.Per, SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds()})
+		count := SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds()}
+		if passScope != nil {
+			stats := passScope.stats()
+			count.ScopeRows = stats.RetainedRows
+			count.ScopeBytes = stats.RetainedBytes
+		}
+		rep.Per = append(rep.Per, count)
 		rep.Total += n
 		candidates.streams.releasePass(s.Name(), bundle)
 	}
+	// Capture observability before dropping the run-local cache. Tail gates and
+	// claiming resolvers use different projections and must not prolong its
+	// lifetime beyond the serial framework registry.
+	rep.FullReadCache = fullReadCache.stats()
+	fullReadCache = nil
 	// The registry consumed or discarded every armed buffer. Release the
 	// shared node snapshot before the independent tail gates and claimers run.
 	candidates.streams = nil
@@ -1194,8 +1236,8 @@ func runFrameworkSynthesizersScoped(
 	// the claiming resolvers run, so a gated edge cannot be mistaken for a
 	// resolved placeholder downstream. Bridge synthesizers are exempt.
 	gateStart := time.Now()
-	if frameworkFamilyGateNeeded(scope, candidates) {
-		rep.Gated = applyFrameworkFamilyGateScoped(g, scope)
+	if frameworkFamilyGateNeeded(executionScope, candidates) {
+		rep.Gated = applyFrameworkFamilyGateScopedForFiles(g, executionScope, filePaths)
 	}
 	rep.GateMillis = time.Since(gateStart).Milliseconds()
 	// Claiming resolvers run last — after every framework synthesizer has
@@ -1203,7 +1245,7 @@ func runFrameworkSynthesizersScoped(
 	// external-call synthesis classifies the residual unresolved refs as
 	// external. Reported in registration order for determinism.
 	claimStart := time.Now()
-	claimed := RunClaimingResolversScoped(g, scope)
+	claimed := RunClaimingResolversScoped(g, executionScope)
 	rep.ClaimMillis = time.Since(claimStart).Milliseconds()
 	for _, r := range defaultClaimingResolvers() {
 		n := claimed[r.Name()]
@@ -1213,8 +1255,10 @@ func runFrameworkSynthesizersScoped(
 	// Receiver-type gate runs last: it corrects (demotes) already-bound C#
 	// member calls, so it must see the settled call graph.
 	demoteStart := time.Now()
-	if frameworkReceiverGateNeeded(scope, candidates) {
-		rep.ReceiverGated = demoteCSharpMisattributedMemberCallsScoped(g, scope)
+	if frameworkReceiverGateNeeded(executionScope, candidates) {
+		rep.ReceiverGated = demoteCSharpMisattributedMemberCallsScopedForFiles(
+			g, executionScope, filePaths, csharpHierarchyChanged,
+		)
 	}
 	rep.DemoteMillis = time.Since(demoteStart).Milliseconds()
 	return rep
@@ -1297,10 +1341,24 @@ type claimTargetVocabulary interface {
 	AdmitsTarget(n *graph.Node) bool
 }
 
+// claimEdgeVocabulary exhaustively enumerates the unresolved names a resolver
+// can claim. Scoped runs use these names for reverse-index lookups; full runs
+// filter the bounded unresolved-identity scan before exact row refetch. Neither
+// path decodes unrelated call/reference payloads. Resolvers with an unbounded
+// vocabulary must omit this interface so discovery fails open to the complete
+// unresolved-edge scan.
+type claimEdgeVocabulary interface {
+	ClaimedUnresolvedNames() []string
+}
+
 // RequiredTargetNames: a Django descriptor claim binds only to an indexed
 // __iter__ method; without one, ResolveBatch resolves nothing.
 func (DjangoDescriptorResolver) RequiredTargetNames() []string {
 	return []string{"__iter__"}
+}
+
+func (DjangoDescriptorResolver) ClaimedUnresolvedNames() []string {
+	return []string{"_iterable_class", "*._iterable_class"}
 }
 
 // AdmitsTarget reports whether an __iter__ candidate has the method shape
@@ -1326,6 +1384,124 @@ func claimingResolverAdmissible(g graph.Store, r ClaimingResolver) bool {
 			if n != nil && vocab.AdmitsTarget(n) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func scopedClaimingCandidates(g graph.Store, scope map[string]bool, resolvers []ClaimingResolver) []*graph.Edge {
+	names := make([]string, 0, len(resolvers))
+	seenNames := make(map[string]struct{}, len(resolvers))
+	for _, resolver := range resolvers {
+		vocabulary, ok := resolver.(claimEdgeVocabulary)
+		if !ok {
+			return unresolvedClaimingCandidates(g, scope)
+		}
+		for _, name := range vocabulary.ClaimedUnresolvedNames() {
+			if name == "" {
+				continue
+			}
+			if _, duplicate := seenNames[name]; duplicate {
+				continue
+			}
+			seenNames[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+
+	materialize := func(identities []graph.EdgeIdentity) []*graph.Edge {
+		current := findFrameworkEdgesByIdentities(g, identities)
+		pending := make([]*graph.Edge, 0, len(identities))
+		for _, identity := range identities {
+			edge := current[identity]
+			if claimingCandidateInScope(edge, scope, resolvers) {
+				pending = append(pending, edge)
+			}
+		}
+		return pending
+	}
+
+	if scope == nil {
+		scanner, ok := g.(graph.UnresolvedEdgeIdentityBatchScanner)
+		if !ok {
+			return unresolvedClaimingCandidates(g, scope)
+		}
+		identities := make([]graph.EdgeIdentity, 0)
+		scanner.ScanUnresolvedEdgeIdentitiesBatched(
+			[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}, 512,
+			func(batch []graph.EdgeIdentity) bool {
+				for _, identity := range batch {
+					if _, claimedName := seenNames[graph.UnresolvedName(identity.To)]; claimedName {
+						identities = append(identities, identity)
+					}
+				}
+				return true
+			},
+		)
+		return materialize(identities)
+	}
+
+	prefixes := frameworkScopePrefixes(scope)
+	targetIDs := make([]string, 0, len(names)*(len(prefixes)+1))
+	for _, name := range names {
+		targetIDs = append(targetIDs, graph.UnresolvedMarker+name)
+		for _, prefix := range prefixes {
+			targetIDs = append(targetIDs, prefix+"::"+graph.UnresolvedMarker+name)
+		}
+	}
+
+	incoming := g.GetInEdgesByNodeIDs(targetIDs)
+	identities := make([]graph.EdgeIdentity, 0)
+	seen := make(map[graph.EdgeIdentity]struct{})
+	for _, targetID := range targetIDs {
+		for _, edge := range incoming[targetID] {
+			if !claimingCandidateInScope(edge, scope, resolvers) {
+				continue
+			}
+			identity := graph.EdgeIdentityFor(edge)
+			if _, duplicate := seen[identity]; duplicate {
+				continue
+			}
+			seen[identity] = struct{}{}
+			identities = append(identities, identity)
+		}
+	}
+
+	return materialize(identities)
+}
+
+func unresolvedClaimingCandidates(g graph.Store, scope map[string]bool) []*graph.Edge {
+	var pending []*graph.Edge
+	for _, edge := range frameworkRepoEdges(g, scope, graph.EdgeCalls, graph.EdgeReferences) {
+		if edge != nil && edge.To != "" && graph.IsUnresolvedTarget(edge.To) {
+			pending = append(pending, edge)
+		}
+	}
+	return pending
+}
+
+func claimingCandidateInScope(edge *graph.Edge, scope map[string]bool, resolvers []ClaimingResolver) bool {
+	if edge == nil || edge.To == "" || !graph.IsUnresolvedTarget(edge.To) {
+		return false
+	}
+	if edge.Kind != graph.EdgeCalls && edge.Kind != graph.EdgeReferences {
+		return false
+	}
+	if scope != nil {
+		prefix := graph.RepoPrefixOfID(edge.From)
+		if !scope[prefix] {
+			prefix = graph.RepoPrefixOfID(edge.FilePath)
+			if !scope[prefix] {
+				return false
+			}
+		}
+	}
+	for _, resolver := range resolvers {
+		if resolver.Claims(edge) {
+			return true
 		}
 	}
 	return false
@@ -1369,12 +1545,7 @@ func RunClaimingResolversScoped(g graph.Store, scope map[string]bool) map[string
 	if len(admissible) == 0 {
 		return out
 	}
-	var pending []*graph.Edge
-	for _, e := range frameworkRepoEdges(g, scope, graph.EdgeCalls, graph.EdgeReferences) {
-		if e != nil && e.To != "" && graph.IsUnresolvedTarget(e.To) {
-			pending = append(pending, e)
-		}
-	}
+	pending := scopedClaimingCandidates(g, scope, admissible)
 	claimed := make(map[*graph.Edge]bool)
 	for _, r := range admissible {
 		candidates := make([]*graph.Edge, 0, len(pending))

@@ -14,16 +14,18 @@ import (
 // (`this.m` / `self.m` / Kotlin `::m`), a concrete type name when the syntax
 // names one (`Foo::bar`), or "" when the name resolves repo-wide (a selector).
 //
-// Forms handled: Java `method_reference` (`Foo::bar`, `this::bar`), Kotlin
-// `callable_reference` (`::m`, `Foo::m`), `this.`/`self.` member access in
-// JS/TS/Python/C#, Ruby `method(:sym)` and `&:sym`, and Swift/ObjC
+// Forms handled: Java `method_reference` (`Foo::bar`, `this::bar`, `Foo::new`),
+// Kotlin `callable_reference` (`::m`, `Foo::m`), `this.`/`self.` member access
+// in JS/TS/Python/C#, Ruby `method(:sym)` and `&:sym`, and Swift/ObjC
 // `#selector(...)` / `@selector(...)`.
 func normalizeFnRefSpecial(n *sitter.Node, src []byte) (refName, recvHint string, ok bool) {
 	switch n.Type() {
 	case "method_reference":
-		return splitColonColonRef(n, src)
+		// Java is the only grammar with this node type, and its `Foo::new`
+		// constructor form names a real indexed member (`<Type>.<init>`).
+		return splitColonColonRef(n, src, true)
 	case "callable_reference":
-		return splitColonColonRef(n, src)
+		return splitColonColonRef(n, src, false)
 	case "member_expression": // JS / TS
 		return selfMemberAccess(n, src, "object", "property")
 	case "attribute": // Python
@@ -44,7 +46,9 @@ func normalizeFnRefSpecial(n *sitter.Node, src []byte) (refName, recvHint string
 
 // splitColonColonRef handles a `::`-style callable reference: the trailing
 // identifier is the member, an optional leading type/expression the qualifier.
-func splitColonColonRef(n *sitter.Node, src []byte) (refName, recvHint string, ok bool) {
+// With ctorRefs set, a `Type::new` constructor reference resolves to that
+// type's `<Type>.<init>` member instead of being rejected.
+func splitColonColonRef(n *sitter.Node, src []byte, ctorRefs bool) (refName, recvHint string, ok bool) {
 	var first, last *sitter.Node
 	for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
 		c := n.NamedChild(i)
@@ -59,6 +63,19 @@ func splitColonColonRef(n *sitter.Node, src []byte) (refName, recvHint string, o
 	if last == nil {
 		return "", "", false
 	}
+	// `Foo::new` — `new` is an anonymous token, so the type is the node's only
+	// named child and the trailing-identifier rule below would mistake the type
+	// itself for the member. The reference targets Foo's constructor, which the
+	// Java extractor indexes as the `Foo.<init>` method of Foo.
+	if ctorRefs && colonColonRefIsCtor(n, src) {
+		ty := colonColonQualifier(first.Content(src))
+		// `String[]::new` allocates an array — there is no declared
+		// constructor to reference.
+		if ty == "" || strings.ContainsAny(ty, "[]") {
+			return "", "", false
+		}
+		return ty + ".<init>", ty, true
+	}
 	member := strings.TrimSpace(last.Content(src))
 	if member == "" || member == "new" {
 		return "", "", false
@@ -70,9 +87,45 @@ func splitColonColonRef(n *sitter.Node, src []byte) (refName, recvHint string, o
 		if q == "this" || q == "self" {
 			return member, "<self>", true
 		}
-		return member, q, true
+		return member, colonColonQualifier(q), true
 	}
 	return member, "<self>", true
+}
+
+// colonColonRefIsCtor reports whether a `::` reference names a constructor —
+// its member position is the `new` keyword. Read off the source rather than the
+// child list because `new` is an anonymous token with no named node, and an
+// explicit type witness (`Foo::<T>new`) sits between the `::` and it.
+func colonColonRefIsCtor(n *sitter.Node, src []byte) bool {
+	text := strings.TrimSpace(n.Content(src))
+	i := strings.LastIndex(text, "::")
+	if i < 0 {
+		return false
+	}
+	rest := strings.TrimSpace(text[i+2:])
+	if strings.HasPrefix(rest, "<") {
+		if j := strings.LastIndex(rest, ">"); j >= 0 {
+			rest = strings.TrimSpace(rest[j+1:])
+		}
+	}
+	return rest == "new"
+}
+
+// colonColonQualifier reduces the qualifier of a `::` reference to the simple
+// type name methods are indexed under: `app.Outer.Inner` → `Inner`,
+// `Wrapper<String>` → `Wrapper`. Without this an import-qualified or nested
+// type never matches a method's receiver and the reference falls back to a
+// repo-wide unique-or-drop lookup, which silently drops every non-unique name.
+// A qualifier naming a value rather than a type (`instance`) is unchanged.
+func colonColonQualifier(q string) string {
+	q = strings.TrimSpace(q)
+	if i := strings.Index(q, "<"); i >= 0 {
+		q = strings.TrimSpace(q[:i])
+	}
+	if i := strings.LastIndex(q, "."); i >= 0 {
+		q = strings.TrimSpace(q[i+1:])
+	}
+	return q
 }
 
 // selfMemberAccess handles a `this.m` / `self.m` member access: the object must

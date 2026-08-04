@@ -22,50 +22,6 @@ func testEvidenceDigest() *localizationEvidenceDigest {
 	})
 }
 
-func requireLocalizationTerminalError(t *testing.T, result *mcpgo.CallToolResult, facade, operation string) localizationTerminalContract {
-	t.Helper()
-	if result == nil || !result.IsError {
-		t.Fatalf("terminal result = %#v, want typed MCP error", result)
-	}
-	text, ok := singleTextContent(result)
-	if !ok {
-		t.Fatalf("terminal result content = %#v, want one text block", result.Content)
-	}
-	var payload struct {
-		ErrorCode ErrorCode `json:"error_code"`
-		Message   string    `json:"message"`
-		Retriable bool      `json:"retriable"`
-		Data      struct {
-			Contract  localizationTerminalContract `json:"contract"`
-			Facade    string                       `json:"facade"`
-			Operation string                       `json:"operation"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(text), &payload); err != nil {
-		t.Fatalf("decode terminal error %q: %v", text, err)
-	}
-	var wire map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(text), &wire); err != nil {
-		t.Fatalf("decode terminal error wire %q: %v", text, err)
-	}
-	if raw, exists := wire["retriable"]; !exists || string(raw) != "false" {
-		t.Fatalf("terminal error must explicitly encode retriable=false: %s", text)
-	}
-	if payload.ErrorCode != ErrCodeLocalizationTerminal || payload.Message == "" || payload.Retriable {
-		t.Fatalf("terminal error = %#v", payload)
-	}
-	if payload.Data.Facade != facade || payload.Data.Operation != operation {
-		t.Fatalf("terminal error route = %q/%q, want %q/%q", payload.Data.Facade, payload.Data.Operation, facade, operation)
-	}
-	contract := payload.Data.Contract
-	if !contract.Terminal || contract.Completion.State != localizationStateAnswerReady ||
-		contract.Completion.ContractVersion != localizationTerminalContractV2 ||
-		contract.Completion.AllowedToolCalls != 0 {
-		t.Fatalf("terminal contract = %#v", contract)
-	}
-	return contract
-}
-
 func requireLocalizationTerminalReplay(t *testing.T, result *mcpgo.CallToolResult, _, _ string) localizationTerminalContract {
 	t.Helper()
 	if result == nil || result.IsError {
@@ -253,7 +209,7 @@ func TestDigestLifecycleAndLegacyFallback(t *testing.T) {
 	requireLocalizationTerminalReplay(t, blocked, "search", "symbols")
 }
 
-func TestDigestByteCapShedsEvidenceTail(t *testing.T) {
+func TestDigestByteCapShedsOptionalMetadataBeforeEvidenceTail(t *testing.T) {
 	envelope := localizationExploreEnvelope{}
 	for i := 0; i < 400; i++ {
 		envelope.Evidence = append(envelope.Evidence, localizationEvidence{
@@ -273,8 +229,17 @@ func TestDigestByteCapShedsEvidenceTail(t *testing.T) {
 	if len(encoded) > localizationDigestMaxBytes {
 		t.Fatalf("digest = %d bytes, want <= %d", len(encoded), localizationDigestMaxBytes)
 	}
-	if len(digest.Evidence) == 0 || len(digest.Evidence) >= localizationReplayEvidenceLimit {
-		t.Fatalf("byte cap retained %d rows, want a non-empty shed prefix", len(digest.Evidence))
+	if len(digest.Evidence) != localizationReplayEvidenceLimit {
+		t.Fatalf("byte cap retained %d rows, want all %d declaration identities", len(digest.Evidence), localizationReplayEvidenceLimit)
+	}
+	stripped := 0
+	for _, row := range digest.Evidence {
+		if row.Signature == "" {
+			stripped++
+		}
+	}
+	if stripped == 0 {
+		t.Fatal("byte cap retained every optional signature instead of compacting metadata")
 	}
 	if len(digest.Files) != len(digest.Evidence) || len(digest.Symbols) != len(digest.Evidence) {
 		t.Fatalf("files=%d symbols=%d evidence=%d, want positional rows", len(digest.Files), len(digest.Symbols), len(digest.Evidence))
@@ -480,11 +445,11 @@ func TestLocalizationCompletionReconcilesShedAllowedSymbols(t *testing.T) {
 		if len(digest.Evidence) != 0 {
 			t.Fatalf("pathological identity survived digest: %#v", digest.Evidence)
 		}
-		if bounded.State != localizationStateAnswerReady || bounded.RequiredAction != "respond" || bounded.AllowedToolCalls != 0 || len(bounded.AllowedSymbols) != 0 {
-			t.Fatalf("empty authorization did not use advisory fallback: %#v", bounded)
+		if bounded.State != localizationStateLocalized || bounded.RequiredAction != "continue_task" || bounded.AllowedToolCalls != 0 || len(bounded.AllowedSymbols) != 0 {
+			t.Fatalf("empty authorization did not use nonterminal advisory fallback: %#v", bounded)
 		}
-		if bounded.FinalResponse == "" {
-			t.Fatal("advisory fallback omitted bounded final response")
+		if bounded.FinalResponse != "" {
+			t.Fatalf("empty evidence should not manufacture a provisional identity page: %q", bounded.FinalResponse)
 		}
 	})
 }
@@ -606,8 +571,8 @@ func TestDigestDowngradesAuthorizationWhenDependencyCannotFit(t *testing.T) {
 		if _, retained := localizationDigestRowsByID(digest)[implementation]; retained {
 			t.Fatal("pathological implementation unexpectedly fit the digest")
 		}
-		if bounded.State != localizationStateAnswerReady || len(bounded.AllowedSymbols) != 0 {
-			t.Fatalf("wrapper remained authorized without its implementation: %#v", bounded)
+		if bounded.State != localizationStateLocalized || len(bounded.AllowedSymbols) != 0 || bounded.AllowedToolCalls != 0 {
+			t.Fatalf("missing implementation proof did not release an advisory completion: %#v", bounded)
 		}
 	})
 
@@ -657,7 +622,7 @@ func TestDigestDowngradesAuthorizationWhenDependencyCannotFit(t *testing.T) {
 	})
 }
 
-func TestTaskAwareDigestMergeRetainsLongTailSameOwnerCohort(t *testing.T) {
+func TestTaskAwareDigestMergePromotesLongTailSameOwnerCohortWithoutIdentityLoss(t *testing.T) {
 	const (
 		currentID = "repo/gate.go::BatchGate.drainPending"
 		targetID  = "repo/gate.go::BatchGate.discardPending"
@@ -696,8 +661,8 @@ func TestTaskAwareDigestMergeRetainsLongTailSameOwnerCohort(t *testing.T) {
 		return false
 	}
 	baseline := mergeLocalizationEvidenceDigest([]localizationDigestRow{current}, retained)
-	if contains(baseline, targetID) {
-		t.Fatal("fixture did not force the unrelated tail to shed the coherent target")
+	if !contains(baseline, targetID) {
+		t.Fatal("byte compaction shed a declaration identity before optional metadata")
 	}
 
 	digest := mergeLocalizationEvidenceDigestForTask(

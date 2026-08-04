@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -41,6 +42,8 @@ type preparedExtraction struct {
 	src         []byte
 	result      *parser.ExtractionResult
 	readVersion fileReadVersion
+	parseLease  *parseAdmissionLease
+	releaseOnce sync.Once
 }
 
 // fileDeltaProbe exposes phase timings and the three delta boundaries used by
@@ -61,32 +64,72 @@ type fileDeltaProbe struct {
 // fingerprint gets one conservative structural patch, which stamps the file
 // for subsequent edits.
 func (idx *Indexer) prepareFileDelta(filePath string) (fileDeltaProbe, bool) {
+	probe, ok, _ := idx.prepareFileDeltaWithAdmission(filePath, false)
+	return probe, ok
+}
+
+// prepareFileDeltaWithAdmission optionally attempts shared admission without
+// waiting. Incremental chunks use tryOnly after they retain their first staged
+// result: pressure then returns admissionBusy so the caller can commit and
+// release the partial chunk before retrying this file. The first file in a
+// chunk still waits, guaranteeing progress even when it is larger than the
+// entire budget (its weight is clamped to capacity).
+func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool) (fileDeltaProbe, bool, bool) {
 	var probe fileDeltaProbe
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
-		return probe, false
+		return probe, false, false
 	}
-	relPath := idx.relKey(absPath)
+	var parseLease *parseAdmissionLease
+	if tryOnly {
+		var admitted bool
+		parseLease, admitted = idx.tryAcquireSharedParsePath(absPath)
+		if !admitted {
+			return probe, false, true
+		}
+	} else {
+		parseLease, err = idx.acquireSharedParsePath(absPath)
+		if err != nil {
+			return probe, false, false
+		}
+	}
+	var (
+		result  *parser.ExtractionResult
+		skipped bool
+	)
+	stored := false
+	defer func() {
+		if !stored {
+			result.ReleaseTree()
+			parseLease.Release()
+		}
+	}()
+	// graphRelKey, not relKey: this path is stamped onto node IDs by the
+	// extractor below and becomes the graph key at prefixPath(). relKey
+	// slash-normalises, which on Windows mints "repo/a/b.go" while the
+	// cold walk already stored "repo/a\b.go" — a second node for the
+	// same file rather than an update of the first.
+	relPath := idx.graphRelKey(absPath)
 
 	started := time.Now()
 	src, readVersion, err := readFileWithVersion(absPath)
 	probe.read = time.Since(started)
 	if err != nil {
-		return probe, false
+		return probe, false, false
 	}
 	lang, ok := idx.effectiveLanguage(absPath, src)
 	if !ok {
-		return probe, false
+		return probe, false, false
 	}
 	ext, _ := idx.registry.GetByLanguage(lang)
 	if ext == nil {
-		return probe, false
+		return probe, false, false
 	}
 	if maxSize := idx.config.MaxFileSize; maxSize > 0 && int64(len(src)) > maxSize {
-		return probe, false
+		return probe, false, false
 	}
 	if _, skip := idx.newContentAdmissionGate().skip(lang, int64(len(src))); skip {
-		return probe, false
+		return probe, false, false
 	}
 	src = idx.transforms.run(relPath, src)
 
@@ -96,34 +139,31 @@ func (idx *Indexer) prepareFileDelta(filePath string) (fileDeltaProbe, bool) {
 		pool, quarantine = idx.sharedParsePool()
 	}
 	started = time.Now()
-	result, skipped, err := idx.extractFile(pool, quarantine, absPath, relPath, lang, ext, src)
+	result, skipped, err = idx.extractFileWithRawLease(
+		parseLease, pool, quarantine, absPath, relPath, lang, ext, src,
+	)
 	probe.extract = time.Since(started)
 	if quarantine != nil && quarantine.Len() > 0 {
 		_ = quarantine.Save()
 	}
-	// Ownership of the result's tree-sitter tree — C memory the Go GC
-	// cannot reclaim — passes to idx.prepared only on the success path
-	// at the bottom. Every early return below drops the result on the
-	// floor, so release the tree unless it was stored.
-	stored := false
-	defer func() {
-		if !stored {
-			result.ReleaseTree()
-		}
-	}()
+	// Ownership of the result's tree-sitter tree, source bytes, and shared
+	// admission lease passes to idx.prepared only on the success path below.
+	// The defer releases all three resources on every rejected probe.
 	if result == nil || skipped || err != nil {
-		return probe, false
+		return probe, false, false
 	}
 
-	started = time.Now()
-	idx.applyCoverageDomains(relPath, lang, src, result)
-	probe.coverage = time.Since(started)
+	if !extractionDispositionFor(result).omitSecondarySourceScans() {
+		started = time.Now()
+		idx.applyCoverageDomains(relPath, lang, src, result)
+		probe.coverage = time.Since(started)
+	}
 
 	started = time.Now()
 	fingerprints, derived, ok := extractionFingerprints(result)
 	probe.fingerprintTime = time.Since(started)
 	if !ok {
-		return probe, false
+		return probe, false, false
 	}
 	probe.fingerprints = fingerprints
 	probe.derived = derived
@@ -145,37 +185,42 @@ func (idx *Indexer) prepareFileDelta(filePath string) (fileDeltaProbe, bool) {
 		src:         append([]byte(nil), src...),
 		result:      result,
 		readVersion: readVersion,
+		parseLease:  parseLease,
 	}
 	idx.preparedMu.Unlock()
-	// Released outside the lock: Release closes the tree through cgo.
-	displaced.releaseTree()
+	// Released outside the lock: release closes the tree through cgo and
+	// returns the displaced entry's shared admission capacity.
+	displaced.release()
 	stored = true
 	probe.readVersion = readVersion
-	return probe, true
+	return probe, true, false
 }
 
-// releaseTree drops the prepared extraction's parse tree. Nil-safe on
-// the entry and on the result, so a caller that took a map slot which
-// may or may not have been occupied can call it unconditionally.
-func (p *preparedExtraction) releaseTree() {
+// release drops every resource owned by a prepared extraction. It is nil-safe
+// and idempotent because prepared entries can be released by a deferred batch
+// cleanup after an explicit post-commit release.
+func (p *preparedExtraction) release() {
 	if p == nil {
 		return
 	}
-	p.result.ReleaseTree()
+	p.releaseOnce.Do(func() {
+		p.result.ReleaseTree()
+		p.parseLease.Release()
+	})
 }
 
-func (idx *Indexer) takePreparedExtraction(absPath, relPath, lang string, src []byte) (*parser.ExtractionResult, bool) {
+func (idx *Indexer) takePreparedExtraction(absPath, relPath, lang string, src []byte) (*preparedExtraction, bool) {
 	idx.preparedMu.Lock()
 	prepared := idx.prepared[absPath]
 	delete(idx.prepared, absPath)
 	idx.preparedMu.Unlock()
 	if prepared == nil || prepared.relPath != relPath || prepared.lang != lang || !bytes.Equal(prepared.src, src) {
-		// The entry is already out of the map and the caller gets
-		// nothing, so this is the last reference to its tree.
-		prepared.releaseTree()
+		// The entry is already out of the map and the caller gets nothing,
+		// so this is the last reference to its retained resources.
+		prepared.release()
 		return nil, false
 	}
-	return prepared.result, true
+	return prepared, true
 }
 
 // takePreparedSnapshot consumes the speculative parse without re-reading disk.
@@ -205,14 +250,14 @@ func (idx *Indexer) takePreparedRefresh(filePath string) (*preparedExtraction, b
 	}
 	current, readVersion, err := readFileWithVersion(absPath)
 	if err != nil {
-		prepared.releaseTree()
+		prepared.release()
 		return nil, false
 	}
 	current = idx.transforms.run(prepared.relPath, current)
 	if !bytes.Equal(current, prepared.src) {
 		// The file moved on since the speculative parse; the entry is
-		// already out of the map, so drop its tree with it.
-		prepared.releaseTree()
+		// already out of the map, so drop all retained resources with it.
+		prepared.release()
 		return nil, false
 	}
 	prepared.readVersion = readVersion
@@ -228,8 +273,8 @@ func (idx *Indexer) discardPreparedExtraction(filePath string) {
 	discarded := idx.prepared[absPath]
 	delete(idx.prepared, absPath)
 	idx.preparedMu.Unlock()
-	// Released outside the lock: Release closes the tree through cgo.
-	discarded.releaseTree()
+	// Released outside the lock: release closes the tree through cgo.
+	discarded.release()
 }
 
 type fingerprintMode uint8
@@ -715,7 +760,7 @@ func (idx *Indexer) applyPreparedMetadataRefresh(filePath string, priorNodes []*
 	// so this function owns the tree. Only Nodes/Edges are read from
 	// here on, and every shape-mismatch check below returns early —
 	// release on all of them.
-	defer result.ReleaseTree()
+	defer prepared.release()
 	idx.applyRepoPrefix(result.Nodes, result.Edges)
 	graphPath := idx.prefixPath(prepared.relPath)
 

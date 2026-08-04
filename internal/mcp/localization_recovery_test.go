@@ -171,7 +171,7 @@ func TestRecoveryRejectsDigestOnlyTermFromRG2095Incident(t *testing.T) {
 	}
 }
 
-func TestRecoveryFailureRestoresOnceAndTerminalizesSameResponse(t *testing.T) {
+func TestRecoveryFailureRestoresOnceThenReleasesAdvisory(t *testing.T) {
 	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := WithSessionID(context.Background(), "weak_recovery_failure")
 	terminal := server.localizationFor(ctx)
@@ -198,15 +198,14 @@ func TestRecoveryFailureRestoresOnceAndTerminalizesSameResponse(t *testing.T) {
 	if err != nil || second == nil || !second.IsError || calls != 2 {
 		t.Fatalf("second failed recovery = (%#v, %v), calls=%d", second, err, calls)
 	}
-	requireLocalizationResultStateEqual(t, terminal, second, localizationStateAnswerReady, true, 0)
+	requireLocalizationResultStateEqual(t, terminal, second, localizationStateLocalized, false, 0)
 
 	third, err := server.handleFacade(ctx, "search", request)
-	if err != nil {
-		t.Fatalf("post-exhaustion search returned transport error: %v", err)
+	if err == nil || third != nil {
+		t.Fatalf("released navigation did not expose the ordinary handler error: (%#v, %v)", third, err)
 	}
-	requireLocalizationTerminalReplay(t, third, "search", "symbols")
-	if calls != 2 {
-		t.Fatalf("recovery allowance restored more than once: calls=%d", calls)
+	if calls != 3 {
+		t.Fatalf("advisory release kept localization interception active: calls=%d", calls)
 	}
 }
 
@@ -239,29 +238,22 @@ func TestEnforceableAnswerReadyLocksBeforeHandler(t *testing.T) {
 	}
 }
 
-func TestUnsupportedRecoveryAttemptTerminatesBeforeSchemaDispatch(t *testing.T) {
+func TestUnsupportedRecoveryAttemptReleasesAdvisoryBeforeSchemaDispatch(t *testing.T) {
 	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := WithSessionID(context.Background(), "unsupported_recovery")
-	server.localizationFor(ctx).armForTask(newLocalizationRecoveryCompletion(), "find candidate resolution")
+	terminal := server.localizationFor(ctx)
+	terminal.armForTask(newLocalizationRecoveryCompletion(), "find candidate resolution")
 
 	result, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "not_an_operation", map[string]any{
 		"query": "resolveCandidate",
 	}))
 	if err != nil || result == nil || !result.IsError {
-		t.Fatalf("unsupported recovery = (%#v, %v), want terminal tool error", result, err)
+		t.Fatalf("unsupported recovery = (%#v, %v), want advisory tool error", result, err)
 	}
-	requireLocalizationTerminalError(t, result, "search", "not_an_operation")
-
-	valid, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
-		"query": "resolveCandidate",
-	}))
-	if err != nil {
-		t.Fatalf("post-rejection recovery returned transport error: %v", err)
-	}
-	requireLocalizationTerminalReplay(t, valid, "search", "text")
+	requireLocalizationResultStateEqual(t, terminal, result, localizationStateLocalized, false, 0)
 }
 
-func TestSchemaInvalidAllowedRecoveryTerminatesBeforeHandler(t *testing.T) {
+func TestSchemaInvalidAllowedRecoveryReleasesAdvisoryBeforeHandler(t *testing.T) {
 	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := WithSessionID(context.Background(), "schema_invalid_recovery")
 	terminal := server.localizationFor(ctx)
@@ -281,9 +273,9 @@ func TestSchemaInvalidAllowedRecoveryTerminatesBeforeHandler(t *testing.T) {
 		"options": "not-an-object",
 	}))
 	if err != nil || invalid == nil || !invalid.IsError {
-		t.Fatalf("schema-invalid recovery = (%#v, %v), want terminal tool error", invalid, err)
+		t.Fatalf("schema-invalid recovery = (%#v, %v), want advisory tool error", invalid, err)
 	}
-	requireLocalizationResultStateEqual(t, terminal, invalid, localizationStateAnswerReady, true, 0)
+	requireLocalizationResultStateEqual(t, terminal, invalid, localizationStateLocalized, false, 0)
 	if calls != 0 {
 		t.Fatalf("schema-invalid recovery reached handler: calls=%d", calls)
 	}
@@ -291,12 +283,11 @@ func TestSchemaInvalidAllowedRecoveryTerminatesBeforeHandler(t *testing.T) {
 	valid, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
 		"query": "resolveCandidate",
 	}))
-	if err != nil {
-		t.Fatalf("post-invalid recovery returned transport error: %v", err)
+	if err != nil || valid == nil || valid.IsError {
+		t.Fatalf("released navigation did not reach ordinary handler: (%#v, %v)", valid, err)
 	}
-	requireLocalizationTerminalReplay(t, valid, "search", "text")
-	if calls != 0 {
-		t.Fatalf("recovery allowance survived invalid schema: calls=%d", calls)
+	if calls != 1 {
+		t.Fatalf("advisory release kept schema-invalid recovery interception active: calls=%d", calls)
 	}
 }
 
@@ -324,8 +315,8 @@ func TestStaleInvalidRecoveryTicketCannotConsumeNewTaskState(t *testing.T) {
 		t.Fatalf("new invalid-recovery preflight = (%#v, %d), old generation=%d", blocked, newGeneration, oldGeneration)
 	}
 	completion, consumed := state.consumeInvalidRecovery("search", "text", newGeneration)
-	if !consumed || completion.State != localizationStateAnswerReady {
-		t.Fatalf("current invalid request consumption = (%#v, %v)", completion, consumed)
+	if !consumed || completion.State != localizationStateLocalized || completion.Enforceable {
+		t.Fatalf("current invalid request did not release advisory state: (%#v, %v)", completion, consumed)
 	}
 }
 
@@ -411,64 +402,43 @@ func TestRecoveryEvidenceRejectsGenericCallableWithSignatureOnlyOverlap(t *testi
 	}
 }
 
-func TestRecoveryWeakResultPreservesAllowanceForEveryOperation(t *testing.T) {
+func TestRecoveryWeakResultReleasesAdvisoryForEveryOperation(t *testing.T) {
 	longSink := localizationDigestRow{
-		ID:        "repo/storage/report.go::Reporter.ReportStorageFailureAsPending",
+		ID:        "fixture/storage/report.go::Reporter.ReportStorageFailureAsPending",
 		Name:      "ReportStorageFailureAsPending",
 		QualName:  "Reporter.ReportStorageFailureAsPending",
 		Kind:      "method",
-		File:      "repo/storage/report.go",
+		File:      "fixture/storage/report.go",
 		Signature: "storage writes stall during commit",
 	}
-	implementation := localizationDigestRow{
-		ID:       "repo/storage/flush.go::Storage.Flush",
-		Name:     "StorageFlush",
-		QualName: "Storage.Flush",
-		Kind:     "method",
-		File:     "repo/storage/flush.go",
-	}
 	tests := []struct {
-		name           string
-		facade         string
-		operation      string
-		arguments      map[string]any
-		retryArguments map[string]any
+		name      string
+		facade    string
+		operation string
+		arguments map[string]any
 	}{
-		{
-			name: "text search", facade: "search", operation: "text",
-			arguments: map[string]any{"query": "storage"}, retryArguments: map[string]any{"query": "storage"},
-		},
-		{
-			name: "symbol search", facade: "search", operation: "symbols",
-			arguments: map[string]any{"query": "storage"}, retryArguments: map[string]any{"query": implementation.Name},
-		},
-		{
-			name: "source read", facade: "read", operation: "source",
-			arguments:      map[string]any{"target": map[string]any{"symbol": longSink.ID}},
-			retryArguments: map[string]any{"target": map[string]any{"symbol": implementation.ID}},
-		},
+		{name: "text search", facade: "search", operation: "text", arguments: map[string]any{"query": "storage"}},
+		{name: "symbol search", facade: "search", operation: "symbols", arguments: map[string]any{"query": "storage"}},
+		{name: "source read", facade: "read", operation: "source", arguments: map[string]any{"target": map[string]any{"symbol": longSink.ID}}},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
 			state := newLocalizationTerminalState()
 			state.armForTask(newLocalizationRecoveryCompletion(), "Storage writes stall during commit")
 
-			blocked, token := state.authorizeWithToken(tt.facade, tt.operation, tt.arguments)
+			blocked, token := state.authorizeWithToken(test.facade, test.operation, test.arguments)
 			if blocked != nil || token == 0 {
-				t.Fatalf("first recovery authorization = (%#v, %d)", blocked, token)
+				t.Fatalf("recovery authorization = (%#v, %d)", blocked, token)
 			}
 			completion := state.finishReservedReadTokenWithDigest(token, true, []localizationDigestRow{longSink}, true)
-			if completion.State != localizationStateNeedsRecovery || completion.AllowedToolCalls != 1 {
-				t.Fatalf("weak recovery completion = %#v, want preserved allowance", completion)
+			if completion.State != localizationStateLocalized || completion.AllowedToolCalls != 0 || completion.Enforceable {
+				t.Fatalf("weak accepted recovery did not release advisory completion: %#v", completion)
 			}
-
-			blocked, retryToken := state.authorizeWithToken(tt.facade, tt.operation, tt.retryArguments)
-			if blocked != nil || retryToken == 0 {
-				t.Fatalf("retry recovery authorization = (%#v, %d)", blocked, retryToken)
-			}
-			completion = state.finishReservedReadTokenWithDigest(retryToken, true, []localizationDigestRow{implementation}, true)
-			if completion.State != localizationStateAnswerReady || completion.AllowedToolCalls != 0 {
-				t.Fatalf("strong recovery completion = %#v, want answer_ready", completion)
+			state.mu.Lock()
+			storedState := state.state
+			state.mu.Unlock()
+			if storedState != localizationStateInactive {
+				t.Fatalf("weak accepted recovery left session restricted: %q", storedState)
 			}
 		})
 	}
@@ -589,7 +559,7 @@ func TestPlannedRecoveryReplaceFamilyRegression(t *testing.T) {
 	}
 }
 
-func TestPlannedRecoveryIsExactRetriableAndFallsBackToGeneric(t *testing.T) {
+func TestPlannedRecoveryIsExactRetriableAndWeakResultReleasesAdvisory(t *testing.T) {
 	task := "Printed records are duplicated unexpectedly\ncombining --multiline with --replace while --only-matching spans lines"
 	preferred := "crates/searcher/src/sink.rs::sink_slow_multi_line_only_matching"
 	current := []localizationDigestRow{{
@@ -666,14 +636,13 @@ func TestPlannedRecoveryIsExactRetriableAndFallsBackToGeneric(t *testing.T) {
 		Name: "replace_with_captures", Kind: "method", File: "crates/searcher/src/glue.rs",
 	}}
 	completion = state.finishReservedReadTokenWithDigest(token, true, weak, true)
-	generic := newLocalizationRecoveryCompletion()
-	if completion.RequiredAction != generic.RequiredAction || completion.Instruction != generic.Instruction ||
-		len(completion.AllowedOperations) != len(generic.AllowedOperations) {
-		t.Fatalf("weak planned result did not fall back to generic recovery: %#v", completion)
+	if completion.State != localizationStateLocalized || completion.RequiredAction != "continue_task" ||
+		completion.AllowedToolCalls != 0 || completion.Enforceable {
+		t.Fatalf("weak planned result did not release an advisory completion: %#v", completion)
 	}
 }
 
-func TestPlannedRecoveryEmptyResultFallsBackToGeneric(t *testing.T) {
+func TestPlannedRecoveryEmptyResultReleasesAdvisory(t *testing.T) {
 	state := newLocalizationTerminalState()
 	state.armForTask(newLocalizationPlannedRecoveryCompletion("search.symbols", "transform_with"), "--multi-line with --transform duplicates output")
 	blocked, token := state.authorizeWithToken("search", "symbols", map[string]any{"query": "transform_with"})
@@ -681,10 +650,9 @@ func TestPlannedRecoveryEmptyResultFallsBackToGeneric(t *testing.T) {
 		t.Fatalf("planned recovery authorization = (%#v, %d)", blocked, token)
 	}
 	completion := state.finishReservedReadTokenWithDigest(token, true, nil, true)
-	generic := newLocalizationRecoveryCompletion()
-	if completion.State != localizationStateNeedsRecovery || completion.RequiredAction != generic.RequiredAction ||
-		completion.Instruction != generic.Instruction || len(completion.AllowedOperations) != len(generic.AllowedOperations) {
-		t.Fatalf("empty planned result did not fall back to generic recovery: %#v", completion)
+	if completion.State != localizationStateLocalized || completion.RequiredAction != "continue_task" ||
+		completion.AllowedToolCalls != 0 || completion.Enforceable {
+		t.Fatalf("empty planned result did not release an advisory completion: %#v", completion)
 	}
 }
 
@@ -738,7 +706,13 @@ func requireLocalizationResultStateEqual(
 	stored := state.completionLocked()
 	state.mu.Unlock()
 	requireLocalizationCompletionJSONEqual(t, wire, host.Contract.Completion, "wire/meta")
-	requireLocalizationCompletionJSONEqual(t, wire, stored, "wire/state")
+	if wantState == localizationStateLocalized {
+		if stored.State != localizationStateInactive {
+			t.Fatalf("localized advisory did not release session state: %#v", stored)
+		}
+	} else {
+		requireLocalizationCompletionJSONEqual(t, wire, stored, "wire/state")
+	}
 	if host.Contract.Terminal != wantTerminal {
 		t.Fatalf("host terminal = %v, want %v", host.Contract.Terminal, wantTerminal)
 	}

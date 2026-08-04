@@ -1,10 +1,6 @@
 package resolver
 
-import (
-	"sort"
-
-	"github.com/zzet/gortex/internal/graph"
-)
+import "github.com/zzet/gortex/internal/graph"
 
 // flutterSetStateVia marks a synthesized Flutter setState→build reachability
 // edge.
@@ -24,69 +20,7 @@ const flutterSetStateVia = "flutter.setstate"
 // ast_inferred and carry synthesizer provenance. Returns the number of
 // setState→build edges synthesized.
 func ResolveFlutterSetStateCalls(g graph.Store) int {
-	if g == nil {
-		return 0
-	}
-
-	methods := nodesByKindsOrAll(g, graph.KindMethod)
-	methodIDs := make([]string, 0, len(methods))
-	for _, method := range methods {
-		if method != nil {
-			methodIDs = append(methodIDs, method.ID)
-		}
-	}
-	outByMethod := g.GetOutEdgesByNodeIDs(methodIDs)
-	classByMethod := map[string]string{}
-	buildByClass := map[string]*graph.Node{}
-	for _, n := range methods {
-		if n == nil {
-			continue
-		}
-		for _, e := range outByMethod[n.ID] {
-			if e == nil || e.Kind != graph.EdgeMemberOf {
-				continue
-			}
-			classByMethod[n.ID] = e.To
-			if n.Name == "build" {
-				buildByClass[e.To] = n
-			}
-			break
-		}
-	}
-	if len(buildByClass) == 0 {
-		return 0
-	}
-
-	var setStateMethods []*graph.Node
-	for _, n := range methods {
-		if n == nil {
-			continue
-		}
-		build := buildByClass[classByMethod[n.ID]]
-		if build == nil || build.ID == n.ID {
-			continue
-		}
-		if !edgesCallSetState(outByMethod[n.ID]) {
-			continue
-		}
-		setStateMethods = append(setStateMethods, n)
-	}
-	sort.Slice(setStateMethods, func(i, j int) bool {
-		return setStateMethods[i].ID < setStateMethods[j].ID
-	})
-
-	var batch []*graph.Edge
-	synthesized := 0
-	for _, m := range setStateMethods {
-		build := buildByClass[classByMethod[m.ID]]
-		batch = append(batch, flutterSetStateEdge(m, build, classByMethod[m.ID]))
-		synthesized++
-	}
-
-	if len(batch) > 0 {
-		g.AddBatch(nil, batch)
-	}
-	return synthesized
+	return resolveSetStateLifecycleCalls(g, "build", flutterSetStateEdge)
 }
 
 // flutterSetStateEdge builds one setState-method → build synthesized edge.

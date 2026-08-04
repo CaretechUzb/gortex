@@ -381,6 +381,41 @@ func DetectPairsStreamingWithStats(items []Item, threshold float64, emit func(Pa
 	for _, it := range items {
 		ix.Add(it.ID, it.Sig)
 	}
+	return ix.detectPairsStreamingWithStats(threshold, emit)
+}
+
+// detectPairsWithStats runs detection over an already-populated Index. It is
+// the retained-index counterpart of DetectPairsWithStats and lets the
+// stratified incremental index reuse its live per-class buckets during the
+// global pass instead of building a second temporary LSH.
+func (ix *Index) detectPairsWithStats(threshold float64) (pairs []Pair, skippedBuckets, skippedBucketItems int) {
+	var mu sync.Mutex
+	skippedBuckets, skippedBucketItems = ix.detectPairsStreamingWithStats(threshold, func(p Pair) {
+		mu.Lock()
+		pairs = append(pairs, p)
+		mu.Unlock()
+	})
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Similarity != pairs[j].Similarity {
+			return pairs[i].Similarity > pairs[j].Similarity
+		}
+		if pairs[i].A != pairs[j].A {
+			return pairs[i].A < pairs[j].A
+		}
+		return pairs[i].B < pairs[j].B
+	})
+	return pairs, skippedBuckets, skippedBucketItems
+}
+
+// detectPairsStreamingWithStats is the worker pipeline shared by fresh batch
+// indexes and retained indexes. ix is read-only for the duration of the walk.
+func (ix *Index) detectPairsStreamingWithStats(threshold float64, emit func(Pair)) (skippedBuckets, skippedBucketItems int) {
+	if threshold <= 0 {
+		threshold = DefaultThreshold
+	}
+	if ix == nil || len(ix.sigs) < 2 {
+		return 0, 0
+	}
 
 	workers := runtime.NumCPU()
 	if workers < 1 {

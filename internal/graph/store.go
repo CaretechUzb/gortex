@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"iter"
 	"sync"
 )
@@ -43,7 +44,8 @@ type EdgeProvenanceUpdate struct {
 // HighWaterID is backend-owned and opaque to callers; SQLite uses the edge
 // rowid so rows inserted or reinserted while a chunked resolver yields cannot
 // leak into the pass. PendingBefore is the exact number of eligible rows at
-// that boundary and is diagnostic only.
+// that boundary when non-negative; -1 means the backend intentionally skipped
+// a pre-count and the consumer must derive the diagnostic count while paging.
 type UnresolvedEdgeScan struct {
 	HighWaterID   int64
 	PendingBefore int
@@ -84,10 +86,13 @@ type UnresolvedEdgePage struct {
 // UnresolvedEdgePager is an optional disk-backend capability used by the
 // resolver's cold pass. Implementations must keyset-page a stable high-water
 // snapshot and honour both bounds (an individually oversized row may exceed
-// maxBytes so the cursor can still make progress).
+// maxBytes so the cursor can still make progress). PendingBefore may be -1
+// when the backend deliberately avoids an exact pre-count; consumers then
+// derive the diagnostic count while paging. A zero high-water mark still
+// means the frontier is known to be empty.
 type UnresolvedEdgePager interface {
-	BeginUnresolvedEdgeScan() (UnresolvedEdgeScan, error)
-	ReadUnresolvedEdgePage(scan UnresolvedEdgeScan, afterID int64, maxRows, maxBytes int) (UnresolvedEdgePage, error)
+	BeginUnresolvedEdgeScan(ctx context.Context) (UnresolvedEdgeScan, error)
+	ReadUnresolvedEdgePage(ctx context.Context, scan UnresolvedEdgeScan, afterID int64, maxRows, maxBytes int) (UnresolvedEdgePage, error)
 }
 
 // Store is the persistence-and-query backend the rest of gortex sees
@@ -723,6 +728,16 @@ type SymbolBundleSearcher interface {
 	SearchSymbolBundles(query string, limit int) ([]SymbolBundle, error)
 }
 
+// ScopedSymbolBundleSearcher is the repo-narrowed variant of
+// SymbolBundleSearcher: repoAllow filters inside the FTS query, not
+// over a bounded fetched head — a post-fetch filter starves when
+// out-of-scope rows outrank every in-scope one deeper than any
+// over-fetch. Unowned rows (empty repo prefix) always pass, the
+// ScopeAllows carve-out.
+type ScopedSymbolBundleSearcher interface {
+	SearchSymbolBundlesRepoScoped(query string, repoAllow []string, limit int) ([]SymbolBundle, error)
+}
+
 // VectorItem is the payload BulkUpsertEmbeddings takes per node:
 // the node's ID and its embedding vector. Length of Vec must
 // match the dim the corresponding BuildVectorIndex call declared
@@ -1352,6 +1367,16 @@ type FnValuePlaceholderScanner interface {
 	FnValuePlaceholderEdges() iter.Seq[*Edge]
 }
 
+// ValueRefPlaceholderScanner is an optional disk-backend capability for the
+// value-reference gate. It yields EdgeReads whose targets occupy the extractor's
+// bare `unresolved::valueref::` namespace, with Meta populated for the gate's
+// exact `via == value_ref_candidate` revalidation. Value-ref extraction was
+// introduced after repository prefixing already preserved unresolved targets,
+// so every current or restorable value-ref placeholder uses the bare form.
+type ValueRefPlaceholderScanner interface {
+	ValueRefPlaceholderEdges() iter.Seq[*Edge]
+}
+
 // EdgePersister is an optional capability backends MAY implement to
 // durably rewrite the mutable attribute columns (Confidence,
 // ConfidenceLabel, Origin, Tier, Meta) of an edge already present in the
@@ -1451,6 +1476,21 @@ type CloneCorpusWriter interface {
 	BulkSetCloneCorpus(repoPrefix string, rows []CloneCorpusRow) error
 }
 
+// CloneCorpusSignatureUpdate is the finalized signature projection for one
+// existing clone-corpus row. An empty Signature is authoritative and means the
+// body was filtered out after CMS boilerplate removal.
+type CloneCorpusSignatureUpdate struct {
+	NodeID    string
+	Signature string
+}
+
+// CloneCorpusSignatureWriter updates finalized signatures without rewriting
+// the unchanged raw-shingle BLOB. Backends may omit this optimization; callers
+// then fall back to CloneCorpusWriter with complete rows.
+type CloneCorpusSignatureWriter interface {
+	BulkSetCloneSignatures(repoPrefix string, updates []CloneCorpusSignatureUpdate) error
+}
+
 // CloneCorpusRepoReplacer resets one repository's authoritative clone
 // projection before a full shadow drain. The empty replacement must clear
 // stale rows left by a prior index.
@@ -1474,6 +1514,15 @@ type UnresolvedInsertionCounter interface {
 // rebuilds.
 type CloneCorpusPager interface {
 	CloneCorpusPage(repoPrefix, afterNodeID string, limit int) ([]CloneCorpusRow, error)
+}
+
+// CloneCorpusInitialization is an optional capability for stores that can
+// distinguish an authoritative empty clone projection from a store created
+// before clone-corpus persistence existed. Backends without this capability
+// retain the compatibility node scan.
+type CloneCorpusInitialization interface {
+	CloneCorpusInitialized(repoPrefix string) (bool, error)
+	MarkCloneCorpusInitialized(repoPrefix string) error
 }
 
 // ConstantValueWriter is an optional capability backends MAY implement
@@ -1554,6 +1603,25 @@ type FileMetaReader interface {
 // persisted content receipt without scanning every file in the repository.
 type FileMetaPathReader interface {
 	FileMetasByPaths(repoPrefix string, filePaths []string) (map[string]FileMetaRow, error)
+}
+
+// FileReceipt is the compact polling projection joining one tracked path's
+// durable mtime with its optional content identity. ContentHash is empty for
+// tracked paths (such as contract manifests) that do not have a files row.
+type FileReceipt struct {
+	FilePath    string
+	MtimeNS     int64
+	ContentHash string
+	Size        int64
+}
+
+// FileReceiptPager reads tracked-file receipts through bounded keyset pages.
+// A caller freezes HighWater before a rotation, then advances AfterPath until
+// the returned page is short. Implementations must close their database cursor
+// before returning so filesystem work cannot pin a read transaction.
+type FileReceiptPager interface {
+	FileReceiptHighWater(repoPrefix string) (string, error)
+	FileReceiptPage(repoPrefix, afterPath, highWaterPath string, limit int, includeContent bool) ([]FileReceipt, error)
 }
 
 // RefFact is one durable resolved-reference fact: a reference edge from
@@ -2134,6 +2202,14 @@ type CrossRepoCandidates interface {
 type ScopedCrossRepoCandidates interface {
 	CrossRepoCandidatesForRepos(baseKinds []EdgeKind, repoPrefixes []string) []CrossRepoCandidateRow
 	CrossRepoCandidatesForFiles(baseKinds []EdgeKind, filePaths []string) []CrossRepoCandidateRow
+}
+
+// MutationScopedCrossRepoCandidates is an optional role-aware refinement for a
+// coordinated mutation receipt. Edge-source files need only edges stamped with
+// those files; changed definitions need edges incident to nodes they contain.
+// Keeping the roles separate avoids three broad query arms for every file.
+type MutationScopedCrossRepoCandidates interface {
+	CrossRepoCandidatesForMutation(baseKinds []EdgeKind, edgeSourceFiles, incidentNodeFiles []string) []CrossRepoCandidateRow
 }
 
 // CrossRepoFlagMarker persists the CrossRepo flag on existing base edges in

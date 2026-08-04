@@ -318,7 +318,8 @@ func TestIncrementalResolutionFrontierOnlySkipsAuthoritativeIrrelevantReceipt(t 
 
 	files, needed, exact = incrementalResolutionFrontier(result, &graph.MutationReceipt{
 		Complete: true, ResolutionRelevant: true,
-		ChangedFiles: []string{"repo/changed.go"},
+		ChangedFiles:    []string{"repo/changed.go"},
+		UnresolvedFiles: []string{"repo/changed.go"},
 	})
 	require.True(t, needed)
 	require.True(t, exact)
@@ -401,6 +402,15 @@ func TestMultiWatcherBatchCallbackRunsOneExactResolveAndDerivedCatchup(t *testin
 		resolveCalls++
 		frontier = append([]string(nil), files...)
 	}
+	crossRepoCalls := 0
+	var crossRepoFrontier []string
+	idx.incrementalCatchupHook = func(kind string, files []string) {
+		if kind != "cross_repo" {
+			return
+		}
+		crossRepoCalls++
+		crossRepoFrontier = append([]string(nil), files...)
+	}
 
 	core, observed := observer.New(zap.InfoLevel)
 	logger := zap.New(core)
@@ -424,6 +434,12 @@ func TestMultiWatcherBatchCallbackRunsOneExactResolveAndDerivedCatchup(t *testin
 	for _, graphPath := range frontier {
 		require.True(t, strings.HasPrefix(graphPath, "repo/"),
 			"receipt frontier must use repo-prefixed graph paths: %q", graphPath)
+	}
+	require.Equal(t, 1, crossRepoCalls)
+	require.NotEmpty(t, crossRepoFrontier)
+	for _, graphPath := range crossRepoFrontier {
+		require.True(t, strings.HasPrefix(graphPath, "repo/"),
+			"cross-repo frontier must use repo-prefixed graph paths: %q", graphPath)
 	}
 	require.Equal(t, 1, observed.FilterMessage("incremental derived passes complete").Len(),
 		"one batch must trigger one derived catch-up")
@@ -494,18 +510,23 @@ func TestMultiWatcherThreeChunksRunEveryCatchupTailOnce(t *testing.T) {
 		indexers: map[string]*Indexer{"repo": idx},
 		logger:   zap.NewNop(),
 	}
+	idx.attachRepositoryMutationCoordinator(mi.repositoryMutationCoordinator("repo"))
 	result, err := mi.IncrementalReindexRepo("repo", paths)
 	require.NoError(t, err)
 	require.Equal(t, len(paths), result.StaleFileCount)
 	require.Empty(t, result.FailedFiles)
 
-	for _, tail := range []string{"resolve", "dataflow", "affected_by", "ref_facts", "semantic", "derived"} {
+	for _, tail := range []string{"resolve", "dataflow", "affected_by", "ref_facts", "semantic", "cross_repo", "derived"} {
 		require.Equalf(t, 1, tailCalls[tail], "%s tail must run once for the complete batch", tail)
 	}
 	require.Len(t, tailFiles["resolve"], len(paths),
 		"the scoped fallback must contain exactly the successful mutation files")
 	require.Equal(t, []string{"repo/caller.go"}, tailFiles["affected_by"],
 		"the surviving caller must be handled once by the separate affected frontier")
+	require.Len(t, tailFiles["cross_repo"], len(paths)+1,
+		"the cross-repo batch must union the changed and affected file frontiers")
+	require.Contains(t, tailFiles["cross_repo"], "repo/caller.go",
+		"the cross-repo batch must include incoming edges owned by affected callers")
 	require.Equal(t, 1, provider.batchCalls)
 	require.Zero(t, provider.singleCalls)
 	require.Zero(t, provider.fullCalls)

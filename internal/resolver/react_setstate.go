@@ -28,70 +28,114 @@ const reactSetStateVia = "react.setstate"
 //
 // Returns the number of setState→render edges synthesized.
 func ResolveReactSetStateCalls(g graph.Store) int {
-	if g == nil {
+	return resolveSetStateLifecycleCalls(g, "render", reactSetStateEdge)
+}
+
+type setStateLifecycleEdgeBuilder func(from, target *graph.Node, class string) *graph.Edge
+
+// resolveSetStateLifecycleCalls performs the shared React/Flutter join without
+// decoding every method node and every outgoing method edge. The membership
+// projection is the cheap census; only methods belonging to a class with the
+// requested lifecycle method reach the adjacency lookup.
+func resolveSetStateLifecycleCalls(
+	g graph.Store,
+	lifecycleName string,
+	edgeBuilder setStateLifecycleEdgeBuilder,
+) int {
+	if g == nil || edgeBuilder == nil {
 		return 0
 	}
 
-	methods := nodesByKindsOrAll(g, graph.KindMethod)
-	methodIDs := make([]string, 0, len(methods))
-	for _, method := range methods {
-		if method != nil {
-			methodIDs = append(methodIDs, method.ID)
-		}
-	}
-	outByMethod := g.GetOutEdgesByNodeIDs(methodIDs)
-	classByMethod := map[string]string{}
-	renderByClass := map[string]*graph.Node{}
-	for _, n := range methods {
-		if n == nil {
+	methodsByClass := memberMethodInfosByType(g)
+	lifecycleClasses := make(map[string]struct{})
+	for classID, methods := range methodsByClass {
+		if classID == "" {
 			continue
 		}
-		for _, e := range outByMethod[n.ID] {
-			if e == nil || e.Kind != graph.EdgeMemberOf {
+		for _, method := range methods {
+			if method.MethodID != "" && method.Name == lifecycleName {
+				lifecycleClasses[classID] = struct{}{}
+				break
+			}
+		}
+	}
+	if len(lifecycleClasses) == 0 {
+		return 0
+	}
+
+	// The projection can list one method under more than one type. Deduplicate
+	// before the store lookup; the targeted adjacency below still selects the
+	// first persisted member_of edge, preserving the legacy ownership rule.
+	candidateByID := make(map[string]graph.MemberMethodInfo)
+	for classID := range lifecycleClasses {
+		for _, method := range methodsByClass[classID] {
+			if method.MethodID == "" {
 				continue
 			}
-			classByMethod[n.ID] = e.To
-			if n.Name == "render" {
-				renderByClass[e.To] = n
+			candidateByID[method.MethodID] = method
+		}
+	}
+	candidateIDs := make([]string, 0, len(candidateByID))
+	for methodID := range candidateByID {
+		candidateIDs = append(candidateIDs, methodID)
+	}
+	sort.Strings(candidateIDs)
+	outByMethod := g.GetOutEdgesByNodeIDs(candidateIDs)
+
+	classByMethod := make(map[string]string, len(candidateIDs))
+	for _, methodID := range candidateIDs {
+		for _, edge := range outByMethod[methodID] {
+			if edge == nil || edge.Kind != graph.EdgeMemberOf {
+				continue
 			}
+			classByMethod[methodID] = edge.To
 			break
 		}
 	}
-	if len(renderByClass) == 0 {
+
+	// candidateIDs are sorted exactly like SQLite's former KindMethod scan, so
+	// duplicate lifecycle methods retain its stable last-writer behavior.
+	targetByClass := make(map[string]*graph.Node)
+	for _, methodID := range candidateIDs {
+		method := candidateByID[methodID]
+		if method.Name != lifecycleName {
+			continue
+		}
+		classID := classByMethod[methodID]
+		if classID == "" {
+			continue
+		}
+		targetByClass[classID] = memberMethodInfoNode(method)
+	}
+	if len(targetByClass) == 0 {
 		return 0
 	}
 
-	var setStateMethods []*graph.Node
-	for _, n := range methods {
-		if n == nil {
+	batch := make([]*graph.Edge, 0)
+	for _, methodID := range candidateIDs {
+		method := candidateByID[methodID]
+		classID := classByMethod[methodID]
+		target := targetByClass[classID]
+		if target == nil || target.ID == methodID || !edgesCallSetState(outByMethod[methodID]) {
 			continue
 		}
-		class := classByMethod[n.ID]
-		render := renderByClass[class]
-		if render == nil || render.ID == n.ID {
-			continue
-		}
-		if !edgesCallSetState(outByMethod[n.ID]) {
-			continue
-		}
-		setStateMethods = append(setStateMethods, n)
+		batch = append(batch, edgeBuilder(memberMethodInfoNode(method), target, classID))
 	}
-	sort.Slice(setStateMethods, func(i, j int) bool {
-		return setStateMethods[i].ID < setStateMethods[j].ID
-	})
-
-	var batch []*graph.Edge
-	synthesized := 0
-	for _, m := range setStateMethods {
-		render := renderByClass[classByMethod[m.ID]]
-		batch = append(batch, reactSetStateEdge(m, render, classByMethod[m.ID]))
-		synthesized++
-	}
-
 	if len(batch) > 0 {
 		g.AddBatch(nil, batch)
 	}
-	return synthesized
+	return len(batch)
+}
+
+func memberMethodInfoNode(method graph.MemberMethodInfo) *graph.Node {
+	return &graph.Node{
+		ID:         method.MethodID,
+		Kind:       graph.KindMethod,
+		Name:       method.Name,
+		FilePath:   method.FilePath,
+		StartLine:  method.StartLine,
+		RepoPrefix: method.RepoPrefix,
+	}
 }
 
 func edgesCallSetState(edges []*graph.Edge) bool {

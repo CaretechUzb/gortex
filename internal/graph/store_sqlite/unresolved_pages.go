@@ -1,6 +1,9 @@
 package store_sqlite
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -15,10 +18,23 @@ var _ graph.UnresolvedEdgePager = (*Store)(nil)
 // BeginUnresolvedEdgeScan captures a stable rowid high-water mark. Reindexing
 // an edge may delete and insert its row; the replacement receives a larger id
 // and therefore cannot be visited twice by the same resolver pass.
-func (s *Store) BeginUnresolvedEdgeScan() (graph.UnresolvedEdgeScan, error) {
-	var scan graph.UnresolvedEdgeScan
-	err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0), COUNT(*) FROM edges WHERE `+unresolvedEdgePredicate).
-		Scan(&scan.HighWaterID, &scan.PendingBefore)
+//
+// PendingBefore is deliberately unknown for a non-empty frontier. Computing
+// it with COUNT(*) made every warm scoped resolve walk the entire unresolved
+// partial index before the first scoped page could run. The descending id
+// probe stops after one indexed entry; the resolver derives the exact
+// diagnostic count while consuming pages.
+func (s *Store) BeginUnresolvedEdgeScan(ctx context.Context) (graph.UnresolvedEdgeScan, error) {
+	scan := graph.UnresolvedEdgeScan{PendingBefore: -1}
+	err := s.db.QueryRowContext(ctx, `SELECT id
+FROM edges INDEXED BY edges_by_unresolved
+WHERE `+unresolvedEdgePredicate+`
+ORDER BY id DESC
+LIMIT 1`).Scan(&scan.HighWaterID)
+	if errors.Is(err, sql.ErrNoRows) {
+		scan.PendingBefore = 0
+		return scan, nil
+	}
 	return scan, err
 }
 
@@ -26,7 +42,7 @@ func (s *Store) BeginUnresolvedEdgeScan() (graph.UnresolvedEdgeScan, error) {
 // byte bound is measured from the encoded row plus scalar/string fields before
 // Meta is decoded; one individually oversized row is admitted to guarantee
 // cursor progress.
-func (s *Store) ReadUnresolvedEdgePage(scan graph.UnresolvedEdgeScan, afterID int64, maxRows, maxBytes int) (graph.UnresolvedEdgePage, error) {
+func (s *Store) ReadUnresolvedEdgePage(ctx context.Context, scan graph.UnresolvedEdgeScan, afterID int64, maxRows, maxBytes int) (graph.UnresolvedEdgePage, error) {
 	if maxRows <= 0 {
 		maxRows = 2048
 	}
@@ -97,7 +113,7 @@ func (s *Store) ReadUnresolvedEdgePage(scan graph.UnresolvedEdgeScan, afterID in
 		predicate += ` AND ` + cond
 	}
 	args = append(args, maxRows)
-	rows, err := s.db.Query(`SELECT id, `+lookupEdgeCols+`
+	rows, err := s.db.QueryContext(ctx, `SELECT id, `+lookupEdgeCols+`
 FROM edges
 WHERE id > ? AND id <= ? AND `+predicate+`
 ORDER BY id
@@ -135,7 +151,7 @@ func scanUnresolvedEdge(scanner interface{ Scan(...any) error }) (int64, *graph.
 	var (
 		id        int64
 		edge      graph.Edge
-		metaBlob  []byte
+		metaBlob  sql.RawBytes
 		crossRepo int64
 		promoted  promotedEdgeMeta
 	)

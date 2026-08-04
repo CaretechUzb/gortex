@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"go.uber.org/zap"
 
@@ -24,6 +25,45 @@ func (idx *Indexer) merkleEnabled() bool {
 		return v == "1" || strings.EqualFold(v, "true")
 	}
 	return idx.config.Merkle
+}
+
+// merkleBaselineCollector retains compact raw-content identities while full
+// indexing already owns each source buffer. It deliberately records raw bytes
+// before transforms: FileMeta hashes describe transformed parser input, while
+// Merkle leaves must describe the repository snapshot on disk.
+type merkleBaselineCollector struct {
+	mu    sync.Mutex
+	files map[string]merkle.FileNode
+}
+
+func newMerkleBaselineCollector(enabled bool, capacity int) *merkleBaselineCollector {
+	if !enabled {
+		return nil
+	}
+	return &merkleBaselineCollector{files: make(map[string]merkle.FileNode, capacity)}
+}
+
+func (c *merkleBaselineCollector) record(rel string, src []byte, mtime int64) {
+	if c == nil || rel == "" || mtime <= 0 {
+		return
+	}
+	node := merkle.FileNode{Hash: contentHashForSource(src), Mtime: mtime}
+	c.mu.Lock()
+	c.files[filepath.ToSlash(rel)] = node
+	c.mu.Unlock()
+}
+
+// take transfers ownership after all parse workers have joined. Missing entries
+// are intentional: streaming/unreadable files use the builder's disk fallback.
+func (c *merkleBaselineCollector) take() map[string]merkle.FileNode {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	files := c.files
+	c.files = nil
+	c.mu.Unlock()
+	return files
 }
 
 // merkleStaleFiles returns the absolute paths of files whose content
@@ -52,19 +92,18 @@ func (idx *Indexer) merkleStaleFiles(rootAbs string, diskFiles map[string]bool) 
 	return stale
 }
 
-// saveMerkleBaseline builds and persists the Merkle tree after a full
-// index, so the next incremental pass diffs against a content-addressed
-// baseline rather than treating every file as changed. It returns the
-// tree root — the workspace fingerprint recorded in repo_index_state and
-// used to short-circuit the global derivation passes when nothing moved.
-func (idx *Indexer) saveMerkleBaseline(rootAbs string, absFiles []string) string {
+func (idx *Indexer) saveMerkleBaselineWithKnownFiles(
+	rootAbs string,
+	absFiles []string,
+	knownFiles map[string]merkle.FileNode,
+) string {
 	rels := make([]string, 0, len(absFiles))
 	for _, f := range absFiles {
 		if rel, err := filepath.Rel(rootAbs, f); err == nil {
 			rels = append(rels, filepath.ToSlash(rel))
 		}
 	}
-	tree := merkle.Build(rootAbs, rels, nil, merkleSaltFor)
+	tree := merkle.BuildWithKnownFiles(rootAbs, rels, nil, merkleSaltFor, knownFiles)
 	if err := tree.Save(merkleTreeFile(rootAbs)); err != nil {
 		idx.logger.Warn("indexer: merkle baseline save failed", zap.Error(err))
 	}

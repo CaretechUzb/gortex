@@ -1,0 +1,59 @@
+package indexer
+
+import (
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/search"
+)
+
+func TestReconcileRepoCtxRoutesManifestOnlyChurnScopedAndConverges(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "main.go"), "package sample\nfunc Alpha() {}\n")
+	writeFile(t, filepath.Join(root, "go.mod"), "module example.com/sample\n")
+	entry := config.RepoEntry{Path: root, Name: "repo"}
+	cm := newTestConfigManager(t)
+	cm.Global().Repos = []config.RepoEntry{entry}
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	seed := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	_, err = seed.IndexAll()
+	require.NoError(t, err)
+	prior := seed.GetIndexer("repo").FileMtimes()
+	_, manifestTrackedByFullIndex := prior["go.mod"]
+	assert.False(t, manifestTrackedByFullIndex)
+
+	core, logs := observer.New(zap.DebugLevel)
+	firstRestart := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewBM25(), cm, zap.New(core))
+	result, err := firstRestart.ReconcileRepoCtx(t.Context(), entry, prior)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.FullRetrack)
+	entries := logs.FilterMessage("daemon: reconciled repo from snapshot").All()
+	require.Len(t, entries, 1)
+	assert.Equal(t, "scoped", entries[0].ContextMap()["route"])
+
+	convergedMtimes := firstRestart.GetIndexer("repo").FileMtimes()
+	_, manifestTracked := convergedMtimes["go.mod"]
+	assert.True(t, manifestTracked)
+
+	core, logs = observer.New(zap.DebugLevel)
+	secondRestart := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewBM25(), cm, zap.New(core))
+	result, err = secondRestart.ReconcileRepoCtx(t.Context(), entry, convergedMtimes)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	entries = logs.FilterMessage("daemon: reconciled repo from snapshot").All()
+	require.Len(t, entries, 1)
+	assert.Equal(t, "census_noop", entries[0].ContextMap()["route"])
+}

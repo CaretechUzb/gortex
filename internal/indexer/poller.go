@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/gitcmd"
+	"github.com/zzet/gortex/internal/graph"
 	"go.uber.org/zap"
 )
 
@@ -61,9 +62,23 @@ type Poller struct {
 	pollRequested uint64
 	pollRunning   bool
 
+	// SQLite-backed pollers advance two independent bounded receipt rotations.
+	// The mtime cursor may move through thousands of cheap stat rows while the
+	// content cursor stops at its own byte budget; coupling them would let one
+	// large file delay ordinary drift/deletion detection.
+	receiptIndexer  *Indexer
+	mtimeRotation   fileReceiptRotation
+	contentRotation fileReceiptRotation
+	// A failed filesystem batch is retried before any new receipt page is
+	// consumed. One discovery page contributes at most the bounded mtime page
+	// plus the 128-row content page, so repeated failures cannot grow this set.
+	pendingFilesystemPaths map[string]struct{}
+
 	// swept is a test hook fired after every poll cycle with the
 	// number of files the cycle re-dispatched. nil in production.
-	swept func(int)
+	swept           func(int)
+	readReceiptFile func(string) ([]byte, error)
+	statReceiptFile func(string) (os.FileInfo, error)
 }
 
 // Poll-interval bounds. A small repo polls near the floor; a large
@@ -82,7 +97,23 @@ const (
 	// and a large monorepo (tens of thousands of nodes) sits at the
 	// ceiling.
 	pollNodesPerStep = 2000
+
+	pollMtimeRotationTarget = time.Hour
+	pollMtimePageMinRows    = 128
+	pollMtimePageMaxRows    = 4096
+	pollContentPageRows     = 128
+	pollContentPageBytes    = int64(4 << 20)
 )
+
+type fileReceiptRotation struct {
+	afterPath     string
+	highWaterPath string
+}
+
+func (r *fileReceiptRotation) reset() {
+	r.afterPath = ""
+	r.highWaterPath = ""
+}
 
 // pollInterval derives an adaptive poll interval from a project-size
 // signal — the indexed node count. The mapping is linear in the node
@@ -104,6 +135,24 @@ func pollInterval(nodeCount int) time.Duration {
 		return pollIntervalMax
 	}
 	return d
+}
+
+// pollMtimePageRows sizes one cheap-stat page so an uncapped rotation finishes
+// in roughly one janitor interval. The hard row cap bounds receipt heap for a
+// very large workspace; the hourly full-tree janitor remains the outer latency
+// bound for ordinary mtime drift when that cap is reached.
+func pollMtimePageRows(tracked int, interval time.Duration) int {
+	if tracked <= 0 {
+		return 0
+	}
+	if interval <= 0 {
+		interval = pollIntervalMin
+	}
+	ticks := max(int(pollMtimeRotationTarget/interval), 1)
+	rows := (tracked + ticks - 1) / ticks
+	rows = max(rows, pollMtimePageMinRows)
+	rows = min(rows, pollMtimePageMaxRows)
+	return min(rows, tracked)
 }
 
 // newPoller builds an adaptive-interval poller for a Watcher. The
@@ -238,13 +287,17 @@ func (p *Poller) poll() {
 // repository mutation lane.
 func (p *Poller) pollOnce() {
 	git := p.observeGitHead()
+	filesystemPaths := p.pendingFilesystemRetryPaths()
+	if len(filesystemPaths) == 0 {
+		filesystemPaths = p.pollFilesystem()
+	}
 	pathSet := make(map[string]struct{}, len(git.paths))
 	for _, path := range git.paths {
 		if path != "" {
 			pathSet[filepath.Clean(path)] = struct{}{}
 		}
 	}
-	for _, path := range p.pollFilesystem() {
+	for _, path := range filesystemPaths {
 		if path != "" {
 			pathSet[filepath.Clean(path)] = struct{}{}
 		}
@@ -276,6 +329,13 @@ func (p *Poller) pollOnce() {
 				zap.Int("paths", len(paths)))
 		}
 	}
+	if len(filesystemPaths) > 0 {
+		if reconciled {
+			p.pendingFilesystemPaths = nil
+		} else {
+			p.retainFilesystemRetryPaths(filesystemPaths)
+		}
+	}
 
 	// A changed Git range is committed only after all of its paths shared the
 	// successful batch above. An empty successful diff has no batch work and can
@@ -298,6 +358,26 @@ func (p *Poller) pollOnce() {
 
 	if p.swept != nil {
 		p.swept(len(paths))
+	}
+}
+
+func (p *Poller) pendingFilesystemRetryPaths() []string {
+	paths := make([]string, 0, len(p.pendingFilesystemPaths))
+	for path := range p.pendingFilesystemPaths {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func (p *Poller) retainFilesystemRetryPaths(paths []string) {
+	if p.pendingFilesystemPaths == nil {
+		p.pendingFilesystemPaths = make(map[string]struct{}, len(paths))
+	}
+	for _, path := range paths {
+		if path != "" {
+			p.pendingFilesystemPaths[filepath.Clean(path)] = struct{}{}
+		}
 	}
 }
 
@@ -454,10 +534,11 @@ func (p *Poller) finalizeGitHead(observation pollGitObservation) error {
 	})
 }
 
-// pollFilesystem snapshots the indexer's per-file mtime map and returns
-// changed or unreadable tracked paths. It performs discovery only: pollOnce
-// unions these paths with Git evidence and the repository batch owns every
-// freshness stamp and deletion decision.
+// pollFilesystem returns tracked paths whose durable receipt no longer matches
+// disk. SQLite stores use two independent, high-water-frozen keyset rotations:
+// a dynamically-sized mtime page and a smaller byte-bounded content page that
+// catches edits whose timestamp was restored. Other stores retain the original
+// immutable-map scan.
 func (p *Poller) pollFilesystem() []string {
 	idx := p.indexer
 	if p.watcher != nil {
@@ -469,12 +550,64 @@ func (p *Poller) pollFilesystem() []string {
 	if idx == nil {
 		return nil
 	}
-	snapshot := idx.FileMtimes()
+	snapshot := idx.publishFileMtimes()
 	if len(snapshot) == 0 {
 		return nil
 	}
+	if !idx.fileReceiptPagingReliable() {
+		// A later authoritative repair must start both rotations from its fresh
+		// durable keyset, not resume a high-water frozen before the failed write.
+		p.mtimeRotation.reset()
+		p.contentRotation.reset()
+		return p.pollFilesystemSnapshot(snapshot)
+	}
+	pager, ok := idx.graph.(graph.FileReceiptPager)
+	if !ok {
+		return p.pollFilesystemSnapshot(snapshot)
+	}
+	if p.receiptIndexer != idx {
+		p.receiptIndexer = idx
+		p.mtimeRotation.reset()
+		p.contentRotation.reset()
+	}
+
+	mtimeRows, mtimeExhausted, mtimeScan, err := p.readReceiptPage(
+		pager, idx.repoPrefix, &p.mtimeRotation,
+		pollMtimePageRows(len(snapshot), p.interval), false,
+	)
+	if err != nil || !mtimeScan {
+		if err != nil && p.logger != nil {
+			p.logger.Debug("watcher: poller receipt page failed; using mtime snapshot",
+				zap.String("root", p.rootPath), zap.Error(err))
+		}
+		// A non-empty in-memory snapshot with no durable receipt page can occur
+		// after a persistence failure. Preserve the prior correctness path.
+		p.mtimeRotation.reset()
+		return p.pollFilesystemSnapshot(snapshot)
+	}
+	paths := p.changedMtimeReceiptPaths(snapshot, mtimeRows)
+	p.advanceReceiptRotation(&p.mtimeRotation, mtimeRows, len(mtimeRows), mtimeExhausted)
+
+	contentRows, contentExhausted, _, contentErr := p.readReceiptPage(
+		pager, idx.repoPrefix, &p.contentRotation,
+		pollContentPageRows, true,
+	)
+	if contentErr != nil {
+		if p.logger != nil {
+			p.logger.Debug("watcher: poller content receipt page failed",
+				zap.String("root", p.rootPath), zap.Error(contentErr))
+		}
+		return appendUniqueSorted(nil, paths...)
+	}
+	contentPaths, processed := p.changedContentReceiptPaths(idx, snapshot, contentRows)
+	paths = append(paths, contentPaths...)
+	p.advanceReceiptRotation(&p.contentRotation, contentRows, processed, contentExhausted)
+	return appendUniqueSorted(nil, paths...)
+}
+
+func (p *Poller) pollFilesystemSnapshot(snapshot map[string]int64) []string {
 	paths := make([]string, 0)
-	for relPath, recorded := range snapshot {
+	for relPath, recordedMtime := range snapshot {
 		abs := filepath.Clean(filepath.Join(p.rootPath, filepath.FromSlash(relPath)))
 		info, err := os.Stat(abs)
 		if err != nil {
@@ -491,12 +624,190 @@ func (p *Poller) pollFilesystem() []string {
 		if info.IsDir() {
 			continue
 		}
-		if info.ModTime().UnixNano() != recorded {
+		if info.ModTime().UnixNano() != recordedMtime {
 			paths = append(paths, abs)
 		}
 	}
 	sort.Strings(paths)
 	return paths
+}
+
+func (p *Poller) readReceiptPage(
+	pager graph.FileReceiptPager,
+	repoPrefix string,
+	rotation *fileReceiptRotation,
+	limit int,
+	includeContent bool,
+) ([]graph.FileReceipt, bool, bool, error) {
+	if limit <= 0 {
+		return nil, true, false, nil
+	}
+	if rotation.highWaterPath == "" {
+		highWater, err := pager.FileReceiptHighWater(repoPrefix)
+		if err != nil {
+			return nil, false, false, err
+		}
+		if highWater == "" {
+			return nil, true, false, nil
+		}
+		rotation.afterPath = ""
+		rotation.highWaterPath = highWater
+	}
+	rows, err := pager.FileReceiptPage(
+		repoPrefix, rotation.afterPath, rotation.highWaterPath, limit, includeContent,
+	)
+	if err != nil {
+		return nil, false, true, err
+	}
+	exhausted := len(rows) < limit
+	if len(rows) == 0 || rows[len(rows)-1].FilePath >= rotation.highWaterPath {
+		exhausted = true
+	}
+	return rows, exhausted, true, nil
+}
+
+func (p *Poller) advanceReceiptRotation(
+	rotation *fileReceiptRotation,
+	rows []graph.FileReceipt,
+	processed int,
+	pageExhausted bool,
+) {
+	processed = min(max(processed, 0), len(rows))
+	if processed > 0 {
+		rotation.afterPath = rows[processed-1].FilePath
+	}
+	if processed == len(rows) && pageExhausted {
+		rotation.reset()
+	}
+}
+
+func (p *Poller) changedMtimeReceiptPaths(
+	snapshot map[string]int64,
+	receipts []graph.FileReceipt,
+) []string {
+	paths := make([]string, 0)
+	for _, receipt := range receipts {
+		recordedMtime, tracked := snapshot[receipt.FilePath]
+		if !tracked {
+			continue
+		}
+		abs := filepath.Clean(filepath.Join(p.rootPath, filepath.FromSlash(receipt.FilePath)))
+		info, err := os.Stat(abs)
+		if err != nil {
+			if os.IsNotExist(err) {
+				paths = append(paths, abs)
+			} else if p.logger != nil {
+				p.logger.Debug("watcher: poller stat failed; preserving tracked path",
+					zap.String("path", abs), zap.Error(err))
+			}
+			continue
+		}
+		if !info.IsDir() && info.ModTime().UnixNano() != recordedMtime {
+			paths = append(paths, abs)
+		}
+	}
+	return paths
+}
+
+func (p *Poller) changedContentReceiptPaths(
+	idx *Indexer,
+	snapshot map[string]int64,
+	receipts []graph.FileReceipt,
+) ([]string, int) {
+	paths := make([]string, 0)
+	processed := 0
+	var bytesRead int64
+	for _, receipt := range receipts {
+		recordedMtime, tracked := snapshot[receipt.FilePath]
+		if !tracked {
+			processed++
+			continue
+		}
+		abs := filepath.Clean(filepath.Join(p.rootPath, filepath.FromSlash(receipt.FilePath)))
+		before, err := p.receiptStat(abs)
+		if err != nil {
+			if os.IsNotExist(err) {
+				paths = append(paths, abs)
+			} else if p.logger != nil {
+				p.logger.Debug("watcher: poller content stat failed; preserving tracked path",
+					zap.String("path", abs), zap.Error(err))
+			}
+			if os.IsNotExist(err) {
+				processed++
+				continue
+			}
+			// A transient stat failure is uncomparable. Keep this row at the
+			// cursor so the next poll retries it instead of waiting a rotation.
+			break
+		}
+		if before.IsDir() {
+			processed++
+			continue
+		}
+		if before.ModTime().UnixNano() != recordedMtime {
+			paths = append(paths, abs)
+			processed++
+			continue
+		}
+		if receipt.ContentHash == "" {
+			processed++
+			continue
+		}
+
+		size := max(before.Size(), int64(0))
+		if bytesRead > 0 && size > pollContentPageBytes-bytesRead {
+			break
+		}
+		matches, comparable, read := p.contentReceiptMatches(idx, abs, before, receipt)
+		bytesRead += read
+		if !comparable {
+			// A transient read/stat race is not evidence that the indexed bytes
+			// changed, but advancing would postpone its next verification for a
+			// full rotation. Retry this exact row on the next poll.
+			break
+		}
+		if !matches {
+			// Do not advance past a proven mismatch. A failed reconcile retries
+			// it next poll; after success the refreshed receipt matches and the
+			// independent content cursor can continue.
+			paths = append(paths, abs)
+			break
+		}
+		processed++
+	}
+	return paths, processed
+}
+
+func (p *Poller) contentReceiptMatches(
+	idx *Indexer,
+	absPath string,
+	before os.FileInfo,
+	receipt graph.FileReceipt,
+) (matches bool, comparable bool, bytesRead int64) {
+	readFile := os.ReadFile
+	if p.readReceiptFile != nil {
+		readFile = p.readReceiptFile
+	}
+	src, err := readFile(absPath)
+	if err != nil {
+		return false, false, 0
+	}
+	bytesRead = int64(len(src))
+	after, err := p.receiptStat(absPath)
+	if err != nil || !sameFileVersion(before, after) {
+		return false, false, bytesRead
+	}
+	relPath := idx.graphRelKey(absPath)
+	src = idx.transforms.run(relPath, src)
+	return int64(len(src)) == receipt.Size && contentHashForSource(src) == receipt.ContentHash,
+		true, bytesRead
+}
+
+func (p *Poller) receiptStat(path string) (os.FileInfo, error) {
+	if p.statReceiptFile != nil {
+		return p.statReceiptFile(path)
+	}
+	return os.Stat(path)
 }
 
 // pollerHeadSHA resolves the current HEAD commit SHA of a worktree.

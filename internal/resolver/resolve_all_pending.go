@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"context"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -148,10 +149,14 @@ func pendingNeedsDepIndex(pending []*graph.Edge) bool {
 
 func pendingNeedsProvidesIndex(pending []*graph.Edge) bool {
 	for _, edge := range pending {
-		if edge == nil || edgeReceiverType(edge) == "" {
+		if edge == nil {
 			continue
 		}
-		if strings.HasPrefix(graph.UnresolvedName(edge.To), "*.") {
+		// Incremental preparation may carry only EdgeIdentity fields. Treat a
+		// wildcard member target as sufficient evidence even when receiver_type
+		// metadata is intentionally deferred to the fresh resolution read.
+		if strings.HasPrefix(graph.UnresolvedName(edge.To), "*.") &&
+			(edge.Meta == nil || edgeReceiverType(edge) != "") {
 			return true
 		}
 	}
@@ -295,15 +300,15 @@ func (p *resolveAllPassIndexes) ensureDir(prefixes []string) {
 		return
 	}
 	if p.resolver.dirIndex == nil {
-		p.resolver.dirIndex = make(map[string][]*graph.Node, 128)
-		p.resolver.lastDirIndex = make(map[string][]*graph.Node, 128)
+		p.resolver.dirIndex = make(map[string][]graph.FileNodeIdentity, 128)
+		p.resolver.lastDirIndex = make(map[string][]graph.FileNodeIdentity, 128)
 	}
-	for node := range graph.NodesInScopeSeq(p.resolver.graph, missing, nil, graph.KindFile) {
-		dir := filepath.Dir(node.FilePath)
-		p.resolver.dirIndex[dir] = append(p.resolver.dirIndex[dir], node)
+	for file := range graph.FileNodeIdentitiesSeq(p.resolver.graph, missing) {
+		dir := filepath.Dir(file.FilePath)
+		p.resolver.dirIndex[dir] = append(p.resolver.dirIndex[dir], file)
 		last := lastPathComponent(dir)
 		if last != "" && last != dir {
-			p.resolver.lastDirIndex[last] = append(p.resolver.lastDirIndex[last], node)
+			p.resolver.lastDirIndex[last] = append(p.resolver.lastDirIndex[last], file)
 		}
 	}
 }
@@ -324,7 +329,7 @@ func (p *resolveAllPassIndexes) ensureDep(prefixes []string) {
 	if p.resolver.depModuleIndex == nil {
 		p.resolver.depModuleIndex = make(map[string][]depModuleEntry)
 	}
-	for node := range graph.NodesInScopeSeq(p.resolver.graph, missing, nil, graph.KindContract) {
+	for node := range graph.RepoNodeIdentitiesSeq(p.resolver.graph, missing, graph.KindContract) {
 		if !strings.HasPrefix(node.ID, "dep::") {
 			continue
 		}
@@ -334,7 +339,7 @@ func (p *resolveAllPassIndexes) ensureDep(prefixes []string) {
 		}
 		p.resolver.depModuleIndex[node.RepoPrefix] = append(
 			p.resolver.depModuleIndex[node.RepoPrefix],
-			depModuleEntry{modulePath: modulePath, node: node},
+			depModuleEntry{modulePath: modulePath, nodeID: node.ID},
 		)
 	}
 	for _, prefix := range missing {
@@ -412,14 +417,21 @@ func (r *Resolver) resolveScopePrefixes() []string {
 // workspace index is built. When a backend bulk pass applies, its mutations
 // precede the returned high-water snapshot so the Go resolver sees exactly the
 // remaining (and any backend-created) unresolved work.
-func (r *Resolver) prepareResolveAllStream() *unresolvedEdgeStream {
-	stream := newUnresolvedEdgeStream(r.graph)
+func (r *Resolver) prepareResolveAllStream(ctx context.Context) *unresolvedEdgeStream {
+	stream := newUnresolvedEdgeStreamContext(ctx, r.graph)
 	if stream.initErr != nil || !backendResolverEnabled() {
+		return stream
+	}
+	if err := ctx.Err(); err != nil {
+		stream.initErr = err
 		return stream
 	}
 
 	prefixes := r.resolveScopePrefixes()
-	hasWork := stream.scan.PendingBefore > 0
+	// Native pagers may deliberately omit the exact pre-count to avoid a
+	// whole-frontier census. A positive high-water mark is sufficient to prove
+	// that unresolved work existed at the pass boundary.
+	hasWork := stream.scan.HighWaterID > 0 || stream.scan.PendingBefore > 0
 	if !hasWork {
 		if indicator, ok := r.graph.(backendResolveWorkIndicator); ok {
 			pending, err := indicator.BackendResolveWorkPending(prefixes)
@@ -456,5 +468,8 @@ func (r *Resolver) prepareResolveAllStream() *unresolvedEdgeStream {
 		zap.Bool("scoped", len(prefixes) > 0),
 		zap.Duration("elapsed", time.Since(bulkStart)),
 		zap.Error(err))
-	return newUnresolvedEdgeStream(r.graph)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return &unresolvedEdgeStream{ctx: ctx, initErr: ctxErr}
+	}
+	return newUnresolvedEdgeStreamContext(ctx, r.graph)
 }

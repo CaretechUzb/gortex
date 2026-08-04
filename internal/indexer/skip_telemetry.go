@@ -106,8 +106,21 @@ func largeFileReadParallelism(workers int) int {
 // completion in its goroutine (tree-sitter's own 5s parse cap bounds
 // the worst case) and its result is discarded.
 func (idx *Indexer) extractWithTimeout(ext parser.Extractor, relPath string, src []byte) (*parser.ExtractionResult, error) {
+	return idx.extractWithTimeoutDone(ext, relPath, src, nil)
+}
+
+func (idx *Indexer) extractWithTimeoutDone(
+	ext parser.Extractor,
+	relPath string,
+	src []byte,
+	done func(),
+) (*parser.ExtractionResult, error) {
+	if done == nil {
+		done = func() {}
+	}
 	budget := effectiveExtractBudget(idx.config.MaxExtractMillis, len(src))
 	if budget <= 0 {
+		defer done()
 		return safeExtract(ext, relPath, src)
 	}
 	type outcome struct {
@@ -117,6 +130,7 @@ func (idx *Indexer) extractWithTimeout(ext parser.Extractor, relPath string, src
 	ch := make(chan outcome, 1)
 	go func() {
 		r, err := safeExtract(ext, relPath, src)
+		done()
 		ch <- outcome{result: r, err: err}
 	}()
 	timer := time.NewTimer(time.Duration(budget) * time.Millisecond)

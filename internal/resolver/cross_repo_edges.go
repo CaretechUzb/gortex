@@ -70,7 +70,7 @@ func DetectCrossRepoEdgesForReindexes(g graph.Store, batch []graph.EdgeReindex) 
 			ids = append(ids, id)
 		}
 	}
-	nodes := g.GetNodesByIDs(ids)
+	placements := graph.NodePlacementsByIDs(g, ids)
 	rows := make([]graph.CrossRepoCandidateRow, 0, len(batch))
 	for _, reindex := range batch {
 		edge := reindex.Edge
@@ -80,8 +80,9 @@ func DetectCrossRepoEdgesForReindexes(g graph.Store, batch []graph.EdgeReindex) 
 		if _, ok := graph.CrossRepoKindFor(edge.Kind); !ok {
 			continue
 		}
-		from, to := nodes[edge.From], nodes[edge.To]
-		if from == nil || to == nil || from.RepoPrefix == "" || to.RepoPrefix == "" || from.RepoPrefix == to.RepoPrefix {
+		from, fromOK := placements[edge.From]
+		to, toOK := placements[edge.To]
+		if !fromOK || !toOK || from.RepoPrefix == "" || to.RepoPrefix == "" || from.RepoPrefix == to.RepoPrefix {
 			continue
 		}
 		rows = append(rows, graph.CrossRepoCandidateRow{
@@ -208,12 +209,12 @@ func crossRepoCandidatesForRepos(g graph.Store, repoPrefixes []string) []graph.C
 	return crossRepoCandidatesFallback(g, baseKinds, stringSet(repoPrefixes), nil)
 }
 
-func crossRepoCandidatesForFiles(g graph.Store, filePaths []string) []graph.CrossRepoCandidateRow {
+func crossRepoCandidatesForMutationFiles(g graph.Store, edgeSourceFiles, incidentNodeFiles []string) []graph.CrossRepoCandidateRow {
 	baseKinds := graph.BaseKindsForCrossRepo()
-	if cap, ok := g.(graph.ScopedCrossRepoCandidates); ok {
-		return cap.CrossRepoCandidatesForFiles(baseKinds, filePaths)
+	if cap, ok := g.(graph.MutationScopedCrossRepoCandidates); ok {
+		return cap.CrossRepoCandidatesForMutation(baseKinds, edgeSourceFiles, incidentNodeFiles)
 	}
-	return crossRepoCandidatesFallback(g, baseKinds, nil, stringSet(filePaths))
+	return crossRepoCandidatesFallbackScopes(g, baseKinds, nil, stringSet(edgeSourceFiles), stringSet(incidentNodeFiles))
 }
 
 func stringSet(values []string) map[string]struct{} {
@@ -231,34 +232,30 @@ func stringSet(values []string) map[string]struct{} {
 // and endpoint N+1 reads: kinds are streamed and endpoint nodes are fetched in
 // one batch.
 func crossRepoCandidatesFallback(g graph.Store, baseKinds []graph.EdgeKind, repos, files map[string]struct{}) []graph.CrossRepoCandidateRow {
-	if len(baseKinds) == 0 || (repos != nil && len(repos) == 0) || (files != nil && len(files) == 0) {
+	return crossRepoCandidatesFallbackScopes(g, baseKinds, repos, files, files)
+}
+
+func crossRepoCandidatesFallbackScopes(g graph.Store, baseKinds []graph.EdgeKind, repos, edgeFiles, incidentFiles map[string]struct{}) []graph.CrossRepoCandidateRow {
+	if len(baseKinds) == 0 || (repos != nil && len(repos) == 0) ||
+		(edgeFiles != nil && incidentFiles != nil && len(edgeFiles) == 0 && len(incidentFiles) == 0) {
 		return nil
 	}
-	seenKinds := make(map[graph.EdgeKind]struct{}, len(baseKinds))
 	var edges []*graph.Edge
-	for _, kind := range baseKinds {
-		if kind == "" {
-			continue
-		}
-		if _, duplicate := seenKinds[kind]; duplicate {
-			continue
-		}
-		seenKinds[kind] = struct{}{}
-		for edge := range g.EdgesByKind(kind) {
-			if edge != nil {
-				edges = append(edges, edge)
-			}
+	for edge := range graph.EdgesLightSeq(g, baseKinds...) {
+		if edge != nil {
+			edges = append(edges, edge)
 		}
 	}
 	endpointIDs := make([]string, 0, len(edges)*2)
 	for _, edge := range edges {
 		endpointIDs = append(endpointIDs, edge.From, edge.To)
 	}
-	nodes := g.GetNodesByIDs(endpointIDs)
+	placements := graph.NodePlacementsByIDs(g, endpointIDs)
 	out := make([]graph.CrossRepoCandidateRow, 0, len(edges))
 	for _, edge := range edges {
-		from, to := nodes[edge.From], nodes[edge.To]
-		if from == nil || to == nil || from.RepoPrefix == "" || to.RepoPrefix == "" || from.RepoPrefix == to.RepoPrefix {
+		from, fromOK := placements[edge.From]
+		to, toOK := placements[edge.To]
+		if !fromOK || !toOK || from.RepoPrefix == "" || to.RepoPrefix == "" || from.RepoPrefix == to.RepoPrefix {
 			continue
 		}
 		if repos != nil {
@@ -268,10 +265,10 @@ func crossRepoCandidatesFallback(g graph.Store, baseKinds []graph.EdgeKind, repo
 				continue
 			}
 		}
-		if files != nil {
-			_, edgeScoped := files[edge.FilePath]
-			_, fromScoped := files[from.FilePath]
-			_, toScoped := files[to.FilePath]
+		if edgeFiles != nil || incidentFiles != nil {
+			_, edgeScoped := edgeFiles[edge.FilePath]
+			_, fromScoped := incidentFiles[from.FilePath]
+			_, toScoped := incidentFiles[to.FilePath]
 			if !edgeScoped && !fromScoped && !toScoped {
 				continue
 			}

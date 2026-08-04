@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"database/sql"
 	"encoding/binary"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -137,7 +138,7 @@ func (s *Store) LoadCloneShingles(repoPrefix string) (map[string][]uint64, error
 	out := make(map[string][]uint64)
 	for rows.Next() {
 		var id string
-		var blob []byte
+		var blob sql.RawBytes
 		if err := rows.Scan(&id, &blob); err != nil {
 			return nil, err
 		}

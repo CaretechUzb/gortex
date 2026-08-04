@@ -33,6 +33,7 @@ type incrementalBatchStage struct {
 	graphPath     string
 	src           []byte
 	result        *parser.ExtractionResult
+	prepared      *preparedExtraction
 	priorNodes    []*graph.Node
 	storedGraph   fileDeltaFingerprints
 	storedDerived derivedFingerprints
@@ -43,6 +44,16 @@ type incrementalBatchStage struct {
 	reuse         map[reuseKey]*reuseVal
 	priorPending  []*graph.Edge
 	bytes         int64
+}
+
+func (stage *incrementalBatchStage) releasePrepared() {
+	if stage == nil {
+		return
+	}
+	stage.prepared.release()
+	stage.prepared = nil
+	stage.src = nil
+	stage.result = nil
 }
 
 type fileReadReceipt struct {
@@ -170,9 +181,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 	// release the batch's trees on every exit, committed or not.
 	defer func() {
 		for _, stage := range stages {
-			if stage != nil {
-				stage.result.ReleaseTree()
-			}
+			stage.releasePrepared()
 		}
 	}()
 	fallbacks := make([]incrementalFallback, 0)
@@ -185,7 +194,15 @@ func (idx *Indexer) reindexIncrementalChunk(
 		priorNodes := priorByFile[graphPath]
 		storedGraph := storedExtractionGraphFingerprints(priorNodes)
 		storedDerived := storedDerivedFingerprints(priorNodes)
-		probe, probeOK := idx.prepareFileDelta(filePath)
+		// Once this chunk retains a prepared result, never block while
+		// asking the shared budget for another. Admission pressure flushes
+		// the partial chunk and retries this file in the next chunk; this
+		// prevents repositories from each holding a partial batch while all
+		// wait for capacity owned by the others.
+		probe, probeOK, admissionBusy := idx.prepareFileDeltaWithAdmission(filePath, len(stages) > 0)
+		if admissionBusy {
+			break
+		}
 		consumed++
 
 		if probeOK && storedGraph.semantic != "" &&
@@ -214,6 +231,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 			prepared, ok = idx.takePreparedRefresh(filePath)
 		}
 		if !ok || prepared == nil || prepared.result == nil {
+			prepared.release()
 			fallbacks = append(fallbacks, incrementalFallback{
 				filePath: filePath, graphPath: graphPath, priorNodes: priorNodes,
 				storedGraph: storedGraph, storedDerived: storedDerived,
@@ -227,7 +245,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 			absPath: filePath, mtimeKey: idx.relKey(filePath),
 			readVersion: prepared.readVersion,
 			relPath:     prepared.relPath, graphPath: graphPath,
-			src: prepared.src, result: prepared.result, priorNodes: priorNodes,
+			src: prepared.src, result: prepared.result, prepared: prepared, priorNodes: priorNodes,
 			storedGraph: storedGraph, storedDerived: storedDerived, probe: probe,
 			metadataOnly: storedGraph.semantic != "" &&
 				probe.fingerprints.semantic == storedGraph.semantic,
@@ -249,6 +267,12 @@ func (idx *Indexer) reindexIncrementalChunk(
 			receipts = append(receipts, fileReadReceipt{
 				absPath: stage.absPath, mtimeKey: stage.mtimeKey, readVersion: stage.readVersion,
 			})
+		}
+		// Commit no longer reads the staged source, result, or tree. Return
+		// their shared admission capacity before fallback work or receipt
+		// validation can wait behind another repository.
+		for _, stage := range stages {
+			stage.releasePrepared()
 		}
 	}
 	freshPaths, stalePaths := idx.recordFileReadVersionsBatched(receipts)
@@ -1016,12 +1040,14 @@ func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (f
 		return fresh, stale
 	}
 	idx.mtimeMu.Lock()
+	idx.ensureFileMtimesWritableLocked()
 	for path, mtime := range mtimes {
 		idx.fileMtimes[path] = mtime
 	}
 	idx.mtimeMu.Unlock()
 	if writer, ok := idx.graph.(graph.FileMtimeWriter); ok {
 		if err := writer.BulkSetFileMtimes(idx.repoPrefix, mtimes); err != nil {
+			idx.markFileMtimePersistenceDirty()
 			idx.logger.Warn("persist file mtimes failed",
 				zap.String("repo", idx.repoPrefix), zap.Int("files", len(mtimes)), zap.Error(err))
 		}
@@ -1111,19 +1137,25 @@ func (idx *Indexer) enrichAndMarkIncrementalStages(
 ) {
 	providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
 	pending := make(map[string]bool, len(stages))
+	eligible := make([]*incrementalBatchStage, 0, len(stages))
 	for _, stage := range stages {
-		pending[stage.graphPath] = providersPresent
+		omitSecondarySourceScans := extractionDispositionFor(stage.result).omitSecondarySourceScans()
+		pending[stage.graphPath] = providersPresent && !omitSecondarySourceScans
+		if !omitSecondarySourceScans {
+			eligible = append(eligible, stage)
+		}
 	}
-	watchEnrichment := providersPresent && !idx.deferGlobalPasses.Load() && idx.semanticMgr.EnrichesOnWatch() &&
+	watchEnrichment := providersPresent && len(eligible) > 0 &&
+		!idx.deferGlobalPasses.Load() && idx.semanticMgr.EnrichesOnWatch() &&
 		(markerBatch == nil || !markerBatch.deferResolverCatchup)
 	if watchEnrichment {
-		paths := make([]string, 0, len(stages))
-		for _, stage := range stages {
+		paths := make([]string, 0, len(eligible))
+		for _, stage := range eligible {
 			paths = append(paths, stage.graphPath)
 		}
 		idx.observeIncrementalCatchup("semantic", paths)
 		byLanguage := make(map[string][]string)
-		for _, stage := range stages {
+		for _, stage := range eligible {
 			language := ""
 			for _, node := range stage.result.Nodes {
 				if node != nil && node.Kind == graph.KindFile {
@@ -1539,6 +1571,7 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		edgesRemoved += edges
 	}
 	idx.mtimeMu.Lock()
+	idx.ensureFileMtimesWritableLocked()
 	for _, relPath := range deleted {
 		delete(idx.fileMtimes, relPath)
 	}

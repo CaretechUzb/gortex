@@ -754,8 +754,8 @@ func TestProviderEnrichRepoBatchesExternalSQLiteMutations(t *testing.T) {
 	_, err = provider.Enrich(counting, root)
 	require.NoError(t, err)
 
-	require.Equal(t, 1, counting.existingNodeIDCalls,
-		"external prefetch must use one lightweight ID-existence batch")
+	require.Equal(t, 2, counting.existingNodeIDCalls,
+		"external prefetch and final apply recheck must each use one lightweight ID-existence batch")
 	require.Zero(t, counting.getNodesByIDsCalls,
 		"external prefetch and SQLite stamps must not materialize full nodes")
 	require.Equal(t, 1, counting.repoSummaryCalls)
@@ -951,15 +951,15 @@ func TestGoTypesHeavyGateDefaultsToOneAndHonorsCancellation(t *testing.T) {
 	provider := newTestProvider(t)
 	require.Equal(t, defaultGoTypesConcurrency, cap(provider.heavyGate))
 
-	release, err := provider.acquireHeavy(context.Background())
+	release, err := provider.acquireHeavy(context.Background(), false)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = provider.acquireHeavy(ctx)
+	_, err = provider.acquireHeavy(ctx, false)
 	require.ErrorIs(t, err, context.Canceled)
 	release()
 
-	release, err = provider.acquireHeavy(context.Background())
+	release, err = provider.acquireHeavy(context.Background(), false)
 	require.NoError(t, err, "the cancelled waiter must not consume the slot")
 	release()
 }

@@ -97,7 +97,7 @@ func TestReconcileRepoCtx_ScopedEqualsFullIndex(t *testing.T) {
 	mi := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
-	priorMtimes := mi.GetMetadata("repo").FileMtimes
+	priorMtimes := mi.FileMtimes("repo")
 	require.NotEmpty(t, priorMtimes)
 
 	// Mutate on disk while the daemon is "down": add, edit, delete, rename.
@@ -169,7 +169,7 @@ func TestReconcileRepoCtx_Routing(t *testing.T) {
 		mi := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
 		_, err = mi.IndexAll()
 		require.NoError(t, err)
-		return s, cm, mi.GetMetadata("repo").FileMtimes
+		return s, cm, mi.FileMtimes("repo")
 	}
 
 	reconcile := func(t *testing.T, s *store_sqlite.Store, cm *config.ConfigManager, repoPath string, prior map[string]int64) *IndexResult {

@@ -61,6 +61,51 @@ func TestMarkEdgesCrossRepoIsSetOrientedDurableAndIdempotent(t *testing.T) {
 	require.Equal(t, 1, statements)
 }
 
+func TestMutationScopedCrossRepoCandidatesSeparatesEdgeSourcesAndIncidentDefinitions(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	nodes := []*graph.Node{
+		{ID: "repoA/a.go::A", Kind: graph.KindFunction, FilePath: "repoA/a.go", RepoPrefix: "repoA"},
+		{ID: "repoB/b.go::B", Kind: graph.KindFunction, FilePath: "repoB/b.go", RepoPrefix: "repoB"},
+		{ID: "repoD/definition.go::D", Kind: graph.KindFunction, FilePath: "repoD/definition.go", RepoPrefix: "repoD"},
+		{ID: "repoE/e.go::E", Kind: graph.KindFunction, FilePath: "repoE/e.go", RepoPrefix: "repoE"},
+		{ID: "repoF/edge-source.go::F", Kind: graph.KindFunction, FilePath: "repoF/edge-source.go", RepoPrefix: "repoF"},
+		{ID: "repoG/g.go::G", Kind: graph.KindFunction, FilePath: "repoG/g.go", RepoPrefix: "repoG"},
+	}
+	edges := []*graph.Edge{
+		{From: nodes[0].ID, To: nodes[1].ID, Kind: graph.EdgeCalls, FilePath: "repoF/edge-source.go", Line: 1},
+		{From: nodes[4].ID, To: nodes[5].ID, Kind: graph.EdgeCalls, FilePath: "elsewhere.go", Line: 2},
+		{From: nodes[2].ID, To: nodes[3].ID, Kind: graph.EdgeCalls, FilePath: "elsewhere.go", Line: 3},
+		{From: nodes[0].ID, To: nodes[1].ID, Kind: graph.EdgeCalls, FilePath: "repoD/definition.go", Line: 4},
+	}
+	store.AddBatch(nodes, edges)
+
+	assertLines := func(rows []graph.CrossRepoCandidateRow, want ...int) {
+		t.Helper()
+		got := make(map[int]struct{}, len(rows))
+		for _, row := range rows {
+			if row.Edge != nil {
+				got[row.Edge.Line] = struct{}{}
+			}
+		}
+		require.Len(t, rows, len(want))
+		for _, line := range want {
+			require.Contains(t, got, line)
+		}
+	}
+	baseKinds := graph.BaseKindsForCrossRepo()
+	assertLines(store.CrossRepoCandidatesForMutation(baseKinds, []string{"repoF/edge-source.go"}, nil), 1)
+	assertLines(store.CrossRepoCandidatesForMutation(baseKinds, nil, []string{"repoD/definition.go"}), 3)
+	assertLines(store.CrossRepoCandidatesForMutation(baseKinds, []string{"repoF/edge-source.go"}, []string{"repoA/a.go"}), 1, 4)
+
+	many := make([]string, 0, 601)
+	for i := 0; i < 600; i++ {
+		many = append(many, fmt.Sprintf("unrelated/%d.go", i))
+	}
+	many = append(many, "repoF/edge-source.go")
+	assertLines(store.CrossRepoCandidatesForMutation(baseKinds, many, nil), 1)
+	require.Empty(t, store.CrossRepoCandidatesForMutation(baseKinds, nil, nil))
+}
+
 func TestScopedCrossRepoCandidatesUseExactIncidentFrontiers(t *testing.T) {
 	store := openReindexReceiptTestStore(t)
 	nodes := []*graph.Node{

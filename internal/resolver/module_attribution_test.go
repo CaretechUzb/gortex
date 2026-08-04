@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -187,4 +188,128 @@ func outEdgesOfKind(g graph.Store, fileID string, kind graph.EdgeKind) []*graph.
 		}
 	}
 	return out
+}
+
+type moduleAttributionBatchCall struct {
+	nodes int
+	edges int
+}
+
+type moduleAttributionBatchRecordingStore struct {
+	graph.Store
+	addNodeCalls int
+	addEdgeCalls int
+	batchCalls   []moduleAttributionBatchCall
+	reindexSizes []int
+	events       []string
+}
+
+func (s *moduleAttributionBatchRecordingStore) AddNode(node *graph.Node) {
+	s.addNodeCalls++
+	s.Store.AddNode(node)
+}
+
+func (s *moduleAttributionBatchRecordingStore) AddEdge(edge *graph.Edge) {
+	s.addEdgeCalls++
+	s.Store.AddEdge(edge)
+}
+
+func (s *moduleAttributionBatchRecordingStore) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+	s.batchCalls = append(s.batchCalls, moduleAttributionBatchCall{nodes: len(nodes), edges: len(edges)})
+	switch {
+	case len(nodes) > 0 && len(edges) == 0:
+		s.events = append(s.events, "nodes")
+	case len(nodes) == 0 && len(edges) > 0:
+		s.events = append(s.events, "edges")
+	default:
+		s.events = append(s.events, "mixed")
+	}
+	s.Store.AddBatch(nodes, edges)
+}
+
+func (s *moduleAttributionBatchRecordingStore) ReindexEdges(batch []graph.EdgeReindex) {
+	s.reindexSizes = append(s.reindexSizes, len(batch))
+	s.events = append(s.events, "reindex")
+	s.Store.ReindexEdges(batch)
+}
+
+func TestAttributeNonGo_BatchedWritesPreserveDedupeAndOrdering(t *testing.T) {
+	base := graph.New()
+	for _, file := range []string{"app/a.py", "app/b.py", "app/c.py", "app/d.py"} {
+		seedFile(base, file, "python")
+	}
+	imports := []*graph.Edge{
+		seedExternalImport(base, "app/a.py", "numpy"),
+		seedExternalImport(base, "app/a.py", "numpy.linalg"),
+		seedExternalImport(base, "app/b.py", "numpy.random"),
+		seedExternalImport(base, "app/c.py", "numpy.typing"),
+		seedExternalImport(base, "app/d.py", "requests"),
+	}
+	base.AddNode(buildNonGoModuleNode(moduleSeed{
+		id: "module::pypi:requests", language: "python", path: "requests",
+	}))
+	base.AddEdge(&graph.Edge{
+		From: "app/c.py", To: "module::pypi:numpy", Kind: graph.EdgeDependsOnModule,
+		FilePath: "app/c.py", Origin: graph.OriginASTResolved,
+	})
+
+	store := &moduleAttributionBatchRecordingStore{Store: base}
+	New(store).attributeNonGoModuleImports()
+
+	assert.Zero(t, store.addNodeCalls, "module materialization must not use single-row writes")
+	assert.Zero(t, store.addEdgeCalls, "dependency materialization must not use single-row writes")
+	assert.Equal(t, []moduleAttributionBatchCall{{nodes: 1}, {edges: 3}}, store.batchCalls)
+	assert.Equal(t, []int{len(imports)}, store.reindexSizes)
+	assert.Equal(t, []string{"nodes", "edges", "reindex"}, store.events,
+		"modules and dependencies must be durable before import reindexing")
+
+	require.NotNil(t, base.GetNode("module::pypi:numpy"))
+	require.NotNil(t, base.GetNode("module::pypi:requests"))
+	for i, edge := range imports {
+		want := "module::pypi:numpy"
+		if i == len(imports)-1 {
+			want = "module::pypi:requests"
+		}
+		assert.Equal(t, want, edge.To)
+		assert.Equal(t, graph.OriginASTResolved, edge.Origin)
+	}
+	assert.Len(t, outEdgesOfKind(base, "app/a.py", graph.EdgeDependsOnModule), 1,
+		"dependsSeen must collapse sub-imports from one file")
+	assert.Len(t, outEdgesOfKind(base, "app/b.py", graph.EdgeDependsOnModule), 1)
+	assert.Len(t, outEdgesOfKind(base, "app/c.py", graph.EdgeDependsOnModule), 1,
+		"existingDepends must suppress an already persisted dependency")
+	assert.Len(t, outEdgesOfKind(base, "app/d.py", graph.EdgeDependsOnModule), 1)
+	assert.Equal(t, 9, base.EdgeCount(), "five imports plus four dependency identities")
+}
+
+func TestAttributeNonGo_BoundsModuleAndDependencyWriteBatches(t *testing.T) {
+	base := graph.New()
+	seedFile(base, "app/main.py", "python")
+	count := moduleAttributionWriteBatchSize + 1
+	imports := make([]*graph.Edge, 0, count)
+	for i := 0; i < count; i++ {
+		name := "package_" + strconv.Itoa(i)
+		imports = append(imports, &graph.Edge{
+			From: "app/main.py", To: "external::" + name, Kind: graph.EdgeImports,
+			FilePath: "app/main.py", Line: i + 1,
+		})
+	}
+	base.AddBatch(nil, imports)
+
+	store := &moduleAttributionBatchRecordingStore{Store: base}
+	New(store).attributeNonGoModuleImports()
+
+	assert.Zero(t, store.addNodeCalls)
+	assert.Zero(t, store.addEdgeCalls)
+	assert.Equal(t, []moduleAttributionBatchCall{
+		{nodes: moduleAttributionWriteBatchSize}, {nodes: 1},
+		{edges: moduleAttributionWriteBatchSize}, {edges: 1},
+	}, store.batchCalls)
+	assert.Equal(t, []int{count}, store.reindexSizes,
+		"ReindexEdges must retain one ordered batch covering every rewritten import")
+	assert.Equal(t, []string{"nodes", "nodes", "edges", "edges", "reindex"}, store.events)
+	assert.Equal(t, count+1, base.NodeCount(), "one file plus one module per import")
+	assert.Equal(t, count*2, base.EdgeCount(), "one import and one dependency per module")
+	assert.Equal(t, "module::pypi:package_0", imports[0].To)
+	assert.Equal(t, "module::pypi:package_"+strconv.Itoa(count-1), imports[count-1].To)
 }

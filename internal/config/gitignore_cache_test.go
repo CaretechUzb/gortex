@@ -257,6 +257,46 @@ func BenchmarkEffectiveExclude(b *testing.B) {
 	}
 }
 
+// benchSetupLayout builds a repo `depth` directories below its git root and
+// tracks the deepest one, so the benchmark quotes the steady-state cost of
+// the chain walk for each real-world layout. depth 0 is the common case
+// (tracked root == git root); depth 2 is the monorepo the chain exists for.
+func benchSetupLayout(b *testing.B, depth int) *ConfigManager {
+	b.Helper()
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-cache-bench/config.yaml")
+	require.NoError(b, err)
+	root := b.TempDir()
+	require.NoError(b, os.MkdirAll(filepath.Join(root, ".git"), 0o755))
+	require.NoError(b, os.WriteFile(filepath.Join(root, ".gitignore"), []byte(benchGitignore), 0o644))
+	tracked := root
+	for i := 0; i < depth; i++ {
+		tracked = filepath.Join(tracked, "nested")
+	}
+	require.NoError(b, os.MkdirAll(tracked, 0o755))
+	cm.LoadWorkspaceConfig("r", tracked)
+	return cm
+}
+
+func BenchmarkEffectiveExcludeAtGitRoot(b *testing.B) {
+	cm := benchSetupLayout(b, 0)
+	cm.EffectiveExclude("r")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = cm.EffectiveExclude("r")
+	}
+}
+
+func BenchmarkEffectiveExcludeBelowGitRoot(b *testing.B) {
+	cm := benchSetupLayout(b, 2)
+	cm.EffectiveExclude("r")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = cm.EffectiveExclude("r")
+	}
+}
+
 func BenchmarkEffectiveExcludeUncached(b *testing.B) {
 	cm := benchSetup(b)
 	cm.mu.RLock()

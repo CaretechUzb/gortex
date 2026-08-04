@@ -146,7 +146,7 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, languagesJSON, filesJ
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		edge, err := scanEdge(rows)
+		edge, err := scanEdgeCursor(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out
@@ -207,7 +207,7 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, languagesJSON, filesJ
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		edge, err := scanEdge(rows)
+		edge, err := scanEdgeCursor(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out
@@ -295,7 +295,7 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, idsJSON, kindsJSON)
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		edge, err := scanEdge(rows)
+		edge, err := scanEdgeCursor(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out

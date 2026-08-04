@@ -40,7 +40,10 @@ type RepoMetadata struct {
 	NodeCount     int
 	EdgeCount     int
 	ParseErrors   []IndexError
-	FileMtimes    map[string]int64
+	// FileMtimes is the immutable committed snapshot shared with the owning
+	// Indexer. Treat it as read-only: later indexer mutations detach through
+	// copy-on-write, so this map never observes a partially applied batch.
+	FileMtimes map[string]int64
 	// IsWorktree records whether RootPath was a linked git worktree
 	// (as opposed to a main checkout) at the time the repo was
 	// tracked. Captured here because once the worktree directory is
@@ -80,6 +83,17 @@ type MultiIndexer struct {
 	// competes for the same weighted in-memory budget; repos that do not fit
 	// immediately stream to SQLite instead of waiting or overcommitting RAM.
 	shadowAdmission *shadowAdmissionBudget
+
+	// parseAdmission is the daemon-wide raw bytes-in-flight gate propagated to
+	// every per-repo Indexer. Unlike the shadow gate it blocks briefly instead
+	// of falling back, because parsing must happen somewhere; sharing one gate
+	// prevents N parallel repos from each consuming their full private budget.
+	parseAdmission atomic.Pointer[parseAdmissionBudget]
+
+	// nativeParseAdmission independently bounds actual in-process C-family
+	// extraction. It must not share accounting with parseAdmission: projected
+	// generated parsers retain raw bytes but never construct native trees.
+	nativeParseAdmission atomic.Pointer[parseAdmissionBudget]
 
 	// reconcileMu serialises ReconcileContractEdges end-to-end. The pass
 	// evicts the prior EdgeMatches / topic / bridge generation and mints
@@ -292,6 +306,8 @@ func (mi *MultiIndexer) newPerRepoIndexerGuardedWithMode(
 ) *Indexer {
 	idx := New(mi.graph, mi.registry, cfg, mi.logger)
 	idx.shadowAdmission = mi.shadowAdmission
+	idx.parseAdmission.Store(mi.parseAdmission.Load())
+	idx.nativeParseAdmission.Store(mi.nativeParseAdmission.Load())
 	idx.repositoryMutationOwner = mi
 	idx.search = mi.search
 	if mi.embedder != nil {
@@ -512,8 +528,54 @@ func (mi *MultiIndexer) SeedPendingEnrichAll() int {
 	return pending
 }
 
+// DeferredPassesResult reports both how the deferred tail resolved its
+// mutation frontier and whether that cross-repository catch-up completed.
+// ExactCrossRepoComplete distinguishes exact receipt-guided work from a full
+// fallback. CrossRepoComplete is true for either form only after it succeeds.
+// The mutation revision is captured at that completion boundary so lifecycle
+// callers can fail closed if any graph writer interleaves before they decide
+// whether a later safety sweep is redundant.
+type DeferredPassesResult struct {
+	EnrichScheduled                int
+	ExactCrossRepoComplete         bool
+	CrossRepoComplete              bool
+	CrossRepoMutationRevision      uint64
+	CrossRepoMutationRevisionKnown bool
+}
+
+// GraphMutationRevision returns the store's monotonic node+edge mutation
+// revision when supported. A caller must treat an unsupported revision as an
+// absent completion proof, never as revision zero.
+func (mi *MultiIndexer) GraphMutationRevision() (uint64, bool) {
+	if mi == nil || mi.graph == nil {
+		return 0, false
+	}
+	revisioner, ok := mi.graph.(interface{ MutationRevision() uint64 })
+	if !ok {
+		return 0, false
+	}
+	return revisioner.MutationRevision(), true
+}
+
 func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) int {
-	return mi.BeginDeferredPasses(ctx, nil).FinishTail()
+	return mi.RunDeferredPassesAllResult(ctx).EnrichScheduled
+}
+
+// RunDeferredPassesAllResult is the result-bearing orchestration form used by
+// lifecycle callers that must decide whether a later global safety sweep is
+// still required. RunDeferredPassesAll preserves the compatibility surface.
+func (mi *MultiIndexer) RunDeferredPassesAllResult(ctx context.Context) DeferredPassesResult {
+	return mi.BeginDeferredPasses(ctx, nil).FinishTailResult()
+}
+
+// finishColdDeferredPasses completes the cold-index deferred tail without
+// repeating the whole-graph cross-repository resolver. The receipt-guided tail
+// already performs either exact cross-repository catch-up or a fail-closed full
+// pass; only contract-bridge reconciliation remains afterward.
+func (mi *MultiIndexer) finishColdDeferredPasses(ctx context.Context) DeferredPassesResult {
+	result := mi.RunDeferredPassesAllResult(ctx)
+	mi.ReconcileContractEdges()
+	return result
 }
 
 // DeferredPassesRun is one in-flight execution of the deferred pass pipeline,
@@ -533,15 +595,14 @@ type DeferredPassesRun struct {
 	indexerCount    int
 	receiptStore    graph.MutationReceiptStore
 	receiptToken    graph.MutationReceiptToken
+	receiptOpen     bool
 	poolDone        chan struct{}
 	restoreGCTune   func()
 	// unresolvedCounter/-Base bound the deferred window's unresolved-target
-	// writes. When the counter is unchanged at FinishTail, the incomplete-
-	// receipt whole-graph fallback resolve is provably a no-op and is
-	// skipped. The base is re-snapshotted at apply-gate open (before any
-	// parked apply can run) so the master resolver's own in-window writes —
-	// e.g. guard reverts, already handled by that same pass — don't defeat
-	// the skip.
+	// writes for diagnostics. The base is re-snapshotted at apply-gate open
+	// (before any parked apply can run), so resolver writes are excluded. A
+	// flat counter is not exact evidence by itself: new definitions and
+	// already-resolved cross-repo edges still require receipt-guided catch-up.
 	unresolvedCounter graph.UnresolvedInsertionCounter
 	unresolvedBase    uint64
 }
@@ -556,19 +617,33 @@ func (r *DeferredPassesRun) SnapshotUnresolvedBase() {
 	}
 }
 
-// BeginDeferredPasses selects the repos with deferred work, opens the
+// BeginApplyMutationReceipt opens the exact observation window for semantic
+// applies and contract commits. Warmup calls it after pre-enrichment resolution
+// has completed and before closing the apply gate, so resolver writes cannot
+// void the receipt and no parked apply can escape it. It is idempotent.
+func (r *DeferredPassesRun) BeginApplyMutationReceipt() {
+	if r == nil {
+		return
+	}
+	r.SnapshotUnresolvedBase()
+	if r.receiptStore == nil || r.receiptOpen {
+		return
+	}
+	r.receiptToken = r.receiptStore.BeginMutationReceipt()
+	r.receiptOpen = true
+}
+
+// BeginDeferredPasses selects the repos with deferred work, prepares the
 // mutation-receipt window, materialises go.mod dependencies, and launches the
 // enrichment pool on its own goroutine. The caller must call FinishTail (which
 // joins the pool) exactly once. applyGate, when non-nil, parks every
 // provider's graph-apply phase until the caller closes it — the caller MUST
-// close it (typically when its resolve phase completes) or FinishTail
-// deadlocks.
+// first call BeginApplyMutationReceipt after its resolve phase, then close the
+// gate, or FinishTail deadlocks.
 //
-// When the pool is overlapped with a resolve phase, the resolver's writes land
-// inside the receipt window and void it, so the tail's catch-up resolve takes
-// the whole-graph fallback — the fail-closed path it already had — instead of
-// the exact-files fast path. That trade is the overlap's cost and is bounded
-// by terminal-stamping (the fallback scans only the surviving pending set).
+// Without an apply gate the receipt opens here. With overlap, delaying it until
+// the apply boundary excludes resolver writes while still observing every
+// semantic apply and contract commit, preserving an exact file frontier.
 func (mi *MultiIndexer) BeginDeferredPasses(_ context.Context, applyGate <-chan struct{}) *DeferredPassesRun {
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
@@ -621,24 +696,18 @@ func (mi *MultiIndexer) BeginDeferredPasses(_ context.Context, applyGate <-chan 
 	}
 
 	// Keep the receipt window exact: only go.mod materialisation, semantic
-	// enrichment, and contract commits are observed (plus, under overlap, the
-	// resolver — which voids it, see above). The capability is optional;
-	// unsupported stores retain the conservative scheduled-work fallback.
-	// Under overlap (applyGate != nil) the resolver runs inside the receipt
-	// window and ALWAYS voids it — the receipt is discarded as incomplete on
-	// every such run, yet its per-write identity bookkeeping
-	// (mutationNodeIdentitiesTx: one identity SELECT per batched ID) taxes
-	// every enrichment apply in the window. Don't open a doomed receipt;
-	// the unresolved-insertion counter below carries the skip/fallback
-	// decision instead.
-	if applyGate == nil {
-		run.receiptStore, _ = mi.graph.(graph.MutationReceiptStore)
-		if run.receiptStore != nil {
-			run.receiptToken = run.receiptStore.BeginMutationReceipt()
-		}
-	}
+	// enrichment, and contract commits are observed. Without an apply gate the
+	// deferred pipeline starts after base resolution, so the window may open
+	// now and include go.mod work. With overlap, warmup opens it later — after
+	// pre-enrichment resolution and immediately before releasing parked applies.
+	// Unsupported stores retain the conservative scheduled-work fallback.
+	run.receiptStore, _ = mi.graph.(graph.MutationReceiptStore)
 	run.unresolvedCounter, _ = mi.graph.(graph.UnresolvedInsertionCounter)
-	run.SnapshotUnresolvedBase()
+	if applyGate == nil {
+		run.BeginApplyMutationReceipt()
+	} else {
+		run.SnapshotUnresolvedBase()
+	}
 
 	// Per-repo deferred work starts with serial go.mod materialisation.
 	// Semantic enrichment then runs in bounded parallel lanes on its own
@@ -656,10 +725,14 @@ func (mi *MultiIndexer) BeginDeferredPasses(_ context.Context, applyGate <-chan 
 // Wait blocks until every enrichment lane has drained.
 func (r *DeferredPassesRun) Wait() { <-r.poolDone }
 
-// FinishTail joins the enrichment pool, runs the contract passes, closes the
-// receipt window, and performs the deferred-mutation catch-up resolve. It
-// returns the number of repos that had enrichment scheduled.
+// FinishTail preserves the compatibility result used by existing callers.
 func (r *DeferredPassesRun) FinishTail() int {
+	return r.FinishTailResult().EnrichScheduled
+}
+
+// FinishTailResult joins the enrichment pool, runs the contract passes, closes
+// the receipt window, and performs the deferred-mutation catch-up resolve.
+func (r *DeferredPassesRun) FinishTailResult() DeferredPassesResult {
 	r.Wait()
 	// Contract passes run serially only after every enrichment lane has
 	// drained: the "no contract mutation overlaps enrichment" invariant
@@ -670,9 +743,10 @@ func (r *DeferredPassesRun) FinishTail() int {
 		idx.runDeferredContractsAndReleaseSemanticState()
 	}
 	var mutationReceipt *graph.MutationReceipt
-	if r.receiptStore != nil {
+	if r.receiptStore != nil && r.receiptOpen {
 		receipt := r.receiptStore.EndMutationReceipt(r.receiptToken)
 		mutationReceipt = &receipt
+		r.receiptOpen = false
 	}
 	for _, idx := range r.workIndexers {
 		idx.SetSkipResolveInDeferred(false)
@@ -681,11 +755,22 @@ func (r *DeferredPassesRun) FinishTail() int {
 	scope := normalizeDeferredCatchupScope(r.catchupScope, r.catchupKnown, r.indexerCount)
 	noNewUnresolved := r.unresolvedCounter != nil &&
 		r.unresolvedCounter.UnresolvedEdgeInsertions() == r.unresolvedBase
-	r.mi.resolveDeferredMutations(mutationReceipt, r.catchupNeeded, scope, noNewUnresolved)
+	mode, crossRepoComplete := r.mi.resolveDeferredMutations(mutationReceipt, r.catchupNeeded, scope, noNewUnresolved)
+	var mutationRevision uint64
+	var mutationRevisionKnown bool
+	if crossRepoComplete {
+		mutationRevision, mutationRevisionKnown = r.mi.GraphMutationRevision()
+	}
 	if r.restoreGCTune != nil {
 		r.restoreGCTune()
 	}
-	return r.enrichScheduled
+	return DeferredPassesResult{
+		EnrichScheduled:                r.enrichScheduled,
+		ExactCrossRepoComplete:         crossRepoComplete && mode != deferredResolveFallback,
+		CrossRepoComplete:              crossRepoComplete,
+		CrossRepoMutationRevision:      mutationRevision,
+		CrossRepoMutationRevisionKnown: mutationRevisionKnown,
+	}
 }
 
 // normalizeDeferredCatchupScope preserves the resolver's full-pass semantics
@@ -708,61 +793,73 @@ const (
 	deferredResolveSkipped  deferredResolveMode = "skipped"
 	deferredResolveExact    deferredResolveMode = "exact_files"
 	deferredResolveFallback deferredResolveMode = "fallback_all"
+	deferredResolveFailed   deferredResolveMode = "failed"
 )
 
 // resolveDeferredMutations chooses the narrowest safe catch-up resolution.
-// A complete receipt is authoritative even when the old scheduled-work
-// heuristic predicted mutations; an incomplete receipt always fails closed to
-// a whole-graph pass. nil means the store does not support receipts yet.
-func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt, fallbackNeeded bool, fallbackScope map[string]struct{}, noNewUnresolved bool) deferredResolveMode {
-	// The counter's verdict holds regardless of receipt availability: zero
-	// unresolved-target writes in the window means the catch-up resolve —
-	// receipt-scoped, heuristic-scoped, or whole-graph — has provably
-	// nothing to bind.
-	if noNewUnresolved {
-		mi.logger.Info("DEFERRED-TIMING no unresolved-target writes in deferred window; skipping catch-up resolve")
-		return deferredResolveSkipped
+// The boolean reports completion independently from whether the work used an
+// exact receipt frontier or a full fallback. A complete receipt is
+// authoritative even when the old scheduled-work heuristic predicted
+// mutations; an incomplete receipt always fails closed to a whole-graph pass.
+// nil means the store does not support receipts yet.
+func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt, fallbackNeeded bool, fallbackScope map[string]struct{}, noNewUnresolved bool) (deferredResolveMode, bool) {
+	fullFallback := func(masterScope map[string]struct{}, reason string) (deferredResolveMode, bool) {
+		// A flat unresolved-insertion counter cannot prove that cross-repository
+		// catch-up is empty: enrichment may add a definition that binds an old
+		// incoming stub, or add an already-resolved base edge whose parallel
+		// cross_repo_* edge still needs materialising. Only a complete receipt
+		// with an exact file frontier may avoid this fail-closed pass.
+		if noNewUnresolved {
+			mi.logger.Info("DEFERRED-TIMING unresolved-target counter unchanged; retaining fallback for definitions and resolved cross-repo edges",
+				zap.String("reason", reason))
+		}
+		if err := mi.runMasterResolveHookedContext(context.Background(), masterScope, false, nil); err != nil {
+			mi.logger.Error("DEFERRED-TIMING fallback master resolve failed", zap.Error(err))
+			return deferredResolveFailed, false
+		}
+		if err := mi.runCrossRepoResolveContext(context.Background(), false); err != nil {
+			mi.logger.Error("DEFERRED-TIMING fallback cross-repo resolve failed", zap.Error(err))
+			return deferredResolveFailed, false
+		}
+		resolver.DetectCrossRepoEdges(mi.graph)
+		return deferredResolveFallback, true
 	}
+
 	if receipt != nil {
 		if !receipt.Complete {
-			if noNewUnresolved {
-				// The receipt was voided (overlap does this by design), but
-				// the store counted zero unresolved-target edge writes since
-				// the apply gate opened — nothing exists for a whole-graph
-				// fallback to resolve that the master pass hasn't already
-				// seen. Measured cost of the blind fallback: 68.8s to
-				// resolve 0 of 282,669 pending.
-				mi.logger.Info("DEFERRED-TIMING mutation receipt incomplete but no unresolved-target writes in window; skipping fallback resolve",
-					zap.String("incomplete_reason", receipt.IncompleteReason))
-				return deferredResolveSkipped
-			}
 			mi.logger.Info("DEFERRED-TIMING mutation receipt incomplete; resolving all",
 				zap.String("incomplete_reason", receipt.IncompleteReason))
-			mi.runMasterResolve(nil, false)
-			return deferredResolveFallback
+			return fullFallback(nil, receipt.IncompleteReason)
 		}
-		if !receipt.ResolutionRelevant {
-			mi.logger.Info("DEFERRED-TIMING mutation receipt has no resolution delta",
-				zap.Int("changed_files", len(receipt.ChangedFiles)),
-				zap.Int("target_ids", len(receipt.TargetIDs)))
-			return deferredResolveSkipped
-		}
-		files := receipt.ResolutionFiles()
-		if len(files) == 0 {
+
+		resolutionFiles := receipt.ResolutionFiles()
+		crossRepoFiles := receipt.CrossRepoFiles()
+		if receipt.ResolutionRelevant && len(resolutionFiles) == 0 {
 			// Completeness implementations should already reject this shape, but
 			// keep the consumer fail-closed if a future backend gets it wrong.
 			mi.logger.Warn("DEFERRED-TIMING resolution delta lacks exact files; resolving all")
-			mi.runMasterResolve(nil, false)
-			return deferredResolveFallback
+			return fullFallback(nil, "resolution_delta_without_files")
 		}
-		mi.runMasterResolveFiles(files, false)
-		return deferredResolveExact
+		if len(resolutionFiles) == 0 && len(crossRepoFiles) == 0 {
+			mi.logger.Info("DEFERRED-TIMING mutation receipt has no file-scoped resolution or cross-repo delta",
+				zap.Int("changed_files", len(receipt.ChangedFiles)),
+				zap.Int("target_ids", len(receipt.TargetIDs)))
+			return deferredResolveSkipped, true
+		}
+
+		if receipt.ResolutionRelevant {
+			mi.runMasterResolveFiles(resolutionFiles, false)
+		}
+		// Resolve only files that can create or bind unresolved edges. Resolved
+		// edge sources still materialise their cross_repo_* generation without
+		// repeating the substantially larger name-resolution frontier.
+		mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, receipt.ChangedFiles, receipt.DefinitionFiles)
+		return deferredResolveExact, true
 	}
 	if !fallbackNeeded {
-		return deferredResolveSkipped
+		return deferredResolveSkipped, true
 	}
-	mi.runMasterResolve(fallbackScope, false)
-	return deferredResolveFallback
+	return fullFallback(fallbackScope, "mutation_receipt_unavailable")
 }
 
 // runMasterResolve runs one same-repo resolver over the whole shared graph,
@@ -804,12 +901,27 @@ func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}, useLSP bool)
 // runMasterResolveHooked is runMasterResolve with an optional compute-done
 // hook threaded into the resolver (see Resolver.OnComputeDone).
 func (mi *MultiIndexer) runMasterResolveHooked(scope map[string]struct{}, useLSP bool, onComputeDone func()) {
+	if err := mi.runMasterResolveHookedContext(context.Background(), scope, useLSP, onComputeDone); err != nil {
+		mi.logger.Error("DEFERRED-TIMING master.ResolveAll", zap.Error(err))
+	}
+}
+
+func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope map[string]struct{}, useLSP bool, onComputeDone func()) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	setupStart := time.Now()
 	master := mi.newMasterResolver(useLSP)
+	mi.logger.Info("DEFERRED-TIMING master setup",
+		zap.Duration("elapsed", time.Since(setupStart)),
+		zap.Bool("initialized", master != nil),
+		zap.Bool("lsp_enabled", useLSP && mi.resolverLSPHelper != nil),
+		zap.Int("scope_repos", len(scope)))
 	if master == nil {
-		if onComputeDone != nil {
+		if onComputeDone != nil && ctx.Err() == nil {
 			onComputeDone()
 		}
-		return
+		return ctx.Err()
 	}
 	master.OnComputeDone = onComputeDone
 	scoped := len(scope) > 0 && mi.scopedGlobalPassesEnabled()
@@ -817,7 +929,7 @@ func (mi *MultiIndexer) runMasterResolveHooked(scope map[string]struct{}, useLSP
 		master.SetScope(scope)
 	}
 	mt := time.Now()
-	stats := master.ResolveAll()
+	stats, err := master.ResolveAllContext(ctx)
 	mi.logger.Info("DEFERRED-TIMING master.ResolveAll",
 		zap.Duration("elapsed", time.Since(mt)),
 		zap.Bool("scoped", scoped),
@@ -828,7 +940,9 @@ func (mi *MultiIndexer) runMasterResolveHooked(scope map[string]struct{}, useLSP
 		// pass (see ResolveStats). A 666k-conversion pass with these two
 		// nearly equal is a pass that admitted nearly everything it scanned.
 		zap.Int("pending_scanned", stats.PendingBefore),
-		zap.Int("pending_admitted", stats.PendingAfter))
+		zap.Int("pending_admitted", stats.PendingAfter),
+		zap.Error(err))
+	return err
 }
 
 func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
@@ -875,7 +989,58 @@ func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
 // in multi-minute stretches and admitting applies between the master and
 // cross-repo passes starved cross-repo to a standstill (measured: 1,049s for
 // a pass that runs in ~38s uncontended on the same workspace).
-func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}, onComputeDone func()) {
+func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}, onComputeDone func()) error {
+	mi.runDeferredGoModAll()
+	if err := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone); err != nil {
+		return err
+	}
+	// Stamp legacy nodes after master resolution so synthetic nodes created by
+	// attribution participate in the cross-workspace boundary check below.
+	mi.BackfillWorkspaceSlugs()
+	// Cross-repo references resolve here so a multi-repo workspace is fully
+	// resolved, not just within each repo. Whole-graph so inbound references
+	// from unchanged repos into the changed repos bind too.
+	return mi.runCrossRepoResolveContext(ctx, false)
+}
+
+// RunPreEnrichResolveFiles preserves an exact warm-reconcile frontier through
+// same-repository and cross-repository resolution. A restart that reparsed one
+// file must not promote that delta to every unresolved edge in its repository.
+func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []string, onComputeDone func()) error {
+	mi.runDeferredGoModAll()
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if len(files) > 0 {
+		mi.runMasterResolveFiles(files, true)
+	}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if onComputeDone != nil {
+		onComputeDone()
+	}
+	// A legacy workspace stamp may change the eligibility of unresolved edges
+	// anywhere in the graph, not only in this exact file frontier. Project-only
+	// fills and WorkspaceID=RepoPrefix fills preserve the resolver's existing
+	// fallback semantics, so only an effective workspace-boundary change needs
+	// to escalate this exact frontier to a graph-wide pass.
+	_, _, resolutionAffected := mi.backfillWorkspaceSlugsWithImpact()
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if resolutionAffected > 0 {
+		return mi.runCrossRepoResolveContext(ctx, false)
+	}
+	mi.runCrossRepoResolveFiles(files)
+	return context.Cause(ctx)
+}
+
+func (mi *MultiIndexer) runDeferredGoModAll() {
+	var memBefore runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
+	started := time.Now()
+
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
 	for _, idx := range mi.indexers {
@@ -885,14 +1050,47 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 	sort.Slice(indexers, func(i, j int) bool {
 		return indexers[i].repoPrefix < indexers[j].repoPrefix
 	})
+
+	pending := 0
 	for _, idx := range indexers {
+		wasPending := idx.pendingContractReg != nil && !idx.deferredGoModDone
+		repoStart := time.Now()
 		idx.runDeferredGoMod()
+		elapsed := time.Since(repoStart)
+		if wasPending {
+			pending++
+		}
+		if wasPending && elapsed > 250*time.Millisecond && mi.logger != nil {
+			mi.logger.Info("DEFERRED-TIMING deferred go.mod repo",
+				zap.String("repo_prefix", idx.repoPrefix),
+				zap.Duration("elapsed", elapsed))
+		}
 	}
-	mi.runMasterResolveHooked(scope, true, onComputeDone)
-	// Cross-repo references resolve here so a multi-repo workspace is fully
-	// resolved, not just within each repo. Whole-graph so inbound references
-	// from unchanged repos into the changed repos bind too.
-	mi.runCrossRepoResolve(false)
+
+	var memAfter runtime.MemStats
+	runtime.ReadMemStats(&memAfter)
+	if mi.logger != nil {
+		mi.logger.Info("DEFERRED-TIMING deferred go.mod drain",
+			zap.Duration("elapsed", time.Since(started)),
+			zap.Int("repos", len(indexers)),
+			zap.Int("pending_repos", pending),
+			zap.Uint64("heap_alloc_before", memBefore.HeapAlloc),
+			zap.Uint64("heap_alloc_after", memAfter.HeapAlloc),
+			zap.Uint64("heap_inuse_before", memBefore.HeapInuse),
+			zap.Uint64("heap_inuse_after", memAfter.HeapInuse),
+			zap.Uint64("heap_released_before", memBefore.HeapReleased),
+			zap.Uint64("heap_released_after", memAfter.HeapReleased),
+			zap.Uint32("gc_before", memBefore.NumGC),
+			zap.Uint32("gc_after", memAfter.NumGC))
+	}
+}
+
+// RunDeferredGoModAll materializes deferred dependency contract nodes for all
+// repositories. Each per-repository drain is idempotent, so warmup can run it
+// while a coordinated bulk load is still open and the normal pre-enrichment
+// path remains a safe fallback for every other caller.
+func (mi *MultiIndexer) RunDeferredGoModAll() {
+	mi.runDeferredGoModAll()
 }
 
 // runDeferredEnrichParallel runs each indexer's semantic enrichment in a
@@ -910,10 +1108,11 @@ func (mi *MultiIndexer) runDeferredEnrichParallel(indexers []*Indexer) {
 // an exclusive batch, which serialized that repo's ENTIRE provider chain —
 // a whale's LSP sweep rode the critical path behind its own type-check.
 // Exclusivity for the genuinely heavyweight resource is enforced where the
-// resource lives: the go/types provider's heavy gate admits one full
-// go/packages program at a time (GORTEX_GOTYPES_CONCURRENCY overrides), and
-// that provider runs under the manager's outer window, so a queued heavy
-// repo waits on the gate without burning a lane or a per-repo deadline.
+// resource lives: the go/types provider admits at most one large full-repo
+// compiler program while allowing a small repo or file-bounded load to use a
+// spare total-capacity lane (GORTEX_GOTYPES_CONCURRENCY controls that cap).
+// The provider runs under the manager's outer window, so a queued heavy repo
+// waits on admission without burning a per-repo deadline.
 // Everything else — LSP sweeps, tree-sitter type providers, the other
 // languages of the same repo — flows through the pool lanes.
 func (mi *MultiIndexer) runDeferredEnrichPool(indexers []*Indexer) {
@@ -1333,6 +1532,14 @@ func (mi *MultiIndexer) runGlobalGraphPasses(
 	mi.runGlobalGraphPassesTopologyHeld(ctx, scope, censusEligible)
 }
 
+// fullCoverageGlobalPass reports whether the pass frontier covers the complete
+// tracked graph. A nil scope is the historical whole-graph form; a detached
+// census attestation makes an explicit all-repository scope equivalent while
+// preserving that scope for passes with per-repository state (notably clones).
+func fullCoverageGlobalPass(scope map[string]struct{}, censusEligible bool) bool {
+	return scope == nil || censusEligible
+}
+
 // runGlobalGraphPassesTopologyHeld runs with caller-owned topology and
 // scope/census state. It never reads or consumes armed batch fields; EndBatch
 // is their sole consumer.
@@ -1346,6 +1553,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	if mi.graph == nil {
 		return
 	}
+	fullCoverage := fullCoverageGlobalPass(scope, censusEligible)
 	reporter := progress.FromContext(ctx)
 	r := resolver.New(mi.graph)
 	// Unconditional per-sub-pass timing. These global passes run serially and
@@ -1383,14 +1591,27 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 			}
 		}
 		sort.Strings(scopedRepoPrefixes)
-		scopedTypeIfaceIDs = make(map[string]bool)
-		for _, id := range graph.ReadRepoNodeIDsByKinds(
-			mi.graph,
-			scopedRepoPrefixes,
-			[]graph.NodeKind{graph.KindType, graph.KindInterface},
-		) {
-			scopedTypeIfaceIDs[id] = true
+		if !fullCoverage {
+			scopedTypeIfaceIDs = make(map[string]bool)
+			for _, id := range graph.ReadRepoNodeIDsByKinds(
+				mi.graph,
+				scopedRepoPrefixes,
+				[]graph.NodeKind{graph.KindType, graph.KindInterface},
+			) {
+				scopedTypeIfaceIDs[id] = true
+			}
 		}
+	}
+
+	// Full-coverage batches retain their explicit repository scope for
+	// per-repository state and framework census ownership, but graph scans use
+	// nil so SQLite can select its whole-store partial indexes instead of
+	// materialising an all-repository join table.
+	scanPrefixes := changedPrefixes
+	scanRepoPrefixes := scopedRepoPrefixes
+	if fullCoverage {
+		scanPrefixes = nil
+		scanRepoPrefixes = nil
 	}
 
 	// Start breadcrumb per pass: completion-only logging left every slow pass
@@ -1398,7 +1619,8 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	passStart := func(pass string) {
 		mi.logger.Info("global pass starting",
 			zap.String("pass", pass),
-			zap.Bool("scoped", scope != nil))
+			zap.Bool("scoped", scope != nil),
+			zap.Bool("full_coverage", fullCoverage))
 	}
 
 	// The global passes below are the first big read sweeps after the
@@ -1419,7 +1641,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	implStart := time.Now()
 	implAdded := 0
 	switch {
-	case scope == nil:
+	case fullCoverage:
 		implAdded = r.InferImplements()
 	case len(scopedTypeIfaceIDs) > 0:
 		// Empty set => no type/interface changed in the batch => no inferred
@@ -1434,7 +1656,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	overStart := time.Now()
 	overAdded := 0
 	switch {
-	case scope == nil:
+	case fullCoverage:
 		overAdded = r.InferOverrides()
 	case len(scopedTypeIfaceIDs) > 0:
 		overAdded = r.InferOverridesScoped(scopedTypeIfaceIDs)
@@ -1445,7 +1667,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		zap.Duration("elapsed", time.Since(overStart)))
 	passStart("test_edges")
 	testStart := time.Now()
-	marked, emitted := markTestSymbolsAndEmitEdgesScoped(mi.graph, changedPrefixes)
+	marked, emitted := markTestSymbolsAndEmitEdgesScoped(mi.graph, scanPrefixes)
 	mi.logger.Info("global pass: test edges",
 		zap.Int("test_symbols", marked),
 		zap.Int("edges", emitted),
@@ -1462,7 +1684,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	}
 	passStart("capability_edges")
 	capStart := time.Now()
-	capRe, capEp, capFa := synthesizeCapabilityEdgesScoped(mi.graph, changedPrefixes)
+	capRe, capEp, capFa := synthesizeCapabilityEdgesScoped(mi.graph, scanPrefixes)
 	mi.logger.Info("global pass: capability edges",
 		zap.Int("reads_env", capRe),
 		zap.Int("executes_process", capEp),
@@ -1498,8 +1720,11 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		return ok
 	}
 	passStart("clone_detect")
-	cloneDetectStart := time.Now()
+	clonePassStart := time.Now()
+	cloneDetectElapsed := time.Duration(0)
+	cloneRebuildElapsed := time.Duration(0)
 	clonesDetected := 0
+	clonesRebuilt := 0
 	for _, idx := range cloneIdx {
 		if !inCloneScope(idx.repoPrefix) {
 			continue
@@ -1510,7 +1735,10 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		// (UpdateFuncs/Rebuild → idx.cloneThreshold()), or the batch and
 		// incremental edge sets diverge for any repo whose configured
 		// threshold differs from the workspace maximum.
-		if cs := detectClonesAndEmitEdgesCtx(ctx, mi.graph, idx.repoPrefix, idx.cloneThreshold()); cs.Items > 0 {
+		detectStart := time.Now()
+		cs, cloneBaseline := detectClonesAndEmitEdgesWithBaselineCtx(ctx, mi.graph, idx.repoPrefix, idx.cloneThreshold())
+		cloneDetectElapsed += time.Since(detectStart)
+		if cs.Items > 0 {
 			mi.logger.Info("clone edges emitted (global)",
 				zap.String("repo", idx.repoPrefix),
 				zap.Int("items", cs.Items),
@@ -1522,33 +1750,26 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 				zap.Int("diffused_edges", cs.DiffusedEdges),
 			)
 		}
-	}
-	// Seed each per-repo indexer's incremental clone index from the
-	// freshly-baselined signatures + sidecar (scoped to that repo's
-	// prefix) so steady-state single-file edits after this batch go
-	// incremental instead of re-running the whole-graph pass per file.
-	cloneRebuildStart := time.Now()
-	clonesRebuilt := 0
-	for _, idx := range cloneIdx {
-		if !inCloneScope(idx.repoPrefix) {
-			continue
-		}
+		// Adopt each repo's baseline immediately so the loop never retains
+		// every repository's raw-shingle corpus at once. Invalid or incomplete
+		// baselines take the existing bounded Rebuild fallback.
+		rebuildStart := time.Now()
 		if idx.cloneIndex != nil {
-			idx.cloneIndex.Rebuild(mi.graph, idx.repoPrefix)
+			idx.cloneIndex.AdoptBaselineOrRebuild(mi.graph, idx.repoPrefix, cloneBaseline)
 			clonesRebuilt++
 		}
+		cloneRebuildElapsed += time.Since(rebuildStart)
 	}
-	// Aggregate timing for the clone passes — previously the most expensive
-	// and least observable part of a warm restart (the per-repo logs above
-	// only fire when a repo actually has clone pairs, so a long run could
-	// pass with no breadcrumbs).
+	// Aggregate timing for the clone passes — the historical field names are
+	// retained for dashboards even though successful seeds are now adoptions.
 	mi.logger.Info("clone passes done (global)",
 		zap.Bool("scoped", scope != nil),
 		zap.Int("repos_total", len(cloneIdx)),
 		zap.Int("detected", clonesDetected),
 		zap.Int("rebuilt", clonesRebuilt),
-		zap.Duration("detect_elapsed", cloneRebuildStart.Sub(cloneDetectStart)),
-		zap.Duration("rebuild_elapsed", time.Since(cloneRebuildStart)),
+		zap.Duration("detect_elapsed", cloneDetectElapsed),
+		zap.Duration("rebuild_elapsed", cloneRebuildElapsed),
+		zap.Duration("elapsed", time.Since(clonePassStart)),
 	)
 	// Framework dynamic-dispatch synthesis (gRPC stubs, Temporal
 	// workflow→activity, in-process / native event channels, native
@@ -1568,6 +1789,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		zap.Any("per_synthesizer", fwRep.Per),
 		zap.Int64("census_ms", fwRep.CensusMillis),
 		zap.Int64("scope_ms", fwRep.ScopeMillis),
+		zap.Any("full_read_cache", fwRep.FullReadCache),
 		zap.Int64("gate_ms", fwRep.GateMillis),
 		zap.Int64("claim_ms", fwRep.ClaimMillis),
 		zap.Int64("demote_ms", fwRep.DemoteMillis),
@@ -1580,10 +1802,10 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	extStart := time.Now()
 	extEnabled := mi.externalCallSynthesisEnabled()
 	extCalls := 0
-	if scope != nil {
-		extCalls = resolver.SynthesizeExternalCallsForRepos(mi.graph, extEnabled, changedPrefixes)
-	} else {
+	if fullCoverage {
 		extCalls = resolver.SynthesizeExternalCalls(mi.graph, extEnabled)
+	} else {
+		extCalls = resolver.SynthesizeExternalCallsForRepos(mi.graph, extEnabled, scanPrefixes)
 	}
 	mi.logger.Info("global pass: external-call synthesis",
 		zap.Int("edges", extCalls),
@@ -1596,10 +1818,10 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	passStart("cross_repo_edges")
 	crStart := time.Now()
 	crossRepoEdges := 0
-	if scope != nil {
-		crossRepoEdges = resolver.DetectCrossRepoEdgesForRepos(mi.graph, scopedRepoPrefixes)
-	} else {
+	if fullCoverage {
 		crossRepoEdges = resolver.DetectCrossRepoEdges(mi.graph)
+	} else {
+		crossRepoEdges = resolver.DetectCrossRepoEdgesForRepos(mi.graph, scanRepoPrefixes)
 	}
 	mi.logger.Info("global pass: cross-repo edges",
 		zap.Int("edges", crossRepoEdges),
@@ -1830,13 +2052,16 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 	for _, repo := range resolved {
 		prefixes = append(prefixes, repo.prefix)
 	}
+	// Freeze one batch-mode generation before acquiring any stable repository
+	// lane. This global gate -> sorted lanes order prevents a queued transition
+	// writer from owning the gate while waiting for a lane held by this batch.
+	mi.batchMutationGate.RLock()
+	defer mi.batchMutationGate.RUnlock()
+
 	var finalResults map[string]*IndexResult
 	laneErr := mi.withRepositoryMutationLanes(context.Background(), prefixes, func() error {
-		// Freeze one batch-mode generation only after every stable repository
-		// lane is held. The one topology writer then covers parse, publication,
-		// deferred/cross-repo tails, ref-facts, and global derivation.
-		mi.batchMutationGate.RLock()
-		defer mi.batchMutationGate.RUnlock()
+		// The one topology writer covers parse, publication, deferred/cross-repo
+		// tails, ref-facts, and global derivation.
 		batchMode := mi.currentBatchMode()
 		finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 		defer finishTopologyMutation(true)
@@ -1889,8 +2114,9 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 						NodeCount:     result.NodeCount,
 						EdgeCount:     result.EdgeCount,
 						ParseErrors:   result.Errors,
-						FileMtimes:    idx.FileMtimes(),
-						IsWorktree:    ResolveWorktree(r.absPath).IsWorktree,
+						FileMtimes:    idx.publishFileMtimes(),
+
+						IsWorktree: ResolveWorktree(r.absPath).IsWorktree,
 					}
 
 					resultCh <- repoResult{prefix: r.prefix, result: result, idx: idx, meta: meta}
@@ -1955,17 +2181,15 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 			// was the dominant cold-index regression. runDeferredGoMod is generation-
 			// idempotent, so RunDeferredPassesAll does not repeat the pre-resolve work.
 			deferCtx := context.Background()
-			mi.RunPreEnrichResolve(deferCtx, nil, nil)
-			enrichScheduled := mi.RunDeferredPassesAll(deferCtx)
+			if err := mi.RunPreEnrichResolve(deferCtx, nil, nil); err != nil {
+				return results, fmt.Errorf("multi-repo pre-enrichment resolve: %w", err)
+			}
+			deferredResult := mi.finishColdDeferredPasses(deferCtx)
 			mi.logger.Info("multi-repo coordinated deferred passes complete",
 				zap.Int("repos_indexed", len(results)),
 				zap.Int("repos_failed", len(indexErrors)),
-				zap.Int("enrich_scheduled", enrichScheduled))
-
-			// Semantic and contract passes can add new cross-repository candidates.
-			// Refresh them once after the receipt-scoped same-repo catch-up and reconcile
-			// contract bridges before graph-wide derivation consumes the final graph.
-			mi.runCrossRepoResolve(true)
+				zap.Int("enrich_scheduled", deferredResult.EnrichScheduled),
+				zap.Bool("exact_cross_repo_complete", deferredResult.ExactCrossRepoComplete))
 
 			// ResolveAll normally seeds ref_facts after a full resolve. The coordinated
 			// cold path intentionally bypasses per-repository ResolveAll, so seed the
@@ -2056,6 +2280,7 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 		return nil, fmt.Errorf("indexing %s returned a nil result", meta.RootPath)
 	}
 
+	fileMtimes := idx.publishFileMtimes()
 	mi.mu.Lock()
 	mi.repos[repoPrefix] = &RepoMetadata{
 		RepoPrefix:    repoPrefix,
@@ -2066,8 +2291,9 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 		NodeCount:     result.NodeCount,
 		EdgeCount:     result.EdgeCount,
 		ParseErrors:   result.Errors,
-		FileMtimes:    idx.FileMtimes(),
-		IsWorktree:    meta.IsWorktree,
+		FileMtimes:    fileMtimes,
+
+		IsWorktree: meta.IsWorktree,
 	}
 	mi.indexers[repoPrefix] = idx
 	mi.mu.Unlock()
@@ -2243,6 +2469,7 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 		mi.resolveIncrementalRepoMutation(repoPrefix, result, nil, eviction.batch)
 	}
 
+	fileMtimes := idx.publishFileMtimes()
 	mi.mu.Lock()
 	mi.repos[repoPrefix] = &RepoMetadata{
 		RepoPrefix:    repoPrefix,
@@ -2253,8 +2480,9 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 		NodeCount:     result.NodeCount,
 		EdgeCount:     result.EdgeCount,
 		ParseErrors:   result.Errors,
-		FileMtimes:    idx.FileMtimes(),
-		IsWorktree:    meta.IsWorktree,
+		FileMtimes:    fileMtimes,
+
+		IsWorktree: meta.IsWorktree,
 	}
 	mi.mu.Unlock()
 
@@ -2292,14 +2520,16 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 		return nil, fmt.Errorf("reindexing %s: %w", meta.RootPath, err)
 	}
 
-	// Resolve exactly once after the bounded parse/evict batch. Complete
-	// mutation receipts provide the precise changed/definition file frontier;
-	// only an incomplete receipt falls back to the conservative scoped-global
-	// resolver. Derived invalidations run once below after bindings are current.
+	// Run the same-repo and cross-repo resolver tails exactly once after the
+	// bounded parse/evict batch. Complete mutation receipts provide the precise
+	// changed/definition file frontier; only an incomplete receipt falls back to
+	// conservative scoped-global resolution. Derived invalidations run once
+	// below after both binding layers are current.
 	mi.resolveIncrementalRepoMutationMode(
 		repoPrefix, result, receipt, batch, mode.exactPointSemantic,
 	)
 
+	fileMtimes := idx.publishFileMtimes()
 	mi.mu.Lock()
 	mi.repos[repoPrefix] = &RepoMetadata{
 		RepoPrefix:    repoPrefix,
@@ -2310,7 +2540,8 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 		NodeCount:     result.NodeCount,
 		EdgeCount:     result.EdgeCount,
 		ParseErrors:   result.Errors,
-		FileMtimes:    idx.FileMtimes(),
+		FileMtimes:    fileMtimes,
+
 		// Carried over from the prior metadata: this pass doesn't change
 		// it, and dropping it here (zero value on a fresh struct literal)
 		// used to silently flip a worktree back to its false default on
@@ -2502,7 +2733,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	// one graph, and every consumer that keyed on ownership — per-repo
 	// counters, scope filters, the nodes_by_repo partial index, warm-restart
 	// mtime lookups — had to carry a branch for the unprefixed shape.
-	idx := mi.newPerRepoIndexer(cfg.Index)
+	idx := mi.newPerRepoIndexerForMutation(ctx, cfg.Index)
 	idx.SetRepoPrefix(prefix)
 	// Workspace / project slugs stamped on every node. Resolution
 	// order (highest priority first): RepoEntry.Workspace from the
@@ -2516,11 +2747,11 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	idx.SetProjectID(resolveProjectID(&entryCopy, cfg, prefix))
 
 	var result *IndexResult
-	err = idx.coordinateRepositoryMutation(ctx, func() error {
+	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
-		// lane and transition read gate are held, reapply the authoritative mode.
+		// lane and transition generation are held, reapply the authoritative mode.
 		batchMode := mi.reapplyBatchModeForMutation(idx)
-		finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
+		finishTopologyMutation := mi.beginRepositoryTopologyMutation(ctx)
 		topologyChanged := false
 		defer func() { finishTopologyMutation(topologyChanged) }()
 
@@ -2553,6 +2784,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 		}
 		result.RepoPrefix = prefix
 
+		fileMtimes := idx.publishFileMtimes()
 		mi.mu.Lock()
 		mi.repos[prefix] = &RepoMetadata{
 			RepoPrefix:    prefix,
@@ -2563,8 +2795,9 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 			NodeCount:     result.NodeCount,
 			EdgeCount:     result.EdgeCount,
 			ParseErrors:   result.Errors,
-			FileMtimes:    idx.FileMtimes(),
-			IsWorktree:    ResolveWorktree(absPath).IsWorktree,
+			FileMtimes:    fileMtimes,
+
+			IsWorktree: ResolveWorktree(absPath).IsWorktree,
 		}
 		mi.indexers[prefix] = idx
 		mi.mu.Unlock()
@@ -2650,7 +2883,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	}
 
 	// Prefix unconditionally, as TrackRepoCtx does — see the note there.
-	idx := mi.newPerRepoIndexer(cfg.Index)
+	idx := mi.newPerRepoIndexerForMutation(ctx, cfg.Index)
 	idx.SetRepoPrefix(prefix)
 	entryCopy := entry
 	idx.SetWorkspaceID(resolveWorkspaceID(&entryCopy, cfg, prefix))
@@ -2659,11 +2892,11 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	idx.SetFileMtimes(priorMtimes)
 
 	var result *IndexResult
-	err = idx.coordinateRepositoryMutation(ctx, func() error {
+	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
-		// lane and transition read gate are held, reapply the authoritative mode.
+		// lane and transition generation are held, reapply the authoritative mode.
 		batchMode := mi.reapplyBatchModeForMutation(idx)
-		finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
+		finishTopologyMutation := mi.beginRepositoryTopologyMutation(ctx)
 		topologyChanged := false
 		defer func() { finishTopologyMutation(topologyChanged) }()
 
@@ -2691,11 +2924,12 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		// only the changed files and evict only the deleted ones, leaving the
 		// rest of the already-persisted graph untouched. A whole-repo re-track
 		// (IndexCtx — which evicts and re-parses every file, then bulk-drains)
-		// is reserved for the cases where scoping is unsafe or not worth it: the
-		// census could not be taken, the churn is a large fraction of the repo,
-		// or an operator forced it via GORTEX_WARMUP_FULL_RETRACK. A repo with
-		// zero changes keeps the fast full-tree incremental no-op (walk + 0 stale →
-		// return), which is what makes an unchanged warm restart near-instant.
+		// is reserved for cases where scoped replacement is not worth it: churn is
+		// a large fraction of the repo, or an operator forced it via
+		// GORTEX_WARMUP_FULL_RETRACK. A failed census falls back to the preserving
+		// full-root incremental path. A repo with zero changes returns directly
+		// from an authoritative non-Merkle census instead of repeating the same
+		// full-tree walk in the incremental pipeline.
 		//
 		// The in-memory backend (*graph.Graph) keeps its exact prior behaviour:
 		// the full-tree modern pipeline is authoritative there — it evicts
@@ -2706,6 +2940,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			receipt          *graph.MutationReceipt
 			batch            *reparsePendingEnrichmentBatch
 			changed, deleted []string
+			detected         int
 			route            = "incremental"
 		)
 		// fullRetrack is the whole-repo re-track — the ONE place FullRetrack is
@@ -2724,17 +2959,48 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
 		default:
 			var censusErr error
-			changed, deleted, censusErr = idx.ChangedSinceMtimes(absPath)
+			changed, deleted, detected, censusErr = idx.changedSinceMtimesCensus(absPath)
 			churn := len(changed) + len(deleted)
 			priorCount := len(priorMtimes)
 			forceFull := os.Getenv("GORTEX_WARMUP_FULL_RETRACK") == "1"
+			manifestOnly := churn > 0
+			for _, relPath := range append(append([]string(nil), changed...), deleted...) {
+				absChangedPath := filepath.Join(absPath, filepath.FromSlash(relPath))
+				if !idx.isIncrementalContractManifest(absChangedPath) {
+					manifestOnly = false
+					break
+				}
+			}
 			switch {
-			case censusErr != nil || forceFull:
-				route = "full_retrack"
-				result, err = fullRetrack()
-			case churn == 0:
+			case censusErr != nil:
+				// A partial filesystem census cannot safely authorize replacement:
+				// preserve rows below unreadable paths through the existing
+				// full-root incremental pipeline.
 				route = "incremental"
 				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
+			case forceFull:
+				route = "full_retrack"
+				result, err = fullRetrack()
+			case churn == 0 && !idx.merkleEnabled():
+				route = "census_noop"
+				result = idx.cleanCensusResult(detected, start)
+			case churn == 0:
+				// The mtime census cannot prove a Merkle-enabled repository clean:
+				// a missing baseline or extractor-salt change still requires the
+				// content-addressed full-tree incremental check.
+				route = "incremental"
+				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
+			case manifestOnly && idx.merkleEnabled():
+				// Keep the Merkle baseline repository-wide; a scoped tree would
+				// replace it with the manifest-only projection.
+				route = "incremental"
+				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
+			case manifestOnly:
+				// Root contract manifests are not part of the source-file count, so
+				// one changed go.mod must not look like >40% source churn in a tiny
+				// repository. The scoped refresh records its mtime and converges.
+				route = "scoped"
+				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, append(changed, deleted...), true)
 			case priorCount > 0 && churn*100 > priorCount*40:
 				route = "full_retrack"
 				result, err = fullRetrack()
@@ -2756,6 +3022,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		}
 		result.RepoPrefix = prefix
 
+		fileMtimes := idx.publishFileMtimes()
 		mi.mu.Lock()
 		mi.repos[prefix] = &RepoMetadata{
 			RepoPrefix:    prefix,
@@ -2766,8 +3033,9 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			NodeCount:     result.NodeCount,
 			EdgeCount:     result.EdgeCount,
 			ParseErrors:   result.Errors,
-			FileMtimes:    idx.FileMtimes(),
-			IsWorktree:    ResolveWorktree(absPath).IsWorktree,
+			FileMtimes:    fileMtimes,
+
+			IsWorktree: ResolveWorktree(absPath).IsWorktree,
 		}
 		mi.indexers[prefix] = idx
 		mi.mu.Unlock()
@@ -2934,11 +3202,11 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 		return 0, 0
 	}
 
-	// The lane is now closed and drained, so taking the transition read side
-	// cannot invert the usual lane -> gate order. Retain it through exact-
-	// generation validation, graph/config purge, contract reconciliation, and
-	// conditional detach; EndBatch and direct global passes see either the
-	// complete repository or its complete absence.
+	// The lane is now closed and drained, so no new admission can cross this
+	// teardown while it takes the transition read side. Retain that admission
+	// through exact-generation validation, graph/config purge, contract
+	// reconciliation, and conditional detach; EndBatch and direct global passes
+	// see either the complete repository or its complete absence.
 	mi.batchMutationGate.RLock()
 	defer mi.batchMutationGate.RUnlock()
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
@@ -3085,6 +3353,26 @@ func (mi *MultiIndexer) GetMetadata(repoPrefix string) *RepoMetadata {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	return mi.repos[repoPrefix]
+}
+
+// FileMtimes returns an owned copy of the repository's committed mtime
+// snapshot. Internal poller and daemon paths use the immutable RepoMetadata
+// snapshot directly; this public accessor keeps callers from mutating it.
+func (mi *MultiIndexer) FileMtimes(repoPrefix string) map[string]int64 {
+	mi.mu.RLock()
+	meta := mi.repos[repoPrefix]
+	if meta == nil {
+		mi.mu.RUnlock()
+		return nil
+	}
+	published := meta.FileMtimes
+	mi.mu.RUnlock()
+
+	out := make(map[string]int64, len(published))
+	for path, mtime := range published {
+		out[path] = mtime
+	}
+	return out
 }
 
 // AllMetadata returns a copy of all repo metadata.

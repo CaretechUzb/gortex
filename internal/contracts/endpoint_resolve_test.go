@@ -15,9 +15,13 @@ import (
 type fakeEndpointStore struct {
 	nodes map[string][]*graph.Node
 	vals  map[string]string
+
+	nameLookups  int
+	valueLookups int
 }
 
 func (f *fakeEndpointStore) FindNodesByNames(names []string) map[string][]*graph.Node {
+	f.nameLookups++
 	out := make(map[string][]*graph.Node, len(names))
 	for _, n := range names {
 		if v, ok := f.nodes[n]; ok {
@@ -28,6 +32,7 @@ func (f *fakeEndpointStore) FindNodesByNames(names []string) map[string][]*graph
 }
 
 func (f *fakeEndpointStore) ConstantValuesByNodeIDs(ids []string) (map[string]string, error) {
+	f.valueLookups++
 	out := make(map[string]string, len(ids))
 	for _, id := range ids {
 		if v, ok := f.vals[id]; ok {
@@ -218,6 +223,30 @@ func TestHTTPExtractor_ExtractWithStore_ConstRoute(t *testing.T) {
 
 	if !hasRoute(got, "GET", "/api/x") {
 		t.Fatalf("expected a GET /api/x route from a const path, got %v", routeSummaries(got))
+	}
+	if store.nameLookups != 1 || store.valueLookups != 1 {
+		t.Fatalf("accepted const route lookups = names %d, values %d; want 1, 1", store.nameLookups, store.valueLookups)
+	}
+}
+
+func TestHTTPExtractor_ExtractWithStore_UnsupportedSelectorsSkipConstLookup(t *testing.T) {
+	src := []byte(`package p
+func work(db DB, format, haystack, needle, query, path string) {
+	fmt.Sprintf(format, 1)
+	strings.Contains(haystack, needle)
+	db.Exec(query)
+	os.Open(path)
+}
+`)
+	store := &fakeEndpointStore{}
+
+	got := (&HTTPExtractor{}).ExtractWithStore("repo/a.go", src, nil, nil, nil, store, "repo")
+
+	if len(got) != 0 {
+		t.Fatalf("unsupported selectors emitted routes: %v", routeSummaries(got))
+	}
+	if store.nameLookups != 0 || store.valueLookups != 0 {
+		t.Fatalf("unsupported selector lookups = names %d, values %d; want 0, 0", store.nameLookups, store.valueLookups)
 	}
 }
 

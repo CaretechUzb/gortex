@@ -6,6 +6,11 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+// moduleAttributionWriteBatchSize bounds transient node and edge slices while
+// allowing SQLite to amortize JSONB payload and transaction setup. It matches
+// the node ingest chunk, the smaller of the two persisted row shapes.
+const moduleAttributionWriteBatchSize = 4 * 1024
+
 // attributeNonGoModuleImports runs as a serial post-pass at the
 // end of ResolveAll. It walks every EdgeImports edge that ended up
 // pointing at an `external::*` stub (i.e. resolveImport found no
@@ -88,11 +93,23 @@ func (r *Resolver) attributeNonGoModuleImports() {
 		seedIDs = append(seedIDs, id)
 	}
 	existing := r.graph.GetNodesByIDs(seedIDs)
+	moduleBatchCapacity := len(moduleSeeds)
+	if moduleBatchCapacity > moduleAttributionWriteBatchSize {
+		moduleBatchCapacity = moduleAttributionWriteBatchSize
+	}
+	moduleBatch := make([]*graph.Node, 0, moduleBatchCapacity)
 	for _, seed := range moduleSeeds {
 		if _, ok := existing[seed.id]; ok {
 			continue
 		}
-		r.graph.AddNode(buildNonGoModuleNode(seed))
+		moduleBatch = append(moduleBatch, buildNonGoModuleNode(seed))
+		if len(moduleBatch) >= moduleAttributionWriteBatchSize {
+			r.graph.AddBatch(moduleBatch, nil)
+			moduleBatch = moduleBatch[:0]
+		}
+	}
+	if len(moduleBatch) > 0 {
+		r.graph.AddBatch(moduleBatch, nil)
 	}
 
 	// Pre-build a set of every (fileID, moduleID) pair the graph
@@ -103,7 +120,7 @@ func (r *Resolver) attributeNonGoModuleImports() {
 	// read on every backend, plus a Go-side map build that turns
 	// the per-rewrite check into a constant-time lookup.
 	existingDepends := make(map[string]map[string]struct{})
-	for e := range r.graph.EdgesByKind(graph.EdgeDependsOnModule) {
+	for e := range graph.EdgesLightSeq(r.graph, graph.EdgeDependsOnModule) {
 		// Only the rewrites' own callers (in scope) are queried below, so a
 		// scoped pass needs the dedupe index for just those repos.
 		if !r.edgeFromInScope(e.From) {
@@ -121,6 +138,11 @@ func (r *Resolver) attributeNonGoModuleImports() {
 	// jobs into one batch so disk backends commit in chunks rather
 	// than once per import rewrite.
 	reindexBatch := make([]graph.EdgeReindex, 0, len(rewrites))
+	dependsBatchCapacity := len(rewrites)
+	if dependsBatchCapacity > moduleAttributionWriteBatchSize {
+		dependsBatchCapacity = moduleAttributionWriteBatchSize
+	}
+	dependsBatch := make([]*graph.Edge, 0, dependsBatchCapacity)
 	for _, p := range rewrites {
 		p.edge.To = p.moduleID
 		p.edge.Origin = graph.OriginASTResolved
@@ -144,7 +166,7 @@ func (r *Resolver) attributeNonGoModuleImports() {
 				continue
 			}
 		}
-		r.graph.AddEdge(&graph.Edge{
+		dependsBatch = append(dependsBatch, &graph.Edge{
 			From:            p.edge.From,
 			To:              p.moduleID,
 			Kind:            graph.EdgeDependsOnModule,
@@ -154,6 +176,13 @@ func (r *Resolver) attributeNonGoModuleImports() {
 			ConfidenceLabel: "EXTRACTED",
 			Origin:          graph.OriginASTResolved,
 		})
+		if len(dependsBatch) >= moduleAttributionWriteBatchSize {
+			r.graph.AddBatch(nil, dependsBatch)
+			dependsBatch = dependsBatch[:0]
+		}
+	}
+	if len(dependsBatch) > 0 {
+		r.graph.AddBatch(nil, dependsBatch)
 	}
 	if len(reindexBatch) > 0 {
 		r.graph.ReindexEdges(reindexBatch)
@@ -164,8 +193,8 @@ func (r *Resolver) attributeNonGoModuleImports() {
 // (file ID → language) for the per-edge dispatch above.
 func (r *Resolver) collectFileLanguages() map[string]string {
 	out := map[string]string{}
-	for n := range r.graph.NodesByKind(graph.KindFile) {
-		out[n.ID] = n.Language
+	for file := range graph.FileLanguageNodesSeq(r.graph) {
+		out[file.ID] = file.Language
 	}
 	return out
 }

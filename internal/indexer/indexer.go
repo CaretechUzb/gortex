@@ -157,6 +157,33 @@ type Indexer struct {
 	// directly through the bounded graph accumulator.
 	shadowAdmission *shadowAdmissionBudget
 
+	// indexMemoryAdmission is the process-wide weighted envelope shared by full
+	// direct parses and in-memory shadows. Unlike shadowAdmission, its lease
+	// remains attached to a shadow through the disk drain, so a source-heavy
+	// direct parse cannot enter while that graph still occupies its working set.
+	// Nil selects the process-wide production budget; tests may inject a private
+	// envelope without affecting sibling Indexers.
+	indexMemoryAdmission *indexMemoryAdmissionBudget
+
+	// parseAdmission is the optional daemon-wide raw bytes-in-flight gate shared
+	// by every repository. Each Indexer keeps its private configured gate too; a
+	// file must satisfy both before its source bytes are materialised.
+	parseAdmission atomic.Pointer[parseAdmissionBudget]
+
+	// nativeParseAdmission is a distinct daemon-wide budget for actual
+	// in-process C-family extraction. Keeping it separate lets generated-parser
+	// projections bypass native-tree admission without weakening the raw-source
+	// memory bound.
+	nativeParseAdmission atomic.Pointer[parseAdmissionBudget]
+
+	// largeDirectAdmission serializes only intrinsically large full-repository
+	// parses that stream directly into the durable store. It complements the
+	// per-file parseAdmission gate by covering repository-level graph batches,
+	// native allocator high-water, and the post-parse heap-release boundary.
+	// Nil selects the process-wide production gate; tests may inject a private
+	// budget without changing other Indexers.
+	largeDirectAdmission *largeDirectAdmissionBudget
+
 	// indexCount tracks how many IndexCtx calls this Indexer has
 	// completed. Gates the cold-start shadow-swap: each per-repo
 	// Indexer in MultiIndexer is fresh (indexCount==0), so all of
@@ -315,11 +342,16 @@ type Indexer struct {
 	workspaceMembers     *workspaceMembershipIndex
 
 	// Mtime tracking and parse error retention for index health diagnostics.
-	parseErrors   []IndexError
-	fileMtimes    map[string]int64
-	lastIndexTime time.Time
-	totalDetected int
-	mtimeMu       sync.RWMutex
+	parseErrors      []IndexError
+	fileMtimes       map[string]int64
+	fileMtimesShared bool
+	// Any failed sidecar write can leave the durable keyset incomplete even
+	// while the immutable in-memory snapshot is current. Receipt paging must
+	// fall back to that snapshot until a full authoritative replace repairs it.
+	fileMtimePersistenceDirty atomic.Bool
+	lastIndexTime             time.Time
+	totalDetected             int
+	mtimeMu                   sync.RWMutex
 
 	// contractCache memoizes the contract-extractor output per file.
 	// Keyed by graph file path (with repo prefix); value is the file's
@@ -497,10 +529,11 @@ type contractCacheEntry struct {
 // callers.
 func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *zap.Logger) *Indexer {
 	idx := &Indexer{
-		graph:           g,
-		shadowAdmission: processShadowAdmission,
-		registry:        reg,
-		resolver:        resolver.New(g),
+		graph:                g,
+		shadowAdmission:      processShadowAdmission,
+		indexMemoryAdmission: processIndexMemoryAdmission,
+		registry:             reg,
+		resolver:             resolver.New(g),
 		// Wrap in Swappable so the auto-upgrade to Bleve at large
 		// corpus sizes can happen in a background goroutine without
 		// racing with concurrent searches. Subsequent reassignments to
@@ -663,14 +696,16 @@ func initialSearchBackend(g graph.Store) search.Backend {
 // defeating the FTS path and pinning the ~100MB heap the FTS
 // integration was meant to release.
 func isSymbolSearcherBackend(b search.Backend) bool {
-	if b == nil {
+	switch backend := b.(type) {
+	case *search.SymbolSearcherBackend:
+		return true
+	case *search.Swappable:
+		return isSymbolSearcherBackend(backend.Inner())
+	case *search.HybridBackend:
+		return isSymbolSearcherBackend(backend.TextBackend())
+	default:
 		return false
 	}
-	if sw, ok := b.(*search.Swappable); ok {
-		b = sw.Inner()
-	}
-	_, ok := b.(*search.SymbolSearcherBackend)
-	return ok
 }
 
 // ftsTokensFor produces the pre-tokenised text the backend FTS path
@@ -977,7 +1012,8 @@ func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 		)
 	}
 	reporter.Report("clone detection pass (global)", 0, 0)
-	if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold()); cs.Items > 0 {
+	cs, cloneBaseline := detectClonesAndEmitEdgesWithBaselineCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold())
+	if cs.Items > 0 {
 		idx.logger.Info("clone edges emitted (global)",
 			zap.Int("items", cs.Items),
 			zap.Int("clone_pairs", cs.Pairs),
@@ -988,11 +1024,10 @@ func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 			zap.Int("diffused_edges", cs.DiffusedEdges),
 		)
 	}
-	// Seed the incremental clone index from the freshly-baselined
-	// signatures + sidecar so steady-state single-file edits after this
-	// batch go incremental instead of re-running the whole-graph pass.
+	// Adopt the freshly-finalized CMS/corpus seed so steady-state single-file
+	// edits go incremental without paging the same compact corpus again.
 	if idx.cloneIndex != nil {
-		idx.cloneIndex.Rebuild(idx.graph, idx.repoPrefix)
+		idx.cloneIndex.AdoptBaselineOrRebuild(idx.graph, idx.repoPrefix, cloneBaseline)
 	}
 	// Framework dynamic-dispatch synthesis (gRPC stubs, Temporal
 	// workflow→activity, in-process / native event channels, native
@@ -1114,12 +1149,21 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 // of declared modules to their dep contract node instead of an external::
 // stub. Split out of RunDeferredPasses so the batch driver can run it
 // serially across repos ahead of the parallel enrichment phase.
-func (idx *Indexer) runDeferredGoMod() {
-	if idx.pendingContractReg == nil || idx.deferredGoModDone {
-		return
+func runDeferredGoModOnce(pending bool, done *bool, drain func()) bool {
+	if !pending || done == nil || *done {
+		return false
 	}
-	idx.extractGoModContracts(idx.pendingContractReg)
-	idx.deferredGoModDone = true
+	if drain != nil {
+		drain()
+	}
+	*done = true
+	return true
+}
+
+func (idx *Indexer) runDeferredGoMod() {
+	runDeferredGoModOnce(idx.pendingContractReg != nil, &idx.deferredGoModDone, func() {
+		idx.extractGoModContracts(idx.pendingContractReg)
+	})
 }
 
 // runDeferredEnrich runs semantic enrichment for this repo. The manager fetches
@@ -1995,11 +2039,6 @@ func stripConfigArtifacts(result *parser.ExtractionResult) {
 	result.Edges = keptEdges
 }
 
-// isInfraOriginConfigKey reports whether a KindConfigKey node was
-// emitted by the K8s / Kustomize / Dockerfile extractors. These
-// nodes carry Meta["origin"] = "k8s" or "dockerfile" by convention.
-// The code-side extractors (Go os.Getenv, Python os.environ, viper,
-// struct-tag, …) leave Meta["origin"] empty.
 // isMigrationOriginNode reports whether a node was emitted by migration /
 // live-DB DDL extraction (Meta["origin"]=="migration"). These schema nodes
 // are high-signal and survive the sql-domain strip — the gate only removes
@@ -2012,12 +2051,17 @@ func isMigrationOriginNode(n *graph.Node) bool {
 	return o == "migration"
 }
 
+// isInfraOriginConfigKey reports whether a KindConfigKey node was
+// emitted by the K8s / Kustomize / Dockerfile / Terraform extractors.
+// These nodes carry Meta["origin"] = "k8s", "dockerfile", or
+// "terraform" by convention. The code-side extractors (Go os.Getenv,
+// Python os.environ, viper, struct-tag, …) leave Meta["origin"] empty.
 func isInfraOriginConfigKey(n *graph.Node) bool {
 	if n == nil || n.Kind != graph.KindConfigKey || n.Meta == nil {
 		return false
 	}
 	origin, _ := n.Meta["origin"].(string)
-	return origin == "k8s" || origin == "dockerfile"
+	return origin == "k8s" || origin == "dockerfile" || origin == "terraform"
 }
 
 // isDocFrontmatterConfigKey reports whether a KindConfigKey node is a
@@ -2418,7 +2462,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 		prefix := current.repoPrefix
 		if owner != nil && prefix != "" {
 			rootPath := current.RootPath()
-			fileMtimes := current.FileMtimes()
+			fileMtimes := current.publishFileMtimes()
 			owner.mu.Lock()
 			if meta := owner.repos[prefix]; meta != nil && owner.indexers[prefix] == current {
 				owner.repos[prefix] = &RepoMetadata{
@@ -2446,15 +2490,6 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
 	start := time.Now()
 	reporter := progress.FromContext(ctx)
-
-	// Cold/full-index GC tuning: raise the GC percent window and install a
-	// cgroup-aware soft memory limit for the duration of the index, then
-	// restore the prior settings on every exit path. The knobs affect only GC
-	// timing and peak RSS during the allocation burst of a full index — the
-	// graph content is identical with them on or off. Disable for A/B runs
-	// with GORTEX_INDEX_GC_TUNE=0; see gc_tune.go.
-	restoreGCTuning := applyIndexGCTuning(idx.logger)
-	defer restoreGCTuning()
 
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -2566,6 +2601,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			zap.Int64("total_bytes", skippedContentBytes))
 	}
 	reporter.Report("walking files", len(files), len(files))
+	// Capture raw content identities while the parser already owns each source
+	// buffer. A nil collector keeps the disabled path allocation-free.
+	merkleBaseline := newMerkleBaselineCollector(idx.merkleEnabled(), len(files))
 
 	// In-memory shadow for cold-start indexing on disk-backed stores.
 	// Disk backends pay ms-level per-call cost on every read; running
@@ -2597,6 +2635,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	//     state.
 	var diskTarget graph.Store
 	var inMemShadow *graph.Graph
+	var shadowEstimate graph.RepoMemoryEstimate
+	var shadowEstimateReady bool
 	bl, blOK := idx.graph.(graph.BulkLoader)
 	// Per-Indexer sentinel: each *Indexer is constructed fresh
 	// (per-repo in MultiIndexer, once in single-repo daemons), so
@@ -2618,38 +2658,48 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// the bounded per-call disk path instead of pinning the whole
 	// post-parse graph in RAM and OOMing (see #120).
 	var totalFileBytes int64
+	var nativePressureFileBytes int64
+	var nativePressureFiles int
 	for i := range files {
-		totalFileBytes += files[i].size
+		totalFileBytes = saturatingAddByteCount(totalFileBytes, files[i].size)
+		if nativeParsePressureLanguage(files[i].lang) {
+			nativePressureFiles++
+			nativePressureFileBytes = saturatingAddByteCount(nativePressureFileBytes, files[i].size)
+		}
 	}
 	maxShadowBytes := shadowMaxBytes()
 	belowShadowBytes := totalFileBytes <= maxShadowBytes
 	shadowWeight := shadowAdmissionWeight(len(files), totalFileBytes)
 	shadowLocallyEligible := blOK && firstIndex && belowShadowMax && belowShadowBytes
+
+	// Acquire a queued shadow slot before the shared repository-memory envelope.
+	// Waiting candidates therefore hold no general memory reservation. Every
+	// path uses the same shadow -> memory lock order, while direct/oversized
+	// candidates acquire only memory, so the two process gates cannot cycle.
 	admission := idx.shadowAdmission
 	if admission == nil {
 		admission = processShadowAdmission
 	}
+	shadowAdmissionStarted := time.Now()
 	var shadowLease *shadowAdmissionLease
-	shadowBudgetGranted := false
 	if shadowLocallyEligible {
-		shadowLease, shadowBudgetGranted = admission.tryAcquire(shadowWeight)
+		shadowLease, err = admission.acquire(ctx, shadowWeight)
+		if err != nil {
+			return nil, err
+		}
 	}
-	shadowTaken := shadowLocallyEligible && shadowBudgetGranted
+	shadowTaken := shadowLease != nil
 	if shadowLease != nil {
-		// Registered before the shadow-drain defer below. Defers execute in
-		// reverse order, so the lease remains charged through every success,
-		// error, and cancellation drain/restore path and releases afterwards.
+		// Registered before both the memory lease and shadow-drain defer below.
+		// Reverse defer order retains the shadow slot through all parsing, durable
+		// drain, FTS finalization, cancellation, and graph-restoration paths.
 		defer shadowLease.Release()
 	}
-	shadowBudgetCapacity, shadowBudgetUsed, shadowBudgetPeak := admission.snapshot()
-	preNodes := idx.graph.NodeCount()
-	preEdges := idx.graph.EdgeCount()
+	shadowStats := admission.snapshot()
 	idx.logger.Info("indexer: shadow-swap decision",
 		zap.String("repo", idx.RepoPrefix()),
 		zap.Bool("bulk_loader", blOK),
 		zap.Bool("first_index", firstIndex),
-		zap.Int("pre_nodes", preNodes),
-		zap.Int("pre_edges", preEdges),
 		zap.Int("files", len(files)),
 		zap.Int("shadow_max_files", shadowMaxFileCount()),
 		zap.Bool("below_shadow_max", belowShadowMax),
@@ -2657,36 +2707,98 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		zap.Int64("shadow_max_bytes", maxShadowBytes),
 		zap.Bool("below_shadow_bytes", belowShadowBytes),
 		zap.Int64("shadow_weight_bytes", shadowWeight),
-		zap.Int64("shadow_process_budget_bytes", shadowBudgetCapacity),
-		zap.Int64("shadow_process_used_bytes", shadowBudgetUsed),
-		zap.Int64("shadow_process_peak_bytes", shadowBudgetPeak),
-		zap.Bool("shadow_budget_granted", shadowBudgetGranted),
+		zap.Int64("shadow_process_budget_bytes", shadowStats.capacity),
+		zap.Int64("shadow_process_used_bytes", shadowStats.used),
+		zap.Int64("shadow_process_peak_bytes", shadowStats.peak),
+		zap.Int("shadow_max_concurrent", shadowStats.maxConcurrent),
+		zap.Int("shadow_active", shadowStats.active),
+		zap.Int("shadow_peak_active", shadowStats.peakActive),
+		zap.Int("shadow_waiters", shadowStats.waiters),
+		zap.Uint64("shadow_admissions", shadowStats.admissions),
+		zap.Uint64("shadow_queued_admissions", shadowStats.queued),
+		zap.Duration("shadow_waited", time.Since(shadowAdmissionStarted)),
+		zap.Bool("shadow_budget_granted", shadowTaken),
 		zap.Bool("shadow_taken", shadowTaken),
 	)
-	if shadowTaken {
-		// Warm-restart safety. `firstIndex` is a PER-INDEXER sentinel, and
-		// a fresh per-repo Indexer is constructed on every daemon restart,
-		// so firstIndex is true on every restart — even when the
-		// persistent disk store already holds this repo's nodes from a
-		// prior run. The shadow drain below ends in BulkLoad's INSERT-only
-		// COPY, which (per this function's own contract) "running against a
-		// non-empty store would corrupt or duplicate". A duplicate-primary-
-		// key bulk load against the persisted rows would fail warmup, and
-		// because the repo's mtimes never get persisted when warmup dies
-		// first, the failure re-fires on the next restart: a crash loop.
-		// Evicting the repo's existing rows first makes the bulk load land
-		// on a clean slate. EvictRepo self-guards with a count query, so this is a
-		// cheap no-op for the genuine first-index cases (true cold start,
-		// a newly-tracked repo) where the disk store has no rows for this
-		// prefix. preNodes>0 short-circuits the call entirely on the
-		// first repo of a cold start (empty store).
-		if preNodes > 0 {
-			if n, e := idx.graph.EvictRepo(idx.RepoPrefix()); n > 0 || e > 0 {
-				idx.logger.Info("indexer: evicted stale repo rows before bulk reload (warm restart)",
+
+	// Reserve one process-wide, repository-scale working-set envelope after the
+	// shadow choice is settled. The same source/structure estimate charges a
+	// direct parse and a shadow, while a fixed per-repository allowance covers
+	// parser workers and SQLite buffers. Direct parses release after their
+	// parser/batch tail; shadows keep the lease through the deferred drain below.
+	// This is intentionally separate from the nested raw/native per-file gates.
+	memoryWeight := indexMemoryAdmissionWeight(len(files), totalFileBytes)
+	if !shadowTaken {
+		memoryWeight = directIndexMemoryAdmissionWeight(len(files), totalFileBytes)
+	}
+	memoryBudget := idx.indexMemoryAdmission
+	if memoryBudget == nil {
+		memoryBudget = processIndexMemoryAdmission
+	}
+	memoryAdmissionStarted := time.Now()
+	memoryLease, err := memoryBudget.acquire(ctx, memoryWeight)
+	if err != nil {
+		return nil, err
+	}
+	var releaseIndexMemoryAdmission func(reason string)
+	if memoryLease != nil {
+		memoryAdmittedAt := time.Now()
+		stats := memoryBudget.snapshot()
+		idx.logger.Info("indexer: memory envelope admitted",
+			zap.String("repo", idx.RepoPrefix()),
+			zap.Int("files", len(files)),
+			zap.Int64("input_bytes", totalFileBytes),
+			zap.Int("native_pressure_files", nativePressureFiles),
+			zap.Int64("native_pressure_bytes", nativePressureFileBytes),
+			zap.Bool("shadow_eligible", shadowLocallyEligible),
+			zap.Bool("shadow_taken", shadowTaken),
+			zap.Int64("requested_weight_bytes", memoryWeight),
+			zap.Int64("weight_bytes", memoryLease.weight),
+			zap.Duration("waited", memoryAdmittedAt.Sub(memoryAdmissionStarted)),
+			zap.Int64("capacity_bytes", stats.capacity),
+			zap.Int64("used_bytes", stats.used),
+			zap.Int64("peak_bytes", stats.peak),
+			zap.Int("waiters", stats.waiters),
+			zap.Int("bounded_bypasses", stats.bypasses),
+			zap.Uint64("admissions", stats.admissions),
+			zap.Uint64("queued_admissions", stats.queued))
+		var releaseOnce sync.Once
+		releaseIndexMemoryAdmission = func(reason string) {
+			releaseOnce.Do(func() {
+				memoryLease.Release()
+				after := memoryBudget.snapshot()
+				idx.logger.Info("indexer: memory envelope released",
 					zap.String("repo", idx.RepoPrefix()),
-					zap.Int("nodes", n), zap.Int("edges", e))
-			}
+					zap.String("reason", reason),
+					zap.Duration("held", time.Since(memoryAdmittedAt)),
+					zap.Int64("weight_bytes", memoryLease.weight),
+					zap.Int64("used_bytes", after.used),
+					zap.Int("waiters", after.waiters),
+					zap.Int("bounded_bypasses", after.bypasses),
+					zap.Uint64("queued_admissions", after.queued))
+			})
 		}
+		// Registered before the GC restore and shadow drain defers. Reverse
+		// defer order keeps this repository charged through both durable drain
+		// and post-burst heap scavenging.
+		defer releaseIndexMemoryAdmission("index_exit")
+	}
+
+	// Install cold/full-index GC tuning only after this repository owns its
+	// process admission. Repositories queued on either gate must not keep the
+	// shared GOGC/memory-limit window open. This defer is registered after both
+	// admission defers, so settings restore and any final heap/native release
+	// finish before a slot admits the next repository. The shadow-drain defer is
+	// registered below and therefore still runs first.
+	restoreGCTuning := applyIndexGCTuning(idx.logger)
+	defer restoreGCTuning()
+
+	if shadowTaken {
+		// Keep the persisted repository queryable while the replacement graph is
+		// parsed in memory. Warm-restart rows are evicted only after parsing has
+		// succeeded, immediately before the INSERT-only bulk drain. Besides
+		// shortening the stale-data window, this keeps the shadow decision free
+		// of store reads that queue behind an unrelated repository's bulk writer.
 		idx.indexCount.Add(1)
 		diskTarget = idx.graph
 		inMemShadow = graph.New()
@@ -2723,11 +2835,29 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			drainStart := time.Now()
 			shadowNodeCount := inMemShadow.NodeCount()
 			shadowEdgeCount := inMemShadow.EdgeCount()
+			if !shadowEstimateReady {
+				shadowEstimate = inMemShadow.RepoMemoryEstimate(idx.RepoPrefix())
+				shadowEstimateReady = true
+			}
+			drainPressure := newShadowDrainPressure(shadowEstimate, idx.RepoPrefix(), idx.logger)
 			idx.logger.Info("indexer: drain start (shadow → disk)",
 				zap.String("repo", idx.RepoPrefix()),
 				zap.Int("shadow_nodes", shadowNodeCount),
 				zap.Int("shadow_edges", shadowEdgeCount),
+				zap.Uint64("shadow_estimated_bytes", shadowEstimate.Total()),
+				zap.Bool("pressure_guard", drainPressure.enabled),
 			)
+			finishDrainPressure := drainPressure.begin()
+			defer finishDrainPressure()
+			// BulkLoad is INSERT-only. A fresh per-repository Indexer also has
+			// firstIndex=true on warm restart, so remove any persisted rows for
+			// this prefix after the replacement parse succeeds and before its
+			// first disk write. EvictRepo is a no-op on a genuine cold/new repo.
+			if n, e := diskTarget.EvictRepo(idx.RepoPrefix()); n > 0 || e > 0 {
+				idx.logger.Info("indexer: evicted stale repo rows before shadow drain",
+					zap.String("repo", idx.RepoPrefix()),
+					zap.Int("nodes", n), zap.Int("edges", e))
+			}
 			bl.BeginBulkLoad()
 			// Transfer the shadow in explicit row/byte-capped batches. The
 			// process-wide shadow admission caps all live shadows at 1 GiB; these
@@ -2761,6 +2891,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			for nodes := range inMemShadow.DrainNodeBatches(persistChunkRows, persistChunkBytes) {
 				diskTarget.AddBatch(nodes, nil)
 				if !ftsReady || retErr != nil {
+					nodeRows := len(nodes)
+					nodes = nil
+					drainPressure.afterNodeBatch(nodeRows)
 					continue
 				}
 				ftsItems := make([]graph.SymbolFTSItem, 0, min(len(nodes), persistFTSChunkRows))
@@ -2801,9 +2934,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				if ftsReady {
 					flushFTS()
 				}
+				nodeRows := len(nodes)
+				nodes = nil
+				drainPressure.afterNodeBatch(nodeRows)
 			}
 			for edges := range inMemShadow.DrainEdgeBatches(persistChunkRows, persistChunkBytes) {
 				diskTarget.AddBatch(nil, edges)
+				edgeRows := len(edges)
+				drainPressure.afterEdgeBatch(edgeRows)
 			}
 
 			flushStart := time.Now()
@@ -2822,6 +2960,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				zap.Int("edges", shadowEdgeCount),
 				zap.Int("fts_items", ftsItemCount),
 			)
+			finishDrainPressure()
 			if retErr == nil {
 				if serr := persistShadowCompactSidecars(
 					inMemShadow, diskTarget, idx.RepoPrefix(),
@@ -2851,7 +2990,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 		}()
 	} else if diskTarget == nil && idx.graph.NodeCount() == 0 && idx.graph.EdgeCount() == 0 {
-		if _, isBulk := idx.graph.(graph.BulkLoader); isBulk && firstIndex && (!belowShadowMax || !belowShadowBytes || !shadowBudgetGranted) {
+		if _, isBulk := idx.graph.(graph.BulkLoader); isBulk && firstIndex && (!belowShadowMax || !belowShadowBytes || !shadowTaken) {
 			idx.logger.Info("indexer: skipping in-memory shadow; building against disk store (bounded RAM)",
 				zap.Int("files", len(files)),
 				zap.Int("file_threshold", shadowMaxFileCount()),
@@ -2860,10 +2999,60 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				zap.Int64("byte_threshold", maxShadowBytes),
 				zap.Bool("over_byte_budget", !belowShadowBytes),
 				zap.Int64("shadow_weight_bytes", shadowWeight),
-				zap.Int64("shadow_process_budget_bytes", shadowBudgetCapacity),
-				zap.Int64("shadow_process_used_bytes", shadowBudgetUsed),
-				zap.Bool("shadow_budget_unavailable", shadowLocallyEligible && !shadowBudgetGranted))
+				zap.Int64("shadow_process_budget_bytes", shadowStats.capacity),
+				zap.Int64("shadow_process_used_bytes", shadowStats.used),
+				zap.Bool("shadow_disabled_or_oversized", shadowLocallyEligible && !shadowTaken))
 		}
+	}
+
+	// Repository-level admission for intrinsically large direct parses. The
+	// per-file parse budget remains active inside this lane, so the admitted
+	// repository still uses its normal worker pool and native-parser lanes; only
+	// a second large direct repository waits. Small direct repositories and
+	// bounded streaming shadows carry zero weight and continue concurrently.
+	streamingParse := diskTarget == nil && streamingFlushActive(idx.graph, len(files))
+	largeDirectWeight := largeDirectParseAdmissionWeight(
+		idx.graph, streamingParse, len(files), totalFileBytes,
+		nativePressureFiles, nativePressureFileBytes,
+	)
+	largeDirectBudget := idx.largeDirectAdmission
+	if largeDirectBudget == nil {
+		largeDirectBudget = processLargeDirectAdmission
+	}
+	admissionStarted := time.Now()
+	largeDirectLease, err := largeDirectBudget.acquire(ctx, largeDirectWeight)
+	if err != nil {
+		return nil, err
+	}
+	var releaseLargeDirectAdmission func()
+	if largeDirectLease != nil {
+		admittedAt := time.Now()
+		stats := largeDirectBudget.snapshot()
+		idx.logger.Info("indexer: large direct parse admitted",
+			zap.String("repo", idx.repoPrefix),
+			zap.Int("files", len(files)),
+			zap.Int64("input_bytes", totalFileBytes),
+			zap.Int("native_pressure_files", nativePressureFiles),
+			zap.Int64("native_pressure_bytes", nativePressureFileBytes),
+			zap.Int64("weight", largeDirectLease.weight),
+			zap.Duration("waited", admittedAt.Sub(admissionStarted)),
+			zap.Int64("capacity", stats.capacity),
+			zap.Int64("used", stats.used),
+			zap.Int64("peak", stats.peak),
+			zap.Int("waiters", stats.waiters))
+		var releaseOnce sync.Once
+		releaseLargeDirectAdmission = func() {
+			releaseOnce.Do(func() {
+				largeDirectLease.Release()
+				after := largeDirectBudget.snapshot()
+				idx.logger.Info("indexer: large direct parse released",
+					zap.String("repo", idx.repoPrefix),
+					zap.Duration("held", time.Since(admittedAt)),
+					zap.Int64("used", after.used),
+					zap.Int("waiters", after.waiters))
+			})
+		}
+		defer releaseLargeDirectAdmission()
 	}
 
 	// Content-index rebuild strategy. The crash-safe path (on-disk store)
@@ -2981,11 +3170,17 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// serialises instead of all workers materialising whole files and
 	// their parse trees at once. Code files are tiny and flow freely;
 	// only genuinely large inputs queue. budget <= 0 disables the cap.
-	parseBudget := idx.config.MaxParseBytesInFlight
-	var parseSem *semaphore.Weighted
-	if parseBudget > 0 {
-		parseSem = semaphore.NewWeighted(parseBudget)
+	localParseBudget := idx.config.MaxParseBytesInFlight
+	var localParseSem, localNativeParseSem *semaphore.Weighted
+	if localParseBudget > 0 {
+		localParseSem = semaphore.NewWeighted(localParseBudget)
+		localNativeParseSem = semaphore.NewWeighted(localParseBudget)
 	}
+	sharedParseAdmission := idx.parseAdmission.Load()
+	sharedNativeParseAdmission := idx.nativeParseAdmission.Load()
+	nativeParseAdmission := newNativeParseExtractionAdmission(
+		localParseBudget, localNativeParseSem, sharedNativeParseAdmission,
+	)
 
 	// In addition to the bytes-in-flight budget above, cap how many
 	// genuinely large files are *read* concurrently: a few huge PDFs /
@@ -3043,6 +3238,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		streamMtimeMu.Unlock()
 		if flush != nil {
 			if err := w.BulkSetFileMtimes(idx.repoPrefix, flush); err != nil {
+				idx.markFileMtimePersistenceDirty()
 				idx.logger.Warn("indexer: incremental mtime batch persist failed",
 					zap.String("repo", idx.repoPrefix), zap.Error(err))
 			}
@@ -3061,6 +3257,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			return
 		}
 		if err := w.BulkSetFileMtimes(idx.repoPrefix, flush); err != nil {
+			idx.markFileMtimePersistenceDirty()
 			idx.logger.Warn("indexer: final incremental mtime batch persist failed",
 				zap.String("repo", idx.repoPrefix), zap.Error(err))
 		}
@@ -3076,6 +3273,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		sidecars := newParseSidecarBatch(idx)
 		contentBatch := newParseContentBatch(idx)
 		graphBatch := newParseGraphBatch(idx.graph)
+		nativePressure := newNativeParsePressureRelief()
 		fileCh := make(chan walkedFile, workers*4)
 		var wg sync.WaitGroup
 		for range workers {
@@ -3094,13 +3292,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// bytes-in-flight budget before reading it, so large
 					// content files serialise instead of all workers
 					// materialising whole files at once.
-					var weight int64
-					if parseSem != nil {
-						weight = clampParseWeight(wf.size, parseBudget)
-						semStart := time.Now()
-						if aerr := parseSem.Acquire(ctx, weight); aerr != nil {
-							return
-						}
+					semStart := time.Now()
+					parseLease, aerr := acquireParseAdmission(
+						ctx, wf.size,
+						localParseBudget, localParseSem, sharedParseAdmission,
+					)
+					if aerr != nil {
+						return
+					}
+					if parseLease != nil {
 						atomic.AddInt64(&parseSemWaitNS, int64(time.Since(semStart)))
 					}
 
@@ -3112,9 +3312,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					if walkExt, found := idx.registry.GetByLanguage(wf.lang); found && parsePool == nil {
 						if se, ok := walkExt.(parser.StreamingExtractor); ok {
 							result, serr := idx.extractStreaming(se, path, relPath)
-							if parseSem != nil {
-								parseSem.Release(weight)
-							}
 							if serr != nil {
 								errMu.Lock()
 								errors = append(errors, IndexError{FilePath: path, Error: serr.Error()})
@@ -3124,6 +3321,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 								errMu.Unlock()
 							}
 							if result == nil {
+								parseLease.Release()
 								continue
 							}
 							idx.applyRepoPrefix(result.Nodes, result.Edges)
@@ -3151,6 +3349,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 								}
 							}
 							sidecars.addConstValues(result)
+							parseLease.Release()
 							continue
 						}
 					}
@@ -3162,11 +3361,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
 						errMu.Unlock()
-						if parseSem != nil {
-							parseSem.Release(weight)
-						}
+						parseLease.Release()
 						continue
 					}
+					merkleBaseline.record(relPath, src, wf.mtimeNano)
 
 					// Reuse the walk-time language. The walk's
 					// effectiveLanguage call already consulted shebang
@@ -3187,9 +3385,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						}
 					}
 					if ext == nil {
-						if parseSem != nil {
-							parseSem.Release(weight)
-						}
+						parseLease.Release()
 						continue
 					}
 
@@ -3199,10 +3395,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					src = idx.transforms.run(relPath, src)
 
 					extractStart := time.Now()
-					result, skipped, err := idx.extractFile(parsePool, quarantine, path, relPath, lang, ext, src)
+					result, skipped, err := idx.extractFileCtxWithRawLease(
+						ctx, nativeParseAdmission, parseLease,
+						parsePool, quarantine, path, relPath, lang, ext, src,
+					)
 					atomic.AddInt64(&parseExtractNS, int64(time.Since(extractStart)))
-					if parseSem != nil {
-						parseSem.Release(weight)
+					omitSecondarySourceScans := extractionDispositionFor(result).omitSecondarySourceScans()
+					recordNativePressure := parsePool == nil && shouldRecordNativeParsePressure(result)
+					if recordNativePressure {
+						nativePressure.afterParse(lang, int64(len(src)))
 					}
 					if err != nil {
 						errMu.Lock()
@@ -3210,6 +3411,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						errMu.Unlock()
 					}
 					if result == nil {
+						parseLease.Release()
 						// A full-index parse failure that produced no nodes:
 						// record it for a skip-node post-pass so the file
 						// stays visible instead of vanishing. (The live-modify
@@ -3237,7 +3439,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// language-extractor output. Skipped for quarantined /
 					// timed-out files — the coverage scanners would re-read
 					// a source the parser could not survive.
-					if !skipped {
+					if !skipped && !omitSecondarySourceScans {
 						idx.applyCoverageDomains(relPath, lang, src, result)
 					}
 
@@ -3303,7 +3505,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					}
 					sidecars.add(relPath, src, result)
 
-					if !skipped && fileGraphPath != "" {
+					if !skipped && !omitSecondarySourceScans && fileGraphPath != "" {
 						exts := contractExtractorsByLang[lang]
 						if len(exts) > 0 {
 							c := idx.runContractExtractorsForFile(
@@ -3332,6 +3534,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// long-lived worker goroutine, so a defer would pin
 					// every tree in the chunk until the worker exits.
 					result.ReleaseTree()
+					parseLease.Release()
 					atomic.AddInt64(&fileCount, 1)
 				}
 				if len(localContracts) > 0 {
@@ -3354,6 +3557,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		}
 		close(fileCh)
 		wg.Wait()
+		nativePressure.flush()
+		if nativeStats := nativePressure.stats(); nativeStats.calls > 0 {
+			idx.logger.Info("indexer: native parser pressure relief",
+				zap.String("repo", idx.repoPrefix),
+				zap.Int64("calls", nativeStats.calls),
+				zap.Uint64("released_bytes", nativeStats.releasedBytes),
+				zap.Duration("elapsed", nativeStats.elapsed))
+		}
 		// Flush every successfully parsed file even when ctx was cancelled
 		// while another worker waited for admission. This preserves the old
 		// per-file durability boundary and makes the next cold attempt resume
@@ -3361,6 +3572,18 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		graphBatch.flush()
 		contentBatch.flush()
 		sidecars.flush()
+
+		// All parse workers have joined, their native trees are released, and
+		// every direct-store graph/content/sidecar batch is durable. Only now
+		// may a large direct SQLite parse return its transient Go high-water;
+		// shadow and streaming parses have no graphBatch and stay untouched.
+		var chunkInputBytes int64
+		for i := range chunkFiles {
+			chunkInputBytes += chunkFiles[i].size
+		}
+		maybeReleaseHeapAfterLargeDirectParse(
+			graphBatch != nil, idx.repoPrefix, len(chunkFiles), chunkInputBytes, idx.logger,
+		)
 	}
 
 	// Dispatch the largest files first. Both dispatch paths below
@@ -3384,7 +3607,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// by default since it requires the disk-only resolver path
 	// (~tens of minutes on huge repos) that we haven't yet
 	// optimised end-to-end.
-	if diskTarget == nil && streamingFlushActive(idx.graph, len(files)) {
+	if streamingParse {
 		bl, _ := idx.graph.(graph.BulkLoader)
 		streamingDisk := idx.graph
 		chunkSize := streamingChunkSize()
@@ -3441,6 +3664,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				}
 				if len(batch) > 0 {
 					if err := w.BulkSetFileMtimes(idx.repoPrefix, batch); err != nil {
+						idx.markFileMtimePersistenceDirty()
 						idx.logger.Warn("indexer: streaming-flush chunk mtime persist failed",
 							zap.String("repo", idx.repoPrefix), zap.Error(err))
 					}
@@ -3463,12 +3687,37 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		}
 	}
 
+	// A pressure-sized shadow reserves its drain turn as soon as parsing has
+	// produced the graph. The later deferred drain marks this reservation ready
+	// only after the remaining in-memory work has completed; separating intent
+	// from readiness lets a finishing large direct parse freeze a fair handoff
+	// without moving ordinary shadows onto the repository-scale phase gate.
+	if inMemShadow != nil {
+		shadowEstimate = inMemShadow.RepoMemoryEstimate(idx.RepoPrefix())
+		shadowEstimateReady = true
+	}
+
 	// Finalise the content index after the per-file streaming appends so
 	// its FTS5 segments are merged before the first content query.
 	if cs := idx.contentSearcher(); cs != nil {
 		if err := cs.BuildContentIndex(); err != nil {
 			idx.logger.Warn("indexer: content index build failed", zap.Error(err))
 		}
+	}
+	// parseChunk has joined every worker, flushed the direct graph/content/
+	// sidecar batches, and run the large-direct heap-release check. Keep the
+	// repository lane through content-index finalisation, then let the next
+	// intrinsically large direct parse enter. The defer remains as the
+	// cancellation/panic/error backstop.
+	if releaseLargeDirectAdmission != nil {
+		releaseLargeDirectAdmission()
+	}
+	if releaseIndexMemoryAdmission != nil && !shadowTaken {
+		// Direct parse batches and native arenas have reached their release
+		// boundary. Returning the repository-scale weight here restores useful
+		// overlap with a shadow drain while avoiding the sustained concurrent
+		// writer pressure that starves periodic WAL checkpoints.
+		releaseIndexMemoryAdmission("direct_parse_complete")
 	}
 
 	if processed > 0 {
@@ -3489,15 +3738,16 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// captured via d.Info(); no per-file os.Stat round-trip here.
 	idx.mtimeMu.Lock()
 	idx.fileMtimes = make(map[string]int64, len(files))
+	idx.fileMtimesShared = false
 	for _, f := range files {
 		if f.mtimeNano > 0 {
 			idx.fileMtimes[idx.relKey(f.path)] = f.mtimeNano
 		}
 	}
-	mtimeSnapshot := make(map[string]int64, len(idx.fileMtimes))
-	for k, v := range idx.fileMtimes {
-		mtimeSnapshot[k] = v
-	}
+	// Bulk persistence consumes the snapshot after mtimeMu is released.
+	// Publish it immutably so later mutations detach before writing.
+	idx.fileMtimesShared = true
+	mtimeSnapshot := idx.fileMtimes
 	idx.mtimeMu.Unlock()
 
 	// Persist the per-file mtimes through the store's optional
@@ -3538,16 +3788,21 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	if len(mtimeSnapshot) > 0 {
 		var perr error
 		persisted := false
+		authoritative := false
 		if r, ok := mtimeTarget.(graph.FileMtimeReplacer); ok {
-			perr, persisted = r.ReplaceFileMtimes(idx.repoPrefix, mtimeSnapshot), true
+			perr, persisted, authoritative = r.ReplaceFileMtimes(idx.repoPrefix, mtimeSnapshot), true, true
 		} else if w, ok := mtimeTarget.(graph.FileMtimeWriter); ok {
 			perr, persisted = w.BulkSetFileMtimes(idx.repoPrefix, mtimeSnapshot), true
 		}
 		if persisted {
 			if perr != nil {
+				idx.markFileMtimePersistenceDirty()
 				idx.logger.Warn("persist file mtimes failed",
 					zap.String("repo", idx.repoPrefix), zap.Error(perr))
 			} else {
+				if authoritative {
+					idx.fileMtimePersistenceDirty.Store(false)
+				}
 				idx.logger.Info("persisted file mtimes",
 					zap.String("repo", idx.repoPrefix),
 					zap.Int("count", len(mtimeSnapshot)))
@@ -3693,7 +3948,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				)
 			}
 			reporter.Report("clone detection pass", 0, 0)
-			if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold()); cs.Items > 0 {
+			cs, cloneBaseline := detectClonesAndEmitEdgesWithBaselineCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold())
+			if cs.Items > 0 {
 				idx.logger.Info("clone edges emitted",
 					zap.Int("items", cs.Items),
 					zap.Int("clone_pairs", cs.Pairs),
@@ -3704,13 +3960,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					zap.Int("diffused_edges", cs.DiffusedEdges),
 				)
 			}
-			// Seed the incremental clone index from the freshly-baselined
-			// signatures + sidecar so steady-state single-file edits go
-			// incremental (EvictFuncs/UpdateFuncs) instead of re-running
-			// this whole-graph pass per file. The batch pass remains the
-			// re-baseline (corrects CMS drift) and owns diffusion.
+			// Adopt the freshly-finalized CMS/corpus seed so steady-state
+			// single-file edits go incremental without another corpus scan.
+			// The batch pass remains the re-baseline and owns diffusion.
 			if idx.cloneIndex != nil {
-				idx.cloneIndex.Rebuild(idx.graph, idx.repoPrefix)
+				idx.cloneIndex.AdoptBaselineOrRebuild(idx.graph, idx.repoPrefix, cloneBaseline)
 			}
 			// Framework dynamic-dispatch synthesis — runs once the call
 			// graph and interface inference are final. Skipped under
@@ -3800,12 +4054,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// Persist the Merkle baseline so the next incremental pass diffs
 	// against content hashes rather than re-indexing the whole repo.
 	workspaceFP := ""
-	if idx.merkleEnabled() {
+	if merkleBaseline != nil {
 		paths := make([]string, len(files))
 		for i, wf := range files {
 			paths[i] = wf.path
 		}
-		workspaceFP = idx.saveMerkleBaseline(absRoot, paths)
+		workspaceFP = idx.saveMerkleBaselineWithKnownFiles(absRoot, paths, merkleBaseline.take())
 	}
 	idx.indexGen.Add(1) // invalidate the trigram search cache
 
@@ -3848,6 +4102,32 @@ func (idx *Indexer) repoNodeEdgeCount() (int, int) {
 	}
 	est := idx.graph.RepoMemoryEstimate(idx.repoPrefix)
 	return est.NodeCount, est.EdgeCount
+}
+
+// cleanCensusResult publishes the same zero-delta state as the full-root
+// incremental pipeline after ChangedSinceMtimes has already proved the tree
+// unchanged. It preserves the one necessary side effect for non-persistent
+// search backends without repeating filesystem discovery.
+func (idx *Indexer) cleanCensusResult(detected int, started time.Time) *IndexResult {
+	if idx.totalDetected == 0 {
+		idx.totalDetected = detected
+	}
+	if !isSymbolSearcherBackend(idx.search) {
+		idx.buildSearchIndex()
+	}
+	nodes, edges := idx.repoNodeEdgeCount()
+	fileCount := idx.trackedFileCount()
+	if fileCount == 0 {
+		fileCount = detected
+	}
+	result := &IndexResult{
+		NodeCount:  nodes,
+		EdgeCount:  edges,
+		FileCount:  fileCount,
+		DurationMs: time.Since(started).Milliseconds(),
+	}
+	idx.warnIfEdgeSanityViolated(result)
+	return result
 }
 
 // warnIfEdgeSanityViolated logs a loud warning when an index pass
@@ -4023,70 +4303,99 @@ func (idx *Indexer) indexFile(
 		idx.graph.EvictFile(graphPath)
 	}
 
-	src, readVersion, err := readFileWithVersion(absPath)
-	if err != nil {
-		return err
+	// A delta probe already owns a shared admission lease together with its
+	// transformed source and parse tree. Validate and consume that snapshot
+	// before acquiring another lease; acquiring first can self-deadlock when
+	// one oversized prepared file owns the entire shared budget.
+	preparedEntry, prepared := idx.takePreparedRefresh(absPath)
+	if prepared && preparedEntry.relPath != relPath {
+		preparedEntry.release()
+		preparedEntry = nil
+		prepared = false
 	}
+	var (
+		parseLease  *parseAdmissionLease
+		src         []byte
+		readVersion fileReadVersion
+		lang        string
+		result      *parser.ExtractionResult
+		skipped     bool
+	)
+	defer func() { parseLease.Release() }()
 
-	lang, ok := idx.effectiveLanguage(absPath, src)
-	if !ok {
-		return nil
-	}
-	ext, _ := idx.registry.GetByLanguage(lang)
-	if ext == nil {
-		return nil
-	}
-
-	// Honour the size cap on the incremental path too: an over-cap
-	// file gets a synthetic skip node, not a parse — matching the
-	// bulk IndexCtx walk. This IS a successful result, so it evicts the
-	// prior state and installs the synthetic node, same as before.
-	if maxSize := idx.config.MaxFileSize; maxSize > 0 && int64(len(src)) > maxSize {
-		n := sizeSkipNode(skippedFile{
-			relPath: relPath, lang: lang, size: int64(len(src)),
-		}, maxSize)
-		idx.applyRepoPrefix([]*graph.Node{n}, nil)
-		evictExisting()
-		idx.graph.AddBatch([]*graph.Node{n}, nil)
-		if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-			return errFileVersionChanged
+	if prepared {
+		parseLease = preparedEntry.parseLease
+		src = preparedEntry.src
+		readVersion = preparedEntry.readVersion
+		lang = preparedEntry.lang
+		result = preparedEntry.result
+	} else {
+		parseLease, err = idx.acquireSharedParsePath(absPath)
+		if err != nil {
+			return err
 		}
-		return nil
-	}
-
-	// Honour the content-admission gate on the incremental path too, so a
-	// document over its cap (or a data asset, by default) the cold walk
-	// would skip doesn't get parsed back in when the watcher re-indexes it
-	// — same synthetic-skip-node treatment as the size cap above.
-	if reason, skip := idx.newContentAdmissionGate().skip(lang, int64(len(src))); skip {
-		n := contentSkipNode(skippedFile{
-			relPath: relPath, lang: lang, size: int64(len(src)), reason: reason,
-		})
-		idx.applyRepoPrefix([]*graph.Node{n}, nil)
-		evictExisting()
-		idx.graph.AddBatch([]*graph.Node{n}, nil)
-		if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-			return errFileVersionChanged
+		src, readVersion, err = readFileWithVersion(absPath)
+		if err != nil {
+			return err
 		}
-		return nil
-	}
 
-	// Pre-ingestion transforms — same pipeline as the bulk path.
-	src = idx.transforms.run(relPath, src)
+		var ok bool
+		lang, ok = idx.effectiveLanguage(absPath, src)
+		if !ok {
+			return nil
+		}
+		ext, _ := idx.registry.GetByLanguage(lang)
+		if ext == nil {
+			return nil
+		}
 
-	// Crash isolation for the incremental path: a file the user just
-	// saved that SIGSEGVs the parser is quarantined instead of taking
-	// the daemon down with it. The pool is long-lived and shared, so
-	// the watcher hot path never forks a worker subprocess per file.
-	var pool *crashpool.Pool
-	var quarantine *crashpool.Quarantine
-	if idx.crashIsolationEnabled() {
-		pool, quarantine = idx.sharedParsePool()
-	}
-	result, prepared := idx.takePreparedExtraction(absPath, relPath, lang, src)
-	skipped := false
-	if !prepared {
-		result, skipped, err = idx.extractFile(pool, quarantine, absPath, relPath, lang, ext, src)
+		// Honour the size cap on the incremental path too: an over-cap
+		// file gets a synthetic skip node, not a parse — matching the
+		// bulk IndexCtx walk. This IS a successful result, so it evicts the
+		// prior state and installs the synthetic node, same as before.
+		if maxSize := idx.config.MaxFileSize; maxSize > 0 && int64(len(src)) > maxSize {
+			n := sizeSkipNode(skippedFile{
+				relPath: relPath, lang: lang, size: int64(len(src)),
+			}, maxSize)
+			idx.applyRepoPrefix([]*graph.Node{n}, nil)
+			evictExisting()
+			idx.graph.AddBatch([]*graph.Node{n}, nil)
+			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
+				return errFileVersionChanged
+			}
+			return nil
+		}
+
+		// Honour the content-admission gate on the incremental path too,
+		// so a document over its cap (or a data asset, by default) the cold
+		// walk would skip does not get parsed back in after a watcher event.
+		if reason, skip := idx.newContentAdmissionGate().skip(lang, int64(len(src))); skip {
+			n := contentSkipNode(skippedFile{
+				relPath: relPath, lang: lang, size: int64(len(src)), reason: reason,
+			})
+			idx.applyRepoPrefix([]*graph.Node{n}, nil)
+			evictExisting()
+			idx.graph.AddBatch([]*graph.Node{n}, nil)
+			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
+				return errFileVersionChanged
+			}
+			return nil
+		}
+
+		// Pre-ingestion transforms — same pipeline as the bulk path.
+		src = idx.transforms.run(relPath, src)
+
+		// Crash isolation for the incremental path: a file the user just
+		// saved that SIGSEGVs the parser is quarantined instead of taking
+		// the daemon down with it. The pool is long-lived and shared.
+		var pool *crashpool.Pool
+		var quarantine *crashpool.Quarantine
+		if idx.crashIsolationEnabled() {
+			pool, quarantine = idx.sharedParsePool()
+		}
+		result, skipped, err = idx.extractFileWithRawLease(
+			parseLease, pool, quarantine, absPath, relPath, lang, ext, src,
+		)
 		if quarantine != nil && quarantine.Len() > 0 {
 			_ = quarantine.Save()
 		}
@@ -4118,6 +4427,7 @@ func (idx *Indexer) indexFile(
 		}
 		return err
 	}
+	omitSecondarySourceScans := extractionDispositionFor(result).omitSecondarySourceScans()
 
 	// Affected-by snapshot: the symbol shapes and reverse-reference
 	// sources the post-resolve signature-delta pass compares against,
@@ -4160,7 +4470,7 @@ func (idx *Indexer) indexFile(
 	// delta already ran this exact pipeline; reusing it avoids both a second
 	// parse and duplicate coverage artifacts.
 	if !skipped {
-		if !prepared {
+		if !prepared && !omitSecondarySourceScans {
 			idx.applyCoverageDomains(relPath, lang, src, result)
 		}
 		// Persist the canonical raw-extraction identity on the file node.
@@ -4205,6 +4515,11 @@ func (idx *Indexer) indexFile(
 	idx.graph.AddBatch(result.Nodes, result.Edges)
 	idx.persistConstValues(result)
 	idx.persistFileMeta(relPath, src, result)
+	// No subsequent stage reads source bytes or the parse tree. Release both
+	// here instead of retaining them through resolver/enrichment work; the
+	// deferred calls above remain as idempotent guards for every early return.
+	result.ReleaseTree()
+	parseLease.Release()
 
 	// Add new symbols to search index. shouldIndexForSearch enforces
 	// the same SkipSearch filter used by the bulk and upgrade paths.
@@ -4325,7 +4640,8 @@ func (idx *Indexer) indexFile(
 			// their pre-enrichment tier until the next full reindex. This caller
 			// enforces Config.EnrichOnWatch; deferred batches use EnrichFiles.
 			providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
-			watchEnrichment := providersPresent && !idx.deferGlobalPasses.Load() && idx.semanticMgr.EnrichesOnWatch()
+			watchEnrichment := providersPresent && !omitSecondarySourceScans &&
+				!idx.deferGlobalPasses.Load() && idx.semanticMgr.EnrichesOnWatch()
 			reEnriched := false
 			if watchEnrichment {
 				enrichStarted := time.Now()
@@ -4345,7 +4661,7 @@ func (idx *Indexer) indexFile(
 			// suppression as re-verification-pending so a hidden-but-real usage
 			// is diagnosable rather than silently dropped. Cleared when
 			// enrichment did re-run for the file.
-			pendingReparseEnrichment := providersPresent && !reEnriched
+			pendingReparseEnrichment := providersPresent && !omitSecondarySourceScans && !reEnriched
 			if markerBatch == nil {
 				idx.setReparsePendingEnrichment(graphPath, pendingReparseEnrichment)
 			} else if markerBatch.add(graphPath, pendingReparseEnrichment) {
@@ -4363,7 +4679,7 @@ func (idx *Indexer) indexFile(
 			abSnap:    abSnap,
 		}}))
 		providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
-		if markerBatch.add(graphPath, providersPresent) {
+		if markerBatch.add(graphPath, providersPresent && !omitSecondarySourceScans) {
 			idx.flushReparsePendingEnrichment(markerBatch)
 		}
 		// A global-using change re-prices unit-wide dependents even on
@@ -4431,10 +4747,12 @@ func (idx *Indexer) recordFileReadVersion(relPath, absPath string, version fileR
 
 func (idx *Indexer) recordFileMtimeValue(relPath string, mtime int64) {
 	idx.mtimeMu.Lock()
+	idx.ensureFileMtimesWritableLocked()
 	idx.fileMtimes[relPath] = mtime
 	idx.mtimeMu.Unlock()
 	if w, ok := idx.graph.(graph.FileMtimeWriter); ok {
 		if err := w.BulkSetFileMtimes(idx.repoPrefix, map[string]int64{relPath: mtime}); err != nil {
+			idx.markFileMtimePersistenceDirty()
 			idx.logger.Warn("persist file mtime failed",
 				zap.String("repo", idx.repoPrefix), zap.String("file", relPath), zap.Error(err))
 		}
@@ -5081,6 +5399,20 @@ func (idx *Indexer) buildSearchIndex() {
 	// leaves it nil, so LastVectorBuildError always reflects the current pass.
 	idx.lastVectorBuildErr = nil
 
+	// Install the learned sub-word boundary table before populating an
+	// in-process BM25 backend. Capability detection happens before graph
+	// enumeration, so native SQLite FTS and Bleve do no boundary census.
+	search.BuildAndInstallNgramBoundaries(idx.search, idx.graph)
+
+	nativeText := isSymbolSearcherBackend(idx.search)
+	buildVectors := idx.embedder != nil && !idx.skipVectorBuild
+	if nativeText && !buildVectors {
+		// SQLite maintains symbol_fts in the graph mutation path. Backend.Add
+		// only adjusts a process-local approximate counter, so walking and
+		// decoding every node here cannot add searchable data.
+		return
+	}
+
 	// Code-only enumeration: content (data_class=content) sections live in
 	// the content index, never the symbol search or the vector store, so the
 	// FTS loop below and collectEmbedTexts both skip them anyway. Fetching
@@ -5089,36 +5421,21 @@ func (idx *Indexer) buildSearchIndex() {
 	// them in SQL), instead of being materialised only to be skipped.
 	nodes := graph.RepoCodeNodes(idx.graph, idx.repoPrefix)
 
-	// Install the learned sub-word boundary table on the BM25 layer
-	// before populating postings, so the optional sparse-ngram
-	// tokenizer's split points are data-driven and — crucially —
-	// identical on the index path here and the query path later. The
-	// table must be in place before the first Add for postings and
-	// queries to agree; it is a no-op for non-BM25 backends and a no-op
-	// for search overall unless GORTEX_SPARSE_NGRAM is set.
-	search.InstallNgramBoundaries(idx.search, search.BuildNgramBoundaries(idx.graph))
-
-	// Build text index. The SkipSearch filter (wired through
-	// idx.shouldIndexForSearch) drops config-key-style variable nodes
-	// that would only pad the index — see docs on IndexConfig.SkipSearch.
-	for _, n := range nodes {
-		if !idx.shouldIndexForSearch(n) {
-			continue
+	// Build the text index only for in-process backends. Native SQLite FTS is
+	// already updated transactionally by graph mutations; its Add method is a
+	// counting compatibility shim rather than an indexing operation.
+	if !nativeText {
+		for _, n := range nodes {
+			if !idx.shouldIndexForSearch(n) {
+				continue
+			}
+			idx.search.Add(n.ID, searchIndexFields(n, idx.projectName)...)
 		}
-		idx.search.Add(n.ID, searchIndexFields(n, idx.projectName)...)
 	}
 
-	// Build vector index if embedder is available.
-	if idx.embedder == nil {
-		return
-	}
-
-	// skipVectorBuild short-circuits the embedding pass: the text index
-	// above is fully populated, but a caller (the daemon warmup loop
-	// after a snapshot restore) has signalled that the workspace vector
-	// index will be supplied separately, so re-embedding here would be
-	// wasted work immediately overwritten by the cached index.
-	if idx.skipVectorBuild {
+	// With no requested vector build, text indexing is complete. This covers
+	// both a missing embedder and snapshot warmup's skipVectorBuild path.
+	if !buildVectors {
 		return
 	}
 
@@ -5494,6 +5811,39 @@ func (idx *Indexer) FileMtimes() map[string]int64 {
 	return out
 }
 
+// publishFileMtimes returns the current map as an immutable committed
+// snapshot. Every later element mutation must call
+// ensureFileMtimesWritableLocked first; that copy-on-write boundary lets the
+// Indexer, RepoMetadata, poller, and daemon snapshot share one map safely.
+func (idx *Indexer) publishFileMtimes() map[string]int64 {
+	idx.mtimeMu.Lock()
+	defer idx.mtimeMu.Unlock()
+	idx.fileMtimesShared = true
+	return idx.fileMtimes
+}
+
+func (idx *Indexer) markFileMtimePersistenceDirty() {
+	idx.fileMtimePersistenceDirty.Store(true)
+}
+
+func (idx *Indexer) fileReceiptPagingReliable() bool {
+	return !idx.fileMtimePersistenceDirty.Load()
+}
+
+// ensureFileMtimesWritableLocked detaches the working map from any published
+// snapshot. The caller must hold mtimeMu for writing.
+func (idx *Indexer) ensureFileMtimesWritableLocked() {
+	if !idx.fileMtimesShared {
+		return
+	}
+	writable := make(map[string]int64, len(idx.fileMtimes))
+	for path, mtime := range idx.fileMtimes {
+		writable[path] = mtime
+	}
+	idx.fileMtimes = writable
+	idx.fileMtimesShared = false
+}
+
 // trackedFileCount reports how many files this indexer currently holds
 // mtime records for — the repo's whole file set, independent of any one
 // pass's scope. A scoped pass adds and evicts its own files within scope
@@ -5536,6 +5886,7 @@ func (idx *Indexer) RefreshFileMtime(filePath string) {
 	idx.mtimeMu.Lock()
 	_, tracked := idx.fileMtimes[key]
 	if tracked {
+		idx.ensureFileMtimesWritableLocked()
 		idx.fileMtimes[key] = mtime
 	}
 	idx.mtimeMu.Unlock()
@@ -5544,6 +5895,7 @@ func (idx *Indexer) RefreshFileMtime(filePath string) {
 	}
 	if w, ok := idx.graph.(graph.FileMtimeWriter); ok {
 		if err := w.BulkSetFileMtimes(idx.repoPrefix, map[string]int64{key: mtime}); err != nil {
+			idx.markFileMtimePersistenceDirty()
 			idx.logger.Warn("persist file mtime failed",
 				zap.String("repo", idx.repoPrefix), zap.String("file", key), zap.Error(err))
 		}
@@ -5562,6 +5914,7 @@ func (idx *Indexer) pruneDeletedFileMtimes(deleted []string) {
 	}
 	if d, ok := idx.graph.(graph.FileMtimeDeleter); ok {
 		if err := d.DeleteFileMtimes(idx.repoPrefix, deleted); err != nil {
+			idx.markFileMtimePersistenceDirty()
 			idx.logger.Warn("prune deleted file mtimes failed",
 				zap.String("repo", idx.repoPrefix), zap.Error(err))
 		}
@@ -5573,6 +5926,7 @@ func (idx *Indexer) SetFileMtimes(mtimes map[string]int64) {
 	idx.mtimeMu.Lock()
 	defer idx.mtimeMu.Unlock()
 	idx.fileMtimes = make(map[string]int64, len(mtimes))
+	idx.fileMtimesShared = false
 	for k, v := range mtimes {
 		idx.fileMtimes[k] = v
 	}
@@ -5789,6 +6143,16 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		}
 	}
 
+	projectionCandidates := make([]string, 0, 1)
+	for relPath := range diskFiles {
+		if filepath.Base(filepath.FromSlash(relPath)) == "parser.c" {
+			projectionCandidates = append(projectionCandidates, relPath)
+		}
+	}
+	for _, relPath := range idx.staleGeneratedParserProjectionPaths(projectionCandidates) {
+		staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(relPath)))
+	}
+
 	// In Merkle mode the per-file mtime check is skipped; the stale set
 	// comes from a content-addressed tree diff over the whole repo,
 	// then intersected back down to the requested scope.
@@ -5977,6 +6341,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
 		idx.markPendingEnrichFiles(invalidation.Files)
 	}
+	if len(failedFiles) == 0 && !idx.hasStaleGeneratedParserProjections() {
+		idx.persistExtractorVersion("c")
+	}
 	return result, nil
 }
 
@@ -6027,6 +6394,7 @@ func (idx *Indexer) buildPerFileContractExtractors() ([]contracts.Extractor, map
 		&contracts.WebSocketExtractor{},
 		&contracts.NestMicroserviceExtractor{},
 		&contracts.EnvVarExtractor{},
+		&contracts.TerraformExtractor{},
 	}
 	// Config-driven event bus: only registered when the user declared
 	// boundaries (index.event_bus / CODEGRAPH_EVENT_CONFIG), so the default
@@ -8505,16 +8873,30 @@ func (idx *Indexer) HasChangesSinceMtimes(root string) bool {
 // caller treats that as "unknown, do a full re-track", exactly as
 // HasChangesSinceMtimes conservatively returns true on the same condition.
 func (idx *Indexer) ChangedSinceMtimes(root string) (changed []string, deleted []string, err error) {
+	changed, deleted, _, err = idx.changedSinceMtimesCensus(root)
+	return changed, deleted, err
+}
+
+// changedSinceMtimesCensus also returns the complete tracked-source count from
+// the same walk. ReconcileRepoCtx uses that count to publish an honest clean
+// result without repeating the full-tree discovery in the incremental path.
+func (idx *Indexer) changedSinceMtimesCensus(root string) (
+	changed []string,
+	deleted []string,
+	detected int,
+	err error,
+) {
 	absRoot, absErr := filepath.Abs(root)
 	if absErr != nil {
-		return nil, nil, absErr
+		return nil, nil, 0, absErr
 	}
 	idx.storeRootPath(absRoot)
 
 	diskFiles := make(map[string]bool)
+	projectionCandidates := make([]string, 0, 1)
 	walkErr := filepath.WalkDir(absRoot, func(path string, d os.DirEntry, werr error) error {
 		if werr != nil {
-			return nil
+			return werr
 		}
 		if d.IsDir() {
 			if idx.shouldPruneDir(path, absRoot) {
@@ -8522,7 +8904,7 @@ func (idx *Indexer) ChangedSinceMtimes(root string) (changed []string, deleted [
 			}
 			return nil
 		}
-		if _, ok := idx.effectiveLanguage(path, nil); !ok {
+		if _, ok := idx.effectiveLanguage(path, nil); !ok && !idx.isIncrementalContractManifest(path) {
 			return nil
 		}
 		if idx.shouldExclude(path, absRoot, false) {
@@ -8530,31 +8912,46 @@ func (idx *Indexer) ChangedSinceMtimes(root string) (changed []string, deleted [
 		}
 		rel := idx.relKey(path)
 		diskFiles[rel] = true
+		if filepath.Base(filepath.FromSlash(rel)) == "parser.c" {
+			projectionCandidates = append(projectionCandidates, rel)
+		}
 		if idx.IsStale(rel) {
 			changed = append(changed, rel)
 		}
 		return nil
 	})
 	if walkErr != nil {
-		return nil, nil, walkErr
+		return nil, nil, 0, walkErr
 	}
 
-	// Deletion check: a previously-indexed file absent from the walk and
-	// confirmed gone from disk counts as a change (its edges must drop).
+	projectionRefresh := idx.staleGeneratedParserProjectionPaths(projectionCandidates)
+	changed = appendUniqueSorted(changed, projectionRefresh...)
+	if len(projectionRefresh) == 0 && !idx.merkleEnabled() {
+		idx.persistExtractorVersion("c")
+	}
+
+	// Deletion check mirrors the modern incremental path: missing files and
+	// files that became excluded must both leave the restored graph.
 	idx.mtimeMu.RLock()
-	var candidates []string
+	candidates := make([]string, 0)
 	for rel := range idx.fileMtimes {
 		if !diskFiles[rel] {
 			candidates = append(candidates, rel)
 		}
 	}
 	idx.mtimeMu.RUnlock()
+	sort.Strings(candidates)
 	for _, rel := range candidates {
-		if _, statErr := os.Stat(filepath.Join(absRoot, filepath.FromSlash(rel))); errors.Is(statErr, os.ErrNotExist) {
+		absPath := filepath.Join(absRoot, filepath.FromSlash(rel))
+		_, statErr := os.Stat(absPath)
+		switch {
+		case statErr == nil && idx.shouldExclude(absPath, absRoot, false):
+			deleted = append(deleted, rel)
+		case errors.Is(statErr, os.ErrNotExist):
 			deleted = append(deleted, rel)
 		}
 	}
-	return changed, deleted, nil
+	return changed, deleted, len(diskFiles), nil
 }
 
 func (idx *Indexer) IsStale(relPath string) bool {

@@ -43,6 +43,44 @@ func (idx *Indexer) persistRepoIndexState(diskTarget graph.Store, rootAbs, works
 	}
 }
 
+// persistExtractorVersion advances one extraction-policy key without
+// restamping unrelated repository provenance. It is used after a scoped warm
+// refresh has proved every stored generated-parser projection current.
+func (idx *Indexer) persistExtractorVersion(lang string) {
+	r, readOK := idx.graph.(graph.RepoIndexStateReader)
+	w, writeOK := idx.graph.(graph.RepoIndexStateWriter)
+	if !readOK || !writeOK {
+		return
+	}
+	st, found, err := r.GetRepoIndexState(idx.repoPrefix)
+	if err != nil || !found {
+		return
+	}
+
+	versions := make(map[string]int)
+	if st.ExtractorVersions != "" {
+		if err := json.Unmarshal([]byte(st.ExtractorVersions), &versions); err != nil {
+			idx.logger.Warn("decode extractor versions failed",
+				zap.String("repo", idx.repoPrefix), zap.Error(err))
+			return
+		}
+	}
+	current := extractorVersionForLang(lang)
+	if versions[lang] >= current {
+		return
+	}
+	versions[lang] = current
+	encoded, err := json.Marshal(versions)
+	if err != nil {
+		return
+	}
+	st.ExtractorVersions = string(encoded)
+	if err := w.SetRepoIndexState(st); err != nil {
+		idx.logger.Warn("persist extractor version failed",
+			zap.String("repo", idx.repoPrefix), zap.String("language", lang), zap.Error(err))
+	}
+}
+
 // reconcileRepoIndexState re-stamps the per-repo freshness row at the
 // current HEAD after the git-watcher catches the index up to a new
 // commit. The full (re)index is otherwise the only writer of this row,

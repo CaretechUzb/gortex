@@ -100,7 +100,7 @@ func (s *Store) streamScopedNodes(query string, args []any, summary bool, yield 
 			if summary {
 				node, scanErr = scanNodeSummary(rows)
 			} else {
-				node, scanErr = scanNode(rows)
+				node, scanErr = scanNodeCursor(rows)
 			}
 			if scanErr != nil {
 				_ = rows.Close()
@@ -148,8 +148,23 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 			panicOnFatal(err)
 			return
 		}
+		// edge.file_path is the cheapest exact-frontier key, but imported or
+		// legacy rows can carry blank/mismatched provenance. Validate only the
+		// frozen edge generation before selecting the covering file index; a
+		// malformed frontier keeps the source-node semantics through the
+		// nodes_by_file -> edges_by_from fallback below.
+		fileIndexed := len(filePaths) > 0 && s.scopedEdgeFileProvenanceCanonical(
+			repoPrefixes, filePaths, kindValues, maxID,
+		)
 		for _, kind := range kindValues {
-			query, args, ok := scopedEdgeProjectionQuery(repoPrefixes, filePaths, kind)
+			var query string
+			var args []any
+			var ok bool
+			if fileIndexed {
+				query, args, ok = scopedEdgeProjectionQuery(repoPrefixes, filePaths, kind)
+			} else {
+				query, args, ok = scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind)
+			}
 			if !ok {
 				return
 			}
@@ -175,7 +190,7 @@ func (s *Store) streamScopedEdges(query string, args []any, maxID int64, yield f
 		page := make([]*graph.Edge, 0, scopedProjectionPage)
 		for rows.Next() {
 			var edgeID int64
-			edge, scanErr := scanEdge(edgeIDScanner{scanner: rows, id: &edgeID})
+			edge, scanErr := scanEdgeCursor(edgeIDScanner{scanner: rows, id: &edgeID})
 			if scanErr != nil {
 				_ = rows.Close()
 				panicOnFatal(scanErr)
@@ -270,7 +285,47 @@ func scopedNodeProjectionQuery(
 	return query, args, true
 }
 
+// scopedEdgeProjectionQuery is the canonical exact-file path. The requested
+// file CTE is deliberately the outer loop and edges_by_file is mandatory: an
+// id-ordered edges_by_kind walk examines a whole corpus kind range merely to
+// discover the handful of rows owned by the requested files.
 func scopedEdgeProjectionQuery(
+	repoPrefixes, filePaths []string,
+	kind string,
+) (string, []any, bool) {
+	if kind == "" {
+		return "", nil, false
+	}
+	filesJSON, haveFiles := projectionJSON(filePaths)
+	if !haveFiles {
+		return scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind)
+	}
+	reposJSON, haveRepos := projectionJSON(repoPrefixes)
+	ctes := []string{`requested_files(file_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`}
+	args := []any{filesJSON}
+	repoPredicate := ""
+	if haveRepos {
+		ctes = append(ctes, `requested_repos(repo_prefix) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`)
+		args = append(args, reposJSON)
+		repoPredicate = ` AND n.repo_prefix IN (SELECT repo_prefix FROM requested_repos)`
+	}
+	args = append(args, kind)
+	query := `WITH ` + strings.Join(ctes, ", ") +
+		` SELECT e.id, ` + lookupQualifiedEdgeCols +
+		` FROM requested_files AS f` +
+		` CROSS JOIN edges AS e INDEXED BY edges_by_file` +
+		` CROSS JOIN nodes AS n` +
+		` WHERE e.file_path = f.file_path AND e.kind = ?` +
+		` AND n.id = e.from_id AND n.file_path = e.file_path` + repoPredicate +
+		` AND e.id > ? AND e.id <= ? ORDER BY e.id LIMIT ?`
+	return query, args, true
+}
+
+// scopedEdgeSourceProjectionQuery preserves source-node ownership when edge
+// provenance is not canonical. Explicit loop order prevents SQLite from
+// satisfying ORDER BY through edges_by_kind and filtering the whole kind
+// range after the fact.
+func scopedEdgeSourceProjectionQuery(
 	repoPrefixes, filePaths []string,
 	kind string,
 ) (string, []any, bool) {
@@ -282,25 +337,74 @@ func scopedEdgeProjectionQuery(
 	if !haveRepos && !haveFiles {
 		return "", nil, false
 	}
-	ctes := make([]string, 0, 2)
-	joins := make([]string, 0, 2)
-	args := make([]any, 0, 3)
-	if haveFiles {
-		ctes = append(ctes, `requested_files(file_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`)
-		joins = append(joins, `JOIN requested_files AS f ON f.file_path = n.file_path`)
-		args = append(args, filesJSON)
+	if !haveFiles {
+		// Preserve the linear id-keyset repository walk. Forcing repository
+		// nodes first would require a temp B-tree to restore e.id order on
+		// every page, recreating the quadratic plan this projection replaced.
+		query := `WITH requested_repos(repo_prefix) AS (` +
+			`SELECT CAST(value AS TEXT) FROM json_each(?))` +
+			` SELECT e.id, ` + lookupQualifiedEdgeCols +
+			` FROM nodes AS n JOIN edges AS e ON e.from_id = n.id` +
+			` JOIN requested_repos AS r ON r.repo_prefix = n.repo_prefix` +
+			` WHERE e.kind = ? AND e.id > ? AND e.id <= ? ORDER BY e.id LIMIT ?`
+		return query, []any{reposJSON, kind}, true
 	}
+
+	ctes := []string{`requested_files(file_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`}
+	args := []any{filesJSON}
+	scopePredicate := `n.file_path = f.file_path`
 	if haveRepos {
 		ctes = append(ctes, `requested_repos(repo_prefix) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`)
-		joins = append(joins, `JOIN requested_repos AS r ON r.repo_prefix = n.repo_prefix`)
 		args = append(args, reposJSON)
+		scopePredicate += ` AND n.repo_prefix IN (SELECT repo_prefix FROM requested_repos)`
 	}
 	args = append(args, kind)
 	query := `WITH ` + strings.Join(ctes, ", ") +
 		` SELECT e.id, ` + lookupQualifiedEdgeCols +
-		` FROM nodes AS n JOIN edges AS e ON e.from_id = n.id ` + strings.Join(joins, " ") +
-		` WHERE e.kind = ? AND e.id > ? AND e.id <= ? ORDER BY e.id LIMIT ?`
+		` FROM requested_files AS f` +
+		` CROSS JOIN nodes AS n INDEXED BY nodes_by_file` +
+		` CROSS JOIN edges AS e INDEXED BY edges_by_from` +
+		` WHERE ` + scopePredicate + ` AND e.from_id = n.id AND e.kind = ?` +
+		` AND e.id > ? AND e.id <= ? ORDER BY e.id LIMIT ?`
 	return query, args, true
+}
+
+func (s *Store) scopedEdgeFileProvenanceCanonical(
+	repoPrefixes, filePaths, kinds []string,
+	maxID int64,
+) bool {
+	filesJSON, haveFiles := projectionJSON(filePaths)
+	kindsJSON, haveKinds := projectionJSON(kinds)
+	if !haveFiles || !haveKinds {
+		return false
+	}
+	reposJSON, haveRepos := projectionJSON(repoPrefixes)
+	ctes := []string{
+		`requested_files(file_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+		`requested_kinds(kind) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+	}
+	args := []any{filesJSON, kindsJSON}
+	repoPredicate := ""
+	if haveRepos {
+		ctes = append(ctes, `requested_repos(repo_prefix) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`)
+		args = append(args, reposJSON)
+		repoPredicate = ` AND n.repo_prefix IN (SELECT repo_prefix FROM requested_repos)`
+	}
+	args = append(args, maxID)
+	query := `WITH ` + strings.Join(ctes, ", ") +
+		` SELECT NOT EXISTS (` +
+		`SELECT 1 FROM requested_files AS f` +
+		` CROSS JOIN nodes AS n INDEXED BY nodes_by_file` +
+		` CROSS JOIN edges AS e INDEXED BY edges_by_from` +
+		` WHERE n.file_path = f.file_path AND e.from_id = n.id` +
+		` AND e.kind IN (SELECT kind FROM requested_kinds)` + repoPredicate +
+		` AND e.id <= ? AND e.file_path <> n.file_path LIMIT 1)`
+	var canonical bool
+	if err := s.db.QueryRow(query, args...).Scan(&canonical); err != nil {
+		panicOnFatal(err)
+		return false
+	}
+	return canonical
 }
 
 var _ graph.ScopedProjectionSequencer = (*Store)(nil)

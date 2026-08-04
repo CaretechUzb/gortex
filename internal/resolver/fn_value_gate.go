@@ -64,148 +64,139 @@ func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
 	if g == nil {
 		return 0
 	}
-	var landed []*graph.Edge
-	// Candidates sharing a file each want the same GetFileNodes(filePath)
-	// result. Fetching it fresh per candidate is a per-candidate SQL
-	// round-trip regardless of how few nodes the file has — a generated file
-	// with a large candidate count (a tree-sitter parser.c, an ORM-generated
-	// Go file) turns into hundreds of thousands of redundant queries against
-	// a handful of nodes. Cache per file for the life of this pass.
-	fileNodes := map[string][]*graph.Node{}
-	getFileNodes := func(filePath string) []*graph.Node {
-		if ns, ok := fileNodes[filePath]; ok {
-			return ns
-		}
-		ns := g.GetFileNodes(filePath)
-		fileNodes[filePath] = ns
-		return ns
-	}
-	// nameMemo caches g.FindNodesByName(name) for the life of the pass. The
-	// resolve helpers hit it repeatedly for the same registration name (every
-	// router.Get("/x", handler) that names the same handler, every recurring
-	// Class::method string), and each hit was an unmemoized FindNodesByName —
-	// on a large graph the single largest cost of the gate. No node is added or
-	// removed until the AddEdge tail below, so a name's node set is stable
-	// across the pass and the memo returns identical results.
-	nameMemo := map[string][]*graph.Node{}
-	process := func(e *graph.Edge) {
-		if e == nil || e.Meta == nil {
+
+	// Finish the candidate cursor before opening the callable projection or
+	// writing synthesized edges. Besides avoiding store re-entry, this lets the
+	// same candidate order feed both the compact and compatibility paths.
+	var candidates []*graph.Edge
+	collect := func(edge *graph.Edge) {
+		if edge == nil || edge.Meta == nil {
 			return
 		}
-		if via, _ := e.Meta["via"].(string); via != fnValueCandidateVia {
+		if via, _ := edge.Meta["via"].(string); via != fnValueCandidateVia {
 			return
 		}
-		name, _ := e.Meta[metaFnValueName].(string)
+		name, _ := edge.Meta[metaFnValueName].(string)
 		if name == "" || isFnValueNonTarget(name) {
 			return
 		}
+		candidates = append(candidates, edge)
+	}
+	if scope == nil {
+		// The gate needs only the placeholders parked in the fn-value namespace,
+		// not every reference edge. The Meta predicate remains in collect because
+		// a non-candidate edge can share that namespace.
+		edges := g.EdgesByKind(graph.EdgeReferences)
+		if fp, ok := g.(graph.FnValuePlaceholderScanner); ok {
+			edges = fp.FnValuePlaceholderEdges()
+		}
+		for edge := range edges {
+			collect(edge)
+		}
+	} else {
+		// Scoped: walk only changed repositories' source-owned edges.
+		for prefix := range scope {
+			if prefix == "" {
+				continue
+			}
+			for _, edge := range g.GetRepoEdges(prefix) {
+				if edge != nil && edge.Kind == graph.EdgeReferences {
+					collect(edge)
+				}
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return 0
+	}
+
+	sameFileTarget := newFnValueSameFileTargetLookup(g, candidates)
+	// Resolve global names lazily. Most candidates bind within their file, so a
+	// pass-wide FindNodesByNames prefetch decodes and retains a much larger node
+	// set than the gate uses. The memo still collapses repeated positive and
+	// negative lookups to one bounded store query per distinct global name.
+	nameMemo := make(map[string][]*graph.Node)
+	var landed []*graph.Edge
+	for _, edge := range candidates {
+		name, _ := edge.Meta[metaFnValueName].(string)
 		// Resolution scope depends on the captured form. A special form's
 		// receiver hint (`<self>` / a concrete type) binds the member against
-		// that type's methods (compiler-precise); a qualified-path candidate
-		// marked `fn_value_ungated` may bind cross-module at a lower tier; a
-		// plain candidate binds same-file.
-		recvHint, _ := e.Meta["fn_ref_recv_hint"].(string)
-		ungated, _ := e.Meta["fn_value_ungated"].(bool)
-		skipGate, _ := e.Meta["skip_gate"].(bool)
-		target := ""
+		// that type's methods; a plain candidate binds same-file.
+		recvHint, _ := edge.Meta["fn_ref_recv_hint"].(string)
+		ungated, _ := edge.Meta["fn_value_ungated"].(bool)
+		skipGate, _ := edge.Meta["skip_gate"].(bool)
+		var targets []string
 		conf := 0.6
 		origin := graph.OriginASTInferred
 		switch {
 		case skipGate:
-			// Curated-HOF string callable: bypass same-file scope and bind by a
-			// repo-wide unique-or-drop rule (a `Class::method` string scopes to
-			// the type).
+			target := ""
 			if recvHint != "" {
 				target = resolveMemberByTypeMemo(g, recvHint, name, nameMemo)
 			}
 			if target == "" {
 				target = resolveUniqueFnValueMemo(g, name, nameMemo)
 			}
-			conf = 0.5
+			targets, conf = appendTarget(nil, target), 0.5
 		case recvHint == "<self>":
-			if target = resolveFnValueSelfMemberMemo(g, e.From, name, nameMemo); target != "" {
+			if targets = resolveFnValueSelfMembersMemo(g, edge.From, name, nameMemo); len(targets) > 0 {
 				conf, origin = 0.85, graph.OriginASTResolved
 			} else {
-				target = resolveFnValueName(getFileNodes(e.FilePath), name)
+				targets = appendTarget(nil, sameFileTarget(edge.FilePath, name))
 			}
 		case recvHint != "":
-			if target = resolveMemberByTypeMemo(g, recvHint, name, nameMemo); target != "" {
+			if targets = resolveMembersByTypeMemo(g, recvHint, name, nameMemo); len(targets) > 0 {
 				conf, origin = 0.85, graph.OriginASTResolved
 			} else if ungated {
-				target = resolveFnValueCrossModuleMemo(g, name, nameMemo)
+				targets = appendTarget(nil, resolveFnValueCrossModuleMemo(g, name, nameMemo))
 				conf = 0.45
 			}
 		default:
-			target = resolveFnValueName(getFileNodes(e.FilePath), name)
-			if target == "" && ungated {
-				target = resolveFnValueCrossModuleMemo(g, name, nameMemo)
+			targets = appendTarget(nil, sameFileTarget(edge.FilePath, name))
+			if len(targets) == 0 && ungated {
+				targets = appendTarget(nil, resolveFnValueCrossModuleMemo(g, name, nameMemo))
 				conf = 0.45
 			}
 		}
-		if target == "" || target == e.From {
-			// Unbound (a local / param / undefined name) or a self-reference
-			// (a function's own declaration token): reject rather than
-			// fabricate an edge.
-			return
+		// An overload set is a genuine ambiguity — exactly one member is the
+		// real target and the graph cannot say which — so each edge in the set
+		// rides the inferred tier at reduced confidence rather than claiming
+		// the resolved-match certainty a lone hit earns.
+		if len(targets) > 1 {
+			conf, origin = 0.6, graph.OriginASTInferred
 		}
-		meta := map[string]any{
-			"via":             fnValueRegistrationVia,
-			metaFnValueName:   name,
-			MetaSynthesizedBy: SynthFnValueCallback,
-			MetaProvenance:    ProvenanceHeuristic,
-		}
-		if form, _ := e.Meta["fn_ref_form"].(string); form != "" {
-			meta["fn_ref_form"] = form
-		}
-		landed = append(landed, &graph.Edge{
-			From:            e.From,
-			To:              target,
-			Kind:            graph.EdgeReferences,
-			FilePath:        e.FilePath,
-			Line:            e.Line,
-			Confidence:      conf,
-			ConfidenceLabel: graph.ConfidenceLabelFor(graph.EdgeReferences, conf),
-			Origin:          origin,
-			Meta:            meta,
-		})
-	}
-
-	if scope == nil {
-		// The gate needs only the placeholders parked in the fn-value namespace,
-		// not every reference edge. When the backend can range-scan that namespace
-		// (FnValuePlaceholderScanner) use it: the generic EdgesByKind(references)
-		// path materialises the whole placeholders-plus-real-references set on every
-		// whole-graph synthesizer pass — several times the size of the placeholder
-		// slice on a large multi-repo graph. Both iterators are iter.Seq[*Edge], so
-		// the loop body is identical; the Meta["via"] == callback_candidate filter
-		// in process STAYS on both paths — a non-candidate edge can be parked in the
-		// namespace (e.g. an already-bound registration) and must never be gated.
-		edges := g.EdgesByKind(graph.EdgeReferences)
-		if fp, ok := g.(graph.FnValuePlaceholderScanner); ok {
-			edges = fp.FnValuePlaceholderEdges()
-		}
-		for e := range edges {
-			process(e)
-		}
-	} else {
-		// Scoped: walk only the changed repos' out-edges (GetRepoEdges is one
-		// backend query per repo). The via filter in process still applies, so a
-		// non-candidate reference edge in the changed repo is ignored.
-		for prefix := range scope {
-			if prefix == "" {
+		for _, target := range targets {
+			if target == "" || target == edge.From {
 				continue
 			}
-			for _, e := range g.GetRepoEdges(prefix) {
-				if e == nil || e.Kind != graph.EdgeReferences {
-					continue
-				}
-				process(e)
+			meta := map[string]any{
+				"via":             fnValueRegistrationVia,
+				metaFnValueName:   name,
+				MetaSynthesizedBy: SynthFnValueCallback,
+				MetaProvenance:    ProvenanceHeuristic,
 			}
+			if form, _ := edge.Meta["fn_ref_form"].(string); form != "" {
+				meta["fn_ref_form"] = form
+			}
+			if len(targets) > 1 {
+				meta["overload_set"] = len(targets)
+			}
+			landed = append(landed, &graph.Edge{
+				From:            edge.From,
+				To:              target,
+				Kind:            graph.EdgeReferences,
+				FilePath:        edge.FilePath,
+				Line:            edge.Line,
+				Confidence:      conf,
+				ConfidenceLabel: graph.ConfidenceLabelFor(graph.EdgeReferences, conf),
+				Origin:          origin,
+				Meta:            meta,
+			})
 		}
 	}
+
 	// One bounded AddBatch per chunk instead of an AddEdge per edge: on a
-	// disk-backed store the per-edge form was one ACID round-trip each
-	// across tens of thousands of synthesized callback edges.
+	// disk-backed store the per-edge form is one ACID round-trip each.
 	const fnValueAddBatchChunk = 4096
 	for start := 0; start < len(landed); start += fnValueAddBatchChunk {
 		end := start + fnValueAddBatchChunk
@@ -215,6 +206,66 @@ func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
 		g.AddBatch(nil, landed[start:end])
 	}
 	return len(landed)
+}
+
+type fnValueFileName struct {
+	file string
+	name string
+}
+
+// newFnValueSameFileTargetLookup indexes only the (file,name) pairs requested
+// by this pass through the existing metadata-free callable projection. A pair
+// with more than one callable falls back to the legacy GetFileNodes order, so
+// overloads and malformed duplicate declarations remain byte-identical.
+func newFnValueSameFileTargetLookup(g graph.Store, candidates []*graph.Edge) func(string, string) string {
+	fileNodes := map[string][]*graph.Node{}
+	legacy := func(filePath, name string) string {
+		nodes, ok := fileNodes[filePath]
+		if !ok {
+			nodes = g.GetFileNodes(filePath)
+			fileNodes[filePath] = nodes
+		}
+		return resolveFnValueName(nodes, name)
+	}
+
+	sequencer, ok := g.(graph.CallableBindingNodeSequencer)
+	if !ok {
+		return legacy
+	}
+	wanted := make(map[fnValueFileName]struct{}, len(candidates))
+	for _, edge := range candidates {
+		if edge == nil || edge.Meta == nil {
+			continue
+		}
+		recvHint, _ := edge.Meta["fn_ref_recv_hint"].(string)
+		skipGate, _ := edge.Meta["skip_gate"].(bool)
+		if skipGate || (recvHint != "" && recvHint != "<self>") {
+			continue
+		}
+		name, _ := edge.Meta[metaFnValueName].(string)
+		wanted[fnValueFileName{file: edge.FilePath, name: name}] = struct{}{}
+	}
+
+	targets := make(map[fnValueFileName]string, len(wanted))
+	ambiguous := make(map[fnValueFileName]struct{})
+	for node := range sequencer.CallableBindingNodesSeq(graph.KindFunction, graph.KindMethod) {
+		key := fnValueFileName{file: node.FilePath, name: node.Name}
+		if _, requested := wanted[key]; !requested {
+			continue
+		}
+		if prior, found := targets[key]; found && prior != node.ID {
+			ambiguous[key] = struct{}{}
+		} else if !found {
+			targets[key] = node.ID
+		}
+	}
+	return func(filePath, name string) string {
+		key := fnValueFileName{file: filePath, name: name}
+		if _, needsLegacyOrder := ambiguous[key]; needsLegacyOrder {
+			return legacy(filePath, name)
+		}
+		return targets[key]
+	}
 }
 
 // resolveFnValueName returns the ID of a function or method named name among
@@ -388,20 +439,64 @@ func resolveMemberByTypeMemo(g graph.Store, typeName, member string, memo map[st
 	return match
 }
 
-// resolveFnValueSelfMemberMemo binds a `this.m` / `self.m` member reference
+// resolveMembersByTypeMemo returns every method of typeName named member —
+// the complete overload set, not the unique-or-drop single match
+// resolveMemberByTypeMemo yields.
+//
+// In Java (and C#, Kotlin, C++) a type may declare one name several times, and
+// a method reference such as `Type::handle` names the whole set: which overload
+// applies is decided by the target functional interface's shape, which the
+// graph does not model. Unique-or-drop therefore discarded the reference
+// outright the moment a target was overloaded, leaving every overload with no
+// incoming reference at all — so an overloaded method reached only through a
+// method reference was reported dead. Binding the set keeps each overload
+// reachable; the caller reduces confidence to mark the ambiguity.
+func resolveMembersByTypeMemo(g graph.Store, typeName, member string, memo map[string][]*graph.Node) []string {
+	if typeName == "" || member == "" {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, n := range findNodesByNameMemo(g, member, memo) {
+		if n == nil || n.Kind != graph.KindMethod {
+			continue
+		}
+		if recv, _ := n.Meta["receiver"].(string); recv != typeName {
+			continue
+		}
+		if seen[n.ID] {
+			continue
+		}
+		seen[n.ID] = true
+		out = append(out, n.ID)
+	}
+	return out
+}
+
+// resolveFnValueSelfMembersMemo binds a `this.m` / `self.m` member reference
 // against the methods of the registration site's enclosing type, so it can
-// never bind a coincidentally-named top-level function. A shared per-pass
-// FindNodesByName memo collapses repeated lookups (nil disables memoization).
-func resolveFnValueSelfMemberMemo(g graph.Store, fromID, member string, memo map[string][]*graph.Node) string {
+// never bind a coincidentally-named top-level function. Returns the full
+// overload set. A shared per-pass FindNodesByName memo collapses repeated
+// lookups (nil disables memoization).
+func resolveFnValueSelfMembersMemo(g graph.Store, fromID, member string, memo map[string][]*graph.Node) []string {
 	from := g.GetNode(fromID)
 	if from == nil || from.Meta == nil {
-		return ""
+		return nil
 	}
 	recv, _ := from.Meta["receiver"].(string)
 	if recv == "" {
-		return ""
+		return nil
 	}
-	return resolveMemberByTypeMemo(g, recv, member, memo)
+	return resolveMembersByTypeMemo(g, recv, member, memo)
+}
+
+// appendTarget appends a resolved target ID to a list, skipping the empty
+// "unresolved" sentinel so single-match paths compose with the set-valued ones.
+func appendTarget(dst []string, target string) []string {
+	if target == "" {
+		return dst
+	}
+	return append(dst, target)
 }
 
 // isFnValueNonTarget reports whether name is a literal/keyword/builtin that

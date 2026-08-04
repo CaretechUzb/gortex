@@ -251,7 +251,7 @@ func TestResolvePHPOverrideDispatch_ReceiverTypeBindsInheritedMethod(t *testing.
 	s.AddEdge(&graph.Edge{
 		From: caller, To: "unresolved::*.getRecord", Kind: graph.EdgeCalls,
 		FilePath: leaf, Line: 12,
-		Meta:     map[string]any{"receiver_type": "StreamHandlerTest"},
+		Meta: map[string]any{"receiver_type": "StreamHandlerTest"},
 	})
 
 	require.Positive(t, New(s).resolvePHPOverrideDispatch())
@@ -281,7 +281,7 @@ func TestResolvePHPOverrideDispatch_ReceiverTypePrefersOwnDeclaration(t *testing
 	s.AddEdge(&graph.Edge{
 		From: caller, To: "unresolved::*.handle", Kind: graph.EdgeCalls,
 		FilePath: app, Line: 3,
-		Meta:     map[string]any{"receiver_type": "StreamHandler"},
+		Meta: map[string]any{"receiver_type": "StreamHandler"},
 	})
 
 	require.Positive(t, New(s).resolvePHPOverrideDispatch())
@@ -310,7 +310,7 @@ func TestResolvePHPOverrideDispatch_UnknownReceiverTypeStaysUnresolved(t *testin
 	s.AddEdge(&graph.Edge{
 		From: caller, To: "unresolved::*.send", Kind: graph.EdgeCalls,
 		FilePath: app, Line: 7,
-		Meta:     map[string]any{"receiver_type": "GuzzleClient"},
+		Meta: map[string]any{"receiver_type": "GuzzleClient"},
 	})
 
 	New(s).resolvePHPOverrideDispatch()
@@ -337,7 +337,7 @@ func TestResolvePHPOverrideDispatch_ReceiverTypeBindsThroughTrait(t *testing.T) 
 	s.AddEdge(&graph.Edge{
 		From: caller, To: "unresolved::*.logInfo", Kind: graph.EdgeCalls,
 		FilePath: cls, Line: 9,
-		Meta:     map[string]any{"receiver_type": "Worker"},
+		Meta: map[string]any{"receiver_type": "Worker"},
 	})
 
 	require.Positive(t, New(s).resolvePHPOverrideDispatch())
@@ -371,7 +371,7 @@ func TestResolveAll_PHPTypedReceiverBeatsSameDirectoryGuess(t *testing.T) {
 	s.AddEdge(&graph.Edge{
 		From: callerID, To: "unresolved::*.getFormatter", Kind: graph.EdgeCalls,
 		FilePath: caller, Line: 124,
-		Meta:     map[string]any{"receiver_type": "AmqpHandler"},
+		Meta: map[string]any{"receiver_type": "AmqpHandler"},
 	})
 
 	New(s).ResolveAll()

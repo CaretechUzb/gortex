@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"container/heap"
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"errors"
 	"math"
@@ -175,7 +176,7 @@ func (s *Store) GetEmbeddings(ids []string) map[string][]float32 {
 		for rows.Next() {
 			var (
 				id   string
-				blob []byte
+				blob sql.RawBytes
 			)
 			if err := rows.Scan(&id, &blob); err != nil {
 				_ = rows.Close()
@@ -217,7 +218,7 @@ func (s *Store) SimilarTo(vec []float32, limit int) ([]graph.VectorHit, error) {
 	h := &hitHeap{}
 	for rows.Next() {
 		var id string
-		var blob []byte
+		var blob sql.RawBytes
 		if err := rows.Scan(&id, &blob); err != nil {
 			return nil, err
 		}

@@ -62,56 +62,59 @@ func captureCFnAddressRefs(result *parser.ExtractionResult, root *sitter.Node, f
 			localDecl[n.Name] = true
 		}
 	}
-	shadowed := cCollectLocalNames(root, src)
+	var shadowed map[string]bool
+	root.WithScratch(func() { shadowed = cCollectLocalNames(root, src) })
 
 	funcRanges := buildFuncRanges(result)
 	seen := map[string]bool{}
 	var cands []FnValueCandidate
-	walkNodes(root, func(n *sitter.Node) {
-		if len(cands) >= cFnAddressMaxPerFile {
-			return // per-file fuse: bound a pathological generated file
-		}
-		if n.Type() != "identifier" {
-			return
-		}
-		form, ok := cFnAddressPosition(n)
-		if !ok {
-			return
-		}
-		name := n.Content(src)
-		if name == "" || isCFnAddressNonTarget(name) || isCValueRefNoise(name) {
-			return
-		}
-		// A name the file itself declares (function / variable / constant /
-		// type) or that is a parameter / local can never be a cross-TU
-		// function address — resolve it locally or not at all.
-		if sameFileFunc[name] || localDecl[name] || shadowed[name] {
-			return
-		}
-		// Defensive callee guard: positions above exclude the callee, but a
-		// macro-call argument that is itself a call (`f(g())`) must not treat
-		// the inner callee as a value.
-		if byteAfterIdentStartsCall(src, int(n.EndByte())) {
-			return
-		}
-		line := int(n.StartPoint().Row) + 1
-		from := findEnclosingFunc(funcRanges, line)
-		if from == "" {
-			from = fileID // file-scope reference (command / dispatch table)
-		}
-		// One candidate per (enclosing symbol or file, name): a function
-		// address binds by name repo-wide, so the same free identifier on N
-		// lines of a generated ==/!= lexer collapses to a single reference.
-		// First occurrence by walk order wins; mirrors the shared
-		// captureFnValueCandidates key shape.
-		key := from + "\x00" + name
-		if seen[key] {
-			return
-		}
-		seen[key] = true
-		cands = append(cands, FnValueCandidate{
-			FromID: from, Name: name, FilePath: filePath, Line: line,
-			Form: form, Lang: "c", Ungated: true,
+	root.WithScratch(func() {
+		walkNodes(root, func(n *sitter.Node) {
+			if len(cands) >= cFnAddressMaxPerFile {
+				return // per-file fuse: bound a pathological generated file
+			}
+			if n.Type() != "identifier" {
+				return
+			}
+			form, ok := cFnAddressPosition(n)
+			if !ok {
+				return
+			}
+			name := n.Content(src)
+			if name == "" || isCFnAddressNonTarget(name) || isCValueRefNoise(name) {
+				return
+			}
+			// A name the file itself declares (function / variable / constant /
+			// type) or that is a parameter / local can never be a cross-TU
+			// function address — resolve it locally or not at all.
+			if sameFileFunc[name] || localDecl[name] || shadowed[name] {
+				return
+			}
+			// Defensive callee guard: positions above exclude the callee, but a
+			// macro-call argument that is itself a call (`f(g())`) must not treat
+			// the inner callee as a value.
+			if byteAfterIdentStartsCall(src, int(n.EndByte())) {
+				return
+			}
+			line := int(n.StartPoint().Row) + 1
+			from := findEnclosingFunc(funcRanges, line)
+			if from == "" {
+				from = fileID // file-scope reference (command / dispatch table)
+			}
+			// One candidate per (enclosing symbol or file, name): a function
+			// address binds by name repo-wide, so the same free identifier on N
+			// lines of a generated ==/!= lexer collapses to a single reference.
+			// First occurrence by walk order wins; mirrors the shared
+			// captureFnValueCandidates key shape.
+			key := from + "\x00" + name
+			if seen[key] {
+				return
+			}
+			seen[key] = true
+			cands = append(cands, FnValueCandidate{
+				FromID: from, Name: name, FilePath: filePath, Line: line,
+				Form: form, Lang: "c", Ungated: true,
+			})
 		})
 	})
 	EmitFnValueCandidates(result, cands)

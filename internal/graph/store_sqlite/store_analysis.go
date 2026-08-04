@@ -12,7 +12,9 @@ package store_sqlite
 // created in schema.go (edges_by_from / edges_by_to / nodes_by_kind).
 
 import (
+	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -25,6 +27,7 @@ var _ graph.StructuralParentEdges = (*Store)(nil)
 var _ graph.ExtractCandidatesScanner = (*Store)(nil)
 var _ graph.CrossRepoCandidates = (*Store)(nil)
 var _ graph.ScopedCrossRepoCandidates = (*Store)(nil)
+var _ graph.MutationScopedCrossRepoCandidates = (*Store)(nil)
 var _ graph.ThrowerErrorSurfacer = (*Store)(nil)
 
 // anaDedupeEdgeKinds drops empty / duplicate edge kinds, preserving
@@ -116,7 +119,7 @@ WHERE e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL`
 	var out []graph.IfaceImplementsRow
 	for rows.Next() {
 		var fromID, ifaceID string
-		var metaBlob []byte
+		var metaBlob sql.RawBytes
 		if err := rows.Scan(&fromID, &ifaceID, &metaBlob); err != nil {
 			continue
 		}
@@ -325,7 +328,7 @@ WHERE kind IN (?,?) AND start_line > 0 AND end_line > 0`
 // ToRepo are the endpoint prefixes. Empty baseKinds returns nil; single-
 // repo graphs (or graphs whose nodes carry no RepoPrefix) yield nothing.
 func (s *Store) CrossRepoCandidates(baseKinds []graph.EdgeKind) []graph.CrossRepoCandidateRow {
-	return s.crossRepoCandidates(baseKinds, nil, nil)
+	return s.crossRepoCandidates(baseKinds, nil, nil, nil)
 }
 
 // CrossRepoCandidatesForRepos applies an incident repository frontier inside
@@ -336,21 +339,28 @@ func (s *Store) CrossRepoCandidatesForRepos(baseKinds []graph.EdgeKind, repoPref
 	if len(repos) == 0 {
 		return nil
 	}
-	return s.crossRepoCandidates(baseKinds, repos, nil)
+	return s.crossRepoCandidates(baseKinds, repos, nil, nil)
 }
 
 // CrossRepoCandidatesForFiles applies the watcher frontier in SQL. The edge's
 // source site and both endpoint file owners are considered, matching the
 // in-memory incident-frontier semantics without one adjacency query per node.
 func (s *Store) CrossRepoCandidatesForFiles(baseKinds []graph.EdgeKind, filePaths []string) []graph.CrossRepoCandidateRow {
-	files := dedupeNonEmpty(filePaths)
-	if len(files) == 0 {
-		return nil
-	}
-	return s.crossRepoCandidates(baseKinds, nil, files)
+	return s.CrossRepoCandidatesForMutation(baseKinds, filePaths, filePaths)
 }
 
-func (s *Store) crossRepoCandidates(baseKinds []graph.EdgeKind, repoPrefixes, filePaths []string) []graph.CrossRepoCandidateRow {
+// CrossRepoCandidatesForMutation applies only the query arms required by each
+// mutation role. The two JSON scopes remain bounded to one host parameter each.
+func (s *Store) CrossRepoCandidatesForMutation(baseKinds []graph.EdgeKind, edgeSourceFiles, incidentNodeFiles []string) []graph.CrossRepoCandidateRow {
+	edgeFiles := dedupeNonEmpty(edgeSourceFiles)
+	incidentFiles := dedupeNonEmpty(incidentNodeFiles)
+	if len(edgeFiles) == 0 && len(incidentFiles) == 0 {
+		return nil
+	}
+	return s.crossRepoCandidates(baseKinds, nil, edgeFiles, incidentFiles)
+}
+
+func (s *Store) crossRepoCandidates(baseKinds []graph.EdgeKind, repoPrefixes, edgeSourceFiles, incidentNodeFiles []string) []graph.CrossRepoCandidateRow {
 	uniq := anaDedupeEdgeKinds(baseKinds)
 	if len(uniq) == 0 {
 		return nil
@@ -395,34 +405,44 @@ JOIN nodes nt ON nt.id = e.to_id
 		args = appendKinds(args)
 		args = append(args, scopeJSON)
 		args = appendKinds(args)
-	} else if len(filePaths) > 0 {
-		scopeJSON, ok := projectionJSON(filePaths)
-		if !ok {
-			return nil
-		}
-		q = `WITH candidate_edges(id) AS (
-  SELECT e.id
+	} else if len(edgeSourceFiles) > 0 || len(incidentNodeFiles) > 0 {
+		candidateQueries := make([]string, 0, 3)
+		if len(edgeSourceFiles) > 0 {
+			scopeJSON, ok := projectionJSON(edgeSourceFiles)
+			if !ok {
+				return nil
+			}
+			candidateQueries = append(candidateQueries, `SELECT e.id
   FROM edges e
   WHERE e.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-    AND e.kind IN (` + inPlaceholders(len(uniq)) + `)
-  UNION
-  SELECT e.id
-  FROM nodes n
-  JOIN edges e ON e.from_id = n.id
-  WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-    AND e.kind IN (` + inPlaceholders(len(uniq)) + `)
-  UNION
-  SELECT e.id
-  FROM nodes n
-  JOIN edges e ON e.to_id = n.id
-  WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-    AND e.kind IN (` + inPlaceholders(len(uniq)) + `)
-)
-` + fmt.Sprintf(projection, `candidate_edges ce JOIN edges e ON e.id = ce.id`)
-		for repeat := 0; repeat < 3; repeat++ {
+    AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
 			args = append(args, scopeJSON)
 			args = appendKinds(args)
 		}
+		if len(incidentNodeFiles) > 0 {
+			scopeJSON, ok := projectionJSON(incidentNodeFiles)
+			if !ok {
+				return nil
+			}
+			candidateQueries = append(candidateQueries, `SELECT e.id
+  FROM nodes n
+  JOIN edges e ON e.from_id = n.id
+  WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+    AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
+			args = append(args, scopeJSON)
+			args = appendKinds(args)
+			candidateQueries = append(candidateQueries, `SELECT e.id
+  FROM nodes n
+  JOIN edges e ON e.to_id = n.id
+  WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+    AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
+			args = append(args, scopeJSON)
+			args = appendKinds(args)
+		}
+		q = `WITH candidate_edges(id) AS (
+` + strings.Join(candidateQueries, "\n  UNION\n  ") + `
+)
+` + fmt.Sprintf(projection, `candidate_edges ce JOIN edges e ON e.id = ce.id`)
 	} else {
 		q = fmt.Sprintf(projection, `edges e`) + ` AND e.kind IN (` + inPlaceholders(len(uniq)) + `)`
 		args = appendKinds(args)
@@ -558,7 +578,7 @@ ORDER BY e.id`
 		}
 		for mrows.Next() {
 			var name string
-			var metaBlob []byte
+			var metaBlob sql.RawBytes
 			if err := mrows.Scan(&name, &metaBlob); err != nil {
 				continue
 			}

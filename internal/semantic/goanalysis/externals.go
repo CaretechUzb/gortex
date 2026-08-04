@@ -33,17 +33,30 @@ const modulePathStdlib = "stdlib"
 //     packages too.
 //   - moduleByPath: import path → KindModule node ID. Cached so the
 //     stdlib (and each dep module) materialises at most once per pass.
-//   - extByObj: types.Object → external node ID. Caches lookups across
-//     multiple Uses of the same external symbol.
+//   - knownNodeIDs: canonical external node IDs, avoiding retention of
+//     go/types objects (and their package/type graphs) across the long apply.
 //
 // Statistics counters surface back through ExternalsResult so the caller
 // can report nodes/edges added.
+// externalUseIdentity is the string-only projection needed while applying one
+// external compiler use. A pass interns it by canonical external node ID, so
+// hundreds of thousands of Uses neither retain types.Object package graphs nor
+// repeatedly allocate the same three resolver-stub targets.
+type externalUseIdentity struct {
+	name        string
+	kind        graph.EdgeKind
+	stubTargets [3]string
+}
+
 type externalsAttribution struct {
 	g            graph.Store
 	pkgByPath    map[string]*packages.Package
 	moduleByPath map[string]string
-	extByObj     map[types.Object]string
-	provider     string
+	// extByObj is a projection-only accelerator. It is cleared together with
+	// pkgByPath before graph apply, so types.Object never crosses that boundary.
+	extByObj    map[types.Object]string
+	useByNodeID map[string]*externalUseIdentity
+	provider    string
 
 	// repoPrefix is the owning repo's prefix, used to namespace stub
 	// IDs (graph.StubID). Empty when the caller doesn't supply one
@@ -60,12 +73,12 @@ type externalsAttribution struct {
 	// processing Uses. It replaces the former GetNode call per unique external
 	// symbol/module and is updated as this pass creates nodes.
 	knownNodeIDs map[string]struct{}
-	// Pending mutations are drained once per loaded package. Keeping these
-	// bounded avoids one SQLite transaction per external symbol, module link,
-	// or stub rebind while preserving the exact edge payloads.
-	pendingNodes     []*graph.Node
-	pendingEdges     []*graph.Edge
-	pendingReindexes []graph.EdgeReindex
+	// Pending graph mutations are projected without store re-entry, then drained
+	// in fixed pages after compiler state is released.
+	pendingNodes           []*graph.Node
+	pendingEdges           []*graph.Edge
+	pendingDependencyEdges map[string]*graph.Edge
+	pendingReindexes       []graph.EdgeReindex
 
 	nodesAdded     int
 	edgesAdded     int
@@ -113,6 +126,7 @@ func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider,
 		pkgByPath:    pkgByPath,
 		moduleByPath: make(map[string]string),
 		extByObj:     make(map[types.Object]string),
+		useByNodeID:  make(map[string]*externalUseIdentity),
 		provider:     provider,
 		repoPrefix:   repoPrefix,
 		knownNodeIDs: make(map[string]struct{}),
@@ -122,7 +136,7 @@ func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider,
 // prefetchExistingNodes collects every external symbol/module ID this repo's
 // Uses can touch and tests their existence in one batched store operation.
 // Only IDs stay resident; decoded nodes are discarded immediately.
-func (e *externalsAttribution) prefetchExistingNodes(pkgs []*packages.Package, objToNode map[types.Object]string) {
+func (e *externalsAttribution) existingNodeIDs(pkgs []*packages.Package, objToNode map[types.Object]string) []string {
 	ids := make(map[string]struct{})
 	for _, root := range pkgs {
 		if root == nil || root.TypesInfo == nil {
@@ -148,12 +162,16 @@ func (e *externalsAttribution) prefetchExistingNodes(pkgs []*packages.Package, o
 			ids[nodeID] = struct{}{}
 		}
 	}
-	if len(ids) == 0 {
-		return
-	}
 	batch := make([]string, 0, len(ids))
 	for id := range ids {
 		batch = append(batch, id)
+	}
+	return batch
+}
+
+func (e *externalsAttribution) prefetchExistingNodeIDs(batch []string) {
+	if len(batch) == 0 {
+		return
 	}
 	for id := range graph.LookupExistingNodeIDs(e.g, batch) {
 		e.knownNodeIDs[id] = struct{}{}
@@ -212,12 +230,16 @@ func (e *externalsAttribution) resolveSymbol(obj types.Object) string {
 		e.pendingNodes = append(e.pendingNodes, buildExternalNode(nodeID, kind, importPath, moduleID, pkg, obj, e.provider))
 		e.knownNodeIDs[nodeID] = struct{}{}
 		e.nodesAdded++
+	}
 
-		// Attribute the symbol to its module via EdgeDependsOnModule. The
-		// schema's existing convention is "file/package/import →
-		// KindModule"; an external symbol is morally equivalent — it's
-		// a first-class entity that depends on the module providing it.
-		e.pendingEdges = append(e.pendingEdges, &graph.Edge{
+	// Schedule module attribution even when the canonical symbol already exists.
+	// New symbols commit with this link in one AddBatch; a retry still repairs
+	// legacy/partial state whose node exists without the exact dependency edge.
+	// AddBatch is identity-idempotent, and drainPendingEdges filters edges already
+	// present so result counters remain exact on ordinary warm runs.
+	e.ensurePendingDependencyEdges()
+	if _, scheduled := e.pendingDependencyEdges[nodeID]; !scheduled {
+		edge := &graph.Edge{
 			From:            nodeID,
 			To:              moduleID,
 			Kind:            graph.EdgeDependsOnModule,
@@ -229,7 +251,9 @@ func (e *externalsAttribution) resolveSymbol(obj types.Object) string {
 			Meta: map[string]any{
 				"semantic_source": e.provider,
 			},
-		})
+		}
+		e.pendingEdges = append(e.pendingEdges, edge)
+		e.pendingDependencyEdges[nodeID] = edge
 		e.edgesAdded++
 		e.modulesLinked++
 	}
@@ -237,37 +261,38 @@ func (e *externalsAttribution) resolveSymbol(obj types.Object) string {
 	return nodeID
 }
 
-// claimAndUpgradeStub looks for an existing edge from caller to one of the
-// resolver's stub targets for this external symbol (stdlib::, dep::, or
-// unresolved::extern::) and rewrites its To to point at the new external
-// node. Returns the rewritten edge for the caller to confirm, or nil
-// when no stub is found.
-//
-// Two passes:
-//
-//  1. Exact stub-string lookup. The parser+resolver shape for direct
-//     package calls like `fmt.Println(...)` lands as `stdlib::fmt::Println`
-//     after the resolver runs (or `unresolved::extern::fmt::Println` if
-//     resolution didn't happen yet). We replace the To with the real
-//     external node ID.
-//  2. Fuzzy line-and-name match. Method calls on external types (e.g.
-//     `os.Stdout.Write(...)`) land as `unresolved::*.Write` because the
-//     parser doesn't know `os.Stdout` resolves to the os.File receiver.
-//     The fuzzy pass scans the caller's outgoing edges at the same line
-//     and matches by trailing-name, which is enough to correctly claim
-//     the stub without bringing in line-unrelated false positives.
-//
-// Why this matters: previously the resolver wrote stub-string targets like
-// "stdlib::fmt::Println" that no node holds. Once goanalysis materialises
-// the real ext::go:fmt::Println node, leaving the stub edge in place
-// would double-count the call (one stub, one real). ReindexEdge migrates
-// the byTo bucket so find_usages on the new node returns the correct
-// caller and the stub bucket drains.
-func (e *externalsAttribution) claimAndUpgradeStub(callerID string, importPath string, obj types.Object, newTarget string, line int) *graph.Edge {
-	if edge := e.claimByExactStub(callerID, importPath, obj, newTarget); edge != nil {
+// releaseCompilerReferences ends the projection lifetime. The graph apply uses
+// only interned string identities and pending graph mutations from this point.
+func (e *externalsAttribution) releaseCompilerReferences() {
+	e.extByObj = nil
+	e.pkgByPath = nil
+}
+
+// projectedUse interns the compact, string-only facts needed by the graph
+// apply. The cache key is the canonical external node ID, never types.Object,
+// so it cannot pin dependency package scopes after compiler projection.
+func (e *externalsAttribution) projectedUse(obj types.Object, nodeID string) *externalUseIdentity {
+	if identity := e.useByNodeID[nodeID]; identity != nil {
+		return identity
+	}
+	if obj == nil || obj.Pkg() == nil {
+		return nil
+	}
+	identity := externalUseIdentityFor(e.repoPrefix, obj.Pkg().Path(), obj)
+	if identity != nil {
+		e.useByNodeID[nodeID] = identity
+	}
+	return identity
+}
+
+func (e *externalsAttribution) claimAndUpgradeProjectedStub(callerID string, identity *externalUseIdentity, newTarget string, line int) *graph.Edge {
+	if identity == nil {
+		return nil
+	}
+	if edge := e.claimByExactTargets(callerID, identity.stubTargets, identity.kind, newTarget); edge != nil {
 		return edge
 	}
-	if edge := e.claimByLineAndName(callerID, obj, newTarget, line); edge != nil {
+	if edge := e.claimByLineAndNameKind(callerID, identity.name, identity.kind, newTarget, line); edge != nil {
 		return edge
 	}
 	return nil
@@ -276,12 +301,18 @@ func (e *externalsAttribution) claimAndUpgradeStub(callerID string, importPath s
 // claimByExactStub handles the canonical resolver-shaped targets. Pulled
 // out so the fuzzy pass can layer on top.
 func (e *externalsAttribution) claimByExactStub(callerID string, importPath string, obj types.Object, newTarget string) *graph.Edge {
+	identity := externalUseIdentityFor(e.repoPrefix, importPath, obj)
+	if identity == nil {
+		return nil
+	}
+	return e.claimByExactTargets(callerID, identity.stubTargets, identity.kind, newTarget)
+}
+
+func (e *externalsAttribution) claimByExactTargets(callerID string, targets [3]string, kind graph.EdgeKind, newTarget string) *graph.Edge {
 	if e.edgeCandidates == nil {
 		return nil
 	}
-	candidates := stubEdgeTargets(e.repoPrefix, importPath, obj)
-	kind := wantedEdgeKind(obj)
-	for _, target := range candidates {
+	for _, target := range targets {
 		edge := e.edgeCandidates.EndpointKind(callerID, target, kind)
 		if edge == nil {
 			continue
@@ -297,24 +328,10 @@ func (e *externalsAttribution) claimByExactStub(callerID string, importPath stri
 	return nil
 }
 
-// claimByLineAndName scans the caller's outgoing edges at line `line` for
-// any edge whose target is still a stub-string (`unresolved::`, `external::`,
-// `stdlib::`, `dep::`) and whose trailing-name matches obj.Name(). Used
-// for method calls on external types where the parser's `unresolved::*.M`
-// shape doesn't carry the import path.
-//
-// Conservative — only matches stub targets so we never overwrite a
-// resolver-confirmed real edge — and only when both line and trailing
-// name match, which together pin the use-site uniquely.
-func (e *externalsAttribution) claimByLineAndName(callerID string, obj types.Object, newTarget string, line int) *graph.Edge {
-	if line <= 0 || e.edgeCandidates == nil {
+func (e *externalsAttribution) claimByLineAndNameKind(callerID, name string, expected graph.EdgeKind, newTarget string, line int) *graph.Edge {
+	if line <= 0 || name == "" || e.edgeCandidates == nil {
 		return nil
 	}
-	name := obj.Name()
-	if name == "" {
-		return nil
-	}
-	expected := wantedEdgeKind(obj)
 	candidates := e.edgeCandidates.Site(callerID, line, expected)
 	for _, edge := range candidates {
 		if edge.Line != line {
@@ -492,11 +509,159 @@ func externalModuleNodeID(pkg *packages.Package) string {
 	return goModuleNodeID(mod.Path, mod.Version)
 }
 
+// drainPendingAdds performs the final missing-node recheck immediately before
+// the caller's AddBatch. enrichRepoContext holds Store.ResolveMutex across this
+// recheck and apply, so a canonical module/external node created after the
+// initial prefetch cannot be rewritten by a stale synthetic identity. Edges are
+// deliberately retained: the reused node may still need this pass's module or
+// call/reference edges.
 func (e *externalsAttribution) drainPendingAdds() (nodes []*graph.Node, edges []*graph.Edge) {
-	nodes, edges = e.pendingNodes, e.pendingEdges
-	e.pendingNodes = nil
-	e.pendingEdges = nil
+	nodes = e.drainPendingNodes(0)
+	edges = e.drainPendingEdgesForNodes(nodes)
+	edges = append(edges, e.drainPendingEdges(0)...)
 	return nodes, edges
+}
+
+// drainPendingNodes returns at most limit nodes (all when limit <= 0), with the
+// final store recheck applied to that page only. Copying and clearing the source
+// slots prevents a suffix slice from keeping already-applied node pointers live.
+func (e *externalsAttribution) drainPendingNodes(limit int) []*graph.Node {
+	take := len(e.pendingNodes)
+	if limit > 0 && take > limit {
+		take = limit
+	}
+	if take == 0 {
+		return nil
+	}
+	nodes := append([]*graph.Node(nil), e.pendingNodes[:take]...)
+	clear(e.pendingNodes[:take])
+	e.pendingNodes = e.pendingNodes[take:]
+	if len(e.pendingNodes) == 0 {
+		e.pendingNodes = nil
+	}
+	if e.g == nil {
+		return nodes
+	}
+
+	ids := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		if node != nil && node.ID != "" {
+			ids = append(ids, node.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nodes
+	}
+	existing := graph.LookupExistingNodeIDs(e.g, ids)
+	if len(existing) == 0 {
+		return nodes
+	}
+
+	kept := nodes[:0]
+	reused := 0
+	for _, node := range nodes {
+		if node != nil {
+			if _, ok := existing[node.ID]; ok {
+				reused++
+				continue
+			}
+		}
+		kept = append(kept, node)
+	}
+	clear(nodes[len(kept):])
+	e.nodesAdded -= reused
+	return kept
+}
+
+// drainPendingEdgesForNodes pairs each genuinely new external symbol with its
+// module edge in the same AddBatch transaction. Module nodes are projected
+// before their symbols, so the target is already committed or in this page.
+func (e *externalsAttribution) drainPendingEdgesForNodes(nodes []*graph.Node) []*graph.Edge {
+	e.ensurePendingDependencyEdges()
+	edges := make([]*graph.Edge, 0, len(nodes))
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		if edge := e.pendingDependencyEdges[node.ID]; edge != nil {
+			edges = append(edges, edge)
+			delete(e.pendingDependencyEdges, node.ID)
+		}
+	}
+	return edges
+}
+
+func (e *externalsAttribution) ensurePendingDependencyEdges() {
+	if e.pendingDependencyEdges != nil {
+		return
+	}
+	e.pendingDependencyEdges = make(map[string]*graph.Edge, len(e.pendingEdges))
+	for _, edge := range e.pendingEdges {
+		if edge != nil {
+			e.pendingDependencyEdges[edge.From] = edge
+		}
+	}
+}
+
+// drainPendingEdges returns remaining retry/legacy repair links. Full logical
+// identities are checked in one batch because SQLite uniqueness includes
+// FilePath and Line in addition to endpoints and kind.
+func (e *externalsAttribution) drainPendingEdges(limit int) []*graph.Edge {
+	e.ensurePendingDependencyEdges()
+	defer func() {
+		if len(e.pendingEdges) == 0 && len(e.pendingDependencyEdges) == 0 {
+			e.pendingDependencyEdges = nil
+		}
+	}()
+	take := len(e.pendingEdges)
+	if limit > 0 && take > limit {
+		take = limit
+	}
+	if take == 0 {
+		return nil
+	}
+	raw := append([]*graph.Edge(nil), e.pendingEdges[:take]...)
+	clear(e.pendingEdges[:take])
+	e.pendingEdges = e.pendingEdges[take:]
+	if len(e.pendingEdges) == 0 {
+		e.pendingEdges = nil
+	}
+
+	edges := raw[:0]
+	for _, edge := range raw {
+		if edge == nil || e.pendingDependencyEdges[edge.From] != edge {
+			continue
+		}
+		delete(e.pendingDependencyEdges, edge.From)
+		edges = append(edges, edge)
+	}
+	clear(raw[len(edges):])
+	if len(edges) == 0 || e.g == nil {
+		return edges
+	}
+
+	identities := make([]graph.EdgeIdentity, 0, len(edges))
+	for _, edge := range edges {
+		identities = append(identities, graph.EdgeIdentityFor(edge))
+	}
+	finder, ok := e.g.(graph.EdgeIdentityBatchFinder)
+	if !ok {
+		return edges
+	}
+	existing := finder.FindEdgesByIdentities(identities)
+	kept := edges[:0]
+	reused := 0
+	for _, edge := range edges {
+		if existing[graph.EdgeIdentityFor(edge)] != nil {
+			reused++
+			continue
+		}
+		kept = append(kept, edge)
+	}
+	clear(edges[len(kept):])
+	e.edgesAdded -= reused
+	e.modulesLinked -= reused
+	return kept
 }
 
 func (e *externalsAttribution) drainPendingReindexes() []graph.EdgeReindex {
@@ -515,17 +680,26 @@ func (e *externalsAttribution) drainPendingReindexes() []graph.EdgeReindex {
 // `stdlib::fmt::Errorf` node. An empty repoPrefix yields the legacy
 // un-prefixed form, which the resolver still emits today.
 func stubEdgeTargets(repoPrefix, importPath string, obj types.Object) []string {
-	if obj == nil {
+	identity := externalUseIdentityFor(repoPrefix, importPath, obj)
+	if identity == nil {
+		return nil
+	}
+	return identity.stubTargets[:]
+}
+
+func externalUseIdentityFor(repoPrefix, importPath string, obj types.Object) *externalUseIdentity {
+	if obj == nil || importPath == "" || obj.Name() == "" {
 		return nil
 	}
 	name := obj.Name()
-	if name == "" {
-		return nil
-	}
-	return []string{
-		graph.StubID(repoPrefix, graph.StubKindStdlib, importPath, name),
-		"dep::" + importPath + "::" + name,
-		"unresolved::extern::" + importPath + "::" + name,
+	return &externalUseIdentity{
+		name: name,
+		kind: wantedEdgeKind(obj),
+		stubTargets: [3]string{
+			graph.StubID(repoPrefix, graph.StubKindStdlib, importPath, name),
+			"dep::" + importPath + "::" + name,
+			"unresolved::extern::" + importPath + "::" + name,
+		},
 	}
 }
 

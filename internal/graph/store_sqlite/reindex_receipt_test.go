@@ -175,7 +175,7 @@ func TestSQLiteRefreshUnresolvedIdentityRecordsNewFile(t *testing.T) {
 	}
 }
 
-func TestSQLiteReceiptIgnoresResolvedEdgeAndNonDefinitionNoise(t *testing.T) {
+func TestSQLiteReceiptCapturesResolvedEdgeAndIgnoresNonDefinitionNoise(t *testing.T) {
 	store := openReindexReceiptTestStore(t)
 	store.AddBatch([]*graph.Node{
 		{ID: "caller", Kind: graph.KindFunction, Name: "caller", FilePath: "repo/caller.go"},
@@ -196,5 +196,11 @@ func TestSQLiteReceiptIgnoresResolvedEdgeAndNonDefinitionNoise(t *testing.T) {
 	}
 	if want := []string{"repo/needed.go"}; !reflect.DeepEqual(receipt.ResolutionFiles(), want) {
 		t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), want)
+	}
+	if want := []string{"repo/needed.go"}; !reflect.DeepEqual(receipt.UnresolvedFiles, want) {
+		t.Fatalf("unresolved files = %v, want %v", receipt.UnresolvedFiles, want)
+	}
+	if want := []string{"repo/needed.go", "repo/noise.go"}; !reflect.DeepEqual(receipt.CrossRepoFiles(), want) {
+		t.Fatalf("cross-repo files = %v, want %v", receipt.CrossRepoFiles(), want)
 	}
 }

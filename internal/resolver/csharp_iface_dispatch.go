@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"sort"
 	"strconv"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -159,18 +160,31 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	// Convert_L39, ...) sharing the same Name, and real call sites bind to any
 	// of them — a single-node-per-name projection would silently drop the
 	// overload the corpus actually calls through.
-	memberEdges := frameworkRepoEdges(g, familyScope, graph.EdgeMemberOf)
-	memberNodeIDs := make([]string, 0, len(memberEdges))
-	for _, edge := range memberEdges {
-		if edge != nil {
-			memberNodeIDs = append(memberNodeIDs, edge.From)
+	// The compact projection is valid for both partial and full-census runs.
+	// On a full run a nil familyScope means every repository; using the same
+	// light EdgeMemberOf and qualified-method streams avoids decoding every
+	// member edge and method metadata blob merely to discover C# anchors.
+	memberEdges, memberNodes, anchorNodes, projected := csharpScopedMemberProjection(g, familyScope, children)
+	if !projected {
+		memberEdges = frameworkRepoEdges(g, familyScope, graph.EdgeMemberOf)
+		memberNodeIDs := make([]string, 0, len(memberEdges))
+		for _, edge := range memberEdges {
+			if edge != nil {
+				memberNodeIDs = append(memberNodeIDs, edge.From)
+			}
 		}
+		memberNodes = g.GetNodesByIDs(memberNodeIDs)
+		anchorNodes = memberNodes
 	}
-	memberNodes := g.GetNodesByIDs(memberNodeIDs)
 	var membersByType map[string]map[string][]*graph.Node
-	if scope == nil {
+	switch {
+	case projected:
+		// Reuse the compact nodes already read for anchor discovery. This is
+		// the full-census fast path as well as the normal scoped path.
+		membersByType = csharpMemberMethodsAllByTypeFromEdges(memberEdges, memberNodes)
+	case scope == nil:
 		membersByType = csharpMemberMethodsAllByType(g)
-	} else {
+	default:
 		membersByType = csharpMemberMethodsAllByTypeFromEdges(memberEdges, memberNodes)
 	}
 	if len(membersByType) == 0 {
@@ -192,7 +206,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		if e == nil || graph.IsUnresolvedTarget(e.To) {
 			continue
 		}
-		m := memberNodes[e.From]
+		m := anchorNodes[e.From]
 		if m == nil || m.Kind != graph.KindMethod || m.Language != "csharp" || !csharpIsIfaceMember(m) {
 			continue
 		}
@@ -279,20 +293,22 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	if len(families) == 0 {
 		return 0
 	}
-	callEdges := frameworkEdgesByKinds(g, graph.EdgeCalls)
+	// Every call that can affect interface dispatch targets a known family
+	// member. Read only those incoming adjacency lists, even for a full pass,
+	// instead of decoding the repository's entire calls corpus.
+	callSeen := make(map[graph.EdgeIdentity]struct{})
+	var callEdges []*graph.Edge
 	if scope != nil {
-		callEdges = nil
-		callSeen := make(map[graph.EdgeIdentity]struct{})
 		callEdges = appendUniqueFrameworkEdges(callEdges, callSeen, scopedSourceCalls...)
-		familyMemberIDs := make([]string, 0, len(famsOfMember))
-		for id := range famsOfMember {
-			familyMemberIDs = append(familyMemberIDs, id)
-		}
-		for _, incoming := range g.GetInEdgesByNodeIDs(familyMemberIDs) {
-			for _, edge := range incoming {
-				if edge != nil && edge.Kind == graph.EdgeCalls {
-					callEdges = appendUniqueFrameworkEdges(callEdges, callSeen, edge)
-				}
+	}
+	familyMemberIDs := make([]string, 0, len(famsOfMember))
+	for id := range famsOfMember {
+		familyMemberIDs = append(familyMemberIDs, id)
+	}
+	for _, incoming := range g.GetInEdgesByNodeIDs(familyMemberIDs) {
+		for _, edge := range incoming {
+			if edge != nil && edge.Kind == graph.EdgeCalls {
+				callEdges = appendUniqueFrameworkEdges(callEdges, callSeen, edge)
 			}
 		}
 	}
@@ -364,6 +380,88 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	return len(batch)
 }
 
+// csharpScopedMemberProjection replaces full EdgeMemberOf and full-node
+// materialisation with metadata-free identities. A nil scope admits every
+// repository for a full-census run. Only C# methods on owners with descendants
+// can seed a dispatch family, so those are exact-refetched after both cursors
+// close; every other family member stays a compact Node value.
+// The final sort mirrors graph.ReadRepoEdgesByKinds so anchor/family and
+// provenance order are unchanged.
+func csharpScopedMemberProjection(
+	g graph.Store,
+	scope map[string]bool,
+	children map[string][]string,
+) (memberEdges []*graph.Edge, memberNodes, anchorNodes map[string]*graph.Node, ok bool) {
+	sequencer, ok := g.(graph.QualifiedNodeIdentitySequencer)
+	if !ok {
+		return nil, nil, nil, false
+	}
+
+	wanted := map[string]struct{}{}
+	for edge := range graph.EdgesLightSeq(g, graph.EdgeMemberOf) {
+		if edge == nil || edge.From == "" {
+			continue
+		}
+		memberEdges = append(memberEdges, edge)
+		wanted[edge.From] = struct{}{}
+	}
+	memberNodes = make(map[string]*graph.Node)
+	for node := range sequencer.QualifiedNodeIdentitiesSeq(graph.KindMethod) {
+		_, needed := wanted[node.ID]
+		if !needed || (scope != nil && !scope[node.RepoPrefix]) {
+			continue
+		}
+		memberNodes[node.ID] = &graph.Node{
+			ID:         node.ID,
+			Kind:       graph.KindMethod,
+			Name:       node.Name,
+			Language:   node.Language,
+			FilePath:   node.FilePath,
+			RepoPrefix: node.RepoPrefix,
+		}
+	}
+
+	filtered := memberEdges[:0]
+	for _, edge := range memberEdges {
+		if memberNodes[edge.From] != nil {
+			filtered = append(filtered, edge)
+		}
+	}
+	memberEdges = filtered
+	var csharpMethodIDs []string
+	for _, edge := range memberEdges {
+		node := memberNodes[edge.From]
+		if node.Language == "csharp" && len(children[edge.To]) > 0 {
+			csharpMethodIDs = append(csharpMethodIDs, edge.From)
+		}
+	}
+	sort.Slice(memberEdges, func(i, j int) bool {
+		left, right := memberEdges[i], memberEdges[j]
+		leftRepo := memberNodes[left.From].RepoPrefix
+		rightRepo := memberNodes[right.From].RepoPrefix
+		if leftRepo != rightRepo {
+			return leftRepo < rightRepo
+		}
+		if left.From != right.From {
+			return left.From < right.From
+		}
+		if left.To != right.To {
+			return left.To < right.To
+		}
+		if left.Kind != right.Kind {
+			return left.Kind < right.Kind
+		}
+		if left.FilePath != right.FilePath {
+			return left.FilePath < right.FilePath
+		}
+		return left.Line < right.Line
+	})
+
+	// Both streaming projections are exhausted before the exact metadata read.
+	anchorNodes = g.GetNodesByIDs(dedupeFrameworkIDs(csharpMethodIDs))
+	return memberEdges, memberNodes, anchorNodes, true
+}
+
 // csharpIsIfaceMember reports whether n is a bodyless (or default) interface
 // member declaration emitted by the C# extractor.
 func csharpIsIfaceMember(n *graph.Node) bool {
@@ -427,7 +525,7 @@ func csharpMemberMethodsAllByType(g graph.Store) map[string]map[string][]*graph.
 	}
 	var edges []*graph.Edge
 	methodIDs := make([]string, 0)
-	for e := range g.EdgesByKind(graph.EdgeMemberOf) {
+	for e := range graph.EdgesLightSeq(g, graph.EdgeMemberOf) {
 		if e == nil {
 			continue
 		}

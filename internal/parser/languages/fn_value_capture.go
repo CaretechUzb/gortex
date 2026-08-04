@@ -80,21 +80,26 @@ func captureFnValueCandidates(result *parser.ExtractionResult, root *sitter.Node
 	if root == nil || result == nil {
 		return
 	}
-	lang := ""
+	lang, fileID := "", ""
 	funcs := map[string]bool{}
 	for _, n := range result.Nodes {
 		if n == nil || n.FilePath != filePath {
 			continue
 		}
-		if n.Kind == graph.KindFile && lang == "" {
-			lang = n.Language
+		if n.Kind == graph.KindFile {
+			if lang == "" {
+				lang = n.Language
+			}
+			if fileID == "" {
+				fileID = n.ID
+			}
 		}
 		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
 			funcs[n.Name] = true
 		}
 	}
 	funcRanges := buildFuncRanges(result)
-	if len(funcRanges) == 0 {
+	if len(funcRanges) == 0 && fileID == "" {
 		return
 	}
 	spec := fnRefSpecFor(lang)
@@ -117,6 +122,18 @@ func captureFnValueCandidates(result *parser.ExtractionResult, root *sitter.Node
 			}
 			line := int(n.StartPoint().Row) + 1
 			fromID := findEnclosingFunc(funcRanges, line)
+			if fromID == "" {
+				// A `Foo::bar` in a field or static initializer sits outside
+				// every method body, yet is one of the commonest places a
+				// method reference appears (constant handler tables,
+				// `Comparator` fields). Anchor it to the file node, as the
+				// Java type-use pass already does for class-level type refs,
+				// instead of dropping the reference entirely. Only the
+				// unambiguous `::`-style / selector forms take this fallback —
+				// a bare identifier outside any function is far more likely a
+				// local or a builtin than a callable reference.
+				fromID = fileID
+			}
 			if fromID == "" {
 				return
 			}

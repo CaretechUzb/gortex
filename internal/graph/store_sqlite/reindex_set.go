@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -13,10 +12,13 @@ import (
 const (
 	// Reindex transactions are simulated as one ordered set so intermediate
 	// writes that cancel do not invalidate analysis or inflate receipts. SQL is
-	// still issued in bounded VALUES relations below SQLite's conservative
-	// 999-variable limit.
-	reindexSetChunkSize = 70  // 70*14 = 980 parameters for edge inserts.
-	reindexKeyChunkSize = 140 // 140*5 = 700 parameters for identity relations.
+	// issued in VALUES relations bounded by the probed connection variable
+	// limit and the shared argument-byte budget.
+	reindexKeyParamsPerRow                = 5
+	reindexRowParamsPerRow                = edgeInsertParams
+	reindexRowMaxChunkSize                = edgeInsertMaxChunkSize
+	reindexResolvedUpdateParamsPerRow     = 15
+	reindexResolvedKindUpdateParamsPerRow = 16
 )
 
 type sqliteReindexKey struct {
@@ -42,26 +44,46 @@ type sqliteReindexRow struct {
 }
 
 type sqliteReindexMutation struct {
-	oldKey sqliteReindexKey
-	newRow sqliteReindexRow
+	oldKey             sqliteReindexKey
+	newRow             sqliteReindexRow
+	resolvedConversion bool
+}
+
+type sqliteResolvedConversionPlan struct {
+	oldUnresolved   bool
+	oldCounts       map[sqliteReindexKey]int
+	newCounts       map[sqliteReindexKey]int
+	fallbackDeletes []sqliteReindexKey
+	fallbackInserts []sqliteReindexRow
+}
+
+func (p sqliteResolvedConversionPlan) updateCandidate(mutation sqliteReindexMutation, updateKind bool) bool {
+	if p.oldCounts[mutation.oldKey] != 1 || p.newCounts[mutation.newRow.key] != 1 {
+		return false
+	}
+	return (mutation.oldKey.kind != mutation.newRow.key.kind) == updateKind
 }
 
 type sqliteReindexSetStats struct {
 	selectStatements int
+	updateStatements int
 	deleteStatements int
 	insertStatements int
+	updatedRows      int
 	deletedRows      int
 	insertedRows     int
 }
 
 func (s sqliteReindexSetStats) writeStatements() int {
-	return s.deleteStatements + s.insertStatements
+	return s.updateStatements + s.deleteStatements + s.insertStatements
 }
 
 func (s *sqliteReindexSetStats) add(other sqliteReindexSetStats) {
 	s.selectStatements += other.selectStatements
+	s.updateStatements += other.updateStatements
 	s.deleteStatements += other.deleteStatements
 	s.insertStatements += other.insertStatements
+	s.updatedRows += other.updatedRows
 	s.deletedRows += other.deletedRows
 	s.insertedRows += other.insertedRows
 }
@@ -119,10 +141,20 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	receipt *sqliteReindexReceipt,
 	err error,
 ) {
-	mutations, keys, err := sqliteReindexMutations(batch)
+	mutations, err := sqliteReindexMutations(batch)
 	if err != nil || len(mutations) == 0 {
 		return stats, false, false, nil, err
 	}
+
+	// Probe before beginWriteContext checks out the writer connection. A fresh
+	// single-connection Store cannot discover its limit while its own
+	// transaction is holding that connection.
+	variableLimit := s.sqliteBatchVariableLimitLocked()
+	defer func() {
+		// Persist a connection-specific fallback discovered while preparing any
+		// of the three bounded reindex statement shapes.
+		s.batchVariableLimit = variableLimit
+	}()
 
 	tx, err := s.beginWriteContext(ctx)
 	if err != nil {
@@ -136,28 +168,71 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	}()
 	receipt = s.prepareSQLiteReindexReceiptTx(tx, batch)
 
-	initial, selectStatements, err := sqliteReindexRowsTx(tx, keys)
-	if err != nil {
-		return stats, false, false, nil, err
+	conversionPlan, resolvedConversionFastPath := sqliteResolvedConversionUpdatePlan(mutations)
+	// A reverse conversion creates a new unresolved edge. While a mutation
+	// receipt is active, retain the generic simulator's exact insert accounting:
+	// UPDATE OR IGNORE reports only an aggregate row count and cannot distinguish
+	// successful updates from destination collisions. Cold guard passes run
+	// outside the receipt window and keep the in-place fast path.
+	if resolvedConversionFastPath && receipt != nil && !conversionPlan.oldUnresolved {
+		resolvedConversionFastPath = false
 	}
-	stats.selectStatements = selectStatements
-	deletes, inserts := simulateSQLiteReindexSet(initial, keys, mutations)
 
-	stats.deletedRows, stats.deleteStatements, err = deleteSQLiteReindexRowsTx(tx, deletes)
+	var deletes []sqliteReindexKey
+	var inserts []sqliteReindexRow
+	if resolvedConversionFastPath {
+		deletes = conversionPlan.fallbackDeletes
+		inserts = conversionPlan.fallbackInserts
+
+		updated, statements, repairDeletes, repairInserts, updateErr :=
+			updateSQLiteResolvedConversionsTxLimited(tx, mutations, conversionPlan, false, &variableLimit)
+		if updateErr != nil {
+			return stats, false, false, nil, updateErr
+		}
+		stats.updatedRows += updated
+		stats.updateStatements += statements
+		deletes = append(deletes, repairDeletes...)
+		inserts = append(inserts, repairInserts...)
+
+		updated, statements, repairDeletes, repairInserts, updateErr =
+			updateSQLiteResolvedConversionsTxLimited(tx, mutations, conversionPlan, true, &variableLimit)
+		if updateErr != nil {
+			return stats, false, false, nil, updateErr
+		}
+		stats.updatedRows += updated
+		stats.updateStatements += statements
+		deletes = append(deletes, repairDeletes...)
+		inserts = append(inserts, repairInserts...)
+	} else {
+		keys := sqliteReindexKeys(mutations)
+		initial, selectStatements, selectErr := sqliteReindexRowsTxLimited(tx, keys, &variableLimit)
+		if selectErr != nil {
+			return stats, false, false, nil, selectErr
+		}
+		stats.selectStatements = selectStatements
+		deletes, inserts = simulateSQLiteReindexSet(initial, keys, mutations)
+	}
+
+	stats.deletedRows, stats.deleteStatements, err = deleteSQLiteReindexRowsTxLimited(tx, deletes, &variableLimit)
 	if err != nil {
 		return stats, false, false, nil, err
 	}
-	stats.insertedRows, stats.insertStatements, err = insertSQLiteReindexRowsTx(tx, inserts)
+	stats.insertedRows, stats.insertStatements, err = insertSQLiteReindexRowsTxLimited(tx, inserts, &variableLimit)
 	if err != nil {
 		return stats, false, false, nil, err
 	}
-	if stats.insertedRows != len(inserts) {
+	if !resolvedConversionFastPath && stats.insertedRows != len(inserts) {
 		return stats, false, false, nil, fmt.Errorf(
 			"store_sqlite: set reindex inserted %d of %d simulated rows",
 			stats.insertedRows, len(inserts),
 		)
 	}
-	changed = stats.deletedRows > 0 || stats.insertedRows > 0
+	// Every in-place candidate is unique across both its old and new logical
+	// key. UPDATE OR IGNORE completes the common case in one write; a short
+	// RowsAffected count repairs the whole bounded chunk through the existing
+	// ordered delete/insert path. Converging and duplicate-old mutations always
+	// take that fallback directly, preserving first-candidate-wins semantics.
+	changed = stats.updatedRows > 0 || stats.deletedRows > 0 || stats.insertedRows > 0
 	if changed && s.analysisGenerationPresent {
 		if err := invalidateAnalysisGenerationTx(tx); err != nil {
 			return stats, false, false, nil, err
@@ -174,18 +249,8 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	return stats, changed, invalidatedAnalysis, receipt, nil
 }
 
-func sqliteReindexMutations(batch []graph.EdgeReindex) ([]sqliteReindexMutation, []sqliteReindexKey, error) {
+func sqliteReindexMutations(batch []graph.EdgeReindex) ([]sqliteReindexMutation, error) {
 	mutations := make([]sqliteReindexMutation, 0, len(batch))
-	keys := make([]sqliteReindexKey, 0, len(batch)*2)
-	seen := make(map[sqliteReindexKey]struct{}, len(batch)*2)
-	addKey := func(key sqliteReindexKey) {
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		keys = append(keys, key)
-	}
-
 	for _, reindex := range batch {
 		edge := reindex.Edge
 		if edge == nil {
@@ -207,17 +272,92 @@ func sqliteReindexMutations(batch []graph.EdgeReindex) ([]sqliteReindexMutation,
 		}
 		newRow, err := sqliteReindexRowForEdge(edge)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		oldKey := sqliteReindexKey{
 			fromID: oldFrom, toID: reindex.OldTo, kind: string(oldKind),
 			filePath: oldFilePath, line: oldLine,
 		}
-		mutations = append(mutations, sqliteReindexMutation{oldKey: oldKey, newRow: newRow})
-		addKey(oldKey)
-		addKey(newRow.key)
+		mutations = append(mutations, sqliteReindexMutation{
+			oldKey: oldKey,
+			newRow: newRow,
+			resolvedConversion: !reindex.RefreshIdentity &&
+				graph.IsUnresolvedTarget(oldKey.toID) != graph.IsUnresolvedTarget(newRow.key.toID),
+		})
 	}
-	return mutations, keys, nil
+	return mutations, nil
+}
+
+// sqliteReindexKeys materializes the generic simulator's affected identity set.
+// Namespace conversions avoid this allocation entirely; it is built only after
+// the conversion planner rejects (or receipt safety disables) the fast path.
+func sqliteReindexKeys(mutations []sqliteReindexMutation) []sqliteReindexKey {
+	keys := make([]sqliteReindexKey, 0, len(mutations)*2)
+	seen := make(map[sqliteReindexKey]struct{}, len(mutations)*2)
+	add := func(key sqliteReindexKey) {
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	for _, mutation := range mutations {
+		add(mutation.oldKey)
+		add(mutation.newRow.key)
+	}
+	return keys
+}
+
+// sqliteResolvedConversionUpdatePlan recognizes uniform transitions across the
+// unresolved-target namespace boundary. It validates direction before building
+// any count maps, then retains only the counts needed to identify one-to-one
+// in-place updates. Duplicate old keys and converging destinations preserve the
+// ordered delete/insert path; its map and slices stay nil on the common unique
+// conversion path.
+func sqliteResolvedConversionUpdatePlan(mutations []sqliteReindexMutation) (sqliteResolvedConversionPlan, bool) {
+	if len(mutations) == 0 {
+		return sqliteResolvedConversionPlan{}, false
+	}
+	oldUnresolved := graph.IsUnresolvedTarget(mutations[0].oldKey.toID)
+	newUnresolved := graph.IsUnresolvedTarget(mutations[0].newRow.key.toID)
+	if oldUnresolved == newUnresolved {
+		return sqliteResolvedConversionPlan{}, false
+	}
+	for _, mutation := range mutations {
+		if !mutation.resolvedConversion ||
+			graph.IsUnresolvedTarget(mutation.oldKey.toID) != oldUnresolved ||
+			graph.IsUnresolvedTarget(mutation.newRow.key.toID) != newUnresolved {
+			return sqliteResolvedConversionPlan{}, false
+		}
+	}
+
+	plan := sqliteResolvedConversionPlan{
+		oldUnresolved: oldUnresolved,
+		oldCounts:     make(map[sqliteReindexKey]int, len(mutations)),
+		newCounts:     make(map[sqliteReindexKey]int, len(mutations)),
+	}
+	for _, mutation := range mutations {
+		plan.oldCounts[mutation.oldKey]++
+		plan.newCounts[mutation.newRow.key]++
+	}
+
+	var fallbackOld map[sqliteReindexKey]struct{}
+	for _, mutation := range mutations {
+		if plan.updateCandidate(mutation, mutation.oldKey.kind != mutation.newRow.key.kind) {
+			continue
+		}
+		if fallbackOld == nil {
+			fallbackOld = make(map[sqliteReindexKey]struct{})
+		}
+		if _, seen := fallbackOld[mutation.oldKey]; !seen {
+			fallbackOld[mutation.oldKey] = struct{}{}
+			plan.fallbackDeletes = append(plan.fallbackDeletes, mutation.oldKey)
+		}
+		// Do not deduplicate destinations: INSERT OR IGNORE preserves the
+		// generic simulator's input-order, first-candidate-wins contract.
+		plan.fallbackInserts = append(plan.fallbackInserts, mutation.newRow)
+	}
+	return plan, true
 }
 
 func sqliteReindexRowForEdge(edge *graph.Edge) (sqliteReindexRow, error) {
@@ -248,23 +388,191 @@ func sqliteReindexRowForEdge(edge *graph.Edge) (sqliteReindexRow, error) {
 	}, nil
 }
 
-func sqliteReindexRowsTx(tx *sql.Tx, keys []sqliteReindexKey) (map[sqliteReindexKey]sqliteReindexRow, int, error) {
-	out := make(map[sqliteReindexKey]sqliteReindexRow, len(keys))
-	statements := 0
-	for start := 0; start < len(keys); start += reindexKeyChunkSize {
-		end := minInt(start+reindexKeyChunkSize, len(keys))
-		chunk := keys[start:end]
-		var values strings.Builder
-		values.Grow(len(chunk) * len("(?,?,?,?,?),"))
-		args := make([]any, 0, len(chunk)*5)
-		for i, key := range chunk {
-			if i > 0 {
-				values.WriteByte(',')
+func updateSQLiteResolvedConversionsTxLimited(
+	tx *sql.Tx,
+	mutations []sqliteReindexMutation,
+	plan sqliteResolvedConversionPlan,
+	updateKind bool,
+	variableLimit *int,
+) (
+	updatedRows int,
+	statements int,
+	repairDeletes []sqliteReindexKey,
+	repairInserts []sqliteReindexRow,
+	err error,
+) {
+	if len(mutations) == 0 {
+		return 0, 0, nil, nil, nil
+	}
+	if variableLimit == nil || *variableLimit <= 0 {
+		fallback := sqliteFallbackVariableLimit
+		variableLimit = &fallback
+	}
+
+	paramsPerRow := reindexResolvedUpdateParamsPerRow
+	if updateKind {
+		paramsPerRow = reindexResolvedKindUpdateParamsPerRow
+	}
+	rowLimit := batchRowsForVariableLimit(*variableLimit, paramsPerRow, reindexRowMaxChunkSize)
+	for pos := 0; pos < len(mutations); {
+		chunkStart := pos
+		args := make([]any, 0, rowLimit*paramsPerRow)
+		argBytes := 0
+		rowCount := 0
+		for pos < len(mutations) && rowCount < rowLimit {
+			mutation := mutations[pos]
+			if !plan.updateCandidate(mutation, updateKind) {
+				pos++
+				continue
 			}
-			values.WriteString("(?,?,?,?,?)")
-			args = append(args, key.fromID, key.toID, key.kind, key.filePath, key.line)
+			row := mutation.newRow
+			argStart := len(args)
+			args = append(args,
+				mutation.oldKey.fromID, mutation.oldKey.toID, mutation.oldKey.kind,
+				mutation.oldKey.filePath, mutation.oldKey.line, row.key.toID,
+			)
+			if updateKind {
+				args = append(args, row.key.kind)
+			}
+			args = append(args,
+				row.confidence, row.confidenceLabel, row.origin, row.tier,
+				row.crossRepo, row.meta, row.resolveTerminal, row.resolveTerminalReason, row.semanticSource,
+			)
+			rowBytes := sqliteBoundArgsBytes(args[argStart:])
+			if rowCount > 0 && argBytes+rowBytes > sqliteBatchMaxBoundBytes {
+				args = args[:argStart]
+				break
+			}
+			pos++
+			rowCount++
+			argBytes += rowBytes
 		}
-		query := `WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES ` + values.String() + `)
+		if rowCount == 0 {
+			continue
+		}
+
+		query := sqliteResolvedConversionUpdateStatement(rowCount, updateKind)
+		result, execErr := tx.Exec(query, args...)
+		if tooManySQLVariables(execErr) && rowCount > 1 {
+			rowLimit = lowerBatchVariableLimit(variableLimit, paramsPerRow, rowCount)
+			pos = chunkStart
+			continue
+		}
+		if execErr != nil {
+			return updatedRows, statements, repairDeletes, repairInserts, execErr
+		}
+		statements++
+		affected64, affectedErr := result.RowsAffected()
+		if affectedErr != nil {
+			return updatedRows, statements, repairDeletes, repairInserts, affectedErr
+		}
+		affected := int(affected64)
+		if affected < 0 || affected > rowCount {
+			return updatedRows, statements, repairDeletes, repairInserts, fmt.Errorf(
+				"store_sqlite: resolved conversion update affected %d of %d rows",
+				affected, rowCount,
+			)
+		}
+		updatedRows += affected
+		if affected != rowCount {
+			// UPDATE OR IGNORE cannot identify which rows were skipped without
+			// materializing RETURNING rows. Replaying the whole bounded chunk is
+			// exact: successful rows already occupy their destination, while
+			// missing sources and destination collisions are repaired below.
+			for _, mutation := range mutations[chunkStart:pos] {
+				if !plan.updateCandidate(mutation, updateKind) {
+					continue
+				}
+				repairDeletes = append(repairDeletes, mutation.oldKey)
+				repairInserts = append(repairInserts, mutation.newRow)
+			}
+		}
+	}
+	return updatedRows, statements, repairDeletes, repairInserts, nil
+}
+
+func sqliteResolvedConversionUpdateStatement(rowCount int, updateKind bool) string {
+	if updateKind {
+		return `WITH patch(
+		old_from_id, old_to_id, old_kind, file_path, line, new_to_id, new_kind,
+		confidence, confidence_label, origin, tier, cross_repo, meta,
+		resolve_terminal, resolve_terminal_reason, semantic_source
+	) AS (VALUES ` + multiValues(rowCount, reindexResolvedKindUpdateParamsPerRow) + `)
+	UPDATE OR IGNORE edges AS e
+	SET to_id = p.new_to_id,
+		kind = p.new_kind,
+		confidence = p.confidence,
+		confidence_label = p.confidence_label,
+		origin = p.origin,
+		tier = p.tier,
+		cross_repo = p.cross_repo,
+		meta = p.meta,
+		resolve_terminal = p.resolve_terminal,
+		resolve_terminal_reason = p.resolve_terminal_reason,
+		semantic_source = p.semantic_source
+	FROM patch AS p
+	WHERE e.from_id = p.old_from_id
+		AND e.to_id = p.old_to_id
+		AND e.kind = p.old_kind
+		AND e.file_path = p.file_path
+		AND e.line = p.line`
+	}
+	return `WITH patch(
+		old_from_id, old_to_id, kind, file_path, line, new_to_id,
+		confidence, confidence_label, origin, tier, cross_repo, meta,
+		resolve_terminal, resolve_terminal_reason, semantic_source
+	) AS (VALUES ` + multiValues(rowCount, reindexResolvedUpdateParamsPerRow) + `)
+	UPDATE OR IGNORE edges AS e
+	SET to_id = p.new_to_id,
+		confidence = p.confidence,
+		confidence_label = p.confidence_label,
+		origin = p.origin,
+		tier = p.tier,
+		cross_repo = p.cross_repo,
+		meta = p.meta,
+		resolve_terminal = p.resolve_terminal,
+		resolve_terminal_reason = p.resolve_terminal_reason,
+		semantic_source = p.semantic_source
+	FROM patch AS p
+	WHERE e.from_id = p.old_from_id
+		AND e.to_id = p.old_to_id
+		AND e.kind = p.kind
+		AND e.file_path = p.file_path
+		AND e.line = p.line`
+}
+
+func sqliteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, variableLimit *int) (map[sqliteReindexKey]sqliteReindexRow, int, error) {
+	out := make(map[sqliteReindexKey]sqliteReindexRow, len(keys))
+	if len(keys) == 0 {
+		return out, 0, nil
+	}
+	if variableLimit == nil || *variableLimit <= 0 {
+		fallback := sqliteFallbackVariableLimit
+		variableLimit = &fallback
+	}
+
+	rowLimit := batchRowsForVariableLimit(*variableLimit, reindexKeyParamsPerRow, len(keys))
+	statements := 0
+	for pos := 0; pos < len(keys); {
+		chunkStart := pos
+		args := make([]any, 0, rowLimit*reindexKeyParamsPerRow)
+		argBytes := 0
+		rowCount := 0
+		for pos < len(keys) && rowCount < rowLimit {
+			key := keys[pos]
+			argStart := len(args)
+			args = append(args, key.fromID, key.toID, key.kind, key.filePath, key.line)
+			rowBytes := sqliteBoundArgsBytes(args[argStart:])
+			if rowCount > 0 && argBytes+rowBytes > sqliteBatchMaxBoundBytes {
+				args = args[:argStart]
+				break
+			}
+			pos++
+			rowCount++
+			argBytes += rowBytes
+		}
+
+		query := `WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES ` + multiValues(rowCount, reindexKeyParamsPerRow) + `)
 		SELECT e.from_id, e.to_id, e.kind, e.file_path, e.line,
 			e.confidence, e.confidence_label, e.origin, e.tier, e.cross_repo,
 			e.meta, e.resolve_terminal, e.resolve_terminal_reason, e.semantic_source
@@ -276,6 +584,11 @@ func sqliteReindexRowsTx(tx *sql.Tx, keys []sqliteReindexKey) (map[sqliteReindex
 		 AND e.file_path = w.file_path
 		 AND e.line = w.line`
 		rows, err := tx.Query(query, args...)
+		if tooManySQLVariables(err) && rowCount > 1 {
+			rowLimit = lowerBatchVariableLimit(variableLimit, reindexKeyParamsPerRow, rowCount)
+			pos = chunkStart
+			continue
+		}
 		if err != nil {
 			return nil, statements, err
 		}
@@ -348,23 +661,38 @@ func equalSQLiteReindexRows(left, right sqliteReindexRow) bool {
 		left.semanticSource == right.semanticSource
 }
 
-func deleteSQLiteReindexRowsTx(tx *sql.Tx, keys []sqliteReindexKey) (int, int, error) {
+func deleteSQLiteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, variableLimit *int) (int, int, error) {
+	if len(keys) == 0 {
+		return 0, 0, nil
+	}
+	if variableLimit == nil || *variableLimit <= 0 {
+		fallback := sqliteFallbackVariableLimit
+		variableLimit = &fallback
+	}
+
+	rowLimit := batchRowsForVariableLimit(*variableLimit, reindexKeyParamsPerRow, len(keys))
 	changed := 0
 	statements := 0
-	for start := 0; start < len(keys); start += reindexKeyChunkSize {
-		end := minInt(start+reindexKeyChunkSize, len(keys))
-		chunk := keys[start:end]
-		var values strings.Builder
-		values.Grow(len(chunk) * len("(?,?,?,?,?),"))
-		args := make([]any, 0, len(chunk)*5)
-		for i, key := range chunk {
-			if i > 0 {
-				values.WriteByte(',')
-			}
-			values.WriteString("(?,?,?,?,?)")
+	for pos := 0; pos < len(keys); {
+		chunkStart := pos
+		args := make([]any, 0, rowLimit*reindexKeyParamsPerRow)
+		argBytes := 0
+		rowCount := 0
+		for pos < len(keys) && rowCount < rowLimit {
+			key := keys[pos]
+			argStart := len(args)
 			args = append(args, key.fromID, key.toID, key.kind, key.filePath, key.line)
+			rowBytes := sqliteBoundArgsBytes(args[argStart:])
+			if rowCount > 0 && argBytes+rowBytes > sqliteBatchMaxBoundBytes {
+				args = args[:argStart]
+				break
+			}
+			pos++
+			rowCount++
+			argBytes += rowBytes
 		}
-		query := `WITH doomed(from_id, to_id, kind, file_path, line) AS (VALUES ` + values.String() + `)
+
+		query := `WITH doomed(from_id, to_id, kind, file_path, line) AS (VALUES ` + multiValues(rowCount, reindexKeyParamsPerRow) + `)
 		DELETE FROM edges
 		WHERE id IN (
 			SELECT e.id
@@ -377,6 +705,11 @@ func deleteSQLiteReindexRowsTx(tx *sql.Tx, keys []sqliteReindexKey) (int, int, e
 			 AND e.line = d.line
 		)`
 		result, err := tx.Exec(query, args...)
+		if tooManySQLVariables(err) && rowCount > 1 {
+			rowLimit = lowerBatchVariableLimit(variableLimit, reindexKeyParamsPerRow, rowCount)
+			pos = chunkStart
+			continue
+		}
 		if err != nil {
 			return changed, statements, err
 		}
@@ -390,32 +723,48 @@ func deleteSQLiteReindexRowsTx(tx *sql.Tx, keys []sqliteReindexKey) (int, int, e
 	return changed, statements, nil
 }
 
-func insertSQLiteReindexRowsTx(tx *sql.Tx, rows []sqliteReindexRow) (int, int, error) {
+func insertSQLiteReindexRowsTxLimited(tx *sql.Tx, rows []sqliteReindexRow, variableLimit *int) (int, int, error) {
+	if len(rows) == 0 {
+		return 0, 0, nil
+	}
+	if variableLimit == nil || *variableLimit <= 0 {
+		fallback := sqliteFallbackVariableLimit
+		variableLimit = &fallback
+	}
+
+	rowLimit := batchRowsForVariableLimit(*variableLimit, reindexRowParamsPerRow, reindexRowMaxChunkSize)
 	changed := 0
 	statements := 0
-	for start := 0; start < len(rows); start += reindexSetChunkSize {
-		end := minInt(start+reindexSetChunkSize, len(rows))
-		chunk := rows[start:end]
-		var values strings.Builder
-		values.Grow(len(chunk) * len("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,),"))
-		args := make([]any, 0, len(chunk)*14)
-		for i, row := range chunk {
-			if i > 0 {
-				values.WriteByte(',')
-			}
-			values.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+	for pos := 0; pos < len(rows); {
+		chunkStart := pos
+		args := make([]any, 0, rowLimit*reindexRowParamsPerRow)
+		argBytes := 0
+		rowCount := 0
+		for pos < len(rows) && rowCount < rowLimit {
+			row := rows[pos]
+			argStart := len(args)
 			args = append(args,
 				row.key.fromID, row.key.toID, row.key.kind, row.key.filePath, row.key.line,
 				row.confidence, row.confidenceLabel, row.origin, row.tier,
 				row.crossRepo, row.meta, row.resolveTerminal, row.resolveTerminalReason, row.semanticSource,
 			)
+			rowBytes := sqliteBoundArgsBytes(args[argStart:])
+			if rowCount > 0 && argBytes+rowBytes > sqliteBatchMaxBoundBytes {
+				args = args[:argStart]
+				break
+			}
+			pos++
+			rowCount++
+			argBytes += rowBytes
 		}
-		query := `INSERT OR IGNORE INTO edges (
-			from_id, to_id, kind, file_path, line,
-			confidence, confidence_label, origin, tier, cross_repo, meta,
-			resolve_terminal, resolve_terminal_reason, semantic_source
-		) VALUES ` + values.String()
+
+		query := `INSERT OR IGNORE INTO edges (` + edgeInsertColumns + `) VALUES ` + multiValues(rowCount, reindexRowParamsPerRow)
 		result, err := tx.Exec(query, args...)
+		if tooManySQLVariables(err) && rowCount > 1 {
+			rowLimit = lowerBatchVariableLimit(variableLimit, reindexRowParamsPerRow, rowCount)
+			pos = chunkStart
+			continue
+		}
 		if err != nil {
 			return changed, statements, err
 		}

@@ -203,6 +203,9 @@ func TestIncrementalCloneUpdatePrefetchesAndDedupesPairs(t *testing.T) {
 	store := &cloneIOCountingStore{Store: base}
 
 	ci := newIncrementalCloneIndex()
+	ci.cms = clones.NewCMS(65536, 4)
+	ci.lsh = clones.NewStratifiedIndex()
+	ci.shingles = make(map[string][]uint64)
 	for _, shingle := range shingles {
 		ci.cms.Add(shingle)
 	}

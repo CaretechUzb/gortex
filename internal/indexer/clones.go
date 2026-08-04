@@ -101,6 +101,20 @@ func applyCloneSignatures(src []byte, result *parser.ExtractionResult) {
 	if result == nil || len(result.Nodes) == 0 {
 		return
 	}
+	// Most data/config files contain no callable bodies. Check that before
+	// building an O(lines) offset table, which can otherwise dominate
+	// allocation for large generated JSON and other non-code sources.
+	hasCallable := false
+	for _, n := range result.Nodes {
+		if n != nil && (n.Kind == graph.KindFunction || n.Kind == graph.KindMethod) {
+			hasCallable = true
+			break
+		}
+	}
+	if !hasCallable {
+		return
+	}
+
 	// Compute newline offsets once per file rather than splitting the
 	// source into N Go strings. offsets[i] is the byte index where
 	// line i+1 (1-indexed) starts; the sentinel offsets[len(offsets)-1]
@@ -315,35 +329,81 @@ func cloneRepoNodes(g graph.Store, repoPrefix string) []*graph.Node {
 	return g.GetRepoNodes(repoPrefix)
 }
 
-// finaliseCloneSignaturesCtx takes the SQLite-first compact projection path
-// when available. It keyset-pages the corpus twice only when at least one row
-// is pending; an unchanged warm corpus is read once and performs no writes.
-func finaliseCloneSignaturesCtx(ctx context.Context, g graph.Store, repoPrefix string) []clones.Item {
+// cloneCorpusBaseline is the complete in-memory seed produced while the
+// compact clone corpus is finalized. Successful paged finalization banks each
+// signed row directly into the persistent stratified LSH; the global detector
+// scans that retained index and the incremental maintainer then adopts it with
+// the CMS, raw-shingle cache and corpus count. No item slice, duplicate LSH, or
+// second corpus scan is needed on that path. A legacy compatibility scan may
+// also prove the corpus structurally empty; that complete empty baseline avoids
+// repeating the same full-node read. Cancelled, error, and non-empty legacy
+// paths remain incomplete so the maintainer keeps its bounded Rebuild fallback.
+type cloneCorpusBaseline struct {
+	repoPrefix string
+	cms        *clones.CMS
+	lsh        *clones.StratifiedIndex
+	shingles   map[string][]uint64
+	items      []clones.Item // legacy fallback only
+	itemCount  int
+	corpus     int
+	complete   bool
+}
+
+// finaliseCloneCorpusCtx takes the SQLite-first compact projection path. It
+// keyset-pages the corpus twice only when at least one row is pending; an
+// unchanged warm corpus is read once and performs no writes. A successful
+// paged pass returns a complete baseline suitable for single-consumer adoption.
+func finaliseCloneCorpusCtx(ctx context.Context, g graph.Store, repoPrefix string) *cloneCorpusBaseline {
+	baseline := &cloneCorpusBaseline{repoPrefix: repoPrefix}
 	pager, paged := g.(graph.CloneCorpusPager)
 	writer, writable := g.(graph.CloneCorpusWriter)
+	signatureWriter, signatureOnly := g.(graph.CloneCorpusSignatureWriter)
+	initialization, stateful := g.(graph.CloneCorpusInitialization)
 	if !paged || !writable {
-		return finaliseCloneSignaturesFromNodes(g, repoPrefix)
+		baseline.items, baseline.corpus = finaliseCloneSignaturesFromNodes(g, repoPrefix)
+		if baseline.corpus == 0 && len(baseline.items) == 0 {
+			completeEmptyCloneBaseline(baseline)
+		}
+		return baseline
 	}
 
-	cms := clones.NewCMS(65536, 4)
-	items := make([]clones.Item, 0, cloneCorpusFinalizeBatch)
+	baseline.cms = clones.NewCMS(65536, 4)
+	baseline.lsh = clones.NewStratifiedIndex()
+	baseline.shingles = make(map[string][]uint64, cloneCorpusFinalizeBatch)
+	addItem := func(item clones.Item) {
+		baseline.lsh.Add(item)
+		baseline.itemCount++
+	}
+	abort := func() *cloneCorpusBaseline {
+		baseline.cms = nil
+		baseline.lsh = nil
+		baseline.shingles = nil
+		baseline.items = nil
+		baseline.itemCount = 0
+		baseline.corpus = 0
+		baseline.complete = false
+		return baseline
+	}
 	corpus, pending := 0, false
 	after := ""
 	for {
 		if ctx.Err() != nil {
-			return nil
+			return abort()
 		}
 		page, err := pager.CloneCorpusPage(repoPrefix, after, cloneCorpusFinalizeBatch)
 		if err != nil {
-			return nil
+			return abort()
 		}
 		if len(page) == 0 {
 			break
 		}
 		for _, row := range page {
 			corpus++
+			if len(row.Shingles) > 0 {
+				baseline.shingles[row.NodeID] = row.Shingles
+			}
 			for _, shingle := range row.Shingles {
-				cms.Add(shingle)
+				baseline.cms.Add(shingle)
 			}
 			if !row.Finalized {
 				pending = true
@@ -357,23 +417,54 @@ func finaliseCloneSignaturesCtx(ctx context.Context, g graph.Store, repoPrefix s
 				pending = true
 				continue
 			}
-			items = append(items, clones.Item{ID: row.NodeID, Sig: sig, TokenCount: row.TokenCount})
+			addItem(clones.Item{ID: row.NodeID, Sig: sig, TokenCount: row.TokenCount})
 		}
 		after = page[len(page)-1].NodeID
 		if len(page) < cloneCorpusFinalizeBatch {
 			break
 		}
 	}
+	baseline.corpus = corpus
 	if corpus == 0 {
+		// An explicit initialization row makes an empty page authoritative. This
+		// is the common genuinely-empty repository path and avoids decoding every
+		// node merely to prove the absence of clone bodies again.
+		if stateful {
+			initialized, err := initialization.CloneCorpusInitialized(repoPrefix)
+			if err == nil && initialized {
+				completeEmptyCloneBaseline(baseline)
+				return baseline
+			}
+		}
+
 		// Compatibility for a pre-projection store: one legacy scoped read
 		// populates the sidecar, after which every restart takes the paged path.
-		return finaliseCloneSignaturesFromNodes(g, repoPrefix)
+		baseline.itemCount = 0
+		baseline.items, baseline.corpus = finaliseCloneSignaturesFromNodes(g, repoPrefix)
+		if baseline.corpus == 0 && len(baseline.items) == 0 {
+			// The compatibility scan proves this repository has neither pending
+			// bodies nor finalized signatures. Persist that fact when supported;
+			// adapters without the optional capability preserve the old fallback.
+			completeEmptyCloneBaseline(baseline)
+			if stateful {
+				_ = initialization.MarkCloneCorpusInitialized(repoPrefix)
+			}
+		} else {
+			// Non-empty compatibility data still needs the exact Rebuild path.
+			// Release the speculative compact seed before returning it.
+			baseline.cms = nil
+			baseline.lsh = nil
+			baseline.shingles = nil
+		}
+		return baseline
 	}
 	if !pending {
-		return items
+		baseline.complete = true
+		return baseline
 	}
 
-	items = items[:0]
+	baseline.lsh = clones.NewStratifiedIndex()
+	baseline.itemCount = 0
 	useFilter := corpus >= cmsMinCorpus
 	threshold := uint32(0)
 	if useFilter {
@@ -385,37 +476,68 @@ func finaliseCloneSignaturesCtx(ctx context.Context, g graph.Store, repoPrefix s
 	after = ""
 	for {
 		if ctx.Err() != nil {
-			return nil
+			return abort()
 		}
 		page, err := pager.CloneCorpusPage(repoPrefix, after, cloneCorpusFinalizeBatch)
 		if err != nil {
-			return nil
+			return abort()
 		}
 		if len(page) == 0 {
 			break
 		}
+		var signatureUpdates []graph.CloneCorpusSignatureUpdate
+		if signatureOnly {
+			signatureUpdates = make([]graph.CloneCorpusSignatureUpdate, 0, len(page))
+		}
 		for i := range page {
 			row := &page[i]
-			sig, ok := computeCloneSigFromShingles(cms, threshold, useFilter, row.Shingles)
+			sig, ok := computeCloneSigFromShingles(baseline.cms, threshold, useFilter, row.Shingles)
 			row.Finalized = true
 			row.Signature = ""
 			if ok {
 				row.Signature = clones.EncodeSignature(sig)
-				items = append(items, clones.Item{ID: row.NodeID, Sig: sig, TokenCount: row.TokenCount})
+				addItem(clones.Item{ID: row.NodeID, Sig: sig, TokenCount: row.TokenCount})
+			}
+			if signatureOnly {
+				signatureUpdates = append(signatureUpdates, graph.CloneCorpusSignatureUpdate{
+					NodeID: row.NodeID, Signature: row.Signature,
+				})
 			}
 		}
-		if err := writer.BulkSetCloneCorpus(repoPrefix, page); err != nil {
-			return nil
+		if signatureOnly {
+			err = signatureWriter.BulkSetCloneSignatures(repoPrefix, signatureUpdates)
+		} else {
+			err = writer.BulkSetCloneCorpus(repoPrefix, page)
+		}
+		if err != nil {
+			return abort()
 		}
 		after = page[len(page)-1].NodeID
 		if len(page) < cloneCorpusFinalizeBatch {
 			break
 		}
 	}
-	return items
+	baseline.complete = true
+	return baseline
 }
 
-func finaliseCloneSignaturesFromNodes(g graph.Store, repoPrefix string) []clones.Item {
+func completeEmptyCloneBaseline(baseline *cloneCorpusBaseline) {
+	if baseline.cms == nil {
+		baseline.cms = clones.NewCMS(65536, 4)
+	}
+	if baseline.lsh == nil {
+		baseline.lsh = clones.NewStratifiedIndex()
+	}
+	if baseline.shingles == nil {
+		baseline.shingles = make(map[string][]uint64)
+	}
+	baseline.items = nil
+	baseline.itemCount = 0
+	baseline.corpus = 0
+	baseline.complete = true
+}
+
+func finaliseCloneSignaturesFromNodes(g graph.Store, repoPrefix string) ([]clones.Item, int) {
 	// First pass: collect every body that has stashed shingles. We
 	// capture the *graph.Node pointers up front so the CMS-build pass
 	// and the signature-compute pass don't both re-read the repo projection.
@@ -452,7 +574,7 @@ func finaliseCloneSignaturesFromNodes(g graph.Store, repoPrefix string) []clones
 		})
 	}
 	if len(bodies) == 0 {
-		return items
+		return items, 0
 	}
 
 	useFilter := len(bodies) >= cmsMinCorpus
@@ -534,7 +656,7 @@ func finaliseCloneSignaturesFromNodes(g graph.Store, repoPrefix string) []clones
 		}
 	}
 	flushProjection()
-	return items
+	return items, len(bodies)
 }
 
 // CloneDetectionStats summarises one detectClonesAndEmitEdges run for
@@ -586,9 +708,18 @@ func detectClonesAndEmitEdges(g graph.Store, repoPrefix string, threshold float6
 // "clone detection pass" marker followed by minutes of silence — no
 // way to tell finalise-signatures from LSH from edge-emission.
 func detectClonesAndEmitEdgesCtx(ctx context.Context, g graph.Store, repoPrefix string, threshold float64) CloneDetectionStats {
+	stats, _ := detectClonesAndEmitEdgesWithBaselineCtx(ctx, g, repoPrefix, threshold)
+	return stats
+}
+
+// detectClonesAndEmitEdgesWithBaselineCtx performs the context-aware clone
+// pass and also returns the finalized compact-corpus baseline. The baseline is
+// complete only when the paged projection was read successfully; callers hand
+// it to AdoptBaselineOrRebuild after this function releases ResolveMutex.
+func detectClonesAndEmitEdgesWithBaselineCtx(ctx context.Context, g graph.Store, repoPrefix string, threshold float64) (CloneDetectionStats, *cloneCorpusBaseline) {
 	var stats CloneDetectionStats
 	if g == nil {
-		return stats
+		return stats, nil
 	}
 	reporter := progress.FromContext(ctx)
 	// Serialise against other graph-wide passes that mutate Node.Meta
@@ -616,14 +747,23 @@ func detectClonesAndEmitEdgesCtx(ctx context.Context, g graph.Store, repoPrefix 
 	// (delete clone_shingles, set clone_sig) don't race the AllNodes
 	// walk below.
 	reporter.Report("clones: CMS-finalise signatures", 0, 0)
-	items := finaliseCloneSignaturesCtx(ctx, g, repoPrefix)
-	stats.Items = len(items)
-	if len(items) < 2 {
-		return stats
+	baseline := finaliseCloneCorpusCtx(ctx, g, repoPrefix)
+	stats.Items = baseline.itemCount
+	if !baseline.complete || baseline.lsh == nil {
+		stats.Items = len(baseline.items)
+	}
+	if stats.Items < 2 {
+		return stats, baseline
 	}
 
-	reporter.Report("clones: LSH + Jaccard filter", len(items), 0)
-	detected, sb, sbi := clones.DetectPairsStratifiedWithStats(items, threshold)
+	reporter.Report("clones: LSH + Jaccard filter", stats.Items, 0)
+	var detected []clones.Pair
+	var sb, sbi int
+	if baseline.complete && baseline.lsh != nil {
+		detected, sb, sbi = baseline.lsh.DetectPairsWithStats(threshold)
+	} else {
+		detected, sb, sbi = clones.DetectPairsStratifiedWithStats(baseline.items, threshold)
+	}
 	stats.SkippedBuckets = sb
 	stats.SkippedBucketItems = sbi
 	stats.Pairs = len(detected)
@@ -640,7 +780,7 @@ func detectClonesAndEmitEdgesCtx(ctx context.Context, g graph.Store, repoPrefix 
 	dp, de := diffuseSimilarityEdges(g, detected, directPairs)
 	stats.DiffusedPairs = dp
 	stats.DiffusedEdges = de
-	return stats
+	return stats, baseline
 }
 
 // Diffusion-pass tuning constants. The graph-diffusion smoothing pass
