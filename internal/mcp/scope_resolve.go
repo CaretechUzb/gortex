@@ -415,6 +415,30 @@ func (s *Server) communitiesInSessionScope(ctx context.Context, cr *analysis.Com
 	return &out
 }
 
+// repoPrefixVisible is the prefix-level analogue of analyzeNodeVisible for
+// handlers whose rows carry a repo prefix instead of a graph node — a
+// watcher event, a contract record. It applies the same two gates in the
+// same order: the session-workspace ceiling first, then the resolved repo
+// allow-set.
+//
+// An empty prefix is admitted by the workspace ceiling and rejected by an
+// explicit allow-set, matching QueryOptions.ScopeAllows and
+// analyzeNodeVisible. Single-repo daemons mint unprefixed rows, and an
+// allow-set keyed by registry prefixes would otherwise narrow all of them
+// away; an explicit narrow, by contrast, names prefixes an unattributed
+// row cannot satisfy.
+func (s *Server) repoPrefixVisible(ctx context.Context, prefix string) bool {
+	if wsRepos, bound := s.sessionWorkspaceRepoSet(ctx); bound && len(wsRepos) > 0 {
+		if prefix != "" && !wsRepos[prefix] {
+			return false
+		}
+	}
+	if allow := repoAllowFromContext(ctx); len(allow) > 0 && !allow[prefix] {
+		return false
+	}
+	return true
+}
+
 // processesInSessionScope returns a scope-clamped copy of pr: processes
 // whose entry point the caller may not see are dropped, and each surviving
 // chain has its out-of-scope steps excised. Process discovery runs over the

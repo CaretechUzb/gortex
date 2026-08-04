@@ -121,8 +121,9 @@ var defaultToolScopes = map[string]ToolScope{
 	// Analysis. Historically takes an optional `repo`; classified
 	// scope: repo to keep behavior unchanged. A follow-up may upgrade
 	// to fan-out once the UX is reviewed.
-	"analyze":   ScopeRepo,
-	"contracts": ScopeRepo,
+	"analyze":         ScopeRepo,
+	"contracts":       ScopeRepo,
+	"run_inspections": ScopeRepo,
 
 	// CPG-lite dataflow primitives. Both walk the active graph by
 	// node ID / name pattern; like analyze + contracts, they take
