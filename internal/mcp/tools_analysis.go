@@ -15,8 +15,12 @@ import (
 func (s *Server) registerAnalysisTools() {
 	s.addTool(
 		mcp.NewTool("get_communities",
-			mcp.WithDescription("Returns functional clusters discovered by community detection. Without id: list all communities with summaries. With id: full details of a specific community (members, files, cohesion)."),
+			mcp.WithDescription("Returns functional clusters discovered by community detection. Without id: list all communities with summaries. With id: full details of a specific community (members, files, cohesion). Members and files are clamped to the session workspace."),
 			mcp.WithString("id", mcp.Description("Optional community ID (e.g. community-0). When set, returns full details of that community instead of the list.")),
+			mcp.WithString("repo", mcp.Description("Narrow to a single repository prefix (tracked name or path). The partition is computed over the whole index, so this is clamped and widened to the session workspace; the response discloses it.")),
+			mcp.WithString("project", mcp.Description("Narrow to the repositories in a project. Clamped and widened to the session workspace like repo.")),
+			mcp.WithString("workspace", mcp.Description("Restrict to the active workspace slug; daemon sessions may only name their own workspace.")),
+			mcp.WithString("scope", mcp.Description("Name of a saved scope (see save_scope). Clamped and widened to the session workspace like repo.")),
 		),
 		s.handleGetCommunities,
 	)
@@ -25,6 +29,10 @@ func (s *Server) registerAnalysisTools() {
 		mcp.NewTool("get_processes",
 			mcp.WithDescription("Returns discovered execution flows — named chains of function calls starting from entry points. Without id: list all processes. With id: full step-by-step call chain for that process."),
 			mcp.WithString("id", mcp.Description("Optional process ID (e.g. process-0). When set, returns the full step-by-step call chain for that process instead of the list.")),
+			mcp.WithString("repo", mcp.Description("Narrow to a single repository prefix (tracked name or path), clamped to the session workspace. Steps outside it are excised from the chains.")),
+			mcp.WithString("project", mcp.Description("Narrow to the repositories in a project, clamped to the session workspace.")),
+			mcp.WithString("workspace", mcp.Description("Restrict to the active workspace slug; daemon sessions may only name their own workspace.")),
+			mcp.WithString("scope", mcp.Description("Name of a saved scope (see save_scope) — its repositories narrow the flows, clamped to the session workspace.")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation metadata rides on the response.")),
 		),
@@ -70,11 +78,33 @@ func (s *Server) registerAnalysisTools() {
 	)
 }
 
+// handleGetCommunities lists (or details) the cached community partition,
+// clamped to the caller's workspace.
+//
+// `analyze kind=communities` is a facade alias that forwards straight to
+// this tool, so the analyze dispatcher's resolveScope never runs here — the
+// clamp has to be applied by the handler, exactly as PR #395 did for
+// audit_health and find_clones. Community detection runs one partition over
+// the whole index, so the clamp is the same workspace-only shape the sibling
+// kinds use (analyze clusters / concepts / suggest_boundaries): a repo /
+// project / scope narrowing is resolved for the response's scope_applied and
+// then widened to the workspace, which workspaceScopeBlock discloses in the
+// body. Repo-narrowing the members of a partition cell would return a
+// "community" of no graph the caller can name, and would make this kind
+// disagree with `analyze kind=clusters` over the very same cached partition.
 func (s *Server) handleGetCommunities(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if pending := s.ensureAnalysis(); !pending.Ready {
-		return s.respondJSONOrTOON(ctx, req, analysisPendingPayload(pending, "communities"))
+	resolved, errResult := s.resolveScope(ctx, req, IntentAnalyze)
+	if errResult != nil {
+		return errResult, nil
 	}
-	comms := s.getCommunities()
+	if pending := s.ensureAnalysis(); !pending.Ready {
+		return s.respondScopedJSONOrTOON(ctx, req, analysisPendingPayload(pending, "communities"), resolved)
+	}
+	// Clamp before the id branch: an out-of-workspace id then reports the
+	// same "not found" as a fabricated one, so the boundary is not
+	// probeable, and a community that straddles the boundary still has its
+	// foreign members dropped.
+	comms := s.communitiesInSessionScope(ctx, s.getCommunities())
 
 	// If id is provided, return the single community in detail.
 	if id := req.GetString("id", ""); id != "" {
@@ -83,7 +113,7 @@ func (s *Server) handleGetCommunities(ctx context.Context, req mcp.CallToolReque
 		}
 		for _, c := range comms.Communities {
 			if c.ID == id {
-				return s.respondJSONOrTOON(ctx, req, c)
+				return s.respondScopedJSONOrTOON(ctx, req, c, resolved)
 			}
 		}
 		return mcp.NewToolResultError("community not found: " + id), nil
@@ -91,10 +121,14 @@ func (s *Server) handleGetCommunities(ctx context.Context, req mcp.CallToolReque
 
 	// Otherwise return the list of summaries.
 	if comms == nil || len(comms.Communities) == 0 {
-		return s.respondJSONOrTOON(ctx, req, map[string]any{
+		empty := map[string]any{
 			"communities": []any{},
 			"message":     "no communities detected yet — run index_repository first",
-		})
+		}
+		if blk := s.workspaceScopeBlock(ctx, req, "communities"); blk != nil {
+			empty["scope"] = blk
+		}
+		return s.respondScopedJSONOrTOON(ctx, req, empty, resolved)
 	}
 
 	// List mode deliberately omits per-community `files` (can be hundreds
@@ -124,18 +158,44 @@ func (s *Server) handleGetCommunities(ctx context.Context, req mcp.CallToolReque
 			ParentID:   c.ParentID,
 		})
 	}
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"communities": summaries,
-		"total":       len(summaries),
-		"modularity":  comms.Modularity,
-	})
+	// `modularity` and the per-row `cohesion` are the global partition's
+	// scores — the clamp drops members, it does not re-run detection — so
+	// they are labelled rather than silently re-reported as if they had
+	// been recomputed for the narrowed set.
+	payload := map[string]any{
+		"communities":      summaries,
+		"total":            len(summaries),
+		"modularity":       comms.Modularity,
+		"modularity_scope": "global-partition",
+	}
+	if blk := s.workspaceScopeBlock(ctx, req, "communities"); blk != nil {
+		payload["scope"] = blk
+	}
+	return s.respondScopedJSONOrTOON(ctx, req, payload, resolved)
 }
 
+// handleGetProcesses lists (or details) the discovered execution flows,
+// clamped to the caller's scope.
+//
+// `analyze kind=processes` is a facade alias that forwards straight to this
+// tool, so the analyze dispatcher's resolveScope never runs here. Unlike the
+// community partition, a flow's rows are per-step and every step is
+// attributable to exactly one repo, so this kind honours the full
+// repo/project/scope narrowing on top of the workspace ceiling — see
+// processesInSessionScope for the subtree-excision rule that keeps a
+// filtered chain honest.
 func (s *Server) handleGetProcesses(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if pending := s.ensureAnalysis(); !pending.Ready {
-		return s.respondJSONOrTOON(ctx, req, analysisPendingPayload(pending, "processes"))
+	resolved, errResult := s.resolveScope(ctx, req, IntentAnalyze)
+	if errResult != nil {
+		return errResult, nil
 	}
-	procs := s.getProcesses()
+	ctx = withRepoAllow(ctx, resolved.RepoAllow)
+	if pending := s.ensureAnalysis(); !pending.Ready {
+		return s.respondScopedJSONOrTOON(ctx, req, analysisPendingPayload(pending, "processes"), resolved)
+	}
+	// Clamp before the id branch so an out-of-scope process id reports the
+	// same "not found" as a fabricated one.
+	procs := s.processesInSessionScope(ctx, s.getProcesses())
 
 	// If id is provided, return the single process in detail.
 	if id := req.GetString("id", ""); id != "" {
@@ -144,7 +204,7 @@ func (s *Server) handleGetProcesses(ctx context.Context, req mcp.CallToolRequest
 		}
 		for _, p := range procs.Processes {
 			if p.ID == id {
-				return s.respondJSONOrTOON(ctx, req, p)
+				return s.respondScopedJSONOrTOON(ctx, req, p, resolved)
 			}
 		}
 		return mcp.NewToolResultError("process not found: " + id), nil
@@ -152,10 +212,10 @@ func (s *Server) handleGetProcesses(ctx context.Context, req mcp.CallToolRequest
 
 	// Otherwise return the list of summaries.
 	if procs == nil || len(procs.Processes) == 0 {
-		return s.respondJSONOrTOON(ctx, req, map[string]any{
+		return s.respondScopedJSONOrTOON(ctx, req, map[string]any{
 			"processes": []any{},
 			"message":   "no processes discovered yet — run index_repository first",
-		})
+		}, resolved)
 	}
 
 	// `repo_prefixes` is the ordered set of distinct "owner/repo" prefixes
@@ -182,10 +242,10 @@ func (s *Server) handleGetProcesses(ctx context.Context, req mcp.CallToolRequest
 			RepoPrefixes: uniqueRepoPrefixesFromSteps(p.Steps),
 		})
 	}
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	return s.respondScopedJSONOrTOON(ctx, req, map[string]any{
 		"processes": summaries,
 		"total":     len(summaries),
-	})
+	}, resolved)
 }
 
 // repoPrefixOf extracts the repo prefix from a node ID of the form

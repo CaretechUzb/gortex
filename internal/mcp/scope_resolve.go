@@ -415,6 +415,91 @@ func (s *Server) communitiesInSessionScope(ctx context.Context, cr *analysis.Com
 	return &out
 }
 
+// processesInSessionScope returns a scope-clamped copy of pr: processes
+// whose entry point the caller may not see are dropped, and each surviving
+// chain has its out-of-scope steps excised. Process discovery runs over the
+// whole index, so without this the process surface would hand a
+// workspace-bound caller a sibling workspace's entry points, call chains and
+// file lists. Strict no-op for an unbound session with no repo allow-set;
+// the cached snapshot is never mutated.
+//
+// Excision is by subtree, not by element. Steps are a DFS preorder whose
+// parent relation is implicit — the parent of a step is the nearest
+// preceding step with a smaller depth (see analysis.Step). Dropping a step
+// on its own would re-parent its children onto an unrelated ancestor and
+// assert a call that does not exist. Removing an out-of-scope step at depth
+// d together with the following run of steps at depth > d cannot do that:
+// any survivor's parent has a strictly smaller depth than the survivor, so
+// a parent inside the removed run would put the survivor inside it too.
+// Depths are therefore left untouched and the surviving tree is exactly the
+// pre-filter tree minus whole subtrees.
+func (s *Server) processesInSessionScope(ctx context.Context, pr *analysis.ProcessResult) *analysis.ProcessResult {
+	// The step / entry-point scope test is a syntactic split of the node id
+	// (graph.RepoPrefixOfID), which only names a repository in multi-repo
+	// mode — on an unprefixed single-repo id it returns the first directory
+	// name. Bail out before that misreads a directory as a repo.
+	if pr == nil || s.multiIndexer == nil {
+		return pr
+	}
+	wsRepos, bound := s.sessionWorkspaceRepoSet(ctx)
+	clampWorkspace := bound && len(wsRepos) > 0
+	repoAllow := repoAllowFromContext(ctx)
+	if !clampWorkspace && len(repoAllow) == 0 {
+		return pr
+	}
+	inScope := func(id string) bool {
+		prefix := graph.RepoPrefixOfID(id)
+		if clampWorkspace && !wsRepos[prefix] {
+			return false
+		}
+		return len(repoAllow) == 0 || repoAllow[prefix]
+	}
+
+	out := *pr
+	out.Processes = make([]analysis.Process, 0, len(pr.Processes))
+	out.NodeToProcs = make(map[string][]string, len(pr.NodeToProcs))
+	for _, p := range pr.Processes {
+		if !inScope(p.EntryPoint) {
+			continue
+		}
+		steps := make([]analysis.Step, 0, len(p.Steps))
+		excised := false
+		for i := 0; i < len(p.Steps); i++ {
+			step := p.Steps[i]
+			if inScope(step.ID) {
+				steps = append(steps, step)
+				continue
+			}
+			// Skip this step and the whole subtree rooted at it: every
+			// following step deeper than it is one of its descendants.
+			excised = true
+			for i+1 < len(p.Steps) && p.Steps[i+1].Depth > step.Depth {
+				i++
+			}
+		}
+		// A process is a chain; discovery itself discards anything
+		// shorter than two steps (analysis.discoverProcesses).
+		if len(steps) < 2 {
+			continue
+		}
+		files := make([]string, 0, len(p.Files))
+		for _, f := range p.Files {
+			if inScope(f) {
+				files = append(files, f)
+			}
+		}
+		p.Steps = steps
+		p.StepCount = len(steps)
+		p.Files = files
+		p.Truncated = p.Truncated || excised
+		out.Processes = append(out.Processes, p)
+		for _, step := range steps {
+			out.NodeToProcs[step.ID] = append(out.NodeToProcs[step.ID], p.ID)
+		}
+	}
+	return &out
+}
+
 // scopeNarrowingRequested reports whether the caller passed an explicit
 // repo / project / scope / ref narrowing arg (other than the "*"
 // all-repos escape hatch).
