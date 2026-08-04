@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	mcp "github.com/mark3labs/mcp-go/mcp"
 
@@ -88,14 +89,229 @@ type impactRow struct {
 	CoChangeFiles   int     `json:"co_change_files"`
 	CommunitySpan   int     `json:"community_span"`
 	FanIn           int     `json:"fan_in"`
+
+	// Depth and Target are populated only for a target-scoped call:
+	// Target marks the symbol the caller asked about, Depth is the
+	// row's distance from it (1..3 dependent tiers). The repo-wide
+	// ranking has no target to measure from and omits both.
+	Depth  int  `json:"depth,omitempty"`
+	Target bool `json:"target,omitempty"`
 }
 
-// handleAnalyzeImpactComposite ranks scoped symbols by composite
-// change impact.
+// impactTargetScope is the dependency closure behind a target-scoped
+// impact call: the seeds the caller named plus every transitive
+// dependent the graph knows about, keyed by BFS depth.
+type impactTargetScope struct {
+	Symbol  string         // resolved target.symbol, when a symbol was named
+	File    string         // target.file, when a file was named
+	Seeds   []string       // depth-0 symbols — always scored
+	Depth   map[string]int // closure member -> 0 (seed) .. 3
+	ByDepth map[int]int    // depth -> dependent count
+	Total   int            // dependents only, i.e. depth >= 1
+
+	// LowerBound and Truncated ride from the shared blast-radius
+	// analyzer. An unbound dispatch site or an exhausted traversal
+	// budget makes the closure a floor — never proof that nothing
+	// else depends on the target.
+	LowerBound bool
+	Truncated  bool
+}
+
+// impactTargetPayload is the GCX payload for a target-scoped call. The
+// closure metadata rides in the encoder header because a caller who
+// only sees rows cannot tell a complete blast radius from a bounded
+// one.
+type impactTargetPayload struct {
+	Target *impactTargetScope
+	Rows   []impactRow
+}
+
+// zeroDependentsCaveat is the wording change impact already uses for an
+// empty blast radius. An extraction or resolution gap looks exactly
+// like a genuinely leaf symbol, so the two must not be reported
+// identically without saying so.
+const zeroDependentsCaveat = "zero observed dependents is not proof of zero impact; extraction or resolution gaps may exist"
+
+// impactClosureTimeout bounds the closure walk. It matches the pre-edit
+// safety gate's deadline so the same question costs the same whether it
+// is asked through change(impact) or analyze(impact).
+const impactClosureTimeout = 3 * time.Second
+
+func (t *impactTargetScope) isSeed(id string) bool {
+	if t == nil {
+		return false
+	}
+	depth, ok := t.Depth[id]
+	return ok && depth == 0
+}
+
+// label names the target for the compact and GCX headers.
+func (t *impactTargetScope) label() string {
+	switch {
+	case t == nil:
+		return ""
+	case t.Symbol != "":
+		return t.Symbol
+	default:
+		return t.File
+	}
+}
+
+// summary is the response envelope that tells the caller which
+// question was answered — which target, how wide its closure, and
+// whether that width is exact or a floor.
+func (t *impactTargetScope) summary() map[string]any {
+	if t == nil {
+		return nil
+	}
+	out := map[string]any{
+		"seeds":      t.Seeds,
+		"dependents": t.Total,
+		"dependents_by_depth": map[string]int{
+			"1": t.ByDepth[1], "2": t.ByDepth[2], "3": t.ByDepth[3],
+		},
+	}
+	if t.Symbol != "" {
+		out["symbol"] = t.Symbol
+	}
+	if t.File != "" {
+		out["file"] = t.File
+	}
+	if t.LowerBound {
+		out["lower_bound"] = true
+	}
+	if t.Truncated {
+		out["truncated"] = true
+	}
+	if t.Total == 0 && !t.LowerBound && !t.Truncated {
+		out["zero_dependents_caveat"] = zeroDependentsCaveat
+	}
+	return out
+}
+
+func (t *impactTargetScope) compactSummary() string {
+	if t == nil {
+		return ""
+	}
+	line := fmt.Sprintf("target %s  dependents=%d (d1=%d d2=%d d3=%d)",
+		t.label(), t.Total, t.ByDepth[1], t.ByDepth[2], t.ByDepth[3])
+	switch {
+	case t.LowerBound || t.Truncated:
+		line += "  lower bound — more dependents may exist"
+	case t.Total == 0:
+		line += "  " + zeroDependentsCaveat
+	}
+	return line
+}
+
+// resolveImpactTarget turns the caller's target selector into the
+// dependency closure impact must rank. It returns (nil, nil) when no
+// selector was passed — the repo-wide ranking keeps its old meaning.
 //
-// Filters:
+// Every failure is a structured error rather than a fallback to that
+// repo-wide ranking: a blast-radius question answered with a global
+// hotspot list is indistinguishable from a correct answer, and the
+// caller has no way to notice their target was dropped.
+func (s *Server) resolveImpactTarget(ctx context.Context, symbol, file string) (*impactTargetScope, *mcp.CallToolResult) {
+	if symbol == "" && file == "" {
+		return nil, nil
+	}
+	if symbol != "" && file != "" {
+		return nil, NewStructuredErrorResult(StructuredError{
+			ErrorCode: ErrCodeInvalidArgument,
+			Message:   "analyze impact accepts one target selector — symbol or file, not both",
+			Data:      map[string]any{"field": "target", "selectors": []string{"symbol", "file"}},
+		})
+	}
+	if s == nil || s.graph == nil {
+		return nil, NewStructuredErrorResult(StructuredError{
+			ErrorCode: ErrCodeSymbolNotFound,
+			Message:   "impact has no graph to resolve the target against",
+			Data:      map[string]any{"field": "target"},
+		})
+	}
+
+	scope := &impactTargetScope{Depth: map[string]int{}, ByDepth: map[int]int{}}
+	if symbol != "" {
+		canonical, ambiguous := s.resolveFacadeSymbolShorthand(ctx, symbol)
+		if len(ambiguous) > 0 {
+			return nil, NewStructuredErrorResult(StructuredError{
+				ErrorCode: ErrCodeInvalidArgument,
+				Message:   fmt.Sprintf("impact target %q is ambiguous", symbol),
+				Data:      map[string]any{"field": "target.symbol", "symbol": symbol, "candidates": ambiguous},
+			})
+		}
+		node := s.graph.GetNode(canonical)
+		if node == nil || !s.nodeInSessionScope(ctx, node) {
+			return nil, NewStructuredErrorResult(StructuredError{
+				ErrorCode: ErrCodeSymbolNotFound,
+				Message:   fmt.Sprintf("impact target %q is not an indexed symbol in this scope", symbol),
+				Data:      map[string]any{"field": "target.symbol", "symbol": symbol},
+			})
+		}
+		scope.Symbol = node.ID
+		scope.Seeds = []string{node.ID}
+	} else {
+		scope.File = file
+		for _, node := range s.graph.GetFileNodes(file) {
+			if node == nil || !reach.ImpactSeedKind(node.Kind) || !s.nodeInSessionScope(ctx, node) {
+				continue
+			}
+			scope.Seeds = append(scope.Seeds, node.ID)
+		}
+		sort.Strings(scope.Seeds)
+		if len(scope.Seeds) == 0 {
+			return nil, NewStructuredErrorResult(StructuredError{
+				ErrorCode: ErrCodeFileNotIndexed,
+				Message:   fmt.Sprintf("no indexed symbols in %q — impact has no target to score", file),
+				Data:      map[string]any{"field": "target.file", "file": file},
+			})
+		}
+	}
+	for _, id := range scope.Seeds {
+		scope.Depth[id] = 0
+	}
+
+	// The closure comes from the analyzer the pre-edit safety gate
+	// already uses (change impact), so the two can never disagree about
+	// what depends on the target.
+	closureCtx, cancel := context.WithTimeout(ctx, impactClosureTimeout)
+	defer cancel()
+	communities, processes := s.tryImpactAnalysisSnapshots()
+	if result := analysis.AnalyzeImpactContext(closureCtx, s.graph, scope.Seeds, communities, processes); result != nil {
+		scope.LowerBound = result.LowerBound
+		scope.Truncated = result.Truncated
+		for depth := 1; depth <= 3; depth++ {
+			for _, entry := range result.ByDepth[depth] {
+				if entry.ID == "" {
+					continue
+				}
+				if _, seen := scope.Depth[entry.ID]; seen {
+					continue
+				}
+				scope.Depth[entry.ID] = depth
+				scope.ByDepth[depth]++
+				scope.Total++
+			}
+		}
+	}
+	return scope, nil
+}
+
+// handleAnalyzeImpactComposite ranks symbols by composite change
+// impact.
+//
+// Target — target:{symbol} (or target:{file}) switches the call from
+// the repo-wide ranking to that symbol's blast radius: the target
+// itself at depth 0 plus its transitive dependents at depths 1..3,
+// ranked by composite score. The target row is always present and
+// always first; the response carries the closure width and whether it
+// is exact. An unresolvable target is a structured error, never a
+// silent fallback to the repo-wide ranking.
+//
+// Filters (applied to the dependents, never to the target):
 //   - ids         — comma-separated symbol IDs; score only these
-//     (the "blast radius of changing X" use).
+//     (a fixed symbol set, no closure walk).
 //   - path_prefix — keep only symbols whose file path starts here.
 //   - kinds       — comma-separated (default function,method); "all"
 //     keeps every kind.
@@ -116,9 +332,22 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		maxScore = v
 	}
 
+	// The facade lowers target:{symbol} to id and target:{file} to path.
+	target, targetErr := s.resolveImpactTarget(ctx,
+		strings.TrimSpace(stringArg(args, "id")),
+		strings.TrimSpace(stringArg(args, "path")))
+	if targetErr != nil {
+		return targetErr, nil
+	}
+
 	allowedKinds := map[graph.NodeKind]struct{}{
 		graph.KindFunction: {},
 		graph.KindMethod:   {},
+	}
+	if target != nil {
+		// A blast radius is not a function-and-method question: a
+		// dependent type, field, or constant breaks just as loudly.
+		allowedKinds = parseAnalyzeKindsFilter("all")
 	}
 	if k := strings.TrimSpace(stringArg(args, "kinds")); k != "" {
 		allowedKinds = parseAnalyzeKindsFilter(k)
@@ -154,17 +383,27 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		if n == nil {
 			continue
 		}
-		if allowedKinds != nil {
-			if _, ok := allowedKinds[n.Kind]; !ok {
+		if target != nil {
+			if _, inClosure := target.Depth[n.ID]; !inClosure {
 				continue
 			}
 		}
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
-			continue
-		}
-		if len(idFilter) > 0 {
-			if _, ok := idFilter[n.ID]; !ok {
+		// The named target is always scored. The filters below narrow the
+		// dependents around it; none of them may drop the symbol the
+		// question is about.
+		if !target.isSeed(n.ID) {
+			if allowedKinds != nil {
+				if _, ok := allowedKinds[n.Kind]; !ok {
+					continue
+				}
+			}
+			if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
 				continue
+			}
+			if len(idFilter) > 0 {
+				if _, ok := idFilter[n.ID]; !ok {
+					continue
+				}
 			}
 		}
 		candidateIDs = append(candidateIDs, n.ID)
@@ -203,13 +442,34 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		}
 		set[comm] = struct{}{}
 	}
-	for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
-		for e := range s.graph.EdgesByKind(kind) {
-			if e == nil {
-				continue
+	if target != nil {
+		// A target closure is a handful of symbols: two batched edge
+		// fetches over the candidate set beat streaming every call and
+		// reference edge in the graph. addComm already ignores
+		// non-candidates, so either endpoint may be the candidate.
+		for _, byNode := range []map[string][]*graph.Edge{
+			s.graph.GetInEdgesByNodeIDs(candidateIDs),
+			s.graph.GetOutEdgesByNodeIDs(candidateIDs),
+		} {
+			for _, edges := range byNode {
+				for _, e := range edges {
+					if e == nil || (e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences) {
+						continue
+					}
+					addComm(e.From, nodeToComm[e.To])
+					addComm(e.To, nodeToComm[e.From])
+				}
 			}
-			addComm(e.From, nodeToComm[e.To])
-			addComm(e.To, nodeToComm[e.From])
+		}
+	} else {
+		for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
+			for e := range s.graph.EdgesByKind(kind) {
+				if e == nil {
+					continue
+				}
+				addComm(e.From, nodeToComm[e.To])
+				addComm(e.To, nodeToComm[e.From])
+			}
 		}
 	}
 
@@ -292,11 +552,17 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		if reachLowerBound && row.Risk == "LOW" {
 			row.Risk = "MEDIUM"
 		}
-		if minScore >= 0 && row.Score < minScore {
-			continue
+		if target != nil {
+			row.Depth = target.Depth[n.ID]
+			row.Target = row.Depth == 0
 		}
-		if maxScore >= 0 && row.Score > maxScore {
-			continue
+		if !row.Target {
+			if minScore >= 0 && row.Score < minScore {
+				continue
+			}
+			if maxScore >= 0 && row.Score > maxScore {
+				continue
+			}
 		}
 		rows = append(rows, row)
 	}
@@ -304,6 +570,11 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 	// Rank by composite descending — the highest-impact symbols, the
 	// ones to change with the most care, surface first.
 	sort.Slice(rows, func(i, j int) bool {
+		// A target leads its own blast radius; its dependents follow by
+		// composite score.
+		if rows[i].Target != rows[j].Target {
+			return rows[i].Target
+		}
 		if rows[i].Score != rows[j].Score {
 			return rows[i].Score > rows[j].Score
 		}
@@ -321,11 +592,22 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 	}
 
 	if s.isGCX(ctx, req) {
+		if target != nil {
+			return s.gcxResponseWithBudget(req)(encodeAnalyze("impact.target",
+				impactTargetPayload{Target: target, Rows: rows}))
+		}
 		return s.gcxResponseWithBudget(req)(encodeAnalyze("impact", rows))
 	}
 	if isCompact(req) {
 		var b strings.Builder
+		if target != nil {
+			fmt.Fprintln(&b, target.compactSummary())
+		}
 		for _, r := range rows {
+			if target != nil {
+				fmt.Fprintf(&b, "d%d %-8s %6.2f  %s:%d  %s\n", r.Depth, r.Risk, r.Score, r.File, r.Line, r.ID)
+				continue
+			}
 			fmt.Fprintf(&b, "%-8s %6.2f  %s:%d  %s\n", r.Risk, r.Score, r.File, r.Line, r.ID)
 		}
 		if len(rows) == 0 {
@@ -345,6 +627,10 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 			"co_change":  impactWeightCoChange,
 			"community":  impactWeightCommunity,
 		},
+	}
+	if target != nil {
+		resp["scope"] = "target_closure"
+		resp["target"] = target.summary()
 	}
 	if truncated {
 		resp["limit"] = limit

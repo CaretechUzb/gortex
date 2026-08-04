@@ -916,6 +916,38 @@ func encodeAnalyze(kind string, payload any) ([]byte, error) {
 			}
 		}
 		return buf.Bytes(), enc.Close()
+	case "impact.target":
+		p, _ := payload.(impactTargetPayload)
+		if p.Target == nil {
+			p.Target = &impactTargetScope{}
+		}
+		// The closure width and its exactness ride in the header: a
+		// caller who sees only rows cannot tell a complete blast radius
+		// from a bounded one.
+		meta := []string{
+			"target", p.Target.label(),
+			"dependents", fmt.Sprintf("%d", p.Target.Total),
+			"count", fmt.Sprintf("%d", len(p.Rows)),
+		}
+		switch {
+		case p.Target.LowerBound || p.Target.Truncated:
+			meta = append(meta, "lower_bound", "true")
+		case p.Target.Total == 0:
+			// Header values are single tokens, so the flag stands in for
+			// the sentence the JSON envelope spells out: an empty closure
+			// is unproven, not proof that nothing depends on the target.
+			meta = append(meta, "zero_dependents_unproven", "true")
+		}
+		enc := newGCX(&buf, "analyze.impact.target",
+			[]string{"depth", "risk", "score", "id", "name", "kind", "file", "line", "fan_in", "reach_count"},
+			meta...,
+		)
+		for _, r := range p.Rows {
+			if err := enc.WriteRow(r.Depth, r.Risk, r.Score, r.ID, r.Name, r.Kind, r.File, r.Line, r.FanIn, r.ReachCount); err != nil {
+				return nil, err
+			}
+		}
+		return buf.Bytes(), enc.Close()
 	default:
 		// Fall back to generic so analyze variants without a hand-tuned
 		// encoder still produce valid GCX instead of failing.
