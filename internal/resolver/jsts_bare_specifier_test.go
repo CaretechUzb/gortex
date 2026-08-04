@@ -165,6 +165,62 @@ func TestResolveImport_BareSpecifierSkipsNonEntryPointSiblings(t *testing.T) {
 		"only the directory entry point is an eligible candidate")
 }
 
+// TestResolveImport_DeclaredExternalDepRefusesEntryPoint closes the residual
+// case the entry-point rule alone cannot reach: a repo that both depends on
+// npm `graphql` AND contains `src/feature/graphql/index.ts`. The manifest
+// says the package comes from the registry, so no in-repo directory is a
+// candidate.
+func TestResolveImport_DeclaredExternalDepRefusesEntryPoint(t *testing.T) {
+	g := graph.New()
+	seedFile(g, "src/app.ts", "typescript")
+	seedFile(g, "src/feature/graphql/index.ts", "typescript")
+	e := seedImportEdge(g, "src/app.ts", "graphql")
+
+	r := New(g)
+	r.SetNpmDependencyLookup(func(callerFile, specifier string) bool {
+		return specifier == "graphql" // declared "^16.8.0"
+	})
+	r.ResolveAll()
+
+	assert.Equal(t, "external::graphql", e.To,
+		"a declared registry dependency must not bind an in-repo entry point")
+}
+
+// TestResolveImport_WorkspaceProtocolDepStillBinds is the other half: a
+// dependency declared as `workspace:*` genuinely names an in-repo package,
+// so the lookup reports false and the entry-point binding survives. This is
+// what keeps pnpm monorepos working — their members are not covered by the
+// root manifest's `workspaces` globs.
+func TestResolveImport_WorkspaceProtocolDepStillBinds(t *testing.T) {
+	g := graph.New()
+	seedFile(g, "src/app.ts", "typescript")
+	seedFile(g, "packages/logger/index.ts", "typescript")
+	e := seedImportEdge(g, "src/app.ts", "logger")
+
+	r := New(g)
+	r.SetNpmDependencyLookup(func(callerFile, specifier string) bool {
+		return false // declared "workspace:*" → resolves in-repo
+	})
+	r.ResolveAll()
+
+	assert.Equal(t, "packages/logger/index.ts", e.To,
+		"a workspace-protocol dependency must still bind its in-repo entry point")
+}
+
+// TestResolveImport_NilDependencyLookupKeepsEntryPointRule pins that without
+// an injected lookup (no indexer wired) behaviour falls back to the
+// entry-point rule alone.
+func TestResolveImport_NilDependencyLookupKeepsEntryPointRule(t *testing.T) {
+	g := graph.New()
+	seedFile(g, "src/app.ts", "typescript")
+	seedFile(g, "packages/logger/index.ts", "typescript")
+	e := seedImportEdge(g, "src/app.ts", "logger")
+
+	New(g).ResolveAll()
+
+	assert.Equal(t, "packages/logger/index.ts", e.To)
+}
+
 func TestIsJSTSDirEntryPoint(t *testing.T) {
 	cases := []struct {
 		path string

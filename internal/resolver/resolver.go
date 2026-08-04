@@ -395,6 +395,12 @@ type Resolver struct {
 	// contract. Set via SetNpmAliasResolver before ResolveAll runs.
 	npmAlias NpmAliasResolver
 
+	// npmDep, when non-nil, reports whether a bare JS/TS specifier is
+	// declared by the importer as a dependency resolving outside the
+	// repository. See npm_dependency.go for the contract. Set via
+	// SetNpmDependencyLookup before ResolveAll runs.
+	npmDep NpmDependencyLookup
+
 	// pathAlias, when non-nil, expands a JS/TS tsconfig/jsconfig
 	// `compilerOptions.paths` / `baseUrl` import specifier to the
 	// repo-prefixed file stem it targets. See jsts_imports.go for the
@@ -3279,6 +3285,13 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// binds `import … from 'graphql'` to an arbitrary file under any
 	// same-named local directory (issue #450). See isJSTSDirEntryPoint.
 	bareJSTS := isJSTSBareSpecifier(jsTSImportCallerFile(e), importPath)
+	// Stronger evidence when the manifest is readable: a bare specifier the
+	// importer declares as a registry / git / tarball dependency comes from
+	// node_modules by definition, so NO in-repo directory is a candidate —
+	// not even one holding an entry point. This is what closes the residual
+	// case the entry-point rule alone cannot: a repo that both depends on
+	// npm `graphql` and contains `src/feature/graphql/index.ts`.
+	externalNpmDep := bareJSTS && declaresExternalNpmDep(r.npmDep, jsTSImportCallerFile(e), importPath)
 	var sameRepo, crossRepoFile graph.FileNodeIdentity
 	var sameRepoFound, crossRepoFound bool
 	var sameRepoAll []graph.FileNodeIdentity
@@ -3308,7 +3321,9 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// same-repo hit is found and we are not collecting every candidate
 	// for workspace disambiguation.
 	stop := func() bool { return sameRepoFound && !collectAll }
-	if r.dirIndex != nil {
+	if externalNpmDep {
+		// Declared node_modules package — skip the cascade outright.
+	} else if r.dirIndex != nil {
 		for _, file := range r.dirIndex[importPath] {
 			consider(file)
 			if stop() {
