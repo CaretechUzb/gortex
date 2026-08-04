@@ -231,6 +231,25 @@ func (mi *MultiIndexer) npmAliasResolver() resolver.NpmAliasResolver {
 	return idx.Resolve
 }
 
+// npmDependencyLookup builds a resolver.NpmDependencyLookup covering every
+// tracked repo's on-disk root. Installed alongside npmAliasResolver so a
+// bare JS/TS specifier declared as an external dependency never binds to a
+// same-named in-repo directory. Returns nil when no repo has a usable root
+// — callers treat that as "no dependency signal".
+func (mi *MultiIndexer) npmDependencyLookup() resolver.NpmDependencyLookup {
+	roots := map[string]string{}
+	for prefix, meta := range mi.AllMetadata() {
+		if meta != nil && meta.RootPath != "" {
+			roots[prefix] = meta.RootPath
+		}
+	}
+	idx := newNpmAliasIndex(roots)
+	if idx == nil {
+		return nil
+	}
+	return idx.DeclaresExternalDependency
+}
+
 // workspaceMembershipResolver builds a resolver.WorkspaceMembership
 // covering every tracked repo's on-disk root. Installed on the global
 // post-pass resolver and the cross-repo resolver so a same-named import
@@ -889,6 +908,7 @@ func (mi *MultiIndexer) newMasterResolver(useLSP bool) *resolver.Resolver {
 		master.SetLSPHelper(mi.resolverLSPHelper)
 	}
 	master.SetNpmAliasResolver(mi.npmAliasResolver())
+	master.SetNpmDependencyLookup(mi.npmDependencyLookup())
 	master.SetPathAliasResolver(mi.pathAliasResolver())
 	master.SetWorkspaceMembership(mi.workspaceMembershipResolver())
 	return master

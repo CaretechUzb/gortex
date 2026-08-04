@@ -40,6 +40,10 @@ type npmAliasIndex struct {
 	// A nil value records "read, but no npm-alias entries / missing
 	// file" so a miss is not re-read on every import edge.
 	aliasCache map[string]map[string]string
+	// depsCache memoises the full declared-dependency map of one
+	// package.json: disk path → (package name → verbatim version spec).
+	// A nil value records "read, but no dependencies / missing file".
+	depsCache map[string]map[string]string
 	// exportsCache memoises the parsed `exports` subpath map of one
 	// package.json: disk path → packageExports. A nil value records
 	// "read, but no usable `exports` field / missing file" so a miss
@@ -80,6 +84,7 @@ func newNpmAliasIndex(roots map[string]string) *npmAliasIndex {
 	return &npmAliasIndex{
 		roots:        usable,
 		aliasCache:   map[string]map[string]string{},
+		depsCache:    map[string]map[string]string{},
 		exportsCache: map[string]*packageExports{},
 	}
 }
@@ -216,6 +221,103 @@ func (x *npmAliasIndex) aliasesFor(absPath string) map[string]string {
 	}
 	x.aliasCache[absPath] = aliases
 	return aliases
+}
+
+// DeclaresExternalDependency implements resolver.NpmDependencyLookup: it
+// reports whether the importing file's nearest-ancestor package.json
+// declares the specifier's package portion as a dependency that resolves
+// OUTSIDE the repository.
+//
+// npm honours the nearest manifest, so the walk stops at the first
+// package.json declaring the name — a nearer `workspace:*` correctly
+// shadows a farther registry range. A name declared nowhere reports false:
+// absence of a manifest entry is not evidence either way (the file may sit
+// outside any package, or the manifest may be unreadable), and the caller's
+// entry-point rule still applies.
+func (x *npmAliasIndex) DeclaresExternalDependency(callerFile, specifier string) bool {
+	if x == nil || callerFile == "" || specifier == "" {
+		return false
+	}
+	if !isJSTSFile(callerFile) {
+		return false
+	}
+	if strings.HasPrefix(specifier, ".") || strings.HasPrefix(specifier, "/") {
+		return false
+	}
+	root, relDir, ok := x.locate(callerFile)
+	if !ok {
+		return false
+	}
+	pkgName, _ := splitPackageSpecifier(specifier)
+	if pkgName == "" {
+		return false
+	}
+	for dir := relDir; ; dir = path.Dir(dir) {
+		manifest := joinPath(root, joinRel(dir, "package.json"))
+		if version, found := x.dependenciesFor(manifest)[pkgName]; found {
+			return !npmSpecResolvesInRepo(version)
+		}
+		if dir == "." || dir == "" || dir == "/" {
+			return false
+		}
+	}
+}
+
+// npmSpecResolvesInRepo reports whether an npm dependency version spec
+// names something inside the repository rather than a published artifact:
+// a workspace member (`workspace:*`), a linked or portalled directory
+// (`link:../ui`, `portal:../ui`), a local path (`file:../ui`, `./ui`,
+// `../ui`, `/abs/ui`).
+//
+// Everything else — semver ranges, dist-tags, `npm:` aliases, git/github
+// specs, tarball URLs, pnpm `catalog:` entries (which resolve to a registry
+// version) — comes from outside the tree. The distinction matters because a
+// pnpm monorepo declares its own members as dependencies too, and those DO
+// legitimately bind to an in-repo directory; `pnpm-workspace.yaml` members
+// are not covered by the root manifest's `workspaces` globs, so they reach
+// the resolver's directory cascade and must not be refused there.
+func npmSpecResolvesInRepo(version string) bool {
+	v := strings.TrimSpace(version)
+	if v == "" {
+		return false
+	}
+	for _, prefix := range []string{"workspace:", "link:", "portal:", "file:"} {
+		if strings.HasPrefix(v, prefix) {
+			return true
+		}
+	}
+	return strings.HasPrefix(v, "./") || strings.HasPrefix(v, "../") || strings.HasPrefix(v, "/")
+}
+
+// dependenciesFor returns the declared-dependency map (package name →
+// verbatim version spec) of the package.json at absPath, reading and
+// caching it on first request. A nil value records "read, but no
+// dependencies / missing file" so a miss is not re-read per import edge.
+//
+// This reuses the very parse aliasesFor already performs — ParsePackageJSON
+// returns every dependencies / devDependencies / peerDependencies /
+// optionalDependencies entry, and aliasesFor discards all but the aliased
+// ones.
+func (x *npmAliasIndex) dependenciesFor(absPath string) map[string]string {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if cached, seen := x.depsCache[absPath]; seen {
+		return cached
+	}
+	var deps map[string]string
+	if src, ok := readDiskFile(absPath); ok {
+		for _, spec := range modules.ParsePackageJSON(src) {
+			if spec.Ecosystem != "npm" || spec.Path == "" {
+				continue
+			}
+			if deps == nil {
+				deps = map[string]string{}
+			}
+			deps[spec.Path] = spec.Version
+		}
+	}
+	x.depsCache[absPath] = deps
+	return deps
 }
 
 // exportsFor returns the parsed `exports` subpath map of the

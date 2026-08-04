@@ -432,6 +432,12 @@ type Resolver struct {
 	// contract. Set via SetNpmAliasResolver before ResolveAll runs.
 	npmAlias NpmAliasResolver
 
+	// npmDep, when non-nil, reports whether a bare JS/TS specifier is
+	// declared by the importer as a dependency resolving outside the
+	// repository. See npm_dependency.go for the contract. Set via
+	// SetNpmDependencyLookup before ResolveAll runs.
+	npmDep NpmDependencyLookup
+
 	// pathAlias, when non-nil, expands a JS/TS tsconfig/jsconfig
 	// `compilerOptions.paths` / `baseUrl` import specifier to the
 	// repo-prefixed file stem it targets. See jsts_imports.go for the
@@ -3357,10 +3363,26 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// the first same-repo hit short-circuits the scan, preserving the
 	// pre-feature cost.
 	collectAll := r.workspaceMembers != nil
+	// A JS/TS bare specifier names a node_modules package or a workspace
+	// member. Node and tsc load such a directory through its entry point, so
+	// only an `index.*` candidate is evidence — without this the cascade
+	// binds `import … from 'graphql'` to an arbitrary file under any
+	// same-named local directory (issue #450). See isJSTSDirEntryPoint.
+	bareJSTS := isJSTSBareSpecifier(jsTSImportCallerFile(e), importPath)
+	// Stronger evidence when the manifest is readable: a bare specifier the
+	// importer declares as a registry / git / tarball dependency comes from
+	// node_modules by definition, so NO in-repo directory is a candidate —
+	// not even one holding an entry point. This is what closes the residual
+	// case the entry-point rule alone cannot: a repo that both depends on
+	// npm `graphql` and contains `src/feature/graphql/index.ts`.
+	externalNpmDep := bareJSTS && declaresExternalNpmDep(r.npmDep, jsTSImportCallerFile(e), importPath)
 	var sameRepo, crossRepoFile graph.FileNodeIdentity
 	var sameRepoFound, crossRepoFound bool
 	var sameRepoAll []graph.FileNodeIdentity
 	consider := func(file graph.FileNodeIdentity) {
+		if bareJSTS && !isJSTSDirEntryPoint(file.FilePath) {
+			return
+		}
 		if callerRepo == "" || file.RepoPrefix == callerRepo {
 			if !sameRepoFound {
 				sameRepo, sameRepoFound = file, true
@@ -3383,7 +3405,9 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// same-repo hit is found and we are not collecting every candidate
 	// for workspace disambiguation.
 	stop := func() bool { return sameRepoFound && !collectAll }
-	if r.dirIndex != nil {
+	if externalNpmDep {
+		// Declared node_modules package — skip the cascade outright.
+	} else if r.dirIndex != nil {
 		for _, file := range r.dirIndex[importPath] {
 			consider(file)
 			if stop() {
@@ -4436,13 +4460,7 @@ func (r *Resolver) buildReachabilityIndex() {
 		switch {
 		case graph.IsUnresolvedTarget(e.To) && strings.HasPrefix(graph.UnresolvedName(e.To), "import::"):
 			path := strings.TrimPrefix(graph.UnresolvedName(e.To), "import::")
-			if files := r.dirIndex[path]; len(files) > 0 {
-				importedDir = filepath.Dir(files[0].FilePath)
-			} else if last := lastPathComponent(path); last != "" {
-				if files := r.lastDirIndex[last]; len(files) > 0 {
-					importedDir = filepath.Dir(files[0].FilePath)
-				}
-			}
+			importedDir = r.importedDirForSpec(jsTSImportCallerFile(e), path)
 		case strings.HasPrefix(e.To, "external::"):
 			// External / unindexed package — nothing to add.
 		default:
@@ -4592,13 +4610,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 					r.buildDirIndexes()
 				}
 				path := strings.TrimPrefix(graph.UnresolvedName(targetID), "import::")
-				if files := r.dirIndex[path]; len(files) > 0 {
-					importedDir = filepath.Dir(files[0].FilePath)
-				} else if last := lastPathComponent(path); last != "" {
-					if files := r.lastDirIndex[last]; len(files) > 0 {
-						importedDir = filepath.Dir(files[0].FilePath)
-					}
-				}
+				importedDir = r.importedDirForSpec(filePath, path)
 			case graph.IsUnresolvedTarget(targetID):
 				stable = false
 			case strings.HasPrefix(targetID, "external::"):
@@ -4655,6 +4667,43 @@ func (r *Resolver) legacyImportTargetsByFile(filePaths []string) map[string][]st
 func (r *Resolver) clearReachabilityIndex() {
 	r.reachableDirsByFile = nil
 	r.dirByFilePath = nil
+}
+
+// importedDirForSpec returns the directory that an unresolved
+// `import::<spec>` target makes reachable from callerFile, or "" when no
+// credible candidate matches.
+//
+// The dirIndex / lastDirIndex probe here has the same last-path-component
+// looseness as the cascade in resolveImport: for a JS/TS BARE specifier,
+// lastDirIndex[spec] is every indexed file under any same-named directory,
+// and taking files[0] admits an arbitrary one. Unlike resolveImport this
+// mints no edge, so it cannot produce the false `imports` edges of issue
+// #450 — but reachableDirsByFile feeds filterByReachability, and a bogus
+// reachable directory lets a same-named call candidate defined there
+// survive the narrowing and win a call edge. So the same gate applies:
+// only a directory entry point counts for a bare specifier, and a declared
+// external npm dependency contributes no in-repo directory at all.
+func (r *Resolver) importedDirForSpec(callerFile, spec string) string {
+	bare := isJSTSBareSpecifier(callerFile, spec)
+	if bare && declaresExternalNpmDep(r.npmDep, callerFile, spec) {
+		return ""
+	}
+	pick := func(files []graph.FileNodeIdentity) string {
+		for _, f := range files {
+			if bare && !isJSTSDirEntryPoint(f.FilePath) {
+				continue
+			}
+			return filepath.Dir(f.FilePath)
+		}
+		return ""
+	}
+	if d := pick(r.dirIndex[spec]); d != "" {
+		return d
+	}
+	if last := lastPathComponent(spec); last != "" {
+		return pick(r.lastDirIndex[last])
+	}
+	return ""
 }
 
 // dirFor returns filepath.Dir(path), served from the per-file memo built in

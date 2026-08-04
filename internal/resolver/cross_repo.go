@@ -133,6 +133,11 @@ type CrossRepoResolver struct {
 	// ancestor package.json. Same contract as the field of the
 	// same name on Resolver — see npm_alias.go.
 	npmAlias NpmAliasResolver
+	// npmDep reports whether a bare JS/TS specifier is declared by the
+	// importer as a dependency resolving outside the repository. Same
+	// contract as the field of the same name on Resolver — see
+	// npm_dependency.go.
+	npmDep NpmDependencyLookup
 	// pathAlias expands a JS/TS tsconfig/jsconfig path-alias / baseUrl
 	// import specifier to the repo-prefixed file stem it targets. Same
 	// contract as the field of the same name on Resolver — see
@@ -1326,10 +1331,20 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	// own workspace; otherwise the first same-repo hit short-circuits
 	// the scan as before.
 	collectAll := cr.workspaceMembers != nil
+	// A JS/TS bare specifier names a node_modules package or a workspace
+	// member — only a directory entry point is evidence. Mirrors
+	// Resolver.resolveImport; see isJSTSDirEntryPoint (issue #450).
+	bareJSTS := isJSTSBareSpecifier(jsTSImportCallerFile(e), importPath)
+	// Declared node_modules package — no in-repo directory is a candidate.
+	// Mirrors Resolver.resolveImport; see declaresExternalNpmDep.
+	externalNpmDep := bareJSTS && declaresExternalNpmDep(cr.npmDep, jsTSImportCallerFile(e), importPath)
 	var sameRepo graph.FileNodeIdentity
 	var sameRepoFound bool
 	var sameRepoAll, crossRepoAll []graph.FileNodeIdentity
 	consider := func(file graph.FileNodeIdentity) {
+		if bareJSTS && !isJSTSDirEntryPoint(file.FilePath) {
+			return
+		}
 		if file.RepoPrefix == callerRepo {
 			if !sameRepoFound {
 				sameRepo, sameRepoFound = file, true
@@ -1351,7 +1366,9 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 		}
 	}
 	stop := func() bool { return sameRepoFound && !collectAll }
-	if cr.dirIndex != nil {
+	if externalNpmDep {
+		// Declared node_modules package — skip the cascade outright.
+	} else if cr.dirIndex != nil {
 		for _, file := range cr.dirIndex[importPath] {
 			consider(file)
 			if stop() {
