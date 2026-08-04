@@ -23,6 +23,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/pathguard"
 )
 
 // minRefTokenLen is the shortest symbol name considered for reference
@@ -82,7 +83,14 @@ func Materialize(g graph.Store, root string, entries []config.ArtifactEntry, rep
 
 // materializeOne reads one artifact file and projects it onto the graph.
 func materializeOne(g graph.Store, root, rel string, entry config.ArtifactEntry, repoPrefix string, nameIndex map[string][]string) (Artifact, bool) {
-	data, err := os.ReadFile(filepath.Join(root, rel))
+	// Re-check confinement at the read itself, not only where the manifest
+	// was expanded: an artifact list can also arrive from a persisted index
+	// built before this guard existed.
+	abs := filepath.Join(root, rel)
+	if pathguard.SymlinkEscapes(abs, root) {
+		return Artifact{}, false
+	}
+	data, err := os.ReadFile(abs)
 	if err != nil {
 		return Artifact{}, false
 	}
@@ -278,8 +286,17 @@ func expandGlob(root, pattern string) []string {
 	if pattern == "" {
 		return nil
 	}
+	// A manifest glob resolves against the repo, so a symlink out of the
+	// repo must not widen it. os.Stat and filepath.Glob both follow links,
+	// which would otherwise let `docs/schema.sql -> /etc/shadow` satisfy an
+	// `artifacts:` entry and be served verbatim by get_artifact.
+	resolvedRoot := pathguard.ResolveRoot(root)
 	if !strings.ContainsAny(pattern, "*?[") {
-		if info, err := os.Stat(filepath.Join(root, pattern)); err == nil && !info.IsDir() {
+		abs := filepath.Join(root, pattern)
+		if pathguard.EscapesResolvedRoot(abs, resolvedRoot) {
+			return nil
+		}
+		if info, err := os.Stat(abs); err == nil && !info.IsDir() {
 			return []string{pattern}
 		}
 		return nil
@@ -291,6 +308,9 @@ func expandGlob(root, pattern string) []string {
 		}
 		var out []string
 		for _, m := range matches {
+			if pathguard.EscapesResolvedRoot(m, resolvedRoot) {
+				continue
+			}
 			if info, err := os.Stat(m); err == nil && !info.IsDir() {
 				if rel, err := filepath.Rel(root, m); err == nil {
 					out = append(out, filepath.ToSlash(rel))
@@ -303,6 +323,9 @@ func expandGlob(root, pattern string) []string {
 	var out []string
 	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
+			return nil
+		}
+		if pathguard.EscapesResolvedRoot(p, resolvedRoot) {
 			return nil
 		}
 		rel, err := filepath.Rel(root, p)
