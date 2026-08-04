@@ -180,11 +180,22 @@ func runHermesPreToolCall(data []byte, port int, mode Mode) {
 // key, which Hermes names `path` rather than Claude's `file_path`);
 // terminal reuses enrichBash, whose `command` key Hermes already
 // matches. Any other tool is a no-op.
+//
+// It reaches those enrichments directly rather than through enrich, so it
+// applies the same tracked-repo gate itself — a Hermes session in an unindexed
+// checkout has no more to redirect to than a Claude one.
 func hermesEnrich(input hermesPreToolInput, _ int) enrichResult {
 	switch input.ToolName {
 	case hermesReadFileTool:
-		return enrichRead(hermesNormalizeReadInput(input.ToolInput), input.CWD)
+		toolInput := hermesNormalizeReadInput(input.ToolInput)
+		if !hookCallTargetsTrackedRepo("Read", toolInput, input.CWD) {
+			return enrichResult{}
+		}
+		return enrichRead(toolInput, input.CWD)
 	case hermesTerminalTool:
+		if !hookCallTargetsTrackedRepo("Bash", input.ToolInput, input.CWD) {
+			return enrichResult{}
+		}
 		return enrichBash(input.ToolInput, input.CWD)
 	default:
 		return enrichResult{}

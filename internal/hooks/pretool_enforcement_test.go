@@ -112,16 +112,18 @@ func TestScopeTrackedViaDaemonUnavailable(t *testing.T) {
 	}
 }
 
-func TestEnrichGrepExplicitNonSourceFileStaysSoft(t *testing.T) {
+func TestEnrichGrepExplicitNonSourceFileStaysSilent(t *testing.T) {
 	stubTrackedScope(t, true)
-	stubProbe(t, nil, errDaemonUnreachable)
+	// A daemon that answers with hits is the case that used to hard-deny a
+	// grep of a README because the pattern existed somewhere in the graph.
+	stubProbe(t, []grepSymbolHit{{Name: "TODO", FilePath: "pkg/a.go", Line: 3}}, nil)
 
 	result := enrichGrep(map[string]any{
 		"pattern": "TODO",
 		"path":    "/repo/README.md",
 	}, 0, "/repo")
-	if result.deny || result.context == "" {
-		t.Fatalf("explicit non-source Grep must remain soft: %#v", result)
+	if result.deny || result.context != "" {
+		t.Fatalf("explicit non-source Grep must not fire at all: %#v", result)
 	}
 }
 
