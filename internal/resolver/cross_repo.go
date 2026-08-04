@@ -1305,10 +1305,17 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	// own workspace; otherwise the first same-repo hit short-circuits
 	// the scan as before.
 	collectAll := cr.workspaceMembers != nil
+	// A JS/TS bare specifier names a node_modules package or a workspace
+	// member — only a directory entry point is evidence. Mirrors
+	// Resolver.resolveImport; see isJSTSDirEntryPoint (issue #450).
+	bareJSTS := isJSTSBareSpecifier(jsTSImportCallerFile(e), importPath)
 	var sameRepo graph.FileNodeIdentity
 	var sameRepoFound bool
 	var sameRepoAll, crossRepoAll []graph.FileNodeIdentity
 	consider := func(file graph.FileNodeIdentity) {
+		if bareJSTS && !isJSTSDirEntryPoint(file.FilePath) {
+			return
+		}
 		if file.RepoPrefix == callerRepo {
 			if !sameRepoFound {
 				sameRepo, sameRepoFound = file, true

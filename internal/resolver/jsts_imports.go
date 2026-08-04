@@ -226,3 +226,67 @@ func isJSTSPath(p string) bool {
 	}
 	return false
 }
+
+// isJSTSBareSpecifier reports whether callerFile is a JS/TS source importing
+// a BARE specifier — one Node resolves through `node_modules` / a workspace
+// member (`graphql`, `@acme/utils`, `lodash/merge`, `node:fs`) rather than
+// through the file system (`./auth`, `../lib/auth`, `/abs`). importPath is the
+// raw `import::` payload, so the optional `::<export>` suffix is stripped
+// first.
+//
+// Callers pair this with isJSTSDirEntryPoint to gate the package-directory
+// cascade in resolveImport; see that function for why.
+func isJSTSBareSpecifier(callerFile, importPath string) bool {
+	if !isJSTSPath(callerFile) {
+		return false
+	}
+	spec, _ := splitImportSpecSymbol(importPath)
+	switch {
+	case spec == "", spec == ".", spec == "..":
+		return false
+	case strings.HasPrefix(spec, "./"), strings.HasPrefix(spec, "../"), strings.HasPrefix(spec, "/"):
+		return false
+	}
+	return true
+}
+
+// isJSTSDirEntryPoint reports whether filePath is the module entry point of
+// its own directory — `index.<ext>` for any JS/TS module extension.
+//
+// This is the evidence bar the dirIndex/lastDirIndex cascade in resolveImport
+// must clear before binding a JS/TS BARE specifier to an in-repo file. The
+// cascade is package-directory-oriented — a Go/Python notion, documented on
+// buildDirIndexes as "an import of `logger` matches any file under
+// .../logger/" — and lastDirIndex keys on nothing but the last path component
+// of each file's directory. For a bare specifier that is every indexed file
+// under any same-named directory, and the same-repo branch of `consider`
+// accepts the first one with no further check. So a repo that merely contains
+// a `*/graphql/` directory made every `import … from 'graphql'` also bind to
+// an arbitrary file inside it, accumulating phantom importers on that file
+// (issue #450).
+//
+// Node and tsc load a directory-shaped module through its entry point
+// (`package.json` main/exports, else `index.<ext>`) — never through an
+// arbitrary file inside it. Requiring an `index.*` candidate is therefore not
+// just a filter but the correct rule: it keeps the intended monorepo
+// behaviour (a bare `logger` resolving to `packages/app/logger/index.ts`,
+// pinned by the workspace-membership tests) while refusing the false binding,
+// which by construction never names an entry point.
+//
+// Deliberately NOT solved by applying dirMatchesImport to the same-repo
+// branch: that gate answers a different question (does this directory
+// genuinely spell out the import path) and would regress that same monorepo
+// behaviour, since dirMatchesImport("packages/app/logger", "logger") is false.
+func isJSTSDirEntryPoint(filePath string) bool {
+	base := filePath
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
+	base = strings.ToLower(base)
+	for _, ext := range jsTSImportExts {
+		if base == "index"+ext {
+			return true
+		}
+	}
+	return false
+}

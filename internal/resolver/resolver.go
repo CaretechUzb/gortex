@@ -3273,10 +3273,19 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// the first same-repo hit short-circuits the scan, preserving the
 	// pre-feature cost.
 	collectAll := r.workspaceMembers != nil
+	// A JS/TS bare specifier names a node_modules package or a workspace
+	// member. Node and tsc load such a directory through its entry point, so
+	// only an `index.*` candidate is evidence — without this the cascade
+	// binds `import … from 'graphql'` to an arbitrary file under any
+	// same-named local directory (issue #450). See isJSTSDirEntryPoint.
+	bareJSTS := isJSTSBareSpecifier(jsTSImportCallerFile(e), importPath)
 	var sameRepo, crossRepoFile graph.FileNodeIdentity
 	var sameRepoFound, crossRepoFound bool
 	var sameRepoAll []graph.FileNodeIdentity
 	consider := func(file graph.FileNodeIdentity) {
+		if bareJSTS && !isJSTSDirEntryPoint(file.FilePath) {
+			return
+		}
 		if callerRepo == "" || file.RepoPrefix == callerRepo {
 			if !sameRepoFound {
 				sameRepo, sameRepoFound = file, true
