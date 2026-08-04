@@ -544,6 +544,25 @@ func inferCommunityLabel(members []string, nodeMap map[string]*graph.Node, files
 	return path.Dir(filepath.ToSlash(files[0]))
 }
 
+// RelabelNarrowedCommunity recomputes a community's label from a member /
+// file set that was narrowed AFTER detection ran — the shape a scope clamp
+// produces when it drops the members a caller may not see.
+//
+// The detection-time label is derived from the whole partition cell: it is
+// the modal directory across every file in it, so a cell that straddles a
+// scope boundary is labelled with whichever side contributed more files.
+// Reporting that label next to a narrowed member list is both a disclosure
+// of the other side and a description of a cluster the caller was not
+// shown. Recomputing over the surviving files keeps the label a description
+// of what was actually returned.
+//
+// The name-prefix fallback needs hydrated nodes and is skipped here; a
+// narrowed cell falls through to its first surviving file's directory
+// instead, which needs no graph reads.
+func RelabelNarrowedCommunity(members, files []string) string {
+	return inferCommunityLabel(members, nil, files)
+}
+
 // pureClusterLabel returns a name for clusters whose files share a
 // meaningful directory ancestor (deeper than repo/plumbing). Returns
 // "" when no such ancestor exists, signalling a mixed cluster.

@@ -15,6 +15,7 @@ import (
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/rerank"
 	"github.com/zzet/gortex/internal/tokens"
@@ -758,14 +759,17 @@ func (s *Server) handleGetRecentChanges(ctx context.Context, req mcp.CallToolReq
 	}
 	ctx = withRepoAllow(ctx, resolved.RepoAllow)
 
-	sinceStr := req.GetString("since", "")
-	events := watcher.History()
-	if sinceStr != "" {
+	// Exactly one of the two reads runs: each copies every tracked repo's
+	// ring buffer under its own lock, and the merged form sorts the union.
+	var events []indexer.GraphChangeEvent
+	if sinceStr := req.GetString("since", ""); sinceStr != "" {
 		t, err := time.Parse(time.RFC3339, sinceStr)
 		if err != nil {
 			return mcp.NewToolResultError("invalid timestamp: " + sinceStr), nil
 		}
 		events = watcher.HistorySince(t)
+	} else {
+		events = watcher.History()
 	}
 
 	var changes []map[string]any

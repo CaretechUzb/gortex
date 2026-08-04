@@ -196,10 +196,25 @@ func TestGetCommunities_StraddlingCommunityDropsForeignMembers(t *testing.T) {
 	idsA := callableIDsForRepo(t, srv.graph, "repo-a")
 	idsB := callableIDsForRepo(t, srv.graph, "repo-b")
 	mixed := append(append([]string{}, idsA...), idsB...)
+	// Label, Hub and ParentID are computed at detection time over the whole
+	// cell, so a straddling community carries the other side's content in
+	// all three: the label is the modal directory across every file (here
+	// repo-b's root, which contributes the most), the hub is the
+	// highest-degree member's symbol name, and the parent is a grouping key
+	// built from that label. Reproduce that shape exactly.
+	mixedFiles := append(filesForIDs(srv.graph, mixed), "repo-b/a.go", "repo-b/b.go")
+	label := analysis.RelabelNarrowedCommunity(mixed, mixedFiles)
+	require.Contains(t, label, "repo-b", "fixture must reproduce a label derived from the beta side")
 	installCommunitiesForTest(srv, &analysis.CommunityResult{
 		Communities: []analysis.Community{{
-			ID: "community-0", Label: "mixed", Size: len(mixed), Cohesion: 0.5,
-			Members: mixed, Files: filesForIDs(srv.graph, mixed),
+			ID:       "community-0",
+			Label:    label,
+			Hub:      "bBillingService",
+			ParentID: "group/repo-b",
+			Size:     len(mixed),
+			Cohesion: 0.5,
+			Members:  mixed,
+			Files:    mixedFiles,
 		}},
 	})
 
@@ -209,6 +224,8 @@ func TestGetCommunities_StraddlingCommunityDropsForeignMembers(t *testing.T) {
 	assert.Contains(t, text, "repo-a")
 	assert.NotContains(t, text, "repo-b",
 		"a straddling community must be served with its out-of-workspace members removed")
+	assert.NotContains(t, text, "bBillingService",
+		"the hub was derived from members that were removed — it must not survive the clamp")
 }
 
 // TestGetCommunities_UnboundSessionUnchanged pins the strict no-op: an

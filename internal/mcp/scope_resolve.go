@@ -407,6 +407,18 @@ func (s *Server) communitiesInSessionScope(ctx context.Context, cr *analysis.Com
 				files = append(files, f)
 			}
 		}
+		// A cell that straddled the boundary keeps display fields derived
+		// from the members that were just removed: Label is the modal
+		// directory across the whole cell (so it can name a sibling repo
+		// outright), Hub is the highest-degree member's symbol name, and
+		// ParentID is a grouping key built from that Label. Recompute the
+		// label over what survives and drop the two fields that cannot be
+		// recomputed without the members that are gone.
+		if len(members) != len(c.Members) {
+			c.Label = analysis.RelabelNarrowedCommunity(members, files)
+			c.Hub = ""
+			c.ParentID = ""
+		}
 		c.Members = members
 		c.Files = files
 		c.Size = len(members)
@@ -421,22 +433,20 @@ func (s *Server) communitiesInSessionScope(ctx context.Context, cr *analysis.Com
 // same order: the session-workspace ceiling first, then the resolved repo
 // allow-set.
 //
-// An empty prefix is admitted by the workspace ceiling and rejected by an
-// explicit allow-set, matching QueryOptions.ScopeAllows and
-// analyzeNodeVisible. Single-repo daemons mint unprefixed rows, and an
-// allow-set keyed by registry prefixes would otherwise narrow all of them
-// away; an explicit narrow, by contrast, names prefixes an unattributed
-// row cannot satisfy.
+// An unattributed row — one whose prefix is empty — is admitted by both
+// gates. The allow-set half routes through repoNarrowAdmits, the single
+// definition of what a repo narrow does to something carrying no prefix;
+// the workspace half follows it for the same reason. Single-repo daemons
+// emit unprefixed rows, so rejecting would not narrow a result, it would
+// empty one. In multi-repo mode every row of both kinds this gates is
+// attributed at its source, so the admitted case does not arise there.
 func (s *Server) repoPrefixVisible(ctx context.Context, prefix string) bool {
 	if wsRepos, bound := s.sessionWorkspaceRepoSet(ctx); bound && len(wsRepos) > 0 {
 		if prefix != "" && !wsRepos[prefix] {
 			return false
 		}
 	}
-	if allow := repoAllowFromContext(ctx); len(allow) > 0 && !allow[prefix] {
-		return false
-	}
-	return true
+	return repoNarrowAdmits(repoAllowFromContext(ctx), prefix)
 }
 
 // processesInSessionScope returns a scope-clamped copy of pr: processes
