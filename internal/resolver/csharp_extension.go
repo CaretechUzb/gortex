@@ -391,12 +391,17 @@ func (r *Resolver) csharpInstanceMemberClaims(e *graph.Edge, recv, method string
 
 // csharpMemberNamesOf memoizes a type's declared member-name set per
 // pass — GetInEdges returns every reference to a popular receiver type,
-// and the claims gate runs once per candidate-bearing call edge.
+// and the claims gate runs once per candidate-bearing call edge. Reached
+// from resolveEdge's worker pool, so reads and writes share csharpNSMu
+// like every sibling memo; the published map is never mutated after.
 func (r *Resolver) csharpMemberNamesOf(typeID string) map[string]struct{} {
-	if names, ok := r.csharpMemberNamesByType[typeID]; ok {
+	r.csharpNSMu.RLock()
+	names, ok := r.csharpMemberNamesByType[typeID]
+	r.csharpNSMu.RUnlock()
+	if ok {
 		return names
 	}
-	names := map[string]struct{}{}
+	names = map[string]struct{}{}
 	for _, in := range r.graph.GetInEdges(typeID) {
 		if in.Kind != graph.EdgeMemberOf {
 			continue
@@ -405,10 +410,12 @@ func (r *Resolver) csharpMemberNamesOf(typeID string) map[string]struct{} {
 			names[m.Name] = struct{}{}
 		}
 	}
+	r.csharpNSMu.Lock()
 	if r.csharpMemberNamesByType == nil {
 		r.csharpMemberNamesByType = map[string]map[string]struct{}{}
 	}
 	r.csharpMemberNamesByType[typeID] = names
+	r.csharpNSMu.Unlock()
 	return names
 }
 

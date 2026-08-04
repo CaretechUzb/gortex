@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -399,6 +400,31 @@ func TestCrossRepo_MissingCSharpCallerNodeFailsClosed(t *testing.T) {
 	NewCrossRepo(g).ResolveAll()
 	assert.Equal(t, "unresolved::*.Foo", edge.To,
 		"no caller node + .cs path: the gate fails closed, not open")
+}
+
+// TestCSharpMemberNamesOf_ParallelWorkers: the member-claims memo is
+// reached from resolveEdge's worker pool — its reads and writes must
+// share csharpNSMu like every sibling memo. Meaningful under -race.
+func TestCSharpMemberNamesOf_ParallelWorkers(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Lib.cs": `namespace App {
+    public class Base { public void Foo() {} }
+    public class Derived : Base { public void Bar() {} }
+}`,
+	})
+	r := New(g)
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				r.csharpMemberNamesOf("Lib.cs::Base")
+				r.csharpMemberNamesOf("Lib.cs::Derived")
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // TestResolveCSharpExtension_SiblingNamespaceUsingNotVisible: a using

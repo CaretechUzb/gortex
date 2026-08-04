@@ -183,6 +183,30 @@ func TestDecodeLegacyJSON(t *testing.T) {
 	mustType[int64](t, la, "timestamp")
 }
 
+// TestDecodeLegacyJSON_CSharpVisibilityKeys: every using stamp the C#
+// visibility rules read must survive the JSON decode path as []string —
+// a []any here silently erases the file's visibility for the resolver.
+func TestDecodeLegacyJSON_CSharpVisibilityKeys(t *testing.T) {
+	orig := map[string]any{
+		"usings":              []string{"LibA"},
+		"global_usings":       []string{"LibB"},
+		"using_static":        []string{"System.Math"},
+		"scoped_usings":       []string{"A|W", "|X"},
+		"global_using_static": []string{"LibA.E1"},
+	}
+	blob, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	got, err := decodeMeta(blob)
+	if err != nil {
+		t.Fatalf("decodeMeta(json): %v", err)
+	}
+	for k := range orig {
+		mustType[[]string](t, got, k)
+	}
+}
+
 // TestDecodeMetaFastMalformed: corrupt / truncated flat blobs return an error
 // rather than panicking — a single bad row must not crash a store scan.
 func TestDecodeMetaFastMalformed(t *testing.T) {
@@ -191,11 +215,11 @@ func TestDecodeMetaFastMalformed(t *testing.T) {
 		t.Fatalf("encodeMetaFast bailed")
 	}
 	cases := map[string][]byte{
-		"magic only":          {metaFlatMagic0, metaFlatVersion},
-		"count then nothing":  {metaFlatMagic0, metaFlatVersion, 0x05},
-		"truncated mid-blob":  good[:len(good)-3],
-		"unknown value tag":   {metaFlatMagic0, metaFlatVersion, 0x01, 0x01, 'k', 0x7E},
-		"giant key length":    {metaFlatMagic0, metaFlatVersion, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F},
+		"magic only":         {metaFlatMagic0, metaFlatVersion},
+		"count then nothing": {metaFlatMagic0, metaFlatVersion, 0x05},
+		"truncated mid-blob": good[:len(good)-3],
+		"unknown value tag":  {metaFlatMagic0, metaFlatVersion, 0x01, 0x01, 'k', 0x7E},
+		"giant key length":   {metaFlatMagic0, metaFlatVersion, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F},
 	}
 	for name, blob := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -215,15 +239,15 @@ func TestStoreReloadMetaFidelity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
 
 	nodeMeta := map[string]any{
-		"complexity":       7,
-		"loop_depth":       2,
-		"confidence":       0.875,
-		"coverage_pct":     1.0, // integral float
-		"candidate_count":  2,
-		"path_param_names": []string{"id", "org"},
-		"status_codes":     []string{"200", "404"},
-		"churn":            map[string]any{"commit_count": 12, "churn_rate": 2.0, "last_author": "a@b.c"},
-		"last_authored":    map[string]any{"timestamp": int64(1700000000), "email": "x@y.z"},
+		"complexity":        7,
+		"loop_depth":        2,
+		"confidence":        0.875,
+		"coverage_pct":      1.0, // integral float
+		"candidate_count":   2,
+		"path_param_names":  []string{"id", "org"},
+		"status_codes":      []string{"200", "404"},
+		"churn":             map[string]any{"commit_count": 12, "churn_rate": 2.0, "last_author": "a@b.c"},
+		"last_authored":     map[string]any{"timestamp": int64(1700000000), "email": "x@y.z"},
 		"response_envelope": []map[string]any{{"name": "data", "n": 1}},
 		"shape": &contracts.Shape{
 			Kind:   "struct",
