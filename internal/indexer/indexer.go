@@ -6017,6 +6017,73 @@ type incrementalPathMode struct {
 	exactPointSemantic        bool
 }
 
+// indexedFilesAbsentFromDisk returns the repo-relative keys of files the graph
+// records for this repo that a full-tree disk walk did not see.
+//
+// It is the answer to "what does the graph hold that the filesystem does not",
+// which the mtime ledger cannot give: the ledger only knows files it was told
+// about, so a deletion it never witnessed leaves the nodes with nothing left
+// pointing at them. The compact file projection is written per indexed file and
+// dropped on eviction, making it the one inventory that tracks the node set.
+//
+// The result is only a candidate list. Every entry still passes the caller's
+// stat gate before anything is evicted, so a file that merely fell out of the
+// walk (an unrecognised language, an artifact, a path form the walk spells
+// differently) is preserved rather than deleted on this evidence.
+func (idx *Indexer) indexedFilesAbsentFromDisk(diskFiles map[string]bool) []string {
+	if len(diskFiles) == 0 {
+		// A full-tree walk that found nothing is far more likely to be a root
+		// that vanished mid-pass — an unmounted network share, a checkout
+		// being replaced — than a repository that genuinely emptied. Widening
+		// deletion detection to the whole graph on that evidence would take
+		// the repository out of the index in one sweep. The mtime ledger keeps
+		// its existing behaviour here; this sweep declines to pile on.
+		return nil
+	}
+	reader, ok := idx.graph.(graph.FileMetaReader)
+	if !ok {
+		return nil
+	}
+	rows, err := reader.FileMetasForRepo(idx.repoPrefix)
+	if err != nil {
+		idx.logger.Warn("incremental reindex: file inventory read failed, skipping orphan sweep",
+			zap.String("repo_prefix", idx.repoPrefix), zap.Error(err))
+		return nil
+	}
+	var out []string
+	for _, row := range rows {
+		relPath, owned := idx.graphPathRelKey(row.FilePath)
+		if !owned || diskFiles[relPath] {
+			continue
+		}
+		out = append(out, relPath)
+	}
+	return out
+}
+
+// graphPathRelKey inverts prefixPath∘graphRelKey: it maps a graph file path
+// back to the canonical repo-relative key fileMtimes and the disk walk share.
+// owned is false when the path does not belong to this repo, which is the only
+// safe answer — a path under another prefix must never be resolved against
+// this repo's root.
+func (idx *Indexer) graphPathRelKey(graphPath string) (relPath string, owned bool) {
+	rel := graphPath
+	if idx.repoPrefix != "" {
+		var trimmed bool
+		rel, trimmed = strings.CutPrefix(rel, idx.repoPrefix+"/")
+		if !trimmed {
+			return "", false
+		}
+	}
+	if rel == "" {
+		return "", false
+	}
+	// relKey slash-normalises; graphRelKey keeps OS-native separators. Fold
+	// back to the slash form so the key matches diskFiles and fileMtimes on
+	// Windows too.
+	return pathkey.Normalize(filepath.ToSlash(rel)), true
+}
+
 func (idx *Indexer) incrementalPathOwned(absPath string) bool {
 	graphPath := idx.prefixPath(idx.graphRelKey(absPath))
 	if len(idx.graph.GetFileNodes(graphPath)) > 0 {
@@ -6229,6 +6296,20 @@ func (idx *Indexer) incrementalReindexPathsMode(
 			}
 		}
 		idx.mtimeMu.RUnlock()
+		// The mtime ledger is not a complete inventory of what the graph
+		// holds. A file whose mtime record was pruned without its nodes, or
+		// never restored on a warm start, is invisible to the loop above — so
+		// its symbols survive every reconcile and keep answering searches with
+		// code that is no longer on disk. On a full-tree pass the disk walk is
+		// authoritative for the whole repo, so the graph's own file inventory
+		// can be diffed against it directly. Scoped passes are excluded: their
+		// disk set covers only the requested subtree and would read the rest of
+		// the repo as deleted.
+		if fullRoot {
+			for _, relPath := range idx.indexedFilesAbsentFromDisk(diskFiles) {
+				candidateSet[relPath] = struct{}{}
+			}
+		}
 		candidates := make([]string, 0, len(candidateSet))
 		for relPath := range candidateSet {
 			candidates = append(candidates, relPath)
