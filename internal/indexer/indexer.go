@@ -4445,6 +4445,8 @@ func (idx *Indexer) indexFile(
 	var abSnap *affectedBySnapshot
 	var reuseIdx map[reuseKey]*reuseVal
 	var priorUnresolved []*graph.Edge
+	var priorVis csharpVisibilityStamp
+	visCaptured := false
 	deferredResolverCatchup := markerBatch != nil && markerBatch.deferResolverCatchup
 	if (resolve || deferredResolverCatchup) && !idx.deferGlobalPasses.Load() && !skipped {
 		snapshotStarted := time.Now()
@@ -4454,7 +4456,8 @@ func (idx *Indexer) indexFile(
 		// still unresolved so the forward pass can skip re-trying them
 		// (priorUnresolved). Together this makes a save re-resolve only the
 		// references it actually changed instead of the whole file.
-		reuseIdx, priorUnresolved = captureIncrementalState(idx.graph, graphPath)
+		reuseIdx, priorUnresolved, priorVis = captureIncrementalState(idx.graph, graphPath)
+		visCaptured = true
 		snapshotDuration = time.Since(snapshotStarted)
 	}
 
@@ -4490,6 +4493,13 @@ func (idx *Indexer) indexFile(
 		if n != nil {
 			newNodeIDs[n.ID] = struct{}{}
 		}
+	}
+	// A using-stamp change re-prices every visibility-narrowed verdict in
+	// the file — the reuse key carries no visibility evidence, so both the
+	// captured resolutions and the prior-unresolved skip are stale.
+	freshVis := csharpVisibilityStampForNodes(result.Nodes)
+	if visCaptured && priorVis != freshVis {
+		reuseIdx, priorUnresolved = nil, nil
 	}
 	if reused := applyResolvedOutEdges(idx.graph, result.Edges, reuseIdx, newNodeIDs); reused > 0 {
 		idx.logger.Debug("indexer: reused prior resolutions",
@@ -4562,6 +4572,13 @@ func (idx *Indexer) indexFile(
 		idx.resolver.ResolveFileAndIncoming(graphPath)
 		resolveDuration = time.Since(resolveStarted)
 		idx.resolver.SetIncrementalSkip(nil)
+		// A global-using edit changes every dependent file's visibility
+		// without touching the files themselves — nothing above re-resolves
+		// them.
+		if visCaptured && priorVis.globals != freshVis.globals {
+			idx.reresolveCSharpGlobalUsingDependents(
+				[]string{graphPath}, map[string]struct{}{graphPath: {}})
+		}
 		// CPG-lite dataflow placeholders for this file: inter-
 		// procedural callees may have just been lifted by
 		// ResolveFile, so re-run the dataflow materialisation pass
@@ -4664,6 +4681,14 @@ func (idx *Indexer) indexFile(
 		providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
 		if markerBatch.add(graphPath, providersPresent && !omitSecondarySourceScans) {
 			idx.flushReparsePendingEnrichment(markerBatch)
+		}
+		// A global-using change re-prices unit-wide dependents even on
+		// this exceptional path — the deferred catch-up re-resolves only
+		// the changed file's own frontier, never the visibility
+		// dependents.
+		if visCaptured && priorVis.globals != freshVis.globals {
+			idx.reresolveCSharpGlobalUsingDependents(
+				[]string{graphPath}, map[string]struct{}{graphPath: {}})
 		}
 	}
 
@@ -6024,6 +6049,17 @@ func (idx *Indexer) incrementalReindexPathsMode(
 
 	merkleMode := idx.merkleEnabled()
 
+	// Non-Merkle upgrade path: Merkle mixes the extractor version into
+	// the leaf salt, so a bump restages stale-language files on its own.
+	// The mtime ledger knows nothing of versions — on a full-tree pass,
+	// files of a version-stale language count stale even when their
+	// mtime is unchanged, and a clean pass re-stamps the stored versions
+	// below so the restage happens exactly once.
+	var extractorStaleLangs map[string]struct{}
+	if !merkleMode && fullRoot {
+		extractorStaleLangs = idx.extractorVersionStaleLangSet()
+	}
+
 	for _, p := range paths {
 		absPath := p
 		if !filepath.IsAbs(absPath) {
@@ -6077,7 +6113,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 				// consistently with fileMtimes for non-ASCII names.
 				relPath := idx.relKey(path)
 				diskFiles[relPath] = true
-				if !merkleMode && idx.IsStale(relPath) {
+				if !merkleMode && (idx.IsStale(relPath) || extractorLangStale(extractorStaleLangs, relPath)) {
 					staleFiles = append(staleFiles, path)
 				}
 				return nil
@@ -6101,7 +6137,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		// regardless of the Unicode form the caller supplied.
 		relPath := idx.relKey(absPath)
 		diskFiles[relPath] = true
-		if mode.forceExplicitFiles || (!merkleMode && idx.IsStale(relPath)) {
+		if mode.forceExplicitFiles ||
+			(!merkleMode && (idx.IsStale(relPath) || extractorLangStale(extractorStaleLangs, relPath))) {
 			staleFiles = append(staleFiles, absPath)
 		}
 	}
@@ -6190,6 +6227,24 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	// their incoming adjacency. The helper performs one batched node/edge
 	// frontier read for the whole deletion set.
 	deletedDependencyFiles := idx.semanticDependencyFrontierForDeletedFiles(deletedFiles)
+	// Same pre-eviction capture as the single-file eviction API: a deleted
+	// global-usings file (or csproj — it draws the unit boundaries) takes
+	// visibility away from every dependent's extension bind, and this
+	// batched path is the one fsnotify deletes and branch switches ride.
+	var evictedGlobalsFiles []string
+	if len(deletedFiles) > 0 {
+		graphPaths := make([]string, len(deletedFiles))
+		for i, relPath := range deletedFiles {
+			graphPaths[i] = idx.prefixPath(filepath.FromSlash(relPath))
+		}
+		nodesByFile := idx.graph.GetFileNodesByPaths(graphPaths)
+		for _, graphPath := range graphPaths {
+			if csharpVisibilityStampForNodes(nodesByFile[graphPath]).globals != "" ||
+				strings.HasSuffix(strings.ToLower(graphPath), ".csproj") {
+				evictedGlobalsFiles = append(evictedGlobalsFiles, graphPath)
+			}
+		}
+	}
 	sourceStaleFiles, manifestFiles := splitIncrementalContractManifests(idx, staleFiles)
 	markerBatch := &reparsePendingEnrichmentBatch{}
 	if len(markerBatches) > 0 && markerBatches[0] != nil {
@@ -6205,6 +6260,13 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	invalidation.Files = appendUniqueSorted(invalidation.Files, deletedDependencyFiles...)
 	idx.pruneDeletedFileMtimes(deletedFiles)
 	idx.flushReparsePendingEnrichment(markerBatch)
+	if len(evictedGlobalsFiles) > 0 {
+		evicted := make(map[string]struct{}, len(evictedGlobalsFiles))
+		for _, p := range evictedGlobalsFiles {
+			evicted[p] = struct{}{}
+		}
+		idx.reresolveCSharpGlobalUsingDependents(evictedGlobalsFiles, evicted)
+	}
 
 	// Structural and metadata refreshes maintain both the in-memory search
 	// backend and persistent FTS one symbol at a time; deletions remove the
@@ -6264,6 +6326,12 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		result.mutationErr = fmt.Errorf(
 			"%w: %s", errFileVersionChanged, strings.Join(versionChangedFiles, ", "),
 		)
+	}
+	// A clean version-driven restage re-stamps the stored extractor
+	// versions; a failed file keeps the old row so the next full pass
+	// retries the language.
+	if len(extractorStaleLangs) > 0 && len(failedFiles) == 0 {
+		idx.reconcileRepoIndexState(absRoot)
 	}
 	idx.warnIfEdgeSanityViolated(result)
 	// Partial work always queues the exact changed/deleted/dependent graph-file

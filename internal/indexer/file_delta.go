@@ -680,7 +680,13 @@ func metadataEdgeRefreshes(g graph.Store, graphPath string, priorNodes, freshNod
 		newIDs[n.ID] = struct{}{}
 	}
 
-	reuse, _ := captureIncrementalState(g, graphPath)
+	reuse, _, priorVis := captureIncrementalState(g, graphPath)
+	if priorVis != csharpVisibilityStampForNodes(freshNodes) {
+		// A using-stamp change re-prices visibility-narrowed resolutions —
+		// a metadata-only refresh could keep verdicts the new usings
+		// refuse. Bail to the structural path, which re-resolves.
+		return nil, false
+	}
 	applyResolvedOutEdges(g, freshEdges, reuse, newIDs)
 
 	freshByKey := make(map[edgeRefreshKey][]*graph.Edge)

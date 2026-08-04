@@ -124,6 +124,16 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		if r.loneMemberDefnKeep(target, j.edge, j.oldTo) {
 			continue
 		}
+		// A C# extension-method bind is corroborated by namespace
+		// visibility, not imports: the extension enters scope via the
+		// caller's enclosing namespace or a project-scoped `global using`
+		// declared in a sibling file (or `using static` of the declaring
+		// class) — none of which leaves an import edge on the calling
+		// file for the reachability closure to see. Re-check the same
+		// visibility evidence the bind used and keep it when it holds.
+		if r.csharpExtensionGuardKeep(j.edge, callerFile, target) {
+			continue
+		}
 		// Not reachable — revert to the unresolved placeholder and
 		// re-index against the resolved target we are abandoning.
 		// SetEdgeProvenance("") drops the resolution provenance so
@@ -135,6 +145,10 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		provBatch = append(provBatch, graph.EdgeProvenanceUpdate{Edge: j.edge, NewOrigin: ""})
 		j.edge.To = j.oldTo
 		j.edge.Confidence = 0
+		// The label travels with the confidence — agents act on it, and an
+		// unresolved edge advertising the abandoned bind's EXTRACTED label
+		// would out-rank evidence that actually survived.
+		j.edge.ConfidenceLabel = ""
 		// Durable revert stamp: the guard's verdicts are otherwise invisible
 		// after the provenance drop, which blocks any selective replay — a
 		// future pass cannot learn which speculative shapes never survive
@@ -143,6 +157,11 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 			j.edge.Meta = map[string]any{}
 		}
 		j.edge.Meta["guard_reverted"] = true
+		// The abandoned bind's provenance must not shadow a later
+		// rebind — the receiver gate exempts resolution shapes like
+		// extension_method, and a stale tag would carry that exemption
+		// to whatever the edge binds to next.
+		delete(j.edge.Meta, "resolution")
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: oldResolved})
 		spoolReverts = append(spoolReverts, lspSpoolRevert{edge: j.edge, oldBoundTo: oldResolved})
 	}

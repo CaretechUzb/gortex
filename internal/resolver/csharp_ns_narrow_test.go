@@ -288,3 +288,107 @@ func TestCSharpNamespaceNarrow_ExternalImportShape(t *testing.T) {
 	assert.Equal(t, "app/Sales/Rules/PricingRules.cs::PricingRules", ref.To,
 		"an already-resolved external:: using edge still carries the namespace")
 }
+
+// TestCSharpGlobalUsings_WindowsPathIDs: production Windows stores join
+// the repo prefix with "/" but keep OS-native "\" below it (the
+// indexer's graphRelKey shape, e.g. `repo/App\Mod\File.cs`). The
+// directory walk must honour both separators — splitting on "/" alone
+// collapses every project to the repo root and leaks one project's
+// global usings into its siblings.
+func TestCSharpGlobalUsings_WindowsPathIDs(t *testing.T) {
+	g := graph.New()
+	add := func(id string, meta map[string]any) {
+		g.AddNode(&graph.Node{ID: id, Kind: graph.KindFile, Name: id, FilePath: id, Language: "csharp", Meta: meta})
+	}
+	add(`Repo/ProjA\Usings.cs`, map[string]any{"global_usings": []string{"LibA"}})
+	add(`Repo/ProjA\Caller.cs`, nil)
+	add(`Repo/ProjB\Caller.cs`, nil)
+
+	r := New(g)
+	got := r.csharpGlobalUsingsFor(`Repo/ProjA\Caller.cs`)
+	if len(got) != 1 || got[0] != "LibA" {
+		t.Fatalf("same-project caller must inherit the global using, got %v", got)
+	}
+	if leaked := r.csharpGlobalUsingsFor(`Repo/ProjB\Caller.cs`); len(leaked) != 0 {
+		t.Fatalf("sibling project must not inherit the global using, got %v", leaked)
+	}
+}
+
+// TestCSharpFileNamespaceSet_EdgeFallbackSurvivesSiblingGlobals: a file
+// extracted before the usings stamp existed (no Meta["usings"], only
+// EdgeImports) must keep its edge-derived usings even when a sibling
+// file contributes global usings — inherited globals are not "this file
+// has a stamp".
+func TestCSharpFileNamespaceSet_EdgeFallbackSurvivesSiblingGlobals(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "Proj/Legacy.cs", Kind: graph.KindFile, FilePath: "Proj/Legacy.cs", Language: "csharp"})
+	g.AddNode(&graph.Node{ID: "Proj/Usings.cs", Kind: graph.KindFile, FilePath: "Proj/Usings.cs", Language: "csharp",
+		Meta: map[string]any{"global_usings": []string{"GlobalNs"}}})
+	g.AddEdge(&graph.Edge{From: "Proj/Legacy.cs", To: "unresolved::import::My/Ns", Kind: graph.EdgeImports, FilePath: "Proj/Legacy.cs"})
+
+	r := New(g)
+	ns := r.csharpFileNamespaceSet("Proj/Legacy.cs")
+	if _, ok := ns.imported["My.Ns"]; !ok {
+		t.Fatalf("edge-derived using lost when a sibling stamps globals: %v", ns.imported)
+	}
+	if _, ok := ns.imported["GlobalNs"]; !ok {
+		t.Fatalf("sibling global using missing: %v", ns.imported)
+	}
+}
+
+// TestCSharpGlobalUsings_CsprojUnitScoping: the compilation unit is the
+// nearest-ancestor csproj directory, in both directions — a global
+// using in Proj/Features/ applies project-wide (not just its subtree),
+// and a nested project with its own csproj is a separate compilation
+// that inherits nothing from the outer one.
+func TestCSharpGlobalUsings_CsprojUnitScoping(t *testing.T) {
+	g := graph.New()
+	file := func(id string, meta map[string]any) {
+		g.AddNode(&graph.Node{ID: id, Kind: graph.KindFile, Name: id, FilePath: id, Language: "csharp", Meta: meta})
+	}
+	file("Proj/App.csproj", nil)
+	file("Proj/Usings.cs", map[string]any{"global_usings": []string{"LibB"}})
+	file("Proj/Features/Usings.cs", map[string]any{"global_usings": []string{"LibA"}})
+	file("Proj/Web/Caller.cs", nil)
+	file("Proj/SubProj/Sub.csproj", nil)
+	file("Proj/SubProj/Caller.cs", nil)
+
+	r := New(g)
+	got := r.csharpGlobalUsingsFor("Proj/Web/Caller.cs")
+	set := map[string]bool{}
+	for _, u := range got {
+		set[u] = true
+	}
+	if !set["LibA"] || !set["LibB"] || len(got) != 2 {
+		t.Fatalf("project-wide inheritance across subtrees expected [LibA LibB], got %v", got)
+	}
+	if leaked := r.csharpGlobalUsingsFor("Proj/SubProj/Caller.cs"); len(leaked) != 0 {
+		t.Fatalf("nested project with its own csproj must not inherit the outer globals, got %v", leaked)
+	}
+}
+
+// TestCSharpFileNamespaceSet_AnySliceMetaShapes: legacy sqlite rows
+// deserialize the usings stamps as []any, not []string — every consumer
+// path must read both shapes, or narrowing silently dies on old stores.
+func TestCSharpFileNamespaceSet_AnySliceMetaShapes(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "Proj/Caller.cs", Kind: graph.KindFile, FilePath: "Proj/Caller.cs", Language: "csharp",
+		Meta: map[string]any{
+			"usings":       []any{"My.Ns"},
+			"using_static": []any{"LibB.EB"},
+		}})
+	g.AddNode(&graph.Node{ID: "Proj/Usings.cs", Kind: graph.KindFile, FilePath: "Proj/Usings.cs", Language: "csharp",
+		Meta: map[string]any{"global_usings": []any{"LibA"}}})
+
+	r := New(g)
+	ns := r.csharpFileNamespaceSet("Proj/Caller.cs")
+	if _, ok := ns.imported["My.Ns"]; !ok {
+		t.Fatalf("[]any usings not read: %v", ns.imported)
+	}
+	if _, ok := ns.imported["LibA"]; !ok {
+		t.Fatalf("[]any global_usings not propagated: %v", ns.imported)
+	}
+	if _, ok := ns.statics["LibB.EB"]; !ok {
+		t.Fatalf("[]any using_static not read: %v", ns.statics)
+	}
+}

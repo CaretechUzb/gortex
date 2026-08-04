@@ -3,7 +3,9 @@ package languages
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -319,45 +321,138 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		}
 	}
 
-	// Build type environment in legacy precedence:
+	// Resolve calls against the function-range lookup + the per-method
+	// type environments. Owner attribution runs once per local, call and
+	// type use — the sorted lookup keeps that from multiplying into an
+	// O(locals×functions) linear-scan product on member-heavy files.
+	funcRanges := newCSharpFuncLookup(buildFuncRanges(result))
+
+	// Build type environments in legacy precedence, scoped per enclosing
+	// method — a same-named local of a different type in a sibling method
+	// must not bleed into this method's receiver stamps (a file-scoped
+	// last-wins map mis-typed the receiver and both the extension binder
+	// and the receiver gate act on that evidence):
 	//   Tier 0 — explicit type annotations (skip "var" placeholder)
 	//   Tier 1 — `var x = new Foo()` walk for `var`-keyed locals only
-	tenv := make(typeEnv)
+	localOwner := func(l csharpDeferredLocal) string {
+		if l.defNode == nil {
+			return ""
+		}
+		return funcRanges.enclosing(int(l.defNode.StartPoint().Row) + 1)
+	}
+	tenvByOwner := map[string]typeEnv{}
+	setLocalType := func(owner, name, typeName string) {
+		env := tenvByOwner[owner]
+		if env == nil {
+			env = make(typeEnv)
+			tenvByOwner[owner] = env
+		}
+		env[name] = typeName
+	}
 	for _, l := range locals {
+		owner := localOwner(l)
+		if owner == "" {
+			continue
+		}
 		typeName := normalizeCSharpTypeName(l.rawType)
 		if typeName != "" && typeName != "var" {
-			tenv[l.name] = typeName
+			setLocalType(owner, l.name, typeName)
 		}
 	}
 	for _, l := range locals {
-		if _, exists := tenv[l.name]; exists {
+		owner := localOwner(l)
+		if owner == "" || l.rawType != "var" || l.defNode == nil {
 			continue
 		}
-		if l.rawType != "var" {
+		if _, exists := tenvByOwner[owner][l.name]; exists {
 			continue
 		}
-		if l.defNode == nil {
-			continue
-		}
+		// First creation in document order = the outermost one; a
+		// nested `new` inside a collection/object initializer must
+		// not override it.
+		done := false
 		walkNodes(l.defNode, func(n *sitter.Node) {
-			if n.Type() == "object_creation_expression" {
+			if !done && n.Type() == "object_creation_expression" {
 				typeName := inferTypeFromCSharpNew(n, src)
 				if typeName != "" {
-					tenv[l.name] = typeName
+					setLocalType(owner, l.name, typeName)
+					done = true
 				}
 			}
 		})
 	}
 
-	// Resolve calls against funcRanges + tenv.
-	funcRanges := buildFuncRanges(result)
+	// Type SHAPE rides in a parallel per-method map: the core stamps keep
+	// their bare spelling (every downstream consumer stays valid), while
+	// array/nullable suffixes and generic arguments — which are part of
+	// applicability — survive in a receiver_shape stamp.
+	shapesByOwner := map[string]map[string]string{}
+	setLocalShape := func(owner, name, shape string) {
+		m := shapesByOwner[owner]
+		if m == nil {
+			m = map[string]string{}
+			shapesByOwner[owner] = m
+		}
+		m[name] = shape
+	}
+	for _, l := range locals {
+		owner := localOwner(l)
+		if owner == "" {
+			continue
+		}
+		if _, exists := shapesByOwner[owner][l.name]; exists {
+			continue
+		}
+		if shape := csharpCanonTypeShape(l.rawType); shape != "" {
+			setLocalShape(owner, l.name, shape)
+		} else if l.rawType == "var" && l.defNode != nil {
+			// Same first-creation rule as the type walk above — the
+			// two stamps must describe the same creation expression.
+			done := false
+			walkNodes(l.defNode, func(n *sitter.Node) {
+				if !done && n.Type() == "object_creation_expression" {
+					if tn := n.ChildByFieldName("type"); tn != nil {
+						if s := csharpCanonTypeShape(tn.Content(src)); s != "" {
+							setLocalShape(owner, l.name, s)
+							done = true
+						}
+					}
+				}
+			})
+		}
+	}
+
+	// Builtin locals key per enclosing method: a same-named local of a
+	// different type in a sibling method must not bleed into this
+	// method's receiver stamp (a file-scoped last-wins map mis-typed
+	// the receiver and the extension binder would act on it).
+	builtinsByOwner := map[string]map[string]string{}
+	for _, l := range locals {
+		if l.defNode == nil {
+			continue
+		}
+		bt := csharpBuiltinTypeName(l.rawType)
+		if bt == "" {
+			continue
+		}
+		owner := funcRanges.enclosing(int(l.defNode.StartPoint().Row) + 1)
+		if owner == "" {
+			continue
+		}
+		m := builtinsByOwner[owner]
+		if m == nil {
+			m = map[string]string{}
+			builtinsByOwner[owner] = m
+		}
+		m[l.name] = bt
+	}
 
 	// Local-variable type annotations → EdgeTypedAs from the enclosing
 	// function (file node as fallback). Mirrors the parameter/return
 	// type-use emission so a type referenced only in a local body
 	// declaration is still a navigable reference without an LSP.
 	for _, tu := range typeUses {
-		ownerID := findEnclosingFunc(funcRanges, tu.line)
+		ownerID := funcRanges.enclosing(tu.line)
 		if ownerID == "" {
 			ownerID = fileID
 		}
@@ -372,7 +467,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	emitCSharpReferenceForms(root, src, filePath, fileID, result)
 
 	for _, c := range calls {
-		callerID := findEnclosingFunc(funcRanges, c.line)
+		callerID := funcRanges.enclosing(c.line)
 		if callerID == "" {
 			continue
 		}
@@ -381,11 +476,30 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				From: callerID, To: "unresolved::*." + c.name,
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			}
-			if recvType, ok := tenv[c.receiver]; ok {
+			if recvType, ok := tenvByOwner[callerID][c.receiver]; ok {
 				edge.Meta = map[string]any{"receiver_type": recvType}
+				if shape := shapesByOwner[callerID][c.receiver]; shape != "" && shape != recvType {
+					edge.Meta["receiver_shape"] = shape
+				}
+			} else if bt := builtinsByOwner[callerID][c.receiver]; bt != "" {
+				// Builtins stay out of receiver_type (the receiver-gate
+				// passes key on user types); extension eligibility still
+				// needs them — `n.Foo()` on an int must match
+				// `Foo(this int)` and refuse `Foo(this string)`.
+				edge.Meta = map[string]any{"receiver_builtin": bt}
+				if shape := shapesByOwner[callerID][c.receiver]; shape != "" && shape != bt {
+					edge.Meta["receiver_shape"] = shape
+				}
 			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
-				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenv, result))
+				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenvByOwner[callerID], result))
 			}
+			// Eviction restubs a member call to a bare unresolved name; the
+			// marker is what lets the resolver still route the rebind through
+			// the extension rule instead of a locality guess.
+			if edge.Meta == nil {
+				edge.Meta = map[string]any{}
+			}
+			edge.Meta["member_call"] = true
 			stampReturnUsage(edge, c.returnUsage)
 			result.Edges = append(result.Edges, edge)
 			continue
@@ -568,12 +682,31 @@ func csharpHasModifier(decl *sitter.Node, src []byte, mod string) bool {
 // normalizeCSharpTypeName it keeps primitive receivers (string / int), since
 // extension methods commonly extend them.
 func csharpExtensionReceiverType(methodNode *sitter.Node, src []byte) string {
+	if t := csharpExtensionReceiverTypeNode(methodNode, src); t != nil {
+		return normalizeCSharpBaseName(t.Content(src))
+	}
+	return ""
+}
+
+// csharpExtensionReceiverRaw returns the this-param's type as written —
+// qualification, generic arguments, and array/nullable suffixes intact.
+// "" for a non-extension method.
+func csharpExtensionReceiverRaw(methodNode *sitter.Node, src []byte) string {
+	if t := csharpExtensionReceiverTypeNode(methodNode, src); t != nil {
+		return t.Content(src)
+	}
+	return ""
+}
+
+// csharpExtensionReceiverTypeNode finds the type node of a method's
+// `this`-marked first parameter — nil for a non-extension method.
+func csharpExtensionReceiverTypeNode(methodNode *sitter.Node, src []byte) *sitter.Node {
 	if methodNode == nil {
-		return ""
+		return nil
 	}
 	params := methodNode.ChildByFieldName("parameters")
 	if params == nil {
-		return ""
+		return nil
 	}
 	var first *sitter.Node
 	for i, _nc := 0, int(params.NamedChildCount()); i < _nc; i++ {
@@ -584,7 +717,7 @@ func csharpExtensionReceiverType(methodNode *sitter.Node, src []byte) string {
 		}
 	}
 	if first == nil {
-		return ""
+		return nil
 	}
 	hasThis := false
 	for i, _nc := 0, int(first.ChildCount()); i < _nc; i++ {
@@ -605,13 +738,9 @@ func csharpExtensionReceiverType(methodNode *sitter.Node, src []byte) string {
 		}
 	}
 	if !hasThis {
-		return ""
+		return nil
 	}
-	t := first.ChildByFieldName("type")
-	if t == nil {
-		return ""
-	}
-	return normalizeCSharpBaseName(t.Content(src))
+	return first.ChildByFieldName("type")
 }
 
 // csharpEnclosingNamespace returns the dotted name of the enclosing
@@ -848,6 +977,33 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	if extType := csharpExtensionReceiverType(def.Node, src); extType != "" {
 		meta["extension"] = true
 		meta["this_param_type"] = extType
+		tparams := csharpMethodTypeParamNames(def.Node, src)
+		// `Foo<T>(this T v)` — the this-param names the method's own
+		// type parameter, i.e. it matches any receiver; the binder must
+		// not treat it as a concrete type named "T". A `where T : X`
+		// clause bounds that: the constraint core names ride along so
+		// the binder can exclude receivers that provably fail them.
+		if tparams[extType] {
+			meta["this_param_generic"] = true
+			if cons := csharpTypeParamConstraints(def.Node, src, extType); len(cons) > 0 {
+				meta["this_param_constraints"] = strings.Join(cons, ",")
+			}
+		}
+		// Shape (generic args, array/nullable suffixes) is part of
+		// applicability — it rides beside the bare core stamp.
+		if raw := csharpExtensionReceiverRaw(def.Node, src); raw != "" {
+			if shape := csharpCanonTypeShape(raw); shape != "" && shape != extType {
+				meta["this_param_shape"] = shape
+			}
+		}
+		if len(tparams) > 0 {
+			names := make([]string, 0, len(tparams))
+			for n := range tparams {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			meta["method_type_params"] = strings.Join(names, ",")
+		}
 	}
 	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
 		meta["scope_ns"] = ns
@@ -890,11 +1046,18 @@ func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID
 		return
 	}
 	seen[id] = true
+	// Ctors own call edges the same way methods do — without the scope
+	// stamp the resolver's namespace walk would read a ctor caller as
+	// global-namespace code.
+	meta := map[string]any{"receiver": owner.name}
+	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
+		meta["scope_ns"] = ns
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindMethod, Name: owner.name + ".<init>",
 		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
 		Language: "csharp",
-		Meta:     map[string]any{"receiver": owner.name},
+		Meta:     meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
@@ -1030,39 +1193,95 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 }
 
 // stampCSharpUsings records the file's plain namespace usings (global
-// ones included) on the file node as Meta["usings"]. Aliases and
-// using-static grant no bare-name namespace visibility and are skipped.
-// Resolution rewrites the per-directive import edges, so the resolver's
-// namespace narrowing reads this shape, which nothing mutates.
+// ones included) on the file node as Meta["usings"]. Aliases grant no
+// bare-name namespace visibility and are skipped. Two side stamps carry
+// the forms the plain shape cannot: Meta["global_usings"] (project-scoped
+// — the resolver propagates them beyond the declaring file) and
+// Meta["using_static"] (class targets whose extension methods stay
+// callable in extension form). Resolution rewrites the per-directive
+// import edges, so the resolver's namespace narrowing reads these
+// shapes, which nothing mutates.
+//
+// C# using visibility is scope-by-scope — a using inside `namespace A`
+// applies within A only, invisible to a sibling namespace in the same
+// file — so each plain using is ALSO stamped with its declaring scope
+// as Meta["scoped_usings"] ("scope|name", empty scope = compilation
+// unit). Additive: the flat keys keep their exact legacy shape.
 func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
-	var usings []string
+	var usings, globals, statics, scoped, globalStatics []string
 	seen := map[string]bool{}
+	seenStatic := map[string]bool{}
+	seenScoped := map[string]bool{}
 	walkNodes(root, func(n *sitter.Node) {
 		if n.Type() != "using_directive" {
 			return
 		}
 		var name string
+		isGlobal, isStatic := false, false
 		for i, _nc := 0, int(n.ChildCount()); i < _nc; i++ {
 			c := n.Child(i)
 			switch c.Type() {
-			case "static", "name_equals", "=":
+			case "global":
+				isGlobal = true
+			case "static":
+				isStatic = true
+			case "name_equals", "=":
 				return
 			case "identifier", "qualified_name":
 				name = strings.TrimSpace(c.Content(src))
 			}
 		}
-		if name != "" && !seen[name] {
+		if name == "" {
+			return
+		}
+		if isStatic {
+			if !seenStatic[name] {
+				seenStatic[name] = true
+				statics = append(statics, name)
+				// A `global using static` is compilation-scoped like its
+				// namespace sibling — its own stamp lets the resolver
+				// propagate it beyond the declaring file.
+				if isGlobal {
+					globalStatics = append(globalStatics, name)
+				}
+			}
+			return
+		}
+		if !seen[name] {
 			seen[name] = true
 			usings = append(usings, name)
+			if isGlobal {
+				globals = append(globals, name)
+			}
+		}
+		// The scoped entry dedups per (scope, name) — the same namespace
+		// imported at two scopes is two distinct visibility facts.
+		if key := csharpEnclosingNamespace(n, src) + "|" + name; !seenScoped[key] {
+			seenScoped[key] = true
+			scoped = append(scoped, key)
 		}
 	})
-	if len(usings) == 0 {
+	if len(usings) == 0 && len(statics) == 0 {
 		return
 	}
 	if fileNode.Meta == nil {
 		fileNode.Meta = map[string]any{}
 	}
-	fileNode.Meta["usings"] = usings
+	if len(usings) > 0 {
+		fileNode.Meta["usings"] = usings
+	}
+	if len(globals) > 0 {
+		fileNode.Meta["global_usings"] = globals
+	}
+	if len(statics) > 0 {
+		fileNode.Meta["using_static"] = statics
+	}
+	if len(scoped) > 0 {
+		fileNode.Meta["scoped_usings"] = scoped
+	}
+	if len(globalStatics) > 0 {
+		fileNode.Meta["global_using_static"] = globalStatics
+	}
 }
 
 func (e *CSharpExtractor) emitUsing(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
@@ -1075,6 +1294,61 @@ func (e *CSharpExtractor) emitUsing(m parser.QueryResult, filePath, fileID strin
 }
 
 // --- Helpers --------------------------------------------------------
+
+// csharpFuncLookup answers "which function owns this line" by binary
+// search instead of the linear scan findEnclosingFunc pays per query —
+// the extractor asks once per local, call and type use, an
+// O(locals×functions) product on member-heavy files. Ranges are sorted
+// by start line with a running max-end, so a stabbing query walks back
+// only while an overlap is still possible; overlapping ranges (a local
+// function inside a method) pick the innermost.
+type csharpFuncLookup struct {
+	ranges []funcRange
+	maxEnd []int
+	ord    []int // original extraction order — the deterministic tie-break
+}
+
+func newCSharpFuncLookup(ranges []funcRange) *csharpFuncLookup {
+	sorted := append([]funcRange(nil), ranges...)
+	ord := make([]int, len(sorted))
+	for i := range ord {
+		ord[i] = i
+	}
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].startLine < sorted[j].startLine })
+	// SliceStable keeps equal start lines in extraction order, so ord
+	// still needs the same permutation applied.
+	sort.SliceStable(ord, func(i, j int) bool { return ranges[ord[i]].startLine < ranges[ord[j]].startLine })
+	maxEnd := make([]int, len(sorted))
+	running := 0
+	for i, r := range sorted {
+		if r.endLine > running {
+			running = r.endLine
+		}
+		maxEnd[i] = running
+	}
+	return &csharpFuncLookup{ranges: sorted, maxEnd: maxEnd, ord: ord}
+}
+
+func (l *csharpFuncLookup) enclosing(line int) string {
+	i := sort.Search(len(l.ranges), func(j int) bool { return l.ranges[j].startLine > line }) - 1
+	best := ""
+	bestSpan := math.MaxInt
+	bestOrd := math.MaxInt
+	for ; i >= 0; i-- {
+		if l.maxEnd[i] < line {
+			break
+		}
+		if r := l.ranges[i]; line <= r.endLine {
+			span := r.endLine - r.startLine
+			// Innermost wins; identical ranges (expression-bodied
+			// members sharing a line) go to the first extracted.
+			if span < bestSpan || (span == bestSpan && l.ord[i] < bestOrd) {
+				best, bestSpan, bestOrd = r.id, span, l.ord[i]
+			}
+		}
+	}
+	return best
+}
 
 type csharpOwner struct {
 	kind string // class_declaration / struct_declaration / interface_declaration
@@ -1300,6 +1574,68 @@ func normalizeCSharpBaseName(raw string) string {
 	return strings.TrimSpace(raw)
 }
 
+// csharpCanonTypeShape collapses a raw type spelling to its canonical
+// shape — whitespace dropped, structure (generic arguments, array /
+// nullable suffixes, qualification) kept verbatim. "" for empty input
+// and for the `var` placeholder (no declared shape).
+func csharpCanonTypeShape(raw string) string {
+	s := strings.Join(strings.Fields(raw), "")
+	if s == "" || s == "var" {
+		return ""
+	}
+	return s
+}
+
+// csharpTypeParamConstraints returns the core names of the type
+// constraints declared for the given method type parameter (`where T :
+// ITagged, IOther` → [ITagged, IOther]). Primary-kind constraints
+// (class / struct / notnull / unmanaged / new()) carry no type identity
+// and are skipped.
+func csharpTypeParamConstraints(methodNode *sitter.Node, src []byte, param string) []string {
+	if methodNode == nil {
+		return nil
+	}
+	var out []string
+	for i, _nc := 0, int(methodNode.NamedChildCount()); i < _nc; i++ {
+		clause := methodNode.NamedChild(i)
+		if clause == nil || clause.Type() != "type_parameter_constraints_clause" {
+			continue
+		}
+		target := ""
+		if n := clause.ChildByFieldName("target"); n != nil {
+			target = strings.TrimSpace(n.Content(src))
+		} else {
+			for j, _jc := 0, int(clause.NamedChildCount()); j < _jc; j++ {
+				c := clause.NamedChild(j)
+				if c != nil && c.Type() == "identifier" {
+					target = strings.TrimSpace(c.Content(src))
+					break
+				}
+			}
+		}
+		if target != param {
+			continue
+		}
+		walkNodes(clause, func(n *sitter.Node) {
+			if n.Type() != "type_parameter_constraint" {
+				return
+			}
+			txt := strings.TrimSpace(n.Content(src))
+			switch txt {
+			case "class", "class?", "struct", "notnull", "unmanaged":
+				return
+			}
+			if strings.Contains(txt, "(") { // new()
+				return
+			}
+			if name := normalizeCSharpBaseName(txt); name != "" && name != param {
+				out = append(out, name)
+			}
+		})
+	}
+	return out
+}
+
 // extractCSharpMethodReturnType walks a method_declaration node for
 // the type child preceding the method name.
 func extractCSharpMethodReturnType(methodNode *sitter.Node, src []byte, methodName string) string {
@@ -1319,6 +1655,69 @@ func extractCSharpMethodReturnType(methodNode *sitter.Node, src []byte, methodNa
 				return rt
 			}
 		}
+	}
+	return ""
+}
+
+// csharpMethodTypeParamNames returns the method's declared generic
+// type-parameter names (the `<T, U>` list), for telling a generic
+// this-param apart from a concrete type of the same spelling.
+func csharpMethodTypeParamNames(methodNode *sitter.Node, src []byte) map[string]bool {
+	if methodNode == nil {
+		return nil
+	}
+	tparams := methodNode.ChildByFieldName("type_parameters")
+	if tparams == nil {
+		for i, _nc := 0, int(methodNode.NamedChildCount()); i < _nc; i++ {
+			c := methodNode.NamedChild(i)
+			if c != nil && c.Type() == "type_parameter_list" {
+				tparams = c
+				break
+			}
+		}
+	}
+	if tparams == nil {
+		return nil
+	}
+	names := map[string]bool{}
+	for i, _nc := 0, int(tparams.NamedChildCount()); i < _nc; i++ {
+		tp := tparams.NamedChild(i)
+		if tp == nil || tp.Type() != "type_parameter" {
+			continue
+		}
+		for j, _jc := 0, int(tp.NamedChildCount()); j < _jc; j++ {
+			c := tp.NamedChild(j)
+			if c != nil && c.Type() == "identifier" {
+				names[c.Content(src)] = true
+				break
+			}
+		}
+	}
+	return names
+}
+
+// csharpBuiltinTypeName returns the C# builtin keyword named by a local
+// declaration type, nullable/array suffixes stripped — "" when the type
+// is not a builtin. normalizeCSharpTypeName deliberately drops these;
+// this is the parallel lookup for the receiver_builtin stamp.
+func csharpBuiltinTypeName(t string) string {
+	t = strings.TrimSpace(t)
+	// Strip nullable/array suffixes to fixpoint — `int?[]` and `int[]?`
+	// spell the same evidence, and the resolver's suffix trim agrees.
+	for {
+		trimmed := strings.TrimSuffix(t, "?")
+		if idx := strings.Index(trimmed, "["); idx > 0 {
+			trimmed = trimmed[:idx]
+		}
+		if trimmed == t {
+			break
+		}
+		t = trimmed
+	}
+	switch t {
+	case "int", "long", "short", "byte", "sbyte", "uint", "ulong", "ushort",
+		"float", "double", "decimal", "bool", "char", "string", "object":
+		return t
 	}
 	return ""
 }

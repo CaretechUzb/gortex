@@ -1187,9 +1187,30 @@ func isCrossRepoHop(callerRepo, targetRepo string) bool {
 	return targetRepo != "" && targetRepo != callerRepo
 }
 
+// csharpVerdictCaller reports whether e's unresolved state is the C#
+// member gates' verdict, which no name-only tier may overturn. Keyed to
+// exactly "csharp" — razor/fsharp callers never enter those gates, so
+// blocking their fallback would only lose edges. A missing caller node
+// fails CLOSED on the .cs file path: the dangling-From window is the
+// eviction window, where resurrecting a refused bind matters most.
+func (cr *CrossRepoResolver) csharpVerdictCaller(e *graph.Edge) bool {
+	if cn := cr.cachedGetNode(e.From); cn != nil {
+		return cn.Language == "csharp"
+	}
+	return strings.HasSuffix(e.FilePath, ".cs")
+}
+
 func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *CrossRepoStats) {
 	candidates := cr.scopedCandidates(e, funcName)
 	if len(candidates) == 0 {
+		stats.Unresolved++
+		return
+	}
+
+	// A restubbed C# member call travels as a bare name and lands here
+	// instead of resolveMethodCall — the member_call evidence in Meta
+	// still marks it as a member-gate verdict.
+	if mc, _ := e.Meta["member_call"].(bool); mc && cr.csharpVerdictCaller(e) {
 		stats.Unresolved++
 		return
 	}
@@ -1474,6 +1495,19 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 	}
 
 	// Fallback: name-only matching (methods first, then functions for pkg.Func() calls).
+	//
+	// C# member calls never take it: the main resolver owns C# member
+	// semantics (instance-member precedence, receiver shape, using
+	// visibility) and leaves a call unresolved as a VERDICT — ambiguity
+	// or provable inapplicability. A name-only bind here would resurrect
+	// exactly the misbinds those gates refuse (an extension from an
+	// invisible namespace, a shape-conflicted overload) with no
+	// confidence and no origin. The exact-receiver tiers above remain
+	// available to C#.
+	if cr.csharpVerdictCaller(e) {
+		stats.Unresolved++
+		return
+	}
 	for _, c := range candidates {
 		if c.Kind == graph.KindMethod && c.RepoPrefix == callerRepo {
 			e.To = c.ID
