@@ -104,6 +104,33 @@ func TestSQLiteReindexUnresolvedTargetRecordsExactFrontier(t *testing.T) {
 	}
 }
 
+// TestSQLiteAttributeOnlyReindexPreloadsSourceFile pins the preload against the
+// mutation builder: an entry whose identity does not move still carries payload
+// and still produces a write, so its source node must be preloaded. When the
+// preload skipped those entries, an edge with no file of its own had nothing to
+// attribute the write to and the receipt fell back to incomplete — which
+// widens the resolution frontier to the whole workspace.
+func TestSQLiteAttributeOnlyReindexPreloadsSourceFile(t *testing.T) {
+	store := openReindexReceiptTestStore(t)
+	edge := seedReindexReceiptEdge(t, store, "unresolved::Target", "")
+	edge.Confidence = 0.4
+	store.AddEdge(edge)
+
+	token := store.BeginMutationReceipt()
+	// Same target, same kind, same identity — only the payload moves. This is
+	// the shape the resolver's terminal-clearing pass produces.
+	edge.Confidence = 0.9
+	store.ReindexEdges([]graph.EdgeReindex{{Edge: edge, OldTo: edge.To}})
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete {
+		t.Fatalf("attribute-only reindex receipt = %#v, want complete", receipt)
+	}
+	if want := []string{"repo/caller.go"}; !reflect.DeepEqual(receipt.ChangedFiles, want) {
+		t.Fatalf("changed files = %v, want %v (the source node's file)", receipt.ChangedFiles, want)
+	}
+}
+
 func TestSQLiteReindexMissingSourceFailsClosedOnlyForNewUnresolvedEdge(t *testing.T) {
 	store := openReindexReceiptTestStore(t)
 	edge := &graph.Edge{

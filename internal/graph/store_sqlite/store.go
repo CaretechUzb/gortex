@@ -1848,6 +1848,9 @@ func (s *Store) GetRepoNodesLight(repoPrefix string) []*graph.Node {
 		}
 		out = append(out, n)
 	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
+	}
 	return out
 }
 
@@ -1869,6 +1872,12 @@ func (s *Store) scanNodeQuery(query string, args ...any) []*graph.Node {
 			return out
 		}
 		out = append(out, n)
+	}
+	// A driver failure part-way through ends the cursor exactly like a clean
+	// exhaust, so without this check a repo-wide node scan can come back
+	// silently truncated and read as complete.
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
 	}
 	return out
 }

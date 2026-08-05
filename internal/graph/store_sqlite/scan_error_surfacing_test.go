@@ -128,3 +128,24 @@ func TestInlineSQLScansSurfaceQueryAndRowErrors(t *testing.T) {
 		store.queryEdgesLightSQL(`SELECT ` + edgeColsLight + ` FROM edges` + poisonAfterFirstEdge)
 	})
 }
+
+// TestNodeScanHelpersSurfaceRowIterationErrors covers the two node cursors the
+// repo-scoped enumerations run on: a scan that dies part-way through must not
+// hand back a short slice that reads as the complete set of repo nodes.
+func TestNodeScanHelpersSurfaceRowIterationErrors(t *testing.T) {
+	store := newScanErrorStore(t)
+
+	if got := len(store.scanNodeQuery(`SELECT ` + lookupNodeCols + ` FROM nodes`)); got != 3 {
+		t.Fatalf("healthy scanNodeQuery returned %d nodes, want 3", got)
+	}
+	if got := len(store.GetRepoNodesLight("")); got != 3 {
+		t.Fatalf("healthy GetRepoNodesLight returned %d nodes, want 3", got)
+	}
+
+	assertScanFailureSurfaces(t, "scanNodeQuery mid-cursor", func() {
+		store.scanNodeQuery(`SELECT ` + lookupNodeCols + ` FROM nodes` + poisonAfterFirstNode)
+	})
+	assertScanFailureSurfaces(t, "scanNodeQuery on a missing table", func() {
+		store.scanNodeQuery(`SELECT ` + lookupNodeCols + ` FROM nodes_that_do_not_exist`)
+	})
+}

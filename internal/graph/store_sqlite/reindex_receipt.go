@@ -19,6 +19,13 @@ type sqliteReindexReceipt struct {
 // prepareSQLiteReindexReceiptTx preloads source identities in bounded SQL
 // batches for unresolved edges whose own file_path is empty. It is a no-op when
 // no receipt window is active, keeping the normal reindex path read-free.
+//
+// The set of entries preloaded here must stay exactly the set
+// sqliteReindexMutations turns into writes. An entry that produces a write
+// without a preloaded source node records an edge with no exact file, which
+// widens the incremental resolution frontier for the whole receipt window — so
+// an entry the mutation builder stopped skipping must stop being skipped here
+// too.
 func (s *Store) prepareSQLiteReindexReceiptTx(tx *sql.Tx, batch []graph.EdgeReindex) *sqliteReindexReceipt {
 	if !s.hasActiveMutationReceiptsLocked() {
 		return nil
@@ -32,13 +39,6 @@ func (s *Store) prepareSQLiteReindexReceiptTx(tx *sql.Tx, batch []graph.EdgeRein
 	for _, reindex := range batch {
 		edge := reindex.Edge
 		if edge == nil || edge.FilePath != "" || !graph.IsUnresolvedTarget(edge.To) {
-			continue
-		}
-		oldKind := reindex.OldKind
-		if oldKind == "" {
-			oldKind = edge.Kind
-		}
-		if !reindex.RefreshIdentity && reindex.OldTo == edge.To && oldKind == edge.Kind {
 			continue
 		}
 		ids = append(ids, edge.From)
