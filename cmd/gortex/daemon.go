@@ -1376,10 +1376,25 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 		}
 	}
 
+	// The state column appears only once a repo is in trouble — its
+	// directory is gone, or the daemon holds no index for it. On a
+	// healthy workspace every row would read "ok", so it stays hidden.
+	showState := false
+	for _, r := range rows {
+		if r.Missing || r.Unloaded {
+			showState = true
+			break
+		}
+	}
+
 	header := table.Row{"repo"}
 	colConfigs := []table.ColumnConfig{{Number: 1, Align: text.AlignLeft}}
 	if showWS {
 		header = append(header, "workspace")
+		colConfigs = append(colConfigs, table.ColumnConfig{Number: len(colConfigs) + 1, Align: text.AlignLeft})
+	}
+	if showState {
+		header = append(header, "state")
 		colConfigs = append(colConfigs, table.ColumnConfig{Number: len(colConfigs) + 1, Align: text.AlignLeft})
 	}
 	header = append(header, "total", "files", "nodes", "edges",
@@ -1407,6 +1422,9 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 			}
 			row = append(row, ws)
 		}
+		if showState {
+			row = append(row, repoStateLabel(r))
+		}
 		row = append(row,
 			formatBytes(r.Memory.TotalBytes),
 			r.Files,
@@ -1430,6 +1448,9 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 		if showWS {
 			footer = append(footer, "")
 		}
+		if showState {
+			footer = append(footer, "")
+		}
 		footer = append(footer, formatBytes(other), "", "", "", "", "", "", "")
 		if showDisk {
 			footer = append(footer, "")
@@ -1439,6 +1460,53 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 	}
 
 	t.Render()
+	renderMissingRepoWarning(w, rows)
+}
+
+// repoStateLabel names a tracked repo's inventory state for the status
+// table. MISSING is deliberately shouted: it is the only state a user
+// has to act on, and the eight-day-old ghost of #312 went unnoticed
+// precisely because nothing in any view said it out loud.
+func repoStateLabel(r daemon.TrackedRepoStatus) string {
+	switch {
+	case r.Missing:
+		return "MISSING"
+	case r.Unloaded:
+		return "not indexed"
+	default:
+		return "ok"
+	}
+}
+
+// renderMissingRepoWarning prints the remediation block below the repos
+// table for every tracked repo whose directory is gone. Nothing else in
+// the daemon ever says so: the repo simply stops indexing, and each view
+// shows a different symptom (an empty git HEAD, a zero-count row, or no
+// row at all). Naming the exact `gortex untrack` command turns a
+// confusing inventory into a one-line fix.
+func renderMissingRepoWarning(w io.Writer, rows []daemon.TrackedRepoStatus) {
+	var gone []daemon.TrackedRepoStatus
+	for _, r := range rows {
+		if r.Missing {
+			gone = append(gone, r)
+		}
+	}
+	if len(gone) == 0 {
+		return
+	}
+	subject := "repo no longer exists"
+	if len(gone) > 1 {
+		subject = "repos no longer exist"
+	}
+	fmt.Fprintf(w, "\n!! %d tracked %s on disk — the path was deleted, renamed, or unmounted:\n",
+		len(gone), subject)
+	for _, r := range gone {
+		fmt.Fprintf(w, "     %-24s %s\n", r.Prefix, r.Path)
+	}
+	fmt.Fprintln(w, "   They can never be re-indexed. Drop each from the inventory with:")
+	for _, r := range gone {
+		fmt.Fprintf(w, "     gortex untrack %s\n", r.Path)
+	}
 }
 
 // renderDaemonWorkspaces prints the per-workspace rollup above the

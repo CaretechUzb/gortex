@@ -429,6 +429,14 @@ func nudgeReason(guidance string) string {
 }
 
 func enrich(input HookInput, port int) enrichResult {
+	// A call that touches no tracked repo has no graph to redirect to, so the
+	// access policy has nothing true to say about it. Checked once here rather
+	// than per-enrichment so every host tool the policy covers is gated the
+	// same way, and so a Gortex MCP call — which is not repo-scoped — is not.
+	if !isGortexMCPToolName(input.ToolName) &&
+		!hookCallTargetsTrackedRepo(input.ToolName, input.ToolInput, input.CWD) {
+		return enrichResult{}
+	}
 	switch input.ToolName {
 	case "Read":
 		return enrichRead(input.ToolInput, input.CWD)
@@ -569,7 +577,13 @@ func enrichGrep(toolInput map[string]any, _ int, cwdArg ...string) enrichResult 
 	if pattern == "" {
 		return enrichResult{}
 	}
-	if hookSearchScopeIndexed(cwd, toolInput) {
+	switch hookSearchScope(cwd, toolInput) {
+	case searchScopeNonSource:
+		// The search is confined to docs or config. Neither the deny nor the
+		// "do not Grep indexed source" advisory is true of it, and the graph
+		// surface both point at has no answer for it either.
+		return enrichResult{}
+	case searchScopeIndexed:
 		return enrichResult{
 			deny:   true,
 			reason: formatTrackedSearchDeny("Grep", pattern),
@@ -578,30 +592,56 @@ func enrichGrep(toolInput map[string]any, _ int, cwdArg ...string) enrichResult 
 	return probeSymbolPattern("Grep", pattern, defaultGrepGuidance())
 }
 
-func hookSearchScopeIndexed(cwd string, toolInput map[string]any) bool {
+// searchScopeVerdict is what a Grep/Glob scope resolves to. The three states
+// are deliberately distinct: only searchScopeIndexed is proof the policy
+// applies, and only searchScopeNonSource is proof it does not. Unproven keeps
+// the historical posture — probe the pattern, fall back to soft guidance.
+type searchScopeVerdict int
+
+const (
+	searchScopeUnproven searchScopeVerdict = iota
+	searchScopeIndexed
+	searchScopeNonSource
+)
+
+// hookSearchScope classifies what a Grep/Glob call actually searches, from its
+// `path` scope plus (for Grep) the `type` / `glob` filters that narrow it.
+func hookSearchScope(cwd string, toolInput map[string]any) searchScopeVerdict {
+	if searchRestrictedToNonSource(toolInput) {
+		return searchScopeNonSource
+	}
+
 	scope, _ := toolInput["path"].(string)
 	scope = strings.TrimSpace(scope)
-	if scope != "" {
-		abs := scope
-		if !filepath.IsAbs(abs) && cwd != "" {
-			abs = filepath.Join(cwd, abs)
+	if scope != "" && scopeNamesFile(cwd, scope) {
+		if !looksLikeSourceFile(scope) {
+			return searchScopeNonSource
 		}
-		if info, err := os.Stat(abs); err == nil && !info.IsDir() {
-			if !looksLikeSourceFile(scope) {
-				return false
-			}
-			indexed, _ := queryFileIndexed(cwd, scope)
-			return indexed
+		if indexed, _ := queryFileIndexed(cwd, scope); indexed {
+			return searchScopeIndexed
 		}
-		if filepath.Ext(scope) != "" {
-			if !looksLikeSourceFile(scope) {
-				return false
-			}
-			indexed, _ := queryFileIndexed(cwd, scope)
-			return indexed
-		}
+		return searchScopeUnproven
 	}
-	return scopeTrackedFn(cwd, scope)
+
+	if scopeTrackedFn(cwd, scope) {
+		return searchScopeIndexed
+	}
+	return searchScopeUnproven
+}
+
+// scopeNamesFile reports whether a `path` scope names one file rather than a
+// directory to search under. An existing path answers directly; one that is
+// not on disk (a scope the agent typed from memory) is judged by whether it
+// carries an extension.
+func scopeNamesFile(cwd, scope string) bool {
+	abs := scope
+	if !filepath.IsAbs(abs) && cwd != "" {
+		abs = filepath.Join(cwd, abs)
+	}
+	if info, err := os.Stat(abs); err == nil {
+		return !info.IsDir()
+	}
+	return filepath.Ext(scope) != ""
 }
 
 func formatTrackedSearchDeny(tool, query string) string {
@@ -1209,7 +1249,12 @@ func enrichGlob(toolInput map[string]any, cwdArg ...string) enrichResult {
 		return enrichResult{}
 	}
 
-	if hookSearchScopeIndexed(cwd, toolInput) {
+	switch hookSearchScope(cwd, toolInput) {
+	case searchScopeNonSource:
+		// The enumeration is scoped to something that is not indexed source,
+		// so neither the deny nor the soft guidance below describes it.
+		return enrichResult{}
+	case searchScopeIndexed:
 		var b strings.Builder
 		fmt.Fprintf(&b, "[Gortex] BLOCKED: Glob `%s` targets indexed source. Use:\n", pattern)
 		b.WriteString("  - `explore(operation:\"outline\")` — repository/file outline\n")

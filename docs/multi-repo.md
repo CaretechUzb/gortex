@@ -93,7 +93,7 @@ gortex untrack /path/to/repo        # Remove a repo from the workspace
 gortex mcp --track /path/to/repo    # Track additional repos on startup
 gortex mcp --project my-saas        # Set active project scope
 gortex status                       # Per-repo and per-project stats
-gortex repos                        # List tracked repos — head-commit SHA, last-indexed time, staleness flag
+gortex repos                        # List tracked repos — head-commit SHA, last-indexed time, freshness
 gortex repos --json                 # Same, machine-readable (for scripts / CI)
 
 # Stamp workspace / project slugs across tracked repos (migration helper)
@@ -110,6 +110,23 @@ gortex config exclude add '**/*.bak' --global       # Write to ~/.gortex/config.
 gortex config exclude add testdata/ --repo backend  # Write to a RepoEntry
 gortex config exclude remove pkg/generated          # Remove from the same target
 ```
+
+### Deleted checkouts
+
+Tracking outlives the directory: nothing removes a repo entry when you
+delete, rename, or unmount its checkout. Such an entry can never be
+indexed again, so all three inventory views agree on flagging it —
+`gortex repos` renders `MISSING` in place of a freshness value (`missing:
+true` under `--json`), `gortex status` and `gortex daemon status` mark the
+row `MISSING`, and `index_health` reports `tracked_repo_paths_ok: false`
+with the dead paths under `missing_repo_paths`. Each prints the
+`gortex untrack <path>` that clears it.
+
+The repo also stays listed after a daemon restart that failed to index
+it: `daemon status` reconciles the live indexer registry against
+`~/.gortex/config.yaml`, so a repo the daemon could not load shows as
+`not indexed` rather than dropping out of one view while the other keeps
+listing it.
 
 ## MCP tools
 

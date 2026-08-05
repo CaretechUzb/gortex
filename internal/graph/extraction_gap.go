@@ -1,9 +1,11 @@
 package graph
 
-// ZeroEdgeClass classifies why a symbol's graph query came back empty.
-// An empty result has two very different causes that an agent cannot
-// otherwise tell apart, and a pre-edit safety check that trusts a
-// false "0 usages" is silently disarmed.
+// ZeroEdgeClass classifies why a symbol's graph query returned nothing an
+// agent can act on. A thin result has several very different causes that
+// an agent cannot otherwise tell apart — genuinely unused code, a symbol
+// the extractor never processed, and resolution that landed too weakly to
+// prove anything — and a pre-edit safety check that trusts a false
+// "0 usages" is silently disarmed.
 type ZeroEdgeClass string
 
 const (
@@ -28,19 +30,24 @@ const (
 	// the dangerous case for a delete-or-rewrite decision.
 	ZeroEdgePossibleExtractionGap ZeroEdgeClass = "possible_extraction_gap"
 
-	// ZeroEdgeCoverageIncomplete means the symbol has no resolved
-	// incoming call/reference edges, but the graph DOES carry
-	// import-level evidence that consumers exist: inbound `imports` /
-	// `re_exports` edges land on the symbol itself, or (for a public
-	// JS/TS symbol) on its file. The usage query is incomplete, not
-	// empty — reference-level resolution failed somewhere upstream —
-	// so an agent must NOT read the empty result as safe-to-remove.
+	// ZeroEdgeCoverageIncomplete means the symbol has no *trustworthy*
+	// incoming call/reference edges, but the graph does carry weaker
+	// evidence that consumers exist, from any of three sources:
+	// inbound `imports` / `re_exports` edges landing on the symbol
+	// itself or (for a public JS/TS symbol) on its file; unresolved
+	// same-name call candidates the resolver never bound; or incoming
+	// usage edges whose only provenance is a name-only match. The usage
+	// query is incomplete, not empty — reference-level resolution
+	// failed somewhere upstream — so an agent must NOT read the result
+	// as safe-to-remove.
 	ZeroEdgeCoverageIncomplete ZeroEdgeClass = "coverage_incomplete"
 )
 
-// ZeroEdgeCaveat is the structured caveat attached to an empty graph
-// query result. Class is machine-checkable so a safety gate can branch
-// on it; Message is a short human-readable explanation.
+// ZeroEdgeCaveat is the structured caveat attached to a graph query
+// result an agent must not take at face value — one that came back empty,
+// or one whose every usage row is a name-only match. Class is
+// machine-checkable so a safety gate can branch on it; Message is a short
+// human-readable explanation.
 type ZeroEdgeCaveat struct {
 	Class   ZeroEdgeClass `json:"class" toon:"class"`
 	Message string        `json:"message" toon:"message"`
@@ -67,9 +74,9 @@ const TierFilteredClass = "tier_filtered"
 // always TierFilteredClass; EdgesBelowMinTier counts the edges dropped by the
 // filter and MaxAvailableTier names the best tier actually present.
 type TierFilteredCaveat struct {
-	Class            string `json:"class" toon:"class"`
-	EdgesBelowMinTier int   `json:"edges_below_min_tier" toon:"edges_below_min_tier"`
-	MaxAvailableTier string `json:"max_available_tier" toon:"max_available_tier"`
+	Class             string `json:"class" toon:"class"`
+	EdgesBelowMinTier int    `json:"edges_below_min_tier" toon:"edges_below_min_tier"`
+	MaxAvailableTier  string `json:"max_available_tier" toon:"max_available_tier"`
 }
 
 // usageEdgeKinds are the incoming edge kinds that count as a symbol
@@ -105,16 +112,56 @@ func UsageInboundEdgeKinds() []EdgeKind {
 	}
 }
 
+// IsWeakUsageEvidence reports whether an incoming usage edge is name-only
+// evidence rather than proof that the symbol is used.
+//
+// An edge is weak when it is speculative (a best-guess dynamic-dispatch
+// edge, default-excluded from every edge-returning surface) or when its
+// effective provenance is the text_matched tier — a bare-name match that
+// no type system, LSP provider, or unambiguous AST binding corroborates.
+// Everything from ast_inferred upward counts as real evidence: it is
+// keyed on an extracted type, not on a name collision.
+//
+// Provenance is read through Edge.EffectiveOrigin, so an edge the
+// producer never stamped is judged by the tier it is *displayed* with
+// rather than treated as untagged.
+func IsWeakUsageEvidence(e *Edge) bool {
+	if e == nil {
+		return true
+	}
+	if e.IsSpeculative() {
+		return true
+	}
+	switch e.EffectiveOrigin() {
+	case OriginTextMatched, OriginSpeculative:
+		return true
+	}
+	return false
+}
+
 // ClassifyZeroEdge inspects a symbol's incoming and outgoing edges and
 // returns how an empty usage/caller/impact query for it should be read.
 //
-//   - ZeroEdgeNone — the symbol has at least one incoming usage edge.
-//   - ZeroEdgeLikelyUnused — no incoming usage edge, but the symbol has
-//     other graph edges (structural defines/member_of, or any outgoing
-//     edge). Consistent with genuine dead code.
+//   - ZeroEdgeNone — the symbol has at least one incoming usage edge
+//     that is more than a name match.
+//   - ZeroEdgeCoverageIncomplete — the only incoming evidence is weak:
+//     import-level consumer edges, unresolved same-name call candidates,
+//     or usage edges resolved by name alone. Unverified, not proof.
+//   - ZeroEdgeLikelyUnused — no incoming usage edge of any strength, but
+//     the symbol has other graph edges (structural defines/member_of, or
+//     any outgoing edge). Consistent with genuine dead code.
 //   - ZeroEdgePossibleExtractionGap — the symbol has no edges at all,
 //     which a normally indexed symbol never has; the extractor most
 //     likely missed it.
+//
+// Classification weighs incoming usage edges by provenance, not by kind
+// alone. A bare-name text match against a common method name (`Get`,
+// `Run`, `Close`) is the single most likely edge to be a false positive,
+// and counting one as proof of use disarms every safety gate downstream:
+// the symbol reads as live, so genuine dead code hides behind the noise.
+// Speculative edges are worse still — they are hidden from the result an
+// agent sees, so trusting them turns an empty answer into an *uncaveated*
+// empty answer, the exact failure this file exists to prevent.
 //
 // An unknown symbol ID is reported as an extraction gap: a query whose
 // target is not even in the graph is exactly as untrustworthy as one
@@ -133,10 +180,15 @@ func ClassifyZeroEdge(g Store, symbolID string) ZeroEdgeClass {
 	if len(in) == 0 && len(out) == 0 {
 		return ZeroEdgePossibleExtractionGap
 	}
+	weakUsage := false
 	for _, e := range in {
-		if usageEdgeKinds[e.Kind] {
+		if !usageEdgeKinds[e.Kind] {
+			continue
+		}
+		if !IsWeakUsageEvidence(e) {
 			return ZeroEdgeNone
 		}
+		weakUsage = true
 	}
 	if importConsumerCount(g, symbolID) > 0 {
 		return ZeroEdgeCoverageIncomplete
@@ -147,6 +199,12 @@ func ClassifyZeroEdge(g Store, symbolID string) ZeroEdgeClass {
 	// sites reference this name; an empty usage set is a resolution/coverage
 	// gap, not proof the symbol is unused.
 	if hasUnresolvedSameNameCandidates(g, symbolID) {
+		return ZeroEdgeCoverageIncomplete
+	}
+	// Name-only usage edges are evidence of a consumer, just not
+	// trustworthy evidence. They rule out likely_unused (something does
+	// name this symbol) without earning ZeroEdgeNone.
+	if weakUsage {
 		return ZeroEdgeCoverageIncomplete
 	}
 	return ZeroEdgeLikelyUnused
@@ -218,10 +276,56 @@ var zeroEdgeMessages = map[ZeroEdgeClass]string{
 		"unverified, not as proof the symbol is unused.",
 	ZeroEdgeCoverageIncomplete: "no resolved call or reference edges, but the graph " +
 		"still carries consumer evidence — import/re-export edges pointing at this " +
-		"symbol or its file, or unresolved same-name call candidates the resolver / " +
-		"enrichment pass never bound to it. Reference-level resolution is incomplete, " +
-		"so treat this empty result as UNVERIFIED coverage, not as proof the symbol is " +
-		"unused or safe to remove.",
+		"symbol or its file, unresolved same-name call candidates the resolver / " +
+		"enrichment pass never bound to it, or usage edges resolved by name alone. " +
+		"Reference-level resolution is incomplete, so treat this empty result as " +
+		"UNVERIFIED coverage, not as proof the symbol is unused or safe to remove.",
+}
+
+// weakUsageEvidenceMessage is the caveat text for a NON-empty result whose
+// every row is a name-only match. The result is not empty, so the other
+// messages' "this empty result" framing would misdescribe it; what the
+// agent needs to know is that the rows it can see are the untrustworthy
+// tier and may all be false positives.
+const weakUsageEvidenceMessage = "every usage below is a name-only match (the " +
+	"text_matched tier) — no type system, LSP provider, or unambiguous AST binding " +
+	"corroborates any of them, so a symbol with a common name collects unrelated " +
+	"call sites here. Treat this as UNVERIFIED coverage in both directions: it is " +
+	"not proof the symbol is used, and the listed callers may not be real. Confirm " +
+	"with a text search for the symbol name before relying on either reading."
+
+// WeakUsageEvidenceOnly reports whether a materialised result consists
+// entirely of weak usage evidence — at least one usage edge, every one of
+// them name-only (see IsWeakUsageEvidence). Non-usage edge kinds are
+// ignored so a structural edge riding along in the subgraph cannot mask
+// the verdict.
+//
+// This is the non-empty counterpart to ClassifyZeroEdge, for callers that
+// already hold the edge list: it reaches the same conclusion from edges in
+// hand instead of re-reading the graph.
+func WeakUsageEvidenceOnly(edges []*Edge) bool {
+	weak := false
+	for _, e := range edges {
+		if e == nil || !usageEdgeKinds[e.Kind] {
+			continue
+		}
+		if !IsWeakUsageEvidence(e) {
+			return false
+		}
+		weak = true
+	}
+	return weak
+}
+
+// CaveatForWeakUsageEvidence is the caveat for a non-empty result whose
+// every usage row is a name-only match. It carries
+// ZeroEdgeCoverageIncomplete so a safety gate already branching on that
+// class trips here too, with wording that fits a populated result.
+func CaveatForWeakUsageEvidence() *ZeroEdgeCaveat {
+	return &ZeroEdgeCaveat{
+		Class:   ZeroEdgeCoverageIncomplete,
+		Message: weakUsageEvidenceMessage,
+	}
 }
 
 // zeroEdgeNotFoundMessage is the caveat text when the queried id is not in

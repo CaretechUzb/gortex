@@ -76,6 +76,16 @@ func (s *Server) gcxResponseWithBudget(req mcp.CallToolRequest) func([]byte, err
 func newGCX(w *bytes.Buffer, tool string, fields []string, metaKV ...string) *wire.Encoder {
 	meta := map[string]string{}
 	for i := 0; i+1 < len(metaKV); i += 2 {
+		// A GCX header is a space-separated run of key=value tokens and the
+		// wire escaper does not encode spaces, so a value containing one
+		// splits into a token with no "=" and the decoder rejects the whole
+		// payload — losing the rows as well as the meta. Prose therefore
+		// cannot ride the header: emit it as a section row (see
+		// writeNotesSection). Dropping the pair here is the backstop that
+		// keeps a payload decodable if a new prose meta slips in.
+		if strings.ContainsAny(metaKV[i], " \t\n") || strings.ContainsAny(metaKV[i+1], " \t\n") {
+			continue
+		}
 		meta[metaKV[i]] = metaKV[i+1]
 	}
 	return wire.NewEncoder(w, wire.Header{
@@ -374,14 +384,58 @@ func encodeBatchSymbols(rows []map[string]any, includeSource bool) ([]byte, erro
 	return buf.Bytes(), enc.Close()
 }
 
-// zeroEdgeCaveatMeta renders a zero-edge caveat as GCX header meta
-// key/value pairs (caveat + caveat_message). Returns nil when the
-// caveat is absent so a non-empty result carries no extra meta.
+// zeroEdgeCaveatMeta renders a zero-edge caveat's machine-checkable class
+// as a GCX header meta pair. Returns nil when the caveat is absent so an
+// uncaveated result carries no extra meta.
+//
+// The prose message is deliberately NOT here — it rides the
+// `<tool>.notes` section instead. It used to be emitted as
+// `caveat_message=<sentence>`, which made every caveated GCX payload
+// undecodable (see newGCX), so the safety wording an agent needs before
+// deleting a symbol was silently destroyed by the very format meant to
+// deliver it compactly.
 func zeroEdgeCaveatMeta(c *graph.ZeroEdgeCaveat) []string {
 	if c == nil {
 		return nil
 	}
-	return []string{"caveat", string(c.Class), "caveat_message", c.Message}
+	return []string{"caveat", string(c.Class)}
+}
+
+// writeNotesSection emits a `<tool>.notes` section carrying the prose an
+// agent has to read alongside the rows: the zero-edge / weak-evidence
+// classification, the note explaining hidden text matches, and the
+// related-tools discovery cue. `kind` names the channel, `class` carries
+// the machine-checkable ZeroEdgeClass on the caveat row, `message` the
+// sentence. Nothing is written when the result carries none of them, so
+// unannotated payloads keep their existing bytes.
+//
+// Prose belongs in rows rather than header meta because a row value is
+// tab-delimited and properly escaped, while a header value cannot contain
+// a space at all. The related-tools cue is here rather than in the header
+// for a second reason: markCueOnce spends its once-per-session budget
+// before the encoder runs, so a cue dropped at encode time is never
+// re-emitted.
+func writeNotesSection(buf *bytes.Buffer, tool string, sg *query.SubGraph) error {
+	if sg == nil || (sg.Caveat == nil && sg.SuppressionCaveat == "" && sg.RelatedTools == "") {
+		return nil
+	}
+	enc := newGCX(buf, tool+".notes", []string{"kind", "class", "message"})
+	if sg.Caveat != nil {
+		if err := enc.WriteRow("caveat", string(sg.Caveat.Class), sg.Caveat.Message); err != nil {
+			return err
+		}
+	}
+	if sg.SuppressionCaveat != "" {
+		if err := enc.WriteRow("text_matched_suppressed", "", sg.SuppressionCaveat); err != nil {
+			return err
+		}
+	}
+	if sg.RelatedTools != "" {
+		if err := enc.WriteRow("related_tools", "", sg.RelatedTools); err != nil {
+			return err
+		}
+	}
+	return enc.Close()
 }
 
 // tierFilteredCaveatMeta lowers a min_tier-filtered caveat into GCX meta so a
@@ -407,12 +461,6 @@ func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
 	meta = append(meta, tierFilteredCaveatMeta(sg.TierFiltered)...)
 	if sg.TextMatchedSuppressed > 0 {
 		meta = append(meta, "text_matched_suppressed", fmt.Sprintf("%d", sg.TextMatchedSuppressed))
-	}
-	if sg.SuppressionCaveat != "" {
-		meta = append(meta, "suppression_caveat", sg.SuppressionCaveat)
-	}
-	if sg.RelatedTools != "" {
-		meta = append(meta, "related_tools", sg.RelatedTools)
 	}
 	if s := sg.UsageSummary; s != nil {
 		// Completeness rollup, same three numbers as the JSON / TOON
@@ -462,7 +510,13 @@ func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return buf.Bytes(), enc.Close()
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	if err := writeNotesSection(&buf, "find_usages", sg); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // encodeSubGraph is a shared encoder for the edge-returning traversal
@@ -515,12 +569,6 @@ func encodeSubGraph(tool string, sg *query.SubGraph) ([]byte, error) {
 	if sg.TextMatchedSuppressed > 0 {
 		edgeMeta = append(edgeMeta, "text_matched_suppressed", fmt.Sprintf("%d", sg.TextMatchedSuppressed))
 	}
-	if sg.SuppressionCaveat != "" {
-		edgeMeta = append(edgeMeta, "suppression_caveat", sg.SuppressionCaveat)
-	}
-	if sg.RelatedTools != "" {
-		edgeMeta = append(edgeMeta, "related_tools", sg.RelatedTools)
-	}
 	edgeEnc := newGCX(&buf, tool+".edges",
 		// line + file_path on the edge let the caller distinguish two
 		// call sites with the same (from, to, kind). Without them
@@ -550,6 +598,9 @@ func encodeSubGraph(tool string, sg *query.SubGraph) ([]byte, error) {
 		}
 	}
 	if err := edgeEnc.Close(); err != nil {
+		return nil, err
+	}
+	if err := writeNotesSection(&buf, tool, sg); err != nil {
 		return nil, err
 	}
 	// caller_notes — one row per caller carrying a concurrency flag. Emitted
@@ -1556,12 +1607,17 @@ func encodeSmartContext(result map[string]any) ([]byte, error) {
 	}
 
 	if br, ok := result["blast_radius"].(map[string]any); ok {
-		warning := str(br["warning"])
 		callerGroups, _ := br["callers_by_file"].([]map[string]any)
+		callerMeta := []string{"count", fmt.Sprintf("%d", len(callerGroups))}
+		// Header values are single tokens, so a flag stands in for the
+		// sentence the JSON envelope spells out — the same substitution
+		// analyze.impact.target makes for zero_dependents_unproven.
+		if str(br["warning"]) != "" {
+			callerMeta = append(callerMeta, "no_covering_tests", "true")
+		}
 		callerEnc := newGCX(&buf, "smart_context.blast_callers",
 			[]string{"file", "callers"},
-			"count", fmt.Sprintf("%d", len(callerGroups)),
-			"warning", warning,
+			callerMeta...,
 		)
 		for _, g := range callerGroups {
 			ids, _ := g["callers"].([]string)

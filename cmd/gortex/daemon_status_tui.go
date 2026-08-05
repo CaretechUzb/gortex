@@ -46,12 +46,18 @@ type repoItem struct {
 	nodes     int
 	edges     int
 	path      string
+	// state names an inventory problem — "MISSING — path deleted" or
+	// "not indexed" — and replaces the counts cell when set. A repo
+	// whose directory is gone renders as a row of zeros otherwise,
+	// which reads as an empty repo rather than an absent one (#312).
+	state string
 }
 
 func (r repoItem) FilterValue() string {
 	// Concatenate every searchable field so users can match by name,
-	// workspace, or path fragment via the bubbles list's `/` filter.
-	return r.name + " " + r.workspace + " " + r.path
+	// workspace, path fragment, or inventory state (`/MISSING`) via the
+	// bubbles list's `/` filter.
+	return r.name + " " + r.workspace + " " + r.path + " " + r.state
 }
 
 type repoDelegate struct{ width int }
@@ -87,6 +93,11 @@ func (d repoDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	}
 
 	stats := fmt.Sprintf("%4df · %9sn · %9se", r.files, humanizeInt(r.nodes), humanizeInt(r.edges))
+	if r.state != "" {
+		// Padded to the counts cell's natural width so the path column
+		// below stays aligned with every other row.
+		stats = fmt.Sprintf("%-31s", r.state)
+	}
 	row := fmt.Sprintf("%-*s  %-*s  %*s   %s",
 		nameW, truncate(r.name, nameW),
 		wsW, truncate(r.workspace, wsW),
@@ -98,6 +109,19 @@ func (d repoDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	}
 
 	fmt.Fprint(w, cursor+style.Render(row))
+}
+
+// repoItemState renders a tracked repo's inventory problem for the watch
+// TUI, or "" for a healthy repo (which shows its counts instead).
+func repoItemState(r daemon.TrackedRepoStatus) string {
+	switch {
+	case r.Missing:
+		return "MISSING — path deleted"
+	case r.Unloaded:
+		return "not indexed"
+	default:
+		return ""
+	}
 }
 
 // ---- model -------------------------------------------------------------
@@ -194,6 +218,7 @@ func (m statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				nodes:     r.Nodes,
 				edges:     r.Edges,
 				path:      r.Path,
+				state:     repoItemState(r),
 			})
 		}
 		// Sort by total memory desc — biggest repos first, like top.

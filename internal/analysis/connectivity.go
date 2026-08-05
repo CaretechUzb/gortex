@@ -111,11 +111,12 @@ const connectivityNote = "Connectivity health is a graph-EXTRACTION diagnostic, 
 // negative value for no cap.
 //
 // Backends that implement graph.NodeDegreeAggregator serve every
-// per-node count from one bulk pass; the fallback path runs
-// the legacy per-node GetInEdges + GetOutEdges + ClassifyZeroEdge
-// trio. The arithmetic is identical either way — the capability
-// inlines ClassifyZeroEdge's "no incoming usage edge" check into the
-// same row.
+// per-node count from one bulk pass; the fallback path runs the legacy
+// per-node GetInEdges + GetOutEdges trio. The arithmetic is identical
+// either way — this analyzer needs only the in/out totals, which is
+// why a kind-only aggregate row suffices. It deliberately does NOT
+// reproduce ClassifyZeroEdge: that classifier also weighs each usage
+// edge's provenance, which no edge-count row can express.
 func GraphConnectivity(g graph.Store, nodes []*graph.Node, fileLimit int) GraphConnectivityReport {
 	report := GraphConnectivityReport{Note: connectivityNote}
 	if g == nil {

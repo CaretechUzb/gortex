@@ -94,6 +94,11 @@ type repoStatus struct {
 	// counts as fresh when its commit matches HEAD — this is provenance,
 	// not a staleness signal.
 	IndexedDirty bool `json:"indexed_dirty,omitempty"`
+	// Missing is true when Path no longer names a directory on disk.
+	// Such an entry outlives the checkout it points at and can never
+	// go fresh again, so it is reported as its own state rather than
+	// collapsing into "stale" behind an empty HEAD (#312).
+	Missing bool `json:"missing,omitempty"`
 }
 
 func runRepos(cmd *cobra.Command, _ []string) error {
@@ -182,6 +187,11 @@ func describeRepo(store persistence.Store, indexStates map[string]graph.RepoInde
 		// Default to stale; cleared below only when a recorded
 		// index is found whose commit matches HEAD.
 		Stale: true,
+		// A deleted checkout is why HEAD came back empty above. Record
+		// the cause so the table can say so instead of leaving the user
+		// to infer it from "(none)" — the ghost in #312 sat unflagged
+		// for eight days on exactly that inference.
+		Missing: config.RepoPathMissing(r.Path),
 	}
 
 	// Primary: the daemon's freshness row for this repo's prefix.
@@ -273,10 +283,42 @@ func renderReposTable(cmd *cobra.Command, entries []repoStatus) error {
 	}
 	t.Render()
 
+	emitReposMissingHint(stderr, entries)
 	if tty {
 		emitReposSummary(stderr, entries)
 	}
 	return nil
+}
+
+// emitReposMissingHint names every tracked repo whose directory is gone
+// and the command that removes it.
+//
+// On stderr, unconditionally — not gated on a TTY like the banner and
+// stat strip. Those are decoration; this is the one thing in the output
+// a user has to act on, so a scripted `gortex repos | grep …` must still
+// see it, and putting it on stdout would inject `gortex untrack <path>`
+// lines into the table that same pipeline parses. Scripted callers read
+// the `missing` field from --json instead.
+func emitReposMissingHint(w interface{ Write([]byte) (int, error) }, entries []repoStatus) {
+	var gone []repoStatus
+	for _, e := range entries {
+		if e.Missing {
+			gone = append(gone, e)
+		}
+	}
+	if len(gone) == 0 {
+		return
+	}
+	subject := "repo no longer exists"
+	if len(gone) > 1 {
+		subject = "repos no longer exist"
+	}
+	fmt.Fprintf(w, "\n!! %d tracked %s on disk — the path was deleted, renamed, or unmounted.\n",
+		len(gone), subject)
+	fmt.Fprintln(w, "   They can never be re-indexed. Drop each from the inventory with:")
+	for _, e := range gone {
+		fmt.Fprintf(w, "     gortex untrack %s\n", e.Path)
+	}
 }
 
 // emitReposBanner prints the gortex mesh banner on stderr above the table.
@@ -296,9 +338,13 @@ func emitReposBanner(w interface{ Write([]byte) (int, error) }) {
 // emitReposSummary appends a stat strip below the table: total / fresh /
 // stale / never-indexed counts so the eye gets the headline at a glance.
 func emitReposSummary(w interface{ Write([]byte) (int, error) }, entries []repoStatus) {
-	fresh, stale, never := 0, 0, 0
+	fresh, stale, never, missing := 0, 0, 0, 0
 	for _, e := range entries {
 		switch {
+		// Missing wins over every freshness bucket: the entry has no
+		// checkout left to be fresh or stale about.
+		case e.Missing:
+			missing++
 		case !e.Indexed:
 			never++
 		case e.Stale:
@@ -316,6 +362,9 @@ func emitReposSummary(w interface{ Write([]byte) (int, error) }, entries []repoS
 	}
 	if never > 0 {
 		stats = append(stats, progress.Stat(strconv.Itoa(never), "never indexed", progress.StatBad))
+	}
+	if missing > 0 {
+		stats = append(stats, progress.Stat(strconv.Itoa(missing), "missing", progress.StatBad))
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  "+progress.StatStrip(stats...))
@@ -351,6 +400,12 @@ func freshnessCell(e repoStatus, tty bool) string {
 	label := "fresh"
 	style := progress.StyleOK
 	switch {
+	// Checked first: a deleted checkout is why HEAD is empty, and
+	// "stale" would read as "re-index me" for a repo that cannot be
+	// re-indexed at all.
+	case e.Missing:
+		label = "MISSING"
+		style = progress.StyleErr
 	case !e.Indexed:
 		label = "not indexed"
 		style = progress.StyleErr
