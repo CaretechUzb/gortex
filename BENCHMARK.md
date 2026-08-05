@@ -173,6 +173,10 @@ Substrate: `bench/wire-format/`
 | smart_context      | 10 | 1.5ms  | 24.2ms  | 24.2ms  | 6.0ms  | 24.2ms  |
 | get_repo_outline   | 50 | 60.6ms | 217.0ms | 377.0ms | 79.3ms | 377.0ms |
 
+_These timings were measured on the retired in-memory backend; the
+harness now builds a SQLite store, so they are pending re-measurement
+against it._
+
 **Headline**: median p95 across tools is **5.5 ms**, median p99 is
 **5.9 ms**. The heavy outliers (`smart_context`, `get_repo_outline`)
 sit at hundreds of ms; everything else is single-digit ms or

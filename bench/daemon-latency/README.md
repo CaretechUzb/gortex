@@ -94,6 +94,9 @@ handler arithmetic, not target lookup.
 - Cold-cache effects show up most in `search_symbols` (BM25
   re-ranks under load) and `smart_context` (assembles fresh
   context each call). Warm-up reduces but doesn't eliminate them.
+- The smoke run below was measured on the retired in-memory backend;
+  the harness now builds a SQLite store, so the numbers are pending
+  re-measurement against it.
 - Smoke run on the gortex repo (71k nodes, Apple M3 Max):
   - `graph_stats` p50 4.2ms · p95 5.5ms
   - `search_symbols` p50 1.2ms · p95 22.4ms
