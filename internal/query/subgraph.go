@@ -39,10 +39,13 @@ type SubGraph struct {
 	// surfaces without repeating. Empty (omitted) when nothing matched or the
 	// cue was already shown this session.
 	RelatedTools string `json:"related_tools,omitempty"`
-	// Caveat is attached only when an edge-returning query (find_usages,
-	// get_callers) comes back with no edges, classifying whether the
-	// empty result reflects genuinely unused code or an extraction gap.
-	// Nil — and omitted from the response — for any non-empty result.
+	// Caveat marks an edge-returning query (find_usages, get_callers)
+	// whose answer must not be taken at face value. Two cases produce
+	// one: the result came back with no edges, classifying whether that
+	// reflects genuinely unused code or an extraction/coverage gap; or
+	// the result is populated but every usage in it is a name-only
+	// match, so the rows may all be false positives. Nil — and omitted
+	// from the response — for any result carrying real usage evidence.
 	Caveat *graph.ZeroEdgeCaveat `json:"caveat,omitempty"`
 	// TierFiltered is attached when a min_tier filter dropped edges while
 	// lower-tier edges still existed — so a min_tier that empties the result

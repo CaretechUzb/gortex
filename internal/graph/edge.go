@@ -918,6 +918,30 @@ const (
 	provWeightASTInferred = 0.8 // heuristic type inference: slight discount
 )
 
+// EffectiveOrigin returns the provenance tier to judge this edge by:
+// Origin when the producer stamped one, otherwise the DefaultOriginFor
+// backfill from kind + confidence + semantic_source.
+//
+// Reading e.Origin raw is almost always a bug. Most stored edges predate
+// per-provider Origin stamping — in a 3.4M-edge graph, 141k resolved
+// `calls` edges carry no Origin at all — and OriginRank maps the empty
+// string to 0, below even OriginSpeculative. So a raw read silently sorts
+// the single largest bucket of call edges *beneath* the weakest tagged
+// tier. The backfill is also what agents are shown: enrichSubGraphEdges
+// stamps the wire `origin` this way, so gating on EffectiveOrigin keeps a
+// decision consistent with the provenance the same edge is displayed with.
+// A nil edge reports the trusted baseline.
+func (e *Edge) EffectiveOrigin() string {
+	if e == nil {
+		return OriginASTResolved
+	}
+	if e.Origin != "" {
+		return e.Origin
+	}
+	sem, _ := e.Meta["semantic_source"].(string)
+	return DefaultOriginFor(e.Kind, e.Confidence, sem)
+}
+
 // ProvenanceWeight returns the centrality weight for an edge based on
 // its resolution provenance, in [ProvenanceWeightMin, ProvenanceWeightMax].
 // Edges with an unset Origin are backfilled via DefaultOriginFor so
@@ -927,12 +951,7 @@ func ProvenanceWeight(e *Edge) float64 {
 	if e == nil {
 		return ProvenanceWeightMax
 	}
-	origin := e.Origin
-	if origin == "" {
-		sem, _ := e.Meta["semantic_source"].(string)
-		origin = DefaultOriginFor(e.Kind, e.Confidence, sem)
-	}
-	switch origin {
+	switch e.EffectiveOrigin() {
 	case OriginLSPResolved, OriginLSPDispatch:
 		return provWeightLSP
 	case OriginASTResolved:

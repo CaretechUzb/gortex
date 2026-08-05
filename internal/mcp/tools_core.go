@@ -760,10 +760,7 @@ func qualifiedName(n *graph.Node) string {
 func enrichSubGraphEdges(sg *query.SubGraph) {
 	for _, e := range sg.Edges {
 		e.ConfidenceLabel = graph.ConfidenceLabelFor(e.Kind, e.Confidence)
-		if e.Origin == "" {
-			src, _ := e.Meta["semantic_source"].(string)
-			e.Origin = graph.DefaultOriginFor(e.Kind, e.Confidence, src)
-		}
+		e.Origin = e.EffectiveOrigin()
 		e.Tier = graph.ResolvedBy(e.Origin)
 		if e.Meta != nil {
 			if v, _ := e.Meta["via"].(string); v != "" {
@@ -2403,8 +2400,20 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 	}
 	enrichSubGraphEdges(sg)
 	annotateCallerConcurrency(eng.Reader(), sg, id)
-	if len(sg.Edges) == 0 {
+	if len(sg.Edges) == 0 && sg.TierFiltered == nil {
+		// A tier_filtered emptiness is not "no callers" — FilterByMinTier
+		// already recorded why, and the caller's own min_tier is what
+		// removed them. Classifying on top would double-report it, and
+		// now that classification weighs provenance it would report the
+		// very tier the caller asked to exclude.
 		sg.Caveat = graph.CaveatForZeroEdge(s.graph, id)
+	} else if len(sg.Edges) > 0 && graph.WeakUsageEvidenceOnly(sg.Edges) {
+		// Populated, but every caller is a bare-name match — the shape a
+		// common method name (`Get`, `Run`, `Close`) produces. Left
+		// uncaveated this reads as proof the symbol is live, which is
+		// exactly how genuine dead code hides. Judged from the edges
+		// already in hand, so no extra graph reads on the hot path.
+		sg.Caveat = graph.CaveatForWeakUsageEvidence()
 	}
 	// Epistemic lower bound: a caller walk over in-edges cannot see callers
 	// that reach this symbol through interface dispatch the resolver left
@@ -2669,6 +2678,12 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 		// already recorded why. Only reach for the extraction-gap / unused
 		// classification when the emptiness was NOT caused by min_tier.
 		sg.Caveat = graph.CaveatForZeroEdge(s.graph, id)
+	} else if len(sg.Edges) > 0 && graph.WeakUsageEvidenceOnly(sg.Edges) {
+		// Populated, but every usage is a bare-name match — the shape a
+		// common symbol name produces. Left uncaveated this reads as proof
+		// the symbol is live, which is exactly how genuine dead code hides.
+		// Judged from the edges already in hand, so no extra graph reads.
+		sg.Caveat = graph.CaveatForWeakUsageEvidence()
 	}
 	// Completeness rollup (n_refs / n_files / n_test_refs) so an agent can
 	// tell at a glance whether the usage list already covers tests instead
