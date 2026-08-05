@@ -435,11 +435,26 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				return
 			}
 			done = true
+			// The initializer must BE the await (parens aside): in
+			// `var w = (await Load()).Weigh()` the local holds Weigh's
+			// return, and stamping the awaited T would hand the
+			// resolver a confident wrong answer.
+			for p := n.Parent(); p != nil; p = p.Parent() {
+				switch p.Type() {
+				case "parenthesized_expression":
+					continue
+				case "equals_value_clause", "variable_declarator":
+					// direct initializer — accept
+				default:
+					return // nested inside a longer expression
+				}
+				break
+			}
 			inner := n.NamedChild(0)
 			if inner == nil {
 				return
 			}
-			if t := csharpAwaitedCallType(inner.Content(src), tenvByOwner[owner], result); t != "" {
+			if t := csharpAwaitedCallType(inner.Content(src), csharpOwnerTypeName(owner), tenvByOwner[owner], result); t != "" {
 				setLocalType(owner, l.name, t)
 			}
 		})
@@ -561,7 +576,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				// `(await LoadAsync()).X()` — the chain walker collapses a
 				// fully-parenthesized receiver to nothing; the receiver is
 				// the T inside the awaited call's Task<T>.
-				if t := csharpAwaitedCallType(inner, tenvByOwner[callerID], result); t != "" {
+				if t := csharpAwaitedCallType(inner, csharpOwnerTypeName(callerID), tenvByOwner[callerID], result); t != "" {
 					edge.Meta = map[string]any{"receiver_type": t}
 				}
 			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
@@ -1828,7 +1843,10 @@ func csharpAwaitedReceiver(recv string) string {
 // prefix through the shared chain walker first; the final hop reads the
 // lossless return_shape because the normalized return_type has already
 // dropped the generic argument — which is exactly the awaited T.
-func csharpAwaitedCallType(expr string, tenv typeEnv, result *parser.ExtractionResult) string {
+// enclosing is the caller's own type: it anchors unqualified and
+// this-qualified calls so a same-named method on an unrelated sibling
+// class never leaks its return shape in.
+func csharpAwaitedCallType(expr, enclosing string, tenv typeEnv, result *parser.ExtractionResult) string {
 	expr = strings.TrimSpace(expr)
 	// Split the final segment off at the last depth-0 dot; the raw prefix
 	// text keeps its call parens so factory-chain seeding still works.
@@ -1847,25 +1865,33 @@ func csharpAwaitedCallType(expr string, tenv typeEnv, result *parser.ExtractionR
 	}
 	if cut < 0 {
 		name := stripCallArgs(expr)
-		return csharpUnwrapTaskType(csharpCallableReturnShape("", name, result))
+		return csharpUnwrapTaskType(csharpCallableReturnShape("", enclosing, name, result))
 	}
 	name := stripCallArgs(expr[cut+1:])
-	recvType := resolveChainType(expr[:cut], tenv, result)
-	if recvType == "" && isKnownType(expr[:cut], result) {
-		recvType = expr[:cut] // static call on a type: `Repo.LoadAsync()`
+	var recvType string
+	switch prefix := expr[:cut]; {
+	case prefix == "this":
+		recvType = enclosing
+	default:
+		recvType = resolveChainType(prefix, tenv, result)
+		if recvType == "" && isKnownType(prefix, result) {
+			recvType = prefix // static call on a type: `Repo.LoadAsync()`
+		}
 	}
 	if name == "" || recvType == "" {
 		return ""
 	}
-	return csharpUnwrapTaskType(csharpCallableReturnShape(recvType, name, result))
+	return csharpUnwrapTaskType(csharpCallableReturnShape(recvType, "", name, result))
 }
 
 // csharpCallableReturnShape finds the declared return shape of a callable
-// named name — on receiverType when given, else receiver-agnostically (an
-// unqualified call inside a method body), where a receiver-less free
-// function wins over a same-named method.
-func csharpCallableReturnShape(receiverType, name string, result *parser.ExtractionResult) string {
-	var fallback string
+// named name. With a receiverType, only an exact receiver match counts.
+// Without one (an unqualified call inside a method body) the enclosing
+// class's own member wins, then a receiver-less free function — never an
+// arbitrary same-named method off an unrelated class, whose shape would
+// ride into receiver_type as a confident wrong answer.
+func csharpCallableReturnShape(receiverType, enclosing, name string, result *parser.ExtractionResult) string {
+	var free string
 	for _, n := range result.Nodes {
 		if n == nil || (n.Kind != graph.KindMethod && n.Kind != graph.KindFunction) || n.Name != name {
 			continue
@@ -1884,14 +1910,29 @@ func csharpCallableReturnShape(receiverType, name string, result *parser.Extract
 			}
 			continue
 		}
-		if recv == "" {
+		if enclosing != "" && recv == enclosing {
 			return shape
 		}
-		if fallback == "" {
-			fallback = shape
+		if recv == "" && free == "" {
+			free = shape
 		}
 	}
-	return fallback
+	return free
+}
+
+// csharpOwnerTypeName extracts the enclosing type's simple name from a
+// symbol owner ID ("file.cs::Outer.Inner.Method" → "Inner"); "" for a
+// top-level function.
+func csharpOwnerTypeName(ownerID string) string {
+	idx := strings.LastIndex(ownerID, "::")
+	if idx < 0 {
+		return ""
+	}
+	parts := strings.Split(ownerID[idx+2:], ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-2]
 }
 
 // csharpUnwrapTaskType strips the Task<>/ValueTask<> wrapper from a return
