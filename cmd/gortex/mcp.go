@@ -6,8 +6,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/indexer"
@@ -38,6 +40,7 @@ var (
 	mcpNoSemantic      bool
 	mcpSemanticMode    string
 	mcpNoDaemon        bool
+	mcpNoCache         bool
 	mcpForceProxy      bool
 	mcpTools           string
 	mcpToolsMode       string
@@ -61,7 +64,7 @@ func init() {
 	mcpCmd.Flags().StringVar(&mcpCORSOrigin, "cors-origin", "*", "allowed CORS origin for server API")
 	mcpCmd.Flags().StringSliceVar(&mcpTrack, "track", nil, "additional repository paths to track")
 	mcpCmd.Flags().StringVar(&mcpProject, "project", "", "active project name")
-	mcpCmd.Flags().StringVar(&mcpCacheDir, "cache-dir", "", "graph cache directory (default ~/.gortex/cache/)")
+	mcpCmd.Flags().StringVar(&mcpCacheDir, "cache-dir", "", "directory for the side stores — notes, feedback, server id (default ~/.gortex/cache/)")
 	mcpCmd.Flags().BoolVar(&mcpEmbeddings, "embeddings", false, "enable semantic search (built-in word vectors or transformer if compiled in)")
 	mcpCmd.Flags().StringVar(&mcpEmbeddingsURL, "embeddings-url", "", "embedding API URL (e.g. http://localhost:11434 for Ollama)")
 	mcpCmd.Flags().StringVar(&mcpEmbeddingsModel, "embeddings-model", "", "embedding model name (default: auto-detect)")
@@ -69,6 +72,10 @@ func init() {
 	mcpCmd.Flags().BoolVar(&mcpNoSemantic, "no-semantic", false, "disable semantic enrichment")
 	mcpCmd.Flags().StringVar(&mcpSemanticMode, "semantic-mode", "typecheck", "Go analysis mode: typecheck or callgraph")
 	mcpCmd.Flags().BoolVar(&mcpNoDaemon, "no-daemon", false, "deprecated no-op (warns when set); the embedded server is used automatically when no daemon is available")
+	mcpCmd.Flags().BoolVar(&mcpNoCache, "no-cache", false, "deprecated no-op (warns when set); the graph is served from the sqlite store, which has no separate cache to disable")
+	// Hidden rather than removed: an editor config that still passes the flag
+	// must keep starting, but nothing should learn it from --help.
+	_ = mcpCmd.Flags().MarkHidden("no-cache")
 	mcpCmd.Flags().BoolVar(&mcpForceProxy, "proxy", false, "require a running daemon and proxy through it (error if unavailable)")
 	mcpCmd.Flags().StringVar(&mcpTools, "tools", "", "restrict the published MCP tool surface to a preset: core (default)|full|readonly|edit|nav (optionally with ,+tool / ,-tool deltas). GORTEX_TOOLS overrides this")
 	mcpCmd.Flags().StringVar(&mcpToolsMode, "tools-mode", "", "how a --tools preset hides tools: hide (remove from tools/list + block calls) or defer (keep reachable via tools_search). Default hide")
@@ -77,20 +84,72 @@ func init() {
 
 var legacyMCPFlagsWarned bool
 
-// warnLegacyMCPFlags emits one stderr line per explicitly-set legacy flag
-// (--index/--watch/--proxy/--no-daemon). These are permanent no-op compat
-// shims for un-migrated on-disk editor configs. stderr only — stdout is
-// the MCP JSON-RPC stream and a stray byte corrupts the protocol.
+// legacyMCPProxyReason explains the flags the daemon-first startup path
+// retired: the mode decision comes from daemon presence plus GORTEX_AUTOSTART,
+// never from a flag.
+const legacyMCPProxyReason = "`gortex mcp` proxies to the daemon (auto-starting it) " +
+	"and falls back to an embedded server"
+
+// legacyMCPFlags are the retired `gortex mcp` flags kept as permanent no-op
+// compat shims, each with the reason it stopped doing anything. Removing one
+// is not an option: on-disk editor configs are never migrated and cobra hard-
+// errors on an unknown flag, so a deletion turns a stale mcp.json into a
+// server that will not start. Order fixes the warning order.
+var legacyMCPFlags = []struct{ name, reason string }{
+	{"index", legacyMCPProxyReason},
+	{"watch", legacyMCPProxyReason},
+	{"proxy", legacyMCPProxyReason},
+	{"no-daemon", legacyMCPProxyReason},
+	{"no-cache", "the graph is served from the sqlite store, which has no separate cache to disable"},
+}
+
+// warnLegacyMCPFlags emits one stderr line per explicitly-set legacy flag.
+// stderr only — stdout is the MCP JSON-RPC stream and a stray byte corrupts
+// the protocol.
 func warnLegacyMCPFlags(cmd *cobra.Command) {
 	if legacyMCPFlagsWarned {
 		return
 	}
 	legacyMCPFlagsWarned = true
-	for _, name := range []string{"index", "watch", "proxy", "no-daemon"} {
-		if f := cmd.Flags().Lookup(name); f != nil && f.Changed {
-			fmt.Fprintf(os.Stderr, "[gortex] note: --%s is deprecated and ignored on the proxy path; "+
-				"`gortex mcp` proxies to the daemon (auto-starting it) and falls back to an embedded server.\n", name)
+	for _, lf := range legacyMCPFlags {
+		if f := cmd.Flags().Lookup(lf.name); f != nil && f.Changed {
+			fmt.Fprintf(os.Stderr, "[gortex] note: --%s is deprecated and ignored; %s.\n", lf.name, lf.reason)
 		}
+	}
+}
+
+// embeddedStoreDirPattern is the temp-directory name the embedded server's
+// throwaway sqlite store lives in. Shared by the allocator and the reaper.
+const embeddedStoreDirPattern = "gortex-mcp-store-*"
+
+// staleEmbeddedStoreTTL is how long an orphaned embedded-store directory is
+// left alone before a later launch reaps it. Long enough that no plausibly
+// live one-shot server is touched; short enough that the debris does not
+// accumulate.
+const staleEmbeddedStoreTTL = 48 * time.Hour
+
+// reapStaleEmbeddedStores removes embedded-store directories older than
+// staleEmbeddedStoreTTL. The one-shot server deletes its own directory on
+// exit, but a SIGKILL skips that and strands a store that can run to
+// gigabytes. Best effort by design: every error is a debug line, never a
+// reason to fail startup.
+func reapStaleEmbeddedStores(logger *zap.Logger) {
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), embeddedStoreDirPattern))
+	if err != nil {
+		logger.Debug("mcp: could not scan for stale embedded stores", zap.Error(err))
+		return
+	}
+	cutoff := time.Now().Add(-staleEmbeddedStoreTTL)
+	for _, dir := range matches {
+		info, statErr := os.Stat(dir)
+		if statErr != nil || !info.IsDir() || info.ModTime().After(cutoff) {
+			continue
+		}
+		if rmErr := os.RemoveAll(dir); rmErr != nil {
+			logger.Debug("mcp: could not reap stale embedded store", zap.String("dir", dir), zap.Error(rmErr))
+			continue
+		}
+		logger.Debug("mcp: reaped stale embedded store", zap.String("dir", dir))
 	}
 }
 
@@ -99,7 +158,7 @@ func warnLegacyMCPFlags(cmd *cobra.Command) {
 // name. It returns the store path and a func that removes the directory;
 // the caller runs that only after the store handle is closed.
 func newEmbeddedStorePath() (string, func(), error) {
-	dir, err := os.MkdirTemp("", "gortex-mcp-store-*")
+	dir, err := os.MkdirTemp("", embeddedStoreDirPattern)
 	if err != nil {
 		return "", nil, err
 	}
@@ -171,8 +230,8 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// The savings ledger is machine-global — the same sidecar database
 	// every entry point writes and the `gortex savings` CLI reads.
 	// --cache-dir deliberately does NOT relocate it: users set that flag
-	// to move the graph cache, and quietly splitting the ledger away
-	// from the dashboard's default read path recreates the
+	// to move the notes / feedback side stores, and quietly splitting the
+	// ledger away from the dashboard's default read path recreates the
 	// empty-dashboard failure mode. Isolation (tests, sandboxes) comes
 	// from XDG_DATA_HOME / XDG_CACHE_HOME, which both ledger paths
 	// honour.
@@ -181,7 +240,9 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// private temp file: it takes no store lock, so pointing it at the
 	// shared default store would put a second unsynchronised writer on the
 	// daemon's database. Removed on shutdown — the graph is rebuilt from
-	// the tree on every launch.
+	// the tree on every launch. Sweep whatever earlier launches were killed
+	// before they could remove theirs.
+	reapStaleEmbeddedStores(logger)
 	storePath, removeStoreDir, err := newEmbeddedStorePath()
 	if err != nil {
 		return fmt.Errorf("create embedded store: %w", err)

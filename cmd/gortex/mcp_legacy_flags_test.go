@@ -11,20 +11,22 @@ import (
 )
 
 // newLegacyMCPCmd builds a throwaway cobra command carrying the same legacy
-// flag surface `gortex mcp` exposes (--index/--watch/--proxy/--no-daemon),
-// so warnLegacyMCPFlags can be driven without mutating the real mcpCmd.
+// flag surface `gortex mcp` exposes, so warnLegacyMCPFlags can be driven
+// without mutating the real mcpCmd.
 func newLegacyMCPCmd() *cobra.Command {
 	var (
 		index    string
 		watch    bool
 		proxy    bool
 		noDaemon bool
+		noCache  bool
 	)
 	cmd := &cobra.Command{Use: "mcp", RunE: func(*cobra.Command, []string) error { return nil }}
 	cmd.Flags().StringVar(&index, "index", "", "repository path to index on startup")
 	cmd.Flags().BoolVar(&watch, "watch", false, "keep graph in sync with filesystem changes")
 	cmd.Flags().BoolVar(&proxy, "proxy", false, "require a running daemon and proxy through it")
 	cmd.Flags().BoolVar(&noDaemon, "no-daemon", false, "force embedded server")
+	cmd.Flags().BoolVar(&noCache, "no-cache", false, "disable graph caching")
 	return cmd
 }
 
@@ -64,8 +66,16 @@ func TestLegacyFlags_NoError(t *testing.T) {
 	// Every legacy flag set at once, plus its full combination, must parse
 	// without a flag-parse error.
 	allFlagsCmd := newLegacyMCPCmd()
-	if err := allFlagsCmd.ParseFlags([]string{"--index", ".", "--watch", "--proxy", "--no-daemon"}); err != nil {
+	if err := allFlagsCmd.ParseFlags([]string{"--index", ".", "--watch", "--proxy", "--no-daemon", "--no-cache"}); err != nil {
 		t.Fatalf("legacy flag combination must parse without error: %v", err)
+	}
+
+	// The real command must still accept every shimmed flag: an editor
+	// mcp.json is never migrated, and cobra hard-errors on an unknown flag.
+	for _, lf := range legacyMCPFlags {
+		if mcpCmd.Flags().Lookup(lf.name) == nil {
+			t.Fatalf("`gortex mcp` no longer registers the --%s compat shim; a stale editor config would fail to start", lf.name)
+		}
 	}
 
 	cases := []struct {
@@ -77,10 +87,11 @@ func TestLegacyFlags_NoError(t *testing.T) {
 		{"watch only", []string{"--watch"}, []string{"watch"}},
 		{"proxy only", []string{"--proxy"}, []string{"proxy"}},
 		{"no-daemon only", []string{"--no-daemon"}, []string{"no-daemon"}},
+		{"no-cache only", []string{"--no-cache"}, []string{"no-cache"}},
 		{
-			"all four",
-			[]string{"--index", ".", "--watch", "--proxy", "--no-daemon"},
-			[]string{"index", "watch", "proxy", "no-daemon"},
+			"all five",
+			[]string{"--index", ".", "--watch", "--proxy", "--no-daemon", "--no-cache"},
+			[]string{"index", "watch", "proxy", "no-daemon", "no-cache"},
 		},
 		{"none set", []string{}, nil},
 	}
