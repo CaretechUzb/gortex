@@ -121,6 +121,28 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`,
 			},
 			forbid: []string{"nodes_by_repo", "SCAN n", "SCAN e"},
 		},
+		{
+			// store.go stmtOutEdges: the adjacency read declares a total
+			// order so first-match callers agree across backends. It has to
+			// stay free — the ORDER BY leads with edges_by_from_line's second
+			// column and breaks ties on the rowid that index already carries,
+			// so the walk itself satisfies it. A sorter here would tax every
+			// out-edge lookup in the daemon.
+			name:   "out_edges_ordered",
+			query:  `SELECT ` + edgeInsertColumns + ` FROM edges WHERE from_id = ? ORDER BY line, id`,
+			args:   1,
+			want:   []string{"SEARCH edges USING INDEX edges_by_from_line (from_id=?)"},
+			forbid: []string{"SCAN edges", "TEMP B-TREE"},
+		},
+		{
+			// store.go stmtInEdges: same contract on the reverse adjacency,
+			// riding edges_by_to's (to_id, kind) prefix plus the rowid.
+			name:   "in_edges_ordered",
+			query:  `SELECT ` + edgeInsertColumns + ` FROM edges WHERE to_id = ? ORDER BY kind, id`,
+			args:   1,
+			want:   []string{"SEARCH edges USING INDEX edges_by_to (to_id=?)"},
+			forbid: []string{"SCAN edges", "TEMP B-TREE"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -255,8 +277,24 @@ func TestPreparedStatementPlansNeverScanBigTables(t *testing.T) {
 		}
 		// The bare AllNodes/AllEdges exports are whole-table by intent —
 		// matched by exact suffix so nothing with a WHERE clause rides along.
-		if strings.HasSuffix(query, "FROM nodes") || strings.HasSuffix(query, "FROM edges") {
-			allowed = true
+		// Their trailing ORDER BY id is the primary-key walk the scan already
+		// performs (nodes is WITHOUT ROWID on id; edges' id is the rowid), so
+		// it makes the order explicit without adding a sorter — which the
+		// no-temp-b-tree assertion below holds them to.
+		wholeTable := false
+		for _, table := range []string{"nodes", "edges"} {
+			if strings.HasSuffix(query, "FROM "+table) || strings.HasSuffix(query, "FROM "+table+" ORDER BY id") {
+				wholeTable = true
+			}
+		}
+		if wholeTable {
+			for _, detail := range explainPlanTolerant(t, s, query) {
+				if strings.Contains(detail, "TEMP B-TREE") {
+					t.Errorf("whole-table export sorts instead of walking the primary key:\n  %s\nplan step: %s",
+						name, strings.TrimSpace(detail))
+				}
+			}
+			continue
 		}
 		if allowed {
 			continue

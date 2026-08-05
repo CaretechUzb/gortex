@@ -19,5 +19,10 @@ import (
 func TestMemoryStoreConformance(t *testing.T) {
 	storetest.RunConformance(t, func(t *testing.T) graph.Store {
 		return graph.New()
-	}, storetest.Semantics{Reads: storetest.ReadsAliasStore})
+	}, storetest.Semantics{
+		Reads: storetest.ReadsAliasStore,
+		// The empty prefix has never been a bucket here: unprefixed nodes live
+		// outside the per-repository index, so EvictRepo("") returns (0, 0).
+		EvictsEmptyRepoPrefix: false,
+	})
 }

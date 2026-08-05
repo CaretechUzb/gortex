@@ -25,7 +25,12 @@ func TestSQLiteStoreConformance(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = s.Close() })
 		return s
-	}, storetest.Semantics{Reads: storetest.ReadsDetached})
+	}, storetest.Semantics{
+		Reads: storetest.ReadsDetached,
+		// repo_prefix is an ordinary column here, so the empty prefix deletes
+		// the unprefixed (standalone-indexing) namespace like any other.
+		EvictsEmptyRepoPrefix: true,
+	})
 }
 
 func TestSQLiteExistingNodeIDsProjectsOnlyRequestedPresence(t *testing.T) {

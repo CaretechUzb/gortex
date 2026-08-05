@@ -267,9 +267,17 @@ func sqliteReindexMutations(batch []graph.EdgeReindex) ([]sqliteReindexMutation,
 				oldFrom = reindex.OldFrom
 			}
 			oldFilePath, oldLine = reindex.OldFilePath, reindex.OldLine
-		} else if reindex.OldTo == edge.To && oldFrom == edge.From && oldKind == edge.Kind {
-			continue
 		}
+		// An entry whose identity did not move is NOT skipped: it still
+		// carries payload. The resolver's terminal-clearing pass hands edges
+		// back with an unchanged target and a cleared terminal stamp, and
+		// skipping those would leave the stale stamp on the row, keeping the
+		// edge permanently excluded from later resolution.
+		//
+		// Such an entry becomes a mutation whose old and new keys are equal.
+		// The simulator compares it against the stored row and emits writes
+		// only on a real difference, so an idempotent replay still touches
+		// nothing.
 		newRow, err := sqliteReindexRowForEdge(edge)
 		if err != nil {
 			return nil, err
