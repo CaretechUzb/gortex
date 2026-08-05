@@ -612,6 +612,15 @@ type Edge struct {
 	// (original) name, so the alias is the only place the renamed identifier
 	// is recorded. Not part of the edge identity / dedup key.
 	Alias string `json:"alias,omitempty"`
+	// NameOnly marks a synthesized candidate row: a call site that names
+	// the queried symbol but never bound to it, projected onto the symbol
+	// so find_usages / get_callers can report what the graph does not
+	// know. It is NOT a resolved binding and may belong to a different
+	// same-named symbol entirely — the flag is what lets a consumer tell
+	// it apart from a text_matched edge the resolver actually chose. Set
+	// only on the in-memory projection under min_tier:"text_matched";
+	// never persisted, never part of the edge identity / dedup key.
+	NameOnly bool `json:"name_only,omitempty"`
 	// Meta is intentionally excluded from JSON. It holds internal
 	// instrumentation (semantic_source, provider hints, etc.) that agents
 	// don't consume but that adds measurable bytes to every edge in

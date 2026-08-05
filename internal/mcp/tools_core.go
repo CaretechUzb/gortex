@@ -35,6 +35,10 @@ const minTierParamDescription = "Filter edges by minimum confidence tier. " +
 	"pass min_tier:\"text_matched\" to include them. If the target's file was " +
 	"re-parsed after the last enrichment pass, the response also carries " +
 	"suppression_caveat warning the hidden rows may be real. " +
+	"find_usages / get_callers additionally report name_only_candidates: call " +
+	"sites that name the symbol but bound to nothing, so a thin edge list is " +
+	"legible as \"N verified, M unverified\" — min_tier:\"text_matched\" returns " +
+	"those rows too. " +
 	"Use lsp_resolved for high-stakes refactors where false positives are expensive."
 
 const includeSpeculativeParamDescription = "Include best-guess speculative " +
@@ -2398,6 +2402,7 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 		sg.SuppressRedundantTextMatches()
 		s.attachSuppressionCaveat(sg, id)
 	}
+	s.attachNameOnlyCandidates(eng, sg, id, minTier, opts)
 	enrichSubGraphEdges(sg)
 	annotateCallerConcurrency(eng.Reader(), sg, id)
 	if len(sg.Edges) == 0 && sg.TierFiltered == nil {
@@ -2659,6 +2664,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 		sg.SuppressRedundantTextMatches()
 		s.attachSuppressionCaveat(sg, id)
 	}
+	s.attachNameOnlyCandidates(eng, sg, id, minTier, opts)
 	enrichSubGraphEdges(sg)
 	// Classify each usage's reference context (parameter_type / return_type
 	// / field / value / type / attribute / call) and optionally filter to
@@ -2733,6 +2739,32 @@ type usageNode struct {
 type usageResponse struct {
 	*query.SubGraph
 	Nodes []usageNode `json:"nodes"`
+}
+
+// attachNameOnlyCandidates records — and, under an explicit
+// min_tier:"text_matched", returns — the call sites that name id but
+// never bound to it.
+//
+// These sites are real calls the extractor saw and the resolver could not
+// place: they sit on a bare-name `unresolved::` placeholder, so no
+// reverse walk over id's in-edges can see them. Without the count, a
+// symbol whose calls all failed to resolve answers "1 caller" and
+// change_impact reports risk LOW for a change that breaks a dozen files.
+// With it, the same answer reads "1 verified, 22 unverified".
+//
+// The rows stay behind the explicit opt-in because a name match may
+// belong to any same-named symbol; only a caller who asked for the
+// weakest tier has said that is the trade they want.
+func (s *Server) attachNameOnlyCandidates(eng *query.Engine, sg *query.SubGraph, id, minTier string, opts query.QueryOptions) {
+	if sg == nil || eng == nil {
+		return
+	}
+	node := eng.GetSymbol(id)
+	if node == nil {
+		return
+	}
+	cands := eng.FindNameOnlyCandidates(node, sg.Edges, opts)
+	sg.AttachNameOnlyCandidates(cands, minTier == graph.OriginTextMatched)
 }
 
 // attachSuppressionCaveat adds a human-readable rider to sg when the adaptive

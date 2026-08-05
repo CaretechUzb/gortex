@@ -211,18 +211,27 @@ func ClassifyZeroEdge(g Store, symbolID string) ZeroEdgeClass {
 }
 
 // hasUnresolvedSameNameCandidates reports whether the graph holds any
-// unresolved member-call edge (`unresolved::*.<name>`) naming this callable
-// symbol. Unresolved call stubs are indexed by their target string, so this is
-// a single reverse-edge lookup — no scan. Non-callable symbols never match.
+// unresolved call edge naming this callable symbol. All four bare-name
+// placeholder shapes count (see UnresolvedNameCandidateIDs): checking only
+// the member form missed every free-function call, and every call at all in
+// a multi-repo graph, so a symbol whose call sites failed to resolve was
+// classified likely_unused. Unresolved call stubs are indexed by their
+// target string, so each check is a reverse-edge lookup — no scan.
+// Non-callable symbols never match.
 func hasUnresolvedSameNameCandidates(g Store, symbolID string) bool {
 	n := g.GetNode(symbolID)
-	if n == nil || n.Name == "" {
+	if n == nil {
 		return false
 	}
 	if n.Kind != KindFunction && n.Kind != KindMethod {
 		return false
 	}
-	return len(g.GetInEdges(UnresolvedMarker+"*."+n.Name)) > 0
+	for _, id := range UnresolvedNameCandidateIDs(n) {
+		if len(g.GetInEdges(id)) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // importConsumerCount counts the import-level consumer evidence for a

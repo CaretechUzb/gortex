@@ -221,6 +221,42 @@ func IsUnresolvedTarget(id string) bool {
 	return strings.Contains(id, "::"+UnresolvedMarker)
 }
 
+// UnresolvedNameCandidateIDs returns every placeholder target id that a
+// symbol's NAME owns — the ids that unbound call sites naming it park on.
+// Four shapes, because a call site is either a free-function call
+// (`unresolved::Foo`) or a member call (`unresolved::*.foo`), and either
+// may carry the multi-repo `<repoPrefix>::` rewrite.
+//
+// Unresolved edges are indexed by their target string, so each id is a
+// single reverse-edge lookup — GetInEdges over the returned slice is a
+// bounded point query, never a scan.
+//
+// Only bare-name shapes are returned. A placeholder carrying more
+// structure (`unresolved::extern::path::sym`, `import::`, `grpc::`) is
+// owned by a dedicated resolver pass and holds evidence a name match does
+// not; conflating the two would let a name coincidence masquerade as an
+// import-grounded reference.
+func UnresolvedNameCandidateIDs(n *Node) []string {
+	if n == nil || n.Name == "" {
+		return nil
+	}
+	ids := []string{
+		UnresolvedMarker + n.Name,
+		UnresolvedMarker + "*." + n.Name,
+	}
+	prefix := n.RepoPrefix
+	if prefix == "" {
+		prefix = RepoPrefixOfID(n.ID)
+	}
+	if prefix == "" {
+		return ids
+	}
+	return append(ids,
+		prefix+"::"+UnresolvedMarker+n.Name,
+		prefix+"::"+UnresolvedMarker+"*."+n.Name,
+	)
+}
+
 // IsFnValuePlaceholder reports whether id is a fn-value gate placeholder in
 // either the bare `unresolved::fnvalue::<name>` form or the multi-repo
 // `<repoPrefix>::unresolved::fnvalue::<name>` COPY-rewrite form — mirroring
