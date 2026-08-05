@@ -116,6 +116,17 @@ internal/
 pkg/gortex/          Public API for embedding
 ```
 
+## Public API (`pkg/gortex`)
+
+`New` returns `(*Engine, error)` — it opens a SQLite graph store, which can
+fail. Pass `WithStorePath` to keep the store at a path of your choosing and
+reuse the index on the next run; without it the store lives in a temp
+directory.
+
+Every `Engine` must be closed. `Close` checkpoints the write-ahead log, closes
+the database handle, and removes the temp directory when `New` created one —
+skipping it leaks a file handle and a background goroutine.
+
 ## Questions?
 
 Open an issue or start a discussion. We're happy to help!
