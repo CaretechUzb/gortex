@@ -56,6 +56,15 @@ jobs:
       - name: Test Windows agent integrations
         run: go test -timeout=5m -count=1 ./internal/agents
 
+      # Symlink confinement keeps out-of-repo files out of the index, and it
+      # reads differently on Windows: a symlink reparse point maps to
+      # ModeSymlink but a directory junction maps to ModeIrregular, and
+      # evalSymlinks normalises path case where Unix does not. Verifying it
+      # only on the linux/macos matrix would leave the platform whose
+      # semantics differ most as the untested one.
+      - name: Test symlink confinement
+        run: go test -timeout=5m -count=1 ./internal/pathguard
+
       # Windows refuses to unlink an open file, so a leaked sidecar handle
       # pins its directory and fails the enclosing t.TempDir() cleanup. That
       # asymmetry is invisible on the linux/macos matrix, which is why this

@@ -127,7 +127,10 @@ func (s *Server) handleGetArtifact(ctx context.Context, req mcp.CallToolRequest)
 		"content_hash": art.ContentHash,
 		"references":   refs,
 	}
-	if abs, _, err := s.resolveFilePath(art.Path); err == nil {
+	// resolveFilePath blocks lexical `../` traversal but follows symlinks, so
+	// the confinement check every other content-serving tool applies is
+	// required here too before the bytes go into the response.
+	if abs, _, err := s.resolveFilePath(art.Path); err == nil && s.guardSymlinkWithinRepo(abs) == nil {
 		if data, err := os.ReadFile(abs); err == nil { //nolint:gosec // path resolved from the indexed manifest
 			content := data
 			truncated := false

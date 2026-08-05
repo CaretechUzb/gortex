@@ -35,6 +35,7 @@ import (
 	"github.com/zzet/gortex/internal/modules"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/crashpool"
+	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/reach"
@@ -5738,6 +5739,21 @@ var dirIgnoreFiles = []string{".gortexignore", ".ignore", ".rgignore"}
 // present in one of its ancestor directories. isDir lets a trailing-
 // slash pattern prune a directory subtree instead of only its files.
 func (idx *Indexer) shouldExclude(path, root string, isDir bool) bool {
+	// Symlink confinement comes first, ahead of every re-include rule below.
+	// filepath.WalkDir already refuses to descend a symlinked DIRECTORY (it
+	// Lstats, so such an entry is never IsDir), but a symlinked FILE has no
+	// equivalent protection: `pwn.go -> /etc/passwd` matches a registered
+	// extension by name alone and would otherwise be admitted, content and
+	// all, to every tool that reads the corpus. Confinement is against the
+	// owning repo's root, so a link into a *sibling tracked repo* is refused
+	// too — one daemon indexing many repos must not let them read each other.
+	//
+	// Ordering matters: the agent-config branch below re-includes MCP config
+	// files that the builtin excludes drop, so a check placed after it would
+	// let `.claude/mcp.json -> ~/.aws/credentials` slip back in.
+	if !isDir && pathguard.SymlinkEscapes(path, root) {
+		return true
+	}
 	// .claude/ and .kiro/ are Builtin-excluded wholesale, but may hold an
 	// MCP server config the MCP-config-as-graph feature targets (the
 	// extractor's own docs name .kiro/mcp.json). Descend those subtrees
