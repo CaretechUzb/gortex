@@ -44,23 +44,23 @@ const (
 	// LifecycleHTTP is the daemon's HTTP surface (gortex daemon --http):
 	// durable, sqlite default, store lock.
 	LifecycleHTTP
-	// LifecycleOneshot is the ephemeral embedded server: memory-only, no
-	// durable store and no store lock — its graph lives and dies with the
-	// process.
+	// LifecycleOneshot is the ephemeral embedded server: a sqlite store on
+	// a private per-process path that the caller supplies and deletes, and
+	// no store lock — its graph lives and dies with the process.
 	LifecycleOneshot
 )
 
-// Writable reports whether the lifecycle owns a durable on-disk store
-// (and therefore takes the cross-process store lock).
+// Writable reports whether the lifecycle owns a *shared* durable store and
+// therefore takes the cross-process store lock. One-shot is deliberately
+// excluded: it runs against a private temp file no other process can name,
+// so an advisory flock would guard nothing while still making two
+// concurrent `gortex mcp` fallbacks fight over the lock file.
 func (l Lifecycle) Writable() bool { return l == LifecycleDaemon || l == LifecycleHTTP }
 
-// defaultBackend resolves the backend name for an empty cfg.Backend.
-func (l Lifecycle) defaultBackend() string {
-	if l == LifecycleOneshot {
-		return "memory"
-	}
-	return "sqlite"
-}
+// defaultBackend resolves the backend name for an empty cfg.Backend. Every
+// lifecycle now runs against the sqlite store; they differ only in where
+// that store lives and whether it is locked.
+func (Lifecycle) defaultBackend() string { return "sqlite" }
 
 // SharedServerConfig carries the knobs that vary between the daemon, the
 // HTTP surface, and the one-shot embedded path. The first block is the
@@ -68,12 +68,16 @@ func (l Lifecycle) defaultBackend() string {
 // entry-point-resolved options threaded through with the already-loaded
 // config rather than re-derived here.
 type SharedServerConfig struct {
-	Lifecycle   Lifecycle // backend default + store-lock posture
-	Index       string    // workspace root the indexer/LSP/bind anchor at
-	Backend     string    // "" resolves via Lifecycle; else memory|sqlite
-	BackendPath string    // "" => ~/.gortex/store/store.sqlite
-	HTTPAddr    string    // opts the lifecycle into the /mcp HTTP surface
-	Watch       bool      // filesystem watcher / incremental reindex
+	Lifecycle Lifecycle // backend default + store-lock posture
+	Index     string    // workspace root the indexer/LSP/bind anchor at
+	Backend   string    // "" resolves via Lifecycle; else memory|sqlite
+	// BackendPath names the store file. Empty means the shared default
+	// (~/.gortex/store/store.sqlite) — which only a lifecycle that takes
+	// the store lock may use, so LifecycleOneshot must set it to a private
+	// per-process path it owns and deletes.
+	BackendPath string
+	HTTPAddr    string // opts the lifecycle into the /mcp HTTP surface
+	Watch       bool   // filesystem watcher / incremental reindex
 
 	// Entry-point-resolved options (not part of the authoritative surface).
 	Config         *config.Config       // loaded .gortex.yaml (required)
@@ -219,6 +223,16 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	backendName := cfg.Backend
 	if backendName == "" {
 		backendName = cfg.Lifecycle.defaultBackend()
+	}
+	// A one-shot server takes no store lock, so it must not be able to
+	// reach the shared default store: resolveBackendPath("") would hand it
+	// ~/.gortex/store/store.sqlite, and a second unlocked writer on the
+	// daemon's database is how that file gets corrupted. Refuse rather
+	// than silently share.
+	if cfg.Lifecycle == LifecycleOneshot && isSqliteBackend(backendName) &&
+		strings.TrimSpace(cfg.BackendPath) == "" {
+		return nil, errors.New("one-shot server requires an explicit BackendPath: " +
+			"it holds no store lock and must not open the shared default store")
 	}
 
 	// Load user-defined domain-extractor rules (TOML tree-sitter patterns).

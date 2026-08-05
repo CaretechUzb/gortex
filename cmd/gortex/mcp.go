@@ -94,6 +94,18 @@ func warnLegacyMCPFlags(cmd *cobra.Command) {
 	}
 }
 
+// newEmbeddedStorePath allocates the per-process sqlite store the embedded
+// MCP server runs against, inside a fresh temp directory nothing else can
+// name. It returns the store path and a func that removes the directory;
+// the caller runs that only after the store handle is closed.
+func newEmbeddedStorePath() (string, func(), error) {
+	dir, err := os.MkdirTemp("", "gortex-mcp-store-*")
+	if err != nil {
+		return "", nil, err
+	}
+	return filepath.Join(dir, "embedded.sqlite"), func() { _ = os.RemoveAll(dir) }, nil
+}
+
 func runMCP(cmd *cobra.Command, args []string) error {
 	warnLegacyMCPFlags(cmd)
 
@@ -165,12 +177,26 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// from XDG_DATA_HOME / XDG_CACHE_HOME, which both ledger paths
 	// honour.
 
+	// The embedded server needs a graph store of its own. It must be a
+	// private temp file: it takes no store lock, so pointing it at the
+	// shared default store would put a second unsynchronised writer on the
+	// daemon's database. Removed on shutdown — the graph is rebuilt from
+	// the tree on every launch.
+	storePath, removeStoreDir, err := newEmbeddedStorePath()
+	if err != nil {
+		return fmt.Errorf("create embedded store: %w", err)
+	}
+	// Registered before the stack's Close so it runs after it: the sqlite
+	// handle must be shut before the directory under it disappears.
+	defer removeStoreDir()
+
 	ss, err := serverstack.NewSharedServer(serverstack.SharedServerConfig{
-		Lifecycle: serverstack.LifecycleOneshot,
-		Index:     mcpIndex,
-		Config:    cfg,
-		Logger:    logger,
-		Version:   version,
+		Lifecycle:   serverstack.LifecycleOneshot,
+		Index:       mcpIndex,
+		BackendPath: storePath,
+		Config:      cfg,
+		Logger:      logger,
+		Version:     version,
 		Embedder: serverstack.EmbedderRequest{
 			FlagChanged: cmd.Flags().Changed("embeddings"),
 			FlagEnabled: mcpEmbeddings,
