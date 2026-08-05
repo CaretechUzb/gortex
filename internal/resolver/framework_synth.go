@@ -124,6 +124,7 @@ const (
 	SynthSwiftUIResolve      = "swiftui-resolve"
 	SynthUIKitResolve        = "uikit-resolve"
 	SynthVaporResolve        = "vapor-resolve"
+	SynthGodotAutoload       = "godot-autoload"
 	SynthGinMiddleware       = "gin-middleware"
 	SynthSvelteKitLoad       = "sveltekit-load"
 	SynthSpeculative         = "speculative-dispatch"
@@ -965,6 +966,10 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// `User.find` / `ApplicationHelper.fmt` call binds to the directory-
 		// located service / model / helper definition named by its receiver.
 		synthFunc{name: SynthRailsResolve, fn: ResolveRailsRefs, candFn: resolveRailsRefs},
+		// Godot autoload resolution: a `Game.set_speed()` call binds to
+		// the script `project.godot` declares the singleton `Game` to
+		// be — the only place that mapping exists.
+		synthFunc{name: SynthGodotAutoload, fn: ResolveGDScriptAutoloads},
 		// SwiftUI directory-convention fallback: a residual `*View` /
 		// `*ViewModel` / `*Store` / `*Manager` / PascalCase-model reference
 		// binds to its /Views/ /ViewModels/ /Stores/ /Models/ definition.

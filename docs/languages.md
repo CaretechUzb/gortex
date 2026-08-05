@@ -255,7 +255,7 @@ What is **not** covered:
 | ActionScript | `.as` | `package`, classes, interfaces, `function`, `import X.Y.*;` |
 | Dart | `.dart` | Full (see core matrix) |
 | Swift | `.swift` | Full (see core matrix) |
-| GDScript | `.gd` | `func`, `class`, signals |
+| GDScript | `.gd`, `project.godot` | `func`, `class`, signals; receiver-typed calls — a script's funcs are methods of its `class_name`, and `Notify.event()` / typed locals / params / `self` bind by receiver, so a project-global class resolves across directories. `[autoload]` singletons in `project.godot` bind to their declared script. |
 | Verse (UEFN) | `.verse` | `class` / `struct` / `enum` / `interface`, functions with specifier blocks, `using { /Path }` |
 | Nix | `.nix` | Attribute sets, functions, `import` / `<nixpkgs>` |
 | AL (Business Central) | `.al` | Tables, pages, codeunits, procedures |
