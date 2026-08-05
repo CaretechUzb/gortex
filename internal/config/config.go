@@ -1426,6 +1426,16 @@ type SearchConfig struct {
 	// An empty value is treated as "split".
 	KeywordSoupRewrite string `mapstructure:"keyword_soup_rewrite" yaml:"keyword_soup_rewrite,omitempty"`
 
+	// RerankEmbedder controls the rerank semantic-cosine channel, which
+	// loads a bundled static code-embedding model into the daemon on the
+	// first search that reranks. The model is tens of MiB and is loaded
+	// regardless of the `embedding:` section — that section drives vector
+	// indexing, this one drives rerank scoring, and they are independent.
+	// On by default (a nil pointer means "on"). Set false on a
+	// memory-constrained daemon to give up natural-language rerank
+	// quality in exchange for the footprint.
+	RerankEmbedder *bool `mapstructure:"rerank_embedder" yaml:"rerank_embedder,omitempty"`
+
 	// EquivalenceClasses enables deterministic, LLM-free query
 	// expansion through the curated software-concept synonym table
 	// plus the per-repo auto-mined concept vocabulary. On by default
@@ -1490,6 +1500,13 @@ func (c SearchConfig) EquivalenceClassesEnabled() bool {
 // (the unset state) means enabled.
 func (c SearchConfig) IndexProseEnabled() bool {
 	return c.IndexProse == nil || *c.IndexProse
+}
+
+// RerankEmbedderEnabled reports whether the rerank semantic-cosine
+// channel may load its code-embedding model. Defaults to true — a nil
+// pointer is the unset state and means enabled.
+func (c SearchConfig) RerankEmbedderEnabled() bool {
+	return c.RerankEmbedder == nil || *c.RerankEmbedder
 }
 
 // CosineRerankEnabled reports whether the post-rerank exact-cosine
