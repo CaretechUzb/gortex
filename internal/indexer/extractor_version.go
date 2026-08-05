@@ -32,7 +32,7 @@ var extractorVersions = map[string]int{
 	//   "go": 2,
 	"c":      generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
 	"php":    2,                                      // class/interface inheritance now emits typed structural edges
-	"csharp": 3,                                      // scoped/global using + receiver/param shape stamps for extension binding (was: null-conditional call edges; caseless reference forms)
+	"csharp": 4,                                      // this./base.-qualified call edges (was: scoped/global using + receiver/param shape stamps; null-conditional call edges)
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
