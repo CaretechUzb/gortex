@@ -11,20 +11,24 @@ import (
 // file keeps the check O(1) per document.
 const binarySniffBytes = 8000
 
-// maxIndexedBytes caps how large a single document may be and still enter
-// the trigram index.
+// maxIndexedBytes is a per-document sanity ceiling: a single file this
+// large is excluded from the index rather than allowed to dominate one
+// repo's build.
 //
-// The index cost of a document tracks its count of DISTINCT trigrams, not
-// its byte length, and every distinct trigram costs a map entry plus a
-// posting slice — order 50 bytes each. Real source is repetitive (measured
-// 1.4x-5x its own size), but a large generated or minified artifact is not,
-// so one file can cost tens of times what it appears to.
+// It is deliberately far above any file a person greps. Once binary
+// content is rejected, real text indexes at 1.4x-5x its own size, so
+// total memory is bounded by the caller's budget over whole repos, not
+// by a per-file cap — and a low cap costs more than it saves. An earlier
+// draft capped at 2 MiB and kept over-cap files as standing candidates
+// merged into every query; on a JavaScript repo full of source maps that
+// turned a memory bound into a per-query scan of every bundle. Excluding
+// only the absurd cases avoids both failure modes.
 //
-// A document over the cap is not dropped from search: it is recorded as
-// unindexed and merged into every candidate set, so it is still opened and
-// verified. The cap trades a little scan time on a rare file for a bounded
-// index.
-const maxIndexedBytes = 2 << 20
+// An excluded document never matches, the same contract Build already has
+// for a file it cannot read.
+//
+// A var only so tests can lower it; nothing in production writes it.
+var maxIndexedBytes int64 = 64 << 20
 
 // IsBinary reports whether content should be treated as opaque bytes rather
 // than searchable text.

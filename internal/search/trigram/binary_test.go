@@ -110,53 +110,44 @@ func TestBuild_KeepsSVGSearchable(t *testing.T) {
 	}
 }
 
-// TestBuild_OversizeTextStaysMatchable proves the size cap costs recall
-// nothing: an over-cap text file holds no postings but is still merged
-// into every candidate set and verified by the scan.
-func TestBuild_OversizeTextStaysMatchable(t *testing.T) {
+// TestBuild_OversizeIsExcluded pins the per-document sanity ceiling: a
+// file over it is never read, and — like an unreadable file — never
+// matches. It must NOT become a standing candidate: an earlier draft did
+// that, which turned a memory bound into a per-query scan of every large
+// generated artifact.
+func TestBuild_OversizeIsExcluded(t *testing.T) {
+	prev := maxIndexedBytes
+	maxIndexedBytes = 1 << 10
+	t.Cleanup(func() { maxIndexedBytes = prev })
+
 	root := t.TempDir()
 	var big strings.Builder
-	for big.Len() < maxIndexedBytes+(1<<10) {
-		fmt.Fprintf(&big, "// filler line %d aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", big.Len())
+	for big.Len() < int(maxIndexedBytes)+256 {
+		fmt.Fprintf(&big, "// filler line %d aaaaaaaaaaaaaaaaaaaaaaaa\n", big.Len())
 	}
 	big.WriteString("needleInAHaystack\n")
 	mk(t, root, "generated/dump.sql", big.String())
-	mk(t, root, "src/small.go", "package src\n")
+	mk(t, root, "src/small.go", "package src // needleInAHaystack\n")
 
 	s := Build(root, []string{"generated/dump.sql", "src/small.go"})
 
 	if got := s.ix.DocCount(); got != 1 {
 		t.Errorf("indexed docs = %d, want only the small file indexed", got)
 	}
-	if len(s.unindexed) != 1 || s.paths[s.unindexed[0]] != "generated/dump.sql" {
-		t.Fatalf("unindexed = %v, want the oversize text file", s.unindexed)
+	if len(s.searchable) != 1 || s.paths[s.searchable[0]] != "src/small.go" {
+		t.Fatalf("searchable = %v, want only the small file", s.searchable)
 	}
-	if m := s.Grep("needleInAHaystack", 0); len(m) != 1 {
-		t.Errorf("Grep over an unindexed text file = %+v, want one hit — the cap must not cost recall", m)
+	// Every query path must agree that the oversize file is not a candidate.
+	for _, id := range s.candidates("needleInAHaystack") {
+		if s.paths[id] == "generated/dump.sql" {
+			t.Fatal("oversize file became a standing candidate")
+		}
 	}
 	re := regexp.MustCompile(`needleIn[A-Z]Haystack`)
-	if m := s.GrepRegexp(re, []string{"needleIn"}, "", 0); len(m) != 1 {
-		t.Errorf("GrepRegexp over an unindexed text file = %+v, want one hit", m)
-	}
-}
-
-// TestBuild_OversizeBinaryIsExcludedWithoutReading covers the branch where
-// a file is both over the cap and binary: it must be dropped, not promoted
-// into the always-scan set.
-func TestBuild_OversizeBinaryIsExcludedWithoutReading(t *testing.T) {
-	root := t.TempDir()
-	mkBinary(t, root, "assets/huge.png", pngLike(maxIndexedBytes+(1<<10)))
-
-	s := Build(root, []string{"assets/huge.png"})
-
-	if s.ix.DocCount() != 0 {
-		t.Errorf("indexed docs = %d, want 0", s.ix.DocCount())
-	}
-	if len(s.unindexed) != 0 {
-		t.Errorf("unindexed = %v, want empty — an oversize binary is excluded outright", s.unindexed)
-	}
-	if len(s.searchable) != 0 {
-		t.Errorf("searchable = %v, want empty", s.searchable)
+	for _, m := range s.GrepRegexp(re, nil, "", 0) {
+		if m.Path == "generated/dump.sql" {
+			t.Fatal("literal-free GrepRegexp scanned the oversize file")
+		}
 	}
 }
 

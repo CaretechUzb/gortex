@@ -27,10 +27,31 @@ const (
 	// only reclaims repos that have gone quiet.
 	defaultTrigramIdleTTL = 10 * time.Minute
 	// defaultTrigramMaxLive caps how many repos may hold a built searcher at
-	// once, which is what actually bounds the worst case: without it, N repos
-	// searched inside one TTL window still means N live indexes.
+	// once. Set it to 0 (GORTEX_TRIGRAM_MAX_LIVE=0) to never build one: every
+	// search then streams over the known file list instead.
 	defaultTrigramMaxLive = 3
+	// defaultTrigramMaxBytes caps the summed estimated heap of every live
+	// searcher. A count cap alone does not bound memory — three indexes of an
+	// arbitrarily large repo is still arbitrarily large — so the byte budget
+	// is what makes the worst case a number instead of a hope. Override with
+	// GORTEX_TRIGRAM_MAX_MB.
+	defaultTrigramMaxBytes int64 = 256 << 20
 )
+
+// TrigramCacheStats is a point-in-time summary of the process-wide trigram
+// searcher cache, for `gortex daemon status`. Without it the largest single
+// in-memory search structure has no line in any status output, while the
+// status line simultaneously advertises search as disk-resident.
+type TrigramCacheStats struct {
+	Live       int           `json:"live"`
+	MaxLive    int           `json:"max_live"`
+	Bytes      int64         `json:"bytes"`
+	MaxBytes   int64         `json:"max_bytes"`
+	IdleTTL    time.Duration `json:"idle_ttl"`
+	BuildsOff  bool          `json:"builds_off"`
+	Evictions  int64         `json:"evictions"`
+	RepoCounts map[string]int64
+}
 
 // trigramBudget tracks which repos currently hold a built trigram searcher
 // and evicts by idle time and by count. It stores release callbacks rather

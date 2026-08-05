@@ -2,7 +2,6 @@ package trigram
 
 import (
 	"bufio"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,14 +27,9 @@ type Searcher struct {
 	ix           *Index
 	paths        []string // docID -> forward-slash repo-relative path
 
-	// unindexed holds the docIDs of text documents that were too large to
-	// index (see maxIndexedBytes). They are merged into every candidate
-	// set, so a bounded index costs a little scan time rather than a
-	// missed match. Binary and unreadable documents are NOT here: they
-	// are excluded from search outright.
-	unindexed []uint32
 	// searchable is the ascending set of docIDs a query with no usable
-	// trigram may scan — indexed plus unindexed, never binary.
+	// trigram may scan. It is exactly the indexed set: binary, oversized
+	// and unreadable documents hold no postings and are not searched.
 	searchable []uint32
 	// indexedBytes is the summed length of the content actually indexed.
 	// It is the input to the caller's memory budget, not a search input.
@@ -47,16 +41,15 @@ type Searcher struct {
 // unindexed (it never matches) but keeps its docID slot so the rest
 // stay aligned.
 //
-// Two classes of file are deliberately kept out of the index:
+// Two further classes are kept out, and like an unreadable file they
+// never match:
 //
-//   - Binary content (IsBinary) is excluded from the index AND from
-//     search. A literal text query cannot meaningfully match compressed
-//     or encoded bytes, and indexing them costs roughly 50x the file's
-//     own size — a single 2 MiB PNG measured 101 MiB of index.
-//   - Text over maxIndexedBytes is excluded from the index but recorded
-//     in unindexed, so it is still a candidate for every query and is
-//     opened and verified like any other file. Bounded memory, no
-//     false negatives.
+//   - Binary content (IsBinary). A literal text query cannot meaningfully
+//     match compressed or encoded bytes, and indexing them costs roughly
+//     50x the file's own size — a single 2 MiB PNG measured 101 MiB of
+//     index.
+//   - Anything over maxIndexedBytes, a per-document sanity ceiling well
+//     above any file a person greps.
 //
 // A path that is a symlink out of root is treated as unreadable. The
 // indexer walk already refuses to admit one, so this is the second of two
@@ -77,19 +70,10 @@ func Build(root string, relPaths []string) *Searcher {
 		if pathguard.EscapesResolvedRoot(abs, s.resolvedRoot) {
 			continue
 		}
+		// Stat first: an oversized file must not be read at all, which is
+		// the whole point of the ceiling.
 		info, err := os.Stat(abs)
-		if err != nil || info.IsDir() {
-			continue
-		}
-		if info.Size() > maxIndexedBytes {
-			// Sniff the head before deciding: an oversized binary is
-			// excluded outright, an oversized text file still has to be
-			// scanned so it stays a standing candidate.
-			if binaryHead(abs) {
-				continue
-			}
-			s.unindexed = append(s.unindexed, uint32(i))
-			s.searchable = append(s.searchable, uint32(i))
+		if err != nil || info.IsDir() || info.Size() > maxIndexedBytes {
 			continue
 		}
 		content, err := os.ReadFile(abs)
@@ -107,36 +91,9 @@ func Build(root string, relPaths []string) *Searcher {
 	return s
 }
 
-// binaryHead reports whether the file at abs begins with binary content.
-// An unreadable file reports false; Build treats it as unindexed either
-// way, so the distinction does not reach a caller.
-func binaryHead(abs string) bool {
-	f, err := os.Open(abs)
-	if err != nil {
-		return false
-	}
-	defer func() { _ = f.Close() }()
-	head := make([]byte, binarySniffBytes)
-	n, err := io.ReadFull(f, head)
-	if n == 0 && err != nil {
-		return false
-	}
-	return IsBinary(head[:n])
-}
-
-// candidates returns the docIDs to verify for query: whatever the trigram
-// index proposes, plus every document too large to have been indexed.
-// The result is sorted ascending and free of duplicates.
+// candidates returns the docIDs to verify for query.
 func (s *Searcher) candidates(query string) []uint32 {
-	ids := s.ix.Candidates(query)
-	if len(s.unindexed) == 0 {
-		return ids
-	}
-	merged := make([]uint32, 0, len(ids)+len(s.unindexed))
-	merged = append(merged, ids...)
-	merged = append(merged, s.unindexed...)
-	slices.Sort(merged)
-	return slices.Compact(merged)
+	return s.ix.Candidates(query)
 }
 
 // IndexedBytes reports the total content length the searcher actually
@@ -264,20 +221,15 @@ func (s *Searcher) GrepRegexp(re *regexp.Regexp, requiredLiterals []string, path
 	var docIDs []uint32
 	if candidates == nil {
 		// No usable literal to trigram-filter on: scan every searchable
-		// document. That is the indexed set plus the oversized-text set —
-		// binary and unreadable documents are excluded, exactly as they
-		// are from the literal path.
+		// document. Binary, oversized and unreadable documents are
+		// excluded here exactly as they are from the literal path.
 		docIDs = slices.Clone(s.searchable)
 	} else {
-		docIDs = make([]uint32, 0, len(candidates)+len(s.unindexed))
+		docIDs = make([]uint32, 0, len(candidates))
 		for id := range candidates {
 			docIDs = append(docIDs, id)
 		}
-		// An oversized text document holds no postings, so no literal can
-		// vouch for it; it has to be verified by the regexp scan itself.
-		docIDs = append(docIDs, s.unindexed...)
 		slices.Sort(docIDs)
-		docIDs = slices.Compact(docIDs)
 	}
 
 	var matches []Match
