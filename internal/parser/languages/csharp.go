@@ -85,6 +85,16 @@ const qCSharpAll = `
       (member_binding_expression
         name: (identifier) @callm.method))) @callm.expr
 
+  (invocation_expression
+    function: (member_access_expression
+      "this"
+      name: (identifier) @callself.method)) @callself.expr
+
+  (invocation_expression
+    function: (member_access_expression
+      "base"
+      name: (identifier) @callbase.method)) @callbase.expr
+
   (local_declaration_statement
     (variable_declaration
       type: (_) @lvar.type
@@ -115,6 +125,10 @@ func (e *CSharpExtractor) Extensions() []string { return []string{".cs"} }
 type csharpDeferredCall struct {
 	name     string
 	receiver string
+	// recvType is the receiver type a `this.`/`base.` qualifier names —
+	// resolved at capture time from the enclosing declaration, since the
+	// keyword itself never appears in any tenv.
+	recvType string
 	line     int
 	isMember bool
 	// returnUsage is how the call site consumes the return value
@@ -277,6 +291,28 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			calls = append(calls, csharpDeferredCall{
 				name:        m.Captures["callm.method"].Text,
 				receiver:    m.Captures["callm.receiver"].Text,
+				line:        expr.StartLine + 1,
+				isMember:    true,
+				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
+			})
+
+		case m.Captures["callself.expr"] != nil:
+			expr := m.Captures["callself.expr"]
+			calls = append(calls, csharpDeferredCall{
+				name:        m.Captures["callself.method"].Text,
+				receiver:    "this",
+				recvType:    csharpQualifiedReceiverType(expr.Node, src, "this"),
+				line:        expr.StartLine + 1,
+				isMember:    true,
+				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
+			})
+
+		case m.Captures["callbase.expr"] != nil:
+			expr := m.Captures["callbase.expr"]
+			calls = append(calls, csharpDeferredCall{
+				name:        m.Captures["callbase.method"].Text,
+				receiver:    "base",
+				recvType:    csharpQualifiedReceiverType(expr.Node, src, "base"),
 				line:        expr.StartLine + 1,
 				isMember:    true,
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
@@ -476,7 +512,11 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				From: callerID, To: "unresolved::*." + c.name,
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			}
-			if recvType, ok := tenvByOwner[callerID][c.receiver]; ok {
+			if c.recvType != "" {
+				// this./base.-qualified: the receiver type came from the
+				// enclosing declaration, not from any variable lookup.
+				edge.Meta = map[string]any{"receiver_type": c.recvType}
+			} else if recvType, ok := tenvByOwner[callerID][c.receiver]; ok {
 				edge.Meta = map[string]any{"receiver_type": recvType}
 				if shape := shapesByOwner[callerID][c.receiver]; shape != "" && shape != recvType {
 					edge.Meta["receiver_shape"] = shape
@@ -1490,6 +1530,63 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 		}
 		result.Edges = append(result.Edges, edge)
 	}
+}
+
+// csharpQualifiedReceiverType resolves the type a `this.` or `base.`
+// call qualifier names: the innermost enclosing type declaration for
+// `this`, its declared base class for `base`. The keywords are anonymous
+// tokens in the grammar — a plain `(_)` receiver capture never matches
+// them — so the type must be recovered from the declaration instead of a
+// tenv. Base discrimination mirrors emitCSharpBaseList: the first
+// base_list entry that is a ctor-base or not I-prefixed is the
+// superclass. Empty when nothing applies (struct `base.`, interface-only
+// bases) — the call still emits as a plain member_call.
+func csharpQualifiedReceiverType(node *sitter.Node, src []byte, keyword string) string {
+	var decl *sitter.Node
+	for n := node; n != nil && decl == nil; n = n.Parent() {
+		switch n.Type() {
+		case "class_declaration", "struct_declaration", "record_declaration", "interface_declaration":
+			decl = n
+		}
+	}
+	if decl == nil {
+		return ""
+	}
+	if keyword == "this" {
+		if nm := decl.ChildByFieldName("name"); nm != nil {
+			return nm.Content(src)
+		}
+		return ""
+	}
+	if !csharpDeclAllowsBaseClass(decl) {
+		return ""
+	}
+	baseList := decl.ChildByFieldName("bases")
+	if baseList == nil {
+		for i, _nc := 0, int(decl.ChildCount()); i < _nc; i++ {
+			if c := decl.Child(i); c != nil && c.Type() == "base_list" {
+				baseList = c
+				break
+			}
+		}
+	}
+	if baseList == nil {
+		return ""
+	}
+	for i, _nc := 0, int(baseList.NamedChildCount()); i < _nc; i++ {
+		entry := baseList.NamedChild(i)
+		if entry == nil {
+			continue
+		}
+		name, isCtorBase := csharpBaseTypeName(entry, src)
+		if name == "" {
+			continue
+		}
+		if isCtorBase || !csharpInterfaceNamePattern.MatchString(name) {
+			return name
+		}
+	}
+	return ""
 }
 
 // csharpDeclAllowsBaseClass reports whether a class/struct/record
