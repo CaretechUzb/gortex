@@ -115,9 +115,10 @@ type Watcher struct {
 	// detectClonesAndEmitEdges, all of which mutate the same Meta
 	// maps unprotected. Storm-mode uses patchGraphNoResolve (driven
 	// from a single goroutine in drainStorm) and bypasses this lock.
-	patchMu          sync.Mutex
-	logger           *zap.Logger
-	done             chan struct{}
+	patchMu sync.Mutex
+	logger  *zap.Logger
+	done    chan struct{}
+	watcherMutationAdmission
 	stopped          chan struct{}
 	stoppedOnce      sync.Once
 	symbolChangeCb   SymbolChangeCallback
@@ -241,12 +242,16 @@ func NewWatcher(idx *Indexer, cfg config.WatchConfig, logger *zap.Logger) (*Watc
 	}
 	cfg.DebounceMs = debounce
 
-	// Storm-mode defaults — kept conservative so a repo producing
-	// normal save traffic stays on the per-file path. Threshold of
-	// zero means the user explicitly disabled storm mode; negative is
-	// coerced to zero for safety.
-	if cfg.StormThreshold < 0 {
+	// Storm-mode defaults — high enough that a repo producing normal save
+	// traffic stays on the per-file path. Tri-state: a negative threshold
+	// is the explicit opt-out, zero means "unset" and takes the default.
+	// Batching is the default because the per-file path arms one timer,
+	// and so one goroutine, per changed path.
+	switch {
+	case cfg.StormThreshold < 0:
 		cfg.StormThreshold = 0
+	case cfg.StormThreshold == 0:
+		cfg.StormThreshold = config.DefaultStormThreshold()
 	}
 	if cfg.StormWindowMs <= 0 {
 		cfg.StormWindowMs = 500
@@ -1576,6 +1581,18 @@ func (w *Watcher) scheduleFileMutation(path string, kind ChangeKind) *MutationTi
 			w.pointMutationClaimed(path)
 		}
 		patchErr := errMutationPatchAborted
+		// Admit through the cohort semaphore before doing any work. A
+		// fired cohort otherwise puts every path's callback into the
+		// patch path at once, all of them contending for the repository
+		// mutation lane. Giving up here rather than queueing forever is
+		// what lets a jammed lane shed work instead of accumulating
+		// goroutines against it.
+		release, admitted := w.admitMutationWork()
+		if !admitted {
+			w.completeMutationWaiters(path, generation, errMutationPatchAborted)
+			return
+		}
+		defer release()
 		superseded := false
 		defer w.guardWatcherPanic("patch " + path)
 		defer func() {
@@ -1991,13 +2008,15 @@ func (w *Watcher) patchGraphWithReceiptState(path string, kind ChangeKind, gener
 	// created. Select the registered Indexer only after admission, because an
 	// IndexRepo replacement uses the same lane and cannot change underneath
 	// the raw patch.
-	err := w.indexer.coordinateRepositoryMutation(context.Background(), func() error {
+	laneCtx, cancelLane := w.mutationLaneContext()
+	err := w.indexer.coordinateRepositoryMutation(laneCtx, func() error {
 		idx := w.currentMutationIndexer()
 		if idx == nil {
 			return errWatcherIndexerMissing
 		}
 		return w.patchGraphWithReceiptStateRawModern(idx, path, kind, generation, receiptChecked, &pending)
 	})
+	cancelLane()
 	// User callbacks are deliberately outside the repository lane. Their
 	// payload was copied while the graph mutation still owned the lane.
 	pending.dispatch()

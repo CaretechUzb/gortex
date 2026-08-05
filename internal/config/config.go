@@ -1298,7 +1298,17 @@ type WatchConfig struct {
 	// rebuild until a quiet period has passed. Protects against event
 	// floods from bulk operations: `rsync`, `npm install`, branch
 	// checkout, bulk format-on-save, find-and-replace across a repo.
-	// Zero disables storm mode (pure per-file behaviour).
+	// Tri-state, matching the other admission caps: >0 uses that
+	// threshold; 0 (absent) uses the built-in default
+	// (defaultStormThreshold); <0 disables storm mode, giving pure
+	// per-file behaviour.
+	//
+	// The default is non-zero because per-file behaviour is not the safe
+	// fallback it looks like: without batching, a checkout or npm install
+	// arms one debounce timer — and so one goroutine — per changed path,
+	// each blocking on the repository mutation lane. Go never returns a
+	// goroutine's stack descriptor to the heap, so that peak is retained
+	// for the life of the process.
 	StormThreshold int `mapstructure:"storm_threshold" yaml:"storm_threshold,omitempty"`
 	// StormWindowMs is the sliding window over which events are counted
 	// against StormThreshold. Defaults to 500.
@@ -1710,6 +1720,16 @@ const defaultMaxDocumentBytes = 10 << 20
 // critical path. 32 MiB clears every realistic diagram, screenshot and
 // icon while excluding multi-hundred-MB assets.
 const defaultMaxImageBytes = 32 << 20
+
+// defaultStormThreshold is how many events inside one window switch the
+// watcher from per-file debounced patching to a batched reconcile. 50 is
+// well above a format-on-save or a multi-file refactor and well below the
+// thousands a checkout or dependency install produces.
+const defaultStormThreshold = 50
+
+// DefaultStormThreshold exposes the built-in storm threshold for callers
+// that resolve WatchConfig's tri-state themselves.
+func DefaultStormThreshold() int { return defaultStormThreshold }
 
 // defaultMaxDataBytes is the built-in per-file cap applied to data assets
 // only when index.content.index_data opts them in — a backstop against a

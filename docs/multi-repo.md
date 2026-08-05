@@ -69,8 +69,9 @@ watch:
   # that defers cross-file resolver + search work until a quiet
   # period has passed. Amortises the cost of bulk operations
   # (rsync, npm install, branch checkout, bulk format-on-save,
-  # find-and-replace). Zero = disabled (default).
-  storm_threshold: 0          # 0 disables; try 50 on monorepos
+  # find-and-replace) and, more importantly, collapses the burst into
+  # one timer instead of one goroutine per changed path.
+  storm_threshold: 0     # 0 = built-in default (50); negative disables
   storm_window_ms: 500
   storm_quiet_period_ms: 500
 ```

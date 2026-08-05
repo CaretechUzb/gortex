@@ -413,3 +413,110 @@ func TestWatcher_DirScanWaitsForPointMutationRepositoryLane(t *testing.T) {
 	}
 	require.NotEmpty(t, idx.graph.FindNodesByName("Discovered"))
 }
+
+// TestStormThresholdDefaultsOn pins the tri-state: batching is the default
+// because the per-file path arms one timer, and so one goroutine, per
+// changed path — and Go never returns a goroutine's stack descriptor to
+// the heap, making a burst's peak a permanent cost.
+func TestStormThresholdDefaultsOn(t *testing.T) {
+	tmp := t.TempDir()
+
+	// Unset (zero) takes the built-in default rather than disabling.
+	w, err := NewWatcher(&Indexer{rootPath: tmp}, config.WatchConfig{Paths: []string{tmp}}, zap.NewNop())
+	require.NoError(t, err)
+	require.Equal(t, config.DefaultStormThreshold(), w.config.StormThreshold)
+	require.Positive(t, w.config.StormThreshold, "storm batching must be on by default")
+
+	// An explicit positive value wins.
+	w, err = NewWatcher(&Indexer{rootPath: tmp},
+		config.WatchConfig{Paths: []string{tmp}, StormThreshold: 7}, zap.NewNop())
+	require.NoError(t, err)
+	require.Equal(t, 7, w.config.StormThreshold)
+
+	// A negative value is the explicit opt-out, coerced to the disabled zero.
+	w, err = NewWatcher(&Indexer{rootPath: tmp},
+		config.WatchConfig{Paths: []string{tmp}, StormThreshold: -1}, zap.NewNop())
+	require.NoError(t, err)
+	require.Zero(t, w.config.StormThreshold)
+	require.False(t, w.shouldEnterStorm(), "a disabled watcher never enters storm mode")
+}
+
+// TestMutationAdmissionBoundsConcurrency verifies the cohort semaphore
+// caps how many debounce callbacks are in the patch path at once, and
+// that a stopping watcher releases waiters instead of parking them.
+func TestMutationAdmissionBoundsConcurrency(t *testing.T) {
+	w := &Watcher{logger: zap.NewNop(), done: make(chan struct{})}
+
+	slots := cap(w.mutationSlots())
+	require.Equal(t, mutationWorkSlots(), slots)
+	require.GreaterOrEqual(t, slots, 2)
+
+	releases := make([]func(), 0, slots)
+	for i := 0; i < slots; i++ {
+		release, ok := w.admitMutationWork()
+		require.True(t, ok, "the first %d admissions must succeed", slots)
+		releases = append(releases, release)
+	}
+
+	// The semaphore is full: a further admission blocks until a slot frees.
+	admitted := make(chan bool, 1)
+	go func() {
+		release, ok := w.admitMutationWork()
+		if ok {
+			release()
+		}
+		admitted <- ok
+	}()
+	select {
+	case <-admitted:
+		t.Fatal("admission succeeded while every slot was held")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releases[0]()
+	require.True(t, <-admitted, "freeing a slot admits the waiter")
+	for _, release := range releases[1:] {
+		release()
+	}
+}
+
+func TestMutationAdmissionReleasedOnStop(t *testing.T) {
+	w := &Watcher{logger: zap.NewNop(), done: make(chan struct{})}
+	held := make([]func(), 0, cap(w.mutationSlots()))
+	for i := 0; i < cap(w.mutationSlots()); i++ {
+		release, ok := w.admitMutationWork()
+		require.True(t, ok)
+		held = append(held, release)
+	}
+
+	admitted := make(chan bool, 1)
+	go func() {
+		_, ok := w.admitMutationWork()
+		admitted <- ok
+	}()
+	close(w.done)
+	require.False(t, <-admitted, "a stopping watcher must not admit new work")
+	for _, release := range held {
+		release()
+	}
+}
+
+// TestMutationLaneContextCarriesDeadline pins the escape hatch: a patch
+// waiting on a stuck repository lane must not park a goroutine forever.
+func TestMutationLaneContextCarriesDeadline(t *testing.T) {
+	w := &Watcher{logger: zap.NewNop(), done: make(chan struct{})}
+	ctx, cancel := w.mutationLaneContext()
+	defer cancel()
+
+	deadline, ok := ctx.Deadline()
+	require.True(t, ok, "the lane wait must be bounded")
+	require.WithinDuration(t, time.Now().Add(mutationLaneTimeout), deadline, time.Minute)
+
+	// Stopping the watcher releases the wait immediately.
+	close(w.done)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("stopping the watcher did not cancel the lane wait")
+	}
+}
