@@ -3032,6 +3032,21 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 // overshoot in the millisecond range.
 const healthScanCancelStride = 512
 
+// healthOrphanScanCap bounds the path-liveness stat loop. index_health is the
+// call an agent makes to find out whether the daemon is up, so it must stay
+// cheap on a workspace whose file count runs to six figures.
+//
+// Past the cap the audit describes a prefix of the node walk rather than the
+// whole graph — not a uniform sample, so an orphan population concentrated in
+// one directory can be over- or under-represented. That is why a truncated
+// scan says so in the payload and its extrapolated total is indicative. What
+// it still answers reliably is the question that matters here: whether the
+// graph is clean at all.
+const healthOrphanScanCap = 20000
+
+// healthOrphanSampleLimit is how many orphan node IDs the payload names.
+const healthOrphanSampleLimit = 3
+
 // buildIndexHealthPayloadCtx is buildIndexHealthPayload with cancellation.
 //
 // "Minimal health probe" is what the tool looks like from outside, but the work
@@ -3098,6 +3113,16 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 	// minified / parse_failed / parse_panic) instead of guessing.
 	skipped := map[string]int{}
 	repoPrefixes := map[string]struct{}{}
+	// Path-liveness audit, folded into the same walk. Every other freshness
+	// signal in this payload is derived from the files the daemon already
+	// tracks — the mtime ledger, the parse-error list, the skip rollup — so
+	// none of them can see a node whose file left the disk without the daemon
+	// witnessing the departure. Those nodes keep answering searches with code
+	// that no longer exists while this call reports 100%. Asking the
+	// filesystem about the paths the graph itself claims is the only probe
+	// that can see them.
+	orphans := graph.OrphanDiagnostics{}
+	checkPath := s.newPathLivenessProbe()
 	scanned = 0
 	for n := range s.graph.NodesByKind(graph.KindFile) {
 		if scanned%healthScanCancelStride == 0 {
@@ -3110,12 +3135,32 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 			continue
 		}
 		repoPrefixes[n.RepoPrefix] = struct{}{}
+		// Synthetic attribution paths (external::, external-call::) name no
+		// file on disk by design, so they are outside the liveness question
+		// for the same reason they are outside the ownership audit.
+		if graph.IsAuditableRepoSourcePath(n.FilePath) {
+			orphans.Candidates++
+			if orphans.Candidates > healthOrphanScanCap {
+				orphans.Truncated = true
+			} else {
+				orphans.Record(n.ID, n.RepoPrefix, checkPath(n), healthOrphanSampleLimit)
+			}
+		}
 		if n.Meta == nil {
 			continue
 		}
 		if reason, _ := n.Meta["skip_reason"].(string); reason != "" {
 			skipped[reason]++
 		}
+	}
+
+	// A graph holding files that no longer exist is not a healthy graph,
+	// whatever the parse ratio says. Worst-of rather than a blend: the two
+	// scores answer different questions ("did the files we found parse" vs
+	// "are the files we hold still there"), and health should track whichever
+	// one is failing.
+	if liveScore := orphans.LiveScore(); liveScore < healthScore {
+		healthScore = liveScore
 	}
 
 	// Per-file rollup from the files sidecar (when the backend records it):
@@ -3151,6 +3196,18 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 	var recommendation string
 	if healthScore < 80 {
 		recommendation = "Health score below 80%. Run index_repository with path \".\" to re-index the codebase."
+	}
+	if !orphans.Clean() {
+		msg := "Graph holds nodes for files that no longer exist on disk (" + orphans.Summary() + "). " +
+			"search_symbols and find_usages will keep returning those symbols, and no staleness signal covers " +
+			"them — stale_files only tracks files the daemon still knows about, and the daemon never witnessed " +
+			"these deletions. Re-index the affected repo with reindex_repository and no `paths` argument — only a " +
+			"full-tree pass evicts them, a scoped one cannot; if they survive it, untrack and re-track the repo."
+		if recommendation == "" {
+			recommendation = msg
+		} else {
+			recommendation = msg + " " + recommendation
+		}
 	}
 	if prefixAuditOK && !prefixAudit.Clean() {
 		msg := "Graph holds inconsistent repository ownership (" + prefixAudit.Summary() + "). " +
@@ -3301,6 +3358,33 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 		}
 		result["repo_ownership"] = ownership
 	}
+	// Path liveness. Reported whenever the audit had something to look at, not
+	// only when it found a defect: "checked 2581, 0 orphans" is the evidence
+	// that the 100% above means what it says, and its absence is what tells a
+	// caller the probe could not run.
+	if orphans.Candidates > 0 {
+		liveness := map[string]any{
+			"checked":      orphans.Checked,
+			"orphan_files": orphans.Orphans,
+			"orphan_rate":  math.Round(orphans.Rate()*10000) / 10000,
+			"clean":        orphans.Clean(),
+		}
+		if orphans.Truncated {
+			liveness["truncated"] = true
+			liveness["candidates"] = orphans.Candidates
+			liveness["estimated_orphan_files"] = orphans.EstimatedOrphans()
+		}
+		if orphans.Unresolvable > 0 {
+			liveness["unresolvable"] = orphans.Unresolvable
+		}
+		if len(orphans.OrphanSamples) > 0 {
+			liveness["orphan_samples"] = orphans.OrphanSamples
+		}
+		if len(orphans.OrphansByRepo) > 0 {
+			liveness["orphans_by_repo"] = orphans.OrphansByRepo
+		}
+		result["path_liveness"] = liveness
+	}
 	// Tool-surface state: the active global preset (the per-session default
 	// may differ by client) and the per-workspace learned surface size, so
 	// the tool policy is inspectable without a separate call.
@@ -3370,6 +3454,68 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 	}
 
 	return result, nil
+}
+
+// repoRootFor resolves the local checkout a repo prefix's nodes were indexed
+// from, or "" when no root answers for it. The multi-repo registry is
+// authoritative; a standalone server has none, and there the lone indexer
+// answers for its own prefix and for the unprefixed nodes it mints.
+func (s *Server) repoRootFor(repoPrefix string) string {
+	if s.multiIndexer != nil {
+		if root, ok := s.multiIndexer.RepoRoot(repoPrefix); ok {
+			return root
+		}
+	}
+	if s.indexer != nil && (repoPrefix == "" || repoPrefix == s.indexer.RepoPrefix()) {
+		return s.indexer.RootPath()
+	}
+	return ""
+}
+
+// newPathLivenessProbe returns a classifier for one file node's on-disk path.
+//
+// The repo-root lookup is cached per prefix across the returned closure's life:
+// a workspace-wide walk asks about the same handful of prefixes tens of
+// thousands of times, and RepoRoot takes the multi-indexer's lock each call.
+//
+// Failure is never reported as absence. A prefix with no resolvable local root
+// yields FilePathUnknown rather than condemning every node under it — that is
+// a tracked-repo defect of its own, and inferring "deleted" from "I could not
+// look" is how a health probe starts lying in the other direction.
+func (s *Server) newPathLivenessProbe() func(*graph.Node) graph.FilePathState {
+	roots := map[string]string{}
+	return func(n *graph.Node) graph.FilePathState {
+		if n == nil {
+			return graph.FilePathUnknown
+		}
+		root, cached := roots[n.RepoPrefix]
+		if !cached {
+			root = s.repoRootFor(n.RepoPrefix)
+			roots[n.RepoPrefix] = root
+		}
+		if root == "" {
+			return graph.FilePathUnknown
+		}
+		rel := n.FilePath
+		if n.RepoPrefix != "" {
+			var trimmed bool
+			rel, trimmed = strings.CutPrefix(rel, n.RepoPrefix+"/")
+			if !trimmed {
+				// The node claims a repo its own path does not sit under, so
+				// joining it against that repo's root would stat a path this
+				// node never described. The ownership audit above is what
+				// reports this population; liveness abstains.
+				return graph.FilePathUnknown
+			}
+		}
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err != nil {
+			if os.IsNotExist(err) {
+				return graph.FilePathGone
+			}
+			return graph.FilePathUnknown
+		}
+		return graph.FilePathLive
+	}
 }
 
 // missingTrackedRepoPaths returns, sorted and de-duplicated, the roots of
