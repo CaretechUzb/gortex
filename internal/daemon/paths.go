@@ -11,7 +11,7 @@ import (
 )
 
 // stateDir returns the directory the daemon keeps its runtime state in
-// (socket, PID file, logs, snapshot) and whether it could be resolved.
+// (socket, PID file, logs) and whether it could be resolved.
 //
 // An absolute $XDG_CACHE_HOME is honoured on every platform. When it is
 // unset the location stays at the historical default so an existing
@@ -139,67 +139,6 @@ func StateDir() string {
 		return dir
 	}
 	return os.TempDir()
-}
-
-// SnapshotPath returns the legacy backend-agnostic snapshot path —
-// `daemon.gob.gz` under the state dir. Kept for callers that haven't
-// moved to backend-tagged storage yet (the legacy cloud indexer
-// worker). The daemon itself routes through
-// BackendSnapshotPath so a memory ↔ disk-backend switch can't read the
-// other backend's snapshot — see that function's doc.
-func SnapshotPath() string {
-	if override := os.Getenv("GORTEX_DAEMON_SNAPSHOT"); override != "" {
-		return override
-	}
-	if dir, ok := stateDir(); ok {
-		return filepath.Join(dir, "daemon.gob.gz")
-	}
-	return filepath.Join(os.TempDir(), "gortex-daemon.gob.gz")
-}
-
-// BackendSnapshotPath returns a backend-tagged snapshot path so the
-// memory and disk backends use distinct files. The memory backend
-// snapshot is a full gob+gzip of the in-memory graph; the disk
-// backend snapshot is metadata-only (FileMtimes, contracts, vector
-// index) because the graph itself lives in the on-disk store. Loading
-// the memory backend's snapshot into a disk-backed daemon (or vice
-// versa) silently produced wrong state — empty graph after disk→memory
-// switch, decode-and-discard nodes after memory→disk — so a fresh
-// daemon now picks the right file by backend tag.
-//
-// Empty backend tag falls back to SnapshotPath() so embedded callers
-// that don't know the backend (the cloud indexer worker) keep working.
-//
-// GORTEX_DAEMON_SNAPSHOT overrides every backend tag — the override
-// is an explicit "use exactly this path" signal.
-func BackendSnapshotPath(backend string) string {
-	if override := os.Getenv("GORTEX_DAEMON_SNAPSHOT"); override != "" {
-		return override
-	}
-	tag := normalizeBackendTag(backend)
-	if tag == "" {
-		return SnapshotPath()
-	}
-	filename := "daemon-" + tag + ".gob.gz"
-	if dir, ok := stateDir(); ok {
-		return filepath.Join(dir, filename)
-	}
-	return filepath.Join(os.TempDir(), "gortex-"+filename)
-}
-
-// normalizeBackendTag canonicalizes a backend identifier into the
-// short tag used in the snapshot filename — "memory" / "sqlite" /
-// etc. Empty / unknown input returns the empty string so the caller
-// can fall back to the legacy unsuffixed path.
-func normalizeBackendTag(backend string) string {
-	switch backend {
-	case "memory", "mem", "in-memory":
-		return "memory"
-	case "sqlite", "sqlite3":
-		return "sqlite"
-	default:
-		return ""
-	}
 }
 
 // EnsureParentDir creates the parent directory of path with permissions

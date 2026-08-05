@@ -41,35 +41,6 @@ type daemonState struct {
 	// owning remote's /v1/subgraph. nil unless federation.edges is on;
 	// the read path hydrates a proxy target before traversing it.
 	proxyHydrator *daemon.ProxyHydrator
-	// snapshotRepos carries per-repo FileMtimes restored from a daemon
-	// snapshot. Populated by buildDaemonState; consumed by
-	// warmupDaemonState to route each configured repo through
-	// ReconcileRepoCtx (incremental) instead of TrackRepoCtx (full
-	// index). nil or missing entries → fall back to full index.
-	snapshotRepos map[string]*snapshotRepo
-	// snapshotContracts carries the per-repo contract entries restored
-	// from the snapshot. Warmup injects these into each indexer after
-	// ReconcileRepoCtx when IncrementalReindexPaths skipped re-extraction (no
-	// stale files). Without this the per-repo contracts.Registry stays
-	// nil for every quiescent repo, so `contracts` / `contracts check`
-	// return empty results even though the graph holds the nodes.
-	snapshotContracts map[string][]contracts.Contract
-	// snapshotPartial reports that the load shed stale records (dropped
-	// nodes / dropped edges whose target vanished). When true, warmup
-	// forces a full per-repo ResolveAll across every indexer instead of
-	// the incremental "only files whose mtime changed" path. Without
-	// this, edges that the loader dropped never come back — every
-	// restart erodes the graph further until exported methods like
-	// (*Node).Type show zero callers despite having dozens of real
-	// callers in source. The IncrementalReindexPaths path never re-resolves
-	// unchanged files, so the lost edges are invisible to it.
-	snapshotPartial bool
-	// snapshotVector carries the workspace-global semantic-search
-	// vector index restored from the snapshot. When its Index is
-	// non-empty and an embedder is configured, warmupDaemonState
-	// restores it after the per-repo re-index loop (which it runs with
-	// vector building skipped) instead of re-embedding the whole graph.
-	snapshotVector snapshotVector
 	// MultiWatcher is built by warmupDaemonState (after tracked repos
 	// have been re-indexed) and handed to realController via
 	// AttachWatcher — it isn't held on daemonState because no caller
@@ -115,9 +86,8 @@ func lspDisabledSet(providers []config.SemanticProviderConfig, envVar string) ma
 }
 
 // buildDaemonState builds the daemon's stack through the shared
-// serverstack constructor, applies the daemon-specific snapshot
-// warm-start (memory backend only), and returns the long-lived
-// daemonState the warmup loop and controller share.
+// serverstack constructor and returns the long-lived daemonState the
+// warmup loop and controller share.
 func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
@@ -158,27 +128,6 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		return nil, fmt.Errorf("build server stack: %w", err)
 	}
 
-	// Snapshot warm-start (memory backend only — the sqlite backend reads
-	// from its own on-disk store and needs no gob replay). Replays
-	// nodes/edges into the graph and carries the per-repo FileMtimes /
-	// contracts / vector index warmup needs. When the snapshot already
-	// holds a dimension-matching vector index, skip re-embedding the whole
-	// graph during warmup; warmupDaemonState restores the cached index.
-	var loadResult snapshotLoadResult
-	if mg, ok := ss.Graph.(*graph.Graph); ok {
-		loadResult, err = loadSnapshot(mg, logger)
-		if err != nil {
-			logger.Warn("daemon: snapshot load failed", zap.Error(err))
-		}
-		if ss.MultiIndexer != nil {
-			if vec := loadResult.Vector; len(vec.Index) > 0 && vec.Dims == ss.EmbedderDims {
-				ss.MultiIndexer.SetSkipVectorBuild(true)
-				logger.Info("daemon: snapshot carries vector index — warmup will restore it instead of re-embedding",
-					zap.Int("vectors", vec.Count), zap.Int("dims", vec.Dims))
-			}
-		}
-	}
-
 	return &daemonState{
 		graph:               ss.Graph,
 		indexer:             ss.Indexer,
@@ -187,10 +136,6 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		mcpServer:           ss.MCP,
 		overlays:            ss.Overlays,
 		shared:              ss,
-		snapshotRepos:       loadResult.Repos,
-		snapshotContracts:   loadResult.Contracts,
-		snapshotPartial:     loadResult.Partial,
-		snapshotVector:      loadResult.Vector,
 		resolverLSPRegistry: ss.ResolverLSPRegistry,
 		lspRouter:           ss.LSPRouter,
 	}, nil
@@ -322,27 +267,6 @@ func healDuplicateRepos(gc *config.GlobalConfig, logger *zap.Logger) int {
 	return len(removed)
 }
 
-// takeWarmupSnapshotPayloads moves one-use restart data out of daemonState.
-// The warmup owns the returned values and drops each after its final consumer;
-// clearing the long-lived fields here prevents successful and failed warmups
-// from retaining serialized repository, contract, or vector payloads.
-func (state *daemonState) takeWarmupSnapshotPayloads() (
-	map[string]*snapshotRepo,
-	map[string][]contracts.Contract,
-	snapshotVector,
-) {
-	if state == nil {
-		return nil, nil, snapshotVector{}
-	}
-	repos := state.snapshotRepos
-	contractEntries := state.snapshotContracts
-	vector := state.snapshotVector
-	state.snapshotRepos = nil
-	state.snapshotContracts = nil
-	state.snapshotVector = snapshotVector{}
-	return repos, contractEntries, vector
-}
-
 // drainGoModAndFinalizeWarmupBulk keeps the dependency-contract drain and the
 // coordinated bulk finalizer in one explicitly ordered operation. The closures
 // make that ordering testable without constructing a daemon or SQLite store.
@@ -381,7 +305,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	if state == nil {
 		return nil, timings
 	}
-	snapshotRepos, snapshotContracts, restoredVector := state.takeWarmupSnapshotPayloads()
 	if state.multiIndexer == nil || state.configManager == nil {
 		return nil, timings
 	}
@@ -522,8 +445,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		zap.Int("repos", len(repos)),
 		zap.Int("workers", workers),
 		zap.Int64("shared_parse_budget_mb", parseBudget>>20),
-		zap.Uint64("managed_memory_mb", currentMemory>>20),
-		zap.Bool("snapshot_partial_forces_full_walk", state.snapshotPartial))
+		zap.Uint64("managed_memory_mb", currentMemory>>20))
 	publishReadinessPhase(state, "parallel_parse", false, map[string]any{
 		"tracked_repos":          len(repos),
 		"workers":                workers,
@@ -587,38 +509,23 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 								deltaFrontier.invalidate()
 							}
 						}()
-						// Route repos whose nodes came from the snapshot through
+						// Route repos the store already knows through
 						// ReconcileRepoCtx — it calls IncrementalReindexPaths, which
 						// evicts files deleted while the daemon was down and
-						// re-indexes only files whose mtime changed. Repos not in
-						// the snapshot (newly tracked, or first startup after a
+						// re-indexes only files whose mtime changed. Repos with no
+						// persisted mtimes (newly tracked, or first startup after a
 						// schema bump) fall back to TrackRepoCtx, which does a
 						// full walk. Both paths end with the repo registered on
 						// the MultiIndexer; contract reconciliation is deferred
 						// to the single RunGlobalResolve call below.
-						//
-						// snapshotPartial == true forces the full-walk path even
-						// when prior mtimes exist: the partial-load signal means
-						// the persisted resolution state is no longer trustworthy
-						// (stale edges were dropped because their targets vanished),
-						// and the incremental path only re-resolves files whose
-						// mtime changed — so the dropped edges would never come
-						// back. Without this override every restart progressively
-						// erodes the graph until exported methods show zero
-						// callers despite having dozens of real call sites.
 						repoStart := time.Now()
-						// Prefer mtimes stored in the backend's FileMtime
-						// sidecar table — that lifts the persistence off the
-						// gob snapshot for disk-backed backends, which is the
-						// path that actually rebuilds across restarts. Falls
-						// back to the snapshot's per-repo FileMtimes when the
-						// backend doesn't implement the reader (memory) or
-						// hasn't seen this repo yet.
+						// The backend's FileMtime sidecar table is the sole source
+						// of prior mtimes. An empty result means the store has
+						// never seen this repo, which is a cold index rather than
+						// a reconcile with nothing to do — normalise it to nil so
+						// the full-walk branch below runs.
 						priorMtimes := priorMtimesFromStore(state.graph, state.configManager, entry, logger)
 						if len(priorMtimes) == 0 {
-							priorMtimes = priorMtimesForEntry(snapshotRepos, entry)
-						}
-						if state.snapshotPartial {
 							priorMtimes = nil
 						}
 						// A backend that crossed a schema-rebuild migration rung
@@ -661,30 +568,8 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 								}
 							default:
 								// Warm no-op path: the repo re-indexed nothing, so its
-								// graph is served straight from the persisted store.
-								// Vet the freshly-recomputed per-repo counts against
-								// what the snapshot recorded — a material shortfall
-								// means the store came back shape-degraded relative to
-								// the snapshot metadata (a persisted resolution
-								// regression). Mark the repo changed so the
-								// end-of-warmup global re-resolve + derivation passes
-								// run for it instead of silently serving the shrunken
-								// graph, and surface the event so a ratchet can't hide
-								// behind an all-green index_health.
-								if res != nil && bootShapeShortfall(snapshotRepos, res.RepoPrefix, res.NodeCount, res.EdgeCount) {
-									indexer.RecordResolutionRegression()
-									logger.Warn("daemon: boot shape-degradation guard — repo graph materially short of snapshot; re-running resolution",
-										zap.String("prefix", res.RepoPrefix),
-										zap.Int("live_nodes", res.NodeCount),
-										zap.Int("live_edges", res.EdgeCount))
-									changedRepos.Add(1)
-									deltaFrontier.invalidate()
-									if res.RepoPrefix != "" {
-										changedPrefixes.Store(res.RepoPrefix, struct{}{})
-									} else {
-										scopeUnknown.Store(true)
-									}
-								}
+								// graph is served straight from the persisted store and
+								// no global pass has to re-run for it.
 							}
 						} else {
 							// No prior mtimes → full cold (re)index of this repo,
@@ -739,9 +624,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		logger.Info("daemon: warmup pre-bulk go.mod drain complete",
 			zap.Duration("elapsed", goModElapsed))
 
-		// Every reconcile and shape guard has finished; release the restored
-		// per-repository mtime maps before the later resolver/enrichment phases.
-		snapshotRepos = nil
 		if coordinatedBulkActive {
 			if finalizeErr != nil {
 				logger.Error("daemon: coordinated cold bulk-load finalize failed", zap.Error(finalizeErr))
@@ -807,7 +689,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// The exact file frontier must not bypass lifecycle-wide safety signals or
 	// the operator override. These conditions already force a full master
 	// scope below; apply them to the branch selector too.
-	exactWarmDelta = exactWarmDelta && len(deltaFiles) > 0 && !state.snapshotPartial && !needsRebuild && !forcedFullResolve
+	exactWarmDelta = exactWarmDelta && len(deltaFiles) > 0 && !needsRebuild && !forcedFullResolve
 	logger.Info("daemon: warmup delta frontier",
 		zap.Bool("exact", exactWarmDelta),
 		zap.Bool("forced_full_resolve", forcedFullResolve),
@@ -821,7 +703,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// global passes switch is honoured downstream in runMasterResolve,
 	// matching ArmBatchScope.
 	resolveScope := warmupResolveScope(changed, len(repos), anyChanged,
-		scopeUnknown.Load(), state.snapshotPartial, needsRebuild)
+		scopeUnknown.Load(), needsRebuild)
 
 	// Resume enrichment for any repo a prior process left partial / abandoned.
 	// Seeded BEFORE the resolve phase so the overlapped enrichment pool below
@@ -945,7 +827,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		})
 	}
 
-	// Rehydrate per-repo contract registries from the snapshot. Only
+	// Rehydrate per-repo contract registries from the graph. Only
 	// target indexers whose registry is still nil — a non-nil registry
 	// means IncrementalReindexPaths (or a fresh TrackRepoCtx) re-extracted
 	// contracts from source, and that result is authoritative. Without
@@ -961,44 +843,29 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			if idx == nil || idx.ContractRegistry() != nil {
 				continue
 			}
-			// Primary path: rebuild the per-repo registry from
-			// KindContract nodes already in the backend's graph.
-			// The indexer stamps every contract record onto
-			// Node.Meta at commit time, so the graph is the
-			// authoritative source — no gob round-trip needed.
+			// The indexer stamps every contract record onto Node.Meta at
+			// commit time, so the KindContract nodes already in the store
+			// are the authoritative source.
 			reg := contracts.LoadRegistryFromGraph(state.graph, prefix)
 			if reg == nil {
-				// Fallback to the legacy gob-snapshot path for
-				// daemons upgrading across this change. The
-				// snapshot copy is read-only by this point so the
-				// two sources can't drift mid-flight.
-				cs, ok := snapshotContracts[prefix]
-				if !ok || len(cs) == 0 {
-					continue
-				}
-				reg = contracts.NewRegistry()
-				for _, c := range cs {
-					reg.Add(c)
-				}
+				continue
 			}
 			idx.SetContractRegistry(reg)
 			injectedRepos++
 			injectedCount += len(reg.All())
 		}
 		if injectedRepos > 0 {
-			logger.Info("daemon: rehydrated contract registries from graph/snapshot",
+			logger.Info("daemon: rehydrated contract registries from graph",
 				zap.Int("repos", injectedRepos),
 				zap.Int("contracts", injectedCount),
 				zap.Duration("elapsed", time.Since(phaseStart)))
 		}
 	}
-	// Backfill `WorkspaceID` / `ProjectID` onto nodes and contracts
-	// loaded from a legacy snapshot. Old snapshots have these fields
-	// as zero (gob decodes unknown fields silently); without this
-	// stamp the matcher's EffectiveWorkspace falls back to RepoPrefix
-	// and explicit shared-workspace declarations stop working until
-	// every file is touched. Idempotent — re-running on a stamped
-	// graph is a no-op.
+	// Backfill `WorkspaceID` / `ProjectID` onto nodes and contracts that
+	// predate those fields — they persist as empty, and without this stamp
+	// the matcher's EffectiveWorkspace falls back to RepoPrefix, so explicit
+	// shared-workspace declarations stop working until every file is
+	// touched. Idempotent — re-running on a stamped graph is a no-op.
 	phaseStart = time.Now()
 	backfillRevisionBefore, backfillRevisionBeforeKnown := state.multiIndexer.GraphMutationRevision()
 	backfilledNodes, backfilledContracts, backfillResolutionAffected := state.multiIndexer.BackfillWorkspaceSlugsWithImpact()
@@ -1125,26 +992,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		"elapsed_ms": time.Since(phaseStart).Milliseconds(),
 	})
 
-	// Restore the workspace vector index from the snapshot. The warmup
-	// loop above ran with vector building skipped (SetSkipVectorBuild),
-	// so the search backend is text-only at this point; ImportVectorIndex
-	// wraps it into a HybridBackend with the cached vectors. This is the
-	// step that lets a default-on daemon avoid re-embedding the whole
-	// graph on every restart. SetSkipVectorBuild(false) afterwards means
-	// any later file-change re-index rebuilds vectors normally.
-	if vec := restoredVector; len(vec.Index) > 0 {
-		phaseStart = time.Now()
-		if err := state.multiIndexer.ImportVectorIndex(vec.Index, vec.Dims, vec.Count); err != nil {
-			logger.Warn("daemon: vector index restore failed — semantic search will rebuild on next index",
-				zap.Error(err))
-		} else {
-			logger.Info("daemon: restored vector index from snapshot",
-				zap.Int("vectors", vec.Count),
-				zap.Int("dims", vec.Dims),
-				zap.Duration("elapsed", time.Since(phaseStart)))
-		}
-		state.multiIndexer.SetSkipVectorBuild(false)
-	}
 	watchCfgs := make(map[string]config.WatchConfig)
 	for prefix := range state.multiIndexer.AllMetadata() {
 		watchCfgs[prefix] = state.configManager.GetRepoConfig(prefix).Watch
@@ -1457,125 +1304,16 @@ func warmupFullResolveForced() bool {
 //   - !anyChanged: nothing re-indexed, the resolve is skipped entirely.
 //   - scopeUnknown: a changed repo's prefix was indeterminate — any per-repo
 //     uncertainty forces the whole-graph pass.
-//   - snapshotPartial: the load shed edges only a full pass can restore.
 //   - needsRebuild: the backend crossed a schema-rebuild rung.
 //   - GORTEX_WARMUP_FULL_RESOLVE=1: operator override.
 //   - empty / all-repos-changed: scoping gains nothing over the full pass.
-func warmupResolveScope(changed map[string]struct{}, totalRepos int, anyChanged, scopeUnknown, snapshotPartial, needsRebuild bool) map[string]struct{} {
+func warmupResolveScope(changed map[string]struct{}, totalRepos int, anyChanged, scopeUnknown, needsRebuild bool) map[string]struct{} {
 	switch {
-	case !anyChanged, scopeUnknown, snapshotPartial, needsRebuild, warmupFullResolveForced():
+	case !anyChanged, scopeUnknown, needsRebuild, warmupFullResolveForced():
 		return nil
 	case len(changed) == 0, len(changed) >= totalRepos:
 		return nil
 	default:
 		return changed
 	}
-}
-
-// priorMtimesForEntry finds the snapshotted FileMtimes map for a
-// configured repo entry, matching on absolute RootPath. Falls back to
-// prefix-based lookup when no path match is found — useful if the
-// user's config moved but the prefix is stable. Returns nil when no
-// match exists (first startup, schema bump, or newly-added repo).
-func priorMtimesForEntry(repos map[string]*snapshotRepo, entry config.RepoEntry) map[string]int64 {
-	if len(repos) == 0 {
-		return nil
-	}
-	absPath, err := filepath.Abs(entry.Path)
-	if err != nil {
-		absPath = entry.Path
-	}
-	for _, r := range repos {
-		if r == nil {
-			continue
-		}
-		if r.RootPath == absPath {
-			return r.FileMtimes
-		}
-	}
-	if prefix := config.ResolvePrefix(entry); prefix != "" && prefix != "." {
-		if r := repos[prefix]; r != nil {
-			return r.FileMtimes
-		}
-	}
-	return nil
-}
-
-// collectSnapshotRepos snapshots the per-repo metadata needed to
-// reconcile the next startup: RepoPrefix, RootPath, and FileMtimes.
-// Called from the shutdown and periodic-snapshot paths so restart
-// warmups can run IncrementalReindexPaths instead of a full walk.
-func collectSnapshotRepos(mi *indexer.MultiIndexer) []snapshotRepo {
-	if mi == nil {
-		return nil
-	}
-	meta := mi.AllMetadata()
-	if len(meta) == 0 {
-		return nil
-	}
-	out := make([]snapshotRepo, 0, len(meta))
-	for prefix, m := range meta {
-		if m == nil {
-			continue
-		}
-		// RepoMetadata publishes an immutable snapshot. Later indexer writes
-		// detach first, so asynchronous encoding can safely share this map
-		// without retaining a second repository-sized copy.
-		mtimes := m.FileMtimes
-		out = append(out, snapshotRepo{
-			RepoPrefix: prefix,
-			RootPath:   m.RootPath,
-			FileMtimes: mtimes,
-			NodeCount:  m.NodeCount,
-			EdgeCount:  m.EdgeCount,
-		})
-	}
-	return out
-}
-
-// collectSnapshotContracts flattens every per-repo contract registry
-// into a single wire-form slice ordered by repo prefix. The warmup path
-// will redistribute by RepoPrefix when loading, so cross-repo ordering
-// is irrelevant here; the stable per-prefix grouping just keeps logs
-// and diffs readable. Called at the same points as collectSnapshotRepos
-// so the header counts and the repo/contract records agree.
-func collectSnapshotContracts(mi *indexer.MultiIndexer) []snapshotContract {
-	if mi == nil {
-		return nil
-	}
-	prefixes := make([]string, 0)
-	for prefix := range mi.AllMetadata() {
-		prefixes = append(prefixes, prefix)
-	}
-	sort.Strings(prefixes)
-
-	var out []snapshotContract
-	for _, prefix := range prefixes {
-		idx := mi.GetIndexer(prefix)
-		if idx == nil {
-			continue
-		}
-		reg := idx.ContractRegistry()
-		if reg == nil {
-			continue
-		}
-		for _, c := range reg.All() {
-			out = append(out, toSnapshotContract(c))
-		}
-	}
-	return out
-}
-
-// collectSnapshotVector serializes the workspace-global semantic-search
-// vector index for the snapshot. The daemon's search backend is shared
-// across every tracked repo, so there is exactly one vector index;
-// MultiIndexer.ExportVectorIndex returns an empty blob when embeddings
-// are disabled or no vectors were built, in which case the snapshot
-// simply carries no vector data and the next warmup re-embeds.
-func collectSnapshotVector(mi *indexer.MultiIndexer) snapshotVector {
-	if mi == nil {
-		return snapshotVector{}
-	}
-	data, dims, count := mi.ExportVectorIndex()
-	return snapshotVector{Index: data, Dims: dims, Count: count}
 }

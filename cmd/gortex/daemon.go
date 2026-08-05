@@ -20,7 +20,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/daemon"
-	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm/conversationlog"
 	"github.com/zzet/gortex/internal/platform"
@@ -82,7 +81,7 @@ var daemonStartCmd = &cobra.Command{
 
 var daemonStopCmd = &cobra.Command{
 	Use:   "stop",
-	Short: "Stop the daemon gracefully (waits for final snapshot)",
+	Short: "Stop the daemon gracefully (waits for the store to close cleanly)",
 	RunE:  runDaemonStop,
 }
 
@@ -207,7 +206,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// the parent did.
 	daemonEmbeddingsChanged = cmd.Flags().Changed("embeddings")
 
-	// Fast path: snapshot load + indexer + MCP server wiring. The
+	// Fast path: open the store + wire the indexer and MCP server. The
 	// per-repo TrackRepoCtx loop and MultiWatcher init are deferred to
 	// warmupDaemonState below so the socket opens immediately instead
 	// of waiting 30–60s for contract re-extraction across every tracked
@@ -242,27 +241,20 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		}
 	}
 	controller.setShutdownHook(func() error {
-		// Stop watchers first so no late events race the snapshot
-		// write — we want the snapshot to reflect a quiescent graph,
-		// not one being mutated by an in-flight re-index.
+		// Stop watchers first so no late events race the teardown of the
+		// store — the backend should be quiescent when it closes, not
+		// being mutated by an in-flight re-index.
 		//
 		// StopWatcher is lock-free by design. This is the first thing a
 		// stop request does, and reading the watcher under the coarse
 		// controller mutex put it straight back behind the long-running
 		// track / reload / enrichment the user is trying to end.
 		controller.StopWatcher()
-		if mg, ok := state.graph.(*graph.Graph); ok {
-			// Memory backend — snapshot the full in-memory graph;
-			// the next warmup replays nodes/edges from the gob+gzip
-			// dump because there's no other persistence layer.
-			saveSnapshot(mg, collectSnapshotRepos(state.multiIndexer), collectSnapshotContracts(state.multiIndexer), collectSnapshotVector(state.multiIndexer), version, logger)
-		}
-		// Persistent backends (sqlite) no longer write a metadata
-		// snapshot: per-file mtimes live in the FileMtime sidecar
-		// table, contract records ride on KindContract.Meta, and the
-		// vector index is persisted by the backend itself. Warm
-		// restart reads everything it needs from the on-disk store —
-		// no gob+gzip round-trip required.
+		// Nothing else has to be serialized here: per-file mtimes live in
+		// the FileMtime sidecar table, contract records ride on
+		// KindContract.Meta, and the vector index is persisted by the
+		// backend itself. Warm restart reads everything it needs straight
+		// from the on-disk store.
 		// Run the shared stack's teardown chain — flushes the savings
 		// store and closes the backend handle (checkpointing the sqlite
 		// WAL) so the daemon shuts down cleanly.
@@ -455,40 +447,10 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// Initial workspace_readiness phase — the snapshot has been
-	// loaded but warmup hasn't started yet.
-	publishReadinessPhase(state, "snapshot_loaded", false, map[string]any{
-		"snapshot_repos": len(state.snapshotRepos),
-	})
-
-	// Periodic snapshots — 10 minute interval, gated on warmup-complete.
-	// On a crash we lose at most one interval's worth of work, which is
-	// acceptable given snapshot writes are atomic (tmp → rename) and can
-	// never leave a truncated file on disk.
-	//
-	// Gating: a snapshot walks the whole graph (AllNodes + AllEdges) and
-	// holds shard RLocks for the duration. While the daemon is still
-	// warming up the parser worker pool is concurrently writing those
-	// shards via AddBatch, so an unsynchronised snapshot tick steals
-	// graph-lock budget from the work that needs to finish first and
-	// pulls millions of node/edge pointers into a live allocation set
-	// the GC then has to clean up. Skipping snapshots until ready cleared
-	// a stall observed in profile #5 where saveSnapshotTo was the only
-	// runnable goroutine on a daemon mid-warmup.
-	// Periodic snapshots fire only for the memory backend — that's
-	// the path that has no other persistence layer for the graph
-	// itself. Persistent backends (sqlite) rely on the backend's own
-	// durability (graph + FileMtimes + contracts + vectors all live
-	// on disk) so the gob+gzip snapshot is dead weight in that mode.
-	stopSnapshotter := func() {}
-	if mg, ok := state.graph.(*graph.Graph); ok {
-		// Gate on IsEnriched, not IsReady: ready now flips once references
-		// resolve (well before enrichment finishes), but a snapshot tick mid-
-		// enrichment still steals shard-lock budget from the enrichment passes
-		// writing those shards — exactly the stall this gate prevents.
-		stopSnapshotter = startPeriodicSnapshots(mg, state.multiIndexer, version, 10*time.Minute, controller.IsEnriched, logger)
-	}
-	defer stopSnapshotter()
+	// First workspace_readiness phase — the store is open and the daemon
+	// state is built, but warmup hasn't started yet. The phase name is
+	// part of the published readiness sequence clients order against.
+	publishReadinessPhase(state, "snapshot_loaded", false, nil)
 
 	// Periodic reconciliation — the "janitor". Walks each tracked repo
 	// and runs IncrementalReindexPaths to evict files deleted offline and
@@ -511,9 +473,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// contracts, attach file watchers. The daemon is already reachable
 	// on the socket at this point, so clients can connect and start
 	// issuing queries while this work continues. Queries against
-	// not-yet-re-indexed repos still hit the snapshot data loaded in
-	// buildDaemonState — they just won't reflect files that changed
-	// since the snapshot was written until warmup gets to that repo.
+	// not-yet-re-indexed repos are served from the persisted store — they
+	// just won't reflect files that changed since the daemon last shut
+	// down until warmup gets to that repo.
 	go func() {
 		runtimeactivity.Begin("warmup")
 		defer func() {
@@ -599,10 +561,6 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	return srv.Serve()
 }
 
-// startPeriodicSnapshots kicks off a goroutine that writes a snapshot on
-// every tick. Returns a stop function the caller runs at shutdown. The
-// final snapshot on shutdown is handled by onShutdown — this loop only
-// covers the "crash resilience" case (interval loss vs full re-index).
 // reconcileInterval returns the janitor tick interval, defaulting to 1
 // hour. GORTEX_RECONCILE_INTERVAL overrides; "0" or "off" disables the
 // janitor entirely (returns 0, which startReconcileJanitor treats as
@@ -671,37 +629,6 @@ func startReconcileJanitor(mi *indexer.MultiIndexer, interval time.Duration, log
 				if reconciled > 0 || gcedCount > 0 {
 					releaseMemoryToOS(logger, "reconcile_janitor")
 				}
-			case <-stop:
-				return
-			}
-		}
-	}()
-	return func() { close(stop) }
-}
-
-func startPeriodicSnapshots(g *graph.Graph, mi *indexer.MultiIndexer, version string, interval time.Duration, isReady func() bool, logger *zap.Logger) func() {
-	stop := make(chan struct{})
-	go func() {
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-t.C:
-				// Skip while the daemon is still warming up — the
-				// graph walk inside saveSnapshot would fight the
-				// parser worker pool for shard locks and pin a
-				// transient allocation set the GC then has to drain.
-				// The next tick after warmup completes catches up.
-				if isReady != nil && !isReady() {
-					logger.Debug("snapshot: skipped tick — daemon still warming up")
-					continue
-				}
-				func() {
-					runtimeactivity.Begin("snapshot")
-					defer runtimeactivity.End("snapshot")
-					saveSnapshot(g, collectSnapshotRepos(mi), collectSnapshotContracts(mi), collectSnapshotVector(mi), version, logger)
-				}()
-				releaseMemoryToOS(logger, "periodic_snapshot")
 			case <-stop:
 				return
 			}
@@ -817,11 +744,11 @@ func spawnDetachedDaemon(childArgs []string) error {
 
 	// Wait until the socket is live or a timeout hits, so we fail fast
 	// if the child died on startup. The socket opens after buildDaemonState
-	// decodes the snapshot; on a multi-hundred-MB snapshot that decode
-	// can take 10–20 s, so 5 s used to time out a perfectly healthy
-	// daemon mid-load. 60 s comfortably covers ~1 GiB snapshots while
-	// still failing fast on a child that crashed outright (those die
-	// in well under a second).
+	// finishes opening the store, which on a large workspace can take
+	// 10–20 s — 5 s used to time out a perfectly healthy daemon mid-load.
+	// 60 s comfortably covers the biggest stores we see while still
+	// failing fast on a child that crashed outright (those die in well
+	// under a second).
 	start := time.Now()
 	deadline := start.Add(60 * time.Second)
 	for time.Now().Before(deadline) {
@@ -850,7 +777,7 @@ func spawnDetachedDaemon(childArgs []string) error {
 		default:
 		}
 		if sp != nil {
-			sp.Set("", fmt.Sprintf("snapshot decoding · %s", time.Since(start).Truncate(100*time.Millisecond)))
+			sp.Set("", fmt.Sprintf("opening store · %s", time.Since(start).Truncate(100*time.Millisecond)))
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

@@ -247,7 +247,7 @@ If you run an XDG layout (any absolute `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XD
 
 - `gortex mcp` (what Claude Code spawns via `.mcp.json`) auto-detects the daemon. If reachable, it acts as a thin stdio ↔ socket proxy (~5 MB per client). If not, it falls back to the embedded server — global mode is never "required."
 - Every tracked repo gets its own fsnotify watcher so edits on disk flow into the graph live; no manual reload needed. `gortex track` attaches a watcher as part of the track operation; `gortex untrack` detaches it before evicting nodes.
-- Graph state is snapshotted to `~/.gortex/cache/daemon.gob.gz` on shutdown and every 10 minutes. Daemon restarts load it back and re-index only changed files.
+- Graph state lives in the on-disk store (`~/.gortex/store/store.sqlite`) as it is indexed. Daemon restarts open the store and re-index only the files whose mtime changed while it was down.
 - Opening Claude Code in an untracked directory returns a structured `repo_not_tracked` error on every tool call. The agent surfaces it; you run `gortex track .` to include it.
 - Per-session state is isolated by a handshake-assigned session ID — two Claude Code windows see their own recent-activity and token-savings counters, not a merged view. Cumulative savings in the sidecar ledger (`~/.gortex/sidecar.sqlite`) are still shared.
 
