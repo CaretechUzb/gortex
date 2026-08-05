@@ -84,11 +84,15 @@ type exploreTarget struct {
 	callees               []*graph.Node
 	directCalleesComplete bool // false when the direct projection was truncated, bounded, or otherwise lower-bound
 	causalCallees         []exploreCausalNeighbor
+	causalChangeBridge    bool   // one graph-proven caller/callee retained as provenance for a promoted continuation
+	causalChangeLeaf      bool   // graph-proven wrapper implementation or task-aligned cross-file change callable
+	causalChangeOwner     bool   // same-file type that encloses or is uniquely returned by the causal change callable
 	source                string // full body (may be empty for non-source kinds)
 	divergentDefaultOwner bool   // unique child constructor whose concrete default causes the queried behavior
 	divergentDefaultType  bool   // owning type paired with divergentDefaultOwner for coherent file/symbol output
 	conceptImplementation bool   // primary identifier-backed callable; may establish answer readiness
 	conceptComplement     bool   // marginal concept callable protected as evidence, never as terminal proof
+	syntacticAnchor       bool   // task-spelled flag/identifier owner protected by bounded lexical competition
 	exactContent          bool   // verified full quoted-literal hit from content_fts
 	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
 	sourceLiteral         bool   // exact source-body hit that must survive final envelope packing
@@ -2582,6 +2586,27 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		}, s.divergentDefaultFallbackSLOOverride)
 		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
 	}
+	// Causal-change promotion is the second concept lane over the same ranked
+	// head. A divergent-default proof is the stronger, pinned claim on that head
+	// and already carries its own provenance pair, so only reach for a causal
+	// route when that promotion did not take the lead.
+	if len(targets) > len(artifactTargets) {
+		symbolTargets := targets[len(artifactTargets):]
+		if exploreDivergentDefaultOwnerSymbol(symbolTargets) == "" {
+			symbolTargets = promoteExploreCausalChangeTargets(task, symbolTargets, s.graph, maxSymbols, func(node *graph.Node) string {
+				return s.manifestSymbolSource(ctx, node)
+			}, func(node *graph.Node) ([]*graph.Node, bool) {
+				callees := eng.GetCallChain(node.ID, ringOpts)
+				if callees == nil {
+					return nil, false
+				}
+				direct, projectionComplete := ringNeighborsProjection(callees.Nodes, node.ID, exploreRingCap)
+				complete := !callees.Truncated && !callees.BudgetHit && !callees.LowerBound && projectionComplete
+				return direct, complete
+			})
+			targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
+		}
+	}
 	// Direct retrieval owns the ranked head. Once graph promotion has selected
 	// a cross-file boundary, materialize exactly that one node so both text and
 	// structured responses can reserve a source body without a broad read.
@@ -3166,6 +3191,27 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 			appendTarget(target)
 		}
 	}
+	// A graph-proven change owner, bridge, and continuation outrank concept-only
+	// retrieval complements. The retrieval head remains first; this reservation
+	// only replaces non-causal tail rows when the final evidence window is full.
+	for _, target := range targets {
+		if target.causalChangeOwner {
+			appendTarget(target)
+			break
+		}
+	}
+	for _, target := range targets {
+		if target.causalChangeBridge {
+			appendTarget(target)
+			break
+		}
+	}
+	for _, target := range targets {
+		if target.causalChangeLeaf {
+			appendTarget(target)
+			break
+		}
+	}
 	// Concept reservations are weaker than exact, source-literal, typed, and
 	// divergent causal evidence, but stronger than draft relations. Keep the
 	// primary and up to two diverse complements adjacent whenever those stronger
@@ -3288,11 +3334,13 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 		}
 		direct[target.node.ID] = target
 		if index < localizationDirectEvidenceReserve || target.node.ID == requiredID ||
+			target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
 			target.divergentDefaultOwner || target.divergentDefaultType || target.conceptImplementation || target.conceptComplement ||
 			target.exactContent || target.sourceLiteral || target.typedAnchorProjection {
 			protected[target.node.ID] = struct{}{}
 		}
-		if target.node.ID == requiredID || target.divergentDefaultOwner || target.divergentDefaultType ||
+		if target.node.ID == requiredID || target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
+			target.divergentDefaultOwner || target.divergentDefaultType ||
 			target.conceptImplementation || target.conceptComplement ||
 			target.exactContent || target.sourceLiteral || target.typedAnchorProjection {
 			orderedPrefix = index + 1
@@ -3410,6 +3458,7 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 		if !exists {
 			relation = exploreTarget{node: best.node, localizationRelation: best.direction}
 		} else if relation.node.ID != requiredID &&
+			!relation.causalChangeBridge && !relation.causalChangeLeaf && !relation.causalChangeOwner &&
 			!relation.divergentDefaultOwner && !relation.divergentDefaultType &&
 			!relation.conceptImplementation && !relation.conceptComplement &&
 			!relation.exactContent && !relation.sourceLiteral && !relation.typedAnchorProjection {
