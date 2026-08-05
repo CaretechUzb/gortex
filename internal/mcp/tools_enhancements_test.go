@@ -447,8 +447,10 @@ func TestPropertyBatchEditDependencyOrdering(t *testing.T) {
 
 // Feature: gortex-enhancements, Property 16: Cross-community warning correctness
 //
-// coupling_score = (cross_boundary_edges / total_edges_in_both) * 100,
-// tightly_coupled iff > 15%.
+// The warning names every affected community and never scores the pairs
+// between them — scoring needs the whole edge set, which the impact safety
+// gate must not read. Whatever the shape of the graph, the answer is the
+// community list and nothing more.
 func TestPropertyCrossCommunityWarningCorrectness(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		// Generate two communities with members and edges
@@ -507,27 +509,6 @@ func TestPropertyCrossCommunityWarningCorrectness(t *testing.T) {
 			g.AddEdge(&graph.Edge{From: allMembersA[fromIdx], To: allMembersB[toIdx], Kind: graph.EdgeCalls})
 		}
 
-		// Count edges manually using the same logic as computeCrossCommunityWarning
-		edges := g.AllEdges()
-		crossBoundary := 0
-		totalEdges := 0
-		for _, e := range edges {
-			inA := membersA[e.From] || membersA[e.To]
-			inB := membersB[e.From] || membersB[e.To]
-			if inA || inB {
-				totalEdges++
-			}
-			if (membersA[e.From] && membersB[e.To]) || (membersB[e.From] && membersA[e.To]) {
-				crossBoundary++
-			}
-		}
-
-		var expectedScore float64
-		if totalEdges > 0 {
-			expectedScore = math.Round(float64(crossBoundary)/float64(totalEdges)*10000) / 100
-		}
-		expectedTightlyCoupled := expectedScore > 15
-
 		// Build community result for the server method
 		communities := &analysis.CommunityResult{
 			Communities: []analysis.Community{
@@ -559,22 +540,9 @@ func TestPropertyCrossCommunityWarningCorrectness(t *testing.T) {
 			rt.Errorf("expected 2 affected communities, got %d", len(warning.AffectedCommunities))
 		}
 
-		if len(warning.Couplings) != 1 {
-			rt.Fatalf("expected 1 coupling pair, got %d", len(warning.Couplings))
-		}
-
-		coupling := warning.Couplings[0]
-
-		// Verify coupling score matches formula
-		if math.Abs(coupling.CouplingScore-expectedScore) > 0.01 {
-			rt.Errorf("coupling score mismatch: got %.2f, expected %.2f (cross=%d, total=%d)",
-				coupling.CouplingScore, expectedScore, crossBoundary, totalEdges)
-		}
-
-		// Verify tightly_coupled flag
-		if coupling.TightlyCoupled != expectedTightlyCoupled {
-			rt.Errorf("tightly_coupled mismatch: got %v, expected %v (score=%.2f)",
-				coupling.TightlyCoupled, expectedTightlyCoupled, coupling.CouplingScore)
+		if len(warning.Couplings) != 0 {
+			rt.Fatalf("impact scored %d coupling pair(s); the safety gate must not read the edge set",
+				len(warning.Couplings))
 		}
 	})
 }

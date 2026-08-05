@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"context"
-	"math"
 	"strings"
 	"time"
 
@@ -451,28 +450,25 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 	// wired up. Classify each input so a safety gate is not disarmed
 	// by a false "0 affected".
 	if impact.TotalAffected == 0 && !impact.Truncated {
-		if _, inMemory := s.graph.(*graph.Graph); inMemory {
-			var caveats []graph.ZeroImpactCaveat
-			for _, id := range ids {
-				if id == "" {
-					continue
-				}
-				if c := graph.CaveatForZeroEdge(s.graph, id); c != nil {
-					caveats = append(caveats, graph.ZeroImpactCaveat{
-						ID:      id,
-						Class:   c.Class,
-						Message: c.Message,
-					})
-				}
+		// The classifier costs a handful of indexed point lookups per input
+		// symbol (node fetch plus its in/out edges), which every backend serves
+		// cheaply — so the safety gate is armed everywhere, not only on small
+		// embedded graphs.
+		var caveats []graph.ZeroImpactCaveat
+		for _, id := range ids {
+			if id == "" {
+				continue
 			}
-			if len(caveats) > 0 {
-				result["zero_impact_caveat"] = caveats
+			if c := graph.CaveatForZeroEdge(s.graph, id); c != nil {
+				caveats = append(caveats, graph.ZeroImpactCaveat{
+					ID:      id,
+					Class:   c.Class,
+					Message: c.Message,
+				})
 			}
-		} else {
-			// Detailed extraction-gap classification performs additional graph
-			// reads. Keep the disk-backed safety gate deadline strict and state
-			// the uncertainty directly instead of risking another SQLite wait.
-			result["zero_impact_warning"] = "zero observed dependents is not proof of zero impact; extraction or resolution gaps may exist"
+		}
+		if len(caveats) > 0 {
+			result["zero_impact_caveat"] = caveats
 		}
 	}
 
@@ -704,77 +700,12 @@ type CrossCommunityWarning struct {
 	Couplings           []CommunityCoupling `json:"couplings,omitempty"`
 }
 
-func (s *Server) computeCrossCommunityWarning(affectedCommunities []string, communities *analysis.CommunityResult) *CrossCommunityWarning {
-	warning := &CrossCommunityWarning{AffectedCommunities: affectedCommunities}
-	if communities == nil || len(affectedCommunities) < 2 {
-		return warning
-	}
-
-	// Impact is an interactive safety gate. Never materialise SQLite's entire
-	// edge table here: the previous implementation did that once per community
-	// pair, turning a small impact query into O(E*C²) database work and starving
-	// every other daemon request. Preserve the detailed score only for bounded
-	// in-memory graphs; disk-backed callers still receive the actionable list of
-	// affected communities and can request the dedicated coupling analysis.
-	const (
-		maxImpactCouplingCommunities = 8
-		maxImpactCouplingEdges       = 50_000
-	)
-	memoryGraph, ok := s.graph.(*graph.Graph)
-	if !ok || len(affectedCommunities) > maxImpactCouplingCommunities || memoryGraph.EdgeCount() > maxImpactCouplingEdges {
-		return warning
-	}
-
-	commLabels := make(map[string]string, len(communities.Communities))
-	commMembers := make(map[string]map[string]bool, len(affectedCommunities))
-	affected := make(map[string]bool, len(affectedCommunities))
-	for _, id := range affectedCommunities {
-		affected[id] = true
-	}
-	for _, c := range communities.Communities {
-		if !affected[c.ID] {
-			continue
-		}
-		commLabels[c.ID] = c.Label
-		memberSet := make(map[string]bool, len(c.Members))
-		for _, member := range c.Members {
-			memberSet[member] = true
-		}
-		commMembers[c.ID] = memberSet
-	}
-
-	// Materialise the already-bounded in-memory edge set once, not once per
-	// pair. This keeps the compatibility detail inexpensive in tests and small
-	// embedded graphs while leaving the production SQLite path read-light.
-	edges := memoryGraph.AllEdges()
-	for i := 0; i < len(affectedCommunities); i++ {
-		for j := i + 1; j < len(affectedCommunities); j++ {
-			cA, cB := affectedCommunities[i], affectedCommunities[j]
-			membersA, membersB := commMembers[cA], commMembers[cB]
-			if len(membersA) == 0 || len(membersB) == 0 {
-				continue
-			}
-			crossBoundary, totalEdges := 0, 0
-			for _, edge := range edges {
-				inA := membersA[edge.From] || membersA[edge.To]
-				inB := membersB[edge.From] || membersB[edge.To]
-				if inA || inB {
-					totalEdges++
-				}
-				if (membersA[edge.From] && membersB[edge.To]) || (membersB[edge.From] && membersA[edge.To]) {
-					crossBoundary++
-				}
-			}
-			var score float64
-			if totalEdges > 0 {
-				score = math.Round(float64(crossBoundary)/float64(totalEdges)*10_000) / 100
-			}
-			warning.Couplings = append(warning.Couplings, CommunityCoupling{
-				CommunityA: cA, CommunityB: cB,
-				LabelA: commLabels[cA], LabelB: commLabels[cB],
-				CouplingScore: score, TightlyCoupled: score > 15,
-			})
-		}
-	}
-	return warning
+// computeCrossCommunityWarning names the communities a change reaches.
+//
+// It deliberately reports no per-pair coupling score: scoring a pair requires
+// the whole edge table, which is far too much work for an interactive safety
+// gate that runs before every edit. Callers who want the numbers ask for the
+// dedicated coupling analysis, which is scoped and budgeted for it.
+func (s *Server) computeCrossCommunityWarning(affectedCommunities []string, _ *analysis.CommunityResult) *CrossCommunityWarning {
+	return &CrossCommunityWarning{AffectedCommunities: affectedCommunities}
 }
