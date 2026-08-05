@@ -350,18 +350,21 @@ var editSymbolCmd = &cobra.Command{
 
 // --- edit rename -----------------------------------------------------------
 
-var editRenameTo string
+var (
+	editRenameTo     string
+	editRenameDryRun bool
+)
 
 var editRenameCmd = &cobra.Command{
 	Use:   "rename <id>",
-	Short: "Plan a coordinated cross-file rename (plan-only, never writes)",
+	Short: "Apply a coordinated cross-file rename (--dry-run to preview)",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if editRenameTo == "" {
 			return fmt.Errorf("--to is required (the new name)")
 		}
 		return runEditTool(cmd, "rename_symbol",
-			map[string]any{"id": args[0], "new_name": editRenameTo}, nil)
+			map[string]any{"id": args[0], "new_name": editRenameTo, "dry_run": editRenameDryRun}, nil)
 	},
 }
 
@@ -578,6 +581,7 @@ func init() {
 
 	// rename
 	editRenameCmd.Flags().StringVar(&editRenameTo, "to", "", "new name for the symbol (new_name)")
+	editRenameCmd.Flags().BoolVar(&editRenameDryRun, "dry-run", false, "preview the edits without writing them")
 
 	// guards
 	editGuardsCmd.Flags().StringVar(&editGuardsIDs, "ids", "", "comma-separated changed symbol IDs")

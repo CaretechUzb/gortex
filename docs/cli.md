@@ -266,7 +266,7 @@ The daemon's safe-edit surface as CLI verbs. The read-only verbs (`context`, `ve
 | `edit batch` | `batch_edit` | `--edits` / `--edits-file` / `-`; `--dry-run`, `--compact` |
 | `edit apply <file>` | `edit_file` | `--old`, `--new` (required), `--replace-all`, `--dry-run`, `--allow-parse-errors`, `--expected <n>` |
 | `edit symbol <id>` | `edit_symbol` | `--old`, `--new` (required), `--dry-run` |
-| `edit rename <id>` | `rename_symbol` | `--to <name>` (required) — **plan-only, never writes** |
+| `edit rename <id>` | `rename_symbol` | `--to <name>` (required), `--dry-run` |
 | `edit guards` | `check_guards` | `--ids <csv>` (required), `--compact` |
 | `edit tests` | `get_test_targets` | `--ids <csv>` (required), `--depth` (default 3) |
 | `edit contract` | `change_contract` | `--source auto\|diff\|edit\|symbols\|ranges`, `--lens api`, `--risk-gate`, `--ack`, `--base <ref>`, `--workspace-edit*`, `--symbols <csv>`, `--ranges*` / `--path` + `--start-line` + `--end-line` |

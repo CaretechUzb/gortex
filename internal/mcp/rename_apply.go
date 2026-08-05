@@ -1,0 +1,273 @@
+package mcp
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/zzet/gortex/internal/agents"
+)
+
+// renameEdit is one planned single-line replacement in a coordinated rename.
+// It is the unit both the preview and the on-disk apply operate on, so what a
+// caller is shown is exactly what gets written.
+type renameEdit struct {
+	File       string `json:"file"`
+	Line       int    `json:"line"`
+	OldText    string `json:"old_text"`
+	NewText    string `json:"new_text"`
+	Confidence string `json:"confidence"`
+	Reason     string `json:"reason"`
+}
+
+// indexIdentifier returns the byte offset of the first whole-identifier
+// occurrence of name at or after from, or -1 when there is none. A candidate
+// is whole only when neither neighbouring rune is an identifier rune, so
+// searching for "Get" does not match inside "GetUser" or "doGet".
+func indexIdentifier(line, name string, from int) int {
+	if name == "" || from > len(line) {
+		return -1
+	}
+	for i := from; i <= len(line)-len(name); {
+		idx := strings.Index(line[i:], name)
+		if idx < 0 {
+			return -1
+		}
+		start := i + idx
+		end := start + len(name)
+		if identifierBoundary(line, start, end) {
+			return start
+		}
+		// Rescan from one byte past this candidate's start rather than past
+		// its end, so an overlapping whole match is not skipped.
+		i = start + 1
+	}
+	return -1
+}
+
+// identifierBoundary reports whether line[start:end] stands alone as an
+// identifier rather than sitting inside a longer one. Identifier runes come
+// from isIdentRune — letters, digits, and '_'. Sigils such as PHP's '$' are
+// deliberately excluded: they prefix a name without being part of it, and
+// counting them would make "$foo" unrenamable.
+func identifierBoundary(line string, start, end int) bool {
+	if start > 0 {
+		if r, _ := utf8.DecodeLastRuneInString(line[:start]); isIdentRune(r) {
+			return false
+		}
+	}
+	if end < len(line) {
+		if r, _ := utf8.DecodeRuneInString(line[end:]); isIdentRune(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// replaceIdentifierAll rewrites every whole-identifier occurrence of old and
+// returns the new line plus the number of replacements. Replacing every
+// occurrence (not just the first) matters on lines such as
+// "x := Get(Get(y))", and the boundary check keeps "GetUser" intact.
+func replaceIdentifierAll(line, old, replacement string) (string, int) {
+	if old == "" {
+		return line, 0
+	}
+	var b strings.Builder
+	count := 0
+	pos := 0
+	for {
+		start := indexIdentifier(line, old, pos)
+		if start < 0 {
+			b.WriteString(line[pos:])
+			break
+		}
+		b.WriteString(line[pos:start])
+		b.WriteString(replacement)
+		count++
+		pos = start + len(old)
+	}
+	if count == 0 {
+		return line, 0
+	}
+	return b.String(), count
+}
+
+// splitLineTerminator splits a raw line into its content and trailing
+// terminator ("", "\n", or "\r\n").
+func splitLineTerminator(raw string) (body, term string) {
+	switch {
+	case strings.HasSuffix(raw, "\r\n"):
+		return raw[:len(raw)-2], "\r\n"
+	case strings.HasSuffix(raw, "\n"):
+		return raw[:len(raw)-1], "\n"
+	default:
+		return raw, ""
+	}
+}
+
+// splitLinesKeepEnds splits content into lines that each retain their own
+// terminator, so rewriting one line cannot normalise the rest of the file's
+// line endings or append a terminator the file never had.
+func splitLinesKeepEnds(content string) []string {
+	if content == "" {
+		return nil
+	}
+	var lines []string
+	for len(content) > 0 {
+		idx := strings.IndexByte(content, '\n')
+		if idx < 0 {
+			lines = append(lines, content)
+			break
+		}
+		lines = append(lines, content[:idx+1])
+		content = content[idx+1:]
+	}
+	return lines
+}
+
+// renameFileWrite is one file's fully-computed rewrite, held in memory until
+// every affected file has passed verification.
+type renameFileWrite struct {
+	RelPath  string
+	AbsPath  string
+	Old      []byte
+	New      []byte
+	Edits    int
+	NewSHA   string
+	Gate     parseGateResult
+	GateInfo map[string]any
+}
+
+// planRenameWrites resolves every affected file, re-verifies each target line
+// against current disk content, and computes the rewritten bytes — without
+// writing anything.
+//
+// Verification and the parse gate run across the whole edit set before the
+// caller commits any file, so a rename either lands completely or not at all.
+// A half-applied rename is worse than a refused one: it leaves the tree
+// uncompilable with no record of how far it got.
+func (s *Server) planRenameWrites(edits []renameEdit, allowParseErrors bool) ([]*renameFileWrite, error) {
+	byFile := make(map[string][]renameEdit)
+	for _, e := range edits {
+		byFile[e.File] = append(byFile[e.File], e)
+	}
+	files := make([]string, 0, len(byFile))
+	for f := range byFile {
+		files = append(files, f)
+	}
+	sort.Strings(files)
+
+	writes := make([]*renameFileWrite, 0, len(files))
+	for _, relPath := range files {
+		absPath, err := s.resolveGraphPath(relPath)
+		if err != nil {
+			return nil, fmt.Errorf("could not resolve %s: %w", relPath, err)
+		}
+		content, err := os.ReadFile(absPath)
+		if err != nil {
+			return nil, fmt.Errorf("could not read %s: %w", relPath, err)
+		}
+		lines := splitLinesKeepEnds(string(content))
+
+		fileEdits := byFile[relPath]
+		sort.Slice(fileEdits, func(i, j int) bool { return fileEdits[i].Line < fileEdits[j].Line })
+		for _, e := range fileEdits {
+			if e.Line < 1 || e.Line > len(lines) {
+				return nil, fmt.Errorf(
+					"%s:%d is outside the file (%d lines) — the index is stale relative to disk; re-run after reindexing",
+					relPath, e.Line, len(lines))
+			}
+			body, term := splitLineTerminator(lines[e.Line-1])
+			if body != e.OldText {
+				// The graph and disk disagree, so the planned replacement was
+				// computed against content that is no longer there. Refuse
+				// rather than write a line we never actually inspected.
+				return nil, fmt.Errorf(
+					"%s:%d changed on disk since it was planned — refusing the rename so no unreviewed line is rewritten. Re-run rename after the file settles",
+					relPath, e.Line)
+			}
+			lines[e.Line-1] = e.NewText + term
+		}
+
+		newContent := []byte(strings.Join(lines, ""))
+		w := &renameFileWrite{
+			RelPath: relPath,
+			AbsPath: absPath,
+			Old:     content,
+			New:     newContent,
+			Edits:   len(fileEdits),
+			NewSHA:  gitBlobSHA(newContent),
+		}
+		if parseGateEnabled() {
+			w.Gate = checkParseGate(relPath, content, newContent)
+			if w.Gate.Blocked && !allowParseErrors {
+				return nil, fmt.Errorf("%s", parseGateError(relPath, w.Gate))
+			}
+		}
+		w.GateInfo = parseGateInfo(w.Gate, allowParseErrors)
+		writes = append(writes, w)
+	}
+	return writes, nil
+}
+
+// commitRenameWrites writes each verified file atomically and reports the
+// per-file outcome. Callers must already hold the mutation locks for every
+// path in writes.
+func (s *Server) commitRenameWrites(ctx context.Context, writes []*renameFileWrite) []map[string]any {
+	sess := s.sessionFor(ctx)
+	results := make([]map[string]any, 0, len(writes))
+	for _, w := range writes {
+		entry := map[string]any{
+			"file":          w.RelPath,
+			"edits":         w.Edits,
+			"bytes_written": len(w.New),
+			"new_sha":       w.NewSHA,
+		}
+		if w.GateInfo != nil {
+			entry["parse_gate"] = w.GateInfo
+		}
+		perm := os.FileMode(0o644)
+		if info, err := os.Stat(w.AbsPath); err == nil {
+			perm = info.Mode().Perm()
+		}
+		if err := agents.AtomicWriteFile(w.AbsPath, w.New, perm); err != nil {
+			entry["status"] = "failed"
+			entry["error"] = err.Error()
+			results = append(results, entry)
+			continue
+		}
+		entry["status"] = "applied"
+		sess.recordModified(w.RelPath)
+		outcome := s.mutationReindexState(ctx, w.AbsPath)
+		if outcome.Err != nil {
+			entry["reindex_error"] = outcome.Err.Error()
+		}
+		s.attachMutationFreshness(entry, w.RelPath, w.AbsPath, outcome)
+		results = append(results, entry)
+	}
+	return results
+}
+
+// previewRenameWrites renders the same per-file shape as a committed rename
+// with nothing written, so a caller can diff a dry run against the real thing.
+func previewRenameWrites(writes []*renameFileWrite) []map[string]any {
+	results := make([]map[string]any, 0, len(writes))
+	for _, w := range writes {
+		entry := map[string]any{
+			"file":          w.RelPath,
+			"edits":         w.Edits,
+			"bytes_written": len(w.New),
+			"new_sha":       w.NewSHA,
+			"status":        "would_apply",
+			"reindexed":     false,
+		}
+		if w.GateInfo != nil {
+			entry["parse_gate"] = w.GateInfo
+		}
+		results = append(results, entry)
+	}
+	return results
+}
