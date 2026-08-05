@@ -347,12 +347,16 @@ func (r *Resolver) loneMemberDefnKeep(target *graph.Node, e *graph.Edge, oldTo s
 // a class-based member call is the language's dispatch model. PHP qualifies:
 // its calls carry a receiver, and since PHP call sites stamp receiver_type the
 // external-receiver gate above screens them more effectively than it does for
-// most of this list. TS / Python / JS stay out — an object literal or a
-// dynamically attached method makes a same-name coincidence likelier there,
-// and their guard revert is load-bearing.
+// most of this list. GDScript qualifies for the same reason and needs it more
+// than any of them: a script IS a class, `class_name` registers it
+// project-globally, and the language has no import statement at all — so the
+// import closure this guard consults is structurally empty for every
+// cross-directory call and would revert all of them. TS / Python / JS stay
+// out — an object literal or a dynamically attached method makes a same-name
+// coincidence likelier there, and their guard revert is load-bearing.
 func loneMemberLang(lang string) bool {
 	switch lang {
-	case "java", "go", "rust", "csharp", "kotlin", "scala", "php":
+	case "java", "go", "rust", "csharp", "kotlin", "scala", "php", "gdscript":
 		return true
 	}
 	return false
