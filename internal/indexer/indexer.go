@@ -765,6 +765,101 @@ func ftsTokensFor(n *graph.Node, projectName string) string {
 	return strings.Join(tokens, " ")
 }
 
+// symbolFTSDirectChunk{Rows,Bytes} bound one BatchUpsertSymbolFTS call made
+// while rebuilding the FTS from an already-persisted repository. They mirror
+// the shadow drain's caps: this path runs when the repository was too large to
+// stage in RAM, so neither the buffer nor the node stream feeding it may grow
+// with repository size.
+const (
+	symbolFTSDirectChunkRows  = 2048
+	symbolFTSDirectChunkBytes = 4 << 20
+)
+
+// populateSymbolFTS rebuilds this repository's symbol FTS documents from the
+// nodes already in the store. The shadow drain writes those documents as it
+// hands nodes to disk; a parse that ran straight against the disk store has no
+// such hand-off, and the backend does not maintain the FTS from graph
+// mutations, so its symbol corpus would otherwise stay empty.
+//
+// Nodes stream through the store's bounded scoped projection instead of a
+// whole-repository read: the caller reached this path precisely because the
+// repository does not fit in memory. Backends without the reset/upsert
+// capabilities (the in-memory store, test fixtures) are a no-op — their search
+// index is populated by buildSearchIndex instead.
+//
+// Admission and token derivation are shared with every other FTS writer
+// (shouldIndexForSearch, ftsTokensFor) so the corpus is identical whichever
+// path produced it.
+func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
+	batcher, hasBatcher := idx.graph.(graph.SymbolFTSBatchUpserter)
+	resetter, hasResetter := idx.graph.(graph.SymbolFTSRepoResetter)
+	stream, hasStream := idx.graph.(graph.ScopedProjectionSequencer)
+	if !hasBatcher || !hasResetter || !hasStream {
+		return nil
+	}
+
+	repoPrefix := idx.RepoPrefix()
+	started := time.Now()
+	if reporter != nil {
+		reporter.Report("building symbol fts", 0, 0)
+	}
+	if err := resetter.ResetSymbolFTS(repoPrefix); err != nil {
+		return fmt.Errorf("indexer: reset symbol FTS: %w", err)
+	}
+
+	items := make([]graph.SymbolFTSItem, 0, symbolFTSDirectChunkRows)
+	var pending uint64
+	written := 0
+	var flushErr error
+	flush := func() bool {
+		if len(items) == 0 {
+			return true
+		}
+		if err := batcher.BatchUpsertSymbolFTS(items); err != nil {
+			flushErr = fmt.Errorf("indexer: append symbol FTS batch: %w", err)
+			return false
+		}
+		written += len(items)
+		items = make([]graph.SymbolFTSItem, 0, symbolFTSDirectChunkRows)
+		pending = 0
+		return true
+	}
+
+	for node := range stream.NodesInScopeSeq([]string{repoPrefix}, nil) {
+		if node == nil || !idx.shouldIndexForSearch(node) {
+			continue
+		}
+		tokens := ftsTokensFor(node, idx.projectName)
+		items = append(items, graph.SymbolFTSItem{NodeID: node.ID, Tokens: tokens})
+		pending += uint64(len(node.ID) + len(tokens) + 32)
+		if len(items) >= symbolFTSDirectChunkRows || pending >= symbolFTSDirectChunkBytes {
+			if !flush() {
+				break
+			}
+		}
+	}
+	if flushErr == nil {
+		flush()
+	}
+	if flushErr != nil {
+		return flushErr
+	}
+
+	if searcher, ok := idx.graph.(graph.SymbolSearcher); ok {
+		if err := searcher.BuildSymbolIndex(); err != nil {
+			return fmt.Errorf("indexer: finalize backend FTS: %w", err)
+		}
+	}
+	if reporter != nil {
+		reporter.Report("building symbol fts", 1, 1)
+	}
+	idx.logger.Info("indexer: symbol FTS rebuilt from store",
+		zap.String("repo", repoPrefix),
+		zap.Int("fts_items", written),
+		zap.Duration("elapsed", time.Since(started)))
+	return nil
+}
+
 // shouldIndexForSearch reports whether a node should be added to the
 // text search index (BM25/Bleve). File and Import nodes are never
 // searchable symbols. Beyond that, config.SkipSearch filters out
@@ -3042,6 +3137,24 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				zap.Int64("shadow_process_used_bytes", shadowStats.used),
 				zap.Bool("shadow_disabled_or_oversized", shadowLocallyEligible && !shadowTaken))
 		}
+	}
+
+	if !shadowTaken {
+		// Without a shadow there is no drain, and the drain is the only place a
+		// full parse writes the backend's symbol FTS — graph mutations do not
+		// maintain it. Left alone, symbol search would be degraded on exactly
+		// the repositories that were too large for the shadow, and on every
+		// streaming-flush parse. Deferred for the same reason the drain is:
+		// resolution and enrichment keep adding nodes after the parse returns,
+		// so running here would index a corpus the shadow path never produces.
+		defer func() {
+			if retErr != nil {
+				return
+			}
+			if err := idx.populateSymbolFTS(reporter); err != nil {
+				retErr = err
+			}
+		}()
 	}
 
 	// Repository-level admission for intrinsically large direct parses. The
