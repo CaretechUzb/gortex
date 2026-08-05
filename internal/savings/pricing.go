@@ -18,9 +18,11 @@ type Price struct {
 // defaultPricing is the built-in table used when no override is configured.
 // Input-token list prices in USD per 1M tokens, covering the providers
 // gortex's LLM features talk to: Anthropic, OpenAI (also reachable via
-// Azure), Google Gemini and DeepSeek. Bedrock-hosted Anthropic/OpenAI ids
-// resolve through findPrice's substring match. Tokens saved are billed at
-// the input rate. Users can override the whole table via
+// Azure), Google Gemini and DeepSeek — plus Zhipu's GLM line, which
+// reaches the ledger as a client model rather than as a gortex provider.
+// Bedrock-hosted Anthropic/OpenAI ids resolve through findPrice's
+// substring match. Tokens saved are billed at the input rate. Users can
+// override the whole table via
 // GORTEX_MODEL_PRICING_JSON='[{"model":"...","usd_per_m_input":N},...]'.
 var defaultPricing = []Price{
 	// Anthropic — claude-opus-4-8 is the headline default (see savings.go).
@@ -64,6 +66,27 @@ var defaultPricing = []Price{
 	// DeepSeek — deepseek-chat / deepseek-reasoner are gortex's configured ids.
 	{"deepseek-chat", 0.27},
 	{"deepseek-reasoner", 0.42},
+	// Zhipu GLM (docs.z.ai list prices). These are client-model slugs — a
+	// coding agent pointed at Zhipu's Anthropic-compatible endpoint, or at
+	// Ollama Cloud, reports them into savings attribution even though
+	// gortex never calls them itself. Every tier gets its own row on
+	// purpose: findPrice falls back to a substring match, so omitting
+	// glm-4.5-air would silently bill it at the glm-4.5 rate — 3x its
+	// real price. The two free Flash tiers carry an explicit 0.00 for the
+	// same reason; they surface as "unpriced", which beats overcharging.
+	{"glm-5.2", 1.40},
+	{"glm-5.1", 1.40},
+	{"glm-5-turbo", 1.20},
+	{"glm-5", 1.00},
+	{"glm-4.7", 0.60},
+	{"glm-4.7-flashx", 0.07},
+	{"glm-4.7-flash", 0.00},
+	{"glm-4.6", 0.60},
+	{"glm-4.5", 0.60},
+	{"glm-4.5-x", 2.20},
+	{"glm-4.5-airx", 1.10},
+	{"glm-4.5-air", 0.20},
+	{"glm-4.5-flash", 0.00},
 }
 
 // Pricing returns the active pricing table — default unless overridden by

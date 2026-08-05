@@ -50,6 +50,7 @@ func TestCostAvoidedAll_IncludesDefaults(t *testing.T) {
 		"gpt-5.5", "gpt-5.4", "gpt-4.1", "gpt-4o", "o4-mini",
 		"gemini-3.1-pro", "gemini-3.5-flash", "gemini-2.5-pro",
 		"deepseek-chat", "deepseek-reasoner",
+		"glm-5.2", "glm-4.7",
 	}
 	for _, m := range wantModels {
 		if _, ok := all[m]; !ok {
@@ -136,6 +137,71 @@ func TestModelRateReportsUnknownAsZero(t *testing.T) {
 	}
 	if got := ModelRate(""); got != 0 {
 		t.Errorf("ModelRate(\"\") = %.4f, want 0", got)
+	}
+}
+
+// TestDefaultPricingCoversGLM pins Zhipu's published input rates. GLM ids
+// arrive as *client* models — a coding agent pointed at Zhipu's endpoint —
+// so they never appear in gortex's own provider config and are easy to
+// forget; a missing row reports $0.00 cost avoided next to real savings.
+func TestDefaultPricingCoversGLM(t *testing.T) {
+	// USD per 1M input tokens, per docs.z.ai.
+	want := map[string]float64{
+		"glm-5.2":        1.40,
+		"glm-5.1":        1.40,
+		"glm-5-turbo":    1.20,
+		"glm-5":          1.00,
+		"glm-4.7":        0.60,
+		"glm-4.7-flashx": 0.07,
+		"glm-4.6":        0.60,
+		"glm-4.5":        0.60,
+		"glm-4.5-x":      2.20,
+		"glm-4.5-airx":   1.10,
+		"glm-4.5-air":    0.20,
+	}
+	for model, rate := range want {
+		got := ModelRate(model)
+		if got == 0 {
+			t.Errorf("ModelRate(%q) = 0 — model missing from the pricing table, so its "+
+				"cost avoided renders as $0.00", model)
+			continue
+		}
+		if got != rate {
+			t.Errorf("ModelRate(%q) = %.2f, want %.2f", model, got, rate)
+		}
+	}
+	// The issue that prompted this row: 1M tokens saved on GLM-5.2 is
+	// $1.40 avoided, not $0.00.
+	if got := CostAvoided(1_000_000, "glm-5.2"); got != 1.40 {
+		t.Errorf("CostAvoided(1M, glm-5.2) = %.4f, want 1.40", got)
+	}
+}
+
+// TestPricingGLMTierDoesNotInheritParentRate guards the substring resolver
+// across the GLM tiers, where the spread is widest: glm-4.5-air is 3x
+// cheaper than glm-4.5 and glm-4.7-flashx nearly 9x cheaper than glm-4.7,
+// so a row falling through to its family prefix overbills by that factor.
+func TestPricingGLMTierDoesNotInheritParentRate(t *testing.T) {
+	for _, tc := range []struct{ tier, parent string }{
+		{"glm-4.5-air", "glm-4.5"},
+		{"glm-4.5-airx", "glm-4.5"},
+		{"glm-4.5-x", "glm-4.5"},
+		{"glm-4.7-flashx", "glm-4.7"},
+		{"glm-5.2", "glm-5"},
+		{"glm-5-turbo", "glm-5"},
+	} {
+		if ModelRate(tc.tier) == ModelRate(tc.parent) {
+			t.Errorf("ModelRate(%q) == ModelRate(%q) — tier resolved against its "+
+				"family prefix instead of its own row", tc.tier, tc.parent)
+		}
+	}
+	// Zhipu's Flash tiers are free. They must not inherit the paid parent
+	// rate; a 0 rate renders as "unpriced", which is the honest outcome
+	// the table has no other way to express.
+	for _, free := range []string{"glm-4.7-flash", "glm-4.5-flash"} {
+		if got := ModelRate(free); got != 0 {
+			t.Errorf("ModelRate(%q) = %.2f, want 0 — free tier must not inherit a paid rate", free, got)
+		}
 	}
 }
 
