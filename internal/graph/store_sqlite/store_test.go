@@ -9,6 +9,13 @@ import (
 	"github.com/zzet/gortex/internal/graph/storetest"
 )
 
+// TestSQLiteStoreConformance runs the shared Store battery against the backend
+// the daemon actually serves from.
+//
+// The factory must stay FILE-backed. A ":memory:" store is a single connection,
+// so the reentrancy subtests — which issue a read from inside an iterator's
+// yield body — would deadlock rather than fail, and a hung package run is far
+// harder to diagnose than a red one.
 func TestSQLiteStoreConformance(t *testing.T) {
 	storetest.RunConformance(t, func(t *testing.T) graph.Store {
 		dir := t.TempDir()
@@ -18,7 +25,7 @@ func TestSQLiteStoreConformance(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = s.Close() })
 		return s
-	})
+	}, storetest.Semantics{Reads: storetest.ReadsDetached})
 }
 
 func TestSQLiteExistingNodeIDsProjectsOnlyRequestedPresence(t *testing.T) {

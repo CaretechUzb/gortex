@@ -25,10 +25,45 @@ import (
 // on-disk state should use t.TempDir() internally to isolate.
 type Factory func(t *testing.T) graph.Store
 
+// ReadSemantics names what a backend hands back from a read — the one
+// behaviour the suite cannot discover by probing, because both answers are
+// legitimate and neither is observable without knowing which to expect.
+type ReadSemantics int
+
+const (
+	// ReadsDetached means every read materialises a fresh copy: mutating a
+	// returned *Node or *Edge changes nothing in the store, and the change is
+	// lost unless the caller hands it back through a write method. This is the
+	// contract every backend the daemon actually runs on satisfies, and the
+	// only one production code is allowed to assume.
+	ReadsDetached ReadSemantics = iota
+
+	// ReadsAliasStore means a read hands back the store's own live pointer, so
+	// an in-place field mutation is immediately durable without any write call.
+	// The in-memory staging graph behaves this way because it is a bag of
+	// pointers, and the cold-index path leans on it as a scratch buffer.
+	//
+	// That is the ONE sanctioned exception. Production code must never rely on
+	// aliasing: the same code running against a detached backend would silently
+	// drop the mutation. Passes that need an attribute change to stick call the
+	// explicit persistence capability (graph.EdgePersister and friends), which
+	// is correct under both semantics.
+	ReadsAliasStore
+)
+
+// Semantics declares the backend behaviours the conformance suite cannot infer
+// from the Store interface alone. Every backend states its answer at the call
+// site, so a divergence between backends is visible in source rather than
+// buried in whichever implementation a reader happens to open first.
+type Semantics struct {
+	// Reads declares whether reads alias the store or return detached copies.
+	Reads ReadSemantics
+}
+
 // RunConformance runs the full conformance suite against the Store
 // produced by factory. Backends invoke it from a _test.go in their
-// own package.
-func RunConformance(t *testing.T, factory Factory) {
+// own package, declaring their semantics alongside the factory.
+func RunConformance(t *testing.T, factory Factory, semantics Semantics) {
 	t.Helper()
 	t.Run("AddGetNode", func(t *testing.T) { testAddGetNode(t, factory) })
 	t.Run("AddGetEdge", func(t *testing.T) { testAddGetEdge(t, factory) })
@@ -113,6 +148,8 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("BlameEnrichmentSidecar", func(t *testing.T) { testBlameEnrichmentSidecar(t, factory) })
 	t.Run("ContractBridgeRoundTrip", func(t *testing.T) { testContractBridgeRoundTrip(t, factory) })
 	t.Run("PrefixDiagnostics", func(t *testing.T) { testPrefixDiagnostics(t, factory) })
+	t.Run("EdgePersistRoundTrip", func(t *testing.T) { testEdgePersistRoundTrip(t, factory) })
+	t.Run("ReadAliasing", func(t *testing.T) { testReadAliasing(t, factory, semantics) })
 }
 
 // testPrefixDiagnostics is the cross-backend fence for the repo-ownership
@@ -4332,4 +4369,207 @@ func testContractBridgeRoundTrip(t *testing.T, factory Factory) {
 	if got := s.GetInEdges("http::GET::/v1/users"); len(got) != 0 {
 		t.Fatalf("stale bridge in-edges survived eviction: %v", got)
 	}
+}
+
+// -- read semantics ----------------------------------------------------
+//
+// The two Store implementations answer a read differently, and until these
+// two subtests existed nothing in the tree said so out loud. The staging
+// graph is a bag of pointers, so a read hands back the store's own *Edge and
+// an in-place field assignment is already durable. A disk backend decodes a
+// row into a fresh struct, so the same assignment writes to garbage the
+// moment the caller drops it.
+//
+// The reconciling mechanism is the optional persistence capability set
+// (graph.EdgePersister / EdgeMetaBatchPersister / EdgeTerminalStampPersister).
+// Code that must make an attribute change stick calls whichever of them the
+// store advertises and is then correct under both semantics — which is why
+// enrichment passes are written as `if w, ok := g.(graph.EdgePersister); ok`
+// rather than mutating and hoping.
+
+// testEdgePersistRoundTrip proves the escape hatch actually works: after a
+// read → mutate → persist cycle, a *fresh* read observes the new attributes.
+// Backends that alias their reads implement none of these capabilities (they
+// have no need for them) and skip.
+func testEdgePersistRoundTrip(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+
+	_, persistOne := s.(graph.EdgePersister)
+	_, persistBatch := s.(graph.EdgeMetaBatchPersister)
+	_, persistStamps := s.(graph.EdgeTerminalStampPersister)
+	if !persistOne && !persistBatch && !persistStamps {
+		t.Skip("backend implements no edge-persistence capability")
+	}
+
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	base := mkEdge("a", "b", graph.EdgeCalls)
+	base.Confidence = 0.2
+	base.ConfidenceLabel = "heuristic"
+	base.Origin = graph.OriginTextMatched
+	base.Tier = "syntax"
+	base.Meta = map[string]any{"opaque": "before"}
+	s.AddEdge(base)
+
+	// readBack re-reads the single a→b edge through the public adjacency
+	// API, so an assertion can never accidentally observe the same struct
+	// the test just mutated.
+	readBack := func() *graph.Edge {
+		t.Helper()
+		out := s.GetOutEdges("a")
+		if len(out) != 1 {
+			t.Fatalf("GetOutEdges(a) = %d edges, want exactly 1", len(out))
+		}
+		return out[0]
+	}
+
+	if w, ok := s.(graph.EdgePersister); ok {
+		e := readBack()
+		e.Confidence = 0.91
+		e.ConfidenceLabel = "confirmed"
+		e.Origin = graph.OriginLSPResolved
+		e.Tier = "compiler"
+		e.Meta = map[string]any{"opaque": "after-single"}
+		w.PersistEdgeAttributes(e)
+
+		got := readBack()
+		if got.Confidence != 0.91 || got.ConfidenceLabel != "confirmed" {
+			t.Fatalf("PersistEdgeAttributes lost confidence: %v/%q", got.Confidence, got.ConfidenceLabel)
+		}
+		if got.Origin != graph.OriginLSPResolved || got.Tier != "compiler" {
+			t.Fatalf("PersistEdgeAttributes lost provenance: %q/%q", got.Origin, got.Tier)
+		}
+		if got.Meta["opaque"] != "after-single" {
+			t.Fatalf("PersistEdgeAttributes lost meta: %v", got.Meta)
+		}
+	}
+
+	if w, ok := s.(graph.EdgeMetaBatchPersister); ok {
+		e := readBack()
+		e.Confidence = 0.55
+		e.Origin = graph.OriginASTInferred
+		e.Meta = map[string]any{"opaque": "after-batch"}
+		w.PersistEdgeAttributesBatch([]*graph.Edge{e})
+
+		got := readBack()
+		if got.Confidence != 0.55 || got.Origin != graph.OriginASTInferred {
+			t.Fatalf("PersistEdgeAttributesBatch lost attributes: %v/%q", got.Confidence, got.Origin)
+		}
+		if got.Meta["opaque"] != "after-batch" {
+			t.Fatalf("PersistEdgeAttributesBatch lost meta: %v", got.Meta)
+		}
+		// An empty batch must be a no-op rather than a panic or a wipe.
+		w.PersistEdgeAttributesBatch(nil)
+		if got := readBack(); got.Confidence != 0.55 {
+			t.Fatalf("empty PersistEdgeAttributesBatch disturbed the edge: %+v", got)
+		}
+	}
+
+	if w, ok := s.(graph.EdgeTerminalStampPersister); ok {
+		// The narrow capability: only the two terminal keys may move. Set a
+		// sentinel on every other attribute first so a wide write is caught.
+		before := readBack()
+		before.Confidence = 0.33
+		before.Origin = "stamp-sentinel"
+		before.Meta = map[string]any{"opaque": "stamp-sentinel"}
+		if p, ok := s.(graph.EdgePersister); ok {
+			p.PersistEdgeAttributes(before)
+		}
+
+		e := readBack()
+		e.Meta = map[string]any{
+			"opaque":                            "must-not-be-written",
+			graph.EdgeMetaResolveTerminal:       true,
+			graph.EdgeMetaResolveTerminalReason: "external",
+		}
+		e.Confidence = 0.01
+		e.Origin = "must-not-be-written"
+		w.PersistEdgeTerminalStamps([]*graph.Edge{e})
+
+		got := readBack()
+		if got.Meta[graph.EdgeMetaResolveTerminal] != true {
+			t.Fatalf("terminal stamp did not land: %v", got.Meta)
+		}
+		if got.Meta[graph.EdgeMetaResolveTerminalReason] != "external" {
+			t.Fatalf("terminal reason did not land: %v", got.Meta)
+		}
+		if got.Confidence != 0.33 || got.Origin != "stamp-sentinel" {
+			t.Fatalf("terminal stamp widened into other attributes: %v/%q", got.Confidence, got.Origin)
+		}
+		if got.Meta["opaque"] != "stamp-sentinel" {
+			t.Fatalf("terminal stamp overwrote unrelated meta: %v", got.Meta)
+		}
+		// Nil edges and unknown identities are no-ops.
+		w.PersistEdgeTerminalStamps(nil)
+		w.PersistEdgeTerminalStamps([]*graph.Edge{nil})
+	}
+}
+
+// testReadAliasing pins the declared semantics on both the edge and the node
+// axis. The assertion is deliberately symmetric: a backend that claims
+// detached reads must DROP an unpersisted mutation, and one that claims
+// aliasing must KEEP it. Either way the suite records a fact rather than a
+// preference, so a backend cannot quietly change sides.
+//
+// There is no NodePersister — a node attribute change is written by handing
+// the node back to AddNode — so nodes are covered on this axis only.
+func testReadAliasing(t *testing.T, factory Factory, semantics Semantics) {
+	t.Helper()
+	aliases := semantics.Reads == ReadsAliasStore
+
+	t.Run("Edge", func(t *testing.T) {
+		s := factory(t)
+		s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+		s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+		e := mkEdge("a", "b", graph.EdgeCalls)
+		e.Confidence = 0.25
+		s.AddEdge(e)
+
+		out := s.GetOutEdges("a")
+		if len(out) != 1 {
+			t.Fatalf("GetOutEdges(a) = %d edges, want 1", len(out))
+		}
+		// No persistence call — this is exactly the mistake the split
+		// punishes.
+		out[0].Confidence = 0.99
+
+		again := s.GetOutEdges("a")
+		if len(again) != 1 {
+			t.Fatalf("GetOutEdges(a) = %d edges, want 1", len(again))
+		}
+		if aliases && again[0].Confidence != 0.99 {
+			t.Fatalf("backend declares aliasing reads but the mutation was dropped: %v", again[0].Confidence)
+		}
+		if !aliases && again[0].Confidence != 0.25 {
+			t.Fatalf("backend declares detached reads but an unpersisted mutation landed: %v", again[0].Confidence)
+		}
+	})
+
+	t.Run("Node", func(t *testing.T) {
+		s := factory(t)
+		n := mkNode("a.go::Foo", "Foo", "a.go", graph.KindFunction)
+		n.EndLine = 10
+		s.AddNode(n)
+
+		got := s.GetNode("a.go::Foo")
+		if got == nil {
+			t.Fatal("GetNode returned nil for inserted node")
+		}
+		// EndLine rather than Name/FilePath: the aliasing backend indexes
+		// nodes by name and path, so mutating one of those behind its back
+		// would corrupt the store instead of demonstrating anything.
+		got.EndLine = 999
+
+		again := s.GetNode("a.go::Foo")
+		if again == nil {
+			t.Fatal("GetNode returned nil on re-read")
+		}
+		if aliases && again.EndLine != 999 {
+			t.Fatalf("backend declares aliasing reads but the node mutation was dropped: %d", again.EndLine)
+		}
+		if !aliases && again.EndLine != 10 {
+			t.Fatalf("backend declares detached reads but an unpersisted node mutation landed: %d", again.EndLine)
+		}
+	})
 }
