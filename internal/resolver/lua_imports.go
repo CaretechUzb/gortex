@@ -102,31 +102,11 @@ func resolveLuaModuleRequire(fileIDs map[string]struct{}, filesByBase map[string
 		}
 	}
 	for _, c := range cands {
-		if m := luaUniqueSuffixMatch(filesByBase, c); m != "" {
+		if m := uniqueFileSuffixMatch(filesByBase, c); m != "" {
 			return m
 		}
 	}
 	return ""
-}
-
-// luaUniqueSuffixMatch returns the single indexed file equal to, or ending with
-// `/`+path, or "" when there is none or more than one (ambiguous).
-func luaUniqueSuffixMatch(filesByBase map[string][]string, path string) string {
-	base := path
-	if i := strings.LastIndex(path, "/"); i >= 0 {
-		base = path[i+1:]
-	}
-	suffix := "/" + path
-	match := ""
-	for _, cand := range filesByBase[base] {
-		if cand == path || strings.HasSuffix(cand, suffix) {
-			if match != "" && match != cand {
-				return "" // ambiguous across roots
-			}
-			match = cand
-		}
-	}
-	return match
 }
 
 // resolveLuaRobloxRequire binds a Roblox instance-path require by its leaf

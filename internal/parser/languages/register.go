@@ -95,6 +95,15 @@ func RegisterAll(reg *parser.Registry) {
 	// autoload singletons become globally-nameable types; the bare
 	// ".godot" extension stays unclaimed.
 	reg.Register(NewGodotProjectExtractor())
+	// Godot text resources (.tscn / .tres) — scene tree plus the
+	// `ext_resource` references that link a scene to the scripts and
+	// sub-scenes it mounts. Registered before registerForestLanguages so it
+	// claims those extensions over the signature-only forest
+	// `godot_resource` grammar, which emits no edges. `.godot` is left
+	// unclaimed here too — GodotProjectExtractor owns the one file that
+	// matters by basename, and claiming the extension would drag in the
+	// engine's `.godot/` cache directory.
+	reg.Register(NewGodotSceneExtractor())
 	reg.Register(NewNixExtractor())
 	reg.Register(NewFortranExtractor())
 	reg.Register(NewSolidityExtractor())

@@ -1551,6 +1551,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// imports above; resolveRelativeImports never touches Lua, so this lands
 	// the Lua module/instance requires onto their indexed file nodes.
 	r.resolveLuaRequires()
+	// Godot `res://` binding — scene `[ext_resource]` references and
+	// GDScript `preload(...)`. Same settle window and the same path-suffix
+	// net as the Lua requires above.
+	r.resolveGodotResPaths()
 	ld2 := time.Now()
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
