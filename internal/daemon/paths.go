@@ -126,6 +126,21 @@ func LogFilePath() string {
 	return filepath.Join(os.TempDir(), "gortex-daemon.log")
 }
 
+// StateDir returns the directory the daemon keeps its runtime state in —
+// the socket, PID file, logs, and any auxiliary journals a subsystem needs
+// to survive a restart. It resolves the same way SocketPath / PIDFilePath
+// do, and falls back to the temp dir when neither the cache nor the home
+// directory can be resolved, so callers always get a usable directory.
+//
+// The directory is not created; use EnsureParentDir on the file you are
+// about to write, or os.MkdirAll on a subdirectory of your own.
+func StateDir() string {
+	if dir, ok := stateDir(); ok {
+		return dir
+	}
+	return os.TempDir()
+}
+
 // SnapshotPath returns the legacy backend-agnostic snapshot path —
 // `daemon.gob.gz` under the state dir. Kept for callers that haven't
 // moved to backend-tagged storage yet (the legacy cloud indexer

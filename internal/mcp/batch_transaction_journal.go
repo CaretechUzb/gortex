@@ -20,7 +20,7 @@ func batchTransactionRoot() string {
 	if root := os.Getenv(batchTransactionDirEnv); root != "" {
 		return filepath.Clean(root)
 	}
-	return filepath.Join(filepath.Dir(daemon.SnapshotPath()), "batch-transactions")
+	return filepath.Join(daemon.StateDir(), "batch-transactions")
 }
 
 func batchTransactionDir(transactionID string) string {
