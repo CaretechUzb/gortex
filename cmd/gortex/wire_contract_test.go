@@ -143,13 +143,17 @@ func wireContractGolden(name string) string {
 		// ProjectID, were added.
 		return "a600bd906c9e09ffa0828427f5d6622acd5fe244798a61d5712c151053be5dac"
 	case "graph.Edge":
-		// Bumped when Alias was added — the renamed name carried by a
-		// per-binding import (`import { x as alias }`) or a re-export
-		// (`export { x as alias } from`) edge; empty on every other edge.
-		// Additive: gob decodes older snapshots with Alias blank; not part of
-		// the edge identity / dedup key.
-		// (Previously bumped when Via, ReturnUsage, Context, then Tier, were added.)
-		return "4e51a5ea5eea74a33875b43baf9b6d80bf9609ae2befc16dd576132e09ea3d09"
+		// Bumped when NameOnly was added — the marker on a synthesized
+		// name-only candidate row (a call site that named the symbol but
+		// never bound to it, projected onto it by find_usages /
+		// get_callers under min_tier:"text_matched"). Set only on the
+		// in-memory projection, so a persisted edge always carries it
+		// false. Additive: gob decodes older snapshots with it false; not
+		// part of the edge identity / dedup key.
+		// (Previously bumped when Alias — the renamed name carried by a
+		// per-binding import or re-export edge — then Via, ReturnUsage,
+		// Context, and Tier, were added.)
+		return "d27d737c6c164243e2d55b4ca265a46d658e9617546f20306e9357e17aa46603"
 	case "snapshotHeader":
 		// Bumped when the VectorIndex / VectorDims / VectorCount fields
 		// were added (additive — gob decodes unknown fields as zero).

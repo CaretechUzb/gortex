@@ -39,8 +39,19 @@ func NewDockerfileExtractor() *DockerfileExtractor {
 }
 
 func (e *DockerfileExtractor) Language() string { return "dockerfile" }
+
+// Extensions covers the three naming conventions in the wild: the
+// `.dockerfile` suffix, the bare `Dockerfile` / `Containerfile`
+// basename, and the per-purpose `Dockerfile.<suffix>` form
+// (Dockerfile.perf, Dockerfile.ci, Containerfile.dev). The stem entries
+// only match a suffix that is not itself a registered extension, so
+// `Dockerfile.md` stays markdown.
 func (e *DockerfileExtractor) Extensions() []string {
-	return []string{".dockerfile", "Dockerfile", "Containerfile"}
+	return []string{
+		".dockerfile",
+		"Dockerfile", "Containerfile",
+		"Dockerfile.*", "Containerfile.*",
+	}
 }
 
 // dockerfileState carries the per-extraction "current stage" cursor.

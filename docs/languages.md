@@ -55,7 +55,7 @@ server matrix, install commands, lifecycle knobs, and config schema.
 | Forest — functional / niche | ~26 | Agda, Idris, PureScript, Roc, Gren, Elm, Fennel, Janet, Hack, Haxe, Pony, C3, Aiken, Effekt, Eiffel, Jule, Koka, Luau, MoonBit, Motoko, Ralph, Scheme, SML, Wing, Common Lisp |
 | Forest — build / DSL / testing | ~16 | Meson, Just, Beancount, Ledger, Gherkin, Hurl, Robot, Earthfile, Ninja, BitBake, Caddy, Snakemake, GN, Cooklang, Requirements, Cedar, CEL, Circom, Clarity, Rego, TLA+, Quint, Structurizr, GritQL, QL |
 | Forest — DB / query | 8 | SPARQL, SurrealQL, PromQL, Kusto, SOQL, SOSL, PRQL, Turtle |
-| Forest — data / lockfiles / shells / configs | ~28 | TSV, PSV, textproto, .po, PGN, todo.txt, go.mod / go.sum / go.work, godot_resource, Fish, Nushell, jq, Awk, Elvish, gitconfig / gitattributes / gitcommit / gitignore, Hyprlang, nftables, passwd, PEM, PoE filter, Puppet, ssh_config, sxhkdrc, tmux |
+| Forest — data / lockfiles / shells / configs | ~28 | TSV, PSV, textproto, .po, PGN, todo.txt, go.mod / go.sum / go.work, Fish, Nushell, jq, Awk, Elvish, gitconfig / gitattributes / gitcommit / gitignore, Hyprlang, nftables, passwd, PEM, PoE filter, Puppet, ssh_config, sxhkdrc, tmux |
 | Forest — misc | ~14 | DOT, gnuplot, GPG, Strace, VRL, Zeek, Ziggy + Schema, Starlark, SourcePawn, SCSS, RBS, OCamllex, DataWeave, USD, WIT |
 | **Total** | **256** | |
 
@@ -121,7 +121,7 @@ Recent extraction refinements (each covered by a per-feature CI golden): Java `@
 | Markdown | `.md` | Headings, local file links, code-block languages |
 | HTML | `.html`, `.htm` | Script / link references, element IDs |
 | CSS | `.css` | Class selectors, ID selectors, custom properties, `@import` |
-| Dockerfile | `Dockerfile`, `Containerfile`, `.dockerfile` | `FROM` (base images), `ENV` / `ARG` variables |
+| Dockerfile | `Dockerfile`, `Containerfile`, `Dockerfile.<suffix>`, `.dockerfile` | `FROM` (base images), `ENV` / `ARG` variables |
 | Makefile | `Makefile`, `GNUmakefile`, `.mk`, `.make` | Targets, `define…endef`, `VAR = …`, `include` / `-include` |
 | CMake | `CMakeLists.txt`, `.cmake` | `function(…)`, `macro(…)`, `add_library`, `add_executable`, `include(…)`, `set(…)` |
 
@@ -255,7 +255,8 @@ What is **not** covered:
 | ActionScript | `.as` | `package`, classes, interfaces, `function`, `import X.Y.*;` |
 | Dart | `.dart` | Full (see core matrix) |
 | Swift | `.swift` | Full (see core matrix) |
-| GDScript | `.gd`, `project.godot` | `func`, `class`, signals; receiver-typed calls — a script's funcs are methods of its `class_name`, and `Notify.event()` / typed locals / params / `self` bind by receiver, so a project-global class resolves across directories. `[autoload]` singletons in `project.godot` bind to their declared script. |
+| GDScript | `.gd`, `project.godot` | `func`, `class`, signals; receiver-typed calls — a script's funcs are methods of its `class_name`, and `Notify.event()` / typed locals / params / `self` bind by receiver, so a project-global class resolves across directories. `[autoload]` singletons in `project.godot` bind to their declared script. `preload("res://…")` binds to the file. |
+| Godot resources | `.tscn`, `.tres` | Scene tree nodes keyed by NodePath, `[ext_resource]` → script / sub-scene / asset, per-node `script =` / `instance=ExtResource(…)` |
 | Verse (UEFN) | `.verse` | `class` / `struct` / `enum` / `interface`, functions with specifier blocks, `using { /Path }` |
 | Nix | `.nix` | Attribute sets, functions, `import` / `<nixpkgs>` |
 | AL (Business Central) | `.al` | Tables, pages, codeunits, procedures |

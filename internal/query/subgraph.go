@@ -22,6 +22,16 @@ type SubGraph struct {
 	// Zero — and omitted — when nothing was suppressed. Re-run with
 	// min_tier:"text_matched" to include the hidden rows.
 	TextMatchedSuppressed int `json:"text_matched_suppressed,omitempty"`
+	// NameOnlyCandidates counts call sites that name this symbol but never
+	// bound to it — the calls parked on a bare-name `unresolved::`
+	// placeholder because no receiver-type evidence tied them here (or
+	// because the cross-package guard reverted a weak guess). They are
+	// NOT usages: each may belong to a different same-named symbol. But a
+	// zero-or-thin edge list beside a non-zero count is an honestly
+	// uncertain answer ("1 verified, 22 unverified") where the count's
+	// absence read as proof of safety. Re-run with min_tier:"text_matched"
+	// to get the rows themselves. Exact even when the rows are capped.
+	NameOnlyCandidates int `json:"name_only_candidates,omitempty"`
 	// SuppressionCaveat is attached by the adaptive text_matched default
 	// (find_usages / get_callers) when TextMatchedSuppressed > 0 AND the
 	// target's file was re-parsed on the live watch path without re-running
