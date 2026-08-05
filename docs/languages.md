@@ -121,7 +121,7 @@ Recent extraction refinements (each covered by a per-feature CI golden): Java `@
 | Markdown | `.md` | Headings, local file links, code-block languages |
 | HTML | `.html`, `.htm` | Script / link references, element IDs |
 | CSS | `.css` | Class selectors, ID selectors, custom properties, `@import` |
-| Dockerfile | `Dockerfile`, `Containerfile`, `.dockerfile` | `FROM` (base images), `ENV` / `ARG` variables |
+| Dockerfile | `Dockerfile`, `Containerfile`, `Dockerfile.<suffix>`, `.dockerfile` | `FROM` (base images), `ENV` / `ARG` variables |
 | Makefile | `Makefile`, `GNUmakefile`, `.mk`, `.make` | Targets, `define…endef`, `VAR = …`, `include` / `-include` |
 | CMake | `CMakeLists.txt`, `.cmake` | `function(…)`, `macro(…)`, `add_library`, `add_executable`, `include(…)`, `set(…)` |
 
