@@ -11,7 +11,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
-	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
@@ -23,12 +22,13 @@ func emitInitDryRunIntake(cmd *cobra.Command, root string) error {
 		cfg = &config.Config{}
 	}
 
-	g := graph.New()
+	// The intake walk only classifies files against the admission gates —
+	// it parses nothing and writes nothing — so it runs off the config and
+	// the extension registry, with no graph store behind it.
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
-	idx := indexer.New(g, reg, cfg.Index, zap.NewNop())
 
-	manifest, err := idx.DryRunIntake(context.Background(), root)
+	manifest, err := indexer.DryRunIntake(context.Background(), root, cfg.Index, reg, zap.NewNop())
 	if err != nil {
 		return err
 	}

@@ -8,6 +8,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/parser"
 )
 
 // IntakeManifest is a privacy-safe, pre-extraction view of the corpus
@@ -52,9 +57,33 @@ type FileBucket struct {
 }
 
 // DryRunIntake walks root with the same high-level language, ignore, prune and
-// max-size gates used before IndexCtx starts extraction. It does not parse,
-// extract, embed, or store anything.
-func (idx *Indexer) DryRunIntake(ctx context.Context, root string) (*IntakeManifest, error) {
+// max-size gates used before IndexCtx starts extraction, and reports what the
+// walk would admit. It does not parse, extract, embed, or store anything, and
+// so needs no graph store: the corpus-admission gates read only the index
+// config and the extension registry.
+func DryRunIntake(ctx context.Context, root string, cfg config.IndexConfig, reg *parser.Registry, logger *zap.Logger) (*IntakeManifest, error) {
+	return newIntakeIndexer(cfg, reg, logger).dryRunIntake(ctx, root)
+}
+
+// newIntakeIndexer builds an Indexer wired for the corpus-admission walk
+// only — the config, extension registry, transform pipeline and logger that
+// shouldPruneDir / shouldExclude / effectiveLanguage and the content and
+// untracked-asset gates consult. It deliberately has no graph store,
+// resolver or search backend, because the walk writes nothing; nothing but
+// dryRunIntake may be called on the result.
+func newIntakeIndexer(cfg config.IndexConfig, reg *parser.Registry, logger *zap.Logger) *Indexer {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	return &Indexer{
+		registry:   reg,
+		config:     cfg,
+		transforms: newTransformPipeline(cfg.Transforms, logger),
+		logger:     logger,
+	}
+}
+
+func (idx *Indexer) dryRunIntake(ctx context.Context, root string) (*IntakeManifest, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err

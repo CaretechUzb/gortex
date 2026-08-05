@@ -18,7 +18,9 @@ import (
 // newAssetTestIndexer registers the code + asset extractors the
 // content-admission gate keys off, so a temp repo of documents / data
 // files exercises the real walk-time gate.
-func newAssetTestIndexer(g graph.Store) *Indexer {
+// newAssetTestRegistry registers the code + asset extractors the content
+// admission gates classify against.
+func newAssetTestRegistry() *parser.Registry {
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewGoExtractor())
 	reg.Register(languages.NewTextExtractor())
@@ -27,9 +29,13 @@ func newAssetTestIndexer(g graph.Store) *Indexer {
 	reg.Register(languages.NewXlsxExtractor())
 	reg.Register(languages.NewDataAssetExtractor())
 	reg.Register(languages.NewImageAssetExtractor())
+	return reg
+}
+
+func newAssetTestIndexer(g graph.Store) *Indexer {
 	cfg := config.Default().Index
 	cfg.Workers = 2
-	return New(g, reg, cfg, zap.NewNop())
+	return New(g, newAssetTestRegistry(), cfg, zap.NewNop())
 }
 
 func TestContentAdmissionConfig_EffectiveCaps(t *testing.T) {
@@ -274,10 +280,10 @@ func TestDryRunIntake_ReflectsContentGate(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "big.txt"), strings.Repeat("filler text ", 400))
 	writeFile(t, filepath.Join(dir, "vectors.npy"), "NUMPY-placeholder-bytes")
 
-	idx := newAssetTestIndexer(graph.New())
-	idx.config.Content.MaxDocumentBytes = 1024
+	cfg := config.Default().Index
+	cfg.Content.MaxDocumentBytes = 1024
 
-	m, err := idx.DryRunIntake(testCtx(), dir)
+	m, err := DryRunIntake(testCtx(), dir, cfg, newAssetTestRegistry(), zap.NewNop())
 	require.NoError(t, err)
 
 	txt, ok := bucketByKey(m.TopSkippedExtensionsByBytes, "txt")
@@ -311,10 +317,10 @@ func TestDryRunIntake_ReflectsUntrackedGate(t *testing.T) {
 	runGit(t, dir, "commit", "-q", "-m", "init")
 	writeFile(t, filepath.Join(dir, "untracked.txt"), "scratch asset")
 
-	idx := newAssetTestIndexer(graph.New())
-	idx.config.SkipUntrackedAssets = true
+	cfg := config.Default().Index
+	cfg.SkipUntrackedAssets = true
 
-	m, err := idx.DryRunIntake(testCtx(), dir)
+	m, err := DryRunIntake(testCtx(), dir, cfg, newAssetTestRegistry(), zap.NewNop())
 	require.NoError(t, err)
 	txt, ok := bucketByKey(m.TopSkippedExtensionsByBytes, "txt")
 	require.True(t, ok)
