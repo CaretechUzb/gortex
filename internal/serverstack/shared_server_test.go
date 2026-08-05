@@ -59,19 +59,17 @@ func TestNewSharedServer_Oneshot(t *testing.T) {
 }
 
 // TestNewSharedServer_LifecyclesDefaultToSqlite asserts every lifecycle
-// resolves to the sqlite backend when Backend is empty, and that one-shot
-// alone stays outside the store lock.
+// accepts the empty backend name (there is only the sqlite store), and that
+// one-shot alone stays outside the store lock.
 func TestNewSharedServer_LifecyclesDefaultToSqlite(t *testing.T) {
-	for _, l := range []Lifecycle{LifecycleDaemon, LifecycleHTTP, LifecycleOneshot} {
-		if got := l.defaultBackend(); got != "sqlite" {
-			t.Errorf("lifecycle %d default backend = %q, want sqlite", l, got)
-		}
+	if err := checkBackend(""); err != nil {
+		t.Errorf("the empty backend name must resolve: %v", err)
 	}
 	if LifecycleOneshot.Writable() {
 		t.Error("oneshot must not be writable (no store lock)")
 	}
-	if !LifecycleDaemon.Writable() || !LifecycleHTTP.Writable() {
-		t.Error("daemon/http lifecycles own a durable store")
+	if !LifecycleDaemon.Writable() {
+		t.Error("the daemon lifecycle owns a durable store")
 	}
 }
 

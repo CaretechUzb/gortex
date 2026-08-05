@@ -128,11 +128,11 @@ func init() {
 	daemonStartCmd.Flags().StringSliceVar(&daemonHTTPConversationAllow, "conversation-host", nil,
 		"extra Host values (beyond loopback) the conversation-log inspector accepts without a token; repeatable")
 	daemonStartCmd.Flags().StringVar(&daemonBackend, "backend", "sqlite",
-		"storage backend: sqlite (default — pure-Go embedded SQL, persists to --backend-path so warm restarts skip re-indexing) | memory (in-process, no persistence — fastest per-op but pays the full cold-warmup cost on every restart)")
+		"storage backend: sqlite (pure-Go embedded SQL, persists to --backend-path so warm restarts skip re-indexing). It is the only backend; point --backend-path at a throwaway file for a store that does not outlive the run")
 	daemonStartCmd.Flags().StringVar(&daemonBackendPath, "backend-path", "",
-		"path to the on-disk backend's store file (its parent directory is created if absent). Defaults to ~/.gortex/store/store.sqlite; ignored when --backend is memory")
+		"path to the store file (its parent directory is created if absent). Defaults to ~/.gortex/store/store.sqlite")
 	daemonStartCmd.Flags().Uint64Var(&daemonBackendBufferPoolMB, "backend-buffer-pool-mb", 0,
-		"advisory page-cache cap (MiB) for on-disk backends. 0 reads $GORTEX_DAEMON_BUFFER_POOL_MB or lets the backend choose its own default; backends that manage their own cache (e.g. sqlite) ignore it")
+		"advisory page-cache cap (MiB) for the store. 0 reads $GORTEX_DAEMON_BUFFER_POOL_MB or lets the backend choose its own default; sqlite manages its own cache and ignores it")
 	daemonStartCmd.Flags().StringVar(&daemonTools, "tools", "",
 		"restrict the published MCP tool surface to a preset: core (default)|full|readonly|edit|nav (optionally with ,+tool / ,-tool deltas). GORTEX_TOOLS overrides this")
 	daemonStartCmd.Flags().StringVar(&daemonToolsMode, "tools-mode", "",

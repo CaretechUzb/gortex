@@ -16,9 +16,9 @@ import (
 // SidecarStore is the SQLite-backed side-store for the agent's
 // non-graph knowledge: session notes, cross-session development
 // memories, saved scopes, and repository notebooks. It is a SEPARATE
-// database file from the graph store — independent of the graph
-// --backend — so notes/memories/scopes/notebooks persist even when
-// the graph runs with the in-memory backend.
+// database file from the graph store, with its own path and lifetime, so
+// notes/memories/scopes/notebooks survive a graph store that is thrown
+// away or rebuilt from scratch.
 //
 // The file lives at <DataDir>/sidecar.sqlite by default (see
 // DefaultSidecarPath); tests and the per-repo `gortex mcp` subprocess

@@ -2,29 +2,47 @@ package serverstack
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"go.uber.org/zap"
-
-	"github.com/zzet/gortex/internal/graph"
 )
 
-// TestOpenBackend_MemoryDefault asserts the memory backend (and the empty
-// default) returns a usable in-process store.
-func TestOpenBackend_MemoryDefault(t *testing.T) {
-	for _, name := range []string{"", "memory", "mem", "in-memory"} {
-		store, cleanup, err := OpenBackend(name, "", 0, zap.NewNop(), false)
-		if err != nil {
-			t.Fatalf("OpenBackend(%q): %v", name, err)
+// TestOpenBackend_MemoryIsRetired asserts the in-memory backend names are
+// refused rather than quietly served by the shared on-disk store: a caller
+// who asked for a throwaway graph must not end up writing the daemon's
+// database. The error has to name the replacement.
+func TestOpenBackend_MemoryIsRetired(t *testing.T) {
+	for _, name := range []string{"memory", "mem", "in-memory", "In-Memory", "  memory  "} {
+		store, _, err := OpenBackend(name, "", 0, zap.NewNop(), false)
+		if err == nil {
+			t.Fatalf("OpenBackend(%q): want an error, got a store", name)
 		}
-		if store == nil {
-			t.Fatalf("OpenBackend(%q): nil store", name)
+		if store != nil {
+			t.Errorf("OpenBackend(%q): store must be nil on error, got %T", name, store)
 		}
-		if _, ok := store.(*graph.Graph); !ok {
-			t.Errorf("OpenBackend(%q): want *graph.Graph, got %T", name, store)
+		msg := err.Error()
+		for _, want := range []string{"retired", "--backend sqlite", "--backend-path"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("OpenBackend(%q): error %q should mention %q", name, msg, want)
+			}
 		}
-		cleanup()
 	}
+}
+
+// TestOpenBackend_EmptyNameOpensSqlite asserts the default (empty) backend
+// name still resolves — the one-shot and daemon flows pass it whenever the
+// caller did not name a backend explicitly.
+func TestOpenBackend_EmptyNameOpensSqlite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	store, cleanup, err := OpenBackend("", path, 0, zap.NewNop(), true)
+	if err != nil {
+		t.Fatalf(`OpenBackend(""): %v`, err)
+	}
+	if store == nil {
+		t.Fatal("nil store for the default backend")
+	}
+	cleanup()
 }
 
 // TestOpenBackend_SqliteOpensFile asserts the sqlite backend opens (and
@@ -41,9 +59,8 @@ func TestOpenBackend_SqliteOpensFile(t *testing.T) {
 	cleanup()
 }
 
-// TestOpenBackend_Unknown asserts only memory|sqlite are accepted — a
-// stale backend name (e.g. the removed ladybug) errors rather than
-// silently falling back.
+// TestOpenBackend_Unknown asserts a stale backend name (e.g. the removed
+// ladybug) errors rather than silently falling back.
 func TestOpenBackend_Unknown(t *testing.T) {
 	if _, _, err := OpenBackend("ladybug", "", 0, zap.NewNop(), false); err == nil {
 		t.Fatal("an unknown backend must error")

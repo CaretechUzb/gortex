@@ -24,8 +24,9 @@ import (
 // smaller is left to organic reuse.
 
 // storeCompactor is the optional store capability the boot-time compaction
-// probes for — implemented by the on-disk backend only, so a memory-mode
-// daemon skips the whole feature via the failed type assertion.
+// probes for. It is a type assertion rather than a method on graph.Store so
+// that stores with nothing to reclaim — the indexer's in-process staging
+// graph, test fixtures — simply do not implement it.
 type storeCompactor interface {
 	CompactStats() (freeBytes, totalBytes int64)
 	Compact() error
