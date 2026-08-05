@@ -103,7 +103,11 @@ func runEvalPack(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	g := graph.New()
+	g, closeStore, err := newEvalStore("pack")
+	if err != nil {
+		return fmt.Errorf("opening eval store: %w", err)
+	}
+	defer closeStore()
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	idx := indexer.New(g, reg, cfg.Index, newRecallLogger())

@@ -115,7 +115,11 @@ func runEvalRecall(_ *cobra.Command, _ []string) error {
 	// silently swallowing them via zap.NewNop() let the recall harness
 	// fall back to BM25 with no visible signal that the hybrid backend
 	// failed to build.
-	g := graph.New()
+	g, closeStore, err := newEvalStore("recall")
+	if err != nil {
+		return fmt.Errorf("opening eval store: %w", err)
+	}
+	defer closeStore()
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	idx := indexer.New(g, reg, cfg.Index, newRecallLogger())
@@ -148,7 +152,7 @@ func runEvalRecall(_ *cobra.Command, _ []string) error {
 
 	// Peel the Swappable wrapper so we can see the real backend. When
 	// embeddings are on, the indexer builds a HybridBackend internally;
-	// its TextBackend() is the pure BM25/Bleve side, and the whole
+	// its TextBackend() is the pure lexical side, and the whole
 	// HybridBackend is what RRF queries.
 	inner := idx.Search()
 	if sw, ok := inner.(*search.Swappable); ok {
@@ -174,13 +178,15 @@ func runEvalRecall(_ *cobra.Command, _ []string) error {
 		fmt.Fprintf(os.Stderr, "[gortex eval recall] vector index: count=%d\n", vecCount)
 	}
 
-	// Engine-backed BM25 mirrors the MCP search_symbols call path
-	// (BM25 + substring fallback for camelCase-only queries). This is
-	// what real callers hit. Critically: the engine is pointed at the
-	// PURE text backend even when --embeddings is on — otherwise the
-	// "bm25" row would silently run through HybridBackend.Search (RRF
+	// The engine-backed lexical row mirrors the MCP search_symbols call
+	// path (BM25 ranking + substring fallback for camelCase-only queries)
+	// against the store's own full-text index — the same backend the
+	// daemon serves, so the row reports what real callers hit rather than
+	// a harness-only in-process index. Critically: the engine is pointed
+	// at the PURE text backend even when --embeddings is on — otherwise
+	// the "bm25" row would silently run through HybridBackend.Search (RRF
 	// fusion with vector results) and the measurement would no longer
-	// isolate BM25's contribution.
+	// isolate the lexical contribution.
 	engForBM25 := query.NewEngine(g)
 	engForBM25.SetSearch(textBackend)
 	engineSearch := func(q string, limit int) []string {
@@ -224,7 +230,7 @@ func runEvalRecall(_ *cobra.Command, _ []string) error {
 
 	// Winnow: needs a Server to run the graph-aware scorer. The Server's
 	// own engine is pointed at the PURE text backend so winnow's
-	// internal text-match step measures graph+BM25 behaviour, not
+	// internal text-match step measures graph+lexical behaviour, not
 	// graph+hybrid — otherwise weak static-embedding semantics would
 	// drag winnow's exact-tier recall down artificially, hiding the
 	// real graph-axis contribution.
@@ -466,7 +472,7 @@ type fixtureMiss struct{ caseID, id string }
 
 // validateFixture reports expected IDs that aren't present in the graph
 // so fixture curation errors surface before they depress recall numbers.
-func validateFixture(f recall.Fixture, g *graph.Graph) []fixtureMiss {
+func validateFixture(f recall.Fixture, g graph.Store) []fixtureMiss {
 	var out []fixtureMiss
 	for _, c := range f.Cases {
 		for _, id := range c.Expected {

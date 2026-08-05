@@ -11,7 +11,6 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/eval"
-	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/parser"
@@ -50,7 +49,11 @@ func runEvalServer(cmd *cobra.Command, args []string) error {
 	}
 
 	// Build the same graph/parser/indexer/query/MCP stack as serve.go.
-	g := graph.New()
+	g, closeStore, err := newEvalStore("server")
+	if err != nil {
+		return fmt.Errorf("opening eval store: %w", err)
+	}
+	defer closeStore()
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	idx := indexer.New(g, reg, cfg.Index, logger)
