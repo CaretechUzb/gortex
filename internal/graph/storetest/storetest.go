@@ -73,6 +73,24 @@ type Semantics struct {
 	// caller should hand a user-supplied prefix to EvictRepo without checking
 	// it is non-empty.
 	EvictsEmptyRepoPrefix bool
+
+	// AdjacencyLineOrdered declares what order GetOutEdges / GetInEdges hand
+	// their edges back in. True means the backend sorts: out-edges ascending
+	// by source line across kinds, in-edges grouped by kind. False means the
+	// backend returns the edges in the order they were added.
+	//
+	// The SQLite store declares the order in SQL, riding the adjacency indexes
+	// that already carry it. The in-memory staging graph hands back its
+	// per-node append slice untouched: sorting it would tax the indexer's hot
+	// staging path — the one place that store still exists to be fast — for a
+	// property no staging caller needs.
+	//
+	// Both are stable within a backend, which is all a single-backend caller
+	// needs. A caller that needs a line order ACROSS backends must sort the
+	// result itself; the declaration exists so that requirement is visible
+	// rather than discovered when a first-match helper picks a different edge
+	// on one backend than the other.
+	AdjacencyLineOrdered bool
 }
 
 // RunConformance runs the full conformance suite against the Store
@@ -167,7 +185,7 @@ func RunConformance(t *testing.T, factory Factory, semantics Semantics) {
 	t.Run("ReadAliasing", func(t *testing.T) { testReadAliasing(t, factory, semantics) })
 	t.Run("IteratorReentrancy", func(t *testing.T) { testIteratorReentrancy(t, factory) })
 	t.Run("ConcurrentReadsDuringWrite", func(t *testing.T) { testConcurrentReadsDuringWrite(t, factory) })
-	t.Run("ReadOrdering", func(t *testing.T) { testReadOrdering(t, factory) })
+	t.Run("ReadOrdering", func(t *testing.T) { testReadOrdering(t, factory, semantics) })
 	t.Run("AttributeOnlyReindex", func(t *testing.T) { testAttributeOnlyReindex(t, factory) })
 	t.Run("MutationReceipts", func(t *testing.T) { testMutationReceipts(t, factory) })
 	t.Run("EmptyRepoPrefix", func(t *testing.T) { testEmptyRepoPrefix(t, factory, semantics) })
@@ -4728,24 +4746,27 @@ func testConcurrentReadsDuringWrite(t *testing.T, factory Factory) {
 // testReadOrdering pins how much of a read's ORDER callers may rely on. Three
 // separate claims, and they are deliberately not the same claim:
 //
-//  1. GetOutEdges returns a node's out-edges in ascending source-line order,
-//     across kinds. This one is load-bearing. Helpers that take the FIRST
-//     edge matching a predicate — the semantic enricher's matching-edge
-//     lookup, for one — pick a different edge when a caller has several edges
-//     to the same target from different lines, which is what any loop body or
-//     repeated call produces. Ordering by line makes the choice the same
-//     everywhere instead of a function of which index a query planner
-//     happened to pick.
+//  1. GetOutEdges returns a node's out-edges in the order the backend declares
+//     through Semantics.AdjacencyLineOrdered — ascending source line across
+//     kinds when the backend sorts, the order the edges were added when it
+//     does not. The distinction is load-bearing, which is why the edges here
+//     are seeded OUT of line order: helpers that take the FIRST edge matching
+//     a predicate — the semantic enricher's matching-edge lookup, for one —
+//     pick a different edge on the two backends when a caller has several
+//     edges to the same target from different lines, which is what any loop
+//     body or repeated call produces. A caller that needs the earliest site
+//     must sort rather than trust the read.
 //
-//  2. GetInEdges is stable and, WITHIN one edge kind, ascending by line.
-//     Across kinds the two backends group differently and converging them
-//     would cost a sort the reverse-adjacency index cannot serve for free.
-//     Callers that need a total order over mixed-kind in-edges must sort.
+//  2. GetInEdges is stable per backend and, on a line-ordered backend,
+//     grouped by edge kind. Ordering WITHIN a kind is insertion order, not
+//     line order: the reverse-adjacency index carries the row id, not the
+//     line, and buying a line order here would cost a sort on every in-edge
+//     read. Callers that need a total order over in-edges must sort.
 //
 //  3. AllNodes / AllEdges are NOT ordered at all. The staging graph walks
 //     hash-map shards, so it hands back a fresh permutation per call by
 //     construction. Only set equality is portable here.
-func testReadOrdering(t *testing.T, factory Factory) {
+func testReadOrdering(t *testing.T, factory Factory, semantics Semantics) {
 	t.Helper()
 	s := factory(t)
 	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
@@ -4753,15 +4774,18 @@ func testReadOrdering(t *testing.T, factory Factory) {
 	s.AddNode(mkNode("c", "C", "x.go", graph.KindFunction))
 
 	// Several sites against the same target with an interleaved kind, added in
-	// the order an extractor walks a file: ascending line. The interleave is
-	// the point — it separates "ordered by line" from "grouped by kind".
+	// an order that is NOT the line order — the shape a re-extraction or a
+	// deferred enrichment pass produces. Seeding in line order would let a
+	// backend that simply replays its append slice pass the ordered assertion
+	// without ordering anything. The kind interleave separates "ordered by
+	// line" from "grouped by kind".
 	seed := []struct {
 		kind graph.EdgeKind
 		line int
 	}{
-		{graph.EdgeCalls, 10},
-		{graph.EdgeReferences, 20},
 		{graph.EdgeCalls, 30},
+		{graph.EdgeReferences, 20},
+		{graph.EdgeCalls, 10},
 	}
 	for _, spec := range seed {
 		e := mkEdge("a", "b", spec.kind)
@@ -4785,18 +4809,28 @@ func testReadOrdering(t *testing.T, factory Factory) {
 	}
 
 	out := s.GetOutEdges("a")
-	want := []string{"b|calls|10", "b|references|20", "b|calls|30"}
+	want := []string{"b|calls|30", "b|references|20", "b|calls|10"} // append order
+	if semantics.AdjacencyLineOrdered {
+		want = []string{"b|calls|10", "b|references|20", "b|calls|30"}
+	}
 	if got := render(out, nil); fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("GetOutEdges(a) = %v, want %v (ascending source line, kinds interleaved)", got, want)
+		t.Fatalf("GetOutEdges(a) = %v, want %v (AdjacencyLineOrdered=%t)",
+			got, want, semantics.AdjacencyLineOrdered)
 	}
 	if got := render(s.GetOutEdges("a"), nil); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("GetOutEdges(a) is not stable across calls: %v then %v", want, got)
 	}
-	// The consequence the enricher depends on: first match is the first site.
+	// The consequence: on a line-ordered backend the first match is the first
+	// site; on an append-ordered one it is whichever site was written first.
+	wantFirstCall := 30
+	if semantics.AdjacencyLineOrdered {
+		wantFirstCall = 10
+	}
 	for _, e := range out {
 		if e.To == "b" && e.Kind == graph.EdgeCalls {
-			if e.Line != 10 {
-				t.Fatalf("first (b, calls) out-edge is at line %d, want the earliest site (10)", e.Line)
+			if e.Line != wantFirstCall {
+				t.Fatalf("first (b, calls) out-edge is at line %d, want %d (AdjacencyLineOrdered=%t)",
+					e.Line, wantFirstCall, semantics.AdjacencyLineOrdered)
 			}
 			break
 		}
@@ -4806,13 +4840,22 @@ func testReadOrdering(t *testing.T, factory Factory) {
 	if len(in) != 4 {
 		t.Fatalf("GetInEdges(b) = %d edges, want 4", len(in))
 	}
-	sameKindFromA := func(e *graph.Edge) bool { return e.From == "a" && e.Kind == graph.EdgeCalls }
-	wantIn := []string{"b|calls|10", "b|calls|30"}
-	if got := render(in, sameKindFromA); fmt.Sprint(got) != fmt.Sprint(wantIn) {
-		t.Fatalf("GetInEdges(b) call edges from a = %v, want %v (ascending source line)", got, wantIn)
-	}
 	if got := render(s.GetInEdges("b"), nil); fmt.Sprint(got) != fmt.Sprint(render(in, nil)) {
 		t.Fatalf("GetInEdges(b) is not stable across calls: %v then %v", render(in, nil), got)
+	}
+	if semantics.AdjacencyLineOrdered {
+		// Grouped by kind, insertion order within a kind — deliberately NOT
+		// line order (line 10 stays behind line 30 because it was written
+		// second).
+		wantIn := []string{"b|calls|30", "b|calls|10", "b|calls|5", "b|references|20"}
+		if got := render(in, nil); fmt.Sprint(got) != fmt.Sprint(wantIn) {
+			t.Fatalf("GetInEdges(b) = %v, want %v (grouped by kind, insertion order within a kind)", got, wantIn)
+		}
+	} else {
+		wantIn := []string{"b|calls|30", "b|references|20", "b|calls|10", "b|calls|5"}
+		if got := render(in, nil); fmt.Sprint(got) != fmt.Sprint(wantIn) {
+			t.Fatalf("GetInEdges(b) = %v, want %v (append order)", got, wantIn)
+		}
 	}
 
 	// Whole-graph reads: same contents, order unspecified.

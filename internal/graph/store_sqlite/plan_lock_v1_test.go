@@ -163,6 +163,102 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`,
 	}
 }
 
+// TestAdjacencyPlanLocksDuringBulkLoad pins the OTHER regime the adjacency
+// reads run in. BeginBulkLoad drops every index in bulkDroppableIndexes for the
+// head of a proven cold load — including edges_by_from_line and edges_by_to,
+// the two the ordered locks above depend on — and rebuilds them at FlushBulk.
+// A read served inside that window therefore cannot get its ORDER BY for free:
+// the out-edge lookup falls back to the edges UNIQUE key and the in-edge lookup
+// to a full table scan, and both pay a per-call TEMP B-TREE sort.
+//
+// That is the accepted trade-off, not a regression: the window is a cold load
+// with no interactive readers, and per-row index maintenance across a
+// multi-hundred-thousand-row drain costs far more than the sorts do. The case
+// is here so the degraded plan is a stated expectation — if it ever becomes a
+// steady-state plan, the locks above fail first and this one explains why the
+// difference exists.
+func TestAdjacencyPlanLocksDuringBulkLoad(t *testing.T) {
+	s := newPlanLockFixture(t)
+	dropBulkLoadIndexes(t, s)
+
+	cases := []struct {
+		name   string
+		query  string
+		want   []string
+		forbid []string
+	}{
+		{
+			// stmtOutEdges: from_id still probes the edges UNIQUE key's
+			// leading column, so the lookup stays a search; only the order
+			// has to be built.
+			name:   "out_edges_ordered_bulk_load",
+			query:  `SELECT ` + edgeInsertColumns + ` FROM edges WHERE from_id = ? ORDER BY line, id`,
+			want:   []string{"SEARCH edges USING INDEX sqlite_autoindex_edges_1 (from_id=?)", "USE TEMP B-TREE FOR ORDER BY"},
+			forbid: []string{"SCAN edges"},
+		},
+		{
+			// stmtInEdges: nothing left indexes to_id, so the reverse
+			// adjacency degrades all the way to a table scan plus a sort.
+			name:  "in_edges_ordered_bulk_load",
+			query: `SELECT ` + edgeInsertColumns + ` FROM edges WHERE to_id = ? ORDER BY kind, id`,
+			want:  []string{"SCAN edges", "USE TEMP B-TREE FOR ORDER BY"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := explainQueryPlan(t, s, tc.query, 1)
+			joined := strings.Join(plan, "\n")
+			for _, want := range tc.want {
+				if !strings.Contains(joined, want) {
+					t.Fatalf("plan missing %q:\n%s", want, joined)
+				}
+			}
+			for _, forbid := range tc.forbid {
+				if strings.Contains(joined, forbid) {
+					t.Fatalf("plan contains forbidden %q:\n%s", forbid, joined)
+				}
+			}
+		})
+	}
+}
+
+// dropBulkLoadIndexes reproduces what BeginBulkLoad does to a store's schema.
+// BeginBulkLoad itself engages only on a provably empty store, and a plan lock
+// needs rows to plan against, so the drops are issued directly from the same
+// list production drops by name.
+//
+// The reader handle is asked for the surviving index set afterwards, which both
+// states the precondition and makes the reader notice the schema change before
+// anything is EXPLAINed against it.
+func dropBulkLoadIndexes(t *testing.T, s *Store) {
+	t.Helper()
+	dropped := make(map[string]struct{}, len(bulkDroppableIndexes))
+	for _, idx := range bulkDroppableIndexes {
+		if _, err := s.writerDB.Exec("DROP INDEX IF EXISTS " + idx.name); err != nil {
+			t.Fatalf("drop %s: %v", idx.name, err)
+		}
+		dropped[idx.name] = struct{}{}
+	}
+	rows, err := s.db.Query(`SELECT name FROM sqlite_master WHERE type = 'index'`)
+	if err != nil {
+		t.Fatalf("read index set: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan index name: %v", err)
+		}
+		if _, ok := dropped[name]; ok {
+			t.Fatalf("index %s survived the bulk-load drop; the degraded plan below would not be the one a cold load runs", name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("index rows: %v", err)
+	}
+}
+
 // explainPlanTolerant mirrors explainQueryPlan but accepts empty plans:
 // prepared DML like a bare INSERT legitimately has no plan rows.
 func explainPlanTolerant(t *testing.T, s *Store, query string) []string {

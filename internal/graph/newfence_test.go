@@ -1,11 +1,14 @@
 package graph
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
-	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -22,6 +25,11 @@ import (
 var stagingCallers = []string{
 	"internal/indexer/indexer.go",
 }
+
+// graphImportPath is the package under fence. The scan resolves whatever local
+// name each file binds it to, so an alias or a dot import is caught the same as
+// the ordinary qualified form.
+const graphImportPath = "github.com/zzet/gortex/internal/graph"
 
 // fenceSkippedDirs are directory names the scan never descends into: version
 // control, fixture trees that intentionally contain unbuildable Go, and vendored
@@ -66,16 +74,17 @@ func TestNewIsFencedToIndexerStaging(t *testing.T) {
 			return relErr
 		}
 		rel = filepath.ToSlash(rel)
-		// This package calls New unqualified, so it never matches the scanned
-		// pattern; skipping it keeps the scan honest about that.
+		// This package calls New unqualified and does not import itself, so it
+		// can never match; skipping it keeps the scan honest about that.
 		if path.Dir(rel) == "internal/graph" {
 			return nil
 		}
-		src, readErr := os.ReadFile(p)
-		if readErr != nil {
-			return readErr
+		constructs, parseErr := fileConstructsStagingGraph(p)
+		if parseErr != nil {
+			t.Errorf("parsing %s: %v", rel, parseErr)
+			return nil
 		}
-		if !callsGraphNew(string(src)) {
+		if !constructs {
 			return nil
 		}
 		if _, ok := allowed[rel]; ok {
@@ -107,32 +116,82 @@ func TestNewIsFencedToIndexerStaging(t *testing.T) {
 	}
 }
 
-// callsGraphNew reports whether src contains a qualified construction of the
-// in-memory Store in executable code. Comments and string literals are stripped
-// first so prose about the staging buffer does not trip the fence, and a match
-// preceded by an identifier character (someothergraph.New()) is rejected.
-func callsGraphNew(src string) bool {
-	code := stripGoComments(src)
-	const call = "graph.New()"
-	for i := 0; ; {
-		j := strings.Index(code[i:], call)
-		if j < 0 {
+// fileConstructsStagingGraph reports whether the file names the graph package's
+// New symbol in executable code.
+//
+// The check is syntactic rather than textual: it resolves the local name the
+// file binds the graph import to and then looks for that name's New. A textual
+// scan for "graph.New()" reads as equivalent but is not — an aliased import
+// (g "…/internal/graph"; g.New()) or a dot import walks straight past it, and
+// the fence exists precisely to stop a new in-memory store from appearing
+// somewhere nobody looked.
+//
+// A reference counts whether or not it is immediately called: taking New as a
+// function value and invoking it elsewhere constructs exactly the same store.
+func fileConstructsStagingGraph(filePath string) (bool, error) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filePath, nil, parser.SkipObjectResolution)
+	if err != nil {
+		return false, err
+	}
+
+	qualifiers := make(map[string]struct{})
+	dotImported := false
+	for _, spec := range file.Imports {
+		importPath, uErr := strconv.Unquote(spec.Path.Value)
+		if uErr != nil || importPath != graphImportPath {
+			continue
+		}
+		switch {
+		case spec.Name == nil:
+			qualifiers["graph"] = struct{}{} // package name, not the last path element
+		case spec.Name.Name == ".":
+			dotImported = true
+		case spec.Name.Name == "_":
+			// Blank import: the package cannot be named, so nothing to fence.
+		default:
+			qualifiers[spec.Name.Name] = struct{}{}
+		}
+	}
+	if len(qualifiers) == 0 && !dotImported {
+		return false, nil
+	}
+
+	found := false
+	// Selector fields (the Sel in x.New) are idents too, and Inspect walks
+	// them. Remembering the ones already accounted for keeps the dot-import
+	// arm below from reading someOther.New as an unqualified New.
+	qualified := make(map[*ast.Ident]struct{})
+	ast.Inspect(file, func(n ast.Node) bool {
+		if found {
 			return false
 		}
-		at := i + j
-		if at == 0 || !isFenceIdentByte(code[at-1]) {
-			return true
+		switch node := n.(type) {
+		case *ast.SelectorExpr:
+			if node.Sel == nil || node.Sel.Name != "New" {
+				return true
+			}
+			qualified[node.Sel] = struct{}{}
+			pkg, ok := node.X.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			if _, ok := qualifiers[pkg.Name]; ok {
+				found = true
+				return false
+			}
+		case *ast.Ident:
+			// Only meaningful for a dot import: an unqualified New in a file
+			// that dot-imports the graph package resolves to graph.New.
+			if _, isSelector := qualified[node]; isSelector {
+				return true
+			}
+			if dotImported && node.Name == "New" {
+				found = true
+				return false
+			}
 		}
-		i = at + len(call)
-	}
-}
-
-func isFenceIdentByte(b byte) bool {
-	switch {
-	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
 		return true
-	case b == '_', b == '.':
-		return true
-	}
-	return false
+	})
+	return found, nil
 }

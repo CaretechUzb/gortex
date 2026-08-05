@@ -30,6 +30,9 @@ func TestSQLiteStoreConformance(t *testing.T) {
 		// repo_prefix is an ordinary column here, so the empty prefix deletes
 		// the unprefixed (standalone-indexing) namespace like any other.
 		EvictsEmptyRepoPrefix: true,
+		// The adjacency statements carry an ORDER BY that the from/to indexes
+		// serve without a sorter; the plan locks hold them to it.
+		AdjacencyLineOrdered: true,
 	})
 }
 

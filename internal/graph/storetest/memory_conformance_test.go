@@ -24,5 +24,9 @@ func TestMemoryStoreConformance(t *testing.T) {
 		// The empty prefix has never been a bucket here: unprefixed nodes live
 		// outside the per-repository index, so EvictRepo("") returns (0, 0).
 		EvictsEmptyRepoPrefix: false,
+		// Adjacency reads hand back the per-node append slice as it stands.
+		// Sorting it would tax the cold-index staging path this store exists
+		// to keep fast, for an order no staging caller reads.
+		AdjacencyLineOrdered: false,
 	})
 }
