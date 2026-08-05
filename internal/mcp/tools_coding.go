@@ -175,9 +175,11 @@ func (s *Server) registerCodingTools() {
 
 	s.addTool(
 		mcp.NewTool("rename_symbol",
-			mcp.WithDescription("Plans a coordinated multi-file rename for a symbol. Plan-only — this call never writes to disk. Returns {file, line, old_text, new_text, confidence, reason} for the definition, every graph usage (calls / references / instantiates), receiver-line edits when renaming a type, and test-function names that embed the old identifier. Apply the returned edits with batch_edit (preferred — preflighted and dependency-ordered), edit_file, or edit_symbol."),
+			mcp.WithDescription("Applies a coordinated multi-file rename for a symbol. Rewrites the definition, every graph usage (calls / references / instantiates), receiver lines when renaming a type, and test-function names that embed the old identifier. Returns status (applied / would_apply / no_edits), the {file, line, old_text, new_text, confidence, reason} edit list, and per-file {bytes_written, new_sha, reindexed}. Every affected line is re-verified against disk and parse-gated before anything is written, so the rename either lands completely or is refused. Pass dry_run=true to preview the identical edit list without writing."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol ID to rename (e.g. auth/token.go::validateToken)")),
 			mcp.WithString("new_name", mcp.Required(), mcp.Description("New name for the symbol")),
+			mcp.WithBoolean("dry_run", mcp.Description("Preview only: compute and verify every edit but write nothing. Returns status \"would_apply\" with the same edits and per-file new_sha the real call would produce. Default false — the call writes.")),
+			mcp.WithBoolean("allow_parse_errors", mcp.Description("Bypass the pre-write parse gate. By default a rename that would leave any affected file with new tree-sitter parse errors is refused before anything is written; set true to rename anyway.")),
 		),
 		s.handleRenameSymbol,
 	)
@@ -2549,6 +2551,8 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 	if err != nil {
 		return mcp.NewToolResultError("new_name is required"), nil
 	}
+	dryRun := req.GetBool("dry_run", false)
+	allowParseErrors := req.GetBool("allow_parse_errors", false)
 
 	node := s.engineFor(ctx).GetSymbol(id)
 	if node == nil {
@@ -2571,21 +2575,24 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 		return abs
 	}
 
-	type renameEdit struct {
-		File       string `json:"file"`
-		Line       int    `json:"line"`
-		OldText    string `json:"old_text"`
-		NewText    string `json:"new_text"`
-		Confidence string `json:"confidence"`
-		Reason     string `json:"reason"`
-	}
-
 	var edits []renameEdit
 	editSeen := make(map[string]bool) // file:line dedup
 
+	// Every planned line is rewritten with whole-identifier replacement of
+	// every occurrence. A substring rewrite would corrupt neighbouring names
+	// ("Get" inside "GetUser"), and a first-occurrence-only rewrite would miss
+	// the second call on lines such as "x := Get(Get(y))". These edits are
+	// written to disk, so the plan has to be exactly right.
+	rewrite := func(line string) (string, bool) {
+		next, n := replaceIdentifierAll(line, oldName, newName)
+		return next, n > 0
+	}
+
 	// 1. The definition itself.
+	// A successful rewrite implies a non-empty line, so an unreadable line
+	// (readSingleLineAt returns "") is skipped by the same check.
 	defLine := readSingleLineAt(resolvePath(node.FilePath), node.StartLine)
-	if defLine != "" && strings.Contains(defLine, oldName) {
+	if newText, ok := rewrite(defLine); ok {
 		key := fmt.Sprintf("%s:%d", node.FilePath, node.StartLine)
 		if !editSeen[key] {
 			editSeen[key] = true
@@ -2593,7 +2600,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 				File:       node.FilePath,
 				Line:       node.StartLine,
 				OldText:    defLine,
-				NewText:    strings.Replace(defLine, oldName, newName, 1),
+				NewText:    newText,
 				Confidence: "high",
 				Reason:     "definition",
 			})
@@ -2608,7 +2615,8 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 		}
 		// Read the source line at the reference.
 		srcLine := readSingleLineAt(resolvePath(edge.FilePath), edge.Line)
-		if srcLine == "" || !strings.Contains(srcLine, oldName) {
+		newText, ok := rewrite(srcLine)
+		if !ok {
 			continue
 		}
 		key := fmt.Sprintf("%s:%d", edge.FilePath, edge.Line)
@@ -2620,7 +2628,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 			File:       edge.FilePath,
 			Line:       edge.Line,
 			OldText:    srcLine,
-			NewText:    strings.Replace(srcLine, oldName, newName, 1),
+			NewText:    newText,
 			Confidence: "high",
 			Reason:     string(edge.Kind),
 		})
@@ -2641,7 +2649,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 			if strings.Contains(memberNode.ID, oldName+".") {
 				// The receiver line may mention the type name.
 				srcLine := readSingleLineAt(resolvePath(memberNode.FilePath), memberNode.StartLine)
-				if srcLine != "" && strings.Contains(srcLine, oldName) {
+				if newText, ok := rewrite(srcLine); ok {
 					key := fmt.Sprintf("%s:%d", memberNode.FilePath, memberNode.StartLine)
 					if !editSeen[key] {
 						editSeen[key] = true
@@ -2649,7 +2657,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 							File:       memberNode.FilePath,
 							Line:       memberNode.StartLine,
 							OldText:    srcLine,
-							NewText:    strings.Replace(srcLine, oldName, newName, 1),
+							NewText:    newText,
 							Confidence: "high",
 							Reason:     "member receiver",
 						})
@@ -2672,6 +2680,18 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 				if srcLine == "" {
 					continue
 				}
+				// Here the old name is deliberately embedded in a longer
+				// identifier ("TestValidateToken"). Rewrite that whole
+				// identifier rather than the bare substring, so the edit
+				// cannot land inside some unrelated name on the same line.
+				renamed := strings.ReplaceAll(n.Name, oldName, newName)
+				if renamed == n.Name {
+					continue
+				}
+				newText, replaced := replaceIdentifierAll(srcLine, n.Name, renamed)
+				if replaced == 0 {
+					continue
+				}
 				key := fmt.Sprintf("%s:%d", n.FilePath, n.StartLine)
 				if editSeen[key] {
 					continue
@@ -2681,7 +2701,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 					File:       n.FilePath,
 					Line:       n.StartLine,
 					OldText:    srcLine,
-					NewText:    strings.Replace(srcLine, oldName, newName, 1),
+					NewText:    newText,
 					Confidence: "medium",
 					Reason:     "test function name",
 				})
@@ -2695,13 +2715,76 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 		fileSet[e.File] = true
 	}
 
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	resp := map[string]any{
 		"old_name":       oldName,
 		"new_name":       newName,
 		"edits":          edits,
 		"total_edits":    len(edits),
 		"files_affected": len(fileSet),
-	})
+		"dry_run":        dryRun,
+	}
+
+	if len(edits) == 0 {
+		// Nothing to write either way. Say so rather than reporting an
+		// applied rename that touched no bytes.
+		resp["status"] = "no_edits"
+		resp["written"] = false
+		return s.respondJSONOrTOON(ctx, req, resp)
+	}
+
+	// Lock every affected path before verifying, so the check that each line
+	// still matches disk cannot be invalidated between verification and write.
+	absPaths := make([]string, 0, len(fileSet))
+	for relPath := range fileSet {
+		abs, err := s.resolveGraphPath(relPath)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("could not resolve %s: %v", relPath, err)), nil
+		}
+		absPaths = append(absPaths, abs)
+	}
+	releaseMutation, lockErr := acquireMutationPaths(ctx, absPaths)
+	if lockErr != nil {
+		return mcp.NewToolResultError("rename cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
+	}
+	defer releaseMutation()
+
+	writes, planErr := s.planRenameWrites(edits, allowParseErrors)
+	if planErr != nil {
+		return mcp.NewToolResultError(planErr.Error()), nil
+	}
+
+	if dryRun {
+		resp["status"] = "would_apply"
+		resp["written"] = false
+		resp["files"] = previewRenameWrites(writes)
+		return s.respondJSONOrTOON(ctx, req, resp)
+	}
+
+	results := s.commitRenameWrites(ctx, writes)
+	written := 0
+	failed := 0
+	for _, r := range results {
+		if r["status"] == "applied" {
+			written++
+			continue
+		}
+		failed++
+	}
+	resp["status"] = "applied"
+	resp["written"] = written > 0
+	resp["files"] = results
+	resp["files_written"] = written
+	if failed > 0 {
+		// Every file passed verification, so a failure here is an I/O fault
+		// during the commit itself. Never report it as an applied rename:
+		// the caller has to know the tree is now inconsistent.
+		resp["files_failed"] = failed
+		resp["status"] = "partially_applied"
+		if written == 0 {
+			resp["status"] = "failed"
+		}
+	}
+	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
 func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
