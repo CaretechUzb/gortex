@@ -29,10 +29,29 @@ func TestRunRepo_LocalFixture(t *testing.T) {
 		Local: true,
 	}, queries, budgets{
 		// Generous budgets so a slow CI doesn't flake — the real
-		// validation lives in main.go's strict-mode path.
-		ImpactP95Ms: 50.0,
-		SearchP95Ms: 100.0,
+		// validation lives in main.go's strict-mode path. These gates
+		// exist to catch a pathological regression (an accidental
+		// whole-table scan per query), never to enforce a latency.
+		//
+		// Calibrated against the SQLite-backed harness under -race,
+		// where the fixture measures search p95 ~40ms and impact p95
+		// ~27ms — the store reads and the race detector together cost
+		// two orders of magnitude over the timings this test was first
+		// written for. A budget within 2-3x of the observed figure is
+		// not generous: it fails whenever the package runs alongside
+		// the rest of the suite and the machine is contended. Keep an
+		// order of magnitude of headroom, and re-derive it from the
+		// MEASURED line below rather than by guessing.
+		ImpactP95Ms: 500.0,
+		SearchP95Ms: 500.0,
 	})
+
+	// The figures the budgets above are derived from — logged so a
+	// recalibration starts from a measurement (`go test -v`) instead of
+	// from a guess.
+	t.Logf("MEASURED cold=%.3fms search_p50=%.3fms search_p95=%.3fms impact_p50=%.3fms impact_p95=%.3fms impact_p99=%.3fms incremental=%.3fms",
+		row.ColdIndexMs, row.SearchP50Ms, row.SearchP95Ms,
+		row.ImpactP50Ms, row.ImpactP95Ms, row.ImpactP99Ms, row.IncrementalMs)
 
 	if row.Error != "" {
 		t.Fatalf("runRepo error: %s", row.Error)
