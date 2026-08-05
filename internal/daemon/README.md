@@ -1,14 +1,14 @@
 # `internal/daemon`
 
 Process-local daemon plumbing — Unix socket transport, MCP dispatch
-session state, snapshot paths, plus the iteration-1 multi-server
+session state, runtime state paths, plus the iteration-1 multi-server
 roster and editor-overlay machinery.
 
 ## Surface
 
 | File | Role |
 |------|------|
-| `paths.go` | Default file paths (socket, PID, snapshot, log) |
+| `paths.go` | Default file paths (socket, PID, log) |
 | `proto.go` | Wire types for the daemon's internal MCP protocol |
 | `client.go` | Connect-and-talk client used by the proxy CLI |
 | `servers.go` | `~/.gortex/servers.toml` loader + `ServerClient` (HTTP/unix) + `WorkspaceRosterCache` + `RouteForCwd` |
@@ -61,11 +61,11 @@ buffer?" The HTTP front door at `/v1/overlay/sessions/...` is wired
 in `internal/server`. `BaseSHA` drift detection refuses to merge a
 stale overlay so wrong-line-number errors don't surface as graph bugs.
 
-## Caveat: pre-workspace-slug snapshots
+## Caveat: pre-workspace-slug stores
 
-Old snapshots written by daemons that predate the workspace-slug
-schema carry no `WorkspaceID`/`ProjectID` fields on nodes (gob
-decodes additive fields as zero). The daemon's warmup path
+A graph store written by a daemon that predates the workspace-slug
+schema carries empty `WorkspaceID`/`ProjectID` columns on its nodes.
+The daemon's warmup path
 (`MultiIndexer.BackfillWorkspaceSlugs` invoked from
 `cmd/gortex/daemon_state.go::warmupDaemonState`) re-stamps them from
 the per-repo `.gortex.yaml`. Without that pass, the matcher's

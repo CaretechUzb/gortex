@@ -44,7 +44,7 @@ Every embedding input is capped at the model's positional budget — `max_positi
 
 ## Persistent index
 
-The vector index and the chunk → symbol map are persisted in the daemon snapshot; restarts re-warm in milliseconds without re-embedding the graph. Daemon snapshot schema is forward-compatible — older snapshots load with an empty vector layer and rebuild incrementally.
+The vector index and the chunk → symbol map are persisted in the daemon's graph store; restarts re-warm in milliseconds without re-embedding the graph. The store's schema is forward-compatible — a store written before the vector layer existed opens with an empty one and rebuilds incrementally.
 
 ## Vocabulary bridging without an LLM
 

@@ -91,7 +91,7 @@ Two ways — pick whichever fits your workflow.
 gortex mcp --index . --watch
 ```
 
-`--watch` re-indexes changed files live via fsnotify. `--cache-dir ~/.gortex/cache` (default) saves snapshots between restarts so subsequent starts are ~200ms instead of 3-5s.
+`--watch` re-indexes changed files live via fsnotify. This one-shot server builds its graph in a private store that is deleted when the process exits, so it re-indexes the tree on every launch; run the daemon instead if you want an index that survives restarts (~200ms starts instead of 3-5s).
 
 To also get the HTTP server API (the UI is a separate Next.js app in `web/` that talks to it over HTTP), add `--server` to the same process:
 
@@ -166,7 +166,7 @@ The hooks didn't install. Re-run `gortex init --hooks-only` and restart the AI t
 The index is empty. Either `gortex mcp` isn't watching the right directory, or `.gortex.yaml` excludes everything. Run `gortex status --index /absolute/path/to/repo` to verify the paths.
 
 **Indexing a big repo takes forever.**
-First-time index of a 100k-symbol repo is ~20-30 seconds. On restart, it's ~200ms because the snapshot gets restored and only changed files re-index. Make sure `--cache-dir` isn't being deleted between runs.
+First-time index of a 100k-symbol repo is ~20-30 seconds. With the daemon, a restart is ~200ms because it reopens the graph store it already wrote and re-indexes only the changed files. Make sure the store directory (`~/.gortex/store`, or wherever `--backend-path` points) isn't being deleted between runs.
 
 **Semantic search isn't working.**
 On first use, Gortex downloads the MiniLM-L6-v2 model (~90 MB) to `~/.gortex/models/`. Needs network the first time; after that, fully offline. Check `~/.gortex/models/sentence-transformers_all-MiniLM-L6-v2/` exists.
@@ -217,7 +217,7 @@ gortex savings                # cumulative tokens saved + $ avoided across all s
 
 ```bash
 gortex daemon start --detach  # spawn in background
-gortex daemon stop            # graceful shutdown + final snapshot
+gortex daemon stop            # graceful shutdown; the graph store is already on disk
 gortex daemon restart         # stop + start
 gortex daemon reload          # re-read config, pick up new/removed repos
 gortex daemon logs -n 50      # tail the log

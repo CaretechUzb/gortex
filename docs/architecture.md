@@ -4,7 +4,7 @@
 
 ```
 gortex binary
-  CLI (cobra)    ──> MultiIndexer ──> In-Memory Graph (shared, per-repo indexed)
+  CLI (cobra)    ──> MultiIndexer ──> Graph store (SQLite, shared, per-repo indexed)
   MCP (stdio)    ──────────────────> Query Engine (repo/project/ref scoping)
   HTTP /v1/*     ──────────────────> same tools + /v1/graph + /v1/events (SSE)
   Daemon (unix)  ──────────────────> shared graph for every MCP client, session isolation
@@ -12,19 +12,19 @@ gortex binary
   MCP Resources  ──────────────────> (16 read-only URIs — bootstrap state + analyzer rollups)
                    MultiWatcher <── filesystem events (fsnotify, per-repo)
                    CrossRepoResolver ──> cross-repo edge creation (type-aware)
-                   Persistence ──> gob+gzip snapshot (pluggable backend)
+                   Persistence ──> the same SQLite store, written as it indexes
 ```
 
 ## Data flow
 
-1. On startup, loads cached graph snapshot if available; otherwise performs full indexing.
+1. On startup, opens the existing on-disk graph store if there is one and reconciles it against the filesystem; otherwise performs full indexing.
 2. MultiIndexer walks each repo directory concurrently, dispatches files to language-specific extractors (tree-sitter).
 3. Extractors produce nodes (files, functions, types, etc.) and edges (calls, imports, defines, etc.) with type environment metadata.
 4. In multi-repo mode, nodes get `RepoPrefix` and IDs become `<repo_prefix>/<path>::<Symbol>`.
 5. Resolver links cross-file references with type-aware method matching; CrossRepoResolver links cross-repo references with same-repo preference.
 6. Query Engine answers traversal queries with optional repo/project/ref scoping.
 7. MultiWatcher detects changes per-repo and surgically patches the graph (debounced per-file), then re-resolves cross-repo edges.
-8. On shutdown, persists graph snapshot for fast restart.
+8. Every mutation lands in the store as it happens, so a shutdown has nothing left to flush and the next start reuses what is already there.
 
 ## Graph schema
 
@@ -53,7 +53,9 @@ gortex binary
 
 ## Graph persistence
 
-The daemon writes the graph into its on-disk SQLite store as it indexes, and restores it on startup with incremental re-indexing of only changed files. The daemonless one-shot path (`gortex mcp --index`) keeps its graph for the life of the process only, so it re-indexes the tree on every launch — run the daemon if you want the index to survive.
+The SQLite store is the graph: the daemon writes into it as it indexes and queries it in place, and restores it on startup with incremental re-indexing of only changed files. There is no separate serialisation step and no other persistence format to choose. The daemonless one-shot path (`gortex mcp --index`) runs against a private temp store that is deleted on shutdown, so it re-indexes the tree on every launch — run the daemon if you want the index to survive.
+
+A cold index does pass through memory first: the indexer parses a repository into an in-memory staging graph and then bulk-drains it into the store, which is several times faster than writing every node and edge through as it is parsed. That staging buffer is an implementation detail of indexing — it holds one repository for the length of one index pass, is never queried by tools, and never outlives the process.
 
 **Warm restarts are incremental.** On restart, each tracked repo is reconciled against disk independently and routed down one of three paths: `incremental` (no on-disk changes — the repo is not re-parsed, re-resolved, or re-enriched at all), `scoped` (only the changed/deleted files are re-parsed and cross-file resolution re-runs against just that delta), or `full_retrack` (a whole-repo evict-and-re-parse, reserved for when the change census can't be taken, churn exceeds ~40% of the repo, or the operator forces it — see `GORTEX_WARMUP_FULL_RETRACK` / `GORTEX_WARMUP_FULL_RESOLVE` in [multi-repo.md](multi-repo.md#daemon-tuning-optional)). Semantic-enrichment completion is persisted per `(repo, provider, commit)` in the graph store, so a repo whose marker still matches HEAD on a clean tree skips re-running its LSP hover pass on the next restart too. Each repo's reconcile logs its route (`route=incremental|scoped|full_retrack`) and an honest `full_retrack` flag; the daemon closes out warmup with a single `daemon: warmup summary` line recapping parse/resolve/enrichment timings for the whole restart.
 
