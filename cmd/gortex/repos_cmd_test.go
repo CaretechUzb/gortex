@@ -16,7 +16,6 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
-	"github.com/zzet/gortex/internal/persistence"
 )
 
 // gitInitRepo creates a real git repository at dir with one commit and
@@ -67,7 +66,7 @@ func gitCommitMore(t *testing.T, dir, file string) (headSHA string) {
 
 // reposTestEnv writes a temp global config tracking the given repo
 // entries, points the package-level cfgFile at it, and routes the
-// persistence store the `repos` command reads at an isolated temp dir.
+// freshness store the `repos` command reads at an isolated temp dir.
 // Both package globals are restored on cleanup.
 func reposTestEnv(t *testing.T, repos []config.RepoEntry) {
 	t.Helper()
@@ -80,17 +79,14 @@ func reposTestEnv(t *testing.T, repos []config.RepoEntry) {
 
 	prevCfg := cfgFile
 	cfgFile = gcPath
-	prevCache := reposCacheDir
-	reposCacheDir = filepath.Join(root, "cache")
 	prevBackend := reposBackendPath
 	// Isolate the SQLite freshness store at a per-test path so the
 	// command never reads the developer's real ~/.gortex/store. Tests
 	// that exercise the repo_index_state path seed this file; the rest
-	// leave it absent so describeRepo falls back to the snapshot store.
+	// leave it absent so every repo reports as never indexed.
 	reposBackendPath = filepath.Join(root, "store", "store.sqlite")
 	t.Cleanup(func() {
 		cfgFile = prevCfg
-		reposCacheDir = prevCache
 		reposBackendPath = prevBackend
 	})
 }
@@ -110,24 +106,6 @@ func seedIndexState(t *testing.T, prefix, sha string, dirty bool, indexedAt time
 		IndexedAt:  indexedAt.Unix(),
 	}))
 	require.NoError(t, st.Close())
-}
-
-// seedSnapshot writes a persisted index snapshot for (repoPath, branch,
-// commit) into the test's persistence cache, so runRepos sees the repo
-// as indexed at that commit. The snapshot is keyed under the canonical
-// repo path — the same key describeRepo reads with.
-func seedSnapshot(t *testing.T, repoPath, branch, commit string, indexedAt time.Time) {
-	t.Helper()
-	store, err := persistence.NewFileStore(reposCacheDir, version)
-	require.NoError(t, err)
-	require.NoError(t, store.Save(&persistence.Snapshot{
-		Version:    version,
-		RepoPath:   canonicalRepo(repoPath),
-		CommitHash: commit,
-		Branch:     branch,
-		IndexedAt:  indexedAt,
-	}))
-	require.NoError(t, store.Close())
 }
 
 func newReposCmd() (*cobra.Command, *bytes.Buffer) {
@@ -159,13 +137,13 @@ func TestRunRepos_JSON_FreshAndStale(t *testing.T) {
 	})
 
 	indexedAt := time.Now().Add(-time.Hour).Truncate(time.Second)
-	// fresh-repo: snapshot at the exact current HEAD.
-	seedSnapshot(t, freshDir, "main", freshHead, indexedAt)
-	// stale-repo: snapshot at the old HEAD, then advance HEAD.
-	seedSnapshot(t, staleDir, "main", oldHead, indexedAt)
+	// fresh-repo: indexed at the exact current HEAD.
+	seedIndexState(t, "fresh-repo", freshHead, false, indexedAt)
+	// stale-repo: indexed at the old HEAD, then advance HEAD.
+	seedIndexState(t, "stale-repo", oldHead, false, indexedAt)
 	newHead := gitCommitMore(t, staleDir, "second.txt")
 	require.NotEqual(t, oldHead, newHead)
-	// never-repo: no snapshot seeded.
+	// never-repo: no freshness row seeded.
 
 	reposJSON = true
 	t.Cleanup(func() { reposJSON = false })
@@ -191,7 +169,7 @@ func TestRunRepos_JSON_FreshAndStale(t *testing.T) {
 	assert.True(t, fresh.Indexed)
 	assert.False(t, fresh.Stale, "index matches HEAD → not stale")
 	require.NotNil(t, fresh.LastIndexed)
-	assert.Equal(t, indexedAt.UTC(), fresh.LastIndexed.UTC())
+	assert.Equal(t, indexedAt.Unix(), fresh.LastIndexed.Unix())
 
 	stale := byName["stale-repo"]
 	assert.Equal(t, newHead, stale.HeadCommit)
@@ -221,7 +199,7 @@ func TestRunRepos_Table(t *testing.T) {
 		{Path: freshDir, Name: "alpha"},
 		{Path: neverDir, Name: "beta"},
 	})
-	seedSnapshot(t, freshDir, "main", freshHead, time.Now().Truncate(time.Second))
+	seedIndexState(t, "alpha", freshHead, false, time.Now().Truncate(time.Second))
 
 	reposJSON = false
 	cmd, buf := newReposCmd()
@@ -257,35 +235,8 @@ func TestRunRepos_NoTrackedRepos(t *testing.T) {
 	assert.Empty(t, got)
 }
 
-// TestRunRepos_StaleWhenBranchSlotMissing proves that a repo on a branch
-// with no persisted snapshot at all reports as not-indexed and stale —
-// the snapshot for a different branch must not count.
-func TestRunRepos_StaleWhenBranchSlotMissing(t *testing.T) {
-	base := t.TempDir()
-	dir := filepath.Join(base, "repo")
-	head := gitInitRepo(t, dir)
-
-	reposTestEnv(t, []config.RepoEntry{{Path: dir, Name: "repo"}})
-	// Snapshot stored under a different branch slot.
-	seedSnapshot(t, dir, "other-branch", head, time.Now().Truncate(time.Second))
-
-	reposJSON = true
-	t.Cleanup(func() { reposJSON = false })
-	cmd, buf := newReposCmd()
-	require.NoError(t, runRepos(cmd, nil))
-
-	var got []repoStatus
-	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
-	require.Len(t, got, 1)
-	assert.False(t, got[0].Indexed, "a snapshot on a different branch must not count")
-	assert.True(t, got[0].Stale)
-}
-
-// TestRunRepos_IndexStateFreshness covers the primary freshness source:
-// the daemon's repo_index_state rows (keyed by repo prefix). This is the
-// path that was dead before — `gortex repos` read only the embedded-server
-// snapshot store, which the daemon never writes, so every daemon-indexed
-// repo wrongly reported "never indexed".
+// TestRunRepos_IndexStateFreshness covers the freshness source: the
+// daemon's repo_index_state rows, keyed by repo prefix.
 func TestRunRepos_IndexStateFreshness(t *testing.T) {
 	base := t.TempDir()
 	freshDir := filepath.Join(base, "alpha")
@@ -381,10 +332,10 @@ func TestRunRepos_IndexStateLoneRepoEmptyPrefix(t *testing.T) {
 	assert.Equal(t, head, got[0].IndexedCommit)
 }
 
-// TestRunRepos_IndexStateBeatsSnapshot proves the repo_index_state row is the
-// authoritative source: when both a freshness row and a (stale) snapshot
-// exist, the row wins.
-func TestRunRepos_IndexStateBeatsSnapshot(t *testing.T) {
+// TestRunRepos_UnseededRepoIsNeverIndexed proves a repo with no
+// repo_index_state row reports as never indexed and stale, even when a
+// sibling repo in the same config does have one.
+func TestRunRepos_UnseededRepoIsNeverIndexed(t *testing.T) {
 	base := t.TempDir()
 	dirA := filepath.Join(base, "one")
 	dirB := filepath.Join(base, "two")
@@ -395,10 +346,7 @@ func TestRunRepos_IndexStateBeatsSnapshot(t *testing.T) {
 		{Path: dirA, Name: "one"},
 		{Path: dirB, Name: "two"},
 	})
-	indexedAt := time.Now().Add(-time.Minute).Truncate(time.Second)
-	// Snapshot says an old/wrong commit; the index-state row says HEAD.
-	seedSnapshot(t, dirA, "main", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", indexedAt)
-	seedIndexState(t, "one", headA, false, indexedAt)
+	seedIndexState(t, "one", headA, false, time.Now().Add(-time.Minute).Truncate(time.Second))
 
 	reposJSON = true
 	t.Cleanup(func() { reposJSON = false })
@@ -413,8 +361,13 @@ func TestRunRepos_IndexStateBeatsSnapshot(t *testing.T) {
 	}
 	one := byName["one"]
 	assert.True(t, one.Indexed)
-	assert.Equal(t, headA, one.IndexedCommit, "repo_index_state row wins over the snapshot store")
+	assert.Equal(t, headA, one.IndexedCommit)
 	assert.False(t, one.Stale)
+
+	two := byName["two"]
+	assert.False(t, two.Indexed, "no freshness row → never indexed")
+	assert.True(t, two.Stale)
+	assert.Nil(t, two.LastIndexed)
 }
 
 // TestShortSHA covers the table SHA abbreviation helper.

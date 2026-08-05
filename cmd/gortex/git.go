@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/churn"
-	"github.com/zzet/gortex/internal/indexer"
 )
 
 // gitCommitHash returns the HEAD commit hash for the repository at dir,
@@ -25,8 +24,7 @@ func gitCommitHash(dir string) string {
 
 // gitBranch returns the current branch name for the repository at dir.
 // It returns an empty string when git is unavailable, the directory is
-// not a repo, or HEAD is detached — callers then key snapshots by
-// commit hash instead of branch.
+// not a repo, or HEAD is detached.
 func gitBranch(dir string) string {
 	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
 	cmd.Dir = dir
@@ -43,15 +41,6 @@ func gitBranch(dir string) string {
 	return branch
 }
 
-// canonicalRepo resolves a git worktree to the main repository it
-// shares a .git directory with, so every worktree of one repo keys its
-// index cache under a shared base — the per-branch snapshot slot then
-// gives each worktree its own entry. A non-worktree path is returned
-// unchanged.
-func canonicalRepo(dir string) string {
-	return indexer.ResolveWorktree(dir).MainRepoPath
-}
-
 // gitDefaultBranch returns the repository's default branch as a
 // rev-parseable reference. Thin wrapper over churn.DefaultBranch so
 // the CLI, daemon controller, and MCP tool resolve the same branch
@@ -59,4 +48,3 @@ func canonicalRepo(dir string) string {
 func gitDefaultBranch(dir string) string {
 	return churn.DefaultBranch(dir)
 }
-

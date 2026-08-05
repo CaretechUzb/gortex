@@ -6,14 +6,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm/conversationlog"
-	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/server"
 	"github.com/zzet/gortex/internal/server/hub"
@@ -33,7 +31,6 @@ var (
 	mcpTrack           []string
 	mcpProject         string
 	mcpCacheDir        string
-	mcpNoCache         bool
 	mcpEmbeddings      bool
 	mcpEmbeddingsURL   string
 	mcpEmbeddingsModel string
@@ -65,7 +62,6 @@ func init() {
 	mcpCmd.Flags().StringSliceVar(&mcpTrack, "track", nil, "additional repository paths to track")
 	mcpCmd.Flags().StringVar(&mcpProject, "project", "", "active project name")
 	mcpCmd.Flags().StringVar(&mcpCacheDir, "cache-dir", "", "graph cache directory (default ~/.gortex/cache/)")
-	mcpCmd.Flags().BoolVar(&mcpNoCache, "no-cache", false, "disable graph caching")
 	mcpCmd.Flags().BoolVar(&mcpEmbeddings, "embeddings", false, "enable semantic search (built-in word vectors or transformer if compiled in)")
 	mcpCmd.Flags().StringVar(&mcpEmbeddingsURL, "embeddings-url", "", "embedding API URL (e.g. http://localhost:11434 for Ollama)")
 	mcpCmd.Flags().StringVar(&mcpEmbeddingsModel, "embeddings-model", "", "embedding model name (default: auto-detect)")
@@ -275,69 +271,20 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		errCh <- srv.ServeStdio()
 	}()
 
-	// Create persistence store.
-	var store persistence.Store
-	if mcpNoCache {
-		store = persistence.NopStore{}
-	} else {
-		var err error
-		store, err = persistence.NewFileStore(mcpCacheDir, version)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[gortex] warning: cache disabled: %v\n", err)
-			store = persistence.NopStore{}
-		}
-	}
-
 	// Background: index, watch, analyze — graph populates while MCP is live.
 	go func() {
 		if mcpIndex != "" {
-			commitHash := gitCommitHash(mcpIndex)
-			branch := gitBranch(mcpIndex)
-			repoKey := canonicalRepo(mcpIndex)
-			cached := false
-
-			if commitHash != "" && store.Check(repoKey, branch, commitHash) && store.Validate(repoKey, branch, commitHash) {
-				snap, err := store.Load(repoKey, branch, commitHash)
-				if err == nil {
-					for _, n := range snap.Nodes {
-						g.AddNode(n)
-					}
-					for _, e := range snap.Edges {
-						g.AddEdge(e)
-					}
-					idx.SetFileMtimes(snap.FileMtimes)
-					idx.SetRootPath(mcpIndex)
-
-					// Restore vector index if available.
-					if len(snap.VectorIndex) > 0 && snap.VectorDims > 0 {
-						if err := idx.ImportVectorIndex(snap.VectorIndex, snap.VectorDims, snap.VectorCount); err != nil {
-							fmt.Fprintf(os.Stderr, "[gortex] vector index restore failed: %v\n", err)
-						}
-					}
-
-					result, err := idx.IncrementalReindexPaths(mcpIndex, nil)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "[gortex] incremental reindex failed: %v\n", err)
-					} else {
-						fmt.Fprintf(os.Stderr, "[gortex] restored graph (%d nodes, %d edges), re-indexed %d stale files in %dms\n",
-							result.NodeCount, result.EdgeCount, result.FileCount, result.DurationMs)
-					}
-					cached = true
-				} else {
-					fmt.Fprintf(os.Stderr, "[gortex] cache load failed, will re-index: %v\n", err)
-				}
+			// The embedded server holds its graph for the life of the
+			// process only: it indexes the tree on every launch. A
+			// long-lived graph is what the daemon is for.
+			fmt.Fprintf(os.Stderr, "[gortex] indexing %s...\n", mcpIndex)
+			result, err := idx.Index(mcpIndex)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[gortex] indexing failed: %v\n", err)
+				return
 			}
-
-			if !cached {
-				fmt.Fprintf(os.Stderr, "[gortex] indexing %s...\n", mcpIndex)
-				result, err := idx.Index(mcpIndex)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "[gortex] indexing failed: %v\n", err)
-					return
-				}
-				fmt.Fprintf(os.Stderr, "[gortex] indexed %d files (%d nodes, %d edges) in %dms\n",
-					result.FileCount, result.NodeCount, result.EdgeCount, result.DurationMs)
-			}
+			fmt.Fprintf(os.Stderr, "[gortex] indexed %d files (%d nodes, %d edges) in %dms\n",
+				result.FileCount, result.NodeCount, result.EdgeCount, result.DurationMs)
 		}
 
 		// Search backend is auto-updated via SearchProvider (idx.Search)
@@ -395,32 +342,6 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		return err
 	case sig := <-sigCh:
 		fmt.Fprintf(os.Stderr, "\n[gortex] received %s, shutting down\n", sig)
-
-		// Persist graph snapshot on shutdown.
-		if mcpIndex != "" {
-			commitHash := gitCommitHash(mcpIndex)
-			if commitHash != "" {
-				snap := &persistence.Snapshot{
-					Version:    version,
-					RepoPath:   canonicalRepo(mcpIndex),
-					CommitHash: commitHash,
-					Branch:     gitBranch(mcpIndex),
-					IndexedAt:  time.Now(),
-					Nodes:      g.AllNodes(),
-					Edges:      g.AllEdges(),
-					FileMtimes: idx.FileMtimes(),
-				}
-				// Include vector index if available.
-				snap.VectorIndex, snap.VectorDims, snap.VectorCount = idx.ExportVectorIndex()
-				if err := store.Save(snap); err != nil {
-					fmt.Fprintf(os.Stderr, "[gortex] cache save failed: %v\n", err)
-				} else {
-					fmt.Fprintf(os.Stderr, "[gortex] saved graph snapshot (%d nodes, %d edges)\n",
-						len(snap.Nodes), len(snap.Edges))
-				}
-			}
-		}
-
 		return nil
 	}
 }

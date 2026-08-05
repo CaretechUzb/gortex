@@ -33,9 +33,8 @@ import (
 	"github.com/zzet/gortex/internal/telemetry"
 )
 
-// Lifecycle selects the backend default, whether warm-restart/snapshot
-// machinery the entry point wires is appropriate, and the store-lock
-// posture.
+// Lifecycle selects the backend default, whether the entry point's
+// warm-restart machinery is appropriate, and the store-lock posture.
 type Lifecycle int
 
 const (
@@ -45,8 +44,9 @@ const (
 	// LifecycleHTTP is the daemon's HTTP surface (gortex daemon --http):
 	// durable, sqlite default, store lock.
 	LifecycleHTTP
-	// LifecycleOneshot is the ephemeral embedded server: memory-only,
-	// FileStore snapshot, no store lock.
+	// LifecycleOneshot is the ephemeral embedded server: memory-only, no
+	// durable store and no store lock — its graph lives and dies with the
+	// process.
 	LifecycleOneshot
 )
 
@@ -68,13 +68,12 @@ func (l Lifecycle) defaultBackend() string {
 // entry-point-resolved options threaded through with the already-loaded
 // config rather than re-derived here.
 type SharedServerConfig struct {
-	Lifecycle    Lifecycle // backend default + store-lock posture
-	Index        string    // workspace root the indexer/LSP/bind anchor at
-	Backend      string    // "" resolves via Lifecycle; else memory|sqlite
-	BackendPath  string    // "" => ~/.gortex/store/store.sqlite
-	SnapshotPath string    // gob+gzip pre-load path; entry point applies it
-	HTTPAddr     string    // opts the lifecycle into the /mcp HTTP surface
-	Watch        bool      // filesystem watcher / incremental reindex
+	Lifecycle   Lifecycle // backend default + store-lock posture
+	Index       string    // workspace root the indexer/LSP/bind anchor at
+	Backend     string    // "" resolves via Lifecycle; else memory|sqlite
+	BackendPath string    // "" => ~/.gortex/store/store.sqlite
+	HTTPAddr    string    // opts the lifecycle into the /mcp HTTP surface
+	Watch       bool      // filesystem watcher / incremental reindex
 
 	// Entry-point-resolved options (not part of the authoritative surface).
 	Config         *config.Config       // loaded .gortex.yaml (required)
@@ -142,8 +141,8 @@ type SharedServer struct {
 	ConfigMgr    *config.ConfigManager
 	Overlays     *daemon.OverlayManager
 	// EmbedderDims is the active embedder's vector dimensionality, or 0
-	// when embeddings are off. The entry point's snapshot warm-start
-	// compares it to a snapshot's vector dims before skipping a re-embed.
+	// when embeddings are off — the width every persisted vector in this
+	// workspace was built at.
 	EmbedderDims int
 
 	// ResolverLSPRegistry / LSPRouter are the resolve-time LSP wiring the
@@ -473,10 +472,10 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 	embedder, embDesc, embReport, embErr := ResolveEmbedder(cfg.Embedder, conf)
 	// Probe API-backed providers up front so Dimensions() is truthful before
-	// we log it and — crucially — before EmbedderDims gates snapshot-vector
-	// reload. An APIProvider reports 0 until its first embed; without this the
-	// log reads dim:0 and the warm-restart vector reload rejects a
-	// correctly-sized cached index, re-embedding the whole graph needlessly.
+	// we log it and before anything gates on the embedder width. An
+	// APIProvider reports 0 until its first embed; without this the log reads
+	// dim:0 and any width comparison against already-persisted vectors sees a
+	// mismatch that isn't there.
 	// Static / local providers know their width natively and don't implement
 	// the prober, so they skip this. Best-effort: a probe failure (bad key /
 	// unreachable URL) only warns — indexing still falls back to BM25.

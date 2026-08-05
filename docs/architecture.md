@@ -53,24 +53,11 @@ gortex binary
 
 ## Graph persistence
 
-Gortex snapshots the graph to disk on shutdown and restores it on startup, with incremental re-indexing of only changed files:
-
-```bash
-# Default cache directory: ~/.gortex/cache/
-gortex mcp --index /path/to/repo
-
-# Custom cache directory
-gortex mcp --index /path/to/repo --cache-dir /tmp/gortex-cache
-
-# Disable caching
-gortex mcp --index /path/to/repo --no-cache
-```
-
-The persistence layer uses a pluggable backend interface (`persistence.Store`). The default backend serializes as gob+gzip. Cache is keyed by repo path + git commit hash, with version validation to invalidate on binary upgrades.
+The daemon writes the graph into its on-disk SQLite store as it indexes, and restores it on startup with incremental re-indexing of only changed files. The daemonless one-shot path (`gortex mcp --index`) keeps its graph for the life of the process only, so it re-indexes the tree on every launch — run the daemon if you want the index to survive.
 
 **Warm restarts are incremental.** On restart, each tracked repo is reconciled against disk independently and routed down one of three paths: `incremental` (no on-disk changes — the repo is not re-parsed, re-resolved, or re-enriched at all), `scoped` (only the changed/deleted files are re-parsed and cross-file resolution re-runs against just that delta), or `full_retrack` (a whole-repo evict-and-re-parse, reserved for when the change census can't be taken, churn exceeds ~40% of the repo, or the operator forces it — see `GORTEX_WARMUP_FULL_RETRACK` / `GORTEX_WARMUP_FULL_RESOLVE` in [multi-repo.md](multi-repo.md#daemon-tuning-optional)). Semantic-enrichment completion is persisted per `(repo, provider, commit)` in the graph store, so a repo whose marker still matches HEAD on a clean tree skips re-running its LSP hover pass on the next restart too. Each repo's reconcile logs its route (`route=incremental|scoped|full_retrack`) and an honest `full_retrack` flag; the daemon closes out warmup with a single `daemon: warmup summary` line recapping parse/resolve/enrichment timings for the whole restart.
 
-**XDG base directories.** Gortex honors the XDG Base Directory spec — `XDG_CONFIG_HOME` for configuration, `XDG_DATA_HOME` for durable data (memories, notes, feedback), and `XDG_CACHE_HOME` for the graph snapshot, token cache, and savings ledger. When set to an absolute path, the variable wins on every platform (Linux / macOS / Windows alike). When unset, every path resolves to its prior default — so upgrading never orphans an existing install's config, memories, or cache. `--cache-dir` still overrides the cache location explicitly.
+**XDG base directories.** Gortex honors the XDG Base Directory spec — `XDG_CONFIG_HOME` for configuration, `XDG_DATA_HOME` for durable data (memories, notes, feedback), and `XDG_CACHE_HOME` for the graph store, token cache, and savings ledger. When set to an absolute path, the variable wins on every platform (Linux / macOS / Windows alike). When unset, every path resolves to its prior default — so upgrading never orphans an existing install's config, memories, or cache. `--cache-dir` still overrides the cache location explicitly.
 
 ## Scale — battle-tested on large repos
 

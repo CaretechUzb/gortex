@@ -15,19 +15,12 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
-	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/tui"
 )
 
 var reposJSON bool
-
-// reposCacheDir is the persistence-store directory `gortex repos`
-// inspects for index freshness. Empty resolves to the default
-// (~/.gortex/cache/) — the same slot `gortex server` / `gortex mcp`
-// persist to. Overridable so tests can point at a temp store.
-var reposCacheDir string
 
 // reposBackendPath is the on-disk SQLite backend file `gortex repos`
 // reads index-freshness provenance (the repo_index_state table) from.
@@ -107,26 +100,16 @@ func runRepos(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	// Primary freshness source: the daemon's on-disk SQLite backend
-	// records one repo_index_state row per repo at the end of every
-	// (re)index. Read it once, read-only, so a single open serves the
-	// whole list. An unavailable / empty store yields an empty map and
-	// we fall back to the snapshot store below.
+	// Freshness source: the daemon's on-disk SQLite backend records one
+	// repo_index_state row per repo at the end of every (re)index. Read it
+	// once, read-only, so a single open serves the whole list. An
+	// unavailable / empty store yields an empty map and every repo reports
+	// as never indexed.
 	indexStates := loadRepoIndexStates()
-
-	// The persistence store is the legacy fallback freshness source —
-	// the embedded `gortex mcp --index` path persists a per-repo
-	// snapshot here on shutdown. An empty cache dir resolves to the
-	// default (~/.gortex/cache/).
-	store, err := persistence.NewFileStore(reposCacheDir, version)
-	if err != nil {
-		return fmt.Errorf("open persistence store: %w", err)
-	}
-	defer store.Close()
 
 	entries := make([]repoStatus, 0, len(repos))
 	for _, r := range repos {
-		entries = append(entries, describeRepo(store, indexStates, len(repos), r))
+		entries = append(entries, describeRepo(indexStates, len(repos), r))
 	}
 	// Stable order regardless of config-file ordering so scripted
 	// diffs and the table stay deterministic.
@@ -150,8 +133,8 @@ func runRepos(cmd *cobra.Command, _ []string) error {
 // (the SQLite repo_index_state table) keyed by repo prefix. It opens the
 // backend store read-only so it is safe to run while a daemon holds the
 // same store. Any failure (no store yet, unreadable cache) degrades to an
-// empty map so `gortex repos` falls back to the snapshot store rather than
-// erroring out.
+// empty map so `gortex repos` reports every repo as never indexed rather
+// than erroring out.
 func loadRepoIndexStates() map[string]graph.RepoIndexState {
 	path := reposBackendPath
 	if path == "" {
@@ -167,14 +150,13 @@ func loadRepoIndexStates() map[string]graph.RepoIndexState {
 // describeRepo resolves one RepoEntry into a repoStatus by reading the
 // repo's current git HEAD and looking up its recorded index freshness.
 //
-// The authoritative source is the daemon's repo_index_state row, keyed by
-// the repo's resolved prefix (config.ResolvePrefix — the entry Name, else
-// the path basename); this is what the daemon writes when it tracks or warms up a repo.
-// When there is exactly one tracked repo, a lone-repo index keyed under the
-// empty prefix counts too. Failing that, the legacy snapshot store (keyed by
-// canonical path + branch) written by the embedded `gortex mcp --index` path
-// is consulted. A repo is fresh when the recorded commit matches HEAD.
-func describeRepo(store persistence.Store, indexStates map[string]graph.RepoIndexState, repoCount int, r config.RepoEntry) repoStatus {
+// Freshness comes from the daemon's repo_index_state row, keyed by the
+// repo's resolved prefix (config.ResolvePrefix — the entry Name, else the
+// path basename); this is what the daemon writes when it tracks or warms up
+// a repo. When there is exactly one tracked repo, a lone-repo index keyed
+// under the empty prefix counts too. A repo is fresh when the recorded
+// commit matches HEAD.
+func describeRepo(indexStates map[string]graph.RepoIndexState, repoCount int, r config.RepoEntry) repoStatus {
 	head := gitCommitHash(r.Path)
 	branch := gitBranch(r.Path)
 
@@ -194,7 +176,7 @@ func describeRepo(store persistence.Store, indexStates map[string]graph.RepoInde
 		Missing: config.RepoPathMissing(r.Path),
 	}
 
-	// Primary: the daemon's freshness row for this repo's prefix.
+	// The daemon's freshness row for this repo's prefix.
 	prefix := config.ResolvePrefix(r)
 	st, ok := indexStates[prefix]
 	if !ok && repoCount == 1 {
@@ -213,23 +195,7 @@ func describeRepo(store persistence.Store, indexStates map[string]graph.RepoInde
 		// commit HEAD currently points at. An empty HeadCommit (not a
 		// git repo) or an empty recorded SHA can never be fresh.
 		entry.Stale = head == "" || st.IndexedSHA == "" || st.IndexedSHA != head
-		return entry
 	}
-
-	// Fallback: the embedded-server snapshot, keyed under the canonical
-	// (main) repo path so every worktree of a repo shares a base slot.
-	repoKey := canonicalRepo(r.Path)
-	snap, loadErr := store.Load(repoKey, branch, head)
-	if loadErr != nil || snap == nil {
-		// ErrNotFound (or any read error) — treat as never indexed.
-		return entry
-	}
-
-	entry.Indexed = true
-	entry.IndexedCommit = snap.CommitHash
-	indexedAt := snap.IndexedAt
-	entry.LastIndexed = &indexedAt
-	entry.Stale = head == "" || snap.CommitHash != head
 	return entry
 }
 
