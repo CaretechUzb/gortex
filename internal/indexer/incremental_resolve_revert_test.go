@@ -81,7 +81,7 @@ func TestIncrementalReindex_DoubleCycle_Sqlite_IntraFileCaller(t *testing.T) {
 
 	cycles := []string{
 		"package p\n\nfunc Foo() {}\n\nfunc Probe() { Foo() }\n", // append + intra-file caller
-		"package p\n\nfunc Foo() {}\n",                          // revert (removes intra-file caller)
+		"package p\n\nfunc Foo() {}\n",                           // revert (removes intra-file caller)
 	}
 	for i, content := range cycles {
 		writeFile(t, defPath, content)
@@ -157,9 +157,9 @@ func TestGuardResolvedEdgeRegression_IncomingArm_FiresOnRevert(t *testing.T) {
 	w.reresolveFn = func(files map[string]struct{}) { fired <- files }
 
 	w.guardResolvedEdgeRegression("def.go",
-		/*nodesBefore*/ 6, /*nodesAfter*/ 5, // probe removed
-		/*resolvedBefore*/ 0, /*resolvedAfter*/ 0, // out-edges never regressed
-		/*incomingBefore*/ 8, /*incomingAfter*/ 0) // callers all dropped
+		/*nodesBefore*/ 6 /*nodesAfter*/, 5, // probe removed
+		/*resolvedBefore*/ 0 /*resolvedAfter*/, 0, // out-edges never regressed
+		/*incomingBefore*/ 8 /*incomingAfter*/, 0) // callers all dropped
 
 	select {
 	case files := <-fired:

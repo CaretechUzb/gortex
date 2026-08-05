@@ -27,8 +27,13 @@ func (idx *Indexer) GrepText(query string, limit int) []trigram.Match {
 
 // warmTrigramSearcher returns the current trigram searcher, rebuilding it
 // when the index generation has moved since the cached searcher was
-// built. Returns nil before anything has been indexed.
+// built. Returns nil before anything has been indexed, and nil when the
+// budget forbids building at all — callers must have a streaming fallback.
 func (idx *Indexer) warmTrigramSearcher() *trigram.Searcher {
+	budget := idx.trigramBudget()
+	if !budget.allowsBuild() {
+		return nil
+	}
 	gen := idx.indexGen.Load()
 
 	idx.trigramMu.Lock()
@@ -49,8 +54,10 @@ func (idx *Indexer) warmTrigramSearcher() *trigram.Searcher {
 	}
 	searcher := idx.trigramSearcher
 	var release func()
+	var bytes int64
 	if searcher != nil {
 		release = idx.trigramReleaseLocked()
+		bytes = searcher.ApproxIndexBytes()
 	}
 	idx.trigramMu.Unlock()
 
@@ -58,9 +65,22 @@ func (idx *Indexer) warmTrigramSearcher() *trigram.Searcher {
 	// different repo, whose callback takes that repo's trigramMu. The lease
 	// captured above prevents a delayed callback from racing a later re-touch.
 	if release != nil {
-		idx.trigramBudget().touch(idx, release)
+		budget.touch(idx, release, bytes)
 	}
 	return searcher
+}
+
+// hasWarmTrigramSearcher reports whether this repo already holds a built
+// searcher, without building one. Callers that can stream instead use it
+// to keep a broad fan-out from building an index per repo.
+func (idx *Indexer) hasWarmTrigramSearcher() bool {
+	if idx == nil {
+		return false
+	}
+	gen := idx.indexGen.Load()
+	idx.trigramMu.Lock()
+	defer idx.trigramMu.Unlock()
+	return idx.trigramSearcher != nil && idx.trigramGen == gen
 }
 
 // trigramBudget returns the budget this Indexer participates in, defaulting

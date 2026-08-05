@@ -19,8 +19,8 @@ func TestStripBOM(t *testing.T) {
 	require.Equal(t, body, stripBOM(append([]byte{0xEF, 0xBB, 0xBF}, body...))) // UTF-8
 	require.Equal(t, body, stripBOM(append([]byte{0xFF, 0xFE}, body...)))       // UTF-16LE
 	require.Equal(t, body, stripBOM(append([]byte{0xFE, 0xFF}, body...)))       // UTF-16BE
-	require.Equal(t, body, stripBOM(body))                                     // no BOM
-	require.Equal(t, []byte{}, stripBOM([]byte{}))                             // empty
+	require.Equal(t, body, stripBOM(body))                                      // no BOM
+	require.Equal(t, []byte{}, stripBOM([]byte{}))                              // empty
 }
 
 func TestTransformPipeline_BOMStripIsBuiltIn(t *testing.T) {
@@ -42,7 +42,7 @@ func TestTransformPipeline_RuleWithNoCommandIgnored(t *testing.T) {
 
 func TestCommandTransform_Matches(t *testing.T) {
 	c := newCommandTransform(config.TransformRule{Extensions: []string{".SVG", ".pdf"}, Command: []string{"cat"}})
-	require.True(t, c.matches("logo.svg"))  // case-insensitive
+	require.True(t, c.matches("logo.svg")) // case-insensitive
 	require.True(t, c.matches("doc.pdf"))
 	require.False(t, c.matches("main.go"))
 

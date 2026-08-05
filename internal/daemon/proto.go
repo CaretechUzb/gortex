@@ -227,6 +227,11 @@ type StatusResponse struct {
 	MemoryBytes   uint64             `json:"memory_bytes"`
 	Runtime       RuntimeStats       `json:"runtime"`
 	SearchBackend SearchBackendStats `json:"search_backend"`
+	// TrigramCache reports the in-memory literal-search index, which is
+	// per repo, lazily built, and can be the largest single structure in
+	// the daemon — while SearchBackend above may simultaneously report
+	// the symbol index as disk-resident. Nil when no indexer is wired.
+	TrigramCache *TrigramCacheStats `json:"trigram_cache,omitempty"`
 	// PProfAddr is set when the daemon has opened an HTTP pprof
 	// listener (via the GORTEX_DAEMON_PPROF_ADDR env var). Empty
 	// string means pprof is not enabled on this daemon.
@@ -358,22 +363,35 @@ type RuntimeStats struct {
 	NumGoroutine int    `json:"num_goroutine"` // live goroutines
 }
 
+// TrigramCacheStats reports the process-wide trigram searcher cache: how
+// many repos hold a built index, its estimated heap, and the ceilings it
+// is held under.
+type TrigramCacheStats struct {
+	Live      int   `json:"live"`
+	MaxLive   int   `json:"max_live"`
+	Bytes     int64 `json:"bytes"`
+	MaxBytes  int64 `json:"max_bytes"`
+	IdleTTLMs int64 `json:"idle_ttl_ms"`
+	BuildsOff bool  `json:"builds_off,omitempty"`
+	Evictions int64 `json:"evictions,omitempty"`
+}
+
 // SearchBackendStats identifies which search backend is currently
 // serving queries, so users can read the `search_b` column in the
 // repo breakdown with the right mental model. Bleve with the default
 // gtreap KV store costs ~32 KiB per document; BM25 costs ~2 KiB.
 type SearchBackendStats struct {
-	Name      string `json:"name"`                 // "bm25" | "bleve-memory" | "bleve-disk" | "sqlite-fts5"
-	DocCount  int    `json:"doc_count"`            // indexed documents across all repos
+	Name     string `json:"name"`      // "bm25" | "bleve-memory" | "bleve-disk" | "sqlite-fts5"
+	DocCount int    `json:"doc_count"` // indexed documents across all repos
 	// DocCountKnown distinguishes "the index holds zero documents" from
 	// "this backend cannot report a document count". Backends whose only
 	// available figure is a since-construction Add/Remove delta leave it
 	// false so renderers omit the number instead of presenting the delta
 	// as a corpus size.
-	DocCountKnown bool `json:"doc_count_known,omitempty"`
-	Bytes     uint64 `json:"bytes"`                // approximate heap footprint
-	DiskPath  string `json:"disk_path,omitempty"`  // set only when Name == "bleve-disk"
-	DiskBytes uint64 `json:"disk_bytes,omitempty"` // current on-disk size for "bleve-disk"
+	DocCountKnown bool   `json:"doc_count_known,omitempty"`
+	Bytes         uint64 `json:"bytes"`                // approximate heap footprint
+	DiskPath      string `json:"disk_path,omitempty"`  // set only when Name == "bleve-disk"
+	DiskBytes     uint64 `json:"disk_bytes,omitempty"` // current on-disk size for "bleve-disk"
 	// DiskResident marks a backend (e.g. "sqlite-fts5") that has no
 	// meaningful heap footprint of its own — its index lives inside the
 	// graph store's own file — and no cheap byte count is available

@@ -33,8 +33,8 @@ func TestContracts_ResponseFromMakeSlice(t *testing.T) {
 import "net/http"
 
 type toolInfo struct {
-	Name        string ` + "`json:\"name\"`" + `
-	Description string ` + "`json:\"description\"`" + `
+	Name        string `+"`json:\"name\"`"+`
+	Description string `+"`json:\"description\"`"+`
 }
 
 type Handler struct{ tools map[string]any }

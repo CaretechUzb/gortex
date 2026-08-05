@@ -135,7 +135,7 @@ func TestIncrementalReindex_DoubleCycle_PreservesIncomingTier(t *testing.T) {
 
 	cycles := []string{
 		"package p\n\nfunc Foo() {}\n\nfunc Extra() {}\n", // append
-		"package p\n\nfunc Foo() {}\n",                     // revert
+		"package p\n\nfunc Foo() {}\n",                    // revert
 	}
 	for i, content := range cycles {
 		writeFile(t, aPath, content)

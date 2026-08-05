@@ -71,9 +71,9 @@ func TestRunnerPropagation_GoDefault(t *testing.T) {
 // import is present.
 func TestRunnerPropagation_PythonFromImports(t *testing.T) {
 	cases := []struct {
-		name        string
-		importPath  string
-		wantRunner  string
+		name       string
+		importPath string
+		wantRunner string
 	}{
 		{"pytest import", "pytest", "pytest"},
 		{"pytest submodule", "pytest.mark", "pytest"},
@@ -141,10 +141,10 @@ func TestRunnerPropagation_RubyFileSuffix(t *testing.T) {
 // global pass still derives the runner from outgoing import edges.
 func TestRunnerPropagation_JSImportEdgeFallback(t *testing.T) {
 	cases := []struct {
-		name    string
-		path    string
-		imp     string
-		want    string
+		name string
+		path string
+		imp  string
+		want string
 	}{
 		{"bun-test via edge", "src/x.test.ts", "bun:test", "bun-test"},
 		{"vitest via edge", "src/x.test.ts", "vitest", "vitest"},

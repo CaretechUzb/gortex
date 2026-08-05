@@ -1283,6 +1283,28 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 				"%s  %sheap=%s", sb.Name, formatSearchDocs(sb), formatBytes(sb.Bytes))})
 		}
 	}
+	if tc := st.TrigramCache; tc != nil {
+		// The literal-search index is per repo, lazily built and can be the
+		// largest single structure in the daemon, so it gets its own line
+		// rather than hiding behind a "disk-resident" search backend.
+		switch {
+		case tc.BuildsOff:
+			t.AppendRow(table.Row{"trigram", "off (GORTEX_TRIGRAM_MAX_LIVE=0) — text search streams"})
+		default:
+			budget := "unbounded"
+			if tc.MaxBytes > 0 {
+				budget = formatBytes(uint64(tc.MaxBytes))
+			}
+			row := fmt.Sprintf("live=%d/%d  heap=%s/%s  idle_ttl=%s",
+				tc.Live, tc.MaxLive,
+				formatBytes(uint64(tc.Bytes)), budget,
+				(time.Duration(tc.IdleTTLMs) * time.Millisecond).String())
+			if tc.Evictions > 0 {
+				row += fmt.Sprintf("  evictions=%d", tc.Evictions)
+			}
+			t.AppendRow(table.Row{"trigram", row})
+		}
+	}
 	rt := st.Runtime
 	if rt.Sys > 0 {
 		t.AppendRow(table.Row{"runtime", fmt.Sprintf(

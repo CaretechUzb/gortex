@@ -56,7 +56,7 @@ func TestIndex_PackageWorkspaceMembership(t *testing.T) {
 		{
 			name: "npm workspace, glob plus explicit member",
 			files: map[string]string{
-				"package.json":              `{"name":"root","workspaces":["packages/*","apps/web"]}`,
+				"package.json":               `{"name":"root","workspaces":["packages/*","apps/web"]}`,
 				"packages/ui/package.json":   `{"name":"ui"}`,
 				"packages/core/package.json": `{"name":"core"}`,
 				"apps/web/package.json":      `{"name":"web"}`,
