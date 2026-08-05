@@ -91,6 +91,10 @@ func RegisterAll(reg *parser.Registry) {
 	reg.Register(NewAutoHotkeyExtractor())
 	reg.Register(NewAssemblyExtractor())
 	reg.Register(NewGDScriptExtractor())
+	// Claims the `project.godot` manifest by exact basename so Godot
+	// autoload singletons become globally-nameable types; the bare
+	// ".godot" extension stays unclaimed.
+	reg.Register(NewGodotProjectExtractor())
 	reg.Register(NewNixExtractor())
 	reg.Register(NewFortranExtractor())
 	reg.Register(NewSolidityExtractor())
