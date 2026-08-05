@@ -595,8 +595,17 @@ var (
 	_ ConstantValueReader      = (*Graph)(nil)
 )
 
-// New creates an empty graph with a shard fan-out derived from the host
-// (see defaultShardCount).
+// New creates an empty in-memory Store with a shard fan-out derived from the
+// host (see defaultShardCount).
+//
+// This is not a selectable persistence backend: nothing it holds outlives the
+// process. It has exactly two roles. In production it is the indexer's staging
+// buffer — a cold index parses into it and then drains the result into the
+// durable store, which is many times faster than writing every node and edge
+// straight through. In tests it is the cheap Store fixture.
+//
+// Anything that must survive a restart needs a real store; a fence test in this
+// package keeps the production call sites down to the indexer's staging ones.
 func New() *Graph {
 	return newWithShardCount(defaultShardCount())
 }

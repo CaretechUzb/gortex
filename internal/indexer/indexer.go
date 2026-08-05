@@ -2927,6 +2927,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// succeeded, immediately before the INSERT-only bulk drain. Besides
 		// shortening the stale-data window, this keeps the shadow decision free
 		// of store reads that queue behind an unrelated repository's bulk writer.
+		//
+		// The shadow is a staging buffer, not a place anything lives: parsing
+		// fills it in memory and the bulk drain below moves everything it holds
+		// into the durable store, which is far cheaper than writing each node
+		// and edge through as it is parsed.
 		idx.indexCount.Add(1)
 		diskTarget = idx.graph
 		inMemShadow = graph.New()
