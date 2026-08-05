@@ -236,6 +236,12 @@ type Indexer struct {
 	// it so a delayed idle/LRU callback cannot release a searcher that was
 	// re-touched after the budget selected its previous lease for eviction.
 	trigramLease uint64
+	// trigramDirty is protected by trigramMu: the repo-relative paths an
+	// incremental pass has changed since the live searcher was built. A
+	// warm search applies them one file at a time instead of rebuilding
+	// the whole corpus, which is what an index-generation bump used to
+	// force after a single edit.
+	trigramDirty map[string]struct{}
 	// trigramBudgetOverride scopes the idle/LRU eviction budget to one
 	// test rather than the process-wide default. Nil in production.
 	trigramBudgetOverride *trigramBudget
@@ -6425,6 +6431,20 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		if contractRefresh.LegacyFallback {
 			invalidation.LegacyFallback = true
 		}
+		// Hand the exact changed set to the trigram cache so the next
+		// search patches those files instead of re-reading the corpus.
+		// staleFiles carries absolute paths; deletedFiles is already
+		// repo-relative, which is the form the searcher keys on.
+		dirty := make([]string, 0, len(staleFiles)+len(deletedFiles))
+		for _, abs := range staleFiles {
+			if rel, err := filepath.Rel(absRoot, abs); err == nil {
+				dirty = append(dirty, filepath.ToSlash(rel))
+			}
+		}
+		for _, rel := range deletedFiles {
+			dirty = append(dirty, filepath.ToSlash(rel))
+		}
+		idx.noteTrigramDirty(dirty...)
 		idx.indexGen.Add(1) // files changed — invalidate the trigram cache
 	}
 

@@ -76,9 +76,6 @@ func TestBuild_ExcludesBinaryFromIndexAndSearch(t *testing.T) {
 	if got := s.ix.DocCount(); got != 1 {
 		t.Errorf("indexed docs = %d, want 1 (the image must not be indexed)", got)
 	}
-	if got := s.IndexedBytes(); got > 1<<10 {
-		t.Errorf("IndexedBytes = %d, want only the source file's bytes", got)
-	}
 	// The image's docID must not be reachable as a candidate for any query,
 	// including the short-query path that returns every known document.
 	for _, q := range []string{"marker", "PNG", "ab"} {
@@ -134,8 +131,8 @@ func TestBuild_OversizeIsExcluded(t *testing.T) {
 	if got := s.ix.DocCount(); got != 1 {
 		t.Errorf("indexed docs = %d, want only the small file indexed", got)
 	}
-	if len(s.searchable) != 1 || s.paths[s.searchable[0]] != "src/small.go" {
-		t.Fatalf("searchable = %v, want only the small file", s.searchable)
+	if ids := s.ix.docIDs(); len(ids) != 1 || s.paths[ids[0]] != "src/small.go" {
+		t.Fatalf("indexed docIDs = %v, want only the small file", ids)
 	}
 	// Every query path must agree that the oversize file is not a candidate.
 	for _, id := range s.candidates("needleInAHaystack") {
@@ -219,5 +216,55 @@ func TestApproxIndexBytes_TracksPairs(t *testing.T) {
 	}
 	if ix.pairs != 0 {
 		t.Errorf("pairs after Remove = %d, want 0", ix.pairs)
+	}
+}
+
+// TestSearcher_UpdatePatchesInPlace covers the incremental path: an edit
+// must be visible on the next search without rebuilding the corpus, a new
+// file must become searchable, and a deleted one must stop matching.
+func TestSearcher_UpdatePatchesInPlace(t *testing.T) {
+	root := t.TempDir()
+	mk(t, root, "src/a.go", "const alpha = 1\n")
+	mk(t, root, "src/b.go", "const beta = 2\n")
+
+	s := Build(root, []string{"src/a.go", "src/b.go"})
+	if m := s.Grep("alpha", 0); len(m) != 1 {
+		t.Fatalf("baseline Grep(alpha) = %+v, want one hit", m)
+	}
+
+	// Edited content replaces the old postings.
+	mk(t, root, "src/a.go", "const gammaRenamed = 1\n")
+	s.Update("src/a.go")
+	if m := s.Grep("alpha", 0); len(m) != 0 {
+		t.Errorf("Grep(alpha) after edit = %+v, want no hits", m)
+	}
+	if m := s.Grep("gammaRenamed", 0); len(m) != 1 || m[0].Path != "src/a.go" {
+		t.Errorf("Grep(gammaRenamed) = %+v, want the edited file", m)
+	}
+
+	// A path the searcher has never seen gets a fresh docID.
+	mk(t, root, "src/c.go", "const deltaAdded = 3\n")
+	s.Update("src/c.go")
+	if m := s.Grep("deltaAdded", 0); len(m) != 1 || m[0].Path != "src/c.go" {
+		t.Errorf("Grep(deltaAdded) = %+v, want the new file", m)
+	}
+
+	// A deleted file is expressed as an Update over a path that is gone.
+	if err := os.Remove(filepath.Join(root, "src", "b.go")); err != nil {
+		t.Fatal(err)
+	}
+	s.Update("src/b.go")
+	if m := s.Grep("beta", 0); len(m) != 0 {
+		t.Errorf("Grep(beta) after delete = %+v, want no hits", m)
+	}
+	if got := s.DocCount(); got != 2 {
+		t.Errorf("DocCount = %d, want 2 (a.go + c.go)", got)
+	}
+
+	// A file that turns binary is dropped rather than indexed.
+	mkBinary(t, root, "src/c.go", pngLike(4<<10))
+	s.Update("src/c.go")
+	if got := s.DocCount(); got != 1 {
+		t.Errorf("DocCount after a file turned binary = %d, want 1", got)
 	}
 }

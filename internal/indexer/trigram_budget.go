@@ -36,6 +36,18 @@ const (
 	// is what makes the worst case a number instead of a hope. Override with
 	// GORTEX_TRIGRAM_MAX_MB.
 	defaultTrigramMaxBytes int64 = 256 << 20
+	// defaultTrigramPromoteAfter is how many searches a repo must serve
+	// inside one window before it earns a built index. An unscoped search
+	// fans out over every tracked repo, so building on the first hit means
+	// one call builds N indexes and the budget immediately evicts all but
+	// a few — N-few full-corpus builds of pure garbage. Until a repo is
+	// promoted its searches stream over the known file list instead, which
+	// costs latency and holds nothing.
+	defaultTrigramPromoteAfter = 3
+	// defaultTrigramPromoteWindow is how long demand accumulates before it
+	// decays. Long enough that a working session on one repo promotes it
+	// quickly, short enough that a one-off fan-out does not.
+	defaultTrigramPromoteWindow = 2 * time.Minute
 )
 
 // TrigramCacheStats is a point-in-time summary of the process-wide trigram
@@ -63,16 +75,21 @@ func TrigramCacheSnapshot() TrigramCacheStats { return processTrigramBudget.stat
 // than the searchers themselves so the owning Indexer keeps sole ownership
 // of its field and its own mutex discipline.
 type trigramBudget struct {
-	mu        sync.Mutex
-	ttl       time.Duration
-	maxLive   int
-	maxBytes  int64
-	entries   map[*Indexer]*trigramEntry
-	bytes     int64
-	evictions int64
-	now       func() time.Time // swappable in tests
-	afterFunc func(time.Duration, func()) *time.Timer
-	timer     *time.Timer
+	mu       sync.Mutex
+	ttl      time.Duration
+	maxLive  int
+	maxBytes int64
+	// promoteAfter / promoteWindow gate how much demand a repo must show
+	// before it is allowed to build an index at all.
+	promoteAfter  int
+	promoteWindow time.Duration
+	entries       map[*Indexer]*trigramEntry
+	demand        map[*Indexer]*trigramDemand
+	bytes         int64
+	evictions     int64
+	now           func() time.Time // swappable in tests
+	afterFunc     func(time.Duration, func()) *time.Timer
+	timer         *time.Timer
 }
 
 type trigramEntry struct {
@@ -82,6 +99,14 @@ type trigramEntry struct {
 	// entry so an eviction can subtract exactly what it removes rather
 	// than re-polling an Indexer that is mid-release.
 	bytes int64
+}
+
+// trigramDemand counts recent searches against one repo, so a repo that
+// is actually being worked in earns an index while a repo brushed once by
+// a fan-out does not.
+type trigramDemand struct {
+	count int
+	since time.Time
 }
 
 var processTrigramBudget = newTrigramBudget(trigramIdleTTLFromEnv(), trigramMaxLiveFromEnv(), trigramMaxBytesFromEnv())
@@ -100,13 +125,45 @@ func newTrigramBudget(ttl time.Duration, maxLive int, maxBytes int64) *trigramBu
 		maxBytes = defaultTrigramMaxBytes
 	}
 	return &trigramBudget{
-		ttl:       ttl,
-		maxLive:   maxLive,
-		maxBytes:  maxBytes,
-		entries:   make(map[*Indexer]*trigramEntry),
-		now:       time.Now,
-		afterFunc: time.AfterFunc,
+		ttl:           ttl,
+		maxLive:       maxLive,
+		maxBytes:      maxBytes,
+		promoteAfter:  defaultTrigramPromoteAfter,
+		promoteWindow: defaultTrigramPromoteWindow,
+		entries:       make(map[*Indexer]*trigramEntry),
+		demand:        make(map[*Indexer]*trigramDemand),
+		now:           time.Now,
+		afterFunc:     time.AfterFunc,
 	}
+}
+
+// earnsBuild records one search against owner and reports whether owner
+// has now served enough of them, recently enough, to justify building an
+// index. Callers that get false must serve the search by streaming.
+//
+// A repo already holding a live index does not come through here: the
+// gate exists to decide whether to pay for a build, not to re-litigate
+// one already paid for.
+func (b *trigramBudget) earnsBuild(owner *Indexer) bool {
+	if b == nil || owner == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.maxLive <= 0 {
+		return false
+	}
+	if b.promoteAfter <= 1 {
+		return true
+	}
+	now := b.now()
+	d, ok := b.demand[owner]
+	if !ok || now.Sub(d.since) > b.promoteWindow {
+		b.demand[owner] = &trigramDemand{count: 1, since: now}
+		return b.promoteAfter <= 1
+	}
+	d.count++
+	return d.count >= b.promoteAfter
 }
 
 // allowsBuild reports whether a repo may build a searcher at all. False
@@ -219,6 +276,10 @@ func (b *trigramBudget) dropLocked(owner *Indexer) func() {
 	}
 	b.evictions++
 	delete(b.entries, owner)
+	// Demand is about earning a build. Once the index is gone the repo
+	// starts over, so a repo evicted for being idle does not instantly
+	// rebuild on its next single search.
+	delete(b.demand, owner)
 	return entry.release
 }
 
@@ -309,6 +370,7 @@ func (b *trigramBudget) forget(owner *Indexer) {
 		}
 		delete(b.entries, owner)
 	}
+	delete(b.demand, owner)
 	b.scheduleExpiryLocked(b.now())
 	b.mu.Unlock()
 }

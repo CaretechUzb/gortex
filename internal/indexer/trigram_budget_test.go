@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,9 @@ import (
 func newTestTrigramBudget(ttl time.Duration, maxLive int, clock *time.Time) *trigramBudget {
 	b := newTrigramBudget(ttl, maxLive, -1)
 	b.now = func() time.Time { return *clock }
+	// These tests exercise eviction, not promotion: build on first demand
+	// so a searcher exists to evict. Promotion has its own test.
+	b.promoteAfter = 1
 	// Fake-clock tests drive expiry by touch; do not arm a real timer against
 	// an artificial wall clock.
 	b.afterFunc = nil
@@ -376,4 +380,109 @@ func TestTrigramBudgetEnvParsing(t *testing.T) {
 	if got := trigramMaxBytesFromEnv(); got != defaultTrigramMaxBytes {
 		t.Errorf("max bytes = %d, want the default for junk", got)
 	}
+}
+
+// TestWarmTrigramSearcherRequiresDemand covers the promotion gate: a repo
+// brushed once by an unscoped fan-out must not build an index, or one
+// search across N repos builds N corpora only for the budget to evict
+// almost all of them. Searches before promotion still answer, by
+// streaming.
+func TestWarmTrigramSearcherRequiresDemand(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	budget := newTestTrigramBudget(time.Hour, 3, &now)
+	budget.promoteAfter = 3
+	budget.promoteWindow = time.Minute
+
+	dir := t.TempDir()
+	writeTestFile(t, dir+"/main.go", "package main\n\nfunc Warm() int { return 0 }\n")
+	idx := &Indexer{
+		rootPath:              dir,
+		fileMtimes:            map[string]int64{"main.go": 1},
+		trigramBudgetOverride: budget,
+	}
+
+	require.Nil(t, idx.warmTrigramSearcher(), "first search must not build")
+	require.Nil(t, idx.warmTrigramSearcher(), "second search must not build")
+	require.Zero(t, budget.live(), "an unpromoted repo holds no index")
+
+	// The unpromoted searches still return results, via the streaming path.
+	matches := idx.GrepText("Warm", 10)
+	require.NotEmpty(t, matches, "streaming must answer while unpromoted")
+
+	require.NotNil(t, idx.warmTrigramSearcher(), "sustained demand earns an index")
+	require.Equal(t, 1, budget.live())
+
+	// Once built, further searches reuse it without re-earning.
+	require.NotNil(t, idx.warmTrigramSearcher())
+	require.Equal(t, 1, budget.live())
+}
+
+// TestTrigramDemandDecays verifies demand is windowed: a repo touched once
+// every so often never accumulates enough to be promoted.
+func TestTrigramDemandDecays(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	budget := newTestTrigramBudget(time.Hour, 3, &now)
+	budget.promoteAfter = 3
+	budget.promoteWindow = time.Minute
+
+	idx := &Indexer{}
+	for i := 0; i < 5; i++ {
+		require.False(t, budget.earnsBuild(idx), "isolated searches must not promote")
+		now = now.Add(2 * time.Minute)
+	}
+}
+
+// TestWarmTrigramSearcherPatchesDirtyFiles covers the incremental path: an
+// index-generation bump with a small changed set patches those files
+// instead of rebuilding the whole corpus.
+func TestWarmTrigramSearcherPatchesDirtyFiles(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	budget := newTestTrigramBudget(time.Hour, 3, &now)
+
+	dir := t.TempDir()
+	writeTestFile(t, dir+"/main.go", "package main\n\nfunc Original() int { return 0 }\n")
+	idx := &Indexer{
+		rootPath:              dir,
+		fileMtimes:            map[string]int64{"main.go": 1},
+		trigramBudgetOverride: budget,
+	}
+	require.NotNil(t, idx.warmTrigramSearcher())
+	built := idx.trigramSearcher
+
+	writeTestFile(t, dir+"/main.go", "package main\n\nfunc Renamed() int { return 0 }\n")
+	idx.noteTrigramDirty("main.go")
+	idx.indexGen.Add(1)
+
+	require.NotNil(t, idx.warmTrigramSearcher())
+	require.Same(t, built, idx.trigramSearcher, "a small delta must patch, not rebuild")
+	require.Empty(t, idx.trigramDirty, "the dirty set is consumed by the patch")
+	require.NotEmpty(t, idx.GrepText("Renamed", 10), "the edit is visible")
+	require.Empty(t, idx.GrepText("Original", 10), "the old content is gone")
+}
+
+// TestWarmTrigramSearcherRebuildsOnLargeDelta pins the other side of the
+// patch decision: past the patch limit a single rebuild is cheaper.
+func TestWarmTrigramSearcherRebuildsOnLargeDelta(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	budget := newTestTrigramBudget(time.Hour, 3, &now)
+
+	dir := t.TempDir()
+	writeTestFile(t, dir+"/main.go", "package main\n")
+	idx := &Indexer{
+		rootPath:              dir,
+		fileMtimes:            map[string]int64{"main.go": 1},
+		trigramBudgetOverride: budget,
+	}
+	require.NotNil(t, idx.warmTrigramSearcher())
+	built := idx.trigramSearcher
+
+	dirty := make([]string, trigramPatchLimit+1)
+	for i := range dirty {
+		dirty[i] = "generated/f" + strconv.Itoa(i) + ".go"
+	}
+	idx.noteTrigramDirty(dirty...)
+	idx.indexGen.Add(1)
+
+	require.NotNil(t, idx.warmTrigramSearcher())
+	require.NotSame(t, built, idx.trigramSearcher, "a large delta must rebuild")
 }

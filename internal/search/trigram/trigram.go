@@ -167,6 +167,20 @@ func (ix *Index) Candidates(query string) []uint32 {
 	return out
 }
 
+// docIDs returns every indexed docID, ascending. It is the candidate set
+// for a query with no usable trigram, and is derived rather than cached so
+// an incremental Add / Remove cannot leave it stale.
+func (ix *Index) docIDs() []uint32 {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	out := make([]uint32, 0, len(ix.docs))
+	for d := range ix.docs {
+		out = append(out, d)
+	}
+	slices.Sort(out)
+	return out
+}
+
 // DocCount returns the number of indexed documents.
 func (ix *Index) DocCount() int {
 	ix.mu.RLock()

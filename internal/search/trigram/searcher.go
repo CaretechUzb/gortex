@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/zzet/gortex/internal/pathguard"
 )
@@ -25,15 +26,14 @@ type Searcher struct {
 	root         string
 	resolvedRoot string // root with symlinks evaluated, for confinement tests
 	ix           *Index
-	paths        []string // docID -> forward-slash repo-relative path
 
-	// searchable is the ascending set of docIDs a query with no usable
-	// trigram may scan. It is exactly the indexed set: binary, oversized
-	// and unreadable documents hold no postings and are not searched.
-	searchable []uint32
-	// indexedBytes is the summed length of the content actually indexed.
-	// It is the input to the caller's memory budget, not a search input.
-	indexedBytes int64
+	// mu guards the path metadata below against a concurrent Update.
+	// Index has its own lock for the postings. Existing path entries are
+	// never rewritten — Update only appends — so a reader that snapshots
+	// the slice header under RLock can range it without holding the lock.
+	mu        sync.RWMutex
+	paths     []string          // docID -> forward-slash repo-relative path
+	pathIndex map[string]uint32 // reverse of paths, for Update
 }
 
 // Build reads every file — forward-slash repo-relative paths under
@@ -62,10 +62,12 @@ func Build(root string, relPaths []string) *Searcher {
 		resolvedRoot: pathguard.ResolveRoot(root),
 		ix:           New(),
 		paths:        make([]string, len(relPaths)),
+		pathIndex:    make(map[string]uint32, len(relPaths)),
 	}
 	for i, rel := range relPaths {
 		rel = filepath.ToSlash(rel)
 		s.paths[i] = rel
+		s.pathIndex[rel] = uint32(i)
 		abs := filepath.Join(root, filepath.FromSlash(rel))
 		if pathguard.EscapesResolvedRoot(abs, s.resolvedRoot) {
 			continue
@@ -84,26 +86,68 @@ func Build(root string, relPaths []string) *Searcher {
 			continue
 		}
 		s.ix.Add(uint32(i), content)
-		s.indexedBytes += int64(len(content))
-		s.searchable = append(s.searchable, uint32(i))
 	}
-	slices.Sort(s.searchable)
 	return s
+}
+
+// Update re-reads one repo-relative path and refreshes its postings in
+// place, so an incremental index pass costs one file instead of a whole
+// corpus rebuild. A path the searcher has not seen gets a fresh docID.
+//
+// Content that has become binary, oversized, or unreadable is dropped
+// from the index by the same rules Build applies — including a file that
+// was deleted, which is how a removal is expressed.
+func (s *Searcher) Update(rel string) {
+	if s == nil || rel == "" {
+		return
+	}
+	rel = filepath.ToSlash(rel)
+
+	s.mu.Lock()
+	docID, known := s.pathIndex[rel]
+	if !known {
+		docID = uint32(len(s.paths))
+		s.paths = append(s.paths, rel)
+		s.pathIndex[rel] = docID
+	}
+	s.mu.Unlock()
+
+	abs := filepath.Join(s.root, filepath.FromSlash(rel))
+	if pathguard.EscapesResolvedRoot(abs, s.resolvedRoot) {
+		s.dropDoc(docID)
+		return
+	}
+	info, err := os.Stat(abs)
+	if err != nil || info.IsDir() || info.Size() > maxIndexedBytes {
+		s.dropDoc(docID)
+		return
+	}
+	content, err := os.ReadFile(abs)
+	if err != nil || IsBinary(content) {
+		s.dropDoc(docID)
+		return
+	}
+	// Add is documented as the re-index path for a changed file: it drops
+	// the previous postings before recording the new ones.
+	s.ix.Add(docID, content)
+}
+
+func (s *Searcher) dropDoc(docID uint32) {
+	s.ix.Remove(docID)
+}
+
+// snapshotPaths returns the current docID -> path mapping. The slice is
+// append-only and its existing entries are never rewritten, so the
+// caller may range it after the lock is dropped.
+func (s *Searcher) snapshotPaths() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.paths
 }
 
 // candidates returns the docIDs to verify for query.
 func (s *Searcher) candidates(query string) []uint32 {
 	return s.ix.Candidates(query)
-}
-
-// IndexedBytes reports the total content length the searcher actually
-// indexed. Callers use it to size the searcher against a memory budget;
-// it excludes binary and oversized documents, which hold no index state.
-func (s *Searcher) IndexedBytes() int64 {
-	if s == nil {
-		return 0
-	}
-	return s.indexedBytes
 }
 
 // ApproxIndexBytes estimates the heap the index retains, for budgeting.
@@ -116,7 +160,7 @@ func (s *Searcher) ApproxIndexBytes() int64 {
 	if s == nil {
 		return 0
 	}
-	return s.ix.approxBytes() + int64(len(s.paths))*40
+	return s.ix.approxBytes() + int64(len(s.snapshotPaths()))*40
 }
 
 // openConfined opens the indexed file at rel for scanning, refusing one
@@ -145,12 +189,13 @@ func (s *Searcher) Grep(query string, limit int) []Match {
 	if query == "" {
 		return nil
 	}
+	paths := s.snapshotPaths()
 	var matches []Match
 	for _, docID := range s.candidates(query) {
-		if int(docID) >= len(s.paths) {
+		if int(docID) >= len(paths) {
 			continue
 		}
-		rel := s.paths[docID]
+		rel := paths[docID]
 		f, err := s.openConfined(rel)
 		if err != nil {
 			continue
@@ -223,7 +268,7 @@ func (s *Searcher) GrepRegexp(re *regexp.Regexp, requiredLiterals []string, path
 		// No usable literal to trigram-filter on: scan every searchable
 		// document. Binary, oversized and unreadable documents are
 		// excluded here exactly as they are from the literal path.
-		docIDs = slices.Clone(s.searchable)
+		docIDs = s.ix.docIDs()
 	} else {
 		docIDs = make([]uint32, 0, len(candidates))
 		for id := range candidates {
@@ -232,12 +277,13 @@ func (s *Searcher) GrepRegexp(re *regexp.Regexp, requiredLiterals []string, path
 		slices.Sort(docIDs)
 	}
 
+	paths := s.snapshotPaths()
 	var matches []Match
 	for _, docID := range docIDs {
-		if int(docID) >= len(s.paths) {
+		if int(docID) >= len(paths) {
 			continue
 		}
-		rel := s.paths[docID]
+		rel := paths[docID]
 		if pathPrefix != "" && !strings.HasPrefix(rel, pathPrefix) {
 			continue
 		}
