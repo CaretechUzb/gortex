@@ -25,9 +25,9 @@ type benchRow struct {
 	Gortex      pipelineResult `json:"gortex"`
 	// Recall@k by token budget. 2k is the "agent reads two pages of
 	// context" frame; 10k is "agent reads a quarter of a window".
-	RecallAt2kFull   float64 `json:"recall_at_2k_full"`
-	RecallAt2kCtx    float64 `json:"recall_at_2k_context"`
-	RecallAt2kGortex float64 `json:"recall_at_2k_gortex"`
+	RecallAt2kFull    float64 `json:"recall_at_2k_full"`
+	RecallAt2kCtx     float64 `json:"recall_at_2k_context"`
+	RecallAt2kGortex  float64 `json:"recall_at_2k_gortex"`
 	RecallAt10kFull   float64 `json:"recall_at_10k_full"`
 	RecallAt10kCtx    float64 `json:"recall_at_10k_context"`
 	RecallAt10kGortex float64 `json:"recall_at_10k_gortex"`
@@ -78,7 +78,8 @@ func main() {
 	if err != nil {
 		die("index: %v", err)
 	}
-	fmt.Fprintf(os.Stderr, "[token-eff] indexed %d nodes\n", len(indexed.graph.AllNodes()))
+	defer indexed.close()
+	fmt.Fprintf(os.Stderr, "[token-eff] indexed %d nodes\n", indexed.graph.NodeCount())
 
 	// Run each query across the available pipelines.
 	rows := make([]benchRow, 0, len(queries))
@@ -194,8 +195,8 @@ func truncate(s string, max int) string {
 // summaryLine emits the headline median-tokens + recall figure that
 // real readers care about. Format:
 //
-//   "Median tokens: rg+full=X / rg+ctx=Y / gortex=Z (gortex −P%).
-//    Median recall@2k: rg+full=A / rg+ctx=B / gortex=C."
+//	"Median tokens: rg+full=X / rg+ctx=Y / gortex=Z (gortex −P%).
+//	 Median recall@2k: rg+full=A / rg+ctx=B / gortex=C."
 func summaryLine(rows []benchRow, rgAvailable bool) string {
 	if len(rows) == 0 {
 		return "_no rows_"

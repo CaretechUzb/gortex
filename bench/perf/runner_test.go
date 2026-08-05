@@ -136,22 +136,35 @@ func TestTouchFile_BumpsMtime(t *testing.T) {
 	}
 }
 
-func TestEstimateDBSize_ScalesWithGraph(t *testing.T) {
-	small := graph.New()
-	small.AddNode(&graph.Node{ID: "s1", Name: "s1", Kind: graph.KindFunction})
-	smallSize := estimateDBSize(small)
-
-	large := graph.New()
-	for i := range 100 {
-		large.AddNode(&graph.Node{ID: funcID(i), Name: funcName(i), Kind: graph.KindFunction})
+func TestDBSizeBytes_SumsEveryFileInStoreDir(t *testing.T) {
+	dir := t.TempDir()
+	// A store directory holds the database plus its write-ahead log
+	// and any sidecar; every one of them counts toward what the user
+	// sees on disk.
+	files := map[string]int{
+		"bench.sqlite":     4096,
+		"bench.sqlite-wal": 512,
+		"nested/side.db":   128,
 	}
-	largeSize := estimateDBSize(large)
-
-	if smallSize <= 0 || largeSize <= 0 {
-		t.Errorf("DB size estimates should be positive, got small=%d large=%d", smallSize, largeSize)
+	want := int64(0)
+	for name, size := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		want += int64(size)
 	}
-	if largeSize <= smallSize {
-		t.Errorf("larger graph should yield larger estimate, got small=%d large=%d", smallSize, largeSize)
+	if got := dbSizeBytes(dir); got != want {
+		t.Errorf("dbSizeBytes = %d, want %d", got, want)
+	}
+}
+
+func TestDBSizeBytes_MissingDirReportsFailure(t *testing.T) {
+	if got := dbSizeBytes(filepath.Join(t.TempDir(), "absent")); got != -1 {
+		t.Errorf("dbSizeBytes(absent) = %d, want -1", got)
 	}
 }
 
@@ -180,9 +193,9 @@ func TestDefaultRepoSet_IncludeLinuxFlag(t *testing.T) {
 
 // --- helpers --------------------------------------------------------
 
-func funcID(i int) string { return "f.go::F" + itoa(i) }
+func funcID(i int) string   { return "f.go::F" + itoa(i) }
 func funcName(i int) string { return "F" + itoa(i) }
-func fileID(i int) string  { return "file" + itoa(i) + ".go" }
+func fileID(i int) string   { return "file" + itoa(i) + ".go" }
 func fileName(i int) string { return "file" + itoa(i) + ".go" }
 func itoa(i int) string {
 	if i == 0 {

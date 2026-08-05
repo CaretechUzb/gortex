@@ -5,8 +5,8 @@
 //   - ripgrep+full-read: rg --files-with-matches → cat each hit
 //   - ripgrep+context:   rg -n -B50 -A50 → use the printed context
 //   - gortex:            search_symbols → get_symbol_source on the
-//                        top result(s); represents the agent path
-//                        the savings dashboard rewards
+//     top result(s); represents the agent path
+//     the savings dashboard rewards
 package main
 
 import (
@@ -23,6 +23,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
@@ -155,29 +156,45 @@ func runGortex(repoRoot, q string, indexedRepo *indexedRepo, topK int) pipelineR
 	return out
 }
 
-// indexedRepo bundles a graph + engine for the gortex pipeline so we
+// indexedRepo bundles a store + engine for the gortex pipeline so we
 // pay the index cost once per repo regardless of how many queries
-// run.
+// run. close releases the store and its temp directory.
 type indexedRepo struct {
-	graph  *graph.Graph
+	graph  graph.Store
 	engine *query.Engine
+	close  func()
 }
 
-// indexRepoForBench builds a fresh gortex index of the repo. Same
-// shape as the reference-repo perf bench: stderr-logger, real
+// indexRepoForBench builds a fresh gortex index of the repo into a
+// throwaway SQLite store — the same backend the daemon serves, so the
+// gortex row measures the search stack a user's agent would hit. Same
+// shape as the reference-repo perf bench otherwise: quiet logger, real
 // parser registry, no extras.
 func indexRepoForBench(root string) (*indexedRepo, error) {
-	g := graph.New()
+	tmpDir, err := os.MkdirTemp("", "gortex-bench-token-efficiency-*")
+	if err != nil {
+		return nil, err
+	}
+	g, err := store_sqlite.Open(filepath.Join(tmpDir, "bench.sqlite"))
+	if err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return nil, err
+	}
+	closeStore := func() {
+		_ = g.Close()
+		_ = os.RemoveAll(tmpDir)
+	}
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	cfg := config.Config{}
 	idx := indexer.New(g, reg, cfg.Index, zap.NewNop())
 	if _, err := idx.Index(root); err != nil {
+		closeStore()
 		return nil, fmt.Errorf("index %s: %w", root, err)
 	}
 	eng := query.NewEngine(g)
 	eng.SetSearch(idx.Search())
-	return &indexedRepo{graph: g, engine: eng}, nil
+	return &indexedRepo{graph: g, engine: eng, close: closeStore}, nil
 }
 
 // ripgrepFilesWithMatches runs `rg --files-with-matches <pattern>` and

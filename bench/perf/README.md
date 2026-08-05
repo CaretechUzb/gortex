@@ -11,8 +11,8 @@ cold-index path before they ship.
 For each repo the harness captures:
 
 - **LoC / files / nodes / edges** — indexed surface size
-- **Cold-index time** — `Indexer.Index(path)` wall time on a fresh
-  graph
+- **Cold-index time** — `Indexer.Index(path)` wall time into a fresh
+  SQLite store, the backend a daemon serves
 - **Search p95** — 50 representative queries (see `queries.json`)
   fanned through `Engine.SearchSymbols`; p50 + p95 reported
 - **Impact p95 / p99** — 10 randomly-picked functions through
@@ -20,9 +20,10 @@ For each repo the harness captures:
   budget gate
 - **Incremental re-index** — touch 5 files (`os.Chtimes`), re-run
   `Indexer.Index`, measure the delta
-- **DB size** — estimated on-disk byte cost of the graph (gob-shaped,
-  matches what a daemon snapshot would weigh)
-- **RSS** — Go heap retained with the graph, indexer and query engine
+- **DB size** — measured on-disk byte cost of the store the repo was
+  indexed into, write-ahead log included: what the same index weighs
+  in a user's state directory
+- **RSS** — Go heap retained with the store, indexer and query engine
   live (`runtime.MemStats` after a forced GC); the figure
   `gortex daemon status` reports as daemon memory
 
