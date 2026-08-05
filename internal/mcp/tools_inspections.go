@@ -434,7 +434,7 @@ func runGuardsInspection(ctx context.Context, s *Server, scope inspectionScope) 
 	// newRepoScopeResolver answers "whose .gortex.yaml governs this node",
 	// not "may this session see it" — the visibility narrowing is the
 	// scoped node set.
-	for _, n := range s.scopedNodes(ctx) {
+	for _, n := range s.scopedNodesLight(ctx) {
 		if !scope.keep(n.FilePath) {
 			continue
 		}

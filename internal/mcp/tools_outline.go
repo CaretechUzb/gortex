@@ -47,7 +47,7 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 	var scoped []*graph.Node
 	var inScope map[string]bool
 	if bound {
-		scoped = s.scopedNodes(ctx)
+		scoped = s.scopedNodesLight(ctx)
 		inScope = make(map[string]bool, len(scoped))
 		for _, n := range scoped {
 			inScope[n.ID] = true

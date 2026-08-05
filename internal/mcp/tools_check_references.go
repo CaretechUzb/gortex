@@ -154,7 +154,7 @@ func (s *Server) handleCheckReferences(ctx context.Context, req mcp.CallToolRequ
 		if target != nil {
 			excludePath = target.FilePath
 		}
-		for _, n := range s.scopedNodes(ctx) {
+		for _, n := range s.scopedNodesLight(ctx) {
 			if n.Name != name {
 				continue
 			}

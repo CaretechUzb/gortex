@@ -144,7 +144,7 @@ func (s *Server) collectExtractionCandidates(
 	}
 	// In-memory fallback — kept inline so the call site doesn't
 	// branch on the capability twice.
-	scoped := s.scopedNodes(ctx)
+	scoped := s.scopedNodesLight(ctx)
 	rows := make([]extractCandidateRow, 0, len(scoped))
 	for _, n := range scoped {
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {

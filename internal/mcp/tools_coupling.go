@@ -60,7 +60,7 @@ func (s *Server) handleGetCouplingMetrics(ctx context.Context, req mcp.CallToolR
 	// edges still count when they connect two unit-tagged symbols.
 	nodeToUnit := map[string]string{}
 	members := map[string]int{}
-	for _, n := range s.scopedNodes(ctx) {
+	for _, n := range s.scopedNodesLight(ctx) {
 		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}

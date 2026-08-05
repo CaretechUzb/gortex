@@ -34,7 +34,7 @@ func (s *Server) handleAnalyzeRole(ctx context.Context, req mcp.CallToolRequest)
 	roleFilter := strings.TrimSpace(req.GetString("role", ""))
 	limit := max(req.GetInt("limit", 200), 1)
 
-	scoped := s.scopedNodes(ctx)
+	scoped := s.scopedNodesLight(ctx)
 	var nodeToComm map[string]string
 	if cr := s.getCommunities(); cr != nil {
 		nodeToComm = cr.NodeToComm

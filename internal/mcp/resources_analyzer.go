@@ -78,7 +78,7 @@ func (s *Server) handleResourceReport(ctx context.Context, req mcp.ReadResourceR
 	// an unbound session it is every node, so the rollup matches the
 	// legacy global view. inScope bounds the analyzer- and edge-driven
 	// counts; nil for an unbound session.
-	scoped := s.scopedNodes(ctx)
+	scoped := s.scopedNodesLight(ctx)
 	_, _, bound := s.sessionScope(ctx)
 	var inScope map[string]bool
 	if bound {
