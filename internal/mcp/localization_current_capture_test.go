@@ -257,8 +257,14 @@ func TestLocalizationRecoveryDoesNotAuthorizeReadFile(t *testing.T) {
 		generation:               2,
 		recoveryRetriesRemaining: 1,
 	}
+	// read.file is still not a recovery anchor: it can never spend the bounded
+	// allowance or drive the contract to answer_ready. Without an explicit
+	// target it is not a directed read either, so it stays refused.
 	blocked, token := state.authorizeWithToken("read", "file", map[string]any{"path": "repo/storage/disk.go"})
 	if token != 0 || blocked == nil {
 		t.Fatalf("read.file authorization = token %d result %#v", token, blocked)
+	}
+	if localizationDirectedRead("read", "file", map[string]any{"path": "repo/storage/disk.go"}) {
+		t.Fatal("an untargeted read.file was treated as a directed read")
 	}
 }

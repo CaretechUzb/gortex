@@ -25,6 +25,11 @@ const (
 
 var localizationRecoveryOperations = []string{"search.text", "search.symbols", "read.source"}
 
+// localizationDirectedReadRelease names the exit on every refusal that would
+// otherwise leave the caller with no move it can reach. A refusal that only
+// says "blocked" is what turns a bad ranking into a stuck session.
+const localizationDirectedReadRelease = `. If these candidates are wrong, read(operation:"file", target:{file:"<path>"}) reads a file you name and releases this localization.`
+
 const localizationSingleResultInstruction = "The indexed localization pass is complete for this request. Its bounded evidence contains exactly one supported primary production implementation candidate and no competing direct candidate. Continue the requested coding work using this result. Editing, building, testing, and other task tools remain available; further localization is unnecessary unless they reveal contradictory evidence."
 
 // localizationCompletion is the host-neutral terminality contract returned by
@@ -123,7 +128,7 @@ func newLocalizationRecoveryCompletion() localizationCompletion {
 		State:             localizationStateNeedsRecovery,
 		Scope:             "localization",
 		RequiredAction:    "recover_once",
-		Instruction:       `Make one accepted, bounded Gortex MCP recovery call: search(operation:"text" or "symbols", query:<specific task anchor>) or read(operation:"source", target:{symbol:<exact id>}). If Gortex explicitly rejects an overbroad request and preserves the recovery allowance, correct it using only Gortex MCP search or read; the rejected request does not count as the accepted recovery. Do not call host Read, Grep, Glob, Bash, or any other non-Gortex tool. Then respond from the accepted result and follow its completion.`,
+		Instruction:       `Make one accepted, bounded Gortex MCP recovery call: search(operation:"text" or "symbols", query:<specific task anchor>) or read(operation:"source", target:{symbol:<exact id>}). If Gortex explicitly rejects an overbroad request and preserves the recovery allowance, correct it using only Gortex MCP search or read; the rejected request does not count as the accepted recovery. If the retained candidates are wrong and you already know the file you need, read(operation:"file", target:{file:"<path>"}) reads it and releases this localization. Do not call host Read, Grep, Glob, Bash, or any other non-Gortex tool. Then respond from the accepted result and follow its completion.`,
 		AllowedToolCalls:  1,
 		ContractVersion:   localizationTerminalContractV2,
 		AllowedOperations: append([]string(nil), localizationRecoveryOperations...),
@@ -599,6 +604,13 @@ func (s *localizationTerminalState) interceptAnswerReady(facade, operation strin
 	case localizationStateAnswerReady:
 		return localizationTerminalResult(s.completionLocked(), facade, operation), 0
 	case localizationStateNeedsRecovery:
+		if localizationDirectedRead(facade, operation, arguments) {
+			// Checked ahead of the planned-recovery mismatch, which returns without
+			// releasing and would otherwise make a planned recovery the one state a
+			// directed read cannot leave.
+			s.releaseLocalizationAdvisoryLocked(nil)
+			return nil, 0
+		}
 		if s.localizationRecoveryPlannedLocked() && !s.localizationRecoveryAllowsLocked(facade, operation, arguments) {
 			return localizationPlannedRecoveryMismatchResult(s.completionLocked(), facade, operation), 0
 		}
@@ -698,6 +710,14 @@ func localizationRecoveryQueryAligned(task, query string) bool {
 	// short for identifier tokenization but occur verbatim in the request.
 	trimmedAnchor := strings.Trim(lowerQuery, " \t\r\n`'\"")
 	if len(trimmedAnchor) >= 2 && strings.Contains(lowerTask, trimmedAnchor) {
+		return true
+	}
+	// The task side is stored whitespace-collapsed (localizationTaskFingerprint),
+	// so a literal copied character-for-character out of a task that wrapped it
+	// across lines or indented it fails the raw containment above. Collapse the
+	// anchor the same way before giving up on the most specific anchor there is.
+	if collapsed := strings.Join(strings.Fields(trimmedAnchor), " "); len(collapsed) >= 2 &&
+		collapsed != trimmedAnchor && strings.Contains(lowerTask, collapsed) {
 		return true
 	}
 	taskTerms := exploreTerminalTerms(task)
@@ -1225,6 +1245,43 @@ func localizationRecoveryOperationAllowed(facade, operation string) bool {
 	}
 }
 
+// localizationDirectedRead reports whether a read call names the target it
+// wants instead of asking localization to find one. The session-start rule
+// already tells agents to read an explicitly named file with
+// read(operation:"file", target:{file:...}) rather than localize it, so a
+// contract that refuses that same call contradicts its own instruction — and,
+// because every other navigation facade is gated too, leaves a session whose
+// ranked candidates were wrong with nowhere left to look. read.source is
+// excluded: it is the call the contract prescribes, and routing it through the
+// release would discard the refinement steering rather than follow it.
+func localizationDirectedRead(facade, operation string, arguments map[string]any) bool {
+	if facade != "read" || operation == "source" {
+		return false
+	}
+	target, ok := arguments["target"].(map[string]any)
+	if !ok {
+		return false
+	}
+	return facadeSelectorPresent(target["file"]) ||
+		facadeSelectorPresent(target["symbol"]) ||
+		facadeSelectorPresent(target["symbols"])
+}
+
+// localizationReleasableByDirectedRead names the non-terminal states a directed
+// read may abandon. answer_ready is deliberately absent: replaying its retained
+// evidence is the measured terminality contract, not a deadlock. The in-flight
+// states are absent because they mean another permitted call is mid-handler — a
+// transient condition that resolves itself, and releasing under it would race
+// that call's finalizer.
+func localizationReleasableByDirectedRead(state string) bool {
+	switch state {
+	case localizationStateNeedsExactRead, localizationStateNeedsRefinement, localizationStateNeedsRecovery:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *localizationTerminalState) consumeInvalidRecovery(facade, operation string, generation uint64) (localizationCompletion, bool) {
 	if s == nil || generation == 0 || !localizationRecoveryOperationAllowed(facade, operation) {
 		return newLocalizationOpenCompletion(), false
@@ -1254,7 +1311,7 @@ func localizationPlannedRecoveryMismatchResult(completion localizationCompletion
 func localizationRecoveryMisalignedResult(completion localizationCompletion, facade, operation string) *mcpgo.CallToolResult {
 	return newStructuredErrorResult(StructuredError{
 		ErrorCode: ErrCodeLocalizationComplete,
-		Message:   "the recovery search query is not specific to the localization task; use a task term or a concrete path/literal anchor; the recovery allowance is still available",
+		Message:   "the recovery search query is not specific to the localization task; use a task term, a qualified or camelCase identifier with search(operation:\"symbols\"), or a concrete path/literal anchor; the recovery allowance is still available" + localizationDirectedReadRelease,
 		Retriable: true,
 		Data: map[string]any{
 			"contract":           localizationContractFor(completion),
@@ -1431,6 +1488,15 @@ func (s *localizationTerminalState) authorizeWithToken(facade, operation string,
 	if s.state == localizationStateAnswerReady {
 		return localizationTerminalResult(s.completionLocked(), facade, operation), 0
 	}
+	// A read that names its own target is the agent declaring it no longer needs
+	// this localization. Admit it and release, so a session whose candidates were
+	// wrong is never left with a gated read-only surface and an ungated mutating
+	// one. Ordered ahead of every non-terminal branch below: those all end in a
+	// refusal that leaves the state untouched.
+	if localizationReleasableByDirectedRead(s.state) && localizationDirectedRead(facade, operation, arguments) {
+		s.releaseLocalizationAdvisoryLocked(nil)
+		return nil, 0
+	}
 	if s.state == localizationStateNeedsRecovery {
 		if s.localizationRecoveryPlannedLocked() && !s.localizationRecoveryAllowsLocked(facade, operation, arguments) {
 			return localizationPlannedRecoveryMismatchResult(s.completionLocked(), facade, operation), 0
@@ -1470,11 +1536,11 @@ func (s *localizationTerminalState) authorizeWithToken(facade, operation string,
 	message := "localization is complete; return the existing evidence without another Gortex navigation call"
 	switch s.state {
 	case localizationStateNeedsExactRead:
-		message = fmt.Sprintf("localization needs exactly one read(operation:\"source\") for %q; other navigation calls are blocked", s.exactSymbol)
+		message = fmt.Sprintf("localization needs exactly one read(operation:\"source\") for %q; other navigation calls are blocked%s", s.exactSymbol, localizationDirectedReadRelease)
 	case localizationStateExactReadInFlight:
 		message = "the permitted exact localization read is already in progress"
 	case localizationStateNeedsRefinement:
-		message = fmt.Sprintf("localization permits exactly one read(operation:\"source\") for %q; other navigation calls are blocked", s.refinementSymbol)
+		message = fmt.Sprintf("localization permits exactly one read(operation:\"source\") for %q; other navigation calls are blocked%s", s.refinementSymbol, localizationDirectedReadRelease)
 	case localizationStateRefineInFlight:
 		message = "the permitted localization refinement read is already in progress"
 	case localizationStateRecoveryInFlight:
