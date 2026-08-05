@@ -469,6 +469,13 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 		}
 		if len(caveats) > 0 {
 			result["zero_impact_caveat"] = caveats
+		} else {
+			// Every input classified as "has real incoming usage edges", so no
+			// per-symbol caveat fired. A zero blast radius must never reach an
+			// agent unannotated — the classifier reasons about the edges the
+			// graph holds, not about the ones extraction or resolution missed —
+			// so state the residual uncertainty plainly.
+			result["zero_impact_warning"] = "zero observed dependents is not proof of zero impact; extraction or resolution gaps may exist"
 		}
 	}
 
