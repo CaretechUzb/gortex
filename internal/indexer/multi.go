@@ -2950,18 +2950,10 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		// full-root incremental path. A repo with zero changes returns directly
 		// from an authoritative non-Merkle census instead of repeating the same
 		// full-tree walk in the incremental pipeline.
-		//
-		// The in-memory backend (*graph.Graph) keeps its exact prior behaviour:
-		// the full-tree modern pipeline is authoritative there — it evicts
-		// offline-deleted files in place, has no reopened disk store, and so no
-		// per-edge write to route around. Gate on the store type.
-		_, memoryBacked := mi.graph.(*graph.Graph)
 		var (
-			receipt          *graph.MutationReceipt
-			batch            *reparsePendingEnrichmentBatch
-			changed, deleted []string
-			detected         int
-			route            = "incremental"
+			receipt *graph.MutationReceipt
+			batch   *reparsePendingEnrichmentBatch
+			route   string
 		)
 		// fullRetrack is the whole-repo re-track — the ONE place FullRetrack is
 		// stamped. StaleFileCount keeps its honest incremental-work meaning (0
@@ -2974,60 +2966,54 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			}
 			return r, e
 		}
+		changed, deleted, detected, censusErr := idx.changedSinceMtimesCensus(absPath)
+		churn := len(changed) + len(deleted)
+		priorCount := len(priorMtimes)
+		forceFull := os.Getenv("GORTEX_WARMUP_FULL_RETRACK") == "1"
+		manifestOnly := churn > 0
+		for _, relPath := range append(append([]string(nil), changed...), deleted...) {
+			absChangedPath := filepath.Join(absPath, filepath.FromSlash(relPath))
+			if !idx.isIncrementalContractManifest(absChangedPath) {
+				manifestOnly = false
+				break
+			}
+		}
 		switch {
-		case memoryBacked:
+		case censusErr != nil:
+			// A partial filesystem census cannot safely authorize replacement:
+			// preserve rows below unreadable paths through the existing
+			// full-root incremental pipeline.
+			route = "incremental"
 			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
+		case forceFull:
+			route = "full_retrack"
+			result, err = fullRetrack()
+		case churn == 0 && !idx.merkleEnabled():
+			route = "census_noop"
+			result = idx.cleanCensusResult(detected, start)
+		case churn == 0:
+			// The mtime census cannot prove a Merkle-enabled repository clean:
+			// a missing baseline or extractor-salt change still requires the
+			// content-addressed full-tree incremental check.
+			route = "incremental"
+			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
+		case manifestOnly && idx.merkleEnabled():
+			// Keep the Merkle baseline repository-wide; a scoped tree would
+			// replace it with the manifest-only projection.
+			route = "incremental"
+			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
+		case manifestOnly:
+			// Root contract manifests are not part of the source-file count, so
+			// one changed go.mod must not look like >40% source churn in a tiny
+			// repository. The scoped refresh records its mtime and converges.
+			route = "scoped"
+			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, append(changed, deleted...), true)
+		case priorCount > 0 && churn*100 > priorCount*40:
+			route = "full_retrack"
+			result, err = fullRetrack()
 		default:
-			var censusErr error
-			changed, deleted, detected, censusErr = idx.changedSinceMtimesCensus(absPath)
-			churn := len(changed) + len(deleted)
-			priorCount := len(priorMtimes)
-			forceFull := os.Getenv("GORTEX_WARMUP_FULL_RETRACK") == "1"
-			manifestOnly := churn > 0
-			for _, relPath := range append(append([]string(nil), changed...), deleted...) {
-				absChangedPath := filepath.Join(absPath, filepath.FromSlash(relPath))
-				if !idx.isIncrementalContractManifest(absChangedPath) {
-					manifestOnly = false
-					break
-				}
-			}
-			switch {
-			case censusErr != nil:
-				// A partial filesystem census cannot safely authorize replacement:
-				// preserve rows below unreadable paths through the existing
-				// full-root incremental pipeline.
-				route = "incremental"
-				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
-			case forceFull:
-				route = "full_retrack"
-				result, err = fullRetrack()
-			case churn == 0 && !idx.merkleEnabled():
-				route = "census_noop"
-				result = idx.cleanCensusResult(detected, start)
-			case churn == 0:
-				// The mtime census cannot prove a Merkle-enabled repository clean:
-				// a missing baseline or extractor-salt change still requires the
-				// content-addressed full-tree incremental check.
-				route = "incremental"
-				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
-			case manifestOnly && idx.merkleEnabled():
-				// Keep the Merkle baseline repository-wide; a scoped tree would
-				// replace it with the manifest-only projection.
-				route = "incremental"
-				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
-			case manifestOnly:
-				// Root contract manifests are not part of the source-file count, so
-				// one changed go.mod must not look like >40% source churn in a tiny
-				// repository. The scoped refresh records its mtime and converges.
-				route = "scoped"
-				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, append(changed, deleted...), true)
-			case priorCount > 0 && churn*100 > priorCount*40:
-				route = "full_retrack"
-				result, err = fullRetrack()
-			default:
-				route = "scoped"
-				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, append(changed, deleted...), true)
-			}
+			route = "scoped"
+			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, append(changed, deleted...), true)
 		}
 		if err != nil {
 			return fmt.Errorf("reconciling %s: %w", absPath, err)

@@ -12,20 +12,28 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/search"
 )
 
-// TestReconcileRepoCtx_EvictsOfflineDeletions simulates the exact B2
-// scenario: daemon indexes a repo, saves its mtimes to a "snapshot",
-// a file is deleted while the daemon is down, daemon restarts and
-// reconciles via ReconcileRepoCtx. After reconcile, the deleted file's
-// nodes must be absent from the graph.
+// TestReconcileRepoCtx_EvictsOfflineDeletions simulates a warm restart:
+// the daemon indexes a repo and records its mtimes, a file is deleted
+// while the daemon is down, the daemon restarts and reconciles via
+// ReconcileRepoCtx. After reconcile, the deleted file's nodes must be
+// absent from the graph.
+//
+// The repo carries enough files that deleting one stays below the churn
+// ratio that escalates to a whole-repo re-track, so this covers the scoped
+// reconcile route that a restart normally takes.
 func TestReconcileRepoCtx_EvictsOfflineDeletions(t *testing.T) {
 	dir := t.TempDir()
 	repoPath := filepath.Join(dir, "repo")
 	require.NoError(t, os.MkdirAll(repoPath, 0o755))
 	writeFile(t, filepath.Join(repoPath, "a.go"), "package main\nfunc Alpha() {}\n")
 	writeFile(t, filepath.Join(repoPath, "b.go"), "package main\nfunc Beta() {}\n")
+	writeFile(t, filepath.Join(repoPath, "c.go"), "package main\nfunc Gamma() {}\n")
+	writeFile(t, filepath.Join(repoPath, "d.go"), "package main\nfunc Delta() {}\n")
+	writeFile(t, filepath.Join(repoPath, "e.go"), "package main\nfunc Epsilon() {}\n")
 
 	cfgPath := filepath.Join(dir, "config.yaml")
 	gc := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: repoPath, Name: "repo"}}}
@@ -34,9 +42,12 @@ func TestReconcileRepoCtx_EvictsOfflineDeletions(t *testing.T) {
 	cm, err := config.NewConfigManager(cfgPath)
 	require.NoError(t, err)
 
-	// First "daemon run": index the repo, capture mtimes as if we were
-	// writing a snapshot.
-	g := graph.New()
+	// First "daemon run": index the repo into the durable store and capture
+	// mtimes, exactly as a daemon does before it shuts down.
+	s, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	g := graph.Store(s)
 	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
@@ -59,9 +70,9 @@ func TestReconcileRepoCtx_EvictsOfflineDeletions(t *testing.T) {
 	_, err = mi2.ReconcileRepoCtx(context.Background(), config.RepoEntry{Path: repoPath, Name: "repo"}, priorMtimes)
 	require.NoError(t, err)
 
-	// The deleted file's nodes must be evicted — that's B2's contract.
+	// The deleted file's nodes must be evicted.
 	assert.Empty(t, g.GetFileNodes("repo/b.go"),
-		"offline-deleted file's nodes must be evicted by reconciliation (B2)")
+		"offline-deleted file's nodes must be evicted by reconciliation")
 	// The surviving file's nodes must still be present.
 	assert.NotEmpty(t, g.GetFileNodes("repo/a.go"),
 		"unchanged file's nodes must survive reconciliation")
@@ -107,12 +118,16 @@ func TestReconcileRepoCtx_DoesNotDuplicateUnchanged(t *testing.T) {
 
 // TestReconcileRepoCtx_RunsDerivedPassesForOfflineChange proves a restored
 // repository consumes the modern pipeline's exact derived plan after an edit
-// that happened while the coordinator was offline.
+// that happened while the coordinator was offline. The repo carries enough
+// unchanged files that one new file stays on the scoped reconcile route
+// instead of escalating to a whole-repo re-track.
 func TestReconcileRepoCtx_RunsDerivedPassesForOfflineChange(t *testing.T) {
 	dir := t.TempDir()
 	repoPath := filepath.Join(dir, "repo")
 	require.NoError(t, os.MkdirAll(repoPath, 0o755))
 	writeFile(t, filepath.Join(repoPath, "base.go"), "package main\nfunc main() {}\n")
+	writeFile(t, filepath.Join(repoPath, "one.go"), "package main\nfunc One() {}\n")
+	writeFile(t, filepath.Join(repoPath, "two.go"), "package main\nfunc Two() {}\n")
 
 	cfgPath := filepath.Join(dir, "config.yaml")
 	gc := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: repoPath, Name: "repo"}}}
@@ -121,7 +136,10 @@ func TestReconcileRepoCtx_RunsDerivedPassesForOfflineChange(t *testing.T) {
 	cm, err := config.NewConfigManager(cfgPath)
 	require.NoError(t, err)
 
-	g := graph.New()
+	s, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	g := graph.Store(s)
 	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
@@ -143,7 +161,7 @@ func Run() error { return exec.Command("true").Run() }
 	assert.True(t, reconcileHasEdgeKind(g, graph.EdgeExecutesProcess),
 		"snapshot reconciliation must consume the derived plan")
 	require.NotNil(t, mi2.GetIndexer("repo"))
-	assert.Equal(t, 2, mi2.GetIndexer("repo").TotalDetected())
+	assert.Equal(t, 4, mi2.GetIndexer("repo").TotalDetected())
 }
 
 func TestReconcileAll_RunsDerivedPassesForMissedChange(t *testing.T) {
