@@ -520,3 +520,25 @@ func TestMutationLaneContextCarriesDeadline(t *testing.T) {
 		t.Fatal("stopping the watcher did not cancel the lane wait")
 	}
 }
+
+// TestWatcherExcludeFilterDropsIgnoredTrees pins that the backend-side
+// filter agrees with the watcher's own exclude matcher, so bulk traffic in
+// .git / node_modules is dropped before it reaches the event channel.
+func TestWatcherExcludeFilterDropsIgnoredTrees(t *testing.T) {
+	root := t.TempDir()
+	w, err := NewWatcher(&Indexer{rootPath: root}, config.WatchConfig{Paths: []string{root}}, zap.NewNop())
+	require.NoError(t, err)
+
+	filter := &watcherExcludeFilter{w: w}
+	for _, rel := range []string{"node_modules/pkg/index.js", ".git/objects/ab/cdef"} {
+		require.False(t, filter.ShouldInclude(filepath.Join(root, rel)),
+			"%s should be filtered at the backend", rel)
+	}
+	for _, rel := range []string{"main.go", "internal/pkg/service.go"} {
+		require.True(t, filter.ShouldInclude(filepath.Join(root, rel)),
+			"%s must still be delivered", rel)
+	}
+
+	// A nil-matcher watcher is inert rather than filtering everything out.
+	require.True(t, (&watcherExcludeFilter{}).ShouldInclude("/anything"))
+}

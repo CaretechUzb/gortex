@@ -452,7 +452,19 @@ func (w *Watcher) Start(paths []string) (retErr error) {
 			return err
 		}
 		absPaths = append(absPaths, absPath)
-		opts = append(opts, fswatcher.WithPath(absPath))
+		// Hand the backend our exclude matcher so events under ignored
+		// trees — .git, node_modules, vendor, target — are dropped at the
+		// source instead of crossing the event channel, the aggregator and
+		// the storm counter only for handleEvent to discard them. An npm
+		// install or a branch checkout is mostly this traffic.
+		//
+		// This does not reduce the inotify watch count on Linux: the
+		// backend's recursive walk adds a watch per subdirectory without
+		// consulting the filter (fswatcher watcher_linux_inotify.go), and
+		// the filter is applied only on the event path. Cutting the watch
+		// count needs a change upstream.
+		opts = append(opts, fswatcher.WithPath(absPath,
+			fswatcher.WithPathFilter(&watcherExcludeFilter{w: w})))
 	}
 	fsw, err := fswatcher.New(opts...)
 	if err != nil {
