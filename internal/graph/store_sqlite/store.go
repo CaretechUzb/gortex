@@ -1966,6 +1966,12 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 		}
 		out = append(out, e)
 	}
+	// A driver failure part-way through the cursor ends the loop exactly like
+	// a clean exhaust. Without this check the caller would receive a silently
+	// truncated slice and treat it as the complete result.
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
+	}
 	return out
 }
 
@@ -1990,6 +1996,9 @@ func (s *Store) queryEdgesLight(stmt *sql.Stmt, args ...any) []*graph.Edge {
 			continue
 		}
 		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
 	}
 	return out
 }
@@ -2382,9 +2391,17 @@ func (s *Store) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
 // deadlocking on the MaxOpenConns=1 pool. Companion to the existing
 // queryEdges helper that takes a *sql.Stmt; this one takes a raw
 // SQL string so the predicate iterators can pass inline queries.
+//
+// Statement-level and cursor-level failures go through panicOnFatal: a
+// teardown-race read still degrades to what was materialised, but a real
+// storage failure is raised instead of being handed back as an empty or short
+// slice the caller cannot tell from a genuinely small result. A single row
+// that will not decode stays non-fatal and is skipped — one unreadable row
+// must not cost the caller the rest of the lookup.
 func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
+		panicOnFatal(err)
 		return nil
 	}
 	defer rows.Close()
@@ -2396,13 +2413,18 @@ func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 		}
 		out = append(out, e)
 	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
+	}
 	return out
 }
 
-// queryNodesSQL is the node-shaped sibling of queryEdgesSQL.
+// queryNodesSQL is the node-shaped sibling of queryEdgesSQL, with the same
+// error contract.
 func (s *Store) queryNodesSQL(q string, args ...any) []*graph.Node {
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
+		panicOnFatal(err)
 		return nil
 	}
 	defer rows.Close()
@@ -2413,6 +2435,9 @@ func (s *Store) queryNodesSQL(q string, args ...any) []*graph.Node {
 			continue
 		}
 		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
 	}
 	return out
 }

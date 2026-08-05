@@ -34,11 +34,14 @@ func (s *Store) AllEdgesLight(kinds ...graph.EdgeKind) []*graph.Edge {
 // queryEdgesLightSQL is the meta-less sibling of queryEdgesSQL: it materialises
 // the rows into a slice and closes the cursor before returning (releasing the
 // single pooled connection), but scans through scanEdgeLight so the meta column
-// is never transferred or decoded. Returns nil on any query error, matching
-// queryEdgesSQL — a teardown-race read degrades to empty rather than panicking.
+// is never transferred or decoded. Failures route through panicOnFatal like
+// queryEdgesSQL: a teardown-race read degrades to empty, an undecodable row is
+// skipped, and anything else is raised rather than returned as a silently
+// truncated slice.
 func (s *Store) queryEdgesLightSQL(q string, args ...any) []*graph.Edge {
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
+		panicOnFatal(err)
 		return nil
 	}
 	defer rows.Close()
@@ -49,6 +52,9 @@ func (s *Store) queryEdgesLightSQL(q string, args ...any) []*graph.Edge {
 			continue
 		}
 		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
 	}
 	return out
 }

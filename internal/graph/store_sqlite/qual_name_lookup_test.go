@@ -129,19 +129,35 @@ func TestGetNodesByQualNamesFailsClosedOnDecodeQueryAndClosedStoreErrors(t *test
 	}
 
 	// INDEXED BY is deliberate: losing the intended index must fail closed
-	// instead of silently degrading into a full nodes-table scan.
+	// instead of silently degrading into a full nodes-table scan. A missing
+	// mandatory index is schema drift, so the lookup raises it rather than
+	// returning an empty map a caller would read as "no such qualified name".
 	if _, err := store.writerDB.Exec(`DROP INDEX nodes_by_qual`); err != nil {
 		t.Fatal(err)
 	}
-	if got := store.GetNodesByQualNames([]string{"good.qual"}); len(got) != 0 {
-		t.Fatalf("lookup without mandatory index returned %#v, want empty", got)
-	}
+	assertQualNameLookupRaises(t, store, "good.qual")
 
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if got := store.GetNodesByQualNames([]string{"good.qual"}); len(got) != 0 {
 		t.Fatalf("lookup on closed store returned %#v, want empty", got)
+	}
+}
+
+// assertQualNameLookupRaises fails unless the lookup surfaces its storage
+// error instead of returning a result the caller cannot distinguish from a
+// legitimate miss.
+func assertQualNameLookupRaises(t *testing.T, store *Store, qualName string) {
+	t.Helper()
+	var raised any
+	func() {
+		defer func() { raised = recover() }()
+		got := store.GetNodesByQualNames([]string{qualName})
+		t.Fatalf("lookup without mandatory index returned %#v, want a surfaced error", got)
+	}()
+	if raised == nil {
+		t.Fatal("lookup without mandatory index did not surface an error")
 	}
 }
 
