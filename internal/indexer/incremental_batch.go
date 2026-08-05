@@ -1478,6 +1478,7 @@ func (idx *Indexer) evictFileIncrementalRaw(relPath string) forcedFileEviction {
 	idx.removeIncrementalContractsForFile(graphPath, &invalidation)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, dependencyFiles...)
 
+	idx.noteTrigramDirty(filepath.ToSlash(relPath))
 	idx.indexGen.Add(1)
 	nodes, edges := idx.repoNodeEdgeCount()
 	result.NodeCount = nodes

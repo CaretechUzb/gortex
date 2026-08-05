@@ -465,6 +465,12 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 	// Embeddings: explicit flag/env > `embedding:` config > default (on,
 	// static GloVe).
+	// The rerank semantic-cosine channel loads its own bundled model,
+	// separately from the vector-index embedder resolved just below, and
+	// used to do so with no way to say no. Honour the resolved config
+	// before anything can trigger the first search.
+	embedding.SetCodeEmbedderEnabled(conf.Search.RerankEmbedderEnabled())
+
 	embedder, embDesc, embReport, embErr := ResolveEmbedder(cfg.Embedder, conf)
 	// Probe API-backed providers up front so Dimensions() is truthful before
 	// we log it and — crucially — before EmbedderDims gates snapshot-vector

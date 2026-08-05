@@ -73,7 +73,7 @@ func (s *Server) handleGetArchitecture(ctx context.Context, req mcp.CallToolRequ
 	var inScope map[string]bool
 	var totalNodesScoped int
 	if needScoped {
-		scoped = s.scopedNodes(ctx)
+		scoped = s.scopedNodesLight(ctx)
 		inScope = make(map[string]bool, len(scoped))
 		for _, n := range scoped {
 			if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {

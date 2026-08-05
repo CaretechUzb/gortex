@@ -157,7 +157,7 @@ func (s *Server) handlePromptOrientation(ctx context.Context, _ mcp.GetPromptReq
 	// byte-identical to the legacy global view there. inScope is the
 	// node-ID set used to bound the analyzer-driven sections; nil for
 	// an unbound session.
-	scoped := s.scopedNodes(ctx)
+	scoped := s.scopedNodesLight(ctx)
 	_, _, bound := s.sessionScope(ctx)
 	var inScope map[string]bool
 	if bound {
@@ -385,7 +385,7 @@ type refEntry struct {
 // findTopReferenced returns the most-referenced symbols, confined to
 // the current session's workspace.
 func (s *Server) findTopReferenced(ctx context.Context, limit int) []refEntry {
-	allNodes := s.scopedNodes(ctx)
+	allNodes := s.scopedNodesLight(ctx)
 	var refs []refEntry
 	for _, n := range allNodes {
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport || n.Kind == graph.KindVariable {

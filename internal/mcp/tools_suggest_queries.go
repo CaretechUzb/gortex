@@ -34,7 +34,7 @@ func (s *Server) handleSuggestQueries(ctx context.Context, req mcp.CallToolReque
 		limit = 20
 	}
 
-	scoped := s.scopedNodes(ctx)
+	scoped := s.scopedNodesLight(ctx)
 	_, _, bound := s.sessionScope(ctx)
 	var inScope map[string]bool
 	if bound {

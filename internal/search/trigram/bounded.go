@@ -6,6 +6,7 @@ import (
 	"math/bits"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -31,11 +32,12 @@ func (s *Searcher) GrepBounded(
 	if s == nil || query == "" {
 		return nil, BoundedSearchStats{}
 	}
-	candidates := s.ix.Candidates(query)
+	known := s.snapshotPaths()
+	candidates := s.candidates(query)
 	paths := make([]string, 0, len(candidates))
 	for _, docID := range candidates {
-		if int(docID) < len(s.paths) {
-			paths = append(paths, s.paths[docID])
+		if int(docID) < len(known) {
+			paths = append(paths, known[docID])
 		}
 	}
 	return grepPathsBounded(ctx, s.root, paths, query, limit, maxFiles)
@@ -55,11 +57,12 @@ func (s *Searcher) GrepLiteralBounded(
 	if s == nil || query == "" {
 		return nil, BoundedSearchStats{}
 	}
-	candidates := s.ix.Candidates(query)
+	known := s.snapshotPaths()
+	candidates := s.candidates(query)
 	paths := make([]string, 0, len(candidates))
 	for _, docID := range candidates {
-		if int(docID) < len(s.paths) {
-			paths = append(paths, s.paths[docID])
+		if int(docID) < len(known) {
+			paths = append(paths, known[docID])
 		}
 	}
 	return grepLiteralPathsBounded(ctx, s.root, paths, query, limit, maxFiles, preferPath)
@@ -94,6 +97,35 @@ func GrepLiteralPathsBounded(
 	return grepLiteralPathsBounded(ctx, root, paths, query, limit, maxFiles, preferPath)
 }
 
+// GrepRegexpPathsBounded is the cold, never-builds counterpart to
+// Searcher.GrepRegexp. It scans the supplied already-known indexed files
+// with the compiled pattern and creates no index state, so a broad
+// fan-out can serve a regexp search without building one index per repo.
+// pathPrefix, when non-empty, restricts the scan to files under it.
+func GrepRegexpPathsBounded(
+	ctx context.Context,
+	root string,
+	paths []string,
+	re *regexp.Regexp,
+	pathPrefix string,
+	limit int,
+	maxFiles int,
+) ([]Match, BoundedSearchStats) {
+	if re == nil {
+		return nil, BoundedSearchStats{}
+	}
+	if pathPrefix != "" {
+		kept := make([]string, 0, len(paths))
+		for _, rel := range paths {
+			if strings.HasPrefix(rel, pathPrefix) {
+				kept = append(kept, rel)
+			}
+		}
+		paths = kept
+	}
+	return grepPathsBoundedMatch(ctx, root, paths, re.MatchString, limit, maxFiles)
+}
+
 func grepPathsBounded(
 	ctx context.Context,
 	root string,
@@ -102,8 +134,29 @@ func grepPathsBounded(
 	limit int,
 	maxFiles int,
 ) ([]Match, BoundedSearchStats) {
+	if query == "" {
+		return nil, BoundedSearchStats{CandidateFiles: len(paths), Incomplete: ctx.Err() != nil}
+	}
+	return grepPathsBoundedMatch(
+		ctx, root, paths,
+		func(text string) bool { return strings.Contains(text, query) },
+		limit, maxFiles,
+	)
+}
+
+// grepPathsBoundedMatch is the shared scanner behind the literal and
+// regexp cold paths: it opens each candidate, skips binary content, and
+// reports every line the matcher accepts.
+func grepPathsBoundedMatch(
+	ctx context.Context,
+	root string,
+	paths []string,
+	match func(string) bool,
+	limit int,
+	maxFiles int,
+) ([]Match, BoundedSearchStats) {
 	stats := BoundedSearchStats{CandidateFiles: len(paths)}
-	if query == "" || ctx.Err() != nil {
+	if match == nil || ctx.Err() != nil {
 		stats.Incomplete = ctx.Err() != nil
 		return nil, stats
 	}
@@ -118,6 +171,7 @@ func grepPathsBounded(
 	}
 	matches := make([]Match, 0, matchCapacity)
 	scanBuffer := make([]byte, 64*1024)
+	sniff := bufio.NewReaderSize(nil, binarySniffBytes)
 	for _, rel := range paths {
 		if ctx.Err() != nil {
 			stats.Incomplete = true
@@ -128,8 +182,16 @@ func grepPathsBounded(
 			stats.Incomplete = true
 			continue
 		}
+		sniff.Reset(f)
+		if readerIsBinary(sniff) {
+			// Opaque bytes cannot match a literal text query. Skipping
+			// costs nothing in recall and keeps a cold scan from paging
+			// megabytes of image or archive content through the scanner.
+			_ = f.Close()
+			continue
+		}
 		stats.ScannedFiles++
-		scanner := bufio.NewScanner(f)
+		scanner := bufio.NewScanner(sniff)
 		scanner.Buffer(scanBuffer, 4*1024*1024)
 		line := 0
 		cancelled := false
@@ -141,7 +203,7 @@ func grepPathsBounded(
 				break
 			}
 			text := scanner.Text()
-			if !strings.Contains(text, query) {
+			if !match(text) {
 				continue
 			}
 			matches = append(matches, Match{Path: rel, Line: line, Text: text})
@@ -188,6 +250,7 @@ func grepLiteralPathsBounded(
 	}
 	matches := make([]Match, 0, matchCapacity)
 	scanBuffer := make([]byte, 64*1024)
+	sniff := bufio.NewReaderSize(nil, binarySniffBytes)
 	for _, rel := range paths {
 		if ctx.Err() != nil {
 			stats.Incomplete = true
@@ -198,8 +261,14 @@ func grepLiteralPathsBounded(
 			stats.Incomplete = true
 			continue
 		}
+		sniff.Reset(f)
+		if readerIsBinary(sniff) {
+			// See grepPathsBounded: opaque bytes hold no identifier.
+			_ = f.Close()
+			continue
+		}
 		stats.ScannedFiles++
-		scanner := bufio.NewScanner(f)
+		scanner := bufio.NewScanner(sniff)
 		scanner.Buffer(scanBuffer, 4*1024*1024)
 		line := 0
 		cancelled := false

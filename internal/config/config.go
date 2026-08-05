@@ -840,6 +840,15 @@ type ContentAdmissionConfig struct {
 	// defaultMaxDataBytes; <0 disables the cap). Ignored when IndexData is
 	// off. Configured under `index.content.max_data_bytes`.
 	MaxDataBytes int64 `mapstructure:"max_data_bytes" yaml:"max_data_bytes,omitempty"`
+	// MaxImageBytes caps individual image assets (.png, .jpg, .gif, .webp,
+	// .bmp, .tiff, .ico, .svg), which become metadata-only KindImage nodes.
+	// Producing that node still costs a full read and a SHA-256 of the
+	// file, so an unbounded image class lets one multi-hundred-MB asset
+	// dominate a walk. Images were the only asset class with no cap.
+	// Same tri-state as MaxDocumentBytes (>0 caps; 0 uses the built-in
+	// default, defaultMaxImageBytes; <0 disables the cap). Configured
+	// under `index.content.max_image_bytes`.
+	MaxImageBytes int64 `mapstructure:"max_image_bytes" yaml:"max_image_bytes,omitempty"`
 }
 
 // EffectiveMaxDocumentBytes resolves MaxDocumentBytes' tri-state into a
@@ -867,6 +876,20 @@ func (c ContentAdmissionConfig) EffectiveMaxDataBytes() (limit int64, capped boo
 		return defaultMaxDataBytes, true
 	default:
 		return c.MaxDataBytes, true
+	}
+}
+
+// EffectiveMaxImageBytes resolves MaxImageBytes' tri-state into a concrete
+// cap. capped is false when images are admitted at any size (the field was
+// set negative).
+func (c ContentAdmissionConfig) EffectiveMaxImageBytes() (limit int64, capped bool) {
+	switch {
+	case c.MaxImageBytes < 0:
+		return 0, false
+	case c.MaxImageBytes == 0:
+		return defaultMaxImageBytes, true
+	default:
+		return c.MaxImageBytes, true
 	}
 }
 
@@ -1275,7 +1298,17 @@ type WatchConfig struct {
 	// rebuild until a quiet period has passed. Protects against event
 	// floods from bulk operations: `rsync`, `npm install`, branch
 	// checkout, bulk format-on-save, find-and-replace across a repo.
-	// Zero disables storm mode (pure per-file behaviour).
+	// Tri-state, matching the other admission caps: >0 uses that
+	// threshold; 0 (absent) uses the built-in default
+	// (defaultStormThreshold); <0 disables storm mode, giving pure
+	// per-file behaviour.
+	//
+	// The default is non-zero because per-file behaviour is not the safe
+	// fallback it looks like: without batching, a checkout or npm install
+	// arms one debounce timer — and so one goroutine — per changed path,
+	// each blocking on the repository mutation lane. Go never returns a
+	// goroutine's stack descriptor to the heap, so that peak is retained
+	// for the life of the process.
 	StormThreshold int `mapstructure:"storm_threshold" yaml:"storm_threshold,omitempty"`
 	// StormWindowMs is the sliding window over which events are counted
 	// against StormThreshold. Defaults to 500.
@@ -1393,6 +1426,16 @@ type SearchConfig struct {
 	// An empty value is treated as "split".
 	KeywordSoupRewrite string `mapstructure:"keyword_soup_rewrite" yaml:"keyword_soup_rewrite,omitempty"`
 
+	// RerankEmbedder controls the rerank semantic-cosine channel, which
+	// loads a bundled static code-embedding model into the daemon on the
+	// first search that reranks. The model is tens of MiB and is loaded
+	// regardless of the `embedding:` section — that section drives vector
+	// indexing, this one drives rerank scoring, and they are independent.
+	// On by default (a nil pointer means "on"). Set false on a
+	// memory-constrained daemon to give up natural-language rerank
+	// quality in exchange for the footprint.
+	RerankEmbedder *bool `mapstructure:"rerank_embedder" yaml:"rerank_embedder,omitempty"`
+
 	// EquivalenceClasses enables deterministic, LLM-free query
 	// expansion through the curated software-concept synonym table
 	// plus the per-repo auto-mined concept vocabulary. On by default
@@ -1457,6 +1500,13 @@ func (c SearchConfig) EquivalenceClassesEnabled() bool {
 // (the unset state) means enabled.
 func (c SearchConfig) IndexProseEnabled() bool {
 	return c.IndexProse == nil || *c.IndexProse
+}
+
+// RerankEmbedderEnabled reports whether the rerank semantic-cosine
+// channel may load its code-embedding model. Defaults to true — a nil
+// pointer is the unset state and means enabled.
+func (c SearchConfig) RerankEmbedderEnabled() bool {
+	return c.RerankEmbedder == nil || *c.RerankEmbedder
 }
 
 // CosineRerankEnabled reports whether the post-rerank exact-cosine
@@ -1679,6 +1729,24 @@ const defaultMaxParseBytesInFlight = 512 << 20
 // searchable while dropping the few huge decks / spreadsheets that
 // dominate a content repo's admitted bytes and blow up parse memory.
 const defaultMaxDocumentBytes = 10 << 20
+
+// defaultMaxImageBytes is the built-in per-file cap applied to image
+// assets. An image contributes only a metadata node (format, dimensions,
+// SHA-256), but minting it still reads and hashes the whole file, so a
+// cap is what keeps one checked-in design export or scan off the walk's
+// critical path. 32 MiB clears every realistic diagram, screenshot and
+// icon while excluding multi-hundred-MB assets.
+const defaultMaxImageBytes = 32 << 20
+
+// defaultStormThreshold is how many events inside one window switch the
+// watcher from per-file debounced patching to a batched reconcile. 50 is
+// well above a format-on-save or a multi-file refactor and well below the
+// thousands a checkout or dependency install produces.
+const defaultStormThreshold = 50
+
+// DefaultStormThreshold exposes the built-in storm threshold for callers
+// that resolve WatchConfig's tri-state themselves.
+func DefaultStormThreshold() int { return defaultStormThreshold }
 
 // defaultMaxDataBytes is the built-in per-file cap applied to data assets
 // only when index.content.index_data opts them in — a backstop against a

@@ -20,10 +20,10 @@ type bodyFactsCache struct {
 }
 
 type bfCacheEntry struct {
-	tree   *parser.ParseTree
-	src    []byte
-	lang   string
-	facts  map[string]contracts.BodyFacts // SymbolID → facts
+	tree  *parser.ParseTree
+	src   []byte
+	lang  string
+	facts map[string]contracts.BodyFacts // SymbolID → facts
 }
 
 // newBodyFactsCache creates a new cache scoped to one resolver pass.

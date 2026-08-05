@@ -30,8 +30,15 @@ import (
 // code-retrieval teacher. It replaces the older averaged word-vector
 // channel for the rerank's semantic-cosine signal.
 type PotionProvider struct {
-	tok  *wordPieceTokenizer
-	mat  []float32 // row-major [vocab][dims]
+	tok *wordPieceTokenizer
+	// mat is the row-major [vocab][dims] embedding matrix kept in the
+	// half-precision form it ships in. Expanding it to float32 at load
+	// doubled the resident cost — a measured 61.98 MiB against the 32 MB
+	// file — for a matrix that is read at most maxPotionTokens rows per
+	// call. Converting per element inside the gather loop trades a few
+	// thousand conversions per embed for half the daemon's steady-state
+	// footprint.
+	mat  []uint16
 	dims int
 }
 
@@ -101,7 +108,7 @@ func (p *PotionProvider) embed(text string) []float32 {
 		}
 		row := p.mat[id*p.dims : (id+1)*p.dims]
 		for i, v := range row {
-			vec[i] += v
+			vec[i] += f16ToF32(v)
 		}
 		n++
 	}
@@ -125,8 +132,10 @@ func (p *PotionProvider) embed(text string) []float32 {
 }
 
 // loadSafetensorsF16 reads a single-tensor safetensors file holding an
-// F16 "embeddings" matrix and returns it as row-major float32.
-func loadSafetensorsF16(path string) ([]float32, int, error) {
+// F16 "embeddings" matrix and returns it row-major, still half-precision.
+// The caller converts the handful of rows it touches; keeping the matrix
+// packed halves what the process holds for the rest of its life.
+func loadSafetensorsF16(path string) ([]uint16, int, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, 0, fmt.Errorf("read weights: %w", err)
@@ -167,9 +176,9 @@ func loadSafetensorsF16(path string) ([]float32, int, error) {
 		return nil, 0, fmt.Errorf("tensor data out of range")
 	}
 	data := raw[start:end]
-	mat := make([]float32, rows*dims)
+	mat := make([]uint16, rows*dims)
 	for i := range mat {
-		mat[i] = f16ToF32(binary.LittleEndian.Uint16(data[i*2 : i*2+2]))
+		mat[i] = binary.LittleEndian.Uint16(data[i*2 : i*2+2])
 	}
 	return mat, dims, nil
 }

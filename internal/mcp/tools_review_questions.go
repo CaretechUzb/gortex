@@ -115,7 +115,7 @@ func (s *Server) handleSuggestedReviewQuestions(ctx context.Context, req mcp.Cal
 
 	// Build the scoped node index once — every miner reads from it.
 	scopedSet := make(map[string]*graph.Node, 1024)
-	for _, n := range s.scopedNodes(ctx) {
+	for _, n := range s.scopedNodesLight(ctx) {
 		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}

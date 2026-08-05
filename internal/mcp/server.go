@@ -2043,7 +2043,34 @@ func (s *Server) nodeInSessionScope(ctx context.Context, n *graph.Node) bool {
 // graph.AllNodes() so a workspace-bound session can never observe
 // another workspace's nodes — not even in aggregate counts.
 func (s *Server) scopedNodes(ctx context.Context) []*graph.Node {
-	all := s.graph.AllNodes()
+	return s.scopeNodes(ctx, s.graph.AllNodes())
+}
+
+// scopedNodesLight is scopedNodes over the projected node scan: the same
+// scoping, but the store stops before the opaque meta blob and the
+// promoted columns, so no per-node map[string]any is decoded. On a
+// 600k-node store that is the difference between a few hundred MiB of
+// transient allocation per whole-graph handler call and almost none.
+//
+// The returned nodes carry ID, Kind, Name, QualName, FilePath, the line
+// and column span, Language, RepoPrefix, WorkspaceID and ProjectID.
+// Node.Meta is NIL — and every promoted key that normally rides in it
+// (signature, doc, visibility, complexity, churn, framework, …) is
+// therefore absent, not empty.
+//
+// Only call this from a handler proven to read none of them. Note that
+// the in-memory graph has no projection and hands back canonical nodes
+// with full Meta, so a wrong call site passes every in-memory test and
+// fails only against SQLite.
+func (s *Server) scopedNodesLight(ctx context.Context) []*graph.Node {
+	return s.scopeNodes(ctx, graph.AllNodesLight(s.graph))
+}
+
+// scopeNodes applies the session's workspace / repo scope to an
+// already-materialized node set. ScopeAllows reads only WorkspaceID,
+// RepoPrefix and ProjectID, all of which the light projection carries, so
+// this is shared by both entry points.
+func (s *Server) scopeNodes(ctx context.Context, all []*graph.Node) []*graph.Node {
 	sessWS, _, bound := s.sessionScope(ctx)
 	repoAllow := repoAllowFromContext(ctx)
 	if !bound && len(repoAllow) == 0 {

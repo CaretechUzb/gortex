@@ -581,6 +581,24 @@ func (c *realController) Reload(ctx context.Context) (json.RawMessage, error) {
 	})
 }
 
+// trigramCacheForResponse snapshots the process-wide trigram searcher
+// cache for `daemon status`. It is reported separately from
+// SearchBackend because the two are different indexes with different
+// lifetimes: the symbol backend can be disk-resident while this one holds
+// the largest in-memory structure in the daemon.
+func trigramCacheForResponse() *daemon.TrigramCacheStats {
+	s := indexer.TrigramCacheSnapshot()
+	return &daemon.TrigramCacheStats{
+		Live:      s.Live,
+		MaxLive:   s.MaxLive,
+		Bytes:     s.Bytes,
+		MaxBytes:  s.MaxBytes,
+		IdleTTLMs: s.IdleTTL.Milliseconds(),
+		BuildsOff: s.BuildsOff,
+		Evictions: s.Evictions,
+	}
+}
+
 // searchBackendInfo bundles the daemon.SearchBackendStats payload with
 // the separate text/vector byte counts we need to split per-repo.
 type searchBackendInfo struct {
@@ -920,6 +938,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		TrackedRepos:  tracked,
 		MemoryBytes:   mem.Alloc,
 		SearchBackend: searchBackendForResponse,
+		TrigramCache:  trigramCacheForResponse(),
 		Runtime: daemon.RuntimeStats{
 			Alloc:        mem.Alloc,
 			Sys:          mem.Sys,

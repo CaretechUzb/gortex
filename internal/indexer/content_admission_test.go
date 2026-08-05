@@ -26,6 +26,7 @@ func newAssetTestIndexer(g graph.Store) *Indexer {
 	reg.Register(languages.NewPptxExtractor())
 	reg.Register(languages.NewXlsxExtractor())
 	reg.Register(languages.NewDataAssetExtractor())
+	reg.Register(languages.NewImageAssetExtractor())
 	cfg := config.Default().Index
 	cfg.Workers = 2
 	return New(g, reg, cfg, zap.NewNop())
@@ -52,6 +53,16 @@ func TestContentAdmissionConfig_EffectiveCaps(t *testing.T) {
 	lim, capped = config.ContentAdmissionConfig{MaxDataBytes: 7}.EffectiveMaxDataBytes()
 	require.True(t, capped)
 	require.Equal(t, int64(7), lim)
+
+	// Same tri-state for images, which were the only asset class with no cap.
+	lim, capped = config.ContentAdmissionConfig{MaxImageBytes: 0}.EffectiveMaxImageBytes()
+	require.True(t, capped)
+	require.Equal(t, int64(32<<20), lim)
+	lim, capped = config.ContentAdmissionConfig{MaxImageBytes: 9}.EffectiveMaxImageBytes()
+	require.True(t, capped)
+	require.Equal(t, int64(9), lim)
+	_, capped = config.ContentAdmissionConfig{MaxImageBytes: -1}.EffectiveMaxImageBytes()
+	require.False(t, capped)
 }
 
 func TestContentAdmissionGate_Skip(t *testing.T) {
@@ -87,6 +98,23 @@ func TestContentAdmissionGate_Skip(t *testing.T) {
 	reason, skip = gate.skip("data", 4096)
 	require.True(t, skip)
 	require.Equal(t, skipReasonLargeData, reason)
+
+	// Images stay admitted by default — a diagram is a first-class node —
+	// but the class now carries a ceiling, because minting that node reads
+	// and hashes the whole file.
+	idx.config.Content = config.Default().Index.Content
+	gate = idx.newContentAdmissionGate()
+	_, skip = gate.skip("image", 2<<20)
+	require.False(t, skip)
+	reason, skip = gate.skip("image", 33<<20)
+	require.True(t, skip)
+	require.Equal(t, skipReasonLargeImage, reason)
+
+	// A negative image cap disables image gating entirely.
+	idx.config.Content = config.ContentAdmissionConfig{MaxImageBytes: -1}
+	gate = idx.newContentAdmissionGate()
+	_, skip = gate.skip("image", 1<<30)
+	require.False(t, skip)
 
 	// A negative document cap disables document gating entirely.
 	idx.config.Content = config.ContentAdmissionConfig{MaxDocumentBytes: -1}

@@ -59,7 +59,7 @@ func (s *Server) handleGetSurprisingConnections(ctx context.Context, req mcp.Cal
 	// function/method. Use scopedNodes' single bulk pull rather than
 	// the per-edge GetNode lookups the legacy path fell back to.
 	scopedSet := make(map[string]*graph.Node, 1024)
-	for _, n := range s.scopedNodes(ctx) {
+	for _, n := range s.scopedNodesLight(ctx) {
 		scopedSet[n.ID] = n
 	}
 

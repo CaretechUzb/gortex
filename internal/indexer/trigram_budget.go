@@ -27,45 +27,172 @@ const (
 	// only reclaims repos that have gone quiet.
 	defaultTrigramIdleTTL = 10 * time.Minute
 	// defaultTrigramMaxLive caps how many repos may hold a built searcher at
-	// once, which is what actually bounds the worst case: without it, N repos
-	// searched inside one TTL window still means N live indexes.
+	// once. Set it to 0 (GORTEX_TRIGRAM_MAX_LIVE=0) to never build one: every
+	// search then streams over the known file list instead.
 	defaultTrigramMaxLive = 3
+	// defaultTrigramMaxBytes caps the summed estimated heap of every live
+	// searcher. A count cap alone does not bound memory — three indexes of an
+	// arbitrarily large repo is still arbitrarily large — so the byte budget
+	// is what makes the worst case a number instead of a hope. Override with
+	// GORTEX_TRIGRAM_MAX_MB.
+	defaultTrigramMaxBytes int64 = 256 << 20
+	// defaultTrigramPromoteAfter is how many searches a repo must serve
+	// inside one window before it earns a built index. An unscoped search
+	// fans out over every tracked repo, so building on the first hit means
+	// one call builds N indexes and the budget immediately evicts all but
+	// a few — N-few full-corpus builds of pure garbage. Until a repo is
+	// promoted its searches stream over the known file list instead, which
+	// costs latency and holds nothing.
+	defaultTrigramPromoteAfter = 3
+	// defaultTrigramPromoteWindow is how long demand accumulates before it
+	// decays. Long enough that a working session on one repo promotes it
+	// quickly, short enough that a one-off fan-out does not.
+	defaultTrigramPromoteWindow = 2 * time.Minute
 )
+
+// TrigramCacheStats is a point-in-time summary of the process-wide trigram
+// searcher cache, for `gortex daemon status`. Without it the largest single
+// in-memory search structure has no line in any status output, while the
+// status line simultaneously advertises search as disk-resident.
+type TrigramCacheStats struct {
+	Live      int           `json:"live"`
+	MaxLive   int           `json:"max_live"`
+	Bytes     int64         `json:"bytes"`
+	MaxBytes  int64         `json:"max_bytes"`
+	IdleTTL   time.Duration `json:"idle_ttl"`
+	BuildsOff bool          `json:"builds_off"`
+	// Evictions counts searchers dropped since start, by any rule. A
+	// number that climbs with every search says the budget is too small
+	// for the workload and every query is paying a rebuild.
+	Evictions int64 `json:"evictions"`
+}
+
+// TrigramCacheSnapshot reports the process-wide trigram cache.
+func TrigramCacheSnapshot() TrigramCacheStats { return processTrigramBudget.stats() }
 
 // trigramBudget tracks which repos currently hold a built trigram searcher
 // and evicts by idle time and by count. It stores release callbacks rather
 // than the searchers themselves so the owning Indexer keeps sole ownership
 // of its field and its own mutex discipline.
 type trigramBudget struct {
-	mu        sync.Mutex
-	ttl       time.Duration
-	maxLive   int
-	entries   map[*Indexer]*trigramEntry
-	now       func() time.Time // swappable in tests
-	afterFunc func(time.Duration, func()) *time.Timer
-	timer     *time.Timer
+	mu       sync.Mutex
+	ttl      time.Duration
+	maxLive  int
+	maxBytes int64
+	// promoteAfter / promoteWindow gate how much demand a repo must show
+	// before it is allowed to build an index at all.
+	promoteAfter  int
+	promoteWindow time.Duration
+	entries       map[*Indexer]*trigramEntry
+	demand        map[*Indexer]*trigramDemand
+	bytes         int64
+	evictions     int64
+	now           func() time.Time // swappable in tests
+	afterFunc     func(time.Duration, func()) *time.Timer
+	timer         *time.Timer
 }
 
 type trigramEntry struct {
 	lastUsed time.Time
 	release  func()
+	// bytes is the owner's last reported estimated index size. Held per
+	// entry so an eviction can subtract exactly what it removes rather
+	// than re-polling an Indexer that is mid-release.
+	bytes int64
 }
 
-var processTrigramBudget = newTrigramBudget(trigramIdleTTLFromEnv(), trigramMaxLiveFromEnv())
+// trigramDemand counts recent searches against one repo, so a repo that
+// is actually being worked in earns an index while a repo brushed once by
+// a fan-out does not.
+type trigramDemand struct {
+	count int
+	since time.Time
+}
 
-func newTrigramBudget(ttl time.Duration, maxLive int) *trigramBudget {
+var processTrigramBudget = newTrigramBudget(trigramIdleTTLFromEnv(), trigramMaxLiveFromEnv(), trigramMaxBytesFromEnv())
+
+// newTrigramBudget builds a budget. A negative ttl / maxLive / maxBytes
+// means "use the built-in default"; maxLive of exactly 0 is meaningful and
+// disables building altogether.
+func newTrigramBudget(ttl time.Duration, maxLive int, maxBytes int64) *trigramBudget {
 	if ttl <= 0 {
 		ttl = defaultTrigramIdleTTL
 	}
-	if maxLive <= 0 {
+	if maxLive < 0 {
 		maxLive = defaultTrigramMaxLive
 	}
+	if maxBytes < 0 {
+		maxBytes = defaultTrigramMaxBytes
+	}
 	return &trigramBudget{
-		ttl:       ttl,
-		maxLive:   maxLive,
-		entries:   make(map[*Indexer]*trigramEntry),
-		now:       time.Now,
-		afterFunc: time.AfterFunc,
+		ttl:           ttl,
+		maxLive:       maxLive,
+		maxBytes:      maxBytes,
+		promoteAfter:  defaultTrigramPromoteAfter,
+		promoteWindow: defaultTrigramPromoteWindow,
+		entries:       make(map[*Indexer]*trigramEntry),
+		demand:        make(map[*Indexer]*trigramDemand),
+		now:           time.Now,
+		afterFunc:     time.AfterFunc,
+	}
+}
+
+// earnsBuild records one search against owner and reports whether owner
+// has now served enough of them, recently enough, to justify building an
+// index. Callers that get false must serve the search by streaming.
+//
+// A repo already holding a live index does not come through here: the
+// gate exists to decide whether to pay for a build, not to re-litigate
+// one already paid for.
+func (b *trigramBudget) earnsBuild(owner *Indexer) bool {
+	if b == nil || owner == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.maxLive <= 0 {
+		return false
+	}
+	if b.promoteAfter <= 1 {
+		return true
+	}
+	now := b.now()
+	d, ok := b.demand[owner]
+	if !ok || now.Sub(d.since) > b.promoteWindow {
+		b.demand[owner] = &trigramDemand{count: 1, since: now}
+		return b.promoteAfter <= 1
+	}
+	d.count++
+	return d.count >= b.promoteAfter
+}
+
+// allowsBuild reports whether a repo may build a searcher at all. False
+// under GORTEX_TRIGRAM_MAX_LIVE=0, which turns every text search into a
+// streaming scan over the known file list and holds no index state.
+func (b *trigramBudget) allowsBuild() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.maxLive > 0
+}
+
+// stats snapshots the budget for status output.
+func (b *trigramBudget) stats() TrigramCacheStats {
+	if b == nil {
+		return TrigramCacheStats{}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return TrigramCacheStats{
+		Live:      len(b.entries),
+		MaxLive:   b.maxLive,
+		Bytes:     b.bytes,
+		MaxBytes:  b.maxBytes,
+		IdleTTL:   b.ttl,
+		BuildsOff: b.maxLive == 0,
+		Evictions: b.evictions,
 	}
 }
 
@@ -79,7 +206,10 @@ func newTrigramBudget(ttl time.Duration, maxLive int) *trigramBudget {
 // takes its Indexer's trigramMu, and holding both locks in one order here
 // while a concurrent warm path takes them in the other order would be a
 // deadlock waiting for load.
-func (b *trigramBudget) touch(owner *Indexer, release func()) {
+// bytes is owner's current estimated index size, used to hold the summed
+// footprint under the byte budget. A count cap alone does not bound memory:
+// three indexes of an arbitrarily large repo is still arbitrarily large.
+func (b *trigramBudget) touch(owner *Indexer, release func(), bytes int64) {
 	if b == nil || owner == nil {
 		return
 	}
@@ -92,8 +222,11 @@ func (b *trigramBudget) touch(owner *Indexer, release func()) {
 		if release != nil {
 			entry.release = release
 		}
+		b.bytes += bytes - entry.bytes
+		entry.bytes = bytes
 	} else if release != nil {
-		b.entries[owner] = &trigramEntry{lastUsed: now, release: release}
+		b.entries[owner] = &trigramEntry{lastUsed: now, release: release, bytes: bytes}
+		b.bytes += bytes
 	}
 
 	for other, entry := range b.entries {
@@ -101,34 +234,72 @@ func (b *trigramBudget) touch(owner *Indexer, release func()) {
 			continue
 		}
 		if !now.Before(entry.lastUsed.Add(b.ttl)) {
-			evictions = append(evictions, entry.release)
-			delete(b.entries, other)
+			evictions = append(evictions, b.dropLocked(other))
 		}
 	}
 
 	for len(b.entries) > b.maxLive {
-		var oldest *Indexer
-		var oldestAt time.Time
-		for other, entry := range b.entries {
-			if other == owner {
-				// The caller is about to use this one; evicting it would
-				// discard the build that is being paid for right now.
-				continue
-			}
-			if oldest == nil || entry.lastUsed.Before(oldestAt) {
-				oldest, oldestAt = other, entry.lastUsed
-			}
-		}
-		if oldest == nil {
+		release := b.evictLRULocked(owner)
+		if release == nil {
 			break
 		}
-		evictions = append(evictions, b.entries[oldest].release)
-		delete(b.entries, oldest)
+		evictions = append(evictions, release)
+	}
+
+	// Byte eviction runs last so it sees the count rule's effect first.
+	// owner is never evicted: it is the build being paid for right now, so
+	// a single repo larger than the whole budget parks over it rather than
+	// thrashing. The idle TTL still reclaims it once the repo goes quiet.
+	for b.maxBytes > 0 && b.bytes > b.maxBytes {
+		release := b.evictLRULocked(owner)
+		if release == nil {
+			break
+		}
+		evictions = append(evictions, release)
 	}
 	b.scheduleExpiryLocked(now)
 	b.mu.Unlock()
 
 	runTrigramReleases(evictions)
+}
+
+// dropLocked removes owner's entry, keeping the byte total in step, and
+// returns its release callback for the caller to run outside the lock.
+func (b *trigramBudget) dropLocked(owner *Indexer) func() {
+	entry, ok := b.entries[owner]
+	if !ok {
+		return nil
+	}
+	b.bytes -= entry.bytes
+	if b.bytes < 0 {
+		b.bytes = 0
+	}
+	b.evictions++
+	delete(b.entries, owner)
+	// Demand is about earning a build. Once the index is gone the repo
+	// starts over, so a repo evicted for being idle does not instantly
+	// rebuild on its next single search.
+	delete(b.demand, owner)
+	return entry.release
+}
+
+// evictLRULocked drops the least recently used entry other than keep.
+// Returns nil when nothing is eligible.
+func (b *trigramBudget) evictLRULocked(keep *Indexer) func() {
+	var oldest *Indexer
+	var oldestAt time.Time
+	for other, entry := range b.entries {
+		if other == keep {
+			continue
+		}
+		if oldest == nil || entry.lastUsed.Before(oldestAt) {
+			oldest, oldestAt = other, entry.lastUsed
+		}
+	}
+	if oldest == nil {
+		return nil
+	}
+	return b.dropLocked(oldest)
 }
 
 // scheduleExpiryLocked maintains one timer for the earliest idle deadline.
@@ -167,8 +338,7 @@ func (b *trigramBudget) expireIdle() {
 	now := b.now()
 	for owner, entry := range b.entries {
 		if !now.Before(entry.lastUsed.Add(b.ttl)) {
-			evictions = append(evictions, entry.release)
-			delete(b.entries, owner)
+			evictions = append(evictions, b.dropLocked(owner))
 		}
 	}
 	b.scheduleExpiryLocked(now)
@@ -193,7 +363,14 @@ func (b *trigramBudget) forget(owner *Indexer) {
 		return
 	}
 	b.mu.Lock()
-	delete(b.entries, owner)
+	if entry, ok := b.entries[owner]; ok {
+		b.bytes -= entry.bytes
+		if b.bytes < 0 {
+			b.bytes = 0
+		}
+		delete(b.entries, owner)
+	}
+	delete(b.demand, owner)
 	b.scheduleExpiryLocked(b.now())
 	b.mu.Unlock()
 }
@@ -220,14 +397,33 @@ func trigramIdleTTLFromEnv() time.Duration {
 	return d
 }
 
+// trigramMaxLiveFromEnv reads GORTEX_TRIGRAM_MAX_LIVE. Zero is honoured
+// and means "never build an index": every text search then streams over
+// the known file list, trading latency for holding no index at all. A
+// negative or unparseable value falls back to the default.
 func trigramMaxLiveFromEnv() int {
 	raw := os.Getenv("GORTEX_TRIGRAM_MAX_LIVE")
 	if raw == "" {
 		return defaultTrigramMaxLive
 	}
 	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
+	if err != nil || n < 0 {
 		return defaultTrigramMaxLive
 	}
 	return n
+}
+
+// trigramMaxBytesFromEnv reads GORTEX_TRIGRAM_MAX_MB, the ceiling on the
+// summed estimated heap of every live searcher. Zero disables the byte
+// ceiling and leaves only the count and TTL rules.
+func trigramMaxBytesFromEnv() int64 {
+	raw := os.Getenv("GORTEX_TRIGRAM_MAX_MB")
+	if raw == "" {
+		return defaultTrigramMaxBytes
+	}
+	mb, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || mb < 0 {
+		return defaultTrigramMaxBytes
+	}
+	return mb << 20
 }

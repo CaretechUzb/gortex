@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"regexp"
 	"regexp/syntax"
 	"sort"
@@ -18,39 +19,60 @@ func (idx *Indexer) GrepText(query string, limit int) []trigram.Match {
 	if query == "" {
 		return nil
 	}
-	s := idx.warmTrigramSearcher()
-	if s == nil {
-		return nil
+	if s := idx.warmTrigramSearcher(); s != nil {
+		return s.Grep(query, limit)
 	}
-	return s.Grep(query, limit)
+	// No index, and this repo has not earned one. Stream over the known
+	// file list instead: same recall, no index state. This is what keeps
+	// one unscoped fan-out from building an index for every tracked repo
+	// only for the budget to evict all but a few.
+	matches, _ := idx.GrepTextBounded(context.Background(), query, limit, 0)
+	return matches
 }
 
 // warmTrigramSearcher returns the current trigram searcher, rebuilding it
 // when the index generation has moved since the cached searcher was
-// built. Returns nil before anything has been indexed.
+// built. Returns nil before anything has been indexed, and nil when the
+// budget forbids building at all — callers must have a streaming fallback.
 func (idx *Indexer) warmTrigramSearcher() *trigram.Searcher {
+	budget := idx.trigramBudget()
+	if !budget.allowsBuild() {
+		return nil
+	}
 	gen := idx.indexGen.Load()
 
-	idx.trigramMu.Lock()
-	if idx.trigramSearcher == nil || idx.trigramGen != gen {
-		root := idx.rootPath
-		if root != "" {
-			idx.mtimeMu.RLock()
-			rels := make([]string, 0, len(idx.fileMtimes))
-			for rel := range idx.fileMtimes {
-				rels = append(rels, rel)
-			}
-			idx.mtimeMu.RUnlock()
-			sort.Strings(rels)
+	// A repo already holding a current index skips the demand gate: the
+	// build is paid for, so re-earning it would only throw it away.
+	if !idx.hasWarmTrigramSearcher() && !budget.earnsBuild(idx) {
+		return nil
+	}
 
-			idx.trigramSearcher = trigram.Build(root, rels)
+	// trigramMu is held across the build on purpose: it collapses a burst
+	// of concurrent searches on one repo into a single build instead of
+	// several racing ones, each paying full corpus memory.
+	idx.trigramMu.Lock()
+	if idx.trigramSearcher != nil && idx.trigramGen != gen && idx.canPatchTrigramLocked() {
+		// An incremental pass moved the generation but only touched a few
+		// files. Re-reading those beats re-reading the corpus.
+		for rel := range idx.trigramDirty {
+			idx.trigramSearcher.Update(rel)
+		}
+		clear(idx.trigramDirty)
+		idx.trigramGen = gen
+	}
+	if idx.trigramSearcher == nil || idx.trigramGen != gen {
+		if root := idx.rootPath; root != "" {
+			idx.trigramSearcher = trigram.Build(root, idx.knownFilePaths())
 			idx.trigramGen = gen
+			clear(idx.trigramDirty)
 		}
 	}
 	searcher := idx.trigramSearcher
 	var release func()
+	var bytes int64
 	if searcher != nil {
 		release = idx.trigramReleaseLocked()
+		bytes = searcher.ApproxIndexBytes()
 	}
 	idx.trigramMu.Unlock()
 
@@ -58,9 +80,61 @@ func (idx *Indexer) warmTrigramSearcher() *trigram.Searcher {
 	// different repo, whose callback takes that repo's trigramMu. The lease
 	// captured above prevents a delayed callback from racing a later re-touch.
 	if release != nil {
-		idx.trigramBudget().touch(idx, release)
+		budget.touch(idx, release, bytes)
 	}
 	return searcher
+}
+
+// trigramPatchLimit is how many changed files an incremental patch will
+// absorb before a full rebuild is the cheaper option. Patching costs one
+// read per changed file plus posting churn; past roughly this fraction of
+// a repo, rebuilding from a single pass wins.
+const trigramPatchLimit = 256
+
+// canPatchTrigramLocked reports whether the pending dirty set is small
+// enough to apply file by file. The caller must hold trigramMu.
+func (idx *Indexer) canPatchTrigramLocked() bool {
+	n := len(idx.trigramDirty)
+	return n > 0 && n <= trigramPatchLimit
+}
+
+// noteTrigramDirty records that an incremental pass changed these
+// repo-relative paths, so the next search patches them into a live
+// searcher instead of rebuilding the corpus. Deletions are included: the
+// patch re-stats each path and drops one that is gone.
+//
+// Paths accumulate only while a searcher is live; with none built there is
+// nothing to patch and the next search builds from the current corpus.
+func (idx *Indexer) noteTrigramDirty(paths ...string) {
+	if idx == nil || len(paths) == 0 {
+		return
+	}
+	idx.trigramMu.Lock()
+	defer idx.trigramMu.Unlock()
+	if idx.trigramSearcher == nil {
+		return
+	}
+	if idx.trigramDirty == nil {
+		idx.trigramDirty = make(map[string]struct{}, len(paths))
+	}
+	for _, p := range paths {
+		if p != "" {
+			idx.trigramDirty[p] = struct{}{}
+		}
+	}
+}
+
+// hasWarmTrigramSearcher reports whether this repo already holds a built
+// searcher, without building one. Callers that can stream instead use it
+// to keep a broad fan-out from building an index per repo.
+func (idx *Indexer) hasWarmTrigramSearcher() bool {
+	if idx == nil {
+		return false
+	}
+	gen := idx.indexGen.Load()
+	idx.trigramMu.Lock()
+	defer idx.trigramMu.Unlock()
+	return idx.trigramSearcher != nil && idx.trigramGen == gen
 }
 
 // trigramBudget returns the budget this Indexer participates in, defaulting
@@ -85,6 +159,7 @@ func (idx *Indexer) releaseTrigramSearcher() {
 	idx.trigramLease++
 	idx.trigramSearcher = nil
 	idx.trigramGen = 0
+	clear(idx.trigramDirty)
 	idx.trigramMu.Unlock()
 }
 
@@ -102,6 +177,7 @@ func (idx *Indexer) releaseTrigramSearcherLease(lease uint64) {
 	if idx.trigramLease == lease {
 		idx.trigramSearcher = nil
 		idx.trigramGen = 0
+		clear(idx.trigramDirty)
 	}
 	idx.trigramMu.Unlock()
 }
@@ -124,12 +200,36 @@ func (idx *Indexer) GrepRegexp(pattern, pathPrefix string, limit int) ([]trigram
 	if err != nil {
 		return nil, err
 	}
-	s := idx.warmTrigramSearcher()
-	if s == nil {
-		return nil, nil
+	if s := idx.warmTrigramSearcher(); s != nil {
+		literals := extractRegexLiterals(pattern)
+		return s.GrepRegexp(re, literals, pathPrefix, limit), nil
 	}
-	literals := extractRegexLiterals(pattern)
-	return s.GrepRegexp(re, literals, pathPrefix, limit), nil
+	// See GrepText: stream rather than build an index this repo has not
+	// earned. Without a trigram pre-filter every known file is scanned,
+	// which is what the literal-free branch of the warm path does anyway.
+	matches, _ := trigram.GrepRegexpPathsBounded(
+		context.Background(), idx.rootPath, idx.knownFilePaths(), re, pathPrefix, limit, 0,
+	)
+	return matches, nil
+}
+
+// knownFilePaths returns a sorted snapshot of the repo's indexed files —
+// the corpus every streaming search walks, and the one Build indexes.
+//
+// Safe to call while holding trigramMu: mtimeMu is a leaf lock, and the
+// build path took it in exactly this order before.
+func (idx *Indexer) knownFilePaths() []string {
+	if idx == nil {
+		return nil
+	}
+	idx.mtimeMu.RLock()
+	paths := make([]string, 0, len(idx.fileMtimes))
+	for rel := range idx.fileMtimes {
+		paths = append(paths, rel)
+	}
+	idx.mtimeMu.RUnlock()
+	sort.Strings(paths)
+	return paths
 }
 
 // extractRegexLiterals returns the literal substrings the regexp must

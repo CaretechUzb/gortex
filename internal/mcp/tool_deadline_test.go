@@ -10,6 +10,9 @@ import (
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
 // registerBlockingTool wires a tool that parks until release is closed, using
@@ -336,5 +339,48 @@ func TestFailsFastWhenTooManyHandlersAreStuck(t *testing.T) {
 	case <-entered:
 		t.Fatal("a refused call must not reach the handler")
 	default:
+	}
+}
+
+// TestResourceAndPromptHandlersJoinTheActivityBracket is the regression for
+// the gap issue #278's reproducer named: resources and prompts run the same
+// whole-graph passes tools do (gortex://report materialises AllEdges; the
+// orientation prompt runs scopedNodes twice), but carried only the hang
+// firewall. Without the bracket the process reads as idle mid-scan, so a
+// scheduled FreeOSMemory can land on top of the scan and nothing schedules
+// a release when it finishes.
+func TestResourceAndPromptHandlersJoinTheActivityBracket(t *testing.T) {
+	s := &Server{logger: zap.NewNop()}
+
+	var duringResource int64
+	resource := s.boundResourceHandler("gortex://probe",
+		func(context.Context, mcplib.ReadResourceRequest) ([]mcplib.ResourceContents, error) {
+			duringResource = runtimeactivity.Current().Active
+			return nil, nil
+		})
+	if _, err := resource(context.Background(), mcplib.ReadResourceRequest{}); err != nil {
+		t.Fatalf("resource handler: %v", err)
+	}
+	if duringResource == 0 {
+		t.Error("resource handler ran outside the activity bracket")
+	}
+	if got := runtimeactivity.Current().Active; got != 0 {
+		t.Errorf("activity leaked after the resource returned: %d", got)
+	}
+
+	var duringPrompt int64
+	prompt := s.boundPromptHandler("probe",
+		func(context.Context, mcplib.GetPromptRequest) (*mcplib.GetPromptResult, error) {
+			duringPrompt = runtimeactivity.Current().Active
+			return &mcplib.GetPromptResult{}, nil
+		})
+	if _, err := prompt(context.Background(), mcplib.GetPromptRequest{}); err != nil {
+		t.Fatalf("prompt handler: %v", err)
+	}
+	if duringPrompt == 0 {
+		t.Error("prompt handler ran outside the activity bracket")
+	}
+	if got := runtimeactivity.Current().Active; got != 0 {
+		t.Errorf("activity leaked after the prompt returned: %d", got)
 	}
 }

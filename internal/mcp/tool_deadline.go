@@ -281,12 +281,23 @@ func (s *Server) boundResourceHandler(uri string, h mcpserver.ResourceHandlerFun
 		if w, deferred := s.deferAnalyzerResource(uri); deferred {
 			return jsonResource(uri, map[string]any{"warming": newEnrichmentPendingEnvelope(w)})
 		}
+		// Resources are not cheap reads: gortex://report and
+		// gortex://surprises materialise AllEdges and run whole-graph
+		// dead-code and cycle passes. They need the same bracket every
+		// tool call gets — without it the process reads as idle mid-scan,
+		// so a scheduled FreeOSMemory can fire on top of the scan, and
+		// nothing schedules a release once it finishes.
+		beginMCPToolCall()
+		defer func() {
+			endMCPToolCall(s.logger, "resource:"+uri)
+			s.releaseTransientAnalysisIfIdle()
+		}()
 		return bounded(ctx, req)
 	}
 }
 
 func (s *Server) boundPromptHandler(name string, h mcpserver.PromptHandlerFunc) mcpserver.PromptHandlerFunc {
-	return boundHandler(s, "prompt", name, (func(context.Context, mcp.GetPromptRequest) (*mcp.GetPromptResult, error))(h),
+	bounded := boundHandler(s, "prompt", name, (func(context.Context, mcp.GetPromptRequest) (*mcp.GetPromptResult, error))(h),
 		func(stuck int64, timeout time.Duration) (*mcp.GetPromptResult, error) {
 			return nil, errors.New(busyMessage("prompt requests", stuck, timeout))
 		},
@@ -297,4 +308,15 @@ func (s *Server) boundPromptHandler(name string, h mcpserver.PromptHandlerFunc) 
 			return nil, fmt.Errorf("prompt %s internal error: %v", name, r)
 		},
 	)
+	// Same reasoning as boundResourceHandler: the orientation prompt runs
+	// scopedNodes twice and materialises AllEdges, so it belongs inside
+	// the activity bracket and owes a release on the way out.
+	return func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+		beginMCPToolCall()
+		defer func() {
+			endMCPToolCall(s.logger, "prompt:"+name)
+			s.releaseTransientAnalysisIfIdle()
+		}()
+		return bounded(ctx, req)
+	}
 }
