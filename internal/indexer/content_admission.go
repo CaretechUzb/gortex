@@ -16,10 +16,11 @@ import (
 // Meta["skip_reason"] so a dropped asset stays listable and index_health
 // rolls it up, mirroring the size / timeout / minified skip telemetry.
 const (
-	skipReasonLargeDocument  = "large_document"   // document over the per-file cap
-	skipReasonVectorData     = "vector_data"      // data asset, data indexing off
-	skipReasonLargeData      = "large_data_asset" // data asset over the per-file cap
-	skipReasonUntrackedAsset = "untracked_asset"  // asset-class file git does not track
+	skipReasonLargeDocument  = "large_document"    // document over the per-file cap
+	skipReasonVectorData     = "vector_data"       // data asset, data indexing off
+	skipReasonLargeData      = "large_data_asset"  // data asset over the per-file cap
+	skipReasonLargeImage     = "large_image_asset" // image asset over the per-file cap
+	skipReasonUntrackedAsset = "untracked_asset"   // asset-class file git does not track
 )
 
 // contentAdmissionGate decides, by asset class, whether a non-source artifact
@@ -28,12 +29,14 @@ const (
 // per-file check is a single map lookup. A nil gate is inert — the common
 // all-code repo (no asset extractors registered) pays nothing.
 type contentAdmissionGate struct {
-	classes    map[string]parser.AssetClass
-	docLimit   int64
-	docCapped  bool
-	indexData  bool
-	dataLimit  int64
-	dataCapped bool
+	classes     map[string]parser.AssetClass
+	docLimit    int64
+	docCapped   bool
+	indexData   bool
+	dataLimit   int64
+	dataCapped  bool
+	imageLimit  int64
+	imageCapped bool
 }
 
 // newContentAdmissionGate builds the gate from the indexer's registry and
@@ -46,13 +49,16 @@ func (idx *Indexer) newContentAdmissionGate() *contentAdmissionGate {
 	c := idx.config.Content
 	docLimit, docCapped := c.EffectiveMaxDocumentBytes()
 	dataLimit, dataCapped := c.EffectiveMaxDataBytes()
+	imageLimit, imageCapped := c.EffectiveMaxImageBytes()
 	return &contentAdmissionGate{
-		classes:    classes,
-		docLimit:   docLimit,
-		docCapped:  docCapped,
-		indexData:  c.IndexData,
-		dataLimit:  dataLimit,
-		dataCapped: dataCapped,
+		classes:     classes,
+		docLimit:    docLimit,
+		docCapped:   docCapped,
+		indexData:   c.IndexData,
+		dataLimit:   dataLimit,
+		dataCapped:  dataCapped,
+		imageLimit:  imageLimit,
+		imageCapped: imageCapped,
 	}
 }
 
@@ -74,6 +80,16 @@ func (g *contentAdmissionGate) skip(lang string, size int64) (string, bool) {
 		}
 		if g.dataCapped && size > g.dataLimit {
 			return skipReasonLargeData, true
+		}
+	case parser.AssetImage:
+		// An image yields a metadata-only node, but minting it reads and
+		// hashes the whole file, so the class needs the same size ceiling
+		// documents and data assets already have. It stays admitted by
+		// default: the memory blow-up images used to cause was in the
+		// literal-search index, and that is fixed in the trigram package
+		// by rejecting binary content outright, not by dropping the node.
+		if g.imageCapped && size > g.imageLimit {
+			return skipReasonLargeImage, true
 		}
 	}
 	return "", false

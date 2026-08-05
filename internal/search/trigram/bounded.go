@@ -31,7 +31,7 @@ func (s *Searcher) GrepBounded(
 	if s == nil || query == "" {
 		return nil, BoundedSearchStats{}
 	}
-	candidates := s.ix.Candidates(query)
+	candidates := s.candidates(query)
 	paths := make([]string, 0, len(candidates))
 	for _, docID := range candidates {
 		if int(docID) < len(s.paths) {
@@ -55,7 +55,7 @@ func (s *Searcher) GrepLiteralBounded(
 	if s == nil || query == "" {
 		return nil, BoundedSearchStats{}
 	}
-	candidates := s.ix.Candidates(query)
+	candidates := s.candidates(query)
 	paths := make([]string, 0, len(candidates))
 	for _, docID := range candidates {
 		if int(docID) < len(s.paths) {
@@ -118,6 +118,7 @@ func grepPathsBounded(
 	}
 	matches := make([]Match, 0, matchCapacity)
 	scanBuffer := make([]byte, 64*1024)
+	sniff := bufio.NewReaderSize(nil, binarySniffBytes)
 	for _, rel := range paths {
 		if ctx.Err() != nil {
 			stats.Incomplete = true
@@ -128,8 +129,16 @@ func grepPathsBounded(
 			stats.Incomplete = true
 			continue
 		}
+		sniff.Reset(f)
+		if readerIsBinary(sniff) {
+			// Opaque bytes cannot match a literal text query. Skipping
+			// costs nothing in recall and keeps a cold scan from paging
+			// megabytes of image or archive content through the scanner.
+			_ = f.Close()
+			continue
+		}
 		stats.ScannedFiles++
-		scanner := bufio.NewScanner(f)
+		scanner := bufio.NewScanner(sniff)
 		scanner.Buffer(scanBuffer, 4*1024*1024)
 		line := 0
 		cancelled := false
@@ -188,6 +197,7 @@ func grepLiteralPathsBounded(
 	}
 	matches := make([]Match, 0, matchCapacity)
 	scanBuffer := make([]byte, 64*1024)
+	sniff := bufio.NewReaderSize(nil, binarySniffBytes)
 	for _, rel := range paths {
 		if ctx.Err() != nil {
 			stats.Incomplete = true
@@ -198,8 +208,14 @@ func grepLiteralPathsBounded(
 			stats.Incomplete = true
 			continue
 		}
+		sniff.Reset(f)
+		if readerIsBinary(sniff) {
+			// See grepPathsBounded: opaque bytes hold no identifier.
+			_ = f.Close()
+			continue
+		}
 		stats.ScannedFiles++
-		scanner := bufio.NewScanner(f)
+		scanner := bufio.NewScanner(sniff)
 		scanner.Buffer(scanBuffer, 4*1024*1024)
 		line := 0
 		cancelled := false

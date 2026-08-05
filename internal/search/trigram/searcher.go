@@ -2,10 +2,11 @@ package trigram
 
 import (
 	"bufio"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/zzet/gortex/internal/pathguard"
@@ -26,12 +27,36 @@ type Searcher struct {
 	resolvedRoot string // root with symlinks evaluated, for confinement tests
 	ix           *Index
 	paths        []string // docID -> forward-slash repo-relative path
+
+	// unindexed holds the docIDs of text documents that were too large to
+	// index (see maxIndexedBytes). They are merged into every candidate
+	// set, so a bounded index costs a little scan time rather than a
+	// missed match. Binary and unreadable documents are NOT here: they
+	// are excluded from search outright.
+	unindexed []uint32
+	// searchable is the ascending set of docIDs a query with no usable
+	// trigram may scan — indexed plus unindexed, never binary.
+	searchable []uint32
+	// indexedBytes is the summed length of the content actually indexed.
+	// It is the input to the caller's memory budget, not a search input.
+	indexedBytes int64
 }
 
 // Build reads every file — forward-slash repo-relative paths under
 // root — and indexes its content. A file that cannot be read is left
 // unindexed (it never matches) but keeps its docID slot so the rest
 // stay aligned.
+//
+// Two classes of file are deliberately kept out of the index:
+//
+//   - Binary content (IsBinary) is excluded from the index AND from
+//     search. A literal text query cannot meaningfully match compressed
+//     or encoded bytes, and indexing them costs roughly 50x the file's
+//     own size — a single 2 MiB PNG measured 101 MiB of index.
+//   - Text over maxIndexedBytes is excluded from the index but recorded
+//     in unindexed, so it is still a candidate for every query and is
+//     opened and verified like any other file. Bounded memory, no
+//     false negatives.
 //
 // A path that is a symlink out of root is treated as unreadable. The
 // indexer walk already refuses to admit one, so this is the second of two
@@ -52,13 +77,89 @@ func Build(root string, relPaths []string) *Searcher {
 		if pathguard.EscapesResolvedRoot(abs, s.resolvedRoot) {
 			continue
 		}
+		info, err := os.Stat(abs)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if info.Size() > maxIndexedBytes {
+			// Sniff the head before deciding: an oversized binary is
+			// excluded outright, an oversized text file still has to be
+			// scanned so it stays a standing candidate.
+			if binaryHead(abs) {
+				continue
+			}
+			s.unindexed = append(s.unindexed, uint32(i))
+			s.searchable = append(s.searchable, uint32(i))
+			continue
+		}
 		content, err := os.ReadFile(abs)
 		if err != nil {
 			continue
 		}
+		if IsBinary(content) {
+			continue
+		}
 		s.ix.Add(uint32(i), content)
+		s.indexedBytes += int64(len(content))
+		s.searchable = append(s.searchable, uint32(i))
 	}
+	slices.Sort(s.searchable)
 	return s
+}
+
+// binaryHead reports whether the file at abs begins with binary content.
+// An unreadable file reports false; Build treats it as unindexed either
+// way, so the distinction does not reach a caller.
+func binaryHead(abs string) bool {
+	f, err := os.Open(abs)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	head := make([]byte, binarySniffBytes)
+	n, err := io.ReadFull(f, head)
+	if n == 0 && err != nil {
+		return false
+	}
+	return IsBinary(head[:n])
+}
+
+// candidates returns the docIDs to verify for query: whatever the trigram
+// index proposes, plus every document too large to have been indexed.
+// The result is sorted ascending and free of duplicates.
+func (s *Searcher) candidates(query string) []uint32 {
+	ids := s.ix.Candidates(query)
+	if len(s.unindexed) == 0 {
+		return ids
+	}
+	merged := make([]uint32, 0, len(ids)+len(s.unindexed))
+	merged = append(merged, ids...)
+	merged = append(merged, s.unindexed...)
+	slices.Sort(merged)
+	return slices.Compact(merged)
+}
+
+// IndexedBytes reports the total content length the searcher actually
+// indexed. Callers use it to size the searcher against a memory budget;
+// it excludes binary and oversized documents, which hold no index state.
+func (s *Searcher) IndexedBytes() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.indexedBytes
+}
+
+// ApproxIndexBytes estimates the heap the index retains, for budgeting.
+// The dominant terms are the posting map (one entry plus a one-element
+// posting slice per distinct (doc, trigram) pair) and the per-document
+// trigram slices; a path string rounds out each doc. The coefficients
+// were fitted against measured heap for this repo's corpus and track it
+// within about 10%.
+func (s *Searcher) ApproxIndexBytes() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.ix.approxBytes() + int64(len(s.paths))*40
 }
 
 // openConfined opens the indexed file at rel for scanning, refusing one
@@ -88,7 +189,7 @@ func (s *Searcher) Grep(query string, limit int) []Match {
 		return nil
 	}
 	var matches []Match
-	for _, docID := range s.ix.Candidates(query) {
+	for _, docID := range s.candidates(query) {
 		if int(docID) >= len(s.paths) {
 			continue
 		}
@@ -162,16 +263,21 @@ func (s *Searcher) GrepRegexp(re *regexp.Regexp, requiredLiterals []string, path
 
 	var docIDs []uint32
 	if candidates == nil {
-		docIDs = make([]uint32, len(s.paths))
-		for i := range s.paths {
-			docIDs[i] = uint32(i)
-		}
+		// No usable literal to trigram-filter on: scan every searchable
+		// document. That is the indexed set plus the oversized-text set —
+		// binary and unreadable documents are excluded, exactly as they
+		// are from the literal path.
+		docIDs = slices.Clone(s.searchable)
 	} else {
-		docIDs = make([]uint32, 0, len(candidates))
+		docIDs = make([]uint32, 0, len(candidates)+len(s.unindexed))
 		for id := range candidates {
 			docIDs = append(docIDs, id)
 		}
-		sort.Slice(docIDs, func(a, b int) bool { return docIDs[a] < docIDs[b] })
+		// An oversized text document holds no postings, so no literal can
+		// vouch for it; it has to be verified by the regexp scan itself.
+		docIDs = append(docIDs, s.unindexed...)
+		slices.Sort(docIDs)
+		docIDs = slices.Compact(docIDs)
 	}
 
 	var matches []Match
