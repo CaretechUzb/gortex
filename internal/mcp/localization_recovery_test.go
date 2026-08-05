@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
@@ -602,7 +603,10 @@ func TestPlannedRecoveryIsExactRetriableAndWeakResultReleasesAdvisory(t *testing
 		t.Fatalf("session-only recovery anchor leaked onto wire: %s", encoded)
 	}
 
-	wrong, generation := state.interceptAnswerReady("read", "file", map[string]any{"target": map[string]any{"file": "CHANGELOG.md"}})
+	// A search on some other anchor is genuinely off-plan. read.file is not a
+	// counter-example any more: naming a file releases the contract by design,
+	// so the planned plan is checked with a call that has no such meaning.
+	wrong, generation := state.interceptAnswerReady("search", "symbols", map[string]any{"query": "SomeOtherAnchor"})
 	if wrong == nil || !wrong.IsError || generation != 0 {
 		t.Fatalf("wrong planned navigation = (%#v, %d), want retriable block", wrong, generation)
 	}
@@ -689,9 +693,20 @@ func requireLocalizationResultStateEqual(
 		if wire.RequiredAction != "recover_once" || len(wire.AllowedOperations) != len(localizationRecoveryOperations) {
 			t.Fatalf("recovery completion is not directional/machine-readable: %#v", wire)
 		}
-		wantInstruction := `Make one accepted, bounded Gortex MCP recovery call: search(operation:"text" or "symbols", query:<specific task anchor>) or read(operation:"source", target:{symbol:<exact id>}). If Gortex explicitly rejects an overbroad request and preserves the recovery allowance, correct it using only Gortex MCP search or read; the rejected request does not count as the accepted recovery. Do not call host Read, Grep, Glob, Bash, or any other non-Gortex tool. Then respond from the accepted result and follow its completion.`
+		wantInstruction := newLocalizationRecoveryCompletion().Instruction
 		if wire.Instruction != wantInstruction {
 			t.Fatalf("recovery instruction = %q, want %q", wire.Instruction, wantInstruction)
+		}
+		// The instruction sends the caller to Gortex rather than to host tools, so
+		// it must also name the move that works when the candidates are wrong.
+		for _, required := range []string{
+			`search(operation:"text" or "symbols"`,
+			`read(operation:"file", target:{file:"<path>"})`,
+			"Do not call host Read, Grep, Glob, Bash",
+		} {
+			if !strings.Contains(wire.Instruction, required) {
+				t.Fatalf("recovery instruction is missing %q: %q", required, wire.Instruction)
+			}
 		}
 	}
 
