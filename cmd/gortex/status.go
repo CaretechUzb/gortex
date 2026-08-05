@@ -115,18 +115,27 @@ func runStatusViaDaemon(cmd *cobra.Command) error {
 		}
 	}
 	for _, r := range st.TrackedRepos {
+		// A repo whose directory is gone (or that the daemon holds no
+		// index for) gets its state spelled out inline instead of
+		// reading as a legitimate zero-count row — see #312.
+		suffix := fmt.Sprintf("(%d files, %d nodes, %d edges)", r.Files, r.Nodes, r.Edges)
+		switch {
+		case r.Missing:
+			suffix = "MISSING — path no longer exists on disk"
+		case r.Unloaded:
+			suffix = "(not indexed — tracked in config, no index held)"
+		}
 		if showWS {
 			ws := r.Workspace
 			if r.WorkspaceProject != "" && r.WorkspaceProject != ws {
 				ws = ws + "/" + r.WorkspaceProject
 			}
-			fmt.Fprintf(w, "  %-24s [%-12s] %s  (%d files, %d nodes, %d edges)\n",
-				r.Prefix, ws, r.Path, r.Files, r.Nodes, r.Edges)
+			fmt.Fprintf(w, "  %-24s [%-12s] %s  %s\n", r.Prefix, ws, r.Path, suffix)
 		} else {
-			fmt.Fprintf(w, "  %-24s %s  (%d files, %d nodes, %d edges)\n",
-				r.Prefix, r.Path, r.Files, r.Nodes, r.Edges)
+			fmt.Fprintf(w, "  %-24s %s  %s\n", r.Prefix, r.Path, suffix)
 		}
 	}
+	renderMissingRepoWarning(w, st.TrackedRepos)
 	return nil
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/audit"
 	"github.com/zzet/gortex/internal/blame"
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/coverage"
 	"github.com/zzet/gortex/internal/excludes"
@@ -3344,11 +3345,67 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 			result["lsp_resolved_edges_by_language"] = lspEdgesByLang
 		}
 	}
+	// Tracked-repo path liveness. A repo whose directory was deleted keeps
+	// its registration forever: it stops indexing, its nodes go stale, and
+	// every remaining signal in this payload stays green because they all
+	// describe what IS in the graph, never what was supposed to be. Health
+	// is the one place an agent looks before trusting a whole-workspace
+	// answer, so a dead registration has to show up here (#312).
+	if missingRepos := s.missingTrackedRepoPaths(); len(missingRepos) > 0 {
+		result["missing_repo_paths"] = missingRepos
+		result["tracked_repo_paths_ok"] = false
+		msg := "Tracked repositories whose directory no longer exists on disk: " + strings.Join(missingRepos, ", ") +
+			". They can never be re-indexed, so workspace-wide answers silently omit them. Remove each with `gortex untrack <path>`."
+		if recommendation == "" {
+			recommendation = msg
+		} else {
+			recommendation = msg + " " + recommendation
+		}
+	} else {
+		result["tracked_repo_paths_ok"] = true
+	}
+
 	if recommendation != "" {
 		result["recommendation"] = recommendation
 	}
 
 	return result, nil
+}
+
+// missingTrackedRepoPaths returns, sorted and de-duplicated, the roots of
+// every tracked repository whose directory is gone from disk.
+//
+// Both registries are consulted because they disagree in exactly the case
+// that matters: right after a delete the dead root is still live in the
+// indexer's metadata, while after a restart the failed repo is only in the
+// config. Reading one alone would report the ghost in one window and lose
+// it in the other.
+func (s *Server) missingTrackedRepoPaths() []string {
+	roots := map[string]struct{}{}
+	if s.multiIndexer != nil {
+		for _, meta := range s.multiIndexer.AllMetadata() {
+			if meta != nil && meta.RootPath != "" {
+				roots[meta.RootPath] = struct{}{}
+			}
+		}
+	}
+	if s.configManager != nil {
+		if gc := s.configManager.Global(); gc != nil {
+			for _, entry := range gc.Repos {
+				if entry.Path != "" {
+					roots[entry.Path] = struct{}{}
+				}
+			}
+		}
+	}
+	missing := make([]string, 0, len(roots))
+	for root := range roots {
+		if config.RepoPathMissing(root) {
+			missing = append(missing, root)
+		}
+	}
+	sort.Strings(missing)
+	return missing
 }
 
 // buildIndexHealthFileRollup reads the per-file metadata sidecar (when the
