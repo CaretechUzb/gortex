@@ -1215,7 +1215,7 @@ func exploreSingleQualifiedImplementation(task string, targets []exploreTarget) 
 	// bounded result must contain exactly one hydrated production callable;
 	// supporting graph relations may still be rendered later, but a selected
 	// alternate can never be described as absent merely because it ranked lower.
-	if len(targets) != 1 || len(exploreQuotedRecallTerms(task)) > 0 ||
+	if len(targets) != 1 || len(exploreQuotedRecallClaimTerms(task)) > 0 ||
 		!exploreHydratedProductionCallable(targets[0]) {
 		return false
 	}
@@ -1340,7 +1340,7 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 	// no verified exact literal evidence, ordinary concept alignment must not
 	// turn that claim into a terminal answer. Explicit path/symbol/signature
 	// anchors and the unique/ambiguous exact paths above retain their behavior.
-	if len(exploreQuotedRecallTerms(task)) > 0 {
+	if len(exploreQuotedRecallClaimTerms(task)) > 0 {
 		return false
 	}
 
@@ -1349,7 +1349,7 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 	// declarations remain useful evidence, but cannot terminate navigation.
 	var implementation *exploreTarget
 	if class == rerank.QueryClassConcept {
-		hasSyntacticAnchors := len(exploreSyntacticAnchors(task)) > 0
+		hasSyntacticAnchors := exploreAuthoredSyntacticAnchorCount(exploreSyntacticAnchors(task)) > 0
 		for i := range targets {
 			target := &targets[i]
 			callable := target.node != nil &&
@@ -5121,18 +5121,48 @@ const (
 	exploreSourceLiteralTaskAlignSignal = "explore_source_literal_task_alignment"
 	exploreSourceLiteralReservationMax  = 2
 	exploreQuotedRecallMaxTerms         = 3
-	exploreQuotedRecallMaxPerTerm       = 12
-	exploreQuotedRecallRetryMaxRows     = 24
+	// Literals mined from code blocks may only take the slots prose left
+	// unclaimed, up to this total, so a task with no code block searches
+	// exactly as many terms as before.
+	exploreQuotedRecallMaxMinedTerms = 5
+	exploreQuotedRecallMaxPerTerm    = 12
+	exploreQuotedRecallRetryMaxRows  = 24
 )
 
 // exploreQuotedRecallTerms extracts only explicit, high-signal literal anchors
-// from prose. The ordinary symbol corpus intentionally excludes function bodies;
-// these literals are the bounded bridge to the existing source-content FTS for
-// errors, configuration values, protocol names, and other evidence that exists
-// only inside an implementation. Regex/pattern literals remain in the shaped
-// symbol query but are not sent to content recall because their punctuation
-// decomposes into noisy one-character terms.
+// from prose, then the literals mined from the task's code blocks. The ordinary
+// symbol corpus intentionally excludes function bodies; these literals are the
+// bounded bridge to the existing source-content FTS for errors, configuration
+// values, protocol names, and other evidence that exists only inside an
+// implementation. Regex/pattern literals remain in the shaped symbol query but
+// are not sent to content recall because their punctuation decomposes into
+// noisy one-character terms.
 func exploreQuotedRecallTerms(task string) []string {
+	seen := make(map[string]struct{}, exploreQuotedRecallMaxMinedTerms)
+	out := make([]string, 0, exploreQuotedRecallMaxMinedTerms)
+	out = admitExploreQuotedRecallTerms(task, exploreProseQuotedLiterals(task), out, seen, exploreQuotedRecallMaxTerms)
+	return admitExploreQuotedRecallTerms(
+		task, exploreFencedRecallLiterals(task), out, seen, exploreQuotedRecallMaxMinedTerms,
+	)
+}
+
+// exploreQuotedRecallClaimTerms returns only the literals the requester wrote
+// as prose. Terminality gates key on the requester's factual claim about the
+// source, never on a literal mined out of a pasted code block: mining is our
+// own inference, and an inference that retrieves nothing must not cost the
+// session a turn. Retrieval keeps using the full list.
+func exploreQuotedRecallClaimTerms(task string) []string {
+	return admitExploreQuotedRecallTerms(
+		task, exploreProseQuotedLiterals(task),
+		make([]string, 0, exploreQuotedRecallMaxTerms),
+		make(map[string]struct{}, exploreQuotedRecallMaxTerms),
+		exploreQuotedRecallMaxTerms,
+	)
+}
+
+// exploreProseQuotedLiterals returns every quoted span of the raw task, in
+// document order.
+func exploreProseQuotedLiterals(task string) []string {
 	literals := make([]string, 0, exploreQuotedRecallMaxTerms)
 	for _, match := range reInlineQuoted.FindAllString(task, -1) {
 		if len(match) >= 2 {
@@ -5155,12 +5185,30 @@ func exploreQuotedRecallTerms(task string) []string {
 		literals = append(literals, rest[:end])
 		rest = rest[end+1:]
 	}
+	return literals
+}
 
-	seen := make(map[string]struct{}, len(literals))
-	out := make([]string, 0, min(len(literals), exploreQuotedRecallMaxTerms))
+// admitExploreQuotedRecallTerms applies the shared acceptance policy — length,
+// noise, short-anchor intent, and case-folded deduplication — to one lane of
+// literal candidates and stops at the lane's cumulative limit.
+func admitExploreQuotedRecallTerms(
+	task string,
+	literals, out []string,
+	seen map[string]struct{},
+	limit int,
+) []string {
 	for _, literal := range literals {
+		if len(out) >= limit {
+			break
+		}
 		literal = strings.TrimSpace(literal)
 		if len(literal) < 2 || len(literal) > 128 || quotedLiteralIsNoise(literal) {
+			continue
+		}
+		// A span the opening delimiter never closed on its line is not a source
+		// literal: content FTS cannot match text that crosses a line break, and
+		// admitting it would spend a term slot the mined lines can use.
+		if strings.ContainsAny(literal, "\r\n") {
 			continue
 		}
 		if exploreTwoLetterQuotedAnchor(literal) && !exploreAllowsTwoLetterQuotedAnchor(task) {
@@ -5172,9 +5220,6 @@ func exploreQuotedRecallTerms(task string) []string {
 		}
 		seen[key] = struct{}{}
 		out = append(out, literal)
-		if len(out) >= exploreQuotedRecallMaxTerms {
-			break
-		}
 	}
 	return out
 }

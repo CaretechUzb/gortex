@@ -147,24 +147,28 @@ func exploreRankedPoolFiles(candidates []*rerank.Candidate) map[string]struct{} 
 }
 
 // exploreExactNameAnchorTokens returns the bounded, deduplicated prose tokens
-// worth one name lookup each. Code-shaped tokens are excluded on purpose: they
-// already own the syntactic lane, and re-admitting them here would spend the
-// budget re-deriving anchors that exist.
+// worth one name lookup each, then the tokens mined from code blocks. Tokens
+// the author wrote as prose rank first and the shared budget is unchanged, so
+// mining can only spend the lookups prose left over. Code-shaped tokens are
+// excluded on purpose: they already own the syntactic lane, and re-admitting
+// them here would spend the budget re-deriving anchors that exist.
 func exploreExactNameAnchorTokens(task string) []string {
 	seen := make(map[string]struct{}, exploreExactNameAnchorMaxTokens)
 	out := make([]string, 0, exploreExactNameAnchorMaxTokens)
-	for _, raw := range exploreUnquotedCodeTokens(task) {
-		token := strings.Trim(raw, "-_.:()[]{}<>,;'\"")
-		if !exploreExactNameAnchorToken(token) {
-			continue
-		}
-		if _, duplicate := seen[token]; duplicate {
-			continue
-		}
-		seen[token] = struct{}{}
-		out = append(out, token)
-		if len(out) == exploreExactNameAnchorMaxTokens {
-			break
+	for _, lane := range [2][]string{exploreUnquotedCodeTokens(task), exploreFencedCodeTokens(task)} {
+		for _, raw := range lane {
+			token := strings.Trim(raw, "-_.:()[]{}<>,;'\"")
+			if !exploreExactNameAnchorToken(token) {
+				continue
+			}
+			if _, duplicate := seen[token]; duplicate {
+				continue
+			}
+			seen[token] = struct{}{}
+			out = append(out, token)
+			if len(out) == exploreExactNameAnchorMaxTokens {
+				return out
+			}
 		}
 	}
 	return out

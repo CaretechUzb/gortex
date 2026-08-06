@@ -34,17 +34,25 @@ type exploreSyntacticAnchor struct {
 	// exactNodes carries the indexed declarations a plain task token named
 	// verbatim, so the anchor lane never repeats the name lookup that found it.
 	exactNodes []*graph.Node
+	// mined marks an anchor read out of a pasted code block rather than spelled
+	// by the requester. It retrieves and ranks like any other anchor, but the
+	// gates that withhold an answer ignore it: a stack frame can name a
+	// third-party symbol this repository will never contain.
+	mined bool
 }
 
 // exploreSyntacticAnchors extracts only syntactically strong, unquoted clues.
 // Flags lead because they are explicit user-facing identifiers; snake/camel/
 // qualified identifiers follow in first-seen order. Prefix-equivalent forms
 // collapse into one anchor, so --replace, replace_all, and Replacer consume a
-// single bounded retrieval lane rather than three.
+// single bounded retrieval lane rather than three. Identifiers mined from code
+// blocks come last: query shaping discards those blocks, so a stack frame or
+// snippet is the only remaining spelling of the symbol it names, but prose the
+// author wrote deliberately still owns the slots it can fill.
 func exploreSyntacticAnchors(task string) []exploreSyntacticAnchor {
 	out := make([]exploreSyntacticAnchor, 0, exploreSyntacticAnchorMaxTerms)
 	tokens := exploreUnquotedCodeTokens(task)
-	add := func(raw string) {
+	add := func(raw string, mined bool) {
 		anchor, ok := newExploreSyntacticAnchor(raw)
 		if !ok {
 			return
@@ -54,6 +62,7 @@ func exploreSyntacticAnchors(task string) []exploreSyntacticAnchor {
 				return
 			}
 		}
+		anchor.mined = mined
 		out = append(out, anchor)
 	}
 
@@ -65,22 +74,24 @@ func exploreSyntacticAnchors(task string) []exploreSyntacticAnchor {
 		if assignment := strings.IndexByte(flag, '='); assignment >= 0 {
 			flag = flag[:assignment]
 		}
-		add(flag)
+		add(flag, false)
 		if len(out) == exploreSyntacticAnchorMaxTerms {
 			return out
 		}
 	}
 
-	for _, token := range tokens {
-		if strings.HasPrefix(token, "--") {
-			continue
-		}
-		if exploreSyntacticAnchorRuntimeDataPath(token) || !exploreCodeShapedToken(token) {
-			continue
-		}
-		add(token)
-		if len(out) == exploreSyntacticAnchorMaxTerms {
-			break
+	for lane, laneTokens := range [2][]string{tokens, exploreFencedCodeTokens(task)} {
+		for _, token := range laneTokens {
+			if strings.HasPrefix(token, "--") {
+				continue
+			}
+			if exploreSyntacticAnchorRuntimeDataPath(token) || !exploreCodeShapedToken(token) {
+				continue
+			}
+			add(token, lane > 0)
+			if len(out) == exploreSyntacticAnchorMaxTerms {
+				return out
+			}
 		}
 	}
 	return out
@@ -1153,12 +1164,23 @@ func exploreSyntacticAnchorMatchesTargetSource(anchor exploreSyntacticAnchor, ta
 
 // exploreSyntacticAnchorEvidenceReady prevents a broad semantic neighbor from
 // terminating localization while a distinctive implementation clue is absent.
-// Every retained anchor needs one production declaration with hydrated source;
-// fields, tests, abstract declarations, and metadata-only hits cannot prove it.
+// Every retained anchor the requester spelled needs one production declaration
+// with hydrated source; fields, tests, abstract declarations, and metadata-only
+// hits cannot prove it.
 func exploreSyntacticAnchorEvidenceReady(task string, targets []exploreTarget) bool {
 	anchors := exploreSyntacticAnchors(task)
 	covered := make([]bool, len(anchors))
-	remaining := len(anchors)
+	remaining := 0
+	for index, anchor := range anchors {
+		if anchor.mined {
+			covered[index] = true
+			continue
+		}
+		remaining++
+	}
+	if remaining == 0 {
+		return true
+	}
 	for _, target := range targets {
 		if !exploreSyntacticAnchorEligibleNode(target.node) || strings.TrimSpace(target.source) == "" {
 			continue
@@ -1180,6 +1202,18 @@ func exploreSyntacticAnchorEvidenceReady(task string, targets []exploreTarget) b
 		}
 	}
 	return remaining == 0
+}
+
+// exploreAuthoredSyntacticAnchorCount counts the anchors the requester spelled.
+// Gates that withhold an answer read this count, never the mined total.
+func exploreAuthoredSyntacticAnchorCount(anchors []exploreSyntacticAnchor) int {
+	authored := 0
+	for _, anchor := range anchors {
+		if !anchor.mined {
+			authored++
+		}
+	}
+	return authored
 }
 
 func exploreSyntacticAnchorTargetMatchesAnchors(anchors []exploreSyntacticAnchor, target exploreTarget) int {
