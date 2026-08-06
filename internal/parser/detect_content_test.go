@@ -117,6 +117,29 @@ func TestDetectLanguageContent_AmbiguousHeader(t *testing.T) {
 	assert.Equal(t, "objc", lang)
 }
 
+// TestExtensionNeedsContentProbe pins the set a name-only detection cannot
+// decide. An indexer that resolves a language before reading the file relies
+// on this to know its answer is provisional: for a contested extension the
+// name yields the default mapping, not a content-backed language.
+func TestExtensionNeedsContentProbe(t *testing.T) {
+	for _, p := range []string{"inc/list.h", "src/View.H", "vendor/table.inc", "a/b.m", "conf/beans.xml", "templates/product.json"} {
+		assert.Truef(t, ExtensionNeedsContentProbe(p), "%s is decided by content", p)
+	}
+	for _, p := range []string{"main.go", "app.cpp", "lib.c", "index.ts", "Makefile"} {
+		assert.Falsef(t, ExtensionNeedsContentProbe(p), "%s is decided by its extension", p)
+	}
+}
+
+// TestDetectLanguageContent_UncontestedExtensionIgnoresProbe guards the gate
+// sniffAmbiguous now applies: only a listed extension may be re-typed from
+// content, so a `.c` file full of C++ markers still goes to the C extractor.
+func TestDetectLanguageContent_UncontestedExtensionIgnoresProbe(t *testing.T) {
+	r := ambiguityRegistry()
+	lang, ok := r.DetectLanguageContent("src/main.c", []byte("namespace ui {\nclass Widget {};\n}\n"))
+	assert.True(t, ok)
+	assert.Equal(t, "c", lang)
+}
+
 func TestDetectLanguageContent_CFragments(t *testing.T) {
 	r := NewRegistry()
 	r.Register(&mockExtractor{lang: "c", exts: []string{".c", ".h", ".def"}})

@@ -307,3 +307,50 @@ func TestCppExtractor_TemplateClassMemberUnchanged(t *testing.T) {
 	assert.Equal(t, 4, puts[0].StartLine, "still spans from the member's own definition")
 	assert.Equal(t, 6, puts[0].EndLine)
 }
+
+// A header-only library opens and closes its namespace through macros the
+// preprocessor would expand (`FMT_BEGIN_NAMESPACE`), which tree-sitter cannot
+// resolve — it reads the marker as a declaration and recovers around it. The
+// free template function further down must still be extracted, carrying the
+// inner `namespace detail` it sits in as its scope. This is the shape a real
+// header-only formatting library ships, include guard and all.
+func TestCppExtractor_TemplateFunctionUnderMacroNamespaceMarkers(t *testing.T) {
+	src := []byte(`#ifndef LIB_PRINTF_H_
+#define LIB_PRINTF_H_
+
+#include "format.h"
+
+FMT_BEGIN_NAMESPACE
+FMT_BEGIN_EXPORT
+
+template <typename Char> class basic_printf_context {
+ public:
+  auto out() -> basic_appender<Char> { return out_; }
+
+ private:
+  basic_appender<Char> out_;
+};
+
+namespace detail {
+
+template <typename Char, typename Context>
+void vprintf(buffer<Char>& buf, basic_string_view<Char> format,
+             basic_format_args<Context> args) {
+  write(buf, format);
+}
+
+}  // namespace detail
+
+FMT_END_EXPORT
+FMT_END_NAMESPACE
+
+#endif  // LIB_PRINTF_H_
+`)
+	result, err := NewCppExtractor().Extract("printf.hpp", src)
+	require.NoError(t, err)
+
+	fn := nodeNamed(t, result.Nodes, graph.KindFunction, "vprintf")
+	assert.Equal(t, 19, fn.StartLine, "span covers the template header")
+	assert.Equal(t, 23, fn.EndLine)
+	assert.Equal(t, "detail", fn.Meta["scope_ns"])
+}

@@ -3405,17 +3405,21 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					}
 					merkleBaseline.record(relPath, src, wf.mtimeNano)
 
-					// Reuse the walk-time language. The walk's
-					// effectiveLanguage call already consulted shebang
-					// bytes via readSniffPrefix (512-byte probe), so a
-					// re-detect against the full src would change the
-					// answer only on the vanishingly rare case where a
-					// language marker lives past byte 512 — and any such
-					// case is content-sniffing-by-luck rather than spec'd
-					// behaviour. The fallback below covers the truly
-					// pathological case where the walk-time language has
-					// no extractor registered (effectively dead code).
+					// Reuse the walk-time language, except where the
+					// extension alone cannot decide it. The walk runs
+					// before any file is read, so for `.h`, `.m` and the
+					// other contested extensions it can only report the
+					// extension's default — reusing that indexed every
+					// C++ header as C, dropping its templates and class
+					// members. The bytes are in hand here, so re-detect;
+					// the second branch still covers a walk-time language
+					// with no extractor registered.
 					lang := wf.lang
+					if parser.ExtensionNeedsContentProbe(path) {
+						if relang, ok := idx.effectiveLanguage(path, src); ok {
+							lang = relang
+						}
+					}
 					ext, _ := idx.registry.GetByLanguage(lang)
 					if ext == nil {
 						if relang, ok := idx.effectiveLanguage(path, src); ok {
