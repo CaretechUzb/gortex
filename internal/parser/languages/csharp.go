@@ -112,6 +112,13 @@ const qCSharpAll = `
       type: (_) @lvar.type
       (variable_declarator
         (identifier) @lvar.name))) @lvar.def
+
+  (member_access_expression
+    name: (identifier) @maccess.name) @maccess.expr
+
+  (conditional_access_expression
+    (member_binding_expression
+      name: (identifier) @maccess.condname)) @maccess.condexpr
 ]
 `
 
@@ -258,6 +265,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	var calls []csharpDeferredCall
 	var locals []csharpDeferredLocal
 	var typeUses []csharpTypeUse
+	var accesses []csharpDeferredAccess
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
@@ -336,6 +344,21 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				name:        m.Captures["call.name"].Text,
 				line:        expr.StartLine + 1,
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
+			})
+
+		case m.Captures["maccess.expr"] != nil:
+			accesses = append(accesses, csharpDeferredAccess{
+				name: m.Captures["maccess.name"].Text,
+				node: m.Captures["maccess.expr"].Node,
+				line: m.Captures["maccess.expr"].StartLine + 1,
+			})
+
+		case m.Captures["maccess.condexpr"] != nil:
+			accesses = append(accesses, csharpDeferredAccess{
+				name:        m.Captures["maccess.condname"].Text,
+				node:        m.Captures["maccess.condexpr"].Node,
+				line:        m.Captures["maccess.condexpr"].StartLine + 1,
+				conditional: true,
 			})
 
 		case m.Captures["lvar.def"] != nil:
@@ -612,6 +635,11 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		stampReturnUsage(edge, c.returnUsage)
 		result.Edges = append(result.Edges, edge)
 	}
+
+	// Member accesses ride the same deferred machinery as calls — the
+	// receiver-typing ladder needs the finished tenv.
+	emitCSharpMemberAccesses(accesses, src, filePath, funcRanges,
+		tenvByOwner, builtinsByOwner, result)
 
 	// .NET surfaces a symbol walk misses: DI registrations + COM
 	// interop. Stamped onto the file node.
