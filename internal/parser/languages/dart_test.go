@@ -547,6 +547,44 @@ class Cache {
 	assert.Nil(t, byID["status.dart::Cache.Cache"])
 }
 
+// A Capitalized call-chain head names a type, so the call edge carries it as
+// receiver_type. Lowercase heads, bare calls, deeper chains, and import-alias
+// heads stay unstamped.
+func TestDartExtractor_CapitalizedChainReceiverType(t *testing.T) {
+	src := []byte(`import 'package:http/http.dart' as http;
+
+class TiledAtlas {
+  factory TiledAtlas.fromTiledMap(int m) => TiledAtlas.fromKey('x');
+  TiledAtlas.fromKey(String k);
+}
+
+void main() {
+  TiledAtlas.fromTiledMap(1);
+  http.get('u');
+  helper.run();
+  bare();
+  Config.opts.apply();
+}
+`)
+	res, err := NewDartExtractor().Extract("main.dart", src)
+	require.NoError(t, err)
+
+	recvType := map[string]any{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls && ed.From == "main.dart::main" {
+			recvType[ed.To] = ed.Meta["receiver_type"]
+		}
+	}
+
+	assert.Equal(t, "TiledAtlas", recvType["unresolved::*.fromTiledMap"],
+		"a Capitalized chain head must be stamped as the receiver type")
+	assert.Nil(t, recvType["unresolved::*.run"], "a lowercase head is a local, not a type")
+	assert.Nil(t, recvType["unresolved::*.bare"], "a bare call has no receiver")
+	assert.Nil(t, recvType["unresolved::*.apply"], "only a two-segment chain types the callee")
+	assert.Nil(t, recvType["unresolved::extern::package:http/http.dart::get"],
+		"an import alias is a library prefix, not a type")
+}
+
 func TestDartExtractor_FactoryChainReceiver(t *testing.T) {
 	src := []byte("Widget builder() { return Widget(); }\n" +
 		"void run() {\n" +

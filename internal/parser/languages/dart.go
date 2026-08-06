@@ -671,15 +671,27 @@ func (e *DartExtractor) extractCalls(
 		}
 
 		target := "unresolved::*." + callName
+		aliased := false
 		if leadingReceiver != "" {
 			if uri, ok := imports[leadingReceiver]; ok {
 				target = "unresolved::extern::" + uri + "::" + callName
+				aliased = true
 			}
 		}
-		result.Edges = append(result.Edges, &graph.Edge{
+		edge := &graph.Edge{
 			From: callerID, To: target,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
-		})
+		}
+		// `TiledAtlas.fromTiledMap(1)` — a Capitalized chain head names the type
+		// the callee lives on, so the resolver binds the call to that type's
+		// member instead of any same-named symbol. Only a two-segment chain
+		// qualifies: in `Foo.bar.baz()` the head types `bar`, not `baz`. An
+		// import alias is excluded — it is a library prefix, not a type, and its
+		// attribution already rides the extern target.
+		if !aliased && len(methodChain) == 2 && isDartTypeNameCapitalized(leadingReceiver) {
+			edge.Meta = map[string]any{"receiver_type": leadingReceiver}
+		}
+		result.Edges = append(result.Edges, edge)
 	})
 }
 
