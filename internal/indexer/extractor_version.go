@@ -32,7 +32,7 @@ var extractorVersions = map[string]int{
 	//   "go": 2,
 	"c":      generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
 	"php":    2,                                      // class/interface inheritance now emits typed structural edges
-	"csharp": 5,                                      // awaited-receiver Task<T> unwrap + return_shape (was: this./base.-qualified call edges)
+	"csharp": 6,                                      // member-access reads/writes edges (was: awaited-receiver Task<T> unwrap + return_shape). NOTE: #478 also claims 6 — whichever lands second bumps to 7.
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
