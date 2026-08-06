@@ -153,12 +153,64 @@ func csharpAccessReceiverType(a csharpDeferredAccess, src []byte, owner string,
 	return resolveChainType(text, tenv, result)
 }
 
+// csharpParamNamesByOwner indexes declared parameter names per owning
+// function/method from the KindParam nodes the shape emitter produced
+// (ID form `<ownerID>#param:<name>@<pos>`). An untyped receiver that
+// names a parameter is still a VALUE — the namespace-noise rule must
+// not swallow its chained reads.
+func csharpParamNamesByOwner(result *parser.ExtractionResult) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	for _, n := range result.Nodes {
+		if n == nil || n.Kind != graph.KindParam {
+			continue
+		}
+		idx := strings.LastIndex(n.ID, "#param:")
+		if idx < 0 {
+			continue
+		}
+		owner := n.ID[:idx]
+		name := n.ID[idx+len("#param:"):]
+		if at := strings.LastIndex(name, "@"); at >= 0 {
+			name = name[:at]
+		}
+		m := out[owner]
+		if m == nil {
+			m = map[string]bool{}
+			out[owner] = m
+		}
+		m[name] = true
+	}
+	return out
+}
+
+// csharpAccessNamesValue reports whether the access's receiver is a
+// bare identifier naming a declared value (parameter, tenv local, or
+// builtin-typed local) of the enclosing function — value-ness evidence
+// even when the TYPE is unknown.
+func csharpAccessNamesValue(a csharpDeferredAccess, src []byte,
+	params map[string]bool, tenv typeEnv, builtins map[string]string) bool {
+	recv := a.node.ChildByFieldName("expression")
+	if a.conditional {
+		recv = a.node.ChildByFieldName("condition")
+	}
+	if recv == nil || recv.Type() != "identifier" {
+		return false
+	}
+	name := recv.Content(src)
+	if params[name] || builtins[name] != "" {
+		return true
+	}
+	_, ok := tenv[name]
+	return ok
+}
+
 // emitCSharpMemberAccesses turns the buffered access sites into
 // EdgeReads/EdgeWrites once the type environments exist.
 func emitCSharpMemberAccesses(accesses []csharpDeferredAccess, src []byte,
 	filePath string, funcRanges *csharpFuncLookup,
 	tenvByOwner map[string]typeEnv, builtinsByOwner map[string]map[string]string,
 	result *parser.ExtractionResult) {
+	paramsByOwner := csharpParamNamesByOwner(result)
 	for _, a := range accesses {
 		if a.node == nil || csharpAccessInCallPosition(a.node) {
 			continue
@@ -169,10 +221,14 @@ func emitCSharpMemberAccesses(accesses []csharpDeferredAccess, src []byte,
 		}
 		recvType := csharpAccessReceiverType(a, src, callerID,
 			tenvByOwner[callerID], builtinsByOwner[callerID], result)
-		if recvType == "" && !a.conditional && csharpAccessIsInnerLink(a.node) {
+		if recvType == "" && !a.conditional && csharpAccessIsInnerLink(a.node) &&
+			!csharpAccessNamesValue(a, src, paramsByOwner[callerID],
+				tenvByOwner[callerID], builtinsByOwner[callerID]) {
 			// Evidence-less inner link — almost always a namespace or
 			// static-qualification prefix; emitting it would shower the
-			// graph with reads of `Threading`/`Tasks`.
+			// graph with reads of `Threading`/`Tasks`. A receiver that
+			// names a declared param/local is a value, not a namespace,
+			// so its chained reads survive even untyped.
 			continue
 		}
 		kind := graph.EdgeReads

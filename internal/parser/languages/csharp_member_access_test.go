@@ -48,6 +48,7 @@ func TestCSharpExtractor_MemberAccessEdges(t *testing.T) {
         public int Chained() { Plaque p = new Plaque(); return p.Title.Length; }
         public int Call() { Plaque p = new Plaque(); return p.Chime(); }
         public string FromParam(Plaque q) { return q.Title; }
+        public int ParamChain(Plaque q) { return q.Title.Length; }
     }
 }
 `)
@@ -100,6 +101,14 @@ func TestCSharpExtractor_MemberAccessEdges(t *testing.T) {
 	param := accessEdges(result.Edges, "Plaque.cs::Reader.FromParam", "Title")
 	require.Len(t, param, 1, "a param-receiver access still emits its read edge")
 	assert.Equal(t, graph.EdgeReads, param[0].Kind)
+
+	// A chained access on a param receiver is a REAL read even though the
+	// receiver is untyped: `q` names a declared parameter, which is
+	// value-ness evidence the namespace-noise rule must respect —
+	// `System` in `System.Threading.Tasks` names no param or local.
+	pchain := accessEdges(result.Edges, "Plaque.cs::Reader.ParamChain", "Title")
+	require.Len(t, pchain, 1, "q.Title inside q.Title.Length is a read of Title")
+	assert.Equal(t, graph.EdgeReads, pchain[0].Kind)
 }
 
 // Dotted namespace qualification parses as nested member accesses in this
