@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -30,6 +31,9 @@ type exploreSyntacticAnchor struct {
 	terms         []string
 	compact       string
 	qualifiedName string
+	// exactNodes carries the indexed declarations a plain task token named
+	// verbatim, so the anchor lane never repeats the name lookup that found it.
+	exactNodes []*graph.Node
 }
 
 // exploreSyntacticAnchors extracts only syntactically strong, unquoted clues.
@@ -137,6 +141,9 @@ func newExploreSyntacticAnchor(raw string) (exploreSyntacticAnchor, bool) {
 	if strings.Contains(raw, "::") {
 		query = strings.Join(strings.Fields(strings.ReplaceAll(raw, "::", " ")), " ")
 		qualifiedName = strings.ReplaceAll(strings.Join(strings.Fields(raw), ""), "::", ".")
+	} else if dotted, ok := exploreDottedQualifiedMention(raw); ok {
+		query = strings.Join(strings.Fields(strings.ReplaceAll(raw, ".", " ")), " ")
+		qualifiedName = dotted
 	}
 	return exploreSyntacticAnchor{
 		query:         query,
@@ -160,8 +167,8 @@ func exploreSyntacticAnchorEquivalent(left, right exploreSyntacticAnchor) bool {
 	if left.compact == right.compact {
 		return true
 	}
-	leftQualified := strings.Contains(left.source, "::")
-	rightQualified := strings.Contains(right.source, "::")
+	leftQualified := left.qualifiedName != ""
+	rightQualified := right.qualifiedName != ""
 	if leftQualified != rightQualified {
 		qualified, plain := left, right
 		if !leftQualified {
@@ -544,7 +551,7 @@ func exploreSyntacticAnchorMatchesNode(anchor exploreSyntacticAnchor, node *grap
 	}
 	return exploreSyntacticAnchorMatchesIdentifier(anchor, node.Name) ||
 		exploreSyntacticAnchorMatchesIdentifier(anchor, node.QualName) ||
-		(strings.Contains(anchor.source, "::") && exploreSyntacticAnchorMatchesIdentifier(anchor, node.ID)) ||
+		(anchor.qualifiedName != "" && exploreSyntacticAnchorMatchesIdentifier(anchor, node.ID)) ||
 		exploreSyntacticAnchorMatchesPath(anchor, node)
 }
 
@@ -763,7 +770,7 @@ func exploreSyntacticAnchorReusesProtected(
 	candidates []*rerank.Candidate,
 	usedIDs map[string]struct{},
 ) string {
-	qualifiedMember := strings.Contains(anchor.source, "::")
+	qualifiedMember := anchor.qualifiedName != ""
 	for _, candidate := range candidates {
 		if candidate == nil || candidate.Node == nil {
 			continue
@@ -843,6 +850,24 @@ func markExploreSyntacticAnchorCandidate(candidate *rerank.Candidate) {
 	candidate.Signals = signals
 }
 
+// exploreAnchorPoolCandidate prefers the already-ranked object for a node the
+// ordinary pool holds, so protecting an anchor never discards its channel
+// ranks, and reports whether the pool owned it.
+func exploreAnchorPoolCandidate(
+	ordinary []*rerank.Candidate,
+	candidate *rerank.Candidate,
+) (*rerank.Candidate, bool) {
+	if candidate == nil || candidate.Node == nil {
+		return candidate, false
+	}
+	for _, existing := range ordinary {
+		if existing != nil && existing.Node != nil && existing.Node.ID == candidate.Node.ID {
+			return existing, true
+		}
+	}
+	return candidate, false
+}
+
 func (s *Server) gatherExploreSyntacticAnchorCandidates(
 	ctx context.Context,
 	task string,
@@ -851,8 +876,11 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 	scope query.QueryOptions,
 	rctx *rerank.Context,
 ) ([]*rerank.Candidate, map[int]string) {
-	anchors := exploreSyntacticAnchors(task)
-	if s == nil || s.graph == nil || eng == nil || len(anchors) == 0 || ctx.Err() != nil {
+	if s == nil || s.graph == nil || eng == nil || ctx.Err() != nil {
+		return nil, nil
+	}
+	anchors := s.exploreTaskAnchors(ctx, task, ordinary, scope)
+	if len(anchors) == 0 {
 		return nil, nil
 	}
 
@@ -870,6 +898,9 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 
 	additions := make([]*rerank.Candidate, 0, len(anchors))
 	missed := make([]int, 0, len(anchors))
+	// Owners admitted alongside a resolved qualified member are recorded past
+	// the anchor list: they belong to no task token of their own.
+	ownerIndex := len(anchors)
 	anchorOpts := scope
 	anchorOpts.SkipInnerRerank = true
 	anchorOpts.SkipVectorChannel = true
@@ -885,18 +916,28 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 			protected[index] = reused
 			continue
 		}
-		if exactCandidate := s.exploreExactQualifiedAnchorCandidate(ctx, anchor, scope, usedIDs, usedFiles); exactCandidate != nil {
-			protectedCandidate := exactCandidate
-			for _, existing := range ordinary {
-				if existing != nil && existing.Node != nil && existing.Node.ID == exactCandidate.Node.ID {
-					protectedCandidate = existing
-					break
-				}
-			}
-			if protectedCandidate == exactCandidate {
-				additions = append(additions, exactCandidate)
+		if exactCandidate := s.exploreExactAnchorCandidate(ctx, anchor, scope, usedIDs, usedFiles); exactCandidate != nil {
+			protectedCandidate, pooled := exploreAnchorPoolCandidate(ordinary, exactCandidate)
+			if !pooled {
+				additions = append(additions, protectedCandidate)
 			}
 			addProtected(index, protectedCandidate)
+			// A resolved member without its declaring type reads as a free
+			// function. Admit the owner only into a slot no task token claims,
+			// so the anchor budget stays capped regardless of resolution order.
+			if ownerIndex < exploreSyntacticAnchorMaxTerms {
+				owner := s.exploreQualifiedAnchorOwnerCandidate(
+					ctx, anchor, protectedCandidate.Node, scope, usedIDs,
+				)
+				if owner != nil {
+					ownerCandidate, ownerPooled := exploreAnchorPoolCandidate(ordinary, owner)
+					if !ownerPooled {
+						additions = append(additions, ownerCandidate)
+					}
+					addProtected(ownerIndex, ownerCandidate)
+					ownerIndex++
+				}
+			}
 			continue
 		}
 		ordinaryCandidate := exploreSyntacticAnchorCandidate(anchor, ordinary, scope, usedIDs, usedFiles)
@@ -918,14 +959,7 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 			missed = append(missed, index)
 			continue
 		}
-		alreadyOrdinary := false
-		for _, existing := range ordinary {
-			if existing != nil && existing.Node != nil && existing.Node.ID == candidate.Node.ID {
-				alreadyOrdinary = true
-				break
-			}
-		}
-		if !alreadyOrdinary {
+		if _, pooled := exploreAnchorPoolCandidate(ordinary, candidate); !pooled {
 			additions = append(additions, candidate)
 		}
 		addProtected(index, candidate)
@@ -1007,6 +1041,26 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 	return additions, protected
 }
 
+// exploreReservedAnchorIndexes orders task-shaped anchors first and
+// graph-resolved reservations after them. Anchors admitted by exact graph name,
+// and owners admitted alongside a resolved qualified member, are recorded past
+// the task-shaped list, so they can only be reserved by identifier — this pure
+// step has no graph with which to re-derive them.
+func exploreReservedAnchorIndexes(anchors []exploreSyntacticAnchor, protected map[int]string) []int {
+	indexes := make([]int, 0, len(anchors)+len(protected))
+	for index := range anchors {
+		indexes = append(indexes, index)
+	}
+	resolved := make([]int, 0, len(protected))
+	for index, id := range protected {
+		if id != "" && index >= len(anchors) {
+			resolved = append(resolved, index)
+		}
+	}
+	sort.Ints(resolved)
+	return append(indexes, resolved...)
+}
+
 // reserveExploreSyntacticAnchorCandidates keeps every discovered anchor owner
 // inside the final window while preserving the semantic head and the relative
 // order of all candidates that do not need promotion.
@@ -1017,7 +1071,7 @@ func reserveExploreSyntacticAnchorCandidates(
 	maxSymbols int,
 ) []*rerank.Candidate {
 	anchors := exploreSyntacticAnchors(task)
-	if len(anchors) == 0 || len(candidates) == 0 || maxSymbols <= 0 {
+	if (len(anchors) == 0 && len(protected) == 0) || len(candidates) == 0 || maxSymbols <= 0 {
 		return candidates
 	}
 	if maxSymbols > len(candidates) {
@@ -1026,11 +1080,11 @@ func reserveExploreSyntacticAnchorCandidates(
 
 	usedIDs := make(map[string]struct{}, len(anchors))
 	usedFiles := make(map[string]struct{}, len(anchors))
-	reservationIDs := make([]string, 0, len(anchors))
-	for index, anchor := range anchors {
+	reservationIDs := make([]string, 0, len(anchors)+len(protected))
+	for _, index := range exploreReservedAnchorIndexes(anchors, protected) {
 		id := protected[index]
-		if id == "" {
-			if candidate := exploreSyntacticAnchorCandidate(anchor, candidates, query.QueryOptions{}, usedIDs, usedFiles); candidate != nil {
+		if id == "" && index < len(anchors) {
+			if candidate := exploreSyntacticAnchorCandidate(anchors[index], candidates, query.QueryOptions{}, usedIDs, usedFiles); candidate != nil {
 				id = candidate.Node.ID
 			}
 		}
