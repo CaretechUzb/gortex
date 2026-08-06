@@ -101,6 +101,7 @@ type exploreTarget struct {
 	sourceLiteralAligned  bool   // source-literal callee that instantiates the task's value; strongest literal owner
 	typedAnchorProjection bool   // bounded field-owner-call proof promoted from a task-aligned typed field
 	foldedOwner           bool   // synthetic owner inserted by concept member folding
+	leadingFileDepth      bool   // sibling of the ranked leading file, admitted into the expendable breadth tail
 	localizationRelation  string // direct_caller/direct_callee row promoted only into the bounded terminal projection
 }
 
@@ -2813,7 +2814,14 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	for i, c := range prod {
 		prodNodes[i] = c.Node
 	}
+	// Retain the pre-diversification order for the localization page: the
+	// leading file's demoted siblings are only recoverable from the pool as
+	// ranking left it.
+	var localizationRankedPool []*rerank.Candidate
 	if exploreShouldDiversifyByFile(queryClass) {
+		if req.GetBool("localize", false) {
+			localizationRankedPool = append([]*rerank.Candidate(nil), prod...)
+		}
 		_, prod = diversifyByFile(prodNodes, prod, defaultMaxPerFile)
 	}
 	prod, protectedImplementationID := reserveExploreConceptImplementation(searchQuery, queryClass, prod, maxSymbols)
@@ -3015,6 +3023,17 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			answerReady = false
 		}
 	}
+	// Once ranking has settled on one file, re-spend the page's expendable
+	// breadth tail on that file's demoted siblings. This is an evidence-page
+	// allocation only: terminality and the contract selections below continue
+	// to read the diversified set.
+	pageTargets := reserveExploreLeadingFileDepthTargets(
+		localizationRankedPool, symbolTargets, maxSymbols, protectedFinalCandidateIDs,
+		func(node *graph.Node) exploreTarget {
+			return s.hydrateExploreLeadingFileDepthTarget(ctx, eng, node, ringOpts)
+		},
+	)
+	targets = append(targets[:len(artifactTargets):len(artifactTargets)], pageTargets...)
 	// File evidence can make localization answer-ready, but it never becomes a
 	// synthetic exact-symbol read. Exact reads remain declaration-only.
 	exactSymbol := exploreLocalizationExplicitTarget(task, symbolTargets)
@@ -3713,7 +3732,10 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 		if index < localizationDirectEvidenceReserve || target.node.ID == requiredID ||
 			target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
 			target.divergentDefaultOwner || target.divergentDefaultType || target.conceptImplementation || target.conceptComplement ||
-			target.exactContent || target.sourceLiteral || target.typedAnchorProjection {
+			target.exactContent || target.sourceLiteral || target.typedAnchorProjection ||
+			// Depth rows already paid for the tail they occupy; a relationship
+			// row must not reclaim the same slot a second time.
+			target.leadingFileDepth {
 			protected[target.node.ID] = struct{}{}
 		}
 		if target.node.ID == requiredID || target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
