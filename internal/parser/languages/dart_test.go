@@ -429,6 +429,124 @@ class App {
 	assert.True(t, sawBuild, "the real method build should still be emitted")
 }
 
+// Every dotted Dart constructor — named, factory, const-named, and redirecting
+// factory — is a first-class member symbol: a KindMethod whose Name is the bare
+// constructor name (not the class name), owned by the enclosing type through an
+// EdgeMemberOf, and spanning at least its signature.
+func TestDartExtractor_ConstructorVariants(t *testing.T) {
+	src := []byte(`class TiledAtlas {
+  final int n;
+
+  TiledAtlas(this.n);
+
+  /// Builds from a cache key.
+  TiledAtlas.fromKey(String key) : n = 1;
+
+  const TiledAtlas.empty() : n = 0;
+
+  TiledAtlas.withBody(int x) : n = x {
+    print(x);
+  }
+
+  factory TiledAtlas.fromTiledMap(int m) {
+    return TiledAtlas.fromKey('x');
+  }
+
+  factory TiledAtlas.redirect() = TiledAtlas.empty;
+}
+`)
+	res, err := NewDartExtractor().Extract("atlas.dart", src)
+	require.NoError(t, err)
+
+	byID := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		byID[n.ID] = n
+	}
+
+	cases := []struct {
+		id        string
+		name      string
+		startLine int
+		endLine   int
+	}{
+		{"atlas.dart::TiledAtlas.fromKey", "fromKey", 7, 7},
+		{"atlas.dart::TiledAtlas.empty", "empty", 9, 9},
+		{"atlas.dart::TiledAtlas.withBody", "withBody", 11, 13},
+		{"atlas.dart::TiledAtlas.fromTiledMap", "fromTiledMap", 15, 17},
+		{"atlas.dart::TiledAtlas.redirect", "redirect", 19, 19},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			n := byID[tc.id]
+			require.NotNil(t, n, "constructor %s not emitted; nodes=%v", tc.id, byID)
+			assert.Equal(t, graph.KindMethod, n.Kind)
+			assert.Equal(t, tc.name, n.Name, "constructor name must be the bare name, not the class name")
+			assert.Equal(t, "TiledAtlas", n.Meta["receiver"])
+			assert.Equal(t, tc.startLine, n.StartLine, "start line")
+			assert.Equal(t, tc.endLine, n.EndLine, "end line")
+
+			var owned bool
+			for _, ed := range res.Edges {
+				if ed.Kind == graph.EdgeMemberOf && ed.From == tc.id && ed.To == "atlas.dart::TiledAtlas" {
+					owned = true
+				}
+			}
+			assert.True(t, owned, "constructor %s must be a member of its type", tc.id)
+		})
+	}
+
+	// The doc comment above a named constructor rides the node.
+	assert.Equal(t, "Builds from a cache key.", byID["atlas.dart::TiledAtlas.fromKey"].Meta["doc"])
+
+	// The unnamed constructor stays out of the graph — `TiledAtlas(...)`
+	// constructs the class and must not be hijacked by a phantom member.
+	assert.Nil(t, byID["atlas.dart::TiledAtlas.TiledAtlas"],
+		"the unnamed constructor must not be emitted as a member")
+
+	// Constructor IDs are unique — a duplicate would collide in the store.
+	ids := map[string]bool{}
+	for _, n := range res.Nodes {
+		require.False(t, ids[n.ID], "duplicate node id %s", n.ID)
+		ids[n.ID] = true
+	}
+}
+
+// A const constructor on an enum and a private named constructor are ordinary
+// members too; a plain field declaration next to them stays a non-symbol.
+func TestDartExtractor_ConstructorsInEnumAndPrivate(t *testing.T) {
+	src := []byte(`enum Status {
+  active,
+  inactive;
+
+  const Status.raw();
+}
+
+class Cache {
+  final int size;
+  Cache._internal(this.size);
+}
+`)
+	res, err := NewDartExtractor().Extract("status.dart", src)
+	require.NoError(t, err)
+
+	byID := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		byID[n.ID] = n
+	}
+
+	raw := byID["status.dart::Status.raw"]
+	require.NotNil(t, raw, "enum const constructor must be emitted")
+	assert.Equal(t, "raw", raw.Name)
+
+	internal := byID["status.dart::Cache._internal"]
+	require.NotNil(t, internal, "private named constructor must be emitted")
+	assert.Equal(t, "private", internal.Meta["visibility"])
+
+	// `final int size;` is a field declaration, not a constructor.
+	assert.Nil(t, byID["status.dart::Cache.size"])
+	assert.Nil(t, byID["status.dart::Cache.Cache"])
+}
+
 func TestDartExtractor_FactoryChainReceiver(t *testing.T) {
 	src := []byte("Widget builder() { return Widget(); }\n" +
 		"void run() {\n" +
