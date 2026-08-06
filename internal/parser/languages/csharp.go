@@ -1881,10 +1881,9 @@ func csharpAwaitedCallType(expr, enclosing string, tenv typeEnv, result *parser.
 	}
 	name := stripCallArgs(expr[cut+1:])
 	var recvType string
-	switch prefix := expr[:cut]; {
-	case prefix == "this":
+	if prefix := expr[:cut]; prefix == "this" {
 		recvType = enclosing
-	default:
+	} else {
 		recvType = resolveChainType(prefix, tenv, result)
 		if recvType == "" && isKnownType(prefix, result) {
 			recvType = prefix // static call on a type: `Repo.LoadAsync()`
