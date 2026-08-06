@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -38,7 +39,11 @@ const exploreToolDescription = "Start here for any task, bug report, or " +
 // corpus, query vocabulary, or benchmark. The verb takes arbitrary free
 // text; nothing here is derived from a fixed task set.
 const (
-	exploreDefaultBudgetTokens             = 1600
+	exploreDefaultBudgetTokens = 1600
+	// localizationDefaultBudgetTokens is the localize-path default. Its
+	// envelope pays for ranked rows and the leading file's outline out of one
+	// budget, where explore(task) prose pays for rows alone.
+	localizationDefaultBudgetTokens        = 2400
 	exploreMinBudgetTokens                 = 1000
 	exploreMaxBudgetTokens                 = 24000
 	exploreDefaultMaxSymbols               = 10
@@ -84,11 +89,15 @@ type exploreTarget struct {
 	callees               []*graph.Node
 	directCalleesComplete bool // false when the direct projection was truncated, bounded, or otherwise lower-bound
 	causalCallees         []exploreCausalNeighbor
+	causalChangeBridge    bool   // one graph-proven caller/callee retained as provenance for a promoted continuation
+	causalChangeLeaf      bool   // graph-proven wrapper implementation or task-aligned cross-file change callable
+	causalChangeOwner     bool   // same-file type that encloses or is uniquely returned by the causal change callable
 	source                string // full body (may be empty for non-source kinds)
 	divergentDefaultOwner bool   // unique child constructor whose concrete default causes the queried behavior
 	divergentDefaultType  bool   // owning type paired with divergentDefaultOwner for coherent file/symbol output
 	conceptImplementation bool   // primary identifier-backed callable; may establish answer readiness
 	conceptComplement     bool   // marginal concept callable protected as evidence, never as terminal proof
+	syntacticAnchor       bool   // task-spelled flag/identifier owner protected by bounded lexical competition
 	exactContent          bool   // verified full quoted-literal hit from content_fts
 	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
 	sourceLiteral         bool   // exact source-body hit that must survive final envelope packing
@@ -96,6 +105,7 @@ type exploreTarget struct {
 	sourceLiteralAligned  bool   // source-literal callee that instantiates the task's value; strongest literal owner
 	typedAnchorProjection bool   // bounded field-owner-call proof promoted from a task-aligned typed field
 	foldedOwner           bool   // synthetic owner inserted by concept member folding
+	leadingFileDepth      bool   // sibling of the ranked leading file, admitted into the expendable breadth tail
 	localizationRelation  string // direct_caller/direct_callee row promoted only into the bounded terminal projection
 }
 
@@ -473,7 +483,8 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 	}
 	makeEntry := func(n *graph.Node, source, evidence string, direct bool, parentRank int) (exploreDraftEntry, int) {
 		overlap, longest := exploreDraftTermOverlap(queryTerms, n)
-		explicitAnchor := exploreLocalizationExplicitAnchor(query, n)
+		explicitAnchor := exploreLocalizationExplicitAnchor(query, n) ||
+			exploreTaskQualifiedSyntacticAnchorMatchesNode(task, n)
 		exact := exploreDraftExactAnchor(query, n) || explicitAnchor
 		// Concept prompts often mention a nearby test helper while asking how the
 		// production path works. Do not let that lexical anchor outrank the
@@ -1204,7 +1215,7 @@ func exploreSingleQualifiedImplementation(task string, targets []exploreTarget) 
 	// bounded result must contain exactly one hydrated production callable;
 	// supporting graph relations may still be rendered later, but a selected
 	// alternate can never be described as absent merely because it ranked lower.
-	if len(targets) != 1 || len(exploreQuotedRecallTerms(task)) > 0 ||
+	if len(targets) != 1 || len(exploreQuotedRecallClaimTerms(task)) > 0 ||
 		!exploreHydratedProductionCallable(targets[0]) {
 		return false
 	}
@@ -1270,7 +1281,6 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		!exploreSyntacticAnchorEvidenceReady(task, targets) && !strongSourceLiteral {
 		return false
 	}
-
 	// Paths, signatures, and identifier-shaped queries carry explicit anchors.
 	// A shared token is not enough: the ranked head must cover the complete
 	// path, qualified symbol, or signature anchor from the request.
@@ -1330,7 +1340,7 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 	// no verified exact literal evidence, ordinary concept alignment must not
 	// turn that claim into a terminal answer. Explicit path/symbol/signature
 	// anchors and the unique/ambiguous exact paths above retain their behavior.
-	if len(exploreQuotedRecallTerms(task)) > 0 {
+	if len(exploreQuotedRecallClaimTerms(task)) > 0 {
 		return false
 	}
 
@@ -1339,7 +1349,7 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 	// declarations remain useful evidence, but cannot terminate navigation.
 	var implementation *exploreTarget
 	if class == rerank.QueryClassConcept {
-		hasSyntacticAnchors := len(exploreSyntacticAnchors(task)) > 0
+		hasSyntacticAnchors := exploreAuthoredSyntacticAnchorCount(exploreSyntacticAnchors(task)) > 0
 		for i := range targets {
 			target := &targets[i]
 			callable := target.node != nil &&
@@ -1416,11 +1426,50 @@ func exploreNormalizedPath(text string) string {
 }
 
 func exploreQueryPathAnchors(query string) ([]string, bool) {
-	anchors := make([]string, 0, 1)
+	fields := make([]string, 0, 2)
+	routeLike := 0
+	for _, raw := range strings.Fields(query) {
+		field := strings.Trim(raw, "`'\"()[]{}<>,;")
+		// A route is commonly embedded in a call token such as
+		// r.GET("/base/:id"). Extract the quoted value before classifying it;
+		// treating the whole call as a source path poisons every later basename
+		// match in the request.
+		if quote := strings.IndexAny(field, "`'\""); quote >= 0 {
+			field = field[quote+1:]
+			if end := strings.IndexAny(field, "`'\""); end >= 0 {
+				field = field[:end]
+			}
+			field = strings.Trim(field, "`'\"()[]{}<>,;")
+		}
+		if !strings.ContainsAny(field, "/\\") || strings.Contains(field, "://") {
+			continue
+		}
+		// A fully qualified Go stack symbol (`github.com/acme/pkg.(*T).M`) is
+		// a package-qualified callable, not a user-supplied source directory.
+		// Let a later basename/file:line anchor such as `tree.go:637` match
+		// instead of making this package token veto every basename.
+		if strings.Contains(field, "(*") && strings.Contains(field, ").") {
+			continue
+		}
+		fields = append(fields, field)
+		normalized := strings.ReplaceAll(field, "\\", "/")
+		if strings.HasPrefix(normalized, "/") {
+			base := normalized[strings.LastIndex(normalized, "/")+1:]
+			dot := strings.LastIndex(base, ".")
+			if dot <= 0 || dot == len(base)-1 {
+				routeLike++
+			}
+		}
+	}
+
+	anchors := make([]string, 0, len(fields))
 	hasDirectory := false
-	for _, field := range strings.Fields(query) {
-		field = strings.Trim(field, "`'\"()[]{}<>,;")
-		if !strings.ContainsAny(field, "/\\") {
+	for _, field := range fields {
+		normalized := strings.ReplaceAll(field, "\\", "/")
+		base := normalized[strings.LastIndex(normalized, "/")+1:]
+		dot := strings.LastIndex(base, ".")
+		rootedWithoutExtension := strings.HasPrefix(normalized, "/") && (dot <= 0 || dot == len(base)-1)
+		if rootedWithoutExtension && (routeLike >= 2 || strings.Contains(normalized, "/:") || strings.ContainsAny(normalized, "{}")) {
 			continue
 		}
 		hasDirectory = true
@@ -1502,6 +1551,13 @@ func exploreLocalizationExplicitAnchor(query string, n *graph.Node) bool {
 // accepted here: it can rank a neighborhood but must not prescribe the one
 // allowed post-localization source read.
 func exploreLocalizationExplicitTarget(task string, targets []exploreTarget) string {
+	// Preserve exact qualified members from the untouched issue before shaping
+	// can truncate a late Owner::member mention out of a long report body.
+	for _, target := range targets {
+		if target.node != nil && exploreTaskQualifiedSyntacticAnchorMatchesNode(task, target.node) {
+			return target.node.ID
+		}
+	}
 	query := shapeExploreQuery(task)
 	if exploreQueryClass(query) == rerank.QueryClassConcept {
 		query = stripLeadingExploreDirective(query)
@@ -1804,9 +1860,322 @@ type exploreConceptImplementationMetric struct {
 	matchedMask uint64
 }
 
-const exploreConceptComplementSignal = "explore_concept_complement"
+const (
+	exploreConceptComplementSignal = "explore_concept_complement"
+	exploreSyntacticAnchorSignal   = "explore_syntactic_anchor"
+)
 
 // reserveExploreConceptImplementation keeps the strongest identifier-backed
+type exploreComponentConjunctionKey struct {
+	workspaceID string
+	projectID   string
+	repoPrefix  string
+	directory   string
+}
+
+type exploreComponentConjunctionSeed struct {
+	index   int
+	node    *graph.Node
+	file    string
+	matched []bool
+}
+
+type exploreComponentConjunctionScore struct {
+	groups   int
+	marginal int
+	rarity   int
+	longest  int
+}
+
+type exploreComponentConjunctionWinner struct {
+	index    int
+	seedRank int
+	score    exploreComponentConjunctionScore
+}
+
+func exploreComponentConjunctionFile(node *graph.Node) string {
+	if node == nil {
+		return ""
+	}
+	file := path.Clean(strings.ReplaceAll(strings.TrimSpace(node.FilePath), "\\", "/"))
+	if file == "" || file == "." || file == "/" || file == ".." || strings.HasPrefix(file, "../") {
+		return ""
+	}
+	return strings.ToLower(file)
+}
+
+func exploreComponentConjunctionComponent(node *graph.Node) (exploreComponentConjunctionKey, bool) {
+	file := exploreComponentConjunctionFile(node)
+	if file == "" {
+		return exploreComponentConjunctionKey{}, false
+	}
+	directory := path.Dir(file)
+	if directory == "" || directory == "." || directory == "/" || directory == ".." || strings.HasPrefix(directory, "../") {
+		return exploreComponentConjunctionKey{}, false
+	}
+	return exploreComponentConjunctionKey{
+		workspaceID: strings.ToLower(strings.TrimSpace(node.WorkspaceID)),
+		projectID:   strings.ToLower(strings.TrimSpace(node.ProjectID)),
+		repoPrefix:  strings.ToLower(strings.TrimSpace(node.RepoPrefix)),
+		directory:   directory,
+	}, true
+}
+
+func exploreComponentConjunctionMatches(node *graph.Node, terms []string) []bool {
+	matched := make([]bool, len(terms))
+	for index, term := range terms {
+		matched[index] = exploreConceptImplementationHasTerm(node, term)
+	}
+	return matched
+}
+
+func exploreComponentConjunctionScoreCompare(left, right exploreComponentConjunctionScore) int {
+	for _, pair := range [...][2]int{
+		{left.groups, right.groups},
+		{left.marginal, right.marginal},
+		{left.rarity, right.rarity},
+		{left.longest, right.longest},
+	} {
+		if pair[0] > pair[1] {
+			return 1
+		}
+		if pair[0] < pair[1] {
+			return -1
+		}
+	}
+	return 0
+}
+
+// reserveExploreComponentConjunction recovers one callable whose identifier
+// completes a task concept already visible in another file of the same exact
+// component. It only reorders the bounded retrieval pool: no graph or source
+// work is added, the semantic head is fixed, and ambiguous component ties are
+// deliberately left untouched.
+func reserveExploreComponentConjunction(
+	query string,
+	queryClass rerank.QueryClass,
+	candidates []*rerank.Candidate,
+	maxSymbols int,
+) []*rerank.Candidate {
+	if queryClass != rerank.QueryClassConcept || maxSymbols < 2 || len(candidates) < 2 {
+		return candidates
+	}
+	width := min(maxSymbols, len(candidates))
+	if width < 2 {
+		return candidates
+	}
+
+	lowValue := exploreConceptComplementLowValueTermSet(query)
+	queryTermSet := exploreTerminalTerms(query)
+	terms := make([]string, 0, len(queryTermSet))
+	groups := make(map[string]struct{}, len(queryTermSet))
+	for term := range queryTermSet {
+		if _, low := lowValue[term]; low {
+			continue
+		}
+		terms = append(terms, term)
+		groups[exploreConceptBehavioralTermGroup(term)] = struct{}{}
+	}
+	if len(terms) < 2 || len(groups) < 2 {
+		return candidates
+	}
+	sort.Strings(terms)
+
+	leadTerms := exploreTerminalTerms(exploreConceptIssueLead(query))
+	lead := make([]bool, len(terms))
+	leadCount := 0
+	for index, term := range terms {
+		if _, present := leadTerms[term]; present {
+			lead[index] = true
+			leadCount++
+		}
+	}
+	if leadCount == 0 {
+		return candidates
+	}
+
+	matches := make([][]bool, len(candidates))
+	frequency := make([]int, len(terms))
+	for candidateIndex, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil {
+			continue
+		}
+		matches[candidateIndex] = exploreComponentConjunctionMatches(candidate.Node, terms)
+		for termIndex, matched := range matches[candidateIndex] {
+			if matched {
+				frequency[termIndex]++
+			}
+		}
+	}
+
+	seeds := make(map[exploreComponentConjunctionKey][]exploreComponentConjunctionSeed)
+	for index := 0; index < width; index++ {
+		candidate := candidates[index]
+		if candidate == nil || candidate.Node == nil || exploreDraftIsTestNode(candidate.Node) ||
+			!exploreCodeDefinitionKind(candidate.Node.Kind) {
+			continue
+		}
+		component, ok := exploreComponentConjunctionComponent(candidate.Node)
+		if !ok {
+			continue
+		}
+		taskAligned := false
+		for _, matched := range matches[index] {
+			if matched {
+				taskAligned = true
+				break
+			}
+		}
+		if !taskAligned {
+			continue
+		}
+		seeds[component] = append(seeds[component], exploreComponentConjunctionSeed{
+			index: index, node: candidate.Node,
+			file: exploreComponentConjunctionFile(candidate.Node), matched: matches[index],
+		})
+	}
+	if len(seeds) == 0 {
+		return candidates
+	}
+
+	sameNode := func(left, right *graph.Node) bool {
+		if left == nil || right == nil {
+			return false
+		}
+		if left.ID != "" && right.ID != "" {
+			return left.ID == right.ID
+		}
+		return left == right
+	}
+	bestByComponent := make(map[exploreComponentConjunctionKey]exploreComponentConjunctionWinner)
+	for index, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil || exploreDraftIsTestNode(candidate.Node) ||
+			(candidate.Node.Kind != graph.KindFunction && candidate.Node.Kind != graph.KindMethod) ||
+			exploreDraftGenericCandidate(candidate.Node, "") {
+			continue
+		}
+		component, ok := exploreComponentConjunctionComponent(candidate.Node)
+		if !ok {
+			continue
+		}
+		componentSeeds := seeds[component]
+		if len(componentSeeds) == 0 {
+			continue
+		}
+
+		base := make([]bool, len(terms))
+		candidateFile := exploreComponentConjunctionFile(candidate.Node)
+		seedRank := len(candidates)
+		hasOtherSeed := false
+		differentFile := false
+		for _, seed := range componentSeeds {
+			if sameNode(seed.node, candidate.Node) {
+				continue
+			}
+			hasOtherSeed = true
+			if seed.index < seedRank {
+				seedRank = seed.index
+			}
+			if seed.file != candidateFile {
+				differentFile = true
+			}
+			for termIndex, matched := range seed.matched {
+				base[termIndex] = base[termIndex] || matched
+			}
+		}
+		if !hasOtherSeed || !differentFile {
+			continue
+		}
+
+		candidateMatched := 0
+		marginal := 0
+		rarity := 0
+		longest := 0
+		unionGroups := make(map[string]struct{}, len(groups))
+		leadAligned := false
+		for termIndex, term := range terms {
+			candidateHasTerm := matches[index][termIndex]
+			if candidateHasTerm {
+				candidateMatched++
+				if len(term) > longest {
+					longest = len(term)
+				}
+				if !base[termIndex] {
+					marginal++
+					denominator := frequency[termIndex]
+					if denominator < 1 {
+						denominator = 1
+					}
+					rarity += 1000 / denominator
+				}
+			}
+			if base[termIndex] || candidateHasTerm {
+				unionGroups[exploreConceptBehavioralTermGroup(term)] = struct{}{}
+				leadAligned = leadAligned || lead[termIndex]
+			}
+		}
+		if candidateMatched == 0 || marginal == 0 || len(unionGroups) < 2 || !leadAligned ||
+			(longest < 5 && candidateMatched < 2) {
+			continue
+		}
+
+		winner := exploreComponentConjunctionWinner{
+			index:    index,
+			seedRank: seedRank,
+			score: exploreComponentConjunctionScore{
+				groups: len(unionGroups), marginal: marginal, rarity: rarity, longest: longest,
+			},
+		}
+		previous, exists := bestByComponent[component]
+		comparison := exploreComponentConjunctionScoreCompare(winner.score, previous.score)
+		if !exists || comparison > 0 ||
+			(comparison == 0 && (winner.seedRank < previous.seedRank ||
+				(winner.seedRank == previous.seedRank && winner.index < previous.index))) {
+			bestByComponent[component] = winner
+		}
+	}
+	if len(bestByComponent) == 0 {
+		return candidates
+	}
+
+	best := exploreComponentConjunctionWinner{index: -1}
+	ambiguous := false
+	for _, winner := range bestByComponent {
+		if best.index < 0 {
+			best = winner
+			continue
+		}
+		comparison := exploreComponentConjunctionScoreCompare(winner.score, best.score)
+		if comparison > 0 {
+			best = winner
+			ambiguous = false
+		} else if comparison == 0 {
+			ambiguous = true
+		}
+	}
+	if best.index < 0 || ambiguous {
+		return candidates
+	}
+
+	result := append([]*rerank.Candidate(nil), candidates...)
+	clone := *result[best.index]
+	clone.Signals = make(map[string]float64, len(result[best.index].Signals)+1)
+	for key, value := range result[best.index].Signals {
+		clone.Signals[key] = value
+	}
+	clone.Signals[exploreConceptComplementSignal] = 1
+	promoted := &clone
+	if best.index < width {
+		result[best.index] = promoted
+		return result
+	}
+
+	target := width - 1
+	copy(result[target+1:best.index+1], result[target:best.index])
+	result[target] = promoted
+	return result
+}
+
 // callable plus up to two callables that cover distinct task concepts in the
 // final window. Retrieval width and response size remain unchanged. The
 // semantic head stays first; reserved implementations occupy the next slots.
@@ -2283,8 +2652,19 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// intentionally optimized for source symbols and may discard the exact
 	// paths, keys, flags, and environment names needed by config/CI searches.
 	artifactIntent := classifyExploreArtifactIntent(task)
+	localize := req.GetBool("localize", false)
+	// The same ranked spans, derived once, applied to source candidate paths.
+	// Ordinary exploration keeps the zero value and so corroborates nothing.
+	var pathProbes explorePathProbes
+	if localize {
+		pathProbes = newExplorePathProbes(task)
+	}
 	maxSymbols := clampInt(req.GetInt("max_symbols", exploreDefaultMaxSymbols), 1, exploreMaxMaxSymbols)
-	budget := clampInt(req.GetInt("token_budget", exploreDefaultBudgetTokens), exploreMinBudgetTokens, exploreMaxBudgetTokens)
+	defaultBudget := exploreDefaultBudgetTokens
+	if localize {
+		defaultBudget = localizationDefaultBudgetTokens
+	}
+	budget := clampInt(req.GetInt("token_budget", defaultBudget), exploreMinBudgetTokens, exploreMaxBudgetTokens)
 
 	resolved, errResult := s.resolveScope(ctx, req, IntentLocate)
 	if errResult != nil {
@@ -2386,6 +2766,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			ranked = mergeExploreCandidates(ranked, anchorCandidates, fetch)
 		}
 	}
+	// Exact source citations in issue bodies are stronger than semantic ranking:
+	// map each bounded file/line range to its smallest enclosing declaration and
+	// place those task-spelled candidates at the head before final selection.
+	ranked = s.promoteExploreSourceRangeCandidates(ctx, task, ranked, opts)
 	// Resilience ladder: a warm-restarted daemon can transiently return an
 	// empty scoped ranked result (workspace stamps not yet backfilled, or
 	// search bundles served before their node payloads re-materialise)
@@ -2423,12 +2807,15 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		if c == nil || c.Node == nil || !exploreLocalizableKind(c.Node.Kind) {
 			continue
 		}
-		if exploreLocalizationTestLaneNode(searchQuery, c.Node) || !exploreCodeDefinitionKind(c.Node.Kind) {
+		if exploreLocalizationTestLaneCandidate(searchQuery, c) || !exploreCodeDefinitionKind(c.Node.Kind) {
 			test = append(test, c)
 		} else {
 			prod = append(prod, c)
 		}
 	}
+	// One bounded string pass over the ranked prefix, so the selection cut and
+	// the leading-file election both read a score computed once.
+	stampExplorePathProbeScores(prod, pathProbes)
 	// Natural-language localization can retrieve large exact-name collision
 	// sets (`client` fields, `Validate` methods, generated accessors). BM25 is
 	// right that each item matches, but a useful neighborhood needs distinct
@@ -2445,10 +2832,24 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	for i, c := range prod {
 		prodNodes[i] = c.Node
 	}
+	// Retain the pre-diversification order for the localization page: the
+	// leading file's demoted siblings are only recoverable from the pool as
+	// ranking left it.
+	var localizationRankedPool []*rerank.Candidate
 	if exploreShouldDiversifyByFile(queryClass) {
+		if localize {
+			localizationRankedPool = append([]*rerank.Candidate(nil), prod...)
+		}
 		_, prod = diversifyByFile(prodNodes, prod, defaultMaxPerFile)
 	}
 	prod, protectedImplementationID := reserveExploreConceptImplementation(searchQuery, queryClass, prod, maxSymbols)
+	prod = reserveExploreComponentConjunction(searchQuery, queryClass, prod, maxSymbols)
+	// Path corroboration decides only what the cut was about to drop: one better
+	// corroborated row below it replaces the weakest row no lane reserved.
+	prod = liftExplorePathProbeCandidates(
+		prod, maxSymbols,
+		exploreFinalReservedCandidateIDs(prod, protectedSyntacticAnchors, protectedImplementationID),
+	)
 	cands := selectFinalExploreCandidates(prod, test, maxSymbols)
 	if len(protectedSyntacticAnchors) > 0 {
 		// Source-literal selection owns its own final-slot guarantees. Re-union
@@ -2477,7 +2878,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		cands, protectedSyntacticAnchors, protectedImplementationID,
 	)
 	if len(cands) == 0 && len(artifactLane.targets) == 0 {
-		if req.GetBool("localize", false) {
+		if localize {
 			return s.completeEmptyLocalization(ctx, task, budget), nil
 		}
 		return mcp.NewToolResultText(fmt.Sprintf(
@@ -2517,6 +2918,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 		if c.Signals != nil {
 			t.conceptComplement = c.Signals[exploreConceptComplementSignal] > 0
+			t.syntacticAnchor = c.Signals[exploreSyntacticAnchorSignal] > 0
 			t.exactContent = c.Signals[exploreContentRecallExactSignal] > 0
 			t.exactContentAmbiguous = c.Signals[exploreContentRecallAmbiguousSignal] > 0
 			t.sourceLiteral = c.Signals[exploreSourceLiteralSignal] > 0
@@ -2582,12 +2984,33 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		}, s.divergentDefaultFallbackSLOOverride)
 		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
 	}
+	// Causal-change promotion is the second concept lane over the same ranked
+	// head. A divergent-default proof is the stronger, pinned claim on that head
+	// and already carries its own provenance pair, so only reach for a causal
+	// route when that promotion did not take the lead.
+	if len(targets) > len(artifactTargets) {
+		symbolTargets := targets[len(artifactTargets):]
+		if exploreDivergentDefaultOwnerSymbol(symbolTargets) == "" {
+			symbolTargets = promoteExploreCausalChangeTargets(task, symbolTargets, s.graph, maxSymbols, func(node *graph.Node) string {
+				return s.manifestSymbolSource(ctx, node)
+			}, func(node *graph.Node) ([]*graph.Node, bool) {
+				callees := eng.GetCallChain(node.ID, ringOpts)
+				if callees == nil {
+					return nil, false
+				}
+				direct, projectionComplete := ringNeighborsProjection(callees.Nodes, node.ID, exploreRingCap)
+				complete := !callees.Truncated && !callees.BudgetHit && !callees.LowerBound && projectionComplete
+				return direct, complete
+			})
+			targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
+		}
+	}
 	// Direct retrieval owns the ranked head. Once graph promotion has selected
 	// a cross-file boundary, materialize exactly that one node so both text and
 	// structured responses can reserve a source body without a broad read.
 	targets = s.materializeExploreStructuralSource(ctx, task, targets, opts)
 
-	if !req.GetBool("localize", false) {
+	if !localize {
 		return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
 	}
 	symbolTargets = targets[len(artifactTargets):]
@@ -2624,6 +3047,24 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			answerReady = false
 		}
 	}
+	// Once ranking has settled on one file, re-spend the page's expendable
+	// breadth tail on that file's demoted siblings. This is an evidence-page
+	// allocation only: terminality and the contract selections below continue
+	// to read the diversified set.
+	pageTargets := reserveExploreLeadingFileDepthTargets(
+		localizationRankedPool, symbolTargets, maxSymbols, protectedFinalCandidateIDs,
+		func(node *graph.Node) exploreTarget {
+			return s.hydrateExploreLeadingFileDepthTarget(ctx, eng, node, ringOpts)
+		},
+	)
+	targets = append(targets[:len(artifactTargets):len(artifactTargets)], pageTargets...)
+	// The same leading file, indexed rather than ranked. The enumeration is
+	// deferred: only a page that stays non-terminal pays for it, and it pays
+	// once however many envelopes this request packs.
+	pageOutline := localizationLeadingFileOutlineProvider(
+		localizationRankedPool, pageTargets,
+		func(file string) []*graph.Node { return fileDefinitionNodes(eng, file) },
+	)
 	// File evidence can make localization answer-ready, but it never becomes a
 	// synthetic exact-symbol read. Exact reads remain declaration-only.
 	exactSymbol := exploreLocalizationExplicitTarget(task, symbolTargets)
@@ -2656,8 +3097,8 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		preferredSymbol := explorePreferredRoutedRefinementSymbol(
 			preferred, symbolTargets, routes,
 		)
-		result, refinement, boundedRoutes, digest := buildLocalizationRefinementResultForTask(
-			preferredSymbol, task, targets, budget, routes,
+		result, refinement, boundedRoutes, digest := buildLocalizationRefinementResultForTaskWithOutline(
+			preferredSymbol, task, targets, budget, routes, pageOutline,
 		)
 		if refinement.State != localizationStateNeedsRefinement {
 			refinement.digest = digest
@@ -2679,7 +3120,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// and is retained for post-terminal replay — for the exact-read contract
 	// too, whose success promotes to answer_ready with the evidence already
 	// stashed.
-	result, _, digest, completion := buildLocalizationExploreResultForTaskFinalized(completion, task, targets, budget)
+	result, _, digest, completion := buildLocalizationExploreResultForTaskFinalizedWithOutline(
+		completion, task, targets, budget, pageOutline,
+	)
 	// Literal-driven terminality must show its evidence: when the verdict
 	// rests on a quoted-literal match but the budgeted envelope shed the
 	// literal, downgrade to the bounded refinement read instead of telling
@@ -2691,8 +3134,8 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		preferredSymbol := explorePreferredRoutedRefinementSymbol(
 			explorePreferredRefinementSymbol(task, symbolTargets), symbolTargets, routes,
 		)
-		refined, refinement, boundedRoutes, refinedDigest := buildLocalizationRefinementResultForTask(
-			preferredSymbol, task, targets, budget, routes,
+		refined, refinement, boundedRoutes, refinedDigest := buildLocalizationRefinementResultForTaskWithOutline(
+			preferredSymbol, task, targets, budget, routes, pageOutline,
 		)
 		if refinement.State != localizationStateNeedsRefinement {
 			refinement.digest = refinedDigest
@@ -2720,11 +3163,12 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 // explicit localization-only request. Ordinary explore(task) retains the
 // human-oriented legacy rendering; localize does not duplicate it.
 type localizationExploreEnvelope struct {
-	Completion localizationCompletion `json:"completion"`
-	Terminal   bool                   `json:"terminal"`
-	Files      []string               `json:"files"`
-	Symbols    []string               `json:"symbols"`
-	Evidence   []localizationEvidence `json:"evidence"`
+	Completion localizationCompletion   `json:"completion"`
+	Terminal   bool                     `json:"terminal"`
+	Files      []string                 `json:"files"`
+	Symbols    []string                 `json:"symbols"`
+	Evidence   []localizationEvidence   `json:"evidence"`
+	Outline    *localizationFileOutline `json:"outline,omitempty"`
 }
 
 type localizationEvidence struct {
@@ -3110,6 +3554,17 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 	if draft == nil && strings.TrimSpace(task) != "" {
 		draft = exploreAnswerDraft(task, targets)
 	}
+	// Preserve the issue author's explicit file/symbol anchor before causal
+	// owner promotion. The owner still remains adjacent, but a proven upstream
+	// cause must not hide the named implementation target from PRIMARY evidence.
+	if explicitID := exploreLocalizationExplicitTarget(task, targets); explicitID != "" {
+		for _, target := range targets {
+			if target.node != nil && target.node.ID == explicitID {
+				appendTarget(target)
+				break
+			}
+		}
+	}
 	// A graph-proven causal constructor and its owning type outrank the
 	// downstream retrieval seed. Their explicit admission metadata survives
 	// draft ranking, owner folding, and byte-budget packing, so this ordering is
@@ -3164,6 +3619,27 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 	for _, target := range targets {
 		if target.typedAnchorProjection {
 			appendTarget(target)
+		}
+	}
+	// A graph-proven change owner, bridge, and continuation outrank concept-only
+	// retrieval complements. The retrieval head remains first; this reservation
+	// only replaces non-causal tail rows when the final evidence window is full.
+	for _, target := range targets {
+		if target.causalChangeOwner {
+			appendTarget(target)
+			break
+		}
+	}
+	for _, target := range targets {
+		if target.causalChangeBridge {
+			appendTarget(target)
+			break
+		}
+	}
+	for _, target := range targets {
+		if target.causalChangeLeaf {
+			appendTarget(target)
+			break
 		}
 	}
 	// Concept reservations are weaker than exact, source-literal, typed, and
@@ -3288,11 +3764,16 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 		}
 		direct[target.node.ID] = target
 		if index < localizationDirectEvidenceReserve || target.node.ID == requiredID ||
+			target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
 			target.divergentDefaultOwner || target.divergentDefaultType || target.conceptImplementation || target.conceptComplement ||
-			target.exactContent || target.sourceLiteral || target.typedAnchorProjection {
+			target.exactContent || target.sourceLiteral || target.typedAnchorProjection ||
+			// Depth rows already paid for the tail they occupy; a relationship
+			// row must not reclaim the same slot a second time.
+			target.leadingFileDepth {
 			protected[target.node.ID] = struct{}{}
 		}
-		if target.node.ID == requiredID || target.divergentDefaultOwner || target.divergentDefaultType ||
+		if target.node.ID == requiredID || target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
+			target.divergentDefaultOwner || target.divergentDefaultType ||
 			target.conceptImplementation || target.conceptComplement ||
 			target.exactContent || target.sourceLiteral || target.typedAnchorProjection {
 			orderedPrefix = index + 1
@@ -3410,6 +3891,7 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 		if !exists {
 			relation = exploreTarget{node: best.node, localizationRelation: best.direction}
 		} else if relation.node.ID != requiredID &&
+			!relation.causalChangeBridge && !relation.causalChangeLeaf && !relation.causalChangeOwner &&
 			!relation.divergentDefaultOwner && !relation.divergentDefaultType &&
 			!relation.conceptImplementation && !relation.conceptComplement &&
 			!relation.exactContent && !relation.sourceLiteral && !relation.typedAnchorProjection {
@@ -3449,6 +3931,41 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 		}
 	}
 	return selected
+}
+
+// prioritizeLocalizationConceptComplement keeps the implementation pair close
+// enough for agents to interpret it as one unit. The semantic head and its
+// primary implementation retain ranks one and two; a later task-complementary
+// callable is stably rotated into rank three before the aligned wire projection
+// is packed. No row is added or removed.
+func prioritizeLocalizationConceptComplement(targets []exploreTarget) []exploreTarget {
+	if len(targets) < 3 {
+		return targets
+	}
+	hasLeadingImplementation := false
+	for index := 0; index < 2; index++ {
+		if targets[index].conceptImplementation {
+			hasLeadingImplementation = true
+			break
+		}
+	}
+	if !hasLeadingImplementation {
+		return targets
+	}
+	for index := 2; index < len(targets); index++ {
+		if !targets[index].conceptComplement {
+			continue
+		}
+		if index == 2 {
+			return targets
+		}
+		ordered := append([]exploreTarget(nil), targets...)
+		complement := ordered[index]
+		copy(ordered[3:index+1], ordered[2:index])
+		ordered[2] = complement
+		return ordered
+	}
+	return targets
 }
 
 func newLocalizationExploreResult(completion localizationCompletion, targets []exploreTarget, budget int) *mcp.CallToolResult {
@@ -3507,6 +4024,20 @@ func buildLocalizationRefinementResultForTask(
 	budget int,
 	routes map[string]localizationRefinementRoute,
 ) (*mcp.CallToolResult, localizationCompletion, map[string]localizationRefinementRoute, *localizationEvidenceDigest) {
+	return buildLocalizationRefinementResultForTaskWithOutline(
+		preferredSymbol, task, targets, budget, routes, nil,
+	)
+}
+
+// The outline variant additionally offers the leading file's declaration index
+// to whichever page this build settles on; see localization_file_outline.go.
+func buildLocalizationRefinementResultForTaskWithOutline(
+	preferredSymbol, task string,
+	targets []exploreTarget,
+	budget int,
+	routes map[string]localizationRefinementRoute,
+	outline func() *localizationFileOutline,
+) (*mcp.CallToolResult, localizationCompletion, map[string]localizationRefinementRoute, *localizationEvidenceDigest) {
 	choosePreferred := func(symbols []string, requested string) (string, []string, map[string]localizationRefinementRoute) {
 		authorized, bounded := boundedLocalizationRefinementRoutes(symbols, routes, requested)
 		if requested != "" {
@@ -3529,7 +4060,9 @@ func buildLocalizationRefinementResultForTask(
 	preferredSymbol, preauthorized, prebounded := choosePreferred(candidateSymbols, preferredSymbol)
 	if preferredSymbol == "" {
 		advisory := newLocalizationCompletion(true, "")
-		result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalized(advisory, task, targets, budget)
+		result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalizedWithOutline(
+			advisory, task, targets, budget, outline,
+		)
 		return result, packedCompletion, nil, digest
 	}
 
@@ -3539,8 +4072,8 @@ func buildLocalizationRefinementResultForTask(
 	budgetCompletion := newLocalizationRefinementCompletionForSymbols(preferredSymbol, preauthorized)
 	budgetCompletion.refinementRoutes = prebounded
 	var finalRoutes map[string]localizationRefinementRoute
-	result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalized(
-		budgetCompletion, task, targets, budget,
+	result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalizedWithOutline(
+		budgetCompletion, task, targets, budget, outline,
 		func(packed localizationExploreEnvelope) localizationCompletion {
 			packedPreferred, allowedSymbols, bounded := choosePreferred(packed.Symbols, preferredSymbol)
 			if packedPreferred == "" {
@@ -3565,6 +4098,19 @@ func buildLocalizationExploreResultForTaskFinalized(
 	budget int,
 	finalize ...localizationCompletionFinalizer,
 ) (*mcp.CallToolResult, []string, *localizationEvidenceDigest, localizationCompletion) {
+	return buildLocalizationExploreResultForTaskFinalizedWithOutline(
+		completion, task, targets, budget, nil, finalize...,
+	)
+}
+
+func buildLocalizationExploreResultForTaskFinalizedWithOutline(
+	completion localizationCompletion,
+	task string,
+	targets []exploreTarget,
+	budget int,
+	outline func() *localizationFileOutline,
+	finalize ...localizationCompletionFinalizer,
+) (*mcp.CallToolResult, []string, *localizationEvidenceDigest, localizationCompletion) {
 	var draft []exploreDraftEntry
 	if strings.TrimSpace(task) != "" {
 		draft = exploreAnswerDraft(task, targets)
@@ -3582,10 +4128,14 @@ func buildLocalizationExploreResultForTaskFinalized(
 	targets = localizationEvidenceTargetsFromDraft(task, requiredSymbol, targets, draft)
 	if refinementFirst {
 		targets = prioritizeLocalizationEvidenceTarget(requiredSymbol, targets)
+		// A divergent-default refinement is one causal unit: keep the prescribed
+		// constructor adjacent to its owning type before the named consumer.
+		targets = preserveExploreDivergentDefaultOrder(targets)
 	}
 	targets = interleaveLocalizationDirectRelationsWithRoutes(
 		task, requiredSymbol, targets, completion.refinementRoutes,
 	)
+	targets = prioritizeLocalizationConceptComplement(targets)
 	contract := localizationContractFor(completion)
 	envelope := localizationExploreEnvelope{
 		Completion: contract.Completion,
@@ -3820,6 +4370,14 @@ func buildLocalizationExploreResultForTaskFinalized(
 	contract = localizationContractReconciledWithDigest(envelope.Completion, digest)
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal
+	// A page that still asks the caller to choose gets the leading file's
+	// declaration index. The rows above name at most one symbol per file, so a
+	// caller looking at the right file and the wrong row has nothing to correct
+	// with; the outline is that file's remaining declarations, and it is the
+	// first thing given back when the budget cannot hold everything.
+	if outline != nil && localizationPageAcceptsOutline(envelope.Completion.State) {
+		envelope.Outline = outline()
+	}
 	// The ready-to-emit answer is derived from the retained rows, so it lands
 	// after the fit checks above and can push the envelope past its budget.
 	// Give back the weakest presented row first — the caller is asked to
@@ -3832,6 +4390,13 @@ func buildLocalizationExploreResultForTaskFinalized(
 		shedBudget = maxBytes + localizationRetiredReadAllowance(maxBytes)
 	}
 	for !localizationEnvelopeFits(envelope, shedBudget) {
+		if envelope.Outline != nil {
+			// The outline is a convenience over rows the caller can still reach
+			// by other means; every other payload here is evidence this
+			// response is answering with.
+			envelope.Outline = nil
+			continue
+		}
 		if digest != nil && len(digest.Evidence) > localizationFinalResponsePrimaryLimit {
 			digest.Evidence = digest.Evidence[:len(digest.Evidence)-1]
 			rebuildLocalizationDigestSkeleton(digest)
@@ -4572,18 +5137,48 @@ const (
 	exploreSourceLiteralTaskAlignSignal = "explore_source_literal_task_alignment"
 	exploreSourceLiteralReservationMax  = 2
 	exploreQuotedRecallMaxTerms         = 3
-	exploreQuotedRecallMaxPerTerm       = 12
-	exploreQuotedRecallRetryMaxRows     = 24
+	// Literals mined from code blocks may only take the slots prose left
+	// unclaimed, up to this total, so a task with no code block searches
+	// exactly as many terms as before.
+	exploreQuotedRecallMaxMinedTerms = 5
+	exploreQuotedRecallMaxPerTerm    = 12
+	exploreQuotedRecallRetryMaxRows  = 24
 )
 
 // exploreQuotedRecallTerms extracts only explicit, high-signal literal anchors
-// from prose. The ordinary symbol corpus intentionally excludes function bodies;
-// these literals are the bounded bridge to the existing source-content FTS for
-// errors, configuration values, protocol names, and other evidence that exists
-// only inside an implementation. Regex/pattern literals remain in the shaped
-// symbol query but are not sent to content recall because their punctuation
-// decomposes into noisy one-character terms.
+// from prose, then the literals mined from the task's code blocks. The ordinary
+// symbol corpus intentionally excludes function bodies; these literals are the
+// bounded bridge to the existing source-content FTS for errors, configuration
+// values, protocol names, and other evidence that exists only inside an
+// implementation. Regex/pattern literals remain in the shaped symbol query but
+// are not sent to content recall because their punctuation decomposes into
+// noisy one-character terms.
 func exploreQuotedRecallTerms(task string) []string {
+	seen := make(map[string]struct{}, exploreQuotedRecallMaxMinedTerms)
+	out := make([]string, 0, exploreQuotedRecallMaxMinedTerms)
+	out = admitExploreQuotedRecallTerms(task, exploreProseQuotedLiterals(task), out, seen, exploreQuotedRecallMaxTerms)
+	return admitExploreQuotedRecallTerms(
+		task, exploreFencedRecallLiterals(task), out, seen, exploreQuotedRecallMaxMinedTerms,
+	)
+}
+
+// exploreQuotedRecallClaimTerms returns only the literals the requester wrote
+// as prose. Terminality gates key on the requester's factual claim about the
+// source, never on a literal mined out of a pasted code block: mining is our
+// own inference, and an inference that retrieves nothing must not cost the
+// session a turn. Retrieval keeps using the full list.
+func exploreQuotedRecallClaimTerms(task string) []string {
+	return admitExploreQuotedRecallTerms(
+		task, exploreProseQuotedLiterals(task),
+		make([]string, 0, exploreQuotedRecallMaxTerms),
+		make(map[string]struct{}, exploreQuotedRecallMaxTerms),
+		exploreQuotedRecallMaxTerms,
+	)
+}
+
+// exploreProseQuotedLiterals returns every quoted span of the raw task, in
+// document order.
+func exploreProseQuotedLiterals(task string) []string {
 	literals := make([]string, 0, exploreQuotedRecallMaxTerms)
 	for _, match := range reInlineQuoted.FindAllString(task, -1) {
 		if len(match) >= 2 {
@@ -4606,12 +5201,30 @@ func exploreQuotedRecallTerms(task string) []string {
 		literals = append(literals, rest[:end])
 		rest = rest[end+1:]
 	}
+	return literals
+}
 
-	seen := make(map[string]struct{}, len(literals))
-	out := make([]string, 0, min(len(literals), exploreQuotedRecallMaxTerms))
+// admitExploreQuotedRecallTerms applies the shared acceptance policy — length,
+// noise, short-anchor intent, and case-folded deduplication — to one lane of
+// literal candidates and stops at the lane's cumulative limit.
+func admitExploreQuotedRecallTerms(
+	task string,
+	literals, out []string,
+	seen map[string]struct{},
+	limit int,
+) []string {
 	for _, literal := range literals {
+		if len(out) >= limit {
+			break
+		}
 		literal = strings.TrimSpace(literal)
 		if len(literal) < 2 || len(literal) > 128 || quotedLiteralIsNoise(literal) {
+			continue
+		}
+		// A span the opening delimiter never closed on its line is not a source
+		// literal: content FTS cannot match text that crosses a line break, and
+		// admitting it would spend a term slot the mined lines can use.
+		if strings.ContainsAny(literal, "\r\n") {
 			continue
 		}
 		if exploreTwoLetterQuotedAnchor(literal) && !exploreAllowsTwoLetterQuotedAnchor(task) {
@@ -4623,9 +5236,6 @@ func exploreQuotedRecallTerms(task string) []string {
 		}
 		seen[key] = struct{}{}
 		out = append(out, literal)
-		if len(out) >= exploreQuotedRecallMaxTerms {
-			break
-		}
 	}
 	return out
 }
@@ -4749,6 +5359,16 @@ func exploreQuotedRecallHasExactSourceNode(
 // a `spec/` directory), so the draft detector votes too — unless the request is
 // about test code or names this candidate outright, in which case the test node
 // is the answer and keeps its production slot.
+func exploreLocalizationTestLaneCandidate(query string, candidate *rerank.Candidate) bool {
+	if candidate == nil || candidate.Node == nil {
+		return false
+	}
+	if candidate.Signals[exploreSourceRangeSignal] > 0 {
+		return false
+	}
+	return exploreLocalizationTestLaneNode(query, candidate.Node)
+}
+
 func exploreLocalizationTestLaneNode(query string, node *graph.Node) bool {
 	if node == nil {
 		return false

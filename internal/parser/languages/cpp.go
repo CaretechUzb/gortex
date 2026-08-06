@@ -56,6 +56,9 @@ const qCppAll = `
       (function_declarator
         declarator: (identifier) @func.name))) @func.def
 
+  (template_declaration
+    (function_definition) @tmplfn.inner) @tmplfn.def
+
   (preproc_include
     path: (_) @include.path) @include.def
 
@@ -143,6 +146,9 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 
 			case m.Captures["enum.def"] != nil:
 				e.emitEnum(m, filePath, fileID, result, seen)
+
+			case m.Captures["tmplfn.def"] != nil:
+				e.emitTemplateFunction(m, filePath, fileID, src, result, seen)
 
 			case m.Captures["func.def"] != nil:
 				e.emitFunction(m, filePath, fileID, src, result, seen)
@@ -455,11 +461,38 @@ func (e *CppExtractor) emitEnum(m parser.QueryResult, filePath, fileID string, r
 // class method with a bare identifier declarator that was emitted
 // through addMethodFromNode — skip the duplicate.
 func (e *CppExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
-	name := m.Captures["func.name"].Text
 	def := m.Captures["func.def"]
 	startLine := def.StartLine + 1
 	lineKey := filePath + "::_method_L" + fmt.Sprint(startLine)
 	if seen[lineKey] {
+		return
+	}
+	if cppTemplateOwnsDefinition(def.Node) {
+		return
+	}
+	e.emitFreeFunction(m.Captures["func.name"].Text, def.Node, startLine, def.EndLine+1,
+		filePath, fileID, src, result, seen)
+}
+
+// emitTemplateFunction emits a free template function definition —
+// `template <typename Char> void vprintf(buffer<Char>&, …) {…}` at file or
+// namespace scope. Two things need the template_declaration rather than the
+// function_definition it wraps: the symbol's span has to cover the
+// `template <…>` header, and an explicit specialization declares itself with a
+// `render<char>` declarator, a form the plain function_definition patterns
+// never reach. A template member declared inside a class or struct body is not
+// a free function and keeps its existing emission path.
+func (e *CppExtractor) emitTemplateFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+	def, inner := m.Captures["tmplfn.def"], m.Captures["tmplfn.inner"]
+	if def == nil || inner == nil || inner.Node == nil || cppInsideTypeBody(inner.Node) {
+		return
+	}
+	e.emitFreeFunction(cppFreeTemplateFuncName(inner.Node, src), inner.Node,
+		def.StartLine+1, def.EndLine+1, filePath, fileID, src, result, seen)
+}
+
+func (e *CppExtractor) emitFreeFunction(name string, fnNode *sitter.Node, startLine, endLine int, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+	if name == "" {
 		return
 	}
 	id := filePath + "::" + name
@@ -471,24 +504,80 @@ func (e *CppExtractor) emitFunction(m parser.QueryResult, filePath, fileID strin
 	}
 	seen[id] = true
 	meta := map[string]any{}
-	if ns := enclosingCppNamespace(def.Node, src); ns != "" {
+	if ns := enclosingCppNamespace(fnNode, src); ns != "" {
 		meta["scope_ns"] = ns
 	}
 	// Free-function return type (smart-pointer-unwrapped) seeds chained-factory
 	// receiver inference for a bare factory call (`make_widget()->draw()`), the
 	// same way addMethodFromNode seeds `Foo::make().x()`.
-	if rt := cppReturnType(def.Node, src); rt != "" {
+	if rt := cppReturnType(fnNode, src); rt != "" {
 		meta["return_type"] = rt
 	}
-	stampCppSignature(meta, def.Node, src)
+	stampCppSignature(meta, fnNode, src)
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindFunction, Name: name,
-		FilePath: filePath, StartLine: startLine, EndLine: def.EndLine + 1,
+		FilePath: filePath, StartLine: startLine, EndLine: endLine,
 		Language: "cpp", Meta: meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine,
 	})
+}
+
+// cppTemplateOwnsDefinition reports whether a function_definition is emitted by
+// the template dispatch instead of the free-function one — true only for a free
+// template function, so members inside a class or struct body still come
+// through emitFunction.
+func cppTemplateOwnsDefinition(fn *sitter.Node) bool {
+	if fn == nil {
+		return false
+	}
+	p := fn.Parent()
+	return p != nil && p.Type() == "template_declaration" && !cppInsideTypeBody(fn)
+}
+
+// cppInsideTypeBody reports whether a node sits in a class / struct body, where
+// a definition is a member rather than a free function. The walk stops at the
+// first enclosing body-shaped ancestor so a member of a class nested in a
+// namespace is not mistaken for a namespace-scope definition.
+func cppInsideTypeBody(n *sitter.Node) bool {
+	if n == nil {
+		return false
+	}
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		switch p.Type() {
+		case "field_declaration_list":
+			return true
+		case "translation_unit", "namespace_definition", "declaration_list":
+			return false
+		}
+	}
+	return false
+}
+
+// cppFreeTemplateFuncName resolves the declarator name of a template function
+// definition. Beyond the declarator forms extractFuncName walks, an explicit
+// specialization names itself with a template_function declarator
+// (`render<char>`). A qualified declarator (`Holder<T>::put`) is an out-of-line
+// member, not a free function, so it yields no name here.
+func cppFreeTemplateFuncName(fn *sitter.Node, src []byte) string {
+	fd := cppFunctionDeclarator(fn.ChildByFieldName("declarator"))
+	if fd == nil {
+		return ""
+	}
+	for i, _nc := 0, int(fd.NamedChildCount()); i < _nc; i++ {
+		c := fd.NamedChild(i)
+		switch c.Type() {
+		case "identifier", "operator_name":
+			return c.Content(src)
+		case "template_function":
+			if n := c.ChildByFieldName("name"); n != nil {
+				return n.Content(src)
+			}
+			return ""
+		}
+	}
+	return ""
 }
 
 func (e *CppExtractor) emitInclude(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {

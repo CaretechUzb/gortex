@@ -733,6 +733,68 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	case "enum":
 		e.emitCSharpEnumMembers(def.Node, src, filePath, id, name, result, seen)
 	}
+	if kind == "record" {
+		e.emitCSharpRecordPositionalProps(id, name, def.Node, src, filePath, fileID, result, seen)
+	}
+}
+
+// emitCSharpRecordPositionalProps fabricates property member nodes for a
+// record's positional parameters — `record Medal(int Id, string Motto)`
+// synthesizes public properties Id and Motto with no declaration node
+// for the member walk to find, so the parameter list is the only source.
+// Runs at container emission, which precedes the body's member matches
+// in tree order: an explicit redeclaration of a positional property
+// (legal C# — it replaces the synthesized one) hits the seen guard and
+// stays a single node for the same logical member.
+func (e *CSharpExtractor) emitCSharpRecordPositionalProps(ownerID, ownerName string, decl *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	// The record's parameter_list is an unnamed child in this grammar —
+	// unlike method parameters, ChildByFieldName("parameters") finds
+	// nothing, so scan the direct children by type.
+	var params *sitter.Node
+	for i, _nc := 0, int(decl.NamedChildCount()); i < _nc; i++ {
+		if c := decl.NamedChild(i); c != nil && c.Type() == "parameter_list" {
+			params = c
+			break
+		}
+	}
+	if params == nil {
+		return
+	}
+	for i, _nc := 0, int(params.NamedChildCount()); i < _nc; i++ {
+		p := params.NamedChild(i)
+		if p == nil || p.Type() != "parameter" {
+			continue
+		}
+		nameNode := p.ChildByFieldName("name")
+		if nameNode == nil {
+			continue
+		}
+		pname := nameNode.Content(src)
+		id := filePath + "::" + ownerName + "." + pname
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		line := int(p.StartPoint().Row) + 1
+		meta := map[string]any{
+			"receiver":   ownerName,
+			"visibility": VisibilityPublic,
+			"kind":       "property",
+			"positional": true,
+		}
+		if t := p.ChildByFieldName("type"); t != nil {
+			meta["field_type"] = strings.TrimSpace(t.Content(src))
+		}
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindField, Name: pname,
+			FilePath: filePath, StartLine: line, EndLine: line,
+			Language: "csharp",
+			Meta:     meta,
+		})
+		result.Edges = append(result.Edges,
+			&graph.Edge{From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: line},
+			&graph.Edge{From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: line})
+	}
 }
 
 // emitCSharpEnumMembers emits one KindEnumMember per `enum_member_declaration`
@@ -1046,7 +1108,7 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	def := m.Captures["method.def"]
 	startLine1 := def.StartLine + 1
 
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
 		// Method outside a recognised container — legacy didn't emit
 		// these (its nested queries required class/struct/interface
@@ -1166,7 +1228,7 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	def := m.Captures["ctor.def"]
 	startLine1 := def.StartLine + 1
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "record_declaration")
 	if owner.kind == "" {
 		return
 	}
@@ -1208,7 +1270,7 @@ func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID
 
 func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	def := m.Captures["field.def"]
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
 		return
 	}
@@ -1275,7 +1337,7 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 
 func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	def := m.Captures["prop.def"]
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
 		return
 	}

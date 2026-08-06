@@ -565,6 +565,112 @@ func localizationFinalResponseBetterTaskScore(left, right localizationFinalRespo
 	return left.longest > right.longest
 }
 
+// localizationFinalResponseBareName is the identifier an answer is most likely
+// to reuse: the last segment of the row's name, stripped of its owner and file.
+// Two rows agreeing on it are the pair a caller can confuse.
+func localizationFinalResponseBareName(row localizationDigestRow) string {
+	name := strings.TrimSpace(row.Name)
+	if name == "" {
+		name = strings.TrimSpace(row.QualName)
+	}
+	if name == "" {
+		name = strings.TrimSpace(row.ID)
+	}
+	if cut := strings.LastIndex(name, "::"); cut >= 0 {
+		name = name[cut+2:]
+	}
+	if cut := strings.LastIndex(name, "."); cut >= 0 {
+		name = name[cut+1:]
+	}
+	return name
+}
+
+// localizationFinalResponseAnchorRank orders the provenance flags that can name
+// the file the page is actually about. A divergent default owner is the
+// strongest such claim, a causal literal callee next, then a proven
+// implementation target and a typed anchor projection.
+func localizationFinalResponseAnchorRank(provenance string) int {
+	switch provenance {
+	case localizationProvenanceDivergentDefault:
+		return 6
+	case localizationProvenanceSourceLiteralCallee:
+		return 5
+	case localizationProvenanceImplementationTarget:
+		return 4
+	case localizationProvenanceTypedAnchorProjection:
+		return 3
+	case localizationProvenanceDivergentDefaultType:
+		return 2
+	case localizationProvenancePermittedReadSource:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func localizationFinalResponseAnchorFile(rows []localizationDigestRow) string {
+	anchor, rank := "", 0
+	for _, row := range rows {
+		file := strings.TrimSpace(row.File)
+		if file == "" {
+			continue
+		}
+		if candidate := localizationFinalResponseAnchorRank(row.Provenance); candidate > rank {
+			anchor, rank = file, candidate
+		}
+		if anchor == "" {
+			// No provenance flag has spoken yet: the top-ranked row's file is the
+			// only thing the page knows about where the answer lives.
+			anchor = file
+		}
+	}
+	return anchor
+}
+
+// localizationFinalResponseHomonymOrder gives the first slot of each same-name
+// group to the row whose file the provenance chain points at. It reorders a
+// presentation copy only; retained evidence and its positional arrays are
+// untouched.
+func localizationFinalResponseHomonymOrder(rows []localizationDigestRow) []localizationDigestRow {
+	if len(rows) < 2 {
+		return rows
+	}
+	anchor := localizationFinalResponseAnchorFile(rows)
+	if anchor == "" {
+		return rows
+	}
+	counts := make(map[string]int, len(rows))
+	preferred := make(map[string]int, len(rows))
+	for index, row := range rows {
+		name := localizationFinalResponseBareName(row)
+		if name == "" {
+			continue
+		}
+		counts[name]++
+		if _, exists := preferred[name]; !exists && strings.TrimSpace(row.File) == anchor {
+			preferred[name] = index
+		}
+	}
+	ordered := make([]localizationDigestRow, 0, len(rows))
+	emitted := make([]bool, len(rows))
+	for index, row := range rows {
+		if emitted[index] {
+			continue
+		}
+		name := localizationFinalResponseBareName(row)
+		if target, exists := preferred[name]; exists && counts[name] > 1 && !emitted[target] {
+			ordered = append(ordered, rows[target])
+			emitted[target] = true
+		}
+		if emitted[index] {
+			continue
+		}
+		ordered = append(ordered, row)
+		emitted[index] = true
+	}
+	return ordered
+}
+
 func localizationFinalResponseNeighborContains(ids []string, id string) bool {
 	for _, candidate := range ids {
 		if strings.TrimSpace(candidate) == id {
@@ -597,6 +703,7 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 	if len(rows) == 0 {
 		return nil
 	}
+	rows = localizationFinalResponseHomonymOrder(rows)
 	primaries := make([]localizationDigestRow, 0, localizationFinalResponsePrimaryLimit)
 	supporting := make([]localizationDigestRow, 0, localizationFinalResponseSupportingLimit)
 	selected := make(map[string]struct{}, localizationFinalResponsePrimaryLimit+localizationFinalResponseSupportingLimit)
@@ -709,7 +816,7 @@ func renderLocalizationFinalResponse(rows []localizationDigestRow) string {
 func renderLocalizationFinalResponseForTask(task string, current, rows []localizationDigestRow) string {
 	presented := localizationFinalResponseRows(task, current, rows)
 	return renderLocalizationAnswerPage(presented, localizationAnswerHeading,
-		"No bounded localization evidence was found.", localizationAnswerReadyDirective)
+		"No bounded localization evidence was found.", localizationAnswerReadyDirective, true)
 }
 
 // renderLocalizationProvisionalResponseForTask renders the same rows for a
@@ -724,22 +831,55 @@ func renderLocalizationProvisionalResponseForTask(task string, current, rows []l
 	if len(presented) > localizationProvisionalRowLimit {
 		presented = presented[:localizationProvisionalRowLimit]
 	}
+	excerpts := true
 	for {
 		page := renderLocalizationAnswerPage(presented, localizationProvisionalHeading,
 			"No localization evidence has been retained for this request yet.",
-			localizationProvisionalDirective)
+			localizationProvisionalDirective, excerpts)
 		if len(page) <= localizationFinalResponseMaxBytes || len(presented) == 0 {
 			return page
+		}
+		if excerpts {
+			// An excerpt proves which declaration a row names; a row is the answer
+			// itself. Drop every excerpt before the first located identity.
+			excerpts = false
+			continue
 		}
 		presented = presented[:len(presented)-1]
 	}
 }
 
+// localizationFinalResponseExcerptMaxRunes bounds one declaration excerpt. The
+// excerpt exists to show which declaration a row names, not to reproduce it.
+const localizationFinalResponseExcerptMaxRunes = 200
+
+func localizationFinalResponseExcerpt(row localizationDigestRow) string {
+	return compactLocalizationField(
+		localizationFinalResponseField(row.Signature), localizationFinalResponseExcerptMaxRunes,
+	)
+}
+
+// localizationFinalResponseSymbolLabel keeps same-named rows distinguishable by
+// the identity string alone. Graph identities already embed their file, so this
+// only qualifies the bare identities a caller could otherwise not tell apart.
+func localizationFinalResponseSymbolLabel(row localizationDigestRow, qualify bool) string {
+	id := localizationFinalResponseField(row.ID)
+	file := localizationFinalResponseField(row.File)
+	if !qualify || id == "" || file == "" || strings.Contains(id, file) {
+		return id
+	}
+	return file + "::" + id
+}
+
 func renderLocalizationAnswerPage(
-	presented []localizationFinalResponseRow, heading, empty, directive string,
+	presented []localizationFinalResponseRow, heading, empty, directive string, excerpts bool,
 ) string {
 	if len(presented) == 0 {
 		return heading + "\n" + empty + "\n\n" + directive
+	}
+	homonyms := make(map[string]int, len(presented))
+	for _, item := range presented {
+		homonyms[localizationFinalResponseBareName(item.row)]++
 	}
 	var response strings.Builder
 	response.WriteString(heading)
@@ -750,12 +890,23 @@ func renderLocalizationAnswerPage(
 			role = "PRIMARY"
 		}
 		file := localizationFinalResponseField(item.row.File)
-		id := localizationFinalResponseField(item.row.ID)
+		id := localizationFinalResponseSymbolLabel(item.row,
+			homonyms[localizationFinalResponseBareName(item.row)] > 1)
 		if item.row.Line > 0 {
 			fmt.Fprintf(&response, "- %s — %s:%d — %s\n", role, file, item.row.Line, id)
+		} else {
+			fmt.Fprintf(&response, "- %s — %s — %s\n", role, file, id)
+		}
+		// The excerpt rides its own line so the role/file/symbol tuple stays one
+		// aligned, parseable row.
+		if !excerpts || !item.primary {
 			continue
 		}
-		fmt.Fprintf(&response, "- %s — %s — %s\n", role, file, id)
+		if excerpt := localizationFinalResponseExcerpt(item.row); excerpt != "" {
+			response.WriteString("  ")
+			response.WriteString(excerpt)
+			response.WriteString("\n")
+		}
 	}
 	response.WriteString("\n")
 	response.WriteString(directive)
@@ -774,6 +925,12 @@ func refreshLocalizationDigestResponses(digest *localizationEvidenceDigest, task
 	digest.provisionalResponse = renderLocalizationProvisionalResponseForTask(task, current, digest.Evidence)
 }
 
+// localizationAnswerClaimDiscipline closes the remaining gap between a page
+// that names the right symbol and an answer that does. It rides the terminal
+// directive only: a page still prescribing a step must keep asking for that
+// step, and the refinement contract it carries is byte-budgeted.
+const localizationAnswerClaimDiscipline = "Name only symbols this page lists or a permitted call already returned."
+
 // The directive is the only instruction the caller sees on a terminal page, so
 // it names the one failure mode measurement keeps finding: an answer that
 // paraphrases the located identifier into a neighbouring one it inferred from
@@ -788,7 +945,7 @@ func refreshLocalizationDigestResponses(digest *localizationEvidenceDigest, task
 // caller's own statements against 2% on pages without it. Ask for the answer,
 // name what the answer should carry, and leave the caller free to disagree —
 // its disagreement is right more often than not.
-const localizationAnswerReadyDirective = "Localization for this task is complete. Answer now from this evidence, naming the files and symbols you rely on. If it does not fit the request, say so and name what does — your judgement about the code is welcome, another navigation call is not."
+const localizationAnswerReadyDirective = "Localization for this task is complete. Answer now from this evidence, naming the files and symbols you rely on. If it does not fit the request, say so and name what does — your judgement about the code is welcome, another navigation call is not. " + localizationAnswerClaimDiscipline
 
 const (
 	localizationAnswerHeading      = "LOCALIZATION:"

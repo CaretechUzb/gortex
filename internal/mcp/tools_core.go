@@ -837,6 +837,21 @@ func stripNonDefinitionNodes(sg *query.SubGraph) *query.SubGraph {
 	}
 }
 
+// fileDefinitionNodes enumerates one file's declared symbols through the same
+// graph query and definition filter get_file_summary answers from, without the
+// tool layer's freshness, encoding, and accounting passes. The path must
+// already be in the graph's stored form.
+func fileDefinitionNodes(eng *query.Engine, filePath string) []*graph.Node {
+	if eng == nil || strings.TrimSpace(filePath) == "" {
+		return nil
+	}
+	sg := stripNonDefinitionNodes(eng.GetFileSymbols(filePath))
+	if sg == nil {
+		return nil
+	}
+	return sg.Nodes
+}
+
 // compactSubGraph formats a SubGraph as compact text.
 func compactSubGraph(sg *query.SubGraph) string {
 	var b strings.Builder
@@ -1960,6 +1975,31 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 	if nextCursor != "" {
 		resp["next_cursor"] = nextCursor
+	}
+	// Exact-identifier miss recovery. An identifier that no extractor turned
+	// into a symbol (macro-generated, string-embedded, or simply missed) still
+	// occurs verbatim in indexed content, and a page the caller learns nothing
+	// from is the only thing the symbol channel can offer. Run one bounded
+	// literal search and return the hits in a separate, explicitly non-symbol
+	// section.
+	//
+	// A decomposition rescue counts as the same miss: it runs only after every
+	// earlier tier returned nothing for the exact query, so its rows are
+	// leaf-token neighbours of the identifier rather than the identifier. Most
+	// real identifiers carry a separator or a camelCase boundary, so gating on
+	// a literally empty page alone would leave the recovery unreachable.
+	//
+	// A kind / flavor narrowing forbids it — a raw content line has no node
+	// kind to satisfy. The section rides its own field: `results`, `total`,
+	// and the graph page captured for the localization recovery contract above
+	// are all untouched, so an empty typed page still reads as empty to every
+	// contract check.
+	if (total == 0 || decomposed) && kindArg == "" && flavorArg == "" {
+		if term, identifier := searchSymbolsContentFallbackTerm(q); identifier {
+			if section := s.searchSymbolsContentFallback(ctx, term, resolved, scope); section != nil {
+				resp["content_matches"] = section
+			}
+		}
 	}
 	// A repo-narrowed zero is indistinguishable from "not indexed" in
 	// clients that never render _meta. Say it in the body — and since the
