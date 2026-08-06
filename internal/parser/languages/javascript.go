@@ -23,6 +23,9 @@ const qJSAll = `
   (function_declaration
     name: (identifier) @func.name) @func.def
 
+  (function_expression
+    name: (identifier) @fnexpr.name) @fnexpr.def
+
   (lexical_declaration
     (variable_declarator
       name: (identifier) @arrow.name
@@ -171,6 +174,9 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 
 		case m.Captures["func.def"] != nil:
 			e.emitFunction(m, filePath, fileID, src, result, seenIDs)
+
+		case m.Captures["fnexpr.def"] != nil:
+			e.emitFunctionExpression(m, filePath, fileID, src, result, seenIDs)
 
 		case m.Captures["arrow.def"] != nil:
 			e.emitArrow(m, filePath, fileID, src, result, arrowNames, seenIDs)
@@ -467,8 +473,25 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 // --- Per-match emit helpers -----------------------------------------
 
 func (e *JavaScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool) {
-	name := m.Captures["func.name"].Text
-	def := m.Captures["func.def"]
+	e.emitNamedFunction(m.Captures["func.name"], m.Captures["func.def"], filePath, fileID, src, result, seenIDs)
+}
+
+// emitFunctionExpression emits a *named* function expression — the
+// binding-independent name in `const x = function foo() {…}`,
+// `module.exports = function foo() {…}`, `{ key: function foo() {…} }`
+// or `export default flag && function foo() {…}`. The grammar gives a
+// named expression the same name/parameters/body shape as a
+// declaration, so it emits through the same path. Anonymous function
+// expressions carry no name field and never match the query pattern.
+func (e *JavaScriptExtractor) emitFunctionExpression(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool) {
+	e.emitNamedFunction(m.Captures["fnexpr.name"], m.Captures["fnexpr.def"], filePath, fileID, src, result, seenIDs)
+}
+
+func (e *JavaScriptExtractor) emitNamedFunction(nameCap, def *parser.CapturedNode, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool) {
+	if nameCap == nil || def == nil {
+		return
+	}
+	name := nameCap.Text
 	id, ok := disambiguateID(seenIDs, filePath+"::"+name, def.StartLine+1)
 	if !ok {
 		return
