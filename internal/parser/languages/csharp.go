@@ -1018,7 +1018,7 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	def := m.Captures["method.def"]
 	startLine1 := def.StartLine + 1
 
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
 		// Method outside a recognised container — legacy didn't emit
 		// these (its nested queries required class/struct/interface
@@ -1138,7 +1138,7 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	def := m.Captures["ctor.def"]
 	startLine1 := def.StartLine + 1
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "record_declaration")
 	if owner.kind == "" {
 		return
 	}
@@ -1180,7 +1180,7 @@ func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID
 
 func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	def := m.Captures["field.def"]
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
 		return
 	}
@@ -1247,7 +1247,7 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 
 func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	def := m.Captures["prop.def"]
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
 		return
 	}
