@@ -17,10 +17,15 @@ type sessionScope struct {
 	CWD       string
 }
 
-// hookTrackedReposFn is the daemon's tracked-repo list, injectable so tests
+// hookTrackedReposFn is the tracked-repo list, injectable so tests
 // never dial a real daemon.
-var hookTrackedReposFn = cachedTrackedRepos
+// Reads the local registry (see tracked_repos_config.go) and only falls back
+// to a daemon round trip when that file cannot be established.
+var hookTrackedReposFn = configTrackedRepos
 
+// cachedTrackedRepos is the daemon-backed registry: the fallback for
+// configTrackedRepos, and still the direct source for callers that need the
+// live per-repo counters the config cannot supply.
 func cachedTrackedRepos() []daemon.TrackedRepoStatus {
 	status, err := cachedDaemonStatus()
 	if err != nil || status == nil {
