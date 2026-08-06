@@ -29,7 +29,10 @@ type exploreArtifactIntent struct {
 	probes        []string
 }
 
-type exploreArtifactProbeCandidate struct {
+// exploreTaskProbe is one distinctive span a task spells out, ranked by how
+// unlikely it is to appear by accident. The artifact lane greps for it; the
+// source lane matches it against candidate paths.
+type exploreTaskProbe struct {
 	value    string
 	priority int
 	order    int
@@ -180,8 +183,24 @@ func canonicalExploreArtifactWord(word string) string {
 	}
 }
 
+// rankedExploreArtifactProbes is the artifact lane's view of the shared probe
+// ranking: the values only, bounded by what a content grep can afford.
 func rankedExploreArtifactProbes(task string, seen map[string]struct{}) []string {
-	candidates := make(map[string]exploreArtifactProbeCandidate)
+	ranked := rankedExploreTaskProbes(task, seen, exploreArtifactProbeLimit)
+	out := make([]string, 0, len(ranked))
+	for _, probe := range ranked {
+		out = append(out, probe.value)
+	}
+	return out
+}
+
+// rankedExploreTaskProbes ranks the task's distinctive spans — property
+// arguments, assignments, quoted spans, flags and environment names — highest
+// priority first, then earliest mention. Terms already consumed as paths are
+// skipped, and every emitted probe is marked in seen so no later lane re-derives
+// it. The probes are pure task text: no graph, index or file access.
+func rankedExploreTaskProbes(task string, seen map[string]struct{}, limit int) []exploreTaskProbe {
+	candidates := make(map[string]exploreTaskProbe)
 	add := func(value string, priority, order int) {
 		value = strings.TrimSpace(strings.Trim(value, "`'\""))
 		if len(value) < 2 || exploreArtifactFile(value) || strings.EqualFold(value, "CI") {
@@ -191,7 +210,7 @@ func rankedExploreArtifactProbes(task string, seen map[string]struct{}) []string
 		if _, exists := seen[key]; exists {
 			return
 		}
-		candidate := exploreArtifactProbeCandidate{value: value, priority: priority, order: order}
+		candidate := exploreTaskProbe{value: value, priority: priority, order: order}
 		if current, exists := candidates[key]; exists &&
 			(current.priority > candidate.priority || (current.priority == candidate.priority && current.order <= candidate.order)) {
 			return
@@ -230,7 +249,7 @@ func rankedExploreArtifactProbes(task string, seen map[string]struct{}) []string
 		}
 		add(trimmed, priority, match[0])
 	}
-	ordered := make([]exploreArtifactProbeCandidate, 0, len(candidates))
+	ordered := make([]exploreTaskProbe, 0, len(candidates))
 	for _, candidate := range candidates {
 		ordered = append(ordered, candidate)
 	}
@@ -243,14 +262,13 @@ func rankedExploreArtifactProbes(task string, seen map[string]struct{}) []string
 		}
 		return ordered[i].value < ordered[j].value
 	})
-	out := make([]string, 0, exploreArtifactProbeLimit)
+	out := make([]exploreTaskProbe, 0, limit)
 	for _, candidate := range ordered {
-		key := strings.ToLower(candidate.value)
-		seen[key] = struct{}{}
-		out = append(out, candidate.value)
-		if len(out) == exploreArtifactProbeLimit {
+		if len(out) == limit {
 			break
 		}
+		seen[strings.ToLower(candidate.value)] = struct{}{}
+		out = append(out, candidate)
 	}
 	return out
 }

@@ -40,10 +40,12 @@ func exploreLeadingFileDepthBudget(limit int) int {
 // exploreLeadingRankedFile names the file a ranked pool has settled on, or ""
 // when ranking is still scattered. The top-ranked candidate's file leads once
 // the window corroborates it with a second hit; otherwise only a strict
-// majority of the window counts, which at most one file can hold.
+// majority of the window counts, which at most one file can hold. A window in
+// which no file repeats is decided — if at all — by the task's own path probes.
 func exploreLeadingRankedFile(ranked []*rerank.Candidate) string {
 	files := make([]string, 0, exploreLeadingFileDepthWindow)
 	counts := make(map[string]int, exploreLeadingFileDepthWindow)
+	probed := make(map[string]int, exploreLeadingFileDepthWindow)
 	for _, candidate := range ranked {
 		if len(files) >= exploreLeadingFileDepthWindow {
 			break
@@ -51,8 +53,12 @@ func exploreLeadingRankedFile(ranked []*rerank.Candidate) string {
 		if candidate == nil || candidate.Node == nil || candidate.Node.FilePath == "" {
 			continue
 		}
-		files = append(files, candidate.Node.FilePath)
-		counts[candidate.Node.FilePath]++
+		file := candidate.Node.FilePath
+		files = append(files, file)
+		counts[file]++
+		if score := explorePathProbeScore(candidate); score > probed[file] {
+			probed[file] = score
+		}
 	}
 	if len(files) == 0 {
 		return ""
@@ -65,7 +71,26 @@ func exploreLeadingRankedFile(ranked []*rerank.Candidate) string {
 			return file
 		}
 	}
-	return ""
+	return exploreProbeCorroboratedLeadingFile(files, probed)
+}
+
+// exploreProbeCorroboratedLeadingFile elects the one window file the task
+// corroborates better than every other. Ranking has already declined to choose
+// here, so a shared best score decides nothing and leaves the window scattered.
+func exploreProbeCorroboratedLeadingFile(files []string, probed map[string]int) string {
+	best, bestScore, tied := "", 0, false
+	for _, file := range files {
+		switch score := probed[file]; {
+		case score > bestScore:
+			best, bestScore, tied = file, score, false
+		case score == bestScore && file != best:
+			tied = true
+		}
+	}
+	if bestScore <= 0 || tied {
+		return ""
+	}
+	return best
 }
 
 // reserveExploreLeadingFileDepthTargets admits the leading file's highest-ranked

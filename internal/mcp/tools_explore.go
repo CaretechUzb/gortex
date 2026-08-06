@@ -2652,9 +2652,16 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// intentionally optimized for source symbols and may discard the exact
 	// paths, keys, flags, and environment names needed by config/CI searches.
 	artifactIntent := classifyExploreArtifactIntent(task)
+	localize := req.GetBool("localize", false)
+	// The same ranked spans, derived once, applied to source candidate paths.
+	// Ordinary exploration keeps the zero value and so corroborates nothing.
+	var pathProbes explorePathProbes
+	if localize {
+		pathProbes = newExplorePathProbes(task)
+	}
 	maxSymbols := clampInt(req.GetInt("max_symbols", exploreDefaultMaxSymbols), 1, exploreMaxMaxSymbols)
 	defaultBudget := exploreDefaultBudgetTokens
-	if req.GetBool("localize", false) {
+	if localize {
 		defaultBudget = localizationDefaultBudgetTokens
 	}
 	budget := clampInt(req.GetInt("token_budget", defaultBudget), exploreMinBudgetTokens, exploreMaxBudgetTokens)
@@ -2806,6 +2813,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			prod = append(prod, c)
 		}
 	}
+	// One bounded string pass over the ranked prefix, so the selection cut and
+	// the leading-file election both read a score computed once.
+	stampExplorePathProbeScores(prod, pathProbes)
 	// Natural-language localization can retrieve large exact-name collision
 	// sets (`client` fields, `Validate` methods, generated accessors). BM25 is
 	// right that each item matches, but a useful neighborhood needs distinct
@@ -2827,13 +2837,19 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// ranking left it.
 	var localizationRankedPool []*rerank.Candidate
 	if exploreShouldDiversifyByFile(queryClass) {
-		if req.GetBool("localize", false) {
+		if localize {
 			localizationRankedPool = append([]*rerank.Candidate(nil), prod...)
 		}
 		_, prod = diversifyByFile(prodNodes, prod, defaultMaxPerFile)
 	}
 	prod, protectedImplementationID := reserveExploreConceptImplementation(searchQuery, queryClass, prod, maxSymbols)
 	prod = reserveExploreComponentConjunction(searchQuery, queryClass, prod, maxSymbols)
+	// Path corroboration decides only what the cut was about to drop: one better
+	// corroborated row below it replaces the weakest row no lane reserved.
+	prod = liftExplorePathProbeCandidates(
+		prod, maxSymbols,
+		exploreFinalReservedCandidateIDs(prod, protectedSyntacticAnchors, protectedImplementationID),
+	)
 	cands := selectFinalExploreCandidates(prod, test, maxSymbols)
 	if len(protectedSyntacticAnchors) > 0 {
 		// Source-literal selection owns its own final-slot guarantees. Re-union
@@ -2862,7 +2878,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		cands, protectedSyntacticAnchors, protectedImplementationID,
 	)
 	if len(cands) == 0 && len(artifactLane.targets) == 0 {
-		if req.GetBool("localize", false) {
+		if localize {
 			return s.completeEmptyLocalization(ctx, task, budget), nil
 		}
 		return mcp.NewToolResultText(fmt.Sprintf(
@@ -2994,7 +3010,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// structured responses can reserve a source body without a broad read.
 	targets = s.materializeExploreStructuralSource(ctx, task, targets, opts)
 
-	if !req.GetBool("localize", false) {
+	if !localize {
 		return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
 	}
 	symbolTargets = targets[len(artifactTargets):]
