@@ -39,7 +39,11 @@ const exploreToolDescription = "Start here for any task, bug report, or " +
 // corpus, query vocabulary, or benchmark. The verb takes arbitrary free
 // text; nothing here is derived from a fixed task set.
 const (
-	exploreDefaultBudgetTokens             = 1600
+	exploreDefaultBudgetTokens = 1600
+	// localizationDefaultBudgetTokens is the localize-path default. Its
+	// envelope pays for ranked rows and the leading file's outline out of one
+	// budget, where explore(task) prose pays for rows alone.
+	localizationDefaultBudgetTokens        = 2400
 	exploreMinBudgetTokens                 = 1000
 	exploreMaxBudgetTokens                 = 24000
 	exploreDefaultMaxSymbols               = 10
@@ -2649,7 +2653,11 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// paths, keys, flags, and environment names needed by config/CI searches.
 	artifactIntent := classifyExploreArtifactIntent(task)
 	maxSymbols := clampInt(req.GetInt("max_symbols", exploreDefaultMaxSymbols), 1, exploreMaxMaxSymbols)
-	budget := clampInt(req.GetInt("token_budget", exploreDefaultBudgetTokens), exploreMinBudgetTokens, exploreMaxBudgetTokens)
+	defaultBudget := exploreDefaultBudgetTokens
+	if req.GetBool("localize", false) {
+		defaultBudget = localizationDefaultBudgetTokens
+	}
+	budget := clampInt(req.GetInt("token_budget", defaultBudget), exploreMinBudgetTokens, exploreMaxBudgetTokens)
 
 	resolved, errResult := s.resolveScope(ctx, req, IntentLocate)
 	if errResult != nil {
@@ -3034,6 +3042,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		},
 	)
 	targets = append(targets[:len(artifactTargets):len(artifactTargets)], pageTargets...)
+	// The same leading file, indexed rather than ranked. The enumeration is
+	// deferred: only a page that stays non-terminal pays for it, and it pays
+	// once however many envelopes this request packs.
+	pageOutline := localizationLeadingFileOutlineProvider(
+		localizationRankedPool, pageTargets,
+		func(file string) []*graph.Node { return fileDefinitionNodes(eng, file) },
+	)
 	// File evidence can make localization answer-ready, but it never becomes a
 	// synthetic exact-symbol read. Exact reads remain declaration-only.
 	exactSymbol := exploreLocalizationExplicitTarget(task, symbolTargets)
@@ -3066,8 +3081,8 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		preferredSymbol := explorePreferredRoutedRefinementSymbol(
 			preferred, symbolTargets, routes,
 		)
-		result, refinement, boundedRoutes, digest := buildLocalizationRefinementResultForTask(
-			preferredSymbol, task, targets, budget, routes,
+		result, refinement, boundedRoutes, digest := buildLocalizationRefinementResultForTaskWithOutline(
+			preferredSymbol, task, targets, budget, routes, pageOutline,
 		)
 		if refinement.State != localizationStateNeedsRefinement {
 			refinement.digest = digest
@@ -3089,7 +3104,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// and is retained for post-terminal replay — for the exact-read contract
 	// too, whose success promotes to answer_ready with the evidence already
 	// stashed.
-	result, _, digest, completion := buildLocalizationExploreResultForTaskFinalized(completion, task, targets, budget)
+	result, _, digest, completion := buildLocalizationExploreResultForTaskFinalizedWithOutline(
+		completion, task, targets, budget, pageOutline,
+	)
 	// Literal-driven terminality must show its evidence: when the verdict
 	// rests on a quoted-literal match but the budgeted envelope shed the
 	// literal, downgrade to the bounded refinement read instead of telling
@@ -3101,8 +3118,8 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		preferredSymbol := explorePreferredRoutedRefinementSymbol(
 			explorePreferredRefinementSymbol(task, symbolTargets), symbolTargets, routes,
 		)
-		refined, refinement, boundedRoutes, refinedDigest := buildLocalizationRefinementResultForTask(
-			preferredSymbol, task, targets, budget, routes,
+		refined, refinement, boundedRoutes, refinedDigest := buildLocalizationRefinementResultForTaskWithOutline(
+			preferredSymbol, task, targets, budget, routes, pageOutline,
 		)
 		if refinement.State != localizationStateNeedsRefinement {
 			refinement.digest = refinedDigest
@@ -3130,11 +3147,12 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 // explicit localization-only request. Ordinary explore(task) retains the
 // human-oriented legacy rendering; localize does not duplicate it.
 type localizationExploreEnvelope struct {
-	Completion localizationCompletion `json:"completion"`
-	Terminal   bool                   `json:"terminal"`
-	Files      []string               `json:"files"`
-	Symbols    []string               `json:"symbols"`
-	Evidence   []localizationEvidence `json:"evidence"`
+	Completion localizationCompletion   `json:"completion"`
+	Terminal   bool                     `json:"terminal"`
+	Files      []string                 `json:"files"`
+	Symbols    []string                 `json:"symbols"`
+	Evidence   []localizationEvidence   `json:"evidence"`
+	Outline    *localizationFileOutline `json:"outline,omitempty"`
 }
 
 type localizationEvidence struct {
@@ -3990,6 +4008,20 @@ func buildLocalizationRefinementResultForTask(
 	budget int,
 	routes map[string]localizationRefinementRoute,
 ) (*mcp.CallToolResult, localizationCompletion, map[string]localizationRefinementRoute, *localizationEvidenceDigest) {
+	return buildLocalizationRefinementResultForTaskWithOutline(
+		preferredSymbol, task, targets, budget, routes, nil,
+	)
+}
+
+// The outline variant additionally offers the leading file's declaration index
+// to whichever page this build settles on; see localization_file_outline.go.
+func buildLocalizationRefinementResultForTaskWithOutline(
+	preferredSymbol, task string,
+	targets []exploreTarget,
+	budget int,
+	routes map[string]localizationRefinementRoute,
+	outline func() *localizationFileOutline,
+) (*mcp.CallToolResult, localizationCompletion, map[string]localizationRefinementRoute, *localizationEvidenceDigest) {
 	choosePreferred := func(symbols []string, requested string) (string, []string, map[string]localizationRefinementRoute) {
 		authorized, bounded := boundedLocalizationRefinementRoutes(symbols, routes, requested)
 		if requested != "" {
@@ -4012,7 +4044,9 @@ func buildLocalizationRefinementResultForTask(
 	preferredSymbol, preauthorized, prebounded := choosePreferred(candidateSymbols, preferredSymbol)
 	if preferredSymbol == "" {
 		advisory := newLocalizationCompletion(true, "")
-		result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalized(advisory, task, targets, budget)
+		result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalizedWithOutline(
+			advisory, task, targets, budget, outline,
+		)
 		return result, packedCompletion, nil, digest
 	}
 
@@ -4022,8 +4056,8 @@ func buildLocalizationRefinementResultForTask(
 	budgetCompletion := newLocalizationRefinementCompletionForSymbols(preferredSymbol, preauthorized)
 	budgetCompletion.refinementRoutes = prebounded
 	var finalRoutes map[string]localizationRefinementRoute
-	result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalized(
-		budgetCompletion, task, targets, budget,
+	result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalizedWithOutline(
+		budgetCompletion, task, targets, budget, outline,
 		func(packed localizationExploreEnvelope) localizationCompletion {
 			packedPreferred, allowedSymbols, bounded := choosePreferred(packed.Symbols, preferredSymbol)
 			if packedPreferred == "" {
@@ -4046,6 +4080,19 @@ func buildLocalizationExploreResultForTaskFinalized(
 	task string,
 	targets []exploreTarget,
 	budget int,
+	finalize ...localizationCompletionFinalizer,
+) (*mcp.CallToolResult, []string, *localizationEvidenceDigest, localizationCompletion) {
+	return buildLocalizationExploreResultForTaskFinalizedWithOutline(
+		completion, task, targets, budget, nil, finalize...,
+	)
+}
+
+func buildLocalizationExploreResultForTaskFinalizedWithOutline(
+	completion localizationCompletion,
+	task string,
+	targets []exploreTarget,
+	budget int,
+	outline func() *localizationFileOutline,
 	finalize ...localizationCompletionFinalizer,
 ) (*mcp.CallToolResult, []string, *localizationEvidenceDigest, localizationCompletion) {
 	var draft []exploreDraftEntry
@@ -4307,6 +4354,14 @@ func buildLocalizationExploreResultForTaskFinalized(
 	contract = localizationContractReconciledWithDigest(envelope.Completion, digest)
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal
+	// A page that still asks the caller to choose gets the leading file's
+	// declaration index. The rows above name at most one symbol per file, so a
+	// caller looking at the right file and the wrong row has nothing to correct
+	// with; the outline is that file's remaining declarations, and it is the
+	// first thing given back when the budget cannot hold everything.
+	if outline != nil && localizationPageAcceptsOutline(envelope.Completion.State) {
+		envelope.Outline = outline()
+	}
 	// The ready-to-emit answer is derived from the retained rows, so it lands
 	// after the fit checks above and can push the envelope past its budget.
 	// Give back the weakest presented row first — the caller is asked to
@@ -4319,6 +4374,13 @@ func buildLocalizationExploreResultForTaskFinalized(
 		shedBudget = maxBytes + localizationRetiredReadAllowance(maxBytes)
 	}
 	for !localizationEnvelopeFits(envelope, shedBudget) {
+		if envelope.Outline != nil {
+			// The outline is a convenience over rows the caller can still reach
+			// by other means; every other payload here is evidence this
+			// response is answering with.
+			envelope.Outline = nil
+			continue
+		}
 		if digest != nil && len(digest.Evidence) > localizationFinalResponsePrimaryLimit {
 			digest.Evidence = digest.Evidence[:len(digest.Evidence)-1]
 			rebuildLocalizationDigestSkeleton(digest)
