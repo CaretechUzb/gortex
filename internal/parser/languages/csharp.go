@@ -86,6 +86,18 @@ const qCSharpAll = `
         name: (identifier) @callm.method))) @callm.expr
 
   (invocation_expression
+    function: (conditional_access_expression
+      "this"
+      (member_binding_expression
+        name: (identifier) @callself.method))) @callself.expr
+
+  (invocation_expression
+    function: (conditional_access_expression
+      "base"
+      (member_binding_expression
+        name: (identifier) @callbase.method))) @callbase.expr
+
+  (invocation_expression
     function: (member_access_expression
       "this"
       name: (identifier) @callself.method)) @callself.expr
