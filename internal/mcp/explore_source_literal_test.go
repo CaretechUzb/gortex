@@ -1017,7 +1017,7 @@ func TestSearchExploreSourceLiteralFallsBackWhenMultiIndexerDoesNotOwnRepo(t *te
 	server := &Server{graph: store, indexer: idx, multiIndexer: multi}
 
 	search := server.searchExploreSourceLiteral(
-		context.Background(), "ku", "", query.QueryOptions{},
+		context.Background(), "ku", "", query.QueryOptions{}, exploreSourceLiteralRecallMaxHits,
 	)
 
 	require.Len(t, search.matches, 1)
@@ -1054,7 +1054,7 @@ func TestSearchExploreSourceLiteralDoesNotCrossConfiguredRepository(t *testing.T
 	server := &Server{graph: store, indexer: direct, multiIndexer: multi}
 
 	search := server.searchExploreSourceLiteral(
-		context.Background(), "ku", "repo-b", query.QueryOptions{},
+		context.Background(), "ku", "repo-b", query.QueryOptions{}, exploreSourceLiteralRecallMaxHits,
 	)
 
 	require.Empty(t, search.matches, "unresolved multi-repo scope must not scan the direct backend")
