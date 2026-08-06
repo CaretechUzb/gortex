@@ -203,7 +203,10 @@ func assertQualNameLookupParity(t *testing.T, store *Store) {
 	for _, qualName := range []string{"pkg.Alpha", "pkg.Middle", "pkg.Zeta"} {
 		want := store.GetNodeByQualName(qualName)
 		if want == nil {
+			// Explicit return so the dereference below is provably
+			// nil-safe rather than safe only by Fatalf convention.
 			t.Fatalf("individual lookup unexpectedly missed %q", qualName)
+			return
 		}
 		nodes := got[qualName]
 		if len(nodes) == 0 || nodes[0] == nil || nodes[0].ID != want.ID {

@@ -116,7 +116,10 @@ func TestSQLiteEdgeCandidateLookupIsPredicateShapedAndLossless(t *testing.T) {
 
 	endpoint := candidates.Endpoint("a", "b")
 	if endpoint == nil {
+		// Explicit return so the dereference below is provably nil-safe
+		// rather than safe only by Fatal convention.
 		t.Fatal("exact endpoint candidate was not returned")
+		return
 	}
 	if got := endpoint.Meta["keep"]; got != "endpoint" {
 		t.Fatalf("endpoint metadata was not preserved: got %v", got)

@@ -706,7 +706,13 @@ func testDuplicateQualNameAcrossRepos(t *testing.T, factory Factory) {
 	for _, want := range []*graph.Node{first, second} {
 		got := s.GetNode(want.ID)
 		if got == nil {
+			// Fatalf ends the test, but static analysis reasons about the
+			// testing helper as an ordinary call and reads the field access
+			// below as reachable with a nil pointer. The explicit return
+			// makes the dereference provably safe instead of conventionally
+			// safe — same rule at every bail-out-then-dereference below.
 			t.Fatalf("GetNode(%q) = nil after adding the same qual_name in another repo", want.ID)
+			return
 		}
 		if got.RepoPrefix != want.RepoPrefix {
 			t.Fatalf("GetNode(%q).RepoPrefix = %q, want %q", want.ID, got.RepoPrefix, want.RepoPrefix)
@@ -1362,6 +1368,7 @@ func testNodeLightScanner(t *testing.T, factory Factory) {
 	}
 	if lightA == nil {
 		t.Fatal("AllNodesLight did not return A")
+		return
 	}
 	if lightA.Kind != a.Kind || lightA.Name != a.Name || lightA.QualName != a.QualName ||
 		lightA.FilePath != a.FilePath || lightA.StartLine != a.StartLine || lightA.EndLine != a.EndLine ||
@@ -1420,6 +1427,7 @@ func testLightEdgeScanner(t *testing.T, factory Factory) {
 	// Promoted fields survive the meta-less scan.
 	if lightCall == nil {
 		t.Fatal("AllEdgesLight did not return the call edge")
+		return
 	}
 	if lightCall.Line != 11 || lightCall.Confidence != 0.75 || lightCall.Origin != graph.OriginLSPResolved ||
 		lightCall.Tier != "lsp" || !lightCall.CrossRepo {
@@ -4336,6 +4344,7 @@ func testContractBridgeRoundTrip(t *testing.T, factory Factory) {
 	got := s.GetNode("bridge::http::GET::/v1/users")
 	if got == nil {
 		t.Fatalf("bridge node did not round-trip")
+		return
 	}
 	if got.Kind != graph.KindContractBridge {
 		t.Fatalf("bridge kind = %q, want %q", got.Kind, graph.KindContractBridge)
@@ -4594,6 +4603,7 @@ func testReadAliasing(t *testing.T, factory Factory, semantics Semantics) {
 		got := s.GetNode("a.go::Foo")
 		if got == nil {
 			t.Fatal("GetNode returned nil for inserted node")
+			return
 		}
 		// EndLine rather than Name/FilePath: the aliasing backend indexes
 		// nodes by name and path, so mutating one of those behind its back
@@ -4603,6 +4613,7 @@ func testReadAliasing(t *testing.T, factory Factory, semantics Semantics) {
 		again := s.GetNode("a.go::Foo")
 		if again == nil {
 			t.Fatal("GetNode returned nil on re-read")
+			return
 		}
 		if aliases && again.EndLine != 999 {
 			t.Fatalf("backend declares aliasing reads but the node mutation was dropped: %d", again.EndLine)
