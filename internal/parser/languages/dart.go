@@ -238,6 +238,9 @@ func (e *DartExtractor) emitDartMixinEdges(classNode *sitter.Node, src []byte, c
 }
 
 // extractMethods finds method_signature nodes inside class_body, extension_body, enum_body.
+// A constructor with no body (named, const, redirecting factory) is not wrapped
+// in method_signature at all — the grammar hangs its signature off a plain
+// `declaration`, so both wrappers are visited in the one walk.
 func (e *DartExtractor) extractMethods(
 	root *sitter.Node, src []byte, filePath string, fileNode *graph.Node,
 	result *parser.ExtractionResult, seen map[string]bool,
@@ -246,7 +249,8 @@ func (e *DartExtractor) extractMethods(
 	typeBodyRanges := e.collectTypeBodyRanges(root, src)
 
 	walkNodes(root, func(node *sitter.Node) {
-		if node.Type() != "method_signature" {
+		nodeType := node.Type()
+		if nodeType != "method_signature" && nodeType != "declaration" {
 			return
 		}
 
@@ -260,7 +264,14 @@ func (e *DartExtractor) extractMethods(
 			return
 		}
 
-		name := e.extractMethodName(node, src)
+		var name string
+		if nodeType == "method_signature" {
+			name = e.extractMethodName(node, src)
+		} else {
+			// Fields and static finals also ride `declaration`; only a
+			// constructor signature child yields a name.
+			name = dartDeclarationCtorName(node, src)
+		}
 		if name == "" {
 			return
 		}
@@ -660,15 +671,27 @@ func (e *DartExtractor) extractCalls(
 		}
 
 		target := "unresolved::*." + callName
+		aliased := false
 		if leadingReceiver != "" {
 			if uri, ok := imports[leadingReceiver]; ok {
 				target = "unresolved::extern::" + uri + "::" + callName
+				aliased = true
 			}
 		}
-		result.Edges = append(result.Edges, &graph.Edge{
+		edge := &graph.Edge{
 			From: callerID, To: target,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
-		})
+		}
+		// `TiledAtlas.fromTiledMap(1)` — a Capitalized chain head names the type
+		// the callee lives on, so the resolver binds the call to that type's
+		// member instead of any same-named symbol. Only a two-segment chain
+		// qualifies: in `Foo.bar.baz()` the head types `bar`, not `baz`. An
+		// import alias is excluded — it is a library prefix, not a type, and its
+		// attribution already rides the extern target.
+		if !aliased && len(methodChain) == 2 && isDartTypeNameCapitalized(leadingReceiver) {
+			edge.Meta = map[string]any{"receiver_type": leadingReceiver}
+		}
+		result.Edges = append(result.Edges, edge)
 	})
 }
 
@@ -731,13 +754,9 @@ func (e *DartExtractor) extractMethodName(node *sitter.Node, src []byte) string 
 			if nameNode != nil {
 				return "set " + nameNode.Content(src)
 			}
-		case "constructor_signature":
-			nameNode := child.ChildByFieldName("name")
-			if nameNode != nil {
-				return nameNode.Content(src)
-			}
-		case "factory_constructor_signature":
-			return e.findChildIdentifier(child, src)
+		case "constructor_signature", "constant_constructor_signature",
+			"factory_constructor_signature", "redirecting_factory_constructor_signature":
+			return dartCtorName(child, src)
 		case "operator_signature":
 			// operator + binary_operator child
 			for j, _nc := 0, int(child.ChildCount()); j < _nc; j++ {
@@ -749,6 +768,51 @@ func (e *DartExtractor) extractMethodName(node *sitter.Node, src []byte) string 
 		}
 	}
 	return ""
+}
+
+// dartDeclarationCtorName returns the constructor name carried by a class-body
+// `declaration` wrapper — the shape the grammar gives a body-less constructor
+// (named, const, redirecting factory). Returns "" for every other declaration
+// (fields, static finals).
+func dartDeclarationCtorName(decl *sitter.Node, src []byte) string {
+	for i, _nc := 0, int(decl.ChildCount()); i < _nc; i++ {
+		child := decl.Child(i)
+		switch child.Type() {
+		case "constructor_signature", "constant_constructor_signature",
+			"factory_constructor_signature", "redirecting_factory_constructor_signature":
+			return dartCtorName(child, src)
+		}
+	}
+	return ""
+}
+
+// dartCtorName returns a constructor signature's declared name. Dart spells a
+// named constructor `Type.name(...)`, and the grammar's `name` field points at
+// the leading TYPE identifier, so the constructor's own name is the identifier
+// that follows the dot. An unnamed constructor has no dot — the type identifier
+// is returned so the caller's unnamed-constructor guard recognises and drops it.
+func dartCtorName(sig *sitter.Node, src []byte) string {
+	typeName := ""
+	afterDot := false
+	for i, _nc := 0, int(sig.ChildCount()); i < _nc; i++ {
+		child := sig.Child(i)
+		switch child.Type() {
+		case ".":
+			afterDot = true
+		case "identifier":
+			if afterDot {
+				return child.Content(src)
+			}
+			if typeName == "" {
+				typeName = child.Content(src)
+			}
+		case "formal_parameter_list":
+			// The parameter list closes the name; a dot inside it
+			// (`Foo(this.n)`) is not a name separator.
+			return typeName
+		}
+	}
+	return typeName
 }
 
 type dartTypeRange struct {

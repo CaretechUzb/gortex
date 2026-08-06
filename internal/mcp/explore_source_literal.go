@@ -265,7 +265,7 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 		// Mapping still shares attemptCtx, so the two attempts remain inside the
 		// fixed 150ms request budget without silently halving grep time again.
 		searchCtx, cancelSearch := context.WithTimeout(attemptCtx, searchBudget)
-		result.search = s.searchExploreSourceLiteral(searchCtx, term, repoPrefix, scope)
+		result.search = s.searchExploreSourceLiteral(searchCtx, term, repoPrefix, scope, exploreSourceLiteralRecallMaxHits)
 		result.searchErr = searchCtx.Err()
 		cancelSearch()
 		if ctx.Err() != nil {
@@ -783,12 +783,15 @@ func exploreSourceLiteralUnprefixedPath(path, repoPrefix string) string {
 
 // searchExploreSourceLiteral mirrors search_text's literal backend while
 // deliberately refusing an unscoped multi-repository fan-out. The caller's
-// session locality supplies repoPrefix in normal operation.
+// session locality supplies repoPrefix in normal operation. maxHits is the
+// caller's own recall cap — every caller is responsible for a bound the rest
+// of its response budget can absorb.
 func (s *Server) searchExploreSourceLiteral(
 	ctx context.Context,
 	term string,
 	repoPrefix string,
 	scope query.QueryOptions,
+	maxHits int,
 ) exploreSourceLiteralSearch {
 	if s.multiIndexer != nil {
 		if repoPrefix == "" {
@@ -807,7 +810,7 @@ func (s *Server) searchExploreSourceLiteral(
 		}
 		result := s.multiIndexer.GrepLiteralForRepoBounded(
 			ctx, repoPrefix, term,
-			exploreSourceLiteralRecallMaxHits,
+			maxHits,
 			exploreSourceLiteralRecallMaxFiles,
 		)
 		if result.Owned {
@@ -832,7 +835,7 @@ func (s *Server) searchExploreSourceLiteral(
 	if s.indexer != nil {
 		matches, incomplete := s.indexer.GrepLiteralBounded(
 			ctx, term,
-			exploreSourceLiteralRecallMaxHits,
+			maxHits,
 			exploreSourceLiteralRecallMaxFiles,
 		)
 		return exploreSourceLiteralSearch{

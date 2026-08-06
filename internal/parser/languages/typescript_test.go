@@ -1091,13 +1091,101 @@ const middlewareImpl: MiddlewareImpl =
 		ids[n.ID] = string(n.Kind)
 	}
 	for id, kind := range map[string]string{
-		"mw/middleware.ts::StoreSetStateWithAction":              "type",
-		"mw/middleware.ts::middlewareImpl":                       "function",
+		"mw/middleware.ts::StoreSetStateWithAction":                  "type",
+		"mw/middleware.ts::middlewareImpl":                           "function",
 		"mw/middleware.ts::middlewareImpl#param:middlewareOptions@1": "param",
-		"mw/middleware.ts::setStateTracked":                      "function",
+		"mw/middleware.ts::setStateTracked":                          "function",
 	} {
 		if ids[id] != kind {
 			t.Fatalf("%s = %q, want %q (all: %v)", id, ids[id], kind, ids)
 		}
 	}
+}
+
+func TestTSExtractor_NamedFunctionExpression(t *testing.T) {
+	cases := []struct {
+		name    string
+		file    string
+		src     string
+		want    string
+		wantSig string
+	}{
+		{
+			name:    "default export logical operand",
+			file:    "adapter.ts",
+			src:     "export default isHttpAdapterSupported && function httpAdapter(config: Config) {\n  return config;\n};\n",
+			want:    "httpAdapter",
+			wantSig: "function httpAdapter()",
+		},
+		{
+			name:    "const initializer",
+			file:    "wrap.ts",
+			src:     "const wrapped = function inner(a: number) {\n  return a;\n};\n",
+			want:    "inner",
+			wantSig: "function inner()",
+		},
+		{
+			name:    "var initializer",
+			file:    "legacy.ts",
+			src:     "var legacy = function legacyImpl() {\n  return 1;\n};\n",
+			want:    "legacyImpl",
+			wantSig: "function legacyImpl()",
+		},
+		{
+			name:    "object property value",
+			file:    "api.ts",
+			src:     "const api = {\n  run: function runTask() {\n    return 1;\n  },\n};\n",
+			want:    "runTask",
+			wantSig: "function runTask()",
+		},
+		{
+			name:    "module.exports assignment",
+			file:    "cjs.ts",
+			src:     "module.exports = function createServer(opts: Options) {\n  return opts;\n};\n",
+			want:    "createServer",
+			wantSig: "function createServer()",
+		},
+		{
+			name:    "tsx grammar",
+			file:    "view.tsx",
+			src:     "const view = function renderView() {\n  return null;\n};\n",
+			want:    "renderView",
+			wantSig: "function renderView()",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := NewTypeScriptExtractor()
+			result, err := e.Extract(tc.file, []byte(tc.src))
+			require.NoError(t, err)
+
+			fn := nodeNamed(t, result.Nodes, graph.KindFunction, tc.want)
+			assert.Equal(t, tc.file, fn.FilePath)
+			assert.Equal(t, "typescript", fn.Language)
+			assert.Greater(t, fn.EndLine, fn.StartLine)
+			assert.Equal(t, tc.wantSig, fn.Meta["signature"])
+
+			var defined bool
+			for _, ed := range edgesOfKind(result.Edges, graph.EdgeDefines) {
+				if ed.From == tc.file && ed.To == fn.ID {
+					defined = true
+				}
+			}
+			assert.True(t, defined, "file must define %s", fn.ID)
+		})
+	}
+}
+
+func TestTSExtractor_AnonymousFunctionExpressionUnemitted(t *testing.T) {
+	src := []byte(`const anon = function () {
+  return 1;
+};
+module.exports = function () {
+  return 2;
+};
+`)
+	e := NewTypeScriptExtractor()
+	result, err := e.Extract("anon.ts", src)
+	require.NoError(t, err)
+	assert.Empty(t, nodesOfKind(result.Nodes, graph.KindFunction))
 }
