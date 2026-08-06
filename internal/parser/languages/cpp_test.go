@@ -204,3 +204,106 @@ func TestCppExtractor_FactoryChainReceiver(t *testing.T) {
 		t.Errorf("receiver_expr = %q, want builder().withX()", got)
 	}
 }
+
+// A free template function definition lives under a template_declaration,
+// so its symbol must cover the `template <…>` header and must survive
+// declarator forms the plain function_definition patterns never reach
+// (an explicit specialization's `name<Args>` declarator). Template
+// members declared inside a class body are not free functions and stay
+// on the class-body path.
+func TestCppExtractor_FreeTemplateFunction(t *testing.T) {
+	cases := []struct {
+		name      string
+		src       string
+		fn        string
+		startLine int
+		endLine   int
+		scopeNS   string
+	}{
+		{
+			name:      "file scope",
+			src:       "template <typename Char>\nvoid vprintf(buffer<Char>& buf, basic_string_view<Char> format) {\n  use(buf);\n}\n",
+			fn:        "vprintf",
+			startLine: 1,
+			endLine:   4,
+		},
+		{
+			name:      "inside namespace",
+			src:       "namespace detail {\ntemplate <typename Char>\nvoid vprintf(buffer<Char>& buf) {\n  use(buf);\n}\n}\n",
+			fn:        "vprintf",
+			startLine: 2,
+			endLine:   5,
+			scopeNS:   "detail",
+		},
+		{
+			name:      "multiple template params",
+			src:       "template <typename T, typename U, int N>\nauto combine(T t, U u) -> U {\n  return u;\n}\n",
+			fn:        "combine",
+			startLine: 1,
+			endLine:   4,
+		},
+		{
+			name:      "explicit specialization",
+			src:       "template <>\nvoid render<char>(char v) {\n  use(v);\n}\n",
+			fn:        "render",
+			startLine: 1,
+			endLine:   4,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := NewCppExtractor().Extract("tpl.hpp", []byte(tc.src))
+			require.NoError(t, err)
+
+			fn := nodeNamed(t, result.Nodes, graph.KindFunction, tc.fn)
+			assert.Equal(t, tc.startLine, fn.StartLine, "span covers the template header")
+			assert.Equal(t, tc.endLine, fn.EndLine)
+			assert.Equal(t, "tpl.hpp::"+tc.fn, fn.ID)
+			if tc.scopeNS != "" {
+				assert.Equal(t, tc.scopeNS, fn.Meta["scope_ns"])
+			}
+
+			var defined bool
+			for _, ed := range edgesOfKind(result.Edges, graph.EdgeDefines) {
+				if ed.From == "tpl.hpp" && ed.To == fn.ID {
+					defined = true
+				}
+			}
+			assert.True(t, defined, "file must define %s", fn.ID)
+		})
+	}
+}
+
+// A primary template and its explicit specialization are two definitions
+// of the same name; both keep a node.
+func TestCppExtractor_TemplateSpecializationDoesNotOverwritePrimary(t *testing.T) {
+	src := []byte("template <typename T>\nvoid render(T v) {\n  use(v);\n}\n\ntemplate <>\nvoid render<char>(char v) {\n  use(v);\n}\n")
+	result, err := NewCppExtractor().Extract("tpl.hpp", []byte(src))
+	require.NoError(t, err)
+
+	starts := map[int]bool{}
+	for _, n := range nodesOfKind(result.Nodes, graph.KindFunction) {
+		if n.Name == "render" {
+			starts[n.StartLine] = true
+		}
+	}
+	assert.Equal(t, map[int]bool{1: true, 6: true}, starts)
+}
+
+// Negative case: a template member declared inside a class body is not a
+// free function — its emission is untouched by the template dispatch.
+func TestCppExtractor_TemplateClassMemberUnchanged(t *testing.T) {
+	src := []byte("class Holder {\n public:\n  template <typename T>\n  void put(T v) {\n    store(v);\n  }\n};\n")
+	result, err := NewCppExtractor().Extract("holder.hpp", src)
+	require.NoError(t, err)
+
+	var puts []*graph.Node
+	for _, n := range result.Nodes {
+		if n.Name == "put" {
+			puts = append(puts, n)
+		}
+	}
+	require.Len(t, puts, 1, "no duplicate node for an in-class template member")
+	assert.Equal(t, 4, puts[0].StartLine, "still spans from the member's own definition")
+	assert.Equal(t, 6, puts[0].EndLine)
+}
