@@ -51,16 +51,22 @@ var dirMarkers = []string{"__tests__", "tests", "test", "spec"}
 //	*Tests.swift                       (Swift)
 //	*Test.php / *test.php              (PHPUnit / Pest)
 //	files under __tests__/, tests/,
-//	  test/, spec/                     (any language using these dirs)
+//	  test/, spec/                     (any language using these dirs;
+//	                                    matched case-insensitively)
 func IsTestFile(path string) bool {
 	if path == "" {
 		return false
 	}
 	// Directory-based hints first — covers projects that don't follow
-	// the per-file naming convention.
+	// the per-file naming convention. Markers match case-insensitively:
+	// .NET solutions capitalize their test directories (Test/, Tests/)
+	// and often name the files beneath them without a Test suffix, so a
+	// case-sensitive scan left every symbol in them stamped as
+	// production code.
 	slashed := strings.ReplaceAll(path, `\`, "/")
+	folded := strings.ToLower(slashed)
 	for _, marker := range dirMarkers {
-		if strings.Contains(slashed, "/"+marker+"/") || strings.HasPrefix(slashed, marker+"/") {
+		if strings.Contains(folded, "/"+marker+"/") || strings.HasPrefix(folded, marker+"/") {
 			return true
 		}
 	}
