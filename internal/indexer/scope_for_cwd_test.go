@@ -93,3 +93,88 @@ func TestScopeForCWD_And_ReposInWorkspace(t *testing.T) {
 	// An unknown workspace resolves to the empty set.
 	assert.Empty(t, mi.ReposInWorkspace("does-not-exist"))
 }
+
+// TestScopeForCWD_WorkspaceRoot covers the reverse containment: a cwd
+// that is not inside any tracked repo but CONTAINS tracked repos (an
+// agent session started at a workspace root above its repos). Such a
+// cwd binds to the contained repos' workspace when that workspace is
+// unambiguous; repos spanning different workspaces keep failing closed
+// — a single-workspace session scope cannot express the union.
+func TestScopeForCWD_WorkspaceRoot(t *testing.T) {
+	mkRepo := func(parent, name string) string {
+		t.Helper()
+		dir := filepath.Join(parent, name)
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"),
+			[]byte("package main\n\nfunc Hello() {}\n"), 0o644))
+		return dir
+	}
+
+	// Layout 1: one repo nested two levels under the workspace root.
+	parentSingle := t.TempDir()
+	app := mkRepo(filepath.Join(parentSingle, "projects"), "app")
+
+	// Layout 2: two repos under one root, sharing workspace "shared".
+	parentShared := t.TempDir()
+	r1 := mkRepo(parentShared, "r1")
+	r2 := mkRepo(parentShared, "r2")
+	require.NoError(t, os.WriteFile(filepath.Join(r1, ".gortex.yaml"),
+		[]byte("workspace: shared\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(r2, ".gortex.yaml"),
+		[]byte("workspace: shared\n"), 0o644))
+
+	// Layout 3: two repos under one root, each its own singleton workspace.
+	parentMixed := t.TempDir()
+	x := mkRepo(parentMixed, "x")
+	y := mkRepo(parentMixed, "y")
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{
+		Repos: []config.RepoEntry{
+			{Path: app, Name: "app"},
+			{Path: r1, Name: "r1"},
+			{Path: r2, Name: "r2"},
+			{Path: x, Name: "x"},
+			{Path: y, Name: "y"},
+		},
+	}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	g := graph.New()
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	_, err = mi.IndexScoped("", "")
+	require.NoError(t, err)
+
+	// Workspace root above exactly one tracked repo: binds with the
+	// full scope of that repo — the session behaves as if started
+	// inside it (home repo included, so locality ranking still works).
+	ws, proj, prefix, ok := mi.ScopeForCWD(parentSingle)
+	require.True(t, ok, "workspace root containing one tracked repo must resolve")
+	assert.Equal(t, "app", ws)
+	assert.Equal(t, "app", proj)
+	assert.Equal(t, "app", prefix)
+
+	// Workspace root above two repos that share one workspace slug:
+	// binds to the workspace, with no home repo (the session has no
+	// single locality anchor).
+	ws, proj, prefix, ok = mi.ScopeForCWD(parentShared)
+	require.True(t, ok, "workspace root over a single shared workspace must resolve")
+	assert.Equal(t, "shared", ws)
+	assert.Empty(t, proj, "ambiguous project must stay empty")
+	assert.Empty(t, prefix, "no home repo above multiple repos")
+
+	// Workspace root above repos in DIFFERENT workspaces: fail closed —
+	// one session scope cannot span two workspace boundaries.
+	_, _, _, ok = mi.ScopeForCWD(parentMixed)
+	assert.False(t, ok, "mixed-workspace parent must not resolve")
+
+	// The forward direction is untouched: inside a repo still wins.
+	ws, _, prefix, ok = mi.ScopeForCWD(filepath.Join(app, "internal"))
+	require.True(t, ok)
+	assert.Equal(t, "app", ws)
+	assert.Equal(t, "app", prefix)
+}

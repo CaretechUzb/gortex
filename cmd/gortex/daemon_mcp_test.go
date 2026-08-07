@@ -346,6 +346,51 @@ func TestDispatcher_UnreachableCWD_StillRejected(t *testing.T) {
 	assert.Equal(t, "repo_not_tracked", data["error_code"])
 }
 
+// TestDispatcher_WorkspaceRootCWD_Passes covers the reverse-containment
+// case: the session cwd is not inside any tracked repo but is a PARENT
+// of one (an agent opened at the workspace root above its repos, e.g.
+// `<root>` over `<root>/projects/<repo>`). The guard must let the frame
+// through — ScopeForCWD binds such a session to the contained repo's
+// workspace, so refusing here contradicts the scope the session would
+// actually get. A parent whose repos span different workspaces stays
+// rejected: sessionScope cannot express that union, and passing the
+// gate would trade the actionable error for silently empty results.
+func TestDispatcher_WorkspaceRootCWD_Passes(t *testing.T) {
+	parent := t.TempDir()
+	app := filepath.Join(parent, "projects", "app")
+	require.NoError(t, os.MkdirAll(app, 0o755))
+
+	d, mi := trackedPathMCPSetup(t, app)
+
+	assert.True(t, d.cwdReachable(parent),
+		"workspace root above one tracked repo must be reachable")
+
+	sess := &daemon.Session{ID: "sess_wsroot", CWD: parent}
+	frame := []byte(`{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"graph_stats","arguments":{}}}`)
+	reply, err := d.Dispatch(context.Background(), sess, frame)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(reply, &parsed))
+	if errObj, ok := parsed["error"].(map[string]any); ok {
+		if data, ok := errObj["data"].(map[string]any); ok {
+			assert.NotEqual(t, "repo_not_tracked", data["error_code"],
+				"workspace-root cwd wrongly rejected by guard: %v", parsed)
+		}
+	}
+
+	// Track a second repo under the same parent: each repo is its own
+	// singleton workspace, so the parent now spans two workspaces and
+	// must fail closed again.
+	other := filepath.Join(parent, "projects", "other")
+	require.NoError(t, os.MkdirAll(other, 0o755))
+	_, err = mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: other})
+	require.NoError(t, err)
+	assert.False(t, d.cwdReachable(parent),
+		"parent spanning two singleton workspaces must stay unreachable")
+}
+
 // TestDispatcher_UntrackedHandshake_SurvivesWithInactiveVariant proves the
 // F4 contract: an MCP session opened in a cwd that no tracked repo covers must
 // still complete its handshake. initialize flows through and the response

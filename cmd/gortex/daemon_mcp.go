@@ -313,6 +313,16 @@ func (d *mcpDispatcher) cwdReachable(cwd string) bool {
 	if d.isCWDTracked(cwd) {
 		return true
 	}
+	// Workspace-root fallback: a cwd that CONTAINS tracked repos (agent
+	// opened at the root above its repos) is reachable exactly when
+	// ScopeForCWD can bind it to one workspace — the same resolution
+	// sessionScope applies later, so the gate can never admit a session
+	// the scope would blank out, or refuse one it could serve.
+	if d.multiIndexer != nil {
+		if _, _, _, ok := d.multiIndexer.ScopeForCWD(cwd); ok {
+			return true
+		}
+	}
 	rtr := d.router.Load()
 	if rtr == nil {
 		return false
