@@ -16,6 +16,25 @@ const godotResScheme = "res://"
 // until this pass lands it on the indexed file.
 const godotResPlaceholderPrefix = "unresolved::import::" + godotResScheme
 
+// isGodotResPlaceholder reports whether a target is a parked `res://`
+// reference that resolveGodotResPaths owns.
+//
+// The generic resolvers must leave it alone. A `res://` path is rooted at
+// the Godot project, never at a package registry, so the `external::`
+// stub they fall back to is always wrong — and it is also unrecoverable:
+// once the scheme is buried inside a bookkeeping string, the later Godot
+// pass cannot tell it from any other unresolved import, and every scene →
+// script edge is lost. That is what used to happen on every real index:
+// this pass ran, found no placeholder left to bind, and did nothing.
+//
+// Holding them back costs nothing — the pass that owns them runs in the
+// same resolve — and a path this pass cannot bind stays unresolved rather
+// than becoming an `external::` stub, which is the honest answer for an
+// asset outside the corpus and the one the pass's own tests pin.
+func isGodotResPlaceholder(to string) bool {
+	return strings.HasPrefix(to, godotResPlaceholderPrefix)
+}
+
 // resolveGodotResPaths binds `res://` references onto the file they name.
 //
 // Two extractors mint these placeholders and neither could resolve them:
@@ -32,7 +51,11 @@ const godotResPlaceholderPrefix = "unresolved::import::" + godotResScheme
 // refuses rather than guesses — see uniqueFileSuffixMatch.
 //
 // Runs serially in ResolveAll's relative-import settle window, alongside
-// the Lua require binding it mirrors.
+// the Lua require binding it mirrors. Reaching that window at all takes
+// isGodotResPlaceholder holding the generic resolvers off: they run
+// first, and each of them stubs an unrecognised import out to
+// `external::<path>` — which this pass can no longer recognise, so
+// nothing here ever fired through the real pipeline.
 func (r *Resolver) resolveGodotResPaths() {
 	if !r.graphHasLanguage("godot_resource") && !r.graphHasLanguage("gdscript") {
 		return

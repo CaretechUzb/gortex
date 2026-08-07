@@ -3267,6 +3267,11 @@ func pendingShapeSummary(pending []*graph.Edge) string {
 }
 
 func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *ResolveStats) {
+	if isGodotResPlaceholder(e.To) {
+		// resolveGodotResPaths owns this one; see the note on the helper.
+		stats.Unresolved++
+		return
+	}
 	callerRepo := r.callerRepoPrefix(e)
 	callerWorkspace := r.callerWorkspaceID(e)
 	ambiguousQualName := false
