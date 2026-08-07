@@ -37,8 +37,19 @@ import (
 // Methods are serialized via a mutex — track/reload can race with status
 // otherwise. The mutex is coarse; finer locking is a later optimization.
 type realController struct {
-	mu            sync.Mutex
-	graph         graph.Store
+	mu sync.Mutex
+	// graph is assigned once when the controller is constructed and never
+	// reassigned, so reading it requires no synchronisation — and must not
+	// take mu. Taking mu for a handle that cannot change bought nothing and
+	// cost everything: mu is held for the entire duration of a track /
+	// reload / enrichment, so the "cheap probe path" the hooks depend on
+	// (SearchSymbols) queued behind minutes of indexing. Measured, the
+	// UserPromptSubmit probe exceeded its 800ms budget on 82.6% of turns.
+	//
+	// Mutating operations still take mu; they serialise indexer work, not
+	// this pointer. If this field ever becomes reassignable, it needs an
+	// atomic — not mu — for the same reason multiWatcher already uses one.
+	graph graph.Store
 	indexer       *indexer.Indexer
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
@@ -687,6 +698,72 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 // Status gathers per-repo stats and basic process metrics. Daemon-level
 // fields (PID, uptime, socket, session count) are filled in by the
 // daemon itself before the response goes out.
+// Probe answers "is the daemon up, is it ready, and what does it track"
+// without taking c.mu and without reading the store.
+//
+// This is the whole point of the call. Status takes c.mu, and c.mu is held
+// for the entire duration of a track / reload / enrichment — the same
+// reasoning that already keeps multiWatcher and onShutdown off that mutex.
+// Measured on a 44-repo workspace, serial Status calls with no concurrent
+// load returned the identical payload in 156 ms to 11.5 s depending only on
+// what the indexer was doing. Callers on a sub-second budget therefore
+// concluded the daemon was unreachable while it was perfectly healthy.
+//
+// So: no c.mu, no graph handle, no runtime.ReadMemStats, and no per-repo
+// stat. ready/enriched are already atomics, and the tracked-repo registry is
+// the config — which is the membership source of truth anyway, since a
+// status row for a repo the daemon holds no index for is itself synthesised
+// from it.
+//
+// Anything added here that reads the store or takes a lock reintroduces
+// exactly the stall this exists to avoid; TestProbeAnswersDuringLongMutation
+// pins that.
+func (c *realController) Probe(ctx context.Context) (daemon.ProbeResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return daemon.ProbeResponse{}, err
+	}
+
+	resp := daemon.ProbeResponse{
+		Ready:    c.ready.Load(),
+		Enriched: c.enriched.Load(),
+	}
+	if c.configManager == nil {
+		return resp, nil
+	}
+	gc := c.configManager.Global()
+	if gc == nil {
+		return resp, nil
+	}
+
+	seen := make(map[string]bool)
+	add := func(e config.RepoEntry) {
+		path := strings.TrimSpace(e.Path)
+		if path == "" || seen[path] {
+			return
+		}
+		seen[path] = true
+		resp.TrackedRepos = append(resp.TrackedRepos, daemon.ProbeRepo{
+			Path:      path,
+			Prefix:    config.ResolvePrefix(e),
+			Name:      e.Name,
+			Workspace: e.Workspace,
+			Project:   e.Project,
+		})
+	}
+	for _, e := range gc.Repos {
+		add(e)
+	}
+	// Project-nested entries are tracked the same as top-level ones. Omitting
+	// them would report a tracked path as untracked, which downstream reads as
+	// "no repo owns this" — the precise misread this call exists to prevent.
+	for _, pc := range gc.Projects {
+		for _, e := range pc.Repos {
+			add(e)
+		}
+	}
+	return resp, nil
+}
+
 func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, error) {
 	// Bail before doing any work if the caller is already gone. Status sits
 	// on the critical path of `daemon stop`, `gortex call`, and the agent
@@ -704,9 +781,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 	// advisory counts and byte estimates intentionally remain zero. Once
 	// enriched, snapshot the graph handle under a brief lock and run the
 	// exact (store-memoised) estimates without holding the controller mutex.
-	c.mu.Lock()
-	g := c.graph
-	c.mu.Unlock()
+	g := c.graph // write-once at construction; see the field comment
 	enriched := c.enriched.Load()
 	var memEstimates map[string]graph.RepoMemoryEstimate
 	var wholeStoreNodes, wholeStoreEdges int
@@ -1203,9 +1278,10 @@ const (
 // shard writers and blew past the hook's 200ms budget. The hook then logged
 // probed_miss / timed_out and never once produced a hit.
 func (c *realController) SearchSymbols(_ context.Context, p daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
-	c.mu.Lock()
+	// No mu: graph is write-once at construction (see the field comment), and
+	// this is the probe path a hook calls on a sub-second budget. Taking mu
+	// here is what made it wait out an in-flight reindex.
 	g := c.graph
-	c.mu.Unlock()
 
 	if g == nil || p.Query == "" {
 		return daemon.SearchSymbolsResult{}, nil
