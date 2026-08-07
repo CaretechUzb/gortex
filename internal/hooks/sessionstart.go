@@ -206,7 +206,7 @@ func buildSessionStartBriefing(cwd string) string {
 	status, err := sessionStartStatusFn()
 	switch {
 	case errors.Is(err, errDaemonUnreachable):
-		sb.WriteString("⚠️  **Gortex graph transport is unreachable.** Required native MCP tools and code-operation enforcement cannot be assumed healthy. Treat this as an MCP integration failure: stop indexed code operations and report it; do not start a daemon manually or switch to a CLI fallback.\n\n")
+		sb.WriteString("⚠️  **Gortex graph transport is unreachable.** Required native MCP tools and code-operation enforcement cannot be assumed healthy. " + daemonUnreachableStance + "\n\n")
 		sb.WriteString(rulePreamble())
 		return sb.String()
 	case err != nil:

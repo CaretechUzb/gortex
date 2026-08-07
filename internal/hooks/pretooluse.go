@@ -168,9 +168,10 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		return
 	}
 
+	daemonUp := daemonReachableFn()
 	emitted := false
 	defer func() {
-		logHookEffectiveness("PreToolUse", emitted, daemonReachableFn(), hookAlternationSegmentCount(input), time.Since(started))
+		logHookEffectiveness("PreToolUse", emitted, daemonUp, hookAlternationSegmentCount(input), time.Since(started))
 	}()
 
 	isGortexMCP := isGortexMCPToolName(input.ToolName)
@@ -191,8 +192,12 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		// a permissive permission mode means low friction, not "stop
 		// reminding me my full-body read is expensive". Never a hard
 		// deny here: auto-approve has already promised to allow the call.
-		if adv := gortexReadNudge(input.ToolName, input.ToolInput); adv != "" {
-			hso.AdditionalContext = adv
+		// Skipped during a daemon outage: coaching the shape of a call
+		// that is about to fail on transport is noise (#486).
+		if daemonUp {
+			if adv := gortexReadNudge(input.ToolName, input.ToolInput); adv != "" {
+				hso.AdditionalContext = adv
+			}
 		}
 		if updatedInput != nil {
 			hso.UpdatedInput = updatedInput
@@ -214,6 +219,31 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 				UpdatedInput:  updatedInput,
 			}})
 		}
+		return
+	}
+
+	// Daemon outage: per-call enforcement stands down (#486). Every deny and
+	// advisory the enrichment below can produce mandates Gortex MCP tools;
+	// while the daemon cannot serve them that guidance deadlocks the agent —
+	// instructed to use tools that cannot answer and flagged for using the
+	// tools that can. Degrade the way the SessionStart briefing does
+	// (rule-only enforcement): stay quiet per call, surface one notice per
+	// session so a mid-session outage is explained, and keep the
+	// localization input passthrough intact. The terminal deny above stays
+	// live on purpose — it is daemon-independent and carries its own answer.
+	if !daemonUp {
+		hso := &HookSpecificOutput{HookEventName: "PreToolUse"}
+		if updatedInput != nil {
+			hso.UpdatedInput = updatedInput
+		}
+		if hookCallTargetsTrackedRepo(input.ToolName, input.ToolInput, input.CWD) {
+			hso.AdditionalContext = daemonDownNoticeOnce(input.SessionID)
+		}
+		if hso.AdditionalContext == "" && hso.UpdatedInput == nil {
+			return
+		}
+		emitted = hso.AdditionalContext != ""
+		emitPreToolUse(HookOutput{HookSpecificOutput: hso})
 		return
 	}
 

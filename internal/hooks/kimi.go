@@ -109,6 +109,13 @@ func runKimiPreToolUseEvent(data []byte, port int, mode Mode) {
 //     whole-file read becomes a Kimi permission-decision block; soft guidance
 //     is appended as plain-stdout context so the call still proceeds.
 func runKimiPreToolUse(toolName string, toolInput map[string]any, sessionID string, port int, mode Mode) {
+	// Daemon outage: stand down (#486). Both the compress-bodies nudge and
+	// the enrich redirects mandate Gortex tools; while the daemon cannot
+	// serve them, silence is the only honest posture — and the one this
+	// file's contract has always documented.
+	if !daemonReachableFn() {
+		return
+	}
 	if kimiGortexReadPreToolUseTool(toolName) {
 		if ctx := gortexReadNudge(toolName, toolInput); ctx != "" {
 			fmt.Print(ctx)
@@ -160,6 +167,13 @@ func runKimiStop(data []byte, port int) {
 // symbols + the tool-swap table) as plain stdout, so it reaches for the graph
 // tools instead of defaulting to raw Read/Grep on indexed source.
 func runKimiSubagentStart(data []byte, port int) {
+	// Daemon outage: don't hand a fresh subagent a "MUST use Gortex MCP"
+	// briefing while the daemon cannot serve a single call (#486). The
+	// static fallback below exists for a missing task text, not for an
+	// outage.
+	if !daemonReachableFn() {
+		return
+	}
 	briefing := buildKimiSubagentBriefing(port, kimiSubagentTask(data))
 	if briefing == "" {
 		return

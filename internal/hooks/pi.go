@@ -129,6 +129,13 @@ func piToolCall(ev PiEvent, port int, mode Mode) PiDecision {
 		return PiDecision{}
 	}
 
+	// Daemon outage: stand down (#486) — a block or advisory here would
+	// point at graph tools the daemon cannot serve. The consult-unlock /
+	// streak bookkeeping above is local state and deliberately stays live.
+	if !daemonReachableFn() {
+		return PiDecision{}
+	}
+
 	result := applyMode(input, isGortexTool, mode, enrich(input, port))
 	if result.deny {
 		return PiDecision{Block: true, Reason: result.reason}
