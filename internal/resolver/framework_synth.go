@@ -125,6 +125,8 @@ const (
 	SynthUIKitResolve        = "uikit-resolve"
 	SynthVaporResolve        = "vapor-resolve"
 	SynthGodotAutoload       = "godot-autoload"
+	SynthGodotPreloadAlias   = "godot-preload-alias"
+	SynthGodotConnection     = "godot-connection"
 	SynthGinMiddleware       = "gin-middleware"
 	SynthSvelteKitLoad       = "sveltekit-load"
 	SynthSpeculative         = "speculative-dispatch"
@@ -587,6 +589,7 @@ const (
 	frameworkMarkerSvelteKitServer    = "sveltekit-load:server"
 	frameworkMarkerPascalSource       = "pascal-form:source"
 	frameworkMarkerPascalForm         = "pascal-form:form"
+	frameworkMarkerGDScript           = "gdscript:node"
 	frameworkMarkerStrictFamilyPrefix = "family-strict:"
 
 	frameworkObserverRegistrarRole  uint8 = 1
@@ -690,6 +693,13 @@ func recordFrameworkNodeCandidates(markers map[string]int, n *graph.Node, family
 		if (n.Kind == graph.KindMethod || n.Kind == graph.KindFunction) && n.Name == "handle" {
 			markers[SynthLaravelEvent]++
 		}
+	case "gdscript":
+		// The receiver gate reads only GDScript nodes, so a corpus with
+		// none provably yields no demotion — and on a scoped run, a
+		// resolve that touched no GDScript file cannot have changed any
+		// verdict, since both the call edges and the class index it
+		// judges against come from `.gd` files.
+		markers[frameworkMarkerGDScript]++
 	case "csharp":
 		if n.Kind == graph.KindInterface {
 			markers[SynthCSharpIfaceDispatch]++
@@ -970,6 +980,16 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// the script `project.godot` declares the singleton `Game` to
 		// be — the only place that mapping exists.
 		synthFunc{name: SynthGodotAutoload, fn: ResolveGDScriptAutoloads},
+		// Godot preload aliases: a `const Persist = preload("res://…")`
+		// names a script file-locally, and `Persist.snapshot()` is then
+		// used exactly like a global — the standard way to reach a
+		// static-utility script that declares no `class_name`.
+		synthFunc{name: SynthGodotPreloadAlias, fn: ResolveGDScriptPreloadAliases},
+		// Godot scene connections: a `.tscn` `[connection … method="…"]`
+		// block wires a signal to a method of the script attached to the
+		// target node. The method is named as a bare string, so nothing in
+		// the scripts records the link.
+		synthFunc{name: SynthGodotConnection, fn: ResolveGodotSceneConnections},
 		// SwiftUI directory-convention fallback: a residual `*View` /
 		// `*ViewModel` / `*Store` / `*Manager` / PascalCase-model reference
 		// binds to its /Views/ /ViewModels/ /Stores/ /Models/ definition.
@@ -1043,6 +1063,10 @@ type FrameworkSynthReport struct {
 	// tier because they attach to a same-named member of a type unrelated to
 	// the edge's receiver_type.
 	ReceiverGated int `json:"receiver_type_gated,omitempty"`
+	// GDScriptReceiverGated counts the same demotion for GDScript, where the
+	// receiver is stated at every call site and a same-named method in the
+	// caller's own directory is the standing phantom.
+	GDScriptReceiverGated int `json:"gdscript_receiver_type_gated,omitempty"`
 	// GateMillis/ClaimMillis/DemoteMillis time the three tail passes that
 	// run once (not per-synthesizer) after the main loop, so a slow one
 	// doesn't hide behind the loop's aggregate elapsed.
@@ -1265,6 +1289,13 @@ func runFrameworkSynthesizersScoped(
 			g, executionScope, filePaths, csharpHierarchyChanged,
 		)
 	}
+	// The GDScript gate runs in the same slot and for the same reason: it
+	// corrects already-bound member calls, so it must see the settled call
+	// graph — after the Godot autoload / preload-alias binders above have
+	// had their chance to claim an edge the gate would otherwise judge.
+	if frameworkGDScriptGateNeeded(candidates) {
+		rep.GDScriptReceiverGated = DemoteGDScriptReceiverMismatches(g)
+	}
 	rep.DemoteMillis = time.Since(demoteStart).Milliseconds()
 	return rep
 }
@@ -1304,6 +1335,20 @@ func frameworkFamilyGateNeeded(_ map[string]bool, summary frameworkCandidateSumm
 // type/interface names proves the gate returns zero on any graph. Scoped
 // runs always run the gate — the gate's name index is whole-graph while a
 // scoped census is not.
+// frameworkGDScriptGateNeeded reports whether the GDScript receiver gate
+// can change anything. Unlike the family/receiver tails, a scoped census
+// is enough here: the gate reads only GDScript nodes and edges, so a
+// resolve whose candidate set contains no GDScript node cannot have moved
+// a verdict. The gate runs whole-graph when it runs, so keeping it off a
+// resolve that touched no `.gd` file is what keeps a warm restart on a
+// polyglot workspace from paying for it.
+func frameworkGDScriptGateNeeded(summary frameworkCandidateSummary) bool {
+	if summary.fullCensus {
+		return summary.allMarkers[frameworkMarkerGDScript] > 0
+	}
+	return summary.scopedMarkers[frameworkMarkerGDScript] > 0
+}
+
 func frameworkReceiverGateNeeded(_ map[string]bool, summary frameworkCandidateSummary) bool {
 	if !summary.fullCensus {
 		return true

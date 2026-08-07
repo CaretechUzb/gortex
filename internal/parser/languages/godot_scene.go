@@ -146,6 +146,35 @@ func (e *GodotSceneExtractor) Extract(filePath string, src []byte) (*parser.Extr
 				})
 				// `instance=ExtResource("id")` rides the header itself.
 				e.addExtResourceRef(result, extResources, id, line, filePath, lineNo)
+			case "connection":
+				// `[connection signal="pressed" from="Button" to="."
+				// method="_on_random"]` wires a signal to a method of the
+				// script attached to the `to` node. The method is named as
+				// a bare string, so nothing in the scripts themselves
+				// records the link: without this edge a rename rewrites the
+				// method and leaves the scene calling a name that no longer
+				// exists, with nothing raising an error.
+				method := attrs["method"]
+				if method == "" {
+					continue
+				}
+				owner := godotScenePathNodeID(filePath, rootName, attrs["to"])
+				if owner == "" {
+					owner = fileNode.ID
+				}
+				// The method name rides in Meta as well as in the
+				// placeholder: once a weaker pass binds the placeholder to
+				// some same-named method, the name is the only way back to
+				// what the scene actually wrote.
+				meta := map[string]any{"godot_connection": true, "godot_method": method}
+				if sig := attrs["signal"]; sig != "" {
+					meta["godot_signal"] = sig
+				}
+				result.Edges = append(result.Edges, &graph.Edge{
+					From: owner, To: "unresolved::*." + method,
+					Kind: graph.EdgeReferences, FilePath: filePath, Line: lineNo,
+					Meta: meta,
+				})
 			}
 			continue
 		}
@@ -204,6 +233,21 @@ func parseGodotAttrs(header string) map[string]string {
 // to the root (`parent="Panel/VBox"`). Prefixing root reproduces the
 // NodePath Godot itself uses, so the ID is stable and collision-free
 // within the scene — including a child that shares the root's name.
+// godotScenePathNodeID resolves a NodePath as written in a `[connection]`
+// header (`to="."`, `to="Panel/VBox"`) to the scene node's graph ID. The
+// path is relative to the scene root, which `godotSceneNodeID` also
+// prefixes, so the two agree on every node in the scene.
+func godotScenePathNodeID(filePath, root, nodePath string) string {
+	if root == "" {
+		return ""
+	}
+	p := strings.Trim(strings.TrimSpace(nodePath), "/")
+	if p == "" || p == "." {
+		return filePath + "::" + root
+	}
+	return filePath + "::" + root + "/" + p
+}
+
 func godotSceneNodeID(filePath, root, parent, name string) string {
 	if name == "" {
 		return ""

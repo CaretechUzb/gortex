@@ -34,7 +34,11 @@ func ResolveGDScriptAutoloads(g graph.Store) int {
 	if len(scripts) == 0 {
 		return 0
 	}
-	members := gdMembersByFile(g, scripts)
+	want := make(map[string]bool, len(scripts))
+	for _, fileID := range scripts {
+		want[fileID] = true
+	}
+	members := gdMembersByFileSet(g, want)
 	resolved := 0
 	var reindex []graph.EdgeReindex
 	for e := range g.EdgesByKind(graph.EdgeCalls) {
@@ -141,13 +145,12 @@ func gdPathMatches(filePath, script string) bool {
 	return strings.HasSuffix(p, "/"+script)
 }
 
-// gdMembersByFile indexes the callable members declared by each autoload
-// script, by name. Signals are included: `Game.started.emit()` and a
-// direct connect both reference the signal as a member.
-func gdMembersByFile(g graph.Store, scripts map[string]string) map[string]map[string]string {
-	want := make(map[string]bool, len(scripts))
-	for _, fileID := range scripts {
-		want[fileID] = true
+// gdMembersByFileSet indexes the callable members declared by each of the
+// named script files, by name. Signals are included: `Game.started.emit()`
+// and a direct connect both reference the signal as a member.
+func gdMembersByFileSet(g graph.Store, want map[string]bool) map[string]map[string]string {
+	if len(want) == 0 {
+		return nil
 	}
 	out := make(map[string]map[string]string, len(want))
 	for _, kind := range []graph.NodeKind{graph.KindMethod, graph.KindFunction} {

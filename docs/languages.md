@@ -255,8 +255,8 @@ What is **not** covered:
 | ActionScript | `.as` | `package`, classes, interfaces, `function`, `import X.Y.*;` |
 | Dart | `.dart` | Full (see core matrix) |
 | Swift | `.swift` | Full (see core matrix) |
-| GDScript | `.gd`, `project.godot` | `func`, `class`, signals; receiver-typed calls — a script's funcs are methods of its `class_name`, and `Notify.event()` / typed locals / params / `self` bind by receiver, so a project-global class resolves across directories. `[autoload]` singletons in `project.godot` bind to their declared script. `preload("res://…")` binds to the file. |
-| Godot resources | `.tscn`, `.tres` | Scene tree nodes keyed by NodePath, `[ext_resource]` → script / sub-scene / asset, per-node `script =` / `instance=ExtResource(…)` |
+| GDScript | `.gd`, `project.godot` | `func`, `class`, signals; receiver-typed calls — a script's funcs are methods of its `class_name`, and `Notify.event()` / typed locals / params / `self` bind by receiver, so a project-global class resolves across directories. A call whose bind contradicts its stated receiver is demoted to the speculative tier, so a caller list holds only calls that class can receive. `[autoload]` singletons in `project.godot` and `const X = preload("res://…")` aliases both bind to the script they name, including one with no `class_name`. Class-body initialiser calls (`@onready var ui = Hud.build()`) are attributed to the file. A method referenced without parentheses — `connect(_on_x)`, `Callable(self, "_on_x")` — is a usage, so `rename` rewrites the signal wiring instead of silently breaking it. `preload("res://…")` binds to the file. |
+| Godot resources | `.tscn`, `.tres` | Scene tree nodes keyed by NodePath, `[ext_resource]` → script / sub-scene / asset, per-node `script =` / `instance=ExtResource(…)`, `[connection … method="…"]` → the handler on the target node's script |
 | Verse (UEFN) | `.verse` | `class` / `struct` / `enum` / `interface`, functions with specifier blocks, `using { /Path }` |
 | Nix | `.nix` | Attribute sets, functions, `import` / `<nixpkgs>` |
 | AL (Business Central) | `.al` | Tables, pages, codeunits, procedures |
