@@ -23,6 +23,11 @@ func TestMain(m *testing.M) {
 		_ = os.Setenv("GORTEX_HOOK_EFFECTIVENESS_LOG", filepath.Join(dir, "hook-effectiveness.jsonl"))
 		defer func() { _ = os.RemoveAll(dir) }()
 	}
+	// Per-call enforcement is gated on daemon reachability (#486). Default
+	// it to "reachable" so enforcement tests stay deterministic on machines
+	// without a daemon (and never dial a real socket); daemon-outage tests
+	// stub it false via withDaemonReachable.
+	daemonReachableFn = func() bool { return true }
 	// Default the file-indexed / file-summary probes to "not indexed" so no
 	// test dials a real daemon. Tests needing an indexed verdict stub
 	// fileIndexedFn / fileSummaryFn (fakeIndexedBridge / newIndexedBridge /
