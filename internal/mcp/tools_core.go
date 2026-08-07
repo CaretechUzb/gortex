@@ -2569,7 +2569,7 @@ func (s *Server) handleFindImplementations(ctx context.Context, req mcp.CallTool
 	if errResult != nil {
 		return errResult, nil
 	}
-	impls := s.engineFor(ctx).FindImplementationsMinTier(id, minTier)
+	impls, implEdges := s.engineFor(ctx).FindImplementationsWithEdgesMinTier(id, minTier)
 	// Confine results to the session's workspace — FindImplementations
 	// doesn't take QueryOptions, so the boundary is enforced here.
 	impls = s.scopedNodeSlice(ctx, impls)
@@ -2577,7 +2577,25 @@ func (s *Server) handleFindImplementations(ctx context.Context, req mcp.CallTool
 	impls = s.withAbsPaths(impls)
 
 	if s.isGCX(ctx, req) {
-		sg := &query.SubGraph{Nodes: impls, TotalNodes: len(impls)}
+		// Keep only the implements-edges whose implementation survived
+		// the scope filters, so the `.edges` section always agrees with
+		// `.nodes` — an edge to a node the session can't see would leak
+		// the boundary the filters just enforced. Copies, not the live
+		// graph edges: enrichSubGraphEdges writes display fields, and a
+		// read path must never mutate shared graph state.
+		keep := make(map[string]bool, len(impls))
+		for _, n := range impls {
+			keep[n.ID] = true
+		}
+		var edges []*graph.Edge
+		for _, edge := range implEdges {
+			if keep[edge.From] {
+				c := *edge
+				edges = append(edges, &c)
+			}
+		}
+		sg := &query.SubGraph{Nodes: impls, Edges: edges, TotalNodes: len(impls), TotalEdges: len(edges)}
+		enrichSubGraphEdges(sg)
 		return s.returnScopedSubGraph(ctx, req, sg, resolved)
 	}
 
