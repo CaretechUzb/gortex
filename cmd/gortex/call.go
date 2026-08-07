@@ -61,7 +61,9 @@ The walrus is recognised only when ":=" opens the token, so a value that quotes
 
 Use --dry to print the lowered argument object and the target tool without
 calling the daemon (works with no daemon running). Use --format to pick the
-wire format the tool renders (json|gcx|toon|text).
+wire format the tool renders (json|gcx|toon|text). --format json always prints
+parseable JSON: a tool that answers in prose is wrapped as
+{"tool":…,"format":"text","text":…}.
 
 When <tool> is one of the compact public tool names, this command automatically
 selects the compact surface for that connection and accepts the exact MCP
@@ -160,9 +162,32 @@ func runCall(cmd *cobra.Command, args []string) error {
 		// corrupt them.
 		fmt.Fprintln(cmd.OutOrStdout(), strings.TrimRight(string(raw), "\n"))
 		return nil
-	default: // json | text
+	case "json":
+		return emitCallJSON(cmd, tool, raw)
+	default: // text
 		return emitDaemonJSON(cmd, raw)
 	}
+}
+
+// emitCallJSON keeps the --format json promise for every tool on the surface,
+// including the ones that answer in prose. A JSON payload is re-indented and
+// printed unchanged. A payload the tool rendered as text is wrapped in a
+// minimal envelope so a JSON client parses a response instead of failing on the
+// first markdown character. explore(operation:"task") is the case in the core
+// surface: it returns the human-oriented localization page and has no
+// structured response upstream to surface instead, unlike operation:"localize",
+// whose envelope passes straight through.
+func emitCallJSON(cmd *cobra.Command, tool string, raw json.RawMessage) error {
+	if json.Valid(raw) {
+		return emitDaemonJSON(cmd, raw)
+	}
+	enc := json.NewEncoder(cmd.OutOrStdout())
+	enc.SetIndent("", "  ")
+	return enc.Encode(map[string]any{
+		"tool":   tool,
+		"format": "text",
+		"text":   string(raw),
+	})
 }
 
 func describeToolEffects(effect daemon.ToolEffect) string {
