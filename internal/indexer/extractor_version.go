@@ -32,7 +32,7 @@ var extractorVersions = map[string]int{
 	//   "go": 2,
 	"c":      generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
 	"php":    2,                                      // class/interface inheritance now emits typed structural edges
-	"csharp": 7,                                      // record positional parameters emit property nodes (was: record members extracted)
+	"csharp": 8,                                      // interface base lists emit extends edges (was: record positional property nodes)
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language

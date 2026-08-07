@@ -723,12 +723,12 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	})
 	emitCSharpAnnotationEdges(csharpCollectAttributes(def.Node, src), id, filePath, result, annotationSeen)
 	emitCSharpGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
-	// Only classes, structs, and records carry a base class / interface
-	// list that splits into EdgeExtends + EdgeImplements. Structs and
-	// `record struct` declarations have no base class — every base is an
-	// interface — which emitCSharpBaseList infers from the declaration.
+	// Classes, structs, records, and interfaces carry a base list;
+	// emitCSharpBaseList derives each entry's edge kind from the
+	// declaration (base class vs interface for classes, all-interface
+	// for structs and records, inheritance for interfaces).
 	switch kind {
-	case "class", "struct", "record":
+	case "class", "struct", "record", "iface":
 		emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, result)
 	case "enum":
 		e.emitCSharpEnumMembers(def.Node, src, filePath, id, name, result, seen)
@@ -1599,6 +1599,8 @@ func collectCSharpInterfaceNames(root *sitter.Node, src []byte) map[string]bool 
 
 // emitCSharpBaseList splits a class/struct/record base list into
 // EdgeExtends (the superclass) and EdgeImplements (the interfaces).
+// An interface's base list bypasses that split entirely — see the
+// short-circuit below.
 //
 // C# lists the optional base class and any implemented interfaces in a
 // single comma-separated base_list, and — unlike Go or Java — the
@@ -1644,6 +1646,10 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 	// Structs and `record struct` cannot derive from a base class — the
 	// CLR forbids it — so every entry in their base list is an interface
 	// and the "first non-interface is the superclass" branch never runs.
+	// An interface's bases can only be interfaces, and the relation is
+	// inheritance — every entry rides EdgeExtends (the same convention
+	// the semantic engine applies), bypassing the discrimination below.
+	ifaceDecl := decl.Type() == "interface_declaration"
 	allowsBaseClass := csharpDeclAllowsBaseClass(decl)
 	extendsTaken := false
 	for i, _nc := 0, int(baseList.NamedChildCount()); i < _nc; i++ {
@@ -1662,7 +1668,10 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 		isInterface := !isCtorBase &&
 			(localInterfaces[name] || csharpInterfaceNamePattern.MatchString(name))
 		kind := graph.EdgeImplements
-		if !isInterface && allowsBaseClass && !extendsTaken {
+		switch {
+		case ifaceDecl:
+			kind = graph.EdgeExtends
+		case !isInterface && allowsBaseClass && !extendsTaken:
 			kind = graph.EdgeExtends
 			extendsTaken = true
 		}
