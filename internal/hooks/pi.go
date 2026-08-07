@@ -122,16 +122,21 @@ func piToolCall(ev PiEvent, port int, mode Mode) PiDecision {
 		if mode == ModeConsultUnlock {
 			markGraphConsulted(ev.SessionID)
 		}
-		// Still let adaptive-nudge reset its streak on a symbolic call.
-		if mode == ModeAdaptiveNudge {
+		// Still let adaptive-nudge reset its streak on a symbolic call —
+		// but only while the daemon is up. During an outage every adapter
+		// freezes the streak entirely (Claude's and Hermes' gates sit above
+		// their streak bookkeeping), so post-outage nudge behavior resumes
+		// exactly where it left off; resetting here would make Pi the one
+		// adapter whose streak drifts mid-outage (#486).
+		if mode == ModeAdaptiveNudge && daemonReachableFn() {
 			_ = applyMode(input, true, mode, enrichResult{})
 		}
 		return PiDecision{}
 	}
 
 	// Daemon outage: stand down (#486) — a block or advisory here would
-	// point at graph tools the daemon cannot serve. The consult-unlock /
-	// streak bookkeeping above is local state and deliberately stays live.
+	// point at graph tools the daemon cannot serve. The consult-unlock
+	// marker above is local state and deliberately stays live.
 	if !daemonReachableFn() {
 		return PiDecision{}
 	}

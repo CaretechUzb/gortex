@@ -1,10 +1,12 @@
 package hooks
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/localizationauth"
 )
 
 // The tests below pin the #486 contract: while the daemon is unreachable,
@@ -288,6 +290,156 @@ func TestDaemonDownNoticeSharesBriefingStance(t *testing.T) {
 	briefing := buildSessionStartBriefing("")
 	if !strings.Contains(briefing, daemonUnreachableStance) {
 		t.Fatalf("the unreachable briefing must carry the shared stance sentence: %q", briefing)
+	}
+}
+
+func TestPreToolUseDaemonDownPreservesLocalizationPassthrough(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	withDaemonReachable(t, false)
+	problemStatement := "Title: Neutral storage failure\n\nDiskStorage.load returns an empty value."
+	identity, ok := beginLocalizationTurnWithProblem(t.Name(), "prompt", "", t.TempDir(), problemStatement)
+	if !ok {
+		t.Fatal("beginLocalizationTurnWithProblem failed")
+	}
+	payload := mustJSON(t, map[string]any{
+		"hook_event_name": "PreToolUse",
+		"tool_name":       gortexMCPToolPrefix + "explore",
+		"tool_use_id":     "tool-use",
+		"tool_input": map[string]any{
+			"operation": "localize",
+			"task":      "literal symptom",
+			"options":   map[string]any{"new_user_task": true},
+		},
+		"session_id": identity.SessionID,
+		"prompt_id":  identity.PromptID,
+		"cwd":        identity.CWD,
+	})
+
+	output := captureHookStdout(t, func() { runPreToolUse(payload, 0, ModeDeny) })
+	var decoded HookOutput
+	if err := json.Unmarshal([]byte(output), &decoded); err != nil || decoded.HookSpecificOutput == nil {
+		t.Fatalf("invalid degraded PreToolUse output: %v\n%s", err, output)
+	}
+	hso := decoded.HookSpecificOutput
+	if hso.PermissionDecision == "deny" {
+		t.Fatalf("degraded branch must not deny: %#v", hso)
+	}
+	// The auth nonce and the problem-statement rewrite are what correlate a
+	// still-live MCP transport's answer_ready receipt with this turn; the
+	// stand-down must not strip them.
+	if _, ok := hso.UpdatedInput[localizationauth.ArgumentKey].(string); !ok {
+		t.Fatalf("degraded branch lost the terminal auth passthrough: %#v", hso)
+	}
+	if got := hso.UpdatedInput["task"]; got != problemStatement {
+		t.Fatalf("degraded branch lost the problem-statement rewrite: %#v", got)
+	}
+}
+
+func TestDaemonDownNoticeScopedToTrackedRepos(t *testing.T) {
+	t.Setenv(hookSessionDirEnvVar, t.TempDir())
+	withDaemonReachable(t, false)
+	oldRepos := hookTrackedReposFn
+	hookTrackedReposFn = func() []daemon.TrackedRepoStatus {
+		return []daemon.TrackedRepoStatus{{Path: "/repo", Name: "repo"}}
+	}
+	t.Cleanup(func() { hookTrackedReposFn = oldRepos })
+
+	untracked := mustJSON(t, map[string]any{
+		"hook_event_name": "PreToolUse",
+		"tool_name":       "Read",
+		"tool_input":      map[string]any{"file_path": "/elsewhere/scratch.go"},
+		"cwd":             "/elsewhere",
+		"session_id":      "sess-scoped",
+	})
+	if out := captureHookStdout(t, func() { runPreToolUse(untracked, 0, ModeDeny) }); out != "" {
+		t.Fatalf("enforcement never applied outside tracked repos, so the notice must not fire there: %q", out)
+	}
+
+	// The untracked call must not have burned the session's single notice.
+	tracked := preToolReadPayload(t, "sess-scoped")
+	out := captureHookStdout(t, func() { runPreToolUse(tracked, 0, ModeDeny) })
+	if !strings.Contains(out, "standing down to rule-only guidance") {
+		t.Fatalf("first tracked-repo call should still carry the notice: %q", out)
+	}
+}
+
+func TestPreToolUseDaemonDownSkipsNudgeUnderAutoApprove(t *testing.T) {
+	payload := mustJSON(t, map[string]any{
+		"hook_event_name": "PreToolUse",
+		"tool_name":       gortexCompactReadTool,
+		"tool_input": map[string]any{
+			"operation": "file",
+			"target":    map[string]any{"file": "/repo/internal/server.go"},
+		},
+		"cwd":             "/repo",
+		"permission_mode": "acceptEdits",
+	})
+
+	withDaemonReachable(t, true)
+	control := captureHookStdout(t, func() { runPreToolUse(payload, 0, ModeDeny) })
+	if !strings.Contains(control, "auto-approved") || !strings.Contains(control, "compress_bodies") {
+		t.Fatalf("control: auto-approve should carry the read nudge while the daemon is up: %q", control)
+	}
+
+	daemonReachableFn = func() bool { return false }
+	out := captureHookStdout(t, func() { runPreToolUse(payload, 0, ModeDeny) })
+	if !strings.Contains(out, "auto-approved") {
+		t.Fatalf("auto-approve itself must survive the outage: %q", out)
+	}
+	if strings.Contains(out, "compress_bodies") {
+		t.Fatalf("coaching the shape of a call about to fail on transport must be skipped: %q", out)
+	}
+}
+
+func TestCodexPostToolUseSuppressDaemonDownStaysSilent(t *testing.T) {
+	oldSummary := fileSummaryFn
+	fileSummaryFn = func(_, _ string) (*hookFileSummary, bool) {
+		return &hookFileSummary{
+			Symbols: []summaryNode{{Name: "Foo", Kind: "function", StartLine: 1, EndLine: 20}},
+		}, true
+	}
+	t.Cleanup(func() { fileSummaryFn = oldSummary })
+	payload := codexPostBashPayload("grep -rn Foo internal/", "internal/server.go:3:Foo()")
+
+	withDaemonReachable(t, true)
+	control := captureHookStdout(t, func() { runCodexPostToolUse(payload, 0, CodexModeSuppress) })
+	if !strings.Contains(control, "Do not re-Grep") {
+		t.Fatalf("control: expected the graph follow-up while the daemon is up: %q", control)
+	}
+
+	daemonReachableFn = func() bool { return false }
+	out := captureHookStdout(t, func() { runCodexPostToolUse(payload, 0, CodexModeSuppress) })
+	if out != "" {
+		t.Fatalf("Codex suppress-mode follow-ups must not land during an outage: %q", out)
+	}
+}
+
+func TestPiAdaptiveNudgeStreakFrozenDuringOutage(t *testing.T) {
+	t.Setenv(hookSessionDirEnvVar, t.TempDir())
+	const session = "sess-pi-streak"
+	saveSessionState(session, sessionState{NonSymbolicStreak: 2})
+	ev := PiEvent{
+		Event:        "tool_call",
+		ToolName:     "search_symbols",
+		CWD:          "/repo",
+		SessionID:    session,
+		IsGortexTool: true,
+	}
+
+	withDaemonReachable(t, false)
+	if d := piToolCall(ev, 0, ModeAdaptiveNudge); d.Block || d.AdditionalContext != "" {
+		t.Fatalf("gortex call must pass through untouched: %#v", d)
+	}
+	if got := loadSessionState(session).NonSymbolicStreak; got != 2 {
+		t.Fatalf("outage must freeze the streak like every other adapter, got %d", got)
+	}
+
+	daemonReachableFn = func() bool { return true }
+	if d := piToolCall(ev, 0, ModeAdaptiveNudge); d.Block || d.AdditionalContext != "" {
+		t.Fatalf("gortex call must pass through untouched: %#v", d)
+	}
+	if got := loadSessionState(session).NonSymbolicStreak; got != 0 {
+		t.Fatalf("a symbolic call with the daemon up should reset the streak, got %d", got)
 	}
 }
 
