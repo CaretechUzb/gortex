@@ -3062,7 +3062,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// deferred: only a page that stays non-terminal pays for it, and it pays
 	// once however many envelopes this request packs. The task's own terms ride
 	// along so a bounded index keeps the declarations the task named.
-	pageOutline := localizationLeadingFileOutlineProvider(
+	pageOutline := localizationPageOutlineProvider(
 		localizationRankedPool, pageTargets, exploreTerminalTerms(task),
 		func(file string) []*graph.Node { return fileDefinitionNodes(eng, file) },
 	)
@@ -3164,12 +3164,16 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 // explicit localization-only request. Ordinary explore(task) retains the
 // human-oriented legacy rendering; localize does not duplicate it.
 type localizationExploreEnvelope struct {
-	Completion localizationCompletion   `json:"completion"`
-	Terminal   bool                     `json:"terminal"`
-	Files      []string                 `json:"files"`
-	Symbols    []string                 `json:"symbols"`
-	Evidence   []localizationEvidence   `json:"evidence"`
-	Outline    *localizationFileOutline `json:"outline,omitempty"`
+	Completion localizationCompletion `json:"completion"`
+	Terminal   bool                   `json:"terminal"`
+	Files      []string               `json:"files"`
+	Symbols    []string               `json:"symbols"`
+	Evidence   []localizationEvidence `json:"evidence"`
+	// Outline indexes the page's leading file; Outlines indexes the page's
+	// further files, deepest first. The split keeps the leading file where
+	// consumers already read it.
+	Outline  *localizationFileOutline   `json:"outline,omitempty"`
+	Outlines []*localizationFileOutline `json:"outlines,omitempty"`
 }
 
 type localizationEvidence struct {
@@ -4037,7 +4041,7 @@ func buildLocalizationRefinementResultForTaskWithOutline(
 	targets []exploreTarget,
 	budget int,
 	routes map[string]localizationRefinementRoute,
-	outline func() *localizationFileOutline,
+	outline func() *localizationPageOutline,
 ) (*mcp.CallToolResult, localizationCompletion, map[string]localizationRefinementRoute, *localizationEvidenceDigest) {
 	choosePreferred := func(symbols []string, requested string) (string, []string, map[string]localizationRefinementRoute) {
 		authorized, bounded := boundedLocalizationRefinementRoutes(symbols, routes, requested)
@@ -4109,7 +4113,7 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 	task string,
 	targets []exploreTarget,
 	budget int,
-	outline func() *localizationFileOutline,
+	outline func() *localizationPageOutline,
 	finalize ...localizationCompletionFinalizer,
 ) (*mcp.CallToolResult, []string, *localizationEvidenceDigest, localizationCompletion) {
 	var draft []exploreDraftEntry
@@ -4371,13 +4375,15 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 	contract = localizationContractReconciledWithDigest(envelope.Completion, digest)
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal
-	// A page that still asks the caller to choose gets the leading file's
-	// declaration index. The rows above name at most one symbol per file, so a
-	// caller looking at the right file and the wrong row has nothing to correct
-	// with; the outline is that file's remaining declarations, and it is the
-	// first thing given back when the budget cannot hold everything.
+	// A page that still asks the caller to choose gets its files' declaration
+	// indexes. The rows above name at most one symbol per file, so a caller
+	// looking at the right file and the wrong row has nothing to correct with;
+	// the outlines are those files' remaining declarations, and they are the
+	// first payload given back when the budget cannot hold everything.
 	if outline != nil && localizationPageAcceptsOutline(envelope.Completion.State) {
-		envelope.Outline = outline().clone()
+		if page := outline().clone(); page != nil {
+			envelope.Outline, envelope.Outlines = page.Leading, page.Others
+		}
 	}
 	// The ready-to-emit answer is derived from the retained rows, so it lands
 	// after the fit checks above and can push the envelope past its budget.
@@ -4391,12 +4397,14 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 		shedBudget = maxBytes + localizationRetiredReadAllowance(maxBytes)
 	}
 	for !localizationEnvelopeFits(envelope, shedBudget) {
-		if envelope.Outline != nil {
-			// The outline is a convenience over rows the caller can still reach
-			// by other means, so it gives way before every other payload here —
-			// but it gives way by degrees. A shorter index is worth far more
-			// than none, and only pressure past its floor drops it outright.
-			envelope.Outline, _ = localizationOutlineRelief(envelope.Outline)
+		block := &localizationPageOutline{Leading: envelope.Outline, Others: envelope.Outlines}
+		if !block.empty() {
+			// The outlines are a convenience over rows the caller can still
+			// reach by other means, so they give way before every other payload
+			// here — but they give way by degrees. A shorter index is worth far
+			// more than none, and only pressure past the floor drops one.
+			block.relieve()
+			envelope.Outline, envelope.Outlines = block.Leading, block.Others
 			continue
 		}
 		if digest != nil && len(digest.Evidence) > localizationFinalResponsePrimaryLimit {

@@ -77,7 +77,7 @@ func TestRefiningPageCarriesTheLeadingFileOutline(t *testing.T) {
 		{node: alternate, source: "func Declared01() { executeOne() }"},
 	}
 	enumerated := 0
-	outline := localizationLeadingFileOutlineProvider(
+	outline := localizationPageOutlineProvider(
 		outlinePool(preferred, alternate), targets, nil,
 		func(file string) []*graph.Node {
 			if file != outlineLeadingFile {
@@ -137,7 +137,7 @@ func TestTerminalPageCarriesNoOutlineAndPaysNoEnumeration(t *testing.T) {
 		sourceLiteral: true, sourceLiteralCallee: true, exactContent: true,
 	}}
 	enumerated := 0
-	outline := localizationLeadingFileOutlineProvider(
+	outline := localizationPageOutlineProvider(
 		outlinePool(declared[0]), targets, nil,
 		func(string) []*graph.Node {
 			enumerated++
@@ -182,9 +182,9 @@ func TestOutlineGivesWayBeforeEvidenceRowsUnderATightBudget(t *testing.T) {
 	}
 	routes := exploreLocalizationRefinementRoutes(targets)
 	build := func(budget int, withOutline bool) (localizationExploreEnvelope, int) {
-		var outline func() *localizationFileOutline
+		var outline func() *localizationPageOutline
 		if withOutline {
-			outline = localizationLeadingFileOutlineProvider(
+			outline = localizationPageOutlineProvider(
 				outlinePool(declared[0], declared[1]), targets, nil,
 				func(string) []*graph.Node { return declared },
 			)
@@ -284,7 +284,7 @@ func TestLocalizationBudgetLeavesRoomForOutlineBesideEvidence(t *testing.T) {
 			Meta:      map[string]any{"signature": "func " + name + "(ctx context.Context) error"},
 		}})
 	}
-	outline := localizationLeadingFileOutlineProvider(
+	outline := localizationPageOutlineProvider(
 		outlinePool(declared[0], declared[1]), targets, nil,
 		func(string) []*graph.Node { return declared },
 	)
@@ -313,7 +313,7 @@ func TestLeadingFileOutlineEnumeratesOncePerPage(t *testing.T) {
 	declared := outlineDeclaredFile(4)
 	targets := []exploreTarget{{node: declared[0]}, {node: declared[1]}}
 	enumerated := 0
-	outline := localizationLeadingFileOutlineProvider(
+	outline := localizationPageOutlineProvider(
 		outlinePool(declared[0], declared[1]), targets, nil,
 		func(string) []*graph.Node {
 			enumerated++
@@ -332,11 +332,11 @@ func TestLeadingFileOutlineEnumeratesOncePerPage(t *testing.T) {
 func TestLeadingFileOutlineFallsBackToAlreadyFetchedNodes(t *testing.T) {
 	declared := outlineDeclaredFile(3)
 	targets := []exploreTarget{{node: declared[0]}, {node: declared[1]}}
-	outline := localizationLeadingFileOutlineProvider(
+	outline := localizationPageOutlineProvider(
 		outlinePool(declared...), targets, nil,
 		func(string) []*graph.Node { return nil },
 	)()
-	if outline == nil || outline.Declared != len(declared) {
+	if outline == nil || outline.Leading == nil || outline.Leading.Declared != len(declared) {
 		t.Fatalf("outline = %#v, want the %d pool nodes of %q", outline, len(declared), outlineLeadingFile)
 	}
 }
@@ -432,6 +432,159 @@ func outlineBreadthTargets(count int) []exploreTarget {
 	return targets
 }
 
+// outlineFileDeclaration mirrors outlineDeclaration for a file other than the
+// page's leading one.
+func outlineFileDeclaration(file, name string, line int) *graph.Node {
+	return &graph.Node{
+		ID:        file + "::" + name,
+		Name:      name,
+		QualName:  name,
+		Kind:      graph.KindMethod,
+		FilePath:  file,
+		StartLine: line,
+		EndLine:   line + 4,
+		Meta:      map[string]any{"signature": "func " + name + "()"},
+	}
+}
+
+func TestOutlineCoversTheOtherFilesTheRowsCameFrom(t *testing.T) {
+	// The ranked page leads with one file and names another only in its last
+	// rows. The rows of that second file are one member each; the declaration
+	// that answers the task is a sibling the rows never reach.
+	const otherFile = "repo/other.go"
+	const answer = "onCollisionRemoved"
+	declared := outlineDeclaredFile(12)
+	other := []*graph.Node{
+		outlineFileDeclaration(otherFile, "OtherType", 4),
+		outlineFileDeclaration(otherFile, "renderTree", 20),
+		outlineFileDeclaration(otherFile, answer, 41),
+		outlineFileDeclaration(otherFile, "attachChild", 60),
+	}
+	targets := []exploreTarget{
+		{node: declared[0], source: "func Declared00() { executeAll() }"},
+		{node: declared[1], source: "func Declared01() { executeOne() }"},
+	}
+	targets = append(targets, outlineBreadthTargets(4)...)
+	targets = append(targets, exploreTarget{node: other[0]}, exploreTarget{node: other[1]})
+
+	enumerated := make([]string, 0, 4)
+	outline := localizationPageOutlineProvider(
+		outlinePool(declared[0], declared[1]), targets, nil,
+		func(file string) []*graph.Node {
+			enumerated = append(enumerated, file)
+			switch file {
+			case outlineLeadingFile:
+				return declared
+			case otherFile:
+				return other
+			}
+			return nil
+		},
+	)
+	result, completion, _, _ := buildLocalizationRefinementResultForTaskWithOutline(
+		declared[0].ID, "find the declared implementation", targets,
+		exploreMaxBudgetTokens, exploreLocalizationRefinementRoutes(targets), outline,
+	)
+	if completion.State != localizationStateNeedsRefinement {
+		t.Fatalf("completion state = %q, want %q", completion.State, localizationStateNeedsRefinement)
+	}
+	envelope := outlineEnvelope(t, result)
+	if envelope.Outline == nil || envelope.Outline.File != outlineLeadingFile {
+		t.Fatalf("leading outline = %#v, want %q", envelope.Outline, outlineLeadingFile)
+	}
+	var second *localizationFileOutline
+	for _, extra := range envelope.Outlines {
+		if extra != nil && extra.File == otherFile {
+			second = extra
+		}
+	}
+	if second == nil {
+		t.Fatalf("outlines = %#v, want the page's other file %q", envelope.Outlines, otherFile)
+	}
+	if !outlineRowNamed(second, answer) {
+		t.Fatalf("the other file's outline never names its unranked declaration: %#v", second.Rows)
+	}
+	// The leading file keeps the deepest index; the files after it are shallower.
+	if len(envelope.Outlines) == 0 {
+		t.Fatal("no further page files were indexed")
+	}
+	for _, extra := range envelope.Outlines {
+		if extra.File == outlineLeadingFile {
+			t.Fatalf("the leading file is indexed twice: %#v", envelope.Outlines)
+		}
+	}
+	for _, file := range enumerated {
+		if file == "" {
+			t.Fatalf("enumerated an empty file: %#v", enumerated)
+		}
+	}
+	if len(enumerated) > localizationOutlineFileCap {
+		t.Fatalf("enumerated %d files, cap %d", len(enumerated), localizationOutlineFileCap)
+	}
+}
+
+func TestPageOutlinesGiveBackDepthBeforeTheyGiveBackAFile(t *testing.T) {
+	const otherFile = "repo/other.go"
+	declared := outlineDeclaredFile(40)
+	other := make([]*graph.Node, 0, 20)
+	for index := 0; index < 20; index++ {
+		other = append(other, outlineFileDeclaration(otherFile, fmt.Sprintf("Other%02d", index), index*3+1))
+	}
+	targets := []exploreTarget{
+		{node: declared[0], source: "func Declared00() { executeAll() }"},
+		{node: declared[1], source: "func Declared01() { executeOne() }"},
+	}
+	targets = append(targets, outlineBreadthTargets(4)...)
+	targets = append(targets, exploreTarget{node: other[0]}, exploreTarget{node: other[1]})
+	routes := exploreLocalizationRefinementRoutes(targets)
+
+	build := func(budget int) localizationExploreEnvelope {
+		outline := localizationPageOutlineProvider(
+			outlinePool(declared[0], declared[1]), targets, nil,
+			func(file string) []*graph.Node {
+				switch file {
+				case outlineLeadingFile:
+					return declared
+				case otherFile:
+					return other
+				}
+				return nil
+			},
+		)
+		result, _, _, _ := buildLocalizationRefinementResultForTaskWithOutline(
+			declared[0].ID, "find the declared implementation", targets, budget, routes, outline,
+		)
+		if bytes := outlineEnvelopeBytes(t, result); bytes > budget*localizationEnvelopeBytesPerToken {
+			t.Fatalf("envelope = %d bytes, budget = %d", bytes, budget*localizationEnvelopeBytesPerToken)
+		}
+		return outlineEnvelope(t, result)
+	}
+
+	roomy := build(exploreMaxBudgetTokens)
+	if roomy.Outline == nil || len(roomy.Outlines) == 0 {
+		t.Fatalf("roomy page = %#v / %#v, want both files indexed", roomy.Outline, roomy.Outlines)
+	}
+	tight := build(exploreMinBudgetTokens)
+	tightRows := 0
+	if tight.Outline != nil {
+		tightRows += len(tight.Outline.Rows)
+	}
+	for _, extra := range tight.Outlines {
+		tightRows += len(extra.Rows)
+	}
+	roomyRows := len(roomy.Outline.Rows)
+	for _, extra := range roomy.Outlines {
+		roomyRows += len(extra.Rows)
+	}
+	if tightRows >= roomyRows {
+		t.Fatalf("tight page indexed %d rows against the roomy page's %d", tightRows, roomyRows)
+	}
+	// Whatever is left of the block still leads with the file the page led with.
+	if len(tight.Outlines) > 0 && tight.Outline == nil {
+		t.Fatalf("the leading file's index went before a later file's: %#v", tight.Outlines)
+	}
+}
+
 func TestOutlineShrinksRatherThanVanishingWhenTheBudgetBinds(t *testing.T) {
 	const named = "computeRetryBackoff"
 	declared := outlineDeclaredFile(40)
@@ -448,7 +601,7 @@ func TestOutlineShrinksRatherThanVanishingWhenTheBudgetBinds(t *testing.T) {
 	routes := exploreLocalizationRefinementRoutes(targets)
 
 	build := func(budget int) localizationExploreEnvelope {
-		outline := localizationLeadingFileOutlineProvider(
+		outline := localizationPageOutlineProvider(
 			outlinePool(declared[0], declared[1]), targets, exploreTerminalTerms(task),
 			func(string) []*graph.Node { return declared },
 		)
@@ -497,7 +650,7 @@ func TestOutlineShrinkingNeverEscapesTheProviderCache(t *testing.T) {
 	declared := outlineDeclaredFile(40)
 	targets := []exploreTarget{{node: declared[0]}, {node: declared[1]}}
 	targets = append(targets, outlineBreadthTargets(8)...)
-	outline := localizationLeadingFileOutlineProvider(
+	outline := localizationPageOutlineProvider(
 		outlinePool(declared[0], declared[1]), targets, nil,
 		func(string) []*graph.Node { return declared },
 	)
@@ -531,12 +684,12 @@ func TestLeadingFileOutlineProviderCarriesTheTaskTerms(t *testing.T) {
 	middle := len(declared) / 2
 	declared[middle] = outlineDeclaration(named, middle+1)
 	targets := []exploreTarget{{node: declared[0]}, {node: declared[1]}}
-	outline := localizationLeadingFileOutlineProvider(
+	outline := localizationPageOutlineProvider(
 		outlinePool(declared[0], declared[1]), targets,
 		exploreTerminalTerms("the http request dispatch never retries"),
 		func(string) []*graph.Node { return declared },
 	)()
-	if !outlineRowNamed(outline, named) {
+	if outline == nil || !outlineRowNamed(outline.Leading, named) {
 		t.Fatalf("provider built an outline blind to the task: %#v", outline)
 	}
 }
@@ -571,7 +724,7 @@ func TestScatteredRankingCarriesNoOutline(t *testing.T) {
 		targets = append(targets, exploreTarget{node: node})
 	}
 	enumerated := 0
-	outline := localizationLeadingFileOutlineProvider(pool, targets, nil, func(string) []*graph.Node {
+	outline := localizationPageOutlineProvider(pool, targets, nil, func(string) []*graph.Node {
 		enumerated++
 		return nil
 	})
