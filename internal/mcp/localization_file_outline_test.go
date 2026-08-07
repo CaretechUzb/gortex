@@ -78,7 +78,7 @@ func TestRefiningPageCarriesTheLeadingFileOutline(t *testing.T) {
 	}
 	enumerated := 0
 	outline := localizationLeadingFileOutlineProvider(
-		outlinePool(preferred, alternate), targets,
+		outlinePool(preferred, alternate), targets, nil,
 		func(file string) []*graph.Node {
 			if file != outlineLeadingFile {
 				t.Fatalf("enumerated file = %q, want %q", file, outlineLeadingFile)
@@ -138,7 +138,7 @@ func TestTerminalPageCarriesNoOutlineAndPaysNoEnumeration(t *testing.T) {
 	}}
 	enumerated := 0
 	outline := localizationLeadingFileOutlineProvider(
-		outlinePool(declared[0]), targets,
+		outlinePool(declared[0]), targets, nil,
 		func(string) []*graph.Node {
 			enumerated++
 			return declared
@@ -185,7 +185,7 @@ func TestOutlineShedsBeforeEvidenceRowsUnderATightBudget(t *testing.T) {
 		var outline func() *localizationFileOutline
 		if withOutline {
 			outline = localizationLeadingFileOutlineProvider(
-				outlinePool(declared[0], declared[1]), targets,
+				outlinePool(declared[0], declared[1]), targets, nil,
 				func(string) []*graph.Node { return declared },
 			)
 		}
@@ -276,7 +276,7 @@ func TestLocalizationBudgetLeavesRoomForOutlineBesideEvidence(t *testing.T) {
 		}})
 	}
 	outline := localizationLeadingFileOutlineProvider(
-		outlinePool(declared[0], declared[1]), targets,
+		outlinePool(declared[0], declared[1]), targets, nil,
 		func(string) []*graph.Node { return declared },
 	)
 	result, completion, _, _ := buildLocalizationRefinementResultForTaskWithOutline(
@@ -305,7 +305,7 @@ func TestLeadingFileOutlineEnumeratesOncePerPage(t *testing.T) {
 	targets := []exploreTarget{{node: declared[0]}, {node: declared[1]}}
 	enumerated := 0
 	outline := localizationLeadingFileOutlineProvider(
-		outlinePool(declared[0], declared[1]), targets,
+		outlinePool(declared[0], declared[1]), targets, nil,
 		func(string) []*graph.Node {
 			enumerated++
 			return declared
@@ -324,11 +324,98 @@ func TestLeadingFileOutlineFallsBackToAlreadyFetchedNodes(t *testing.T) {
 	declared := outlineDeclaredFile(3)
 	targets := []exploreTarget{{node: declared[0]}, {node: declared[1]}}
 	outline := localizationLeadingFileOutlineProvider(
-		outlinePool(declared...), targets,
+		outlinePool(declared...), targets, nil,
 		func(string) []*graph.Node { return nil },
 	)()
 	if outline == nil || outline.Declared != len(declared) {
 		t.Fatalf("outline = %#v, want the %d pool nodes of %q", outline, len(declared), outlineLeadingFile)
+	}
+}
+
+func outlineRowNamed(outline *localizationFileOutline, name string) bool {
+	if outline == nil {
+		return false
+	}
+	for _, row := range outline.Rows {
+		if row.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestOutlineElisionKeepsTaskTermMatchingDeclarations(t *testing.T) {
+	const named = "dispatchHttpRequest"
+	declared := outlineDeclaredFile(60)
+	// The declaration the task names sits in the middle of the file — exactly
+	// where a blind head/tail elision drops it.
+	middle := len(declared) / 2
+	declared[middle] = outlineDeclaration(named, middle+1)
+
+	blind := newLocalizationFileOutline(outlineLeadingFile, declared)
+	if blind == nil || len(blind.Rows) != localizationOutlineRowCap {
+		t.Fatalf("blind outline = %#v, want %d rows", blind, localizationOutlineRowCap)
+	}
+	if outlineRowNamed(blind, named) {
+		t.Fatalf("fixture does not reproduce a mid-file elision: %q survived a blind cap", named)
+	}
+
+	terms := exploreTerminalTerms("the http request dispatch never retries")
+	outline := newLocalizationFileOutlineForTerms(outlineLeadingFile, declared, terms, localizationOutlineRowCap)
+	if outline == nil {
+		t.Fatal("task-term outline is absent")
+	}
+	if len(outline.Rows) != localizationOutlineRowCap {
+		t.Fatalf("outline rows = %d, want cap %d", len(outline.Rows), localizationOutlineRowCap)
+	}
+	if outline.Declared != len(declared) || outline.Elided != len(declared)-localizationOutlineRowCap {
+		t.Fatalf("outline = declared %d elided %d, want %d/%d",
+			outline.Declared, outline.Elided, len(declared), len(declared)-localizationOutlineRowCap)
+	}
+	if !outlineRowNamed(outline, named) {
+		t.Fatalf("outline elided the declaration the task names: %#v", outline.Rows)
+	}
+	// The retained rows stay a file index: still in line order, still anchored
+	// at the file's own head and tail.
+	for index := 1; index < len(outline.Rows); index++ {
+		if outline.Rows[index-1].Line > outline.Rows[index].Line {
+			t.Fatalf("outline rows are out of file order at %d: %#v", index, outline.Rows)
+		}
+	}
+	if outline.Rows[0].Line != 1 || outline.Rows[len(outline.Rows)-1].Line != len(declared) {
+		t.Fatalf("outline spans lines %d..%d, want the whole file's ends",
+			outline.Rows[0].Line, outline.Rows[len(outline.Rows)-1].Line)
+	}
+}
+
+func TestLeadingFileOutlineProviderCarriesTheTaskTerms(t *testing.T) {
+	const named = "dispatchHttpRequest"
+	declared := outlineDeclaredFile(60)
+	middle := len(declared) / 2
+	declared[middle] = outlineDeclaration(named, middle+1)
+	targets := []exploreTarget{{node: declared[0]}, {node: declared[1]}}
+	outline := localizationLeadingFileOutlineProvider(
+		outlinePool(declared[0], declared[1]), targets,
+		exploreTerminalTerms("the http request dispatch never retries"),
+		func(string) []*graph.Node { return declared },
+	)()
+	if !outlineRowNamed(outline, named) {
+		t.Fatalf("provider built an outline blind to the task: %#v", outline)
+	}
+}
+
+func TestOutlineElisionRanksStrongerTaskTermMatchesFirst(t *testing.T) {
+	declared := outlineDeclaredFile(120)
+	// More task-term matches than the cap can hold: the strongest match must
+	// still survive, ahead of the rows matching a single term.
+	for index := 20; index < 100; index++ {
+		declared[index] = outlineDeclaration(fmt.Sprintf("retryOnce%02d", index), index+1)
+	}
+	declared[60] = outlineDeclaration("retryBackoffSchedule", 61)
+	terms := exploreTerminalTerms("the retry backoff schedule never fires")
+	outline := newLocalizationFileOutlineForTerms(outlineLeadingFile, declared, terms, localizationOutlineRowCap)
+	if !outlineRowNamed(outline, "retryBackoffSchedule") {
+		t.Fatalf("outline dropped the strongest task-term match: %#v", outline)
 	}
 }
 
@@ -347,7 +434,7 @@ func TestScatteredRankingCarriesNoOutline(t *testing.T) {
 		targets = append(targets, exploreTarget{node: node})
 	}
 	enumerated := 0
-	outline := localizationLeadingFileOutlineProvider(pool, targets, func(string) []*graph.Node {
+	outline := localizationLeadingFileOutlineProvider(pool, targets, nil, func(string) []*graph.Node {
 		enumerated++
 		return nil
 	})

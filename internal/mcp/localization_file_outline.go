@@ -36,14 +36,21 @@ type localizationOutlineRow struct {
 	Kind string `json:"kind,omitempty"`
 }
 
-// localizationFileOutline is the bounded declaration index of a page's leading
-// file. Declared counts what the file declares; Elided counts the rows the cap
+// localizationFileOutline is the bounded declaration index of a page file.
+// Declared counts what the file declares; Elided counts the rows the cap
 // dropped from the middle.
+//
+// The unexported fields are the whole file in line order plus the task-term
+// priority over it, retained so the same outline can be re-elided at a smaller
+// cap without re-reading the graph. They are never serialized.
 type localizationFileOutline struct {
 	File     string                   `json:"file"`
 	Declared int                      `json:"declared"`
 	Elided   int                      `json:"elided,omitempty"`
 	Rows     []localizationOutlineRow `json:"rows"`
+
+	all      []localizationOutlineRow
+	priority []int
 }
 
 // localizationPageAcceptsOutline admits the outline on the states whose caller
@@ -63,6 +70,7 @@ func localizationPageAcceptsOutline(state string) bool {
 func localizationLeadingFileOutlineProvider(
 	pool []*rerank.Candidate,
 	targets []exploreTarget,
+	terms map[string]struct{},
 	enumerate func(string) []*graph.Node,
 ) func() *localizationFileOutline {
 	if enumerate == nil {
@@ -87,7 +95,7 @@ func localizationLeadingFileOutlineProvider(
 			// which is the whole of what it knows about that file.
 			nodes = localizationOutlineFetchedNodes(pool, targets)
 		}
-		outline = newLocalizationFileOutline(file, nodes)
+		outline = newLocalizationFileOutlineForTerms(file, nodes, terms, localizationOutlineRowCap)
 		return outline
 	}
 }
@@ -125,10 +133,22 @@ func localizationOutlineFetchedNodes(pool []*rerank.Candidate, targets []explore
 	return nodes
 }
 
-// newLocalizationFileOutline projects one file's declarations into file order.
-// Nodes from another file are dropped, so a candidate pool is as valid an input
-// as a file enumeration.
+// newLocalizationFileOutline projects one file's declarations into file order
+// at the default cap, with no task to prioritize by.
 func newLocalizationFileOutline(file string, nodes []*graph.Node) *localizationFileOutline {
+	return newLocalizationFileOutlineForTerms(file, nodes, nil, localizationOutlineRowCap)
+}
+
+// newLocalizationFileOutlineForTerms projects one file's declarations into file
+// order. Nodes from another file are dropped, so a candidate pool is as valid an
+// input as a file enumeration. Rows whose name carries a task term are ranked
+// ahead of the file's own head and tail for whatever the cap can hold.
+func newLocalizationFileOutlineForTerms(
+	file string,
+	nodes []*graph.Node,
+	terms map[string]struct{},
+	rowCap int,
+) *localizationFileOutline {
 	file = strings.TrimSpace(file)
 	if file == "" {
 		return nil
@@ -169,17 +189,119 @@ func newLocalizationFileOutline(file string, nodes []*graph.Node) *localizationF
 		}
 		return rows[first].Name < rows[second].Name
 	})
-	outline := &localizationFileOutline{File: file, Declared: len(rows), Rows: rows}
-	if len(rows) > localizationOutlineRowCap {
-		// Both ends of a file carry declarations a caller may want; the middle
-		// is what a bounded index can give back.
-		kept := make([]localizationOutlineRow, 0, localizationOutlineRowCap)
-		kept = append(kept, rows[:localizationOutlineHeadRows]...)
-		kept = append(kept, rows[len(rows)-(localizationOutlineRowCap-localizationOutlineHeadRows):]...)
-		outline.Elided = len(rows) - localizationOutlineRowCap
-		outline.Rows = kept
+	outline := &localizationFileOutline{
+		File:     file,
+		Declared: len(rows),
+		all:      rows,
+		priority: localizationOutlinePriority(rows, terms),
 	}
+	outline.elide(rowCap)
 	return outline
+}
+
+// localizationOutlinePriority ranks the declarations a task names: more distinct
+// task terms first, then the longer match, then file order. A row that names
+// nothing the task said is not in the result at all.
+func localizationOutlinePriority(rows []localizationOutlineRow, terms map[string]struct{}) []int {
+	if len(terms) == 0 {
+		return nil
+	}
+	type match struct{ index, matched, longest int }
+	matches := make([]match, 0, len(rows))
+	for index, row := range rows {
+		matched, longest := localizationOutlineRowTermMatch(row.Name, terms)
+		if matched == 0 {
+			continue
+		}
+		matches = append(matches, match{index: index, matched: matched, longest: longest})
+	}
+	sort.SliceStable(matches, func(first, second int) bool {
+		if matches[first].matched != matches[second].matched {
+			return matches[first].matched > matches[second].matched
+		}
+		if matches[first].longest != matches[second].longest {
+			return matches[first].longest > matches[second].longest
+		}
+		return matches[first].index < matches[second].index
+	})
+	priority := make([]int, 0, len(matches))
+	for _, ranked := range matches {
+		priority = append(priority, ranked.index)
+	}
+	return priority
+}
+
+// localizationOutlineRowTermMatch counts the distinct task terms a declaration
+// name carries, over the same camel/snake tokenization and the same root form
+// the task's own terms were built with.
+func localizationOutlineRowTermMatch(name string, terms map[string]struct{}) (matched, longest int) {
+	if len(terms) == 0 {
+		return 0, 0
+	}
+	seen := make(map[string]struct{}, len(terms))
+	for _, raw := range rerank.Tokenize(name) {
+		token := exploreTerminalTermRoot(strings.ToLower(strings.TrimSpace(raw)))
+		if token == "" {
+			continue
+		}
+		if _, ok := terms[token]; !ok {
+			continue
+		}
+		if _, duplicate := seen[token]; duplicate {
+			continue
+		}
+		seen[token] = struct{}{}
+		matched++
+		if len(token) > longest {
+			longest = len(token)
+		}
+	}
+	return matched, longest
+}
+
+// elide re-projects the retained rows at rowCap. The declarations the task names
+// are kept first; the file's head and tail then fill whatever the cap has left,
+// so an index the caller cannot navigate by eye still shows both of its ends.
+func (o *localizationFileOutline) elide(rowCap int) {
+	if o == nil {
+		return
+	}
+	if rowCap < 0 {
+		rowCap = 0
+	}
+	if len(o.all) <= rowCap {
+		o.Rows = o.all
+		o.Elided = 0
+		return
+	}
+	kept := make(map[int]struct{}, rowCap)
+	for _, index := range o.priority {
+		if len(kept) >= rowCap {
+			break
+		}
+		kept[index] = struct{}{}
+	}
+	// Both ends of a file carry declarations a caller may want; the middle is
+	// what a bounded index gives back once the task's own matches are held.
+	headQuota := (rowCap - len(kept)) / 2
+	for index := 0; index < len(o.all) && headQuota > 0 && len(kept) < rowCap; index++ {
+		if _, duplicate := kept[index]; duplicate {
+			continue
+		}
+		kept[index] = struct{}{}
+		headQuota--
+	}
+	for index := len(o.all) - 1; index >= 0 && len(kept) < rowCap; index-- {
+		kept[index] = struct{}{}
+	}
+	rows := make([]localizationOutlineRow, 0, len(kept))
+	for index, row := range o.all {
+		if _, keep := kept[index]; keep {
+			rows = append(rows, row)
+		}
+	}
+	o.Rows = rows
+	o.Elided = len(o.all) - len(rows)
 }
 
 func localizationOutlineKindLetter(kind graph.NodeKind) string {

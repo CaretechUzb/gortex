@@ -3060,9 +3060,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	targets = append(targets[:len(artifactTargets):len(artifactTargets)], pageTargets...)
 	// The same leading file, indexed rather than ranked. The enumeration is
 	// deferred: only a page that stays non-terminal pays for it, and it pays
-	// once however many envelopes this request packs.
+	// once however many envelopes this request packs. The task's own terms ride
+	// along so a bounded index keeps the declarations the task named.
 	pageOutline := localizationLeadingFileOutlineProvider(
-		localizationRankedPool, pageTargets,
+		localizationRankedPool, pageTargets, exploreTerminalTerms(task),
 		func(file string) []*graph.Node { return fileDefinitionNodes(eng, file) },
 	)
 	// File evidence can make localization answer-ready, but it never becomes a
