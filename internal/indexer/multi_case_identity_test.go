@@ -82,6 +82,19 @@ func TestScopeForCWD_CaseMismatchedCwd(t *testing.T) {
 	assert.Equal(t, "myrepo", prefix)
 }
 
+// The reverse direction folds too: a case-variant of the PARENT above
+// the tracked repo (a workspace-root cwd) still resolves to the
+// contained repo. The #277 scenario one level up.
+func TestScopeForCWD_CaseMismatchedWorkspaceRoot(t *testing.T) {
+	forceCaseInsensitive(t, true)
+	mi, dir := indexSingleRepoForTest(t)
+
+	parent := caseVariantOf(filepath.Dir(dir))
+	_, _, prefix, ok := mi.ScopeForCWD(parent)
+	require.True(t, ok, "case-variant workspace root must resolve to the contained repo")
+	assert.Equal(t, "myrepo", prefix)
+}
+
 // ScopeForCWD must NOT resolve a genuinely unrelated cwd.
 func TestScopeForCWD_UnrelatedCwdMisses(t *testing.T) {
 	forceCaseInsensitive(t, true)
