@@ -646,6 +646,119 @@ func TestOutlineShrinksRatherThanVanishingWhenTheBudgetBinds(t *testing.T) {
 	}
 }
 
+// outlineBudgetFillingTargets is a page whose ranked rows fill the localize
+// default budget on their own — the shape that left no room for any index at
+// all. Each row carries the qualified name, signature, and neighbour
+// identifiers a real evidence row serializes.
+func outlineBudgetFillingTargets(count int) []exploreTarget {
+	targets := make([]exploreTarget, 0, count)
+	for index := 0; index < count; index++ {
+		name := fmt.Sprintf("BreadthCandidate%02d", index)
+		dir := fmt.Sprintf("repo/breadth/service/%02d", index)
+		qual := dir + "/handler." + name + ".ExecuteWithRetriesAndBackoff"
+		neighbors := make([]*graph.Node, 0, 3)
+		for neighbor := 0; neighbor < 3; neighbor++ {
+			neighbors = append(neighbors, &graph.Node{
+				ID: fmt.Sprintf("%s/neighbor_%d.go::NeighbouringCandidate%02d%d.Execute", dir, neighbor, index, neighbor),
+			})
+		}
+		targets = append(targets, exploreTarget{
+			node: &graph.Node{
+				ID:        dir + "/handler.go::" + name,
+				Name:      name,
+				QualName:  qual,
+				Kind:      graph.KindFunction,
+				FilePath:  dir + "/handler.go",
+				StartLine: 24,
+				EndLine:   96,
+				Meta: map[string]any{
+					"signature": "func (" + name + ") ExecuteWithRetriesAndBackoff(ctx context.Context, request *BreadthRequest, options ...BreadthOption) (*BreadthResponse, error)",
+					"qualname":  qual,
+				},
+			},
+			callers: neighbors,
+			callees: neighbors,
+		})
+	}
+	return targets
+}
+
+func TestOutlineFloorOutranksTheTrailingRowsExpansionDetail(t *testing.T) {
+	const named = "computeRetryBackoff"
+	declared := outlineDeclaredFile(20)
+	middle := len(declared) / 2
+	declared[middle] = outlineDeclaration(named, middle+1)
+	task := "the retry backoff never fires after a throttled response"
+	targets := []exploreTarget{
+		{node: declared[0], source: "func Declared00() { executeAll() }"},
+		{node: declared[1], source: "func Declared01() { executeOne() }"},
+	}
+	targets = append(targets, outlineBudgetFillingTargets(8)...)
+	routes := exploreLocalizationRefinementRoutes(targets)
+
+	build := func(withOutline bool) localizationExploreEnvelope {
+		var outline func() *localizationPageOutline
+		if withOutline {
+			outline = localizationPageOutlineProvider(
+				outlinePool(declared[0], declared[1]), targets, exploreTerminalTerms(task),
+				func(file string) []*graph.Node {
+					if file == outlineLeadingFile {
+						return declared
+					}
+					return nil
+				},
+			)
+		}
+		result, completion, _, _ := buildLocalizationRefinementResultForTaskWithOutline(
+			declared[0].ID, task, targets, localizationDefaultBudgetTokens, routes, outline,
+		)
+		if completion.State != localizationStateNeedsRefinement {
+			t.Fatalf("completion state = %q, want %q", completion.State, localizationStateNeedsRefinement)
+		}
+		budget := localizationDefaultBudgetTokens * localizationEnvelopeBytesPerToken
+		if bytes := outlineEnvelopeBytes(t, result); bytes > budget {
+			t.Fatalf("envelope = %d bytes, budget = %d", bytes, budget)
+		}
+		return outlineEnvelope(t, result)
+	}
+
+	bare := build(false)
+	if bare.Outline != nil {
+		t.Fatalf("the no-outline build produced one: %#v", bare.Outline)
+	}
+	// The fixture only proves anything if the rows really did fill the budget:
+	// a page with room to spare never has to trade anything for its index.
+	if len(bare.Evidence) != len(targets) {
+		t.Fatalf("bare evidence rows = %d, want all %d ranked rows", len(bare.Evidence), len(targets))
+	}
+	page := build(true)
+	if page.Outline == nil || len(page.Outline.Rows) < localizationOutlineFloorRows {
+		t.Fatalf("a page whose rows filled the budget carries no index: %#v", page.Outline)
+	}
+	if !outlineRowNamed(page.Outline, named) {
+		t.Fatalf("the retained index misses the declaration the task names: %#v", page.Outline.Rows)
+	}
+	// Not one ranked row was given up for it, and none lost its identity.
+	if !reflect.DeepEqual(page.Symbols, bare.Symbols) || !reflect.DeepEqual(page.Files, bare.Files) {
+		t.Fatalf("the index cost ranked rows: %d/%d symbols, %d/%d files",
+			len(page.Symbols), len(bare.Symbols), len(page.Files), len(bare.Files))
+	}
+	for index, row := range page.Evidence {
+		if row.ID != bare.Evidence[index].ID || row.Line != bare.Evidence[index].Line ||
+			row.File != bare.Evidence[index].File || row.Name != bare.Evidence[index].Name {
+			t.Fatalf("row %d lost its identity: %#v against %#v", index, row, bare.Evidence[index])
+		}
+	}
+	// The detail it traded came off the expendable tail, never the rows the
+	// refinement contract is allowed to name.
+	for index := 0; index < min(localizationDirectEvidenceReserve, len(page.Evidence)); index++ {
+		if !reflect.DeepEqual(page.Evidence[index], bare.Evidence[index]) {
+			t.Fatalf("row %d inside the direct-evidence reserve gave up detail: %#v against %#v",
+				index, page.Evidence[index], bare.Evidence[index])
+		}
+	}
+}
+
 func TestOutlineShrinkingNeverEscapesTheProviderCache(t *testing.T) {
 	declared := outlineDeclaredFile(40)
 	targets := []exploreTarget{{node: declared[0]}, {node: declared[1]}}

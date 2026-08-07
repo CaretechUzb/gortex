@@ -458,6 +458,23 @@ func (p *localizationPageOutline) empty() bool {
 	return p == nil || (p.Leading == nil && len(p.Others) == 0)
 }
 
+// atFloor reports a block that has given back every row it can and would next
+// have to give back a whole file.
+func (p *localizationPageOutline) atFloor() bool {
+	if p == nil {
+		return true
+	}
+	if p.Leading != nil && len(p.Leading.Rows) > localizationOutlineFloorRows {
+		return false
+	}
+	for _, other := range p.Others {
+		if other != nil && len(other.Rows) > localizationOutlineFloorRows {
+			return false
+		}
+	}
+	return true
+}
+
 // localizationOutlineNextRowCap steps a bounded index down in proportion to its
 // size, so a wide outline converges on a fitting one in a few steps and a narrow
 // one gives back only what it must.

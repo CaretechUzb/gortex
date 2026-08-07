@@ -4403,6 +4403,17 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 			// reach by other means, so they give way before every other payload
 			// here — but they give way by degrees. A shorter index is worth far
 			// more than none, and only pressure past the floor drops one.
+			if block.atFloor() &&
+				localizationShedTrailingEvidenceDetail(&envelope, mandatoryCount) {
+				// The index has given back everything it can and the page still
+				// does not fit. A ranked page fills its budget with rows, so
+				// without this the floor is unreachable exactly on the pages
+				// that need an index most. The expendable breadth tail pays,
+				// in the detail a caller can re-derive from the identity that
+				// stays — never in a row, and never inside the reserve the
+				// refinement contract may name.
+				continue
+			}
 			block.relieve()
 			envelope.Outline, envelope.Outlines = block.Leading, block.Others
 			continue
@@ -4449,6 +4460,27 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 	}
 	result := attachLocalizationHostEnvelope(mcp.NewToolResultText(string(body)), envelope.Completion, digest)
 	return result, append([]string(nil), envelope.Symbols...), digest, envelope.Completion
+}
+
+// localizationShedTrailingEvidenceDetail gives back one trailing row's
+// expansion detail — the qualified name, signature, and neighbour identifiers a
+// caller can re-derive from the identity that stays. Only the breadth tail past
+// the direct-evidence reserve is eligible, and the row's ID, kind, file, line,
+// and provenance are untouched, so nothing the completion contract or the
+// evidence policy reads can move. This is the same trade the packing loop
+// already makes for a mandatory row that will not fit whole.
+func localizationShedTrailingEvidenceDetail(envelope *localizationExploreEnvelope, mandatory int) bool {
+	protected := max(mandatory, localizationDirectEvidenceReserve)
+	for index := len(envelope.Evidence) - 1; index >= protected; index-- {
+		row := &envelope.Evidence[index]
+		if row.QualName == "" && row.Signature == "" && len(row.Callers) == 0 && len(row.Callees) == 0 {
+			continue
+		}
+		row.QualName, row.Signature = "", ""
+		row.Callers, row.Callees = nil, nil
+		return true
+	}
+	return false
 }
 
 func boundedLocalizationNeighborIDs(nodes []*graph.Node, limit int) []string {
