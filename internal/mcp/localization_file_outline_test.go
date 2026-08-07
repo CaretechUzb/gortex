@@ -159,7 +159,7 @@ func TestTerminalPageCarriesNoOutlineAndPaysNoEnumeration(t *testing.T) {
 	}
 }
 
-func TestOutlineShedsBeforeEvidenceRowsUnderATightBudget(t *testing.T) {
+func TestOutlineGivesWayBeforeEvidenceRowsUnderATightBudget(t *testing.T) {
 	declared := outlineDeclaredFile(40)
 	long := strings.Repeat("quoted-\"-slash-\\-metadata-", 24)
 	neighbors := make([]*graph.Node, 0, 12)
@@ -199,8 +199,13 @@ func TestOutlineShedsBeforeEvidenceRowsUnderATightBudget(t *testing.T) {
 	}
 
 	tight, tightBytes := build(exploreMinBudgetTokens, true)
+	// The outline is what a tight page gives back, and it gives it back by
+	// degrees: fewer rows down to the floor, then nothing.
 	if tight.Outline != nil {
-		t.Fatalf("tight page kept the outline: %#v", tight.Outline)
+		if rows := len(tight.Outline.Rows); rows >= len(declared) || rows < localizationOutlineFloorRows {
+			t.Fatalf("tight page kept %d outline rows of %d declared, floor %d",
+				rows, len(declared), localizationOutlineFloorRows)
+		}
 	}
 	if tightBytes > exploreMinBudgetTokens*localizationEnvelopeBytesPerToken {
 		t.Fatalf("tight envelope = %d bytes, budget = %d",
@@ -214,8 +219,12 @@ func TestOutlineShedsBeforeEvidenceRowsUnderATightBudget(t *testing.T) {
 	// The same rows and the same outline, with room for both: only the budget
 	// decided which one gave way.
 	wide, _ := build(exploreMaxBudgetTokens, true)
-	if wide.Outline == nil {
-		t.Fatal("a page with room to spare shed the outline anyway")
+	if wide.Outline == nil || len(wide.Outline.Rows) != len(declared) {
+		t.Fatalf("a page with room to spare shortened its outline: %#v", wide.Outline)
+	}
+	if tight.Outline != nil && len(tight.Outline.Rows) >= len(wide.Outline.Rows) {
+		t.Fatalf("the tight page gave nothing back: %d rows against %d",
+			len(tight.Outline.Rows), len(wide.Outline.Rows))
 	}
 }
 
@@ -385,6 +394,134 @@ func TestOutlineElisionKeepsTaskTermMatchingDeclarations(t *testing.T) {
 	if outline.Rows[0].Line != 1 || outline.Rows[len(outline.Rows)-1].Line != len(declared) {
 		t.Fatalf("outline spans lines %d..%d, want the whole file's ends",
 			outline.Rows[0].Line, outline.Rows[len(outline.Rows)-1].Line)
+	}
+}
+
+// outlineBreadthTargets is the ranked breadth a real localization page carries
+// beside its leading file: distinct files, each with the qualified name,
+// signature, and neighbor identifiers an evidence row serializes.
+func outlineBreadthTargets(count int) []exploreTarget {
+	targets := make([]exploreTarget, 0, count)
+	for index := 0; index < count; index++ {
+		name := fmt.Sprintf("BreadthCandidate%02d", index)
+		qual := fmt.Sprintf("repo/breadth/service/%02d/handler.BreadthCandidate%02d.Execute", index, index)
+		neighbors := make([]*graph.Node, 0, 3)
+		for neighbor := 0; neighbor < 3; neighbor++ {
+			neighbors = append(neighbors, &graph.Node{
+				ID: fmt.Sprintf("repo/breadth/service/%02d/neighbor_%d.go::Neighbor%02d%d", index, neighbor, index, neighbor),
+			})
+		}
+		targets = append(targets, exploreTarget{
+			node: &graph.Node{
+				ID:        fmt.Sprintf("repo/breadth/service/%02d/handler.go::%s", index, name),
+				Name:      name,
+				QualName:  qual,
+				Kind:      graph.KindFunction,
+				FilePath:  fmt.Sprintf("repo/breadth/service/%02d/handler.go", index),
+				StartLine: 24,
+				EndLine:   96,
+				Meta: map[string]any{
+					"signature": "func (" + name + ") Execute(ctx context.Context, request *BreadthRequest, options ...BreadthOption) (*BreadthResponse, error)",
+					"qualname":  qual,
+				},
+			},
+			callers: neighbors,
+			callees: neighbors,
+		})
+	}
+	return targets
+}
+
+func TestOutlineShrinksRatherThanVanishingWhenTheBudgetBinds(t *testing.T) {
+	const named = "computeRetryBackoff"
+	declared := outlineDeclaredFile(40)
+	// The answer is a declaration of the file the page already leads with, in
+	// the middle of it — the shape the outline exists to catch.
+	middle := len(declared) / 2
+	declared[middle] = outlineDeclaration(named, middle+1)
+	task := "the retry backoff never fires after a throttled response"
+	targets := []exploreTarget{
+		{node: declared[0], source: "func Declared00() { executeAll() }"},
+		{node: declared[1], source: "func Declared01() { executeOne() }"},
+	}
+	targets = append(targets, outlineBreadthTargets(8)...)
+	routes := exploreLocalizationRefinementRoutes(targets)
+
+	build := func(budget int) localizationExploreEnvelope {
+		outline := localizationLeadingFileOutlineProvider(
+			outlinePool(declared[0], declared[1]), targets, exploreTerminalTerms(task),
+			func(string) []*graph.Node { return declared },
+		)
+		result, completion, _, _ := buildLocalizationRefinementResultForTaskWithOutline(
+			declared[0].ID, task, targets, budget, routes, outline,
+		)
+		if completion.State != localizationStateNeedsRefinement {
+			t.Fatalf("completion state = %q, want %q", completion.State, localizationStateNeedsRefinement)
+		}
+		if bytes := outlineEnvelopeBytes(t, result); bytes > budget*localizationEnvelopeBytesPerToken {
+			t.Fatalf("envelope = %d bytes, budget = %d", bytes, budget*localizationEnvelopeBytesPerToken)
+		}
+		return outlineEnvelope(t, result)
+	}
+
+	roomy := build(exploreMaxBudgetTokens)
+	if roomy.Outline == nil || len(roomy.Outline.Rows) != localizationOutlineRowCap {
+		t.Fatalf("roomy page outline = %#v, want the full %d rows", roomy.Outline, localizationOutlineRowCap)
+	}
+
+	page := build(localizationDefaultBudgetTokens)
+	if page.Outline == nil {
+		t.Fatal("the default budget shed the leading-file outline entirely")
+	}
+	if len(page.Outline.Rows) >= localizationOutlineRowCap {
+		t.Fatalf("fixture is not under budget pressure: %d rows survived at the default budget",
+			len(page.Outline.Rows))
+	}
+	if len(page.Outline.Rows) < localizationOutlineFloorRows {
+		t.Fatalf("outline shrank past its floor: %d rows, floor %d",
+			len(page.Outline.Rows), localizationOutlineFloorRows)
+	}
+	if page.Outline.Declared != len(declared) {
+		t.Fatalf("outline declared = %d, want the file's %d", page.Outline.Declared, len(declared))
+	}
+	if !outlineRowNamed(page.Outline, named) {
+		t.Fatalf("shrinking dropped the declaration the task names: %#v", page.Outline.Rows)
+	}
+	if len(page.Evidence) != len(roomy.Evidence) {
+		t.Fatalf("evidence rows = %d, want the %d the same page carries with room to spare",
+			len(page.Evidence), len(roomy.Evidence))
+	}
+}
+
+func TestOutlineShrinkingNeverEscapesTheProviderCache(t *testing.T) {
+	declared := outlineDeclaredFile(40)
+	targets := []exploreTarget{{node: declared[0]}, {node: declared[1]}}
+	targets = append(targets, outlineBreadthTargets(8)...)
+	outline := localizationLeadingFileOutlineProvider(
+		outlinePool(declared[0], declared[1]), targets, nil,
+		func(string) []*graph.Node { return declared },
+	)
+	routes := exploreLocalizationRefinementRoutes(targets)
+	// The same provider serves every envelope one request packs. A page that
+	// shrank its outline must not hand the next page a shrunken one.
+	tight, _, _, _ := buildLocalizationRefinementResultForTaskWithOutline(
+		declared[0].ID, "find the declared implementation", targets,
+		localizationDefaultBudgetTokens, routes, outline,
+	)
+	roomy, _, _, _ := buildLocalizationRefinementResultForTaskWithOutline(
+		declared[0].ID, "find the declared implementation", targets,
+		exploreMaxBudgetTokens, routes, outline,
+	)
+	tightPage, roomyPage := outlineEnvelope(t, tight), outlineEnvelope(t, roomy)
+	if tightPage.Outline == nil || roomyPage.Outline == nil {
+		t.Fatalf("outlines = %#v tight, %#v roomy; want both pages indexed",
+			tightPage.Outline, roomyPage.Outline)
+	}
+	tightRows := len(tightPage.Outline.Rows)
+	roomyRows := len(roomyPage.Outline.Rows)
+	if roomyRows != localizationOutlineRowCap || roomyRows <= tightRows {
+		t.Fatalf("outline rows = %d tight, %d roomy; want the cached outline unshrunk at %d",
+			tightRows, roomyRows, localizationOutlineRowCap)
 	}
 }
 

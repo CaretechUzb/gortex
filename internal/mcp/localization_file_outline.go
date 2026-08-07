@@ -26,6 +26,9 @@ const (
 	// localizationOutlineHeadRows splits an elided outline between the file's
 	// opening declarations and its closing ones.
 	localizationOutlineHeadRows = localizationOutlineRowCap / 2
+	// localizationOutlineFloorRows is the smallest index still worth its bytes.
+	// Budget pressure shrinks an outline to this floor before it may drop one.
+	localizationOutlineFloorRows = 8
 )
 
 type localizationOutlineRow struct {
@@ -302,6 +305,43 @@ func (o *localizationFileOutline) elide(rowCap int) {
 	}
 	o.Rows = rows
 	o.Elided = len(o.all) - len(rows)
+}
+
+// clone detaches an outline from the provider's cache. One request can pack
+// several envelopes from the same provider, and each envelope shrinks its own
+// copy under its own budget; the retained declarations are read-only and stay
+// shared.
+func (o *localizationFileOutline) clone() *localizationFileOutline {
+	if o == nil {
+		return nil
+	}
+	copied := *o
+	copied.Rows = append([]localizationOutlineRow(nil), o.Rows...)
+	return &copied
+}
+
+// localizationOutlineRelief gives back one increment of outline payload, and
+// reports whether anything was given. An outline that no longer fits shrinks
+// toward its floor before it is dropped: a shorter index still names the file
+// and still carries the declarations the task asked about, where no index at
+// all sends the caller back to search for what it is already looking at.
+func localizationOutlineRelief(outline *localizationFileOutline) (*localizationFileOutline, bool) {
+	if outline == nil {
+		return nil, false
+	}
+	if rows := len(outline.Rows); rows > localizationOutlineFloorRows {
+		outline.elide(localizationOutlineNextRowCap(rows))
+		return outline, true
+	}
+	return nil, true
+}
+
+// localizationOutlineNextRowCap steps a bounded index down in proportion to its
+// size, so a wide outline converges on a fitting one in a few steps and a narrow
+// one gives back only what it must.
+func localizationOutlineNextRowCap(rows int) int {
+	step := max(rows/4, 4)
+	return max(rows-step, localizationOutlineFloorRows)
 }
 
 func localizationOutlineKindLetter(kind graph.NodeKind) string {

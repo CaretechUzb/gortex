@@ -4377,7 +4377,7 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 	// with; the outline is that file's remaining declarations, and it is the
 	// first thing given back when the budget cannot hold everything.
 	if outline != nil && localizationPageAcceptsOutline(envelope.Completion.State) {
-		envelope.Outline = outline()
+		envelope.Outline = outline().clone()
 	}
 	// The ready-to-emit answer is derived from the retained rows, so it lands
 	// after the fit checks above and can push the envelope past its budget.
@@ -4393,9 +4393,10 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 	for !localizationEnvelopeFits(envelope, shedBudget) {
 		if envelope.Outline != nil {
 			// The outline is a convenience over rows the caller can still reach
-			// by other means; every other payload here is evidence this
-			// response is answering with.
-			envelope.Outline = nil
+			// by other means, so it gives way before every other payload here —
+			// but it gives way by degrees. A shorter index is worth far more
+			// than none, and only pressure past its floor drops it outright.
+			envelope.Outline, _ = localizationOutlineRelief(envelope.Outline)
 			continue
 		}
 		if digest != nil && len(digest.Evidence) > localizationFinalResponsePrimaryLimit {
