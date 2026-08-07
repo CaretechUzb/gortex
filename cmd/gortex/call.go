@@ -56,7 +56,8 @@ from three layers (last wins per key):
 number, null -> null, a value starting with [ or { -> parsed JSON, key:=<raw>
 forces raw-JSON parse of the right-hand side (so version:="1.0" stays the
 string "1.0"), key= -> the empty string, and anything else stays a string.
-Repeating a key replaces the earlier value.
+The walrus is recognised only when ":=" opens the token, so a value that quotes
+":=" is passed through verbatim. Repeating a key replaces the earlier value.
 
 Use --dry to print the lowered argument object and the target tool without
 calling the daemon (works with no daemon running). Use --format to pick the
@@ -281,15 +282,25 @@ func mergeJSONObject(dst map[string]any, data []byte, source string) error {
 // type coercion. The grammar:
 //
 //	key:=<raw>  walrus — the right-hand side is parsed as raw JSON (so
-//	            version:="1.0" stays the string "1.0", not a number)
+//	            version:="1.0" stays the string "1.0", not a number). Applies
+//	            only when ":=" opens the token; a ":=" inside the value is
+//	            ordinary text.
 //	key=value   value is coerced: true/false -> bool, int/float -> number,
 //	            null -> null, a value starting with [ or { -> parsed JSON,
 //	            key= -> empty string, everything else -> string
 func coerceArg(token string) (string, any, error) {
-	// Walrus first: a "key:=rhs" forces raw-JSON parse of the RHS. Detect the
-	// ":=" boundary before the plain "=" so version:="1.0" is not mistaken for
-	// a key of "version:" with an "=" value.
-	if i := strings.Index(token, ":="); i >= 0 {
+	// The separator is decided on the KEY position alone. Whichever of ":=" and
+	// "=" opens the token ends the key; everything after it is the value, and a
+	// ":=" that occurs later belongs to the value. Scanning the whole token for
+	// the walrus would split a pasted snippet (task=Dim x := 5) mid-value and
+	// then reject the remainder as invalid JSON.
+	eq := strings.Index(token, "=")
+	if eq < 0 {
+		return "", nil, fmt.Errorf("--arg %q: expected key=value or key:=<json>", token)
+	}
+	// Walrus: a "key:=rhs" forces raw-JSON parse of the RHS, so version:="1.0"
+	// stays the string "1.0" and is not mistaken for a key of "version:".
+	if i := strings.Index(token, ":="); i >= 0 && i < eq {
 		key := token[:i]
 		if key == "" {
 			return "", nil, fmt.Errorf("--arg %q: empty key", token)
@@ -302,10 +313,6 @@ func coerceArg(token string) (string, any, error) {
 		return key, v, nil
 	}
 
-	eq := strings.Index(token, "=")
-	if eq < 0 {
-		return "", nil, fmt.Errorf("--arg %q: expected key=value or key:=<json>", token)
-	}
 	key := token[:eq]
 	if key == "" {
 		return "", nil, fmt.Errorf("--arg %q: empty key", token)

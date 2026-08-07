@@ -114,6 +114,46 @@ func TestCoerceArg(t *testing.T) {
 	})
 }
 
+// TestCoerceArg_SeparatorChosenByKeyPosition pins the rule that decides which
+// separator splits a token: the walrus applies only when ":=" opens the token's
+// key, so a VALUE that quotes ":=" (a pasted VB/Go snippet, a Pascal
+// assignment) is carried through verbatim instead of being split mid-value and
+// rejected as invalid JSON.
+func TestCoerceArg_SeparatorChosenByKeyPosition(t *testing.T) {
+	t.Run("value containing walrus stays a string", func(t *testing.T) {
+		k, v, err := coerceArg("key=a:=b")
+		require.NoError(t, err)
+		require.Equal(t, "key", k)
+		require.Equal(t, "a:=b", v)
+	})
+	t.Run("walrus in key position parses JSON", func(t *testing.T) {
+		k, v, err := coerceArg(`key:={"x":1}`)
+		require.NoError(t, err)
+		require.Equal(t, "key", k)
+		require.Equal(t, map[string]any{"x": float64(1)}, v)
+	})
+	t.Run("plain key=value is unchanged", func(t *testing.T) {
+		k, v, err := coerceArg("key=val")
+		require.NoError(t, err)
+		require.Equal(t, "key", k)
+		require.Equal(t, "val", v)
+	})
+	t.Run("value containing both separators is verbatim", func(t *testing.T) {
+		// A pasted issue body: the first "=" ends the key, everything after it
+		// — further "=" signs and the ":=" walrus alike — is the value.
+		k, v, err := coerceArg("task=Dim x := 5 : y = x + 1")
+		require.NoError(t, err)
+		require.Equal(t, "task", k)
+		require.Equal(t, "Dim x := 5 : y = x + 1", v)
+	})
+	t.Run("walrus still wins when it opens the token", func(t *testing.T) {
+		k, v, err := coerceArg(`note:="a=b:=c"`)
+		require.NoError(t, err)
+		require.Equal(t, "note", k)
+		require.Equal(t, "a=b:=c", v)
+	})
+}
+
 // TestLowerCallArgs_Precedence asserts the three precedence layers: base JSON,
 // inline JSON merged over it, and --arg merged on top (last wins per key).
 func TestLowerCallArgs_Precedence(t *testing.T) {
