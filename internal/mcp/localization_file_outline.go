@@ -117,10 +117,6 @@ func localizationPageOutlineProvider(
 			return page
 		}
 		built = true
-		leading := localizationOutlineLeadingFile(pool, targets)
-		if leading == "" {
-			return nil
-		}
 		index := func(file string, rank int) *localizationFileOutline {
 			nodes := enumerate(file)
 			if len(nodes) == 0 {
@@ -130,13 +126,24 @@ func localizationPageOutlineProvider(
 			}
 			return newLocalizationFileOutlineForTerms(file, nodes, terms, localizationOutlineFileRowCap(rank))
 		}
-		outline := index(leading, 0)
-		if outline == nil {
-			return nil
+		// A page whose ranking never settled on one file has no leading slice to
+		// give — but its rows still name files, and every one of them declares
+		// siblings the rows could not show. Those files are indexed at the
+		// shallower depths instead, so scattered ranking costs the caller an
+		// index only where there is nothing to index.
+		leading := localizationOutlineLeadingFile(pool, targets)
+		following := localizationOutlineFileCap
+		page = &localizationPageOutline{}
+		if leading != "" {
+			if outline := index(leading, 0); outline != nil {
+				page.Leading = outline
+				following--
+			} else {
+				leading = ""
+			}
 		}
-		page = &localizationPageOutline{Leading: outline}
 		ranked := localizationOutlinePageRowCounts(targets)
-		for _, file := range localizationOutlineFollowingFiles(targets, leading, localizationOutlineFileCap-1) {
+		for _, file := range localizationOutlineFollowingFiles(targets, leading, following) {
 			other := index(file, len(page.Others)+1)
 			if other == nil || other.Declared <= ranked[file] {
 				// A file whose every declaration is already a row on this page
@@ -145,6 +152,9 @@ func localizationPageOutlineProvider(
 				continue
 			}
 			page.Others = append(page.Others, other)
+		}
+		if page.empty() {
+			page = nil
 		}
 		return page
 	}

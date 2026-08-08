@@ -921,29 +921,57 @@ func TestOutlineElisionRanksStrongerTaskTermMatchesFirst(t *testing.T) {
 	}
 }
 
-func TestScatteredRankingCarriesNoOutline(t *testing.T) {
+func TestScatteredRankingIndexesThePageFilesWithoutALeadingOne(t *testing.T) {
 	var pool []*rerank.Candidate
 	var targets []exploreTarget
+	declared := map[string][]*graph.Node{}
 	for index := 0; index < 6; index++ {
+		file := fmt.Sprintf("repo/scatter_%d.go", index)
 		node := &graph.Node{
-			ID:        fmt.Sprintf("repo/scatter_%d.go::Scatter%d", index, index),
+			ID:        file + fmt.Sprintf("::Scatter%d", index),
 			Name:      fmt.Sprintf("Scatter%d", index),
 			Kind:      graph.KindFunction,
-			FilePath:  fmt.Sprintf("repo/scatter_%d.go", index),
+			FilePath:  file,
 			StartLine: 3,
 		}
 		pool = append(pool, &rerank.Candidate{Node: node, TextRank: index, VectorRank: -1})
 		targets = append(targets, exploreTarget{node: node})
+		for sibling := 0; sibling < 4; sibling++ {
+			declared[file] = append(declared[file], &graph.Node{
+				ID:        file + fmt.Sprintf("::Sibling%d%d", index, sibling),
+				Name:      fmt.Sprintf("Sibling%d%d", index, sibling),
+				Kind:      graph.KindFunction,
+				FilePath:  file,
+				StartLine: 10 + sibling*5,
+			})
+		}
 	}
 	enumerated := 0
-	outline := localizationPageOutlineProvider(pool, targets, nil, func(string) []*graph.Node {
+	page := localizationPageOutlineProvider(pool, targets, nil, func(file string) []*graph.Node {
 		enumerated++
-		return nil
-	})
-	if page := outline(); page != nil {
-		t.Fatalf("scattered ranking produced an outline: %#v", page)
+		return declared[file]
+	})()
+	if page == nil {
+		t.Fatal("a scattered page carries no index at all")
 	}
-	if enumerated != 0 {
-		t.Fatalf("scattered ranking paid %d graph enumerations", enumerated)
+	// Ranking never settled, so no file earns the leading slot — but the rows
+	// still name files, and each of them declares siblings the rows never show.
+	if page.Leading != nil {
+		t.Fatalf("a scattered page elected a leading file: %#v", page.Leading)
+	}
+	if len(page.Others) == 0 {
+		t.Fatal("a scattered page indexed none of the files its rows named")
+	}
+	if len(page.Others) > localizationOutlineFileCap {
+		t.Fatalf("indexed %d files, cap %d", len(page.Others), localizationOutlineFileCap)
+	}
+	if enumerated > localizationOutlineFileCap {
+		t.Fatalf("scattered ranking paid %d graph enumerations, cap %d",
+			enumerated, localizationOutlineFileCap)
+	}
+	for _, other := range page.Others {
+		if len(other.Rows) > localizationOutlineSecondFileRowCap {
+			t.Fatalf("a file on a page with no leading one took the deepest slice: %#v", other)
+		}
 	}
 }
