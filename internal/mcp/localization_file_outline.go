@@ -433,17 +433,18 @@ func (p *localizationPageOutline) relieve() {
 	if p == nil {
 		return
 	}
-	deepest, rows := (*localizationFileOutline)(nil), localizationOutlineFloorRows
+	floor := p.leadingFloor()
+	deepest, rows := (*localizationFileOutline)(nil), floor
 	if p.Leading != nil && len(p.Leading.Rows) > rows {
 		deepest, rows = p.Leading, len(p.Leading.Rows)
 	}
 	for _, other := range p.Others {
 		if other != nil && len(other.Rows) >= rows && len(other.Rows) > localizationOutlineFloorRows {
-			deepest, rows = other, len(other.Rows)
+			deepest, rows, floor = other, len(other.Rows), localizationOutlineFloorRows
 		}
 	}
 	if deepest != nil {
-		deepest.elide(localizationOutlineNextRowCap(rows))
+		deepest.elide(max(localizationOutlineNextRowCap(rows), floor))
 		return
 	}
 	if last := len(p.Others); last > 0 {
@@ -451,6 +452,18 @@ func (p *localizationPageOutline) relieve() {
 		return
 	}
 	p.Leading = nil
+}
+
+// leadingFloor is where the leading file's index stops shrinking. While the page
+// still indexes further files, they are what a tight page gives back — measured,
+// spending the leading file's depth on a neighbour's first twelve rows loses the
+// answer more often than it finds one. Once no further file is left, the leading
+// index may shrink to the same floor as any other.
+func (p *localizationPageOutline) leadingFloor() int {
+	if len(p.Others) > 0 {
+		return localizationOutlineSecondFileRowCap
+	}
+	return localizationOutlineFloorRows
 }
 
 // empty reports a block with nothing left to give.
@@ -464,7 +477,7 @@ func (p *localizationPageOutline) atFloor() bool {
 	if p == nil {
 		return true
 	}
-	if p.Leading != nil && len(p.Leading.Rows) > localizationOutlineFloorRows {
+	if p.Leading != nil && len(p.Leading.Rows) > p.leadingFloor() {
 		return false
 	}
 	for _, other := range p.Others {

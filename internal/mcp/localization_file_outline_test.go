@@ -762,6 +762,57 @@ func TestOutlineFloorOutranksTheTrailingRowsExpansionDetail(t *testing.T) {
 	}
 }
 
+func TestFurtherFilesGiveWayBeforeTheLeadingFilesDepth(t *testing.T) {
+	leading := &localizationFileOutline{File: "repo/lead.go"}
+	leading.all = make([]localizationOutlineRow, 0, 30)
+	for index := 0; index < 30; index++ {
+		leading.all = append(leading.all, localizationOutlineRow{
+			Name: fmt.Sprintf("Declared%02d", index), Line: index + 1, Kind: "f",
+		})
+	}
+	leading.Declared = len(leading.all)
+	leading.elide(localizationOutlineRowCap)
+	page := &localizationPageOutline{Leading: leading}
+	for _, file := range []string{"repo/second.go", "repo/third.go"} {
+		other := &localizationFileOutline{File: file}
+		for index := 0; index < 20; index++ {
+			other.all = append(other.all, localizationOutlineRow{
+				Name: fmt.Sprintf("Other%02d", index), Line: index + 1, Kind: "f",
+			})
+		}
+		other.Declared = len(other.all)
+		other.elide(localizationOutlineSecondFileRowCap)
+		page.Others = append(page.Others, other)
+	}
+
+	// Pressure until nothing is left, recording the leading file's depth at the
+	// moment each further file went.
+	depthWhenAFileWent := []int{}
+	for guard := 0; !page.empty(); guard++ {
+		if guard > 200 {
+			t.Fatal("relief never converged")
+		}
+		before := len(page.Others)
+		leadingRows := 0
+		if page.Leading != nil {
+			leadingRows = len(page.Leading.Rows)
+		}
+		page.relieve()
+		if len(page.Others) < before {
+			depthWhenAFileWent = append(depthWhenAFileWent, leadingRows)
+		}
+	}
+	if len(depthWhenAFileWent) != 2 {
+		t.Fatalf("further files dropped %d times, want 2", len(depthWhenAFileWent))
+	}
+	for _, depth := range depthWhenAFileWent {
+		if depth < localizationOutlineSecondFileRowCap {
+			t.Fatalf("a further file survived the leading file's depth falling to %d, floor %d",
+				depth, localizationOutlineSecondFileRowCap)
+		}
+	}
+}
+
 func TestATradeThatCannotSaveTheOutlineIsGivenBack(t *testing.T) {
 	const named = "computeRetryBackoff"
 	declared := outlineDeclaredFile(20)
