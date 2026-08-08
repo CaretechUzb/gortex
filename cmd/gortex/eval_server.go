@@ -2,10 +2,12 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 
 	"github.com/spf13/cobra"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/server"
 )
 
 var (
@@ -33,8 +36,15 @@ var evalServerCmd = &cobra.Command{
 	RunE:  runEvalServer,
 }
 
+var (
+	evalBind      string
+	evalAuthToken string
+)
+
 func init() {
 	evalServerCmd.Flags().IntVar(&evalPort, "port", 4747, "HTTP port to listen on")
+	evalServerCmd.Flags().StringVar(&evalBind, "bind", "127.0.0.1", "bind address; a non-loopback bind requires --auth-token")
+	evalServerCmd.Flags().StringVar(&evalAuthToken, "auth-token", "", "bearer token required for every request (fallback: $GORTEX_EVAL_TOKEN)")
 	evalServerCmd.Flags().StringVar(&evalIndex, "index", "", "repository path to index on startup")
 	evalServerCmd.Flags().StringVar(&evalCacheDir, "cache-dir", "", "index cache directory (default ~/.gortex-eval-cache)")
 	rootCmd.AddCommand(evalServerCmd)
@@ -114,13 +124,28 @@ func runEvalServer(cmd *cobra.Command, args []string) error {
 	// Wire the MCP server's tool dispatch into an HTTP handler.
 	handler := eval.NewHandler(srv.MCPServer(), g, version, logger)
 
-	addr := fmt.Sprintf(":%d", evalPort)
+	// Bind loopback by default and refuse a wider bind without a token.
+	// This surface publishes the daemon's whole tool catalogue — including
+	// file reads and writes — so binding every interface unauthenticated
+	// handed the machine's indexed repositories to anyone who could route
+	// to the port.
+	authToken := evalAuthToken
+	if authToken == "" {
+		authToken = os.Getenv("GORTEX_EVAL_TOKEN")
+	}
+	addr := net.JoinHostPort(evalBind, strconv.Itoa(evalPort))
+	if err := httpTokenRequirementError(addr, authToken); err != nil {
+		return err
+	}
+	if authToken == "" {
+		fmt.Fprintln(os.Stderr, "[gortex] eval-server: unauthenticated mode; localhost only")
+	}
 	httpServer := &http.Server{
 		Addr:    addr,
-		Handler: handler,
+		Handler: server.WithAuth(handler, authToken),
 	}
 
-	fmt.Fprintf(os.Stderr, "[gortex] eval-server listening on http://localhost:%d\n", evalPort)
+	fmt.Fprintf(os.Stderr, "[gortex] eval-server listening on http://%s\n", addr)
 
 	// Start HTTP server in a goroutine.
 	errCh := make(chan error, 1)

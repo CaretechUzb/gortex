@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/zzet/gortex/internal/daemon"
@@ -216,7 +217,45 @@ func buildDaemonStreamableHandler(disp daemon.MCPDispatcher, reg *daemon.Session
 	// Always wrap: the middleware resolves the token per request, so a
 	// request with no configured token is served unauthenticated and the
 	// token can be rotated (added/changed/removed) without a restart.
-	return bearerAuthMiddleware(mux, tokenFn)
+	// The origin guard sits outside it, because the request it refuses is
+	// one a browser makes with the user's own credentials — an unauthenticated
+	// loopback bind is reachable from any page the user visits.
+	return browserOriginGuard(bearerAuthMiddleware(mux, tokenFn), daemonHTTPAllowedOrigins)
+}
+
+// browserOriginGuard refuses a request carrying a cross-origin Origin header.
+//
+// A loopback HTTP bind is not private: every page in the user's browser can
+// reach 127.0.0.1, and the transport's own Origin allowlist
+// (streamable.Config.AllowedOrigins) was never wired to anything, so it
+// admitted every origin. With the surface's default of no auth token on a
+// localhost bind, that made the full MCP tool catalogue — file reads and
+// writes included — reachable from any site the user happened to open.
+//
+// A request with NO Origin header is allowed: browsers always set it
+// cross-origin, and ordinary MCP clients (which are not browsers) never send
+// it. So the guard costs nothing for real clients and closes the browser path.
+// Operators serving a genuine web front end name its origin explicitly.
+func browserOriginGuard(next http.Handler, allowed []string) http.Handler {
+	allowSet := make(map[string]struct{}, len(allowed))
+	for _, o := range allowed {
+		if o = strings.ToLower(strings.TrimSpace(o)); o != "" {
+			allowSet[o] = struct{}{}
+		}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := strings.ToLower(strings.TrimSpace(r.Header.Get("Origin")))
+		if origin == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if _, ok := allowSet[origin]; ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "forbidden: cross-origin requests are not accepted; "+
+			"pass --http-allowed-origin to permit a specific web origin", http.StatusForbidden)
+	})
 }
 
 // bearerAuthMiddleware gates every request behind a bearer token resolved

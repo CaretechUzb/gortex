@@ -64,6 +64,9 @@ func Run(repoRoot, relPath string) (map[int]Author, error) {
 // pinning to `origin/main` so feature-branch work-in-progress doesn't
 // pollute the persisted data.
 func RunAt(repoRoot, rev, relPath string) (map[int]Author, error) {
+	if err := gitcmd.ValidateRef(rev); err != nil {
+		return nil, err
+	}
 	args := []string{"blame", "-p"}
 	if rev != "" {
 		args = append(args, rev)
