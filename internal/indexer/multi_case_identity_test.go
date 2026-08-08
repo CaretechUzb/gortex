@@ -8,9 +8,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/search"
 )
 
 // forceCaseInsensitive flips the process-global pathkey.CaseInsensitivePaths
@@ -84,12 +87,29 @@ func TestScopeForCWD_CaseMismatchedCwd(t *testing.T) {
 
 // The reverse direction folds too: a case-variant of the PARENT above
 // the tracked repo (a workspace-root cwd) still resolves to the
-// contained repo. The #277 scenario one level up.
+// contained repo. The #277 scenario one level up. The repo sits under a
+// LETTERED intermediate directory on purpose: t.TempDir's own basename
+// is digits-only, which swapCaseASCII leaves unchanged — toggling it
+// would exercise nothing.
 func TestScopeForCWD_CaseMismatchedWorkspaceRoot(t *testing.T) {
 	forceCaseInsensitive(t, true)
-	mi, dir := indexSingleRepoForTest(t)
+	dir := setupRepoDir(t, filepath.Join("Work", "myrepo"))
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{
+		Repos: []config.RepoEntry{{Path: dir, Name: "myrepo"}},
+	}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
 
 	parent := caseVariantOf(filepath.Dir(dir))
+	require.NotEqual(t, filepath.Dir(dir), parent,
+		"the case variant must differ byte-wise or the test is vacuous")
 	_, _, prefix, ok := mi.ScopeForCWD(parent)
 	require.True(t, ok, "case-variant workspace root must resolve to the contained repo")
 	assert.Equal(t, "myrepo", prefix)

@@ -223,6 +223,17 @@ func TestDaemon_EndToEnd_WorkspaceRootCWDServed(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(reply, &resp))
 	require.NotNil(t, resp.Result, "workspace-root cwd must get a tool result: %s", string(reply))
+
+	// Scope-sensitive twin: graph_stats never consults the session
+	// scope, so a binding that admits the session but blanks its scope
+	// would pass the assertion above. A symbol search runs through the
+	// scoped engine — the tracked repo's own symbol must come back.
+	frame = []byte(`{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search_symbols","arguments":{"query":"main"}}}`)
+	require.NoError(t, client.WriteMCPFrame(frame))
+	reply, err = client.ReadMCPFrame()
+	require.NoError(t, err)
+	require.Contains(t, string(reply), "main.go",
+		"workspace-root session's scope must reach the contained repo's symbols: %s", string(reply))
 }
 
 // TestDaemon_EndToEnd_TrackAddsRepoLive proves track-while-running is
