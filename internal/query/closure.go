@@ -27,11 +27,18 @@ type ClosureOptions struct {
 	// bound. Nodes are admitted in breadth-first / nearest-first order,
 	// so the cap keeps the closest nodes.
 	MaxNodes int
-	// WorkspaceID / ProjectID scope the traversal exactly as the
-	// matching WalkOptions fields do — neighbours outside the scope are
-	// dropped along with the edge that reached them.
+	// WorkspaceID / ProjectID / RepoAllow scope the traversal exactly as
+	// the matching WalkOptions fields do — neighbours outside the scope
+	// are dropped along with the edge that reached them.
+	//
+	// RepoAllow is not optional defence in depth: a session bound to the
+	// repos its cwd contains has an empty WorkspaceID, so it is the only
+	// axis carrying that session's boundary. Omitting it here expanded
+	// the closure across every repo in the graph and left the caller to
+	// filter the result — after the traversal had already crossed.
 	WorkspaceID string
 	ProjectID   string
+	RepoAllow   map[string]bool
 }
 
 // ClosureNode is one node in a dependency closure, tagged with its
@@ -70,7 +77,11 @@ const (
 // enforces the same workspace/project boundary without duplicating the
 // fallback logic.
 func (o ClosureOptions) closureScopeAllows(n *graph.Node) bool {
-	return WalkOptions{WorkspaceID: o.WorkspaceID, ProjectID: o.ProjectID}.scopeAllows(n)
+	return WalkOptions{
+		WorkspaceID: o.WorkspaceID,
+		ProjectID:   o.ProjectID,
+		RepoAllow:   o.RepoAllow,
+	}.scopeAllows(n)
 }
 
 // ImportClosure walks the transitive dependency closure of a set of

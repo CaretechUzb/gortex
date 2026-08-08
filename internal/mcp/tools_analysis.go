@@ -311,9 +311,9 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	// Resolve the working tree: explicit repo selector, lone tracked repo,
 	// or the session's cwd-bound repo. The "." fallback keeps the standalone
 	// (indexer-less) server working from its own cwd.
-	repoRoot, repoPrefix := s.diffRepoScope(ctx, strings.TrimSpace(req.GetString("repo", "")))
-	if repoRoot == "" {
-		repoRoot = "."
+	repoRoot, repoPrefix, rootErr := s.resolveDiffRoot(ctx, strings.TrimSpace(req.GetString("repo", "")))
+	if rootErr != nil {
+		return mcp.NewToolResultError(rootErr.Error()), nil
 	}
 	if freshnessErr := s.awaitMutationFreshnessForRepos(ctx, repoPrefix); freshnessErr != nil {
 		return mcp.NewToolResultError("change detection refused a stale graph: " + freshnessErr.Error()), nil

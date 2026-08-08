@@ -82,15 +82,21 @@ func (m *memoryManager) allEntries() []persistence.MemoryEntry {
 // disable the corresponding filter; tag matching is exact
 // (case-insensitive).
 type MemoryQueryFilter struct {
-	SymbolID          string
-	FilePath          string
-	Tag               string
-	Kind              string
-	Source            string
-	AuthorAgent       string
-	TextSearch        string // case-insensitive substring against Body / Title
-	Since             time.Time
-	WorkspaceID       string
+	SymbolID    string
+	FilePath    string
+	Tag         string
+	Kind        string
+	Source      string
+	AuthorAgent string
+	TextSearch  string // case-insensitive substring against Body / Title
+	Since       time.Time
+	WorkspaceID string
+	// WorkspaceIn is the set-valued form of WorkspaceID, for a session
+	// bound to the repos its cwd contains: that shape spans several
+	// workspaces and has no single slug, and an empty WorkspaceID means
+	// "no filter", so without this such a session would read every
+	// workspace's memories.
+	WorkspaceIn       map[string]bool
 	ProjectID         string
 	Pinned            *bool
 	MinImportance     int  // 0 = no filter; 1..5 = lower bound
@@ -279,6 +285,9 @@ func (mm *memoryManager) Query(f MemoryQueryFilter) []persistence.MemoryEntry {
 		if f.WorkspaceID != "" && e.WorkspaceID != f.WorkspaceID {
 			continue
 		}
+		if len(f.WorkspaceIn) > 0 && !f.WorkspaceIn[e.WorkspaceID] {
+			continue
+		}
 		if f.ProjectID != "" && e.ProjectID != f.ProjectID {
 			continue
 		}
@@ -386,10 +395,13 @@ func (mm *memoryManager) trimLocked() {
 // SurfaceOptions tunes Surface. Defaults: Limit=10, ExcerptCap=320,
 // MinScore=0, MarkAccessed=true, IncludeSuperseded=false.
 type SurfaceOptions struct {
-	Task              string
-	SymbolIDs         []string
-	FilePaths         []string
-	WorkspaceID       string
+	Task        string
+	SymbolIDs   []string
+	FilePaths   []string
+	WorkspaceID string
+	// WorkspaceIn mirrors MemoryQueryFilter.WorkspaceIn — the set-valued
+	// workspace filter a contained-repo session needs.
+	WorkspaceIn       map[string]bool
 	ProjectID         string
 	Limit             int
 	ExcerptCap        int
@@ -576,6 +588,9 @@ func (mm *memoryManager) Surface(opts SurfaceOptions, resolveNode func(string) *
 			continue
 		}
 		if opts.WorkspaceID != "" && e.WorkspaceID != opts.WorkspaceID {
+			continue
+		}
+		if len(opts.WorkspaceIn) > 0 && !opts.WorkspaceIn[e.WorkspaceID] {
 			continue
 		}
 		if opts.ProjectID != "" && e.ProjectID != opts.ProjectID {

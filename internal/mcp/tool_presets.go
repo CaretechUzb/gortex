@@ -310,6 +310,12 @@ func newToolPolicy(cfg ToolPolicyConfig, logger *zap.Logger) *toolPolicy {
 // (tools_search) stay reachable under every preset so an agent can
 // always see its surface and, in defer mode, discover more. An explicit
 // deny still wins (checked before this in allows).
+//
+// The untracked-cwd repair tools (capabilities / workspace_admin) are
+// deliberately NOT listed here: on the facade surface they are ordinary
+// members of the published set, and this predicate's facade-v1 arm below
+// returns false for everything it names — adding them would hide exactly
+// the tools a blocked session needs.
 func isAlwaysKeptTool(name string) bool {
 	return name == "tool_profile" || name == LazyToolsSearchName
 }

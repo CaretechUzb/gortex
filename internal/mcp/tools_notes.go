@@ -206,8 +206,9 @@ func (s *Server) handleQueryNotes(ctx context.Context, req mcp.CallToolRequest) 
 		filter.Pinned = &yes
 	}
 
-	if workspaceID, _, bound := s.sessionScope(ctx); bound {
+	if workspaceID, workspaceIn, bound := s.sessionSideStoreScope(ctx); bound {
 		filter.WorkspaceID = workspaceID
+		filter.WorkspaceIn = workspaceIn
 	}
 
 	notes := s.notes.Query(filter)
@@ -314,6 +315,24 @@ func noteEntryToWire(e persistence.NoteEntry) map[string]any {
 // sessionWorkspaceIDOrEmpty returns the session's workspace ID,
 // falling back to "" for unbound sessions. Helper because the
 // autoLinkBody signature takes a single string.
+// sessionSideStoreScope returns the workspace filter for the per-workspace
+// side stores (notes, memories). ws is the session's single workspace slug
+// when it has one; in is the set of slugs a session bound to the repos its
+// cwd contains spans, which has no single slug to filter on. Exactly one of
+// the two is populated for a bound session — an empty ws with an empty in
+// would read as "no filter" and hand that session every workspace's
+// entries.
+func (s *Server) sessionSideStoreScope(ctx context.Context) (ws string, in map[string]bool, bound bool) {
+	slug, _, isBound := s.sessionScope(ctx)
+	if !isBound {
+		return "", nil, false
+	}
+	if slug == "" {
+		return "", s.sessionScopeWorkspaces(ctx), true
+	}
+	return slug, nil, true
+}
+
 func sessionWorkspaceIDOrEmpty(s *Server, ctx context.Context) string {
 	if s == nil {
 		return ""

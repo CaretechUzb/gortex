@@ -119,6 +119,15 @@ func (mi *MultiIndexer) ScopeForCWD(cwd string) (workspaceID, projectID, repoPre
 		}
 	}
 	if bestPrefix == "" {
+		// Reverse containment only. A root too broad to be anyone's
+		// project lexically contains every tracked repo, so it must not
+		// bind here either — `/` over a set of repos that happen to share
+		// one declared slug would otherwise resolve to that whole
+		// workspace, walking straight past the same guard in
+		// ContainedReposScope.
+		if UnsafeIndexRootReason(cwd) != "" {
+			return "", "", "", false
+		}
 		return mi.scopeForWorkspaceRootLocked(cwd)
 	}
 
@@ -132,6 +141,82 @@ func (mi *MultiIndexer) ScopeForCWD(cwd string) (workspaceID, projectID, repoPre
 		}
 	}
 	return ws, proj, bestPrefix, true
+}
+
+// ContainedReposScope resolves a working directory that CONTAINS tracked
+// repos — a session opened at a root above its repos — to the exact set of
+// repo prefixes rooted under it, together with the effective workspace slug
+// of each.
+//
+// It is ScopeForCWD's reverse-containment arm without the
+// one-workspace-slug requirement. That requirement exists because a session
+// scope is a single slug and a union cannot be expressed as one; this
+// function answers a different question, whose answer needs no slug at all:
+// which tracked repos does this directory physically contain? Callers MUST
+// enforce the returned prefixes as a hard allow-set. Doing so is strictly
+// narrower than binding to a slug: a slug names every repo that declares it,
+// wherever it sits on disk, whereas containment names only what lies under
+// this cwd.
+//
+// The returned workspaces are informational — they let a `workspace:`
+// selector narrow *within* the session. They must never widen it.
+//
+// ok is false when cwd contains no tracked repo; the caller then fails
+// closed exactly as before.
+//
+// A root too broad to be anyone's project — `/`, a Windows drive root,
+// the home directory — is refused outright even though it lexically
+// contains every tracked repo. Containment is only a meaningful boundary
+// when the directory was a deliberate choice, and those three are what an
+// editor hands us when it has NOT made one: resolveLaunchCWD falls back to
+// them when no workspace hint is available. Binding them would turn "the
+// client forgot to set a cwd" into a session scoped to the entire graph.
+func (mi *MultiIndexer) ContainedReposScope(cwd string) (repos []string, workspaces []string, ok bool) {
+	if mi == nil || cwd == "" {
+		return nil, nil, false
+	}
+	cwd = filepath.Clean(cwd)
+	if UnsafeIndexRootReason(cwd) != "" {
+		return nil, nil, false
+	}
+
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+
+	seenWS := make(map[string]bool)
+	for prefix, meta := range mi.repos {
+		if meta == nil {
+			continue
+		}
+		root := filepath.Clean(meta.RootPath)
+		if root == "" || root == "." || !pathkey.HasPathPrefix(root, cwd) {
+			continue
+		}
+		repos = append(repos, prefix)
+		if ws := mi.effectiveWorkspaceLocked(prefix); !seenWS[ws] {
+			seenWS[ws] = true
+			workspaces = append(workspaces, ws)
+		}
+	}
+	if len(repos) == 0 {
+		return nil, nil, false
+	}
+	sort.Strings(repos)
+	sort.Strings(workspaces)
+	return repos, workspaces, true
+}
+
+// effectiveWorkspaceLocked returns a tracked repo's effective workspace
+// slug under the singleton fallback every scope path shares: a repo that
+// declares none is its own workspace, keyed on its repo prefix. Caller
+// holds mi.mu (read).
+func (mi *MultiIndexer) effectiveWorkspaceLocked(prefix string) string {
+	if idx := mi.indexers[prefix]; idx != nil {
+		if v := idx.WorkspaceID(); v != "" {
+			return v
+		}
+	}
+	return prefix
 }
 
 // scopeForWorkspaceRootLocked is ScopeForCWD's reverse-containment
@@ -150,12 +235,7 @@ func (mi *MultiIndexer) scopeForWorkspaceRootLocked(cwd string) (workspaceID, pr
 		if root == "" || root == "." || !pathkey.HasPathPrefix(root, cwd) {
 			continue
 		}
-		ws := prefix // singleton fallback, same rule as ReposInWorkspace
-		if idx := mi.indexers[prefix]; idx != nil {
-			if v := idx.WorkspaceID(); v != "" {
-				ws = v
-			}
-		}
+		ws := mi.effectiveWorkspaceLocked(prefix) // singleton fallback, same rule as ReposInWorkspace
 		if len(contained) > 0 && ws != sharedWS {
 			return "", "", "", false // spans workspaces — fail closed
 		}
