@@ -823,10 +823,12 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	resolveScope := warmupResolveScope(changed, len(repos), anyChanged,
 		scopeUnknown.Load(), state.snapshotPartial, needsRebuild)
 
-	// Resume enrichment for any repo a prior process left partial / abandoned.
+	// Resume enrichment for any repo a prior process left partial / abandoned,
+	// or that indexed files under a deferred-enrichment window it never closed.
 	// Seeded BEFORE the resolve phase so the overlapped enrichment pool below
 	// covers those repos too. Cheap for a fully-enriched workspace: each
-	// already-complete repo pays only a git rev-parse plus one marker lookup.
+	// already-complete repo pays a git rev-parse, one marker lookup, and one
+	// repo-scoped file-node projection — bounded by file count, not symbols.
 	enrichPending := state.multiIndexer.SeedPendingEnrichAll()
 	if enrichPending > 0 && !anyChanged {
 		logger.Info("daemon: warmup resuming incomplete enrichment on an otherwise-unchanged restart",
