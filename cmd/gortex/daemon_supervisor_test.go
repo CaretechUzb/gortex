@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 func restoreServiceSeams() {
@@ -59,9 +60,7 @@ func TestRunDaemonRestart_SupervisedRoutesToServiceRestart(t *testing.T) {
 func TestDefaultServiceActive_NoUnitFileIsInactive(t *testing.T) {
 	// Point HOME (and cache) at an empty dir so no unit file exists; detection
 	// must short-circuit to false without shelling out to the supervisor.
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	testenv.Sandbox(t)
 	if defaultServiceActive() {
 		t.Fatal("no installed unit file => service must be reported inactive")
 	}

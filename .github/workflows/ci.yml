@@ -72,6 +72,15 @@ jobs:
       - name: Test sidecar handle release
         run: go test -timeout=5m -count=1 -run TestCloseSidecar ./internal/persistence
 
+      # os.UserHomeDir reads %USERPROFILE% here and $HOME everywhere else, so
+      # a test that isolates itself with HOME alone keeps resolving the real
+      # profile on Windows — and writes to it. That is invisible to the
+      # linux/macos matrix by construction, so the isolation helper and the
+      # path resolver it protects have to be verified on this runner or not
+      # at all.
+      - name: Test user-state isolation
+        run: go test -timeout=5m -count=1 ./internal/testenv ./internal/platform
+
   build-linux-static:
     # The linux release ships a statically linked binary so it runs on any
     # distro (see .goreleaser.yml). That only holds while the code stays

@@ -10,19 +10,21 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/zzet/gortex/internal/profiles"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // sandboxInstructionsEnv points the profile dir (XDG_DATA_HOME) and the
-// home dir (skills sync, pointer nudge) at temp dirs, and neutralises
-// the profile env override so on-disk state decides.
+// home dir at temp dirs, and neutralises the profile env override so
+// on-disk state decides. The home has to be isolated the cross-platform
+// way: runInstructionsSwitch hands os.UserHomeDir() to SyncGlobalSkills,
+// which prunes shipped skills out of <home>/.claude/skills — against the
+// developer's real profile on Windows, where a HOME-only override is a
+// no-op.
 func sandboxInstructionsEnv(t *testing.T) (home, dataDir string) {
 	t.Helper()
-	home = t.TempDir()
-	dataDir = t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_DATA_HOME", dataDir)
+	d := testenv.Sandbox(t)
 	t.Setenv(profiles.ActiveEnv, "")
-	return home, dataDir
+	return d.Home, d.Data
 }
 
 func captureCmd() (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {

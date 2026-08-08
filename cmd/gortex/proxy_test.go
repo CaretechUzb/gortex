@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // TestResolveLaunchCWDFallsBackFromHome exercises the gortexhq/gortex#19
@@ -29,7 +31,7 @@ func TestResolveLaunchCWDFallsBackFromHome(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Setenv("HOME", fakeHome)
+	testenv.SetHome(t, fakeHome)
 	t.Setenv("PWD", "") // clear so we exercise the editor-env path
 	t.Setenv("CURSOR_WORKSPACE", project)
 	t.Setenv("CLAUDE_CODE_WORKSPACE", "")

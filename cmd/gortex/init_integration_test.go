@@ -11,6 +11,7 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 func TestInitSummaryDoesNotRequireManualMCPEnablement(t *testing.T) {
@@ -48,7 +49,7 @@ func TestInitDryRunJSONReportShape(t *testing.T) {
 
 	repo := t.TempDir()
 	home := t.TempDir()
-	isolateInitTestEnv(t, home)
+	testenv.SandboxAt(t, home)
 
 	initYes = true
 	initDryRun = true
@@ -119,7 +120,7 @@ func TestInitAgentsFilterRejectsUnknownName(t *testing.T) {
 	})
 
 	repo := t.TempDir()
-	isolateInitTestEnv(t, t.TempDir())
+	testenv.SandboxAt(t, t.TempDir())
 
 	initYes = true
 	initDryRun = true
@@ -169,7 +170,7 @@ func TestInitCreatesProjectMarker(t *testing.T) {
 	t.Setenv("GORTEX_DAEMON_SNAPSHOT", filepath.Join(inheritedDaemon, "daemon.gob.gz"))
 
 	repo := t.TempDir()
-	isolateInitTestEnv(t, t.TempDir())
+	testenv.SandboxAt(t, t.TempDir())
 
 	initYes = true
 	initDryRun = false
@@ -227,7 +228,7 @@ func TestInitDryRunSkipsProjectMarker(t *testing.T) {
 	})
 
 	repo := t.TempDir()
-	isolateInitTestEnv(t, t.TempDir())
+	testenv.SandboxAt(t, t.TempDir())
 
 	initYes = true
 	initDryRun = true
@@ -266,7 +267,7 @@ func TestInitRefusesHomeDirectory(t *testing.T) {
 	})
 
 	home := t.TempDir()
-	isolateInitTestEnv(t, home)
+	testenv.SandboxAt(t, home)
 
 	initYes = true
 	initDryRun = false
@@ -308,7 +309,7 @@ func TestInitForceBypassesHomeDirectoryGuard(t *testing.T) {
 	})
 
 	home := t.TempDir()
-	isolateInitTestEnv(t, home)
+	testenv.SandboxAt(t, home)
 
 	initYes = true
 	initDryRun = true // planning-only: keeps the forced run from writing into $HOME during the test
@@ -335,7 +336,7 @@ func TestInitHooksOnlyRefreshesClaudeAndCodexHooks(t *testing.T) {
 
 	repo := t.TempDir()
 	home := t.TempDir()
-	isolateInitTestEnv(t, home)
+	testenv.SandboxAt(t, home)
 
 	codexDir := filepath.Join(home, ".codex")
 	if err := os.MkdirAll(codexDir, 0o755); err != nil {
@@ -411,7 +412,7 @@ func TestInitHooksOnlyRespectsAgentsAllowlist(t *testing.T) {
 
 	repo := t.TempDir()
 	home := t.TempDir()
-	isolateInitTestEnv(t, home)
+	testenv.SandboxAt(t, home)
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +449,7 @@ func TestInitHooksOnlyRespectsAgentsSkip(t *testing.T) {
 
 	repo := t.TempDir()
 	home := t.TempDir()
-	isolateInitTestEnv(t, home)
+	testenv.SandboxAt(t, home)
 	codexDir := filepath.Join(home, ".codex")
 	if err := os.MkdirAll(codexDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -499,7 +500,7 @@ func TestInitHooksOnlyDryRunDoesNotWriteHooks(t *testing.T) {
 
 	repo := t.TempDir()
 	home := t.TempDir()
-	isolateInitTestEnv(t, home)
+	testenv.SandboxAt(t, home)
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +546,7 @@ func TestInitDryRunIntakeJSONDoesNotWrite(t *testing.T) {
 	})
 
 	repo := t.TempDir()
-	isolateInitTestEnv(t, t.TempDir())
+	testenv.SandboxAt(t, t.TempDir())
 	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -584,22 +585,6 @@ func TestInitDryRunIntakeJSONDoesNotWrite(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(repo, ".gortex")); err == nil {
 		t.Fatal("dry-run-intake wrote .gortex/ — must be inspection-only")
 	}
-}
-
-// isolateInitTestEnv prevents inherited machine state from escaping the test sandbox.
-func isolateInitTestEnv(t *testing.T, home string) {
-	t.Helper()
-
-	root := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
-	t.Setenv("XDG_DATA_HOME", filepath.Join(root, "data"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
-	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(root, "runtime"))
-	t.Setenv("GORTEX_DAEMON_SOCKET", filepath.Join(root, "daemon.sock"))
-	t.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(root, "daemon.pid"))
-	t.Setenv("GORTEX_DAEMON_LOGFILE", filepath.Join(root, "daemon.log"))
-	t.Setenv("GORTEX_DAEMON_SNAPSHOT", filepath.Join(root, "daemon.gob.gz"))
 }
 
 func saveInitGlobals(t *testing.T) func() {
