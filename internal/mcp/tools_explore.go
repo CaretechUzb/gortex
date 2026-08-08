@@ -4396,6 +4396,9 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 	if satisfiedSymbol != "" {
 		shedBudget = maxBytes + localizationRetiredReadAllowance(maxBytes)
 	}
+	// The rows as they stood before the breadth tail was asked to pay for an
+	// index. A trade that ends with no index bought nothing, so it is undone.
+	var untraded []localizationEvidence
 	for !localizationEnvelopeFits(envelope, shedBudget) {
 		block := &localizationPageOutline{Leading: envelope.Outline, Others: envelope.Outlines}
 		if !block.empty() {
@@ -4403,8 +4406,7 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 			// reach by other means, so they give way before every other payload
 			// here — but they give way by degrees. A shorter index is worth far
 			// more than none, and only pressure past the floor drops one.
-			if block.atFloor() &&
-				localizationShedTrailingEvidenceDetail(&envelope, mandatoryCount) {
+			if block.atFloor() {
 				// The index has given back everything it can and the page still
 				// does not fit. A ranked page fills its budget with rows, so
 				// without this the floor is unreachable exactly on the pages
@@ -4412,10 +4414,21 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 				// in the detail a caller can re-derive from the identity that
 				// stays — never in a row, and never inside the reserve the
 				// refinement contract may name.
-				continue
+				if untraded == nil {
+					untraded = append([]localizationEvidence(nil), envelope.Evidence...)
+				}
+				if localizationShedTrailingEvidenceDetail(&envelope, mandatoryCount) {
+					continue
+				}
 			}
 			block.relieve()
 			envelope.Outline, envelope.Outlines = block.Leading, block.Others
+			if block.empty() && untraded != nil {
+				// Nothing was bought. Give the tail its detail back rather than
+				// return a page that is both shorter and unindexed.
+				envelope.Evidence = untraded
+				untraded = nil
+			}
 			continue
 		}
 		if digest != nil && len(digest.Evidence) > localizationFinalResponsePrimaryLimit {

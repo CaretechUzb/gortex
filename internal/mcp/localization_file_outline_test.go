@@ -650,11 +650,14 @@ func TestOutlineShrinksRatherThanVanishingWhenTheBudgetBinds(t *testing.T) {
 // default budget on their own — the shape that left no room for any index at
 // all. Each row carries the qualified name, signature, and neighbour
 // identifiers a real evidence row serializes.
-func outlineBudgetFillingTargets(count int) []exploreTarget {
+func outlineBudgetFillingTargets(count int, deep bool) []exploreTarget {
 	targets := make([]exploreTarget, 0, count)
 	for index := 0; index < count; index++ {
 		name := fmt.Sprintf("BreadthCandidate%02d", index)
 		dir := fmt.Sprintf("repo/breadth/service/%02d", index)
+		if deep {
+			dir += "/subsystem/internal"
+		}
 		qual := dir + "/handler." + name + ".ExecuteWithRetriesAndBackoff"
 		neighbors := make([]*graph.Node, 0, 3)
 		for neighbor := 0; neighbor < 3; neighbor++ {
@@ -693,7 +696,7 @@ func TestOutlineFloorOutranksTheTrailingRowsExpansionDetail(t *testing.T) {
 		{node: declared[0], source: "func Declared00() { executeAll() }"},
 		{node: declared[1], source: "func Declared01() { executeOne() }"},
 	}
-	targets = append(targets, outlineBudgetFillingTargets(8)...)
+	targets = append(targets, outlineBudgetFillingTargets(8, false)...)
 	routes := exploreLocalizationRefinementRoutes(targets)
 
 	build := func(withOutline bool) localizationExploreEnvelope {
@@ -756,6 +759,51 @@ func TestOutlineFloorOutranksTheTrailingRowsExpansionDetail(t *testing.T) {
 			t.Fatalf("row %d inside the direct-evidence reserve gave up detail: %#v against %#v",
 				index, page.Evidence[index], bare.Evidence[index])
 		}
+	}
+}
+
+func TestATradeThatCannotSaveTheOutlineIsGivenBack(t *testing.T) {
+	const named = "computeRetryBackoff"
+	declared := outlineDeclaredFile(20)
+	middle := len(declared) / 2
+	declared[middle] = outlineDeclaration(named, middle+1)
+	task := "the retry backoff never fires after a throttled response"
+	targets := []exploreTarget{
+		{node: declared[0], source: "func Declared00() { executeAll() }"},
+		{node: declared[1], source: "func Declared01() { executeOne() }"},
+	}
+	// One expendable row on a page too tight for even a floor-sized index:
+	// whatever that row gives up cannot buy the index, so it keeps it.
+	targets = append(targets, outlineBudgetFillingTargets(7, true)...)
+	routes := exploreLocalizationRefinementRoutes(targets)
+
+	build := func(withOutline bool) localizationExploreEnvelope {
+		var outline func() *localizationPageOutline
+		if withOutline {
+			outline = localizationPageOutlineProvider(
+				outlinePool(declared[0], declared[1]), targets, exploreTerminalTerms(task),
+				func(file string) []*graph.Node {
+					if file == outlineLeadingFile {
+						return declared
+					}
+					return nil
+				},
+			)
+		}
+		result, _, _, _ := buildLocalizationRefinementResultForTaskWithOutline(
+			declared[0].ID, task, targets, localizationDefaultBudgetTokens, routes, outline,
+		)
+		return outlineEnvelope(t, result)
+	}
+
+	bare := build(false)
+	page := build(true)
+	if page.Outline != nil {
+		t.Skip("the fixture is no longer tight enough to drop the index")
+	}
+	if !reflect.DeepEqual(page.Evidence, bare.Evidence) {
+		t.Fatalf("a page that dropped its index still paid for it:\n%#v\nagainst\n%#v",
+			page.Evidence, bare.Evidence)
 	}
 }
 
