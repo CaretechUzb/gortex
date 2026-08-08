@@ -302,7 +302,14 @@ func TestFacadeLegacyClientKeepsLegacySurfaceAndSchema(t *testing.T) {
 	properties, ok := analyzeSchema["properties"].(map[string]any)
 	require.True(t, ok)
 	require.Contains(t, properties, "algorithm", "legacy analyze must retain its full legacy schema")
-	require.NotContains(t, properties, "target", "legacy analyze must not receive the facade schema")
+	// The compact envelope containers are what would mark a swapped-in facade
+	// schema; `target` no longer serves as that marker because the analyze
+	// dispatcher genuinely accepts a target selector on every surface, and a
+	// schema that hid it is what let a dropped target look like an answer.
+	require.NotContains(t, properties, "options", "legacy analyze must not receive the facade schema")
+	require.NotContains(t, properties, "output", "legacy analyze must not receive the facade schema")
+	require.Contains(t, properties, "target", "legacy analyze must advertise the selector it honours")
+	require.Contains(t, properties, "id", "legacy analyze must keep the field target lowers into")
 
 	callFrame := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"analyze","arguments":{"kind":"help"}}}`)
 	raw, err = json.Marshal(srv.MCPServer().HandleMessage(ctx, callFrame))

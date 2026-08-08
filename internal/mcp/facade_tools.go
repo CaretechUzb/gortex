@@ -262,6 +262,37 @@ func (s *Server) registerFacadeTools() {
 	}
 }
 
+// facadeSelectorKeys carry the subject of the question. Losing one silently
+// changes the answer, so any value under these keys routes to the public
+// dispatcher — a malformed selector then earns a structured error instead of
+// a confident answer to a question the caller did not ask.
+var facadeSelectorKeys = []string{"target", "to"}
+
+// facadeContainerKeys are the remaining public envelope containers of the
+// compact surface. They are vocabulary, not payload: no legacy handler has a
+// field to read them from, so a call carrying one must be lowered through the
+// public dispatcher or its knobs are silently discarded.
+var facadeContainerKeys = []string{"arguments", "options", "source", "context", "guard", "output"}
+
+// usesFacadeVocabulary reports whether a call to a reused (legacy-named)
+// facade speaks the compact envelope. For the non-selector containers only an
+// object counts: every legacy parameter of the reused names is a scalar, so an
+// object under one of those keys is unambiguously the public shape and can
+// never be a legacy argument that happens to share the name.
+func usesFacadeVocabulary(args map[string]any) bool {
+	for _, key := range facadeSelectorKeys {
+		if value, present := args[key]; present && value != nil {
+			return true
+		}
+	}
+	for _, key := range facadeContainerKeys {
+		if _, ok := args[key].(map[string]any); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) wrapLegacyFacade(name string, raw server.ToolHandlerFunc) server.ToolHandlerFunc {
 	if !isFacadeToolName(name) {
 		return raw
@@ -270,7 +301,13 @@ func (s *Server) wrapLegacyFacade(name string, raw server.ToolHandlerFunc) serve
 		args := req.GetArguments()
 		_, explicitOperation := args["operation"]
 		facadeSession := s.effectiveSessionPolicy(ctx).preset == FacadeSurfaceVersion
-		if !facadeSession && !explicitOperation {
+		// `operation` cannot be the only compact-call signal: analyze
+		// discriminates on `kind`, so a well-formed compact analyze call
+		// never carries one. Without the vocabulary check below, every
+		// analyze(kind=…, target={…}) call outside a facade-v1 session went
+		// straight to the legacy handler, which has no target to read — the
+		// caller got a repo-wide ranking that looks like an answer.
+		if !facadeSession && !explicitOperation && !usesFacadeVocabulary(args) {
 			return raw(ctx, req)
 		}
 		if name == "analyze" {
@@ -1038,6 +1075,10 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		outcome = facadeOutcomeBlocked
 		return blockedAnalyzeKindResult(kind), nil
 	}
+	if invalid := s.rejectInertFacadeSelector(spec, req.GetArguments()); invalid != nil {
+		outcome = facadeOutcomeInvalidArgument
+		return invalid, nil
+	}
 	if OverlayViewFromContext(ctx) == nil && !facadeLegacyManagesOwnOverlay(spec.Legacy) {
 		view, viewErr := s.buildOverlayViewForCtx(ctx)
 		if viewErr != nil {
@@ -1126,6 +1167,186 @@ func requestedAnalyzeKind(input map[string]any) string {
 		return ""
 	}
 	return normalizeFacadeOperation(fmt.Sprint(raw))
+}
+
+// facadeBespokeSelectorOperations are the operations whose selectors are
+// consumed by an operation-specific rule (normalizeFacadeAliases or one of the
+// lowering blocks in invokeFacadeSpec) rather than by applyFacadeTarget's
+// default field mapping. They opt out of the "is this selector inert?" check
+// below because the field it lands in is not the one facadeTargetField names.
+var facadeBespokeSelectorOperations = map[string]bool{
+	"change.impact":        true, // target.symbol/target.file both become ids
+	"change.edit_plan":     true, // normalizeFacadeChangeTargets lowers the set
+	"change.guards":        true,
+	"change.tests":         true,
+	"change.contract":      true,
+	"change.pattern":       true,
+	"read.editing_context": true, // the symbol is resolved to its file
+	"trace.flow":           true, // target/to become source_id/sink_id
+	"trace.path":           true,
+	"trace.taint":          true, // target/to become source_pattern/sink_pattern
+}
+
+// facadeToSelectorOperations are the only operations that read the `to`
+// destination container. Everywhere else normalizeFacadeArguments lowers it to
+// to_<selector> keys that no handler declares, so it is inert.
+var facadeToSelectorOperations = map[string]bool{
+	"trace.flow": true, "trace.path": true, "trace.taint": true,
+}
+
+// analyzeAliasedSymbolKinds are the analyze kinds that dispatch to a tool other
+// than the analyze dispatcher AND whose id-shaped field really holds a symbol.
+// Declaring the field is not evidence enough for these: get_communities and
+// get_processes both take an `id`, but it names a community or a process. A
+// symbol lowered into one resolves against the wrong entity and comes back as
+// "community not found: pkg/foo.go::Bar" — a loud failure, but one that blames
+// the id channel for what is really a selector-semantics mistake, and one
+// capabilities never advertised as available in the first place. Refusing it
+// keeps the published shape and the accepted shape the same set.
+var analyzeAliasedSymbolKinds = map[string]bool{
+	"co_change": true,
+	"why":       true,
+}
+
+// legacyDeclaresField reports whether the named legacy tool advertises a field.
+func (s *Server) legacyDeclaresField(legacy, field string) bool {
+	if field == "" {
+		return false
+	}
+	captured, available := s.facades.legacy(legacy)
+	if !available {
+		return false
+	}
+	_, declared := captured.tool.InputSchema.Properties[field]
+	return declared
+}
+
+// facadeSelectorReaches reports whether a public selector actually arrives at
+// the selected legacy handler as a field that handler declares and reads.
+func (s *Server) facadeSelectorReaches(spec facadeOperationSpec, selector string) bool {
+	if facadeBespokeSelectorOperations[spec.Facade+"."+spec.Operation] {
+		return true
+	}
+	if spec.Facade == "analyze" && spec.Legacy != "analyze" &&
+		(selector == "symbol" || selector == "symbols") && !analyzeAliasedSymbolKinds[spec.Operation] {
+		return false
+	}
+	field := facadeTargetField(spec.Legacy, selector)
+	if field == "" {
+		return false
+	}
+	legacy, available := s.facades.legacy(spec.Legacy)
+	if !available {
+		return true // availability is reported separately; do not guess here
+	}
+	if len(legacy.tool.InputSchema.Properties) == 0 {
+		// A tool that advertises no parameters is not evidence that it ignores
+		// this one. Refuse only where the schema actually says so.
+		return true
+	}
+	property, declared := legacy.tool.InputSchema.Properties[field]
+	if !declared {
+		return false
+	}
+	if spec.Legacy != "analyze" {
+		return true
+	}
+	// The analyze dispatcher is many handlers behind one schema, so declaring
+	// the field is not enough — the requested kind has to be one that reads
+	// it. That per-kind answer comes from the dispatcher's own annotated
+	// descriptions, the same source capabilities publishes, so the selectors
+	// accepted and the selectors advertised cannot drift apart.
+	return analyzeFieldApplies(spec.Operation, field, property)
+}
+
+// facadeOperationsAcceptingSelector lists the operations of a facade that do
+// consume the selector, so a refusal can point at the calls that would work.
+func (s *Server) facadeOperationsAcceptingSelector(facade, selector string) []string {
+	operations := make([]string, 0, 4)
+	for _, spec := range s.capabilityOperations(facade) {
+		if spec.Operation == "help" {
+			continue
+		}
+		if s.facadeSelectorReaches(spec, selector) {
+			operations = append(operations, spec.Operation)
+		}
+	}
+	sort.Strings(operations)
+	return operations
+}
+
+// rejectInertFacadeSelector fails closed when a caller aims an operation at a
+// selector that operation cannot consume. Silently dropping it is the failure
+// the whole lowering path exists to prevent: a repo-wide ranking returned for
+// "what is the blast radius of X" is indistinguishable from a correct answer,
+// and the caller has no way to notice their target was ignored.
+func (s *Server) rejectInertFacadeSelector(spec facadeOperationSpec, input map[string]any) *mcpgo.CallToolResult {
+	refuse := func(container, selector string, accepted []string) *mcpgo.CallToolResult {
+		data := map[string]any{
+			"field":  container + "." + selector,
+			"reason": "unsupported_target",
+			"domain": spec.Facade, "operation": spec.Operation,
+		}
+		subject := fmt.Sprintf("%s.%s", spec.Facade, spec.Operation)
+		if spec.Facade == "analyze" {
+			data["kind"] = spec.Operation
+			subject = fmt.Sprintf("analyze(kind=%s)", spec.Operation)
+		}
+		if len(accepted) > 0 {
+			data["accepted_by"] = accepted
+		}
+		// Two different mistakes reach here and they deserve different words.
+		// Usually the handler has no field for the selector, so it would be
+		// dropped. Sometimes the field exists but names another kind of
+		// entity, and lowering into it would resolve the caller's symbol
+		// against a community or a process instead. Only a kind dispatching
+		// to its own legacy tool can be in the second case: the analyze
+		// dispatcher declares id once for every kind behind it, so a field it
+		// declares says nothing about whether this kind reads it.
+		field := facadeTargetField(spec.Legacy, selector)
+		message := fmt.Sprintf("%s has no %s.%s to act on — it would be ignored, so the call is refused rather than answered as if it had not been sent",
+			subject, container, selector)
+		if spec.Legacy != "analyze" && s.legacyDeclaresField(spec.Legacy, field) {
+			data["entity_mismatch"] = field
+			message = fmt.Sprintf("%s selects by %s, which does not name a symbol — %s.%s would be resolved against the wrong entity, so the call is refused",
+				subject, field, container, selector)
+		}
+		return NewStructuredErrorResult(StructuredError{
+			ErrorCode: ErrCodeInvalidArgument,
+			Message:   message,
+			Data:      data,
+		})
+	}
+	if to, ok := input["to"].(map[string]any); ok && len(to) > 0 {
+		if !facadeToSelectorOperations[spec.Facade+"."+spec.Operation] {
+			for _, selector := range sortedSelectorKeys(to) {
+				return refuse("to", selector, nil)
+			}
+		}
+	}
+	target, ok := input["target"].(map[string]any)
+	if !ok || len(target) == 0 {
+		return nil
+	}
+	for _, selector := range sortedSelectorKeys(target) {
+		if s.facadeSelectorReaches(spec, selector) {
+			continue
+		}
+		return refuse("target", selector, s.facadeOperationsAcceptingSelector(spec.Facade, selector))
+	}
+	return nil
+}
+
+func sortedSelectorKeys(selectors map[string]any) []string {
+	keys := make([]string, 0, len(selectors))
+	for key, value := range selectors {
+		if value == nil {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func blockedAnalyzeKindResult(kind string) *mcpgo.CallToolResult {
@@ -1868,6 +2089,39 @@ func mergeFacadeObject(dst map[string]any, raw any) {
 	}
 }
 
+// facadeTargetField is the single decision of which legacy field a public
+// target selector lowers into. Both the lowering below and the "would this
+// selector reach the handler at all?" check read it, so a selector can never
+// be accepted by one and dropped by the other. An empty result means the
+// selector has no legacy field on this tool.
+func facadeTargetField(legacy, selector string) string {
+	switch selector {
+	case "file":
+		if legacy == "find_co_changing_symbols" {
+			return "file_path"
+		}
+		return "path"
+	case "symbol":
+		switch legacy {
+		case "check_references", "find_co_changing_symbols":
+			return "symbol_id"
+		case "find_import_path":
+			return "name"
+		}
+		return "id"
+	case "symbols":
+		return "ids"
+	case "query":
+		return "query"
+	case "artifact":
+		return "id"
+	case "repo":
+		return "repo"
+	default:
+		return ""
+	}
+}
+
 func applyFacadeTarget(legacy string, out, target map[string]any) {
 	set := func(key string, value any) {
 		if value != nil {
@@ -1875,22 +2129,10 @@ func applyFacadeTarget(legacy string, out, target map[string]any) {
 		}
 	}
 	if file := target["file"]; file != nil {
-		key := "path"
-		switch legacy {
-		case "find_co_changing_symbols":
-			key = "file_path"
-		}
-		set(key, file)
+		set(facadeTargetField(legacy, "file"), file)
 	}
 	if symbol := target["symbol"]; symbol != nil {
-		key := "id"
-		switch legacy {
-		case "check_references", "find_co_changing_symbols":
-			key = "symbol_id"
-		case "find_import_path":
-			key = "name"
-		}
-		set(key, symbol)
+		set(facadeTargetField(legacy, "symbol"), symbol)
 	}
 	if symbols := target["symbols"]; symbols != nil {
 		if values, ok := symbols.([]any); ok {
@@ -1899,24 +2141,24 @@ func applyFacadeTarget(legacy string, out, target map[string]any) {
 				parts = append(parts, fmt.Sprint(value))
 			}
 			if encoded, err := json.Marshal(parts); err == nil {
-				set("ids", string(encoded))
+				set(facadeTargetField(legacy, "symbols"), string(encoded))
 			}
 		} else if values, ok := symbols.([]string); ok {
 			if encoded, err := json.Marshal(values); err == nil {
-				set("ids", string(encoded))
+				set(facadeTargetField(legacy, "symbols"), string(encoded))
 			}
 		} else {
-			set("ids", symbols)
+			set(facadeTargetField(legacy, "symbols"), symbols)
 		}
 	}
 	if query := target["query"]; query != nil {
-		set("query", query)
+		set(facadeTargetField(legacy, "query"), query)
 	}
 	if artifact := target["artifact"]; artifact != nil {
-		set("id", artifact)
+		set(facadeTargetField(legacy, "artifact"), artifact)
 	}
 	if repo := target["repo"]; repo != nil {
-		set("repo", repo)
+		set(facadeTargetField(legacy, "repo"), repo)
 	}
 }
 
@@ -2147,7 +2389,10 @@ func analyzeFacadeCapabilitySchema(spec facadeOperationSpec, legacyProperties ma
 	options := make(map[string]any)
 	output := make(map[string]any)
 	for field, property := range legacyProperties {
-		if field == "kind" {
+		// kind is the discriminator and target is a top-level envelope
+		// container the switch below publishes explicitly; neither belongs
+		// in the per-operation options object.
+		if field == "kind" || field == "target" {
 			continue
 		}
 		if _, fixed := spec.Fixed[field]; fixed {
@@ -2214,13 +2459,13 @@ func analyzeFacadeCapabilitySchema(spec facadeOperationSpec, legacyProperties ma
 	if len(output) > 0 {
 		properties["output"] = map[string]any{"type": "object", "properties": output, "additionalProperties": false}
 	}
-	// def_use and co_change are target-only. impact's target is optional:
+	// def_use, co_change and why are target-only. impact's target is optional:
 	// with one it ranks that symbol's blast radius, without one it keeps
 	// its repo-wide ranking.
 	switch spec.Operation {
-	case "def_use", "co_change", "impact":
+	case "def_use", "co_change", "impact", "why":
 		targetProperties := map[string]any{"symbol": map[string]any{"type": "string"}}
-		if spec.Operation != "def_use" {
+		if spec.Operation != "def_use" && spec.Operation != "why" {
 			targetProperties["file"] = map[string]any{"type": "string"}
 		}
 		properties["target"] = map[string]any{
@@ -2370,7 +2615,7 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 		switch spec.Operation {
 		case "citation":
 			args["options"] = map[string]any{"span": "<verbatim code>", "file_path": "<file>"}
-		case "co_change", "def_use", "impact":
+		case "co_change", "def_use", "impact", "why":
 			args["target"] = placeholder("symbol")
 		case "would_create_cycle":
 			args["options"] = map[string]any{"from_id": "<source symbol>", "to_id": "<target symbol>"}

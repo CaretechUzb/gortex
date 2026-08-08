@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -242,7 +243,15 @@ type defUseItem struct {
 func (s *Server) handleAnalyzeDefUse(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ids := symbolIDList(req.GetArguments())
 	if len(ids) == 0 {
-		return mcp.NewToolResultError("def_use requires `ids` (comma-separated symbol IDs) or `id`"), nil
+		// Name the public selector first: the compact surface is what
+		// capabilities advertises, so an error that only speaks legacy
+		// vocabulary sends the caller looking for a field their schema
+		// does not have.
+		return NewStructuredErrorResult(StructuredError{
+			ErrorCode: ErrCodeInvalidArgument,
+			Message:   "def_use requires a target symbol — pass target:{symbol:\"<symbol id>\"} (legacy: `id`, or `ids` for a comma-separated list)",
+			Data:      map[string]any{"field": "target.symbol", "kind": "def_use"},
+		}), nil
 	}
 
 	type chainRow struct {
@@ -359,29 +368,54 @@ func (s *Server) handleAnalyzeDefUse(ctx context.Context, req mcp.CallToolReques
 
 // symbolIDList parses the def_use id arguments: `ids` as a comma-
 // separated string or JSON array, falling back to a single `id`.
-func symbolIDList(args map[string]any) []string {
+// splitSymbolIDField decodes every encoding a symbol-id list arrives in: a
+// real array, the legacy comma-separated string, or the JSON array the facade
+// emits when it lowers target:{symbols}. Comma-splitting a JSON array yields
+// bracket- and quote-fringed ids that match nothing, which reads as an empty
+// result rather than an error — so the reader, not the writer, is where the
+// encodings have to converge.
+func splitSymbolIDField(raw any) []string {
 	var out []string
 	add := func(s string) {
-		s = strings.TrimSpace(s)
-		if s != "" {
+		if s = strings.TrimSpace(s); s != "" {
 			out = append(out, s)
 		}
 	}
-	switch v := args["ids"].(type) {
+	switch value := raw.(type) {
 	case string:
-		for _, part := range strings.Split(v, ",") {
+		if trimmed := strings.TrimSpace(value); strings.HasPrefix(trimmed, "[") {
+			var decoded []string
+			if err := json.Unmarshal([]byte(trimmed), &decoded); err == nil {
+				for _, item := range decoded {
+					add(item)
+				}
+				return out
+			}
+		}
+		for _, part := range strings.Split(value, ",") {
 			add(part)
 		}
+	case []string:
+		for _, item := range value {
+			add(item)
+		}
 	case []any:
-		for _, item := range v {
+		for _, item := range value {
 			if s, ok := item.(string); ok {
 				add(s)
 			}
 		}
 	}
+	return out
+}
+
+func symbolIDList(args map[string]any) []string {
+	out := splitSymbolIDField(args["ids"])
 	if len(out) == 0 {
 		if id, ok := args["id"].(string); ok {
-			add(id)
+			if id = strings.TrimSpace(id); id != "" {
+				out = append(out, id)
+			}
 		}
 	}
 	return out
