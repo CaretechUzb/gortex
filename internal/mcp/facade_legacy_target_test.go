@@ -3,11 +3,20 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/query"
 )
 
 // facadeFrameCaller drives real MCP frames against the registered tool
@@ -376,4 +385,76 @@ func TestRefusedSelectorNamesTheActualMistake(t *testing.T) {
 		require.True(t, wrongEntity.IsError)
 		require.Contains(t, toolResultText(wrongEntity), "not found")
 	}
+}
+
+// setupNarrowingFixtureServer indexes a repo whose call graph has a symbol
+// outside the target's dependent closure, so a targeted ranking is provably
+// narrower than the repo-wide one rather than merely annotated as such.
+func setupNarrowingFixtureServer(t *testing.T) *Server {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(`package main
+
+func main() { helper() }
+
+func helper() { leaf() }
+
+func leaf() {}
+
+func isolated() {}
+`), 0o644))
+
+	g := graph.New()
+	idx := indexer.New(g, testRegistry(), config.Default().Index, zap.NewNop())
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+	srv := NewServer(query.NewEngine(g), g, idx, nil, zap.NewNop(), nil)
+	srv.RunAnalysis()
+	return srv
+}
+
+// TestAnalyzeTargetActuallyNarrowsTheRanking is the control the report's
+// `untested` measurement suggested: a scalar carried by the response tells you
+// whether a filter applied, where a row count can be disguised by truncation or
+// by a closure that happens to be the same size. The repo-wide and targeted
+// calls must disagree on their totals and on their membership — equal totals
+// would mean the selector was accepted and then not used.
+func TestAnalyzeTargetActuallyNarrowsTheRanking(t *testing.T) {
+	srv := setupNarrowingFixtureServer(t)
+	ctx := WithSessionID(context.Background(), "impact_narrowing")
+	call := facadeFrameCaller(t, srv, ctx)
+	helperID := fixtureSymbolID(t, srv, ctx, "helper")
+
+	wide := unmarshalResult(t, call(2, "analyze", map[string]any{
+		"kind": "impact", "output": map[string]any{"format": "json"},
+	}))
+	targeted := unmarshalResult(t, call(3, "analyze", map[string]any{
+		"kind":   "impact",
+		"target": map[string]any{"symbol": helperID},
+		"output": map[string]any{"format": "json"},
+	}))
+
+	wideTotal, ok := wide["total"].(float64)
+	require.True(t, ok, "the repo-wide ranking must report a total")
+	targetedTotal, ok := targeted["total"].(float64)
+	require.True(t, ok, "a target-scoped ranking must report a total")
+	require.Less(t, targetedTotal, wideTotal,
+		"an identical total means the target was accepted and then not applied")
+
+	ids := func(payload map[string]any) []string {
+		rows, _ := payload["symbols"].([]any)
+		out := make([]string, 0, len(rows))
+		for _, row := range rows {
+			if fields, ok := row.(map[string]any); ok {
+				out = append(out, fmt.Sprint(fields["id"]))
+			}
+		}
+		return out
+	}
+	require.Contains(t, ids(wide), "main.go::isolated",
+		"the fixture must put a symbol outside the target's closure into the repo-wide ranking")
+	require.NotContains(t, ids(targeted), "main.go::isolated",
+		"a symbol that cannot be reached from the target must not appear in its blast radius")
+	require.Contains(t, ids(targeted), helperID)
+	require.Contains(t, ids(targeted), "main.go::main", "the target's caller is its blast radius")
 }
