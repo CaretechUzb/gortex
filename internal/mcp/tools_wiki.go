@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -67,6 +68,16 @@ func (s *Server) handleGenerateWiki(ctx context.Context, req mcp.CallToolRequest
 		NoContracts:    boolArgValue(args, "no_contracts"),
 		NoDocs:         boolArgValue(args, "no_docs"),
 		Force:          boolArgValue(args, "force"),
+	}
+
+	// output_dir becomes the writer root and `repo` becomes a path segment
+	// under it, so both steer where files land. Confine them the same way
+	// export_graph confines its own output arguments.
+	if err := s.guardGeneratedOutputPath(ctx, opts.OutputDir); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if err := s.guardGeneratedOutputPath(ctx, filepath.Join(opts.OutputDir, opts.Repo)); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	g := s.graph
@@ -171,6 +182,9 @@ func (s *Server) handleGenerateDocs(ctx context.Context, req mcp.CallToolRequest
 
 	outputPath := stringArg(args, "output_path")
 	if outputPath != "" {
+		if err := s.guardGeneratedOutputPath(ctx, outputPath); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		if err := writeWikiFile(outputPath, []byte(output)); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("write %q: %v", outputPath, err)), nil
 		}
