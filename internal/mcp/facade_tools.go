@@ -262,6 +262,26 @@ func (s *Server) registerFacadeTools() {
 	}
 }
 
+// facadeContainerKeys are the public envelope containers of the compact
+// surface. They are vocabulary, not payload: no legacy handler has a field to
+// read them from, so a call carrying one must be lowered through the public
+// dispatcher or it silently answers a different question than the one asked.
+var facadeContainerKeys = []string{"target", "to", "arguments", "options", "source", "context", "guard", "output"}
+
+// usesFacadeVocabulary reports whether a call to a reused (legacy-named)
+// facade speaks the compact envelope. Only object-valued containers count:
+// every legacy parameter of the reused names is a scalar, so an object under
+// one of these keys is unambiguously the public shape and can never be a
+// legacy argument that happens to share the name.
+func usesFacadeVocabulary(args map[string]any) bool {
+	for _, key := range facadeContainerKeys {
+		if _, ok := args[key].(map[string]any); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) wrapLegacyFacade(name string, raw server.ToolHandlerFunc) server.ToolHandlerFunc {
 	if !isFacadeToolName(name) {
 		return raw
@@ -270,7 +290,13 @@ func (s *Server) wrapLegacyFacade(name string, raw server.ToolHandlerFunc) serve
 		args := req.GetArguments()
 		_, explicitOperation := args["operation"]
 		facadeSession := s.effectiveSessionPolicy(ctx).preset == FacadeSurfaceVersion
-		if !facadeSession && !explicitOperation {
+		// `operation` cannot be the only compact-call signal: analyze
+		// discriminates on `kind`, so a well-formed compact analyze call
+		// never carries one. Without the vocabulary check below, every
+		// analyze(kind=…, target={…}) call outside a facade-v1 session went
+		// straight to the legacy handler, which has no target to read — the
+		// caller got a repo-wide ranking that looks like an answer.
+		if !facadeSession && !explicitOperation && !usesFacadeVocabulary(args) {
 			return raw(ctx, req)
 		}
 		if name == "analyze" {
@@ -1038,6 +1064,10 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		outcome = facadeOutcomeBlocked
 		return blockedAnalyzeKindResult(kind), nil
 	}
+	if invalid := s.rejectUnsupportedAnalyzeTarget(spec, req.GetArguments()); invalid != nil {
+		outcome = facadeOutcomeInvalidArgument
+		return invalid, nil
+	}
 	if OverlayViewFromContext(ctx) == nil && !facadeLegacyManagesOwnOverlay(spec.Legacy) {
 		view, viewErr := s.buildOverlayViewForCtx(ctx)
 		if viewErr != nil {
@@ -1126,6 +1156,92 @@ func requestedAnalyzeKind(input map[string]any) string {
 		return ""
 	}
 	return normalizeFacadeOperation(fmt.Sprint(raw))
+}
+
+// analyzeTargetSelectorFields maps each public target selector to the legacy
+// analyze field applyFacadeTarget lowers it into. A selector missing from this
+// table has no legacy field to reach on the analyze dispatcher at all.
+var analyzeTargetSelectorFields = map[string]string{
+	"symbol":  "id",
+	"symbols": "ids",
+	"file":    "path",
+	"repo":    "repo",
+}
+
+// analyzeKindAcceptsTargetField reports whether an analyze kind consumes the
+// named legacy field. The answer is read off the dispatcher's own annotated
+// schema — the same source capabilities publishes — so the accepted selectors
+// and the advertised ones cannot drift apart.
+func (s *Server) analyzeKindAcceptsTargetField(kind, field string) bool {
+	legacy, available := s.facades.legacy("analyze")
+	if !available {
+		return false
+	}
+	property, declared := legacy.tool.InputSchema.Properties[field]
+	if !declared {
+		return false
+	}
+	return analyzeFieldApplies(kind, field, property)
+}
+
+// analyzeKindsAcceptingTargetField lists the kinds that do consume the field,
+// so a refusal can point at the calls that would have worked.
+func (s *Server) analyzeKindsAcceptingTargetField(field string) []string {
+	kinds := make([]string, 0, 4)
+	for _, kind := range AnalyzeKinds() {
+		if analyzeKindRequiresAdmin(kind) {
+			continue
+		}
+		if s.analyzeKindAcceptsTargetField(kind, field) {
+			kinds = append(kinds, kind)
+		}
+	}
+	sort.Strings(kinds)
+	return kinds
+}
+
+// rejectUnsupportedAnalyzeTarget fails closed when a caller aims analyze at a
+// target the requested kind cannot rank. Silently dropping the selector is the
+// failure this whole path exists to prevent: a repo-wide ranking returned for
+// "what is the blast radius of X" is indistinguishable from a correct answer,
+// and the caller has no way to notice their target was ignored.
+func (s *Server) rejectUnsupportedAnalyzeTarget(spec facadeOperationSpec, input map[string]any) *mcpgo.CallToolResult {
+	if spec.Facade != "analyze" || spec.Legacy != "analyze" {
+		return nil
+	}
+	target, ok := input["target"].(map[string]any)
+	if !ok || len(target) == 0 {
+		return nil
+	}
+	selectors := make([]string, 0, len(target))
+	for selector := range target {
+		selectors = append(selectors, selector)
+	}
+	sort.Strings(selectors)
+	for _, selector := range selectors {
+		if value := target[selector]; value == nil {
+			continue
+		}
+		field, lowered := analyzeTargetSelectorFields[selector]
+		if lowered && s.analyzeKindAcceptsTargetField(spec.Operation, field) {
+			continue
+		}
+		data := map[string]any{
+			"field":  "target." + selector,
+			"kind":   spec.Operation,
+			"reason": "unsupported_target",
+		}
+		if lowered {
+			data["accepted_by_kinds"] = s.analyzeKindsAcceptingTargetField(field)
+		}
+		return NewStructuredErrorResult(StructuredError{
+			ErrorCode: ErrCodeInvalidArgument,
+			Message: fmt.Sprintf("analyze(kind=%s) has no target.%s to rank — it would be ignored, so the call is refused rather than answered repo-wide",
+				spec.Operation, selector),
+			Data: data,
+		})
+	}
+	return nil
 }
 
 func blockedAnalyzeKindResult(kind string) *mcpgo.CallToolResult {
@@ -2147,7 +2263,10 @@ func analyzeFacadeCapabilitySchema(spec facadeOperationSpec, legacyProperties ma
 	options := make(map[string]any)
 	output := make(map[string]any)
 	for field, property := range legacyProperties {
-		if field == "kind" {
+		// kind is the discriminator and target is a top-level envelope
+		// container the switch below publishes explicitly; neither belongs
+		// in the per-operation options object.
+		if field == "kind" || field == "target" {
 			continue
 		}
 		if _, fixed := spec.Fixed[field]; fixed {

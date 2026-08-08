@@ -242,7 +242,15 @@ type defUseItem struct {
 func (s *Server) handleAnalyzeDefUse(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ids := symbolIDList(req.GetArguments())
 	if len(ids) == 0 {
-		return mcp.NewToolResultError("def_use requires `ids` (comma-separated symbol IDs) or `id`"), nil
+		// Name the public selector first: the compact surface is what
+		// capabilities advertises, so an error that only speaks legacy
+		// vocabulary sends the caller looking for a field their schema
+		// does not have.
+		return NewStructuredErrorResult(StructuredError{
+			ErrorCode: ErrCodeInvalidArgument,
+			Message:   "def_use requires a target symbol — pass target:{symbol:\"<symbol id>\"} (legacy: `id`, or `ids` for a comma-separated list)",
+			Data:      map[string]any{"field": "target.symbol", "kind": "def_use"},
+		}), nil
 	}
 
 	type chainRow struct {
