@@ -2817,11 +2817,12 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 	baseRef := req.GetString("base_ref", "main")
 
 	// Resolve the working tree: explicit repo selector, lone tracked repo,
-	// or the session's cwd-bound repo. The "." fallback keeps the standalone
-	// (indexer-less) server working from its own cwd.
-	repoRoot, repoPrefix := s.diffRepoScope(ctx, strings.TrimSpace(req.GetString("repo", "")))
-	if repoRoot == "" {
-		repoRoot = "."
+	// the session's cwd-bound repo, then its sole contained repo. "." is
+	// reserved for the standalone (indexer-less) server, which is started
+	// in the tree it serves.
+	repoRoot, repoPrefix, rootErr := s.resolveDiffRoot(ctx, strings.TrimSpace(req.GetString("repo", "")))
+	if rootErr != nil {
+		return mcp.NewToolResultError(rootErr.Error()), nil
 	}
 
 	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)

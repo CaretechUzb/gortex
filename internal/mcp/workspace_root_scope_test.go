@@ -317,3 +317,48 @@ func TestInvalidateSessionScopes_UnlatchesAfterTrack(t *testing.T) {
 	assert.NotContains(t, ws, unresolvedWorkspacePrefix,
 		"after tracking its own cwd the session must see the repo it added")
 }
+
+// TestContainedSession_DiffRootDoesNotFallBackToDaemonCWD covers the
+// diff-driven handlers. Their working-tree resolution ends in a `"."`
+// fallback, which is the daemon PROCESS's cwd — wherever `gortex daemon
+// start` happened to run. That is a legitimate answer only for a
+// standalone, indexer-less server started inside the tree it serves.
+//
+// A session bound to the repos its cwd contains has no home repo, so every
+// earlier branch misses and the fallback was reached on the ordinary path.
+// detect_changes then diffed an unrelated tree the session is not scoped
+// to — a wrong answer and a disclosure, in one call.
+func TestContainedSession_DiffRootDoesNotFallBackToDaemonCWD(t *testing.T) {
+	f := newContainedFixture(t)
+	ctx := sessionCtx("s-parent", f.parent)
+
+	t.Run("several contained repos are ambiguous, not the daemon cwd", func(t *testing.T) {
+		root, _, err := f.srv.resolveDiffRoot(ctx, "")
+		require.Error(t, err, "an ambiguous session must not resolve to a working tree")
+		assert.Empty(t, root)
+		assert.NotEqual(t, ".", root)
+		// The error has to name the candidates, or the agent cannot act.
+		assert.Contains(t, err.Error(), "repo-a")
+		assert.Contains(t, err.Error(), "repo-b")
+		assert.Contains(t, err.Error(), "repo:")
+	})
+
+	t.Run("an explicit selector inside the session resolves", func(t *testing.T) {
+		root, prefix, err := f.srv.resolveDiffRoot(ctx, "repo-a")
+		require.NoError(t, err)
+		assert.Equal(t, "repo-a", prefix)
+		assert.Equal(t, f.repoA, root)
+	})
+
+	t.Run("a selector outside the session is refused", func(t *testing.T) {
+		_, _, err := f.srv.resolveDiffRoot(ctx, "repo-c")
+		require.Error(t, err, "a repo the session does not contain must not resolve a working tree")
+	})
+
+	t.Run("a session bound inside one repo still resolves it", func(t *testing.T) {
+		root, prefix, err := f.srv.resolveDiffRoot(sessionCtx("s-a", f.repoA), "")
+		require.NoError(t, err)
+		assert.Equal(t, "repo-a", prefix)
+		assert.Equal(t, f.repoA, root)
+	})
+}

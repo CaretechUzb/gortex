@@ -323,9 +323,9 @@ func (s *Server) lowerDiffSource(ctx context.Context, req mcp.CallToolRequest) (
 	if scope == "" {
 		scope = "unstaged"
 	}
-	repoRoot, repoPrefix := s.diffRepoScope(ctx, strings.TrimSpace(req.GetString("repo", "")))
-	if repoRoot == "" {
-		repoRoot = "."
+	repoRoot, repoPrefix, rootErr := s.resolveDiffRoot(ctx, strings.TrimSpace(req.GetString("repo", "")))
+	if rootErr != nil {
+		return nil, rootErr
 	}
 	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, base)
 	if err != nil {
