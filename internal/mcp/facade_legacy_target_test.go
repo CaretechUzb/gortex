@@ -166,10 +166,16 @@ func TestAnalyzeUnsupportedTargetFailsClosed(t *testing.T) {
 }
 
 // TestAnalyzeAdvertisedTargetMatchesAcceptedTarget is the anti-drift gate the
-// original report asked for: capabilities is the documentation callers build
-// against, so a kind whose published request shape carries a target must
-// accept one, and a kind whose shape omits it must refuse one. Neither
-// direction may be discovered at runtime by getting a confident wrong answer.
+// original report asked for, and it is deliberately symmetric: capabilities is
+// the documentation callers build against, so a kind whose published request
+// shape carries a target must accept one, and a kind whose shape omits it must
+// refuse one. Neither direction may be discovered at runtime by getting a
+// confident wrong answer — the kind that publishes nothing (routes, hotspots,
+// dead_code, …) is the direction the original report tripped over.
+//
+// Every non-admin analyze kind is covered, including the ones that dispatch to
+// a legacy tool other than the analyze dispatcher; those were the blind spot
+// where a target could still be accepted without ever being advertised.
 func TestAnalyzeAdvertisedTargetMatchesAcceptedTarget(t *testing.T) {
 	srv, _ := setupTestServer(t)
 	ctx := WithSessionID(context.Background(), "analyze_target_parity")
@@ -179,9 +185,13 @@ func TestAnalyzeAdvertisedTargetMatchesAcceptedTarget(t *testing.T) {
 	id := 200
 	checked := 0
 	advertised := 0
+	aliased := 0
 	for _, spec := range srv.capabilityOperations("analyze") {
-		if spec.Legacy != "analyze" || spec.Operation == "help" {
+		if spec.Operation == "help" {
 			continue
+		}
+		if spec.Legacy != "analyze" {
+			aliased++
 		}
 		capability := srv.facadeCapability(spec, true)
 		shape, _ := capability["request_shape"].(map[string]any)
@@ -209,6 +219,8 @@ func TestAnalyzeAdvertisedTargetMatchesAcceptedTarget(t *testing.T) {
 	}
 	require.Greater(t, checked, 20, "the analyze catalogue must be exercised, not skipped")
 	require.GreaterOrEqual(t, advertised, 2, "impact and def_use both publish a target")
+	require.Greater(t, aliased, 10,
+		"the kinds dispatching to another legacy tool must be covered, not filtered out")
 }
 
 // TestInertSelectorsFailClosedAcrossFacades extends the analyze contract to the

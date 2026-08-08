@@ -1194,11 +1194,26 @@ var facadeToSelectorOperations = map[string]bool{
 	"trace.flow": true, "trace.path": true, "trace.taint": true,
 }
 
+// analyzeAliasedSymbolKinds are the analyze kinds that dispatch to a tool other
+// than the analyze dispatcher AND whose id-shaped field really holds a symbol.
+// Declaring the field is not evidence enough for these: get_communities and
+// get_processes both take an `id`, but it names a community or a process, so a
+// symbol lowered into it matches nothing and reads as an empty answer — the
+// same silence this whole path exists to remove.
+var analyzeAliasedSymbolKinds = map[string]bool{
+	"co_change": true,
+	"why":       true,
+}
+
 // facadeSelectorReaches reports whether a public selector actually arrives at
-// the selected legacy handler as a field that handler declares.
+// the selected legacy handler as a field that handler declares and reads.
 func (s *Server) facadeSelectorReaches(spec facadeOperationSpec, selector string) bool {
 	if facadeBespokeSelectorOperations[spec.Facade+"."+spec.Operation] {
 		return true
+	}
+	if spec.Facade == "analyze" && spec.Legacy != "analyze" &&
+		(selector == "symbol" || selector == "symbols") && !analyzeAliasedSymbolKinds[spec.Operation] {
+		return false
 	}
 	field := facadeTargetField(spec.Legacy, selector)
 	if field == "" {
@@ -2413,13 +2428,13 @@ func analyzeFacadeCapabilitySchema(spec facadeOperationSpec, legacyProperties ma
 	if len(output) > 0 {
 		properties["output"] = map[string]any{"type": "object", "properties": output, "additionalProperties": false}
 	}
-	// def_use and co_change are target-only. impact's target is optional:
+	// def_use, co_change and why are target-only. impact's target is optional:
 	// with one it ranks that symbol's blast radius, without one it keeps
 	// its repo-wide ranking.
 	switch spec.Operation {
-	case "def_use", "co_change", "impact":
+	case "def_use", "co_change", "impact", "why":
 		targetProperties := map[string]any{"symbol": map[string]any{"type": "string"}}
-		if spec.Operation != "def_use" {
+		if spec.Operation != "def_use" && spec.Operation != "why" {
 			targetProperties["file"] = map[string]any{"type": "string"}
 		}
 		properties["target"] = map[string]any{
@@ -2569,7 +2584,7 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 		switch spec.Operation {
 		case "citation":
 			args["options"] = map[string]any{"span": "<verbatim code>", "file_path": "<file>"}
-		case "co_change", "def_use", "impact":
+		case "co_change", "def_use", "impact", "why":
 			args["target"] = placeholder("symbol")
 		case "would_create_cycle":
 			args["options"] = map[string]any{"from_id": "<source symbol>", "to_id": "<target symbol>"}
