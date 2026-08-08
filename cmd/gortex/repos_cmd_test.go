@@ -370,6 +370,51 @@ func TestRunRepos_UnseededRepoIsNeverIndexed(t *testing.T) {
 	assert.Nil(t, two.LastIndexed)
 }
 
+// TestRunRepos_CorruptIndexStoreIsNotAnUnindexedOne separates the two states
+// the command used to conflate. Every failure to read the freshness store
+// degraded to an empty map, so a corrupt store produced a successful run
+// reporting each repo as never indexed — a confident claim about the repos,
+// made without having looked, that sends the user to re-do work already done.
+// Only a store that genuinely is not there may report "never indexed".
+func TestRunRepos_CorruptIndexStoreIsNotAnUnindexedOne(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "solo")
+	head := gitInitRepo(t, dir)
+
+	reposTestEnv(t, []config.RepoEntry{{Path: dir, Name: "solo"}})
+	reposJSON = true
+	t.Cleanup(func() { reposJSON = false })
+
+	// No store file at all: nothing has been indexed, and saying so is right.
+	cmd, buf := newReposCmd()
+	require.NoError(t, runRepos(cmd, nil))
+	var got []repoStatus
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	require.Len(t, got, 1)
+	assert.False(t, got[0].Indexed, "an absent store means the repo really has never been indexed")
+
+	// A store that is present but is not a database: the command has no idea
+	// whether the repo is indexed, and must say so instead of guessing.
+	require.NoError(t, os.MkdirAll(filepath.Dir(reposBackendPath), 0o755))
+	require.NoError(t, os.WriteFile(reposBackendPath, []byte("this is not a sqlite database"), 0o600))
+
+	cmd, buf = newReposCmd()
+	err := runRepos(cmd, nil)
+	require.Error(t, err, "a corrupt freshness store must fail the command, not report every repo unindexed")
+	assert.Contains(t, err.Error(), reposBackendPath, "the error should name the store it could not read")
+	assert.Empty(t, buf.String(), "a failed read must not also print a repo listing")
+
+	// The seeded, readable store still works — the guard rejects unreadable
+	// stores, not every store.
+	require.NoError(t, os.Remove(reposBackendPath))
+	seedIndexState(t, "solo", head, false, time.Now().Truncate(time.Second))
+	cmd, buf = newReposCmd()
+	require.NoError(t, runRepos(cmd, nil))
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	require.Len(t, got, 1)
+	assert.True(t, got[0].Indexed)
+}
+
 // TestShortSHA covers the table SHA abbreviation helper.
 func TestShortSHA(t *testing.T) {
 	assert.Equal(t, "(none)", shortSHA(""))

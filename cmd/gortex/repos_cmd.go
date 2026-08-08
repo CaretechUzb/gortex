@@ -102,10 +102,13 @@ func runRepos(cmd *cobra.Command, _ []string) error {
 
 	// Freshness source: the daemon's on-disk SQLite backend records one
 	// repo_index_state row per repo at the end of every (re)index. Read it
-	// once, read-only, so a single open serves the whole list. An
-	// unavailable / empty store yields an empty map and every repo reports
-	// as never indexed.
-	indexStates := loadRepoIndexStates()
+	// once, read-only, so a single open serves the whole list. A store that
+	// does not exist yet yields an empty map and every repo reports as never
+	// indexed; a store that exists but cannot be read fails the command.
+	indexStates, err := loadRepoIndexStates()
+	if err != nil {
+		return err
+	}
 
 	entries := make([]repoStatus, 0, len(repos))
 	for _, r := range repos {
@@ -132,19 +135,24 @@ func runRepos(cmd *cobra.Command, _ []string) error {
 // loadRepoIndexStates reads the daemon's per-repo index-freshness rows
 // (the SQLite repo_index_state table) keyed by repo prefix. It opens the
 // backend store read-only so it is safe to run while a daemon holds the
-// same store. Any failure (no store yet, unreadable cache) degrades to an
-// empty map so `gortex repos` reports every repo as never indexed rather
-// than erroring out.
-func loadRepoIndexStates() map[string]graph.RepoIndexState {
+// same store.
+//
+// "No store yet" is a legitimate empty answer and returns an empty map. A
+// store that exists but cannot be read — corrupt bytes, wrong permissions, a
+// schema the query cannot run against — is an error. Degrading those to an
+// empty map printed a confident "never indexed" for every repo, which reads as
+// a fact about the repos rather than a failure to look, and sends the user to
+// re-index work that is already done.
+func loadRepoIndexStates() (map[string]graph.RepoIndexState, error) {
 	path := reposBackendPath
 	if path == "" {
 		path = filepath.Join(platform.StoreDir(), "store.sqlite")
 	}
 	states, err := store_sqlite.ReadRepoIndexStates(path)
 	if err != nil {
-		return map[string]graph.RepoIndexState{}
+		return nil, fmt.Errorf("read index freshness from %s: %w", path, err)
 	}
-	return states
+	return states, nil
 }
 
 // describeRepo resolves one RepoEntry into a repoStatus by reading the
