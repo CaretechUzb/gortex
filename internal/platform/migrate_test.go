@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 func seed(t *testing.T, path, content string) {
@@ -20,9 +22,7 @@ func seed(t *testing.T, path, content string) {
 // unified ~/.gortex tree, the stale socket is left behind, and a second
 // run is a no-op that doesn't clobber.
 func TestMigrateToUnifiedHome(t *testing.T) {
-	clearXDG(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := testenv.UnifiedHome(t)
 
 	seed(t, filepath.Join(home, ".config", "gortex", "config.yaml"), "cfg")
 	seed(t, filepath.Join(home, ".cache", "gortex", "daemon-sqlite.gob.gz"), "snap")
@@ -72,9 +72,7 @@ func TestMigrateToUnifiedHome(t *testing.T) {
 // TestMigrateToUnifiedHome_SkipsUnderXDG verifies an explicit XDG opt-in
 // makes migration a no-op — the user chose the XDG layout.
 func TestMigrateToUnifiedHome_SkipsUnderXDG(t *testing.T) {
-	clearXDG(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := testenv.UnifiedHome(t)
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
 	old := filepath.Join(home, ".config", "gortex", "config.yaml")

@@ -3,23 +3,13 @@ package platform
 import (
 	"path/filepath"
 	"testing"
-)
 
-// clearXDG unsets every XDG base-directory variable so a test starts
-// from a known clean slate; t.Setenv restores the prior value at the
-// end of the test.
-func clearXDG(t *testing.T) {
-	t.Helper()
-	for _, v := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"} {
-		t.Setenv(v, "")
-	}
-}
+	"github.com/zzet/gortex/internal/testenv"
+)
 
 // TestHome verifies the unified per-user directory is $HOME/.gortex.
 func TestHome(t *testing.T) {
-	clearXDG(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := testenv.UnifiedHome(t)
 
 	if got, want := Home(), filepath.Join(home, ".gortex"); got != want {
 		t.Errorf("Home() = %s, want %s", got, want)
@@ -29,7 +19,7 @@ func TestHome(t *testing.T) {
 // TestConfigDir_HonorsXDGConfigHome verifies an absolute $XDG_CONFIG_HOME
 // relocates config to the standard XDG location.
 func TestConfigDir_HonorsXDGConfigHome(t *testing.T) {
-	clearXDG(t)
+	testenv.UnifiedHome(t)
 	xdg := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", xdg)
 
@@ -42,9 +32,7 @@ func TestConfigDir_HonorsXDGConfigHome(t *testing.T) {
 // TestConfigDir_UnsetFallback verifies the env-unset default is the
 // unified $HOME/.gortex directory.
 func TestConfigDir_UnsetFallback(t *testing.T) {
-	clearXDG(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := testenv.UnifiedHome(t)
 
 	want := filepath.Join(home, ".gortex")
 	if got := ConfigDir(); got != want {
@@ -55,7 +43,7 @@ func TestConfigDir_UnsetFallback(t *testing.T) {
 // TestDataDir_HonorsXDGDataHome verifies an absolute $XDG_DATA_HOME
 // relocates data to the standard XDG location.
 func TestDataDir_HonorsXDGDataHome(t *testing.T) {
-	clearXDG(t)
+	testenv.UnifiedHome(t)
 	xdg := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", xdg)
 
@@ -68,9 +56,7 @@ func TestDataDir_HonorsXDGDataHome(t *testing.T) {
 // TestDataDir_UnsetFallback verifies the env-unset default collapses
 // into the unified $HOME/.gortex directory.
 func TestDataDir_UnsetFallback(t *testing.T) {
-	clearXDG(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := testenv.UnifiedHome(t)
 
 	want := filepath.Join(home, ".gortex")
 	if got := DataDir(); got != want {
@@ -81,9 +67,7 @@ func TestDataDir_UnsetFallback(t *testing.T) {
 // TestTelemetryDir verifies the telemetry buffer lives under DataDir, both for
 // the unified default and an absolute $XDG_DATA_HOME relocation.
 func TestTelemetryDir(t *testing.T) {
-	clearXDG(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := testenv.UnifiedHome(t)
 	if got, want := TelemetryDir(), filepath.Join(home, ".gortex", "telemetry"); got != want {
 		t.Errorf("TelemetryDir() = %s, want %s (unified default)", got, want)
 	}
@@ -98,7 +82,7 @@ func TestTelemetryDir(t *testing.T) {
 // TestCacheDir_HonorsXDGCacheHome verifies an absolute $XDG_CACHE_HOME
 // relocates cache to the standard XDG location.
 func TestCacheDir_HonorsXDGCacheHome(t *testing.T) {
-	clearXDG(t)
+	testenv.UnifiedHome(t)
 	xdg := t.TempDir()
 	t.Setenv("XDG_CACHE_HOME", xdg)
 
@@ -111,9 +95,7 @@ func TestCacheDir_HonorsXDGCacheHome(t *testing.T) {
 // TestCacheDir_UnsetFallback verifies the env-unset default is the
 // cache/ sub-directory inside the unified ~/.gortex tree.
 func TestCacheDir_UnsetFallback(t *testing.T) {
-	clearXDG(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := testenv.UnifiedHome(t)
 
 	want := filepath.Join(home, ".gortex", "cache")
 	if got := CacheDir(); got != want {
@@ -125,9 +107,7 @@ func TestCacheDir_UnsetFallback(t *testing.T) {
 // to the same place as CacheDir under both an XDG override and the
 // unified default.
 func TestOSCacheDir_ConvergesWithCacheDir(t *testing.T) {
-	clearXDG(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := testenv.UnifiedHome(t)
 	if got, want := OSCacheDir(), CacheDir(); got != want {
 		t.Errorf("OSCacheDir() = %s, want %s (must converge with CacheDir)", got, want)
 	}
@@ -145,9 +125,7 @@ func TestOSCacheDir_ConvergesWithCacheDir(t *testing.T) {
 // TestPurposeDirs_UnsetFallback verifies the store / models / memories
 // sub-directories hang off the unified ~/.gortex tree by default.
 func TestPurposeDirs_UnsetFallback(t *testing.T) {
-	clearXDG(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := testenv.UnifiedHome(t)
 
 	cases := []struct {
 		name string
@@ -168,7 +146,7 @@ func TestPurposeDirs_UnsetFallback(t *testing.T) {
 // TestPurposeDirs_HonorXDGDataHome verifies the purpose sub-directories
 // follow an absolute $XDG_DATA_HOME into the standard XDG layout.
 func TestPurposeDirs_HonorXDGDataHome(t *testing.T) {
-	clearXDG(t)
+	testenv.UnifiedHome(t)
 	xdg := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", xdg)
 
@@ -192,9 +170,7 @@ func TestPurposeDirs_HonorXDGDataHome(t *testing.T) {
 // ignored, as the XDG Base Directory specification mandates — the
 // resolver falls back to the unified $HOME/.gortex default instead.
 func TestNonAbsoluteXDGIgnored(t *testing.T) {
-	clearXDG(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := testenv.UnifiedHome(t)
 
 	cases := []struct {
 		name   string
