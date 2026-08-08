@@ -45,6 +45,9 @@ type DiffResult struct {
 // repo-relative paths; empty only for the standalone Indexer, which
 // mints unprefixed paths.
 func MapGitDiff(g graph.Store, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, error) {
+	if err := gitcmd.ValidateRef(baseRef); err != nil {
+		return nil, err
+	}
 	args := buildDiffArgs(scope, baseRef)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -156,6 +159,13 @@ func GitDiffArgs(scope, baseRef string, unified int) []string {
 	case "all":
 		args = append(args, "HEAD")
 	case "compare":
+		// A hostile base degrades to the documented default rather than
+		// reaching argv: the token is baseRef+"...HEAD", so a value
+		// starting with "-" is still an option to git, and GitDiffArgs
+		// has no error return to surface it through. MapGitDiff rejects
+		// it loudly before calling here; this is the backstop for the
+		// other callers that build args directly.
+		baseRef = gitcmd.SafeRef(baseRef)
 		if baseRef == "" {
 			baseRef = "main"
 		}
@@ -300,6 +310,9 @@ func parseNewStart(line string) (int, bool) {
 // the diff's context width differs), so symbol overlap is unaffected.
 // repoPrefix anchors the node join exactly as in MapGitDiff.
 func MapGitDiffWithLines(g graph.Store, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, map[string][]HunkLine, error) {
+	if err := gitcmd.ValidateRef(baseRef); err != nil {
+		return nil, nil, err
+	}
 	args := buildDiffArgsWithContext(scope, baseRef)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

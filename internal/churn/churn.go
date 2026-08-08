@@ -206,6 +206,9 @@ type commitRecord struct {
 // Ordered newest → oldest. Empty slice when the file has no history
 // on that branch (untracked, or the rev predates the file).
 func fileCommits(repoRoot, branch, relPath string) ([]commitRecord, error) {
+	if err := gitcmd.ValidateRef(branch); err != nil {
+		return nil, err
+	}
 	out, err := gitcmd.Run(context.Background(), repoRoot, "log", branch,
 		"--no-merges", "--follow", "--format=%H|%ct|%ae", "--", relPath)
 	if err != nil {

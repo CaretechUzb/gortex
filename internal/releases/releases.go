@@ -53,8 +53,8 @@ func ListTags(repoRoot string) []string {
 func ListTagsOnBranch(repoRoot, branch string) []string {
 	args := []string{"for-each-ref",
 		"--sort=creatordate", "--format=%(refname:short)"}
-	if strings.TrimSpace(branch) != "" {
-		args = append(args, "--merged="+branch)
+	if b := gitcmd.SafeRef(strings.TrimSpace(branch)); b != "" {
+		args = append(args, "--merged="+b)
 	}
 	args = append(args, "refs/tags/")
 	out, err := gitcmd.Run(context.Background(), repoRoot, args...)
