@@ -307,3 +307,50 @@ func TestAnalyzeDbtModels_FilterByType(t *testing.T) {
 		t.Fatalf("expected 1 source row, got %d", len(rows))
 	}
 }
+
+// A route contract node is keyed by method+path with no repo prefix, so one
+// node is shared by every repo that handles the same route. Narrowing to a repo
+// that is not the shared node's owner must still return that repo's rows: the
+// repo decision belongs to the handler, which is unambiguously attributed.
+func TestAnalyzeRoutes_RepoNarrowKeepsRowsWhenContractNodeIsSharedAcrossRepos(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	// The shared contract node carries exactly one repo prefix.
+	srv.graph.AddNode(&graph.Node{
+		ID: "http::GET::/alpha", Kind: graph.KindContract, Name: "http::GET::/alpha",
+		Language: "contract", RepoPrefix: "repo-b",
+		Meta: map[string]any{"type": "http", "role": "provider", "method": "GET", "path": "/alpha"},
+	})
+	for _, repo := range []string{"repo-a", "repo-b"} {
+		srv.graph.AddNode(&graph.Node{
+			ID: repo + "/main.go::alphaHandler", Kind: graph.KindFunction,
+			Name: "alphaHandler", Language: "go", RepoPrefix: repo,
+		})
+		addHandlesRouteEdge(srv.graph, repo+"/main.go::alphaHandler", "http::GET::/alpha", repo+"/main.go", 7)
+	}
+
+	for _, repo := range []string{"repo-a", "repo-b"} {
+		t.Run(repo, func(t *testing.T) {
+			ctx := withRepoAllow(context.Background(), map[string]bool{repo: true})
+			req := mcplib.CallToolRequest{}
+			req.Params.Name = "analyze"
+			req.Params.Arguments = map[string]any{"kind": "routes"}
+			res, err := srv.handleAnalyzeRoutes(ctx, req)
+			if err != nil {
+				t.Fatalf("handleAnalyzeRoutes: %v", err)
+			}
+			var out map[string]any
+			if err := json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &out); err != nil {
+				t.Fatalf("json: %v", err)
+			}
+			rows, _ := out["routes"].([]any)
+			if len(rows) != 1 {
+				t.Fatalf("repo %q: got %d rows, want 1 — the shared contract node must not decide repo visibility; out=%v", repo, len(rows), out)
+			}
+			got := rows[0].(map[string]any)["handler"].(string)
+			if want := repo + "/main.go::alphaHandler"; got != want {
+				t.Fatalf("repo %q: handler = %q, want %q", repo, got, want)
+			}
+		})
+	}
+}
