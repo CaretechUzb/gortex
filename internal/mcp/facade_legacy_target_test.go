@@ -144,6 +144,17 @@ func TestAnalyzeUnsupportedTargetFailsClosed(t *testing.T) {
 	require.True(t, fileTargeted.IsError, "def_use ranks symbols, not files: %s", toolResultText(fileTargeted))
 	require.Contains(t, toolResultText(fileTargeted), "unsupported_target")
 
+	// A malformed selector is refused, not quietly ignored: a scalar where the
+	// envelope is expected used to slip past every lowering layer and land as a
+	// repo-wide ranking.
+	scalar := call(122, "analyze", map[string]any{
+		"kind":   "impact",
+		"target": helperID,
+		"output": map[string]any{"format": "json"},
+	})
+	require.True(t, scalar.IsError, "a scalar target must be refused: %s", toolResultText(scalar))
+	require.Contains(t, toolResultText(scalar), "target must be an object")
+
 	// A missing selector must speak the vocabulary the caller's schema uses.
 	empty := call(121, "analyze", map[string]any{
 		"kind":   "def_use",

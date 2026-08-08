@@ -262,18 +262,29 @@ func (s *Server) registerFacadeTools() {
 	}
 }
 
-// facadeContainerKeys are the public envelope containers of the compact
-// surface. They are vocabulary, not payload: no legacy handler has a field to
-// read them from, so a call carrying one must be lowered through the public
-// dispatcher or it silently answers a different question than the one asked.
-var facadeContainerKeys = []string{"target", "to", "arguments", "options", "source", "context", "guard", "output"}
+// facadeSelectorKeys carry the subject of the question. Losing one silently
+// changes the answer, so any value under these keys routes to the public
+// dispatcher — a malformed selector then earns a structured error instead of
+// a confident answer to a question the caller did not ask.
+var facadeSelectorKeys = []string{"target", "to"}
+
+// facadeContainerKeys are the remaining public envelope containers of the
+// compact surface. They are vocabulary, not payload: no legacy handler has a
+// field to read them from, so a call carrying one must be lowered through the
+// public dispatcher or its knobs are silently discarded.
+var facadeContainerKeys = []string{"arguments", "options", "source", "context", "guard", "output"}
 
 // usesFacadeVocabulary reports whether a call to a reused (legacy-named)
-// facade speaks the compact envelope. Only object-valued containers count:
-// every legacy parameter of the reused names is a scalar, so an object under
-// one of these keys is unambiguously the public shape and can never be a
-// legacy argument that happens to share the name.
+// facade speaks the compact envelope. For the non-selector containers only an
+// object counts: every legacy parameter of the reused names is a scalar, so an
+// object under one of those keys is unambiguously the public shape and can
+// never be a legacy argument that happens to share the name.
 func usesFacadeVocabulary(args map[string]any) bool {
+	for _, key := range facadeSelectorKeys {
+		if value, present := args[key]; present && value != nil {
+			return true
+		}
+	}
 	for _, key := range facadeContainerKeys {
 		if _, ok := args[key].(map[string]any); ok {
 			return true
