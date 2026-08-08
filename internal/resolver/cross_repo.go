@@ -1474,7 +1474,10 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 	receiverType := edgeReceiverType(e)
 	reachable := cr.reachabilityChecker(e)
 
-	// If we have a type hint, try exact type match first.
+	// If we have a type hint, try exact type match first. Both exact-type
+	// tiers stamp OriginASTResolved like the main resolver's Passes 1/2 —
+	// unstamped, their receiver-typed evidence would be indistinguishable
+	// from the name-tier binds semantic enrichment is allowed to reclaim.
 	if receiverType != "" {
 		// Same-repo + exact type.
 		for _, c := range candidates {
@@ -1483,6 +1486,7 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 				nodeReceiverType(c) == receiverType {
 				e.To = c.ID
 				e.Confidence = 0.95
+				e.Origin = graph.OriginASTResolved
 				stats.Resolved++
 				return
 			}
@@ -1501,6 +1505,7 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 			}
 			e.To = c.ID
 			e.Confidence = 0.85
+			e.Origin = graph.OriginASTResolved
 			stats.Resolved++
 			if isCrossRepoHop(callerRepo, c.RepoPrefix) {
 				e.CrossRepo = true

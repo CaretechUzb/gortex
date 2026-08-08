@@ -57,10 +57,12 @@ namespace App.Services {
 	New(g).ResolveAll()
 
 	from := "FolioService.cs::FolioService.FetchSealedFolios"
+	matched := 0
 	for _, e := range g.GetOutEdges(from) {
 		if e.Kind != graph.EdgeCalls || !strings.HasSuffix(e.To, "FetchSealedFolios") {
 			continue
 		}
+		matched++
 		require.NotEqual(t, from, e.To,
 			"member call on the injected field must not bind to the calling method itself (got conf=%v origin=%q)",
 			e.Confidence, e.Origin)
@@ -73,6 +75,10 @@ namespace App.Services {
 				"an origin-unstamped name-tier bind at >=0.9 masquerades as AST-grade (to=%s)", e.To)
 		}
 	}
+	// The loop's assertions are only meaningful if the extractor emitted
+	// the call at all — zero matches would pass vacuously on an ID-scheme
+	// drift.
+	require.NotZero(t, matched, "no FetchSealedFolios call edges found — fixture or ID scheme broke")
 }
 
 // Control: the gate must not disturb same-class binds that carry real

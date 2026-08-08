@@ -1065,7 +1065,7 @@ func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichRes
 		return
 	}
 	caller := idx.enclosingCallable(cf.line)
-	if caller == nil || caller.ID == target.ID {
+	if caller == nil {
 		return
 	}
 	strategy, confidence := strategyDirect, astConfidence
@@ -1073,6 +1073,15 @@ func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichRes
 		// The receiver type was derived through a chained return-type
 		// rewrite rather than a direct binding — grade the edge honestly.
 		strategy, confidence = strategyInferred, inferredConfidence
+	}
+	if caller.ID == target.ID {
+		// A SELF-typed receiver — a field of the enclosing class calling
+		// the same method (linked list, chain of responsibility) — makes
+		// the calling method its own genuine target. Claim the extracted
+		// stub in place; minting a fresh self-edge stays forbidden, which
+		// is what this guard has always been for.
+		a.upgradeExistingCall(caller, target, cf, res, strategy, confidence)
+		return
 	}
 	a.upgradeOrCreateCall(caller, target, cf, idx.facts.file, res, strategy, confidence)
 }
@@ -1338,13 +1347,26 @@ func (a *applier) buildExtensionIndex() {
 // a fresh edge. Edges that already carry compiler/AST-grade provenance
 // pointing elsewhere are never overridden.
 func (a *applier) upgradeOrCreateCall(caller, target *graph.Node, cf callFact, file string, res *semantic.EnrichResult, strategy resolutionStrategy, confidence float64) {
+	if a.upgradeExistingCall(caller, target, cf, res, strategy, confidence) {
+		return
+	}
+	a.addASTEdge(caller.ID, target.ID, graph.EdgeCalls, file, cf.line, strategy, confidence)
+	res.EdgesAdded++
+}
+
+// upgradeExistingCall confirms or retargets an edge already present at
+// the call site and reports whether the site is handled — false means
+// no edge matched and the caller may mint a fresh one. Split out so the
+// self-target path (a SELF-typed receiver field, where target == caller)
+// can claim the extracted stub without ever being allowed to create.
+func (a *applier) upgradeExistingCall(caller, target *graph.Node, cf callFact, res *semantic.EnrichResult, strategy resolutionStrategy, confidence float64) bool {
 	outs := a.outEdges(caller.ID)
 	for _, e := range outs {
 		if e.Kind == graph.EdgeCalls && e.To == target.ID {
 			if a.confirmCall(e, strategy, confidence) {
 				res.EdgesConfirmed++
 			}
-			return
+			return true
 		}
 	}
 	for _, e := range outs {
@@ -1358,17 +1380,16 @@ func (a *applier) upgradeOrCreateCall(caller, target *graph.Node, cf callFact, f
 			// A same-line edge for this name already carries
 			// equal-or-stronger evidence for a different target —
 			// leave it alone and don't double the call site.
-			return
+			return true
 		}
 		oldTo := e.To
 		e.To = target.ID
 		a.reindexEdge(e, oldTo)
 		a.confirmCall(e, strategy, confidence)
 		res.EdgesConfirmed++
-		return
+		return true
 	}
-	a.addASTEdge(caller.ID, target.ID, graph.EdgeCalls, file, cf.line, strategy, confidence)
-	res.EdgesAdded++
+	return false
 }
 
 // confirmCall lands the provenance of a resolved call edge at the band
@@ -1711,8 +1732,8 @@ func (a *applier) claimable(e *graph.Edge) bool {
 		return true
 	}
 	// A member-call bind that never got an Origin stamp came from the
-	// resolver's name-locality tiers (the caller-receiver and locality
-	// fallbacks stamp none) — name evidence no matter its confidence.
+	// resolver's caller-receiver fallback (which stamps no Origin) or a
+	// pre-stamping vintage — name evidence no matter its confidence.
 	// Without this, the DefaultOriginFor backfill grades a 0.9 guess at
 	// the AST ceiling and blocks the retarget: the facade shape (a
 	// service wrapping a same-named repository method) stays bound to

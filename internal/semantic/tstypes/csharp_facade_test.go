@@ -142,3 +142,50 @@ namespace App.Services {
 		t.Fatalf("an explicitly ast_resolved bind must not be retargeted; edges: %v", g.GetOutEdges(callerID))
 	}
 }
+
+// Recursion through a SELF-typed field (linked list, chain of
+// responsibility): `next.Print()` inside Print, where `next` is a field
+// of the enclosing class. The resolver's facade gate leaves this site
+// as a stub on purpose — so the engine must be able to claim it when
+// its field-type evidence names the calling method itself. Only
+// claiming: a fresh self-edge is still never minted (that stays the
+// self-guard's job).
+func TestCSharp_SelfTypedFieldRecursionClaimsStub(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"A/Node.cs": `namespace App {
+    public class Node {
+        private Node next;
+
+        public void Print() {
+            if (next != null) {
+                next.Print();
+            }
+        }
+    }
+}
+`,
+	})
+
+	callerID := "A/Node.cs::Node.Print"
+	edges := callEdgesNamed(g, callerID, "Print")
+	if len(edges) != 1 {
+		t.Fatalf("expected the one extracted member-call stub, got %v", edges)
+	}
+	if !isStubTarget(edges[0].To) {
+		t.Fatalf("precondition: the call must be an unresolved stub, got %q", edges[0].To)
+	}
+
+	p := NewProvider(CSharpSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	e := callEdgeTo(g, callerID, callerID)
+	if e == nil {
+		t.Fatalf("typed-field recursion must claim the stub back to the caller; edges: %v", g.GetOutEdges(callerID))
+	}
+	assertASTProvenance(t, e, "csharp-types")
+	if got := len(callEdgesNamed(g, callerID, "Print")); got != 1 {
+		t.Errorf("the stub must be claimed in place, not duplicated: %d edges", got)
+	}
+}

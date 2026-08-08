@@ -4104,12 +4104,13 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	//
 	// C# member calls are exempt: a member_call edge still untyped here has
 	// an explicit receiver that is NOT this/base (those carry receiver_type
-	// from extraction) — a field, parameter, or untyped local. Whether the
-	// CALLER's class declares a same-named method says nothing about such a
-	// receiver, and on facade classes that wrap a same-named repository
-	// method this fallback bound the call to the calling method ITSELF (the
-	// PHP shield above exists for the identical failure). Leave the site for
-	// the extension/locality tiers and semantic enrichment.
+	// from extraction) — a field, parameter, or an expression the tenv
+	// couldn't type. Whether the CALLER's class declares a same-named method
+	// says nothing about such a receiver, and on facade classes that wrap a
+	// same-named repository method this fallback bound the call to the
+	// calling method ITSELF (the PHP shield above exists for the identical
+	// failure). Leave the site for the extension/locality tiers and
+	// semantic enrichment.
 	memberCall, _ := e.Meta["member_call"].(bool)
 	callerNode := r.cachedGetNode(e.From)
 	if callerNode != nil && callerNode.Kind == graph.KindMethod && !memberCall {
@@ -4174,7 +4175,8 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		}
 		// A member call never locality-binds to the calling method itself:
 		// `x.Foo()` inside Foo is the facade shape wrapping a same-named
-		// member on x, not recursion — recursion is an unqualified call.
+		// member on x, not recursion — self-recursion through `this`
+		// carries receiver_type and resolves in the typed passes above.
 		if memberCall && c.ID == e.From {
 			continue
 		}
