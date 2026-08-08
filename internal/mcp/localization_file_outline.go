@@ -378,9 +378,14 @@ func (o *localizationFileOutline) elide(rowCap int) {
 		o.Elided = 0
 		return
 	}
+	// The task's own matches lead, but never take the whole index: a task whose
+	// words happen to name half a file would otherwise turn that file's index
+	// into a list of the query, and the declaration a caller cannot name is
+	// exactly the one it came here to find.
+	reserve := max(rowCap/2, 1)
 	kept := make(map[int]struct{}, rowCap)
 	for _, index := range o.priority {
-		if len(kept) >= rowCap {
+		if len(kept) >= reserve {
 			break
 		}
 		kept[index] = struct{}{}

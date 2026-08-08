@@ -906,6 +906,39 @@ func TestLeadingFileOutlineProviderCarriesTheTaskTerms(t *testing.T) {
 	}
 }
 
+func TestOutlineElisionLeavesHalfTheIndexToTheFileItself(t *testing.T) {
+	// A task whose words happen to name half a file must not turn that file's
+	// index into a list of its own query. The declaration a caller is looking
+	// for is often the one the task could not name.
+	declared := outlineDeclaredFile(25)
+	for _, index := range []int{2, 3, 4, 5, 10, 11, 17, 18} {
+		declared[index] = outlineDeclaration(fmt.Sprintf("retryBackoff%02d", index), index+1)
+	}
+	const named = "send"
+	declared[22] = outlineDeclaration(named, 23)
+	terms := exploreTerminalTerms("the retry backoff never fires")
+	outline := newLocalizationFileOutlineForTerms(outlineLeadingFile, declared, terms, 12)
+	if outline == nil || len(outline.Rows) != 12 {
+		t.Fatalf("outline = %#v, want 12 rows", outline)
+	}
+	matched := 0
+	for _, row := range outline.Rows {
+		if strings.HasPrefix(row.Name, "retryBackoff") {
+			matched++
+		}
+	}
+	if matched > 6 {
+		t.Fatalf("task-term matches took %d of 12 rows, want at most half", matched)
+	}
+	if outline.Rows[0].Line != 1 || outline.Rows[len(outline.Rows)-1].Line != len(declared) {
+		t.Fatalf("outline spans lines %d..%d, want the file's own ends",
+			outline.Rows[0].Line, outline.Rows[len(outline.Rows)-1].Line)
+	}
+	if !outlineRowNamed(outline, named) {
+		t.Fatalf("the file's own tail lost a declaration the task could not name: %#v", outline.Rows)
+	}
+}
+
 func TestOutlineElisionRanksStrongerTaskTermMatchesFirst(t *testing.T) {
 	declared := outlineDeclaredFile(120)
 	// More task-term matches than the cap can hold: the strongest match must
