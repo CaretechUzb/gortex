@@ -1,6 +1,8 @@
 package indexer
 
 import (
+	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -71,4 +73,105 @@ func searchAll(t *testing.T, store graph.SymbolSearcher, query string) []graph.S
 	hits, err := store.SearchSymbols(query, 50)
 	require.NoError(t, err)
 	return hits
+}
+
+// errInjectedFTSWrite stands in for whatever ends a rebuild half-way.
+var errInjectedFTSWrite = errors.New("injected symbol FTS write failure")
+
+// ftsFailingStore fails the second symbol-FTS write of a rebuild, through
+// whichever door the indexer uses to perform it.
+type ftsFailingStore struct {
+	*store_sqlite.Store
+	writes int
+}
+
+func (f *ftsFailingStore) failed() bool {
+	f.writes++
+	return f.writes >= 2
+}
+
+func (f *ftsFailingStore) BatchUpsertSymbolFTS(items []graph.SymbolFTSItem) error {
+	if f.failed() {
+		return errInjectedFTSWrite
+	}
+	return f.Store.BatchUpsertSymbolFTS(items)
+}
+
+func (f *ftsFailingStore) ReplaceSymbolFTS(repoPrefix string, produce func(emit func([]graph.SymbolFTSItem) error) error) error {
+	return f.Store.ReplaceSymbolFTS(repoPrefix, func(emit func([]graph.SymbolFTSItem) error) error {
+		return produce(func(items []graph.SymbolFTSItem) error {
+			if f.failed() {
+				return errInjectedFTSWrite
+			}
+			return emit(items)
+		})
+	})
+}
+
+// TestPopulateSymbolFTSKeepsPriorCorpusWhenRebuildFails is the production
+// composition of the all-or-nothing rebuild. A rebuild that wipes the corpus
+// and then appends chunk by chunk commits the wipe first, so a chunk that
+// fails after it leaves the repository holding only what happened to land —
+// documents that were searchable a moment ago now miss, and nothing repairs
+// them short of another full index. The previous corpus must survive a
+// rebuild that does not finish.
+func TestPopulateSymbolFTSKeepsPriorCorpusWhenRebuildFails(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "fts-rebuild.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	// The corpus the repository already has, indexed and being served.
+	prior := make([]graph.SymbolFTSItem, 0, 8)
+	for i := range 8 {
+		prior = append(prior, graph.SymbolFTSItem{
+			NodeID: fmt.Sprintf("prior_%02d.go::Prior%02d", i, i),
+			Tokens: rebuildProbeToken("pri", i),
+		})
+	}
+	require.NoError(t, store.BulkUpsertSymbolFTS("", prior))
+
+	// Enough nodes that the rebuild streams more than one bounded chunk, so
+	// the injected failure lands after a chunk has already been written.
+	nodes := make([]*graph.Node, 0, symbolFTSDirectChunkRows+64)
+	for i := range symbolFTSDirectChunkRows + 64 {
+		nodes = append(nodes, &graph.Node{
+			ID:       fmt.Sprintf("rebuilt_%04d.go::Rebuilt%04d", i, i),
+			Kind:     graph.KindFunction,
+			Name:     fmt.Sprintf("Rebuilt%04d", i),
+			Language: "go",
+			FilePath: fmt.Sprintf("rebuilt_%04d.go", i),
+		})
+	}
+	store.AddBatch(nodes, nil)
+
+	failing := &ftsFailingStore{Store: store}
+	idx := newTestIndexer(failing)
+	err = idx.populateSymbolFTS(nil)
+	require.ErrorIs(t, err, errInjectedFTSWrite, "a failed FTS write must fail the rebuild")
+	require.GreaterOrEqual(t, failing.writes, 2, "the failure must land after a chunk was already written")
+
+	count, err := store.SymbolFTSCount()
+	require.NoError(t, err)
+	require.Equal(t, len(prior), count, "a failed rebuild must leave the prior corpus size untouched")
+	for i, item := range prior {
+		hits, err := store.SearchSymbols(rebuildProbeToken("pri", i), 20)
+		require.NoError(t, err)
+		ids := make([]string, 0, len(hits))
+		for _, hit := range hits {
+			ids = append(ids, hit.NodeID)
+		}
+		require.Contains(t, ids, item.NodeID, "a failed rebuild destroyed a previously searchable document")
+	}
+}
+
+// rebuildProbeToken builds a fixed-width nonsense word unique to (family, n).
+// The FTS query path ORs prefix terms together, so a per-document probe needs
+// a token nothing else in the corpus carries.
+func rebuildProbeToken(family string, n int) string {
+	letters := [3]byte{}
+	for i := 2; i >= 0; i-- {
+		letters[i] = byte('a' + n%26)
+		n /= 26
+	}
+	return family + string(letters[:])
 }

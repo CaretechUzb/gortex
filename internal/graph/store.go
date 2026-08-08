@@ -589,6 +589,33 @@ type SymbolFTSBatchDeleter interface {
 	BatchDeleteSymbolFTS(nodeIDs []string) error
 }
 
+// SymbolFTSRepoReplacer replaces one repository's whole symbol corpus as a
+// single all-or-nothing unit. It is what a rebuild against an already-indexed
+// repository must use: composing SymbolFTSRepoResetter with a series of
+// SymbolFTSBatchUpserter appends commits the wipe first, so a failure part-way
+// through leaves the repository with a truncated corpus and durable false
+// negatives that only a later full re-index repairs.
+//
+// Contract:
+//
+//   - The implementation removes repoPrefix's documents and applies everything
+//     produce emits inside one backend transaction. If produce returns an
+//     error, or any emit fails, or the commit fails, the corpus that existed
+//     before the call is left exactly as it was.
+//
+//   - produce is called once and streams the replacement corpus through emit
+//     in bounded chunks, so neither side retains a whole-repository slice.
+//     Each emit either applies the chunk or returns the error that ends the
+//     replacement.
+//
+//   - produce runs while the backend holds its writer for the transaction, so
+//     it MUST NOT issue writes against the same store. Reads are fine on a
+//     backend whose readers do not contend with its writer; an implementation
+//     that cannot offer that MUST refuse the call rather than deadlock.
+type SymbolFTSRepoReplacer interface {
+	ReplaceSymbolFTS(repoPrefix string, produce func(emit func([]SymbolFTSItem) error) error) error
+}
+
 // FileBatchEvicter is the set-oriented sibling of Store.EvictFile. The
 // partial/warm reconcile path parses a bounded file chunk first, then asks the
 // backend to remove every successfully parsed replacement in one atomic

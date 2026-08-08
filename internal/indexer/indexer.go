@@ -783,18 +783,22 @@ const (
 //
 // Nodes stream through the store's bounded scoped projection instead of a
 // whole-repository read: the caller reached this path precisely because the
-// repository does not fit in memory. Backends without the reset/upsert
-// capabilities (the in-memory store, test fixtures) are a no-op — their search
-// index is populated by buildSearchIndex instead.
+// repository does not fit in memory. Backends without the replace/projection
+// capabilities (test fixtures) are a no-op — their search index is populated
+// by buildSearchIndex instead.
+//
+// The replacement is one atomic unit: a rebuild that fails part-way leaves the
+// corpus the repository already had. Wiping first and appending chunk by chunk
+// would commit the wipe, so any later failure would strand the repository with
+// a truncated index whose misses are indistinguishable from real ones.
 //
 // Admission and token derivation are shared with every other FTS writer
 // (shouldIndexForSearch, ftsTokensFor) so the corpus is identical whichever
 // path produced it.
 func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
-	batcher, hasBatcher := idx.graph.(graph.SymbolFTSBatchUpserter)
-	resetter, hasResetter := idx.graph.(graph.SymbolFTSRepoResetter)
+	replacer, hasReplacer := idx.graph.(graph.SymbolFTSRepoReplacer)
 	stream, hasStream := idx.graph.(graph.ScopedProjectionSequencer)
-	if !hasBatcher || !hasResetter || !hasStream {
+	if !hasReplacer || !hasStream {
 		return nil
 	}
 
@@ -803,46 +807,44 @@ func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
 	if reporter != nil {
 		reporter.Report("building symbol fts", 0, 0)
 	}
-	if err := resetter.ResetSymbolFTS(repoPrefix); err != nil {
-		return fmt.Errorf("indexer: reset symbol FTS: %w", err)
-	}
 
-	items := make([]graph.SymbolFTSItem, 0, symbolFTSDirectChunkRows)
-	var pending uint64
 	written := 0
-	var flushErr error
-	flush := func() bool {
-		if len(items) == 0 {
-			return true
+	err := replacer.ReplaceSymbolFTS(repoPrefix, func(emit func([]graph.SymbolFTSItem) error) error {
+		items := make([]graph.SymbolFTSItem, 0, symbolFTSDirectChunkRows)
+		var pending uint64
+		flush := func() error {
+			if len(items) == 0 {
+				return nil
+			}
+			if err := emit(items); err != nil {
+				return err
+			}
+			written += len(items)
+			items = make([]graph.SymbolFTSItem, 0, symbolFTSDirectChunkRows)
+			pending = 0
+			return nil
 		}
-		if err := batcher.BatchUpsertSymbolFTS(items); err != nil {
-			flushErr = fmt.Errorf("indexer: append symbol FTS batch: %w", err)
-			return false
-		}
-		written += len(items)
-		items = make([]graph.SymbolFTSItem, 0, symbolFTSDirectChunkRows)
-		pending = 0
-		return true
-	}
-
-	for node := range stream.NodesInScopeSeq([]string{repoPrefix}, nil) {
-		if node == nil || !idx.shouldIndexForSearch(node) {
-			continue
-		}
-		tokens := ftsTokensFor(node, idx.projectName)
-		items = append(items, graph.SymbolFTSItem{NodeID: node.ID, Tokens: tokens})
-		pending += uint64(len(node.ID) + len(tokens) + 32)
-		if len(items) >= symbolFTSDirectChunkRows || pending >= symbolFTSDirectChunkBytes {
-			if !flush() {
-				break
+		var produceErr error
+		for node := range stream.NodesInScopeSeq([]string{repoPrefix}, nil) {
+			if node == nil || !idx.shouldIndexForSearch(node) {
+				continue
+			}
+			tokens := ftsTokensFor(node, idx.projectName)
+			items = append(items, graph.SymbolFTSItem{NodeID: node.ID, Tokens: tokens})
+			pending += uint64(len(node.ID) + len(tokens) + 32)
+			if len(items) >= symbolFTSDirectChunkRows || pending >= symbolFTSDirectChunkBytes {
+				if produceErr = flush(); produceErr != nil {
+					break
+				}
 			}
 		}
-	}
-	if flushErr == nil {
-		flush()
-	}
-	if flushErr != nil {
-		return flushErr
+		if produceErr != nil {
+			return produceErr
+		}
+		return flush()
+	})
+	if err != nil {
+		return fmt.Errorf("indexer: rebuild symbol FTS: %w", err)
 	}
 
 	if searcher, ok := idx.graph.(graph.SymbolSearcher); ok {
