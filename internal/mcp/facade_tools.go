@@ -1197,12 +1197,28 @@ var facadeToSelectorOperations = map[string]bool{
 // analyzeAliasedSymbolKinds are the analyze kinds that dispatch to a tool other
 // than the analyze dispatcher AND whose id-shaped field really holds a symbol.
 // Declaring the field is not evidence enough for these: get_communities and
-// get_processes both take an `id`, but it names a community or a process, so a
-// symbol lowered into it matches nothing and reads as an empty answer — the
-// same silence this whole path exists to remove.
+// get_processes both take an `id`, but it names a community or a process. A
+// symbol lowered into one resolves against the wrong entity and comes back as
+// "community not found: pkg/foo.go::Bar" — a loud failure, but one that blames
+// the id channel for what is really a selector-semantics mistake, and one
+// capabilities never advertised as available in the first place. Refusing it
+// keeps the published shape and the accepted shape the same set.
 var analyzeAliasedSymbolKinds = map[string]bool{
 	"co_change": true,
 	"why":       true,
+}
+
+// legacyDeclaresField reports whether the named legacy tool advertises a field.
+func (s *Server) legacyDeclaresField(legacy, field string) bool {
+	if field == "" {
+		return false
+	}
+	captured, available := s.facades.legacy(legacy)
+	if !available {
+		return false
+	}
+	_, declared := captured.tool.InputSchema.Properties[field]
+	return declared
 }
 
 // facadeSelectorReaches reports whether a public selector actually arrives at
@@ -1279,11 +1295,26 @@ func (s *Server) rejectInertFacadeSelector(spec facadeOperationSpec, input map[s
 		if len(accepted) > 0 {
 			data["accepted_by"] = accepted
 		}
+		// Two different mistakes reach here and they deserve different words.
+		// Usually the handler has no field for the selector, so it would be
+		// dropped. Sometimes the field exists but names another kind of
+		// entity, and lowering into it would resolve the caller's symbol
+		// against a community or a process instead. Only a kind dispatching
+		// to its own legacy tool can be in the second case: the analyze
+		// dispatcher declares id once for every kind behind it, so a field it
+		// declares says nothing about whether this kind reads it.
+		field := facadeTargetField(spec.Legacy, selector)
+		message := fmt.Sprintf("%s has no %s.%s to act on — it would be ignored, so the call is refused rather than answered as if it had not been sent",
+			subject, container, selector)
+		if spec.Legacy != "analyze" && s.legacyDeclaresField(spec.Legacy, field) {
+			data["entity_mismatch"] = field
+			message = fmt.Sprintf("%s selects by %s, which does not name a symbol — %s.%s would be resolved against the wrong entity, so the call is refused",
+				subject, field, container, selector)
+		}
 		return NewStructuredErrorResult(StructuredError{
 			ErrorCode: ErrCodeInvalidArgument,
-			Message: fmt.Sprintf("%s has no %s.%s to act on — it would be ignored, so the call is refused rather than answered as if it had not been sent",
-				subject, container, selector),
-			Data: data,
+			Message:   message,
+			Data:      data,
 		})
 	}
 	if to, ok := input["to"].(map[string]any); ok && len(to) > 0 {

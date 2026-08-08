@@ -332,3 +332,48 @@ func TestSplitSymbolIDFieldAcceptsEveryEncoding(t *testing.T) {
 	require.Empty(t, splitSymbolIDField(""))
 	require.Empty(t, splitSymbolIDField(nil))
 }
+
+// TestRefusedSelectorNamesTheActualMistake keeps the refusal honest about why
+// it fired. Most kinds have no field for the selector, so it would be dropped.
+// communities and processes do have an `id` — it just names a community or a
+// process, so lowering a symbol into it resolves against the wrong entity and
+// returns "community not found: <symbol>", a loud failure that blames the id
+// channel for a selector-semantics mistake. The two cases must not share one
+// wording.
+func TestRefusedSelectorNamesTheActualMistake(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	ctx := WithSessionID(context.Background(), "refusal_wording")
+	call := facadeFrameCaller(t, srv, ctx)
+	helperID := fixtureSymbolID(t, srv, ctx, "helper")
+
+	dropped := call(400, "analyze", map[string]any{
+		"kind": "routes", "target": map[string]any{"symbol": helperID},
+		"output": map[string]any{"format": "json"},
+	})
+	require.True(t, dropped.IsError)
+	require.Contains(t, toolResultText(dropped), "would be ignored",
+		"a kind with no field for the selector drops it")
+	require.NotContains(t, toolResultText(dropped), "entity_mismatch")
+
+	for i, kind := range []string{"communities", "processes"} {
+		mismatched := call(401+i, "analyze", map[string]any{
+			"kind": kind, "target": map[string]any{"symbol": helperID},
+			"output": map[string]any{"format": "json"},
+		})
+		require.True(t, mismatched.IsError)
+		text := toolResultText(mismatched)
+		require.Contains(t, text, "entity_mismatch",
+			"analyze(kind=%s) does have an id field — it just is not a symbol", kind)
+		require.Contains(t, text, "does not name a symbol")
+		require.NotContains(t, text, "would be ignored")
+
+		// The id channel itself still works when given the right entity, and
+		// still fails loudly when given the wrong one.
+		wrongEntity := call(410+i, "analyze", map[string]any{
+			"kind": kind, "options": map[string]any{"id": helperID},
+			"output": map[string]any{"format": "json"},
+		})
+		require.True(t, wrongEntity.IsError)
+		require.Contains(t, toolResultText(wrongEntity), "not found")
+	}
+}
