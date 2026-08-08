@@ -3060,9 +3060,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	targets = append(targets[:len(artifactTargets):len(artifactTargets)], pageTargets...)
 	// The same leading file, indexed rather than ranked. The enumeration is
 	// deferred: only a page that stays non-terminal pays for it, and it pays
-	// once however many envelopes this request packs.
-	pageOutline := localizationLeadingFileOutlineProvider(
-		localizationRankedPool, pageTargets,
+	// once however many envelopes this request packs. The task's own terms ride
+	// along so a bounded index keeps the declarations the task named.
+	pageOutline := localizationPageOutlineProvider(
+		localizationRankedPool, pageTargets, exploreTerminalTerms(task),
 		func(file string) []*graph.Node { return fileDefinitionNodes(eng, file) },
 	)
 	// File evidence can make localization answer-ready, but it never becomes a
@@ -3163,12 +3164,16 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 // explicit localization-only request. Ordinary explore(task) retains the
 // human-oriented legacy rendering; localize does not duplicate it.
 type localizationExploreEnvelope struct {
-	Completion localizationCompletion   `json:"completion"`
-	Terminal   bool                     `json:"terminal"`
-	Files      []string                 `json:"files"`
-	Symbols    []string                 `json:"symbols"`
-	Evidence   []localizationEvidence   `json:"evidence"`
-	Outline    *localizationFileOutline `json:"outline,omitempty"`
+	Completion localizationCompletion `json:"completion"`
+	Terminal   bool                   `json:"terminal"`
+	Files      []string               `json:"files"`
+	Symbols    []string               `json:"symbols"`
+	Evidence   []localizationEvidence `json:"evidence"`
+	// Outline indexes the page's leading file; Outlines indexes the page's
+	// further files, deepest first. The split keeps the leading file where
+	// consumers already read it.
+	Outline  *localizationFileOutline   `json:"outline,omitempty"`
+	Outlines []*localizationFileOutline `json:"outlines,omitempty"`
 }
 
 type localizationEvidence struct {
@@ -4036,7 +4041,7 @@ func buildLocalizationRefinementResultForTaskWithOutline(
 	targets []exploreTarget,
 	budget int,
 	routes map[string]localizationRefinementRoute,
-	outline func() *localizationFileOutline,
+	outline func() *localizationPageOutline,
 ) (*mcp.CallToolResult, localizationCompletion, map[string]localizationRefinementRoute, *localizationEvidenceDigest) {
 	choosePreferred := func(symbols []string, requested string) (string, []string, map[string]localizationRefinementRoute) {
 		authorized, bounded := boundedLocalizationRefinementRoutes(symbols, routes, requested)
@@ -4108,7 +4113,7 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 	task string,
 	targets []exploreTarget,
 	budget int,
-	outline func() *localizationFileOutline,
+	outline func() *localizationPageOutline,
 	finalize ...localizationCompletionFinalizer,
 ) (*mcp.CallToolResult, []string, *localizationEvidenceDigest, localizationCompletion) {
 	var draft []exploreDraftEntry
@@ -4370,13 +4375,15 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 	contract = localizationContractReconciledWithDigest(envelope.Completion, digest)
 	envelope.Completion = contract.Completion
 	envelope.Terminal = contract.Terminal
-	// A page that still asks the caller to choose gets the leading file's
-	// declaration index. The rows above name at most one symbol per file, so a
-	// caller looking at the right file and the wrong row has nothing to correct
-	// with; the outline is that file's remaining declarations, and it is the
-	// first thing given back when the budget cannot hold everything.
+	// A page that still asks the caller to choose gets its files' declaration
+	// indexes. The rows above name at most one symbol per file, so a caller
+	// looking at the right file and the wrong row has nothing to correct with;
+	// the outlines are those files' remaining declarations, and they are the
+	// first payload given back when the budget cannot hold everything.
 	if outline != nil && localizationPageAcceptsOutline(envelope.Completion.State) {
-		envelope.Outline = outline()
+		if page := outline().clone(); page != nil {
+			envelope.Outline, envelope.Outlines = page.Leading, page.Others
+		}
 	}
 	// The ready-to-emit answer is derived from the retained rows, so it lands
 	// after the fit checks above and can push the envelope past its budget.
@@ -4389,12 +4396,39 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 	if satisfiedSymbol != "" {
 		shedBudget = maxBytes + localizationRetiredReadAllowance(maxBytes)
 	}
+	// The rows as they stood before the breadth tail was asked to pay for an
+	// index. A trade that ends with no index bought nothing, so it is undone.
+	var untraded []localizationEvidence
 	for !localizationEnvelopeFits(envelope, shedBudget) {
-		if envelope.Outline != nil {
-			// The outline is a convenience over rows the caller can still reach
-			// by other means; every other payload here is evidence this
-			// response is answering with.
-			envelope.Outline = nil
+		block := &localizationPageOutline{Leading: envelope.Outline, Others: envelope.Outlines}
+		if !block.empty() {
+			// The outlines are a convenience over rows the caller can still
+			// reach by other means, so they give way before every other payload
+			// here — but they give way by degrees. A shorter index is worth far
+			// more than none, and only pressure past the floor drops one.
+			if block.atFloor() {
+				// The index has given back everything it can and the page still
+				// does not fit. A ranked page fills its budget with rows, so
+				// without this the floor is unreachable exactly on the pages
+				// that need an index most. The expendable breadth tail pays,
+				// in the detail a caller can re-derive from the identity that
+				// stays — never in a row, and never inside the reserve the
+				// refinement contract may name.
+				if untraded == nil {
+					untraded = append([]localizationEvidence(nil), envelope.Evidence...)
+				}
+				if localizationShedTrailingEvidenceDetail(&envelope, mandatoryCount) {
+					continue
+				}
+			}
+			block.relieve()
+			envelope.Outline, envelope.Outlines = block.Leading, block.Others
+			if block.empty() && untraded != nil {
+				// Nothing was bought. Give the tail its detail back rather than
+				// return a page that is both shorter and unindexed.
+				envelope.Evidence = untraded
+				untraded = nil
+			}
 			continue
 		}
 		if digest != nil && len(digest.Evidence) > localizationFinalResponsePrimaryLimit {
@@ -4439,6 +4473,27 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 	}
 	result := attachLocalizationHostEnvelope(mcp.NewToolResultText(string(body)), envelope.Completion, digest)
 	return result, append([]string(nil), envelope.Symbols...), digest, envelope.Completion
+}
+
+// localizationShedTrailingEvidenceDetail gives back one trailing row's
+// expansion detail — the qualified name, signature, and neighbour identifiers a
+// caller can re-derive from the identity that stays. Only the breadth tail past
+// the direct-evidence reserve is eligible, and the row's ID, kind, file, line,
+// and provenance are untouched, so nothing the completion contract or the
+// evidence policy reads can move. This is the same trade the packing loop
+// already makes for a mandatory row that will not fit whole.
+func localizationShedTrailingEvidenceDetail(envelope *localizationExploreEnvelope, mandatory int) bool {
+	protected := max(mandatory, localizationDirectEvidenceReserve)
+	for index := len(envelope.Evidence) - 1; index >= protected; index-- {
+		row := &envelope.Evidence[index]
+		if row.QualName == "" && row.Signature == "" && len(row.Callers) == 0 && len(row.Callees) == 0 {
+			continue
+		}
+		row.QualName, row.Signature = "", ""
+		row.Callers, row.Callees = nil, nil
+		return true
+	}
+	return false
 }
 
 func boundedLocalizationNeighborIDs(nodes []*graph.Node, limit int) []string {
