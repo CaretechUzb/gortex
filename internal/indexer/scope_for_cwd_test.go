@@ -12,6 +12,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // TestScopeForCWD_And_ReposInWorkspace exercises the per-session
@@ -270,4 +271,60 @@ func TestContainedReposScope(t *testing.T) {
 	// Empty cwd is never a boundary.
 	_, _, ok = mi.ContainedReposScope("")
 	assert.False(t, ok)
+}
+
+// TestContainedReposScope_RefusesOverbroadRoots is the containment rule's
+// safety limit. `/` lexically contains every absolute path, so without an
+// explicit refusal a session launched at the filesystem root — or at the
+// home directory — would bind to the WHOLE graph rather than fail closed.
+//
+// That is not hypothetical: resolveLaunchCWD (cmd/gortex/proxy.go) falls
+// back to exactly these paths when an editor spawns the MCP server with no
+// usable working directory, which is the case its own doc comment cites.
+// Binding them would convert a missing cwd into maximum scope.
+func TestContainedReposScope_RefusesOverbroadRoots(t *testing.T) {
+	// Relocate the home directory so the ~/code layout below is built in
+	// a sandbox rather than in the developer's real home.
+	home := testenv.Sandbox(t).Home
+	require.NotEmpty(t, home)
+
+	// Repos under a real parent inside the home directory — the ~/code
+	// layout — so home and `/` both lexically contain them.
+	parent := filepath.Join(home, "code")
+	repoA := filepath.Join(parent, "contained-a")
+	repoB := filepath.Join(parent, "contained-b")
+	for _, dir := range []string{repoA, repoB} {
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"),
+			[]byte("package main\n\nfunc Hello() {}\n"), 0o644))
+	}
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{
+		Repos: []config.RepoEntry{
+			{Path: repoA, Name: "contained-a"},
+			{Path: repoB, Name: "contained-b"},
+		},
+	}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	g := graph.New()
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	_, err = mi.IndexScoped("", "")
+	require.NoError(t, err)
+
+	// Precondition: a genuine parent inside home still binds, so the
+	// refusals below are testing the guard and not an empty repo set.
+	repos, _, ok := mi.ContainedReposScope(parent)
+	require.True(t, ok, "a real parent-of-repos under home must still bind")
+	require.ElementsMatch(t, []string{"contained-a", "contained-b"}, repos)
+
+	for _, cwd := range []string{string(filepath.Separator), home} {
+		_, _, ok := mi.ContainedReposScope(cwd)
+		assert.False(t, ok, "%q lexically contains every repo and must not bind a session", cwd)
+	}
 }

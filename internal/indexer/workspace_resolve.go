@@ -154,11 +154,22 @@ func (mi *MultiIndexer) ScopeForCWD(cwd string) (workspaceID, projectID, repoPre
 //
 // ok is false when cwd contains no tracked repo; the caller then fails
 // closed exactly as before.
+//
+// A root too broad to be anyone's project — `/`, a Windows drive root,
+// the home directory — is refused outright even though it lexically
+// contains every tracked repo. Containment is only a meaningful boundary
+// when the directory was a deliberate choice, and those three are what an
+// editor hands us when it has NOT made one: resolveLaunchCWD falls back to
+// them when no workspace hint is available. Binding them would turn "the
+// client forgot to set a cwd" into a session scoped to the entire graph.
 func (mi *MultiIndexer) ContainedReposScope(cwd string) (repos []string, workspaces []string, ok bool) {
 	if mi == nil || cwd == "" {
 		return nil, nil, false
 	}
 	cwd = filepath.Clean(cwd)
+	if UnsafeIndexRootReason(cwd) != "" {
+		return nil, nil, false
+	}
 
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
