@@ -113,8 +113,9 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		// be able to do that to itself; the operator CLI still can.
 		if s.confineCallerPaths(ctx) {
 			return mcp.NewToolResultError(
-				"force is not available to an agent session: it would track a root that " +
-					"widens file access for every tool. Run `gortex track` yourself if that is intended."), nil
+				"force is not available to an agent session: it would track a root such as / or " +
+					"your home directory, widening file access for every tool and persisting that to " +
+					"your global config. Track the specific repository you need instead."), nil
 		}
 		entry.Force = true
 	}
