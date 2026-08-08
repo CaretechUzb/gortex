@@ -240,31 +240,32 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			return preset, mode, srv.LearnedToolCount()
 		}
 	}
-	controller.setShutdownHook(func() error {
-		// Stop watchers first so no late events race the teardown of the
-		// store — the backend should be quiescent when it closes, not
-		// being mutated by an in-flight re-index.
-		//
-		// StopWatcher is lock-free by design. This is the first thing a
-		// stop request does, and reading the watcher under the coarse
-		// controller mutex put it straight back behind the long-running
-		// track / reload / enrichment the user is trying to end.
-		controller.StopWatcher()
-		// Nothing else has to be serialized here: per-file mtimes live in
-		// the FileMtime sidecar table, contract records ride on
+	// Teardown is wired into every exit path, not just the control-socket
+	// one. A SIGINT/SIGTERM is handled inside the daemon server: it calls
+	// Server.Shutdown directly, Serve returns, and the controller's hook is
+	// never reached — so installing the chain only on the hook meant a
+	// signalled daemon skipped watcher shutdown, the savings flush, and the
+	// final WAL checkpoint entirely. Both paths now run the same
+	// once-guarded func, and the deferred call covers whichever exit
+	// actually happens.
+	runTeardown := installDaemonTeardown(controller, controller.StopWatcher, func() error {
+		// Nothing has to be serialized here: per-file mtimes live in the
+		// FileMtime sidecar table, contract records ride on
 		// KindContract.Meta, and the vector index is persisted by the
 		// backend itself. Warm restart reads everything it needs straight
 		// from the on-disk store.
-		// Run the shared stack's teardown chain — flushes the savings
-		// store and closes the backend handle (checkpointing the sqlite
-		// WAL) so the daemon shuts down cleanly.
+		//
+		// The shared stack's teardown chain flushes the savings store and
+		// closes the backend handle, checkpointing the sqlite WAL.
 		if state.shared != nil {
-			_ = state.shared.Close()
-		} else if state.mcpServer != nil {
-			_ = state.mcpServer.FlushSavings()
+			return state.shared.Close()
+		}
+		if state.mcpServer != nil {
+			return state.mcpServer.FlushSavings()
 		}
 		return nil
 	})
+	defer runTeardown()
 	srv.Controller = controller
 	// Surface warmup state on the handshake ack: a proxy / CLI that connects
 	// during the (minutes-long) warmup should know the graph is still filling
@@ -568,6 +569,56 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	}()
 
 	return srv.Serve()
+}
+
+// installDaemonTeardown wires one once-guarded teardown into both of the
+// daemon's exit paths and returns the func the caller must defer.
+//
+// The two paths never meet on their own. A `gortex daemon stop` arrives over
+// the control socket and reaches the controller's shutdown hook; a
+// SIGINT/SIGTERM is handled inside the daemon server, which shuts the listener
+// down directly and lets Serve return without the controller hearing about it.
+// Whichever fires, the same func runs — and sync.Once makes the second call a
+// no-op, so a signalled daemon whose controller shutdown also lands does not
+// close the store twice.
+//
+// stopWatcher runs first so no late event races the close — the backend should
+// be quiescent when it closes, not being mutated by an in-flight re-index. It
+// is passed explicitly rather than reached through the controller so the
+// ordering contract is visible at the call site. The controller's StopWatcher
+// is lock-free by design: this is the first thing a stop does, and reading the
+// watcher under the coarse controller mutex would queue it behind the
+// long-running track / reload / enrichment the user is trying to end.
+//
+// closeShared is the stack teardown: the savings flush and the backend close
+// that checkpoints the sqlite WAL.
+func installDaemonTeardown(controller *realController, stopWatcher func(), closeShared func() error) func() {
+	teardown := newDaemonTeardown(stopWatcher, closeShared)
+	controller.setShutdownHook(teardown)
+	return func() { _ = teardown() }
+}
+
+// newDaemonTeardown returns the once-guarded teardown itself. Split from the
+// wiring so the exactly-once contract can be exercised on both call paths
+// without standing up a daemon.
+func newDaemonTeardown(stopWatcher func(), closeShared func() error) func() error {
+	var (
+		once sync.Once
+		err  error
+	)
+	return func() error {
+		once.Do(func() {
+			if stopWatcher != nil {
+				stopWatcher()
+			}
+			if closeShared != nil {
+				err = closeShared()
+			}
+		})
+		// Later callers see the same outcome the run produced rather than a
+		// misleading nil: whoever exits second is often the one reporting.
+		return err
+	}
 }
 
 // reconcileInterval returns the janitor tick interval, defaulting to 1
