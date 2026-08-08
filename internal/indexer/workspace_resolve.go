@@ -119,6 +119,15 @@ func (mi *MultiIndexer) ScopeForCWD(cwd string) (workspaceID, projectID, repoPre
 		}
 	}
 	if bestPrefix == "" {
+		// Reverse containment only. A root too broad to be anyone's
+		// project lexically contains every tracked repo, so it must not
+		// bind here either — `/` over a set of repos that happen to share
+		// one declared slug would otherwise resolve to that whole
+		// workspace, walking straight past the same guard in
+		// ContainedReposScope.
+		if UnsafeIndexRootReason(cwd) != "" {
+			return "", "", "", false
+		}
 		return mi.scopeForWorkspaceRootLocked(cwd)
 	}
 

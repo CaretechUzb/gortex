@@ -326,5 +326,58 @@ func TestContainedReposScope_RefusesOverbroadRoots(t *testing.T) {
 	for _, cwd := range []string{string(filepath.Separator), home} {
 		_, _, ok := mi.ContainedReposScope(cwd)
 		assert.False(t, ok, "%q lexically contains every repo and must not bind a session", cwd)
+
+		// ScopeForCWD reaches its own reverse-containment arm first, and
+		// sessionScope consults it before ContainedReposScope — so the
+		// guard has to hold on both routes or an overbroad root simply
+		// takes the other one.
+		_, _, _, ok = mi.ScopeForCWD(cwd)
+		assert.False(t, ok, "ScopeForCWD must refuse the overbroad root %q too", cwd)
+	}
+}
+
+// TestScopeForCWD_RefusesOverbroadRootSharedWorkspace is the same guard on
+// the route the previous test cannot reach: when every tracked repo shares
+// one declared workspace slug, ScopeForCWD's reverse-containment arm
+// resolves successfully and never consults ContainedReposScope. Without a
+// guard of its own, `/` binds a session to that entire workspace.
+func TestScopeForCWD_RefusesOverbroadRootSharedWorkspace(t *testing.T) {
+	home := testenv.Sandbox(t).Home
+	require.NotEmpty(t, home)
+
+	parent := filepath.Join(home, "code")
+	var repos []config.RepoEntry
+	for _, name := range []string{"shared-a", "shared-b"} {
+		dir := filepath.Join(parent, name)
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, ".gortex.yaml"),
+			[]byte("workspace: everything\n"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"),
+			[]byte("package main\n\nfunc Hello() {}\n"), 0o644))
+		repos = append(repos, config.RepoEntry{Path: dir, Name: name})
+	}
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: repos}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	_, err = mi.IndexScoped("", "")
+	require.NoError(t, err)
+
+	// Precondition: the shared slug makes the reverse-containment arm
+	// succeed for a genuine parent, so the refusals below exercise the
+	// guard rather than an unrelated failure.
+	ws, _, _, ok := mi.ScopeForCWD(parent)
+	require.True(t, ok, "a real parent over one shared workspace must still bind")
+	require.Equal(t, "everything", ws)
+
+	for _, cwd := range []string{string(filepath.Separator), home} {
+		_, _, _, ok := mi.ScopeForCWD(cwd)
+		assert.False(t, ok, "%q must not bind to the shared workspace", cwd)
 	}
 }
