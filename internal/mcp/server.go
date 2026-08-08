@@ -230,8 +230,18 @@ type Server struct {
 	analysisGeneration      graph.AnalysisGenerationHeader
 	analysisGenerationReady bool
 	analysisPruneScheduled  atomic.Bool
-	analysisMaterializeMu   sync.Mutex
-	analysisMu              sync.RWMutex
+	// backgroundMaintenance joins the detached analysis-generation prune
+	// goroutine. Anyone closing the backend store must DrainBackground
+	// first: an in-flight prune batch survives sql.DB.Close on its pinned
+	// connection and its next WAL commit recreates store files
+	// mid-teardown. Add is gated by the mutex + drained flag so it never
+	// races DrainBackground's Wait, and a prune requested after the drain
+	// is dropped rather than run against a closing store.
+	backgroundMaintenance        sync.WaitGroup
+	backgroundMaintenanceMu      sync.Mutex
+	backgroundMaintenanceDrained bool
+	analysisMaterializeMu        sync.Mutex
+	analysisMu                   sync.RWMutex
 
 	// cochange caches the git-history co-change graph. cochangeByFile
 	// maps a file path to its co-changing file paths and association
