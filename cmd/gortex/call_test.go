@@ -114,6 +114,46 @@ func TestCoerceArg(t *testing.T) {
 	})
 }
 
+// TestCoerceArg_SeparatorChosenByKeyPosition pins the rule that decides which
+// separator splits a token: the walrus applies only when ":=" opens the token's
+// key, so a VALUE that quotes ":=" (a pasted VB/Go snippet, a Pascal
+// assignment) is carried through verbatim instead of being split mid-value and
+// rejected as invalid JSON.
+func TestCoerceArg_SeparatorChosenByKeyPosition(t *testing.T) {
+	t.Run("value containing walrus stays a string", func(t *testing.T) {
+		k, v, err := coerceArg("key=a:=b")
+		require.NoError(t, err)
+		require.Equal(t, "key", k)
+		require.Equal(t, "a:=b", v)
+	})
+	t.Run("walrus in key position parses JSON", func(t *testing.T) {
+		k, v, err := coerceArg(`key:={"x":1}`)
+		require.NoError(t, err)
+		require.Equal(t, "key", k)
+		require.Equal(t, map[string]any{"x": float64(1)}, v)
+	})
+	t.Run("plain key=value is unchanged", func(t *testing.T) {
+		k, v, err := coerceArg("key=val")
+		require.NoError(t, err)
+		require.Equal(t, "key", k)
+		require.Equal(t, "val", v)
+	})
+	t.Run("value containing both separators is verbatim", func(t *testing.T) {
+		// A pasted issue body: the first "=" ends the key, everything after it
+		// — further "=" signs and the ":=" walrus alike — is the value.
+		k, v, err := coerceArg("task=Dim x := 5 : y = x + 1")
+		require.NoError(t, err)
+		require.Equal(t, "task", k)
+		require.Equal(t, "Dim x := 5 : y = x + 1", v)
+	})
+	t.Run("walrus still wins when it opens the token", func(t *testing.T) {
+		k, v, err := coerceArg(`note:="a=b:=c"`)
+		require.NoError(t, err)
+		require.Equal(t, "note", k)
+		require.Equal(t, "a=b:=c", v)
+	})
+}
+
 // TestLowerCallArgs_Precedence asserts the three precedence layers: base JSON,
 // inline JSON merged over it, and --arg merged on top (last wins per key).
 func TestLowerCallArgs_Precedence(t *testing.T) {
@@ -264,6 +304,78 @@ func TestCall_CompactDefaultPreservesRequestOutputFormat(t *testing.T) {
 	require.Equal(t, "toon", output["format"])
 	require.Equal(t, float64(7), output["limit"])
 	require.Equal(t, "TOON|results|...\n", buf.String())
+}
+
+// exploreTaskMarkdown is the shape explore(operation:"task") returns: the
+// human-oriented localization page, which the tool renders as markdown and
+// which carries no structured payload of its own.
+const exploreTaskMarkdown = "# Task: retry backoff\n\n## Candidates\n\n1. `Client.do` — internal/http/client.go:42\n"
+
+// TestCall_JSONFormatAlwaysEmitsJSON pins the --format json contract at the
+// only layer that promises it: whatever the tool rendered, stdout parses as
+// JSON. explore(operation:"task") is the case in the core surface that renders
+// markdown, so a JSON client used to get a parse error instead of a response.
+func TestCall_JSONFormatAlwaysEmitsJSON(t *testing.T) {
+	origLegacy, origFacade := callDaemonTool, callFacadeDaemonTool
+	t.Cleanup(func() { callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade })
+
+	t.Run("explore task markdown is wrapped in an envelope", func(t *testing.T) {
+		callFacadeDaemonTool = func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
+			return json.RawMessage(exploreTaskMarkdown), nil
+		}
+		cmd, buf := newCallTestCmd(t)
+		callArgs = []string{"operation=task", "task=why does the retry backoff never fire"}
+		require.NoError(t, runCall(cmd, []string{"explore"}))
+
+		var envelope map[string]any
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &envelope),
+			"--format json must emit parseable JSON, got: %s", buf.String())
+		require.Equal(t, "explore", envelope["tool"])
+		require.Equal(t, "text", envelope["format"])
+		require.Equal(t, exploreTaskMarkdown, envelope["text"])
+	})
+
+	t.Run("structured payloads pass through unwrapped", func(t *testing.T) {
+		callFacadeDaemonTool = func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
+			return json.RawMessage(`{"completion":{"state":"localized"},"symbols":["a"]}`), nil
+		}
+		cmd, buf := newCallTestCmd(t)
+		callArgs = []string{"operation=localize", "task=where is the retry backoff"}
+		require.NoError(t, runCall(cmd, []string{"explore"}))
+
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &payload))
+		require.Contains(t, payload, "completion", "a JSON tool response must not be re-wrapped")
+		require.NotContains(t, payload, "text")
+	})
+
+	t.Run("legacy relay text is wrapped too", func(t *testing.T) {
+		callDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {
+			if tool == "tool_profile" {
+				return json.RawMessage(cannedToolProfileJSON), nil
+			}
+			return json.RawMessage("plain prose, not JSON\n"), nil
+		}
+		cmd, buf := newCallTestCmd(t)
+		require.NoError(t, runCall(cmd, []string{"search_symbols"}))
+
+		var envelope map[string]any
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &envelope),
+			"--format json must emit parseable JSON, got: %s", buf.String())
+		require.Equal(t, "search_symbols", envelope["tool"])
+		require.Equal(t, "plain prose, not JSON\n", envelope["text"])
+	})
+
+	t.Run("format text keeps the rendered page verbatim", func(t *testing.T) {
+		callFacadeDaemonTool = func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
+			return json.RawMessage(exploreTaskMarkdown), nil
+		}
+		cmd, buf := newCallTestCmd(t)
+		callFormat = "text"
+		callArgs = []string{"operation=task", "task=why does the retry backoff never fire"}
+		require.NoError(t, runCall(cmd, []string{"explore"}))
+		require.Equal(t, exploreTaskMarkdown+"\n", buf.String())
+	})
 }
 
 func TestCall_CompactDryRunShowsFinalExplicitFormat(t *testing.T) {
