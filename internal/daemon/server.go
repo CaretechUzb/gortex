@@ -831,6 +831,10 @@ func (s *Server) Shutdown() error {
 		s.connsMu.Unlock()
 		_ = os.Remove(s.SocketPath)
 		_ = os.Remove(PIDFilePath())
+		// The runtime record describes THIS daemon's resolved choices, so it
+		// shares the PID file's lifetime — a survivor would point readers at
+		// a store no daemon has open.
+		RemoveRuntimeState()
 	})
 	return first
 }

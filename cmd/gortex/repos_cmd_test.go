@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
@@ -96,8 +97,15 @@ func reposTestEnv(t *testing.T, repos []config.RepoEntry) {
 // a repo, and the authoritative source describeRepo reads first.
 func seedIndexState(t *testing.T, prefix, sha string, dirty bool, indexedAt time.Time) {
 	t.Helper()
-	require.NoError(t, os.MkdirAll(filepath.Dir(reposBackendPath), 0o755))
-	st, err := store_sqlite.Open(reposBackendPath)
+	seedIndexStateAt(t, reposBackendPath, prefix, sha, dirty, indexedAt)
+}
+
+// seedIndexStateAt writes a freshness row into an explicitly named store, for
+// the tests that care about WHICH store the command decided to read.
+func seedIndexStateAt(t *testing.T, path, prefix, sha string, dirty bool, indexedAt time.Time) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	st, err := store_sqlite.Open(path)
 	require.NoError(t, err)
 	require.NoError(t, st.SetRepoIndexState(graph.RepoIndexState{
 		RepoPrefix: prefix,
@@ -413,6 +421,77 @@ func TestRunRepos_CorruptIndexStoreIsNotAnUnindexedOne(t *testing.T) {
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
 	require.Len(t, got, 1)
 	assert.True(t, got[0].Indexed)
+}
+
+// TestRunRepos_FollowsTheDaemonRecordedBackendPath exercises the production
+// routing. A daemon started with --backend-path writes its freshness rows to a
+// store the platform default does not name, and `gortex repos` had no way to
+// learn that — it always read the default and reported every repo the daemon
+// had indexed as never indexed. The command must follow the store the running
+// daemon recorded, with an explicit flag still winning over it.
+func TestRunRepos_FollowsTheDaemonRecordedBackendPath(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "solo")
+	head := gitInitRepo(t, dir)
+
+	reposTestEnv(t, []config.RepoEntry{{Path: dir, Name: "solo"}})
+	// Isolate the platform default so the fallback can never reach the
+	// developer's real store, and so "not found there" is a real answer.
+	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
+	t.Setenv("GORTEX_DAEMON_STATEFILE", filepath.Join(base, "daemon.state.json"))
+
+	// The daemon's store: somewhere only its own record names.
+	daemonStore := filepath.Join(base, "daemon-store", "custom.sqlite")
+	indexedAt := time.Now().Add(-time.Minute).Truncate(time.Second)
+	seedIndexStateAt(t, daemonStore, "solo", head, false, indexedAt)
+
+	// Production shape: no --backend-path on this command at all.
+	prevFlag := reposBackendPath
+	reposBackendPath = ""
+	t.Cleanup(func() { reposBackendPath = prevFlag })
+
+	reposJSON = true
+	t.Cleanup(func() { reposJSON = false })
+
+	// With no daemon record, the default store has nothing — the repo really
+	// does look unindexed from here.
+	cmd, buf := newReposCmd()
+	require.NoError(t, runRepos(cmd, nil))
+	var got []repoStatus
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	require.Len(t, got, 1)
+	require.False(t, got[0].Indexed, "without a daemon record only the default store is in scope")
+
+	// A live daemon recording its resolved store is what routes the command.
+	require.NoError(t, daemon.WriteRuntimeState(daemon.RuntimeState{BackendPath: daemonStore}))
+	t.Cleanup(daemon.RemoveRuntimeState)
+
+	cmd, buf = newReposCmd()
+	require.NoError(t, runRepos(cmd, nil))
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	require.Len(t, got, 1)
+	assert.True(t, got[0].Indexed, "repos must read the store the running daemon recorded")
+	assert.False(t, got[0].Stale)
+	assert.Equal(t, head, got[0].IndexedCommit)
+	require.NotNil(t, got[0].LastIndexed)
+	assert.Equal(t, indexedAt.Unix(), got[0].LastIndexed.Unix())
+
+	// An explicit flag still outranks the daemon's record.
+	reposBackendPath = filepath.Join(base, "explicit", "explicit.sqlite")
+	cmd, buf = newReposCmd()
+	require.NoError(t, runRepos(cmd, nil))
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	require.Len(t, got, 1)
+	assert.False(t, got[0].Indexed, "--backend-path must win over the daemon's recorded store")
+}
+
+// TestReposBackendPathFlagIsRegistered pins the flag on the command: the
+// resolution order documents it as the explicit override, and a variable with
+// no flag behind it is only reachable from tests.
+func TestReposBackendPathFlagIsRegistered(t *testing.T) {
+	flag := reposCmd.Flags().Lookup("backend-path")
+	require.NotNil(t, flag, "`gortex repos` must accept --backend-path")
+	assert.NotEmpty(t, flag.Usage, "the flag needs help text — it is how users learn the resolution order")
 }
 
 // TestShortSHA covers the table SHA abbreviation helper.

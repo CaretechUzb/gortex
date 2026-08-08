@@ -465,6 +465,15 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	if err := srv.Listen(); err != nil {
 		return err
 	}
+	// Publish the choices an out-of-band CLI cannot otherwise discover. The
+	// store path is the one that matters: `gortex repos` reads the freshness
+	// rows straight out of the store file, and a daemon started with
+	// --backend-path put them somewhere the platform default does not name.
+	// Advisory — a daemon that cannot write its record still serves, callers
+	// just fall back to the default path.
+	if err := daemon.WriteRuntimeState(daemon.RuntimeState{BackendPath: state.backendPath}); err != nil {
+		logger.Warn("daemon: could not record runtime state", zap.Error(err))
+	}
 	fmt.Fprintf(cmd.ErrOrStderr(),
 		"[gortex daemon] listening on %s (pid %d)\n",
 		daemon.SocketPath(), os.Getpid())

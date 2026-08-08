@@ -138,6 +138,11 @@ type SharedServer struct {
 	MCP          *gortexmcp.Server
 	ConfigMgr    *config.ConfigManager
 	Overlays     *daemon.OverlayManager
+	// StorePath is the graph store file this stack actually opened: the
+	// caller's BackendPath expanded to an absolute path, or the platform
+	// default when it was empty. Entry points publish it so out-of-band
+	// readers can find the same store instead of re-deriving the default.
+	StorePath string
 	// EmbedderDims is the active embedder's vector dimensionality, or 0
 	// when embeddings are off — the width every persisted vector in this
 	// workspace was built at.
@@ -250,6 +255,18 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 	s := &SharedServer{}
 
+	// Resolve the store path once, up front: the lock, the open, and the
+	// path published on SharedServer must all name the same file, and a bad
+	// backend name is rejected before anything touches the filesystem.
+	if err := checkBackend(cfg.Backend); err != nil {
+		return nil, err
+	}
+	storePath, err := resolveBackendPath(cfg.BackendPath, "store.sqlite")
+	if err != nil {
+		return nil, err
+	}
+	s.StorePath = storePath
+
 	// Cross-process store lock: a writable, on-disk lifecycle
 	// acquires an advisory flock on store.sqlite.lock and fails fast if
 	// another process owns the store. SQLite's in-process writeMu +
@@ -257,10 +274,6 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	// a second OS process opening the same file and corrupting it.
 	storeLockHeld := false // set true once the exclusive store flock is owned below
 	if cfg.Lifecycle.Writable() {
-		storePath, perr := resolveBackendPath(cfg.BackendPath, "store.sqlite")
-		if perr != nil {
-			return nil, perr
-		}
 		lock := flock.New(storePath + ".lock")
 		locked, lerr := lock.TryLock()
 		if lerr != nil {
@@ -279,7 +292,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 	// allowRebuild is gated on actually holding the store lock: only then may
 	// the sqlite backend drop and recreate an incompatible-schema DB.
-	g, backendCleanup, err := OpenBackend(cfg.Backend, cfg.BackendPath, cfg.BufferPoolMB, logger, storeLockHeld)
+	g, backendCleanup, err := OpenBackend(cfg.Backend, storePath, cfg.BufferPoolMB, logger, storeLockHeld)
 	if err != nil {
 		return nil, err
 	}

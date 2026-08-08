@@ -65,6 +65,12 @@ type daemonState struct {
 	// shared is the constructed server stack; its Close() runs the
 	// teardown chain (savings flush, backend close) at daemon shutdown.
 	shared *serverstack.SharedServer
+
+	// backendPath is the graph store file this daemon actually opened, with
+	// --backend-path already resolved. Published in the daemon's runtime
+	// record so out-of-band readers (`gortex repos`) can find the same store
+	// instead of assuming the platform default.
+	backendPath string
 }
 
 // lspDisabledSet builds the set of LSP spec names that should NOT be
@@ -136,6 +142,7 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		mcpServer:           ss.MCP,
 		overlays:            ss.Overlays,
 		shared:              ss,
+		backendPath:         ss.StorePath,
 		resolverLSPRegistry: ss.ResolverLSPRegistry,
 		lspRouter:           ss.LSPRouter,
 	}, nil

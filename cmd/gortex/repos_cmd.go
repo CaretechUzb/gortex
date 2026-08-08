@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jedib0t/go-pretty/v6/table"
@@ -13,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/platform"
@@ -24,8 +26,9 @@ var reposJSON bool
 
 // reposBackendPath is the on-disk SQLite backend file `gortex repos`
 // reads index-freshness provenance (the repo_index_state table) from.
-// Empty resolves to the daemon's default store (~/.gortex/store/store.sqlite).
-// Overridable so tests can point at an isolated store.
+// Empty defers to resolveReposBackendPath — the running daemon's recorded
+// store, else the platform default. Set by --backend-path, and by tests
+// pointing at an isolated store.
 var reposBackendPath string
 
 var reposCmd = &cobra.Command{
@@ -40,6 +43,11 @@ whether that index still matches HEAD. A repo is "stale" when HEAD has
 moved past the commit the cached index was built from, or when no index
 has been persisted yet.
 
+Freshness is read straight out of the graph store. The store is located
+in this order: --backend-path if given, else the store a running daemon
+recorded at startup (so a daemon started with --backend-path is followed
+without repeating the flag here), else ~/.gortex/store/store.sqlite.
+
 The default output is a table; --json emits the same data as a JSON
 array suitable for scripting.`,
 	RunE: runRepos,
@@ -47,6 +55,8 @@ array suitable for scripting.`,
 
 func init() {
 	reposCmd.Flags().BoolVar(&reposJSON, "json", false, "emit machine-readable JSON instead of a table")
+	reposCmd.Flags().StringVar(&reposBackendPath, "backend-path", "",
+		"read index freshness from this store file (default: the running daemon's recorded store, else ~/.gortex/store/store.sqlite)")
 	rootCmd.AddCommand(reposCmd)
 }
 
@@ -144,15 +154,32 @@ func runRepos(cmd *cobra.Command, _ []string) error {
 // a fact about the repos rather than a failure to look, and sends the user to
 // re-index work that is already done.
 func loadRepoIndexStates() (map[string]graph.RepoIndexState, error) {
-	path := reposBackendPath
-	if path == "" {
-		path = filepath.Join(platform.StoreDir(), "store.sqlite")
-	}
+	path := resolveReposBackendPath()
 	states, err := store_sqlite.ReadRepoIndexStates(path)
 	if err != nil {
 		return nil, fmt.Errorf("read index freshness from %s: %w", path, err)
 	}
 	return states, nil
+}
+
+// resolveReposBackendPath picks the store to read freshness from:
+//
+//  1. --backend-path, when the user named one explicitly.
+//  2. The store a running daemon recorded at startup. Without this step a
+//     daemon started with --backend-path writes its rows somewhere this
+//     command never looks, and every repo it has indexed reports as never
+//     indexed — the flag would have to be repeated on every status call to
+//     get a true answer.
+//  3. The platform default, which is where a daemon started without the flag
+//     put its store anyway.
+func resolveReposBackendPath() string {
+	if path := strings.TrimSpace(reposBackendPath); path != "" {
+		return path
+	}
+	if st, ok := daemon.ReadRuntimeState(); ok && st.BackendPath != "" {
+		return st.BackendPath
+	}
+	return filepath.Join(platform.StoreDir(), "store.sqlite")
 }
 
 // describeRepo resolves one RepoEntry into a repoStatus by reading the
