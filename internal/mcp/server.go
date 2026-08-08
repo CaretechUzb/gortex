@@ -1452,7 +1452,11 @@ func (s *Server) activeProjectName(cwd string) string {
 		return ""
 	}
 	if strings.TrimSpace(cwd) != "" {
-		if _, proj, _, ok := s.multiIndexer.ScopeForCWD(cwd); ok && proj != "" {
+		if _, proj, _, ok := s.multiIndexer.ScopeForCWD(cwd); ok {
+			// A resolved cwd owns the answer either way: a multi-repo
+			// workspace-root binding resolves with an empty project, and
+			// falling through to the server-wide default would advertise
+			// a project the session's bound scope may not even see.
 			return proj
 		}
 	}

@@ -75,9 +75,19 @@ func resolveProjectID(entry *config.RepoEntry, cfg *config.Config, fallbackPrefi
 // matching repo root wins so a repo nested inside another resolves to
 // the inner one.
 //
-// ok is false when cwd lies outside every tracked repo — callers MUST
-// fail closed (return no cross-workspace data) rather than widening to
-// the global graph.
+// When cwd is inside no tracked repo but is a PARENT of tracked repos
+// (a session started at a workspace root above its repos), it binds to
+// the contained repos' workspace — provided they all share one
+// effective workspace slug. A single contained repo keeps its full
+// scope (home repo included, so locality ranking works); several repos
+// in one workspace bind with no home repo. Contained repos spanning
+// DIFFERENT workspaces fail closed: a single-workspace session scope
+// cannot express the union, and widening silently would cross the
+// isolation boundary.
+//
+// ok is false when neither direction matches — callers MUST fail
+// closed (return no cross-workspace data) rather than widening to the
+// global graph.
 //
 // A repo whose effective WorkspaceID is empty (no `.gortex.yaml::
 // workspace:` and no global-config override) is treated as its own
@@ -109,7 +119,7 @@ func (mi *MultiIndexer) ScopeForCWD(cwd string) (workspaceID, projectID, repoPre
 		}
 	}
 	if bestPrefix == "" {
-		return "", "", "", false
+		return mi.scopeForWorkspaceRootLocked(cwd)
 	}
 
 	ws, proj := bestPrefix, bestPrefix
@@ -122,6 +132,52 @@ func (mi *MultiIndexer) ScopeForCWD(cwd string) (workspaceID, projectID, repoPre
 		}
 	}
 	return ws, proj, bestPrefix, true
+}
+
+// scopeForWorkspaceRootLocked is ScopeForCWD's reverse-containment
+// fallback: cwd contains tracked repos instead of living inside one.
+// Caller holds mi.mu (read).
+func (mi *MultiIndexer) scopeForWorkspaceRootLocked(cwd string) (workspaceID, projectID, repoPrefix string, ok bool) {
+	var (
+		contained []string // repo prefixes rooted under cwd
+		sharedWS  string
+	)
+	for prefix, meta := range mi.repos {
+		if meta == nil {
+			continue
+		}
+		root := filepath.Clean(meta.RootPath)
+		if root == "" || root == "." || !pathkey.HasPathPrefix(root, cwd) {
+			continue
+		}
+		ws := prefix // singleton fallback, same rule as ReposInWorkspace
+		if idx := mi.indexers[prefix]; idx != nil {
+			if v := idx.WorkspaceID(); v != "" {
+				ws = v
+			}
+		}
+		if len(contained) > 0 && ws != sharedWS {
+			return "", "", "", false // spans workspaces — fail closed
+		}
+		sharedWS = ws
+		contained = append(contained, prefix)
+	}
+	switch len(contained) {
+	case 0:
+		return "", "", "", false
+	case 1:
+		prefix := contained[0]
+		proj := prefix
+		if idx := mi.indexers[prefix]; idx != nil {
+			if v := idx.ProjectID(); v != "" {
+				proj = v
+			}
+		}
+		return sharedWS, proj, prefix, true
+	default:
+		// Several repos, one workspace: no single home repo or project.
+		return sharedWS, "", "", true
+	}
 }
 
 // ReposInWorkspace returns the set of repo prefixes whose effective
