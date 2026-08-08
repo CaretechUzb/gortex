@@ -67,17 +67,29 @@ func (s *Server) handleAnalyzeRoutes(ctx context.Context, req mcp.CallToolReques
 		})
 	}
 	// routes reads EdgeHandlesRoute directly off s.graph; narrow each row to
-	// the session workspace + optional repo allow-set. Keep a row only when
-	// BOTH endpoints — the handler (e.From) and the route contract (e.To) —
-	// are visible. Unbound sessions see every row (analyzeNodeVisible passes),
-	// so this is a strict no-op there. total recomputes after this block.
+	// the session workspace + optional repo allow-set. Unbound sessions see
+	// every row, so this is a strict no-op there. total recomputes after this
+	// block.
+	//
+	// The repo decision comes from the handler alone. A route contract is keyed
+	// by method+path with no repo prefix, so a single node is shared by every
+	// repo that handles the same route and carries exactly one repo's prefix.
+	// Requiring that shared node to satisfy the repo allow-set dropped every row
+	// for all but its owning repo — a scoped query returned 0 while the same
+	// rows were plainly present unscoped, and analyze contracts accepted the
+	// identical repo value. The handler endpoint is unambiguously attributed, so
+	// it decides. The contract is still held to the session workspace ceiling.
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*routeRow, 0, len(rows))
 		for _, r := range rows {
-			if s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Handler)) &&
-				s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Route)) {
-				kept = append(kept, r)
+			if !s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Handler)) {
+				continue
 			}
+			route := s.graph.GetNode(r.Route)
+			if route == nil || !s.nodeInSessionScope(ctx, route) {
+				continue
+			}
+			kept = append(kept, r)
 		}
 		rows = kept
 	}
