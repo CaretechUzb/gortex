@@ -39,6 +39,16 @@ func startPProfIfEnabled(logger *zap.Logger) {
 	if addr == "" {
 		return
 	}
+	// pprof serves the DefaultServeMux with no auth, and /debug/pprof/cmdline
+	// echoes the daemon's argv — which carries --http-auth-token. The heap it
+	// dumps holds indexed source from every tracked repository. Keep it on
+	// loopback: an operator who wants it reachable can port-forward.
+	if !isLocalhostBind(addr) {
+		logger.Warn("daemon: refusing non-loopback pprof bind",
+			zap.String("addr", addr),
+			zap.String("hint", "pprof is unauthenticated and exposes argv + heap; bind 127.0.0.1 and port-forward"))
+		return
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		logger.Warn("daemon: pprof listener failed",

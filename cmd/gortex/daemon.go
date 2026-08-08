@@ -51,6 +51,7 @@ var (
 	daemonStatusInterval        time.Duration
 	daemonHTTPAddr              string
 	daemonHTTPAuthToken         string
+	daemonHTTPAllowedOrigins    []string
 	daemonHTTPCORSOrigin        string
 	daemonHTTPConversationAllow []string
 	daemonBackend               string
@@ -124,6 +125,8 @@ func init() {
 		"also expose the MCP 2026 Streamable HTTP transport on this TCP address (e.g. 127.0.0.1:7411); empty disables")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPAuthToken, "http-auth-token", "",
 		"bearer token required on every Streamable HTTP request (default: read $GORTEX_DAEMON_HTTP_TOKEN; empty allows unauthenticated localhost binds)")
+	daemonStartCmd.Flags().StringSliceVar(&daemonHTTPAllowedOrigins, "http-allowed-origin", nil,
+		"web origin permitted to call /mcp cross-origin (e.g. https://ui.example); repeatable. Empty refuses every browser origin — a loopback bind is reachable from any page the user visits")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPCORSOrigin, "cors-origin", "*",
 		"allowed CORS origin for the HTTP surface (use '*' for any); applies to both /mcp and /v1 when --http-addr is set")
 	daemonStartCmd.Flags().StringSliceVar(&daemonHTTPConversationAllow, "conversation-host", nil,
