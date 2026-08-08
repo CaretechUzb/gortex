@@ -398,7 +398,12 @@ func fetchAndMergeBM25Timed(eng *query.Engine, original string, expanded []strin
 				if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 					continue
 				}
-				if scope.WorkspaceID != "" && !scope.ScopeAllows(n) {
+				// ScopeAllows is a no-op when neither axis is set, so the
+				// guard must not pre-test WorkspaceID: a session bound to
+				// the repos its cwd contains carries its whole boundary in
+				// RepoAllow, and pre-testing the slug skipped the check
+				// exactly when it was the only one left.
+				if !scope.ScopeAllows(n) {
 					continue
 				}
 				seen[n.ID] = true

@@ -292,7 +292,9 @@ func TestDispatcher_LocalWorkspaceUmbrellaCWD_Passes(t *testing.T) {
 		"workspace-umbrella cwd must be reachable when .gortex.yaml declares a workspace, even when no server claims it")
 
 	sess := &daemon.Session{ID: "sess_umbrella", CWD: umbrella}
-	frame := []byte(`{"jsonrpc":"2.0","id":9,"method":"graph_stats","params":{}}`)
+	// Must be a tools/call: the gate only refuses that method, so a
+	// frame with any other method can never exercise it.
+	frame := []byte(`{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"graph_stats","arguments":{}}}`)
 	reply, err := d.Dispatch(context.Background(), sess, frame)
 	require.NoError(t, err)
 	require.NotNil(t, reply)
@@ -380,15 +382,76 @@ func TestDispatcher_WorkspaceRootCWD_Passes(t *testing.T) {
 		}
 	}
 
-	// Track a second repo under the same parent: each repo is its own
-	// singleton workspace, so the parent now spans two workspaces and
-	// must fail closed again.
+	// Track a second repo under the same parent. Each repo is its own
+	// singleton workspace, so the parent now spans two — the shape
+	// ScopeForCWD fails closed on. It must STILL be reachable: the
+	// session binds to the contained repo set instead of to a slug
+	// (gortexhq/gortex#418). Two unrelated repos under one folder is
+	// the ordinary case, and refusing it left the session with no
+	// working call and a remedy that would have re-indexed both repos
+	// a second time under the parent.
 	other := filepath.Join(parent, "projects", "other")
 	require.NoError(t, os.MkdirAll(other, 0o755))
 	_, err = mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: other})
 	require.NoError(t, err)
-	assert.False(t, d.cwdReachable(parent),
-		"parent spanning two singleton workspaces must stay unreachable")
+	_, _, _, singleSlug := mi.ScopeForCWD(parent)
+	require.False(t, singleSlug, "precondition: the parent must span two workspaces")
+	assert.True(t, d.cwdReachable(parent),
+		"parent containing repos in different workspaces must bind to the contained repo set")
+
+	sess = &daemon.Session{ID: "sess_wsroot_mixed", CWD: parent}
+	reply, err = d.Dispatch(context.Background(), sess, frame)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	parsed = nil
+	require.NoError(t, json.Unmarshal(reply, &parsed))
+	if errObj, ok := parsed["error"].(map[string]any); ok {
+		if data, ok := errObj["data"].(map[string]any); ok {
+			assert.NotEqual(t, "repo_not_tracked", data["error_code"],
+				"mixed-workspace parent wrongly rejected: %v", parsed)
+		}
+	}
+}
+
+// TestDispatcher_GateMatchesSessionScope pins the invariant the gate's own
+// doc comment asserts: cwdReachable admits exactly the cwds the MCP server
+// can bind to a non-sentinel scope. The two resolutions live in different
+// packages and drifted apart before — a cwd the gate admitted but the scope
+// blanked produced silent zeros, which is the failure mode the loud
+// repo_not_tracked error exists to prevent.
+func TestDispatcher_GateMatchesSessionScope(t *testing.T) {
+	parent := t.TempDir()
+	repoA := filepath.Join(parent, "a")
+	repoB := filepath.Join(parent, "b")
+	require.NoError(t, os.MkdirAll(repoA, 0o755))
+	require.NoError(t, os.MkdirAll(repoB, 0o755))
+
+	d, mi := trackedPathMCPSetup(t, repoA)
+	_, err := mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: repoB})
+	require.NoError(t, err)
+
+	stranger := t.TempDir()
+
+	for _, tc := range []struct {
+		name string
+		cwd  string
+		want bool
+	}{
+		{"inside a tracked repo", repoA, true},
+		{"subdirectory of a tracked repo", filepath.Join(repoA, "internal", "deep"), true},
+		{"parent containing two tracked repos", parent, true},
+		{"unrelated directory", stranger, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gate := d.cwdReachable(tc.cwd)
+			assert.Equal(t, tc.want, gate, "gate verdict")
+
+			_, _, _, inside := mi.ScopeForCWD(tc.cwd)
+			_, _, contains := mi.ContainedReposScope(tc.cwd)
+			assert.Equal(t, gate, inside || contains,
+				"the gate and the session-scope resolution must agree for %s", tc.cwd)
+		})
+	}
 }
 
 // TestDispatcher_UntrackedHandshake_SurvivesWithInactiveVariant proves the

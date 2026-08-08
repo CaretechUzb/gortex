@@ -221,10 +221,19 @@ func untrackedBootstrapCall(frame []byte) bool {
 	if json.Unmarshal(frame, &peek) != nil || peek.Method != "tools/call" {
 		return false
 	}
-	if peek.Params.Name == "capabilities" {
+	switch peek.Params.Name {
+	case "capabilities":
 		return true
+	case "track_repository", "index_repository":
+		// The legacy-surface equivalents of workspace_admin(track). A
+		// client on the legacy surface could otherwise see the repair
+		// advice in the initialize instructions and have no tool able
+		// to carry it out.
+		return true
+	case "workspace_admin":
+		return strings.EqualFold(strings.TrimSpace(fmt.Sprint(peek.Params.Arguments["operation"])), "track")
 	}
-	return peek.Params.Name == "workspace_admin" && strings.EqualFold(strings.TrimSpace(fmt.Sprint(peek.Params.Arguments["operation"])), "track")
+	return false
 }
 
 // rewriteUntrackedResponse swaps a successful initialize response for its
@@ -313,13 +322,25 @@ func (d *mcpDispatcher) cwdReachable(cwd string) bool {
 	if d.isCWDTracked(cwd) {
 		return true
 	}
-	// Workspace-root fallback: a cwd that CONTAINS tracked repos (agent
-	// opened at the root above its repos) is reachable exactly when
-	// ScopeForCWD can bind it to one workspace — the same resolution
-	// sessionScope applies later, so the gate can never admit a session
-	// the scope would blank out, or refuse one it could serve.
+	// Workspace-root fallback: a cwd that CONTAINS tracked repos — an
+	// agent opened at the root above its repos — is reachable when
+	// either resolution binds it, and it MUST be the same pair
+	// sessionScope applies later, or the gate admits sessions the scope
+	// blanks out (silent zeros) and refuses ones it could serve.
+	//
+	// ScopeForCWD binds only when the contained repos agree on one
+	// workspace slug, because a session scope is a single slug.
+	// ContainedReposScope needs no agreement: it binds to the contained
+	// repo SET, which is a filesystem fact and strictly narrower than
+	// any slug. Two unrelated repos under one parent are the common
+	// shape — each is its own workspace by default — and refusing them
+	// left the session with no working call and a remedy (`gortex track
+	// <parent>`) that would have indexed every child a second time.
 	if d.multiIndexer != nil {
 		if _, _, _, ok := d.multiIndexer.ScopeForCWD(cwd); ok {
+			return true
+		}
+		if _, _, ok := d.multiIndexer.ContainedReposScope(cwd); ok {
 			return true
 		}
 	}

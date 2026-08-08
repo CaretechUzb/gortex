@@ -298,6 +298,13 @@ type Server struct {
 	// used.
 	sessions *sessionMap
 
+	// degradedNote is a one-line operating-mode warning prepended to the
+	// initialize instructions — see SetDegradedNote. Guarded because the
+	// embedded entry point sets it after NewServer, concurrently with
+	// the first client handshakes.
+	degradedMu   sync.RWMutex
+	degradedNote string
+
 	guardRules   []config.GuardRule
 	architecture config.ArchitectureConfig
 	// eventRules is the declarative event-boundary rule family, installed via
@@ -675,11 +682,28 @@ type sessionState struct {
 	// closed rather than widening to the global graph. scopeRepoPrefix
 	// / scopeProjectID feed relevance ranking (same-repo > same-project
 	// > same-workspace); they never relax the boundary.
+	//
+	// scopeRepoAllow is the session's HARD repo ceiling. It is nil for
+	// the common shapes, where scopeWorkspaceID is the whole boundary.
+	// It is non-nil (and never empty) for a session opened at a root
+	// ABOVE its repos whose contained repos span more than one
+	// workspace: there is no single slug to bind to, so the contained
+	// repo set is itself the boundary and scopeWorkspaceID stays empty.
+	// Every scope consumer MUST fold it in — an empty workspace slug
+	// with no repo ceiling is the unbounded global graph.
+	// scopeWorkspaces are the slugs those repos resolve to; they let a
+	// `workspace:` selector narrow within the session, never widen it.
+	// scopeCWD records the cwd the binding was derived from so a
+	// transport that revises a session's cwd (Streamable HTTP) re-resolves
+	// instead of serving the stale — possibly unbound — boundary.
 	scopeResolved    bool
 	scopeBound       bool
 	scopeWorkspaceID string
 	scopeProjectID   string
 	scopeRepoPrefix  string
+	scopeRepoAllow   map[string]bool
+	scopeWorkspaces  map[string]bool
+	scopeCWD         string
 
 	// planningMode, when true, removes every editing tool from this
 	// session's tool surface and hard-blocks edit calls — a runtime
@@ -1295,7 +1319,8 @@ func ServerInstructionsUntracked(cwd string, roots ...string) string {
 		"so the graph tools have nothing to answer with yet.\n\n"+
 		"To activate: run `gortex track %s`, then reconnect — the full tool catalogue and the "+
 		"graph become available.\n\n"+
-		"Until then tools/list is intentionally empty; fall back to your own file reads and text search.", target, target)
+		"Until then only capabilities and workspace_admin(operation:\"track\") will answer; every other call "+
+		"returns repo_not_tracked, so fall back to your own file reads and text search.", target, target)
 	// Append the tracked roots so the mismatch is self-diagnosing: a
 	// case-only or drive-letter difference between the cwd above and one
 	// of these roots is the usual cause of an INACTIVE session (#277).
@@ -1367,15 +1392,51 @@ func (s *Server) stateAwareInstructionsForPolicy(cwd string, policy *toolPolicy)
 }
 
 func (s *Server) stateAwareInstructionsWithBase(cwd, base string) string {
+	// The reachability test must match the dispatcher's gate exactly.
+	// Telling a session it is INACTIVE while every call succeeds is the
+	// same divergence as the reverse, just quieter.
 	if s.multiIndexer != nil && strings.TrimSpace(cwd) != "" {
-		if _, _, _, ok := s.multiIndexer.ScopeForCWD(cwd); !ok {
+		_, _, _, inside := s.multiIndexer.ScopeForCWD(cwd)
+		_, _, contains := s.multiIndexer.ContainedReposScope(cwd)
+		if !inside && !contains {
 			return ServerInstructionsUntracked(cwd, s.trackedRepoRoots()...)
 		}
 	}
 	if facts := s.liveInstructionFacts(cwd); facts != "" {
-		return base + "\n\n" + facts
+		base = base + "\n\n" + facts
+	}
+	if note := s.DegradedNote(); note != "" {
+		base = note + "\n\n" + base
 	}
 	return base
+}
+
+// DegradedNote returns the operating-mode warning prepended to this
+// server's initialize instructions, or "" when it is operating normally.
+func (s *Server) DegradedNote() string {
+	if s == nil {
+		return ""
+	}
+	s.degradedMu.RLock()
+	defer s.degradedMu.RUnlock()
+	return s.degradedNote
+}
+
+// SetDegradedNote records a one-line explanation of a degraded operating
+// mode, delivered to every client in the initialize instructions.
+//
+// The embedded fallback is the case this exists for: when no daemon is
+// reachable, `gortex mcp` serves one locally-indexed tree with no
+// workspace scoping, and announced it only on stderr — which MCP clients
+// routinely discard. An agent then attributed the difference to the graph
+// rather than to the mode it was running in.
+func (s *Server) SetDegradedNote(note string) {
+	if s == nil {
+		return
+	}
+	s.degradedMu.Lock()
+	s.degradedNote = note
+	s.degradedMu.Unlock()
 }
 
 // liveInstructionFacts renders the per-connection state block appended to the
@@ -1956,22 +2017,26 @@ const unresolvedWorkspacePrefix = "\x00gortex-unresolved-workspace:"
 // server --workspace`) and callers fall back to the server-default
 // scope.
 //
-// Resolution happens once per session — derived from the immutable
-// session cwd — and is cached on sessionState. repoPrefix is the
-// session's home repo, used only for relevance ranking.
+// Resolution is cached on sessionState and recomputed only when the
+// session's cwd changes — the stdio proxy fixes it for the connection's
+// life, but the Streamable HTTP transport carries it per request, and a
+// binding resolved from one cwd must never be served to another.
+// repoPrefix is the session's home repo, used only for relevance ranking.
 func (s *Server) sessionScope(ctx context.Context) (workspaceID, projectID string, bound bool) {
 	ss := s.sessionFor(ctx)
 	if ss == nil {
 		return "", "", false
 	}
+	cwd := SessionCWDFromContext(ctx)
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
-	if ss.scopeResolved {
+	if ss.scopeResolved && ss.scopeCWD == cwd {
 		return ss.scopeWorkspaceID, ss.scopeProjectID, ss.scopeBound
 	}
+	ss.resetScopeLocked()
 	ss.scopeResolved = true
+	ss.scopeCWD = cwd
 
-	cwd := SessionCWDFromContext(ctx)
 	if cwd == "" || s.multiIndexer == nil {
 		// No cwd (embedded stdio, control clients) or no multi-repo
 		// indexer: unbound — the server-default scope applies.
@@ -1984,14 +2049,132 @@ func (s *Server) sessionScope(ctx context.Context) (workspaceID, projectID strin
 		ss.scopeWorkspaceID = ws
 		ss.scopeProjectID = proj
 		ss.scopeRepoPrefix = repoPrefix
-	} else {
-		// cwd is non-empty but maps to no tracked repo. The daemon
-		// dispatcher rejects unreachable cwds before dispatch, so
-		// this is defensive: the sentinel matches no node, so the
-		// session sees nothing rather than the whole global graph.
-		ss.scopeWorkspaceID = unresolvedWorkspacePrefix + cwd
+		return ss.scopeWorkspaceID, ss.scopeProjectID, true
 	}
+
+	// cwd lies inside no tracked repo. It may still CONTAIN them — an
+	// agent opened at the root above its repos. Bind to that repo set
+	// directly: it is a filesystem fact, and a strictly narrower
+	// boundary than any workspace slug (a slug also names repos rooted
+	// elsewhere). scopeWorkspaceID stays empty here, so scopeRepoAllow
+	// is the ONLY thing standing between this session and the global
+	// graph — it is never empty on this path.
+	if repos, workspaces, contained := s.multiIndexer.ContainedReposScope(cwd); contained {
+		ss.scopeRepoAllow = setOfStrings(repos)
+		ss.scopeWorkspaces = setOfStrings(workspaces)
+		if len(repos) == 1 {
+			// A single contained repo has a real home: keep its full
+			// scope so locality ranking still works.
+			ss.scopeWorkspaceID = workspaces[0]
+			ss.scopeRepoPrefix = repos[0]
+		}
+		return ss.scopeWorkspaceID, ss.scopeProjectID, true
+	}
+
+	// cwd neither lives inside nor contains a tracked repo. The daemon
+	// dispatcher rejects unreachable cwds before dispatch, so this is
+	// defensive: the sentinel matches no node, so the session sees
+	// nothing rather than the whole global graph.
+	ss.scopeWorkspaceID = unresolvedWorkspacePrefix + cwd
 	return ss.scopeWorkspaceID, ss.scopeProjectID, true
+}
+
+// resetScopeLocked clears every cached scope field so a re-resolution
+// cannot inherit a stale boundary from the previous cwd. Caller holds
+// ss.mu.
+func (ss *sessionState) resetScopeLocked() {
+	ss.scopeResolved = false
+	ss.scopeBound = false
+	ss.scopeWorkspaceID = ""
+	ss.scopeProjectID = ""
+	ss.scopeRepoPrefix = ""
+	ss.scopeRepoAllow = nil
+	ss.scopeWorkspaces = nil
+	ss.scopeCWD = ""
+}
+
+// setOfStrings turns a slice into a lookup set. Returns nil for an empty
+// slice so "no ceiling" and "an empty ceiling" stay distinguishable — the
+// difference between an unbounded session and a blind one.
+func setOfStrings(vals []string) map[string]bool {
+	if len(vals) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(vals))
+	for _, v := range vals {
+		out[v] = true
+	}
+	return out
+}
+
+// sessionRepoCeiling returns the session's hard repo allow-set, or nil
+// when the session's workspace slug is the whole boundary. Non-nil only
+// for a workspace-root session bound to the repos it contains.
+//
+// This is the single accessor every scope consumer folds in; a bound
+// session always satisfies `workspaceID != "" || len(ceiling) > 0`.
+func (s *Server) sessionRepoCeiling(ctx context.Context) map[string]bool {
+	ss := s.sessionFor(ctx)
+	if ss == nil {
+		return nil
+	}
+	// Ensure the binding is resolved (populates scopeRepoAllow).
+	s.sessionScope(ctx)
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.scopeRepoAllow
+}
+
+// sessionScopeWorkspaces returns the workspace slugs a contained-repo
+// session spans, for the `workspace:` selector. Nil for every other shape.
+func (s *Server) sessionScopeWorkspaces(ctx context.Context) map[string]bool {
+	ss := s.sessionFor(ctx)
+	if ss == nil {
+		return nil
+	}
+	s.sessionScope(ctx)
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.scopeWorkspaces
+}
+
+// sessionScopeOptions builds the QueryOptions that express the current
+// session's boundary — workspace slug plus repo ceiling. bound is false
+// for an unbound session, whose callers must not clamp.
+//
+// Every per-node session gate routes through this so the two axes can
+// never drift apart: a shape that has no workspace slug carries a repo
+// ceiling instead, and both are applied together.
+func (s *Server) sessionScopeOptions(ctx context.Context) (query.QueryOptions, bool) {
+	sessWS, _, bound := s.sessionScope(ctx)
+	if !bound {
+		return query.QueryOptions{}, false
+	}
+	return query.QueryOptions{WorkspaceID: sessWS, RepoAllow: s.sessionRepoCeiling(ctx)}, true
+}
+
+// InvalidateSessionScopes drops every session's cached workspace binding
+// so the next call re-resolves it against the current tracked-repo set.
+// Called after a repo is tracked or untracked: without it a session that
+// bound before the change keeps serving the boundary it latched — which
+// is what made the untracked-cwd bootstrap exemption decorative, since a
+// session that tracked its own repo stayed blind to it.
+func (s *Server) InvalidateSessionScopes() {
+	if s == nil {
+		return
+	}
+	states := []*sessionState{s.session}
+	if s.sessions != nil {
+		states = append(states, s.sessions.snapshotSessions()...)
+	}
+	for _, ss := range states {
+		if ss == nil {
+			continue
+		}
+		ss.mu.Lock()
+		ss.resetScopeLocked()
+		ss.mu.Unlock()
+	}
 }
 
 // sessionLocality returns the session's home repo prefix and project
@@ -2014,11 +2197,10 @@ func (s *Server) sessionLocality(ctx context.Context) (repoPrefix, projectID str
 // session or when the multi-repo indexer is unavailable. Used by the
 // introspection tools so they report the session's real boundary.
 func (s *Server) sessionWorkspaceRepos(ctx context.Context) []map[string]string {
-	sessWS, _, bound := s.sessionScope(ctx)
-	if !bound || s.multiIndexer == nil {
+	prefixes, bound := s.sessionWorkspaceRepoSet(ctx)
+	if !bound {
 		return nil
 	}
-	prefixes := s.multiIndexer.ReposInWorkspace(sessWS)
 	meta := s.multiIndexer.AllMetadata()
 	out := make([]map[string]string, 0, len(prefixes))
 	for p := range prefixes {
@@ -2040,14 +2222,14 @@ func (s *Server) sessionWorkspaceRepos(ctx context.Context) []map[string]string 
 // whole-graph handlers that don't route through the engine's scoped
 // traversal.
 func (s *Server) nodeInSessionScope(ctx context.Context, n *graph.Node) bool {
-	sessWS, _, bound := s.sessionScope(ctx)
+	opts, bound := s.sessionScopeOptions(ctx)
 	if !bound {
 		return true
 	}
 	if n == nil {
 		return false
 	}
-	return query.QueryOptions{WorkspaceID: sessWS}.ScopeAllows(n)
+	return opts.ScopeAllows(n)
 }
 
 // scopedNodes returns the graph nodes visible to the current session:
@@ -2085,14 +2267,9 @@ func (s *Server) scopedNodesLight(ctx context.Context) []*graph.Node {
 // RepoPrefix and ProjectID, all of which the light projection carries, so
 // this is shared by both entry points.
 func (s *Server) scopeNodes(ctx context.Context, all []*graph.Node) []*graph.Node {
-	sessWS, _, bound := s.sessionScope(ctx)
-	repoAllow := repoAllowFromContext(ctx)
-	if !bound && len(repoAllow) == 0 {
+	opts, active := s.scopeOptionsWithRepoNarrow(ctx, repoAllowFromContext(ctx))
+	if !active {
 		return all
-	}
-	opts := query.QueryOptions{RepoAllow: repoAllow}
-	if bound {
-		opts.WorkspaceID = sessWS
 	}
 	out := make([]*graph.Node, 0, len(all))
 	for _, n := range all {
@@ -2101,6 +2278,37 @@ func (s *Server) scopeNodes(ctx context.Context, all []*graph.Node) []*graph.Nod
 		}
 	}
 	return out
+}
+
+// scopeOptionsWithRepoNarrow folds a handler-supplied repo narrow into the
+// session boundary. active is false only when there is nothing to apply —
+// an unbound session with no narrow.
+//
+// The narrow can only narrow: against a session repo ceiling the two sets
+// are intersected, so a handler narrow can never name a repo the session
+// may not see. A narrow disjoint from the ceiling collapses to the
+// unresolved-workspace sentinel rather than to an empty allow-set — an
+// empty RepoAllow with an empty workspace slug reads as "no filter" to
+// ScopeAllows, which would turn a fully-excluded narrow into a global scan.
+func (s *Server) scopeOptionsWithRepoNarrow(ctx context.Context, narrow map[string]bool) (query.QueryOptions, bool) {
+	opts, bound := s.sessionScopeOptions(ctx)
+	if !bound {
+		return query.QueryOptions{RepoAllow: narrow}, len(narrow) > 0
+	}
+	switch {
+	case len(narrow) == 0:
+		// Nothing to fold in — the session boundary stands alone.
+	case len(opts.RepoAllow) == 0:
+		opts.RepoAllow = narrow
+	default:
+		if merged := intersectRepoSets(narrow, opts.RepoAllow); len(merged) > 0 {
+			opts.RepoAllow = merged
+		} else {
+			opts.WorkspaceID = unresolvedWorkspacePrefix + "disjoint-repo-narrow"
+			opts.RepoAllow = nil
+		}
+	}
+	return opts, true
 }
 
 // scopedNodesByKinds is the kind-pushdown sibling of scopedNodes for
@@ -2142,14 +2350,9 @@ func (s *Server) scopedNodesByKinds(ctx context.Context, kinds []graph.NodeKind)
 			}
 		}
 	}
-	sessWS, _, bound := s.sessionScope(ctx)
-	repoAllow := repoAllowFromContext(ctx)
-	if !bound && len(repoAllow) == 0 {
+	opts, active := s.scopeOptionsWithRepoNarrow(ctx, repoAllowFromContext(ctx))
+	if !active {
 		return nodes
-	}
-	opts := query.QueryOptions{RepoAllow: repoAllow}
-	if bound {
-		opts.WorkspaceID = sessWS
 	}
 	out := make([]*graph.Node, 0, len(nodes))
 	for _, n := range nodes {
@@ -2164,14 +2367,9 @@ func (s *Server) scopedNodesByKinds(ctx context.Context, kinds []graph.NodeKind)
 // workspace. Convenience for handlers that already hold a node list
 // (engine list methods that don't take QueryOptions).
 func (s *Server) scopedNodeSlice(ctx context.Context, nodes []*graph.Node) []*graph.Node {
-	sessWS, _, bound := s.sessionScope(ctx)
-	repoAllow := repoAllowFromContext(ctx)
-	if !bound && len(repoAllow) == 0 {
+	opts, active := s.scopeOptionsWithRepoNarrow(ctx, repoAllowFromContext(ctx))
+	if !active {
 		return nodes
-	}
-	opts := query.QueryOptions{RepoAllow: repoAllow}
-	if bound {
-		opts.WorkspaceID = sessWS
 	}
 	out := make([]*graph.Node, 0, len(nodes))
 	for _, n := range nodes {

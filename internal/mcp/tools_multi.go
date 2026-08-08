@@ -146,6 +146,12 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 						zap.String("path", path), zap.Error(saveErr))
 				}
 			}
+			// The tracked-repo set just changed, so every session's
+			// cached workspace binding is stale. Without this the
+			// session that ran `track` to repair its own uncovered cwd
+			// keeps the boundary it latched before the call and stays
+			// blind to the repo it just added.
+			s.InvalidateSessionScopes()
 			s.RunAnalysis()
 		}
 		done <- trackOutcome{result: res, err: trackErr}
@@ -219,6 +225,10 @@ func (s *Server) handleUntrackRepository(ctx context.Context, req mcp.CallToolRe
 				zap.String("path", path), zap.Error(saveErr))
 		}
 	}
+
+	// The tracked-repo set changed: drop cached session bindings so a
+	// session does not keep serving a repo that is no longer tracked.
+	s.InvalidateSessionScopes()
 
 	// Re-run analysis after removing a repo.
 	s.RunAnalysis()

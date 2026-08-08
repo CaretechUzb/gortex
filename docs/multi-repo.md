@@ -12,7 +12,15 @@ Slug resolution precedence (first match wins):
 2. `workspace:` in the repo's own `.gortex.yaml` — the default for first-party repos
 3. The repo prefix — fallback when neither is set, so each unconfigured repo gets its own isolated workspace
 
-The same chain applies to the optional `project:` slug (a sub-bucket inside a workspace). The daemon loads every tracked repo into one shared graph; you scope a query to a single workspace or project at request time rather than at startup. Over the HTTP surface (`gortex daemon start --http-addr ...`) the `/v1/graph` route accepts `?project=` and `?repo=` to narrow the dump, so a typo'd value returns an empty result for that request instead of bringing the whole index up empty.
+The same chain applies to the optional `project:` slug (a sub-bucket inside a workspace). The daemon loads every tracked repo into one shared graph; you scope a query to a single workspace or project at request time rather than at startup.
+
+### Sessions opened above their repos
+
+A session's boundary comes from its working directory. Inside a tracked repo it is that repo's workspace slug. At a directory that *contains* tracked repos — an agent opened at the root above them — the boundary is the set of repos rooted under that directory, and it needs no shared slug: two unrelated repos side by side, each its own workspace by default, bind together. Nothing else is visible, including a repo that declares one of the same slugs from elsewhere on disk — containment is the narrower rule, and it is the one that applies.
+
+Such a session has no single workspace slug, so `_meta.scope_applied` reports `repos:N` rather than `workspace`. `repo:`, `project:`, `workspace:` and `scope:` narrow *within* the contained set; naming a repo or workspace outside it is refused with an error rather than answered empty. `repo:"*"` widens only back to the session's own repos.
+
+A directory that neither lies inside nor contains a tracked repo still fails closed with the structured `repo_not_tracked` error — tracking the parent of your repos is not required, and doing so would index every child a second time. Over the HTTP surface (`gortex daemon start --http-addr ...`) the `/v1/graph` route accepts `?project=` and `?repo=` to narrow the dump, so a typo'd value returns an empty result for that request instead of bringing the whole index up empty.
 
 ## Configuration
 

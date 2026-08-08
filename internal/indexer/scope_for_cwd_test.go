@@ -178,3 +178,96 @@ func TestScopeForCWD_WorkspaceRoot(t *testing.T) {
 	assert.Equal(t, "app", ws)
 	assert.Equal(t, "app", prefix)
 }
+
+// TestContainedReposScope binds a session opened ABOVE its repos to the
+// repo set the directory physically contains, with no requirement that
+// those repos agree on a workspace slug. Two unrelated repos under one
+// parent — each its own workspace by default — is the shape ScopeForCWD
+// fails closed on and the shape agents actually open (gortexhq/gortex#418).
+//
+// The containment answer must stay strictly narrower than any slug: a
+// repo that declares a slug the session spans, but sits OUTSIDE the cwd,
+// must not appear. That is the property that makes admitting this shape
+// safe, so it is asserted directly rather than implied.
+func TestContainedReposScope(t *testing.T) {
+	mkRepo := func(parent, name string) string {
+		t.Helper()
+		dir := filepath.Join(parent, name)
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"),
+			[]byte("package main\n\nfunc Hello() {}\n"), 0o644))
+		return dir
+	}
+
+	// Two unrelated repos under one parent; each is its own workspace.
+	parentMixed := t.TempDir()
+	x := mkRepo(parentMixed, "x")
+	y := mkRepo(parentMixed, "y")
+
+	// A third repo OUTSIDE the parent that declares workspace "x" — the
+	// slug one of the contained repos resolves to. Binding by slug would
+	// pull it in; binding by containment must not.
+	elsewhere := t.TempDir()
+	outsider := mkRepo(elsewhere, "outsider")
+	require.NoError(t, os.WriteFile(filepath.Join(outsider, ".gortex.yaml"),
+		[]byte("workspace: x\n"), 0o644))
+
+	// A parent with no tracked repo under it at all.
+	empty := t.TempDir()
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{
+		Repos: []config.RepoEntry{
+			{Path: x, Name: "x"},
+			{Path: y, Name: "y"},
+			{Path: outsider, Name: "outsider"},
+		},
+	}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	g := graph.New()
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	_, err = mi.IndexScoped("", "")
+	require.NoError(t, err)
+
+	// ScopeForCWD still fails closed on the mixed parent — this change
+	// adds a second resolution, it does not relax the first.
+	_, _, _, ok := mi.ScopeForCWD(parentMixed)
+	require.False(t, ok, "ScopeForCWD must keep failing closed on a mixed-workspace parent")
+
+	repos, workspaces, ok := mi.ContainedReposScope(parentMixed)
+	require.True(t, ok, "a parent containing tracked repos must resolve")
+	assert.Equal(t, []string{"x", "y"}, repos)
+	assert.Equal(t, []string{"x", "y"}, workspaces, "undeclared repos are their own workspaces")
+	assert.NotContains(t, repos, "outsider",
+		"containment must not admit a repo rooted outside the cwd, whatever slug it declares")
+
+	// ReposInWorkspace, the slug-keyed lookup, DOES include the
+	// outsider — which is exactly why the session ceiling is the
+	// containment set and not the slug's membership.
+	assert.True(t, mi.ReposInWorkspace("x")["outsider"],
+		"precondition: the outsider shares slug \"x\"")
+
+	// A directory containing nothing tracked stays unresolvable.
+	_, _, ok = mi.ContainedReposScope(empty)
+	assert.False(t, ok, "a parent with no tracked repo under it must not resolve")
+
+	// A cwd INSIDE a tracked repo contains no repo below it.
+	_, _, ok = mi.ContainedReposScope(filepath.Join(x, "internal"))
+	assert.False(t, ok, "a directory inside a repo contains no tracked repo")
+
+	// The repo root itself counts as contained (HasPathPrefix is
+	// reflexive), so a session opened exactly at a repo root resolves
+	// through the forward direction and the reverse one alike.
+	repos, _, ok = mi.ContainedReposScope(x)
+	require.True(t, ok)
+	assert.Equal(t, []string{"x"}, repos)
+
+	// Empty cwd is never a boundary.
+	_, _, ok = mi.ContainedReposScope("")
+	assert.False(t, ok)
+}

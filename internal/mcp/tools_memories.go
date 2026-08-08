@@ -303,11 +303,13 @@ func (s *Server) handleQueryMemories(ctx context.Context, req mcp.CallToolReques
 		// construction, so the filter would silently drop them.
 		perStoreFilter := filter
 		if store != s.globalMemories {
-			if workspaceID, _, bound := s.sessionScope(ctx); bound {
+			if workspaceID, workspaceIn, bound := s.sessionSideStoreScope(ctx); bound {
 				perStoreFilter.WorkspaceID = workspaceID
+				perStoreFilter.WorkspaceIn = workspaceIn
 			}
 		} else {
 			perStoreFilter.WorkspaceID = ""
+			perStoreFilter.WorkspaceIn = nil
 		}
 		for _, m := range store.Query(perStoreFilter) {
 			row := memoryEntryToWire(m)
@@ -357,8 +359,10 @@ func (s *Server) handleSurfaceMemories(ctx context.Context, req mcp.CallToolRequ
 	// entries don't carry a WorkspaceID, so leaving the opts default
 	// is correct.
 	if store != s.globalMemories {
-		if workspaceID, projectID, bound := s.sessionScope(ctx); bound {
+		if _, projectID, bound := s.sessionScope(ctx); bound {
+			workspaceID, workspaceIn, _ := s.sessionSideStoreScope(ctx)
 			opts.WorkspaceID = workspaceID
+			opts.WorkspaceIn = workspaceIn
 			opts.ProjectID = projectID
 		}
 	}
@@ -484,10 +488,7 @@ func (s *Server) handleCheckOnboardingPerformed(ctx context.Context, req mcp.Cal
 	minPerKind := max(req.GetInt("min_per_kind", 1), 1)
 	minTotal := max(req.GetInt("min_total", 0), 0)
 
-	workspaceID := ""
-	if id, _, bound := s.sessionScope(ctx); bound {
-		workspaceID = id
-	}
+	workspaceID, workspaceIn, _ := s.sessionSideStoreScope(ctx)
 
 	// One Query per kind. The store is in-memory so this is cheap;
 	// the readability win over a single Query+group-by is worth
@@ -498,6 +499,7 @@ func (s *Server) handleCheckOnboardingPerformed(ctx context.Context, req mcp.Cal
 		entries := s.memories.Query(MemoryQueryFilter{
 			Kind:        k,
 			WorkspaceID: workspaceID,
+			WorkspaceIn: workspaceIn,
 		})
 		countsByKind[k] = len(entries)
 		if len(entries) < minPerKind {
@@ -506,7 +508,7 @@ func (s *Server) handleCheckOnboardingPerformed(ctx context.Context, req mcp.Cal
 	}
 
 	// total counts every workspace-scoped memory regardless of kind.
-	total := len(s.memories.Query(MemoryQueryFilter{WorkspaceID: workspaceID}))
+	total := len(s.memories.Query(MemoryQueryFilter{WorkspaceID: workspaceID, WorkspaceIn: workspaceIn}))
 
 	performed := len(missing) == 0 && total >= minTotal
 	return s.respondJSONOrTOON(ctx, req, map[string]any{

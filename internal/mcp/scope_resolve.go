@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -95,25 +97,56 @@ func (s *Server) resolveBoundSessionScope(ctx context.Context, sessWS, sessProj,
 		resolved.Applied = "project:" + project
 	}
 
-	// A `workspace` arg may only name the session's own workspace. Any
-	// other value is a cross-workspace escape attempt -- reject it
-	// outright rather than silently honouring the boundary and
-	// returning a confusing empty result.
+	// ceiling is non-nil only for a session bound to the repos its cwd
+	// CONTAINS: that shape has no single workspace slug, so the repo set
+	// is the boundary and every branch that would otherwise leave
+	// RepoAllow nil must carry it instead. Nil for every other shape,
+	// where the slug in resolved.WorkspaceID is the whole boundary and
+	// nil keeps today's behaviour byte-for-byte.
+	ceiling := s.sessionRepoCeiling(ctx)
+
+	// A `workspace` arg may only name a workspace the session is already
+	// inside. Any other value is a cross-workspace escape attempt --
+	// reject it outright rather than silently honouring the boundary and
+	// returning a confusing empty result. A contained-repo session spans
+	// several, so it accepts any of them and narrows to that one.
 	if workspaceArg != "" && workspaceArg != sessWS {
-		return ResolvedScope{}, fmt.Errorf(
-			"workspace %q is outside the active workspace %q; cross-workspace queries are not permitted",
-			workspaceArg, sessWS)
+		spanned := s.sessionScopeWorkspaces(ctx)
+		if !spanned[workspaceArg] {
+			return ResolvedScope{}, fmt.Errorf(
+				"workspace %q is outside the active workspace %s; cross-workspace queries are not permitted",
+				workspaceArg, describeSessionWorkspaces(sessWS, spanned))
+		}
+		// Narrow to the named workspace's slice of the ceiling. The
+		// intersection keeps containment authoritative: a repo declaring
+		// this slug from outside the session's cwd stays invisible.
+		narrowed := intersectRepoSets(s.multiIndexer.ReposInWorkspace(workspaceArg), ceiling)
+		if len(narrowed) == 0 {
+			return ResolvedScope{}, fmt.Errorf(
+				"workspace %q names no repository inside this session", workspaceArg)
+		}
+		resolved.WorkspaceID = workspaceArg
+		resolved.ProjectID = project
+		resolved.RepoAllow = narrowed
+		resolved.Applied = "workspace:" + workspaceArg
+		if project == "" && repo == "" && ref == "" && scopeRepos == nil {
+			return resolved, nil
+		}
+		ceiling = narrowed
 	}
-	if workspaceArg != "" && project == "" && repo == "" && ref == "" && scopeRepos == nil {
+	if workspaceArg != "" && workspaceArg == sessWS && project == "" && repo == "" && ref == "" && scopeRepos == nil {
 		resolved.ProjectID = ""
-		resolved.RepoAllow = nil
+		resolved.RepoAllow = ceiling
 		resolved.Applied = "workspace"
 		return resolved, nil
 	}
 
-	wsRepos := map[string]bool{}
-	if s.multiIndexer != nil {
-		wsRepos = s.multiIndexer.ReposInWorkspace(sessWS)
+	wsRepos := ceiling
+	if wsRepos == nil {
+		wsRepos = map[string]bool{}
+		if s.multiIndexer != nil {
+			wsRepos = s.multiIndexer.ReposInWorkspace(sessWS)
+		}
 	}
 
 	if !explicitNarrowing {
@@ -134,8 +167,8 @@ func (s *Server) resolveBoundSessionScope(ctx context.Context, sessWS, sessProj,
 		intersected := intersectRepoSets(scopeRepos, wsRepos)
 		if len(intersected) == 0 {
 			return ResolvedScope{}, fmt.Errorf(
-				"saved scope %q resolves to nothing inside the active workspace %q",
-				scopeArg, sessWS)
+				"saved scope %q resolves to nothing inside the active workspace %s",
+				scopeArg, describeSessionWorkspaces(sessWS, s.sessionScopeWorkspaces(ctx)))
 		}
 		resolved.ProjectID = ""
 		resolved.RepoAllow = intersected
@@ -145,7 +178,7 @@ func (s *Server) resolveBoundSessionScope(ctx context.Context, sessWS, sessProj,
 
 	if repo == "*" && project == "" && ref == "" {
 		resolved.ProjectID = ""
-		resolved.RepoAllow = nil
+		resolved.RepoAllow = ceiling
 		resolved.Applied = "workspace"
 		return resolved, nil
 	}
@@ -161,15 +194,15 @@ func (s *Server) resolveBoundSessionScope(ctx context.Context, sessWS, sessProj,
 	}
 	if narrowed == nil {
 		resolved.ProjectID = project
-		resolved.RepoAllow = nil
-		resolved.Applied = appliedForExplicit(project, repo, ref, nil)
+		resolved.RepoAllow = ceiling
+		resolved.Applied = appliedForExplicit(project, repo, ref, ceiling)
 		return resolved, nil
 	}
 	intersected := intersectRepoSets(narrowed, wsRepos)
 	if len(intersected) == 0 {
 		return ResolvedScope{}, fmt.Errorf(
-			"repo/project/ref filter resolves to nothing inside the active workspace %q; cross-workspace queries are not permitted",
-			sessWS)
+			"repo/project/ref filter resolves to nothing inside the active workspace %s; cross-workspace queries are not permitted",
+			describeSessionWorkspaces(sessWS, s.sessionScopeWorkspaces(ctx)))
 	}
 	resolved.ProjectID = ""
 	if project != "" {
@@ -240,18 +273,53 @@ func (s *Server) scopeIntentDefaultsEnabled() bool {
 
 func (s *Server) applyIntentDefault(ctx context.Context, resolved ResolvedScope, intent ToolIntent) ResolvedScope {
 	resolved.ProjectID = ""
-	resolved.RepoAllow = nil
+	// The session repo ceiling is the floor of every intent default, not
+	// an optional extra: for a session bound to the repos its cwd
+	// contains, resolved.WorkspaceID is empty, so leaving RepoAllow nil
+	// here would make every reach / analyze call a full-graph pass.
+	ceiling := s.sessionRepoCeiling(ctx)
+	resolved.RepoAllow = ceiling
 	resolved.Applied = "workspace"
+	if len(ceiling) > 0 {
+		resolved.Applied = appliedForRepoSet(ceiling)
+	}
 	if intent != IntentLocate {
 		return resolved
 	}
 	repo, _ := s.sessionLocality(ctx)
-	if repo == "" {
+	if repo == "" || (ceiling != nil && !ceiling[repo]) {
 		return resolved
 	}
 	resolved.RepoAllow = map[string]bool{repo: true}
 	resolved.Applied = "repo:" + repo
 	return resolved
+}
+
+// appliedForRepoSet renders a repo allow-set for the `_meta.scope_applied`
+// provenance line: the repo name when it is a single repo, a count
+// otherwise. Display only — it carries no enforcement.
+func appliedForRepoSet(repos map[string]bool) string {
+	if len(repos) == 1 {
+		for p := range repos {
+			return "repo:" + p
+		}
+	}
+	return fmt.Sprintf("repos:%d", len(repos))
+}
+
+// describeSessionWorkspaces renders a session's workspace boundary for an
+// error message. A session bound to the repos its cwd contains has no
+// single slug, so quoting the empty sessWS would read as `workspace ""`.
+func describeSessionWorkspaces(sessWS string, spanned map[string]bool) string {
+	if sessWS != "" || len(spanned) == 0 {
+		return strconv.Quote(sessWS)
+	}
+	names := make([]string, 0, len(spanned))
+	for w := range spanned {
+		names = append(names, strconv.Quote(w))
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 func appliedProjectOrWorkspace(project string) string {
@@ -371,6 +439,12 @@ func (s *Server) sessionWorkspaceRepoSet(ctx context.Context) (map[string]bool, 
 	sessWS, _, bound := s.sessionScope(ctx)
 	if !bound || s.multiIndexer == nil {
 		return nil, false
+	}
+	// A session bound to the repos its cwd contains carries the ceiling
+	// directly: its workspace slug is empty, and ReposInWorkspace("") is
+	// the empty set — which every clamp below reads as "nothing to clamp".
+	if ceiling := s.sessionRepoCeiling(ctx); len(ceiling) > 0 {
+		return ceiling, true
 	}
 	return s.multiIndexer.ReposInWorkspace(sessWS), true
 }

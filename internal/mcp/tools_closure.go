@@ -116,6 +116,7 @@ func (s *Server) handleContextClosure(ctx context.Context, req mcp.CallToolReque
 		MaxNodes:    req.GetInt("max_nodes", 0),
 		WorkspaceID: resolved.WorkspaceID,
 		ProjectID:   resolved.ProjectID,
+		RepoAllow:   resolved.RepoAllow,
 	})
 
 	// Apply the repo filter (defence in depth alongside the scope the
@@ -266,6 +267,12 @@ func orderClosureMembers(members []query.ClosureNode, proximity map[string]float
 
 // filterClosureNodes drops closure members outside the resolved repo
 // filter. A nil/empty allow-set passes everything (no filter active).
+//
+// Admission routes through repoNarrowAdmits — the single definition of
+// what a repo narrow does to a node carrying no prefix — rather than
+// indexing the allow-set directly. A direct index rejects the
+// unattributed nodes every other repo-scoping predicate admits, which
+// turns a narrow into an emptying wherever prefixes are absent.
 func filterClosureNodes(nodes []query.ClosureNode, allowed map[string]bool) []query.ClosureNode {
 	if len(allowed) == 0 {
 		return nodes
@@ -275,7 +282,7 @@ func filterClosureNodes(nodes []query.ClosureNode, allowed map[string]bool) []qu
 		if m.Node == nil {
 			continue
 		}
-		if allowed[m.Node.RepoPrefix] {
+		if repoNarrowAdmits(allowed, m.Node.RepoPrefix) {
 			kept = append(kept, m)
 		}
 	}
