@@ -1710,6 +1710,23 @@ func (a *applier) claimable(e *graph.Edge) bool {
 	if isStubTarget(e.To) {
 		return true
 	}
+	// A member-call bind that never got an Origin stamp came from the
+	// resolver's name-locality tiers (the caller-receiver and locality
+	// fallbacks stamp none) — name evidence no matter its confidence.
+	// Without this, the DefaultOriginFor backfill grades a 0.9 guess at
+	// the AST ceiling and blocks the retarget: the facade shape (a
+	// service wrapping a same-named repository method) stays bound to
+	// the calling method itself forever. Explicitly stamped tiers, DI
+	// binds (resolution marker), and provider edges (semantic_source)
+	// keep their rank.
+	if e.Origin == "" && e.Meta != nil {
+		mc, _ := e.Meta["member_call"].(bool)
+		_, hasResolution := e.Meta["resolution"]
+		_, hasSemantic := e.Meta["semantic_source"]
+		if mc && !hasResolution && !hasSemantic {
+			return true
+		}
+	}
 	return graph.OriginRank(effectiveOrigin(e)) < graph.OriginRank(graph.OriginASTResolved)
 }
 
