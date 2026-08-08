@@ -41,6 +41,40 @@ process execution — are the security boundary, not the agent's good behavior.
   resolved before the check so a link cannot be used to escape a root.
 - Gortex does not require, and does not request, access to files outside the
   repositories you index.
+- The confinement boundary is the **union of every tracked repository root**,
+  not the workspace of the session making the call. A session working in one
+  tracked repository can read and write files in another tracked repository by
+  absolute path. Workspace and project scoping narrow *graph queries*; they are
+  a relevance and context boundary, not a filesystem one. Do not track a
+  repository you would not let every agent session on this machine read and
+  modify.
+- Because the tracked-root set defines that boundary, the tools that extend it
+  (`track_repository` / `workspace_admin(operation:"track")`) are part of the
+  boundary. Tracking a new root widens file access for every tool and persists
+  to your global config; the `force` option, which would allow tracking `/` or
+  your home directory, is refused for agent sessions and available only from
+  the CLI you run yourself.
+
+### The daemon socket is the trust boundary
+
+The daemon runs as **you**, never with elevated privileges, and its unix socket
+is created `0600` inside a `0700` directory. It performs no per-connection
+authorization beyond those filesystem permissions: any process that can open
+the socket has the daemon's full authority over every tracked repository —
+reads, writes, and the control surface (track / untrack / shutdown).
+
+This means Gortex never grants access to a directory you could not already read
+yourself. It also means a second local account cannot reach your daemon. What it
+does *not* mean is that separate sessions are isolated from one another; they are
+not, by design.
+
+Optional HTTP surfaces (`gortex daemon start --http-addr`, `gortex mcp
+--server`, `gortex eval-server`) change this: a loopback TCP port is reachable
+by **every local process and by any page the user's browser loads**, which the
+unix socket's permissions do not cover. `/mcp` therefore refuses cross-origin
+browser requests unless you name the origin with `--http-allowed-origin`, and a
+non-loopback bind requires an auth token. Prefer the unix socket unless you
+specifically need HTTP.
 
 ### Network access
 
