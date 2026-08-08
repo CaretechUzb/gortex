@@ -2419,12 +2419,13 @@ func (s *Store) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
 // queryEdges helper that takes a *sql.Stmt; this one takes a raw
 // SQL string so the predicate iterators can pass inline queries.
 //
-// Statement-level and cursor-level failures go through panicOnFatal: a
-// teardown-race read still degrades to what was materialised, but a real
-// storage failure is raised instead of being handed back as an empty or short
-// slice the caller cannot tell from a genuinely small result. A single row
-// that will not decode stays non-fatal and is skipped — one unreadable row
-// must not cost the caller the rest of the lookup.
+// Statement-level, row-level, and cursor-level failures all go through
+// panicOnFatal: a teardown-race read still degrades to what was materialised,
+// but a real storage failure is raised instead of being handed back as an
+// empty or short slice the caller cannot tell from a genuinely small result.
+// A row that will not decode ends the scan for the same reason a driver error
+// does — skipping it hands back a result that is short by exactly the rows
+// that were corrupt, which is the one failure a caller cannot detect.
 func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
@@ -2435,7 +2436,11 @@ func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 	var out []*graph.Edge
 	for rows.Next() {
 		e, err := scanEdgeCursor(rows)
-		if err != nil || e == nil {
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		if e == nil {
 			continue
 		}
 		out = append(out, e)
@@ -2458,7 +2463,11 @@ func (s *Store) queryNodesSQL(q string, args ...any) []*graph.Node {
 	var out []*graph.Node
 	for rows.Next() {
 		n, err := scanNodeCursor(rows)
-		if err != nil || n == nil {
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		if n == nil {
 			continue
 		}
 		out = append(out, n)

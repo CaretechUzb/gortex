@@ -119,14 +119,11 @@ func TestGetNodesByQualNamesFailsClosedOnDecodeQueryAndClosedStoreErrors(t *test
 		t.Fatal(err)
 	}
 
-	got := store.GetNodesByQualNames([]string{"bad.qual", "good.qual"})
-	good := got["good.qual"]
-	if len(got) != 1 || len(good) != 1 || good[0] == nil || good[0].ID != "node::good" {
-		t.Fatalf("decode failure should skip only the corrupt row, got %#v", got)
-	}
-	if got["bad.qual"] != nil {
-		t.Fatalf("corrupt row unexpectedly survived strict node decoding: %#v", got["bad.qual"])
-	}
+	// A row that will not decode is a storage failure, not a row to step
+	// over. Skipping it returns a map that is short by exactly the corrupt
+	// entries, and a caller reading "no such qualified name" cannot tell that
+	// from a genuine miss — the one outcome this lookup must never produce.
+	assertQualNameLookupRaises(t, store, "bad.qual")
 
 	// INDEXED BY is deliberate: losing the intended index must fail closed
 	// instead of silently degrading into a full nodes-table scan. A missing
@@ -154,10 +151,10 @@ func assertQualNameLookupRaises(t *testing.T, store *Store, qualName string) {
 	func() {
 		defer func() { raised = recover() }()
 		got := store.GetNodesByQualNames([]string{qualName})
-		t.Fatalf("lookup without mandatory index returned %#v, want a surfaced error", got)
+		t.Fatalf("degraded lookup returned %#v, want a surfaced error", got)
 	}()
 	if raised == nil {
-		t.Fatal("lookup without mandatory index did not surface an error")
+		t.Fatal("degraded lookup did not surface an error")
 	}
 }
 
