@@ -589,6 +589,10 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 	gortexmcp.Version = cfg.Version
 	srv := gortexmcp.NewServer(eng, g, idx, nil, logger, conf.Guards.Rules, multiOpts...)
+	// Appended after backendCleanup so LIFO teardown drains the server's
+	// detached store-writing goroutines (analysis-generation prune) before
+	// the backend store closes underneath them.
+	s.cleanup = append(s.cleanup, srv.DrainBackground)
 	srv.SetArchitecture(conf.Architecture)
 	srv.SetEventRules(conf.Events.Rules)
 	srv.SetArtifacts(conf.Artifacts)

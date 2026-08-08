@@ -40,6 +40,11 @@ func TestRunAnalysis_FeedsBundleFingerprintsToSQLiteBackend(t *testing.T) {
 
 	eng := query.NewEngine(s)
 	srv := NewServer(eng, s, nil, nil, zap.NewNop(), nil)
+	// Registered after the store's Close cleanup so it runs first: the
+	// analysis-generation prune RunAnalysis spawns must finish before the
+	// store closes and the TempDir is removed, or its WAL commit recreates
+	// files under the directory mid-RemoveAll.
+	t.Cleanup(srv.DrainBackground)
 
 	// RunAnalysis must reach backendStore() == the sqlite store and feed
 	// it fingerprints. After it, a query populates the cache; a graph
