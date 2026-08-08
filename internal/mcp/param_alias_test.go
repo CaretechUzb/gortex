@@ -161,3 +161,41 @@ func TestReconcileToolParams_PreservesFacadeEnvelope(t *testing.T) {
 		require.Lenf(t, args, 7, "%s lost an envelope container", tool)
 	}
 }
+
+// TestReconcileArgKeys_NeverInvertsMeaning pins the guard against the typo
+// matcher's worst failure: "include" and "exclude" are two substitutions
+// apart, the same budget a real typo gets, so a caller's filter was accepted
+// as its own negation. The handler then returns a well-formed result set that
+// is close to the complement of the requested one, with nothing in the
+// response saying a key was rewritten.
+func TestReconcileArgKeys_NeverInvertsMeaning(t *testing.T) {
+	cases := []struct {
+		name      string
+		real      toolParams
+		key       string
+		mustNotBe string
+	}{
+		{"include vs exclude", toolParams{"exclude_tests": "boolean", "id": "string"}, "include_tests", "exclude_tests"},
+		{"exclude vs include", toolParams{"include_speculative": "boolean", "id": "string"}, "exclude_speculative", "include_speculative"},
+		{"superseded memories", toolParams{"include_superseded": "boolean"}, "exclude_superseded", "include_superseded"},
+		{"max vs min", toolParams{"min_score": "number"}, "max_score", "min_score"},
+		{"min vs max", toolParams{"max_tier": "number"}, "min_tier", "max_tier"},
+		{"enable vs disable", toolParams{"disable_cache": "boolean"}, "enable_cache", "disable_cache"},
+		{"from vs to", toolParams{"to_id": "string"}, "from_id", "to_id"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := map[string]any{tc.key: true}
+			require.Empty(t, reconcileArgKeys(args, tc.real),
+				"%q must not be reconciled into its own negation", tc.key)
+			require.NotContains(t, args, tc.mustNotBe)
+			require.Contains(t, args, tc.key, "the caller's key stays as sent")
+		})
+	}
+	t.Run("a real typo of the same polarity still resolves", func(t *testing.T) {
+		real := toolParams{"include_tests": "boolean"}
+		args := map[string]any{"include_test": true}
+		require.NotEmpty(t, reconcileArgKeys(args, real))
+		require.Equal(t, true, args["include_tests"])
+	})
+}

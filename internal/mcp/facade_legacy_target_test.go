@@ -210,3 +210,113 @@ func TestAnalyzeAdvertisedTargetMatchesAcceptedTarget(t *testing.T) {
 	require.Greater(t, checked, 20, "the analyze catalogue must be exercised, not skipped")
 	require.GreaterOrEqual(t, advertised, 2, "impact and def_use both publish a target")
 }
+
+// TestInertSelectorsFailClosedAcrossFacades extends the analyze contract to the
+// rest of the compact surface: a selector the selected operation cannot consume
+// is refused, not accepted and dropped. Each case below was verified to reach a
+// legacy handler that has no field for the value.
+func TestInertSelectorsFailClosedAcrossFacades(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	sessionID := "inert_selectors"
+	ctx := WithSessionID(context.Background(), sessionID)
+	call := facadeFrameCaller(t, srv, ctx)
+	srv.NoteSessionToolPolicy(sessionID, FacadeSurfaceVersion, "hide")
+	helperID := fixtureSymbolID(t, srv, ctx, "helper")
+
+	cases := []struct {
+		name      string
+		tool      string
+		arguments map[string]any
+	}{
+		{
+			// analyze kinds that dispatch to a different legacy tool were the
+			// blind spot of the first fix: find_clones has no id field, so the
+			// selector was lowered into nothing.
+			name: "analyze_kind_on_another_legacy_tool",
+			tool: "analyze",
+			arguments: map[string]any{
+				"kind": "clones", "target": map[string]any{"symbol": helperID},
+			},
+		},
+		{
+			// `to` is advertised on every relations operation but only the
+			// trace flow/path/taint operations lower it into a sink field.
+			name: "relations_destination_selector",
+			tool: "relations",
+			arguments: map[string]any{
+				"operation": "usages",
+				"target":    map[string]any{"symbol": helperID},
+				"to":        map[string]any{"symbol": helperID},
+			},
+		},
+		{
+			name: "change_detect_target",
+			tool: "change",
+			arguments: map[string]any{
+				"operation": "detect", "target": map[string]any{"file": "main.go"},
+			},
+		},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.arguments["output"] = map[string]any{"format": "json"}
+			result := call(300+i, tc.tool, tc.arguments)
+			require.True(t, result.IsError,
+				"%s must refuse a selector it cannot consume, got: %s", tc.name, toolResultText(result))
+			require.Contains(t, toolResultText(result), "unsupported_target")
+		})
+	}
+
+	// The consuming operations still accept their selectors.
+	for i, ok := range []map[string]any{
+		{"operation": "usages", "target": map[string]any{"symbol": helperID}},
+		{"kind": "impact", "target": map[string]any{"symbol": helperID}},
+	} {
+		tool := "relations"
+		if _, isAnalyze := ok["kind"]; isAnalyze {
+			tool = "analyze"
+		}
+		ok["output"] = map[string]any{"format": "json"}
+		result := call(320+i, tool, ok)
+		require.Falsef(t, result.IsError, "a consumed selector must still work: %s", toolResultText(result))
+	}
+}
+
+// TestAnalyzeImpactAcceptsSymbolBatchSelector pins the encoding seam: the
+// facade lowers target:{symbols} to a JSON array, and a reader that only
+// comma-splits turns that into ids matching nothing — an empty ranking with no
+// error, which is the same fail-open in a different disguise.
+func TestAnalyzeImpactAcceptsSymbolBatchSelector(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	ctx := WithSessionID(context.Background(), "impact_symbol_batch")
+	call := facadeFrameCaller(t, srv, ctx)
+	helperID := fixtureSymbolID(t, srv, ctx, "helper")
+
+	result := call(2, "analyze", map[string]any{
+		"kind":   "impact",
+		"target": map[string]any{"symbols": []string{helperID}},
+		"output": map[string]any{"format": "json"},
+	})
+	require.False(t, result.IsError, toolResultText(result))
+	payload := unmarshalResult(t, result)
+	symbols, _ := payload["symbols"].([]any)
+	require.NotEmpty(t, symbols, "a symbol batch selector must score its symbols, not silently match nothing")
+	require.Contains(t, toolResultText(result), helperID)
+}
+
+func TestSplitSymbolIDFieldAcceptsEveryEncoding(t *testing.T) {
+	want := []string{"a.go::A", "b.go::B"}
+	for name, raw := range map[string]any{
+		"json array":        `["a.go::A","b.go::B"]`,
+		"comma separated":   "a.go::A,b.go::B",
+		"spaced comma list": " a.go::A , b.go::B ",
+		"string slice":      []string{"a.go::A", "b.go::B"},
+		"any slice":         []any{"a.go::A", "b.go::B"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, want, splitSymbolIDField(raw))
+		})
+	}
+	require.Empty(t, splitSymbolIDField(""))
+	require.Empty(t, splitSymbolIDField(nil))
+}

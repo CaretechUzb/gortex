@@ -150,7 +150,11 @@ func resolveParamAlias(key string, real toolParams, args map[string]any) string 
 		if len(r) < 4 {
 			continue // too short to typo-match safely
 		}
-		if d := levenshtein(keyLower, strings.ToLower(r)); d > 0 && d <= 2 {
+		candidate := strings.ToLower(r)
+		if invertsMeaning(keyLower, candidate) {
+			continue
+		}
+		if d := levenshtein(keyLower, candidate); d > 0 && d <= 2 {
 			candidates[r] = struct{}{}
 		}
 	}
@@ -168,6 +172,53 @@ func resolveParamAlias(key string, real toolParams, args map[string]any) string 
 		return viable[0]
 	}
 	return ""
+}
+
+// opposedAffixes are the parameter-name affix pairs that negate each other.
+// Each pair is exactly two edits apart in several of its instances, which is
+// precisely the distance the typo matcher accepts.
+var opposedAffixes = [][2]string{
+	{"include_", "exclude_"},
+	{"enable_", "disable_"},
+	{"with_", "without_"},
+	{"allow_", "deny_"},
+	{"min_", "max_"},
+	{"first_", "last_"},
+	{"before_", "after_"},
+	{"start_", "end_"},
+	{"source_", "sink_"},
+	{"from_", "to_"},
+}
+
+// invertsMeaning reports whether two parameter names are opposites sharing a
+// stem — include_tests / exclude_tests, min_score / max_score — rather than one
+// being a typo of the other. The edit-distance matcher cannot tell the
+// difference: "include" and "exclude" differ by two substitutions, the same
+// budget a genuine typo gets. Accepting the match hands the handler the exact
+// negation of what the caller asked for, and the response looks ordinary — a
+// filtered-out set reads exactly like an unfiltered one. A caller who really
+// meant the opposite parameter can always spell it; a caller who meant what
+// they typed must never be silently inverted.
+func invertsMeaning(key, candidate string) bool {
+	if key == candidate {
+		return false
+	}
+	for _, pair := range opposedAffixes {
+		for _, ordered := range [][2]string{{pair[0], pair[1]}, {pair[1], pair[0]}} {
+			one, other := ordered[0], ordered[1]
+			if strings.HasPrefix(key, one) && strings.HasPrefix(candidate, other) &&
+				strings.TrimPrefix(key, one) == strings.TrimPrefix(candidate, other) {
+				return true
+			}
+			if strings.HasSuffix(key, "_"+strings.TrimSuffix(one, "_")) &&
+				strings.HasSuffix(candidate, "_"+strings.TrimSuffix(other, "_")) &&
+				strings.TrimSuffix(key, "_"+strings.TrimSuffix(one, "_")) ==
+					strings.TrimSuffix(candidate, "_"+strings.TrimSuffix(other, "_")) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // levenshtein computes the edit distance between two short strings.

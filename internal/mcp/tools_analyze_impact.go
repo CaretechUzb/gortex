@@ -321,7 +321,7 @@ func (s *Server) resolveImpactTarget(ctx context.Context, symbol, file string) (
 func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	pathPrefix := strings.TrimSpace(stringArg(args, "path_prefix"))
-	idFilter := splitIDSet(stringArg(args, "ids"))
+	idFilter := splitIDSet(args["ids"])
 	limit := intArg(args, "limit", 100)
 	minScore := -1.0
 	if v, ok := args["min_score"].(float64); ok {
@@ -685,14 +685,13 @@ func cyclomaticOf(n *graph.Node) int {
 	return 1
 }
 
-// splitIDSet parses a comma-separated symbol-ID list into a set.
-// Unlike parseCSVSet it preserves case — symbol IDs are case-sensitive.
-func splitIDSet(in string) map[string]struct{} {
+// splitIDSet parses a symbol-ID list into a set, accepting every encoding the
+// public surface produces (see splitSymbolIDField). Unlike parseCSVSet it
+// preserves case — symbol IDs are case-sensitive.
+func splitIDSet(in any) map[string]struct{} {
 	out := map[string]struct{}{}
-	for _, part := range strings.Split(in, ",") {
-		if p := strings.TrimSpace(part); p != "" {
-			out[p] = struct{}{}
-		}
+	for _, id := range splitSymbolIDField(in) {
+		out[id] = struct{}{}
 	}
 	return out
 }
