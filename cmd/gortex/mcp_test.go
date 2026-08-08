@@ -62,14 +62,7 @@ func TestOneshotEmbeddedStorePathIsPrivateTemp(t *testing.T) {
 // directory a killed process left behind is removed once it ages past the
 // TTL, and a fresh one (the store a concurrent server is using) is not.
 func TestReapStaleEmbeddedStores(t *testing.T) {
-	tmp := t.TempDir()
-	// os.TempDir reads TMPDIR on unix and TMP/TEMP on Windows.
-	t.Setenv("TMPDIR", tmp)
-	t.Setenv("TMP", tmp)
-	t.Setenv("TEMP", tmp)
-	if os.TempDir() != tmp {
-		t.Skipf("temp root not redirectable on this platform: %q", os.TempDir())
-	}
+	tmp := redirectTempRoot(t)
 
 	stale := filepath.Join(tmp, "gortex-mcp-store-stale")
 	fresh := filepath.Join(tmp, "gortex-mcp-store-fresh")
@@ -79,12 +72,8 @@ func TestReapStaleEmbeddedStores(t *testing.T) {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
 	}
-	aged := time.Now().Add(-staleEmbeddedStoreTTL - time.Hour)
-	for _, dir := range []string{stale, unrelated} {
-		if err := os.Chtimes(dir, aged, aged); err != nil {
-			t.Fatalf("chtimes %s: %v", dir, err)
-		}
-	}
+	ageDirBeyondTTL(t, stale)
+	ageDirBeyondTTL(t, unrelated)
 
 	reapStaleEmbeddedStores(zap.NewNop())
 
@@ -96,5 +85,81 @@ func TestReapStaleEmbeddedStores(t *testing.T) {
 	}
 	if _, err := os.Stat(unrelated); err != nil {
 		t.Errorf("reaper touched a directory that is not an embedded store, stat err = %v", err)
+	}
+}
+
+// TestReapStaleEmbeddedStoresSpareLockedStore is the liveness contract. A
+// `gortex mcp` session that has been serving for longer than the TTL still
+// owns its store: sqlite writes land in files INSIDE the directory and never
+// bump the directory's own mtime, so age alone reports a busy server's store
+// as abandoned and a newer launch deletes the database out from under it.
+// The advisory lock the live store holds is the real proof of occupancy, and
+// only an aged directory whose lock is free may be removed.
+func TestReapStaleEmbeddedStoresSpareLockedStore(t *testing.T) {
+	tmp := redirectTempRoot(t)
+
+	// The live store: allocated exactly as a running embedded server
+	// allocates it, so it holds whatever lock the production path takes.
+	livePath, releaseLive, err := newEmbeddedStorePath()
+	if err != nil {
+		t.Fatalf("newEmbeddedStorePath: %v", err)
+	}
+	defer releaseLive()
+	if err := os.WriteFile(livePath, []byte("live sqlite bytes"), 0o600); err != nil {
+		t.Fatalf("write live store file: %v", err)
+	}
+	liveDir := filepath.Dir(livePath)
+	// The directory looks ancient — the whole point is that its age says
+	// nothing about whether the process using it is alive.
+	ageDirBeyondTTL(t, liveDir)
+
+	// The abandoned store: same shape, same age, but its owner is gone, so
+	// nothing holds the lock file it left behind.
+	abandonedDir := filepath.Join(tmp, "gortex-mcp-store-abandoned")
+	if err := os.MkdirAll(abandonedDir, 0o755); err != nil {
+		t.Fatalf("mkdir abandoned dir: %v", err)
+	}
+	for _, name := range []string{"embedded.sqlite", embeddedStoreLockName} {
+		if err := os.WriteFile(filepath.Join(abandonedDir, name), []byte("orphaned"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	ageDirBeyondTTL(t, abandonedDir)
+
+	reapStaleEmbeddedStores(zap.NewNop())
+
+	if _, err := os.Stat(liveDir); err != nil {
+		t.Errorf("the reaper deleted a live embedded store dir, stat err = %v", err)
+	}
+	if _, err := os.Stat(livePath); err != nil {
+		t.Errorf("the reaper deleted a live embedded store file, stat err = %v", err)
+	}
+	if _, err := os.Stat(abandonedDir); !os.IsNotExist(err) {
+		t.Errorf("an aged unlocked store dir survived the reap, stat err = %v", err)
+	}
+}
+
+// redirectTempRoot points os.TempDir at a per-test directory so the reaper
+// only ever sees this test's fixtures, and skips when the platform will not
+// honour the redirect.
+func redirectTempRoot(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	// os.TempDir reads TMPDIR on unix and TMP/TEMP on Windows.
+	t.Setenv("TMPDIR", tmp)
+	t.Setenv("TMP", tmp)
+	t.Setenv("TEMP", tmp)
+	if os.TempDir() != tmp {
+		t.Skipf("temp root not redirectable on this platform: %q", os.TempDir())
+	}
+	return tmp
+}
+
+// ageDirBeyondTTL backdates dir's mtime past the reaper's age pre-filter.
+func ageDirBeyondTTL(t *testing.T, dir string) {
+	t.Helper()
+	aged := time.Now().Add(-staleEmbeddedStoreTTL - time.Hour)
+	if err := os.Chtimes(dir, aged, aged); err != nil {
+		t.Fatalf("chtimes %s: %v", dir, err)
 	}
 }

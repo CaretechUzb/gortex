@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
@@ -122,17 +123,29 @@ func warnLegacyMCPFlags(cmd *cobra.Command) {
 // throwaway sqlite store lives in. Shared by the allocator and the reaper.
 const embeddedStoreDirPattern = "gortex-mcp-store-*"
 
-// staleEmbeddedStoreTTL is how long an orphaned embedded-store directory is
-// left alone before a later launch reaps it. Long enough that no plausibly
-// live one-shot server is touched; short enough that the debris does not
-// accumulate.
+// embeddedStoreLockName is the advisory lock file every live embedded store
+// holds for its process lifetime, inside its own store directory. It is the
+// reaper's liveness proof: the directory mtime is not one, because sqlite
+// writes update files INSIDE the directory without touching the directory's
+// own mtime, so a session that has been serving for days looks as old as its
+// first second.
+const embeddedStoreLockName = "store.lock"
+
+// staleEmbeddedStoreTTL is a cheap pre-filter in front of the lock probe, not
+// the liveness test. It keeps a launch from opening a lock file for every
+// recent sibling directory; the lock is what decides whether a candidate is
+// actually abandoned.
 const staleEmbeddedStoreTTL = 48 * time.Hour
 
-// reapStaleEmbeddedStores removes embedded-store directories older than
-// staleEmbeddedStoreTTL. The one-shot server deletes its own directory on
-// exit, but a SIGKILL skips that and strands a store that can run to
-// gigabytes. Best effort by design: every error is a debug line, never a
-// reason to fail startup.
+// reapStaleEmbeddedStores removes abandoned embedded-store directories. The
+// one-shot server deletes its own directory on exit, but a SIGKILL skips that
+// and strands a store that can run to gigabytes.
+//
+// A candidate is removed only after this process non-blockingly acquires that
+// directory's advisory lock. A live server holds that lock until it exits (the
+// kernel drops it even on SIGKILL), so a failed acquisition means "in use" and
+// the directory is left alone however old it looks. Best effort otherwise:
+// every error is a debug line, never a reason to fail startup.
 func reapStaleEmbeddedStores(logger *zap.Logger) {
 	matches, err := filepath.Glob(filepath.Join(os.TempDir(), embeddedStoreDirPattern))
 	if err != nil {
@@ -145,7 +158,19 @@ func reapStaleEmbeddedStores(logger *zap.Logger) {
 		if statErr != nil || !info.IsDir() || info.ModTime().After(cutoff) {
 			continue
 		}
-		if rmErr := os.RemoveAll(dir); rmErr != nil {
+		lock := flock.New(filepath.Join(dir, embeddedStoreLockName))
+		locked, lockErr := lock.TryLock()
+		if lockErr != nil {
+			logger.Debug("mcp: could not probe embedded store lock", zap.String("dir", dir), zap.Error(lockErr))
+			continue
+		}
+		if !locked {
+			// Owned by a live one-shot server — nothing to reap here.
+			continue
+		}
+		rmErr := os.RemoveAll(dir)
+		_ = lock.Unlock()
+		if rmErr != nil {
 			logger.Debug("mcp: could not reap stale embedded store", zap.String("dir", dir), zap.Error(rmErr))
 			continue
 		}
@@ -155,14 +180,32 @@ func reapStaleEmbeddedStores(logger *zap.Logger) {
 
 // newEmbeddedStorePath allocates the per-process sqlite store the embedded
 // MCP server runs against, inside a fresh temp directory nothing else can
-// name. It returns the store path and a func that removes the directory;
-// the caller runs that only after the store handle is closed.
+// name, and takes the directory's advisory lock so a later launch's reaper
+// treats this store as live for as long as this process runs. It returns the
+// store path and a func that releases the lock and removes the directory; the
+// caller runs that only after the store handle is closed.
+//
+// A lock that cannot be taken is a hard failure rather than a warning: without
+// it the store is indistinguishable from abandoned debris, and a session that
+// outlives staleEmbeddedStoreTTL would have its database deleted underneath it.
 func newEmbeddedStorePath() (string, func(), error) {
 	dir, err := os.MkdirTemp("", embeddedStoreDirPattern)
 	if err != nil {
 		return "", nil, err
 	}
-	return filepath.Join(dir, "embedded.sqlite"), func() { _ = os.RemoveAll(dir) }, nil
+	lock := flock.New(filepath.Join(dir, embeddedStoreLockName))
+	locked, lockErr := lock.TryLock()
+	if lockErr != nil || !locked {
+		_ = os.RemoveAll(dir)
+		if lockErr == nil {
+			lockErr = fmt.Errorf("lock already held")
+		}
+		return "", nil, fmt.Errorf("lock embedded store dir %q: %w", dir, lockErr)
+	}
+	return filepath.Join(dir, "embedded.sqlite"), func() {
+		_ = lock.Unlock()
+		_ = os.RemoveAll(dir)
+	}, nil
 }
 
 func runMCP(cmd *cobra.Command, args []string) error {
