@@ -2117,9 +2117,17 @@ func (w *Watcher) patchGraphWithReceiptStateRawModern(
 	if err != nil {
 		return err
 	}
-	if !w.generationCurrent(path, generation) {
-		return errMutationSuperseded
-	}
+	// A newer generation can be scheduled while the reindex runs — FSEvents
+	// reports a single save as several notifications, and the wider the patch
+	// window (a loaded machine, a repository lane held by a sibling repo) the
+	// likelier one lands right here. The graph mutation above has already
+	// landed, so this pass still owes the announcement for it: returning now
+	// drops the change from Events(), from History(), and from the
+	// symbol-change callback, and the newer generation cannot make up for it
+	// because it finds the persisted receipt already matching and correctly
+	// patches nothing. Finish the announcement and report the supersession to
+	// the caller, which owns waiter attachment.
+	superseded := !w.generationCurrent(path, generation)
 	if result == nil {
 		return errors.New("watcher: exact-path reindex returned no result")
 	}
@@ -2200,6 +2208,9 @@ func (w *Watcher) patchGraphWithReceiptStateRawModern(
 			zap.String("kind", string(kind)),
 			zap.String("delta_class", classification),
 			zap.Int64("ms", ev.DurationMs))
+	}
+	if superseded {
+		return errMutationSuperseded
 	}
 	return nil
 }
