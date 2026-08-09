@@ -51,52 +51,21 @@ func (p *preparedVectorPlan) Release() {
 	p.embeddedText = 0
 }
 
-// prepareSearchIndex updates the process-local text index, then prepares the
-// vector corpus without mutating either the durable vector store or the active
-// vector backend. The caller decides when publication is safe.
+// prepareSearchIndex prepares the vector corpus without mutating either the
+// durable vector store or the active vector backend. The caller decides when
+// publication is safe.
 func (idx *Indexer) prepareSearchIndex(ctx context.Context) (*preparedVectorPlan, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	idx.lastVectorBuildErr = nil
-
-	// Install learned sub-word boundaries before populating an in-process BM25
-	// backend. Native SQLite FTS needs neither the census nor duplicate Adds.
-	search.BuildAndInstallNgramBoundaries(idx.search, idx.graph)
-	nativeText := isSymbolSearcherBackend(idx.search)
-	buildVectors := idx.embedder != nil
-	if nativeText && !buildVectors {
+	if idx.embedder == nil {
 		return nil, nil
 	}
 
 	// Content sections belong to content search, not symbol/vector search.
 	nodes := graph.RepoCodeNodes(idx.graph, idx.repoPrefix)
-	if !nativeText {
-		for _, n := range nodes {
-			if idx.shouldIndexForSearch(n) {
-				idx.search.Add(n.ID, searchIndexFields(n, idx.projectName)...)
-			}
-		}
-	}
-	if !buildVectors {
-		return nil, nil
-	}
 	return idx.prepareVectorPlan(ctx, nodes)
-}
-
-// rebuildTextSearchIndex restores only the non-persistent text channel. It is
-// used on warm startup after a durable vector corpus has been published, so a
-// paid embedding pass is not repeated merely to reconstruct BM25.
-func (idx *Indexer) rebuildTextSearchIndex() {
-	search.BuildAndInstallNgramBoundaries(idx.search, idx.graph)
-	if isSymbolSearcherBackend(idx.search) {
-		return
-	}
-	for _, n := range graph.RepoCodeNodes(idx.graph, idx.repoPrefix) {
-		if idx.shouldIndexForSearch(n) {
-			idx.search.Add(n.ID, searchIndexFields(n, idx.projectName)...)
-		}
-	}
 }
 
 func (idx *Indexer) prepareVectorPlan(ctx context.Context, nodes []*graph.Node) (*preparedVectorPlan, error) {
@@ -230,9 +199,9 @@ func (idx *Indexer) prepareVectorPlan(ctx context.Context, nodes []*graph.Node) 
 	return plan, nil
 }
 
-// prepareSearchIndexForPublication preserves the historical text-only
-// degradation policy for provider/cap/validation failures. Parent cancellation
-// is different: it aborts the index operation and must not publish anything.
+// prepareSearchIndexForPublication retains the previous vector publication on
+// provider, cap, or validation failures. Parent cancellation is different: it
+// aborts the index operation and must not publish anything.
 func (idx *Indexer) prepareSearchIndexForPublication(ctx context.Context) (*preparedVectorPlan, error) {
 	plan, err := idx.prepareSearchIndex(ctx)
 	if err == nil {
