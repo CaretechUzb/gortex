@@ -4510,7 +4510,7 @@ func (r *Resolver) buildReachabilityIndex() {
 // concrete From node when possible, otherwise leave that edge unfiltered. The
 // reachability filter is explicitly fail-open for an unknown caller path.
 func (r *Resolver) buildReachabilityIndexForPending(pending []*graph.Edge, sources map[string]*graph.Node) bool {
-	ok, _ := r.buildReachabilityIndexForPendingCached(pending, sources, nil)
+	ok, _ := r.buildReachabilityIndexForPendingCached(pending, sources, nil, nil)
 	return ok
 }
 
@@ -4531,21 +4531,28 @@ const reachabilityStableFileCap = 1 << 16
 // went. Purely observational — prepare logs it so a cold run can show whether
 // unstable caller files dominate the per-page rebuild cost.
 type reachabilityPageStats struct {
-	files    int
-	cached   int
-	missing  int
-	unstable int
-	project  time.Duration
-	place    time.Duration
-	match    time.Duration
+	files     int
+	cached    int
+	missing   int
+	unstable  int
+	adjCached int
+	project   time.Duration
+	place     time.Duration
+	match     time.Duration
 }
 
 func (r *Resolver) buildReachabilityIndexForPendingCached(
 	pending []*graph.Edge,
 	sources map[string]*graph.Node,
 	stableByFile map[string]map[string]struct{},
+	adjacency map[string][]string,
 ) (bool, reachabilityPageStats) {
 	var stats reachabilityPageStats
+	if len(adjacency) > reachabilityStableFileCap {
+		// Same overflow contract as the stable retention below: a wholesale
+		// clear beats piecemeal eviction, which would recreate per-page churn.
+		clear(adjacency)
+	}
 	callerPaths := make(map[string]struct{})
 	missingCallerSet := make(map[string]struct{})
 	for _, edge := range pending {
@@ -4619,17 +4626,40 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 	stats.files = len(filePaths)
 	stats.missing = len(missingFiles)
 
-	importsByFile := make(map[string][]string)
-	projectStart := time.Now()
-	if len(missingFiles) > 0 {
-		if projector, ok := r.graph.(graph.ImportAdjacencyProjector); ok {
-			if projected, complete := projector.ProjectImportAdjacency(missingFiles); complete {
-				importsByFile = projected
-			} else {
-				importsByFile = r.legacyImportTargetsByFile(missingFiles)
+	importsByFile := make(map[string][]string, len(missingFiles))
+	projectFiles := missingFiles
+	if adjacency != nil {
+		projectFiles = make([]string, 0, len(missingFiles))
+		for _, filePath := range missingFiles {
+			if cached, ok := adjacency[filePath]; ok {
+				importsByFile[filePath] = cached
+				stats.adjCached++
+				continue
 			}
-		} else {
-			importsByFile = r.legacyImportTargetsByFile(missingFiles)
+			projectFiles = append(projectFiles, filePath)
+		}
+	}
+	projectStart := time.Now()
+	if len(projectFiles) > 0 {
+		var projected map[string][]string
+		complete := false
+		if projector, ok := r.graph.(graph.ImportAdjacencyProjector); ok {
+			projected, complete = projector.ProjectImportAdjacency(projectFiles)
+		}
+		if !complete {
+			// complete=false is a canonicality signal, not a cacheable
+			// answer — fallback results are never retained.
+			projected = r.legacyImportTargetsByFile(projectFiles)
+		} else if adjacency != nil {
+			// Retain raw projections for every projected file, including
+			// ones absent from the result map — known-empty is knowledge
+			// too, else importless files re-project forever.
+			for _, filePath := range projectFiles {
+				adjacency[filePath] = projected[filePath]
+			}
+		}
+		for filePath, targets := range projected {
+			importsByFile[filePath] = targets
 		}
 	}
 	stats.project = time.Since(projectStart)

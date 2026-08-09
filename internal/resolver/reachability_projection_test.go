@@ -92,7 +92,7 @@ func TestReachabilityProjectionCapClearsPathologicalCache(t *testing.T) {
 	for i := 0; i <= reachabilityStableFileCap; i++ {
 		indexes.reachabilityFiles[fmt.Sprintf("bulk/file%06d.go", i)] = map[string]struct{}{"bulk": {}}
 	}
-	if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles); !ok {
+	if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles, nil); !ok {
 		t.Fatal("reachability build failed")
 	}
 	defer r.clearReachabilityIndex()
@@ -116,7 +116,7 @@ func TestReachabilityProjectionFallsBackForMalformedProvenance(t *testing.T) {
 		From: "repo/caller.go::Caller", To: graph.UnresolvedMarker + "Work",
 		Kind: graph.EdgeCalls, FilePath: "repo/caller.go",
 	}}
-	if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, make(map[string]map[string]struct{})); !ok {
+	if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, make(map[string]map[string]struct{}), nil); !ok {
 		t.Fatal("reachability was not built through compatibility fallback")
 	}
 	defer r.clearReachabilityIndex()
@@ -154,6 +154,90 @@ func TestReachabilityProjectionRefreshInvalidatesPassCache(t *testing.T) {
 	indexes.close()
 	if indexes.reachabilityFiles != nil {
 		t.Fatal("close retained the pass-local reachability cache")
+	}
+}
+
+func TestReachabilityAdjacencyRetentionServesUnstableAcrossPages(t *testing.T) {
+	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
+	defer indexes.close()
+	// An unresolved import keeps the caller out of the stable set — before
+	// retention this file re-projected on every page it appeared on.
+	store.projected["repo/caller.go"] = []string{graph.UnresolvedMarker + "import::dep"}
+	adjacency := make(map[string][]string)
+	for page := 0; page < 3; page++ {
+		if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles, adjacency); !ok {
+			t.Fatalf("page %d build failed", page)
+		}
+		r.clearReachabilityIndex()
+	}
+	if store.projectionCalls != 1 {
+		t.Fatalf("projection calls = %d, want 1: retained adjacency must serve later pages", store.projectionCalls)
+	}
+	if len(indexes.reachabilityFiles) != 0 {
+		t.Fatal("unresolved import must still keep the file out of the stable set")
+	}
+	if _, ok := adjacency["repo/caller.go"]; !ok {
+		t.Fatal("adjacency retention missing the projected caller")
+	}
+}
+
+func TestReachabilityAdjacencyRetentionStatsCountHits(t *testing.T) {
+	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
+	defer indexes.close()
+	store.projected["repo/caller.go"] = []string{graph.UnresolvedMarker + "import::dep"}
+	adjacency := make(map[string][]string)
+	if _, stats := r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles, adjacency); stats.adjCached != 0 {
+		t.Fatalf("first page adjCached = %d, want 0", stats.adjCached)
+	}
+	r.clearReachabilityIndex()
+	_, stats := r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles, adjacency)
+	defer r.clearReachabilityIndex()
+	if stats.adjCached != 1 || stats.missing != 1 {
+		t.Fatalf("second page adjCached=%d missing=%d, want 1/1", stats.adjCached, stats.missing)
+	}
+}
+
+func TestReachabilityAdjacencyRetentionSkipsFallback(t *testing.T) {
+	// complete=false is a store-canonicality signal — legacy answers are
+	// never retained.
+	g := graph.New()
+	g.AddBatch([]*graph.Node{
+		{ID: "repo/caller.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "repo/caller.go"},
+		{ID: "dep/target.go", Kind: graph.KindFile, Name: "target.go", FilePath: "dep/target.go"},
+	}, []*graph.Edge{{
+		From: "repo/caller.go::Caller", To: "dep/target.go", Kind: graph.EdgeImports, FilePath: "",
+	}})
+	counting := &resolverBatchCountingStore{Store: g}
+	store := &scriptedImportProjectionStore{resolverBatchCountingStore: counting, complete: false}
+	r := New(store)
+	pending := []*graph.Edge{{
+		From: "repo/caller.go::Caller", To: graph.UnresolvedMarker + "Work",
+		Kind: graph.EdgeCalls, FilePath: "repo/caller.go",
+	}}
+	adjacency := make(map[string][]string)
+	if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, make(map[string]map[string]struct{}), adjacency); !ok {
+		t.Fatal("fallback build failed")
+	}
+	defer r.clearReachabilityIndex()
+	if len(adjacency) != 0 {
+		t.Fatalf("fallback results retained: %v", adjacency)
+	}
+}
+
+func TestReachabilityAdjacencyRetentionCapClearsWholesale(t *testing.T) {
+	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
+	defer indexes.close()
+	store.projected["repo/caller.go"] = []string{graph.UnresolvedMarker + "import::dep"}
+	adjacency := make(map[string][]string, reachabilityStableFileCap+2)
+	for i := 0; i <= reachabilityStableFileCap; i++ {
+		adjacency[fmt.Sprintf("bulk/file%06d.go", i)] = nil
+	}
+	if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles, adjacency); !ok {
+		t.Fatal("build failed")
+	}
+	defer r.clearReachabilityIndex()
+	if len(adjacency) > 1 {
+		t.Fatalf("cap overflow retained %d entries, want wholesale clear + this page's entry", len(adjacency))
 	}
 }
 

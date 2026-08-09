@@ -196,7 +196,7 @@ func (p *resolveAllPassIndexes) prepare(pending []*graph.Edge) map[string]*graph
 		providesElapsed = time.Since(start)
 	}
 	reachabilityStart := time.Now()
-	_, reachStats := p.resolver.buildReachabilityIndexForPendingCached(pending, sources, p.reachabilityFiles)
+	_, reachStats := p.resolver.buildReachabilityIndexForPendingCached(pending, sources, p.reachabilityFiles, nil)
 	reachabilityElapsed := time.Since(reachabilityStart)
 	p.generation = p.resolver.scratchGeneration
 	p.resolver.logger.Info("resolver: prepare page indexes",
