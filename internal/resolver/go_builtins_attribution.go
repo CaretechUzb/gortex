@@ -178,9 +178,7 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 	if len(batch) == 0 {
 		return
 	}
-	if batchWritesImportEdges(batch) {
-		r.noteImportEdgeWrite()
-	}
+	r.noteImportEdgeReindexes(batch)
 	targeter, ok := r.graph.(graph.UnresolvedEdgeTargetBatchReindexer)
 	if !ok {
 		r.graph.ReindexEdges(batch)
@@ -274,9 +272,7 @@ func (r *Resolver) attributeGoBuiltinIdentityCandidates(
 		r.graph.AddBatch(nodes, nil)
 	}
 	if len(direct) > 0 {
-		if targetBatchWritesImportEdges(direct) {
-			r.noteImportEdgeWrite()
-		}
+		r.noteImportTargetReindexes(direct)
 		targeter.ReindexUnresolvedEdgeTargets(direct)
 	}
 	return true

@@ -244,33 +244,73 @@ func TestReachabilityAdjacencyRetentionCapClearsWholesale(t *testing.T) {
 	}
 }
 
-func TestBatchWritesImportEdgesDetectsKind(t *testing.T) {
-	calls := []graph.EdgeReindex{{Edge: &graph.Edge{Kind: graph.EdgeCalls}}}
-	if batchWritesImportEdges(calls) {
-		t.Fatal("calls-only batch must not flag import writes")
+func TestNoteImportEdgeReindexesRecordsDirtyFiles(t *testing.T) {
+	r := New(graph.New())
+	r.noteImportEdgeReindexes([]graph.EdgeReindex{
+		{Edge: &graph.Edge{Kind: graph.EdgeCalls, FilePath: "a.go"}},
+		{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "b.go"}},
+		{Edge: nil},
+	})
+	if _, ok := r.importDirtyFiles["b.go"]; !ok || len(r.importDirtyFiles) != 1 {
+		t.Fatalf("dirty files = %v, want exactly b.go", r.importDirtyFiles)
 	}
-	mixed := append(calls, graph.EdgeReindex{Edge: &graph.Edge{Kind: graph.EdgeImports}})
-	if !batchWritesImportEdges(mixed) {
-		t.Fatal("batch containing an imports edge must flag")
+	if r.importEdgeGen != 0 {
+		t.Fatal("known-file invalidation must not bump the wholesale generation")
 	}
-	// A kind migration away from imports still rewrites an imports row.
-	migrated := []graph.EdgeReindex{{Edge: &graph.Edge{Kind: graph.EdgeCalls}, OldKind: graph.EdgeImports}}
-	if !batchWritesImportEdges(migrated) {
-		t.Fatal("batch migrating an edge off the imports kind must flag")
+	// A kind migration away from imports still rewrites an imports row; the
+	// pre-mutation provenance names the file.
+	r.noteImportEdgeReindexes([]graph.EdgeReindex{
+		{Edge: &graph.Edge{Kind: graph.EdgeCalls}, OldKind: graph.EdgeImports, OldFilePath: "c.go"},
+	})
+	if _, ok := r.importDirtyFiles["c.go"]; !ok {
+		t.Fatalf("dirty files = %v, want c.go from OldFilePath", r.importDirtyFiles)
 	}
-	if batchWritesImportEdges([]graph.EdgeReindex{{Edge: nil}}) {
-		t.Fatal("nil edge must not flag")
+	// No file provenance at all → conservative wholesale clear.
+	r.noteImportEdgeReindexes([]graph.EdgeReindex{{Edge: &graph.Edge{Kind: graph.EdgeImports}}})
+	if r.importEdgeGen != 1 {
+		t.Fatal("provenance-less imports write must fall back to the wholesale generation")
 	}
 }
 
-func TestTargetBatchWritesImportEdgesDetectsKind(t *testing.T) {
-	calls := []graph.UnresolvedEdgeTargetReindex{{Old: graph.EdgeIdentity{Kind: graph.EdgeCalls}}}
-	if targetBatchWritesImportEdges(calls) {
-		t.Fatal("calls-only batch must not flag import writes")
+func TestNoteImportTargetReindexesRecordsDirtyFiles(t *testing.T) {
+	r := New(graph.New())
+	r.noteImportTargetReindexes([]graph.UnresolvedEdgeTargetReindex{
+		{Old: graph.EdgeIdentity{Kind: graph.EdgeCalls, FilePath: "a.go"}},
+		{Old: graph.EdgeIdentity{Kind: graph.EdgeImports, FilePath: "b.go"}},
+	})
+	if _, ok := r.importDirtyFiles["b.go"]; !ok || len(r.importDirtyFiles) != 1 {
+		t.Fatalf("dirty files = %v, want exactly b.go", r.importDirtyFiles)
 	}
-	mixed := append(calls, graph.UnresolvedEdgeTargetReindex{Old: graph.EdgeIdentity{Kind: graph.EdgeImports}})
-	if !targetBatchWritesImportEdges(mixed) {
-		t.Fatal("batch containing an imports identity must flag")
+	if r.importEdgeGen != 0 {
+		t.Fatal("known-file invalidation must not bump the wholesale generation")
+	}
+	r.noteImportTargetReindexes([]graph.UnresolvedEdgeTargetReindex{
+		{Old: graph.EdgeIdentity{Kind: graph.EdgeImports}},
+	})
+	if r.importEdgeGen != 1 {
+		t.Fatal("provenance-less imports identity must fall back to the wholesale generation")
+	}
+}
+
+// The cold-run regression this amendment fixes: import edges resolve in a
+// steady stream throughout a pass, so invalidation must be per-file — a write
+// against an UNRELATED file must not evict the whole retention.
+func TestReachabilityAdjacencyRetentionSurvivesUnrelatedImportWrites(t *testing.T) {
+	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
+	defer indexes.close()
+	store.projected["repo/caller.go"] = []string{graph.UnresolvedMarker + "import::dep"}
+
+	indexes.prepare(pending)
+	indexes.clearPage()
+	for page := 0; page < 3; page++ {
+		r.noteImportEdgeReindexes([]graph.EdgeReindex{
+			{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "other/unrelated.go"}},
+		})
+		indexes.prepare(pending)
+		indexes.clearPage()
+	}
+	if store.projectionCalls != 1 {
+		t.Fatalf("projection calls = %d, want 1: unrelated import writes must not evict the retention", store.projectionCalls)
 	}
 }
 
@@ -296,7 +336,9 @@ func TestReachabilityProjectionUnresolvedImportsStayFresh(t *testing.T) {
 	}
 
 	store.projected["repo/caller.go"] = []string{"dep2/two.go"}
-	r.noteImportEdgeWrite()
+	r.noteImportEdgeReindexes([]graph.EdgeReindex{
+		{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "repo/caller.go"}},
+	})
 	indexes.prepare(pending)
 	defer indexes.clearPage()
 	if store.projectionCalls != 2 {

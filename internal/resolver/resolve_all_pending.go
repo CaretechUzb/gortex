@@ -206,12 +206,19 @@ func (p *resolveAllPassIndexes) prepare(pending []*graph.Edge) map[string]*graph
 		providesElapsed = time.Since(start)
 	}
 	if p.importAdjacencyGen != p.resolver.importEdgeGen {
-		// An imports-kind edge write landed since this retention was built —
-		// stored adjacency rows may have changed under it. Clear wholesale;
-		// the next projection repopulates at first-touch cost.
+		// A provenance-less imports-kind write landed since this retention
+		// was built — adjacency rows may have changed anywhere. Clear
+		// wholesale; the next projection repopulates at first-touch cost.
 		clear(p.importAdjacency)
 		p.importAdjacencyGen = p.resolver.importEdgeGen
+	} else {
+		// The common path: the pass resolved import edges with known
+		// provenance. Drop exactly those files' retained projections.
+		for filePath := range p.resolver.importDirtyFiles {
+			delete(p.importAdjacency, filePath)
+		}
 	}
+	clear(p.resolver.importDirtyFiles)
 	reachabilityStart := time.Now()
 	_, reachStats := p.resolver.buildReachabilityIndexForPendingCached(pending, sources, p.reachabilityFiles, p.importAdjacency)
 	reachabilityElapsed := time.Since(reachabilityStart)

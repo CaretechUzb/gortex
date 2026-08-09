@@ -185,9 +185,7 @@ func (r *Resolver) attributeNonGoModuleImports() {
 		r.graph.AddBatch(nil, dependsBatch)
 	}
 	if len(reindexBatch) > 0 {
-		if batchWritesImportEdges(reindexBatch) {
-			r.noteImportEdgeWrite()
-		}
+		r.noteImportEdgeReindexes(reindexBatch)
 		r.graph.ReindexEdges(reindexBatch)
 	}
 }

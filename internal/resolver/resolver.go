@@ -222,6 +222,10 @@ type Resolver struct {
 	// pass may hold pass-scoped import-adjacency retention. Write-site
 	// verdicts live at noteImportEdgeWrite's callers.
 	importEdgeGen uint64
+	// importDirtyFiles names caller files whose stored import adjacency was
+	// rewritten with known provenance; prepare deletes exactly these keys
+	// from the pass-scoped retention instead of clearing it wholesale.
+	importDirtyFiles map[string]struct{}
 	// depModuleIndex bridges Go imports to dep::<module> contract
 	// nodes emitted from go.mod. Keyed by RepoPrefix (the dep node's
 	// owning repo) so we never link an import in repo A to a dep
@@ -1003,9 +1007,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				perWorkerJobs[i] = kept
 			}
 			if len(reindexBatch) > 0 {
-				if batchWritesImportEdges(reindexBatch) {
-					r.noteImportEdgeWrite()
-				}
+				r.noteImportEdgeReindexes(reindexBatch)
 				r.graph.ReindexEdges(reindexBatch)
 				reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
 				reindexTotal += len(reindexBatch)
@@ -1352,9 +1354,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				terminalClears = append(terminalClears, graph.EdgeReindex{Edge: edge.edge, OldTo: oldTo})
 			}
 			if len(terminalClears) > 0 {
-				if batchWritesImportEdges(terminalClears) {
-					r.noteImportEdgeWrite()
-				}
+				r.noteImportEdgeReindexes(terminalClears)
 				r.graph.ReindexEdges(terminalClears)
 			}
 
@@ -2672,9 +2672,7 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	stats *ResolveStats,
 ) {
 	if len(reindexBatch) > 0 {
-		if batchWritesImportEdges(reindexBatch) {
-			r.noteImportEdgeWrite()
-		}
+		r.noteImportEdgeReindexes(reindexBatch)
 		r.graph.ReindexEdges(reindexBatch)
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
@@ -4774,7 +4772,8 @@ func (r *Resolver) clearReachabilityIndex() {
 //
 // Write-site audit (every ReindexEdges / ReindexUnresolvedEdgeTargets /
 // AddBatch call in this package):
-//   - guarded bump: main page commit + incremental commit (resolver.go),
+//   - precise invalidation via noteImportEdgeReindexes/noteImportTargetReindexes:
+//     main page commit + incremental commit (resolver.go),
 //     deferred-LSP terminal clears and page reindexes (resolver.go,
 //     lsp_resolve.go), attribution batches (attribution_reindex_batch.go,
 //     go_builtins_attribution.go, incremental_attribution_cache.go),
@@ -4796,30 +4795,53 @@ func (r *Resolver) noteImportEdgeWrite() {
 	r.importEdgeGen++
 }
 
-// batchWritesImportEdges reports whether an edge-reindex batch can change a
-// file's stored import adjacency. Kind migrations count in both directions:
-// either the new or the persisted pre-mutation kind being imports rewrites an
-// imports row. Sites whose batches are provably calls-only skip the bump —
-// the verdict table lives at noteImportEdgeWrite's callers.
-func batchWritesImportEdges(batch []graph.EdgeReindex) bool {
-	for _, reindex := range batch {
-		if reindex.OldKind == graph.EdgeImports {
-			return true
-		}
-		if reindex.Edge != nil && reindex.Edge.Kind == graph.EdgeImports {
-			return true
-		}
+func (r *Resolver) markImportDirty(filePath string) {
+	if r.importDirtyFiles == nil {
+		r.importDirtyFiles = make(map[string]struct{})
 	}
-	return false
+	r.importDirtyFiles[filePath] = struct{}{}
 }
 
-func targetBatchWritesImportEdges(batch []graph.UnresolvedEdgeTargetReindex) bool {
+// noteImportEdgeReindexes records which caller files' stored import adjacency
+// an edge-reindex batch rewrites. Kind migrations count in both directions:
+// either the new or the persisted pre-mutation kind being imports rewrites an
+// imports row. Known files invalidate precisely — import edges resolve in a
+// steady stream throughout a cold pass, so clearing wholesale here would
+// evict the retention before it ever serves. Entries without file provenance
+// fall back to the wholesale generation.
+func (r *Resolver) noteImportEdgeReindexes(batch []graph.EdgeReindex) {
 	for _, reindex := range batch {
-		if reindex.Old.Kind == graph.EdgeImports {
-			return true
+		importsRow := reindex.OldKind == graph.EdgeImports ||
+			(reindex.Edge != nil && reindex.Edge.Kind == graph.EdgeImports)
+		if !importsRow {
+			continue
+		}
+		marked := false
+		if reindex.Edge != nil && reindex.Edge.FilePath != "" {
+			r.markImportDirty(reindex.Edge.FilePath)
+			marked = true
+		}
+		if reindex.OldFilePath != "" {
+			r.markImportDirty(reindex.OldFilePath)
+			marked = true
+		}
+		if !marked {
+			r.noteImportEdgeWrite()
 		}
 	}
-	return false
+}
+
+func (r *Resolver) noteImportTargetReindexes(batch []graph.UnresolvedEdgeTargetReindex) {
+	for _, reindex := range batch {
+		if reindex.Old.Kind != graph.EdgeImports {
+			continue
+		}
+		if reindex.Old.FilePath == "" {
+			r.noteImportEdgeWrite()
+			continue
+		}
+		r.markImportDirty(reindex.Old.FilePath)
+	}
 }
 
 // importedDirForSpec returns the directory that an unresolved
