@@ -489,18 +489,6 @@ func (m *OverlayManager) Files(sessionID string) (map[string]OverlayFile, error)
 	return out, nil
 }
 
-// SessionWorkspace returns the workspace slug captured at Register.
-// ErrSessionNotFound when the session doesn't exist.
-func (m *OverlayManager) SessionWorkspace(sessionID string) (string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	sess, ok := m.sessions[sessionID]
-	if !ok {
-		return "", ErrSessionNotFound
-	}
-	return sess.WorkspaceID, nil
-}
-
 // SweepIdle drops sessions whose LastUsed is older than IdleTTL.
 // Returns the count of dropped sessions for telemetry. Safe to call
 // from a single janitor goroutine on a ticker.
@@ -962,24 +950,6 @@ func (m *OverlayManager) PushToBranch(sessionID, branchName string, overlay Over
 		return ErrBranchNotFound
 	}
 	br.files[overlay.Path] = overlay
-	sess.LastUsed = time.Now()
-	return nil
-}
-
-// DeleteFromBranch removes one overlay file from a specific branch.
-// Companion to PushToBranch; does not change the active pointer.
-func (m *OverlayManager) DeleteFromBranch(sessionID, branchName, path string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	sess, ok := m.sessions[sessionID]
-	if !ok {
-		return ErrSessionNotFound
-	}
-	br, ok := sess.branches[branchName]
-	if !ok {
-		return ErrBranchNotFound
-	}
-	delete(br.files, path)
 	sess.LastUsed = time.Now()
 	return nil
 }
