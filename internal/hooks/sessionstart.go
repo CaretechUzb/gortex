@@ -22,11 +22,16 @@ type SessionStartInput struct {
 	SessionID      string `json:"session_id"`
 	TranscriptPath string `json:"transcript_path"`
 	CWD            string `json:"cwd"`
-	// Source is "startup" | "resume" | "clear" | "compact". Currently
-	// unused — every source gets the same orientation block — but kept
-	// here so future logic can branch.
+	// Source is "startup" | "resume" | "clear" | "compact" | "fork".
+	// Only "compact" changes the briefing: it is the one injection point
+	// Gortex has after a compaction, because PreCompact cannot add context
+	// (see runPreCompact). Every other source gets the same orientation block.
 	Source string `json:"source"`
 }
+
+// sessionSourceCompact is the SessionStart source Claude Code sets when the
+// session continues after its context window was compacted.
+const sessionSourceCompact = "compact"
 
 // runSessionStart handles a SessionStart hook by querying the daemon
 // for status and emitting an additionalContext block. The block is
@@ -36,7 +41,7 @@ type SessionStartInput struct {
 // Graceful degradation: if the daemon socket can't be dialled, the
 // hook still emits a block — but its content tells the user that
 // enforcement is disabled and how to fix it.
-func runSessionStart(data []byte) {
+func runSessionStart(data []byte, port int) {
 	started := time.Now()
 	var input SessionStartInput
 	if err := json.Unmarshal(data, &input); err != nil {
@@ -57,6 +62,11 @@ func runSessionStart(data []byte) {
 	ctx := buildSessionStartBriefing(input.CWD)
 	if ctx == "" {
 		return
+	}
+	// A compacted session is the only one that wakes up holding re-injected
+	// file content, and this is the only hook that can tell it so.
+	if strings.EqualFold(strings.TrimSpace(input.Source), sessionSourceCompact) {
+		ctx += buildCompactionBriefing(port)
 	}
 
 	output := HookOutput{
