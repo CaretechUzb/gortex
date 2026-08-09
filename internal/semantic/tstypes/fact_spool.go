@@ -201,6 +201,112 @@ func unmarshalFileFacts(filePath, repoPrefix string, payload []byte) (*fileFacts
 	return facts, nil
 }
 
+// factClass partitions one file's facts by the phase that applies them.
+// Values are stable spool row keys — the temp spool never outlives a pass,
+// so renumbering is safe across builds but pointless.
+type factClass int
+
+const (
+	classImports factClass = iota
+	classSupers
+	classMetas
+	classAliases
+	classCalls
+)
+
+// marshalClassPayloads encodes one file's facts as per-class JSON arrays,
+// omitting empty classes entirely — a file with no aliases contributes no
+// aliases row, which is what lets a phase skip files wholesale.
+func marshalClassPayloads(facts *fileFacts) (map[factClass][]byte, error) {
+	out := make(map[factClass][]byte, 5)
+	put := func(class factClass, v any, n int) error {
+		if n == 0 {
+			return nil
+		}
+		blob, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		out[class] = blob
+		return nil
+	}
+	if err := put(classImports, facts.imports, len(facts.imports)); err != nil {
+		return nil, err
+	}
+	wireSupers := make([]encodedSuper, 0, len(facts.supers))
+	for _, fact := range facts.supers {
+		wireSupers = append(wireSupers, encodedSuper{fact.typeName, fact.superName, fact.kind, fact.line})
+	}
+	if err := put(classSupers, wireSupers, len(wireSupers)); err != nil {
+		return nil, err
+	}
+	wireMetas := make([]encodedMeta, 0, len(facts.metas))
+	for _, fact := range facts.metas {
+		wireMetas = append(wireMetas, encodedMeta{fact.key, fact.value, fact.owner, fact.name, fact.line})
+	}
+	if err := put(classMetas, wireMetas, len(wireMetas)); err != nil {
+		return nil, err
+	}
+	wireAliases := make([]encodedAlias, 0, len(facts.aliases))
+	for _, fact := range facts.aliases {
+		wireAliases = append(wireAliases, encodedAlias{fact.typeName, fact.alias, fact.trait, fact.method, fact.line})
+	}
+	if err := put(classAliases, wireAliases, len(wireAliases)); err != nil {
+		return nil, err
+	}
+	wireCalls := make([]encodedCall, 0, len(facts.calls))
+	for i := range facts.calls {
+		wireCalls = append(wireCalls, *encodeCallFact(&facts.calls[i]))
+	}
+	if err := put(classCalls, wireCalls, len(wireCalls)); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// unmarshalClassPayload appends one class's decoded facts onto facts.
+func unmarshalClassPayload(facts *fileFacts, class factClass, payload []byte) error {
+	switch class {
+	case classImports:
+		return json.Unmarshal(payload, &facts.imports)
+	case classSupers:
+		var wire []encodedSuper
+		if err := json.Unmarshal(payload, &wire); err != nil {
+			return err
+		}
+		for _, fact := range wire {
+			facts.supers = append(facts.supers, superFact{fact.TypeName, fact.SuperName, fact.Kind, fact.Line})
+		}
+	case classMetas:
+		var wire []encodedMeta
+		if err := json.Unmarshal(payload, &wire); err != nil {
+			return err
+		}
+		for _, fact := range wire {
+			facts.metas = append(facts.metas, metaFact{fact.Key, fact.Value, fact.Owner, fact.Name, fact.Line})
+		}
+	case classAliases:
+		var wire []encodedAlias
+		if err := json.Unmarshal(payload, &wire); err != nil {
+			return err
+		}
+		for _, fact := range wire {
+			facts.aliases = append(facts.aliases, aliasFact{fact.TypeName, fact.Alias, fact.Trait, fact.Method, fact.Line})
+		}
+	case classCalls:
+		var wire []encodedCall
+		if err := json.Unmarshal(payload, &wire); err != nil {
+			return err
+		}
+		for i := range wire {
+			facts.calls = append(facts.calls, *decodeCallFact(&wire[i]))
+		}
+	default:
+		return fmt.Errorf("unknown fact class %d", class)
+	}
+	return nil
+}
+
 type stagedFileFacts struct {
 	facts   *fileFacts
 	payload []byte
