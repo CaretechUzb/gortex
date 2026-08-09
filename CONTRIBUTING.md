@@ -12,13 +12,13 @@ contribution; the project retains a perpetual, worldwide, royalty-free
 license to use, modify, and redistribute it as part of Gortex.
 
 Contributors are listed in [CONTRIBUTORS.md](CONTRIBUTORS.md). Add yourself
-to that file in the same PR if you'd like to be credited.
+to that file in the dedicated PR, linking previous contributions if you'd like to be credited.
 
 ## Getting Started
 
 ### Prerequisites
 
-- Go 1.21+
+- Go 1.25+
 - CGO enabled (required for tree-sitter C bindings)
 - Git
 
