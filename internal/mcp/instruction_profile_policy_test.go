@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -16,7 +17,32 @@ import (
 // stub activeInstructionPreset directly.
 func TestMain(m *testing.M) {
 	os.Setenv(profiles.ActiveEnv, profiles.DefaultName)
-	os.Exit(m.Run())
+
+	// NewServer constructs the query logger eagerly. Keep its default path in
+	// a disposable package-local cache so concurrent package tests cannot write
+	// through to the developer's real ~/.gortex/cache/query-log.jsonl.
+	testCache, err := os.MkdirTemp("", "gortex-mcp-test-cache-")
+	if err != nil {
+		os.Exit(1)
+	}
+	previousCache, hadCache := os.LookupEnv("XDG_CACHE_HOME")
+	previousQueryLog, hadQueryLog := os.LookupEnv("GORTEX_QUERY_LOG")
+	_ = os.Setenv("XDG_CACHE_HOME", testCache)
+	_ = os.Setenv("GORTEX_QUERY_LOG", filepath.Join(testCache, "query-log.jsonl"))
+
+	code := m.Run()
+	if hadCache {
+		_ = os.Setenv("XDG_CACHE_HOME", previousCache)
+	} else {
+		_ = os.Unsetenv("XDG_CACHE_HOME")
+	}
+	if hadQueryLog {
+		_ = os.Setenv("GORTEX_QUERY_LOG", previousQueryLog)
+	} else {
+		_ = os.Unsetenv("GORTEX_QUERY_LOG")
+	}
+	_ = os.RemoveAll(testCache)
+	os.Exit(code)
 }
 
 // stubActiveProfilePreset swaps the machine-state reader for the test.
