@@ -52,7 +52,6 @@ func spinUpDaemonWithConfig(t *testing.T) (configPath, socket, trackedRoot strin
 	socket = filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
 	t.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(dir, "p"))
-	t.Setenv("GORTEX_DAEMON_SNAPSHOT", filepath.Join(dir, "snap.gob.gz"))
 
 	// Stage a tiny repo the daemon can track.
 	trackedRoot = filepath.Join(dir, "repo")

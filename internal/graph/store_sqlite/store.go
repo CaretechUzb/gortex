@@ -853,8 +853,12 @@ func (s *Store) prepare() error {
 		`SELECT `+nodeCols+` FROM nodes WHERE file_path = ?`)
 	prep(&s.stmtRepoNodes,
 		`SELECT `+nodeCols+` FROM nodes WHERE repo_prefix = ?`)
+	// ORDER BY id: nodes is WITHOUT ROWID keyed on id, so the scan already
+	// walks primary-key order and the clause costs nothing (no temp b-tree in
+	// the query plan). Stating it makes whole-graph enumeration reproducible
+	// instead of merely happening to be stable.
 	prep(&s.stmtAllNodes,
-		`SELECT `+nodeCols+` FROM nodes`)
+		`SELECT `+nodeCols+` FROM nodes ORDER BY id`)
 	prep(&s.stmtNodeCount,
 		`SELECT COUNT(*) FROM nodes`)
 	prep(&s.stmtRepoPrefixes,
@@ -893,22 +897,36 @@ func (s *Store) prepare() error {
 
 	prepWrite(&s.stmtInsertEdge,
 		`INSERT OR IGNORE INTO edges (`+edgeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	// The adjacency reads carry an explicit total order. Several callers take
+	// the FIRST edge matching a predicate (the semantic enricher's
+	// matching-edge lookup, for one), so several edges sharing
+	// (from, to, kind) and differing only by source line used to make the
+	// choice depend on undefined row order.
+	//
+	// Both clauses are free: they lead with the column the chosen index
+	// already sorts on (edges_by_from_line for from_id, edges_by_to for
+	// to_id) and break ties on the rowid every index carries as its trailing
+	// key, so the planner satisfies them from the index walk with no temp
+	// b-tree.
 	prep(&s.stmtOutEdges,
-		`SELECT `+edgeCols+` FROM edges WHERE from_id = ?`)
+		`SELECT `+edgeCols+` FROM edges WHERE from_id = ? ORDER BY line, id`)
 	// edgeColsLight is the package-level meta-less projection (store_light_edges.go),
 	// shared with AllEdgesLight so this prepared statement and the whole-graph scan
-	// can never drift apart.
+	// can never drift apart. The ordering must match stmtOutEdges for the same
+	// reason: callers switch between the two purely to skip the Meta blob.
 	prep(&s.stmtOutEdgesLight,
-		`SELECT `+edgeColsLight+` FROM edges WHERE from_id = ?`)
+		`SELECT `+edgeColsLight+` FROM edges WHERE from_id = ? ORDER BY line, id`)
 	prep(&s.stmtInEdges,
-		`SELECT `+edgeCols+` FROM edges WHERE to_id = ?`)
+		`SELECT `+edgeCols+` FROM edges WHERE to_id = ? ORDER BY kind, id`)
 	prep(&s.stmtRepoEdges,
 		`SELECT `+lookupQualifiedEdgeCols+`
 		   FROM edges e
 		   JOIN nodes n ON n.id = e.from_id
 		  WHERE n.repo_prefix = ?`)
+	// id is the rowid alias, so the full scan already yields insertion order
+	// and the clause adds no sorter — same reasoning as stmtAllNodes above.
 	prep(&s.stmtAllEdges,
-		`SELECT `+edgeCols+` FROM edges`)
+		`SELECT `+edgeCols+` FROM edges ORDER BY id`)
 	prep(&s.stmtEdgeCount,
 		`SELECT COUNT(*) FROM edges`)
 	prepWrite(&s.stmtRemoveEdge,
@@ -1830,6 +1848,9 @@ func (s *Store) GetRepoNodesLight(repoPrefix string) []*graph.Node {
 		}
 		out = append(out, n)
 	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
+	}
 	return out
 }
 
@@ -1851,6 +1872,12 @@ func (s *Store) scanNodeQuery(query string, args ...any) []*graph.Node {
 			return out
 		}
 		out = append(out, n)
+	}
+	// A driver failure part-way through ends the cursor exactly like a clean
+	// exhaust, so without this check a repo-wide node scan can come back
+	// silently truncated and read as complete.
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
 	}
 	return out
 }
@@ -1966,6 +1993,12 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 		}
 		out = append(out, e)
 	}
+	// A driver failure part-way through the cursor ends the loop exactly like
+	// a clean exhaust. Without this check the caller would receive a silently
+	// truncated slice and treat it as the complete result.
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
+	}
 	return out
 }
 
@@ -1990,6 +2023,9 @@ func (s *Store) queryEdgesLight(stmt *sql.Stmt, args ...any) []*graph.Edge {
 			continue
 		}
 		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
 	}
 	return out
 }
@@ -2382,37 +2418,62 @@ func (s *Store) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
 // deadlocking on the MaxOpenConns=1 pool. Companion to the existing
 // queryEdges helper that takes a *sql.Stmt; this one takes a raw
 // SQL string so the predicate iterators can pass inline queries.
+//
+// Statement-level, row-level, and cursor-level failures all go through
+// panicOnFatal: a teardown-race read still degrades to what was materialised,
+// but a real storage failure is raised instead of being handed back as an
+// empty or short slice the caller cannot tell from a genuinely small result.
+// A row that will not decode ends the scan for the same reason a driver error
+// does — skipping it hands back a result that is short by exactly the rows
+// that were corrupt, which is the one failure a caller cannot detect.
 func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
+		panicOnFatal(err)
 		return nil
 	}
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
 		e, err := scanEdgeCursor(rows)
-		if err != nil || e == nil {
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		if e == nil {
 			continue
 		}
 		out = append(out, e)
 	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
+	}
 	return out
 }
 
-// queryNodesSQL is the node-shaped sibling of queryEdgesSQL.
+// queryNodesSQL is the node-shaped sibling of queryEdgesSQL, with the same
+// error contract.
 func (s *Store) queryNodesSQL(q string, args ...any) []*graph.Node {
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
+		panicOnFatal(err)
 		return nil
 	}
 	defer rows.Close()
 	var out []*graph.Node
 	for rows.Next() {
 		n, err := scanNodeCursor(rows)
-		if err != nil || n == nil {
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		if n == nil {
 			continue
 		}
 		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
 	}
 	return out
 }

@@ -243,6 +243,17 @@ internal/
 `internal/` holds many more focused packages than the ones above; those are the
 load-bearing ones to know first.
 
+## Public API (`pkg/gortex`)
+
+`New(opts ...Option) (*Engine, error)` opens a SQLite graph store, which can
+fail — construction returns an error rather than a bare `*Engine`. Pass
+`WithStorePath` to keep the store at a path of your choosing and reuse the
+index on the next run; without it the store lives in a temp directory.
+
+Every `Engine` must be closed. `Close` checkpoints the write-ahead log, closes
+the database handle, and removes the temp directory when `New` created one —
+skipping it leaks a file handle and a background goroutine.
+
 ## Where to Read Next
 
 | Doc | Covers |

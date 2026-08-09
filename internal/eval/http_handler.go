@@ -21,7 +21,7 @@ type Handler struct {
 
 // NewHandler creates an eval HTTP handler that dispatches to MCP tools.
 // It provides all server /v1/* endpoints plus POST /v1/augment.
-func NewHandler(mcpServer *mcpserver.MCPServer, g *graph.Graph, version string, logger *zap.Logger) *Handler {
+func NewHandler(mcpServer *mcpserver.MCPServer, g graph.Store, version string, logger *zap.Logger) *Handler {
 	base := server.NewHandler(mcpServer, g, version, logger)
 	h := &Handler{Handler: base}
 	base.Mux().HandleFunc("POST /v1/augment", h.handleAugment)

@@ -33,34 +33,28 @@ import (
 	"github.com/zzet/gortex/internal/telemetry"
 )
 
-// Lifecycle selects the backend default, whether warm-restart/snapshot
-// machinery the entry point wires is appropriate, and the store-lock
-// posture.
+// Lifecycle selects whether the entry point's warm-restart machinery is
+// appropriate and what the store-lock posture is. Every lifecycle runs
+// against the sqlite store; they differ only in where that store lives and
+// whether it is locked.
 type Lifecycle int
 
 const (
-	// LifecycleDaemon is the durable, long-lived daemon: sqlite default,
-	// cross-process store lock.
+	// LifecycleDaemon is the durable, long-lived daemon — including its
+	// HTTP surface: a shared store under the cross-process store lock.
 	LifecycleDaemon Lifecycle = iota
-	// LifecycleHTTP is the daemon's HTTP surface (gortex daemon --http):
-	// durable, sqlite default, store lock.
-	LifecycleHTTP
-	// LifecycleOneshot is the ephemeral embedded server: memory-only,
-	// FileStore snapshot, no store lock.
+	// LifecycleOneshot is the ephemeral embedded server: a sqlite store on
+	// a private per-process path that the caller supplies and deletes, and
+	// no store lock — its graph lives and dies with the process.
 	LifecycleOneshot
 )
 
-// Writable reports whether the lifecycle owns a durable on-disk store
-// (and therefore takes the cross-process store lock).
-func (l Lifecycle) Writable() bool { return l == LifecycleDaemon || l == LifecycleHTTP }
-
-// defaultBackend resolves the backend name for an empty cfg.Backend.
-func (l Lifecycle) defaultBackend() string {
-	if l == LifecycleOneshot {
-		return "memory"
-	}
-	return "sqlite"
-}
+// Writable reports whether the lifecycle owns a *shared* durable store and
+// therefore takes the cross-process store lock. One-shot is deliberately
+// excluded: it runs against a private temp file no other process can name,
+// so an advisory flock would guard nothing while still making two
+// concurrent `gortex mcp` fallbacks fight over the lock file.
+func (l Lifecycle) Writable() bool { return l == LifecycleDaemon }
 
 // SharedServerConfig carries the knobs that vary between the daemon, the
 // HTTP surface, and the one-shot embedded path. The first block is the
@@ -68,13 +62,16 @@ func (l Lifecycle) defaultBackend() string {
 // entry-point-resolved options threaded through with the already-loaded
 // config rather than re-derived here.
 type SharedServerConfig struct {
-	Lifecycle    Lifecycle // backend default + store-lock posture
-	Index        string    // workspace root the indexer/LSP/bind anchor at
-	Backend      string    // "" resolves via Lifecycle; else memory|sqlite
-	BackendPath  string    // "" => ~/.gortex/store/store.sqlite
-	SnapshotPath string    // gob+gzip pre-load path; entry point applies it
-	HTTPAddr     string    // opts the lifecycle into the /mcp HTTP surface
-	Watch        bool      // filesystem watcher / incremental reindex
+	Lifecycle Lifecycle // store-lock posture
+	Index     string    // workspace root the indexer/LSP/bind anchor at
+	Backend   string    // "" or "sqlite" — the sqlite store is the only backend
+	// BackendPath names the store file. Empty means the shared default
+	// (~/.gortex/store/store.sqlite) — which only a lifecycle that takes
+	// the store lock may use, so LifecycleOneshot must set it to a private
+	// per-process path it owns and deletes.
+	BackendPath string
+	HTTPAddr    string // opts the lifecycle into the /mcp HTTP surface
+	Watch       bool   // filesystem watcher / incremental reindex
 
 	// Entry-point-resolved options (not part of the authoritative surface).
 	Config         *config.Config       // loaded .gortex.yaml (required)
@@ -141,9 +138,14 @@ type SharedServer struct {
 	MCP          *gortexmcp.Server
 	ConfigMgr    *config.ConfigManager
 	Overlays     *daemon.OverlayManager
+	// StorePath is the graph store file this stack actually opened: the
+	// caller's BackendPath expanded to an absolute path, or the platform
+	// default when it was empty. Entry points publish it so out-of-band
+	// readers can find the same store instead of re-deriving the default.
+	StorePath string
 	// EmbedderDims is the active embedder's vector dimensionality, or 0
-	// when embeddings are off. The entry point's snapshot warm-start
-	// compares it to a snapshot's vector dims before skipping a re-embed.
+	// when embeddings are off — the width every persisted vector in this
+	// workspace was built at.
 	EmbedderDims int
 
 	// ResolverLSPRegistry / LSPRouter are the resolve-time LSP wiring the
@@ -217,9 +219,21 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	if conf == nil {
 		conf = config.Default()
 	}
-	backendName := cfg.Backend
-	if backendName == "" {
-		backendName = cfg.Lifecycle.defaultBackend()
+	// Reject an unusable backend name here, before the store lock is taken
+	// and before any path is resolved, so the caller gets the naming error
+	// rather than a downstream symptom of it.
+	if err := checkBackend(cfg.Backend); err != nil {
+		return nil, err
+	}
+	// A one-shot server takes no store lock, so it must not be able to
+	// reach the shared default store: resolveBackendPath("") would hand it
+	// ~/.gortex/store/store.sqlite, and a second unlocked writer on the
+	// daemon's database is how that file gets corrupted. Refuse rather
+	// than silently share.
+	if cfg.Lifecycle == LifecycleOneshot &&
+		strings.TrimSpace(cfg.BackendPath) == "" {
+		return nil, errors.New("one-shot server requires an explicit BackendPath: " +
+			"it holds no store lock and must not open the shared default store")
 	}
 
 	// Load user-defined domain-extractor rules (TOML tree-sitter patterns).
@@ -241,17 +255,22 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 	s := &SharedServer{}
 
+	// Resolve the store path once: the lock, the open, and the path published
+	// on SharedServer must all name the same file. The backend name was
+	// already rejected above, before anything touched the filesystem.
+	storePath, err := resolveBackendPath(cfg.BackendPath, "store.sqlite")
+	if err != nil {
+		return nil, err
+	}
+	s.StorePath = storePath
+
 	// Cross-process store lock: a writable, on-disk lifecycle
 	// acquires an advisory flock on store.sqlite.lock and fails fast if
 	// another process owns the store. SQLite's in-process writeMu +
 	// busy_timeout serialise in-process writers only; nothing else stops
 	// a second OS process opening the same file and corrupting it.
 	storeLockHeld := false // set true once the exclusive store flock is owned below
-	if cfg.Lifecycle.Writable() && isSqliteBackend(backendName) {
-		storePath, perr := resolveBackendPath(cfg.BackendPath, "store.sqlite")
-		if perr != nil {
-			return nil, perr
-		}
+	if cfg.Lifecycle.Writable() {
 		lock := flock.New(storePath + ".lock")
 		locked, lerr := lock.TryLock()
 		if lerr != nil {
@@ -270,7 +289,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 	// allowRebuild is gated on actually holding the store lock: only then may
 	// the sqlite backend drop and recreate an incompatible-schema DB.
-	g, backendCleanup, err := OpenBackend(backendName, cfg.BackendPath, cfg.BufferPoolMB, logger, storeLockHeld)
+	g, backendCleanup, err := OpenBackend(cfg.Backend, storePath, cfg.BufferPoolMB, logger, storeLockHeld)
 	if err != nil {
 		return nil, err
 	}
@@ -473,10 +492,10 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 	embedder, embDesc, embReport, embErr := ResolveEmbedder(cfg.Embedder, conf)
 	// Probe API-backed providers up front so Dimensions() is truthful before
-	// we log it and — crucially — before EmbedderDims gates snapshot-vector
-	// reload. An APIProvider reports 0 until its first embed; without this the
-	// log reads dim:0 and the warm-restart vector reload rejects a
-	// correctly-sized cached index, re-embedding the whole graph needlessly.
+	// we log it and before anything gates on the embedder width. An
+	// APIProvider reports 0 until its first embed; without this the log reads
+	// dim:0 and any width comparison against already-persisted vectors sees a
+	// mismatch that isn't there.
 	// Static / local providers know their width natively and don't implement
 	// the prober, so they skip this. Best-effort: a probe failure (bad key /
 	// unreachable URL) only warns — indexing still falls back to BM25.
@@ -628,9 +647,11 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	srv.SetTelemetryRecorder(teleRec)
 	s.cleanup = append(s.cleanup, func() { srv.FlushTelemetry() })
 	if cfg.Lifecycle == LifecycleDaemon {
-		// One daemon-session event per process start, dimensioned by backend.
+		// One daemon-session event per process start, dimensioned by backend
+		// — a constant now that sqlite is the only one, kept as a dimension
+		// so the event shape survives a future second store.
 		// Opt-in + fail-silent: a disabled recorder drops it.
-		telemetry.RecordDaemonSession(teleRec, backendName)
+		telemetry.RecordDaemonSession(teleRec, "sqlite")
 		s.cleanup = append(s.cleanup, startTelemetrySender(srv, teleStore, teleDir, cfg.Version))
 	}
 

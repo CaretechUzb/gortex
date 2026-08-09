@@ -8,10 +8,10 @@ package main
 import (
 	"crypto/rand"
 	"encoding/binary"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +26,7 @@ import (
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
@@ -88,7 +89,23 @@ func runRepo(spec repoSpec, queries []string, budget budgets) repoRow {
 	row.Path = spec.Path
 
 	// --- 1. Cold-index ------------------------------------------
-	g := graph.New()
+	// The bench indexes into a throwaway SQLite store because that is
+	// what a daemon holds: cold-index time, search latency and the
+	// on-disk size column all depend on the store, and an in-memory
+	// graph would report a configuration nobody runs.
+	storeDir, err := os.MkdirTemp("", "gortex-bench-perf-"+spec.Slug+"-*")
+	if err != nil {
+		row.Error = fmt.Sprintf("store dir: %v", err)
+		return row
+	}
+	defer func() { _ = os.RemoveAll(storeDir) }()
+	g, err := store_sqlite.Open(filepath.Join(storeDir, "bench.sqlite"))
+	if err != nil {
+		row.Error = fmt.Sprintf("open store: %v", err)
+		return row
+	}
+	defer func() { _ = g.Close() }()
+
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	cfg := config.Config{}
@@ -147,7 +164,7 @@ func runRepo(spec repoSpec, queries []string, budget budgets) repoRow {
 	}
 
 	// --- 5. DB size ---------------------------------------------
-	row.DBBytes = estimateDBSize(g)
+	row.DBBytes = dbSizeBytes(storeDir)
 
 	// --- 6. Resident memory -------------------------------------
 	// Measured with the graph, indexer (search index) and query
@@ -206,10 +223,10 @@ func ensureCloned(spec repoSpec) (string, error) {
 // sumLOC is a cheap LoC proxy: total Lines field across file-kind
 // nodes. Not byte-exact (matches what the graph counted at index
 // time), but stable across runs and that's what the bench needs.
-func sumLOC(g *graph.Graph) int {
+func sumLOC(g graph.Store) int {
 	total := 0
-	for _, n := range g.AllNodes() {
-		if n == nil || n.Kind != graph.KindFile {
+	for n := range g.NodesByKind(graph.KindFile) {
+		if n == nil {
 			continue
 		}
 		// Graph stores per-file line counts under Meta["lines"] when
@@ -229,17 +246,11 @@ func sumLOC(g *graph.Graph) int {
 	return total
 }
 
-// countEdges sums the outgoing-edge count across every node — graph
-// doesn't expose a top-level edge count directly.
-func countEdges(g *graph.Graph) int {
-	total := 0
-	for _, n := range g.AllNodes() {
-		if n == nil {
-			continue
-		}
-		total += len(g.GetOutEdges(n.ID))
-	}
-	return total
+// countEdges returns the store's total edge count. Asking the store
+// for its own tally beats walking every node's out-edges: on a disk
+// backend that would be one round-trip per node.
+func countEdges(g graph.Store) int {
+	return g.Stats().TotalEdges
 }
 
 // pickImpactSeeds returns up to n random function/method IDs from
@@ -247,16 +258,15 @@ func countEdges(g *graph.Graph) int {
 // would name. Deterministic by node-ID sort + crypto/rand pick so
 // the same fixture produces consistent magnitudes (not byte-equal
 // numbers, but the same shape).
-func pickImpactSeeds(g *graph.Graph, n int) []string {
+func pickImpactSeeds(g graph.Store, n int) []string {
 	var pool []string
-	for _, node := range g.AllNodes() {
-		if node == nil {
-			continue
+	for _, kind := range []graph.NodeKind{graph.KindFunction, graph.KindMethod} {
+		for node := range g.NodesByKind(kind) {
+			if node == nil {
+				continue
+			}
+			pool = append(pool, node.ID)
 		}
-		if node.Kind != graph.KindFunction && node.Kind != graph.KindMethod {
-			continue
-		}
-		pool = append(pool, node.ID)
 	}
 	sort.Strings(pool)
 	if len(pool) <= n {
@@ -281,13 +291,10 @@ func pickImpactSeeds(g *graph.Graph, n int) []string {
 
 // pickIncrementalFiles returns up to n file paths to touch for the
 // incremental-reindex measurement.
-func pickIncrementalFiles(g *graph.Graph, n int) []string {
+func pickIncrementalFiles(g graph.Store, n int) []string {
 	var pool []string
-	for _, node := range g.AllNodes() {
-		if node == nil || node.Kind != graph.KindFile {
-			continue
-		}
-		if node.FilePath == "" {
+	for node := range g.NodesByKind(graph.KindFile) {
+		if node == nil || node.FilePath == "" {
 			continue
 		}
 		pool = append(pool, node.FilePath)
@@ -312,37 +319,32 @@ func touchFile(path string) error {
 	return err
 }
 
-// estimateDBSize gob-encodes the graph into a discard writer and
-// returns the byte count. This is the same on-disk shape the
-// persistence layer uses, so the number reflects what a `gortex
-// daemon` snapshot would actually weigh.
-func estimateDBSize(g *graph.Graph) int64 {
-	counter := &countingWriter{}
-	enc := gob.NewEncoder(counter)
-	// graph.Graph isn't directly gob-encodable; estimate via node +
-	// edge counts × a calibrated per-node/per-edge byte cost taken
-	// from the daemon's snapshot fixtures (~250 bytes / node + ~64
-	// bytes / edge after gob+gzip compression). Calibration is
-	// stable enough for an order-of-magnitude column.
-	stats := struct {
-		Nodes int
-		Edges int
-	}{
-		Nodes: len(g.AllNodes()),
-		Edges: countEdges(g),
-	}
-	if err := enc.Encode(stats); err != nil {
+// dbSizeBytes returns the real on-disk footprint of the store built
+// for this repo: every file in its directory, so the write-ahead log
+// and any sidecar count toward the total the way they do in a user's
+// state directory. Replaces an older per-node/per-edge byte estimate,
+// which could only ever be a calibrated guess. Returns -1 when the
+// directory can't be walked.
+func dbSizeBytes(dir string) int64 {
+	var total int64
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return ierr
+		}
+		total += info.Size()
+		return nil
+	})
+	if err != nil {
 		return -1
 	}
-	return int64(stats.Nodes*250 + stats.Edges*64)
-}
-
-// countingWriter is an io.Writer that just counts bytes.
-type countingWriter struct{ n int64 }
-
-func (c *countingWriter) Write(p []byte) (int, error) {
-	c.n += int64(len(p))
-	return len(p), nil
+	return total
 }
 
 // residentBytes returns the Go heap currently retained — the

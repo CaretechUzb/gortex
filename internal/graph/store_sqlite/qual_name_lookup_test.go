@@ -119,29 +119,42 @@ func TestGetNodesByQualNamesFailsClosedOnDecodeQueryAndClosedStoreErrors(t *test
 		t.Fatal(err)
 	}
 
-	got := store.GetNodesByQualNames([]string{"bad.qual", "good.qual"})
-	good := got["good.qual"]
-	if len(got) != 1 || len(good) != 1 || good[0] == nil || good[0].ID != "node::good" {
-		t.Fatalf("decode failure should skip only the corrupt row, got %#v", got)
-	}
-	if got["bad.qual"] != nil {
-		t.Fatalf("corrupt row unexpectedly survived strict node decoding: %#v", got["bad.qual"])
-	}
+	// A row that will not decode is a storage failure, not a row to step
+	// over. Skipping it returns a map that is short by exactly the corrupt
+	// entries, and a caller reading "no such qualified name" cannot tell that
+	// from a genuine miss — the one outcome this lookup must never produce.
+	assertQualNameLookupRaises(t, store, "bad.qual")
 
 	// INDEXED BY is deliberate: losing the intended index must fail closed
-	// instead of silently degrading into a full nodes-table scan.
+	// instead of silently degrading into a full nodes-table scan. A missing
+	// mandatory index is schema drift, so the lookup raises it rather than
+	// returning an empty map a caller would read as "no such qualified name".
 	if _, err := store.writerDB.Exec(`DROP INDEX nodes_by_qual`); err != nil {
 		t.Fatal(err)
 	}
-	if got := store.GetNodesByQualNames([]string{"good.qual"}); len(got) != 0 {
-		t.Fatalf("lookup without mandatory index returned %#v, want empty", got)
-	}
+	assertQualNameLookupRaises(t, store, "good.qual")
 
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if got := store.GetNodesByQualNames([]string{"good.qual"}); len(got) != 0 {
 		t.Fatalf("lookup on closed store returned %#v, want empty", got)
+	}
+}
+
+// assertQualNameLookupRaises fails unless the lookup surfaces its storage
+// error instead of returning a result the caller cannot distinguish from a
+// legitimate miss.
+func assertQualNameLookupRaises(t *testing.T, store *Store, qualName string) {
+	t.Helper()
+	var raised any
+	func() {
+		defer func() { raised = recover() }()
+		got := store.GetNodesByQualNames([]string{qualName})
+		t.Fatalf("degraded lookup returned %#v, want a surfaced error", got)
+	}()
+	if raised == nil {
+		t.Fatal("degraded lookup did not surface an error")
 	}
 }
 
@@ -187,7 +200,10 @@ func assertQualNameLookupParity(t *testing.T, store *Store) {
 	for _, qualName := range []string{"pkg.Alpha", "pkg.Middle", "pkg.Zeta"} {
 		want := store.GetNodeByQualName(qualName)
 		if want == nil {
+			// Explicit return so the dereference below is provably
+			// nil-safe rather than safe only by Fatalf convention.
 			t.Fatalf("individual lookup unexpectedly missed %q", qualName)
+			return
 		}
 		nodes := got[qualName]
 		if len(nodes) == 0 || nodes[0] == nil || nodes[0].ID != want.ID {

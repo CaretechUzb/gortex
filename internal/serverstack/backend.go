@@ -11,6 +11,7 @@
 package serverstack
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,46 +25,46 @@ import (
 	"github.com/zzet/gortex/internal/platform"
 )
 
-// OpenBackend constructs the graph.Store the server will run against,
-// picking the implementation by name:
+// OpenBackend constructs the graph.Store the server will run against. The
+// pure-Go modernc.org/sqlite store is the only implementation: an empty
+// name selects it, and it lives at the resolved path (an empty path means
+// ~/.gortex/store/store.sqlite).
 //
-//   - "" / "memory" — in-process *graph.Graph; nothing persists across
-//     runs; matches every existing test fixture.
-//   - "sqlite" — the pure-Go modernc.org/sqlite store under the resolved
-//     path (defaults to ~/.gortex/store/store.sqlite).
-//
-// Returns the store, a cleanup func the caller must defer (closes the
-// underlying handle on disk-backed stores), and any open error.
-// allowRebuild permits the on-disk sqlite backend to drop and recreate a
-// database whose schema version is incompatible. The caller must hold the
-// store lock; NewSharedServer passes true only in the branch where it acquired
-// the exclusive flock.
+// Returns the store, a cleanup func the caller must defer (it closes the
+// handle on disk), and any open error.
+// allowRebuild permits the backend to drop and recreate a database whose
+// schema version is incompatible. The caller must hold the store lock;
+// NewSharedServer passes true only in the branch where it acquired the
+// exclusive flock.
 func OpenBackend(name, path string, bufferPoolMB uint64, logger *zap.Logger, allowRebuild bool) (graph.Store, func(), error) {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "", "memory", "mem", "in-memory":
-		s := graph.New()
-		return s, func() {}, nil
-	case "sqlite", "sqlite3":
-		resolved, err := resolveBackendPath(path, "store.sqlite")
-		if err != nil {
-			return nil, nil, err
-		}
-		if logger != nil {
-			logger.Info("opening sqlite backend", zap.String("path", resolved))
-		}
-		return openSqliteBackend(resolved, bufferPoolMB, allowRebuild)
-	default:
-		return nil, nil, fmt.Errorf("unknown backend %q (expected: memory, sqlite)", name)
+	if err := checkBackend(name); err != nil {
+		return nil, nil, err
 	}
+	resolved, err := resolveBackendPath(path, "store.sqlite")
+	if err != nil {
+		return nil, nil, err
+	}
+	if logger != nil {
+		logger.Info("opening sqlite backend", zap.String("path", resolved))
+	}
+	return openSqliteBackend(resolved, bufferPoolMB, allowRebuild)
 }
 
-// isSqliteBackend reports whether name selects the on-disk sqlite store.
-func isSqliteBackend(name string) bool {
+// checkBackend validates a requested backend name. It is split out of
+// OpenBackend so a caller that takes the cross-process store lock first can
+// reject an unusable name before touching the lock or the filesystem.
+func checkBackend(name string) error {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "sqlite", "sqlite3":
-		return true
+	case "", "sqlite", "sqlite3":
+		return nil
+	case "memory", "mem", "in-memory":
+		// Substituting sqlite here would write a caller who asked for a
+		// throwaway store into the shared database on disk. Name the
+		// replacement and let the caller choose the path instead.
+		return errors.New("the in-memory backend is retired; use --backend sqlite --backend-path <path> " +
+			"(a throwaway path gives the old ephemeral behaviour)")
 	default:
-		return false
+		return fmt.Errorf("unknown backend %q (expected: sqlite)", name)
 	}
 }
 

@@ -12,8 +12,9 @@ We aim to acknowledge receipt within 48 hours and will provide a timeline for a 
 
 ## Overview
 
-Gortex is a code-intelligence engine. It indexes repositories into an in-memory
-knowledge graph and exposes that graph over a CLI and an MCP server. Running
+Gortex is a code-intelligence engine. It indexes repositories into a knowledge
+graph held in a local SQLite store and exposes that graph over a CLI and an MCP
+server. Running
 locally — on the user's machine, with the user's privileges — is the default and
 the assumption of this policy, but Gortex can also be deployed remotely (for
 example, a daemon bound to a non-localhost address), where the network-exposure

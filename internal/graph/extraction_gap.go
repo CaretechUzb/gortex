@@ -218,6 +218,13 @@ func ClassifyZeroEdge(g Store, symbolID string) ZeroEdgeClass {
 // classified likely_unused. Unresolved call stubs are indexed by their
 // target string, so each check is a reverse-edge lookup — no scan.
 // Non-callable symbols never match.
+//
+// Only existence matters here, never the edges themselves. A placeholder for a
+// common method name (`unresolved::*.Get`) is a hub with thousands of inbound
+// call edges, and materialising all of them with their Meta blobs to answer a
+// yes/no question is the expensive way to ask it. Backends that can count
+// server-side answer every candidate in one round-trip; the rest fall back to
+// the direct edge read.
 func hasUnresolvedSameNameCandidates(g Store, symbolID string) bool {
 	n := g.GetNode(symbolID)
 	if n == nil {
@@ -226,7 +233,19 @@ func hasUnresolvedSameNameCandidates(g Store, symbolID string) bool {
 	if n.Kind != KindFunction && n.Kind != KindMethod {
 		return false
 	}
-	for _, id := range UnresolvedNameCandidateIDs(n) {
+	candidates := UnresolvedNameCandidateIDs(n)
+	if len(candidates) == 0 {
+		return false
+	}
+	if counter, ok := g.(InDegreeForNodes); ok {
+		for _, count := range counter.InDegreeForNodes(candidates) {
+			if count > 0 {
+				return true
+			}
+		}
+		return false
+	}
+	for _, id := range candidates {
 		if len(g.GetInEdges(id)) > 0 {
 			return true
 		}

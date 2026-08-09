@@ -8,12 +8,13 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm/conversationlog"
-	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/server"
 	"github.com/zzet/gortex/internal/server/hub"
@@ -33,7 +34,6 @@ var (
 	mcpTrack           []string
 	mcpProject         string
 	mcpCacheDir        string
-	mcpNoCache         bool
 	mcpEmbeddings      bool
 	mcpEmbeddingsURL   string
 	mcpEmbeddingsModel string
@@ -41,6 +41,7 @@ var (
 	mcpNoSemantic      bool
 	mcpSemanticMode    string
 	mcpNoDaemon        bool
+	mcpNoCache         bool
 	mcpForceProxy      bool
 	mcpTools           string
 	mcpToolsMode       string
@@ -64,8 +65,7 @@ func init() {
 	mcpCmd.Flags().StringVar(&mcpCORSOrigin, "cors-origin", "*", "allowed CORS origin for server API")
 	mcpCmd.Flags().StringSliceVar(&mcpTrack, "track", nil, "additional repository paths to track")
 	mcpCmd.Flags().StringVar(&mcpProject, "project", "", "active project name")
-	mcpCmd.Flags().StringVar(&mcpCacheDir, "cache-dir", "", "graph cache directory (default ~/.gortex/cache/)")
-	mcpCmd.Flags().BoolVar(&mcpNoCache, "no-cache", false, "disable graph caching")
+	mcpCmd.Flags().StringVar(&mcpCacheDir, "cache-dir", "", "directory for the side stores — notes, feedback, server id (default ~/.gortex/cache/)")
 	mcpCmd.Flags().BoolVar(&mcpEmbeddings, "embeddings", false, "enable semantic search (built-in word vectors or transformer if compiled in)")
 	mcpCmd.Flags().StringVar(&mcpEmbeddingsURL, "embeddings-url", "", "embedding API URL (e.g. http://localhost:11434 for Ollama)")
 	mcpCmd.Flags().StringVar(&mcpEmbeddingsModel, "embeddings-model", "", "embedding model name (default: auto-detect)")
@@ -73,6 +73,10 @@ func init() {
 	mcpCmd.Flags().BoolVar(&mcpNoSemantic, "no-semantic", false, "disable semantic enrichment")
 	mcpCmd.Flags().StringVar(&mcpSemanticMode, "semantic-mode", "typecheck", "Go analysis mode: typecheck or callgraph")
 	mcpCmd.Flags().BoolVar(&mcpNoDaemon, "no-daemon", false, "deprecated no-op (warns when set); the embedded server is used automatically when no daemon is available")
+	mcpCmd.Flags().BoolVar(&mcpNoCache, "no-cache", false, "deprecated no-op (warns when set); the graph is served from the sqlite store, which has no separate cache to disable")
+	// Hidden rather than removed: an editor config that still passes the flag
+	// must keep starting, but nothing should learn it from --help.
+	_ = mcpCmd.Flags().MarkHidden("no-cache")
 	mcpCmd.Flags().BoolVar(&mcpForceProxy, "proxy", false, "require a running daemon and proxy through it (error if unavailable)")
 	mcpCmd.Flags().StringVar(&mcpTools, "tools", "", "restrict the published MCP tool surface to a preset: core (default)|full|readonly|edit|nav (optionally with ,+tool / ,-tool deltas). GORTEX_TOOLS overrides this")
 	mcpCmd.Flags().StringVar(&mcpToolsMode, "tools-mode", "", "how a --tools preset hides tools: hide (remove from tools/list + block calls) or defer (keep reachable via tools_search). Default hide")
@@ -81,21 +85,127 @@ func init() {
 
 var legacyMCPFlagsWarned bool
 
-// warnLegacyMCPFlags emits one stderr line per explicitly-set legacy flag
-// (--index/--watch/--proxy/--no-daemon). These are permanent no-op compat
-// shims for un-migrated on-disk editor configs. stderr only — stdout is
-// the MCP JSON-RPC stream and a stray byte corrupts the protocol.
+// legacyMCPProxyReason explains the flags the daemon-first startup path
+// retired: the mode decision comes from daemon presence plus GORTEX_AUTOSTART,
+// never from a flag.
+const legacyMCPProxyReason = "`gortex mcp` proxies to the daemon (auto-starting it) " +
+	"and falls back to an embedded server"
+
+// legacyMCPFlags are the retired `gortex mcp` flags kept as permanent no-op
+// compat shims, each with the reason it stopped doing anything. Removing one
+// is not an option: on-disk editor configs are never migrated and cobra hard-
+// errors on an unknown flag, so a deletion turns a stale mcp.json into a
+// server that will not start. Order fixes the warning order.
+var legacyMCPFlags = []struct{ name, reason string }{
+	{"index", legacyMCPProxyReason},
+	{"watch", legacyMCPProxyReason},
+	{"proxy", legacyMCPProxyReason},
+	{"no-daemon", legacyMCPProxyReason},
+	{"no-cache", "the graph is served from the sqlite store, which has no separate cache to disable"},
+}
+
+// warnLegacyMCPFlags emits one stderr line per explicitly-set legacy flag.
+// stderr only — stdout is the MCP JSON-RPC stream and a stray byte corrupts
+// the protocol.
 func warnLegacyMCPFlags(cmd *cobra.Command) {
 	if legacyMCPFlagsWarned {
 		return
 	}
 	legacyMCPFlagsWarned = true
-	for _, name := range []string{"index", "watch", "proxy", "no-daemon"} {
-		if f := cmd.Flags().Lookup(name); f != nil && f.Changed {
-			fmt.Fprintf(os.Stderr, "[gortex] note: --%s is deprecated and ignored on the proxy path; "+
-				"`gortex mcp` proxies to the daemon (auto-starting it) and falls back to an embedded server.\n", name)
+	for _, lf := range legacyMCPFlags {
+		if f := cmd.Flags().Lookup(lf.name); f != nil && f.Changed {
+			fmt.Fprintf(os.Stderr, "[gortex] note: --%s is deprecated and ignored; %s.\n", lf.name, lf.reason)
 		}
 	}
+}
+
+// embeddedStoreDirPattern is the temp-directory name the embedded server's
+// throwaway sqlite store lives in. Shared by the allocator and the reaper.
+const embeddedStoreDirPattern = "gortex-mcp-store-*"
+
+// embeddedStoreLockName is the advisory lock file every live embedded store
+// holds for its process lifetime, inside its own store directory. It is the
+// reaper's liveness proof: the directory mtime is not one, because sqlite
+// writes update files INSIDE the directory without touching the directory's
+// own mtime, so a session that has been serving for days looks as old as its
+// first second.
+const embeddedStoreLockName = "store.lock"
+
+// staleEmbeddedStoreTTL is a cheap pre-filter in front of the lock probe, not
+// the liveness test. It keeps a launch from opening a lock file for every
+// recent sibling directory; the lock is what decides whether a candidate is
+// actually abandoned.
+const staleEmbeddedStoreTTL = 48 * time.Hour
+
+// reapStaleEmbeddedStores removes abandoned embedded-store directories. The
+// one-shot server deletes its own directory on exit, but a SIGKILL skips that
+// and strands a store that can run to gigabytes.
+//
+// A candidate is removed only after this process non-blockingly acquires that
+// directory's advisory lock. A live server holds that lock until it exits (the
+// kernel drops it even on SIGKILL), so a failed acquisition means "in use" and
+// the directory is left alone however old it looks. Best effort otherwise:
+// every error is a debug line, never a reason to fail startup.
+func reapStaleEmbeddedStores(logger *zap.Logger) {
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), embeddedStoreDirPattern))
+	if err != nil {
+		logger.Debug("mcp: could not scan for stale embedded stores", zap.Error(err))
+		return
+	}
+	cutoff := time.Now().Add(-staleEmbeddedStoreTTL)
+	for _, dir := range matches {
+		info, statErr := os.Stat(dir)
+		if statErr != nil || !info.IsDir() || info.ModTime().After(cutoff) {
+			continue
+		}
+		lock := flock.New(filepath.Join(dir, embeddedStoreLockName))
+		locked, lockErr := lock.TryLock()
+		if lockErr != nil {
+			logger.Debug("mcp: could not probe embedded store lock", zap.String("dir", dir), zap.Error(lockErr))
+			continue
+		}
+		if !locked {
+			// Owned by a live one-shot server — nothing to reap here.
+			continue
+		}
+		rmErr := os.RemoveAll(dir)
+		_ = lock.Unlock()
+		if rmErr != nil {
+			logger.Debug("mcp: could not reap stale embedded store", zap.String("dir", dir), zap.Error(rmErr))
+			continue
+		}
+		logger.Debug("mcp: reaped stale embedded store", zap.String("dir", dir))
+	}
+}
+
+// newEmbeddedStorePath allocates the per-process sqlite store the embedded
+// MCP server runs against, inside a fresh temp directory nothing else can
+// name, and takes the directory's advisory lock so a later launch's reaper
+// treats this store as live for as long as this process runs. It returns the
+// store path and a func that releases the lock and removes the directory; the
+// caller runs that only after the store handle is closed.
+//
+// A lock that cannot be taken is a hard failure rather than a warning: without
+// it the store is indistinguishable from abandoned debris, and a session that
+// outlives staleEmbeddedStoreTTL would have its database deleted underneath it.
+func newEmbeddedStorePath() (string, func(), error) {
+	dir, err := os.MkdirTemp("", embeddedStoreDirPattern)
+	if err != nil {
+		return "", nil, err
+	}
+	lock := flock.New(filepath.Join(dir, embeddedStoreLockName))
+	locked, lockErr := lock.TryLock()
+	if lockErr != nil || !locked {
+		_ = os.RemoveAll(dir)
+		if lockErr == nil {
+			lockErr = fmt.Errorf("lock already held")
+		}
+		return "", nil, fmt.Errorf("lock embedded store dir %q: %w", dir, lockErr)
+	}
+	return filepath.Join(dir, "embedded.sqlite"), func() {
+		_ = lock.Unlock()
+		_ = os.RemoveAll(dir)
+	}, nil
 }
 
 func runMCP(cmd *cobra.Command, args []string) error {
@@ -171,18 +281,34 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// The savings ledger is machine-global — the same sidecar database
 	// every entry point writes and the `gortex savings` CLI reads.
 	// --cache-dir deliberately does NOT relocate it: users set that flag
-	// to move the graph cache, and quietly splitting the ledger away
-	// from the dashboard's default read path recreates the
+	// to move the notes / feedback side stores, and quietly splitting the
+	// ledger away from the dashboard's default read path recreates the
 	// empty-dashboard failure mode. Isolation (tests, sandboxes) comes
 	// from XDG_DATA_HOME / XDG_CACHE_HOME, which both ledger paths
 	// honour.
 
+	// The embedded server needs a graph store of its own. It must be a
+	// private temp file: it takes no store lock, so pointing it at the
+	// shared default store would put a second unsynchronised writer on the
+	// daemon's database. Removed on shutdown — the graph is rebuilt from
+	// the tree on every launch. Sweep whatever earlier launches were killed
+	// before they could remove theirs.
+	reapStaleEmbeddedStores(logger)
+	storePath, removeStoreDir, err := newEmbeddedStorePath()
+	if err != nil {
+		return fmt.Errorf("create embedded store: %w", err)
+	}
+	// Registered before the stack's Close so it runs after it: the sqlite
+	// handle must be shut before the directory under it disappears.
+	defer removeStoreDir()
+
 	ss, err := serverstack.NewSharedServer(serverstack.SharedServerConfig{
-		Lifecycle: serverstack.LifecycleOneshot,
-		Index:     mcpIndex,
-		Config:    cfg,
-		Logger:    logger,
-		Version:   version,
+		Lifecycle:   serverstack.LifecycleOneshot,
+		Index:       mcpIndex,
+		BackendPath: storePath,
+		Config:      cfg,
+		Logger:      logger,
+		Version:     version,
 		Embedder: serverstack.EmbedderRequest{
 			FlagChanged: cmd.Flags().Changed("embeddings"),
 			FlagEnabled: mcpEmbeddings,
@@ -289,69 +415,20 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		errCh <- srv.ServeStdio()
 	}()
 
-	// Create persistence store.
-	var store persistence.Store
-	if mcpNoCache {
-		store = persistence.NopStore{}
-	} else {
-		var err error
-		store, err = persistence.NewFileStore(mcpCacheDir, version)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[gortex] warning: cache disabled: %v\n", err)
-			store = persistence.NopStore{}
-		}
-	}
-
 	// Background: index, watch, analyze — graph populates while MCP is live.
 	go func() {
 		if mcpIndex != "" {
-			commitHash := gitCommitHash(mcpIndex)
-			branch := gitBranch(mcpIndex)
-			repoKey := canonicalRepo(mcpIndex)
-			cached := false
-
-			if commitHash != "" && store.Check(repoKey, branch, commitHash) && store.Validate(repoKey, branch, commitHash) {
-				snap, err := store.Load(repoKey, branch, commitHash)
-				if err == nil {
-					for _, n := range snap.Nodes {
-						g.AddNode(n)
-					}
-					for _, e := range snap.Edges {
-						g.AddEdge(e)
-					}
-					idx.SetFileMtimes(snap.FileMtimes)
-					idx.SetRootPath(mcpIndex)
-
-					// Restore vector index if available.
-					if len(snap.VectorIndex) > 0 && snap.VectorDims > 0 {
-						if err := idx.ImportVectorIndex(snap.VectorIndex, snap.VectorDims, snap.VectorCount); err != nil {
-							fmt.Fprintf(os.Stderr, "[gortex] vector index restore failed: %v\n", err)
-						}
-					}
-
-					result, err := idx.IncrementalReindexPaths(mcpIndex, nil)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "[gortex] incremental reindex failed: %v\n", err)
-					} else {
-						fmt.Fprintf(os.Stderr, "[gortex] restored graph (%d nodes, %d edges), re-indexed %d stale files in %dms\n",
-							result.NodeCount, result.EdgeCount, result.FileCount, result.DurationMs)
-					}
-					cached = true
-				} else {
-					fmt.Fprintf(os.Stderr, "[gortex] cache load failed, will re-index: %v\n", err)
-				}
+			// The embedded server holds its graph for the life of the
+			// process only: it indexes the tree on every launch. A
+			// long-lived graph is what the daemon is for.
+			fmt.Fprintf(os.Stderr, "[gortex] indexing %s...\n", mcpIndex)
+			result, err := idx.Index(mcpIndex)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[gortex] indexing failed: %v\n", err)
+				return
 			}
-
-			if !cached {
-				fmt.Fprintf(os.Stderr, "[gortex] indexing %s...\n", mcpIndex)
-				result, err := idx.Index(mcpIndex)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "[gortex] indexing failed: %v\n", err)
-					return
-				}
-				fmt.Fprintf(os.Stderr, "[gortex] indexed %d files (%d nodes, %d edges) in %dms\n",
-					result.FileCount, result.NodeCount, result.EdgeCount, result.DurationMs)
-			}
+			fmt.Fprintf(os.Stderr, "[gortex] indexed %d files (%d nodes, %d edges) in %dms\n",
+				result.FileCount, result.NodeCount, result.EdgeCount, result.DurationMs)
 		}
 
 		// Search backend is auto-updated via SearchProvider (idx.Search)
@@ -409,32 +486,6 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		return err
 	case sig := <-sigCh:
 		fmt.Fprintf(os.Stderr, "\n[gortex] received %s, shutting down\n", sig)
-
-		// Persist graph snapshot on shutdown.
-		if mcpIndex != "" {
-			commitHash := gitCommitHash(mcpIndex)
-			if commitHash != "" {
-				snap := &persistence.Snapshot{
-					Version:    version,
-					RepoPath:   canonicalRepo(mcpIndex),
-					CommitHash: commitHash,
-					Branch:     gitBranch(mcpIndex),
-					IndexedAt:  time.Now(),
-					Nodes:      g.AllNodes(),
-					Edges:      g.AllEdges(),
-					FileMtimes: idx.FileMtimes(),
-				}
-				// Include vector index if available.
-				snap.VectorIndex, snap.VectorDims, snap.VectorCount = idx.ExportVectorIndex()
-				if err := store.Save(snap); err != nil {
-					fmt.Fprintf(os.Stderr, "[gortex] cache save failed: %v\n", err)
-				} else {
-					fmt.Fprintf(os.Stderr, "[gortex] saved graph snapshot (%d nodes, %d edges)\n",
-						len(snap.Nodes), len(snap.Edges))
-				}
-			}
-		}
-
 		return nil
 	}
 }

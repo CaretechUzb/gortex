@@ -2,10 +2,15 @@
 package gortex
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
@@ -13,40 +18,114 @@ import (
 )
 
 // Engine is the public entry point for the Gortex code intelligence engine.
+//
+// An Engine owns a SQLite graph store — an open database handle plus the
+// background bookkeeping that keeps its write-ahead log in check — so every
+// Engine must be closed when the caller is done with it. See Close.
 type Engine struct {
-	graph   *graph.Graph
+	store   *store_sqlite.Store
 	indexer *indexer.Indexer
 	query   *query.Engine
+
+	// tmpDir is non-empty when New created the store in a temp directory it
+	// owns; Close removes it.
+	tmpDir string
 }
 
 // Option configures an Engine.
-type Option func(*config.IndexConfig)
+type Option func(*settings)
+
+// settings collects everything the options can influence before the Engine
+// and its store are constructed.
+type settings struct {
+	index     config.IndexConfig
+	storePath string
+}
 
 // WithWorkers sets the number of parallel parsing workers.
 func WithWorkers(n int) Option {
-	return func(c *config.IndexConfig) { c.Workers = n }
+	return func(s *settings) { s.index.Workers = n }
 }
 
 // WithExclude adds exclude patterns.
 func WithExclude(patterns ...string) Option {
-	return func(c *config.IndexConfig) { c.Exclude = append(c.Exclude, patterns...) }
+	return func(s *settings) { s.index.Exclude = append(s.index.Exclude, patterns...) }
+}
+
+// WithStorePath puts the graph store at path, creating the file and any
+// missing parent directories. The store survives Close, so a later Engine
+// opened on the same path starts from the graph the previous run indexed.
+//
+// Without this option New keeps the store in a temp directory that Close
+// deletes, which suits one-shot analysis but throws the index away.
+func WithStorePath(path string) Option {
+	return func(s *settings) { s.storePath = path }
 }
 
 // New creates a new Gortex Engine with the given options.
-func New(opts ...Option) *Engine {
+//
+// The caller owns the returned Engine's store and must call Close on it.
+func New(opts ...Option) (*Engine, error) {
 	cfg := config.Default()
+	set := &settings{index: cfg.Index}
 	for _, o := range opts {
-		o(&cfg.Index)
+		o(set)
 	}
 
-	g := graph.New()
+	path := set.storePath
+	tmpDir := ""
+	if path == "" {
+		dir, err := os.MkdirTemp("", "gortex-engine-*")
+		if err != nil {
+			return nil, fmt.Errorf("create temporary graph store directory: %w", err)
+		}
+		tmpDir = dir
+		path = filepath.Join(dir, "graph.sqlite")
+	} else if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create graph store directory %s: %w", dir, err)
+		}
+	}
+
+	st, err := store_sqlite.Open(path)
+	if err != nil {
+		if tmpDir != "" {
+			_ = os.RemoveAll(tmpDir)
+		}
+		return nil, fmt.Errorf("open graph store %s: %w", path, err)
+	}
+
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 
-	idx := indexer.New(g, reg, cfg.Index, zap.NewNop())
-	eng := query.NewEngine(g)
+	return &Engine{
+		store:   st,
+		indexer: indexer.New(st, reg, set.index, zap.NewNop()),
+		query:   query.NewEngine(st),
+		tmpDir:  tmpDir,
+	}, nil
+}
 
-	return &Engine{graph: g, indexer: idx, query: eng}
+// Close releases the graph store: it checkpoints the write-ahead log and
+// closes the database handle, and removes the temp directory when New created
+// one. Every Engine must be closed exactly once; calling it a second time is a
+// no-op. After Close the Engine's query and index methods must not be used.
+func (e *Engine) Close() error {
+	if e == nil {
+		return nil
+	}
+	var err error
+	if e.store != nil {
+		err = e.store.Close()
+		e.store = nil
+	}
+	if e.tmpDir != "" {
+		if rmErr := os.RemoveAll(e.tmpDir); rmErr != nil && err == nil {
+			err = rmErr
+		}
+		e.tmpDir = ""
+	}
+	return err
 }
 
 // IndexResult is the result of an indexing operation.

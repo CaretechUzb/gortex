@@ -12,6 +12,7 @@ package storetest
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"testing"
@@ -25,10 +26,77 @@ import (
 // on-disk state should use t.TempDir() internally to isolate.
 type Factory func(t *testing.T) graph.Store
 
+// ReadSemantics names what a backend hands back from a read — the one
+// behaviour the suite cannot discover by probing, because both answers are
+// legitimate and neither is observable without knowing which to expect.
+type ReadSemantics int
+
+const (
+	// ReadsDetached means every read materialises a fresh copy: mutating a
+	// returned *Node or *Edge changes nothing in the store, and the change is
+	// lost unless the caller hands it back through a write method. This is the
+	// contract every backend the daemon actually runs on satisfies, and the
+	// only one production code is allowed to assume.
+	ReadsDetached ReadSemantics = iota
+
+	// ReadsAliasStore means a read hands back the store's own live pointer, so
+	// an in-place field mutation is immediately durable without any write call.
+	// The in-memory staging graph behaves this way because it is a bag of
+	// pointers, and the cold-index path leans on it as a scratch buffer.
+	//
+	// That is the ONE sanctioned exception. Production code must never rely on
+	// aliasing: the same code running against a detached backend would silently
+	// drop the mutation. Passes that need an attribute change to stick call the
+	// explicit persistence capability (graph.EdgePersister and friends), which
+	// is correct under both semantics.
+	ReadsAliasStore
+)
+
+// Semantics declares the backend behaviours the conformance suite cannot infer
+// from the Store interface alone. Every backend states its answer at the call
+// site, so a divergence between backends is visible in source rather than
+// buried in whichever implementation a reader happens to open first.
+type Semantics struct {
+	// Reads declares whether reads alias the store or return detached copies.
+	Reads ReadSemantics
+
+	// EvictsEmptyRepoPrefix declares what EvictRepo("") does. The empty prefix
+	// is the standalone/single-repository namespace: nodes indexed without a
+	// repository own it. The two backends disagree about whether it can be
+	// evicted as a unit — the in-memory store treats the empty prefix as "not a
+	// repository" and no-ops, while the SQLite store runs the ordinary
+	// repo_prefix = ? delete and clears it.
+	//
+	// This field records that disagreement rather than resolving it. Changing
+	// either side is a behaviour change for the standalone indexing path and
+	// belongs in its own change, with its own justification; until then, no
+	// caller should hand a user-supplied prefix to EvictRepo without checking
+	// it is non-empty.
+	EvictsEmptyRepoPrefix bool
+
+	// AdjacencyLineOrdered declares what order GetOutEdges / GetInEdges hand
+	// their edges back in. True means the backend sorts: out-edges ascending
+	// by source line across kinds, in-edges grouped by kind. False means the
+	// backend returns the edges in the order they were added.
+	//
+	// The SQLite store declares the order in SQL, riding the adjacency indexes
+	// that already carry it. The in-memory staging graph hands back its
+	// per-node append slice untouched: sorting it would tax the indexer's hot
+	// staging path — the one place that store still exists to be fast — for a
+	// property no staging caller needs.
+	//
+	// Both are stable within a backend, which is all a single-backend caller
+	// needs. A caller that needs a line order ACROSS backends must sort the
+	// result itself; the declaration exists so that requirement is visible
+	// rather than discovered when a first-match helper picks a different edge
+	// on one backend than the other.
+	AdjacencyLineOrdered bool
+}
+
 // RunConformance runs the full conformance suite against the Store
 // produced by factory. Backends invoke it from a _test.go in their
-// own package.
-func RunConformance(t *testing.T, factory Factory) {
+// own package, declaring their semantics alongside the factory.
+func RunConformance(t *testing.T, factory Factory, semantics Semantics) {
 	t.Helper()
 	t.Run("AddGetNode", func(t *testing.T) { testAddGetNode(t, factory) })
 	t.Run("AddGetEdge", func(t *testing.T) { testAddGetEdge(t, factory) })
@@ -113,6 +181,14 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("BlameEnrichmentSidecar", func(t *testing.T) { testBlameEnrichmentSidecar(t, factory) })
 	t.Run("ContractBridgeRoundTrip", func(t *testing.T) { testContractBridgeRoundTrip(t, factory) })
 	t.Run("PrefixDiagnostics", func(t *testing.T) { testPrefixDiagnostics(t, factory) })
+	t.Run("EdgePersistRoundTrip", func(t *testing.T) { testEdgePersistRoundTrip(t, factory) })
+	t.Run("ReadAliasing", func(t *testing.T) { testReadAliasing(t, factory, semantics) })
+	t.Run("IteratorReentrancy", func(t *testing.T) { testIteratorReentrancy(t, factory) })
+	t.Run("ConcurrentReadsDuringWrite", func(t *testing.T) { testConcurrentReadsDuringWrite(t, factory) })
+	t.Run("ReadOrdering", func(t *testing.T) { testReadOrdering(t, factory, semantics) })
+	t.Run("AttributeOnlyReindex", func(t *testing.T) { testAttributeOnlyReindex(t, factory) })
+	t.Run("MutationReceipts", func(t *testing.T) { testMutationReceipts(t, factory) })
+	t.Run("EmptyRepoPrefix", func(t *testing.T) { testEmptyRepoPrefix(t, factory, semantics) })
 }
 
 // testPrefixDiagnostics is the cross-backend fence for the repo-ownership
@@ -636,7 +712,13 @@ func testDuplicateQualNameAcrossRepos(t *testing.T, factory Factory) {
 	for _, want := range []*graph.Node{first, second} {
 		got := s.GetNode(want.ID)
 		if got == nil {
+			// Fatalf ends the test, but static analysis reasons about the
+			// testing helper as an ordinary call and reads the field access
+			// below as reachable with a nil pointer. The explicit return
+			// makes the dereference provably safe instead of conventionally
+			// safe — same rule at every bail-out-then-dereference below.
 			t.Fatalf("GetNode(%q) = nil after adding the same qual_name in another repo", want.ID)
+			return
 		}
 		if got.RepoPrefix != want.RepoPrefix {
 			t.Fatalf("GetNode(%q).RepoPrefix = %q, want %q", want.ID, got.RepoPrefix, want.RepoPrefix)
@@ -1292,6 +1374,7 @@ func testNodeLightScanner(t *testing.T, factory Factory) {
 	}
 	if lightA == nil {
 		t.Fatal("AllNodesLight did not return A")
+		return
 	}
 	if lightA.Kind != a.Kind || lightA.Name != a.Name || lightA.QualName != a.QualName ||
 		lightA.FilePath != a.FilePath || lightA.StartLine != a.StartLine || lightA.EndLine != a.EndLine ||
@@ -1350,6 +1433,7 @@ func testLightEdgeScanner(t *testing.T, factory Factory) {
 	// Promoted fields survive the meta-less scan.
 	if lightCall == nil {
 		t.Fatal("AllEdgesLight did not return the call edge")
+		return
 	}
 	if lightCall.Line != 11 || lightCall.Confidence != 0.75 || lightCall.Origin != graph.OriginLSPResolved ||
 		lightCall.Tier != "lsp" || !lightCall.CrossRepo {
@@ -4266,6 +4350,7 @@ func testContractBridgeRoundTrip(t *testing.T, factory Factory) {
 	got := s.GetNode("bridge::http::GET::/v1/users")
 	if got == nil {
 		t.Fatalf("bridge node did not round-trip")
+		return
 	}
 	if got.Kind != graph.KindContractBridge {
 		t.Fatalf("bridge kind = %q, want %q", got.Kind, graph.KindContractBridge)
@@ -4338,4 +4423,650 @@ func testContractBridgeRoundTrip(t *testing.T, factory Factory) {
 	if got := s.GetInEdges("http::GET::/v1/users"); len(got) != 0 {
 		t.Fatalf("stale bridge in-edges survived eviction: %v", got)
 	}
+}
+
+// -- read semantics ----------------------------------------------------
+//
+// The two Store implementations answer a read differently, and until these
+// two subtests existed nothing in the tree said so out loud. The staging
+// graph is a bag of pointers, so a read hands back the store's own *Edge and
+// an in-place field assignment is already durable. A disk backend decodes a
+// row into a fresh struct, so the same assignment writes to garbage the
+// moment the caller drops it.
+//
+// The reconciling mechanism is the optional persistence capability set
+// (graph.EdgePersister / EdgeMetaBatchPersister / EdgeTerminalStampPersister).
+// Code that must make an attribute change stick calls whichever of them the
+// store advertises and is then correct under both semantics — which is why
+// enrichment passes are written as `if w, ok := g.(graph.EdgePersister); ok`
+// rather than mutating and hoping.
+
+// testEdgePersistRoundTrip proves the escape hatch actually works: after a
+// read → mutate → persist cycle, a *fresh* read observes the new attributes.
+// Backends that alias their reads implement none of these capabilities (they
+// have no need for them) and skip.
+func testEdgePersistRoundTrip(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+
+	_, persistOne := s.(graph.EdgePersister)
+	_, persistBatch := s.(graph.EdgeMetaBatchPersister)
+	_, persistStamps := s.(graph.EdgeTerminalStampPersister)
+	if !persistOne && !persistBatch && !persistStamps {
+		t.Skip("backend implements no edge-persistence capability")
+	}
+
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	base := mkEdge("a", "b", graph.EdgeCalls)
+	base.Confidence = 0.2
+	base.ConfidenceLabel = "heuristic"
+	base.Origin = graph.OriginTextMatched
+	base.Tier = "syntax"
+	base.Meta = map[string]any{"opaque": "before"}
+	s.AddEdge(base)
+
+	// readBack re-reads the single a→b edge through the public adjacency
+	// API, so an assertion can never accidentally observe the same struct
+	// the test just mutated.
+	readBack := func() *graph.Edge {
+		t.Helper()
+		out := s.GetOutEdges("a")
+		if len(out) != 1 {
+			t.Fatalf("GetOutEdges(a) = %d edges, want exactly 1", len(out))
+		}
+		return out[0]
+	}
+
+	if w, ok := s.(graph.EdgePersister); ok {
+		e := readBack()
+		e.Confidence = 0.91
+		e.ConfidenceLabel = "confirmed"
+		e.Origin = graph.OriginLSPResolved
+		e.Tier = "compiler"
+		e.Meta = map[string]any{"opaque": "after-single"}
+		w.PersistEdgeAttributes(e)
+
+		got := readBack()
+		if got.Confidence != 0.91 || got.ConfidenceLabel != "confirmed" {
+			t.Fatalf("PersistEdgeAttributes lost confidence: %v/%q", got.Confidence, got.ConfidenceLabel)
+		}
+		if got.Origin != graph.OriginLSPResolved || got.Tier != "compiler" {
+			t.Fatalf("PersistEdgeAttributes lost provenance: %q/%q", got.Origin, got.Tier)
+		}
+		if got.Meta["opaque"] != "after-single" {
+			t.Fatalf("PersistEdgeAttributes lost meta: %v", got.Meta)
+		}
+	}
+
+	if w, ok := s.(graph.EdgeMetaBatchPersister); ok {
+		e := readBack()
+		e.Confidence = 0.55
+		e.Origin = graph.OriginASTInferred
+		e.Meta = map[string]any{"opaque": "after-batch"}
+		w.PersistEdgeAttributesBatch([]*graph.Edge{e})
+
+		got := readBack()
+		if got.Confidence != 0.55 || got.Origin != graph.OriginASTInferred {
+			t.Fatalf("PersistEdgeAttributesBatch lost attributes: %v/%q", got.Confidence, got.Origin)
+		}
+		if got.Meta["opaque"] != "after-batch" {
+			t.Fatalf("PersistEdgeAttributesBatch lost meta: %v", got.Meta)
+		}
+		// An empty batch must be a no-op rather than a panic or a wipe.
+		w.PersistEdgeAttributesBatch(nil)
+		if got := readBack(); got.Confidence != 0.55 {
+			t.Fatalf("empty PersistEdgeAttributesBatch disturbed the edge: %+v", got)
+		}
+	}
+
+	if w, ok := s.(graph.EdgeTerminalStampPersister); ok {
+		// The narrow capability: only the two terminal keys may move. Set a
+		// sentinel on every other attribute first so a wide write is caught.
+		before := readBack()
+		before.Confidence = 0.33
+		before.Origin = "stamp-sentinel"
+		before.Meta = map[string]any{"opaque": "stamp-sentinel"}
+		if p, ok := s.(graph.EdgePersister); ok {
+			p.PersistEdgeAttributes(before)
+		}
+
+		e := readBack()
+		e.Meta = map[string]any{
+			"opaque":                            "must-not-be-written",
+			graph.EdgeMetaResolveTerminal:       true,
+			graph.EdgeMetaResolveTerminalReason: "external",
+		}
+		e.Confidence = 0.01
+		e.Origin = "must-not-be-written"
+		w.PersistEdgeTerminalStamps([]*graph.Edge{e})
+
+		got := readBack()
+		if got.Meta[graph.EdgeMetaResolveTerminal] != true {
+			t.Fatalf("terminal stamp did not land: %v", got.Meta)
+		}
+		if got.Meta[graph.EdgeMetaResolveTerminalReason] != "external" {
+			t.Fatalf("terminal reason did not land: %v", got.Meta)
+		}
+		if got.Confidence != 0.33 || got.Origin != "stamp-sentinel" {
+			t.Fatalf("terminal stamp widened into other attributes: %v/%q", got.Confidence, got.Origin)
+		}
+		if got.Meta["opaque"] != "stamp-sentinel" {
+			t.Fatalf("terminal stamp overwrote unrelated meta: %v", got.Meta)
+		}
+		// Nil edges and unknown identities are no-ops.
+		w.PersistEdgeTerminalStamps(nil)
+		w.PersistEdgeTerminalStamps([]*graph.Edge{nil})
+	}
+}
+
+// testReadAliasing pins the declared semantics on both the edge and the node
+// axis. The assertion is deliberately symmetric: a backend that claims
+// detached reads must DROP an unpersisted mutation, and one that claims
+// aliasing must KEEP it. Either way the suite records a fact rather than a
+// preference, so a backend cannot quietly change sides.
+//
+// There is no NodePersister — a node attribute change is written by handing
+// the node back to AddNode — so nodes are covered on this axis only.
+func testReadAliasing(t *testing.T, factory Factory, semantics Semantics) {
+	t.Helper()
+	aliases := semantics.Reads == ReadsAliasStore
+
+	t.Run("Edge", func(t *testing.T) {
+		s := factory(t)
+		s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+		s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+		e := mkEdge("a", "b", graph.EdgeCalls)
+		e.Confidence = 0.25
+		s.AddEdge(e)
+
+		out := s.GetOutEdges("a")
+		if len(out) != 1 {
+			t.Fatalf("GetOutEdges(a) = %d edges, want 1", len(out))
+		}
+		// No persistence call — this is exactly the mistake the split
+		// punishes.
+		out[0].Confidence = 0.99
+
+		again := s.GetOutEdges("a")
+		if len(again) != 1 {
+			t.Fatalf("GetOutEdges(a) = %d edges, want 1", len(again))
+		}
+		if aliases && again[0].Confidence != 0.99 {
+			t.Fatalf("backend declares aliasing reads but the mutation was dropped: %v", again[0].Confidence)
+		}
+		if !aliases && again[0].Confidence != 0.25 {
+			t.Fatalf("backend declares detached reads but an unpersisted mutation landed: %v", again[0].Confidence)
+		}
+	})
+
+	t.Run("Node", func(t *testing.T) {
+		s := factory(t)
+		n := mkNode("a.go::Foo", "Foo", "a.go", graph.KindFunction)
+		n.EndLine = 10
+		s.AddNode(n)
+
+		got := s.GetNode("a.go::Foo")
+		if got == nil {
+			t.Fatal("GetNode returned nil for inserted node")
+			return
+		}
+		// EndLine rather than Name/FilePath: the aliasing backend indexes
+		// nodes by name and path, so mutating one of those behind its back
+		// would corrupt the store instead of demonstrating anything.
+		got.EndLine = 999
+
+		again := s.GetNode("a.go::Foo")
+		if again == nil {
+			t.Fatal("GetNode returned nil on re-read")
+			return
+		}
+		if aliases && again.EndLine != 999 {
+			t.Fatalf("backend declares aliasing reads but the node mutation was dropped: %d", again.EndLine)
+		}
+		if !aliases && again.EndLine != 10 {
+			t.Fatalf("backend declares detached reads but an unpersisted node mutation landed: %d", again.EndLine)
+		}
+	})
+}
+
+// -- reentrancy, ordering and payload semantics -------------------------
+
+// testIteratorReentrancy proves a predicate iterator's yield body may call
+// back into the store. This is not hypothetical: the resolver reads adjacency
+// and node identities while walking EdgesWithUnresolvedTarget, so an
+// implementation that held a connection (or a lock) across yield would
+// deadlock the daemon rather than fail a test.
+//
+// A backend that streams rows must therefore release its read resource before
+// calling yield, or materialise the page first. Note that a deadlock here
+// HANGS the package run; a store built on a single connection (SQLite opened
+// at ":memory:") is exactly that shape, which is why the disk factory stays
+// file-backed.
+func testIteratorReentrancy(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	for i := range 4 {
+		s.AddNode(mkNode(fmt.Sprintf("n%d", i), fmt.Sprintf("N%d", i), "x.go", graph.KindFunction))
+	}
+	for i := range 3 {
+		e := mkEdge("n0", fmt.Sprintf("n%d", i+1), graph.EdgeCalls)
+		e.Line = i + 1
+		s.AddEdge(e)
+	}
+	unresolved := mkEdge("n0", "repo::"+graph.UnresolvedMarker+"Missing", graph.EdgeCalls)
+	unresolved.Line = 90
+	s.AddEdge(unresolved)
+
+	// Point lookup, adjacency read and a nested iterator, all from inside a
+	// yield body.
+	seen := 0
+	for e := range s.EdgesByKind(graph.EdgeCalls) {
+		seen++
+		if s.GetNode(e.From) == nil {
+			t.Fatalf("re-entrant GetNode(%q) returned nil", e.From)
+		}
+		if len(s.GetOutEdges(e.From)) == 0 {
+			t.Fatalf("re-entrant GetOutEdges(%q) returned nothing", e.From)
+		}
+		nested := 0
+		for range s.NodesByKind(graph.KindFunction) {
+			nested++
+			if s.NodeCount() != 4 {
+				t.Fatalf("doubly re-entrant NodeCount = %d, want 4", s.NodeCount())
+			}
+		}
+		if nested != 4 {
+			t.Fatalf("nested NodesByKind yielded %d nodes, want 4", nested)
+		}
+	}
+	if seen != 4 {
+		t.Fatalf("EdgesByKind(calls) yielded %d edges, want 4", seen)
+	}
+
+	for e := range s.EdgesWithUnresolvedTarget() {
+		if got := s.GetOutEdges(e.From); len(got) != 4 {
+			t.Fatalf("re-entrant read inside the unresolved scan saw %d out-edges, want 4", len(got))
+		}
+	}
+
+	// Early stop must release whatever the iterator holds, or the very next
+	// read blocks.
+	for range s.EdgesByKind(graph.EdgeCalls) {
+		break
+	}
+	if s.EdgeCount() != 4 {
+		t.Fatalf("EdgeCount after an abandoned iterator = %d, want 4", s.EdgeCount())
+	}
+}
+
+// testConcurrentReadsDuringWrite runs more concurrent readers than the SQLite
+// backend keeps read connections for (its pool tops out at four) while a
+// writer mutates, so readers must queue on the pool rather than fail, and the
+// writer must not be starved behind them.
+func testConcurrentReadsDuringWrite(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	const (
+		readers = 8
+		writes  = 40
+		reads   = 20
+	)
+	s.AddNode(mkNode("seed", "Seed", "x.go", graph.KindFunction))
+
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	for r := range readers {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			for range reads {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				// A read concurrent with a write may legitimately observe
+				// either side of it; only crashes, deadlocks and torn reads
+				// are forbidden.
+				if n := s.GetNode("seed"); n != nil && n.ID != "seed" {
+					t.Errorf("torn node read: %+v", n)
+					return
+				}
+				_ = s.GetOutEdges("seed")
+				_ = s.NodeCount()
+				for range s.NodesByKind(graph.KindFunction) {
+					break
+				}
+			}
+		}(r)
+	}
+
+	for i := range writes {
+		id := fmt.Sprintf("w%d", i)
+		s.AddNode(mkNode(id, fmt.Sprintf("W%d", i), "y.go", graph.KindFunction))
+		e := mkEdge("seed", id, graph.EdgeCalls)
+		e.Line = i + 1
+		s.AddEdge(e)
+	}
+	close(done)
+	wg.Wait()
+
+	if got, want := s.NodeCount(), writes+1; got != want {
+		t.Fatalf("NodeCount after concurrent load = %d, want %d", got, want)
+	}
+	if got := len(s.GetOutEdges("seed")); got != writes {
+		t.Fatalf("GetOutEdges(seed) after concurrent load = %d, want %d", got, writes)
+	}
+}
+
+// testReadOrdering pins how much of a read's ORDER callers may rely on. Three
+// separate claims, and they are deliberately not the same claim:
+//
+//  1. GetOutEdges returns a node's out-edges in the order the backend declares
+//     through Semantics.AdjacencyLineOrdered — ascending source line across
+//     kinds when the backend sorts, the order the edges were added when it
+//     does not. The distinction is load-bearing, which is why the edges here
+//     are seeded OUT of line order: helpers that take the FIRST edge matching
+//     a predicate — the semantic enricher's matching-edge lookup, for one —
+//     pick a different edge on the two backends when a caller has several
+//     edges to the same target from different lines, which is what any loop
+//     body or repeated call produces. A caller that needs the earliest site
+//     must sort rather than trust the read.
+//
+//  2. GetInEdges is stable per backend and, on a line-ordered backend,
+//     grouped by edge kind. Ordering WITHIN a kind is insertion order, not
+//     line order: the reverse-adjacency index carries the row id, not the
+//     line, and buying a line order here would cost a sort on every in-edge
+//     read. Callers that need a total order over in-edges must sort.
+//
+//  3. AllNodes / AllEdges are NOT ordered at all. The staging graph walks
+//     hash-map shards, so it hands back a fresh permutation per call by
+//     construction. Only set equality is portable here.
+func testReadOrdering(t *testing.T, factory Factory, semantics Semantics) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("c", "C", "x.go", graph.KindFunction))
+
+	// Several sites against the same target with an interleaved kind, added in
+	// an order that is NOT the line order — the shape a re-extraction or a
+	// deferred enrichment pass produces. Seeding in line order would let a
+	// backend that simply replays its append slice pass the ordered assertion
+	// without ordering anything. The kind interleave separates "ordered by
+	// line" from "grouped by kind".
+	seed := []struct {
+		kind graph.EdgeKind
+		line int
+	}{
+		{graph.EdgeCalls, 30},
+		{graph.EdgeReferences, 20},
+		{graph.EdgeCalls, 10},
+	}
+	for _, spec := range seed {
+		e := mkEdge("a", "b", spec.kind)
+		e.Line = spec.line
+		s.AddEdge(e)
+	}
+	other := mkEdge("c", "b", graph.EdgeCalls)
+	other.Line = 5
+	s.AddEdge(other)
+
+	// render describes an edge sequence exactly enough to catch a reordering.
+	render := func(edges []*graph.Edge, keep func(*graph.Edge) bool) []string {
+		out := make([]string, 0, len(edges))
+		for _, e := range edges {
+			if keep != nil && !keep(e) {
+				continue
+			}
+			out = append(out, fmt.Sprintf("%s|%s|%d", e.To, e.Kind, e.Line))
+		}
+		return out
+	}
+
+	out := s.GetOutEdges("a")
+	want := []string{"b|calls|30", "b|references|20", "b|calls|10"} // append order
+	if semantics.AdjacencyLineOrdered {
+		want = []string{"b|calls|10", "b|references|20", "b|calls|30"}
+	}
+	if got := render(out, nil); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("GetOutEdges(a) = %v, want %v (AdjacencyLineOrdered=%t)",
+			got, want, semantics.AdjacencyLineOrdered)
+	}
+	if got := render(s.GetOutEdges("a"), nil); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("GetOutEdges(a) is not stable across calls: %v then %v", want, got)
+	}
+	// The consequence: on a line-ordered backend the first match is the first
+	// site; on an append-ordered one it is whichever site was written first.
+	wantFirstCall := 30
+	if semantics.AdjacencyLineOrdered {
+		wantFirstCall = 10
+	}
+	for _, e := range out {
+		if e.To == "b" && e.Kind == graph.EdgeCalls {
+			if e.Line != wantFirstCall {
+				t.Fatalf("first (b, calls) out-edge is at line %d, want %d (AdjacencyLineOrdered=%t)",
+					e.Line, wantFirstCall, semantics.AdjacencyLineOrdered)
+			}
+			break
+		}
+	}
+
+	in := s.GetInEdges("b")
+	if len(in) != 4 {
+		t.Fatalf("GetInEdges(b) = %d edges, want 4", len(in))
+	}
+	if got := render(s.GetInEdges("b"), nil); fmt.Sprint(got) != fmt.Sprint(render(in, nil)) {
+		t.Fatalf("GetInEdges(b) is not stable across calls: %v then %v", render(in, nil), got)
+	}
+	if semantics.AdjacencyLineOrdered {
+		// Grouped by kind, insertion order within a kind — deliberately NOT
+		// line order (line 10 stays behind line 30 because it was written
+		// second).
+		wantIn := []string{"b|calls|30", "b|calls|10", "b|calls|5", "b|references|20"}
+		if got := render(in, nil); fmt.Sprint(got) != fmt.Sprint(wantIn) {
+			t.Fatalf("GetInEdges(b) = %v, want %v (grouped by kind, insertion order within a kind)", got, wantIn)
+		}
+	} else {
+		wantIn := []string{"b|calls|30", "b|references|20", "b|calls|10", "b|calls|5"}
+		if got := render(in, nil); fmt.Sprint(got) != fmt.Sprint(wantIn) {
+			t.Fatalf("GetInEdges(b) = %v, want %v (append order)", got, wantIn)
+		}
+	}
+
+	// Whole-graph reads: same contents, order unspecified.
+	if got, wantIDs := sortNodeIDs(s.AllNodes()), []string{"a", "b", "c"}; fmt.Sprint(got) != fmt.Sprint(wantIDs) {
+		t.Fatalf("AllNodes = %v, want %v", got, wantIDs)
+	}
+	if got, second := sortEdgeKeys(s.AllEdges()), sortEdgeKeys(s.AllEdges()); fmt.Sprint(got) != fmt.Sprint(second) {
+		t.Fatalf("AllEdges contents changed between calls: %v then %v", got, second)
+	}
+}
+
+// testAttributeOnlyReindex pins that ReindexEdges persists an entry's payload
+// even when its identity did not move.
+//
+// The resolver relies on it: when a deferred language-server lookup is still
+// pending, the pass clears the edge's durable terminal stamp and hands the
+// edge back with an unchanged target. Skipping such an entry as "nothing to
+// do" leaves the stale stamp on disk, and the edge stays permanently excluded
+// from later resolution.
+func testAttributeOnlyReindex(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+
+	seed := mkEdge("a", "b", graph.EdgeCalls)
+	seed.Line = 7
+	seed.Confidence = 0.2
+	seed.ConfidenceLabel = "heuristic"
+	seed.Origin = graph.OriginTextMatched
+	seed.Tier = "syntax"
+	seed.Meta = map[string]any{
+		"opaque":                            "before",
+		graph.EdgeMetaResolveTerminal:       true,
+		graph.EdgeMetaResolveTerminalReason: "no_candidate",
+	}
+	s.AddEdge(seed)
+
+	read := func() *graph.Edge {
+		t.Helper()
+		out := s.GetOutEdges("a")
+		if len(out) != 1 {
+			t.Fatalf("GetOutEdges(a) = %d edges, want exactly 1", len(out))
+		}
+		return out[0]
+	}
+
+	e := read()
+	e.Confidence = 0.87
+	e.ConfidenceLabel = "confirmed"
+	e.Origin = graph.OriginLSPResolved
+	e.Tier = "compiler"
+	e.Meta = map[string]any{"opaque": "after"}
+	s.ReindexEdges([]graph.EdgeReindex{{Edge: e, OldTo: e.To}})
+
+	got := read()
+	if got.To != "b" || got.Line != 7 || got.Kind != graph.EdgeCalls {
+		t.Fatalf("attribute-only reindex moved the identity: %+v", got)
+	}
+	if got.Confidence != 0.87 || got.ConfidenceLabel != "confirmed" {
+		t.Fatalf("attribute-only reindex dropped confidence: %v/%q", got.Confidence, got.ConfidenceLabel)
+	}
+	if got.Origin != graph.OriginLSPResolved || got.Tier != "compiler" {
+		t.Fatalf("attribute-only reindex dropped provenance: %q/%q", got.Origin, got.Tier)
+	}
+	if got.Meta["opaque"] != "after" {
+		t.Fatalf("attribute-only reindex dropped meta: %v", got.Meta)
+	}
+	if _, still := got.Meta[graph.EdgeMetaResolveTerminal]; still {
+		t.Fatalf("attribute-only reindex left the stale terminal stamp: %v", got.Meta)
+	}
+
+	// Replaying the same entry is a no-op, not a duplicate or a wipe.
+	s.ReindexEdges([]graph.EdgeReindex{{Edge: got, OldTo: got.To}})
+	replayed := read()
+	if replayed.Confidence != 0.87 || replayed.Origin != graph.OriginLSPResolved {
+		t.Fatalf("idempotent replay disturbed the edge: %+v", replayed)
+	}
+	if s.EdgeCount() != 1 {
+		t.Fatalf("EdgeCount after replay = %d, want 1", s.EdgeCount())
+	}
+}
+
+// testMutationReceipts pins the optional receipt capability both backends
+// advertise. A receipt is how the daemon avoids a whole-graph resolve after a
+// small edit, so an inflated one is merely slow but a receipt that misses a
+// mutation leaves the graph wrong: the contract is that it either describes
+// the window exactly or admits it is incomplete.
+func testMutationReceipts(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	rs, ok := s.(graph.MutationReceiptStore)
+	if !ok {
+		t.Skip("backend does not implement graph.MutationReceiptStore")
+	}
+
+	caller := mkRepoNode("repo/src/a.go::Caller", "Caller", "src/a.go", "repo", graph.KindFunction)
+	callee := mkRepoNode("repo/src/b.go::Load", "Load", "src/b.go", "repo", graph.KindFunction)
+	pending := &graph.Edge{
+		From: caller.ID, To: "repo::" + graph.UnresolvedMarker + "Load",
+		Kind: graph.EdgeCalls, FilePath: "src/a.go", Line: 3,
+	}
+
+	token := rs.BeginMutationReceipt()
+	s.AddBatch([]*graph.Node{caller, callee}, []*graph.Edge{pending})
+	receipt := rs.EndMutationReceipt(token)
+
+	if !receipt.Complete {
+		t.Fatalf("receipt incomplete for a plain batch insert: %+v", receipt)
+	}
+	if !receipt.ResolutionRelevant {
+		t.Fatalf("receipt missed a new unresolved edge: %+v", receipt)
+	}
+	if got, want := receipt.ResolutionFiles(), []string{"src/a.go", "src/b.go"}; !slices.Equal(got, want) {
+		t.Fatalf("resolution files = %v, want exactly %v", got, want)
+	}
+	if !slices.Contains(receipt.TargetIDs, pending.To) {
+		t.Fatalf("receipt target ids %v omit the unresolved target %q", receipt.TargetIDs, pending.To)
+	}
+	if !slices.Contains(receipt.TargetNames, "Load") {
+		t.Fatalf("receipt target names %v omit the added definition", receipt.TargetNames)
+	}
+
+	// Re-applying identical writes changes nothing, so the window must be
+	// complete AND empty — this is what lets an idempotent reindex skip the
+	// resolve entirely.
+	token = rs.BeginMutationReceipt()
+	s.AddBatch([]*graph.Node{caller, callee}, []*graph.Edge{pending})
+	replay := rs.EndMutationReceipt(token)
+	if !replay.Complete {
+		t.Fatalf("idempotent replay produced an incomplete receipt: %+v", replay)
+	}
+	if replay.ResolutionRelevant || len(replay.ResolutionFiles()) != 0 {
+		t.Fatalf("idempotent replay reported a delta: %+v", replay)
+	}
+
+	// A token that was never issued (or was already closed) must fail closed:
+	// an empty delta and "nothing happened" have to be distinguishable.
+	if stale := rs.EndMutationReceipt(token); stale.Complete {
+		t.Fatalf("reusing a closed token reported a complete receipt: %+v", stale)
+	}
+}
+
+// testEmptyRepoPrefix pins what the empty repository prefix means on each
+// read. It is not one convention: standalone indexing leaves every node's
+// prefix empty, so "" is a real namespace on some calls and a stand-in for
+// "every repository" on others, and the two backends do not even agree on
+// EvictRepo. Recording the current answers is what makes a future change to
+// any of them a deliberate one.
+func testEmptyRepoPrefix(t *testing.T, factory Factory, semantics Semantics) {
+	t.Helper()
+
+	t.Run("NonContentNodesAreGlobal", func(t *testing.T) {
+		s := factory(t)
+		s.AddNode(mkRepoNode("r1/a.go::Foo", "Foo", "r1/a.go", "r1", graph.KindFunction))
+		s.AddNode(mkRepoNode("r2/x.go::Baz", "Baz", "r2/x.go", "r2", graph.KindFunction))
+		s.AddNode(mkNode("standalone.go::Bare", "Bare", "standalone.go", graph.KindFunction))
+
+		// "" is a WILDCARD here — the global code/search passes are built on
+		// it. Tightening it to an exact prefix match would empty them
+		// silently rather than fail.
+		if got := len(s.GetRepoNonContentNodes("")); got != 3 {
+			t.Fatalf("GetRepoNonContentNodes(\"\") = %d nodes, want 3 (every repository)", got)
+		}
+		if got := len(s.GetRepoNonContentNodes("r1")); got != 1 {
+			t.Fatalf("GetRepoNonContentNodes(\"r1\") = %d nodes, want 1", got)
+		}
+	})
+
+	t.Run("EvictRepo", func(t *testing.T) {
+		s := factory(t)
+		s.AddNode(mkNode("standalone.go::Bare", "Bare", "standalone.go", graph.KindFunction))
+		s.AddNode(mkRepoNode("r1/a.go::Foo", "Foo", "r1/a.go", "r1", graph.KindFunction))
+
+		nodesRemoved, _ := s.EvictRepo("")
+		if semantics.EvictsEmptyRepoPrefix {
+			if nodesRemoved != 1 {
+				t.Fatalf("EvictRepo(\"\") removed %d nodes, want 1 — this backend treats "+
+					"the empty prefix as an ordinary repository", nodesRemoved)
+			}
+			if s.GetNode("standalone.go::Bare") != nil {
+				t.Fatalf("EvictRepo(\"\") left the unprefixed node behind")
+			}
+		} else {
+			if nodesRemoved != 0 {
+				t.Fatalf("EvictRepo(\"\") removed %d nodes, want 0 — this backend treats "+
+					"the empty prefix as \"not a repository\"", nodesRemoved)
+			}
+			if s.GetNode("standalone.go::Bare") == nil {
+				t.Fatalf("EvictRepo(\"\") removed the unprefixed node on a backend that declares it a no-op")
+			}
+		}
+		if s.GetNode("r1/a.go::Foo") == nil {
+			t.Fatalf("EvictRepo(\"\") must never touch a prefixed repository")
+		}
+	})
 }

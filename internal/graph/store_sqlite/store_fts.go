@@ -45,6 +45,7 @@ var (
 	_ graph.SymbolSearcher             = (*Store)(nil)
 	_ graph.SymbolFTSBatchUpserter     = (*Store)(nil)
 	_ graph.SymbolFTSRepoResetter      = (*Store)(nil)
+	_ graph.SymbolFTSRepoReplacer      = (*Store)(nil)
 	_ graph.SymbolFTSBatchDeleter      = (*Store)(nil)
 	_ graph.SymbolBundleSearcher       = (*Store)(nil)
 	_ graph.ScopedSymbolBundleSearcher = (*Store)(nil)
@@ -183,12 +184,9 @@ SELECT fts_rowid FROM symbol_fts_rowid WHERE node_id IN (`+placeholders+`)
 	return tx.Commit()
 }
 
-func (s *Store) batchUpsertSymbolFTS(items []graph.SymbolFTSItem) (symbolFTSBatchStats, error) {
-	var stats symbolFTSBatchStats
-	if len(items) == 0 {
-		return stats, nil
-	}
-
+// dedupeSymbolFTSItems drops empty IDs and collapses repeats with last-write-
+// wins, mirroring UpsertSymbolFTS's delete-then-insert semantics.
+func dedupeSymbolFTSItems(items []graph.SymbolFTSItem) []graph.SymbolFTSItem {
 	positions := make(map[string]int, len(items))
 	deduped := make([]graph.SymbolFTSItem, 0, len(items))
 	for _, item := range items {
@@ -202,7 +200,137 @@ func (s *Store) batchUpsertSymbolFTS(items []graph.SymbolFTSItem) (symbolFTSBatc
 		positions[item.NodeID] = len(deduped)
 		deduped = append(deduped, item)
 	}
-	items = deduped
+	return deduped
+}
+
+// upsertSymbolFTSChunkTx writes one bounded, already-deduped chunk inside an
+// open write transaction, advancing *nextRowid over the docids it allocates.
+// Shared by the incremental batch path and the whole-repository replacement so
+// the two cannot drift in how they derive ownership or reuse docids.
+func upsertSymbolFTSChunkTx(tx *sql.Tx, chunk []graph.SymbolFTSItem, nextRowid *int64, stats *symbolFTSBatchStats) error {
+	type rowState struct {
+		repoPrefix string
+		rowid      int64
+		exists     bool
+	}
+
+	// Fetch owning repo prefixes and prior FTS docids with one indexed
+	// VALUES join for the whole chunk. This replaces the old two SELECTs
+	// per symbol while retaining the exact old rowid when one exists.
+	var lookup strings.Builder
+	lookup.WriteString(`WITH wanted(ord, node_id) AS (VALUES `)
+	lookupArgs := make([]any, 0, len(chunk)*2)
+	for i, item := range chunk {
+		if i > 0 {
+			lookup.WriteByte(',')
+		}
+		lookup.WriteString(`(?, ?)`)
+		lookupArgs = append(lookupArgs, i, item.NodeID)
+	}
+	lookup.WriteString(`)
+SELECT wanted.ord, COALESCE(nodes.repo_prefix, ''), symbol_fts_rowid.fts_rowid
+FROM wanted
+LEFT JOIN nodes ON nodes.id = wanted.node_id
+LEFT JOIN symbol_fts_rowid ON symbol_fts_rowid.node_id = wanted.node_id
+ORDER BY wanted.ord`)
+	rows, err := tx.Query(lookup.String(), lookupArgs...)
+	if err != nil {
+		return err
+	}
+	states := make([]rowState, len(chunk))
+	seen := 0
+	for rows.Next() {
+		var ord int
+		var repoPrefix string
+		var oldRowid sql.NullInt64
+		if err := rows.Scan(&ord, &repoPrefix, &oldRowid); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if ord < 0 || ord >= len(states) {
+			_ = rows.Close()
+			return fmt.Errorf("symbol FTS batch lookup returned invalid ordinal %d", ord)
+		}
+		states[ord].repoPrefix = repoPrefix
+		if oldRowid.Valid {
+			states[ord].rowid = oldRowid.Int64
+			states[ord].exists = true
+		}
+		seen++
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	stats.lookupStatements++
+	if seen != len(chunk) {
+		return fmt.Errorf("symbol FTS batch lookup returned %d of %d rows", seen, len(chunk))
+	}
+
+	oldRowids := make([]any, 0, len(chunk))
+	for i := range states {
+		if states[i].exists {
+			oldRowids = append(oldRowids, states[i].rowid)
+			continue
+		}
+		states[i].rowid = *nextRowid
+		*nextRowid++
+	}
+	if len(oldRowids) > 0 {
+		var wipe strings.Builder
+		wipe.WriteString(`DELETE FROM symbol_fts WHERE rowid IN (`)
+		for i := range oldRowids {
+			if i > 0 {
+				wipe.WriteByte(',')
+			}
+			wipe.WriteByte('?')
+		}
+		wipe.WriteByte(')')
+		if _, err := tx.Exec(wipe.String(), oldRowids...); err != nil {
+			return err
+		}
+		stats.deleteStatements++
+	}
+
+	var insert strings.Builder
+	insert.WriteString(`INSERT INTO symbol_fts (rowid, node_id, repo_prefix, tokens) VALUES `)
+	insertArgs := make([]any, 0, len(chunk)*4)
+	for i, item := range chunk {
+		if i > 0 {
+			insert.WriteByte(',')
+		}
+		insert.WriteString(`(?, ?, ?, ?)`)
+		insertArgs = append(insertArgs, states[i].rowid, item.NodeID, states[i].repoPrefix, item.Tokens)
+	}
+	if _, err := tx.Exec(insert.String(), insertArgs...); err != nil {
+		return err
+	}
+	stats.insertStatements++
+
+	var ownership strings.Builder
+	ownership.WriteString(`INSERT OR REPLACE INTO symbol_fts_rowid (node_id, repo_prefix, fts_rowid) VALUES `)
+	ownershipArgs := make([]any, 0, len(chunk)*3)
+	for i, item := range chunk {
+		if i > 0 {
+			ownership.WriteByte(',')
+		}
+		ownership.WriteString(`(?, ?, ?)`)
+		ownershipArgs = append(ownershipArgs, item.NodeID, states[i].repoPrefix, states[i].rowid)
+	}
+	if _, err := tx.Exec(ownership.String(), ownershipArgs...); err != nil {
+		return err
+	}
+	stats.ownershipStatements++
+	return nil
+}
+
+func (s *Store) batchUpsertSymbolFTS(items []graph.SymbolFTSItem) (symbolFTSBatchStats, error) {
+	var stats symbolFTSBatchStats
+	if len(items) == 0 {
+		return stats, nil
+	}
+	items = dedupeSymbolFTSItems(items)
 	if len(items) == 0 {
 		return stats, nil
 	}
@@ -221,123 +349,11 @@ func (s *Store) batchUpsertSymbolFTS(items []graph.SymbolFTSItem) (symbolFTSBatc
 	}
 	stats.allocatorQueries++
 
-	type rowState struct {
-		repoPrefix string
-		rowid      int64
-		exists     bool
-	}
 	for start := 0; start < len(items); start += ftsInsertChunkRows {
 		end := minInt(start+ftsInsertChunkRows, len(items))
-		chunk := items[start:end]
-
-		// Fetch owning repo prefixes and prior FTS docids with one indexed
-		// VALUES join for the whole chunk. This replaces the old two SELECTs
-		// per symbol while retaining the exact old rowid when one exists.
-		var lookup strings.Builder
-		lookup.WriteString(`WITH wanted(ord, node_id) AS (VALUES `)
-		lookupArgs := make([]any, 0, len(chunk)*2)
-		for i, item := range chunk {
-			if i > 0 {
-				lookup.WriteByte(',')
-			}
-			lookup.WriteString(`(?, ?)`)
-			lookupArgs = append(lookupArgs, i, item.NodeID)
-		}
-		lookup.WriteString(`)
-SELECT wanted.ord, COALESCE(nodes.repo_prefix, ''), symbol_fts_rowid.fts_rowid
-FROM wanted
-LEFT JOIN nodes ON nodes.id = wanted.node_id
-LEFT JOIN symbol_fts_rowid ON symbol_fts_rowid.node_id = wanted.node_id
-ORDER BY wanted.ord`)
-		rows, err := tx.Query(lookup.String(), lookupArgs...)
-		if err != nil {
+		if err := upsertSymbolFTSChunkTx(tx, items[start:end], &nextRowid, &stats); err != nil {
 			return stats, err
 		}
-		states := make([]rowState, len(chunk))
-		seen := 0
-		for rows.Next() {
-			var ord int
-			var repoPrefix string
-			var oldRowid sql.NullInt64
-			if err := rows.Scan(&ord, &repoPrefix, &oldRowid); err != nil {
-				_ = rows.Close()
-				return stats, err
-			}
-			if ord < 0 || ord >= len(states) {
-				_ = rows.Close()
-				return stats, fmt.Errorf("symbol FTS batch lookup returned invalid ordinal %d", ord)
-			}
-			states[ord].repoPrefix = repoPrefix
-			if oldRowid.Valid {
-				states[ord].rowid = oldRowid.Int64
-				states[ord].exists = true
-			}
-			seen++
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return stats, err
-		}
-		_ = rows.Close()
-		stats.lookupStatements++
-		if seen != len(chunk) {
-			return stats, fmt.Errorf("symbol FTS batch lookup returned %d of %d rows", seen, len(chunk))
-		}
-
-		oldRowids := make([]any, 0, len(chunk))
-		for i := range states {
-			if states[i].exists {
-				oldRowids = append(oldRowids, states[i].rowid)
-				continue
-			}
-			states[i].rowid = nextRowid
-			nextRowid++
-		}
-		if len(oldRowids) > 0 {
-			var wipe strings.Builder
-			wipe.WriteString(`DELETE FROM symbol_fts WHERE rowid IN (`)
-			for i := range oldRowids {
-				if i > 0 {
-					wipe.WriteByte(',')
-				}
-				wipe.WriteByte('?')
-			}
-			wipe.WriteByte(')')
-			if _, err := tx.Exec(wipe.String(), oldRowids...); err != nil {
-				return stats, err
-			}
-			stats.deleteStatements++
-		}
-
-		var insert strings.Builder
-		insert.WriteString(`INSERT INTO symbol_fts (rowid, node_id, repo_prefix, tokens) VALUES `)
-		insertArgs := make([]any, 0, len(chunk)*4)
-		for i, item := range chunk {
-			if i > 0 {
-				insert.WriteByte(',')
-			}
-			insert.WriteString(`(?, ?, ?, ?)`)
-			insertArgs = append(insertArgs, states[i].rowid, item.NodeID, states[i].repoPrefix, item.Tokens)
-		}
-		if _, err := tx.Exec(insert.String(), insertArgs...); err != nil {
-			return stats, err
-		}
-		stats.insertStatements++
-
-		var ownership strings.Builder
-		ownership.WriteString(`INSERT OR REPLACE INTO symbol_fts_rowid (node_id, repo_prefix, fts_rowid) VALUES `)
-		ownershipArgs := make([]any, 0, len(chunk)*3)
-		for i, item := range chunk {
-			if i > 0 {
-				ownership.WriteByte(',')
-			}
-			ownership.WriteString(`(?, ?, ?)`)
-			ownershipArgs = append(ownershipArgs, item.NodeID, states[i].repoPrefix, states[i].rowid)
-		}
-		if _, err := tx.Exec(ownership.String(), ownershipArgs...); err != nil {
-			return stats, err
-		}
-		stats.ownershipStatements++
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -345,6 +361,77 @@ ORDER BY wanted.ord`)
 	}
 	stats.commits++
 	return stats, nil
+}
+
+// ReplaceSymbolFTS swaps one repository's whole symbol corpus atomically. The
+// wipe and every document produce streams through emit share one transaction,
+// so an interrupted rebuild — a failing chunk, a producer that gives up
+// half-way, a failed commit — leaves the previous corpus untouched instead of
+// stranding the repository with a truncated index that reads as a set of
+// legitimate misses.
+//
+// produce runs while this call holds writeMu and the write transaction, so it
+// must not write through this store. Reading is safe on an on-disk store,
+// whose readers use a separate pool; an in-process database shares one handle
+// between readers and writers, so a streaming producer there would wait on the
+// connection its own transaction is holding. That case is refused rather than
+// hung.
+func (s *Store) ReplaceSymbolFTS(repoPrefix string, produce func(emit func([]graph.SymbolFTSItem) error) error) error {
+	if produce == nil {
+		return nil
+	}
+	if s.db == s.writerDB {
+		return fmt.Errorf("store_sqlite: ReplaceSymbolFTS needs independent read and write pools; %q shares one handle", s.dbPath)
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Drive the wipe through the indexed rowid sidecar, and drop the sidecar
+	// rows in lockstep so the two can never diverge.
+	if _, err := tx.Exec(deleteSymbolFTSForRepoSQL, repoPrefix); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE repo_prefix = ?`, repoPrefix); err != nil {
+		return err
+	}
+	// Allocated after the wipe: every surviving docid is below this, so newly
+	// inserted rows never collide with a sibling repository's.
+	nextRowid, err := nextFTSRowIDTx(tx, "symbol_fts")
+	if err != nil {
+		return err
+	}
+
+	var stats symbolFTSBatchStats
+	stats.allocatorQueries++
+	emit := func(items []graph.SymbolFTSItem) error {
+		items = dedupeSymbolFTSItems(items)
+		for start := 0; start < len(items); start += ftsInsertChunkRows {
+			end := minInt(start+ftsInsertChunkRows, len(items))
+			if err := upsertSymbolFTSChunkTx(tx, items[start:end], &nextRowid, &stats); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := produce(emit); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 // BulkUpsertSymbolFTS is the cold-start fast path: wipe this repo's

@@ -32,6 +32,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/parser"
@@ -45,13 +46,13 @@ import (
 // (e.g. different query strings) so the dispatch path isn't
 // trivially memoised by an upstream cache.
 type toolCall struct {
-	Tool     string
-	ArgsFn   func(iter int) map[string]any
-	WarmupN  int
-	IterN    int
+	Tool    string
+	ArgsFn  func(iter int) map[string]any
+	WarmupN int
+	IterN   int
 	// SkipIfMissing lets a tool opt out when its substrate isn't
 	// in the indexed graph (e.g. nothing to call get_callers on).
-	SkipIfMissing func(g *graph.Graph) bool
+	SkipIfMissing func(g graph.Store) bool
 }
 
 // result captures the per-tool aggregate the bench publishes.
@@ -84,8 +85,9 @@ func main() {
 	}
 
 	fmt.Fprintf(os.Stderr, "[daemon-latency] indexing %s...\n", absRepo)
-	g, srv := buildInProcessServer(absRepo)
-	fmt.Fprintf(os.Stderr, "[daemon-latency] indexed %d nodes\n", len(g.AllNodes()))
+	g, srv, closeStore := buildInProcessServer(absRepo)
+	defer closeStore()
+	fmt.Fprintf(os.Stderr, "[daemon-latency] indexed %d nodes\n", g.NodeCount())
 
 	handler := internalserver.NewHandler(srv.MCPServer(), g, "bench", zap.NewNop())
 
@@ -139,23 +141,40 @@ func main() {
 // --- in-process server ---------------------------------------------
 
 // buildInProcessServer wires the same Server the production stdio /
-// daemon front-ends use, against a fresh in-process graph of repoRoot.
-// Identical wiring to `cmd/gortex/eval_recall.go`'s indexed-server
-// path so the bench reflects production handler arithmetic.
-func buildInProcessServer(repoRoot string) (*graph.Graph, *gortexmcp.Server) {
-	g := graph.New()
+// daemon front-ends use, against a throwaway SQLite store holding a
+// fresh index of repoRoot. The store backend is load-bearing for this
+// bench: handler latency includes the store's own reads and its native
+// full-text search, so measuring against anything the daemon does not
+// serve would publish numbers nobody can reproduce.
+//
+// The returned cleanup closes the store and removes its temp directory.
+func buildInProcessServer(repoRoot string) (graph.Store, *gortexmcp.Server, func()) {
+	tmpDir, err := os.MkdirTemp("", "gortex-bench-daemon-latency-*")
+	if err != nil {
+		die("temp store dir: %v", err)
+	}
+	g, err := store_sqlite.Open(filepath.Join(tmpDir, "bench.sqlite"))
+	if err != nil {
+		_ = os.RemoveAll(tmpDir)
+		die("open store: %v", err)
+	}
+	cleanup := func() {
+		_ = g.Close()
+		_ = os.RemoveAll(tmpDir)
+	}
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	cfg := config.Config{}
 	idx := indexer.New(g, reg, cfg.Index, zap.NewNop())
 	if _, err := idx.Index(repoRoot); err != nil {
+		cleanup()
 		die("index %s: %v", repoRoot, err)
 	}
 	eng := query.NewEngine(g)
 	eng.SetSearch(idx.Search())
 	srv := gortexmcp.NewServer(eng, g, idx, nil, zap.NewNop(), cfg.Guards.Rules)
 	srv.RunAnalysis()
-	return g, srv
+	return g, srv, cleanup
 }
 
 // --- call set -------------------------------------------------------
@@ -164,26 +183,31 @@ func buildInProcessServer(repoRoot string) (*graph.Graph, *gortexmcp.Server) {
 // tools agents actually call in production (the headline savings
 // drivers) — covering both cheap (graph_stats) and expensive
 // (smart_context) shapes so the published table shows the spread.
-func defaultCalls(g *graph.Graph, iter int) []toolCall {
+func defaultCalls(g graph.Store, iter int) []toolCall {
 	if iter <= 0 {
 		iter = 200
 	}
 	warmup := max(iter/10, 5)
 
 	// Pick representative symbol IDs / file paths from the indexed
-	// graph so the synthetic requests have real targets.
+	// graph so the synthetic requests have real targets. Iterating
+	// per kind rather than over every node keeps a disk-backed store
+	// from materialising the whole corpus just to find two samples.
 	var sampleFnID, sampleFilePath string
-	for _, n := range g.AllNodes() {
-		if n == nil {
-			continue
+	for _, kind := range []graph.NodeKind{graph.KindFunction, graph.KindMethod} {
+		for n := range g.NodesByKind(kind) {
+			if n != nil && n.ID != "" {
+				sampleFnID = n.ID
+				break
+			}
 		}
-		if sampleFnID == "" && (n.Kind == graph.KindFunction || n.Kind == graph.KindMethod) {
-			sampleFnID = n.ID
+		if sampleFnID != "" {
+			break
 		}
-		if sampleFilePath == "" && n.Kind == graph.KindFile && n.FilePath != "" {
+	}
+	for n := range g.NodesByKind(graph.KindFile) {
+		if n != nil && n.FilePath != "" {
 			sampleFilePath = n.FilePath
-		}
-		if sampleFnID != "" && sampleFilePath != "" {
 			break
 		}
 	}
@@ -215,7 +239,7 @@ func defaultCalls(g *graph.Graph, iter int) []toolCall {
 				return map[string]any{"id": sampleFnID}
 			},
 			WarmupN: warmup, IterN: iter,
-			SkipIfMissing: func(g *graph.Graph) bool { return sampleFnID == "" },
+			SkipIfMissing: func(g graph.Store) bool { return sampleFnID == "" },
 		},
 		{
 			Tool: "get_callers",
@@ -223,7 +247,7 @@ func defaultCalls(g *graph.Graph, iter int) []toolCall {
 				return map[string]any{"id": sampleFnID, "limit": float64(50)}
 			},
 			WarmupN: warmup, IterN: iter,
-			SkipIfMissing: func(g *graph.Graph) bool { return sampleFnID == "" },
+			SkipIfMissing: func(g graph.Store) bool { return sampleFnID == "" },
 		},
 		{
 			Tool: "find_usages",
@@ -231,7 +255,7 @@ func defaultCalls(g *graph.Graph, iter int) []toolCall {
 				return map[string]any{"id": sampleFnID}
 			},
 			WarmupN: warmup, IterN: iter,
-			SkipIfMissing: func(g *graph.Graph) bool { return sampleFnID == "" },
+			SkipIfMissing: func(g graph.Store) bool { return sampleFnID == "" },
 		},
 		{
 			Tool: "get_file_summary",
@@ -239,7 +263,7 @@ func defaultCalls(g *graph.Graph, iter int) []toolCall {
 				return map[string]any{"path": sampleFilePath}
 			},
 			WarmupN: warmup, IterN: iter,
-			SkipIfMissing: func(g *graph.Graph) bool { return sampleFilePath == "" },
+			SkipIfMissing: func(g graph.Store) bool { return sampleFilePath == "" },
 		},
 		{
 			Tool: "smart_context",
@@ -338,12 +362,12 @@ func meanMs(xs []time.Duration) float64 {
 
 // --- rendering ------------------------------------------------------
 
-func renderMarkdown(rows []result, repoRoot string, g *graph.Graph) string {
+func renderMarkdown(rows []result, repoRoot string, g graph.Store) string {
 	var b strings.Builder
 	fmt.Fprintln(&b, "# Daemon-mode MCP-tool latency")
 	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "_Corpus: `%s` (%d nodes). In-process handler dispatch — measures `Handler.CallToolStrict` end-to-end. Daemon socket overhead adds typically <1 ms on a warm pipe; the handler latency below dominates user-perceived response time._\n",
-		repoRoot, len(g.AllNodes()))
+		repoRoot, g.NodeCount())
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "| tool | iters | p50 | p95 | p99 | mean | max | errors |")
 	fmt.Fprintln(&b, "|------|------:|----:|----:|----:|-----:|----:|-------:|")

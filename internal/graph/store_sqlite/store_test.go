@@ -9,6 +9,13 @@ import (
 	"github.com/zzet/gortex/internal/graph/storetest"
 )
 
+// TestSQLiteStoreConformance runs the shared Store battery against the backend
+// the daemon actually serves from.
+//
+// The factory must stay FILE-backed. A ":memory:" store is a single connection,
+// so the reentrancy subtests — which issue a read from inside an iterator's
+// yield body — would deadlock rather than fail, and a hung package run is far
+// harder to diagnose than a red one.
 func TestSQLiteStoreConformance(t *testing.T) {
 	storetest.RunConformance(t, func(t *testing.T) graph.Store {
 		dir := t.TempDir()
@@ -18,6 +25,14 @@ func TestSQLiteStoreConformance(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = s.Close() })
 		return s
+	}, storetest.Semantics{
+		Reads: storetest.ReadsDetached,
+		// repo_prefix is an ordinary column here, so the empty prefix deletes
+		// the unprefixed (standalone-indexing) namespace like any other.
+		EvictsEmptyRepoPrefix: true,
+		// The adjacency statements carry an ORDER BY that the from/to indexes
+		// serve without a sorter; the plan locks hold them to it.
+		AdjacencyLineOrdered: true,
 	})
 }
 
@@ -101,7 +116,10 @@ func TestSQLiteEdgeCandidateLookupIsPredicateShapedAndLossless(t *testing.T) {
 
 	endpoint := candidates.Endpoint("a", "b")
 	if endpoint == nil {
+		// Explicit return so the dereference below is provably nil-safe
+		// rather than safe only by Fatal convention.
 		t.Fatal("exact endpoint candidate was not returned")
+		return
 	}
 	if got := endpoint.Meta["keep"]; got != "endpoint" {
 		t.Fatalf("endpoint metadata was not preserved: got %v", got)

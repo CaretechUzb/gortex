@@ -14,9 +14,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
-	"github.com/zzet/gortex/internal/persistence"
 )
 
 // gitInitRepo creates a real git repository at dir with one commit and
@@ -67,7 +67,7 @@ func gitCommitMore(t *testing.T, dir, file string) (headSHA string) {
 
 // reposTestEnv writes a temp global config tracking the given repo
 // entries, points the package-level cfgFile at it, and routes the
-// persistence store the `repos` command reads at an isolated temp dir.
+// freshness store the `repos` command reads at an isolated temp dir.
 // Both package globals are restored on cleanup.
 func reposTestEnv(t *testing.T, repos []config.RepoEntry) {
 	t.Helper()
@@ -80,17 +80,14 @@ func reposTestEnv(t *testing.T, repos []config.RepoEntry) {
 
 	prevCfg := cfgFile
 	cfgFile = gcPath
-	prevCache := reposCacheDir
-	reposCacheDir = filepath.Join(root, "cache")
 	prevBackend := reposBackendPath
 	// Isolate the SQLite freshness store at a per-test path so the
 	// command never reads the developer's real ~/.gortex/store. Tests
 	// that exercise the repo_index_state path seed this file; the rest
-	// leave it absent so describeRepo falls back to the snapshot store.
+	// leave it absent so every repo reports as never indexed.
 	reposBackendPath = filepath.Join(root, "store", "store.sqlite")
 	t.Cleanup(func() {
 		cfgFile = prevCfg
-		reposCacheDir = prevCache
 		reposBackendPath = prevBackend
 	})
 }
@@ -100,8 +97,15 @@ func reposTestEnv(t *testing.T, repos []config.RepoEntry) {
 // a repo, and the authoritative source describeRepo reads first.
 func seedIndexState(t *testing.T, prefix, sha string, dirty bool, indexedAt time.Time) {
 	t.Helper()
-	require.NoError(t, os.MkdirAll(filepath.Dir(reposBackendPath), 0o755))
-	st, err := store_sqlite.Open(reposBackendPath)
+	seedIndexStateAt(t, reposBackendPath, prefix, sha, dirty, indexedAt)
+}
+
+// seedIndexStateAt writes a freshness row into an explicitly named store, for
+// the tests that care about WHICH store the command decided to read.
+func seedIndexStateAt(t *testing.T, path, prefix, sha string, dirty bool, indexedAt time.Time) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	st, err := store_sqlite.Open(path)
 	require.NoError(t, err)
 	require.NoError(t, st.SetRepoIndexState(graph.RepoIndexState{
 		RepoPrefix: prefix,
@@ -110,24 +114,6 @@ func seedIndexState(t *testing.T, prefix, sha string, dirty bool, indexedAt time
 		IndexedAt:  indexedAt.Unix(),
 	}))
 	require.NoError(t, st.Close())
-}
-
-// seedSnapshot writes a persisted index snapshot for (repoPath, branch,
-// commit) into the test's persistence cache, so runRepos sees the repo
-// as indexed at that commit. The snapshot is keyed under the canonical
-// repo path — the same key describeRepo reads with.
-func seedSnapshot(t *testing.T, repoPath, branch, commit string, indexedAt time.Time) {
-	t.Helper()
-	store, err := persistence.NewFileStore(reposCacheDir, version)
-	require.NoError(t, err)
-	require.NoError(t, store.Save(&persistence.Snapshot{
-		Version:    version,
-		RepoPath:   canonicalRepo(repoPath),
-		CommitHash: commit,
-		Branch:     branch,
-		IndexedAt:  indexedAt,
-	}))
-	require.NoError(t, store.Close())
 }
 
 func newReposCmd() (*cobra.Command, *bytes.Buffer) {
@@ -159,13 +145,13 @@ func TestRunRepos_JSON_FreshAndStale(t *testing.T) {
 	})
 
 	indexedAt := time.Now().Add(-time.Hour).Truncate(time.Second)
-	// fresh-repo: snapshot at the exact current HEAD.
-	seedSnapshot(t, freshDir, "main", freshHead, indexedAt)
-	// stale-repo: snapshot at the old HEAD, then advance HEAD.
-	seedSnapshot(t, staleDir, "main", oldHead, indexedAt)
+	// fresh-repo: indexed at the exact current HEAD.
+	seedIndexState(t, "fresh-repo", freshHead, false, indexedAt)
+	// stale-repo: indexed at the old HEAD, then advance HEAD.
+	seedIndexState(t, "stale-repo", oldHead, false, indexedAt)
 	newHead := gitCommitMore(t, staleDir, "second.txt")
 	require.NotEqual(t, oldHead, newHead)
-	// never-repo: no snapshot seeded.
+	// never-repo: no freshness row seeded.
 
 	reposJSON = true
 	t.Cleanup(func() { reposJSON = false })
@@ -191,7 +177,7 @@ func TestRunRepos_JSON_FreshAndStale(t *testing.T) {
 	assert.True(t, fresh.Indexed)
 	assert.False(t, fresh.Stale, "index matches HEAD → not stale")
 	require.NotNil(t, fresh.LastIndexed)
-	assert.Equal(t, indexedAt.UTC(), fresh.LastIndexed.UTC())
+	assert.Equal(t, indexedAt.Unix(), fresh.LastIndexed.Unix())
 
 	stale := byName["stale-repo"]
 	assert.Equal(t, newHead, stale.HeadCommit)
@@ -221,7 +207,7 @@ func TestRunRepos_Table(t *testing.T) {
 		{Path: freshDir, Name: "alpha"},
 		{Path: neverDir, Name: "beta"},
 	})
-	seedSnapshot(t, freshDir, "main", freshHead, time.Now().Truncate(time.Second))
+	seedIndexState(t, "alpha", freshHead, false, time.Now().Truncate(time.Second))
 
 	reposJSON = false
 	cmd, buf := newReposCmd()
@@ -257,35 +243,8 @@ func TestRunRepos_NoTrackedRepos(t *testing.T) {
 	assert.Empty(t, got)
 }
 
-// TestRunRepos_StaleWhenBranchSlotMissing proves that a repo on a branch
-// with no persisted snapshot at all reports as not-indexed and stale —
-// the snapshot for a different branch must not count.
-func TestRunRepos_StaleWhenBranchSlotMissing(t *testing.T) {
-	base := t.TempDir()
-	dir := filepath.Join(base, "repo")
-	head := gitInitRepo(t, dir)
-
-	reposTestEnv(t, []config.RepoEntry{{Path: dir, Name: "repo"}})
-	// Snapshot stored under a different branch slot.
-	seedSnapshot(t, dir, "other-branch", head, time.Now().Truncate(time.Second))
-
-	reposJSON = true
-	t.Cleanup(func() { reposJSON = false })
-	cmd, buf := newReposCmd()
-	require.NoError(t, runRepos(cmd, nil))
-
-	var got []repoStatus
-	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
-	require.Len(t, got, 1)
-	assert.False(t, got[0].Indexed, "a snapshot on a different branch must not count")
-	assert.True(t, got[0].Stale)
-}
-
-// TestRunRepos_IndexStateFreshness covers the primary freshness source:
-// the daemon's repo_index_state rows (keyed by repo prefix). This is the
-// path that was dead before — `gortex repos` read only the embedded-server
-// snapshot store, which the daemon never writes, so every daemon-indexed
-// repo wrongly reported "never indexed".
+// TestRunRepos_IndexStateFreshness covers the freshness source: the
+// daemon's repo_index_state rows, keyed by repo prefix.
 func TestRunRepos_IndexStateFreshness(t *testing.T) {
 	base := t.TempDir()
 	freshDir := filepath.Join(base, "alpha")
@@ -381,10 +340,10 @@ func TestRunRepos_IndexStateLoneRepoEmptyPrefix(t *testing.T) {
 	assert.Equal(t, head, got[0].IndexedCommit)
 }
 
-// TestRunRepos_IndexStateBeatsSnapshot proves the repo_index_state row is the
-// authoritative source: when both a freshness row and a (stale) snapshot
-// exist, the row wins.
-func TestRunRepos_IndexStateBeatsSnapshot(t *testing.T) {
+// TestRunRepos_UnseededRepoIsNeverIndexed proves a repo with no
+// repo_index_state row reports as never indexed and stale, even when a
+// sibling repo in the same config does have one.
+func TestRunRepos_UnseededRepoIsNeverIndexed(t *testing.T) {
 	base := t.TempDir()
 	dirA := filepath.Join(base, "one")
 	dirB := filepath.Join(base, "two")
@@ -395,10 +354,7 @@ func TestRunRepos_IndexStateBeatsSnapshot(t *testing.T) {
 		{Path: dirA, Name: "one"},
 		{Path: dirB, Name: "two"},
 	})
-	indexedAt := time.Now().Add(-time.Minute).Truncate(time.Second)
-	// Snapshot says an old/wrong commit; the index-state row says HEAD.
-	seedSnapshot(t, dirA, "main", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", indexedAt)
-	seedIndexState(t, "one", headA, false, indexedAt)
+	seedIndexState(t, "one", headA, false, time.Now().Add(-time.Minute).Truncate(time.Second))
 
 	reposJSON = true
 	t.Cleanup(func() { reposJSON = false })
@@ -413,8 +369,129 @@ func TestRunRepos_IndexStateBeatsSnapshot(t *testing.T) {
 	}
 	one := byName["one"]
 	assert.True(t, one.Indexed)
-	assert.Equal(t, headA, one.IndexedCommit, "repo_index_state row wins over the snapshot store")
+	assert.Equal(t, headA, one.IndexedCommit)
 	assert.False(t, one.Stale)
+
+	two := byName["two"]
+	assert.False(t, two.Indexed, "no freshness row → never indexed")
+	assert.True(t, two.Stale)
+	assert.Nil(t, two.LastIndexed)
+}
+
+// TestRunRepos_CorruptIndexStoreIsNotAnUnindexedOne separates the two states
+// the command used to conflate. Every failure to read the freshness store
+// degraded to an empty map, so a corrupt store produced a successful run
+// reporting each repo as never indexed — a confident claim about the repos,
+// made without having looked, that sends the user to re-do work already done.
+// Only a store that genuinely is not there may report "never indexed".
+func TestRunRepos_CorruptIndexStoreIsNotAnUnindexedOne(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "solo")
+	head := gitInitRepo(t, dir)
+
+	reposTestEnv(t, []config.RepoEntry{{Path: dir, Name: "solo"}})
+	reposJSON = true
+	t.Cleanup(func() { reposJSON = false })
+
+	// No store file at all: nothing has been indexed, and saying so is right.
+	cmd, buf := newReposCmd()
+	require.NoError(t, runRepos(cmd, nil))
+	var got []repoStatus
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	require.Len(t, got, 1)
+	assert.False(t, got[0].Indexed, "an absent store means the repo really has never been indexed")
+
+	// A store that is present but is not a database: the command has no idea
+	// whether the repo is indexed, and must say so instead of guessing.
+	require.NoError(t, os.MkdirAll(filepath.Dir(reposBackendPath), 0o755))
+	require.NoError(t, os.WriteFile(reposBackendPath, []byte("this is not a sqlite database"), 0o600))
+
+	cmd, buf = newReposCmd()
+	err := runRepos(cmd, nil)
+	require.Error(t, err, "a corrupt freshness store must fail the command, not report every repo unindexed")
+	assert.Contains(t, err.Error(), reposBackendPath, "the error should name the store it could not read")
+	assert.Empty(t, buf.String(), "a failed read must not also print a repo listing")
+
+	// The seeded, readable store still works — the guard rejects unreadable
+	// stores, not every store.
+	require.NoError(t, os.Remove(reposBackendPath))
+	seedIndexState(t, "solo", head, false, time.Now().Truncate(time.Second))
+	cmd, buf = newReposCmd()
+	require.NoError(t, runRepos(cmd, nil))
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	require.Len(t, got, 1)
+	assert.True(t, got[0].Indexed)
+}
+
+// TestRunRepos_FollowsTheDaemonRecordedBackendPath exercises the production
+// routing. A daemon started with --backend-path writes its freshness rows to a
+// store the platform default does not name, and `gortex repos` had no way to
+// learn that — it always read the default and reported every repo the daemon
+// had indexed as never indexed. The command must follow the store the running
+// daemon recorded, with an explicit flag still winning over it.
+func TestRunRepos_FollowsTheDaemonRecordedBackendPath(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "solo")
+	head := gitInitRepo(t, dir)
+
+	reposTestEnv(t, []config.RepoEntry{{Path: dir, Name: "solo"}})
+	// Isolate the platform default so the fallback can never reach the
+	// developer's real store, and so "not found there" is a real answer.
+	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
+	t.Setenv("GORTEX_DAEMON_STATEFILE", filepath.Join(base, "daemon.state.json"))
+
+	// The daemon's store: somewhere only its own record names.
+	daemonStore := filepath.Join(base, "daemon-store", "custom.sqlite")
+	indexedAt := time.Now().Add(-time.Minute).Truncate(time.Second)
+	seedIndexStateAt(t, daemonStore, "solo", head, false, indexedAt)
+
+	// Production shape: no --backend-path on this command at all.
+	prevFlag := reposBackendPath
+	reposBackendPath = ""
+	t.Cleanup(func() { reposBackendPath = prevFlag })
+
+	reposJSON = true
+	t.Cleanup(func() { reposJSON = false })
+
+	// With no daemon record, the default store has nothing — the repo really
+	// does look unindexed from here.
+	cmd, buf := newReposCmd()
+	require.NoError(t, runRepos(cmd, nil))
+	var got []repoStatus
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	require.Len(t, got, 1)
+	require.False(t, got[0].Indexed, "without a daemon record only the default store is in scope")
+
+	// A live daemon recording its resolved store is what routes the command.
+	require.NoError(t, daemon.WriteRuntimeState(daemon.RuntimeState{BackendPath: daemonStore}))
+	t.Cleanup(daemon.RemoveRuntimeState)
+
+	cmd, buf = newReposCmd()
+	require.NoError(t, runRepos(cmd, nil))
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	require.Len(t, got, 1)
+	assert.True(t, got[0].Indexed, "repos must read the store the running daemon recorded")
+	assert.False(t, got[0].Stale)
+	assert.Equal(t, head, got[0].IndexedCommit)
+	require.NotNil(t, got[0].LastIndexed)
+	assert.Equal(t, indexedAt.Unix(), got[0].LastIndexed.Unix())
+
+	// An explicit flag still outranks the daemon's record.
+	reposBackendPath = filepath.Join(base, "explicit", "explicit.sqlite")
+	cmd, buf = newReposCmd()
+	require.NoError(t, runRepos(cmd, nil))
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	require.Len(t, got, 1)
+	assert.False(t, got[0].Indexed, "--backend-path must win over the daemon's recorded store")
+}
+
+// TestReposBackendPathFlagIsRegistered pins the flag on the command: the
+// resolution order documents it as the explicit override, and a variable with
+// no flag behind it is only reachable from tests.
+func TestReposBackendPathFlagIsRegistered(t *testing.T) {
+	flag := reposCmd.Flags().Lookup("backend-path")
+	require.NotNil(t, flag, "`gortex repos` must accept --backend-path")
+	assert.NotEmpty(t, flag.Usage, "the flag needs help text — it is how users learn the resolution order")
 }
 
 // TestShortSHA covers the table SHA abbreviation helper.

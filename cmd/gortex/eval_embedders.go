@@ -18,7 +18,6 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/eval/recall"
-	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
@@ -249,8 +248,16 @@ func benchVariant(name string, probeTexts []string, fixture recall.Fixture, cfg 
 
 	// Re-index with this embedder so the vector backend is populated
 	// with the variant's own embeddings — anything less is mix-and-match.
+	// Each variant gets a fresh store so no vectors leak across rows.
+	// The store owns the vector index, and the in-process backend the
+	// semantic ranker queries forwards into it, so the recall column
+	// scores the variant's embeddings through the served search path.
 	fmt.Fprintf(os.Stderr, "[gortex eval embedders] %s: indexing...\n", name)
-	g := graph.New()
+	g, closeStore, err := newEvalStore("embedders")
+	if err != nil {
+		return row, fmt.Errorf("opening eval store: %w", err)
+	}
+	defer closeStore()
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	// A WARN-level stderr logger (not zap.NewNop) so the indexer's vector-build

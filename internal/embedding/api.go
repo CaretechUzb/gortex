@@ -187,9 +187,9 @@ func (p *APIProvider) Close() error    { return nil }
 // first real embed (embedOpenAI / embedOllama set p.dims from the returned
 // vector); until then Dimensions() returns 0, which has two concrete
 // consequences at daemon startup: the "embeddings enabled" log mislabels
-// the width as dim:0, and the snapshot-vector reload gate
-// (daemon_state.go: vec.Dims == EmbedderDims) rejects a correctly-sized
-// persisted index, forcing a needless full re-embed on every restart.
+// the width as dim:0, and any gate comparing the configured width against
+// already-persisted vectors sees a mismatch that isn't there and forces a
+// needless full re-embed.
 //
 // Idempotent: a no-op once the width is known. Best-effort: on any
 // transport/auth error it returns the error and leaves dims at 0 — the

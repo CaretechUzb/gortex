@@ -32,25 +32,31 @@ different absolute timings but the same relative shape.
 
 ## 1. Reference-repo perf
 
-**Last updated: 2026-05-20** · operator hardware: Apple M3 Max
+**Last updated: 2026-08-05** · operator hardware: Apple M3 Max
 
 | repo | LoC | files | nodes | edges | cold-index | search p95 | impact p95 | impact p99 | incremental | DB size | RSS | budget |
 |------|----:|------:|------:|------:|-----------:|-----------:|-----------:|-----------:|------------:|--------:|----:|:------:|
-| nestjs (in-tree fixture) | — | 32 | 240 | 414 | 17.8ms | 0.09ms | 0.01ms | 0.01ms | 11.8ms | 92.3KB | 2.4MB | ✓ |
+| nestjs (in-tree fixture) | — | 32 | 250 | 582 | 137.7ms | 2.3ms | 0.76ms | 0.76ms | 150.4ms | 3.3MB | 4.7MB | ✓ |
 
 _The full 3-repo run (gin + nestjs + react) requires network access
 to clone each repo on first invocation. The fixture row above
 exercises the same harness path against the in-tree nestjs fixture
 so the contract is verifiable offline. The sub-millisecond impact
-analysis claim holds — impact p95 of 0.01ms is 100× under the 1.0ms
+analysis claim holds — impact p95 of 0.76ms is under the 1.0ms
 budget._
 
-_The **RSS** column is the Go heap retained with the graph, indexer
+_The harness indexes each repo into a fresh SQLite store, the
+backend a daemon serves. Cold-index, search and impact timings
+therefore include real store reads and writes, and the **DB size**
+column is the measured on-disk footprint of that store (write-ahead
+log included) rather than an estimate._
+
+_The **RSS** column is the Go heap retained with the store, indexer
 and query engine all live — the `runtime.MemStats` figure
 `gortex daemon status` reports as daemon memory, sampled after a
-forced GC so it reflects only the retained graph + search index.
-True OS resident set adds a fixed Go-runtime overhead (stacks,
-mcache, code) that does not scale with repo size._
+forced GC so it reflects only the retained working set. True OS
+resident set adds a fixed Go-runtime overhead (stacks, mcache, code)
+that does not scale with repo size._
 
 ### How to reproduce
 
@@ -166,6 +172,10 @@ Substrate: `bench/wire-format/`
 | get_file_summary   | 50 | 0.03ms | 0.04ms  | 0.05ms  | 0.03ms | 0.05ms  |
 | smart_context      | 10 | 1.5ms  | 24.2ms  | 24.2ms  | 6.0ms  | 24.2ms  |
 | get_repo_outline   | 50 | 60.6ms | 217.0ms | 377.0ms | 79.3ms | 377.0ms |
+
+_These timings were measured on the retired in-memory backend; the
+harness now builds a SQLite store, so they are pending re-measurement
+against it._
 
 **Headline**: median p95 across tools is **5.5 ms**, median p99 is
 **5.9 ms**. The heavy outliers (`smart_context`, `get_repo_outline`)

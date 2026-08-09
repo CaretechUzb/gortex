@@ -54,7 +54,7 @@ High-quality parsing 257 languages/grammars through tree-sitter AST analysis, in
 - **Speculative execution** — `preview_edit` / `simulate_chain` answer "what would change if I applied this WorkspaceEdit?" without touching disk
 - **Live editor overlays** — push unsaved buffers as a shadow graph; tools read through it. Branching for parallel speculative sessions
 - **GCX1 wire format** — published, round-trippable. **An additional −27% tokens vs JSON** at same fidelity → [docs/wire-format.md](docs/wire-format.md)
-- **Long-living daemon** — one process serves every IDE window; live fsnotify, on-disk snapshots, restart, OS-supervised lifecycle
+- **Long-living daemon** — one process serves every IDE window; live fsnotify, an on-disk SQLite graph store, incremental restart, OS-supervised lifecycle
 - **9 LLM providers (optional)** — local llama.cpp, Anthropic, OpenAI, Ollama, Claude / Codex CLI subprocess, Gemini, Bedrock, DeepSeek → [docs/llm.md](docs/llm.md)
 - **Composable safety** — `verify_change`, `check_guards`, `audit_agent_config` flag broken callers, guard violations, stale docs before they ship
 - **PR review, end to end** — `gortex prs` triages open PRs (per-PR blast radius, merge-order conflicts via shared communities, AI-ranked queue, reviewer suggestions); `gortex review` emits line-anchored findings with a BLOCK/REVIEW/APPROVE verdict from a graph-grounded rulepack; MCP tools (`pr_risk`, `get_pr_impact`, `review`, `review_pack`, `post_review`, …) expose it to agents → [docs/cli.md](docs/cli.md)
@@ -135,13 +135,13 @@ All time    ███████████████░   93.3%  saved 11,2
 
 ```
 gortex binary
-  CLI (cobra)    ──> MultiIndexer ──> In-Memory Graph (shared, per-repo indexed)
+  CLI (cobra)    ──> MultiIndexer ──> Graph store (SQLite, shared, per-repo indexed)
   MCP (stdio)    ──────────────────> Query Engine (repo/project/ref scoping)
   HTTP /v1/*     ──────────────────> same tools + /v1/graph + /v1/events (SSE)
   Daemon (unix)  ──────────────────> shared graph for every MCP client, session isolation
                   MultiWatcher    <── filesystem events (fsnotify, per-repo)
                   CrossRepoResolver ──> cross-repo edge creation (type-aware)
-                  Persistence     ──> gob+gzip snapshot (pluggable backend)
+                  Persistence     ──> the same SQLite store, written as it indexes
 ```
 
 Data flow, graph schema (node and edge kinds, multi-repo fields, test taxonomy), persistence model: [docs/architecture.md](docs/architecture.md).

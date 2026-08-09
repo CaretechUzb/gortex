@@ -47,7 +47,7 @@ gortex daemon start --detach --http-addr 127.0.0.1:7411 --log-level debug
                                     # --detach forwards every other flag to the background process,
                                     # so a detached start behaves like the same command without it
 gortex daemon status                # PID, uptime, memory, tracked repos, sessions, server roster, search backend, warmup + enrichment progress
-gortex daemon stop                  # graceful shutdown + final snapshot
+gortex daemon stop                  # graceful shutdown; the graph store is already on disk
 gortex daemon restart               # stop + start
 gortex daemon reload                # re-read the global config AND every tracked repo's .gortex.yaml, pick up new/removed repos
 gortex daemon logs -n 50            # tail the log file

@@ -29,10 +29,29 @@ func TestRunRepo_LocalFixture(t *testing.T) {
 		Local: true,
 	}, queries, budgets{
 		// Generous budgets so a slow CI doesn't flake — the real
-		// validation lives in main.go's strict-mode path.
-		ImpactP95Ms: 50.0,
-		SearchP95Ms: 100.0,
+		// validation lives in main.go's strict-mode path. These gates
+		// exist to catch a pathological regression (an accidental
+		// whole-table scan per query), never to enforce a latency.
+		//
+		// Calibrated against the SQLite-backed harness under -race,
+		// where the fixture measures search p95 ~40ms and impact p95
+		// ~27ms — the store reads and the race detector together cost
+		// two orders of magnitude over the timings this test was first
+		// written for. A budget within 2-3x of the observed figure is
+		// not generous: it fails whenever the package runs alongside
+		// the rest of the suite and the machine is contended. Keep an
+		// order of magnitude of headroom, and re-derive it from the
+		// MEASURED line below rather than by guessing.
+		ImpactP95Ms: 500.0,
+		SearchP95Ms: 500.0,
 	})
+
+	// The figures the budgets above are derived from — logged so a
+	// recalibration starts from a measurement (`go test -v`) instead of
+	// from a guess.
+	t.Logf("MEASURED cold=%.3fms search_p50=%.3fms search_p95=%.3fms impact_p50=%.3fms impact_p95=%.3fms impact_p99=%.3fms incremental=%.3fms",
+		row.ColdIndexMs, row.SearchP50Ms, row.SearchP95Ms,
+		row.ImpactP50Ms, row.ImpactP95Ms, row.ImpactP99Ms, row.IncrementalMs)
 
 	if row.Error != "" {
 		t.Fatalf("runRepo error: %s", row.Error)
@@ -136,22 +155,35 @@ func TestTouchFile_BumpsMtime(t *testing.T) {
 	}
 }
 
-func TestEstimateDBSize_ScalesWithGraph(t *testing.T) {
-	small := graph.New()
-	small.AddNode(&graph.Node{ID: "s1", Name: "s1", Kind: graph.KindFunction})
-	smallSize := estimateDBSize(small)
-
-	large := graph.New()
-	for i := range 100 {
-		large.AddNode(&graph.Node{ID: funcID(i), Name: funcName(i), Kind: graph.KindFunction})
+func TestDBSizeBytes_SumsEveryFileInStoreDir(t *testing.T) {
+	dir := t.TempDir()
+	// A store directory holds the database plus its write-ahead log
+	// and any sidecar; every one of them counts toward what the user
+	// sees on disk.
+	files := map[string]int{
+		"bench.sqlite":     4096,
+		"bench.sqlite-wal": 512,
+		"nested/side.db":   128,
 	}
-	largeSize := estimateDBSize(large)
-
-	if smallSize <= 0 || largeSize <= 0 {
-		t.Errorf("DB size estimates should be positive, got small=%d large=%d", smallSize, largeSize)
+	want := int64(0)
+	for name, size := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		want += int64(size)
 	}
-	if largeSize <= smallSize {
-		t.Errorf("larger graph should yield larger estimate, got small=%d large=%d", smallSize, largeSize)
+	if got := dbSizeBytes(dir); got != want {
+		t.Errorf("dbSizeBytes = %d, want %d", got, want)
+	}
+}
+
+func TestDBSizeBytes_MissingDirReportsFailure(t *testing.T) {
+	if got := dbSizeBytes(filepath.Join(t.TempDir(), "absent")); got != -1 {
+		t.Errorf("dbSizeBytes(absent) = %d, want -1", got)
 	}
 }
 
@@ -180,9 +212,9 @@ func TestDefaultRepoSet_IncludeLinuxFlag(t *testing.T) {
 
 // --- helpers --------------------------------------------------------
 
-func funcID(i int) string { return "f.go::F" + itoa(i) }
+func funcID(i int) string   { return "f.go::F" + itoa(i) }
 func funcName(i int) string { return "F" + itoa(i) }
-func fileID(i int) string  { return "file" + itoa(i) + ".go" }
+func fileID(i int) string   { return "file" + itoa(i) + ".go" }
 func fileName(i int) string { return "file" + itoa(i) + ".go" }
 func itoa(i int) string {
 	if i == 0 {

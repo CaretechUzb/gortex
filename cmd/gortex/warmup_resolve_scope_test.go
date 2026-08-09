@@ -12,7 +12,7 @@ func TestWarmupResolveScope(t *testing.T) {
 	const totalRepos = 3 // more repos than changed, so scoping is beneficial.
 
 	t.Run("scoped happy path", func(t *testing.T) {
-		got := warmupResolveScope(changed, totalRepos, true, false, false, false)
+		got := warmupResolveScope(changed, totalRepos, true, false, false)
 		if got == nil {
 			t.Fatal("expected the changed set, got nil")
 		}
@@ -22,45 +22,39 @@ func TestWarmupResolveScope(t *testing.T) {
 	})
 
 	t.Run("nothing changed → nil", func(t *testing.T) {
-		if got := warmupResolveScope(changed, totalRepos, false, false, false, false); got != nil {
+		if got := warmupResolveScope(changed, totalRepos, false, false, false); got != nil {
 			t.Fatalf("expected nil, got %v", got)
 		}
 	})
 
 	t.Run("scopeUnknown → nil", func(t *testing.T) {
-		if got := warmupResolveScope(changed, totalRepos, true, true, false, false); got != nil {
-			t.Fatalf("expected nil, got %v", got)
-		}
-	})
-
-	t.Run("snapshotPartial → nil", func(t *testing.T) {
-		if got := warmupResolveScope(changed, totalRepos, true, false, true, false); got != nil {
+		if got := warmupResolveScope(changed, totalRepos, true, true, false); got != nil {
 			t.Fatalf("expected nil, got %v", got)
 		}
 	})
 
 	t.Run("storeNeedsRebuild → nil", func(t *testing.T) {
-		if got := warmupResolveScope(changed, totalRepos, true, false, false, true); got != nil {
+		if got := warmupResolveScope(changed, totalRepos, true, false, true); got != nil {
 			t.Fatalf("expected nil, got %v", got)
 		}
 	})
 
 	t.Run("empty changed set → nil", func(t *testing.T) {
-		if got := warmupResolveScope(map[string]struct{}{}, totalRepos, true, false, false, false); got != nil {
+		if got := warmupResolveScope(map[string]struct{}{}, totalRepos, true, false, false); got != nil {
 			t.Fatalf("expected nil, got %v", got)
 		}
 	})
 
 	t.Run("all repos changed (cold) → nil", func(t *testing.T) {
 		all := map[string]struct{}{"repoa": {}, "repob": {}, "repoc": {}}
-		if got := warmupResolveScope(all, totalRepos, true, false, false, false); got != nil {
+		if got := warmupResolveScope(all, totalRepos, true, false, false); got != nil {
 			t.Fatalf("expected nil for all-repos-changed, got %v", got)
 		}
 	})
 
 	t.Run("GORTEX_WARMUP_FULL_RESOLVE forces nil", func(t *testing.T) {
 		t.Setenv("GORTEX_WARMUP_FULL_RESOLVE", "1")
-		if got := warmupResolveScope(changed, totalRepos, true, false, false, false); got != nil {
+		if got := warmupResolveScope(changed, totalRepos, true, false, false); got != nil {
 			t.Fatalf("expected nil under GORTEX_WARMUP_FULL_RESOLVE=1, got %v", got)
 		}
 	})
