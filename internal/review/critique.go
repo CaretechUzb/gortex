@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -277,19 +276,4 @@ func valueOr(v, fallback string) string {
 		return fallback
 	}
 	return v
-}
-
-// SortCritiquedBySeverity orders critiqued findings worst-severity-first for a
-// deterministic dropped-list rendering.
-func SortCritiquedBySeverity(rows []CritiquedFinding) {
-	sort.SliceStable(rows, func(i, j int) bool {
-		si, sj := severityRank(rows[i].Finding.Severity), severityRank(rows[j].Finding.Severity)
-		if si != sj {
-			return si > sj
-		}
-		if rows[i].Finding.File != rows[j].Finding.File {
-			return rows[i].Finding.File < rows[j].Finding.File
-		}
-		return rows[i].Finding.Line < rows[j].Finding.Line
-	})
 }

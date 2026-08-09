@@ -163,8 +163,8 @@ func (s *Server) anyGuardRulesConfigured() bool {
 
 // guardsFamily adapts the per-repo guard resolution to
 // analysis.RuleFamily, so the change-contract pipeline scopes rules to
-// each changed symbol's repo exactly like check_guards does. It replaces
-// analysis.GuardsFamily, which can only carry one flat rule list.
+// each changed symbol's repo exactly like check_guards does. A family
+// carrying one flat rule list cannot express that per-repo scoping.
 type guardsFamily struct{ srv *Server }
 
 func (f guardsFamily) Name() string { return "guards" }

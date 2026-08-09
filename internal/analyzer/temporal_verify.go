@@ -24,7 +24,6 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/llm"
-	"github.com/zzet/gortex/internal/llm/provider"
 	"github.com/zzet/gortex/internal/resolver"
 )
 
@@ -164,26 +163,11 @@ type llmTemporalVerifier struct {
 	p llm.Provider
 }
 
-// NewLLMTemporalVerifier builds a verifier from resolved LLM config. Returns a
-// close func and (nil, nil, err) when no provider can be constructed — the
-// caller treats that as "LLM unavailable" and skips verification.
-func NewLLMTemporalVerifier(cfg llm.Config) (resolver.TemporalVerifier, func() error, error) {
-	cfg = cfg.ApplyDefaults()
-	if !cfg.IsEnabled() {
-		return nil, nil, fmt.Errorf("llm provider not enabled (set llm.provider)")
-	}
-	p, err := provider.New(cfg)
-	if err != nil {
-		return nil, nil, err
-	}
-	return &llmTemporalVerifier{p: p}, p.Close, nil
-}
-
 // NewLLMTemporalVerifierFromProvider wraps an already-constructed provider.
 //
 // PURPOSE — let a host that already owns a live llm.Provider (e.g. the MCP
 // server's shared LLM service) reuse it for temporal verification instead of
-// spinning up a second provider from raw config via NewLLMTemporalVerifier.
+// spinning up a second provider from raw config.
 // RATIONALE — the verifier is a thin Verify(req)→verdict adapter over
 // Provider.Complete; binding it to an existing provider avoids duplicate model
 // loads / API clients and respects the caller's provider lifecycle (no Close

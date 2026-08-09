@@ -104,18 +104,6 @@ func WithCompactor(c *RollingCompactor) AgentOption {
 	return func(a *Agent) { a.compactor = c }
 }
 
-// WithSyncCompaction is a test/throttling seam that forces synchronous
-// (inline) summarization. Used when the run deadline is too short for the
-// async path. It is exposed as an option so callers that already know their
-// per-call deadline is tight can opt in without reflection.
-func WithSyncCompaction() AgentOption {
-	return func(a *Agent) {
-		if a.compactor != nil {
-			a.compactor.sync = true
-		}
-	}
-}
-
 // enabled reports whether the compactor can actually compact (it has a
 // summarizer). A nil receiver or nil summarizer disables compaction.
 func (c *RollingCompactor) enabled() bool {

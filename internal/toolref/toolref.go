@@ -33,13 +33,6 @@ var cliExample = map[string]string{
 	"reindex_repository":  `gortex call workspace_admin --arg operation=reindex --arg arguments='{"path":"<repo-root>"}'`,
 }
 
-// MCPRef renders an MCP-directed reference to a tool: "call the `read_file` MCP
-// tool". Use wherever guidance assumes the agent has the Gortex MCP server
-// mounted and can call the tool directly.
-func MCPRef(tool string) string {
-	return "call the `" + tool + "` MCP tool"
-}
-
 // CLIFallback renders the compact shell invocation for one operation, for
 // example `gortex call read --arg target='{"file":"..."}'`. This is the single
 // place an internal tool reference becomes agent-facing Bash — nothing else

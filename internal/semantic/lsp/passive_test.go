@@ -160,15 +160,6 @@ func (s *fakeLSPSocketServer) PushRequest(id any, method string, params any) err
 	return err
 }
 
-// SetHandler installs a custom request handler. The default handler
-// answers initialize with an empty ServerCapabilities and any other
-// method with an empty result object.
-func (s *fakeLSPSocketServer) SetHandler(h func(method string, params json.RawMessage) (any, bool)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.handler = h
-}
-
 func (s *fakeLSPSocketServer) defaultHandler(method string, _ json.RawMessage) (any, bool) {
 	switch method {
 	case "initialize":

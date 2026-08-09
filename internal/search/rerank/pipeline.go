@@ -250,16 +250,6 @@ func sameSliceHeader(a, b []*Candidate) bool {
 	return &a[0] == &b[0]
 }
 
-// Nodes is a convenience that unwraps a result slice into the
-// underlying graph nodes in score order.
-func Nodes(cands []*Candidate) []*graph.Node {
-	out := make([]*graph.Node, 0, len(cands))
-	for _, c := range cands {
-		out = append(out, c.Node)
-	}
-	return out
-}
-
 // DefaultSignals returns the canonical signal lineup in stable order.
 // Callers wanting a subset should construct New() directly.
 func DefaultSignals() []Signal {

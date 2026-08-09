@@ -211,6 +211,3 @@ func Current() Snapshot { return process.Snapshot() }
 func RunIfQuiet(quiet time.Duration, fn func()) (bool, time.Duration) {
 	return process.RunIfQuiet(quiet, fn)
 }
-
-// RegisterIdleHook registers a process-wide idle-transition callback.
-func RegisterIdleHook(hook func(string)) func() { return process.RegisterIdleHook(hook) }
