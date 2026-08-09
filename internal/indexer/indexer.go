@@ -328,10 +328,6 @@ type Indexer struct {
 	// semanticMgr is the optional semantic enrichment manager.
 	semanticMgr *semantic.Manager
 
-	// resolverLSPHelper, when non-nil, is the resolve-time LSP
-	// helper installed on idx.resolver. See SetResolverLSPHelper.
-	resolverLSPHelper resolver.LSPHelper
-
 	// npmAliasOnce builds npmAlias lazily on the first resolve-time
 	// import-rewrite request. Lazy because the repo root and prefix
 	// are set after New(); by the time the resolver runs they are
@@ -1646,12 +1642,12 @@ func (idx *Indexer) SemanticManager() *semantic.Manager { return idx.semanticMgr
 //
 // Pass nil to detach. Must be called before ResolveAll / ResolveFile;
 // the resolver caches no LSP state across passes, so mid-pass swaps
-// are racy and not supported.
+// are racy and not supported. The resolver owns the helper — this is a
+// pass-through, not a second place it is stored.
 func (idx *Indexer) SetResolverLSPHelper(h resolver.LSPHelper) {
 	if idx.resolver != nil {
 		idx.resolver.SetLSPHelper(h)
 	}
-	idx.resolverLSPHelper = h
 }
 
 // prefixPath prepends the repoPrefix to a relative path when in multi-repo mode.

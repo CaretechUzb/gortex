@@ -2,7 +2,6 @@ package graph
 
 import (
 	"strings"
-	"sync/atomic"
 )
 
 // Stub-node identifier conventions.
@@ -171,11 +170,6 @@ func StructuralEdgeTargetInvalid(kind EdgeKind, toID string) bool {
 	return strings.Contains(toID, "#param:") || strings.Contains(toID, "#local:")
 }
 
-// structuralWriteDrops counts edges the write funnels refused — the
-// feedback-loop counter: every increment means an upstream pass produced a
-// structurally impossible edge and a gate (not luck) stopped it.
-var structuralWriteDrops atomic.Int64
-
 // FilterStructuralEdgeViolations drops edges StructuralEdgeTargetInvalid
 // rejects, copying the slice only when a violation exists — the clean path
 // (every real batch) allocates nothing. Returns the kept slice and the
@@ -195,9 +189,6 @@ func FilterStructuralEdgeViolations(edges []*Edge) ([]*Edge, int) {
 		if dropped > 0 {
 			kept = append(kept, e)
 		}
-	}
-	if dropped > 0 {
-		structuralWriteDrops.Add(int64(dropped))
 	}
 	return kept, dropped
 }

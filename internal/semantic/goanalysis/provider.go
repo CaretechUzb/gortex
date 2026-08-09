@@ -2275,9 +2275,10 @@ func findContainingFuncInNodes(nodes []*graph.Node, line int) *graph.Node {
 	return best
 }
 
-// matchRepoNodeByFileLine mirrors semantic.MatchNodeByFileLine over an
-// already-materialized file slice. Keeping the exact innermost-then-nearest
-// policy preserves matching behavior while removing the per-object store read.
+// matchRepoNodeByFileLine picks the node covering a line from an
+// already-materialized file slice, so enrichment does not pay a store read per
+// object. The innermost enclosing node wins; ties break toward the smallest
+// span, and file/import nodes never match.
 func matchRepoNodeByFileLine(nodes []*graph.Node, line int) *graph.Node {
 	var best *graph.Node
 	bestSize := int(^uint(0) >> 1)

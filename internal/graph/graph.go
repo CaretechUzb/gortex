@@ -2714,7 +2714,6 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 func (g *Graph) AddEdge(e *Edge) {
 	// Structural-shape backstop: see StructuralEdgeTargetInvalid.
 	if e != nil && StructuralEdgeTargetInvalid(e.Kind, e.To) {
-		structuralWriteDrops.Add(1)
 		return
 	}
 	receiptActive := g.beginReceiptMutation()
