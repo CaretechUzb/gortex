@@ -1695,43 +1695,6 @@ func (g *Graph) AllEdgesLight(kinds ...EdgeKind) []*Edge {
 	return out
 }
 
-// EdgesForKindsLight returns the edges of the given kinds (an empty kinds list
-// means every kind) for a whole-graph scan, preferring the meta-less
-// LightEdgeScanner capability when the store implements it (skips the per-edge
-// Meta decode on disk backends) and otherwise falling back to AllEdges() with a
-// Go-side kind filter. See LightEdgeScanner for the Meta-presence contract:
-// callers must read only the promoted edge fields, never arbitrary Meta.
-func EdgesForKindsLight(g Store, kinds ...EdgeKind) []*Edge {
-	if g == nil {
-		return nil
-	}
-	if sc, ok := g.(LightEdgeScanner); ok {
-		return sc.AllEdgesLight(kinds...)
-	}
-	all := g.AllEdges()
-	if len(kinds) == 0 {
-		return all
-	}
-	want := make(map[EdgeKind]struct{}, len(kinds))
-	for _, k := range kinds {
-		if k != "" {
-			want[k] = struct{}{}
-		}
-	}
-	if len(want) == 0 {
-		return nil
-	}
-	out := make([]*Edge, 0, len(all))
-	for _, e := range all {
-		if e != nil {
-			if _, ok := want[e.Kind]; ok {
-				out = append(out, e)
-			}
-		}
-	}
-	return out
-}
-
 // DeadCodeCandidates is the in-memory reference implementation of
 // DeadCodeCandidator. Iterates the requested node kinds and filters
 // out anything whose incoming-edge bucket contains an allowlist match

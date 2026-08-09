@@ -107,10 +107,8 @@ var stubKinds = []string{
 
 // IsStdlibStub etc are convenience predicates that don't make
 // the caller compare StubKind's return against a literal.
-func IsStdlibStub(id string) bool       { return StubKind(id) == StubKindStdlib }
-func IsBuiltinStub(id string) bool      { return StubKind(id) == StubKindBuiltin }
-func IsExternalCallStub(id string) bool { return StubKind(id) == StubKindExternalCall }
-func IsModuleStub(id string) bool       { return StubKind(id) == StubKindModule }
+func IsStdlibStub(id string) bool  { return StubKind(id) == StubKindStdlib }
+func IsBuiltinStub(id string) bool { return StubKind(id) == StubKindBuiltin }
 
 // StubRest returns the kind-specific tail of a stub id (the
 // portion after "<repo>::<kind>::" or "<kind>::"). Returns "" if
@@ -175,15 +173,8 @@ func StructuralEdgeTargetInvalid(kind EdgeKind, toID string) bool {
 
 // structuralWriteDrops counts edges the write funnels refused — the
 // feedback-loop counter: every increment means an upstream pass produced a
-// structurally impossible edge and a gate (not luck) stopped it. Exposed via
-// StructuralEdgeDropCount for the audit battery and tests.
+// structurally impossible edge and a gate (not luck) stopped it.
 var structuralWriteDrops atomic.Int64
-
-// StructuralEdgeDropCount reports how many structurally invalid edges write
-// funnels have refused since process start.
-func StructuralEdgeDropCount() int64 {
-	return structuralWriteDrops.Load()
-}
 
 // FilterStructuralEdgeViolations drops edges StructuralEdgeTargetInvalid
 // rejects, copying the slice only when a violation exists — the clean path
