@@ -53,7 +53,8 @@ returned. Cases are tiered (exact / concept / multi_hop) so per-tier recall
 is broken out separately.
 
 Rankers:
-  bm25      — text-only (default text backend)
+  bm25      — lexical-only: the store-native symbol FTS queried
+              through Engine.SearchSymbols (the search_symbols path)
   semantic  — vector-only (requires --embeddings)
   rrf       — BM25 + vector fused via RRF (requires --embeddings)
   winnow    — graph-aware constraint chain (MCP winnow_symbols scorer)
@@ -152,7 +153,8 @@ func runEvalRecall(_ *cobra.Command, _ []string) error {
 
 	// Peel the Swappable wrapper so we can see the real backend. When
 	// embeddings are on, the indexer builds a HybridBackend internally;
-	// its TextBackend() is the pure lexical side, and the whole
+	// its TextBackend() is the pure lexical side — an adapter over the
+	// store's own symbol FTS, not a harness-built index — and the whole
 	// HybridBackend is what RRF queries.
 	inner := idx.Search()
 	if sw, ok := inner.(*search.Swappable); ok {
@@ -181,10 +183,12 @@ func runEvalRecall(_ *cobra.Command, _ []string) error {
 	}
 
 	// The engine-backed lexical row mirrors the MCP search_symbols call
-	// path (BM25 ranking + substring fallback for camelCase-only queries)
-	// against the store's own full-text index — the same backend the
-	// daemon serves, so the row reports what real callers hit rather than
-	// a harness-only in-process index. Critically: the engine is pointed
+	// path: the store-native FTS ranking plus the substring fallback for
+	// camelCase-only queries, run through Engine.SearchSymbols against
+	// the store's own full-text index — the same backend the daemon
+	// serves, so the row reports what real callers hit. The "bm25" row
+	// key is kept only so historical bench artifacts stay joinable; no
+	// in-process BM25 index is involved. Critically: the engine is pointed
 	// at the PURE text backend even when --embeddings is on — otherwise
 	// the "bm25" row would silently run through HybridBackend.Search (RRF
 	// fusion with vector results) and the measurement would no longer

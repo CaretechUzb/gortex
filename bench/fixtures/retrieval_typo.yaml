@@ -512,9 +512,9 @@ cases:
         - internal/parser/languages/register.go::RegisterAll
     - id: concept-ranker-bm25-typo
       tier: concept
-      query: eval rnker adapter for BM25
+      query: eval rnker adapter for engine search
       expected:
-        - internal/eval/recall/rankers.go::BM25Ranker
+        - internal/eval/recall/rankers.go::EngineRanker
     - id: concept-ranker-rrf-typo
       tier: concept
       query: eval ranker dapter for RRF hybrid
@@ -708,7 +708,7 @@ cases:
       tier: multi_hop
       query: ranker adapters in the eval packapge
       expected:
-        - internal/eval/recall/rankers.go::BM25Ranker
+        - internal/eval/recall/rankers.go::EngineRanker
         - internal/eval/recall/rankers.go::SemanticRanker
         - internal/eval/recall/rankers.go::RRFRanker
         - internal/eval/recall/rankers.go::WinnowRanker

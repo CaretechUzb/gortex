@@ -154,7 +154,7 @@ cases:
   - { id: concept-ts-extract,        tier: concept, query: "TypeScript language extractor",                 expected: [internal/parser/languages/typescript.go::TypeScriptExtractor] }
   - { id: concept-detect-lang,       tier: concept, query: "detect language from file extension",           expected: [internal/parser/registry.go::Registry.GetByExtension] }
   - { id: concept-register-all,      tier: concept, query: "register every language extractor",             expected: [internal/parser/languages/register.go::RegisterAll] }
-  - { id: concept-ranker-bm25,       tier: concept, query: "eval ranker adapter for BM25",                  expected: [internal/eval/recall/rankers.go::BM25Ranker] }
+  - { id: concept-ranker-bm25,       tier: concept, query: "eval ranker adapter for engine search",         expected: [internal/eval/recall/rankers.go::EngineRanker] }
   - { id: concept-ranker-rrf,        tier: concept, query: "eval ranker adapter for RRF hybrid",            expected: [internal/eval/recall/rankers.go::RRFRanker] }
   - { id: concept-ranker-semantic,   tier: concept, query: "eval ranker for vector-only semantic",          expected: [internal/eval/recall/rankers.go::SemanticRanker] }
   - { id: concept-ranker-winnow,     tier: concept, query: "eval ranker wrapping graph-aware winnow",       expected: [internal/eval/recall/rankers.go::WinnowRanker] }
@@ -269,7 +269,7 @@ cases:
     tier: multi_hop
     query: "ranker adapters in the eval package"
     expected:
-      - internal/eval/recall/rankers.go::BM25Ranker
+      - internal/eval/recall/rankers.go::EngineRanker
       - internal/eval/recall/rankers.go::SemanticRanker
       - internal/eval/recall/rankers.go::RRFRanker
       - internal/eval/recall/rankers.go::WinnowRanker
