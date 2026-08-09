@@ -18,7 +18,7 @@ func withFakeStatus(t *testing.T, fn func() (*daemon.StatusResponse, error)) {
 
 func TestRunSessionStart_RejectsWrongEvent(t *testing.T) {
 	data := []byte(`{"hook_event_name":"PreCompact"}`)
-	out := captureStdout(t, func() { runSessionStart(data) })
+	out := captureStdout(t, func() { runSessionStart(data, 0) })
 	if out != "" {
 		t.Errorf("expected no-op for non-SessionStart, got: %q", out)
 	}
@@ -71,7 +71,7 @@ func TestRunSessionStartEmitsNeutralRoutingAndIdentifierGuidance(t *testing.T) {
 		"session_id":      "routing-event",
 		"cwd":             t.TempDir(),
 	})
-	output := captureHookStdout(t, func() { runSessionStart(payload) })
+	output := captureHookStdout(t, func() { runSessionStart(payload, 0) })
 	var decoded HookOutput
 	if err := json.Unmarshal([]byte(output), &decoded); err != nil {
 		t.Fatalf("decode SessionStart output: %v; output=%q", err, output)
@@ -118,7 +118,7 @@ func TestRunSessionStart_DaemonDown(t *testing.T) {
 	})
 
 	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/x","source":"startup"}`)
-	out := captureStdout(t, func() { runSessionStart(data) })
+	out := captureStdout(t, func() { runSessionStart(data, 0) })
 	if out == "" {
 		t.Fatal("expected briefing output even when daemon is down")
 	}
@@ -159,7 +159,7 @@ func TestRunSessionStart_DaemonReady_CwdExactMatch(t *testing.T) {
 	})
 
 	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/gortex"}`)
-	out := captureStdout(t, func() { runSessionStart(data) })
+	out := captureStdout(t, func() { runSessionStart(data, 0) })
 
 	var payload HookOutput
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
@@ -192,7 +192,7 @@ func TestRunSessionStart_DaemonReady_CwdContainsRepos(t *testing.T) {
 	})
 
 	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp"}`)
-	out := captureStdout(t, func() { runSessionStart(data) })
+	out := captureStdout(t, func() { runSessionStart(data, 0) })
 
 	var payload HookOutput
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
@@ -228,7 +228,7 @@ func TestRunSessionStart_DaemonReady_CwdNotTracked(t *testing.T) {
 	})
 
 	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/playground"}`)
-	out := captureStdout(t, func() { runSessionStart(data) })
+	out := captureStdout(t, func() { runSessionStart(data, 0) })
 
 	var payload HookOutput
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
@@ -253,7 +253,7 @@ func TestRunSessionStart_DaemonWarmup(t *testing.T) {
 		}, nil
 	})
 	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/x"}`)
-	out := captureStdout(t, func() { runSessionStart(data) })
+	out := captureStdout(t, func() { runSessionStart(data, 0) })
 
 	var payload HookOutput
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
@@ -265,12 +265,61 @@ func TestRunSessionStart_DaemonWarmup(t *testing.T) {
 	}
 }
 
+// TestRunSessionStart_CompactSourceAddsReinjectionAdvisory pins the one place
+// Gortex can speak after a compaction. PreCompact cannot inject context, so if
+// this branch regresses the agent wakes up holding re-injected whole-file
+// content with nothing telling it not to read those files again.
+func TestRunSessionStart_CompactSourceAddsReinjectionAdvisory(t *testing.T) {
+	withFakeStatus(t, func() (*daemon.StatusResponse, error) {
+		return &daemon.StatusResponse{
+			Version: "v0.63.2", Ready: true, EnrichmentComplete: true,
+			TrackedRepos: []daemon.TrackedRepoStatus{},
+		}, nil
+	})
+	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/x","source":"compact"}`)
+	out := captureStdout(t, func() { runSessionStart(data, 1) })
+
+	var payload HookOutput
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("invalid HookOutput JSON: %v\n%s", err, out)
+	}
+	ac := payload.HookSpecificOutput.AdditionalContext
+	for _, want := range []string{
+		"Gortex Post-Compaction Snapshot",
+		"Do not re-read indexed files.",
+		"Rule:", // the ordinary orientation block must survive alongside it
+	} {
+		if !strings.Contains(ac, want) {
+			t.Errorf("compact-source briefing missing %q, got:\n%s", want, ac)
+		}
+	}
+}
+
+func TestRunSessionStart_NonCompactSourcesStayUnchanged(t *testing.T) {
+	for _, source := range []string{"startup", "resume", "clear", "fork", ""} {
+		t.Run(source, func(t *testing.T) {
+			withFakeStatus(t, func() (*daemon.StatusResponse, error) {
+				return &daemon.StatusResponse{
+					Version: "v0.63.2", Ready: true, EnrichmentComplete: true,
+					TrackedRepos: []daemon.TrackedRepoStatus{},
+				}, nil
+			})
+			data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/x","source":"` + source + `"}`)
+			out := captureStdout(t, func() { runSessionStart(data, 1) })
+
+			if strings.Contains(out, "Post-Compaction") {
+				t.Errorf("source %q must not get the post-compaction block, got:\n%s", source, out)
+			}
+		})
+	}
+}
+
 func TestRunSessionStart_DaemonError(t *testing.T) {
 	withFakeStatus(t, func() (*daemon.StatusResponse, error) {
 		return nil, errors.New("synthetic transport failure")
 	})
 	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/x"}`)
-	out := captureStdout(t, func() { runSessionStart(data) })
+	out := captureStdout(t, func() { runSessionStart(data, 0) })
 
 	var payload HookOutput
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
@@ -338,6 +387,50 @@ func TestFormatDuration(t *testing.T) {
 		got := formatDuration(c.secs)
 		if got != c.want {
 			t.Errorf("formatDuration(%d) = %q, want %q", c.secs, got, c.want)
+		}
+	}
+}
+
+// TestRunSessionStart_DoesNotDoubleVersionPrefix guards the "vv0.63.2" render
+// reported in issue #70. StatusResponse.Version arrives already v-prefixed, and
+// every readiness line adds its own literal "v".
+func TestRunSessionStart_DoesNotDoubleVersionPrefix(t *testing.T) {
+	cases := []struct {
+		name   string
+		status *daemon.StatusResponse
+	}{
+		{"ready", &daemon.StatusResponse{Version: "v0.63.2", Ready: true, EnrichmentComplete: true}},
+		{"enriching", &daemon.StatusResponse{Version: "v0.63.2", Ready: true}},
+		{"warmup", &daemon.StatusResponse{Version: "v0.63.2", WarmupSeconds: 30}},
+		{"unprefixed", &daemon.StatusResponse{Version: "0.63.2", Ready: true, EnrichmentComplete: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.status.TrackedRepos = []daemon.TrackedRepoStatus{}
+			withFakeStatus(t, func() (*daemon.StatusResponse, error) { return tc.status, nil })
+
+			data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/x"}`)
+			out := captureStdout(t, func() { runSessionStart(data, 0) })
+
+			if strings.Contains(out, "vv") {
+				t.Errorf("doubled version prefix in briefing:\n%s", out)
+			}
+			if !strings.Contains(out, "v0.63.2") {
+				t.Errorf("version missing from briefing:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestDaemonVersionLabel(t *testing.T) {
+	for in, want := range map[string]string{
+		"v0.63.2":            "0.63.2",
+		"0.63.2":             "0.63.2",
+		"v0.63.2-39-gabcdef": "0.63.2-39-gabcdef",
+		"":                   "",
+	} {
+		if got := daemonVersionLabel(in); got != want {
+			t.Errorf("daemonVersionLabel(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

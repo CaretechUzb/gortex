@@ -23,14 +23,40 @@ type PreCompactInput struct {
 	CustomInstructions string `json:"custom_instructions"`
 }
 
+// compactionReinjectionAdvisory is the load-bearing half of the post-compaction
+// block. Claude Code rebuilds the window from the summary, the most recent
+// exchanges, and up to five recently-read files, which it re-reads from disk and
+// re-injects as system-reminder blocks. That path calls the Read tool directly,
+// so no PreToolUse hook sees it and none of Gortex's redirects apply: the agent
+// wakes up holding raw whole-file content it never asked for. Telling it so is
+// what stops it paying for the same bytes twice.
+const compactionReinjectionAdvisory = "This session was just compacted. Claude Code rebuilt the context window from " +
+	"the summary, the most recent exchanges, and up to five recently-read files — re-read from disk and " +
+	"re-injected as `system-reminder` blocks. That content is already in context and did not pass through " +
+	"Gortex, so re-reading those files buys nothing and pays for the same bytes twice.\n\n" +
+	"Continue with Gortex: call `explore` for the task, then inspect with `search`, `read`, `relations`, " +
+	"or `trace`. Do not re-read indexed files.\n\n"
+
 // runPreCompact handles a PreCompact hook invocation given the raw stdin bytes
-// already read by the dispatcher. It queries the Gortex bridge at the given
-// port for an orientation snapshot and emits additionalContext so the agent
-// survives compaction without having to re-explore.
+// already read by the dispatcher.
 //
-// Graceful degradation: if the bridge is unreachable (port wrong, server down),
-// the hook returns silently with no output. It never blocks compaction.
-func runPreCompact(data []byte, port int) {
+// It deliberately emits nothing. PreCompact has no context-injection contract in
+// Claude Code: its documented output is a top-level `decision: "block"` (or exit
+// code 2), both of which *block compaction* — and `hookSpecificOutput.additionalContext`
+// is honoured only for SessionStart, Setup, SubagentStart, the tool events, Stop
+// and SubagentStop. PreCompact is not on that list, and its stdout is not one of
+// the three events (UserPromptSubmit, UserPromptExpansion, SessionStart) whose
+// plain stdout becomes context. A briefing emitted here therefore never reaches
+// the model, whatever shape it takes.
+//
+// The orientation snapshot is delivered instead by SessionStart with
+// source="compact", which does honour additionalContext and fires once the new
+// context window has been built. See buildCompactionBriefing and runSessionStart.
+//
+// The event is still handled so hook-effectiveness telemetry records the
+// compaction, and so there is a place to hang a future PreCompact decision.
+// It never blocks compaction.
+func runPreCompact(data []byte, _ int) {
 	started := time.Now()
 	var input PreCompactInput
 	if err := json.Unmarshal(data, &input); err != nil {
@@ -39,42 +65,26 @@ func runPreCompact(data []byte, port int) {
 	if input.HookEventName != "PreCompact" {
 		return
 	}
-	emitted := false
-	defer func() {
-		logHookEffectiveness("PreCompact", emitted, daemonReachableFn(), 0, time.Since(started))
-	}()
-
-	briefing := buildPreCompactBriefing(port)
-	if briefing == "" {
-		return
-	}
-
-	output := HookOutput{
-		HookSpecificOutput: &HookSpecificOutput{
-			HookEventName:     "PreCompact",
-			AdditionalContext: briefing,
-		},
-	}
-	out, err := json.Marshal(output)
-	if err != nil {
-		return
-	}
-	emitted = true
-	fmt.Print(string(out))
+	logHookEffectiveness("PreCompact", false, daemonReachableFn(), 0, time.Since(started))
 }
 
-// buildPreCompactBriefing queries the bridge and renders a markdown briefing.
-// Returns empty string when the bridge is unreachable or returns no data.
-func buildPreCompactBriefing(port int) string {
+// buildCompactionBriefing renders the post-compaction orientation block that
+// SessionStart(source="compact") injects.
+//
+// Unlike the rest of the briefing surface it always returns something: the
+// re-injection advisory costs no daemon call and is the most valuable half of
+// the block, so an unreachable bridge degrades to advisory-only rather than to
+// silence.
+func buildCompactionBriefing(port int) string {
+	var sb strings.Builder
+	sb.WriteString("\n## Gortex Post-Compaction Snapshot\n\n")
+	sb.WriteString(compactionReinjectionAdvisory)
+
 	stats := callServerTool(port, "graph_stats", nil)
 	if stats == "" {
-		// No bridge => nothing useful to say; let compaction proceed silently.
-		return ""
+		// No bridge => the advisory above is the whole value.
+		return sb.String()
 	}
-
-	var sb strings.Builder
-	sb.WriteString("## Gortex PreCompact Snapshot\n\n")
-	sb.WriteString("Continue with Gortex after compaction: call `explore` for the task, then inspect with `search`, `read`, `relations`, or `trace`; do not re-read indexed files.\n\n")
 
 	if summary := renderStatsSummary(stats); summary != "" {
 		sb.WriteString("**Index:** ")

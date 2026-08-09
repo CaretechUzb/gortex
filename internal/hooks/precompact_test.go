@@ -32,7 +32,50 @@ func TestRunPreCompact_NoBridge(t *testing.T) {
 	}
 }
 
-func TestRunPreCompact_RendersBriefing(t *testing.T) {
+// TestRunPreCompact_EmitsNothingEvenWithBridge is a contract guard, not a
+// behavioural test. PreCompact has no context-injection contract in Claude Code:
+// additionalContext is honoured only for SessionStart / Setup / SubagentStart /
+// the tool events / Stop / SubagentStop, and PreCompact's only documented output
+// (`decision: "block"`, exit 2) blocks compaction. Anything this hook prints is
+// therefore either discarded or actively harmful, so it must print nothing —
+// even when the bridge is up and a briefing could be built.
+func TestRunPreCompact_EmitsNothingEvenWithBridge(t *testing.T) {
+	srv := newFakeServer(map[string]string{
+		"graph_stats": `{"total_nodes":4500,"total_edges":47000,"by_language":{"go":3000}}`,
+		"analyze":     "method Graph.AddNode internal/graph/graph.go fan_in=42 fan_out=3",
+	})
+	defer srv.Close()
+
+	port := portFromURL(t, srv.URL)
+	data := []byte(`{"hook_event_name":"PreCompact","session_id":"s","trigger":"auto"}`)
+	out := captureStdout(t, func() { runPreCompact(data, port) })
+
+	if out != "" {
+		t.Errorf("PreCompact must emit nothing — it has no additionalContext contract; got:\n%s", out)
+	}
+}
+
+func TestDispatch_RoutesPreCompactSilently(t *testing.T) {
+	srv := newFakeServer(map[string]string{
+		"graph_stats": `{"total_nodes":1,"total_edges":0,"by_language":{"go":1}}`,
+	})
+	defer srv.Close()
+	port := portFromURL(t, srv.URL)
+
+	data := []byte(`{"hook_event_name":"PreCompact","session_id":"s","trigger":"auto"}`)
+	var out string
+	withStdin(t, data, func() {
+		out = captureStdout(t, func() { Run(port, ModeDeny) })
+	})
+	if out != "" {
+		t.Errorf("PreCompact routing must stay silent, got:\n%s", out)
+	}
+}
+
+// TestBuildCompactionBriefing_CarriesAdvisoryAndSnapshot covers the block that
+// SessionStart(source="compact") injects — the content that used to be emitted,
+// uselessly, from PreCompact.
+func TestBuildCompactionBriefing_CarriesAdvisoryAndSnapshot(t *testing.T) {
 	srv := newFakeServer(map[string]string{
 		"graph_stats": `{"total_nodes":4500,"total_edges":47000,"by_language":{"go":3000,"typescript":400,"markdown":500}}`,
 		"get_symbol_history": "method Server.handleBatchEdit internal/mcp/tools_enhancements.go:1200 (edits=3, CHURNING)\n" +
@@ -43,66 +86,35 @@ func TestRunPreCompact_RendersBriefing(t *testing.T) {
 	})
 	defer srv.Close()
 
-	port := portFromURL(t, srv.URL)
-	data := []byte(`{"hook_event_name":"PreCompact","session_id":"s","trigger":"auto"}`)
-	out := captureStdout(t, func() { runPreCompact(data, port) })
+	got := buildCompactionBriefing(portFromURL(t, srv.URL))
 
-	if out == "" {
-		t.Fatal("expected output when bridge is reachable")
-	}
-
-	var payload HookOutput
-	if err := json.Unmarshal([]byte(out), &payload); err != nil {
-		t.Fatalf("output is not valid HookOutput JSON: %v\n%s", err, out)
-	}
-	if payload.HookSpecificOutput == nil {
-		t.Fatal("hookSpecificOutput missing")
-	}
-	if payload.HookSpecificOutput.HookEventName != "PreCompact" {
-		t.Errorf("wrong hookEventName: %q", payload.HookSpecificOutput.HookEventName)
-	}
-	ac := payload.HookSpecificOutput.AdditionalContext
-	if !strings.Contains(ac, "Gortex PreCompact Snapshot") {
-		t.Errorf("briefing missing header:\n%s", ac)
-	}
-	if !strings.Contains(ac, "4500 nodes, 47000 edges") {
-		t.Errorf("briefing missing graph stats:\n%s", ac)
-	}
-	if !strings.Contains(ac, "handleBatchEdit") {
-		t.Errorf("briefing missing recent modifications:\n%s", ac)
-	}
-	if !strings.Contains(ac, "Graph.AddNode") {
-		t.Errorf("briefing missing hotspots:\n%s", ac)
-	}
-	if !strings.Contains(ac, "HandleRequest") {
-		t.Errorf("briefing missing feedback ranking:\n%s", ac)
+	for _, want := range []string{
+		"Gortex Post-Compaction Snapshot",
+		"re-injected as `system-reminder` blocks",
+		"Do not re-read indexed files.",
+		"4500 nodes, 47000 edges",
+		"handleBatchEdit",
+		"Graph.AddNode",
+		"HandleRequest",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("post-compaction briefing missing %q:\n%s", want, got)
+		}
 	}
 }
 
-func TestDispatch_RoutesPreCompact(t *testing.T) {
-	srv := newFakeServer(map[string]string{
-		"graph_stats": `{"total_nodes":1,"total_edges":0,"by_language":{"go":1}}`,
-	})
-	defer srv.Close()
-	port := portFromURL(t, srv.URL)
+// TestBuildCompactionBriefing_AdvisorySurvivesDeadBridge pins the degrade path.
+// The re-injection advisory needs no daemon, and it is the half that actually
+// stops the agent paying twice for content the harness already pushed in — so a
+// dead bridge must cost the graph sections, not the whole block.
+func TestBuildCompactionBriefing_AdvisorySurvivesDeadBridge(t *testing.T) {
+	got := buildCompactionBriefing(1) // port 1 is guaranteed closed
 
-	data := []byte(`{"hook_event_name":"PreCompact","session_id":"s","trigger":"auto"}`)
-	old := os.Stdin
-	defer func() { os.Stdin = old }()
-
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
+	if !strings.Contains(got, "Do not re-read indexed files.") {
+		t.Errorf("advisory must survive an unreachable bridge, got:\n%s", got)
 	}
-	go func() {
-		_, _ = w.Write(data)
-		_ = w.Close()
-	}()
-	os.Stdin = r
-
-	out := captureStdout(t, func() { Run(port, ModeDeny) })
-	if !strings.Contains(out, "Gortex PreCompact Snapshot") {
-		t.Errorf("Run did not route to PreCompact handler:\n%s", out)
+	if strings.Contains(got, "**Index:**") {
+		t.Errorf("graph sections must be absent without a bridge, got:\n%s", got)
 	}
 }
 

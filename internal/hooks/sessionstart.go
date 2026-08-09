@@ -22,11 +22,16 @@ type SessionStartInput struct {
 	SessionID      string `json:"session_id"`
 	TranscriptPath string `json:"transcript_path"`
 	CWD            string `json:"cwd"`
-	// Source is "startup" | "resume" | "clear" | "compact". Currently
-	// unused — every source gets the same orientation block — but kept
-	// here so future logic can branch.
+	// Source is "startup" | "resume" | "clear" | "compact" | "fork".
+	// Only "compact" changes the briefing: it is the one injection point
+	// Gortex has after a compaction, because PreCompact cannot add context
+	// (see runPreCompact). Every other source gets the same orientation block.
 	Source string `json:"source"`
 }
+
+// sessionSourceCompact is the SessionStart source Claude Code sets when the
+// session continues after its context window was compacted.
+const sessionSourceCompact = "compact"
 
 // runSessionStart handles a SessionStart hook by querying the daemon
 // for status and emitting an additionalContext block. The block is
@@ -36,7 +41,7 @@ type SessionStartInput struct {
 // Graceful degradation: if the daemon socket can't be dialled, the
 // hook still emits a block — but its content tells the user that
 // enforcement is disabled and how to fix it.
-func runSessionStart(data []byte) {
+func runSessionStart(data []byte, port int) {
 	started := time.Now()
 	var input SessionStartInput
 	if err := json.Unmarshal(data, &input); err != nil {
@@ -57,6 +62,11 @@ func runSessionStart(data []byte) {
 	ctx := buildSessionStartBriefing(input.CWD)
 	if ctx == "" {
 		return
+	}
+	// A compacted session is the only one that wakes up holding re-injected
+	// file content, and this is the only hook that can tell it so.
+	if strings.EqualFold(strings.TrimSpace(input.Source), sessionSourceCompact) {
+		ctx += buildCompactionBriefing(port)
 	}
 
 	output := HookOutput{
@@ -236,6 +246,17 @@ func buildSessionStartBriefing(cwd string) string {
 // touching machine state.
 var activeHookTier = profiles.ActiveHookTier
 
+// daemonVersionLabel renders a daemon version with no leading "v", so a
+// caller's own literal "v" cannot double it into "vv0.63.2".
+//
+// StatusResponse.Version is normally already v-prefixed — canonicalVersion
+// composes it through version.Version.String(), which hardcodes the "v" — but
+// its fallback branch returns a bare version instead, so the trim has to
+// tolerate both and every "(v%s" site has to go through here.
+func daemonVersionLabel(version string) string {
+	return strings.TrimPrefix(version, "v")
+}
+
 // renderLeanReadiness is the one-line status the lean tier emits when
 // the cwd is a tracked repo. The workspace-root and not-covered cases
 // keep their full explanations in every tier — those are actionable
@@ -252,10 +273,10 @@ func renderLeanReadiness(cwd string, s *daemon.StatusResponse) string {
 	// A probe-sourced response carries no counters. Printing its zero as a
 	// node count would state something untrue about the graph.
 	line := fmt.Sprintf("✓ Gortex %s (v%s): %d repo(s), %d nodes.",
-		state, strings.TrimPrefix(s.Version, "v"), len(s.TrackedRepos), totalNodes)
+		state, daemonVersionLabel(s.Version), len(s.TrackedRepos), totalNodes)
 	if s.CountsUnknown {
 		line = fmt.Sprintf("✓ Gortex %s (v%s): %d repo(s).",
-			state, strings.TrimPrefix(s.Version, "v"), len(s.TrackedRepos))
+			state, daemonVersionLabel(s.Version), len(s.TrackedRepos))
 	}
 
 	abs := cwd
@@ -287,13 +308,13 @@ func renderDaemonReadiness(s *daemon.StatusResponse) string {
 	var sb strings.Builder
 	switch {
 	case s.Ready && s.EnrichmentComplete:
-		fmt.Fprintf(&sb, "✓ Gortex daemon ready (v%s, uptime %s). ", s.Version, formatDuration(s.UptimeSeconds))
+		fmt.Fprintf(&sb, "✓ Gortex daemon ready (v%s, uptime %s). ", daemonVersionLabel(s.Version), formatDuration(s.UptimeSeconds))
 	case s.Ready:
 		fmt.Fprintf(&sb, "✓ Gortex daemon ready — references queryable (v%s, uptime %s); semantic enrichment still running. ",
-			s.Version, formatDuration(s.UptimeSeconds))
+			daemonVersionLabel(s.Version), formatDuration(s.UptimeSeconds))
 	default:
 		fmt.Fprintf(&sb, "⏳ Gortex daemon warming up (v%s, %s elapsed). Enforcement is partial until ready. ",
-			s.Version, formatDuration(s.WarmupSeconds))
+			daemonVersionLabel(s.Version), formatDuration(s.WarmupSeconds))
 	}
 	// A probe-sourced response never computed the aggregates; reporting its
 	// zeros as real totals would say the graph is empty when it is not.

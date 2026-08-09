@@ -123,7 +123,7 @@ func Run(port int, mode Mode) {
 		runPostTask(data, port)
 	case "SessionStart":
 		captureModelHint(data)
-		runSessionStart(data)
+		runSessionStart(data, port)
 	case "UserPromptSubmit":
 		runUserPromptSubmit(data)
 	case "SubagentStart":

@@ -85,7 +85,7 @@ func runCodex(data []byte, port int, selected ...CodexMode) {
 
 	switch {
 	case peek.HookEventName == "SessionStart":
-		runSessionStart(data)
+		runSessionStart(data, port)
 	case peek.HookEventName == "PreToolUse" && peek.ToolName == "Bash":
 		switch mode {
 		case CodexModeDeny:
