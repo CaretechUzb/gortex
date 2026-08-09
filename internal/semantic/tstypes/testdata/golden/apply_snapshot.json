@@ -1,0 +1,349 @@
+{
+  "Edges": [
+    {
+      "From": "widgets/Alpha.Part1.cs",
+      "To": "widgets/Alpha.Part1.cs::Alpha",
+      "Kind": "defines",
+      "Origin": "",
+      "Line": 3
+    },
+    {
+      "From": "widgets/Alpha.Part1.cs",
+      "To": "widgets/Alpha.Part1.cs::Alpha.Sidekick",
+      "Kind": "defines",
+      "Origin": "",
+      "Line": 5
+    },
+    {
+      "From": "widgets/Alpha.Part1.cs",
+      "To": "widgets/Alpha.Part1.cs::Widgets",
+      "Kind": "defines",
+      "Origin": "",
+      "Line": 1
+    },
+    {
+      "From": "widgets/Alpha.Part1.cs::Alpha",
+      "To": "widgets/Base.cs::WidgetBase",
+      "Kind": "extends",
+      "Origin": "ast_resolved",
+      "Line": 3
+    },
+    {
+      "From": "widgets/Alpha.Part1.cs::Alpha.Sidekick",
+      "To": "unresolved::Helper",
+      "Kind": "typed_as",
+      "Origin": "ast_inferred",
+      "Line": 5
+    },
+    {
+      "From": "widgets/Alpha.Part1.cs::Alpha.Sidekick",
+      "To": "widgets/Alpha.Part1.cs::Alpha",
+      "Kind": "member_of",
+      "Origin": "",
+      "Line": 5
+    },
+    {
+      "From": "widgets/Alpha.Part2.cs",
+      "To": "widgets/Alpha.Part2.cs::Alpha",
+      "Kind": "defines",
+      "Origin": "",
+      "Line": 3
+    },
+    {
+      "From": "widgets/Alpha.Part2.cs",
+      "To": "widgets/Alpha.Part2.cs::Alpha.Draw",
+      "Kind": "defines",
+      "Origin": "",
+      "Line": 5
+    },
+    {
+      "From": "widgets/Alpha.Part2.cs",
+      "To": "widgets/Alpha.Part2.cs::Widgets",
+      "Kind": "defines",
+      "Origin": "",
+      "Line": 1
+    },
+    {
+      "From": "widgets/Alpha.Part2.cs::Alpha.Draw",
+      "To": "unresolved::*.Render",
+      "Kind": "calls",
+      "Origin": "",
+      "Line": 7
+    },
+    {
+      "From": "widgets/Alpha.Part2.cs::Alpha.Draw",
+      "To": "unresolved::Helper",
+      "Kind": "instantiates",
+      "Origin": "ast_resolved",
+      "Line": 8
+    },
+    {
+      "From": "widgets/Alpha.Part2.cs::Alpha.Draw",
+      "To": "widgets/Alpha.Part2.cs::Alpha",
+      "Kind": "member_of",
+      "Origin": "",
+      "Line": 5
+    },
+    {
+      "From": "widgets/Alpha.Part2.cs::Alpha.Draw",
+      "To": "widgets/Helper.cs::Helper.Assist",
+      "Kind": "calls",
+      "Origin": "ast_resolved",
+      "Line": 9
+    },
+    {
+      "From": "widgets/Base.cs",
+      "To": "widgets/Base.cs::WidgetBase",
+      "Kind": "defines",
+      "Origin": "",
+      "Line": 3
+    },
+    {
+      "From": "widgets/Base.cs",
+      "To": "widgets/Base.cs::WidgetBase.Render",
+      "Kind": "defines",
+      "Origin": "",
+      "Line": 5
+    },
+    {
+      "From": "widgets/Base.cs",
+      "To": "widgets/Base.cs::Widgets",
+      "Kind": "defines",
+      "Origin": "",
+      "Line": 1
+    },
+    {
+      "From": "widgets/Base.cs::WidgetBase.Render",
+      "To": "widgets/Base.cs::WidgetBase",
+      "Kind": "member_of",
+      "Origin": "",
+      "Line": 5
+    },
+    {
+      "From": "widgets/Helper.cs",
+      "To": "widgets/Helper.cs::Helper",
+      "Kind": "defines",
+      "Origin": "",
+      "Line": 3
+    },
+    {
+      "From": "widgets/Helper.cs",
+      "To": "widgets/Helper.cs::Helper.Assist",
+      "Kind": "defines",
+      "Origin": "",
+      "Line": 5
+    },
+    {
+      "From": "widgets/Helper.cs",
+      "To": "widgets/Helper.cs::Widgets",
+      "Kind": "defines",
+      "Origin": "",
+      "Line": 1
+    },
+    {
+      "From": "widgets/Helper.cs::Helper.Assist",
+      "To": "widgets/Base.cs::WidgetBase.Render",
+      "Kind": "calls",
+      "Origin": "ast_resolved",
+      "Line": 7
+    },
+    {
+      "From": "widgets/Helper.cs::Helper.Assist",
+      "To": "widgets/Helper.cs::Helper",
+      "Kind": "member_of",
+      "Origin": "",
+      "Line": 5
+    },
+    {
+      "From": "widgets/Helper.cs::Helper.Assist#param:w@0",
+      "To": "unresolved::WidgetBase",
+      "Kind": "typed_as",
+      "Origin": "ast_inferred",
+      "Line": 5
+    },
+    {
+      "From": "widgets/Helper.cs::Helper.Assist#param:w@0",
+      "To": "widgets/Helper.cs::Helper.Assist",
+      "Kind": "param_of",
+      "Origin": "ast_resolved",
+      "Line": 5
+    }
+  ],
+  "MetaStamps": [
+    {
+      "NodeID": "widgets/Alpha.Part1.cs::Alpha",
+      "Key": "scope_ns",
+      "Value": "Widgets"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part1.cs::Alpha",
+      "Key": "type_flavor",
+      "Value": "class"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part1.cs::Alpha",
+      "Key": "visibility",
+      "Value": "public"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part1.cs::Alpha.Sidekick",
+      "Key": "field_type",
+      "Value": "Helper"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part1.cs::Alpha.Sidekick",
+      "Key": "kind",
+      "Value": "property"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part1.cs::Alpha.Sidekick",
+      "Key": "receiver",
+      "Value": "Alpha"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part1.cs::Alpha.Sidekick",
+      "Key": "semantic_source",
+      "Value": "csharp-types"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part1.cs::Alpha.Sidekick",
+      "Key": "semantic_type",
+      "Value": "Helper"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part1.cs::Alpha.Sidekick",
+      "Key": "visibility",
+      "Value": "public"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part2.cs::Alpha",
+      "Key": "scope_ns",
+      "Value": "Widgets"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part2.cs::Alpha",
+      "Key": "type_flavor",
+      "Value": "class"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part2.cs::Alpha",
+      "Key": "visibility",
+      "Value": "public"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part2.cs::Alpha.Draw",
+      "Key": "receiver",
+      "Value": "Alpha"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part2.cs::Alpha.Draw",
+      "Key": "return_type",
+      "Value": "void"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part2.cs::Alpha.Draw",
+      "Key": "scope_ns",
+      "Value": "Widgets"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part2.cs::Alpha.Draw",
+      "Key": "semantic_source",
+      "Value": "csharp-types"
+    },
+    {
+      "NodeID": "widgets/Alpha.Part2.cs::Alpha.Draw",
+      "Key": "visibility",
+      "Value": "public"
+    },
+    {
+      "NodeID": "widgets/Base.cs::WidgetBase",
+      "Key": "scope_ns",
+      "Value": "Widgets"
+    },
+    {
+      "NodeID": "widgets/Base.cs::WidgetBase",
+      "Key": "type_flavor",
+      "Value": "class"
+    },
+    {
+      "NodeID": "widgets/Base.cs::WidgetBase",
+      "Key": "visibility",
+      "Value": "public"
+    },
+    {
+      "NodeID": "widgets/Base.cs::WidgetBase.Render",
+      "Key": "receiver",
+      "Value": "WidgetBase"
+    },
+    {
+      "NodeID": "widgets/Base.cs::WidgetBase.Render",
+      "Key": "return_type",
+      "Value": "void"
+    },
+    {
+      "NodeID": "widgets/Base.cs::WidgetBase.Render",
+      "Key": "scope_ns",
+      "Value": "Widgets"
+    },
+    {
+      "NodeID": "widgets/Base.cs::WidgetBase.Render",
+      "Key": "semantic_source",
+      "Value": "csharp-types"
+    },
+    {
+      "NodeID": "widgets/Base.cs::WidgetBase.Render",
+      "Key": "visibility",
+      "Value": "public"
+    },
+    {
+      "NodeID": "widgets/Helper.cs::Helper",
+      "Key": "scope_ns",
+      "Value": "Widgets"
+    },
+    {
+      "NodeID": "widgets/Helper.cs::Helper",
+      "Key": "type_flavor",
+      "Value": "class"
+    },
+    {
+      "NodeID": "widgets/Helper.cs::Helper",
+      "Key": "visibility",
+      "Value": "public"
+    },
+    {
+      "NodeID": "widgets/Helper.cs::Helper.Assist",
+      "Key": "receiver",
+      "Value": "Helper"
+    },
+    {
+      "NodeID": "widgets/Helper.cs::Helper.Assist",
+      "Key": "return_type",
+      "Value": "void"
+    },
+    {
+      "NodeID": "widgets/Helper.cs::Helper.Assist",
+      "Key": "scope_ns",
+      "Value": "Widgets"
+    },
+    {
+      "NodeID": "widgets/Helper.cs::Helper.Assist",
+      "Key": "semantic_source",
+      "Value": "csharp-types"
+    },
+    {
+      "NodeID": "widgets/Helper.cs::Helper.Assist",
+      "Key": "visibility",
+      "Value": "public"
+    },
+    {
+      "NodeID": "widgets/Helper.cs::Helper.Assist#param:w@0",
+      "Key": "type",
+      "Value": "WidgetBase"
+    }
+  ],
+  "EdgesConfirmed": 3,
+  "EdgesAdded": 0,
+  "SymbolsCovered": 13,
+  "SymbolsTotal": 13,
+  "CoveragePercent": 100
+}
