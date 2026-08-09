@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 func TestObserveLocalizationTerminalAcceptsDirectAndPluginNavigationFacades(t *testing.T) {
@@ -1007,9 +1009,7 @@ func mustJSON(t *testing.T, value any) []byte {
 
 func configureLocalizationTerminalTestHome(t *testing.T) {
 	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CACHE_HOME", home)
+	testenv.Sandbox(t)
 }
 
 func captureHookStdout(t *testing.T, fn func()) string {

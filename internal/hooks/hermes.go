@@ -155,6 +155,14 @@ func runHermesPreToolCall(data []byte, port int, mode Mode) {
 		return
 	}
 
+	// Daemon outage: never block (#486). pre_tool_call's only channel is a
+	// block, and a block that redirects to graph tools the daemon cannot
+	// serve deadlocks the agent. The consult-unlock marker above is local
+	// state and deliberately stays live.
+	if !daemonReachableFn() {
+		return
+	}
+
 	result := hermesEnrich(input, port)
 
 	switch mode {

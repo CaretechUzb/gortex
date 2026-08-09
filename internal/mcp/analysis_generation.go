@@ -335,7 +335,20 @@ func (s *Server) scheduleAnalysisGenerationPrune(writer graph.AnalysisGeneration
 	if writer == nil || !s.analysisPruneScheduled.CompareAndSwap(false, true) {
 		return
 	}
+	// Add under the gate so it cannot start at counter zero concurrently
+	// with DrainBackground's Wait (a WaitGroup misuse panic), and so a
+	// prune requested after the drain is refused instead of escaping it
+	// to write through a store that is about to close.
+	s.backgroundMaintenanceMu.Lock()
+	if s.backgroundMaintenanceDrained {
+		s.backgroundMaintenanceMu.Unlock()
+		s.analysisPruneScheduled.Store(false)
+		return
+	}
+	s.backgroundMaintenance.Add(1)
+	s.backgroundMaintenanceMu.Unlock()
 	go func() {
+		defer s.backgroundMaintenance.Done()
 		defer s.analysisPruneScheduled.Store(false)
 		runtimeactivity.Begin("analysis_generation_gc")
 		defer runtimeactivity.End("analysis_generation_gc")
@@ -345,6 +358,23 @@ func (s *Server) scheduleAnalysisGenerationPrune(writer graph.AnalysisGeneration
 			s.logger.Warn("mcp: analysis generation prune failed", zap.Error(err))
 		}
 	}()
+}
+
+// DrainBackground waits for any in-flight analysis-generation prune and
+// permanently refuses to schedule new ones. Call it before closing the backend
+// store: the prune keeps writing on its already-acquired connection after
+// sql.DB.Close, and a commit there recreates WAL files under a directory being
+// torn down (a test TempDir, an uninstall). The wait ends once the prune's
+// 30s context expires between chunks, though an in-flight chunk can first
+// queue behind the store's writer gate. It does not quiesce RunAnalysis
+// itself: a pass still running on a detached caller (on-demand ensureAnalysis,
+// the track_repository worker) keeps writing generations through the store,
+// and stopping those is the caller's lifecycle problem, not this drain's.
+func (s *Server) DrainBackground() {
+	s.backgroundMaintenanceMu.Lock()
+	s.backgroundMaintenanceDrained = true
+	s.backgroundMaintenanceMu.Unlock()
+	s.backgroundMaintenance.Wait()
 }
 
 func restoreAdjacencyBlob(payload []byte) (*analysis.AdjacencySnapshot, error) {

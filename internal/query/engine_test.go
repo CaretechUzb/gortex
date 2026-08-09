@@ -156,6 +156,22 @@ func TestFindImplementations(t *testing.T) {
 	assert.Equal(t, "DBImpl", impls[0].Name)
 }
 
+// The implements-edges behind the node list must be retrievable too —
+// find_implementations' wire format promises a `.edges` section
+// (from/to/kind/origin/confidence), and the handler can only fill it
+// if the engine hands the edges over instead of dropping them after
+// the walk.
+func TestFindImplementationsWithEdges(t *testing.T) {
+	e := NewEngine(buildTestGraph())
+
+	impls, edges := e.FindImplementationsWithEdgesMinTier("pkg/db.go::DB", "")
+	require.Len(t, impls, 1)
+	require.Len(t, edges, 1, "one implements edge backs the one implementation")
+	assert.Equal(t, impls[0].ID, edges[0].From)
+	assert.Equal(t, "pkg/db.go::DB", edges[0].To)
+	assert.Equal(t, graph.EdgeImplements, edges[0].Kind)
+}
+
 func TestFindUsages(t *testing.T) {
 	e := NewEngine(buildTestGraph())
 

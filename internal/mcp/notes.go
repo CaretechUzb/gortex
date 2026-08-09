@@ -70,16 +70,22 @@ func newNotesManagerFromSidecar(sidecar *persistence.SidecarStore, repoKey, lega
 // NoteQueryFilter constrains a Query call. Zero-value fields disable
 // the corresponding filter; tag matching is exact (case-insensitive).
 type NoteQueryFilter struct {
-	SessionID  string
-	SymbolID   string
-	FilePath   string
-	Tag        string
-	TextSearch string // case-insensitive substring against Body
-	Since      time.Time
+	SessionID   string
+	SymbolID    string
+	FilePath    string
+	Tag         string
+	TextSearch  string // case-insensitive substring against Body
+	Since       time.Time
 	WorkspaceID string
-	ProjectID  string
-	Pinned     *bool // nil = either; true = pinned only; false = unpinned only
-	Limit      int   // 0 = no limit
+	// WorkspaceIn is the set-valued form of WorkspaceID, for a session
+	// bound to the repos its cwd contains: that shape spans several
+	// workspaces and has no single slug, and an empty WorkspaceID means
+	// "no filter", so without this such a session would read every
+	// workspace's notes.
+	WorkspaceIn map[string]bool
+	ProjectID   string
+	Pinned      *bool // nil = either; true = pinned only; false = unpinned only
+	Limit       int   // 0 = no limit
 }
 
 // Save persists a new entry, returning the generated ID. The entry's
@@ -187,6 +193,9 @@ func (nm *notesManager) Query(f NoteQueryFilter) []persistence.NoteEntry {
 		if f.WorkspaceID != "" && e.WorkspaceID != f.WorkspaceID {
 			continue
 		}
+		if len(f.WorkspaceIn) > 0 && !f.WorkspaceIn[e.WorkspaceID] {
+			continue
+		}
 		if f.ProjectID != "" && e.ProjectID != f.ProjectID {
 			continue
 		}
@@ -272,17 +281,17 @@ func (nm *notesManager) trimLocked() {
 // distillResult is the structured digest returned by DistillSession.
 // The shape is stable across both the JSON and gcx wire formats.
 type distillResult struct {
-	SessionID    string             `json:"session_id"`
-	NoteCount    int                `json:"note_count"`
-	Window       distillWindow      `json:"window"`
-	TopSymbols   []distillSymbolHit `json:"top_symbols"`
-	TopFiles     []distillCountHit  `json:"top_files,omitempty"`
-	TopTags      []distillCountHit  `json:"top_tags,omitempty"`
-	Decisions    []distillExcerpt   `json:"decisions,omitempty"`
-	PinnedNotes  []distillExcerpt   `json:"pinned_notes,omitempty"`
-	Recent       []distillExcerpt   `json:"recent,omitempty"`
-	Summary      string             `json:"summary,omitempty"`
-	Truncated    bool               `json:"truncated,omitempty"`
+	SessionID   string             `json:"session_id"`
+	NoteCount   int                `json:"note_count"`
+	Window      distillWindow      `json:"window"`
+	TopSymbols  []distillSymbolHit `json:"top_symbols"`
+	TopFiles    []distillCountHit  `json:"top_files,omitempty"`
+	TopTags     []distillCountHit  `json:"top_tags,omitempty"`
+	Decisions   []distillExcerpt   `json:"decisions,omitempty"`
+	PinnedNotes []distillExcerpt   `json:"pinned_notes,omitempty"`
+	Recent      []distillExcerpt   `json:"recent,omitempty"`
+	Summary     string             `json:"summary,omitempty"`
+	Truncated   bool               `json:"truncated,omitempty"`
 }
 
 type distillWindow struct {
@@ -313,11 +322,11 @@ type distillExcerpt struct {
 
 // distillOptions tunes DistillSession.
 type distillOptions struct {
-	MaxSymbols  int
-	MaxFiles    int
-	MaxTags     int
-	MaxRecent   int
-	ExcerptCap  int // max bytes of body to retain per excerpt
+	MaxSymbols int
+	MaxFiles   int
+	MaxTags    int
+	MaxRecent  int
+	ExcerptCap int // max bytes of body to retain per excerpt
 }
 
 func defaultDistillOptions() distillOptions {

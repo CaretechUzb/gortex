@@ -138,10 +138,18 @@ func runCodexBashHardDeny(data []byte, port int) {
 	if err := json.Unmarshal(data, &input); err != nil || input.HookEventName != "PreToolUse" || input.ToolName != "Bash" {
 		return
 	}
+	daemonUp := daemonReachableFn()
 	emitted := false
 	defer func() {
-		logHookEffectiveness("PreToolUse", emitted, daemonReachableFn(), hookAlternationSegmentCount(input), time.Since(started))
+		logHookEffectiveness("PreToolUse", emitted, daemonUp, hookAlternationSegmentCount(input), time.Since(started))
 	}()
+
+	// Daemon outage: the deny posture stands down entirely (#486) — both the
+	// deny escalation and its advisory fallback mandate MCP operations the
+	// daemon cannot currently serve.
+	if !daemonUp {
+		return
+	}
 
 	result := enrich(input, port)
 	classification := classifyBashCommand(fmt.Sprint(input.ToolInput["command"]))
@@ -152,7 +160,7 @@ func runCodexBashHardDeny(data []byte, port int) {
 		// indexed. Keep the reminder but never block that command.
 		result = enrichResult{context: defaultGrepGuidance()}
 	}
-	if !result.deny && daemonReachableFn() && workspaceScoped &&
+	if !result.deny && workspaceScoped &&
 		classification.Action == BashActionGrepLike && result.context != "" &&
 		codexTextSearchHitFn(port, classification.Pattern) {
 		result.deny = true
@@ -290,10 +298,19 @@ func runCodexMCPReadPreToolUse(data []byte, mode CodexMode) {
 	if input.HookEventName != "PreToolUse" || !codexMCPReadPreToolUseTool(input.ToolName) {
 		return
 	}
+	daemonUp := daemonReachableFn()
 	emitted := false
 	defer func() {
-		logHookEffectiveness("PreToolUse", emitted, daemonReachableFn(), 0, time.Since(started))
+		logHookEffectiveness("PreToolUse", emitted, daemonUp, 0, time.Since(started))
 	}()
+
+	// Daemon outage: nudging, rewriting, or (in deny mode) blocking a Gortex
+	// read is moot when the daemon cannot serve it — the call is about to
+	// fail on transport, and a compress-bodies deny on top of that failure
+	// would read as enforcement of a tool that does not answer (#486).
+	if !daemonUp {
+		return
+	}
 
 	ctx := gortexReadNudge(input.ToolName, input.ToolInput)
 	if ctx == "" {
@@ -341,10 +358,18 @@ func runCodexBashRewrite(data []byte, port int) {
 	if err := json.Unmarshal(data, &input); err != nil || input.HookEventName != "PreToolUse" || input.ToolName != "Bash" {
 		return
 	}
+	daemonUp := daemonReachableFn()
 	emitted := false
 	defer func() {
-		logHookEffectiveness("PreToolUse", emitted, daemonReachableFn(), hookAlternationSegmentCount(input), time.Since(started))
+		logHookEffectiveness("PreToolUse", emitted, daemonUp, hookAlternationSegmentCount(input), time.Since(started))
 	}()
+
+	// Daemon outage: stand down (#486). Rewriting a working `cat` into a
+	// `gortex call read` that cannot be served would break the command
+	// outright, and the advisory fallback mandates the same unusable tools.
+	if !daemonUp {
+		return
+	}
 
 	if updated, message, ok := rewrittenCodexBashInput(input); ok {
 		emitted = true
@@ -405,12 +430,19 @@ func runCodexPostToolUse(data []byte, port int, mode CodexMode) {
 		return
 	}
 	if input.ToolName == "apply_patch" {
-		ctx := buildMutationBriefing(port, sessionScope{
-			SessionID: input.SessionID,
-			CWD:       firstNonEmpty(input.CWD, loadHookCWD()),
-		})
+		daemonUp := daemonReachableFn()
+		ctx := ""
+		// Daemon outage: the mutation briefing is built from daemon answers
+		// only, so skip its round-trips instead of paying them just to
+		// render nothing (#486).
+		if daemonUp {
+			ctx = buildMutationBriefing(port, sessionScope{
+				SessionID: input.SessionID,
+				CWD:       firstNonEmpty(input.CWD, loadHookCWD()),
+			})
+		}
 		emitted := ctx != ""
-		logHookEffectiveness("PostToolUse", emitted, daemonReachableFn(), 0, time.Since(started))
+		logHookEffectiveness("PostToolUse", emitted, daemonUp, 0, time.Since(started))
 		if !emitted {
 			return
 		}
@@ -452,9 +484,15 @@ func runCodexPostToolUse(data []byte, port int, mode CodexMode) {
 		runPostToolUse(normalized)
 		return
 	}
-	ctx := postToolContext(input)
+	daemonUp := daemonReachableFn()
+	ctx := ""
+	// Same stand-down as runPostToolUse's own gate (#486): the follow-ups
+	// need daemon answers and point at tools an outage cannot serve.
+	if daemonUp {
+		ctx = postToolContext(input)
+	}
 	emitted := ctx != ""
-	logHookEffectiveness("PostToolUse", emitted, daemonReachableFn(), 0, time.Since(started))
+	logHookEffectiveness("PostToolUse", emitted, daemonUp, 0, time.Since(started))
 	if emitted {
 		emitPostToolContext(ctx, true)
 	}

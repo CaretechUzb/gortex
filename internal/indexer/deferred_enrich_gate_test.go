@@ -24,6 +24,7 @@ import (
 type spyEnrichProvider struct {
 	mu      sync.Mutex
 	repos   []string
+	files   []string
 	partial bool
 }
 
@@ -42,8 +43,15 @@ func (s *spyEnrichProvider) Enrich(g graph.Store, repoRoot string) (*semantic.En
 	return s.EnrichRepo(g, "", repoRoot)
 }
 
-func (s *spyEnrichProvider) EnrichFile(_ graph.Store, _, _ string) (*semantic.EnrichResult, error) {
-	return nil, nil
+// EnrichFile records the single-file dispatch a one-file frontier takes
+// (EnrichFilesContext calls it directly rather than a repo-wide pass), and
+// reports the same Partial disposition as the repo entry point so the
+// deferral-ledger tests can drive both outcomes.
+func (s *spyEnrichProvider) EnrichFile(_ graph.Store, _, filePath string) (*semantic.EnrichResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.files = append(s.files, filePath)
+	return &semantic.EnrichResult{Provider: "spy", Language: "go", Partial: s.partial}, nil
 }
 
 func (s *spyEnrichProvider) Close() error { return nil }
@@ -52,6 +60,14 @@ func (s *spyEnrichProvider) invoked() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.repos...)
+}
+
+// enrichedFiles returns the file-scoped dispatches, the frontier equivalent of
+// invoked().
+func (s *spyEnrichProvider) enrichedFiles() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.files...)
 }
 
 func newSpyManager(spy *spyEnrichProvider) *semantic.Manager {

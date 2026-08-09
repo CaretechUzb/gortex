@@ -54,6 +54,18 @@ func TestIsTestFile(t *testing.T) {
 		// Directory markers must be whole path segments.
 		{"src/testing/helper.go", false},
 		{"src/spectrum/color.ts", false},
+
+		// Directory markers match case-insensitively. .NET solutions
+		// capitalize test directories (Test/, Tests/), and the files
+		// beneath them frequently don't carry a Test/Tests filename
+		// suffix — the marker is the only signal.
+		{"App/Test/Unit/CalculatorProbe.cs", true},
+		{`App\Tests\Support\Builder.cs`, true},
+		{"Test/main.cs", true},
+
+		// The whole-segment rule holds case-insensitively too.
+		{"src/Testing/helper.go", false},
+		{"src/Spectrum/color.ts", false},
 	}
 	for _, c := range cases {
 		if got := IsTestFile(c.path); got != c.want {

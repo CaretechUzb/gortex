@@ -737,6 +737,77 @@ class Panel : Widget {}`)
 	})
 }
 
+// TestCSharpExtractor_InterfaceBaseList: an interface declaration's
+// base list is interface inheritance — every entry must emit
+// EdgeExtends at the same inferred tier as the class path. Without
+// these edges a derived interface has no hierarchy in the base graph.
+func TestCSharpExtractor_InterfaceBaseList(t *testing.T) {
+	e := NewCSharpExtractor()
+
+	t.Run("single base interface", func(t *testing.T) {
+		src := []byte(`interface IDerived : IBase {}`)
+		result, err := e.Extract("D.cs", src)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"IBase"},
+			edgeTargetNames(result.Edges, "D.cs::IDerived", graph.EdgeExtends))
+		assert.Empty(t, edgeTargetNames(result.Edges, "D.cs::IDerived", graph.EdgeImplements))
+	})
+
+	t.Run("generic base strips type arguments", func(t *testing.T) {
+		// Type params on the declaring interface and a where-clause
+		// (a base_list sibling in the grammar) must not disturb the
+		// entry walk.
+		src := []byte(`interface ILedger<T> : IReadRepository<T> where T : class {}`)
+		result, err := e.Extract("L.cs", src)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"IReadRepository"},
+			edgeTargetNames(result.Edges, "L.cs::ILedger", graph.EdgeExtends))
+	})
+
+	t.Run("qualified base keeps target_fqn for namespace narrowing", func(t *testing.T) {
+		src := []byte(`interface IHandle : System.IDisposable {}`)
+		result, err := e.Extract("H.cs", src)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"IDisposable"},
+			edgeTargetNames(result.Edges, "H.cs::IHandle", graph.EdgeExtends))
+		for _, ed := range result.Edges {
+			if ed.From == "H.cs::IHandle" && ed.Kind == graph.EdgeExtends {
+				assert.Equal(t, "System.IDisposable", ed.Meta["target_fqn"])
+			}
+		}
+	})
+
+	t.Run("multiple bases all extend", func(t *testing.T) {
+		src := []byte(`interface IBoth : IReader, IWriter {}`)
+		result, err := e.Extract("B.cs", src)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"IReader", "IWriter"},
+			edgeTargetNames(result.Edges, "B.cs::IBoth", graph.EdgeExtends))
+	})
+
+	t.Run("inferred tier and no edges without a base list", func(t *testing.T) {
+		src := []byte(`interface IDerived : IBase {}
+interface IPlain {}`)
+		result, err := e.Extract("T.cs", src)
+		require.NoError(t, err)
+
+		found := false
+		for _, ed := range result.Edges {
+			if ed.From == "T.cs::IDerived" && ed.Kind == graph.EdgeExtends {
+				found = true
+				assert.Equal(t, graph.OriginASTInferred, ed.Origin)
+			}
+		}
+		assert.True(t, found, "IDerived must emit an extends edge")
+		assert.Empty(t, edgeTargetNames(result.Edges, "T.cs::IPlain", graph.EdgeExtends))
+		assert.Empty(t, edgeTargetNames(result.Edges, "T.cs::IPlain", graph.EdgeImplements))
+	})
+}
+
 // TestCSharpEnumMembersConstsAndFlags is the C8 test: enum members extract as
 // navigable nodes (with values), `const` fields classify as constants,
 // async/static/readonly/value-type flags are stamped, and types/methods carry

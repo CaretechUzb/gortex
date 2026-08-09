@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -30,7 +31,7 @@ func (s *Server) registerMultiRepoTools() {
 			mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path to repository")),
 			mcp.WithString("name", mcp.Description("Optional repo prefix override")),
 			mcp.WithBoolean("as_worktree", mcp.Description("Track a linked git worktree as an independent instance (derived `<base>@<workspace>` prefix) even when its repo is already tracked elsewhere. Auto-detected when the worktree's .gortex.yaml declares a different workspace; set this to force it.")),
-			mcp.WithBoolean("force", mcp.Description("Track even when the path is the home directory or filesystem root (refused by default to avoid an unbounded crawl).")),
+			mcp.WithBoolean("force", mcp.Description("Track even when the path is the home directory or filesystem root (refused by default to avoid an unbounded crawl). Operator/CLI channel only — refused for agent sessions, since the tracked-root set is the file-access boundary.")),
 		),
 		s.handleTrackRepository,
 	)
@@ -103,8 +104,21 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 	if asWT, ok := req.GetArguments()["as_worktree"].(bool); ok {
 		entry.AsWorktree = asWT
 	}
-	if force, ok := req.GetArguments()["force"].(bool); ok {
-		entry.Force = force
+	if force, ok := req.GetArguments()["force"].(bool); ok && force {
+		// force skips unsafeRootBlocked, the guard that refuses `/`, a
+		// Windows drive root and $HOME. That guard is not only a crawl
+		// bound: the tracked-root set IS the confinement boundary for
+		// every file-path tool (guardRepoRoots), so tracking `/` would
+		// widen read and write access to the whole filesystem — and the
+		// change persists to the global config. An agent session must not
+		// be able to do that to itself; the operator CLI still can.
+		if s.confineCallerPaths(ctx) {
+			return mcp.NewToolResultError(
+				"force is not available to an agent session: it would track a root such as / or " +
+					"your home directory, widening file access for every tool and persisting that to " +
+					"your global config. Track the specific repository you need instead."), nil
+		}
+		entry.Force = true
 	}
 
 	// A fresh repo's first index routinely outruns the MCP request deadline,
@@ -146,6 +160,12 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 						zap.String("path", path), zap.Error(saveErr))
 				}
 			}
+			// The tracked-repo set just changed, so every session's
+			// cached workspace binding is stale. Without this the
+			// session that ran `track` to repair its own uncovered cwd
+			// keeps the boundary it latched before the call and stays
+			// blind to the repo it just added.
+			s.InvalidateSessionScopes()
 			s.RunAnalysis()
 		}
 		done <- trackOutcome{result: res, err: trackErr}
@@ -219,6 +239,10 @@ func (s *Server) handleUntrackRepository(ctx context.Context, req mcp.CallToolRe
 				zap.String("path", path), zap.Error(saveErr))
 		}
 	}
+
+	// The tracked-repo set changed: drop cached session bindings so a
+	// session does not keep serving a repo that is no longer tracked.
+	s.InvalidateSessionScopes()
 
 	// Re-run analysis after removing a repo.
 	s.RunAnalysis()
@@ -409,6 +433,14 @@ func (s *Server) diffRepoScope(ctx context.Context, repo string) (repoRoot, repo
 		if p := s.resolveRepoPrefix(repo); p != "" {
 			repo = p
 		}
+		// A selector still has to stay inside the session. Every other
+		// scope path intersects an explicit repo with the session's
+		// ceiling; this one resolved against the whole tracked set, so a
+		// session bound to one repo could name another and diff its
+		// working tree.
+		if ceiling := s.sessionRepoCeiling(ctx); len(ceiling) > 0 && !ceiling[repo] {
+			return "", ""
+		}
 		root := pickRepoRoot(s.collectRepoRoots(repo), repo)
 		if root == "" {
 			return "", ""
@@ -425,7 +457,66 @@ func (s *Server) diffRepoScope(ctx context.Context, repo string) (repoRoot, repo
 			}
 		}
 	}
+	// A session bound to the repos its cwd CONTAINS has no home repo, so
+	// none of the branches above resolve. When the ceiling names exactly
+	// one repo that is still an unambiguous answer; several is genuinely
+	// ambiguous and must stay unresolved so the caller asks rather than
+	// guesses.
+	if ceiling := s.sessionRepoCeiling(ctx); len(ceiling) == 1 {
+		for prefix := range ceiling {
+			if root, ok := s.multiIndexer.RepoRoot(prefix); ok && root != "" {
+				return root, prefix
+			}
+		}
+	}
 	return "", ""
+}
+
+// resolveDiffRoot is diffRepoScope plus the standalone-server fallback,
+// with a single rule for when "." is a legitimate working tree.
+//
+// "." is the daemon PROCESS's cwd. That is the right answer only for a
+// standalone, indexer-less server started inside the tree it serves.
+// Inside the daemon it is wherever `gortex daemon start` happened to run
+// — unrelated to the caller, and not necessarily a tree the session is
+// scoped to at all. Falling back to it there answers a question nobody
+// asked, from a directory the session may not be entitled to see.
+//
+// The session shapes that reach here are the ones with no home repo: a
+// session bound to several contained repos, or one whose cwd resolves to
+// no repo. Both want an actionable error naming the candidates, not a
+// silent diff of the daemon's launch directory.
+func (s *Server) resolveDiffRoot(ctx context.Context, repo string) (repoRoot, repoPrefix string, err error) {
+	repoRoot, repoPrefix = s.diffRepoScope(ctx, repo)
+	if repoRoot != "" {
+		return repoRoot, repoPrefix, nil
+	}
+	if s.multiIndexer == nil {
+		return ".", repoPrefix, nil
+	}
+	if repo != "" {
+		return "", "", fmt.Errorf("repo %q names no tracked repository with a working tree", repo)
+	}
+	if candidates := sortedRepoNames(s.sessionRepoCeiling(ctx)); len(candidates) > 0 {
+		return "", "", fmt.Errorf(
+			"this session spans %d repositories (%s) — pass repo:<name> to say which working tree to diff",
+			len(candidates), strings.Join(candidates, ", "))
+	}
+	return "", "", fmt.Errorf("no working tree resolved for this session — pass repo:<name>")
+}
+
+// sortedRepoNames renders a repo allow-set deterministically for an error
+// message.
+func sortedRepoNames(repos map[string]bool) []string {
+	if len(repos) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(repos))
+	for p := range repos {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // resolveRepoPrefixOrReconcile resolves a path-or-prefix to a repo prefix

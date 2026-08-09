@@ -8,18 +8,16 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // TestComputePurgePlanCollectsExistingDataDirs proves --purge targets the
 // unified ~/.gortex tree when it exists, de-duplicated across the
 // config/data/cache/home categories that collapse to it.
 func TestComputePurgePlanCollectsExistingDataDirs(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	// Neutralise XDG overrides so the categories collapse into ~/.gortex.
-	t.Setenv("XDG_CONFIG_HOME", "")
-	t.Setenv("XDG_DATA_HOME", "")
-	t.Setenv("XDG_CACHE_HOME", "")
+	// UnifiedHome clears the XDG overrides so the categories collapse into ~/.gortex.
+	home := testenv.UnifiedHome(t)
 
 	gortexHome := filepath.Join(home, ".gortex")
 	require.NoError(t, os.MkdirAll(filepath.Join(gortexHome, "cache"), 0o755))
@@ -37,11 +35,7 @@ func TestComputePurgePlanCollectsExistingDataDirs(t *testing.T) {
 // TestComputePurgePlanEmptyWhenNothingInstalled asserts a clean host yields no
 // data dirs to remove.
 func TestComputePurgePlanEmptyWhenNothingInstalled(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", "")
-	t.Setenv("XDG_DATA_HOME", "")
-	t.Setenv("XDG_CACHE_HOME", "")
+	testenv.UnifiedHome(t)
 
 	p := computePurgePlan()
 	assert.Empty(t, p.dirs)

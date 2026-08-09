@@ -74,11 +74,12 @@ func (s *Server) handlePromptPreCommit(ctx context.Context, req mcp.GetPromptReq
 	}
 
 	// Resolve the working tree: explicit repo argument, lone tracked repo,
-	// or the session's cwd-bound repo. The "." fallback keeps the standalone
-	// (indexer-less) server working from its own cwd.
-	repoRoot, repoPrefix := s.diffRepoScope(ctx, promptArg(req, "repo"))
-	if repoRoot == "" {
-		repoRoot = "."
+	// the session's cwd-bound repo, then its sole contained repo. "." is
+	// reserved for the standalone (indexer-less) server, which is started
+	// in the tree it serves.
+	repoRoot, repoPrefix, rootErr := s.resolveDiffRoot(ctx, promptArg(req, "repo"))
+	if rootErr != nil {
+		return promptError(rootErr.Error()), nil
 	}
 
 	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, "main")

@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -113,4 +115,27 @@ func (a *watcherHistoryAdapter) HistorySince(since time.Time) []docs.HistoryEven
 		})
 	}
 	return out
+}
+
+// guardGeneratedOutputPath confines a caller-named output path for the
+// generator tools (generate_wiki, generate_docs) to the indexed repository
+// roots, on the same terms export_graph already applies to its own output
+// arguments.
+//
+// Those two tools wrote wherever the argument pointed: generate_docs took
+// output_path straight to os.MkdirAll + os.WriteFile, and generate_wiki's
+// output_dir became the writer root. A prompt-injected agent could therefore
+// drive the daemon into creating a tree — or truncating a file — anywhere the
+// daemon user can write, which is exactly what the export path was hardened
+// against. The guard is skipped for the operator-driven CLI / control channel
+// (confineCallerPaths), which asks for the write in the user's own name.
+func (s *Server) guardGeneratedOutputPath(ctx context.Context, path string) error {
+	if path == "" || !s.confineCallerPaths(ctx) {
+		return nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve output path %q: %w", path, err)
+	}
+	return s.guardSymlinkWithinRepo(abs)
 }

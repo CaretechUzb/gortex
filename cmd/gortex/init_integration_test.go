@@ -11,6 +11,7 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 func TestInitSummaryDoesNotRequireManualMCPEnablement(t *testing.T) {
@@ -48,7 +49,7 @@ func TestInitDryRunJSONReportShape(t *testing.T) {
 
 	repo := t.TempDir()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SandboxAt(t, home)
 
 	initYes = true
 	initDryRun = true
@@ -119,7 +120,7 @@ func TestInitAgentsFilterRejectsUnknownName(t *testing.T) {
 	})
 
 	repo := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	testenv.SandboxAt(t, t.TempDir())
 
 	initYes = true
 	initDryRun = true
@@ -156,8 +157,20 @@ func TestInitCreatesProjectMarker(t *testing.T) {
 		initAgents = saved.agents
 	})
 
+	inheritedConfig := t.TempDir()
+	inheritedData := t.TempDir()
+	inheritedCache := t.TempDir()
+	inheritedDaemon := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", inheritedConfig)
+	t.Setenv("XDG_DATA_HOME", inheritedData)
+	t.Setenv("XDG_CACHE_HOME", inheritedCache)
+	t.Setenv("GORTEX_DAEMON_SOCKET", filepath.Join(inheritedDaemon, "daemon.sock"))
+	t.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(inheritedDaemon, "daemon.pid"))
+	t.Setenv("GORTEX_DAEMON_LOGFILE", filepath.Join(inheritedDaemon, "daemon.log"))
+	t.Setenv("GORTEX_DAEMON_SNAPSHOT", filepath.Join(inheritedDaemon, "daemon.gob.gz"))
+
 	repo := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	testenv.SandboxAt(t, t.TempDir())
 
 	initYes = true
 	initDryRun = false
@@ -189,6 +202,16 @@ func TestInitCreatesProjectMarker(t *testing.T) {
 	if err := runInit(initCmd, []string{repo}); err != nil {
 		t.Fatalf("second runInit: %v", err)
 	}
+
+	for _, root := range []string{inheritedConfig, inheritedData, inheritedCache, inheritedDaemon} {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			t.Fatalf("read inherited state root %s: %v", root, err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("runInit wrote through inherited state root %s: %v", root, entries)
+		}
+	}
 }
 
 // TestInitDryRunSkipsProjectMarker pins the inverse: dry-run is a
@@ -205,7 +228,7 @@ func TestInitDryRunSkipsProjectMarker(t *testing.T) {
 	})
 
 	repo := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	testenv.SandboxAt(t, t.TempDir())
 
 	initYes = true
 	initDryRun = true
@@ -244,7 +267,7 @@ func TestInitRefusesHomeDirectory(t *testing.T) {
 	})
 
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SandboxAt(t, home)
 
 	initYes = true
 	initDryRun = false
@@ -286,7 +309,7 @@ func TestInitForceBypassesHomeDirectoryGuard(t *testing.T) {
 	})
 
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SandboxAt(t, home)
 
 	initYes = true
 	initDryRun = true // planning-only: keeps the forced run from writing into $HOME during the test
@@ -313,7 +336,7 @@ func TestInitHooksOnlyRefreshesClaudeAndCodexHooks(t *testing.T) {
 
 	repo := t.TempDir()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SandboxAt(t, home)
 
 	codexDir := filepath.Join(home, ".codex")
 	if err := os.MkdirAll(codexDir, 0o755); err != nil {
@@ -389,7 +412,7 @@ func TestInitHooksOnlyRespectsAgentsAllowlist(t *testing.T) {
 
 	repo := t.TempDir()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SandboxAt(t, home)
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +449,7 @@ func TestInitHooksOnlyRespectsAgentsSkip(t *testing.T) {
 
 	repo := t.TempDir()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SandboxAt(t, home)
 	codexDir := filepath.Join(home, ".codex")
 	if err := os.MkdirAll(codexDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -477,7 +500,7 @@ func TestInitHooksOnlyDryRunDoesNotWriteHooks(t *testing.T) {
 
 	repo := t.TempDir()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SandboxAt(t, home)
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -523,7 +546,7 @@ func TestInitDryRunIntakeJSONDoesNotWrite(t *testing.T) {
 	})
 
 	repo := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	testenv.SandboxAt(t, t.TempDir())
 	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

@@ -204,6 +204,21 @@ func (m *sessionMap) release(id string) {
 	delete(m.sessions, id)
 }
 
+// snapshotSessions returns every live session's state. The map lock is
+// held only while copying the slice, so a caller may take per-session
+// locks afterwards without inverting the lock order.
+func (m *sessionMap) snapshotSessions() []*sessionState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*sessionState, 0, len(m.sessions))
+	for _, sl := range m.sessions {
+		if sl != nil && sl.session != nil {
+			out = append(out, sl.session)
+		}
+	}
+	return out
+}
+
 // setPersistent updates the shared savings store pointer and
 // propagates it into every live session so no existing client flushes
 // savings to a stale (or nil) store.

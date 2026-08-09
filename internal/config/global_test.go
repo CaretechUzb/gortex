@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 	"pgregory.net/rapid"
+
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // TestDefaultGlobalConfigPath_HonorsHomeChange guards the regression
@@ -26,7 +28,7 @@ func TestDefaultGlobalConfigPath_HonorsHomeChange(t *testing.T) {
 	// this test asserts.
 	t.Setenv("XDG_CONFIG_HOME", "")
 	homeA := t.TempDir()
-	t.Setenv("HOME", homeA)
+	testenv.SetHome(t, homeA)
 	gotA := DefaultGlobalConfigPath()
 	wantA := filepath.Join(homeA, ".gortex", "config.yaml")
 	if gotA != wantA {
@@ -34,7 +36,7 @@ func TestDefaultGlobalConfigPath_HonorsHomeChange(t *testing.T) {
 	}
 
 	homeB := t.TempDir()
-	t.Setenv("HOME", homeB)
+	testenv.SetHome(t, homeB)
 	gotB := DefaultGlobalConfigPath()
 	wantB := filepath.Join(homeB, ".gortex", "config.yaml")
 	if gotB != wantB {
@@ -48,7 +50,7 @@ func TestDefaultGlobalConfigPath_HonorsHomeChange(t *testing.T) {
 // unified $HOME/.gortex location.
 func TestDefaultGlobalConfigPath_HonorsXDGConfigHome(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SetHome(t, home)
 
 	// Unset: historical default.
 	t.Setenv("XDG_CONFIG_HOME", "")

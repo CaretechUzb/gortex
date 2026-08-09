@@ -168,9 +168,10 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		return
 	}
 
+	daemonUp := daemonReachableFn()
 	emitted := false
 	defer func() {
-		logHookEffectiveness("PreToolUse", emitted, daemonReachableFn(), hookAlternationSegmentCount(input), time.Since(started))
+		logHookEffectiveness("PreToolUse", emitted, daemonUp, hookAlternationSegmentCount(input), time.Since(started))
 	}()
 
 	isGortexMCP := isGortexMCPToolName(input.ToolName)
@@ -191,8 +192,12 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		// a permissive permission mode means low friction, not "stop
 		// reminding me my full-body read is expensive". Never a hard
 		// deny here: auto-approve has already promised to allow the call.
-		if adv := gortexReadNudge(input.ToolName, input.ToolInput); adv != "" {
-			hso.AdditionalContext = adv
+		// Skipped during a daemon outage: coaching the shape of a call
+		// that is about to fail on transport is noise (#486).
+		if daemonUp {
+			if adv := gortexReadNudge(input.ToolName, input.ToolInput); adv != "" {
+				hso.AdditionalContext = adv
+			}
 		}
 		if updatedInput != nil {
 			hso.UpdatedInput = updatedInput
@@ -214,6 +219,31 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 				UpdatedInput:  updatedInput,
 			}})
 		}
+		return
+	}
+
+	// Daemon outage: per-call enforcement stands down (#486). Every deny and
+	// advisory the enrichment below can produce mandates Gortex MCP tools;
+	// while the daemon cannot serve them that guidance deadlocks the agent —
+	// instructed to use tools that cannot answer and flagged for using the
+	// tools that can. Degrade the way the SessionStart briefing does
+	// (rule-only enforcement): stay quiet per call, surface one notice per
+	// session so a mid-session outage is explained, and keep the
+	// localization input passthrough intact. The terminal deny above stays
+	// live on purpose — it is daemon-independent and carries its own answer.
+	if !daemonUp {
+		hso := &HookSpecificOutput{HookEventName: "PreToolUse"}
+		if updatedInput != nil {
+			hso.UpdatedInput = updatedInput
+		}
+		if hookCallTargetsTrackedRepo(input.ToolName, input.ToolInput, input.CWD) {
+			hso.AdditionalContext = daemonDownNoticeOnce(input.SessionID)
+		}
+		if hso.AdditionalContext == "" && hso.UpdatedInput == nil {
+			return
+		}
+		emitted = hso.AdditionalContext != ""
+		emitPreToolUse(HookOutput{HookSpecificOutput: hso})
 		return
 	}
 
@@ -483,6 +513,11 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 		reason.WriteString("  - `read(operation:\"editing_context\", target:{file:\"<path>\"})` — full editing context\n")
 		reason.WriteString(gcxTip)
 		reason.WriteString(toolref.MCPRequiredLine())
+		// Naming the replacement tool without showing what the graph holds
+		// makes the caller spend its next turn asking for what the hook can
+		// already see. The outline is additive: with no answer the deny reads
+		// exactly as it did before.
+		reason.WriteString(readOutlineEvidence(cwd, filePath))
 
 		return enrichResult{
 			deny:   true,
@@ -836,27 +871,155 @@ func defaultGrepGuidance() string {
 }
 
 func formatGrepDeny(pattern string, hits []grepSymbolHit) string {
-	const maxShown = 5
 	var b strings.Builder
 	fmt.Fprintf(&b, "[Gortex] BLOCKED: \"%s\" matches %d indexed symbol(s). Use `search(operation:\"symbols\")` or `relations(operation:\"usages\")`:\n\n", pattern, len(hits))
-	shown := min(len(hits), maxShown)
-	for i := range shown {
-		h := hits[i]
-		kind := h.Kind
-		if kind == "" {
-			kind = "symbol"
-		}
-		fmt.Fprintf(&b, "  %s — %s:%d (%s)\n", h.Name, h.FilePath, h.Line, kind)
-	}
-	if len(hits) > maxShown {
-		fmt.Fprintf(&b, "  ... and %d more\n", len(hits)-maxShown)
-	}
+	b.WriteString(grepHitEvidence(hits))
 	b.WriteString("\n")
 	b.WriteString("Localizing a task rather than one symbol? `explore` returns the ranked neighborhood (symbols + source + call paths) in one call.\n")
 	b.WriteString(gcxTip)
 	b.WriteString(toolref.MCPRequiredLine())
 	b.WriteString("To force text search, add a regex metachar (e.g. \\b) or quote the pattern.")
 	return b.String()
+}
+
+// A deny that only names the replacement tool costs the caller a turn to
+// re-derive what the hook already asked the graph. These bounds decide how
+// much of that answer rides along: enough rows to act on, never enough to
+// bury the redirect itself.
+const (
+	denyEvidenceMaxLines = 5
+	denyEvidenceMaxBytes = 600
+)
+
+// denyEvidenceRow is one graph result rendered into a deny: what was found,
+// where it lives, and an optional parenthesised note (its kind).
+type denyEvidenceRow struct {
+	Label string
+	File  string
+	Line  int
+	Note  string
+}
+
+// denyEvidenceBlock renders rows as "  label — file:line (note)" under an
+// optional header, capped at denyEvidenceMaxLines rows and denyEvidenceMaxBytes
+// for the whole block including the header and the trailing "... and N more".
+// An empty return means nothing fit, and the caller's message stays as it was.
+func denyEvidenceBlock(header string, rows []denyEvidenceRow) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, denyEvidenceMaxLines)
+	used := len(header)
+	for _, row := range rows {
+		if len(lines) == denyEvidenceMaxLines {
+			break
+		}
+		line := formatDenyEvidenceRow(row)
+		// Reserve the tail before taking the line. The dropped count only
+		// shrinks as more rows are taken, so budgeting for the tail this row
+		// would leave behind keeps every stopping point inside the cap.
+		tail := 0
+		if dropped := len(rows) - len(lines) - 1; dropped > 0 {
+			tail = len(denyEvidenceMoreLine(dropped))
+		}
+		if used+len(line)+tail > denyEvidenceMaxBytes {
+			break
+		}
+		lines = append(lines, line)
+		used += len(line)
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(header)
+	for _, line := range lines {
+		b.WriteString(line)
+	}
+	if dropped := len(rows) - len(lines); dropped > 0 {
+		b.WriteString(denyEvidenceMoreLine(dropped))
+	}
+	return b.String()
+}
+
+func formatDenyEvidenceRow(row denyEvidenceRow) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "  %s — %s:%d", row.Label, row.File, row.Line)
+	if row.Note != "" {
+		fmt.Fprintf(&b, " (%s)", row.Note)
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+func denyEvidenceMoreLine(dropped int) string {
+	return fmt.Sprintf("  ... and %d more\n", dropped)
+}
+
+// grepHitEvidence renders the probe hits the deny was decided on. The probe
+// has already run by the time this is called, so the evidence costs nothing
+// beyond formatting.
+func grepHitEvidence(hits []grepSymbolHit) string {
+	rows := make([]denyEvidenceRow, 0, len(hits))
+	for _, h := range hits {
+		kind := h.Kind
+		if kind == "" {
+			kind = "symbol"
+		}
+		rows = append(rows, denyEvidenceRow{Label: h.Name, File: h.FilePath, Line: h.Line, Note: kind})
+	}
+	return denyEvidenceBlock("", rows)
+}
+
+// readOutlineTimeout bounds the outline lookup behind a Read deny. It is much
+// tighter than fileIndexedTimeout because the deny is already decided: the
+// outline only enriches it, so a slow daemon must cost the refusal nothing.
+const readOutlineTimeout = 250 * time.Millisecond
+
+const readOutlineHeader = "\nSymbols indexed in this file:\n"
+
+// readOutlineEvidence returns the head of filePath's indexed symbol outline,
+// or "" when the daemon cannot answer inside readOutlineTimeout. Degrading to
+// "" rather than to a half-formatted section keeps the daemon-less deny byte
+// for byte what it has always been.
+func readOutlineEvidence(cwd, filePath string) string {
+	summary, ok := fileOutlineWithin(cwd, filePath, readOutlineTimeout)
+	if !ok || summary == nil {
+		return ""
+	}
+	rows := make([]denyEvidenceRow, 0, len(summary.Symbols))
+	for _, sym := range summary.Symbols {
+		if sym.Name == "" || sym.StartLine <= 0 {
+			continue
+		}
+		rows = append(rows, denyEvidenceRow{Label: sym.Name, File: filePath, Line: sym.StartLine, Note: sym.Kind})
+	}
+	return denyEvidenceBlock(readOutlineHeader, rows)
+}
+
+// fileOutlineWithin runs the shared get_file_summary probe under a deadline of
+// its own. daemonFileSummaryRaw's socket deadline is sized for the indexed
+// check that gates the deny; this call happens after that verdict, so it gets
+// a budget the caller never waits on.
+func fileOutlineWithin(cwd, filePath string, timeout time.Duration) (*hookFileSummary, bool) {
+	type outlineResult struct {
+		summary *hookFileSummary
+		ok      bool
+	}
+	// Read the seam here, not in the goroutine: an abandoned probe must not
+	// race a test restoring it.
+	probe := fileSummaryFn
+	done := make(chan outlineResult, 1)
+	go func() {
+		summary, ok := probe(cwd, filePath)
+		done <- outlineResult{summary: summary, ok: ok}
+	}()
+	select {
+	case res := <-done:
+		return res.summary, res.ok
+	case <-time.After(timeout):
+		return nil, false
+	}
 }
 
 // queryFileIndexed reports whether the file at filePath is indexed by the

@@ -245,10 +245,12 @@ If you run an XDG layout (any absolute `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XD
 
 ### How it works
 
-- `gortex mcp` (what Claude Code spawns via `.mcp.json`) auto-detects the daemon. If reachable, it acts as a thin stdio ↔ socket proxy (~5 MB per client). If not, it falls back to the embedded server — global mode is never "required."
+- `gortex mcp` (what Claude Code spawns via `.mcp.json`) auto-detects the daemon. If reachable, it acts as a thin stdio ↔ socket proxy (~5 MB per client). If not, it falls back to the embedded server — global mode is never "required." The fallback announces itself in the `initialize` instructions (`DEGRADED: no gortex daemon is reachable…`), because MCP hosts routinely discard stderr and an embedded single-tree answer is otherwise indistinguishable from a daemon-backed one.
+- The embedded fallback infers its index root from the launch directory, but refuses two shapes: a root unsafe to crawl (`/`, a drive root, `$HOME`), and a directory that merely *contains* tracked repositories — indexing the parent would build a second, unscoped copy of every child. An inferred root also never receives the repo-local notebook, so a daemon blip cannot leave an untracked `.gortex/` directory in whatever tree the client launched from. An explicit `--index` is always honoured verbatim and keeps the repo-local notebook.
 - Every tracked repo gets its own fsnotify watcher so edits on disk flow into the graph live; no manual reload needed. `gortex track` attaches a watcher as part of the track operation; `gortex untrack` detaches it before evicting nodes.
 - Graph state lives in the on-disk store (`~/.gortex/store/store.sqlite`) as it is indexed. Daemon restarts open the store and re-index only the files whose mtime changed while it was down.
-- Opening Claude Code in an untracked directory returns a structured `repo_not_tracked` error on every tool call. The agent surfaces it; you run `gortex track .` to include it.
+- Opening Claude Code in a directory that neither lies inside nor contains a tracked repository returns a structured `repo_not_tracked` error on every tool call. The agent surfaces it; you run `gortex track .` to include it.
+- Opening it at a directory **above** your repos works without tracking the parent. The session binds to the repos rooted under that directory, whether or not they share a `workspace:` slug, and sees nothing else — a repo declaring the same slug from elsewhere on disk stays invisible, because the boundary is containment, not slug membership. `repo:`, `project:` and `workspace:` selectors narrow within that set; naming anything outside it is refused rather than silently answered empty.
 - Per-session state is isolated by a handshake-assigned session ID — two Claude Code windows see their own recent-activity and token-savings counters, not a merged view. Cumulative savings in the sidecar ledger (`~/.gortex/sidecar.sqlite`) are still shared.
 
 ### Fallback rules

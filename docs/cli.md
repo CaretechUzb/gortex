@@ -160,6 +160,8 @@ The bytes are validated as well-formed JSON before the call. The same `inline / 
 | `key=` | the empty string |
 | anything else | string |
 
+The separator is chosen by the **key** position: `:=` opens a raw-JSON token only when it comes before the first `=`. A `:=` inside the value is ordinary text, so `--arg task=Dim x := 5` passes the snippet through verbatim.
+
 Repeating a key replaces the earlier value. For `call`, a base object can also come from `--json '<obj>'`, `--json-file <path>`, or `--json -` (stdin); precedence is **file < `--json` < `--arg`** (last wins per key).
 
 ### `gortex call <tool>` — invoke any tool by name
@@ -171,7 +173,7 @@ The generic relay: invoke any tool the daemon's MCP surface registers, even one 
 | `--arg key=value` | one argument, repeatable; coercion table above |
 | `--json '<obj>'` / `--json -` | base object inline or from stdin |
 | `--json-file <path>` | base object from a file |
-| `--format json\|gcx\|toon\|text` | wire format forwarded to the tool (default `json`) |
+| `--format json\|gcx\|toon\|text` | wire format forwarded to the tool (default `json`). `json` always prints parseable JSON: a tool that answers in prose — `explore` with `operation: "task"`, which renders a markdown page — is wrapped as `{"tool":…,"format":"text","text":…}`. Use `--format text` for the page itself. |
 | `--dry` | print the lowered argument object + target tool **without** calling the daemon (works offline) |
 | `--quiet` | suppress the mutating-tool stderr note |
 | `--legacy` | use the historical handler contract for a name shared by the compact and legacy surfaces (`analyze`, `explore`, `review`, `ask`) |

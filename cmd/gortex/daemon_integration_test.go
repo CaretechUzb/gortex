@@ -162,8 +162,12 @@ func TestDaemon_EndToEnd_GraphStatsOverMCPProxy(t *testing.T) {
 // dispatcher. An agent opening in an untracked directory must see a
 // usable error on every tool call, not a silent zero result.
 func TestDaemon_EndToEnd_UntrackedCWDRejectedViaProxy(t *testing.T) {
-	socket, trackedRoot := spinUpDaemon(t)
-	untracked := filepath.Dir(trackedRoot) // parent of tracked root is NOT tracked
+	socket, _ := spinUpDaemon(t)
+	// A directory unrelated to the tracked root in either containment
+	// direction. (The tracked root's PARENT no longer qualifies — a
+	// workspace-root cwd above tracked repos is served, see
+	// TestDaemon_EndToEnd_WorkspaceRootCWDServed.)
+	untracked := t.TempDir()
 
 	client, err := daemon.DialTo(socket, daemon.Handshake{
 		Mode: daemon.ModeMCP,
@@ -189,6 +193,46 @@ func TestDaemon_EndToEnd_UntrackedCWDRejectedViaProxy(t *testing.T) {
 	assert.Equal(t, "repo_not_tracked", resp.Error.Data["error_code"],
 		"untracked cwd must produce structured error: %s", string(reply))
 	assert.Equal(t, untracked, resp.Error.Data["path"])
+}
+
+// TestDaemon_EndToEnd_WorkspaceRootCWDServed pins the flip side: a cwd
+// that is the PARENT of the tracked root (an agent opened at the
+// workspace root above its repo) binds to the contained repo's
+// workspace and gets real answers, not repo_not_tracked.
+func TestDaemon_EndToEnd_WorkspaceRootCWDServed(t *testing.T) {
+	socket, trackedRoot := spinUpDaemon(t)
+	wsRoot := filepath.Dir(trackedRoot)
+
+	client, err := daemon.DialTo(socket, daemon.Handshake{
+		Mode: daemon.ModeMCP,
+		CWD:  wsRoot,
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	frame := []byte(`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"graph_stats","arguments":{}}}`)
+	require.NoError(t, client.WriteMCPFrame(frame))
+	reply, err := client.ReadMCPFrame()
+	require.NoError(t, err)
+
+	require.NotContains(t, string(reply), "repo_not_tracked",
+		"workspace-root cwd must be served, got: %s", string(reply))
+	var resp struct {
+		Result map[string]any `json:"result"`
+	}
+	require.NoError(t, json.Unmarshal(reply, &resp))
+	require.NotNil(t, resp.Result, "workspace-root cwd must get a tool result: %s", string(reply))
+
+	// Scope-sensitive twin: graph_stats never consults the session
+	// scope, so a binding that admits the session but blanks its scope
+	// would pass the assertion above. A symbol search runs through the
+	// scoped engine — the tracked repo's own symbol must come back.
+	frame = []byte(`{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search_symbols","arguments":{"query":"main"}}}`)
+	require.NoError(t, client.WriteMCPFrame(frame))
+	reply, err = client.ReadMCPFrame()
+	require.NoError(t, err)
+	require.Contains(t, string(reply), "main.go",
+		"workspace-root session's scope must reach the contained repo's symbols: %s", string(reply))
 }
 
 // TestDaemon_EndToEnd_TrackAddsRepoLive proves track-while-running is

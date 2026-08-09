@@ -51,17 +51,73 @@ var aliasCanonicals = map[string][]string{
 // paramRewrite records one applied alias rewrite, for debug logging.
 type paramRewrite struct{ from, to string }
 
+// toolParams is the parameter surface a tool really declares: parameter name
+// to the JSON Schema type it advertises ("" when the schema leaves the type
+// unspecified).
+type toolParams map[string]string
+
+func (p toolParams) declares(name string) bool {
+	_, ok := p[name]
+	return ok
+}
+
+// accepts reports whether value could plausibly be what the named parameter
+// expects. Shape compatibility is a hard precondition for a rewrite, not a
+// nicety: moving an object into a string parameter does not produce a wrong
+// answer loudly, it produces one silently — the handler's stringArg read
+// yields "" and it runs exactly as though the argument had never been sent.
+// That is the fail-open shape this guard exists to prevent, so a candidate
+// whose declared type cannot hold the value is rejected rather than guessed
+// at. It is also what keeps the public envelope containers (target, options,
+// source, guard, …) from being renamed into unrelated scalar fields.
+func (p toolParams) accepts(name string, value any) bool {
+	declared, ok := p[name]
+	if !ok {
+		return false
+	}
+	switch declared {
+	case "object":
+		_, isObject := value.(map[string]any)
+		return isObject
+	case "array":
+		switch value.(type) {
+		case []any, []string:
+			return true
+		default:
+			return false
+		}
+	case "":
+		// An unspecified schema type still may not swallow a container:
+		// every canonical in aliasCanonicals is a scalar field, and a
+		// typo-matched candidate is at best a guess.
+		return !isContainerValue(value)
+	default:
+		// string / number / integer / boolean: scalars only. Cross-scalar
+		// coercion stays permitted — mcp-go already tolerates it.
+		return !isContainerValue(value)
+	}
+}
+
+func isContainerValue(value any) bool {
+	switch value.(type) {
+	case map[string]any, []any, []string, []map[string]any:
+		return true
+	default:
+		return false
+	}
+}
+
 // reconcileArgKeys rewrites, in place, argument keys that are not real
 // parameters of the tool to their canonical names. A key is rewritten
 // only when it confidently resolves to exactly one real, not-yet-supplied
-// parameter. Returns the rewrites applied.
-func reconcileArgKeys(args map[string]any, real map[string]bool) []paramRewrite {
+// parameter that can hold the supplied value. Returns the rewrites applied.
+func reconcileArgKeys(args map[string]any, real toolParams) []paramRewrite {
 	if len(args) == 0 || len(real) == 0 {
 		return nil
 	}
 	var unknown []string
 	for k := range args {
-		if !real[k] {
+		if !real.declares(k) {
 			unknown = append(unknown, k)
 		}
 	}
@@ -80,9 +136,10 @@ func reconcileArgKeys(args map[string]any, real map[string]bool) []paramRewrite 
 
 // resolveParamAlias returns the canonical parameter name key was most
 // likely meant to be, or "" when there is no confident single match. A
-// candidate qualifies only if it is a real parameter of the tool and is
-// not already present in args (so an explicit value is never displaced).
-func resolveParamAlias(key string, real map[string]bool, args map[string]any) string {
+// candidate qualifies only if it is a real parameter of the tool, is not
+// already present in args (so an explicit value is never displaced), and
+// declares a type that can hold the value being moved.
+func resolveParamAlias(key string, real toolParams, args map[string]any) string {
 	keyLower := strings.ToLower(strings.TrimSpace(key))
 	candidates := map[string]struct{}{}
 	for _, c := range aliasCanonicals[keyLower] {
@@ -93,13 +150,17 @@ func resolveParamAlias(key string, real map[string]bool, args map[string]any) st
 		if len(r) < 4 {
 			continue // too short to typo-match safely
 		}
-		if d := levenshtein(keyLower, strings.ToLower(r)); d > 0 && d <= 2 {
+		candidate := strings.ToLower(r)
+		if invertsMeaning(keyLower, candidate) {
+			continue
+		}
+		if d := levenshtein(keyLower, candidate); d > 0 && d <= 2 {
 			candidates[r] = struct{}{}
 		}
 	}
 	var viable []string
 	for c := range candidates {
-		if !real[c] {
+		if !real.accepts(c, args[key]) {
 			continue
 		}
 		if _, present := args[c]; present {
@@ -111,6 +172,53 @@ func resolveParamAlias(key string, real map[string]bool, args map[string]any) st
 		return viable[0]
 	}
 	return ""
+}
+
+// opposedAffixes are the parameter-name affix pairs that negate each other.
+// Each pair is exactly two edits apart in several of its instances, which is
+// precisely the distance the typo matcher accepts.
+var opposedAffixes = [][2]string{
+	{"include_", "exclude_"},
+	{"enable_", "disable_"},
+	{"with_", "without_"},
+	{"allow_", "deny_"},
+	{"min_", "max_"},
+	{"first_", "last_"},
+	{"before_", "after_"},
+	{"start_", "end_"},
+	{"source_", "sink_"},
+	{"from_", "to_"},
+}
+
+// invertsMeaning reports whether two parameter names are opposites sharing a
+// stem — include_tests / exclude_tests, min_score / max_score — rather than one
+// being a typo of the other. The edit-distance matcher cannot tell the
+// difference: "include" and "exclude" differ by two substitutions, the same
+// budget a genuine typo gets. Accepting the match hands the handler the exact
+// negation of what the caller asked for, and the response looks ordinary — a
+// filtered-out set reads exactly like an unfiltered one. A caller who really
+// meant the opposite parameter can always spell it; a caller who meant what
+// they typed must never be silently inverted.
+func invertsMeaning(key, candidate string) bool {
+	if key == candidate {
+		return false
+	}
+	for _, pair := range opposedAffixes {
+		for _, ordered := range [][2]string{{pair[0], pair[1]}, {pair[1], pair[0]}} {
+			one, other := ordered[0], ordered[1]
+			if strings.HasPrefix(key, one) && strings.HasPrefix(candidate, other) &&
+				strings.TrimPrefix(key, one) == strings.TrimPrefix(candidate, other) {
+				return true
+			}
+			if strings.HasSuffix(key, "_"+strings.TrimSuffix(one, "_")) &&
+				strings.HasSuffix(candidate, "_"+strings.TrimSuffix(other, "_")) &&
+				strings.TrimSuffix(key, "_"+strings.TrimSuffix(one, "_")) ==
+					strings.TrimSuffix(candidate, "_"+strings.TrimSuffix(other, "_")) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // levenshtein computes the edit distance between two short strings.
@@ -138,9 +246,11 @@ func levenshtein(a, b string) int {
 	return prev[len(rb)]
 }
 
-// toolParamNames returns the set of real parameter names declared by the
-// named tool's input schema, or nil when the tool or its schema is unknown.
-func (s *Server) toolParamNames(toolName string) map[string]bool {
+// toolParamNames returns the real parameters declared by the named tool's
+// input schema keyed by name, each carrying its declared JSON Schema type
+// ("" when the schema omits one). Returns nil when the tool or its schema is
+// unknown.
+func (s *Server) toolParamNames(toolName string) toolParams {
 	if s == nil || s.mcpServer == nil {
 		return nil
 	}
@@ -152,9 +262,13 @@ func (s *Server) toolParamNames(toolName string) map[string]bool {
 	if len(props) == 0 {
 		return nil
 	}
-	out := make(map[string]bool, len(props))
-	for k := range props {
-		out[k] = true
+	out := make(toolParams, len(props))
+	for k, raw := range props {
+		declared := ""
+		if property, ok := raw.(map[string]any); ok {
+			declared, _ = property["type"].(string)
+		}
+		out[k] = declared
 	}
 	return out
 }

@@ -202,6 +202,7 @@ func (s *Server) registerEnhancementTools() {
 			mcp.WithNumber("max_score", mcp.Description("(health_score) Drop rows whose composite score is above this (0..100)")),
 			mcp.WithNumber("min_axes", mcp.Description("(health_score) Require at least this many populated axes per row (default 1; raise to demand multi-signal confidence)")),
 			mcp.WithString("roll_up", mcp.Description("(health_score) Aggregate per-symbol scores up to a coarser scope — 'file' (per-file average + per-grade counts) or 'repo' (per-repo). Omit for per-symbol rows.")),
+			mcp.WithObject("target", mcp.AdditionalProperties(true), mcp.Description("(impact, def_use) Analysis target: {\"symbol\": \"<symbol id>\"} — or, for impact, {\"file\": \"<path>\"}. Lowered to the id / ids / path fields below. A kind with nothing to rank refuses the call instead of ignoring the target.")),
 			mcp.WithString("ids", mcp.Description("(impact) Comma-separated symbol IDs — score exactly these symbols. A fixed set, not a closure walk; pass `id` for the blast radius of one symbol.")),
 			mcp.WithString("id", mcp.Description("(impact, def_use) Target symbol ID. For impact this scopes the ranking to that symbol's blast radius — the symbol itself plus its transitive dependents — instead of the repo-wide ranking.")),
 			mcp.WithString("path", mcp.Description("(impact) Target file — rank the blast radius of every symbol defined in it.")),
@@ -2816,11 +2817,12 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 	baseRef := req.GetString("base_ref", "main")
 
 	// Resolve the working tree: explicit repo selector, lone tracked repo,
-	// or the session's cwd-bound repo. The "." fallback keeps the standalone
-	// (indexer-less) server working from its own cwd.
-	repoRoot, repoPrefix := s.diffRepoScope(ctx, strings.TrimSpace(req.GetString("repo", "")))
-	if repoRoot == "" {
-		repoRoot = "."
+	// the session's cwd-bound repo, then its sole contained repo. "." is
+	// reserved for the standalone (indexer-less) server, which is started
+	// in the tree it serves.
+	repoRoot, repoPrefix, rootErr := s.resolveDiffRoot(ctx, strings.TrimSpace(req.GetString("repo", "")))
+	if rootErr != nil {
+		return mcp.NewToolResultError(rootErr.Error()), nil
 	}
 
 	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)

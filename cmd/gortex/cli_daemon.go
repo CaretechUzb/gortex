@@ -227,7 +227,16 @@ func daemonOwnsRepo(abs string) bool {
 		if repo.Path == "" {
 			continue
 		}
+		// Forward containment: abs is inside a tracked repo.
 		if pathkey.HasPathPrefix(abs, repo.Path) {
+			return true
+		}
+		// Reverse containment: abs is a root ABOVE tracked repos. The
+		// MCP dispatcher serves this shape (cmd/gortex/daemon_mcp.go
+		// cwdReachable), and the two gates answering differently for
+		// the same directory is a difference the user experiences as
+		// "the agent can query this folder but the CLI cannot".
+		if pathkey.HasPathPrefix(repo.Path, abs) {
 			return true
 		}
 	}

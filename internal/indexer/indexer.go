@@ -1375,7 +1375,15 @@ func (idx *Indexer) runDeferredEnrich() {
 		// A file frontier proves only that the affected language/file batches
 		// were refreshed. It must never publish the whole-repository completion
 		// marker: files and packages outside this exact frontier did not run.
-		idx.clearPendingEnrich(pendingGeneration)
+		if idx.clearPendingEnrich(pendingGeneration) {
+			// The whole dispatched frontier is discharged, not just the paths a
+			// provider claimed: a file whose language no provider covers still
+			// had its deferred pass run, and leaving it marked would re-arm it
+			// on every restart forever. A newer generation (the watcher queued
+			// work mid-pass) keeps its own markers — clearPendingEnrich already
+			// declined, so this does not run.
+			idx.dischargePendingEnrichFrontier(pendingFiles)
+		}
 		return
 	}
 	// A re-parse this run evicted the persisted hover edges of the re-parsed
@@ -1412,6 +1420,12 @@ func (idx *Indexer) runDeferredEnrich() {
 	// so a later deferred pass (or the next restart, once the repo changes
 	// again) retries the enrichment rather than trusting an incomplete graph.
 	if !partialRepos[idx.repoPrefix] && idx.clearPendingEnrich(pendingGeneration) {
+		// A whole-repo pass covers every file, so it discharges the durable
+		// per-file ledger outright. This is the only place a non-git or dirty
+		// repo can ever retire those markers — RecordRepoEnrichmentComplete
+		// below no-ops for it — and it is what keeps find_usages from riding a
+		// re-verification-pending flag on files whose enrichment did complete.
+		idx.dischargePendingEnrichFrontier(idx.pendingEnrichFrontier())
 		// Persist a whole-repo completion marker at this HEAD so the next warm
 		// restart can tell, with one lookup, that this repo's enrichment finished
 		// and MaybeSeedPendingEnrich need not resume it. A partial / abandoned
@@ -1432,13 +1446,31 @@ func (idx *Indexer) runDeferredEnrich() {
 // file changed to raise the flag. The daemon warmup calls this after the parse
 // phase, before draining the deferred passes.
 //
+// Two independent signals arm it, in dominance order:
+//
+//	Whole-repo completion marker — absent or stale at a clean HEAD means the
+//	last pass never finished, so the WHOLE repo is re-armed. This signal needs
+//	a git sha it can key on and a clean tree it can trust, and is skipped on a
+//	backend that does not persist enrichment state (such a backend re-indexes
+//	from scratch each restart anyway).
+//
+//	Durable per-file ledger — the graph.MetaReparsePendingEnrichment markers
+//	the watch / incremental paths stamp on files they re-parsed without
+//	running enrichment. This signal needs no git state at all, so it is what
+//	closes the window for (a) a tracked directory that is not a git repository
+//	and (b) a git repo whose watch-indexed changes stay uncommitted across
+//	restarts. Both used to decline here, silently and permanently: the marker
+//	could never be keyed (recordEnrichMarker no-ops on an empty sha) or was
+//	current for a HEAD the uncommitted files had moved past, the warmup parse
+//	saw the watcher's own persisted results and reported nothing changed, and
+//	so the "until the next full enrichment" window that EnrichesOnWatch
+//	documents never closed. The ledger names exactly the outstanding files, so
+//	the resumed pass is file-scoped rather than a whole-repo re-enrich.
+//
 // Returns whether this repo will enrich (already pending, or newly seeded). A
-// no-op — false — for a repo without semantic providers, on a non-git tree (no
-// reliable freshness signal), on a backend that does not persist enrichment
-// state (it re-indexes from scratch each restart anyway), when the completion
-// marker already records the current HEAD, or on a dirty tree (the marker is
-// never written or trusted against uncommitted content, and resuming every
-// restart while the tree stays dirty would defeat the warm-restart fast path).
+// no-op — false — for a repo without semantic providers, and for one whose
+// completion marker is current with an empty ledger; that decline is logged at
+// debug with the reason, since it is the ordinary warm-restart outcome.
 func (idx *Indexer) MaybeSeedPendingEnrich() bool {
 	if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() || !idx.semanticMgr.HasProviders() {
 		return false
@@ -1450,22 +1482,42 @@ func (idx *Indexer) MaybeSeedPendingEnrich() bool {
 	// Cheap probe first: only the sha is needed to tell a repo whose marker is
 	// already current (the common warm-restart case) from one that must resume,
 	// so the slower git status shell-out is deferred to the resume path below.
-	sha := repoHead(idx.rootPath)
-	if sha == "" {
-		return false
+	reason := "no git head"
+	if sha := repoHead(idx.rootPath); sha != "" {
+		current, persisted := idx.semanticMgr.RepoEnrichmentMarkerState(idx.graph, idx.repoPrefix, sha)
+		switch {
+		case !persisted:
+			reason = "enrichment state not persisted"
+		case current:
+			reason = "completion marker current"
+		default:
+			// Known-incomplete. The marker is only trustworthy against
+			// committed content, so a dirty tree falls through to the ledger
+			// rather than re-enriching the whole repo on every restart.
+			if _, dirty := repoHeadAndDirty(idx.rootPath); !dirty {
+				idx.logger.Info("deferred enrichment re-armed: persisted enrichment incomplete",
+					zap.String("repo", idx.repoPrefix),
+					zap.String("sha", sha))
+				idx.markPendingEnrichFull()
+				return true
+			}
+			reason = "completion marker stale on a dirty tree"
+		}
 	}
-	current, persisted := idx.semanticMgr.RepoEnrichmentMarkerState(idx.graph, idx.repoPrefix, sha)
-	if !persisted || current {
-		return false
+	// The whole-repo marker could not settle it. Resume from the durable
+	// per-file ledger, which is independent of git state.
+	if frontier := idx.pendingEnrichFrontier(); len(frontier) > 0 {
+		idx.logger.Info("deferred enrichment re-armed: files indexed without semantic enrichment",
+			zap.String("repo", idx.repoPrefix),
+			zap.Int("files", len(frontier)),
+			zap.String("marker", reason))
+		idx.markPendingEnrichFiles(frontier)
+		return true
 	}
-	if _, dirty := repoHeadAndDirty(idx.rootPath); dirty {
-		return false
-	}
-	idx.logger.Info("deferred enrichment re-armed: persisted enrichment incomplete",
+	idx.logger.Debug("deferred enrichment not re-armed",
 		zap.String("repo", idx.repoPrefix),
-		zap.String("sha", sha))
-	idx.markPendingEnrichFull()
-	return true
+		zap.String("reason", reason))
+	return false
 }
 
 // runDeferredContracts extracts and commits this repo's contract nodes and
@@ -3525,17 +3577,21 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					}
 					merkleBaseline.record(relPath, src, wf.mtimeNano)
 
-					// Reuse the walk-time language. The walk's
-					// effectiveLanguage call already consulted shebang
-					// bytes via readSniffPrefix (512-byte probe), so a
-					// re-detect against the full src would change the
-					// answer only on the vanishingly rare case where a
-					// language marker lives past byte 512 — and any such
-					// case is content-sniffing-by-luck rather than spec'd
-					// behaviour. The fallback below covers the truly
-					// pathological case where the walk-time language has
-					// no extractor registered (effectively dead code).
+					// Reuse the walk-time language, except where the
+					// extension alone cannot decide it. The walk runs
+					// before any file is read, so for `.h`, `.m` and the
+					// other contested extensions it can only report the
+					// extension's default — reusing that indexed every
+					// C++ header as C, dropping its templates and class
+					// members. The bytes are in hand here, so re-detect;
+					// the second branch still covers a walk-time language
+					// with no extractor registered.
 					lang := wf.lang
+					if parser.ExtensionNeedsContentProbe(path) {
+						if relang, ok := idx.effectiveLanguage(path, src); ok {
+							lang = relang
+						}
+					}
 					ext, _ := idx.registry.GetByLanguage(lang)
 					if ext == nil {
 						if relang, ok := idx.effectiveLanguage(path, src); ok {

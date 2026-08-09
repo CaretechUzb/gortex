@@ -237,15 +237,23 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// We only reach here when no daemon is available (or autostart is off).
 	// A bare `gortex mcp` with no --index used to serve an EMPTY embedded
 	// graph — every tool returned nothing, which reads to the user as "gortex
-	// is broken." Default the embedded index to the launch cwd so the fallback
-	// serves the user's actual repo instead of nothing. An explicit --index
-	// still wins; an ambiguous cwd (`/`, $HOME) is left unset rather than
-	// indexing the world.
-	if mcpIndex == "" {
-		if cwd, cwdErr := resolveLaunchCWD(); cwdErr == nil && !isAmbiguousLaunchCWD(cwd) {
-			mcpIndex = cwd
-			fmt.Fprintf(os.Stderr, "[gortex] no daemon available; embedded server indexing %s\n", mcpIndex)
-		}
+	// is broken." So the fallback infers an index root from the launch cwd.
+	// resolveEmbeddedIndex bounds that inference: an explicit --index wins,
+	// an unsafe root or a directory that merely CONTAINS tracked repos is
+	// refused rather than crawled, and an inferred root never gets the
+	// repo-local notebook — a guess must not leave a .gortex/ directory in
+	// whatever tree the MCP client happened to launch from.
+	launchCWD, cwdErr := resolveLaunchCWD()
+	if cwdErr != nil {
+		launchCWD = ""
+	}
+	plan := resolveEmbeddedIndex(mcpIndex, launchCWD, loadGlobalConfigForEmbedded())
+	mcpIndex = plan.Index
+	switch {
+	case plan.Refusal != "":
+		fmt.Fprintf(os.Stderr, "[gortex] no daemon available; embedded server serving an empty graph: %s\n", plan.Refusal)
+	case plan.Inferred:
+		fmt.Fprintf(os.Stderr, "[gortex] no daemon available; embedded server indexing %s\n", mcpIndex)
 	}
 
 	// The embedded server runs in single-repo mode over --index: it
@@ -314,7 +322,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 			NotesRepo:    mcpIndex,
 			FeedbackDir:  mcpCacheDir,
 			FeedbackRepo: mcpIndex,
-			NotebookPath: mcpIndex,
+			NotebookPath: plan.Notebook,
 		},
 		SavingsRepo: mcpIndex,
 	})
@@ -328,6 +336,12 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	cm := ss.ConfigMgr
 	mi := ss.MultiIndexer
 	srv := ss.MCP
+
+	// Announce the degraded mode to the CLIENT, not just to stderr. An
+	// MCP host that discards stderr — most of them — otherwise cannot
+	// tell an embedded single-tree answer from a daemon-backed one, and
+	// neither can the agent reading the results.
+	srv.SetDegradedNote(embeddedModeNote(plan))
 
 	// Persist the resolved active project so the MCP server and
 	// set_active_project agree on the default scope.

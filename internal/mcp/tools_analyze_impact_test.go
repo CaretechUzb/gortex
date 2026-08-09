@@ -172,6 +172,12 @@ func TestAnalyzeImpact_TargetRanksItsOwnClosure(t *testing.T) {
 }
 
 // The reported call shape: analyze(kind:"impact", target:{symbol:…}).
+// This calls the lowering and the handler directly, so it proves only that
+// applyFacadeTarget maps target.symbol to id. It passed throughout the period
+// when no real call could reach either — the argument reconciler renamed the
+// selector away before dispatch, and the reused legacy name never routed
+// through the facade outside a facade-v1 session. The protocol-level guard
+// against that is TestAnalyzeTargetReachesHandlerOnEverySurface.
 func TestAnalyzeImpact_FacadeTargetReachesTheHandler(t *testing.T) {
 	s := newImpactTestServer(t)
 	spec := facadeOperationSpec{Facade: "analyze", Operation: "impact", Legacy: "analyze"}

@@ -27,6 +27,11 @@ type sessionState struct {
 	// calls (Read / Grep / Glob) since the last symbolic call or nudge.
 	// ModeAdaptiveNudge fires a soft-deny when it crosses the threshold.
 	NonSymbolicStreak int `json:"non_symbolic_streak,omitempty"`
+	// DaemonDownNotified records that this session was already told the
+	// daemon is unreachable and per-call enforcement is standing down, so
+	// the degradation notice fires once per session rather than once per
+	// tool call (see daemonDownNoticeOnce).
+	DaemonDownNotified bool `json:"daemon_down_notified,omitempty"`
 	// WrittenPaths is the set of file paths (and graph symbol IDs, whose
 	// path part is extracted at match time) this session's tool calls were
 	// about to rewrite. It is what lets a Stop-hook briefing tell this

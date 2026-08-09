@@ -57,6 +57,7 @@ func runPostToolUse(data []byte) {
 	if input.HookEventName != "PostToolUse" {
 		return
 	}
+	daemonUp := daemonReachableFn()
 	emitted := false
 	terminalObserved := false
 	defer func() {
@@ -64,12 +65,23 @@ func runPostToolUse(data []byte) {
 			localizationTerminalTelemetry("observed", emitted, started)
 			return
 		}
-		logHookEffectiveness("PostToolUse", emitted, daemonReachableFn(), 0, time.Since(started))
+		logHookEffectiveness("PostToolUse", emitted, daemonUp, 0, time.Since(started))
 	}()
 
 	if terminal, observed := observeLocalizationTerminal(data); observed {
 		terminalObserved = true
 		emitted = emitLocalizationTerminalContext(terminal)
+		return
+	}
+
+	// Daemon outage: the follow-ups below both need daemon answers and
+	// instruct "Do not re-Read / re-Grep" — guidance that must not land
+	// while the daemon cannot serve the tools it points at (#486). The
+	// per-file probes would fail individually anyway; returning here keeps
+	// a flapping daemon from emitting follow-ups mid-outage and skips up to
+	// one failed dial per matched file. Terminal-receipt handling above is
+	// local state and deliberately stays ahead of this gate.
+	if !daemonUp {
 		return
 	}
 

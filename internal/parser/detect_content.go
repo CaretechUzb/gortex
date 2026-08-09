@@ -3,6 +3,7 @@ package parser
 import (
 	"bytes"
 	"path"
+	"path/filepath"
 	"strings"
 )
 
@@ -103,6 +104,28 @@ func trimInterpVersion(interp string) string {
 	return interp[:end]
 }
 
+// ambiguousExtensions is the set of extensions whose default language
+// mapping is a guess that sniffAmbiguous may overturn from content. It
+// gates sniffAmbiguous, so no extension can be refined without being
+// listed here, and ExtensionNeedsContentProbe reports the same set to
+// callers that detected a language before reading the file.
+var ambiguousExtensions = map[string]bool{
+	".json": true,
+	".h":    true,
+	".inc":  true,
+	".m":    true,
+	".xml":  true,
+}
+
+// ExtensionNeedsContentProbe reports whether a file's extension maps to
+// more than one plausible language. A language detected for such a file
+// without its bytes in hand is provisional — the extension's default,
+// never a content-backed answer — so a caller that later reads the file
+// must re-detect with the content before choosing an extractor.
+func ExtensionNeedsContentProbe(filePath string) bool {
+	return ambiguousExtensions[strings.ToLower(filepath.Ext(filePath))]
+}
+
 // sniffAmbiguous refines the language of a file whose extension maps
 // to more than one plausible language. ext is the file extension
 // (with leading dot). It returns (lang, true) when the content
@@ -110,7 +133,7 @@ func trimInterpVersion(interp string) string {
 // extension is not ambiguous or the probe is inconclusive — the
 // caller then keeps the extension's default mapping.
 func sniffAmbiguous(filePath, ext string, content []byte) (string, bool) {
-	if len(content) == 0 {
+	if len(content) == 0 || !ambiguousExtensions[strings.ToLower(ext)] {
 		return "", false
 	}
 	probe := content

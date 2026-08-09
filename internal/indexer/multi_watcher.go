@@ -18,11 +18,17 @@ type MultiWatcher struct {
 	watchers    map[string]*Watcher    // repoPrefix → file watcher
 	gitWatchers map[string]*GitWatcher // repoPrefix → .git ref watcher
 	started     map[string]bool        // tracks which watchers have been started
-	multi       *MultiIndexer
-	logger      *zap.Logger
-	events      chan GraphChangeEvent
-	done        chan struct{}
-	mu          sync.Mutex
+	// startFailures records why a per-repo watcher never came up. A watcher
+	// that failed to start has no degraded reason of its own — it has no
+	// running state at all — so without this the repo is simply absent from
+	// every health surface and the daemon reports it watched. This is the
+	// only record that it is not.
+	startFailures map[string]string
+	multi         *MultiIndexer
+	logger        *zap.Logger
+	events        chan GraphChangeEvent
+	done          chan struct{}
+	mu            sync.Mutex
 
 	// symbolChangeCb is the OnSymbolChange callback registered by the
 	// MCP server (or any other consumer). It's fanned out to every
@@ -45,13 +51,14 @@ func NewMultiWatcher(
 	logger *zap.Logger,
 ) (*MultiWatcher, error) {
 	mw := &MultiWatcher{
-		watchers:    make(map[string]*Watcher),
-		gitWatchers: make(map[string]*GitWatcher),
-		started:     make(map[string]bool),
-		multi:       mi,
-		logger:      logger,
-		events:      make(chan GraphChangeEvent, 128),
-		done:        make(chan struct{}),
+		watchers:      make(map[string]*Watcher),
+		gitWatchers:   make(map[string]*GitWatcher),
+		started:       make(map[string]bool),
+		startFailures: make(map[string]string),
+		multi:         mi,
+		logger:        logger,
+		events:        make(chan GraphChangeEvent, 128),
+		done:          make(chan struct{}),
 	}
 
 	for prefix, cfg := range configs {
@@ -137,10 +144,11 @@ func (mw *MultiWatcher) Start() error {
 	// held for the whole call so Start/Stop can't interleave; the
 	// concurrency here is purely within one Start.
 	type startResult struct {
-		prefix string
-		w      *Watcher
-		gw     *GitWatcher
-		ok     bool
+		prefix  string
+		w       *Watcher
+		gw      *GitWatcher
+		ok      bool
+		failure string
 	}
 	prefixes := make([]string, 0, len(mw.watchers))
 	for prefix := range mw.watchers {
@@ -151,9 +159,13 @@ func (mw *MultiWatcher) Start() error {
 	for i, prefix := range prefixes {
 		w := mw.watchers[prefix]
 		meta := mw.multi.GetMetadata(prefix)
+		// A repo skipped here is as unwatched as one whose Start failed, so
+		// it is recorded the same way. Logging alone left the daemon
+		// reporting it watched.
 		if meta == nil {
 			mw.logger.Warn("skipping watcher start: repo metadata not found",
 				zap.String("prefix", prefix))
+			results[i] = startResult{prefix: prefix, failure: "repository metadata not found"}
 			continue
 		}
 
@@ -164,6 +176,7 @@ func (mw *MultiWatcher) Start() error {
 				zap.String("root", meta.RootPath),
 				zap.Error(err),
 			)
+			results[i] = startResult{prefix: prefix, failure: "repository root is inaccessible: " + err.Error()}
 			continue
 		}
 
@@ -173,8 +186,10 @@ func (mw *MultiWatcher) Start() error {
 			if err := w.Start([]string{rootPath}); err != nil {
 				mw.logger.Warn("failed to start watcher for repo",
 					zap.String("prefix", prefix),
+					zap.String("root", rootPath),
 					zap.Error(err),
 				)
+				results[slot] = startResult{prefix: prefix, failure: err.Error()}
 				return
 			}
 			res := startResult{prefix: prefix, w: w, ok: true}
@@ -205,8 +220,12 @@ func (mw *MultiWatcher) Start() error {
 
 	for _, res := range results {
 		if !res.ok {
+			if res.failure != "" {
+				mw.startFailures[res.prefix] = res.failure
+			}
 			continue
 		}
+		delete(mw.startFailures, res.prefix)
 		mw.started[res.prefix] = true
 		if res.gw != nil {
 			mw.gitWatchers[res.prefix] = res.gw
@@ -392,15 +411,42 @@ func (mw *MultiWatcher) DegradedReason() string {
 		prefixes = append(prefixes, prefix)
 	}
 	sort.Strings(prefixes)
+	// A watcher that never started outranks a degraded one: it is not
+	// watching at all, and it has no DegradedReason of its own to report.
+	for _, prefix := range prefixes {
+		if failure, dead := mw.startFailures[prefix]; dead {
+			return qualifyRepoReason(prefix,
+				"the file watcher failed to start — edits are not reaching the graph until the daemon restarts ("+failure+")")
+		}
+	}
 	for _, prefix := range prefixes {
 		if r := mw.watchers[prefix].DegradedReason(); r != "" {
-			if prefix != "" {
-				return prefix + ": " + r
-			}
-			return r
+			return qualifyRepoReason(prefix, r)
 		}
 	}
 	return ""
+}
+
+func qualifyRepoReason(prefix, reason string) string {
+	if prefix == "" {
+		return reason
+	}
+	return prefix + ": " + reason
+}
+
+// WatchedRepos reports how many per-repo watchers are live out of how many
+// were configured. The daemon announces readiness with these counts, and
+// reporting the configured total as if it were the live one is what let an
+// install where every watcher had failed still look fully watched.
+func (mw *MultiWatcher) WatchedRepos() (live, configured int) {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	for _, started := range mw.started {
+		if started {
+			live++
+		}
+	}
+	return live, len(mw.watchers)
 }
 
 // AddRepo creates and starts a watcher for a newly tracked repo.
@@ -432,6 +478,7 @@ func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error
 	}
 
 	mw.started[repoPrefix] = true
+	delete(mw.startFailures, repoPrefix)
 	if idx := mw.multi.GetIndexer(repoPrefix); idx != nil {
 		if gw, err := NewGitWatcher(meta.RootPath, idx, mw.logger.With(zap.String("repo", repoPrefix))); err == nil {
 			mw.configureGitWatcher(repoPrefix, gw)
@@ -481,5 +528,6 @@ func (mw *MultiWatcher) RemoveRepo(repoPrefix string) error {
 	}
 	delete(mw.watchers, repoPrefix)
 	delete(mw.started, repoPrefix)
+	delete(mw.startFailures, repoPrefix)
 	return err
 }

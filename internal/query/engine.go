@@ -343,8 +343,19 @@ func (e *Engine) FindOverridden(methodID string) []*graph.Node {
 // graph.OriginLSPDispatch (or higher) to restrict to compiler-verified
 // interface dispatches.
 func (e *Engine) FindImplementationsMinTier(interfaceID, minTier string) []*graph.Node {
+	impls, _ := e.FindImplementationsWithEdgesMinTier(interfaceID, minTier)
+	return impls
+}
+
+// FindImplementationsWithEdgesMinTier additionally returns the
+// implements-edges the node list was derived from, index-aligned by
+// construction (edges[i].From == impls[i].ID). Callers rendering a
+// subgraph need them — the wire format's `.edges` section carries the
+// evidence tier (origin/confidence) that the bare node list drops.
+func (e *Engine) FindImplementationsWithEdgesMinTier(interfaceID, minTier string) ([]*graph.Node, []*graph.Edge) {
 	edges := e.g.GetInEdges(interfaceID)
 	var impls []*graph.Node
+	var kept []*graph.Edge
 	for _, edge := range edges {
 		if edge.Kind != graph.EdgeImplements {
 			continue
@@ -361,9 +372,10 @@ func (e *Engine) FindImplementationsMinTier(interfaceID, minTier string) []*grap
 		}
 		if n := e.g.GetNode(edge.From); n != nil {
 			impls = append(impls, n)
+			kept = append(kept, edge)
 		}
 	}
-	return impls
+	return impls, kept
 }
 
 // FindUsages returns all nodes that reference a symbol.

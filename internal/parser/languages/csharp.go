@@ -86,6 +86,18 @@ const qCSharpAll = `
         name: (identifier) @callm.method))) @callm.expr
 
   (invocation_expression
+    function: (conditional_access_expression
+      "this"
+      (member_binding_expression
+        name: (identifier) @callself.method))) @callself.expr
+
+  (invocation_expression
+    function: (conditional_access_expression
+      "base"
+      (member_binding_expression
+        name: (identifier) @callbase.method))) @callbase.expr
+
+  (invocation_expression
     function: (member_access_expression
       "this"
       name: (identifier) @callself.method)) @callself.expr
@@ -100,6 +112,13 @@ const qCSharpAll = `
       type: (_) @lvar.type
       (variable_declarator
         (identifier) @lvar.name))) @lvar.def
+
+  (member_access_expression
+    name: (identifier) @maccess.name) @maccess.expr
+
+  (conditional_access_expression
+    (member_binding_expression
+      name: (identifier) @maccess.condname)) @maccess.condexpr
 ]
 `
 
@@ -246,6 +265,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	var calls []csharpDeferredCall
 	var locals []csharpDeferredLocal
 	var typeUses []csharpTypeUse
+	var accesses []csharpDeferredAccess
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
@@ -326,6 +346,21 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
 			})
 
+		case m.Captures["maccess.expr"] != nil:
+			accesses = append(accesses, csharpDeferredAccess{
+				name: m.Captures["maccess.name"].Text,
+				node: m.Captures["maccess.expr"].Node,
+				line: m.Captures["maccess.expr"].StartLine + 1,
+			})
+
+		case m.Captures["maccess.condexpr"] != nil:
+			accesses = append(accesses, csharpDeferredAccess{
+				name:        m.Captures["maccess.condname"].Text,
+				node:        m.Captures["maccess.condexpr"].Node,
+				line:        m.Captures["maccess.condexpr"].StartLine + 1,
+				conditional: true,
+			})
+
 		case m.Captures["lvar.def"] != nil:
 			locals = append(locals, csharpDeferredLocal{
 				name:    m.Captures["lvar.name"].Text,
@@ -370,6 +405,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// and the receiver gate act on that evidence):
 	//   Tier 0 — explicit type annotations (skip "var" placeholder)
 	//   Tier 1 — `var x = new Foo()` walk for `var`-keyed locals only
+	//   Tier 2 — `var x = await LoadAsync()` walk → the awaited Task<T>'s T
 	localOwner := func(l csharpDeferredLocal) string {
 		if l.defNode == nil {
 			return ""
@@ -414,6 +450,47 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 					setLocalType(owner, l.name, typeName)
 					done = true
 				}
+			}
+		})
+	}
+	//   Tier 2 — `var x = await LoadAsync()` walk: no object_creation ever
+	//   appears; the local's type is the T inside the awaited call's Task<T>,
+	//   reachable through the called method's declared return shape.
+	for _, l := range locals {
+		owner := localOwner(l)
+		if owner == "" || l.rawType != "var" || l.defNode == nil {
+			continue
+		}
+		if _, exists := tenvByOwner[owner][l.name]; exists {
+			continue
+		}
+		done := false
+		walkNodes(l.defNode, func(n *sitter.Node) {
+			if done || n.Type() != "await_expression" {
+				return
+			}
+			done = true
+			// The initializer must BE the await (parens aside): in
+			// `var w = (await Load()).Weigh()` the local holds Weigh's
+			// return, and stamping the awaited T would hand the
+			// resolver a confident wrong answer.
+			for p := n.Parent(); p != nil; p = p.Parent() {
+				switch p.Type() {
+				case "parenthesized_expression":
+					continue
+				case "equals_value_clause", "variable_declarator":
+					// direct initializer — accept
+				default:
+					return // nested inside a longer expression
+				}
+				break
+			}
+			inner := n.NamedChild(0)
+			if inner == nil {
+				return
+			}
+			if t := csharpAwaitedCallType(inner.Content(src), csharpOwnerTypeName(owner), tenvByOwner[owner], result); t != "" {
+				setLocalType(owner, l.name, t)
 			}
 		})
 	}
@@ -530,6 +607,13 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				if shape := shapesByOwner[callerID][c.receiver]; shape != "" && shape != bt {
 					edge.Meta["receiver_shape"] = shape
 				}
+			} else if inner := csharpAwaitedReceiver(c.receiver); inner != "" {
+				// `(await LoadAsync()).X()` — the chain walker collapses a
+				// fully-parenthesized receiver to nothing; the receiver is
+				// the T inside the awaited call's Task<T>.
+				if t := csharpAwaitedCallType(inner, csharpOwnerTypeName(callerID), tenvByOwner[callerID], result); t != "" {
+					edge.Meta = map[string]any{"receiver_type": t}
+				}
 			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
 				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenvByOwner[callerID], result))
 			}
@@ -551,6 +635,11 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		stampReturnUsage(edge, c.returnUsage)
 		result.Edges = append(result.Edges, edge)
 	}
+
+	// Member accesses ride the same deferred machinery as calls — the
+	// receiver-typing ladder needs the finished tenv.
+	emitCSharpMemberAccesses(accesses, src, filePath, funcRanges,
+		tenvByOwner, builtinsByOwner, result)
 
 	// .NET surfaces a symbol walk misses: DI registrations + COM
 	// interop. Stamped onto the file node.
@@ -634,15 +723,77 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	})
 	emitCSharpAnnotationEdges(csharpCollectAttributes(def.Node, src), id, filePath, result, annotationSeen)
 	emitCSharpGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
-	// Only classes, structs, and records carry a base class / interface
-	// list that splits into EdgeExtends + EdgeImplements. Structs and
-	// `record struct` declarations have no base class — every base is an
-	// interface — which emitCSharpBaseList infers from the declaration.
+	// Classes, structs, records, and interfaces carry a base list;
+	// emitCSharpBaseList derives each entry's edge kind from the
+	// declaration (base class vs interface for classes, all-interface
+	// for structs and records, inheritance for interfaces).
 	switch kind {
-	case "class", "struct", "record":
+	case "class", "struct", "record", "iface":
 		emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, result)
 	case "enum":
 		e.emitCSharpEnumMembers(def.Node, src, filePath, id, name, result, seen)
+	}
+	if kind == "record" {
+		e.emitCSharpRecordPositionalProps(id, name, def.Node, src, filePath, fileID, result, seen)
+	}
+}
+
+// emitCSharpRecordPositionalProps fabricates property member nodes for a
+// record's positional parameters — `record Medal(int Id, string Motto)`
+// synthesizes public properties Id and Motto with no declaration node
+// for the member walk to find, so the parameter list is the only source.
+// Runs at container emission, which precedes the body's member matches
+// in tree order: an explicit redeclaration of a positional property
+// (legal C# — it replaces the synthesized one) hits the seen guard and
+// stays a single node for the same logical member.
+func (e *CSharpExtractor) emitCSharpRecordPositionalProps(ownerID, ownerName string, decl *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	// The record's parameter_list is an unnamed child in this grammar —
+	// unlike method parameters, ChildByFieldName("parameters") finds
+	// nothing, so scan the direct children by type.
+	var params *sitter.Node
+	for i, _nc := 0, int(decl.NamedChildCount()); i < _nc; i++ {
+		if c := decl.NamedChild(i); c != nil && c.Type() == "parameter_list" {
+			params = c
+			break
+		}
+	}
+	if params == nil {
+		return
+	}
+	for i, _nc := 0, int(params.NamedChildCount()); i < _nc; i++ {
+		p := params.NamedChild(i)
+		if p == nil || p.Type() != "parameter" {
+			continue
+		}
+		nameNode := p.ChildByFieldName("name")
+		if nameNode == nil {
+			continue
+		}
+		pname := nameNode.Content(src)
+		id := filePath + "::" + ownerName + "." + pname
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		line := int(p.StartPoint().Row) + 1
+		meta := map[string]any{
+			"receiver":   ownerName,
+			"visibility": VisibilityPublic,
+			"kind":       "property",
+			"positional": true,
+		}
+		if t := p.ChildByFieldName("type"); t != nil {
+			meta["field_type"] = strings.TrimSpace(t.Content(src))
+		}
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindField, Name: pname,
+			FilePath: filePath, StartLine: line, EndLine: line,
+			Language: "csharp",
+			Meta:     meta,
+		})
+		result.Edges = append(result.Edges,
+			&graph.Edge{From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: line},
+			&graph.Edge{From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: line})
 	}
 }
 
@@ -957,7 +1108,7 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	def := m.Captures["method.def"]
 	startLine1 := def.StartLine + 1
 
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
 		// Method outside a recognised container — legacy didn't emit
 		// these (its nested queries required class/struct/interface
@@ -1002,8 +1153,11 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	if isIface {
 		meta["iface_member"] = true
 	}
-	if rt := extractCSharpMethodReturnType(def.Node, src, name); rt != "" {
+	if rt, shape := extractCSharpMethodReturnType(def.Node, src, name); rt != "" {
 		meta["return_type"] = rt
+		if shape != rt {
+			meta["return_shape"] = shape
+		}
 	}
 	if csharpHasModifier(def.Node, src, "async") {
 		meta["async"] = true
@@ -1074,7 +1228,7 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	def := m.Captures["ctor.def"]
 	startLine1 := def.StartLine + 1
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "record_declaration")
 	if owner.kind == "" {
 		return
 	}
@@ -1116,7 +1270,7 @@ func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID
 
 func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	def := m.Captures["field.def"]
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
 		return
 	}
@@ -1183,7 +1337,7 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 
 func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	def := m.Captures["prop.def"]
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
 		return
 	}
@@ -1445,6 +1599,8 @@ func collectCSharpInterfaceNames(root *sitter.Node, src []byte) map[string]bool 
 
 // emitCSharpBaseList splits a class/struct/record base list into
 // EdgeExtends (the superclass) and EdgeImplements (the interfaces).
+// An interface's base list bypasses that split entirely — see the
+// short-circuit below.
 //
 // C# lists the optional base class and any implemented interfaces in a
 // single comma-separated base_list, and — unlike Go or Java — the
@@ -1490,6 +1646,10 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 	// Structs and `record struct` cannot derive from a base class — the
 	// CLR forbids it — so every entry in their base list is an interface
 	// and the "first non-interface is the superclass" branch never runs.
+	// An interface's bases can only be interfaces, and the relation is
+	// inheritance — every entry rides EdgeExtends (the same convention
+	// the semantic engine applies), bypassing the discrimination below.
+	ifaceDecl := decl.Type() == "interface_declaration"
 	allowsBaseClass := csharpDeclAllowsBaseClass(decl)
 	extendsTaken := false
 	for i, _nc := 0, int(baseList.NamedChildCount()); i < _nc; i++ {
@@ -1508,7 +1668,10 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 		isInterface := !isCtorBase &&
 			(localInterfaces[name] || csharpInterfaceNamePattern.MatchString(name))
 		kind := graph.EdgeImplements
-		if !isInterface && allowsBaseClass && !extendsTaken {
+		switch {
+		case ifaceDecl:
+			kind = graph.EdgeExtends
+		case !isInterface && allowsBaseClass && !extendsTaken:
 			kind = graph.EdgeExtends
 			extendsTaken = true
 		}
@@ -1734,10 +1897,12 @@ func csharpTypeParamConstraints(methodNode *sitter.Node, src []byte, param strin
 }
 
 // extractCSharpMethodReturnType walks a method_declaration node for
-// the type child preceding the method name.
-func extractCSharpMethodReturnType(methodNode *sitter.Node, src []byte, methodName string) string {
+// the type child preceding the method name. Returns the normalized name
+// plus the raw declared shape — normalization drops generic arguments,
+// and for a Task<T> the argument is exactly what an await evaluates to.
+func extractCSharpMethodReturnType(methodNode *sitter.Node, src []byte, methodName string) (string, string) {
 	if methodNode == nil {
-		return ""
+		return "", ""
 	}
 	for i, _nc := 0, int(methodNode.ChildCount()); i < _nc; i++ {
 		child := methodNode.Child(i)
@@ -1749,9 +1914,156 @@ func extractCSharpMethodReturnType(methodNode *sitter.Node, src []byte, methodNa
 			"nullable_type", "array_type", "tuple_type":
 			rawType := string(src[child.StartByte():child.EndByte()])
 			if rt := normalizeCSharpTypeName(rawType); rt != "" && rt != "var" {
-				return rt
+				return rt, strings.TrimSpace(rawType)
 			}
 		}
+	}
+	return "", ""
+}
+
+// csharpAwaitedReceiver returns the awaited expression inside a receiver
+// that is exactly one parenthesized await group — `(await LoadAsync(id))`
+// → `LoadAsync(id)` — and "" for every other receiver shape.
+func csharpAwaitedReceiver(recv string) string {
+	s := strings.TrimSpace(recv)
+	if !strings.HasPrefix(s, "(") || !strings.HasSuffix(s, ")") {
+		return ""
+	}
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && i != len(s)-1 {
+				return "" // opening paren closes early — not one group
+			}
+		}
+	}
+	inner := strings.TrimSpace(s[1 : len(s)-1])
+	if rest := strings.TrimPrefix(inner, "await "); rest != inner {
+		return strings.TrimSpace(rest)
+	}
+	return ""
+}
+
+// csharpAwaitedCallType resolves the type an awaited call expression
+// evaluates to: the called method's declared return shape with the
+// Task<>/ValueTask<> wrapper stripped. A chained call types its receiver
+// prefix through the shared chain walker first; the final hop reads the
+// lossless return_shape because the normalized return_type has already
+// dropped the generic argument — which is exactly the awaited T.
+// enclosing is the caller's own type: it anchors unqualified and
+// this-qualified calls so a same-named method on an unrelated sibling
+// class never leaks its return shape in.
+func csharpAwaitedCallType(expr, enclosing string, tenv typeEnv, result *parser.ExtractionResult) string {
+	expr = strings.TrimSpace(expr)
+	// Split the final segment off at the last depth-0 dot; the raw prefix
+	// text keeps its call parens so factory-chain seeding still works.
+	depth, cut := 0, -1
+	for i := 0; i < len(expr); i++ {
+		switch expr[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case '.':
+			if depth == 0 {
+				cut = i
+			}
+		}
+	}
+	if cut < 0 {
+		name := stripCallArgs(expr)
+		return csharpUnwrapTaskType(csharpCallableReturnShape("", enclosing, name, result))
+	}
+	name := stripCallArgs(expr[cut+1:])
+	var recvType string
+	if prefix := expr[:cut]; prefix == "this" {
+		recvType = enclosing
+	} else {
+		recvType = resolveChainType(prefix, tenv, result)
+		if recvType == "" && isKnownType(prefix, result) {
+			recvType = prefix // static call on a type: `Repo.LoadAsync()`
+		}
+	}
+	if name == "" || recvType == "" {
+		return ""
+	}
+	return csharpUnwrapTaskType(csharpCallableReturnShape(recvType, "", name, result))
+}
+
+// csharpCallableReturnShape finds the declared return shape of a callable
+// named name. With a receiverType, only an exact receiver match counts.
+// Without one (an unqualified call inside a method body) the enclosing
+// class's own member wins, then a receiver-less free function — never an
+// arbitrary same-named method off an unrelated class, whose shape would
+// ride into receiver_type as a confident wrong answer.
+func csharpCallableReturnShape(receiverType, enclosing, name string, result *parser.ExtractionResult) string {
+	var free string
+	for _, n := range result.Nodes {
+		if n == nil || (n.Kind != graph.KindMethod && n.Kind != graph.KindFunction) || n.Name != name {
+			continue
+		}
+		shape, _ := n.Meta["return_shape"].(string)
+		if shape == "" {
+			shape, _ = n.Meta["return_type"].(string)
+		}
+		if shape == "" {
+			continue
+		}
+		recv, _ := n.Meta["receiver"].(string)
+		if receiverType != "" {
+			if recv == receiverType {
+				return shape
+			}
+			continue
+		}
+		if enclosing != "" && recv == enclosing {
+			return shape
+		}
+		if recv == "" && free == "" {
+			free = shape
+		}
+	}
+	return free
+}
+
+// csharpOwnerTypeName extracts the enclosing type's simple name from a
+// symbol owner ID ("file.cs::Outer.Inner.Method" → "Inner"); "" for a
+// top-level function.
+func csharpOwnerTypeName(ownerID string) string {
+	idx := strings.LastIndex(ownerID, "::")
+	if idx < 0 {
+		return ""
+	}
+	parts := strings.Split(ownerID[idx+2:], ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-2]
+}
+
+// csharpUnwrapTaskType strips the Task<>/ValueTask<> wrapper from a return
+// shape and returns the normalized result type — what an await on that
+// call evaluates to. Anything else (bare Task, custom awaitables) yields
+// "" rather than a guess.
+func csharpUnwrapTaskType(shape string) string {
+	s := strings.TrimSpace(shape)
+	lt := strings.Index(s, "<")
+	if lt <= 0 || !strings.HasSuffix(s, ">") {
+		return ""
+	}
+	head := s[:lt]
+	if dot := strings.LastIndex(head, "."); dot >= 0 {
+		head = head[dot+1:]
+	}
+	if head != "Task" && head != "ValueTask" {
+		return ""
+	}
+	if t := normalizeCSharpTypeName(s[lt+1 : len(s)-1]); t != "" && t != "var" {
+		return t
 	}
 	return ""
 }

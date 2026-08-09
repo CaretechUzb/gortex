@@ -160,6 +160,24 @@ func (s *Server) mergeContentChannel(ctx context.Context, query string, nodes []
 		limit = fetchLimit
 	}
 	repoPrefix, _ := s.sessionLocality(ctx)
+	// A workspace-root binding has no home repo, so the prefix above is
+	// empty and SearchContent would span every repo in every workspace —
+	// the one channel the session's workspace boundary doesn't reach
+	// (the merged hits are materialised by raw GetNode below). Clamp the
+	// hits to the bound workspace's repo set; a bound session whose
+	// workspace enumerates no repos fails closed and merges nothing.
+	var allow map[string]bool
+	if repoPrefix == "" {
+		if ws, _, bound := s.sessionScope(ctx); bound {
+			if s.multiIndexer == nil {
+				return nodes
+			}
+			allow = s.multiIndexer.ReposInWorkspace(ws)
+			if len(allow) == 0 {
+				return nodes
+			}
+		}
+	}
 	hits, err := cs.SearchContent(query, repoPrefix, limit)
 	if err != nil || len(hits) == 0 {
 		return nodes
@@ -178,6 +196,9 @@ func (s *Server) mergeContentChannel(ctx context.Context, query string, nodes []
 		}
 		n := s.graph.GetNode(h.NodeID)
 		if n == nil {
+			continue
+		}
+		if allow != nil && !allow[n.RepoPrefix] {
 			continue
 		}
 		seen[h.NodeID] = struct{}{}

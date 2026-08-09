@@ -153,6 +153,59 @@ func (idx *Indexer) semanticDependencyFrontierForDeletedFiles(relPaths []string)
 	return appendUniqueSorted(nil, frontier...)
 }
 
+// pendingEnrichFrontier reads the DURABLE per-file deferral ledger: the graph
+// paths whose KindFile node still carries graph.MetaReparsePendingEnrichment,
+// which the incremental / watch paths stamp on a file they re-parsed while
+// semantic enrichment was deferred (semantic.enrich_on_watch=false, or a
+// deferred global-pass window). Unlike the in-memory deferredEnrichFiles set it
+// lives on the node itself, so it survives a daemon restart — and unlike the
+// whole-repo completion marker it needs neither a git sha nor a clean tree, so
+// it is the ONLY evidence of outstanding enrichment for a repo that is not a
+// git checkout or whose watch-indexed edits are still uncommitted.
+//
+// One repo-scoped, kind-filtered projection per call; the marker is a binary
+// meta blob, so the key test is decoded backend-side rather than pushed into
+// the query. Bounded by the repo's file count, not its symbol count.
+func (idx *Indexer) pendingEnrichFrontier() []string {
+	nodes := graph.ReadRepoNodesByKindsWithMetaKey(
+		idx.graph, idx.repoPrefix, idx.workspaceID,
+		[]graph.NodeKind{graph.KindFile}, graph.MetaReparsePendingEnrichment,
+	)
+	var frontier []string
+	for _, node := range nodes {
+		if node == nil || node.FilePath == "" {
+			continue
+		}
+		// Mirror suppressionMayBeStale: only a truthy marker is pending. The
+		// writer deletes the key when it clears, so a false value is unreachable
+		// today — reading it defensively keeps the two consumers in agreement.
+		if pending, _ := node.Meta[graph.MetaReparsePendingEnrichment].(bool); pending {
+			frontier = append(frontier, node.FilePath)
+		}
+	}
+	return appendUniqueSorted(nil, frontier...)
+}
+
+// dischargePendingEnrichFrontier clears the durable per-file deferral for the
+// graph paths a deferred pass just covered. Without it the ledger only ever
+// grows: nothing but a watch-time enrichment (which is off by construction on
+// the deferral path) cleared the marker, so a resumed pass would re-arm the
+// same files on every restart, and find_usages would keep riding every one of
+// those files' suppressions with a re-verification-pending flag that no
+// completed enrichment could ever retire.
+func (idx *Indexer) dischargePendingEnrichFrontier(graphPaths []string) {
+	if len(graphPaths) == 0 {
+		return
+	}
+	discharged := make(map[string]bool, len(graphPaths))
+	for _, graphPath := range graphPaths {
+		if graphPath != "" {
+			discharged[graphPath] = false
+		}
+	}
+	idx.setReparsePendingEnrichments(discharged)
+}
+
 // clearPendingEnrich clears only the work represented by generation. If a
 // watcher queued another change during enrichment, that newer work remains.
 func (idx *Indexer) clearPendingEnrich(generation uint64) bool {
