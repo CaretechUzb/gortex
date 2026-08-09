@@ -47,7 +47,7 @@ func TestScopeForCWD_And_ReposInWorkspace(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexScoped("", "") // empty scope → index every configured repo
 	require.NoError(t, err)
 
@@ -146,7 +146,7 @@ func TestScopeForCWD_WorkspaceRoot(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexScoped("", "")
 	require.NoError(t, err)
 
@@ -231,7 +231,7 @@ func TestContainedReposScope(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexScoped("", "")
 	require.NoError(t, err)
 
@@ -313,7 +313,7 @@ func TestContainedReposScope_RefusesOverbroadRoots(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexScoped("", "")
 	require.NoError(t, err)
 
@@ -365,7 +365,7 @@ func TestScopeForCWD_RefusesOverbroadRootSharedWorkspace(t *testing.T) {
 	cm, err := config.NewConfigManager(tmpCfg)
 	require.NoError(t, err)
 
-	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexScoped("", "")
 	require.NoError(t, err)
 

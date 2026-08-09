@@ -57,7 +57,7 @@ func newIsolationServer(t *testing.T) (srv *Server, repoA, repoB string) {
 
 	g := graph.New()
 	reg := testRegistry()
-	bm := search.NewBM25()
+	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
 	_, err = mi.IndexScoped("", "") // index every configured repo
 	require.NoError(t, err)

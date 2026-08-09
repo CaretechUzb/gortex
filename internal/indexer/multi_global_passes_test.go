@@ -82,7 +82,7 @@ func TestMultiIndexer_IndexAll_GlobalPassesProduceEdges(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	results, err := mi.IndexAll()
 	require.NoError(t, err)
@@ -134,7 +134,7 @@ func TestMultiIndexer_GlobalGraphPassPipeline_Idempotent(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
@@ -173,7 +173,7 @@ func TestMultiIndexer_BeginEndBatch_DefersGlobalPasses(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	mi.BeginBatch()
 
@@ -213,7 +213,7 @@ func TestMultiIndexer_TrackRepoCtx_NoBatch_RunsGlobalPassesInline(t *testing.T) 
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err = mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: repoA, Name: "repo-a"})
 	require.NoError(t, err)

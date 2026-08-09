@@ -41,7 +41,7 @@ func TestReconcileRepoCtx_Sqlite_FullRetrackFlag(t *testing.T) {
 
 	// First "daemon run": index the repo on the disk-backed store and
 	// capture mtimes as if we were writing a warm-restart snapshot.
-	mi := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
@@ -54,7 +54,7 @@ func TestReconcileRepoCtx_Sqlite_FullRetrackFlag(t *testing.T) {
 	// down the whole-repo re-track branch.
 	writeFile(t, filepath.Join(repoPath, "b.go"), "package main\nfunc Beta() {}\n")
 
-	mi2 := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi2 := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	result, err := mi2.ReconcileRepoCtx(context.Background(), config.RepoEntry{Path: repoPath, Name: "repo"}, priorMtimes)
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -70,7 +70,7 @@ func TestReconcileRepoCtx_Sqlite_FullRetrackFlag(t *testing.T) {
 	require.NotNil(t, meta2)
 	unchangedMtimes := mi2.FileMtimes("repo")
 
-	mi3 := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi3 := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	result2, err := mi3.ReconcileRepoCtx(context.Background(), config.RepoEntry{Path: repoPath, Name: "repo"}, unchangedMtimes)
 	require.NoError(t, err)
 	require.NotNil(t, result2)

@@ -27,7 +27,7 @@ func inertTestWatcher(t *testing.T, fileName, content string) (string, *Indexer,
 
 	g := graph.New()
 	idx := newTestIndexer(g)
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
@@ -265,7 +265,7 @@ func TestWatcher_OldDatabaseFirstPatchIsConservative(t *testing.T) {
 	path := filepath.Join(dir, "main.go")
 	writeTestFile(t, path, "package main\n\nfunc Stable() {}\n")
 	idx := newTestIndexer(graph.New())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.Index(dir)
 	require.NoError(t, err)

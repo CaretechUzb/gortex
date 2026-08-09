@@ -27,7 +27,7 @@ type Swappable struct {
 }
 
 // NewSwappable wraps b. Panics if b is nil — every Indexer must start
-// with a real backend, even if it's the in-memory NewAuto() default.
+// with a real backend, even if it's the NewNull() no-op default.
 func NewSwappable(b Backend) *Swappable {
 	if b == nil {
 		panic("search.NewSwappable: nil backend")

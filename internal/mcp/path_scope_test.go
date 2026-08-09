@@ -86,7 +86,7 @@ func TestResolvePathFilter_Sources(t *testing.T) {
 	t.Setenv("GORTEX_SCOPES_PATH", filepath.Join(tempSidecarDir(t), "scopes.json"))
 	g := graph.New()
 	eng := query.NewEngine(g)
-	eng.SetSearch(search.NewBM25())
+	eng.SetSearch(search.NewNull())
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 	require.NoError(t, srv.scopeStoreOrInit().put(SavedScope{
 		Name: "billing", Repos: []string{"r"}, Paths: []string{"services/billing"},

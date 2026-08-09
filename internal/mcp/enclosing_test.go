@@ -73,7 +73,7 @@ func TestFindUsages_GroupByFile(t *testing.T) {
 	g.AddEdge(&graph.Edge{From: b1.ID, To: target.ID, Kind: graph.EdgeCalls, FilePath: "pkg/b.go", Line: 5})
 
 	eng := query.NewEngine(g)
-	eng.SetSearch(search.NewBM25())
+	eng.SetSearch(search.NewNull())
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 
 	req := mcplib.CallToolRequest{}
@@ -117,7 +117,7 @@ func TestFindUsages_FlatByDefault(t *testing.T) {
 	g.AddEdge(&graph.Edge{From: caller.ID, To: target.ID, Kind: graph.EdgeCalls, FilePath: "pkg/a.go", Line: 3})
 
 	eng := query.NewEngine(g)
-	eng.SetSearch(search.NewBM25())
+	eng.SetSearch(search.NewNull())
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 
 	req := mcplib.CallToolRequest{}

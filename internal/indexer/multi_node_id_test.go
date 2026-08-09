@@ -87,7 +87,7 @@ func TestMultiRepo_ResolvesCallEdges(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err, "track %s", entry.Name)
@@ -164,7 +164,7 @@ func TestTrackRepoCtx_FirstOfManyStillGetsPrefix(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	// Simulate warmupDaemonState's loop: TrackRepoCtx each config'd repo
 	// in order. The first call is the one that used to skip prefixing.
@@ -275,7 +275,7 @@ rules:
 	g := graph.New()
 	registry := newTestRegistry()
 	registry.Register(languages.NewYAMLExtractor())
-	mi := NewMultiIndexer(g, registry, search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, registry, search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err, "tracking %s", entry.Name)

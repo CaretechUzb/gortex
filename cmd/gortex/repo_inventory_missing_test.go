@@ -116,7 +116,7 @@ func newInventoryController(t *testing.T, repos []config.RepoEntry) *realControl
 	g := graph.New()
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
-	mi := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, _ = mi.IndexAll()
 
 	return &realController{graph: g, multiIndexer: mi, configManager: cm, logger: zap.NewNop()}

@@ -29,7 +29,7 @@ func TestReconcileRepoCtxKeepsMerkleFallbackForCleanMtimeCensus(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 
-	seed := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	seed := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = seed.IndexAll()
 	require.NoError(t, err)
 	prior := seed.GetIndexer("repo").FileMtimes()
@@ -45,7 +45,7 @@ func TestReconcileRepoCtxKeepsMerkleFallbackForCleanMtimeCensus(t *testing.T) {
 	// remain disabled for every Merkle-enabled repository.
 	require.NoError(t, os.Remove(merkleTreeFile(root)))
 	core, logs := observer.New(zap.DebugLevel)
-	restarted := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewBM25(), cm, zap.New(core))
+	restarted := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewNull(), cm, zap.New(core))
 	result, err := restarted.ReconcileRepoCtx(t.Context(), entry, prior)
 	require.NoError(t, err)
 	require.NotNil(t, result)

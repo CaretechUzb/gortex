@@ -226,7 +226,7 @@ func TestHandleReindexRepository_MultiRepoRoutesByPrefix(t *testing.T) {
 	reg.Register(languages.NewGoExtractor())
 
 	g := graph.New()
-	mi := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 	require.True(t, mi.IsMultiRepo())
@@ -284,7 +284,7 @@ func TestHandleReindexRepository_MultiRepoPathScoped(t *testing.T) {
 	reg.Register(languages.NewGoExtractor())
 
 	g := graph.New()
-	mi := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
@@ -338,7 +338,7 @@ func TestHandleReindexRepository_MultiRepoRejectsUntrackedPath(t *testing.T) {
 	reg.Register(languages.NewGoExtractor())
 
 	g := graph.New()
-	mi := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 

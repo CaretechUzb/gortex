@@ -58,7 +58,7 @@ func nestedRepoServer(t *testing.T, entries []config.RepoEntry) (*Server, *graph
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewGoExtractor())
 	g := graph.New()
-	mi := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 

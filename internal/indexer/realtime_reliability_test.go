@@ -254,7 +254,7 @@ func TestPollGitHead_DiffFailureRetriesRange(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(repoDir)
 	_, err = idx.IndexCtx(testCtx(), repoDir)
 	require.NoError(t, err)
@@ -395,7 +395,7 @@ func TestWatcher_OverflowReconcileIndexesMissedFile(t *testing.T) {
 	reg.Register(ext)
 	g := graph.New()
 	idx := New(g, reg, config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 
 	ext.setFail(false)
@@ -449,7 +449,7 @@ func TestWatcher_NewSubdirScanIndexesPreWatchFile(t *testing.T) {
 	reg.Register(ext)
 	g := graph.New()
 	idx := New(g, reg, config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 
 	ext.setFail(false)
@@ -562,7 +562,7 @@ func TestWatcher_PatchPanicRecoveredNotCrash(t *testing.T) {
 	reg.Register(ext)
 	store := &panicOnReadStore{Store: graph.New()}
 	idx := New(store, reg, config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	dir := t.TempDir()
 	idx.SetRootPath(dir)
 	path := filepath.Join(dir, "main.fk")

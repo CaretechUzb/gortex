@@ -77,7 +77,7 @@ func newSharedWorkspaceServer(t *testing.T, flagOn bool) sharedWSOptions {
 
 	g := graph.New()
 	reg := testRegistry()
-	bm := search.NewBM25()
+	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
 	_, err = mi.IndexScoped("", "")
 	require.NoError(t, err)
@@ -115,7 +115,7 @@ func newSplitProjectWorkspaceServer(t *testing.T, flagOn bool) sharedWSOptions {
 
 	g := graph.New()
 	reg := testRegistry()
-	bm := search.NewBM25()
+	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
 	_, err = mi.IndexScoped("", "")
 	require.NoError(t, err)
@@ -694,7 +694,7 @@ func newLoneRepoServer(t *testing.T, flagOn bool) (*Server, string) {
 
 	g := graph.New()
 	reg := testRegistry()
-	bm := search.NewBM25()
+	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
 	_, err = mi.IndexScoped("", "")
 	require.NoError(t, err)

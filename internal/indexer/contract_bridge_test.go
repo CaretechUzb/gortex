@@ -197,7 +197,7 @@ func TestContractBridge_TwoRepoIntegration(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err)
@@ -386,7 +386,7 @@ func TestReconcileContractEdges_ConcurrentNoRaceOrTear(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err)

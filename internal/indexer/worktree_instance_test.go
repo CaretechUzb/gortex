@@ -60,7 +60,7 @@ func newWorktreeTestIndexer(t *testing.T, repos ...config.RepoEntry) (*graph.Gra
 	cm, err := config.NewConfigManager(cfgPath)
 	require.NoError(t, err)
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	return g, mi, cm
 }
 

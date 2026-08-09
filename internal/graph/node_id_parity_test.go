@@ -220,7 +220,7 @@ func indexFixture(t *testing.T, checkoutName string) fixtureResult {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := indexer.NewMultiIndexer(g, newParityRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, newParityRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err, "track %s", entry.Name)

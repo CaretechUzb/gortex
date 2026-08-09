@@ -155,7 +155,7 @@ func TestGatherSymbolCandidates_EmptyBackendStillFallsBack(t *testing.T) {
 	n := &graph.Node{ID: "app/w.go::WidgetExtensions", Name: "WidgetExtensions", Kind: graph.KindType, RepoPrefix: "app"}
 	g.AddNode(n)
 	engine := NewEngine(g)
-	engine.SetSearch(search.NewBM25()) // empty: Count 0, no corpus
+	engine.SetSearch(search.NewNull()) // empty: Count 0, no corpus
 
 	got := engine.GatherSymbolCandidates("WidgetExtensions", 5, QueryOptions{SkipInnerRerank: true, SkipVectorChannel: true}, nil)
 	if len(got) != 1 || got[0].Node.ID != n.ID {

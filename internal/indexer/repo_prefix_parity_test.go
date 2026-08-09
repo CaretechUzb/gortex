@@ -64,7 +64,7 @@ func TestRepoPrefixParityAfterIndexing(t *testing.T) {
 			require.NoError(t, err)
 
 			g := graph.New()
-			mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+			mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 			for _, e := range entries {
 				_, err := mi.TrackRepoCtx(context.Background(), e)
 				require.NoError(t, err)

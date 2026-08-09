@@ -1046,7 +1046,7 @@ func TestSearchExploreSourceLiteralDoesNotCrossConfiguredRepository(t *testing.T
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	manager, err := config.NewConfigManager(configPath)
 	require.NoError(t, err)
-	multi := indexer.NewMultiIndexer(store, registry, search.NewAuto(), manager, zap.NewNop())
+	multi := indexer.NewMultiIndexer(store, registry, search.NewNull(), manager, zap.NewNop())
 	otherRoot := filepath.Join(t.TempDir(), "repo-a")
 	require.NoError(t, os.MkdirAll(otherRoot, 0o755))
 	_, err = multi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: otherRoot, Force: true})

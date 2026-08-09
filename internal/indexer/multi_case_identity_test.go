@@ -103,7 +103,7 @@ func TestScopeForCWD_CaseMismatchedWorkspaceRoot(t *testing.T) {
 	require.NoError(t, gc.Save())
 	cm, err := config.NewConfigManager(tmpCfg)
 	require.NoError(t, err)
-	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 

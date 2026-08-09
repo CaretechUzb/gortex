@@ -48,7 +48,7 @@ func coldOrchestrationRepos(t *testing.T, count int) []config.RepoEntry {
 }
 
 func newColdOrchestrationMulti(store graph.Store, logger *zap.Logger) *MultiIndexer {
-	return NewMultiIndexer(store, coldOrchestrationRegistry(), search.NewAuto(), nil, logger)
+	return NewMultiIndexer(store, coldOrchestrationRegistry(), search.NewNull(), nil, logger)
 }
 
 type coldOrchestrationProbeStore struct {

@@ -193,8 +193,8 @@ func TestShadowAdmissionIsProcessWideAcrossMultiIndexers(t *testing.T) {
 	g := graph.New()
 	reg := parser.NewRegistry()
 	logger := zap.NewNop()
-	first := NewMultiIndexer(g, reg, search.NewBM25(), nil, logger)
-	second := NewMultiIndexer(g, reg, search.NewBM25(), nil, logger)
+	first := NewMultiIndexer(g, reg, search.NewNull(), nil, logger)
+	second := NewMultiIndexer(g, reg, search.NewNull(), nil, logger)
 	standalone := New(g, reg, config.IndexConfig{}, logger)
 	if first.shadowAdmission == nil || first.shadowAdmission != second.shadowAdmission ||
 		first.shadowAdmission != standalone.shadowAdmission {

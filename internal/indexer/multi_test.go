@@ -51,7 +51,7 @@ func Hello() {}
 func TestNewMultiIndexer(t *testing.T) {
 	g := graph.New()
 	reg := newTestRegistry()
-	s := search.NewBM25()
+	s := search.NewNull()
 	cm := newTestConfigManager(t)
 
 	mi := NewMultiIndexer(g, reg, s, cm, zap.NewNop())
@@ -76,7 +76,7 @@ func TestMultiIndexer_IndexAll_SingleRepo(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	results, err := mi.IndexAll()
 	require.NoError(t, err)
@@ -122,7 +122,7 @@ func TestMultiIndexer_IndexAll_MultiRepo(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	results, err := mi.IndexAll()
 	require.NoError(t, err)
@@ -160,7 +160,7 @@ func TestMultiIndexer_IndexAll_SingleRepoLoadsWorkspaceExclude(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
@@ -196,7 +196,7 @@ func TestMultiIndexer_IndexAll_MultiRepoLoadsWorkspaceExclude(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
@@ -230,7 +230,7 @@ func TestMultiIndexer_IndexRepo(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
@@ -258,7 +258,7 @@ func TestMultiIndexer_IndexRepo(t *testing.T) {
 func TestMultiIndexer_IndexRepo_NotFound(t *testing.T) {
 	g := graph.New()
 	cm := newTestConfigManager(t)
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err := mi.IndexRepo("nonexistent")
 	assert.Error(t, err)
@@ -270,7 +270,7 @@ func TestMultiIndexer_TrackRepo(t *testing.T) {
 
 	g := graph.New()
 	cm := newTestConfigManager(t)
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	result, err := mi.TrackRepo(config.RepoEntry{Path: dir, Name: "tracked"})
 	require.NoError(t, err)
@@ -369,7 +369,7 @@ func TestMultiIndexer_TrackRepo_EmptyAfterPopulated(t *testing.T) {
 
 	g := graph.New()
 	cm := newTestConfigManager(t)
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	first, err := mi.TrackRepo(config.RepoEntry{Path: populated, Name: "populated"})
 	require.NoError(t, err)
@@ -408,7 +408,7 @@ func TestMultiIndexer_TrackRepo_EmptyAfterPopulated(t *testing.T) {
 func TestMultiIndexer_TrackRepo_InvalidPath(t *testing.T) {
 	g := graph.New()
 	cm := newTestConfigManager(t)
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err := mi.TrackRepo(config.RepoEntry{Path: "/nonexistent/path/xyz"})
 	assert.Error(t, err)
@@ -421,7 +421,7 @@ func TestMultiIndexer_TrackRepo_NotADirectory(t *testing.T) {
 
 	g := graph.New()
 	cm := newTestConfigManager(t)
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err := mi.TrackRepo(config.RepoEntry{Path: tmpFile})
 	assert.Error(t, err)
@@ -446,7 +446,7 @@ func TestMultiIndexer_UntrackRepo(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
@@ -470,7 +470,7 @@ func TestMultiIndexer_UntrackRepo(t *testing.T) {
 func TestMultiIndexer_UntrackRepo_NotFound(t *testing.T) {
 	g := graph.New()
 	cm := newTestConfigManager(t)
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	nodesRemoved, edgesRemoved := mi.UntrackRepo("nonexistent")
 	assert.Equal(t, 0, nodesRemoved)
@@ -495,7 +495,7 @@ func TestMultiIndexer_RepoForFile(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
@@ -522,7 +522,7 @@ func TestMultiIndexer_GetIndexer(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
@@ -535,7 +535,7 @@ func TestMultiIndexer_GetIndexer(t *testing.T) {
 func TestMultiIndexer_IndexAll_EmptyRepos(t *testing.T) {
 	cm := newTestConfigManager(t)
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	results, err := mi.IndexAll()
 	require.NoError(t, err)
@@ -589,7 +589,7 @@ func TestPropertyNodeIDFormat(t *testing.T) {
 			require.NoError(t, err)
 
 			g := graph.New()
-			mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+			mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 			results, err := mi.IndexAll()
 			require.NoError(t, err)
@@ -622,7 +622,7 @@ func TestPropertyNodeIDFormat(t *testing.T) {
 			require.NoError(t, err)
 
 			g := graph.New()
-			mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+			mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 			results, err := mi.IndexAll()
 			require.NoError(t, err)
@@ -697,7 +697,7 @@ func TestPropertyReindexIsolation(t *testing.T) {
 		require.NoError(t, err)
 
 		g := graph.New()
-		mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+		mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 		_, err = mi.IndexAll()
 		require.NoError(t, err)
@@ -782,7 +782,7 @@ func TestLoneRepo_ConfigCompat(t *testing.T) {
 		require.NoError(t, err)
 
 		g := graph.New()
-		mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+		mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 		_, err = mi.IndexAll()
 		require.NoError(t, err)
@@ -853,7 +853,7 @@ guards:
 		require.NoError(t, err)
 
 		g := graph.New()
-		mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+		mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 		_, err = mi.IndexAll()
 		require.NoError(t, err)
@@ -896,7 +896,7 @@ func TestGrowWorkspaceFromOneRepoToTwo(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
@@ -934,7 +934,7 @@ func TestGrowWorkspaceFromOneRepoToTwo(t *testing.T) {
 	require.NoError(t, err)
 
 	g2 := graph.New()
-	mi2 := NewMultiIndexer(g2, newTestRegistry(), search.NewBM25(), cm2, zap.NewNop())
+	mi2 := NewMultiIndexer(g2, newTestRegistry(), search.NewNull(), cm2, zap.NewNop())
 
 	results, err := mi2.IndexAll()
 	require.NoError(t, err)
@@ -974,7 +974,7 @@ func TestScopedReindexPreservesRepoMetadataFileCount(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 

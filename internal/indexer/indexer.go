@@ -668,13 +668,15 @@ func (d *vectorSearcherDelegate) SimilarTo(vec []float32, limit int) ([]graph.Ve
 // in its Swappable on construction. When the underlying store
 // implements graph.SymbolSearcher (today only store_sqlite), a
 // thin adapter routes Search calls through the store's native FTS
-// — the in-process BM25 build path is bypassed entirely. Otherwise
-// falls through to search.NewAuto's in-memory BM25 index.
+// — the in-process BM25 build path is bypassed entirely. Every other
+// store gets the null backend: it indexes nothing and reports an
+// empty corpus, so the query engine answers from its own substring
+// scan rather than from a second, in-process copy of the corpus.
 func initialSearchBackend(g graph.Store) search.Backend {
 	if s, ok := g.(graph.SymbolSearcher); ok {
 		return search.NewSymbolSearcherBackend(s)
 	}
-	return search.NewAuto()
+	return search.NewNull()
 }
 
 // isSymbolSearcherBackend reports whether the swappable's currently

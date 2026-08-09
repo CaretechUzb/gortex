@@ -65,7 +65,7 @@ func newContainedFixture(t *testing.T) containedFixture {
 	require.NoError(t, err)
 
 	g := graph.New()
-	bm := search.NewBM25()
+	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(g, testRegistry(), bm, cm, zap.NewNop())
 	_, err = mi.IndexScoped("", "")
 	require.NoError(t, err)

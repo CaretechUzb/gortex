@@ -353,7 +353,7 @@ func TestGitWatcher_NonASCIIFileBranchSwitch(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(repoDir)
 	_, err := idx.IndexCtx(testCtx(), repoDir)
 	require.NoError(t, err)
