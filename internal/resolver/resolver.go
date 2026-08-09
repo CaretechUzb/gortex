@@ -4101,8 +4101,19 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	// If the caller is a method on type X and there's a candidate method on
 	// type X with the same name, prefer it.  This handles e.extractFunctions()
 	// where the type env doesn't have a hint for parameter-bound receivers.
+	//
+	// C# member calls are exempt: a member_call edge still untyped here has
+	// an explicit receiver that is NOT this/base (those carry receiver_type
+	// from extraction) — a field, parameter, or an expression the tenv
+	// couldn't type. Whether the CALLER's class declares a same-named method
+	// says nothing about such a receiver, and on facade classes that wrap a
+	// same-named repository method this fallback bound the call to the
+	// calling method ITSELF (the PHP shield above exists for the identical
+	// failure). Leave the site for the extension/locality tiers and
+	// semantic enrichment.
+	memberCall, _ := e.Meta["member_call"].(bool)
 	callerNode := r.cachedGetNode(e.From)
-	if callerNode != nil && callerNode.Kind == graph.KindMethod {
+	if callerNode != nil && callerNode.Kind == graph.KindMethod && !memberCall {
 		callerRecv := nodeReceiverType(callerNode)
 		if callerRecv != "" {
 			// Same receiver type + same directory = very high confidence.
@@ -4160,6 +4171,13 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		// rule above; a locality guess must never pick one, which would
 		// misattribute `x.Foo()` to an unrelated extension named Foo.
 		if isCSharpExtension(c) {
+			continue
+		}
+		// A member call never locality-binds to the calling method itself:
+		// `x.Foo()` inside Foo is the facade shape wrapping a same-named
+		// member on x, not recursion — self-recursion through `this`
+		// carries receiver_type and resolves in the typed passes above.
+		if memberCall && c.ID == e.From {
 			continue
 		}
 		switch c.Kind {
