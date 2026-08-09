@@ -4510,7 +4510,8 @@ func (r *Resolver) buildReachabilityIndex() {
 // concrete From node when possible, otherwise leave that edge unfiltered. The
 // reachability filter is explicitly fail-open for an unknown caller path.
 func (r *Resolver) buildReachabilityIndexForPending(pending []*graph.Edge, sources map[string]*graph.Node) bool {
-	return r.buildReachabilityIndexForPendingCached(pending, sources, nil)
+	ok, _ := r.buildReachabilityIndexForPendingCached(pending, sources, nil)
+	return ok
 }
 
 // buildReachabilityIndexForPendingCached materialises direct-import
@@ -4525,11 +4526,26 @@ func (r *Resolver) buildReachabilityIndexForPending(pending []*graph.Edge, sourc
 // pathological inputs.
 const reachabilityStableFileCap = 1 << 16
 
+// reachabilityPageStats reports how much of one page's reachability build was
+// served from the pass-scoped stable retention and where the recompute time
+// went. Purely observational — prepare logs it so a cold run can show whether
+// unstable caller files dominate the per-page rebuild cost.
+type reachabilityPageStats struct {
+	files    int
+	cached   int
+	missing  int
+	unstable int
+	project  time.Duration
+	place    time.Duration
+	match    time.Duration
+}
+
 func (r *Resolver) buildReachabilityIndexForPendingCached(
 	pending []*graph.Edge,
 	sources map[string]*graph.Node,
 	stableByFile map[string]map[string]struct{},
-) bool {
+) (bool, reachabilityPageStats) {
+	var stats reachabilityPageStats
 	callerPaths := make(map[string]struct{})
 	missingCallerSet := make(map[string]struct{})
 	for _, edge := range pending {
@@ -4593,13 +4609,18 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 		dirs[filePath] = dir
 		if cached, ok := stableByFile[filePath]; ok {
 			reachable[filePath] = cached
+			stats.cached++
 			continue
 		}
 		reachable[filePath] = map[string]struct{}{dir: {}}
 		missingFiles = append(missingFiles, filePath)
 	}
 
+	stats.files = len(filePaths)
+	stats.missing = len(missingFiles)
+
 	importsByFile := make(map[string][]string)
+	projectStart := time.Now()
 	if len(missingFiles) > 0 {
 		if projector, ok := r.graph.(graph.ImportAdjacencyProjector); ok {
 			if projected, complete := projector.ProjectImportAdjacency(missingFiles); complete {
@@ -4611,6 +4632,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 			importsByFile = r.legacyImportTargetsByFile(missingFiles)
 		}
 	}
+	stats.project = time.Since(projectStart)
 
 	targetSet := make(map[string]struct{})
 	for _, filePath := range missingFiles {
@@ -4624,8 +4646,11 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 	for id := range targetSet {
 		targetIDs = append(targetIDs, id)
 	}
+	placeStart := time.Now()
 	targets := graph.NodePlacementsByIDs(r.graph, targetIDs)
+	stats.place = time.Since(placeStart)
 
+	matchStart := time.Now()
 	for _, filePath := range missingFiles {
 		stable := true
 		for _, targetID := range importsByFile[filePath] {
@@ -4653,11 +4678,14 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 		}
 		if stable {
 			stableByFile[filePath] = reachable[filePath]
+		} else {
+			stats.unstable++
 		}
 	}
+	stats.match = time.Since(matchStart)
 	r.reachableDirsByFile = reachable
 	r.dirByFilePath = dirs
-	return true
+	return true, stats
 }
 
 // legacyImportTargetsByFile preserves the ordinary Store path for in-memory

@@ -92,7 +92,7 @@ func TestReachabilityProjectionCapClearsPathologicalCache(t *testing.T) {
 	for i := 0; i <= reachabilityStableFileCap; i++ {
 		indexes.reachabilityFiles[fmt.Sprintf("bulk/file%06d.go", i)] = map[string]struct{}{"bulk": {}}
 	}
-	if !r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles) {
+	if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles); !ok {
 		t.Fatal("reachability build failed")
 	}
 	defer r.clearReachabilityIndex()
@@ -116,7 +116,7 @@ func TestReachabilityProjectionFallsBackForMalformedProvenance(t *testing.T) {
 		From: "repo/caller.go::Caller", To: graph.UnresolvedMarker + "Work",
 		Kind: graph.EdgeCalls, FilePath: "repo/caller.go",
 	}}
-	if !r.buildReachabilityIndexForPendingCached(pending, nil, make(map[string]map[string]struct{})) {
+	if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, make(map[string]map[string]struct{})); !ok {
 		t.Fatal("reachability was not built through compatibility fallback")
 	}
 	defer r.clearReachabilityIndex()

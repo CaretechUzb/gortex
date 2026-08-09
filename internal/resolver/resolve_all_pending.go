@@ -196,7 +196,7 @@ func (p *resolveAllPassIndexes) prepare(pending []*graph.Edge) map[string]*graph
 		providesElapsed = time.Since(start)
 	}
 	reachabilityStart := time.Now()
-	p.resolver.buildReachabilityIndexForPendingCached(pending, sources, p.reachabilityFiles)
+	_, reachStats := p.resolver.buildReachabilityIndexForPendingCached(pending, sources, p.reachabilityFiles)
 	reachabilityElapsed := time.Since(reachabilityStart)
 	p.generation = p.resolver.scratchGeneration
 	p.resolver.logger.Info("resolver: prepare page indexes",
@@ -207,6 +207,13 @@ func (p *resolveAllPassIndexes) prepare(pending []*graph.Edge) map[string]*graph
 		zap.Duration("ensure_dep", depElapsed),
 		zap.Duration("ensure_provides", providesElapsed),
 		zap.Duration("reachability", reachabilityElapsed),
+		zap.Int("reach_files", reachStats.files),
+		zap.Int("reach_cached", reachStats.cached),
+		zap.Int("reach_missing", reachStats.missing),
+		zap.Int("reach_unstable", reachStats.unstable),
+		zap.Duration("reach_project", reachStats.project),
+		zap.Duration("reach_place", reachStats.place),
+		zap.Duration("reach_match", reachStats.match),
 		zap.Duration("elapsed", time.Since(prepareStart)))
 	return sources
 }
