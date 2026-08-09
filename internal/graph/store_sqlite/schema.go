@@ -747,7 +747,7 @@ CREATE TABLE IF NOT EXISTS blame_enrichment (
 CREATE INDEX IF NOT EXISTS blame_by_repo ON blame_enrichment(repo_prefix) WHERE repo_prefix <> '';
 
 -- symbol_fts is the FTS5 full-text index over pre-tokenised symbol
--- names. It replaces the multi-GB in-heap Bleve/BM25 index with an
+-- names. It replaces the multi-GB in-heap BM25 index with an
 -- on-disk inverted index the SymbolSearcher / SymbolBundleSearcher
 -- query through. A standard (NOT contentless) FTS5 table; individual
 -- rows are deleted by their FTS5 docid via the symbol_fts_rowid sidecar

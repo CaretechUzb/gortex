@@ -604,8 +604,10 @@ type IndexConfig struct {
 	// SkipSearch is the effective text-index skip rules resolved from
 	// Semantic.SkipSearch, same propagation pattern as SkipEmbed.
 	// Users configure this under semantic.skip_search; the indexer
-	// reads it here. Controls what goes into BM25/Bleve — unlike
-	// SkipEmbed it doesn't affect the graph or vector index.
+	// reads it here. Controls what goes into the text search index
+	// (in-process BM25 in tests and evals, store-native FTS in
+	// production) — unlike SkipEmbed it doesn't affect the graph or
+	// vector index.
 	SkipSearch []SkipEmbedRule `mapstructure:"-" yaml:"-"`
 	// IndexProse is the effective prose-indexing toggle resolved from
 	// Search.IndexProse -- same `-` (not on-disk) propagation pattern
