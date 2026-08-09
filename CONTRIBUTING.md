@@ -236,7 +236,7 @@ internal/
   query/             Query engine (BFS traversal, SubGraph)
   resolver/          Cross-file reference resolution, IMPLEMENTS inference
   review/            PR review and diff analysis pipeline
-  search/            BM25, trigram, and semantic search
+  search/            FTS adapter, trigram, and semantic search
   server/            HTTP transports and the web dashboard
 ```
 

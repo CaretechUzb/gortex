@@ -11,14 +11,15 @@ import (
 // SymbolSearcherBackend adapts a graph.SymbolSearcher into the
 // search.Backend the daemon's search-symbols path consumes.
 // Engine.gatherBackendCandidates and the rerank pipeline don't need
-// to know whether the backend is BM25 or native FTS — they
-// see a plain search.Backend and call Search on it.
+// to know where the ranking comes from — they see a plain
+// search.Backend and call Search on it.
 //
 // Production wiring: when the indexer detects that the backing
 // graph.Store also implements graph.SymbolSearcher, it constructs
-// this adapter as the initial
-// search.Backend wrapped by search.NewSwappable. The in-process
-// BM25 build path is then bypassed entirely.
+// this adapter as the initial search.Backend wrapped by
+// search.NewSwappable. A store without that capability gets
+// NullBackend instead, and the engine falls back to its substring
+// scan — no text index is ever built in this process.
 //
 // Add / Remove are no-ops on the adapter because the indexer
 // already drives the SymbolSearcher writes directly:

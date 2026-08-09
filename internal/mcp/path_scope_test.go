@@ -120,11 +120,19 @@ func TestResolvePathFilter_Sources(t *testing.T) {
 func pathScopeServer(t *testing.T) *Server {
 	t.Helper()
 	g := graph.New()
-	bm := search.NewBM25()
+	// Every symbol is retrievable by its whole name and by each of the
+	// camelCase words in it, so the queries below reach all three and
+	// only the path filter can confine the result.
+	ob := newOrderedBackend()
 	files := map[string]string{
 		"services/billing/Invoice.go": "BillingInvoice",
 		"services/auth/Login.go":      "AuthLogin",
 		"libs/money/Amount.go":        "MoneyAmount",
+	}
+	tokens := map[string][]string{
+		"BillingInvoice": {"billinginvoice", "billing", "invoice"},
+		"AuthLogin":      {"authlogin", "auth", "login"},
+		"MoneyAmount":    {"moneyamount", "money", "amount"},
 	}
 	for path, name := range files {
 		id := path + "::" + name
@@ -132,10 +140,12 @@ func pathScopeServer(t *testing.T) *Server {
 			ID: id, Kind: graph.KindFunction, Name: name,
 			FilePath: path, StartLine: 1, EndLine: 5, Language: "go",
 		})
-		bm.Add(id, name, path, "")
+		for _, tok := range tokens[name] {
+			ob.put(tok, id)
+		}
 	}
 	eng := query.NewEngine(g)
-	eng.SetSearch(bm)
+	eng.SetSearch(ob)
 	return NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 }
 

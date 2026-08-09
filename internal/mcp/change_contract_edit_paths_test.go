@@ -106,7 +106,7 @@ func setupContractMultiRepoServer(t *testing.T, names ...string) (*Server, *grap
 	require.NoError(t, err)
 
 	g := graph.New()
-	multi := indexer.NewMultiIndexer(g, testRegistry(), search.NewBM25(), manager, zap.NewNop())
+	multi := indexer.NewMultiIndexer(g, testRegistry(), search.NewNull(), manager, zap.NewNop())
 	_, err = multi.IndexAll()
 	require.NoError(t, err)
 

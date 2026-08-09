@@ -33,9 +33,8 @@ order of operations."
    `parser.ExtractionResult`; `Indexer.processExtraction` writes
    them into the `graph.Graph` and accumulates incoming-edge
    tracking for the next phase.
-4. `Indexer.buildSearchIndex` (in-process BM25 in tests and evals,
-   store-native FTS in production) + `idx.embedder` (if set)
-   populate the search backends.
+4. `Indexer.buildSearchIndex` (the store-native FTS) +
+   `idx.embedder` (if set) populate the search backends.
 5. Semantic enrichment (`internal/semantic`) runs LSP / SCIP
    providers in parallel; resolved edges get
    `Origin=lsp_resolved` for tier filtering.

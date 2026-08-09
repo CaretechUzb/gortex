@@ -16,7 +16,7 @@ import (
 // reranking every identifier query. Enable it with
 // GORTEX_FTS_STEMMING=1 (also true / yes / on).
 //
-// Read once at process start, like the bigram-typo flag: the index
+// Read once at process start: the index
 // built during a daemon's lifetime and every query against it share a
 // single setting, so a mid-session toggle can't desynchronise stemmed
 // postings from stemmed query terms. When enabled, the same
@@ -47,11 +47,11 @@ var ftsStopWords = map[string]struct{}{
 	"it": {}, "its": {}, "so": {}, "such": {}, "via": {}, "per": {},
 }
 
-// NormalizeFTSTokens applies the FR63 stopword filter and Porter stemmer
-// to a token list produced by Tokenize / TokenizeQuery. The index path
-// (BM25Backend.Add) and the query path (BM25Backend.Search) both
-// call it, so a stemmed
-// posting list is always probed with stemmed query terms.
+// NormalizeFTSTokens applies the stopword filter and Porter stemmer to
+// a token list produced by Tokenize / TokenizeQuery. Every producer of
+// FTS terms routes through it — both the tokens written into the index
+// and the tokens a query is lowered into — so a stemmed posting list is
+// always probed with stemmed query terms.
 //
 // Stopwords are dropped before stemming so a stemmed form can never
 // collide with a stopword entry. The result is a freshly allocated

@@ -29,7 +29,7 @@ func newLifecycleTestMultiIndexer(t *testing.T) *MultiIndexer {
 	return NewMultiIndexer(
 		graph.New(),
 		newTestRegistry(),
-		search.NewBM25(),
+		search.NewNull(),
 		newTestConfigManager(t),
 		zap.NewNop(),
 	)

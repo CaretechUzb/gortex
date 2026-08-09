@@ -9,11 +9,11 @@ import (
 	"github.com/zzet/gortex/internal/search/rerank"
 )
 
-// HybridBackend combines text search (BM25 or the store-native FTS
-// adapter) with vector search (HNSW) using query-adaptive, α-weighted
-// Reciprocal Rank Fusion (RRF). Identifier-shaped queries lean toward BM25,
-// where exact-token matches are most reliable; natural-language queries give
-// semantic similarity more weight so synonymous wording can surface.
+// HybridBackend combines text search (the store-native FTS adapter)
+// with vector search (HNSW) using query-adaptive, α-weighted
+// Reciprocal Rank Fusion (RRF). Identifier-shaped queries lean toward the
+// text channel, where exact-token matches are most reliable; natural-language
+// queries give semantic similarity more weight so synonymous wording can surface.
 type HybridBackend struct {
 	text     Backend
 	vector   *VectorBackend
@@ -50,7 +50,7 @@ func (h *HybridBackend) Remove(id string) {
 }
 
 // Search runs both text and vector search and fuses them with adaptive
-// α-weighted RRF. Identifier queries lean toward BM25; natural-language
+// α-weighted RRF. Identifier queries lean toward text search; natural-language
 // queries give semantic similarity more weight.
 func (h *HybridBackend) Search(query string, limit int) []SearchResult {
 	textResults, vecIDs, _ := h.searchChannels(query, limit)
@@ -63,7 +63,7 @@ func (h *HybridBackend) Search(query string, limit int) []SearchResult {
 	return alphaFuse(textResults, vecIDs, rerank.AlphaFor(query), h.k, limit)
 }
 
-// SearchChannels returns the raw per-channel results — BM25 ranks
+// SearchChannels returns the raw per-channel results — text ranks
 // (with scores) and the parallel vector-search ID list — without
 // RRF fusion. The rerank pipeline calls this so each channel can
 // contribute as a separate Signal instead of being collapsed into a
@@ -83,7 +83,7 @@ type ChannelTimings struct {
 }
 
 // VectorChannelOnly returns the vector-channel IDs (embedder + ANN
-// search) WITHOUT re-running the text BM25 path. Used by the engine
+// search) WITHOUT re-running the text search. Used by the engine
 // when the text channel has already been satisfied via the bundle
 // path — the bundle returns Nodes + edges + scores already, so
 // re-running text Search would double-pay the FTS cost. Returns
@@ -112,7 +112,7 @@ func (h *HybridBackend) VectorChannelOnly(query string, limit int) ([]string, Ch
 }
 
 // SearchChannelsTimed is SearchChannels with a per-phase timing
-// breakdown so callers can prove which sub-step (text BM25 vs
+// breakdown so callers can prove which sub-step (text FTS vs
 // vector embed vs vector ANN) actually cost wall-clock time.
 // Used by the MCP search_symbols handler's debug-log
 // instrumentation; production callers that don't care just use
@@ -131,7 +131,7 @@ func (h *HybridBackend) SearchChannelsTimed(query string, limit int) ([]SearchRe
 // HybridBackend wires both channels together in production, so the
 // engine's bundle-detection step type-asserts on the outer
 // HybridBackend through Swappable; this is what makes the bundle
-// path available when the daemon's search is the BM25 + vector
+// path available when the daemon's search is the FTS + vector
 // stack instead of a bare SymbolSearcherBackend.
 func (h *HybridBackend) SearchSymbolBundles(query string, limit int) []SymbolBundle {
 	if h == nil || h.text == nil {
@@ -275,9 +275,9 @@ func (h *HybridBackend) VectorSizeBytes() uint64 { return h.vector.SizeBytes() }
 // alphaFuse combines text and vector results with an α-weighted blend
 // of their reciprocal-rank contributions. Higher α gives the vector
 // channel more weight (good for natural-language queries where
-// semantic similarity catches synonyms); lower α gives BM25 more
-// weight (good for identifier queries where exact-token matches are
-// the most reliable signal).
+// semantic similarity catches synonyms); lower α gives the text channel
+// more weight (good for identifier queries where exact-token matches
+// are the most reliable signal).
 //
 // Formula:
 //

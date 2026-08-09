@@ -589,15 +589,14 @@ type IndexConfig struct {
 	// SkipSearch is the effective text-index skip rules resolved from
 	// Semantic.SkipSearch, same propagation pattern as SkipEmbed.
 	// Users configure this under semantic.skip_search; the indexer
-	// reads it here. Controls what goes into the text search index
-	// (in-process BM25 in tests and evals, store-native FTS in
-	// production) — unlike SkipEmbed it doesn't affect the graph or
+	// reads it here. Controls what goes into the store-native FTS
+	// text index — unlike SkipEmbed it doesn't affect the graph or
 	// vector index.
 	SkipSearch []SkipEmbedRule `mapstructure:"-" yaml:"-"`
 	// IndexProse is the effective prose-indexing toggle resolved from
 	// Search.IndexProse -- same `-` (not on-disk) propagation pattern
 	// as SkipSearch. When false, Markdown KindDoc prose-section nodes
-	// are kept out of the BM25 search index. Defaults to true.
+	// are kept out of the text search index. Defaults to true.
 	IndexProse bool `mapstructure:"-" yaml:"-"`
 	// MaxFileSize skips files larger than this during indexing. Zero
 	// (the default) disables the cap — full coverage is preferred so

@@ -21,10 +21,9 @@ import (
 type Candidate struct {
 	Node *graph.Node
 
-	// TextRank is the 0-based BM25 rank. -1 means the candidate did
-	// not appear in the text-search result list (e.g. a substring or
-	// bigram-rescue fallback hit, or a candidate added by another
-	// retrieval channel).
+	// TextRank is the 0-based text-search rank. -1 means the candidate
+	// did not appear in the text-search result list (e.g. a substring
+	// fallback hit, or a candidate added by another retrieval channel).
 	TextRank int
 	// VectorRank is the 0-based vector-search rank. -1 means absent.
 	VectorRank int

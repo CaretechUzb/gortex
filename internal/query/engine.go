@@ -16,7 +16,8 @@ import (
 
 // SearchProvider is a function that returns the current search backend.
 // This allows the engine to always use the latest backend even when the
-// indexer replaces it (e.g., wrapping BM25 in HybridBackend for embeddings).
+// indexer replaces it (e.g., wrapping the text backend in HybridBackend
+// for embeddings).
 type SearchProvider func() search.Backend
 
 // Engine provides higher-level query operations over the graph.
@@ -492,9 +493,8 @@ func (e *Engine) GetCluster(nodeID string, opts QueryOptions) *SubGraph {
 
 // SearchSymbols performs full-text search across all nodes.
 // When a search backend is configured, uses that backend's ranking —
-// the in-process BM25 index in tests and evals, the store-native FTS
-// index in production — with camelCase-aware tokenization. Falls back
-// to substring matching otherwise.
+// the store-native FTS index — with camelCase-aware tokenization.
+// Falls back to substring matching otherwise.
 func (e *Engine) SearchSymbols(query string, limit int) []*graph.Node {
 	return e.SearchSymbolsScoped(query, limit, QueryOptions{})
 }
@@ -682,9 +682,9 @@ func repoAllowList(allow map[string]bool) []string {
 	return out
 }
 
-// gatherBackendCandidates fetches BM25 + (optional) vector results,
+// gatherBackendCandidates fetches text + (optional) vector results,
 // dedups them across channels, and supplements with exact-name /
-// substring / bigram-rescue matches. Each candidate carries its
+// substring matches. Each candidate carries its
 // 0-based TextRank and VectorRank (or -1 when the channel didn't
 // return it) so the rerank pipeline can score per channel.
 //

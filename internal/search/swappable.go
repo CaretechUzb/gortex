@@ -230,7 +230,7 @@ func (s *Swappable) SearchSymbolBundlesScoped(query string, repoAllow []string, 
 
 // VectorChannelOnly forwards to the inner backend when it implements
 // the vector-only channel pull (today: HybridBackend). Lets the
-// engine fetch the vector channel without re-running text BM25 —
+// engine fetch the vector channel without re-running the text search —
 // the bundle path already has the text hits. Returns (nil, zero
 // timings) when the inner backend isn't vector-aware.
 func (s *Swappable) VectorChannelOnly(query string, limit int) ([]string, ChannelTimings) {

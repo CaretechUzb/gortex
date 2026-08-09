@@ -1,10 +1,16 @@
 // Package search provides full-text search over code symbols with
-// camelCase/snake_case-aware tokenization and BM25 ranking.
+// camelCase/snake_case-aware tokenization.
 //
-// Production search runs on SymbolSearcherBackend, a thin adapter over
-// the graph store's own FTS index — no parallel in-process corpus.
-// A store that exposes no native symbol search gets NullBackend, whose
-// empty corpus routes the query engine to its substring fallback.
+// The package owns no text index of its own. Search runs on
+// SymbolSearcherBackend, a thin adapter over the graph store's own FTS
+// index, and this package contributes the tokenization and query
+// normalization both sides of that index agree on. A store that
+// exposes no native symbol search gets NullBackend, whose empty corpus
+// routes the query engine to its substring fallback.
+//
+// HybridBackend layers the optional vector channel on top of whichever
+// text Backend it is given; Swappable lets the indexer replace the
+// backend under a live engine.
 package search
 
 // SearchResult is a single search hit.
@@ -33,10 +39,10 @@ type Backend interface {
 
 // ChannelSearcher is an optional interface a Backend can implement to
 // expose its per-channel raw retrieval output. The rerank pipeline
-// queries it so BM25 and semantic (vector) ranks can contribute as
+// queries it so text and semantic (vector) ranks can contribute as
 // separate signals instead of being collapsed via RRF before scoring.
-// Backends that only do text search (BM25, the store-native FTS
-// adapter) don't satisfy this interface; callers fall through to plain
+// Backends that only do text search (the store-native FTS adapter)
+// don't satisfy this interface; callers fall through to plain
 // Search().
 type ChannelSearcher interface {
 	SearchChannels(query string, limit int) (textResults []SearchResult, vectorIDs []string)
