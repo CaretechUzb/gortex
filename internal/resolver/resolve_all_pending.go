@@ -228,6 +228,7 @@ func (p *resolveAllPassIndexes) prepare(pending []*graph.Edge) map[string]*graph
 		zap.Int("reach_cached", reachStats.cached),
 		zap.Int("reach_missing", reachStats.missing),
 		zap.Int("reach_unstable", reachStats.unstable),
+		zap.Int("reach_adj_cached", reachStats.adjCached),
 		zap.Duration("reach_project", reachStats.project),
 		zap.Duration("reach_place", reachStats.place),
 		zap.Duration("reach_match", reachStats.match),
