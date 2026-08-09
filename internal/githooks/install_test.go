@@ -26,9 +26,9 @@ func initRepo(t *testing.T) string {
 	return tmp
 }
 
-func TestInstallPostCommit_FreshFile(t *testing.T) {
+func TestInstallHookPostCommit_FreshFile(t *testing.T) {
 	repo := initRepo(t)
-	path, err := InstallPostCommit(repo, InstallOpts{RegenMermaid: true, RegenWiki: true, Binary: "gortex"})
+	path, err := InstallHook(repo, "post-commit", InstallOpts{RegenMermaid: true, RegenWiki: true, Binary: "gortex"})
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
@@ -57,33 +57,35 @@ func TestInstallPostCommit_FreshFile(t *testing.T) {
 	}
 }
 
-func TestInstallPostCommit_Idempotent(t *testing.T) {
+func TestInstallHookPostCommit_Idempotent(t *testing.T) {
 	repo := initRepo(t)
 	for i := range 3 {
-		if _, err := InstallPostCommit(repo, InstallOpts{RegenMermaid: true}); err != nil {
+		if _, err := InstallHook(repo, "post-commit", InstallOpts{RegenMermaid: true}); err != nil {
 			t.Fatalf("install %d: %v", i, err)
 		}
 	}
-	rep, err := Status(repo)
+	hookPath, err := HookPathFor(repo, "post-commit")
 	if err != nil {
-		t.Fatalf("Status: %v", err)
+		t.Fatalf("HookPathFor: %v", err)
 	}
-	if !rep.Managed {
-		t.Error("after install, status should report managed")
+	body, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
 	}
-	if c := strings.Count(rep.Body, MarkerBegin); c != 1 {
+	got := string(body)
+	if c := strings.Count(got, MarkerBegin); c != 1 {
 		t.Errorf("expected one MarkerBegin, got %d", c)
 	}
-	if c := strings.Count(rep.Body, MarkerEnd); c != 1 {
+	if c := strings.Count(got, MarkerEnd); c != 1 {
 		t.Errorf("expected one MarkerEnd, got %d", c)
 	}
 }
 
-func TestInstallPostCommit_PreservesUserContent(t *testing.T) {
+func TestInstallHookPostCommit_PreservesUserContent(t *testing.T) {
 	repo := initRepo(t)
-	hookPath, err := HookPath(repo)
+	hookPath, err := HookPathFor(repo, "post-commit")
 	if err != nil {
-		t.Fatalf("HookPath: %v", err)
+		t.Fatalf("HookPathFor: %v", err)
 	}
 	preexisting := `#!/bin/sh
 # my custom hook
@@ -92,7 +94,7 @@ echo "hello from user hook"
 	if err := os.WriteFile(hookPath, []byte(preexisting), 0o755); err != nil {
 		t.Fatalf("write preexisting: %v", err)
 	}
-	if _, err := InstallPostCommit(repo, InstallOpts{RegenMermaid: true}); err != nil {
+	if _, err := InstallHook(repo, "post-commit", InstallOpts{RegenMermaid: true}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 	body, err := os.ReadFile(hookPath)
@@ -108,11 +110,11 @@ echo "hello from user hook"
 	}
 }
 
-func TestUninstallPostCommit_RemovesBlock(t *testing.T) {
+func TestUninstallHookPostCommit_RemovesBlock(t *testing.T) {
 	repo := initRepo(t)
-	hookPath, err := HookPath(repo)
+	hookPath, err := HookPathFor(repo, "post-commit")
 	if err != nil {
-		t.Fatalf("HookPath: %v", err)
+		t.Fatalf("HookPathFor: %v", err)
 	}
 	preexisting := `#!/bin/sh
 # my custom hook
@@ -121,10 +123,10 @@ echo "hello"
 	if err := os.WriteFile(hookPath, []byte(preexisting), 0o755); err != nil {
 		t.Fatalf("write preexisting: %v", err)
 	}
-	if _, err := InstallPostCommit(repo, InstallOpts{RegenWiki: true}); err != nil {
+	if _, err := InstallHook(repo, "post-commit", InstallOpts{RegenWiki: true}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	path, removed, err := UninstallPostCommit(repo)
+	path, removed, err := UninstallHook(repo, "post-commit")
 	if err != nil {
 		t.Fatalf("Uninstall: %v", err)
 	}
@@ -147,12 +149,12 @@ echo "hello"
 	}
 }
 
-func TestUninstallPostCommit_RemovesFileWhenStubOnly(t *testing.T) {
+func TestUninstallHookPostCommit_RemovesFileWhenStubOnly(t *testing.T) {
 	repo := initRepo(t)
-	if _, err := InstallPostCommit(repo, InstallOpts{RegenMermaid: true}); err != nil {
+	if _, err := InstallHook(repo, "post-commit", InstallOpts{RegenMermaid: true}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	path, removed, err := UninstallPostCommit(repo)
+	path, removed, err := UninstallHook(repo, "post-commit")
 	if err != nil {
 		t.Fatalf("Uninstall: %v", err)
 	}
@@ -164,9 +166,9 @@ func TestUninstallPostCommit_RemovesFileWhenStubOnly(t *testing.T) {
 	}
 }
 
-func TestUninstallPostCommit_Noop(t *testing.T) {
+func TestUninstallHookPostCommit_Noop(t *testing.T) {
 	repo := initRepo(t)
-	path, removed, err := UninstallPostCommit(repo)
+	path, removed, err := UninstallHook(repo, "post-commit")
 	if err != nil {
 		t.Fatalf("Uninstall: %v", err)
 	}
@@ -175,20 +177,6 @@ func TestUninstallPostCommit_Noop(t *testing.T) {
 	}
 	if path == "" {
 		t.Error("Uninstall should still return resolved hook path")
-	}
-}
-
-func TestStatus_NewRepo(t *testing.T) {
-	repo := initRepo(t)
-	rep, err := Status(repo)
-	if err != nil {
-		t.Fatalf("Status: %v", err)
-	}
-	if rep.Exists {
-		t.Error("fresh repo shouldn't have a hook")
-	}
-	if rep.Managed {
-		t.Error("fresh repo shouldn't be managed")
 	}
 }
 
@@ -264,7 +252,7 @@ func TestInstallHook_RejectsUnsupportedHook(t *testing.T) {
 	}
 }
 
-func TestHookPath_HonoursCoreHooksPath(t *testing.T) {
+func TestHookPathFor_HonoursCoreHooksPath(t *testing.T) {
 	repo := initRepo(t)
 	customHooks := filepath.Join(repo, "custom-hooks")
 	if err := os.MkdirAll(customHooks, 0o755); err != nil {
@@ -275,12 +263,12 @@ func TestHookPath_HonoursCoreHooksPath(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("config core.hooksPath: %v: %s", err, out)
 	}
-	path, err := HookPath(repo)
+	path, err := HookPathFor(repo, "post-commit")
 	if err != nil {
-		t.Fatalf("HookPath: %v", err)
+		t.Fatalf("HookPathFor: %v", err)
 	}
 	if filepath.Dir(path) != customHooks {
-		t.Errorf("HookPath should honour core.hooksPath, got %q under %q (want %q)",
+		t.Errorf("HookPathFor should honour core.hooksPath, got %q under %q (want %q)",
 			path, filepath.Dir(path), customHooks)
 	}
 }
