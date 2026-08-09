@@ -329,9 +329,7 @@ type Indexer struct {
 	semanticMgr *semantic.Manager
 
 	// resolverLSPHelper, when non-nil, is the resolve-time LSP
-	// helper installed on idx.resolver. Held here so MultiIndexer
-	// can mirror it onto the global post-pass resolver in
-	// RunDeferredPassesAll. See SetResolverLSPHelper.
+	// helper installed on idx.resolver. See SetResolverLSPHelper.
 	resolverLSPHelper resolver.LSPHelper
 
 	// npmAliasOnce builds npmAlias lazily on the first resolve-time
@@ -1655,11 +1653,6 @@ func (idx *Indexer) SetResolverLSPHelper(h resolver.LSPHelper) {
 	}
 	idx.resolverLSPHelper = h
 }
-
-// ResolverLSPHelper returns the currently installed resolver-time LSP
-// helper, or nil. Exported so MultiIndexer can mirror the helper onto
-// the global post-pass resolver in RunDeferredPassesAll.
-func (idx *Indexer) ResolverLSPHelper() resolver.LSPHelper { return idx.resolverLSPHelper }
 
 // prefixPath prepends the repoPrefix to a relative path when in multi-repo mode.
 // Returns the path unchanged when repoPrefix is empty.
