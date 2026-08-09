@@ -691,20 +691,13 @@ func impactMetaString(m map[string]any, key string) string {
 	return v
 }
 
-// CommunityCoupling describes the coupling between two communities.
-type CommunityCoupling struct {
-	CommunityA     string  `json:"community_a"`
-	CommunityB     string  `json:"community_b"`
-	LabelA         string  `json:"label_a"`
-	LabelB         string  `json:"label_b"`
-	CouplingScore  float64 `json:"coupling_score"`
-	TightlyCoupled bool    `json:"tightly_coupled"`
-}
-
 // CrossCommunityWarning describes cross-community impact.
+//
+// It carries the affected community names and nothing else on purpose: the
+// mandatory impact path must never perform a graph-wide coupling scan, so
+// there is deliberately no field here for per-pair coupling scores.
 type CrossCommunityWarning struct {
-	AffectedCommunities []string            `json:"affected_communities"`
-	Couplings           []CommunityCoupling `json:"couplings,omitempty"`
+	AffectedCommunities []string `json:"affected_communities"`
 }
 
 // computeCrossCommunityWarning names the communities a change reaches.
