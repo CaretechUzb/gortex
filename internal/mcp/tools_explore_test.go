@@ -13,7 +13,6 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
-	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/search/rerank"
 )
 
@@ -812,7 +811,14 @@ func TestExploreHelpers(t *testing.T) {
 // repeated same-name leaves must not crowd out a differently-named code target.
 func TestFacadeExploreDemotesRepeatedDataLeafNames(t *testing.T) {
 	g := graph.New()
-	bm := search.NewBM25()
+	// Retrieval ordering, stated rather than ranked: every query in this
+	// fixture retrieves the 30 short exact-name `client` declarations
+	// first and the differently-named callable last. That is the shape a
+	// ranker produces for this task -- the literal name matches win the
+	// head, the callable that actually explains the area matches on prose
+	// and lands behind them -- and it is the shape explore's over-fetch
+	// window must retain so name diversification can promote it.
+	ob := newOrderedBackend()
 	for i := 0; i < 30; i++ {
 		id := fmt.Sprintf("pkg/service%d.go::client", i)
 		n := &graph.Node{
@@ -821,7 +827,7 @@ func TestFacadeExploreDemotesRepeatedDataLeafNames(t *testing.T) {
 			Meta: map[string]any{"signature": "var client *Transport"},
 		}
 		g.AddNode(n)
-		bm.Add(id, n.Name, n.FilePath, "trace client coordinated transport")
+		ob.putDefault(id)
 	}
 	relevant := &graph.Node{
 		ID: "pkg/coordinator.go::TransportCoordinator", Name: "TransportCoordinator",
@@ -829,14 +835,10 @@ func TestFacadeExploreDemotesRepeatedDataLeafNames(t *testing.T) {
 		Meta: map[string]any{"signature": "func TransportCoordinator()"},
 	}
 	g.AddNode(relevant)
-	// It matches the whole task, but its longer prose and non-literal symbol
-	// name rank below the short exact-name `client` declarations. The concept
-	// over-fetch window must retain it so name diversification can promote it.
-	relevantText := strings.Repeat("architecture routing plumbing lifecycle ", 40) + "trace client coordinated transport coordinator"
-	bm.Add(relevant.ID, relevant.Name, relevant.FilePath, relevantText)
+	ob.putDefault(relevant.ID)
 
 	eng := query.NewEngine(g)
-	eng.SetSearch(bm)
+	eng.SetSearch(ob)
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 	task := "trace how the client is coordinated"
 	searchQuery := shapeExploreQuery(task)
