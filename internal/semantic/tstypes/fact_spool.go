@@ -385,6 +385,106 @@ WHERE file_path = ? ORDER BY class`, facts.file)
 	return page, last, stats, nil
 }
 
+// pageClass reads a deterministic keyset page of one fact class. Every
+// returned fileFacts carries that class plus the file's imports — buildIndex
+// needs the import map in every phase. Files without facts of the class have
+// no row and are skipped wholesale.
+func (s *factSpool) pageClass(ctx context.Context, class factClass, after string) ([]*fileFacts, string, factPageStats, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT file_path,repo_prefix,payload FROM file_facts
+WHERE class = ? AND file_path > ? ORDER BY file_path LIMIT ?`, int(class), after, tstypesFactPageFiles)
+	if err != nil {
+		return nil, after, factPageStats{}, err
+	}
+	page := make([]*fileFacts, 0, tstypesFactPageFiles)
+	stats := factPageStats{}
+	last := after
+	for rows.Next() {
+		var filePath, repoPrefix string
+		var payload []byte
+		if err := rows.Scan(&filePath, &repoPrefix, &payload); err != nil {
+			_ = rows.Close()
+			return nil, last, stats, err
+		}
+		if len(page) > 0 && stats.Bytes+len(payload) > tstypesFactPageBytes {
+			break
+		}
+		facts := &fileFacts{file: filePath, repoPrefix: repoPrefix}
+		if err := unmarshalClassPayload(facts, class, payload); err != nil {
+			_ = rows.Close()
+			return nil, last, stats, fmt.Errorf("decode facts for %s: %w", filePath, err)
+		}
+		page = append(page, facts)
+		last = filePath
+		stats.Files++
+		stats.Bytes += len(payload)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, last, stats, err
+	}
+	if class != classImports && len(page) > 0 {
+		if err := s.attachImports(ctx, page); err != nil {
+			return nil, last, stats, err
+		}
+	}
+	for _, facts := range page {
+		stats.Facts += len(facts.imports) + len(facts.calls) + len(facts.supers) + len(facts.metas) + len(facts.aliases)
+	}
+	return page, last, stats, nil
+}
+
+// attachImports hydrates the page files' imports rows in one bounded IN query.
+func (s *factSpool) attachImports(ctx context.Context, page []*fileFacts) error {
+	byFile := make(map[string]*fileFacts, len(page))
+	args := make([]any, 0, len(page)+1)
+	args = append(args, int(classImports))
+	for _, facts := range page {
+		byFile[facts.file] = facts
+		args = append(args, facts.file)
+	}
+	placeholders := strings.Repeat(",?", len(page))[1:]
+	rows, err := s.db.QueryContext(ctx, `SELECT file_path,payload FROM file_facts
+WHERE class = ? AND file_path IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var filePath string
+		var payload []byte
+		if err := rows.Scan(&filePath, &payload); err != nil {
+			return err
+		}
+		if facts := byFile[filePath]; facts != nil {
+			if err := unmarshalClassPayload(facts, classImports, payload); err != nil {
+				return fmt.Errorf("decode imports for %s: %w", filePath, err)
+			}
+		}
+	}
+	return rows.Err()
+}
+
+// pageFiles lists staged files as bare stubs for the coverage walk — no
+// payload touched anywhere.
+func (s *factSpool) pageFiles(ctx context.Context, after string) ([]*fileFacts, string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT file_path,repo_prefix FROM files
+WHERE file_path > ? ORDER BY file_path LIMIT ?`, after, tstypesFactPageFiles)
+	if err != nil {
+		return nil, after, err
+	}
+	defer rows.Close()
+	page := make([]*fileFacts, 0, tstypesFactPageFiles)
+	last := after
+	for rows.Next() {
+		var filePath, repoPrefix string
+		if err := rows.Scan(&filePath, &repoPrefix); err != nil {
+			return nil, last, err
+		}
+		page = append(page, &fileFacts{file: filePath, repoPrefix: repoPrefix})
+		last = filePath
+	}
+	return page, last, rows.Err()
+}
+
 func (s *factSpool) appendAliases(records []stagedResolvedAlias) error {
 	if len(records) == 0 {
 		return nil
