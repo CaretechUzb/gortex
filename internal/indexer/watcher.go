@@ -730,10 +730,22 @@ func (w *Watcher) mergeInitialReplayEvent(events map[string]fswatcher.WatchEvent
 
 // reconcileInitialReplayThroughMarkers closes the Darwin FSEvents startup
 // ordering gap without scanning the repository. Each watched root gets one
-// ignored marker after the quiet drain. FSEvents preserves order within a
-// root stream, so observing that marker proves every earlier replay event for
-// the root has reached this channel. Only paths actually observed in that tail
-// are deduplicated and reconciled before Start returns.
+// ignored marker after the quiet drain. FSEvents preserves order within a root
+// stream, so observing that marker means every earlier replay event for the
+// root has reached this channel. Only paths actually observed in that tail are
+// deduplicated and reconciled before Start returns.
+//
+// That ordering holds at the OS boundary, not all the way to this channel: the
+// backend aggregates by path in a map and flushes by ranging it, so events
+// sharing a flush cycle with the marker are emitted in map order and the
+// marker can in principle be emitted first. Do not build on this barrier as a
+// strict happens-before. It is safe because the failure is benign — an
+// overtaken event is still delivered, and loop() reindexes it a moment later
+// through the ordinary path, losing only the batched receipt lookup for that
+// one path. Measured on macOS 26: the stream is created SinceNow, so there is
+// no synthetic replay burst to overtake (one event reaches this channel during
+// a normal start — our own marker), and 500 writes issued immediately before
+// the marker settled before Start returned in every one of 12 runs.
 func (w *Watcher) reconcileInitialReplayThroughMarkers(
 	roots []string,
 	timeout time.Duration,
