@@ -10,7 +10,7 @@ Manages the full container lifecycle for a single eval instance:
 
 Architecture:
   Agent bash cmd → /usr/local/bin/gortex-search → curl localhost:4747/tool/search_symbols
-    → eval-server → in-memory graph
+    → eval-server → graph store
   Fallback: → gortex CLI (cold path)
 """
 

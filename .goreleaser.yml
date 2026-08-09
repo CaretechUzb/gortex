@@ -127,7 +127,7 @@ nfpms:
     vendor: "zzet"
     homepage: "https://github.com/zzet/gortex"
     maintainer: "zzet"
-    description: "Code intelligence engine that indexes repositories into an in-memory knowledge graph."
+    description: "Code intelligence engine that indexes repositories into a knowledge graph."
     license: "Custom"
 
 # NOTE: the homebrew cask is NOT generated here. goreleaser's `homebrew_casks`

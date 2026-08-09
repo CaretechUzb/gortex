@@ -1,5 +1,5 @@
 // Package docs generates a "living changelog + ownership + blame +
-// stale code" bundle from the in-memory graph. Output is markdown or
+// stale code" bundle from the graph store. Output is markdown or
 // JSON; the CLI verb `gortex docs` and the MCP tool `generate_docs`
 // both call into here.
 //
@@ -287,8 +287,8 @@ func walkNodes(g graph.Store, opts Options, now time.Time) ([]OwnershipRow, []St
 	return ownerRows, stale
 }
 
-// tsFromMeta normalises int64 (in-process) vs float64 (gob-decoded
-// snapshot) timestamps so this package works on both code paths —
+// tsFromMeta normalises int64 (in-process) vs float64 (decoded from the
+// store's JSON meta) timestamps so this package works on both code paths —
 // same trick the MCP handlers use today.
 func tsFromMeta(v any) int64 {
 	switch x := v.(type) {
