@@ -74,6 +74,29 @@ func TestResolveSearchBackend_SymbolSearcherBackend_ThroughSwappable(t *testing.
 	assert.True(t, info.DiskResident)
 }
 
+func TestResolveSearchBackend_NullBackend(t *testing.T) {
+	// A store with no native symbol search carries the null text backend.
+	// Status must name it, not report it as an unrecognised backend: the
+	// difference between "nothing is indexing text here" and "we could not
+	// identify what is" is exactly what a user reads this row for.
+	info := resolveSearchBackend(search.NewNull())
+
+	assert.Equal(t, "none", info.Name)
+	assert.False(t, info.DiskResident, "there is no index on disk either")
+	assert.Zero(t, info.Bytes)
+	assert.True(t, info.DocCountKnown, "zero documents is a known count, not an unanswerable one")
+	assert.Zero(t, info.DocCount)
+}
+
+func TestRenderDaemonHeader_SearchBackendRow_NullBackend(t *testing.T) {
+	st := sampleStatus()
+	st.SearchBackend = daemon.SearchBackendStats{Name: "none", DocCountKnown: true}
+	var buf bytes.Buffer
+	renderDaemonHeader(&buf, st)
+	assert.Contains(t, buf.String(), "none  docs=0  heap=0 B",
+		"an empty backend still gets a row, with its zeros stated plainly")
+}
+
 func TestRenderDaemonHeader_SearchBackendRow_SymbolSearcher(t *testing.T) {
 	st := sampleStatus()
 	st.SearchBackend = daemon.SearchBackendStats{

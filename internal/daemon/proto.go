@@ -468,11 +468,13 @@ type TrigramCacheStats struct {
 
 // SearchBackendStats identifies which search backend is currently
 // serving queries, so users can read the `search_b` column in the
-// repo breakdown with the right mental model. The in-process BM25
-// index costs ~2 KiB of heap per document; the store-native FTS index
-// lives inside the graph store's own file and costs no heap of its own.
+// repo breakdown with the right mental model. The store-native FTS
+// index lives inside the graph store's own file and costs no heap of
+// its own. "none" means the store exposes no native symbol search, so
+// no text index is serving queries at all and the engine answers from
+// its substring fallback.
 type SearchBackendStats struct {
-	Name     string `json:"name"`      // "bm25" | "sqlite-fts5" | "unknown"
+	Name     string `json:"name"`      // "sqlite-fts5" | "none" | "unknown"
 	DocCount int    `json:"doc_count"` // indexed documents across all repos
 	// DocCountKnown distinguishes "the index holds zero documents" from
 	// "this backend cannot report a document count". Backends whose only

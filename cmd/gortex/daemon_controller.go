@@ -622,14 +622,13 @@ type searchBackendInfo struct {
 // document count, and its heap footprint.
 //
 // Real-world unwrap order: Swappable → HybridBackend → (text, vector).
-// The text side is itself a concrete BM25/SymbolSearcherBackend. Both
-// layers have to be peeled; if we stop early we fall into the default
-// branch and the status reports "unknown" — which was the bug users
-// saw. When the store implements graph.SymbolSearcher, the indexer
-// wires up a *search.SymbolSearcherBackend instead of building an
-// in-process BM25 index at all (see initialSearchBackend in
-// internal/indexer/indexer.go) — that case has to be matched
-// explicitly too, or it falls into the same "unknown" default.
+// Both layers have to be peeled; if we stop early we fall into the
+// default branch and the status reports "unknown" — which was the bug
+// users saw. The text side is a concrete backend that has to be matched
+// explicitly, or it lands in that same "unknown" default: the indexer
+// wires up a *search.SymbolSearcherBackend when the store implements
+// graph.SymbolSearcher and a *search.NullBackend when it does not (see
+// initialSearchBackend in internal/indexer/indexer.go).
 func resolveSearchBackend(b search.Backend) searchBackendInfo {
 	out := searchBackendInfo{}
 	if b == nil {
@@ -659,11 +658,6 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 	}
 
 	switch back := inner.(type) {
-	case *search.BM25Backend:
-		out.Name = "bm25"
-		out.DocCount = back.Count()
-		out.DocCountKnown = true
-		out.Bytes = back.SizeBytes()
 	case *search.SymbolSearcherBackend:
 		// The FTS5 index lives inside the graph store's own file, not a
 		// separate in-memory structure — there is no honest byte count
@@ -679,6 +673,15 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 		out.Name = "sqlite-fts5"
 		out.DiskResident = true
 		out.DocCount, out.DocCountKnown = back.DocCount()
+	case *search.NullBackend:
+		// A store with no native symbol search gets the null text
+		// backend: it indexes nothing and the engine falls back to its
+		// substring path. Say so — an empty backend is a fact worth
+		// reporting, whereas the "unknown" default would imply we failed
+		// to recognise whatever is serving queries. Doc count and heap
+		// stay zero because both are honestly zero.
+		out.Name = "none"
+		out.DocCountKnown = true
 	default:
 		out.Name = "unknown"
 		out.DocCount = inner.Count()
