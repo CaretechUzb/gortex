@@ -480,6 +480,9 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 		r.lspDeferredCursorSet = false
 	}
 	if len(reindexBatch) > 0 {
+		if batchWritesImportEdges(reindexBatch) {
+			r.noteImportEdgeWrite()
+		}
 		r.graph.ReindexEdges(reindexBatch)
 		reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
 	}

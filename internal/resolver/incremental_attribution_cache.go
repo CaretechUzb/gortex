@@ -93,6 +93,9 @@ func (r *Resolver) flushIncrementalAttributionReindexes() {
 	// Release the resolver-owned backing array before entering the store. Every
 	// emitted chunk is still referenced by batch until its write completes.
 	r.incrementalAttributionReindex = nil
+	if batchWritesImportEdges(batch) {
+		r.noteImportEdgeWrite()
+	}
 	for len(batch) > 0 {
 		n := attributionReindexBatchSize
 		if len(batch) < n {
@@ -112,6 +115,9 @@ func (r *Resolver) clearIncrementalAttributionCache() {
 func (r *Resolver) persistAttributionReindexes(batch []graph.EdgeReindex) {
 	if len(batch) == 0 {
 		return
+	}
+	if batchWritesImportEdges(batch) {
+		r.noteImportEdgeWrite()
 	}
 	if r.incrementalNodesByFile == nil {
 		for len(batch) > 0 {

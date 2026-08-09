@@ -244,6 +244,36 @@ func TestReachabilityAdjacencyRetentionCapClearsWholesale(t *testing.T) {
 	}
 }
 
+func TestBatchWritesImportEdgesDetectsKind(t *testing.T) {
+	calls := []graph.EdgeReindex{{Edge: &graph.Edge{Kind: graph.EdgeCalls}}}
+	if batchWritesImportEdges(calls) {
+		t.Fatal("calls-only batch must not flag import writes")
+	}
+	mixed := append(calls, graph.EdgeReindex{Edge: &graph.Edge{Kind: graph.EdgeImports}})
+	if !batchWritesImportEdges(mixed) {
+		t.Fatal("batch containing an imports edge must flag")
+	}
+	// A kind migration away from imports still rewrites an imports row.
+	migrated := []graph.EdgeReindex{{Edge: &graph.Edge{Kind: graph.EdgeCalls}, OldKind: graph.EdgeImports}}
+	if !batchWritesImportEdges(migrated) {
+		t.Fatal("batch migrating an edge off the imports kind must flag")
+	}
+	if batchWritesImportEdges([]graph.EdgeReindex{{Edge: nil}}) {
+		t.Fatal("nil edge must not flag")
+	}
+}
+
+func TestTargetBatchWritesImportEdgesDetectsKind(t *testing.T) {
+	calls := []graph.UnresolvedEdgeTargetReindex{{Old: graph.EdgeIdentity{Kind: graph.EdgeCalls}}}
+	if targetBatchWritesImportEdges(calls) {
+		t.Fatal("calls-only batch must not flag import writes")
+	}
+	mixed := append(calls, graph.UnresolvedEdgeTargetReindex{Old: graph.EdgeIdentity{Kind: graph.EdgeImports}})
+	if !targetBatchWritesImportEdges(mixed) {
+		t.Fatal("batch containing an imports identity must flag")
+	}
+}
+
 // Renegotiated from TestReachabilityProjectionDoesNotCacheUnresolvedImports:
 // adjacency for an unresolved-import caller MAY now be retained across pages —
 // the pinned invariant is freshness, not absence. An imports-kind edge write

@@ -151,6 +151,9 @@ func (r *Resolver) resolveRazorUsings() {
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 	}
 	if len(reindexBatch) > 0 {
+		if batchWritesImportEdges(reindexBatch) {
+			r.noteImportEdgeWrite()
+		}
 		r.graph.ReindexEdges(reindexBatch)
 	}
 	// The marker edges were scaffolding for this pass — remove them so they do

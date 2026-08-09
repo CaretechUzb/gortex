@@ -144,6 +144,9 @@ func (r *Resolver) reindexAttributionTargetsBatched(
 		fallback = append(fallback, candidate.old)
 	}
 	if len(direct) > 0 {
+		if targetBatchWritesImportEdges(direct) {
+			r.noteImportEdgeWrite()
+		}
 		targeter.ReindexUnresolvedEdgeTargets(direct)
 	}
 	if len(fallback) > 0 {

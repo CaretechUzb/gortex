@@ -1003,6 +1003,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				perWorkerJobs[i] = kept
 			}
 			if len(reindexBatch) > 0 {
+				if batchWritesImportEdges(reindexBatch) {
+					r.noteImportEdgeWrite()
+				}
 				r.graph.ReindexEdges(reindexBatch)
 				reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
 				reindexTotal += len(reindexBatch)
@@ -1349,6 +1352,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				terminalClears = append(terminalClears, graph.EdgeReindex{Edge: edge.edge, OldTo: oldTo})
 			}
 			if len(terminalClears) > 0 {
+				if batchWritesImportEdges(terminalClears) {
+					r.noteImportEdgeWrite()
+				}
 				r.graph.ReindexEdges(terminalClears)
 			}
 
@@ -2666,6 +2672,9 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	stats *ResolveStats,
 ) {
 	if len(reindexBatch) > 0 {
+		if batchWritesImportEdges(reindexBatch) {
+			r.noteImportEdgeWrite()
+		}
 		r.graph.ReindexEdges(reindexBatch)
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
@@ -4762,8 +4771,55 @@ func (r *Resolver) clearReachabilityIndex() {
 // pass-scoped import-adjacency retention compares generations at page start
 // and clears wholesale on drift — invalidation precision is traded for
 // audit-proof simplicity, and measured import writes are rare mid-pass.
+//
+// Write-site audit (every ReindexEdges / ReindexUnresolvedEdgeTargets /
+// AddBatch call in this package):
+//   - guarded bump: main page commit + incremental commit (resolver.go),
+//     deferred-LSP terminal clears and page reindexes (resolver.go,
+//     lsp_resolve.go), attribution batches (attribution_reindex_batch.go,
+//     go_builtins_attribution.go, incremental_attribution_cache.go),
+//     import-flavored retargets (relative_imports.go, lua_imports.go,
+//     razor_using.go, godot_res_paths.go), module attribution reindexes
+//     (module_attribution.go).
+//   - no bump, kind-bounded: generic_param_bind.go (EdgesByKind over
+//     non-import kinds), cross_pkg_guard.go (call-edge guard reverts).
+//   - no bump, outside any live pass retention: exported framework/registry
+//     synthesis passes (celery/mediatr/express/fastapi/django/rails/vapor/
+//     grpc/rtk/redux/vuex/ngrx/react/swiftui/uikit/sidekiq/spring/sql/
+//     store_factory/temporal/goframe/mybatis/laravel/gdscript/godot-scene/
+//     rust/kmp/iface-dispatch/fn-pointer/fn-value/chain-factory/
+//     speculative/external_calls/object_registry/value_refs and peers),
+//     cross-repo resolver (own lifecycle), framework store wrappers
+//     (their callers decide), node-only AddBatch sites, and indexer-side
+//     writers (interleave refresh already clears retention wholesale).
 func (r *Resolver) noteImportEdgeWrite() {
 	r.importEdgeGen++
+}
+
+// batchWritesImportEdges reports whether an edge-reindex batch can change a
+// file's stored import adjacency. Kind migrations count in both directions:
+// either the new or the persisted pre-mutation kind being imports rewrites an
+// imports row. Sites whose batches are provably calls-only skip the bump —
+// the verdict table lives at noteImportEdgeWrite's callers.
+func batchWritesImportEdges(batch []graph.EdgeReindex) bool {
+	for _, reindex := range batch {
+		if reindex.OldKind == graph.EdgeImports {
+			return true
+		}
+		if reindex.Edge != nil && reindex.Edge.Kind == graph.EdgeImports {
+			return true
+		}
+	}
+	return false
+}
+
+func targetBatchWritesImportEdges(batch []graph.UnresolvedEdgeTargetReindex) bool {
+	for _, reindex := range batch {
+		if reindex.Old.Kind == graph.EdgeImports {
+			return true
+		}
+	}
+	return false
 }
 
 // importedDirForSpec returns the directory that an unresolved
