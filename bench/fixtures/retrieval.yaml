@@ -230,7 +230,7 @@ cases:
     query: "search backend implementations"
     expected:
       - internal/search/bm25.go::BM25Backend
-      - internal/search/bleve.go::BleveBackend
+      - internal/search/symbolsearcher_backend.go::SymbolSearcherBackend
       - internal/search/hybrid.go::HybridBackend
       - internal/search/vector.go::VectorBackend
       - internal/search/swappable.go::Swappable
