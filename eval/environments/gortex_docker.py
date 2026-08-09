@@ -290,18 +290,10 @@ class GortexDockerEnvironment:
 
     def _start_eval_server(self) -> None:
         """Start ``gortex eval-server`` as a background process in the container."""
-        cache_flag = ""
-        cache_dest = "/root/.gortex-cache"
-        # Check if cache was restored
-        exit_code, _ = self._container.exec_run(["test", "-d", cache_dest])
-        if exit_code == 0:
-            cache_flag = f"--cache-dir {cache_dest}"
-
         cmd = (
             f"nohup /usr/local/bin/gortex eval-server "
             f"--port {self.eval_server_port} "
             f"--index {self.repo_path} "
-            f"{cache_flag} "
             f"> /tmp/gortex-eval-server.log 2>&1 &"
         )
         logger.info("Starting eval-server on port %d", self.eval_server_port)

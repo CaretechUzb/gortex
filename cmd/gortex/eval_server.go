@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 
 	"github.com/spf13/cobra"
@@ -23,9 +22,8 @@ import (
 )
 
 var (
-	evalPort     int
-	evalIndex    string
-	evalCacheDir string
+	evalPort  int
+	evalIndex string
 )
 
 var evalServerCmd = &cobra.Command{
@@ -45,7 +43,6 @@ func init() {
 	evalServerCmd.Flags().StringVar(&evalBind, "bind", "127.0.0.1", "bind address; a non-loopback bind requires --auth-token")
 	evalServerCmd.Flags().StringVar(&evalAuthToken, "auth-token", "", "bearer token required for every request (fallback: $GORTEX_EVAL_TOKEN)")
 	evalServerCmd.Flags().StringVar(&evalIndex, "index", "", "repository path to index on startup")
-	evalServerCmd.Flags().StringVar(&evalCacheDir, "cache-dir", "", "index cache directory (default ~/.gortex-eval-cache)")
 	rootCmd.AddCommand(evalServerCmd)
 }
 
@@ -77,48 +74,15 @@ func runEvalServer(cmd *cobra.Command, args []string) error {
 	srv.SetArtifacts(cfg.Artifacts)
 	srv.SetNamedQueries(cfg.Queries)
 
-	// Index the repository if --index is provided, with cache support.
+	// Index the repository if --index is provided.
 	if evalIndex != "" {
-		cache, err := eval.NewCache(evalCacheDir, version)
+		fmt.Fprintf(os.Stderr, "[gortex] eval-server: indexing %s...\n", evalIndex)
+		result, err := idx.Index(evalIndex)
 		if err != nil {
-			return fmt.Errorf("creating index cache: %w", err)
+			return fmt.Errorf("indexing %s: %w", evalIndex, err)
 		}
-
-		// Derive repo name from directory name and get commit hash.
-		repoName := filepath.Base(evalIndex)
-		commitHash := gitCommitHash(evalIndex)
-
-		cached := false
-		if commitHash != "" {
-			if cache.Check(repoName, commitHash) && cache.Validate(repoName, commitHash) {
-				cachePath, err := cache.Load(repoName, commitHash)
-				if err == nil {
-					fmt.Fprintf(os.Stderr, "[gortex] eval-server: loaded cached index from %s\n", cachePath)
-					cached = true
-				} else {
-					fmt.Fprintf(os.Stderr, "[gortex] eval-server: cache load failed, will re-index: %v\n", err)
-				}
-			}
-		}
-
-		if !cached {
-			fmt.Fprintf(os.Stderr, "[gortex] eval-server: indexing %s...\n", evalIndex)
-			result, err := idx.Index(evalIndex)
-			if err != nil {
-				return fmt.Errorf("indexing %s: %w", evalIndex, err)
-			}
-			fmt.Fprintf(os.Stderr, "[gortex] eval-server: indexed %d files (%d nodes, %d edges) in %dms\n",
-				result.FileCount, result.NodeCount, result.EdgeCount, result.DurationMs)
-
-			// Store to cache for future runs.
-			if commitHash != "" {
-				if err := cache.Store(repoName, commitHash, evalIndex); err != nil {
-					fmt.Fprintf(os.Stderr, "[gortex] eval-server: cache store warning: %v\n", err)
-				} else {
-					fmt.Fprintf(os.Stderr, "[gortex] eval-server: cached index for %s@%s\n", repoName, commitHash[:8])
-				}
-			}
-		}
+		fmt.Fprintf(os.Stderr, "[gortex] eval-server: indexed %d files (%d nodes, %d edges) in %dms\n",
+			result.FileCount, result.NodeCount, result.EdgeCount, result.DurationMs)
 	}
 
 	// Run analysis (communities, processes) after indexing.
@@ -170,5 +134,3 @@ func runEvalServer(cmd *cobra.Command, args []string) error {
 		return httpServer.Close()
 	}
 }
-
-// gitCommitHash is defined in git.go
