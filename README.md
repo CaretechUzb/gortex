@@ -21,6 +21,7 @@
 [![MCP Toplist](https://mcptoplist.com/badge/glama%2Fzzet%2Fgortex.svg)](https://mcptoplist.com/server/glama%2Fzzet%2Fgortex)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/zzet/gortex/badge)](https://scorecard.dev/viewer/?uri=github.com/zzet/gortex)
 [![Go Reference](https://pkg.go.dev/badge/github.com/zzet/gortex.svg)](https://pkg.go.dev/github.com/zzet/gortex)
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/39MFHu3J5d)
   <br />
   <a href="https://trendshift.io/repositories/36832" target="_blank"><img src="https://trendshift.io/api/badge/repositories/36832" alt="zzet%2Fgortex | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </div>
@@ -187,3 +188,5 @@ Apache License 2.0. See [LICENSE.md](LICENSE.md). Copyright 2024-2026 Andrey Kum
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on adding features, language extractors, and submitting PRs.
+
+New contributors are very welcome — join us on [Discord](https://discord.gg/39MFHu3J5d) and introduce yourself. It's the easiest place to ask questions, check whether someone is already working on something, and get feedback on a design before you write the code.
