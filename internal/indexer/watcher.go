@@ -1731,7 +1731,7 @@ func (w *Watcher) scheduleFileMutation(path string, kind ChangeKind) *MutationTi
 		// mutation lane. Giving up here rather than queueing forever is
 		// what lets a jammed lane shed work instead of accumulating
 		// goroutines against it.
-		release, admitted := w.admitMutationWork()
+		release, admitted := w.admitMutationWork(path)
 		if !admitted {
 			w.completeMutationWaiters(path, generation, errMutationPatchAborted)
 			return

@@ -48,6 +48,23 @@ var Builtin = []string{
 	".bundle/",    // Ruby Bundler cache
 	".dart_tool/", // Dart/Flutter build cache
 	".pub-cache/", // Dart global pub cache, occasionally vendored
+	// Dependency caches a repo-local toolchain home materializes inside the
+	// working tree. A harness that pins M2_HOME / store-dir at the repo
+	// (CI images, benchmark runners, reproducible-build setups) lands tens
+	// of thousands of upstream artifacts under these names. They hold
+	// third-party jars and tarballs, never first-party source, and a repo
+	// that redirects a toolchain home this way rarely thinks to .gitignore
+	// the result — which is the case this list exists to cover.
+	".m2/",         // Maven local repository
+	".ivy2/",       // Ivy / sbt resolution cache
+	".sbt/",        // sbt launcher + plugin cache
+	".pnpm-store/", // pnpm content-addressable store
+	".stack-work/", // Haskell Stack build tree
+	// IDE workspace state: per-machine indexes, launch configs, and scratch
+	// metadata. `.eclipse/` and `.metadata/` are unambiguous — no project
+	// keeps its own source under either.
+	".eclipse/",
+	".metadata/",
 	// Visual Studio / MSBuild artifacts.
 	".vs/",         // Visual Studio per-solution cache
 	"TestResults/", // Visual Studio / `dotnet test` output

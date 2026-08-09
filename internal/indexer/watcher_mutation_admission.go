@@ -31,6 +31,14 @@ const (
 	// large repo has been measured in the tens of seconds — so it only
 	// fires for a lane that is genuinely stuck.
 	mutationLaneTimeout = 10 * time.Minute
+	// mutationShedLogInterval throttles the shed warning. A jammed lane
+	// sheds one patch per queued callback, so logging each one unthrottled
+	// emits a line per shed — thousands per minute on a repo with a large
+	// generated tree, which buries the storm-drain and reconcile records
+	// that explain why the lane is jammed in the first place. One line per
+	// interval carrying the suppressed count and a sample path is what a
+	// diagnosis actually needs.
+	mutationShedLogInterval = 30 * time.Second
 )
 
 // mutationWorkSlots sizes the cohort semaphore. Patching is CPU- and
@@ -47,8 +55,10 @@ func mutationWorkSlots() int {
 // admitMutationWork takes a slot in the watcher's cohort semaphore. The
 // returned release must be called when the work is done. admitted is
 // false when the wait timed out or the watcher is stopping, in which case
-// release is a no-op and the caller must not proceed.
-func (w *Watcher) admitMutationWork() (release func(), admitted bool) {
+// release is a no-op and the caller must not proceed. path names the file
+// whose patch is at stake; it is only used to give the shed warning a
+// sample worth acting on.
+func (w *Watcher) admitMutationWork(path string) (release func(), admitted bool) {
 	if w == nil {
 		return func() {}, false
 	}
@@ -64,12 +74,46 @@ func (w *Watcher) admitMutationWork() (release func(), admitted bool) {
 	case <-w.done:
 		return func() {}, false
 	case <-timer.C:
-		if w.logger != nil {
-			w.logger.Warn("watcher: mutation admission timed out; shedding patch",
-				zap.Duration("waited", mutationAdmissionWaitTimeout))
-		}
+		w.noteShedPatch(path)
 		return func() {}, false
 	}
+}
+
+// noteShedPatch records one shed patch and writes at most one warning per
+// mutationShedLogInterval. The first shed of a burst logs immediately so the
+// condition is never silent; the rest accumulate into that line's count.
+func (w *Watcher) noteShedPatch(path string) {
+	if w == nil || w.logger == nil {
+		return
+	}
+	w.shedMu.Lock()
+	w.shedCount++
+	if w.shedSample == "" {
+		w.shedSample = path
+	}
+	now := time.Now()
+	first := w.shedWindowStart.IsZero()
+	if !first && now.Sub(w.shedWindowStart) < mutationShedLogInterval {
+		w.shedMu.Unlock()
+		return
+	}
+	count := w.shedCount
+	sample := w.shedSample
+	window := now.Sub(w.shedWindowStart)
+	w.shedWindowStart = now
+	w.shedCount = 0
+	w.shedSample = ""
+	w.shedMu.Unlock()
+
+	fields := []zap.Field{
+		zap.Int("shed", count),
+		zap.Duration("waited", mutationAdmissionWaitTimeout),
+		zap.String("sample_path", sample),
+	}
+	if !first {
+		fields = append(fields, zap.Duration("window", window))
+	}
+	w.logger.Warn("watcher: mutation admission timed out; shedding patches", fields...)
 }
 
 // mutationSlots returns the cohort semaphore, creating it on first use so
@@ -85,6 +129,13 @@ func (w *Watcher) mutationSlots() chan struct{} {
 type watcherMutationAdmission struct {
 	mutationSlotsOnce sync.Once
 	mutationSlotsCh   chan struct{}
+
+	// shed* throttle the admission-timeout warning. Guarded by shedMu
+	// because every debounce callback that gives up races here.
+	shedMu          sync.Mutex
+	shedWindowStart time.Time
+	shedCount       int
+	shedSample      string
 }
 
 // mutationLaneContext returns the context a watcher-driven patch uses to
