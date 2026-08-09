@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
@@ -453,7 +455,7 @@ func TestMutationAdmissionBoundsConcurrency(t *testing.T) {
 
 	releases := make([]func(), 0, slots)
 	for i := 0; i < slots; i++ {
-		release, ok := w.admitMutationWork()
+		release, ok := w.admitMutationWork("held.go")
 		require.True(t, ok, "the first %d admissions must succeed", slots)
 		releases = append(releases, release)
 	}
@@ -461,7 +463,7 @@ func TestMutationAdmissionBoundsConcurrency(t *testing.T) {
 	// The semaphore is full: a further admission blocks until a slot frees.
 	admitted := make(chan bool, 1)
 	go func() {
-		release, ok := w.admitMutationWork()
+		release, ok := w.admitMutationWork("queued.go")
 		if ok {
 			release()
 		}
@@ -484,14 +486,14 @@ func TestMutationAdmissionReleasedOnStop(t *testing.T) {
 	w := &Watcher{logger: zap.NewNop(), done: make(chan struct{})}
 	held := make([]func(), 0, cap(w.mutationSlots()))
 	for i := 0; i < cap(w.mutationSlots()); i++ {
-		release, ok := w.admitMutationWork()
+		release, ok := w.admitMutationWork("held.go")
 		require.True(t, ok)
 		held = append(held, release)
 	}
 
 	admitted := make(chan bool, 1)
 	go func() {
-		_, ok := w.admitMutationWork()
+		_, ok := w.admitMutationWork("stopping.go")
 		admitted <- ok
 	}()
 	close(w.done)
@@ -499,6 +501,49 @@ func TestMutationAdmissionReleasedOnStop(t *testing.T) {
 	for _, release := range held {
 		release()
 	}
+}
+
+// TestShedPatchLoggingIsThrottled pins that a jammed lane reports itself
+// once per window rather than once per shed patch. A repo with a large
+// generated tree sheds thousands of patches a minute; logging each one
+// buries the storm-drain and reconcile records that explain the jam.
+func TestShedPatchLoggingIsThrottled(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	w := &Watcher{logger: zap.New(core), done: make(chan struct{})}
+
+	w.noteShedPatch("first.go")
+	require.Equal(t, 1, logs.Len(), "the first shed must report immediately")
+
+	for i := range 500 {
+		w.noteShedPatch(fmt.Sprintf("burst-%d.go", i))
+	}
+	require.Equal(t, 1, logs.Len(), "sheds inside the window must not each log")
+
+	// Reopening the window publishes the suppressed count and a sample.
+	w.shedMu.Lock()
+	w.shedWindowStart = time.Now().Add(-2 * mutationShedLogInterval)
+	w.shedMu.Unlock()
+	w.noteShedPatch("last.go")
+
+	require.Equal(t, 2, logs.Len())
+	entry := logs.All()[1]
+	fields := entry.ContextMap()
+	require.Equal(t, int64(501), fields["shed"],
+		"the throttled line must account for every suppressed shed")
+	require.Equal(t, "burst-0.go", fields["sample_path"],
+		"the sample must name a real shed path")
+	require.Contains(t, fields, "window")
+
+	// The first line carries no window — there is no prior one to measure.
+	require.NotContains(t, logs.All()[0].ContextMap(), "window")
+	require.Equal(t, int64(1), logs.All()[0].ContextMap()["shed"])
+}
+
+// TestShedPatchLoggingSurvivesNilLogger keeps the accounting path inert for
+// a watcher built without a logger rather than panicking on a shed.
+func TestShedPatchLoggingSurvivesNilLogger(t *testing.T) {
+	require.NotPanics(t, func() { (&Watcher{}).noteShedPatch("x.go") })
+	require.NotPanics(t, func() { (*Watcher)(nil).noteShedPatch("x.go") })
 }
 
 // TestMutationLaneContextCarriesDeadline pins the escape hatch: a patch
