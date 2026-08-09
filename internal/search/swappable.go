@@ -2,12 +2,11 @@ package search
 
 import "sync"
 
-// Swappable wraps a Backend and lets a single in-place swap be performed
-// concurrently with reads. Used by the indexer to upgrade from the
-// in-memory BM25 backend to Bleve once the corpus crosses AutoThreshold,
+// Swappable wraps a Backend and lets an in-place swap be performed
+// concurrently with reads. Used by the indexer to re-wrap the active
+// text backend in a HybridBackend once the vector index is ready,
 // without making every call site re-thread a new Backend reference and
-// without holding the indexer's lock during the (potentially seconds-long)
-// re-population of Bleve.
+// without holding the indexer's lock across the swap.
 //
 // Callers see a stable *Swappable; reads delegate to whichever inner
 // backend is currently active. Swap atomically replaces the inner

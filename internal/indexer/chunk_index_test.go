@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,29 @@ import (
 	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/search"
 )
+
+// stubEmbedder is a deterministic minimal embedder that lets the
+// indexer wire up a HybridBackend in tests without pulling in the
+// static-vector asset or a real ONNX runtime. It emits a 4-dim
+// vector whose first element is the text length — enough for the
+// vector backend to accept the adds and for Search to return
+// something non-empty.
+type stubEmbedder struct{}
+
+func (stubEmbedder) Embed(_ context.Context, text string) ([]float32, error) {
+	return []float32{float32(len(text)), 0, 0, 0}, nil
+}
+
+func (stubEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float32, error) {
+	out := make([][]float32, len(texts))
+	for i, t := range texts {
+		out[i] = []float32{float32(len(t)), 0, 0, 0}
+	}
+	return out, nil
+}
+
+func (stubEmbedder) Dimensions() int { return 4 }
+func (stubEmbedder) Close() error    { return nil }
 
 // indexedVectorBackend indexes dir with the given chunk options and
 // returns the vector backend buildSearchIndex produced.

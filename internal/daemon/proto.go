@@ -703,17 +703,16 @@ type ConfiguredServerStatus struct {
 // data structures that dominate the daemon's footprint. All values
 // are approximate — exact accounting would require walking Go's
 // heap, which is too expensive for a status call. See the individual
-// estimators (graph.RepoMemoryEstimate, search.BleveBackend.SizeBytes,
+// estimators (graph.RepoMemoryEstimate, search.BackendSize,
 // search.VectorBackend.SizeBytes) for methodology.
 type MemoryBreakdown struct {
 	NodesBytes   uint64 `json:"nodes_bytes"`
 	EdgesBytes   uint64 `json:"edges_bytes"`
 	SearchBytes  uint64 `json:"search_bytes"`
 	VectorsBytes uint64 `json:"vectors_bytes"`
-	// DiskBytes is populated only when the Bleve backend is running in
-	// disk mode (GORTEX_BLEVE_DISK_DIR set). Each repo gets a
-	// node-proportional share of the on-disk index size. Zero in
-	// memory-only mode.
+	// DiskBytes is populated only when the active search backend keeps
+	// its index on disk. Each repo gets a node-proportional share of
+	// the on-disk index size. Zero for purely in-memory backends.
 	DiskBytes  uint64 `json:"disk_bytes,omitempty"`
 	TotalBytes uint64 `json:"total_bytes"`
 }

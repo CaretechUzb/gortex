@@ -369,19 +369,6 @@ type Indexer struct {
 	contractCache   map[string]*contractCacheEntry
 	contractCacheMu sync.RWMutex
 
-	// upgradeOnce gates the BM25→Bleve auto-upgrade to exactly one
-	// goroutine per indexer lifetime. Without this, every post-threshold
-	// IndexCtx — which fires once per tracked repo during multi-repo
-	// warmup — would spawn a fresh upgradeSearchToBleve goroutine.
-	// Each rebuilds ~N-doc Bleve indexes (≈32 KiB/doc), so overlapping
-	// upgrades peak memory far above steady-state and waste CPU on
-	// rebuilds that the next Swap immediately discards. Also counts
-	// scheduled upgrades so tests can observe gating decisions
-	// without relying on log scrapes or timing.
-	upgradeOnce      sync.Once
-	upgradeSpawnedMu sync.Mutex
-	upgradeSpawned   int
-
 	// deferResolve, when set, makes IndexCtx skip the cross-cutting passes
 	// (per-repo ResolveAll / semantic enrichment / contract extraction +
 	// commit) so the multi-repo orchestrator can run them serially after
@@ -541,18 +528,18 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 		indexMemoryAdmission: processIndexMemoryAdmission,
 		registry:             reg,
 		resolver:             resolver.New(g),
-		// Wrap in Swappable so the auto-upgrade to Bleve at large
-		// corpus sizes can happen in a background goroutine without
-		// racing with concurrent searches. Subsequent reassignments to
-		// idx.search (Hybrid wrap, etc.) should use swap helpers below.
+		// Wrap in Swappable so the later Hybrid re-wrap (text +
+		// vector) can happen without racing with concurrent searches.
+		// Subsequent reassignments to idx.search should use the swap
+		// helpers below.
 		//
 		// When the backing store implements graph.SymbolSearcher
 		// (today only store_sqlite), the initial backend is a thin
 		// adapter that forwards Search to the store's native FTS.
-		// The in-process Bleve / BM25 build path is then bypassed
-		// entirely — saving ~100MB heap on a Vscode-scale repo and
-		// putting search in the same address space as the rest of
-		// the graph queries.
+		// The in-process BM25 build path is then bypassed entirely —
+		// saving ~100MB heap on a Vscode-scale repo and putting
+		// search in the same address space as the rest of the graph
+		// queries.
 		search:        search.NewSwappable(initialSearchBackend(g)),
 		config:        cfg,
 		transforms:    newTransformPipeline(cfg.Transforms, logger),
@@ -700,10 +687,8 @@ func (d *vectorSearcherDelegate) SimilarTo(vec []float32, limit int) ([]graph.Ve
 // in its Swappable on construction. When the underlying store
 // implements graph.SymbolSearcher (today only store_sqlite), a
 // thin adapter routes Search calls through the store's native FTS
-// — the in-process BM25 / Bleve build path is bypassed entirely.
-// Otherwise falls through to search.NewAuto which picks BM25 for
-// small corpora and auto-upgrades to Bleve once the size warrants
-// it.
+// — the in-process BM25 build path is bypassed entirely. Otherwise
+// falls through to search.NewAuto's in-memory BM25 index.
 func initialSearchBackend(g graph.Store) search.Backend {
 	if s, ok := g.(graph.SymbolSearcher); ok {
 		return search.NewSymbolSearcherBackend(s)
@@ -712,11 +697,10 @@ func initialSearchBackend(g graph.Store) search.Backend {
 }
 
 // isSymbolSearcherBackend reports whether the swappable's currently
-// active backend is the SymbolSearcher adapter. Used to suppress
-// the Bleve auto-upgrade goroutine — if the active backend is
-// already a native FTS, upgrading to Bleve would re-index the same
-// corpus into a parallel in-process Bleve and silently swap it in,
-// defeating the FTS path and pinning the ~100MB heap the FTS
+// active backend is the SymbolSearcher adapter. Used to suppress the
+// in-process index builds — if the active backend is already a native
+// FTS, re-indexing the same corpus into a parallel in-process index
+// would defeat the FTS path and pin the ~100MB heap the FTS
 // integration was meant to release.
 func isSymbolSearcherBackend(b search.Backend) bool {
 	switch backend := b.(type) {
@@ -853,13 +837,12 @@ func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
 }
 
 // shouldIndexForSearch reports whether a node should be added to the
-// text search index (BM25/Bleve). File and Import nodes are never
+// text search index. File and Import nodes are never
 // searchable symbols. Beyond that, config.SkipSearch filters out
 // (language, kind) pairs that would only add noise — JSON/YAML/TOML
-// keys, CSS tokens, Terraform blocks, shell/build variables. All three
-// text-index call sites (buildSearchIndex bulk loop, indexFile
-// incremental add, upgradeSearchToBleve repopulate) must go through
-// this predicate so they can't drift.
+// keys, CSS tokens, Terraform blocks, shell/build variables. Every
+// text-index call site (buildSearchIndex bulk loop, indexFile
+// incremental add) must go through this predicate so they can't drift.
 func (idx *Indexer) shouldIndexForSearch(n *graph.Node) bool {
 	// Cross-daemon proxy-edge nodes stand in for remote symbols; they
 	// are never surfaced in local name search. Inert until
@@ -929,121 +912,6 @@ func (idx *Indexer) removeFromSearch(n *graph.Node) {
 		return
 	}
 	idx.search.Remove(n.ID)
-}
-
-// upgradeSearchToBleve constructs a Bleve backend from the current graph
-// and atomically swaps it in. Designed to run in a background goroutine
-// triggered by IndexCtx after the initial index completes. Does nothing
-// if Bleve construction fails (caller already hit AutoThreshold but the
-// in-memory backend keeps serving correctly, just with worse memory
-// characteristics).
-// bleveUpgradeEntry is one row of the snapshot the upgrade goroutine
-// works from. Snapshotting (id, name, file, signature) up front in
-// the foreground — before the goroutine starts reading them — keeps
-// the goroutine race-free against subsequent Index calls' Meta-writing
-// passes (reach.BuildIndex, ResolveTemporalCalls, ...).
-type bleveUpgradeEntry struct {
-	id string
-	// fields is the BM25 text payload for the node, as produced by
-	// searchIndexFields: name + file + signature for a code symbol,
-	// name + file + section body for a KindDoc prose section.
-	fields []string
-}
-
-// snapshotBleveEntries captures every node currently eligible for the
-// search index plus its `signature` Meta string. Called synchronously
-// from IndexCtx after every Node.Meta mutating pass has returned, so
-// the read of n.Meta happens with no concurrent writer.
-func (idx *Indexer) snapshotBleveEntries() []bleveUpgradeEntry {
-	nodes := graph.RepoCodeNodes(idx.graph, idx.repoPrefix)
-	out := make([]bleveUpgradeEntry, 0, len(nodes))
-	for _, n := range nodes {
-		if !idx.shouldIndexForSearch(n) {
-			continue
-		}
-		out = append(out, bleveUpgradeEntry{id: n.ID, fields: searchIndexFields(n, idx.projectName)})
-	}
-	return out
-}
-
-func (idx *Indexer) upgradeSearchToBleve(snapshot []bleveUpgradeEntry) {
-	// Defensive early-return: if the active text backend is already
-	// Bleve, there is nothing to upgrade. IndexCtx's sync.Once guard
-	// prevents re-entry from the auto-upgrade path, but direct
-	// callers (tests, manual invocation from tooling) could still
-	// hit this function twice; a second run would pointlessly
-	// rebuild a full Bleve index and Swap it over an identical one.
-	inner := idx.swappable().Inner()
-	if _, ok := inner.(*search.BleveBackend); ok {
-		return
-	}
-	if hyb, ok := inner.(*search.HybridBackend); ok {
-		if _, ok := hyb.TextBackend().(*search.BleveBackend); ok {
-			return
-		}
-	}
-
-	// Opt-in disk backend. Scorch stores the inverted index on disk
-	// (~10-20× less heap than upsidedown+gtreap) at the cost of file
-	// I/O during build. Users point GORTEX_BLEVE_DISK_DIR at a
-	// writable path; we manage the file lifecycle inside it.
-	diskDir := os.Getenv("GORTEX_BLEVE_DISK_DIR")
-
-	var (
-		blv *search.BleveBackend
-		err error
-	)
-	if diskDir != "" {
-		blv, err = search.NewBleveDisk(diskDir)
-		if err != nil {
-			idx.logger.Warn("search: bleve disk construction failed, falling back to in-memory",
-				zap.String("dir", diskDir), zap.Error(err))
-		}
-	}
-	if blv == nil {
-		blv, err = search.NewBleve()
-		if err != nil {
-			idx.logger.Warn("search: bleve construction failed, staying on in-memory",
-				zap.Error(err))
-			return
-		}
-	}
-
-	// Use the foreground snapshot the spawner captured rather than
-	// re-walking idx.graph here: the goroutine outlives the spawning
-	// IndexCtx call, and subsequent Index calls' Meta-writing passes
-	// (reach.BuildIndex, ResolveTemporalCalls, ...) mutate Node.Meta
-	// on the same Node objects. Reading sig from a live n.Meta here
-	// would race with those writes.
-	for _, e := range snapshot {
-		blv.Add(e.id, e.fields...)
-	}
-
-	// Preserve the vector index if one is wired up. The previous inner
-	// is normally a HybridBackend wrapping text + vector + embedder;
-	// swapping in raw Bleve would let Swap's old.Close() run on the
-	// old Hybrid, which closes only its text side (hybrid.Close) but
-	// leaves the resulting inner — raw *BleveBackend — unwrapped, so
-	// every downstream hybrid/semantic query silently degrades to
-	// BM25 until the daemon restarts. Rewrap the fresh Bleve in a new
-	// Hybrid carrying the old vector + embedder. The vector backend
-	// itself is never closed by Hybrid.Close, so it stays alive even
-	// after the old Hybrid is torn down by Swap.
-	sw := idx.swappable()
-	var replacement search.Backend = blv
-	if oldHybrid, ok := sw.Inner().(*search.HybridBackend); ok {
-		replacement = search.NewHybrid(blv, oldHybrid.VectorIndex(), oldHybrid.Embedder())
-	}
-	sw.Swap(replacement)
-
-	mode := "memory"
-	if blv.DiskPath() != "" {
-		mode = "disk"
-	}
-	idx.logger.Info("search: upgraded to Bleve backend (background)",
-		zap.Int("symbols", blv.Count()),
-		zap.String("mode", mode),
-		zap.String("disk_path", blv.DiskPath()))
 }
 
 // Graph returns the underlying graph.
@@ -4154,40 +4022,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		}
 	}
 
-	// Auto-upgrade to Bleve if above threshold. Run in the background
-	// so the foreground IndexCtx returns immediately — populating
-	// Bleve with 50k+ symbols takes 30-60s and adding that to the
-	// initial-index latency was the dominant tail. Searches against
-	// idx.search keep hitting the in-memory backend until the swap
-	// completes; nothing observes a half-built Bleve.
-	//
-	// upgradeOnce gates the spawn so multi-repo warmup, which calls
-	// IndexCtx once per tracked repo, doesn't launch one upgrade
-	// goroutine per post-threshold repo. One per indexer lifetime.
-	//
-	// Skip the upgrade when the active search backend is the
-	// SymbolSearcher adapter: the disk store's native FTS is
-	// already serving search at engine-native latency, and
-	// spawning a parallel Bleve build would (a) waste ~100MB heap
-	// re-indexing the same corpus and (b) silently swap the
-	// adapter out for Bleve on completion — defeating the whole
-	// FTS path. The Swappable's current backend tells us which
-	// branch we're on.
-	if !isSymbolSearcherBackend(idx.search) && idx.search.Count() >= search.AutoThreshold {
-		idx.upgradeOnce.Do(func() {
-			reporter.Report("scheduling search backend upgrade", 0, 0)
-			idx.upgradeSpawnedMu.Lock()
-			idx.upgradeSpawned++
-			idx.upgradeSpawnedMu.Unlock()
-			// Snapshot upfront so the background goroutine doesn't
-			// read Node.Meta concurrently with subsequent Index
-			// calls' Meta-writing passes (reach.BuildIndex,
-			// ResolveTemporalCalls, ...).
-			snapshot := idx.snapshotBleveEntries()
-			go idx.upgradeSearchToBleve(snapshot)
-		})
-	}
-
 	// Persist the parser quarantine so a file that crashed the parser
 	// stays skipped across daemon restarts until its content changes.
 	if quarantine != nil {
@@ -5549,7 +5383,7 @@ func (idx *Indexer) buildSearchIndex() {
 
 	// Install the learned sub-word boundary table before populating an
 	// in-process BM25 backend. Capability detection happens before graph
-	// enumeration, so native SQLite FTS and Bleve do no boundary census.
+	// enumeration, so the native SQLite FTS does no boundary census.
 	search.BuildAndInstallNgramBoundaries(idx.search, idx.graph)
 
 	nativeText := isSymbolSearcherBackend(idx.search)
@@ -5806,7 +5640,7 @@ func (idx *Indexer) buildSearchIndex() {
 	// once per tracked repo during daemon warmup) would stack a fresh
 	// Hybrid on top of the previous one — nested Hybrids retain all
 	// their stale vector indexes, ballooning live memory by an order
-	// of magnitude. The text backend (BM25 or Bleve) has already been
+	// of magnitude. The text backend has already been
 	// updated with every node via idx.search.Add above; a single
 	// Hybrid wrapping it + the latest vecBackend is all we need.
 	sw := idx.swappable()

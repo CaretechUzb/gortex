@@ -9,7 +9,8 @@ import (
 	"github.com/zzet/gortex/internal/search/rerank"
 )
 
-// HybridBackend combines text search (BM25/Bleve) with vector search (HNSW)
+// HybridBackend combines text search (BM25 or the store-native FTS
+// adapter) with vector search (HNSW)
 // using Reciprocal Rank Fusion (RRF) for result ranking.
 //
 // When autoAlpha is true (the default), Search() classifies the query as

@@ -135,7 +135,7 @@ func BuildNgramBoundaries(g graph.Reader) *NgramTable {
 // tokenizer's split decisions become data-driven. The production
 // backend is a Swappable wrapping either a HybridBackend (text+vector)
 // or a bare BM25Backend; this unwraps both. Backends with no BM25 layer
-// (Bleve, SymbolSearcher) do not run the sparse-ngram stage, so there
+// (SymbolSearcher) do not run the sparse-ngram stage, so there
 // is nothing to install and the call is a harmless no-op returning
 // false.
 //
@@ -157,7 +157,7 @@ func InstallNgramBoundaries(backend Backend, table NgramBoundaries) bool {
 
 // BuildAndInstallNgramBoundaries mines and installs a boundary table only
 // when backend actually contains a BM25 layer. Capability detection must
-// precede BuildNgramBoundaries: native SQLite FTS and Bleve never consume the
+// precede BuildNgramBoundaries: the native SQLite FTS never consumes the
 // table, and walking the whole graph for them is pure allocation and I/O.
 func BuildAndInstallNgramBoundaries(backend Backend, g graph.Reader) bool {
 	bm := bm25Of(backend)

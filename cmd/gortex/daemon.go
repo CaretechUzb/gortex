@@ -1444,9 +1444,9 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 	})
 
 	// The disk_b column only appears when any repo actually has disk
-	// usage — i.e. Bleve is running in disk mode. Keeping it
-	// conditional stops the default in-memory output from carrying a
-	// dead column users would (rightly) ask about.
+	// usage — i.e. the active search backend keeps its index on disk.
+	// Keeping it conditional stops the default in-memory output from
+	// carrying a dead column users would (rightly) ask about.
 	showDisk := false
 	for _, r := range rows {
 		if r.Memory.DiskBytes > 0 {

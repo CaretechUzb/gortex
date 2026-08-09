@@ -619,16 +619,15 @@ type searchBackendInfo struct {
 
 // resolveSearchBackend inspects the live search backend and produces
 // the stats needed by status rendering: which backend is active, total
-// document count, its heap footprint, and (for disk-backed Bleve) the
-// on-disk size.
+// document count, and its heap footprint.
 //
 // Real-world unwrap order: Swappable → HybridBackend → (text, vector).
-// The text side is itself a concrete BM25/Bleve/SymbolSearcherBackend.
-// Both layers have to be peeled; if we stop early we fall into the
-// default branch and the status reports "unknown" — which was the bug
-// users saw. When the store implements graph.SymbolSearcher, the
-// indexer wires up a *search.SymbolSearcherBackend instead of building
-// an in-process BM25/Bleve index at all (see initialSearchBackend in
+// The text side is itself a concrete BM25/SymbolSearcherBackend. Both
+// layers have to be peeled; if we stop early we fall into the default
+// branch and the status reports "unknown" — which was the bug users
+// saw. When the store implements graph.SymbolSearcher, the indexer
+// wires up a *search.SymbolSearcherBackend instead of building an
+// in-process BM25 index at all (see initialSearchBackend in
 // internal/indexer/indexer.go) — that case has to be matched
 // explicitly too, or it falls into the same "unknown" default.
 func resolveSearchBackend(b search.Backend) searchBackendInfo {
@@ -655,17 +654,6 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 	}
 
 	switch back := inner.(type) {
-	case *search.BleveBackend:
-		if path := back.DiskPath(); path != "" {
-			out.Name = "bleve-disk"
-			out.DiskPath = path
-			out.DiskBytes = back.DiskBytes()
-		} else {
-			out.Name = "bleve-memory"
-		}
-		out.DocCount = back.Count()
-		out.DocCountKnown = true
-		out.Bytes = back.SizeBytes()
 	case *search.BM25Backend:
 		out.Name = "bm25"
 		out.DocCount = back.Count()
