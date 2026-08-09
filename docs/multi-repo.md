@@ -98,7 +98,39 @@ Environment variables:
 - `GORTEX_TRIGRAM_MAX_MB` — ceiling on the summed estimated heap of every live trigram searcher (default `256`; `0` disables the byte ceiling). The trigram index is the in-memory literal-search structure behind `search_text` / `find_declaration`, built lazily per repo on first use. A count cap alone does not bound it — three indexes of an arbitrarily large repo is still arbitrarily large — so this is the rule that makes the worst case a number. `gortex daemon status` prints a `trigram` line with the live count, current heap and the active budget.
 - `GORTEX_TRIGRAM_MAX_LIVE` — how many repos may hold a built trigram index at once (default `3`). `0` means never build one: every text search then streams over the repo's known file list, holding no index state at the cost of scan latency. Binary files are excluded from the index and from literal search regardless of these settings.
 - `GORTEX_TRIGRAM_IDLE_TTL` — how long an unused trigram index is kept before it is dropped (default `10m`, any Go duration string). A repo being actively grepped re-touches its entry on every query, so the TTL only reclaims repos that have gone quiet.
+- `GORTEX_WATCHER_STARTUP_BARRIER_TIMEOUT` — how long a macOS watcher waits at startup for FSEvents to hand back its own handshake marker, proving the stream is live and its replay has been ordered. Default `5s`; any Go duration string. Raise it if `daemon: some repositories are not being watched` appears on a very large tree or a busy machine. Exceeding it no longer stops the repo from being watched — the watcher continues in a degraded state, backed by the adaptive poller, and reports the reason.
 - `GORTEX_DAEMON_MEMRELEASE=0` — disable the post-burst heap-to-OS release. By default the daemon calls `debug.FreeOSMemory()` at allocation-burst boundaries (warmup completion, a reconcile-janitor tick that reindexed something, the close of a cold-index window, and a whole-graph analysis pass) so a burst's high-water footprint is returned to the OS promptly instead of pinning resident memory at the peak. It only ever fires at those boundaries, never on a timer.
+
+### When a repository stops being watched
+
+A dead watcher is the one failure mode that looks like success: the graph still
+answers, `gortex repos` still prints `fresh` (it compares indexed SHA against
+`git rev-parse`, not against what the watcher is doing), and every answer comes
+from a graph that stopped advancing. The daemon reports it in three places:
+
+- **Startup.** `daemon: watching` logs `repos` (live) alongside `configured`.
+  When they differ, a `daemon: some repositories are not being watched` warning
+  names the first reason.
+- **Health push.** Subscribers receive a `degraded` readiness phase carrying
+  `watch_degraded`, both for a watcher that never started and for one that
+  degraded later.
+- **Read tools.** `read_file`, `get_symbol_source` and friends attach
+  `index_frozen` with the reason, so an agent sees it without polling.
+
+Causes worth knowing:
+
+- **A watcher that never started** — a repository root removed under a running
+  daemon, or a root the daemon cannot write a startup marker into. The repo is
+  not watched at all until the daemon restarts.
+- **A degraded watcher** — inotify or file-descriptor exhaustion (raise
+  `fs.inotify.max_user_watches` / `ulimit -n`), a slow mount, or a macOS
+  startup barrier that did not complete within
+  `GORTEX_WATCHER_STARTUP_BARRIER_TIMEOUT`. Live watching continues, with the
+  adaptive poller covering what the native backend misses.
+
+`GORTEX_RECONCILE_INTERVAL` bounds how long any of this can hide drift: the
+janitor walks every tracked repo against disk on that tick regardless of
+watcher health.
 
 ## CLI
 

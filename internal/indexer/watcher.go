@@ -222,7 +222,33 @@ var (
 	errMutationPatchAborted  = errors.New("mutation patch aborted")
 	errWatcherStopped        = errors.New("watcher stopped before mutation completed")
 	errWatcherIndexerMissing = errors.New("watcher repository indexer is no longer registered")
+	// errStartupBarrierIncomplete marks a Darwin startup barrier that was
+	// established — the markers were written and published — but never
+	// observed its own tail. It separates a liveness fault, where the right
+	// answer is to degrade and keep watching, from a setup fault such as an
+	// unwritable root, which stays fail-closed.
+	errStartupBarrierIncomplete = errors.New("watcher: startup marker barrier incomplete")
 )
+
+// defaultStartupBarrierTimeout bounds the Darwin startup marker barrier.
+const defaultStartupBarrierTimeout = 5 * time.Second
+
+// startupBarrierTimeout returns the Darwin startup-barrier budget.
+// GORTEX_WATCHER_STARTUP_BARRIER_TIMEOUT overrides it with any Go duration
+// ("15s", "500ms") for installs whose FSEvents delivery is slower than the
+// default allows — a very large tree, a busy machine, or a network volume.
+// An unparseable or non-positive value keeps the default.
+func startupBarrierTimeout() time.Duration {
+	raw := os.Getenv("GORTEX_WATCHER_STARTUP_BARRIER_TIMEOUT")
+	if raw == "" {
+		return defaultStartupBarrierTimeout
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return defaultStartupBarrierTimeout
+	}
+	return d
+}
 
 // probeMarker is the substring embedded in handshake-probe filenames
 // (see confirmWatchActive) and used by handleEvent to absorb their
@@ -463,7 +489,7 @@ func (w *Watcher) Start(paths []string) (retErr error) {
 		// consulting the filter (fswatcher watcher_linux_inotify.go), and
 		// the filter is applied only on the event path. Cutting the watch
 		// count needs a change upstream.
-		opts = append(opts, fswatcher.WithPath(absPath,
+		opts = append(opts, fswatcher.WithPath(backendWatchPath(absPath),
 			fswatcher.WithPathFilter(&watcherExcludeFilter{w: w})))
 	}
 	fsw, err := fswatcher.New(opts...)
@@ -478,9 +504,27 @@ func (w *Watcher) Start(paths []string) (retErr error) {
 	go func() {
 		err := fsw.Watch(ctx)
 		watchErr <- err
-		if err != nil && !errors.Is(err, context.Canceled) && w.logger != nil {
-			w.logger.Warn("watcher: backend stopped", zap.Error(err))
+		if err == nil || errors.Is(err, context.Canceled) {
+			return
 		}
+		// The backend died after Start had already succeeded. We own the
+		// event channels precisely so the library never closes them, which
+		// means loop() cannot notice — it just parks in its select and the
+		// watcher stays alive and deaf. Nothing else observes this, so
+		// without a degraded reason here the graph quietly ages while the
+		// daemon keeps reporting the repository watched.
+		//
+		// Defer to a reason already on record: the errno-specific ones name
+		// the sysctl or ulimit to raise, which this generic notice would
+		// otherwise overwrite with strictly less for the operator to act on.
+		if w.DegradedReason() != "" {
+			return
+		}
+		w.markDegraded(
+			"the native file watcher stopped — live edits are no longer reaching the graph; restart the daemon to resume watching (the adaptive poller covers some changes)",
+			"watcher: backend stopped — the watcher is deaf until the daemon restarts",
+			err,
+		)
 	}()
 	// Wait for the backend to become ready or fail fast on early
 	// initialisation errors (e.g. an inotify add returning ENOSPC).
@@ -518,14 +562,28 @@ func (w *Watcher) Start(paths []string) (retErr error) {
 	if runtime.GOOS == "darwin" {
 		initialReplay, err := w.drainInitialReplay(150 * time.Millisecond)
 		if err == nil {
-			err = w.reconcileInitialReplayThroughMarkers(absPaths, 5*time.Second, initialReplay)
+			err = w.reconcileInitialReplayThroughMarkers(absPaths, startupBarrierTimeout(), initialReplay)
 		}
 		if err != nil {
-			cancel()
-			if w.fsw != nil {
-				w.fsw.Close()
+			// A barrier that could never be established — an unwritable root —
+			// is a setup fault the operator must see, so it stays fail-closed.
+			// A barrier that was published but not observed is a liveness
+			// fault, and tearing the watcher down for it is what turns this
+			// into silent staleness: the repo ends up with no live watching,
+			// no poller and no degraded reason, while the daemon keeps
+			// reporting it fresh. Keep the stream and say so instead.
+			if !errors.Is(err, errStartupBarrierIncomplete) {
+				cancel()
+				if w.fsw != nil {
+					w.fsw.Close()
+				}
+				return err
 			}
-			return err
+			w.markDegraded(
+				"file watcher started without its startup ordering barrier — edits made during daemon startup may be missing until the next reindex (the adaptive poller covers ongoing changes)",
+				"watcher: startup marker barrier incomplete — continuing with the adaptive poller rather than leaving the repository unwatched",
+				err,
+			)
 		}
 	}
 	loopLaunched = true
@@ -650,7 +708,7 @@ func (w *Watcher) mergeInitialReplayEvent(events map[string]fswatcher.WatchEvent
 		}
 	}
 	path := filepath.Clean(normalizeEventPath(event.Path, w.indexer.rootPath))
-	if path == "." || strings.Contains(filepath.Base(path), probeMarker) {
+	if path == "." || isProbeMarkerPath(path) {
 		return nil
 	}
 	event.Path = path
@@ -672,10 +730,22 @@ func (w *Watcher) mergeInitialReplayEvent(events map[string]fswatcher.WatchEvent
 
 // reconcileInitialReplayThroughMarkers closes the Darwin FSEvents startup
 // ordering gap without scanning the repository. Each watched root gets one
-// ignored marker after the quiet drain. FSEvents preserves order within a
-// root stream, so observing that marker proves every earlier replay event for
-// the root has reached this channel. Only paths actually observed in that tail
-// are deduplicated and reconciled before Start returns.
+// ignored marker after the quiet drain. FSEvents preserves order within a root
+// stream, so observing that marker means every earlier replay event for the
+// root has reached this channel. Only paths actually observed in that tail are
+// deduplicated and reconciled before Start returns.
+//
+// That ordering holds at the OS boundary, not all the way to this channel: the
+// backend aggregates by path in a map and flushes by ranging it, so events
+// sharing a flush cycle with the marker are emitted in map order and the
+// marker can in principle be emitted first. Do not build on this barrier as a
+// strict happens-before. It is safe because the failure is benign — an
+// overtaken event is still delivered, and loop() reindexes it a moment later
+// through the ordinary path, losing only the batched receipt lookup for that
+// one path. Measured on macOS 26: the stream is created SinceNow, so there is
+// no synthetic replay burst to overtake (one event reaches this channel during
+// a normal start — our own marker), and 500 writes issued immediately before
+// the marker settled before Start returned in every one of 12 runs.
 func (w *Watcher) reconcileInitialReplayThroughMarkers(
 	roots []string,
 	timeout time.Duration,
@@ -763,48 +833,80 @@ func (w *Watcher) reconcileInitialReplayThroughMarkers(
 		}
 	}
 
+	// From here the markers are published, so every remaining failure is a
+	// liveness problem rather than a setup fault: report it as incomplete so
+	// Start degrades instead of leaving the repository unwatched. Whatever
+	// replay was observed is still reconciled on the way out — dropping it
+	// would strand exactly the edits the barrier exists to catch.
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	eventsCh := w.fsw.Events()
 	droppedCh := w.fsw.Dropped()
+	observed := 0
+	incomplete := func(cause string) error {
+		reconcileErr := w.reconcileInitialReplayEvents(deferred)
+		err := fmt.Errorf("%w: %s (%s; %d event(s) observed while waiting)",
+			errStartupBarrierIncomplete, cause, describeOutstandingMarkers(markers), observed)
+		if reconcileErr != nil {
+			return fmt.Errorf("%w; reconciling the observed replay also failed: %w", err, reconcileErr)
+		}
+		return err
+	}
 	for len(markers) > 0 {
 		select {
 		case event, ok := <-eventsCh:
 			if !ok {
-				return errors.New("watcher: event stream closed during startup marker barrier")
+				return incomplete("event stream closed")
 			}
+			observed++
 			path := filepath.Clean(normalizeEventPath(event.Path, w.indexer.rootPath))
 			if _, marker := markers[path]; marker {
 				delete(markers, path)
 				continue
 			}
-			if strings.Contains(filepath.Base(path), probeMarker) {
+			if isProbeMarkerPath(path) {
 				continue
 			}
 			if err := w.mergeInitialReplayEvent(deferred, event); err != nil {
-				return err
+				return fmt.Errorf("%w: %w", errStartupBarrierIncomplete, err)
 			}
 		case _, ok := <-droppedCh:
 			if !ok {
 				droppedCh = nil
 				continue
 			}
-			return errors.New("watcher: event dropped during startup marker barrier")
+			return incomplete("event dropped")
 		case <-timer.C:
-			return fmt.Errorf("watcher: startup marker barrier did not complete within %s", timeout)
+			return incomplete(fmt.Sprintf("did not complete within %s", timeout))
 		}
 	}
 
 	if err := w.reconcileInitialReplayEvents(deferred); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errStartupBarrierIncomplete, err)
 	}
 	w.mu.Lock()
 	idle := len(w.pending) == 0 && len(w.pendingGeneration) == 0
 	w.mu.Unlock()
 	if !idle {
-		return errors.New("watcher: startup marker barrier left queued mutations")
+		return fmt.Errorf("%w: left queued mutations", errStartupBarrierIncomplete)
 	}
 	return nil
+}
+
+// describeOutstandingMarkers renders the roots whose marker never came back,
+// so the operator can tell a stream that delivered nothing at all from one
+// that delivered everything except our own probe — the difference between a
+// dead FSEvents stream and a filter swallowing the handshake.
+func describeOutstandingMarkers(markers map[string]struct{}) string {
+	if len(markers) == 0 {
+		return "no markers outstanding"
+	}
+	roots := make([]string, 0, len(markers))
+	for marker := range markers {
+		roots = append(roots, filepath.Dir(marker))
+	}
+	sort.Strings(roots)
+	return fmt.Sprintf("%d marker(s) unobserved under %s", len(markers), strings.Join(roots, ", "))
 }
 
 func (w *Watcher) reconcileInitialReplayEvents(events map[string]fswatcher.WatchEvent) error {
@@ -1073,13 +1175,24 @@ func (w *Watcher) OnSymbolChange(cb SymbolChangeCallback) {
 }
 
 // OnDegraded registers a callback invoked once when the file watcher first
-// enters a degraded state (inotify / FD exhaustion). The daemon wires it to its
-// health push-notification channel so a subscribed agent learns the index may
-// be frozen without polling.
+// enters a degraded state (inotify / FD exhaustion, a stopped backend, an
+// incomplete startup barrier). The daemon wires it to its health
+// push-notification channel so a subscribed agent learns the index may be
+// frozen without polling.
+//
+// Registration replays a degradation that already happened. The daemon can
+// only register after MultiWatcher.Start returns, and the degradations most
+// worth hearing about — the ones raised while starting — all fire before
+// that. Without the replay every one of them is announced to nobody, which is
+// how a frozen index ends up looking healthy.
 func (w *Watcher) OnDegraded(cb func(reason string)) {
 	w.degradedMu.Lock()
 	w.degradedCb = cb
+	reason := w.degradedReason
 	w.degradedMu.Unlock()
+	if cb != nil && reason != "" {
+		cb(reason)
+	}
 }
 
 // DegradedReason returns a human-readable explanation when the native file
@@ -1120,6 +1233,19 @@ func (w *Watcher) noteWatchDegraded(err error) bool {
 	default:
 		return false
 	}
+	return w.markDegraded(reason, logMsg)
+}
+
+// markDegraded records reason as the watcher's degraded state and logs logMsg
+// once. cause, when non-nil, rides the log line so the operator gets the
+// underlying error without it leaking into the user-facing reason. Returns
+// true on the first (logged) call; later calls update the reason silently.
+//
+// Every degradation funnels through here so a newly-degraded mode cannot be
+// added without also becoming visible to DegradedReason and the daemon's
+// health push — the difference between a stale index the operator can see and
+// one that quietly answers from an aging graph.
+func (w *Watcher) markDegraded(reason, logMsg string, cause ...error) bool {
 	w.degradedMu.Lock()
 	first := !w.degradedLogged
 	w.degradedReason = reason
@@ -1128,7 +1254,13 @@ func (w *Watcher) noteWatchDegraded(err error) bool {
 	w.degradedMu.Unlock()
 	if first {
 		if w.logger != nil {
-			w.logger.Warn(logMsg)
+			fields := make([]zap.Field, 0, 1)
+			for _, err := range cause {
+				if err != nil {
+					fields = append(fields, zap.Error(err))
+				}
+			}
+			w.logger.Warn(logMsg, fields...)
 		}
 		if cb != nil {
 			cb(reason)
@@ -1443,7 +1575,7 @@ func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
 	// the registered waiter; their remove event (after Start removes
 	// the file) is silently absorbed so it never reaches user-visible
 	// event consumers.
-	if strings.Contains(filepath.Base(path), probeMarker) {
+	if isProbeMarkerPath(path) {
 		if v, loaded := w.probeWaiters.LoadAndDelete(path); loaded {
 			if ch, ok := v.(chan struct{}); ok {
 				close(ch)
@@ -2529,6 +2661,34 @@ func normalizeEventPath(path, rootPath string) string {
 		return path
 	}
 	return stripped
+}
+
+// backendWatchPath returns the form of root to register with the fswatcher
+// backend.
+//
+// The backend resolves a path-scoped option — our exclude filter — by string
+// prefix against the registered root (fswatcher findMostSpecificWatchPath).
+// On macOS, FSEvents reports the symlink-resolved path, so a root registered
+// as /var/... never prefix-matches an event at /private/var/..., the backend
+// finds no owning watch path, and the filter is silently skipped for every
+// event. The result is not a wrong answer — handleEvent re-checks excludes —
+// but the whole ignored tree (.git object churn, node_modules) crosses
+// the channel, the aggregator and the storm counter unfiltered. Registering
+// the resolved form makes the match succeed.
+//
+// Event paths are unaffected: FSEvents already emits the resolved form, and
+// normalizeEventPath maps it back to whichever form the indexer root uses.
+// Confined to darwin because inotify reports paths as registered — resolving
+// there would emit canonical paths the rest of the daemon does not expect.
+func backendWatchPath(root string) string {
+	if runtime.GOOS != "darwin" {
+		return root
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return root
+	}
+	return resolved
 }
 
 // pickKind reduces the aggregated event-type set from fswatcher to a

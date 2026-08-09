@@ -1171,9 +1171,21 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			srv.PublishReadiness("degraded", true, map[string]any{"watch_degraded": reason})
 		})
 	}
-	logger.Info("daemon: watching", zap.Int("repos", len(watchCfgs)))
+	// Announce what is actually being watched. Reporting the configured count
+	// here made an install where every watcher had failed to start look fully
+	// watched, so the one signal that the graph was going stale never fired.
+	live, configured := mw.WatchedRepos()
+	if live < configured {
+		logger.Warn("daemon: some repositories are not being watched — their graphs go stale until the daemon restarts",
+			zap.Int("live", live),
+			zap.Int("configured", configured),
+			zap.String("first_reason", mw.DegradedReason()),
+		)
+	}
+	logger.Info("daemon: watching", zap.Int("repos", live), zap.Int("configured", configured))
 	publishReadinessPhase(state, "watcher_started", true, map[string]any{
-		"watched_repos": len(watchCfgs),
+		"watched_repos":    live,
+		"configured_repos": configured,
 	})
 	return mw, timings
 }
