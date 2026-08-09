@@ -205,6 +205,7 @@ func (p *resolveAllPassIndexes) prepare(pending []*graph.Edge) map[string]*graph
 		p.ensureProvides(prefixes)
 		providesElapsed = time.Since(start)
 	}
+	reachDirty := len(p.resolver.importDirtyFiles)
 	if p.importAdjacencyGen != p.resolver.importEdgeGen {
 		// A provenance-less imports-kind write landed since this retention
 		// was built — adjacency rows may have changed anywhere. Clear
@@ -236,6 +237,8 @@ func (p *resolveAllPassIndexes) prepare(pending []*graph.Edge) map[string]*graph
 		zap.Int("reach_missing", reachStats.missing),
 		zap.Int("reach_unstable", reachStats.unstable),
 		zap.Int("reach_adj_cached", reachStats.adjCached),
+		zap.Int("reach_dirty", reachDirty),
+		zap.Uint64("reach_gen", p.resolver.importEdgeGen),
 		zap.Duration("reach_project", reachStats.project),
 		zap.Duration("reach_place", reachStats.place),
 		zap.Duration("reach_match", reachStats.match),

@@ -247,8 +247,8 @@ func TestReachabilityAdjacencyRetentionCapClearsWholesale(t *testing.T) {
 func TestNoteImportEdgeReindexesRecordsDirtyFiles(t *testing.T) {
 	r := New(graph.New())
 	r.noteImportEdgeReindexes([]graph.EdgeReindex{
-		{Edge: &graph.Edge{Kind: graph.EdgeCalls, FilePath: "a.go"}},
-		{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "b.go"}},
+		{Edge: &graph.Edge{Kind: graph.EdgeCalls, FilePath: "a.go", To: "x"}, OldTo: "y"},
+		{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "b.go", To: "dep/one.go"}, OldTo: "unresolved::import::dep"},
 		{Edge: nil},
 	})
 	if _, ok := r.importDirtyFiles["b.go"]; !ok || len(r.importDirtyFiles) != 1 {
@@ -260,15 +260,34 @@ func TestNoteImportEdgeReindexesRecordsDirtyFiles(t *testing.T) {
 	// A kind migration away from imports still rewrites an imports row; the
 	// pre-mutation provenance names the file.
 	r.noteImportEdgeReindexes([]graph.EdgeReindex{
-		{Edge: &graph.Edge{Kind: graph.EdgeCalls}, OldKind: graph.EdgeImports, OldFilePath: "c.go"},
+		{Edge: &graph.Edge{Kind: graph.EdgeCalls, To: "x"}, OldTo: "x", OldKind: graph.EdgeImports, OldFilePath: "c.go"},
 	})
 	if _, ok := r.importDirtyFiles["c.go"]; !ok {
 		t.Fatalf("dirty files = %v, want c.go from OldFilePath", r.importDirtyFiles)
 	}
 	// No file provenance at all → conservative wholesale clear.
-	r.noteImportEdgeReindexes([]graph.EdgeReindex{{Edge: &graph.Edge{Kind: graph.EdgeImports}}})
+	r.noteImportEdgeReindexes([]graph.EdgeReindex{
+		{Edge: &graph.Edge{Kind: graph.EdgeImports, To: "dep/one.go"}, OldTo: "unresolved::import::dep"},
+	})
 	if r.importEdgeGen != 1 {
 		t.Fatal("provenance-less imports write must fall back to the wholesale generation")
+	}
+}
+
+// The second cold-run regression: the pass rewrites still-unresolved import
+// edges for bookkeeping (meta, confidence, terminality) on every frontier
+// revisit. A rewrite that changes neither target, kind, nor file cannot
+// change stored adjacency — it must NOT dirty the file, or the retention
+// evicts exactly the unstable files it exists to serve.
+func TestNoteImportEdgeReindexesIgnoresIdentityPreservingRewrites(t *testing.T) {
+	r := New(graph.New())
+	r.noteImportEdgeReindexes([]graph.EdgeReindex{
+		{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "a.go", To: "unresolved::import::dep"},
+			OldTo: "unresolved::import::dep"},
+	})
+	if len(r.importDirtyFiles) != 0 || r.importEdgeGen != 0 {
+		t.Fatalf("identity-preserving rewrite dirtied files=%v gen=%d, want none",
+			r.importDirtyFiles, r.importEdgeGen)
 	}
 }
 
@@ -304,7 +323,8 @@ func TestReachabilityAdjacencyRetentionSurvivesUnrelatedImportWrites(t *testing.
 	indexes.clearPage()
 	for page := 0; page < 3; page++ {
 		r.noteImportEdgeReindexes([]graph.EdgeReindex{
-			{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "other/unrelated.go"}},
+			{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "other/unrelated.go", To: "dep/one.go"},
+				OldTo: graph.UnresolvedMarker + "import::other"},
 		})
 		indexes.prepare(pending)
 		indexes.clearPage()
@@ -337,7 +357,8 @@ func TestReachabilityProjectionUnresolvedImportsStayFresh(t *testing.T) {
 
 	store.projected["repo/caller.go"] = []string{"dep2/two.go"}
 	r.noteImportEdgeReindexes([]graph.EdgeReindex{
-		{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "repo/caller.go"}},
+		{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "repo/caller.go", To: "dep2/two.go"},
+			OldTo: graph.UnresolvedMarker + "import::dep"},
 	})
 	indexes.prepare(pending)
 	defer indexes.clearPage()

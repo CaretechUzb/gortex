@@ -4816,6 +4816,14 @@ func (r *Resolver) noteImportEdgeReindexes(batch []graph.EdgeReindex) {
 		if !importsRow {
 			continue
 		}
+		// Frontier revisits rewrite still-unresolved import edges for pure
+		// bookkeeping (meta, confidence, terminality). A rewrite that keeps
+		// target, kind, and file cannot change stored adjacency — dirtying
+		// it would evict exactly the unstable files the retention serves.
+		if reindex.Edge != nil && reindex.OldTo == reindex.Edge.To &&
+			reindex.OldKind == "" && reindex.OldFilePath == "" {
+			continue
+		}
 		marked := false
 		if reindex.Edge != nil && reindex.Edge.FilePath != "" {
 			r.markImportDirty(reindex.Edge.FilePath)
