@@ -255,12 +255,9 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 	s := &SharedServer{}
 
-	// Resolve the store path once, up front: the lock, the open, and the
-	// path published on SharedServer must all name the same file, and a bad
-	// backend name is rejected before anything touches the filesystem.
-	if err := checkBackend(cfg.Backend); err != nil {
-		return nil, err
-	}
+	// Resolve the store path once: the lock, the open, and the path published
+	// on SharedServer must all name the same file. The backend name was
+	// already rejected above, before anything touched the filesystem.
 	storePath, err := resolveBackendPath(cfg.BackendPath, "store.sqlite")
 	if err != nil {
 		return nil, err
