@@ -62,10 +62,16 @@ func newFactSpool() (*factSpool, error) {
 	if _, err := db.Exec(`PRAGMA journal_mode=OFF;
 PRAGMA synchronous=OFF;
 PRAGMA cache_size=-4096;
-CREATE TABLE file_facts (
+CREATE TABLE files (
   file_path TEXT PRIMARY KEY,
+  repo_prefix TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE file_facts (
+  class INTEGER NOT NULL,
+  file_path TEXT NOT NULL,
   repo_prefix TEXT NOT NULL,
-  payload BLOB NOT NULL
+  payload BLOB NOT NULL,
+  PRIMARY KEY (class, file_path)
 ) WITHOUT ROWID;
 CREATE TABLE resolved_aliases (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,14 +99,6 @@ func (s *factSpool) close() {
 	_ = os.Remove(s.path + "-journal")
 	_ = os.Remove(s.path + "-wal")
 	_ = os.Remove(s.path + "-shm")
-}
-
-type encodedFileFacts struct {
-	Imports []Import       `json:"imports,omitempty"`
-	Calls   []encodedCall  `json:"calls,omitempty"`
-	Supers  []encodedSuper `json:"supers,omitempty"`
-	Metas   []encodedMeta  `json:"metas,omitempty"`
-	Aliases []encodedAlias `json:"aliases,omitempty"`
 }
 
 type encodedCall struct {
@@ -161,44 +159,6 @@ func decodeCallFact(in *encodedCall) *callFact {
 		recvIdent: in.RecvIdent, recvChain: decodeCallFact(in.RecvChain),
 		inferred: in.Inferred, argCount: in.ArgCount, argKnown: in.ArgKnown,
 	}
-}
-
-func marshalFileFacts(facts *fileFacts) ([]byte, error) {
-	wire := encodedFileFacts{Imports: facts.imports}
-	for i := range facts.calls {
-		wire.Calls = append(wire.Calls, *encodeCallFact(&facts.calls[i]))
-	}
-	for _, fact := range facts.supers {
-		wire.Supers = append(wire.Supers, encodedSuper{fact.typeName, fact.superName, fact.kind, fact.line})
-	}
-	for _, fact := range facts.metas {
-		wire.Metas = append(wire.Metas, encodedMeta{fact.key, fact.value, fact.owner, fact.name, fact.line})
-	}
-	for _, fact := range facts.aliases {
-		wire.Aliases = append(wire.Aliases, encodedAlias{fact.typeName, fact.alias, fact.trait, fact.method, fact.line})
-	}
-	return json.Marshal(&wire)
-}
-
-func unmarshalFileFacts(filePath, repoPrefix string, payload []byte) (*fileFacts, error) {
-	var wire encodedFileFacts
-	if err := json.Unmarshal(payload, &wire); err != nil {
-		return nil, err
-	}
-	facts := &fileFacts{file: filePath, repoPrefix: repoPrefix, imports: wire.Imports}
-	for i := range wire.Calls {
-		facts.calls = append(facts.calls, *decodeCallFact(&wire.Calls[i]))
-	}
-	for _, fact := range wire.Supers {
-		facts.supers = append(facts.supers, superFact{fact.TypeName, fact.SuperName, fact.Kind, fact.Line})
-	}
-	for _, fact := range wire.Metas {
-		facts.metas = append(facts.metas, metaFact{fact.Key, fact.Value, fact.Owner, fact.Name, fact.Line})
-	}
-	for _, fact := range wire.Aliases {
-		facts.aliases = append(facts.aliases, aliasFact{fact.TypeName, fact.Alias, fact.Trait, fact.Method, fact.Line})
-	}
-	return facts, nil
 }
 
 // factClass partitions one file's facts by the phase that applies them.
@@ -308,17 +268,26 @@ func unmarshalClassPayload(facts *fileFacts, class factClass, payload []byte) er
 }
 
 type stagedFileFacts struct {
-	facts   *fileFacts
-	payload []byte
+	facts    *fileFacts
+	payloads map[factClass][]byte
+	bytes    int
 }
 
 func stageFileFacts(facts *fileFacts) (stagedFileFacts, error) {
-	payload, err := marshalFileFacts(facts)
-	return stagedFileFacts{facts: facts, payload: payload}, err
+	payloads, err := marshalClassPayloads(facts)
+	if err != nil {
+		return stagedFileFacts{}, err
+	}
+	total := 0
+	for _, payload := range payloads {
+		total += len(payload)
+	}
+	return stagedFileFacts{facts: facts, payloads: payloads, bytes: total}, nil
 }
 
 // appendFiles performs one bounded transaction for a writer page; it is never
-// called once per parser worker or source file.
+// called once per parser worker or source file. Each record lands as one
+// files row plus a file_facts row per non-empty class.
 func (s *factSpool) appendFiles(records []stagedFileFacts) error {
 	if len(records) == 0 {
 		return nil
@@ -328,65 +297,90 @@ func (s *factSpool) appendFiles(records []stagedFileFacts) error {
 		return err
 	}
 	for start := 0; start < len(records); start += tstypesSQLChunkRows {
-		end := start + tstypesSQLChunkRows
-		if end > len(records) {
-			end = len(records)
-		}
-		values := make([]string, 0, end-start)
-		args := make([]any, 0, (end-start)*3)
+		end := min(start+tstypesSQLChunkRows, len(records))
+		fileValues := make([]string, 0, end-start)
+		fileArgs := make([]any, 0, (end-start)*2)
+		classValues := make([]string, 0, (end-start)*4)
+		classArgs := make([]any, 0, (end-start)*4*4)
 		for _, record := range records[start:end] {
 			if record.facts == nil {
 				continue
 			}
-			values = append(values, "(?,?,?)")
-			args = append(args, record.facts.file, record.facts.repoPrefix, record.payload)
+			fileValues = append(fileValues, "(?,?)")
+			fileArgs = append(fileArgs, record.facts.file, record.facts.repoPrefix)
+			for class, payload := range record.payloads {
+				classValues = append(classValues, "(?,?,?,?)")
+				classArgs = append(classArgs, int(class), record.facts.file, record.facts.repoPrefix, payload)
+			}
 		}
-		if len(values) == 0 {
-			continue
+		if len(fileValues) > 0 {
+			query := `INSERT INTO files(file_path,repo_prefix) VALUES ` + strings.Join(fileValues, ",") + `
+ON CONFLICT(file_path) DO UPDATE SET repo_prefix=excluded.repo_prefix`
+			if _, err := tx.Exec(query, fileArgs...); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
 		}
-		query := `INSERT INTO file_facts(file_path,repo_prefix,payload) VALUES ` + strings.Join(values, ",") + `
-ON CONFLICT(file_path) DO UPDATE SET repo_prefix=excluded.repo_prefix,payload=excluded.payload`
-		if _, err := tx.Exec(query, args...); err != nil {
-			_ = tx.Rollback()
-			return err
+		if len(classValues) > 0 {
+			query := `INSERT INTO file_facts(class,file_path,repo_prefix,payload) VALUES ` + strings.Join(classValues, ",") + `
+ON CONFLICT(class,file_path) DO UPDATE SET repo_prefix=excluded.repo_prefix,payload=excluded.payload`
+			if _, err := tx.Exec(query, classArgs...); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
 		}
 	}
 	return tx.Commit()
 }
 
-// page reads a deterministic keyset page. Rows are streamed and the byte cap
-// stops decoding before a second large row can inflate retained memory.
+// page reads a deterministic keyset page over the staged files, hydrating
+// every class — transitional full-fat shape; per-class paging lands with the
+// phase-loop change.
 func (s *factSpool) page(ctx context.Context, after string) ([]*fileFacts, string, factPageStats, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT file_path,repo_prefix,payload FROM file_facts
+	rows, err := s.db.QueryContext(ctx, `SELECT file_path,repo_prefix FROM files
 WHERE file_path > ? ORDER BY file_path LIMIT ?`, after, tstypesFactPageFiles)
 	if err != nil {
 		return nil, after, factPageStats{}, err
 	}
-	defer rows.Close()
 	page := make([]*fileFacts, 0, tstypesFactPageFiles)
 	stats := factPageStats{}
 	last := after
 	for rows.Next() {
 		var filePath, repoPrefix string
-		var payload []byte
-		if err := rows.Scan(&filePath, &repoPrefix, &payload); err != nil {
+		if err := rows.Scan(&filePath, &repoPrefix); err != nil {
+			_ = rows.Close()
 			return nil, last, stats, err
 		}
-		if len(page) > 0 && stats.Bytes+len(payload) > tstypesFactPageBytes {
-			break
-		}
-		facts, err := unmarshalFileFacts(filePath, repoPrefix, payload)
-		if err != nil {
-			return nil, last, stats, fmt.Errorf("decode facts for %s: %w", filePath, err)
-		}
-		page = append(page, facts)
+		page = append(page, &fileFacts{file: filePath, repoPrefix: repoPrefix})
 		last = filePath
 		stats.Files++
-		stats.Bytes += len(payload)
-		stats.Facts += len(facts.imports) + len(facts.calls) + len(facts.supers) + len(facts.metas) + len(facts.aliases)
 	}
-	if err := rows.Err(); err != nil {
+	if err := rows.Close(); err != nil {
 		return nil, last, stats, err
+	}
+	for _, facts := range page {
+		classRows, err := s.db.QueryContext(ctx, `SELECT class,payload FROM file_facts
+WHERE file_path = ? ORDER BY class`, facts.file)
+		if err != nil {
+			return nil, last, stats, err
+		}
+		for classRows.Next() {
+			var class int
+			var payload []byte
+			if err := classRows.Scan(&class, &payload); err != nil {
+				_ = classRows.Close()
+				return nil, last, stats, err
+			}
+			if err := unmarshalClassPayload(facts, factClass(class), payload); err != nil {
+				_ = classRows.Close()
+				return nil, last, stats, fmt.Errorf("decode facts for %s: %w", facts.file, err)
+			}
+			stats.Bytes += len(payload)
+		}
+		if err := classRows.Close(); err != nil {
+			return nil, last, stats, err
+		}
+		stats.Facts += len(facts.imports) + len(facts.calls) + len(facts.supers) + len(facts.metas) + len(facts.aliases)
 	}
 	return page, last, stats, nil
 }

@@ -54,3 +54,34 @@ func TestMarshalClassPayloadsRoundTrip(t *testing.T) {
 		t.Fatalf("aliases should stay empty: %+v", dst.aliases)
 	}
 }
+
+func TestAppendFilesWritesClassRows(t *testing.T) {
+	spool, err := newFactSpool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.close()
+	record, err := stageFileFacts(sampleFacts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.bytes <= 0 {
+		t.Fatal("staged bytes must sum class payloads")
+	}
+	if err := spool.appendFiles([]stagedFileFacts{record}); err != nil {
+		t.Fatal(err)
+	}
+	var fileRows, classRows, aliasClassRows int
+	if err := spool.db.QueryRow(`SELECT COUNT(*) FROM files`).Scan(&fileRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.db.QueryRow(`SELECT COUNT(*) FROM file_facts`).Scan(&classRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.db.QueryRow(`SELECT COUNT(*) FROM file_facts WHERE class=3`).Scan(&aliasClassRows); err != nil {
+		t.Fatal(err)
+	}
+	if fileRows != 1 || classRows != 4 || aliasClassRows != 0 {
+		t.Fatalf("rows: files=%d classes=%d aliases=%d (want 1/4/0)", fileRows, classRows, aliasClassRows)
+	}
+}

@@ -104,12 +104,12 @@ func (p *Provider) stageRepoFacts(ctx context.Context, files []fileRef, spool *f
 			continue
 		}
 		if len(batch) > 0 && (len(batch) >= tstypesFactPageFiles ||
-			batchBytes+len(record.payload) > tstypesFactPageBytes) {
+			batchBytes+record.bytes > tstypesFactPageBytes) {
 			flush()
 		}
 		if stageErr == nil {
 			batch = append(batch, record)
-			batchBytes += len(record.payload)
+			batchBytes += record.bytes
 		}
 	}
 	if stageErr == nil && ctx.Err() == nil {
