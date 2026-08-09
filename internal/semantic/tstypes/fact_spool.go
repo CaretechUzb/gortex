@@ -333,58 +333,6 @@ ON CONFLICT(class,file_path) DO UPDATE SET repo_prefix=excluded.repo_prefix,payl
 	return tx.Commit()
 }
 
-// page reads a deterministic keyset page over the staged files, hydrating
-// every class — transitional full-fat shape; per-class paging lands with the
-// phase-loop change.
-func (s *factSpool) page(ctx context.Context, after string) ([]*fileFacts, string, factPageStats, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT file_path,repo_prefix FROM files
-WHERE file_path > ? ORDER BY file_path LIMIT ?`, after, tstypesFactPageFiles)
-	if err != nil {
-		return nil, after, factPageStats{}, err
-	}
-	page := make([]*fileFacts, 0, tstypesFactPageFiles)
-	stats := factPageStats{}
-	last := after
-	for rows.Next() {
-		var filePath, repoPrefix string
-		if err := rows.Scan(&filePath, &repoPrefix); err != nil {
-			_ = rows.Close()
-			return nil, last, stats, err
-		}
-		page = append(page, &fileFacts{file: filePath, repoPrefix: repoPrefix})
-		last = filePath
-		stats.Files++
-	}
-	if err := rows.Close(); err != nil {
-		return nil, last, stats, err
-	}
-	for _, facts := range page {
-		classRows, err := s.db.QueryContext(ctx, `SELECT class,payload FROM file_facts
-WHERE file_path = ? ORDER BY class`, facts.file)
-		if err != nil {
-			return nil, last, stats, err
-		}
-		for classRows.Next() {
-			var class int
-			var payload []byte
-			if err := classRows.Scan(&class, &payload); err != nil {
-				_ = classRows.Close()
-				return nil, last, stats, err
-			}
-			if err := unmarshalClassPayload(facts, factClass(class), payload); err != nil {
-				_ = classRows.Close()
-				return nil, last, stats, fmt.Errorf("decode facts for %s: %w", facts.file, err)
-			}
-			stats.Bytes += len(payload)
-		}
-		if err := classRows.Close(); err != nil {
-			return nil, last, stats, err
-		}
-		stats.Facts += len(facts.imports) + len(facts.calls) + len(facts.supers) + len(facts.metas) + len(facts.aliases)
-	}
-	return page, last, stats, nil
-}
-
 // pageClass reads a deterministic keyset page of one fact class. Every
 // returned fileFacts carries that class plus the file's imports — buildIndex
 // needs the import map in every phase. Files without facts of the class have

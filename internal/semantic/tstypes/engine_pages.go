@@ -276,6 +276,32 @@ func factCallChainDepth(facts *fileFacts) int {
 	return maxDepth
 }
 
+// coverFiles hydrates the page's per-file node groups (through the pass hot
+// cache — warming them for every later phase) and counts covered symbols.
+// It replaces the coverage side effect the supers phase carried when every
+// file appeared in its walk; the walk itself decodes no facts.
+func (a *applier) coverFiles(page []*fileFacts) int {
+	files := make([]string, 0, len(page))
+	fileSet := make(map[string]struct{}, len(page))
+	repoNames := make(map[string]map[string]struct{})
+	for _, facts := range page {
+		if facts == nil || facts.file == "" {
+			continue
+		}
+		if _, duplicate := fileSet[facts.file]; duplicate {
+			continue
+		}
+		fileSet[facts.file] = struct{}{}
+		files = append(files, facts.file)
+		if _, ok := repoNames[facts.repoPrefix]; !ok {
+			repoNames[facts.repoPrefix] = make(map[string]struct{})
+		}
+	}
+	sort.Strings(files)
+	a.loadPageFileNodes(files, fileSet, repoNames)
+	return a.coveredSymbols(page)
+}
+
 func (a *applier) preparePage(all []*fileFacts) []*fileIndex {
 	sort.Slice(all, func(i, j int) bool { return all[i].file < all[j].file })
 	a.preload(all)

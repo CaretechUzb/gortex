@@ -152,6 +152,34 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 	// process CPU (48–62% measured) because each of the 4 phases re-fetched
 	// near-identical name groups and inheritance frontiers per 32-file page.
 	hot := newApplyHotCache(applyHotCacheBudget())
+
+	// Coverage walk: every staged file, no payload decode. The supers phase
+	// no longer sees files without inheritance facts, so coverage counting
+	// cannot ride on it; this walk also pre-warms the per-file node groups
+	// for all four phases.
+	after := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		page, last, err := spool.pageFiles(ctx, after)
+		if err != nil {
+			return err
+		}
+		if len(page) == 0 {
+			break
+		}
+		ap := newApplier(g, p.spec, p.Name()).withHotCache(hot)
+		res.SymbolsCovered += ap.coverFiles(page)
+		after = last
+	}
+
+	classForPhase := map[stagedFactPhase]factClass{
+		stagedSupers:  classSupers,
+		stagedMetas:   classMetas,
+		stagedAliases: classAliases,
+		stagedCalls:   classCalls,
+	}
 	for phase := stagedSupers; phase <= stagedCalls; phase++ {
 		// Adjacency is only valid within one phase: the supers phase
 		// synthesizes inheritance edges that later phases' frontier walks
@@ -164,7 +192,7 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			page, last, stats, err := spool.page(ctx, after)
+			page, last, stats, err := spool.pageClass(ctx, classForPhase[phase], after)
 			if err != nil {
 				return err
 			}
@@ -175,7 +203,6 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 			switch phase {
 			case stagedSupers:
 				err = ap.applySupersPage(ctx, page, res)
-				res.SymbolsCovered += ap.coveredSymbols(page)
 			case stagedMetas:
 				err = ap.applyMetasPage(ctx, page, res)
 				ap.flush()
