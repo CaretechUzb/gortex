@@ -55,9 +55,12 @@ var (
 	daemonHTTPConversationAllow []string
 	daemonBackend               string
 	daemonBackendPath           string
-	daemonBackendBufferPoolMB   uint64
 	daemonTools                 string
 	daemonToolsMode             string
+	// daemonBackendBufferPoolMBIgnored is the sink for the retired
+	// --backend-buffer-pool-mb flag. Nothing reads it: SQLite sizes its page
+	// cache via a pragma, so there is no advisory cap to honour.
+	daemonBackendBufferPoolMBIgnored uint64
 )
 
 var daemonCmd = &cobra.Command{
@@ -144,8 +147,12 @@ func init() {
 		"storage backend: sqlite (pure-Go embedded SQL, persists to --backend-path so warm restarts skip re-indexing). It is the only backend; point --backend-path at a throwaway file for a store that does not outlive the run")
 	daemonStartCmd.Flags().StringVar(&daemonBackendPath, "backend-path", "",
 		"path to the store file (its parent directory is created if absent). Defaults to ~/.gortex/store/store.sqlite")
-	daemonStartCmd.Flags().Uint64Var(&daemonBackendBufferPoolMB, "backend-buffer-pool-mb", 0,
-		"advisory page-cache cap (MiB) for the store. 0 reads $GORTEX_DAEMON_BUFFER_POOL_MB or lets the backend choose its own default; sqlite manages its own cache and ignores it")
+	daemonStartCmd.Flags().Uint64Var(&daemonBackendBufferPoolMBIgnored, "backend-buffer-pool-mb", 0,
+		"deprecated no-op; sqlite sizes its page cache via a pragma, so there is no advisory cap to set")
+	// Hidden rather than removed: cobra hard-errors on an unknown flag, so a
+	// deletion would break existing daemon-start scripts and the detach
+	// re-exec path. Nothing should learn it from --help.
+	_ = daemonStartCmd.Flags().MarkHidden("backend-buffer-pool-mb")
 	daemonStartCmd.Flags().StringVar(&daemonTools, "tools", "",
 		"restrict the published MCP tool surface to a preset: core (default)|full|readonly|edit|nav (optionally with ,+tool / ,-tool deltas). GORTEX_TOOLS overrides this")
 	daemonStartCmd.Flags().StringVar(&daemonToolsMode, "tools-mode", "",
@@ -1768,21 +1775,6 @@ func daemonControlClient() (*daemon.Client, error) {
 		return nil, fmt.Errorf("daemon not reachable (%v) — is it running? Try `gortex daemon start`", err)
 	}
 	return c, nil
-}
-
-// resolveDaemonBufferPoolMB returns the effective buffer-pool cap.
-// Precedence: --backend-buffer-pool-mb flag > GORTEX_DAEMON_BUFFER_POOL_MB env > 0
-// (which Open then maps to DefaultBufferPoolMB inside the store).
-func resolveDaemonBufferPoolMB() uint64 {
-	if daemonBackendBufferPoolMB != 0 {
-		return daemonBackendBufferPoolMB
-	}
-	if env := strings.TrimSpace(os.Getenv("GORTEX_DAEMON_BUFFER_POOL_MB")); env != "" {
-		if v, err := strconv.ParseUint(env, 10, 64); err == nil {
-			return v
-		}
-	}
-	return 0
 }
 
 // killByPID is the fallback stop path for stale daemons that have a PID

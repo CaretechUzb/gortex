@@ -79,7 +79,6 @@ type SharedServerConfig struct {
 	Logger         *zap.Logger
 	Version        string
 	Embedder       EmbedderRequest
-	BufferPoolMB   uint64
 	SideStores     SideStores
 	ScopeWorkspace string
 	ScopeProject   string
@@ -285,7 +284,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 	// allowRebuild is gated on actually holding the store lock: only then may
 	// the sqlite backend drop and recreate an incompatible-schema DB.
-	g, backendCleanup, err := OpenBackend(cfg.Backend, storePath, cfg.BufferPoolMB, logger, storeLockHeld)
+	g, backendCleanup, err := OpenBackend(cfg.Backend, storePath, logger, storeLockHeld)
 	if err != nil {
 		return nil, err
 	}

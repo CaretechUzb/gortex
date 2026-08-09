@@ -106,14 +106,13 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	applyToolPresetFlags(cfg, daemonTools, daemonToolsMode)
 
 	ss, err := serverstack.NewSharedServer(serverstack.SharedServerConfig{
-		Lifecycle:    serverstack.LifecycleDaemon,
-		Backend:      daemonBackend,
-		BackendPath:  daemonBackendPath,
-		BufferPoolMB: resolveDaemonBufferPoolMB(),
-		Config:       cfg,
-		Global:       gc,
-		Logger:       logger,
-		Version:      version,
+		Lifecycle:   serverstack.LifecycleDaemon,
+		Backend:     daemonBackend,
+		BackendPath: daemonBackendPath,
+		Config:      cfg,
+		Global:      gc,
+		Logger:      logger,
+		Version:     version,
 		Embedder: serverstack.EmbedderRequest{
 			FlagChanged: daemonEmbeddingsChanged,
 			FlagEnabled: daemonEmbeddings,
