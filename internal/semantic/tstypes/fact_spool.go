@@ -28,6 +28,7 @@ type factSpool struct {
 }
 
 type factPageStats struct {
+	Class      factClass
 	Files      int
 	Facts      int
 	Bytes      int
@@ -344,7 +345,7 @@ WHERE class = ? AND file_path > ? ORDER BY file_path LIMIT ?`, int(class), after
 		return nil, after, factPageStats{}, err
 	}
 	page := make([]*fileFacts, 0, tstypesFactPageFiles)
-	stats := factPageStats{}
+	stats := factPageStats{Class: class}
 	last := after
 	for rows.Next() {
 		var filePath, repoPrefix string

@@ -283,6 +283,28 @@ func (c *applyHotCache) putIn(id string, edges []*graph.Edge) {
 	c.cur.bytes += int64(len(id)) + applyHotEdgesBytes(edges)
 }
 
+// applyHotCacheStats reports the funnel counters for the pass-end log line —
+// they were previously write-only, which left this cache invisible to the
+// completion log the resolver-side caches already have.
+type applyHotCacheStats struct {
+	NodeHits, NodeMisses int64
+	NameHits, NameMisses int64
+	AdjHits, AdjMisses   int64
+	FileHits, FileMisses int64
+}
+
+func (c *applyHotCache) statsSnapshot() applyHotCacheStats {
+	if c == nil {
+		return applyHotCacheStats{}
+	}
+	return applyHotCacheStats{
+		NodeHits: c.nodeHits, NodeMisses: c.nodeMisses,
+		NameHits: c.nameHits, NameMisses: c.nameMisses,
+		AdjHits: c.adjHits, AdjMisses: c.adjMisses,
+		FileHits: c.fileHits, FileMisses: c.fileMisses,
+	}
+}
+
 // flushAdjacency drops every cached adjacency entry in both generations. The
 // driver calls it at phase boundaries: the supers phase synthesizes
 // inheritance edges, and every later phase's frontier walk must observe them

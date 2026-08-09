@@ -234,6 +234,14 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 			after = last
 		}
 	}
+	stats := hot.statsSnapshot()
+	p.logger.Info("tstypes: apply hot cache",
+		zap.String("provider", p.Name()),
+		zap.String("repo_prefix", repoPrefix),
+		zap.Int64("node_hits", stats.NodeHits), zap.Int64("node_misses", stats.NodeMisses),
+		zap.Int64("name_hits", stats.NameHits), zap.Int64("name_misses", stats.NameMisses),
+		zap.Int64("adj_hits", stats.AdjHits), zap.Int64("adj_misses", stats.AdjMisses),
+		zap.Int64("file_hits", stats.FileHits), zap.Int64("file_misses", stats.FileMisses))
 	if res.SymbolsTotal > 0 {
 		res.CoveragePercent = float64(res.SymbolsCovered) / float64(res.SymbolsTotal) * 100
 	}
