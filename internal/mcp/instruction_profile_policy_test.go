@@ -1,13 +1,14 @@
 package mcp
 
 import (
+	"fmt"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/profiles"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // TestMain pins the instruction-profile env override to the default
@@ -18,30 +19,21 @@ import (
 func TestMain(m *testing.M) {
 	os.Setenv(profiles.ActiveEnv, profiles.DefaultName)
 
-	// NewServer constructs the query logger eagerly. Keep its default path in
-	// a disposable package-local cache so concurrent package tests cannot write
-	// through to the developer's real ~/.gortex/cache/query-log.jsonl.
-	testCache, err := os.MkdirTemp("", "gortex-mcp-test-cache-")
+	// NewServer constructs the query logger and mounts the global memory store
+	// eagerly. Sandbox the whole process so both XDG_CACHE_HOME and the
+	// XDG_DATA_HOME-backed ~/.gortex/memories path stay out of the developer's
+	// real home.
+	restore, err := testenv.SandboxProcess()
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "internal/mcp: cannot sandbox the test environment: %v\n", err)
 		os.Exit(1)
 	}
-	previousCache, hadCache := os.LookupEnv("XDG_CACHE_HOME")
-	previousQueryLog, hadQueryLog := os.LookupEnv("GORTEX_QUERY_LOG")
-	_ = os.Setenv("XDG_CACHE_HOME", testCache)
-	_ = os.Setenv("GORTEX_QUERY_LOG", filepath.Join(testCache, "query-log.jsonl"))
+	// query_log.go lets an ambient GORTEX_QUERY_LOG override CacheDir, so clear
+	// it and let the logger resolve the sandboxed cache directory.
+	_ = os.Unsetenv("GORTEX_QUERY_LOG")
 
 	code := m.Run()
-	if hadCache {
-		_ = os.Setenv("XDG_CACHE_HOME", previousCache)
-	} else {
-		_ = os.Unsetenv("XDG_CACHE_HOME")
-	}
-	if hadQueryLog {
-		_ = os.Setenv("GORTEX_QUERY_LOG", previousQueryLog)
-	} else {
-		_ = os.Unsetenv("GORTEX_QUERY_LOG")
-	}
-	_ = os.RemoveAll(testCache)
+	restore()
 	os.Exit(code)
 }
 
