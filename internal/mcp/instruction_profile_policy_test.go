@@ -1,12 +1,14 @@
 package mcp
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/profiles"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // TestMain pins the instruction-profile env override to the default
@@ -16,7 +18,23 @@ import (
 // stub activeInstructionPreset directly.
 func TestMain(m *testing.M) {
 	os.Setenv(profiles.ActiveEnv, profiles.DefaultName)
-	os.Exit(m.Run())
+
+	// NewServer constructs the query logger and mounts the global memory store
+	// eagerly. Sandbox the whole process so both XDG_CACHE_HOME and the
+	// XDG_DATA_HOME-backed ~/.gortex/memories path stay out of the developer's
+	// real home.
+	restore, err := testenv.SandboxProcess()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "internal/mcp: cannot sandbox the test environment: %v\n", err)
+		os.Exit(1)
+	}
+	// query_log.go lets an ambient GORTEX_QUERY_LOG override CacheDir, so clear
+	// it and let the logger resolve the sandboxed cache directory.
+	_ = os.Unsetenv("GORTEX_QUERY_LOG")
+
+	code := m.Run()
+	restore()
+	os.Exit(code)
 }
 
 // stubActiveProfilePreset swaps the machine-state reader for the test.
