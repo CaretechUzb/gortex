@@ -154,16 +154,31 @@ func TestBuildSearchIndex_ChunkedSymbolNotDuplicatedInSearch(t *testing.T) {
 	b.WriteString("}\n\nfunc checkField() {}\n")
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "v.go"), []byte(b.String()), 0o644))
 
-	g := graph.New()
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewGoExtractor())
 	cfg := config.Default().Index
 	cfg.Workers = 1
-	idx := New(g, reg, cfg, zap.NewNop())
-	idx.SetEmbedder(stubEmbedder{})
-	idx.SetEmbeddingChunkOptions(embedding.ChunkOptions{ThresholdLines: 20, WindowLines: 15})
-	_, err := idx.Index(dir)
+	idx, store := newFTSIndexer(t, dir, reg, cfg, func(idx *Indexer) {
+		idx.SetEmbedder(stubEmbedder{})
+		idx.SetEmbeddingChunkOptions(embedding.ChunkOptions{ThresholdLines: 20, WindowLines: 15})
+	})
+
+	const symbolID = "v.go::ValidateRequestPayload"
+
+	// Probe the text half of the hybrid on its own first. The fused result
+	// below cannot carry this claim: the stub embedder maps every text to the
+	// same direction, so the vector channel returns the whole corpus for any
+	// query and would answer "is the symbol retrievable" no matter what the
+	// text side did. The query is multi-word on purpose — an identifier-shaped
+	// query is short-circuited on an exact FindNodesByName hit (store_fts.go
+	// tier 0) and never reaches the ranked FTS tier.
+	ftsHits, err := store.SearchSymbols("validate request payload", 20)
 	require.NoError(t, err)
+	ftsIDs := make([]string, 0, len(ftsHits))
+	for _, h := range ftsHits {
+		ftsIDs = append(ftsIDs, h.NodeID)
+	}
+	require.Contains(t, ftsIDs, symbolID, "the chunked symbol must be in the symbol FTS corpus")
 
 	results := idx.Search().Search("ValidateRequestPayload", 20)
 	require.NotEmpty(t, results)
@@ -174,6 +189,6 @@ func TestBuildSearchIndex_ChunkedSymbolNotDuplicatedInSearch(t *testing.T) {
 			"a chunk ID must never appear in search output")
 		seen[r.ID]++
 	}
-	assert.LessOrEqual(t, seen["v.go::ValidateRequestPayload"], 1,
-		"the chunked symbol must not be returned more than once")
+	assert.Equal(t, 1, seen[symbolID],
+		"the chunked symbol must be returned exactly once")
 }

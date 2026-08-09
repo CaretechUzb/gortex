@@ -12,13 +12,46 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
-	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 )
 
+// newFTSServer indexes dir into a real sqlite store and returns a Server whose
+// search reads that store's native symbol FTS — the corpus production actually
+// serves. Everything the daemon's search_symbols path touches (the engine, the
+// retrieval channels, the rerank) then sees the same documents and the same
+// ranking it would see in a live workspace.
+//
+// The SymbolFTSCount gate is load-bearing: an empty corpus answers every
+// "must not be returned" assertion correctly and leaves the "must be returned"
+// ones as the only thing between the fixture and a silent pass.
+func newFTSServer(t *testing.T, dir string, cfg config.IndexConfig) *Server {
+	t.Helper()
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "fts.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	idx := indexer.New(store, testRegistry(), cfg, zap.NewNop())
+	_, err = idx.Index(dir)
+	require.NoError(t, err)
+	requireSymbolFTS(t, store)
+
+	eng := query.NewEngine(store)
+	eng.SetSearchProvider(idx.Search)
+	return NewServer(eng, store, idx, nil, zap.NewNop(), nil)
+}
+
+// requireSymbolFTS fails unless the store's symbol corpus holds something.
+func requireSymbolFTS(t *testing.T, store *store_sqlite.Store) {
+	t.Helper()
+	count, err := store.SymbolFTSCount()
+	require.NoError(t, err)
+	require.Greater(t, count, 0, "fixture left the symbol FTS empty — search assertions would be vacuous")
+}
+
 // corpusTestServer indexes a repo containing a Go file and a Markdown
-// doc, so the BM25 index holds both code symbols and prose-section
+// doc, so the symbol FTS corpus holds both code symbols and prose-section
 // nodes.
 func corpusTestServer(t *testing.T) *Server {
 	return corpusTestServerProse(t, true)
@@ -39,16 +72,9 @@ func corpusTestServerProse(t *testing.T, indexProse bool) *Server {
 			"and apply the kubernetes manifest.\n\n"+
 			"## Troubleshooting\n\nCheck the logs when a request times out.\n"), 0o644))
 
-	g := graph.New()
-	reg := testRegistry()
 	cfg := config.Default()
 	cfg.Index.IndexProse = indexProse
-	idx := indexer.New(g, reg, cfg.Index, zap.NewNop())
-	_, err := idx.Index(dir)
-	require.NoError(t, err)
-	eng := query.NewEngine(g)
-	eng.SetSearchProvider(idx.Search)
-	return NewServer(eng, g, idx, nil, zap.NewNop(), nil)
+	return newFTSServer(t, dir, cfg.Index)
 }
 
 func corpusSearch(t *testing.T, srv *Server, args map[string]any) []map[string]any {

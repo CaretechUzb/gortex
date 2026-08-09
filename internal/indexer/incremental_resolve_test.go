@@ -189,7 +189,7 @@ func TestIncrementalReindex_DeletedDefinition_NoStaleTierOnStub(t *testing.T) {
 // cascade: deleting a file drops its nodes' churn/coverage/blame
 // sidecar rows, leaving no orphan enrichment.
 func TestEvictFile_DropsEnrichmentSidecars(t *testing.T) {
-	idx, _ := newToggleIndexer(t)
+	idx, _, _ := newToggleIndexer(t)
 	dir := t.TempDir()
 	idx.SetRootPath(dir)
 	g := idx.graph

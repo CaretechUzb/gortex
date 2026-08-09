@@ -19,6 +19,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search"
@@ -828,18 +829,24 @@ func newTwoRepoServer(t *testing.T) (*Server, string) {
 	cm, err := config.NewConfigManager(tmpCfg)
 	require.NoError(t, err)
 
-	g := graph.New()
-	reg := testRegistry()
-	bm := search.NewBM25()
-	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
+	// A real sqlite store: search runs off its native symbol FTS, the same
+	// corpus the daemon serves, so the scope narrowing is applied to
+	// production-shaped hits.
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "fts.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	backend := search.NewSymbolSearcherBackend(store)
+	mi := indexer.NewMultiIndexer(store, testRegistry(), backend, cm, zap.NewNop())
 	_, err = mi.IndexScoped("", "")
 	require.NoError(t, err)
+	requireSymbolFTS(t, store)
 
-	eng := query.NewEngine(g)
-	eng.SetSearch(bm)
+	eng := query.NewEngine(store)
+	eng.SetSearch(backend)
 
 	flagVal := true
-	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
+	srv := NewServer(eng, store, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
 		MultiIndexer:        mi,
 		ConfigManager:       cm,
 		ScopeIntentDefaults: &flagVal,

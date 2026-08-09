@@ -320,8 +320,8 @@ func TestMultiIndexer_TrackRepo_SearchSpansAllRepos(t *testing.T) {
 	cm, err := config.NewConfigManager(tmpCfg)
 	require.NoError(t, err)
 
-	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	store := newFTSStore(t)
+	mi := NewMultiIndexer(store, newTestRegistry(), search.NewSymbolSearcherBackend(store), cm, zap.NewNop())
 
 	for _, e := range []config.RepoEntry{
 		{Path: dirA, Name: "repo-aaa"},
@@ -331,10 +331,13 @@ func TestMultiIndexer_TrackRepo_SearchSpansAllRepos(t *testing.T) {
 		_, err := mi.TrackRepo(e)
 		require.NoError(t, err)
 	}
+	requireSymbolFTS(t, store)
 
 	// Query the camelCase-split tokens individually — that's how the
-	// BM25 backend stores them at Add time, and Search.TokenizeQuery
-	// doesn't perform the same camelCase split.
+	// write-side tokenizer stores them, and the query tokenizer doesn't
+	// perform the same camelCase split. Each is also a token no node
+	// carries as its whole name, so the exact-name short-circuit
+	// (store_fts.go tier 0) misses and the ranked FTS tier answers.
 	for _, want := range []struct{ query, prefix string }{
 		{"alpha", "repo-aaa"},
 		{"beta", "repo-bbb"},
