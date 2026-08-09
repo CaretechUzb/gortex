@@ -121,7 +121,7 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		// receivers (owner.foo() → BaseType.foo two packages up) never name the
 		// declaring package, so the import closure structurally misses them.
 		// Keep the resolution.
-		if r.loneMemberDefnKeep(target, j.edge, j.oldTo) {
+		if r.loneMemberDefnKeep(target, j.edge, j.oldTo, callerFile) {
 			continue
 		}
 		// A C# extension-method bind is corroborated by namespace
@@ -298,8 +298,10 @@ func sameScopePackage(a, b *graph.Node) bool {
 // languages listed in loneMemberLang, and gated on the receiver, when known,
 // naming an in-repo type so an external-typed receiver (a logging facade's
 // `logger.info`) still reverts rather than latching onto an unrelated
-// same-named local method.
-func (r *Resolver) loneMemberDefnKeep(target *graph.Node, e *graph.Edge, oldTo string) bool {
+// same-named local method. C# demands one more corroboration: the
+// candidate's namespace must be visible from the calling file — see the
+// BCL-shadowing note in the body.
+func (r *Resolver) loneMemberDefnKeep(target *graph.Node, e *graph.Edge, oldTo, callerFile string) bool {
 	if target == nil || !loneMemberLang(target.Language) {
 		return false
 	}
@@ -320,6 +322,29 @@ func (r *Resolver) loneMemberDefnKeep(target *graph.Node, e *graph.Edge, oldTo s
 	repo := r.callerRepoPrefix(e)
 	if rt := edgeReceiverType(e); rt != "" && !r.hasInRepoType(rt, repo) {
 		return false
+	}
+	// C#: a lone definition is no corroboration when the name shadows a
+	// BCL member (`Where`, `Select`, `Parse`) — the true target is
+	// external, so the sole indexed homonym is a decoy for every call the
+	// tenv could not type. Demand the candidate's namespace be visible
+	// from the calling file. Narrowing-only, like the extension-
+	// visibility policy: a file with NO recorded usings is stale or
+	// partial data, not evidence of absence — the keep is lost only when
+	// using evidence exists and the namespace is not in it (nor an
+	// enclosing one). For the member shapes that can bind cross-namespace
+	// without the file naming the type — extensions and class-qualified
+	// statics — visibility is the language rule, not a heuristic; for
+	// var-typed instance receivers it trades a rare silent miss for an
+	// honest unresolved.
+	if target.Language == "csharp" {
+		if ns, _ := target.Meta["scope_ns"].(string); ns != "" {
+			visible := r.csharpFileNamespaceSet(callerFile)
+			_, enc := visible.enclosing[ns]
+			_, imp := visible.imported[ns]
+			if len(visible.imported) > 0 && !enc && !imp {
+				return false
+			}
+		}
 	}
 	n := 0
 	for _, c := range r.cachedFindNodesByNameInRepo(name, repo) {
