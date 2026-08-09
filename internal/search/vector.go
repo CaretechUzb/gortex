@@ -1,24 +1,12 @@
 package search
 
 import (
-	"bytes"
-	"encoding/binary"
-	"encoding/json"
-	"fmt"
-	"io"
 	"sync"
 
 	"github.com/coder/hnsw"
 
 	"github.com/zzet/gortex/internal/graph"
 )
-
-// vectorFrameMagic prefixes the framed VectorBackend.Save format: a
-// 4-byte magic, a uint32 chunk-map JSON length, the chunk-map JSON,
-// then the raw HNSW export. A blob lacking the magic is a legacy
-// (pre-chunking) raw HNSW export and is loaded with an empty chunk
-// map — so old snapshots keep working.
-var vectorFrameMagic = [4]byte{'G', 'V', 'X', '1'}
 
 // VectorDelegate is the subset of graph.VectorSearcher the
 // VectorBackend shim consults when it's been told to delegate
@@ -195,82 +183,4 @@ func (v *VectorBackend) SizeBytes() uint64 {
 	const hnswOverhead = 5900 // neighbor lists + map headers + priority-queue slack
 	perVector := uint64(v.dims)*4 + hnswOverhead
 	return uint64(v.count) * perVector
-}
-
-// Save writes the vector index to a writer in the framed format:
-// magic + chunk-map JSON + raw HNSW export. The chunk map is persisted
-// so query-time de-chunking still works after a daemon restart.
-func (v *VectorBackend) Save(w io.Writer) error {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-
-	mapJSON := []byte("{}")
-	if len(v.chunkMap) > 0 {
-		b, err := json.Marshal(v.chunkMap)
-		if err != nil {
-			return fmt.Errorf("marshal chunk map: %w", err)
-		}
-		mapJSON = b
-	}
-	if _, err := w.Write(vectorFrameMagic[:]); err != nil {
-		return fmt.Errorf("write vector frame magic: %w", err)
-	}
-	var lenBuf [4]byte
-	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(mapJSON)))
-	if _, err := w.Write(lenBuf[:]); err != nil {
-		return fmt.Errorf("write chunk map length: %w", err)
-	}
-	if _, err := w.Write(mapJSON); err != nil {
-		return fmt.Errorf("write chunk map: %w", err)
-	}
-	if err := v.graph.Export(w); err != nil {
-		return fmt.Errorf("export vector index: %w", err)
-	}
-	return nil
-}
-
-// LoadFrom restores the vector index from a reader. It accepts both
-// the framed format (magic + chunk map + HNSW) and the legacy raw
-// HNSW export written before AST sub-chunking shipped — a legacy blob
-// has no magic and loads with an empty chunk map.
-func (v *VectorBackend) LoadFrom(r io.Reader) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	// Buffer the whole blob so a missing magic can be replayed into the
-	// HNSW importer. Vector index blobs are small relative to the graph.
-	all, err := io.ReadAll(r)
-	if err != nil {
-		return fmt.Errorf("read vector index: %w", err)
-	}
-	hnswBytes := all
-	v.chunkMap = nil
-	if len(all) >= 8 && bytes.Equal(all[:4], vectorFrameMagic[:]) {
-		mapLen := binary.LittleEndian.Uint32(all[4:8])
-		if int(mapLen)+8 > len(all) {
-			return fmt.Errorf("vector index frame: chunk map length %d exceeds blob", mapLen)
-		}
-		mapJSON := all[8 : 8+mapLen]
-		hnswBytes = all[8+mapLen:]
-		if mapLen > 0 {
-			m := make(map[string]string)
-			if err := json.Unmarshal(mapJSON, &m); err != nil {
-				return fmt.Errorf("unmarshal chunk map: %w", err)
-			}
-			if len(m) > 0 {
-				v.chunkMap = m
-			}
-		}
-	}
-	if err := v.graph.Import(bytes.NewReader(hnswBytes)); err != nil {
-		return fmt.Errorf("import vector index: %w", err)
-	}
-	return nil
-}
-
-// SetCount sets the node count (used after loading from persistence).
-func (v *VectorBackend) SetCount(n int) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.count = n
 }

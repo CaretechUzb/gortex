@@ -1,7 +1,6 @@
 package indexer
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
@@ -274,15 +273,6 @@ type Indexer struct {
 
 	// embedder is the optional embedding provider for semantic search.
 	embedder embedding.Provider
-
-	// skipVectorBuild, when true, makes buildSearchIndex populate only
-	// the text index and never run the embedding pass — even with an
-	// embedder set. The daemon flips it on for the warmup re-index loop
-	// when a snapshot already carries the workspace vector index, so
-	// the graph is not re-embedded only to have the cached index
-	// overwrite it. Off by default; a normal index always builds
-	// vectors when an embedder is present.
-	skipVectorBuild bool
 
 	// bulkVectorSink holds the disk store captured at the bulk-load
 	// shadow swap, so buildSearchIndex can still persist the vector
@@ -1751,13 +1741,6 @@ func (idx *Indexer) ProjectID() string { return idx.projectID }
 // When set, buildSearchIndex will create a HybridBackend with vector search.
 func (idx *Indexer) SetEmbedder(p embedding.Provider) { idx.embedder = p }
 
-// SetSkipVectorBuild toggles the embedding pass in buildSearchIndex.
-// When true, buildSearchIndex builds only the text index — used by the
-// daemon warmup path when a snapshot already carries the workspace
-// vector index, so the graph is not needlessly re-embedded. When false
-// (the default) an indexer with an embedder set always builds vectors.
-func (idx *Indexer) SetSkipVectorBuild(skip bool) { idx.skipVectorBuild = skip }
-
 // SetEmbeddingChunkOptions tunes the AST sub-chunking applied to large
 // symbols before embedding (threshold and window line counts). The
 // zero value leaves the chunker on its built-in defaults.
@@ -1809,55 +1792,6 @@ func (idx *Indexer) SetResolverLSPHelper(h resolver.LSPHelper) {
 // helper, or nil. Exported so MultiIndexer can mirror the helper onto
 // the global post-pass resolver in RunDeferredPassesAll.
 func (idx *Indexer) ResolverLSPHelper() resolver.LSPHelper { return idx.resolverLSPHelper }
-
-// ExportVectorIndex returns the serialized vector index bytes, dims, and count.
-// Returns nil, 0, 0 if no vector index is active.
-func (idx *Indexer) ExportVectorIndex() ([]byte, int, int) {
-	hybrid, ok := idx.swappable().Inner().(*search.HybridBackend)
-	if !ok {
-		return nil, 0, 0
-	}
-	vec := hybrid.VectorIndex()
-	if vec == nil || vec.Count() == 0 {
-		return nil, 0, 0
-	}
-
-	var buf bytes.Buffer
-	if err := vec.Save(&buf); err != nil {
-		idx.logger.Warn("failed to export vector index", zap.Error(err))
-		return nil, 0, 0
-	}
-	return buf.Bytes(), vec.Dims(), vec.Count()
-}
-
-// ImportVectorIndex restores a vector index from serialized data and wraps
-// the current text search backend into a HybridBackend.
-func (idx *Indexer) ImportVectorIndex(data []byte, dims, count int) error {
-	if len(data) == 0 || idx.embedder == nil {
-		return nil
-	}
-
-	// Validate dimensions match the current embedder to avoid mismatches
-	// when switching providers (e.g., GloVe 50d → ONNX 384d).
-	embedderDims := idx.embedder.Dimensions()
-	if embedderDims > 0 && embedderDims != dims {
-		idx.logger.Info("vector index dims mismatch, will re-embed",
-			zap.Int("cached_dims", dims), zap.Int("embedder_dims", embedderDims))
-		return nil // skip import, buildSearchIndex will re-embed
-	}
-
-	vec := search.NewVector(dims)
-	if err := vec.LoadFrom(bytes.NewReader(data)); err != nil {
-		return fmt.Errorf("import vector index: %w", err)
-	}
-	vec.SetCount(count)
-
-	sw := idx.swappable()
-	sw.Swap(search.NewHybrid(sw.Inner(), vec, idx.embedder))
-	idx.logger.Info("restored vector index from cache",
-		zap.Int("vectors", count), zap.Int("dims", dims))
-	return nil
-}
 
 // prefixPath prepends the repoPrefix to a relative path when in multi-repo mode.
 // Returns the path unchanged when repoPrefix is empty.
@@ -5281,11 +5215,10 @@ func (idx *Indexer) restubIncomingRefs(graphPath string) {
 // embeddingDimsOrDefault returns the embedder's reported vector width,
 // falling back to a neutral placeholder only when the provider cannot
 // state its width yet (Dimensions() == 0, the APIProvider-before-first-
-// call case). The fallback is never persisted: buildSearchIndex and
-// ImportVectorIndex both overwrite it with the true width taken from a
-// real vector / the cached header. Kept as a named helper so the
-// vector-dimension default has one definition instead of a scattered
-// magic number.
+// call case). The fallback is never persisted: buildSearchIndex
+// overwrites it with the true width taken from a real vector. Kept as a
+// named helper so the vector-dimension default has one definition
+// instead of a scattered magic number.
 func embeddingDimsOrDefault(p embedding.Provider) int {
 	if p == nil {
 		return 0
@@ -5620,7 +5553,7 @@ func (idx *Indexer) buildSearchIndex() {
 	search.BuildAndInstallNgramBoundaries(idx.search, idx.graph)
 
 	nativeText := isSymbolSearcherBackend(idx.search)
-	buildVectors := idx.embedder != nil && !idx.skipVectorBuild
+	buildVectors := idx.embedder != nil
 	if nativeText && !buildVectors {
 		// SQLite maintains symbol_fts in the graph mutation path. Backend.Add
 		// only adjusts a process-local approximate counter, so walking and
@@ -5648,8 +5581,7 @@ func (idx *Indexer) buildSearchIndex() {
 		}
 	}
 
-	// With no requested vector build, text indexing is complete. This covers
-	// both a missing embedder and snapshot warmup's skipVectorBuild path.
+	// With no embedder set, text indexing is complete.
 	if !buildVectors {
 		return
 	}

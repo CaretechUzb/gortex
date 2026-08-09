@@ -1,7 +1,6 @@
 package indexer
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -168,16 +167,6 @@ type MultiIndexer struct {
 	// participate in the N5 hot path without daemon restart.
 	onRepoTracked func(prefix, absPath string)
 
-	// skipVectorBuild, when set, propagates SetSkipVectorBuild(true) to
-	// every per-repo Indexer this MultiIndexer constructs, so their
-	// buildSearchIndex passes populate only the text index and never
-	// embed. The daemon flips it on for the warmup loop when a snapshot
-	// already carries the workspace vector index — re-embedding 30k+
-	// symbols only to overwrite them with the cached index is the
-	// dominant restart cost. After warmup it restores the cached index
-	// once via ImportVectorIndex and clears the flag.
-	skipVectorBuild bool
-
 	// embedChunkOpts is the AST sub-chunking configuration propagated
 	// to every per-repo Indexer this MultiIndexer constructs. The zero
 	// value leaves the chunker on its built-in defaults.
@@ -333,7 +322,6 @@ func (mi *MultiIndexer) newPerRepoIndexerGuardedWithMode(
 		idx.SetEmbedder(mi.embedder)
 	}
 	applyMultiIndexerBatchMode(idx, mode)
-	idx.SetSkipVectorBuild(mi.skipVectorBuild)
 	idx.SetEmbeddingChunkOptions(mi.embedChunkOpts)
 	idx.SetEmbeddingMaxSymbols(mi.embedMaxSymbols)
 	idx.SetEmbeddingAPIConcurrency(mi.embedAPIConcurrency)
@@ -413,26 +401,6 @@ func (mi *MultiIndexer) SetSemanticManager(m *semantic.Manager) {
 	mi.mu.Unlock()
 	for _, idx := range live {
 		idx.SetSemanticManager(m)
-	}
-}
-
-// SetSkipVectorBuild controls whether per-repo Indexers constructed
-// from now on skip the embedding pass in buildSearchIndex (text index
-// only). The daemon enables it for the warmup loop when a snapshot
-// already carries the workspace vector index, then disables it and
-// restores the cached index once warmup finishes. It also re-applies
-// the flag to every per-repo Indexer already constructed so a flag
-// flip mid-lifecycle takes effect everywhere.
-func (mi *MultiIndexer) SetSkipVectorBuild(skip bool) {
-	mi.mu.Lock()
-	mi.skipVectorBuild = skip
-	live := make([]*Indexer, 0, len(mi.indexers))
-	for _, idx := range mi.indexers {
-		live = append(live, idx)
-	}
-	mi.mu.Unlock()
-	for _, idx := range live {
-		idx.SetSkipVectorBuild(skip)
 	}
 }
 
@@ -4419,72 +4387,6 @@ func (mi *MultiIndexer) applyRemoteStitch(cr *resolver.CrossRepoResolver) {
 // Search returns the shared search backend.
 func (mi *MultiIndexer) Search() search.Backend {
 	return mi.search
-}
-
-// ExportVectorIndex serializes the workspace-global semantic-search
-// vector index — there is one shared HNSW index across every tracked
-// repo, not one per repo. Returns nil, 0, 0 when no vector index is
-// active (embeddings disabled, or the backend is still text-only).
-// Used by the daemon snapshot path so a default-on daemon does not
-// re-embed the whole graph on every restart.
-func (mi *MultiIndexer) ExportVectorIndex() ([]byte, int, int) {
-	sw, ok := mi.search.(*search.Swappable)
-	if !ok {
-		return nil, 0, 0
-	}
-	hybrid, ok := sw.Inner().(*search.HybridBackend)
-	if !ok {
-		return nil, 0, 0
-	}
-	vec := hybrid.VectorIndex()
-	if vec == nil || vec.Count() == 0 {
-		return nil, 0, 0
-	}
-	var buf bytes.Buffer
-	if err := vec.Save(&buf); err != nil {
-		mi.logger.Warn("failed to export vector index", zap.Error(err))
-		return nil, 0, 0
-	}
-	return buf.Bytes(), vec.Dims(), vec.Count()
-}
-
-// ImportVectorIndex restores a previously-exported vector index into
-// the shared search backend, wrapping the current text backend in a
-// HybridBackend. It is a no-op when embeddings are disabled (no
-// configured embedder) or when the cached index's dimensionality does
-// not match the active embedder — a provider switch (GloVe 50d → ONNX
-// 384d) makes the cached vectors meaningless, so the indexer re-embeds
-// instead. Returns an error only on a structurally corrupt index blob.
-func (mi *MultiIndexer) ImportVectorIndex(data []byte, dims, count int) error {
-	if len(data) == 0 || mi.embedder == nil {
-		return nil
-	}
-	if embedderDims := mi.embedder.Dimensions(); embedderDims > 0 && embedderDims != dims {
-		mi.logger.Info("vector index dims mismatch, will re-embed",
-			zap.Int("cached_dims", dims), zap.Int("embedder_dims", embedderDims))
-		return nil
-	}
-	sw, ok := mi.search.(*search.Swappable)
-	if !ok {
-		return nil
-	}
-	vec := search.NewVector(dims)
-	if err := vec.LoadFrom(bytes.NewReader(data)); err != nil {
-		return fmt.Errorf("import vector index: %w", err)
-	}
-	vec.SetCount(count)
-
-	// Unwrap an existing HybridBackend to its text side before
-	// re-wrapping so we never nest Hybrids (each retains a stale
-	// vector index — see buildSearchIndex for the memory rationale).
-	inner := sw.Inner()
-	if hyb, ok := inner.(*search.HybridBackend); ok {
-		inner = hyb.TextBackend()
-	}
-	sw.Swap(search.NewHybrid(inner, vec, mi.embedder))
-	mi.logger.Info("restored vector index from snapshot",
-		zap.Int("vectors", count), zap.Int("dims", dims))
-	return nil
 }
 
 // AutoDetectRepos walks immediate subdirectories of parentPath looking for

@@ -143,10 +143,6 @@ type SharedServer struct {
 	// default when it was empty. Entry points publish it so out-of-band
 	// readers can find the same store instead of re-deriving the default.
 	StorePath string
-	// EmbedderDims is the active embedder's vector dimensionality, or 0
-	// when embeddings are off — the width every persisted vector in this
-	// workspace was built at.
-	EmbedderDims int
 
 	// ResolverLSPRegistry / LSPRouter are the resolve-time LSP wiring the
 	// entry point's warmup hooks reference; nil when semantic enrichment
@@ -541,7 +537,6 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 		idx.SetEmbeddingChunkOptions(EmbeddingChunkOptions(conf))
 		idx.SetEmbeddingMaxSymbols(conf.Embedding.MaxSymbols)
 		idx.SetEmbeddingAPIConcurrency(conf.Embedding.APIConcurrency)
-		s.EmbedderDims = embedder.Dimensions()
 	}
 
 	cm, err := config.NewConfigManager("")
