@@ -79,39 +79,41 @@ func TestRenderDaemonRepos_NoRepos(t *testing.T) {
 	assert.Contains(t, buf.String(), "tracked repos: (none)")
 }
 
-func TestRenderDaemonRepos_DiskColumnAppearsWhenDiskMode(t *testing.T) {
-	st := sampleStatus()
-	// Flip the biggest repo into disk mode.
-	st.TrackedRepos[0].Memory.DiskBytes = 500_000_000
-	var buf bytes.Buffer
-	renderDaemonRepos(&buf, st)
-	out := buf.String()
-	assert.Contains(t, out, "disk_b", "disk_b column must appear when any repo has DiskBytes > 0")
-}
-
-func TestRenderDaemonRepos_NoDiskColumnInMemoryMode(t *testing.T) {
-	var buf bytes.Buffer
-	renderDaemonRepos(&buf, sampleStatus())
-	assert.NotContains(t, buf.String(), "disk_b",
-		"disk_b column should be hidden when all repos are in-memory")
-}
-
 func TestRenderDaemonHeader_SearchBackendRow(t *testing.T) {
 	st := sampleStatus()
+	// What resolveSearchBackend emits for the store-native FTS index:
+	// no heap figure of its own, so the row says disk-resident instead
+	// of printing a fabricated "heap=0 B".
 	st.SearchBackend = daemon.SearchBackendStats{
-		Name:          "bleve-disk",
+		Name:          "sqlite-fts5",
 		DocCount:      65000,
 		DocCountKnown: true,
-		Bytes:     200 * 1024 * 1024,
-		DiskPath:  "/tmp/gortex/bleve.scorch",
-		DiskBytes: 800 * 1024 * 1024,
+		DiskResident:  true,
 	}
 	var buf bytes.Buffer
 	renderDaemonHeader(&buf, st)
 	out := buf.String()
-	assert.Contains(t, out, "bleve-disk")
+	assert.Contains(t, out, "sqlite-fts5")
 	assert.Contains(t, out, "65000")
-	assert.Contains(t, out, "/tmp/gortex/bleve.scorch")
+	assert.Contains(t, out, "disk-resident")
+	assert.NotContains(t, out, "heap=")
+}
+
+func TestRenderDaemonHeader_SearchBackendRow_HeapBackend(t *testing.T) {
+	st := sampleStatus()
+	// The in-process BM25 index does have a heap footprint to report.
+	st.SearchBackend = daemon.SearchBackendStats{
+		Name:          "bm25",
+		DocCount:      12000,
+		DocCountKnown: true,
+		Bytes:         200 * 1024 * 1024,
+	}
+	var buf bytes.Buffer
+	renderDaemonHeader(&buf, st)
+	out := buf.String()
+	assert.Contains(t, out, "bm25")
+	assert.Contains(t, out, "12000")
+	assert.Contains(t, out, "heap=")
 }
 
 func TestRenderDaemonHeader_WarmupLabel(t *testing.T) {

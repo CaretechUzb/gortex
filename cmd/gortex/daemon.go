@@ -1284,11 +1284,6 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			return fmt.Sprintf("docs=%d  ", sb.DocCount)
 		}
 		switch {
-		case sb.DiskPath != "":
-			t.AppendRow(table.Row{"search", fmt.Sprintf(
-				"%s  %sheap=%s  disk=%s  path=%s",
-				sb.Name, formatSearchDocs(sb), formatBytes(sb.Bytes),
-				formatBytes(sb.DiskBytes), sb.DiskPath)})
 		case sb.DiskResident:
 			// No heap footprint to report — the index lives inside the
 			// graph store's own file, not a separate in-memory
@@ -1450,18 +1445,6 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 		return rows[i].Memory.TotalBytes > rows[j].Memory.TotalBytes
 	})
 
-	// The disk_b column only appears when any repo actually has disk
-	// usage — i.e. the active search backend keeps its index on disk.
-	// Keeping it conditional stops the default in-memory output from
-	// carrying a dead column users would (rightly) ask about.
-	showDisk := false
-	for _, r := range rows {
-		if r.Memory.DiskBytes > 0 {
-			showDisk = true
-			break
-		}
-	}
-
 	fmt.Fprintln(w, "\ntracked repos:")
 	t := table.NewWriter()
 	t.SetOutputMirror(w)
@@ -1507,10 +1490,6 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 	for i := 0; i < 8; i++ {
 		colConfigs = append(colConfigs, table.ColumnConfig{Number: len(colConfigs) + 1, Align: text.AlignRight})
 	}
-	if showDisk {
-		header = append(header, "disk_b")
-		colConfigs = append(colConfigs, table.ColumnConfig{Number: len(colConfigs) + 1, Align: text.AlignRight})
-	}
 	header = append(header, "path")
 	colConfigs = append(colConfigs, table.ColumnConfig{Number: len(colConfigs) + 1, Align: text.AlignLeft})
 	t.AppendHeader(header)
@@ -1540,9 +1519,6 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 			formatBytes(r.Memory.SearchBytes),
 			formatBytes(r.Memory.VectorsBytes),
 		)
-		if showDisk {
-			row = append(row, formatBytes(r.Memory.DiskBytes))
-		}
 		row = append(row, r.Path)
 		t.AppendRow(row)
 	}
@@ -1557,9 +1533,6 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 			footer = append(footer, "")
 		}
 		footer = append(footer, formatBytes(other), "", "", "", "", "", "", "")
-		if showDisk {
-			footer = append(footer, "")
-		}
 		footer = append(footer, "embedder + runtime + caches (not attributed)")
 		t.AppendFooter(footer)
 	}

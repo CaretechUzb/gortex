@@ -973,7 +973,6 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 				share := float64(nodes) / float64(totalNodes)
 				mem.SearchBytes = uint64(float64(backendStats.Bytes) * share)
 				mem.VectorsBytes = uint64(float64(backendStats.vectorBytes) * share)
-				mem.DiskBytes = uint64(float64(backendStats.DiskBytes) * share)
 			}
 			mem.TotalBytes = mem.NodesBytes + mem.EdgesBytes + mem.SearchBytes + mem.VectorsBytes
 

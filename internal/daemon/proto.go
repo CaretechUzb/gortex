@@ -464,10 +464,11 @@ type TrigramCacheStats struct {
 
 // SearchBackendStats identifies which search backend is currently
 // serving queries, so users can read the `search_b` column in the
-// repo breakdown with the right mental model. Bleve with the default
-// gtreap KV store costs ~32 KiB per document; BM25 costs ~2 KiB.
+// repo breakdown with the right mental model. The in-process BM25
+// index costs ~2 KiB of heap per document; the store-native FTS index
+// lives inside the graph store's own file and costs no heap of its own.
 type SearchBackendStats struct {
-	Name     string `json:"name"`      // "bm25" | "bleve-memory" | "bleve-disk" | "sqlite-fts5"
+	Name     string `json:"name"`      // "bm25" | "sqlite-fts5" | "unknown"
 	DocCount int    `json:"doc_count"` // indexed documents across all repos
 	// DocCountKnown distinguishes "the index holds zero documents" from
 	// "this backend cannot report a document count". Backends whose only
@@ -475,9 +476,7 @@ type SearchBackendStats struct {
 	// false so renderers omit the number instead of presenting the delta
 	// as a corpus size.
 	DocCountKnown bool   `json:"doc_count_known,omitempty"`
-	Bytes         uint64 `json:"bytes"`                // approximate heap footprint
-	DiskPath      string `json:"disk_path,omitempty"`  // set only when Name == "bleve-disk"
-	DiskBytes     uint64 `json:"disk_bytes,omitempty"` // current on-disk size for "bleve-disk"
+	Bytes         uint64 `json:"bytes"` // approximate heap footprint
 	// DiskResident marks a backend (e.g. "sqlite-fts5") that has no
 	// meaningful heap footprint of its own — its index lives inside the
 	// graph store's own file — and no cheap byte count is available
@@ -710,11 +709,7 @@ type MemoryBreakdown struct {
 	EdgesBytes   uint64 `json:"edges_bytes"`
 	SearchBytes  uint64 `json:"search_bytes"`
 	VectorsBytes uint64 `json:"vectors_bytes"`
-	// DiskBytes is populated only when the active search backend keeps
-	// its index on disk. Each repo gets a node-proportional share of
-	// the on-disk index size. Zero for purely in-memory backends.
-	DiskBytes  uint64 `json:"disk_bytes,omitempty"`
-	TotalBytes uint64 `json:"total_bytes"`
+	TotalBytes   uint64 `json:"total_bytes"`
 }
 
 // WriteJSONLine writes v as one JSON object followed by a newline. The
