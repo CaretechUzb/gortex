@@ -18,9 +18,10 @@ import (
 // The audit applies only to repository source nodes. Some synthetic nodes
 // retain a FilePath as attribution rather than as an on-disk source path:
 // semantic externals use `external::…`, synthesized external calls use
-// `external-call::…`, and contracts plus topics use identity namespaces that
-// deliberately do not mirror their source path. Those populations are outside
-// the ownership invariant even when FilePath is non-empty.
+// `external-call::…`, and contracts, topics plus projected rationale use
+// identity namespaces that deliberately do not mirror their source path.
+// Those populations are outside the ownership invariant even when FilePath is
+// non-empty.
 //
 // Every other file-backed node with an empty prefix is an UNOWNED CODE NODE:
 // a real symbol, extracted from a real file, that no repository claims.
@@ -130,13 +131,17 @@ func IsAuditableRepoSourcePath(filePath string) bool {
 // IsAuditableRepoSourceNode reports whether n participates in the repository
 // ownership invariant. Contract and topic identities intentionally live in
 // global namespaces rather than below their source repository prefix; contract
-// bridge nodes likewise use the virtual contracts://bridges path.
+// bridge nodes likewise use the virtual contracts://bridges path. Rationale
+// nodes are the same shape: the memory projection mints them as
+// `rationale::<memory-id>` over the virtual .gortex/rationale path while still
+// stamping the repo the memory belongs to, so their identity can never carry
+// the prefix and auditing them reports a defect on every healthy graph.
 func IsAuditableRepoSourceNode(n *Node) bool {
 	if n == nil || !IsAuditableRepoSourcePath(n.FilePath) {
 		return false
 	}
 	switch n.Kind {
-	case KindContract, KindContractBridge, KindTopic:
+	case KindContract, KindContractBridge, KindTopic, KindRationale:
 		return false
 	default:
 		return true

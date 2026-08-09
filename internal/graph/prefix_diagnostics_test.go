@@ -63,6 +63,15 @@ func TestClassifyNodePrefix(t *testing.T) {
 		node: &Node{ID: "topic::nats::go", Kind: KindTopic, FilePath: "gortex/main.go", RepoPrefix: "gortex"},
 		want: "",
 	}, {
+		// A repo-scoped development memory projects to a repo-stamped node
+		// whose identity is `rationale::<memory-id>` over a virtual path. It
+		// can never carry the prefix, so auditing it reported a misprefixed
+		// node — and downgraded the whole audit to Error — on every graph that
+		// had one.
+		name: "projected rationale identity is not audited",
+		node: &Node{ID: "rationale::mem3539475d73f80040", Kind: KindRationale, FilePath: ".gortex/rationale", RepoPrefix: "gortex"},
+		want: "",
+	}, {
 		name: "repo-scoped stub carries no file and is not audited",
 		node: &Node{ID: "gortex::builtin::go::make", Kind: KindBuiltin, RepoPrefix: "gortex"},
 		want: "",
