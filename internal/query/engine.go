@@ -999,54 +999,7 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		}
 	}
 
-	// Bigram-overlap typo rescue. Same gates as the legacy path:
-	// nothing else surfaced, query is one indivisible 4+ char token,
-	// backend can provide candidates. The bigram backend also returns
-	// raw IDs — batch-materialise them too rather than fall back to
-	// per-id GetNode. A query with a separator OR an internal-uppercase
-	// camelCase boundary is decomposable, so it is left for the handler's
-	// leaf-decomposition rescue (more precise than fuzzy bigram overlap) —
-	// the bigram tier serves true atomic-token typos only.
-	if len(cands) == 0 && len(query) >= 4 && !strings.ContainsAny(query, " /.:_-") && !hasInternalUppercase(query) {
-		if bg, ok := backend.(bigramProvider); ok {
-			keys := len(query) - 1
-			minOverlap := (keys + 1) / 2
-			if minOverlap < 3 {
-				minOverlap = 3
-			}
-			bigramIDs := bg.BigramCandidates(query, minOverlap)
-			// Skip the batch fetch entirely when the bigram backend
-			// returned nothing — otherwise we'd issue an empty query
-			// round-trip.
-			if len(bigramIDs) > 0 {
-				bigramNodes := e.g.GetNodesByIDs(bigramIDs)
-				for _, id := range bigramIDs {
-					if _, seen := idx[id]; seen {
-						continue
-					}
-					node := bigramNodes[id]
-					if node == nil || node.Kind == graph.KindFile || node.Kind == graph.KindImport {
-						continue
-					}
-					idx[id] = len(cands)
-					cands = append(cands, &rerank.Candidate{Node: node, TextRank: -1, VectorRank: -1})
-					if len(cands) >= limit {
-						break
-					}
-				}
-			}
-		}
-	}
-
 	return cands
-}
-
-// bigramProvider is satisfied by backends that expose a typo-tolerant
-// rescue list. Declared here (not in search) so the engine can adopt
-// rescue without the search interface changing; any backend that can
-// provide bigram candidates just has to implement this method.
-type bigramProvider interface {
-	BigramCandidates(query string, minOverlap int) []string
 }
 
 const substringSearchPageSize = 256
@@ -1286,27 +1239,14 @@ func (e *Engine) Stats() *graph.GraphStats {
 	return &s
 }
 
-// bfs performs breadth-first traversal from nodeID.
-// If forward is true, follows outgoing edges; if false, follows incoming.
-// If edgeKinds is nil, follows all edge kinds bidirectionally (for cluster).
-// hasInternalUppercase reports whether s carries a camelCase boundary — an
-// uppercase letter anywhere but the first byte. Such a query decomposes into
-// multiple leaf tokens, so the bigram typo-rescue tier defers to the handler's
-// leaf-decomposition rescue for it.
-func hasInternalUppercase(s string) bool {
-	for i := 1; i < len(s); i++ {
-		if s[i] >= 'A' && s[i] <= 'Z' {
-			return true
-		}
-	}
-	return false
-}
-
 // defaultDispatchFanout bounds how many overriders one interface/abstract
 // method expands to during polymorphic dispatch expansion, so a hub interface
 // with hundreds of implementors cannot blow up a call-chain walk.
 const defaultDispatchFanout = 24
 
+// bfs performs breadth-first traversal from nodeID.
+// If forward is true, follows outgoing edges; if false, follows incoming.
+// If edgeKinds is nil, follows all edge kinds bidirectionally (for cluster).
 func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds []graph.EdgeKind) *SubGraph {
 	if opts.Depth <= 0 {
 		opts.Depth = 3
