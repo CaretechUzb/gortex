@@ -159,11 +159,6 @@ func FacadeToolNames() []string {
 // surface.
 func IsFacadeToolName(name string) bool { return isFacadeToolName(name) }
 
-// IsDedicatedFacadeToolName reports whether name exists only on facade-v1.
-// Shared names such as analyze/explore/review/ask retain legacy meanings and
-// are deliberately excluded.
-func IsDedicatedFacadeToolName(name string) bool { return isDedicatedFacadeTool(name) }
-
 // PublicOperationForLegacy resolves an implementation-era tool name to the
 // compact public domain and operation used in user-facing migration guidance.
 // When one legacy handler has deliberate effect splits, the first safe public
