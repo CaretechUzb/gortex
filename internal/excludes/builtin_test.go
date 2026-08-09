@@ -64,6 +64,48 @@ func TestBuiltinExcludesVisualStudioArtifacts(t *testing.T) {
 	}
 }
 
+// A harness that pins a toolchain home at the repo (CI images, benchmark
+// runners) materializes these caches inside the working tree, where they
+// hold upstream artifacts the walker would otherwise index.
+func TestBuiltinExcludesRepoLocalToolchainCaches(t *testing.T) {
+	t.Parallel()
+
+	matcher := New(Builtin)
+	for _, path := range []string{
+		".m2/repository/org/slf4j/slf4j-api/2.0.9/slf4j-api-2.0.9.jar",
+		".ivy2/cache/org.scala-lang/scala-library/ivy.xml",
+		".sbt/1.0/plugins/target/config-classes/cached.class",
+		".pnpm-store/v3/files/00/abcdef",
+		".stack-work/dist/x86_64-linux/build/Main.hi",
+		".eclipse/org.eclipse.platform_4.30/configuration/config.ini",
+		".metadata/.plugins/org.eclipse.core.resources/.projects/p/.location",
+		"nested/.m2/repository/junit/junit/4.13.2/junit-4.13.2.jar",
+	} {
+		if !matcher.MatchRel(path) {
+			t.Errorf("Builtin should exclude toolchain cache path %q", path)
+		}
+	}
+}
+
+// The cache entries are directory-anchored, so a first-party package or file
+// that merely shares the stem stays indexed.
+func TestBuiltinDoesNotExcludeSimilarToolchainNames(t *testing.T) {
+	t.Parallel()
+
+	matcher := New(Builtin)
+	for _, path := range []string{
+		"m2/decoder.go",
+		"internal/sbt/parser.go",
+		"pkg/metadata/loader.go",
+		"src/eclipse/render.ts",
+		"tools/pnpm-store-inspector/main.go",
+	} {
+		if matcher.MatchRel(path) {
+			t.Errorf("Builtin unexpectedly excludes first-party path %q", path)
+		}
+	}
+}
+
 // The MSBuild entries name what MSBuild writes rather than blanket-dropping
 // `obj/` or `bin/`, both of which are committed source in other ecosystems.
 func TestBuiltinDoesNotExcludeFirstPartyObjOrBin(t *testing.T) {
