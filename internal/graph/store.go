@@ -513,10 +513,12 @@ type SymbolFTSItem struct {
 // SymbolSearcher is an optional interface backends MAY implement to
 // expose engine-native full-text search over the graph's symbol
 // names. When the backing store implements it, the daemon's
-// search_symbols path routes through the backend FTS instead of
-// building a parallel in-process BM25 index — saving ~100MB
-// of heap on a vscode-scale repo and putting the search latency in
-// the same address space as the rest of the graph.
+// search_symbols path routes through the backend FTS; a store that
+// does not gets search.NullBackend and the engine's index-free
+// substring scan instead. Serving ranked search from the store's own
+// index is what keeps ~100MB of heap off a vscode-scale repo and puts
+// the search latency in the same address space as the rest of the
+// graph.
 //
 // Contract:
 //

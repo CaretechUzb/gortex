@@ -2,6 +2,10 @@ package search
 
 import "testing"
 
+// The null backend must satisfy Backend itself — the optional
+// interfaces it must NOT satisfy are asserted below at run time.
+var _ Backend = (*NullBackend)(nil)
+
 // TestNullBackend_ImplementsBackendAndNothingElse pins the property the
 // fallback seam rests on. The query engine treats a backend as having a
 // corpus when Count() is positive OR when it satisfies DocCounter and
@@ -12,7 +16,7 @@ import "testing"
 // engine would rank against nothing instead of falling back to its
 // substring scan.
 func TestNullBackend_ImplementsBackendAndNothingElse(t *testing.T) {
-	var b Backend = NewNull()
+	b := NewNull()
 
 	if _, ok := b.(DocCounter); ok {
 		t.Error("NullBackend must not implement DocCounter — it would claim a corpus it has no documents for")
@@ -51,11 +55,18 @@ func TestNullBackend_StaysEmptyAfterAdd(t *testing.T) {
 	}
 }
 
-// TestNewNull_DistinctInstances guards the identity contract Swappable
-// relies on: Swap closes the previous backend only when it differs from
-// the incoming one, so two null backends must not compare equal.
-func TestNewNull_DistinctInstances(t *testing.T) {
-	if NewNull() == NewNull() {
-		t.Error("NewNull must hand back a distinct backend per call")
+// nullIdentityEscapeSink forces both returned pointers to escape. Without it,
+// inlining may give two zero-sized values distinct stack addresses and let a
+// field-less NullBackend pass the identity assertion accidentally.
+var nullIdentityEscapeSink [2]Backend
+
+// TestNewNullReturnsDistinctInstances pins NewNull's identity contract
+// directly. NullBackend intentionally carries one byte so independent
+// constructions cannot collapse onto runtime.zerobase.
+func TestNewNullReturnsDistinctInstances(t *testing.T) {
+	nullIdentityEscapeSink = [2]Backend{NewNull(), NewNull()}
+	t.Cleanup(func() { nullIdentityEscapeSink = [2]Backend{} })
+	if nullIdentityEscapeSink[0] == nullIdentityEscapeSink[1] {
+		t.Fatal("NewNull handed back one shared instance")
 	}
 }

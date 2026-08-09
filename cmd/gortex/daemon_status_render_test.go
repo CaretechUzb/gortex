@@ -101,9 +101,12 @@ func TestRenderDaemonHeader_SearchBackendRow(t *testing.T) {
 
 func TestRenderDaemonHeader_SearchBackendRow_HeapBackend(t *testing.T) {
 	st := sampleStatus()
-	// The in-process BM25 index does have a heap footprint to report.
+	// The other arm of the row: a backend that is not disk-resident, so
+	// the heap figure it does report has to be printed. resolveSearchBackend
+	// reaches it for a backend it cannot identify, where the byte count
+	// comes from search.BackendSize.
 	st.SearchBackend = daemon.SearchBackendStats{
-		Name:          "bm25",
+		Name:          "unknown",
 		DocCount:      12000,
 		DocCountKnown: true,
 		Bytes:         200 * 1024 * 1024,
@@ -111,7 +114,7 @@ func TestRenderDaemonHeader_SearchBackendRow_HeapBackend(t *testing.T) {
 	var buf bytes.Buffer
 	renderDaemonHeader(&buf, st)
 	out := buf.String()
-	assert.Contains(t, out, "bm25")
+	assert.Contains(t, out, "unknown")
 	assert.Contains(t, out, "12000")
 	assert.Contains(t, out, "heap=")
 }

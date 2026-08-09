@@ -14,17 +14,27 @@ package search
 // see the Engine built by pkg/gortex.New, which wires query.NewEngine
 // and never calls SetSearch.
 //
-// NewNull hands back a distinct pointer per call so that identity
-// comparisons — Swappable.Swap only closes the old backend when it is
-// not the incoming one — behave as they do for every other backend.
+// NewNull hands back a distinct pointer per call so independent backend
+// constructions retain ordinary object identity instead of collapsing onto
+// runtime.zerobase.
 //
 // It deliberately implements Backend and nothing else. Satisfying
 // DocCounter would let a disk-corpus count claim a corpus that does
 // not exist; Sizer and ChannelSearcher would advertise memory and
 // per-channel retrieval it does not have.
-type NullBackend struct{}
+type NullBackend struct {
+	// A field-less struct has size zero, and the language only
+	// promises distinct addresses for variables of non-zero size: every
+	// escaping &NullBackend{} would share runtime.zerobase, so any two
+	// null backends would compare equal. One byte buys each
+	// construction a real address, which is what the identity promise
+	// on NewNull rests on. Nothing reads it — the blank name says so.
+	_ byte
+}
 
-// NewNull returns a Backend that indexes and answers nothing.
+// NewNull returns a Backend that indexes and answers nothing. Every call
+// allocates its own instance, so independently constructed null backends have
+// distinct identity just like every other backend implementation.
 func NewNull() Backend { return &NullBackend{} }
 
 // Add discards the symbol; nothing is indexed.

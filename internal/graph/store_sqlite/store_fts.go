@@ -40,7 +40,7 @@ import (
 // Compile-time assertions: *Store satisfies the symbol-search
 // capabilities. The indexer auto-engages these when the active backend
 // implements them, routing search_symbols through on-disk FTS5 instead
-// of the in-process BM25 index.
+// of the engine's index-free substring fallback.
 var (
 	_ graph.SymbolSearcher             = (*Store)(nil)
 	_ graph.SymbolFTSBatchUpserter     = (*Store)(nil)
