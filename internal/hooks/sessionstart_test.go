@@ -390,3 +390,47 @@ func TestFormatDuration(t *testing.T) {
 		}
 	}
 }
+
+// TestRunSessionStart_DoesNotDoubleVersionPrefix guards the "vv0.63.2" render
+// reported in issue #70. StatusResponse.Version arrives already v-prefixed, and
+// every readiness line adds its own literal "v".
+func TestRunSessionStart_DoesNotDoubleVersionPrefix(t *testing.T) {
+	cases := []struct {
+		name   string
+		status *daemon.StatusResponse
+	}{
+		{"ready", &daemon.StatusResponse{Version: "v0.63.2", Ready: true, EnrichmentComplete: true}},
+		{"enriching", &daemon.StatusResponse{Version: "v0.63.2", Ready: true}},
+		{"warmup", &daemon.StatusResponse{Version: "v0.63.2", WarmupSeconds: 30}},
+		{"unprefixed", &daemon.StatusResponse{Version: "0.63.2", Ready: true, EnrichmentComplete: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.status.TrackedRepos = []daemon.TrackedRepoStatus{}
+			withFakeStatus(t, func() (*daemon.StatusResponse, error) { return tc.status, nil })
+
+			data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/x"}`)
+			out := captureStdout(t, func() { runSessionStart(data, 0) })
+
+			if strings.Contains(out, "vv") {
+				t.Errorf("doubled version prefix in briefing:\n%s", out)
+			}
+			if !strings.Contains(out, "v0.63.2") {
+				t.Errorf("version missing from briefing:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestDaemonVersionLabel(t *testing.T) {
+	for in, want := range map[string]string{
+		"v0.63.2":            "0.63.2",
+		"0.63.2":             "0.63.2",
+		"v0.63.2-39-gabcdef": "0.63.2-39-gabcdef",
+		"":                   "",
+	} {
+		if got := daemonVersionLabel(in); got != want {
+			t.Errorf("daemonVersionLabel(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
