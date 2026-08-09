@@ -139,6 +139,11 @@ func testPrefixDiagnostics(t *testing.T, factory Factory) {
 	s.AddNode(mkRepoNode("contract::http::GET::/health", "GET /health", "r1/api.go", "r1", graph.KindContract))
 	s.AddNode(mkRepoNode("contract-bridge::request::response", "request → response", "contracts://bridges", "r1", graph.KindContractBridge))
 	s.AddNode(mkRepoNode("topic::nats::go", "go", "r1/main.go", "r1", graph.KindTopic))
+	// The memory projection stamps the owning repo but mints the identity as
+	// `rationale::<memory-id>` over a virtual path, so a rationale node can
+	// never carry its prefix. Auditing it reported a misprefixed node on every
+	// healthy graph that had a repo-scoped memory.
+	s.AddNode(mkRepoNode("rationale::mem3539475d73f80040", "why the resolver stubs res://", ".gortex/rationale", "r1", graph.KindRationale))
 
 	d, ok := graph.ReadPrefixDiagnostics(s, 5)
 	if !ok {
