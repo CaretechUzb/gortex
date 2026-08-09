@@ -155,6 +155,9 @@ func TestReachabilityProjectionRefreshInvalidatesPassCache(t *testing.T) {
 	if indexes.reachabilityFiles != nil {
 		t.Fatal("close retained the pass-local reachability cache")
 	}
+	if indexes.importAdjacency != nil {
+		t.Fatal("close retained the pass-local adjacency retention")
+	}
 }
 
 func TestReachabilityAdjacencyRetentionServesUnstableAcrossPages(t *testing.T) {
@@ -241,19 +244,35 @@ func TestReachabilityAdjacencyRetentionCapClearsWholesale(t *testing.T) {
 	}
 }
 
-func TestReachabilityProjectionDoesNotCacheUnresolvedImports(t *testing.T) {
-	_, store, _, indexes, pending := newReachabilityProjectionFixture(t)
+// Renegotiated from TestReachabilityProjectionDoesNotCacheUnresolvedImports:
+// adjacency for an unresolved-import caller MAY now be retained across pages —
+// the pinned invariant is freshness, not absence. An imports-kind edge write
+// (noted via the resolver generation) clears the retention, and the next page
+// re-projects and sees the newly resolved target.
+func TestReachabilityProjectionUnresolvedImportsStayFresh(t *testing.T) {
+	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
 	defer indexes.close()
 	store.projected["repo/caller.go"] = []string{graph.UnresolvedMarker + "import::dep"}
 
 	for page := 0; page < 2; page++ {
 		indexes.prepare(pending)
 		if len(indexes.reachabilityFiles) != 0 {
-			t.Fatalf("page %d cached an unresolved import", page)
+			t.Fatalf("page %d cached an unresolved import in the stable set", page)
 		}
 		indexes.clearPage()
 	}
+	if store.projectionCalls != 1 {
+		t.Fatalf("projection calls = %d, want 1: unstable adjacency is retained across pages", store.projectionCalls)
+	}
+
+	store.projected["repo/caller.go"] = []string{"dep2/two.go"}
+	r.noteImportEdgeWrite()
+	indexes.prepare(pending)
+	defer indexes.clearPage()
 	if store.projectionCalls != 2 {
-		t.Fatalf("unresolved projection calls = %d, want 2", store.projectionCalls)
+		t.Fatalf("projection calls = %d, want 2 after an imports-kind write", store.projectionCalls)
+	}
+	if _, ok := r.reachableDirsByFile["repo/caller.go"]["dep2"]; !ok {
+		t.Fatal("post-write projection missing the newly resolved dep2 directory")
 	}
 }

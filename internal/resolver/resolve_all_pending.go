@@ -28,6 +28,14 @@ type resolveAllPassIndexes struct {
 	// caller files already seen in this pass. Page-local active maps remain on
 	// Resolver and are cleared after every page.
 	reachabilityFiles map[string]map[string]struct{}
+
+	// importAdjacency retains raw ProjectImportAdjacency results for caller
+	// files already seen in this pass — stable or not. Only the store read is
+	// retained; the per-page derivation still reruns, so reachable dirs track
+	// targets resolved later in the pass. Cleared wholesale on interleave and
+	// on importAdjacencyGen drift (an imports-kind edge write landed).
+	importAdjacency    map[string][]string
+	importAdjacencyGen uint64
 }
 
 func newResolveAllPassIndexes(r *Resolver) *resolveAllPassIndexes {
@@ -38,6 +46,7 @@ func newResolveAllPassIndexes(r *Resolver) *resolveAllPassIndexes {
 		depRepos:          make(map[string]struct{}),
 		provideRepos:      make(map[string]struct{}),
 		reachabilityFiles: make(map[string]map[string]struct{}),
+		importAdjacency:   make(map[string][]string),
 	}
 }
 
@@ -48,6 +57,7 @@ func newPendingFrontierPassIndexes(r *Resolver) *resolveAllPassIndexes {
 		depRepos:          make(map[string]struct{}),
 		provideRepos:      make(map[string]struct{}),
 		reachabilityFiles: make(map[string]map[string]struct{}),
+		importAdjacency:   make(map[string][]string),
 	}
 }
 
@@ -195,8 +205,15 @@ func (p *resolveAllPassIndexes) prepare(pending []*graph.Edge) map[string]*graph
 		p.ensureProvides(prefixes)
 		providesElapsed = time.Since(start)
 	}
+	if p.importAdjacencyGen != p.resolver.importEdgeGen {
+		// An imports-kind edge write landed since this retention was built —
+		// stored adjacency rows may have changed under it. Clear wholesale;
+		// the next projection repopulates at first-touch cost.
+		clear(p.importAdjacency)
+		p.importAdjacencyGen = p.resolver.importEdgeGen
+	}
 	reachabilityStart := time.Now()
-	_, reachStats := p.resolver.buildReachabilityIndexForPendingCached(pending, sources, p.reachabilityFiles, nil)
+	_, reachStats := p.resolver.buildReachabilityIndexForPendingCached(pending, sources, p.reachabilityFiles, p.importAdjacency)
 	reachabilityElapsed := time.Since(reachabilityStart)
 	p.generation = p.resolver.scratchGeneration
 	p.resolver.logger.Info("resolver: prepare page indexes",
@@ -226,6 +243,7 @@ func (p *resolveAllPassIndexes) resetAfterInterleave() {
 	p.depRepos = make(map[string]struct{})
 	p.provideRepos = make(map[string]struct{})
 	p.reachabilityFiles = make(map[string]map[string]struct{})
+	p.importAdjacency = make(map[string][]string)
 }
 
 // refreshAfterInterleave restores only scratch actually invalidated while
@@ -264,6 +282,7 @@ func (p *resolveAllPassIndexes) prepareTail() {
 
 func (p *resolveAllPassIndexes) close() {
 	p.reachabilityFiles = nil
+	p.importAdjacency = nil
 	p.resolver.clearPassIndexes()
 }
 

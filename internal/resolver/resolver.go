@@ -218,6 +218,10 @@ type Resolver struct {
 	// (filepathlite.Dir/Clean dominate). Read-only after build, so the
 	// workers share it lock-free.
 	dirByFilePath map[string]string
+	// importEdgeGen counts imports-kind edge writes noted while a resolve
+	// pass may hold pass-scoped import-adjacency retention. Write-site
+	// verdicts live at noteImportEdgeWrite's callers.
+	importEdgeGen uint64
 	// depModuleIndex bridges Go imports to dep::<module> contract
 	// nodes emitted from go.mod. Keyed by RepoPrefix (the dep node's
 	// owning repo) so we never link an import in repo A to a dep
@@ -4752,6 +4756,14 @@ func (r *Resolver) legacyImportTargetsByFile(filePaths []string) map[string][]st
 func (r *Resolver) clearReachabilityIndex() {
 	r.reachableDirsByFile = nil
 	r.dirByFilePath = nil
+}
+
+// noteImportEdgeWrite records that an imports-kind edge row was written. The
+// pass-scoped import-adjacency retention compares generations at page start
+// and clears wholesale on drift — invalidation precision is traded for
+// audit-proof simplicity, and measured import writes are rare mid-pass.
+func (r *Resolver) noteImportEdgeWrite() {
+	r.importEdgeGen++
 }
 
 // importedDirForSpec returns the directory that an unresolved
