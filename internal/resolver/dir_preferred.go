@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // ResolveByConvention resolves a symbol name to its definition node by the
@@ -103,6 +104,7 @@ func isConventionResolvable(n *graph.Node) bool {
 // directory segments. A preferDir is matched both as written and with
 // surrounding slashes trimmed, so "/middleware/" and "middleware" both work.
 func dirMatchesAny(filePath string, dirs []string) bool {
+	filePath = graphpath.Norm(filePath)
 	for _, d := range dirs {
 		if d == "" {
 			continue
@@ -132,10 +134,7 @@ func uniqueInDir(cands []*graph.Node, dir string) string {
 	return id
 }
 
-// dirOf returns the directory portion of a file path.
+// dirOf returns the '/'-joined directory portion of a store path.
 func dirOf(path string) string {
-	if i := strings.LastIndexByte(path, '/'); i >= 0 {
-		return path[:i]
-	}
-	return ""
+	return graphpath.Dir(path)
 }
