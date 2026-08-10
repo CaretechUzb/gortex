@@ -410,15 +410,25 @@ func TestManager_CloseCancelsContextProviderAndWaitsForPass(t *testing.T) {
 		t.Fatal("context provider did not start")
 	}
 	require.NoError(t, mgr.Close())
+	// close(returned) runs inside the provider call, which the pass drains
+	// before releasing the active-pass gate Close waits on — so Close cannot
+	// observe it unclosed and a non-blocking poll is sound.
 	select {
 	case <-returned:
 	default:
 		t.Fatal("Close returned before the context provider stopped")
 	}
+	// The pass writes its terminal status before releasing that gate too, so
+	// no pass may still be running or draining the instant Close returns —
+	// that is the invariant Close's wait exists for. Polling enrichDone here
+	// instead would assert that the test's own goroutine had already been
+	// scheduled to run its deferred close, which nothing orders against
+	// Close's return and a loaded runner loses.
+	assert.False(t, mgr.EnrichmentActive(), "Close returned while a pass was still active")
 	select {
 	case <-enrichDone:
-	default:
-		t.Fatal("Close returned before the complete manager-owned pass stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the context provider and pass were still running after Close returned")
 	}
 }
 
