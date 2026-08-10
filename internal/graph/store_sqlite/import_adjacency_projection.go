@@ -49,7 +49,16 @@ func (s *Store) ProjectImportAdjacency(filePaths []string) (map[string][]string,
 	seen := make(map[string]struct{}, len(filePaths))
 	paths := make([]string, 0, len(filePaths))
 	for _, path := range filePaths {
-		if path == "" || path == "." || filepath.Clean(path) != path {
+		if path == "" || path == "." {
+			return nil, false
+		}
+		// Indexed paths keep '/' after the repo prefix with the rest
+		// OS-native, so on Windows filepath.Clean rewrites separators on
+		// every stored path. A separator-only difference is not a
+		// canonicality violation — only a structural one (traversal,
+		// duplicate separators, trailing dots) rejects the request.
+		if cleaned := filepath.Clean(path); cleaned != path &&
+			filepath.ToSlash(cleaned) != filepath.ToSlash(path) {
 			return nil, false
 		}
 		if _, duplicate := seen[path]; duplicate {
