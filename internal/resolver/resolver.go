@@ -4769,10 +4769,11 @@ func (r *Resolver) clearReachabilityIndex() {
 	r.dirByFilePath = nil
 }
 
-// noteImportEdgeWrite records that an imports-kind edge row was written. The
-// pass-scoped import-adjacency retention compares generations at page start
-// and clears wholesale on drift — invalidation precision is traded for
-// audit-proof simplicity, and measured import writes are rare mid-pass.
+// noteImportEdgeWrite records an imports-kind edge write with no file
+// provenance. The pass-scoped import-adjacency retention compares generations
+// at page start and clears wholesale on drift — the conservative fallback
+// behind the per-file invalidation in noteImportEdgeReindexes, which covers
+// the common provenance-carrying writes.
 //
 // Write-site audit (every ReindexEdges / ReindexUnresolvedEdgeTargets /
 // AddBatch call in this package):

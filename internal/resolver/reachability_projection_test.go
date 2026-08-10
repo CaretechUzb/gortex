@@ -274,11 +274,11 @@ func TestNoteImportEdgeReindexesRecordsDirtyFiles(t *testing.T) {
 	}
 }
 
-// The second cold-run regression: the pass rewrites still-unresolved import
-// edges for bookkeeping (meta, confidence, terminality) on every frontier
-// revisit. A rewrite that changes neither target, kind, nor file cannot
-// change stored adjacency — it must NOT dirty the file, or the retention
-// evicts exactly the unstable files it exists to serve.
+// The pass rewrites still-unresolved import edges for bookkeeping (meta,
+// confidence, terminality) on every frontier revisit. A rewrite that changes
+// neither target, kind, nor file cannot change stored adjacency — it must
+// NOT dirty the file, or the retention evicts exactly the unstable files it
+// exists to serve.
 func TestNoteImportEdgeReindexesIgnoresIdentityPreservingRewrites(t *testing.T) {
 	r := New(graph.New())
 	r.noteImportEdgeReindexes([]graph.EdgeReindex{
@@ -311,9 +311,9 @@ func TestNoteImportTargetReindexesRecordsDirtyFiles(t *testing.T) {
 	}
 }
 
-// The cold-run regression this amendment fixes: import edges resolve in a
-// steady stream throughout a pass, so invalidation must be per-file — a write
-// against an UNRELATED file must not evict the whole retention.
+// Import edges resolve in a steady stream throughout a cold pass, so
+// invalidation must be per-file — a write against an UNRELATED file must not
+// evict the whole retention.
 func TestReachabilityAdjacencyRetentionSurvivesUnrelatedImportWrites(t *testing.T) {
 	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
 	defer indexes.close()
