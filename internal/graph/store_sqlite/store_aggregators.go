@@ -3,8 +3,10 @@ package store_sqlite
 import (
 	"iter"
 	"sort"
+	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // This file implements the trivial SQL aggregator / scanner optional
@@ -160,8 +162,9 @@ func (s *Store) NodeDegreeByKinds(kinds []graph.NodeKind, pathPrefix string) []g
 	FROM nodes n
 	WHERE n.kind IN (` + inPlaceholders(len(kindArgs)) + `)`
 	if pathPrefix != "" {
-		q += ` AND n.file_path LIKE ? ESCAPE '\'`
-		args = append(args, escapeLikePattern(pathPrefix)+"%")
+		pred, pargs := pathPrefixPredicate("n.file_path", pathPrefix)
+		q += ` AND ` + pred
+		args = append(args, pargs...)
 	}
 	q += ` ORDER BY n.id`
 	rows, err := s.db.Query(q, args...)
@@ -179,6 +182,21 @@ func (s *Store) NodeDegreeByKinds(kinds []graph.NodeKind, pathPrefix string) []g
 	}
 	panicOnFatal(rows.Err())
 	return out
+}
+
+// pathPrefixPredicate returns a WHERE predicate (and its args) matching
+// column against every store spelling of a path prefix — the '/'-joined
+// form and the repo-prefixed native form (see graphpath.PrefixForms).
+// The column itself cannot be normalized without defeating its index.
+func pathPrefixPredicate(column, pathPrefix string) (string, []any) {
+	forms := graphpath.PrefixForms(pathPrefix)
+	ors := make([]string, len(forms))
+	args := make([]any, len(forms))
+	for i, form := range forms {
+		ors[i] = column + ` LIKE ? ESCAPE '\'`
+		args[i] = escapeLikePattern(form) + "%"
+	}
+	return "(" + strings.Join(ors, " OR ") + ")", args
 }
 
 // nodesInFilesByKindQuery builds the per-chunk projection SQL. Pure string

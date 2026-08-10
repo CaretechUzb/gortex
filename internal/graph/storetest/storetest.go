@@ -12,6 +12,7 @@ package storetest
 
 import (
 	"fmt"
+	"path/filepath"
 	"slices"
 	"sort"
 	"sync"
@@ -174,6 +175,7 @@ func RunConformance(t *testing.T, factory Factory, semantics Semantics) {
 	t.Run("ClassHierarchyTraverser", func(t *testing.T) { testClassHierarchyTraverser(t, factory) })
 	t.Run("FileEditingContext", func(t *testing.T) { testFileEditingContext(t, factory) })
 	t.Run("NodeDegreeByKinds", func(t *testing.T) { testNodeDegreeByKinds(t, factory) })
+	t.Run("PathPrefixNativeSeparators", func(t *testing.T) { testPathPrefixNativeSeparators(t, factory) })
 	t.Run("CloneShingleSidecar", func(t *testing.T) { testCloneShingleSidecar(t, factory) })
 	t.Run("ChurnEnrichmentSidecar", func(t *testing.T) { testChurnEnrichmentSidecar(t, factory) })
 	t.Run("CoverageEnrichmentSidecar", func(t *testing.T) { testCoverageEnrichmentSidecar(t, factory) })
@@ -3912,6 +3914,46 @@ func testNodeDegreeByKinds(t *testing.T, factory Factory) {
 	)
 	if len(rows) != 1 || rows[0].NodeID != "Leaf" {
 		t.Fatalf("pathPrefix scope mismatch: got %v", rows)
+	}
+}
+
+// testPathPrefixNativeSeparators pins path-prefix scoping against the
+// store path shape (`repo/` + OS-native rest): a '/'-joined prefix must
+// match rows whose stored path uses native separators past the repo
+// prefix.
+func testPathPrefixNativeSeparators(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.NodeDegreeByKinds)
+	if !ok {
+		t.Skip("backend does not implement graph.NodeDegreeByKinds")
+	}
+	deep := mkNode("Deep", "Deep", "r/"+filepath.FromSlash("internal/resolver/deep.go"), graph.KindFunction)
+	deep.StartLine, deep.EndLine = 1, 3
+	shallow := mkNode("Shallow", "Shallow", "r/top.go", graph.KindFunction)
+	shallow.StartLine, shallow.EndLine = 1, 3
+	s.AddNode(deep)
+	s.AddNode(shallow)
+
+	rows := scan.NodeDegreeByKinds([]graph.NodeKind{graph.KindFunction}, "r/internal/resolver")
+	if len(rows) != 1 || rows[0].NodeID != "Deep" {
+		t.Fatalf("NodeDegreeByKinds deep prefix = %+v, want [Deep]", rows)
+	}
+	if cand, ok := s.(graph.ExtractCandidatesScanner); ok {
+		got := cand.ExtractCandidates([]graph.EdgeKind{graph.EdgeCalls}, 0, 0, 0, "r/internal/resolver")
+		if len(got) != 1 || got[0].NodeID != "Deep" {
+			t.Fatalf("ExtractCandidates deep prefix = %+v, want [Deep]", got)
+		}
+	}
+	if ts, ok := s.(graph.ThrowerErrorSurfacer); ok {
+		te := mkEdge("Deep", "errs.ErrDeep", graph.EdgeThrows)
+		te.FilePath = deep.FilePath
+		te.Line = 2
+		s.AddEdge(te)
+		throwers := ts.ThrowerErrorSurface("r/internal/resolver")
+		if len(throwers) != 1 || throwers[0].ThrowerID != "Deep" {
+			t.Fatalf("ThrowerErrorSurface deep prefix = %+v, want [Deep]", throwers)
+		}
 	}
 }
 
