@@ -4547,6 +4547,8 @@ type reachabilityPageStats struct {
 	missing   int
 	unstable  int
 	adjCached int
+	fallback  int
+	retained  int
 	project   time.Duration
 	place     time.Duration
 	match     time.Duration
@@ -4660,6 +4662,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 		if !complete {
 			// complete=false is a canonicality signal, not a cacheable
 			// answer — fallback results are never retained.
+			stats.fallback = 1
 			projected = r.legacyImportTargetsByFile(projectFiles)
 		} else if adjacency != nil {
 			// Retain raw projections for every projected file, including
@@ -4724,6 +4727,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 		}
 	}
 	stats.match = time.Since(matchStart)
+	stats.retained = len(adjacency)
 	r.reachableDirsByFile = reachable
 	r.dirByFilePath = dirs
 	return true, stats
