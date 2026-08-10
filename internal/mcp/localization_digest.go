@@ -17,15 +17,17 @@ import (
 
 const (
 	// localizationDigestMaxBytes bounds retained session state independently of
-	// the original envelope budget.
-	localizationDigestMaxBytes = 4096
-	// localizationReplayEvidenceLimit preserves the complete eight-symbol
-	// refinement window plus two graph-relationship slots. The retained byte cap
-	// remains authoritative when long identities cannot all fit.
-	localizationReplayEvidenceLimit = 10
+	// the original envelope budget. Sized to hold the full replay window below
+	// without shedding: a retention cap tighter than the page silently undoes
+	// any widening of the page.
+	localizationDigestMaxBytes = 12288
+	// localizationReplayEvidenceLimit preserves the complete twelve-symbol
+	// refinement window plus four graph-relationship slots. The retained byte
+	// cap remains authoritative when long identities cannot all fit.
+	localizationReplayEvidenceLimit = 16
 	// localizationFinalResponseMaxBytes bounds the ready-to-emit answer that
 	// accompanies the retained digest on terminal responses and replays.
-	localizationFinalResponseMaxBytes = 4096
+	localizationFinalResponseMaxBytes = 8192
 	// This canonical envelope is deliberately carried in MCP _meta. Adapting
 	// hosts may render its ordered evidence deterministically without exposing
 	// retained rows to model-visible text or structuredContent.
@@ -487,7 +489,21 @@ func localizationFinalResponseField(value string) string {
 }
 
 const (
-	localizationFinalResponsePrimaryLimit = 3
+	// Five primary slots: sessions convert a primary-seated answer at a far
+	// higher rate than any other placement, and the observed gold rank is
+	// usually within the top five. Slots below stay SUPPORTING so the page
+	// keeps an explicit confidence order.
+	localizationFinalResponsePrimaryLimit = 5
+	// localizationDigestShrinkFloorRows is the smallest answer the envelope
+	// shed loop may shrink the digest to under extreme budget pressure. It is
+	// deliberately narrower than the primary block: the primary width is what
+	// a roomy page seats, while this floor is the minimum worth returning at
+	// all — and the tight-budget wire bound must hold at any primary width.
+	localizationDigestShrinkFloorRows = 3
+	// localizationAnswerPageAllowanceBytes is reserved during evidence-row
+	// admission for the answer block reconciled after packing: the rendered
+	// floor-sized primary block, its excerpts, and the directive.
+	localizationAnswerPageAllowanceBytes = 1024
 	// The answer asks the caller to reproduce these lines verbatim, so the
 	// presentation must cover every row the digest retained: a retained row
 	// that never reaches the answer is evidence the page found and then hid.
@@ -853,6 +869,12 @@ func renderLocalizationProvisionalResponseForTask(task string, current, rows []l
 // excerpt exists to show which declaration a row names, not to reproduce it.
 const localizationFinalResponseExcerptMaxRunes = 200
 
+// localizationFinalResponseExcerptRowLimit bounds how many primary rows carry
+// an excerpt line. Deliberately narrower than the primary block itself: every
+// primary's full body already ships in the page's prose section, and the
+// rendered answer must hold the tight-budget wire bound at any primary width.
+const localizationFinalResponseExcerptRowLimit = 3
+
 func localizationFinalResponseExcerpt(row localizationDigestRow) string {
 	return compactLocalizationField(
 		localizationFinalResponseField(row.Signature), localizationFinalResponseExcerptMaxRunes,
@@ -884,6 +906,7 @@ func renderLocalizationAnswerPage(
 	var response strings.Builder
 	response.WriteString(heading)
 	response.WriteString("\n")
+	excerpted := 0
 	for _, item := range presented {
 		role := "SUPPORTING"
 		if item.primary {
@@ -898,14 +921,18 @@ func renderLocalizationAnswerPage(
 			fmt.Fprintf(&response, "- %s — %s — %s\n", role, file, id)
 		}
 		// The excerpt rides its own line so the role/file/symbol tuple stays one
-		// aligned, parseable row.
-		if !excerpts || !item.primary {
+		// aligned, parseable row. Only the leading primaries carry one: the
+		// full bodies for every primary already ship in the prose section, and
+		// the page must stay inside the tight-budget wire bound however wide
+		// the primary block is.
+		if !excerpts || !item.primary || excerpted >= localizationFinalResponseExcerptRowLimit {
 			continue
 		}
 		if excerpt := localizationFinalResponseExcerpt(item.row); excerpt != "" {
 			response.WriteString("  ")
 			response.WriteString(excerpt)
 			response.WriteString("\n")
+			excerpted++
 		}
 	}
 	response.WriteString("\n")

@@ -48,7 +48,9 @@ func leadingDepthPool() (pool []*rerank.Candidate, leading, breadth []*graph.Nod
 	first := leadingDepthNode("repo/lead.go::LeadPrimary", "LeadPrimary", "repo/lead.go")
 	second := leadingDepthNode("repo/lead.go::LeadSecond", "LeadSecond", "repo/lead.go")
 	leading = append(leading, first, second)
-	for index := 0; index < 8; index++ {
+	// One breadth file per remaining window slot, so the assembled window is
+	// exactly the default page regardless of how wide the page constant is.
+	for index := 0; index < exploreDefaultMaxSymbols-2; index++ {
 		breadth = append(breadth, leadingDepthNode(
 			fmt.Sprintf("repo/other_%d.go::Breadth%d", index, index),
 			fmt.Sprintf("Breadth%d", index),
@@ -107,13 +109,14 @@ func TestLeadingFileDepthAdmitsDemotedSiblingsIntoLocalizationPage(t *testing.T)
 			admitted[target.node.ID] = true
 		}
 	}
-	// Global ranks eleven and twelve, demoted below every other file.
+	// The first two siblings, ranked immediately past the window and demoted
+	// below every other file.
 	for _, node := range leading[2:4] {
 		if !admitted[node.ID] {
 			t.Fatalf("leading-file sibling %q missing from page: %v", node.ID, leadingDepthIDs(got))
 		}
 	}
-	if admitted[breadth[6].ID] || admitted[breadth[7].ID] {
+	if admitted[breadth[len(breadth)-2].ID] || admitted[breadth[len(breadth)-1].ID] {
 		t.Fatalf("depth rows did not come from the breadth tail: %v", leadingDepthIDs(got))
 	}
 	for index := 0; index < localizationDirectEvidenceReserve; index++ {
@@ -121,9 +124,20 @@ func TestLeadingFileDepthAdmitsDemotedSiblingsIntoLocalizationPage(t *testing.T)
 			t.Fatalf("head row %d = %q, want %q", index, leadingDepthIDs(got)[index], targets[index].node.ID)
 		}
 	}
-	for _, target := range got[localizationDirectEvidenceReserve:] {
+	// Every admitted sibling arrived via the depth allocator and must be
+	// marked and hydrated. (The displaceable tail can be wider than the
+	// sibling pool, so retained breadth rows may legitimately sit beside
+	// them.)
+	siblings := map[string]bool{}
+	for _, node := range leading[2:] {
+		siblings[node.ID] = true
+	}
+	for _, target := range got {
+		if target.node == nil || !siblings[target.node.ID] {
+			continue
+		}
 		if !target.leadingFileDepth || target.source == "" {
-			t.Fatalf("depth row %q is unmarked or unhydrated", leadingDepthIDs(got))
+			t.Fatalf("depth row %q is unmarked or unhydrated", target.node.ID)
 		}
 	}
 	again := reserveExploreLeadingFileDepthTargets(
@@ -137,8 +151,15 @@ func TestLeadingFileDepthAdmitsDemotedSiblingsIntoLocalizationPage(t *testing.T)
 func TestLeadingFileDepthNeverEvictsProtectedEvidence(t *testing.T) {
 	pool, leading, breadth := leadingDepthPool()
 	targets := leadingDepthWindow(leading, breadth)
-	targets[8].causalChangeOwner = true
-	targets[9].sourceLiteral = true
+	// Protect every displaceable row — the tail past the direct-evidence
+	// reserve — so a correct allocator has nothing it may move.
+	for index := localizationDirectEvidenceReserve; index < len(targets); index++ {
+		if (index-localizationDirectEvidenceReserve)%2 == 0 {
+			targets[index].causalChangeOwner = true
+		} else {
+			targets[index].sourceLiteral = true
+		}
+	}
 
 	got := reserveExploreLeadingFileDepthTargets(
 		pool, targets, exploreDefaultMaxSymbols, nil, leadingDepthHydrate,
@@ -147,13 +168,13 @@ func TestLeadingFileDepthNeverEvictsProtectedEvidence(t *testing.T) {
 		t.Fatalf("protected tail was displaced: %v", leadingDepthIDs(got))
 	}
 
-	targets[9].sourceLiteral = false
-	reserved := map[string]struct{}{targets[9].node.ID: {}}
+	targets[len(targets)-1].sourceLiteral = false
+	reserved := map[string]struct{}{targets[len(targets)-1].node.ID: {}}
 	got = reserveExploreLeadingFileDepthTargets(
 		pool, targets, exploreDefaultMaxSymbols, reserved, leadingDepthHydrate,
 	)
 	for _, target := range got {
-		if target.node != nil && target.node.ID == targets[9].node.ID {
+		if target.node != nil && target.node.ID == targets[len(targets)-1].node.ID {
 			return
 		}
 	}

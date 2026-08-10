@@ -702,20 +702,33 @@ func TestRenderExploreBudgetTruncation(t *testing.T) {
 }
 
 func TestRenderExploreLimitsFullBodiesToTopTargets(t *testing.T) {
-	targets := exploreTestTargets()
-	targets = append(targets, exploreTarget{
-		node:   &graph.Node{Name: "Third", Kind: graph.KindFunction, FilePath: "third.go", StartLine: 1, EndLine: 4, Language: "go"},
-		source: "func Third() int {\n\treturn 3\n}",
-	})
+	// One target past the full-body limit, each with an unmistakable body
+	// marker: bodies must flow to every slot inside the limit and stop at the
+	// first one past it, whatever the limit is tuned to.
+	var targets []exploreTarget
+	for index := 1; index <= exploreFullBodyLimit+1; index++ {
+		name := fmt.Sprintf("Cand%02d", index)
+		targets = append(targets, exploreTarget{
+			node: &graph.Node{
+				Name: name, Kind: graph.KindFunction,
+				FilePath: fmt.Sprintf("cand_%02d.go", index),
+				StartLine: 1, EndLine: 4, Language: "go",
+			},
+			source: fmt.Sprintf("func %s() int {\n\treturn 9900 + %d\n}", name, index),
+		})
+	}
 	out := (&Server{}).renderExplore("task", targets, exploreDefaultBudgetTokens)
 	if exploreDefaultBudgetTokens != 1600 {
 		t.Fatalf("default explore budget=%d want 1600", exploreDefaultBudgetTokens)
 	}
-	if !strings.Contains(out, "3. Third  function") {
-		t.Fatal("third candidate header was dropped")
+	if !strings.Contains(out, fmt.Sprintf("%d. Cand%02d  function", exploreFullBodyLimit+1, exploreFullBodyLimit+1)) {
+		t.Fatal("candidate header past the body limit was dropped")
 	}
-	if strings.Contains(out, "return 3") {
-		t.Fatal("third candidate unexpectedly retained a full body")
+	if !strings.Contains(out, fmt.Sprintf("return 9900 + %d", exploreFullBodyLimit)) {
+		t.Fatalf("candidate %d inside the body limit lost its full body", exploreFullBodyLimit)
+	}
+	if strings.Contains(out, fmt.Sprintf("return 9900 + %d", exploreFullBodyLimit+1)) {
+		t.Fatal("candidate past the body limit unexpectedly retained a full body")
 	}
 }
 
