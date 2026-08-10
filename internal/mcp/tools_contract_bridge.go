@@ -3,7 +3,6 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"path"
 	"sort"
 	"strings"
 
@@ -11,6 +10,7 @@ import (
 
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // rrfK is the standard reciprocal-rank-fusion smoothing constant: the
@@ -563,7 +563,7 @@ func bridgeAdjacencyScore(g *bridgeGroupResult, symNode *graph.Node, anchors map
 		case e.FilePath != "" && e.FilePath == symNode.FilePath:
 			score = 4
 		case e.FilePath != "" && symNode.FilePath != "" &&
-			path.Dir(e.FilePath) == path.Dir(symNode.FilePath):
+			graphpath.Dir(e.FilePath) == graphpath.Dir(symNode.FilePath):
 			score = 2
 		case e.Repo != "" && e.Repo == symNode.RepoPrefix:
 			score = 1
