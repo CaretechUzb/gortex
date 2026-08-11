@@ -71,41 +71,69 @@ const qCSharpAll = `
 
   (using_directive (_) @using.path) @using.def
 
+  ; An invocation that spells explicit type arguments parses its callee
+  ; name as a generic_name, never a bare identifier — so pinning the name
+  ; to (identifier) dropped every generic call site outright, with no edge
+  ; and no unresolved stub. That is the dominant .NET call shape
+  ; (GetRequiredService<T>(), AddSingleton<TI, TImpl>()), and it left
+  ; heavily-called methods looking like dead code. Each alternation
+  ; captures the inner identifier, so the callee name stays bare.
   (invocation_expression
-    function: (identifier) @call.name) @call.expr
+    function: [
+      (identifier) @call.name
+      (generic_name (identifier) @call.name)
+    ]) @call.expr
 
   (invocation_expression
     function: (member_access_expression
       expression: (_) @callm.receiver
-      name: (identifier) @callm.method)) @callm.expr
+      name: [
+        (identifier) @callm.method
+        (generic_name (identifier) @callm.method)
+      ])) @callm.expr
 
   (invocation_expression
     function: (conditional_access_expression
       condition: (_) @callm.receiver
       (member_binding_expression
-        name: (identifier) @callm.method))) @callm.expr
+        name: [
+          (identifier) @callm.method
+          (generic_name (identifier) @callm.method)
+        ]))) @callm.expr
 
   (invocation_expression
     function: (conditional_access_expression
       "this"
       (member_binding_expression
-        name: (identifier) @callself.method))) @callself.expr
+        name: [
+          (identifier) @callself.method
+          (generic_name (identifier) @callself.method)
+        ]))) @callself.expr
 
   (invocation_expression
     function: (conditional_access_expression
       "base"
       (member_binding_expression
-        name: (identifier) @callbase.method))) @callbase.expr
+        name: [
+          (identifier) @callbase.method
+          (generic_name (identifier) @callbase.method)
+        ]))) @callbase.expr
 
   (invocation_expression
     function: (member_access_expression
       "this"
-      name: (identifier) @callself.method)) @callself.expr
+      name: [
+        (identifier) @callself.method
+        (generic_name (identifier) @callself.method)
+      ])) @callself.expr
 
   (invocation_expression
     function: (member_access_expression
       "base"
-      name: (identifier) @callbase.method)) @callbase.expr
+      name: [
+        (identifier) @callbase.method
+        (generic_name (identifier) @callbase.method)
+      ])) @callbase.expr
 
   (local_declaration_statement
     (variable_declaration
@@ -114,11 +142,17 @@ const qCSharpAll = `
         (identifier) @lvar.name))) @lvar.def
 
   (member_access_expression
-    name: (identifier) @maccess.name) @maccess.expr
+    name: [
+      (identifier) @maccess.name
+      (generic_name (identifier) @maccess.name)
+    ]) @maccess.expr
 
   (conditional_access_expression
     (member_binding_expression
-      name: (identifier) @maccess.condname)) @maccess.condexpr
+      name: [
+        (identifier) @maccess.condname
+        (generic_name (identifier) @maccess.condname)
+      ])) @maccess.condexpr
 ]
 `
 
