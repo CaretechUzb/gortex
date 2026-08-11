@@ -81,6 +81,31 @@ func TestImportAdjacencyProjectionSkipsUnrelatedOutgoingRows(t *testing.T) {
 	}
 }
 
+func TestImportAdjacencyProjectionAcceptsMixedSeparatorPaths(t *testing.T) {
+	// Windows stores index paths with the repo prefix joined by '/' and the
+	// rest OS-native ("repo/dir\file.cs"). filepath.Clean normalizes the
+	// separators, so a separator-only difference is not a canonicality
+	// violation — treating it as one silently disabled the projection (and
+	// every consumer above it) on Windows.
+	store := openImportProjectionTestStore(t)
+	const callerPath = `pkg/sub\caller.go`
+	const callerID = callerPath + "::Caller"
+	const targetPath = "dep/target.go"
+	store.AddBatch([]*graph.Node{
+		{ID: callerID, Kind: graph.KindFunction, Name: "Caller", FilePath: callerPath},
+		{ID: targetPath, Kind: graph.KindFile, Name: "target.go", FilePath: targetPath},
+	}, []*graph.Edge{{
+		From: callerID, To: targetPath, Kind: graph.EdgeImports, FilePath: callerPath,
+	}})
+	got, complete := store.ProjectImportAdjacency([]string{callerPath})
+	if !complete {
+		t.Fatal("mixed-separator canonical path reported incomplete")
+	}
+	if targets := got[callerPath]; len(targets) != 1 || targets[0] != targetPath {
+		t.Fatalf("projected targets = %v, want [%s]", targets, targetPath)
+	}
+}
+
 func TestImportAdjacencyProjectionRejectsMalformedProvenance(t *testing.T) {
 	t.Run("noncanonical request", func(t *testing.T) {
 		store := openImportProjectionTestStore(t)
