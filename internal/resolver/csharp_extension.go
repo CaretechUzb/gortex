@@ -195,6 +195,11 @@ func (r *Resolver) tryBindCSharpExtension(e *graph.Edge, methodName, receiverTyp
 				return false
 			}
 		}
+		// Applicability before visibility: C# considers only the
+		// candidates a call site could actually invoke at each scope
+		// level, and sibling overloads of one method group share a
+		// namespace, so visibility alone can never split them.
+		typed = csharpNarrowByApplicability(e, typed)
 		if len(typed) == 1 {
 			if !r.csharpExtensionVisible(e, e.FilePath, typed[0]) {
 				// An extension the call site can neither enclose nor
@@ -261,14 +266,28 @@ func (r *Resolver) bindCSharpExtensionUntyped(e *graph.Edge, pool []*graph.Node,
 	if len(pool) == 0 {
 		return false
 	}
+	// Applicability is a hard rule, so it runs ahead of the visibility
+	// tier — but it must not SMUGGLE a candidate past it. The
+	// pool-unique rule below deliberately waives visibility (partial
+	// using data is common, and a name with exactly one extension in the
+	// whole repo has nothing to confuse it with); a pool applicability
+	// just narrowed is a different thing entirely — visibility is
+	// precisely what would have ranked the candidates it removed, so its
+	// veto still has to hold.
+	applicable := csharpNarrowByApplicability(e, pool)
+	narrowed := len(applicable) < len(pool)
+	pool = applicable
 	if vis := r.narrowCSharpExtensionsByVisibility(e, pool); len(vis) == 1 {
 		pool = vis
 	}
-	if len(pool) == 1 && !csharpHasCompetingMethod(candidates) {
-		r.bindCSharpExtension(e, pool[0], 0.75, stats)
-		return true
+	if len(pool) != 1 || csharpHasCompetingMethod(candidates) {
+		return false
 	}
-	return false
+	if narrowed && !r.csharpExtensionVisible(e, e.FilePath, pool[0]) {
+		return false
+	}
+	r.bindCSharpExtension(e, pool[0], 0.75, stats)
+	return true
 }
 
 // csharpExtensionReachableMatches walks the receiver type's declared

@@ -29,7 +29,7 @@ func emitCSharpFunctionShape(ownerID string, methodNode *sitter.Node, src []byte
 }
 
 func emitCSharpParamNodes(ownerID string, params *sitter.Node, src []byte, filePath string, declLine int, result *parser.ExtractionResult) {
-	pos := 0
+	declaredPos := 0
 	for i, _nc := 0, int(params.NamedChildCount()); i < _nc; i++ {
 		decl := params.NamedChild(i)
 		if decl == nil {
@@ -38,22 +38,20 @@ func emitCSharpParamNodes(ownerID string, params *sitter.Node, src []byte, fileP
 		if decl.Type() != "parameter" {
 			continue
 		}
+		// Every `parameter` child holds a position, whether or not it
+		// gets a node below: a discard (`void Foo(int _, string name)`)
+		// still occupies slot 0, so skipping it silently would shift
+		// every later parameter's recorded position down by one.
+		pos := declaredPos
+		declaredPos++
 		var name, typeRaw string
-		variadic := false
 		if n := decl.ChildByFieldName("name"); n != nil {
 			name = n.Content(src)
 		}
 		if t := decl.ChildByFieldName("type"); t != nil {
 			typeRaw = strings.TrimSpace(t.Content(src))
 		}
-		// Look for `params` modifier — variadic in C#.
-		for j, _nc := 0, int(decl.NamedChildCount()); j < _nc; j++ {
-			c := decl.NamedChild(j)
-			if c != nil && c.Type() == "parameter_modifier" && strings.Contains(c.Content(src), "params") {
-				variadic = true
-				break
-			}
-		}
+		variadic := csharpParamIsVariadic(decl, src)
 		if name == "" || name == "_" {
 			continue
 		}
@@ -97,7 +95,6 @@ func emitCSharpParamNodes(ownerID string, params *sitter.Node, src []byte, fileP
 				Origin:   graph.OriginASTInferred,
 			})
 		}
-		pos++
 	}
 }
 
