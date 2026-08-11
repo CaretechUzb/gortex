@@ -81,6 +81,22 @@ jobs:
       - name: Test user-state isolation
         run: go test -timeout=5m -count=1 ./internal/testenv ./internal/platform
 
+      # Indexed paths are repoPrefix + '/' + the rest in native separators, so
+      # on Windows a stored path reads `repo/dir\file.cs`. Every test for that
+      # shape is a no-op on the linux/macos matrix — POSIX treats '\' as an
+      # ordinary filename byte, so filepath.Clean and filepath.ToSlash both
+      # leave the fixture untouched and the assertions pass with or without
+      # the production fix. This runner is the only one where they can fail.
+      - name: Test store path separator handling
+        run: go test -timeout=5m -count=1 ./internal/graphpath
+
+      - name: Test native-separator store path comparisons
+        run: >
+          go test -timeout=10m -count=1
+          -run 'NativeSeparator|MixedSeparator|ImportAdjacency'
+          ./internal/analysis ./internal/graph/store_sqlite
+          ./internal/mcp ./internal/resolver
+
   build-linux-static:
     # The linux release ships a statically linked binary so it runs on any
     # distro (see .goreleaser.yml). That only holds while the code stays

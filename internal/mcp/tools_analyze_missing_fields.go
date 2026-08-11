@@ -7,6 +7,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // handleAnalyzeConstructorsMissingFields surfaces struct/class
@@ -16,15 +17,15 @@ import (
 //
 // Heuristic, not a full literal-site analyzer:
 //
-//   1. For every type node T with member fields (via inbound
-//      EdgeMemberOf from field nodes), collect T_fields.
-//   2. For every EdgeInstantiates whose target is T, take the
-//      origin function F.
-//   3. Look at every outbound EdgeReferences from F whose target
-//      is a member field of T. The set of referenced field names
-//      is F_referenced.
-//   4. missing = T_fields - F_referenced. When non-empty, emit a
-//      row (F, T, missing fields).
+//  1. For every type node T with member fields (via inbound
+//     EdgeMemberOf from field nodes), collect T_fields.
+//  2. For every EdgeInstantiates whose target is T, take the
+//     origin function F.
+//  3. Look at every outbound EdgeReferences from F whose target
+//     is a member field of T. The set of referenced field names
+//     is F_referenced.
+//  4. missing = T_fields - F_referenced. When non-empty, emit a
+//     row (F, T, missing fields).
 //
 // False positives:
 //   - F populates the field via shorthand the extractor doesn't
@@ -72,7 +73,7 @@ func (s *Server) handleAnalyzeConstructorsMissingFields(ctx context.Context, req
 			if typeFilter != "" && e.To != typeFilter {
 				continue
 			}
-			if pathPrefix != "" && !strings.HasPrefix(scopedSet[e.To].FilePath, pathPrefix) {
+			if !graphpath.HasPrefix(scopedSet[e.To].FilePath, pathPrefix) {
 				continue
 			}
 			if typeFields[e.To] == nil {

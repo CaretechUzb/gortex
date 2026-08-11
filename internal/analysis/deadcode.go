@@ -9,6 +9,7 @@ import (
 	"unicode"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // DeadCodeEntry represents a symbol with zero incoming references that is not excluded.
@@ -1080,11 +1081,12 @@ func matchesExcludePattern(filePath, nodeID string, patterns []string) bool {
 			return true
 		}
 		// Try prefix match against file path
-		if strings.HasPrefix(filePath, pattern) {
+		if graphpath.HasPrefix(filePath, pattern) {
 			return true
 		}
-		// Try prefix match against node ID
-		if strings.HasPrefix(nodeID, pattern) {
+		// Try prefix match against node ID. A node ID embeds the file path,
+		// so it carries the same native separators.
+		if graphpath.HasPrefix(nodeID, pattern) {
 			return true
 		}
 	}

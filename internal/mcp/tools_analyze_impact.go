@@ -12,6 +12,7 @@ import (
 
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/reach"
 )
 
@@ -397,7 +398,7 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 					continue
 				}
 			}
-			if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+			if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 				continue
 			}
 			if len(idFilter) > 0 {
@@ -529,25 +530,25 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 				impactWeightCoChange + impactWeightCommunity)
 
 		row := impactRow{
-			ID:            n.ID,
-			Name:          n.Name,
-			Kind:          string(n.Kind),
-			File:          n.FilePath,
-			Line:          n.StartLine,
-			Score:         roundTo(composite, 2),
-			Risk:          impactRisk(composite),
-			Centrality:    roundTo(centrality, 2),
-			Reach:         roundTo(reachScore, 2),
-			Complexity:    roundTo(complexityScore, 2),
-			CoChange:      roundTo(coChangeScore, 2),
-			Community:     roundTo(communityScore, 2),
-			PageRank:      prVal,
-			ReachCount:    reachCount,
+			ID:              n.ID,
+			Name:            n.Name,
+			Kind:            string(n.Kind),
+			File:            n.FilePath,
+			Line:            n.StartLine,
+			Score:           roundTo(composite, 2),
+			Risk:            impactRisk(composite),
+			Centrality:      roundTo(centrality, 2),
+			Reach:           roundTo(reachScore, 2),
+			Complexity:      roundTo(complexityScore, 2),
+			CoChange:        roundTo(coChangeScore, 2),
+			Community:       roundTo(communityScore, 2),
+			PageRank:        prVal,
+			ReachCount:      reachCount,
 			ReachLowerBound: reachLowerBound,
-			Cyclomatic:    cyc,
-			CoChangeFiles: ccFiles,
-			CommunitySpan: span,
-			FanIn:         fanIn[n.ID],
+			Cyclomatic:      cyc,
+			CoChangeFiles:   ccFiles,
+			CommunitySpan:   span,
+			FanIn:           fanIn[n.ID],
 		}
 		if reachLowerBound && row.Risk == "LOW" {
 			row.Risk = "MEDIUM"

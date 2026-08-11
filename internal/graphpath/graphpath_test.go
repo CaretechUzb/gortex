@@ -81,3 +81,47 @@ func TestPrefixFormsNormalizesNativeInput(t *testing.T) {
 		t.Fatalf("PrefixForms(%q) = %v, missing slash form", in, got)
 	}
 }
+
+func TestHasPrefixMatchesNativeStorePaths(t *testing.T) {
+	// The store spelling on Windows; identical to the caller's spelling on
+	// POSIX, which is why this case can only fail on the windows runner.
+	stored := "repo/" + filepath.FromSlash("internal/resolver/pass.go")
+	for _, prefix := range []string{
+		"repo/internal/resolver",
+		"repo/" + filepath.FromSlash("internal/resolver"),
+		"repo/internal",
+		"repo",
+	} {
+		if !HasPrefix(stored, prefix) {
+			t.Fatalf("HasPrefix(%q, %q) = false, want true", stored, prefix)
+		}
+	}
+}
+
+func TestHasPrefixRejectsUnrelatedPrefixes(t *testing.T) {
+	stored := "repo/" + filepath.FromSlash("internal/resolver/pass.go")
+	for _, prefix := range []string{
+		"repo/internal/indexer",
+		"other/internal/resolver",
+	} {
+		if HasPrefix(stored, prefix) {
+			t.Fatalf("HasPrefix(%q, %q) = true, want false", stored, prefix)
+		}
+	}
+}
+
+func TestHasPrefixEmptyPrefixMatchesEverything(t *testing.T) {
+	// Every swept call site previously guarded this with `prefix != ""`.
+	if !HasPrefix("repo/"+filepath.FromSlash("a/b.go"), "") {
+		t.Fatal(`HasPrefix(path, "") = false, want true`)
+	}
+}
+
+// The filters this helper replaced were raw string prefixes, not segment
+// aware. Pinning that keeps the sweep behaviour-preserving: turning it into a
+// segment match would silently change what every analyze path_prefix returns.
+func TestHasPrefixStaysARawStringPrefix(t *testing.T) {
+	if !HasPrefix("repo/"+filepath.FromSlash("internal/mcpx/tool.go"), "repo/internal/mcp") {
+		t.Fatal("HasPrefix stopped matching a partial segment; that is a behaviour change")
+	}
+}

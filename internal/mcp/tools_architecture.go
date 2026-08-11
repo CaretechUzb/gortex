@@ -10,6 +10,7 @@ import (
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // registerArchitectureTool wires get_architecture — the single-shot
@@ -76,7 +77,7 @@ func (s *Server) handleGetArchitecture(ctx context.Context, req mcp.CallToolRequ
 		scoped = s.scopedNodesLight(ctx)
 		inScope = make(map[string]bool, len(scoped))
 		for _, n := range scoped {
-			if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+			if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 				continue
 			}
 			inScope[n.ID] = true

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // HistoryEvent is the docs-package projection of one watcher event.
@@ -67,13 +68,13 @@ type Options struct {
 // Bundle is the canonical structured result. RenderMarkdown / RenderJSON
 // project it to one of the two wire formats.
 type Bundle struct {
-	GeneratedAt    time.Time         `json:"generated_at"`
-	Since          time.Time         `json:"since"`
-	RecentChanges  []HistoryEvent    `json:"recent_changes,omitempty"`
-	OwnershipRows  []OwnershipRow    `json:"ownership,omitempty"`
-	StaleCodeRows  []StaleCodeRow    `json:"stale_code,omitempty"`
-	Blame          *BlameSummary     `json:"blame,omitempty"`
-	Sections       []string          `json:"sections"`
+	GeneratedAt   time.Time      `json:"generated_at"`
+	Since         time.Time      `json:"since"`
+	RecentChanges []HistoryEvent `json:"recent_changes,omitempty"`
+	OwnershipRows []OwnershipRow `json:"ownership,omitempty"`
+	StaleCodeRows []StaleCodeRow `json:"stale_code,omitempty"`
+	Blame         *BlameSummary  `json:"blame,omitempty"`
+	Sections      []string       `json:"sections"`
 }
 
 // OwnershipRow describes one author's stake in the codebase.
@@ -211,7 +212,7 @@ func walkNodes(g graph.Store, opts Options, now time.Time) ([]OwnershipRow, []St
 		if _, ok := allowed[n.Kind]; !ok {
 			continue
 		}
-		if opts.PathPrefix != "" && !strings.HasPrefix(n.FilePath, opts.PathPrefix) {
+		if !graphpath.HasPrefix(n.FilePath, opts.PathPrefix) {
 			continue
 		}
 		if opts.WorkspaceID != "" {

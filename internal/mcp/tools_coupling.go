@@ -8,6 +8,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // registerCouplingMetricsTool wires get_coupling_metrics — the
@@ -61,7 +62,7 @@ func (s *Server) handleGetCouplingMetrics(ctx context.Context, req mcp.CallToolR
 	nodeToUnit := map[string]string{}
 	members := map[string]int{}
 	for _, n := range s.scopedNodesLight(ctx) {
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
 		var unit string

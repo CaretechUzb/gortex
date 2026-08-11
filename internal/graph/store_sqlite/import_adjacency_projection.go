@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // importAdjacencyProjectionSQL has two deliberately narrow branches. The
@@ -56,9 +57,11 @@ func (s *Store) ProjectImportAdjacency(filePaths []string) (map[string][]string,
 		// OS-native, so on Windows filepath.Clean rewrites separators on
 		// every stored path. A separator-only difference is not a
 		// canonicality violation — only a structural one (traversal,
-		// duplicate separators, trailing dots) rejects the request.
-		if cleaned := filepath.Clean(path); cleaned != path &&
-			filepath.ToSlash(cleaned) != filepath.ToSlash(path) {
+		// duplicate separators, a trailing "/." segment) rejects the
+		// request. Comparing the normalized forms is the whole test: Clean
+		// never inserts characters, so equal normalized forms mean the two
+		// spellings differ only in separators.
+		if cleaned := filepath.Clean(path); graphpath.Norm(cleaned) != graphpath.Norm(path) {
 			return nil, false
 		}
 		if _, duplicate := seen[path]; duplicate {

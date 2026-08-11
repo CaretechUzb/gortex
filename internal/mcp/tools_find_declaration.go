@@ -7,6 +7,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/trigram"
 )
@@ -163,7 +164,7 @@ func (s *Server) findUseSiteMatches(useSite string, isRegex bool, pathPrefix str
 	}
 	var matches []trigram.Match
 	for _, m := range raw {
-		if pathPrefix != "" && !strings.HasPrefix(m.Path, pathPrefix) {
+		if !graphpath.HasPrefix(m.Path, pathPrefix) {
 			continue
 		}
 		matches = append(matches, m)

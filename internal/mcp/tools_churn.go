@@ -8,6 +8,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/query"
 )
 
@@ -100,7 +101,7 @@ func (s *Server) handleGetChurnRate(ctx context.Context, req mcp.CallToolRequest
 						continue
 					}
 				}
-				if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+				if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 					continue
 				}
 				if e.CommitCount < minCommits {
@@ -121,7 +122,7 @@ func (s *Server) handleGetChurnRate(ctx context.Context, req mcp.CallToolRequest
 					continue
 				}
 			}
-			if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+			if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 				continue
 			}
 			row, ok := churnRowFromMeta(n)

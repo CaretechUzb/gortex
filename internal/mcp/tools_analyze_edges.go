@@ -27,6 +27,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // ---------------------------------------------------------------------------
@@ -73,7 +74,7 @@ func (s *Server) handleAnalyzeChannelOps(ctx context.Context, req mcp.CallToolRe
 	// One scan over Sends+Recvs only — replaces the legacy AllEdges()
 	// walk that pulled every edge over cgo just to keep two kinds.
 	for e := range edgesByKinds(s.graph, graph.EdgeSends, graph.EdgeRecvs) {
-		if pathPrefix != "" && !strings.HasPrefix(e.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(e.FilePath, pathPrefix) {
 			continue
 		}
 		row := get(e.To)
@@ -1408,7 +1409,7 @@ func (s *Server) handleAnalyzeErrorSurface(ctx context.Context, req mcp.CallTool
 	} else {
 		byThrower := map[string]*throwerRow{}
 		for e := range edgesByKinds(s.graph, graph.EdgeThrows) {
-			if pathPrefix != "" && !strings.HasPrefix(e.FilePath, pathPrefix) {
+			if !graphpath.HasPrefix(e.FilePath, pathPrefix) {
 				continue
 			}
 			row, ok := byThrower[e.From]
@@ -1607,7 +1608,7 @@ func (s *Server) handleAnalyzeCrossRepo(ctx context.Context, req mcp.CallToolReq
 		if !ok {
 			continue
 		}
-		if pathPrefix != "" && !strings.HasPrefix(e.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(e.FilePath, pathPrefix) {
 			continue
 		}
 		if kindFilter != "" && string(base) != kindFilter {

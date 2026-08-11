@@ -12,6 +12,7 @@ import (
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/clones"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // registerCloneTools wires the find_clones MCP tool — the query
@@ -86,7 +87,7 @@ func (s *Server) handleFindClones(ctx context.Context, req mcp.CallToolRequest) 
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
 			return false
 		}
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			return false
 		}
 		return s.analyzeNodeVisible(ctx, n)
