@@ -89,6 +89,11 @@ type GlobalConfig struct {
 	// single workspace. Lives in the user-level config for that reason.
 	Daemon DaemonConfig `mapstructure:"daemon" yaml:"daemon,omitempty"`
 
+	// MCP carries machine-level client startup policy. It intentionally lives
+	// in the user config rather than a repo's .gortex.yaml: checked-in content
+	// must not be able to authorize extra in-process servers on the machine.
+	MCP GlobalMCPConfig `mapstructure:"mcp" yaml:"mcp,omitempty"`
+
 	// configPath stores the file path used for Save(). Set by LoadGlobal or SetConfigPath.
 	configPath string `yaml:"-"`
 }
@@ -102,6 +107,16 @@ type DaemonConfig struct {
 	// to a sane band). The GORTEX_DAEMON_MEMLIMIT env var overrides this,
 	// and a runtime-honored GOMEMLIMIT overrides both.
 	MemoryLimit string `mapstructure:"memory_limit" yaml:"memory_limit,omitempty"`
+}
+
+// GlobalMCPConfig is the `mcp:` block in ~/.gortex/config.yaml. It contains
+// machine-level permissions for MCP client processes, distinct from the
+// repo-local MCP server settings in Config.MCP.
+type GlobalMCPConfig struct {
+	// AllowEmbedded permits `gortex mcp` to start a private in-process server
+	// when the shared daemon is unavailable. It is off by default so multiple
+	// MCP clients cannot silently build duplicate indexes.
+	AllowEmbedded bool `mapstructure:"allow_embedded" yaml:"allow_embedded,omitempty"`
 }
 
 // MergeLLMInto layers a repo-local llm.Config over the global user
@@ -166,7 +181,7 @@ func (gc *GlobalConfig) MergeEmbeddingInto(local EmbeddingConfig) EmbeddingConfi
 // so UnknownGlobalKeys surfaces it for a startup warning.
 var knownGlobalTopLevelKeys = map[string]bool{
 	"projects": true, "repos": true, "active_project": true,
-	"exclude": true, "llm": true, "embedding": true,
+	"exclude": true, "llm": true, "embedding": true, "mcp": true,
 }
 
 // UnknownGlobalKeys returns the top-level keys present in the global config file
