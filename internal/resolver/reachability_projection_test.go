@@ -337,8 +337,12 @@ func TestReachabilityAdjacencyRetentionSurvivesUnrelatedImportWrites(t *testing.
 // Renegotiated from TestReachabilityProjectionDoesNotCacheUnresolvedImports:
 // adjacency for an unresolved-import caller MAY now be retained across pages —
 // the pinned invariant is freshness, not absence. An imports-kind edge write
-// (noted via the resolver generation) clears the retention, and the next page
-// re-projects and sees the newly resolved target.
+// clears the retention, and the next page re-projects and sees the newly
+// resolved target.
+//
+// The write below carries an Edge.FilePath, so this exercises the per-file
+// dirty path; importEdgeGen stays 0 throughout. The generation branch is
+// covered by TestAdjacencyRetentionClearedWholesaleByProvenancelessImportWrite.
 func TestReachabilityProjectionUnresolvedImportsStayFresh(t *testing.T) {
 	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
 	defer indexes.close()
@@ -367,5 +371,89 @@ func TestReachabilityProjectionUnresolvedImportsStayFresh(t *testing.T) {
 	}
 	if _, ok := r.reachableDirsByFile["repo/caller.go"]["dep2"]; !ok {
 		t.Fatal("post-write projection missing the newly resolved dep2 directory")
+	}
+}
+
+// The retention's correctness depends on production write paths calling
+// noteImportEdgeReindexes — but every other test in this file notes the write
+// itself, from the test body. Stripping all fourteen production call sites
+// leaves ./internal/resolver and ./internal/indexer green, so the wiring that
+// makes the retention safe is unpinned. This drives the collector every
+// attribution pass funnels through instead, so removing the note from
+// persistAttributionReindexes fails here.
+func TestAdjacencyRetentionInvalidatedThroughProductionAttributionWrite(t *testing.T) {
+	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
+	defer indexes.close()
+	store.projected["repo/caller.go"] = []string{graph.UnresolvedMarker + "import::dep"}
+
+	indexes.prepare(pending)
+	indexes.clearPage()
+	if store.projectionCalls != 1 {
+		t.Fatalf("projection calls = %d, want 1 before the write", store.projectionCalls)
+	}
+
+	// Production path: collector.add -> flush -> persistAttributionReindexes
+	// -> noteImportEdgeReindexes. No note* call in this test body.
+	store.projected["repo/caller.go"] = []string{"dep2/two.go"}
+	collector := newAttributionReindexCollector(r)
+	collector.add(
+		&graph.Edge{Kind: graph.EdgeImports, FilePath: "repo/caller.go", To: "dep2/two.go"},
+		graph.UnresolvedMarker+"import::dep",
+	)
+	collector.flush()
+
+	indexes.prepare(pending)
+	defer indexes.clearPage()
+	if store.projectionCalls != 2 {
+		t.Fatalf("projection calls = %d, want 2: a production attribution write must evict the retained file", store.projectionCalls)
+	}
+	if _, ok := r.reachableDirsByFile["repo/caller.go"]["dep2"]; !ok {
+		t.Fatal("post-write projection missing the newly resolved dep2 directory")
+	}
+}
+
+// The generation branch in prepare — the wholesale clear taken when an
+// imports write lands without file provenance — had no test reaching it: its
+// statements profiled at zero executions. A provenance-less write leaves
+// importDirtyFiles empty, so the per-file branch would delete nothing and the
+// retention would survive; only the generation branch can evict it. That makes
+// re-projection here an exact discriminator between the two branches.
+func TestAdjacencyRetentionClearedWholesaleByProvenancelessImportWrite(t *testing.T) {
+	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
+	defer indexes.close()
+	store.projected["repo/caller.go"] = []string{graph.UnresolvedMarker + "import::dep"}
+
+	indexes.prepare(pending)
+	indexes.clearPage()
+	if store.projectionCalls != 1 {
+		t.Fatalf("projection calls = %d, want 1 before the write", store.projectionCalls)
+	}
+
+	store.projected["repo/caller.go"] = []string{"dep2/two.go"}
+	collector := newAttributionReindexCollector(r)
+	collector.add(
+		&graph.Edge{Kind: graph.EdgeImports, To: "dep2/two.go"}, // no FilePath
+		graph.UnresolvedMarker+"import::dep",
+	)
+	collector.flush()
+	if len(r.importDirtyFiles) != 0 {
+		t.Fatalf("importDirtyFiles = %v, want empty: the test would not distinguish the two branches", r.importDirtyFiles)
+	}
+	if r.importEdgeGen == 0 {
+		t.Fatal("a provenance-less imports write did not bump the generation")
+	}
+
+	indexes.prepare(pending)
+	if store.projectionCalls != 2 {
+		t.Fatalf("projection calls = %d, want 2: a provenance-less write must clear the retention wholesale", store.projectionCalls)
+	}
+	indexes.clearPage()
+
+	// The generation is re-synced, so an unchanged pass retains again rather
+	// than re-projecting on every page from here on.
+	indexes.prepare(pending)
+	defer indexes.clearPage()
+	if store.projectionCalls != 2 {
+		t.Fatalf("projection calls = %d, want 2: the retention must re-arm once the generation is re-synced", store.projectionCalls)
 	}
 }
