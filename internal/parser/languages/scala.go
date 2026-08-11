@@ -613,6 +613,21 @@ func (e *ScalaExtractor) extractCall(
 		return
 	}
 	callee := node.Child(0)
+	// A call spelling explicit type arguments — `f[T]()`, `obj.m[T](x)`,
+	// `Future[Int] { … }` — wraps its callee in a generic_function node, so
+	// the switch below saw neither an identifier nor a field_expression and
+	// returned without emitting anything: no edge, not even an unresolved
+	// stub. Unwrap to the real callee and the ordinary cases apply.
+	if callee != nil && callee.Type() == "generic_function" {
+		if inner := callee.ChildByFieldName("function"); inner != nil {
+			callee = inner
+		} else if inner := callee.NamedChild(0); inner != nil {
+			callee = inner
+		}
+	}
+	if callee == nil {
+		return
+	}
 	var callName string
 	var receiver string
 	switch callee.Type() {
