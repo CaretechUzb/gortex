@@ -262,20 +262,41 @@ func isNoDaemonErr(err error) bool {
 	return false
 }
 
+// ProbeAvailability checks the default daemon socket while preserving whether
+// a failed dial means "not running" or a real system error. Startup selection
+// must not hide permissions or a broken socket behind embedded fallback.
+func ProbeAvailability() error {
+	return probeAvailabilityAt(SocketPath())
+}
+
+func probeAvailabilityAt(socketPath string) error {
+	d := &net.Dialer{Timeout: 200 * time.Millisecond}
+	conn, err := d.Dial("unix", socketPath)
+	if err != nil {
+		return classifyDaemonProbeError(err)
+	}
+	_ = conn.Close()
+	return nil
+}
+
+func classifyDaemonProbeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isNoDaemonErr(err) {
+		return fmt.Errorf("%w: %v", ErrDaemonUnavailable, err)
+	}
+	return err
+}
+
 // IsRunning returns true when a daemon is reachable on the default socket.
 // A thin convenience for CLI paths that want to branch on availability
 // without constructing a full handshake.
 func IsRunning() bool {
-	return IsRunningAt(SocketPath())
+	return ProbeAvailability() == nil
 }
 
 // IsRunningAt is IsRunning with an explicit socket path.
 func IsRunningAt(socketPath string) bool {
-	d := &net.Dialer{Timeout: 200 * time.Millisecond}
-	conn, err := d.Dial("unix", socketPath)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
+	return probeAvailabilityAt(socketPath) == nil
 }

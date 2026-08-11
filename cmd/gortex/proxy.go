@@ -185,9 +185,15 @@ var (
 func dialDaemonWithRetry(ctx context.Context, h daemon.Handshake) (client *daemon.Client, recoverable bool, lastErr error) {
 	deadline := time.Now().Add(proxyDialRetryWindow)
 	for {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, false, ctxErr
+		}
 		c, err := dialDaemon(h)
 		if err == nil {
 			return c, false, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, false, ctxErr
 		}
 		if !daemon.ShouldFallBackToEmbedded(err) {
 			return nil, false, err
@@ -202,7 +208,7 @@ func dialDaemonWithRetry(ctx context.Context, h daemon.Handshake) (client *daemo
 		}
 		select {
 		case <-ctx.Done():
-			return nil, true, err
+			return nil, false, ctx.Err()
 		case <-time.After(proxyDialRetryInterval):
 		}
 	}

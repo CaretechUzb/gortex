@@ -308,9 +308,8 @@ func DefaultGortexMCPEntry() map[string]any {
 // The proxy shape carries no cwd-relative state: the daemon resolves
 // the active workspace per session from the request handshake, so
 // the global config never trips the strict entry-point check on the
-// home directory. If no daemon is running, `gortex mcp --proxy` exits
-// with a clear "no daemon" error rather than silently falling back
-// to a broken indexer.
+// home directory. If no daemon is running, the canonical command exits by
+// default; embedded mode still requires the machine-global opt-in.
 // GlobalGortexMCPEntry is now identical to DefaultGortexMCPEntry — the
 // canonical `["mcp"]` shape carries no cwd-relative or proxy flag. Kept
 // as a named function so existing call sites compile.

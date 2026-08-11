@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm/conversationlog"
 	"github.com/zzet/gortex/internal/platform"
@@ -83,11 +84,14 @@ func init() {
 	rootCmd.AddCommand(mcpCmd)
 }
 
-var legacyMCPFlagsWarned bool
+var (
+	legacyMCPFlagsWarned    bool
+	probeDaemonAvailability = daemon.ProbeAvailability
+)
 
-// legacyMCPProxyReason explains the flags the daemon-first startup path
-// retired: the mode decision comes from daemon presence plus GORTEX_AUTOSTART,
-// never from a flag.
+// legacyMCPProxyReason explains compatibility flags that no longer choose the
+// startup path. The --proxy flag is different: it can still forbid embedded
+// mode when a caller requires the shared daemon.
 const legacyMCPProxyReason = "`gortex mcp` proxies to the daemon (auto-starting it) " +
 	"and only uses an embedded server when mcp.allow_embedded is enabled"
 
@@ -99,7 +103,6 @@ const legacyMCPProxyReason = "`gortex mcp` proxies to the daemon (auto-starting 
 var legacyMCPFlags = []struct{ name, reason string }{
 	{"index", legacyMCPProxyReason},
 	{"watch", legacyMCPProxyReason},
-	{"proxy", legacyMCPProxyReason},
 	{"no-daemon", legacyMCPProxyReason},
 	{"no-cache", "the graph is served from the sqlite store, which has no separate cache to disable"},
 }
@@ -214,7 +217,7 @@ func newEmbeddedStorePath() (string, func(), error) {
 func loadEmbeddedMCPGlobalConfig(path string) (*config.GlobalConfig, error) {
 	global, err := config.LoadGlobal(path)
 	if err != nil {
-		return nil, fmt.Errorf("load global config for embedded MCP policy: %w", err)
+		return nil, fmt.Errorf("load global config %q for embedded MCP policy: %w", path, err)
 	}
 	if !global.MCP.AllowEmbedded {
 		return nil, fmt.Errorf(
@@ -228,13 +231,22 @@ func loadEmbeddedMCPGlobalConfig(path string) (*config.GlobalConfig, error) {
 func runMCP(cmd *cobra.Command, args []string) error {
 	warnLegacyMCPFlags(cmd)
 
+	// A boolean liveness check cannot distinguish an absent daemon from a
+	// permission or broken-socket failure. Preserve that distinction before
+	// startup selection so even an opted-in embedded server cannot mask a live
+	// daemon or a system error.
+	if err := probeDaemonAvailability(); err != nil && !daemon.ShouldFallBackToEmbedded(err) {
+		return fmt.Errorf("check gortex daemon availability: %w", err)
+	}
+
 	// Daemon-first: ensure a daemon is up (auto-starting it under a
 	// single-flight lock when GORTEX_AUTOSTART allows), then relay stdio
 	// over its socket. The old stdin-TTY heuristic is gone — behavior is
 	// identical from a terminal or a pipe given the same daemon state. The
 	// legacy --no-daemon flag is an inert no-op (warned above); embedded mode
 	// is available only through the machine-global opt-in checked below.
-	switch resolveDaemonDecision() {
+	decision := resolveDaemonDecision()
+	switch decision {
 	case daemonReady, daemonAutostarted:
 		ran, proxyErr := runProxy(cmd.Context(), proxyToolSurface())
 		if proxyErr != nil {
@@ -245,6 +257,32 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		}
 		// Lost the daemon between ensure and dial (rare) — proceed to the
 		// same explicit embedded-mode policy as every other unavailable case.
+	}
+
+	// Re-probe after an unavailable decision: a peer may have started the
+	// daemon while we were deciding. Prefer that daemon over an embedded copy,
+	// and preserve any non-recoverable socket error that appeared meanwhile.
+	if decision == daemonUnavailable {
+		if probeErr := probeDaemonAvailability(); probeErr == nil {
+			ran, proxyErr := runProxy(cmd.Context(), proxyToolSurface())
+			if proxyErr != nil {
+				return proxyErr
+			}
+			if ran {
+				return nil
+			}
+		} else if !daemon.ShouldFallBackToEmbedded(probeErr) {
+			return fmt.Errorf("check gortex daemon availability: %w", probeErr)
+		}
+	}
+
+	if ctx := cmd.Context(); ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if mcpForceProxy {
+		return fmt.Errorf("gortex daemon is unavailable and --proxy requires it; start the daemon with `gortex daemon start`")
 	}
 
 	global, err := loadEmbeddedMCPGlobalConfig(config.DefaultGlobalConfigPath())

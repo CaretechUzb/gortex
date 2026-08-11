@@ -90,6 +90,9 @@ gortex init --dry-run-intake --json     # inspect admitted/skipped corpus bucket
 # Standalone mode requires `mcp.allow_embedded: true` in the user-level config.
 # `--no-daemon` is deprecated and does not bypass the opt-in.
 gortex mcp --index /path/to/repo --watch
+
+# Require the shared daemon even when embedded fallback is globally allowed.
+gortex mcp --proxy
 ```
 
 ## Query subcommands
