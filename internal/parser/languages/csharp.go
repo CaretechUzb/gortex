@@ -71,41 +71,69 @@ const qCSharpAll = `
 
   (using_directive (_) @using.path) @using.def
 
+  ; An invocation that spells explicit type arguments parses its callee
+  ; name as a generic_name, never a bare identifier — so pinning the name
+  ; to (identifier) dropped every generic call site outright, with no edge
+  ; and no unresolved stub. That is the dominant .NET call shape
+  ; (GetRequiredService<T>(), AddSingleton<TI, TImpl>()), and it left
+  ; heavily-called methods looking like dead code. Each alternation
+  ; captures the inner identifier, so the callee name stays bare.
   (invocation_expression
-    function: (identifier) @call.name) @call.expr
+    function: [
+      (identifier) @call.name
+      (generic_name (identifier) @call.name)
+    ]) @call.expr
 
   (invocation_expression
     function: (member_access_expression
       expression: (_) @callm.receiver
-      name: (identifier) @callm.method)) @callm.expr
+      name: [
+        (identifier) @callm.method
+        (generic_name (identifier) @callm.method)
+      ])) @callm.expr
 
   (invocation_expression
     function: (conditional_access_expression
       condition: (_) @callm.receiver
       (member_binding_expression
-        name: (identifier) @callm.method))) @callm.expr
+        name: [
+          (identifier) @callm.method
+          (generic_name (identifier) @callm.method)
+        ]))) @callm.expr
 
   (invocation_expression
     function: (conditional_access_expression
       "this"
       (member_binding_expression
-        name: (identifier) @callself.method))) @callself.expr
+        name: [
+          (identifier) @callself.method
+          (generic_name (identifier) @callself.method)
+        ]))) @callself.expr
 
   (invocation_expression
     function: (conditional_access_expression
       "base"
       (member_binding_expression
-        name: (identifier) @callbase.method))) @callbase.expr
+        name: [
+          (identifier) @callbase.method
+          (generic_name (identifier) @callbase.method)
+        ]))) @callbase.expr
 
   (invocation_expression
     function: (member_access_expression
       "this"
-      name: (identifier) @callself.method)) @callself.expr
+      name: [
+        (identifier) @callself.method
+        (generic_name (identifier) @callself.method)
+      ])) @callself.expr
 
   (invocation_expression
     function: (member_access_expression
       "base"
-      name: (identifier) @callbase.method)) @callbase.expr
+      name: [
+        (identifier) @callbase.method
+        (generic_name (identifier) @callbase.method)
+      ])) @callbase.expr
 
   (local_declaration_statement
     (variable_declaration
@@ -114,11 +142,17 @@ const qCSharpAll = `
         (identifier) @lvar.name))) @lvar.def
 
   (member_access_expression
-    name: (identifier) @maccess.name) @maccess.expr
+    name: [
+      (identifier) @maccess.name
+      (generic_name (identifier) @maccess.name)
+    ]) @maccess.expr
 
   (conditional_access_expression
     (member_binding_expression
-      name: (identifier) @maccess.condname)) @maccess.condexpr
+      name: [
+        (identifier) @maccess.condname
+        (generic_name (identifier) @maccess.condname)
+      ])) @maccess.condexpr
 ]
 `
 
@@ -154,6 +188,23 @@ type csharpDeferredCall struct {
 	// (graph.ReturnUsage* label), classified at capture time and
 	// stamped as edge Meta on the EdgeCalls emitted for this site.
 	returnUsage string
+	// argCount / typeArgCount are the call's applicability evidence:
+	// how many arguments it passes and how many type arguments it
+	// spells explicitly. Their *Known flags keep "no evidence"
+	// distinguishable from a genuine zero — narrowing an overload set
+	// on a count we never measured would be a guess, not a rule.
+	argCount     int
+	argKnown     bool
+	typeArgCount int
+	typeArgKnown bool
+}
+
+// withCSharpCallArity records the applicability counts an invocation
+// node carries, so every capture site stamps the same evidence.
+func withCSharpCallArity(c csharpDeferredCall, inv *sitter.Node) csharpDeferredCall {
+	c.argCount, c.argKnown = csharpCallArgCount(inv)
+	c.typeArgCount, c.typeArgKnown = csharpCallTypeArgCount(inv)
+	return c
 }
 
 // csharpDeferredLocal buffers a local variable declaration for the
@@ -308,36 +359,39 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 
 		case m.Captures["callm.expr"] != nil:
 			expr := m.Captures["callm.expr"]
-			calls = append(calls, csharpDeferredCall{
+			calls = append(calls, withCSharpCallArity(csharpDeferredCall{
 				name:        m.Captures["callm.method"].Text,
 				receiver:    m.Captures["callm.receiver"].Text,
 				line:        expr.StartLine + 1,
 				isMember:    true,
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
-			})
+			}, expr.Node))
 
 		case m.Captures["callself.expr"] != nil:
 			expr := m.Captures["callself.expr"]
-			calls = append(calls, csharpDeferredCall{
+			calls = append(calls, withCSharpCallArity(csharpDeferredCall{
 				name:        m.Captures["callself.method"].Text,
 				receiver:    "this",
 				recvType:    csharpQualifiedReceiverType(expr.Node, src, "this"),
 				line:        expr.StartLine + 1,
 				isMember:    true,
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
-			})
+			}, expr.Node))
 
 		case m.Captures["callbase.expr"] != nil:
 			expr := m.Captures["callbase.expr"]
-			calls = append(calls, csharpDeferredCall{
+			calls = append(calls, withCSharpCallArity(csharpDeferredCall{
 				name:        m.Captures["callbase.method"].Text,
 				receiver:    "base",
 				recvType:    csharpQualifiedReceiverType(expr.Node, src, "base"),
 				line:        expr.StartLine + 1,
 				isMember:    true,
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
-			})
+			}, expr.Node))
 
+		// A receiverless call carries no applicability stamps: nothing
+		// resolves it through the extension binder, and the scope rules
+		// that do bind it never consult arity.
 		case m.Captures["call.expr"] != nil:
 			expr := m.Captures["call.expr"]
 			calls = append(calls, csharpDeferredCall{
@@ -616,6 +670,16 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				}
 			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
 				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenvByOwner[callerID], result))
+			} else if c.receiver != "" {
+				// A bare receiver nothing above could type. Its spelling
+				// is still evidence: reaching here means no local, param
+				// or builtin in scope carries that name, so a receiver
+				// that names a static class is the STATIC form of an
+				// extension call (`BagExt.Add(bag)`) — where the `this`
+				// slot is filled by the first argument, not the
+				// receiver. The extension binder needs that distinction
+				// before it can compare argument counts.
+				edge.Meta = map[string]any{"receiver_name": c.receiver}
 			}
 			// Eviction restubs a member call to a bare unresolved name; the
 			// marker is what lets the resolver still route the rebind through
@@ -624,6 +688,16 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				edge.Meta = map[string]any{}
 			}
 			edge.Meta["member_call"] = true
+			// Applicability evidence for the overload set behind this
+			// name. Member calls carry it because they are the shape
+			// the extension binder resolves; a plain `Foo()` is already
+			// bound by scope rules that never consult arity.
+			if c.argKnown {
+				edge.Meta["arg_count"] = c.argCount
+			}
+			if c.typeArgKnown {
+				edge.Meta["type_arg_count"] = c.typeArgCount
+			}
 			stampReturnUsage(edge, c.returnUsage)
 			result.Edges = append(result.Edges, edge)
 			continue
@@ -1197,6 +1271,20 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 			}
 			sort.Strings(names)
 			meta["method_type_params"] = strings.Join(names, ",")
+		}
+	}
+	// Parameter arity — the evidence that splits a same-name overload set
+	// the receiver type alone cannot. Stamped on the node rather than read
+	// back off the KindParam nodes because those carry no default-value
+	// marker (and a discard parameter emits none at all), so they cannot
+	// answer "how many arguments MUST a caller supply".
+	if count, required, variadic, ok := csharpParamArity(def.Node, src); ok {
+		meta["param_count"] = count
+		if required != count {
+			meta["param_required"] = required
+		}
+		if variadic {
+			meta["param_variadic"] = true
 		}
 	}
 	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {

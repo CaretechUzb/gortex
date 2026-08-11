@@ -32,7 +32,7 @@ var extractorVersions = map[string]int{
 	//   "go": 2,
 	"c":      generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
 	"php":    2,                                      // class/interface inheritance now emits typed structural edges
-	"csharp": 8,                                      // interface base lists emit extends edges (was: record positional property nodes)
+	"csharp": 9,                                      // generic invocations emit call edges (was: interface base lists emit extends edges)
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
@@ -41,41 +41,47 @@ var extractorVersions = map[string]int{
 // staleness, the pre-existing behaviour). Extensions are grouped to the
 // extractor that owns them.
 var extractorSaltExtLang = map[string]string{
-	".go":    "go",
-	".py":    "python",
-	".pyi":   "python",
-	".js":    "javascript",
-	".jsx":   "javascript",
-	".mjs":   "javascript",
-	".cjs":   "javascript",
-	".ts":    "typescript",
-	".tsx":   "typescript",
-	".mts":   "typescript",
-	".cts":   "typescript",
-	".java":  "java",
-	".rb":    "ruby",
-	".rs":    "rust",
-	".c":     "c",
-	".h":     "c",
-	".cc":    "cpp",
-	".cpp":   "cpp",
-	".cxx":   "cpp",
-	".hpp":   "cpp",
-	".hh":    "cpp",
-	".cs":    "csharp",
-	".php":   "php",
-	".swift": "swift",
-	".kt":    "kotlin",
-	".kts":   "kotlin",
-	".scala": "scala",
-	".m":     "objc",
-	".mm":    "objcpp",
-	".lua":   "lua",
-	".dart":  "dart",
-	".ex":    "elixir",
-	".exs":   "elixir",
-	".sh":    "bash",
-	".bash":  "bash",
+	".go":   "go",
+	".py":   "python",
+	".pyi":  "python",
+	".js":   "javascript",
+	".jsx":  "javascript",
+	".mjs":  "javascript",
+	".cjs":  "javascript",
+	".ts":   "typescript",
+	".tsx":  "typescript",
+	".mts":  "typescript",
+	".cts":  "typescript",
+	".java": "java",
+	".rb":   "ruby",
+	".rs":   "rust",
+	".c":    "c",
+	".h":    "c",
+	".cc":   "cpp",
+	".cpp":  "cpp",
+	".cxx":  "cpp",
+	".hpp":  "cpp",
+	".hh":   "cpp",
+	".cs":   "csharp",
+	// Razor templates are extracted by the C# extractor over their
+	// embedded code blocks, so a C# extraction fix has to re-flag them
+	// too — otherwise the same stale extraction survives on exactly the
+	// files whose C# is hardest to re-trigger by hand.
+	".razor":  "csharp",
+	".cshtml": "csharp",
+	".php":    "php",
+	".swift":  "swift",
+	".kt":     "kotlin",
+	".kts":    "kotlin",
+	".scala":  "scala",
+	".m":      "objc",
+	".mm":     "objcpp",
+	".lua":    "lua",
+	".dart":   "dart",
+	".ex":     "elixir",
+	".exs":    "elixir",
+	".sh":     "bash",
+	".bash":   "bash",
 }
 
 // ExtractorLangForFile returns the extractor-staleness language key for a
