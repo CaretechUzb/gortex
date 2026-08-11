@@ -50,6 +50,10 @@ ORDER BY file_path, line LIMIT 120000`)
 		site.Kind = graph.EdgeKind(kind)
 		fileOrdered = append(fileOrdered, site)
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		b.Fatalf("harvest probe sites: %v", err)
+	}
 	if err := rows.Close(); err != nil {
 		b.Fatalf("close harvest: %v", err)
 	}

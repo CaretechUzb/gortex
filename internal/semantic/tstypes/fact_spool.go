@@ -367,6 +367,16 @@ WHERE class = ? AND file_path > ? ORDER BY file_path LIMIT ?`, int(class), after
 		stats.Files++
 		stats.Bytes += len(payload)
 	}
+	// Rows.Close reports the driver's close error, not the iteration error
+	// (rs.lasterr), so a failure part-way through the scan is invisible
+	// without Err. The empty page that produced would read as "class
+	// exhausted" to the driver loop in provider_stream.go, silently dropping
+	// the rest of this phase's facts. The break above is not an error, so
+	// Err stays nil on the byte-budget path.
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, last, stats, err
+	}
 	if err := rows.Close(); err != nil {
 		return nil, last, stats, err
 	}
@@ -491,6 +501,10 @@ WHERE type_id IN (`+values+`) ORDER BY type_id,seq`, args...)
 				return nil, err
 			}
 			out = append(out, record)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
 		}
 		if err := rows.Close(); err != nil {
 			return nil, err

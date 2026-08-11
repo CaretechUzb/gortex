@@ -202,6 +202,11 @@ func (s *Store) OrphanRepoPrefixes(known []string) []string {
 			seen[p] = struct{}{}
 			out = append(out, p)
 		}
+		// The result drives PurgeRepo, so a truncated scan can only
+		// under-report orphans — it can never promote a tracked repo into
+		// the purge list. Losing a candidate defers the purge to the next
+		// warmup, which is the safe direction for a destructive caller.
+		_ = rows.Err()
 		_ = rows.Close()
 	}
 	return out

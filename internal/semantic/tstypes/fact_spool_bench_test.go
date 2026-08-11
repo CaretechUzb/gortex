@@ -78,6 +78,10 @@ func legacyFourPhaseWalk(b *testing.B, spool *factSpool) int {
 						b.Fatal(err)
 					}
 				}
+				if err := rows.Err(); err != nil {
+					_ = rows.Close()
+					b.Fatal(err)
+				}
 				_ = rows.Close()
 				total += len(stub.calls) + len(stub.supers) + len(stub.metas) + len(stub.aliases)
 			}

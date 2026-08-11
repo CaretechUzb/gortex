@@ -276,6 +276,10 @@ func (s *Store) ListAnalysisCommunitySummaries(generationID int64, limit int, cu
 		}
 		items = append(items, item)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, "", err
+	}
 	if err := rows.Close(); err != nil {
 		return nil, "", err
 	}
@@ -387,6 +391,10 @@ func (s *Store) ListAnalysisProcessSummaries(generationID int64, limit int, curs
 		}
 		item.Truncated = truncated != 0
 		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, "", err
 	}
 	if err := rows.Close(); err != nil {
 		return nil, "", err
@@ -552,6 +560,10 @@ func (s *Store) analysisConceptsLocked(generationID int64, tokens []string, dire
 		}
 		result.Concepts[positions[token]].InVocabulary = vocabulary != 0
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return graph.AnalysisConceptQueryResult{}, err
+	}
 	if err := rows.Close(); err != nil {
 		return graph.AnalysisConceptQueryResult{}, err
 	}
@@ -601,6 +613,10 @@ func (s *Store) ListAnalysisConcepts(generationID int64, limit int, cursorToken 
 			return graph.AnalysisConceptQueryResult{}, "", err
 		}
 		tokens = append(tokens, token)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return graph.AnalysisConceptQueryResult{}, "", err
 	}
 	if err := rows.Close(); err != nil {
 		return graph.AnalysisConceptQueryResult{}, "", err

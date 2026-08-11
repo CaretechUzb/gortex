@@ -7,6 +7,16 @@ linters:
   # errcheck, govet, ineffassign, staticcheck, unused.
   default: standard
 
+  enable:
+    # sql.Rows.Close reports the driver's close error, not the iteration
+    # error (rs.lasterr), so a scan that fails part-way through looks like a
+    # scan that ended. The result is an empty or short result set returned
+    # with a nil error — a wrong answer, not a failure. errcheck cannot see
+    # this because Close IS checked at these sites; only the Err call is
+    # missing. Every such site found when this was enabled was a silent
+    # truncation, so the class is worth a linter rather than review vigilance.
+    - rowserrcheck
+
   settings:
     errcheck:
       # Unchecked errors on the fmt print family are noise, not bugs: these

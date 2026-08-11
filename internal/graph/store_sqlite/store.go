@@ -2079,6 +2079,14 @@ func (s *Store) Stats() graph.GraphStats {
 		}
 		st.ByKind[kind] = n
 	}
+	// Same treatment as a Scan failure above: Close reports the driver's
+	// close error, so without Err a scan that died mid-flight returns a
+	// short histogram indistinguishable from a real one.
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		panicOnFatal(err)
+		return st
+	}
 	_ = rows.Close()
 
 	rows, err = s.stmtStatsByLanguage.Query()
@@ -2095,6 +2103,11 @@ func (s *Store) Stats() graph.GraphStats {
 			return st
 		}
 		st.ByLanguage[lang] = n
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		panicOnFatal(err)
+		return st
 	}
 	_ = rows.Close()
 	return st
@@ -2124,6 +2137,11 @@ func (s *Store) RepoStats() map[string]graph.GraphStats {
 		st.ByLanguage[lang] += n
 		out[repo] = st
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		panicOnFatal(err)
+		return out
+	}
 	_ = rows.Close()
 
 	rows, err = s.stmtRepoStatsEdges.Query()
@@ -2146,6 +2164,11 @@ func (s *Store) RepoStats() map[string]graph.GraphStats {
 		st.TotalEdges = n
 		out[repo] = st
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		panicOnFatal(err)
+		return out
+	}
 	_ = rows.Close()
 	return out
 }
@@ -2166,6 +2189,9 @@ func (s *Store) RepoPrefixes() []string {
 		}
 		out = append(out, p)
 	}
+	// A short prefix list feeds repo scoping and orphan purging, so a
+	// truncated scan must not pass for the whole set.
+	panicOnFatal(rows.Err())
 	return out
 }
 

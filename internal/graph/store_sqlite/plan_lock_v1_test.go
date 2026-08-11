@@ -281,6 +281,9 @@ func explainPlanTolerant(t *testing.T, s *Store, query string) []string {
 		}
 		plan = append(plan, detail)
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate plan rows: %v", err)
+	}
 	return plan
 }
 
@@ -310,6 +313,9 @@ func TestSweepPlanLockReceiverRebindBatch(t *testing.T) {
 			t.Fatalf("scan: %v", err)
 		}
 		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate plan rows: %v", err)
 	}
 	joined := strings.Join(plan, "\n")
 	if !strings.Contains(joined, "SCAN f") && !strings.Contains(joined, "go_receiver_rebind_files") {
