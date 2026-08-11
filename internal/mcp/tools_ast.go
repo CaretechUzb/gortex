@@ -10,6 +10,7 @@ import (
 
 	"github.com/zzet/gortex/internal/astquery"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // registerASTTools wires the `search_ast` MCP tool: a structural,
@@ -175,7 +176,7 @@ func (s *Server) buildASTTargets(language, pathPrefix string, allowedRepos map[s
 		if language != "" && !strings.EqualFold(n.Language, language) {
 			continue
 		}
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
 		abs, err := s.resolveNodePath(n)

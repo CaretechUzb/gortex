@@ -3,11 +3,11 @@ package mcp
 import (
 	"context"
 	"sort"
-	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // handleGetUntestedSymbols returns functions and methods in non-test files
@@ -56,7 +56,7 @@ func (s *Server) handleGetUntestedSymbols(ctx context.Context, req mcp.CallToolR
 		if isTestFile(n.FilePath) {
 			continue
 		}
-		if filePrefix != "" && !strings.HasPrefix(n.FilePath, filePrefix) {
+		if !graphpath.HasPrefix(n.FilePath, filePrefix) {
 			continue
 		}
 		totalCandidates++

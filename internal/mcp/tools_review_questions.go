@@ -10,6 +10,7 @@ import (
 
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // errReviewQuestionsNoRoot is returned when a `base` diff is requested
@@ -116,7 +117,7 @@ func (s *Server) handleSuggestedReviewQuestions(ctx context.Context, req mcp.Cal
 	// Build the scoped node index once — every miner reads from it.
 	scopedSet := make(map[string]*graph.Node, 1024)
 	for _, n := range s.scopedNodesLight(ctx) {
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
 		scopedSet[n.ID] = n

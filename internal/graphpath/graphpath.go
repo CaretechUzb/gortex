@@ -17,6 +17,21 @@ func Norm(p string) string {
 	return filepath.ToSlash(p)
 }
 
+// HasPrefix reports whether a stored path lies under prefix, comparing both
+// in normalized form so a caller-supplied '/'-joined prefix still matches the
+// native spelling the store holds. An empty prefix matches everything, which
+// is what the `pathPrefix != "" && ...` guard at every call site meant.
+//
+// The comparison stays a raw string prefix, not a segment-aware one, because
+// that is the behaviour these filters already had: `internal/mcp` matches
+// `internal/mcpx` here exactly as it did before normalization.
+func HasPrefix(path, prefix string) bool {
+	if prefix == "" {
+		return true
+	}
+	return strings.HasPrefix(Norm(path), Norm(prefix))
+}
+
 // Dir returns the '/'-joined directory of the normalized path, "" when the
 // path has no directory component.
 func Dir(p string) string {

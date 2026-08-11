@@ -6,6 +6,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // GuardViolation describes a single guard rule violation.
@@ -87,10 +88,10 @@ func evaluateCoChange(rule config.GuardRule, changedNodes []*graph.Node) []Guard
 		if matchesAnyGlob(n.FilePath, rule.Except) {
 			continue
 		}
-		if strings.HasPrefix(n.FilePath, rule.Source) {
+		if graphpath.HasPrefix(n.FilePath, rule.Source) {
 			hasSource = true
 		}
-		if strings.HasPrefix(n.FilePath, rule.Target) {
+		if graphpath.HasPrefix(n.FilePath, rule.Target) {
 			hasTarget = true
 		}
 		if hasSource && hasTarget {
@@ -121,7 +122,7 @@ func evaluateBoundary(g graph.Store, rule config.GuardRule, changedNodes []*grap
 	seen := make(map[string]bool)
 
 	for _, n := range changedNodes {
-		if !strings.HasPrefix(n.FilePath, rule.Source) {
+		if !graphpath.HasPrefix(n.FilePath, rule.Source) {
 			continue
 		}
 		if matchesAnyGlob(n.FilePath, rule.Except) {
@@ -139,7 +140,7 @@ func evaluateBoundary(g graph.Store, rule config.GuardRule, changedNodes []*grap
 				continue
 			}
 
-			if !strings.HasPrefix(target.FilePath, rule.Target) {
+			if !graphpath.HasPrefix(target.FilePath, rule.Target) {
 				continue
 			}
 

@@ -33,6 +33,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // ---------------------------------------------------------------------------
@@ -80,7 +81,7 @@ func (s *Server) handleAnalyzeRaceWrites(ctx context.Context, req mcp.CallToolRe
 		if target == nil || target.Kind != graph.KindField {
 			continue
 		}
-		if pathPrefix != "" && !strings.HasPrefix(e.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(e.FilePath, pathPrefix) {
 			continue
 		}
 		// Lock-guard check is cached per writer because it walks the
@@ -252,7 +253,7 @@ func isLockMethodName(name string) bool {
 		"acquire", "tryacquire",
 		"withlock", "withreadlock", "withwritelock",
 		"runwithlock",
-		"do",       // sync.Once
+		"do",           // sync.Once
 		"synchronized": // Java-flavoured wrapper helpers
 		return true
 	}
@@ -343,7 +344,7 @@ func (s *Server) handleAnalyzeUnclosedChannels(ctx context.Context, req mcp.Call
 	var rows []unclosedRow
 
 	for _, info := range byChannel {
-		if pathPrefix != "" && !strings.HasPrefix(info.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(info.FilePath, pathPrefix) {
 			continue
 		}
 		if info.Sends == 0 {

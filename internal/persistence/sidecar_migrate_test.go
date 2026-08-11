@@ -52,6 +52,11 @@ func hasColumn(t *testing.T, db *sql.DB, table, col string) bool {
 			return true
 		}
 	}
+	// A truncated table_info scan reads as "column absent", which would let
+	// a migration assertion pass without the migration having run.
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate table_info(%s): %v", table, err)
+	}
 	return false
 }
 

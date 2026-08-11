@@ -681,6 +681,13 @@ func validateAnalysisGenerationTx(tx *sql.Tx, generationID int64) (graph.Analysi
 		}
 		sealed[component] = count
 	}
+	// A truncated read here would drop components from `sealed`, and the
+	// loop below reads a missing component as a seal defect rather than as
+	// the read failure it is.
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return graph.AnalysisGenerationHeader{}, err
+	}
 	if err := rows.Close(); err != nil {
 		return graph.AnalysisGenerationHeader{}, err
 	}

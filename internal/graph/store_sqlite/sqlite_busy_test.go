@@ -237,6 +237,7 @@ func TestLongWALReaderDoesNotBlockReindexWriter(t *testing.T) {
 		rows, err := readTx.QueryContext(ctx, `SELECT from_id FROM edges`)
 		require.NoError(t, err)
 		require.True(t, rows.Next())
+		require.NoError(t, rows.Err())
 		held = append(held, heldReader{conn: conn, tx: readTx, rows: rows})
 	}
 
@@ -663,6 +664,7 @@ func TestEvictRepoLargeScopeUsesIndexedSetCandidates(t *testing.T) {
 		plan.WriteString(detail)
 		plan.WriteByte('\n')
 	}
+	require.NoError(t, planRows.Err())
 	require.NoError(t, planRows.Close())
 	require.Contains(t, plan.String(), "nodes_by_repo")
 

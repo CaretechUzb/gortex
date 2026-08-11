@@ -7,6 +7,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // registerSurprisingConnectionsTool wires get_surprising_connections —
@@ -169,8 +170,8 @@ func (s *Server) collectSurprisingEdges(
 			continue
 		}
 		if pathPrefix != "" &&
-			!strings.HasPrefix(from.FilePath, pathPrefix) &&
-			!strings.HasPrefix(to.FilePath, pathPrefix) {
+			!graphpath.HasPrefix(from.FilePath, pathPrefix) &&
+			!graphpath.HasPrefix(to.FilePath, pathPrefix) {
 			continue
 		}
 

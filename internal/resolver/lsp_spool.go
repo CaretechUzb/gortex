@@ -158,6 +158,12 @@ func (s *deferredLSPSpool) hasForScope(scope map[string]struct{}) bool {
 			return true
 		}
 	}
+	// A truncated scan reports "nothing in scope", matching the Query error
+	// above. Failing open instead would keep re-arming the retry pass against
+	// a spool that cannot be read; the caller also consults the in-memory
+	// lspDeferredRetry list, so a read failure delays work rather than
+	// dropping it.
+	_ = rows.Err()
 	return false
 }
 
@@ -213,6 +219,12 @@ ORDER BY file_path,line,from_id,kind,target LIMIT ?`, args...)
 			record.payload.line = record.key.line
 			record.payload.crossRepo = crossRepo != 0
 			records = append(records, record)
+		}
+		// A short page would end the iteration early and look like a drained
+		// spool, silently abandoning the remaining deferred work.
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, false, err
 		}
 		if err := rows.Close(); err != nil {
 			return nil, false, err

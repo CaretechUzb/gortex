@@ -9,6 +9,7 @@ import (
 	mcp "github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // ---------------------------------------------------------------------------
@@ -92,7 +93,7 @@ func (s *Server) handleAnalyzeTestsAsEdges(ctx context.Context, req mcp.CallTool
 		if n == nil {
 			continue
 		}
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
 		related := make([]testEdgeRef, 0, len(relatedIDs))

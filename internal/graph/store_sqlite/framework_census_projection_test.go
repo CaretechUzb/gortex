@@ -210,6 +210,9 @@ ORDER BY id`, string(graph.EdgeCalls))
 		}
 		details = append(details, detail)
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	plan := strings.Join(details, "\n")
 	if !strings.Contains(plan, "edges_by_kind") {
 		t.Fatalf("plan does not use edges_by_kind:\n%s", plan)

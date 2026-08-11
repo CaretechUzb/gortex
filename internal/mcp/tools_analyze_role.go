@@ -7,6 +7,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // handleAnalyzeRole classifies every function/method node in scope
@@ -57,7 +58,7 @@ func (s *Server) handleAnalyzeRole(ctx context.Context, req mcp.CallToolRequest)
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
 			continue
 		}
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
 		fanIn := countCallEdges(s.graph.GetInEdges(n.ID))
@@ -90,12 +91,12 @@ func (s *Server) handleAnalyzeRole(ctx context.Context, req mcp.CallToolRequest)
 	}
 
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"symbols":      rows,
-		"total":        len(rows),
-		"truncated":    truncated,
+		"symbols":       rows,
+		"total":         len(rows),
+		"truncated":     truncated,
 		"tally_by_role": tally,
-		"path_prefix":  pathPrefix,
-		"role_filter":  roleFilter,
+		"path_prefix":   pathPrefix,
+		"role_filter":   roleFilter,
 	})
 }
 

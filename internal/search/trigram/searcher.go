@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/pathguard"
 )
 
@@ -284,7 +285,7 @@ func (s *Searcher) GrepRegexp(re *regexp.Regexp, requiredLiterals []string, path
 			continue
 		}
 		rel := paths[docID]
-		if pathPrefix != "" && !strings.HasPrefix(rel, pathPrefix) {
+		if !graphpath.HasPrefix(rel, pathPrefix) {
 			continue
 		}
 		f, err := s.openConfined(rel)

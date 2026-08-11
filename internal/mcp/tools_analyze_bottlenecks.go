@@ -7,6 +7,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // bottleneckRow is one function/method ranked by computation-bottleneck
@@ -115,7 +116,7 @@ func (s *Server) handleAnalyzeBottlenecks(ctx context.Context, req mcp.CallToolR
 		if _, ok := allowed[n.Kind]; !ok {
 			continue
 		}
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
 		metrics[n.ID] = &fnMetrics{

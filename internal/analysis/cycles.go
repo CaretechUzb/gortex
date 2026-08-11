@@ -2,9 +2,9 @@ package analysis
 
 import (
 	"sort"
-	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // edgePair identifies a directed edge between two nodes.
@@ -29,7 +29,7 @@ func DetectCycles(g graph.Store, communities *CommunityResult, scope string) []C
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
-		if scope != "" && !strings.HasPrefix(n.FilePath, scope) {
+		if !graphpath.HasPrefix(n.FilePath, scope) {
 			continue
 		}
 		inScope[n.ID] = true

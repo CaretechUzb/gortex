@@ -7,6 +7,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // registerKnowledgeGapsTool wires get_knowledge_gaps — a cold-start
@@ -146,7 +147,7 @@ func (s *Server) scopedFunctionDegrees(ctx context.Context, pathPrefix string) (
 func (s *Server) collectDisconnected(scoped []*graph.Node, pathPrefix string, limit int, degreeByID map[string]graph.NodeDegreeRow) []gapDisconnected {
 	candidates := make([]*graph.Node, 0, len(scoped))
 	for _, n := range scoped {
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
 		candidates = append(candidates, n)
@@ -286,7 +287,7 @@ func (s *Server) collectUntestedHotspots(scoped []*graph.Node, pathPrefix string
 	}
 	pool := make([]*graph.Node, 0, len(scoped))
 	for _, n := range scoped {
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
 		pool = append(pool, n)

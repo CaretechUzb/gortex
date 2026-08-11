@@ -186,6 +186,9 @@ func (s *Store) GetEmbeddings(ids []string) map[string][]float32 {
 				out[id] = vec
 			}
 		}
+		// Best-effort by construction (see the Query error above): a short
+		// batch costs recall in the refinement stage, never correctness.
+		_ = rows.Err()
 		_ = rows.Close()
 	}
 

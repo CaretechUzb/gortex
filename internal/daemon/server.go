@@ -683,7 +683,22 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		return ControlResponse{OK: true, Result: buf}
 
 	case ControlStatus:
-		st, err := s.Controller.Status(ctx)
+		var sp StatusParams
+		if len(req.Params) > 0 {
+			// A caller that sends no params, or an older client that sends
+			// something else entirely, gets the routine counter-backed poll.
+			_ = json.Unmarshal(req.Params, &sp)
+		}
+		statusFn := s.Controller.Status
+		if sp.Exact {
+			// Optional: a controller whose backend cannot recount simply does
+			// not implement this, and --exact degrades to the ordinary answer
+			// rather than failing.
+			if exact, ok := s.Controller.(StatusExactController); ok {
+				statusFn = exact.StatusExact
+			}
+		}
+		st, err := statusFn(ctx)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -940,4 +955,15 @@ func unmarshalParams(raw json.RawMessage, v any) error {
 
 func controlErr(code, msg string) ControlResponse {
 	return ControlResponse{ErrorCode: code, ErrorMsg: msg}
+}
+
+// StatusExactController is the opt-in audit half of ControlStatus. A
+// controller implements it when its backend can recount the corpus; the
+// routine Status path reads maintained counters and never scans, so this is
+// the only way a user can ask "are those counters telling the truth".
+//
+// Implementations are expected to heal what they find: the point of paying
+// for a full scan is that the next cheap poll is correct again.
+type StatusExactController interface {
+	StatusExact(ctx context.Context) (StatusResponse, error)
 }

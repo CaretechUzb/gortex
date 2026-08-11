@@ -49,7 +49,7 @@ type realController struct {
 	// Mutating operations still take mu; they serialise indexer work, not
 	// this pointer. If this field ever becomes reassignable, it needs an
 	// atomic — not mu — for the same reason multiWatcher already uses one.
-	graph graph.Store
+	graph         graph.Store
 	indexer       *indexer.Indexer
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
@@ -764,6 +764,49 @@ func (c *realController) Probe(ctx context.Context) (daemon.ProbeResponse, error
 	return resp, nil
 }
 
+// StatusExact recounts the per-repo estimates from the stored nodes and
+// edges, writes the result back over any counter that had drifted, and then
+// reports status the ordinary way — so the numbers it returns are measured,
+// and the next cheap poll is measured too.
+//
+// This is the escape hatch for the routine path's one assumption: that the
+// counters the indexer persists still describe the corpus. Answering that
+// question costs a full scan (tens of seconds on a large store), which is
+// exactly why it is a flag and not the default.
+func (c *realController) StatusExact(ctx context.Context) (daemon.StatusResponse, error) {
+	g := c.graph // write-once at construction; see the field comment
+	scanner, ok := graph.Store(g).(graph.RepoMemoryEstimateScanner)
+	if !ok || !c.enriched.Load() {
+		// Nothing to reconcile against — an in-memory backend maintains its
+		// counters on every mutation, and a graph that has not finished
+		// enriching has no counters worth auditing yet. Say so: a user who
+		// asked for measured numbers should not have to guess whether the
+		// ones they got were measured.
+		if c.logger != nil {
+			c.logger.Info("daemon: exact status served from maintained counters",
+				zap.Bool("backend_can_recount", ok),
+				zap.Bool("enriched", c.enriched.Load()))
+		}
+		return c.Status(ctx)
+	}
+
+	scanned, err := scanner.ScanRepoMemoryEstimates(ctx)
+	if err != nil {
+		// A scan that ran out of the caller's budget has no numbers to
+		// report. Say so rather than quietly serving the counters the user
+		// explicitly asked to bypass.
+		return daemon.StatusResponse{}, fmt.Errorf("exact repo counts: %w", err)
+	}
+	if reconciler, ok := graph.Store(g).(interface {
+		ReconcileRepoCounters(map[string]graph.RepoMemoryEstimate) error
+	}); ok {
+		if err := reconciler.ReconcileRepoCounters(scanned); err != nil {
+			return daemon.StatusResponse{}, fmt.Errorf("reconcile repo counters: %w", err)
+		}
+	}
+	return c.Status(ctx)
+}
+
 func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, error) {
 	// Bail before doing any work if the caller is already gone. Status sits
 	// on the critical path of `daemon stop`, `gortex call`, and the agent
@@ -791,8 +834,18 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		// backend, a walk of every shard in memory. They were computed
 		// under c.mu until the same stall showed up on the whole-store
 		// path, so they are hoisted out alongside the estimate.
-		wholeStoreNodes = g.NodeCount()
-		wholeStoreEdges = g.EdgeCount()
+		//
+		// They are also only read on the sole-repo path below, where the
+		// single row reports whole-store totals so status agrees with
+		// `query stats`. A multi-repo daemon was paying for both scans —
+		// measured 2.25s and 2.03s on a 9.4 GB store, unbounded and growing
+		// with the corpus — to fill in one field of a conditional log line.
+		// One counter row per indexed repo is enough to tell the two cases
+		// apart, and it is already in hand.
+		if len(memEstimates) <= 1 {
+			wholeStoreNodes = g.NodeCount()
+			wholeStoreEdges = g.EdgeCount()
+		}
 	}
 
 	// runtime.ReadMemStats stops the world. Under reindex allocation churn
@@ -849,20 +902,33 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		// wholeStoreNodes / wholeStoreEdges were computed above, before the
 		// controller mutex was taken — see the note at the top of Status.
 
-		// Diagnostic: when AllMetadata has tracked repos but
-		// AllRepoMemoryEstimates returns nothing (or a much smaller set),
-		// some path has cleared the per-repo counters without clearing the
-		// underlying nodes. The meta fallback below keeps the table usable
-		// in the meantime. There is no longer an expected shortfall to
-		// exempt: a bucket short of the tracked count is always a defect.
+		// Diagnostic: a repo the indexer has produced nodes for, with no
+		// counter bucket, means some path cleared the per-repo counters
+		// without clearing the underlying nodes. The meta fallback below
+		// keeps the table usable in the meantime.
+		//
+		// Comparing bucket count against tracked count — the earlier
+		// shape — reads a repo that has simply not finished its first
+		// index as a defect, because a repo earns its counter row by
+		// completing one. Requiring meta.NodeCount > 0 asks the question
+		// that was actually meant: this repo has content, so where did its
+		// counter go?
 		if enriched && c.logger != nil {
-			tracked := len(allMeta)
-			counted := len(memEstimates)
-			if tracked > 0 && counted < tracked {
-				c.logger.Warn("daemon: per-repo counters below tracked-repo count — graph mutation cleared per-repo index?",
-					zap.Int("tracked_repos", tracked),
-					zap.Int("counter_buckets", counted),
-					zap.Int("graph_total_nodes", wholeStoreNodes))
+			var missing []string
+			for prefix, meta := range allMeta {
+				if meta == nil || meta.NodeCount == 0 {
+					continue
+				}
+				if _, ok := memEstimates[prefix]; !ok {
+					missing = append(missing, prefix)
+				}
+			}
+			if len(missing) > 0 {
+				sort.Strings(missing)
+				c.logger.Warn("daemon: indexed repos missing per-repo counters — graph mutation cleared per-repo index?",
+					zap.Strings("repos", missing),
+					zap.Int("tracked_repos", len(allMeta)),
+					zap.Int("counter_buckets", len(memEstimates)))
 			}
 		}
 
@@ -878,7 +944,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		// every counter is empty, fall back to per-repo meta so the share
 		// denominator stays nonzero and the search budget gets attributed
 		// instead of falling on the floor.
-		if soleRepo && enriched {
+		if soleRepo && enriched && wholeStoreNodes > 0 {
 			totalNodes = wholeStoreNodes
 		} else {
 			for _, est := range memEstimates {
@@ -898,7 +964,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 			edges := meta.EdgeCount
 			var mem daemon.MemoryBreakdown
 			switch {
-			case soleRepo && enriched:
+			case soleRepo && enriched && wholeStoreNodes > 0:
 				// A single tracked repo owns the entire store — including
 				// the handful of synthetic global externals that belong to
 				// no repo — so reporting whole-store totals keeps `daemon

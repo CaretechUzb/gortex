@@ -67,6 +67,10 @@ func (s *Store) PruneAnalysisGenerations(ctx context.Context, keep, batch int) e
 		}
 		candidates = append(candidates, generationID)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
 	if err := rows.Close(); err != nil {
 		return err
 	}

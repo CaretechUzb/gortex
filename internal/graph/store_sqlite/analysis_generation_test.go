@@ -624,6 +624,10 @@ func TestAnalysisGenerationQueryPlansUseBoundedIndexes(t *testing.T) {
 			}
 			details = append(details, detail)
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
 		rows.Close()
 		plan := strings.Join(details, " | ")
 		if !strings.Contains(plan, index) {

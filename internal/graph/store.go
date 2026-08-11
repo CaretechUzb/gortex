@@ -325,6 +325,13 @@ type Store interface {
 	// --- Memory estimation (advisory; in-memory-specific) ----------
 
 	RepoMemoryEstimate(repoPrefix string) RepoMemoryEstimate
+
+	// AllRepoMemoryEstimates reports one entry per repo the backend has
+	// counters for. Backends serve it from maintained counters, not by
+	// walking the corpus — the in-memory graph from its shard counters, the
+	// SQLite store from the row the indexer persists per repo. Callers must
+	// not read a missing or short result as evidence that a repo is empty:
+	// a repo that has never finished an index simply has no counter yet.
 	AllRepoMemoryEstimates() map[string]RepoMemoryEstimate
 
 	// --- Coordination ----------------------------------------------
@@ -2608,4 +2615,19 @@ type FileSubGraphCountReader interface {
 // NodeDegreeCounts IN-list when the backend doesn't implement it.
 type NodeDegreeByKinds interface {
 	NodeDegreeByKinds(kinds []NodeKind, pathPrefix string) []NodeDegreeRow
+}
+
+// RepoMemoryEstimateScanner recomputes the per-repo estimates from the stored
+// nodes and edges instead of reading maintained counters. It is the audit path
+// for backends whose counters are written once per index pass and could drift;
+// backends that maintain counters on every mutation have nothing to reconcile
+// against and do not implement it.
+//
+// The scan is proportional to the whole corpus — tens of seconds on a large
+// store — so it belongs behind an explicit user request, never on a polling
+// path. A scan that cannot finish inside the caller's context returns the
+// context error rather than a short map: a partial count is a wrong answer,
+// not a stale one.
+type RepoMemoryEstimateScanner interface {
+	ScanRepoMemoryEstimates(ctx context.Context) (map[string]RepoMemoryEstimate, error)
 }

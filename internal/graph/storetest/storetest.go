@@ -1045,9 +1045,35 @@ func testAllRepoMemoryEstimates(t *testing.T, factory Factory) {
 	s := factory(t)
 	s.AddNode(mkRepoNode("r1/a.go::Foo", "Foo", "r1/a.go", "r1", graph.KindFunction))
 	s.AddNode(mkRepoNode("r2/x.go::Baz", "Baz", "r2/x.go", "r2", graph.KindFunction))
+
+	// Both backends serve this from maintained counters rather than a corpus
+	// walk, but they maintain them at different moments: the in-memory graph
+	// updates shard counters inside AddNode, while a durable backend records
+	// one row per repo when the index pass that produced those nodes
+	// finishes. Stamping the row here is what the indexer does at the end of
+	// a pass, so the case exercises each backend's real mechanism instead of
+	// asserting the in-memory one against both.
+	if w, ok := s.(graph.RepoIndexStateWriter); ok {
+		for _, repo := range []string{"r1", "r2"} {
+			if err := w.SetRepoIndexState(graph.RepoIndexState{
+				RepoPrefix: repo, NodeCount: 1,
+			}); err != nil {
+				t.Fatalf("SetRepoIndexState(%s): %v", repo, err)
+			}
+		}
+	}
+
 	all := s.AllRepoMemoryEstimates()
 	if len(all) != 2 {
 		t.Fatalf("AllRepoMemoryEstimates len = %d, want 2", len(all))
+	}
+	for _, repo := range []string{"r1", "r2"} {
+		if all[repo].NodeCount != 1 {
+			t.Fatalf("estimate for %s = %d nodes, want 1", repo, all[repo].NodeCount)
+		}
+		if all[repo].NodeBytes == 0 {
+			t.Fatalf("estimate for %s has no byte estimate", repo)
+		}
 	}
 }
 

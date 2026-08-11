@@ -136,6 +136,12 @@ WHERE e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL`
 			IfaceMeta: meta,
 		})
 	}
+	// Individual undecodable rows are skipped above by design; a failed
+	// iteration is different in kind — it truncates the projection — so it
+	// fails the whole call the way a failed Query does.
+	if rows.Err() != nil {
+		return nil
+	}
 	return out
 }
 
@@ -182,6 +188,9 @@ ORDER BY e.id`
 			RepoPrefix: repoPrefix,
 		})
 	}
+	if rows.Err() != nil {
+		return nil
+	}
 	if len(out) == 0 {
 		// Match the in-memory reference: empty graph returns nil.
 		return nil
@@ -227,6 +236,9 @@ ORDER BY e.id`
 			ToKind:   graph.NodeKind(toKind),
 			Origin:   origin,
 		})
+	}
+	if rows.Err() != nil {
+		return nil
 	}
 	return out
 }
@@ -558,6 +570,12 @@ func (s *Store) ThrowerErrorSurface(pathPrefix string) []graph.ThrowerErrorRow {
 			acc.row.ErrorTargets = append(acc.row.ErrorTargets, to)
 		}
 	}
+	// Pass 1 seeds every accumulator; a truncated read here silently drops
+	// throwers from the result rather than reporting a failure.
+	if trows.Err() != nil {
+		_ = trows.Close()
+		return nil
+	}
 	_ = trows.Close()
 	if len(accums) == 0 {
 		return nil
@@ -598,6 +616,10 @@ ORDER BY e.id`
 			acc.msgSeen[name] = struct{}{}
 			acc.row.ErrorMsgs = append(acc.row.ErrorMsgs, name)
 		}
+		// Pass 2 only decorates rows pass 1 already produced, so a failed
+		// read costs this thrower its message list and nothing else —
+		// the same outcome as the Query error handled above.
+		_ = mrows.Err()
 		_ = mrows.Close()
 	}
 
