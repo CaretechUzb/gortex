@@ -188,6 +188,23 @@ type csharpDeferredCall struct {
 	// (graph.ReturnUsage* label), classified at capture time and
 	// stamped as edge Meta on the EdgeCalls emitted for this site.
 	returnUsage string
+	// argCount / typeArgCount are the call's applicability evidence:
+	// how many arguments it passes and how many type arguments it
+	// spells explicitly. Their *Known flags keep "no evidence"
+	// distinguishable from a genuine zero — narrowing an overload set
+	// on a count we never measured would be a guess, not a rule.
+	argCount     int
+	argKnown     bool
+	typeArgCount int
+	typeArgKnown bool
+}
+
+// withCSharpCallArity records the applicability counts an invocation
+// node carries, so every capture site stamps the same evidence.
+func withCSharpCallArity(c csharpDeferredCall, inv *sitter.Node) csharpDeferredCall {
+	c.argCount, c.argKnown = csharpCallArgCount(inv)
+	c.typeArgCount, c.typeArgKnown = csharpCallTypeArgCount(inv)
+	return c
 }
 
 // csharpDeferredLocal buffers a local variable declaration for the
@@ -342,36 +359,39 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 
 		case m.Captures["callm.expr"] != nil:
 			expr := m.Captures["callm.expr"]
-			calls = append(calls, csharpDeferredCall{
+			calls = append(calls, withCSharpCallArity(csharpDeferredCall{
 				name:        m.Captures["callm.method"].Text,
 				receiver:    m.Captures["callm.receiver"].Text,
 				line:        expr.StartLine + 1,
 				isMember:    true,
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
-			})
+			}, expr.Node))
 
 		case m.Captures["callself.expr"] != nil:
 			expr := m.Captures["callself.expr"]
-			calls = append(calls, csharpDeferredCall{
+			calls = append(calls, withCSharpCallArity(csharpDeferredCall{
 				name:        m.Captures["callself.method"].Text,
 				receiver:    "this",
 				recvType:    csharpQualifiedReceiverType(expr.Node, src, "this"),
 				line:        expr.StartLine + 1,
 				isMember:    true,
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
-			})
+			}, expr.Node))
 
 		case m.Captures["callbase.expr"] != nil:
 			expr := m.Captures["callbase.expr"]
-			calls = append(calls, csharpDeferredCall{
+			calls = append(calls, withCSharpCallArity(csharpDeferredCall{
 				name:        m.Captures["callbase.method"].Text,
 				receiver:    "base",
 				recvType:    csharpQualifiedReceiverType(expr.Node, src, "base"),
 				line:        expr.StartLine + 1,
 				isMember:    true,
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
-			})
+			}, expr.Node))
 
+		// A receiverless call carries no applicability stamps: nothing
+		// resolves it through the extension binder, and the scope rules
+		// that do bind it never consult arity.
 		case m.Captures["call.expr"] != nil:
 			expr := m.Captures["call.expr"]
 			calls = append(calls, csharpDeferredCall{
@@ -658,6 +678,16 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				edge.Meta = map[string]any{}
 			}
 			edge.Meta["member_call"] = true
+			// Applicability evidence for the overload set behind this
+			// name. Member calls carry it because they are the shape
+			// the extension binder resolves; a plain `Foo()` is already
+			// bound by scope rules that never consult arity.
+			if c.argKnown {
+				edge.Meta["arg_count"] = c.argCount
+			}
+			if c.typeArgKnown {
+				edge.Meta["type_arg_count"] = c.typeArgCount
+			}
 			stampReturnUsage(edge, c.returnUsage)
 			result.Edges = append(result.Edges, edge)
 			continue
@@ -1231,6 +1261,20 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 			}
 			sort.Strings(names)
 			meta["method_type_params"] = strings.Join(names, ",")
+		}
+	}
+	// Parameter arity — the evidence that splits a same-name overload set
+	// the receiver type alone cannot. Stamped on the node rather than read
+	// back off the KindParam nodes because those carry no default-value
+	// marker (and a discard parameter emits none at all), so they cannot
+	// answer "how many arguments MUST a caller supply".
+	if count, required, variadic, ok := csharpParamArity(def.Node, src); ok {
+		meta["param_count"] = count
+		if required != count {
+			meta["param_required"] = required
+		}
+		if variadic {
+			meta["param_variadic"] = true
 		}
 	}
 	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
