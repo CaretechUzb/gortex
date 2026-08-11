@@ -55,7 +55,7 @@ func TestFactSpoolThousandsStayInBoundedDeterministicPages(t *testing.T) {
 	seen := 0
 	lastSeen := ""
 	for {
-		page, last, stats, pageErr := spool.page(context.Background(), after)
+		page, last, stats, pageErr := spool.pageClass(context.Background(), classCalls, after)
 		require.NoError(t, pageErr)
 		if len(page) == 0 {
 			break
@@ -68,6 +68,8 @@ func TestFactSpoolThousandsStayInBoundedDeterministicPages(t *testing.T) {
 			require.Len(t, facts.calls, 1)
 			require.NotNil(t, facts.calls[0].recvChain)
 			assert.Equal(t, "step", facts.calls[0].recvChain.method)
+			require.Len(t, facts.imports, 1, "imports side-fetch must ride every class page")
+			assert.Empty(t, facts.supers, "a calls page must not decode other classes")
 			seen++
 		}
 		after = last
