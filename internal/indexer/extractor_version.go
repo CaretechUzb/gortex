@@ -34,6 +34,7 @@ var extractorVersions = map[string]int{
 	"php":    2,                                      // class/interface inheritance now emits typed structural edges
 	"csharp": 8,                                      // interface base lists emit extends edges (was: record positional property nodes)
 	"scala":  2,                                      // explicitly instantiated generic calls emit call edges
+	"go":     2,                                      // explicitly instantiated generic calls emit call edges
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language

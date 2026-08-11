@@ -54,6 +54,40 @@ const qGoAll = `
       operand: (_) @callm.receiver
       field: (field_identifier) @callm.method)) @callm.expr
 
+  ; Explicitly instantiated generic calls. With ONE type argument the
+  ; grammar cannot tell Zero[int]() from indexing a func-valued map, so
+  ; it parses the callee as an index_expression and the patterns above
+  ; match nothing — every such call vanished, edge and stub alike. Go
+  ; forbids a func and a var sharing a package-scope name, so binding the
+  ; operand name is safe: a genuine handlers[k]() finds no function of
+  ; that name and stays an unresolved stub. Two or more type arguments
+  ; already parse as a plain callee with a sibling type_arguments field
+  ; and were never affected.
+  (call_expression
+    function: (index_expression
+      operand: (identifier) @call.name)) @call.expr
+
+  (call_expression
+    function: (index_expression
+      operand: (selector_expression
+        operand: (_) @callm.receiver
+        field: (field_identifier) @callm.method))) @callm.expr
+
+  ; ...and with exactly one VALUE argument the same call is not even a
+  ; call_expression: One[int](1) is indistinguishable from a conversion
+  ; to the generic type One[int], and the grammar picks the conversion.
+  ; Same reasoning applies — a real conversion names a type, and a type
+  ; cannot share a package-scope name with a function.
+  (type_conversion_expression
+    type: (generic_type
+      type: (type_identifier) @call.name)) @call.expr
+
+  (type_conversion_expression
+    type: (generic_type
+      type: (qualified_type
+        package: (_) @callm.receiver
+        name: (type_identifier) @callm.method))) @callm.expr
+
   (var_declaration
     (var_spec
       name: (identifier) @var.name
