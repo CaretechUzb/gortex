@@ -75,6 +75,7 @@ func (r *Resolver) resolveLuaRequires() {
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 	}
 	if len(reindexBatch) > 0 {
+		r.noteImportEdgeReindexes(reindexBatch)
 		r.graph.ReindexEdges(reindexBatch)
 	}
 }

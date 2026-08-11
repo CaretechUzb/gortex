@@ -92,7 +92,7 @@ func TestReachabilityProjectionCapClearsPathologicalCache(t *testing.T) {
 	for i := 0; i <= reachabilityStableFileCap; i++ {
 		indexes.reachabilityFiles[fmt.Sprintf("bulk/file%06d.go", i)] = map[string]struct{}{"bulk": {}}
 	}
-	if !r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles) {
+	if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles, nil); !ok {
 		t.Fatal("reachability build failed")
 	}
 	defer r.clearReachabilityIndex()
@@ -116,7 +116,7 @@ func TestReachabilityProjectionFallsBackForMalformedProvenance(t *testing.T) {
 		From: "repo/caller.go::Caller", To: graph.UnresolvedMarker + "Work",
 		Kind: graph.EdgeCalls, FilePath: "repo/caller.go",
 	}}
-	if !r.buildReachabilityIndexForPendingCached(pending, nil, make(map[string]map[string]struct{})) {
+	if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, make(map[string]map[string]struct{}), nil); !ok {
 		t.Fatal("reachability was not built through compatibility fallback")
 	}
 	defer r.clearReachabilityIndex()
@@ -155,21 +155,217 @@ func TestReachabilityProjectionRefreshInvalidatesPassCache(t *testing.T) {
 	if indexes.reachabilityFiles != nil {
 		t.Fatal("close retained the pass-local reachability cache")
 	}
+	if indexes.importAdjacency != nil {
+		t.Fatal("close retained the pass-local adjacency retention")
+	}
 }
 
-func TestReachabilityProjectionDoesNotCacheUnresolvedImports(t *testing.T) {
-	_, store, _, indexes, pending := newReachabilityProjectionFixture(t)
+func TestReachabilityAdjacencyRetentionServesUnstableAcrossPages(t *testing.T) {
+	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
+	defer indexes.close()
+	// An unresolved import keeps the caller out of the stable set — before
+	// retention this file re-projected on every page it appeared on.
+	store.projected["repo/caller.go"] = []string{graph.UnresolvedMarker + "import::dep"}
+	adjacency := make(map[string][]string)
+	for page := 0; page < 3; page++ {
+		if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles, adjacency); !ok {
+			t.Fatalf("page %d build failed", page)
+		}
+		r.clearReachabilityIndex()
+	}
+	if store.projectionCalls != 1 {
+		t.Fatalf("projection calls = %d, want 1: retained adjacency must serve later pages", store.projectionCalls)
+	}
+	if len(indexes.reachabilityFiles) != 0 {
+		t.Fatal("unresolved import must still keep the file out of the stable set")
+	}
+	if _, ok := adjacency["repo/caller.go"]; !ok {
+		t.Fatal("adjacency retention missing the projected caller")
+	}
+}
+
+func TestReachabilityAdjacencyRetentionStatsCountHits(t *testing.T) {
+	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
+	defer indexes.close()
+	store.projected["repo/caller.go"] = []string{graph.UnresolvedMarker + "import::dep"}
+	adjacency := make(map[string][]string)
+	if _, stats := r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles, adjacency); stats.adjCached != 0 {
+		t.Fatalf("first page adjCached = %d, want 0", stats.adjCached)
+	}
+	r.clearReachabilityIndex()
+	_, stats := r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles, adjacency)
+	defer r.clearReachabilityIndex()
+	if stats.adjCached != 1 || stats.missing != 1 {
+		t.Fatalf("second page adjCached=%d missing=%d, want 1/1", stats.adjCached, stats.missing)
+	}
+}
+
+func TestReachabilityAdjacencyRetentionSkipsFallback(t *testing.T) {
+	// complete=false is a store-canonicality signal — legacy answers are
+	// never retained.
+	g := graph.New()
+	g.AddBatch([]*graph.Node{
+		{ID: "repo/caller.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "repo/caller.go"},
+		{ID: "dep/target.go", Kind: graph.KindFile, Name: "target.go", FilePath: "dep/target.go"},
+	}, []*graph.Edge{{
+		From: "repo/caller.go::Caller", To: "dep/target.go", Kind: graph.EdgeImports, FilePath: "",
+	}})
+	counting := &resolverBatchCountingStore{Store: g}
+	store := &scriptedImportProjectionStore{resolverBatchCountingStore: counting, complete: false}
+	r := New(store)
+	pending := []*graph.Edge{{
+		From: "repo/caller.go::Caller", To: graph.UnresolvedMarker + "Work",
+		Kind: graph.EdgeCalls, FilePath: "repo/caller.go",
+	}}
+	adjacency := make(map[string][]string)
+	if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, make(map[string]map[string]struct{}), adjacency); !ok {
+		t.Fatal("fallback build failed")
+	}
+	defer r.clearReachabilityIndex()
+	if len(adjacency) != 0 {
+		t.Fatalf("fallback results retained: %v", adjacency)
+	}
+}
+
+func TestReachabilityAdjacencyRetentionCapClearsWholesale(t *testing.T) {
+	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
+	defer indexes.close()
+	store.projected["repo/caller.go"] = []string{graph.UnresolvedMarker + "import::dep"}
+	adjacency := make(map[string][]string, reachabilityStableFileCap+2)
+	for i := 0; i <= reachabilityStableFileCap; i++ {
+		adjacency[fmt.Sprintf("bulk/file%06d.go", i)] = nil
+	}
+	if ok, _ := r.buildReachabilityIndexForPendingCached(pending, nil, indexes.reachabilityFiles, adjacency); !ok {
+		t.Fatal("build failed")
+	}
+	defer r.clearReachabilityIndex()
+	if len(adjacency) > 1 {
+		t.Fatalf("cap overflow retained %d entries, want wholesale clear + this page's entry", len(adjacency))
+	}
+}
+
+func TestNoteImportEdgeReindexesRecordsDirtyFiles(t *testing.T) {
+	r := New(graph.New())
+	r.noteImportEdgeReindexes([]graph.EdgeReindex{
+		{Edge: &graph.Edge{Kind: graph.EdgeCalls, FilePath: "a.go", To: "x"}, OldTo: "y"},
+		{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "b.go", To: "dep/one.go"}, OldTo: "unresolved::import::dep"},
+		{Edge: nil},
+	})
+	if _, ok := r.importDirtyFiles["b.go"]; !ok || len(r.importDirtyFiles) != 1 {
+		t.Fatalf("dirty files = %v, want exactly b.go", r.importDirtyFiles)
+	}
+	if r.importEdgeGen != 0 {
+		t.Fatal("known-file invalidation must not bump the wholesale generation")
+	}
+	// A kind migration away from imports still rewrites an imports row; the
+	// pre-mutation provenance names the file.
+	r.noteImportEdgeReindexes([]graph.EdgeReindex{
+		{Edge: &graph.Edge{Kind: graph.EdgeCalls, To: "x"}, OldTo: "x", OldKind: graph.EdgeImports, OldFilePath: "c.go"},
+	})
+	if _, ok := r.importDirtyFiles["c.go"]; !ok {
+		t.Fatalf("dirty files = %v, want c.go from OldFilePath", r.importDirtyFiles)
+	}
+	// No file provenance at all → conservative wholesale clear.
+	r.noteImportEdgeReindexes([]graph.EdgeReindex{
+		{Edge: &graph.Edge{Kind: graph.EdgeImports, To: "dep/one.go"}, OldTo: "unresolved::import::dep"},
+	})
+	if r.importEdgeGen != 1 {
+		t.Fatal("provenance-less imports write must fall back to the wholesale generation")
+	}
+}
+
+// The pass rewrites still-unresolved import edges for bookkeeping (meta,
+// confidence, terminality) on every frontier revisit. A rewrite that changes
+// neither target, kind, nor file cannot change stored adjacency — it must
+// NOT dirty the file, or the retention evicts exactly the unstable files it
+// exists to serve.
+func TestNoteImportEdgeReindexesIgnoresIdentityPreservingRewrites(t *testing.T) {
+	r := New(graph.New())
+	r.noteImportEdgeReindexes([]graph.EdgeReindex{
+		{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "a.go", To: "unresolved::import::dep"},
+			OldTo: "unresolved::import::dep"},
+	})
+	if len(r.importDirtyFiles) != 0 || r.importEdgeGen != 0 {
+		t.Fatalf("identity-preserving rewrite dirtied files=%v gen=%d, want none",
+			r.importDirtyFiles, r.importEdgeGen)
+	}
+}
+
+func TestNoteImportTargetReindexesRecordsDirtyFiles(t *testing.T) {
+	r := New(graph.New())
+	r.noteImportTargetReindexes([]graph.UnresolvedEdgeTargetReindex{
+		{Old: graph.EdgeIdentity{Kind: graph.EdgeCalls, FilePath: "a.go"}},
+		{Old: graph.EdgeIdentity{Kind: graph.EdgeImports, FilePath: "b.go"}},
+	})
+	if _, ok := r.importDirtyFiles["b.go"]; !ok || len(r.importDirtyFiles) != 1 {
+		t.Fatalf("dirty files = %v, want exactly b.go", r.importDirtyFiles)
+	}
+	if r.importEdgeGen != 0 {
+		t.Fatal("known-file invalidation must not bump the wholesale generation")
+	}
+	r.noteImportTargetReindexes([]graph.UnresolvedEdgeTargetReindex{
+		{Old: graph.EdgeIdentity{Kind: graph.EdgeImports}},
+	})
+	if r.importEdgeGen != 1 {
+		t.Fatal("provenance-less imports identity must fall back to the wholesale generation")
+	}
+}
+
+// Import edges resolve in a steady stream throughout a cold pass, so
+// invalidation must be per-file — a write against an UNRELATED file must not
+// evict the whole retention.
+func TestReachabilityAdjacencyRetentionSurvivesUnrelatedImportWrites(t *testing.T) {
+	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
+	defer indexes.close()
+	store.projected["repo/caller.go"] = []string{graph.UnresolvedMarker + "import::dep"}
+
+	indexes.prepare(pending)
+	indexes.clearPage()
+	for page := 0; page < 3; page++ {
+		r.noteImportEdgeReindexes([]graph.EdgeReindex{
+			{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "other/unrelated.go", To: "dep/one.go"},
+				OldTo: graph.UnresolvedMarker + "import::other"},
+		})
+		indexes.prepare(pending)
+		indexes.clearPage()
+	}
+	if store.projectionCalls != 1 {
+		t.Fatalf("projection calls = %d, want 1: unrelated import writes must not evict the retention", store.projectionCalls)
+	}
+}
+
+// Renegotiated from TestReachabilityProjectionDoesNotCacheUnresolvedImports:
+// adjacency for an unresolved-import caller MAY now be retained across pages —
+// the pinned invariant is freshness, not absence. An imports-kind edge write
+// (noted via the resolver generation) clears the retention, and the next page
+// re-projects and sees the newly resolved target.
+func TestReachabilityProjectionUnresolvedImportsStayFresh(t *testing.T) {
+	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
 	defer indexes.close()
 	store.projected["repo/caller.go"] = []string{graph.UnresolvedMarker + "import::dep"}
 
 	for page := 0; page < 2; page++ {
 		indexes.prepare(pending)
 		if len(indexes.reachabilityFiles) != 0 {
-			t.Fatalf("page %d cached an unresolved import", page)
+			t.Fatalf("page %d cached an unresolved import in the stable set", page)
 		}
 		indexes.clearPage()
 	}
+	if store.projectionCalls != 1 {
+		t.Fatalf("projection calls = %d, want 1: unstable adjacency is retained across pages", store.projectionCalls)
+	}
+
+	store.projected["repo/caller.go"] = []string{"dep2/two.go"}
+	r.noteImportEdgeReindexes([]graph.EdgeReindex{
+		{Edge: &graph.Edge{Kind: graph.EdgeImports, FilePath: "repo/caller.go", To: "dep2/two.go"},
+			OldTo: graph.UnresolvedMarker + "import::dep"},
+	})
+	indexes.prepare(pending)
+	defer indexes.clearPage()
 	if store.projectionCalls != 2 {
-		t.Fatalf("unresolved projection calls = %d, want 2", store.projectionCalls)
+		t.Fatalf("projection calls = %d, want 2 after an imports-kind write", store.projectionCalls)
+	}
+	if _, ok := r.reachableDirsByFile["repo/caller.go"]["dep2"]; !ok {
+		t.Fatal("post-write projection missing the newly resolved dep2 directory")
 	}
 }

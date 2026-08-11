@@ -218,6 +218,14 @@ type Resolver struct {
 	// (filepathlite.Dir/Clean dominate). Read-only after build, so the
 	// workers share it lock-free.
 	dirByFilePath map[string]string
+	// importEdgeGen counts imports-kind edge writes noted while a resolve
+	// pass may hold pass-scoped import-adjacency retention. Write-site
+	// verdicts live at noteImportEdgeWrite's callers.
+	importEdgeGen uint64
+	// importDirtyFiles names caller files whose stored import adjacency was
+	// rewritten with known provenance; prepare deletes exactly these keys
+	// from the pass-scoped retention instead of clearing it wholesale.
+	importDirtyFiles map[string]struct{}
 	// depModuleIndex bridges Go imports to dep::<module> contract
 	// nodes emitted from go.mod. Keyed by RepoPrefix (the dep node's
 	// owning repo) so we never link an import in repo A to a dep
@@ -999,6 +1007,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				perWorkerJobs[i] = kept
 			}
 			if len(reindexBatch) > 0 {
+				r.noteImportEdgeReindexes(reindexBatch)
 				r.graph.ReindexEdges(reindexBatch)
 				reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
 				reindexTotal += len(reindexBatch)
@@ -1345,6 +1354,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				terminalClears = append(terminalClears, graph.EdgeReindex{Edge: edge.edge, OldTo: oldTo})
 			}
 			if len(terminalClears) > 0 {
+				r.noteImportEdgeReindexes(terminalClears)
 				r.graph.ReindexEdges(terminalClears)
 			}
 
@@ -2662,6 +2672,7 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	stats *ResolveStats,
 ) {
 	if len(reindexBatch) > 0 {
+		r.noteImportEdgeReindexes(reindexBatch)
 		r.graph.ReindexEdges(reindexBatch)
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
@@ -4510,7 +4521,8 @@ func (r *Resolver) buildReachabilityIndex() {
 // concrete From node when possible, otherwise leave that edge unfiltered. The
 // reachability filter is explicitly fail-open for an unknown caller path.
 func (r *Resolver) buildReachabilityIndexForPending(pending []*graph.Edge, sources map[string]*graph.Node) bool {
-	return r.buildReachabilityIndexForPendingCached(pending, sources, nil)
+	ok, _ := r.buildReachabilityIndexForPendingCached(pending, sources, nil, nil)
+	return ok
 }
 
 // buildReachabilityIndexForPendingCached materialises direct-import
@@ -4525,11 +4537,35 @@ func (r *Resolver) buildReachabilityIndexForPending(pending []*graph.Edge, sourc
 // pathological inputs.
 const reachabilityStableFileCap = 1 << 16
 
+// reachabilityPageStats reports how much of one page's reachability build was
+// served from the pass-scoped stable retention and where the recompute time
+// went. Purely observational — prepare logs it so a cold run can show whether
+// unstable caller files dominate the per-page rebuild cost.
+type reachabilityPageStats struct {
+	files     int
+	cached    int
+	missing   int
+	unstable  int
+	adjCached int
+	fallback  int
+	retained  int
+	project   time.Duration
+	place     time.Duration
+	match     time.Duration
+}
+
 func (r *Resolver) buildReachabilityIndexForPendingCached(
 	pending []*graph.Edge,
 	sources map[string]*graph.Node,
 	stableByFile map[string]map[string]struct{},
-) bool {
+	adjacency map[string][]string,
+) (bool, reachabilityPageStats) {
+	var stats reachabilityPageStats
+	if len(adjacency) > reachabilityStableFileCap {
+		// Same overflow contract as the stable retention below: a wholesale
+		// clear beats piecemeal eviction, which would recreate per-page churn.
+		clear(adjacency)
+	}
 	callerPaths := make(map[string]struct{})
 	missingCallerSet := make(map[string]struct{})
 	for _, edge := range pending {
@@ -4593,24 +4629,54 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 		dirs[filePath] = dir
 		if cached, ok := stableByFile[filePath]; ok {
 			reachable[filePath] = cached
+			stats.cached++
 			continue
 		}
 		reachable[filePath] = map[string]struct{}{dir: {}}
 		missingFiles = append(missingFiles, filePath)
 	}
 
-	importsByFile := make(map[string][]string)
-	if len(missingFiles) > 0 {
-		if projector, ok := r.graph.(graph.ImportAdjacencyProjector); ok {
-			if projected, complete := projector.ProjectImportAdjacency(missingFiles); complete {
-				importsByFile = projected
-			} else {
-				importsByFile = r.legacyImportTargetsByFile(missingFiles)
+	stats.files = len(filePaths)
+	stats.missing = len(missingFiles)
+
+	importsByFile := make(map[string][]string, len(missingFiles))
+	projectFiles := missingFiles
+	if adjacency != nil {
+		projectFiles = make([]string, 0, len(missingFiles))
+		for _, filePath := range missingFiles {
+			if cached, ok := adjacency[filePath]; ok {
+				importsByFile[filePath] = cached
+				stats.adjCached++
+				continue
 			}
-		} else {
-			importsByFile = r.legacyImportTargetsByFile(missingFiles)
+			projectFiles = append(projectFiles, filePath)
 		}
 	}
+	projectStart := time.Now()
+	if len(projectFiles) > 0 {
+		var projected map[string][]string
+		complete := false
+		if projector, ok := r.graph.(graph.ImportAdjacencyProjector); ok {
+			projected, complete = projector.ProjectImportAdjacency(projectFiles)
+		}
+		if !complete {
+			// complete=false is a canonicality signal, not a cacheable
+			// answer — fallback results are never retained.
+			stats.fallback = 1
+			projected = r.legacyImportTargetsByFile(projectFiles)
+		} else if adjacency != nil {
+			// Retain raw projections for every projected file, including
+			// ones absent from the result map — known-empty is knowledge
+			// too, else importless files re-project forever.
+			for _, filePath := range projectFiles {
+				adjacency[filePath] = projected[filePath]
+			}
+		}
+		for filePath, targets := range projected {
+			importsByFile[filePath] = targets
+		}
+	}
+	stats.project = time.Since(projectStart)
 
 	targetSet := make(map[string]struct{})
 	for _, filePath := range missingFiles {
@@ -4624,8 +4690,11 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 	for id := range targetSet {
 		targetIDs = append(targetIDs, id)
 	}
+	placeStart := time.Now()
 	targets := graph.NodePlacementsByIDs(r.graph, targetIDs)
+	stats.place = time.Since(placeStart)
 
+	matchStart := time.Now()
 	for _, filePath := range missingFiles {
 		stable := true
 		for _, targetID := range importsByFile[filePath] {
@@ -4653,11 +4722,15 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 		}
 		if stable {
 			stableByFile[filePath] = reachable[filePath]
+		} else {
+			stats.unstable++
 		}
 	}
+	stats.match = time.Since(matchStart)
+	stats.retained = len(adjacency)
 	r.reachableDirsByFile = reachable
 	r.dirByFilePath = dirs
-	return true
+	return true, stats
 }
 
 // legacyImportTargetsByFile preserves the ordinary Store path for in-memory
@@ -4694,6 +4767,94 @@ func (r *Resolver) legacyImportTargetsByFile(filePaths []string) map[string][]st
 func (r *Resolver) clearReachabilityIndex() {
 	r.reachableDirsByFile = nil
 	r.dirByFilePath = nil
+}
+
+// noteImportEdgeWrite records an imports-kind edge write with no file
+// provenance. The pass-scoped import-adjacency retention compares generations
+// at page start and clears wholesale on drift — the conservative fallback
+// behind the per-file invalidation in noteImportEdgeReindexes, which covers
+// the common provenance-carrying writes.
+//
+// Write-site audit (every ReindexEdges / ReindexUnresolvedEdgeTargets /
+// AddBatch call in this package):
+//   - precise invalidation via noteImportEdgeReindexes/noteImportTargetReindexes:
+//     main page commit + incremental commit (resolver.go),
+//     deferred-LSP terminal clears and page reindexes (resolver.go,
+//     lsp_resolve.go), attribution batches (attribution_reindex_batch.go,
+//     go_builtins_attribution.go, incremental_attribution_cache.go),
+//     import-flavored retargets (relative_imports.go, lua_imports.go,
+//     razor_using.go, godot_res_paths.go), module attribution reindexes
+//     (module_attribution.go).
+//   - no bump, kind-bounded: generic_param_bind.go (EdgesByKind over
+//     non-import kinds), cross_pkg_guard.go (call-edge guard reverts).
+//   - no bump, outside any live pass retention: exported framework/registry
+//     synthesis passes (celery/mediatr/express/fastapi/django/rails/vapor/
+//     grpc/rtk/redux/vuex/ngrx/react/swiftui/uikit/sidekiq/spring/sql/
+//     store_factory/temporal/goframe/mybatis/laravel/gdscript/godot-scene/
+//     rust/kmp/iface-dispatch/fn-pointer/fn-value/chain-factory/
+//     speculative/external_calls/object_registry/value_refs and peers),
+//     cross-repo resolver (own lifecycle), framework store wrappers
+//     (their callers decide), node-only AddBatch sites, and indexer-side
+//     writers (interleave refresh already clears retention wholesale).
+func (r *Resolver) noteImportEdgeWrite() {
+	r.importEdgeGen++
+}
+
+func (r *Resolver) markImportDirty(filePath string) {
+	if r.importDirtyFiles == nil {
+		r.importDirtyFiles = make(map[string]struct{})
+	}
+	r.importDirtyFiles[filePath] = struct{}{}
+}
+
+// noteImportEdgeReindexes records which caller files' stored import adjacency
+// an edge-reindex batch rewrites. Kind migrations count in both directions:
+// either the new or the persisted pre-mutation kind being imports rewrites an
+// imports row. Known files invalidate precisely — import edges resolve in a
+// steady stream throughout a cold pass, so clearing wholesale here would
+// evict the retention before it ever serves. Entries without file provenance
+// fall back to the wholesale generation.
+func (r *Resolver) noteImportEdgeReindexes(batch []graph.EdgeReindex) {
+	for _, reindex := range batch {
+		importsRow := reindex.OldKind == graph.EdgeImports ||
+			(reindex.Edge != nil && reindex.Edge.Kind == graph.EdgeImports)
+		if !importsRow {
+			continue
+		}
+		// Frontier revisits rewrite still-unresolved import edges for pure
+		// bookkeeping (meta, confidence, terminality). A rewrite that keeps
+		// target, kind, and file cannot change stored adjacency — dirtying
+		// it would evict exactly the unstable files the retention serves.
+		if reindex.Edge != nil && reindex.OldTo == reindex.Edge.To &&
+			reindex.OldKind == "" && reindex.OldFilePath == "" {
+			continue
+		}
+		marked := false
+		if reindex.Edge != nil && reindex.Edge.FilePath != "" {
+			r.markImportDirty(reindex.Edge.FilePath)
+			marked = true
+		}
+		if reindex.OldFilePath != "" {
+			r.markImportDirty(reindex.OldFilePath)
+			marked = true
+		}
+		if !marked {
+			r.noteImportEdgeWrite()
+		}
+	}
+}
+
+func (r *Resolver) noteImportTargetReindexes(batch []graph.UnresolvedEdgeTargetReindex) {
+	for _, reindex := range batch {
+		if reindex.Old.Kind != graph.EdgeImports {
+			continue
+		}
+		if reindex.Old.FilePath == "" {
+			r.noteImportEdgeWrite()
+			continue
+		}
+		r.markImportDirty(reindex.Old.FilePath)
+	}
 }
 
 // importedDirForSpec returns the directory that an unresolved
