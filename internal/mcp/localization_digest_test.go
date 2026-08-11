@@ -645,6 +645,17 @@ func TestTaskAwareDigestMergePromotesLongTailSameOwnerCohortWithoutIdentityLoss(
 		row(targetID, "discardPending", "BatchGate.discardPending", "method", "repo/gate.go"),
 		row("repo/metrics.go::Metrics.Emit", "Emit", "Metrics.Emit", "method", "repo/metrics.go"),
 	}
+	// Pad with unrelated single-owner rows until the retained window is full,
+	// so the cohort promotion below happens under a genuinely tight cap.
+	for index := len(retainedRows); index < localizationReplayEvidenceLimit; index++ {
+		retainedRows = append(retainedRows, row(
+			fmt.Sprintf("repo/filler%02d.go::Filler%02d.Run", index, index),
+			fmt.Sprintf("Run%02d", index),
+			fmt.Sprintf("Filler%02d.Run", index),
+			"method",
+			fmt.Sprintf("repo/filler%02d.go", index),
+		))
+	}
 	retained := mergeLocalizationEvidenceDigest(nil, &localizationEvidenceDigest{Evidence: retainedRows})
 	if len(retained.Evidence) != localizationReplayEvidenceLimit {
 		t.Fatalf("fixture retained %d rows, want %d", len(retained.Evidence), localizationReplayEvidenceLimit)
@@ -712,6 +723,16 @@ func TestTaskAwareDigestMergeKeepsExplicitFourthOwnerMethodUnderTightCap(t *test
 		row("repo/trace.go::Trace.record", "record", "Trace.record", "repo/trace.go"),
 		row(explicitID, "forceDiscard", "BatchGate.forceDiscard", "repo/gate.go"),
 		row("repo/metrics.go::Metrics.emit", "emit", "Metrics.emit", "repo/metrics.go"),
+	}
+	// Pad with unrelated rows to fill the retained window; the explicitly
+	// cited fourth owner method must survive a genuinely tight cap.
+	for index := len(retainedRows); index < localizationReplayEvidenceLimit; index++ {
+		retainedRows = append(retainedRows, row(
+			fmt.Sprintf("repo/filler%02d.go::Filler%02d.run", index, index),
+			fmt.Sprintf("run%02d", index),
+			fmt.Sprintf("Filler%02d.run", index),
+			fmt.Sprintf("repo/filler%02d.go", index),
+		))
 	}
 	retained := mergeLocalizationEvidenceDigest(nil, &localizationEvidenceDigest{Evidence: retainedRows})
 	if len(retained.Evidence) != localizationReplayEvidenceLimit {
@@ -813,14 +834,17 @@ func TestDigestByteCapRetainsSingleMandatoryRowAfterSheddingOptionalFields(t *te
 	envelope := localizationExploreEnvelope{Evidence: []localizationEvidence{{
 		Rank:      1,
 		ID:        "repo/registry.go::Registry.Configure",
+		// Each optional field scales with the retention cap so every shed
+		// step is still forced: after callers, callees, and the signature go,
+		// the qual-name alone still busts the cap and must go too.
 		Name:      strings.Repeat("n", 1000),
-		QualName:  strings.Repeat("q", 3000),
+		QualName:  strings.Repeat("q", localizationDigestMaxBytes),
 		Kind:      "method",
 		File:      "repo/registry.go",
 		Line:      17,
-		Signature: strings.Repeat("s", 8000),
-		Callers:   []string{strings.Repeat("caller", 1000)},
-		Callees:   []string{strings.Repeat("callee", 1000)},
+		Signature: strings.Repeat("s", 2*localizationDigestMaxBytes),
+		Callers:   []string{strings.Repeat("caller", localizationDigestMaxBytes/6)},
+		Callees:   []string{strings.Repeat("callee", localizationDigestMaxBytes/6)},
 	}}}
 
 	digest := newLocalizationEvidenceDigest(envelope)
@@ -954,7 +978,7 @@ func TestLocalizationFinalResponseKeepsDuplicateFilesPositionallyAligned(t *test
 }
 
 func TestLocalizationFinalResponseCapsRolesAndPrioritizesProofRelations(t *testing.T) {
-	rows := make([]localizationDigestRow, 10)
+	rows := make([]localizationDigestRow, localizationReplayEvidenceLimit)
 	for index := range rows {
 		rows[index] = localizationDigestRow{
 			ID:   fmt.Sprintf("repo/pkg/file%02d.go::Worker%02d.Run", index, index),
@@ -962,9 +986,12 @@ func TestLocalizationFinalResponseCapsRolesAndPrioritizesProofRelations(t *testi
 			Kind: "method", File: fmt.Sprintf("pkg/file%02d.go", index), Line: index + 10,
 		}
 	}
-	rows[7].Provenance = localizationProvenanceImplementationTarget
-	rows[8].Provenance = localizationProvenanceImplementationRoute
-	rows[9].Provenance = "direct_callee"
+	// Proof-bearing provenance sits in the window's tail, past every seat the
+	// primary block could reach on rank alone.
+	target, route, callee := len(rows)-3, len(rows)-2, len(rows)-1
+	rows[target].Provenance = localizationProvenanceImplementationTarget
+	rows[route].Provenance = localizationProvenanceImplementationRoute
+	rows[callee].Provenance = "direct_callee"
 
 	response := renderLocalizationFinalResponse(rows)
 	if got := strings.Count(response, "- PRIMARY —"); got != localizationFinalResponsePrimaryLimit {
@@ -974,9 +1001,9 @@ func TestLocalizationFinalResponseCapsRolesAndPrioritizesProofRelations(t *testi
 		t.Fatalf("supporting rows = %d, want %d:\n%s", got, localizationFinalResponseSupportingLimit, response)
 	}
 	for _, want := range []string{
-		"- PRIMARY — pkg/file07.go:17 — repo/pkg/file07.go::Worker07.Run",
-		"- SUPPORTING — pkg/file08.go:18 — repo/pkg/file08.go::Worker08.Run",
-		"- SUPPORTING — pkg/file09.go:19 — repo/pkg/file09.go::Worker09.Run",
+		fmt.Sprintf("- PRIMARY — pkg/file%02d.go:%d — repo/pkg/file%02d.go::Worker%02d.Run", target, target+10, target, target),
+		fmt.Sprintf("- SUPPORTING — pkg/file%02d.go:%d — repo/pkg/file%02d.go::Worker%02d.Run", route, route+10, route, route),
+		fmt.Sprintf("- SUPPORTING — pkg/file%02d.go:%d — repo/pkg/file%02d.go::Worker%02d.Run", callee, callee+10, callee, callee),
 	} {
 		if !strings.Contains(response, want) {
 			t.Fatalf("bounded response omitted prioritized tuple %q:\n%s", want, response)

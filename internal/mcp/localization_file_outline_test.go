@@ -263,8 +263,8 @@ func TestLocalizationBudgetLeavesRoomForOutlineBesideEvidence(t *testing.T) {
 	if exploreDefaultBudgetTokens != 1600 {
 		t.Fatalf("explore default budget = %d, want 1600 for non-localization paths", exploreDefaultBudgetTokens)
 	}
-	if localizationDefaultBudgetTokens != 2400 {
-		t.Fatalf("localization default budget = %d, want 2400", localizationDefaultBudgetTokens)
+	if localizationDefaultBudgetTokens != 12000 {
+		t.Fatalf("localization default budget = %d, want 12000", localizationDefaultBudgetTokens)
 	}
 	declared := outlineDeclaredFile(60)
 	targets := []exploreTarget{
@@ -622,12 +622,15 @@ func TestOutlineShrinksRatherThanVanishingWhenTheBudgetBinds(t *testing.T) {
 		t.Fatalf("roomy page outline = %#v, want the full %d rows", roomy.Outline, localizationOutlineRowCap)
 	}
 
-	page := build(localizationDefaultBudgetTokens)
+	// A deliberately tight budget: the shrink path is about pressure, not
+	// about whatever the localize default happens to be.
+	const tightBudgetTokens = 2400
+	page := build(tightBudgetTokens)
 	if page.Outline == nil {
-		t.Fatal("the default budget shed the leading-file outline entirely")
+		t.Fatal("the tight budget shed the leading-file outline entirely")
 	}
 	if len(page.Outline.Rows) >= localizationOutlineRowCap {
-		t.Fatalf("fixture is not under budget pressure: %d rows survived at the default budget",
+		t.Fatalf("fixture is not under budget pressure: %d rows survived at the tight budget",
 			len(page.Outline.Rows))
 	}
 	if len(page.Outline.Rows) < localizationOutlineFloorRows {
@@ -869,9 +872,11 @@ func TestOutlineShrinkingNeverEscapesTheProviderCache(t *testing.T) {
 	routes := exploreLocalizationRefinementRoutes(targets)
 	// The same provider serves every envelope one request packs. A page that
 	// shrank its outline must not hand the next page a shrunken one.
+	// An explicitly tight budget — the point is a page that had to shrink,
+	// independent of what the localize default is tuned to.
 	tight, _, _, _ := buildLocalizationRefinementResultForTaskWithOutline(
 		declared[0].ID, "find the declared implementation", targets,
-		localizationDefaultBudgetTokens, routes, outline,
+		2400, routes, outline,
 	)
 	roomy, _, _, _ := buildLocalizationRefinementResultForTaskWithOutline(
 		declared[0].ID, "find the declared implementation", targets,

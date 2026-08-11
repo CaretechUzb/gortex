@@ -43,23 +43,33 @@ const (
 	// localizationDefaultBudgetTokens is the localize-path default. Its
 	// envelope pays for ranked rows and the leading file's outline out of one
 	// budget, where explore(task) prose pays for rows alone.
-	localizationDefaultBudgetTokens        = 2400
+	// Sized so the localize page can carry real source for its whole primary
+	// window, not just name/signature rows: a page that names the right
+	// declaration but shows no code asks the caller to choose between
+	// look-alike siblings on identifier alone. Sessions measured against an
+	// unrestricted grep agent showed the answer present-but-unnamed far more
+	// often than absent; serving bodies is what closes that, and the session
+	// token spend stays well under the plain-search agent's.
+	localizationDefaultBudgetTokens        = 12000
 	exploreMinBudgetTokens                 = 1000
 	exploreMaxBudgetTokens                 = 24000
-	exploreDefaultMaxSymbols               = 10
+	exploreDefaultMaxSymbols               = 16
 	exploreMaxMaxSymbols                   = 30
 	exploreRingCap                         = 5 // callers / callees shown per target
+	// Kept at eight while the page itself widens: this cap also sets the
+	// envelope's shed floor and the tight-budget wire guarantee, so widening
+	// it is a contract change, not a serving change.
 	localizationRefinementAllowedSymbolCap = 8 // preferred plus ranked alternates; preserves rank seven
 	exploreCharsPerToken                   = 4 // coarse token estimate for budgeting
 	// Full bodies are the largest repeated-context cost. Candidate headers,
 	// locations, signatures, and graph rings preserve recall for the whole
 	// neighborhood; only the top targets need full source to make the first
 	// response answer-ready.
-	exploreFullBodyLimit = 2
+	exploreFullBodyLimit = 5
 	// exploreBodyBudgetShare caps any single full body at this fraction of
 	// the total budget, so one huge top-ranked symbol cannot starve the
 	// rest of the neighborhood of their bodies.
-	exploreBodyBudgetShare = 3
+	exploreBodyBudgetShare = 6
 )
 
 // registerExploreTool wires the one-shot localization verb into the tool
@@ -4153,6 +4163,14 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 	if maxBytes < 1 {
 		maxBytes = 1
 	}
+	// Row admission must leave room for the answer block that is attached
+	// only after packing: a page whose rows fill the whole wire budget has no
+	// way to carry its own conclusion. The allowance covers the rendered
+	// primary block and directive at the digest shrink floor.
+	admitBytes := maxBytes - localizationAnswerPageAllowanceBytes
+	if admitBytes < 1 {
+		admitBytes = 1
+	}
 
 	mandatoryCount := 0
 	if len(targets) > 0 {
@@ -4244,7 +4262,7 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 		candidate.Symbols = append(candidate.Symbols, n.ID)
 		candidate.Evidence = append(candidate.Evidence, evidence)
 		mandatory := len(envelope.Evidence) < mandatoryCount
-		if !localizationEnvelopeFits(candidate, maxBytes) {
+		if !localizationEnvelopeFits(candidate, admitBytes) {
 			if !mandatory {
 				continue
 			}
@@ -4431,7 +4449,7 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 			}
 			continue
 		}
-		if digest != nil && len(digest.Evidence) > localizationFinalResponsePrimaryLimit {
+		if digest != nil && len(digest.Evidence) > localizationDigestShrinkFloorRows {
 			digest.Evidence = digest.Evidence[:len(digest.Evidence)-1]
 			rebuildLocalizationDigestSkeleton(digest)
 			refreshLocalizationDigestResponses(digest, task, nil)
@@ -4449,6 +4467,14 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 			shed = index
 		}
 		if shed < 0 {
+			// The same trade the indexed page makes, for a page that carries
+			// no index: the breadth tail gives back detail the caller can
+			// re-derive from the identity that stays — never a row. Without
+			// this, a page whose rows filled the budget before the answer
+			// block was attached has no way back under its wire bound.
+			if localizationShedTrailingEvidenceDetail(&envelope, mandatoryCount) {
+				continue
+			}
 			// Last resort. The unproven page is the answer a caller that stops
 			// here would give, so it outranks every packed body and survives
 			// until nothing else can be given back — and even then it goes only

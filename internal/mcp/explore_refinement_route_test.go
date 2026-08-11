@@ -237,13 +237,15 @@ func TestBuildLocalizationRefinementResultOffersRecoveryWithoutValidPreferredRou
 }
 
 func TestBoundedLocalizationRefinementRoutesCapsWireSetAndKeepsPreferred(t *testing.T) {
-	symbols := make([]string, 10)
+	// Two more candidates than the cap, so the bound genuinely binds and the
+	// preferred symbol must be promoted from beyond it.
+	symbols := make([]string, localizationRefinementAllowedSymbolCap+2)
 	routes := make(map[string]localizationRefinementRoute, len(symbols))
 	for i := range symbols {
 		symbols[i] = fmt.Sprintf("repo/internal/localization/package%02d/file.go::Resolver.Method%02d", i, i)
 		routes[symbols[i]] = localizationRefinementRoute{}
 	}
-	preferred := symbols[9]
+	preferred := symbols[len(symbols)-1]
 	authorized, bounded := boundedLocalizationRefinementRoutes(symbols, routes, preferred)
 	if len(authorized) != localizationRefinementAllowedSymbolCap || len(bounded) != localizationRefinementAllowedSymbolCap {
 		t.Fatalf("bounded authorization sizes = (%d, %d), want (%d, %d)", len(authorized), len(bounded), localizationRefinementAllowedSymbolCap, localizationRefinementAllowedSymbolCap)

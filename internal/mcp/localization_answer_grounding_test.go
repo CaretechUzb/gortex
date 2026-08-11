@@ -28,22 +28,22 @@ func TestPrimaryRowsCarryTheirDeclarationExcerpt(t *testing.T) {
 			File: "repo/storage/disk.go", Line: 42,
 			Signature: "func (s *DiskStorage) Load(key string) ([]byte, error)",
 		},
-		{
-			ID: "repo/storage/cache.go::Cache.Warm", Name: "Warm", Kind: "method",
-			File: "repo/storage/cache.go", Line: 8,
-			Signature: "func (c *Cache) Warm(ctx context.Context) error",
-		},
-		{
-			ID: "repo/storage/index.go::Index.Rebuild", Name: "Rebuild", Kind: "method",
-			File: "repo/storage/index.go", Line: 3,
-			Signature: "func (i *Index) Rebuild() error",
-		},
-		{
-			ID: "repo/storage/meta.go::Meta.Stamp", Name: "Stamp", Kind: "method",
-			File: "repo/storage/meta.go", Line: 90,
-			Signature: "func (m *Meta) Stamp(at time.Time)",
-		},
 	}
+	// Fill the remaining primary slots, then one more row that must land
+	// SUPPORTING however wide the primary window is.
+	for index := 1; index < localizationFinalResponsePrimaryLimit; index++ {
+		rows = append(rows, localizationDigestRow{
+			ID:   fmt.Sprintf("repo/storage/primary%d.go::Store%d.Serve", index, index),
+			Name: fmt.Sprintf("Store%d.Serve", index), Kind: "method",
+			File: fmt.Sprintf("repo/storage/primary%d.go", index), Line: index + 1,
+			Signature: fmt.Sprintf("func (s *Store%d) Serve() error", index),
+		})
+	}
+	rows = append(rows, localizationDigestRow{
+		ID: "repo/storage/meta.go::Meta.Stamp", Name: "Stamp", Kind: "method",
+		File: "repo/storage/meta.go", Line: 90,
+		Signature: "func (m *Meta) Stamp(at time.Time)",
+	})
 	page := renderLocalizationFinalResponse(rows)
 
 	require.Contains(t, page,
@@ -64,7 +64,12 @@ func TestDeclarationExcerptsShedBeforeLocatedRows(t *testing.T) {
 			ID:   fmt.Sprintf("repo/pkg/file%d.go::Handler%d.Run", index, index),
 			Name: fmt.Sprintf("Handler%d.Run", index), Kind: "method",
 			File: fmt.Sprintf("pkg/file%d.go", index), Line: index + 1,
-			Signature: "func (h *Handler) Run(" + strings.Repeat("option string, ", 260) + ") error",
+			// Sized so even one retained signature overruns the digest
+			// retention cap on its own: shedding must therefore strip every
+			// excerpt before it may touch a located row's identity. (The page
+			// renderer clamps long excerpts, so only the retention cap can
+			// force the shed this test is about.)
+			Signature: "func (h *Handler) Run(" + strings.Repeat("option string, ", localizationDigestMaxBytes/15+64) + ") error",
 		})
 	}
 	digest := newLocalizationEvidenceDigestForTask("run the handler", envelope)

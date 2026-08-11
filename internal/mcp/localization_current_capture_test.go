@@ -40,13 +40,17 @@ func TestMergeLocalizationEvidenceDigestReservesPriorWindowAndStaysAligned(t *te
 	if got, want := len(merged.Evidence), 6; got != want {
 		t.Fatalf("evidence count = %d, want %d", got, want)
 	}
+	// The whole current page fits inside the fresh-evidence reserve
+	// (localizationFreshEvidenceReserve rows), so every current row leads —
+	// base.go dedup-merges into its retained twin — and the retained window
+	// follows in its original order.
 	wantIDs := []string{
 		"repo/storage/disk.go::DiskStorage.Load",
 		"repo/storage/base.go::Storage.Load",
+		"repo/storage/mirror.go::Mirror.Load",
 		"repo/storage/cloud.go::CloudStorage.Load",
 		"repo/storage/cache.go::Cache.Load",
 		"repo/storage/archive.go::Archive.Load",
-		"repo/storage/mirror.go::Mirror.Load",
 	}
 	for index, want := range wantIDs {
 		row := merged.Evidence[index]
