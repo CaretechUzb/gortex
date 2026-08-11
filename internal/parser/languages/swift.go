@@ -49,6 +49,15 @@ const qSwiftAll = `
   (call_expression
     (navigation_expression
       (navigation_suffix (simple_identifier) @callm.name)) @callm.nav) @callm.expr
+
+  ; A call spelling explicit type arguments is not a call_expression at
+  ; all: lowerGeneric<Int>(), obj.doThing<Int>() and MyType<Int>(x:) all
+  ; parse as a constructor_expression whose constructed type carries the
+  ; whole dotted path. Nothing in this query matched one, so adding type
+  ; arguments to any call — free function, member, or initializer —
+  ; silently deleted its edge.
+  (constructor_expression
+    (user_type) @ctor.type) @ctor.expr
 ]
 `
 
@@ -170,17 +179,32 @@ func (e *SwiftExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 			if nav := m.Captures["callm.nav"]; nav != nil && nav.Node != nil && nav.Node.NamedChildCount() > 0 {
 				recv = strings.TrimSpace(nav.Node.NamedChild(0).Content(src))
 			}
-			// Only chained-factory member calls (the receiver is itself a call)
-			// are captured here, so the bare-identifier query stays authoritative
-			// for ordinary obj.method() and the graph is not flooded.
-			if strings.Contains(recv, "(") {
-				calls = append(calls, swiftDeferredCall{
-					name:     m.Captures["callm.name"].Text,
-					line:     expr.StartLine + 1,
-					isMember: true,
-					receiver: recv,
-				})
+			calls = append(calls, swiftDeferredCall{
+				name:     m.Captures["callm.name"].Text,
+				line:     expr.StartLine + 1,
+				isMember: true,
+				receiver: recv,
+			})
+
+		case m.Captures["ctor.expr"] != nil:
+			expr := m.Captures["ctor.expr"]
+			path := swiftUserTypePath(m.Captures["ctor.type"].Node, src)
+			if len(path) == 0 {
+				break
 			}
+			call := swiftDeferredCall{
+				name: path[len(path)-1],
+				line: expr.StartLine + 1,
+			}
+			// A dotted constructed type is a member call whose receiver
+			// the grammar folded into the type path; a bare one is a free
+			// function or an initializer, which the non-generic spelling
+			// already records the same way.
+			if len(path) > 1 {
+				call.isMember = true
+				call.receiver = strings.Join(path[:len(path)-1], ".")
+			}
+			calls = append(calls, call)
 		}
 	})
 
@@ -903,4 +927,23 @@ func findEnclosingSwiftContainer(n *sitter.Node, t string) *sitter.Node {
 		}
 	}
 	return nil
+}
+
+// swiftUserTypePath returns the dotted path spelled by a constructed
+// type, outermost segment first: `MyType<Int>` yields ["MyType"] and
+// `obj.doThing<Int>` yields ["obj", "doThing"]. Only the node's own
+// type_identifier children count — the ones nested inside a
+// type_arguments list are the type ARGUMENTS, not part of the path.
+func swiftUserTypePath(userType *sitter.Node, src []byte) []string {
+	if userType == nil {
+		return nil
+	}
+	var path []string
+	for i, nc := 0, int(userType.NamedChildCount()); i < nc; i++ {
+		c := userType.NamedChild(i)
+		if c != nil && c.Type() == "type_identifier" {
+			path = append(path, c.Content(src))
+		}
+	}
+	return path
 }

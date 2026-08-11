@@ -40,12 +40,21 @@ func TestStaleLangsDetection(t *testing.T) {
 			t.Errorf("bad json = %v, want nil", got)
 		}
 		// Against the live extractor versions, an unchanged baseline language
-		// is not stale.
-		if got := ExtractorVersionStaleLangs(`{"go":1}`); len(got) != 0 {
+		// is not stale. Java is the exemplar because its extractor has never
+		// been bumped — a language whose version this suite also asserts
+		// would make the check tautological.
+		if got := ExtractorVersionStaleLangs(`{"java":1}`); len(got) != 0 {
 			t.Errorf("stored at current = %v, want empty", got)
 		}
-		if got := ExtractorVersionStaleLangs(`{"go":1,"php":1}`); !reflect.DeepEqual(got, []string{"php"}) {
+		if got := ExtractorVersionStaleLangs(`{"java":1,"php":1}`); !reflect.DeepEqual(got, []string{"php"}) {
 			t.Errorf("stored PHP structural-edge version = %v, want [php]", got)
+		}
+		// A store extracted before the generic-call fix must re-extract:
+		// until then, every call spelling explicit type arguments is missing
+		// from its graph entirely, and no content change will trigger it.
+		if got := ExtractorVersionStaleLangs(`{"go":1,"scala":1,"cpp":1,"swift":1}`); !reflect.DeepEqual(
+			got, []string{"cpp", "go", "scala", "swift"}) {
+			t.Errorf("stored pre-generic-call version = %v, want all four", got)
 		}
 		// A store extracted before the C# usings-scope/builtin-receiver
 		// stamps must re-extract its .cs files on upgrade — the stamps
