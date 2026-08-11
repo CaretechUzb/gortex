@@ -139,6 +139,52 @@ func TestReapStaleEmbeddedStoresSpareLockedStore(t *testing.T) {
 	}
 }
 
+func TestLoadEmbeddedMCPGlobalConfig(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		write       bool
+		wantError   string
+		wantAllowed bool
+	}{
+		{name: "missing config defaults off", wantError: "mcp.allow_embedded: true"},
+		{name: "explicit false", body: "mcp:\n  allow_embedded: false\n", write: true, wantError: "mcp.allow_embedded: true"},
+		{name: "explicit true", body: "mcp:\n  allow_embedded: true\n", write: true, wantAllowed: true},
+		{name: "malformed config fails closed", body: "mcp: [\n", write: true, wantError: "load global config for embedded MCP policy"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if tt.write {
+				if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+					t.Fatalf("write global config: %v", err)
+				}
+			}
+
+			cfg, err := loadEmbeddedMCPGlobalConfig(path)
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("error = %v, want substring %q", err, tt.wantError)
+				}
+				if cfg != nil {
+					t.Fatalf("denied config = %#v, want nil", cfg)
+				}
+				if !strings.Contains(err.Error(), path) && tt.name != "malformed config fails closed" {
+					t.Fatalf("error %q does not identify config path %q", err, path)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadEmbeddedMCPGlobalConfig: %v", err)
+			}
+			if cfg == nil || cfg.MCP.AllowEmbedded != tt.wantAllowed {
+				t.Fatalf("allow_embedded = %v, want %v", cfg != nil && cfg.MCP.AllowEmbedded, tt.wantAllowed)
+			}
+		})
+	}
+}
+
 // redirectTempRoot points os.TempDir at a per-test directory so the reaper
 // only ever sees this test's fixtures, and skips when the platform will not
 // honour the redirect.

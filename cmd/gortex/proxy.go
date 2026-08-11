@@ -88,8 +88,8 @@ func jsonRPCResult(id json.RawMessage, result any) []byte {
 // detects a running daemon and isn't forced to embedded mode.
 //
 // Returns (true, nil) when the proxy ran and finished cleanly. Returns
-// (false, nil) when the daemon isn't reachable — the caller should fall
-// back to embedded mode. Any other error is a real problem.
+// (false, nil) when the daemon isn't reachable — the caller applies its
+// configured embedded-mode policy. Any other error is a real problem.
 func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, err error) {
 	cwd, wdErr := resolveLaunchCWD()
 	if wdErr != nil {
@@ -111,9 +111,9 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 	}
 	if client == nil {
 		if errors.Is(err, daemon.ErrProtocolVersionMismatch) {
-			fmt.Fprintln(os.Stderr, "[gortex mcp] daemon protocol mismatch; falling back to embedded server")
+			fmt.Fprintln(os.Stderr, "[gortex mcp] daemon protocol mismatch")
 		} else {
-			fmt.Fprintln(os.Stderr, "[gortex mcp] daemon unreachable after retry window; falling back to embedded server")
+			fmt.Fprintln(os.Stderr, "[gortex mcp] daemon unreachable after retry window")
 		}
 		return false, nil
 	}
@@ -180,7 +180,7 @@ var (
 //   - (nil, false, err)     on a non-recoverable error — the caller surfaces it.
 //   - (nil, true, lastErr)  when the window expires with the daemon still
 //     unreachable, or on a protocol-version mismatch (which never resolves by
-//     waiting) — the caller falls back to the embedded server. lastErr lets the
+//     waiting) — the caller applies its embedded-mode policy. lastErr lets the
 //     caller distinguish the mismatch case for logging.
 func dialDaemonWithRetry(ctx context.Context, h daemon.Handshake) (client *daemon.Client, recoverable bool, lastErr error) {
 	deadline := time.Now().Add(proxyDialRetryWindow)
@@ -193,7 +193,7 @@ func dialDaemonWithRetry(ctx context.Context, h daemon.Handshake) (client *daemo
 			return nil, false, err
 		}
 		// A protocol-version mismatch is a stale daemon after an upgrade —
-		// waiting can't fix it, so concede to the embedded server now.
+		// waiting can't fix it, so return to the startup policy immediately.
 		if errors.Is(err, daemon.ErrProtocolVersionMismatch) {
 			return nil, true, err
 		}

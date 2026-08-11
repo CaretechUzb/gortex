@@ -72,7 +72,7 @@ func init() {
 	mcpCmd.Flags().BoolVar(&mcpSemantic, "semantic", false, "enable semantic enrichment (SCIP, go/types, LSP)")
 	mcpCmd.Flags().BoolVar(&mcpNoSemantic, "no-semantic", false, "disable semantic enrichment")
 	mcpCmd.Flags().StringVar(&mcpSemanticMode, "semantic-mode", "typecheck", "Go analysis mode: typecheck or callgraph")
-	mcpCmd.Flags().BoolVar(&mcpNoDaemon, "no-daemon", false, "deprecated no-op (warns when set); the embedded server is used automatically when no daemon is available")
+	mcpCmd.Flags().BoolVar(&mcpNoDaemon, "no-daemon", false, "deprecated no-op (warns when set); embedded mode requires mcp.allow_embedded in the user-level config")
 	mcpCmd.Flags().BoolVar(&mcpNoCache, "no-cache", false, "deprecated no-op (warns when set); the graph is served from the sqlite store, which has no separate cache to disable")
 	// Hidden rather than removed: an editor config that still passes the flag
 	// must keep starting, but nothing should learn it from --help.
@@ -89,7 +89,7 @@ var legacyMCPFlagsWarned bool
 // retired: the mode decision comes from daemon presence plus GORTEX_AUTOSTART,
 // never from a flag.
 const legacyMCPProxyReason = "`gortex mcp` proxies to the daemon (auto-starting it) " +
-	"and falls back to an embedded server"
+	"and only uses an embedded server when mcp.allow_embedded is enabled"
 
 // legacyMCPFlags are the retired `gortex mcp` flags kept as permanent no-op
 // compat shims, each with the reason it stopped doing anything. Removing one
@@ -208,6 +208,23 @@ func newEmbeddedStorePath() (string, func(), error) {
 	}, nil
 }
 
+// loadEmbeddedMCPGlobalConfig enforces the machine-level permission for the
+// one-shot MCP server. Repository config is deliberately not consulted: a
+// checked-in .gortex.yaml must not be able to authorize extra processes.
+func loadEmbeddedMCPGlobalConfig(path string) (*config.GlobalConfig, error) {
+	global, err := config.LoadGlobal(path)
+	if err != nil {
+		return nil, fmt.Errorf("load global config for embedded MCP policy: %w", err)
+	}
+	if !global.MCP.AllowEmbedded {
+		return nil, fmt.Errorf(
+			"gortex daemon is unavailable and embedded MCP mode is disabled by default; run `gortex daemon start` or set `mcp.allow_embedded: true` in the machine-global config %q",
+			path,
+		)
+	}
+	return global, nil
+}
+
 func runMCP(cmd *cobra.Command, args []string) error {
 	warnLegacyMCPFlags(cmd)
 
@@ -215,9 +232,8 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// single-flight lock when GORTEX_AUTOSTART allows), then relay stdio
 	// over its socket. The old stdin-TTY heuristic is gone — behavior is
 	// identical from a terminal or a pipe given the same daemon state. The
-	// legacy --no-daemon flag is an inert no-op (warned above): whether we
-	// proxy or fall back to the embedded server is decided purely by daemon
-	// presence + GORTEX_AUTOSTART, never by the flag.
+	// legacy --no-daemon flag is an inert no-op (warned above); embedded mode
+	// is available only through the machine-global opt-in checked below.
 	switch resolveDaemonDecision() {
 	case daemonReady, daemonAutostarted:
 		ran, proxyErr := runProxy(cmd.Context(), proxyToolSurface())
@@ -227,8 +243,13 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		if ran {
 			return nil
 		}
-		// Lost the daemon between ensure and dial (rare) — fall
-		// through to the embedded server.
+		// Lost the daemon between ensure and dial (rare) — proceed to the
+		// same explicit embedded-mode policy as every other unavailable case.
+	}
+
+	global, err := loadEmbeddedMCPGlobalConfig(config.DefaultGlobalConfigPath())
+	if err != nil {
+		return err
 	}
 
 	logger := newLogger()
@@ -247,7 +268,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	if cwdErr != nil {
 		launchCWD = ""
 	}
-	plan := resolveEmbeddedIndex(mcpIndex, launchCWD, loadGlobalConfigForEmbedded())
+	plan := resolveEmbeddedIndex(mcpIndex, launchCWD, global)
 	mcpIndex = plan.Index
 	switch {
 	case plan.Refusal != "":
