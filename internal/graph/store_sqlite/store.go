@@ -144,6 +144,12 @@ type Store struct {
 	memEstMu  sync.Mutex
 	memEstVal map[string]graph.RepoMemoryEstimate
 	memEstAt  time.Time
+	// memEstCost is what the last *complete* recompute actually took; the
+	// TTL scales with it so a scan that costs seconds is not repeated every
+	// few seconds. memEstRetryAt suppresses retries after a recompute ran
+	// out of budget.
+	memEstCost    time.Duration
+	memEstRetryAt time.Time
 
 	// Bulk-load fast path (graph.BulkLoader). Non-nil only between
 	// BeginBulkLoad and FlushBulk, and only on a first/empty cold index.
@@ -2212,6 +2218,24 @@ func (s *Store) RepoMemoryEstimate(repoPrefix string) graph.RepoMemoryEstimate {
 // status polls from each triggering a full COUNT … GROUP BY scan.
 const memEstTTL = 3 * time.Second
 
+// memEstTTLScale keeps a recompute that cost T from being repeated for
+// roughly T*scale, capped by memEstMaxTTL. A fixed TTL is only correct while
+// the scan is cheap: on a large store the COUNT scan grew past the TTL, so
+// every poll recomputed and the memoisation stopped doing anything.
+const memEstTTLScale = 10
+
+// memEstMaxTTL caps the adaptive TTL so the estimate cannot go stale forever.
+const memEstMaxTTL = 5 * time.Minute
+
+// memEstBackoff suppresses recomputes after one ran out of budget, so a burst
+// of status polls does not walk into the same wall every time.
+const memEstBackoff = 30 * time.Second
+
+// memEstBudget bounds a single recompute. The estimate is advisory (status
+// display), so it must never be able to spend the caller's whole control
+// budget. A var, not a const, so tests can force the truncated path.
+var memEstBudget = 2 * time.Second
+
 func cloneRepoMemEstimates(m map[string]graph.RepoMemoryEstimate) map[string]graph.RepoMemoryEstimate {
 	out := make(map[string]graph.RepoMemoryEstimate, len(m))
 	for k, v := range m {
@@ -2223,59 +2247,134 @@ func cloneRepoMemEstimates(m map[string]graph.RepoMemoryEstimate) map[string]gra
 func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
 	// Hold memEstMu across the recompute so a burst of concurrent status
 	// polls collapses onto one scan: the first caller computes and
-	// caches, the rest block briefly and then hit the fresh cache.
+	// caches, the rest block briefly and then hit the fresh cache. The
+	// hold is bounded by memEstBudget, so "briefly" stays true.
 	s.memEstMu.Lock()
 	defer s.memEstMu.Unlock()
-	if s.memEstVal != nil && time.Since(s.memEstAt) < memEstTTL {
+	if s.memEstVal != nil && time.Since(s.memEstAt) < s.memEstFreshFor() {
 		return cloneRepoMemEstimates(s.memEstVal)
 	}
+	if !s.memEstRetryAt.IsZero() && time.Now().Before(s.memEstRetryAt) {
+		// A recent recompute ran out of budget. Serve what we have rather
+		// than spending the caller's budget on the same scan again.
+		if s.memEstVal != nil {
+			return cloneRepoMemEstimates(s.memEstVal)
+		}
+		return map[string]graph.RepoMemoryEstimate{}
+	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), memEstBudget)
+	defer cancel()
+
+	started := time.Now()
+	out, complete := s.scanRepoMemEstimates(ctx)
+	if !complete {
+		// Never cache a truncated count. A partial estimate is not stale,
+		// it is wrong, and the TTL would then serve that wrong number as
+		// though it had been measured.
+		//
+		// Back off only when there is already an answer worth protecting.
+		// With nothing cached there is nothing to serve, so keep trying —
+		// each attempt is bounded by memEstBudget anyway, and a cold start
+		// that hit one slow moment should not blank the column for a
+		// whole backoff window.
+		if s.memEstVal != nil {
+			s.memEstRetryAt = time.Now().Add(memEstBackoff)
+			return cloneRepoMemEstimates(s.memEstVal)
+		}
+		return map[string]graph.RepoMemoryEstimate{}
+	}
+
+	s.memEstVal = out
+	s.memEstAt = time.Now()
+	s.memEstCost = time.Since(started)
+	s.memEstRetryAt = time.Time{}
+	return cloneRepoMemEstimates(out)
+}
+
+// memEstFreshFor scales the memoisation window with what the last complete
+// recompute cost, so the TTL stays useful as the store grows. Callers hold
+// memEstMu.
+func (s *Store) memEstFreshFor() time.Duration {
+	ttl := time.Duration(memEstTTLScale) * s.memEstCost
+	if ttl < memEstTTL {
+		ttl = memEstTTL
+	}
+	if ttl > memEstMaxTTL {
+		ttl = memEstMaxTTL
+	}
+	return ttl
+}
+
+// scanRepoMemEstimates runs the two COUNT … GROUP BY scans under ctx. The
+// bool reports whether both completed; a false means the caller must not
+// cache what came back. Callers hold memEstMu.
+func (s *Store) scanRepoMemEstimates(ctx context.Context) (map[string]graph.RepoMemoryEstimate, bool) {
 	out := map[string]graph.RepoMemoryEstimate{}
-	rows, err := s.stmtAllRepoCountsNodes.Query()
+
+	rows, err := s.stmtAllRepoCountsNodes.QueryContext(ctx)
 	if err != nil {
-		panicOnFatal(err)
-		return out
+		if ctx.Err() == nil {
+			panicOnFatal(err)
+		}
+		return out, false
 	}
 	for rows.Next() {
 		var repo string
 		var n int
 		if err := rows.Scan(&repo, &n); err != nil {
 			_ = rows.Close()
-			panicOnFatal(err)
-			return out
+			if ctx.Err() == nil {
+				panicOnFatal(err)
+			}
+			return out, false
 		}
 		est := out[repo]
 		est.NodeCount = n
 		est.NodeBytes = uint64(n) * perNodeByteEstimate
 		out[repo] = est
 	}
+	err = rows.Err()
 	_ = rows.Close()
-
-	rows, err = s.stmtAllRepoCountsEdges.Query()
 	if err != nil {
-		panicOnFatal(err)
-		return out
+		if ctx.Err() == nil {
+			panicOnFatal(err)
+		}
+		return out, false
+	}
+
+	rows, err = s.stmtAllRepoCountsEdges.QueryContext(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			panicOnFatal(err)
+		}
+		return out, false
 	}
 	for rows.Next() {
 		var repo string
 		var n int
 		if err := rows.Scan(&repo, &n); err != nil {
 			_ = rows.Close()
-			panicOnFatal(err)
-			return out
+			if ctx.Err() == nil {
+				panicOnFatal(err)
+			}
+			return out, false
 		}
 		est := out[repo]
 		est.EdgeCount = n
 		est.EdgeBytes = uint64(n) * perEdgeByteEstimate
 		out[repo] = est
 	}
+	err = rows.Err()
 	_ = rows.Close()
+	if err != nil {
+		if ctx.Err() == nil {
+			panicOnFatal(err)
+		}
+		return out, false
+	}
 
-	// Cache only on the full-success path — the early error returns above
-	// leave a partial `out` and must not poison the cache.
-	s.memEstVal = out
-	s.memEstAt = time.Now()
-	return cloneRepoMemEstimates(out)
+	return out, true
 }
 
 // -- helpers --------------------------------------------------------------
