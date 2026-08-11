@@ -36,6 +36,7 @@ var extractorVersions = map[string]int{
 	"scala":  2,                                      // explicitly instantiated generic calls emit call edges
 	"go":     2,                                      // explicitly instantiated generic calls emit call edges
 	"cpp":    2,                                      // templated and namespace-qualified calls emit call edges
+	"swift":  2,                                      // generic calls and ordinary member calls emit call edges
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
