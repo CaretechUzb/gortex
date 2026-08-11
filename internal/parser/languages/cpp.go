@@ -74,6 +74,33 @@ const qCppAll = `
   (call_expression
     function: (field_expression
       field: (field_identifier) @callm.method)) @callm.expr
+
+  ; Explicitly instantiated template calls. foo<T>() wraps its callee in
+  ; a template_function, and obj.foo<T>() / ptr->foo<T>() wrap the member
+  ; in a template_method, so neither pattern above could match and every
+  ; templated call site emitted no edge at all.
+  (call_expression
+    function: (template_function
+      name: (identifier) @call.name)) @call.expr
+
+  (call_expression
+    function: (field_expression
+      field: (template_method
+        name: (field_identifier) @callm.method))) @callm.expr
+
+  ; Namespace-qualified free calls. std::move(x), ns::helper() and their
+  ; templated forms parse the callee as a qualified_identifier, which the
+  ; bare-identifier pattern cannot match — so every :: call was dropped
+  ; too, generics or not. Rust already carries the equivalent
+  ; scoped_identifier pattern; the trailing name is what the call names.
+  (call_expression
+    function: (qualified_identifier
+      name: (identifier) @call.name)) @call.expr
+
+  (call_expression
+    function: (qualified_identifier
+      name: (template_function
+        name: (identifier) @call.name))) @call.expr
 ]
 `
 
