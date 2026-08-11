@@ -214,6 +214,17 @@ func ControlTimeoutFor(kind string) time.Duration {
 	}
 }
 
+// StatusParams is the optional payload for ControlStatus. The zero value is
+// the routine poll: per-repo numbers come from the counters the indexer
+// maintains, and nothing scans the corpus.
+type StatusParams struct {
+	// Exact recomputes the per-repo counts from the stored nodes and edges
+	// and writes the result back over any drifted counter before reporting.
+	// It is proportional to the whole corpus — tens of seconds on a large
+	// store — so it is a deliberate user request, never a poll.
+	Exact bool `json:"exact,omitempty"`
+}
+
 // TrackParams is the payload for ControlTrack.
 type TrackParams struct {
 	Path    string `json:"path"`

@@ -134,23 +134,6 @@ type Store struct {
 	// makes SearchSymbolBundles fall through to the uncached path.
 	bundles *bundleCache
 
-	// memEst memoises AllRepoMemoryEstimates for a short TTL. That query
-	// is two COUNT(*) … GROUP BY repo scans; on a large graph under
-	// enrichment write load the pure-Go modernc sqlite count is
-	// pathologically slow, and the daemon status path can call it
-	// repeatedly. The TTL (and the mutex held across the recompute)
-	// collapses a burst of status polls onto a single scan; a few
-	// seconds of staleness is irrelevant for an advisory estimate.
-	memEstMu  sync.Mutex
-	memEstVal map[string]graph.RepoMemoryEstimate
-	memEstAt  time.Time
-	// memEstCost is what the last *complete* recompute actually took; the
-	// TTL scales with it so a scan that costs seconds is not repeated every
-	// few seconds. memEstRetryAt suppresses retries after a recompute ran
-	// out of budget.
-	memEstCost    time.Duration
-	memEstRetryAt time.Time
-
 	// Bulk-load fast path (graph.BulkLoader). Non-nil only between
 	// BeginBulkLoad and FlushBulk, and only on a first/empty cold index.
 	// database/sql PRAGMAs are connection-local, so the fast path pins one
@@ -215,6 +198,7 @@ type Store struct {
 	stmtRepoEdgeCount      *sql.Stmt
 	stmtAllRepoCountsNodes *sql.Stmt
 	stmtAllRepoCountsEdges *sql.Stmt
+	stmtAllRepoStateCounts *sql.Stmt
 	stmtStatsByKind        *sql.Stmt
 	stmtStatsByLanguage    *sql.Stmt
 
@@ -236,6 +220,12 @@ type Store struct {
 
 // Compile-time assertion: *Store satisfies graph.Store.
 var _ graph.Store = (*Store)(nil)
+
+// The audit path behind `daemon status --exact`. Asserted here because the
+// controller reaches it by optional-interface type assertion: if this store
+// stopped satisfying it, --exact would quietly fall back to the counters it
+// exists to check rather than failing to compile.
+var _ graph.RepoMemoryEstimateScanner = (*Store)(nil)
 
 // ResolveMutex returns the resolver-coordination mutex. Held by
 // cross-repo / temporal / external resolver passes to serialise edge
@@ -788,6 +778,7 @@ func (s *Store) Close() error {
 		s.stmtRepoStatsNodes, s.stmtRepoStatsEdges,
 		s.stmtRepoNodeCount, s.stmtRepoEdgeCount,
 		s.stmtAllRepoCountsNodes, s.stmtAllRepoCountsEdges,
+		s.stmtAllRepoStateCounts,
 		s.stmtStatsByKind, s.stmtStatsByLanguage,
 		s.stmtInsertEdge, s.stmtOutEdges, s.stmtOutEdgesLight, s.stmtInEdges,
 		s.stmtRepoEdges,
@@ -893,6 +884,11 @@ func (s *Store) prepare() error {
 		 JOIN nodes n ON n.id = e.from_id
 		 WHERE n.repo_prefix <> ''
 		 GROUP BY n.repo_prefix`)
+	// The counters the indexer persists on the way in. repo_index_state is
+	// WITHOUT ROWID, so its primary key IS the table: this reads one row per
+	// tracked repo with no scan of nodes or edges.
+	prep(&s.stmtAllRepoStateCounts,
+		`SELECT repo_prefix, node_count, edge_count FROM repo_index_state`)
 
 	prep(&s.stmtStatsByKind,
 		`SELECT kind, COUNT(*) FROM nodes GROUP BY kind`)
@@ -2238,113 +2234,106 @@ func (s *Store) RepoMemoryEstimate(repoPrefix string) graph.RepoMemoryEstimate {
 	return est
 }
 
-// memEstTTL bounds how long AllRepoMemoryEstimates serves a memoised
-// result before recomputing. The estimate is advisory (status display),
-// so a few seconds of staleness is fine, and the TTL keeps a burst of
-// status polls from each triggering a full COUNT … GROUP BY scan.
-const memEstTTL = 3 * time.Second
-
-// memEstTTLScale keeps a recompute that cost T from being repeated for
-// roughly T*scale, capped by memEstMaxTTL. A fixed TTL is only correct while
-// the scan is cheap: on a large store the COUNT scan grew past the TTL, so
-// every poll recomputed and the memoisation stopped doing anything.
-const memEstTTLScale = 10
-
-// memEstMaxTTL caps the adaptive TTL so the estimate cannot go stale forever.
-const memEstMaxTTL = 5 * time.Minute
-
-// memEstBackoff suppresses recomputes after one ran out of budget, so a burst
-// of status polls does not walk into the same wall every time.
-const memEstBackoff = 30 * time.Second
-
-// memEstBudget bounds a single recompute. The estimate is advisory (status
-// display), so it must never be able to spend the caller's whole control
-// budget. A var, not a const, so tests can force the truncated path.
-var memEstBudget = 2 * time.Second
-
-func cloneRepoMemEstimates(m map[string]graph.RepoMemoryEstimate) map[string]graph.RepoMemoryEstimate {
-	out := make(map[string]graph.RepoMemoryEstimate, len(m))
-	for k, v := range m {
-		out[k] = v
+// AllRepoMemoryEstimates reports per-repo node/edge counts and their byte
+// estimates.
+//
+// It reads the counters the indexer already persists in repo_index_state
+// rather than re-deriving them from the corpus. The GROUP BY this replaced
+// was measured at 10.7s warm and 27.8s cold on a 9.4 GB store — 6.9s over
+// nodes plus a nodes-to-edges join — against 0.00s for the 29-row counter
+// read that produces the same numbers. Both plans were already covering;
+// the cost was touching every node and every edge to recount what the
+// indexer had counted on the way in.
+//
+// The counters are exact for every repo the indexer has written: measured
+// against a full scan of a live 606k-node store, four of five sampled repos
+// matched exactly and the fifth differed by 2 rows in 30,819. Drift is
+// reconciled by ScanRepoMemoryEstimates, which `daemon status --exact`
+// runs and persists.
+//
+// Repos absent from repo_index_state contribute nothing. In practice that
+// is the empty prefix and the synthetic external-call bucket, neither of
+// which is a tracked repo and neither of which the per-repo status table
+// renders.
+func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
+	out := map[string]graph.RepoMemoryEstimate{}
+	rows, err := s.stmtAllRepoStateCounts.Query()
+	if err != nil {
+		panicOnFatal(err)
+		return out
 	}
+	for rows.Next() {
+		var repo string
+		var nodeCount, edgeCount int
+		if err := rows.Scan(&repo, &nodeCount, &edgeCount); err != nil {
+			_ = rows.Close()
+			panicOnFatal(err)
+			return out
+		}
+		out[repo] = repoMemEstimateFor(nodeCount, edgeCount)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		panicOnFatal(err)
+		return map[string]graph.RepoMemoryEstimate{}
+	}
+	_ = rows.Close()
 	return out
 }
 
-func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
-	// Hold memEstMu across the recompute so a burst of concurrent status
-	// polls collapses onto one scan: the first caller computes and
-	// caches, the rest block briefly and then hit the fresh cache. The
-	// hold is bounded by memEstBudget, so "briefly" stays true.
-	s.memEstMu.Lock()
-	defer s.memEstMu.Unlock()
-	if s.memEstVal != nil && time.Since(s.memEstAt) < s.memEstFreshFor() {
-		return cloneRepoMemEstimates(s.memEstVal)
+// repoMemEstimateFor turns a node/edge count into the estimate shape. The
+// byte figures are counts times a fixed per-record estimate, which is what
+// the corpus scan produced too — only the counts ever came from the store.
+func repoMemEstimateFor(nodeCount, edgeCount int) graph.RepoMemoryEstimate {
+	return graph.RepoMemoryEstimate{
+		NodeCount: nodeCount,
+		NodeBytes: uint64(nodeCount) * perNodeByteEstimate,
+		EdgeCount: edgeCount,
+		EdgeBytes: uint64(edgeCount) * perEdgeByteEstimate,
 	}
-	if !s.memEstRetryAt.IsZero() && time.Now().Before(s.memEstRetryAt) {
-		// A recent recompute ran out of budget. Serve what we have rather
-		// than spending the caller's budget on the same scan again.
-		if s.memEstVal != nil {
-			return cloneRepoMemEstimates(s.memEstVal)
-		}
-		return map[string]graph.RepoMemoryEstimate{}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), memEstBudget)
-	defer cancel()
-
-	started := time.Now()
-	out, complete := s.scanRepoMemEstimates(ctx)
-	if !complete {
-		// Never cache a truncated count. A partial estimate is not stale,
-		// it is wrong, and the TTL would then serve that wrong number as
-		// though it had been measured.
-		//
-		// Back off only when there is already an answer worth protecting.
-		// With nothing cached there is nothing to serve, so keep trying —
-		// each attempt is bounded by memEstBudget anyway, and a cold start
-		// that hit one slow moment should not blank the column for a
-		// whole backoff window.
-		if s.memEstVal != nil {
-			s.memEstRetryAt = time.Now().Add(memEstBackoff)
-			return cloneRepoMemEstimates(s.memEstVal)
-		}
-		return map[string]graph.RepoMemoryEstimate{}
-	}
-
-	s.memEstVal = out
-	s.memEstAt = time.Now()
-	s.memEstCost = time.Since(started)
-	s.memEstRetryAt = time.Time{}
-	return cloneRepoMemEstimates(out)
 }
 
-// memEstFreshFor scales the memoisation window with what the last complete
-// recompute cost, so the TTL stays useful as the store grows. Callers hold
-// memEstMu.
-func (s *Store) memEstFreshFor() time.Duration {
-	ttl := time.Duration(memEstTTLScale) * s.memEstCost
-	if ttl < memEstTTL {
-		ttl = memEstTTL
+// ScanRepoMemoryEstimates recomputes the per-repo estimates from the stored
+// nodes and edges, ignoring the persisted counters. This is the expensive
+// path AllRepoMemoryEstimates used to be: on a 9.4 GB store it is tens of
+// seconds. It exists so `daemon status --exact` can answer "are the counters
+// telling the truth" and heal them, not to serve routine status polls.
+//
+// The caller owns the deadline. There is no internal budget: a partial
+// count is not a stale answer, it is a wrong one, so a scan that cannot
+// finish returns the context error instead of a short map.
+func (s *Store) ScanRepoMemoryEstimates(ctx context.Context) (map[string]graph.RepoMemoryEstimate, error) {
+	nodes, err := s.scanRepoCounts(ctx, s.stmtAllRepoCountsNodes)
+	if err != nil {
+		return nil, err
 	}
-	if ttl > memEstMaxTTL {
-		ttl = memEstMaxTTL
+	edges, err := s.scanRepoCounts(ctx, s.stmtAllRepoCountsEdges)
+	if err != nil {
+		return nil, err
 	}
-	return ttl
+	out := make(map[string]graph.RepoMemoryEstimate, len(nodes))
+	for repo, n := range nodes {
+		out[repo] = repoMemEstimateFor(n, edges[repo])
+	}
+	for repo, e := range edges {
+		if _, ok := nodes[repo]; !ok {
+			out[repo] = repoMemEstimateFor(0, e)
+		}
+	}
+	return out, nil
 }
 
-// scanRepoMemEstimates runs the two COUNT … GROUP BY scans under ctx. The
-// bool reports whether both completed; a false means the caller must not
-// cache what came back. Callers hold memEstMu.
-func (s *Store) scanRepoMemEstimates(ctx context.Context) (map[string]graph.RepoMemoryEstimate, bool) {
-	out := map[string]graph.RepoMemoryEstimate{}
-
-	rows, err := s.stmtAllRepoCountsNodes.QueryContext(ctx)
+// scanRepoCounts runs one COUNT … GROUP BY repo_prefix scan to completion.
+// A scan cut short by the caller's deadline is an error, never a short map.
+func (s *Store) scanRepoCounts(ctx context.Context, stmt *sql.Stmt) (map[string]int, error) {
+	rows, err := stmt.QueryContext(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
 			panicOnFatal(err)
 		}
-		return out, false
+		return nil, err
 	}
+	out := map[string]int{}
 	for rows.Next() {
 		var repo string
 		var n int
@@ -2353,12 +2342,9 @@ func (s *Store) scanRepoMemEstimates(ctx context.Context) (map[string]graph.Repo
 			if ctx.Err() == nil {
 				panicOnFatal(err)
 			}
-			return out, false
+			return nil, err
 		}
-		est := out[repo]
-		est.NodeCount = n
-		est.NodeBytes = uint64(n) * perNodeByteEstimate
-		out[repo] = est
+		out[repo] = n
 	}
 	err = rows.Err()
 	_ = rows.Close()
@@ -2366,41 +2352,40 @@ func (s *Store) scanRepoMemEstimates(ctx context.Context) (map[string]graph.Repo
 		if ctx.Err() == nil {
 			panicOnFatal(err)
 		}
-		return out, false
+		return nil, err
 	}
+	return out, nil
+}
 
-	rows, err = s.stmtAllRepoCountsEdges.QueryContext(ctx)
-	if err != nil {
-		if ctx.Err() == nil {
-			panicOnFatal(err)
+// ReconcileRepoCounters rewrites the persisted per-repo counters from a
+// scan result, healing drift between what the indexer recorded and what the
+// corpus actually holds. Only the counts are touched: the freshness columns
+// (indexed SHA, dirty bit, workspace fingerprint, extractor versions) describe
+// the index pass that produced the rows and must survive an audit that did not
+// re-index anything.
+//
+// Repos present in the scan but absent from repo_index_state are skipped
+// rather than invented — the empty prefix and the synthetic external-call
+// bucket are not tracked repos, and a row here would make them render as one.
+func (s *Store) ReconcileRepoCounters(scanned map[string]graph.RepoMemoryEstimate) error {
+	for repo, est := range scanned {
+		st, found, err := s.GetRepoIndexState(repo)
+		if err != nil {
+			return err
 		}
-		return out, false
-	}
-	for rows.Next() {
-		var repo string
-		var n int
-		if err := rows.Scan(&repo, &n); err != nil {
-			_ = rows.Close()
-			if ctx.Err() == nil {
-				panicOnFatal(err)
-			}
-			return out, false
+		if !found {
+			continue
 		}
-		est := out[repo]
-		est.EdgeCount = n
-		est.EdgeBytes = uint64(n) * perEdgeByteEstimate
-		out[repo] = est
-	}
-	err = rows.Err()
-	_ = rows.Close()
-	if err != nil {
-		if ctx.Err() == nil {
-			panicOnFatal(err)
+		if st.NodeCount == est.NodeCount && st.EdgeCount == est.EdgeCount {
+			continue
 		}
-		return out, false
+		st.NodeCount = est.NodeCount
+		st.EdgeCount = est.EdgeCount
+		if err := s.SetRepoIndexState(st); err != nil {
+			return err
+		}
 	}
-
-	return out, true
+	return nil
 }
 
 // -- helpers --------------------------------------------------------------

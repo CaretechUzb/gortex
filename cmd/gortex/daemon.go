@@ -98,6 +98,10 @@ var daemonReloadCmd = &cobra.Command{
 	RunE:  runDaemonReload,
 }
 
+// daemonStatusExact opts `daemon status` out of the maintained per-repo
+// counters and into a full recount. See the flag help for the cost.
+var daemonStatusExact bool
+
 var daemonStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show daemon PID, uptime, tracked repos, memory, sessions",
@@ -112,6 +116,11 @@ var daemonLogsCmd = &cobra.Command{
 
 func init() {
 	daemonStartCmd.RunE = runDaemonStart
+	daemonStatusCmd.Flags().BoolVar(&daemonStatusExact, "exact", false,
+		"recount nodes and edges from the store instead of reading the counters "+
+			"the indexer maintains, and repair any that have drifted. Proportional "+
+			"to the whole corpus — tens of seconds on a large store")
+
 	daemonStartCmd.Flags().BoolVar(&daemonDetach, "detach", false,
 		"fork to background after starting (logs to the daemon log file — see `gortex daemon logs`)")
 	daemonStartCmd.Flags().BoolVar(&daemonEmbeddings, "embeddings", false,
@@ -1170,7 +1179,7 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 	if daemonStatusWatch {
 		return runDaemonStatusWatch(cmd)
 	}
-	st, err := fetchDaemonStatusForCLI()
+	st, err := fetchDaemonStatusWithOptions(daemon.StatusParams{Exact: daemonStatusExact})
 	if err != nil {
 		return err
 	}
@@ -1186,13 +1195,25 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 // fetchDaemonStatusForCLI dials the control socket once and returns a parsed
 // StatusResponse. Shared by the one-shot and watch paths.
 func fetchDaemonStatusForCLI() (daemon.StatusResponse, error) {
+	return fetchDaemonStatusWithOptions(daemon.StatusParams{})
+}
+
+// fetchDaemonStatusWithOptions is fetchDaemonStatusForCLI with the control
+// payload spelled out. An exact recount can outrun the default control budget
+// by a wide margin on a large store, so that request waits without a bound —
+// the user asked for the scan and is watching it happen.
+func fetchDaemonStatusWithOptions(params daemon.StatusParams) (daemon.StatusResponse, error) {
 	var st daemon.StatusResponse
 	c, err := daemonControlClient()
 	if err != nil {
 		return st, err
 	}
 	defer c.Close()
-	resp, err := c.Control(daemon.ControlStatus, nil)
+	timeout := daemon.ControlTimeoutFor(daemon.ControlStatus)
+	if params.Exact {
+		timeout = 0
+	}
+	resp, err := c.ControlWithTimeout(daemon.ControlStatus, params, timeout)
 	if err != nil {
 		return st, err
 	}
