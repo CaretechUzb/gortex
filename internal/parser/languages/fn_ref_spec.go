@@ -224,6 +224,33 @@ func fnRefStartsCall(spec fnRefSpec, n *sitter.Node, src []byte) bool {
 	return byteAfterIdentStartsCall(src, int(n.EndByte()))
 }
 
+// fnRefIsCallableDeclName reports whether n is the NAME of a callable
+// declaration rather than a use of one.
+//
+// The byte heuristic leans on the `(` that follows a declaration's name to
+// exclude the declaration itself, and that holds only while nothing sits
+// between them. A generic declaration puts the type parameters there —
+// `AddFooDecorator<TInterface, TImpl>(` — so the method's own name read as a
+// function-as-value and landed a placeholder reference edge stamped at its
+// declaration line, which the gate then bound to a sibling overload.
+//
+// Widening the byte rule to `<` is not available: `f < g` is a comparison in
+// JavaScript, TypeScript and every C-family language the capture serves. The
+// tree answers exactly, and for every language at once — a node that fills its
+// parent's `name` field where that parent also declares `parameters` is a
+// declaration however it is spelled.
+func fnRefIsCallableDeclName(n *sitter.Node) bool {
+	p := n.Parent()
+	if p == nil {
+		return false
+	}
+	name := p.ChildByFieldName("name")
+	if name == nil || name.StartByte() != n.StartByte() || name.EndByte() != n.EndByte() {
+		return false
+	}
+	return p.ChildByFieldName("parameters") != nil
+}
+
 // fnRefForm reports the wrapper form (address_of / eta) a captured node sits in
 // per the spec's unwrapForms, or "" for a plain value position.
 func (s fnRefSpec) fnRefForm(n *sitter.Node) string {

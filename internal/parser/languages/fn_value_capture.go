@@ -177,6 +177,9 @@ func captureFnValueCandidates(result *parser.ExtractionResult, root *sitter.Node
 		if fnRefStartsCall(spec, n, src) {
 			return // callee of a call (incl. tagged template), not a value use
 		}
+		if fnRefIsCallableDeclName(n) {
+			return // the declaration of the function, not a use of it
+		}
 		line := int(n.StartPoint().Row) + 1
 		fromID := findEnclosingFunc(funcRanges, line)
 		if fromID == "" {
