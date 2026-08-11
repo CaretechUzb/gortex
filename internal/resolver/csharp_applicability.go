@@ -97,13 +97,18 @@ func csharpMethodTypeParamCount(c *graph.Node) int {
 }
 
 // csharpExtensionAcceptsArgCount reports whether a candidate extension
-// method can accept the call's argument count written in EXTENSION FORM
-// (`x.Foo(a)`), where the receiver supplies the `this` parameter.
+// method can accept the call's argument count.
 //
 // The window is [required, count], widened to [required, +inf) by a
-// trailing `params` array. A candidate with no parameter stamp — an
-// older graph, or a declaration whose parameter list the grammar did not
-// expose — accepts anything.
+// trailing `params` array. In EXTENSION form (`x.Foo(a)`) the receiver
+// fills the `this` slot, so both ends drop by one; in STATIC form
+// (`Ext.Foo(x, a)`) the argument list covers every parameter and the
+// window is used as declared. Reading the wrong form would exclude an
+// overload for the very count it accepts, and — worse — could leave a
+// sibling as the sole survivor.
+//
+// A candidate with no parameter stamp — an older graph, or a declaration
+// whose parameter list the grammar did not expose — accepts anything.
 func csharpExtensionAcceptsArgCount(e *graph.Edge, c *graph.Node) bool {
 	argc, ok := metaIntValue(e.Meta["arg_count"])
 	if !ok || c == nil || c.Meta == nil {
@@ -120,15 +125,33 @@ func csharpExtensionAcceptsArgCount(e *graph.Edge, c *graph.Node) bool {
 	if r, rok := metaIntValue(c.Meta["param_required"]); rok {
 		required = r
 	}
-	// The receiver fills the `this` slot; the remaining parameters are
-	// what the argument list has to cover.
-	count--
-	required--
-	if required < 0 {
-		required = 0
+	if !csharpCallIsStaticForm(e, c) {
+		count--
+		required--
+		if required < 0 {
+			required = 0
+		}
 	}
 	if variadic, _ := c.Meta["param_variadic"].(bool); variadic {
 		return argc >= required
 	}
 	return argc >= required && argc <= count
+}
+
+// csharpCallIsStaticForm reports whether the call invokes the extension
+// through its declaring class (`BagExt.Add(bag)`) rather than on a
+// receiver value (`bag.Add()`).
+//
+// The extractor stamps receiver_name only for a bare receiver that no
+// local, parameter or builtin in scope explains — so a receiver_name
+// equal to the candidate's own declaring class is a type reference, not
+// a shadowing variable. Any receiver the extractor DID type is a value
+// by construction, and carries no receiver_name at all.
+func csharpCallIsStaticForm(e *graph.Edge, c *graph.Node) bool {
+	recv, _ := e.Meta["receiver_name"].(string)
+	if recv == "" {
+		return false
+	}
+	owner, _ := c.Meta["receiver"].(string)
+	return owner != "" && recv == owner
 }

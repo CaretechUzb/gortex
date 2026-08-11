@@ -305,3 +305,47 @@ namespace App {
 	assert.True(t, graph.IsUnresolvedTarget(target),
 		"the only arity-applicable overload lives in an unimported namespace, got %q", target)
 }
+
+// An extension method can also be invoked through its declaring class,
+// where the argument list covers EVERY parameter because the first
+// argument is what fills the `this` slot. Reading such a call as
+// extension form shifts the whole arity window by one, which does not
+// merely lose the bind — it can leave the wrong sibling as the sole
+// survivor and bind that instead.
+//
+// The extractor stamps a bare receiver's spelling only when no local,
+// parameter or builtin in scope explains it, so a receiver naming the
+// candidate's own declaring class is a type reference rather than a
+// shadowing variable.
+func TestResolveCSharpExtension_StaticFormCountsTheReceiverArgument(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Ext.cs": `using System;
+namespace Lib {
+    public interface IBag { }
+    public class Opts { }
+    public static class BagExt {
+        public static IBag Add(this IBag bag) { return bag; }
+        public static IBag Add(this IBag bag, Action<Opts> configure) { return bag; }
+    }
+}`,
+		"Caller.cs": `using Lib;
+namespace App {
+    public class Runner {
+        public void Extension(IBag bag) { bag.Add(); }
+        public void StaticForm(IBag bag) { BagExt.Add(bag); }
+        public void StaticFormTwo(IBag bag) { BagExt.Add(bag, x => { }); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	assert.Equal(t, "Ext.cs::BagExt.Add",
+		namedCallTarget(t, g, "Caller.cs::Runner.Extension", "Add"),
+		"extension form: the receiver fills the this slot, so zero arguments is the one-parameter overload")
+	assert.Equal(t, "Ext.cs::BagExt.Add",
+		namedCallTarget(t, g, "Caller.cs::Runner.StaticForm", "Add"),
+		"static form: the single argument IS the receiver, so this is still the one-parameter overload")
+	assert.Equal(t, "Ext.cs::BagExt.Add_L7",
+		namedCallTarget(t, g, "Caller.cs::Runner.StaticFormTwo", "Add"),
+		"static form with a real second argument is the two-parameter overload")
+}

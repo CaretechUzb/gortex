@@ -670,6 +670,16 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				}
 			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
 				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenvByOwner[callerID], result))
+			} else if c.receiver != "" {
+				// A bare receiver nothing above could type. Its spelling
+				// is still evidence: reaching here means no local, param
+				// or builtin in scope carries that name, so a receiver
+				// that names a static class is the STATIC form of an
+				// extension call (`BagExt.Add(bag)`) — where the `this`
+				// slot is filled by the first argument, not the
+				// receiver. The extension binder needs that distinction
+				// before it can compare argument counts.
+				edge.Meta = map[string]any{"receiver_name": c.receiver}
 			}
 			// Eviction restubs a member call to a bare unresolved name; the
 			// marker is what lets the resolver still route the rebind through
