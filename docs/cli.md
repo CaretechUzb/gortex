@@ -5,7 +5,7 @@ gortex install               One-time machine-wide setup (user-level MCP, skills
 gortex init [path]           Per-repo setup (.mcp.json, hooks, community routing, per-community SKILL.md)
 gortex init --dry-run-intake Emit a privacy-safe intake manifest and exit before parsing/writes
 gortex doctor                Zero-op state report: adapter drift, hook activity, adoption, savings (human or --json)
-gortex mcp [flags]           Start the MCP stdio server (auto-detects daemon; --no-daemon / --proxy; --server adds HTTP API)
+gortex mcp [flags]           Start the MCP stdio proxy (connects to or auto-starts the daemon; embedded fallback requires config opt-in; --server adds HTTP API)
 gortex daemon start [flags]  Start the daemon; --http-addr <addr> serves the HTTP/JSON API under /v1/* plus the MCP /mcp transport (--http-auth-token, --cors-origin)
 gortex daemon <sub>          start / stop / restart / reload / status / logs / install-service / service-status / uninstall-service / server (multi-server roster)
 gortex eval <sub>            Retrieval + coverage benchmarks — recall / embedders / pack / swebench / stdbench / tokens / baselines / quality / parity (substrate; prefer `gortex bench` for the user-facing surface). `parity` measures per-language cross-file coverage against the committed baseline
@@ -87,9 +87,9 @@ gortex init --no-hooks                  # full init but skip hook installation
 gortex init --dry-run-intake --json     # inspect admitted/skipped corpus buckets; no parsing/storage/writes,
                                         # no raw paths or file contents in the report
 
-# Run the MCP server standalone (auto-detects daemon via stdio; --no-daemon forces embedded):
+# Standalone mode requires `mcp.allow_embedded: true` in the user-level config.
+# `--no-daemon` is deprecated and does not bypass the opt-in.
 gortex mcp --index /path/to/repo --watch
-gortex mcp --no-daemon --watch          # explicit embedded mode
 ```
 
 ## Query subcommands
