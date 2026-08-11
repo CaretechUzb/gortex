@@ -262,8 +262,9 @@ func (s *Store) ExtractCandidates(kinds []graph.EdgeKind, minLines, minCallers, 
 WHERE kind IN (?,?) AND start_line > 0 AND end_line > 0`
 	args := []any{string(graph.KindFunction), string(graph.KindMethod)}
 	if pathPrefix != "" {
-		q += ` AND file_path LIKE ? ESCAPE '\'`
-		args = append(args, escapeLikePattern(pathPrefix)+"%")
+		pred, pargs := pathPrefixPredicate("file_path", pathPrefix)
+		q += ` AND ` + pred
+		args = append(args, pargs...)
 	}
 	q += ` ORDER BY id`
 	nodes := s.queryNodesSQL(q, args...)
@@ -510,8 +511,9 @@ func (s *Store) ThrowerErrorSurface(pathPrefix string) []graph.ThrowerErrorRow {
 	tq := `SELECT from_id, to_id, file_path, line FROM edges WHERE kind = ?`
 	targs := []any{string(graph.EdgeThrows)}
 	if pathPrefix != "" {
-		tq += ` AND file_path LIKE ? ESCAPE '\'`
-		targs = append(targs, escapeLikePattern(pathPrefix)+"%")
+		pred, pargs := pathPrefixPredicate("file_path", pathPrefix)
+		tq += ` AND ` + pred
+		targs = append(targs, pargs...)
 	}
 	tq += ` ORDER BY id`
 	trows, err := s.db.Query(tq, targs...)

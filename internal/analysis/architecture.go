@@ -8,6 +8,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // EvaluateArchitecture checks the declarative architecture DSL — named
@@ -284,7 +285,7 @@ func effectivePath(n *graph.Node) string {
 // pathHasSegment reports whether seg appears as a full path segment of
 // filePath (e.g. seg "domain" matches "internal/domain/user.go").
 func pathHasSegment(filePath, seg string) bool {
-	for _, part := range strings.Split(filePath, "/") {
+	for _, part := range strings.Split(graphpath.Norm(filePath), "/") {
 		if part == seg {
 			return true
 		}
@@ -296,7 +297,7 @@ func pathHasSegment(filePath, seg string) bool {
 // any number of path segments (including zero); "*" and "?" match
 // within a single segment via the stdlib path.Match rules.
 func globMatch(pattern, p string) bool {
-	return matchSegments(strings.Split(pattern, "/"), strings.Split(p, "/"))
+	return matchSegments(strings.Split(pattern, "/"), strings.Split(graphpath.Norm(p), "/"))
 }
 
 func matchSegments(pat, seg []string) bool {

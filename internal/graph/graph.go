@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // GraphStats holds summary counts of the graph contents.
@@ -4298,7 +4300,7 @@ func (g *Graph) ThrowerErrorSurface(pathPrefix string) []ThrowerErrorRow {
 		if e == nil {
 			continue
 		}
-		if pathPrefix != "" && !strings.HasPrefix(e.FilePath, pathPrefix) {
+		if pathPrefix != "" && !strings.HasPrefix(graphpath.Norm(e.FilePath), graphpath.Norm(pathPrefix)) {
 			continue
 		}
 		row, ok := byThrower[e.From]
@@ -4674,7 +4676,7 @@ func (g *Graph) ExtractCandidates(
 		if n == nil {
 			continue
 		}
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+		if pathPrefix != "" && !strings.HasPrefix(graphpath.Norm(n.FilePath), graphpath.Norm(pathPrefix)) {
 			continue
 		}
 		if n.StartLine == 0 || n.EndLine == 0 {
@@ -5034,7 +5036,7 @@ func (g *Graph) NodeDegreeByKinds(kinds []NodeKind, pathPrefix string) []NodeDeg
 		if n == nil {
 			continue
 		}
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+		if pathPrefix != "" && !strings.HasPrefix(graphpath.Norm(n.FilePath), graphpath.Norm(pathPrefix)) {
 			continue
 		}
 		out = append(out, NodeDegreeRow{
