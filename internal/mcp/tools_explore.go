@@ -5260,12 +5260,11 @@ const (
 	exploreSourceLiteralCoverageSignal  = "explore_source_literal_coverage"
 	exploreSourceLiteralTaskAlignSignal = "explore_source_literal_task_alignment"
 	exploreSourceLiteralReservationMax  = 2
-	exploreQuotedRecallMaxTerms         = 3
+	exploreQuotedRecallMaxTerms         = 6
 	// Literals mined from code blocks may only take the slots prose left
-	// unclaimed, up to this total, so a task with no code block searches
-	// exactly as many terms as before.
-	exploreQuotedRecallMaxMinedTerms = 5
-	exploreQuotedRecallMaxPerTerm    = 12
+	// unclaimed. Explicit and mined anchors share one fixed request budget.
+	exploreQuotedRecallMaxMinedTerms = 6
+	exploreQuotedRecallMaxPerTerm    = 24
 	exploreQuotedRecallRetryMaxRows  = 24
 )
 
@@ -5529,8 +5528,8 @@ func exploreSourceLiteralConstructionIntent(task string) bool {
 	return false
 }
 
-// gatherExploreQuotedContentCandidates performs at most four bounded content
-// searches (three literals plus one adaptive retry). It scans source bodies only
+// gatherExploreQuotedContentCandidates performs at most seven bounded content
+// searches (six literals plus one adaptive retry). It scans source bodies only
 // when neither the ordinary nor content channels already contain an exact,
 // localizable code symbol. The fallback is request-local and never persists a
 // source-body index.
@@ -5549,7 +5548,7 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 	if len(terms) == 0 {
 		return nil
 	}
-	perTerm := clampInt(limit/4, 4, exploreQuotedRecallMaxPerTerm)
+	perTerm := clampInt(limit/3, 4, exploreQuotedRecallMaxPerTerm)
 	repoPrefix := ""
 	if len(scope.RepoAllow) == 1 {
 		for prefix, allowed := range scope.RepoAllow {

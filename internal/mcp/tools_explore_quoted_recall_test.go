@@ -87,6 +87,28 @@ func candidateByID(candidates []*rerank.Candidate, id string) *rerank.Candidate 
 	return nil
 }
 
+func TestExploreQuotedRecallTermsAdmitsSixExplicitLiterals(t *testing.T) {
+	terms := exploreQuotedRecallTerms(`find "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", and "golf"`)
+	require.Equal(t, []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot"}, terms)
+}
+
+func TestGatherExploreQuotedContentCandidatesUsesBoundedWidePages(t *testing.T) {
+	terms := []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot"}
+	hits := make(map[string][]graph.ContentHit, len(terms))
+	for _, term := range terms {
+		hits[term] = quotedRecallHits(term, 1, 0)
+	}
+	server, store := newQuotedRecallCountingServer(t, hits)
+	candidates := server.gatherExploreQuotedContentCandidates(
+		context.Background(), `find "alpha", "bravo", "charlie", "delta", "echo", and "foxtrot"`, nil, 72,
+		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+	)
+
+	require.Len(t, candidates, len(terms))
+	require.Equal(t, []int{24, 24, 24, 24, 24, 24}, store.searchLimits)
+	require.Equal(t, 1, store.graphLookups, "all term pages must share one graph lookup")
+}
+
 func TestGatherExploreQuotedContentCandidatesRetriesOneSaturatedTermWithinBounds(t *testing.T) {
 	hits := map[string][]graph.ContentHit{
 		"ku": quotedRecallHits("ku", exploreQuotedRecallRetryMaxRows, 17),
@@ -100,8 +122,8 @@ func TestGatherExploreQuotedContentCandidatesRetriesOneSaturatedTermWithinBounds
 	)
 
 	require.LessOrEqual(t, len(store.searchLimits), exploreQuotedRecallMaxTerms+1)
-	require.Equal(t, []int{5, 5, 5, exploreQuotedRecallRetryMaxRows}, store.searchLimits)
-	require.Equal(t, []int{5, 5, 5, exploreQuotedRecallRetryMaxRows}, store.searchRows)
+	require.Equal(t, []int{6, 6, 6, exploreQuotedRecallRetryMaxRows}, store.searchLimits)
+	require.Equal(t, []int{6, 6, 6, exploreQuotedRecallRetryMaxRows}, store.searchRows)
 	require.LessOrEqual(t, store.searchRows[len(store.searchRows)-1], exploreQuotedRecallRetryMaxRows)
 	require.Equal(t, 1, store.graphLookups, "all final pages must share one graph lookup")
 
@@ -126,7 +148,7 @@ func TestGatherExploreQuotedContentCandidatesKeepsUniqueExactFastPath(t *testing
 		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
 	)
 
-	require.Equal(t, []int{4}, store.searchLimits)
+	require.Equal(t, []int{5}, store.searchLimits)
 	require.Equal(t, 1, store.graphLookups)
 	exact := candidateByID(candidates, "demo/exact.go::candidate")
 	require.NotNil(t, exact)
