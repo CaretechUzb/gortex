@@ -566,3 +566,46 @@ func TestRouter_SetMaxAlive_NeverEvictsPinned(t *testing.T) {
 		t.Fatalf("want 2 unpinned evictions, got %d", got)
 	}
 }
+
+// TestRouter_Stats_ReportsInUsePin — Stats must carry the pin count,
+// not just the last-used time. A pinned provider is skipped by both
+// the reaper and the LRU evictor, so a count that never returns to
+// zero holds a language-server subprocess alive for the life of the
+// daemon; without InUse in Stats that leak is invisible to
+// `gortex daemon status`.
+func TestRouter_Stats_ReportsInUsePin(t *testing.T) {
+	workspace := t.TempDir()
+	r := NewRouter(workspace, zap.NewNop())
+	defer r.Close()
+
+	const specName = "fake-spec"
+	injectProvider(r, specName, workspace, time.Now(), 0)
+	// Register the spec and force-mark it available so the pinning
+	// fetch takes the cache-hit path without a real binary on PATH.
+	r.RegisterSpec(&ServerSpec{Name: specName, Languages: []string{"go"}})
+	r.availMu.Lock()
+	r.avail[specName] = true
+	r.availMu.Unlock()
+
+	stats := r.Stats()
+	if len(stats) != 1 {
+		t.Fatalf("want 1 stats row, got %d", len(stats))
+	}
+	if stats[0].InUse != 0 {
+		t.Fatalf("want InUse=0 before pinning, got %d", stats[0].InUse)
+	}
+
+	if _, err := r.ProviderForSpecWorkspace(specName, workspace); err != nil {
+		t.Fatalf("ProviderForSpecWorkspace: %v", err)
+	}
+	stats = r.Stats()
+	if len(stats) != 1 || stats[0].InUse != 1 {
+		t.Fatalf("want InUse=1 while pinned, got %+v", stats)
+	}
+
+	r.ReleaseSpecWorkspace(specName, workspace)
+	stats = r.Stats()
+	if len(stats) != 1 || stats[0].InUse != 0 {
+		t.Fatalf("want InUse=0 after release, got %+v", stats)
+	}
+}

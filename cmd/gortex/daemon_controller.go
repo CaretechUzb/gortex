@@ -1238,6 +1238,8 @@ func (c *realController) collectLSPRouterStatus() *daemon.LSPRouterStatus {
 	}
 	out := &daemon.LSPRouterStatus{
 		DefaultWorkspace: router.DefaultWorkspace(),
+		MaxAlive:         router.MaxAlive(),
+		Evictions:        router.EvictionCount(),
 	}
 	for _, name := range router.EnabledSpecNames() {
 		out.EnabledSpecs = append(out.EnabledSpecs, daemon.LSPSpecStatus{
@@ -1251,6 +1253,7 @@ func (c *realController) collectLSPRouterStatus() *daemon.LSPRouterStatus {
 			Spec:      s.Spec,
 			Workspace: s.Workspace,
 			LastUsed:  s.LastUsed.Format(time.RFC3339),
+			InUse:     s.InUse,
 		})
 	}
 	return out
