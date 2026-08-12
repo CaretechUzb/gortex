@@ -54,8 +54,8 @@ func TestInstallPermissionsMigratesWildcardButPreservesCustomPolicy(t *testing.T
 //   - .mcp.json with our server stanza
 //   - .claude/settings.json with MCP permissions
 //   - .claude/settings.local.json with the lifecycle and tool hook events
-//   - CLAUDE.md with the marker-guarded communities block (since
-//     the test env seeds SkillsRouting)
+//   - AGENTS.md with the marker-guarded communities block
+//   - CLAUDE.md importing the canonical AGENTS.md instructions
 //   - .claude/skills/generated/<DirName>/SKILL.md (one per
 //     GeneratedSkill)
 //
@@ -81,6 +81,7 @@ func TestClaudeCodeProjectModeCreatesCanonicalArtifacts(t *testing.T) {
 		filepath.Join(env.Root, ".mcp.json"),
 		filepath.Join(env.Root, ".claude", "settings.json"),
 		filepath.Join(env.Root, ".claude", "settings.local.json"),
+		filepath.Join(env.Root, "AGENTS.md"),
 		filepath.Join(env.Root, "CLAUDE.md"),
 	}
 	for _, s := range env.GeneratedSkills {
@@ -116,11 +117,18 @@ func TestClaudeCodeProjectModeCreatesCanonicalArtifacts(t *testing.T) {
 		}
 	}
 
-	// CLAUDE.md must contain the communities-block markers (since
-	// the stub SkillsRouting routes through UpsertMarkedBlock).
+	// Community routing has one canonical copy in AGENTS.md. CLAUDE.md
+	// imports it rather than carrying a second generated block.
+	agentsMd, _ := os.ReadFile(filepath.Join(env.Root, "AGENTS.md"))
+	if !strings.Contains(string(agentsMd), agents.CommunitiesStartMarker) {
+		t.Fatalf("AGENTS.md missing communities start marker: %s", agentsMd)
+	}
 	claudeMd, _ := os.ReadFile(filepath.Join(env.Root, "CLAUDE.md"))
-	if !strings.Contains(string(claudeMd), agents.CommunitiesStartMarker) {
-		t.Fatalf("CLAUDE.md missing communities start marker: %s", claudeMd)
+	if strings.Count(string(claudeMd), projectAgentsImport) != 1 {
+		t.Fatalf("CLAUDE.md must import AGENTS.md exactly once: %s", claudeMd)
+	}
+	if strings.Contains(string(claudeMd), agents.CommunitiesStartMarker) {
+		t.Fatalf("CLAUDE.md unexpectedly duplicates communities block: %s", claudeMd)
 	}
 
 	// Hooks file must reference our test hook command.
