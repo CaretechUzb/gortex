@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -107,6 +108,43 @@ func TestGatherExploreQuotedContentCandidatesUsesBoundedWidePages(t *testing.T) 
 	require.Len(t, candidates, len(terms))
 	require.Equal(t, []int{24, 24, 24, 24, 24, 24}, store.searchLimits)
 	require.Equal(t, 1, store.graphLookups, "all term pages must share one graph lookup")
+}
+
+func TestGatherExploreContentCandidatesForBareTermsUsesSharedBounds(t *testing.T) {
+	hits := map[string][]graph.ContentHit{
+		"DISKFULL": {{
+			NodeID: "demo/storage.go::persist", FilePath: "demo/storage.go",
+			Snippet: `return errors.New("DISKFULL")`,
+		}},
+	}
+	server, store := newQuotedRecallCountingServer(t, hits)
+	candidates := server.gatherExploreContentCandidatesForTerms(
+		context.Background(), "the daemon emits DISKFULL while persisting", []string{"DISKFULL"}, nil, 72,
+		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+	)
+
+	require.Equal(t, []int{exploreQuotedRecallMaxPerTerm}, store.searchLimits)
+	require.Equal(t, 1, store.graphLookups)
+	exact := candidateByID(candidates, "demo/storage.go::persist")
+	require.NotNil(t, exact)
+	require.Equal(t, float64(1), exact.Signals[exploreContentRecallExactSignal])
+}
+
+func TestGatherExploreContentCandidatesForBareTermsCapsSearchesAndHydratesOnce(t *testing.T) {
+	terms := []string{"ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO"}
+	hits := make(map[string][]graph.ContentHit, len(terms))
+	for _, term := range terms {
+		hits[term] = quotedRecallHits(term, exploreQuotedRecallMaxPerTerm, -1)
+	}
+	server, store := newQuotedRecallCountingServer(t, hits)
+	candidates := server.gatherExploreContentCandidatesForTerms(
+		context.Background(), strings.Join(terms, " "), terms, nil, 72,
+		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+	)
+
+	require.NotEmpty(t, candidates)
+	require.LessOrEqual(t, len(store.searchLimits), exploreBareLiteralMaxTerms+1)
+	require.Equal(t, 1, store.graphLookups, "all bare term pages must share one graph lookup")
 }
 
 func TestGatherExploreQuotedContentCandidatesRetriesOneSaturatedTermWithinBounds(t *testing.T) {

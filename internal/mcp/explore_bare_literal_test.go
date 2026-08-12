@@ -5,6 +5,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
 func TestExploreBareLiteralRecallTermsKeepsDiagnosticTail(t *testing.T) {
@@ -49,4 +52,40 @@ func TestExploreBareLiteralRecallTermsDoesNotCreateQuotedClaims(t *testing.T) {
 	require.NotEmpty(t, exploreBareLiteralRecallTerms(task))
 	require.Empty(t, exploreQuotedRecallTerms(task))
 	require.Empty(t, exploreQuotedRecallClaimTerms(task))
+}
+
+func TestExploreBareLiteralLaneEligibleOnlyForUnanchoredConcepts(t *testing.T) {
+	unanchoredTask := "Recovery loses the registry entry during rollback"
+	require.True(t, exploreBareLiteralLaneEligible(
+		unanchoredTask, unanchoredTask, true, false, nil, nil,
+	))
+
+	explicit := []*rerank.Candidate{{Node: &graph.Node{
+		ID: "demo/registry.go::FlushRegistry", Name: "FlushRegistry",
+		Kind: graph.KindFunction, FilePath: "demo/registry.go",
+	}}}
+	cases := []struct {
+		name          string
+		task          string
+		query         string
+		concept       bool
+		artifactReady bool
+		candidates    []*rerank.Candidate
+		protected     map[int]string
+	}{
+		{name: "quoted", task: `recovery logs "registry entry missing"`, query: unanchoredTask, concept: true},
+		{name: "path", task: unanchoredTask, query: "fix src/cache.go during recovery", concept: true},
+		{name: "ranked explicit call", task: unanchoredTask, query: "FlushRegistry() loses entries", concept: true, candidates: explicit},
+		{name: "protected syntax", task: unanchoredTask, query: unanchoredTask, concept: true, protected: map[int]string{0: "node"}},
+		{name: "artifact ready", task: unanchoredTask, query: unanchoredTask, concept: true, artifactReady: true},
+		{name: "non concept", task: unanchoredTask, query: unanchoredTask},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			require.False(t, exploreBareLiteralLaneEligible(
+				test.task, test.query, test.concept, test.artifactReady,
+				test.candidates, test.protected,
+			))
+		})
+	}
 }

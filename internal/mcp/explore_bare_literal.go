@@ -5,6 +5,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
 const (
@@ -294,4 +296,40 @@ func exploreBareLiteralRepresentedByAnchor(term string, anchors []exploreSyntact
 		}
 	}
 	return false
+}
+
+func exploreHasExplicitCandidateTarget(query string, candidates []*rerank.Candidate) bool {
+	if _, hasPath := exploreQueryPathAnchors(query); hasPath {
+		return true
+	}
+	for _, candidate := range candidates {
+		if candidate != nil && candidate.Node != nil &&
+			exploreLocalizationExplicitAnchor(query, candidate.Node) {
+			return true
+		}
+	}
+	return false
+}
+
+// exploreLiteralEvidenceEligible is the shared admission and seating gate for
+// inferred source literals. Keeping both decisions behind one predicate makes
+// anchored tasks a strict no-op and prevents a retrieved bare term from later
+// taking a PRIMARY seat under different rules.
+func exploreLiteralEvidenceEligible(
+	query string,
+	candidates []*rerank.Candidate,
+	protectedSyntacticAnchors map[int]string,
+) bool {
+	return len(protectedSyntacticAnchors) == 0 &&
+		!exploreHasExplicitCandidateTarget(query, candidates)
+}
+
+func exploreBareLiteralLaneEligible(
+	task, query string,
+	conceptTask, artifactReady bool,
+	candidates []*rerank.Candidate,
+	protectedSyntacticAnchors map[int]string,
+) bool {
+	return conceptTask && !artifactReady && len(exploreQuotedRecallTerms(task)) == 0 &&
+		exploreLiteralEvidenceEligible(query, candidates, protectedSyntacticAnchors)
 }

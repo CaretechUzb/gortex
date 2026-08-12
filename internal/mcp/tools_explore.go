@@ -2778,6 +2778,20 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			ranked = mergeExploreCandidates(ranked, anchorCandidates, fetch)
 		}
 	}
+	// Only an unanchored concept task may infer bare source literals. Quoted
+	// literals, artifact evidence, explicit paths/names, and protected syntax
+	// already have stronger bounded lanes and make this path a strict no-op.
+	if exploreBareLiteralLaneEligible(
+		task, searchQuery, queryClass == rerank.QueryClassConcept, artifactLane.ready,
+		ranked, protectedSyntacticAnchors,
+	) {
+		terms := exploreBareLiteralRecallTerms(task)
+		if content := s.gatherExploreContentCandidatesForTerms(ctx, task, terms, ranked, fetch, opts); len(content) > 0 {
+			ranked = mergeExploreCandidates(ranked, content, 0)
+			ranked = limitExploreCandidatesPreservingSourceLiteral(ranked, fetch*2)
+			ranked = rerankExploreConceptCoverage(searchQuery, ranked)
+		}
+	}
 	// Exact source citations in issue bodies are stronger than semantic ranking:
 	// map each bounded file/line range to its smallest enclosing declaration and
 	// place those task-spelled candidates at the head before final selection.
@@ -2902,20 +2916,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		Depth: 1, Limit: exploreRingCap * 3, Detail: "brief",
 		WorkspaceID: resolved.WorkspaceID, ProjectID: resolved.ProjectID, RepoAllow: resolved.RepoAllow,
 	}
-	explicitTarget := false
-	if _, hasPath := exploreQueryPathAnchors(searchQuery); hasPath {
-		explicitTarget = true
-	}
-	if !explicitTarget {
-		for _, c := range cands {
-			if c != nil && c.Node != nil && exploreLocalizationExplicitAnchor(searchQuery, c.Node) {
-				explicitTarget = true
-				break
-			}
-		}
-	}
+	explicitTarget := exploreHasExplicitCandidateTarget(searchQuery, cands)
 	artifactTargets := artifactLane.targets
-	literalPrimaryEligible := !explicitTarget && len(protectedSyntacticAnchors) == 0
+	literalPrimaryEligible := exploreLiteralEvidenceEligible(searchQuery, cands, protectedSyntacticAnchors)
 	targets := make([]exploreTarget, 0, len(artifactTargets)+len(cands))
 	// Artifact evidence leads only when the strong classifier activated its
 	// lane. Ordinary source localization retains the exact prior target order.
@@ -5540,11 +5543,25 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 	limit int,
 	scope query.QueryOptions,
 ) []*rerank.Candidate {
+	return s.gatherExploreContentCandidatesForTerms(
+		ctx, task, exploreQuotedRecallTerms(task), ordinary, limit, scope,
+	)
+}
+
+// gatherExploreContentCandidatesForTerms is the shared bounded content path for
+// authored quoted literals and the separately-gated inferred bare lane.
+func (s *Server) gatherExploreContentCandidatesForTerms(
+	ctx context.Context,
+	task string,
+	terms []string,
+	ordinary []*rerank.Candidate,
+	limit int,
+	scope query.QueryOptions,
+) []*rerank.Candidate {
 	if s == nil || s.graph == nil || ctx.Err() != nil {
 		return nil
 	}
 	content, hasContent := s.graph.(graph.ContentSearcher)
-	terms := exploreQuotedRecallTerms(task)
 	if len(terms) == 0 {
 		return nil
 	}
