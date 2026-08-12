@@ -1166,3 +1166,13 @@ func ConfidenceLabelFor(kind EdgeKind, confidence float64) string {
 		return "INFERRED"
 	}
 }
+
+// MetaGenericInstantiation is the edge Meta key marking a call whose
+// callee spelled explicit type arguments. Some grammars cannot separate
+// that from unrelated constructs — Go writes `Zero[int]()` exactly like
+// indexing a func-valued map and `One[int](1)` exactly like converting
+// to a generic type — so the extractor emits all of them and records
+// which ones claimed to be instantiations. A resolver may then bind such
+// an edge only to a declaration that really is generic, which is the one
+// property a true instantiation guarantees and the impostors never have.
+const MetaGenericInstantiation = "generic_instantiation"

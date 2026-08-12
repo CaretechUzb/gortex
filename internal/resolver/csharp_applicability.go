@@ -1,6 +1,8 @@
 package resolver
 
 import (
+	"strings"
+
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -142,15 +144,22 @@ func csharpExtensionAcceptsArgCount(e *graph.Edge, c *graph.Node) bool {
 // through its declaring class (`BagExt.Add(bag)`) rather than on a
 // receiver value (`bag.Add()`).
 //
-// The extractor stamps receiver_name only for a bare receiver that no
-// local, parameter or builtin in scope explains — so a receiver_name
-// equal to the candidate's own declaring class is a type reference, not
-// a shadowing variable. Any receiver the extractor DID type is a value
-// by construction, and carries no receiver_name at all.
+// The extractor stamps receiver_name only for a receiver that no local,
+// parameter, builtin or chain walk explains — so a receiver_name whose
+// trailing segment is the candidate's own declaring class is a type
+// reference, not a shadowing variable. Any receiver the extractor DID
+// type is a value by construction, and carries no receiver_name at all.
+//
+// The trailing segment is what matters because the class may be written
+// namespace-qualified: `Lib.BagExt.Add(bag)` and `BagExt.Add(bag)` are
+// the same call and must reach the same overload.
 func csharpCallIsStaticForm(e *graph.Edge, c *graph.Node) bool {
 	recv, _ := e.Meta["receiver_name"].(string)
 	if recv == "" {
 		return false
+	}
+	if i := strings.LastIndex(recv, "."); i >= 0 {
+		recv = recv[i+1:]
 	}
 	owner, _ := c.Meta["receiver"].(string)
 	return owner != "" && recv == owner

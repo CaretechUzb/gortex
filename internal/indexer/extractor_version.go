@@ -32,9 +32,9 @@ var extractorVersions = map[string]int{
 	//   "go": 2,
 	"c":      generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
 	"php":    2,                                      // class/interface inheritance now emits typed structural edges
-	"csharp": 9,                                      // generic invocations emit call edges (was: interface base lists emit extends edges)
+	"csharp": 10,                                     // qualified static-form extension calls pick the right overload (was: generic invocations emit call edges)
 	"scala":  2,                                      // explicitly instantiated generic calls emit call edges
-	"go":     2,                                      // explicitly instantiated generic calls emit call edges
+	"go":     3,                                      // generic instantiations are marked so indexing a func value cannot bind (was: generic calls emit call edges)
 	"cpp":    2,                                      // templated and namespace-qualified calls emit call edges
 	"swift":  2,                                      // generic calls and ordinary member calls emit call edges
 }
