@@ -106,7 +106,7 @@ func TestExploreExactQualifiedAnchorCandidateFindsParserName(t *testing.T) {
 	})
 	server := &Server{graph: g}
 	got := server.exploreExactQualifiedAnchorCandidate(
-		context.Background(), anchors[1], query.QueryOptions{},
+		context.Background(), anchors[1], nil, query.QueryOptions{},
 		map[string]struct{}{}, map[string]struct{}{},
 	)
 	if got == nil || got.Node == nil {

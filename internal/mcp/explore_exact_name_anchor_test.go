@@ -37,7 +37,7 @@ func TestExploreTaskAnchorsAdmitLowercaseProseSymbolName(t *testing.T) {
 		t.Fatalf("anchor compact = %q, want vprintf", anchors[0].compact)
 	}
 	got := server.exploreExactAnchorCandidate(
-		context.Background(), anchors[0], query.QueryOptions{},
+		context.Background(), anchors[0], nil, query.QueryOptions{},
 		map[string]struct{}{}, map[string]struct{}{},
 	)
 	if got == nil || got.Node == nil || got.Node.ID != vprintf.ID {
@@ -188,7 +188,7 @@ func TestExploreDottedQualifiedMentionResolvesMemberAndOwner(t *testing.T) {
 		t.Fatalf("anchors = %#v, want the dotted qualified member", anchors)
 	}
 	got := server.exploreExactAnchorCandidate(
-		context.Background(), anchors[0], query.QueryOptions{},
+		context.Background(), anchors[0], nil, query.QueryOptions{},
 		map[string]struct{}{}, map[string]struct{}{},
 	)
 	if got == nil || got.Node == nil || got.Node.ID != member.ID {

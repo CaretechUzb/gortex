@@ -19,6 +19,9 @@ const (
 	exploreSyntacticAnchorMaxTerms         = 3
 	exploreSyntacticAnchorFetch            = 10
 	exploreSyntacticAnchorCompetitionFetch = 32
+	// A qualified leaf may inspect only the first four ranked files that
+	// contain an exact owner declaration.
+	exploreQualifiedLeafMaxFiles = 4
 )
 
 // exploreSyntacticAnchor is a bounded, implementation-shaped clue copied
@@ -799,16 +802,21 @@ func exploreSyntacticAnchorReusesProtected(
 // exploreExactQualifiedAnchorCandidate resolves the parser's exact member name
 // before the bounded lexical lane. Graph nodes commonly store only the terminal
 // method Name while the ID tail carries Owner.member, so query both exact forms.
-// This lookup is restricted to explicit Owner::member task syntax and still
-// applies session, query, kind, and diversity filters through the ordinary
-// anchor selector.
+// If those exact point lookups cannot select a qualified node, one final lane
+// may inspect up to four already-ranked files that contain an exact owner
+// declaration. It never performs a substring or corpus-wide scan.
 func (s *Server) exploreExactQualifiedAnchorCandidate(
 	ctx context.Context,
 	anchor exploreSyntacticAnchor,
+	ordinary []*rerank.Candidate,
 	scope query.QueryOptions,
 	usedIDs, usedFiles map[string]struct{},
 ) *rerank.Candidate {
-	if s == nil || s.graph == nil || anchor.qualifiedName == "" || ctx.Err() != nil {
+	if s == nil || anchor.qualifiedName == "" || ctx.Err() != nil {
+		return nil
+	}
+	reader := s.readerFor(ctx)
+	if reader == nil {
 		return nil
 	}
 	names := []string{anchor.qualifiedName}
@@ -818,7 +826,7 @@ func (s *Server) exploreExactQualifiedAnchorCandidate(
 	candidates := make([]*rerank.Candidate, 0, exploreSyntacticAnchorFetch)
 	seen := make(map[string]struct{}, exploreSyntacticAnchorFetch)
 	for _, name := range names {
-		for _, node := range s.graph.FindNodesByName(name) {
+		for _, node := range reader.FindNodesByName(name) {
 			if node == nil || !s.nodeInSessionScope(ctx, node) {
 				continue
 			}
@@ -835,7 +843,10 @@ func (s *Server) exploreExactQualifiedAnchorCandidate(
 			break
 		}
 	}
-	return exploreSyntacticAnchorCandidate(anchor, candidates, scope, usedIDs, usedFiles)
+	if candidate := exploreSyntacticAnchorCandidate(anchor, candidates, scope, usedIDs, usedFiles); candidate != nil {
+		return candidate
+	}
+	return s.exploreQualifiedLeafCandidate(ctx, reader, anchor, ordinary, scope, usedIDs, usedFiles)
 }
 
 // gatherExploreSyntacticAnchorCandidates performs a tiny lexical retrieval for
@@ -928,7 +939,7 @@ func (s *Server) gatherExploreSyntacticAnchorCandidatesCollecting(
 			protected[index] = reused
 			continue
 		}
-		if exactCandidate := s.exploreExactAnchorCandidate(ctx, anchor, scope, usedIDs, usedFiles); exactCandidate != nil {
+		if exactCandidate := s.exploreExactAnchorCandidate(ctx, anchor, ordinary, scope, usedIDs, usedFiles); exactCandidate != nil {
 			protectedCandidate, pooled := exploreAnchorPoolCandidate(ordinary, exactCandidate)
 			if !pooled {
 				additions = append(additions, protectedCandidate)

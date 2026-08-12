@@ -50,7 +50,7 @@ func TestExploreTaskAnchorsResolveExactNameOnlyInsideFence(t *testing.T) {
 	require.Len(t, anchors[0].exactNodes, 1)
 
 	got := server.exploreExactAnchorCandidate(
-		context.Background(), anchors[0], query.QueryOptions{},
+		context.Background(), anchors[0], nil, query.QueryOptions{},
 		map[string]struct{}{}, map[string]struct{}{},
 	)
 	require.NotNil(t, got)

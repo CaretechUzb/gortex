@@ -413,6 +413,7 @@ func exploreIdentifierSegment(segment string) bool {
 func (s *Server) exploreExactAnchorCandidate(
 	ctx context.Context,
 	anchor exploreSyntacticAnchor,
+	ordinary []*rerank.Candidate,
 	scope query.QueryOptions,
 	usedIDs, usedFiles map[string]struct{},
 ) *rerank.Candidate {
@@ -425,7 +426,7 @@ func (s *Server) exploreExactAnchorCandidate(
 			return got
 		}
 	}
-	return s.exploreExactQualifiedAnchorCandidate(ctx, anchor, scope, usedIDs, usedFiles)
+	return s.exploreExactQualifiedAnchorCandidate(ctx, anchor, ordinary, scope, usedIDs, usedFiles)
 }
 
 // exploreQualifiedAnchorOwnerCandidate resolves the declaring type named by a
