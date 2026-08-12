@@ -47,8 +47,8 @@ func spawnBareDaemon() error { return spawnDetachedDaemon(nil) }
 
 // resolveDaemonDecision probes the socket and, when auto-start is enabled
 // and no daemon is up, single-flights a spawn. It never returns an error;
-// an unrecoverable state collapses to daemonUnavailable so the caller
-// falls back to the embedded server.
+// an unrecoverable state collapses to daemonUnavailable so the caller can
+// apply the machine-level embedded-mode policy.
 func resolveDaemonDecision() daemonDecision {
 	return ensureDaemonReady(daemon.ParseAutostart())
 }
@@ -64,8 +64,8 @@ func ensureDaemonReady(autostart bool) daemonDecision {
 	}
 	// Respect an explicit `daemon stop`: do not resurrect a daemon the user
 	// deliberately stopped. The mark is cleared by `daemon start` / `restart`.
-	// A suppressed `gortex mcp` falls back to the embedded server, so this
-	// declines the background daemon without breaking the tool surface.
+	// A suppressed `gortex mcp` either uses an explicitly allowed embedded
+	// server or exits, so this never overrides the user's stay-down intent.
 	if stopIntentActive() {
 		return daemonUnavailable
 	}

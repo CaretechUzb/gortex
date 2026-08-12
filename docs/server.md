@@ -18,7 +18,8 @@ gortex daemon start --http-addr 127.0.0.1:7411
 # Non-localhost bind requires an auth token
 gortex daemon start --http-addr 0.0.0.0:7411 --http-auth-token "$(openssl rand -hex 32)"
 
-# HTTP API alongside MCP stdio (same process)
+# Optional one-shot HTTP API alongside MCP stdio; first enable
+# mcp.allow_embedded in the user-level config.
 gortex mcp --index /path/to/repo --server --port 8765
 ```
 

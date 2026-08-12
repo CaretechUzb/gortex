@@ -67,8 +67,9 @@ var daemonCmd = &cobra.Command{
 MCP client (Claude Code, Cursor, Kiro, ...) plus the CLI from one shared
 index.
 
-If no daemon is running, ` + "`gortex mcp`" + ` still works standalone — the daemon
-is additive, not required.`,
+` + "`gortex mcp`" + ` connects to and may auto-start this daemon. If no compatible
+daemon is available, it exits unless ` + "`mcp.allow_embedded`" + ` is enabled
+in the user-level config.`,
 }
 
 // RunE is wired in init() rather than here: runDaemonStart reaches back for

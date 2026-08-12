@@ -3,6 +3,8 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"net"
+	"syscall"
 	"testing"
 )
 
@@ -24,5 +26,23 @@ func TestProtocolFallbackEmbedded(t *testing.T) {
 	}
 	if ShouldFallBackToEmbedded(nil) {
 		t.Error("nil must not trigger fallback")
+	}
+}
+
+func TestClassifyDaemonProbeError(t *testing.T) {
+	missing := classifyDaemonProbeError(&net.OpError{Op: "dial", Net: "unix", Err: syscall.ENOENT})
+	if !errors.Is(missing, ErrDaemonUnavailable) {
+		t.Fatalf("missing socket error = %v, want ErrDaemonUnavailable", missing)
+	}
+	if !ShouldFallBackToEmbedded(missing) {
+		t.Fatal("a missing socket must permit the configured embedded fallback")
+	}
+
+	permission := classifyDaemonProbeError(&net.OpError{Op: "dial", Net: "unix", Err: syscall.EACCES})
+	if !errors.Is(permission, syscall.EACCES) {
+		t.Fatalf("permission error = %v, want EACCES", permission)
+	}
+	if ShouldFallBackToEmbedded(permission) {
+		t.Fatal("a socket permission failure must not permit embedded fallback")
 	}
 }
