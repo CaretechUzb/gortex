@@ -3040,7 +3040,8 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	targets = s.materializeExploreStructuralSource(ctx, task, targets, opts)
 
 	if !localize {
-		return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
+		pageOutline := s.exploreTaskPageOutline(task, targets)
+		return mcp.NewToolResultText(s.renderExploreTask(task, targets, budget, pageOutline)), nil
 	}
 	declarations := newLocalizationFileDeclarationCache(eng.Reader())
 	symbolTargets = targets[len(artifactTargets):]
