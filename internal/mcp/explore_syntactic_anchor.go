@@ -887,6 +887,18 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 	scope query.QueryOptions,
 	rctx *rerank.Context,
 ) ([]*rerank.Candidate, map[int]string) {
+	return s.gatherExploreSyntacticAnchorCandidatesCollecting(ctx, task, ordinary, eng, scope, rctx, nil)
+}
+
+func (s *Server) gatherExploreSyntacticAnchorCandidatesCollecting(
+	ctx context.Context,
+	task string,
+	ordinary []*rerank.Candidate,
+	eng *query.Engine,
+	scope query.QueryOptions,
+	rctx *rerank.Context,
+	collector *localizationSourceWindowHitCollector,
+) ([]*rerank.Candidate, map[int]string) {
 	if s == nil || s.graph == nil || eng == nil || ctx.Err() != nil {
 		return nil, nil
 	}
@@ -1034,6 +1046,12 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 		}
 		if selected == nil {
 			continue
+		}
+		for _, hit := range recall.hits {
+			if hit.anchor == localIndex && hit.nodeID == selected.ID && hit.rank == selectedRank {
+				collector.add(hit)
+				break
+			}
 		}
 		sourceRank := 1.0
 		if selectedRank > 0 {

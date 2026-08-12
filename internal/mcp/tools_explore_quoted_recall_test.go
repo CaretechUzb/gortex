@@ -130,6 +130,34 @@ func TestGatherExploreContentCandidatesForBareTermsUsesSharedBounds(t *testing.T
 	require.Equal(t, float64(1), exact.Signals[exploreContentRecallExactSignal])
 }
 
+func TestSourceWindowCollectionAddsNoContentSearchOrGraphLookup(t *testing.T) {
+	hits := map[string][]graph.ContentHit{
+		"needle": {{
+			NodeID: "demo/needle.go::candidate", FilePath: "demo/needle.go",
+			Snippet: `register("needle")`,
+		}},
+	}
+	ordinary := []*rerank.Candidate{{Node: &graph.Node{
+		ID: "demo/owner.go::needle", Name: "needle", Kind: graph.KindFunction,
+		FilePath: "demo/owner.go", RepoPrefix: "demo",
+	}}}
+	baselineServer, baselineStore := newQuotedRecallCountingServer(t, hits)
+	baseline := baselineServer.gatherExploreQuotedContentCandidates(
+		context.Background(), `find "needle"`, ordinary, 12, query.QueryOptions{},
+	)
+	collectingServer, collectingStore := newQuotedRecallCountingServer(t, hits)
+	collector := &localizationSourceWindowHitCollector{}
+	collected := collectingServer.gatherExploreQuotedContentCandidatesCollecting(
+		context.Background(), `find "needle"`, ordinary, 12, query.QueryOptions{}, collector,
+	)
+
+	require.Equal(t, baselineStore.searchLimits, collectingStore.searchLimits)
+	require.Equal(t, baselineStore.searchRows, collectingStore.searchRows)
+	require.Equal(t, baselineStore.graphLookups, collectingStore.graphLookups)
+	require.Equal(t, len(baseline), len(collected))
+	require.Empty(t, collector.hits, "content metadata without an existing trigram coordinate cannot fabricate a window")
+}
+
 func TestGatherExploreContentCandidatesForBareTermsCapsSearchesAndHydratesOnce(t *testing.T) {
 	terms := []string{"ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO"}
 	hits := make(map[string][]graph.ContentHit, len(terms))

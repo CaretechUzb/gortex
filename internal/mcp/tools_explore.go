@@ -103,6 +103,7 @@ type exploreTarget struct {
 	causalChangeLeaf       bool   // graph-proven wrapper implementation or task-aligned cross-file change callable
 	causalChangeOwner      bool   // same-file type that encloses or is uniquely returned by the causal change callable
 	source                 string // full body (may be empty for non-source kinds)
+	sourceWindow           *localizationSourceWindow
 	divergentDefaultOwner  bool   // unique child constructor whose concrete default causes the queried behavior
 	divergentDefaultType   bool   // owning type paired with divergentDefaultOwner for coherent file/symbol output
 	conceptImplementation  bool   // primary identifier-backed callable; may establish answer readiness
@@ -2665,6 +2666,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// paths, keys, flags, and environment names needed by config/CI searches.
 	artifactIntent := classifyExploreArtifactIntent(task)
 	localize := req.GetBool("localize", false)
+	var sourceWindowHits *localizationSourceWindowHitCollector
+	if localize {
+		sourceWindowHits = &localizationSourceWindowHitCollector{}
+	}
 	// The same ranked spans, derived once, applied to source candidate paths.
 	// Ordinary exploration keeps the zero value and so corroborates nothing.
 	var pathProbes explorePathProbes
@@ -2741,7 +2746,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// graph-aware reranker: its centrality and edge hydration costs scale
 		// with every candidate, not just the final response size.
 		ranked = limitExploreCandidates(ranked, fetch*2)
-		if content := s.gatherExploreQuotedContentCandidates(ctx, task, ranked, fetch, opts); len(content) > 0 {
+		if content := s.gatherExploreQuotedContentCandidatesCollecting(ctx, task, ranked, fetch, opts, sourceWindowHits); len(content) > 0 {
 			ranked = mergeExploreCandidates(ranked, content, 0)
 			ranked = limitExploreCandidatesPreservingSourceLiteral(ranked, fetch*2)
 		}
@@ -2758,7 +2763,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// supplies at most one candidate per matching file, and the final
 		// source-evidence reservation keeps its strongest result without
 		// reranking the already-ranked primary channel a second time.
-		if content := s.gatherExploreQuotedContentCandidates(ctx, task, ranked, fetch, opts); len(content) > 0 {
+		if content := s.gatherExploreQuotedContentCandidatesCollecting(ctx, task, ranked, fetch, opts, sourceWindowHits); len(content) > 0 {
 			ranked = mergeExploreCandidates(ranked, content, 0)
 			ranked = limitExploreCandidatesPreservingSourceLiteral(ranked, fetch*2)
 		}
@@ -2770,8 +2775,8 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// index.
 	var protectedSyntacticAnchors map[int]string
 	if queryClass == rerank.QueryClassConcept {
-		anchorCandidates, protected := s.gatherExploreSyntacticAnchorCandidates(
-			ctx, task, ranked, eng, opts, rctx,
+		anchorCandidates, protected := s.gatherExploreSyntacticAnchorCandidatesCollecting(
+			ctx, task, ranked, eng, opts, rctx, sourceWindowHits,
 		)
 		protectedSyntacticAnchors = protected
 		if len(anchorCandidates) > 0 {
@@ -2786,7 +2791,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		ranked, protectedSyntacticAnchors,
 	) {
 		terms := exploreBareLiteralRecallTerms(task)
-		if content := s.gatherExploreContentCandidatesForTerms(ctx, task, terms, ranked, fetch, opts); len(content) > 0 {
+		if content := s.gatherExploreContentCandidatesForTermsCollecting(ctx, task, terms, ranked, fetch, opts, sourceWindowHits); len(content) > 0 {
 			ranked = mergeExploreCandidates(ranked, content, 0)
 			ranked = limitExploreCandidatesPreservingSourceLiteral(ranked, fetch*2)
 			ranked = rerankExploreConceptCoverage(searchQuery, ranked)
@@ -3082,6 +3087,11 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			return s.hydrateExploreLeadingFileDepthTarget(ctx, eng, node, ringOpts)
 		},
 	)
+	if index, hit, ok := sourceWindowHits.elect(pageTargets); ok {
+		if pageTargets[index].node != nil {
+			pageTargets[index].sourceWindow = s.localizationSourceWindowForHit(ctx, hit, pageTargets[index].node.ID)
+		}
+	}
 	targets = append(targets[:len(artifactTargets):len(artifactTargets)], pageTargets...)
 	// The same leading file, indexed rather than ranked. The enumeration is
 	// deferred: only a page that stays non-terminal pays for it, and it pays
@@ -3197,8 +3207,9 @@ type localizationExploreEnvelope struct {
 	// Outline indexes the page's leading file; Outlines indexes the page's
 	// further files, deepest first. The split keeps the leading file where
 	// consumers already read it.
-	Outline  *localizationFileOutline   `json:"outline,omitempty"`
-	Outlines []*localizationFileOutline `json:"outlines,omitempty"`
+	Outline      *localizationFileOutline   `json:"outline,omitempty"`
+	Outlines     []*localizationFileOutline `json:"outlines,omitempty"`
+	SourceWindow *localizationSourceWindow  `json:"source_window,omitempty"`
 }
 
 type localizationEvidence struct {
@@ -4492,6 +4503,9 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 	// index. A trade that ends with no index bought nothing, so it is undone.
 	var untraded []localizationEvidence
 	for !localizationEnvelopeFits(envelope, shedBudget) {
+		if localizationShedSourceWindow(&envelope) {
+			continue
+		}
 		block := &localizationPageOutline{Leading: envelope.Outline, Others: envelope.Outlines}
 		if !block.empty() {
 			// The outlines are a convenience over rows the caller can still
@@ -4568,6 +4582,13 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 		envelope.Evidence[shed].Source = ""
 	}
 	envelope, digest = promoteLocalizationBodyMentions(task, envelope, declarations, shedBudget, digest)
+	for _, target := range acceptedTargets {
+		if target.sourceWindow == nil {
+			continue
+		}
+		envelope = localizationEnvelopePackingSourceWindow(envelope, target.sourceWindow, maxBytes)
+		break
+	}
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil, nil, envelope.Completion
@@ -5576,8 +5597,19 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 	limit int,
 	scope query.QueryOptions,
 ) []*rerank.Candidate {
-	return s.gatherExploreContentCandidatesForTerms(
-		ctx, task, exploreQuotedRecallTerms(task), ordinary, limit, scope,
+	return s.gatherExploreQuotedContentCandidatesCollecting(ctx, task, ordinary, limit, scope, nil)
+}
+
+func (s *Server) gatherExploreQuotedContentCandidatesCollecting(
+	ctx context.Context,
+	task string,
+	ordinary []*rerank.Candidate,
+	limit int,
+	scope query.QueryOptions,
+	collector *localizationSourceWindowHitCollector,
+) []*rerank.Candidate {
+	return s.gatherExploreContentCandidatesForTermsCollecting(
+		ctx, task, exploreQuotedRecallTerms(task), ordinary, limit, scope, collector,
 	)
 }
 
@@ -5590,6 +5622,18 @@ func (s *Server) gatherExploreContentCandidatesForTerms(
 	ordinary []*rerank.Candidate,
 	limit int,
 	scope query.QueryOptions,
+) []*rerank.Candidate {
+	return s.gatherExploreContentCandidatesForTermsCollecting(ctx, task, terms, ordinary, limit, scope, nil)
+}
+
+func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
+	ctx context.Context,
+	task string,
+	terms []string,
+	ordinary []*rerank.Candidate,
+	limit int,
+	scope query.QueryOptions,
+	collector *localizationSourceWindowHitCollector,
 ) []*rerank.Candidate {
 	if s == nil || s.graph == nil || ctx.Err() != nil {
 		return nil
@@ -5679,6 +5723,7 @@ func (s *Server) gatherExploreContentCandidatesForTerms(
 	sourceLiteralSettled := make(map[string]bool)
 	sourceLiteralCallee := make(map[string]bool)
 	sourceLiteralTaskAligned := make(map[string]bool)
+	sourceLiteralCoordinates := make(map[string][]exploreSourceLiteralHit)
 	for _, page := range pages {
 		seenForTerm := make(map[string]struct{}, len(page.hits))
 		exactIDs := make(map[string]struct{})
@@ -5744,6 +5789,7 @@ func (s *Server) gatherExploreContentCandidatesForTerms(
 		sourceRecall := s.gatherExploreSourceLiteralRecall(ctx, sourceRecallTerms, repoPrefix, scope)
 		missingNodes := make([]string, 0, len(sourceRecall.hits))
 		for _, hit := range sourceRecall.hits {
+			sourceLiteralCoordinates[hit.nodeID] = append(sourceLiteralCoordinates[hit.nodeID], hit)
 			if previous, exists := bestRank[hit.nodeID]; !exists {
 				order = append(order, hit.nodeID)
 				bestRank[hit.nodeID] = hit.rank
@@ -5834,6 +5880,7 @@ func (s *Server) gatherExploreContentCandidatesForTerms(
 			}
 		}
 		if sourceRank := sourceLiteralHit[id]; sourceRank > 0 {
+			collector.add(sourceLiteralCoordinates[id]...)
 			signals[exploreSourceLiteralSignal] = sourceRank
 			signals[exploreSourceLiteralCoverageSignal] = float64(len(sourceLiteralAnchors[id]))
 			if sourceLiteralCallee[id] {

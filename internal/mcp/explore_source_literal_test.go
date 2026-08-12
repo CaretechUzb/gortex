@@ -128,6 +128,21 @@ func sourceLiteralNode(id, name, path string, kind graph.NodeKind, start, end in
 	}
 }
 
+func requireSourceLiteralHitIdentity(t testing.TB, hits []exploreSourceLiteralHit, expected ...exploreSourceLiteralHit) {
+	t.Helper()
+	require.Len(t, hits, len(expected))
+	for index := range expected {
+		require.Equal(t, expected[index].nodeID, hits[index].nodeID)
+		require.Equal(t, expected[index].rank, hits[index].rank)
+		require.Equal(t, expected[index].anchor, hits[index].anchor)
+		require.Equal(t, expected[index].ambiguous, hits[index].ambiguous)
+		require.Equal(t, expected[index].callee, hits[index].callee)
+		require.NotEmpty(t, hits[index].matchPath)
+		require.Positive(t, hits[index].matchLine)
+		require.NotEmpty(t, hits[index].literal)
+	}
+}
+
 func TestExploreSourceLiteralCallNameAcrossLanguages(t *testing.T) {
 	tests := []struct {
 		name string
@@ -179,7 +194,7 @@ func TestMapExploreSourceLiteralMatchesPromotesUniqueDirectCalleeAcrossLanguages
 				Path: path, Line: 3, Text: test.line,
 			}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-			require.Equal(t, []exploreSourceLiteralHit{{nodeID: callee.ID, rank: 0, callee: true}}, recall.hits)
+			requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: callee.ID, rank: 0, callee: true})
 			require.Equal(t, callee.FilePath, recall.ownerFiles[callee.ID])
 			require.Zero(t, counting.allNodesCalls, "callee promotion must remain batch- and file-bounded")
 			require.Equal(t, 1, counting.outEdgeBatchCalls)
@@ -202,7 +217,7 @@ func TestMapExploreSourceLiteralMatchesDoesNotPromoteAmbiguousCallee(t *testing.
 		Path: path, Line: 3, Text: `RegisterDefaultFormatter("ku");`,
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: owner.ID, rank: 0}}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: owner.ID, rank: 0})
 }
 
 func TestMapExploreSourceLiteralMatchesDoesNotPromoteAssignment(t *testing.T) {
@@ -217,8 +232,7 @@ func TestMapExploreSourceLiteralMatchesDoesNotPromoteAssignment(t *testing.T) {
 		Path: path, Line: 3, Text: `const locale = "ku";`,
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: owner.ID, rank: 0}}, recall.hits,
-		"an unrelated same-line edge must not turn an assignment into a callsite")
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: owner.ID, rank: 0})
 	require.Zero(t, counting.outEdgeBatchCalls, "non-call literal hits must not query graph adjacency")
 	require.Zero(t, counting.nodeLookupBatches, "non-call literal hits must not query callee nodes")
 }
@@ -259,7 +273,7 @@ func TestMapExploreSourceLiteralMatchesFindsCSharpConstructor(t *testing.T) {
 		Path: path, Line: 24, Text: `Register("ku", new CentralKurdishFormatter());`,
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: constructor.ID, rank: 0}}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: constructor.ID, rank: 0})
 	require.False(t, recall.ambiguous)
 }
 
@@ -276,7 +290,7 @@ func TestMapExploreSourceLiteralMatchesFallsBackToSingleRepoUnprefixedPath(t *te
 		Path: matchPath, Line: 24, Text: `RegisterDefaultFormatter("ku");`,
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"humanizer-1059": true}})
 
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: constructor.ID, rank: 0}}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: constructor.ID, rank: 0})
 	require.False(t, recall.ambiguous)
 }
 
@@ -293,7 +307,7 @@ func TestMapExploreSourceLiteralMatchesPrefersExactPathOverAlias(t *testing.T) {
 		Path: matchPath, Line: 24, Text: `RegisterDefaultFormatter("ku");`,
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"humanizer-1059": true}})
 
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: exact.ID, rank: 0}}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: exact.ID, rank: 0})
 }
 
 func TestMapExploreSourceLiteralMatchesQueriesExactPathsBeforeAliases(t *testing.T) {
@@ -316,10 +330,10 @@ func TestMapExploreSourceLiteralMatchesQueriesExactPathsBeforeAliases(t *testing
 	}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
 	require.Equal(t, []string{"demo/src/a.cs", "demo/src/b.cs", "src/a.cs"}, store.calls)
-	require.Equal(t, []exploreSourceLiteralHit{
-		{nodeID: exactB.ID, rank: 0},
-		{nodeID: exactA.ID, rank: 1},
-	}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits,
+		exploreSourceLiteralHit{nodeID: exactB.ID, rank: 0},
+		exploreSourceLiteralHit{nodeID: exactA.ID, rank: 1},
+	)
 	require.True(t, recall.ambiguous)
 }
 
@@ -334,7 +348,7 @@ func TestMapExploreSourceLiteralMatchesChoosesSmallestEnclosingSymbol(t *testing
 		Path: path, Line: 23, Text: `register("ku")`,
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: closure.ID, rank: 0}}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: closure.ID, rank: 0})
 }
 
 func TestMapExploreSourceLiteralMatchesKeepsCommonLiteralNonTerminal(t *testing.T) {
@@ -399,7 +413,7 @@ func TestMapDiscoveredExploreSourceLiteralMatchesPreservesHitsAfterDiscoveryDead
 	)
 
 	require.NoError(t, mappingErr)
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: constructor.ID, rank: 0}}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: constructor.ID, rank: 0})
 	require.True(t, recall.ambiguous, "deadline-truncated discovery must remain non-terminal")
 }
 
@@ -832,6 +846,11 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	require.NotEmpty(t, envelope.Evidence)
 	require.Equal(t, "RegisterDefaultFormatter", envelope.Evidence[0].Name, "invoked source evidence must lead the final localization envelope")
 	require.Equal(t, localizationProvenanceSourceLiteralCallee, envelope.Evidence[0].Provenance)
+	require.NotNil(t, envelope.SourceWindow)
+	require.Equal(t, rel, envelope.SourceWindow.Path)
+	require.Equal(t, 3, envelope.SourceWindow.MatchLine)
+	require.Equal(t, envelope.Evidence[0].ID, envelope.SourceWindow.AnchorSymbol)
+	require.Contains(t, envelope.SourceWindow.Content, `RegisterDefaultFormatter("ku")`)
 	require.Equal(t, localizationStateAnswerReady, envelope.Completion.State)
 	require.True(t, envelope.Terminal)
 	require.True(t, envelope.Completion.Enforceable)

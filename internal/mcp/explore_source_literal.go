@@ -41,6 +41,12 @@ type exploreSourceLiteralHit struct {
 	anchor    int
 	ambiguous bool
 	callee    bool
+	// The exact source-match coordinate is retained request-locally so the
+	// localization envelope may offer one bounded live source window without
+	// repeating the content search. Raw match text is intentionally discarded.
+	matchPath string
+	matchLine int
+	literal   string
 }
 
 type exploreSourceLiteralDiagnostic struct {
@@ -599,7 +605,10 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 			continue
 		}
 		seen[node.ID] = len(hits)
-		hits = append(hits, exploreSourceLiteralHit{nodeID: node.ID, rank: item.rank, callee: calleeResolved})
+		hits = append(hits, exploreSourceLiteralHit{
+			nodeID: node.ID, rank: item.rank, callee: calleeResolved,
+			matchPath: item.match.Path, matchLine: item.match.Line, literal: term,
+		})
 		ownerFiles[node.ID] = node.FilePath
 	}
 	return exploreSourceLiteralRecall{
