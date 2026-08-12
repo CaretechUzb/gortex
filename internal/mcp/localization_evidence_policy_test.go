@@ -39,6 +39,25 @@ func requireLocalizationHostContractMatchesVisible(
 	return host
 }
 
+func TestLocalizationTargetProvenanceSeatsOnlyUnanchoredContentEvidence(t *testing.T) {
+	node := &graph.Node{ID: "repo/service.go::Handle", Name: "Handle", FilePath: "repo/service.go"}
+	weak := exploreTarget{node: node, sourceLiteral: true}
+	if got := localizationTargetProvenance(localizationCompletion{}, weak); got != "" {
+		t.Fatalf("anchored/default literal provenance = %q, want empty", got)
+	}
+
+	weak.literalPrimaryEligible = true
+	if got := localizationTargetProvenance(localizationCompletion{}, weak); got != localizationProvenanceContentLiteral {
+		t.Fatalf("unanchored literal provenance = %q, want %q", got, localizationProvenanceContentLiteral)
+	}
+	proof := localizationStrongEvidenceForCompletion(
+		newLocalizationCompletion(true, ""), []exploreTarget{weak},
+	)
+	if proof.provenance != "" {
+		t.Fatalf("unanchored content seating became strong terminal proof: %#v", proof)
+	}
+}
+
 func TestLocalizationEvidencePolicyHoldsWeakOwnerForOneBoundedCallFromSQLiteCSharpIndex(t *testing.T) {
 	root := t.TempDir()
 	rel := "src/Humanizer/Localisation/Localiser.cs"

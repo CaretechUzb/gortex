@@ -299,6 +299,24 @@ func TestExploreAnswerReadyKeepsQuotedNonExactConceptNonTerminal(t *testing.T) {
 	require.False(t, exploreAnswerReady(`locate locale registry pipeline for "ku"`, []exploreTarget{head}))
 }
 
+func TestLocalizationEvidenceOrdersEligibleLiteralRowsByDistinctMatches(t *testing.T) {
+	semantic := exploreTarget{node: &graph.Node{ID: "repo/semantic.go::Semantic", Name: "Semantic", FilePath: "repo/semantic.go"}}
+	low := exploreTarget{
+		node:          &graph.Node{ID: "repo/low.go::Low", Name: "Low", FilePath: "repo/low.go"},
+		sourceLiteral: true, literalPrimaryEligible: true, literalMatchCount: 1,
+	}
+	high := exploreTarget{
+		node:          &graph.Node{ID: "repo/high.go::High", Name: "High", FilePath: "repo/high.go"},
+		sourceLiteral: true, literalPrimaryEligible: true, literalMatchCount: 3,
+	}
+
+	ordered := localizationEvidenceTargetsFromDraft("find the handler", "", []exploreTarget{semantic, low, high}, nil)
+	require.Len(t, ordered, 3)
+	require.Equal(t, semantic.node.ID, ordered[0].node.ID)
+	require.Equal(t, high.node.ID, ordered[1].node.ID)
+	require.Equal(t, low.node.ID, ordered[2].node.ID)
+}
+
 func BenchmarkLimitExploreCandidatesPreservingSourceLiteral80(b *testing.B) {
 	candidates := make([]*rerank.Candidate, 0, 80)
 	for i := 0; i < 79; i++ {

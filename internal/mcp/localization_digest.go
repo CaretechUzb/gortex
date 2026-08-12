@@ -523,7 +523,8 @@ type localizationFinalResponseTaskScore struct {
 
 func localizationFinalResponsePrimaryProvenance(provenance string) bool {
 	switch provenance {
-	case localizationProvenanceSourceLiteralCallee,
+	case localizationProvenanceContentLiteral,
+		localizationProvenanceSourceLiteralCallee,
 		localizationProvenanceDivergentDefault,
 		localizationProvenanceImplementationTarget,
 		localizationProvenanceTypedAnchorProjection,
@@ -743,9 +744,24 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 	// Fresh rows already lead the merged evidence order. Primary status is earned
 	// from proof, task alignment, or owner coherence below; arrival time alone
 	// must not displace stronger retained evidence.
+	literalPrimaryCount := 0
+	appendPrimary := func(row localizationDigestRow) bool {
+		literal := row.Provenance == localizationProvenanceContentLiteral ||
+			row.Provenance == localizationProvenanceSourceLiteralCallee
+		if literal && literalPrimaryCount >= exploreSourceLiteralReservationMax {
+			return false
+		}
+		if !appendRow(&primaries, localizationFinalResponsePrimaryLimit, row) {
+			return false
+		}
+		if literal {
+			literalPrimaryCount++
+		}
+		return true
+	}
 	for _, row := range rows {
 		if localizationFinalResponsePrimaryProvenance(row.Provenance) {
-			appendRow(&primaries, localizationFinalResponsePrimaryLimit, row)
+			appendPrimary(row)
 		}
 	}
 
@@ -779,7 +795,7 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 			}
 		}
 		if bestSameOwner >= 0 {
-			appendRow(&primaries, localizationFinalResponsePrimaryLimit, rows[bestSameOwner])
+			appendPrimary(rows[bestSameOwner])
 		}
 	}
 
@@ -799,11 +815,11 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 			}
 		}
 		if bestTaskMatch >= 0 {
-			appendRow(&primaries, localizationFinalResponsePrimaryLimit, rows[bestTaskMatch])
+			appendPrimary(rows[bestTaskMatch])
 		}
 	}
 	for _, row := range rows {
-		appendRow(&primaries, localizationFinalResponsePrimaryLimit, row)
+		appendPrimary(row)
 	}
 
 	for _, row := range rows {

@@ -50,12 +50,12 @@ const (
 	// unrestricted grep agent showed the answer present-but-unnamed far more
 	// often than absent; serving bodies is what closes that, and the session
 	// token spend stays well under the plain-search agent's.
-	localizationDefaultBudgetTokens        = 12000
-	exploreMinBudgetTokens                 = 1000
-	exploreMaxBudgetTokens                 = 24000
-	exploreDefaultMaxSymbols               = 16
-	exploreMaxMaxSymbols                   = 30
-	exploreRingCap                         = 5 // callers / callees shown per target
+	localizationDefaultBudgetTokens = 12000
+	exploreMinBudgetTokens          = 1000
+	exploreMaxBudgetTokens          = 24000
+	exploreDefaultMaxSymbols        = 16
+	exploreMaxMaxSymbols            = 30
+	exploreRingCap                  = 5 // callers / callees shown per target
 	// Kept at eight while the page itself widens: this cap also sets the
 	// envelope's shed floor and the tight-budget wire guarantee, so widening
 	// it is a contract change, not a serving change.
@@ -93,30 +93,32 @@ func (s *Server) registerExploreTool() {
 // exploreTarget is one ranked candidate plus its bounded neighborhood,
 // gathered before rendering so the renderer can honour the token budget.
 type exploreTarget struct {
-	node                  *graph.Node
-	score                 float64
-	callers               []*graph.Node
-	callees               []*graph.Node
-	directCalleesComplete bool // false when the direct projection was truncated, bounded, or otherwise lower-bound
-	causalCallees         []exploreCausalNeighbor
-	causalChangeBridge    bool   // one graph-proven caller/callee retained as provenance for a promoted continuation
-	causalChangeLeaf      bool   // graph-proven wrapper implementation or task-aligned cross-file change callable
-	causalChangeOwner     bool   // same-file type that encloses or is uniquely returned by the causal change callable
-	source                string // full body (may be empty for non-source kinds)
-	divergentDefaultOwner bool   // unique child constructor whose concrete default causes the queried behavior
-	divergentDefaultType  bool   // owning type paired with divergentDefaultOwner for coherent file/symbol output
-	conceptImplementation bool   // primary identifier-backed callable; may establish answer readiness
-	conceptComplement     bool   // marginal concept callable protected as evidence, never as terminal proof
-	syntacticAnchor       bool   // task-spelled flag/identifier owner protected by bounded lexical competition
-	exactContent          bool   // verified full quoted-literal hit from content_fts
-	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
-	sourceLiteral         bool   // exact source-body hit that must survive final envelope packing
-	sourceLiteralCallee   bool   // exact source callsite uniquely resolved to this invoked callable
-	sourceLiteralAligned  bool   // source-literal callee that instantiates the task's value; strongest literal owner
-	typedAnchorProjection bool   // bounded field-owner-call proof promoted from a task-aligned typed field
-	foldedOwner           bool   // synthetic owner inserted by concept member folding
-	leadingFileDepth      bool   // sibling of the ranked leading file, admitted into the expendable breadth tail
-	localizationRelation  string // direct_caller/direct_callee row promoted only into the bounded terminal projection
+	node                   *graph.Node
+	score                  float64
+	callers                []*graph.Node
+	callees                []*graph.Node
+	directCalleesComplete  bool // false when the direct projection was truncated, bounded, or otherwise lower-bound
+	causalCallees          []exploreCausalNeighbor
+	causalChangeBridge     bool   // one graph-proven caller/callee retained as provenance for a promoted continuation
+	causalChangeLeaf       bool   // graph-proven wrapper implementation or task-aligned cross-file change callable
+	causalChangeOwner      bool   // same-file type that encloses or is uniquely returned by the causal change callable
+	source                 string // full body (may be empty for non-source kinds)
+	divergentDefaultOwner  bool   // unique child constructor whose concrete default causes the queried behavior
+	divergentDefaultType   bool   // owning type paired with divergentDefaultOwner for coherent file/symbol output
+	conceptImplementation  bool   // primary identifier-backed callable; may establish answer readiness
+	conceptComplement      bool   // marginal concept callable protected as evidence, never as terminal proof
+	syntacticAnchor        bool   // task-spelled flag/identifier owner protected by bounded lexical competition
+	exactContent           bool   // verified full quoted-literal hit from content_fts
+	exactContentAmbiguous  bool   // exact evidence has visible or possibly truncated peers
+	sourceLiteral          bool   // exact source-body hit that must survive final envelope packing
+	sourceLiteralCallee    bool   // exact source callsite uniquely resolved to this invoked callable
+	sourceLiteralAligned   bool   // source-literal callee that instantiates the task's value; strongest literal owner
+	literalPrimaryEligible bool   // unanchored bounded content evidence may take one of two PRIMARY seats
+	literalMatchCount      int    // distinct task literals matched; stable tie-break among eligible rows
+	typedAnchorProjection  bool   // bounded field-owner-call proof promoted from a task-aligned typed field
+	foldedOwner            bool   // synthetic owner inserted by concept member folding
+	leadingFileDepth       bool   // sibling of the ranked leading file, admitted into the expendable breadth tail
+	localizationRelation   string // direct_caller/direct_callee row promoted only into the bounded terminal projection
 }
 
 type exploreCausalNeighbor struct {
@@ -2913,6 +2915,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 	}
 	artifactTargets := artifactLane.targets
+	literalPrimaryEligible := !explicitTarget && len(protectedSyntacticAnchors) == 0
 	targets := make([]exploreTarget, 0, len(artifactTargets)+len(cands))
 	// Artifact evidence leads only when the strong classifier activated its
 	// lane. Ordinary source localization retains the exact prior target order.
@@ -2935,6 +2938,14 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			t.sourceLiteralCallee = c.Signals[exploreSourceLiteralCalleeSignal] > 0
 			t.sourceLiteralAligned = c.Signals[exploreSourceLiteralTaskAlignSignal] > 0
 			t.typedAnchorProjection = c.Signals[exploreTypedAnchorProjectionSignal] > 0
+			if literalPrimaryEligible && (t.sourceLiteral || t.exactContent) {
+				t.literalPrimaryEligible = true
+				matches := c.Signals[exploreContentRecallTermSignal]
+				if coverage := c.Signals[exploreSourceLiteralCoverageSignal]; coverage > matches {
+					matches = coverage
+				}
+				t.literalMatchCount = int(matches)
+			}
 		}
 		t.source = s.manifestSymbolSource(ctx, n)
 		if callers := eng.GetCallers(n.ID, ringOpts); callers != nil {
@@ -3608,6 +3619,25 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 			}
 		}
 	}
+	// Unanchored content evidence may occupy at most two PRIMARY seats. Candidate
+	// selection already bounds this lane; order its survivors by the number of
+	// distinct task literals they corroborate before the ordinary draft fills
+	// the projection.
+	literalPrimaries := make([]exploreTarget, 0, exploreSourceLiteralReservationMax)
+	for _, target := range targets {
+		if target.literalPrimaryEligible {
+			literalPrimaries = append(literalPrimaries, target)
+		}
+	}
+	sort.SliceStable(literalPrimaries, func(i, j int) bool {
+		return literalPrimaries[i].literalMatchCount > literalPrimaries[j].literalMatchCount
+	})
+	for index, target := range literalPrimaries {
+		if index == exploreSourceLiteralReservationMax {
+			break
+		}
+		appendTarget(target)
+	}
 	// A source-body literal is the only direct evidence that can identify an
 	// implementation absent from symbol metadata. Reserve the strongest one
 	// before draft promotion and byte-budget packing can consume every slot.
@@ -4210,6 +4240,19 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 				mandatoryCount = index + 1
 				break
 			}
+		}
+	}
+	literalMandatory := 0
+	for index, target := range targets {
+		if !target.literalPrimaryEligible {
+			continue
+		}
+		if index+1 > mandatoryCount {
+			mandatoryCount = index + 1
+		}
+		literalMandatory++
+		if literalMandatory == exploreSourceLiteralReservationMax {
+			break
 		}
 	}
 	for index, target := range targets {

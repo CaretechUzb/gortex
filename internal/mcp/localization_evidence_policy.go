@@ -10,6 +10,10 @@ import (
 // The latter is a ranking decision; the former requires one of these bounded,
 // production-proven evidence shapes and must survive final response packing.
 const (
+	// localizationProvenanceContentLiteral marks a bounded content/source hit
+	// that is useful answer evidence but is not, by itself, strong enough to
+	// make terminal enforcement safe.
+	localizationProvenanceContentLiteral        = "content_literal"
 	localizationProvenanceSourceLiteralCallee   = "source_literal_callee"
 	localizationProvenanceDivergentDefault      = "divergent_default_owner"
 	localizationProvenanceDivergentDefaultType  = "divergent_default_type"
@@ -394,6 +398,9 @@ func localizationTargetProvenance(completion localizationCompletion, target expl
 	}
 	if localizationStrongSourceLiteralCallee(target) {
 		return localizationProvenanceSourceLiteralCallee
+	}
+	if target.literalPrimaryEligible && (target.sourceLiteral || target.exactContent) {
+		return localizationProvenanceContentLiteral
 	}
 	if target.typedAnchorProjection {
 		return localizationProvenanceTypedAnchorProjection

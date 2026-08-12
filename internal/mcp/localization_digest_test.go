@@ -209,6 +209,48 @@ func TestDigestLifecycleAndLegacyFallback(t *testing.T) {
 	requireLocalizationTerminalReplay(t, blocked, "search", "symbols")
 }
 
+func TestContentLiteralRowsTakeAtMostTwoPrimarySeats(t *testing.T) {
+	rows := []localizationDigestRow{
+		{ID: "repo/a.go::First", Name: "First", File: "repo/a.go", Provenance: localizationProvenanceContentLiteral},
+		{ID: "repo/b.go::Second", Name: "Second", File: "repo/b.go", Provenance: localizationProvenanceSourceLiteralCallee},
+		{ID: "repo/c.go::Third", Name: "Third", File: "repo/c.go", Provenance: localizationProvenanceContentLiteral},
+		{ID: "repo/d.go::Semantic", Name: "Semantic", File: "repo/d.go"},
+	}
+
+	presented := localizationFinalResponseRows("find the semantic handler", nil, rows)
+	literalPrimaries := 0
+	semanticPrimary := false
+	for _, row := range presented {
+		if !row.primary {
+			continue
+		}
+		if row.row.Provenance == localizationProvenanceContentLiteral ||
+			row.row.Provenance == localizationProvenanceSourceLiteralCallee {
+			literalPrimaries++
+		}
+		if row.row.ID == "repo/d.go::Semantic" {
+			semanticPrimary = true
+		}
+	}
+	if literalPrimaries != exploreSourceLiteralReservationMax {
+		t.Fatalf("literal PRIMARY rows = %d, want bounded %d", literalPrimaries, exploreSourceLiteralReservationMax)
+	}
+	if !semanticPrimary {
+		t.Fatal("literal seating consumed every semantic PRIMARY opportunity")
+	}
+}
+
+func TestContentLiteralProvenanceDoesNotBecomeStrongTerminalProof(t *testing.T) {
+	rows := map[string]localizationDigestRow{
+		"repo/a.go::First": {
+			ID: "repo/a.go::First", File: "repo/a.go", Provenance: localizationProvenanceContentLiteral,
+		},
+	}
+	if localizationDigestStrongProofRetained(rows, "repo/a.go::First") {
+		t.Fatal("ordinary content evidence became enforceable terminal proof")
+	}
+}
+
 func TestDigestByteCapShedsOptionalMetadataBeforeEvidenceTail(t *testing.T) {
 	envelope := localizationExploreEnvelope{}
 	for i := 0; i < 400; i++ {
@@ -832,8 +874,8 @@ func TestTaskAwareDigestMergeDoesNotCohortQualifiedFunctions(t *testing.T) {
 
 func TestDigestByteCapRetainsSingleMandatoryRowAfterSheddingOptionalFields(t *testing.T) {
 	envelope := localizationExploreEnvelope{Evidence: []localizationEvidence{{
-		Rank:      1,
-		ID:        "repo/registry.go::Registry.Configure",
+		Rank: 1,
+		ID:   "repo/registry.go::Registry.Configure",
 		// Each optional field scales with the retention cap so every shed
 		// step is still forced: after callers, callees, and the signature go,
 		// the qual-name alone still busts the cap and must go too.
