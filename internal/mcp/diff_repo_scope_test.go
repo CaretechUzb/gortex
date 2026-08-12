@@ -62,11 +62,13 @@ func TestDiffRepoScope(t *testing.T) {
 	require.Equal(t, repoA, root)
 	require.Equal(t, "repo-a", prefix)
 
-	// An unknown selector resolves nothing — the caller errors instead of
-	// falling back to an unrelated repo.
-	root, prefix = srv.diffRepoScope(ctx, "nope")
-	require.Empty(t, root)
-	require.Empty(t, prefix)
+	// Unknown prefix and absolute path selectors both resolve nothing — the
+	// caller errors instead of falling back to an unrelated active repo.
+	for _, selector := range []string{"nope", t.TempDir()} {
+		root, prefix = srv.diffRepoScope(ctx, selector)
+		require.Empty(t, root)
+		require.Empty(t, prefix)
+	}
 
 	// No selector + multiple tracked repos + no session binding: ambiguous.
 	root, prefix = srv.diffRepoScope(ctx, "")
