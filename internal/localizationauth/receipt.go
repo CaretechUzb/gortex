@@ -35,9 +35,11 @@ const (
 // answer_ready contract. PostToolUse treats this server-owned record, rather
 // than its visible tool_response, as the terminal authority.
 type Receipt struct {
-	FinalResponse   string `json:"final_response"`
-	ContractVersion int    `json:"contract_version"`
-	Enforceable     bool   `json:"enforceable"`
+	FinalResponse   string   `json:"final_response"`
+	PrimaryIDs      []string `json:"primary_ids,omitempty"`
+	EvidenceIDs     []string `json:"evidence_ids,omitempty"`
+	ContractVersion int      `json:"contract_version"`
+	Enforceable     bool     `json:"enforceable"`
 }
 
 type receiptEnvelope struct {

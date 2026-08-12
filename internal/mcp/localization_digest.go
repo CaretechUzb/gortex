@@ -49,6 +49,10 @@ type localizationEvidenceDigest struct {
 	// session that ends holding nothing is the one outcome with no recovery, so
 	// every state carries a page — labelled for what it is.
 	provisionalResponse string
+	// primaryIDs is the exact bounded PRIMARY projection used to render the
+	// final response. It stays out of retained digest JSON to avoid counting the
+	// same identities twice, but is copied into authenticated host authority.
+	primaryIDs []string
 }
 
 type localizationDigestRow struct {
@@ -892,6 +896,20 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 	return presented
 }
 
+func localizationFinalResponsePrimaryIDs(task string, current, rows []localizationDigestRow) []string {
+	presented := localizationFinalResponseRows(task, current, rows)
+	ids := make([]string, 0, localizationFinalResponsePrimaryLimit)
+	for _, item := range presented {
+		if !item.primary {
+			break
+		}
+		if id := strings.TrimSpace(item.row.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 func renderLocalizationFinalResponse(rows []localizationDigestRow) string {
 	return renderLocalizationFinalResponseForTask("", nil, rows)
 }
@@ -1017,6 +1035,7 @@ func refreshLocalizationDigestResponses(digest *localizationEvidenceDigest, task
 	}
 	digest.finalResponse = renderLocalizationFinalResponseForTask(task, current, digest.Evidence)
 	digest.provisionalResponse = renderLocalizationProvisionalResponseForTask(task, current, digest.Evidence)
+	digest.primaryIDs = localizationFinalResponsePrimaryIDs(task, current, digest.Evidence)
 }
 
 // localizationAnswerClaimDiscipline closes the remaining gap between a page
