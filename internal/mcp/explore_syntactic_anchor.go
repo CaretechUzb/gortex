@@ -879,17 +879,6 @@ func exploreAnchorPoolCandidate(
 	return candidate, false
 }
 
-func (s *Server) gatherExploreSyntacticAnchorCandidates(
-	ctx context.Context,
-	task string,
-	ordinary []*rerank.Candidate,
-	eng *query.Engine,
-	scope query.QueryOptions,
-	rctx *rerank.Context,
-) ([]*rerank.Candidate, map[int]string) {
-	return s.gatherExploreSyntacticAnchorCandidatesCollecting(ctx, task, ordinary, eng, scope, rctx, nil)
-}
-
 func (s *Server) gatherExploreSyntacticAnchorCandidatesCollecting(
 	ctx context.Context,
 	task string,
