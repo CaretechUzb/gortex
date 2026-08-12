@@ -77,39 +77,64 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 	priorityIDs := localizationDigestPriorityIDs(envelope.Completion, envelope.Evidence)
 
 	seen := make(map[string]struct{}, localizationReplayEvidenceLimit)
-	appendRows := func(priority bool) {
-		for _, row := range envelope.Evidence {
-			if len(digest.Evidence) >= localizationReplayEvidenceLimit {
-				return
-			}
-			if row.ID == "" || row.File == "" {
-				continue
-			}
-			_, prioritized := priorityIDs[row.ID]
-			if prioritized != priority {
-				continue
-			}
-			if _, exists := seen[row.ID]; exists {
-				continue
-			}
-			seen[row.ID] = struct{}{}
-			digest.Evidence = append(digest.Evidence, localizationDigestRow{
-				Rank:       row.Rank,
-				ID:         row.ID,
-				Name:       row.Name,
-				QualName:   row.QualName,
-				Kind:       row.Kind,
-				File:       row.File,
-				Line:       row.Line,
-				Signature:  row.Signature,
-				Callers:    append([]string(nil), row.Callers...),
-				Callees:    append([]string(nil), row.Callees...),
-				Provenance: row.Provenance,
-			})
+	appendRow := func(row localizationEvidence) bool {
+		if row.ID == "" || row.File == "" || len(digest.Evidence) >= localizationReplayEvidenceLimit {
+			return false
+		}
+		if _, exists := seen[row.ID]; exists {
+			return false
+		}
+		seen[row.ID] = struct{}{}
+		digest.Evidence = append(digest.Evidence, localizationDigestRow{
+			Rank:       row.Rank,
+			ID:         row.ID,
+			Name:       row.Name,
+			QualName:   row.QualName,
+			Kind:       row.Kind,
+			File:       row.File,
+			Line:       row.Line,
+			Signature:  row.Signature,
+			Callers:    append([]string(nil), row.Callers...),
+			Callees:    append([]string(nil), row.Callees...),
+			Provenance: row.Provenance,
+		})
+		return true
+	}
+	// Proof/authorization identities remain the immutable prefix.
+	for _, row := range envelope.Evidence {
+		if _, prioritized := priorityIDs[row.ID]; prioritized {
+			appendRow(row)
 		}
 	}
-	appendRows(true)
-	appendRows(false)
+	// Reserve tail capacity for real body-derived declarations before ordinary
+	// non-priority rows fill the replay window. Visible envelope rows are never
+	// removed; only the weakest retained digest tail yields.
+	bodyIDs := make(map[string]struct{}, localizationBodyMentionCap)
+	for _, row := range envelope.Evidence {
+		if row.Provenance == localizationProvenanceBodyMention && row.ID != "" {
+			if _, already := seen[row.ID]; !already {
+				bodyIDs[row.ID] = struct{}{}
+			}
+		}
+	}
+	bodyReserve := min(len(bodyIDs), localizationReplayEvidenceLimit-len(digest.Evidence))
+	ordinaryLimit := localizationReplayEvidenceLimit - bodyReserve
+	for _, row := range envelope.Evidence {
+		if len(digest.Evidence) >= ordinaryLimit {
+			break
+		}
+		if row.Provenance == localizationProvenanceBodyMention {
+			continue
+		}
+		if _, prioritized := priorityIDs[row.ID]; !prioritized {
+			appendRow(row)
+		}
+	}
+	for _, row := range envelope.Evidence {
+		if row.Provenance == localizationProvenanceBodyMention {
+			appendRow(row)
+		}
+	}
 
 	for {
 		rebuildLocalizationDigestSkeleton(digest)
@@ -120,6 +145,10 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 		}
 		if len(digest.Evidence) == 0 {
 			return digest
+		}
+		if retained, removed := shedLocalizationDigestBodyMention(digest.Evidence); removed {
+			digest.Evidence = retained
+			continue
 		}
 		last := len(digest.Evidence) - 1
 		if shedLocalizationDigestOptionalFields(digest.Evidence) {
@@ -293,6 +322,10 @@ func mergeLocalizationEvidenceDigest(current []localizationDigestRow, retained *
 		}
 		if len(digest.Evidence) == 0 {
 			return digest
+		}
+		if retained, removed := shedLocalizationDigestBodyMention(digest.Evidence); removed {
+			digest.Evidence = retained
+			continue
 		}
 		last := len(digest.Evidence) - 1
 		if shedLocalizationDigestOptionalFields(digest.Evidence) {
@@ -469,6 +502,21 @@ func shedLocalizationDigestOptionalFields(rows []localizationDigestRow) bool {
 		}
 	}
 	return false
+}
+
+// Body mentions supplement the packed declarations that produced them. Under
+// retained-state pressure they yield before richer metadata or independently
+// ranked evidence, regardless of where a later merge placed them.
+func shedLocalizationDigestBodyMention(rows []localizationDigestRow) ([]localizationDigestRow, bool) {
+	for index := len(rows) - 1; index >= 0; index-- {
+		if rows[index].Provenance != localizationProvenanceBodyMention {
+			continue
+		}
+		copy(rows[index:], rows[index+1:])
+		rows[len(rows)-1] = localizationDigestRow{}
+		return rows[:len(rows)-1], true
+	}
+	return rows, false
 }
 
 func rebuildLocalizationDigestSkeleton(digest *localizationEvidenceDigest) {
@@ -746,6 +794,9 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 	// must not displace stronger retained evidence.
 	literalPrimaryCount := 0
 	appendPrimary := func(row localizationDigestRow) bool {
+		if row.Provenance == localizationProvenanceBodyMention {
+			return false
+		}
 		literal := row.Provenance == localizationProvenanceContentLiteral ||
 			row.Provenance == localizationProvenanceSourceLiteralCallee
 		if literal && literalPrimaryCount >= exploreSourceLiteralReservationMax {

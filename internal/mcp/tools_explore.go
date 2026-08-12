@@ -3123,8 +3123,8 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		preferredSymbol := explorePreferredRoutedRefinementSymbol(
 			preferred, symbolTargets, routes,
 		)
-		result, refinement, boundedRoutes, digest := buildLocalizationRefinementResultForTaskWithOutline(
-			preferredSymbol, task, targets, budget, routes, pageOutline,
+		result, refinement, boundedRoutes, digest := buildLocalizationRefinementResultForTaskWithOutlineAndDeclarations(
+			preferredSymbol, task, targets, budget, routes, pageOutline, declarations,
 		)
 		if refinement.State != localizationStateNeedsRefinement {
 			refinement.digest = digest
@@ -3146,8 +3146,8 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// and is retained for post-terminal replay — for the exact-read contract
 	// too, whose success promotes to answer_ready with the evidence already
 	// stashed.
-	result, _, digest, completion := buildLocalizationExploreResultForTaskFinalizedWithOutline(
-		completion, task, targets, budget, pageOutline,
+	result, _, digest, completion := buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
+		completion, task, targets, budget, pageOutline, declarations,
 	)
 	// Literal-driven terminality must show its evidence: when the verdict
 	// rests on a quoted-literal match but the budgeted envelope shed the
@@ -3160,8 +3160,8 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		preferredSymbol := explorePreferredRoutedRefinementSymbol(
 			explorePreferredRefinementSymbol(task, symbolTargets), symbolTargets, routes,
 		)
-		refined, refinement, boundedRoutes, refinedDigest := buildLocalizationRefinementResultForTaskWithOutline(
-			preferredSymbol, task, targets, budget, routes, pageOutline,
+		refined, refinement, boundedRoutes, refinedDigest := buildLocalizationRefinementResultForTaskWithOutlineAndDeclarations(
+			preferredSymbol, task, targets, budget, routes, pageOutline, declarations,
 		)
 		if refinement.State != localizationStateNeedsRefinement {
 			refinement.digest = refinedDigest
@@ -4087,6 +4087,19 @@ func buildLocalizationRefinementResultForTaskWithOutline(
 	routes map[string]localizationRefinementRoute,
 	outline func() *localizationPageOutline,
 ) (*mcp.CallToolResult, localizationCompletion, map[string]localizationRefinementRoute, *localizationEvidenceDigest) {
+	return buildLocalizationRefinementResultForTaskWithOutlineAndDeclarations(
+		preferredSymbol, task, targets, budget, routes, outline, nil,
+	)
+}
+
+func buildLocalizationRefinementResultForTaskWithOutlineAndDeclarations(
+	preferredSymbol, task string,
+	targets []exploreTarget,
+	budget int,
+	routes map[string]localizationRefinementRoute,
+	outline func() *localizationPageOutline,
+	declarations *localizationFileDeclarationCache,
+) (*mcp.CallToolResult, localizationCompletion, map[string]localizationRefinementRoute, *localizationEvidenceDigest) {
 	choosePreferred := func(symbols []string, requested string) (string, []string, map[string]localizationRefinementRoute) {
 		authorized, bounded := boundedLocalizationRefinementRoutes(symbols, routes, requested)
 		if requested != "" {
@@ -4109,8 +4122,8 @@ func buildLocalizationRefinementResultForTaskWithOutline(
 	preferredSymbol, preauthorized, prebounded := choosePreferred(candidateSymbols, preferredSymbol)
 	if preferredSymbol == "" {
 		advisory := newLocalizationCompletion(true, "")
-		result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalizedWithOutline(
-			advisory, task, targets, budget, outline,
+		result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
+			advisory, task, targets, budget, outline, declarations,
 		)
 		return result, packedCompletion, nil, digest
 	}
@@ -4121,8 +4134,8 @@ func buildLocalizationRefinementResultForTaskWithOutline(
 	budgetCompletion := newLocalizationRefinementCompletionForSymbols(preferredSymbol, preauthorized)
 	budgetCompletion.refinementRoutes = prebounded
 	var finalRoutes map[string]localizationRefinementRoute
-	result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalizedWithOutline(
-		budgetCompletion, task, targets, budget, outline,
+	result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
+		budgetCompletion, task, targets, budget, outline, declarations,
 		func(packed localizationExploreEnvelope) localizationCompletion {
 			packedPreferred, allowedSymbols, bounded := choosePreferred(packed.Symbols, preferredSymbol)
 			if packedPreferred == "" {
@@ -4158,6 +4171,20 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 	targets []exploreTarget,
 	budget int,
 	outline func() *localizationPageOutline,
+	finalize ...localizationCompletionFinalizer,
+) (*mcp.CallToolResult, []string, *localizationEvidenceDigest, localizationCompletion) {
+	return buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
+		completion, task, targets, budget, outline, nil, finalize...,
+	)
+}
+
+func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
+	completion localizationCompletion,
+	task string,
+	targets []exploreTarget,
+	budget int,
+	outline func() *localizationPageOutline,
+	declarations *localizationFileDeclarationCache,
 	finalize ...localizationCompletionFinalizer,
 ) (*mcp.CallToolResult, []string, *localizationEvidenceDigest, localizationCompletion) {
 	var draft []exploreDraftEntry
@@ -4540,6 +4567,7 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutline(
 		}
 		envelope.Evidence[shed].Source = ""
 	}
+	envelope, digest = promoteLocalizationBodyMentions(task, envelope, declarations, shedBudget, digest)
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil, nil, envelope.Completion
@@ -5163,16 +5191,20 @@ func exploreLiteralWordRune(r rune) bool {
 // snippets are unhighlighted, so a bounded case-folded substring scan with
 // Unicode-aware word boundaries is sufficient and does not read source again.
 func exploreTextHasExactLiteral(text, literal string) bool {
-	literal = strings.TrimSpace(literal)
-	if text == "" || literal == "" {
+	return exploreLowerTextHasExactLiteral(strings.ToLower(text), literal)
+}
+
+// exploreLowerTextHasExactLiteral is the allocation-aware sibling for bounded
+// scans that test many declaration names against one already-lowercased body.
+func exploreLowerTextHasExactLiteral(lowerText, literal string) bool {
+	literal = strings.ToLower(strings.TrimSpace(literal))
+	if lowerText == "" || literal == "" {
 		return false
 	}
-	text = strings.ToLower(text)
-	literal = strings.ToLower(literal)
 	first, _ := utf8.DecodeRuneInString(literal)
 	last, _ := utf8.DecodeLastRuneInString(literal)
-	for offset := 0; offset <= len(text)-len(literal); {
-		relative := strings.Index(text[offset:], literal)
+	for offset := 0; offset <= len(lowerText)-len(literal); {
+		relative := strings.Index(lowerText[offset:], literal)
 		if relative < 0 {
 			return false
 		}
@@ -5180,12 +5212,12 @@ func exploreTextHasExactLiteral(text, literal string) bool {
 		end := start + len(literal)
 		beforeOK := true
 		if start > 0 && exploreLiteralWordRune(first) {
-			previous, _ := utf8.DecodeLastRuneInString(text[:start])
+			previous, _ := utf8.DecodeLastRuneInString(lowerText[:start])
 			beforeOK = !exploreLiteralWordRune(previous)
 		}
 		afterOK := true
-		if end < len(text) && exploreLiteralWordRune(last) {
-			next, _ := utf8.DecodeRuneInString(text[end:])
+		if end < len(lowerText) && exploreLiteralWordRune(last) {
+			next, _ := utf8.DecodeRuneInString(lowerText[end:])
 			afterOK = !exploreLiteralWordRune(next)
 		}
 		if beforeOK && afterOK {
