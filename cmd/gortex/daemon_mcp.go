@@ -156,6 +156,12 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 			// Record only permitted calls to deferred/learned tools so a rejected
 			// hidden call cannot refresh learned-surface state.
 			d.srv.NoteToolUse(name, sess.CWD, newly)
+			// Promotion alone is not enough: mcp-go re-applies the tools/list
+			// filter to the requested tool at call time and reports a filtered
+			// tool as "not found". Mark the call as authorized so the surface
+			// filter recognises that probe (see WithAuthorizedToolCall); the
+			// per-call gate inside the handler still decides the outcome.
+			ctx = gortexmcp.WithAuthorizedToolCall(ctx, name)
 		}
 	}
 
