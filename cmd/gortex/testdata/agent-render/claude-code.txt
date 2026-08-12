@@ -30,8 +30,10 @@
     }
   }
 }
-=== root/CLAUDE.md ===
+=== root/AGENTS.md ===
 <!-- gortex:communities:start -->
 - [example-community](.claude/skills/example/SKILL.md) — example routing block
 
 <!-- gortex:communities:end -->
+=== root/CLAUDE.md ===
+@AGENTS.md
