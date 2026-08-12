@@ -22,17 +22,44 @@ import (
 // across the whole resolve pass and applies a per-call timeout so a
 // stalled server never gates the resolve.
 //
-// Concurrency model: the helper owns a pool of N independent
-// providers (= N tsserver processes for the TS spec). Each Definition
-// call borrows one provider from the pool, runs FindDefinition, and
-// returns it. Within a single provider tsserver is single-threaded,
-// but across providers calls are parallel. Pool size 1 collapses to
-// the original "one provider, fully serialised" model.
+// Two ownership contracts live behind this one type, and they differ
+// in exactly one respect — who owns the *Provider:
+//
+//   - Router-backed (NewLazyResolverHelper). The helper owns NO
+//     provider. Every Definition call re-runs the lookup closure
+//     (Router.ForSpecWorkspace) to acquire the provider for that one
+//     call. On a router cache hit that lookup is a map read which also
+//     refreshes the router's lastUsed, so a provider under active
+//     resolve traffic is never reaped mid-pass; when the router has
+//     already reaped or LRU-evicted it, the lookup spawns a fresh,
+//     router-TRACKED replacement. Caching the pointer across calls
+//     (what this helper used to do) let the router drop the provider
+//     from its map while the helper kept the only reference: the next
+//     EnsureClient saw a dead client and re-spawned the LSP subprocess
+//     behind the router's back, leaking a process tree that nothing
+//     could ever reap for the life of the daemon.
+//   - Helper-owned (NewPooledResolverHelper with poolSize > 1, and
+//     NewResolverHelper with a concrete provider). The helper spawns
+//     and owns its providers and borrows one per call from a pool
+//     channel. These providers sit outside the router's bookkeeping by
+//     construction, so an in-place respawn inside EnsureClient is the
+//     helper's own business; Close shuts them down.
+//
+// Concurrency model: one Definition call uses exactly one provider at
+// a time. Router-backed mode holds h.mu across the whole call — the
+// router hands every caller the same *Provider and a provider's stdio
+// is single-threaded, and pool size is 1 in that mode anyway, so this
+// matches the throughput of the borrow channel it replaced.
+// Owned-pool mode borrows from a channel of N independent providers
+// (= N tsserver processes for the TS spec), giving mutual exclusion
+// per provider and parallelism across them.
 //
 // Lifecycle:
 //   - Constructed once per (workspace, language family) at index time.
-//   - Lazy-spawns N underlying LSP subprocesses on the first Definition
-//     call.
+//   - Owned-pool mode lazy-spawns N underlying LSP subprocesses on the
+//     first Definition call. Router-backed mode spawns nothing of its
+//     own — the router does, on demand, inside its own reap/evict
+//     accounting.
 //   - Caches no answers across passes — the resolver owns dedup via
 //     its lspIndex.
 //
@@ -41,9 +68,22 @@ import (
 // the per-provider state can add up; the pool size knob trades
 // throughput for tsserver memory.
 type ResolverHelper struct {
+	// routerBacked marks the NewLazyResolverHelper flavour, whose
+	// provider belongs to the LSP router rather than to this helper.
+	// It selects the per-call lookup path in acquire and makes Close a
+	// no-op. See the type comment for why the two modes must differ.
+	routerBacked bool
+
+	// mu serialises Definition in router-backed mode, where every call
+	// runs against the single router-cached provider for this (spec,
+	// workspace) pair. Unused in owned-pool mode — the pool channel
+	// already provides the same per-provider exclusion there.
+	mu sync.Mutex
+
 	// spawnOnce gates the lazy creation of the provider pool so the
 	// underlying LSP processes aren't started until the first
-	// Definition call lands.
+	// Definition call lands. Owned-pool mode only; router-backed mode
+	// never touches the pool.
 	spawnOnce sync.Once
 	spawnErr  error
 
@@ -62,9 +102,12 @@ type ResolverHelper struct {
 	// (which may have providers in flight).
 	providers []*Provider
 
-	// spawnFn produces a fresh, initialised *Provider each call. Pool
-	// mode calls it poolSize times; legacy single-provider mode uses
-	// it as a lookup that returns a cached singleton (called once).
+	// spawnFn produces the *Provider a call runs against. Owned-pool
+	// mode requires a FRESH, fully-initialised provider per call and
+	// invokes it poolSize times at pool construction. Router-backed
+	// mode invokes it once per Definition call — a router cache hit is
+	// a cheap map read, and going through it every time is precisely
+	// what keeps the router's idle/LRU accounting honest.
 	// At most one of spawnFn and provider is set at construction.
 	spawnFn func() (*Provider, error)
 
@@ -150,18 +193,34 @@ func NewResolverHelper(provider *Provider, workspaceRoot string, timeout time.Du
 	return h
 }
 
-// NewLazyResolverHelper builds a helper whose underlying *Provider
-// is resolved on first use via lookup(). This is the router-backed
-// flavour — pass a closure that calls Router.ForSpecWorkspace or
-// equivalent. lookup() runs at most once across the helper's
-// lifetime (subsequent failures sticky); concurrent first-use calls
-// see the same result.
+// NewLazyResolverHelper builds the router-backed helper: pass a
+// closure that calls Router.ForSpecWorkspace (or equivalent) and the
+// helper will run it on EVERY Definition call rather than caching the
+// resulting *Provider.
+//
+// Per-call lookup is the contract, not an inefficiency. The router
+// owns provider lifetime — idle reaping and LRU eviction both Close
+// providers and delete them from its map — so a helper holding a
+// cached pointer would keep driving a provider the router no longer
+// tracks, and Provider.EnsureClient would silently re-spawn the
+// language server as an untracked orphan. Re-asking the router is a
+// map read on the hot path (it also refreshes lastUsed, which is what
+// stops the reaper from taking a provider mid-pass), and returns a
+// fresh router-tracked provider when the previous one is gone.
+//
+// Lookup errors are NOT sticky: the router's own markSpawnFailed
+// already fails a genuinely broken server fast for every subsequent
+// call, so per-call lookup cannot turn into a respawn storm, and a
+// helper poisoned by one transient failure would stay blind for the
+// life of the daemon.
 //
 // extensions narrows the set of file extensions the helper claims
-// before lookup() fires. Pass nil to use the default TS-family set
-// (matching N5 scope).
+// without consulting the router at all. Pass nil to use the default
+// TS-family set.
 func NewLazyResolverHelper(lookup func() (*Provider, error), workspaceRoot string, extensions []string, timeout time.Duration, logger *zap.Logger) *ResolverHelper {
-	return NewPooledResolverHelper(lookup, workspaceRoot, extensions, timeout, 1, logger)
+	h := NewPooledResolverHelper(lookup, workspaceRoot, extensions, timeout, 1, logger)
+	h.routerBacked = true
+	return h
 }
 
 // NewPooledResolverHelper builds a helper backed by `poolSize`
@@ -171,8 +230,14 @@ func NewLazyResolverHelper(lookup func() (*Provider, error), workspaceRoot strin
 // ceiling that dominated multi-repo resolve-time profiles (29 min
 // `deferred_passes_all` on a 488-repo TS-heavy workspace).
 //
+// The providers are owned by the helper — they are NOT registered
+// with the LSP router, so nothing idle-reaps them and Close is the
+// only thing that shuts them down. NewLazyResolverHelper wraps this
+// constructor with poolSize 1 and flips the helper to the
+// router-backed contract instead (per-call lookup, no ownership).
+//
 // spawn must produce a fresh, fully-initialised provider each call.
-// For the typical router-backed wiring the closure is something like:
+// For the typical owned-pool wiring the closure is something like:
 //
 //	func() (*Provider, error) {
 //	    p := lsp.NewProviderFromSpec(spec, logger)
@@ -228,6 +293,10 @@ func NewPooledResolverHelper(
 // ensurePool spawns the pool's providers on first call, populating
 // the borrow channel. Subsequent calls are a no-op. Returns the
 // cached error when spawn failed — Definition then short-circuits.
+//
+// Owned-pool / eager mode only. Router-backed helpers never call it:
+// they own no providers, so there is no pool to fill and no spawn
+// error worth remembering (see NewLazyResolverHelper).
 func (h *ResolverHelper) ensurePool() error {
 	h.spawnOnce.Do(func() {
 		// Eager-construction path (NewResolverHelper): the pool was
@@ -280,6 +349,54 @@ func (h *ResolverHelper) borrow() (*Provider, func()) {
 	return p, func() { h.pool <- p }
 }
 
+// acquire returns the provider one Definition call should run
+// against, plus the release closure the caller must defer. ok is
+// false when no provider could be obtained — the caller then falls
+// through to the resolver's heuristics, and release must not be
+// called.
+//
+// This is the single point where the two ownership contracts diverge:
+//
+//   - Router-backed: take h.mu, then ask the router again. The lookup
+//     is what keeps the router's lastUsed fresh (so an in-flight
+//     resolve pass is never reaped) and what guarantees a provider the
+//     router already reaped is replaced by a new router-tracked one
+//     instead of being resurrected in place behind the router's back.
+//     The lock is held until release so a provider shared with every
+//     other caller of ForSpecWorkspace still sees serialised stdio.
+//   - Owned pool: spawn the pool once, then borrow a provider from the
+//     channel for the duration of the call.
+//
+// relPath is carried purely for the failure log — a lookup that fails
+// is worth one Debug line naming the file that wanted it, never an
+// error that poisons the helper.
+func (h *ResolverHelper) acquire(relPath string) (*Provider, func(), bool) {
+	if h.routerBacked {
+		h.mu.Lock()
+		p, err := h.spawnFn()
+		if err != nil || p == nil {
+			h.mu.Unlock()
+			h.logger.Debug("resolve-time LSP: provider lookup failed",
+				zap.String("path", relPath), zap.Error(err))
+			return nil, nil, false
+		}
+		return p, func() { h.mu.Unlock() }, true
+	}
+
+	if err := h.ensurePool(); err != nil {
+		h.logger.Debug("resolve-time LSP: pool spawn failed",
+			zap.String("path", relPath), zap.Error(err))
+		return nil, nil, false
+	}
+	if h.pool == nil {
+		// Eager-construction path was given a nil provider — short-
+		// circuit instead of deadlocking on a never-fed channel.
+		return nil, nil, false
+	}
+	p, release := h.borrow()
+	return p, release, true
+}
+
 // SupportsPath implements resolver.LSPHelper.
 //
 // SupportsPath does NOT trigger the lazy provider lookup — it's
@@ -304,7 +421,8 @@ func (h *ResolverHelper) SupportsPath(relPath string) bool {
 // (definitionRelPath, 1-based line, ok).
 //
 // Implementation notes:
-//   - The provider is spawned lazily on first call (EnsureClient).
+//   - The provider for the call comes from acquire: a per-call router
+//     lookup in router-backed mode, a pool borrow in owned-pool mode.
 //   - The file is opened with didOpen on first call (EnsureFileOpen)
 //     so tsserver has the buffer in its workspace state.
 //   - The identifier column on `oneBasedLine` is resolved from the
@@ -322,18 +440,10 @@ func (h *ResolverHelper) Definition(relPath string, oneBasedLine int, name strin
 		return "", 0, false
 	}
 
-	if err := h.ensurePool(); err != nil {
-		h.logger.Debug("resolve-time LSP: pool spawn failed",
-			zap.String("path", relPath), zap.Error(err))
+	provider, release, ok := h.acquire(relPath)
+	if !ok {
 		return "", 0, false
 	}
-	if h.pool == nil {
-		// Eager-construction path was given a nil provider — short-
-		// circuit instead of deadlocking on a never-fed channel.
-		return "", 0, false
-	}
-
-	provider, release := h.borrow()
 	defer release()
 
 	if err := provider.EnsureClient(h.workspaceRoot); err != nil {
@@ -455,17 +565,24 @@ func ResolverPoolSizeFromEnv(defaultSize int) int {
 	return n
 }
 
-// Close shuts down every provider in the pool. Called by the indexer
-// at shutdown when the helper owns its providers; helpers built
-// around router-managed providers (NewLazyResolverHelper /
-// NewPooledResolverHelper that close over Router.ForSpecWorkspace)
-// can still call Close — the underlying Provider.Close is idempotent
-// and routers re-spawn on next demand.
+// Close shuts down every provider the helper owns. Called by the
+// indexer at shutdown.
+//
+// Router-backed helpers (NewLazyResolverHelper) own nothing, so Close
+// is deliberately a no-op for them: their provider is the router's,
+// shared with enrichment and with every other helper for the same
+// (spec, workspace), and closing it here would kill a subprocess the
+// router still lists as alive — the mirror image of the orphan bug
+// per-call lookup exists to prevent. Router.Close is what shuts those
+// down.
 //
 // Safe to call when the lazy spawn has not yet fired — Close is a
-// no-op in that case.
+// no-op in that case too.
 func (h *ResolverHelper) Close() error {
 	if h == nil {
+		return nil
+	}
+	if h.routerBacked {
 		return nil
 	}
 	var firstErr error
