@@ -37,8 +37,8 @@ type plannedBatchEdit struct {
 type batchFileBuffer struct {
 	absPath      string
 	relPath      string
-	mode         os.FileMode
-	fileMode     os.FileMode
+	mode         os.FileMode // permission bits preserved when writing replacement files
+	fileMode     os.FileMode // complete mode retained for symlink and regular-file checks
 	original     []byte
 	content      []byte
 	existsBefore bool

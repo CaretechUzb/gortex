@@ -160,13 +160,10 @@ func (s *Server) prepareBatchJournal(receipt *batchTransactionReceipt, buffers m
 	files := make([]batchTransactionFile, 0, len(orderedPaths))
 	for i, path := range orderedPaths {
 		buffer := buffers[path]
-		// Non-nil byte slices preserve compatibility with direct test/embedding
-		// construction that predates explicit existence-state fields.
-		existsBefore, existsAfter := buffer.existsBefore, buffer.existsAfter
 		if !buffer.existenceSet {
-			existsBefore = buffer.original != nil
-			existsAfter = buffer.content != nil
+			return fmt.Errorf("batch buffer existence state is unset for %s", buffer.relPath)
 		}
+		existsBefore, existsAfter := buffer.existsBefore, buffer.existsAfter
 		file := batchTransactionFile{
 			Path: path, RelativePath: buffer.relPath, Mode: buffer.mode,
 			BeforeAbsent: !existsBefore, AfterAbsent: !existsAfter,
