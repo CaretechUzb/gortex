@@ -39,6 +39,18 @@ func (s *Server) editingToolsHidden(ctx context.Context) bool {
 }
 
 func (s *Server) toolSurfaceFilter(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
+	// mcp-go v0.55.1+ re-runs every registered tool filter at CALL time
+	// (server.passesToolFilters) with just the requested tool, and answers
+	// "tool '<name>' not found" when the filter drops it. This filter shapes
+	// tools/list VISIBILITY — a deferred tool promoted on demand, or any tool
+	// outside a narrow preset, is still callable by name (checkToolGate is the
+	// authoritative call gate). Let that single-tool probe through when the
+	// dispatcher already authorized this exact call, or the visibility rule
+	// silently becomes a call gate that reports the tool as missing.
+	if name := authorizedToolCallFromContext(ctx); name != "" &&
+		len(tools) == 1 && tools[0].Name == name {
+		return tools
+	}
 	if s.editingToolsHidden(ctx) {
 		tools = withoutMutatingTools(tools)
 	}
