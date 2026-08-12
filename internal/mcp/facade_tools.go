@@ -1392,6 +1392,23 @@ func validateFacadeInput(spec facadeOperationSpec, input map[string]any) *mcpgo.
 			continue
 		}
 		if _, ok := value.(map[string]any); !ok {
+			if field == "arguments" {
+				_, declared := facadeToolDefinition(spec.Facade).InputSchema.Properties[field]
+				if !declared {
+					receivedType := fmt.Sprintf("%T", value)
+					return NewStructuredErrorResult(StructuredError{
+						ErrorCode: ErrCodeInvalidArgument,
+						Message: fmt.Sprintf(
+							"arguments is an unexpected top-level key for %s.%s (received %s); Pass operation/query/options at the top level; arguments is the JSON-RPC envelope, not a parameter",
+							spec.Facade, spec.Operation, receivedType,
+						),
+						Data: map[string]any{
+							"field": "arguments", "received_type": receivedType,
+							"accepted_shape": "pass request_shape fields directly as tool arguments",
+						},
+					})
+				}
+			}
 			return NewStructuredErrorResult(StructuredError{
 				ErrorCode: ErrCodeInvalidArgument,
 				Message:   fmt.Sprintf("%s must be an object", field),
@@ -2372,6 +2389,7 @@ func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) 
 			}
 			out["input_schema"] = inputSchema
 			out["request_shape"] = requestShape
+			out["request_shape_note"] = fmt.Sprintf("Pass each request_shape field directly in the %s tool call; do not nest the object under arguments or params.", spec.Facade)
 			if raw, err := json.Marshal(inputSchema); err == nil {
 				sum := sha256.Sum256(raw)
 				out["schema_hash"] = hex.EncodeToString(sum[:])
@@ -2746,7 +2764,7 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 		}
 		extras[field] = facadeSchemaPlaceholder(field, properties[field])
 	}
-	return map[string]any{"tool": spec.Facade, "arguments": args}
+	return args
 }
 
 // applyFacadeSurface provides session-level surface negotiation. Legacy

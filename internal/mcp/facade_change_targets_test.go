@@ -141,9 +141,8 @@ func TestFacadeChangeTargetShapesAreAdvertisedOnce(t *testing.T) {
 				require.NotContains(t, optionProperties, "ids", "compatibility aliases must not duplicate the canonical target schema")
 			}
 
-			shape := payload["request_shape"].(map[string]any)
-			arguments := shape["arguments"].(map[string]any)
-			require.Contains(t, arguments, "target")
+			requestShape := payload["request_shape"].(map[string]any)
+			require.Contains(t, requestShape, "target")
 		})
 	}
 }

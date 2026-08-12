@@ -9,6 +9,48 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestFacadeCapabilityRequestShapeIsDirectCallerInput(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	for _, test := range []struct {
+		domain    string
+		operation string
+	}{
+		{domain: "search", operation: "symbols"},
+		{domain: "read", operation: "file"},
+	} {
+		t.Run(test.domain+"."+test.operation, func(t *testing.T) {
+			spec, ok := srv.facades.operation(test.domain, test.operation)
+			require.True(t, ok)
+			capability := srv.facadeCapability(spec, true)
+			requestShape := capability["request_shape"].(map[string]any)
+			publicSchema := facadeSchemaMapForTest(t, capability["input_schema"])
+
+			require.Equal(t, test.operation, requestShape["operation"])
+			require.NotContains(t, requestShape, "tool")
+			require.NotContains(t, requestShape, "arguments")
+			require.NoError(t, validateFacadeSchema(publicSchema, requestShape, "$"))
+			require.Contains(t, capability["request_shape_note"], "directly")
+		})
+	}
+}
+
+func TestFacadeInvalidArgumentsEnvelopeErrorIsSelfCorrecting(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	spec, ok := srv.facades.operation("search", "symbols")
+	require.True(t, ok)
+
+	result := validateFacadeInput(spec, map[string]any{
+		"operation": "symbols",
+		"query":     "MyType",
+		"arguments": `{"query":"MyType"}`,
+	})
+	require.NotNil(t, result)
+	message := toolResultText(result)
+	require.Contains(t, message, `unexpected top-level key`)
+	require.Contains(t, message, `received string`)
+	require.Contains(t, message, `Pass operation/query/options at the top level`)
+}
+
 func TestFacadeCapabilitiesPublicSchemasMatchEveryAvailableOperation(t *testing.T) {
 	srv, _ := setupTestServer(t)
 	checked := 0
@@ -30,8 +72,7 @@ func TestFacadeCapabilitiesPublicSchemasMatchEveryAvailableOperation(t *testing.
 			t.Run(name, func(t *testing.T) {
 				capability := srv.facadeCapability(spec, true)
 				publicSchema := facadeSchemaMapForTest(t, capability["input_schema"])
-				requestShape := capability["request_shape"].(map[string]any)
-				arguments := requestShape["arguments"].(map[string]any)
+				arguments := capability["request_shape"].(map[string]any)
 
 				require.NoError(t, validateFacadeSchema(publicSchema, arguments, "$"), "public schema must accept its own request_shape")
 				require.NoError(t, validateFacadeSchema(staticSchema, arguments, "$"), "request_shape must remain valid against the static tools/list schema")
