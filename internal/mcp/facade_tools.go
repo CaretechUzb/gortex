@@ -538,7 +538,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		s.recordFacadeTelemetry(facade, "unknown", facadeOutcomeInvalidOperation, time.Since(started))
 		return result, nil
 	}
-	if invalid := validateFacadeInput(spec, input); invalid != nil {
+	if invalid := s.validateFacadeInput(spec, input); invalid != nil {
 		if completion, consumed := terminal.consumeInvalidRecovery(facade, operation, recoveryGeneration); consumed {
 			invalid, _ = decorateExhaustedLocalizationReadFailure(invalid, nil, completion, spec)
 		}
@@ -956,7 +956,7 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 			Data:      map[string]any{"facade": spec.Facade, "operation": spec.Operation, "legacy_tool": spec.Legacy},
 		}), nil
 	}
-	if invalid := validateFacadeInput(spec, req.GetArguments()); invalid != nil {
+	if invalid := s.validateFacadeInput(spec, req.GetArguments()); invalid != nil {
 		outcome = facadeOutcomeInvalidArgument
 		return invalid, nil
 	}
@@ -1385,7 +1385,52 @@ func facadeLegacyManagesOwnOverlay(name string) bool {
 	}
 }
 
-func validateFacadeInput(spec facadeOperationSpec, input map[string]any) *mcpgo.CallToolResult {
+func facadeJSONType(value any) string {
+	switch value.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return "boolean"
+	case string:
+		return "string"
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return "number"
+	case []any, []string, []map[string]any:
+		return "array"
+	case map[string]any:
+		return "object"
+	default:
+		return "unsupported value"
+	}
+}
+
+func (s *Server) facadeAcceptedTopLevelFields(spec facadeOperationSpec) []string {
+	capability := s.facadeCapability(spec, true)
+	schema, _ := capability["input_schema"].(map[string]any)
+	properties, _ := schema["properties"].(map[string]any)
+	fields := sortedFacadeMapKeys(properties)
+	fieldRank := func(field string) int {
+		switch field {
+		case "operation":
+			return 0
+		case "options":
+			return 2
+		default:
+			return 1
+		}
+	}
+	sort.SliceStable(fields, func(i, j int) bool {
+		leftRank := fieldRank(fields[i])
+		rightRank := fieldRank(fields[j])
+		if leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		return fields[i] < fields[j]
+	})
+	return fields
+}
+
+func (s *Server) validateFacadeInput(spec facadeOperationSpec, input map[string]any) *mcpgo.CallToolResult {
 	for _, field := range []string{"arguments", "options", "source", "context", "guard", "output"} {
 		value, present := input[field]
 		if !present || value == nil {
@@ -1395,16 +1440,18 @@ func validateFacadeInput(spec facadeOperationSpec, input map[string]any) *mcpgo.
 			if field == "arguments" {
 				_, declared := facadeToolDefinition(spec.Facade).InputSchema.Properties[field]
 				if !declared {
-					receivedType := fmt.Sprintf("%T", value)
+					receivedType := facadeJSONType(value)
+					acceptedFields := s.facadeAcceptedTopLevelFields(spec)
 					return NewStructuredErrorResult(StructuredError{
 						ErrorCode: ErrCodeInvalidArgument,
 						Message: fmt.Sprintf(
-							"arguments is an unexpected top-level key for %s.%s (received %s); Pass operation/query/options at the top level; arguments is the JSON-RPC envelope, not a parameter",
-							spec.Facade, spec.Operation, receivedType,
+							"arguments is an unexpected top-level key for %s.%s (received %s); pass %s at the top level; arguments is the JSON-RPC envelope, not a parameter",
+							spec.Facade, spec.Operation, receivedType, strings.Join(acceptedFields, "/"),
 						),
 						Data: map[string]any{
 							"field": "arguments", "received_type": receivedType,
-							"accepted_shape": "pass request_shape fields directly as tool arguments",
+							"accepted_fields": acceptedFields,
+							"accepted_shape":  "pass request_shape fields directly as tool arguments",
 						},
 					})
 				}
@@ -2568,8 +2615,8 @@ func analyzeFieldApplies(kind, field string, raw any) bool {
 
 // facadeRequestShape makes capabilities actionable without teaching callers
 // canonical handler names. input_schema describes the operation-specific
-// fields; request_shape shows where those fields belong in the stable public
-// envelope and which target selector to use.
+// fields; request_shape shows the directly callable top-level fields and the
+// target selector to use.
 func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, required []string) map[string]any {
 	args := map[string]any{"operation": spec.Operation}
 	placeholder := func(key string) map[string]any { return map[string]any{key: "<" + key + ">"} }

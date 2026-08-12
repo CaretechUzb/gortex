@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -36,19 +37,35 @@ func TestFacadeCapabilityRequestShapeIsDirectCallerInput(t *testing.T) {
 
 func TestFacadeInvalidArgumentsEnvelopeErrorIsSelfCorrecting(t *testing.T) {
 	srv, _ := setupTestServer(t)
-	spec, ok := srv.facades.operation("search", "symbols")
-	require.True(t, ok)
+	for _, test := range []struct {
+		facade       string
+		operation    string
+		arguments    any
+		receivedType string
+	}{
+		{facade: "search", operation: "symbols", arguments: `{"query":"MyType"}`, receivedType: "string"},
+		{facade: "read", operation: "file", arguments: []any{"main.go"}, receivedType: "array"},
+		{facade: "change", operation: "impact", arguments: float64(1), receivedType: "number"},
+	} {
+		t.Run(test.facade+"."+test.operation, func(t *testing.T) {
+			spec, ok := srv.facades.operation(test.facade, test.operation)
+			require.True(t, ok)
+			acceptedFields := srv.facadeAcceptedTopLevelFields(spec)
 
-	result := validateFacadeInput(spec, map[string]any{
-		"operation": "symbols",
-		"query":     "MyType",
-		"arguments": `{"query":"MyType"}`,
-	})
-	require.NotNil(t, result)
-	message := toolResultText(result)
-	require.Contains(t, message, `unexpected top-level key`)
-	require.Contains(t, message, `received string`)
-	require.Contains(t, message, `Pass operation/query/options at the top level`)
+			result := srv.validateFacadeInput(spec, map[string]any{
+				"operation": test.operation,
+				"query":     "MyType",
+				"arguments": test.arguments,
+			})
+			require.NotNil(t, result)
+			message := toolResultText(result)
+			require.Contains(t, message, `unexpected top-level key`)
+			require.Contains(t, message, `received `+test.receivedType)
+			require.Contains(t, message, `pass `+strings.Join(acceptedFields, "/")+` at the top level`)
+			require.NotContains(t, message, "interface {}")
+			require.NotContains(t, message, "float64")
+		})
+	}
 }
 
 func TestFacadeCapabilitiesPublicSchemasMatchEveryAvailableOperation(t *testing.T) {
