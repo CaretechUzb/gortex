@@ -86,3 +86,54 @@ func Run() {
 	assert.Contains(t, targets, "app/lib.go::OneArg",
 		"a generic call with exactly one value argument resolves to its declaration")
 }
+
+// The package-scope argument above covers a var and a func sharing a
+// name. It does NOT cover two cases that are ordinary Go:
+//
+//   - a func-valued STRUCT FIELD, which lives in the type's namespace and
+//     may freely share a name with a method on some other type;
+//   - a LOCAL variable shadowing a package-scope function name.
+//
+// Both spell an index-then-call exactly like a generic instantiation, and
+// before the instantiation marker existed the ordinary name tiers bound
+// them: `t.handlers[k]()` landed on an unrelated `Other.handlers`, and a
+// shadowed `Handler[k]()` landed on the package's `Handler` at the
+// ast_resolved tier. Requiring a real type-parameter list on the target
+// is what separates the instantiation from both impostors.
+func TestResolveGo_IndexedFieldAndLocalShadowDoNotBind(t *testing.T) {
+	g := buildMultiLangGraph(t, map[string]string{
+		"app/a.go": `package app
+
+type Other struct{}
+
+func (o Other) handlers() {}
+
+func Handler() {}
+
+type T struct {
+	handlers map[string]func()
+}
+
+func (t T) Dispatch(k string) {
+	t.handlers[k]()
+}
+
+func LocalShadow(k string) {
+	Handler := map[string]func(){}
+	Handler[k]()
+}
+`,
+	})
+	New(g).ResolveAll()
+
+	for _, caller := range []string{"app/a.go::T.Dispatch", "app/a.go::LocalShadow"} {
+		for _, e := range g.GetOutEdges(caller) {
+			if e.Kind != graph.EdgeCalls {
+				continue
+			}
+			assert.True(t, graph.IsUnresolvedTarget(e.To),
+				"%s: indexing a func value is not a generic call, so it must not bind (got %s)",
+				caller, e.To)
+		}
+	}
+}
