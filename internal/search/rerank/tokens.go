@@ -3,6 +3,7 @@ package rerank
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // tokenize lowercases and splits a string on non-alphanumeric and
@@ -45,9 +46,9 @@ func tokenize(s string) []string {
 				// SCREAMING → Camel split: keep the last upper as
 				// the start of the next token: HTTPHeader → HTTP +
 				// Header.
-				if unicode.IsUpper(r) && unicode.IsUpper(prev) && i+1 < len(s) {
-					next := []rune(s[i:])[1]
-					if unicode.IsLower(next) {
+				if unicode.IsUpper(r) && unicode.IsUpper(prev) {
+					next, size := utf8.DecodeRuneInString(s[i+utf8.RuneLen(r):])
+					if size > 0 && unicode.IsLower(next) {
 						flush()
 					}
 				}
