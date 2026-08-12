@@ -39,7 +39,7 @@ A Gortex daemon is configured machine-wide via the §gortex§ MCP server. Whenev
 // sectionExploreOpener positions the one-shot localization verb as
 // the opening move (standard rendering; the lean profile carries its
 // own condensed line).
-var sectionExploreOpener = bt(`For an explicitly named file to read/review/summarize, call §read(operation:"file", target:{file:"<path>"})§ directly; do not start localization. When the file, symbol, or evidence must be discovered, call §explore(operation:"localize")§ and obey §completion.required_action§; after §answer_ready§ answer from §completion.final_response§ and make no further tool calls. For diagnosis or requested changes, call §explore(operation:"task")§, make at most one focused follow-up, then proceed to impact, edit, and test.
+var sectionExploreOpener = bt(`For an explicitly named file to read/review/summarize, on the first direct file read caused by a new user request call §read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})§; do not start localization. When the file, symbol, or evidence must be discovered, call §explore(operation:"localize")§ and obey §completion.required_action§; after §answer_ready§ answer from §completion.final_response§ and make no further tool calls. For diagnosis or requested changes, call §explore(operation:"task")§, make at most one focused follow-up, then proceed to impact, edit, and test.
 
 `)
 
@@ -48,7 +48,7 @@ var sectionExploreOpener = bt(`For an explicitly named file to read/review/summa
 // can actually call; exact operation schemas remain on demand.
 var sectionCompactWorkflow = bt(`For every coding task:
 
-1. For an explicitly named file to read/review/summarize, call §read(operation:"file", target:{file:"<path>"})§ directly; do not start localization. When the file, symbol, or evidence must be discovered, call §explore(operation:"localize")§ and obey §completion.required_action§; after §answer_ready§, answer from §completion.final_response§ and stop. For diagnosis or modification, call §explore(operation:"task")§.
+1. Named-file read/review/summarize: first new-task call §read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})§; do not localize. When the file, symbol, or evidence must be discovered, call §explore(operation:"localize")§ and obey §completion.required_action§; after §answer_ready§, answer from §completion.final_response§ and stop. For diagnosis or modification, call §explore(operation:"task")§.
 2. In a diagnosis/change flow, make at most one follow-up call on one unresolved symbol with §search§, §read§, §relations§, or §trace§, then continue to step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
 3. Before mutation, call §change(operation:"impact")§; for a signature change, also call §change(operation:"verify")§ with the proposed signature. Mutate only with §edit§ or §refactor§. After mutation, call §change(operation:"detect")§, then use its symbol IDs with §change(operation:"tests")§, §change(operation:"guards")§, and §change(operation:"contract")§.
 4. Call §capabilities§ only when you need the exact fields for an operation.
@@ -65,7 +65,7 @@ var sectionCompactMemory = bt(`Use §recall§ before revisiting prior work. Call
 
 var sectionFullRuleTable = bt(`| Instead of...                       | Use...                                   |
 |-------------------------------------|------------------------------------------|
-| Explicitly named file to read / review / summarize | §read(operation:"file", target:{file:"<path>"})§ directly |
+| Explicitly named file to read / review / summarize | First new-task read: §read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})§ |
 | Unknown file / symbol / evidence / "where is X" | §explore(operation:"localize")§; obey §completion§ |
 | Diagnosing or changing code           | §explore(operation:"task")§, then impact/edit/test |
 | §Grep§ / §grep§ / §rg§ for a symbol | §search_symbols§ (BM25 + camelCase-aware) |
