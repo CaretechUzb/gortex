@@ -3037,6 +3037,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if !localize {
 		return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
 	}
+	declarations := newLocalizationFileDeclarationCache(eng.Reader())
 	symbolTargets = targets[len(artifactTargets):]
 	// An implementation-intent query expands abstract seeds into their
 	// concrete implementors before terminality is judged, so the envelope
@@ -3088,7 +3089,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// along so a bounded index keeps the declarations the task named.
 	pageOutline := localizationPageOutlineProvider(
 		localizationRankedPool, pageTargets, exploreTerminalTerms(task),
-		func(file string) []*graph.Node { return fileDefinitionNodes(eng, file) },
+		declarations.definitions,
 	)
 	// File evidence can make localization answer-ready, but it never becomes a
 	// synthetic exact-symbol read. Exact reads remain declaration-only.
