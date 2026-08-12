@@ -206,7 +206,7 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 					plan.absPath, plan.file = absPath, relPath
 				}
 			}
-		default:
+		case "edit_symbol":
 			switch {
 			case edit.SymbolID == "":
 				plan.err = "edit_symbol op requires id"
@@ -238,6 +238,8 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 					plan.order = 20
 				}
 			}
+		default:
+			plan.err = fmt.Sprintf("unsupported batch edit op %q", plan.op)
 		}
 		plans = append(plans, plan)
 	}
@@ -763,7 +765,7 @@ func (s *Server) handleAtomicBatchEdit(ctx context.Context, req mcp.CallToolRequ
 
 	edits, err := parseBatchEdits(rawEdits)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return batchEditInvalidArgumentResult(err), nil
 	}
 	if len(edits) == 0 {
 		return mcp.NewToolResultError("edits array is empty"), nil
