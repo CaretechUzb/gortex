@@ -3682,23 +3682,27 @@ func (s *Server) handleGetSymbolHistory(ctx context.Context, req mcp.CallToolReq
 // 10.11 handleBatchEdit
 // ---------------------------------------------------------------------------
 
-// batchEditItem represents a single edit in a batch.
 // batchEditItem is one operation in a batch_edit call. It is a discriminated
-// union over `op`: an edit_symbol op carries {id, old_source, new_source}; an
-// edit_file op carries {path, old_string, new_string, replace_all?}. When `op`
-// is omitted it is inferred (edit_file when a path is present, else edit_symbol)
-// so the legacy homogeneous {id, old_source, new_source} payload still works.
+// union over `op`: edit_symbol and edit_file replace content; move_file and
+// delete_file operate on whole files. Lifecycle operations may pin the source
+// bytes with expected_sha256 so the precondition is checked under the same
+// transaction lock as the mutation.
 type batchEditItem struct {
 	Op string `json:"op,omitempty"`
 	// edit_symbol
 	SymbolID  string `json:"id,omitempty"`
 	OldSource string `json:"old_source,omitempty"`
 	NewSource string `json:"new_source,omitempty"`
-	// edit_file
+	// edit_file and delete_file
 	Path       string `json:"path,omitempty"`
 	OldString  string `json:"old_string,omitempty"`
 	NewString  string `json:"new_string,omitempty"`
 	ReplaceAll bool   `json:"replace_all,omitempty"`
+	// move_file
+	SourcePath      string `json:"source,omitempty"`
+	DestinationPath string `json:"destination,omitempty"`
+	// move_file and delete_file
+	ExpectedSHA256 string `json:"expected_sha256,omitempty"`
 }
 
 // kind resolves the operation kind for an item: an explicit, recognised `op`
@@ -3706,7 +3710,7 @@ type batchEditItem struct {
 // edit_symbol.
 func (it batchEditItem) kind() string {
 	switch it.Op {
-	case "edit_file", "edit_symbol":
+	case "edit_file", "edit_symbol", "move_file", "delete_file":
 		return it.Op
 	}
 	if it.Path != "" {
@@ -3720,6 +3724,7 @@ type batchEditResult struct {
 	Op                       string `json:"op,omitempty"`
 	SymbolID                 string `json:"id,omitempty"`
 	FilePath                 string `json:"path"`
+	DestinationPath          string `json:"destination,omitempty"`
 	Status                   string `json:"status"` // "applied", "failed", "skipped"
 	Error                    string `json:"error,omitempty"`
 	Reindexed                bool   `json:"reindexed"`
@@ -3764,6 +3769,27 @@ func batchEditItemsSchema() map[string]any {
 					"replace_all": map[string]any{"type": "boolean", "description": "Replace every occurrence instead of requiring uniqueness."},
 				},
 				"required": []any{"op", "path", "old_string", "new_string"},
+			},
+			map[string]any{
+				"type":        "object",
+				"description": "Move a whole file atomically within an indexed repository.",
+				"properties": map[string]any{
+					"op":              map[string]any{"const": "move_file"},
+					"source":          map[string]any{"type": "string", "description": "Existing source path (repo-relative or absolute)."},
+					"destination":     map[string]any{"type": "string", "description": "Non-existing destination path in the same indexed repository."},
+					"expected_sha256": map[string]any{"type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "Optional SHA-256 precondition for the complete source bytes."},
+				},
+				"required": []any{"op", "source", "destination"},
+			},
+			map[string]any{
+				"type":        "object",
+				"description": "Delete a whole file atomically within an indexed repository.",
+				"properties": map[string]any{
+					"op":              map[string]any{"const": "delete_file"},
+					"path":            map[string]any{"type": "string", "description": "Existing file path (repo-relative or absolute)."},
+					"expected_sha256": map[string]any{"type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "Optional SHA-256 precondition for the complete file bytes."},
+				},
+				"required": []any{"op", "path"},
 			},
 		},
 	}

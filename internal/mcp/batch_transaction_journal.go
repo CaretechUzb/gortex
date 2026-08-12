@@ -160,15 +160,30 @@ func (s *Server) prepareBatchJournal(receipt *batchTransactionReceipt, buffers m
 	files := make([]batchTransactionFile, 0, len(orderedPaths))
 	for i, path := range orderedPaths {
 		buffer := buffers[path]
-		backupName := fmt.Sprintf("before-%04d.bin", i)
-		backupPath := filepath.Join(dir, backupName)
-		if err := s.batchDurability().writeFile(backupPath, buffer.original, 0o600); err != nil {
-			return fmt.Errorf("write backup for %s: %w", buffer.relPath, err)
+		// Non-nil byte slices preserve compatibility with direct test/embedding
+		// construction that predates explicit existence-state fields.
+		existsBefore, existsAfter := buffer.existsBefore, buffer.existsAfter
+		if !buffer.existenceSet {
+			existsBefore = buffer.original != nil
+			existsAfter = buffer.content != nil
 		}
-		files = append(files, batchTransactionFile{
+		file := batchTransactionFile{
 			Path: path, RelativePath: buffer.relPath, Mode: buffer.mode,
-			BeforeSHA256: digestBatchBytes(buffer.original), AfterSHA256: digestBatchBytes(buffer.content), Backup: backupName,
-		})
+			BeforeAbsent: !existsBefore, AfterAbsent: !existsAfter,
+		}
+		if existsBefore {
+			backupName := fmt.Sprintf("before-%04d.bin", i)
+			backupPath := filepath.Join(dir, backupName)
+			if err := s.batchDurability().writeFile(backupPath, buffer.original, 0o600); err != nil {
+				return fmt.Errorf("write backup for %s: %w", buffer.relPath, err)
+			}
+			file.BeforeSHA256 = digestBatchBytes(buffer.original)
+			file.Backup = backupName
+		}
+		if existsAfter {
+			file.AfterSHA256 = digestBatchBytes(buffer.content)
+		}
+		files = append(files, file)
 		// Keep the receipt aware of every completed backup so an error on a
 		// later file still cleans the already-durable partial journal.
 		receipt.Files = append([]batchTransactionFile(nil), files...)
@@ -198,6 +213,20 @@ func readBatchBackup(receipt batchTransactionReceipt, file batchTransactionFile)
 func classifyBatchFiles(files []batchTransactionFile) (before, after, unknown []batchTransactionFile, err error) {
 	for _, file := range files {
 		content, readErr := os.ReadFile(file.Path)
+		if errors.Is(readErr, os.ErrNotExist) {
+			switch {
+			case file.BeforeAbsent:
+				before = append(before, file)
+			case file.AfterAbsent:
+				after = append(after, file)
+			default:
+				unknown = append(unknown, file)
+				if err == nil {
+					err = fmt.Errorf("%s is unexpectedly absent", file.RelativePath)
+				}
+			}
+			continue
+		}
 		if readErr != nil {
 			unknown = append(unknown, file)
 			if err == nil {
@@ -206,15 +235,15 @@ func classifyBatchFiles(files []batchTransactionFile) (before, after, unknown []
 			continue
 		}
 		digest := digestBatchBytes(content)
-		switch digest {
-		case file.BeforeSHA256:
+		switch {
+		case !file.BeforeAbsent && digest == file.BeforeSHA256:
 			before = append(before, file)
-		case file.AfterSHA256:
+		case !file.AfterAbsent && digest == file.AfterSHA256:
 			after = append(after, file)
 		default:
 			unknown = append(unknown, file)
 			if err == nil {
-				err = fmt.Errorf("%s has neither the before nor after transaction hash", file.RelativePath)
+				err = fmt.Errorf("%s has neither the before nor after transaction state", file.RelativePath)
 			}
 		}
 	}
@@ -227,6 +256,12 @@ func (s *Server) rollbackBatchReceipt(receipt batchTransactionReceipt) (string, 
 		return "recovery_conflict", fmt.Errorf("rollback refused unknown disk state: %w", classifyErr)
 	}
 	for _, file := range after {
+		if file.BeforeAbsent {
+			if err := s.batchDurability().removeFile(file.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return "recovery_conflict", fmt.Errorf("remove rollback-created %s: %w", file.RelativePath, err)
+			}
+			continue
+		}
 		backup, err := readBatchBackup(receipt, file)
 		if err != nil {
 			return "recovery_conflict", fmt.Errorf("load rollback backup for %s: %w", file.RelativePath, err)

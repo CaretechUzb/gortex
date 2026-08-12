@@ -366,11 +366,13 @@ type Server struct {
 
 	// batchTransactions holds daemon-lifetime delivery receipts for atomic
 	// batch edits. sync.Map's zero value keeps directly-constructed test and
-	// embedded servers usable without constructor wiring. batchWriteOverride is
-	// a narrow target-write fault-injection seam; batchDurabilityOverride covers
-	// journal, fsync, rollback, and cleanup ordering. Production leaves both nil.
+	// embedded servers usable without constructor wiring. The write/remove
+	// overrides are narrow target-mutation fault-injection seams;
+	// batchDurabilityOverride covers journal, fsync, rollback, and cleanup
+	// ordering. Production leaves all three nil.
 	batchTransactions       sync.Map
 	batchWriteOverride      func(string, []byte, os.FileMode) error
+	batchRemoveOverride     func(string) error
 	batchDurabilityOverride *batchDurabilityOps
 
 	// packCache retains recent smart_context pack views keyed by pack
