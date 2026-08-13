@@ -106,7 +106,7 @@ func localizationStructuredSymbolClaim(value string) string {
 	if len(fields) == 0 {
 		return ""
 	}
-	claim := strings.Trim(fields[0], "`_.$:#\\/-,;:")
+	claim := strings.Trim(fields[0], "`_.$:#\\/-,;")
 	for strings.HasSuffix(claim, "()") {
 		claim = strings.TrimSuffix(claim, "()")
 	}
@@ -119,7 +119,7 @@ func localizationStructuredSymbolClaim(value string) string {
 			claim = claim[1:close] + claim[close+1:]
 		}
 	}
-	return strings.Trim(claim, "`_.$:#\\/-,;:")
+	return strings.Trim(claim, "`_.$:#\\/-,;")
 }
 
 func localizationCodeShapedClaim(claim string) bool {
