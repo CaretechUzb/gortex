@@ -564,6 +564,38 @@ func (s *Server) overlayContentFor(ctx context.Context, absPath string) (string,
 	return "", false
 }
 
+// overlayShadowsGraphPath reports whether the active request replaces or
+// tombstones the path represented by a base search hit. Search indexes are
+// built from durable files, so their snippets must never authenticate stale
+// content from a file whose editor overlay owns the request-time view.
+func (s *Server) overlayShadowsGraphPath(ctx context.Context, graphPath, nodeID string) bool {
+	view := OverlayViewFromContext(ctx)
+	if view == nil || view.Layer() == nil {
+		return false
+	}
+	layer := view.Layer()
+	for _, candidate := range []string{graphPath, graph.IDFile(nodeID)} {
+		candidate = filepath.ToSlash(filepath.Clean(strings.TrimSpace(candidate)))
+		if candidate != "" && candidate != "." && layer.HasFile(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) filterOverlayContentHits(ctx context.Context, hits []graph.ContentHit) []graph.ContentHit {
+	if OverlayViewFromContext(ctx) == nil || len(hits) == 0 {
+		return hits
+	}
+	filtered := hits[:0:0]
+	for _, hit := range hits {
+		if !s.overlayShadowsGraphPath(ctx, hit.FilePath, hit.NodeID) {
+			filtered = append(filtered, hit)
+		}
+	}
+	return filtered
+}
+
 // overlayCacheInvalidate drops the cached layer for a session. Called
 // by overlay_push / overlay_delete / overlay_drop so the next tool
 // call re-parses with the fresh buffer state.

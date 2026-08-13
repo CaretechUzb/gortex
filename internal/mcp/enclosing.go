@@ -229,11 +229,12 @@ func (s *Server) buildFileSymbolIndexForPathsContext(ctx context.Context, paths 
 // keeping file-node lookup bounded by ctx. Source-literal mapping uses this to
 // query authoritative match paths before compatibility aliases.
 func (s *Server) buildFileSymbolIndexForOrderedPathsContext(ctx context.Context, paths []string) map[string]*fileSymbolIndex {
-	if s.graph == nil || len(paths) == 0 || ctx.Err() != nil {
+	reader := s.readerFor(ctx)
+	if reader == nil || len(paths) == 0 || ctx.Err() != nil {
 		return nil
 	}
 	out := make(map[string]*fileSymbolIndex, len(paths))
-	contextReader, hasContextReader := s.graph.(contextFileNodeReader)
+	contextReader, hasContextReader := reader.(contextFileNodeReader)
 	for _, path := range paths {
 		if ctx.Err() != nil {
 			break
@@ -242,7 +243,7 @@ func (s *Server) buildFileSymbolIndexForOrderedPathsContext(ctx context.Context,
 		if hasContextReader {
 			nodes = contextReader.GetFileNodesContext(ctx, path)
 		} else {
-			nodes = s.graph.GetFileNodes(path)
+			nodes = reader.GetFileNodes(path)
 		}
 		if ctx.Err() != nil {
 			break

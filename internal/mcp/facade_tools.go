@@ -735,11 +735,15 @@ func (s *Server) captureLocalizationSearchText(ctx context.Context, matches []en
 }
 
 func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTextMatch) (*graph.Node, string) {
-	if s == nil || s.graph == nil {
+	if s == nil {
+		return nil, ""
+	}
+	reader := s.readerFor(ctx)
+	if reader == nil {
 		return nil, ""
 	}
 	if id := strings.TrimSpace(match.SymbolID); id != "" {
-		if node := s.graph.GetNode(id); node != nil && s.nodeInSessionScope(ctx, node) {
+		if node := reader.GetNode(id); node != nil && s.nodeInSessionScope(ctx, node) {
 			return node, "permitted_search_text"
 		}
 		return nil, ""
@@ -751,7 +755,7 @@ func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTe
 	var owner *graph.Node
 	var fileNode *graph.Node
 	ownerSpan := int(^uint(0) >> 1)
-	for _, node := range s.graph.GetFileNodes(path) {
+	for _, node := range reader.GetFileNodes(path) {
 		if node == nil || !s.nodeInSessionScope(ctx, node) {
 			continue
 		}
@@ -781,7 +785,7 @@ func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTe
 		return owner, "permitted_search_text_owner"
 	}
 	if fileNode == nil {
-		if node := s.graph.GetNode(path); node != nil && node.Kind == graph.KindFile && s.nodeInSessionScope(ctx, node) {
+		if node := reader.GetNode(path); node != nil && node.Kind == graph.KindFile && s.nodeInSessionScope(ctx, node) {
 			fileNode = node
 		}
 	}

@@ -1015,7 +1015,7 @@ func (s *Server) gatherExploreSyntacticAnchorCandidatesCollecting(
 	for _, hit := range recall.hits {
 		ids = append(ids, hit.nodeID)
 	}
-	nodes := s.graph.GetNodesByIDs(ids)
+	nodes := s.readerFor(ctx).GetNodesByIDs(ids)
 	for localIndex, anchorIndex := range missed {
 		var fallback *graph.Node
 		var selected *graph.Node

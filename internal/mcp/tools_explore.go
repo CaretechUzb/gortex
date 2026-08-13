@@ -5656,9 +5656,15 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 	scope query.QueryOptions,
 	collector *localizationSourceWindowHitCollector,
 ) []*rerank.Candidate {
-	if s == nil || s.graph == nil || ctx.Err() != nil {
+	if s == nil || ctx.Err() != nil {
 		return nil
 	}
+	reader := s.readerFor(ctx)
+	if reader == nil {
+		return nil
+	}
+	// Durable content FTS remains the discovery backend. Overlay-owned files
+	// are filtered below before any snippet can authenticate a candidate.
 	content, hasContent := s.graph.(graph.ContentSearcher)
 	if len(terms) == 0 {
 		return nil
@@ -5693,7 +5699,9 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 		if err != nil {
 			continue
 		}
-		pages = append(pages, recallPage{term: term, hits: hits, saturated: len(hits) >= perTerm})
+		saturated := len(hits) >= perTerm
+		hits = s.filterOverlayContentHits(ctx, hits)
+		pages = append(pages, recallPage{term: term, hits: hits, saturated: saturated})
 	}
 
 	// A short or collision-heavy literal can fill the first page before its
@@ -5727,8 +5735,8 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 	}
 	if retry >= 0 && ctx.Err() == nil {
 		if hits, err := content.SearchContent(pages[retry].term, repoPrefix, exploreQuotedRecallRetryMaxRows); err == nil {
-			pages[retry].hits = hits
 			pages[retry].saturated = len(hits) >= exploreQuotedRecallRetryMaxRows
+			pages[retry].hits = s.filterOverlayContentHits(ctx, hits)
 		}
 	}
 
@@ -5779,7 +5787,7 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 	}
 	nodes := make(map[string]*graph.Node, len(order))
 	if len(order) > 0 {
-		nodes = s.graph.GetNodesByIDs(order)
+		nodes = reader.GetNodesByIDs(order)
 	}
 	// Decide source coverage per quoted term. An exact metadata hit for one
 	// symbol-like term must not suppress a different compact value whose only
@@ -5852,7 +5860,7 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 			}
 		}
 		if len(missingNodes) > 0 {
-			for id, node := range s.graph.GetNodesByIDs(missingNodes) {
+			for id, node := range reader.GetNodesByIDs(missingNodes) {
 				nodes[id] = node
 			}
 		}
@@ -5869,7 +5877,7 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 				}
 			}
 			if len(calleeIDs) > 0 {
-				for id, edges := range s.graph.GetOutEdgesByNodeIDs(calleeIDs) {
+				for id, edges := range reader.GetOutEdgesByNodeIDs(calleeIDs) {
 					for _, edge := range edges {
 						if edge != nil && edge.Kind == graph.EdgeInstantiates {
 							sourceLiteralTaskAligned[id] = true

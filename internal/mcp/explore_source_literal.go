@@ -483,6 +483,10 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 	if s == nil || len(matches) == 0 || ctx.Err() != nil {
 		return exploreSourceLiteralRecall{}
 	}
+	reader := s.readerFor(ctx)
+	if reader == nil {
+		return exploreSourceLiteralRecall{}
+	}
 	saturated := len(matches) >= exploreSourceLiteralRecallMaxHits
 	if len(matches) > exploreSourceLiteralRecallMaxHits {
 		matches = matches[:exploreSourceLiteralRecallMaxHits]
@@ -570,7 +574,7 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 	}
 
 	if len(ownerIDs) > 0 {
-		ownerEdges = s.graph.GetOutEdgesByNodeIDs(ownerIDs)
+		ownerEdges = reader.GetOutEdgesByNodeIDs(ownerIDs)
 		for _, item := range mapped {
 			if item.callName == "" {
 				continue
@@ -589,7 +593,7 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 	}
 	calleeNodes := map[string]*graph.Node{}
 	if len(calleeIDs) > 0 {
-		calleeNodes = s.graph.GetNodesByIDs(calleeIDs)
+		calleeNodes = reader.GetNodesByIDs(calleeIDs)
 	}
 
 	seen := make(map[string]int, len(mapped))
@@ -809,6 +813,19 @@ func exploreSourceLiteralUnprefixedPath(path, repoPrefix string) string {
 	return strings.TrimPrefix(path, marker)
 }
 
+func (s *Server) filterExploreSourceLiteralMatches(ctx context.Context, matches []trigram.Match) []trigram.Match {
+	if OverlayViewFromContext(ctx) == nil || len(matches) == 0 {
+		return matches
+	}
+	filtered := matches[:0:0]
+	for _, match := range matches {
+		if !s.overlayShadowsGraphPath(ctx, match.Path, "") {
+			filtered = append(filtered, match)
+		}
+	}
+	return filtered
+}
+
 // searchExploreSourceLiteral mirrors search_text's literal backend while
 // deliberately refusing an unscoped multi-repository fan-out. The caller's
 // session locality supplies repoPrefix in normal operation. maxHits is the
@@ -843,7 +860,7 @@ func (s *Server) searchExploreSourceLiteral(
 		)
 		if result.Owned {
 			return exploreSourceLiteralSearch{
-				matches:          result.Matches,
+				matches:          s.filterExploreSourceLiteralMatches(ctx, result.Matches),
 				incomplete:       result.Incomplete,
 				backend:          "multi",
 				owned:            true,
@@ -867,7 +884,7 @@ func (s *Server) searchExploreSourceLiteral(
 			exploreSourceLiteralRecallMaxFiles,
 		)
 		return exploreSourceLiteralSearch{
-			matches:          matches,
+			matches:          s.filterExploreSourceLiteralMatches(ctx, matches),
 			incomplete:       incomplete,
 			backend:          "direct",
 			owned:            true,

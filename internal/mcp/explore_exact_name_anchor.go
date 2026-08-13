@@ -447,7 +447,11 @@ func (s *Server) exploreQualifiedAnchorOwnerCandidate(
 	scope query.QueryOptions,
 	usedIDs map[string]struct{},
 ) *rerank.Candidate {
-	if s == nil || s.graph == nil || member == nil || anchor.qualifiedName == "" || ctx.Err() != nil {
+	if s == nil || member == nil || anchor.qualifiedName == "" || ctx.Err() != nil {
+		return nil
+	}
+	reader := s.readerFor(ctx)
+	if reader == nil {
 		return nil
 	}
 	dot := strings.LastIndexByte(anchor.qualifiedName, '.')
@@ -463,7 +467,7 @@ func (s *Server) exploreQualifiedAnchorOwnerCandidate(
 	}
 	var best *graph.Node
 	rawScanned, eligibleScanned := 0, 0
-	for _, node := range s.graph.FindNodesByName(owner) {
+	for _, node := range reader.FindNodesByName(owner) {
 		if rawScanned == exploreExactNameAnchorOwnerRawScan {
 			break
 		}
