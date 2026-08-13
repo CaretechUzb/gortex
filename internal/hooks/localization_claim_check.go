@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 const localizationClaimCheckMaxChars = 600
@@ -151,5 +152,9 @@ func boundedLocalizationClaimCheck(prompt string) string {
 		return prompt
 	}
 	const suffix = "… Do not retrieve more evidence."
-	return fmt.Sprintf("%s%s", prompt[:localizationClaimCheckMaxChars-len(suffix)], suffix)
+	cut := localizationClaimCheckMaxChars - len(suffix)
+	for cut > 0 && !utf8.RuneStart(prompt[cut]) {
+		cut--
+	}
+	return fmt.Sprintf("%s%s", prompt[:cut], suffix)
 }
