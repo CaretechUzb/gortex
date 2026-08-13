@@ -226,3 +226,45 @@ func TestAtomicBatchLifecycleUsesDurableWriterForCreatedDestination(t *testing.T
 		t.Fatalf("receipt=%+v writes=%d", receipt, writes.Load())
 	}
 }
+
+func TestAtomicBatchLifecycleCommitsCreationsBeforeRemovals(t *testing.T) {
+	s := newAtomicBatchTestServer(t, mutationTestWatcher{})
+	dir := t.TempDir()
+	source := writeAtomicBatchFixture(t, dir, "aaa-source.txt", "source\n")
+	destination := filepath.Join(dir, "zzz-destination.txt")
+	operations := make([]string, 0, 2)
+	s.batchWriteOverride = func(path string, content []byte, mode os.FileMode) error {
+		operations = append(operations, "write:"+filepath.Base(path))
+		return agents.AtomicWriteFile(path, content, mode)
+	}
+	s.batchRemoveOverride = func(path string) error {
+		operations = append(operations, "remove:"+filepath.Base(path))
+		return os.Remove(path)
+	}
+
+	receipt, err := s.runBatchTransaction(context.Background(), []batchEditItem{
+		atomicFileMove(source, destination, ""),
+	}, "file-lifecycle-create-before-remove")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Status != "committed" {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+	if got, want := strings.Join(operations, ","), "write:zzz-destination.txt,remove:aaa-source.txt"; got != want {
+		t.Fatalf("commit order = %q, want %q", got, want)
+	}
+}
+
+func TestValidateBatchCreateTargetRejectsLateDestination(t *testing.T) {
+	s := newAtomicBatchTestServer(t, mutationTestWatcher{})
+	dir := t.TempDir()
+	destination := filepath.Join(dir, "destination.txt")
+	if err := s.validateBatchCreateTarget(destination, "destination.txt"); err != nil {
+		t.Fatalf("absent destination rejected: %v", err)
+	}
+	writeAtomicBatchFixture(t, dir, "destination.txt", "racer\n")
+	if err := s.validateBatchCreateTarget(destination, "destination.txt"); err == nil || !strings.Contains(err.Error(), "destination already exists") {
+		t.Fatalf("late destination error = %v", err)
+	}
+}

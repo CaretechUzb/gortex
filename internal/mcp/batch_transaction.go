@@ -444,8 +444,13 @@ func (s *Server) readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFi
 			if readErr != nil {
 				return fmt.Errorf("could not read %s: %w", relPath, readErr)
 			}
-			buffer.mode = info.Mode().Perm()
 			buffer.fileMode = info.Mode()
+			// fileMode intentionally describes the path itself for lifecycle
+			// type checks, while mode follows symlinks so edit_file preserves
+			// the permissions of the content source it is replacing.
+			if followed, statErr := os.Stat(path); statErr == nil {
+				buffer.mode = followed.Mode().Perm()
+			}
 			buffer.original = append([]byte(nil), content...)
 			buffer.content = append([]byte(nil), content...)
 			buffer.existsBefore = true
@@ -725,23 +730,35 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		receipt.Summary = batchSummary(receipt.Results)
 		return s.finishBatchTransaction(state, receipt, status, diskStatus, "not_started", message)
 	}
+	// Publish every after-image before removing any before-image. For moves this
+	// keeps the source intact until the destination has passed its final
+	// collision guard and has been durably written.
 	for _, path := range orderedPaths {
 		buffer := buffers[path]
+		if !buffer.existsAfter {
+			continue
+		}
 		var commitErr error
-		if buffer.existsAfter {
-			if !buffer.existsBefore {
-				if targetErr := s.validateBatchCreateTarget(path, buffer.relPath); targetErr != nil {
-					commitErr = targetErr
-				} else {
-					commitErr = writer(path, buffer.content, buffer.mode)
-				}
+		if !buffer.existsBefore {
+			if targetErr := s.validateBatchCreateTarget(path, buffer.relPath); targetErr != nil {
+				commitErr = targetErr
 			} else {
 				commitErr = writer(path, buffer.content, buffer.mode)
 			}
 		} else {
-			commitErr = remover(path)
+			commitErr = writer(path, buffer.content, buffer.mode)
 		}
 		if commitErr != nil {
+			message := fmt.Sprintf("could not commit %s: %v", buffer.relPath, commitErr)
+			return finishCommitFailure(buffer.relPath, message), nil
+		}
+	}
+	for _, path := range orderedPaths {
+		buffer := buffers[path]
+		if buffer.existsAfter {
+			continue
+		}
+		if commitErr := remover(path); commitErr != nil {
 			message := fmt.Sprintf("could not commit %s: %v", buffer.relPath, commitErr)
 			return finishCommitFailure(buffer.relPath, message), nil
 		}

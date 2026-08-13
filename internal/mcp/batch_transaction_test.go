@@ -73,6 +73,47 @@ func TestBatchEditSchemaAdvertisesAtomicStatusProtocol(t *testing.T) {
 	if !strings.Contains(legacy.tool.Description, "restores all touched files") || !strings.Contains(legacy.tool.Description, "daemon restart") {
 		t.Fatalf("batch_edit description does not state atomic/durable behavior: %q", legacy.tool.Description)
 	}
+	for _, operation := range []string{"edit_symbol", "edit_file", "move_file", "delete_file"} {
+		if !strings.Contains(legacy.tool.Description, operation) {
+			t.Fatalf("batch_edit description does not advertise %s: %q", operation, legacy.tool.Description)
+		}
+	}
+}
+
+func TestAtomicBatchEditFileThroughSymlinkPreservesTargetPermissions(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("symlink creation is not reliably available on Windows CI")
+	}
+	s := newAtomicBatchTestServer(t, mutationTestWatcher{})
+	dir := t.TempDir()
+	target := writeAtomicBatchFixture(t, dir, "target.txt", "before\n")
+	if err := os.Chmod(target, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	receipt, err := s.runBatchTransaction(context.Background(), []batchEditItem{
+		atomicFileEdit(link, "before", "after"),
+	}, "edit-file-symlink-permissions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Status != "committed" {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+	info, err := os.Stat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("replacement permissions = %04o, want 0600", got)
+	}
+	if got := readAtomicBatchFixture(t, link); got != "after\n" {
+		t.Fatalf("replacement content = %q", got)
+	}
 }
 
 func TestBatchTransactionDefaultIDsAreUnique(t *testing.T) {
