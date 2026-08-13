@@ -85,19 +85,20 @@ func SetAgent(name string) {
 func ActiveAgent() string { return activeAgent }
 
 var hookEffectivenessEvents = map[string]bool{
-	"PostToolUse":                          true,
-	"PreToolUse":                           true,
-	"SessionStart":                         true,
-	"UserPromptSubmit":                     true,
-	"PreCompact":                           true,
-	"PostCompact":                          true,
-	"Stop":                                 true,
-	"SubagentStart":                        true,
-	"SubagentStop":                         true,
-	"LocalizationTerminal.observed":        true,
-	"LocalizationTerminal.denied":          true,
-	"LocalizationTerminal.cleared_prompt":  true,
-	"LocalizationTerminal.cleared_session": true,
+	"PostToolUse":                   true,
+	"PreToolUse":                    true,
+	"SessionStart":                  true,
+	"UserPromptSubmit":              true,
+	"PreCompact":                    true,
+	"PostCompact":                   true,
+	"Stop":                          true,
+	"SubagentStart":                 true,
+	"SubagentStop":                  true,
+	"LocalizationTerminal.observed": true,
+	"LocalizationTerminal.denied":   true,
+	"LocalizationTerminal.claim_lock_release_failed": true,
+	"LocalizationTerminal.cleared_prompt":            true,
+	"LocalizationTerminal.cleared_session":           true,
 }
 
 // hookDecisionsPath returns the telemetry file path. Respects GORTEX_HOOK_LOG

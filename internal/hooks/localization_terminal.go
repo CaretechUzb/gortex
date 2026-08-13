@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -758,25 +760,42 @@ func acquireLocalizationClaimCheck(path string) (func(), bool) {
 	return func() { releaseLocalizationClaimLock(lock) }, true
 }
 
+const localizationClaimLockReleaseAttempts = 3
+
 func releaseLocalizationClaimLock(lock *flock.Flock) {
-	releaseLocalizationClaimLockWith(lock, func(candidate *flock.Flock) error {
+	releaseLocalizationClaimLockObserved(lock, func(candidate *flock.Flock) error {
 		// Close is gofrs/flock's documented release API: it unlocks and closes
 		// the underlying descriptor while leaving the reusable sidecar in place.
 		return candidate.Close()
 	})
 }
 
-func releaseLocalizationClaimLockWith(lock *flock.Flock, release func(*flock.Flock) error) {
-	if lock == nil || release == nil || release(lock) == nil {
-		return
+func releaseLocalizationClaimLockObserved(lock *flock.Flock, release func(*flock.Flock) error) bool {
+	started := time.Now()
+	if releaseLocalizationClaimLockWith(lock, release) {
+		return true
 	}
-	// Retry through the concrete release API if an injected wrapper or a
-	// transient syscall error fails before descriptor cleanup.
-	for attempts := 0; attempts < 2; attempts++ {
-		if lock.Close() == nil {
-			return
+	localizationTerminalTelemetry("claim_lock_release_failed", true, started)
+	return false
+}
+
+func releaseLocalizationClaimLockWith(lock *flock.Flock, release func(*flock.Flock) error) bool {
+	if lock == nil {
+		return true
+	}
+	if release == nil {
+		return false
+	}
+	for attempt := 0; attempt < localizationClaimLockReleaseAttempts; attempt++ {
+		err := release(lock)
+		if err == nil {
+			return true
+		}
+		if !errors.Is(err, syscall.EINTR) {
+			return false
 		}
 	}
+	return false
 }
 
 func readLocalizationTerminalMarker(path string, identity localizationTerminalIdentity) (localizationTerminalMarker, bool) {

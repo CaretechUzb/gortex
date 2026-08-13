@@ -66,8 +66,30 @@ func localizationBoundedSymbolClaims(message string) ([]string, bool, bool) {
 	explicitNone := false
 	inSymbols := false
 	symbolsSawContent := false
+	lines := strings.Split(message, "\n")
+	var fence localizationMarkdownFenceState
 
-	for _, line := range strings.Split(message, "\n") {
+	for index, line := range lines {
+		markdown := localizationMarkdownContainerContent(line)
+		if marker, ok := localizationMarkdownFenceMarker(markdown); ok {
+			if !fence.open {
+				fence = marker
+				continue
+			}
+			if marker.character == fence.character && marker.length >= fence.length && marker.closing {
+				fence = localizationMarkdownFenceState{}
+				continue
+			}
+		}
+		if fence.open {
+			// A heading-looking line inside a code fence is code, not a heading.
+			// Scan it so a fabricated qualified identity cannot hide behind '#'.
+			if !localizationScanUnstructuredClaimBody(line, budget) {
+				return nil, false, false
+			}
+			continue
+		}
+
 		trimmed := strings.TrimSpace(line)
 		if localizationSymbolsHeading(trimmed) {
 			inSymbols = true
@@ -81,19 +103,19 @@ func localizationBoundedSymbolClaims(message string) ([]string, bool, bool) {
 				}
 				continue
 			}
-			if localizationMarkdownHeading(trimmed) || localizationEmptyClaimRoleLabel(trimmed) {
+			if localizationMarkdownHeadingAt(lines, index) || localizationEmptyClaimRoleLabel(trimmed) {
 				inSymbols = false
 				continue
 			}
 			token, rest, none, material := localizationStructuredClaimLine(trimmed)
 			if material {
 				symbolsSawContent = true
-				if !budget.countToken(token) {
+				if token != "" && !budget.countToken(token) {
 					return nil, false, false
 				}
 				if none {
 					explicitNone = true
-				} else if !budget.addClaim(localizationStructuredSymbolClaim(token), false) {
+				} else if token != "" && !budget.addClaim(localizationStructuredSymbolClaim(token), false) {
 					return nil, false, false
 				}
 				if rest != "" && !localizationScanUnstructuredClaimBody(rest, budget) {
@@ -102,6 +124,9 @@ func localizationBoundedSymbolClaims(message string) ([]string, bool, bool) {
 				continue
 			}
 			inSymbols = false
+		}
+		if localizationMarkdownHeadingAt(lines, index) {
+			continue
 		}
 		body, inspect := localizationUnstructuredClaimLine(line)
 		if inspect && !localizationScanUnstructuredClaimBody(body, budget) {
@@ -185,13 +210,90 @@ func localizationUnstructuredClaimLine(line string) (string, bool) {
 	return line, true
 }
 
-func localizationMarkdownHeading(line string) bool {
+type localizationMarkdownFenceState struct {
+	open      bool
+	character byte
+	length    int
+	closing   bool
+}
+
+func localizationMarkdownFenceMarker(line string) (localizationMarkdownFenceState, bool) {
+	line = strings.TrimLeft(line, " \t")
+	if len(line) < 3 || (line[0] != '`' && line[0] != '~') {
+		return localizationMarkdownFenceState{}, false
+	}
+	character := line[0]
+	length := 0
+	for length < len(line) && line[length] == character {
+		length++
+	}
+	if length < 3 {
+		return localizationMarkdownFenceState{}, false
+	}
+	return localizationMarkdownFenceState{
+		open:      true,
+		character: character,
+		length:    length,
+		closing:   strings.TrimSpace(line[length:]) == "",
+	}, true
+}
+
+func localizationMarkdownContainerContent(line string) string {
 	line = strings.TrimSpace(line)
+	for depth := 0; depth < 8 && line != ""; depth++ {
+		before := line
+		if line[0] == '>' && (len(line) == 1 || line[1] == ' ' || line[1] == '\t') {
+			line = strings.TrimSpace(line[1:])
+		}
+		if len(line) >= 2 && strings.ContainsRune("-*+", rune(line[0])) && (line[1] == ' ' || line[1] == '\t') {
+			line = strings.TrimSpace(line[1:])
+		} else {
+			index := 0
+			for index < len(line) && line[index] >= '0' && line[index] <= '9' {
+				index++
+			}
+			if index > 0 && index+1 < len(line) && (line[index] == '.' || line[index] == ')') && (line[index+1] == ' ' || line[index+1] == '\t') {
+				line = strings.TrimSpace(line[index+1:])
+			}
+		}
+		if line == before {
+			break
+		}
+	}
+	return line
+}
+
+func localizationMarkdownHeading(line string) bool {
+	line = localizationMarkdownContainerContent(line)
 	count := 0
 	for count < len(line) && line[count] == '#' {
 		count++
 	}
 	return count > 0 && count <= 6 && (count == len(line) || line[count] == ' ' || line[count] == '\t')
+}
+
+func localizationMarkdownSetextUnderline(line string) bool {
+	line = localizationMarkdownContainerContent(line)
+	if line == "" || (line[0] != '=' && line[0] != '-') {
+		return false
+	}
+	for index := 1; index < len(line); index++ {
+		if line[index] != line[0] {
+			return false
+		}
+	}
+	return true
+}
+
+func localizationMarkdownHeadingAt(lines []string, index int) bool {
+	if index < 0 || index >= len(lines) {
+		return false
+	}
+	if localizationMarkdownHeading(lines[index]) || localizationMarkdownSetextUnderline(lines[index]) {
+		return true
+	}
+	content := localizationMarkdownContainerContent(lines[index])
+	return content != "" && index+1 < len(lines) && localizationMarkdownSetextUnderline(lines[index+1])
 }
 
 func localizationEmptyClaimRoleLabel(line string) bool {
@@ -221,7 +323,7 @@ func localizationClaimTokenRune(r rune) bool {
 }
 
 func localizationStructuredClaimLine(line string) (token, rest string, explicitNone, material bool) {
-	line, listed := localizationTrimClaimListMarker(line)
+	line, _ = localizationTrimClaimListMarker(line)
 	if line == "" {
 		return "", "", false, false
 	}
@@ -230,11 +332,44 @@ func localizationStructuredClaimLine(line string) (token, rest string, explicitN
 	}
 	token = localizationFirstClaimToken(line)
 	claim := localizationStructuredSymbolClaim(token)
-	if !listed && token != line && !localizationCodeShapedClaim(claim) {
-		return "", "", false, false
-	}
 	rest = strings.TrimSpace(strings.TrimPrefix(line, token))
-	return token, rest, false, true
+	if rest == "" && localizationExplicitIdentityRow(token, claim) {
+		return token, "", false, true
+	}
+	if localizationCodeShapedClaim(claim) {
+		return token, rest, false, true
+	}
+	// A prose row inside SYMBOLS is not permission to accept its first bare
+	// word as an identity. Scan the complete row for qualified claims instead.
+	return "", line, false, true
+}
+
+func localizationExplicitIdentityRow(token, claim string) bool {
+	if token == "" || claim == "" {
+		return false
+	}
+	unwrapped := strings.TrimSpace(token)
+	if strings.HasPrefix(unwrapped, "`") && strings.HasSuffix(unwrapped, "`") && len(unwrapped) > 2 {
+		unwrapped = unwrapped[1 : len(unwrapped)-1]
+	}
+	for strings.HasSuffix(unwrapped, "()") {
+		unwrapped = strings.TrimSuffix(unwrapped, "()")
+	}
+	if unwrapped != claim {
+		return false
+	}
+	for index, r := range claim {
+		if index == 0 {
+			if !unicode.IsLetter(r) && r != '_' && r != '$' {
+				return false
+			}
+			continue
+		}
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '$' {
+			return false
+		}
+	}
+	return true
 }
 
 func localizationTrimClaimListMarker(line string) (string, bool) {
@@ -303,8 +438,44 @@ func localizationCodeShapedClaim(claim string) bool {
 	if strings.Contains(claim, "/") && !strings.Contains(claim, "::") && !strings.Contains(claim, "#") {
 		return false
 	}
-	if strings.ContainsAny(claim, "._:#\\/") {
+	if strings.Contains(claim, ":") && !strings.Contains(claim, "::") {
+		return false
+	}
+
+	parts := strings.FieldsFunc(claim, func(r rune) bool {
+		return strings.ContainsRune(".:#\\/", r)
+	})
+	if len(parts) == 0 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		for index, r := range part {
+			if index == 0 {
+				if !unicode.IsLetter(r) && r != '_' && r != '$' {
+					return false
+				}
+				continue
+			}
+			if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '$' {
+				return false
+			}
+		}
+	}
+	if strings.ContainsAny(claim, "_#$\\") || strings.Contains(claim, "::") {
 		return true
+	}
+	if strings.Contains(claim, ".") {
+		// Reject prose abbreviations such as e.g. while retaining ordinary
+		// qualified identities such as writer.flush.
+		for _, part := range parts {
+			if utf8.RuneCountInString(part) > 1 {
+				return true
+			}
+		}
+		return false
 	}
 	for index, r := range claim {
 		if index > 0 && unicode.IsUpper(r) {
@@ -346,10 +517,15 @@ func localizationQualifiedSymbolMatches(claim, evidence string) bool {
 	if !localizationQualifiedSymbolClaim(claim) {
 		return claim == localizationSymbolLeaf(evidence)
 	}
-	// Preserve notation as identity: suffix matching is allowed only when the
-	// evidence has the same literal separator immediately before the claim.
-	for _, separator := range []string{"::", ".", "#", "\\"} {
-		if strings.Contains(claim, separator) && strings.HasSuffix(evidence, separator+claim) {
+	if !strings.HasSuffix(evidence, claim) {
+		return false
+	}
+	prefix := strings.TrimSuffix(evidence, claim)
+	// The claim's internal notation remains literal. Its containing identity
+	// may use another language-appropriate separator, but must end at a real
+	// boundary rather than merely sharing a textual suffix.
+	for _, boundary := range []string{"::", ".", "#", "\\"} {
+		if strings.HasSuffix(prefix, boundary) {
 			return true
 		}
 	}

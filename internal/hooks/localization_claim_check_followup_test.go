@@ -1,7 +1,10 @@
 package hooks
 
 import (
-	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/gofrs/flock"
@@ -79,23 +82,63 @@ func TestLocalizationClaimParserKeepsColonEndedMaterialClaims(t *testing.T) {
 	}
 }
 
-func TestLocalizationClaimLockReleaseFailureFallsBackToConcreteClose(t *testing.T) {
+func TestLocalizationClaimLockReleaseRetriesEINTR(t *testing.T) {
 	path := t.TempDir() + "/claim-check.lock"
 	lock := flock.New(path)
 	locked, err := lock.TryLock()
 	if err != nil || !locked {
 		t.Fatalf("initial lock failed: locked=%v err=%v", locked, err)
 	}
-	releaseLocalizationClaimLockWith(lock, func(*flock.Flock) error {
-		return errors.New("injected release failure")
-	})
+	attempts := 0
+	if !releaseLocalizationClaimLockWith(lock, func(candidate *flock.Flock) error {
+		attempts++
+		if attempts < localizationClaimLockReleaseAttempts {
+			return syscall.EINTR
+		}
+		return candidate.Close()
+	}) {
+		t.Fatal("EINTR retries did not release the lock")
+	}
+	if attempts != localizationClaimLockReleaseAttempts {
+		t.Fatalf("release attempts = %d, want %d", attempts, localizationClaimLockReleaseAttempts)
+	}
 
 	challenger := flock.New(path)
 	locked, err = challenger.TryLock()
 	if err != nil || !locked {
-		t.Fatalf("fallback Close retained ownership: locked=%v err=%v", locked, err)
+		t.Fatalf("successful retry retained ownership: locked=%v err=%v", locked, err)
 	}
 	if err := challenger.Close(); err != nil {
 		t.Fatalf("challenger release failed: %v", err)
+	}
+}
+
+func TestLocalizationClaimLockReleaseExhaustionIsObservable(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "effectiveness.jsonl")
+	t.Setenv("GORTEX_HOOK_EFFECTIVENESS_LOG", logPath)
+	lock := flock.New(filepath.Join(t.TempDir(), "claim-check.lock"))
+	locked, err := lock.TryLock()
+	if err != nil || !locked {
+		t.Fatalf("initial lock failed: locked=%v err=%v", locked, err)
+	}
+	attempts := 0
+	if releaseLocalizationClaimLockObserved(lock, func(*flock.Flock) error {
+		attempts++
+		return syscall.EINTR
+	}) {
+		t.Fatal("persistent EINTR was reported as a successful release")
+	}
+	if attempts != localizationClaimLockReleaseAttempts {
+		t.Fatalf("release attempts = %d, want %d", attempts, localizationClaimLockReleaseAttempts)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatalf("test cleanup release failed: %v", err)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read release telemetry: %v", err)
+	}
+	if !strings.Contains(string(data), `"event":"LocalizationTerminal.claim_lock_release_failed"`) {
+		t.Fatalf("release failure telemetry missing: %s", data)
 	}
 }
