@@ -72,6 +72,7 @@ func localizationBoundedSymbolClaims(message string) ([]string, bool, bool) {
 	for index, line := range lines {
 		markdown := localizationParseMarkdownContainer(line)
 		if marker, ok := localizationMarkdownFenceMarker(markdown.content); ok && !markdown.codeIndented {
+			// CommonMark indented code cannot open or close a fenced block.
 			if !fence.open {
 				fence = marker
 				continue
@@ -211,7 +212,7 @@ func localizationScanUnstructuredClaimBody(body string, budget *localizationClai
 // the answer marks it as code or a call. Ordinary prose words remain outside
 // claim checking; qualified and file-qualified identities continue through
 // localizationCodeShapedClaim instead.
-func localizationContextualFileClaim(body string, start, end int, claim string) bool {
+func localizationContextualFileClaim(body string, start, _ int, claim string) bool {
 	if !localizationAmbiguousFileExtension(claim) {
 		return false
 	}
@@ -220,13 +221,11 @@ func localizationContextualFileClaim(body string, start, end int, claim string) 
 	if beforeStart < 0 {
 		beforeStart = 0
 	}
-	afterEnd := end + contextBytes
-	if afterEnd > len(body) {
-		afterEnd = len(body)
+	before := body[beforeStart:start]
+	if boundary := strings.LastIndexAny(before, ".;!?\n\r"); boundary >= 0 {
+		before = before[boundary+1:]
 	}
-	before := localizationContextWords(body[beforeStart:start])
-	after := localizationContextWords(body[end:afterEnd])
-	return localizationFileContextBefore(before) || (len(after) > 0 && localizationFileContextWord(after[0]))
+	return localizationFileContextBefore(localizationContextWords(before))
 }
 
 func localizationContextWords(value string) []string {
@@ -263,7 +262,7 @@ func localizationFileContextWord(word string) bool {
 }
 
 func localizationExplicitInlineClaim(body string, start, end int, claim string) bool {
-	if !localizationExplicitIdentityRow(claim, claim) {
+	if !localizationInlineIdentitySyntax(claim) {
 		return false
 	}
 	callEnd := end
@@ -272,6 +271,27 @@ func localizationExplicitInlineClaim(body string, start, end int, claim string) 
 		callEnd += 2
 	}
 	return callShaped || localizationInlineCodeDelimited(body, start, callEnd)
+}
+
+func localizationInlineIdentitySyntax(claim string) bool {
+	if localizationExplicitIdentityRow(claim, claim) {
+		return true
+	}
+	if claim == "" || strings.ContainsAny(claim, "/\\") {
+		return false
+	}
+	parts := strings.FieldsFunc(claim, func(r rune) bool {
+		return strings.ContainsRune(".:#", r)
+	})
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || !localizationExplicitIdentityRow(part, part) {
+			return false
+		}
+	}
+	return true
 }
 
 func localizationInlineCodeDelimited(body string, start, end int) bool {

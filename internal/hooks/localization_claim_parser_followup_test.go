@@ -249,6 +249,62 @@ func TestLocalizationClaimParserRecognizesStableFileVocabulary(t *testing.T) {
 	}
 }
 
+func TestLocalizationClaimParserKeepsIndentedPseudoFenceOpen(t *testing.T) {
+	message := "```text\ninside\n    ```\n# Fabricated.flush\n```"
+	claims, _, valid := localizationBoundedSymbolClaims(message)
+	if !valid {
+		t.Fatal("message was rejected")
+	}
+	assertLocalizationClaims(t, claims, []string{"Fabricated.flush"})
+}
+
+func TestLocalizationAmbiguousFileContextIsPrefixAndClauseBounded(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		want    []string
+	}{
+		{name: "direct file prefix", message: "Use file foo.m."},
+		{name: "colon path prefix", message: "Use path: foo.r."},
+		{name: "file copula prefix", message: "The source file is node.s."},
+		{name: "unsafe suffix adjacency", message: "Call obj.m file handler.", want: []string{"obj.m"}},
+		{name: "prior clause does not leak", message: "Inspect the source file; the owner is pkg.v.", want: []string{"pkg.v"}},
+		{name: "prior sentence does not leak", message: "Inspect the path. The owner is value.d.", want: []string{"value.d"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			claims, _, valid := localizationBoundedSymbolClaims(test.message)
+			if !valid {
+				t.Fatal("message was rejected")
+			}
+			assertLocalizationClaims(t, claims, test.want)
+		})
+	}
+}
+
+func TestLocalizationExplicitSyntaxOverridesFileExtension(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		want    []string
+	}{
+		{name: "plain file", message: "See foo.go."},
+		{name: "inline dotted identity", message: "The owner is `writer.go`.", want: []string{"writer.go"}},
+		{name: "dotted call", message: "The owner calls writer.go().", want: []string{"writer.go"}},
+		{name: "inline config identity", message: "The owner is `config.json`.", want: []string{"config.json"}},
+		{name: "file-qualified remains claim", message: "The owner is foo.go::writer.", want: []string{"foo.go::writer"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			claims, _, valid := localizationBoundedSymbolClaims(test.message)
+			if !valid {
+				t.Fatal("message was rejected")
+			}
+			assertLocalizationClaims(t, claims, test.want)
+		})
+	}
+}
+
 func assertLocalizationClaims(t *testing.T, got, want []string) {
 	t.Helper()
 	if len(got) != len(want) {
