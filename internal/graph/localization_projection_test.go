@@ -300,3 +300,150 @@ func TestOverlaidViewFindFileNodesBoundedReplacesAndTombstones(t *testing.T) {
 		t.Fatalf("tombstone leaked base nodes: %#v", deleted)
 	}
 }
+
+func TestFindFileNodesBoundedAllocatesOnlyRetainedSummaries(t *testing.T) {
+	const (
+		filePath  = "repo/generated.go"
+		nodeCount = 2_048
+		limit     = 8
+	)
+	memory := New()
+	layer := NewOverlayLayer()
+	layer.MarkFile(filePath, false)
+	for index := 0; index < nodeCount; index++ {
+		node := &Node{
+			ID:   fmt.Sprintf("%s::declaration-%04d", filePath, index),
+			Name: fmt.Sprintf("declaration%d", index), Kind: KindFunction,
+			FilePath: filePath, Meta: map[string]any{"doc": "large retrieval payload"},
+		}
+		memory.AddNode(node)
+		layer.AddNode(filePath, node)
+	}
+
+	readers := []struct {
+		name   string
+		reader BoundedFileNodeReader
+	}{
+		{name: "graph", reader: memory},
+		{name: "overlay", reader: NewOverlaidView(nil, layer)},
+	}
+	for _, test := range readers {
+		t.Run(test.name, func(t *testing.T) {
+			var page BoundedNodeProjection
+			allocations := testing.AllocsPerRun(3, func() {
+				var err error
+				page, err = test.reader.FindFileNodesBounded(
+					context.Background(), filePath, LocalizationNodeScope{}, limit,
+				)
+				if err != nil {
+					panic(err)
+				}
+			})
+			if allocations > 64 {
+				t.Fatalf("allocations = %.0f, want response-bounded summary allocation", allocations)
+			}
+			if len(page.Nodes) != limit || page.Total != limit+1 || !page.Truncated {
+				t.Fatalf("page = %#v, want bounded saturated projection", page)
+			}
+			for _, node := range page.Nodes {
+				if node.Meta != nil {
+					t.Fatalf("retained summary hydrated metadata: %#v", node.Meta)
+				}
+			}
+		})
+	}
+}
+
+type cancelAfterLocalizationChecksContext struct {
+	context.Context
+	remaining int
+	done      chan struct{}
+}
+
+func (ctx *cancelAfterLocalizationChecksContext) Done() <-chan struct{} {
+	return ctx.done
+}
+
+func (ctx *cancelAfterLocalizationChecksContext) Err() error {
+	if ctx.remaining > 0 {
+		ctx.remaining--
+		if ctx.remaining > 0 {
+			return nil
+		}
+	}
+	select {
+	case <-ctx.done:
+	default:
+		close(ctx.done)
+	}
+	return context.Canceled
+}
+
+func TestOverlaidViewFindFileNodesBoundedCancelsDuringLargeScan(t *testing.T) {
+	const filePath = "repo/generated.go"
+	layer := NewOverlayLayer()
+	layer.MarkFile(filePath, false)
+	for index := 0; index < 1_024; index++ {
+		layer.AddNode(filePath, &Node{
+			ID:   fmt.Sprintf("%s::declaration-%04d", filePath, index),
+			Name: "declaration", Kind: KindFunction, FilePath: filePath,
+		})
+	}
+	ctx := &cancelAfterLocalizationChecksContext{
+		Context: context.Background(), remaining: 3, done: make(chan struct{}),
+	}
+	page, err := NewOverlaidView(nil, layer).FindFileNodesBounded(
+		ctx, filePath, LocalizationNodeScope{}, 8,
+	)
+	if err != context.Canceled {
+		t.Fatalf("error = %v, want context cancellation during scan", err)
+	}
+	if len(page.Nodes) != 0 || page.Total != 0 {
+		t.Fatalf("cancelled scan returned partial page: %#v", page)
+	}
+}
+
+func TestOverlayLayerAddNodeReplacesDuplicateIdentity(t *testing.T) {
+	const (
+		filePath = "repo/handler.go"
+		nodeID   = filePath + "::handler"
+	)
+	layer := NewOverlayLayer()
+	layer.MarkFile(filePath, false)
+	layer.AddNode(filePath, &Node{
+		ID: nodeID, Name: "old", QualName: "repo.Old", Kind: KindFunction, FilePath: filePath,
+	})
+	layer.AddNode(filePath, &Node{
+		ID: nodeID, Name: "handler", QualName: "repo.Handler", Kind: KindFunction,
+		FilePath: filePath, StartLine: 2,
+	})
+	final := &Node{
+		ID: nodeID, Name: "handler", QualName: "repo.Handler", Kind: KindFunction,
+		FilePath: filePath, StartLine: 3,
+	}
+	layer.AddNode(filePath, final)
+
+	if nodes := layer.nodesForFile(filePath); len(nodes) != 1 || nodes[0] != final {
+		t.Fatalf("file nodes = %#v, want one final replacement", nodes)
+	}
+	if old := layer.NodesByName("old"); len(old) != 0 {
+		t.Fatalf("old name index retained replacement: %#v", old)
+	}
+	if current := layer.NodesByName("handler"); len(current) != 1 || current[0] != final {
+		t.Fatalf("name index = %#v, want final replacement", current)
+	}
+	view := NewOverlaidView(nil, layer)
+	if view.GetNode(nodeID) != final || view.GetNodeByQualName("repo.Handler") != final {
+		t.Fatal("identity or qualified-name index did not retain final replacement")
+	}
+	if stale := view.GetNodeByQualName("repo.Old"); stale != nil {
+		t.Fatalf("stale qualified name retained: %#v", stale)
+	}
+	page, err := view.FindFileNodesBounded(context.Background(), filePath, LocalizationNodeScope{}, 1)
+	if err != nil {
+		t.Fatalf("bounded file lookup: %v", err)
+	}
+	if page.Total != 1 || page.Truncated || len(page.Nodes) != 1 || page.Nodes[0].StartLine != 3 {
+		t.Fatalf("duplicate identity inflated bounded projection: %#v", page)
+	}
+}

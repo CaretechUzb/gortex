@@ -111,6 +111,17 @@ func (l *OverlayLayer) AddNode(graphPath string, n *Node) {
 		// Tombstone: silently drop. Caller bug — but cheap to absorb.
 		return
 	}
+	if old := l.nodeByID[n.ID]; old != nil {
+		for index, candidate := range entry.Nodes {
+			if candidate == nil || candidate.ID != n.ID {
+				continue
+			}
+			entry.Nodes[index] = n
+			l.nodeByID[n.ID] = n
+			l.replaceNodeIndexes(old, n)
+			return
+		}
+	}
 	entry.Nodes = append(entry.Nodes, n)
 	l.nodeByID[n.ID] = n
 	if n.Name != "" {
@@ -118,6 +129,50 @@ func (l *OverlayLayer) AddNode(graphPath string, n *Node) {
 	}
 	if n.QualName != "" {
 		l.nodesByQual[n.QualName] = n
+	}
+}
+
+func (l *OverlayLayer) replaceNodeIndexes(old, replacement *Node) {
+	if old.Name == replacement.Name {
+		if old.Name != "" {
+			replaced := false
+			for index, candidate := range l.nodesByName[old.Name] {
+				if candidate != nil && candidate.ID == replacement.ID {
+					l.nodesByName[old.Name][index] = replacement
+					replaced = true
+				}
+			}
+			if !replaced {
+				l.nodesByName[old.Name] = append(l.nodesByName[old.Name], replacement)
+			}
+		}
+	} else {
+		if old.Name != "" {
+			bucket := l.nodesByName[old.Name]
+			filtered := bucket[:0]
+			for _, candidate := range bucket {
+				if candidate == nil || candidate.ID != replacement.ID {
+					filtered = append(filtered, candidate)
+				}
+			}
+			if len(filtered) == 0 {
+				delete(l.nodesByName, old.Name)
+			} else {
+				l.nodesByName[old.Name] = filtered
+			}
+		}
+		if replacement.Name != "" {
+			l.nodesByName[replacement.Name] = append(l.nodesByName[replacement.Name], replacement)
+		}
+	}
+
+	if old.QualName != "" && old.QualName != replacement.QualName {
+		if current := l.nodesByQual[old.QualName]; current != nil && current.ID == replacement.ID {
+			delete(l.nodesByQual, old.QualName)
+		}
+	}
+	if replacement.QualName != "" {
+		l.nodesByQual[replacement.QualName] = replacement
 	}
 }
 
@@ -255,6 +310,21 @@ func (l *OverlayLayer) nodesForFile(graphPath string) []*Node {
 	out := make([]*Node, len(e.Nodes))
 	copy(out, e.Nodes)
 	return out
+}
+
+// nodesForFileReadOnly exposes the immutable layer's backing slice to internal
+// bounded readers. Overlay construction is complete before an OverlaidView is
+// published, so scanning this slice cannot race a writer and avoids an O(N)
+// snapshot allocation before cancellation can be observed.
+func (l *OverlayLayer) nodesForFileReadOnly(graphPath string) []*Node {
+	if l == nil {
+		return nil
+	}
+	entry := l.entries[graphPath]
+	if entry == nil || entry.Deleted {
+		return nil
+	}
+	return entry.Nodes
 }
 
 // OverlaidView composes an immutable base Reader with a per-session

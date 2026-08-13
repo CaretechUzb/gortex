@@ -316,9 +316,16 @@ func TestFindFileNodesBoundedPlanUsesFileIndexWithoutSorter(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	store.AddNode(&graph.Node{ID: "repo/file.go::handler", Name: "handler", Kind: graph.KindFunction, FilePath: "repo/file.go"})
+	store.AddNode(&graph.Node{
+		ID: "repo/file.go::handler", Name: "handler", Kind: graph.KindFunction,
+		FilePath: "repo/file.go", RepoPrefix: "repo", WorkspaceID: "workspace", ProjectID: "project",
+	})
 
-	predicate, args := localizationFileNodePredicate("repo/file.go", graph.LocalizationNodeScope{})
+	predicate, args := localizationFileNodePredicate("repo/file.go", graph.LocalizationNodeScope{
+		WorkspaceID: "workspace", ProjectID: "project",
+		RepoAllow: map[string]bool{"repo": true},
+		Kinds:     map[graph.NodeKind]bool{graph.KindFunction: true, graph.KindMethod: true},
+	})
 	args = append(args, "", 257)
 	rows, err := store.db.Query(
 		`EXPLAIN QUERY PLAN SELECT `+lookupNodeSummaryCols+` FROM nodes WHERE `+predicate+` AND id > ? ORDER BY id LIMIT ?`,

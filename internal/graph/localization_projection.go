@@ -198,7 +198,7 @@ func (g *Graph) FindFileNodesBounded(
 				continue
 			}
 			total++
-			kept = insertBoundedLocalizationNode(kept, localizationNodeSummary(node), pageSize)
+			kept = insertBoundedLocalizationNode(kept, node, pageSize)
 		}
 		shard.mu.RUnlock()
 	}
@@ -207,6 +207,7 @@ func (g *Graph) FindFileNodesBounded(
 	if len(kept) > limit {
 		kept = kept[:limit]
 	}
+	kept = localizationNodeSummaries(kept)
 	if total > pageSize {
 		total = pageSize
 	}
@@ -223,6 +224,16 @@ func localizationNodeSummary(node *Node) *Node {
 		StartColumn: node.StartColumn, EndColumn: node.EndColumn, Language: node.Language,
 		RepoPrefix: node.RepoPrefix, WorkspaceID: node.WorkspaceID, ProjectID: node.ProjectID,
 	}
+}
+
+// localizationNodeSummaries copies only the retained response page. Callers
+// first rank raw immutable graph pointers, so discarded candidates never
+// allocate summary objects or retain retrieval metadata.
+func localizationNodeSummaries(nodes []*Node) []*Node {
+	for index, node := range nodes {
+		nodes[index] = localizationNodeSummary(node)
+	}
+	return nodes
 }
 
 func insertBoundedLocalizationNode(nodes []*Node, node *Node, limit int) []*Node {
@@ -393,7 +404,7 @@ func (v *OverlaidView) FindFileNodesBounded(
 		pageSize := limit + 1
 		kept := make([]*Node, 0, pageSize)
 		total := 0
-		for index, node := range v.layer.nodesForFile(filePath) {
+		for index, node := range v.layer.nodesForFileReadOnly(filePath) {
 			if index&127 == 0 {
 				if err := ctx.Err(); err != nil {
 					return BoundedNodeProjection{}, err
@@ -403,12 +414,13 @@ func (v *OverlaidView) FindFileNodesBounded(
 				continue
 			}
 			total++
-			kept = insertBoundedLocalizationNode(kept, localizationNodeSummary(node), pageSize)
+			kept = insertBoundedLocalizationNode(kept, node, pageSize)
 		}
 		truncated := total > limit
 		if len(kept) > limit {
 			kept = kept[:limit]
 		}
+		kept = localizationNodeSummaries(kept)
 		if total > pageSize {
 			total = pageSize
 		}
