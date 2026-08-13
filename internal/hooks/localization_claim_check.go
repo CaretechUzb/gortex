@@ -103,7 +103,9 @@ func localizationBoundedSymbolClaims(message string) ([]string, bool, bool) {
 				}
 				continue
 			}
-			if localizationMarkdownHeadingAt(lines, index) || localizationEmptyClaimRoleLabel(trimmed) {
+			// Structured rows are explicit identity claims. Do not let a later
+			// thematic break masquerade as a Setext underline and suppress one.
+			if localizationMarkdownHeading(trimmed) || localizationEmptyClaimRoleLabel(trimmed) {
 				inSymbols = false
 				continue
 			}
@@ -174,12 +176,16 @@ func (budget *localizationClaimBudget) addClaim(claim string, requireCodeShape b
 
 func localizationScanUnstructuredClaimBody(body string, budget *localizationClaimBudget) bool {
 	tokenStart := -1
-	consume := func(token string) bool {
+	consume := func(start, end int) bool {
+		token := body[start:end]
 		if !budget.countToken(token) {
 			return false
 		}
-		claim := strings.Trim(token, "_.$:#\\/-")
-		return budget.addClaim(claim, true)
+		// '_' and '$' are identifier characters, not wrappers. Trimming them
+		// silently changed _private/$foo into another identity (or no claim).
+		claim := strings.Trim(token, ".:#\\/-")
+		explicitSyntax := localizationExplicitInlineClaim(body, start, end, claim)
+		return budget.addClaim(claim, !explicitSyntax)
 	}
 	for index, r := range body {
 		if localizationClaimTokenRune(r) {
@@ -189,13 +195,44 @@ func localizationScanUnstructuredClaimBody(body string, budget *localizationClai
 			continue
 		}
 		if tokenStart >= 0 {
-			if !consume(body[tokenStart:index]) {
+			if !consume(tokenStart, index) {
 				return false
 			}
 			tokenStart = -1
 		}
 	}
-	return tokenStart < 0 || consume(body[tokenStart:])
+	return tokenStart < 0 || consume(tokenStart, len(body))
+}
+
+// localizationExplicitInlineClaim admits a simple lower-case leaf only when
+// the answer marks it as code or a call. Ordinary prose words remain outside
+// claim checking; qualified and file-qualified identities continue through
+// localizationCodeShapedClaim instead.
+func localizationExplicitInlineClaim(body string, start, end int, claim string) bool {
+	if !localizationExplicitIdentityRow(claim, claim) {
+		return false
+	}
+	callEnd := end
+	callShaped := strings.HasPrefix(body[end:], "()")
+	if callShaped {
+		callEnd += 2
+	}
+	return callShaped || localizationInlineCodeDelimited(body, start, callEnd)
+}
+
+func localizationInlineCodeDelimited(body string, start, end int) bool {
+	opening := 0
+	for index := start - 1; index >= 0 && body[index] == '`'; index-- {
+		opening++
+	}
+	if opening < 1 || opening > 3 {
+		return false
+	}
+	closing := 0
+	for index := end; index < len(body) && body[index] == '`'; index++ {
+		closing++
+	}
+	return closing == opening
 }
 
 func localizationUnstructuredClaimLine(line string) (string, bool) {
@@ -238,29 +275,42 @@ func localizationMarkdownFenceMarker(line string) (localizationMarkdownFenceStat
 	}, true
 }
 
-func localizationMarkdownContainerContent(line string) string {
-	line = strings.TrimSpace(line)
-	for depth := 0; depth < 8 && line != ""; depth++ {
-		before := line
+type localizationMarkdownContainer struct {
+	content    string
+	quoteDepth int
+	listItem   bool
+}
+
+func localizationParseMarkdownContainer(line string) localizationMarkdownContainer {
+	container := localizationMarkdownContainer{content: strings.TrimSpace(line)}
+	for depth := 0; depth < 8 && container.content != ""; depth++ {
+		line = container.content
 		if line[0] == '>' && (len(line) == 1 || line[1] == ' ' || line[1] == '\t') {
-			line = strings.TrimSpace(line[1:])
+			container.quoteDepth++
+			container.content = strings.TrimSpace(line[1:])
+			continue
 		}
 		if len(line) >= 2 && strings.ContainsRune("-*+", rune(line[0])) && (line[1] == ' ' || line[1] == '\t') {
-			line = strings.TrimSpace(line[1:])
-		} else {
-			index := 0
-			for index < len(line) && line[index] >= '0' && line[index] <= '9' {
-				index++
-			}
-			if index > 0 && index+1 < len(line) && (line[index] == '.' || line[index] == ')') && (line[index+1] == ' ' || line[index+1] == '\t') {
-				line = strings.TrimSpace(line[index+1:])
-			}
+			container.listItem = true
+			container.content = strings.TrimSpace(line[1:])
+			continue
 		}
-		if line == before {
-			break
+		index := 0
+		for index < len(line) && line[index] >= '0' && line[index] <= '9' {
+			index++
 		}
+		if index > 0 && index+1 < len(line) && (line[index] == '.' || line[index] == ')') && (line[index+1] == ' ' || line[index+1] == '\t') {
+			container.listItem = true
+			container.content = strings.TrimSpace(line[index+1:])
+			continue
+		}
+		break
 	}
-	return line
+	return container
+}
+
+func localizationMarkdownContainerContent(line string) string {
+	return localizationParseMarkdownContainer(line).content
 }
 
 func localizationMarkdownHeading(line string) bool {
@@ -292,8 +342,12 @@ func localizationMarkdownHeadingAt(lines []string, index int) bool {
 	if localizationMarkdownHeading(lines[index]) || localizationMarkdownSetextUnderline(lines[index]) {
 		return true
 	}
-	content := localizationMarkdownContainerContent(lines[index])
-	return content != "" && index+1 < len(lines) && localizationMarkdownSetextUnderline(lines[index+1])
+	current := localizationParseMarkdownContainer(lines[index])
+	if current.content == "" || current.listItem || index+1 >= len(lines) {
+		return false
+	}
+	next := localizationParseMarkdownContainer(lines[index+1])
+	return !next.listItem && current.quoteDepth == next.quoteDepth && localizationMarkdownSetextUnderline(next.content)
 }
 
 func localizationEmptyClaimRoleLabel(line string) bool {
@@ -412,7 +466,7 @@ func localizationExplicitNoneClaim(value string) bool {
 }
 
 func localizationStructuredSymbolClaim(value string) string {
-	claim := strings.Trim(localizationFirstClaimToken(value), "`_.$:#\\/-,;")
+	claim := strings.Trim(localizationFirstClaimToken(value), "` .:#\\/-,;")
 	for strings.HasSuffix(claim, "()") {
 		claim = strings.TrimSuffix(claim, "()")
 	}
@@ -425,15 +479,52 @@ func localizationStructuredSymbolClaim(value string) string {
 			claim = claim[1:close] + claim[close+1:]
 		}
 	}
-	return strings.Trim(claim, "`_.$:#\\/-,;")
+	// '_' and '$' remain identity bytes at either edge.
+	return strings.Trim(claim, "` .:#\\/-,;")
+}
+
+// localizationLooksLikeFileToken rejects source/config/document basenames from
+// prose claim extraction. File-qualified identities such as foo.c::flush are
+// deliberately exempt: their suffix is an explicit symbol identity.
+func localizationLooksLikeFileToken(value string) bool {
+	if value == "" || strings.Contains(value, "::") || strings.Contains(value, "#") {
+		return false
+	}
+	if strings.ContainsAny(value, "/\\") {
+		return true
+	}
+	dot := strings.LastIndexByte(value, '.')
+	if dot <= 0 || dot+1 >= len(value) {
+		return false
+	}
+	extension := strings.ToLower(value[dot+1:])
+	switch extension {
+	case "c", "h", "cc", "cp", "cpp", "cxx", "hh", "hpp", "hxx", "m", "mm",
+		"go", "rs", "zig", "d", "v", "odin", "hare", "carbon", "asm", "s",
+		"py", "pyi", "pyx", "rb", "php", "pl", "pm", "raku", "lua", "tcl", "r",
+		"js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "coffee",
+		"java", "kt", "kts", "scala", "groovy", "clj", "cljs", "cljc", "edn",
+		"cs", "fs", "fsx", "vb", "swift", "dart", "ex", "exs", "erl", "hrl",
+		"hs", "lhs", "ml", "mli", "mll", "elm", "gleam", "res", "re", "rei",
+		"sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "ahk",
+		"html", "htm", "css", "scss", "sass", "less", "vue", "svelte", "astro",
+		"sql", "graphql", "gql", "proto", "thrift", "capnp", "prisma", "wit",
+		"json", "jsonc", "json5", "yaml", "yml", "toml", "xml", "xsd", "xsl", "xslt",
+		"ini", "cfg", "conf", "properties", "env", "hcl", "tf", "tfvars", "nix",
+		"md", "markdown", "mdx", "rst", "txt", "adoc", "asciidoc", "org", "tex",
+		"razor", "cshtml", "jsp", "ejs", "hbs", "twig",
+		"erb", "liquid", "pug", "blade", "tmpl", "tpl", "gotmpl", "mustache",
+		"dockerfile", "cmake", "gradle", "bazel", "bzl", "make", "mk", "ninja",
+		"csv", "tsv", "parquet", "avro", "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx":
+		return true
+	default:
+		return false
+	}
 }
 
 func localizationCodeShapedClaim(claim string) bool {
-	lower := strings.ToLower(claim)
-	for _, extension := range []string{".go", ".py", ".js", ".ts", ".tsx", ".rs", ".java", ".php", ".rb", ".swift", ".dart", ".cs"} {
-		if strings.HasSuffix(lower, extension) {
-			return false
-		}
+	if localizationLooksLikeFileToken(claim) {
+		return false
 	}
 	if strings.Contains(claim, "/") && !strings.Contains(claim, "::") && !strings.Contains(claim, "#") {
 		return false

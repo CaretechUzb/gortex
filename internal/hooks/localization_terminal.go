@@ -775,7 +775,9 @@ func releaseLocalizationClaimLockObserved(lock *flock.Flock, release func(*flock
 	if releaseLocalizationClaimLockWith(lock, release) {
 		return true
 	}
-	localizationTerminalTelemetry("claim_lock_release_failed", true, started)
+	// Lock-release telemetry describes an internal failure; no user-visible
+	// hook context was emitted by this path.
+	localizationTerminalTelemetry("claim_lock_release_failed", false, started)
 	return false
 }
 
