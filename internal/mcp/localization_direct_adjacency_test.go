@@ -99,6 +99,143 @@ func TestPromoteLocalizationDirectAdjacencyNeverEscalatesAuthority(t *testing.T)
 	}
 }
 
+func TestPromoteLocalizationDirectAdjacencyPreservesExactAndRoutePriorities(t *testing.T) {
+	t.Run("exact symbol", func(t *testing.T) {
+		evidence := make([]localizationEvidence, 0, 7)
+		for index := 0; index < localizationFinalResponsePrimaryLimit; index++ {
+			evidence = append(evidence, localizationEvidence{
+				Rank: index + 1, ID: fmt.Sprintf("primary-%d", index), Name: "primary", Kind: "function", File: "src/primary.go", Line: index + 1,
+			})
+		}
+		evidence[0].Callees = []string{"target"}
+		evidence = append(evidence,
+			localizationEvidence{Rank: 6, ID: "weak", Name: "weak", Kind: "function", File: "src/weak.go", Line: 1},
+			localizationEvidence{Rank: 7, ID: "exact", Name: "exact", Kind: "function", File: "src/exact.go", Line: 1},
+		)
+		envelope := localizationExploreEnvelope{
+			Completion: newLocalizationExactReadCompletion("exact", false),
+			Evidence:   evidence,
+		}
+		reader := &localizationDirectAdjacencyReader{nodes: map[string]*graph.Node{
+			"target": nodeForDirectAdjacency("target", "target", "src/target.go", 7),
+		}}
+
+		promoted, _ := promoteLocalizationDirectAdjacency(
+			"target", envelope, reader, len(evidence), 1<<20,
+			newLocalizationEvidenceDigestForTask("target", envelope),
+		)
+
+		assertLocalizationEvidenceIDs(t, promoted.Evidence, []string{
+			"primary-0", "primary-1", "primary-2", "primary-3", "primary-4", "exact", "target",
+		})
+		if promoted.Completion.ExactSymbol != "exact" {
+			t.Fatalf("exact symbol = %q, want preserved exact", promoted.Completion.ExactSymbol)
+		}
+	})
+
+	t.Run("allowed symbols and route proofs", func(t *testing.T) {
+		allowed := make([]string, localizationRefinementAllowedSymbolCap)
+		evidence := make([]localizationEvidence, 0, len(allowed)+3)
+		for index := range allowed {
+			allowed[index] = fmt.Sprintf("allowed-%d", index)
+			evidence = append(evidence, localizationEvidence{
+				Rank: index + 1, ID: allowed[index], Name: allowed[index], Kind: "function", File: "src/allowed.go", Line: index + 1,
+			})
+		}
+		evidence[0].Callees = []string{"target"}
+		evidence[0].Provenance = localizationProvenanceImplementationRoute
+		evidence[1].Provenance = localizationProvenanceImplementationTarget
+		evidence = append(evidence,
+			localizationEvidence{Rank: 9, ID: "weak", Name: "weak", Kind: "function", File: "src/weak.go", Line: 1},
+			localizationEvidence{Rank: 10, ID: "implementation", Name: "implementation", Kind: "function", File: "src/implementation.go", Line: 1, Provenance: localizationProvenanceImplementationTarget},
+			localizationEvidence{Rank: 11, ID: "proof", Name: "proof", Kind: "function", File: "src/proof.go", Line: 1, Provenance: localizationProvenanceImplementationRoute},
+		)
+		completion := newLocalizationRefinementCompletionForSymbols(allowed[0], allowed)
+		completion.refinementRoutes = map[string]localizationRefinementRoute{
+			allowed[0]: {implementationSymbol: "implementation"},
+			allowed[1]: {proofSymbol: "proof"},
+		}
+		envelope := localizationExploreEnvelope{Completion: completion, Evidence: evidence}
+		reader := &localizationDirectAdjacencyReader{nodes: map[string]*graph.Node{
+			"target": nodeForDirectAdjacency("target", "target", "src/target.go", 7),
+		}}
+
+		promoted, _ := promoteLocalizationDirectAdjacency(
+			"target", envelope, reader, len(evidence), 1<<20,
+			newLocalizationEvidenceDigestForTask("target", envelope),
+		)
+
+		want := append(append([]string(nil), allowed...), "implementation", "proof", "target")
+		assertLocalizationEvidenceIDs(t, promoted.Evidence, want)
+		if !reflect.DeepEqual(promoted.Completion.AllowedSymbols, allowed) {
+			t.Fatalf("allowed symbols = %v, want %v", promoted.Completion.AllowedSymbols, allowed)
+		}
+		if route := promoted.Completion.refinementRoutes[allowed[0]]; route.implementationSymbol != "implementation" {
+			t.Fatalf("implementation route = %+v, want implementation proof retained", route)
+		}
+		if route := promoted.Completion.refinementRoutes[allowed[1]]; route.proofSymbol != "proof" {
+			t.Fatalf("proof route = %+v, want proof retained", route)
+		}
+	})
+}
+
+func TestPromoteLocalizationDirectAdjacencyUsesBestDuplicateRelationContext(t *testing.T) {
+	reader := &localizationDirectAdjacencyReader{nodes: map[string]*graph.Node{
+		"shared":     nodeForDirectAdjacency("shared", "sharedTarget", "src/shared.go", 7),
+		"competitor": nodeForDirectAdjacency("competitor", "competitorTarget", "src/competitor.go", 8),
+	}}
+	allowed := []string{"owner-0", "owner-1", "owner-2"}
+	envelope := localizationExploreEnvelope{
+		Completion: newLocalizationRefinementCompletionForSymbols(allowed[0], allowed),
+		Evidence: []localizationEvidence{
+			{Rank: 1, ID: allowed[0], Name: "owner0", Kind: "function", File: "src/other.go", Line: 1, Callees: []string{"shared"}},
+			{Rank: 2, ID: allowed[1], Name: "owner1", Kind: "function", File: "src/shared.go", Line: 1, Callees: []string{"shared"}},
+			{Rank: 3, ID: allowed[2], Name: "owner2", Kind: "function", File: "src/competitor.go", Line: 1, Callees: []string{"competitor"}},
+		},
+	}
+
+	promoted, _ := promoteLocalizationDirectAdjacency(
+		"target", envelope, reader, len(envelope.Evidence)+1, 1<<20,
+		newLocalizationEvidenceDigestForTask("target", envelope),
+	)
+
+	assertLocalizationEvidenceIDs(t, promoted.Evidence, []string{"owner-0", "owner-1", "owner-2", "shared"})
+	if len(reader.batches) != 1 || !reflect.DeepEqual(reader.batches[0], []string{"shared", "competitor"}) {
+		t.Fatalf("deduplicated batch = %v, want [shared competitor]", reader.batches)
+	}
+}
+
+func TestLocalizationDirectAdjacencyReplacementRenumbersEvidence(t *testing.T) {
+	evidence := make([]localizationEvidence, 0, 8)
+	for index := 0; index < localizationFinalResponsePrimaryLimit; index++ {
+		evidence = append(evidence, localizationEvidence{
+			Rank: index + 1, ID: fmt.Sprintf("primary-%d", index), Name: "primary", Kind: "function", File: "src/primary.go", Line: index + 1,
+		})
+	}
+	evidence = append(evidence,
+		localizationEvidence{Rank: 6, ID: "replaceable", Name: "replaceable", Kind: "function", File: "src/weak.go", Line: 1},
+		localizationEvidence{Rank: 7, ID: "body", Name: "body", Kind: "function", File: "src/body.go", Line: 1, Provenance: localizationProvenanceBodyMention},
+		localizationEvidence{Rank: 8, ID: "adjacent", Name: "adjacent", Kind: "function", File: "src/adjacent.go", Line: 1, Provenance: localizationProvenanceDirectAdjacency},
+	)
+	envelope := localizationExploreEnvelope{Evidence: evidence}
+	candidate, admitted := localizationDirectAdjacencyEnvelopeWithRow(
+		"target", envelope, newLocalizationEvidenceDigestForTask("target", envelope),
+		localizationEvidence{ID: "target", Name: "target", Kind: "function", File: "src/target.go", Line: 1, Provenance: localizationProvenanceDirectAdjacency},
+		len(evidence),
+	)
+	if !admitted {
+		t.Fatal("replacement was not admitted")
+	}
+	for index, row := range candidate.Evidence {
+		if row.Rank != index+1 {
+			t.Fatalf("evidence[%d] rank = %d, want %d", index, row.Rank, index+1)
+		}
+	}
+	assertLocalizationEvidenceIDs(t, candidate.Evidence, []string{
+		"primary-0", "primary-1", "primary-2", "primary-3", "primary-4", "body", "adjacent", "target",
+	})
+}
+
 func TestPromoteLocalizationDirectAdjacencyRejectsOverBudgetRow(t *testing.T) {
 	reader := &localizationDirectAdjacencyReader{nodes: map[string]*graph.Node{
 		"target": nodeForDirectAdjacency("target", "target", "src/target.go", 7),

@@ -63,7 +63,11 @@ func promoteLocalizationDirectAdjacency(
 			ids = ids[:localizationMaxNeighborIDs]
 		}
 		for relationOrder, rawID := range ids {
-			if len(lookupIDs) >= localizationDirectAdjacencyLookupCap {
+			// Relation contexts are independently bounded, but an identity may
+			// appear beside several owners. Retain those contexts so ranking can
+			// select its best same-file/direction proof while the store lookup
+			// remains one deduplicated batch.
+			if len(relations) >= localizationDirectAdjacencyLookupCap {
 				return
 			}
 			id := strings.TrimSpace(rawID)
@@ -73,11 +77,10 @@ func promoteLocalizationDirectAdjacency(
 			if _, exists := seenIDs[id]; exists {
 				continue
 			}
-			if _, exists := lookupSeen[id]; exists {
-				continue
+			if _, exists := lookupSeen[id]; !exists {
+				lookupSeen[id] = struct{}{}
+				lookupIDs = append(lookupIDs, id)
 			}
-			lookupSeen[id] = struct{}{}
-			lookupIDs = append(lookupIDs, id)
 			relations = append(relations, relation{
 				id:            id,
 				ownerFile:     strings.TrimSpace(owner.File),
@@ -92,7 +95,7 @@ func promoteLocalizationDirectAdjacency(
 		// callers remain equally eligible and win whenever task alignment is better.
 		appendRelations(owner.Callees, owner, ownerIndex, 0)
 		appendRelations(owner.Callers, owner, ownerIndex, 1)
-		if len(lookupIDs) >= localizationDirectAdjacencyLookupCap {
+		if len(relations) >= localizationDirectAdjacencyLookupCap {
 			break
 		}
 	}
@@ -176,6 +179,7 @@ func promoteLocalizationDirectAdjacency(
 			Line:       node.StartLine,
 			EndLine:    node.EndLine,
 			Provenance: localizationProvenanceDirectAdjacency,
+
 		}
 		if row.File == "" {
 			continue
@@ -218,18 +222,22 @@ func localizationDirectAdjacencyEnvelopeWithRow(
 		if retainedDigest == nil {
 			retainedDigest = newLocalizationEvidenceDigestForTask(task, envelope)
 		}
-		primaryIDs := make(map[string]struct{}, localizationFinalResponsePrimaryLimit)
+		// Contract priorities include exact/allowed identities and every
+		// implementation/proof dependency of an authorized refinement route.
+		// Supporting adjacency must never narrow that live authorization merely
+		// because only five of its rows fit the model-facing PRIMARY block.
+		protectedIDs := localizationDigestPriorityIDs(envelope.Completion, evidence)
 		if retainedDigest != nil {
 			for _, presented := range localizationFinalResponseRows(task, nil, retainedDigest.Evidence) {
 				if presented.primary {
-					primaryIDs[strings.TrimSpace(presented.row.ID)] = struct{}{}
+					protectedIDs[strings.TrimSpace(presented.row.ID)] = struct{}{}
 				}
 			}
 		}
 		replace := -1
 		for index := len(evidence) - 1; index >= 0; index-- {
 			id := strings.TrimSpace(evidence[index].ID)
-			if _, primary := primaryIDs[id]; primary {
+			if _, protected := protectedIDs[id]; protected {
 				continue
 			}
 			if localizationSupportingOnlyProvenance(evidence[index].Provenance) {
@@ -246,8 +254,10 @@ func localizationDirectAdjacencyEnvelopeWithRow(
 	if len(evidence) >= maxEvidence {
 		return envelope, false
 	}
-	row.Rank = len(evidence) + 1
 	evidence = append(evidence, row)
+	for index := range evidence {
+		evidence[index].Rank = index + 1
+	}
 
 	candidate := envelope
 	candidate.Evidence = evidence
