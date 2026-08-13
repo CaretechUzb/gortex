@@ -3,6 +3,7 @@ package mcp
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"path"
 	"sort"
 	"strconv"
@@ -10,14 +11,17 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/trigram"
+	"github.com/zzet/gortex/internal/testpath"
 )
 
 const (
-	exploreSourceLiteralOverlayMaxHits      = 24
-	exploreSourceLiteralOverlayMaxBytes     = 4 << 20
-	exploreSourceLiteralOverlayMaxLineBytes = 64 << 10
-	exploreSourceLiteralOverlayBudget       = 75 * time.Millisecond
+	exploreSourceLiteralOverlayMaxHits         = 24
+	exploreSourceLiteralOverlayMaxBytes        = 4 << 20
+	exploreSourceLiteralOverlayMaxLineBytes    = 64 << 10
+	exploreSourceLiteralOverlayMaxCoveredFiles = 256
+	exploreSourceLiteralOverlayBudget          = 75 * time.Millisecond
 )
 
 // exploreSourceLiteralOverlayFile is the request-local form of an editor
@@ -35,6 +39,164 @@ type exploreSourceLiteralOverlayScan struct {
 	matches    []trigram.Match
 	covered    map[string]struct{}
 	incomplete bool
+}
+
+// effectiveExploreSourceLiteralScope intersects the caller's requested scope
+// with the session's immutable workspace/repository boundary. Caller filters
+// may narrow the session, never widen it.
+func (s *Server) effectiveExploreSourceLiteralScope(
+	ctx context.Context,
+	requested query.QueryOptions,
+) (query.QueryOptions, bool) {
+	merged := s.localizationNodeScopeWithTests(ctx, requested, requested.ExcludeTests)
+	if strings.HasPrefix(merged.WorkspaceID, unresolvedWorkspacePrefix) {
+		return query.QueryOptions{}, false
+	}
+	effective := requested
+	effective.WorkspaceID = merged.WorkspaceID
+	effective.ProjectID = merged.ProjectID
+	effective.RepoAllow = merged.RepoAllow
+	effective.ExcludeTests = merged.ExcludeTests
+	return effective, true
+}
+
+func (s *Server) resolveExploreSourceLiteralRepoPrefix(
+	repoPrefix string,
+	scope query.QueryOptions,
+) (string, bool) {
+	repoPrefix = strings.TrimSuffix(strings.TrimSpace(repoPrefix), "/")
+	if s != nil && s.multiIndexer == nil && s.indexer != nil {
+		actual := strings.TrimSuffix(strings.TrimSpace(s.indexer.RepoPrefix()), "/")
+		if actual != "" && repoPrefix != "" && repoPrefix != actual {
+			return "", false
+		}
+		if actual != "" && len(scope.RepoAllow) > 0 && !scope.RepoAllow[actual] {
+			return "", false
+		}
+		return actual, true
+	}
+	if repoPrefix != "" {
+		if len(scope.RepoAllow) > 0 && !scope.RepoAllow[repoPrefix] {
+			return "", false
+		}
+		return repoPrefix, true
+	}
+	for candidate, allowed := range scope.RepoAllow {
+		if !allowed {
+			continue
+		}
+		candidate = strings.TrimSuffix(strings.TrimSpace(candidate), "/")
+		if repoPrefix != "" && candidate != repoPrefix {
+			return "", false
+		}
+		repoPrefix = candidate
+	}
+	if repoPrefix != "" {
+		return repoPrefix, true
+	}
+	if s != nil && s.multiIndexer != nil {
+		prefixes := s.multiIndexer.RepoPrefixes()
+		if len(prefixes) == 1 {
+			return prefixes[0], true
+		}
+		if len(prefixes) > 1 {
+			return "", false
+		}
+	}
+	if s != nil && s.indexer != nil {
+		return s.indexer.RepoPrefix(), true
+	}
+	return "", true
+}
+
+// snapshotExploreSourceLiteralOverlays consumes the exact immutable editor
+// cohort pinned by request middleware, resolves each buffer to its graph path,
+// and computes scope eligibility without parsing an overlay graph. A context
+// that was not prepared intentionally has no overlay lane.
+func (s *Server) snapshotExploreSourceLiteralOverlays(
+	ctx context.Context,
+	scope query.QueryOptions,
+	repoPrefix string,
+) ([]exploreSourceLiteralOverlayFile, map[string]struct{}, bool, bool, error) {
+	covered := make(map[string]struct{})
+	if s == nil || ctx == nil {
+		return nil, covered, false, false, nil
+	}
+	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
+	if !ok || snapshot == nil {
+		if OverlayViewFromContext(ctx) != nil {
+			return nil, covered, true, false, fmt.Errorf("overlay view has no pinned request snapshot")
+		}
+		return nil, covered, false, false, nil
+	}
+	if snapshot.sessionID != SessionIDFromContext(ctx) {
+		return nil, covered, false, false, fmt.Errorf("overlay request snapshot belongs to session %q, not %q", snapshot.sessionID, SessionIDFromContext(ctx))
+	}
+	fileCapacity := len(snapshot.files)
+	if fileCapacity > exploreSourceLiteralOverlayMaxCoveredFiles {
+		fileCapacity = exploreSourceLiteralOverlayMaxCoveredFiles
+	}
+	files := make([]exploreSourceLiteralOverlayFile, 0, fileCapacity)
+	fileIndex := make(map[string]int, fileCapacity)
+	incomplete := false
+	recordOverflow := false
+	recordCount := 0
+	for _, overlay := range snapshot.files {
+		if err := ctx.Err(); err != nil {
+			return nil, covered, incomplete, recordOverflow, err
+		}
+		absPath, resolveErr := s.resolveOverlayAbsPath(overlay.Path)
+		if resolveErr != nil {
+			incomplete = true
+			continue
+		}
+		if absPath == "" {
+			incomplete = true
+			continue
+		}
+		graphPath := canonicalExploreSourceLiteralPath(s.resolveOverlayGraphPath(overlay.Path, absPath))
+		if graphPath == "" {
+			incomplete = true
+			continue
+		}
+		owner := s.pickIndexerForPath(absPath)
+		if owner == nil {
+			incomplete = true
+			continue
+		}
+		if repoPrefix != "" && owner.RepoPrefix() != repoPrefix {
+			continue
+		}
+		// Bound records, not only unique graph paths: raw aliases can resolve
+		// to one canonical file and must not grow the scan cohort unboundedly.
+		recordCount++
+		if recordCount > exploreSourceLiteralOverlayMaxCoveredFiles {
+			// Fail closed at the sentinel. Returning even the bounded prefix
+			// could expose stale evidence if a later raw alias replaces it.
+			return nil, covered, true, true, nil
+		}
+		covered[graphPath] = struct{}{}
+		eligible := repoNarrowAdmits(scope.RepoAllow, owner.RepoPrefix())
+		if eligible && scope.WorkspaceID != "" {
+			eligible = owner.WorkspaceID() == scope.WorkspaceID
+		}
+		if eligible && scope.ProjectID != "" {
+			eligible = scope.WorkspaceID != "" && owner.ProjectID() == scope.ProjectID
+		}
+		if eligible && scope.ExcludeTests {
+			eligible = !testpath.IsTestFile(graphPath)
+		}
+		file := exploreSourceLiteralOverlayFile{
+			path: graphPath, content: overlay.Content, deleted: overlay.Deleted, eligible: eligible,
+		}
+		if index, exists := fileIndex[graphPath]; exists {
+			files[index] = file // SnapshotFor order defines the effective last record.
+		} else {
+			fileIndex[graphPath] = len(files)
+			files = append(files, file)
+		}
+	}
+	return files, covered, incomplete, recordOverflow, nil
 }
 
 // scanExploreSourceLiteralOverlays searches editor buffers without building an
@@ -84,7 +246,7 @@ func scanExploreSourceLiteralOverlaysWithClock(
 		}
 	}
 	sort.SliceStable(ordered, func(i, j int) bool {
-		return ordered[i].path < ordered[j].path
+		return exploreSourceLiteralPathLess(ordered[i].path, ordered[j].path)
 	})
 
 	if now == nil {
@@ -184,7 +346,7 @@ func mergeExploreSourceLiteralMatches(
 	}
 	sort.SliceStable(matches, func(i, j int) bool {
 		if matches[i].Path != matches[j].Path {
-			return matches[i].Path < matches[j].Path
+			return exploreSourceLiteralPathLess(matches[i].Path, matches[j].Path)
 		}
 		if matches[i].Line != matches[j].Line {
 			return matches[i].Line < matches[j].Line
@@ -196,6 +358,14 @@ func mergeExploreSourceLiteralMatches(
 		incomplete = true
 	}
 	return matches, incomplete
+}
+
+func exploreSourceLiteralPathLess(left, right string) bool {
+	leftTest, rightTest := testpath.IsTestFile(left), testpath.IsTestFile(right)
+	if leftTest != rightTest {
+		return !leftTest
+	}
+	return left < right
 }
 
 func canonicalExploreSourceLiteralPath(candidate string) string {

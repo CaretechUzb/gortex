@@ -88,7 +88,7 @@ func (s *Server) searchSymbolsContentFallback(
 	search := s.searchExploreSourceLiteral(
 		boundedCtx, term, "", scope, searchSymbolsContentFallbackMaxMatches,
 	)
-	if len(search.matches) == 0 {
+	if search.err != nil || len(search.matches) == 0 {
 		return nil
 	}
 

@@ -161,6 +161,101 @@ func TestScanExploreSourceLiteralOverlaysDeadline(t *testing.T) {
 	}
 }
 
+func TestScanExploreSourceLiteralOverlaysPrefersProductionBeforeTestCap(t *testing.T) {
+	files := make([]exploreSourceLiteralOverlayFile, 0, exploreSourceLiteralOverlayMaxHits+2)
+	for i := 0; i <= exploreSourceLiteralOverlayMaxHits; i++ {
+		files = append(files, exploreSourceLiteralOverlayFile{
+			path:     "repo/aaa/tests/test_" + strings.Repeat("a", i+1) + ".py",
+			content:  `label = "needle"`,
+			eligible: true,
+		})
+	}
+	files = append(files, exploreSourceLiteralOverlayFile{
+		path: "repo/zzz/app.py", content: `label = "needle"`, eligible: true,
+	})
+
+	got, err := scanExploreSourceLiteralOverlays(context.Background(), "needle", files, exploreSourceLiteralOverlayMaxHits)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(got.matches) != exploreSourceLiteralOverlayMaxHits || !got.incomplete {
+		t.Fatalf("matches/incomplete = %d/%t, want %d/true", len(got.matches), got.incomplete, exploreSourceLiteralOverlayMaxHits)
+	}
+	if got.matches[0].Path != "repo/zzz/app.py" {
+		t.Fatalf("first match = %q, want production path", got.matches[0].Path)
+	}
+}
+
+func TestMergeExploreSourceLiteralMatchesPreservesProductionPriority(t *testing.T) {
+	got, incomplete := mergeExploreSourceLiteralMatches(nil, []trigram.Match{
+		{Path: "repo/aaa/tests/test_alpha.py", Line: 1, Text: "test"},
+		{Path: "repo/zzz/app.py", Line: 2, Text: "production"},
+	}, nil, exploreSourceLiteralOverlayMaxHits)
+	if incomplete || len(got) != 2 {
+		t.Fatalf("matches/incomplete = %d/%t, want 2/false", len(got), incomplete)
+	}
+	if got[0].Path != "repo/zzz/app.py" {
+		t.Fatalf("first match = %q, want production path", got[0].Path)
+	}
+}
+
+func TestFinalizeExploreSourceLiteralSearchPreservesDurableFastPath(t *testing.T) {
+	durable := []trigram.Match{
+		{Path: "repo/production.py", Line: 2, Text: "production"},
+		{Path: "repo/tests/test_alpha.py", Line: 1, Text: "test"},
+		{Path: "repo/extra.py", Line: 3, Text: "sentinel"},
+	}
+	got := finalizeExploreSourceLiteralSearch(
+		exploreSourceLiteralSearch{matches: durable, backend: "direct", owned: true},
+		exploreSourceLiteralOverlayScan{}, nil, 2, false, false, nil,
+	)
+	if len(got.matches) != 2 || !got.incomplete {
+		t.Fatalf("matches/incomplete = %d/%t, want 2/true", len(got.matches), got.incomplete)
+	}
+	if got.matches[0].Path != durable[0].Path || got.matches[1].Path != durable[1].Path {
+		t.Fatalf("durable order changed: %#v", got.matches)
+	}
+	if &got.matches[0] != &durable[0] {
+		t.Fatal("durable fast path allocated a replacement backing slice")
+	}
+}
+
+func TestFinalizeExploreSourceLiteralSearchRetainsOnlySafePartialEvidence(t *testing.T) {
+	deadlineErr := context.DeadlineExceeded
+	got := finalizeExploreSourceLiteralSearch(
+		exploreSourceLiteralSearch{
+			matches: []trigram.Match{
+				{Path: "repo/covered.go", Line: 1, Text: "stale durable"},
+				{Path: "repo/safe.go", Line: 2, Text: "safe durable"},
+			},
+			backend: "direct", owned: true,
+		},
+		exploreSourceLiteralOverlayScan{
+			matches:    []trigram.Match{{Path: "repo/live.go", Line: 3, Text: "partial overlay"}},
+			incomplete: true,
+		},
+		map[string]struct{}{"repo/covered.go": {}},
+		exploreSourceLiteralOverlayMaxHits,
+		true,
+		false,
+		deadlineErr,
+	)
+	if !errors.Is(got.err, deadlineErr) || !got.incomplete {
+		t.Fatalf("err/incomplete = %v/%t, want deadline/true", got.err, got.incomplete)
+	}
+	if len(got.matches) != 2 {
+		t.Fatalf("matches = %#v, want safe durable plus partial overlay", got.matches)
+	}
+	for _, match := range got.matches {
+		if match.Path == "repo/covered.go" {
+			t.Fatalf("covered durable row leaked: %#v", got.matches)
+		}
+	}
+	if got.matches[0].Path != "repo/live.go" || got.matches[1].Path != "repo/safe.go" {
+		t.Fatalf("matches = %#v, want live overlay then safe durable", got.matches)
+	}
+}
+
 func TestMergeExploreSourceLiteralMatchesOverlayWinsAndSortsBeforeLimit(t *testing.T) {
 	overlay := []trigram.Match{
 		{Path: `repo\\same.go`, Line: 9, Text: "overlay replacement"},

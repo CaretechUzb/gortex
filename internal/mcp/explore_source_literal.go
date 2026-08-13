@@ -71,6 +71,7 @@ type exploreSourceLiteralSearch struct {
 	backend          string
 	owned            bool
 	lookupRepoPrefix string
+	err              error
 }
 
 // explorePreferredSourceLiteral picks one deterministic source-search key.
@@ -291,7 +292,10 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 		// fixed 150ms request budget without silently halving grep time again.
 		searchCtx, cancelSearch := context.WithTimeout(attemptCtx, searchBudget)
 		result.search = s.searchExploreSourceLiteral(searchCtx, term, repoPrefix, scope, exploreSourceLiteralRecallMaxHits)
-		result.searchErr = searchCtx.Err()
+		result.searchErr = result.search.err
+		if result.searchErr == nil {
+			result.searchErr = searchCtx.Err()
+		}
 		cancelSearch()
 		if ctx.Err() != nil {
 			return result
@@ -826,6 +830,43 @@ func (s *Server) filterExploreSourceLiteralMatches(ctx context.Context, matches 
 	return filtered
 }
 
+func finalizeExploreSourceLiteralSearch(
+	result exploreSourceLiteralSearch,
+	overlayScan exploreSourceLiteralOverlayScan,
+	covered map[string]struct{},
+	maxHits int,
+	overlayPresent bool,
+	overlayIncomplete bool,
+	err error,
+) exploreSourceLiteralSearch {
+	if maxHits <= 0 || maxHits > exploreSourceLiteralOverlayMaxHits {
+		maxHits = exploreSourceLiteralOverlayMaxHits
+	}
+	if len(covered) == 0 && len(overlayScan.matches) == 0 {
+		if len(result.matches) > maxHits {
+			result.matches = result.matches[:maxHits]
+			result.incomplete = true
+		}
+		result.incomplete = result.incomplete || overlayIncomplete || overlayScan.incomplete || err != nil
+		result.err = err
+		if overlayPresent {
+			result.backend += "+overlay"
+		}
+		return result
+	}
+	merged, mergeIncomplete := mergeExploreSourceLiteralMatches(
+		overlayScan.matches, result.matches, covered, maxHits,
+	)
+	result.matches = merged
+	result.incomplete = result.incomplete || overlayIncomplete || overlayScan.incomplete || mergeIncomplete || err != nil
+	result.err = err
+	if overlayPresent {
+		result.backend += "+overlay"
+		result.owned = result.owned || len(overlayScan.matches) > 0
+	}
+	return result
+}
+
 // searchExploreSourceLiteral mirrors search_text's literal backend while
 // deliberately refusing an unscoped multi-repository fan-out. The caller's
 // session locality supplies repoPrefix in normal operation. maxHits is the
@@ -838,58 +879,74 @@ func (s *Server) searchExploreSourceLiteral(
 	scope query.QueryOptions,
 	maxHits int,
 ) exploreSourceLiteralSearch {
-	if s.multiIndexer != nil {
-		if repoPrefix == "" {
-			haveScopedPrefix := false
-			for prefix, allowed := range scope.RepoAllow {
-				if !allowed {
-					continue
-				}
-				prefix = strings.TrimSuffix(strings.TrimSpace(prefix), "/")
-				if haveScopedPrefix && repoPrefix != prefix {
-					return exploreSourceLiteralSearch{backend: "multi-ambiguous-scope"}
-				}
-				repoPrefix = prefix
-				haveScopedPrefix = true
-			}
-		}
-		result := s.multiIndexer.GrepLiteralForRepoBounded(
-			ctx, repoPrefix, term,
-			maxHits,
-			exploreSourceLiteralRecallMaxFiles,
-		)
-		if result.Owned {
-			return exploreSourceLiteralSearch{
-				matches:          s.filterExploreSourceLiteralMatches(ctx, result.Matches),
-				incomplete:       result.Incomplete,
-				backend:          "multi",
-				owned:            true,
-				lookupRepoPrefix: result.RepoPrefix,
-			}
-		}
-		// Once MultiIndexer owns any repository, an unresolved prefix is an
-		// ownership failure rather than permission to scan the base indexer.
-		// Falling through here can leak matches from a different repository.
-		if result.Configured {
-			return exploreSourceLiteralSearch{
-				backend:          "multi-unresolved",
-				lookupRepoPrefix: repoPrefix,
-			}
+	if err := ctx.Err(); err != nil {
+		return exploreSourceLiteralSearch{backend: "none", lookupRepoPrefix: repoPrefix, err: err}
+	}
+	if maxHits <= 0 || maxHits > exploreSourceLiteralOverlayMaxHits {
+		maxHits = exploreSourceLiteralOverlayMaxHits
+	}
+	var scopeOK bool
+	scope, scopeOK = s.effectiveExploreSourceLiteralScope(ctx, scope)
+	if !scopeOK {
+		return exploreSourceLiteralSearch{backend: "session-scope-mismatch", lookupRepoPrefix: repoPrefix}
+	}
+	resolvedRepoPrefix, prefixOK := s.resolveExploreSourceLiteralRepoPrefix(repoPrefix, scope)
+	if !prefixOK {
+		return exploreSourceLiteralSearch{backend: "multi-ambiguous-scope", lookupRepoPrefix: repoPrefix}
+	}
+	repoPrefix = resolvedRepoPrefix
+	overlayFiles, covered, overlayIncomplete, coveredOverflow, overlayErr := s.snapshotExploreSourceLiteralOverlays(ctx, scope, repoPrefix)
+	if overlayErr != nil {
+		return exploreSourceLiteralSearch{
+			backend: "overlay", lookupRepoPrefix: repoPrefix, incomplete: true, owned: true, err: overlayErr,
 		}
 	}
-	if s.indexer != nil {
-		matches, incomplete := s.indexer.GrepLiteralBounded(
-			ctx, term,
-			maxHits,
-			exploreSourceLiteralRecallMaxFiles,
+	compensation := len(covered)
+	durableLimit := maxHits + compensation + 1
+
+	result := exploreSourceLiteralSearch{backend: "none", lookupRepoPrefix: repoPrefix}
+	if coveredOverflow {
+		result.backend = "overlay-covered-cap"
+		result.incomplete = true
+		result.owned = true
+	}
+	if !coveredOverflow && s.multiIndexer != nil {
+		durable := s.multiIndexer.GrepLiteralForRepoBounded(
+			ctx, repoPrefix, term, durableLimit, exploreSourceLiteralRecallMaxFiles,
 		)
-		return exploreSourceLiteralSearch{
+		if durable.Owned {
+			result = exploreSourceLiteralSearch{
+				matches:          s.filterExploreSourceLiteralMatches(ctx, durable.Matches),
+				incomplete:       durable.Incomplete || len(durable.Matches) >= durableLimit,
+				backend:          "multi",
+				owned:            true,
+				lookupRepoPrefix: durable.RepoPrefix,
+			}
+		} else if durable.Configured {
+			result = exploreSourceLiteralSearch{backend: "multi-unresolved", lookupRepoPrefix: repoPrefix}
+		}
+	}
+	if !coveredOverflow && !result.owned && result.backend != "multi-unresolved" && result.backend != "multi-ambiguous-scope" && s.indexer != nil {
+		matches, incomplete := s.indexer.GrepLiteralBounded(
+			ctx, term, durableLimit, exploreSourceLiteralRecallMaxFiles,
+		)
+		result = exploreSourceLiteralSearch{
 			matches:          s.filterExploreSourceLiteralMatches(ctx, matches),
-			incomplete:       incomplete,
+			incomplete:       incomplete || len(matches) >= durableLimit,
 			backend:          "direct",
 			owned:            true,
 			lookupRepoPrefix: s.indexer.RepoPrefix(),
 		}
 	}
-	return exploreSourceLiteralSearch{backend: "none", lookupRepoPrefix: repoPrefix}
+	if err := ctx.Err(); err != nil {
+		return finalizeExploreSourceLiteralSearch(
+			result, exploreSourceLiteralOverlayScan{}, covered, maxHits,
+			len(overlayFiles) > 0, overlayIncomplete, err,
+		)
+	}
+	overlayScan, err := scanExploreSourceLiteralOverlays(ctx, term, overlayFiles, maxHits)
+	return finalizeExploreSourceLiteralSearch(
+		result, overlayScan, covered, maxHits,
+		len(overlayFiles) > 0, overlayIncomplete, err,
+	)
 }
