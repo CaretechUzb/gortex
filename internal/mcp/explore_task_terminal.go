@@ -29,9 +29,7 @@ func newExploreTaskPageOutlineProvider(reader graph.Reader, task string) explore
 	terms := exploreTerminalTerms(task)
 	return func(targets []exploreTarget) *localizationPageOutline {
 		declarations := newBoundedLocalizationFileDeclarationCache(reader, exploreTaskDeclarationRetentionLimit)
-		provider := localizationPageOutlineProvider(nil, targets, terms, func(file string) []*graph.Node {
-			return declarations.definitions(file).Nodes
-		})
+		provider := localizationPageOutlineProvider(nil, targets, terms, declarations.definitions)
 		if provider == nil {
 			return nil
 		}

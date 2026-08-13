@@ -142,6 +142,46 @@ func TestExploreTaskOutlineProviderUsesSelectedReader(t *testing.T) {
 	}
 }
 
+func TestExploreTaskOutlineProviderPreservesBoundedDeclarationCounts(t *testing.T) {
+	const (
+		file     = "generated.go"
+		declared = 140
+	)
+	nodes := make([]*graph.Node, 0, declared)
+	for index := 0; index < declared; index++ {
+		name := fmt.Sprintf("Declaration%03d", index)
+		nodes = append(nodes, &graph.Node{
+			ID:        file + "::" + name,
+			Name:      name,
+			Kind:      graph.KindFunction,
+			FilePath:  file,
+			StartLine: index + 1,
+		})
+	}
+	selected := &localizationDeclarationSpyReader{
+		files:     map[string][]*graph.Node{file: nodes},
+		fileCalls: make(map[string]int),
+	}
+	provider := newExploreTaskPageOutlineProvider(selected, "generated declarations")
+	page := provider([]exploreTarget{{node: nodes[0]}})
+
+	if page == nil || page.Leading == nil {
+		t.Fatal("task provider did not produce a leading outline")
+	}
+	if page.Leading.Declared != declared {
+		t.Fatalf("declared = %d, want %d", page.Leading.Declared, declared)
+	}
+	if page.Leading.Elided != declared-exploreTaskDeclarationRetentionLimit {
+		t.Fatalf("elided = %d, want %d", page.Leading.Elided, declared-exploreTaskDeclarationRetentionLimit)
+	}
+	if len(page.Leading.Rows) != exploreTaskDeclarationRetentionLimit {
+		t.Fatalf("rows = %d, want %d", len(page.Leading.Rows), exploreTaskDeclarationRetentionLimit)
+	}
+	if selected.fileCalls[file] != 1 {
+		t.Fatalf("selected reader called %d times, want 1", selected.fileCalls[file])
+	}
+}
+
 func TestRenderExploreTaskOutlineShrinksCloneOnly(t *testing.T) {
 	rows := make([]localizationOutlineRow, 0, localizationOutlineRowCap)
 	for index := 0; index < localizationOutlineRowCap; index++ {
