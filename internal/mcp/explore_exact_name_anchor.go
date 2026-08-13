@@ -192,11 +192,12 @@ func exploreExactNameCaseVariants(token string) []string {
 func (lookup *exploreExactNameAnchorLookup) caseFoldedMatches(
 	ctx context.Context,
 	token string,
+	scope graph.LocalizationNodeScope,
 	eligible func(*graph.Node) bool,
-) []*graph.Node {
+) ([]*graph.Node, int) {
 	if lookup == nil || lookup.reader == nil || ctx.Err() != nil ||
 		lookup.fallbackTokens == exploreExactNameAnchorCaseFoldMaxTokens {
-		return nil
+		return nil, 0
 	}
 	lookup.fallbackTokens++
 	matches := make([]*graph.Node, 0, exploreExactNameAnchorMaxNodes)
@@ -214,23 +215,35 @@ func (lookup *exploreExactNameAnchorLookup) caseFoldedMatches(
 	}
 
 	variants := exploreExactNameCaseVariants(token)
+	shared := 0
 	for _, variant := range variants[1:] {
 		if ctx.Err() != nil {
-			return matches
+			return matches, shared
 		}
-		for _, node := range lookup.reader.FindNodesByName(variant) {
+		page, ok := boundedLocalizationExactName(
+			ctx,
+			lookup.reader,
+			variant,
+			scope,
+			exploreExactNameAnchorMaxNodes,
+		)
+		if !ok {
+			return matches, shared
+		}
+		shared += page.Total
+		for _, node := range page.Nodes {
 			add(node)
 		}
 	}
 	if len(matches) > 0 {
-		return matches
+		return matches, shared
 	}
 
 	for _, node := range lookup.rankedNodes {
 		add(node)
 	}
 	if len(matches) > 0 {
-		return matches
+		return matches, len(matches)
 	}
 
 	for _, path := range lookup.rankedFiles {
@@ -249,7 +262,7 @@ func (lookup *exploreExactNameAnchorLookup) caseFoldedMatches(
 			break
 		}
 	}
-	return matches
+	return matches, len(matches)
 }
 
 // exploreExactNameAnchorNodes returns localizable declarations whose indexed
@@ -266,8 +279,8 @@ func (s *Server) exploreExactNameAnchorNodes(
 		return node != nil && exploreSyntacticAnchorEligibleNode(node) &&
 			scope.ScopeAllows(node) && s.nodeInSessionScope(ctx, node)
 	}
-	selectMatches := func(matches []*graph.Node, exact bool) ([]*graph.Node, bool) {
-		shared := 0
+	selectMatches := func(matches []*graph.Node, exact bool, shared int) ([]*graph.Node, bool) {
+		eligibleShared := 0
 		eligible := make([]*graph.Node, 0, exploreExactNameAnchorMaxNodes)
 		pooled := make([]*graph.Node, 0, exploreExactNameAnchorMaxNodes)
 		for _, node := range matches {
@@ -275,7 +288,7 @@ func (s *Server) exploreExactNameAnchorNodes(
 				!eligibleNode(node) {
 				continue
 			}
-			shared++
+			eligibleShared++
 			if len(eligible) < exploreExactNameAnchorMaxNodes {
 				eligible = append(eligible, node)
 			}
@@ -286,17 +299,77 @@ func (s *Server) exploreExactNameAnchorNodes(
 		if shared > exploreExactNameAnchorMaxShared {
 			// The ranked pool is independent evidence that one of the homonyms is
 			// the one the task means; without it an ambiguous name stays unanchored.
-			return pooled, true
+			if len(pooled) > 0 {
+				return pooled, true
+			}
+			return lookup.preferredFileMatches(ctx, token, exact, eligibleNode), true
 		}
-		return eligible, shared > 0
+		return eligible, eligibleShared > 0
 	}
 
-	if exact, found := selectMatches(lookup.reader.FindNodesByName(token), true); found {
-		return exact
+	nodeScope := s.localizationNodeScope(
+		ctx, scope, graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindMacro,
+	)
+	page, ok := boundedLocalizationExactName(
+		ctx,
+		lookup.reader,
+		token,
+		nodeScope,
+		exploreExactNameAnchorMaxNodes,
+	)
+	if ok {
+		if exact, found := selectMatches(page.Nodes, true, page.Total); found {
+			return exact
+		}
 	}
-	matches := lookup.caseFoldedMatches(ctx, token, eligibleNode)
-	selected, _ := selectMatches(matches, false)
+	matches, shared := lookup.caseFoldedMatches(ctx, token, nodeScope, eligibleNode)
+	selected, _ := selectMatches(matches, false, shared)
 	return selected
+}
+
+// preferredFileMatches preserves the independent ranked-file evidence used to
+// disambiguate a highly shared name even when its declaration sorts beyond the
+// bounded exact-name page. rankedFiles is request-capped at four and fileNodes
+// is shared with case-fold recovery, so this cannot grow into a corpus scan.
+func (lookup *exploreExactNameAnchorLookup) preferredFileMatches(
+	ctx context.Context,
+	token string,
+	exact bool,
+	eligible func(*graph.Node) bool,
+) []*graph.Node {
+	if lookup == nil || lookup.reader == nil || eligible == nil {
+		return nil
+	}
+	matches := make([]*graph.Node, 0, exploreExactNameAnchorMaxNodes)
+	seen := make(map[string]struct{}, exploreExactNameAnchorMaxNodes)
+	for _, path := range lookup.rankedFiles {
+		if ctx.Err() != nil || len(matches) == exploreExactNameAnchorMaxNodes {
+			break
+		}
+		nodes, cached := lookup.fileNodes[path]
+		if !cached {
+			nodes = lookup.reader.GetFileNodes(path)
+			lookup.fileNodes[path] = nodes
+		}
+		for _, node := range nodes {
+			nameMatches := node != nil && strings.EqualFold(node.Name, token)
+			if exact {
+				nameMatches = node != nil && node.Name == token
+			}
+			if !nameMatches || !eligible(node) {
+				continue
+			}
+			if _, duplicate := seen[node.ID]; duplicate {
+				continue
+			}
+			seen[node.ID] = struct{}{}
+			matches = append(matches, node)
+			if len(matches) == exploreExactNameAnchorMaxNodes {
+				break
+			}
+		}
+	}
+	return matches
 }
 
 func exploreRankedPoolFiles(candidates []*rerank.Candidate) map[string]struct{} {
@@ -465,9 +538,19 @@ func (s *Server) exploreQualifiedAnchorOwnerCandidate(
 	if owner == "" || owner == member.Name {
 		return nil
 	}
+	page, ok := boundedLocalizationExactName(
+		ctx,
+		reader,
+		owner,
+		s.localizationNodeScope(ctx, scope, graph.KindType, graph.KindInterface),
+		exploreExactNameAnchorOwnerRawScan,
+	)
+	if !ok {
+		return nil
+	}
 	var best *graph.Node
 	rawScanned, eligibleScanned := 0, 0
-	for _, node := range reader.FindNodesByName(owner) {
+	for _, node := range page.Nodes {
 		if rawScanned == exploreExactNameAnchorOwnerRawScan {
 			break
 		}

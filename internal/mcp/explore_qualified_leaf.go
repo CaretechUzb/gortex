@@ -46,9 +46,19 @@ func (s *Server) exploreRankedQualifiedOwnerFiles(
 	ordinary []*rerank.Candidate,
 	scope query.QueryOptions,
 ) []exploreQualifiedOwnerFile {
+	page, ok := boundedLocalizationExactName(
+		ctx,
+		reader,
+		owner,
+		s.localizationNodeScope(ctx, scope, graph.KindType, graph.KindInterface),
+		exploreExactNameAnchorOwnerRawScan,
+	)
+	if !ok {
+		return nil
+	}
 	ownersByFile := make(map[string]map[string]struct{})
 	rawScanned, eligibleScanned := 0, 0
-	for _, node := range reader.FindNodesByName(owner) {
+	for _, node := range page.Nodes {
 		if rawScanned == exploreExactNameAnchorOwnerRawScan {
 			break
 		}

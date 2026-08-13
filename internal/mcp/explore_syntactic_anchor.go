@@ -826,7 +826,21 @@ func (s *Server) exploreExactQualifiedAnchorCandidate(
 	candidates := make([]*rerank.Candidate, 0, exploreSyntacticAnchorFetch)
 	seen := make(map[string]struct{}, exploreSyntacticAnchorFetch)
 	for _, name := range names {
-		for _, node := range reader.FindNodesByName(name) {
+		remaining := exploreSyntacticAnchorFetch - len(candidates)
+		if remaining <= 0 {
+			break
+		}
+		page, ok := boundedLocalizationExactName(
+			ctx,
+			reader,
+			name,
+			s.localizationNodeScope(ctx, scope, graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindInterface, graph.KindMacro),
+			remaining,
+		)
+		if !ok {
+			return nil
+		}
+		for _, node := range page.Nodes {
 			if node == nil || !s.nodeInSessionScope(ctx, node) {
 				continue
 			}

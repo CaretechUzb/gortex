@@ -67,14 +67,19 @@ func TestReserveExploreSyntacticAnchorCandidatesKeepsGraphResolvedAnchor(t *test
 }
 
 func TestExploreTaskAnchorsSkipAmbiguousPlainName(t *testing.T) {
-	nodes := make([]*graph.Node, 0, 9)
-	for index := 0; index < 9; index++ {
+	nodes := make([]*graph.Node, 0, 33)
+	for index := 0; index < 32; index++ {
 		nodes = append(nodes, &graph.Node{
-			ID:   fmt.Sprintf("pkg/h%d.go::handle", index),
+			ID:   fmt.Sprintf("pkg/a-%02d.go::handle", index),
 			Name: "handle", Kind: graph.KindFunction,
-			FilePath: fmt.Sprintf("pkg/h%d.go", index),
+			FilePath: fmt.Sprintf("pkg/a-%02d.go", index),
 		})
 	}
+	rankedHandle := &graph.Node{
+		ID: "pkg/z-ranked.go::handle", Name: "handle", Kind: graph.KindFunction,
+		FilePath: "pkg/z-ranked.go",
+	}
+	nodes = append(nodes, rankedHandle)
 	server := exactNameAnchorServer(t, nodes...)
 	task := "requests handle poorly under sustained load"
 	if anchors := server.exploreTaskAnchors(context.Background(), task, nil, query.QueryOptions{}); len(anchors) != 0 {
@@ -82,14 +87,15 @@ func TestExploreTaskAnchorsSkipAmbiguousPlainName(t *testing.T) {
 	}
 
 	pool := []*rerank.Candidate{{Node: &graph.Node{
-		ID: "pkg/h3.go::serve", Name: "serve", Kind: graph.KindFunction, FilePath: "pkg/h3.go",
+		ID: "pkg/z-ranked.go::serve", Name: "serve", Kind: graph.KindFunction,
+		FilePath: rankedHandle.FilePath,
 	}}}
 	anchors := server.exploreTaskAnchors(context.Background(), task, pool, query.QueryOptions{})
 	if len(anchors) != 1 || anchors[0].compact != "handle" {
 		t.Fatalf("anchors = %#v, want the ranked-pool file to disambiguate handle", anchors)
 	}
-	if len(anchors[0].exactNodes) != 1 || anchors[0].exactNodes[0].FilePath != "pkg/h3.go" {
-		t.Fatalf("exact nodes = %#v, want only the ranked-pool declaration", anchors[0].exactNodes)
+	if len(anchors[0].exactNodes) != 1 || anchors[0].exactNodes[0].ID != rankedHandle.ID {
+		t.Fatalf("exact nodes = %#v, want ranked declaration %q beyond the bounded page", anchors[0].exactNodes, rankedHandle.ID)
 	}
 }
 
@@ -319,6 +325,37 @@ func TestExploreTaskAnchorsCaseFoldedFallbackHonorsSessionScope(t *testing.T) {
 	}
 }
 
+func TestExploreTaskAnchorsPushSessionScopeBeforeBoundedLookup(t *testing.T) {
+	nodes := make([]*graph.Node, 0, 162)
+	for index := 0; index < 160; index++ {
+		nodes = append(nodes, &graph.Node{
+			ID: fmt.Sprintf("a-foreign/%03d.go::MOUNT", index), Name: "MOUNT",
+			Kind: graph.KindFunction, FilePath: fmt.Sprintf("a-foreign/%03d.go", index),
+			RepoPrefix: "foreign", WorkspaceID: "foreign",
+		})
+	}
+	local := &graph.Node{
+		ID: "z-local/router.go::MOUNT", Name: "MOUNT", Kind: graph.KindFunction,
+		FilePath: "z-local/router.go", RepoPrefix: "local", WorkspaceID: "local",
+	}
+	ranked := &graph.Node{
+		ID: "z-local/router.go::serve", Name: "serve", Kind: graph.KindFunction,
+		FilePath: local.FilePath, RepoPrefix: "local", WorkspaceID: "local",
+	}
+	nodes = append(nodes, local, ranked)
+	server := exactNameAnchorServer(t, nodes...)
+	server.session = &sessionState{
+		scopeResolved: true, scopeBound: true, scopeWorkspaceID: "local",
+		scopeRepoAllow: map[string]bool{"local": true},
+	}
+	anchors := server.exploreTaskAnchors(
+		context.Background(), "mount", []*rerank.Candidate{{Node: ranked}}, query.QueryOptions{},
+	)
+	if len(anchors) != 1 || len(anchors[0].exactNodes) != 1 || anchors[0].exactNodes[0].ID != local.ID {
+		t.Fatalf("anchors = %#v, want session-local declaration %q beyond foreign homonyms", anchors, local.ID)
+	}
+}
+
 func TestExploreTaskAnchorsRecoverInteriorCaseOnlyFromRankedFile(t *testing.T) {
 	target := &graph.Node{
 		ID: "pkg/render.go::buildContent", Name: "buildContent",
@@ -367,9 +404,22 @@ type exactNameAnchorCountingReader struct {
 	fileLookups []string
 }
 
-func (reader *exactNameAnchorCountingReader) FindNodesByName(name string) []*graph.Node {
+func (reader *exactNameAnchorCountingReader) FindNodesByName(string) []*graph.Node {
+	panic("localization must not use the legacy unbounded exact-name reader")
+}
+
+func (reader *exactNameAnchorCountingReader) FindNodesByNameBounded(
+	ctx context.Context,
+	name string,
+	scope graph.LocalizationNodeScope,
+	limit int,
+) (graph.BoundedNodeProjection, error) {
 	reader.nameLookups = append(reader.nameLookups, name)
-	return reader.Reader.FindNodesByName(name)
+	bounded, ok := reader.Reader.(graph.BoundedExactNameReader)
+	if !ok {
+		return graph.BoundedNodeProjection{}, graph.ErrBoundedLocalizationUnavailable
+	}
+	return bounded.FindNodesByNameBounded(ctx, name, scope, limit)
 }
 
 func (reader *exactNameAnchorCountingReader) GetFileNodes(path string) []*graph.Node {
