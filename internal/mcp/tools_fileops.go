@@ -1,7 +1,6 @@
 package mcp
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -1130,10 +1129,18 @@ func samePhysicalFileVersion(a, b os.FileInfo) bool {
 		os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
 }
 
-// readPhysicalFileEvidence returns bytes and a digest from one stable disk
-// version. A second read from the same handle catches in-place rewrites that
-// preserve size and timestamp closely enough to evade metadata-only checks.
+// readPhysicalFileEvidence hashes the exact buffer returned to the caller from
+// one file-handle read. Metadata and path identity checks bound replacement or
+// in-place drift during that read without doubling file I/O or peak memory.
 func readPhysicalFileEvidence(absPath string) ([]byte, physicalReadEvidence, error) {
+	return readPhysicalFileEvidenceObserved(absPath, nil)
+}
+
+func readPhysicalFileEvidenceObserved(absPath string, afterRead func()) ([]byte, physicalReadEvidence, error) {
+	linkInfo, err := os.Lstat(absPath)
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not inspect physical path: %w", err)
+	}
 	resolvedBefore, err := filepath.EvalSymlinks(absPath)
 	if err != nil {
 		return nil, physicalReadEvidence{}, fmt.Errorf("could not resolve physical file: %w", err)
@@ -1151,24 +1158,16 @@ func readPhysicalFileEvidence(absPath string) ([]byte, physicalReadEvidence, err
 	if !before.Mode().IsRegular() {
 		return nil, physicalReadEvidence{}, fmt.Errorf("physical evidence requires a regular file, got %s", before.Mode().Type())
 	}
-	first, err := io.ReadAll(f)
+	content, err := io.ReadAll(f)
 	if err != nil {
 		return nil, physicalReadEvidence{}, fmt.Errorf("could not read physical file: %w", err)
 	}
-	middle, err := f.Stat()
-	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not restat physical file: %w", err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not rewind physical file: %w", err)
-	}
-	second, err := io.ReadAll(f)
-	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical file: %w", err)
+	if afterRead != nil {
+		afterRead()
 	}
 	after, err := f.Stat()
 	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical file metadata: %w", err)
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not restat physical file: %w", err)
 	}
 	pathInfo, err := os.Stat(absPath)
 	if err != nil {
@@ -1179,19 +1178,17 @@ func readPhysicalFileEvidence(absPath string) ([]byte, physicalReadEvidence, err
 		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path resolution: %w", err)
 	}
 	if filepath.Clean(resolvedBefore) != filepath.Clean(resolvedAfter) ||
-		!samePhysicalFileVersion(before, middle) ||
-		!samePhysicalFileVersion(middle, after) ||
-		!samePhysicalFileVersion(after, pathInfo) ||
-		!bytes.Equal(first, second) {
+		!samePhysicalFileVersion(before, after) ||
+		!samePhysicalFileVersion(after, pathInfo) {
 		return nil, physicalReadEvidence{}, errors.New("physical file changed while it was being read; retry")
 	}
 
-	sum := sha256.Sum256(first)
-	return first, physicalReadEvidence{
+	sum := sha256.Sum256(content)
+	return content, physicalReadEvidence{
 		resolvedPath:    resolvedAfter,
 		contentSHA256:   fmt.Sprintf("%x", sum),
-		byteCount:       len(first),
-		symlinkResolved: filepath.Clean(resolvedAfter) != filepath.Clean(absPath),
+		byteCount:       len(content),
+		symlinkResolved: linkInfo.Mode()&os.ModeSymlink != 0,
 		readAt:          time.Now().UTC(),
 	}, nil
 }
@@ -1386,7 +1383,6 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		result["content_source"] = contentSource
 		result["disk_verified"] = true
 		result["same_buffer_as_content"] = !contentAltered
-		result["content_truncated"] = contentAltered
 		result["symlink_resolved"] = physicalEvidence.symlinkResolved
 	}
 

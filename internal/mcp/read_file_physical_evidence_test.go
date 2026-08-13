@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -35,9 +37,11 @@ func TestReadFilePhysicalEvidenceHashesFullDiskBuffer(t *testing.T) {
 	require.Equal(t, "disk", got["content_source"])
 	require.Equal(t, true, got["disk_verified"])
 	require.Equal(t, false, got["same_buffer_as_content"])
-	require.Equal(t, true, got["content_truncated"])
+	require.NotContains(t, got, "content_truncated")
 	require.Equal(t, float64(len(content)), got["byte_count"])
-	require.Equal(t, target, got["resolved_path"])
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	require.NoError(t, err)
+	require.Equal(t, resolvedTarget, got["resolved_path"])
 	require.Equal(t, "regular", got["file_kind"])
 	require.NotEmpty(t, got["read_at"])
 }
@@ -62,7 +66,7 @@ func TestReadFilePhysicalEvidenceSameBufferForFullText(t *testing.T) {
 	got := decodeFileOpsResult(t, result)
 	require.Equal(t, string(content), got["content"])
 	require.Equal(t, true, got["same_buffer_as_content"])
-	require.Equal(t, false, got["content_truncated"])
+	require.NotContains(t, got, "content_truncated")
 }
 
 func TestReadFilePhysicalEvidenceBinaryAndEmptyDigests(t *testing.T) {
@@ -87,10 +91,24 @@ func TestReadFilePhysicalEvidenceBinaryAndEmptyDigests(t *testing.T) {
 			require.Equal(t, float64(len(test.content)), got["byte_count"])
 			if test.name == "binary" {
 				require.Equal(t, false, got["same_buffer_as_content"])
-				require.Equal(t, true, got["content_truncated"])
+				require.NotContains(t, got, "content_truncated")
 			}
 		})
 	}
+}
+
+func TestReadFilePhysicalEvidenceMaxCharsRetainsTruncationContract(t *testing.T) {
+	srv, dir := setupTestServer(t)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "bounded.txt"), []byte("abcdef"), 0o644))
+	got := decodeFileOpsResult(t, callTool(t, srv, "read_file", map[string]any{
+		"path":              "bounded.txt",
+		"physical_evidence": true,
+		"max_chars":         3,
+	}))
+	require.Equal(t, "abc", got["content"])
+	require.Equal(t, true, got["content_truncated"])
+	require.Equal(t, float64(3), got["max_chars"])
+	require.Equal(t, false, got["same_buffer_as_content"])
 }
 
 func TestReadFilePhysicalEvidenceETagIgnoresObservationTime(t *testing.T) {
@@ -113,6 +131,71 @@ func TestReadFilePhysicalEvidenceRejectsInvalidDigestContract(t *testing.T) {
 		result := callTool(t, srv, "read_file", args)
 		require.True(t, result.IsError)
 	}
+}
+
+func TestReadFilePhysicalEvidenceRejectsSameSizeDriftDuringObservation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "drift.txt")
+	require.NoError(t, os.WriteFile(path, []byte("before"), 0o644))
+	before, err := os.Stat(path)
+	require.NoError(t, err)
+	_, _, err = readPhysicalFileEvidenceObserved(path, func() {
+		require.NoError(t, os.WriteFile(path, []byte("after!"), 0o644))
+		changedAt := before.ModTime().Add(time.Second)
+		require.NoError(t, os.Chtimes(path, changedAt, changedAt))
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "changed while it was being read")
+}
+
+func TestReadFilePhysicalEvidenceRejectsPathReplacementDuringObservation(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("replacing an open file is not reliably available on Windows CI")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "observed.txt")
+	replacement := filepath.Join(dir, "replacement.txt")
+	require.NoError(t, os.WriteFile(path, []byte("first"), 0o644))
+	require.NoError(t, os.WriteFile(replacement, []byte("other"), 0o644))
+	_, _, err := readPhysicalFileEvidenceObserved(path, func() {
+		require.NoError(t, os.Rename(replacement, path))
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "changed while it was being read")
+}
+
+func TestReadFilePhysicalEvidenceReportsRequestedFileSymlink(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("symlink creation is not reliably available on Windows CI")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.txt")
+	link := filepath.Join(dir, "link.txt")
+	require.NoError(t, os.WriteFile(target, []byte("target"), 0o644))
+	require.NoError(t, os.Symlink(target, link))
+	content, evidence, err := readPhysicalFileEvidence(link)
+	require.NoError(t, err)
+	require.Equal(t, []byte("target"), content)
+	require.True(t, evidence.symlinkResolved)
+	resolved, err := filepath.EvalSymlinks(link)
+	require.NoError(t, err)
+	require.Equal(t, resolved, evidence.resolvedPath)
+}
+
+func TestReadFilePhysicalEvidenceAncestorSymlinkDoesNotMarkFileAsLink(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("symlink creation is not reliably available on Windows CI")
+	}
+	dir := t.TempDir()
+	realDir := filepath.Join(dir, "real")
+	linkedDir := filepath.Join(dir, "linked")
+	require.NoError(t, os.Mkdir(realDir, 0o755))
+	require.NoError(t, os.Symlink(realDir, linkedDir))
+	path := filepath.Join(realDir, "file.txt")
+	require.NoError(t, os.WriteFile(path, []byte("content"), 0o644))
+	_, evidence, err := readPhysicalFileEvidence(filepath.Join(linkedDir, "file.txt"))
+	require.NoError(t, err)
+	require.False(t, evidence.symlinkResolved)
+	require.True(t, strings.HasSuffix(filepath.ToSlash(evidence.resolvedPath), "/real/file.txt"))
 }
 
 func TestReadFilePhysicalEvidenceIsPublishedByFacadeSchema(t *testing.T) {
