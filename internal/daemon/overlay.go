@@ -380,30 +380,42 @@ func (m *OverlayManager) SnapshotFor(sessionID string) (workspace string, files 
 	if m == nil {
 		return "", nil, ErrSessionNotFound
 	}
-	// Promoted to write lock so we can refresh LastUsed alongside
-	// the snapshot copy: every tool-call view-build flows through
-	// here, and that activity must reset the idle timer. Without
-	// this, a session that only queries (no further Push) would
-	// trip the TTL while in active use. The cost is one extra
-	// mutex promotion per overlay-active tool call — negligible
-	// against the parse work the view builder is about to do.
+	// Ordinary MCP sessions are not overlay sessions. Prove absence under a
+	// shared lock so their request preparation never queues for the manager-wide
+	// writer. A Register racing after this check belongs to the next request;
+	// this read-lock instant is the current request's empty snapshot boundary.
+	m.mu.RLock()
+	_, exists := m.sessions[sessionID]
+	m.mu.RUnlock()
+	if !exists {
+		return "", nil, ErrSessionNotFound
+	}
+
+	// Registered sessions still count reads as activity. Re-check after lock
+	// promotion because Drop may win the gap, then copy the active branch while
+	// protected. Sorting happens after unlock: the returned slice owns its
+	// headers and no longer needs to serialize unrelated sessions.
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	sess, ok := m.sessions[sessionID]
 	if !ok {
+		m.mu.Unlock()
 		return "", nil, ErrSessionNotFound
 	}
 	sess.LastUsed = time.Now()
+	workspace = sess.WorkspaceID
 	br := sess.activeBranch()
 	if br == nil {
-		return sess.WorkspaceID, nil, nil
+		m.mu.Unlock()
+		return workspace, nil, nil
 	}
 	out := make([]OverlayFile, 0, len(br.files))
 	for _, f := range br.files {
 		out = append(out, f)
 	}
+	m.mu.Unlock()
+
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	return sess.WorkspaceID, out, nil
+	return workspace, out, nil
 }
 
 // Push attaches one overlay file to a session's active branch.

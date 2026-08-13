@@ -72,6 +72,25 @@ func TestOverlayManager_HasAndFileCount(t *testing.T) {
 	require.Zero(t, m.FileCount(id))
 }
 
+func TestOverlayManager_SnapshotForMissingUsesSharedLock(t *testing.T) {
+	m := NewOverlayManager(time.Minute)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := m.SnapshotFor("ordinary-mcp-session")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, ErrSessionNotFound)
+	case <-time.After(time.Second):
+		t.Fatal("missing-session snapshot waited for an exclusive manager lock")
+	}
+}
+
 // TestOverlayManager_DriftCheck verifies that Push surfaces a drift
 // error when the supplied BaseSHA disagrees with the on-disk SHA
 // reported by the callback. Without drift detection two clients
