@@ -15,17 +15,30 @@ func TestRenderExploreTaskAddsCompletionWithinBudget(t *testing.T) {
 	for _, want := range []string{
 		"EXPLORE — retry backoff",
 		"## Completion",
-		`"state": "answer_ready"`,
-		`"required_action": "respond"`,
+		`"state": "localized"`,
+		`"scope": "task"`,
+		`"required_action": "continue_task"`,
 		`"allowed_tool_calls": 0`,
-		"Answer from the ranked evidence and file outlines above.",
+		`"terminal": false`,
+		"Editing, navigation, building, and testing remain available.",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("task completion missing %q:\n%s", want, got)
 		}
 	}
+	if strings.Contains(got, localizationAnswerReadyInstruction) || strings.Contains(got, `"state": "answer_ready"`) {
+		t.Fatalf("ordinary task mode incorrectly terminalized navigation:\n%s", got)
+	}
 	if used := estimateTokens(got); used > 1600 {
 		t.Fatalf("task response used %d tokens, budget 1600", used)
+	}
+}
+
+func TestRenderExploreTaskCompletionLeavesLocalizeTerminalContractUnchanged(t *testing.T) {
+	contract := localizationContractFor(newLocalizationCompletion(true, ""))
+	if !contract.Terminal || contract.Completion.State != localizationStateAnswerReady ||
+		contract.Completion.RequiredAction != "respond" || contract.Completion.Instruction != localizationAnswerReadyInstruction {
+		t.Fatalf("localize terminal contract changed: %#v", contract)
 	}
 }
 

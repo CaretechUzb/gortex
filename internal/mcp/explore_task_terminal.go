@@ -106,8 +106,15 @@ func joinExploreTaskSections(base, outlines, completion string) string {
 }
 
 func renderExploreTaskCompletion() string {
-	completion := newLocalizationCompletion(true, "")
-	completion.FinalResponse = "Answer from the ranked evidence and file outlines above."
+	completion := localizationCompletion{
+		State:            localizationStateLocalized,
+		Scope:            "task",
+		RequiredAction:   "continue_task",
+		Instruction:      "Continue the requested diagnosis or implementation from the ranked evidence and file outlines above. Editing, navigation, building, and testing remain available.",
+		FinalResponse:    "Use the ranked evidence and file outlines above to continue the requested task.",
+		AllowedToolCalls: 0,
+		ContractVersion:  localizationTerminalContractV2,
+	}
 	contract := localizationContractFor(completion)
 	encoded, err := json.MarshalIndent(contract, "", "  ")
 	if err != nil {
