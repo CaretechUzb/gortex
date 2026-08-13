@@ -113,6 +113,31 @@ func TestScanExploreSourceLiteralOverlaysCapsAndCancellation(t *testing.T) {
 	}
 }
 
+func TestScanExploreSourceLiteralOverlaysChargesOnlyInspectedBytes(t *testing.T) {
+	largeTail := strings.Repeat("x\n", exploreSourceLiteralOverlayMaxBytes/2+1)
+	early, err := scanExploreSourceLiteralOverlays(context.Background(), "needle", []exploreSourceLiteralOverlayFile{
+		{path: "repo/early.go", content: "needle\n" + largeTail, eligible: true},
+	}, 24)
+	if err != nil {
+		t.Fatalf("early scan: %v", err)
+	}
+	if early.incomplete || len(early.matches) != 1 {
+		t.Fatalf("early hit: matches=%#v incomplete=%v", early.matches, early.incomplete)
+	}
+
+	line := strings.Repeat("x", exploreSourceLiteralOverlayMaxLineBytes-1) + "\n"
+	lateContent := strings.Repeat(line, exploreSourceLiteralOverlayMaxBytes/(exploreSourceLiteralOverlayMaxLineBytes-1)+1) + "needle\n"
+	late, err := scanExploreSourceLiteralOverlays(context.Background(), "needle", []exploreSourceLiteralOverlayFile{
+		{path: "repo/late.go", content: lateContent, eligible: true},
+	}, 24)
+	if err != nil {
+		t.Fatalf("late scan: %v", err)
+	}
+	if !late.incomplete || len(late.matches) != 0 {
+		t.Fatalf("late hit: matches=%#v incomplete=%v", late.matches, late.incomplete)
+	}
+}
+
 func TestScanExploreSourceLiteralOverlaysDeadline(t *testing.T) {
 	started := time.Unix(1, 0)
 	calls := 0

@@ -100,12 +100,6 @@ func scanExploreSourceLiteralOverlaysWithClock(
 			result.incomplete = true
 			break
 		}
-		if len(file.content) > exploreSourceLiteralOverlayMaxBytes-inputBytes {
-			result.incomplete = true
-			break
-		}
-		inputBytes += len(file.content)
-
 		scanner := bufio.NewScanner(strings.NewReader(file.content))
 		scanner.Buffer(make([]byte, 4096), exploreSourceLiteralOverlayMaxLineBytes)
 		line := 0
@@ -118,6 +112,12 @@ func scanExploreSourceLiteralOverlaysWithClock(
 				result.incomplete = true
 				break
 			}
+			lineBytes := scanner.Bytes()
+			if len(lineBytes) > exploreSourceLiteralOverlayMaxBytes-inputBytes {
+				result.incomplete = true
+				break
+			}
+			inputBytes += len(lineBytes)
 			text := scanner.Text()
 			if !exploreOverlayLiteralHasBoundary(text, term) {
 				continue
