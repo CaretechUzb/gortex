@@ -15,6 +15,12 @@ func TestExploreBareLiteralRecallTermsKeepsDiagnosticTail(t *testing.T) {
 	require.Equal(t, []string{"unable to seal chunk manifest"}, terms)
 }
 
+func TestExploreBareLiteralRecallTermsRequiresThreeWordDiagnosticTail(t *testing.T) {
+	require.Empty(t, exploreBareLiteralRecallTerms("The daemon reports manifest missing."))
+	require.Equal(t, []string{"durable manifest missing"},
+		exploreBareLiteralRecallTerms("The daemon reports durable manifest missing."))
+}
+
 func TestExploreBareLiteralRecallTermsAdmitsAllCapsAndCuedStructuredValues(t *testing.T) {
 	terms := exploreBareLiteralRecallTerms("Run ZRANGEBYSCORE again with the header X-CACHE-MODE value.")
 	require.Equal(t, []string{"X-CACHE-MODE", "ZRANGEBYSCORE"}, terms)

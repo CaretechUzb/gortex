@@ -15,7 +15,7 @@ const (
 	exploreBareLiteralMinRunes     = 4
 	exploreBareLiteralMaxRunes     = 128
 	exploreBareDiagnosticMinRunes  = 12
-	exploreBareDiagnosticMinWords  = 2
+	exploreBareDiagnosticMinWords  = 3
 	exploreBareDiagnosticMaxWords  = 6
 )
 
