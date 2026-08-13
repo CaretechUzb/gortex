@@ -21,20 +21,13 @@ func localizationClaimCheck(input PostTaskInput) string {
 	if !ok {
 		return ""
 	}
-	marker, ok := localizationTerminalMarkerFor(identity)
-	if !ok || len(marker.PrimaryIDs) == 0 || len(marker.EvidenceIDs) == 0 {
-		return ""
-	}
 	claims := localizationExplicitSymbolClaims(message)
 	if len(claims) == 0 {
 		return ""
 	}
-	for _, claim := range claims {
-		for _, evidenceID := range marker.EvidenceIDs {
-			if localizationClaimMatchesEvidence(claim, evidenceID) {
-				return ""
-			}
-		}
+	marker, consumed := consumeLocalizationClaimCheck(identity, claims)
+	if !consumed {
+		return ""
 	}
 	prompt := "[Gortex claim_check] Your answer names no symbol in the authenticated evidence. Cite one of these PRIMARY IDs, or explicitly confirm that none fits: " + strings.Join(marker.PrimaryIDs, ", ") + ". Do not retrieve more evidence."
 	return boundedLocalizationClaimCheck(prompt)

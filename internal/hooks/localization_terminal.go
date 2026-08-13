@@ -107,9 +107,10 @@ type localizationTerminalMarker struct {
 	// FinalResponse rides the marker so a blocked call can hand back the answer
 	// itself. A refusal that only says "you are done" gives the caller nothing
 	// to act on and it tries the next tool; the answer ends the turn.
-	FinalResponse string   `json:"final_response,omitempty"`
-	PrimaryIDs    []string `json:"primary_ids,omitempty"`
-	EvidenceIDs   []string `json:"evidence_ids,omitempty"`
+	FinalResponse      string   `json:"final_response,omitempty"`
+	PrimaryIDs         []string `json:"primary_ids,omitempty"`
+	EvidenceIDs        []string `json:"evidence_ids,omitempty"`
+	ClaimCheckConsumed bool     `json:"claim_check_consumed,omitempty"`
 }
 
 type localizationTerminalHookInput struct {
@@ -696,6 +697,46 @@ func localizationTerminalMarkerFor(identity localizationTerminalIdentity) (local
 		return marker, true
 	}
 	return localizationTerminalMarker{}, false
+}
+
+// consumeLocalizationClaimCheck atomically marks one enforceable terminal
+// marker as challenged. Concurrent or host-retried Stop hooks fail open after
+// the first successful claim, even when a host omits stop_hook_active.
+func consumeLocalizationClaimCheck(identity localizationTerminalIdentity, claims []string) (localizationTerminalMarker, bool) {
+	path := localizationTerminalMarkerPath(identity)
+	claimToken, ok := localizationauth.NewToken()
+	if !ok {
+		return localizationTerminalMarker{}, false
+	}
+	claimPath := path + ".claim-" + claimToken
+	if err := os.Rename(path, claimPath); err != nil {
+		return localizationTerminalMarker{}, false
+	}
+	claimed := false
+	defer func() {
+		if !claimed {
+			_ = os.Rename(claimPath, path)
+		}
+		_ = os.Remove(claimPath)
+	}()
+
+	marker, ok := readLocalizationTerminalMarker(claimPath, identity)
+	if !ok || marker.Advisory || marker.ClaimCheckConsumed || len(marker.PrimaryIDs) == 0 || len(marker.EvidenceIDs) == 0 {
+		return localizationTerminalMarker{}, false
+	}
+	for _, claim := range claims {
+		for _, evidenceID := range marker.EvidenceIDs {
+			if localizationClaimMatchesEvidence(claim, evidenceID) {
+				return localizationTerminalMarker{}, false
+			}
+		}
+	}
+	marker.ClaimCheckConsumed = true
+	if !writeLocalizationState(path, marker) {
+		return localizationTerminalMarker{}, false
+	}
+	claimed = true
+	return marker, true
 }
 
 func readLocalizationTerminalMarker(path string, identity localizationTerminalIdentity) (localizationTerminalMarker, bool) {
