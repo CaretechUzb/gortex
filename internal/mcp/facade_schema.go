@@ -28,7 +28,7 @@ func facadePublicCapabilitySchema(
 ) map[string]any {
 	definition := facadeToolDefinition(spec.Facade)
 	staticProperties := definition.InputSchema.Properties
-	requestArguments, _ := requestShape["arguments"].(map[string]any)
+	requestArguments := requestShape
 
 	properties := make(map[string]any)
 	requiredTop := make(map[string]struct{})
