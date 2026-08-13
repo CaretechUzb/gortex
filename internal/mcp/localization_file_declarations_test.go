@@ -75,3 +75,18 @@ func TestLocalizationFileDeclarationCacheKeepsOnlyDefinitionsInReaderOrder(t *te
 
 	require.Equal(t, []*graph.Node{first, second}, newLocalizationFileDeclarationCache(reader).definitions("src/a.go"))
 }
+
+func TestLocalizationFileDeclarationCacheBoundsRetainedDefinitions(t *testing.T) {
+	first := &graph.Node{ID: "src/a.go::first", Name: "first", Kind: graph.KindFunction, FilePath: "src/a.go"}
+	second := &graph.Node{ID: "src/a.go::second", Name: "second", Kind: graph.KindFunction, FilePath: "src/a.go"}
+	third := &graph.Node{ID: "src/a.go::third", Name: "third", Kind: graph.KindFunction, FilePath: "src/a.go"}
+	reader := &localizationDeclarationSpyReader{
+		files:     map[string][]*graph.Node{"src/a.go": {first, second, third}},
+		fileCalls: make(map[string]int),
+	}
+	cache := newBoundedLocalizationFileDeclarationCache(reader, 2)
+
+	require.Equal(t, []*graph.Node{first, second}, cache.definitions("src/a.go"))
+	require.Equal(t, []*graph.Node{first, second}, cache.definitions("src/a.go"))
+	require.Equal(t, 1, reader.fileCalls["src/a.go"])
+}
