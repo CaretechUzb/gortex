@@ -66,6 +66,9 @@ func runCodex(data []byte, port int, selected ...CodexMode) {
 	var peek struct {
 		HookEventName string `json:"hook_event_name"`
 		ToolName      string `json:"tool_name"`
+		SessionID     string `json:"session_id"`
+		PromptID      string `json:"prompt_id"`
+		AgentID       string `json:"agent_id"`
 		CWD           string `json:"cwd"`
 		// Codex sends the active model slug on every hook event. Claude Code
 		// does not, which is why its hint has to be recovered from the
@@ -84,14 +87,19 @@ func runCodex(data []byte, port int, selected ...CodexMode) {
 	defer setHookCWD("")
 
 	// Codex has specialized Bash and Gortex-read handlers, so enforce the
-	// shared all-tool terminal contract before dispatch. With no terminal
-	// marker this is a local no-op and the historical per-tool behavior below
-	// remains unchanged.
-	if peek.HookEventName == "PreToolUse" {
-		var input HookInput
-		if json.Unmarshal(data, &input) == nil && enforceLocalizationTerminalPreToolUse(input, time.Now()) {
-			return
-		}
+	// shared terminal contract before dispatch. Decode only the identity and
+	// tool name here: Codex permits tool_input to be any JSON value, and a
+	// scalar or array must not bypass an enforceable terminal marker merely
+	// because later tool-specific handlers expect an arguments object.
+	if peek.HookEventName == "PreToolUse" && enforceLocalizationTerminalPreToolUse(HookInput{
+		HookEventName: peek.HookEventName,
+		ToolName:      peek.ToolName,
+		SessionID:     peek.SessionID,
+		PromptID:      peek.PromptID,
+		AgentID:       peek.AgentID,
+		CWD:           peek.CWD,
+	}, time.Now()) {
+		return
 	}
 
 	switch {

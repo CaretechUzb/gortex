@@ -60,8 +60,10 @@ const (
 	v060CodexSessionStartCommand        = "printf '%s\\n' '" + v060CodexSessionStartMessage + "'"
 	v060CodexSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + v060CodexSessionStartMessage + "'\""
 	// Codex matchers are regular expressions. A match-all PreToolUse hook is
-	// required because terminal localization is an all-tool contract; the
-	// handler stays a strict local no-op for unrelated tools without a marker.
+	// required because terminal localization covers every local tool routed
+	// through Codex's hook path; hosted and specialized opt-out tools remain
+	// outside the host's hook boundary. Without a marker the handler is a
+	// strict local no-op.
 	codexPreToolUseMatcher = ".*"
 	// Retained as migration fingerprints in tests: upsertCodexHookSet removes
 	// both split predecessors by managed command identity before installing the
@@ -517,8 +519,56 @@ func upsertSessionStartHook(root map[string]any, env agents.Env, opts agents.App
 }
 
 func upsertPreToolUseHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
+	// Codex permits several handlers in one matcher group. Users sometimes add
+	// their own handler beside an installed Gortex handler, so split mixed
+	// groups before replacing legacy Gortex matchers; group-level replacement
+	// would otherwise delete the co-located user handler.
+	splitChanged := splitMixedCodexPreToolUseGroups(root)
 	desired := []map[string]any{codexPreToolUseHookEntry(env)}
-	return upsertCodexHookSet(root, "PreToolUse", codexHookEntryIsGortexPreToolUse, desired, opts)
+	upsertChanged := upsertCodexHookSet(root, "PreToolUse", codexHookEntryIsGortexPreToolUse, desired, opts)
+	return splitChanged || upsertChanged
+}
+
+func splitMixedCodexPreToolUseGroups(root map[string]any) bool {
+	hooks, ok := root["hooks"].(map[string]any)
+	if !ok {
+		return false
+	}
+	entries, ok := codexHookList(hooks["PreToolUse"])
+	if !ok {
+		return false
+	}
+
+	changed := false
+	for _, entry := range entries {
+		group, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		handlers, ok := codexHookList(group["hooks"])
+		if !ok {
+			continue
+		}
+		managed := 0
+		kept := make([]any, 0, len(handlers))
+		for _, handler := range handlers {
+			fields, ok := handler.(map[string]any)
+			if ok {
+				command, _ := fields["command"].(string)
+				if codexCommandInvokesCodexHook(command) {
+					managed++
+					continue
+				}
+			}
+			kept = append(kept, handler)
+		}
+		if managed == 0 || len(kept) == 0 {
+			continue
+		}
+		group["hooks"] = kept
+		changed = true
+	}
+	return changed
 }
 
 func upsertPostToolUseHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
