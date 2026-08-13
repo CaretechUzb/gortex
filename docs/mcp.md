@@ -2,6 +2,7 @@
 
 Gortex exposes a knowledge-graph query surface over the [Model Context Protocol](https://modelcontextprotocol.io): **100+ tools, 18 resources, 3 prompts**. Agents call the same surface from stdio, the daemon Unix socket, or the MCP 2026 Streamable HTTP endpoint.
 
+- [Daemon availability and embedded fallback](#daemon-availability-and-embedded-fallback)
 - [Compact MCP surface](#compact-mcp-surface)
 - [Tool discovery (lazy mode)](#tool-discovery-lazy-mode)
 - [Restricting the tool surface (presets)](#restricting-the-tool-surface-presets)
@@ -25,6 +26,21 @@ Gortex exposes a knowledge-graph query surface over the [Model Context Protocol]
 - [Speculative execution](#speculative-execution)
 - [MCP resources (18)](#mcp-resources-18)
 - [MCP prompts (3)](#mcp-prompts-3)
+
+## Daemon availability and embedded fallback
+
+`gortex mcp` connects to and may auto-start the shared daemon. If no compatible daemon can be reached, it exits by default instead of starting a private in-process server. This prevents multiple MCP clients from silently indexing the same repository in parallel.
+
+To retain the legacy standalone behavior, opt in from the user-level config (`~/.gortex/config.yaml`, or `$XDG_CONFIG_HOME/gortex/config.yaml`):
+
+```yaml
+mcp:
+  allow_embedded: true
+```
+
+Repository-local `.gortex.yaml` files cannot enable this machine-level permission.
+
+With the opt-in, daemon-unavailable launches—including `gortex mcp --index ...`—use a private temporary SQLite store that is removed on exit and rebuild the tree on every launch.
 
 ## Compact MCP surface
 
@@ -251,7 +267,7 @@ unbounded for a different reason — abandoning a half-done store flush is worse
 than a slow stop — so the *command* carries the bound instead.
 
 `GORTEX_MCP_TOOL_TIMEOUT` is read in the server's own process, so set it in the
-**daemon's** environment (or the `gortex mcp` process for the embedded server),
+**daemon's** environment (or, when embedded fallback is enabled, the `gortex mcp` process),
 not in the MCP client's config. It can always tighten the bound. It can only
 *raise* it past 60 s on the embedded stdio server and Streamable HTTP — on the
 daemon socket the per-request lifetime is a hard 60 s that clamps it. Raise it

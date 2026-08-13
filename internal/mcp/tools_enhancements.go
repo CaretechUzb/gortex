@@ -3683,10 +3683,12 @@ func (s *Server) handleGetSymbolHistory(ctx context.Context, req mcp.CallToolReq
 // ---------------------------------------------------------------------------
 
 // batchEditItem is one operation in a batch_edit call. It is a discriminated
-// union over `op`: edit_symbol and edit_file replace content; move_file and
-// delete_file operate on whole files. Lifecycle operations may pin the source
-// bytes with expected_sha256 so the precondition is checked under the same
-// transaction lock as the mutation.
+// union over `op`: an edit_symbol op carries {id, old_source, new_source}; an
+// edit_file op carries {path, old_string, new_string, replace_all?}. When `op`
+// is omitted it is inferred only from one complete, unambiguous field set, so
+// both legacy item shapes remain supported without silently misclassifying
+// malformed payloads. move_file and delete_file require an explicit op and may
+// pin source bytes with expected_sha256 under the transaction lock.
 type batchEditItem struct {
 	Op string `json:"op,omitempty"`
 	// edit_symbol
@@ -3705,12 +3707,11 @@ type batchEditItem struct {
 	ExpectedSHA256 string `json:"expected_sha256,omitempty"`
 }
 
-// kind resolves the operation kind for an item: an explicit, recognised `op`
-// wins; otherwise edit_file is inferred when a path is present, else
-// edit_symbol.
+// kind returns a normalized operation kind. Runtime payloads are normalized by
+// parseBatchEdits; preserving an explicit unknown value here ensures internal
+// callers also fail closed instead of silently becoming edit_symbol.
 func (it batchEditItem) kind() string {
-	switch it.Op {
-	case "edit_file", "edit_symbol", "move_file", "delete_file":
+	if it.Op != "" {
 		return it.Op
 	}
 	if it.Path != "" {
@@ -3762,13 +3763,13 @@ func batchEditItemsSchema() map[string]any {
 				"type":        "object",
 				"description": "Replace a string in any file (imports, config, comments — non-symbol edits).",
 				"properties": map[string]any{
-					"op":          map[string]any{"const": "edit_file", "description": "Operation kind. Required to select a file edit."},
+					"op":          map[string]any{"const": "edit_file", "description": "Operation kind (optional; inferred as edit_file when omitted and the complete file field set is present)."},
 					"path":        map[string]any{"type": "string", "description": "File path (repo-relative or absolute)."},
 					"old_string":  map[string]any{"type": "string", "description": "Exact text to replace; must be unique unless replace_all is set. CRLF/LF line-ending differences against the file are tolerated."},
 					"new_string":  map[string]any{"type": "string", "description": "Replacement text."},
 					"replace_all": map[string]any{"type": "boolean", "description": "Replace every occurrence instead of requiring uniqueness."},
 				},
-				"required": []any{"op", "path", "old_string", "new_string"},
+				"required": []any{"path", "old_string", "new_string"},
 			},
 			map[string]any{
 				"type":        "object",
@@ -3795,9 +3796,105 @@ func batchEditItemsSchema() map[string]any {
 	}
 }
 
+var batchEditAcceptedShapes = [...]string{
+	`{"op":"edit_file","path":"<file>","old_string":"<text>","new_string":"<text>"}`,
+	`{"op":"edit_symbol","id":"<symbol_id>","old_source":"<source>","new_source":"<source>"}`,
+	`{"op":"move_file","source":"<file>","destination":"<file>"}`,
+	`{"op":"delete_file","path":"<file>"}`,
+}
+
+type batchEditArgumentError struct {
+	index  int
+	reason string
+}
+
+func (e *batchEditArgumentError) Error() string {
+	return fmt.Sprintf("edits[%d]: %s; accepted shapes: %s", e.index, e.reason, strings.Join(batchEditAcceptedShapes[:], " or "))
+}
+
+func batchEditHasAny(fields map[string]json.RawMessage, names ...string) bool {
+	for _, name := range names {
+		if _, ok := fields[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func missingBatchEditFields(fields map[string]json.RawMessage, names ...string) []string {
+	missing := make([]string, 0, len(names))
+	for _, name := range names {
+		if _, ok := fields[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
+func classifyBatchEditItem(fields map[string]json.RawMessage, op string) (string, error) {
+	hasPath := batchEditHasAny(fields, "path")
+	hasFileFields := batchEditHasAny(fields, "old_string", "new_string", "replace_all")
+	hasSymbolFields := batchEditHasAny(fields, "id", "old_source", "new_source")
+	hasMoveFields := batchEditHasAny(fields, "source", "destination")
+	hasDigest := batchEditHasAny(fields, "expected_sha256")
+
+	if _, explicit := fields["op"]; explicit {
+		switch op {
+		case "edit_file", "edit_symbol", "move_file", "delete_file":
+		default:
+			return "", fmt.Errorf("unknown op %q (accepted values: edit_file, edit_symbol, move_file, delete_file)", op)
+		}
+	}
+
+	kind := op
+	if kind == "" {
+		switch {
+		case hasMoveFields || hasDigest:
+			return "", fmt.Errorf("move_file and delete_file require an explicit op")
+		case (hasPath || hasFileFields) && hasSymbolFields:
+			return "", fmt.Errorf("item mixes edit_file and edit_symbol fields")
+		case hasPath || hasFileFields:
+			kind = "edit_file"
+		case hasSymbolFields:
+			kind = "edit_symbol"
+		default:
+			return "", fmt.Errorf("item does not match a supported batch edit shape")
+		}
+	}
+
+	var missing []string
+	switch kind {
+	case "edit_file":
+		if hasSymbolFields || hasMoveFields || hasDigest {
+			return "", fmt.Errorf("item mixes fields from multiple batch edit operations")
+		}
+		missing = missingBatchEditFields(fields, "path", "old_string", "new_string")
+	case "edit_symbol":
+		if hasPath || hasFileFields || hasMoveFields || hasDigest {
+			return "", fmt.Errorf("item mixes edit_file and edit_symbol fields")
+		}
+		missing = missingBatchEditFields(fields, "id", "old_source", "new_source")
+	case "move_file":
+		if hasPath || hasFileFields || hasSymbolFields {
+			return "", fmt.Errorf("item mixes fields from multiple batch edit operations")
+		}
+		missing = missingBatchEditFields(fields, "source", "destination")
+	case "delete_file":
+		if hasFileFields || hasSymbolFields || hasMoveFields {
+			return "", fmt.Errorf("item mixes fields from multiple batch edit operations")
+		}
+		missing = missingBatchEditFields(fields, "path")
+	}
+	if len(missing) > 0 {
+		return "", fmt.Errorf("incomplete %s shape (missing: %s)", kind, strings.Join(missing, ", "))
+	}
+	return kind, nil
+}
+
 // parseBatchEdits accepts the `edits` argument as either a structured JSON
 // array (the typed-schema path) or a JSON-encoded string of the same array
-// (the legacy path), and decodes it into batch edit items.
+// (the legacy path). It validates every item's discriminator and complete field
+// set before returning anything to the transaction layer.
 func parseBatchEdits(raw any) ([]batchEditItem, error) {
 	var data []byte
 	switch v := raw.(type) {
@@ -3812,11 +3909,44 @@ func parseBatchEdits(raw any) ([]batchEditItem, error) {
 		}
 		data = b
 	}
-	var edits []batchEditItem
-	if err := json.Unmarshal(data, &edits); err != nil {
+
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(data, &rawItems); err != nil {
 		return nil, fmt.Errorf("invalid edits JSON: %v", err)
 	}
+	edits := make([]batchEditItem, 0, len(rawItems))
+	for i, rawItem := range rawItems {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(rawItem, &fields); err != nil {
+			return nil, &batchEditArgumentError{index: i, reason: "item must be an object: " + err.Error()}
+		}
+		var edit batchEditItem
+		if err := json.Unmarshal(rawItem, &edit); err != nil {
+			return nil, &batchEditArgumentError{index: i, reason: "invalid item fields: " + err.Error()}
+		}
+		kind, err := classifyBatchEditItem(fields, edit.Op)
+		if err != nil {
+			return nil, &batchEditArgumentError{index: i, reason: err.Error()}
+		}
+		edit.Op = kind
+		edits = append(edits, edit)
+	}
 	return edits, nil
+}
+
+func batchEditInvalidArgumentResult(err error) *mcp.CallToolResult {
+	data := map[string]any{
+		"accepted_values": []string{"edit_file", "edit_symbol", "move_file", "delete_file"},
+		"accepted_shapes": batchEditAcceptedShapes[:],
+	}
+	if itemErr, ok := err.(*batchEditArgumentError); ok {
+		data["item_index"] = itemErr.index
+	}
+	return NewStructuredErrorResult(StructuredError{
+		ErrorCode: ErrCodeInvalidArgument,
+		Message:   err.Error(),
+		Data:      data,
+	})
 }
 
 func (s *Server) handleBatchEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

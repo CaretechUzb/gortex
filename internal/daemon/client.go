@@ -81,7 +81,7 @@ func DialTo(socketPath string, h Handshake) (*Client, error) {
 	if !ack.OK {
 		_ = conn.Close()
 		// A protocol-version rejection is recoverable: wrap the sentinel so the
-		// proxy can fall back to the embedded server instead of failing.
+		// proxy's startup policy can decide whether embedded mode is allowed.
 		if ack.ErrorCode == ErrProtocolMismatch {
 			return nil, fmt.Errorf("%w: %s", ErrProtocolVersionMismatch, ack.ErrorMsg)
 		}
@@ -204,9 +204,8 @@ var ErrDaemonUnavailable = errors.New("daemon unavailable")
 // ErrProtocolVersionMismatch is returned by Dial when the daemon answers the
 // handshake with a protocol_mismatch rejection — the running daemon speaks a
 // different wire version than this binary (a stale daemon after an upgrade).
-// Like ErrDaemonUnavailable it is recoverable: the caller should fall back to
-// the embedded in-process server rather than fail, so an in-flight editor
-// session keeps working across a version skew.
+// Like ErrDaemonUnavailable it is recoverable for startup selection: the
+// caller may use an explicitly allowed embedded server or report the mismatch.
 var ErrProtocolVersionMismatch = errors.New("daemon protocol version mismatch")
 
 // ErrDaemonUnresponsive is returned when the daemon accepted the connection
@@ -226,11 +225,11 @@ func isTimeoutErr(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
-// ShouldFallBackToEmbedded reports whether a Dial error is one the MCP proxy
-// can recover from by running the embedded in-process server instead: the
-// daemon isn't running, or it is running a mismatched protocol version. Any
-// other error (permissions, a genuinely broken socket) is a real failure the
-// caller must surface.
+// ShouldFallBackToEmbedded reports whether a Dial error permits the MCP
+// startup policy to consider an embedded in-process server: the daemon isn't
+// running, or it is running a mismatched protocol version. Any other error
+// (permissions, a genuinely broken socket) is a real failure the caller must
+// surface.
 func ShouldFallBackToEmbedded(err error) bool {
 	return errors.Is(err, ErrDaemonUnavailable) || errors.Is(err, ErrProtocolVersionMismatch)
 }
@@ -263,20 +262,41 @@ func isNoDaemonErr(err error) bool {
 	return false
 }
 
+// ProbeAvailability checks the default daemon socket while preserving whether
+// a failed dial means "not running" or a real system error. Startup selection
+// must not hide permissions or a broken socket behind embedded fallback.
+func ProbeAvailability() error {
+	return probeAvailabilityAt(SocketPath())
+}
+
+func probeAvailabilityAt(socketPath string) error {
+	d := &net.Dialer{Timeout: 200 * time.Millisecond}
+	conn, err := d.Dial("unix", socketPath)
+	if err != nil {
+		return classifyDaemonProbeError(err)
+	}
+	_ = conn.Close()
+	return nil
+}
+
+func classifyDaemonProbeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isNoDaemonErr(err) {
+		return fmt.Errorf("%w: %v", ErrDaemonUnavailable, err)
+	}
+	return err
+}
+
 // IsRunning returns true when a daemon is reachable on the default socket.
 // A thin convenience for CLI paths that want to branch on availability
 // without constructing a full handshake.
 func IsRunning() bool {
-	return IsRunningAt(SocketPath())
+	return ProbeAvailability() == nil
 }
 
 // IsRunningAt is IsRunning with an explicit socket path.
 func IsRunningAt(socketPath string) bool {
-	d := &net.Dialer{Timeout: 200 * time.Millisecond}
-	conn, err := d.Dial("unix", socketPath)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
+	return probeAvailabilityAt(socketPath) == nil
 }

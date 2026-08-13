@@ -150,10 +150,11 @@ opam install ocaml-lsp-server
 brew install zls
 ```
 
-Verify with `gortex daemon status` — the LSP-router section lists
-`alive`, `last_used`, and the resolved command for each running
-server. Newly enabled specs show up only after the first request that
-needs them.
+Verify with `gortex daemon status` — the `lsp` row reports `alive`
+against the live-provider cap plus the eviction count, followed by one
+line per running server carrying its workspace, `last_used` age, and
+`in_use` pin count. Newly enabled specs show up only after the first
+request that needs them.
 
 ## Lifecycle
 

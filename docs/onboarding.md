@@ -39,7 +39,7 @@ cd ~/projects/myapp
 gortex init
 ```
 
-With `--start`, the daemon is already running and Claude Code will find Gortex on its next run. If you skipped `--start`, you can either spawn the daemon (`gortex daemon start --detach`) or run a per-repo server (`gortex mcp --index . --watch`).
+With `--start`, the daemon is already running and Claude Code will find Gortex on its next run. If you skipped it, `gortex mcp` will try to auto-start the daemon; the legacy per-repo server requires the embedded-fallback opt-in described below.
 
 Open your AI assistant in that repo and ask it to do something real. It'll use Gortex tools automatically. If that worked, the rest of this document is optional detail.
 
@@ -83,27 +83,22 @@ gortex init --skills-min-size 5 --skills-max 10   # raise the floor / lower the 
 
 ### 3. Start the MCP server
 
-Two ways — pick whichever fits your workflow.
+The default setup lets your IDE spawn `gortex mcp`, which connects to or auto-starts the shared daemon. You normally do not run another server process yourself.
 
-**Option A — you start it and leave it running.** Useful when multiple AI tools point at the same graph, or when you want the web UI:
+To deliberately use the legacy one-shot server, first opt in from the user-level config (`~/.gortex/config.yaml`, or its XDG equivalent):
+
+```yaml
+mcp:
+  allow_embedded: true
+```
+
+Then start it for one repository:
 
 ```bash
 gortex mcp --index . --watch
 ```
 
-`--watch` re-indexes changed files live via fsnotify. This one-shot server builds its graph in a private store that is deleted when the process exits, so it re-indexes the tree on every launch; run the daemon instead if you want an index that survives restarts (~200ms starts instead of 3-5s).
-
-To also get the HTTP server API (the UI is a separate Next.js app in `web/` that talks to it over HTTP), add `--server` to the same process:
-
-```bash
-gortex mcp --index . --watch --server
-```
-
-`--server` listens on `http://localhost:8765` and exposes `/v1/*` (including `/v1/graph` and `/v1/events` for force-directed rendering). The long-living daemon serves the same surface — run `gortex daemon start --http-addr 127.0.0.1:7411` to expose `/v1/*` and `/mcp` for every tracked repo at once.
-
-**Option B — your IDE starts it automatically.** The `.mcp.json` that `gortex init` created tells the IDE how to spawn `gortex mcp`. You don't run anything yourself. Claude Code, Cursor, and VS Code all work this way. Downside: each tool gets its own server process (memory cost scales with number of tools).
-
-If you're unsure, start with Option A. You can always remove the `.mcp.json` → switch to Option B later.
+The one-shot graph lives in a private store that is deleted on exit, so it is rebuilt on every launch. Add `--server` to expose `/v1/*` on `http://localhost:8765`; for a persistent shared HTTP surface, use `gortex daemon start --http-addr 127.0.0.1:7411` instead.
 
 ### 4. Verify the integration
 
@@ -245,8 +240,8 @@ If you run an XDG layout (any absolute `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XD
 
 ### How it works
 
-- `gortex mcp` (what Claude Code spawns via `.mcp.json`) auto-detects the daemon. If reachable, it acts as a thin stdio ↔ socket proxy (~5 MB per client). If not, it falls back to the embedded server — global mode is never "required." The fallback announces itself in the `initialize` instructions (`DEGRADED: no gortex daemon is reachable…`), because MCP hosts routinely discard stderr and an embedded single-tree answer is otherwise indistinguishable from a daemon-backed one.
-- The embedded fallback infers its index root from the launch directory, but refuses two shapes: a root unsafe to crawl (`/`, a drive root, `$HOME`), and a directory that merely *contains* tracked repositories — indexing the parent would build a second, unscoped copy of every child. An inferred root also never receives the repo-local notebook, so a daemon blip cannot leave an untracked `.gortex/` directory in whatever tree the client launched from. An explicit `--index` is always honoured verbatim and keeps the repo-local notebook.
+- `gortex mcp` (what Claude Code spawns via `.mcp.json`) connects to and may auto-start the daemon, then acts as a thin stdio ↔ socket proxy (~5 MB per client). If no compatible daemon can be reached, it exits by default with instructions to start one or enable `mcp.allow_embedded` in the user-level config.
+- With that opt-in, the embedded fallback infers its index root from the launch directory but refuses `/`, a drive root, `$HOME`, or a directory that merely contains tracked repositories. An inferred root never receives the repo-local notebook; an explicit `--index` is honoured verbatim and keeps it. The fallback identifies itself as `DEGRADED` in the MCP `initialize` instructions.
 - Every tracked repo gets its own fsnotify watcher so edits on disk flow into the graph live; no manual reload needed. `gortex track` attaches a watcher as part of the track operation; `gortex untrack` detaches it before evicting nodes.
 - Graph state lives in the on-disk store (`~/.gortex/store/store.sqlite`) as it is indexed. Daemon restarts open the store and re-index only the files whose mtime changed while it was down.
 - Opening Claude Code in a directory that neither lies inside nor contains a tracked repository returns a structured `repo_not_tracked` error on every tool call. The agent surfaces it; you run `gortex track .` to include it.
@@ -257,7 +252,7 @@ If you run an XDG layout (any absolute `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XD
 
 | Invocation | Daemon running | Daemon not running |
 |---|---|---|
-| Claude Code spawns `gortex mcp` | Proxies through daemon | Embedded server (current behavior) |
+| Claude Code spawns `gortex mcp` | Proxies through daemon | Exits with guidance by default; embedded server only with `mcp.allow_embedded: true` |
 | `gortex track /path` | Immediate re-index + watcher attached via daemon | Writes config; takes effect on next daemon/server start |
 | `gortex untrack /path` | Immediate graph eviction + watcher detached | Removes from config |
 | `gortex status` | Aggregate across tracked repos | One-shot local index |

@@ -885,6 +885,14 @@ type RouterStat struct {
 	Spec      string    `json:"spec"`
 	Workspace string    `json:"workspace"`
 	LastUsed  time.Time `json:"last_used"`
+	// InUse is the provider's pin count — how many callers currently
+	// hold it for a long operation via ProviderForSpecWorkspace. A
+	// pinned provider is skipped by both the reaper and the LRU
+	// evictor, so a count that never returns to zero is the signature
+	// of a pass that ended without its ReleaseSpecWorkspace, and it
+	// pins a subprocess alive for the life of the daemon. Surfacing it
+	// is what makes that leak observable from `gortex daemon status`.
+	InUse int `json:"in_use"`
 }
 
 // Stats returns one entry per live (spec, workspace) provider.
@@ -897,6 +905,7 @@ func (r *Router) Stats() []RouterStat {
 			Spec:      key.specName,
 			Workspace: key.workspace,
 			LastUsed:  rp.lastUsed,
+			InUse:     rp.inUse,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

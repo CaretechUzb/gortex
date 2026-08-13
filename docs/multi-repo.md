@@ -28,7 +28,7 @@ A directory that neither lies inside nor contains a tracked repo still fails clo
 
 Two-tier config hierarchy:
 
-- **Global config** (`~/.gortex/config.yaml`) — projects, repo lists, active project, reference tags
+- **Global config** (`~/.gortex/config.yaml`) — projects, repo lists, active project, reference tags, and machine-level MCP policy
 - **Workspace config** (`.gortex.yaml` per repo) — guards, excludes, local overrides
 
 Excludes are layered — builtin → the repo's `.gitignore` chain → global → per-repo entry → workspace — with gitignore semantics. `.gitignore` is respected by default so you don't have to re-declare entries already curated for git; opt out per-workspace with `respect_gitignore: false` in `.gortex.yaml`. Use `!pattern` in a later layer to re-include something an earlier layer excluded. Beyond `.gitignore`, the index walk also honors per-directory `.gortexignore` files (Gortex's own ignore file, a sibling to `.gitignore`) and ripgrep's `.ignore` / `.rgignore` — each scoped to the directory that contains it.
@@ -38,6 +38,9 @@ When a tracked root sits below its git root — the monorepo case, `gortex track
 ```yaml
 # ~/.gortex/config.yaml
 active_project: my-saas
+
+mcp:
+  allow_embedded: false               # Require the shared daemon (default)
 
 exclude:                            # Applies to every tracked repo
   - "**/*.generated.*"
@@ -62,6 +65,8 @@ projects:
         name: shared-lib
         ref: opensource
 ```
+
+The embedded MCP fallback is a machine-level, default-off policy. Enable `mcp.allow_embedded` only in the user-level config; see [Daemon availability and embedded fallback](mcp.md#daemon-availability-and-embedded-fallback).
 
 `synthesize_external_calls: true` (opt-in, default off — set in `.gortex.yaml` or the global config) makes the resolver synthesize placeholder nodes for calls into un-indexed external packages or sibling services, so call-chains keep the external hop instead of terminating at the indexed boundary.
 

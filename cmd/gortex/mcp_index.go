@@ -153,15 +153,3 @@ func joinShort(paths []string) string {
 	}
 	return out
 }
-
-// loadGlobalConfigForEmbedded reads the user-level config so the embedded
-// path can see the tracked-repo list. Errors are not fatal: a missing or
-// unreadable config just means "no tracked repos known", which degrades
-// resolveEmbeddedIndex to its cwd-is-the-index default.
-func loadGlobalConfigForEmbedded() *config.GlobalConfig {
-	global, err := config.LoadGlobal()
-	if err != nil {
-		return nil
-	}
-	return global
-}

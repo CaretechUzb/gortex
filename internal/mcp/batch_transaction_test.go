@@ -484,6 +484,7 @@ func prepareAtomicRecoveryFixture(t *testing.T, s *Server, id string, paths []st
 		buffers[path] = &batchFileBuffer{
 			absPath: path, relPath: filepath.Base(path), mode: 0o644,
 			original: []byte(before[i]), content: []byte(after[i]),
+			existsBefore: true, existsAfter: true, existenceSet: true,
 		}
 		results[i] = batchEditResult{Op: "edit_file", FilePath: filepath.Base(path), Status: "validated"}
 	}

@@ -43,6 +43,10 @@ projects: {}
 # use "!pattern" in a later layer to re-include.
 exclude: []
 
+# MCP client startup policy. Keep false to require the shared daemon.
+mcp:
+  allow_embedded: false
+
 # Semantic search tuning.
 semantic:
   # Node (language, kind) pairs skipped during vector-index construction.

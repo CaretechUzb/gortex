@@ -88,7 +88,7 @@ func (g *Generator) GenerateAll() []GeneratedSkill {
 	return skills
 }
 
-// GenerateRouting produces the CLAUDE.md routing table between markers.
+// GenerateRouting produces the shared agent routing table between markers.
 func (g *Generator) GenerateRouting(skills []GeneratedSkill) string {
 	var sb strings.Builder
 	sb.WriteString("<!-- gortex:skills:start -->\n")

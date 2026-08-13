@@ -670,6 +670,15 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				}
 			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
 				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenvByOwner[callerID], result))
+				if edge.Meta == nil && !strings.Contains(c.receiver, "(") {
+					// A namespace-qualified receiver the chain walker could
+					// not type (`Lib.BagExt.Add(bag)`). That is the same
+					// static-form evidence as the bare spelling below —
+					// without it the binder reads the call as extension
+					// form, discounts a `this` slot the argument list never
+					// filled, and lands on the wrong overload.
+					edge.Meta = map[string]any{"receiver_name": c.receiver}
+				}
 			} else if c.receiver != "" {
 				// A bare receiver nothing above could type. Its spelling
 				// is still evidence: reaching here means no local, param

@@ -377,6 +377,15 @@ type LSPRouterStatus struct {
 	// owning an alive LSP subprocess. May be empty even when several
 	// specs are enabled — the router lazy-spawns on first request.
 	ActiveProviders []LSPActiveProvider `json:"active_providers,omitempty"`
+	// MaxAlive is the router's concurrent-provider cap; zero means
+	// unbounded. Read alongside len(ActiveProviders) it says how close
+	// the daemon is to LRU-evicting warm language servers.
+	MaxAlive int `json:"max_alive,omitempty"`
+	// Evictions counts LRU evictions since daemon start. A number that
+	// climbs while the workspace set is stable means the cap is too
+	// low for the repos actually being touched — every eviction is a
+	// language server that will be re-spawned cold on next demand.
+	Evictions uint64 `json:"evictions,omitempty"`
 }
 
 // LSPSpecStatus is one row in LSPRouterStatus.EnabledSpecs.
@@ -391,6 +400,11 @@ type LSPActiveProvider struct {
 	Spec      string `json:"spec"`
 	Workspace string `json:"workspace"`
 	LastUsed  string `json:"last_used"` // RFC3339
+	// InUse is the router's pin count for this provider — callers
+	// currently holding it for a long operation. Nonzero means neither
+	// the reaper nor the LRU evictor can reclaim it; a count stuck
+	// above zero on an otherwise-idle daemon is a leaked pin.
+	InUse int `json:"in_use,omitempty"`
 }
 
 // EnrichmentProgress summarizes the semantic-enrichment manager's

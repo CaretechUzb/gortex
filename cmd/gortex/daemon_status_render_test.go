@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -171,6 +172,74 @@ func TestRenderDaemonHeader_EnrichmentProgress_NoCurrentPass(t *testing.T) {
 	var buf bytes.Buffer
 	renderDaemonHeader(&buf, st)
 	assert.Contains(t, buf.String(), "enriching 5/5 repos")
+}
+
+// TestRenderDaemonHeader_LSPRouterSection — alive language servers are
+// subprocesses the daemon holds open, and until they were rendered
+// here the only way to see one leak was `ps`. The row reports the cap
+// it is running against, the eviction count, and per provider the idle
+// age plus the pin count that keeps a provider out of the reaper's
+// reach.
+func TestRenderDaemonHeader_LSPRouterSection(t *testing.T) {
+	st := sampleStatus()
+	st.LSPRouter = &daemon.LSPRouterStatus{
+		MaxAlive:  6,
+		Evictions: 3,
+		ActiveProviders: []daemon.LSPActiveProvider{
+			{
+				Spec:      "gopls",
+				Workspace: "/tmp/code/project1",
+				LastUsed:  time.Now().Add(-3*time.Minute - 12*time.Second).Format(time.RFC3339),
+			},
+			{
+				Spec:      "typescript-language-server",
+				Workspace: "/tmp/code/project2",
+				LastUsed:  time.Now().Add(-30 * time.Second).Format(time.RFC3339),
+				InUse:     1,
+			},
+		},
+	}
+	var buf bytes.Buffer
+	renderDaemonHeader(&buf, st)
+	out := buf.String()
+	assert.Contains(t, out, "lsp")
+	assert.Contains(t, out, "alive=2/6")
+	assert.Contains(t, out, "evictions=3")
+	assert.Contains(t, out, "gopls@/tmp/code/project1")
+	assert.Contains(t, out, "3m12s ago")
+	assert.Contains(t, out, "in_use=1")
+}
+
+// TestRenderDaemonHeader_LSPRouterOmittedWhenIdle — the section must
+// vanish when no router is wired or nothing is alive, so daemons that
+// never spawn a language server keep the terser header they had.
+func TestRenderDaemonHeader_LSPRouterOmittedWhenIdle(t *testing.T) {
+	for name, router := range map[string]*daemon.LSPRouterStatus{
+		"no router wired": nil,
+		"router with no alive provider": {
+			MaxAlive:     6,
+			EnabledSpecs: []daemon.LSPSpecStatus{{Name: "gopls", Available: true}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := sampleStatus()
+			st.LSPRouter = router
+			var buf bytes.Buffer
+			renderDaemonHeader(&buf, st)
+			assert.NotContains(t, buf.String(), "alive=")
+		})
+	}
+}
+
+// TestFormatLSPLastUsed_UnparseablePassesThrough — a timestamp an
+// older daemon build renders differently must stay visible rather than
+// silently reading as "now".
+func TestFormatLSPLastUsed_UnparseablePassesThrough(t *testing.T) {
+	now := time.Now()
+	assert.Equal(t, "not-a-timestamp", formatLSPLastUsed("not-a-timestamp", now))
+	// Clock skew must not print a negative age.
+	future := now.Add(5 * time.Second).Format(time.RFC3339)
+	assert.Equal(t, "0s ago", formatLSPLastUsed(future, now))
 }
 
 func TestRenderDaemonHeader_ReadyAndEnriched_NoWarmupLabelChange(t *testing.T) {

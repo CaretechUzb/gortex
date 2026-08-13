@@ -67,8 +67,9 @@ var daemonCmd = &cobra.Command{
 MCP client (Claude Code, Cursor, Kiro, ...) plus the CLI from one shared
 index.
 
-If no daemon is running, ` + "`gortex mcp`" + ` still works standalone — the daemon
-is additive, not required.`,
+` + "`gortex mcp`" + ` connects to and may auto-start this daemon. If no compatible
+daemon is available, it exits unless ` + "`mcp.allow_embedded`" + ` is enabled
+in the user-level config.`,
 }
 
 // RunE is wired in init() rather than here: runDaemonStart reaches back for
@@ -1316,6 +1317,18 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			t.AppendRow(table.Row{"trigram", row})
 		}
 	}
+	// Alive language servers are subprocesses the daemon is holding
+	// open — the one class of daemon-owned resource that survives
+	// outside the Go heap, and the one whose leak is invisible in every
+	// other row here. The section is omitted entirely when no router is
+	// wired or nothing is alive, so the common case stays as terse as
+	// it was.
+	if summary, providers := formatLSPRouterRows(st.LSPRouter, time.Now()); summary != "" {
+		t.AppendRow(table.Row{"lsp", summary})
+		for _, line := range providers {
+			t.AppendRow(table.Row{"", line})
+		}
+	}
 	rt := st.Runtime
 	if rt.Sys > 0 {
 		t.AppendRow(table.Row{"runtime", fmt.Sprintf(
@@ -1336,6 +1349,58 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			st.PProfAddr, st.PProfAddr)})
 	}
 	t.Render()
+}
+
+// formatLSPRouterRows renders the daemon's LSP-router state into the
+// `lsp` summary cell plus one indented line per alive language-server
+// subprocess. Returns an empty summary when there is nothing to show
+// — no router wired (nil status) or no provider alive — so the header
+// table keeps its previous shape on daemons that never spawn one.
+//
+// The per-provider line reports last_used as an age rather than a
+// timestamp because the question it answers is "is the 10-minute idle
+// reaper about to take this one?", and in_use because a pin count
+// that never falls back to zero is precisely what keeps a provider
+// out of the reaper's and the LRU evictor's reach.
+//
+// now is passed in rather than read here so the rendering is
+// deterministic under test.
+func formatLSPRouterRows(r *daemon.LSPRouterStatus, now time.Time) (string, []string) {
+	if r == nil || len(r.ActiveProviders) == 0 {
+		return "", nil
+	}
+	summary := fmt.Sprintf("alive=%d", len(r.ActiveProviders))
+	if r.MaxAlive > 0 {
+		summary = fmt.Sprintf("alive=%d/%d", len(r.ActiveProviders), r.MaxAlive)
+	}
+	if r.Evictions > 0 {
+		summary += fmt.Sprintf("  evictions=%d", r.Evictions)
+	}
+
+	lines := make([]string, 0, len(r.ActiveProviders))
+	for _, p := range r.ActiveProviders {
+		lines = append(lines, fmt.Sprintf("  %s@%s  last_used=%s  in_use=%d",
+			p.Spec, p.Workspace, formatLSPLastUsed(p.LastUsed, now), p.InUse))
+	}
+	return summary, lines
+}
+
+// formatLSPLastUsed turns the RFC3339 timestamp the daemon sends into
+// a "3m12s ago" age. An unparseable value is passed through verbatim
+// rather than dropped — a malformed timestamp from an older daemon
+// build should still be visible, not silently rendered as "now".
+func formatLSPLastUsed(raw string, now time.Time) string {
+	ts, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return raw
+	}
+	age := now.Sub(ts)
+	if age < 0 {
+		// Clock skew between the status read and the daemon's own
+		// clock; "0s ago" beats a negative duration.
+		age = 0
+	}
+	return formatDuration(age.Truncate(time.Second)) + " ago"
 }
 
 // formatEnrichmentProgress renders the semantic-enrichment progress
