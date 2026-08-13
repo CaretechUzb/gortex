@@ -39,22 +39,73 @@ func requireLocalizationHostContractMatchesVisible(
 	return host
 }
 
-func TestLocalizationTargetProvenanceSeatsOnlyUnanchoredContentEvidence(t *testing.T) {
+func TestLocalizationTargetProvenanceSeparatesLiteralObservationFromPrimarySeating(t *testing.T) {
 	node := &graph.Node{ID: "repo/service.go::Handle", Name: "Handle", FilePath: "repo/service.go"}
 	weak := exploreTarget{node: node, sourceLiteral: true}
-	if got := localizationTargetProvenance(localizationCompletion{}, weak); got != "" {
-		t.Fatalf("anchored/default literal provenance = %q, want empty", got)
+	if got := localizationTargetProvenance(localizationCompletion{}, weak); got != localizationProvenanceContentLiteral {
+		t.Fatalf("anchored literal provenance = %q, want %q", got, localizationProvenanceContentLiteral)
+	}
+	if localizationFinalResponsePrimaryProvenance(localizationDigestRow{Provenance: localizationProvenanceContentLiteral}) {
+		t.Fatal("anchored literal provenance must not reserve a PRIMARY seat")
 	}
 
 	weak.literalPrimaryEligible = true
 	if got := localizationTargetProvenance(localizationCompletion{}, weak); got != localizationProvenanceContentLiteral {
 		t.Fatalf("unanchored literal provenance = %q, want %q", got, localizationProvenanceContentLiteral)
 	}
+	if !localizationFinalResponsePrimaryProvenance(localizationDigestRow{
+		Provenance: localizationProvenanceContentLiteral, literalPrimaryEligible: true,
+	}) {
+		t.Fatal("eligible unanchored literal must retain its bounded PRIMARY reservation")
+	}
 	proof := localizationStrongEvidenceForCompletion(
 		newLocalizationCompletion(true, ""), []exploreTarget{weak},
 	)
 	if proof.provenance != "" {
 		t.Fatalf("unanchored content seating became strong terminal proof: %#v", proof)
+	}
+}
+
+func TestLocalizationLiteralProvenanceSurvivesFinalProjection(t *testing.T) {
+	tests := []struct {
+		name        string
+		target      exploreTarget
+		provenance  string
+		enforceable bool
+	}{
+		{
+			name: "authenticated content observation remains advisory",
+			target: exploreTarget{
+				node:   &graph.Node{ID: "repo/service.go::Handle", Name: "Handle", Kind: graph.KindFunction, FilePath: "repo/service.go"},
+				source: "func Handle() {}", exactContent: true,
+			},
+			provenance: localizationProvenanceContentLiteral,
+		},
+		{
+			name: "unique graph-resolved literal callee remains strong",
+			target: exploreTarget{
+				node:   &graph.Node{ID: "repo/registry.go::Register", Name: "Register", Kind: graph.KindFunction, FilePath: "repo/registry.go"},
+				source: "func Register(value string) {}", exactContent: true,
+				sourceLiteral: true, sourceLiteralCallee: true,
+			},
+			provenance:  localizationProvenanceSourceLiteralCallee,
+			enforceable: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, _, _, completion := buildLocalizationExploreResultForTaskFinalized(
+				newLocalizationCompletion(true, ""), `locate the value "wire-key"`,
+				[]exploreTarget{test.target}, exploreDefaultBudgetTokens,
+			)
+			body, ok := singleTextContent(result)
+			require.True(t, ok)
+			var envelope localizationExploreEnvelope
+			require.NoError(t, json.Unmarshal([]byte(body), &envelope))
+			require.Len(t, envelope.Evidence, 1)
+			require.Equal(t, test.provenance, envelope.Evidence[0].Provenance)
+			require.Equal(t, test.enforceable, completion.Enforceable)
+		})
 	}
 }
 
@@ -132,7 +183,7 @@ func TestLocalizationEvidencePolicyHoldsWeakOwnerForOneBoundedCallFromSQLiteCSha
 	require.Equal(t, localizationStateNeedsRecovery, envelope.Completion.State)
 	require.False(t, envelope.Completion.Enforceable)
 	require.Len(t, envelope.Evidence, 1)
-	require.Empty(t, envelope.Evidence[0].Provenance)
+	require.Equal(t, localizationProvenanceContentLiteral, envelope.Evidence[0].Provenance)
 
 	wire, err := json.Marshal(result)
 	require.NoError(t, err)

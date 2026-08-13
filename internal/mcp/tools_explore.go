@@ -3227,6 +3227,11 @@ type localizationEvidence struct {
 	Callees    []string `json:"callees,omitempty"`
 	Provenance string   `json:"provenance,omitempty"`
 	Source     string   `json:"source,omitempty"`
+
+	// Request-local presentation authority. This is deliberately not serialized:
+	// provenance may describe an exact literal on any authenticated row, while
+	// only an unanchored literal may reserve a PRIMARY seat ahead of ranking.
+	literalPrimaryEligible bool
 }
 
 func (s *Server) completeEmptyLocalization(ctx context.Context, task string, budget int) *mcp.CallToolResult {
@@ -4336,6 +4341,8 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 			Callers:    boundedLocalizationNeighborIDs(target.callers, localizationMaxNeighborIDs),
 			Callees:    boundedLocalizationNeighborIDs(target.callees, localizationMaxNeighborIDs),
 			Provenance: provenance,
+
+			literalPrimaryEligible: target.literalPrimaryEligible,
 		}
 
 		candidate := envelope

@@ -67,6 +67,11 @@ type localizationDigestRow struct {
 	Callers    []string `json:"callers,omitempty"`
 	Callees    []string `json:"callees,omitempty"`
 	Provenance string   `json:"provenance,omitempty"`
+
+	// Kept only in the request-local/session-retained projection. It separates
+	// truthful literal provenance from permission to pre-seat that row as
+	// PRIMARY, without spending response bytes on an internal policy bit.
+	literalPrimaryEligible bool
 }
 
 // newLocalizationEvidenceDigestForTask retains only concrete ranked evidence
@@ -101,6 +106,8 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 			Callers:    append([]string(nil), row.Callers...),
 			Callees:    append([]string(nil), row.Callees...),
 			Provenance: row.Provenance,
+
+			literalPrimaryEligible: row.literalPrimaryEligible,
 		})
 		return true
 	}
@@ -265,6 +272,7 @@ func mergeLocalizationDigestRowEvidence(primary, supplementary localizationDiges
 	if primary.Provenance == "" {
 		primary.Provenance = supplementary.Provenance
 	}
+	primary.literalPrimaryEligible = primary.literalPrimaryEligible || supplementary.literalPrimaryEligible
 	primary.Callers = mergeLocalizationDigestStrings(primary.Callers, supplementary.Callers)
 	primary.Callees = mergeLocalizationDigestStrings(primary.Callees, supplementary.Callees)
 	return primary
@@ -573,10 +581,11 @@ type localizationFinalResponseTaskScore struct {
 	callable bool
 }
 
-func localizationFinalResponsePrimaryProvenance(provenance string) bool {
-	switch provenance {
-	case localizationProvenanceContentLiteral,
-		localizationProvenanceSourceLiteralCallee,
+func localizationFinalResponsePrimaryProvenance(row localizationDigestRow) bool {
+	switch row.Provenance {
+	case localizationProvenanceContentLiteral:
+		return row.literalPrimaryEligible
+	case localizationProvenanceSourceLiteralCallee,
 		localizationProvenanceDivergentDefault,
 		localizationProvenanceImplementationTarget,
 		localizationProvenanceTypedAnchorProjection,
@@ -815,7 +824,7 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 		return true
 	}
 	for _, row := range rows {
-		if localizationFinalResponsePrimaryProvenance(row.Provenance) {
+		if localizationFinalResponsePrimaryProvenance(row) {
 			appendPrimary(row)
 		}
 	}

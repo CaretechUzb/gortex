@@ -399,7 +399,11 @@ func localizationTargetProvenance(completion localizationCompletion, target expl
 	if localizationStrongSourceLiteralCallee(target) {
 		return localizationProvenanceSourceLiteralCallee
 	}
-	if target.literalPrimaryEligible && (target.sourceLiteral || target.exactContent) {
+	// Provenance describes how this authenticated graph identity was found;
+	// PRIMARY seating is a separate presentation decision. Explicit symbol or
+	// path anchors must not erase an exact content/source observation merely
+	// because that observation is not allowed to reserve an extra PRIMARY seat.
+	if target.sourceLiteral || target.exactContent {
 		return localizationProvenanceContentLiteral
 	}
 	if target.typedAnchorProjection {
