@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -163,6 +164,188 @@ func TestFindNodesByNameBoundedHonorsCancellation(t *testing.T) {
 	}
 	if len(page.Nodes) != 0 || page.Total != 0 {
 		t.Fatalf("cancelled lookup returned partial page %#v", page)
+	}
+}
+
+func TestFindFileNodesBoundedCapsScopesKindsAndDropsPayloads(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	const filePath = "shared/dense.go"
+	nodes := make([]*graph.Node, 0, 192)
+	for index := 0; index < 64; index++ {
+		nodes = append(nodes,
+			&graph.Node{
+				ID: fmt.Sprintf("repo/dense.go::fn-%03d", index), Name: fmt.Sprintf("fn%d", index),
+				Kind: graph.KindFunction, FilePath: filePath, RepoPrefix: "repo",
+				WorkspaceID: "workspace", ProjectID: "project",
+				Meta: map[string]any{
+					"signature":       "func with promoted payload",
+					"doc":             stringsRepeatForProjectionTest("documentation", 32),
+					"custom_metadata": stringsRepeatForProjectionTest("metadata", 32),
+				},
+			},
+			&graph.Node{
+				ID: fmt.Sprintf("repo/dense.go::value-%03d", index), Name: fmt.Sprintf("value%d", index),
+				Kind: graph.KindVariable, FilePath: filePath, RepoPrefix: "repo",
+				WorkspaceID: "workspace", ProjectID: "project",
+			},
+			&graph.Node{
+				ID: fmt.Sprintf("foreign/dense.go::fn-%03d", index), Name: fmt.Sprintf("foreign%d", index),
+				Kind: graph.KindFunction, FilePath: filePath, RepoPrefix: "foreign",
+				WorkspaceID: "foreign", ProjectID: "foreign",
+			},
+		)
+	}
+	store.BeginBulkLoad()
+	store.AddBatch(nodes, nil)
+	store.FlushBulk()
+
+	page, err := store.FindFileNodesBounded(
+		context.Background(), filePath,
+		graph.LocalizationNodeScope{
+			WorkspaceID: "workspace", ProjectID: "project",
+			RepoAllow: map[string]bool{"repo": true},
+			Kinds:     map[graph.NodeKind]bool{graph.KindFunction: true},
+		},
+		8,
+	)
+	if err != nil {
+		t.Fatalf("bounded file lookup: %v", err)
+	}
+	if page.Total != 9 || !page.Truncated || len(page.Nodes) != 8 {
+		t.Fatalf("page = %#v, want threshold total 9, truncated, cap 8", page)
+	}
+	for index, node := range page.Nodes {
+		want := fmt.Sprintf("repo/dense.go::fn-%03d", index)
+		if node.ID != want {
+			t.Fatalf("node[%d] = %q, want deterministic %q", index, node.ID, want)
+		}
+		if node.Kind != graph.KindFunction || node.RepoPrefix != "repo" || node.WorkspaceID != "workspace" {
+			t.Fatalf("scope or kind was applied after cap: %#v", node)
+		}
+		if node.Meta != nil {
+			t.Fatalf("summary node[%d] hydrated metadata: %#v", index, node.Meta)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if cancelled, err := store.FindFileNodesBounded(ctx, filePath, graph.LocalizationNodeScope{}, 8); err == nil || len(cancelled.Nodes) != 0 {
+		t.Fatalf("cancelled file lookup = %#v, %v; want empty error result", cancelled, err)
+	}
+}
+
+func TestFindFileNodesBoundedFindsProductionRowsBehindTests(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	const filePath = "repo/dense.go"
+	nodes := make([]*graph.Node, 0, 310)
+	for index := 0; index < 300; index++ {
+		nodes = append(nodes, &graph.Node{
+			ID: fmt.Sprintf("repo/dense.go::a-test-%03d", index), Name: "test",
+			Kind: graph.KindFunction, FilePath: filePath, Meta: map[string]any{"is_test": true},
+		})
+	}
+	for index := 0; index < 10; index++ {
+		nodes = append(nodes, &graph.Node{
+			ID: fmt.Sprintf("repo/dense.go::z-prod-%03d", index), Name: "prod",
+			Kind: graph.KindFunction, FilePath: filePath,
+		})
+	}
+	store.BeginBulkLoad()
+	store.AddBatch(nodes, nil)
+	store.FlushBulk()
+
+	page, err := store.FindFileNodesBounded(
+		context.Background(), filePath, graph.LocalizationNodeScope{ExcludeTests: true}, 8,
+	)
+	if err != nil {
+		t.Fatalf("bounded file lookup: %v", err)
+	}
+	if page.Total != 9 || !page.Truncated || len(page.Nodes) != 8 {
+		t.Fatalf("page = %#v, want production sentinel after test rows", page)
+	}
+	for _, node := range page.Nodes {
+		if node.Name != "prod" {
+			t.Fatalf("test declaration consumed production cap: %#v", node)
+		}
+	}
+}
+
+func TestFindFileNodesBoundedDoesNotTransferMetadataWhenTestsIncluded(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	const nodeID = "repo/file.go::handler"
+	store.AddNode(&graph.Node{
+		ID: nodeID, Name: "handler", Kind: graph.KindFunction, FilePath: "repo/file.go",
+		Meta: map[string]any{"signature": "func handler()", "doc": "promoted payload"},
+	})
+	if _, err := store.writerDB.Exec(`UPDATE nodes SET meta = ? WHERE id = ?`, []byte("not-valid-metadata"), nodeID); err != nil {
+		t.Fatalf("corrupt metadata fixture: %v", err)
+	}
+
+	page, err := store.FindFileNodesBounded(
+		context.Background(), "repo/file.go", graph.LocalizationNodeScope{}, 8,
+	)
+	if err != nil {
+		t.Fatalf("summary lookup decoded metadata it must not select: %v", err)
+	}
+	if len(page.Nodes) != 1 || page.Nodes[0].ID != nodeID {
+		t.Fatalf("page = %#v, want one summary node", page)
+	}
+	if page.Nodes[0].Meta != nil {
+		t.Fatalf("summary hydrated metadata: %#v", page.Nodes[0].Meta)
+	}
+}
+
+func TestFindFileNodesBoundedPlanUsesFileIndexWithoutSorter(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	store.AddNode(&graph.Node{ID: "repo/file.go::handler", Name: "handler", Kind: graph.KindFunction, FilePath: "repo/file.go"})
+
+	predicate, args := localizationFileNodePredicate("repo/file.go", graph.LocalizationNodeScope{})
+	args = append(args, "", 257)
+	rows, err := store.db.Query(
+		`EXPLAIN QUERY PLAN SELECT `+lookupNodeSummaryCols+` FROM nodes WHERE `+predicate+` AND id > ? ORDER BY id LIMIT ?`,
+		args...,
+	)
+	if err != nil {
+		t.Fatalf("explain bounded file query: %v", err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan query plan: %v", err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("query plan rows: %v", err)
+	}
+	plan := strings.Join(details, "\n")
+	if !strings.Contains(plan, "nodes_by_file") {
+		t.Fatalf("query plan does not use nodes_by_file:\n%s", plan)
+	}
+	if strings.Contains(strings.ToUpper(plan), "TEMP B-TREE") {
+		t.Fatalf("query plan sorts bounded file rows:\n%s", plan)
 	}
 }
 

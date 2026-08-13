@@ -9,7 +9,10 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-var _ graph.BoundedExactNameReader = (*Store)(nil)
+var (
+	_ graph.BoundedExactNameReader = (*Store)(nil)
+	_ graph.BoundedFileNodeReader  = (*Store)(nil)
+)
 
 // lookupLocalizationNodeCols carries identity, kind, location, and scope plus
 // the opaque metadata blob needed to preserve the exact anchor's is_test gate.
@@ -105,9 +108,121 @@ func (s *Store) FindNodesByNameBounded(
 	return graph.BoundedNodeProjection{Nodes: nodes, Total: total, Truncated: truncated}, nil
 }
 
+// FindFileNodesBounded reads one file through the identity/location projection.
+// Scope and kind predicates are pushed before the sentinel cap. The normal
+// declaration path transfers no metadata column at all; callers that explicitly
+// exclude tests pay bounded RawBytes decoding because is_test still lives in the
+// legacy metadata blob. Every keyset cursor is closed before the next page.
+func (s *Store) FindFileNodesBounded(
+	ctx context.Context,
+	filePath string,
+	scope graph.LocalizationNodeScope,
+	limit int,
+) (graph.BoundedNodeProjection, error) {
+	if s == nil || s.db == nil || filePath == "" || limit <= 0 {
+		return graph.BoundedNodeProjection{}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return graph.BoundedNodeProjection{}, err
+	}
+	if scope.ExcludeFiles[filePath] {
+		return graph.BoundedNodeProjection{}, nil
+	}
+
+	predicate, args := localizationFileNodePredicate(filePath, scope)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return graph.BoundedNodeProjection{}, err
+	}
+	defer tx.Rollback()
+
+	columns := lookupNodeSummaryCols
+	if scope.ExcludeTests {
+		columns = lookupLocalizationNodeCols
+	}
+	const rawPageSize = 256
+	sentinel := limit + 1
+	nodes := make([]*graph.Node, 0, sentinel)
+	lastID := ""
+	for len(nodes) < sentinel {
+		if err := ctx.Err(); err != nil {
+			return graph.BoundedNodeProjection{}, err
+		}
+		pageArgs := append(append([]any(nil), args...), lastID, rawPageSize)
+		rows, queryErr := tx.QueryContext(
+			ctx,
+			`SELECT `+columns+` FROM nodes WHERE `+predicate+` AND id > ? ORDER BY id LIMIT ?`,
+			pageArgs...,
+		)
+		if queryErr != nil {
+			return graph.BoundedNodeProjection{}, queryErr
+		}
+		rawRows := 0
+		for rows.Next() {
+			var node *graph.Node
+			var scanErr error
+			if scope.ExcludeTests {
+				node, scanErr = scanLocalizationNode(rows)
+			} else {
+				node, scanErr = scanNodeSummary(rows)
+			}
+			if scanErr != nil {
+				_ = rows.Close()
+				return graph.BoundedNodeProjection{}, scanErr
+			}
+			rawRows++
+			lastID = node.ID
+			if !scope.Allows(node) {
+				continue
+			}
+			nodes = append(nodes, node)
+			if len(nodes) == sentinel {
+				break
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return graph.BoundedNodeProjection{}, err
+		}
+		if err := rows.Close(); err != nil {
+			return graph.BoundedNodeProjection{}, err
+		}
+		if len(nodes) == sentinel || rawRows < rawPageSize {
+			break
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return graph.BoundedNodeProjection{}, err
+	}
+
+	total := len(nodes)
+	truncated := total > limit
+	if len(nodes) > limit {
+		nodes = nodes[:limit]
+	}
+	return graph.BoundedNodeProjection{Nodes: nodes, Total: total, Truncated: truncated}, nil
+}
+
 func localizationNodePredicate(name string, scope graph.LocalizationNodeScope) (string, []any) {
-	clauses := []string{`name = ?`}
-	args := []any{name}
+	clauses, args := localizationScopePredicate(scope)
+	clauses = append([]string{`name = ?`}, clauses...)
+	args = append([]any{name}, args...)
+	return strings.Join(clauses, ` AND `), args
+}
+
+func localizationFileNodePredicate(filePath string, scope graph.LocalizationNodeScope) (string, []any) {
+	clauses, args := localizationScopePredicate(scope)
+	clauses = append([]string{`file_path = ?`}, clauses...)
+	args = append([]any{filePath}, args...)
+	return strings.Join(clauses, ` AND `), args
+}
+
+func localizationScopePredicate(scope graph.LocalizationNodeScope) ([]string, []any) {
+	var clauses []string
+	var args []any
 	if len(scope.Kinds) > 0 {
 		kinds := make([]string, 0, len(scope.Kinds))
 		for kind, allowed := range scope.Kinds {
@@ -150,7 +265,7 @@ func localizationNodePredicate(name string, scope graph.LocalizationNodeScope) (
 			}
 		}
 	}
-	return strings.Join(clauses, ` AND `), args
+	return clauses, args
 }
 
 func scanLocalizationNode(scanner interface{ Scan(...any) error }) (*graph.Node, error) {

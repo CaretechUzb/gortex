@@ -88,7 +88,18 @@ type BoundedExactNameReader interface {
 	FindNodesByNameBounded(context.Context, string, LocalizationNodeScope, int) (BoundedNodeProjection, error)
 }
 
-var _ BoundedExactNameReader = (*Graph)(nil)
+// BoundedFileNodeReader projects one file's scoped identity, kind, and source
+// location rows without transferring retrieval payloads. It is optional rather
+// than part of Reader so localization callers can fail closed instead of
+// silently falling back to the legacy full-row GetFileNodes path.
+type BoundedFileNodeReader interface {
+	FindFileNodesBounded(context.Context, string, LocalizationNodeScope, int) (BoundedNodeProjection, error)
+}
+
+var (
+	_ BoundedExactNameReader = (*Graph)(nil)
+	_ BoundedFileNodeReader  = (*Graph)(nil)
+)
 
 // FindNodesByNameBounded reads at most limit+1 matching pointers while still
 // counting every scoped homonym. The bounded sorted insertion keeps memory
@@ -147,6 +158,73 @@ func (g *Graph) FindNodesByNameBounded(
 	return BoundedNodeProjection{Nodes: kept, Total: total, Truncated: truncated}, nil
 }
 
+// FindFileNodesBounded is the in-memory reference implementation of the
+// lightweight file projection. It retains only limit+1 pointers while scanning
+// the file buckets, applies scope before the cap, and returns a deterministic
+// ID-ordered page. As with FindNodesByNameBounded, concurrent writes can yield a
+// weak cross-shard snapshot; the page invariants remain intact.
+func (g *Graph) FindFileNodesBounded(
+	ctx context.Context,
+	filePath string,
+	scope LocalizationNodeScope,
+	limit int,
+) (BoundedNodeProjection, error) {
+	if g == nil || filePath == "" || limit <= 0 {
+		return BoundedNodeProjection{}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return BoundedNodeProjection{}, err
+	}
+
+	pageSize := limit + 1
+	kept := make([]*Node, 0, pageSize)
+	total := 0
+	for _, shard := range g.shards {
+		if err := ctx.Err(); err != nil {
+			return BoundedNodeProjection{}, err
+		}
+		shard.mu.RLock()
+		for index, node := range shard.byFile[filePath] {
+			if index&127 == 0 {
+				if err := ctx.Err(); err != nil {
+					shard.mu.RUnlock()
+					return BoundedNodeProjection{}, err
+				}
+			}
+			if !scope.Allows(node) {
+				continue
+			}
+			total++
+			kept = insertBoundedLocalizationNode(kept, localizationNodeSummary(node), pageSize)
+		}
+		shard.mu.RUnlock()
+	}
+
+	truncated := len(kept) > limit || total > limit
+	if len(kept) > limit {
+		kept = kept[:limit]
+	}
+	if total > pageSize {
+		total = pageSize
+	}
+	return BoundedNodeProjection{Nodes: kept, Total: total, Truncated: truncated}, nil
+}
+
+func localizationNodeSummary(node *Node) *Node {
+	if node == nil {
+		return nil
+	}
+	return &Node{
+		ID: node.ID, Kind: node.Kind, Name: node.Name, QualName: node.QualName,
+		FilePath: node.FilePath, StartLine: node.StartLine, EndLine: node.EndLine,
+		StartColumn: node.StartColumn, EndColumn: node.EndColumn, Language: node.Language,
+		RepoPrefix: node.RepoPrefix, WorkspaceID: node.WorkspaceID, ProjectID: node.ProjectID,
+	}
+}
+
 func insertBoundedLocalizationNode(nodes []*Node, node *Node, limit int) []*Node {
 	if node == nil || limit <= 0 {
 		return nodes
@@ -169,6 +247,7 @@ func insertBoundedLocalizationNode(nodes []*Node, node *Node, limit int) []*Node
 
 var (
 	_ BoundedExactNameReader = (*OverlaidView)(nil)
+	_ BoundedFileNodeReader  = (*OverlaidView)(nil)
 	// ErrBoundedLocalizationUnavailable lets MCP localization fail closed when
 	// a third-party Reader has not implemented the bounded projection. Falling
 	// back to FindNodesByName would silently restore the unbounded allocation.
@@ -288,4 +367,60 @@ func (v *OverlaidView) FindNodesByNameBounded(
 		kept = kept[:limit]
 	}
 	return BoundedNodeProjection{Nodes: kept, Total: visible, Truncated: truncated}, nil
+}
+
+// FindFileNodesBounded preserves file-overlay replacement semantics: an
+// overlaid file is answered exclusively from its request-local replacement (or
+// as empty for a tombstone), while an untouched file delegates to the bounded
+// base capability. It never merges stale base declarations into an overlay.
+func (v *OverlaidView) FindFileNodesBounded(
+	ctx context.Context,
+	filePath string,
+	scope LocalizationNodeScope,
+	limit int,
+) (BoundedNodeProjection, error) {
+	if v == nil || filePath == "" || limit <= 0 {
+		return BoundedNodeProjection{}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return BoundedNodeProjection{}, err
+	}
+
+	if v.layer != nil && v.layer.HasFile(filePath) {
+		pageSize := limit + 1
+		kept := make([]*Node, 0, pageSize)
+		total := 0
+		for index, node := range v.layer.nodesForFile(filePath) {
+			if index&127 == 0 {
+				if err := ctx.Err(); err != nil {
+					return BoundedNodeProjection{}, err
+				}
+			}
+			if !scope.Allows(node) {
+				continue
+			}
+			total++
+			kept = insertBoundedLocalizationNode(kept, localizationNodeSummary(node), pageSize)
+		}
+		truncated := total > limit
+		if len(kept) > limit {
+			kept = kept[:limit]
+		}
+		if total > pageSize {
+			total = pageSize
+		}
+		return BoundedNodeProjection{Nodes: kept, Total: total, Truncated: truncated}, nil
+	}
+
+	if v.base == nil {
+		return BoundedNodeProjection{}, nil
+	}
+	baseReader, ok := v.base.(BoundedFileNodeReader)
+	if !ok {
+		return BoundedNodeProjection{}, ErrBoundedLocalizationUnavailable
+	}
+	return baseReader.FindFileNodesBounded(ctx, filePath, scope, limit)
 }

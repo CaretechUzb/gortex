@@ -171,3 +171,132 @@ func TestOverlaidViewFindNodesByNameBoundedHonorsDetachedRemoval(t *testing.T) {
 		t.Fatalf("detached removal leaked stale base node: %#v", page)
 	}
 }
+
+func TestFindFileNodesBoundedCapsScopeKindsAndCancels(t *testing.T) {
+	graph := New()
+	const filePath = "repo/dense.go"
+	for index := 0; index < 32; index++ {
+		graph.AddNode(&Node{
+			ID: fmt.Sprintf("repo/dense.go::fn-%03d", index), Name: fmt.Sprintf("fn%d", index),
+			Kind: KindFunction, FilePath: filePath, RepoPrefix: "repo",
+			WorkspaceID: "workspace", ProjectID: "project",
+			Meta: map[string]any{"doc": "must not escape the summary projection"},
+		})
+		graph.AddNode(&Node{
+			ID: fmt.Sprintf("repo/dense.go::value-%03d", index), Name: fmt.Sprintf("value%d", index),
+			Kind: KindVariable, FilePath: filePath, RepoPrefix: "repo",
+			WorkspaceID: "workspace", ProjectID: "project",
+		})
+		graph.AddNode(&Node{
+			ID: fmt.Sprintf("foreign/dense.go::fn-%03d", index), Name: fmt.Sprintf("foreign%d", index),
+			Kind: KindFunction, FilePath: filePath, RepoPrefix: "foreign",
+			WorkspaceID: "foreign", ProjectID: "foreign",
+		})
+	}
+
+	page, err := graph.FindFileNodesBounded(
+		context.Background(), filePath,
+		LocalizationNodeScope{
+			WorkspaceID: "workspace", ProjectID: "project",
+			RepoAllow: map[string]bool{"repo": true},
+			Kinds:     map[NodeKind]bool{KindFunction: true},
+		},
+		8,
+	)
+	if err != nil {
+		t.Fatalf("bounded file lookup: %v", err)
+	}
+	if page.Total != 9 || !page.Truncated || len(page.Nodes) != 8 {
+		t.Fatalf("page = %#v, want threshold total 9, truncated, cap 8", page)
+	}
+	if !sort.SliceIsSorted(page.Nodes, func(i, j int) bool { return page.Nodes[i].ID < page.Nodes[j].ID }) {
+		t.Fatalf("nodes are not deterministic: %#v", page.Nodes)
+	}
+	for _, node := range page.Nodes {
+		if node.Kind != KindFunction || node.RepoPrefix != "repo" || node.WorkspaceID != "workspace" {
+			t.Fatalf("scope or kind was applied after cap: %#v", node)
+		}
+		if node.Meta != nil {
+			t.Fatalf("in-memory file summary retained metadata: %#v", node.Meta)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if cancelled, err := graph.FindFileNodesBounded(ctx, filePath, LocalizationNodeScope{}, 8); err == nil || len(cancelled.Nodes) != 0 {
+		t.Fatalf("cancelled file lookup = %#v, %v; want empty error result", cancelled, err)
+	}
+}
+
+func TestFindFileNodesBoundedFiltersTestsBeforeCap(t *testing.T) {
+	graph := New()
+	const filePath = "repo/dense_test.go"
+	for index := 0; index < 32; index++ {
+		graph.AddNode(&Node{
+			ID: fmt.Sprintf("repo/dense_test.go::a-test-%03d", index), Name: "test",
+			Kind: KindFunction, FilePath: filePath, Meta: map[string]any{"is_test": true},
+		})
+	}
+	for index := 0; index < 10; index++ {
+		graph.AddNode(&Node{
+			ID: fmt.Sprintf("repo/dense_test.go::z-prod-%03d", index), Name: "prod",
+			Kind: KindFunction, FilePath: filePath,
+		})
+	}
+
+	page, err := graph.FindFileNodesBounded(
+		context.Background(), filePath, LocalizationNodeScope{ExcludeTests: true}, 8,
+	)
+	if err != nil {
+		t.Fatalf("bounded file lookup: %v", err)
+	}
+	if page.Total != 9 || !page.Truncated || len(page.Nodes) != 8 {
+		t.Fatalf("page = %#v, want production sentinel after test rows", page)
+	}
+	for _, node := range page.Nodes {
+		if node.Name != "prod" {
+			t.Fatalf("test node consumed the production cap: %#v", node)
+		}
+	}
+}
+
+func TestOverlaidViewFindFileNodesBoundedReplacesAndTombstones(t *testing.T) {
+	base := New()
+	const filePath = "repo/handler.go"
+	base.AddNode(&Node{ID: filePath + "::old", Name: "old", Kind: KindFunction, FilePath: filePath})
+
+	layer := NewOverlayLayer()
+	layer.MarkFile(filePath, false)
+	layer.AddNode(filePath, &Node{
+		ID: filePath + "::replacement", Name: "replacement", Kind: KindFunction, FilePath: filePath,
+		Meta: map[string]any{"doc": "must not escape the overlay summary projection"},
+	})
+	layer.AddNode(filePath, &Node{ID: filePath + "::ignored", Name: "ignored", Kind: KindVariable, FilePath: filePath})
+	view := NewOverlaidView(base, layer)
+
+	page, err := view.FindFileNodesBounded(
+		context.Background(), filePath,
+		LocalizationNodeScope{Kinds: map[NodeKind]bool{KindFunction: true}}, 8,
+	)
+	if err != nil {
+		t.Fatalf("bounded overlay file lookup: %v", err)
+	}
+	if page.Total != 1 || page.Truncated || len(page.Nodes) != 1 || page.Nodes[0].Name != "replacement" {
+		t.Fatalf("overlay page = %#v, want replacement only", page)
+	}
+	if page.Nodes[0].Meta != nil {
+		t.Fatalf("overlay file summary retained metadata: %#v", page.Nodes[0].Meta)
+	}
+
+	tombstone := NewOverlayLayer()
+	tombstone.MarkFile(filePath, true)
+	deleted, err := NewOverlaidView(base, tombstone).FindFileNodesBounded(
+		context.Background(), filePath, LocalizationNodeScope{}, 8,
+	)
+	if err != nil {
+		t.Fatalf("bounded tombstone lookup: %v", err)
+	}
+	if deleted.Total != 0 || deleted.Truncated || len(deleted.Nodes) != 0 {
+		t.Fatalf("tombstone leaked base nodes: %#v", deleted)
+	}
+}
