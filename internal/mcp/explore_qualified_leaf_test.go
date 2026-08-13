@@ -41,6 +41,100 @@ func TestExploreQualifiedLeafRecoversWithinRankedOwnerFileAcrossStores(t *testin
 	})
 }
 
+func TestExploreQualifiedLeafRejectsSiblingOwnerCollision(t *testing.T) {
+	anchor, owner, _ := qualifiedLeafFixture()
+	other := &graph.Node{
+		ID: "src/HipChatHandler.php::Other.buildContent", Name: "buildContent",
+		QualName: "Other.buildContent", Kind: graph.KindMethod,
+		FilePath: owner.FilePath, StartLine: 30,
+	}
+	server := exactNameAnchorServer(t, owner, other)
+	got := server.exploreQualifiedLeafCandidate(
+		context.Background(), server.graph, anchor, []*rerank.Candidate{{Node: owner}},
+		query.QueryOptions{}, map[string]struct{}{}, map[string]struct{}{},
+	)
+	if got != nil {
+		t.Fatalf("qualified leaf = %#v, want explicit other-owner member rejected", got)
+	}
+}
+
+func TestExploreQualifiedLeafChoosesQualifiedOwnerAmongSameFileCollisions(t *testing.T) {
+	anchor, owner, member := qualifiedLeafFixture()
+	other := &graph.Node{
+		ID: "src/HipChatHandler.php::Other.buildContent", Name: "buildContent",
+		QualName: "Other.buildContent", Kind: graph.KindMethod,
+		FilePath: owner.FilePath, StartLine: 30,
+	}
+	server := exactNameAnchorServer(t, owner, other, member)
+	got := server.exploreQualifiedLeafCandidate(
+		context.Background(), server.graph, anchor, []*rerank.Candidate{{Node: owner}},
+		query.QueryOptions{}, map[string]struct{}{}, map[string]struct{}{},
+	)
+	if got == nil || got.Node == nil || got.Node.ID != member.ID {
+		t.Fatalf("qualified leaf = %#v, want requested owner member %q", got, member.ID)
+	}
+}
+
+func TestExploreQualifiedLeafUsesMemberOfToDisambiguateBareLeaves(t *testing.T) {
+	anchor, owner, _ := qualifiedLeafFixture()
+	requested := &graph.Node{
+		ID: owner.FilePath + "::buildContent#requested", Name: "buildContent",
+		Kind: graph.KindMethod, FilePath: owner.FilePath, StartLine: 40,
+	}
+	ambiguous := &graph.Node{
+		ID: owner.FilePath + "::buildContent#ambiguous", Name: "buildContent",
+		Kind: graph.KindMethod, FilePath: owner.FilePath, StartLine: 50,
+	}
+	store := graph.New()
+	store.AddNode(owner)
+	store.AddNode(requested)
+	store.AddNode(ambiguous)
+	store.AddEdge(&graph.Edge{From: requested.ID, To: owner.ID, Kind: graph.EdgeMemberOf})
+	server := &Server{graph: store}
+	got := server.exploreQualifiedLeafCandidate(
+		context.Background(), store, anchor, []*rerank.Candidate{{Node: owner}},
+		query.QueryOptions{}, map[string]struct{}{}, map[string]struct{}{},
+	)
+	if got == nil || got.Node == nil || got.Node.ID != requested.ID {
+		t.Fatalf("qualified leaf = %#v, want member_of-proven leaf %q", got, requested.ID)
+	}
+}
+
+func TestExploreQualifiedLeafAllowsUniqueUnqualifiedLeaf(t *testing.T) {
+	anchor, owner, _ := qualifiedLeafFixture()
+	bare := &graph.Node{
+		ID: owner.FilePath + "::buildContent", Name: "buildContent",
+		Kind: graph.KindMethod, FilePath: owner.FilePath, StartLine: 40,
+	}
+	server := exactNameAnchorServer(t, owner, bare)
+	got := server.exploreQualifiedLeafCandidate(
+		context.Background(), server.graph, anchor, []*rerank.Candidate{{Node: owner}},
+		query.QueryOptions{}, map[string]struct{}{}, map[string]struct{}{},
+	)
+	if got == nil || got.Node == nil || got.Node.ID != bare.ID {
+		t.Fatalf("qualified leaf = %#v, want unique bare member %q", got, bare.ID)
+	}
+}
+
+func TestExploreQualifiedLeafRejectsAmbiguousUnqualifiedLeavesAcrossOwnerFiles(t *testing.T) {
+	anchor, firstOwner, _ := qualifiedLeafFixture()
+	secondOwner := &graph.Node{
+		ID: "src/Legacy/HipChatHandler.php::HipChatHandler", Name: "HipChatHandler",
+		Kind: graph.KindType, FilePath: "src/Legacy/HipChatHandler.php", StartLine: 8,
+	}
+	first := &graph.Node{ID: firstOwner.FilePath + "::buildContent", Name: "buildContent", Kind: graph.KindMethod, FilePath: firstOwner.FilePath, StartLine: 40}
+	second := &graph.Node{ID: secondOwner.FilePath + "::buildContent", Name: "buildContent", Kind: graph.KindMethod, FilePath: secondOwner.FilePath, StartLine: 50}
+	server := exactNameAnchorServer(t, firstOwner, secondOwner, first, second)
+	ordinary := []*rerank.Candidate{{Node: firstOwner}, {Node: secondOwner}}
+	got := server.exploreQualifiedLeafCandidate(
+		context.Background(), server.graph, anchor, ordinary,
+		query.QueryOptions{}, map[string]struct{}{}, map[string]struct{}{},
+	)
+	if got != nil {
+		t.Fatalf("qualified leaf = %#v, want ambiguous bare leaves rejected", got)
+	}
+}
+
 func TestExploreQualifiedLeafRequiresRankedOwnerFile(t *testing.T) {
 	anchor, owner, member := qualifiedLeafFixture()
 	other := &graph.Node{

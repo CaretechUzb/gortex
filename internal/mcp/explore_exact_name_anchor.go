@@ -17,9 +17,10 @@ const (
 	exploreExactNameAnchorMaxChars  = 64
 	// A name this widely shared describes a convention (handle, execute, run),
 	// not the task's subject, so it cannot anchor on its own.
-	exploreExactNameAnchorMaxShared = 8
-	exploreExactNameAnchorMaxNodes  = 10
-	exploreExactNameAnchorOwnerScan = 32
+	exploreExactNameAnchorMaxShared    = 8
+	exploreExactNameAnchorMaxNodes     = 10
+	exploreExactNameAnchorOwnerScan    = 32
+	exploreExactNameAnchorOwnerRawScan = 4 * exploreExactNameAnchorOwnerScan
 	// Case folding is a miss-only recovery lane. Four tokens, three alternate
 	// indexed spellings each, and four ranked files are hard request-wide caps.
 	exploreExactNameAnchorCaseFoldMaxTokens = 4
@@ -461,8 +462,12 @@ func (s *Server) exploreQualifiedAnchorOwnerCandidate(
 		return nil
 	}
 	var best *graph.Node
-	scanned := 0
+	rawScanned, eligibleScanned := 0, 0
 	for _, node := range s.graph.FindNodesByName(owner) {
+		if rawScanned == exploreExactNameAnchorOwnerRawScan {
+			break
+		}
+		rawScanned++
 		if node == nil || node.Name != owner ||
 			(node.Kind != graph.KindType && node.Kind != graph.KindInterface) {
 			continue
@@ -470,10 +475,10 @@ func (s *Server) exploreQualifiedAnchorOwnerCandidate(
 		if !scope.ScopeAllows(node) || !s.nodeInSessionScope(ctx, node) {
 			continue
 		}
-		if scanned == exploreExactNameAnchorOwnerScan {
+		if eligibleScanned == exploreExactNameAnchorOwnerScan {
 			break
 		}
-		scanned++
+		eligibleScanned++
 		if _, used := usedIDs[node.ID]; used {
 			continue
 		}

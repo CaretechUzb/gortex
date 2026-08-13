@@ -31,6 +31,11 @@ func exploreQualifiedLeafMatchesNode(node *graph.Node, leaf string) bool {
 	return false
 }
 
+type exploreQualifiedOwnerFile struct {
+	path     string
+	ownerIDs map[string]struct{}
+}
+
 // exploreRankedQualifiedOwnerFiles intersects exact owner declarations with
 // the ordinary result order. Thus a common owner name cannot authorize a new
 // file: independent retrieval must already have ranked that file.
@@ -40,44 +45,68 @@ func (s *Server) exploreRankedQualifiedOwnerFiles(
 	owner string,
 	ordinary []*rerank.Candidate,
 	scope query.QueryOptions,
-) []string {
-	ownerFiles := make(map[string]struct{})
-	scanned := 0
+) []exploreQualifiedOwnerFile {
+	ownersByFile := make(map[string]map[string]struct{})
+	rawScanned, eligibleScanned := 0, 0
 	for _, node := range reader.FindNodesByName(owner) {
-		if scanned == exploreExactNameAnchorOwnerScan {
+		if rawScanned == exploreExactNameAnchorOwnerRawScan {
 			break
 		}
-		scanned++
+		rawScanned++
 		if node == nil || node.Name != owner || node.FilePath == "" ||
 			(node.Kind != graph.KindType && node.Kind != graph.KindInterface) ||
 			!scope.ScopeAllows(node) || !s.nodeInSessionScope(ctx, node) {
 			continue
 		}
-		ownerFiles[node.FilePath] = struct{}{}
+		if eligibleScanned == exploreExactNameAnchorOwnerScan {
+			break
+		}
+		eligibleScanned++
+		ownerIDs := ownersByFile[node.FilePath]
+		if ownerIDs == nil {
+			ownerIDs = make(map[string]struct{})
+			ownersByFile[node.FilePath] = ownerIDs
+		}
+		ownerIDs[node.ID] = struct{}{}
 	}
-	if len(ownerFiles) == 0 {
+	if len(ownersByFile) == 0 {
 		return nil
 	}
-	files := make([]string, 0, exploreQualifiedLeafMaxFiles)
+	files := make([]exploreQualifiedOwnerFile, 0, exploreQualifiedLeafMaxFiles)
 	seen := make(map[string]struct{}, exploreQualifiedLeafMaxFiles)
 	for _, candidate := range ordinary {
 		if candidate == nil || candidate.Node == nil {
 			continue
 		}
 		path := candidate.Node.FilePath
-		if _, ownerFile := ownerFiles[path]; !ownerFile {
+		ownerIDs, ownerFile := ownersByFile[path]
+		if !ownerFile {
 			continue
 		}
 		if _, duplicate := seen[path]; duplicate {
 			continue
 		}
 		seen[path] = struct{}{}
-		files = append(files, path)
+		files = append(files, exploreQualifiedOwnerFile{path: path, ownerIDs: ownerIDs})
 		if len(files) == exploreQualifiedLeafMaxFiles {
 			break
 		}
 	}
 	return files
+}
+
+type exploreQualifiedLeafOwnerStatus uint8
+
+const (
+	exploreQualifiedLeafOwnerUnknown exploreQualifiedLeafOwnerStatus = iota
+	exploreQualifiedLeafOwnerMatch
+	exploreQualifiedLeafOwnerMismatch
+)
+
+type exploreQualifiedLeafMatch struct {
+	node     *graph.Node
+	ownerIDs map[string]struct{}
+	proven   bool
 }
 
 func (s *Server) exploreQualifiedLeafCandidate(
@@ -96,14 +125,13 @@ func (s *Server) exploreQualifiedLeafCandidate(
 	if len(files) == 0 {
 		return nil
 	}
-	var fallback *rerank.Candidate
+	matches := make([]exploreQualifiedLeafMatch, 0, exploreSyntacticAnchorFetch)
 	seen := make(map[string]struct{}, exploreSyntacticAnchorFetch)
-	matched := 0
-	for _, path := range files {
-		if ctx.Err() != nil {
+	for _, file := range files {
+		if ctx.Err() != nil || len(matches) == exploreSyntacticAnchorFetch {
 			break
 		}
-		for _, node := range reader.GetFileNodes(path) {
+		for _, node := range reader.GetFileNodes(file.path) {
 			if node == nil || !exploreQualifiedLeafMatchesNode(node, member) ||
 				!exploreSyntacticAnchorEligibleNode(node) || !scope.ScopeAllows(node) ||
 				!s.nodeInSessionScope(ctx, node) {
@@ -113,21 +141,105 @@ func (s *Server) exploreQualifiedLeafCandidate(
 				continue
 			}
 			seen[node.ID] = struct{}{}
-			if _, used := usedIDs[node.ID]; used {
+			ownerStatus := exploreQualifiedLeafIdentityOwnerStatus(node, owner, member)
+			if ownerStatus == exploreQualifiedLeafOwnerMismatch {
 				continue
 			}
-			candidate := &rerank.Candidate{Node: node, VectorRank: -1}
-			if fallback == nil {
-				fallback = candidate
-			}
-			if _, repeatedFile := usedFiles[node.FilePath]; !repeatedFile {
-				return candidate
-			}
-			matched++
-			if matched == exploreSyntacticAnchorFetch {
-				return fallback
+			matches = append(matches, exploreQualifiedLeafMatch{
+				node: node, ownerIDs: file.ownerIDs,
+				proven: ownerStatus == exploreQualifiedLeafOwnerMatch,
+			})
+			if len(matches) == exploreSyntacticAnchorFetch {
+				break
 			}
 		}
 	}
-	return fallback
+	if len(matches) == 0 {
+		return nil
+	}
+
+	ids := make([]string, 0, len(matches))
+	for _, match := range matches {
+		if !match.proven {
+			ids = append(ids, match.node.ID)
+		}
+	}
+	if len(ids) > 0 {
+		outEdges := reader.GetOutEdgesByNodeIDs(ids)
+		for index := range matches {
+			if matches[index].proven {
+				continue
+			}
+			for _, edge := range outEdges[matches[index].node.ID] {
+				if edge == nil || edge.Kind != graph.EdgeMemberOf {
+					continue
+				}
+				if _, exactOwner := matches[index].ownerIDs[edge.To]; exactOwner {
+					matches[index].proven = true
+					break
+				}
+			}
+		}
+	}
+
+	var provenFallback *graph.Node
+	for _, match := range matches {
+		if !match.proven {
+			continue
+		}
+		if _, used := usedIDs[match.node.ID]; used {
+			continue
+		}
+		if provenFallback == nil {
+			provenFallback = match.node
+		}
+		if _, repeatedFile := usedFiles[match.node.FilePath]; !repeatedFile {
+			return &rerank.Candidate{Node: match.node, VectorRank: -1}
+		}
+	}
+	if provenFallback != nil {
+		return &rerank.Candidate{Node: provenFallback, VectorRank: -1}
+	}
+	// Parsers that do not retain enclosing-owner metadata still recover one
+	// globally unique leaf. Any second leaf makes ownership ambiguous and the
+	// qualified fallback deliberately declines.
+	if len(matches) != 1 {
+		return nil
+	}
+	if _, used := usedIDs[matches[0].node.ID]; used {
+		return nil
+	}
+	return &rerank.Candidate{Node: matches[0].node, VectorRank: -1}
+}
+
+func exploreQualifiedLeafIdentityOwnerStatus(node *graph.Node, owner, member string) exploreQualifiedLeafOwnerStatus {
+	if node == nil || owner == "" || member == "" {
+		return exploreQualifiedLeafOwnerUnknown
+	}
+	status := exploreQualifiedLeafOwnerUnknown
+	identities := []string{node.QualName, node.Name, node.ID}
+	for index, identity := range identities {
+		identity = strings.TrimSpace(identity)
+		if index == len(identities)-1 {
+			// Graph IDs carry a file/repo prefix before the final ::. Only the
+			// symbol suffix can describe an enclosing declaration.
+			if cut := strings.LastIndex(identity, "::"); cut >= 0 {
+				identity = identity[cut+2:]
+			}
+		}
+		identity = strings.ReplaceAll(identity, "::", ".")
+		separator := strings.LastIndexByte(identity, '.')
+		if separator <= 0 || !strings.EqualFold(exploreQualifiedIdentifierLeaf(identity[separator+1:]), member) {
+			continue
+		}
+		ownerPart := exploreQualifiedIdentifierLeaf(identity[:separator])
+		if ownerPart == "" {
+			continue
+		}
+		if strings.EqualFold(ownerPart, owner) {
+			return exploreQualifiedLeafOwnerMatch
+		}
+		status = exploreQualifiedLeafOwnerMismatch
+	}
+	return status
 }
