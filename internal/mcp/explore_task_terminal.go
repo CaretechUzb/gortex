@@ -4,44 +4,87 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 const (
-	exploreTaskOutlineBudgetShare = 4
-	exploreTaskOutlineHeading     = "## File outlines"
+	exploreTaskOutlineBudgetShare        = 4
+	exploreTaskOutlineHeading            = "## File outlines"
+	exploreTaskMinimumOutlineTokens      = 64
+	exploreTaskDeclarationRetentionLimit = 128
+	exploreTaskSectionSeparatorTokens    = 2
 )
 
-// exploreTaskPageOutline returns the same bounded declaration indexes used by
-// localize pages. Task-mode completion is visible guidance only: building this
-// page never arms the session-local localization gate.
-func (s *Server) exploreTaskPageOutline(task string, targets []exploreTarget) *localizationPageOutline {
-	if s == nil || s.engine == nil {
+type exploreTaskOutlineProvider func([]exploreTarget) *localizationPageOutline
+
+// newExploreTaskPageOutlineProvider returns the same bounded declaration index
+// used by localize pages. It captures the reader selected for this request, so
+// session overlays cannot fall back to the server's base engine. Enumeration is
+// deferred until the renderer proves a useful outline can fit.
+func newExploreTaskPageOutlineProvider(reader graph.Reader, task string) exploreTaskOutlineProvider {
+	if reader == nil {
 		return nil
 	}
-	declarations := newLocalizationFileDeclarationCache(s.engine.Reader())
-	provider := localizationPageOutlineProvider(
-		nil, targets, exploreTerminalTerms(task), declarations.definitions,
-	)
-	if provider == nil {
-		return nil
+	terms := exploreTerminalTerms(task)
+	return func(targets []exploreTarget) *localizationPageOutline {
+		declarations := newBoundedLocalizationFileDeclarationCache(reader, exploreTaskDeclarationRetentionLimit)
+		provider := localizationPageOutlineProvider(nil, targets, terms, declarations.definitions)
+		if provider == nil {
+			return nil
+		}
+		return provider()
 	}
-	return provider()
 }
 
-// renderExploreTask appends task-mode terminal guidance and a bounded file
-// index without changing renderExplore's established output contract. The
-// caller remains free to diagnose or edit from the evidence: unlike localize,
-// ordinary task mode deliberately retains no authorization state.
-func (s *Server) renderExploreTask(task string, targets []exploreTarget, budget int, outline *localizationPageOutline) string {
-	base := s.renderExplore(task, targets, budget)
+// renderExploreTask appends task-mode terminal guidance and, when the remaining
+// budget can carry a useful index, lazily loads bounded file outlines. Ordinary
+// task mode deliberately retains no authorization state.
+func (s *Server) renderExploreTask(
+	task string,
+	targets []exploreTarget,
+	budget int,
+	outlineProvider exploreTaskOutlineProvider,
+) string {
 	completion := renderExploreTaskCompletion()
-	outlineBudget := max(budget/exploreTaskOutlineBudgetShare, exploreMinBudgetTokens/exploreTaskOutlineBudgetShare)
-	outlines := renderExploreTaskOutlines(outline, outlineBudget)
+	completionTokens := estimateTokens(completion)
+	outlineReserve := 0
+	if outlineProvider != nil && budget > completionTokens+exploreTaskMinimumOutlineTokens {
+		outlineReserve = min(
+			budget/exploreTaskOutlineBudgetShare,
+			budget-completionTokens-exploreTaskSectionSeparatorTokens,
+		)
+	}
+	baseBudget := max(budget-completionTokens-outlineReserve-exploreTaskSectionSeparatorTokens, 0)
+	renderedTargets := targets
+	base := s.renderExplore(task, renderedTargets, baseBudget)
+	for len(renderedTargets) > 1 && estimateTokens(base) > baseBudget {
+		renderedTargets = renderedTargets[:len(renderedTargets)-1]
+		base = s.renderExplore(task, renderedTargets, baseBudget)
+	}
+	if estimateTokens(joinExploreTaskSections(base, "", completion)) > budget {
+		base = renderExploreTaskMinimalBase(task, renderedTargets)
+	}
 
+	withoutOutline := joinExploreTaskSections(base, "", completion)
+	remaining := budget - estimateTokens(withoutOutline)
+	if outlineProvider == nil || remaining < exploreTaskMinimumOutlineTokens || outlineReserve < exploreTaskMinimumOutlineTokens {
+		return withoutOutline
+	}
+	outlineBudget := min(remaining, outlineReserve)
+	outlines := renderExploreTaskOutlines(outlineProvider(renderedTargets), outlineBudget)
+	withOutline := joinExploreTaskSections(base, outlines, completion)
+	if outlines == "" || estimateTokens(withOutline) > budget {
+		return withoutOutline
+	}
+	return withOutline
+}
+
+func joinExploreTaskSections(base, outlines, completion string) string {
 	var b strings.Builder
-	b.Grow(len(base) + len(outlines) + len(completion) + 2)
+	b.Grow(len(base) + len(outlines) + len(completion) + 3)
 	b.WriteString(base)
-	if !strings.HasSuffix(base, "\n") {
+	if base != "" && !strings.HasSuffix(base, "\n") {
 		b.WriteByte('\n')
 	}
 	if outlines != "" {
@@ -52,6 +95,28 @@ func (s *Server) renderExploreTask(task string, targets []exploreTarget, budget 
 		b.WriteByte('\n')
 		b.WriteString(completion)
 	}
+	return b.String()
+}
+
+// renderExploreTaskMinimalBase is the final budget relief after every trailing
+// candidate has been shed. API requests are clamped to exploreMinBudgetTokens,
+// so these bounded fields leave ample room for the mandatory completion JSON.
+func renderExploreTaskMinimalBase(task string, targets []exploreTarget) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "EXPLORE — %s\n\n## Likely target\n", truncateOneLine(task, 120))
+	if len(targets) == 0 || targets[0].node == nil {
+		b.WriteString("No ranked target was available.\n")
+	} else {
+		node := targets[0].node
+		fmt.Fprintf(
+			&b,
+			"- FILE: %s · SYMBOL: %s · ID: %s\n",
+			compactLocalizationField(nodeDisplayPath(node), 180),
+			compactLocalizationField(exploreDraftSymbol(node), 120),
+			compactLocalizationField(node.ID, 180),
+		)
+	}
+	b.WriteString("Task evidence was reduced to preserve the requested response budget.\n")
 	return b.String()
 }
 

@@ -7,16 +7,12 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-func TestRenderExploreTaskAddsCompletionWithoutChangingBaseRenderer(t *testing.T) {
+func TestRenderExploreTaskAddsCompletionWithinBudget(t *testing.T) {
 	targets := exploreTestTargets()
-	server := &Server{}
-	base := server.renderExplore("retry backoff", targets, 1600)
-	got := server.renderExploreTask("retry backoff", targets, 1600, nil)
+	got := (&Server{}).renderExploreTask("retry backoff", targets, 1600, nil)
 
-	if !strings.HasPrefix(got, base) {
-		t.Fatalf("task wrapper changed established explore output:\n%s", got)
-	}
 	for _, want := range []string{
+		"EXPLORE — retry backoff",
 		"## Completion",
 		`"state": "answer_ready"`,
 		`"required_action": "respond"`,
@@ -27,9 +23,12 @@ func TestRenderExploreTaskAddsCompletionWithoutChangingBaseRenderer(t *testing.T
 			t.Fatalf("task completion missing %q:\n%s", want, got)
 		}
 	}
+	if used := estimateTokens(got); used > 1600 {
+		t.Fatalf("task response used %d tokens, budget 1600", used)
+	}
 }
 
-func TestRenderExploreTaskAddsBoundedTopFileOutline(t *testing.T) {
+func TestRenderExploreTaskLazilyAddsBoundedTopFileOutline(t *testing.T) {
 	targets := exploreTestTargets()
 	nodes := []*graph.Node{
 		targets[0].node,
@@ -37,15 +36,17 @@ func TestRenderExploreTaskAddsBoundedTopFileOutline(t *testing.T) {
 		{ID: "retry.go::RetryPolicy", Name: "RetryPolicy", QualName: "RetryPolicy", Kind: graph.KindType, FilePath: "retry.go", StartLine: 2},
 	}
 	reads := 0
-	provider := localizationPageOutlineProvider(nil, targets, exploreTerminalTerms("retry policy"), func(file string) []*graph.Node {
-		reads++
-		if file != "retry.go" {
-			t.Fatalf("enumerated unexpected file %q", file)
-		}
-		return nodes
+	provider := exploreTaskOutlineProvider(func(actualTargets []exploreTarget) *localizationPageOutline {
+		outline := localizationPageOutlineProvider(nil, actualTargets, exploreTerminalTerms("retry policy"), func(file string) []*graph.Node {
+			reads++
+			if file != "retry.go" {
+				t.Fatalf("enumerated unexpected file %q", file)
+			}
+			return nodes
+		})
+		return outline()
 	})
-	outline := provider()
-	got := (&Server{}).renderExploreTask("retry policy", targets, 1600, outline)
+	got := (&Server{}).renderExploreTask("retry policy", targets, exploreMaxBudgetTokens, provider)
 
 	if reads != 1 {
 		t.Fatalf("file declarations read %d times, want 1", reads)
@@ -61,8 +62,47 @@ func TestRenderExploreTaskAddsBoundedTopFileOutline(t *testing.T) {
 			t.Fatalf("task outline missing %q:\n%s", want, got)
 		}
 	}
-	if estimateTokens(formatExploreTaskOutlines(outline)) > 1600/exploreTaskOutlineBudgetShare {
-		t.Fatal("fixture unexpectedly exceeds task outline allowance")
+	if used := estimateTokens(got); used > exploreMaxBudgetTokens {
+		t.Fatalf("task response used %d tokens, budget %d", used, exploreMaxBudgetTokens)
+	}
+}
+
+func TestRenderExploreTaskDoesNotLoadOutlineWithoutUsefulResidual(t *testing.T) {
+	calls := 0
+	provider := exploreTaskOutlineProvider(func([]exploreTarget) *localizationPageOutline {
+		calls++
+		return nil
+	})
+	budget := estimateTokens(renderExploreTaskCompletion()) + exploreTaskMinimumOutlineTokens - 1
+	_ = (&Server{}).renderExploreTask("retry policy", exploreTestTargets(), budget, provider)
+	if calls != 0 {
+		t.Fatalf("outline provider called %d times without useful residual", calls)
+	}
+}
+
+func TestRenderExploreTaskHonorsClampedBudgets(t *testing.T) {
+	for _, budget := range []int{exploreMinBudgetTokens, exploreDefaultBudgetTokens, exploreMaxBudgetTokens} {
+		t.Run(strings.Repeat("b", budget/1000), func(t *testing.T) {
+			got := (&Server{}).renderExploreTask("retry policy", exploreTestTargets(), budget, nil)
+			if used := estimateTokens(got); used > budget {
+				t.Fatalf("task response used %d tokens, budget %d", used, budget)
+			}
+		})
+	}
+}
+
+func TestExploreTaskOutlineProviderUsesSelectedReader(t *testing.T) {
+	targets := exploreTestTargets()
+	selected := &localizationDeclarationSpyReader{
+		files:     map[string][]*graph.Node{"retry.go": {targets[0].node}},
+		fileCalls: make(map[string]int),
+	}
+	provider := newExploreTaskPageOutlineProvider(selected, "retry policy")
+	if provider == nil || provider(targets) == nil {
+		t.Fatal("selected reader did not produce an outline")
+	}
+	if selected.fileCalls["retry.go"] != 1 {
+		t.Fatalf("selected reader called %d times, want 1", selected.fileCalls["retry.go"])
 	}
 }
 
