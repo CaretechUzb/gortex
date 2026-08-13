@@ -83,6 +83,17 @@ func runCodex(data []byte, port int, selected ...CodexMode) {
 	setHookCWD(peek.CWD)
 	defer setHookCWD("")
 
+	// Codex has specialized Bash and Gortex-read handlers, so enforce the
+	// shared all-tool terminal contract before dispatch. With no terminal
+	// marker this is a local no-op and the historical per-tool behavior below
+	// remains unchanged.
+	if peek.HookEventName == "PreToolUse" {
+		var input HookInput
+		if json.Unmarshal(data, &input) == nil && enforceLocalizationTerminalPreToolUse(input, time.Now()) {
+			return
+		}
+	}
+
 	switch {
 	case peek.HookEventName == "Stop":
 		// Codex uses the same stop_hook_active and last_assistant_message

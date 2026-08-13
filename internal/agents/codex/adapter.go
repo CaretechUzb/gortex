@@ -59,11 +59,18 @@ const (
 	v060CodexSessionStartMessage        = "IMPORTANT: Prefer Gortex MCP tools (search_symbols, get_callers, get_file_summary, edit_file) over Read/Grep/Glob/Edit."
 	v060CodexSessionStartCommand        = "printf '%s\\n' '" + v060CodexSessionStartMessage + "'"
 	v060CodexSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + v060CodexSessionStartMessage + "'\""
-	codexPreToolUseMatcher              = "^Bash$"
-	codexMCPReadPreToolUseMatcher       = "^(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze)$"
-	codexPostToolUseMatcher             = "^(Bash|apply_patch|(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze))$"
-	codexHookTimeoutSeconds             = 5
-	codexHookModeEnvVar                 = "GORTEX_CODEX_HOOK_MODE"
+	// Codex matchers are regular expressions. A match-all PreToolUse hook is
+	// required because terminal localization is an all-tool contract; the
+	// handler stays a strict local no-op for unrelated tools without a marker.
+	codexPreToolUseMatcher = ".*"
+	// Retained as migration fingerprints in tests: upsertCodexHookSet removes
+	// both split predecessors by managed command identity before installing the
+	// singleton match-all hook.
+	codexLegacyBashPreToolUseMatcher          = "^Bash$"
+	codexLegacyMCPNavigationPreToolUseMatcher = "^(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze)$"
+	codexPostToolUseMatcher                   = "^(Bash|apply_patch|(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze))$"
+	codexHookTimeoutSeconds                   = 5
+	codexHookModeEnvVar                       = "GORTEX_CODEX_HOOK_MODE"
 	// Codex merges its home instructions file into every session ahead of
 	// the repo's own AGENTS.md, preferring the override name when present.
 	codexGlobalInstructionsFile         = "AGENTS.md"
@@ -510,10 +517,7 @@ func upsertSessionStartHook(root map[string]any, env agents.Env, opts agents.App
 }
 
 func upsertPreToolUseHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
-	desired := []map[string]any{
-		codexPreToolUseHookEntry(env),
-		codexMCPReadPreToolUseHookEntry(env),
-	}
+	desired := []map[string]any{codexPreToolUseHookEntry(env)}
 	return upsertCodexHookSet(root, "PreToolUse", codexHookEntryIsGortexPreToolUse, desired, opts)
 }
 
@@ -758,21 +762,7 @@ func codexPreToolUseHookEntry(env agents.Env) map[string]any {
 				"type":          "command",
 				"command":       codexPreToolUseCommand(env),
 				"timeout":       codexHookTimeoutSeconds,
-				"statusMessage": "Loading Gortex Bash guidance...",
-			},
-		},
-	}
-}
-
-func codexMCPReadPreToolUseHookEntry(env agents.Env) map[string]any {
-	return map[string]any{
-		"matcher": codexMCPReadPreToolUseMatcher,
-		"hooks": []any{
-			map[string]any{
-				"type":          "command",
-				"command":       codexPreToolUseCommand(env),
-				"timeout":       codexHookTimeoutSeconds,
-				"statusMessage": "Loading Gortex read guidance...",
+				"statusMessage": "Loading Gortex tool guidance...",
 			},
 		},
 	}

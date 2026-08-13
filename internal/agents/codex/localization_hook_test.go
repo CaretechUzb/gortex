@@ -13,10 +13,10 @@ func TestCodexLocalizationLifecycleMatchersCoverEveryFacadeAndNamespace(t *testi
 		t.Fatalf("apply: %v", err)
 	}
 	cfg := readCodexConfig(t, env)
-	requireHookEntry(t, cfg, "PreToolUse", codexMCPReadPreToolUseMatcher, testCodexHookCommand)
+	requireHookEntry(t, cfg, "PreToolUse", codexPreToolUseMatcher, testCodexHookCommand)
 	requireHookEntry(t, cfg, "PostToolUse", codexPostToolUseMatcher, testCodexHookCommand)
 
-	preMatcher := regexp.MustCompile(codexMCPReadPreToolUseMatcher)
+	preMatcher := regexp.MustCompile(codexPreToolUseMatcher)
 	postMatcher := regexp.MustCompile(codexPostToolUseMatcher)
 	for _, prefix := range []string{"mcp__gortex__", "gortex__"} {
 		for _, operation := range []string{"explore", "search", "read", "relations", "trace", "analyze"} {
@@ -31,7 +31,7 @@ func TestCodexLocalizationLifecycleMatchersCoverEveryFacadeAndNamespace(t *testi
 	}
 
 	state := Inspect(env.Home)
-	if state.Hooks["PreToolUse"] != 2 || state.Hooks["PostToolUse"] != 1 {
+	if state.Hooks["PreToolUse"] != 1 || state.Hooks["PostToolUse"] != 1 {
 		t.Fatalf("doctor did not recognize localization hooks: %+v", state.Hooks)
 	}
 }
