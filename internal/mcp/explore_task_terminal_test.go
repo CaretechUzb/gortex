@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -25,6 +26,41 @@ func TestRenderExploreTaskAddsCompletionWithinBudget(t *testing.T) {
 	}
 	if used := estimateTokens(got); used > 1600 {
 		t.Fatalf("task response used %d tokens, budget 1600", used)
+	}
+}
+
+func TestRenderExploreTaskNilOutlineDoesNotDisplaceRankedTargets(t *testing.T) {
+	targets := make([]exploreTarget, 0, exploreDefaultMaxSymbols)
+	for index := 0; index < exploreDefaultMaxSymbols; index++ {
+		name := fmt.Sprintf("Candidate%02d", index)
+		targets = append(targets, exploreTarget{node: &graph.Node{
+			ID:        "candidate.go::" + name,
+			Name:      name,
+			Kind:      graph.KindFunction,
+			FilePath:  "candidate.go",
+			StartLine: index + 1,
+		}})
+	}
+	withoutProvider := (&Server{}).renderExploreTask("retry policy", targets, exploreDefaultBudgetTokens, nil)
+	calls := 0
+	withNilOutline := (&Server{}).renderExploreTask("retry policy", targets, exploreDefaultBudgetTokens, func(actual []exploreTarget) *localizationPageOutline {
+		calls++
+		if len(actual) != len(targets) {
+			t.Fatalf("outline provider received %d targets, want %d", len(actual), len(targets))
+		}
+		return nil
+	})
+
+	if calls != 1 {
+		t.Fatalf("outline provider called %d times, want 1", calls)
+	}
+	if withNilOutline != withoutProvider {
+		t.Fatalf("nil optional outline changed ranked task response:\n--- without provider ---\n%s\n--- with provider ---\n%s", withoutProvider, withNilOutline)
+	}
+	for _, target := range targets {
+		if !strings.Contains(withNilOutline, target.node.ID) {
+			t.Fatalf("ranked target %q was displaced:\n%s", target.node.ID, withNilOutline)
+		}
 	}
 }
 

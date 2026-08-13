@@ -29,7 +29,9 @@ func newExploreTaskPageOutlineProvider(reader graph.Reader, task string) explore
 	terms := exploreTerminalTerms(task)
 	return func(targets []exploreTarget) *localizationPageOutline {
 		declarations := newBoundedLocalizationFileDeclarationCache(reader, exploreTaskDeclarationRetentionLimit)
-		provider := localizationPageOutlineProvider(nil, targets, terms, declarations.definitions)
+		provider := localizationPageOutlineProvider(nil, targets, terms, func(file string) []*graph.Node {
+			return declarations.definitions(file).Nodes
+		})
 		if provider == nil {
 			return nil
 		}
@@ -48,34 +50,41 @@ func (s *Server) renderExploreTask(
 ) string {
 	completion := renderExploreTaskCompletion()
 	completionTokens := estimateTokens(completion)
-	outlineReserve := 0
-	if outlineProvider != nil && budget > completionTokens+exploreTaskMinimumOutlineTokens {
-		outlineReserve = min(
-			budget/exploreTaskOutlineBudgetShare,
-			budget-completionTokens-exploreTaskSectionSeparatorTokens,
-		)
+	fullBaseBudget := max(budget-completionTokens-exploreTaskSectionSeparatorTokens, 0)
+	renderWithoutOutline := func() string {
+		base := s.renderExplore(task, targets, fullBaseBudget)
+		return joinExploreTaskSections(base, "", completion)
 	}
-	baseBudget := max(budget-completionTokens-outlineReserve-exploreTaskSectionSeparatorTokens, 0)
-	renderedTargets := targets
-	base := s.renderExplore(task, renderedTargets, baseBudget)
-	for len(renderedTargets) > 1 && estimateTokens(base) > baseBudget {
-		renderedTargets = renderedTargets[:len(renderedTargets)-1]
-		base = s.renderExplore(task, renderedTargets, baseBudget)
-	}
-	if estimateTokens(joinExploreTaskSections(base, "", completion)) > budget {
-		base = renderExploreTaskMinimalBase(task, renderedTargets)
+	if outlineProvider == nil || budget <= completionTokens+exploreTaskMinimumOutlineTokens {
+		return renderWithoutOutline()
 	}
 
+	// Reserve source-packing space for an outline, never candidate space.
+	// renderExplore always keeps every ranked location and signature even when
+	// those mandatory rows exceed its approximate source budget.
+	outlineReserve := min(
+		budget/exploreTaskOutlineBudgetShare,
+		budget-completionTokens-exploreTaskSectionSeparatorTokens,
+	)
+	if outlineReserve < exploreTaskMinimumOutlineTokens {
+		return renderWithoutOutline()
+	}
+	baseBudget := max(fullBaseBudget-outlineReserve, 0)
+	base := s.renderExplore(task, targets, baseBudget)
 	withoutOutline := joinExploreTaskSections(base, "", completion)
 	remaining := budget - estimateTokens(withoutOutline)
-	if outlineProvider == nil || remaining < exploreTaskMinimumOutlineTokens || outlineReserve < exploreTaskMinimumOutlineTokens {
-		return withoutOutline
+	if remaining < exploreTaskMinimumOutlineTokens {
+		return renderWithoutOutline()
 	}
+
 	outlineBudget := min(remaining, outlineReserve)
-	outlines := renderExploreTaskOutlines(outlineProvider(renderedTargets), outlineBudget)
+	outlines := renderExploreTaskOutlines(outlineProvider(targets), outlineBudget)
 	withOutline := joinExploreTaskSections(base, outlines, completion)
 	if outlines == "" || estimateTokens(withOutline) > budget {
-		return withoutOutline
+		// The optional index did not use its allowance. Re-render with the full
+		// source budget so a nil or over-budget outline cannot make task mode
+		// poorer than the same request with outlines disabled.
+		return renderWithoutOutline()
 	}
 	return withOutline
 }
@@ -95,28 +104,6 @@ func joinExploreTaskSections(base, outlines, completion string) string {
 		b.WriteByte('\n')
 		b.WriteString(completion)
 	}
-	return b.String()
-}
-
-// renderExploreTaskMinimalBase is the final budget relief after every trailing
-// candidate has been shed. API requests are clamped to exploreMinBudgetTokens,
-// so these bounded fields leave ample room for the mandatory completion JSON.
-func renderExploreTaskMinimalBase(task string, targets []exploreTarget) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "EXPLORE — %s\n\n## Likely target\n", truncateOneLine(task, 120))
-	if len(targets) == 0 || targets[0].node == nil {
-		b.WriteString("No ranked target was available.\n")
-	} else {
-		node := targets[0].node
-		fmt.Fprintf(
-			&b,
-			"- FILE: %s · SYMBOL: %s · ID: %s\n",
-			compactLocalizationField(nodeDisplayPath(node), 180),
-			compactLocalizationField(exploreDraftSymbol(node), 120),
-			compactLocalizationField(node.ID, 180),
-		)
-	}
-	b.WriteString("Task evidence was reduced to preserve the requested response budget.\n")
 	return b.String()
 }
 
