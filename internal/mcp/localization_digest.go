@@ -122,7 +122,7 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 	// removed; only the weakest retained digest tail yields.
 	bodyIDs := make(map[string]struct{}, localizationBodyMentionCap)
 	for _, row := range envelope.Evidence {
-		if row.Provenance == localizationProvenanceBodyMention && row.ID != "" {
+		if localizationSupportingOnlyProvenance(row.Provenance) && row.ID != "" {
 			if _, already := seen[row.ID]; !already {
 				bodyIDs[row.ID] = struct{}{}
 			}
@@ -134,7 +134,7 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 		if len(digest.Evidence) >= ordinaryLimit {
 			break
 		}
-		if row.Provenance == localizationProvenanceBodyMention {
+		if localizationSupportingOnlyProvenance(row.Provenance) {
 			continue
 		}
 		if _, prioritized := priorityIDs[row.ID]; !prioritized {
@@ -142,7 +142,7 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 		}
 	}
 	for _, row := range envelope.Evidence {
-		if row.Provenance == localizationProvenanceBodyMention {
+		if localizationSupportingOnlyProvenance(row.Provenance) {
 			appendRow(row)
 		}
 	}
@@ -600,6 +600,7 @@ func localizationFinalResponseSupportingProvenance(provenance string) bool {
 	switch provenance {
 	case localizationProvenanceDivergentDefaultType,
 		localizationProvenanceImplementationRoute,
+		localizationProvenanceDirectAdjacency,
 		"direct_caller", "direct_callee":
 		return true
 	default:
@@ -807,7 +808,7 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 	// must not displace stronger retained evidence.
 	literalPrimaryCount := 0
 	appendPrimary := func(row localizationDigestRow) bool {
-		if row.Provenance == localizationProvenanceBodyMention {
+		if localizationSupportingOnlyProvenance(row.Provenance) {
 			return false
 		}
 		literal := row.Provenance == localizationProvenanceContentLiteral ||

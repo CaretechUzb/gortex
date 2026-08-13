@@ -4600,6 +4600,9 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 		envelope = localizationEnvelopePackingSourceWindow(envelope, target.sourceWindow, maxBytes)
 		break
 	}
+	if declarations != nil {
+		envelope, digest = promoteLocalizationDirectAdjacency(task, envelope, declarations.reader, len(envelope.Evidence), shedBudget, digest)
+	}
 	envelope, digest = promoteLocalizationBodyMentions(task, envelope, declarations, shedBudget, digest)
 	body, err := json.Marshal(envelope)
 	if err != nil {
