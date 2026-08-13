@@ -74,12 +74,12 @@ type localizationOutlineRow struct {
 }
 
 // localizationFileOutline is the bounded declaration index of a page file.
-// Declared counts what the file declares; Elided counts the rows the cap
-// dropped from the middle.
+// Declared counts what the file declares; Elided counts every declaration not
+// represented in Rows, whether the declaration cache or the row cap omitted it.
 //
-// The unexported fields are the whole file in line order plus the task-term
-// priority over it, retained so the same outline can be re-elided at a smaller
-// cap without re-reading the graph. They are never serialized.
+// The unexported fields are the retained declarations in line order plus the
+// task-term priority over them, kept so the same outline can be re-elided at a
+// smaller cap without re-reading the graph. They are never serialized.
 type localizationFileOutline struct {
 	File     string                   `json:"file"`
 	Declared int                      `json:"declared"`
@@ -109,9 +109,10 @@ func localizationPageOutlineProvider(
 	pool []*rerank.Candidate,
 	targets []exploreTarget,
 	terms map[string]struct{},
-	enumerate func(string) []*graph.Node,
+	enumerate any,
 ) func() *localizationPageOutline {
-	if enumerate == nil {
+	enumerateDeclarations := localizationOutlineDeclarationEnumerator(enumerate)
+	if enumerateDeclarations == nil {
 		return nil
 	}
 	var (
@@ -124,13 +125,15 @@ func localizationPageOutlineProvider(
 		}
 		built = true
 		index := func(file string, rank int) *localizationFileOutline {
-			nodes := enumerate(file)
-			if len(nodes) == 0 {
+			declarations := enumerateDeclarations(file)
+			if len(declarations.Nodes) == 0 {
 				// Nothing to enumerate leaves the nodes this page already
 				// fetched, which is the whole of what it knows about that file.
-				nodes = localizationOutlineFetchedNodes(pool, targets)
+				declarations = localizationFileDeclarations{
+					Nodes: localizationOutlineFetchedNodes(pool, targets),
+				}
 			}
-			outline := newLocalizationFileOutlineForTerms(file, nodes, terms, localizationOutlineFileRowCap(rank))
+			outline := newLocalizationFileOutlineForDeclarations(file, declarations, terms, localizationOutlineFileRowCap(rank))
 			if outline != nil {
 				outline.rank = rank
 			}
@@ -172,6 +175,22 @@ func localizationPageOutlineProvider(
 			page = nil
 		}
 		return page
+	}
+}
+
+// localizationOutlineDeclarationEnumerator keeps direct outline helpers that
+// enumerate raw nodes source-compatible while allowing bounded caches to carry
+// an exact declaration count alongside their retained page.
+func localizationOutlineDeclarationEnumerator(enumerate any) func(string) localizationFileDeclarations {
+	switch enumerate := enumerate.(type) {
+	case func(string) localizationFileDeclarations:
+		return enumerate
+	case func(string) []*graph.Node:
+		return func(file string) localizationFileDeclarations {
+			return localizationFileDeclarations{Nodes: enumerate(file)}
+		}
+	default:
+		return nil
 	}
 }
 
@@ -282,13 +301,22 @@ func newLocalizationFileOutlineForTerms(
 	terms map[string]struct{},
 	rowCap int,
 ) *localizationFileOutline {
+	return newLocalizationFileOutlineForDeclarations(file, localizationFileDeclarations{Nodes: nodes}, terms, rowCap)
+}
+
+func newLocalizationFileOutlineForDeclarations(
+	file string,
+	declarations localizationFileDeclarations,
+	terms map[string]struct{},
+	rowCap int,
+) *localizationFileOutline {
 	file = strings.TrimSpace(file)
 	if file == "" {
 		return nil
 	}
-	rows := make([]localizationOutlineRow, 0, len(nodes))
-	seen := make(map[string]struct{}, len(nodes))
-	for _, node := range nodes {
+	rows := make([]localizationOutlineRow, 0, len(declarations.Nodes))
+	seen := make(map[string]struct{}, len(declarations.Nodes))
+	for _, node := range declarations.Nodes {
 		if node == nil || nodeDisplayPath(node) != file || isNonDefinitionNode(node.Kind) {
 			continue
 		}
@@ -323,9 +351,13 @@ func newLocalizationFileOutlineForTerms(
 		}
 		return rows[first].Name < rows[second].Name
 	})
+	declared := len(rows)
+	if declarations.DeclaredKnown {
+		declared = max(declared, declarations.Declared)
+	}
 	outline := &localizationFileOutline{
 		File:     file,
-		Declared: len(rows),
+		Declared: declared,
 		all:      rows,
 		priority: localizationOutlinePriority(rows, terms),
 	}
@@ -443,7 +475,7 @@ func (o *localizationFileOutline) elide(rowCap int) {
 	}
 	if rowCap == localizationOutlineCompleteRows {
 		o.Rows = o.all
-		o.Elided = 0
+		o.Elided = max(o.Declared-len(o.Rows), 0)
 		return
 	}
 	if rowCap < 0 {
@@ -451,7 +483,7 @@ func (o *localizationFileOutline) elide(rowCap int) {
 	}
 	if len(o.all) <= rowCap {
 		o.Rows = o.all
-		o.Elided = 0
+		o.Elided = max(o.Declared-len(o.Rows), 0)
 		return
 	}
 	// The task's own matches lead, but never take the whole index: a task whose
@@ -486,7 +518,7 @@ func (o *localizationFileOutline) elide(rowCap int) {
 		}
 	}
 	o.Rows = rows
-	o.Elided = len(o.all) - len(rows)
+	o.Elided = max(o.Declared-len(rows), 0)
 }
 
 // clone detaches an outline from the provider's cache. One request can pack
