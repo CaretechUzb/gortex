@@ -37,6 +37,12 @@ func TestCppExtractor_QualifiedCallEmitsEdge(t *testing.T) {
 	src := []byte(`void run() {
   ns::helper();
   ns::templated<int>();
+  ns::Type::method();
+  ns::Type::templated<int>();
+  a::b::c::function();
+  a::b::c::templated<int>();
+  std::chrono::duration_cast<int>(value);
+  boost::asio::post(ex);
 }
 `)
 	res, err := NewCppExtractor().Extract("demo.cpp", src)
@@ -47,4 +53,16 @@ func TestCppExtractor_QualifiedCallEmitsEdge(t *testing.T) {
 		"the trailing name is what a qualified call names")
 	assert.Contains(t, byLine[3], "unresolved::templated",
 		"a templated qualified call names the same trailing identifier")
+	assert.Contains(t, byLine[4], "unresolved::method",
+		"a three-segment qualified call names its trailing identifier")
+	assert.Contains(t, byLine[5], "unresolved::templated",
+		"a three-segment templated call names its trailing identifier")
+	assert.Contains(t, byLine[6], "unresolved::function",
+		"qualification depth must not cap call extraction")
+	assert.Contains(t, byLine[7], "unresolved::templated",
+		"template extraction must not be capped by qualification depth")
+	assert.Contains(t, byLine[8], "unresolved::duration_cast",
+		"standard-library nested calls must remain visible")
+	assert.Contains(t, byLine[9], "unresolved::post",
+		"library namespace depth must not hide free calls")
 }

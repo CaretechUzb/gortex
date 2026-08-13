@@ -88,19 +88,12 @@ const qCppAll = `
       field: (template_method
         name: (field_identifier) @callm.method))) @callm.expr
 
-  ; Namespace-qualified free calls. std::move(x), ns::helper() and their
-  ; templated forms parse the callee as a qualified_identifier, which the
-  ; bare-identifier pattern cannot match — so every :: call was dropped
-  ; too, generics or not. Rust already carries the equivalent
-  ; scoped_identifier pattern; the trailing name is what the call names.
+  ; Namespace-qualified free calls. Capture the complete qualified_identifier
+  ; instead of fixing the query to one nesting depth: a::b::c() nests another
+  ; qualified_identifier in its name field, and the trailing identifier is
+  ; recovered structurally in cppQualifiedCallName.
   (call_expression
-    function: (qualified_identifier
-      name: (identifier) @call.name)) @call.expr
-
-  (call_expression
-    function: (qualified_identifier
-      name: (template_function
-        name: (identifier) @call.name))) @call.expr
+    function: (qualified_identifier) @callq.name) @callq.expr
 ]
 `
 
@@ -196,6 +189,18 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 					line:     expr.StartLine + 1,
 					isMember: true,
 					receiver: cppCallReceiverText(expr.Node, src),
+					argTypes: extractCppCallArgTypes(expr.Node, src),
+				})
+
+			case m.Captures["callq.expr"] != nil:
+				expr := m.Captures["callq.expr"]
+				name := cppQualifiedCallName(m.Captures["callq.name"].Node, src)
+				if name == "" {
+					return
+				}
+				calls = append(calls, cppDeferredCall{
+					name:     name,
+					line:     expr.StartLine + 1,
 					argTypes: extractCppCallArgTypes(expr.Node, src),
 				})
 
@@ -686,6 +691,25 @@ func cppInnerDeclarator(decl *sitter.Node) *sitter.Node {
 		}
 	}
 	return nil
+}
+
+// cppQualifiedCallName follows a qualified call's name field until it reaches
+// the trailing identifier. tree-sitter-cpp nests another qualified_identifier
+// there for every additional :: segment; a templated tail adds one
+// template_function wrapper. Unknown shapes return no evidence rather than
+// inventing a callee name.
+func cppQualifiedCallName(node *sitter.Node, src []byte) string {
+	for depth := 0; node != nil && depth < 64; depth++ {
+		switch node.Type() {
+		case "identifier", "field_identifier":
+			return node.Content(src)
+		case "qualified_identifier", "template_function":
+			node = node.ChildByFieldName("name")
+		default:
+			return ""
+		}
+	}
+	return ""
 }
 
 // lastIdentifier extracts the last identifier from a qualified_identifier.
