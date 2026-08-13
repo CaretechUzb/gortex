@@ -242,6 +242,37 @@ func TestSearchExploreSourceLiteralIsolatesTargetRepoOverlays(t *testing.T) {
 	}
 }
 
+func TestOverlayRequestCanonicalizesMultiRepoAliasesAcrossConsumers(t *testing.T) {
+	server, sessionID := newExploreSourceLiteralMultiRepoTestServer(t)
+	target := server.multiIndexer.GetIndexer("target")
+	if target == nil {
+		t.Fatal("target indexer missing")
+	}
+	absPath := filepath.Join(target.RootPath(), "disk.go")
+	const content = "package repo\nvar _ = \"overlay_alias\"\n"
+	for _, alias := range []string{absPath, "target/disk.go"} {
+		pushExploreSourceLiteralOverlay(t, server, sessionID, alias, content, false)
+	}
+
+	ctx := prepareExploreSourceLiteralOverlayContext(t, server, sessionID)
+	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
+	if !ok || !snapshot.canonical || len(snapshot.files) != 1 {
+		t.Fatalf("canonical snapshot = %#v", snapshot)
+	}
+	if snapshot.files[0].Path != "target/disk.go" {
+		t.Fatalf("canonical path = %q", snapshot.files[0].Path)
+	}
+	if got, found := server.overlayContentFor(ctx, absPath); !found || got != content {
+		t.Fatalf("overlay content = %q, %v", got, found)
+	}
+	result := server.searchExploreSourceLiteral(
+		ctx, "overlay_alias", "target", query.QueryOptions{RepoAllow: map[string]bool{"target": true}}, 1,
+	)
+	if result.err != nil || len(result.matches) != 1 || result.matches[0].Path != "target/disk.go" {
+		t.Fatalf("literal result = %#v, err=%v", result.matches, result.err)
+	}
+}
+
 func TestSearchExploreSourceLiteralSessionProjectDoesNotHideSiblingProject(t *testing.T) {
 	server, sessionID := newExploreSourceLiteralMultiRepoTestServer(t)
 	home := server.multiIndexer.GetIndexer("target")
@@ -350,25 +381,30 @@ func TestSearchExploreSourceLiteralRejectsViewWithoutPinnedSnapshot(t *testing.T
 	}
 }
 
-func TestSearchExploreSourceLiteralUsesLastCanonicalAlias(t *testing.T) {
+func TestSearchExploreSourceLiteralUsesCanonicalAliasCohort(t *testing.T) {
 	server, sessionID := newExploreSourceLiteralOverlayTestServer(t, map[string]string{
 		"alias.go": "package repo\nvar _ = \"needle\"\n",
 	})
-	pushExploreSourceLiteralOverlay(t, server, sessionID, "./alias.go", "package repo\nvar _ = \"needle\"\n", false)
-	pushExploreSourceLiteralOverlay(t, server, sessionID, "alias.go", "package repo\nvar _ = \"other\"\n", false)
+	const overlayContent = "package repo\nvar _ = \"other\"\n"
+	pushExploreSourceLiteralOverlay(t, server, sessionID, "./alias.go", overlayContent, false)
+	pushExploreSourceLiteralOverlay(t, server, sessionID, "alias.go", overlayContent, false)
+	ctx := prepareExploreSourceLiteralOverlayContext(t, server, sessionID)
+	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
+	if !ok || !snapshot.canonical || len(snapshot.files) != 1 {
+		t.Fatalf("canonical snapshot = %#v", snapshot)
+	}
 	result := server.searchExploreSourceLiteral(
-		prepareExploreSourceLiteralOverlayContext(t, server, sessionID), "needle", "repo",
-		query.QueryOptions{RepoAllow: map[string]bool{"repo": true}}, 1,
+		ctx, "needle", "repo", query.QueryOptions{RepoAllow: map[string]bool{"repo": true}}, 1,
 	)
 	if result.err != nil {
 		t.Fatalf("search: %v", result.err)
 	}
 	if len(result.matches) != 0 {
-		t.Fatalf("superseded alias leaked: %#v", result.matches)
+		t.Fatalf("canonical alias did not mask durable content: %#v", result.matches)
 	}
 }
 
-func TestSnapshotExploreSourceLiteralOverlaysBoundsCanonicalAliases(t *testing.T) {
+func TestSnapshotExploreSourceLiteralOverlaysCollapsesCanonicalAliases(t *testing.T) {
 	server, sessionID := newExploreSourceLiteralOverlayTestServer(t, nil)
 	for index := 0; index <= exploreSourceLiteralOverlayMaxCoveredFiles; index++ {
 		pushExploreSourceLiteralOverlay(t, server, sessionID,
@@ -381,8 +417,8 @@ func TestSnapshotExploreSourceLiteralOverlaysBoundsCanonicalAliases(t *testing.T
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
-	if !incomplete || !overflow || len(files) != 0 || len(covered) != 1 {
-		t.Fatalf("alias bound: files=%d covered=%d incomplete=%v overflow=%v", len(files), len(covered), incomplete, overflow)
+	if incomplete || overflow || len(files) != 1 || len(covered) != 1 {
+		t.Fatalf("alias cohort: files=%d covered=%d incomplete=%v overflow=%v", len(files), len(covered), incomplete, overflow)
 	}
 }
 

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -132,30 +131,22 @@ func (s *Server) snapshotExploreSourceLiteralOverlays(
 	if snapshot.sessionID != SessionIDFromContext(ctx) {
 		return nil, covered, false, false, fmt.Errorf("overlay request snapshot belongs to session %q, not %q", snapshot.sessionID, SessionIDFromContext(ctx))
 	}
+	if !snapshot.canonical {
+		return nil, covered, true, false, fmt.Errorf("overlay request snapshot is not canonical")
+	}
 	fileCapacity := len(snapshot.files)
 	if fileCapacity > exploreSourceLiteralOverlayMaxCoveredFiles {
 		fileCapacity = exploreSourceLiteralOverlayMaxCoveredFiles
 	}
 	files := make([]exploreSourceLiteralOverlayFile, 0, fileCapacity)
-	fileIndex := make(map[string]int, fileCapacity)
 	incomplete := false
-	recordOverflow := false
 	recordCount := 0
 	for _, overlay := range snapshot.files {
 		if err := ctx.Err(); err != nil {
-			return nil, covered, incomplete, recordOverflow, err
+			return nil, covered, incomplete, false, err
 		}
 		absPath, resolveErr := s.resolveOverlayAbsPath(overlay.Path)
-		if resolveErr != nil {
-			incomplete = true
-			continue
-		}
-		if absPath == "" {
-			incomplete = true
-			continue
-		}
-		graphPath := canonicalExploreSourceLiteralPath(s.resolveOverlayGraphPath(overlay.Path, absPath))
-		if graphPath == "" {
+		if resolveErr != nil || absPath == "" {
 			incomplete = true
 			continue
 		}
@@ -167,12 +158,15 @@ func (s *Server) snapshotExploreSourceLiteralOverlays(
 		if repoPrefix != "" && owner.RepoPrefix() != repoPrefix {
 			continue
 		}
-		// Bound records, not only unique graph paths: raw aliases can resolve
-		// to one canonical file and must not grow the scan cohort unboundedly.
+		graphPath := canonicalExploreSourceLiteralPath(overlay.Path)
+		if graphPath == "" {
+			incomplete = true
+			continue
+		}
 		recordCount++
 		if recordCount > exploreSourceLiteralOverlayMaxCoveredFiles {
-			// Fail closed at the sentinel. Returning even the bounded prefix
-			// could expose stale evidence if a later raw alias replaces it.
+			// The request cohort is already canonical, so this sentinel counts
+			// distinct effective files rather than raw aliases.
 			return nil, covered, true, true, nil
 		}
 		covered[graphPath] = struct{}{}
@@ -186,17 +180,11 @@ func (s *Server) snapshotExploreSourceLiteralOverlays(
 		if eligible && scope.ExcludeTests {
 			eligible = !testpath.IsTestFile(graphPath)
 		}
-		file := exploreSourceLiteralOverlayFile{
+		files = append(files, exploreSourceLiteralOverlayFile{
 			path: graphPath, content: overlay.Content, deleted: overlay.Deleted, eligible: eligible,
-		}
-		if index, exists := fileIndex[graphPath]; exists {
-			files[index] = file // SnapshotFor order defines the effective last record.
-		} else {
-			fileIndex[graphPath] = len(files)
-			files = append(files, file)
-		}
+		})
 	}
-	return files, covered, incomplete, recordOverflow, nil
+	return files, covered, incomplete, false, nil
 }
 
 // scanExploreSourceLiteralOverlays searches editor buffers without building an
@@ -369,12 +357,7 @@ func exploreSourceLiteralPathLess(left, right string) bool {
 }
 
 func canonicalExploreSourceLiteralPath(candidate string) string {
-	candidate = strings.TrimSpace(strings.ReplaceAll(candidate, "\\", "/"))
-	candidate = strings.TrimPrefix(candidate, "./")
-	if candidate == "" || candidate == "." {
-		return ""
-	}
-	return path.Clean(candidate)
+	return canonicalOverlayGraphPath(candidate)
 }
 
 func exploreOverlayLiteralHasBoundary(text, term string) bool {

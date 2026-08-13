@@ -632,6 +632,83 @@ func TestOverlay_RequestSnapshotRejectsForeignWorkspaceAndPath(t *testing.T) {
 	})
 }
 
+func TestOverlay_RequestSnapshotCanonicalizesEquivalentAliases(t *testing.T) {
+	srv, _, targetFile, _ := setupOverlayServer(t)
+	const sessionID = "canonical-aliases"
+	require.NoError(t, srv.OverlayManager().RegisterWithID(sessionID, ""))
+	const content = "package main\n\nfunc CanonicalBuffer() {}\n"
+	for _, alias := range []string{targetFile, filepath.Base(targetFile), "./" + filepath.Base(targetFile)} {
+		require.NoError(t, srv.OverlayManager().Push(sessionID, daemon.OverlayFile{
+			Path: alias, Content: content, BaseSHA: "",
+		}, nil))
+	}
+
+	ctx, view, err := srv.prepareOverlayRequest(WithSessionID(context.Background(), sessionID))
+	require.NoError(t, err)
+	require.NotNil(t, view)
+	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
+	require.True(t, ok)
+	require.True(t, snapshot.canonical)
+	require.Len(t, snapshot.files, 1)
+	require.Equal(t, filepath.Base(targetFile), snapshot.files[0].Path)
+	require.Equal(t, content, snapshot.files[0].Content)
+	got, found := srv.overlayContentFor(ctx, targetFile)
+	require.True(t, found)
+	require.Equal(t, content, got)
+}
+
+func TestOverlay_RequestSnapshotRejectsConflictingAliases(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		first  daemon.OverlayFile
+		second daemon.OverlayFile
+	}{
+		{
+			name:   "content",
+			first:  daemon.OverlayFile{Content: "package main\nfunc First() {}\n"},
+			second: daemon.OverlayFile{Content: "package main\nfunc Second() {}\n"},
+		},
+		{
+			name:   "tombstone",
+			first:  daemon.OverlayFile{Content: "package main\nfunc Present() {}\n"},
+			second: daemon.OverlayFile{Deleted: true},
+		},
+		{
+			name:   "base sha",
+			first:  daemon.OverlayFile{Content: "package main\n", BaseSHA: "first"},
+			second: daemon.OverlayFile{Content: "package main\n", BaseSHA: "second"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			srv, _, targetFile, _ := setupOverlayServer(t)
+			const sessionID = "conflicting-aliases"
+			require.NoError(t, srv.OverlayManager().RegisterWithID(sessionID, ""))
+			first, second := test.first, test.second
+			first.Path = targetFile
+			second.Path = filepath.Base(targetFile)
+			require.NoError(t, srv.OverlayManager().Push(sessionID, first, nil))
+			require.NoError(t, srv.OverlayManager().Push(sessionID, second, nil))
+
+			_, _, err := srv.prepareOverlayRequest(WithSessionID(context.Background(), sessionID))
+			require.ErrorContains(t, err, "conflicting overlay aliases")
+		})
+	}
+}
+
+func TestOverlay_RequestSnapshotRejectsNonCanonicalSnapshotWithView(t *testing.T) {
+	srv, _, targetFile, _ := setupOverlayServer(t)
+	const sessionID = "noncanonical-view"
+	ctx := WithSessionID(context.Background(), sessionID)
+	ctx = withOverlayRequestSnapshot(ctx, &overlayRequestSnapshot{
+		sessionID: sessionID,
+		files:     []daemon.OverlayFile{{Path: targetFile, Deleted: true}},
+	})
+	ctx = WithOverlayView(ctx, graph.NewOverlaidView(srv.graph, graph.NewOverlayLayer()))
+
+	_, _, err := srv.prepareOverlayRequest(ctx)
+	require.ErrorContains(t, err, "non-canonical request snapshot")
+}
+
 // baseNodeIDs returns a sorted slice of every node ID in the base
 // graph. Used to verify the shadow-graph design's load-bearing
 // invariant: base is never mutated during overlay processing.

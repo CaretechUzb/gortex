@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -33,6 +34,7 @@ type overlayRequestSnapshot struct {
 	sessionID string
 	workspace string
 	files     []daemon.OverlayFile
+	canonical bool
 }
 
 func withOverlayRequestSnapshot(ctx context.Context, snapshot *overlayRequestSnapshot) context.Context {
@@ -155,21 +157,28 @@ func (s *Server) prepareOverlayRequest(ctx context.Context) (context.Context, *g
 	if ok && snapshot.sessionID != SessionIDFromContext(ctx) {
 		return ctx, nil, fmt.Errorf("overlay request snapshot belongs to session %q, not %q", snapshot.sessionID, SessionIDFromContext(ctx))
 	}
-	if view := OverlayViewFromContext(ctx); view != nil {
-		return ctx, view, nil
-	}
 	if !ok {
+		if OverlayViewFromContext(ctx) != nil {
+			return ctx, nil, fmt.Errorf("overlay view has no pinned request snapshot")
+		}
 		var err error
 		snapshot, err = s.snapshotOverlayRequestForCtx(ctx)
 		if err != nil {
 			return ctx, nil, err
 		}
-		if snapshot != nil {
-			ctx = withOverlayRequestSnapshot(ctx, snapshot)
-		}
 	}
 	if snapshot == nil {
-		return ctx, nil, nil
+		return ctx, OverlayViewFromContext(ctx), nil
+	}
+	if view := OverlayViewFromContext(ctx); view != nil && !snapshot.canonical {
+		return ctx, nil, fmt.Errorf("overlay view has a non-canonical request snapshot")
+	}
+	if err := s.canonicalizeOverlayRequestSnapshot(snapshot); err != nil {
+		return ctx, nil, err
+	}
+	ctx = withOverlayRequestSnapshot(ctx, snapshot)
+	if view := OverlayViewFromContext(ctx); view != nil {
+		return ctx, view, nil
 	}
 	view, err := s.buildOverlayViewForCtx(ctx)
 	if err != nil {
@@ -181,26 +190,78 @@ func (s *Server) prepareOverlayRequest(ctx context.Context) (context.Context, *g
 	return ctx, view, nil
 }
 
-// validateOverlayRequestSnapshot ensures every raw buffer belongs to the
-// workspace under which the session was registered. Unknown and foreign paths
-// fail closed before parsing so a session cannot shadow another workspace.
-func (s *Server) validateOverlayRequestSnapshot(snapshot *overlayRequestSnapshot) error {
-	if snapshot == nil {
+func canonicalOverlayGraphPath(candidate string) string {
+	candidate = strings.TrimSpace(strings.ReplaceAll(candidate, "\\", "/"))
+	if candidate == "" {
+		return ""
+	}
+	candidate = path.Clean(candidate)
+	if candidate == "." {
+		return ""
+	}
+	return candidate
+}
+
+// canonicalizeOverlayRequestSnapshot validates and normalizes the pinned raw
+// buffer cohort exactly once. Aliases resolving to one graph path collapse
+// only when their replacement state is identical. SnapshotFor does not retain
+// push chronology, so conflicting aliases fail closed instead of guessing
+// which editor state is newer.
+func (s *Server) canonicalizeOverlayRequestSnapshot(snapshot *overlayRequestSnapshot) error {
+	if snapshot == nil || snapshot.canonical {
 		return nil
 	}
+	if len(snapshot.files) == 0 {
+		snapshot.canonical = true
+		return nil
+	}
+
+	sort.SliceStable(snapshot.files, func(i, j int) bool {
+		return snapshot.files[i].Path < snapshot.files[j].Path
+	})
+	type canonicalRecord struct {
+		file    daemon.OverlayFile
+		rawPath string
+	}
+	byPath := make(map[string]canonicalRecord, len(snapshot.files))
 	for _, file := range snapshot.files {
-		absPath, err := s.resolveOverlayAbsPath(file.Path)
+		rawPath := file.Path
+		absPath, err := s.resolveOverlayAbsPath(rawPath)
 		if err != nil {
 			return err
 		}
 		owner := s.pickIndexerForPath(absPath)
 		if absPath == "" || owner == nil {
-			return fmt.Errorf("overlay path %q is outside the registered workspace", file.Path)
+			return fmt.Errorf("overlay path %q is outside the registered workspace", rawPath)
 		}
 		if snapshot.workspace != "" && owner.WorkspaceID() != snapshot.workspace {
-			return fmt.Errorf("overlay path %q belongs to workspace %q, not registered workspace %q", file.Path, owner.WorkspaceID(), snapshot.workspace)
+			return fmt.Errorf("overlay path %q belongs to workspace %q, not registered workspace %q", rawPath, owner.WorkspaceID(), snapshot.workspace)
 		}
+		graphPath := canonicalOverlayGraphPath(s.resolveOverlayGraphPath(rawPath, absPath))
+		if graphPath == "" {
+			return fmt.Errorf("overlay path %q has no canonical graph path", rawPath)
+		}
+		if existing, ok := byPath[graphPath]; ok {
+			if existing.file.Content != file.Content || existing.file.Deleted != file.Deleted || existing.file.BaseSHA != file.BaseSHA {
+				return fmt.Errorf("conflicting overlay aliases %q and %q resolve to %q", existing.rawPath, rawPath, graphPath)
+			}
+			continue
+		}
+		file.Path = graphPath
+		byPath[graphPath] = canonicalRecord{file: file, rawPath: rawPath}
 	}
+
+	paths := make([]string, 0, len(byPath))
+	for graphPath := range byPath {
+		paths = append(paths, graphPath)
+	}
+	sort.Strings(paths)
+	files := make([]daemon.OverlayFile, 0, len(paths))
+	for _, graphPath := range paths {
+		files = append(files, byPath[graphPath].file)
+	}
+	snapshot.files = files
+	snapshot.canonical = true
 	return nil
 }
 
@@ -211,8 +272,8 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 	if !ok || snapshot == nil || len(snapshot.files) == 0 {
 		return nil, nil
 	}
-	if err := s.validateOverlayRequestSnapshot(snapshot); err != nil {
-		return nil, err
+	if !snapshot.canonical {
+		return nil, fmt.Errorf("overlay request snapshot is not canonical")
 	}
 	files := snapshot.files
 	sessID := SessionIDFromContext(ctx)
@@ -630,7 +691,7 @@ func (s *Server) overlayContentFor(ctx context.Context, absPath string) (string,
 		return "", false
 	}
 	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
-	if !ok || snapshot == nil {
+	if !ok || snapshot == nil || !snapshot.canonical {
 		return "", false
 	}
 	cleanedAbs := filepath.Clean(absPath)
