@@ -130,16 +130,14 @@ func TestCSharpExtractor_MethodStampsParamArity(t *testing.T) {
 	assert.Equal(t, 3, opt.Meta["param_count"])
 	assert.Equal(t, 2, opt.Meta["param_required"], "a defaulted parameter is omissible")
 
-	// The vendored grammar does not resolve a `params` entry into a
-	// parameter node — it flattens the type and name into loose siblings
-	// of the list. Counting what survives would claim one parameter for a
-	// two-parameter method, so an unreadable list must yield NO stamp:
-	// the resolver then treats the method as universally applicable
-	// instead of excluding it from argument counts it really accepts.
+	// tree-sitter-c-sharp flattens a `params` entry into loose type/name
+	// siblings. The extractor reconstructs that grammar shape so the
+	// resolver can use the variadic applicability window.
 	vari := byID["Ext.cs::Ext.Variadic"]
 	require.NotNil(t, vari)
-	assert.NotContains(t, vari.Meta, "param_count",
-		"a parameter list the grammar cannot fully structure yields no arity evidence")
+	assert.Equal(t, 2, vari.Meta["param_count"])
+	assert.Equal(t, 1, vari.Meta["param_required"])
+	assert.Equal(t, true, vari.Meta["param_variadic"])
 
 	nullary := byID["Ext.cs::Ext.Nullary"]
 	require.NotNil(t, nullary)
