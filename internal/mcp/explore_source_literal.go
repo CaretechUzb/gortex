@@ -528,7 +528,7 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 			orderedPaths = append(orderedPaths, alias)
 		}
 	}
-	indexes := s.buildFileSymbolIndexForOrderedPathsContext(ctx, orderedPaths)
+	indexes := s.buildFileSymbolIndexForOrderedPathsScopedContext(ctx, orderedPaths, scope)
 	type mappedLiteralOwner struct {
 		owner    *graph.Node
 		match    trigram.Match

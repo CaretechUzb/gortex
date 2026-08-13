@@ -321,7 +321,7 @@ func exploreSourceRangeLines(tail string) (int, int, bool) {
 // line falls inside one, the enclosing named method/function remains the useful
 // localization symbol (for example FingersCrossedHandler::flushBuffer).
 func exploreSourceRangeDefinitions(index *fileSymbolIndex, start, end int) []*graph.Node {
-	if index == nil {
+	if index == nil || index.saturated {
 		return nil
 	}
 	if end < start {
@@ -455,7 +455,7 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 	if len(resolved) == 0 {
 		return ordinary
 	}
-	indexes := s.buildFileSymbolIndexForOrderedPathsContext(ctx, orderedPaths)
+	indexes := s.buildFileSymbolIndexForOrderedPathsScopedContext(ctx, orderedPaths, scope)
 	exactNodes := make([]*graph.Node, 0, len(resolved))
 	seenNodes := make(map[string]struct{}, len(resolved))
 	for _, item := range resolved {

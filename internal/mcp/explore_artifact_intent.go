@@ -389,7 +389,8 @@ func (s *Server) gatherExploreArtifactLane(ctx context.Context, intent exploreAr
 		} else {
 			matches = s.indexer.GrepText(probe, exploreArtifactTextHitLimit)
 		}
-		for _, match := range s.enrichTextMatches(matches) {
+		enriched, _ := s.enrichTextMatchesContext(ctx, matches, scope)
+		for _, match := range enriched {
 			hit := byPath[strings.ToLower(strings.ReplaceAll(match.Path, "\\", "/"))]
 			if hit == nil || !exploreArtifactFile(hit.path) {
 				continue

@@ -109,7 +109,7 @@ func (s *Server) searchSymbolsContentFallback(
 		return nil
 	}
 
-	enriched := s.enrichTextMatches(exact)
+	enriched, _ := s.enrichTextMatchesContext(boundedCtx, exact, scope)
 	if len(enriched) == 0 {
 		return nil
 	}

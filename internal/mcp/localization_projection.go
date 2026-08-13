@@ -12,6 +12,18 @@ func (s *Server) localizationNodeScope(
 	opts query.QueryOptions,
 	kinds ...graph.NodeKind,
 ) graph.LocalizationNodeScope {
+	return s.localizationNodeScopeWithTests(ctx, opts, true, kinds...)
+}
+
+// localizationNodeScopeWithTests keeps request/session intersection identical
+// across localization projections while letting file ownership include test
+// declarations without transferring metadata from SQLite.
+func (s *Server) localizationNodeScopeWithTests(
+	ctx context.Context,
+	opts query.QueryOptions,
+	excludeTests bool,
+	kinds ...graph.NodeKind,
+) graph.LocalizationNodeScope {
 	if session, bound := s.sessionScopeOptions(ctx); bound {
 		switch {
 		case opts.WorkspaceID == "":
@@ -38,7 +50,7 @@ func (s *Server) localizationNodeScope(
 		WorkspaceID:  opts.WorkspaceID,
 		ProjectID:    opts.ProjectID,
 		RepoAllow:    opts.RepoAllow,
-		ExcludeTests: true,
+		ExcludeTests: excludeTests,
 	}
 	if len(kinds) > 0 {
 		scope.Kinds = make(map[graph.NodeKind]bool, len(kinds))

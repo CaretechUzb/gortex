@@ -109,8 +109,8 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 		matches = limitTextMatches(matches, limit)
 	}
 
-	enriched := s.enrichTextMatches(matches)
-	s.captureLocalizationSearchText(ctx, enriched)
+	enriched, fileIndexes := s.enrichTextMatchesContext(ctx, matches, queryOptionsForResolvedScope(resolved))
+	s.captureLocalizationSearchText(ctx, enriched, fileIndexes)
 	resp := map[string]any{
 		"query":   query,
 		"matches": enriched,
@@ -228,35 +228,49 @@ func graphMatchPathKey(path string, repoPrefixed bool) string {
 	return filepath.FromSlash(path)
 }
 
-// enrichTextMatches decorates every trigram match with its enclosing
-// graph symbol. It builds one per-file symbol index for the set of
-// matched files, then resolves each match's line through it.
-//
-// The index is queried under both path spellings: file nodes are fetched
-// and keyed by the graph's own FilePath, which on Windows is not the
-// forward-slash path the match carries.
+// enrichTextMatches decorates every trigram match with its enclosing graph
+// symbol through the bounded file projection. The compatibility wrapper keeps
+// non-request tests/callers bounded; request paths use enrichTextMatchesContext
+// so storage receives the effective request/session scope.
 func (s *Server) enrichTextMatches(matches []trigram.Match) []enrichedTextMatch {
+	enriched, _ := s.enrichTextMatchesContext(context.Background(), matches, query.QueryOptions{})
+	return enriched
+}
+
+// enrichTextMatchesContext returns the same file indexes used for enrichment so
+// localization evidence capture never repeats the file scan. Exact and Windows
+// path spellings share the request-wide 4096-node budget.
+func (s *Server) enrichTextMatchesContext(
+	ctx context.Context,
+	matches []trigram.Match,
+	opts query.QueryOptions,
+) ([]enrichedTextMatch, map[string]*fileSymbolIndex) {
 	out := make([]enrichedTextMatch, 0, len(matches))
 	paths := make(map[string]struct{}, len(matches))
-	for _, m := range matches {
-		paths[m.Path] = struct{}{}
-		if key := graphMatchPathKey(m.Path, true); key != m.Path {
+	for _, match := range matches {
+		paths[match.Path] = struct{}{}
+		if key := graphMatchPathKey(match.Path, true); key != match.Path {
 			paths[key] = struct{}{}
 		}
 	}
-	idx := s.buildFileSymbolIndexForPaths(paths)
-	for _, m := range matches {
-		em := enrichedTextMatch{Path: m.Path, Line: m.Line, Text: m.Text}
-		fi := idx[m.Path]
-		if fi == nil {
-			if key := graphMatchPathKey(m.Path, true); key != m.Path {
-				fi = idx[key]
-			}
+	indexes := s.buildFileSymbolIndexForPathsScopedContext(ctx, paths, opts)
+	for _, match := range matches {
+		enriched := enrichedTextMatch{Path: match.Path, Line: match.Line, Text: match.Text}
+		index := fileSymbolIndexForPath(indexes, match.Path)
+		if index != nil {
+			enriched.SymbolID, enriched.SymbolName = index.find(match.Line)
 		}
-		if fi != nil {
-			em.SymbolID, em.SymbolName = fi.find(m.Line)
-		}
-		out = append(out, em)
+		out = append(out, enriched)
 	}
-	return out
+	return out, indexes
+}
+
+func fileSymbolIndexForPath(indexes map[string]*fileSymbolIndex, path string) *fileSymbolIndex {
+	if index := indexes[path]; index != nil {
+		return index
+	}
+	if key := graphMatchPathKey(path, true); key != path {
+		return indexes[key]
+	}
+	return nil
 }

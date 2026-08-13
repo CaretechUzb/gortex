@@ -712,18 +712,20 @@ func captureLocalizationSearchSymbols(ctx context.Context, nodes []*graph.Node) 
 }
 
 // captureLocalizationSearchText promotes only graph-backed identities from the
-// typed search.text page. A file-level literal may have no enclosing SymbolID;
-// in that case the matching path and line are resolved back to the narrowest
-// in-scope graph declaration, or finally to the graph's file node. Rendered MCP
-// Content is never parsed as evidence.
-func (s *Server) captureLocalizationSearchText(ctx context.Context, matches []enrichedTextMatch) {
+// typed search.text page. It reuses the exact bounded file indexes built for
+// enrichment, so a permitted-evidence capture never repeats a file scan.
+func (s *Server) captureLocalizationSearchText(
+	ctx context.Context,
+	matches []enrichedTextMatch,
+	indexes map[string]*fileSymbolIndex,
+) {
 	capture, _ := ctx.Value(localizationPermittedEvidenceCaptureKey{}).(*localizationPermittedEvidenceCapture)
 	if capture == nil {
 		return
 	}
 	rows := make([]localizationDigestRow, 0, len(matches))
 	for _, match := range matches {
-		node, provenance := s.localizationTextMatchNode(ctx, match)
+		node, provenance := s.localizationTextMatchNode(ctx, match, indexes)
 		if row, ok := localizationDigestRowFromNode(node, provenance); ok {
 			if match.Line > 0 {
 				row.Line = match.Line
@@ -734,7 +736,11 @@ func (s *Server) captureLocalizationSearchText(ctx context.Context, matches []en
 	captureLocalizationRows(ctx, rows)
 }
 
-func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTextMatch) (*graph.Node, string) {
+func (s *Server) localizationTextMatchNode(
+	ctx context.Context,
+	match enrichedTextMatch,
+	indexes map[string]*fileSymbolIndex,
+) (*graph.Node, string) {
 	if s == nil {
 		return nil, ""
 	}
@@ -742,6 +748,8 @@ func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTe
 	if reader == nil {
 		return nil, ""
 	}
+	// Preserve the typed SymbolID path exactly: an already-enriched hit needs
+	// one identity lookup, not another file projection.
 	if id := strings.TrimSpace(match.SymbolID); id != "" {
 		if node := reader.GetNode(id); node != nil && s.nodeInSessionScope(ctx, node) {
 			return node, "permitted_search_text"
@@ -752,45 +760,15 @@ func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTe
 	if path == "" {
 		return nil, ""
 	}
-	var owner *graph.Node
-	var fileNode *graph.Node
-	ownerSpan := int(^uint(0) >> 1)
-	for _, node := range reader.GetFileNodes(path) {
-		if node == nil || !s.nodeInSessionScope(ctx, node) {
-			continue
-		}
-		if node.Kind == graph.KindFile {
-			if fileNode == nil || node.ID < fileNode.ID {
-				fileNode = node
-			}
-			continue
-		}
-		if match.Line <= 0 || node.StartLine <= 0 || node.StartLine > match.Line || !exploreLocalizableKind(node.Kind) {
-			continue
-		}
-		end := node.EndLine
-		if end <= 0 {
-			end = node.StartLine
-		}
-		if end < match.Line {
-			continue
-		}
-		span := end - node.StartLine
-		if owner == nil || span < ownerSpan || (span == ownerSpan && node.ID < owner.ID) {
-			owner = node
-			ownerSpan = span
-		}
+	index := fileSymbolIndexForPath(indexes, path)
+	if index == nil || index.saturated {
+		return nil, ""
 	}
-	if owner != nil {
+	if owner := index.smallestEnclosing(match.Line); owner != nil && s.nodeInSessionScope(ctx, owner) {
 		return owner, "permitted_search_text_owner"
 	}
-	if fileNode == nil {
-		if node := reader.GetNode(path); node != nil && node.Kind == graph.KindFile && s.nodeInSessionScope(ctx, node) {
-			fileNode = node
-		}
-	}
-	if fileNode != nil {
-		return fileNode, "permitted_search_text_file"
+	if index.fileNode != nil && s.nodeInSessionScope(ctx, index.fileNode) {
+		return index.fileNode, "permitted_search_text_file"
 	}
 	return nil, ""
 }

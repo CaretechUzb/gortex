@@ -48,18 +48,32 @@ func (s *exploreSourceLiteralCountingStore) GetNodesByIDs(ids []string) map[stri
 	return s.Store.GetNodesByIDs(ids)
 }
 
+func (s *exploreSourceLiteralCountingStore) FindFileNodesBounded(
+	ctx context.Context,
+	path string,
+	scope graph.LocalizationNodeScope,
+	limit int,
+) (graph.BoundedNodeProjection, error) {
+	return s.Store.(graph.BoundedFileNodeReader).FindFileNodesBounded(ctx, path, scope, limit)
+}
+
 type exploreSourceLiteralBlockingStore struct {
 	graph.Store
 	started chan struct{}
 }
 
-func (s *exploreSourceLiteralBlockingStore) GetFileNodesContext(ctx context.Context, _ string) []*graph.Node {
+func (s *exploreSourceLiteralBlockingStore) FindFileNodesBounded(
+	ctx context.Context,
+	_ string,
+	_ graph.LocalizationNodeScope,
+	_ int,
+) (graph.BoundedNodeProjection, error) {
 	select {
 	case s.started <- struct{}{}:
 	default:
 	}
 	<-ctx.Done()
-	return nil
+	return graph.BoundedNodeProjection{}, ctx.Err()
 }
 
 type exploreSourceLiteralOrderedStore struct {
@@ -69,13 +83,26 @@ type exploreSourceLiteralOrderedStore struct {
 	calls       []string
 }
 
-func (s *exploreSourceLiteralOrderedStore) GetFileNodesContext(ctx context.Context, path string) []*graph.Node {
+func (s *exploreSourceLiteralOrderedStore) FindFileNodesBounded(
+	ctx context.Context,
+	path string,
+	_ graph.LocalizationNodeScope,
+	limit int,
+) (graph.BoundedNodeProjection, error) {
 	s.calls = append(s.calls, path)
 	if path == s.blockPath {
 		<-ctx.Done()
-		return nil
+		return graph.BoundedNodeProjection{}, ctx.Err()
 	}
-	return s.nodesByPath[path]
+	nodes := s.nodesByPath[path]
+	if len(nodes) <= limit {
+		return graph.BoundedNodeProjection{Nodes: nodes, Total: len(nodes)}, nil
+	}
+	return graph.BoundedNodeProjection{
+		Nodes:     nodes[:limit],
+		Total:     limit + 1,
+		Truncated: true,
+	}, nil
 }
 
 func (s *exploreSourceLiteralOrderedStore) GetOutEdgesByNodeIDs([]string) map[string][]*graph.Edge {
