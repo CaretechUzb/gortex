@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -356,7 +357,74 @@ func validBatchExpectedSHA256(expected string) bool {
 	return err == nil && len(decoded) == sha256.Size
 }
 
-func readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFileBuffer, []string, error) {
+// guardBatchLifecycleDestination rejects every symlink component below the
+// lexical repository root. General file resolution permits in-repo symlinks,
+// which is correct for reads, but a move destination must not redirect a
+// transaction write through either a symlink leaf or a symlinked parent.
+// The repository root itself is deliberately not inspected so checkouts under
+// symlinked system prefixes remain valid.
+func (s *Server) guardBatchLifecycleDestination(absPath string) error {
+	cleanPath := filepath.Clean(absPath)
+	root := ""
+	considerRoot := func(candidate string) {
+		candidate = filepath.Clean(candidate)
+		if pathContainedIn(cleanPath, candidate) && len(candidate) > len(root) {
+			root = candidate
+		}
+	}
+	if s.multiIndexer != nil {
+		for _, prefix := range s.multiIndexer.RepoPrefixes() {
+			if candidate, ok := s.multiIndexer.RepoRoot(prefix); ok {
+				considerRoot(candidate)
+			}
+		}
+	}
+	if s.indexer != nil && s.indexer.RootPath() != "" {
+		considerRoot(s.indexer.RootPath())
+	}
+	if root == "" {
+		return nil
+	}
+
+	rel, err := filepath.Rel(root, cleanPath)
+	if err != nil {
+		return fmt.Errorf("could not inspect move destination %s: %w", cleanPath, err)
+	}
+	current := root
+	for _, component := range strings.Split(rel, string(filepath.Separator)) {
+		if component == "" || component == "." {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, statErr := os.Lstat(current)
+		switch {
+		case errors.Is(statErr, os.ErrNotExist):
+			return nil
+		case statErr != nil:
+			return fmt.Errorf("could not inspect move destination %s: %w", current, statErr)
+		case info.Mode()&os.ModeSymlink != 0:
+			return fmt.Errorf("move destination contains symlink component %s", current)
+		}
+	}
+	return nil
+}
+
+func (s *Server) validateBatchCreateTarget(absPath, relPath string) error {
+	if err := s.guardBatchLifecycleDestination(absPath); err != nil {
+		return err
+	}
+	_, err := os.Lstat(absPath)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	case err != nil:
+		return fmt.Errorf("could not stat %s: %w", relPath, err)
+	default:
+		return fmt.Errorf("destination already exists")
+	}
+}
+
+func (s *Server) readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFileBuffer, []string, error) {
 	buffers := make(map[string]*batchFileBuffer)
 	paths := make([]string, 0)
 	add := func(path, relPath string) error {
@@ -392,6 +460,9 @@ func readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFileBuffer, []
 			return nil, nil, err
 		}
 		if plan.destinationPath != "" {
+			if err := s.guardBatchLifecycleDestination(plan.destinationPath); err != nil {
+				return nil, nil, err
+			}
 			if err := add(plan.destinationPath, plan.destination); err != nil {
 				return nil, nil, err
 			}
@@ -608,7 +679,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", receipt.Results[0].Error), nil
 	}
 
-	buffers, orderedPaths, readErr := readBatchBuffers(plans)
+	buffers, orderedPaths, readErr := s.readBatchBuffers(plans)
 	if readErr != nil {
 		receipt.Results = batchFailureResults(plans, 0, readErr.Error())
 		receipt.Summary = batchSummary(receipt.Results)
@@ -658,7 +729,15 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		buffer := buffers[path]
 		var commitErr error
 		if buffer.existsAfter {
-			commitErr = writer(path, buffer.content, buffer.mode)
+			if !buffer.existsBefore {
+				if targetErr := s.validateBatchCreateTarget(path, buffer.relPath); targetErr != nil {
+					commitErr = targetErr
+				} else {
+					commitErr = writer(path, buffer.content, buffer.mode)
+				}
+			} else {
+				commitErr = writer(path, buffer.content, buffer.mode)
+			}
 		} else {
 			commitErr = remover(path)
 		}
