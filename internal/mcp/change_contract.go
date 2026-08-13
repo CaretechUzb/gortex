@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -129,6 +130,7 @@ type prediction struct {
 	step         *simulationStep
 	impact       *analysis.ImpactResult
 	touchedFiles []string
+	repoPrefixes []string
 }
 
 // nodesForIDs resolves symbol IDs to graph nodes, dropping any that no longer
@@ -345,6 +347,7 @@ func (s *Server) lowerDiffSource(ctx context.Context, req mcp.CallToolRequest) (
 		nodes:        s.nodesForIDs(ids),
 		impact:       s.analyzeImpactLazy(ctx, ids),
 		touchedFiles: diff.ChangedFiles,
+		repoPrefixes: []string{repoPrefix},
 	}, nil
 }
 
@@ -503,9 +506,61 @@ func classifyChange(p *prediction) string {
 	return "behavioral"
 }
 
+// verificationRepoPrefixes returns every repository that contributes to the
+// predicted change or its impact. A command without a working-directory scope
+// is only safe when this set contains at most one repository.
+func verificationRepoPrefixes(p *prediction) []string {
+	prefixes := map[string]bool{}
+	for _, prefix := range p.repoPrefixes {
+		if prefix = strings.TrimSpace(prefix); prefix != "" {
+			prefixes[prefix] = true
+		}
+	}
+	for _, n := range p.nodes {
+		if n != nil && n.RepoPrefix != "" {
+			prefixes[n.RepoPrefix] = true
+		}
+	}
+	if p.impact != nil {
+		for prefix := range p.impact.ByRepo {
+			if prefix != "" {
+				prefixes[prefix] = true
+			}
+		}
+	}
+
+	out := make([]string, 0, len(prefixes))
+	for prefix := range prefixes {
+		out = append(out, prefix)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func repoLocalVerificationPath(file, repoPrefix string) string {
+	file = strings.TrimPrefix(strings.ReplaceAll(file, "\\", "/"), "./")
+	prefix := strings.Trim(strings.ReplaceAll(repoPrefix, "\\", "/"), "/")
+	if prefix != "" {
+		file = strings.TrimPrefix(file, prefix+"/")
+	}
+	return file
+}
+
+func verificationPackageDir(file, repoPrefix string, recursive bool) string {
+	dir := path.Dir(repoLocalVerificationPath(file, repoPrefix))
+	pkg := "."
+	if dir != "." && dir != "" {
+		pkg = "./" + strings.TrimPrefix(dir, "/")
+	}
+	if recursive {
+		return strings.TrimSuffix(pkg, "/") + "/..."
+	}
+	return pkg
+}
+
 // buildVerificationCommand synthesises the command that proves the change is
 // safe — drawn from the covering tests of the changed set.
-func buildVerificationCommand(p *prediction) string {
+func buildVerificationCommand(p *prediction) (string, error) {
 	testFiles := map[string]bool{}
 	if p.impact != nil {
 		for _, f := range p.impact.TestFiles {
@@ -514,7 +569,7 @@ func buildVerificationCommand(p *prediction) string {
 	}
 	if p.step != nil {
 		for _, t := range p.step.testTargets {
-			if strings.HasSuffix(t, "_test.go") {
+			if strings.HasSuffix(strings.ReplaceAll(t, "\\", "/"), "_test.go") {
 				testFiles[t] = true
 			}
 		}
@@ -522,16 +577,28 @@ func buildVerificationCommand(p *prediction) string {
 
 	goChange := false
 	for _, f := range p.touchedFiles {
-		if strings.HasSuffix(f, ".go") {
+		if strings.HasSuffix(strings.ReplaceAll(f, "\\", "/"), ".go") {
 			goChange = true
 			break
 		}
+	}
+	if len(testFiles) == 0 && !goChange {
+		return "", nil
+	}
+
+	prefixes := verificationRepoPrefixes(p)
+	if len(prefixes) > 1 {
+		return "", fmt.Errorf("cannot synthesize one verification command for multiple repositories: %s", strings.Join(prefixes, ", "))
+	}
+	repoPrefix := ""
+	if len(prefixes) == 1 {
+		repoPrefix = prefixes[0]
 	}
 
 	if len(testFiles) > 0 {
 		dirs := map[string]bool{}
 		for f := range testFiles {
-			dirs["./"+filepath.ToSlash(filepath.Dir(f))] = true
+			dirs[verificationPackageDir(f, repoPrefix, false)] = true
 		}
 		ds := make([]string, 0, len(dirs))
 		for d := range dirs {
@@ -539,29 +606,26 @@ func buildVerificationCommand(p *prediction) string {
 		}
 		sort.Strings(ds)
 		if goChange {
-			return "go test -race " + strings.Join(ds, " ")
+			return "go test -race " + strings.Join(ds, " "), nil
 		}
-		return "run the covering tests in: " + strings.Join(ds, " ")
+		return "run the covering tests in: " + strings.Join(ds, " "), nil
 	}
 
-	if goChange {
-		dirs := map[string]bool{}
-		for _, f := range p.touchedFiles {
-			if strings.HasSuffix(f, ".go") {
-				dirs["./"+filepath.ToSlash(filepath.Dir(f))+"/..."] = true
-			}
+	dirs := map[string]bool{}
+	for _, f := range p.touchedFiles {
+		if strings.HasSuffix(strings.ReplaceAll(f, "\\", "/"), ".go") {
+			dirs[verificationPackageDir(f, repoPrefix, true)] = true
 		}
-		ds := make([]string, 0, len(dirs))
-		for d := range dirs {
-			ds = append(ds, d)
-		}
-		sort.Strings(ds)
-		if len(ds) > 0 {
-			return "go build " + strings.Join(ds, " ") + " && go test -race " + strings.Join(ds, " ")
-		}
-		return "go build ./... && go test -race ./..."
 	}
-	return ""
+	ds := make([]string, 0, len(dirs))
+	for d := range dirs {
+		ds = append(ds, d)
+	}
+	sort.Strings(ds)
+	if len(ds) > 0 {
+		return "go build " + strings.Join(ds, " ") + " && go test -race " + strings.Join(ds, " "), nil
+	}
+	return "go build ./... && go test -race ./...", nil
 }
 
 // buildStopCondition states the checkable predicate that, once true, means the
@@ -657,7 +721,16 @@ func (s *Server) assembleEnvelope(p *prediction, violations []analysis.GuardViol
 		}
 	}
 
-	verCmd := buildVerificationCommand(p)
+	verCmd, verificationErr := buildVerificationCommand(p)
+	if verificationErr != nil {
+		reasons = append(reasons, changeReason{
+			Family:     "verification",
+			Severity:   "warn",
+			Message:    verificationErr.Error(),
+			Confidence: 1,
+		})
+		verdict = escalate(verdict, verdictWarn)
+	}
 	classification := classifyChange(p)
 
 	env := changeEnvelope{
