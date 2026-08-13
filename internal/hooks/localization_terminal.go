@@ -29,6 +29,7 @@ const (
 	localizationTerminalDenyReason = "[Gortex] Localization for this task is complete, so this tool call is blocked. Answer now from the retained evidence below, naming what you rely on; if it does not fit the request, say so in your answer."
 	localizationAdvisoryDenyReason = "[Gortex] Localization for this task is complete, so this additional Gortex navigation call was not run. Answer now from the retained evidence below, naming what you rely on; if it does not fit the request, say so in your answer."
 	gortexPluginMCPToolPrefix      = "mcp__plugin_gortex_gortex__"
+	gortexCodexMCPToolPrefix       = "gortex__"
 	localizationHostMetaKey        = "gortex/localization"
 )
 
@@ -353,7 +354,8 @@ func localizationNavigationTool(tool string) bool {
 }
 
 func isGortexMCPToolName(tool string) bool {
-	return strings.HasPrefix(tool, gortexMCPToolPrefix) || strings.HasPrefix(tool, gortexPluginMCPToolPrefix)
+	return strings.HasPrefix(tool, gortexMCPToolPrefix) || strings.HasPrefix(tool, gortexPluginMCPToolPrefix) ||
+		strings.HasPrefix(tool, gortexCodexMCPToolPrefix)
 }
 
 func preToolUsePolicyTool(tool string) bool {

@@ -133,7 +133,8 @@ func gortexReadAdvisory(toolName, path string) string {
 // mcp__plugin_gortex_gortex__. The advisory should display only the operation.
 func shortGortexToolName(toolName string) string {
 	toolName = strings.TrimPrefix(toolName, gortexMCPToolPrefix)
-	return strings.TrimPrefix(toolName, gortexPluginMCPToolPrefix)
+	toolName = strings.TrimPrefix(toolName, gortexPluginMCPToolPrefix)
+	return strings.TrimPrefix(toolName, gortexCodexMCPToolPrefix)
 }
 
 // hasReadSizeCap reports whether the read already bounds its output via a
