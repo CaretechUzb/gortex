@@ -256,6 +256,104 @@ func TestFinalizeExploreSourceLiteralSearchRetainsOnlySafePartialEvidence(t *tes
 	}
 }
 
+func TestRunExploreSourceLiteralLanesOrdersAndBoundsWork(t *testing.T) {
+	productionOverlay := trigram.Match{Path: "overlay.go", Line: 1, Text: "needle"}
+	testOverlay := trigram.Match{Path: "a_test.go", Line: 1, Text: "needle"}
+	productionDurable := trigram.Match{Path: "durable.go", Line: 1, Text: "needle"}
+
+	t.Run("overlay scans before durable and wins within production", func(t *testing.T) {
+		order := make([]string, 0, 2)
+		result := runExploreSourceLiteralLanes(
+			context.Background(), "needle", "repo", 2,
+			[]exploreSourceLiteralOverlayFile{{path: "overlay.go"}}, map[string]struct{}{"overlay.go": {}}, false, false,
+			func(context.Context, string, []exploreSourceLiteralOverlayFile, int) (exploreSourceLiteralOverlayScan, error) {
+				order = append(order, "overlay")
+				return exploreSourceLiteralOverlayScan{matches: []trigram.Match{productionOverlay}}, nil
+			},
+			func(context.Context, string, string, int) exploreSourceLiteralSearch {
+				order = append(order, "durable")
+				return exploreSourceLiteralSearch{matches: []trigram.Match{productionDurable}, backend: "direct", owned: true}
+			},
+		)
+		if strings.Join(order, ",") != "overlay,durable" {
+			t.Fatalf("lane order = %v", order)
+		}
+		if len(result.matches) != 2 || result.matches[0].Path != "overlay.go" || result.matches[1].Path != "durable.go" {
+			t.Fatalf("matches = %#v", result.matches)
+		}
+	})
+
+	t.Run("durable production outranks overlay test", func(t *testing.T) {
+		result := runExploreSourceLiteralLanes(
+			context.Background(), "needle", "repo", 2,
+			[]exploreSourceLiteralOverlayFile{{path: "a_test.go"}}, map[string]struct{}{"a_test.go": {}}, false, false,
+			func(context.Context, string, []exploreSourceLiteralOverlayFile, int) (exploreSourceLiteralOverlayScan, error) {
+				return exploreSourceLiteralOverlayScan{matches: []trigram.Match{testOverlay}}, nil
+			},
+			func(context.Context, string, string, int) exploreSourceLiteralSearch {
+				return exploreSourceLiteralSearch{matches: []trigram.Match{productionDurable}, backend: "direct", owned: true}
+			},
+		)
+		if len(result.matches) != 2 || result.matches[0].Path != "durable.go" || result.matches[1].Path != "a_test.go" {
+			t.Fatalf("matches = %#v", result.matches)
+		}
+	})
+
+	t.Run("full production overlay skips durable", func(t *testing.T) {
+		durableCalls := 0
+		result := runExploreSourceLiteralLanes(
+			context.Background(), "needle", "repo", 1,
+			[]exploreSourceLiteralOverlayFile{{path: "overlay.go"}}, map[string]struct{}{"overlay.go": {}}, false, false,
+			func(context.Context, string, []exploreSourceLiteralOverlayFile, int) (exploreSourceLiteralOverlayScan, error) {
+				return exploreSourceLiteralOverlayScan{matches: []trigram.Match{productionOverlay}}, nil
+			},
+			func(context.Context, string, string, int) exploreSourceLiteralSearch {
+				durableCalls++
+				return exploreSourceLiteralSearch{}
+			},
+		)
+		if durableCalls != 0 || !result.incomplete || len(result.matches) != 1 || result.matches[0].Path != "overlay.go" {
+			t.Fatalf("durable calls=%d incomplete=%v matches=%#v", durableCalls, result.incomplete, result.matches)
+		}
+	})
+
+	t.Run("no overlay preserves durable order and skips scanner", func(t *testing.T) {
+		scanCalls := 0
+		durable := []trigram.Match{{Path: "z.go", Line: 1}, {Path: "a.go", Line: 1}}
+		result := runExploreSourceLiteralLanes(
+			context.Background(), "needle", "repo", 2, nil, nil, false, false,
+			func(context.Context, string, []exploreSourceLiteralOverlayFile, int) (exploreSourceLiteralOverlayScan, error) {
+				scanCalls++
+				return exploreSourceLiteralOverlayScan{}, nil
+			},
+			func(context.Context, string, string, int) exploreSourceLiteralSearch {
+				return exploreSourceLiteralSearch{matches: durable, backend: "direct", owned: true}
+			},
+		)
+		if scanCalls != 0 || result.matches[0].Path != "z.go" || result.matches[1].Path != "a.go" {
+			t.Fatalf("scan calls=%d matches=%#v", scanCalls, result.matches)
+		}
+	})
+
+	t.Run("scan error returns safe partial without durable", func(t *testing.T) {
+		durableCalls := 0
+		result := runExploreSourceLiteralLanes(
+			context.Background(), "needle", "repo", 2,
+			[]exploreSourceLiteralOverlayFile{{path: "overlay.go"}}, map[string]struct{}{"shadowed.go": {}}, false, false,
+			func(context.Context, string, []exploreSourceLiteralOverlayFile, int) (exploreSourceLiteralOverlayScan, error) {
+				return exploreSourceLiteralOverlayScan{matches: []trigram.Match{productionOverlay}, incomplete: true}, context.DeadlineExceeded
+			},
+			func(context.Context, string, string, int) exploreSourceLiteralSearch {
+				durableCalls++
+				return exploreSourceLiteralSearch{}
+			},
+		)
+		if durableCalls != 0 || result.err != context.DeadlineExceeded || !result.incomplete || len(result.matches) != 1 {
+			t.Fatalf("durable calls=%d result=%#v", durableCalls, result)
+		}
+	})
+}
+
 func TestMergeExploreSourceLiteralMatchesOverlayWinsAndSortsBeforeLimit(t *testing.T) {
 	overlay := []trigram.Match{
 		{Path: `repo\\same.go`, Line: 9, Text: "overlay replacement"},
@@ -273,14 +371,14 @@ func TestMergeExploreSourceLiteralMatchesOverlayWinsAndSortsBeforeLimit(t *testi
 	if incomplete || len(matches) != 3 {
 		t.Fatalf("full merge = %#v incomplete=%v", matches, incomplete)
 	}
-	if matches[0].Path != "repo/a.go" || matches[1].Text != "overlay replacement" || matches[2].Path != "repo/z.go" {
+	if matches[0].Text != "overlay replacement" || matches[1].Path != "repo/z.go" || matches[2].Path != "repo/a.go" {
 		t.Fatalf("merge order/precedence = %#v", matches)
 	}
 
 	capped, incomplete := mergeExploreSourceLiteralMatches(overlay, durable, map[string]struct{}{
 		"repo/same.go": {},
 	}, 2)
-	if !incomplete || len(capped) != 2 || capped[1].Text != "overlay replacement" {
+	if !incomplete || len(capped) != 2 || capped[0].Text != "overlay replacement" || capped[1].Path != "repo/z.go" {
 		t.Fatalf("capped merge = %#v incomplete=%v", capped, incomplete)
 	}
 }

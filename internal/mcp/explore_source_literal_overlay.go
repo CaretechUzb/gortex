@@ -307,9 +307,13 @@ func mergeExploreSourceLiteralMatches(
 	if maxHits > 0 && maxHits < limit {
 		limit = maxHits
 	}
-	matches = make([]trigram.Match, 0, len(overlay)+len(durable))
+	type rankedMatch struct {
+		match   trigram.Match
+		overlay bool
+	}
+	ranked := make([]rankedMatch, 0, len(overlay)+len(durable))
 	seen := make(map[string]struct{}, len(overlay)+len(durable))
-	appendUnique := func(match trigram.Match) {
+	appendUnique := func(match trigram.Match, fromOverlay bool) {
 		match.Path = canonicalExploreSourceLiteralPath(match.Path)
 		if match.Path == "" {
 			return
@@ -320,27 +324,39 @@ func mergeExploreSourceLiteralMatches(
 		}
 		seen[key] = struct{}{}
 		match.Text = strings.Clone(match.Text)
-		matches = append(matches, match)
+		ranked = append(ranked, rankedMatch{match: match, overlay: fromOverlay})
 	}
 	for _, match := range overlay {
-		appendUnique(match)
+		appendUnique(match, true)
 	}
 	for _, match := range durable {
 		canonical := canonicalExploreSourceLiteralPath(match.Path)
 		if _, shadowed := covered[canonical]; shadowed {
 			continue
 		}
-		appendUnique(match)
+		appendUnique(match, false)
 	}
-	sort.SliceStable(matches, func(i, j int) bool {
-		if matches[i].Path != matches[j].Path {
-			return exploreSourceLiteralPathLess(matches[i].Path, matches[j].Path)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		left, right := ranked[i], ranked[j]
+		leftTest, rightTest := testpath.IsTestFile(left.match.Path), testpath.IsTestFile(right.match.Path)
+		if leftTest != rightTest {
+			return !leftTest
 		}
-		if matches[i].Line != matches[j].Line {
-			return matches[i].Line < matches[j].Line
+		if left.overlay != right.overlay {
+			return left.overlay
 		}
-		return matches[i].Text < matches[j].Text
+		if left.match.Path != right.match.Path {
+			return left.match.Path < right.match.Path
+		}
+		if left.match.Line != right.match.Line {
+			return left.match.Line < right.match.Line
+		}
+		return left.match.Text < right.match.Text
 	})
+	matches = make([]trigram.Match, 0, len(ranked))
+	for _, rankedMatch := range ranked {
+		matches = append(matches, rankedMatch.match)
+	}
 	if len(matches) > limit {
 		matches = matches[:limit]
 		incomplete = true

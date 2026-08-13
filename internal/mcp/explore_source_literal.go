@@ -13,6 +13,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/trigram"
+	"github.com/zzet/gortex/internal/testpath"
 )
 
 const (
@@ -867,6 +868,117 @@ func finalizeExploreSourceLiteralSearch(
 	return result
 }
 
+type exploreSourceLiteralOverlayScanner func(
+	context.Context, string, []exploreSourceLiteralOverlayFile, int,
+) (exploreSourceLiteralOverlayScan, error)
+
+type exploreSourceLiteralDurableSearcher func(
+	context.Context, string, string, int,
+) exploreSourceLiteralSearch
+
+func runExploreSourceLiteralLanes(
+	ctx context.Context,
+	term string,
+	repoPrefix string,
+	maxHits int,
+	overlayFiles []exploreSourceLiteralOverlayFile,
+	covered map[string]struct{},
+	overlayIncomplete bool,
+	coveredOverflow bool,
+	scanOverlay exploreSourceLiteralOverlayScanner,
+	searchDurable exploreSourceLiteralDurableSearcher,
+) exploreSourceLiteralSearch {
+	if maxHits <= 0 || maxHits > exploreSourceLiteralOverlayMaxHits {
+		maxHits = exploreSourceLiteralOverlayMaxHits
+	}
+	if coveredOverflow {
+		return exploreSourceLiteralSearch{
+			backend: "overlay-covered-cap", lookupRepoPrefix: repoPrefix, incomplete: true, owned: true,
+		}
+	}
+	if len(overlayFiles) == 0 && len(covered) == 0 {
+		result := searchDurable(ctx, term, repoPrefix, maxHits+1)
+		return finalizeExploreSourceLiteralSearch(
+			result, exploreSourceLiteralOverlayScan{}, covered, maxHits, false,
+			overlayIncomplete, ctx.Err(),
+		)
+	}
+
+	overlayScan, scanErr := scanOverlay(ctx, term, overlayFiles, maxHits)
+	if scanErr != nil {
+		return finalizeExploreSourceLiteralSearch(
+			exploreSourceLiteralSearch{backend: "none", lookupRepoPrefix: repoPrefix},
+			overlayScan, covered, maxHits, true, overlayIncomplete, scanErr,
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return finalizeExploreSourceLiteralSearch(
+			exploreSourceLiteralSearch{backend: "none", lookupRepoPrefix: repoPrefix},
+			overlayScan, covered, maxHits, true, overlayIncomplete, err,
+		)
+	}
+	if len(overlayScan.matches) >= maxHits {
+		allProduction := true
+		for _, match := range overlayScan.matches[:maxHits] {
+			if testpath.IsTestFile(match.Path) {
+				allProduction = false
+				break
+			}
+		}
+		if allProduction {
+			overlayScan.incomplete = true // Durable existence is deliberately not probed.
+			return finalizeExploreSourceLiteralSearch(
+				exploreSourceLiteralSearch{backend: "none", lookupRepoPrefix: repoPrefix},
+				overlayScan, covered, maxHits, true, overlayIncomplete, nil,
+			)
+		}
+	}
+
+	result := searchDurable(ctx, term, repoPrefix, maxHits+len(covered)+1)
+	return finalizeExploreSourceLiteralSearch(
+		result, overlayScan, covered, maxHits, true, overlayIncomplete, ctx.Err(),
+	)
+}
+
+func (s *Server) searchExploreSourceLiteralDurable(
+	ctx context.Context,
+	term string,
+	repoPrefix string,
+	durableLimit int,
+) exploreSourceLiteralSearch {
+	result := exploreSourceLiteralSearch{backend: "none", lookupRepoPrefix: repoPrefix}
+	if s.multiIndexer != nil {
+		durable := s.multiIndexer.GrepLiteralForRepoBounded(
+			ctx, repoPrefix, term, durableLimit, exploreSourceLiteralRecallMaxFiles,
+		)
+		if durable.Owned {
+			return exploreSourceLiteralSearch{
+				matches:          s.filterExploreSourceLiteralMatches(ctx, durable.Matches),
+				incomplete:       durable.Incomplete || len(durable.Matches) >= durableLimit,
+				backend:          "multi",
+				owned:            true,
+				lookupRepoPrefix: durable.RepoPrefix,
+			}
+		}
+		if durable.Configured {
+			return exploreSourceLiteralSearch{backend: "multi-unresolved", lookupRepoPrefix: repoPrefix}
+		}
+	}
+	if s.indexer != nil {
+		matches, incomplete := s.indexer.GrepLiteralBounded(
+			ctx, term, durableLimit, exploreSourceLiteralRecallMaxFiles,
+		)
+		return exploreSourceLiteralSearch{
+			matches:          s.filterExploreSourceLiteralMatches(ctx, matches),
+			incomplete:       incomplete || len(matches) >= durableLimit,
+			backend:          "direct",
+			owned:            true,
+			lookupRepoPrefix: s.indexer.RepoPrefix(),
+		}
+	}
+	return result
+}
+
 // searchExploreSourceLiteral mirrors search_text's literal backend while
 // deliberately refusing an unscoped multi-repository fan-out. The caller's
 // session locality supplies repoPrefix in normal operation. maxHits is the
@@ -901,52 +1013,9 @@ func (s *Server) searchExploreSourceLiteral(
 			backend: "overlay", lookupRepoPrefix: repoPrefix, incomplete: true, owned: true, err: overlayErr,
 		}
 	}
-	compensation := len(covered)
-	durableLimit := maxHits + compensation + 1
-
-	result := exploreSourceLiteralSearch{backend: "none", lookupRepoPrefix: repoPrefix}
-	if coveredOverflow {
-		result.backend = "overlay-covered-cap"
-		result.incomplete = true
-		result.owned = true
-	}
-	if !coveredOverflow && s.multiIndexer != nil {
-		durable := s.multiIndexer.GrepLiteralForRepoBounded(
-			ctx, repoPrefix, term, durableLimit, exploreSourceLiteralRecallMaxFiles,
-		)
-		if durable.Owned {
-			result = exploreSourceLiteralSearch{
-				matches:          s.filterExploreSourceLiteralMatches(ctx, durable.Matches),
-				incomplete:       durable.Incomplete || len(durable.Matches) >= durableLimit,
-				backend:          "multi",
-				owned:            true,
-				lookupRepoPrefix: durable.RepoPrefix,
-			}
-		} else if durable.Configured {
-			result = exploreSourceLiteralSearch{backend: "multi-unresolved", lookupRepoPrefix: repoPrefix}
-		}
-	}
-	if !coveredOverflow && !result.owned && result.backend != "multi-unresolved" && result.backend != "multi-ambiguous-scope" && s.indexer != nil {
-		matches, incomplete := s.indexer.GrepLiteralBounded(
-			ctx, term, durableLimit, exploreSourceLiteralRecallMaxFiles,
-		)
-		result = exploreSourceLiteralSearch{
-			matches:          s.filterExploreSourceLiteralMatches(ctx, matches),
-			incomplete:       incomplete || len(matches) >= durableLimit,
-			backend:          "direct",
-			owned:            true,
-			lookupRepoPrefix: s.indexer.RepoPrefix(),
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return finalizeExploreSourceLiteralSearch(
-			result, exploreSourceLiteralOverlayScan{}, covered, maxHits,
-			len(overlayFiles) > 0, overlayIncomplete, err,
-		)
-	}
-	overlayScan, err := scanExploreSourceLiteralOverlays(ctx, term, overlayFiles, maxHits)
-	return finalizeExploreSourceLiteralSearch(
-		result, overlayScan, covered, maxHits,
-		len(overlayFiles) > 0, overlayIncomplete, err,
+	return runExploreSourceLiteralLanes(
+		ctx, term, repoPrefix, maxHits, overlayFiles, covered,
+		overlayIncomplete, coveredOverflow,
+		scanExploreSourceLiteralOverlays, s.searchExploreSourceLiteralDurable,
 	)
 }
