@@ -132,16 +132,13 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// request path; all real work runs on a background goroutine.
 		s.maybeAutoIndexCWD()
 		if injectOverlay {
-			view, err := s.buildOverlayViewForCtx(ctx)
+			var err error
+			ctx, _, err = s.prepareOverlayRequest(ctx)
 			if err != nil {
-				// Drift surfaces as a structured tool error result so the
-				// client knows to re-read and resubmit. Return (result,
-				// nil) so the JSON-RPC framing carries the message rather
-				// than a transport error.
+				// Drift and ownership failures surface as structured tool
+				// errors so the client can refresh and resubmit without a
+				// transport-level failure.
 				return mcp.NewToolResultError(err.Error()), nil
-			}
-			if view != nil {
-				ctx = WithOverlayView(ctx, view)
 			}
 		}
 		// Warmup fast path: when the daemon is still warming up and

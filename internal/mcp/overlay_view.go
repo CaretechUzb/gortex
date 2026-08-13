@@ -23,6 +23,32 @@ import (
 // `s.readerFor(ctx)`. Unexported so external code can't smuggle a
 // view onto an unrelated context.
 type overlayViewCtxKey struct{}
+type overlayRequestSnapshotCtxKey struct{}
+
+// overlayRequestSnapshot is the immutable raw-buffer cohort used to build one
+// request's OverlaidView. OverlayFile strings are immutable; retaining this
+// slice through handler return adds only the copied slice headers and prevents
+// a second manager snapshot from observing a different editor state.
+type overlayRequestSnapshot struct {
+	sessionID string
+	workspace string
+	files     []daemon.OverlayFile
+}
+
+func withOverlayRequestSnapshot(ctx context.Context, snapshot *overlayRequestSnapshot) context.Context {
+	if ctx == nil || snapshot == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, overlayRequestSnapshotCtxKey{}, snapshot)
+}
+
+func overlayRequestSnapshotFromContext(ctx context.Context) (*overlayRequestSnapshot, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	snapshot, ok := ctx.Value(overlayRequestSnapshotCtxKey{}).(*overlayRequestSnapshot)
+	return snapshot, ok && snapshot != nil
+}
 
 // WithOverlayView returns a child context carrying the
 // shadow-graph view for the current `tools/call`. Tool handlers
@@ -101,29 +127,95 @@ type overlayLayerCacheEntry struct {
 	files []string
 }
 
-// buildOverlayViewForCtx is the per-request entry called by
-// wrapToolHandler. Returns (nil, nil) for non-overlay sessions, the
-// overlay-view for overlay-active sessions, or (nil, err) when drift
-// detection trips so the client knows to refresh and resubmit.
-func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidView, error) {
+func (s *Server) snapshotOverlayRequestForCtx(ctx context.Context) (*overlayRequestSnapshot, error) {
 	if s == nil || s.overlays == nil {
 		return nil, nil
 	}
-	sessID := SessionIDFromContext(ctx)
-	if sessID == "" {
+	sessionID := SessionIDFromContext(ctx)
+	if sessionID == "" {
 		return nil, nil
 	}
-	if s.overlays.FileCount(sessID) == 0 {
-		return nil, nil
-	}
-	_, files, err := s.overlays.SnapshotFor(sessID)
+	workspace, files, err := s.overlays.SnapshotFor(sessionID)
 	if err != nil {
-		// Session evaporated. Fast-path the non-overlay route.
+		// Pin the attempted empty cohort. A nested facade must not retry and
+		// accidentally observe buffers pushed after the outer request began.
+		return &overlayRequestSnapshot{sessionID: sessionID}, nil
+	}
+	return &overlayRequestSnapshot{sessionID: sessionID, workspace: workspace, files: files}, nil
+}
+
+// prepareOverlayRequest pins one manager snapshot and the graph view derived
+// from it onto the request context. Reusing an already-prepared context is
+// idempotent, which keeps nested facade calls on the same editor-buffer cohort.
+func (s *Server) prepareOverlayRequest(ctx context.Context) (context.Context, *graph.OverlaidView, error) {
+	if ctx == nil {
+		return ctx, nil, nil
+	}
+	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
+	if ok && snapshot.sessionID != SessionIDFromContext(ctx) {
+		return ctx, nil, fmt.Errorf("overlay request snapshot belongs to session %q, not %q", snapshot.sessionID, SessionIDFromContext(ctx))
+	}
+	if view := OverlayViewFromContext(ctx); view != nil {
+		return ctx, view, nil
+	}
+	if !ok {
+		var err error
+		snapshot, err = s.snapshotOverlayRequestForCtx(ctx)
+		if err != nil {
+			return ctx, nil, err
+		}
+		if snapshot != nil {
+			ctx = withOverlayRequestSnapshot(ctx, snapshot)
+		}
+	}
+	if snapshot == nil {
+		return ctx, nil, nil
+	}
+	view, err := s.buildOverlayViewForCtx(ctx)
+	if err != nil {
+		return ctx, nil, err
+	}
+	if view != nil {
+		ctx = WithOverlayView(ctx, view)
+	}
+	return ctx, view, nil
+}
+
+// validateOverlayRequestSnapshot ensures every raw buffer belongs to the
+// workspace under which the session was registered. Unknown and foreign paths
+// fail closed before parsing so a session cannot shadow another workspace.
+func (s *Server) validateOverlayRequestSnapshot(snapshot *overlayRequestSnapshot) error {
+	if snapshot == nil {
+		return nil
+	}
+	for _, file := range snapshot.files {
+		absPath, err := s.resolveOverlayAbsPath(file.Path)
+		if err != nil {
+			return err
+		}
+		owner := s.pickIndexerForPath(absPath)
+		if absPath == "" || owner == nil {
+			return fmt.Errorf("overlay path %q is outside the registered workspace", file.Path)
+		}
+		if snapshot.workspace != "" && owner.WorkspaceID() != snapshot.workspace {
+			return fmt.Errorf("overlay path %q belongs to workspace %q, not registered workspace %q", file.Path, owner.WorkspaceID(), snapshot.workspace)
+		}
+	}
+	return nil
+}
+
+// buildOverlayViewForCtx consumes only the raw snapshot installed by request
+// preparation, ensuring parsing and later raw-buffer reads observe one cohort.
+func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidView, error) {
+	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
+	if !ok || snapshot == nil || len(snapshot.files) == 0 {
 		return nil, nil
 	}
-	if len(files) == 0 {
-		return nil, nil
+	if err := s.validateOverlayRequestSnapshot(snapshot); err != nil {
+		return nil, err
 	}
+	files := snapshot.files
+	sessID := SessionIDFromContext(ctx)
 
 	// Drift check up front for every overlay that carries a BaseSHA.
 	// We do it here, before parsing, so a stale overlay never costs
@@ -534,22 +626,15 @@ func hashOverlayFiles(files []daemon.OverlayFile) string {
 // case, since a tombstone has no content to return and callers
 // should treat the file as absent.
 func (s *Server) overlayContentFor(ctx context.Context, absPath string) (string, bool) {
-	if s == nil || s.overlays == nil || ctx == nil {
+	if s == nil || ctx == nil {
 		return "", false
 	}
-	sessID := SessionIDFromContext(ctx)
-	if sessID == "" {
-		return "", false
-	}
-	if s.overlays.FileCount(sessID) == 0 {
-		return "", false
-	}
-	_, files, err := s.overlays.SnapshotFor(sessID)
-	if err != nil || len(files) == 0 {
+	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
+	if !ok || snapshot == nil {
 		return "", false
 	}
 	cleanedAbs := filepath.Clean(absPath)
-	for _, ov := range files {
+	for _, ov := range snapshot.files {
 		if ov.Deleted {
 			continue
 		}

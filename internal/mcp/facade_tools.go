@@ -1097,14 +1097,12 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		outcome = facadeOutcomeInvalidArgument
 		return invalid, nil
 	}
-	if OverlayViewFromContext(ctx) == nil && !facadeLegacyManagesOwnOverlay(spec.Legacy) {
-		view, viewErr := s.buildOverlayViewForCtx(ctx)
+	if !facadeLegacyManagesOwnOverlay(spec.Legacy) {
+		var viewErr error
+		ctx, _, viewErr = s.prepareOverlayRequest(ctx)
 		if viewErr != nil {
 			outcome = facadeOutcomeToolError
 			return mcpgo.NewToolResultError(viewErr.Error()), nil
-		}
-		if view != nil {
-			ctx = WithOverlayView(ctx, view)
 		}
 	}
 	forwarded := req

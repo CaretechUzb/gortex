@@ -119,7 +119,8 @@ func TestLocalizationSourceWindowValidatesOverlayAwareContent(t *testing.T) {
 		Path: rel, Content: localizationSourceWindowFixture(20, 10, "OVERLAY"),
 	}, nil))
 	server.overlays = manager
-	ctx := WithSessionID(context.Background(), "session")
+	ctx, _, err := server.prepareOverlayRequest(WithSessionID(context.Background(), "session"))
+	require.NoError(t, err)
 
 	overlayWindow := server.localizationSourceWindowForHit(ctx, exploreSourceLiteralHit{
 		nodeID: "src/registry.go::register", matchPath: rel, matchLine: 10, literal: "OVERLAY",

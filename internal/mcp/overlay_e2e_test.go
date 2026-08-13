@@ -535,6 +535,103 @@ func TestOverlay_ListExposesExpiryMetadata(t *testing.T) {
 	require.Contains(t, body, `"idle_ttl_seconds"`)
 }
 
+func TestOverlay_RequestSnapshotPinsWorkspaceAndFilesAcrossConcurrentPush(t *testing.T) {
+	srv, _, targetFile, _ := setupOverlayServer(t)
+	srv.indexer.SetWorkspaceID("workspace-a")
+	const sessionID = "request-snapshot"
+	require.NoError(t, srv.OverlayManager().RegisterWithID(sessionID, "workspace-a"))
+	const firstContent = "package main\n\nfunc FirstBuffer() {}\n"
+	require.NoError(t, srv.OverlayManager().Push(sessionID, daemon.OverlayFile{
+		Path: targetFile, Content: firstContent,
+	}, nil))
+
+	ctx, firstView, err := srv.prepareOverlayRequest(WithSessionID(context.Background(), sessionID))
+	require.NoError(t, err)
+	require.NotNil(t, firstView)
+	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
+	require.True(t, ok)
+	require.Equal(t, "workspace-a", snapshot.workspace)
+	require.Len(t, snapshot.files, 1)
+	require.Equal(t, firstContent, snapshot.files[0].Content)
+
+	pushDone := make(chan error, 1)
+	go func() {
+		pushDone <- srv.OverlayManager().Push(sessionID, daemon.OverlayFile{
+			Path: targetFile, Content: "package main\n\nfunc SecondBuffer() {}\n",
+		}, nil)
+	}()
+	require.NoError(t, <-pushDone)
+
+	content, found := srv.overlayContentFor(ctx, targetFile)
+	require.True(t, found)
+	require.Equal(t, firstContent, content, "the prepared request must retain its immutable buffer cohort")
+	reusedCtx, reusedView, err := srv.prepareOverlayRequest(ctx)
+	require.NoError(t, err)
+	require.Same(t, firstView, reusedView)
+	reusedSnapshot, ok := overlayRequestSnapshotFromContext(reusedCtx)
+	require.True(t, ok)
+	require.Same(t, snapshot, reusedSnapshot)
+
+	mismatchedCtx := WithSessionID(ctx, "different-session")
+	_, _, err = srv.prepareOverlayRequest(mismatchedCtx)
+	require.ErrorContains(t, err, "belongs to session")
+}
+
+func TestOverlay_RequestSnapshotPinsEmptyAttemptAcrossLaterPush(t *testing.T) {
+	srv, _, targetFile, _ := setupOverlayServer(t)
+	srv.indexer.SetWorkspaceID("workspace-a")
+	const sessionID = "empty-request-snapshot"
+	require.NoError(t, srv.OverlayManager().RegisterWithID(sessionID, "workspace-a"))
+
+	ctx, view, err := srv.prepareOverlayRequest(WithSessionID(context.Background(), sessionID))
+	require.NoError(t, err)
+	require.Nil(t, view)
+	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
+	require.True(t, ok, "even an empty attempt must be pinned")
+	require.Equal(t, "workspace-a", snapshot.workspace)
+	require.Empty(t, snapshot.files)
+
+	require.NoError(t, srv.OverlayManager().Push(sessionID, daemon.OverlayFile{
+		Path: targetFile, Content: "package main\n\nfunc LaterBuffer() {}\n",
+	}, nil))
+	reusedCtx, reusedView, err := srv.prepareOverlayRequest(ctx)
+	require.NoError(t, err)
+	require.Nil(t, reusedView, "a nested call must not resnapshot buffers pushed mid-request")
+	reusedSnapshot, ok := overlayRequestSnapshotFromContext(reusedCtx)
+	require.True(t, ok)
+	require.Same(t, snapshot, reusedSnapshot)
+	_, found := srv.overlayContentFor(reusedCtx, targetFile)
+	require.False(t, found)
+}
+
+func TestOverlay_RequestSnapshotRejectsForeignWorkspaceAndPath(t *testing.T) {
+	t.Run("workspace mismatch", func(t *testing.T) {
+		srv, _, targetFile, _ := setupOverlayServer(t)
+		srv.indexer.SetWorkspaceID("workspace-a")
+		const sessionID = "foreign-workspace"
+		require.NoError(t, srv.OverlayManager().RegisterWithID(sessionID, "workspace-b"))
+		require.NoError(t, srv.OverlayManager().Push(sessionID, daemon.OverlayFile{
+			Path: targetFile, Deleted: true,
+		}, nil))
+
+		_, _, err := srv.prepareOverlayRequest(WithSessionID(context.Background(), sessionID))
+		require.ErrorContains(t, err, "not registered workspace")
+	})
+
+	t.Run("untracked path", func(t *testing.T) {
+		srv, _, _, _ := setupOverlayServer(t)
+		srv.indexer.SetWorkspaceID("workspace-a")
+		const sessionID = "foreign-path"
+		require.NoError(t, srv.OverlayManager().RegisterWithID(sessionID, "workspace-a"))
+		require.NoError(t, srv.OverlayManager().Push(sessionID, daemon.OverlayFile{
+			Path: filepath.Join(t.TempDir(), "foreign.go"), Deleted: true,
+		}, nil))
+
+		_, _, err := srv.prepareOverlayRequest(WithSessionID(context.Background(), sessionID))
+		require.ErrorContains(t, err, "outside the registered workspace")
+	})
+}
+
 // baseNodeIDs returns a sorted slice of every node ID in the base
 // graph. Used to verify the shadow-graph design's load-bearing
 // invariant: base is never mutated during overlay processing.
