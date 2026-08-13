@@ -296,6 +296,29 @@ func TestExploreTaskAnchorsCaseFoldedFallbackSkipsOutOfScopeVariant(t *testing.T
 	}
 }
 
+func TestExploreTaskAnchorsCaseFoldedFallbackHonorsSessionScope(t *testing.T) {
+	foreign := &graph.Node{
+		ID: "foreign/router.go::Mount", Name: "Mount", Kind: graph.KindFunction,
+		FilePath: "foreign/router.go", WorkspaceID: "foreign", StartLine: 4,
+	}
+	local := &graph.Node{
+		ID: "local/router.go::MOUNT", Name: "MOUNT", Kind: graph.KindFunction,
+		FilePath: "local/router.go", WorkspaceID: "local", StartLine: 8,
+	}
+	ranked := &graph.Node{
+		ID: "local/router.go::serve", Name: "serve", Kind: graph.KindFunction,
+		FilePath: "local/router.go", WorkspaceID: "local", StartLine: 2,
+	}
+	server := exactNameAnchorServer(t, foreign, local, ranked)
+	server.session = &sessionState{scopeResolved: true, scopeBound: true, scopeWorkspaceID: "local"}
+	anchors := server.exploreTaskAnchors(
+		context.Background(), "mount", []*rerank.Candidate{{Node: ranked}}, query.QueryOptions{},
+	)
+	if len(anchors) != 1 || len(anchors[0].exactNodes) != 1 || anchors[0].exactNodes[0].ID != local.ID {
+		t.Fatalf("anchors = %#v, want session-scoped fallback %q", anchors, local.ID)
+	}
+}
+
 func TestExploreTaskAnchorsRecoverInteriorCaseOnlyFromRankedFile(t *testing.T) {
 	target := &graph.Node{
 		ID: "pkg/render.go::buildContent", Name: "buildContent",
