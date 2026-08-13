@@ -114,7 +114,7 @@ type exploreTarget struct {
 	sourceLiteral          bool   // exact source-body hit that must survive final envelope packing
 	sourceLiteralCallee    bool   // exact source callsite uniquely resolved to this invoked callable
 	sourceLiteralAligned   bool   // source-literal callee that instantiates the task's value; strongest literal owner
-	literalPrimaryEligible bool   // retrieval hint; final reserve requires authenticated callee proof
+	literalPrimaryEligible bool   // authenticated unanchored literal may use the one bounded PRIMARY reserve
 	literalMatchCount      int    // distinct task literals matched; stable tie-break among eligible rows
 	typedAnchorProjection  bool   // bounded field-owner-call proof promoted from a task-aligned typed field
 	foldedOwner            bool   // synthetic owner inserted by concept member folding
@@ -4294,7 +4294,7 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 	}
 	literalMandatory := 0
 	for index, target := range targets {
-		if !localizationStrongSourceLiteralCallee(target) {
+		if !target.literalPrimaryEligible && !localizationStrongSourceLiteralCallee(target) {
 			continue
 		}
 		if index+1 > mandatoryCount {
@@ -4344,7 +4344,7 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 			Callees:    boundedLocalizationNeighborIDs(target.callees, localizationMaxNeighborIDs),
 			Provenance: provenance,
 
-			literalPrimaryEligible: localizationStrongSourceLiteralCallee(target),
+			literalPrimaryEligible: target.literalPrimaryEligible || localizationStrongSourceLiteralCallee(target),
 			supportingOnly:         target.leadingFileDepth,
 		}
 

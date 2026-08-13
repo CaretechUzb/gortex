@@ -66,6 +66,80 @@ func TestLocalizationTargetProvenanceSeparatesLiteralObservationFromPrimarySeati
 	}
 }
 
+func TestLocalizationEligibleContentLiteralReachesPrimaryThroughPackedEnvelope(t *testing.T) {
+	const literalID = "repo/literal.go::LiteralOwner"
+	ordinary := []struct {
+		id   string
+		name string
+		file string
+	}{
+		{"repo/a.go::Alpha", "Alpha", "repo/a.go"},
+		{"repo/b.go::Bravo", "Bravo", "repo/b.go"},
+		{"repo/c.go::Charlie", "Charlie", "repo/c.go"},
+		{"repo/d.go::Delta", "Delta", "repo/d.go"},
+		{"repo/e.go::Echo", "Echo", "repo/e.go"},
+	}
+	buildTargets := func(eligible bool) []exploreTarget {
+		targets := make([]exploreTarget, 0, len(ordinary)+1)
+		for _, item := range ordinary {
+			targets = append(targets, exploreTarget{node: &graph.Node{
+				ID: item.id, Name: item.name, Kind: graph.KindFunction, FilePath: item.file,
+			}})
+		}
+		targets = append(targets, exploreTarget{
+			node: &graph.Node{
+				ID: literalID, Name: "LiteralOwner", Kind: graph.KindFunction, FilePath: "repo/literal.go",
+			},
+			exactContent: true, sourceLiteral: true, syntacticAnchor: !eligible,
+			literalPrimaryEligible: eligible,
+		})
+		return targets
+	}
+
+	for _, test := range []struct {
+		name     string
+		eligible bool
+	}{
+		{name: "authenticated unanchored literal reserves one primary seat", eligible: true},
+		{name: "anchored literal observation remains rank only", eligible: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, _, digest, _ := buildLocalizationExploreResultForTaskFinalized(
+				newLocalizationCompletion(true, ""), "", buildTargets(test.eligible),
+				exploreDefaultBudgetTokens,
+			)
+			require.NotNil(t, digest)
+			require.LessOrEqual(t, len(digest.primaryIDs), localizationFinalResponsePrimaryLimit)
+
+			body, ok := singleTextContent(result)
+			require.True(t, ok)
+			var envelope localizationExploreEnvelope
+			require.NoError(t, json.Unmarshal([]byte(body), &envelope))
+			found := false
+			for _, row := range envelope.Evidence {
+				if row.ID == literalID {
+					found = true
+					require.Equal(t, localizationProvenanceContentLiteral, row.Provenance)
+				}
+			}
+			require.True(t, found, "literal evidence must survive production packing")
+			retainedEligible := false
+			for _, row := range digest.Evidence {
+				if row.ID == literalID {
+					retainedEligible = row.literalPrimaryEligible
+				}
+			}
+			require.Equal(t, test.eligible, retainedEligible)
+			require.Contains(t, digest.primaryIDs, literalID, "ordinary ranking may still seat either literal")
+			if test.eligible {
+				require.Equal(t, literalID, digest.primaryIDs[0], "the bounded literal reserve must pre-seat the eligible row")
+			} else {
+				require.NotEqual(t, literalID, digest.primaryIDs[0], "an ineligible literal must not claim the reserve")
+			}
+		})
+	}
+}
+
 func TestLocalizationLiteralProvenanceSurvivesFinalProjection(t *testing.T) {
 	tests := []struct {
 		name        string
