@@ -191,6 +191,7 @@ func exploreExactNameCaseVariants(token string) []string {
 func (lookup *exploreExactNameAnchorLookup) caseFoldedMatches(
 	ctx context.Context,
 	token string,
+	eligible func(*graph.Node) bool,
 ) []*graph.Node {
 	if lookup == nil || lookup.reader == nil || ctx.Err() != nil ||
 		lookup.fallbackTokens == exploreExactNameAnchorCaseFoldMaxTokens {
@@ -201,7 +202,7 @@ func (lookup *exploreExactNameAnchorLookup) caseFoldedMatches(
 	seen := make(map[string]struct{}, exploreExactNameAnchorMaxNodes)
 	add := func(node *graph.Node) {
 		if node == nil || node.ID == "" || len(matches) == exploreExactNameAnchorMaxNodes ||
-			!strings.EqualFold(node.Name, token) {
+			!strings.EqualFold(node.Name, token) || eligible == nil || !eligible(node) {
 			return
 		}
 		if _, duplicate := seen[node.ID]; duplicate {
@@ -251,47 +252,50 @@ func (lookup *exploreExactNameAnchorLookup) caseFoldedMatches(
 }
 
 // exploreExactNameAnchorNodes returns localizable declarations whose indexed
-// name matches the task token. The exact case bucket is authoritative. Only an
-// empty bucket opens the bounded case-folded recovery lane.
+// name matches the task token. An exact case bucket is authoritative only when
+// it contains a declaration eligible for this request's repo/session scope;
+// foreign homonyms cannot suppress bounded case-fold recovery.
 func (s *Server) exploreExactNameAnchorNodes(
 	ctx context.Context,
 	token string,
 	scope query.QueryOptions,
 	lookup *exploreExactNameAnchorLookup,
 ) []*graph.Node {
-	matches := lookup.reader.FindNodesByName(token)
-	exact := len(matches) > 0
-	if !exact {
-		matches = lookup.caseFoldedMatches(ctx, token)
+	eligibleNode := func(node *graph.Node) bool {
+		return node != nil && exploreSyntacticAnchorEligibleNode(node) &&
+			scope.ScopeAllows(node) && s.nodeInSessionScope(ctx, node)
 	}
-	if len(matches) == 0 {
-		return nil
+	selectMatches := func(matches []*graph.Node, exact bool) ([]*graph.Node, bool) {
+		shared := 0
+		eligible := make([]*graph.Node, 0, exploreExactNameAnchorMaxNodes)
+		pooled := make([]*graph.Node, 0, exploreExactNameAnchorMaxNodes)
+		for _, node := range matches {
+			if node == nil || (exact && node.Name != token) || (!exact && !strings.EqualFold(node.Name, token)) ||
+				!eligibleNode(node) {
+				continue
+			}
+			shared++
+			if len(eligible) < exploreExactNameAnchorMaxNodes {
+				eligible = append(eligible, node)
+			}
+			if _, ranked := lookup.pooledFiles[node.FilePath]; ranked && len(pooled) < exploreExactNameAnchorMaxNodes {
+				pooled = append(pooled, node)
+			}
+		}
+		if shared > exploreExactNameAnchorMaxShared {
+			// The ranked pool is independent evidence that one of the homonyms is
+			// the one the task means; without it an ambiguous name stays unanchored.
+			return pooled, true
+		}
+		return eligible, shared > 0
 	}
-	shared := 0
-	eligible := make([]*graph.Node, 0, exploreExactNameAnchorMaxNodes)
-	pooled := make([]*graph.Node, 0, exploreExactNameAnchorMaxNodes)
-	for _, node := range matches {
-		if node == nil || (exact && node.Name != token) || (!exact && !strings.EqualFold(node.Name, token)) {
-			continue
-		}
-		shared++
-		if !exploreSyntacticAnchorEligibleNode(node) || !scope.ScopeAllows(node) ||
-			!s.nodeInSessionScope(ctx, node) {
-			continue
-		}
-		if len(eligible) < exploreExactNameAnchorMaxNodes {
-			eligible = append(eligible, node)
-		}
-		if _, ranked := lookup.pooledFiles[node.FilePath]; ranked && len(pooled) < exploreExactNameAnchorMaxNodes {
-			pooled = append(pooled, node)
-		}
+
+	if exact, found := selectMatches(lookup.reader.FindNodesByName(token), true); found {
+		return exact
 	}
-	if shared > exploreExactNameAnchorMaxShared {
-		// The ranked pool is independent evidence that one of the homonyms is the
-		// one the task means; without it an ambiguous name stays unanchored.
-		return pooled
-	}
-	return eligible
+	matches := lookup.caseFoldedMatches(ctx, token, eligibleNode)
+	selected, _ := selectMatches(matches, false)
+	return selected
 }
 
 func exploreRankedPoolFiles(candidates []*rerank.Candidate) map[string]struct{} {
@@ -320,10 +324,11 @@ func exploreExactNameAnchorTokens(task string) []string {
 			if !exploreExactNameAnchorToken(token) {
 				continue
 			}
-			if _, duplicate := seen[token]; duplicate {
+			key := strings.ToLower(token)
+			if _, duplicate := seen[key]; duplicate {
 				continue
 			}
-			seen[token] = struct{}{}
+			seen[key] = struct{}{}
 			out = append(out, token)
 			if len(out) == exploreExactNameAnchorMaxTokens {
 				return out
@@ -458,10 +463,6 @@ func (s *Server) exploreQualifiedAnchorOwnerCandidate(
 	var best *graph.Node
 	scanned := 0
 	for _, node := range s.graph.FindNodesByName(owner) {
-		if scanned == exploreExactNameAnchorOwnerScan {
-			break
-		}
-		scanned++
 		if node == nil || node.Name != owner ||
 			(node.Kind != graph.KindType && node.Kind != graph.KindInterface) {
 			continue
@@ -469,6 +470,10 @@ func (s *Server) exploreQualifiedAnchorOwnerCandidate(
 		if !scope.ScopeAllows(node) || !s.nodeInSessionScope(ctx, node) {
 			continue
 		}
+		if scanned == exploreExactNameAnchorOwnerScan {
+			break
+		}
+		scanned++
 		if _, used := usedIDs[node.ID]; used {
 			continue
 		}

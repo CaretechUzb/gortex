@@ -127,6 +127,13 @@ func TestExploreTaskAnchorsKeepCodeShapedAnchorsAhead(t *testing.T) {
 	}
 }
 
+func TestExploreExactNameAnchorTokensDeduplicateCaseFoldedSpellings(t *testing.T) {
+	got := exploreExactNameAnchorTokens("Mount mount MOUNT latch")
+	if fmt.Sprint(got) != fmt.Sprint([]string{"Mount", "latch"}) {
+		t.Fatalf("tokens = %#v, want first spelling plus latch", got)
+	}
+}
+
 func TestExploreExactNameAnchorTokensAreBoundedAndDeduplicated(t *testing.T) {
 	words := []string{
 		"alpha", "bravo", "delta", "gamma", "kappa", "sigma", "theta", "omega",
@@ -264,6 +271,29 @@ func TestExploreTaskAnchorsKeepExactCaseBucketAuthoritativeAcrossStores(t *testi
 			t.Fatalf("exact node = %q, want authoritative exact-case node %q", got, lower.ID)
 		}
 	})
+}
+
+func TestExploreTaskAnchorsCaseFoldedFallbackSkipsOutOfScopeVariant(t *testing.T) {
+	foreign := &graph.Node{
+		ID: "foreign/router.go::Mount", Name: "Mount", Kind: graph.KindFunction,
+		FilePath: "foreign/router.go", RepoPrefix: "foreign", WorkspaceID: "foreign", StartLine: 4,
+	}
+	local := &graph.Node{
+		ID: "local/router.go::MOUNT", Name: "MOUNT", Kind: graph.KindFunction,
+		FilePath: "local/router.go", RepoPrefix: "local", WorkspaceID: "local", StartLine: 8,
+	}
+	ranked := &graph.Node{
+		ID: "local/router.go::serve", Name: "serve", Kind: graph.KindFunction,
+		FilePath: "local/router.go", RepoPrefix: "local", WorkspaceID: "local", StartLine: 2,
+	}
+	server := exactNameAnchorServer(t, foreign, local, ranked)
+	anchors := server.exploreTaskAnchors(
+		context.Background(), "mount", []*rerank.Candidate{{Node: ranked}},
+		query.QueryOptions{WorkspaceID: "local", RepoAllow: map[string]bool{"local": true}},
+	)
+	if len(anchors) != 1 || len(anchors[0].exactNodes) != 1 || anchors[0].exactNodes[0].ID != local.ID {
+		t.Fatalf("anchors = %#v, want scoped fallback %q", anchors, local.ID)
+	}
 }
 
 func TestExploreTaskAnchorsRecoverInteriorCaseOnlyFromRankedFile(t *testing.T) {
