@@ -75,6 +75,7 @@ type localizationDigestRow struct {
 	literalPrimaryEligible bool
 	primaryCohortOrder     int
 	supportingOnly         bool
+	authorizationPriority  bool
 }
 
 // newLocalizationEvidenceDigestForTask retains only concrete ranked evidence
@@ -97,6 +98,7 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 			return false
 		}
 		seen[row.ID] = struct{}{}
+		_, authorizationPriority := priorityIDs[row.ID]
 		digest.Evidence = append(digest.Evidence, localizationDigestRow{
 			Rank:       row.Rank,
 			ID:         row.ID,
@@ -113,6 +115,7 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 			literalPrimaryEligible: row.literalPrimaryEligible,
 			primaryCohortOrder:     row.primaryCohortOrder,
 			supportingOnly:         row.supportingOnly || localizationSupportingOnlyProvenance(row.Provenance),
+			authorizationPriority:  authorizationPriority,
 		})
 		return true
 	}
@@ -127,7 +130,7 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 	// removed; only the weakest retained digest tail yields.
 	bodyIDs := make(map[string]struct{}, localizationBodyMentionCap)
 	for _, row := range envelope.Evidence {
-		if localizationSupportingOnlyProvenance(row.Provenance) && row.ID != "" {
+		if row.Provenance == localizationProvenanceBodyMention && row.ID != "" {
 			if _, already := seen[row.ID]; !already {
 				bodyIDs[row.ID] = struct{}{}
 			}
@@ -162,7 +165,7 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 		if len(digest.Evidence) == 0 {
 			return digest
 		}
-		if retained, removed := shedLocalizationDigestBodyMention(digest.Evidence); removed {
+		if retained, removed := shedLocalizationDigestSupportingOnly(digest.Evidence); removed {
 			digest.Evidence = retained
 			continue
 		}
@@ -278,6 +281,7 @@ func mergeLocalizationDigestRowEvidence(primary, supplementary localizationDiges
 		primary.Provenance = supplementary.Provenance
 	}
 	primary.literalPrimaryEligible = primary.literalPrimaryEligible || supplementary.literalPrimaryEligible
+	primary.authorizationPriority = primary.authorizationPriority || supplementary.authorizationPriority
 	// An identity that was independently ranked remains cohort-eligible when a
 	// later supplemental observation of the same row is merged into it.
 	primary.supportingOnly = primary.supportingOnly && supplementary.supportingOnly
@@ -347,7 +351,7 @@ func mergeLocalizationEvidenceDigest(current []localizationDigestRow, retained *
 		if len(digest.Evidence) == 0 {
 			return digest
 		}
-		if retained, removed := shedLocalizationDigestBodyMention(digest.Evidence); removed {
+		if retained, removed := shedLocalizationDigestSupportingOnly(digest.Evidence); removed {
 			digest.Evidence = retained
 			continue
 		}
@@ -528,12 +532,13 @@ func shedLocalizationDigestOptionalFields(rows []localizationDigestRow) bool {
 	return false
 }
 
-// Body mentions supplement the packed declarations that produced them. Under
-// retained-state pressure they yield before richer metadata or independently
-// ranked evidence, regardless of where a later merge placed them.
-func shedLocalizationDigestBodyMention(rows []localizationDigestRow) ([]localizationDigestRow, bool) {
+// Supplemental rows yield before richer metadata or independently ranked
+// evidence under retained-state pressure, regardless of where a later merge
+// placed them. An identity required by the live completion is protected even
+// when its only visible observation has supplemental provenance.
+func shedLocalizationDigestSupportingOnly(rows []localizationDigestRow) ([]localizationDigestRow, bool) {
 	for index := len(rows) - 1; index >= 0; index-- {
-		if rows[index].Provenance != localizationProvenanceBodyMention {
+		if !localizationFinalResponseSupportingOnly(rows[index]) || rows[index].authorizationPriority {
 			continue
 		}
 		copy(rows[index:], rows[index+1:])

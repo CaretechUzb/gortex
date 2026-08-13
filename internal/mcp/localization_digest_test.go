@@ -370,6 +370,85 @@ func TestDigestByteCapShedsOptionalMetadataBeforeEvidenceTail(t *testing.T) {
 	}
 }
 
+func TestDigestPressureShedsSupplementalRowsBeforeRankedEvidence(t *testing.T) {
+	const (
+		protectedID = "repo/protected.go::Protected"
+		bodyID      = "repo/body.go::BodyMention"
+		adjacentID  = "repo/adjacent.go::Adjacent"
+		ordinary    = 13
+	)
+	largeSignature := strings.Repeat("large optional signature ", 120)
+	completion := newLocalizationRefinementCompletion(protectedID)
+	evidence := []localizationEvidence{{
+		Rank: 1, ID: protectedID, Name: "Protected", Kind: "function",
+		File: "repo/protected.go", Signature: largeSignature,
+		Provenance: localizationProvenanceDirectAdjacency, supportingOnly: true,
+	}}
+	for index := 0; index < ordinary; index++ {
+		evidence = append(evidence, localizationEvidence{
+			Rank: len(evidence) + 1,
+			ID:   fmt.Sprintf("repo/ordinary%02d.go::Ordinary%02d", index, index),
+			Name: fmt.Sprintf("Ordinary%02d", index), Kind: "function",
+			File: fmt.Sprintf("repo/ordinary%02d.go", index), Signature: largeSignature,
+		})
+	}
+	evidence = append(evidence,
+		localizationEvidence{Rank: len(evidence) + 1, ID: bodyID, Name: "BodyMention", Kind: "function", File: "repo/body.go", Signature: largeSignature, Provenance: localizationProvenanceBodyMention, supportingOnly: true},
+		localizationEvidence{Rank: len(evidence) + 2, ID: adjacentID, Name: "Adjacent", Kind: "function", File: "repo/adjacent.go", Signature: largeSignature, Provenance: localizationProvenanceDirectAdjacency, supportingOnly: true},
+	)
+
+	assertRetained := func(t *testing.T, digest *localizationEvidenceDigest) {
+		t.Helper()
+		ids := make(map[string]localizationDigestRow, len(digest.Evidence))
+		for index, row := range digest.Evidence {
+			ids[row.ID] = row
+			if row.Rank != index+1 || digest.Files[index] != row.File || digest.Symbols[index] != row.ID {
+				t.Fatalf("unaligned retained row %d: %#v", index+1, row)
+			}
+		}
+		if _, exists := ids[bodyID]; exists {
+			t.Fatal("body supplement survived retained-state pressure")
+		}
+		if _, exists := ids[adjacentID]; exists {
+			t.Fatal("direct adjacency supplement survived retained-state pressure")
+		}
+		protected, exists := ids[protectedID]
+		if !exists || !protected.authorizationPriority {
+			t.Fatalf("authorized supplemental identity was shed or lost priority: %#v", protected)
+		}
+		for index := 0; index < ordinary; index++ {
+			id := fmt.Sprintf("repo/ordinary%02d.go::Ordinary%02d", index, index)
+			if _, exists := ids[id]; !exists {
+				t.Fatalf("independently ranked row %q was shed before supplements", id)
+			}
+		}
+		encoded, err := json.Marshal(digest)
+		if err != nil || len(encoded) > localizationDigestMaxBytes || len(digest.finalResponse) > localizationFinalResponseMaxBytes {
+			t.Fatalf("unbounded digest bytes=%d final=%d err=%v", len(encoded), len(digest.finalResponse), err)
+		}
+	}
+
+	t.Run("initial digest", func(t *testing.T) {
+		digest := newLocalizationEvidenceDigestForTask("find Protected", localizationExploreEnvelope{
+			Completion: completion,
+			Evidence:   evidence,
+		})
+		assertRetained(t, digest)
+	})
+	t.Run("post-read merge", func(t *testing.T) {
+		rows := make([]localizationDigestRow, 0, len(evidence))
+		for _, row := range evidence {
+			rows = append(rows, localizationDigestRow{
+				Rank: row.Rank, ID: row.ID, Name: row.Name, Kind: row.Kind,
+				File: row.File, Signature: row.Signature, Provenance: row.Provenance,
+				supportingOnly:        row.supportingOnly,
+				authorizationPriority: row.ID == protectedID,
+			})
+		}
+		assertRetained(t, mergeLocalizationEvidenceDigest(nil, &localizationEvidenceDigest{Evidence: rows}))
+	})
+}
+
 func authorizationAwareDigestFixture() (localizationExploreEnvelope, []string) {
 	allowed := []string{
 		"repo/storage/level.go::StorageLevel.Normalize",

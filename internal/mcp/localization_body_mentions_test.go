@@ -218,15 +218,24 @@ func TestLocalizationDigestReservesBodyMentionTail(t *testing.T) {
 	require.NotContains(t, digest.Symbols, "src/a.go::ordinary15")
 }
 
-func TestShedLocalizationDigestBodyMentionBeforeOrdinaryRows(t *testing.T) {
+func TestShedLocalizationDigestSupportingOnlyBeforeOrdinaryRows(t *testing.T) {
 	rows := []localizationDigestRow{
 		{ID: "ordinary", Provenance: "ranked"},
-		{ID: "mentioned", Provenance: localizationProvenanceBodyMention},
+		{ID: "mentioned", Provenance: localizationProvenanceBodyMention, supportingOnly: true},
+		{ID: "adjacent", Provenance: localizationProvenanceDirectAdjacency, supportingOnly: true},
+		{ID: "protected", Provenance: localizationProvenanceDirectAdjacency, supportingOnly: true, authorizationPriority: true},
 		{ID: "tail", Provenance: "ranked"},
 	}
 
-	retained, removed := shedLocalizationDigestBodyMention(rows)
-
+	retained, removed := shedLocalizationDigestSupportingOnly(rows)
 	require.True(t, removed)
-	require.Equal(t, []string{"ordinary", "tail"}, []string{retained[0].ID, retained[1].ID})
+	require.Equal(t, []string{"ordinary", "mentioned", "protected", "tail"}, []string{retained[0].ID, retained[1].ID, retained[2].ID, retained[3].ID})
+
+	retained, removed = shedLocalizationDigestSupportingOnly(retained)
+	require.True(t, removed)
+	require.Equal(t, []string{"ordinary", "protected", "tail"}, []string{retained[0].ID, retained[1].ID, retained[2].ID})
+
+	retained, removed = shedLocalizationDigestSupportingOnly(retained)
+	require.False(t, removed)
+	require.Equal(t, []string{"ordinary", "protected", "tail"}, []string{retained[0].ID, retained[1].ID, retained[2].ID})
 }
