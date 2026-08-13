@@ -956,10 +956,6 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 			Data:      map[string]any{"facade": spec.Facade, "operation": spec.Operation, "legacy_tool": spec.Legacy},
 		}), nil
 	}
-	if invalid := s.validateFacadeInput(spec, req.GetArguments()); invalid != nil {
-		outcome = facadeOutcomeInvalidArgument
-		return invalid, nil
-	}
 	normalized := normalizeFacadeArguments(spec, req.GetArguments())
 	if targetErr := normalizeFacadeChangeTargets(spec, req.GetArguments(), normalized); targetErr != nil {
 		outcome = facadeOutcomeInvalidArgument
@@ -1399,12 +1395,8 @@ func (s *Server) validateFacadeInput(spec facadeOperationSpec, input map[string]
 			})
 		}
 	}
-	if capability := s.facadeCapability(spec, true); capability != nil {
-		if schema, ok := capability["input_schema"].(map[string]any); ok {
-			if invalid := validateFacadeContainerFields(input, schema); invalid != nil {
-				return invalid
-			}
-		}
+	if invalid := s.validateFacadeRepositoryFields(spec, input); invalid != nil {
+		return invalid
 	}
 	for _, field := range []string{"target", "to"} {
 		if raw, present := input[field]; present && raw != nil {
@@ -1445,53 +1437,42 @@ func (s *Server) validateFacadeInput(spec facadeOperationSpec, input map[string]
 	return nil
 }
 
-// validateFacadeContainerFields fails closed for unknown repository selectors and
-// source fields before normalization can merge them into a legacy request. Other
-// containers retain their compatibility aliases until the public schema can
-// advertise them without breaking existing facade clients.
-func validateFacadeContainerFields(input, schema map[string]any) *mcpgo.CallToolResult {
-	properties, _ := schema["properties"].(map[string]any)
-	for _, containerName := range facadeContainerKeys {
-		fields, ok := input[containerName].(map[string]any)
-		if !ok || len(fields) == 0 {
-			continue
+// validateFacadeRepositoryFields rejects repository-selector spellings only
+// when the selected legacy handler cannot consume their normalized form. This
+// preserves working compatibility aliases while closing every top-level and
+// nested-container path that would otherwise silently target the active repo.
+func (s *Server) validateFacadeRepositoryFields(spec facadeOperationSpec, input map[string]any) *mcpgo.CallToolResult {
+	locations := append([]string{""}, facadeContainerKeys...)
+	for _, containerName := range locations {
+		fields := input
+		if containerName != "" {
+			var ok bool
+			fields, ok = input[containerName].(map[string]any)
+			if !ok {
+				continue
+			}
 		}
-		container, advertised := properties[containerName].(map[string]any)
-		if !advertised {
-			// Minimal test doubles may capture a legacy handler without its real
-			// schema. There is no published closed container to enforce in that
-			// case; production registrations always carry their full schema.
-			continue
-		}
-		open, _ := container["additionalProperties"].(bool)
-		if open {
-			continue
-		}
-		allowed, _ := container["properties"].(map[string]any)
-		validFields := sortedFacadeMapKeys(allowed)
 		for _, field := range sortedFacadeMapKeys(fields) {
-			if _, valid := allowed[field]; valid {
-				continue
-			}
 			if containerName == "options" && field == "repo" {
-				// options.repo predates operation-specific schemas on a few facade
-				// paths and is still deliberately normalized as a compatibility alias.
+				// options.repo is the canonical public repository selector. Some
+				// facade middleware consumes it before the legacy handler does.
 				continue
 			}
-			if !facadeRepositorySelectorLike(field) &&
-				(containerName != "source" || facadeCompatibilitySourceField(field)) {
+			if !facadeRepositorySelectorLike(field) || s.facadeFieldConsumed(spec, containerName, field, fields[field]) {
 				continue
 			}
-			path := containerName + "." + field
-			data := map[string]any{
-				"field": path, "container": containerName, "valid_fields": validFields,
+			path := field
+			if containerName != "" {
+				path = containerName + "." + field
+			}
+			data := map[string]any{"field": path}
+			if containerName != "" {
+				data["container"] = containerName
 			}
 			message := fmt.Sprintf("unknown field %q", path)
-			if facadeRepositorySelectorLike(field) && facadeSchemaAllowsPath(schema, "options", "repo") {
+			if s.facadeFieldConsumed(spec, "options", "repo", fields[field]) {
 				data["suggested_field"] = "options.repo"
 				message += "; use options.repo to select a repository"
-			} else if len(validFields) > 0 {
-				message += fmt.Sprintf("; valid %s fields: %s", containerName, strings.Join(validFields, ", "))
 			}
 			return NewStructuredErrorResult(StructuredError{
 				ErrorCode: ErrCodeInvalidArgument,
@@ -1503,6 +1484,24 @@ func validateFacadeContainerFields(input, schema map[string]any) *mcpgo.CallTool
 	return nil
 }
 
+func (s *Server) facadeFieldConsumed(spec facadeOperationSpec, containerName, field string, value any) bool {
+	probe := map[string]any{"operation": spec.Operation}
+	if containerName == "" {
+		probe[field] = value
+	} else {
+		probe[containerName] = map[string]any{field: value}
+	}
+	for lowered := range normalizeFacadeArguments(spec, probe) {
+		if _, fixed := spec.Fixed[lowered]; fixed {
+			continue
+		}
+		if s.legacyDeclaresField(spec.Legacy, lowered) {
+			return true
+		}
+	}
+	return false
+}
+
 func facadeRepositorySelectorLike(field string) bool {
 	switch strings.ToLower(strings.TrimSpace(field)) {
 	case "repo", "repo_path", "repository", "repository_path":
@@ -1510,23 +1509,6 @@ func facadeRepositorySelectorLike(field string) bool {
 	default:
 		return false
 	}
-}
-
-func facadeCompatibilitySourceField(field string) bool {
-	switch field {
-	case "changes", "file", "id", "ids", "range", "ranges", "source", "steps", "symbol", "symbols", "workspace_edit":
-		return true
-	default:
-		return false
-	}
-}
-
-func facadeSchemaAllowsPath(schema map[string]any, containerName, field string) bool {
-	properties, _ := schema["properties"].(map[string]any)
-	container, _ := properties[containerName].(map[string]any)
-	allowed, _ := container["properties"].(map[string]any)
-	_, ok := allowed[field]
-	return ok
 }
 
 func validateFacadeSelector(field string, raw any) *mcpgo.CallToolResult {

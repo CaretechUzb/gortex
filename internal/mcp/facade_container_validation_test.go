@@ -1,159 +1,125 @@
 package mcp
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
 
-	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 )
 
-func TestValidateFacadeContainerFieldsRejectsUnknownNestedFields(t *testing.T) {
-	schema := facadeContainerValidationSchema()
+func TestFacadeRepositoryValidationRejectsUnconsumedPathsFromRealRegistry(t *testing.T) {
+	srv, _ := setupTestServer(t)
 
 	for _, test := range []struct {
 		name      string
+		facade    string
+		operation string
 		input     map[string]any
 		wantField string
-		wantHint  string
 	}{
 		{
-			name:      "change detect source repo path",
-			input:     map[string]any{"source": map[string]any{"repo_path": `C:\work\other-repo`}},
-			wantField: "source.repo_path",
-			wantHint:  "options.repo",
+			name: "top-level repo path", facade: "change", operation: "detect",
+			input: map[string]any{"repo_path": `C:\work\other-repo`}, wantField: "repo_path",
 		},
 		{
-			name:      "review run source repo",
-			input:     map[string]any{"source": map[string]any{"repo": "other-repo"}},
-			wantField: "source.repo",
-			wantHint:  "options.repo",
+			name: "context repo path", facade: "change", operation: "detect",
+			input: map[string]any{"context": map[string]any{"repo_path": `C:\work\other-repo`}}, wantField: "context.repo_path",
 		},
 		{
-			name:      "unknown source field",
-			input:     map[string]any{"source": map[string]any{"mystery": true}},
-			wantField: "source.mystery",
-			wantHint:  "scope",
+			name: "guard repo path", facade: "change", operation: "detect",
+			input: map[string]any{"guard": map[string]any{"repo_path": `C:\work\other-repo`}}, wantField: "guard.repo_path",
 		},
 		{
-			name:      "unknown options field",
-			input:     map[string]any{"options": map[string]any{"repo_path": "/work/repo"}},
-			wantField: "options.repo_path",
-			wantHint:  "options.repo",
+			name: "cold pr source repo path", facade: "pr", operation: "risk",
+			input: map[string]any{"source": map[string]any{"repo_path": `C:\work\other-repo`}}, wantField: "source.repo_path",
+		},
+		{
+			name: "cold pr context repository", facade: "pr", operation: "list",
+			input: map[string]any{"context": map[string]any{"repository": "other-repo"}}, wantField: "context.repository",
+		},
+		{
+			name: "external write source repo path", facade: "publish_review", operation: "post",
+			input: map[string]any{"source": map[string]any{"repo_path": `C:\work\other-repo`}}, wantField: "source.repo_path",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			result := validateFacadeContainerFields(test.input, schema)
+			spec, ok := srv.facades.operation(test.facade, test.operation)
+			require.True(t, ok, "real registry must contain %s.%s", test.facade, test.operation)
+			test.input["operation"] = test.operation
+
+			result := srv.validateFacadeInput(spec, test.input)
 			require.NotNil(t, result)
 			require.True(t, result.IsError)
-			text := toolResultText(result)
-			require.Contains(t, text, test.wantField)
-			require.Contains(t, text, test.wantHint)
-		})
-	}
-}
-
-func TestValidateFacadeContainerFieldsAcceptsPublishedAndOpenFields(t *testing.T) {
-	schema := facadeContainerValidationSchema()
-	for _, repo := range []string{`C:\work\tracked-repo`, "tracked-prefix"} {
-		require.Nil(t, validateFacadeContainerFields(map[string]any{
-			"source":  map[string]any{"scope": "unstaged"},
-			"options": map[string]any{"repo": repo},
-		}, schema))
-	}
-	require.Nil(t, validateFacadeContainerFields(map[string]any{
-		"arguments": map[string]any{"provider_specific": true},
-	}, schema), "additionalProperties=true must remain open")
-}
-
-func TestFacadeRejectsUnknownNestedFieldsBeforeLegacyDispatch(t *testing.T) {
-	for _, test := range []struct {
-		facade    string
-		operation string
-		legacy    string
-	}{
-		{facade: "change", operation: "detect", legacy: "detect_changes"},
-		{facade: "review", operation: "run", legacy: "review"},
-	} {
-		t.Run(test.facade+"."+test.operation, func(t *testing.T) {
-			srv := &Server{facades: newFacadeRegistry()}
-			called := false
-			tool := mcpgo.NewTool(test.legacy,
-				mcpgo.WithString("scope"),
-				mcpgo.WithString("base_ref"),
-				mcpgo.WithString("base"),
-				mcpgo.WithString("diff"),
-				mcpgo.WithString("repo"),
-			)
-			srv.facades.capture(tool, func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-				called = true
-				return mcpgo.NewToolResultJSON(req.GetArguments())
-			})
-
-			req := mcpgo.CallToolRequest{}
-			req.Params.Arguments = map[string]any{
-				"operation": test.operation,
-				"source":    map[string]any{"repo_path": `C:\work\other-repo`},
-			}
-			result, err := srv.handleFacade(context.Background(), test.facade, req)
-			require.NoError(t, err)
-			require.True(t, result.IsError)
-			require.False(t, called, "unknown selector-like fields must fail before legacy dispatch")
 			var structured StructuredError
 			require.NoError(t, json.Unmarshal([]byte(toolResultText(result)), &structured))
 			require.Equal(t, ErrCodeInvalidArgument, structured.ErrorCode)
-			require.Equal(t, "source.repo_path", structured.Data["field"])
-			require.Equal(t, "options.repo", structured.Data["suggested_field"])
+			require.Equal(t, test.wantField, structured.Data["field"])
 		})
 	}
 }
 
-func TestFacadeForwardsSupportedRepositorySelectors(t *testing.T) {
-	srv := &Server{facades: newFacadeRegistry()}
-	tool := mcpgo.NewTool("detect_changes",
-		mcpgo.WithString("scope"),
-		mcpgo.WithString("base_ref"),
-		mcpgo.WithString("repo"),
-	)
-	srv.facades.capture(tool, func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-		return mcpgo.NewToolResultJSON(req.GetArguments())
-	})
+func TestFacadeRepositoryValidationPreservesConsumedCompatibilityFields(t *testing.T) {
+	srv, _ := setupTestServer(t)
 
-	for _, repo := range []string{`C:\work\tracked-repo`, "tracked-prefix", `C:\work\untracked-repo`} {
-		req := mcpgo.CallToolRequest{}
-		req.Params.Arguments = map[string]any{
-			"operation": "detect",
-			"source":    map[string]any{"scope": "unstaged"},
-			"options":   map[string]any{"repo": repo},
-		}
-		result, err := srv.handleFacade(context.Background(), "change", req)
-		require.NoError(t, err)
-		require.False(t, result.IsError)
-		require.Equal(t, repo, unmarshalResult(t, result)["repo"])
+	for _, test := range []struct {
+		name        string
+		facade      string
+		operation   string
+		container   string
+		fields      map[string]any
+		wantLowered []string
+	}{
+		{
+			name: "change source base ref and repo", facade: "change", operation: "detect", container: "source",
+			fields: map[string]any{"base_ref": "HEAD", "repo": "tracked-repo"}, wantLowered: []string{"base_ref", "repo"},
+		},
+		{
+			name: "change output repo", facade: "change", operation: "detect", container: "output",
+			fields: map[string]any{"repo": "tracked-repo"}, wantLowered: []string{"repo"},
+		},
+		{
+			name: "review source base ref", facade: "review", operation: "run", container: "source",
+			fields: map[string]any{"base_ref": "HEAD"}, wantLowered: []string{"base_ref"},
+		},
+		{
+			name: "change ranges source fields", facade: "change", operation: "ranges", container: "source",
+			fields: map[string]any{"path": "main.go", "start_line": 1, "end_line": 2}, wantLowered: []string{"path", "start_line", "end_line"},
+		},
+		{
+			name: "change contract source fields", facade: "change", operation: "contract", container: "source",
+			fields: map[string]any{"lens": "api", "risk_gate": "strict"}, wantLowered: []string{"lens", "risk_gate"},
+		},
+		{
+			name: "change simulate source keep", facade: "change", operation: "simulate", container: "source",
+			fields: map[string]any{"keep": true}, wantLowered: []string{"keep"},
+		},
+		{
+			name: "review critique prior review", facade: "review", operation: "critique", container: "source",
+			fields: map[string]any{"prior_review": "review text"}, wantLowered: []string{"prior_review"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spec, ok := srv.facades.operation(test.facade, test.operation)
+			require.True(t, ok, "real registry must contain %s.%s", test.facade, test.operation)
+			input := map[string]any{"operation": test.operation, test.container: test.fields}
+
+			require.Nil(t, srv.validateFacadeInput(spec, input))
+			normalized := normalizeFacadeArguments(spec, input)
+			for _, field := range test.wantLowered {
+				_, exists := normalized[field]
+				require.True(t, exists, "%s must survive normalization", field)
+				require.True(t, srv.legacyDeclaresField(spec.Legacy, field), "%s must be consumed by %s", field, spec.Legacy)
+			}
+		})
 	}
 }
 
-func facadeContainerValidationSchema() map[string]any {
-	closed := func(fields ...string) map[string]any {
-		properties := make(map[string]any, len(fields))
-		for _, field := range fields {
-			properties[field] = map[string]any{"type": "string"}
-		}
-		return map[string]any{
-			"type":                 "object",
-			"properties":           properties,
-			"additionalProperties": false,
-		}
-	}
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"source":    closed("scope"),
-			"options":   closed("repo", "base_ref"),
-			"output":    closed("summary_only"),
-			"arguments": map[string]any{"type": "object", "additionalProperties": true},
-		},
-		"additionalProperties": false,
-	}
+func TestFacadeRepositoryValidationLeavesNonSelectorCompatibilityAlone(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	spec, ok := srv.facades.operation("change", "detect")
+	require.True(t, ok)
+	require.Nil(t, srv.validateFacadeInput(spec, map[string]any{
+		"operation": "detect",
+		"source":    map[string]any{"base": "HEAD", "mystery": true},
+	}))
 }
