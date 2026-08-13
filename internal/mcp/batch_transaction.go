@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -21,30 +23,38 @@ import (
 const batchTransactionVersion = 1
 
 type plannedBatchEdit struct {
-	edit    batchEditItem
-	op      string
-	order   int
-	file    string
-	absPath string
-	idx     int
-	node    *graph.Node
-	err     string
+	edit            batchEditItem
+	op              string
+	order           int
+	file            string
+	absPath         string
+	destination     string
+	destinationPath string
+	idx             int
+	node            *graph.Node
+	err             string
 }
 
 type batchFileBuffer struct {
-	absPath  string
-	relPath  string
-	mode     os.FileMode
-	original []byte
-	content  []byte
+	absPath      string
+	relPath      string
+	mode         os.FileMode // permission bits preserved when writing replacement files
+	fileMode     os.FileMode // complete mode retained for symlink and regular-file checks
+	original     []byte
+	content      []byte
+	existsBefore bool
+	existsAfter  bool
+	existenceSet bool
 }
 
 type batchTransactionFile struct {
 	Path              string      `json:"path"`
 	RelativePath      string      `json:"relative_path,omitempty"`
 	Mode              os.FileMode `json:"mode"`
-	BeforeSHA256      string      `json:"before_sha256"`
-	AfterSHA256       string      `json:"after_sha256"`
+	BeforeSHA256      string      `json:"before_sha256,omitempty"`
+	AfterSHA256       string      `json:"after_sha256,omitempty"`
+	BeforeAbsent      bool        `json:"before_absent,omitempty"`
+	AfterAbsent       bool        `json:"after_absent,omitempty"`
 	Backup            string      `json:"backup,omitempty"`
 	ReindexReceipt    string      `json:"reindex_receipt,omitempty"`
 	ReindexGeneration uint64      `json:"reindex_generation,omitempty"`
@@ -162,7 +172,7 @@ func batchSummary(results []batchEditResult) map[string]int {
 func batchFailureResults(plans []plannedBatchEdit, failedAt int, message string) []batchEditResult {
 	results := make([]batchEditResult, len(plans))
 	for i, plan := range plans {
-		result := batchEditResult{Op: plan.op, SymbolID: plan.edit.SymbolID, FilePath: plan.file, Status: "skipped"}
+		result := batchEditResult{Op: plan.op, SymbolID: plan.edit.SymbolID, FilePath: plan.file, DestinationPath: plan.destination, Status: "skipped"}
 		if i == failedAt {
 			result.Status = "failed"
 			result.Error = message
@@ -177,7 +187,7 @@ func markBatchCommitFailure(results []batchEditResult, failedPath, message strin
 	for i := range marked {
 		marked[i].Status = "skipped"
 		marked[i].Error = ""
-		if marked[i].FilePath == failedPath {
+		if marked[i].FilePath == failedPath || marked[i].DestinationPath == failedPath {
 			marked[i].Status = "failed"
 			marked[i].Error = message
 		}
@@ -198,6 +208,50 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 				plan.err = "edit_file op requires path"
 			case edit.OldString == edit.NewString:
 				plan.err = "old_string and new_string are identical"
+			default:
+				absPath, relPath, err := s.resolveFilePath(edit.Path)
+				if err != nil {
+					plan.err = err.Error()
+				} else {
+					plan.absPath, plan.file = absPath, relPath
+				}
+			}
+		case "move_file":
+			plan.order = 2000
+			plan.file, plan.destination = edit.SourcePath, edit.DestinationPath
+			switch {
+			case edit.SourcePath == "":
+				plan.err = "move_file op requires source"
+			case edit.DestinationPath == "":
+				plan.err = "move_file op requires destination"
+			case !validBatchExpectedSHA256(edit.ExpectedSHA256):
+				plan.err = "expected_sha256 must be exactly 64 hexadecimal characters"
+			default:
+				sourcePath, sourceRel, err := s.resolveFilePath(edit.SourcePath)
+				if err != nil {
+					plan.err = err.Error()
+					break
+				}
+				destinationPath, destinationRel, err := s.resolveFilePath(edit.DestinationPath)
+				if err != nil {
+					plan.err = err.Error()
+					break
+				}
+				if sourcePath == destinationPath {
+					plan.err = "move_file source and destination resolve to the same path"
+					break
+				}
+				plan.absPath, plan.file = sourcePath, sourceRel
+				plan.destinationPath, plan.destination = destinationPath, destinationRel
+			}
+		case "delete_file":
+			plan.order = 2000
+			plan.file = edit.Path
+			switch {
+			case edit.Path == "":
+				plan.err = "delete_file op requires path"
+			case !validBatchExpectedSHA256(edit.ExpectedSHA256):
+				plan.err = "expected_sha256 must be exactly 64 hexadecimal characters"
 			default:
 				absPath, relPath, err := s.resolveFilePath(edit.Path)
 				if err != nil {
@@ -244,6 +298,28 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 		plans = append(plans, plan)
 	}
 
+	// A lifecycle operation owns the complete path state. Reject overlap with
+	// any other operation rather than assigning surprising sequential semantics
+	// to move/delete chains. Multiple content edits to one file remain supported.
+	type pathOwner struct {
+		index     int
+		lifecycle bool
+	}
+	owners := make(map[string]pathOwner)
+	for i := range plans {
+		lifecycle := plans[i].op == "move_file" || plans[i].op == "delete_file"
+		for _, path := range []string{plans[i].absPath, plans[i].destinationPath} {
+			if path == "" {
+				continue
+			}
+			if owner, exists := owners[path]; exists && (owner.lifecycle || lifecycle) {
+				plans[i].err = fmt.Sprintf("file lifecycle operation overlaps batch item %d", plans[owner.index].idx+1)
+				break
+			}
+			owners[path] = pathOwner{index: i, lifecycle: lifecycle}
+		}
+	}
+
 	// Preserve the established definitions-before-callers behavior without
 	// performing graph work while disk locks are held.
 	for i := range plans {
@@ -273,26 +349,129 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 	return plans
 }
 
-func readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFileBuffer, []string, error) {
-	buffers := make(map[string]*batchFileBuffer)
-	paths := make([]string, 0)
-	for _, plan := range plans {
-		if _, exists := buffers[plan.absPath]; exists {
+func validBatchExpectedSHA256(expected string) bool {
+	if expected == "" {
+		return true
+	}
+	decoded, err := hex.DecodeString(expected)
+	return err == nil && len(decoded) == sha256.Size
+}
+
+// guardBatchLifecycleDestination rejects every symlink component below the
+// lexical repository root. General file resolution permits in-repo symlinks,
+// which is correct for reads, but a move destination must not redirect a
+// transaction write through either a symlink leaf or a symlinked parent.
+// The repository root itself is deliberately not inspected so checkouts under
+// symlinked system prefixes remain valid.
+func (s *Server) guardBatchLifecycleDestination(absPath string) error {
+	cleanPath := filepath.Clean(absPath)
+	root := ""
+	considerRoot := func(candidate string) {
+		candidate = filepath.Clean(candidate)
+		if pathContainedIn(cleanPath, candidate) && len(candidate) > len(root) {
+			root = candidate
+		}
+	}
+	if s.multiIndexer != nil {
+		for _, prefix := range s.multiIndexer.RepoPrefixes() {
+			if candidate, ok := s.multiIndexer.RepoRoot(prefix); ok {
+				considerRoot(candidate)
+			}
+		}
+	}
+	if s.indexer != nil && s.indexer.RootPath() != "" {
+		considerRoot(s.indexer.RootPath())
+	}
+	if root == "" {
+		return nil
+	}
+
+	rel, err := filepath.Rel(root, cleanPath)
+	if err != nil {
+		return fmt.Errorf("could not inspect move destination %s: %w", cleanPath, err)
+	}
+	current := root
+	for _, component := range strings.Split(rel, string(filepath.Separator)) {
+		if component == "" || component == "." {
 			continue
 		}
-		content, err := os.ReadFile(plan.absPath)
-		if err != nil {
-			return nil, nil, fmt.Errorf("could not read %s: %w", plan.file, err)
+		current = filepath.Join(current, component)
+		info, statErr := os.Lstat(current)
+		switch {
+		case errors.Is(statErr, os.ErrNotExist):
+			return nil
+		case statErr != nil:
+			return fmt.Errorf("could not inspect move destination %s: %w", current, statErr)
+		case info.Mode()&os.ModeSymlink != 0:
+			return fmt.Errorf("move destination contains symlink component %s", current)
 		}
-		mode := os.FileMode(0o644)
-		if info, statErr := os.Stat(plan.absPath); statErr == nil {
-			mode = info.Mode().Perm()
+	}
+	return nil
+}
+
+func (s *Server) validateBatchCreateTarget(absPath, relPath string) error {
+	if err := s.guardBatchLifecycleDestination(absPath); err != nil {
+		return err
+	}
+	_, err := os.Lstat(absPath)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	case err != nil:
+		return fmt.Errorf("could not stat %s: %w", relPath, err)
+	default:
+		return fmt.Errorf("destination already exists")
+	}
+}
+
+func (s *Server) readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFileBuffer, []string, error) {
+	buffers := make(map[string]*batchFileBuffer)
+	paths := make([]string, 0)
+	add := func(path, relPath string) error {
+		if _, exists := buffers[path]; exists {
+			return nil
 		}
-		buffers[plan.absPath] = &batchFileBuffer{
-			absPath: plan.absPath, relPath: plan.file, mode: mode,
-			original: append([]byte(nil), content...), content: append([]byte(nil), content...),
+		buffer := &batchFileBuffer{absPath: path, relPath: relPath, mode: 0o644, existenceSet: true}
+		info, err := os.Lstat(path)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			// Missing paths are retained in the transaction snapshot so a move
+			// destination can be created and rollback can prove it was absent.
+		case err != nil:
+			return fmt.Errorf("could not stat %s: %w", relPath, err)
+		default:
+			content, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return fmt.Errorf("could not read %s: %w", relPath, readErr)
+			}
+			buffer.fileMode = info.Mode()
+			// fileMode intentionally describes the path itself for lifecycle
+			// type checks, while mode follows symlinks so edit_file preserves
+			// the permissions of the content source it is replacing.
+			if followed, statErr := os.Stat(path); statErr == nil {
+				buffer.mode = followed.Mode().Perm()
+			}
+			buffer.original = append([]byte(nil), content...)
+			buffer.content = append([]byte(nil), content...)
+			buffer.existsBefore = true
+			buffer.existsAfter = true
 		}
-		paths = append(paths, plan.absPath)
+		buffers[path] = buffer
+		paths = append(paths, path)
+		return nil
+	}
+	for _, plan := range plans {
+		if err := add(plan.absPath, plan.file); err != nil {
+			return nil, nil, err
+		}
+		if plan.destinationPath != "" {
+			if err := s.guardBatchLifecycleDestination(plan.destinationPath); err != nil {
+				return nil, nil, err
+			}
+			if err := add(plan.destinationPath, plan.destination); err != nil {
+				return nil, nil, err
+			}
+		}
 	}
 	sort.Strings(paths)
 	return buffers, paths, nil
@@ -392,21 +571,63 @@ func applyBatchPlans(plans []plannedBatchEdit, buffers map[string]*batchFileBuff
 	results := make([]batchEditResult, 0, len(plans))
 	for i, plan := range plans {
 		buffer := buffers[plan.absPath]
-		result := batchEditResult{Op: plan.op, SymbolID: plan.edit.SymbolID, FilePath: plan.file, Status: "validated"}
+		result := batchEditResult{
+			Op: plan.op, SymbolID: plan.edit.SymbolID, FilePath: plan.file,
+			DestinationPath: plan.destination, Status: "validated",
+		}
 		var (
 			content    []byte
 			normalized bool
 			err        error
 		)
-		if plan.op == "edit_file" {
+		switch plan.op {
+		case "edit_file":
+			if !buffer.existsAfter {
+				err = fmt.Errorf("file does not exist")
+				break
+			}
 			content, normalized, err = applyBatchFileToContent(plan.edit, buffer.content)
-		} else {
+			if err == nil {
+				buffer.content = content
+			}
+		case "move_file", "delete_file":
+			switch {
+			case !buffer.existsAfter:
+				err = fmt.Errorf("source file does not exist")
+			case buffer.fileMode&os.ModeSymlink != 0:
+				err = fmt.Errorf("source path is a symlink; whole-file lifecycle operations require a regular file")
+			case !buffer.fileMode.IsRegular():
+				err = fmt.Errorf("source path is not a regular file")
+			case plan.edit.ExpectedSHA256 != "" && !strings.EqualFold(plan.edit.ExpectedSHA256, digestBatchBytes(buffer.content)):
+				err = fmt.Errorf("expected_sha256 does not match complete source bytes")
+			}
+			if err == nil && plan.op == "move_file" {
+				destination := buffers[plan.destinationPath]
+				if destination.existsAfter {
+					err = fmt.Errorf("destination already exists")
+				} else {
+					destination.mode = buffer.mode
+					destination.fileMode = buffer.fileMode
+					destination.content = append([]byte(nil), buffer.content...)
+					destination.existsAfter = true
+				}
+			}
+			if err == nil {
+				buffer.existsAfter = false
+			}
+		default:
+			if !buffer.existsAfter {
+				err = fmt.Errorf("symbol file does not exist")
+				break
+			}
 			content, normalized, err = applyBatchSymbolToContent(plan.edit, plan.node, buffer.content)
+			if err == nil {
+				buffer.content = content
+			}
 		}
 		if err != nil {
 			return batchFailureResults(plans, i, err.Error()), i, err
 		}
-		buffer.content = content
 		result.EOLNormalized = normalized
 		results = append(results, result)
 	}
@@ -443,9 +664,12 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 			return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", plan.err), nil
 		}
 	}
-	paths := make([]string, 0, len(plans))
+	paths := make([]string, 0, len(plans)*2)
 	for _, plan := range plans {
 		paths = append(paths, plan.absPath)
+		if plan.destinationPath != "" {
+			paths = append(paths, plan.destinationPath)
+		}
 	}
 	release, lockErr := acquireMutationPaths(ctx, paths)
 	if lockErr != nil {
@@ -460,7 +684,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", receipt.Results[0].Error), nil
 	}
 
-	buffers, orderedPaths, readErr := readBatchBuffers(plans)
+	buffers, orderedPaths, readErr := s.readBatchBuffers(plans)
 	if readErr != nil {
 		receipt.Results = batchFailureResults(plans, 0, readErr.Error())
 		receipt.Summary = batchSummary(receipt.Results)
@@ -484,10 +708,14 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 	// Commit is deliberately non-cancellable. Once the first rename succeeds,
 	// every remaining write or rollback must run to a terminal disk state.
 	writer := s.batchDurability().writeFile
+	remover := s.batchDurability().removeFile
 	if s.batchWriteOverride != nil {
 		// Preserve the target-only fault-injection seam used by commit tests;
 		// journal and rollback writes always retain the durability discipline.
 		writer = s.batchWriteOverride
+	}
+	if s.batchRemoveOverride != nil {
+		remover = s.batchRemoveOverride
 	}
 	finishCommitFailure := func(failedPath, message string) batchTransactionReceipt {
 		status, rollbackErr := s.rollbackBatchReceipt(receipt)
@@ -502,10 +730,36 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		receipt.Summary = batchSummary(receipt.Results)
 		return s.finishBatchTransaction(state, receipt, status, diskStatus, "not_started", message)
 	}
+	// Publish every after-image before removing any before-image. For moves this
+	// keeps the source intact until the destination has passed its final
+	// collision guard and has been durably written.
 	for _, path := range orderedPaths {
 		buffer := buffers[path]
-		if writeErr := writer(path, buffer.content, buffer.mode); writeErr != nil {
-			message := fmt.Sprintf("could not commit %s: %v", buffer.relPath, writeErr)
+		if !buffer.existsAfter {
+			continue
+		}
+		var commitErr error
+		if !buffer.existsBefore {
+			if targetErr := s.validateBatchCreateTarget(path, buffer.relPath); targetErr != nil {
+				commitErr = targetErr
+			} else {
+				commitErr = writer(path, buffer.content, buffer.mode)
+			}
+		} else {
+			commitErr = writer(path, buffer.content, buffer.mode)
+		}
+		if commitErr != nil {
+			message := fmt.Sprintf("could not commit %s: %v", buffer.relPath, commitErr)
+			return finishCommitFailure(buffer.relPath, message), nil
+		}
+	}
+	for _, path := range orderedPaths {
+		buffer := buffers[path]
+		if buffer.existsAfter {
+			continue
+		}
+		if commitErr := remover(path); commitErr != nil {
+			message := fmt.Sprintf("could not commit %s: %v", buffer.relPath, commitErr)
 			return finishCommitFailure(buffer.relPath, message), nil
 		}
 	}
@@ -529,6 +783,9 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 	for _, plan := range plans {
 		session := s.sessionFor(ctx)
 		session.recordModified(plan.file)
+		if plan.destination != "" {
+			session.recordModified(plan.destination)
+		}
 		if plan.edit.SymbolID != "" {
 			session.recordSymbol(plan.edit.SymbolID)
 		}
@@ -780,7 +1037,7 @@ func (s *Server) handleAtomicBatchEdit(ctx context.Context, req mcp.CallToolRequ
 			}
 			plan = append(plan, map[string]any{
 				"order": i + 1, "op": item.op, "id": item.edit.SymbolID,
-				"path": item.file, "status": status,
+				"path": item.file, "destination": item.destination, "status": status,
 			})
 		}
 		if isCompact(req) {
