@@ -36,25 +36,31 @@ const qCppAll = `
   (enum_specifier
     name: (type_identifier) @enum.name) @enum.def
 
+  ; A definition written outside its declaring scope — void ns::Cls::run()
+  ; in the .cpp for a header's class — declares itself with a
+  ; qualified_identifier, so admitting only a bare identifier here dropped the
+  ; whole definition: no node, and every call in the body went with it for
+  ; want of an enclosing function range. emitOutOfLineMember reads the
+  ; qualifier off the node; the capture stays the plain-name fast path.
   (function_definition
     declarator: (function_declarator
-      declarator: (identifier) @func.name)) @func.def
+      declarator: [(identifier) (qualified_identifier)] @func.name)) @func.def
 
   (function_definition
     declarator: (pointer_declarator
       declarator: (function_declarator
-        declarator: (identifier) @func.name))) @func.def
+        declarator: [(identifier) (qualified_identifier)] @func.name))) @func.def
 
   (function_definition
     declarator: (pointer_declarator
       declarator: (pointer_declarator
         declarator: (function_declarator
-          declarator: (identifier) @func.name)))) @func.def
+          declarator: [(identifier) (qualified_identifier)] @func.name)))) @func.def
 
   (function_definition
     declarator: (reference_declarator
       (function_declarator
-        declarator: (identifier) @func.name))) @func.def
+        declarator: [(identifier) (qualified_identifier)] @func.name))) @func.def
 
   (template_declaration
     (function_definition) @tmplfn.inner) @tmplfn.def
@@ -156,7 +162,7 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 			switch {
 
 			case m.Captures["ns.def"] != nil:
-				e.emitNamespace(m, filePath, fileID, result)
+				e.emitNamespace(m, filePath, fileID, result, seen)
 
 			case m.Captures["class.def"] != nil:
 				e.emitClass(m, filePath, fileID, src, result, seen)
@@ -194,7 +200,7 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 
 			case m.Captures["callq.expr"] != nil:
 				expr := m.Captures["callq.expr"]
-				name := cppQualifiedCallName(m.Captures["callq.name"].Node, src)
+				_, name := cppQualifiedParts(m.Captures["callq.name"].Node, src)
 				if name == "" {
 					return
 				}
@@ -270,10 +276,13 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 
 // --- Per-match emit helpers -----------------------------------------
 
-func (e *CppExtractor) emitNamespace(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+func (e *CppExtractor) emitNamespace(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
 	name := m.Captures["ns.name"].Text
 	def := m.Captures["ns.def"]
 	id := filePath + "::" + name
+	// Records that this name is a namespace, so an out-of-line definition
+	// qualified with it is read as a free function rather than a member.
+	seen[cppNamespaceMarker(filePath, name)] = true
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindPackage, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
@@ -296,6 +305,7 @@ func (e *CppExtractor) emitClass(m parser.QueryResult, filePath, fileID string, 
 		return
 	}
 	seen[classID] = true
+	seen[cppTypeMarker(filePath, className)] = true
 	meta := map[string]any{"type_flavor": "class"}
 	if ns := enclosingCppNamespace(def.Node, src); ns != "" {
 		meta["scope_ns"] = ns
@@ -425,6 +435,7 @@ func (e *CppExtractor) emitStruct(m parser.QueryResult, filePath, fileID string,
 		return
 	}
 	seen[id] = true
+	seen[cppTypeMarker(filePath, name)] = true
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
@@ -502,6 +513,9 @@ func (e *CppExtractor) emitFunction(m parser.QueryResult, filePath, fileID strin
 	if cppTemplateOwnsDefinition(def.Node) {
 		return
 	}
+	if e.emitOutOfLineMember(def.Node, startLine, def.EndLine+1, filePath, fileID, src, result, seen) {
+		return
+	}
 	e.emitFreeFunction(m.Captures["func.name"].Text, def.Node, startLine, def.EndLine+1,
 		filePath, fileID, src, result, seen)
 }
@@ -517,6 +531,12 @@ func (e *CppExtractor) emitFunction(m parser.QueryResult, filePath, fileID strin
 func (e *CppExtractor) emitTemplateFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	def, inner := m.Captures["tmplfn.def"], m.Captures["tmplfn.inner"]
 	if def == nil || inner == nil || inner.Node == nil || cppInsideTypeBody(inner.Node) {
+		return
+	}
+	// `template <typename T> void Holder<T>::put(T) {…}` is an out-of-line
+	// member, not a free template function — its span is still the
+	// template_declaration's, so the header is covered either way.
+	if e.emitOutOfLineMember(inner.Node, def.StartLine+1, def.EndLine+1, filePath, fileID, src, result, seen) {
 		return
 	}
 	e.emitFreeFunction(cppFreeTemplateFuncName(inner.Node, src), inner.Node,
@@ -649,7 +669,8 @@ func extractFuncName(funcNode *sitter.Node, src []byte) string {
 		case "identifier", "field_identifier", "destructor_name", "operator_name":
 			return gc.Content(src)
 		case "qualified_identifier":
-			return lastIdentifier(gc, src)
+			_, name := cppQualifiedParts(gc, src)
+			return name
 		}
 	}
 	return ""
@@ -691,38 +712,6 @@ func cppInnerDeclarator(decl *sitter.Node) *sitter.Node {
 		}
 	}
 	return nil
-}
-
-// cppQualifiedCallName follows a qualified call's name field until it reaches
-// the trailing identifier. tree-sitter-cpp nests another qualified_identifier
-// there for every additional :: segment; a templated tail adds one
-// template_function wrapper. Unknown shapes return no evidence rather than
-// inventing a callee name.
-func cppQualifiedCallName(node *sitter.Node, src []byte) string {
-	for depth := 0; node != nil && depth < 64; depth++ {
-		switch node.Type() {
-		case "identifier", "field_identifier":
-			return node.Content(src)
-		case "qualified_identifier", "template_function":
-			node = node.ChildByFieldName("name")
-		default:
-			return ""
-		}
-	}
-	return ""
-}
-
-// lastIdentifier extracts the last identifier from a qualified_identifier.
-func lastIdentifier(node *sitter.Node, src []byte) string {
-	name := ""
-	for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
-		child := node.NamedChild(i)
-		switch child.Type() {
-		case "identifier", "field_identifier", "destructor_name":
-			name = child.Content(src)
-		}
-	}
-	return name
 }
 
 // enclosingCppNamespace walks node up through the tree-sitter AST
