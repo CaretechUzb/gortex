@@ -55,6 +55,10 @@ const (
 	// index. Recoverable: the agent can search for it instead.
 	ErrCodeSymbolNotFound ErrorCode = "symbol_not_found"
 
+	// ErrCodeSymbolNotIndexed — the symbol's file exists and is in scope but
+	// carries no indexed symbols, so semantic rename cannot see it.
+	ErrCodeSymbolNotIndexed ErrorCode = "symbol_not_indexed"
+
 	// ErrCodeFileNotIndexed — no symbols are indexed for the requested
 	// file (new / ignored / unsupported language). Recoverable.
 	ErrCodeFileNotIndexed ErrorCode = "file_not_indexed"

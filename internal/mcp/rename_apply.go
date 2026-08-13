@@ -47,28 +47,42 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 		return nil
 	}
 
+	content, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil
+	}
+	occurrences := countIdentifierOccurrences(string(content), requestedSymbol)
+	if occurrences == 0 {
+		return nil
+	}
+
 	return map[string]any{
 		"status":                   "refused",
-		"error_code":               "symbol_not_indexed",
 		"symbol_id":                id,
 		"requested_symbol":         requestedSymbol,
 		"new_name":                 newName,
 		"file":                     file,
+		"occurrences":              occurrences,
 		"semantic_rename_complete": false,
 		"written":                  false,
 		"dry_run":                  dryRun,
 		"safe_fallback": map[string]any{
-			"tool":      "edit",
-			"operation": "file",
-			"target":    map[string]any{"file": file},
-			"required_guards": []string{
-				"explicit file target",
-				"whole-identifier match",
-				"expected_occurrences",
-				"base_sha",
+			"tool":        "edit",
+			"operation":   "file",
+			"target":      map[string]any{"file": file},
+			"match":       requestedSymbol,
+			"replacement": newName,
+			"options":     map[string]any{"replace_all": true},
+			"guard": map[string]any{
+				"expected_occurrences": occurrences,
+				"base_sha":             gitBlobSHA(content),
+			},
+			"guidance": []string{
+				"Use the explicit file target and keep the replacement bounded to whole identifiers.",
+				"If the exact edit reports a different raw match count, use narrower contextual replacements.",
 			},
 		},
-		"warning": "Cross-file references are not proven because this file is outside the graph. No text was changed.",
+		"warning": "Cross-file references are not proven because this symbol is unavailable to the semantic graph. No text was changed.",
 	}
 }
 
@@ -114,6 +128,21 @@ func identifierBoundary(line string, start, end int) bool {
 		}
 	}
 	return true
+}
+
+// countIdentifierOccurrences returns the number of whole-identifier matches in
+// content. The same boundary rule used by rename planning keeps a requested
+// name from matching inside a longer identifier.
+func countIdentifierOccurrences(content, name string) int {
+	count := 0
+	for from := 0; ; {
+		idx := indexIdentifier(content, name, from)
+		if idx < 0 {
+			return count
+		}
+		count++
+		from = idx + len(name)
+	}
 }
 
 // replaceIdentifierAll rewrites every whole-identifier occurrence of old and

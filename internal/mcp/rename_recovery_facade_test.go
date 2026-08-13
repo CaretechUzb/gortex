@@ -25,9 +25,12 @@ func TestRenameFacade_UnindexedRecovery(t *testing.T) {
 	}
 	res, err := srv.handleFacade(context.Background(), "refactor", req)
 	require.NoError(t, err)
-	resp := decodeRenameResp(t, res)
+	require.True(t, res.IsError)
+	require.Equal(t, facadeOutcomeToolError, classifyFacadeOutcome(res, nil))
+	resp := decodeRenameErrorResp(t, res)
 	require.Equal(t, "symbol_not_indexed", resp["error_code"])
-	require.Equal(t, false, resp["written"])
+	require.Equal(t, "refused", resp["data"].(map[string]any)["status"])
+	require.Equal(t, false, resp["data"].(map[string]any)["written"])
 
 	got, err := os.ReadFile(path)
 	require.NoError(t, err)
