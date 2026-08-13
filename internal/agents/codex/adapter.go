@@ -519,10 +519,9 @@ func upsertSessionStartHook(root map[string]any, env agents.Env, opts agents.App
 }
 
 func upsertPreToolUseHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
-	// Codex permits several handlers in one matcher group. Users sometimes add
-	// their own handler beside an installed Gortex handler, so split mixed
-	// groups before replacing legacy Gortex matchers; group-level replacement
-	// would otherwise delete the co-located user handler.
+	// Codex permits several handlers in one matcher group. Normalize at handler
+	// granularity before replacing legacy Gortex matchers: this preserves every
+	// co-located user handler while collapsing duplicate managed invocations.
 	splitChanged := splitMixedCodexPreToolUseGroups(root)
 	desired := []map[string]any{codexPreToolUseHookEntry(env)}
 	upsertChanged := upsertCodexHookSet(root, "PreToolUse", codexHookEntryIsGortexPreToolUse, desired, opts)
@@ -539,14 +538,17 @@ func splitMixedCodexPreToolUseGroups(root map[string]any) bool {
 		return false
 	}
 
+	normalized := make([]any, 0, len(entries))
 	changed := false
 	for _, entry := range entries {
 		group, ok := entry.(map[string]any)
 		if !ok {
+			normalized = append(normalized, entry)
 			continue
 		}
 		handlers, ok := codexHookList(group["hooks"])
 		if !ok {
+			normalized = append(normalized, entry)
 			continue
 		}
 		managed := 0
@@ -562,13 +564,32 @@ func splitMixedCodexPreToolUseGroups(root map[string]any) bool {
 			}
 			kept = append(kept, handler)
 		}
-		if managed == 0 || len(kept) == 0 {
-			continue
+		switch {
+		case managed == 0:
+			normalized = append(normalized, entry)
+		case managed == 1 && len(handlers) == 1:
+			// Leave a singleton managed group for upsertCodexHookSet to
+			// validate or replace. A current singleton remains idempotent.
+			normalized = append(normalized, entry)
+		default:
+			changed = true
+			if len(kept) == 0 {
+				continue
+			}
+			preserved := make(map[string]any, len(group))
+			for key, value := range group {
+				preserved[key] = value
+			}
+			preserved["hooks"] = kept
+			normalized = append(normalized, preserved)
 		}
-		group["hooks"] = kept
-		changed = true
 	}
-	return changed
+	if !changed {
+		return false
+	}
+	hooks["PreToolUse"] = normalized
+	root["hooks"] = hooks
+	return true
 }
 
 func upsertPostToolUseHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
