@@ -1062,13 +1062,10 @@ func TestFacadeCapabilitiesReturnsOperationSchema(t *testing.T) {
 	boundary := optionProperties["new_user_task"].(map[string]any)
 	require.Equal(t, "boolean", boundary["type"])
 	require.Contains(t, boundary["description"], "first read.file")
-	shape, ok := out["request_shape"].(map[string]any)
+	requestShape, ok := out["request_shape"].(map[string]any)
 	require.True(t, ok)
-	require.Equal(t, "read", shape["tool"])
-	arguments, ok := shape["arguments"].(map[string]any)
-	require.True(t, ok)
-	require.Equal(t, "file", arguments["operation"])
-	require.Equal(t, map[string]any{"file": "<file>"}, arguments["target"])
+	require.Equal(t, "file", requestShape["operation"])
+	require.Equal(t, map[string]any{"file": "<file>"}, requestShape["target"])
 }
 
 func TestFacadeCapabilitiesChangeImpactUsesPublicTargetSchema(t *testing.T) {
@@ -1108,8 +1105,8 @@ func TestFacadeCapabilitiesChangeImpactUsesPublicTargetSchema(t *testing.T) {
 	for _, field := range []string{"summary_only", "offset", "limit", "format", "max_bytes"} {
 		require.Contains(t, outputProperties, field)
 	}
-	shape := out["request_shape"].(map[string]any)["arguments"].(map[string]any)
-	require.Equal(t, map[string]any{"symbol": "<symbol>"}, shape["target"])
+	requestShape := out["request_shape"].(map[string]any)
+	require.Equal(t, map[string]any{"symbol": "<symbol>"}, requestShape["target"])
 }
 
 func TestFacadeCapabilitiesRequestShapesUsePublicMutationFields(t *testing.T) {
@@ -1149,11 +1146,9 @@ func TestFacadeCapabilitiesRequestShapesUsePublicMutationFields(t *testing.T) {
 		result, err := srv.handleCapabilities(context.Background(), req)
 		require.NoError(t, err)
 		out := unmarshalResult(t, result)
-		shape, ok := out["request_shape"].(map[string]any)
+		requestShape, ok := out["request_shape"].(map[string]any)
 		require.True(t, ok)
-		arguments, ok := shape["arguments"].(map[string]any)
-		require.True(t, ok)
-		return arguments
+		return requestShape
 	}
 
 	edit := requestShape("edit", "file")
@@ -1216,8 +1211,8 @@ func TestFacadeCapabilitiesDiscoversNativeAnalyzeKinds(t *testing.T) {
 	out := unmarshalResult(t, result)
 	require.Equal(t, true, out["available"])
 	require.Equal(t, AnalyzeKindDescription("todos"), out["summary"])
-	shape := out["request_shape"].(map[string]any)["arguments"].(map[string]any)
-	require.Equal(t, "todos", shape["kind"])
+	requestShape := out["request_shape"].(map[string]any)
+	require.Equal(t, "todos", requestShape["kind"])
 	schema := out["input_schema"].(map[string]any)
 	schemaProperties := schema["properties"].(map[string]any)
 	optionsProperties := schemaProperties["options"].(map[string]any)["properties"].(map[string]any)
@@ -1313,15 +1308,15 @@ func TestFacadeCapabilitiesCollapseSessionSubscriptionChannels(t *testing.T) {
 	schemaReq.Params.Arguments = map[string]any{"domain": "session", "operation": "subscribe", "detail": "schema"}
 	schemaResult, err := srv.handleCapabilities(context.Background(), schemaReq)
 	require.NoError(t, err)
-	shape := unmarshalResult(t, schemaResult)["request_shape"].(map[string]any)["arguments"].(map[string]any)
-	require.Equal(t, "subscribe", shape["operation"])
-	require.Equal(t, "<channel>", shape["channel"])
+	requestShape := unmarshalResult(t, schemaResult)["request_shape"].(map[string]any)
+	require.Equal(t, "subscribe", requestShape["operation"])
+	require.Equal(t, "<channel>", requestShape["channel"])
 
 	cursorReq := mcpgo.CallToolRequest{}
 	cursorReq.Params.Arguments = map[string]any{"domain": "session", "operation": "cursor", "detail": "schema"}
 	cursorResult, err := srv.handleCapabilities(context.Background(), cursorReq)
 	require.NoError(t, err)
-	cursorShape := unmarshalResult(t, cursorResult)["request_shape"].(map[string]any)["arguments"].(map[string]any)
+	cursorShape := unmarshalResult(t, cursorResult)["request_shape"].(map[string]any)
 	require.Equal(t, "cursor", cursorShape["operation"])
 	require.Equal(t, "<action>", cursorShape["arguments"].(map[string]any)["action"])
 
