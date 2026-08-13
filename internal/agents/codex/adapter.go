@@ -60,8 +60,8 @@ const (
 	v060CodexSessionStartCommand        = "printf '%s\\n' '" + v060CodexSessionStartMessage + "'"
 	v060CodexSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + v060CodexSessionStartMessage + "'\""
 	codexPreToolUseMatcher              = "^Bash$"
-	codexMCPReadPreToolUseMatcher       = "^mcp__gortex__read$"
-	codexPostToolUseMatcher             = "^(Bash|apply_patch)$"
+	codexMCPReadPreToolUseMatcher       = "^(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze)$"
+	codexPostToolUseMatcher             = "^(Bash|apply_patch|(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze))$"
 	codexHookTimeoutSeconds             = 5
 	codexHookModeEnvVar                 = "GORTEX_CODEX_HOOK_MODE"
 	// Codex merges its home instructions file into every session ahead of

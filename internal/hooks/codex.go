@@ -100,9 +100,9 @@ func runCodex(data []byte, port int, selected ...CodexMode) {
 		default:
 			runPreToolUse(data, port, ModeEnrich)
 		}
-	case peek.HookEventName == "PreToolUse" && codexMCPReadPreToolUseTool(peek.ToolName):
-		runCodexMCPReadPreToolUse(data, mode)
-	case peek.HookEventName == "PostToolUse" && (peek.ToolName == "Bash" || peek.ToolName == "apply_patch"):
+	case peek.HookEventName == "PreToolUse" && codexLocalizationPreToolUseTool(peek.ToolName):
+		runCodexLocalizationPreToolUse(data, mode)
+	case peek.HookEventName == "PostToolUse" && (peek.ToolName == "Bash" || peek.ToolName == "apply_patch" || localizationNavigationTool(peek.ToolName)):
 		runCodexPostToolUse(data, port, mode)
 	case peek.HookEventName == "UserPromptSubmit":
 		// Re-surface graph symbols relevant to the prompt on every turn.
@@ -294,45 +294,67 @@ func codexMCPReadPreToolUseTool(toolName string) bool {
 	}
 }
 
-func runCodexMCPReadPreToolUse(data []byte, mode CodexMode) {
+func codexLocalizationPreToolUseTool(toolName string) bool {
+	return codexMCPReadPreToolUseTool(toolName) || localizationNavigationTool(toolName)
+}
+
+func runCodexLocalizationPreToolUse(data []byte, mode CodexMode) {
 	started := time.Now()
 	var input HookInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
 	}
-	if input.HookEventName != "PreToolUse" || !codexMCPReadPreToolUseTool(input.ToolName) {
+	if input.HookEventName != "PreToolUse" || !codexLocalizationPreToolUseTool(input.ToolName) {
 		return
 	}
+
+	updatedInput := map[string]any(nil)
+	if turn, ok := currentLocalizationTurnState(input.SessionID, input.PromptID, input.AgentID, input.CWD); ok {
+		if authToken, ready := snapshotLocalizationToolUseWithAuth(input, turn.Identity); ready {
+			updatedInput = localizationPreToolUpdatedInput(input, authToken, turn.ProblemStatement)
+		}
+	}
+
 	daemonUp := daemonReachableFn()
 	emitted := false
 	defer func() {
 		logHookEffectiveness("PreToolUse", emitted, daemonUp, 0, time.Since(started))
 	}()
 
-	// Daemon outage: nudging, rewriting, or (in deny mode) blocking a Gortex
-	// read is moot when the daemon cannot serve it — the call is about to
-	// fail on transport, and a compress-bodies deny on top of that failure
-	// would read as enforcement of a tool that does not answer (#486).
-	if !daemonUp {
+	ctx := ""
+	if daemonUp && codexMCPReadPreToolUseTool(input.ToolName) {
+		ctx = gortexReadNudge(input.ToolName, input.ToolInput)
+	}
+	if ctx == "" && updatedInput == nil {
 		return
 	}
-
-	ctx := gortexReadNudge(input.ToolName, input.ToolInput)
-	if ctx == "" {
-		return
+	hso := &HookSpecificOutput{
+		HookEventName:     "PreToolUse",
+		AdditionalContext: ctx,
+		UpdatedInput:      updatedInput,
 	}
-	hso := &HookSpecificOutput{HookEventName: "PreToolUse", AdditionalContext: ctx}
-	switch mode {
-	case CodexModeDeny:
-		hso.AdditionalContext = ""
-		hso.PermissionDecision = "deny"
-		hso.PermissionDecisionReason = ctx
-	case CodexModeRewrite:
-		hso.PermissionDecision = "allow"
-		hso.UpdatedInput = rewrittenGortexReadInput(input.ToolName, input.ToolInput)
+	if ctx != "" {
+		switch mode {
+		case CodexModeDeny:
+			hso.AdditionalContext = ""
+			hso.PermissionDecision = "deny"
+			hso.PermissionDecisionReason = ctx
+		case CodexModeRewrite:
+			hso.PermissionDecision = "allow"
+			rewritten := rewrittenGortexReadInput(input.ToolName, input.ToolInput)
+			for key, value := range updatedInput {
+				rewritten[key] = value
+			}
+			hso.UpdatedInput = rewritten
+		}
 	}
 	emitted = true
 	emitPreToolUse(HookOutput{HookSpecificOutput: hso})
+}
+
+// Kept for existing callers that exercise the read-only Codex path directly.
+func runCodexMCPReadPreToolUse(data []byte, mode CodexMode) {
+	runCodexLocalizationPreToolUse(data, mode)
 }
 
 func rewrittenGortexReadInput(toolName string, input map[string]any) map[string]any {
@@ -432,6 +454,12 @@ func runCodexPostToolUse(data []byte, port int, mode CodexMode) {
 		return
 	}
 	if input.HookEventName != "PostToolUse" {
+		return
+	}
+	if localizationNavigationTool(input.ToolName) {
+		if terminal, observed := observeLocalizationTerminal(data); observed {
+			_ = emitLocalizationTerminalContext(terminal)
+		}
 		return
 	}
 	if input.ToolName == "apply_patch" {
