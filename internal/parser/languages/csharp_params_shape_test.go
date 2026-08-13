@@ -58,6 +58,7 @@ func TestCSharpExtractor_DiscardEmitsParamNode(t *testing.T) {
 	}
 	discard := byID["Handler.cs::Handler.Handle#param:_@0"]
 	require.NotNil(t, discard)
+	assert.Equal(t, "_", discard.Name)
 	assert.Equal(t, "int", discard.Meta["type"])
 	assert.Equal(t, 0, discard.Meta["position"])
 }

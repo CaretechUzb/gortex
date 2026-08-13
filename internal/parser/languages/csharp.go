@@ -1285,8 +1285,7 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	// Parameter arity — the evidence that splits a same-name overload set
 	// the receiver type alone cannot. Stamped on the node rather than read
 	// back off the KindParam nodes because those carry no default-value
-	// marker (and a discard parameter emits none at all), so they cannot
-	// answer "how many arguments MUST a caller supply".
+	// marker, so they cannot answer "how many arguments MUST a caller supply".
 	if count, required, variadic, ok := csharpParamArity(def.Node, src); ok {
 		meta["param_count"] = count
 		if required != count {

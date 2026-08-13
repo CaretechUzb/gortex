@@ -144,10 +144,9 @@ func TestCSharpExtractor_MethodStampsParamArity(t *testing.T) {
 	assert.Equal(t, 0, nullary.Meta["param_count"])
 }
 
-// A discard parameter is a real positional slot. Skipping its node while
-// also skipping its position renumbered every parameter after it, so
-// `name` in `Foo(int _, string name)` reported position 0 — the slot the
-// discard occupies.
+// An underscore in a method declaration is an ordinary named parameter and a
+// real positional slot. Emitting it under its own name keeps the node ID, Name,
+// named-argument spelling, and later parameter positions consistent.
 func TestCSharpExtractor_DiscardParamKeepsPositions(t *testing.T) {
 	src := []byte(`namespace App {
     public class Handler {
@@ -165,7 +164,7 @@ func TestCSharpExtractor_DiscardParamKeepsPositions(t *testing.T) {
 			pos[n.Name] = n.Meta["position"]
 		}
 	}
-	assert.Equal(t, 1, pos["name"], "name follows the discard in slot 1")
+	assert.Equal(t, 0, pos["_"], "the declared underscore parameter keeps its own name and slot")
+	assert.Equal(t, 1, pos["name"])
 	assert.Equal(t, 2, pos["count"])
-	assert.NotContains(t, pos, "_", "a discard names no value, so it emits no node")
 }

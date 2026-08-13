@@ -46,15 +46,10 @@ func emitCSharpParamNodes(ownerID string, params *sitter.Node, src []byte, fileP
 		if startLine == 0 {
 			startLine = declLine
 		}
-		displayName := entry.name
-		if displayName == "_" {
-			// A discard occupies a signature slot but binds no value.
-			displayName = "<discard>"
-		}
 		result.Nodes = append(result.Nodes, &graph.Node{
 			ID:        paramID,
 			Kind:      graph.KindParam,
-			Name:      displayName,
+			Name:      entry.name,
 			FilePath:  filePath,
 			StartLine: startLine,
 			EndLine:   entry.endLine,
