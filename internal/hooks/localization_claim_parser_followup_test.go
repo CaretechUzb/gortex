@@ -130,6 +130,125 @@ func TestLocalizationClaimLockFailureTelemetryDoesNotClaimContext(t *testing.T) 
 	}
 }
 
+func TestLocalizationClaimParserRespectsIndentedCode(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		want    []string
+	}{
+		{name: "zero-space Setext", message: "Fabricated.flush\n---"},
+		{name: "three-space Setext", message: "   Fabricated.flush\n   ---"},
+		{name: "four-space code", message: "    Fabricated.flush\n    ---", want: []string{"Fabricated.flush"}},
+		{name: "tab-indented code", message: "\tFabricated.flush\n\t---", want: []string{"Fabricated.flush"}},
+		{name: "top-level claim and code underline", message: "Fabricated.flush\n    ---", want: []string{"Fabricated.flush"}},
+		{name: "quoted Setext", message: "> Fabricated.flush\n> ---"},
+		{name: "different quote containers", message: "> Fabricated.flush\n>> ---", want: []string{"Fabricated.flush"}},
+		{name: "structured claim before thematic break", message: "SYMBOLS:\n- Fabricated.flush\n---", want: []string{"Fabricated.flush"}},
+		{name: "list claim before thematic break", message: "- Fabricated.flush\n---", want: []string{"Fabricated.flush"}},
+		{name: "atx heading", message: "# Fabricated.flush"},
+		{name: "fenced heading-like code", message: "```text\n# Fabricated.flush\n```", want: []string{"Fabricated.flush"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			claims, _, valid := localizationBoundedSymbolClaims(test.message)
+			if !valid {
+				t.Fatal("message was rejected")
+			}
+			assertLocalizationClaims(t, claims, test.want)
+		})
+	}
+}
+
+func TestLocalizationClaimParserKeepsAmbiguousExtensionSymbols(t *testing.T) {
+	for _, identity := range []string{"obj.m", "module.r", "node.s", "pkg.v", "value.d"} {
+		t.Run(identity+" symbol", func(t *testing.T) {
+			claims, _, valid := localizationBoundedSymbolClaims("The owner is " + identity + ".")
+			if !valid {
+				t.Fatal("message was rejected")
+			}
+			assertLocalizationClaims(t, claims, []string{identity})
+		})
+		t.Run(identity+" file context", func(t *testing.T) {
+			claims, _, valid := localizationBoundedSymbolClaims("The source file is " + identity + ".")
+			if !valid {
+				t.Fatal("message was rejected")
+			}
+			assertLocalizationClaims(t, claims, nil)
+		})
+		t.Run(identity+" structured", func(t *testing.T) {
+			claims, _, valid := localizationBoundedSymbolClaims("SYMBOLS:\n- " + identity)
+			if !valid {
+				t.Fatal("message was rejected")
+			}
+			assertLocalizationClaims(t, claims, []string{identity})
+		})
+	}
+	claims, _, valid := localizationBoundedSymbolClaims("See file foo.c.")
+	if !valid {
+		t.Fatal("C file message was rejected")
+	}
+	assertLocalizationClaims(t, claims, nil)
+}
+
+func TestLocalizationStructuredClaimsNormalizeSentencePunctuation(t *testing.T) {
+	for _, test := range []struct {
+		row  string
+		want string
+	}{
+		{row: "flush,", want: "flush"},
+		{row: "Writer;", want: "Writer"},
+		{row: "_private.", want: "_private"},
+		{row: "$foo:", want: "$foo"},
+		{row: "`flush`,", want: "flush"},
+		{row: "flush(),", want: "flush"},
+	} {
+		t.Run(test.row, func(t *testing.T) {
+			claims, _, valid := localizationBoundedSymbolClaims("SYMBOLS:\n- " + test.row)
+			if !valid {
+				t.Fatal("message was rejected")
+			}
+			assertLocalizationClaims(t, claims, []string{test.want})
+		})
+	}
+	claims, _, valid := localizationBoundedSymbolClaims("SYMBOLS:\n- Writer performs the work.")
+	if !valid {
+		t.Fatal("prose row was rejected")
+	}
+	assertLocalizationClaims(t, claims, nil)
+}
+
+func TestLocalizationClaimParserRecognizesStableFileVocabulary(t *testing.T) {
+	files := []string{
+		"README", "LICENSE", "CHANGELOG", "Dockerfile.ci", "Makefile.am", "CMakeLists.txt",
+		"go.mod", "go.sum", "go.work", "Cargo.lock", "notebook.ipynb", "contract.sol",
+		"module.move", "program.cairo", "circuit.noir", "contract.tact", "service.bal",
+		"settings.toml", "page.vue", "template.gotmpl", "document.adoc",
+	}
+	for _, file := range files {
+		t.Run(file, func(t *testing.T) {
+			claims, _, valid := localizationBoundedSymbolClaims("See " + file + ".")
+			if !valid {
+				t.Fatal("message was rejected")
+			}
+			assertLocalizationClaims(t, claims, nil)
+		})
+	}
+	for _, test := range []struct {
+		message string
+		want    string
+	}{
+		{message: "The owner is writer.flush.", want: "writer.flush"},
+		{message: "The owner is obj.m.", want: "obj.m"},
+		{message: "The owner is file.ext::symbol.", want: "file.ext::symbol"},
+	} {
+		claims, _, valid := localizationBoundedSymbolClaims(test.message)
+		if !valid {
+			t.Fatalf("message %q was rejected", test.message)
+		}
+		assertLocalizationClaims(t, claims, []string{test.want})
+	}
+}
+
 func assertLocalizationClaims(t *testing.T, got, want []string) {
 	t.Helper()
 	if len(got) != len(want) {

@@ -70,8 +70,8 @@ func localizationBoundedSymbolClaims(message string) ([]string, bool, bool) {
 	var fence localizationMarkdownFenceState
 
 	for index, line := range lines {
-		markdown := localizationMarkdownContainerContent(line)
-		if marker, ok := localizationMarkdownFenceMarker(markdown); ok {
+		markdown := localizationParseMarkdownContainer(line)
+		if marker, ok := localizationMarkdownFenceMarker(markdown.content); ok && !markdown.codeIndented {
 			if !fence.open {
 				fence = marker
 				continue
@@ -184,6 +184,9 @@ func localizationScanUnstructuredClaimBody(body string, budget *localizationClai
 		// '_' and '$' are identifier characters, not wrappers. Trimming them
 		// silently changed _private/$foo into another identity (or no claim).
 		claim := strings.Trim(token, ".:#\\/-")
+		if localizationContextualFileClaim(body, start, end, claim) {
+			return true
+		}
 		explicitSyntax := localizationExplicitInlineClaim(body, start, end, claim)
 		return budget.addClaim(claim, !explicitSyntax)
 	}
@@ -208,6 +211,57 @@ func localizationScanUnstructuredClaimBody(body string, budget *localizationClai
 // the answer marks it as code or a call. Ordinary prose words remain outside
 // claim checking; qualified and file-qualified identities continue through
 // localizationCodeShapedClaim instead.
+func localizationContextualFileClaim(body string, start, end int, claim string) bool {
+	if !localizationAmbiguousFileExtension(claim) {
+		return false
+	}
+	const contextBytes = 64
+	beforeStart := start - contextBytes
+	if beforeStart < 0 {
+		beforeStart = 0
+	}
+	afterEnd := end + contextBytes
+	if afterEnd > len(body) {
+		afterEnd = len(body)
+	}
+	before := localizationContextWords(body[beforeStart:start])
+	after := localizationContextWords(body[end:afterEnd])
+	return localizationFileContextBefore(before) || (len(after) > 0 && localizationFileContextWord(after[0]))
+}
+
+func localizationContextWords(value string) []string {
+	return strings.FieldsFunc(strings.ToLower(value), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'
+	})
+}
+
+func localizationFileContextBefore(words []string) bool {
+	if len(words) == 0 {
+		return false
+	}
+	if localizationFileContextWord(words[len(words)-1]) {
+		return true
+	}
+	if len(words) < 2 {
+		return false
+	}
+	switch words[len(words)-1] {
+	case "is", "at", "named", "called":
+		return localizationFileContextWord(words[len(words)-2])
+	default:
+		return false
+	}
+}
+
+func localizationFileContextWord(word string) bool {
+	switch word {
+	case "file", "path", "source", "header", "document", "manifest":
+		return true
+	default:
+		return false
+	}
+}
+
 func localizationExplicitInlineClaim(body string, start, end int, claim string) bool {
 	if !localizationExplicitIdentityRow(claim, claim) {
 		return false
@@ -276,23 +330,33 @@ func localizationMarkdownFenceMarker(line string) (localizationMarkdownFenceStat
 }
 
 type localizationMarkdownContainer struct {
-	content    string
-	quoteDepth int
-	listItem   bool
+	content      string
+	quoteDepth   int
+	listItem     bool
+	codeIndented bool
 }
 
 func localizationParseMarkdownContainer(line string) localizationMarkdownContainer {
-	container := localizationMarkdownContainer{content: strings.TrimSpace(line)}
+	container := localizationMarkdownContainer{content: strings.TrimRight(line, " \t\r")}
 	for depth := 0; depth < 8 && container.content != ""; depth++ {
+		content, codeIndented := localizationMarkdownIndent(container.content)
+		container.content = strings.TrimRight(content, " \t\r")
+		if codeIndented {
+			container.codeIndented = true
+			break
+		}
 		line = container.content
+		if line == "" {
+			break
+		}
 		if line[0] == '>' && (len(line) == 1 || line[1] == ' ' || line[1] == '\t') {
 			container.quoteDepth++
-			container.content = strings.TrimSpace(line[1:])
+			container.content = localizationMarkdownMarkerRemainder(line[1:])
 			continue
 		}
 		if len(line) >= 2 && strings.ContainsRune("-*+", rune(line[0])) && (line[1] == ' ' || line[1] == '\t') {
 			container.listItem = true
-			container.content = strings.TrimSpace(line[1:])
+			container.content = localizationMarkdownMarkerRemainder(line[1:])
 			continue
 		}
 		index := 0
@@ -301,7 +365,7 @@ func localizationParseMarkdownContainer(line string) localizationMarkdownContain
 		}
 		if index > 0 && index+1 < len(line) && (line[index] == '.' || line[index] == ')') && (line[index+1] == ' ' || line[index+1] == '\t') {
 			container.listItem = true
-			container.content = strings.TrimSpace(line[index+1:])
+			container.content = localizationMarkdownMarkerRemainder(line[index+1:])
 			continue
 		}
 		break
@@ -309,12 +373,42 @@ func localizationParseMarkdownContainer(line string) localizationMarkdownContain
 	return container
 }
 
+func localizationMarkdownIndent(line string) (string, bool) {
+	columns := 0
+	for index := 0; index < len(line); index++ {
+		switch line[index] {
+		case ' ':
+			columns++
+			if columns >= 4 {
+				return line[index+1:], true
+			}
+		case '\t':
+			// A leading tab advances to at least the four-column code indent.
+			return line[index+1:], true
+		default:
+			return line[index:], false
+		}
+	}
+	return "", false
+}
+
+func localizationMarkdownMarkerRemainder(line string) string {
+	if line != "" && (line[0] == ' ' || line[0] == '\t') {
+		line = line[1:]
+	}
+	return strings.TrimRight(line, " \t\r")
+}
+
 func localizationMarkdownContainerContent(line string) string {
 	return localizationParseMarkdownContainer(line).content
 }
 
 func localizationMarkdownHeading(line string) bool {
-	line = localizationMarkdownContainerContent(line)
+	container := localizationParseMarkdownContainer(line)
+	if container.codeIndented {
+		return false
+	}
+	line = container.content
 	count := 0
 	for count < len(line) && line[count] == '#' {
 		count++
@@ -323,7 +417,11 @@ func localizationMarkdownHeading(line string) bool {
 }
 
 func localizationMarkdownSetextUnderline(line string) bool {
-	line = localizationMarkdownContainerContent(line)
+	container := localizationParseMarkdownContainer(line)
+	if container.codeIndented {
+		return false
+	}
+	line = container.content
 	if line == "" || (line[0] != '=' && line[0] != '-') {
 		return false
 	}
@@ -343,11 +441,12 @@ func localizationMarkdownHeadingAt(lines []string, index int) bool {
 		return true
 	}
 	current := localizationParseMarkdownContainer(lines[index])
-	if current.content == "" || current.listItem || index+1 >= len(lines) {
+	if current.content == "" || current.codeIndented || current.listItem || index+1 >= len(lines) {
 		return false
 	}
 	next := localizationParseMarkdownContainer(lines[index+1])
-	return !next.listItem && current.quoteDepth == next.quoteDepth && localizationMarkdownSetextUnderline(next.content)
+	return !next.codeIndented && !next.listItem && current.quoteDepth == next.quoteDepth &&
+		localizationMarkdownSetextUnderline(next.content)
 }
 
 func localizationEmptyClaimRoleLabel(line string) bool {
@@ -399,17 +498,7 @@ func localizationStructuredClaimLine(line string) (token, rest string, explicitN
 }
 
 func localizationExplicitIdentityRow(token, claim string) bool {
-	if token == "" || claim == "" {
-		return false
-	}
-	unwrapped := strings.TrimSpace(token)
-	if strings.HasPrefix(unwrapped, "`") && strings.HasSuffix(unwrapped, "`") && len(unwrapped) > 2 {
-		unwrapped = unwrapped[1 : len(unwrapped)-1]
-	}
-	for strings.HasSuffix(unwrapped, "()") {
-		unwrapped = strings.TrimSuffix(unwrapped, "()")
-	}
-	if unwrapped != claim {
+	if token == "" || claim == "" || localizationStructuredSymbolClaim(token) != claim {
 		return false
 	}
 	for index, r := range claim {
@@ -483,9 +572,9 @@ func localizationStructuredSymbolClaim(value string) string {
 	return strings.Trim(claim, "` .:#\\/-,;")
 }
 
-// localizationLooksLikeFileToken rejects source/config/document basenames from
-// prose claim extraction. File-qualified identities such as foo.c::flush are
-// deliberately exempt: their suffix is an explicit symbol identity.
+// localizationLooksLikeFileToken rejects stable file basenames and extensions
+// from prose claim extraction. File-qualified identities such as foo.c::flush
+// are deliberately exempt: their suffix is an explicit symbol identity.
 func localizationLooksLikeFileToken(value string) bool {
 	if value == "" || strings.Contains(value, "::") || strings.Contains(value, "#") {
 		return false
@@ -493,29 +582,71 @@ func localizationLooksLikeFileToken(value string) bool {
 	if strings.ContainsAny(value, "/\\") {
 		return true
 	}
+	if localizationKnownFileBasename(value) {
+		return true
+	}
 	dot := strings.LastIndexByte(value, '.')
-	if dot <= 0 || dot+1 >= len(value) {
+	return dot > 0 && dot+1 < len(value) && localizationKnownFileExtension(value[dot+1:])
+}
+
+func localizationKnownFileBasename(value string) bool {
+	name := strings.ToLower(strings.Trim(value, "`.,;:"))
+	for _, stem := range []string{"dockerfile.", "containerfile.", "makefile."} {
+		if strings.HasPrefix(name, stem) && len(name) > len(stem) {
+			return true
+		}
+	}
+	switch name {
+	case "readme", "license", "licence", "copying", "notice", "changelog", "changes", "authors",
+		"makefile", "dockerfile", "containerfile", "rakefile", "gemfile", "procfile", "cmakelists.txt":
+		return true
+	default:
 		return false
 	}
-	extension := strings.ToLower(value[dot+1:])
-	switch extension {
-	case "c", "h", "cc", "cp", "cpp", "cxx", "hh", "hpp", "hxx", "m", "mm",
-		"go", "rs", "zig", "d", "v", "odin", "hare", "carbon", "asm", "s",
-		"py", "pyi", "pyx", "rb", "php", "pl", "pm", "raku", "lua", "tcl", "r",
+}
+
+func localizationAmbiguousFileExtension(value string) bool {
+	dot := strings.LastIndexByte(value, '.')
+	if dot <= 0 || dot+2 != len(value) {
+		return false
+	}
+	switch strings.ToLower(value[dot+1:]) {
+	case "m", "r", "s", "v", "d":
+		return true
+	default:
+		return false
+	}
+}
+
+func localizationKnownFileExtension(extension string) bool {
+	switch strings.ToLower(extension) {
+	// Native and systems languages. One-letter m/r/s/v/d remain ambiguous
+	// unless the surrounding answer explicitly identifies a file or path.
+	case "c", "h", "cc", "cp", "cpp", "cxx", "hh", "hpp", "hxx", "mm",
+		"go", "rs", "zig", "odin", "hare", "carbon", "asm",
+		"sol", "move", "cairo", "nr", "noir", "tact", "bal":
+		return true
+	// Scripting, web, JVM, .NET, functional, and shell.
+	case "py", "pyi", "pyx", "rb", "php", "pl", "pm", "raku", "lua", "tcl",
 		"js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "coffee",
 		"java", "kt", "kts", "scala", "groovy", "clj", "cljs", "cljc", "edn",
 		"cs", "fs", "fsx", "vb", "swift", "dart", "ex", "exs", "erl", "hrl",
 		"hs", "lhs", "ml", "mli", "mll", "elm", "gleam", "res", "re", "rei",
-		"sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "ahk",
-		"html", "htm", "css", "scss", "sass", "less", "vue", "svelte", "astro",
+		"sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "ahk":
+		return true
+	// UI, schemas, queries, config, and manifests.
+	case "html", "htm", "css", "scss", "sass", "less", "vue", "svelte", "astro",
 		"sql", "graphql", "gql", "proto", "thrift", "capnp", "prisma", "wit",
 		"json", "jsonc", "json5", "yaml", "yml", "toml", "xml", "xsd", "xsl", "xslt",
 		"ini", "cfg", "conf", "properties", "env", "hcl", "tf", "tfvars", "nix",
-		"md", "markdown", "mdx", "rst", "txt", "adoc", "asciidoc", "org", "tex",
-		"razor", "cshtml", "jsp", "ejs", "hbs", "twig",
-		"erb", "liquid", "pug", "blade", "tmpl", "tpl", "gotmpl", "mustache",
-		"dockerfile", "cmake", "gradle", "bazel", "bzl", "make", "mk", "ninja",
-		"csv", "tsv", "parquet", "avro", "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx":
+		"mod", "sum", "work", "lock", "ipynb":
+		return true
+	// Documents, templates, build files, and data assets.
+	case "md", "markdown", "mdx", "rst", "txt", "adoc", "asciidoc", "org", "tex",
+		"razor", "cshtml", "jsp", "ejs", "hbs", "twig", "erb", "liquid", "pug",
+		"blade", "tmpl", "tpl", "gotmpl", "mustache", "cmake", "gradle", "bazel", "bzl",
+		"make", "mk", "ninja", "csv", "tsv", "parquet", "avro", "pdf", "doc", "docx",
+		"ppt", "pptx", "xls", "xlsx":
 		return true
 	default:
 		return false
