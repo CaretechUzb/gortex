@@ -103,6 +103,73 @@ func TestPromoteLocalizationBodyMentionsIsCappedAndCached(t *testing.T) {
 	}
 }
 
+func TestPromoteLocalizationBodyMentionsUsesPackedSourceWindow(t *testing.T) {
+	sibling := localizationBodyMentionTestNode("src/a.go", "sibling", 22)
+	reader := &localizationDeclarationSpyReader{
+		files:     map[string][]*graph.Node{"src/a.go": {sibling}},
+		fileCalls: make(map[string]int),
+	}
+	envelope := localizationExploreEnvelope{
+		Completion: newLocalizationCompletion(true, ""),
+		Files:      []string{"src/a.go"},
+		Symbols:    []string{"src/a.go::owner"},
+		Evidence: []localizationEvidence{{
+			Rank: 1, ID: "src/a.go::owner", Name: "owner", Kind: string(graph.KindFunction),
+			File: "src/a.go", Line: 1,
+		}},
+		SourceWindow: &localizationSourceWindow{
+			Path: "src/a.go", StartLine: 20, EndLine: 24, MatchLine: 21,
+			Content: "func call() { sibling() }", AnchorSymbol: "src/a.go::owner",
+		},
+	}
+
+	packed, packedDigest := promoteLocalizationBodyMentions(
+		"find sibling", envelope, newLocalizationFileDeclarationCache(reader), 1<<20,
+		newLocalizationEvidenceDigestForTask("find sibling", envelope),
+	)
+
+	require.Contains(t, packed.Symbols, sibling.ID)
+	require.True(t, localizationBodyMentionDigestContains(packedDigest, sibling.ID))
+	for _, row := range localizationFinalResponseRows("find sibling", nil, packedDigest.Evidence) {
+		if row.row.ID == sibling.ID {
+			require.False(t, row.primary, "window-derived rows must remain supporting-only")
+		}
+	}
+}
+
+func TestPromoteLocalizationBodyMentionsBoundsDeclarationsPerFile(t *testing.T) {
+	inside := localizationBodyMentionTestNode("src/generated.go", "Inside", 1)
+	outside := localizationBodyMentionTestNode("src/generated.go", "Outside", localizationBodyMentionDeclarationCap+1)
+	declarations := make([]*graph.Node, 0, localizationBodyMentionDeclarationCap+1)
+	declarations = append(declarations, inside)
+	for index := 1; index < localizationBodyMentionDeclarationCap; index++ {
+		declarations = append(declarations, localizationBodyMentionTestNode("src/generated.go", fmt.Sprintf("Filler%d", index), index+1))
+	}
+	declarations = append(declarations, outside)
+	reader := &localizationDeclarationSpyReader{
+		files:     map[string][]*graph.Node{"src/generated.go": declarations},
+		fileCalls: make(map[string]int),
+	}
+	envelope := localizationExploreEnvelope{
+		Completion: newLocalizationCompletion(true, ""),
+		Files:      []string{"src/generated.go"},
+		Symbols:    []string{"src/generated.go::owner"},
+		Evidence: []localizationEvidence{{
+			Rank: 1, ID: "src/generated.go::owner", Name: "owner", Kind: string(graph.KindFunction),
+			File: "src/generated.go", Line: 1, Source: "Inside(); Outside()",
+		}},
+	}
+
+	packed, _ := promoteLocalizationBodyMentions(
+		"find Inside and Outside", envelope, newLocalizationFileDeclarationCache(reader), 1<<20,
+		newLocalizationEvidenceDigestForTask("find Inside and Outside", envelope),
+	)
+
+	require.Contains(t, packed.Symbols, inside.ID)
+	require.NotContains(t, packed.Symbols, outside.ID)
+	require.Equal(t, 1, reader.fileCalls["src/generated.go"])
+}
+
 func TestPromoteLocalizationBodyMentionsHonorsEnvelopeBudget(t *testing.T) {
 	sibling := localizationBodyMentionTestNode("src/a.go", "sibling", 22)
 	reader := &localizationDeclarationSpyReader{

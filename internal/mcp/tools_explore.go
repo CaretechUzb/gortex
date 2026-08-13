@@ -4582,7 +4582,6 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 		}
 		envelope.Evidence[shed].Source = ""
 	}
-	envelope, digest = promoteLocalizationBodyMentions(task, envelope, declarations, shedBudget, digest)
 	for _, target := range acceptedTargets {
 		if target.sourceWindow == nil {
 			continue
@@ -4590,6 +4589,7 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 		envelope = localizationEnvelopePackingSourceWindow(envelope, target.sourceWindow, maxBytes)
 		break
 	}
+	envelope, digest = promoteLocalizationBodyMentions(task, envelope, declarations, shedBudget, digest)
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil, nil, envelope.Completion

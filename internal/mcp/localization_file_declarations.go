@@ -36,10 +36,31 @@ func (cache *localizationFileDeclarationCache) definitions(file string) []*graph
 	if nodes, cached := cache.byFile[file]; cached {
 		return nodes
 	}
+	definitions := cache.readDefinitions(file, cache.definitionLimit)
+	cache.byFile[file] = definitions
+	return definitions
+}
+
+// boundedDefinitions avoids retaining a generated file's entire declaration
+// set for callers that need only bounded supporting evidence. A full cached
+// outline can be sliced safely; an uncached file is filtered into a short-lived
+// bounded slice and deliberately does not poison the complete-outline cache.
+func (cache *localizationFileDeclarationCache) boundedDefinitions(file string, limit int) []*graph.Node {
+	file = strings.TrimSpace(file)
+	if cache == nil || cache.reader == nil || file == "" || limit <= 0 {
+		return nil
+	}
+	if nodes, cached := cache.byFile[file]; cached {
+		return nodes[:min(len(nodes), limit)]
+	}
+	return cache.readDefinitions(file, limit)
+}
+
+func (cache *localizationFileDeclarationCache) readDefinitions(file string, limit int) []*graph.Node {
 	nodes := cache.reader.GetFileNodes(file)
 	capacity := len(nodes)
-	if cache.definitionLimit > 0 {
-		capacity = min(capacity, cache.definitionLimit)
+	if limit > 0 {
+		capacity = min(capacity, limit)
 	}
 	definitions := make([]*graph.Node, 0, capacity)
 	for _, node := range nodes {
@@ -47,10 +68,9 @@ func (cache *localizationFileDeclarationCache) definitions(file string) []*graph
 			continue
 		}
 		definitions = append(definitions, node)
-		if cache.definitionLimit > 0 && len(definitions) >= cache.definitionLimit {
+		if limit > 0 && len(definitions) >= limit {
 			break
 		}
 	}
-	cache.byFile[file] = definitions
 	return definitions
 }
