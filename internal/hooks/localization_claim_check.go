@@ -73,11 +73,14 @@ func localizationBoundedSymbolClaims(message string) ([]string, bool, bool) {
 		markdown := localizationParseMarkdownContainer(line)
 		if marker, ok := localizationMarkdownFenceMarker(markdown.content); ok && !markdown.codeIndented {
 			// CommonMark indented code cannot open or close a fenced block.
+			container := markdown.identity()
 			if !fence.open {
+				marker.container = container
 				fence = marker
 				continue
 			}
-			if marker.character == fence.character && marker.length >= fence.length && marker.closing {
+			if marker.character == fence.character && marker.length >= fence.length && marker.closing &&
+				fence.container == container {
 				fence = localizationMarkdownFenceState{}
 				continue
 			}
@@ -321,11 +324,18 @@ func localizationUnstructuredClaimLine(line string) (string, bool) {
 	return line, true
 }
 
+type localizationMarkdownContainerIdentity struct {
+	quoteDepth   int
+	listItem     bool
+	codeIndented bool
+}
+
 type localizationMarkdownFenceState struct {
 	open      bool
 	character byte
 	length    int
 	closing   bool
+	container localizationMarkdownContainerIdentity
 }
 
 func localizationMarkdownFenceMarker(line string) (localizationMarkdownFenceState, bool) {
@@ -354,6 +364,14 @@ type localizationMarkdownContainer struct {
 	quoteDepth   int
 	listItem     bool
 	codeIndented bool
+}
+
+func (container localizationMarkdownContainer) identity() localizationMarkdownContainerIdentity {
+	return localizationMarkdownContainerIdentity{
+		quoteDepth:   container.quoteDepth,
+		listItem:     container.listItem,
+		codeIndented: container.codeIndented,
+	}
 }
 
 func localizationParseMarkdownContainer(line string) localizationMarkdownContainer {

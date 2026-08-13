@@ -258,6 +258,60 @@ func TestLocalizationClaimParserKeepsIndentedPseudoFenceOpen(t *testing.T) {
 	assertLocalizationClaims(t, claims, []string{"Fabricated.flush"})
 }
 
+func TestLocalizationClaimParserKeepsFenceWithinOpeningContainer(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		want    []string
+	}{
+		{
+			name:    "top level rejects quoted pseudo-close",
+			message: "```text\ninside\n> ```\n# Fabricated.flush\n```",
+			want:    []string{"Fabricated.flush"},
+		},
+		{
+			name:    "quoted rejects top-level pseudo-close",
+			message: "> ```text\n> inside\n```\n> # Fabricated.flush\n> ```",
+			want:    []string{"Fabricated.flush"},
+		},
+		{
+			name:    "top level rejects list pseudo-close",
+			message: "```text\ninside\n- ```\n# Fabricated.flush\n```",
+			want:    []string{"Fabricated.flush"},
+		},
+		{
+			name:    "list rejects top-level pseudo-close",
+			message: "- ```text\n- inside\n```\n- # Fabricated.flush\n- ```",
+			want:    []string{"Fabricated.flush"},
+		},
+		{
+			name:    "top-level same-container close",
+			message: "```text\ninside\n```\n# Fabricated.flush",
+		},
+		{
+			name:    "quoted same-container close",
+			message: "> ```text\n> inside\n> ```\n> # Fabricated.flush",
+		},
+		{
+			name:    "list same-container close",
+			message: "- ```text\n- inside\n- ```\n- # Fabricated.flush",
+		},
+		{
+			name:    "legal indentation remains compatible",
+			message: "   ```text\ninside\n ```\n# Fabricated.flush",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			claims, _, valid := localizationBoundedSymbolClaims(test.message)
+			if !valid {
+				t.Fatal("message was rejected")
+			}
+			assertLocalizationClaims(t, claims, test.want)
+		})
+	}
+}
+
 func TestLocalizationAmbiguousFileContextIsPrefixAndClauseBounded(t *testing.T) {
 	tests := []struct {
 		name    string
