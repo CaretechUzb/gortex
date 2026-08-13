@@ -23,12 +23,13 @@ import (
 // carries outlines; a terminal page's caller is answering, not choosing.
 
 const (
-	// localizationOutlineCompleteRows asks elide to retain the complete file.
-	// The top two page files start complete and yield only under real envelope
-	// pressure.
+	// localizationOutlineCompleteRows is the internal no-cap sentinel used only
+	// while re-projecting an already bounded outline during relief tests and
+	// compatibility paths. Page construction never selects it.
 	localizationOutlineCompleteRows = -1
-	// localizationOutlineRowCap remains the default for direct outline helpers;
-	// page-ranked outlines use the complete sentinel below.
+	// localizationOutlineRowCap bounds the leading file's declaration index.
+	// Forty task-prioritized head/tail rows preserve useful navigation without
+	// letting one large file consume an otherwise healthy localization page.
 	localizationOutlineRowCap = 40
 	// localizationOutlineHeadRows splits an elided outline between the file's
 	// opening declarations and its closing ones.
@@ -47,10 +48,22 @@ const (
 	localizationOutlineProtectedFileCount = 2
 )
 
-// localizationOutlineFileRowCap is the depth ladder over a page's files: the
-// leading file keeps the whole index, the next one a third of it, and the rest
-// start where shrinking would stop anyway.
+// localizationOutlineFileRowCap is the depth ladder over a page's files. The
+// protected leading pair remain the deepest indexes, but start bounded: the
+// leading file gets forty task-prioritized head/tail rows, the second gets
+// twelve, and later files start where shrinking would stop anyway.
 func localizationOutlineFileRowCap(rank int) int {
+	switch rank {
+	case 0:
+		return localizationOutlineRowCap
+	case 1:
+		return localizationOutlineSecondFileRowCap
+	default:
+		return localizationOutlineFloorRows
+	}
+}
+
+func localizationCompleteOutlineFileRowCap(rank int) int {
 	if rank >= 0 && rank < localizationOutlineProtectedFileCount {
 		return localizationOutlineCompleteRows
 	}
@@ -111,6 +124,32 @@ func localizationPageOutlineProvider(
 	terms map[string]struct{},
 	enumerate any,
 ) func() *localizationPageOutline {
+	return localizationPageOutlineProviderWithCaps(
+		pool, targets, terms, enumerate, localizationCompleteOutlineFileRowCap,
+	)
+}
+
+// boundedLocalizationPageOutlineProvider applies the compact wire caps used by
+// structured localize responses. Task-mode rendering keeps the complete retained
+// declaration set and applies its own token-budget relief after rendering.
+func boundedLocalizationPageOutlineProvider(
+	pool []*rerank.Candidate,
+	targets []exploreTarget,
+	terms map[string]struct{},
+	enumerate any,
+) func() *localizationPageOutline {
+	return localizationPageOutlineProviderWithCaps(
+		pool, targets, terms, enumerate, localizationOutlineFileRowCap,
+	)
+}
+
+func localizationPageOutlineProviderWithCaps(
+	pool []*rerank.Candidate,
+	targets []exploreTarget,
+	terms map[string]struct{},
+	enumerate any,
+	rowCap func(int) int,
+) func() *localizationPageOutline {
 	enumerateDeclarations := localizationOutlineDeclarationEnumerator(enumerate)
 	if enumerateDeclarations == nil {
 		return nil
@@ -133,7 +172,7 @@ func localizationPageOutlineProvider(
 					Nodes: localizationOutlineFetchedNodes(pool, targets),
 				}
 			}
-			outline := newLocalizationFileOutlineForDeclarations(file, declarations, terms, localizationOutlineFileRowCap(rank))
+			outline := newLocalizationFileOutlineForDeclarations(file, declarations, terms, rowCap(rank))
 			if outline != nil {
 				outline.rank = rank
 			}

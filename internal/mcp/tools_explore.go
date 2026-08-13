@@ -3098,7 +3098,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// deferred: only a page that stays non-terminal pays for it, and it pays
 	// once however many envelopes this request packs. The task's own terms ride
 	// along so a bounded index keeps the declarations the task named.
-	pageOutline := localizationPageOutlineProvider(
+	pageOutline := boundedLocalizationPageOutlineProvider(
 		localizationRankedPool, pageTargets, exploreTerminalTerms(task),
 		declarations.definitions,
 	)

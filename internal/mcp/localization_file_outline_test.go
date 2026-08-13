@@ -959,7 +959,7 @@ func TestOutlineElisionRanksStrongerTaskTermMatchesFirst(t *testing.T) {
 	}
 }
 
-func TestOutlineTopTwoFilesStartComplete(t *testing.T) {
+func TestOutlineTopTwoFilesStartBoundedWithTruthfulCounts(t *testing.T) {
 	leading := outlineDeclaredFile(localizationOutlineRowCap + 7)
 	secondFile := "repo/second.go"
 	second := make([]*graph.Node, 0, localizationOutlineSecondFileRowCap+9)
@@ -967,7 +967,7 @@ func TestOutlineTopTwoFilesStartComplete(t *testing.T) {
 		second = append(second, outlineFileDeclaration(secondFile, fmt.Sprintf("Second%02d", index), index+1))
 	}
 	targets := []exploreTarget{{node: leading[0]}, {node: second[0]}}
-	page := localizationPageOutlineProvider(
+	page := boundedLocalizationPageOutlineProvider(
 		outlinePool(leading[0]), targets, nil,
 		func(file string) []*graph.Node {
 			if file == outlineLeadingFile {
@@ -978,13 +978,19 @@ func TestOutlineTopTwoFilesStartComplete(t *testing.T) {
 	)()
 
 	if page == nil || page.Leading == nil || len(page.Others) != 1 {
-		t.Fatalf("page = %#v, want complete top-two outlines", page)
+		t.Fatalf("page = %#v, want bounded top-two outlines", page)
 	}
-	if len(page.Leading.Rows) != len(leading) || page.Leading.Elided != 0 {
-		t.Fatalf("leading = %#v, want all %d declarations", page.Leading, len(leading))
+	if got := len(page.Leading.Rows); got != localizationOutlineRowCap {
+		t.Fatalf("leading rows = %d, want cap %d", got, localizationOutlineRowCap)
 	}
-	if len(page.Others[0].Rows) != len(second) || page.Others[0].Elided != 0 {
-		t.Fatalf("second = %#v, want all %d declarations", page.Others[0], len(second))
+	if page.Leading.Declared != len(leading) || page.Leading.Elided != len(leading)-localizationOutlineRowCap {
+		t.Fatalf("leading counts = declared %d, elided %d; want %d and %d", page.Leading.Declared, page.Leading.Elided, len(leading), len(leading)-localizationOutlineRowCap)
+	}
+	if got := len(page.Others[0].Rows); got != localizationOutlineSecondFileRowCap {
+		t.Fatalf("second rows = %d, want cap %d", got, localizationOutlineSecondFileRowCap)
+	}
+	if page.Others[0].Declared != len(second) || page.Others[0].Elided != len(second)-localizationOutlineSecondFileRowCap {
+		t.Fatalf("second counts = declared %d, elided %d; want %d and %d", page.Others[0].Declared, page.Others[0].Elided, len(second), len(second)-localizationOutlineSecondFileRowCap)
 	}
 }
 
