@@ -218,6 +218,12 @@ func TestMapExploreSourceLiteralMatchesDoesNotPromoteAmbiguousCallee(t *testing.
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
 	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: owner.ID, rank: 0})
+	target := exploreTarget{
+		node: owner, source: "void configure() {}", exactContent: true,
+		sourceLiteral: true, sourceLiteralCallee: recall.hits[0].callee,
+	}
+	require.Equal(t, localizationProvenanceContentLiteral, localizationTargetProvenance(localizationCompletion{}, target))
+	require.False(t, localizationStrongSourceLiteralCallee(target), "ambiguous call edges must remain advisory")
 }
 
 func TestMapExploreSourceLiteralMatchesDoesNotPromoteAssignment(t *testing.T) {
@@ -233,6 +239,12 @@ func TestMapExploreSourceLiteralMatchesDoesNotPromoteAssignment(t *testing.T) {
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
 	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: owner.ID, rank: 0})
+	target := exploreTarget{
+		node: owner, source: "void configure() {}", exactContent: true,
+		sourceLiteral: true, sourceLiteralCallee: recall.hits[0].callee,
+	}
+	require.Equal(t, localizationProvenanceContentLiteral, localizationTargetProvenance(localizationCompletion{}, target))
+	require.False(t, localizationStrongSourceLiteralCallee(target), "assignment literals must remain advisory")
 	require.Zero(t, counting.outEdgeBatchCalls, "non-call literal hits must not query graph adjacency")
 	require.Zero(t, counting.nodeLookupBatches, "non-call literal hits must not query callee nodes")
 }
@@ -242,6 +254,20 @@ func TestExploreSourceLiteralLocalCalleeRejectsCrossRepositoryTarget(t *testing.
 	callee := sourceLiteralNode("other/registry.cs::register", "RegisterDefaultFormatter", "other/registry.cs", graph.KindMethod, 7, 9)
 	callee.RepoPrefix = "other"
 	require.False(t, exploreSourceLiteralLocalCallee(owner, callee, "RegisterDefaultFormatter", query.QueryOptions{}))
+
+	server, _ := newExploreSourceLiteralGraphServer(t, []*graph.Node{owner, callee}, []*graph.Edge{{
+		From: owner.ID, To: callee.ID, Kind: graph.EdgeCalls, FilePath: owner.FilePath, Line: 3,
+	}})
+	recall := server.mapExploreSourceLiteralMatches("ku", []trigram.Match{{
+		Path: owner.FilePath, Line: 3, Text: `RegisterDefaultFormatter("ku");`,
+	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: owner.ID, rank: 0})
+	target := exploreTarget{
+		node: owner, source: "void configure() {}", exactContent: true,
+		sourceLiteral: true, sourceLiteralCallee: recall.hits[0].callee,
+	}
+	require.Equal(t, localizationProvenanceContentLiteral, localizationTargetProvenance(localizationCompletion{}, target))
+	require.False(t, localizationStrongSourceLiteralCallee(target), "cross-repository edges must remain advisory")
 }
 
 func TestSourceLiteralCalleeRemainsAuthorizedForRefinement(t *testing.T) {
@@ -573,6 +599,32 @@ func TestRetainExploreSourceLiteralOwnersDiversifiesFilesWithinCaps(t *testing.T
 	})
 	require.Equal(t, exploreSourceLiteralRecallMaxFilesPerTerm, files)
 	require.Equal(t, "file_cap", reason)
+}
+
+func TestRetainExploreSourceLiteralOwnersPrefersResolvedCalleeWithinFileDiverseCaps(t *testing.T) {
+	recall := exploreSourceLiteralRecall{
+		hits: []exploreSourceLiteralHit{
+			{nodeID: "owner-a", rank: 0},
+			{nodeID: "owner-b", rank: 1},
+			{nodeID: "other-file", rank: 2},
+			{nodeID: "resolved-callee", rank: 3, callee: true},
+		},
+		ownerFiles: map[string]string{
+			"owner-a":         "src/first.go",
+			"owner-b":         "src/first.go",
+			"other-file":      "src/second.go",
+			"resolved-callee": "src/first.go",
+		},
+	}
+
+	hits, files, reason := retainExploreSourceLiteralOwners(recall)
+
+	require.Equal(t, []string{"resolved-callee", "other-file", "owner-a"}, []string{
+		hits[0].nodeID, hits[1].nodeID, hits[2].nodeID,
+	})
+	require.True(t, hits[0].callee)
+	require.Equal(t, exploreSourceLiteralRecallMaxFilesPerTerm, files)
+	require.Equal(t, "owner_cap", reason)
 }
 
 func TestGatherExploreSourceLiteralRecallAggregatesCompactAnchorsAcrossLanguages(t *testing.T) {

@@ -6340,20 +6340,20 @@ func reserveExploreSourceLiteralCandidate(candidates, bounded []*rerank.Candidat
 		if leftCoverage != rightCoverage {
 			return leftCoverage > rightCoverage
 		}
-		leftSettled := sources[i].Signals[exploreContentRecallAmbiguousSignal] <= 0
-		rightSettled := sources[j].Signals[exploreContentRecallAmbiguousSignal] <= 0
-		if leftSettled != rightSettled {
-			return leftSettled
+		leftAligned := sources[i].Signals[exploreSourceLiteralTaskAlignSignal] > 0
+		rightAligned := sources[j].Signals[exploreSourceLiteralTaskAlignSignal] > 0
+		if leftAligned != rightAligned {
+			return leftAligned
 		}
 		leftDirect := directProductionCallee(sources[i])
 		rightDirect := directProductionCallee(sources[j])
 		if leftDirect != rightDirect {
 			return leftDirect
 		}
-		leftAligned := sources[i].Signals[exploreSourceLiteralTaskAlignSignal] > 0
-		rightAligned := sources[j].Signals[exploreSourceLiteralTaskAlignSignal] > 0
-		if leftAligned != rightAligned {
-			return leftAligned
+		leftSettled := sources[i].Signals[exploreContentRecallAmbiguousSignal] <= 0
+		rightSettled := sources[j].Signals[exploreContentRecallAmbiguousSignal] <= 0
+		if leftSettled != rightSettled {
+			return leftSettled
 		}
 		leftRank := sources[i].Signals[exploreSourceLiteralSignal]
 		rightRank := sources[j].Signals[exploreSourceLiteralSignal]

@@ -161,6 +161,23 @@ func retainExploreSourceLiteralOwners(recall exploreSourceLiteralRecall) (hits [
 	seenOwners := make(map[string]struct{}, min(len(recall.hits), exploreSourceLiteralRecallMaxOwnersPerTerm))
 	seenFiles := make(map[string]struct{}, exploreSourceLiteralRecallMaxFilesPerTerm)
 	selected := make([]bool, len(recall.hits))
+	order := make([]int, len(recall.hits))
+	for index := range recall.hits {
+		order[index] = index
+	}
+	// A graph-resolved direct callee is more actionable than its enclosing
+	// source owner. Prefer it inside the same fixed owner/file caps; ambiguity
+	// remains attached to the hit and therefore cannot become terminal proof.
+	sort.SliceStable(order, func(i, j int) bool {
+		left, right := recall.hits[order[i]], recall.hits[order[j]]
+		if left.callee != right.callee {
+			return left.callee
+		}
+		if left.rank != right.rank {
+			return left.rank < right.rank
+		}
+		return left.nodeID < right.nodeID
+	})
 	add := func(index int) {
 		hit := recall.hits[index]
 		if _, duplicate := seenOwners[hit.nodeID]; duplicate {
@@ -175,10 +192,11 @@ func retainExploreSourceLiteralOwners(recall exploreSourceLiteralRecall) (hits [
 	}
 
 	// First pass: one declaration from each distinct file.
-	for index, hit := range recall.hits {
+	for _, index := range order {
 		if len(hits) >= exploreSourceLiteralRecallMaxOwnersPerTerm || len(seenFiles) >= exploreSourceLiteralRecallMaxFilesPerTerm {
 			break
 		}
+		hit := recall.hits[index]
 		file := recall.ownerFiles[hit.nodeID]
 		if file == "" {
 			continue
@@ -189,13 +207,14 @@ func retainExploreSourceLiteralOwners(recall exploreSourceLiteralRecall) (hits [
 		add(index)
 	}
 	// Second pass: fill remaining owner slots from already-admitted files.
-	for index, hit := range recall.hits {
+	for _, index := range order {
 		if len(hits) >= exploreSourceLiteralRecallMaxOwnersPerTerm {
 			break
 		}
 		if selected[index] {
 			continue
 		}
+		hit := recall.hits[index]
 		file := recall.ownerFiles[hit.nodeID]
 		if file != "" {
 			if _, admitted := seenFiles[file]; !admitted && len(seenFiles) >= exploreSourceLiteralRecallMaxFilesPerTerm {
