@@ -755,7 +755,28 @@ func acquireLocalizationClaimCheck(path string) (func(), bool) {
 	if err != nil || !locked {
 		return nil, false
 	}
-	return func() { _ = lock.Unlock() }, true
+	return func() { releaseLocalizationClaimLock(lock) }, true
+}
+
+func releaseLocalizationClaimLock(lock *flock.Flock) {
+	releaseLocalizationClaimLockWith(lock, func(candidate *flock.Flock) error {
+		// Close is gofrs/flock's documented release API: it unlocks and closes
+		// the underlying descriptor while leaving the reusable sidecar in place.
+		return candidate.Close()
+	})
+}
+
+func releaseLocalizationClaimLockWith(lock *flock.Flock, release func(*flock.Flock) error) {
+	if lock == nil || release == nil || release(lock) == nil {
+		return
+	}
+	// Retry through the concrete release API if an injected wrapper or a
+	// transient syscall error fails before descriptor cleanup.
+	for attempts := 0; attempts < 2; attempts++ {
+		if lock.Close() == nil {
+			return
+		}
+	}
 }
 
 func readLocalizationTerminalMarker(path string, identity localizationTerminalIdentity) (localizationTerminalMarker, bool) {
