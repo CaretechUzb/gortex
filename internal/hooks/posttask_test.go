@@ -427,10 +427,15 @@ func TestRunPostTask_OwnsAll_SkipsImpactCall(t *testing.T) {
 
 func claimCheckTestInput(t *testing.T, message string) PostTaskInput {
 	t.Helper()
-	configureLocalizationTerminalTestHome(t)
-	identity := beginTestLocalizationTurn(t, t.Name(), "prompt", t.TempDir())
 	primary := []string{"repo/a.go::Writer.write", "repo/b.go::Reader.read", "repo/c.go::Store.load", "repo/d.go::Cache.get", "repo/e.go::Index.find"}
 	evidence := append(append([]string(nil), primary...), "repo/f.go::Helper.close")
+	return claimCheckTestInputWithEvidence(t, message, primary, evidence)
+}
+
+func claimCheckTestInputWithEvidence(t *testing.T, message string, primary, evidence []string) PostTaskInput {
+	t.Helper()
+	configureLocalizationTerminalTestHome(t)
+	identity := beginTestLocalizationTurn(t, t.Name(), "prompt", t.TempDir())
 	if !markLocalizationTerminalReceipt(identity, localizationauth.Receipt{
 		FinalResponse: "answer", PrimaryIDs: primary, EvidenceIDs: evidence,
 		ContractVersion: localizationTerminalContractV2, Enforceable: true,
@@ -462,6 +467,13 @@ func TestLocalizationClaimCheckNormalizesCommonMethodNotation(t *testing.T) {
 	input.LastAssistantMessage = "SYMBOLS:\n- (*Writer).write"
 	if got := localizationClaimCheck(input); got != "" {
 		t.Fatalf("pointer-receiver method was challenged: %q", got)
+	}
+}
+
+func TestLocalizationClaimCheckRequiresEveryMaterialClaim(t *testing.T) {
+	input := claimCheckTestInput(t, "SYMBOLS:\n- Writer.write\n- Fabricated.flush")
+	if got := localizationClaimCheck(input); got == "" {
+		t.Fatal("a fabricated claim beside an authenticated claim was not challenged")
 	}
 }
 

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofrs/flock"
+
 	"github.com/zzet/gortex/internal/localizationauth"
 )
 
@@ -699,44 +701,61 @@ func localizationTerminalMarkerFor(identity localizationTerminalIdentity) (local
 	return localizationTerminalMarker{}, false
 }
 
-// consumeLocalizationClaimCheck atomically marks one enforceable terminal
-// marker as challenged. Concurrent or host-retried Stop hooks fail open after
-// the first successful claim, even when a host omits stop_hook_active.
+// consumeLocalizationClaimCheck serializes one enforceable terminal marker's
+// challenge without ever removing the marker from its canonical path. Keeping
+// that path readable closes the window in which a concurrent PreToolUse could
+// bypass terminal enforcement. Host-retried Stop hooks still fail open after
+// the first successful challenge, even when the host omits stop_hook_active.
 func consumeLocalizationClaimCheck(identity localizationTerminalIdentity, claims []string) (localizationTerminalMarker, bool) {
+	if len(claims) == 0 {
+		return localizationTerminalMarker{}, false
+	}
 	path := localizationTerminalMarkerPath(identity)
-	claimToken, ok := localizationauth.NewToken()
+	release, ok := acquireLocalizationClaimCheck(path)
 	if !ok {
 		return localizationTerminalMarker{}, false
 	}
-	claimPath := path + ".claim-" + claimToken
-	if err := os.Rename(path, claimPath); err != nil {
-		return localizationTerminalMarker{}, false
-	}
-	claimed := false
-	defer func() {
-		if !claimed {
-			_ = os.Rename(claimPath, path)
-		}
-		_ = os.Remove(claimPath)
-	}()
+	defer release()
 
-	marker, ok := readLocalizationTerminalMarker(claimPath, identity)
+	marker, ok := readLocalizationTerminalMarker(path, identity)
 	if !ok || marker.Advisory || marker.ClaimCheckConsumed || len(marker.PrimaryIDs) == 0 || len(marker.EvidenceIDs) == 0 {
 		return localizationTerminalMarker{}, false
 	}
+	allAuthenticated := true
 	for _, claim := range claims {
+		matched := false
 		for _, evidenceID := range marker.EvidenceIDs {
 			if localizationClaimMatchesEvidence(claim, evidenceID) {
-				return localizationTerminalMarker{}, false
+				matched = true
+				break
 			}
 		}
+		if !matched {
+			allAuthenticated = false
+			break
+		}
+	}
+	if allAuthenticated {
+		return localizationTerminalMarker{}, false
 	}
 	marker.ClaimCheckConsumed = true
 	if !writeLocalizationState(path, marker) {
 		return localizationTerminalMarker{}, false
 	}
-	claimed = true
 	return marker, true
+}
+
+func acquireLocalizationClaimCheck(path string) (func(), bool) {
+	// Kernel-backed advisory locking makes the sidecar reusable: a process
+	// crash releases ownership automatically, so a stale path can never wedge
+	// future claim checks. Do not remove the sidecar on unlock; another process
+	// may already have opened the same inode while waiting to contend.
+	lock := flock.New(path + ".claim-check")
+	locked, err := lock.TryLock()
+	if err != nil || !locked {
+		return nil, false
+	}
+	return func() { _ = lock.Unlock() }, true
 }
 
 func readLocalizationTerminalMarker(path string, identity localizationTerminalIdentity) (localizationTerminalMarker, bool) {
