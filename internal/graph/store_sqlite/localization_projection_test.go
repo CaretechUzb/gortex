@@ -219,6 +219,9 @@ func TestFindFileNodesBoundedCapsScopesKindsAndDropsPayloads(t *testing.T) {
 	if page.Total != 9 || !page.Truncated || len(page.Nodes) != 8 {
 		t.Fatalf("page = %#v, want threshold total 9, truncated, cap 8", page)
 	}
+	if cap(page.Nodes) != len(page.Nodes) {
+		t.Fatalf("page capacity = %d, want exact returned length %d", cap(page.Nodes), len(page.Nodes))
+	}
 	for index, node := range page.Nodes {
 		want := fmt.Sprintf("repo/dense.go::fn-%03d", index)
 		if node.ID != want {

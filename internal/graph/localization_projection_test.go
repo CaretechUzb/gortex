@@ -345,9 +345,12 @@ func TestFindFileNodesBoundedAllocatesOnlyRetainedSummaries(t *testing.T) {
 			if len(page.Nodes) != limit || page.Total != limit+1 || !page.Truncated {
 				t.Fatalf("page = %#v, want bounded saturated projection", page)
 			}
-			for _, node := range page.Nodes {
+			if cap(page.Nodes) != len(page.Nodes) {
+				t.Fatalf("page capacity = %d, want exact returned length %d", cap(page.Nodes), len(page.Nodes))
+			}
+			for _, node := range page.Nodes[:cap(page.Nodes)] {
 				if node.Meta != nil {
-					t.Fatalf("retained summary hydrated metadata: %#v", node.Meta)
+					t.Fatalf("retained or reslice-reachable summary hydrated metadata: %#v", node.Meta)
 				}
 			}
 		})

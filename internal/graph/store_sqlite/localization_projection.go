@@ -203,6 +203,9 @@ func (s *Store) FindFileNodesBounded(
 	if len(nodes) > limit {
 		nodes = nodes[:limit]
 	}
+	// Match the in-memory projection's ownership boundary: callers cannot
+	// reslice a bounded page into the sentinel slot.
+	nodes = nodes[:len(nodes):len(nodes)]
 	return graph.BoundedNodeProjection{Nodes: nodes, Total: total, Truncated: truncated}, nil
 }
 

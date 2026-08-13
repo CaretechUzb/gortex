@@ -226,14 +226,16 @@ func localizationNodeSummary(node *Node) *Node {
 	}
 }
 
-// localizationNodeSummaries copies only the retained response page. Callers
-// first rank raw immutable graph pointers, so discarded candidates never
-// allocate summary objects or retain retrieval metadata.
+// localizationNodeSummaries copies only the retained response page onto a fresh,
+// exact-capacity backing array. Callers first rank raw immutable graph pointers,
+// so discarded candidates never allocate summary objects, and a saturated raw
+// sentinel cannot remain reachable behind the returned slice length.
 func localizationNodeSummaries(nodes []*Node) []*Node {
+	summaries := make([]*Node, len(nodes))
 	for index, node := range nodes {
-		nodes[index] = localizationNodeSummary(node)
+		summaries[index] = localizationNodeSummary(node)
 	}
-	return nodes
+	return summaries
 }
 
 func insertBoundedLocalizationNode(nodes []*Node, node *Node, limit int) []*Node {
