@@ -994,7 +994,10 @@ func TestOutlineTopTwoFilesStartBoundedWithTruthfulCounts(t *testing.T) {
 	}
 }
 
-func TestOutlineProviderEnumeratesAtMostTenDistinctFiles(t *testing.T) {
+func TestOutlineProviderEnumeratesAtMostEightDistinctFiles(t *testing.T) {
+	if localizationOutlineFileCap != 8 {
+		t.Fatalf("outline file cap = %d, want 8", localizationOutlineFileCap)
+	}
 	targets := outlineBreadthTargets(localizationOutlineFileCap + 1)
 	enumerated := 0
 	page := localizationPageOutlineProvider(nil, targets, nil, func(file string) []*graph.Node {

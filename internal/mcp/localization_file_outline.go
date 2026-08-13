@@ -41,8 +41,10 @@ const (
 	// after the leading one gets. Every file after that starts at the floor.
 	localizationOutlineSecondFileRowCap = 12
 	// localizationOutlineFileCap bounds how many of the page's distinct files
-	// are indexed at all, leading file included.
-	localizationOutlineFileCap = 10
+	// are indexed at all, leading file included. Eight covers the ranked page's
+	// useful breadth without serializing two low-rank declaration indexes whose
+	// evidence rows remain independently visible.
+	localizationOutlineFileCap = 8
 	// The page's first two files keep their complete indexes until every lower
 	// ranked file has yielded its expendable depth and breadth.
 	localizationOutlineProtectedFileCount = 2
