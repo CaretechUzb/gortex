@@ -69,16 +69,18 @@ func TestBuildVerificationCommand(t *testing.T) {
 		{
 			name: "graph-qualified Go file",
 			prediction: &prediction{
-				touchedFiles: []string{"gortex/internal/mcp/change_contract.go"},
-				repoPrefixes: []string{"gortex"},
+				touchedFiles:              []string{"gortex/internal/mcp/change_contract.go"},
+				touchedFilesRepoQualified: true,
+				repoPrefixes:              []string{"gortex"},
 			},
 			wantCommand: "go build ./internal/mcp/... && go test -race ./internal/mcp/...",
 		},
 		{
 			name: "graph-qualified Windows path",
 			prediction: &prediction{
-				touchedFiles: []string{`gortex\internal\mcp\change_contract.go`},
-				repoPrefixes: []string{"gortex"},
+				touchedFiles:              []string{`gortex\internal\mcp\change_contract.go`},
+				touchedFilesRepoQualified: true,
+				repoPrefixes:              []string{"gortex"},
 			},
 			wantCommand: "go build ./internal/mcp/... && go test -race ./internal/mcp/...",
 		},
@@ -92,6 +94,32 @@ func TestBuildVerificationCommand(t *testing.T) {
 				},
 			},
 			wantCommand: "go test -race ./internal/mcp",
+		},
+		{
+			name: "cross-repo impact keeps source repository command",
+			prediction: &prediction{
+				touchedFiles: []string{"internal/mcp/change_contract.go"},
+				repoPrefixes: []string{"gortex"},
+				impact: &analysis.ImpactResult{
+					ByRepo: map[string][]analysis.ImpactEntry{
+						"gortex":       {{RepoPrefix: "gortex"}},
+						"gortex-cloud": {{RepoPrefix: "gortex-cloud"}},
+					},
+					TestFiles: []string{
+						"gortex/internal/mcp/change_contract_test.go",
+						"gortex-cloud/internal/client/client_test.go",
+					},
+				},
+			},
+			wantCommand: "go test -race ./internal/mcp",
+		},
+		{
+			name: "repo-relative path starts with repository prefix",
+			prediction: &prediction{
+				touchedFiles: []string{"web/handler/handler.go"},
+				repoPrefixes: []string{"web"},
+			},
+			wantCommand: "go build ./web/handler/... && go test -race ./web/handler/...",
 		},
 		{
 			name: "multiple repositories",
@@ -118,6 +146,33 @@ func TestBuildVerificationCommand(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, tt.wantCommand, cmd)
 		})
+	}
+}
+
+func TestAssembleEnvelopeKeepsSingleRepoVerificationWithCrossRepoImpact(t *testing.T) {
+	srv := &Server{}
+	p := &prediction{
+		source:       "diff",
+		touchedFiles: []string{"internal/mcp/change_contract.go"},
+		repoPrefixes: []string{"gortex"},
+		impact: &analysis.ImpactResult{
+			ByRepo: map[string][]analysis.ImpactEntry{
+				"gortex":       {{RepoPrefix: "gortex"}},
+				"gortex-cloud": {{RepoPrefix: "gortex-cloud"}},
+			},
+			TestFiles: []string{
+				"gortex/internal/mcp/change_contract_test.go",
+				"gortex-cloud/internal/client/client_test.go",
+			},
+		},
+	}
+
+	env := srv.assembleEnvelope(p, nil)
+	require.Equal(t, verdictAllow, env.Verdict)
+	require.Equal(t, "go test -race ./internal/mcp", env.VerificationCommand)
+	require.Contains(t, env.StopCondition, "`go test -race ./internal/mcp` exits 0")
+	for _, reason := range env.Reasons {
+		require.NotEqual(t, "verification", reason.Family)
 	}
 }
 

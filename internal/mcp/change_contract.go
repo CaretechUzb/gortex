@@ -121,16 +121,17 @@ type changeEnvelope struct {
 // the workspace_edit source (a true speculative simulation); the other sources
 // fill blast/impact from the change set without an edit to apply.
 type prediction struct {
-	source       string
-	lens         string
-	riskGate     bool
-	changed      []changedSymbolRef
-	changedIDs   []string
-	nodes        []*graph.Node
-	step         *simulationStep
-	impact       *analysis.ImpactResult
-	touchedFiles []string
-	repoPrefixes []string
+	source                    string
+	lens                      string
+	riskGate                  bool
+	changed                   []changedSymbolRef
+	changedIDs                []string
+	nodes                     []*graph.Node
+	step                      *simulationStep
+	impact                    *analysis.ImpactResult
+	touchedFiles              []string
+	touchedFilesRepoQualified bool
+	repoPrefixes              []string
 }
 
 // nodesForIDs resolves symbol IDs to graph nodes, dropping any that no longer
@@ -233,13 +234,14 @@ func (s *Server) lowerEditSource(ctx context.Context, req mcp.CallToolRequest) (
 		changed = append(changed, refFromNode(n))
 	}
 	return &prediction{
-		source:       "edit",
-		changed:      changed,
-		changedIDs:   ids,
-		nodes:        nodes,
-		step:         &step,
-		impact:       s.analyzeImpactLazy(ctx, ids),
-		touchedFiles: step.touchedFiles,
+		source:                    "edit",
+		changed:                   changed,
+		changedIDs:                ids,
+		nodes:                     nodes,
+		step:                      &step,
+		impact:                    s.analyzeImpactLazy(ctx, ids),
+		touchedFiles:              step.touchedFiles,
+		touchedFilesRepoQualified: true,
 	}, nil
 }
 
@@ -284,12 +286,13 @@ func (s *Server) lowerRangeSource(ctx context.Context, req mcp.CallToolRequest) 
 	}
 	ids = dedupeStrings(ids)
 	return &prediction{
-		source:       "ranges",
-		changed:      changed,
-		changedIDs:   ids,
-		nodes:        s.nodesForIDs(ids),
-		impact:       s.analyzeImpactLazy(ctx, ids),
-		touchedFiles: dedupeStrings(files),
+		source:                    "ranges",
+		changed:                   changed,
+		changedIDs:                ids,
+		nodes:                     s.nodesForIDs(ids),
+		impact:                    s.analyzeImpactLazy(ctx, ids),
+		touchedFiles:              dedupeStrings(files),
+		touchedFilesRepoQualified: true,
 	}, nil
 }
 
@@ -307,12 +310,13 @@ func (s *Server) lowerSymbolSource(ctx context.Context, req mcp.CallToolRequest)
 		files = append(files, n.FilePath)
 	}
 	return &prediction{
-		source:       "symbols",
-		changed:      changed,
-		changedIDs:   ids,
-		nodes:        nodes,
-		impact:       s.analyzeImpactLazy(ctx, ids),
-		touchedFiles: dedupeStrings(files),
+		source:                    "symbols",
+		changed:                   changed,
+		changedIDs:                ids,
+		nodes:                     nodes,
+		impact:                    s.analyzeImpactLazy(ctx, ids),
+		touchedFiles:              dedupeStrings(files),
+		touchedFilesRepoQualified: true,
 	}, nil
 }
 
@@ -506,9 +510,9 @@ func classifyChange(p *prediction) string {
 	return "behavioral"
 }
 
-// verificationRepoPrefixes returns every repository that contributes to the
-// predicted change or its impact. A command without a working-directory scope
-// is only safe when this set contains at most one repository.
+// verificationRepoPrefixes returns the repositories that contain changed
+// files or seed symbols. Impacted dependents may live in other repositories,
+// but they do not change the working directory in which this command runs.
 func verificationRepoPrefixes(p *prediction) []string {
 	prefixes := map[string]bool{}
 	for _, prefix := range p.repoPrefixes {
@@ -521,14 +525,6 @@ func verificationRepoPrefixes(p *prediction) []string {
 			prefixes[n.RepoPrefix] = true
 		}
 	}
-	if p.impact != nil {
-		for prefix := range p.impact.ByRepo {
-			if prefix != "" {
-				prefixes[prefix] = true
-			}
-		}
-	}
-
 	out := make([]string, 0, len(prefixes))
 	for prefix := range prefixes {
 		out = append(out, prefix)
@@ -537,17 +533,26 @@ func verificationRepoPrefixes(p *prediction) []string {
 	return out
 }
 
-func repoLocalVerificationPath(file, repoPrefix string) string {
+func repoLocalVerificationPath(file, repoPrefix string, graphQualified bool) string {
 	file = strings.TrimPrefix(strings.ReplaceAll(file, "\\", "/"), "./")
 	prefix := strings.Trim(strings.ReplaceAll(repoPrefix, "\\", "/"), "/")
-	if prefix != "" {
+	if graphQualified && prefix != "" {
 		file = strings.TrimPrefix(file, prefix+"/")
 	}
 	return file
 }
 
-func verificationPackageDir(file, repoPrefix string, recursive bool) string {
-	dir := path.Dir(repoLocalVerificationPath(file, repoPrefix))
+func verificationPathInRepo(file, repoPrefix string) bool {
+	prefix := strings.Trim(strings.ReplaceAll(repoPrefix, "\\", "/"), "/")
+	if prefix == "" {
+		return true
+	}
+	file = strings.TrimPrefix(strings.ReplaceAll(file, "\\", "/"), "./")
+	return strings.HasPrefix(file, prefix+"/")
+}
+
+func verificationPackageDir(file, repoPrefix string, recursive, graphQualified bool) string {
+	dir := path.Dir(repoLocalVerificationPath(file, repoPrefix, graphQualified))
 	pkg := "."
 	if dir != "." && dir != "" {
 		pkg = "./" + strings.TrimPrefix(dir, "/")
@@ -561,29 +566,12 @@ func verificationPackageDir(file, repoPrefix string, recursive bool) string {
 // buildVerificationCommand synthesises the command that proves the change is
 // safe — drawn from the covering tests of the changed set.
 func buildVerificationCommand(p *prediction) (string, error) {
-	testFiles := map[string]bool{}
-	if p.impact != nil {
-		for _, f := range p.impact.TestFiles {
-			testFiles[f] = true
-		}
-	}
-	if p.step != nil {
-		for _, t := range p.step.testTargets {
-			if strings.HasSuffix(strings.ReplaceAll(t, "\\", "/"), "_test.go") {
-				testFiles[t] = true
-			}
-		}
-	}
-
 	goChange := false
 	for _, f := range p.touchedFiles {
 		if strings.HasSuffix(strings.ReplaceAll(f, "\\", "/"), ".go") {
 			goChange = true
 			break
 		}
-	}
-	if len(testFiles) == 0 && !goChange {
-		return "", nil
 	}
 
 	prefixes := verificationRepoPrefixes(p)
@@ -595,10 +583,33 @@ func buildVerificationCommand(p *prediction) (string, error) {
 		repoPrefix = prefixes[0]
 	}
 
+	// Impact tests are graph-qualified and may include dependents from other
+	// repositories. Keep only tests runnable from the changed repository;
+	// refusing the entire command would discard valid local verification.
+	testFiles := map[string]bool{}
+	if p.impact != nil {
+		for _, f := range p.impact.TestFiles {
+			if verificationPathInRepo(f, repoPrefix) {
+				testFiles[f] = true
+			}
+		}
+	}
+	if p.step != nil {
+		for _, t := range p.step.testTargets {
+			if strings.HasSuffix(strings.ReplaceAll(t, "\\", "/"), "_test.go") &&
+				verificationPathInRepo(t, repoPrefix) {
+				testFiles[t] = true
+			}
+		}
+	}
+	if len(testFiles) == 0 && !goChange {
+		return "", nil
+	}
+
 	if len(testFiles) > 0 {
 		dirs := map[string]bool{}
-		for f := range testFiles {
-			dirs[verificationPackageDir(f, repoPrefix, false)] = true
+		for f, graphQualified := range testFiles {
+			dirs[verificationPackageDir(f, repoPrefix, false, graphQualified)] = true
 		}
 		ds := make([]string, 0, len(dirs))
 		for d := range dirs {
@@ -614,7 +625,7 @@ func buildVerificationCommand(p *prediction) (string, error) {
 	dirs := map[string]bool{}
 	for _, f := range p.touchedFiles {
 		if strings.HasSuffix(strings.ReplaceAll(f, "\\", "/"), ".go") {
-			dirs[verificationPackageDir(f, repoPrefix, true)] = true
+			dirs[verificationPackageDir(f, repoPrefix, true, p.touchedFilesRepoQualified)] = true
 		}
 	}
 	ds := make([]string, 0, len(dirs))
