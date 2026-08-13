@@ -2556,6 +2556,9 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 
 	node := s.engineFor(ctx).GetSymbol(id)
 	if node == nil {
+		if recovery := s.unindexedRenameRecovery(ctx, id, newName, dryRun); recovery != nil {
+			return s.respondJSONOrTOON(ctx, req, recovery)
+		}
 		return mcp.NewToolResultError("symbol not found: " + id), nil
 	}
 

@@ -23,6 +23,55 @@ type renameEdit struct {
 	Reason     string `json:"reason"`
 }
 
+// unindexedRenameRecovery distinguishes an invalid symbol ID from an existing
+// file that semantic rename cannot see. It returns guidance only: without graph
+// usage edges, automatically changing even one occurrence would imply a
+// completeness guarantee the rename cannot make.
+func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string, dryRun bool) map[string]any {
+	filePart, requestedSymbol, ok := strings.Cut(id, "::")
+	if !ok || strings.TrimSpace(filePart) == "" || strings.TrimSpace(requestedSymbol) == "" {
+		return nil
+	}
+
+	absPath, relPath, err := s.resolveFilePath(filePart)
+	if err != nil {
+		return nil
+	}
+	info, err := os.Stat(absPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil
+	}
+
+	file := s.graphPathSpelling(relPath)
+	if indexed := s.engineFor(ctx).GetFileSymbols(file); indexed != nil && indexed.TotalNodes > 0 {
+		return nil
+	}
+
+	return map[string]any{
+		"status":                   "refused",
+		"error_code":               "symbol_not_indexed",
+		"symbol_id":                id,
+		"requested_symbol":         requestedSymbol,
+		"new_name":                 newName,
+		"file":                     file,
+		"semantic_rename_complete": false,
+		"written":                  false,
+		"dry_run":                  dryRun,
+		"safe_fallback": map[string]any{
+			"tool":      "edit",
+			"operation": "file",
+			"target":    map[string]any{"file": file},
+			"required_guards": []string{
+				"explicit file target",
+				"whole-identifier match",
+				"expected_occurrences",
+				"base_sha",
+			},
+		},
+		"warning": "Cross-file references are not proven because this file is outside the graph. No text was changed.",
+	}
+}
+
 // indexIdentifier returns the byte offset of the first whole-identifier
 // occurrence of name at or after from, or -1 when there is none. A candidate
 // is whole only when neither neighbouring rune is an identifier rune, so
