@@ -246,8 +246,17 @@ func (v *OverlaidView) FindNodesByNameBounded(
 	}
 
 	// Inflate only by detached identities this exact-name bucket can shadow.
-	// Whole-file shadows were already removed by baseScope.ExcludeFiles.
-	baseLimit := limit + len(shadowIDs)
+	// Whole-file shadows were already removed by baseScope.ExcludeFiles, so
+	// counting their identities again would let one large overlay defeat the
+	// projection's hard row/allocation bound.
+	detachedShadows := 0
+	for id := range shadowIDs {
+		path := IDFile(id)
+		if path == "" || !baseScope.ExcludeFiles[path] {
+			detachedShadows++
+		}
+	}
+	baseLimit := limit + detachedShadows
 	basePage, err := baseReader.FindNodesByNameBounded(ctx, name, baseScope, baseLimit)
 	if err != nil {
 		return BoundedNodeProjection{}, err
@@ -267,7 +276,7 @@ func (v *OverlaidView) FindNodesByNameBounded(
 		kept = insertBoundedLocalizationNode(kept, node, pageSize)
 	}
 	// Saturation of the shadow-inflated base page proves at least limit+1
-	// visible rows: no more than len(shadowIDs) returned identities can vanish.
+	// visible rows: no more than detachedShadows returned identities can vanish.
 	if basePage.Truncated && visible <= limit {
 		visible = limit + 1
 	}

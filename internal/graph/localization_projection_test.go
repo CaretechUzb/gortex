@@ -101,6 +101,50 @@ func TestOverlaidViewFindNodesByNameBoundedRefillsAfterFileTombstone(t *testing.
 	}
 }
 
+type recordingBoundedExactNameReader struct {
+	Reader
+	bounded BoundedExactNameReader
+	limits  []int
+}
+
+func (reader *recordingBoundedExactNameReader) FindNodesByNameBounded(
+	ctx context.Context,
+	name string,
+	scope LocalizationNodeScope,
+	limit int,
+) (BoundedNodeProjection, error) {
+	reader.limits = append(reader.limits, limit)
+	return reader.bounded.FindNodesByNameBounded(ctx, name, scope, limit)
+}
+
+func TestOverlaidViewFindNodesByNameBoundedDoesNotInflateWholeFileShadows(t *testing.T) {
+	base := New()
+	visible := &Node{
+		ID: "repo/visible.go::handle", Name: "handle", Kind: KindFunction,
+		FilePath: "repo/visible.go",
+	}
+	base.AddNode(visible)
+	recording := &recordingBoundedExactNameReader{Reader: base, bounded: base}
+
+	layer := NewOverlayLayer()
+	layer.MarkFile("repo/generated.go", false)
+	for index := 0; index < 2_000; index++ {
+		layer.MarkRemoved("handle", fmt.Sprintf("repo/generated.go::handle:%04d", index))
+	}
+	view := NewOverlaidView(recording, layer)
+
+	page, err := view.FindNodesByNameBounded(context.Background(), "handle", LocalizationNodeScope{}, 8)
+	if err != nil {
+		t.Fatalf("bounded overlay lookup: %v", err)
+	}
+	if len(recording.limits) != 1 || recording.limits[0] != 8 {
+		t.Fatalf("base limits = %v, want unchanged request limit 8", recording.limits)
+	}
+	if page.Total != 1 || page.Truncated || len(page.Nodes) != 1 || page.Nodes[0].ID != visible.ID {
+		t.Fatalf("page = %#v, want the one visible base homonym", page)
+	}
+}
+
 func TestOverlaidViewFindNodesByNameBoundedHonorsDetachedRemoval(t *testing.T) {
 	base := New()
 	stale := &Node{
@@ -108,16 +152,20 @@ func TestOverlaidViewFindNodesByNameBoundedHonorsDetachedRemoval(t *testing.T) {
 		FilePath: "repo/old.go",
 	}
 	base.AddNode(stale)
+	recording := &recordingBoundedExactNameReader{Reader: base, bounded: base}
 
 	layer := NewOverlayLayer()
 	// MarkRemoved is sufficient in the legacy overlay contract even when the
 	// layer was assembled without MarkFile. The bounded path must keep parity.
 	layer.MarkRemoved(stale.Name, stale.ID)
-	view := NewOverlaidView(base, layer)
+	view := NewOverlaidView(recording, layer)
 
 	page, err := view.FindNodesByNameBounded(context.Background(), "handle", LocalizationNodeScope{}, 8)
 	if err != nil {
 		t.Fatalf("bounded overlay lookup: %v", err)
+	}
+	if len(recording.limits) != 1 || recording.limits[0] != 9 {
+		t.Fatalf("base limits = %v, want one detached-shadow refill slot", recording.limits)
 	}
 	if page.Total != 0 || len(page.Nodes) != 0 || page.Truncated {
 		t.Fatalf("detached removal leaked stale base node: %#v", page)
