@@ -11,7 +11,7 @@ func TestPolicyBodiesRouteExplicitFileReadsDirectly(t *testing.T) {
 		"compact workflow": sectionCompactWorkflow,
 		"full rule table":  sectionFullRuleTable,
 	}
-	direct := `read(operation:"file", target:{file:"<path>"})`
+	direct := `read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})`
 	localize := `explore(operation:"localize")`
 
 	for name, body := range bodies {

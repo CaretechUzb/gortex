@@ -85,13 +85,23 @@ func TestHandleFacadeValidatesMalformedExplicitNewUserBoundary(t *testing.T) {
 		{
 			name: "boundary on unsupported explore operation",
 			args: map[string]any{"operation": "outline", "task": "Locate Bar", "options": map[string]any{"new_user_task": true}},
-			want: "valid only on the first explore.task or explore.localize",
+			want: "valid only on the first explore.task, explore.localize, or read.file",
+		},
+		{
+			name:   "boundary on unsupported read operation",
+			facade: "read",
+			args: map[string]any{
+				"operation": "source",
+				"target":    map[string]any{"symbol": "pkg/a.go::A"},
+				"options":   map[string]any{"new_user_task": true},
+			},
+			want: "valid only on the first explore.task, explore.localize, or read.file",
 		},
 		{
 			name:   "boundary on another facade",
 			facade: "search",
 			args:   map[string]any{"operation": "symbols", "query": "Run", "options": map[string]any{"new_user_task": true}},
-			want:   "valid only on the first explore.task or explore.localize",
+			want:   "valid only on the first explore.task, explore.localize, or read.file",
 		},
 		{
 			name: "boundary without task",
@@ -627,6 +637,129 @@ func TestHandleFacadeExplicitNewUserTaskCrossesTerminalBoundary(t *testing.T) {
 	if state != localizationStateInactive || digest != nil || completion.digest != nil || completion.FinalResponse != "" {
 		t.Fatalf("new user task leaked prior terminal replay: state=%q digest=%#v completion=%#v", state, digest, completion)
 	}
+}
+
+func TestHandleFacadeExplicitNewUserReadCrossesTerminalBoundary(t *testing.T) {
+	registry := newFacadeRegistry()
+	calls := 0
+	registry.capture(mcpgo.NewTool("read_file", mcpgo.WithString("path", mcpgo.Required())), func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		calls++
+		if got := req.GetString("path", ""); got != "specs/localization-close-the-grep-gap.md" {
+			t.Fatalf("read path = %q", got)
+		}
+		return mcpgo.NewToolResultText("spec contents"), nil
+	})
+	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	ctx := WithSessionID(context.Background(), "explicit-read-boundary")
+	terminal := server.localizationFor(ctx)
+	prior := newLocalizationCompletion(true, "")
+	prior.digest = testEvidenceDigest()
+	terminal.armForTask(prior, "Locate Foo")
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Name = "read"
+	req.Params.Arguments = map[string]any{
+		"operation": "file",
+		"target":    map[string]any{"file": "specs/localization-close-the-grep-gap.md"},
+	}
+	replayed, err := server.handleFacade(ctx, "read", req)
+	if err != nil || calls != 0 {
+		t.Fatalf("ordinary read escaped terminal state: result=%#v err=%v calls=%d", replayed, err, calls)
+	}
+	requireLocalizationTerminalReplay(t, replayed, "read", "file")
+
+	req.Params.Arguments.(map[string]any)["options"] = map[string]any{"new_user_task": true}
+	result, err := server.handleFacade(ctx, "read", req)
+	if err != nil || result == nil || result.IsError || calls != 1 {
+		t.Fatalf("explicit read boundary = (%#v, %v), calls=%d", result, err, calls)
+	}
+	if text, _ := singleTextContent(result); text != "spec contents" {
+		t.Fatalf("explicit read boundary text = %q", text)
+	}
+	if blocked := terminal.block("search", "symbols", nil); blocked != nil {
+		t.Fatalf("successful direct read retained prior terminal state: %#v", blocked)
+	}
+	terminal.mu.Lock()
+	fingerprint := terminal.taskFingerprint
+	state := terminal.state
+	digest := terminal.digest
+	terminal.mu.Unlock()
+	if fingerprint != "read.file specs/localization-close-the-grep-gap.md" || state != localizationStateInactive || digest != nil {
+		t.Fatalf("direct read boundary state = fingerprint %q, state %q, digest %#v", fingerprint, state, digest)
+	}
+}
+
+func TestHandleFacadeNewUserReadValidatesBeforeTerminalReplay(t *testing.T) {
+	registry := newFacadeRegistry()
+	calls := 0
+	registry.capture(mcpgo.NewTool("read_file"), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		calls++
+		return mcpgo.NewToolResultText("unexpected"), nil
+	})
+	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	ctx := WithSessionID(context.Background(), "invalid-read-boundary")
+	terminal := server.localizationFor(ctx)
+	prior := newLocalizationCompletion(true, "")
+	prior.digest = testEvidenceDigest()
+	terminal.armForTask(prior, "Locate Foo")
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Name = "read"
+	req.Params.Arguments = map[string]any{
+		"operation": "file",
+		"target": map[string]any{
+			"file": "specs/localization-close-the-grep-gap.md",
+			"repo": "gortex-bench",
+		},
+		"options": map[string]any{"new_user_task": true},
+	}
+	result, err := server.handleFacade(ctx, "read", req)
+	if err != nil || result == nil || !result.IsError {
+		t.Fatalf("invalid direct read boundary = (%#v, %v), want selector error", result, err)
+	}
+	text, _ := singleTextContent(result)
+	if !strings.Contains(text, "target must contain exactly one selector") || strings.Contains(text, "LOCALIZATION:") {
+		t.Fatalf("invalid direct read boundary text = %q", text)
+	}
+	if calls != 0 {
+		t.Fatalf("invalid direct read dispatched %d legacy call(s)", calls)
+	}
+	if blocked := terminal.block("search", "symbols", nil); blocked == nil {
+		t.Fatal("invalid direct read boundary cleared the prior terminal contract")
+	}
+}
+
+func TestHandleFacadeFailedNewUserReadRollsBackTerminalState(t *testing.T) {
+	registry := newFacadeRegistry()
+	calls := 0
+	registry.capture(mcpgo.NewTool("read_file"), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		calls++
+		return mcpgo.NewToolResultError("read failed"), nil
+	})
+	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	ctx := WithSessionID(context.Background(), "failed-read-boundary")
+	terminal := server.localizationFor(ctx)
+	prior := newLocalizationCompletion(true, "")
+	prior.digest = testEvidenceDigest()
+	terminal.armForTask(prior, "Locate Foo")
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Name = "read"
+	req.Params.Arguments = map[string]any{
+		"operation": "file",
+		"target":    map[string]any{"file": "missing.md"},
+		"options":   map[string]any{"new_user_task": true},
+	}
+	result, err := server.handleFacade(ctx, "read", req)
+	if err != nil || result == nil || !result.IsError || calls != 1 {
+		t.Fatalf("failed direct read boundary = (%#v, %v), calls=%d", result, err, calls)
+	}
+	delete(req.Params.Arguments.(map[string]any), "options")
+	replayed, err := server.handleFacade(ctx, "read", req)
+	if err != nil || calls != 1 {
+		t.Fatalf("failed boundary did not restore terminal state: result=%#v err=%v calls=%d", replayed, err, calls)
+	}
+	requireLocalizationTerminalReplay(t, replayed, "read", "file")
 }
 
 func TestHandleFacadeExactReadCommitsOnlyOnSuccess(t *testing.T) {
