@@ -129,6 +129,8 @@ scan:
 			File:       nodeDisplayPath(node),
 			Line:       node.StartLine,
 			Provenance: localizationProvenanceBodyMention,
+
+			supportingOnly: true,
 		}
 		candidate := envelope
 		// Files, Symbols, and Evidence are positional arrays. Repeated file

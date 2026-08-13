@@ -114,7 +114,7 @@ type exploreTarget struct {
 	sourceLiteral          bool   // exact source-body hit that must survive final envelope packing
 	sourceLiteralCallee    bool   // exact source callsite uniquely resolved to this invoked callable
 	sourceLiteralAligned   bool   // source-literal callee that instantiates the task's value; strongest literal owner
-	literalPrimaryEligible bool   // unanchored bounded content evidence may take one of two PRIMARY seats
+	literalPrimaryEligible bool   // retrieval hint; final reserve requires authenticated callee proof
 	literalMatchCount      int    // distinct task literals matched; stable tie-break among eligible rows
 	typedAnchorProjection  bool   // bounded field-owner-call proof promoted from a task-aligned typed field
 	foldedOwner            bool   // synthetic owner inserted by concept member folding
@@ -3228,10 +3228,12 @@ type localizationEvidence struct {
 	Provenance string   `json:"provenance,omitempty"`
 	Source     string   `json:"source,omitempty"`
 
-	// Request-local presentation authority. This is deliberately not serialized:
-	// provenance may describe an exact literal on any authenticated row, while
-	// only an unanchored literal may reserve a PRIMARY seat ahead of ranking.
+	// Request-local presentation authority. These fields are deliberately not
+	// serialized: provenance remains truthful while supplemental rows and the
+	// frozen initial PRIMARY cohort keep their distinct presentation roles.
 	literalPrimaryEligible bool
+	primaryCohortOrder     int
+	supportingOnly         bool
 }
 
 func (s *Server) completeEmptyLocalization(ctx context.Context, task string, budget int) *mcp.CallToolResult {
@@ -4292,14 +4294,14 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 	}
 	literalMandatory := 0
 	for index, target := range targets {
-		if !target.literalPrimaryEligible {
+		if !localizationStrongSourceLiteralCallee(target) {
 			continue
 		}
 		if index+1 > mandatoryCount {
 			mandatoryCount = index + 1
 		}
 		literalMandatory++
-		if literalMandatory == exploreSourceLiteralReservationMax {
+		if literalMandatory == localizationFinalResponseLiteralReserve {
 			break
 		}
 	}
@@ -4342,7 +4344,8 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 			Callees:    boundedLocalizationNeighborIDs(target.callees, localizationMaxNeighborIDs),
 			Provenance: provenance,
 
-			literalPrimaryEligible: target.literalPrimaryEligible,
+			literalPrimaryEligible: localizationStrongSourceLiteralCallee(target),
+			supportingOnly:         target.leadingFileDepth,
 		}
 
 		candidate := envelope
@@ -4600,6 +4603,9 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 		envelope = localizationEnvelopePackingSourceWindow(envelope, target.sourceWindow, maxBytes)
 		break
 	}
+	// Freeze the ranked answer before adjacency/body/depth supplementation can
+	// rebuild the digest and accidentally promote a newly materialized row.
+	freezeLocalizationPrimaryCohort(task, &envelope, digest)
 	if declarations != nil {
 		envelope, digest = promoteLocalizationDirectAdjacency(task, envelope, declarations.reader, len(envelope.Evidence), shedBudget, digest)
 	}

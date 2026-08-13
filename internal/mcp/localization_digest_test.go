@@ -209,34 +209,108 @@ func TestDigestLifecycleAndLegacyFallback(t *testing.T) {
 	requireLocalizationTerminalReplay(t, blocked, "search", "symbols")
 }
 
-func TestContentLiteralRowsTakeAtMostTwoPrimarySeats(t *testing.T) {
+func TestOnlyAuthenticatedSourceLiteralCalleeReservesOnePrimarySeat(t *testing.T) {
 	rows := []localizationDigestRow{
-		{ID: "repo/a.go::First", Name: "First", File: "repo/a.go", Provenance: localizationProvenanceContentLiteral},
-		{ID: "repo/b.go::Second", Name: "Second", File: "repo/b.go", Provenance: localizationProvenanceSourceLiteralCallee},
-		{ID: "repo/c.go::Third", Name: "Third", File: "repo/c.go", Provenance: localizationProvenanceContentLiteral},
 		{ID: "repo/d.go::Semantic", Name: "Semantic", File: "repo/d.go"},
+		{ID: "repo/e.go::RankedTwo", Name: "RankedTwo", File: "repo/e.go"},
+		{ID: "repo/f.go::RankedThree", Name: "RankedThree", File: "repo/f.go"},
+		{ID: "repo/g.go::RankedFour", Name: "RankedFour", File: "repo/g.go"},
+		{ID: "repo/h.go::RankedFive", Name: "RankedFive", File: "repo/h.go"},
+		{ID: "repo/b.go::FirstCallee", Name: "FirstCallee", File: "repo/b.go", Provenance: localizationProvenanceSourceLiteralCallee, literalPrimaryEligible: true},
+		{ID: "repo/c.go::SecondCallee", Name: "SecondCallee", File: "repo/c.go", Provenance: localizationProvenanceSourceLiteralCallee},
+		{ID: "repo/a.go::Content", Name: "Content", File: "repo/a.go", Provenance: localizationProvenanceContentLiteral},
 	}
 
 	presented := localizationFinalResponseRows("find the semantic handler", nil, rows)
-	literalPrimaries := 0
+	reservedLiteralPrimaries := 0
+	contentLiteralPrimary := false
 	semanticPrimary := false
 	for _, row := range presented {
 		if !row.primary {
 			continue
 		}
-		if row.row.Provenance == localizationProvenanceContentLiteral ||
-			row.row.Provenance == localizationProvenanceSourceLiteralCallee {
-			literalPrimaries++
+		if row.row.Provenance == localizationProvenanceSourceLiteralCallee {
+			reservedLiteralPrimaries++
+		}
+		if row.row.Provenance == localizationProvenanceContentLiteral {
+			contentLiteralPrimary = true
 		}
 		if row.row.ID == "repo/d.go::Semantic" {
 			semanticPrimary = true
 		}
 	}
-	if literalPrimaries != exploreSourceLiteralReservationMax {
-		t.Fatalf("literal PRIMARY rows = %d, want bounded %d", literalPrimaries, exploreSourceLiteralReservationMax)
+	if reservedLiteralPrimaries != localizationFinalResponseLiteralReserve {
+		t.Fatalf("reserved literal PRIMARY rows = %d, want %d", reservedLiteralPrimaries, localizationFinalResponseLiteralReserve)
+	}
+	if contentLiteralPrimary {
+		t.Fatal("generic content literal gained PRIMARY authority from the literal alone")
 	}
 	if !semanticPrimary {
-		t.Fatal("literal seating consumed every semantic PRIMARY opportunity")
+		t.Fatal("literal reserve consumed the semantic PRIMARY opportunity")
+	}
+}
+
+func TestFrozenPrimaryCohortSurvivesSupplementalRows(t *testing.T) {
+	cases := []struct {
+		name string
+		task string
+		gold string
+	}{
+		{name: "aiohttp anchored import", task: "import aiohttp fails when zstd is not installed", gold: "aiohttp/compression_utils.py::ZSTDDecompressor.__init__"},
+		{name: "fmt anchored print", task: "ostream print fails with constant conditional warning", gold: "include/fmt/ostream.h::print"},
+		{name: "vue anchored hydrate", task: "skip detached async component hydration", gold: "packages/runtime-core/src/apiAsyncComponent.ts::performHydrate"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envelope := localizationExploreEnvelope{Evidence: []localizationEvidence{
+				{ID: tc.gold, Name: "gold", File: strings.Split(tc.gold, "::")[0]},
+				{ID: "repo/second.go::Second", Name: "Second", File: "repo/second.go"},
+				{ID: "repo/third.go::Third", Name: "Third", File: "repo/third.go"},
+				{ID: "repo/fourth.go::Fourth", Name: "Fourth", File: "repo/fourth.go"},
+				{ID: "repo/fifth.go::Fifth", Name: "Fifth", File: "repo/fifth.go"},
+			}}
+			digest := newLocalizationEvidenceDigestForTask(tc.task, envelope)
+			before := append([]string(nil), digest.primaryIDs...)
+			freezeLocalizationPrimaryCohort(tc.task, &envelope, digest)
+			for index := 0; index < 4; index++ {
+				envelope.Evidence = append(envelope.Evidence, localizationEvidence{
+					ID:   fmt.Sprintf("repo/supplement%02d.go::HydratePrint", index),
+					Name: "HydratePrint", File: fmt.Sprintf("repo/supplement%02d.go", index),
+					Provenance: localizationProvenanceDirectAdjacency, supportingOnly: true,
+				})
+			}
+			afterDigest := newLocalizationEvidenceDigestForTask(tc.task, envelope)
+			after := localizationFinalResponsePrimaryIDs(tc.task, nil, afterDigest.Evidence)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("PRIMARY cohort changed after supplemental rows:\nbefore=%v\nafter=%v", before, after)
+			}
+			if len(after) != localizationFinalResponsePrimaryLimit || after[0] != tc.gold {
+				t.Fatalf("PRIMARY cohort lost anchored candidate or count: %v", after)
+			}
+		})
+	}
+}
+
+func TestSupplementalRowsStaySupportingAcrossEverySelectorLoop(t *testing.T) {
+	rows := []localizationDigestRow{
+		{ID: "repo/base.go::First", Name: "First", File: "repo/base.go", primaryCohortOrder: 1},
+		{ID: "repo/base.go::Second", Name: "Second", File: "repo/base.go", primaryCohortOrder: 2},
+		{ID: "repo/base.go::Third", Name: "Third", File: "repo/base.go", primaryCohortOrder: 3},
+		{ID: "repo/base.go::Fourth", Name: "Fourth", File: "repo/base.go", primaryCohortOrder: 4},
+		{ID: "repo/supp.go::ExactTaskMatch", Name: "ExactTaskMatch", Kind: "method", File: "repo/supp.go", supportingOnly: true},
+		{ID: "repo/body.go::Body", Name: "Body", File: "repo/body.go", Provenance: localizationProvenanceBodyMention, supportingOnly: true},
+		{ID: "repo/adj.go::Adjacent", Name: "Adjacent", File: "repo/adj.go", Provenance: localizationProvenanceDirectAdjacency, supportingOnly: true},
+	}
+	current := []localizationDigestRow{{ID: "repo/supp.go::Current", Name: "Current", QualName: "Owner.Current", Kind: "method", File: "repo/supp.go"}}
+	first := localizationFinalResponseRows("ExactTaskMatch", current, rows)
+	second := localizationFinalResponseRows("ExactTaskMatch", current, rows)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatal("selector output is not deterministic")
+	}
+	for _, item := range first {
+		if item.primary && localizationFinalResponseSupportingOnly(item.row) {
+			t.Fatalf("supplemental row became PRIMARY: %+v", item.row)
+		}
 	}
 }
 

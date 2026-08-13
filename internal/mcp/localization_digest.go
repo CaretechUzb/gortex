@@ -68,10 +68,13 @@ type localizationDigestRow struct {
 	Callees    []string `json:"callees,omitempty"`
 	Provenance string   `json:"provenance,omitempty"`
 
-	// Kept only in the request-local/session-retained projection. It separates
-	// truthful literal provenance from permission to pre-seat that row as
-	// PRIMARY, without spending response bytes on an internal policy bit.
+	// Kept only in the request-local/session-retained projection. They separate
+	// truthful provenance from presentation authority without spending response
+	// bytes on internal policy state. primaryCohortOrder freezes the ranked
+	// PRIMARY projection before supplemental evidence is materialized.
 	literalPrimaryEligible bool
+	primaryCohortOrder     int
+	supportingOnly         bool
 }
 
 // newLocalizationEvidenceDigestForTask retains only concrete ranked evidence
@@ -108,6 +111,8 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 			Provenance: row.Provenance,
 
 			literalPrimaryEligible: row.literalPrimaryEligible,
+			primaryCohortOrder:     row.primaryCohortOrder,
+			supportingOnly:         row.supportingOnly || localizationSupportingOnlyProvenance(row.Provenance),
 		})
 		return true
 	}
@@ -273,6 +278,13 @@ func mergeLocalizationDigestRowEvidence(primary, supplementary localizationDiges
 		primary.Provenance = supplementary.Provenance
 	}
 	primary.literalPrimaryEligible = primary.literalPrimaryEligible || supplementary.literalPrimaryEligible
+	// An identity that was independently ranked remains cohort-eligible when a
+	// later supplemental observation of the same row is merged into it.
+	primary.supportingOnly = primary.supportingOnly && supplementary.supportingOnly
+	if primary.primaryCohortOrder == 0 ||
+		(supplementary.primaryCohortOrder > 0 && supplementary.primaryCohortOrder < primary.primaryCohortOrder) {
+		primary.primaryCohortOrder = supplementary.primaryCohortOrder
+	}
 	primary.Callers = mergeLocalizationDigestStrings(primary.Callers, supplementary.Callers)
 	primary.Callees = mergeLocalizationDigestStrings(primary.Callees, supplementary.Callees)
 	return primary
@@ -554,6 +566,9 @@ const (
 	// usually within the top five. Slots below stay SUPPORTING so the page
 	// keeps an explicit confidence order.
 	localizationFinalResponsePrimaryLimit = 5
+	// One authenticated source-literal callee may pre-seat ahead of the ranked
+	// cohort. Further literal rows compete only through ordinary ranking.
+	localizationFinalResponseLiteralReserve = 1
 	// localizationDigestShrinkFloorRows is the smallest answer the envelope
 	// shed loop may shrink the digest to under extreme budget pressure. It is
 	// deliberately narrower than the primary block: the primary width is what
@@ -594,6 +609,10 @@ func localizationFinalResponsePrimaryProvenance(row localizationDigestRow) bool 
 	default:
 		return false
 	}
+}
+
+func localizationFinalResponseSupportingOnly(row localizationDigestRow) bool {
+	return row.supportingOnly || localizationSupportingOnlyProvenance(row.Provenance)
 }
 
 func localizationFinalResponseSupportingProvenance(provenance string) bool {
@@ -803,31 +822,50 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 	for _, row := range rows {
 		rowsByID[strings.TrimSpace(row.ID)] = row
 	}
-	// Fresh rows already lead the merged evidence order. Primary status is earned
-	// from proof, task alignment, or owner coherence below; arrival time alone
-	// must not displace stronger retained evidence.
-	literalPrimaryCount := 0
+	// Fresh rows already lead the merged evidence order. Once the initial ranked
+	// cohort has been frozen, later supplemental projections cannot reshuffle it:
+	// replay and permitted-read merges recover the exact original order first.
 	appendPrimary := func(row localizationDigestRow) bool {
-		if localizationSupportingOnlyProvenance(row.Provenance) {
+		if localizationFinalResponseSupportingOnly(row) {
 			return false
+		}
+		return appendRow(&primaries, localizationFinalResponsePrimaryLimit, row)
+	}
+	for order := 1; order <= localizationFinalResponsePrimaryLimit; order++ {
+		for _, row := range rows {
+			if row.primaryCohortOrder == order {
+				appendPrimary(row)
+				break
+			}
+		}
+	}
+
+	// A graph-authenticated source-literal callee may reserve one seat before
+	// ordinary task/rank selection. Exact content rows retain their truthful
+	// provenance but never gain presentation authority from the literal alone.
+	literalReserveUsed := false
+	for _, row := range primaries {
+		if row.Provenance == localizationProvenanceSourceLiteralCallee && row.literalPrimaryEligible {
+			literalReserveUsed = true
+			break
+		}
+	}
+	for _, row := range rows {
+		if !localizationFinalResponsePrimaryProvenance(row) {
+			continue
 		}
 		literal := row.Provenance == localizationProvenanceContentLiteral ||
 			row.Provenance == localizationProvenanceSourceLiteralCallee
-		if literal && literalPrimaryCount >= exploreSourceLiteralReservationMax {
-			return false
-		}
-		if !appendRow(&primaries, localizationFinalResponsePrimaryLimit, row) {
-			return false
-		}
 		if literal {
-			literalPrimaryCount++
+			if literalReserveUsed {
+				continue
+			}
+			if appendPrimary(row) {
+				literalReserveUsed = true
+			}
+			continue
 		}
-		return true
-	}
-	for _, row := range rows {
-		if localizationFinalResponsePrimaryProvenance(row) {
-			appendPrimary(row)
-		}
+		appendPrimary(row)
 	}
 
 	taskTerms := exploreTerminalTerms(task)
@@ -884,6 +922,8 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 		}
 	}
 	for _, row := range rows {
+		// Further authenticated literal callees may still win through ordinary
+		// rank; only the pre-seated reserve above is capped at one.
 		appendPrimary(row)
 	}
 
@@ -918,6 +958,47 @@ func localizationFinalResponsePrimaryIDs(task string, current, rows []localizati
 		}
 	}
 	return ids
+}
+
+// freezeLocalizationPrimaryCohort records the exact initial PRIMARY projection
+// immediately before supplemental evidence is materialized. The order is
+// request-local policy state: it is retained across digest rebuilds and reads,
+// but never serialized into the response payload.
+func freezeLocalizationPrimaryCohort(
+	task string,
+	envelope *localizationExploreEnvelope,
+	digest *localizationEvidenceDigest,
+) {
+	if envelope == nil || digest == nil {
+		return
+	}
+	primaryIDs := append([]string(nil), digest.primaryIDs...)
+	if len(primaryIDs) == 0 {
+		primaryIDs = localizationFinalResponsePrimaryIDs(task, nil, digest.Evidence)
+	}
+	if len(primaryIDs) > localizationFinalResponsePrimaryLimit {
+		primaryIDs = primaryIDs[:localizationFinalResponsePrimaryLimit]
+	}
+	orders := make(map[string]int, len(primaryIDs))
+	for index, id := range primaryIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			orders[id] = index + 1
+		}
+	}
+	for index := range envelope.Evidence {
+		row := &envelope.Evidence[index]
+		if order := orders[strings.TrimSpace(row.ID)]; order > 0 && !row.supportingOnly &&
+			!localizationSupportingOnlyProvenance(row.Provenance) {
+			row.primaryCohortOrder = order
+		}
+	}
+	for index := range digest.Evidence {
+		row := &digest.Evidence[index]
+		if order := orders[strings.TrimSpace(row.ID)]; order > 0 && !localizationFinalResponseSupportingOnly(*row) {
+			row.primaryCohortOrder = order
+		}
+	}
+	refreshLocalizationDigestResponses(digest, task, nil)
 }
 
 func renderLocalizationFinalResponse(rows []localizationDigestRow) string {
