@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"reflect"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -29,7 +31,7 @@ func NormalizeEvidenceIDs(primaryIDs, evidenceIDs []string) ([]string, []string,
 		total := 0
 		for _, raw := range values {
 			id := strings.TrimSpace(raw)
-			if id == "" || len(id) > maxEvidenceIDSize {
+			if id == "" || len(id) > maxEvidenceIDSize || !validEvidenceIDText(id) {
 				return nil, nil, 0, false
 			}
 			if _, duplicate := seen[id]; duplicate {
@@ -58,6 +60,22 @@ func NormalizeEvidenceIDs(primaryIDs, evidenceIDs []string) ([]string, []string,
 		}
 	}
 	return primary, evidence, true
+}
+
+// validEvidenceIDText keeps authenticated identities safe to interpolate into
+// a one-line hook reason. Reject invalid UTF-8, control/format characters, and
+// Unicode line/paragraph separators at the authority boundary.
+func validEvidenceIDText(id string) bool {
+	if !utf8.ValidString(id) {
+		return false
+	}
+	for _, r := range id {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) ||
+			unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			return false
+		}
+	}
+	return true
 }
 
 // MarshalJSON prevents a direct caller from publishing an oversized authority
