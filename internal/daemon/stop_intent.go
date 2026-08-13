@@ -17,9 +17,9 @@ import (
 // declines to resurrect a deliberately-stopped daemon.
 //
 // Unlike the spawn-fail marker, this one is sticky — it has no TTL and is
-// cleared only by an explicit `gortex daemon start` / `restart`. Suppressing
-// autostart does not break `gortex mcp`: a suppressed proxy falls back to the
-// embedded in-process server exactly as it does under GORTEX_AUTOSTART=0.
+// cleared only by an explicit `gortex daemon start` / `restart`. A suppressed
+// `gortex mcp` exits unless the user-level config explicitly allows the
+// embedded in-process server.
 
 // StopIntentMarkerPath returns the sentinel file recording an explicit
 // `daemon stop`. Co-located with the socket / PID / spawn-lock under the

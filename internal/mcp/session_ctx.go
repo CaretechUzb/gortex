@@ -78,6 +78,44 @@ func SessionCWDFromContext(ctx context.Context) string {
 	return ""
 }
 
+// authorizedCallCtxKey carries the tool name of an inbound tools/call that
+// the session's own authorization already permitted (see
+// Server.IsToolEnabledForSession). It exists because mcp-go re-runs every
+// registered tool filter at CALL time (server.passesToolFilters, added in
+// mcp-go v0.55.1) with the single requested tool: a filter that only shapes
+// tools/list VISIBILITY would otherwise turn a legitimate by-name call into
+// "tool '<name>' not found". Unexported key: set it via
+// WithAuthorizedToolCall.
+type authorizedCallCtxKey struct{}
+
+// WithAuthorizedToolCall returns a context marking name as an authorized
+// by-name tools/call for this session. The daemon's MCP dispatcher sets it
+// after IsToolEnabledForSession accepts the call and before HandleMessage, so
+// toolSurfaceFilter knows the follow-up single-tool filter invocation is
+// mcp-go's call-time access check and not a tools/list render.
+//
+// This never widens what a session may call: the marker is only set for names
+// the session's effective surface already permits, and checkToolGate still
+// runs the authoritative per-call gate inside the handler wrapper.
+func WithAuthorizedToolCall(ctx context.Context, name string) context.Context {
+	if name == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, authorizedCallCtxKey{}, name)
+}
+
+// authorizedToolCallFromContext returns the tool name attached via
+// WithAuthorizedToolCall, or "" when none is present.
+func authorizedToolCallFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if name, ok := ctx.Value(authorizedCallCtxKey{}).(string); ok {
+		return name
+	}
+	return ""
+}
+
 // repoAllowCtxKey carries the per-request repo allow-set resolved by
 // handleAnalyze (resolveScope → ResolvedScope.RepoAllow). The scoped-
 // node accessors (scopedNodes / scopedNodesByKinds / scopedNodeSlice)

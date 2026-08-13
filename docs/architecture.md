@@ -53,7 +53,7 @@ gortex binary
 
 ## Graph persistence
 
-The SQLite store is the graph: the daemon writes into it as it indexes and queries it in place, and restores it on startup with incremental re-indexing of only changed files. There is no separate serialisation step and no other persistence format to choose. The daemonless one-shot path (`gortex mcp --index`) runs against a private temp store that is deleted on shutdown, so it re-indexes the tree on every launch — run the daemon if you want the index to survive.
+The SQLite store is the graph: the daemon writes into it as it indexes and queries it in place, and restores it on startup with incremental re-indexing of only changed files. There is no separate serialisation step and no other persistence format to choose. The explicitly enabled daemonless path (`mcp.allow_embedded: true` plus `gortex mcp --index`) uses a private temporary store that is deleted on shutdown, so it re-indexes the tree on every launch.
 
 A cold index does pass through memory first: the indexer parses a repository into an in-memory staging graph and then bulk-drains it into the store, which is several times faster than writing every node and edge through as it is parsed. That staging buffer is an implementation detail of indexing — it holds one repository for the length of one index pass, is never queried by tools, and never outlives the process.
 

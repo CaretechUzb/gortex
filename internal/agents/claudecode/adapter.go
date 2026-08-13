@@ -77,15 +77,18 @@ func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 
 	// Project mode — only genuinely repo-specific artifacts. No
 	// tool-usage duplication: that lives at ~/.claude/skills/
-	// (installed by `gortex install`). CLAUDE.md gets a
-	// marker-guarded block only when --analyze or --skills produce
-	// codebase-derived content.
+	// (installed by `gortex install`). Community routing is canonical
+	// in AGENTS.md; CLAUDE.md imports it and retains only --analyze
+	// content in its marker-guarded block.
 	p.Files = append(p.Files, agents.FileAction{Path: filepath.Join(env.Root, ".mcp.json"), Action: agents.ActionWouldCreate, Keys: []string{"mcpServers"}})
 	p.Files = append(p.Files, agents.FileAction{Path: filepath.Join(env.Root, ".claude", "settings.json"), Action: agents.ActionWouldMerge, Keys: []string{"permissions"}})
 	if env.InstallHooks {
 		p.Files = append(p.Files, agents.FileAction{Path: filepath.Join(env.Root, ".claude", "settings.local.json"), Action: agents.ActionWouldMerge, Keys: []string{"hooks"}})
 	}
-	if env.AnalyzedOverview != "" || env.SkillsRouting != "" {
+	if env.SkillsRouting != "" {
+		p.Files = append(p.Files, agents.FileAction{Path: filepath.Join(env.Root, "AGENTS.md"), Action: agents.ActionWouldMerge, Keys: []string{"communities-block"}})
+		p.Files = append(p.Files, agents.FileAction{Path: filepath.Join(env.Root, "CLAUDE.md"), Action: agents.ActionWouldMerge, Keys: []string{"agents-import", "communities-block"}})
+	} else if env.AnalyzedOverview != "" {
 		p.Files = append(p.Files, agents.FileAction{Path: filepath.Join(env.Root, "CLAUDE.md"), Action: agents.ActionWouldMerge, Keys: []string{"communities-block"}})
 	}
 	for _, s := range env.GeneratedSkills {
@@ -154,32 +157,35 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		logf(w, "[gortex init] skipping hook installation (--no-hooks)")
 	}
 
-	// 4. CLAUDE.md — only written when there's genuinely
-	// codebase-specific content to place there: either the
-	// --analyze overview, the --skills community routing, or both.
-	// Generic tool-usage moved to user-level ~/.claude/skills/
-	// (installed by `gortex install`).
+	// 4. Community routing is canonical in AGENTS.md so every agent can
+	// share one generated table. Claude Code imports that canonical file
+	// from CLAUDE.md; an existing Gortex-managed CLAUDE.md block is
+	// migrated away while any --analyze overview remains Claude-specific.
+	if env.SkillsRouting != "" {
+		agentsMdPath := filepath.Join(env.Root, "AGENTS.md")
+		routingAction, err := agents.UpsertMarkedBlock(w, agentsMdPath, env.SkillsRouting,
+			agents.CommunitiesStartMarker, agents.CommunitiesEndMarker, opts)
+		if err != nil {
+			return res, fmt.Errorf("AGENTS.md: %w", err)
+		}
+		res.Files = append(res.Files, routingAction)
+	}
 	if env.AnalyzedOverview != "" || env.SkillsRouting != "" {
 		claudeMdPath := filepath.Join(env.Root, "CLAUDE.md")
-		var body strings.Builder
-		if env.AnalyzedOverview != "" {
-			body.WriteString(env.AnalyzedOverview)
-			if !strings.HasSuffix(env.AnalyzedOverview, "\n") {
-				body.WriteString("\n")
-			}
-		}
-		if env.SkillsRouting != "" {
-			if body.Len() > 0 {
-				body.WriteString("\n")
-			}
-			body.WriteString(env.SkillsRouting)
-		}
-		claudeAction, err := agents.UpsertMarkedBlock(w, claudeMdPath, body.String(),
+		claudeAction, err := agents.UpsertMarkedBlock(w, claudeMdPath, env.AnalyzedOverview,
 			agents.CommunitiesStartMarker, agents.CommunitiesEndMarker, opts)
 		if err != nil {
 			return res, fmt.Errorf("CLAUDE.md: %w", err)
 		}
 		res.Files = append(res.Files, claudeAction)
+
+		if env.SkillsRouting != "" {
+			importAction, err := ensureProjectAgentsImport(w, claudeMdPath, opts)
+			if err != nil {
+				return res, fmt.Errorf("CLAUDE.md import: %w", err)
+			}
+			res.Files = append(res.Files, importAction)
+		}
 	}
 
 	// 5. Generated community skills — per-community SKILL.md files
@@ -556,6 +562,59 @@ func fileContains(path, needle string) bool {
 func pathExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+const projectAgentsImport = "@AGENTS.md"
+
+// ensureProjectAgentsImport adds Claude Code's project-level import for the
+// canonical shared instructions without rewriting or duplicating user content.
+func ensureProjectAgentsImport(w io.Writer, path string, opts agents.ApplyOpts) (agents.FileAction, error) {
+	action := agents.FileAction{Path: path, Keys: []string{"agents-import"}}
+	existing, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return action, err
+	}
+	if hasProjectAgentsImport(string(existing)) {
+		action.Action = agents.ActionSkip
+		action.Reason = "unchanged"
+		return action, nil
+	}
+
+	newline := "\n"
+	if strings.Contains(string(existing), "\r\n") {
+		newline = "\r\n"
+	}
+	content := projectAgentsImport + newline
+	if len(existing) > 0 {
+		content += newline + string(existing)
+	}
+	if opts.DryRun {
+		if os.IsNotExist(err) {
+			action.Action = agents.ActionWouldCreate
+		} else {
+			action.Action = agents.ActionWouldMerge
+		}
+		return action, nil
+	}
+	if err := agents.AtomicWriteFile(path, []byte(content), 0o644); err != nil {
+		return action, err
+	}
+	if os.IsNotExist(err) {
+		action.Action = agents.ActionCreate
+	} else {
+		action.Action = agents.ActionMerge
+	}
+	logf(w, "[gortex init] ensured %s imports AGENTS.md", path)
+	return action, nil
+}
+
+func hasProjectAgentsImport(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		if strings.TrimSpace(line) == projectAgentsImport {
+			return true
+		}
+	}
+	return false
 }
 
 // installPermissions merges an {"permissions": {"allow":

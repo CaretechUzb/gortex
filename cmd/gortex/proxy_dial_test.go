@@ -111,15 +111,20 @@ func TestDialDaemonWithRetry_NonRecoverableSurfaced(t *testing.T) {
 	}
 }
 
-func TestDialDaemonWithRetry_ContextCancelConcedes(t *testing.T) {
+func TestDialDaemonWithRetry_ContextCancelSurfaced(t *testing.T) {
 	withFastDialRetry(t, 10*time.Second)
+	var calls int32
 	dialDaemon = func(daemon.Handshake) (*daemon.Client, error) {
+		atomic.AddInt32(&calls, 1)
 		return nil, fmt.Errorf("%w: connection refused", daemon.ErrDaemonUnavailable)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	client, recoverable, err := dialDaemonWithRetry(ctx, daemon.Handshake{})
-	if client != nil || !recoverable {
-		t.Fatalf("want (nil, true, err) on cancel, got (%v, %v, %v)", client, recoverable, err)
+	if client != nil || recoverable || !errors.Is(err, context.Canceled) {
+		t.Fatalf("want (nil, false, context.Canceled), got (%v, %v, %v)", client, recoverable, err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("canceled context attempted %d daemon dial(s), want 0", got)
 	}
 }

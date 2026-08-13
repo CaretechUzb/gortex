@@ -132,10 +132,13 @@ func TestResolverHelperMux_RoutesByExtension(t *testing.T) {
 	assert.Equal(t, 9, defLine)
 }
 
-// TestNewLazyResolverHelper_LookupFiresOnce verifies that the lazy
-// provider lookup runs exactly once and the result (or error) is
-// cached for subsequent calls.
-func TestNewLazyResolverHelper_LookupFiresOnce(t *testing.T) {
+// TestNewLazyResolverHelper_LookupRunsPerCall verifies the
+// router-backed contract through the public Definition entry point: a
+// failing lookup is re-run on the next call rather than poisoning the
+// helper. Sticky failures were how a helper went permanently blind
+// after one transient router hiccup; the router's own markSpawnFailed
+// is what fails a genuinely-broken server fast.
+func TestNewLazyResolverHelper_LookupRunsPerCall(t *testing.T) {
 	var calls int
 	h := NewLazyResolverHelper(
 		func() (*Provider, error) {
@@ -152,7 +155,7 @@ func TestNewLazyResolverHelper_LookupFiresOnce(t *testing.T) {
 	assert.False(t, ok)
 	_, _, ok = h.Definition("foo.ts", 2, "y")
 	assert.False(t, ok)
-	assert.Equal(t, 1, calls, "lookup must run exactly once")
+	assert.Equal(t, 2, calls, "router-backed lookup must run once per Definition call")
 }
 
 func TestResolverHelper_NilSafe(t *testing.T) {

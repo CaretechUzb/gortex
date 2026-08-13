@@ -13,11 +13,11 @@ import (
 	"github.com/zzet/gortex/internal/testenv"
 )
 
-// TestResolveEmbeddedIndex covers what the embedded fallback is allowed
-// to serve when no daemon answers. The fallback is reached by accident —
-// a daemon restart is enough — so its inference has to be conservative:
-// it may serve a project directory, and it may not crawl a directory the
-// user never asked it to index (gortexhq/gortex#418).
+// TestResolveEmbeddedIndex covers what the explicitly enabled embedded
+// fallback is allowed to serve when no daemon answers. The opt-in permits
+// the mode, not an arbitrary crawl, so inference remains conservative: it
+// may serve a project directory, and it may not crawl a directory the user
+// never asked it to index (gortexhq/gortex#418).
 func TestResolveEmbeddedIndex(t *testing.T) {
 	testenv.Sandbox(t)
 
@@ -131,11 +131,10 @@ func TestTrackedReposUnder(t *testing.T) {
 }
 
 // TestEmbeddedFallback_LeavesNoGortexDirInLaunchCWD is the filesystem
-// half of #418: starting the embedded server must not create a .gortex/
-// directory in whatever tree the MCP client happened to launch from. The
-// notebook sidecar was opened eagerly at startup, before any notebook
-// tool was called, so a daemon blip was enough to leave an untracked
-// `.gortex/` in a production repo's `git status`.
+// half of #418: even an explicitly enabled embedded server must not create
+// a .gortex/ directory in whatever tree the MCP client happened to launch
+// from. The notebook sidecar used to open eagerly at startup and leave an
+// untracked `.gortex/` in a production repo's `git status`.
 func TestEmbeddedFallback_LeavesNoGortexDirInLaunchCWD(t *testing.T) {
 	testenv.Sandbox(t)
 

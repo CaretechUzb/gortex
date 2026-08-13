@@ -302,11 +302,55 @@ func (r *Resolver) cachedFindNodesByNameInRepoForEdge(name, repo string, edge *g
 	if r.nodesByRepoLanguageName != nil {
 		if byName, ok := r.nodesByRepoLanguageName[scope]; ok {
 			if hits, warmed := byName[name]; warmed {
-				return hits
+				return genericInstantiationOnly(edge, hits)
 			}
 		}
 	}
-	return graph.FindNodesByNamesInRepoLanguages(r.graph, []string{name}, scope.repo, languages)[name]
+	return genericInstantiationOnly(edge,
+		graph.FindNodesByNamesInRepoLanguages(r.graph, []string{name}, scope.repo, languages)[name])
+}
+
+// genericInstantiationOnly narrows a call edge's candidates when the
+// extractor marked it as an explicit generic instantiation.
+//
+// Some grammars spell an instantiation exactly like something unrelated:
+// Go parses `Zero[int]()` the same as indexing a func-valued map or
+// struct field, and `One[int](1)` the same as a conversion to a generic
+// type. Emitting all three is what recovers the real generic calls, but
+// it also hands the ordinary name tiers candidates a genuine index or
+// conversion should never reach — and those tiers bound them, pointing
+// `t.handlers[k]()` at an unrelated same-named method.
+//
+// A true instantiation can only target a declaration that DECLARES type
+// parameters. Requiring that is exact rather than heuristic, and it is
+// what separates the call from both impostors: a func-valued field and a
+// shadowing local name nothing generic. Narrowing only — an unmarked
+// edge, or one whose candidates carry no evidence either way, is
+// returned untouched. An empty result leaves the edge unresolved, which
+// is the correct answer for an index or a conversion.
+//
+// The returned slice is never the cached input when it filters, so the
+// shared name cache is not mutated.
+func genericInstantiationOnly(edge *graph.Edge, hits []*graph.Node) []*graph.Node {
+	if edge == nil || edge.Meta == nil || len(hits) == 0 {
+		return hits
+	}
+	if marked, _ := edge.Meta[graph.MetaGenericInstantiation].(bool); !marked {
+		return hits
+	}
+	out := make([]*graph.Node, 0, len(hits))
+	for _, n := range hits {
+		if n == nil || n.Meta == nil {
+			continue
+		}
+		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
+			continue
+		}
+		if tp, ok := n.Meta["type_params"]; ok && tp != nil {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // cachedFindExternNodesByName keeps explicit extern candidates isolated by the

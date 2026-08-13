@@ -1,15 +1,20 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/platform"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // TestEmbeddedStorePathIsPrivateTemp pins the property that keeps the
@@ -137,6 +142,140 @@ func TestReapStaleEmbeddedStoresSpareLockedStore(t *testing.T) {
 	if _, err := os.Stat(abandonedDir); !os.IsNotExist(err) {
 		t.Errorf("an aged unlocked store dir survived the reap, stat err = %v", err)
 	}
+}
+
+func TestLoadEmbeddedMCPGlobalConfig(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		write       bool
+		wantError   string
+		wantAllowed bool
+	}{
+		{name: "missing config defaults off", wantError: "mcp.allow_embedded: true"},
+		{name: "explicit false", body: "mcp:\n  allow_embedded: false\n", write: true, wantError: "mcp.allow_embedded: true"},
+		{name: "explicit true", body: "mcp:\n  allow_embedded: true\n", write: true, wantAllowed: true},
+		{name: "malformed config fails closed", body: "mcp: [\n", write: true, wantError: "embedded MCP policy"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if tt.write {
+				if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+					t.Fatalf("write global config: %v", err)
+				}
+			}
+
+			cfg, err := loadEmbeddedMCPGlobalConfig(path)
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("error = %v, want substring %q", err, tt.wantError)
+				}
+				if cfg != nil {
+					t.Fatalf("denied config = %#v, want nil", cfg)
+				}
+				if !strings.Contains(err.Error(), path) {
+					t.Fatalf("error %q does not identify config path %q", err, path)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadEmbeddedMCPGlobalConfig: %v", err)
+			}
+			if cfg == nil || cfg.MCP.AllowEmbedded != tt.wantAllowed {
+				t.Fatalf("allow_embedded = %v, want %v", cfg != nil && cfg.MCP.AllowEmbedded, tt.wantAllowed)
+			}
+		})
+	}
+}
+
+func TestRunMCPDefaultDenyIgnoresRepoConfig(t *testing.T) {
+	dirs := testenv.Sandbox(t)
+	stubUnavailableMCPDaemon(t)
+
+	repoConfig := filepath.Join(t.TempDir(), ".gortex.yaml")
+	if err := os.WriteFile(repoConfig, []byte("mcp:\n  allow_embedded: true\n"), 0o600); err != nil {
+		t.Fatalf("write repo config: %v", err)
+	}
+	cfgFile = repoConfig
+
+	err := runMCP(mcpCmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "mcp.allow_embedded: true") {
+		t.Fatalf("runMCP error = %v, want default-deny guidance", err)
+	}
+	globalPath := filepath.Join(dirs.Config, "gortex", "config.yaml")
+	if !strings.Contains(err.Error(), globalPath) {
+		t.Fatalf("runMCP error %q does not identify machine-global config %q", err, globalPath)
+	}
+}
+
+func TestRunMCPProxyRequiresDaemonEvenWhenEmbeddedAllowed(t *testing.T) {
+	dirs := testenv.Sandbox(t)
+	stubUnavailableMCPDaemon(t)
+	mcpForceProxy = true
+
+	globalPath := filepath.Join(dirs.Config, "gortex", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(globalPath), 0o700); err != nil {
+		t.Fatalf("create global config dir: %v", err)
+	}
+	if err := os.WriteFile(globalPath, []byte("mcp:\n  allow_embedded: true\n"), 0o600); err != nil {
+		t.Fatalf("write global config: %v", err)
+	}
+
+	err := runMCP(mcpCmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "--proxy requires") {
+		t.Fatalf("runMCP error = %v, want daemon-only --proxy error", err)
+	}
+}
+
+func TestRunMCPRejectsNonRecoverableDaemonProbe(t *testing.T) {
+	testenv.Sandbox(t)
+	stubUnavailableMCPDaemon(t)
+	probeDaemonAvailability = func() error { return os.ErrPermission }
+
+	err := runMCP(mcpCmd, nil)
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("runMCP error = %v, want permission error", err)
+	}
+}
+
+func TestRunMCPCanceledContextDoesNotFallback(t *testing.T) {
+	testenv.Sandbox(t)
+	stubUnavailableMCPDaemon(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cmd := &cobra.Command{}
+	cmd.SetContext(ctx)
+
+	err := runMCP(cmd, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runMCP error = %v, want context.Canceled", err)
+	}
+}
+
+func stubUnavailableMCPDaemon(t *testing.T) {
+	t.Helper()
+	oldProbe := probeDaemonAvailability
+	oldRunning := isDaemonRunning
+	oldForceProxy := mcpForceProxy
+	oldConfig := cfgFile
+	oldWarned := legacyMCPFlagsWarned
+	t.Cleanup(func() {
+		probeDaemonAvailability = oldProbe
+		isDaemonRunning = oldRunning
+		mcpForceProxy = oldForceProxy
+		cfgFile = oldConfig
+		legacyMCPFlagsWarned = oldWarned
+	})
+
+	t.Setenv("GORTEX_AUTOSTART", "0")
+	probeDaemonAvailability = func() error { return daemon.ErrDaemonUnavailable }
+	isDaemonRunning = func() bool { return false }
+	mcpForceProxy = false
+	cfgFile = ""
+	legacyMCPFlagsWarned = false
 }
 
 // redirectTempRoot points os.TempDir at a per-test directory so the reaper

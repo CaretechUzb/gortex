@@ -65,13 +65,13 @@ const qGoAll = `
   ; and were never affected.
   (call_expression
     function: (index_expression
-      operand: (identifier) @call.name)) @call.expr
+      operand: (identifier) @callg.name)) @callg.expr
 
   (call_expression
     function: (index_expression
       operand: (selector_expression
-        operand: (_) @callm.receiver
-        field: (field_identifier) @callm.method))) @callm.expr
+        operand: (_) @callmg.receiver
+        field: (field_identifier) @callmg.method))) @callmg.expr
 
   ; ...and with exactly one VALUE argument the same call is not even a
   ; call_expression: One[int](1) is indistinguishable from a conversion
@@ -80,13 +80,13 @@ const qGoAll = `
   ; cannot share a package-scope name with a function.
   (type_conversion_expression
     type: (generic_type
-      type: (type_identifier) @call.name)) @call.expr
+      type: (type_identifier) @callg.name)) @callg.expr
 
   (type_conversion_expression
     type: (generic_type
       type: (qualified_type
-        package: (_) @callm.receiver
-        name: (type_identifier) @callm.method))) @callm.expr
+        package: (_) @callmg.receiver
+        name: (type_identifier) @callmg.method))) @callmg.expr
 
   (var_declaration
     (var_spec
@@ -243,7 +243,13 @@ type goDeferredCall struct {
 	receiver   string // selector call receiver text
 	line       int    // 1-based line of call_expression
 	isSelector bool
-	spawn      bool // call is launched via `go` — emit EdgeSpawns alongside EdgeCalls
+	// genericInst marks a call whose callee spelled explicit type
+	// arguments. Go writes those exactly like indexing a func-valued
+	// map or field, and like converting to a generic type, so the
+	// marker rides onto the edge and the resolver binds it only to a
+	// declaration that is actually generic.
+	genericInst bool
+	spawn       bool // call is launched via `go` — emit EdgeSpawns alongside EdgeCalls
 	// returnUsage is how the call site consumes the return value
 	// (graph.ReturnUsage* label), classified from the call node's
 	// parent chain at capture time and stamped as edge Meta on every
@@ -479,6 +485,35 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				dc.grpcRegService, dc.grpcRegArgNode = svc, argNode
 			}
 			calls = append(calls, dc)
+
+		// An explicitly instantiated generic call. The grammar spells
+		// these exactly like indexing a func-valued map/field and like
+		// converting to a generic type, so the marker rides along and
+		// the resolver refuses to bind unless the target really is
+		// generic — see goGenericInstantiationOnly.
+		case m.Captures["callg.expr"] != nil:
+			expr := m.Captures["callg.expr"]
+			calls = append(calls, goDeferredCall{
+				callName:    m.Captures["callg.name"].Text,
+				line:        expr.StartLine + 1,
+				spawn:       isGoroutineSpawn(expr.Node),
+				returnUsage: classifyReturnUsage(expr.Node, src, goReturnUsageSpec),
+				callNode:    expr.Node,
+				genericInst: true,
+			})
+
+		case m.Captures["callmg.expr"] != nil:
+			expr := m.Captures["callmg.expr"]
+			calls = append(calls, goDeferredCall{
+				method:      m.Captures["callmg.method"].Text,
+				receiver:    m.Captures["callmg.receiver"].Text,
+				line:        expr.StartLine + 1,
+				isSelector:  true,
+				spawn:       isGoroutineSpawn(expr.Node),
+				returnUsage: classifyReturnUsage(expr.Node, src, goReturnUsageSpec),
+				callNode:    expr.Node,
+				genericInst: true,
+			})
 
 		case m.Captures["callm.expr"] != nil:
 			expr := m.Captures["callm.expr"]
@@ -999,6 +1034,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				From: callerID, To: target,
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			}
+			stampGoGenericInstantiation(edge, c)
 			applyGoGRPCRegisterMeta(edge, c, src, tenv)
 			applyGoTemporalRegisterMeta(edge, c)
 			applyGoTemporalHandlerMeta(edge, c)
@@ -1016,6 +1052,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				From: callerID, To: target,
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			}
+			stampGoGenericInstantiation(edge, c)
 			applyGoGRPCRegisterMeta(edge, c, src, tenv)
 			applyGoTemporalRegisterMeta(edge, c)
 			applyGoTemporalHandlerMeta(edge, c)
@@ -1065,6 +1102,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			}
 			stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, composed, result))
 		}
+		stampGoGenericInstantiation(edge, c)
 		applyGoGRPCRegisterMeta(edge, c, src, tenv)
 		applyGoTemporalRegisterMeta(edge, c)
 		applyGoTemporalSignalQueryMeta(edge, c)
@@ -2993,4 +3031,22 @@ func isGoBuiltinOrKeyword(name string) bool {
 		return true
 	}
 	return false
+}
+
+// stampGoGenericInstantiation marks a call edge whose callee spelled
+// explicit type arguments. Go's grammar cannot separate that from
+// indexing a func-valued map or field, nor from a conversion to a
+// generic type, so the extractor emits all three and records which ones
+// claimed to be instantiations. The resolver then binds such an edge
+// only to a declaration that actually declares type parameters, which
+// is the one thing a real instantiation guarantees and the impostors
+// never do.
+func stampGoGenericInstantiation(edge *graph.Edge, c goDeferredCall) {
+	if edge == nil || !c.genericInst {
+		return
+	}
+	if edge.Meta == nil {
+		edge.Meta = map[string]any{}
+	}
+	edge.Meta[graph.MetaGenericInstantiation] = true
 }

@@ -11,12 +11,18 @@ func TestFacadeRepositoryValidationRejectsUnconsumedPathsFromRealRegistry(t *tes
 	srv, _ := setupTestServer(t)
 
 	for _, test := range []struct {
-		name      string
-		facade    string
-		operation string
-		input     map[string]any
-		wantField string
+		name          string
+		facade        string
+		operation     string
+		input         map[string]any
+		wantField     string
+		wantSuggested bool
 	}{
+		{
+			name: "change detect source repo path", facade: "change", operation: "detect",
+			input:     map[string]any{"source": map[string]any{"repo_path": `C:\work\other-repo`}},
+			wantField: "source.repo_path", wantSuggested: true,
+		},
 		{
 			name: "top-level repo path", facade: "change", operation: "detect",
 			input: map[string]any{"repo_path": `C:\work\other-repo`}, wantField: "repo_path",
@@ -54,6 +60,9 @@ func TestFacadeRepositoryValidationRejectsUnconsumedPathsFromRealRegistry(t *tes
 			require.NoError(t, json.Unmarshal([]byte(toolResultText(result)), &structured))
 			require.Equal(t, ErrCodeInvalidArgument, structured.ErrorCode)
 			require.Equal(t, test.wantField, structured.Data["field"])
+			if test.wantSuggested {
+				require.Equal(t, "options.repo", structured.Data["suggested_field"])
+			}
 		})
 	}
 }

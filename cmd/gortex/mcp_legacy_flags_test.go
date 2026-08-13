@@ -58,10 +58,10 @@ func captureLegacyStderr(t *testing.T, fn func()) (stderr, stdout string) {
 	return errBuf.String(), outBuf.String()
 }
 
-// TestLegacyFlags_NoError asserts that each legacy `gortex mcp` flag still
-// PARSES (the deprecation shims never break a stale editor config) and that
-// warnLegacyMCPFlags emits exactly one stderr line per CHANGED legacy flag
-// while writing nothing to stdout (stdout is the MCP JSON-RPC stream).
+// TestLegacyFlags_NoError asserts that the compatibility flags still parse
+// (a stale editor config must not break), while only the retired flags emit a
+// deprecation note. The active --proxy safety flag parses without a warning.
+// Nothing may be written to stdout, which is the MCP JSON-RPC stream.
 func TestLegacyFlags_NoError(t *testing.T) {
 	// Every legacy flag set at once, plus its full combination, must parse
 	// without a flag-parse error.
@@ -85,13 +85,13 @@ func TestLegacyFlags_NoError(t *testing.T) {
 	}{
 		{"index only", []string{"--index", "."}, []string{"index"}},
 		{"watch only", []string{"--watch"}, []string{"watch"}},
-		{"proxy only", []string{"--proxy"}, []string{"proxy"}},
+		{"proxy only", []string{"--proxy"}, nil},
 		{"no-daemon only", []string{"--no-daemon"}, []string{"no-daemon"}},
 		{"no-cache only", []string{"--no-cache"}, []string{"no-cache"}},
 		{
 			"all five",
 			[]string{"--index", ".", "--watch", "--proxy", "--no-daemon", "--no-cache"},
-			[]string{"index", "watch", "proxy", "no-daemon", "no-cache"},
+			[]string{"index", "watch", "no-daemon", "no-cache"},
 		},
 		{"none set", []string{}, nil},
 	}

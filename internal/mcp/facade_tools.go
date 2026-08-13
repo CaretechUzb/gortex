@@ -118,7 +118,14 @@ func facadeToolDefinitionWithOperations(name string, operations []string) mcpgo.
 	case "search":
 		opts = []mcpgo.ToolOption{operation, mcpgo.WithString("query"), options, output}
 	case "read":
-		opts = []mcpgo.ToolOption{operation, target, freeObject("context", "Read window or source-context controls."), options, output}
+		opts = []mcpgo.ToolOption{
+			operation, target, freeObject("context", "Read window or source-context controls."),
+			mcpgo.WithObject("options",
+				mcpgo.Description("Set new_user_task=true only on the first read.file call caused by a new user request. Never set it to retry, continue the current request, or bypass answer_ready."),
+				mcpgo.AdditionalProperties(true),
+			),
+			output,
+		}
 	case "relations", "trace":
 		opts = []mcpgo.ToolOption{operation, freeObject("target", "Primary file or symbol target."), freeObject("to", "Optional destination target."), options, output}
 	case "analyze":
@@ -174,6 +181,16 @@ func facadeToolDefinitionWithOperations(name string, operations []string) mcpgo.
 	opts = append(opts, output)
 	opts = append([]mcpgo.ToolOption{mcpgo.WithDescription(desc), annotation}, opts...)
 	tool := mcpgo.NewTool(name, opts...)
+	if name == "read" {
+		if optionsSchema, ok := tool.InputSchema.Properties["options"].(map[string]any); ok {
+			optionsSchema["properties"] = map[string]any{
+				"new_user_task": map[string]any{
+					"type":        "boolean",
+					"description": "True only for the first read.file call caused by a new user request.",
+				},
+			}
+		}
+	}
 	if targetSchema, ok := tool.InputSchema.Properties["target"].(map[string]any); ok {
 		// The public facade validator already requires one selector. Encode that
 		// contract in tools/list as well so a caller can construct its first read
@@ -417,13 +434,15 @@ func localizationReadStructuredPayload(content []mcpgo.Content, completion local
 }
 
 func parseLocalizationNewUserBoundary(facade, operation string, arguments map[string]any) (bool, *mcpgo.CallToolResult) {
+	boundaryAllowed := (facade == "explore" && (operation == "task" || operation == "localize")) ||
+		(facade == "read" && operation == "file")
 	rawOptions, present := arguments["options"]
 	if !present || rawOptions == nil {
 		return false, nil
 	}
 	options, ok := rawOptions.(map[string]any)
 	if !ok {
-		if facade != "explore" || (operation != "task" && operation != "localize") {
+		if !boundaryAllowed {
 			return false, nil
 		}
 		return false, NewStructuredErrorResult(StructuredError{
@@ -444,10 +463,10 @@ func parseLocalizationNewUserBoundary(facade, operation string, arguments map[st
 			Data:      map[string]any{"field": "options.new_user_task", "operation": operation},
 		})
 	}
-	if facade != "explore" || (operation != "task" && operation != "localize") {
+	if !boundaryAllowed {
 		return false, NewStructuredErrorResult(StructuredError{
 			ErrorCode: ErrCodeInvalidArgument,
-			Message:   "options.new_user_task is valid only on the first explore.task or explore.localize call of a new user request",
+			Message:   "options.new_user_task is valid only on the first explore.task, explore.localize, or read.file call of a new user request",
 			Data:      map[string]any{"field": "options.new_user_task", "facade": facade, "operation": operation},
 		})
 	}
@@ -482,12 +501,14 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		return invalidBoundary, nil
 	}
 	newUserExploreFlow := facade == "explore" && newUserTask && (operation == "task" || operation == "localize")
+	newUserReadFlow := facade == "read" && operation == "file" && newUserTask
+	newUserBoundaryFlow := newUserExploreFlow || newUserReadFlow
 	// Parse enough of an explicit new-task boundary to validate it, then apply
 	// the cheap terminal gate before operation lookup, shorthand resolution,
 	// overlay construction, and legacy dispatch. Non-navigation facades never
 	// enter this gate.
 	recoveryGeneration := uint64(0)
-	if !newUserExploreFlow {
+	if !newUserBoundaryFlow {
 		var blocked *mcpgo.CallToolResult
 		blocked, recoveryGeneration = terminal.interceptAnswerReady(facade, operation, req.GetArguments())
 		if blocked != nil {
@@ -546,23 +567,28 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		publishLocalizationAuthReceipt(localizationAuthToken, invalid)
 		return invalid, nil
 	}
-	// Every localize call and an explicit new-user task call starts a
-	// transactional reservation. Task text never implies a boundary. A task
-	// boundary stages inactive navigation so later diagnosis calls are admitted
-	// only after the first explore call succeeds.
-	transactionalExploreFlow := freshLocalizeFlow || newUserExploreFlow
-	localizeReservation := uint64(0)
-	localizeFinished := false
-	if transactionalExploreFlow {
+	// Every localize call and explicit new-user task boundary starts a
+	// transactional reservation. Task text and directed-read arguments never
+	// imply a boundary on their own. A diagnosis or read boundary stages inactive
+	// navigation and replaces the prior contract only after the first call succeeds.
+	transactionalBoundaryFlow := freshLocalizeFlow || newUserBoundaryFlow
+	boundaryTask := req.GetString("task", "")
+	if newUserReadFlow {
+		target, _ := input["target"].(map[string]any)
+		boundaryTask = "read.file " + strings.TrimSpace(fmt.Sprint(target["file"]))
+	}
+	taskBoundaryReservation := uint64(0)
+	taskBoundaryFinished := false
+	if transactionalBoundaryFlow {
 		var blocked *mcpgo.CallToolResult
-		localizeReservation, blocked = terminal.beginLocalize(req.GetString("task", ""), newUserTask)
+		taskBoundaryReservation, blocked = terminal.beginLocalize(boundaryTask, newUserTask)
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
 			publishLocalizationAuthReceipt(localizationAuthToken, blocked)
 			return blocked, nil
 		}
 		if !freshLocalizeFlow {
-			terminal.keepOpenForTask(req.GetString("task", ""))
+			terminal.keepOpenForTask(boundaryTask)
 		}
 	}
 	localizationReadReservation := uint64(0)
@@ -571,12 +597,12 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		if localizationReadReservation != 0 {
 			terminal.finishReservedReadTokenWithDigest(localizationReadReservation, localizationReadSucceeded, nil, false)
 		}
-		if localizeReservation != 0 && !localizeFinished {
+		if taskBoundaryReservation != 0 && !taskBoundaryFinished {
 			// Errors and panics roll back to the previous completion contract.
-			terminal.finishLocalize(localizeReservation, false)
+			terminal.finishLocalize(taskBoundaryReservation, false)
 		}
 	}()
-	if !transactionalExploreFlow {
+	if !transactionalBoundaryFlow {
 		blocked, reservation := terminal.authorizeWithToken(facade, operation, req.GetArguments())
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
@@ -611,9 +637,9 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 			result, err = decorateExhaustedLocalizationReadFailure(result, err, completion, spec)
 		}
 	}
-	if transactionalExploreFlow {
-		terminal.finishLocalize(localizeReservation, succeeded)
-		localizeFinished = true
+	if transactionalBoundaryFlow {
+		terminal.finishLocalize(taskBoundaryReservation, succeeded)
+		taskBoundaryFinished = true
 	}
 	publishLocalizationAuthReceipt(localizationAuthToken, result)
 	return result, err
@@ -1381,6 +1407,51 @@ func facadeLegacyManagesOwnOverlay(name string) bool {
 	}
 }
 
+func facadeJSONType(value any) string {
+	switch value.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return "boolean"
+	case string:
+		return "string"
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return "number"
+	case []any, []string, []map[string]any:
+		return "array"
+	case map[string]any:
+		return "object"
+	default:
+		return "unsupported value"
+	}
+}
+
+func (s *Server) facadeAcceptedTopLevelFields(spec facadeOperationSpec) []string {
+	capability := s.facadeCapability(spec, true)
+	schema, _ := capability["input_schema"].(map[string]any)
+	properties, _ := schema["properties"].(map[string]any)
+	fields := sortedFacadeMapKeys(properties)
+	fieldRank := func(field string) int {
+		switch field {
+		case "operation":
+			return 0
+		case "options":
+			return 2
+		default:
+			return 1
+		}
+	}
+	sort.SliceStable(fields, func(i, j int) bool {
+		leftRank := fieldRank(fields[i])
+		rightRank := fieldRank(fields[j])
+		if leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		return fields[i] < fields[j]
+	})
+	return fields
+}
+
 func (s *Server) validateFacadeInput(spec facadeOperationSpec, input map[string]any) *mcpgo.CallToolResult {
 	for _, field := range facadeContainerKeys {
 		value, present := input[field]
@@ -1388,6 +1459,25 @@ func (s *Server) validateFacadeInput(spec facadeOperationSpec, input map[string]
 			continue
 		}
 		if _, ok := value.(map[string]any); !ok {
+			if field == "arguments" {
+				_, declared := facadeToolDefinition(spec.Facade).InputSchema.Properties[field]
+				if !declared {
+					receivedType := facadeJSONType(value)
+					acceptedFields := s.facadeAcceptedTopLevelFields(spec)
+					return NewStructuredErrorResult(StructuredError{
+						ErrorCode: ErrCodeInvalidArgument,
+						Message: fmt.Sprintf(
+							"arguments is an unexpected top-level key for %s.%s (received %s); pass %s at the top level; arguments is the JSON-RPC envelope, not a parameter",
+							spec.Facade, spec.Operation, receivedType, strings.Join(acceptedFields, "/"),
+						),
+						Data: map[string]any{
+							"field": "arguments", "received_type": receivedType,
+							"accepted_fields": acceptedFields,
+							"accepted_shape":  "pass request_shape fields directly as tool arguments",
+						},
+					})
+				}
+			}
 			return NewStructuredErrorResult(StructuredError{
 				ErrorCode: ErrCodeInvalidArgument,
 				Message:   fmt.Sprintf("%s must be an object", field),
@@ -2445,6 +2535,7 @@ func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) 
 			}
 			out["input_schema"] = inputSchema
 			out["request_shape"] = requestShape
+			out["request_shape_note"] = fmt.Sprintf("Pass each request_shape field directly in the %s tool call; do not nest the object under arguments or params.", spec.Facade)
 			if raw, err := json.Marshal(inputSchema); err == nil {
 				sum := sha256.Sum256(raw)
 				out["schema_hash"] = hex.EncodeToString(sum[:])
@@ -2623,8 +2714,8 @@ func analyzeFieldApplies(kind, field string, raw any) bool {
 
 // facadeRequestShape makes capabilities actionable without teaching callers
 // canonical handler names. input_schema describes the operation-specific
-// fields; request_shape shows where those fields belong in the stable public
-// envelope and which target selector to use.
+// fields; request_shape shows the directly callable top-level fields and the
+// target selector to use.
 func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, required []string) map[string]any {
 	args := map[string]any{"operation": spec.Operation}
 	placeholder := func(key string) map[string]any { return map[string]any{key: "<" + key + ">"} }
@@ -2819,7 +2910,7 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 		}
 		extras[field] = facadeSchemaPlaceholder(field, properties[field])
 	}
-	return map[string]any{"tool": spec.Facade, "arguments": args}
+	return args
 }
 
 // applyFacadeSurface provides session-level surface negotiation. Legacy

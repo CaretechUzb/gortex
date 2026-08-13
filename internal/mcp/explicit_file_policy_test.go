@@ -6,7 +6,7 @@ import (
 )
 
 func TestCodingAgentInstructionsRouteExplicitFileReadsDirectly(t *testing.T) {
-	direct := `read(operation:"file", target:{file:"<path>"})`
+	direct := `read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})`
 	localize := `explore(operation:"localize")`
 	directAt := strings.Index(codingAgentInstructions, direct)
 	localizeAt := strings.Index(codingAgentInstructions, localize)
