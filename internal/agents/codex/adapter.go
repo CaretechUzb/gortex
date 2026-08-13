@@ -525,6 +525,10 @@ func upsertUserPromptSubmitHook(root map[string]any, env agents.Env, opts agents
 	return upsertCodexHookSet(root, "UserPromptSubmit", codexHookEntryIsGortexUserPromptSubmit, []map[string]any{codexUserPromptSubmitHookEntry(env)}, opts)
 }
 
+func upsertStopHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
+	return upsertCodexHookSet(root, "Stop", codexHookEntryIsGortexStop, []map[string]any{codexStopHookEntry(env)}, opts)
+}
+
 // InstallHooksOnly refreshes the Codex lifecycle hooks in configPath without
 // touching MCP server entries, AGENTS.md, or any other Codex adapter surface.
 func InstallHooksOnly(w io.Writer, configPath string, env agents.Env, opts agents.ApplyOpts) (agents.FileAction, error) {
@@ -545,7 +549,8 @@ func upsertCodexHooks(root map[string]any, env agents.Env, opts agents.ApplyOpts
 	preChanged := upsertPreToolUseHook(root, env, opts)
 	postChanged := upsertPostToolUseHook(root, env, opts)
 	promptChanged := upsertUserPromptSubmitHook(root, env, opts)
-	return sessionChanged || preChanged || postChanged || promptChanged
+	stopChanged := upsertStopHook(root, env, opts)
+	return sessionChanged || preChanged || postChanged || promptChanged || stopChanged
 }
 
 func upsertCodexHookSet(root map[string]any, event string, isGortex func(any) bool, desired []map[string]any, opts agents.ApplyOpts) bool {
@@ -694,6 +699,10 @@ func codexHookEntryIsGortexUserPromptSubmit(entry any) bool {
 	return codexHookEntryInvokesCodexHook(entry)
 }
 
+func codexHookEntryIsGortexStop(entry any) bool {
+	return codexHookEntryInvokesCodexHook(entry)
+}
+
 func codexHookEntryInvokesCodexHook(entry any) bool {
 	group, ok := entry.(map[string]any)
 	if !ok {
@@ -796,6 +805,22 @@ func codexUserPromptSubmitHookEntry(env agents.Env) map[string]any {
 				"command":       codexHookCommand(env),
 				"timeout":       codexHookTimeoutSeconds,
 				"statusMessage": "Surfacing Gortex graph context for your prompt...",
+			},
+		},
+	}
+}
+
+// codexStopHookEntry has no matcher: Stop applies to every final response.
+// Older Codex hosts that omit last_assistant_message remain fail-open in the
+// shared Stop handler.
+func codexStopHookEntry(env agents.Env) map[string]any {
+	return map[string]any{
+		"hooks": []any{
+			map[string]any{
+				"type":          "command",
+				"command":       codexHookCommand(env),
+				"timeout":       codexHookTimeoutSeconds,
+				"statusMessage": "Checking Gortex evidence authority...",
 			},
 		},
 	}

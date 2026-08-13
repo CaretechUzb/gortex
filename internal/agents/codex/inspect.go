@@ -35,7 +35,7 @@ type InstallState struct {
 // HookEvents are the lifecycle events this adapter installs, in the order
 // they matter for adoption: SessionStart is what states the Gortex rule for
 // the session, so its absence explains a silent integration on its own.
-var HookEvents = []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"}
+var HookEvents = []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}
 
 // TrustRemedy is how a user approves hooks Codex is skipping.
 const TrustRemedy = "run `/hooks` inside Codex, review the gortex entries, and trust them"
@@ -96,6 +96,7 @@ func countGortexHooks(root map[string]any, out map[string]int) {
 		"UserPromptSubmit": codexHookEntryIsGortexUserPromptSubmit,
 		"PreToolUse":       codexHookEntryIsGortexPreToolUse,
 		"PostToolUse":      codexHookEntryIsGortexPostToolUse,
+		"Stop":             codexHookEntryIsGortexStop,
 	}
 	for event, isGortex := range recognisers {
 		entries, ok := codexHookList(hooks[event])

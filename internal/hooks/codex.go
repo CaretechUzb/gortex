@@ -84,6 +84,11 @@ func runCodex(data []byte, port int, selected ...CodexMode) {
 	defer setHookCWD("")
 
 	switch {
+	case peek.HookEventName == "Stop":
+		// Codex uses the same stop_hook_active and last_assistant_message
+		// fields as the shared Stop handler. Unsupported/older hosts omit the
+		// message and therefore fail open in runPostTask.
+		runPostTask(data, port)
 	case peek.HookEventName == "SessionStart":
 		runSessionStart(data, port)
 	case peek.HookEventName == "PreToolUse" && peek.ToolName == "Bash":
