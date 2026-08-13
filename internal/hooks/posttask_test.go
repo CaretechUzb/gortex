@@ -454,6 +454,28 @@ func TestLocalizationClaimCheckAcceptsAuthenticatedClaim(t *testing.T) {
 	}
 }
 
+func TestLocalizationClaimCheckNormalizesCommonMethodNotation(t *testing.T) {
+	input := claimCheckTestInput(t, "SYMBOLS:\n- Writer.write()")
+	if got := localizationClaimCheck(input); got != "" {
+		t.Fatalf("qualified method call was challenged: %q", got)
+	}
+	input.LastAssistantMessage = "SYMBOLS:\n- (*Writer).write"
+	if got := localizationClaimCheck(input); got != "" {
+		t.Fatalf("pointer-receiver method was challenged: %q", got)
+	}
+}
+
+func TestLocalizationClaimCheckAcceptsExplicitNoneFitsOnly(t *testing.T) {
+	input := claimCheckTestInput(t, "SYMBOLS:\n- none fits")
+	if got := localizationClaimCheck(input); got != "" {
+		t.Fatalf("explicit none-fits response was challenged: %q", got)
+	}
+	input.LastAssistantMessage = "SYMBOLS:\n- none fits\n- flush"
+	if got := localizationClaimCheck(input); got == "" {
+		t.Fatal("an unsupported claim hidden beside none-fits was not challenged")
+	}
+}
+
 func TestLocalizationClaimCheckChallengesWrongBareSymbolWithinBound(t *testing.T) {
 	input := claimCheckTestInput(t, "SYMBOLS:\n- flush")
 	got := localizationClaimCheck(input)

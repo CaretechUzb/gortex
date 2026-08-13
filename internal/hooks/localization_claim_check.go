@@ -34,8 +34,8 @@ func localizationClaimCheck(input PostTaskInput) string {
 }
 
 func localizationExplicitSymbolClaims(message string) []string {
-	claims := localizationStructuredSymbolClaims(message)
-	if len(claims) > 0 {
+	claims, explicitNone := localizationStructuredSymbolClaims(message)
+	if len(claims) > 0 || explicitNone {
 		return claims
 	}
 	fields := strings.FieldsFunc(message, func(r rune) bool {
@@ -58,8 +58,7 @@ func localizationExplicitSymbolClaims(message string) []string {
 	return claims
 }
 
-func localizationStructuredSymbolClaims(message string) []string {
-	var claims []string
+func localizationStructuredSymbolClaims(message string) (claims []string, explicitNone bool) {
 	inSymbols := false
 	for _, line := range strings.Split(message, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -80,14 +79,47 @@ func localizationStructuredSymbolClaims(message string) []string {
 			break
 		}
 		trimmed = strings.TrimSpace(strings.TrimLeft(trimmed, "-*•0123456789. "))
-		if fields := strings.Fields(trimmed); len(fields) > 0 {
-			claim := strings.Trim(fields[0], "`_.$:#\\/-")
-			if claim != "" {
-				claims = append(claims, claim)
-			}
+		if localizationExplicitNoneClaim(trimmed) {
+			explicitNone = true
+			continue
+		}
+		if claim := localizationStructuredSymbolClaim(trimmed); claim != "" {
+			claims = append(claims, claim)
 		}
 	}
-	return claims
+	return claims, explicitNone
+}
+
+func localizationExplicitNoneClaim(value string) bool {
+	value = strings.ToLower(strings.Trim(strings.TrimSpace(value), "`._:;,-"))
+	switch value {
+	case "none", "none fits", "none fit", "none of these", "none of the above",
+		"no symbol fits", "no symbols fit", "no listed symbol fits", "no listed symbols fit":
+		return true
+	default:
+		return false
+	}
+}
+
+func localizationStructuredSymbolClaim(value string) string {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return ""
+	}
+	claim := strings.Trim(fields[0], "`_.$:#\\/-,;:")
+	for strings.HasSuffix(claim, "()") {
+		claim = strings.TrimSuffix(claim, "()")
+	}
+	if strings.HasPrefix(claim, "(*") {
+		if close := strings.Index(claim, ")."); close > 2 {
+			claim = claim[2:close] + claim[close+1:]
+		}
+	} else if strings.HasPrefix(claim, "(") {
+		if close := strings.Index(claim, ")."); close > 1 {
+			claim = claim[1:close] + claim[close+1:]
+		}
+	}
+	return strings.Trim(claim, "`_.$:#\\/-,;:")
 }
 
 func localizationCodeShapedClaim(claim string) bool {
