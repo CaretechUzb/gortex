@@ -1327,6 +1327,7 @@ type localizationHostEnvelope struct {
 	Version        int                          `json:"version"`
 	FallbackFormat string                       `json:"fallback_format"`
 	Evidence       *localizationEvidenceDigest  `json:"evidence"`
+	PrimaryIDs     []string                     `json:"primary_ids,omitempty"`
 	Contract       localizationTerminalContract `json:"contract"`
 }
 
@@ -1365,10 +1366,15 @@ func attachLocalizationHostEnvelope(result *mcpgo.CallToolResult, completion loc
 	if result.Meta.AdditionalFields == nil {
 		result.Meta.AdditionalFields = make(map[string]any)
 	}
+	primaryIDs := []string(nil)
+	if digest != nil {
+		primaryIDs = append(primaryIDs, digest.primaryIDs...)
+	}
 	result.Meta.AdditionalFields[localizationHostMetaKey] = localizationHostEnvelope{
 		Version:        1,
 		FallbackFormat: "{file}:{line} — {id} ({signature})",
 		Evidence:       digest,
+		PrimaryIDs:     primaryIDs,
 		Contract:       contract,
 	}
 	return result

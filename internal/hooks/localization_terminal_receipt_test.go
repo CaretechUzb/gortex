@@ -251,7 +251,7 @@ func TestLocalizationAdvisoryMarkerRotatesAndDelayedPostCannotPoisonNewTurn(t *t
 	if _, observed := observeLocalizationTerminal(pendingPost); observed {
 		t.Fatal("pending pre-rotation advisory receipt armed the next turn")
 	}
-	if !markLocalizationTerminalReceipt(oldTurn, localizationTerminalContractV2, false, "") {
+	if !markLocalizationTerminalReceipt(oldTurn, localizationauth.Receipt{ContractVersion: localizationTerminalContractV2}) {
 		t.Fatal("simulate delayed advisory marker write")
 	}
 	if _, marked := localizationTerminalMarkerFor(newTurn); marked {

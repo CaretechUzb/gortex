@@ -654,8 +654,18 @@ func publishLocalizationAuthReceipt(token string, result *mcpgo.CallToolResult) 
 		return
 	}
 	completion := host.Contract.Completion
+	evidenceIDs := make([]string, 0, localizationReplayEvidenceLimit)
+	if host.Evidence != nil {
+		for _, row := range host.Evidence.Evidence {
+			if id := strings.TrimSpace(row.ID); id != "" {
+				evidenceIDs = append(evidenceIDs, id)
+			}
+		}
+	}
 	localizationauth.Publish(token, localizationauth.Receipt{
 		FinalResponse:   completion.FinalResponse,
+		PrimaryIDs:      append([]string(nil), host.PrimaryIDs...),
+		EvidenceIDs:     evidenceIDs,
 		ContractVersion: completion.ContractVersion,
 		Enforceable:     completion.Enforceable,
 	})
