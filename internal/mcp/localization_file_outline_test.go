@@ -1074,6 +1074,31 @@ func TestOutlineReliefProtectsTopTwoFiles(t *testing.T) {
 	}
 }
 
+func TestOutlineDropsUnprotectedFloorBeforeEvidenceRelief(t *testing.T) {
+	outline := func(file string, rank int) *localizationFileOutline {
+		rows := make([]localizationOutlineRow, localizationOutlineFloorRows)
+		for index := range rows {
+			rows[index] = localizationOutlineRow{Name: fmt.Sprintf("Row%02d", index), Line: index + 1}
+		}
+		return &localizationFileOutline{File: file, Declared: len(rows), Rows: rows, all: rows, rank: rank}
+	}
+	page := &localizationPageOutline{
+		Leading: outline("repo/lead.go", 0),
+		Others: []*localizationFileOutline{
+			outline("repo/second.go", 1), outline("repo/third.go", 2),
+		},
+	}
+	if !page.dropUnprotectedFloorFile() {
+		t.Fatal("rank-two floor outline was not dropped")
+	}
+	if len(page.Others) != 1 || page.Others[0].File != "repo/second.go" || page.Leading == nil {
+		t.Fatalf("protected outline changed: %#v", page)
+	}
+	if page.dropUnprotectedFloorFile() {
+		t.Fatal("protected leading pair was dropped")
+	}
+}
+
 func TestOutlineTermFormsMatchConservativeInflections(t *testing.T) {
 	for _, test := range []struct {
 		name  string

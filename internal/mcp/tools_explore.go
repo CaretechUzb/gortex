@@ -4514,13 +4514,17 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 			// here — but they give way by degrees. A shorter index is worth far
 			// more than none, and only pressure past the floor drops one.
 			if block.atFloor() {
-				// The index has given back everything it can and the page still
-				// does not fit. A ranked page fills its budget with rows, so
-				// without this the floor is unreachable exactly on the pages
-				// that need an index most. The expendable breadth tail pays,
-				// in the detail a caller can re-derive from the identity that
-				// stays — never in a row, and never inside the reserve the
-				// refinement contract may name.
+				// A rank-two-or-later file at its floor is less valuable than
+				// independently useful evidence detail. Drop that expendable
+				// breadth before stripping a row; the leading pair stays protected.
+				if block.dropUnprotectedFloorFile() {
+					envelope.Outline, envelope.Outlines = block.Leading, block.Others
+					continue
+				}
+				// The protected index has given back everything it can and the
+				// page still does not fit. The expendable evidence tail now pays,
+				// in detail a caller can re-derive from the identity that stays —
+				// never in a row or refinement reserve.
 				if untraded == nil {
 					untraded = append([]localizationEvidence(nil), envelope.Evidence...)
 				}

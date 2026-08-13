@@ -514,6 +514,25 @@ func (p *localizationPageOutline) clone() *localizationPageOutline {
 	return copied
 }
 
+// dropUnprotectedFloorFile gives back one rank-two-or-later outline after all
+// of its depth has already yielded. Envelope packing uses this before stripping
+// independently useful evidence detail; the protected leading pair is untouched.
+func (p *localizationPageOutline) dropUnprotectedFloorFile() bool {
+	if p == nil {
+		return false
+	}
+	for index := len(p.Others) - 1; index >= 0; index-- {
+		outline := p.Others[index]
+		if outline == nil || p.otherRank(index) < localizationOutlineProtectedFileCount ||
+			len(outline.Rows) > localizationOutlineFloorRows {
+			continue
+		}
+		p.Others = append(p.Others[:index], p.Others[index+1:]...)
+		return true
+	}
+	return false
+}
+
 // relieve gives back one increment of outline payload. Every rank-two-or-later
 // file shrinks and then drops before either of the top two files changes. Under
 // further pressure rank one yields before rank zero. This makes completeness a
