@@ -69,18 +69,22 @@ func TestBuildVerificationCommand(t *testing.T) {
 		{
 			name: "graph-qualified Go file",
 			prediction: &prediction{
-				touchedFiles:              []string{"gortex/internal/mcp/change_contract.go"},
-				touchedFilesRepoQualified: true,
-				repoPrefixes:              []string{"gortex"},
+				touchedFiles: []string{"gortex/internal/mcp/change_contract.go"},
+				verificationFiles: []verificationFile{{
+					repoPrefix: "gortex",
+					path:       "internal/mcp/change_contract.go",
+				}},
 			},
 			wantCommand: "go build ./internal/mcp/... && go test -race ./internal/mcp/...",
 		},
 		{
 			name: "graph-qualified Windows path",
 			prediction: &prediction{
-				touchedFiles:              []string{`gortex\internal\mcp\change_contract.go`},
-				touchedFilesRepoQualified: true,
-				repoPrefixes:              []string{"gortex"},
+				touchedFiles: []string{`gortex\internal\mcp\change_contract.go`},
+				verificationFiles: []verificationFile{{
+					repoPrefix: "gortex",
+					path:       `internal\mcp\change_contract.go`,
+				}},
 			},
 			wantCommand: "go build ./internal/mcp/... && go test -race ./internal/mcp/...",
 		},
@@ -125,7 +129,10 @@ func TestBuildVerificationCommand(t *testing.T) {
 			name: "multiple repositories",
 			prediction: &prediction{
 				touchedFiles: []string{"api/internal/api.go", "worker/internal/worker.go"},
-				repoPrefixes: []string{"api", "worker"},
+				verificationFiles: []verificationFile{
+					{repoPrefix: "api", path: "internal/api.go"},
+					{repoPrefix: "worker", path: "internal/worker.go"},
+				},
 			},
 			wantErr: "cannot synthesize one verification command for multiple repositories: api, worker",
 		},
@@ -181,7 +188,10 @@ func TestAssembleEnvelopeReportsMultiRepoVerificationRefusal(t *testing.T) {
 	p := &prediction{
 		source:       "symbols",
 		touchedFiles: []string{"api/internal/api.go", "worker/internal/worker.go"},
-		repoPrefixes: []string{"api", "worker"},
+		verificationFiles: []verificationFile{
+			{repoPrefix: "api", path: "internal/api.go"},
+			{repoPrefix: "worker", path: "internal/worker.go"},
+		},
 	}
 
 	env := srv.assembleEnvelope(p, nil)
@@ -197,7 +207,8 @@ func TestAssembleEnvelopeReportsMultiRepoVerificationRefusal(t *testing.T) {
 	}
 	require.NotNil(t, verificationReason)
 	require.Equal(t, "cannot synthesize one verification command for multiple repositories: api, worker", verificationReason.Message)
-	require.NotContains(t, env.StopCondition, verificationReason.Message)
+	require.Contains(t, env.StopCondition, "repository-scoped verification commands")
+	require.Contains(t, env.StopCondition, "all commands exit 0")
 }
 
 func TestChangeContractSymbolSource(t *testing.T) {

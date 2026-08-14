@@ -120,18 +120,23 @@ type changeEnvelope struct {
 // prediction is the normalised PREDICT-stage result. step is non-nil only for
 // the workspace_edit source (a true speculative simulation); the other sources
 // fill blast/impact from the change set without an edit to apply.
+type verificationFile struct {
+	repoPrefix string
+	path       string
+}
+
 type prediction struct {
-	source                    string
-	lens                      string
-	riskGate                  bool
-	changed                   []changedSymbolRef
-	changedIDs                []string
-	nodes                     []*graph.Node
-	step                      *simulationStep
-	impact                    *analysis.ImpactResult
-	touchedFiles              []string
-	touchedFilesRepoQualified bool
-	repoPrefixes              []string
+	source            string
+	lens              string
+	riskGate          bool
+	changed           []changedSymbolRef
+	changedIDs        []string
+	nodes             []*graph.Node
+	step              *simulationStep
+	impact            *analysis.ImpactResult
+	touchedFiles      []string
+	verificationFiles []verificationFile
+	repoPrefixes      []string
 }
 
 // nodesForIDs resolves symbol IDs to graph nodes, dropping any that no longer
@@ -151,6 +156,35 @@ func (s *Server) nodesForIDs(ids []string) []*graph.Node {
 
 func refFromNode(n *graph.Node) changedSymbolRef {
 	return changedSymbolRef{ID: n.ID, Name: n.Name, Kind: string(n.Kind), File: n.FilePath}
+}
+
+func verificationFilesForNodes(nodes []*graph.Node) []verificationFile {
+	seen := map[verificationFile]bool{}
+	files := make([]verificationFile, 0, len(nodes))
+	for _, node := range nodes {
+		if node == nil || node.FilePath == "" {
+			continue
+		}
+		file := verificationFile{
+			repoPrefix: node.RepoPrefix,
+			path:       strings.TrimPrefix(filepath.ToSlash(node.FilePath), "./"),
+		}
+		if file.repoPrefix != "" {
+			file.path = strings.TrimPrefix(file.path, filepath.ToSlash(file.repoPrefix)+"/")
+		}
+		if file.path == "" || seen[file] {
+			continue
+		}
+		seen[file] = true
+		files = append(files, file)
+	}
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].repoPrefix != files[j].repoPrefix {
+			return files[i].repoPrefix < files[j].repoPrefix
+		}
+		return files[i].path < files[j].path
+	})
+	return files
 }
 
 // lowerChange dispatches on the requested source and returns a normalised
@@ -233,16 +267,58 @@ func (s *Server) lowerEditSource(ctx context.Context, req mcp.CallToolRequest) (
 	for _, n := range nodes {
 		changed = append(changed, refFromNode(n))
 	}
+	verificationFiles, verr := s.workspaceEditVerificationFiles(edit)
+	if verr != nil {
+		return nil, verr
+	}
 	return &prediction{
-		source:                    "edit",
-		changed:                   changed,
-		changedIDs:                ids,
-		nodes:                     nodes,
-		step:                      &step,
-		impact:                    s.analyzeImpactLazy(ctx, ids),
-		touchedFiles:              step.touchedFiles,
-		touchedFilesRepoQualified: true,
+		source:            "edit",
+		changed:           changed,
+		changedIDs:        ids,
+		nodes:             nodes,
+		step:              &step,
+		impact:            s.analyzeImpactLazy(ctx, ids),
+		touchedFiles:      step.touchedFiles,
+		verificationFiles: verificationFiles,
 	}, nil
+}
+
+// workspaceEditVerificationFiles resolves every caller path to one repository
+// owner and one repository-local path. Verification command synthesis consumes
+// only this canonical form, never the caller's absolute, URI, or graph-qualified
+// spelling.
+func (s *Server) workspaceEditVerificationFiles(edit lsp.WorkspaceEdit) ([]verificationFile, error) {
+	fileEdits, err := s.groupEditByFile(edit)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]verificationFile, 0, len(fileEdits))
+	for _, fe := range fileEdits {
+		_, rel, err := s.resolveFilePath(fe.overlayPath)
+		if err != nil {
+			return nil, fmt.Errorf("cannot determine repository ownership for workspace edit path %q: %w", fe.overlayPath, err)
+		}
+		rel = strings.TrimPrefix(filepath.ToSlash(rel), "./")
+		vf := verificationFile{path: rel}
+		if s.multiIndexer != nil {
+			vf.repoPrefix = matchedRepoPrefix(s.multiIndexer, rel)
+			if vf.repoPrefix == "" {
+				return nil, fmt.Errorf("cannot determine repository ownership for workspace edit path %q", fe.overlayPath)
+			}
+			vf.path = strings.TrimPrefix(rel, vf.repoPrefix+"/")
+		}
+		if vf.path == "" || vf.path == "." || vf.path == ".." || strings.HasPrefix(vf.path, "../") {
+			return nil, fmt.Errorf("workspace edit path %q has no repository-local file path", fe.overlayPath)
+		}
+		files = append(files, vf)
+	}
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].repoPrefix != files[j].repoPrefix {
+			return files[i].repoPrefix < files[j].repoPrefix
+		}
+		return files[i].path < files[j].path
+	})
+	return files, nil
 }
 
 // lowerWorkspaceEditRanges maps each TextEdit's range to its enclosing symbols.
@@ -285,14 +361,15 @@ func (s *Server) lowerRangeSource(ctx context.Context, req mcp.CallToolRequest) 
 		files = append(files, h.File)
 	}
 	ids = dedupeStrings(ids)
+	nodes := s.nodesForIDs(ids)
 	return &prediction{
-		source:                    "ranges",
-		changed:                   changed,
-		changedIDs:                ids,
-		nodes:                     s.nodesForIDs(ids),
-		impact:                    s.analyzeImpactLazy(ctx, ids),
-		touchedFiles:              dedupeStrings(files),
-		touchedFilesRepoQualified: true,
+		source:            "ranges",
+		changed:           changed,
+		changedIDs:        ids,
+		nodes:             nodes,
+		impact:            s.analyzeImpactLazy(ctx, ids),
+		touchedFiles:      dedupeStrings(files),
+		verificationFiles: verificationFilesForNodes(nodes),
 	}, nil
 }
 
@@ -310,13 +387,13 @@ func (s *Server) lowerSymbolSource(ctx context.Context, req mcp.CallToolRequest)
 		files = append(files, n.FilePath)
 	}
 	return &prediction{
-		source:                    "symbols",
-		changed:                   changed,
-		changedIDs:                ids,
-		nodes:                     nodes,
-		impact:                    s.analyzeImpactLazy(ctx, ids),
-		touchedFiles:              dedupeStrings(files),
-		touchedFilesRepoQualified: true,
+		source:            "symbols",
+		changed:           changed,
+		changedIDs:        ids,
+		nodes:             nodes,
+		impact:            s.analyzeImpactLazy(ctx, ids),
+		touchedFiles:      dedupeStrings(files),
+		verificationFiles: verificationFilesForNodes(nodes),
 	}, nil
 }
 
@@ -520,6 +597,11 @@ func verificationRepoPrefixes(p *prediction) []string {
 			prefixes[prefix] = true
 		}
 	}
+	for _, file := range p.verificationFiles {
+		if prefix := strings.TrimSpace(file.repoPrefix); prefix != "" {
+			prefixes[prefix] = true
+		}
+	}
 	for _, n := range p.nodes {
 		if n != nil && n.RepoPrefix != "" {
 			prefixes[n.RepoPrefix] = true
@@ -566,9 +648,17 @@ func verificationPackageDir(file, repoPrefix string, recursive, graphQualified b
 // buildVerificationCommand synthesises the command that proves the change is
 // safe — drawn from the covering tests of the changed set.
 func buildVerificationCommand(p *prediction) (string, error) {
+	files := p.verificationFiles
+	if len(files) == 0 {
+		files = make([]verificationFile, 0, len(p.touchedFiles))
+		for _, file := range p.touchedFiles {
+			files = append(files, verificationFile{path: file})
+		}
+	}
+
 	goChange := false
-	for _, f := range p.touchedFiles {
-		if strings.HasSuffix(strings.ReplaceAll(f, "\\", "/"), ".go") {
+	for _, file := range files {
+		if strings.HasSuffix(strings.ReplaceAll(file.path, "\\", "/"), ".go") {
 			goChange = true
 			break
 		}
@@ -623,9 +713,9 @@ func buildVerificationCommand(p *prediction) (string, error) {
 	}
 
 	dirs := map[string]bool{}
-	for _, f := range p.touchedFiles {
-		if strings.HasSuffix(strings.ReplaceAll(f, "\\", "/"), ".go") {
-			dirs[verificationPackageDir(f, repoPrefix, true, p.touchedFilesRepoQualified)] = true
+	for _, file := range files {
+		if strings.HasSuffix(strings.ReplaceAll(file.path, "\\", "/"), ".go") {
+			dirs[verificationPackageDir(file.path, file.repoPrefix, true, false)] = true
 		}
 	}
 	ds := make([]string, 0, len(dirs))
@@ -743,6 +833,10 @@ func (s *Server) assembleEnvelope(p *prediction, violations []analysis.GuardViol
 		verdict = escalate(verdict, verdictWarn)
 	}
 	classification := classifyChange(p)
+	stopCondition := buildStopCondition(p, risk, verCmd)
+	if verificationErr != nil {
+		stopCondition = "Done when repository-scoped verification commands have been run separately for every changed repository, all commands exit 0, and no new tree-sitter parse errors are introduced."
+	}
 
 	env := changeEnvelope{
 		Verdict:             verdict,
@@ -752,7 +846,7 @@ func (s *Server) assembleEnvelope(p *prediction, violations []analysis.GuardViol
 		Reasons:             reasons,
 		Risk:                risk,
 		VerificationCommand: verCmd,
-		StopCondition:       buildStopCondition(p, risk, verCmd),
+		StopCondition:       stopCondition,
 		EditStrategy:        s.buildEditStrategy(p),
 		APISurface:          apiSurface,
 	}
