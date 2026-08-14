@@ -363,7 +363,7 @@ func TestMapExploreSourceLiteralMatchesPrefersExactPathOverAlias(t *testing.T) {
 	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: exact.ID, rank: 0})
 }
 
-func TestMapExploreSourceLiteralMatchesQueriesExactPathsBeforeAliases(t *testing.T) {
+func TestMapExploreSourceLiteralMatchesPreservesFirstSeenExactPathsBeforeAliases(t *testing.T) {
 	exactA := sourceLiteralNode("demo/src/a.cs::Register", "RegisterA", "demo/src/a.cs", graph.KindMethod, 1, 5)
 	exactB := sourceLiteralNode("demo/src/b.cs::Register", "RegisterB", "demo/src/b.cs", graph.KindMethod, 1, 5)
 	store := &exploreSourceLiteralOrderedStore{
@@ -382,7 +382,7 @@ func TestMapExploreSourceLiteralMatchesQueriesExactPathsBeforeAliases(t *testing
 		{Path: exactA.FilePath, Line: 3, Text: `Register("ku")`},
 	}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-	require.Equal(t, []string{"demo/src/a.cs", "demo/src/b.cs", "src/a.cs"}, store.calls)
+	require.Equal(t, []string{"demo/src/b.cs", "demo/src/a.cs", "src/b.cs", "src/a.cs"}, store.calls)
 	requireSourceLiteralHitIdentity(t, recall.hits,
 		exploreSourceLiteralHit{nodeID: exactB.ID, rank: 0},
 		exploreSourceLiteralHit{nodeID: exactA.ID, rank: 1},

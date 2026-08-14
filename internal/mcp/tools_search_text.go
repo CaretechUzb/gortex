@@ -246,14 +246,30 @@ func (s *Server) enrichTextMatchesContext(
 	opts query.QueryOptions,
 ) ([]enrichedTextMatch, map[string]*fileSymbolIndex) {
 	out := make([]enrichedTextMatch, 0, len(matches))
-	paths := make(map[string]struct{}, len(matches))
+	exactPaths := make([]string, 0, len(matches))
+	aliasPaths := make([]string, 0, len(matches))
+	exactSeen := make(map[string]struct{}, len(matches))
+	aliasSeen := make(map[string]struct{}, len(matches))
 	for _, match := range matches {
-		paths[match.Path] = struct{}{}
-		if key := graphMatchPathKey(match.Path, true); key != match.Path {
-			paths[key] = struct{}{}
+		if _, duplicate := exactSeen[match.Path]; !duplicate {
+			exactSeen[match.Path] = struct{}{}
+			exactPaths = append(exactPaths, match.Path)
+		}
+		if alias := graphMatchPathKey(match.Path, true); alias != match.Path {
+			if _, duplicate := aliasSeen[alias]; !duplicate {
+				aliasSeen[alias] = struct{}{}
+				aliasPaths = append(aliasPaths, alias)
+			}
 		}
 	}
-	indexes := s.buildFileSymbolIndexForPathsScopedContext(ctx, paths, opts)
+	orderedPaths := make([]string, 0, len(exactPaths)+len(aliasPaths))
+	orderedPaths = append(orderedPaths, exactPaths...)
+	for _, alias := range aliasPaths {
+		if _, isExact := exactSeen[alias]; !isExact {
+			orderedPaths = append(orderedPaths, alias)
+		}
+	}
+	indexes := s.buildFileSymbolIndexForOrderedPathsScopedContext(ctx, orderedPaths, opts)
 	for _, match := range matches {
 		enriched := enrichedTextMatch{Path: match.Path, Line: match.Line, Text: match.Text}
 		index := fileSymbolIndexForPath(indexes, match.Path)

@@ -41,6 +41,59 @@ func TestSearchTextEnrichmentAndCaptureShareOneBoundedFetch(t *testing.T) {
 	}
 }
 
+func TestSearchTextEnrichmentPreservesFirstSeenFilePriority(t *testing.T) {
+	const (
+		firstPath  = "repo/z.go"
+		secondPath = "repo/a.go"
+	)
+	backing := graph.New()
+	firstOwner := &graph.Node{
+		ID: firstPath + "::first", Name: "first", Kind: graph.KindFunction,
+		FilePath: firstPath, StartLine: 1, EndLine: 20,
+	}
+	secondOwner := &graph.Node{
+		ID: secondPath + "::second", Name: "second", Kind: graph.KindFunction,
+		FilePath: secondPath, StartLine: 1, EndLine: 20,
+	}
+	backing.AddNode(firstOwner)
+	backing.AddNode(secondOwner)
+	probe := &boundedFileStoreProbe{Store: backing}
+	probe.read = func(ctx context.Context, path string, scope graph.LocalizationNodeScope, limit int) (graph.BoundedNodeProjection, error) {
+		return backing.FindFileNodesBounded(ctx, path, scope, limit)
+	}
+	server := &Server{graph: probe}
+
+	enriched, _ := server.enrichTextMatchesContext(context.Background(), []trigram.Match{
+		{Path: firstPath, Line: 3, Text: "first"},
+		{Path: secondPath, Line: 4, Text: "second"},
+		{Path: firstPath, Line: 5, Text: "first again"},
+	}, query.QueryOptions{})
+
+	if len(probe.calls) != 2 || probe.calls[0].path != firstPath || probe.calls[1].path != secondPath {
+		t.Fatalf("bounded fetch order = %#v, want first-seen paths [%q %q]", probe.calls, firstPath, secondPath)
+	}
+	if len(enriched) != 3 || enriched[0].SymbolID != firstOwner.ID || enriched[1].SymbolID != secondOwner.ID || enriched[2].SymbolID != firstOwner.ID {
+		t.Fatalf("first-seen enrichment = %#v", enriched)
+	}
+}
+
+func TestGenericFileSymbolIndexMapOrderingRemainsDeterministic(t *testing.T) {
+	probe := &boundedFileStoreProbe{Store: graph.New()}
+	probe.read = func(_ context.Context, _ string, _ graph.LocalizationNodeScope, _ int) (graph.BoundedNodeProjection, error) {
+		return graph.BoundedNodeProjection{}, nil
+	}
+	server := &Server{graph: probe}
+	server.buildFileSymbolIndexForPathsScopedContext(context.Background(), map[string]struct{}{
+		"repo/z.go": {},
+		"repo/a.go": {},
+		"repo/m.go": {},
+	}, query.QueryOptions{})
+
+	if len(probe.calls) != 3 || probe.calls[0].path != "repo/a.go" || probe.calls[1].path != "repo/m.go" || probe.calls[2].path != "repo/z.go" {
+		t.Fatalf("generic map fetch order = %#v, want alphabetical determinism", probe.calls)
+	}
+}
+
 func TestLocalizationTextMatchDirectSymbolIDSkipsFileIndex(t *testing.T) {
 	store := graph.New()
 	node := &graph.Node{ID: "repo/direct.go::direct", Name: "direct", Kind: graph.KindFunction, FilePath: "repo/direct.go"}

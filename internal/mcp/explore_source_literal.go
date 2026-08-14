@@ -524,8 +524,6 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 			}
 		}
 	}
-	sort.Strings(exactPaths)
-	sort.Strings(aliasPaths)
 	orderedPaths := make([]string, 0, len(exactPaths)+len(aliasPaths))
 	orderedPaths = append(orderedPaths, exactPaths...)
 	for _, alias := range aliasPaths {
