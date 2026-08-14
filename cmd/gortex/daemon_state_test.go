@@ -8,6 +8,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/intern"
+	"github.com/zzet/gortex/internal/serverstack"
 )
 
 // TestLSPDisabledSet_ConfigOnly — a `semantic.providers` entry with
@@ -16,7 +17,7 @@ import (
 // `enabled: false` for a custom non-registry daemon doesn't shadow
 // a same-named LSP).
 func TestLSPDisabledSet_ConfigOnly(t *testing.T) {
-	got := lspDisabledSet([]config.SemanticProviderConfig{
+	got := serverstack.LspDisabledSet([]config.SemanticProviderConfig{
 		{Name: "gopls", Enabled: false},
 		{Name: "tsserver", Enabled: true}, // explicitly enabled — must NOT land in disabled
 		{Name: "not-a-real-lsp", Enabled: false},
@@ -30,7 +31,7 @@ func TestLSPDisabledSet_ConfigOnly(t *testing.T) {
 // TestLSPDisabledSet_EnvOnly — comma-separated names land in the
 // disabled set. Whitespace is trimmed; empty entries are skipped.
 func TestLSPDisabledSet_EnvOnly(t *testing.T) {
-	got := lspDisabledSet(nil, "gopls, tsserver,, ,pyright")
+	got := serverstack.LspDisabledSet(nil, "gopls, tsserver,, ,pyright")
 	want := map[string]bool{"gopls": true, "tsserver": true, "pyright": true}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -42,7 +43,7 @@ func TestLSPDisabledSet_EnvOnly(t *testing.T) {
 // auto-registration entirely.
 func TestLSPDisabledSet_EnvAllKillSwitch(t *testing.T) {
 	for _, env := range []string{"all", "ALL", "*", " all "} {
-		got := lspDisabledSet(nil, env)
+		got := serverstack.LspDisabledSet(nil, env)
 		if !got["__all__"] {
 			t.Fatalf("env=%q: expected __all__ kill switch, got %v", env, got)
 		}
@@ -52,7 +53,7 @@ func TestLSPDisabledSet_EnvAllKillSwitch(t *testing.T) {
 // TestLSPDisabledSet_ConfigAndEnvMerge — disables from both sources
 // merge cleanly into one map.
 func TestLSPDisabledSet_ConfigAndEnvMerge(t *testing.T) {
-	got := lspDisabledSet([]config.SemanticProviderConfig{
+	got := serverstack.LspDisabledSet([]config.SemanticProviderConfig{
 		{Name: "gopls", Enabled: false},
 	}, "tsserver,pyright")
 	want := map[string]bool{
@@ -68,7 +69,7 @@ func TestLSPDisabledSet_ConfigAndEnvMerge(t *testing.T) {
 // TestLSPDisabledSet_Empty — no providers, empty env yields an empty
 // map (not nil — callers index into it).
 func TestLSPDisabledSet_Empty(t *testing.T) {
-	got := lspDisabledSet(nil, "")
+	got := serverstack.LspDisabledSet(nil, "")
 	if got == nil {
 		t.Fatal("expected non-nil empty map")
 	}

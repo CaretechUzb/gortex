@@ -311,17 +311,6 @@ func (m *OverlayManager) Touch(sessionID string) error {
 	return nil
 }
 
-// IdleTTL returns the configured idle expiry duration. Exposed so the
-// overlay_list tool can compute and surface an `expires_at` hint to
-// editor extensions that want to schedule a keepalive proactively.
-// Zero means "no expiry" (test-mode).
-func (m *OverlayManager) IdleTTL() time.Duration {
-	if m == nil {
-		return 0
-	}
-	return m.idleTTL
-}
-
 // SessionStatus is the per-session liveness snapshot reported through
 // overlay_list. Callers compare `IdleSeconds` to `IdleTTLSeconds` to
 // decide when to push a keepalive; `ExpiresAt` (RFC3339) is the

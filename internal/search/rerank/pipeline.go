@@ -65,10 +65,6 @@ func New(signals []Signal, weights map[string]float64) *Pipeline {
 // NewDefault is shorthand for New(DefaultSignals(), DefaultWeights()).
 func NewDefault() *Pipeline { return New(DefaultSignals(), DefaultWeights()) }
 
-// Signals returns the signal list. Order is stable but not
-// load-bearing — scores are computed independently per signal.
-func (p *Pipeline) Signals() []Signal { return p.signals }
-
 // Weights returns a copy of the current weight map.
 func (p *Pipeline) Weights() map[string]float64 {
 	out := make(map[string]float64, len(p.weights))
