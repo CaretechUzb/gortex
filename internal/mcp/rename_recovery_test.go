@@ -234,7 +234,7 @@ func setupMultiRepoRenameRecoveryServer(
 
 	registry := testRegistry()
 	store := graph.New()
-	multi := indexer.NewMultiIndexer(store, registry, search.NewBM25(), manager, zap.NewNop())
+	multi := indexer.NewMultiIndexer(store, registry, search.NewNull(), manager, zap.NewNop())
 	_, err = multi.IndexAll()
 	require.NoError(t, err)
 
