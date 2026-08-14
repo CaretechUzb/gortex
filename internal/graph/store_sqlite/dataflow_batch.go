@@ -9,14 +9,6 @@ import (
 
 const maxEdgeKindScanBatch = 4096
 
-// ScanDataflowEdgesBatched retains the original dataflow-specific capability
-// while delegating to the generic bounded kind scanner.
-func (s *Store) ScanDataflowEdgesBatched(batchSize int, yield func([]*graph.Edge) bool) {
-	s.ScanEdgesByKindsBatched(
-		[]graph.EdgeKind{graph.EdgeArgOf, graph.EdgeReturnsTo}, batchSize, yield,
-	)
-}
-
 // ScanEdgesByKindsBatched walks full edge rows through bounded row-id pages.
 // The high-water mark is captured before the first page, so delete+insert
 // identity rewrites cannot make a just-rewritten row reappear in the same

@@ -137,16 +137,11 @@ func TestReindexEdgesRetriesWholeTransactionAfterBusy(t *testing.T) {
 		_, err := store.reindexEdgesSetOriented(batch)
 		result <- err
 	}()
-	require.Eventually(t, func() bool {
-		return store.BusyRetryStats().Retries > 0
-	}, 2*time.Second, 2*time.Millisecond, "reindex should observe and retry SQLITE_BUSY")
+	requireBusyOperationBlocked(t, result, "reindex")
 	require.NoError(t, lockTx.Rollback())
 	require.NoError(t, locker.Close())
 	require.NoError(t, <-result)
 
-	stats := store.BusyRetryStats()
-	assert.Greater(t, stats.Retries, uint64(0))
-	assert.Zero(t, stats.Exhausted)
 	requireReindexedTarget(t, store, "repo/target.go::Target")
 	require.NoError(t, store.Close())
 
@@ -181,15 +176,12 @@ func TestReceiverRebindRetriesBusyBeginOnPinnedWriter(t *testing.T) {
 		changed, rebindErr := store.RebindGoMethodReceivers("")
 		done <- result{changed: changed, err: rebindErr}
 	}()
-	require.Eventually(t, func() bool {
-		return store.BusyRetryStats().Retries > 0
-	}, 2*time.Second, 2*time.Millisecond, "receiver rebind should retry a busy IMMEDIATE begin")
+	requireBusyOperationBlocked(t, done, "receiver rebind")
 	require.NoError(t, lockTx.Rollback())
 	require.NoError(t, locker.Close())
 	got := <-done
 	require.NoError(t, got.err)
 	assert.Equal(t, 1, got.changed)
-	assert.Zero(t, store.BusyRetryStats().Exhausted)
 }
 
 func TestReindexEdgesPersistentBusySurfacesAndRollsBack(t *testing.T) {
@@ -200,12 +192,14 @@ func TestReindexEdgesPersistentBusySurfacesAndRollsBack(t *testing.T) {
 	store.busyRetryTimeout = 60 * time.Millisecond
 	locker, lockTx := holdExternalWriter(t, path)
 
+	started := time.Now()
 	_, err := store.reindexEdgesSetOriented(batch)
+	elapsed := time.Since(started)
 	require.Error(t, err)
 	assert.True(t, isSQLiteBusyErr(err), "the exhausted error must retain the SQLite result code")
-	stats := store.BusyRetryStats()
-	assert.Greater(t, stats.Retries, uint64(0))
-	assert.Equal(t, uint64(1), stats.Exhausted)
+	assert.ErrorIs(t, err, errSQLiteBusyRetryExhausted)
+	assert.GreaterOrEqual(t, elapsed, 50*time.Millisecond)
+	assert.Less(t, elapsed, time.Second)
 	requireReindexedTarget(t, store, "unresolved::Target")
 
 	require.NoError(t, lockTx.Rollback())
@@ -245,7 +239,6 @@ func TestLongWALReaderDoesNotBlockReindexWriter(t *testing.T) {
 	_, err := store.reindexEdgesSetOriented(batch)
 	require.NoError(t, err)
 	assert.Less(t, time.Since(started), time.Second)
-	assert.Zero(t, store.BusyRetryStats().Retries)
 
 	for _, reader := range held {
 		require.NoError(t, reader.rows.Close())
@@ -453,11 +446,9 @@ func TestCheckpointBusyResultIsRetriedAndNeverReportedAsSuccess(t *testing.T) {
 	require.NoError(t, readTx.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&count))
 	store.AddNode(&graph.Node{ID: "repo/b.go::B", Kind: graph.KindFunction, Name: "B"})
 
-	beforePassive := store.BusyRetryStats()
 	started := time.Now()
 	store.checkpointWALPassive()
 	assert.Less(t, time.Since(started), time.Second, "PASSIVE maintenance must not wait for the long reader")
-	assert.Equal(t, beforePassive, store.BusyRetryStats(), "periodic PASSIVE checkpoint must be one-shot")
 
 	setWriterBusyTimeout(t, store, 0)
 	store.busyRetryTimeout = 80 * time.Millisecond
@@ -465,11 +456,12 @@ func TestCheckpointBusyResultIsRetriedAndNeverReportedAsSuccess(t *testing.T) {
 	started = time.Now()
 	err = store.checkpointWALWithContext(ctx)
 	cancel()
+	elapsed := time.Since(started)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errSQLiteCheckpointIncomplete)
 	assert.ErrorIs(t, err, errSQLiteBusyRetryExhausted)
-	assert.Less(t, time.Since(started), time.Second)
-	assert.Greater(t, store.BusyRetryStats().Retries, beforePassive.Retries)
+	assert.GreaterOrEqual(t, elapsed, 60*time.Millisecond)
+	assert.Less(t, elapsed, time.Second)
 
 	require.NoError(t, readTx.Rollback())
 	require.NoError(t, readConn.Close())
@@ -551,9 +543,7 @@ func TestEvictFileRetriesBusyBeginAndCommitsAtomically(t *testing.T) {
 		nodes, edges := store.EvictFile(evictFixtureFile)
 		done <- [2]int{nodes, edges}
 	}()
-	require.Eventually(t, func() bool {
-		return store.BusyRetryStats().Retries > 0
-	}, 2*time.Second, 2*time.Millisecond, "file eviction should retry its IMMEDIATE begin")
+	requireBusyOperationBlocked(t, done, "file eviction")
 	require.NoError(t, lockTx.Rollback())
 	require.NoError(t, locker.Close())
 	released = true
@@ -566,7 +556,6 @@ func TestEvictFileRetriesBusyBeginAndCommitsAtomically(t *testing.T) {
 	}
 	require.Equal(t, [2]int{2, 3}, got)
 	requireAtomicFileEvictionCommitted(t, store)
-	require.Greater(t, store.BusyRetryStats().Retries, uint64(0))
 	require.NoError(t, store.Close())
 
 	reopened, err := Open(path)
@@ -735,6 +724,15 @@ func openBusyReindexFixture(t *testing.T, path string) (*Store, []graph.EdgeRein
 	resolved.To = "repo/target.go::Target"
 	resolved.Origin = "resolver"
 	return store, []graph.EdgeReindex{{Edge: &resolved, OldTo: old.To}}
+}
+
+func requireBusyOperationBlocked[T any](t *testing.T, result <-chan T, operation string) {
+	t.Helper()
+	select {
+	case value := <-result:
+		t.Fatalf("%s completed while the external writer lock was held: %v", operation, value)
+	case <-time.After(50 * time.Millisecond):
+	}
 }
 
 func setWriterBusyTimeout(t *testing.T, store *Store, milliseconds int) {

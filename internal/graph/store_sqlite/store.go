@@ -51,9 +51,7 @@ type Store struct {
 	// busyRetryTimeout is the whole-transaction contention budget. The zero
 	// value selects defaultSQLiteBusyRetryTimeout; tests shorten it to exercise
 	// persistent-lock exhaustion deterministically.
-	busyRetryTimeout   time.Duration
-	busyRetries        atomic.Uint64
-	busyRetryExhausted atomic.Uint64
+	busyRetryTimeout time.Duration
 
 	// passiveCheckpointTimeout bounds one periodic PASSIVE checkpoint. The zero
 	// value selects walPassiveCheckpointTimeout; tests shorten it to exercise
@@ -205,7 +203,6 @@ type Store struct {
 	stmtInsertEdge       *sql.Stmt
 	unresolvedInserts    atomic.Uint64
 	stmtOutEdges         *sql.Stmt
-	stmtOutEdgesLight    *sql.Stmt
 	stmtInEdges          *sql.Stmt
 	stmtRepoEdges        *sql.Stmt
 	stmtAllEdges         *sql.Stmt
@@ -780,7 +777,7 @@ func (s *Store) Close() error {
 		s.stmtAllRepoCountsNodes, s.stmtAllRepoCountsEdges,
 		s.stmtAllRepoStateCounts,
 		s.stmtStatsByKind, s.stmtStatsByLanguage,
-		s.stmtInsertEdge, s.stmtOutEdges, s.stmtOutEdgesLight, s.stmtInEdges,
+		s.stmtInsertEdge, s.stmtOutEdges, s.stmtInEdges,
 		s.stmtRepoEdges,
 		s.stmtAllEdges, s.stmtEdgeCount, s.stmtRemoveEdge,
 		s.stmtUpdateEdgeOrigin, s.stmtUpdateEdgeAttrs, s.stmtSelectEdgeOrigin, s.stmtDeleteEdgeByKey,
@@ -912,12 +909,6 @@ func (s *Store) prepare() error {
 	// b-tree.
 	prep(&s.stmtOutEdges,
 		`SELECT `+edgeCols+` FROM edges WHERE from_id = ? ORDER BY line, id`)
-	// edgeColsLight is the package-level meta-less projection (store_light_edges.go),
-	// shared with AllEdgesLight so this prepared statement and the whole-graph scan
-	// can never drift apart. The ordering must match stmtOutEdges for the same
-	// reason: callers switch between the two purely to skip the Meta blob.
-	prep(&s.stmtOutEdgesLight,
-		`SELECT `+edgeColsLight+` FROM edges WHERE from_id = ? ORDER BY line, id`)
 	prep(&s.stmtInEdges,
 		`SELECT `+edgeCols+` FROM edges WHERE to_id = ? ORDER BY kind, id`)
 	prep(&s.stmtRepoEdges,
@@ -1908,13 +1899,6 @@ func (s *Store) EdgeExists(from, to string, kind graph.EdgeKind, filePath string
 	return true
 }
 
-// GetOutEdgesLight returns a node's out-edges without decoding the
-// per-edge Meta blob -- for hot dataflow lookups that need only
-// endpoints/kind/line. The returned edges have a nil Meta.
-func (s *Store) GetOutEdgesLight(nodeID string) []*graph.Edge {
-	return s.queryEdgesLight(s.stmtOutEdgesLight, nodeID)
-}
-
 func (s *Store) GetInEdges(nodeID string) []*graph.Edge {
 	return s.queryEdges(s.stmtInEdges, nodeID)
 }
@@ -1998,34 +1982,6 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 	// A driver failure part-way through the cursor ends the loop exactly like
 	// a clean exhaust. Without this check the caller would receive a silently
 	// truncated slice and treat it as the complete result.
-	if err := rows.Err(); err != nil {
-		panicOnFatal(err)
-	}
-	return out
-}
-
-// queryEdgesLight mirrors queryEdges but scans each row without its
-// meta blob (scanEdgeLight), leaving Meta nil. Only for callers that
-// never read edge Meta.
-func (s *Store) queryEdgesLight(stmt *sql.Stmt, args ...any) []*graph.Edge {
-	rows, err := stmt.Query(args...)
-	if err != nil {
-		panicOnFatal(err)
-		return nil
-	}
-	defer rows.Close()
-	var out []*graph.Edge
-	for rows.Next() {
-		e, err := scanEdgeLight(rows)
-		if err != nil {
-			panicOnFatal(err)
-			return out
-		}
-		if e == nil {
-			continue
-		}
-		out = append(out, e)
-	}
 	if err := rows.Err(); err != nil {
 		panicOnFatal(err)
 	}

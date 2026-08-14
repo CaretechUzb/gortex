@@ -7,10 +7,10 @@ var _ graph.LightEdgeScanner = (*Store)(nil)
 
 // edgeColsLight is the meta-less edge column projection: the promoted struct
 // columns WITHOUT the meta blob (and without resolve_terminal, which lives in
-// Meta). It is exactly the ten columns scanEdgeLight scans, and is shared with
-// the stmtOutEdgesLight prepared statement so the projection can never drift
-// from the scanner. Adding meta back here would defeat the whole point — the
-// per-row JSON decode this projection exists to skip.
+// Meta). It is exactly the ten columns scanEdgeLight scans and is shared by
+// every meta-less SQLite edge query so projections cannot drift from the
+// scanner. Adding meta back here would defeat the whole point — the per-row
+// JSON decode this projection exists to skip.
 const edgeColsLight = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo`
 
 // AllEdgesLight implements graph.LightEdgeScanner: a kind-scoped edge scan that

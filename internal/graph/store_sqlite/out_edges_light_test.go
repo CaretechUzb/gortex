@@ -9,11 +9,10 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// TestGetOutEdgesLight_SkipsMetaKeepsEndpoints proves the light out-edge
-// fetch returns the same endpoints/kind/line as GetOutEdges while leaving
-// Meta nil — it must never pay the per-edge meta JSON decode. This is the
-// fetch findCallTarget uses on the dataflow hot path.
-func TestGetOutEdgesLight_SkipsMetaKeepsEndpoints(t *testing.T) {
+// TestAllEdgesLight_SkipsMetaKeepsEndpoints proves the live light-edge scan
+// returns the same endpoints/kind/line as GetOutEdges while leaving Meta nil —
+// it must never pay the per-edge meta JSON decode.
+func TestAllEdgesLight_SkipsMetaKeepsEndpoints(t *testing.T) {
 	s := openTestStore(t)
 
 	want := &graph.Edge{
@@ -31,7 +30,7 @@ func TestGetOutEdgesLight_SkipsMetaKeepsEndpoints(t *testing.T) {
 	require.NotNil(t, full[0].Meta, "GetOutEdges must decode Meta")
 	assert.Equal(t, "unresolved::Callee", full[0].Meta["callee_target"])
 
-	light := s.GetOutEdgesLight("pkg/x.go::Caller")
+	light := s.AllEdgesLight()
 	require.Len(t, light, 1)
 	assert.Equal(t, full[0].From, light[0].From)
 	assert.Equal(t, full[0].To, light[0].To)
@@ -40,6 +39,4 @@ func TestGetOutEdgesLight_SkipsMetaKeepsEndpoints(t *testing.T) {
 	assert.Equal(t, full[0].FilePath, light[0].FilePath)
 	assert.Nil(t, light[0].Meta, "light fetch must not decode the meta blob")
 
-	// A node with no out-edges returns nothing on both paths.
-	assert.Empty(t, s.GetOutEdgesLight("pkg/x.go::Callee"))
 }
