@@ -2,14 +2,13 @@ package analyzer
 
 // LLM-backed adapter for the Temporal dispatch verification pass.
 //
-// PURPOSE — wire the deterministic verification core in
-// internal/resolver/temporal_verify.go to (a) a real LLM provider, (b) on-disk
-// source grounding, (c) a reproducibility cache, and (d) the canonical
-// map[string]any output shape. Keeps the resolver core free of any LLM / I/O
-// dependency; all the "actions" live here.
-// RATIONALE — the verifier and source provider are injected interfaces, so this
-// file holds the only LLM + filesystem coupling. The cache makes re-runs cheap
-// and deterministic (same code + model → cached verdict).
+// PURPOSE — adapt the deterministic verification core in
+// internal/resolver/temporal_verify.go to a real LLM provider, a reproducibility
+// cache, and the canonical map[string]any output shape. Source grounding remains
+// an injected resolver.TemporalSourceProvider supplied by the host that owns
+// repository path resolution.
+// RATIONALE — the cache keeps re-runs cheap and deterministic (same code + model
+// → cached verdict) without coupling the resolver core to LLM or filesystem I/O.
 // KEYWORDS — temporal, verify, llm, source, cache, adapter
 
 import (
@@ -22,7 +21,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/llm"
 	"github.com/zzet/gortex/internal/resolver"
 )
@@ -58,94 +56,6 @@ func VerifyReportToMap(rep resolver.TemporalVerifyReport) map[string]any {
 			"errors":    rep.Errors,
 		},
 	}
-}
-
-// --- File-backed source provider ------------------------------------------
-
-// maxNodeSourceBytes caps the per-node source handed to the LLM so a giant
-// function body can't blow the prompt budget.
-const maxNodeSourceBytes = 6000
-
-// FileSourceProvider reads a graph node's source from disk, slicing the file by
-// the node's [StartLine, EndLine]. Files are cached in-memory for the run.
-type FileSourceProvider struct {
-	root  string
-	cache map[string]string
-}
-
-// NewFileSourceProvider returns a source provider rooted at the indexed repo.
-func NewFileSourceProvider(root string) *FileSourceProvider {
-	return &FileSourceProvider{root: root, cache: map[string]string{}}
-}
-
-// NodeSource returns the source text of n's declaration, or ("", false).
-func (p *FileSourceProvider) NodeSource(n *graph.Node) (string, bool) {
-	if n == nil || n.FilePath == "" {
-		return "", false
-	}
-	body, ok := p.fileBody(n.FilePath)
-	if !ok {
-		return "", false
-	}
-	lines := strings.Split(body, "\n")
-	start, end := n.StartLine, n.EndLine
-	if start < 1 {
-		start = 1
-	}
-	if start > len(lines) {
-		return "", false
-	}
-	if end < start || end > len(lines) {
-		end = len(lines)
-	}
-	src := strings.Join(lines[start-1:end], "\n")
-	if len(src) > maxNodeSourceBytes {
-		src = src[:maxNodeSourceBytes] + "\n// …truncated"
-	}
-	return src, true
-}
-
-func (p *FileSourceProvider) fileBody(rel string) (string, bool) {
-	if b, ok := p.cache[rel]; ok {
-		return b, b != ""
-	}
-	abs, ok := p.resolveWithinRoot(rel)
-	if !ok {
-		p.cache[rel] = ""
-		return "", false
-	}
-	raw, err := os.ReadFile(abs)
-	if err != nil {
-		p.cache[rel] = ""
-		return "", false
-	}
-	p.cache[rel] = string(raw)
-	return string(raw), true
-}
-
-// resolveWithinRoot resolves rel — relative to p.root, or absolute — and
-// confirms the result stays inside p.root. A node FilePath that escapes the
-// indexed tree (via "..", or an absolute path elsewhere) is refused, so a
-// crafted graph node can't make the verifier read arbitrary files off disk and
-// ship them to the LLM. An empty root refuses everything (nothing to bound to).
-func (p *FileSourceProvider) resolveWithinRoot(rel string) (string, bool) {
-	if p.root == "" || rel == "" {
-		return "", false
-	}
-	rootAbs, err := filepath.Abs(p.root)
-	if err != nil {
-		return "", false
-	}
-	cand := rel
-	if !filepath.IsAbs(cand) {
-		cand = filepath.Join(rootAbs, cand)
-	}
-	cand = filepath.Clean(cand)
-	relToRoot, err := filepath.Rel(rootAbs, cand)
-	if err != nil || relToRoot == ".." || strings.HasPrefix(relToRoot, ".."+string(filepath.Separator)) {
-		return "", false
-	}
-	return cand, true
 }
 
 // --- LLM verifier ----------------------------------------------------------
