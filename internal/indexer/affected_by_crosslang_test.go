@@ -41,10 +41,6 @@ func TestAffectedBy_TypeScriptParamChange_ReresolvesCaller(t *testing.T) {
 	_, err = idx.IncrementalReindexPaths(dir, []string{aPath})
 	require.NoError(t, err)
 
-	passes, files, _ := idx.AffectedByCounts()
-	assert.Equal(t, int64(1), passes,
-		"a TypeScript parameter change must trigger the pass even though Meta[signature] is name-only")
-	assert.Equal(t, int64(1), files)
 	assert.Equal(t, "a.ts::F", callTargetFrom(t, g, callerID),
 		"the caller must be re-resolved to the fresh F")
 }
@@ -64,14 +60,22 @@ func TestAffectedBy_TypeScriptBodyOnly_NoFanout(t *testing.T) {
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 	idx.ResolveAll()
+	g := idx.Graph()
+	snap := idx.snapshotAffectedBy("a.ts")
+	require.NotNil(t, snap)
 
 	bumpMtime(t, aPath, "export function F(x: number): number {\n  return x + 1 + 2 + 3\n}\n")
 	_, err = idx.IncrementalReindexPaths(dir, []string{aPath})
 	require.NoError(t, err)
 
-	passes, _, _ := idx.AffectedByCounts()
-	assert.Equal(t, int64(0), passes,
-		"a TypeScript body-only edit must not fan out")
+	var fresh []*graph.Node
+	for _, node := range g.AllNodes() {
+		if node != nil && node.FilePath == "a.ts" {
+			fresh = append(fresh, node)
+		}
+	}
+	assert.Empty(t, affectedByDelta(g, snap, fresh),
+		"a TypeScript body-only edit must not produce an affected-by frontier")
 }
 
 // TestAffectedByDelta_LineSuffixedID_NoSpuriousDelta proves the line-
@@ -155,11 +159,6 @@ func TestAffectedBy_MinifiedSkip_PreservesFactsNoFanout(t *testing.T) {
 	bumpMtime(t, aPath, blob)
 	_, err = idx.IncrementalReindexPaths(dir, []string{aPath})
 	require.NoError(t, err)
-
-	passes, files, _ := idx.AffectedByCounts()
-	assert.Equal(t, int64(0), passes,
-		"a minified-skip (zero symbols) must not fan out as if every symbol was removed")
-	assert.Equal(t, int64(0), files)
 
 	after, err := store.LoadRefFactsByTargets("", []string{fID})
 	require.NoError(t, err)

@@ -401,7 +401,7 @@ type Indexer struct {
 	// graph-apply phase until the channel closes. Set by BeginDeferredPasses
 	// before the pool launches (so the pool's compute may overlap the warmup
 	// resolve without its applies starving the resolver) and cleared by
-	// FinishTail.
+	// FinishTailResult.
 	deferredApplyGate <-chan struct{}
 
 	// deferredEnrichFiles holds a deduplicated, repo-scoped Go frontier for
@@ -446,14 +446,14 @@ type Indexer struct {
 	// entire shared graph, so running them per-repo inside a batch loop
 	// (warmup, ReconcileAll) is O(R · global_size) — quadratic for repo
 	// counts in the hundreds. The batch caller is responsible for invoking
-	// RunGlobalGraphPasses exactly once at the end. Has no effect on the
+	// the shared global-pass pipeline exactly once at the end. Has no effect on the
 	// deferResolve path (multi-repo IndexCtx already skips those passes).
 	deferGlobalPasses atomic.Bool
 
 	// skipResolveInDeferred, when set, makes RunDeferredPasses skip the
 	// per-repo resolver.ResolveAll() call. ResolveAll walks the entire
 	// shared graph, so paying it once per indexer across hundreds of
-	// repos is O(R · E). MultiIndexer.RunDeferredPassesAll sets this
+	// repos is O(R · E). MultiIndexer.RunDeferredPassesAllResult sets this
 	// flag on every indexer and runs a single resolver.New(graph).ResolveAll
 	// once at the end, which picks up every placeholder edge at once.
 	// Has no effect on direct (non-batch) callers of RunDeferredPasses.
@@ -484,16 +484,6 @@ type Indexer struct {
 	// between the probe and graph patch.
 	preparedMu sync.Mutex
 	prepared   map[string]*preparedExtraction
-
-	// affectedByPasses / affectedByFilesResolved / affectedByDropped
-	// count the affected-by re-resolution activity (see affected_by.go):
-	// passes that found a signature delta and ran, referencing files
-	// re-resolved by them, and files dropped by the fan-out cap.
-	// Exposed via AffectedByCounts so tests and diagnostics can observe
-	// that a body-only edit triggered no fan-out.
-	affectedByPasses        atomic.Int64
-	affectedByFilesResolved atomic.Int64
-	affectedByDropped       atomic.Int64
 
 	// repositoryMutation is the single discovery/parse/resolve/derived lane
 	// for this repository. It is lazy so focused Indexer fixtures do not need
@@ -961,119 +951,10 @@ func (idx *Indexer) SetSkipResolveInDeferred(v bool) { idx.skipResolveInDeferred
 // SetDeferGlobalPasses toggles whether the graph-wide derivation passes
 // (InferImplements, InferOverrides, markTestSymbolsAndEmitEdges) run
 // inline at the end of IndexCtx / IncrementalReindexPaths. Set true when the
-// caller drives a batch (e.g. daemon warmup) and will invoke
-// RunGlobalGraphPasses once at the end. See the deferGlobalPasses field
+// caller drives a batch (e.g. daemon warmup) and will invoke the shared
+// multi-repository global-pass pipeline once at the end. See the deferGlobalPasses field
 // comment.
 func (idx *Indexer) SetDeferGlobalPasses(v bool) { idx.deferGlobalPasses.Store(v) }
-
-// RunGlobalGraphPasses runs the graph-wide derivation passes once
-// against the indexer's shared graph. Safe to call against a graph that
-// already has these edges — InferImplements / InferOverrides skip
-// existing parents, and graph.AddEdge dedupes by edgeKey so EdgeTests
-// re-emission is a no-op. Logs counts for telemetry. Use when batching
-// multiple per-repo TrackRepoCtx / IncrementalReindexPaths calls under
-// SetDeferGlobalPasses(true).
-func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
-	if idx.graph == nil {
-		return
-	}
-	reporter := progress.FromContext(ctx)
-	if added := idx.resolver.InferImplements(); added > 0 {
-		idx.logger.Info("inferred implements (global)", zap.Int("added", added))
-	}
-	if added := idx.resolver.InferOverrides(); added > 0 {
-		idx.logger.Info("inferred overrides (global)", zap.Int("added", added))
-	}
-	marked, emitted := markTestSymbolsAndEmitEdges(idx.graph)
-	if marked > 0 || emitted > 0 {
-		idx.logger.Info("test edges emitted (global)",
-			zap.Int("test_symbols", marked),
-			zap.Int("edges", emitted),
-		)
-	}
-	if ctrl := entrypoints.PropagateEntryPointsDownHierarchy(idx.graph); ctrl > 0 {
-		idx.logger.Info("entry-point hierarchy stamped (global)", zap.Int("stamped", ctrl))
-	}
-	if re, ep, fa := synthesizeCapabilityEdges(idx.graph); re > 0 || ep > 0 || fa > 0 {
-		idx.logger.Info("capability edges emitted (global)",
-			zap.Int("reads_env", re),
-			zap.Int("executes_process", ep),
-			zap.Int("accesses_field", fa),
-		)
-	}
-	reporter.Report("clone detection pass (global)", 0, 0)
-	cs, cloneBaseline := detectClonesAndEmitEdgesWithBaselineCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold())
-	if cs.Items > 0 {
-		idx.logger.Info("clone edges emitted (global)",
-			zap.Int("items", cs.Items),
-			zap.Int("clone_pairs", cs.Pairs),
-			zap.Int("edges", cs.Edges),
-			zap.Int("skipped_buckets", cs.SkippedBuckets),
-			zap.Int("skipped_bucket_items", cs.SkippedBucketItems),
-			zap.Int("diffused_pairs", cs.DiffusedPairs),
-			zap.Int("diffused_edges", cs.DiffusedEdges),
-		)
-	}
-	// Adopt the freshly-finalized CMS/corpus seed so steady-state single-file
-	// edits go incremental without paging the same compact corpus again.
-	if idx.cloneIndex != nil {
-		idx.cloneIndex.AdoptBaselineOrRebuild(idx.graph, idx.repoPrefix, cloneBaseline)
-	}
-	// Framework dynamic-dispatch synthesis (gRPC stubs, Temporal
-	// workflow→activity, in-process / native event channels, native
-	// bridges). Runs after InferImplements/InferOverrides (the
-	// interface-satisfaction signals several synthesizers depend on) and
-	// before DetectCrossRepoEdges so a cross-repo synthesized call gets
-	// its parallel cross_repo_calls edge.
-	reporter.Report("framework dispatch synthesis (global)", 0, 0)
-	if rep := resolver.RunFrameworkSynthesizers(idx.graph); rep.Total > 0 {
-		idx.logger.Info("framework dispatch calls synthesized (global)",
-			zap.Int("edges", rep.Total),
-			zap.Any("per_synthesizer", rep.Per),
-		)
-	}
-	// External-call placeholder synthesis (opt-in). Runs after the
-	// resolver and the gRPC/Temporal stub passes so every edge that
-	// could land on a real node already has; the leftover external
-	// terminals are then materialised into synthetic call-chain nodes.
-	reporter.Report("external-call synthesis (global)", 0, 0)
-	if extCalls := resolver.SynthesizeExternalCalls(idx.graph, idx.externalCallSynthesisEnabled()); extCalls > 0 {
-		idx.logger.Info("external-call placeholders synthesized (global)",
-			zap.Int("edges", extCalls),
-		)
-	}
-	// Speculative dynamic-dispatch synthesis (opt-in, default off). Mints
-	// best-guess hidden-by-default call edges for blind-spot shapes.
-	if spec := resolver.ResolveSpeculativeDispatch(idx.graph, idx.speculativeDispatchEnabled()); spec > 0 {
-		idx.logger.Info("speculative dispatch edges synthesized (global)",
-			zap.Int("edges", spec),
-		)
-	}
-	// Content -> code "why" links. Runs before DetectCrossRepoEdges so a
-	// chunk that motivates a symbol in another repo gets its parallel
-	// cross_repo_motivates edge minted by the cross-repo pass below.
-	reporter.Report("content links (global)", 0, 0)
-	idx.linkContentToCode()
-	// Cross-repo edge layer. Runs after InferImplements / InferOverrides
-	// so cross-repo implements / extends edges pick up their parallel
-	// cross_repo_* edges. No-op on single-repo graphs (no RepoPrefix).
-	reporter.Report("cross-repo edges (global)", 0, 0)
-	if crossRepoEdges := resolver.DetectCrossRepoEdges(idx.graph); crossRepoEdges > 0 {
-		idx.logger.Info("cross-repo edges emitted (global)",
-			zap.Int("edges", crossRepoEdges),
-		)
-	}
-	// Reachability index — used to be precomputed here for every
-	// impact seed. The eager pass was retired because the breakeven
-	// math doesn't work: on a 200 k-seed graph (k8s) the build took
-	// ~2000 s of cold-index wall time to save ~10 ms per
-	// AnalyzeImpact call, requiring ~200 k queries to pay off — well
-	// beyond any realistic agent session. Lookups are now
-	// compute-on-first-use; we just invalidate the cache so any
-	// surviving stamps from a previous build don't shadow the fresh
-	// graph state.
-	reach.InvalidateIndex()
-}
 
 // cloneThreshold returns the configured Jaccard similarity cutoff for
 // clone detection (0 = use the clones package default).
@@ -1090,7 +971,7 @@ func (idx *Indexer) cloneThreshold() float64 {
 // The graph-wide derivation passes (InferImplements, InferOverrides,
 // markTestSymbolsAndEmitEdges) intentionally do NOT run here. They walk
 // the entire shared graph, so the multi-repo orchestrator must invoke
-// MultiIndexer.RunGlobalGraphPasses exactly once after every repo has
+// its shared global-pass pipeline exactly once after every repo has
 // finished its deferred per-repo work.
 func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 	if idx.pendingContractReg == nil {
@@ -3984,7 +3865,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// Framework dynamic-dispatch synthesis — runs once the call
 			// graph and interface inference are final. Skipped under
 			// deferGlobalPasses; the batch caller folds it into
-			// RunGlobalGraphPasses.
+			// shared multi-repository global-pass pipeline.
 			reporter.Report("framework dispatch synthesis", 0, 0)
 			if rep := resolver.RunFrameworkSynthesizers(idx.graph); rep.Total > 0 {
 				idx.logger.Info("framework dispatch calls synthesized",
@@ -5958,15 +5839,6 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 		return nil, err
 	}
 	return idx.coordinateRepositoryReindex(context.Background(), canonical)
-}
-
-// incrementalDiscoverPaths discovers and refreshes files beneath paths without
-// treating absent tracked files as deletions. Watcher directory-create scans
-// use this mode because their job is to recover creates that happened before a
-// nested watch was attached. A concurrent file-delete event must remain the
-// sole owner of eviction so it can publish the pre-delete symbol snapshot.
-func (idx *Indexer) incrementalDiscoverPaths(root string, paths []string) (*IndexResult, error) {
-	return idx.incrementalReindexPaths(root, paths, false)
 }
 
 // incrementalPathMode keeps forced point semantics private to the caller that

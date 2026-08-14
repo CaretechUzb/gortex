@@ -127,7 +127,7 @@ type MultiIndexer struct {
 	// deferGlobalPasses, when set, propagates SetDeferGlobalPasses(true)
 	// to every per-repo Indexer constructed by this MultiIndexer. Batch
 	// warmup callers flip it on around their loop and
-	// invoke RunGlobalGraphPasses once at the end so the O(global) walks
+	// invoke the shared global-pass pipeline once at the end so the O(global) walks
 	// (InferImplements / InferOverrides / markTestSymbolsAndEmitEdges)
 	// don't run R times against an R-repo graph.
 	deferGlobalPasses bool
@@ -137,13 +137,13 @@ type MultiIndexer struct {
 	// parallel warmup path: per-repo ResolveAll / contract extract /
 	// semantic enrich mutate the shared graph, so running them in
 	// parallel across repos races. With this flag the parallel loop
-	// just parses; RunDeferredPassesAll runs the per-repo passes
+	// just parses; RunDeferredPassesAllResult runs the per-repo passes
 	// serially after the loop. Independent of deferGlobalPasses — that
 	// flag covers a separate (cheaper) set of O(global) walks.
 	deferResolve bool
 
 	// batchChangedPrefixes scopes the per-repo clone-detection and
-	// clone-index Rebuild passes in RunGlobalGraphPasses to the repos that
+	// clone-index Rebuild passes in the shared global-pass pipeline to the repos that
 	// actually re-indexed in the current batch. nil — the default, and what
 	// every one-off EndBatch caller leaves it as — means "run the clone
 	// passes for every tracked repo", the prior whole-workspace behaviour.
@@ -153,7 +153,7 @@ type MultiIndexer struct {
 	// disk. Clone edges are per-repo (no cross-repo pair is ever formed),
 	// so an unchanged repo's persisted edges stay valid; its in-memory
 	// incremental clone index is reseeded lazily on its first later edit.
-	// Consumed and cleared by RunGlobalGraphPasses. Guarded by mi.mu.
+	// Consumed and cleared by the shared global-pass pipeline. Guarded by mi.mu.
 	batchChangedPrefixes map[string]struct{}
 	// batchCensusEligible is the daemon's one-shot full-coverage attestation
 	// for the armed batch scope — see ArmBatchCensusEligible.
@@ -161,7 +161,7 @@ type MultiIndexer struct {
 
 	// resolverLSPHelper is the resolve-time LSP helper propagated
 	// onto every per-repo Indexer and onto the global post-pass
-	// resolver in RunDeferredPassesAll. nil means no LSP hot-path
+	// resolver in RunDeferredPassesAllResult. nil means no LSP hot-path
 	// (heuristic-only resolution, the pre-N5 behaviour). The
 	// daemon installs the helper via SetResolverLSPHelper after
 	// constructing the LSP router; a multi-repo composite helper
@@ -421,7 +421,7 @@ func (mi *MultiIndexer) SetSemanticManager(m *semantic.Manager) {
 
 // SetResolverLSPHelper installs the resolve-time LSP helper used by
 // every per-repo Indexer this MultiIndexer constructs from now on,
-// and by the global post-pass resolver in RunDeferredPassesAll. Pass
+// and by the global post-pass resolver in RunDeferredPassesAllResult. Pass
 // nil to detach. Safe to call zero or one times; subsequent calls
 // silently replace and propagate to every existing per-repo indexer.
 func (mi *MultiIndexer) SetResolverLSPHelper(h resolver.LSPHelper) {
@@ -474,7 +474,7 @@ func (mi *MultiIndexer) BeginBatch() {
 // indexing loop across goroutines (warmup) — the parallel parsers
 // must not race each other inside ResolveAll / contract extract /
 // semantic enrich, which all mutate the shared graph. Pair with
-// EndBatch; call RunDeferredPassesAll between the parallel parse and
+// EndBatch; call RunDeferredPassesAllResult between the parallel parse and
 // EndBatch to run the deferred per-repo passes serially.
 func (mi *MultiIndexer) BeginParallelBatch() {
 	mi.batchMutationGate.Lock()
@@ -490,26 +490,10 @@ func (mi *MultiIndexer) BeginParallelBatch() {
 	}
 }
 
-// RunDeferredPassesAll drains the deferred per-repo passes (semantic
-// enrich / contract extract+commit) serially across the indexers the
-// parallel parse populated. Pairs with BeginParallelBatch: the parallel
-// loop parses with deferResolve on; this serial loop runs the passes that
-// would otherwise race on the shared graph. The references-completeness
-// resolve runs ahead of this in RunPreEnrichResolve (so the daemon can mark
-// itself queryable before enrichment); the per-repo resolver pass is
-// suppressed here because resolver.ResolveAll walks the entire shared graph
-// — paying it R times is O(R · E). One master resolver.New(graph).ResolveAll
-// runs at the end to lift the placeholder edges enrichment + contracts added.
-//
-// Returns the number of repos whose deferred semantic enrichment was
-// actually dispatched (pendingEnrich set, or forced via
-// GORTEX_WARMUP_FORCE_ENRICH) rather than skipped as unchanged. Sampled
-// before runDeferredEnrichParallel runs, since a successful non-partial
-// pass clears the flag it reads.
 // SeedPendingEnrichAll re-arms the deferred-enrichment gate for every tracked
 // repo whose persisted enrichment is known-incomplete at its current clean HEAD
 // (see Indexer.MaybeSeedPendingEnrich). The daemon warmup calls it after the
-// parallel parse and before RunDeferredPassesAll so a repo left partial or
+// parallel parse and before RunDeferredPassesAllResult so a repo left partial or
 // abandoned by a prior process resumes even when no file changed this run.
 // Returns the number of repos that will enrich (already pending plus newly
 // seeded) — the caller uses a non-zero count to run the deferred passes on a
@@ -559,13 +543,9 @@ func (mi *MultiIndexer) GraphMutationRevision() (uint64, bool) {
 	return revisioner.MutationRevision(), true
 }
 
-func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) int {
-	return mi.RunDeferredPassesAllResult(ctx).EnrichScheduled
-}
-
 // RunDeferredPassesAllResult is the result-bearing orchestration form used by
 // lifecycle callers that must decide whether a later global safety sweep is
-// still required. RunDeferredPassesAll preserves the compatibility surface.
+// still required.
 func (mi *MultiIndexer) RunDeferredPassesAllResult(ctx context.Context) DeferredPassesResult {
 	return mi.BeginDeferredPasses(ctx, nil).FinishTailResult()
 }
@@ -637,11 +617,11 @@ func (r *DeferredPassesRun) BeginApplyMutationReceipt() {
 
 // BeginDeferredPasses selects the repos with deferred work, prepares the
 // mutation-receipt window, materialises go.mod dependencies, and launches the
-// enrichment pool on its own goroutine. The caller must call FinishTail (which
+// enrichment pool on its own goroutine. The caller must call FinishTailResult (which
 // joins the pool) exactly once. applyGate, when non-nil, parks every
 // provider's graph-apply phase until the caller closes it — the caller MUST
 // first call BeginApplyMutationReceipt after its resolve phase, then close the
-// gate, or FinishTail deadlocks.
+// gate, or FinishTailResult deadlocks.
 //
 // Without an apply gate the receipt opens here. With overlap, delaying it until
 // the apply boundary excludes resolver writes while still observing every
@@ -726,11 +706,6 @@ func (mi *MultiIndexer) BeginDeferredPasses(_ context.Context, applyGate <-chan 
 
 // Wait blocks until every enrichment lane has drained.
 func (r *DeferredPassesRun) Wait() { <-r.poolDone }
-
-// FinishTail preserves the compatibility result used by existing callers.
-func (r *DeferredPassesRun) FinishTail() int {
-	return r.FinishTailResult().EnrichScheduled
-}
 
 // FinishTailResult joins the enrichment pool, runs the contract passes, closes
 // the receipt window, and performs the deferred-mutation catch-up resolve.
@@ -1096,15 +1071,6 @@ func (mi *MultiIndexer) RunDeferredGoModAll() {
 	mi.runDeferredGoModAll()
 }
 
-// runDeferredEnrichParallel runs each indexer's semantic enrichment in a
-// bounded worker pool. Concurrency is capped so at most a few LSP servers
-// background-index at once (the memory-sensitive part). The manager pins each
-// repo's LSP provider in-use for the duration of its pass, so the router's
-// LRU evictor never closes a provider another repo is still enriching against.
-func (mi *MultiIndexer) runDeferredEnrichParallel(indexers []*Indexer) {
-	mi.runDeferredEnrichPool(indexers)
-}
-
 // runDeferredEnrichPool drains per-repo semantic enrichment through a
 // bounded worker pool with no inter-repo barriers. The old fixed batches
 // made every batch wait for its slowest member and gave each heavy-Go repo
@@ -1392,7 +1358,7 @@ func enrichConcurrency(repos int) int {
 // the per-Indexer flag too so a subsequent one-off TrackRepoCtx call
 // runs the passes inline as expected.
 // ArmBatchScope records the prefixes of the repos that re-indexed in the
-// batch about to be ended, so the next RunGlobalGraphPasses runs the
+// batch about to be ended, so the next shared global-pass run executes the
 // per-repo clone-detection + clone-index Rebuild passes only for those
 // repos instead of for every tracked repo. An empty set, or scoped global
 // passes being disabled, leaves the scope nil (run all). Only the daemon
@@ -1485,8 +1451,8 @@ func (mi *MultiIndexer) EndBatch() {
 // derivation passes. It is the warm-restart fast-path counterpart to
 // EndBatch: when the warmup reconcile loop observed zero changed files
 // across every repo, the persistent backend already holds every resolved
-// and derived edge from the prior run, so RunGlobalGraphPasses (plus the
-// RunDeferredPassesAll / RunGlobalResolve the caller also skips) would
+// and derived edge from the prior run, so the shared global-pass pipeline (plus
+// RunDeferredPassesAllResult / RunGlobalResolve, which the caller also skips) would
 // only recompute what's already on disk — the work that turns a warm
 // restart into a 30s–500s stall. The per-Indexer SetDeferGlobalPasses
 // flag is still restored so a later watch-triggered TrackRepoCtx /
@@ -1505,21 +1471,6 @@ func (mi *MultiIndexer) ResetBatch() {
 	for _, idx := range mi.indexers {
 		applyMultiIndexerBatchMode(idx, mode)
 	}
-}
-
-// RunGlobalGraphPasses runs the graph-wide derivation passes once
-// against the shared graph: InferImplements (structural interface
-// satisfaction), InferOverrides (method-level overrides on
-// extends/implements/composes parents), and markTestSymbolsAndEmitEdges
-// (test→subject EdgeTests). Idempotent — graph.AddEdge dedupes by
-// edgeKey and the resolver passes skip already-present parents.
-func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
-	// Direct callers own no transition gate. Exclude repository mutation
-	// pipelines for the complete unscoped derivation run; callers already under
-	// a batch gate use runGlobalGraphPasses directly.
-	mi.batchMutationGate.Lock()
-	defer mi.batchMutationGate.Unlock()
-	mi.runGlobalGraphPasses(ctx, nil, false)
 }
 
 // runGlobalGraphPasses owns the reachability topology writer for callers that
@@ -2099,7 +2050,7 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 					// race against each other across goroutines on the shared
 					// graph. They run serially below via RunDeferredPasses after
 					// wg.Wait(). The graph-wide derivation passes run once after
-					// the loop via mi.RunGlobalGraphPasses().
+					// the loop via the shared global-pass pipeline.
 					idx.SetDeferResolve(true)
 
 					result, err := idx.indexCtxRaw(context.Background(), r.absPath)

@@ -248,7 +248,7 @@ func TestRunDeferredPassesAllPoolsEnrichmentBounded(t *testing.T) {
 				t.Fatalf("queue dropped repos: %d of %d", len(queue), len(indexers))
 			}
 
-			scheduled := mi.RunDeferredPassesAll(t.Context())
+			scheduled := mi.RunDeferredPassesAllResult(t.Context()).EnrichScheduled
 			require.Equal(t, 8, scheduled)
 			assert.Equal(t, int32(8), provider.calls.Load())
 			// The pool bounds concurrent per-repo passes at enrichConcurrency
@@ -262,7 +262,7 @@ func TestRunDeferredPassesAllFailureKeepsGenerationPending(t *testing.T) {
 	provider := &coldBatchProvider{language: "go", fail: true}
 	mi := deferredBatchFixture(t, "go", 1, provider)
 
-	require.Equal(t, 1, mi.RunDeferredPassesAll(t.Context()))
+	require.Equal(t, 1, mi.RunDeferredPassesAllResult(t.Context()).EnrichScheduled)
 	idx := mi.indexers["batch-00"]
 	require.NotNil(t, idx)
 	assert.True(t, idx.pendingEnrich.Load(),
@@ -297,7 +297,7 @@ func serialColdReference(t *testing.T, repos []config.RepoEntry) *MultiIndexer {
 		mi.indexers[prefix].RunDeferredPasses(t.Context())
 	}
 	mi.runCrossRepoResolve(true)
-	mi.RunGlobalGraphPasses(t.Context())
+	mi.runGlobalGraphPasses(t.Context(), nil, false)
 	return mi
 }
 
@@ -476,7 +476,7 @@ func TestIndexMultiRepoRefFactFailureStopsGlobalConsumers(t *testing.T) {
 // TestBeginDeferredPassesOverlapSplitsPoolFromTail pins the overlap contract:
 // BeginDeferredPasses drains the enrichment pool on its own goroutine while
 // the caller is free to run the resolve phase; contracts and the catch-up
-// resolve happen only in FinishTail, and the batch-only resolve gate is
+// resolve happen only in FinishTailResult, and the batch-only resolve gate is
 // restored afterwards.
 func TestBeginDeferredPassesOverlapSplitsPoolFromTail(t *testing.T) {
 	provider := &coldBatchProvider{language: "python", delay: 15 * time.Millisecond}
@@ -485,13 +485,13 @@ func TestBeginDeferredPassesOverlapSplitsPoolFromTail(t *testing.T) {
 	run := mi.BeginDeferredPasses(t.Context(), nil)
 	run.Wait()
 	assert.Equal(t, int32(4), provider.calls.Load(),
-		"the pool must drain without FinishTail being called")
+		"the pool must drain without FinishTailResult being called")
 	for prefix, idx := range mi.indexers {
 		assert.True(t, idx.skipResolveInDeferred,
 			"%s must keep the batch-only resolve gate until the tail runs", prefix)
 	}
 
-	scheduled := run.FinishTail()
+	scheduled := run.FinishTailResult().EnrichScheduled
 	assert.Equal(t, 4, scheduled)
 	for prefix, idx := range mi.indexers {
 		assert.False(t, idx.skipResolveInDeferred,

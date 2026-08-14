@@ -194,7 +194,7 @@ func TestIncrementalDiscoverPaths_PreservesDeletedTrackedFile(t *testing.T) {
 	require.NotEmpty(t, g.FindNodesByName("Original"))
 
 	require.NoError(t, os.Remove(gone))
-	res, err := idx.incrementalDiscoverPaths(dir, nil)
+	res, err := idx.incrementalReindexPathsMode(dir, nil, incrementalPathMode{detectDeletions: false})
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.Zero(t, res.DeletedFileCount)
