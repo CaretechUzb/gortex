@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -763,12 +764,14 @@ func (ss *sessionState) markCueOnce(key string) bool {
 type lastSearchState struct {
 	query string
 	// returned is the result IDs in rank order (0 = top); returnedIDs
-	// maps an ID to its rank for O(1) membership + rank lookup. consumed
-	// tracks which returned IDs the agent went on to use, so a later
-	// search can record an implicit "skip-above" negative for the
+	// maps an ID to its rank for O(1) membership + rank lookup. fileIDs
+	// maps each canonical returned Node.FilePath to the IDs on that page.
+	// consumed tracks which returned IDs the agent went on to use, so a
+	// later search can record an implicit "skip-above" negative for the
 	// higher-ranked results that were passed over.
 	returned    []string
 	returnedIDs map[string]int
+	fileIDs     map[string][]string
 	consumed    map[string]struct{}
 	at          time.Time
 }
@@ -1121,26 +1124,78 @@ func (s *Server) resolveSessionFormat(ctx context.Context) string {
 // with a T-second window; 5 minutes is long enough for agents that
 // interleave many tool calls but short enough that an unrelated later
 // consume doesn't get mis-attributed.
-const comboWindow = 5 * time.Minute
+const (
+	comboWindow       = 5 * time.Minute
+	lastSearchPageCap = 256
+)
 
-// recordLastSearch captures the query + the IDs it returned so a later
-// consume call can be credited to this query. Truncating to the top N
-// results keeps the map small — only symbols the agent can plausibly
-// have seen are eligible.
-func (ss *sessionState) recordLastSearch(query string, ids []string) {
+func normalizeSearchAttributionPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	path = filepath.ToSlash(filepath.Clean(path))
+	if path == "." {
+		return ""
+	}
+	return path
+}
+
+// recordLastSearch captures one actually returned page so a later consume call
+// can be credited to this query. At most lastSearchPageCap page positions are
+// inspected; ranked IDs and per-file memberships are both unique and bounded.
+func (ss *sessionState) recordLastSearchPage(query string, nodes []*graph.Node) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
-	set := make(map[string]int, len(ids))
-	for i, id := range ids {
-		set[id] = i
+
+	positions := min(len(nodes), lastSearchPageCap)
+	returned := make([]string, 0, positions)
+	returnedIDs := make(map[string]int, positions)
+	fileIDs := make(map[string][]string)
+	for index := 0; index < positions; index++ {
+		node := nodes[index]
+		if node == nil || node.ID == "" {
+			continue
+		}
+		if _, duplicate := returnedIDs[node.ID]; duplicate {
+			continue
+		}
+		returnedIDs[node.ID] = len(returned)
+		returned = append(returned, node.ID)
+		path := normalizeSearchAttributionPath(node.FilePath)
+		if path == "" {
+			path = normalizeSearchAttributionPath(graph.IDFile(node.ID))
+		}
+		if path != "" {
+			fileIDs[path] = append(fileIDs[path], node.ID)
+		}
+	}
+	if strings.TrimSpace(query) == "" || len(returned) == 0 {
+		ss.lastSearch = lastSearchState{}
+		return
 	}
 	ss.lastSearch = lastSearchState{
 		query:       query,
-		returned:    append([]string(nil), ids...),
-		returnedIDs: set,
+		returned:    returned,
+		returnedIDs: returnedIDs,
+		fileIDs:     fileIDs,
 		consumed:    make(map[string]struct{}),
 		at:          time.Now(),
 	}
+}
+
+// recordLastSearch retains the legacy ID-only seam used by symbol consumers
+// that do not have node metadata. File memberships are recovered from IDs when
+// possible; search_symbols uses recordLastSearchPage with authoritative nodes.
+func (ss *sessionState) recordLastSearch(query string, ids []string) {
+	nodes := make([]*graph.Node, 0, min(len(ids), lastSearchPageCap))
+	for index, id := range ids {
+		if index >= lastSearchPageCap {
+			break
+		}
+		nodes = append(nodes, &graph.Node{ID: id})
+	}
+	ss.recordLastSearchPage(query, nodes)
 }
 
 // attributedQuery returns the query string that should receive credit for
@@ -1166,12 +1221,39 @@ func (ss *sessionState) attributedQuery(symbolID string) string {
 	return ss.lastSearch.query
 }
 
-// attributedConsumptionBatch credits a set of symbol IDs to the recent
-// search in one pass: it returns the search's query and the subset of
-// ids that the search returned within the attribution window (marking
-// each consumed). Used by the tool-call observer when the agent opens a
-// file — every symbol in it that the search surfaced is credited at
-// once. Returns ("", nil) when no fresh search is attributable.
+// attributedFileConsumption returns the recent search query and the exact
+// returned-page IDs recorded for path, marking each as consumed. The lookup is
+// graph-free: file membership was captured with the page under this same lock.
+func (ss *sessionState) attributedFileConsumption(path string) (string, []string) {
+	path = normalizeSearchAttributionPath(path)
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if path == "" || ss.lastSearch.query == "" || time.Since(ss.lastSearch.at) > comboWindow {
+		return "", nil
+	}
+	ids := ss.lastSearch.fileIDs[path]
+	if len(ids) == 0 {
+		return "", nil
+	}
+	if ss.lastSearch.consumed == nil {
+		ss.lastSearch.consumed = make(map[string]struct{})
+	}
+	matched := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, consumed := ss.lastSearch.consumed[id]; consumed {
+			continue
+		}
+		ss.lastSearch.consumed[id] = struct{}{}
+		matched = append(matched, id)
+	}
+	if len(matched) == 0 {
+		return "", nil
+	}
+	return ss.lastSearch.query, matched
+}
+
+// attributedConsumptionBatch preserves the legacy ID-batch seam while file
+// consumers migrate to the graph-free attributedFileConsumption lookup.
 func (ss *sessionState) attributedConsumptionBatch(ids []string) (string, []string) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
@@ -1181,12 +1263,9 @@ func (ss *sessionState) attributedConsumptionBatch(ids []string) (string, []stri
 	if ss.lastSearch.consumed == nil {
 		ss.lastSearch.consumed = make(map[string]struct{})
 	}
-	var matched []string
+	matched := make([]string, 0, len(ids))
 	for _, id := range ids {
-		if id == "" {
-			continue
-		}
-		if _, ok := ss.lastSearch.returnedIDs[id]; !ok {
+		if _, ok := ss.lastSearch.returnedIDs[id]; !ok || id == "" {
 			continue
 		}
 		ss.lastSearch.consumed[id] = struct{}{}

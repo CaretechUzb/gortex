@@ -1902,10 +1902,6 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		}
 	}
 
-	// Remember the returned IDs for attribution on later consume calls.
-	// Cap at top limit so unseen "overflow" results don't get credited.
-	recordLastSearchFromNodes(sess, q, nodes, limit)
-
 	total := len(nodes)
 	// Slice the (offset, limit) window. nextCursor is empty when the
 	// last row in `nodes` is included.
@@ -1917,6 +1913,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		offset = total
 	}
 	page := nodes[offset:end]
+	// Record only the actual post-cursor page. Empty and out-of-range pages
+	// deliberately clear any prior attribution state.
+	recordLastSearchFromNodes(sess, q, page)
 	// Decorate the page with absolute file paths so every output format
 	// below surfaces an openable path alongside the repo-relative one.
 	page = s.withAbsPaths(page)

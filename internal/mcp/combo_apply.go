@@ -69,19 +69,12 @@ func applyRerankBoostsTimed(s *Server, nodes []*graph.Node, query string, rerank
 	return result, prepare, signals
 }
 
-// recordLastSearchFromNodes stores the query + top-limit IDs on the session
-// so a subsequent get_symbol_source / get_editing_context can credit this
-// search. Capped at limit to avoid crediting results the agent never saw.
-func recordLastSearchFromNodes(sess *sessionState, query string, nodes []*graph.Node, limit int) {
-	if sess == nil || len(nodes) == 0 {
+// recordLastSearchFromNodes stores exactly one returned search page so later
+// symbol/file consumption can be attributed without graph reads. Empty pages
+// intentionally clear the prior page.
+func recordLastSearchFromNodes(sess *sessionState, query string, nodes []*graph.Node) {
+	if sess == nil {
 		return
 	}
-	if limit <= 0 || limit > len(nodes) {
-		limit = len(nodes)
-	}
-	ids := make([]string, 0, limit)
-	for i := 0; i < limit; i++ {
-		ids = append(ids, nodes[i].ID)
-	}
-	sess.recordLastSearch(query, ids)
+	sess.recordLastSearchPage(query, nodes)
 }

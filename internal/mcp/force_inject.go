@@ -15,24 +15,14 @@ import (
 // Cheap-gated on a fresh search so a file open with no recent search
 // pays nothing.
 func (s *Server) creditFileConsumption(ctx context.Context, filePath string) {
-	if s == nil || s.combo == nil || filePath == "" {
+	if s == nil || s.combo == nil || ctx == nil || ctx.Err() != nil || filePath == "" {
 		return
 	}
 	sess := s.sessionFor(ctx)
-	if sess == nil || !sess.hasFreshSearch() {
+	if sess == nil || ctx.Err() != nil {
 		return
 	}
-	nodes := s.readerFor(ctx).GetFileNodes(filePath)
-	if len(nodes) == 0 {
-		return
-	}
-	ids := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		if n != nil && n.ID != "" {
-			ids = append(ids, n.ID)
-		}
-	}
-	query, matched := sess.attributedConsumptionBatch(ids)
+	query, matched := sess.attributedFileConsumption(filePath)
 	if query != "" && len(matched) > 0 {
 		s.combo.RecordBatch(query, matched)
 	}
