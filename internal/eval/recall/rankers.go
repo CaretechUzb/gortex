@@ -84,9 +84,9 @@ func SemanticRanker(name string, vector *search.VectorBackend, embedder embeddin
 	}
 }
 
-// RRFRanker adapts a HybridBackend (BM25 + vector fused via RRF) to the
-// Ranker shape. Uses Search() which runs both sides and fuses when the
-// vector backend has data — otherwise it degrades to BM25 gracefully.
+// RRFRanker preserves the historical eval row key while adapting the live
+// HybridBackend (native symbol FTS + vector with adaptive-alpha fusion) to the
+// Ranker shape. Callers install it only when the vector backend has data.
 func RRFRanker(name string, hybrid *search.HybridBackend) Ranker {
 	return Ranker{
 		Name: name,

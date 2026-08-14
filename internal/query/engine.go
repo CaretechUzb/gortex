@@ -932,7 +932,7 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		insert(id, -1, rank)
 	}
 
-	// Stop early when the BM25 + vector union has already exceeded the
+	// Stop early when the native text + vector union has already exceeded the
 	// requested width; the supplementary tiers below are a fill, not a
 	// boost.
 	if len(cands) >= limit*2 {

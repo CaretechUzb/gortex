@@ -56,7 +56,8 @@ Rankers:
   bm25      — lexical-only: the store-native symbol FTS queried
               through Engine.SearchSymbols (the search_symbols path)
   semantic  — vector-only (requires --embeddings)
-  rrf       — BM25 + vector fused via RRF (requires --embeddings)
+  rrf       — native FTS + vector with adaptive alpha (historical key;
+              requires --embeddings)
   winnow    — graph-aware constraint chain (MCP winnow_symbols scorer)
   ripgrep   — rg --files-with-matches baseline ("retrieval floor")
 

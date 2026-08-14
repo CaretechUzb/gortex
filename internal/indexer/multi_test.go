@@ -290,7 +290,7 @@ func TestMultiIndexer_TrackRepo(t *testing.T) {
 }
 
 // TestMultiIndexer_TrackRepo_SearchSpansAllRepos verifies that scoping
-// buildSearchIndex to the current repo (the perf fix that drops the
+// native symbol FTS writes to the current repo (the perf fix that drops the
 // O(N²) re-index of every prior repo's nodes on every TrackRepo call)
 // does not regress search recall. After three repos are tracked, the
 // shared search backend must still find symbols defined in the first,
