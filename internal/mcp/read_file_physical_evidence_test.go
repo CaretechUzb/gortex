@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -140,8 +139,7 @@ func TestReadFilePhysicalEvidenceRejectsSameSizeDriftDuringObservation(t *testin
 	require.NoError(t, err)
 	_, _, err = readPhysicalFileEvidenceObserved(path, func() {
 		require.NoError(t, os.WriteFile(path, []byte("after!"), 0o644))
-		changedAt := before.ModTime().Add(time.Second)
-		require.NoError(t, os.Chtimes(path, changedAt, changedAt))
+		require.NoError(t, os.Chtimes(path, before.ModTime(), before.ModTime()))
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "changed while it was being read")
@@ -196,6 +194,72 @@ func TestReadFilePhysicalEvidenceAncestorSymlinkDoesNotMarkFileAsLink(t *testing
 	require.NoError(t, err)
 	require.False(t, evidence.symlinkResolved)
 	require.True(t, strings.HasSuffix(filepath.ToSlash(evidence.resolvedPath), "/real/file.txt"))
+}
+
+func TestReadFilePhysicalEvidenceRejectsOutAndBackSymlinkTarget(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("symlink creation is not reliably available on Windows CI")
+	}
+	srv, repo := setupTestServer(t)
+	inside := filepath.Join(repo, "inside.txt")
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	link := filepath.Join(repo, "evidence-link.txt")
+	require.NoError(t, os.WriteFile(inside, []byte("inside"), 0o644))
+	require.NoError(t, os.WriteFile(outside, []byte("outside"), 0o644))
+	require.NoError(t, os.Symlink(inside, link))
+	require.NoError(t, srv.guardSymlinkWithinRepo(link))
+
+	require.NoError(t, os.Remove(link))
+	require.NoError(t, os.Symlink(outside, link))
+	content, evidence, err := readPhysicalFileEvidence(link)
+	require.NoError(t, err)
+	require.Equal(t, []byte("outside"), content)
+
+	require.NoError(t, os.Remove(link))
+	require.NoError(t, os.Symlink(inside, link))
+	require.NoError(t, srv.guardSymlinkWithinRepo(link), "a fresh post-read resolution alone sees only the restored inside target")
+	err = srv.guardResolvedPathWithinRepo(link, evidence.resolvedPath)
+	require.Error(t, err)
+	require.ErrorIs(t, err, errPathEscape)
+}
+
+func TestReadFilePhysicalEvidenceRequiresSecretIntentForDigest(t *testing.T) {
+	srv, dir := setupTestServer(t)
+	content := []byte("PASSWORD=hunter2\n")
+	path := filepath.Join(dir, ".env")
+	require.NoError(t, os.WriteFile(path, content, 0o600))
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+
+	refused := callTool(t, srv, "read_file", map[string]any{
+		"path": ".env", "physical_evidence": true,
+	})
+	require.True(t, refused.IsError)
+	require.Contains(t, toolResultText(refused), "requires allow_secrets=true")
+	require.NotContains(t, toolResultText(refused), digest)
+
+	allowed := callTool(t, srv, "read_file", map[string]any{
+		"path": ".env", "physical_evidence": true, "allow_secrets": true,
+	})
+	require.False(t, allowed.IsError, toolResultText(allowed))
+	got := decodeFileOpsResult(t, allowed)
+	require.Equal(t, digest, got["content_sha256"])
+	require.Equal(t, string(content), got["content"])
+}
+
+func TestReadFilePhysicalEvidenceInvalidUTF8IsNotSameWireBuffer(t *testing.T) {
+	srv, dir := setupTestServer(t)
+	content := []byte{0xff, 0xfe, 'x'}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "invalid.txt"), content, 0o644))
+
+	result := callTool(t, srv, "read_file", map[string]any{
+		"path": "invalid.txt", "physical_evidence": true,
+	})
+	require.False(t, result.IsError, toolResultText(result))
+	got := decodeFileOpsResult(t, result)
+	sum := sha256.Sum256(content)
+	require.Equal(t, hex.EncodeToString(sum[:]), got["content_sha256"])
+	require.Equal(t, false, got["same_buffer_as_content"])
 }
 
 func TestReadFilePhysicalEvidenceIsPublishedByFacadeSchema(t *testing.T) {
