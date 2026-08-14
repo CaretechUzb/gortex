@@ -716,6 +716,9 @@ func (s *Server) handleChangeContract(ctx context.Context, req mcp.CallToolReque
 	}
 	p, err := s.lowerChange(ctx, req)
 	if err != nil {
+		if ctxErr := requestContextError(ctx, err); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	if req.GetBool("ack", false) {

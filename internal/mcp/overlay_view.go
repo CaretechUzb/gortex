@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"path"
 	"path/filepath"
@@ -25,6 +26,13 @@ import (
 // view onto an unrelated context.
 type overlayViewCtxKey struct{}
 type overlayRequestSnapshotCtxKey struct{}
+
+const (
+	overlayRequestSnapshotMaxFiles = exploreSourceLiteralOverlayMaxCoveredFiles + 1
+	overlayRequestSnapshotMaxBytes = exploreSourceLiteralOverlayMaxBytes + exploreSourceLiteralOverlayMaxLineBytes
+	overlaySimulationInputMaxBytes = exploreSourceLiteralOverlayMaxBytes
+	overlaySimulationMaxSteps      = 16
+)
 
 // overlayRequestSnapshot is the immutable raw-buffer cohort used to build one
 // request's OverlaidView. OverlayFile strings are immutable; retaining this
@@ -137,8 +145,21 @@ func (s *Server) snapshotOverlayRequestForCtx(ctx context.Context) (*overlayRequ
 	if sessionID == "" {
 		return nil, nil
 	}
-	workspace, files, err := s.overlays.SnapshotFor(sessionID)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	workspace, files, err := s.overlays.SnapshotForBounded(
+		sessionID,
+		overlayRequestSnapshotMaxFiles,
+		overlayRequestSnapshotMaxBytes,
+	)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil {
+		if !errors.Is(err, daemon.ErrSessionNotFound) {
+			return nil, err
+		}
 		// Pin the attempted empty cohort. A nested facade must not retry and
 		// accidentally observe buffers pushed after the outer request began.
 		return &overlayRequestSnapshot{sessionID: sessionID}, nil
@@ -320,7 +341,7 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 		}
 	}
 
-	layer, paths, err := s.constructOverlayLayer(files)
+	layer, paths, err := s.constructOverlayLayer(ctx, files)
 	if err != nil {
 		return nil, err
 	}
@@ -429,7 +450,16 @@ func (s *Server) pickIndexerForPath(absPath string) *indexer.Indexer {
 // simple name resolution — but covers the common cases: direct
 // function calls, method calls in the same file, intra-package
 // references.
-func (s *Server) constructOverlayLayer(files []daemon.OverlayFile) (*graph.OverlayLayer, []string, error) {
+func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.OverlayFile) (*graph.OverlayLayer, []string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if err := validateOverlayBuildEnvelope(files); err != nil {
+		return nil, nil, err
+	}
 	if s.graph == nil {
 		return nil, nil, nil
 	}
@@ -437,6 +467,9 @@ func (s *Server) constructOverlayLayer(files []daemon.OverlayFile) (*graph.Overl
 	var coveredPaths []string
 
 	for _, ov := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		absPath, err := s.resolveOverlayAbsPath(ov.Path)
 		if err != nil {
 			return nil, nil, err
@@ -484,6 +517,9 @@ func (s *Server) constructOverlayLayer(files []daemon.OverlayFile) (*graph.Overl
 		result, err := ext.Extract(relPath, []byte(ov.Content))
 		if err != nil {
 			return nil, nil, fmt.Errorf("overlay parse %s: %w", ov.Path, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
 		}
 		// Track which base IDs disappear under the overlay so
 		// FindNodesByName / GetInEdges filter them. Build the set
@@ -534,9 +570,69 @@ func (s *Server) constructOverlayLayer(files []daemon.OverlayFile) (*graph.Overl
 	// Local resolver pass: rewrite unresolved overlay edges to point
 	// at concrete IDs whenever a single best match exists in
 	// (overlay ∪ base).
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	s.resolveOverlayEdges(layer)
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 
 	return layer, coveredPaths, nil
+}
+
+func validateOverlayBuildEnvelope(files []daemon.OverlayFile) error {
+	if len(files) > overlayRequestSnapshotMaxFiles {
+		return overlayBuildEnvelopeError("files", overlayRequestSnapshotMaxFiles)
+	}
+	totalBytes := 0
+	for _, file := range files {
+		if err := addOverlayBuildFileBytes(&totalBytes, file); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateOverlayBuildMapEnvelope checks simulation state before it is copied
+// into a retained, sorted snapshot. Keeping this map-shaped seam avoids
+// materializing an already-oversized state merely to discover its size.
+func validateOverlayBuildMapEnvelope(files map[string]daemon.OverlayFile) error {
+	if len(files) > overlayRequestSnapshotMaxFiles {
+		return overlayBuildEnvelopeError("files", overlayRequestSnapshotMaxFiles)
+	}
+	totalBytes := 0
+	for _, file := range files {
+		if err := addOverlayBuildFileBytes(&totalBytes, file); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addOverlayBuildFileBytes(totalBytes *int, file daemon.OverlayFile) error {
+	for _, size := range [...]int{len(file.Path), len(file.Content), len(file.BaseSHA)} {
+		remaining := overlayRequestSnapshotMaxBytes - *totalBytes
+		if size > remaining {
+			return overlayBuildEnvelopeError("bytes", overlayRequestSnapshotMaxBytes)
+		}
+		*totalBytes += size
+	}
+	return nil
+}
+
+func overlayBuildEnvelopeError(resource string, limit int) error {
+	return &daemon.ErrOverlaySnapshotTooLarge{Resource: resource, Limit: limit}
+}
+
+// requestContextError preserves request transport cancellation instead of
+// converting it into an MCP tool-error payload. Only the parent request context
+// is authoritative: component-local cancellation remains an ordinary tool error.
+func requestContextError(ctx context.Context, _ error) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
 }
 
 // applyRepoPrefixToResult prepends repoPrefix to every node/edge in

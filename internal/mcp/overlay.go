@@ -140,6 +140,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			var err error
 			ctx, _, err = s.prepareOverlayRequest(ctx)
 			if err != nil {
+				if ctxErr := requestContextError(ctx, err); ctxErr != nil {
+					return nil, ctxErr
+				}
 				// Drift and ownership failures surface as structured tool
 				// errors so the client can refresh and resubmit without a
 				// transport-level failure.

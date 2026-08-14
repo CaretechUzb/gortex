@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"regexp"
 	"sort"
@@ -160,6 +161,19 @@ var ErrSessionNotFound = errors.New("overlay session not found")
 // merge artefacts (lines moved by a sibling tool's edit) would
 // surface as wrong-line errors that look like graph bugs.
 var ErrOverlayDrift = errors.New("overlay base SHA mismatch — re-read and resubmit")
+
+// ErrOverlaySnapshotTooLarge reports that a bounded overlay snapshot could not
+// be materialized within its caller-supplied file or byte envelope. Resource is
+// either "files" or "bytes" and Limit is the corresponding hard cap. Bounded
+// snapshot APIs return no workspace or file slice with this error.
+type ErrOverlaySnapshotTooLarge struct {
+	Resource string
+	Limit    int
+}
+
+func (e *ErrOverlaySnapshotTooLarge) Error() string {
+	return fmt.Sprintf("overlay snapshot too large: %s exceed limit %d", e.Resource, e.Limit)
+}
 
 // ErrBranchNotFound is returned by branch tools when the named
 // branch does not exist on the session. The MCP surface translates
@@ -416,6 +430,76 @@ func (m *OverlayManager) SnapshotFor(sessionID string) (workspace string, files 
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return workspace, out, nil
+}
+
+// SnapshotForBounded is SnapshotFor with a hard pre-materialization envelope.
+// Both limits must be positive. File count and Path+Content+BaseSHA bytes are
+// checked while holding the manager lock and before allocating the result
+// slice. LastUsed is bumped even when the envelope rejects the snapshot.
+func (m *OverlayManager) SnapshotForBounded(
+	sessionID string,
+	maxFiles, maxBytes int,
+) (workspace string, files []OverlayFile, err error) {
+	if maxFiles <= 0 || maxBytes <= 0 {
+		return "", nil, fmt.Errorf("overlay snapshot limits must be positive: files=%d bytes=%d", maxFiles, maxBytes)
+	}
+	if m == nil {
+		return "", nil, ErrSessionNotFound
+	}
+
+	m.mu.RLock()
+	_, exists := m.sessions[sessionID]
+	m.mu.RUnlock()
+	if !exists {
+		return "", nil, ErrSessionNotFound
+	}
+
+	m.mu.Lock()
+	sess, ok := m.sessions[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return "", nil, ErrSessionNotFound
+	}
+	sess.LastUsed = time.Now()
+	workspace = sess.WorkspaceID
+	br := sess.activeBranch()
+	if br == nil {
+		m.mu.Unlock()
+		return workspace, nil, nil
+	}
+	out, snapshotErr := copyOverlayFilesBounded(br.files, maxFiles, maxBytes)
+	m.mu.Unlock()
+	if snapshotErr != nil {
+		return "", nil, snapshotErr
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return workspace, out, nil
+}
+
+// copyOverlayFilesBounded validates a locked branch map before allocating or
+// copying its snapshot. Callers must hold the manager lock for the full call.
+func copyOverlayFilesBounded(
+	files map[string]OverlayFile,
+	maxFiles, maxBytes int,
+) ([]OverlayFile, error) {
+	if len(files) > maxFiles {
+		return nil, &ErrOverlaySnapshotTooLarge{Resource: "files", Limit: maxFiles}
+	}
+	totalBytes := 0
+	for _, file := range files {
+		for _, size := range [...]int{len(file.Path), len(file.Content), len(file.BaseSHA)} {
+			if size > maxBytes-totalBytes {
+				return nil, &ErrOverlaySnapshotTooLarge{Resource: "bytes", Limit: maxBytes}
+			}
+			totalBytes += size
+		}
+	}
+	out := make([]OverlayFile, 0, len(files))
+	for _, file := range files {
+		out = append(out, file)
+	}
+	return out, nil
 }
 
 // Push attaches one overlay file to a session's active branch.
@@ -1020,6 +1104,48 @@ func (m *OverlayManager) FilesForBranch(sessionID, branchName string) ([]Overlay
 	for _, f := range br.files {
 		out = append(out, f)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, nil
+}
+
+// FilesForBranchBounded snapshots a named branch under the same bounded
+// materialization contract as SnapshotForBounded.
+func (m *OverlayManager) FilesForBranchBounded(
+	sessionID, branchName string,
+	maxFiles, maxBytes int,
+) ([]OverlayFile, error) {
+	if maxFiles <= 0 || maxBytes <= 0 {
+		return nil, fmt.Errorf("overlay snapshot limits must be positive: files=%d bytes=%d", maxFiles, maxBytes)
+	}
+	if m == nil {
+		return nil, ErrSessionNotFound
+	}
+
+	m.mu.RLock()
+	_, exists := m.sessions[sessionID]
+	m.mu.RUnlock()
+	if !exists {
+		return nil, ErrSessionNotFound
+	}
+
+	m.mu.Lock()
+	sess, ok := m.sessions[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return nil, ErrSessionNotFound
+	}
+	br, ok := sess.branches[branchName]
+	if !ok {
+		m.mu.Unlock()
+		return nil, ErrBranchNotFound
+	}
+	sess.LastUsed = time.Now()
+	out, snapshotErr := copyOverlayFilesBounded(br.files, maxFiles, maxBytes)
+	m.mu.Unlock()
+	if snapshotErr != nil {
+		return nil, snapshotErr
+	}
+
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, nil
 }

@@ -1101,6 +1101,9 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		var viewErr error
 		ctx, _, viewErr = s.prepareOverlayRequest(ctx)
 		if viewErr != nil {
+			if ctxErr := requestContextError(ctx, viewErr); ctxErr != nil {
+				return nil, ctxErr
+			}
 			outcome = facadeOutcomeToolError
 			return mcpgo.NewToolResultError(viewErr.Error()), nil
 		}

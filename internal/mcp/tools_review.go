@@ -1166,7 +1166,10 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 
 	// Cost bound: run a speculative preview_edit for the high-risk (d=1-heavy)
 	// changed symbols only — never the whole changeset.
-	previews := s.highRiskPreviews(ctx, diff, impact)
+	previews, previewErr := s.highRiskPreviews(ctx, diff, impact)
+	if previewErr != nil {
+		return nil, previewErr
+	}
 
 	// Privacy-safe risk receipt over the whole changeset.
 	scrub := requestBoolDefault(req, "scrub", false)
@@ -1290,12 +1293,15 @@ func (s *Server) reviewTestTargets(ctx context.Context, ids []string) []string {
 // so the broken-callers / impact rollup is computed without touching disk. Only
 // the high-risk subset is simulated, so the pass never scales with the whole
 // changeset.
-func (s *Server) highRiskPreviews(ctx context.Context, diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult) []reviewPreview {
+func (s *Server) highRiskPreviews(ctx context.Context, diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult) ([]reviewPreview, error) {
 	if diff == nil || impact == nil {
-		return nil
+		return nil, nil
 	}
 	var previews []reviewPreview
 	for _, cs := range diff.ChangedSymbols {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		ir := impact[cs.ID]
 		if ir == nil || len(ir.ByDepth[1]) < highRiskD1Threshold {
 			continue
@@ -1305,7 +1311,13 @@ func (s *Server) highRiskPreviews(ctx context.Context, diff *analysis.DiffResult
 			continue
 		}
 		sim, err := s.buildSimulation(ctx, []lsp.WorkspaceEdit{edit}, false)
-		if err != nil || len(sim.steps) == 0 {
+		if err != nil {
+			if ctxErr := requestContextError(ctx, err); ctxErr != nil {
+				return nil, ctxErr
+			}
+			continue
+		}
+		if len(sim.steps) == 0 {
 			continue
 		}
 		step := sim.steps[0]
@@ -1317,7 +1329,7 @@ func (s *Server) highRiskPreviews(ctx context.Context, diff *analysis.DiffResult
 		})
 	}
 	sort.SliceStable(previews, func(i, j int) bool { return previews[i].SymbolID < previews[j].SymbolID })
-	return previews
+	return previews, nil
 }
 
 // identityEditForSymbol builds a no-op WorkspaceEdit that rewrites a symbol's own

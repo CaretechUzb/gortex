@@ -413,7 +413,18 @@ func (s *Server) handleCompareBranches(ctx context.Context, req mcp.CallToolRequ
 	limit := int(req.GetFloat("limit", 50))
 	opts := query.QueryOptions{Depth: depth, Limit: limit, Detail: "brief"}
 
-	aFiles, errA := s.overlays.FilesForBranch(id, a)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	aFiles, errA := s.overlays.FilesForBranchBounded(
+		id,
+		a,
+		overlayRequestSnapshotMaxFiles,
+		overlayRequestSnapshotMaxBytes,
+	)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if errA != nil {
 		switch {
 		case errors.Is(errA, daemon.ErrSessionNotFound):
@@ -424,7 +435,18 @@ func (s *Server) handleCompareBranches(ctx context.Context, req mcp.CallToolRequ
 			return mcp.NewToolResultError(errA.Error()), nil
 		}
 	}
-	bFiles, errB := s.overlays.FilesForBranch(id, b)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	bFiles, errB := s.overlays.FilesForBranchBounded(
+		id,
+		b,
+		overlayRequestSnapshotMaxFiles,
+		overlayRequestSnapshotMaxBytes,
+	)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if errB != nil {
 		switch {
 		case errors.Is(errB, daemon.ErrSessionNotFound):
@@ -436,12 +458,18 @@ func (s *Server) handleCompareBranches(ctx context.Context, req mcp.CallToolRequ
 		}
 	}
 
-	aIDs, aPaths, err := s.runBranchQuery(aFiles, kind, symID, opts)
+	aIDs, aPaths, err := s.runBranchQuery(ctx, aFiles, kind, symID, opts)
 	if err != nil {
+		if ctxErr := requestContextError(ctx, err); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return mcp.NewToolResultError(fmt.Sprintf("branch %q: %v", a, err)), nil
 	}
-	bIDs, bPaths, err := s.runBranchQuery(bFiles, kind, symID, opts)
+	bIDs, bPaths, err := s.runBranchQuery(ctx, bFiles, kind, symID, opts)
 	if err != nil {
+		if ctxErr := requestContextError(ctx, err); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return mcp.NewToolResultError(fmt.Sprintf("branch %q: %v", b, err)), nil
 	}
 
@@ -479,11 +507,11 @@ func (s *Server) handleCompareBranches(ctx context.Context, req mcp.CallToolRequ
 // branch file set and runs the query kind against it. Returns the
 // stable-sorted result IDs and the overlay path coverage. Empty
 // branches fall through to the base engine.
-func (s *Server) runBranchQuery(files []daemon.OverlayFile, kind, symID string, opts query.QueryOptions) ([]string, []string, error) {
+func (s *Server) runBranchQuery(ctx context.Context, files []daemon.OverlayFile, kind, symID string, opts query.QueryOptions) ([]string, []string, error) {
 	eng := s.engine
 	paths := []string{}
 	if len(files) > 0 {
-		layer, p, err := s.constructOverlayLayer(files)
+		layer, p, err := s.constructOverlayLayer(ctx, files)
 		if err != nil {
 			return nil, nil, err
 		}

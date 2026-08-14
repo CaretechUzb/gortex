@@ -108,6 +108,9 @@ func (s *Server) handlePreviewEdit(ctx context.Context, req mcp.CallToolRequest)
 
 	sim, simErr := s.buildSimulation(ctx, []lsp.WorkspaceEdit{edit}, inherit)
 	if simErr != nil {
+		if ctxErr := requestContextError(ctx, simErr); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return mcp.NewToolResultError(simErr.Error()), nil
 	}
 	step := sim.steps[0]
@@ -149,12 +152,18 @@ func (s *Server) handleSimulateChain(ctx context.Context, req mcp.CallToolReques
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	if len(rawSteps) > overlaySimulationInputMaxBytes {
+		return mcp.NewToolResultError(fmt.Sprintf("steps input exceeds limit %d bytes", overlaySimulationInputMaxBytes)), nil
+	}
 	var rawEdits []json.RawMessage
 	if err := json.Unmarshal([]byte(rawSteps), &rawEdits); err != nil {
 		return mcp.NewToolResultError("steps must be a JSON array of WorkspaceEdit objects: " + err.Error()), nil
 	}
 	if len(rawEdits) == 0 {
 		return mcp.NewToolResultError("steps array is empty — pass at least one WorkspaceEdit"), nil
+	}
+	if len(rawEdits) > overlaySimulationMaxSteps {
+		return mcp.NewToolResultError(fmt.Sprintf("steps exceed limit %d", overlaySimulationMaxSteps)), nil
 	}
 	edits := make([]lsp.WorkspaceEdit, 0, len(rawEdits))
 	for i, raw := range rawEdits {
@@ -176,6 +185,9 @@ func (s *Server) handleSimulateChain(ctx context.Context, req mcp.CallToolReques
 
 	sim, simErr := s.buildSimulation(ctx, edits, inherit)
 	if simErr != nil {
+		if ctxErr := requestContextError(ctx, simErr); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return mcp.NewToolResultError(simErr.Error()), nil
 	}
 
@@ -301,13 +313,36 @@ type simulationStep struct {
 // contents from prior steps' snapshots and never persists them
 // unless the caller asks for `keep`.
 func (s *Server) buildSimulation(ctx context.Context, edits []lsp.WorkspaceEdit, inherit bool) (*simulation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(edits) > overlaySimulationMaxSteps {
+		return nil, fmt.Errorf("simulation steps exceed limit %d", overlaySimulationMaxSteps)
+	}
 	sim := &simulation{}
 	current := map[string]daemon.OverlayFile{}
 
 	if inherit {
 		if sessID := SessionIDFromContext(ctx); sessID != "" && s.overlays != nil && s.overlays.Has(sessID) {
-			_, files, err := s.overlays.SnapshotFor(sessID)
-			if err == nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			_, files, err := s.overlays.SnapshotForBounded(
+				sessID,
+				overlayRequestSnapshotMaxFiles,
+				overlayRequestSnapshotMaxBytes,
+			)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if err != nil {
+				if !errors.Is(err, daemon.ErrSessionNotFound) {
+					return nil, fmt.Errorf("inherit overlay snapshot: %w", err)
+				}
+			} else {
 				for _, f := range files {
 					current[filepath.Clean(f.Path)] = f
 				}
@@ -392,7 +427,11 @@ func (s *Server) buildSimulation(ctx context.Context, edits []lsp.WorkspaceEdit,
 		sort.Strings(step.deletedFiles)
 		sort.Strings(step.missingFiles)
 
-		// 2. Snapshot the overlay state at this step.
+		// 2. Snapshot the overlay state at this step. Reject an oversized map
+		// before allocating or retaining its sorted slice representation.
+		if err := validateOverlayBuildMapEnvelope(current); err != nil {
+			return nil, fmt.Errorf("step %d: overlay snapshot: %w", stepIdx, err)
+		}
 		snap := make([]daemon.OverlayFile, 0, len(current))
 		for _, f := range current {
 			snap = append(snap, f)
@@ -403,7 +442,7 @@ func (s *Server) buildSimulation(ctx context.Context, edits []lsp.WorkspaceEdit,
 		// 3. Compute graph impact for this step: build the layer,
 		//    diff vs base, surface broken callers / implementors,
 		//    rank test targets.
-		layer, _, layerErr := s.constructOverlayLayer(snap)
+		layer, _, layerErr := s.constructOverlayLayer(ctx, snap)
 		if layerErr != nil {
 			return nil, fmt.Errorf("step %d: overlay parse: %w", stepIdx, layerErr)
 		}
@@ -1117,6 +1156,9 @@ func (s *Server) persistSimulationOverlay(ctx context.Context, sim *simulation) 
 // `{uri: [TextEdit,...]}`) or `documentChanges` (modern form) — both
 // are valid LSP shapes.
 func parseWorkspaceEdit(raw string) (lsp.WorkspaceEdit, error) {
+	if len(raw) > overlaySimulationInputMaxBytes {
+		return lsp.WorkspaceEdit{}, fmt.Errorf("workspace_edit input exceeds limit %d bytes", overlaySimulationInputMaxBytes)
+	}
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return lsp.WorkspaceEdit{}, errors.New("workspace_edit is empty")
