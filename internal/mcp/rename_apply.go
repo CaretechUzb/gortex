@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/indexer"
 )
 
 // renameEdit is one planned single-line replacement in a coordinated rename.
@@ -45,6 +46,10 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 	}
 
 	file := s.graphPathSpelling(relPath)
+	owner, relPath := s.indexerForRel(file)
+	if owner == nil || relPath == "" {
+		return nil
+	}
 	if indexed := s.engineFor(ctx).GetFileSymbols(file); indexed != nil && indexed.TotalNodes > 0 {
 		return nil
 	}
@@ -53,7 +58,7 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 	if err != nil {
 		return nil
 	}
-	extracted, err := s.indexer.ExtractSource(ctx, relPath, content)
+	extracted, err := owner.ExtractSource(ctx, relPath, content)
 	if err != nil || extracted == nil {
 		return nil
 	}
@@ -77,7 +82,7 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 	}
 
 	oldLine, newLine, ok := s.verifiedDeclarationRename(
-		ctx, relPath, content, declarationLine, requestedSymbol, declarationName, newName,
+		ctx, owner, relPath, content, declarationLine, requestedSymbol, declarationName, newName,
 	)
 	if !ok {
 		return nil
@@ -129,6 +134,7 @@ const (
 // rather than at its name.
 func (s *Server) verifiedDeclarationRename(
 	ctx context.Context,
+	owner *indexer.Indexer,
 	relPath string,
 	content []byte,
 	declarationLine int,
@@ -175,7 +181,7 @@ func (s *Server) verifiedDeclarationRename(
 		candidateLines[declarationLine-1] = candidateLine
 		candidateContent := []byte(strings.Join(candidateLines, ""))
 
-		candidate, err := s.indexer.ExtractSource(ctx, relPath, candidateContent)
+		candidate, err := owner.ExtractSource(ctx, relPath, candidateContent)
 		if err == nil && candidate != nil {
 			originalPresent := false
 			expectedAtDeclaration := 0

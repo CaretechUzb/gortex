@@ -14,10 +14,12 @@ import (
 // interactive recovery must not turn one MCP request into an unbounded parse.
 const maxAdHocExtractSourceBytes = 1 << 20 // 1 MiB
 
-// ExtractSource parses caller-owned bytes through the indexer's normal
-// admission, minified-content, timeout, panic-recovery, and optional
-// crash-isolation path without mutating graph state. The caller owns the
-// returned result and must call ReleaseTree when it is no longer needed.
+// ExtractSource parses caller-owned bytes through bounded admission,
+// minified-content, timeout, panic-recovery, and optional crash isolation
+// without mutating graph state. Preparation must preserve raw byte and line
+// coordinates; configured command transforms are refused because they may
+// synthesize declarations that cannot safely anchor an edit of the raw file.
+// The caller owns the result and must call ReleaseTree when finished.
 func (idx *Indexer) ExtractSource(ctx context.Context, filePath string, src []byte) (*parser.ExtractionResult, error) {
 	if idx == nil || idx.registry == nil {
 		return nil, fmt.Errorf("indexer source extraction is unavailable")
@@ -36,7 +38,15 @@ func (idx *Indexer) ExtractSource(ctx context.Context, filePath string, src []by
 		return nil, fmt.Errorf("source exceeds bounded extraction limit (%d bytes)", limit)
 	}
 
-	language, ok := idx.registry.DetectLanguageContent(filePath, src)
+	path := filePath
+	if !filepath.IsAbs(path) && idx.rootPath != "" {
+		path = filepath.Join(idx.rootPath, filepath.FromSlash(filePath))
+	}
+	prepared, err := idx.transforms.prepareCoordinateStable(path, src)
+	if err != nil {
+		return nil, fmt.Errorf("coordinate-stable source preparation: %w", err)
+	}
+	language, ok := idx.effectiveLanguage(path, prepared)
 	if !ok {
 		return nil, fmt.Errorf("unsupported source language for %s", filePath)
 	}
@@ -44,7 +54,10 @@ func (idx *Indexer) ExtractSource(ctx context.Context, filePath string, src []by
 	if !ok {
 		return nil, fmt.Errorf("no extractor registered for %s", language)
 	}
-	prepared := parser.ApplyPreParse(extractor, src)
+	prepared = parser.ApplyPreParse(extractor, prepared)
+	if !sameSourceCoordinates(src, prepared) {
+		return nil, fmt.Errorf("extractor pre-parse rewrite does not preserve source coordinates")
+	}
 	if int64(len(prepared)) > limit {
 		return nil, fmt.Errorf("prepared source exceeds bounded extraction limit (%d bytes)", limit)
 	}
@@ -55,12 +68,16 @@ func (idx *Indexer) ExtractSource(ctx context.Context, filePath string, src []by
 		pool, quarantine = idx.sharedParsePool()
 	}
 	nativeAdmission := newNativeParseExtractionAdmission(0, nil, idx.nativeParseAdmission.Load())
-	path := filePath
-	if !filepath.IsAbs(path) && idx.rootPath != "" {
-		path = filepath.Join(idx.rootPath, filepath.FromSlash(filePath))
+	rawLease, err := acquireParseAdmission(
+		ctx, int64(len(prepared)), 0, nil, idx.parseAdmission.Load(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("source admission: %w", err)
 	}
-	result, skipped, err := idx.extractFileCtx(
-		ctx, nativeAdmission, pool, quarantine,
+	defer rawLease.Release()
+
+	result, skipped, err := idx.extractFileCtxWithRawLease(
+		ctx, nativeAdmission, rawLease, pool, quarantine,
 		path, filePath, language, extractor, prepared,
 	)
 	if err != nil {
