@@ -7,6 +7,8 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/analysis"
 )
 
 func TestVerdictEscalation(t *testing.T) {
@@ -51,15 +53,162 @@ func TestIsConfigFile(t *testing.T) {
 }
 
 func TestBuildVerificationCommand(t *testing.T) {
-	p := &prediction{
-		touchedFiles: []string{"internal/svc/svc.go"},
-		impact:       nil,
+	tests := []struct {
+		name        string
+		prediction  *prediction
+		wantCommand string
+		wantErr     string
+	}{
+		{
+			name: "repo-relative Go file",
+			prediction: &prediction{
+				touchedFiles: []string{"internal/svc/svc.go"},
+			},
+			wantCommand: "go build ./internal/svc/... && go test -race ./internal/svc/...",
+		},
+		{
+			name: "graph-qualified Go file",
+			prediction: &prediction{
+				touchedFiles: []string{"gortex/internal/mcp/change_contract.go"},
+				verificationFiles: []verificationFile{{
+					repoPrefix: "gortex",
+					path:       "internal/mcp/change_contract.go",
+				}},
+			},
+			wantCommand: "go build ./internal/mcp/... && go test -race ./internal/mcp/...",
+		},
+		{
+			name: "graph-qualified Windows path",
+			prediction: &prediction{
+				touchedFiles: []string{`gortex\internal\mcp\change_contract.go`},
+				verificationFiles: []verificationFile{{
+					repoPrefix: "gortex",
+					path:       `internal\mcp\change_contract.go`,
+				}},
+			},
+			wantCommand: "go build ./internal/mcp/... && go test -race ./internal/mcp/...",
+		},
+		{
+			name: "covering test path",
+			prediction: &prediction{
+				touchedFiles: []string{"gortex/internal/mcp/change_contract.go"},
+				repoPrefixes: []string{"gortex"},
+				impact: &analysis.ImpactResult{
+					TestFiles: []string{"gortex/internal/mcp/change_contract_test.go"},
+				},
+			},
+			wantCommand: "go test -race ./internal/mcp",
+		},
+		{
+			name: "cross-repo impact keeps source repository command",
+			prediction: &prediction{
+				touchedFiles: []string{"internal/mcp/change_contract.go"},
+				repoPrefixes: []string{"gortex"},
+				impact: &analysis.ImpactResult{
+					ByRepo: map[string][]analysis.ImpactEntry{
+						"gortex":       {{RepoPrefix: "gortex"}},
+						"gortex-cloud": {{RepoPrefix: "gortex-cloud"}},
+					},
+					TestFiles: []string{
+						"gortex/internal/mcp/change_contract_test.go",
+						"gortex-cloud/internal/client/client_test.go",
+					},
+				},
+			},
+			wantCommand: "go test -race ./internal/mcp",
+		},
+		{
+			name: "repo-relative path starts with repository prefix",
+			prediction: &prediction{
+				touchedFiles: []string{"web/handler/handler.go"},
+				repoPrefixes: []string{"web"},
+			},
+			wantCommand: "go build ./web/handler/... && go test -race ./web/handler/...",
+		},
+		{
+			name: "multiple repositories",
+			prediction: &prediction{
+				touchedFiles: []string{"api/internal/api.go", "worker/internal/worker.go"},
+				verificationFiles: []verificationFile{
+					{repoPrefix: "api", path: "internal/api.go"},
+					{repoPrefix: "worker", path: "internal/worker.go"},
+				},
+			},
+			wantErr: "cannot synthesize one verification command for multiple repositories: api, worker",
+		},
+		{
+			name:        "documentation only",
+			prediction:  &prediction{touchedFiles: []string{"docs/guide.md"}},
+			wantCommand: "",
+		},
 	}
-	cmd := buildVerificationCommand(p)
-	require.Contains(t, cmd, "go ")
 
-	p2 := &prediction{touchedFiles: []string{"docs/guide.md"}}
-	require.Equal(t, "", buildVerificationCommand(p2))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := buildVerificationCommand(tt.prediction)
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantCommand, cmd)
+		})
+	}
+}
+
+func TestAssembleEnvelopeKeepsSingleRepoVerificationWithCrossRepoImpact(t *testing.T) {
+	srv := &Server{}
+	p := &prediction{
+		source:       "diff",
+		touchedFiles: []string{"internal/mcp/change_contract.go"},
+		repoPrefixes: []string{"gortex"},
+		impact: &analysis.ImpactResult{
+			ByRepo: map[string][]analysis.ImpactEntry{
+				"gortex":       {{RepoPrefix: "gortex"}},
+				"gortex-cloud": {{RepoPrefix: "gortex-cloud"}},
+			},
+			TestFiles: []string{
+				"gortex/internal/mcp/change_contract_test.go",
+				"gortex-cloud/internal/client/client_test.go",
+			},
+		},
+	}
+
+	env := srv.assembleEnvelope(p, nil)
+	require.Equal(t, verdictAllow, env.Verdict)
+	require.Equal(t, "go test -race ./internal/mcp", env.VerificationCommand)
+	require.Contains(t, env.StopCondition, "`go test -race ./internal/mcp` exits 0")
+	for _, reason := range env.Reasons {
+		require.NotEqual(t, "verification", reason.Family)
+	}
+}
+
+func TestAssembleEnvelopeReportsMultiRepoVerificationRefusal(t *testing.T) {
+	srv := &Server{}
+	p := &prediction{
+		source:       "symbols",
+		touchedFiles: []string{"api/internal/api.go", "worker/internal/worker.go"},
+		verificationFiles: []verificationFile{
+			{repoPrefix: "api", path: "internal/api.go"},
+			{repoPrefix: "worker", path: "internal/worker.go"},
+		},
+	}
+
+	env := srv.assembleEnvelope(p, nil)
+	require.Equal(t, verdictWarn, env.Verdict)
+	require.Empty(t, env.VerificationCommand)
+
+	var verificationReason *changeReason
+	for i := range env.Reasons {
+		if env.Reasons[i].Family == "verification" {
+			verificationReason = &env.Reasons[i]
+			break
+		}
+	}
+	require.NotNil(t, verificationReason)
+	require.Equal(t, "cannot synthesize one verification command for multiple repositories: api, worker", verificationReason.Message)
+	require.Contains(t, env.StopCondition, "repository-scoped verification commands")
+	require.Contains(t, env.StopCondition, "all commands exit 0")
 }
 
 func TestChangeContractSymbolSource(t *testing.T) {
