@@ -31,6 +31,7 @@ const plannerStatsAnalysisLimit = 1000
 const plannerStatsIndexQuery = `
 WITH critical(name) AS (VALUES
   ('edges_by_from_line'),
+  ('edges_by_from_line_kind'),
   ('edges_by_kind'),
   ('nodes_by_file'),
   ('nodes_by_kind'),
@@ -110,14 +111,21 @@ func quoteSQLiteIdentifier(name string) string {
 func healPlannerStats(db *sql.DB) {
 	var hasTable bool
 	// sqlite_stat1 does not exist until the first ANALYZE, so probe the catalog
-	// before the table. A sidecar-only stat row is not enough: nodes_by_file is
-	// the sentinel for the graph-index refresh that protects the hottest plan.
+	// before the table. Warm stores with edges must have both the original hot
+	// file stat and the bounded exact-site stat; Open may have just created the
+	// latter index on a pre-upgrade database. Empty edge tables emit no sibling
+	// stat and need no edge-plan repair.
 	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1')`).Scan(&hasTable); err != nil {
 		return
 	}
 	if hasTable {
 		var populated bool
-		if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_stat1 WHERE idx = 'nodes_by_file')`).Scan(&populated); err == nil && populated {
+		if err := db.QueryRow(`
+SELECT EXISTS(SELECT 1 FROM sqlite_stat1 WHERE idx = 'nodes_by_file')
+   AND (
+       NOT EXISTS(SELECT 1 FROM edges LIMIT 1)
+       OR EXISTS(SELECT 1 FROM sqlite_stat1 WHERE idx = 'edges_by_from_line_kind')
+   )`).Scan(&populated); err == nil && populated {
 			return
 		}
 	}
