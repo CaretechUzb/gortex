@@ -122,7 +122,7 @@ func (s *Server) handleAnalyzeNamed(ctx context.Context, req mcp.CallToolRequest
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	fileSymbols := s.buildFileSymbolIndex(targets)
+	fileSymbols := s.buildFileSymbolIndexForTargetsContext(ctx, targets)
 	lookup := func(graphPath string, line int) (string, string) {
 		idx := fileSymbols[graphPath]
 		if idx == nil {

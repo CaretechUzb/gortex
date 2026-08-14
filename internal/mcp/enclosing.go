@@ -16,44 +16,31 @@ import (
 // to answer "which symbol contains this?" -- they share this code so
 // the answer stays consistent.
 
-// buildFileSymbolIndex returns one fileSymbolIndex per Target's graph
-// path. Building all indexes up-front (instead of lazily on first
-// match) is fine because the cost is one graph pass per file's
-// symbol list, and the alternative — locking inside the worker pool
-// hot path — is worse for parallel runs.
-func (s *Server) buildFileSymbolIndex(targets []astquery.Target) map[string]*fileSymbolIndex {
-	if s.graph == nil {
-		return nil
-	}
-	wanted := make(map[string]struct{}, len(targets))
-	for _, t := range targets {
-		wanted[t.GraphPath] = struct{}{}
-	}
-	out := make(map[string]*fileSymbolIndex, len(wanted))
-	for _, n := range s.graph.AllNodes() {
-		if _, ok := wanted[n.FilePath]; !ok {
+// buildFileSymbolIndexForTargetsContext builds bounded enclosing-symbol
+// indexes for AST targets in their first-seen graph-path order. AST targets
+// describe on-disk files selected from the durable graph, so this path reads
+// the base store explicitly even when the request carries an editor overlay.
+// Duplicate grammar targets (for example TypeScript + TSX) consume one file
+// projection and all calls share the request-wide localization budget.
+func (s *Server) buildFileSymbolIndexForTargetsContext(
+	ctx context.Context,
+	targets []astquery.Target,
+) map[string]*fileSymbolIndex {
+	paths := make([]string, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if target.GraphPath == "" {
 			continue
 		}
-		// Functions, methods, closures, and macros are meaningful
-		// "enclosing scope" candidates. Macro nodes are declaration-backed and
-		// already carry exact source ranges; token-tree contents are never parsed
-		// as declarations here. KindType (struct/class) is included too so a
-		// class-body match still gets a symbol identity.
-		switch n.Kind {
-		case graph.KindFunction, graph.KindMethod, graph.KindClosure, graph.KindMacro,
-			graph.KindType, graph.KindInterface:
-			idx := out[n.FilePath]
-			if idx == nil {
-				idx = &fileSymbolIndex{}
-				out[n.FilePath] = idx
-			}
-			idx.add(n)
+		if _, duplicate := seen[target.GraphPath]; duplicate {
+			continue
 		}
+		seen[target.GraphPath] = struct{}{}
+		paths = append(paths, target.GraphPath)
 	}
-	for _, idx := range out {
-		idx.finalise()
-	}
-	return out
+	return s.buildFileSymbolIndexForOrderedPathsScopedReaderContext(
+		ctx, s.graph, paths, query.QueryOptions{},
+	)
 }
 
 // fileSymbolIndex is the per-file lookup used by the SymbolLookup
@@ -254,10 +241,20 @@ func (s *Server) buildFileSymbolIndexForOrderedPathsScopedContext(
 	paths []string,
 	opts query.QueryOptions,
 ) map[string]*fileSymbolIndex {
+	return s.buildFileSymbolIndexForOrderedPathsScopedReaderContext(
+		ctx, s.readerFor(ctx), paths, opts,
+	)
+}
+
+func (s *Server) buildFileSymbolIndexForOrderedPathsScopedReaderContext(
+	ctx context.Context,
+	reader graph.Reader,
+	paths []string,
+	opts query.QueryOptions,
+) map[string]*fileSymbolIndex {
 	if len(paths) == 0 {
 		return nil
 	}
-	reader := s.readerFor(ctx)
 	bounded, ok := reader.(graph.BoundedFileNodeReader)
 	if reader == nil || !ok || ctx.Err() != nil {
 		return saturatedFileSymbolIndexes(paths)

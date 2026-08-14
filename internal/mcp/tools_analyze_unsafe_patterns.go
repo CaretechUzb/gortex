@@ -50,9 +50,9 @@ type unsafePatternSummary struct {
 // Filters (all optional):
 //   - language     — comma-separated subset (rust,python,javascript,typescript,go).
 //   - detector     — comma-separated subset (must be a member of
-//                    astquery.UnsafePatternDetectors). Lets the agent
-//                    narrow the bundle without falling back to
-//                    individual search_ast calls.
+//     astquery.UnsafePatternDetectors). Lets the agent
+//     narrow the bundle without falling back to
+//     individual search_ast calls.
 //   - severity     — comma-separated subset (error,warning,info).
 //   - path_prefix  — keep matches whose file path starts with this.
 //   - limit        — cap rows (default 200; matches error_surface's UX).
@@ -80,7 +80,7 @@ func (s *Server) handleAnalyzeUnsafePatterns(ctx context.Context, req mcp.CallTo
 
 	// Per-file enclosing-symbol index — shared across detectors so
 	// every row gets symbol enrichment without re-building.
-	fileSymbols := s.buildFileSymbolIndex(targets)
+	fileSymbols := s.buildFileSymbolIndexForTargetsContext(ctx, targets)
 	lookup := func(graphPath string, line int) (string, string) {
 		idx := fileSymbols[graphPath]
 		if idx == nil {

@@ -102,7 +102,7 @@ func (s *Server) handleSearchAST(ctx context.Context, req mcp.CallToolRequest) (
 	// lookup is amortised by caching the per-file index on first
 	// hit. The graph walk is single-pass so even big indexes
 	// pay it once per `search_ast` call.
-	fileSymbols := s.buildFileSymbolIndex(targets)
+	fileSymbols := s.buildFileSymbolIndexForTargetsContext(ctx, targets)
 	lookup := func(graphPath string, line int) (string, string) {
 		idx := fileSymbols[graphPath]
 		if idx == nil {

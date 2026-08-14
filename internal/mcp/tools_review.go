@@ -641,7 +641,7 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 		return nil
 	}
 
-	fileSymbols := s.buildFileSymbolIndex(targets)
+	fileSymbols := s.buildFileSymbolIndexForTargetsContext(ctx, targets)
 	lookup := func(graphPath string, line int) (string, string) {
 		idx := fileSymbols[graphPath]
 		if idx == nil {

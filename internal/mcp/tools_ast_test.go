@@ -85,6 +85,47 @@ func F() {
 	}
 }
 
+func TestSearchASTUsesBoundedEnclosingProjection(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	abs := writeTempGoFile(t, "bounded.go", `package x
+
+func Bounded() {
+	panic("boom")
+}
+`)
+	backing := graph.New()
+	backing.AddNode(&graph.Node{
+		ID: abs, Kind: graph.KindFile, Name: abs,
+		FilePath: abs, Language: "go", StartLine: 1, EndLine: 5,
+	})
+	owner := &graph.Node{
+		ID: abs + "::Bounded", Kind: graph.KindFunction, Name: "Bounded",
+		FilePath: abs, StartLine: 3, EndLine: 5,
+	}
+	backing.AddNode(owner)
+	probe := &astTargetBoundedStore{Store: backing}
+	probe.read = func(ctx context.Context, path string, scope graph.LocalizationNodeScope, limit int) (graph.BoundedNodeProjection, error) {
+		return backing.FindFileNodesBounded(ctx, path, scope, limit)
+	}
+	srv.graph = probe
+
+	out := callSearchAST(t, srv, map[string]any{
+		"pattern":  `((call_expression function: (identifier) @fn) @match (#eq? @fn "panic"))`,
+		"language": "go",
+	})
+
+	if got, _ := out["total"].(float64); got != 1 {
+		t.Fatalf("expected 1 bounded match, got %v\n%v", got, out)
+	}
+	match := out["matches"].([]any)[0].(map[string]any)
+	if match["symbol_id"] != owner.ID || match["symbol_name"] != owner.Name {
+		t.Fatalf("bounded handler enrichment = %#v, want %s/%s", match, owner.ID, owner.Name)
+	}
+	if len(probe.calls) != 1 || probe.calls[0].path != abs {
+		t.Fatalf("bounded handler calls = %#v, want one read of %q", probe.calls, abs)
+	}
+}
+
 func TestSearchAST_BundledDetector_HardcodedSecret(t *testing.T) {
 	srv, _ := setupTestServer(t)
 	abs := writeTempGoFile(t, "creds.go", `package x
