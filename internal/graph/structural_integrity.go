@@ -335,18 +335,7 @@ func (m *StructuralIntegrityMeter) Record(event StructuralIntegrityEvent) {
 		m.sampleOverflow++
 		return
 	}
-	m.samples[sampleKey] = StructuralIntegritySample{
-		Direction: event.Direction,
-		Path:      event.Path,
-		Repo:      event.Repo,
-		Kind:      event.Kind,
-		Reason:    event.Reason,
-		Origin:    event.Origin,
-		From:      event.From,
-		To:        event.To,
-		FilePath:  event.FilePath,
-		Line:      event.Line,
-	}
+	m.samples[sampleKey] = StructuralIntegritySample(event)
 }
 
 func (m *StructuralIntegrityMeter) Snapshot(opts StructuralIntegritySnapshotOptions) StructuralIntegritySnapshot {

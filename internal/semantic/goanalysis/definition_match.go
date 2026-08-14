@@ -248,9 +248,9 @@ func matchRepoDefinitionNode(nodes []*graph.Node, position token.Position, ident
 		owner := goDefinitionNodeOwner(node)
 		ownerRank := 0
 		if expectedOwner != "" {
-			switch {
-			case owner == expectedOwner:
-			case owner == "":
+			switch owner {
+			case expectedOwner:
+			case "":
 				ownerRank = 1
 			default:
 				continue

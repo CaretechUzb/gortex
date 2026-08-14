@@ -5675,17 +5675,6 @@ func (idx *Indexer) incrementalPathOwned(absPath string) bool {
 	return ok
 }
 
-func (idx *Indexer) incrementalReindexPaths(
-	root string,
-	paths []string,
-	detectDeletions bool,
-	markerBatches ...*reparsePendingEnrichmentBatch,
-) (*IndexResult, error) {
-	return idx.incrementalReindexPathsMode(root, paths, incrementalPathMode{
-		detectDeletions: detectDeletions,
-	}, markerBatches...)
-}
-
 func (idx *Indexer) incrementalReindexPathsMode(
 	root string,
 	paths []string,

@@ -79,10 +79,8 @@ func (t *Tracker) End(kind string) {
 	}
 	kind = normalizeKind(kind)
 	t.gate.RLock()
-	remaining := t.active.Add(-1)
-	if remaining < 0 {
+	if t.active.Add(-1) < 0 {
 		t.active.Store(0)
-		remaining = 0
 	}
 	t.epoch.Add(1)
 	t.lastNano.Store(time.Now().UnixNano())
