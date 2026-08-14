@@ -38,18 +38,19 @@ func TestRenameSymbol_UnindexedRecovery(t *testing.T) {
 		require.Equal(t, false, recovery["semantic_rename_complete"])
 		require.Equal(t, false, recovery["written"])
 		require.Equal(t, dryRun, recovery["dry_run"])
-		require.EqualValues(t, 2, recovery["occurrences"])
-		require.Contains(t, recovery["warning"], "unavailable to the semantic graph")
+		require.EqualValues(t, 1, recovery["occurrences"])
+		require.Contains(t, recovery["warning"], "Only the parsed declaration is anchored")
 
 		fallback := recovery["safe_fallback"].(map[string]any)
 		require.Equal(t, "edit", fallback["tool"])
-		require.Equal(t, "file", fallback["operation"])
-		require.Equal(t, "late.go", fallback["target"].(map[string]any)["file"])
-		require.Equal(t, "Late", fallback["match"])
-		require.Equal(t, "Renamed", fallback["replacement"])
-		require.Equal(t, true, fallback["options"].(map[string]any)["replace_all"])
-		guard := fallback["guard"].(map[string]any)
-		require.EqualValues(t, 2, guard["expected_occurrences"])
+		require.Equal(t, "declaration_only", fallback["scope"])
+		request := fallback["request"].(map[string]any)
+		require.Equal(t, "file", request["operation"])
+		require.Equal(t, "late.go", request["target"].(map[string]any)["file"])
+		require.Equal(t, "func Late() {}\n", request["match"])
+		require.Equal(t, "func Renamed() {}\n", request["replacement"])
+		guard := request["guard"].(map[string]any)
+		require.EqualValues(t, 1, guard["expected_occurrences"])
 		require.NotEmpty(t, guard["base_sha"])
 		require.NotEmpty(t, fallback["guidance"])
 
@@ -75,6 +76,49 @@ func TestRenameSymbol_IgnoredRecovery(t *testing.T) {
 	resp := decodeRenameErrorResp(t, res)
 	require.Equal(t, "symbol_not_indexed", resp["error_code"])
 	require.EqualValues(t, 1, resp["data"].(map[string]any)["occurrences"])
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, source, string(got))
+}
+
+func TestRenameSymbol_RecoveryExecutesDeclarationOnly(t *testing.T) {
+	srv, dir := setupRenameServer(t, renameTargetSrc, renameCallerSrc)
+	const source = "package main\n\ntype Server struct{}\nfunc (s *Server) Run() {}\nfunc Use(s *Server) { s.Run() }\n"
+	path := filepath.Join(dir, "late.go")
+	require.NoError(t, os.WriteFile(path, []byte(source), 0o644))
+
+	res := callToolByName(t, srv, context.Background(), "rename_symbol", map[string]any{
+		"id": "late.go::Server.Run", "new_name": "Execute",
+	})
+	resp := decodeRenameErrorResp(t, res)
+	recovery := resp["data"].(map[string]any)
+	require.Equal(t, "Run", recovery["declaration_name"])
+	fallback := recovery["safe_fallback"].(map[string]any)
+	request := fallback["request"].(map[string]any)
+
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "edit"
+	req.Params.Arguments = request
+	editResult, err := srv.handleFacade(context.Background(), "edit", req)
+	require.NoError(t, err)
+	require.False(t, editResult.IsError, toolResultText(editResult))
+
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "package main\n\ntype Server struct{}\nfunc (s *Server) Execute() {}\nfunc Use(s *Server) { s.Run() }\n", string(got))
+}
+
+func TestRenameSymbol_SubIdentifierIsNotADeclaration(t *testing.T) {
+	srv, dir := setupRenameServer(t, renameTargetSrc, renameCallerSrc)
+	const source = "const foo$bar = 1;\n"
+	path := filepath.Join(dir, "late.js")
+	require.NoError(t, os.WriteFile(path, []byte(source), 0o644))
+
+	res := callToolByName(t, srv, context.Background(), "rename_symbol", map[string]any{
+		"id": "late.js::foo", "new_name": "renamed",
+	})
+	require.True(t, res.IsError)
+	require.Contains(t, toolResultText(res), "symbol not found: late.js::foo")
 	got, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, source, string(got))

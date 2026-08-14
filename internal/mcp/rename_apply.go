@@ -24,9 +24,9 @@ type renameEdit struct {
 }
 
 // unindexedRenameRecovery distinguishes an invalid symbol ID from an existing
-// file that semantic rename cannot see. It returns guidance only: without graph
-// usage edges, automatically changing even one occurrence would imply a
-// completeness guarantee the rename cannot make.
+// file that semantic rename cannot see. When the configured language extractor
+// identifies exactly one requested declaration, it returns a guarded exact-line
+// edit for that declaration only. References remain outside the recovery scope.
 func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string, dryRun bool) map[string]any {
 	filePart, requestedSymbol, ok := strings.Cut(id, "::")
 	if !ok || strings.TrimSpace(filePart) == "" || strings.TrimSpace(requestedSymbol) == "" {
@@ -51,38 +51,73 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 	if err != nil {
 		return nil
 	}
-	occurrences := countIdentifierOccurrences(string(content), requestedSymbol)
-	if occurrences == 0 {
+	extracted, err := s.indexer.ExtractSource(relPath, content)
+	if err != nil || extracted == nil {
 		return nil
 	}
+	defer extracted.ReleaseTree()
+
+	var declarationName string
+	var declarationLine int
+	var declarationColumn int
+	for _, node := range extracted.Nodes {
+		_, suffix, hasSuffix := strings.Cut(node.ID, "::")
+		if !hasSuffix || suffix != requestedSymbol {
+			continue
+		}
+		if declarationName != "" {
+			return nil
+		}
+		declarationName = node.Name
+		declarationLine = node.StartLine
+		declarationColumn = node.StartColumn
+	}
+	if declarationName == "" || declarationLine <= 0 {
+		return nil
+	}
+
+	lines := splitLinesKeepEnds(string(content))
+	if declarationLine > len(lines) {
+		return nil
+	}
+	oldLine := lines[declarationLine-1]
+	body, term := splitLineTerminator(oldLine)
+	nameOffset := indexIdentifier(body, declarationName, declarationColumn)
+	if nameOffset < 0 {
+		return nil
+	}
+	newLine := body[:nameOffset] + newName + body[nameOffset+len(declarationName):] + term
 
 	return map[string]any{
 		"status":                   "refused",
 		"symbol_id":                id,
 		"requested_symbol":         requestedSymbol,
+		"declaration_name":         declarationName,
 		"new_name":                 newName,
 		"file":                     file,
-		"occurrences":              occurrences,
+		"occurrences":              1,
 		"semantic_rename_complete": false,
 		"written":                  false,
 		"dry_run":                  dryRun,
 		"safe_fallback": map[string]any{
-			"tool":        "edit",
-			"operation":   "file",
-			"target":      map[string]any{"file": file},
-			"match":       requestedSymbol,
-			"replacement": newName,
-			"options":     map[string]any{"replace_all": true},
-			"guard": map[string]any{
-				"expected_occurrences": occurrences,
-				"base_sha":             gitBlobSHA(content),
+			"tool": "edit",
+			"request": map[string]any{
+				"operation":   "file",
+				"target":      map[string]any{"file": file},
+				"match":       oldLine,
+				"replacement": newLine,
+				"guard": map[string]any{
+					"expected_occurrences": 1,
+					"base_sha":             gitBlobSHA(content),
+				},
 			},
+			"scope": "declaration_only",
 			"guidance": []string{
-				"Use the explicit file target and keep the replacement bounded to whole identifiers.",
-				"If the exact edit reports a different raw match count, use narrower contextual replacements.",
+				"Apply this exact contextual edit only after reviewing the declaration line.",
+				"Update same-file and cross-file references separately; completeness is not proven.",
 			},
 		},
-		"warning": "Cross-file references are not proven because this symbol is unavailable to the semantic graph. No text was changed.",
+		"warning": "Only the parsed declaration is anchored. Same-file and cross-file references are not proven because this symbol is unavailable to the semantic graph. No text was changed.",
 	}
 }
 
