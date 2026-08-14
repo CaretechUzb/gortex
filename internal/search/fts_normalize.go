@@ -9,8 +9,9 @@ import (
 )
 
 // ftsStemmingEnabled gates the token-normalization pass — stopword
-// removal plus Porter stemming — applied to the full-text-search index
-// and query paths. Default OFF: on the recall fixture stemming trades
+// removal plus Porter stemming — applied to the native symbol FTS index
+// and query paths. Content FTS intentionally keeps raw body tokens.
+// Default OFF: on the recall fixture stemming trades
 // exact-symbol-lookup precision (exact-tier R@5 −3.1pp) for broader
 // recall (R@20 +5.7pp), so it ships as an opt-in rather than quietly
 // reranking every identifier query. Enable it with

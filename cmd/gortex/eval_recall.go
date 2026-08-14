@@ -62,9 +62,9 @@ Rankers:
 
 By default every available ranker runs; narrow with --rankers bm25,rrf.
 
-Without --embeddings, semantic and RRF degrade: semantic reports SKIPPED
-and RRF falls back to BM25 inside HybridBackend.Search. Use --embeddings
-to enable the built-in static (GloVe) provider, or --embeddings-url to
+Without --embeddings, semantic and RRF both report SKIPPED. Use
+--embeddings to enable the built-in static (GloVe) provider, or
+--embeddings-url to
 point at an OpenAI-compatible API (e.g. Ollama).`,
 	RunE: runEvalRecall,
 }

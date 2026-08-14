@@ -233,7 +233,10 @@ joinable._
 symbol-name queries — 3.2× ripgrep's R@5 floor. Enabling Porter
 stemming (`GORTEX_FTS_STEMMING=1`) trades a little exact-tier
 precision for breadth — R@20 +5.7pp, exact-tier R@5 −3.1pp — so it
-ships opt-in. The `semantic` and `rrf` rankers require `--embeddings`
+ships opt-in. The mode is read at process start; on a later restart,
+gortex automatically rebuilds a repository's native symbol FTS when
+its persisted normalization marker differs. The `semantic` and `rrf`
+rankers require `--embeddings`
 and are omitted here; the `graph` ranker scores only graph-traversal
 fixtures.
 
