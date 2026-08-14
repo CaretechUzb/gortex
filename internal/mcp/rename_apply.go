@@ -59,7 +59,6 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 
 	var declarationName string
 	var declarationLine int
-	var declarationColumn int
 	for _, node := range extracted.Nodes {
 		_, suffix, hasSuffix := strings.Cut(node.ID, "::")
 		if !hasSuffix || suffix != requestedSymbol {
@@ -70,23 +69,17 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 		}
 		declarationName = node.Name
 		declarationLine = node.StartLine
-		declarationColumn = node.StartColumn
 	}
 	if declarationName == "" || declarationLine <= 0 {
 		return nil
 	}
 
-	lines := splitLinesKeepEnds(string(content))
-	if declarationLine > len(lines) {
+	oldLine, newLine, ok := s.verifiedDeclarationRename(
+		relPath, content, declarationLine, requestedSymbol, declarationName, newName,
+	)
+	if !ok {
 		return nil
 	}
-	oldLine := lines[declarationLine-1]
-	body, term := splitLineTerminator(oldLine)
-	nameOffset := indexIdentifier(body, declarationName, declarationColumn)
-	if nameOffset < 0 {
-		return nil
-	}
-	newLine := body[:nameOffset] + newName + body[nameOffset+len(declarationName):] + term
 
 	return map[string]any{
 		"status":                   "refused",
@@ -119,6 +112,73 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 		},
 		"warning": "Only the parsed declaration is anchored. Same-file and cross-file references are not proven because this symbol is unavailable to the semantic graph. No text was changed.",
 	}
+}
+
+// verifiedDeclarationRename tries each whole-identifier occurrence on the
+// declaration line and reparses the resulting file. It accepts exactly one
+// candidate: the edit must remove the requested symbol ID and create the
+// expected renamed ID on the same declaration line. This avoids relying on
+// optional extractor columns, which may point at the start of the declaration
+// rather than at its name.
+func (s *Server) verifiedDeclarationRename(
+	relPath string,
+	content []byte,
+	declarationLine int,
+	requestedSymbol, declarationName, newName string,
+) (string, string, bool) {
+	lines := splitLinesKeepEnds(string(content))
+	if declarationLine > len(lines) {
+		return "", "", false
+	}
+	oldLine := lines[declarationLine-1]
+	body, term := splitLineTerminator(oldLine)
+
+	if !strings.HasSuffix(requestedSymbol, declarationName) {
+		return "", "", false
+	}
+	expectedSymbol := strings.TrimSuffix(requestedSymbol, declarationName) + newName
+
+	var accepted string
+	for from := 0; ; {
+		nameOffset := indexIdentifier(body, declarationName, from)
+		if nameOffset < 0 {
+			break
+		}
+		candidateLine := body[:nameOffset] + newName + body[nameOffset+len(declarationName):] + term
+		candidateLines := append([]string(nil), lines...)
+		candidateLines[declarationLine-1] = candidateLine
+		candidateContent := []byte(strings.Join(candidateLines, ""))
+
+		candidate, err := s.indexer.ExtractSource(relPath, candidateContent)
+		if err == nil && candidate != nil {
+			originalPresent := false
+			expectedAtDeclaration := 0
+			for _, node := range candidate.Nodes {
+				_, suffix, hasSuffix := strings.Cut(node.ID, "::")
+				if !hasSuffix {
+					continue
+				}
+				if suffix == requestedSymbol {
+					originalPresent = true
+				}
+				if suffix == expectedSymbol && node.StartLine == declarationLine {
+					expectedAtDeclaration++
+				}
+			}
+			candidate.ReleaseTree()
+			if !originalPresent && expectedAtDeclaration == 1 {
+				if accepted != "" {
+					return "", "", false
+				}
+				accepted = candidateLine
+			}
+		}
+		from = nameOffset + 1
+	}
+	if accepted == "" {
+		return "", "", false
+	}
+	return oldLine, accepted, true
 }
 
 // indexIdentifier returns the byte offset of the first whole-identifier

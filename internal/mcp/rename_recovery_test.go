@@ -83,12 +83,12 @@ func TestRenameSymbol_IgnoredRecovery(t *testing.T) {
 
 func TestRenameSymbol_RecoveryExecutesDeclarationOnly(t *testing.T) {
 	srv, dir := setupRenameServer(t, renameTargetSrc, renameCallerSrc)
-	const source = "package main\n\ntype Server struct{}\nfunc (s *Server) Run() {}\nfunc Use(s *Server) { s.Run() }\n"
+	const source = "package main\n\ntype Run struct{}\nfunc (r *Run) Run() {}\nfunc Use(r *Run) { r.Run() }\n"
 	path := filepath.Join(dir, "late.go")
 	require.NoError(t, os.WriteFile(path, []byte(source), 0o644))
 
 	res := callToolByName(t, srv, context.Background(), "rename_symbol", map[string]any{
-		"id": "late.go::Server.Run", "new_name": "Execute",
+		"id": "late.go::Run.Run", "new_name": "Execute",
 	})
 	resp := decodeRenameErrorResp(t, res)
 	recovery := resp["data"].(map[string]any)
@@ -105,7 +105,7 @@ func TestRenameSymbol_RecoveryExecutesDeclarationOnly(t *testing.T) {
 
 	got, err := os.ReadFile(path)
 	require.NoError(t, err)
-	require.Equal(t, "package main\n\ntype Server struct{}\nfunc (s *Server) Execute() {}\nfunc Use(s *Server) { s.Run() }\n", string(got))
+	require.Equal(t, "package main\n\ntype Run struct{}\nfunc (r *Run) Execute() {}\nfunc Use(r *Run) { r.Run() }\n", string(got))
 }
 
 func TestRenameSymbol_SubIdentifierIsNotADeclaration(t *testing.T) {
