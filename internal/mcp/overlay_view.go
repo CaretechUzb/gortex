@@ -32,7 +32,32 @@ const (
 	overlayRequestSnapshotMaxBytes = exploreSourceLiteralOverlayMaxBytes + exploreSourceLiteralOverlayMaxLineBytes
 	overlaySimulationInputMaxBytes = exploreSourceLiteralOverlayMaxBytes
 	overlaySimulationMaxSteps      = 16
+
+	overlayLayerBaseNodesPerFileMax = 1024
+	// BaseNodesMax bounds summaries retained across the layer build. Once the
+	// budget is full, a later file may transiently return one emptiness sentinel.
+	overlayLayerBaseNodesMax       = 4096
+	overlayLayerParsedNodesMax     = 4096
+	overlayLayerParsedEdgesMax     = 16384
+	overlayLayerUnresolvedNamesMax = 1024
 )
+
+type overlayLayerLimitError struct {
+	Resource string
+	Limit    int
+}
+
+func (e *overlayLayerLimitError) Error() string {
+	return fmt.Sprintf("overlay layer %s exceeds limit %d", e.Resource, e.Limit)
+}
+
+type stagedOverlayFile struct {
+	graphPath  string
+	deleted    bool
+	repoPrefix string
+	baseNodes  []*graph.Node
+	result     *parser.ExtractionResult
+}
 
 // overlayRequestSnapshot is the immutable raw-buffer cohort used to build one
 // request's OverlaidView. OverlayFile strings are immutable; retaining this
@@ -463,8 +488,16 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 	if s.graph == nil {
 		return nil, nil, nil
 	}
-	layer := graph.NewOverlayLayer()
-	var coveredPaths []string
+
+	// Stage every bounded read and extraction before constructing the layer.
+	// Extractors may reuse result pointers, so no prefix or graph mutation is
+	// allowed until every file has passed its caps and cancellation checks.
+	baseReader, _ := s.graph.(graph.BoundedFileNodeReader)
+	staged := make([]stagedOverlayFile, 0, len(files))
+	coveredPaths := make([]string, 0, len(files))
+	baseNodeCount := 0
+	parsedNodeCount := 0
+	parsedEdgeCount := 0
 
 	for _, ov := range files {
 		if err := ctx.Err(); err != nil {
@@ -481,11 +514,15 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		coveredPaths = append(coveredPaths, graphPath)
 
 		if ov.Deleted {
-			// Tombstone: hide every base node for this file.
-			for _, n := range s.graph.GetFileNodes(graphPath) {
-				layer.MarkRemoved(n.Name, n.ID)
+			baseNodes, err := readOverlayBaseNodes(ctx, baseReader, graphPath, &baseNodeCount)
+			if err != nil {
+				return nil, nil, err
 			}
-			layer.MarkFile(graphPath, true)
+			staged = append(staged, stagedOverlayFile{
+				graphPath: graphPath,
+				deleted:   true,
+				baseNodes: baseNodes,
+			})
 			continue
 		}
 
@@ -497,7 +534,8 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		if reg == nil {
 			continue
 		}
-		lang, ok := reg.DetectLanguageContent(absPath, []byte(ov.Content))
+		content := []byte(ov.Content)
+		lang, ok := reg.DetectLanguageContent(absPath, content)
 		if !ok {
 			continue
 		}
@@ -514,44 +552,109 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 				relPath = filepath.ToSlash(r)
 			}
 		}
-		result, err := ext.Extract(relPath, []byte(ov.Content))
-		if err != nil {
-			return nil, nil, fmt.Errorf("overlay parse %s: %w", ov.Path, err)
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		result, extractErr := ext.Extract(relPath, content)
+		if result != nil {
+			// Overlay construction never retains parse trees or constant-value
+			// sidecars. Release/clear before every error and cancellation branch.
+			result.ReleaseTree()
+			result.ConstValues = nil
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
-		// Track which base IDs disappear under the overlay so
-		// FindNodesByName / GetInEdges filter them. Build the set
-		// first from base, then mark every base ID that the overlay
-		// did NOT re-emit (by ID equality).
-		baseIDsByName := map[string]map[string]bool{}
-		for _, n := range s.graph.GetFileNodes(graphPath) {
-			set, ok := baseIDsByName[n.Name]
-			if !ok {
-				set = make(map[string]bool)
-				baseIDsByName[n.Name] = set
+		if extractErr != nil {
+			return nil, nil, fmt.Errorf("overlay parse %s: %w", ov.Path, extractErr)
+		}
+		if result == nil {
+			return nil, nil, fmt.Errorf("overlay parse %s: extractor returned nil result", ov.Path)
+		}
+		if result != nil {
+			if len(result.Nodes) > overlayLayerParsedNodesMax-parsedNodeCount {
+				return nil, nil, &overlayLayerLimitError{
+					Resource: "parsed nodes",
+					Limit:    overlayLayerParsedNodesMax,
+				}
 			}
-			set[n.ID] = true
-		}
-		overlayIDsByName := map[string]map[string]bool{}
-		applyRepoPrefixToResult(result, idx.RepoPrefix())
-		layer.MarkFile(graphPath, false)
-		for _, n := range result.Nodes {
-			layer.AddNode(graphPath, n)
-			set, ok := overlayIDsByName[n.Name]
-			if !ok {
-				set = make(map[string]bool)
-				overlayIDsByName[n.Name] = set
+			parsedNodeCount += len(result.Nodes)
+			if len(result.Edges) > overlayLayerParsedEdgesMax-parsedEdgeCount {
+				return nil, nil, &overlayLayerLimitError{
+					Resource: "parsed edges",
+					Limit:    overlayLayerParsedEdgesMax,
+				}
 			}
-			set[n.ID] = true
+			parsedEdgeCount += len(result.Edges)
 		}
-		for _, e := range result.Edges {
-			layer.AddEdge(e)
+		baseNodes, err := readOverlayBaseNodes(ctx, baseReader, graphPath, &baseNodeCount)
+		if err != nil {
+			return nil, nil, err
 		}
-		// Names that existed in base but were not re-emitted by the
-		// overlay (same name, different ID, or absent entirely) get
-		// marked removed so FindNodesByName filters the base hits.
+		staged = append(staged, stagedOverlayFile{
+			graphPath:  graphPath,
+			repoPrefix: idx.RepoPrefix(),
+			baseNodes:  baseNodes,
+			result:     cloneOverlayExtractionResult(result),
+		})
+	}
+
+	if len(coveredPaths) == 0 {
+		return nil, nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	sort.Strings(coveredPaths)
+
+	layer := graph.NewOverlayLayer()
+	for index, file := range staged {
+		if index&15 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+		}
+		if file.deleted {
+			for _, node := range file.baseNodes {
+				layer.MarkRemoved(node.Name, node.ID)
+			}
+			layer.MarkFile(file.graphPath, true)
+			continue
+		}
+
+		// The staged result is an owned, unprefixed clone captured before the
+		// next Extract call. Prefix it only after the full cohort preflight.
+		result := file.result
+		applyRepoPrefixToResult(result, file.repoPrefix)
+
+		baseIDsByName := make(map[string]map[string]bool)
+		for _, node := range file.baseNodes {
+			set := baseIDsByName[node.Name]
+			if set == nil {
+				set = make(map[string]bool)
+				baseIDsByName[node.Name] = set
+			}
+			set[node.ID] = true
+		}
+		overlayIDsByName := make(map[string]map[string]bool)
+		layer.MarkFile(file.graphPath, false)
+		if result != nil {
+			for _, node := range result.Nodes {
+				if node == nil {
+					continue
+				}
+				layer.AddNode(file.graphPath, node)
+				set := overlayIDsByName[node.Name]
+				if set == nil {
+					set = make(map[string]bool)
+					overlayIDsByName[node.Name] = set
+				}
+				set[node.ID] = true
+			}
+			for _, edge := range result.Edges {
+				layer.AddEdge(edge)
+			}
+		}
 		for name, baseIDs := range baseIDsByName {
 			overlayIDs := overlayIDsByName[name]
 			for id := range baseIDs {
@@ -562,23 +665,114 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		}
 	}
 
-	if len(coveredPaths) == 0 {
-		return nil, nil, nil
-	}
-	sort.Strings(coveredPaths)
-
-	// Local resolver pass: rewrite unresolved overlay edges to point
-	// at concrete IDs whenever a single best match exists in
-	// (overlay ∪ base).
-	if err := ctx.Err(); err != nil {
+	if err := resolveOverlayEdges(ctx, s.graph, layer); err != nil {
 		return nil, nil, err
 	}
-	s.resolveOverlayEdges(layer)
-	if err := ctx.Err(); err != nil {
-		return nil, nil, err
-	}
-
 	return layer, coveredPaths, nil
+}
+
+func readOverlayBaseNodes(
+	ctx context.Context,
+	reader graph.BoundedFileNodeReader,
+	graphPath string,
+	total *int,
+) ([]*graph.Node, error) {
+	if reader == nil {
+		return nil, fmt.Errorf("overlay base identities for %s: %w", graphPath, graph.ErrBoundedLocalizationUnavailable)
+	}
+	if total == nil || *total < 0 || *total > overlayLayerBaseNodesMax {
+		return nil, fmt.Errorf("overlay base identities for %s: invalid aggregate count", graphPath)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	remaining := overlayLayerBaseNodesMax - *total
+	queryLimit := overlayLayerBaseNodesPerFileMax
+	aggregateLimited := remaining < queryLimit
+	if aggregateLimited {
+		queryLimit = remaining
+		if queryLimit == 0 {
+			// A one-row emptiness sentinel lets an actually empty later file pass
+			// without ever issuing an invalid limit-zero projection.
+			queryLimit = 1
+		}
+	}
+	projection, err := reader.FindFileNodesBounded(
+		ctx,
+		graphPath,
+		graph.LocalizationNodeScope{},
+		queryLimit,
+	)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil {
+		return nil, fmt.Errorf("overlay base identities for %s: %w", graphPath, err)
+	}
+	if projection.Truncated || projection.Total > queryLimit || len(projection.Nodes) > queryLimit {
+		resource := "base nodes per file"
+		limit := overlayLayerBaseNodesPerFileMax
+		if aggregateLimited {
+			resource = "base nodes"
+			limit = overlayLayerBaseNodesMax
+		}
+		return nil, &overlayLayerLimitError{Resource: resource, Limit: limit}
+	}
+	if projection.Total < 0 || projection.Total != len(projection.Nodes) {
+		return nil, fmt.Errorf("overlay base identities for %s: invalid bounded projection", graphPath)
+	}
+	if projection.Total > remaining {
+		return nil, &overlayLayerLimitError{
+			Resource: "base nodes",
+			Limit:    overlayLayerBaseNodesMax,
+		}
+	}
+	for _, node := range projection.Nodes {
+		if node == nil {
+			return nil, fmt.Errorf("overlay base identities for %s: invalid nil node", graphPath)
+		}
+	}
+	*total += projection.Total
+	return projection.Nodes, nil
+}
+
+func cloneOverlayExtractionResult(result *parser.ExtractionResult) *parser.ExtractionResult {
+	if result == nil {
+		return nil
+	}
+	cloned := &parser.ExtractionResult{
+		Nodes: make([]*graph.Node, len(result.Nodes)),
+		Edges: make([]*graph.Edge, len(result.Edges)),
+	}
+	for index, node := range result.Nodes {
+		if node == nil {
+			continue
+		}
+		copy := *node
+		copy.Meta = cloneOverlayMetadata(node.Meta)
+		cloned.Nodes[index] = &copy
+	}
+	for index, edge := range result.Edges {
+		if edge == nil {
+			continue
+		}
+		copy := *edge
+		copy.Meta = cloneOverlayMetadata(edge.Meta)
+		cloned.Edges[index] = &copy
+	}
+	return cloned
+}
+
+func cloneOverlayMetadata(meta map[string]any) map[string]any {
+	if meta == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(meta))
+	for key, value := range meta {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func validateOverlayBuildEnvelope(files []daemon.OverlayFile) error {
@@ -687,76 +881,140 @@ const unresolvedPrefix = "unresolved::"
 // overlay buffers are transient and the common case the editor
 // cares about is "I added a call to Foo; does find_usages of Foo
 // now include this site?" Direct name resolution covers that.
-func (s *Server) resolveOverlayEdges(layer *graph.OverlayLayer) {
+func resolveOverlayEdges(ctx context.Context, base graph.Reader, layer *graph.OverlayLayer) error {
 	if layer == nil {
-		return
+		return nil
 	}
-	// Collect every From → []Edge that the layer holds. We iterate
-	// over a copy of the map so we can rewrite layer edges
-	// in-place via AddEdge / removal pattern (layer is meant
-	// to be append-only post-construction; the resolver pass runs
-	// before the layer is handed to the View, so we still own it).
-	for _, edges := range layer.OutEdgesByFromAll() {
-		for _, e := range edges {
-			if !strings.HasPrefix(e.To, unresolvedPrefix) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	edgesByFrom := layer.OutEdgesByFromAll()
+	names := make(map[string]struct{})
+	inspected := 0
+	for _, edges := range edgesByFrom {
+		for _, edge := range edges {
+			inspected++
+			if inspected&127 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			if edge == nil {
 				continue
 			}
-			target := strings.TrimPrefix(e.To, unresolvedPrefix)
-			// Strip kind segment if present (e.g. "call::FooBar").
-			if i := strings.Index(target, "::"); i > 0 {
-				target = target[i+2:]
-			}
-			// Strip trailing argument-count / disambiguator hints.
-			if i := strings.Index(target, "@"); i > 0 {
-				target = target[:i]
-			}
-			if target == "" {
+			name := overlayUnresolvedTargetName(edge.To)
+			if name == "" {
 				continue
 			}
-			resolved := s.lookupOverlayTarget(layer, target)
-			if resolved == "" {
+			if _, exists := names[name]; exists {
 				continue
 			}
-			e.To = resolved
+			if len(names) >= overlayLayerUnresolvedNamesMax {
+				return &overlayLayerLimitError{
+					Resource: "unresolved names",
+					Limit:    overlayLayerUnresolvedNamesMax,
+				}
+			}
+			names[name] = struct{}{}
 		}
 	}
-	// Rebuild the layer's inEdges index now that targets may have
-	// changed. The layer exposes a Rebuild helper so we don't have
-	// to know the internal map shape.
+
+	orderedNames := make([]string, 0, len(names))
+	for name := range names {
+		orderedNames = append(orderedNames, name)
+	}
+	sort.Strings(orderedNames)
+	resolvedByName := make(map[string]string, len(orderedNames))
+	view := graph.NewOverlaidView(base, layer)
+	for _, name := range orderedNames {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		overlay := layer.NodesByName(name)
+		if len(overlay) == 1 {
+			if overlay[0] == nil {
+				return fmt.Errorf("overlay target %q: invalid nil overlay node", name)
+			}
+			resolvedByName[name] = overlay[0].ID
+			continue
+		}
+		if len(overlay) > 1 {
+			continue
+		}
+
+		projection, err := view.FindNodesByNameBounded(
+			ctx,
+			name,
+			graph.LocalizationNodeScope{},
+			1,
+		)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if err != nil {
+			return fmt.Errorf("overlay target %q: %w", name, err)
+		}
+		if projection.Total < 0 || projection.Total < len(projection.Nodes) || len(projection.Nodes) > 1 {
+			return fmt.Errorf("overlay target %q: invalid bounded projection", name)
+		}
+		if projection.Truncated || projection.Total > 1 {
+			continue // ambiguous names remain unresolved
+		}
+		switch projection.Total {
+		case 0:
+			if len(projection.Nodes) != 0 {
+				return fmt.Errorf("overlay target %q: invalid empty projection", name)
+			}
+		case 1:
+			if len(projection.Nodes) != 1 || projection.Nodes[0] == nil {
+				return fmt.Errorf("overlay target %q: invalid unique projection", name)
+			}
+			resolvedByName[name] = projection.Nodes[0].ID
+		default:
+			return fmt.Errorf("overlay target %q: invalid bounded projection", name)
+		}
+	}
+
+	inspected = 0
+	for _, edges := range edgesByFrom {
+		for _, edge := range edges {
+			inspected++
+			if inspected&127 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			if edge == nil {
+				continue
+			}
+			if resolved := resolvedByName[overlayUnresolvedTargetName(edge.To)]; resolved != "" {
+				edge.To = resolved
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	layer.RebuildInEdges()
+	return ctx.Err()
 }
 
-// lookupOverlayTarget tries to find a unique node with the given
-// short name in (layer ∪ base). Returns the node ID on a unique
-// match, empty string otherwise. Tied matches return empty so the
-// edge stays as a placeholder rather than picking the wrong target.
-func (s *Server) lookupOverlayTarget(layer *graph.OverlayLayer, name string) string {
-	overlay := layer.NodesByName(name)
-	if len(overlay) == 1 {
-		return overlay[0].ID
-	}
-	if len(overlay) > 1 {
+func overlayUnresolvedTargetName(target string) string {
+	if !strings.HasPrefix(target, unresolvedPrefix) {
 		return ""
 	}
-	if s.graph == nil {
-		return ""
+	target = strings.TrimPrefix(target, unresolvedPrefix)
+	if index := strings.Index(target, "::"); index > 0 {
+		target = target[index+2:]
 	}
-	hits := s.graph.FindNodesByName(name)
-	// Drop hits whose file is overlaid AND whose ID wasn't kept by
-	// the overlay — those are now-deleted symbols.
-	keep := hits[:0:0]
-	for _, n := range hits {
-		if layer.HasFile(graph.IDFile(n.ID)) {
-			if !layer.HasNode(n.ID) {
-				continue
-			}
-		}
-		keep = append(keep, n)
+	if index := strings.Index(target, "@"); index > 0 {
+		target = target[:index]
 	}
-	if len(keep) == 1 {
-		return keep[0].ID
-	}
-	return ""
+	return target
 }
 
 // hashOverlayFiles produces a stable content-hash of an overlay
