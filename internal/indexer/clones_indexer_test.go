@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -169,12 +170,12 @@ func TestDetectClonesAndEmitEdges(t *testing.T) {
 		FilePath: "c.go", StartLine: 1, Language: "go",
 	})
 
-	stats := detectClonesAndEmitEdges(g, "", 0)
+	stats, _ := detectClonesAndEmitEdgesWithBaselineCtx(context.Background(), g, "", 0)
 	assert.Equal(t, 1, stats.Pairs)
 	assert.Equal(t, 2, stats.Edges)
 
 	// Idempotent: a second run dedupes via graph.AddEdge.
-	detectClonesAndEmitEdges(g, "", 0)
+	detectClonesAndEmitEdgesWithBaselineCtx(context.Background(), g, "", 0)
 	assert.Len(t, similarToEdges(g), 2, "second pass must not duplicate edges")
 }
 

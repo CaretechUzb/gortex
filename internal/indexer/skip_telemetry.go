@@ -105,15 +105,12 @@ func largeFileReadParallelism(workers int) int {
 	return min(2, workers)
 }
 
-// extractWithTimeout runs ext.Extract under the per-file extraction
-// budget. With no budget configured it calls Extract directly. On
-// timeout it returns errExtractTimeout; the slow extraction runs on to
-// completion in its goroutine (tree-sitter's own 5s parse cap bounds
-// the worst case) and its result is discarded.
-func (idx *Indexer) extractWithTimeout(ext parser.Extractor, relPath string, src []byte) (*parser.ExtractionResult, error) {
-	return idx.extractWithTimeoutDone(ext, relPath, src, nil)
-}
-
+// extractWithTimeoutDone runs ext.Extract under the per-file extraction
+// budget and invokes done when extraction actually finishes. With no budget
+// configured it calls Extract directly. On timeout it returns
+// errExtractTimeout; the slow extraction runs on to completion in its goroutine
+// (tree-sitter's own 5s parse cap bounds the worst case) and its result is
+// discarded.
 func (idx *Indexer) extractWithTimeoutDone(
 	ext parser.Extractor,
 	relPath string,

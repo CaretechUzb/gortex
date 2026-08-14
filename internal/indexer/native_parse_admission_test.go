@@ -103,8 +103,8 @@ func TestGeneratedParserProjectionBypassesNativeAdmission(t *testing.T) {
 	src := generatedParserAdmissionFixture()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	result, skipped, err := idx.extractFileCtx(
-		ctx, admission, nil, nil,
+	result, skipped, err := idx.extractFileCtxWithRawLease(
+		ctx, admission, nil, nil, nil,
 		"/tmp/parser.c", "parser.c", "c", ext, src,
 	)
 	if err != nil {
@@ -141,8 +141,8 @@ func TestTimedOutNativeExtractionRetainsAdmission(t *testing.T) {
 	}
 	outcome := make(chan extractionOutcome, 1)
 	go func() {
-		result, skipped, err := idx.extractFileCtx(
-			context.Background(), admission, nil, nil,
+		result, skipped, err := idx.extractFileCtxWithRawLease(
+			context.Background(), admission, nil, nil, nil,
 			"/tmp/blocked.c", "blocked.c", "c", blocking, []byte("int x;"),
 		)
 		outcome <- extractionOutcome{result: result, skipped: skipped, err: err}
@@ -161,8 +161,8 @@ func TestTimedOutNativeExtractionRetainsAdmission(t *testing.T) {
 	second := &nativeAdmissionTestExtractor{}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
-	_, _, err := idx.extractFileCtx(
-		ctx, admission, nil, nil,
+	_, _, err := idx.extractFileCtxWithRawLease(
+		ctx, admission, nil, nil, nil,
 		"/tmp/second.c", "second.c", "c", second, []byte("int y;"),
 	)
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -180,8 +180,8 @@ func TestTimedOutNativeExtractionRetainsAdmission(t *testing.T) {
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, skipped, err := idx.extractFileCtx(
-		ctx, admission, nil, nil,
+	_, skipped, err := idx.extractFileCtxWithRawLease(
+		ctx, admission, nil, nil, nil,
 		"/tmp/third.c", "third.c", "c", second, []byte("int z;"),
 	)
 	if err != nil || skipped {

@@ -80,13 +80,6 @@ func newTransformPipeline(rules []config.TransformRule, logger *zap.Logger) *tra
 	return p
 }
 
-// addPrePass registers an offset-preserving pre-parse transform. Pre-parse
-// transforms run before the offset-shifting ones and their length is enforced
-// by run.
-func (p *transformPipeline) addPrePass(t preParseTransform) {
-	p.prePass = append(p.prePass, t)
-}
-
 // run applies every matching transform to src in order. A transform
 // that errors is logged and skipped — the bytes from the previous
 // stage are kept, so one failing processor never drops a file.

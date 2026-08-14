@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -327,7 +328,7 @@ func spokeID(i int) string {
 // TestDetectClonesAndEmitEdges_DiffusionWiring is an integration test
 // over the full clone+diffusion pass. It hand-builds a graph where two
 // function bodies are exact clones of a shared body and a third is a
-// partial variant, then asserts detectClonesAndEmitEdges materialises
+// partial variant, then asserts the live clone pass materialises
 // both similar_to and semantically_related edges and reports the
 // diffusion counts on CloneDetectionStats.
 func TestDetectClonesAndEmitEdges_DiffusionWiring(t *testing.T) {
@@ -357,7 +358,7 @@ func TestDetectClonesAndEmitEdges_DiffusionWiring(t *testing.T) {
 		Meta: map[string]any{cloneSigMetaKey: encAB},
 	})
 
-	stats := detectClonesAndEmitEdges(g, "", 0)
+	stats, _ := detectClonesAndEmitEdgesWithBaselineCtx(context.Background(), g, "", 0)
 	// A, B, C all share a signature: three direct clone pairs, so the
 	// only diffusable pairs are themselves direct clones — diffusion
 	// correctly emits nothing (partition invariant).

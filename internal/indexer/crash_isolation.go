@@ -237,18 +237,6 @@ func (idx *Indexer) extractFileWithRawLease(
 	)
 }
 
-func (idx *Indexer) extractFileCtx(
-	ctx context.Context,
-	nativeAdmission *nativeParseExtractionAdmission,
-	pool *crashpool.Pool, q *crashpool.Quarantine,
-	path, relPath, lang string, ext parser.Extractor, src []byte,
-) (result *parser.ExtractionResult, skipped bool, err error) {
-	return idx.extractFileCtxWithRawLease(
-		ctx, nativeAdmission, nil,
-		pool, q, path, relPath, lang, ext, src,
-	)
-}
-
 func (idx *Indexer) extractFileCtxWithRawLease(
 	ctx context.Context,
 	nativeAdmission *nativeParseExtractionAdmission,
