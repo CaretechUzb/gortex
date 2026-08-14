@@ -486,6 +486,13 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
 		}
 	}
+	// The repository index references columns introduced by the v10 vector
+	// migration, so create it only after pending migrations have rebuilt the
+	// legacy table. On current and fresh stores this is an idempotent no-op.
+	if _, err := db.Exec(vectorRepoIndexSQL); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite vector repository index: %w", err)
+	}
 	// A schema transition invalidates any generation produced against the old
 	// graph shape. The v4 migration also drops the unreleased blob-only table.
 	if stored != current {

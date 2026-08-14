@@ -39,10 +39,10 @@ var errInvalidDims = errors.New("store_sqlite: invalid vector dims")
 // index structure to build, since SimilarTo computes over the table
 // directly.
 
-// vectorChunk bounds rows per multi-row INSERT in BulkUpsertEmbeddings.
-// 3 host params per row, SQLite's default limit is 999 → 333 max; 300
-// leaves headroom.
-const vectorChunk = 300
+// vectorChunk bounds rows per multi-row INSERT in BulkUpsertEmbeddings and
+// ReplaceVectorCorpus. Five host parameters per row, SQLite's conservative
+// default limit is 999; 180 leaves headroom.
+const vectorChunk = 180
 
 // encodeVec serialises a float32 slice to a little-endian BLOB
 // (4 bytes per element).
@@ -73,8 +73,8 @@ func (s *Store) UpsertEmbedding(nodeID string, vec []float32) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_, err := s.execActiveWriteLocked(context.Background(),
-		`INSERT OR REPLACE INTO vectors (node_id, dims, vec) VALUES (?, ?, ?)`,
-		nodeID, len(vec), encodeVec(vec),
+		`INSERT OR REPLACE INTO vectors (node_id, repo_prefix, parent_id, dims, vec) VALUES (?, ?, '', ?, ?)`,
+		nodeID, graph.RepoPrefixOfID(nodeID), len(vec), encodeVec(vec),
 	)
 	return err
 }
@@ -103,15 +103,15 @@ func (s *Store) BulkUpsertEmbeddings(items []graph.VectorItem) error {
 		}
 		batch := items[start:end]
 
-		args := make([]any, 0, len(batch)*3)
-		stmt := make([]byte, 0, 64+len(batch)*16)
-		stmt = append(stmt, "INSERT OR REPLACE INTO vectors (node_id, dims, vec) VALUES "...)
+		args := make([]any, 0, len(batch)*4)
+		stmt := make([]byte, 0, 96+len(batch)*20)
+		stmt = append(stmt, "INSERT OR REPLACE INTO vectors (node_id, repo_prefix, parent_id, dims, vec) VALUES "...)
 		for i, it := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?, ?, ?)"...)
-			args = append(args, it.NodeID, len(it.Vec), encodeVec(it.Vec))
+			stmt = append(stmt, "(?, ?, '', ?, ?)"...)
+			args = append(args, it.NodeID, graph.RepoPrefixOfID(it.NodeID), len(it.Vec), encodeVec(it.Vec))
 		}
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
 			return err
@@ -209,7 +209,7 @@ func (s *Store) SimilarTo(vec []float32, limit int) ([]graph.VectorHit, error) {
 		return nil, nil
 	}
 
-	rows, err := s.db.Query(`SELECT node_id, vec FROM vectors`)
+	rows, err := s.db.Query(`SELECT node_id, parent_id, vec FROM vectors WHERE dims = ?`, len(vec))
 	if err != nil {
 		return nil, err
 	}
@@ -220,9 +220,9 @@ func (s *Store) SimilarTo(vec []float32, limit int) ([]graph.VectorHit, error) {
 	// `limit` and yields an exact top-k.
 	h := &hitHeap{}
 	for rows.Next() {
-		var id string
+		var id, parentID string
 		var blob sql.RawBytes
-		if err := rows.Scan(&id, &blob); err != nil {
+		if err := rows.Scan(&id, &parentID, &blob); err != nil {
 			return nil, err
 		}
 		cand := decodeVec(blob)
@@ -236,9 +236,9 @@ func (s *Store) SimilarTo(vec []float32, limit int) ([]graph.VectorHit, error) {
 		dist := cosineDistance(vec, cand, qNorm, cNorm)
 
 		if h.Len() < limit {
-			heap.Push(h, graph.VectorHit{NodeID: id, Distance: dist})
+			heap.Push(h, graph.VectorHit{NodeID: id, ParentID: parentID, Distance: dist})
 		} else if dist < (*h)[0].Distance {
-			(*h)[0] = graph.VectorHit{NodeID: id, Distance: dist}
+			(*h)[0] = graph.VectorHit{NodeID: id, ParentID: parentID, Distance: dist}
 			heap.Fix(h, 0)
 		}
 	}
