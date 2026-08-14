@@ -87,6 +87,13 @@ func TestNewDelegatedVectorHasNoHeapIndexAndUsesDurableStats(t *testing.T) {
 	if got := backend.Count(); got != 17 {
 		t.Fatalf("Count() = %d, want complete durable count 17", got)
 	}
+	backend.Add("process-local-write", []float32{1, 0})
+	if got := backend.Count(); got != 17 {
+		t.Fatalf("Count() = %d after delegated Add, want unchanged durable count 17", got)
+	}
+	if backend.graph != nil {
+		t.Fatal("delegated Add allocated an in-process HNSW graph")
+	}
 	if !backend.HasChunks() {
 		t.Fatal("HasChunks() = false, want durable chunk metadata")
 	}
@@ -133,44 +140,6 @@ func TestDelegatedVectorSearchRejectsNonPositiveLimitWithoutDelegateCall(t *test
 	delegate.mu.Unlock()
 	if len(limits) != 0 {
 		t.Fatalf("delegate called with limits %v for non-positive k", limits)
-	}
-}
-
-func TestSetDelegateReleasesHeapAndChunkState(t *testing.T) {
-	backend := NewVector(2)
-	backend.Add("symbol-a#chunk0", []float32{1, 0})
-	backend.Add("symbol-b", []float32{0, 1})
-	backend.SetChunkMap(map[string]string{"symbol-a#chunk0": "symbol-a"})
-	if backend.SizeBytes() == 0 {
-		t.Fatal("heap backend reported no retained vector bytes before delegation")
-	}
-
-	backend.SetDelegate(&publicationTestDelegate{})
-
-	if backend.graph != nil {
-		t.Fatal("SetDelegate retained the old HNSW graph")
-	}
-	if backend.chunkMap != nil {
-		t.Fatal("SetDelegate retained the old chunk ownership map")
-	}
-	if got := backend.Count(); got != 0 {
-		t.Fatalf("Count() = %d after mode switch, want fresh delegated count", got)
-	}
-	if backend.HasChunks() {
-		t.Fatal("SetDelegate retained old chunk statistics")
-	}
-	if got := backend.SizeBytes(); got != 0 {
-		t.Fatalf("SizeBytes() = %d after delegation, want zero", got)
-	}
-
-	// Preserve the legacy build path: Add records successfully accepted
-	// delegate-side writes without rebuilding an HNSW graph.
-	backend.Add("symbol-c", []float32{1, 0})
-	if got := backend.Count(); got != 1 {
-		t.Fatalf("Count() = %d after delegated Add, want 1", got)
-	}
-	if backend.graph != nil {
-		t.Fatal("delegated Add allocated an HNSW graph")
 	}
 }
 
@@ -366,16 +335,20 @@ func TestReplaceHybridVectorWaitsForReadersAndTransfersTextOwnership(t *testing.
 		t.Fatalf("new reader saw %v, want complete new result %v", got, want)
 	}
 
-	current, ok := swappable.Inner().(*HybridBackend)
-	if !ok {
-		t.Fatalf("active backend is %T, want *HybridBackend", swappable.Inner())
-	}
-	if current.TextBackend() != text {
-		t.Fatal("replacement did not retain the original text backend")
-	}
-	if _, nested := current.TextBackend().(*HybridBackend); nested {
-		t.Fatal("replacement nested a HybridBackend inside another HybridBackend")
-	}
+	func() {
+		backend, release := swappable.AcquireBackend()
+		defer release()
+		current, ok := backend.(*HybridBackend)
+		if !ok {
+			t.Fatalf("active backend is %T, want *HybridBackend", backend)
+		}
+		if current.TextBackend() != text {
+			t.Fatal("replacement did not retain the original text backend")
+		}
+		if _, nested := current.TextBackend().(*HybridBackend); nested {
+			t.Fatal("replacement nested a HybridBackend inside another HybridBackend")
+		}
+	}()
 
 	swappable.Close()
 	if got := text.closes(); got != 1 {
@@ -438,9 +411,11 @@ func vectorIDs(swappable *Swappable, query string) []string {
 
 func assertSingleHybrid(t *testing.T, swappable *Swappable, wantText Backend) {
 	t.Helper()
-	hybrid, ok := swappable.Inner().(*HybridBackend)
+	backend, release := swappable.AcquireBackend()
+	defer release()
+	hybrid, ok := backend.(*HybridBackend)
 	if !ok {
-		t.Fatalf("active backend is %T, want *HybridBackend", swappable.Inner())
+		t.Fatalf("active backend is %T, want *HybridBackend", backend)
 	}
 	if hybrid.TextBackend() != wantText {
 		t.Fatalf("hybrid text backend is %T, want original %T", hybrid.TextBackend(), wantText)

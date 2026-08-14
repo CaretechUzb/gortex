@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -19,13 +20,13 @@ func (s *countingSearchStore) AllNodes() []*graph.Node {
 	return s.Store.AllNodes()
 }
 
-func TestBuildSearchIndex_WithoutVectorsSkipsNodeCensus(t *testing.T) {
+func TestBuildSearchIndexCtx_WithoutVectorsSkipsNodeCensus(t *testing.T) {
 	store := &countingSearchStore{Store: graph.New()}
 	backend := search.NewSwappable(search.NewSymbolSearcherBackend(nil))
 	defer backend.Close()
 
 	idx := &Indexer{graph: store, search: backend}
-	idx.buildSearchIndex()
+	assert.NoError(t, idx.buildSearchIndexCtx(context.Background()))
 
 	assert.Zero(t, store.allNodesCalls)
 }

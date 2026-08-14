@@ -107,16 +107,6 @@ func (s *Swappable) AcquireBackend() (backend Backend, release func()) {
 	}
 }
 
-// Inner returns an unpinned snapshot of the currently-active backend. It is
-// retained for tests and diagnostics only: production callers must not keep or
-// dereference the result because replacement may retire it immediately after
-// this method returns. Use AcquireBackend or a forwarded capability instead.
-func (s *Swappable) Inner() Backend {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.inner
-}
-
 // Embedder returns the active hybrid's externally-owned embedding provider.
 // The lookup is protected by the Swappable read lock; replacement never closes
 // the provider, so the returned provider remains under its original owner's

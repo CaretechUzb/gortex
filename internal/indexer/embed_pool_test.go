@@ -161,10 +161,10 @@ func TestEmbedAllChunks_AbortsOnError(t *testing.T) {
 	assert.Contains(t, err.Error(), "t37")
 }
 
-// TestBuildSearchIndex_AbortOnEmbedErrorKeepsTextOnly asserts the
-// end-to-end abort contract: when embedding fails, buildSearchIndex
-// leaves the search backend text-only — no HybridBackend is swapped in.
-func TestBuildSearchIndex_AbortOnEmbedErrorKeepsTextOnly(t *testing.T) {
+// TestBuildSearchIndexCtx_AbortOnEmbedErrorKeepsTextOnly asserts the end-to-end
+// abort contract: when embedding fails, vector publication leaves the search
+// backend text-only — no HybridBackend is swapped in.
+func TestBuildSearchIndexCtx_AbortOnEmbedErrorKeepsTextOnly(t *testing.T) {
 	g := graph.New()
 	// Two function nodes; their embed metadata text is
 	// "function <Name> ...". poolEmbedder fails on an exact text
@@ -176,15 +176,18 @@ func TestBuildSearchIndex_AbortOnEmbedErrorKeepsTextOnly(t *testing.T) {
 	emb := &poolEmbedder{failOnText: "function Alpha  a.go"}
 	idx.SetEmbedder(emb)
 
-	idx.buildSearchIndex()
+	require.NoError(t, idx.buildSearchIndexCtx(context.Background()))
+	require.Error(t, idx.LastVectorBuildError())
 
 	// The backend must NOT be a HybridBackend — embedding aborted, so
 	// the search stays text-only.
 	sw, ok := idx.Search().(*search.Swappable)
 	require.True(t, ok)
-	_, isHybrid := sw.Inner().(*search.HybridBackend)
+	backend, release := sw.AcquireBackend()
+	defer release()
+	_, isHybrid := backend.(*search.HybridBackend)
 	assert.False(t, isHybrid,
-		"buildSearchIndex must not install a HybridBackend when embedding fails")
+		"vector publication must not install a HybridBackend when embedding fails")
 }
 
 // TestEmbedAllChunks_DeterministicRegardlessOfOrder runs the pool many

@@ -31,14 +31,10 @@ func NewHybrid(text Backend, vector *VectorBackend, embedder embedding.Provider)
 	}
 }
 
-// Add indexes a symbol in both text and vector backends.
+// Add forwards a symbol update to the text backend. Vector corpora are
+// prepared and published atomically by the indexer.
 func (h *HybridBackend) Add(id string, fields ...string) {
 	h.text.Add(id, fields...)
-}
-
-// AddVector adds a vector for a symbol to the vector backend.
-func (h *HybridBackend) AddVector(id string, vector []float32) {
-	h.vector.Add(id, vector)
 }
 
 // Remove removes a symbol from the text backend.

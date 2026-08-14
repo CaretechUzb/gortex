@@ -298,14 +298,14 @@ type Indexer struct {
 	// Set during the shadow swap, cleared when idx.graph is restored.
 	contractStateSink graph.ContractStateStore
 
-	// embedChunkOpts tunes the AST sub-chunking buildSearchIndex applies
-	// to large symbols before embedding. The zero value makes the
-	// chunker fall back to its package defaults.
+	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
+	// vector publication plan. The zero value makes the chunker fall back to
+	// its package defaults.
 	embedChunkOpts embedding.ChunkOptions
 
-	// embedMaxSymbols overrides the built-in cap on how many texts the
-	// vector index will hold before buildSearchIndex skips the embed
-	// pass. Zero keeps the built-in default.
+	// embedMaxSymbols overrides the built-in cap on how many texts the vector
+	// preparation pass accepts before skipping embeddings. Zero keeps the
+	// built-in default.
 	embedMaxSymbols int
 
 	// embedAPIConcurrency bounds how many embedding requests run in
@@ -314,8 +314,8 @@ type Indexer struct {
 	// inference mutex.
 	embedAPIConcurrency int
 
-	// lastVectorBuildErr records why the most recent buildSearchIndex pass
-	// shipped text-only instead of a vector index (chunk-embed failure,
+	// lastVectorBuildErr records why the most recent vector prepare/install
+	// pass did not publish a vector index (chunk-embed failure,
 	// all-vectors-invalid, or the symbol-count guard). Nil after a build that
 	// produced a vector index. Read via LastVectorBuildError once a build has
 	// finished — it lets `gortex eval embedders` report the real cause instead
@@ -648,10 +648,10 @@ func docSummary(doc string) string {
 	return doc
 }
 
-// vectorSearcherDelegate is the search.VectorDelegate-shaped
-// adapter the indexer hands to VectorBackend.SetDelegate when the
-// underlying store implements graph.VectorSearcher. SimilarTo just
-// forwards — search.VectorDelegate is defined to return
+// vectorSearcherDelegate is the search.VectorDelegate-shaped adapter the
+// indexer passes to search.NewDelegatedVector when the underlying store
+// implements graph.VectorSearcher. SimilarTo just forwards —
+// search.VectorDelegate is defined to return
 // graph.VectorHit slices directly, so there's no translation work
 // here, just a small struct so the in-process search package
 // doesn't depend on graph.VectorSearcher's full surface.
@@ -726,8 +726,9 @@ const (
 // Nodes stream through the store's bounded scoped projection instead of a
 // whole-repository read: the caller reached this path precisely because the
 // repository does not fit in memory. Backends without the replace/projection
-// capabilities (test fixtures) are a no-op — their search index is populated
-// by buildSearchIndex instead.
+// capabilities (test fixtures and in-memory stores) are a no-op — their
+// search backend stays empty and the query engine uses its graph substring
+// fallback.
 //
 // The replacement is one atomic unit: a rebuild that fails part-way leaves the
 // corpus the repository already had. Wiping first and appending chunk by chunk
@@ -809,8 +810,8 @@ func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
 // searchable symbols. Beyond that, config.SkipSearch filters out
 // (language, kind) pairs that would only add noise — JSON/YAML/TOML
 // keys, CSS tokens, Terraform blocks, shell/build variables. Every
-// text-index call site (buildSearchIndex bulk loop, indexFile
-// incremental add) must go through this predicate so they can't drift.
+// FTS writer (shadow drain, direct rebuild, and incremental mutation) must go
+// through this predicate so the persisted corpora cannot drift.
 func (idx *Indexer) shouldIndexForSearch(n *graph.Node) bool {
 	// Cross-daemon proxy-edge nodes stand in for remote symbols; they
 	// are never surfaced in local name search. Inert until
@@ -1465,8 +1466,8 @@ func (idx *Indexer) SetProjectID(id string) { idx.projectID = id }
 // ProjectID returns the project slug this indexer stamps on nodes.
 func (idx *Indexer) ProjectID() string { return idx.projectID }
 
-// SetEmbedder sets the embedding provider for semantic search.
-// When set, buildSearchIndex will create a HybridBackend with vector search.
+// SetEmbedder sets the embedding provider for semantic search. When set, the
+// vector prepare/install pipeline publishes a HybridBackend with vector search.
 func (idx *Indexer) SetEmbedder(p embedding.Provider) { idx.embedder = p }
 
 // SetEmbeddingChunkOptions tunes the AST sub-chunking applied to large
@@ -1477,8 +1478,8 @@ func (idx *Indexer) SetEmbeddingChunkOptions(opts embedding.ChunkOptions) {
 }
 
 // SetEmbeddingMaxSymbols overrides the cap on how many texts the vector
-// index will hold before buildSearchIndex skips the embed pass. Zero
-// keeps the built-in default.
+// preparation pass accepts before skipping embeddings. Zero keeps the built-in
+// default.
 func (idx *Indexer) SetEmbeddingMaxSymbols(n int) { idx.embedMaxSymbols = n }
 
 // SetEmbeddingAPIConcurrency overrides how many embedding requests run
@@ -4940,8 +4941,8 @@ func (idx *Indexer) restubIncomingRefs(graphPath string) {
 // embeddingDimsOrDefault returns the embedder's reported vector width,
 // falling back to a neutral placeholder only when the provider cannot
 // state its width yet (Dimensions() == 0, the APIProvider-before-first-
-// call case). The fallback is never persisted: buildSearchIndex
-// overwrites it with the true width taken from a real vector. Kept as a
+// call case). The fallback is never persisted: vector-plan preparation
+// replaces it with the true width taken from a real vector. Kept as a
 // named helper so the vector-dimension default has one definition
 // instead of a scattered magic number.
 func embeddingDimsOrDefault(p embedding.Provider) int {
@@ -5263,16 +5264,6 @@ func flattenEmbedResults(results [][][]float32) [][]float32 {
 		out = append(out, r...)
 	}
 	return out
-}
-
-// buildSearchIndex is the compatibility entry point for direct and focused
-// callers. Full indexing uses the context-aware preparation/publication split
-// so a cold shadow can defer publication until its durable drain succeeds.
-func (idx *Indexer) buildSearchIndex() {
-	if err := idx.buildSearchIndexCtx(context.Background()); err != nil {
-		idx.lastVectorBuildErr = err
-		idx.logger.Warn("vector index build canceled", zap.Error(err))
-	}
 }
 
 // dirIgnoreFiles are the per-directory ignore-file basenames honored by
