@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -128,7 +129,7 @@ func TestOverlaidViewFindNodesByNameBoundedDoesNotInflateWholeFileShadows(t *tes
 
 	layer := NewOverlayLayer()
 	layer.MarkFile("repo/generated.go", false)
-	for index := 0; index < 2_000; index++ {
+	for index := 0; index < overlayExactNameInspectionLimit; index++ {
 		layer.MarkRemoved("handle", fmt.Sprintf("repo/generated.go::handle:%04d", index))
 	}
 	view := NewOverlaidView(recording, layer)
@@ -142,6 +143,178 @@ func TestOverlaidViewFindNodesByNameBoundedDoesNotInflateWholeFileShadows(t *tes
 	}
 	if page.Total != 1 || page.Truncated || len(page.Nodes) != 1 || page.Nodes[0].ID != visible.ID {
 		t.Fatalf("page = %#v, want the one visible base homonym", page)
+	}
+}
+
+func TestOverlaidViewFindNodesByNameBoundedFailsClosedAboveInspectionLimit(t *testing.T) {
+	base := New()
+	recording := &recordingBoundedExactNameReader{Reader: base, bounded: base}
+	layer := NewOverlayLayer()
+	layer.MarkFile("repo/generated.go", false)
+	for index := 0; index <= overlayExactNameInspectionLimit; index++ {
+		layer.MarkRemoved("handle", fmt.Sprintf("repo/generated.go::handle:%04d", index))
+	}
+
+	page, err := NewOverlaidView(recording, layer).FindNodesByNameBounded(
+		context.Background(), "handle", LocalizationNodeScope{}, 8,
+	)
+	var limitErr *BoundedLocalizationLimitError
+	if !errors.As(err, &limitErr) || limitErr.Resource != "overlay exact-name entries" ||
+		limitErr.Limit != overlayExactNameInspectionLimit {
+		t.Fatalf("error = %v, want typed inspection limit error", err)
+	}
+	if len(page.Nodes) != 0 || page.Total != 0 || page.Truncated {
+		t.Fatalf("overflow returned a partial page: %#v", page)
+	}
+	if len(recording.limits) != 0 {
+		t.Fatalf("overflow called base with limits %v", recording.limits)
+	}
+}
+
+func TestOverlaidViewFindNodesByNameBoundedAllowsDetachedShadowLimit(t *testing.T) {
+	base := New()
+	layer := NewOverlayLayer()
+	for index := 0; index < overlayDetachedShadowLimit; index++ {
+		stale := &Node{
+			ID: fmt.Sprintf("repo/a-old-%03d.go::handle", index), Name: "handle",
+			Kind: KindFunction, FilePath: fmt.Sprintf("repo/a-old-%03d.go", index),
+		}
+		base.AddNode(stale)
+		layer.MarkRemoved(stale.Name, stale.ID)
+	}
+	visible := &Node{
+		ID: "repo/z-visible.go::handle", Name: "handle", Kind: KindFunction,
+		FilePath: "repo/z-visible.go",
+	}
+	base.AddNode(visible)
+	recording := &recordingBoundedExactNameReader{Reader: base, bounded: base}
+
+	page, err := NewOverlaidView(recording, layer).FindNodesByNameBounded(
+		context.Background(), "handle", LocalizationNodeScope{}, 8,
+	)
+	if err != nil {
+		t.Fatalf("bounded overlay lookup: %v", err)
+	}
+	if len(recording.limits) != 1 || recording.limits[0] != 8+overlayDetachedShadowLimit {
+		t.Fatalf("base limits = %v, want exact detached-shadow compensation", recording.limits)
+	}
+	if page.Total != 1 || page.Truncated || len(page.Nodes) != 1 || page.Nodes[0].ID != visible.ID {
+		t.Fatalf("page = %#v, want only the visible base homonym", page)
+	}
+	if cap(page.Nodes) != len(page.Nodes) {
+		t.Fatalf("page capacity = %d, want exact returned length %d", cap(page.Nodes), len(page.Nodes))
+	}
+}
+
+func TestOverlaidViewFindNodesByNameBoundedFailsClosedAboveDetachedShadowLimit(t *testing.T) {
+	base := New()
+	recording := &recordingBoundedExactNameReader{Reader: base, bounded: base}
+	layer := NewOverlayLayer()
+	for index := 0; index <= overlayDetachedShadowLimit; index++ {
+		layer.MarkRemoved("handle", fmt.Sprintf("repo/old-%03d.go::handle", index))
+	}
+
+	page, err := NewOverlaidView(recording, layer).FindNodesByNameBounded(
+		context.Background(), "handle", LocalizationNodeScope{}, 8,
+	)
+	var limitErr *BoundedLocalizationLimitError
+	if !errors.As(err, &limitErr) || limitErr.Resource != "detached overlay shadow identities" ||
+		limitErr.Limit != overlayDetachedShadowLimit {
+		t.Fatalf("error = %v, want typed detached-shadow limit error", err)
+	}
+	if len(page.Nodes) != 0 || page.Total != 0 || page.Truncated {
+		t.Fatalf("overflow returned a partial page: %#v", page)
+	}
+	if len(recording.limits) != 0 {
+		t.Fatalf("overflow called base with limits %v", recording.limits)
+	}
+}
+
+func TestOverlaidViewFindNodesByNameBoundedCancelsDuringOverlayInspection(t *testing.T) {
+	base := New()
+	recording := &recordingBoundedExactNameReader{Reader: base, bounded: base}
+	layer := NewOverlayLayer()
+	layer.MarkFile("repo/generated.go", false)
+	for index := 0; index < 512; index++ {
+		layer.MarkRemoved("handle", fmt.Sprintf("repo/generated.go::handle:%04d", index))
+	}
+	ctx := &cancelAfterLocalizationChecksContext{
+		Context: context.Background(), remaining: 3, done: make(chan struct{}),
+	}
+
+	page, err := NewOverlaidView(recording, layer).FindNodesByNameBounded(
+		ctx, "handle", LocalizationNodeScope{}, 8,
+	)
+	if err != context.Canceled {
+		t.Fatalf("error = %v, want context cancellation during overlay inspection", err)
+	}
+	if len(page.Nodes) != 0 || page.Total != 0 || page.Truncated {
+		t.Fatalf("cancelled inspection returned a partial page: %#v", page)
+	}
+	if len(recording.limits) != 0 {
+		t.Fatalf("cancelled inspection called base with limits %v", recording.limits)
+	}
+}
+
+func TestOverlaidViewFindNodesByNameBoundedComposesExclusionsWithoutMutatingCaller(t *testing.T) {
+	base := New()
+	for _, filePath := range []string{
+		"repo/caller-hidden.go", "repo/inner-hidden.go", "repo/outer-hidden.go", "repo/visible.go",
+	} {
+		base.AddNode(&Node{
+			ID: filePath + "::handle", Name: "handle", Kind: KindFunction, FilePath: filePath,
+		})
+	}
+	innerLayer := NewOverlayLayer()
+	innerLayer.MarkFile("repo/inner-hidden.go", true)
+	outerLayer := NewOverlayLayer()
+	outerLayer.MarkFile("repo/outer-hidden.go", true)
+	view := NewOverlaidView(NewOverlaidView(base, innerLayer), outerLayer)
+	callerFiles := map[string]bool{"repo/caller-hidden.go": true}
+
+	page, err := view.FindNodesByNameBounded(
+		context.Background(), "handle", LocalizationNodeScope{ExcludeFiles: callerFiles}, 8,
+	)
+	if err != nil {
+		t.Fatalf("bounded nested-overlay lookup: %v", err)
+	}
+	if page.Total != 1 || page.Truncated || len(page.Nodes) != 1 || page.Nodes[0].FilePath != "repo/visible.go" {
+		t.Fatalf("page = %#v, want only the file outside all exclusion layers", page)
+	}
+	if len(callerFiles) != 1 || !callerFiles["repo/caller-hidden.go"] {
+		t.Fatalf("caller exclusion map was mutated: %#v", callerFiles)
+	}
+	for _, filePath := range []string{"repo/inner-hidden.go", "repo/outer-hidden.go"} {
+		if _, added := callerFiles[filePath]; added {
+			t.Fatalf("overlay path %q leaked into caller exclusion map: %#v", filePath, callerFiles)
+		}
+	}
+}
+
+func TestOverlaidViewFindNodesByNameBoundedAllocationDoesNotScaleWithCoveredFiles(t *testing.T) {
+	base := New()
+	base.AddNode(&Node{
+		ID: "repo/visible.go::handle", Name: "handle", Kind: KindFunction,
+		FilePath: "repo/visible.go",
+	})
+	layer := NewOverlayLayer()
+	for index := 0; index < overlayExactNameInspectionLimit; index++ {
+		layer.MarkFile(fmt.Sprintf("repo/covered-%04d.go", index), true)
+	}
+	view := NewOverlaidView(base, layer)
+
+	result := testing.Benchmark(func(b *testing.B) {
+		for iteration := 0; iteration < b.N; iteration++ {
+			page, err := view.FindNodesByNameBounded(
+				context.Background(), "handle", LocalizationNodeScope{}, 8,
+			)
+			if err != nil || len(page.Nodes) != 1 {
+				b.Fatalf("bounded overlay lookup = %#v, %v", page, err)
+			}
+		}
+	})
+	if bytes := result.AllocedBytesPerOp(); bytes > 16<<10 {
+		t.Fatalf("allocated %d bytes/op with many covered files, want request-bounded allocation", bytes)
 	}
 }
 

@@ -167,6 +167,56 @@ func TestFindNodesByNameBoundedHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestOverlaidViewFindNodesByNameBoundedAppliesSQLiteScopeWithoutMutatingCaller(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	nodes := make([]*graph.Node, 0, 302)
+	for index := 0; index < 300; index++ {
+		nodes = append(nodes, &graph.Node{
+			ID: fmt.Sprintf("repo/a-overlay-hidden.go::handle:%03d", index), Name: "handle",
+			Kind: graph.KindFunction, FilePath: "repo/a-overlay-hidden.go",
+		})
+	}
+	nodes = append(nodes,
+		&graph.Node{
+			ID: "repo/b-caller-hidden.go::handle", Name: "handle", Kind: graph.KindFunction,
+			FilePath: "repo/b-caller-hidden.go",
+		},
+		&graph.Node{
+			ID: "repo/z-visible.go::handle", Name: "handle", Kind: graph.KindFunction,
+			FilePath: "repo/z-visible.go",
+		},
+	)
+	store.BeginBulkLoad()
+	store.AddBatch(nodes, nil)
+	store.FlushBulk()
+
+	layer := graph.NewOverlayLayer()
+	layer.MarkFile("repo/a-overlay-hidden.go", true)
+	callerFiles := map[string]bool{"repo/b-caller-hidden.go": true}
+	page, err := graph.NewOverlaidView(store, layer).FindNodesByNameBounded(
+		context.Background(), "handle",
+		graph.LocalizationNodeScope{ExcludeFiles: callerFiles}, 8,
+	)
+	if err != nil {
+		t.Fatalf("bounded SQLite overlay lookup: %v", err)
+	}
+	if page.Total != 1 || page.Truncated || len(page.Nodes) != 1 ||
+		page.Nodes[0].FilePath != "repo/z-visible.go" {
+		t.Fatalf("page = %#v, want only the visible row behind excluded keyset pages", page)
+	}
+	if len(callerFiles) != 1 || !callerFiles["repo/b-caller-hidden.go"] {
+		t.Fatalf("caller exclusion map was mutated: %#v", callerFiles)
+	}
+	if _, added := callerFiles["repo/a-overlay-hidden.go"]; added {
+		t.Fatalf("overlay path leaked into caller exclusion map: %#v", callerFiles)
+	}
+}
+
 func TestFindFileNodesBoundedCapsScopesKindsAndDropsPayloads(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	if err != nil {

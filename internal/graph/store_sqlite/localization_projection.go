@@ -128,7 +128,7 @@ func (s *Store) FindFileNodesBounded(
 	if err := ctx.Err(); err != nil {
 		return graph.BoundedNodeProjection{}, err
 	}
-	if scope.ExcludeFiles[filePath] {
+	if scope.ExcludesFile(filePath) {
 		return graph.BoundedNodeProjection{}, nil
 	}
 

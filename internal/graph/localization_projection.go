@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 )
 
@@ -23,10 +24,35 @@ type LocalizationNodeScope struct {
 	// ExcludeTests preserves localization's production-anchor gate. SQLite
 	// evaluates the legacy is_test metadata while keyset-paging bounded rows.
 	ExcludeTests bool
-	// ExcludeFiles lets an overlay push whole-file tombstones into the base
-	// projection before LIMIT. SQLite applies it between bounded keyset pages,
-	// avoiding a variable-sized NOT IN clause and SQLite variable limits.
+	// ExcludeFiles applies caller-owned whole-file exclusions before LIMIT.
+	// SQLite evaluates it between bounded keyset pages, avoiding a variable-sized
+	// NOT IN clause and SQLite variable limits.
 	ExcludeFiles map[string]bool
+
+	// excludeFile is a request-local immutable view over an overlay's covered
+	// paths. Keeping it separate avoids cloning every overlay file into
+	// ExcludeFiles for each exact-name lookup. It composes through
+	// withFileExcluder and is deliberately unexported: callers own ExcludeFiles.
+	excludeFile func(string) bool
+}
+
+// ExcludesFile applies caller and immutable overlay exclusions consistently in
+// the in-memory graph, SQLite keyset projections, and overlay composition.
+func (s LocalizationNodeScope) ExcludesFile(path string) bool {
+	return s.ExcludeFiles[path] || s.excludeFile != nil && s.excludeFile(path)
+}
+
+func (s LocalizationNodeScope) withFileExcluder(exclude func(string) bool) LocalizationNodeScope {
+	if exclude == nil {
+		return s
+	}
+	if s.excludeFile == nil {
+		s.excludeFile = exclude
+		return s
+	}
+	prior := s.excludeFile
+	s.excludeFile = func(path string) bool { return prior(path) || exclude(path) }
+	return s
 }
 
 // Allows applies the same effective workspace/project and repository rules as
@@ -52,7 +78,7 @@ func (s LocalizationNodeScope) Allows(n *Node) bool {
 	if path == "" {
 		path = IDFile(n.ID)
 	}
-	if s.ExcludeFiles[path] {
+	if s.ExcludesFile(path) {
 		return false
 	}
 	if s.WorkspaceID != "" {
@@ -265,6 +291,23 @@ func insertBoundedLocalizationNode(nodes []*Node, node *Node, limit int) []*Node
 	return nodes
 }
 
+const (
+	overlayExactNameInspectionLimit = 4096
+	overlayDetachedShadowLimit      = 256
+)
+
+// BoundedLocalizationLimitError reports that a bounded projection cannot
+// preserve its completeness contract within a hard work or allocation limit.
+// Callers must not use a partial result when this error is returned.
+type BoundedLocalizationLimitError struct {
+	Resource string
+	Limit    int
+}
+
+func (e *BoundedLocalizationLimitError) Error() string {
+	return fmt.Sprintf("bounded localization %s exceeds limit %d", e.Resource, e.Limit)
+}
+
 var (
 	_ BoundedExactNameReader = (*OverlaidView)(nil)
 	_ BoundedFileNodeReader  = (*OverlaidView)(nil)
@@ -293,19 +336,102 @@ func (v *OverlaidView) FindNodesByNameBounded(
 		return BoundedNodeProjection{}, err
 	}
 
+	var baseReader BoundedExactNameReader
+	if v.base != nil {
+		var ok bool
+		baseReader, ok = v.base.(BoundedExactNameReader)
+		if !ok {
+			return BoundedNodeProjection{}, ErrBoundedLocalizationUnavailable
+		}
+	}
+
+	removedCount, overlayNodeCount := 0, 0
+	if v.layer != nil {
+		removedCount = len(v.layer.nameRemoved[name])
+		overlayNodeCount = len(v.layer.nodesByName[name])
+	}
+	if removedCount > overlayExactNameInspectionLimit ||
+		overlayNodeCount > overlayExactNameInspectionLimit-removedCount {
+		return BoundedNodeProjection{}, &BoundedLocalizationLimitError{
+			Resource: "overlay exact-name entries",
+			Limit:    overlayExactNameInspectionLimit,
+		}
+	}
+
+	const maxInt = int(^uint(0) >> 1)
+	if limit == maxInt {
+		return BoundedNodeProjection{}, &BoundedLocalizationLimitError{
+			Resource: "exact-name page capacity",
+			Limit:    maxInt - 1,
+		}
+	}
 	pageSize := limit + 1
 	kept := make([]*Node, 0, pageSize)
 	overlayCount := 0
-	shadowIDs := make(map[string]struct{})
+
+	// Exclude whole-file replacements and tombstones in the base reader without
+	// cloning a potentially repository-sized entries map into every request.
+	baseScope := scope
+	if v.layer != nil {
+		baseScope = baseScope.withFileExcluder(v.layer.HasFile)
+	}
+
+	var detachedShadowIDs map[string]struct{}
+	shadowCapacity := removedCount + overlayNodeCount
+	if shadowCapacity > overlayDetachedShadowLimit {
+		shadowCapacity = overlayDetachedShadowLimit
+	}
+	addDetachedShadow := func(id, path string) error {
+		if baseReader == nil || id == "" || baseScope.ExcludesFile(path) {
+			return nil
+		}
+		if _, exists := detachedShadowIDs[id]; exists {
+			return nil
+		}
+		if len(detachedShadowIDs) >= overlayDetachedShadowLimit {
+			return &BoundedLocalizationLimitError{
+				Resource: "detached overlay shadow identities",
+				Limit:    overlayDetachedShadowLimit,
+			}
+		}
+		if detachedShadowIDs == nil {
+			detachedShadowIDs = make(map[string]struct{}, shadowCapacity)
+		}
+		detachedShadowIDs[id] = struct{}{}
+		return nil
+	}
+
+	inspected := 0
+	checkInspection := func() error {
+		inspected++
+		if inspected&127 == 0 {
+			return ctx.Err()
+		}
+		return nil
+	}
 	if v.layer != nil {
 		for id := range v.layer.nameRemoved[name] {
-			shadowIDs[id] = struct{}{}
+			if err := checkInspection(); err != nil {
+				return BoundedNodeProjection{}, err
+			}
+			if err := addDetachedShadow(id, IDFile(id)); err != nil {
+				return BoundedNodeProjection{}, err
+			}
 		}
 		for _, node := range v.layer.nodesByName[name] {
+			if err := checkInspection(); err != nil {
+				return BoundedNodeProjection{}, err
+			}
 			if node == nil {
 				continue
 			}
-			shadowIDs[node.ID] = struct{}{}
+			path := node.FilePath
+			if path == "" {
+				path = IDFile(node.ID)
+			}
+			if err := addDetachedShadow(node.ID, path); err != nil {
+				return BoundedNodeProjection{}, err
+			}
 			if !scope.Allows(node) {
 				continue
 			}
@@ -313,79 +439,71 @@ func (v *OverlaidView) FindNodesByNameBounded(
 			kept = insertBoundedLocalizationNode(kept, node, pageSize)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return BoundedNodeProjection{}, err
+	}
 
-	if v.base == nil {
+	if baseReader == nil {
+		truncated := overlayCount > limit
 		if len(kept) > limit {
 			kept = kept[:limit]
 		}
-		return BoundedNodeProjection{
-			Nodes: kept, Total: overlayCount, Truncated: overlayCount > limit,
-		}, nil
-	}
-	baseReader, ok := v.base.(BoundedExactNameReader)
-	if !ok {
-		return BoundedNodeProjection{}, ErrBoundedLocalizationUnavailable
-	}
-
-	// Push whole-file replacement/tombstone filtering into the base projection.
-	// A MarkFile-only layer can hide arbitrarily many leading homonyms without
-	// populating nameRemoved; filtering after LIMIT would omit later visible
-	// rows. Clone the caller map so overlay state never mutates request scope.
-	baseScope := scope
-	if v.layer != nil && len(v.layer.entries) > 0 {
-		baseScope.ExcludeFiles = make(map[string]bool, len(scope.ExcludeFiles)+len(v.layer.entries))
-		for path, excluded := range scope.ExcludeFiles {
-			if excluded {
-				baseScope.ExcludeFiles[path] = true
-			}
+		total := overlayCount
+		if total > pageSize {
+			total = pageSize
 		}
-		for path := range v.layer.entries {
-			baseScope.ExcludeFiles[path] = true
+		kept = kept[:len(kept):len(kept)]
+		return BoundedNodeProjection{Nodes: kept, Total: total, Truncated: truncated}, nil
+	}
+	if limit > maxInt-len(detachedShadowIDs) {
+		return BoundedNodeProjection{}, &BoundedLocalizationLimitError{
+			Resource: "exact-name shadow compensation",
+			Limit:    maxInt - limit,
 		}
 	}
-
-	// Inflate only by detached identities this exact-name bucket can shadow.
-	// Whole-file shadows were already removed by baseScope.ExcludeFiles, so
-	// counting their identities again would let one large overlay defeat the
-	// projection's hard row/allocation bound.
-	detachedShadows := 0
-	for id := range shadowIDs {
-		path := IDFile(id)
-		if path == "" || !baseScope.ExcludeFiles[path] {
-			detachedShadows++
-		}
-	}
-	baseLimit := limit + detachedShadows
+	baseLimit := limit + len(detachedShadowIDs)
 	basePage, err := baseReader.FindNodesByNameBounded(ctx, name, baseScope, baseLimit)
 	if err != nil {
 		return BoundedNodeProjection{}, err
 	}
+
 	visible := overlayCount
-	for _, node := range basePage.Nodes {
+	for index, node := range basePage.Nodes {
+		if index&127 == 0 {
+			if err := ctx.Err(); err != nil {
+				return BoundedNodeProjection{}, err
+			}
+		}
 		if node == nil {
 			continue
 		}
-		if _, shadowed := shadowIDs[node.ID]; shadowed {
+		if _, shadowed := detachedShadowIDs[node.ID]; shadowed {
 			continue
 		}
-		if v.layer != nil && v.layer.HasFile(IDFile(node.ID)) {
+		path := node.FilePath
+		if path == "" {
+			path = IDFile(node.ID)
+		}
+		if baseScope.ExcludesFile(path) {
 			continue
 		}
 		visible++
 		kept = insertBoundedLocalizationNode(kept, node, pageSize)
 	}
 	// Saturation of the shadow-inflated base page proves at least limit+1
-	// visible rows: no more than detachedShadows returned identities can vanish.
+	// visible rows: no more than len(detachedShadowIDs) returned identities can
+	// vanish, while whole-file shadows were excluded inside the base reader.
 	if basePage.Truncated && visible <= limit {
 		visible = limit + 1
 	}
-	if visible > limit+1 {
-		visible = limit + 1
+	if visible > pageSize {
+		visible = pageSize
 	}
 	truncated := visible > limit
 	if len(kept) > limit {
 		kept = kept[:limit]
 	}
+	kept = kept[:len(kept):len(kept)]
 	return BoundedNodeProjection{Nodes: kept, Total: visible, Truncated: truncated}, nil
 }
 
