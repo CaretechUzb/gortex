@@ -10,6 +10,13 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search"
 )
 
 func decodeRenameErrorResp(t *testing.T, res *mcplib.CallToolResult) map[string]any {
@@ -205,6 +212,80 @@ func TestRenameSymbol_SymlinkRecoveryIsRefused(t *testing.T) {
 	info, err := os.Lstat(linkPath)
 	require.NoError(t, err)
 	require.NotZero(t, info.Mode()&os.ModeSymlink)
+}
+
+func setupMultiRepoRenameRecoveryServer(
+	t *testing.T,
+	repoYAML string,
+	baseCfg *config.IndexConfig,
+) (*Server, string) {
+	t.Helper()
+	repo := setupMiniRepo(t, "repo-a")
+	if repoYAML != "" {
+		require.NoError(t, os.WriteFile(filepath.Join(repo, ".gortex.yaml"), []byte(repoYAML), 0o644))
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	global := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: repo, Name: "repo-a"}}}
+	global.SetConfigPath(configPath)
+	require.NoError(t, global.Save())
+	manager, err := config.NewConfigManager(configPath)
+	require.NoError(t, err)
+
+	registry := testRegistry()
+	store := graph.New()
+	multi := indexer.NewMultiIndexer(store, registry, search.NewBM25(), manager, zap.NewNop())
+	_, err = multi.IndexAll()
+	require.NoError(t, err)
+
+	var base *indexer.Indexer
+	if baseCfg != nil {
+		base = indexer.New(store, registry, *baseCfg, zap.NewNop())
+		t.Cleanup(base.Close)
+	}
+	srv := NewServer(query.NewEngine(store), store, base, nil, zap.NewNop(), nil, MultiRepoOptions{
+		ConfigManager: manager,
+		MultiIndexer:  multi,
+	})
+	return srv, repo
+}
+
+func TestRenameSymbol_UnindexedRecoveryUsesOwningRepoIndexer(t *testing.T) {
+	srv, repo := setupMultiRepoRenameRecoveryServer(t, "", nil)
+	const source = "package main\n\nfunc Late() {}\n"
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "late.go"), []byte(source), 0o644))
+
+	res := callToolByName(t, srv, context.Background(), "rename_symbol", map[string]any{
+		"id": "repo-a/late.go::Late", "new_name": "Renamed",
+	})
+	resp := decodeRenameErrorResp(t, res)
+	require.Equal(t, "symbol_not_indexed", resp["error_code"])
+	recovery := resp["data"].(map[string]any)
+	fallback := recovery["safe_fallback"].(map[string]any)
+	request := fallback["request"].(map[string]any)
+	require.Equal(t, "repo-a/late.go", request["target"].(map[string]any)["file"])
+}
+
+func TestRenameSymbol_UnindexedRecoveryHonorsOwningRepoLimit(t *testing.T) {
+	base := config.Default().Index
+	base.MaxFileSize = 0
+	srv, repo := setupMultiRepoRenameRecoveryServer(t, "index:\n  max_file_size: 16\n", &base)
+	const source = "package main\n\nfunc Restricted() {}\n"
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "late.go"), []byte(source), 0o644))
+
+	owner, ownerRel := srv.indexerForRel("repo-a/late.go")
+	require.NotNil(t, owner)
+	result, err := owner.ExtractSource(t.Context(), ownerRel, []byte(source))
+	require.Nil(t, result)
+	require.ErrorContains(t, err, "bounded extraction limit (16 bytes)")
+
+	res := callToolByName(t, srv, context.Background(), "rename_symbol", map[string]any{
+		"id": "repo-a/late.go::Restricted", "new_name": "Renamed",
+	})
+	require.True(t, res.IsError)
+	text := toolResultText(res)
+	require.Contains(t, text, "symbol not found: repo-a/late.go::Restricted")
+	require.NotContains(t, text, "safe_fallback")
 }
 
 func TestRenameSymbol_InvalidTargetStaysNotFound(t *testing.T) {

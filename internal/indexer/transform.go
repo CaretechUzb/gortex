@@ -119,6 +119,71 @@ func (p *transformPipeline) run(path string, src []byte) []byte {
 	return out
 }
 
+// prepareCoordinateStable applies only source preparation whose output keeps
+// a one-to-one byte and line mapping to the caller-owned bytes. Unindexed
+// rename recovery edits the raw file, so an arbitrary command transform may
+// not synthesize or relocate a declaration and still be advertised as a
+// declaration-only fallback.
+func (p *transformPipeline) prepareCoordinateStable(path string, src []byte) ([]byte, error) {
+	if p == nil {
+		return src, nil
+	}
+	out := src
+	for _, transform := range p.prePass {
+		if !transform.matches(path) {
+			continue
+		}
+		rewritten := transform.rewrite(path, out)
+		if !sameSourceCoordinates(out, rewritten) {
+			return nil, fmt.Errorf("pre-parse transform %q does not preserve source coordinates", transform.name())
+		}
+		out = rewritten
+	}
+	for _, transform := range p.transforms {
+		if !transform.matches(path) {
+			continue
+		}
+		switch transform.(type) {
+		case bomStripTransform:
+			var err error
+			out, err = neutralizeSourceBOM(out)
+			if err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("source transform %q does not guarantee coordinate preservation", transform.name())
+		}
+	}
+	return out, nil
+}
+
+func sameSourceCoordinates(raw, prepared []byte) bool {
+	if len(raw) != len(prepared) {
+		return false
+	}
+	for i := range raw {
+		rawBreak := raw[i] == '\n' || raw[i] == '\r'
+		preparedBreak := prepared[i] == '\n' || prepared[i] == '\r'
+		if (rawBreak || preparedBreak) && raw[i] != prepared[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func neutralizeSourceBOM(src []byte) ([]byte, error) {
+	switch {
+	case bytes.HasPrefix(src, []byte{0xef, 0xbb, 0xbf}):
+		out := bytes.Clone(src)
+		copy(out[:3], []byte("   "))
+		return out, nil
+	case bytes.HasPrefix(src, []byte{0xff, 0xfe}), bytes.HasPrefix(src, []byte{0xfe, 0xff}):
+		return nil, fmt.Errorf("UTF-16 BOM cannot be prepared without changing source coordinates")
+	default:
+		return src, nil
+	}
+}
+
 // languageFor returns the language a transform re-types path to, or ""
 // when no transform claims it. Lets a file whose extension is not
 // natively indexed (e.g. .pdf) still reach an extractor.
