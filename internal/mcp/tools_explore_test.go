@@ -710,7 +710,7 @@ func TestRenderExploreLimitsFullBodiesToTopTargets(t *testing.T) {
 		targets = append(targets, exploreTarget{
 			node: &graph.Node{
 				Name: name, Kind: graph.KindFunction,
-				FilePath: fmt.Sprintf("cand_%02d.go", index),
+				FilePath:  fmt.Sprintf("cand_%02d.go", index),
 				StartLine: 1, EndLine: 4, Language: "go",
 			},
 			source: fmt.Sprintf("func %s() int {\n\treturn 9900 + %d\n}", name, index),
