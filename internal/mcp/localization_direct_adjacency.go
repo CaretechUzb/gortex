@@ -14,16 +14,27 @@ const (
 )
 
 type localizationDirectAdjacencyCandidate struct {
-	node          *graph.Node
-	ownerFile     string
-	ownerIndex    int
-	relationOrder int
-	direction     int
-	matched       int
-	longest       int
-	production    bool
-	callable      bool
-	sameFile      bool
+	node               *graph.Node
+	ownerFile          string
+	ownerIndex         int
+	relationOrder      int
+	direction          int
+	matched            int
+	longest            int
+	production         bool
+	callable           bool
+	sameFile           bool
+	taskCited          bool
+	taskCitationOffset int
+}
+
+func localizationDirectAdjacencyNodeTaskCitationOffset(task string, node *graph.Node) int {
+	if node == nil {
+		return -1
+	}
+	return localizationEvidenceTaskCitationOffset(task, localizationEvidence{
+		ID: node.ID, Name: node.Name, QualName: node.QualName,
+	})
 }
 
 // promoteLocalizationDirectAdjacency promotes only graph-authenticated nodes
@@ -113,17 +124,20 @@ func promoteLocalizationDirectAdjacency(
 		}
 		matched, longest := exploreDraftTermOverlap(taskTerms, node)
 		kind := strings.ToLower(strings.TrimSpace(string(node.Kind)))
+		taskCitationOffset := localizationDirectAdjacencyNodeTaskCitationOffset(task, node)
 		candidates = append(candidates, localizationDirectAdjacencyCandidate{
-			node:          node,
-			ownerFile:     relation.ownerFile,
-			ownerIndex:    relation.ownerIndex,
-			relationOrder: relation.relationOrder,
-			direction:     relation.direction,
-			matched:       matched,
-			longest:       longest,
-			production:    !exploreDraftIsTestNode(node),
-			callable:      kind == "function" || kind == "method",
-			sameFile:      relation.ownerFile != "" && nodeDisplayPath(node) == relation.ownerFile,
+			node:               node,
+			ownerFile:          relation.ownerFile,
+			ownerIndex:         relation.ownerIndex,
+			relationOrder:      relation.relationOrder,
+			direction:          relation.direction,
+			matched:            matched,
+			longest:            longest,
+			production:         !exploreDraftIsTestNode(node),
+			callable:           kind == "function" || kind == "method",
+			sameFile:           relation.ownerFile != "" && nodeDisplayPath(node) == relation.ownerFile,
+			taskCited:          taskCitationOffset >= 0,
+			taskCitationOffset: taskCitationOffset,
 		})
 	}
 	if len(candidates) == 0 {
@@ -159,27 +173,47 @@ func promoteLocalizationDirectAdjacency(
 		return left.node.ID < right.node.ID
 	})
 
+	// PRIMARY authority follows the request's first exact identifier citation,
+	// while the evidence list keeps the established graph/task-score order.
+	taskCitedPrimaryID := ""
+	taskCitedPrimaryOffset := -1
+	for _, candidate := range candidates {
+		if candidate.taskCitationOffset >= 0 &&
+			(taskCitedPrimaryOffset < 0 || candidate.taskCitationOffset < taskCitedPrimaryOffset) {
+			taskCitedPrimaryID = strings.TrimSpace(candidate.node.ID)
+			taskCitedPrimaryOffset = candidate.taskCitationOffset
+		}
+	}
+
 	promoted := 0
+	taskCitedPrimaryPending := taskCitedPrimaryID != ""
 	for _, candidate := range candidates {
 		if promoted >= localizationDirectAdjacencyCap {
 			break
 		}
 		node := candidate.node
 		id := strings.TrimSpace(node.ID)
+		if taskCitedPrimaryPending && id != taskCitedPrimaryID &&
+			promoted == localizationDirectAdjacencyCap-1 {
+			continue
+		}
+		if id == taskCitedPrimaryID {
+			taskCitedPrimaryPending = false
+		}
 		if _, exists := seenIDs[id]; exists {
 			continue
 		}
 		row := localizationEvidence{
-			Rank:       len(envelope.Evidence) + 1,
-			ID:         id,
-			Name:       compactLocalizationField(node.Name, localizationMaxNameRunes),
-			QualName:   compactLocalizationField(node.QualName, localizationMaxNameRunes),
-			Kind:       string(node.Kind),
-			File:       nodeDisplayPath(node),
-			Line:       node.StartLine,
-			EndLine:    node.EndLine,
-			Provenance: localizationProvenanceDirectAdjacency,
-
+			Rank:                     len(envelope.Evidence) + 1,
+			ID:                       id,
+			Name:                     compactLocalizationField(node.Name, localizationMaxNameRunes),
+			QualName:                 compactLocalizationField(node.QualName, localizationMaxNameRunes),
+			Kind:                     string(node.Kind),
+			File:                     nodeDisplayPath(node),
+			Line:                     node.StartLine,
+			EndLine:                  node.EndLine,
+			Provenance:               localizationProvenanceDirectAdjacency,
+			taskCitedPrimaryEligible: candidate.taskCited && id == taskCitedPrimaryID,
 		}
 		if row.File == "" {
 			continue
@@ -190,6 +224,11 @@ func promoteLocalizationDirectAdjacency(
 			continue
 		}
 		candidateDigest := newLocalizationEvidenceDigestForTask(task, candidateEnvelope)
+		if row.taskCitedPrimaryEligible {
+			candidateEnvelope, candidateDigest = promoteLocalizationTaskCitedAdjacencyPrimary(
+				task, candidateEnvelope, candidateDigest, row.ID,
+			)
+		}
 		if !localizationDirectAdjacencyDigestContains(candidateDigest, row.ID) {
 			continue
 		}
@@ -240,11 +279,24 @@ func localizationDirectAdjacencyEnvelopeWithRow(
 			if _, protected := protectedIDs[id]; protected {
 				continue
 			}
+			if localizationEvidenceTaskCited(task, evidence[index]) {
+				continue
+			}
 			if localizationSupportingOnlyProvenance(evidence[index].Provenance) {
 				continue
 			}
 			replace = index
 			break
+		}
+		if replace < 0 && row.taskCitedPrimaryEligible {
+			victimID, victimOrder := localizationTaskCitedAdjacencyPrimaryVictim(task, retainedDigest, row.ID)
+			for index := range evidence {
+				if evidence[index].ID == victimID {
+					replace = index
+					row.primaryCohortOrder = victimOrder
+					break
+				}
+			}
 		}
 		if replace < 0 {
 			return envelope, false
@@ -268,6 +320,85 @@ func localizationDirectAdjacencyEnvelopeWithRow(
 		candidate.Symbols = append(candidate.Symbols, retained.ID)
 	}
 	return candidate, true
+}
+
+func localizationTaskCitedAdjacencyPrimaryVictim(
+	task string,
+	digest *localizationEvidenceDigest,
+	candidateID string,
+) (string, int) {
+	if digest == nil {
+		return "", 0
+	}
+	for _, row := range digest.Evidence {
+		if row.ID != candidateID && row.taskCitedPrimaryEligible && row.primaryCohortOrder > 0 {
+			return "", 0
+		}
+	}
+	for order := localizationFinalResponsePrimaryLimit; order >= 2; order-- {
+		for _, row := range digest.Evidence {
+			if row.primaryCohortOrder != order || row.ID == candidateID ||
+				row.authorizationPriority || localizationFinalResponsePrimaryProvenance(row) ||
+				localizationDigestRowIdentifierTaskCited(task, row) {
+				continue
+			}
+			return row.ID, order
+		}
+	}
+	return "", 0
+}
+
+func promoteLocalizationTaskCitedAdjacencyPrimary(
+	task string,
+	envelope localizationExploreEnvelope,
+	digest *localizationEvidenceDigest,
+	candidateID string,
+) (localizationExploreEnvelope, *localizationEvidenceDigest) {
+	candidateID = strings.TrimSpace(candidateID)
+	if digest == nil || candidateID == "" {
+		return envelope, digest
+	}
+	for _, row := range digest.Evidence {
+		if row.ID == candidateID && row.taskCitedPrimaryEligible && row.primaryCohortOrder > 0 {
+			return envelope, digest
+		}
+	}
+	victimID, victimOrder := localizationTaskCitedAdjacencyPrimaryVictim(task, digest, candidateID)
+	if victimID == "" {
+		return envelope, digest
+	}
+
+	candidateEnvelopeIndex, victimEnvelopeIndex := -1, -1
+	for index := range envelope.Evidence {
+		switch envelope.Evidence[index].ID {
+		case candidateID:
+			candidateEnvelopeIndex = index
+		case victimID:
+			victimEnvelopeIndex = index
+		}
+	}
+	candidateDigestIndex, victimDigestIndex := -1, -1
+	for index := range digest.Evidence {
+		switch digest.Evidence[index].ID {
+		case candidateID:
+			candidateDigestIndex = index
+		case victimID:
+			victimDigestIndex = index
+		}
+	}
+	if candidateEnvelopeIndex < 0 || victimEnvelopeIndex < 0 ||
+		candidateDigestIndex < 0 || victimDigestIndex < 0 {
+		return envelope, digest
+	}
+
+	envelope.Evidence[victimEnvelopeIndex].primaryCohortOrder = 0
+	envelope.Evidence[candidateEnvelopeIndex].taskCitedPrimaryEligible = true
+	envelope.Evidence[candidateEnvelopeIndex].primaryCohortOrder = victimOrder
+	digest.Evidence[victimDigestIndex].primaryCohortOrder = 0
+	digest.Evidence[candidateDigestIndex].taskCitedPrimaryEligible = true
+	digest.Evidence[candidateDigestIndex].primaryCohortOrder = victimOrder
+	refreshLocalizationDigestResponses(digest, task, nil)
+	return envelope, digest
 }
 
 func localizationDirectAdjacencyDigestContains(digest *localizationEvidenceDigest, id string) bool {

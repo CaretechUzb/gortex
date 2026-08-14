@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 )
@@ -72,10 +74,11 @@ type localizationDigestRow struct {
 	// truthful provenance from presentation authority without spending response
 	// bytes on internal policy state. primaryCohortOrder freezes the ranked
 	// PRIMARY projection before supplemental evidence is materialized.
-	literalPrimaryEligible bool
-	primaryCohortOrder     int
-	supportingOnly         bool
-	authorizationPriority  bool
+	literalPrimaryEligible   bool
+	taskCitedPrimaryEligible bool
+	primaryCohortOrder       int
+	supportingOnly           bool
+	authorizationPriority    bool
 }
 
 // newLocalizationEvidenceDigestForTask retains only concrete ranked evidence
@@ -112,16 +115,20 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 			Callees:    append([]string(nil), row.Callees...),
 			Provenance: row.Provenance,
 
-			literalPrimaryEligible: row.literalPrimaryEligible,
-			primaryCohortOrder:     row.primaryCohortOrder,
-			supportingOnly:         row.supportingOnly || localizationSupportingOnlyProvenance(row.Provenance),
-			authorizationPriority:  authorizationPriority,
+			literalPrimaryEligible:   row.literalPrimaryEligible,
+			taskCitedPrimaryEligible: row.taskCitedPrimaryEligible,
+			primaryCohortOrder:       row.primaryCohortOrder,
+			supportingOnly:           row.supportingOnly || localizationSupportingOnlyProvenance(row.Provenance),
+			authorizationPriority:    authorizationPriority,
 		})
 		return true
 	}
-	// Proof/authorization identities remain the immutable prefix.
+	// Proof/authorization identities and the one task-cited supplemental
+	// PRIMARY remain the immutable prefix. The latter is presentation evidence,
+	// not authorization, so it is reserved without entering priorityIDs.
 	for _, row := range envelope.Evidence {
-		if _, prioritized := priorityIDs[row.ID]; prioritized {
+		_, prioritized := priorityIDs[row.ID]
+		if prioritized || localizationEvidenceTaskCitedPrimary(row) {
 			appendRow(row)
 		}
 	}
@@ -145,7 +152,7 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 		if localizationSupportingOnlyProvenance(row.Provenance) {
 			continue
 		}
-		if _, prioritized := priorityIDs[row.ID]; !prioritized {
+		if _, prioritized := priorityIDs[row.ID]; !prioritized && !localizationEvidenceTaskCitedPrimary(row) {
 			appendRow(row)
 		}
 	}
@@ -281,6 +288,7 @@ func mergeLocalizationDigestRowEvidence(primary, supplementary localizationDiges
 		primary.Provenance = supplementary.Provenance
 	}
 	primary.literalPrimaryEligible = primary.literalPrimaryEligible || supplementary.literalPrimaryEligible
+	primary.taskCitedPrimaryEligible = primary.taskCitedPrimaryEligible || supplementary.taskCitedPrimaryEligible
 	primary.authorizationPriority = primary.authorizationPriority || supplementary.authorizationPriority
 	// An identity that was independently ranked remains cohort-eligible when a
 	// later supplemental observation of the same row is merged into it.
@@ -444,6 +452,84 @@ func localizationTaskAwareRetainedRows(task string, current []localizationDigest
 	})
 	appendWhere(0, func(localizationDigestRow) bool { return true })
 	return ordered
+}
+
+func localizationIdentifierRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '$'
+}
+
+func localizationTaskExactIdentifierOffset(task, value string) int {
+	value = strings.TrimSpace(value)
+	if value == "" || len(task) < len(value) {
+		return -1
+	}
+	quoted := false
+	for _, quote := range []string{"`", "'", "\""} {
+		if strings.Contains(task, quote+value+quote) {
+			quoted = true
+			break
+		}
+	}
+	if !localizationRecoveryConcreteIdentifier(value) &&
+		!exploreQueryHasCallAnchor(task, value) && !quoted {
+		return -1
+	}
+	for offset := 0; offset <= len(task)-len(value); {
+		relative := strings.Index(task[offset:], value)
+		if relative < 0 {
+			return -1
+		}
+		start := offset + relative
+		end := start + len(value)
+		leftBoundary := start == 0
+		if !leftBoundary {
+			r, _ := utf8.DecodeLastRuneInString(task[:start])
+			leftBoundary = !localizationIdentifierRune(r)
+		}
+		rightBoundary := end == len(task)
+		if !rightBoundary {
+			r, _ := utf8.DecodeRuneInString(task[end:])
+			rightBoundary = !localizationIdentifierRune(r)
+		}
+		if leftBoundary && rightBoundary {
+			return start
+		}
+		offset = start + 1
+	}
+	return -1
+}
+
+func localizationTaskCitesExactIdentifier(task, value string) bool {
+	return localizationTaskExactIdentifierOffset(task, value) >= 0
+}
+
+func localizationEvidenceTaskCitationOffset(task string, row localizationEvidence) int {
+	best := -1
+	for _, value := range []string{row.ID, row.Name, row.QualName} {
+		offset := localizationTaskExactIdentifierOffset(task, value)
+		if offset >= 0 && (best < 0 || offset < best) {
+			best = offset
+		}
+	}
+	return best
+}
+
+func localizationEvidenceTaskCited(task string, row localizationEvidence) bool {
+	return localizationEvidenceTaskCitationOffset(task, row) >= 0
+}
+
+func localizationEvidenceTaskCitedPrimary(row localizationEvidence) bool {
+	return row.taskCitedPrimaryEligible && row.primaryCohortOrder > 0 &&
+		row.Provenance == localizationProvenanceDirectAdjacency
+}
+
+func localizationDigestRowIdentifierTaskCited(task string, row localizationDigestRow) bool {
+	for _, value := range []string{row.ID, row.Name, row.QualName} {
+		if localizationTaskCitesExactIdentifier(task, value) {
+			return true
+		}
+	}
+	return false
 }
 
 func localizationDigestRowTaskCited(task string, row localizationDigestRow) bool {
@@ -617,6 +703,10 @@ func localizationFinalResponsePrimaryProvenance(row localizationDigestRow) bool 
 }
 
 func localizationFinalResponseSupportingOnly(row localizationDigestRow) bool {
+	if row.taskCitedPrimaryEligible && row.primaryCohortOrder > 0 &&
+		row.Provenance == localizationProvenanceDirectAdjacency {
+		return false
+	}
 	return row.supportingOnly || localizationSupportingOnlyProvenance(row.Provenance)
 }
 
@@ -1129,9 +1219,9 @@ func refreshLocalizationDigestResponses(digest *localizationEvidenceDigest, task
 	if digest == nil {
 		return
 	}
+	digest.primaryIDs = localizationFinalResponsePrimaryIDs(task, current, digest.Evidence)
 	digest.finalResponse = renderLocalizationFinalResponseForTask(task, current, digest.Evidence)
 	digest.provisionalResponse = renderLocalizationProvisionalResponseForTask(task, current, digest.Evidence)
-	digest.primaryIDs = localizationFinalResponsePrimaryIDs(task, current, digest.Evidence)
 }
 
 // localizationAnswerClaimDiscipline closes the remaining gap between a page

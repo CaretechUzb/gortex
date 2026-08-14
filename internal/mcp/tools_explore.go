@@ -3240,9 +3240,10 @@ type localizationEvidence struct {
 	// Request-local presentation authority. These fields are deliberately not
 	// serialized: provenance remains truthful while supplemental rows and the
 	// frozen initial PRIMARY cohort keep their distinct presentation roles.
-	literalPrimaryEligible bool
-	primaryCohortOrder     int
-	supportingOnly         bool
+	literalPrimaryEligible   bool
+	taskCitedPrimaryEligible bool
+	primaryCohortOrder       int
+	supportingOnly           bool
 }
 
 func (s *Server) completeEmptyLocalization(ctx context.Context, task string, budget int) *mcp.CallToolResult {
