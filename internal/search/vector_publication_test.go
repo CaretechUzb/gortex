@@ -20,6 +20,9 @@ func (d *publicationTestDelegate) SimilarTo(_ []float32, limit int) ([]graph.Vec
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.limits = append(d.limits, limit)
+	if limit < len(d.hits) {
+		return append([]graph.VectorHit(nil), d.hits[:limit]...), nil
+	}
 	return append([]graph.VectorHit(nil), d.hits...), nil
 }
 
@@ -95,6 +98,44 @@ func TestNewDelegatedVectorHasNoHeapIndexAndUsesDurableStats(t *testing.T) {
 	}
 }
 
+func TestDelegatedVectorSearchOverfetchesForUniqueParents(t *testing.T) {
+	delegate := &publicationTestDelegate{hits: []graph.VectorHit{
+		{NodeID: "symbol-a#chunk0", ParentID: "symbol-a"},
+		{NodeID: "symbol-a#chunk1", ParentID: "symbol-a"},
+		{NodeID: "symbol-b"},
+		{NodeID: "symbol-c"},
+	}}
+	backend := NewDelegatedVector(2, delegate, 4, 2)
+
+	if got, want := backend.Search([]float32{1, 0}, 3), []string{"symbol-a", "symbol-b", "symbol-c"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Search() = %v, want k unique parent IDs %v", got, want)
+	}
+
+	delegate.mu.Lock()
+	limits := append([]int(nil), delegate.limits...)
+	delegate.mu.Unlock()
+	if got, want := limits, []int{4}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("delegate limits = %v, want min(delegateCount, k+chunkCount) = %v", got, want)
+	}
+}
+
+func TestDelegatedVectorSearchRejectsNonPositiveLimitWithoutDelegateCall(t *testing.T) {
+	delegate := &publicationTestDelegate{hits: []graph.VectorHit{{NodeID: "symbol-a"}}}
+	backend := NewDelegatedVector(2, delegate, 1, 0)
+
+	for _, k := range []int{0, -1} {
+		if got := backend.Search([]float32{1, 0}, k); got != nil {
+			t.Fatalf("Search(k=%d) = %v, want nil", k, got)
+		}
+	}
+	delegate.mu.Lock()
+	limits := append([]int(nil), delegate.limits...)
+	delegate.mu.Unlock()
+	if len(limits) != 0 {
+		t.Fatalf("delegate called with limits %v for non-positive k", limits)
+	}
+}
+
 func TestSetDelegateReleasesHeapAndChunkState(t *testing.T) {
 	backend := NewVector(2)
 	backend.Add("symbol-a#chunk0", []float32{1, 0})
@@ -130,6 +171,89 @@ func TestSetDelegateReleasesHeapAndChunkState(t *testing.T) {
 	}
 	if backend.graph != nil {
 		t.Fatal("delegated Add allocated an HNSW graph")
+	}
+}
+
+func TestSerializeVectorUpdateSerializesConcurrentCallbacks(t *testing.T) {
+	swappable := NewSwappable(&publicationTestTextBackend{})
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan struct{})
+	go func() {
+		_ = swappable.SerializeVectorUpdate(func() error {
+			close(firstStarted)
+			<-releaseFirst
+			return nil
+		})
+		close(firstDone)
+	}()
+	awaitPublicationSignal(t, "first callback start", firstStarted)
+
+	secondAttempted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	secondDone := make(chan struct{})
+	go func() {
+		close(secondAttempted)
+		_ = swappable.SerializeVectorUpdate(func() error {
+			close(secondStarted)
+			return nil
+		})
+		close(secondDone)
+	}()
+	awaitPublicationSignal(t, "second callback attempt", secondAttempted)
+
+	select {
+	case <-secondStarted:
+		t.Fatal("second vector-update callback started while the first was active")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	awaitPublicationSignal(t, "first callback completion", firstDone)
+	awaitPublicationSignal(t, "second callback start", secondStarted)
+	awaitPublicationSignal(t, "second callback completion", secondDone)
+	swappable.Close()
+}
+
+func TestCloseWaitsForActiveVectorUpdate(t *testing.T) {
+	text := &publicationTestTextBackend{}
+	swappable := NewSwappable(text)
+	updateStarted := make(chan struct{})
+	releaseUpdate := make(chan struct{})
+	updateDone := make(chan struct{})
+	go func() {
+		_ = swappable.SerializeVectorUpdate(func() error {
+			close(updateStarted)
+			<-releaseUpdate
+			return nil
+		})
+		close(updateDone)
+	}()
+	awaitPublicationSignal(t, "vector-update callback start", updateStarted)
+
+	closeAttempted := make(chan struct{})
+	closeDone := make(chan struct{})
+	go func() {
+		close(closeAttempted)
+		swappable.Close()
+		close(closeDone)
+	}()
+	awaitPublicationSignal(t, "Close attempt", closeAttempted)
+
+	select {
+	case <-closeDone:
+		t.Fatal("Close completed while a vector-update callback was active")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := text.closes(); got != 0 {
+		t.Fatalf("backend close count = %d while vector update active, want 0", got)
+	}
+
+	close(releaseUpdate)
+	awaitPublicationSignal(t, "vector-update callback completion", updateDone)
+	awaitPublicationSignal(t, "Close completion", closeDone)
+	if got := text.closes(); got != 1 {
+		t.Fatalf("backend close count = %d after vector update drained, want 1", got)
 	}
 }
 
@@ -295,6 +419,15 @@ func TestReplaceHybridVectorFlattensAndSupportsRepeatedReplacement(t *testing.T)
 	}
 	if got := fourth.Count(); got != 0 {
 		t.Fatalf("last vector Count() = %d after close, want 0", got)
+	}
+}
+
+func awaitPublicationSignal(t *testing.T, name string, signal <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", name)
 	}
 }
 

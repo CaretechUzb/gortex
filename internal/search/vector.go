@@ -148,15 +148,35 @@ func (v *VectorBackend) SetDelegate(d VectorDelegate) {
 
 // Search returns the k nearest neighbors to the query vector.
 func (v *VectorBackend) Search(query []float32, k int) []string {
+	if k <= 0 {
+		return nil
+	}
 	v.mu.RLock()
 	d := v.delegate
+	delegateCount := v.delegateCount
+	delegateChunks := v.delegateChunkCount
 	v.mu.RUnlock()
 	if d != nil {
-		hits, err := d.SimilarTo(query, k)
+		// Similarity rows are vector-ranked, but several top rows may be sibling
+		// chunks of one parent. Overfetch by the complete chunk population (capped
+		// by the corpus size), then stop after k unique symbols so de-duplication
+		// cannot silently under-fill an otherwise sufficient result set.
+		fetch := k
+		if delegateChunks > 0 {
+			if delegateCount-k <= delegateChunks {
+				fetch = delegateCount
+			} else {
+				fetch = k + delegateChunks
+			}
+			if fetch < k {
+				fetch = k
+			}
+		}
+		hits, err := d.SimilarTo(query, fetch)
 		if err != nil || len(hits) == 0 {
 			return nil
 		}
-		ids := make([]string, 0, len(hits))
+		ids := make([]string, 0, min(k, len(hits)))
 		seen := make(map[string]struct{}, len(hits))
 		for _, h := range hits {
 			id := h.NodeID
@@ -171,6 +191,9 @@ func (v *VectorBackend) Search(query []float32, k int) []string {
 			}
 			seen[id] = struct{}{}
 			ids = append(ids, id)
+			if len(ids) == k {
+				break
+			}
 		}
 		return ids
 	}
