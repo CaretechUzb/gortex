@@ -16,12 +16,14 @@ func TestLocalizationClaimParserPairsSetextWithinOneContainer(t *testing.T) {
 		message string
 		want    []string
 	}{
-		{name: "top level heading", message: "Fabricated.flush\n---"},
-		{name: "quoted heading", message: "> Fabricated.flush\n> ==="},
+		{name: "top level heading", message: "Fabricated.flush\n---", want: []string{"Fabricated.flush"}},
+		{name: "quoted heading", message: "> Fabricated.flush\n> ===", want: []string{"Fabricated.flush"}},
 		{name: "structured row before thematic break", message: "SYMBOLS:\n- Fabricated.flush\n---", want: []string{"Fabricated.flush"}},
 		{name: "list row before thematic break", message: "- Fabricated.flush\n---", want: []string{"Fabricated.flush"}},
 		{name: "different quote container", message: "Fabricated.flush\n> ---", want: []string{"Fabricated.flush"}},
-		{name: "atx heading", message: "## Fabricated.flush"},
+		{name: "new list cannot underline bare claim", message: "FabricatedThing\n- ---", want: []string{"FabricatedThing"}},
+		{name: "new quote cannot underline bare claim", message: "FabricatedThing\n> ---", want: []string{"FabricatedThing"}},
+		{name: "atx heading", message: "## Fabricated.flush", want: []string{"Fabricated.flush"}},
 		{name: "fenced heading-like code", message: "```text\n# Fabricated.flush\n```", want: []string{"Fabricated.flush"}},
 	}
 	for _, test := range tests {
@@ -136,16 +138,16 @@ func TestLocalizationClaimParserRespectsIndentedCode(t *testing.T) {
 		message string
 		want    []string
 	}{
-		{name: "zero-space Setext", message: "Fabricated.flush\n---"},
-		{name: "three-space Setext", message: "   Fabricated.flush\n   ---"},
+		{name: "zero-space Setext", message: "Fabricated.flush\n---", want: []string{"Fabricated.flush"}},
+		{name: "three-space Setext", message: "   Fabricated.flush\n   ---", want: []string{"Fabricated.flush"}},
 		{name: "four-space code", message: "    Fabricated.flush\n    ---", want: []string{"Fabricated.flush"}},
 		{name: "tab-indented code", message: "\tFabricated.flush\n\t---", want: []string{"Fabricated.flush"}},
 		{name: "top-level claim and code underline", message: "Fabricated.flush\n    ---", want: []string{"Fabricated.flush"}},
-		{name: "quoted Setext", message: "> Fabricated.flush\n> ---"},
+		{name: "quoted Setext", message: "> Fabricated.flush\n> ---", want: []string{"Fabricated.flush"}},
 		{name: "different quote containers", message: "> Fabricated.flush\n>> ---", want: []string{"Fabricated.flush"}},
 		{name: "structured claim before thematic break", message: "SYMBOLS:\n- Fabricated.flush\n---", want: []string{"Fabricated.flush"}},
 		{name: "list claim before thematic break", message: "- Fabricated.flush\n---", want: []string{"Fabricated.flush"}},
-		{name: "atx heading", message: "# Fabricated.flush"},
+		{name: "atx heading", message: "# Fabricated.flush", want: []string{"Fabricated.flush"}},
 		{name: "fenced heading-like code", message: "```text\n# Fabricated.flush\n```", want: []string{"Fabricated.flush"}},
 	}
 	for _, test := range tests {
@@ -265,40 +267,61 @@ func TestLocalizationClaimParserKeepsFenceWithinOpeningContainer(t *testing.T) {
 		want    []string
 	}{
 		{
-			name:    "top level rejects quoted pseudo-close",
-			message: "```text\ninside\n> ```\n# Fabricated.flush\n```",
-			want:    []string{"Fabricated.flush"},
+			name:    "bullet continuation closes",
+			message: "PRIMARY:\n- ```text\n  harmless\n  ```\n- Writer",
+			want:    []string{"Writer"},
 		},
 		{
-			name:    "quoted rejects top-level pseudo-close",
-			message: "> ```text\n> inside\n```\n> # Fabricated.flush\n> ```",
-			want:    []string{"Fabricated.flush"},
+			name:    "ordered continuation closes",
+			message: "PRIMARY:\n1. ```text\n   harmless\n   ```\n2. Writer",
+			want:    []string{"Writer"},
 		},
 		{
-			name:    "top level rejects list pseudo-close",
-			message: "```text\ninside\n- ```\n# Fabricated.flush\n```",
-			want:    []string{"Fabricated.flush"},
+			name:    "nested continuation closes",
+			message: "PRIMARY:\n- 1. ```text\n     harmless\n     ```\n- 2. Writer",
+			want:    []string{"Writer"},
 		},
 		{
-			name:    "list rejects top-level pseudo-close",
-			message: "- ```text\n- inside\n```\n- # Fabricated.flush\n- ```",
-			want:    []string{"Fabricated.flush"},
+			name:    "quote then list continuation closes",
+			message: "> PRIMARY:\n> - ```text\n>   harmless\n>   ```\n> - Writer",
+			want:    []string{"Writer"},
 		},
 		{
-			name:    "top-level same-container close",
-			message: "```text\ninside\n```\n# Fabricated.flush",
+			name:    "list then quote continuation closes",
+			message: "- PRIMARY:\n  > ```text\n  > harmless\n  > ```\n  > Writer",
+			want:    []string{"Writer"},
 		},
 		{
-			name:    "quoted same-container close",
-			message: "> ```text\n> inside\n> ```\n> # Fabricated.flush",
+			name:    "sibling item cannot close",
+			message: "PRIMARY:\n- ```text\n  harmless\n- ```\n  Writer\n  ```",
 		},
 		{
-			name:    "list same-container close",
-			message: "- ```text\n- inside\n- ```\n- # Fabricated.flush",
+			name:    "list exit reprocesses line",
+			message: "- ```text\n  harmless\nPRIMARY:\nWriter",
+			want:    []string{"Writer"},
 		},
 		{
-			name:    "legal indentation remains compatible",
-			message: "   ```text\ninside\n ```\n# Fabricated.flush",
+			name:    "quote exit reprocesses line",
+			message: "> ```text\n> harmless\nPRIMARY:\nWriter",
+			want:    []string{"Writer"},
+		},
+		{
+			name:    "nested fence opener captures child path",
+			message: "- PRIMARY:\n  - ```text\n    Writer\n    ```\n  - Reader",
+			want:    []string{"Reader"},
+		},
+		{
+			name:    "list tab overshoot stays code indented",
+			message: "PRIMARY:\n- ```text\n\t  ```\n  Writer\n  ```",
+		},
+		{
+			name:    "quote tab overshoot stays code indented",
+			message: "PRIMARY:\n> ```text\n>\t  ```\n> Writer\n> ```",
+		},
+		{
+			name:    "three-space closer indentation is legal",
+			message: "PRIMARY:\n- ```text\n  harmless\n     ```\n- Writer",
+			want:    []string{"Writer"},
 		},
 	}
 	for _, test := range tests {

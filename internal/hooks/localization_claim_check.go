@@ -68,78 +68,180 @@ func localizationBoundedSymbolClaims(message string) ([]string, bool, bool) {
 	symbolsSawContent := false
 	lines := strings.Split(message, "\n")
 	var fence localizationMarkdownFenceState
+	var symbolsContainer localizationMarkdownContainerIdentity
 
 	for index, line := range lines {
 		markdown := localizationParseMarkdownContainer(line)
-		if marker, ok := localizationMarkdownFenceMarker(markdown.content); ok && !markdown.codeIndented {
-			// CommonMark indented code cannot open or close a fenced block.
-			container := markdown.identity()
-			if !fence.open {
-				marker.container = container
-				fence = marker
-				continue
-			}
-			if marker.character == fence.character && marker.length >= fence.length && marker.closing &&
-				fence.container == container {
-				fence = localizationMarkdownFenceState{}
-				continue
-			}
+		if !markdown.valid {
+			return nil, false, false
 		}
 		if fence.open {
-			// A heading-looking line inside a code fence is code, not a heading.
-			// Scan it so a fabricated qualified identity cannot hide behind '#'.
-			if !localizationScanUnstructuredClaimBody(line, budget) {
-				return nil, false, false
+			contained, sameContainer := localizationParseMarkdownContinuation(line, fence.container)
+			if sameContainer {
+				if marker, ok := localizationMarkdownFenceMarker(contained.content); ok &&
+					!contained.codeIndented && marker.character == fence.character &&
+					marker.length >= fence.length && marker.closing {
+					fence = localizationMarkdownFenceState{}
+					continue
+				}
+				// A heading-looking line inside a code fence is code, not a heading.
+				// Scan it so a fabricated qualified identity cannot hide behind '#'.
+				if !localizationScanUnstructuredClaimBody(contained.content, budget) {
+					return nil, false, false
+				}
+				continue
 			}
+			// A list or quote container ended before its fence closed. CommonMark
+			// ends the fenced block with that container; process this same line
+			// again as ordinary answer content instead of dropping it.
+			fence = localizationMarkdownFenceState{}
+		}
+
+		if inSymbols && symbolsContainer.depth > 0 {
+			scoped, sameContainer := localizationParseMarkdownContinuationWithChildren(line, symbolsContainer)
+			if sameContainer {
+				if !scoped.valid {
+					return nil, false, false
+				}
+				markdown = scoped
+			} else {
+				inSymbols = false
+				symbolsSawContent = false
+				symbolsContainer = localizationMarkdownContainerIdentity{}
+			}
+		}
+		if marker, ok := localizationMarkdownFenceMarker(markdown.content); ok && !markdown.codeIndented {
+			marker.container = markdown.identity()
+			fence = marker
 			continue
 		}
 
-		trimmed := strings.TrimSpace(line)
-		if localizationSymbolsHeading(trimmed) {
-			inSymbols = true
+		trimmed := strings.TrimSpace(markdown.content)
+		headingBody, heading := localizationMarkdownHeadingBodyAt(lines, index, markdown)
+		_, atxHeading := localizationMarkdownATXHeadingBody(markdown.content)
+		if heading {
+			if role, body, roleLine := localizationClaimRoleLine(headingBody, true); roleLine {
+				inSymbols = role == localizationClaimRoleOpen
+				symbolsSawContent = false
+				symbolsContainer = localizationMarkdownContainerIdentity{}
+				if inSymbols {
+					symbolsContainer = markdown.identity()
+				}
+				if body == "" {
+					continue
+				}
+				if inSymbols {
+					material, none, valid := localizationAddStructuredClaimLine(body, budget)
+					if !valid {
+						return nil, false, false
+					}
+					symbolsSawContent = material
+					explicitNone = explicitNone || none
+				} else if !localizationScanHeadingClaimBody(body, budget) {
+					return nil, false, false
+				}
+				continue
+			}
+			if atxHeading {
+				inSymbols = false
+				symbolsSawContent = false
+				symbolsContainer = localizationMarkdownContainerIdentity{}
+				if !localizationScanHeadingClaimBody(headingBody, budget) {
+					return nil, false, false
+				}
+				continue
+			}
+		}
+		if localizationMarkdownSetextUnderlineContent(markdown.content) {
+			continue
+		}
+		if role, body, roleLine := localizationClaimRoleLine(trimmed, false); roleLine {
+			inSymbols = role == localizationClaimRoleOpen
 			symbolsSawContent = false
+			symbolsContainer = localizationMarkdownContainerIdentity{}
+			if inSymbols {
+				symbolsContainer = markdown.identity()
+			}
+			if body == "" {
+				continue
+			}
+			if inSymbols {
+				material, none, valid := localizationAddStructuredClaimLine(body, budget)
+				if !valid {
+					return nil, false, false
+				}
+				symbolsSawContent = material
+				explicitNone = explicitNone || none
+			} else if !localizationScanUnstructuredClaimBody(body, budget) {
+				return nil, false, false
+			}
 			continue
 		}
 		if inSymbols {
 			if trimmed == "" {
 				if symbolsSawContent {
 					inSymbols = false
+					symbolsContainer = localizationMarkdownContainerIdentity{}
 				}
 				continue
 			}
-			// Structured rows are explicit identity claims. Do not let a later
-			// thematic break masquerade as a Setext underline and suppress one.
-			if localizationMarkdownHeading(trimmed) || localizationEmptyClaimRoleLabel(trimmed) {
-				inSymbols = false
-				continue
+			material, none, valid := localizationAddStructuredClaimLine(trimmed, budget)
+			if !valid {
+				return nil, false, false
 			}
-			token, rest, none, material := localizationStructuredClaimLine(trimmed)
 			if material {
 				symbolsSawContent = true
-				if token != "" && !budget.countToken(token) {
-					return nil, false, false
-				}
-				if none {
-					explicitNone = true
-				} else if token != "" && !budget.addClaim(localizationStructuredSymbolClaim(token), false) {
-					return nil, false, false
-				}
-				if rest != "" && !localizationScanUnstructuredClaimBody(rest, budget) {
-					return nil, false, false
-				}
+				explicitNone = explicitNone || none
 				continue
 			}
 			inSymbols = false
+			symbolsContainer = localizationMarkdownContainerIdentity{}
 		}
-		if localizationMarkdownHeadingAt(lines, index) {
+		if heading {
+			if !localizationScanHeadingClaimBody(headingBody, budget) {
+				return nil, false, false
+			}
 			continue
 		}
-		body, inspect := localizationUnstructuredClaimLine(line)
+		body, inspect := localizationUnstructuredClaimLine(markdown.content)
 		if inspect && !localizationScanUnstructuredClaimBody(body, budget) {
 			return nil, false, false
 		}
 	}
 	return budget.claims, explicitNone, true
+}
+
+func localizationAddStructuredClaimLine(line string, budget *localizationClaimBudget) (bool, bool, bool) {
+	token, rest, none, material := localizationStructuredClaimLine(line)
+	if !material {
+		return false, false, true
+	}
+	if token != "" && !budget.countToken(token) {
+		return false, false, false
+	}
+	if !none && token != "" && !budget.addClaim(localizationStructuredSymbolClaim(token), false) {
+		return false, false, false
+	}
+	if rest != "" && !localizationScanUnstructuredClaimBody(rest, budget) {
+		return false, false, false
+	}
+	return true, none, true
+}
+
+func localizationClaimRoleLine(line string, heading bool) (localizationClaimRoleMode, string, bool) {
+	line = strings.TrimSpace(line)
+	if colon := strings.IndexByte(line, ':'); colon >= 0 &&
+		(colon+1 >= len(line) || line[colon+1] != ':') {
+		if role := localizationClaimRole(line[:colon]); role != localizationClaimRoleNone {
+			return role, strings.TrimSpace(line[colon+1:]), true
+		}
+	}
+	if heading {
+		if role := localizationClaimRole(strings.TrimSuffix(line, ":")); role != localizationClaimRoleNone {
+			return role, "", true
+		}
+	}
+	return localizationClaimRoleNone, "", false
 }
 
 type localizationClaimBudget struct {
@@ -179,7 +281,16 @@ func (budget *localizationClaimBudget) addClaim(claim string, requireCodeShape b
 }
 
 func localizationScanUnstructuredClaimBody(body string, budget *localizationClaimBudget) bool {
+	return localizationScanClaimBody(body, budget, false)
+}
+
+func localizationScanHeadingClaimBody(body string, budget *localizationClaimBudget) bool {
+	return localizationScanClaimBody(body, budget, true)
+}
+
+func localizationScanClaimBody(body string, budget *localizationClaimBudget, heading bool) bool {
 	tokenStart := -1
+	skipUntil := -1
 	consume := func(start, end int) bool {
 		token := body[start:end]
 		if !budget.countToken(token) {
@@ -192,9 +303,40 @@ func localizationScanUnstructuredClaimBody(body string, budget *localizationClai
 			return true
 		}
 		explicitSyntax := localizationExplicitInlineClaim(body, start, end, claim)
+		if heading {
+			qualified := strings.ContainsAny(claim, ".:#") && localizationCodeShapedClaim(claim) ||
+				localizationBackslashQualifiedClaim(claim)
+			if !explicitSyntax && !qualified {
+				return true
+			}
+			return budget.addClaim(claim, false)
+		}
 		return budget.addClaim(claim, !explicitSyntax)
 	}
 	for index, r := range body {
+		if index < skipUntil {
+			continue
+		}
+		if r == '(' {
+			receiverStart := index
+			if tokenStart >= 0 {
+				prefix := body[tokenStart:index]
+				if strings.HasSuffix(prefix, ".") || strings.HasSuffix(prefix, "::") {
+					receiverStart = tokenStart
+				}
+			}
+			if end, claim, ok := localizationGoReceiverClaimAt(body, receiverStart, index); ok {
+				if tokenStart >= 0 && tokenStart < receiverStart && !consume(tokenStart, receiverStart) {
+					return false
+				}
+				tokenStart = -1
+				if !budget.countToken(body[receiverStart:end]) || !budget.addClaim(claim, false) {
+					return false
+				}
+				skipUntil = end
+				continue
+			}
+		}
 		if localizationClaimTokenRune(r) {
 			if tokenStart < 0 {
 				tokenStart = index
@@ -209,6 +351,87 @@ func localizationScanUnstructuredClaimBody(body string, budget *localizationClai
 		}
 	}
 	return tokenStart < 0 || consume(tokenStart, len(body))
+}
+
+func localizationGoReceiverClaimAt(body string, start, receiverOpen int) (int, string, bool) {
+	if start < 0 || start > receiverOpen || receiverOpen >= len(body) || body[receiverOpen] != '(' {
+		return 0, "", false
+	}
+	prefix := ""
+	fileQualified := false
+	if start < receiverOpen {
+		rawPrefix := body[start:receiverOpen]
+		switch {
+		case strings.HasSuffix(rawPrefix, "::"):
+			file := strings.TrimSuffix(rawPrefix, "::")
+			if !localizationFileQualifiedClaim(file + "::receiver") {
+				return 0, "", false
+			}
+			prefix = file + "::"
+			fileQualified = true
+		case strings.HasSuffix(rawPrefix, "."):
+			qualifier := strings.TrimSuffix(rawPrefix, ".")
+			if !localizationGoPackageQualifier(qualifier) {
+				return 0, "", false
+			}
+			prefix = qualifier + "."
+		default:
+			return 0, "", false
+		}
+	}
+	index := receiverOpen + 1
+	if index < len(body) && body[index] == '*' {
+		index++
+	}
+	receiverStart := index
+	for index < len(body) {
+		r, width := utf8.DecodeRuneInString(body[index:])
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '$' && r != '.' {
+			break
+		}
+		index += width
+	}
+	if receiverStart == index || index+2 >= len(body) || body[index] != ')' || body[index+1] != '.' {
+		return 0, "", false
+	}
+	methodStart := index + 2
+	index = methodStart
+	for index < len(body) {
+		r, width := utf8.DecodeRuneInString(body[index:])
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '$' {
+			break
+		}
+		index += width
+	}
+	if methodStart == index {
+		return 0, "", false
+	}
+	receiver := localizationNormalizeGoPointerIdentity(body[receiverOpen:index])
+	if !localizationInlineIdentitySyntax(receiver) {
+		return 0, "", false
+	}
+	claim := prefix + receiver
+	if !fileQualified && !localizationInlineIdentitySyntax(claim) {
+		return 0, "", false
+	}
+	end := index
+	if strings.HasPrefix(body[end:], "()") {
+		end += 2
+	}
+	return end, claim, true
+}
+
+func localizationGoPackageQualifier(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) == 0 {
+		return false
+	}
+	for _, part := range parts {
+		if !localizationExplicitIdentityRow(part, part) {
+			return false
+		}
+	}
+	return true
 }
 
 // localizationExplicitInlineClaim admits a simple lower-case leaf only when
@@ -297,6 +520,19 @@ func localizationInlineIdentitySyntax(claim string) bool {
 	return true
 }
 
+func localizationBackslashQualifiedClaim(claim string) bool {
+	parts := strings.Split(claim, "\\")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if !localizationExplicitIdentityRow(part, part) {
+			return false
+		}
+	}
+	return true
+}
+
 func localizationInlineCodeDelimited(body string, start, end int) bool {
 	opening := 0
 	for index := start - 1; index >= 0 && body[index] == '`'; index-- {
@@ -314,20 +550,40 @@ func localizationInlineCodeDelimited(body string, start, end int) bool {
 
 func localizationUnstructuredClaimLine(line string) (string, bool) {
 	line = strings.TrimSpace(line)
-	if line == "" || localizationMarkdownHeading(line) {
+	if line == "" {
 		return "", false
 	}
-	if colon := strings.IndexByte(line, ':'); colon >= 0 && localizationClaimRoleLabel(line[:colon]) {
+	if _, heading := localizationMarkdownATXHeadingBody(line); heading {
+		return "", false
+	}
+	if localizationClaimRole(line) != localizationClaimRoleNone {
+		return "", false
+	}
+	if colon := strings.IndexByte(line, ':'); colon >= 0 &&
+		(colon+1 >= len(line) || line[colon+1] != ':') && localizationClaimRoleLabel(line[:colon]) {
 		line = strings.TrimSpace(line[colon+1:])
 		return line, line != ""
 	}
 	return line, true
 }
 
+const localizationMarkdownContainerMaxDepth = 8
+
+type localizationMarkdownContainerKind uint8
+
+const (
+	localizationMarkdownQuoteContainer localizationMarkdownContainerKind = iota + 1
+	localizationMarkdownListContainer
+)
+
+type localizationMarkdownContainerFrame struct {
+	kind                localizationMarkdownContainerKind
+	continuationColumns uint8
+}
+
 type localizationMarkdownContainerIdentity struct {
-	quoteDepth   int
-	listItem     bool
-	codeIndented bool
+	depth  uint8
+	frames [localizationMarkdownContainerMaxDepth]localizationMarkdownContainerFrame
 }
 
 type localizationMarkdownFenceState struct {
@@ -339,7 +595,6 @@ type localizationMarkdownFenceState struct {
 }
 
 func localizationMarkdownFenceMarker(line string) (localizationMarkdownFenceState, bool) {
-	line = strings.TrimLeft(line, " \t")
 	if len(line) < 3 || (line[0] != '`' && line[0] != '~') {
 		return localizationMarkdownFenceState{}, false
 	}
@@ -361,152 +616,329 @@ func localizationMarkdownFenceMarker(line string) (localizationMarkdownFenceStat
 
 type localizationMarkdownContainer struct {
 	content      string
-	quoteDepth   int
-	listItem     bool
+	path         localizationMarkdownContainerIdentity
 	codeIndented bool
+	valid        bool
 }
 
 func (container localizationMarkdownContainer) identity() localizationMarkdownContainerIdentity {
-	return localizationMarkdownContainerIdentity{
-		quoteDepth:   container.quoteDepth,
-		listItem:     container.listItem,
-		codeIndented: container.codeIndented,
+	return container.path
+}
+
+func (container *localizationMarkdownContainer) push(frame localizationMarkdownContainerFrame) bool {
+	if int(container.path.depth) >= len(container.path.frames) {
+		return false
 	}
+	container.path.frames[container.path.depth] = frame
+	container.path.depth++
+	return true
 }
 
 func localizationParseMarkdownContainer(line string) localizationMarkdownContainer {
-	container := localizationMarkdownContainer{content: strings.TrimRight(line, " \t\r")}
-	for depth := 0; depth < 8 && container.content != ""; depth++ {
-		content, codeIndented := localizationMarkdownIndent(container.content)
+	container := localizationMarkdownContainer{
+		content: strings.TrimRight(line, " \t\r"),
+		valid:   true,
+	}
+	return localizationParseMarkdownChildContainers(container, 0)
+}
+
+func localizationParseMarkdownChildContainers(
+	container localizationMarkdownContainer,
+	column int,
+) localizationMarkdownContainer {
+	for container.content != "" {
+		content, indent, codeIndented := localizationMarkdownIndentWidthAt(container.content, column)
+		column += indent
 		container.content = strings.TrimRight(content, " \t\r")
 		if codeIndented {
 			container.codeIndented = true
 			break
 		}
-		line = container.content
+		line := container.content
 		if line == "" {
 			break
 		}
 		if line[0] == '>' && (len(line) == 1 || line[1] == ' ' || line[1] == '\t') {
-			container.quoteDepth++
-			container.content = localizationMarkdownMarkerRemainder(line[1:])
+			if !container.push(localizationMarkdownContainerFrame{kind: localizationMarkdownQuoteContainer}) {
+				container.valid = false
+				return container
+			}
+			var padding int
+			container.content, padding = localizationMarkdownMarkerRemainderAt(line[1:], column+1)
+			column += 1 + padding
 			continue
 		}
-		if len(line) >= 2 && strings.ContainsRune("-*+", rune(line[0])) && (line[1] == ' ' || line[1] == '\t') {
-			container.listItem = true
-			container.content = localizationMarkdownMarkerRemainder(line[1:])
-			continue
+		frame, remainder, markerColumns, listItem := localizationMarkdownListMarker(line, column)
+		if !listItem {
+			break
 		}
-		index := 0
-		for index < len(line) && line[index] >= '0' && line[index] <= '9' {
-			index++
+		frame.continuationColumns += uint8(indent)
+		if !container.push(frame) {
+			container.valid = false
+			return container
 		}
-		if index > 0 && index+1 < len(line) && (line[index] == '.' || line[index] == ')') && (line[index+1] == ' ' || line[index+1] == '\t') {
-			container.listItem = true
-			container.content = localizationMarkdownMarkerRemainder(line[index+1:])
-			continue
-		}
-		break
+		column += markerColumns
+		container.content = strings.TrimRight(remainder, " \t\r")
 	}
 	return container
 }
 
-func localizationMarkdownIndent(line string) (string, bool) {
+func localizationParseMarkdownContinuation(
+	line string,
+	identity localizationMarkdownContainerIdentity,
+) (localizationMarkdownContainer, bool) {
+	return localizationParseMarkdownContinuationMode(line, identity, false)
+}
+
+func localizationParseMarkdownContinuationWithChildren(
+	line string,
+	identity localizationMarkdownContainerIdentity,
+) (localizationMarkdownContainer, bool) {
+	return localizationParseMarkdownContinuationMode(line, identity, true)
+}
+
+func localizationParseMarkdownContinuationMode(
+	line string,
+	identity localizationMarkdownContainerIdentity,
+	parseChildren bool,
+) (localizationMarkdownContainer, bool) {
+	container := localizationMarkdownContainer{
+		content: strings.TrimRight(line, " \t\r"),
+		path:    identity,
+		valid:   true,
+	}
+	column := 0
+	for index := 0; index < int(identity.depth); index++ {
+		frame := identity.frames[index]
+		if strings.TrimSpace(container.content) == "" {
+			for remaining := index; remaining < int(identity.depth); remaining++ {
+				if identity.frames[remaining].kind == localizationMarkdownQuoteContainer {
+					return localizationMarkdownContainer{}, false
+				}
+			}
+			container.content = ""
+			return container, true
+		}
+		switch frame.kind {
+		case localizationMarkdownQuoteContainer:
+			content, indent, codeIndented := localizationMarkdownIndentWidthAt(container.content, column)
+			column += indent
+			if codeIndented || content == "" || content[0] != '>' ||
+				len(content) > 1 && content[1] != ' ' && content[1] != '\t' {
+				return localizationMarkdownContainer{}, false
+			}
+			var padding int
+			container.content, padding = localizationMarkdownMarkerRemainderAt(content[1:], column+1)
+			column += 1 + padding
+		case localizationMarkdownListContainer:
+			required := int(frame.continuationColumns)
+			content, indent, ok := localizationMarkdownConsumeIndentAt(
+				container.content, required, column,
+			)
+			if !ok {
+				return localizationMarkdownContainer{}, false
+			}
+			if indent > required {
+				content = strings.Repeat(" ", indent-required) + content
+				indent = required
+			}
+			column += indent
+			container.content = strings.TrimRight(content, " \t\r")
+		default:
+			return localizationMarkdownContainer{}, false
+		}
+	}
+	if parseChildren {
+		return localizationParseMarkdownChildContainers(container, column), true
+	}
+	content, _, codeIndented := localizationMarkdownIndentWidthAt(container.content, column)
+	container.content = strings.TrimRight(content, " \t\r")
+	container.codeIndented = codeIndented
+	return container, true
+}
+
+func localizationMarkdownListMarker(
+	line string,
+	column int,
+) (localizationMarkdownContainerFrame, string, int, bool) {
+	markerEnd := 0
+	if len(line) >= 2 && strings.ContainsRune("-*+", rune(line[0])) {
+		markerEnd = 1
+	} else {
+		for markerEnd < len(line) && markerEnd < 9 && line[markerEnd] >= '0' && line[markerEnd] <= '9' {
+			markerEnd++
+		}
+		if markerEnd == 0 || markerEnd >= len(line) ||
+			(line[markerEnd] != '.' && line[markerEnd] != ')') {
+			return localizationMarkdownContainerFrame{}, "", 0, false
+		}
+		markerEnd++
+	}
+	if markerEnd >= len(line) || line[markerEnd] != ' ' && line[markerEnd] != '\t' {
+		return localizationMarkdownContainerFrame{}, "", 0, false
+	}
+
+	paddingEnd := markerEnd
+	paddingColumns := 0
+	for paddingEnd < len(line) && (line[paddingEnd] == ' ' || line[paddingEnd] == '\t') {
+		if line[paddingEnd] == ' ' {
+			paddingColumns++
+		} else {
+			paddingColumns += 4 - (column+markerEnd+paddingColumns)%4
+		}
+		paddingEnd++
+	}
+	if paddingColumns > 4 {
+		paddingEnd = markerEnd + 1
+		paddingColumns = 1
+		if line[markerEnd] == '\t' {
+			paddingColumns = 4 - (column+markerEnd)%4
+		}
+	}
+	markerColumns := markerEnd + paddingColumns
+	return localizationMarkdownContainerFrame{
+		kind:                localizationMarkdownListContainer,
+		continuationColumns: uint8(markerColumns),
+	}, line[paddingEnd:], markerColumns, true
+}
+
+func localizationMarkdownIndentWidthAt(line string, column int) (string, int, bool) {
 	columns := 0
 	for index := 0; index < len(line); index++ {
 		switch line[index] {
 		case ' ':
 			columns++
-			if columns >= 4 {
-				return line[index+1:], true
-			}
 		case '\t':
-			// A leading tab advances to at least the four-column code indent.
-			return line[index+1:], true
+			columns += 4 - (column+columns)%4
 		default:
-			return line[index:], false
+			return line[index:], columns, false
+		}
+		if columns >= 4 {
+			return line[index+1:], columns, true
 		}
 	}
-	return "", false
+	return "", columns, columns >= 4
 }
 
-func localizationMarkdownMarkerRemainder(line string) string {
-	if line != "" && (line[0] == ' ' || line[0] == '\t') {
-		line = line[1:]
+func localizationMarkdownConsumeIndentAt(line string, required, column int) (string, int, bool) {
+	columns := 0
+	index := 0
+	for index < len(line) && columns < required {
+		switch line[index] {
+		case ' ':
+			columns++
+		case '\t':
+			columns += 4 - (column+columns)%4
+		default:
+			return "", 0, false
+		}
+		index++
 	}
-	return strings.TrimRight(line, " \t\r")
-}
-
-func localizationMarkdownContainerContent(line string) string {
-	return localizationParseMarkdownContainer(line).content
-}
-
-func localizationMarkdownHeading(line string) bool {
-	container := localizationParseMarkdownContainer(line)
-	if container.codeIndented {
-		return false
+	if columns < required {
+		return "", 0, false
 	}
-	line = container.content
+	return line[index:], columns, true
+}
+
+func localizationMarkdownMarkerRemainderAt(line string, column int) (string, int) {
+	padding := 0
+	if line != "" {
+		switch line[0] {
+		case ' ':
+			padding = 1
+			line = line[1:]
+		case '\t':
+			// CommonMark permits one optional padding column after a quote
+			// marker. Preserve the tab's remaining virtual columns so they
+			// still contribute to code indentation after the container prefix.
+			width := 4 - column%4
+			line = line[1:]
+			if width > 1 {
+				line = strings.Repeat(" ", width-1) + line
+			}
+			padding = 1
+		}
+	}
+	return strings.TrimRight(line, " \t\r"), padding
+}
+
+func localizationMarkdownATXHeadingBody(line string) (string, bool) {
 	count := 0
 	for count < len(line) && line[count] == '#' {
 		count++
 	}
-	return count > 0 && count <= 6 && (count == len(line) || line[count] == ' ' || line[count] == '\t')
+	if count == 0 || count > 6 || count < len(line) && line[count] != ' ' && line[count] != '\t' {
+		return "", false
+	}
+	body := strings.TrimSpace(line[count:])
+	closing := len(body)
+	for closing > 0 && body[closing-1] == '#' {
+		closing--
+	}
+	if closing < len(body) && (closing == 0 || body[closing-1] == ' ' || body[closing-1] == '\t') {
+		body = strings.TrimSpace(body[:closing])
+	}
+	return body, true
 }
 
-func localizationMarkdownSetextUnderline(line string) bool {
-	container := localizationParseMarkdownContainer(line)
-	if container.codeIndented {
+func localizationMarkdownSetextUnderlineContent(content string) bool {
+	if content == "" || (content[0] != '=' && content[0] != '-') {
 		return false
 	}
-	line = container.content
-	if line == "" || (line[0] != '=' && line[0] != '-') {
-		return false
-	}
-	for index := 1; index < len(line); index++ {
-		if line[index] != line[0] {
+	for index := 1; index < len(content); index++ {
+		if content[index] != content[0] {
 			return false
 		}
 	}
 	return true
 }
 
-func localizationMarkdownHeadingAt(lines []string, index int) bool {
-	if index < 0 || index >= len(lines) {
-		return false
+func localizationMarkdownHeadingBodyAt(
+	lines []string,
+	index int,
+	current localizationMarkdownContainer,
+) (string, bool) {
+	if index < 0 || index >= len(lines) || current.codeIndented {
+		return "", false
 	}
-	if localizationMarkdownHeading(lines[index]) || localizationMarkdownSetextUnderline(lines[index]) {
-		return true
+	if body, ok := localizationMarkdownATXHeadingBody(current.content); ok {
+		return body, true
 	}
-	current := localizationParseMarkdownContainer(lines[index])
-	if current.content == "" || current.codeIndented || current.listItem || index+1 >= len(lines) {
-		return false
+	if current.content == "" || index+1 >= len(lines) ||
+		localizationMarkdownSetextUnderlineContent(current.content) {
+		return "", false
 	}
-	next := localizationParseMarkdownContainer(lines[index+1])
-	return !next.codeIndented && !next.listItem && current.quoteDepth == next.quoteDepth &&
-		localizationMarkdownSetextUnderline(next.content)
+	next, sameContainer := localizationParseMarkdownContinuation(lines[index+1], current.identity())
+	if !sameContainer || next.codeIndented || !localizationMarkdownSetextUnderlineContent(next.content) {
+		return "", false
+	}
+	return strings.TrimSpace(current.content), true
 }
 
-func localizationEmptyClaimRoleLabel(line string) bool {
-	line = strings.TrimSpace(line)
-	return strings.HasSuffix(line, ":") && localizationClaimRoleLabel(strings.TrimSuffix(line, ":"))
-}
+type localizationClaimRoleMode uint8
 
-func localizationSymbolsHeading(line string) bool {
-	line = strings.TrimSpace(line)
-	return strings.EqualFold(strings.TrimSuffix(line, ":"), "symbols")
-}
+const (
+	localizationClaimRoleNone localizationClaimRoleMode = iota
+	localizationClaimRoleOpen
+	localizationClaimRoleClose
+)
 
-func localizationClaimRoleLabel(value string) bool {
+func localizationClaimRole(value string) localizationClaimRoleMode {
 	value = strings.ToLower(strings.TrimSpace(value))
 	value = strings.ReplaceAll(value, "-", "_")
 	switch value {
-	case "primary", "supporting", "evidence", "file", "files", "symbol", "symbols",
-		"implementation", "implementation_details", "details", "answer", "result", "results":
-		return true
+	case "primary", "supporting", "symbol", "symbols":
+		return localizationClaimRoleOpen
+	case "evidence", "file", "files", "implementation", "implementation_details",
+		"details", "answer", "result", "results":
+		return localizationClaimRoleClose
 	default:
-		return false
+		return localizationClaimRoleNone
 	}
+}
+
+func localizationClaimRoleLabel(value string) bool {
+	return localizationClaimRole(value) != localizationClaimRoleNone
 }
 
 func localizationClaimTokenRune(r rune) bool {

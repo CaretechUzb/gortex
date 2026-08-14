@@ -24,10 +24,10 @@ func TestLocalizationClaimParserHonorsMarkdownStructure(t *testing.T) {
 		message string
 		want    string
 	}{
-		{name: "atx heading", message: "# Fabricated.flush", want: ""},
-		{name: "setext heading", message: "Fabricated.flush\n---", want: ""},
-		{name: "container atx heading", message: "> # Fabricated.flush", want: ""},
-		{name: "container setext heading", message: "> Fabricated.flush\n> ===", want: ""},
+		{name: "atx heading", message: "# Fabricated.flush", want: "Fabricated.flush"},
+		{name: "setext heading", message: "Fabricated.flush\n---", want: "Fabricated.flush"},
+		{name: "container atx heading", message: "> # Fabricated.flush", want: "Fabricated.flush"},
+		{name: "container setext heading", message: "> Fabricated.flush\n> ===", want: "Fabricated.flush"},
 		{name: "backtick fenced heading-like code", message: "```go\n# Fabricated.flush\n```", want: "Fabricated.flush"},
 		{name: "tilde fenced heading-like code", message: "~~~text\n## Fabricated.flush\n~~~~", want: "Fabricated.flush"},
 	}

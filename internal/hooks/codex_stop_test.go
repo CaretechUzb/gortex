@@ -28,6 +28,22 @@ func TestRunCodexStopClaimCheckUsesFinalMessageAndStopsAfterRetry(t *testing.T) 
 	}
 }
 
+func TestRunCodexStopClaimCheckReadsPrimaryHeading(t *testing.T) {
+	input := claimCheckTestInput(t, "# PRIMARY\nFabricated")
+	data, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() { runCodex(data, 0) })
+	var payload HookOutput
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("decode heading claim-check output %q: %v", out, err)
+	}
+	if payload.Decision != "block" || !strings.Contains(payload.Reason, "claim_check") {
+		t.Fatalf("Codex Stop did not enforce PRIMARY heading claims: %#v", payload)
+	}
+}
+
 func TestRunCodexStopFailsOpenWithoutFinalMessage(t *testing.T) {
 	input := claimCheckTestInput(t, "")
 	data, err := json.Marshal(input)
