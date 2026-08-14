@@ -36,10 +36,11 @@ const (
 	overlayLayerBaseNodesPerFileMax = 1024
 	// BaseNodesMax bounds summaries retained across the layer build. Once the
 	// budget is full, a later file may transiently return one emptiness sentinel.
-	overlayLayerBaseNodesMax       = 4096
-	overlayLayerParsedNodesMax     = 4096
-	overlayLayerParsedEdgesMax     = 16384
-	overlayLayerUnresolvedNamesMax = 1024
+	overlayLayerBaseNodesMax         = 4096
+	overlayLayerParsedNodesMax       = 4096
+	overlayLayerParsedEdgesMax       = 16384
+	overlayLayerParsedResultBytesMax = 16 << 20
+	overlayLayerUnresolvedNamesMax   = 1024
 )
 
 type overlayLayerLimitError struct {
@@ -49,6 +50,35 @@ type overlayLayerLimitError struct {
 
 func (e *overlayLayerLimitError) Error() string {
 	return fmt.Sprintf("overlay layer %s exceeds limit %d", e.Resource, e.Limit)
+}
+
+func validateBoundedOverlayExtractionUsage(
+	result *parser.ExtractionResult,
+	usage parser.ExtractionUsage,
+	limits parser.ExtractionLimits,
+) error {
+	if usage.RawNodes < 1 || usage.RawEdges < 0 || usage.StdoutBytes < 0 || usage.ResultBytes < 0 {
+		return fmt.Errorf("bounded extractor returned negative or missing usage")
+	}
+	if usage.StdoutBytes > usage.ResultBytes {
+		return fmt.Errorf("bounded extractor result usage is smaller than stdout usage")
+	}
+	if len(result.Nodes) > usage.RawNodes || len(result.Edges) > usage.RawEdges {
+		return fmt.Errorf("bounded extractor result exceeds reported raw usage")
+	}
+	if usage.RawNodes > limits.MaxNodes {
+		return &overlayLayerLimitError{Resource: "parsed nodes", Limit: overlayLayerParsedNodesMax}
+	}
+	if usage.RawEdges > limits.MaxEdges {
+		return &overlayLayerLimitError{Resource: "parsed edges", Limit: overlayLayerParsedEdgesMax}
+	}
+	if usage.StdoutBytes > int64(limits.MaxStdoutBytes) {
+		return &overlayLayerLimitError{Resource: "parsed stdout bytes", Limit: overlayLayerParsedResultBytesMax}
+	}
+	if usage.ResultBytes > int64(limits.MaxResultBytes) {
+		return &overlayLayerLimitError{Resource: "parsed result bytes", Limit: overlayLayerParsedResultBytesMax}
+	}
+	return nil
 }
 
 type stagedOverlayFile struct {
@@ -498,6 +528,7 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 	baseNodeCount := 0
 	parsedNodeCount := 0
 	parsedEdgeCount := 0
+	parsedResultBytes := int64(0)
 
 	for _, ov := range files {
 		if err := ctx.Err(); err != nil {
@@ -555,7 +586,28 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
-		result, extractErr := ext.Extract(relPath, content)
+
+		var (
+			result        *parser.ExtractionResult
+			extractErr    error
+			boundedUsage  parser.ExtractionUsage
+			boundedLimits parser.ExtractionLimits
+			bounded       bool
+		)
+		if boundedExtractor, ok := ext.(parser.BoundedExtractor); ok {
+			bounded = true
+			boundedLimits = parser.DefaultExtractionLimits()
+			boundedLimits.MaxNodes = overlayLayerParsedNodesMax - parsedNodeCount
+			boundedLimits.MaxEdges = overlayLayerParsedEdgesMax - parsedEdgeCount
+			remainingResultBytes := int64(overlayLayerParsedResultBytesMax) - parsedResultBytes
+			boundedLimits.MaxStdoutBytes = int(remainingResultBytes)
+			boundedLimits.MaxResultBytes = int(remainingResultBytes)
+			result, boundedUsage, extractErr = boundedExtractor.ExtractBounded(
+				ctx, relPath, content, boundedLimits,
+			)
+		} else {
+			result, extractErr = ext.Extract(relPath, content)
+		}
 		if result != nil {
 			// Overlay construction never retains parse trees or constant-value
 			// sidecars. Release/clear before every error and cancellation branch.
@@ -571,20 +623,32 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		if result == nil {
 			return nil, nil, fmt.Errorf("overlay parse %s: extractor returned nil result", ov.Path)
 		}
-		if result != nil {
-			if len(result.Nodes) > overlayLayerParsedNodesMax-parsedNodeCount {
-				return nil, nil, &overlayLayerLimitError{
-					Resource: "parsed nodes",
-					Limit:    overlayLayerParsedNodesMax,
-				}
+		if bounded {
+			if err := validateBoundedOverlayExtractionUsage(result, boundedUsage, boundedLimits); err != nil {
+				return nil, nil, fmt.Errorf("overlay parse %s: %w", ov.Path, err)
 			}
+		}
+
+		// Keep the raw returned-slice checks as defense in depth for both optional
+		// bounded implementations and trusted legacy extractors.
+		if len(result.Nodes) > overlayLayerParsedNodesMax-parsedNodeCount {
+			return nil, nil, &overlayLayerLimitError{
+				Resource: "parsed nodes",
+				Limit:    overlayLayerParsedNodesMax,
+			}
+		}
+		if len(result.Edges) > overlayLayerParsedEdgesMax-parsedEdgeCount {
+			return nil, nil, &overlayLayerLimitError{
+				Resource: "parsed edges",
+				Limit:    overlayLayerParsedEdgesMax,
+			}
+		}
+		if bounded {
+			parsedNodeCount += boundedUsage.RawNodes
+			parsedEdgeCount += boundedUsage.RawEdges
+			parsedResultBytes += boundedUsage.ResultBytes
+		} else {
 			parsedNodeCount += len(result.Nodes)
-			if len(result.Edges) > overlayLayerParsedEdgesMax-parsedEdgeCount {
-				return nil, nil, &overlayLayerLimitError{
-					Resource: "parsed edges",
-					Limit:    overlayLayerParsedEdgesMax,
-				}
-			}
 			parsedEdgeCount += len(result.Edges)
 		}
 		baseNodes, err := readOverlayBaseNodes(ctx, baseReader, graphPath, &baseNodeCount)
