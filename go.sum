@@ -448,8 +448,6 @@ github.com/blevesearch/bleve/v2 v2.6.0 h1:Cyd3dd4q5tCbOV8MnKUVRUDYMHOir9xn12NZzX
 github.com/blevesearch/bleve/v2 v2.6.0/go.mod h1:gLmI8lWgHgrIYf7UpUX7JISI1CaqC6VScu46mHThuAY=
 github.com/blevesearch/bleve_index_api v1.3.12 h1:MirVNltwGq8z0PhOgiQp+bKL5qq8OvCxEwOOC7NnHNE=
 github.com/blevesearch/bleve_index_api v1.3.12/go.mod h1:xvd48t5XMeeioWQ5/jZvgLrV98flT2rdvEJ3l/ki4Ko=
-github.com/blevesearch/bleve_index_api v1.4.1 h1:CYIyecFlI+/RYjzUm+NmDjYbSvk870Bb7f+Vl4b12q8=
-github.com/blevesearch/bleve_index_api v1.4.1/go.mod h1:xvd48t5XMeeioWQ5/jZvgLrV98flT2rdvEJ3l/ki4Ko=
 github.com/blevesearch/geo v0.2.5 h1:yJg9FX1oRwLnjXSXF+ECHfXFTF4diF02Ca/qUGVjJhE=
 github.com/blevesearch/geo v0.2.5/go.mod h1:Jhq7WE2K6mJTx1xS44M2pUO6Io+wjCSHh1+co3YOgH4=
 github.com/blevesearch/go-faiss v1.1.5 h1:/IU5lkOahH9Ghfk9n3F6N0XD7PYVXZJWmNDc9TtXuco=
@@ -462,8 +460,6 @@ github.com/blevesearch/mmap-go v1.2.0 h1:l33nNKPFcBjJUMwem6sAYJPUzhUCABoK9FxZDGi
 github.com/blevesearch/mmap-go v1.2.0/go.mod h1:Vd6+20GBhEdwJnU1Xohgt88XCD/CTWcqbCNxkZpyBo0=
 github.com/blevesearch/scorch_segment_api/v2 v2.4.7 h1:GlMzW08hcsM3DnLUxhyF/1PcDal1qtvvIuytuph5djw=
 github.com/blevesearch/scorch_segment_api/v2 v2.4.7/go.mod h1://IJ7tG3QCf0cWW/aVSXqy77tc1AvLu3fcJLYEvOAFs=
-github.com/blevesearch/scorch_segment_api/v2 v2.4.8 h1:ueWgv4xcTUbll2Lm42p/C9spOtFiuzs6iSLfJMnxg5Y=
-github.com/blevesearch/scorch_segment_api/v2 v2.4.8/go.mod h1:dkeBYwY/JqzXo/q55PLDzmxoiXH9Y8vr52q2+gY0nxk=
 github.com/blevesearch/segment v0.9.1 h1:+dThDy+Lvgj5JMxhmOVlgFfkUtZV2kw49xax4+jTfSU=
 github.com/blevesearch/segment v0.9.1/go.mod h1:zN21iLm7+GnBHWTao9I+Au/7MBiL8pPFtJBJTsk6kQw=
 github.com/blevesearch/snowballstem v0.9.0 h1:lMQ189YspGP6sXvZQ4WZ+MLawfV8wOmPoD/iWeNXm8s=
@@ -486,8 +482,6 @@ github.com/blevesearch/zapx/v16 v16.3.4 h1:hDAqA8qusZTNbPEL7//w5P65UZ2de6yhSeUaT
 github.com/blevesearch/zapx/v16 v16.3.4/go.mod h1:zqkPPqs9GS9FzVWzCO3Wf1X044yWAV17+4zb+FTiEHg=
 github.com/blevesearch/zapx/v17 v17.1.9 h1:K5MsArRyuwfylDTN1+cU7plGVIFz4gPoH4HD5M7I8ik=
 github.com/blevesearch/zapx/v17 v17.1.9/go.mod h1:34TIaJmdo5hMh2IBLoE4Day65j7DJ++8s5trz1yrsGY=
-github.com/blevesearch/zapx/v17 v17.2.1 h1:yIfupsQn2YlP5uKoWK8iGZ3uvxeQ2TQSNPEMnRVqPoA=
-github.com/blevesearch/zapx/v17 v17.2.1/go.mod h1:qwCdOYIG1kG0V4iYxwzNMwhxZxw7IXnSRrMobR1C/S0=
 github.com/campoy/embedmd v1.0.0 h1:V4kI2qTJJLf4J29RzI/MAt2c3Bl4dQSYPuflzwFH2hY=
 github.com/campoy/embedmd v1.0.0/go.mod h1:oxyr9RCiSXg0M3VJ3ks0UGfp98BpSSGr0kpiX3MzVl8=
 github.com/charmbracelet/bubbles v1.0.0 h1:12J8/ak/uCZEMQ6KU7pcfwceyjLlWsDLAxB5fXonfvc=
