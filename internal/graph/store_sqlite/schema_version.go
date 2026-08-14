@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 10
+const currentSchemaVersion = 11
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -78,6 +78,18 @@ var schemaMigrations = []schemaMigration{
 	// the legacy (node_id, dims, vec) rows for every ID shape. Rebuild only the
 	// derived vector sidecar rather than discarding otherwise-valid topology.
 	{version: 10, name: "rebuild vector corpus ownership and parents", inPlace: rebuildVectorCorpusSchema},
+	{version: 11, name: "add symbol FTS normalization state", inPlace: createSymbolFTSNormalizationStateTable},
+}
+
+// createSymbolFTSNormalizationStateTable is the explicit v11 migration for
+// existing stores. schemaSQL owns the canonical fresh-store definition; this
+// idempotent step makes the additive table part of the versioned contract.
+func createSymbolFTSNormalizationStateTable(tx *sql.Tx) error {
+	_, err := tx.Exec(`CREATE TABLE IF NOT EXISTS symbol_fts_state (
+		repo_prefix TEXT PRIMARY KEY,
+		normalization TEXT NOT NULL DEFAULT ''
+	) WITHOUT ROWID`)
+	return err
 }
 
 // dropUnusedSemanticPendingIndex removes an experimental index for a query

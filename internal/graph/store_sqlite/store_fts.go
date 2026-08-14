@@ -664,7 +664,7 @@ func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit 
 		}
 	}
 
-	match := s.buildFTSMatch(query)
+	match := s.buildFTSMatch(query, true)
 	if match == "" {
 		return nil, nil
 	}
@@ -730,17 +730,22 @@ func tier0ShortCircuitKind(k graph.NodeKind) bool {
 // buildFTSMatch tokenises the query with the write-side splitter and
 // builds an FTS5 MATCH expression: each token becomes a quoted prefix
 // term ("tok"*) and the terms are OR-joined so any token match counts.
+// normalize selects the symbol-FTS normalization pass. Content FTS keeps raw
+// bodies for snippets and scans, so its query path must remain unnormalised.
 // Returns "" when the query degenerates to no tokens.
-func (s *Store) buildFTSMatch(query string) string {
+func (s *Store) buildFTSMatch(query string, normalize bool) string {
 	tokens := search.Tokenize(query)
 	if len(tokens) == 0 {
 		// Fallback: when Tokenize drops everything (e.g. a single
 		// sub-2-char token like "go"), use the looser query tokeniser so
 		// the search still reaches the engine instead of returning empty.
 		tokens = search.TokenizeQuery(query)
-		if len(tokens) == 0 {
-			return ""
-		}
+	}
+	if normalize {
+		tokens = search.NormalizeFTSTokens(tokens)
+	}
+	if len(tokens) == 0 {
+		return ""
 	}
 	parts := make([]string, 0, len(tokens))
 	for _, t := range tokens {

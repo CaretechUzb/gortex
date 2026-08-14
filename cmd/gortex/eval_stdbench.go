@@ -112,9 +112,10 @@ func runEvalStdbench(_ *cobra.Command, _ []string) error {
 		// Mirrors the indexer's ftsTokensFor: the write side splits with
 		// search.Tokenize so the read side's query tokenisation lands on
 		// the same terms.
+		tokens := search.NormalizeFTSTokens(search.Tokenize(d.Text))
 		items = append(items, graph.SymbolFTSItem{
 			NodeID: d.ID,
-			Tokens: strings.Join(search.Tokenize(d.Text), " "),
+			Tokens: strings.Join(tokens, " "),
 		})
 	}
 	// One call, not a chunked loop: BulkUpsertSymbolFTS wipes the prefix

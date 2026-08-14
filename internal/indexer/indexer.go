@@ -701,6 +701,7 @@ func ftsTokensFor(n *graph.Node, projectName string) string {
 		}
 		tokens = append(tokens, search.Tokenize(f)...)
 	}
+	tokens = search.NormalizeFTSTokens(tokens)
 	if len(tokens) == 0 {
 		return ""
 	}
@@ -2646,6 +2647,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// into the durable store, which is far cheaper than writing each node
 		// and edge through as it is parsed.
 		idx.indexCount.Add(1)
+		if err := idx.markSymbolFTSNormalizationPending(idx.graph); err != nil {
+			return nil, err
+		}
 		diskTarget = idx.graph
 		inMemShadow = idx.newStructuralIntegrityShadow(diskTarget, graph.StructuralPathShadowCold)
 		idx.graph = inMemShadow
@@ -2822,6 +2826,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						retErr = fmt.Errorf("indexer: finalize backend FTS: %w", ferr)
 					}
 				}
+				if retErr == nil && ftsReady {
+					if err := idx.markSymbolFTSNormalization(diskTarget); err != nil {
+						retErr = err
+					}
+				}
 				reporter.Report("building symbol fts", 1, 1)
 			}
 			reporter.Report("persisting bulk graph", 1, 1)
@@ -2875,7 +2884,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if retErr != nil {
 				return
 			}
+			if err := idx.markSymbolFTSNormalizationPending(idx.graph); err != nil {
+				retErr = err
+				return
+			}
 			if err := idx.populateSymbolFTS(reporter); err != nil {
+				retErr = err
+				return
+			}
+			if err := idx.markSymbolFTSNormalization(idx.graph); err != nil {
 				retErr = err
 			}
 		}()
@@ -3988,6 +4005,9 @@ func (idx *Indexer) cleanCensusResult(ctx context.Context, detected int, started
 		if err := idx.buildSearchIndexCtx(ctx); err != nil {
 			return nil, err
 		}
+	}
+	if _, err := idx.reconcileSymbolFTSNormalization(nil); err != nil {
+		return nil, err
 	}
 
 	nodes, edges := idx.repoNodeEdgeCount()
@@ -5672,6 +5692,13 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
+
+	// Reconcile the complete durable corpus before any scoped mutation writes
+	// rows with this process's normalization mode. Doing this after a partial
+	// update would leave unchanged symbols in the previous mode.
+	if _, err := idx.reconcileSymbolFTSNormalization(nil); err != nil {
+		return nil, err
+	}
 
 	// scopeRels holds the repo-relative slash-paths the caller asked to
 	// reindex — used both to drive the discovery walk and to bound

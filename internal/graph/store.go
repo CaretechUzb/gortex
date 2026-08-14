@@ -574,6 +574,16 @@ type SymbolFTSCounter interface {
 	SymbolFTSCount() (int, error)
 }
 
+// SymbolFTSNormalizationState persists the normalization mode used to produce
+// each repository's native symbol FTS corpus. An indexer must advance the
+// marker only after an authoritative replacement succeeds; a crash between
+// replacement and marker update is safe because the next warm reconcile
+// repeats the idempotent rebuild.
+type SymbolFTSNormalizationState interface {
+	GetSymbolFTSNormalization(repoPrefix string) (mode string, ok bool, err error)
+	SetSymbolFTSNormalization(repoPrefix, mode string) error
+}
+
 // SymbolFTSBatchUpserter is the optional incremental fast path. It is kept
 // separate from SymbolSearcher so alternate search implementations and test
 // doubles retain source compatibility. Indexing paths use this capability as

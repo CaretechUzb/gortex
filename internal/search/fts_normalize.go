@@ -24,6 +24,20 @@ import (
 // two never disagree.
 var ftsStemmingEnabled = ftsStemmingFromEnv()
 
+const ftsNormalizationPorterV1 = "porter-v1"
+
+// FTSNormalizationMode returns the stable identifier persisted beside each
+// repository's native symbol FTS corpus. The empty string is the historical
+// unnormalised mode, so stores created before the marker existed remain
+// compatible while stemming is disabled. A non-empty change requires the
+// indexer to rebuild the repository's symbol FTS before serving it.
+func FTSNormalizationMode() string {
+	if ftsStemmingEnabled {
+		return ftsNormalizationPorterV1
+	}
+	return ""
+}
+
 func ftsStemmingFromEnv() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("GORTEX_FTS_STEMMING"))) {
 	case "1", "true", "yes", "on", "y":
