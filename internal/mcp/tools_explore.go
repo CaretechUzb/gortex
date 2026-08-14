@@ -3601,6 +3601,64 @@ func prioritizeLocalizationEvidenceTarget(requiredID string, targets []exploreTa
 	return ordered
 }
 
+// localizationSecondaryTaskCitedTarget reserves one independently cited
+// identity already present in the bounded target window. Citation offsets used
+// by the explicit target or exact source-range owners are consumed: one authored
+// mention cannot seat several overloads that share the same bare name. The
+// caller only reorders presentation evidence; no graph read, provenance, or
+// completion authority is added.
+func localizationSecondaryTaskCitedTarget(
+	task string,
+	targets, selected []exploreTarget,
+) (exploreTarget, bool) {
+	if strings.TrimSpace(task) == "" || len(targets) == 0 {
+		return exploreTarget{}, false
+	}
+	selectedIDs := make(map[string]struct{}, len(selected))
+	selectedNames := make(map[string]struct{}, len(selected))
+	consumedOffsets := make(map[int]struct{}, len(selected))
+	for _, target := range selected {
+		if target.node == nil {
+			continue
+		}
+		selectedIDs[exploreDraftNodeKey(target.node)] = struct{}{}
+		if name := strings.TrimSpace(target.node.Name); name != "" {
+			selectedNames[name] = struct{}{}
+		}
+		if offset := localizationDirectAdjacencyNodeTaskCitationOffset(task, target.node); offset >= 0 {
+			consumedOffsets[offset] = struct{}{}
+		}
+	}
+	bestIndex, bestOffset := -1, -1
+	for index, target := range targets {
+		if target.node == nil {
+			continue
+		}
+		if _, selected := selectedIDs[exploreDraftNodeKey(target.node)]; selected {
+			continue
+		}
+		offset := localizationDirectAdjacencyNodeTaskCitationOffset(task, target.node)
+		if offset < 0 {
+			continue
+		}
+		name := strings.TrimSpace(target.node.Name)
+		if _, represented := selectedNames[name]; represented &&
+			localizationTaskExactIdentifierOffset(task, name) == offset {
+			continue
+		}
+		if _, consumed := consumedOffsets[offset]; consumed {
+			continue
+		}
+		if bestIndex < 0 || offset < bestOffset {
+			bestIndex, bestOffset = index, offset
+		}
+	}
+	if bestIndex < 0 {
+		return exploreTarget{}, false
+	}
+	return targets[bestIndex], true
+}
+
 func localizationEvidenceTargetsFromDraft(task, exactID string, targets []exploreTarget, draft []exploreDraftEntry) []exploreTarget {
 	if len(targets) == 0 {
 		return targets
@@ -3674,6 +3732,14 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 				break
 			}
 		}
+	}
+	// One further concrete identifier that the task independently cites may
+	// precede generic draft ranking. Graph-proven causal pairs, the retrieval
+	// head, and any prescribed exact symbol have already retained their order.
+	// Offsets represented above are consumed so one authored mention cannot
+	// reserve several same-name overloads.
+	if target, ok := localizationSecondaryTaskCitedTarget(task, targets, selected); ok {
+		appendTarget(target)
 	}
 	// Unanchored content evidence may occupy at most two PRIMARY seats. Candidate
 	// selection already bounds this lane; order its survivors by the number of
