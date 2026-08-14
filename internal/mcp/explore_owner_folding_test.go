@@ -66,6 +66,43 @@ func TestFoldMemberOwnersPromotesSharedOwner(t *testing.T) {
 	}
 }
 
+func TestFoldMemberOwnersPromotesTwoGroupsAtCurrentMemberRanks(t *testing.T) {
+	g := graph.New()
+	ownerA := &graph.Node{ID: "repo/groups.go::OwnerA", Kind: graph.KindType, Name: "OwnerA", FilePath: "repo/groups.go"}
+	ownerB := &graph.Node{ID: "repo/groups.go::OwnerB", Kind: graph.KindType, Name: "OwnerB", FilePath: "repo/groups.go"}
+	memberA1 := &graph.Node{ID: "repo/groups.go::OwnerA.a", Kind: graph.KindMethod, Name: "a", FilePath: "repo/groups.go"}
+	memberA2 := &graph.Node{ID: "repo/groups.go::OwnerA.b", Kind: graph.KindMethod, Name: "b", FilePath: "repo/groups.go"}
+	memberB1 := &graph.Node{ID: "repo/groups.go::OwnerB.a", Kind: graph.KindMethod, Name: "a", FilePath: "repo/groups.go"}
+	memberB2 := &graph.Node{ID: "repo/groups.go::OwnerB.b", Kind: graph.KindMethod, Name: "b", FilePath: "repo/groups.go"}
+	unrelatedX := &graph.Node{ID: "repo/groups.go::x", Kind: graph.KindFunction, Name: "x", FilePath: "repo/groups.go"}
+	unrelatedY := &graph.Node{ID: "repo/groups.go::y", Kind: graph.KindFunction, Name: "y", FilePath: "repo/groups.go"}
+	g.AddBatch([]*graph.Node{ownerA, ownerB, memberA1, memberA2, memberB1, memberB2, unrelatedX, unrelatedY}, []*graph.Edge{
+		{From: memberA1.ID, To: ownerA.ID, Kind: graph.EdgeMemberOf},
+		{From: memberA2.ID, To: ownerA.ID, Kind: graph.EdgeMemberOf},
+		{From: memberB1.ID, To: ownerB.ID, Kind: graph.EdgeMemberOf},
+		{From: memberB2.ID, To: ownerB.ID, Kind: graph.EdgeMemberOf},
+	})
+	server := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil)
+	targets := []exploreTarget{
+		{node: memberA1, score: 1},
+		{node: unrelatedX, score: .9},
+		{node: memberA2, score: .8},
+		{node: memberB1, score: .7},
+		{node: unrelatedY, score: .6},
+		{node: memberB2, score: .5},
+	}
+	folded := server.foldMemberOwners(context.Background(), targets, graph.LocalizationNodeScope{})
+	want := []string{ownerA.ID, memberA1.ID, unrelatedX.ID, memberA2.ID, ownerB.ID, memberB1.ID, unrelatedY.ID, memberB2.ID}
+	if len(folded) != len(want) {
+		t.Fatalf("folded len = %d, want %d: %#v", len(folded), len(want), folded)
+	}
+	for index, id := range want {
+		if folded[index].node == nil || folded[index].node.ID != id {
+			t.Fatalf("folded[%d] = %#v, want %q; full=%#v", index, folded[index], id, folded)
+		}
+	}
+}
+
 func TestFoldMemberOwnersBoundedRelationCapAndKindFilter(t *testing.T) {
 	for _, test := range []struct {
 		name     string

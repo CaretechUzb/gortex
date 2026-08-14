@@ -95,9 +95,9 @@ func (s *Server) foldMemberOwners(
 	}
 
 	type ownerGroup struct {
-		owner       *graph.Node
-		firstMember int
-		members     int
+		owner         *graph.Node
+		firstMemberID string
+		members       int
 	}
 	groups := map[string]*ownerGroup{}
 	order := make([]string, 0, exploreOwnerFoldScan)
@@ -118,7 +118,7 @@ func (s *Server) foldMemberOwners(
 		}
 		group, ok := groups[owner.ID]
 		if !ok {
-			group = &ownerGroup{owner: owner, firstMember: index}
+			group = &ownerGroup{owner: owner, firstMemberID: target.node.ID}
 			groups[owner.ID] = group
 			order = append(order, owner.ID)
 		}
@@ -137,7 +137,11 @@ func (s *Server) foldMemberOwners(
 		if group.members < 2 {
 			continue
 		}
-		if existing, present := rankOf[ownerID]; present && existing <= group.firstMember {
+		firstMember, present := rankOf[group.firstMemberID]
+		if !present {
+			return originalTargets
+		}
+		if existing, present := rankOf[ownerID]; present && existing <= firstMember {
 			continue // the owner already leads its members
 		}
 		// Remove a lower-ranked occurrence of the owner, then insert it
@@ -156,7 +160,7 @@ func (s *Server) foldMemberOwners(
 		if !found {
 			ownerTarget = exploreTarget{node: group.owner, foldedOwner: true}
 		}
-		insertAt := group.firstMember
+		insertAt := firstMember
 		if insertAt > len(kept) {
 			insertAt = len(kept)
 		}
