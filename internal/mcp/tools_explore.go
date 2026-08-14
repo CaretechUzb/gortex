@@ -5885,16 +5885,9 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 					calleeIDs = append(calleeIDs, id)
 				}
 			}
-			if len(calleeIDs) > 0 {
-				for id, edges := range reader.GetOutEdgesByNodeIDs(calleeIDs) {
-					for _, edge := range edges {
-						if edge != nil && edge.Kind == graph.EdgeInstantiates {
-							sourceLiteralTaskAligned[id] = true
-							break
-						}
-					}
-				}
-			}
+			sourceLiteralTaskAligned = projectExploreSourceLiteralConstructionAlignment(
+				ctx, reader, calleeIDs,
+			)
 		}
 	}
 	if len(order) == 0 {

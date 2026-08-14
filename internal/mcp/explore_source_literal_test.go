@@ -28,9 +28,21 @@ import (
 
 type exploreSourceLiteralCountingStore struct {
 	graph.Store
-	allNodesCalls     int
-	outEdgeBatchCalls int
-	nodeLookupBatches int
+	allNodesCalls         int
+	outEdgeBatchCalls     int
+	outSiteBatchCalls     int
+	outEndpointBatchCalls int
+	nodeLookupBatches     int
+	lastSites             []graph.EdgeSourceSite
+	lastSiteKinds         []graph.EdgeKind
+	lastSiteLimit         int
+	lastEndpointIDs       []string
+	lastEndpointKinds     []graph.EdgeKind
+	lastEndpointLimit     int
+	lastNodeIDs           []string
+	siteLookup            func(context.Context, []graph.EdgeSourceSite, []graph.EdgeKind, int) (graph.BoundedSiteEdgeIdentityProjection, error)
+	endpointLookup        func(context.Context, []string, []graph.EdgeKind, int) (graph.BoundedEdgeIdentityProjection, error)
+	nodeLookup            func(context.Context, []string) (map[string]*graph.Node, error)
 }
 
 func (s *exploreSourceLiteralCountingStore) AllNodes() []*graph.Node {
@@ -45,7 +57,54 @@ func (s *exploreSourceLiteralCountingStore) GetOutEdgesByNodeIDs(ids []string) m
 
 func (s *exploreSourceLiteralCountingStore) GetNodesByIDs(ids []string) map[string]*graph.Node {
 	s.nodeLookupBatches++
+	s.lastNodeIDs = append([]string(nil), ids...)
 	return s.Store.GetNodesByIDs(ids)
+}
+
+func (s *exploreSourceLiteralCountingStore) GetNodesByIDsContext(
+	ctx context.Context,
+	ids []string,
+) (map[string]*graph.Node, error) {
+	s.nodeLookupBatches++
+	s.lastNodeIDs = append([]string(nil), ids...)
+	if s.nodeLookup != nil {
+		return s.nodeLookup(ctx, ids)
+	}
+	return s.Store.(exploreContextNodesReader).GetNodesByIDsContext(ctx, ids)
+}
+
+func (s *exploreSourceLiteralCountingStore) FindOutgoingSiteEdgeIdentitiesBounded(
+	ctx context.Context,
+	sites []graph.EdgeSourceSite,
+	kinds []graph.EdgeKind,
+	limit int,
+) (graph.BoundedSiteEdgeIdentityProjection, error) {
+	s.outSiteBatchCalls++
+	s.lastSites = append([]graph.EdgeSourceSite(nil), sites...)
+	s.lastSiteKinds = append([]graph.EdgeKind(nil), kinds...)
+	s.lastSiteLimit = limit
+	if s.siteLookup != nil {
+		return s.siteLookup(ctx, sites, kinds, limit)
+	}
+	return s.Store.(graph.BoundedOutgoingSiteEdgeIdentityReader).
+		FindOutgoingSiteEdgeIdentitiesBounded(ctx, sites, kinds, limit)
+}
+
+func (s *exploreSourceLiteralCountingStore) FindOutgoingEdgeIdentitiesBounded(
+	ctx context.Context,
+	ids []string,
+	kinds []graph.EdgeKind,
+	limit int,
+) (graph.BoundedEdgeIdentityProjection, error) {
+	s.outEndpointBatchCalls++
+	s.lastEndpointIDs = append([]string(nil), ids...)
+	s.lastEndpointKinds = append([]graph.EdgeKind(nil), kinds...)
+	s.lastEndpointLimit = limit
+	if s.endpointLookup != nil {
+		return s.endpointLookup(ctx, ids, kinds, limit)
+	}
+	return s.Store.(graph.BoundedOutgoingEdgeIdentityReader).
+		FindOutgoingEdgeIdentitiesBounded(ctx, ids, kinds, limit)
 }
 
 func (s *exploreSourceLiteralCountingStore) FindFileNodesBounded(
@@ -224,7 +283,11 @@ func TestMapExploreSourceLiteralMatchesPromotesUniqueDirectCalleeAcrossLanguages
 			requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: callee.ID, rank: 0, callee: true})
 			require.Equal(t, callee.FilePath, recall.ownerFiles[callee.ID])
 			require.Zero(t, counting.allNodesCalls, "callee promotion must remain batch- and file-bounded")
-			require.Equal(t, 1, counting.outEdgeBatchCalls)
+			require.Zero(t, counting.outEdgeBatchCalls, "legacy adjacency must not be queried")
+			require.Equal(t, 1, counting.outSiteBatchCalls)
+			require.Equal(t, []graph.EdgeSourceSite{{From: owner.ID, Line: 3}}, counting.lastSites)
+			require.Equal(t, []graph.EdgeKind{graph.EdgeCalls}, counting.lastSiteKinds)
+			require.Equal(t, exploreSourceLiteralCallEdgesPerSite, counting.lastSiteLimit)
 			require.Equal(t, 1, counting.nodeLookupBatches)
 		})
 	}
@@ -272,7 +335,8 @@ func TestMapExploreSourceLiteralMatchesDoesNotPromoteAssignment(t *testing.T) {
 	}
 	require.Equal(t, localizationProvenanceContentLiteral, localizationTargetProvenance(localizationCompletion{}, target))
 	require.False(t, localizationStrongSourceLiteralCallee(target), "assignment literals must remain advisory")
-	require.Zero(t, counting.outEdgeBatchCalls, "non-call literal hits must not query graph adjacency")
+	require.Zero(t, counting.outEdgeBatchCalls, "non-call literal hits must not query legacy graph adjacency")
+	require.Zero(t, counting.outSiteBatchCalls, "non-call literal hits must not query graph adjacency")
 	require.Zero(t, counting.nodeLookupBatches, "non-call literal hits must not query callee nodes")
 }
 

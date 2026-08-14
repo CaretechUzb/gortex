@@ -23,6 +23,8 @@ const (
 	exploreSourceLiteralRecallMaxTerms         = 2
 	exploreSourceLiteralRecallMaxOwnersPerTerm = 3
 	exploreSourceLiteralRecallMaxFilesPerTerm  = 2
+	exploreSourceLiteralCallEdgesPerSite       = 8
+	exploreSourceLiteralCalleeHydrationLimit   = exploreSourceLiteralRecallMaxHits * exploreSourceLiteralCallEdgesPerSite
 )
 
 // sourceLiteralRecallBudget is the wall-clock slice one anchor of the bounded
@@ -539,11 +541,8 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 		callName string
 	}
 	mapped := make([]mappedLiteralOwner, 0, len(matches))
-	ownerIDs := make([]string, 0, len(matches))
-	seenOwners := make(map[string]struct{}, len(matches))
-	calleeIDs := make([]string, 0, len(matches))
-	seenCallees := make(map[string]struct{}, len(matches))
-	ownerEdges := make(map[string][]*graph.Edge)
+	ownerSites := make([]graph.EdgeSourceSite, 0, len(matches))
+	seenSites := make(map[graph.EdgeSourceSite]struct{}, len(matches))
 
 	// First map each exact line to its smallest enclosing declaration. When
 	// the literal is syntactically inside one call on that line, retain the
@@ -568,35 +567,60 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 		callName, _ := exploreSourceLiteralCallName(match.Text, term)
 		mapped = append(mapped, mappedLiteralOwner{owner: owner, match: match, rank: rank, callName: callName})
 		if callName != "" {
-			if _, duplicate := seenOwners[owner.ID]; duplicate {
+			site := graph.EdgeSourceSite{From: owner.ID, Line: match.Line}
+			if _, duplicate := seenSites[site]; duplicate {
 				continue
 			}
-			seenOwners[owner.ID] = struct{}{}
-			ownerIDs = append(ownerIDs, owner.ID)
+			seenSites[site] = struct{}{}
+			ownerSites = append(ownerSites, site)
 		}
 	}
 
-	if len(ownerIDs) > 0 {
-		ownerEdges = reader.GetOutEdgesByNodeIDs(ownerIDs)
-		for _, item := range mapped {
-			if item.callName == "" {
-				continue
+	siteEdges := make(map[graph.EdgeSourceSite][]graph.EdgeIdentity)
+	calleeNodes := map[string]*graph.Node{}
+	if len(ownerSites) > 0 {
+		bounded, supported := reader.(graph.BoundedOutgoingSiteEdgeIdentityReader)
+		if supported {
+			projection, err := bounded.FindOutgoingSiteEdgeIdentitiesBounded(
+				ctx, ownerSites, []graph.EdgeKind{graph.EdgeCalls}, exploreSourceLiteralCallEdgesPerSite,
+			)
+			complete := err == nil && ctx.Err() == nil
+			calleeIDs := make([]string, 0, exploreSourceLiteralCalleeHydrationLimit)
+			seenCallees := make(map[string]struct{}, exploreSourceLiteralCalleeHydrationLimit)
+			if complete {
+				for _, site := range ownerSites {
+					if projection.Truncated[site] {
+						complete = false
+						break
+					}
+					for _, identity := range projection.BySite[site] {
+						if identity.To == "" {
+							continue
+						}
+						if _, duplicate := seenCallees[identity.To]; duplicate {
+							continue
+						}
+						if len(calleeIDs) == exploreSourceLiteralCalleeHydrationLimit {
+							complete = false
+							break
+						}
+						seenCallees[identity.To] = struct{}{}
+						calleeIDs = append(calleeIDs, identity.To)
+					}
+					if !complete {
+						break
+					}
+				}
 			}
-			for _, edge := range ownerEdges[item.owner.ID] {
-				if edge == nil || edge.Kind != graph.EdgeCalls || edge.Line != item.match.Line || edge.To == "" {
-					continue
+			if complete {
+				if hydrated, hydratedComplete := exploreNodesByIDsBounded(
+					ctx, reader, calleeIDs, exploreSourceLiteralCalleeHydrationLimit,
+				); hydratedComplete {
+					siteEdges = projection.BySite
+					calleeNodes = hydrated
 				}
-				if _, duplicate := seenCallees[edge.To]; duplicate {
-					continue
-				}
-				seenCallees[edge.To] = struct{}{}
-				calleeIDs = append(calleeIDs, edge.To)
 			}
 		}
-	}
-	calleeNodes := map[string]*graph.Node{}
-	if len(calleeIDs) > 0 {
-		calleeNodes = reader.GetNodesByIDs(calleeIDs)
 	}
 
 	seen := make(map[string]int, len(mapped))
@@ -607,11 +631,9 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 		calleeResolved := false
 		if item.callName != "" {
 			resolved := make(map[string]*graph.Node)
-			for _, edge := range ownerEdges[item.owner.ID] {
-				if edge == nil || edge.Kind != graph.EdgeCalls || edge.Line != item.match.Line {
-					continue
-				}
-				callee := calleeNodes[edge.To]
+			site := graph.EdgeSourceSite{From: item.owner.ID, Line: item.match.Line}
+			for _, identity := range siteEdges[site] {
+				callee := calleeNodes[identity.To]
 				if !exploreSourceLiteralLocalCallee(item.owner, callee, item.callName, scope) {
 					continue
 				}
@@ -642,6 +664,51 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 		ambiguous:  saturated || len(hits) > 1,
 		ownerFiles: ownerFiles,
 	}
+}
+
+// projectExploreSourceLiteralConstructionAlignment proves only complete,
+// current-view instantiation adjacency for the already-bounded literal callee
+// cohort. The full per-key projection cap is intentional: a truncated page may
+// consist entirely of durable edges hidden by an overlay, so truncation can
+// never be treated as a positive witness.
+func projectExploreSourceLiteralConstructionAlignment(
+	ctx context.Context,
+	reader graph.Reader,
+	ids []string,
+) map[string]bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if reader == nil || ctx.Err() != nil {
+		return nil
+	}
+	boundedIDs, complete := exploreBoundedNodeIDs(ids, exploreSourceLiteralRecallMaxHits)
+	if !complete || len(boundedIDs) == 0 {
+		return nil
+	}
+	bounded, supported := reader.(graph.BoundedOutgoingEdgeIdentityReader)
+	if !supported {
+		return nil
+	}
+	projection, err := bounded.FindOutgoingEdgeIdentitiesBounded(
+		ctx,
+		boundedIDs,
+		[]graph.EdgeKind{graph.EdgeInstantiates},
+		graph.MaxBoundedAdjacencyRowsPerKey,
+	)
+	if err != nil || ctx.Err() != nil {
+		return nil
+	}
+	aligned := make(map[string]bool, len(boundedIDs))
+	for _, id := range boundedIDs {
+		if projection.Truncated[id] {
+			continue
+		}
+		if len(projection.ByEndpoint[id]) > 0 {
+			aligned[id] = true
+		}
+	}
+	return aligned
 }
 
 type exploreSourceLiteralSpan struct {
@@ -778,6 +845,9 @@ func exploreSourceLiteralLocalCallee(owner, callee *graph.Node, callName string,
 		return false
 	}
 	if callee.Kind != graph.KindFunction && callee.Kind != graph.KindMethod {
+		return false
+	}
+	if scope.ExcludeTests && exploreDraftIsTestNode(callee) {
 		return false
 	}
 	if callee.RepoPrefix != owner.RepoPrefix {
