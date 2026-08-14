@@ -56,12 +56,16 @@ func TestStaleLangsDetection(t *testing.T) {
 			got, []string{"cpp", "go", "scala", "swift"}) {
 			t.Errorf("stored pre-generic-call version = %v, want all four", got)
 		}
-		// A store extracted before the C# usings-scope/builtin-receiver
-		// stamps must re-extract its .cs files on upgrade — the stamps
-		// only exist post-extraction, so without the bump the extension
-		// visibility features stay dormant on existing stores.
-		if got := ExtractorVersionStaleLangs(`{"csharp":2}`); !reflect.DeepEqual(got, []string{"csharp"}) {
-			t.Errorf("stored C# usings-stamp version = %v, want [csharp]", got)
+		// A store extracted before the C# params-shape fix must re-extract
+		// unchanged .cs, .razor, and .cshtml files. Without the bump, their
+		// persisted graph keeps the old arity and parameter evidence.
+		if got := ExtractorVersionStaleLangs(`{"csharp":10}`); !reflect.DeepEqual(got, []string{"csharp"}) {
+			t.Errorf("stored pre-params C# version = %v, want [csharp]", got)
+		}
+		for _, path := range []string{"src/Handler.cs", "Views/Page.razor", "Views/Page.cshtml"} {
+			if got := merkleSaltFor(path); got != "csharp@11" {
+				t.Errorf("C# extractor salt for %s = %q, want csharp@11", path, got)
+			}
 		}
 		if got := merkleSaltFor("src/Handler.php"); got != "php@2" {
 			t.Errorf("PHP extractor salt = %q, want php@2", got)

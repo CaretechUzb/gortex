@@ -130,26 +130,23 @@ func TestCSharpExtractor_MethodStampsParamArity(t *testing.T) {
 	assert.Equal(t, 3, opt.Meta["param_count"])
 	assert.Equal(t, 2, opt.Meta["param_required"], "a defaulted parameter is omissible")
 
-	// The vendored grammar does not resolve a `params` entry into a
-	// parameter node — it flattens the type and name into loose siblings
-	// of the list. Counting what survives would claim one parameter for a
-	// two-parameter method, so an unreadable list must yield NO stamp:
-	// the resolver then treats the method as universally applicable
-	// instead of excluding it from argument counts it really accepts.
+	// tree-sitter-c-sharp flattens a `params` entry into loose type/name
+	// siblings. The extractor reconstructs that grammar shape so the
+	// resolver can use the variadic applicability window.
 	vari := byID["Ext.cs::Ext.Variadic"]
 	require.NotNil(t, vari)
-	assert.NotContains(t, vari.Meta, "param_count",
-		"a parameter list the grammar cannot fully structure yields no arity evidence")
+	assert.Equal(t, 2, vari.Meta["param_count"])
+	assert.Equal(t, 1, vari.Meta["param_required"])
+	assert.Equal(t, true, vari.Meta["param_variadic"])
 
 	nullary := byID["Ext.cs::Ext.Nullary"]
 	require.NotNil(t, nullary)
 	assert.Equal(t, 0, nullary.Meta["param_count"])
 }
 
-// A discard parameter is a real positional slot. Skipping its node while
-// also skipping its position renumbered every parameter after it, so
-// `name` in `Foo(int _, string name)` reported position 0 — the slot the
-// discard occupies.
+// An underscore in a method declaration is an ordinary named parameter and a
+// real positional slot. Emitting it under its own name keeps the node ID, Name,
+// named-argument spelling, and later parameter positions consistent.
 func TestCSharpExtractor_DiscardParamKeepsPositions(t *testing.T) {
 	src := []byte(`namespace App {
     public class Handler {
@@ -167,7 +164,7 @@ func TestCSharpExtractor_DiscardParamKeepsPositions(t *testing.T) {
 			pos[n.Name] = n.Meta["position"]
 		}
 	}
-	assert.Equal(t, 1, pos["name"], "name follows the discard in slot 1")
+	assert.Equal(t, 0, pos["_"], "the declared underscore parameter keeps its own name and slot")
+	assert.Equal(t, 1, pos["name"])
 	assert.Equal(t, 2, pos["count"])
-	assert.NotContains(t, pos, "_", "a discard names no value, so it emits no node")
 }
