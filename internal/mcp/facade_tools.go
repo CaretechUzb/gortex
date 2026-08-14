@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -1543,26 +1544,37 @@ func (s *Server) validateFacadeRepositoryFields(spec facadeOperationSpec, input 
 			}
 		}
 		for _, field := range sortedFacadeMapKeys(fields) {
-			if containerName == "options" && field == "repo" {
-				// options.repo is the canonical public repository selector. Some
-				// facade middleware consumes it before the legacy handler does.
-				continue
-			}
-			if !facadeRepositorySelectorLike(field) || s.facadeFieldConsumed(spec, containerName, field, fields[field]) {
+			if !facadeRepositorySelectorLike(field) {
 				continue
 			}
 			path := field
 			if containerName != "" {
 				path = containerName + "." + field
 			}
+			canonicalPath := s.facadePublicRepositoryField(spec)
+			if path == canonicalPath {
+				value, ok := fields[field].(string)
+				if !ok || strings.TrimSpace(value) == "" {
+					return NewStructuredErrorResult(StructuredError{
+						ErrorCode: ErrCodeInvalidArgument,
+						Message:   fmt.Sprintf("%s must be a non-empty string", path),
+						Data: map[string]any{
+							"field": path, "expected_type": "non-empty string",
+						},
+					})
+				}
+			}
+			if s.facadeFieldConsumed(spec, containerName, field, fields[field]) {
+				continue
+			}
 			data := map[string]any{"field": path}
 			if containerName != "" {
 				data["container"] = containerName
 			}
 			message := fmt.Sprintf("unknown field %q", path)
-			if s.facadeFieldConsumed(spec, "options", "repo", fields[field]) {
-				data["suggested_field"] = "options.repo"
-				message += "; use options.repo to select a repository"
+			if canonicalPath != "" {
+				data["suggested_field"] = canonicalPath
+				message += fmt.Sprintf("; use %s to select a repository", canonicalPath)
 			}
 			return NewStructuredErrorResult(StructuredError{
 				ErrorCode: ErrCodeInvalidArgument,
@@ -1575,21 +1587,40 @@ func (s *Server) validateFacadeRepositoryFields(spec facadeOperationSpec, input 
 }
 
 func (s *Server) facadeFieldConsumed(spec facadeOperationSpec, containerName, field string, value any) bool {
+	baseline := normalizeFacadeArguments(spec, map[string]any{"operation": spec.Operation})
 	probe := map[string]any{"operation": spec.Operation}
 	if containerName == "" {
 		probe[field] = value
 	} else {
 		probe[containerName] = map[string]any{field: value}
 	}
-	for lowered := range normalizeFacadeArguments(spec, probe) {
-		if _, fixed := spec.Fixed[lowered]; fixed {
+	for lowered, candidateValue := range normalizeFacadeArguments(spec, probe) {
+		if _, fixed := spec.Fixed[lowered]; fixed || !s.legacyDeclaresField(spec.Legacy, lowered) {
 			continue
 		}
-		if s.legacyDeclaresField(spec.Legacy, lowered) {
+		baselineValue, existed := baseline[lowered]
+		if !existed || !reflect.DeepEqual(baselineValue, candidateValue) {
 			return true
 		}
 	}
 	return false
+}
+
+func (s *Server) facadePublicRepositoryField(spec facadeOperationSpec) string {
+	capability := s.facadeCapability(spec, true)
+	schema, _ := capability["input_schema"].(map[string]any)
+	properties, _ := schema["properties"].(map[string]any)
+	if _, ok := properties["repo"]; ok {
+		return "repo"
+	}
+	for _, container := range facadeContainerKeys {
+		containerSchema, _ := properties[container].(map[string]any)
+		containerProperties, _ := containerSchema["properties"].(map[string]any)
+		if _, ok := containerProperties["repo"]; ok {
+			return container + ".repo"
+		}
+	}
+	return ""
 }
 
 func facadeRepositorySelectorLike(field string) bool {

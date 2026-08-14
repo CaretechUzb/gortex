@@ -1,9 +1,13 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
+	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 )
 
@@ -16,12 +20,12 @@ func TestFacadeRepositoryValidationRejectsUnconsumedPathsFromRealRegistry(t *tes
 		operation     string
 		input         map[string]any
 		wantField     string
-		wantSuggested bool
+		wantSuggested string
 	}{
 		{
 			name: "change detect source repo path", facade: "change", operation: "detect",
 			input:     map[string]any{"source": map[string]any{"repo_path": `C:\work\other-repo`}},
-			wantField: "source.repo_path", wantSuggested: true,
+			wantField: "source.repo_path", wantSuggested: "options.repo",
 		},
 		{
 			name: "top-level repo path", facade: "change", operation: "detect",
@@ -38,6 +42,7 @@ func TestFacadeRepositoryValidationRejectsUnconsumedPathsFromRealRegistry(t *tes
 		{
 			name: "cold pr source repo path", facade: "pr", operation: "risk",
 			input: map[string]any{"source": map[string]any{"repo_path": `C:\work\other-repo`}}, wantField: "source.repo_path",
+			wantSuggested: "arguments.repo",
 		},
 		{
 			name: "cold pr context repository", facade: "pr", operation: "list",
@@ -46,6 +51,11 @@ func TestFacadeRepositoryValidationRejectsUnconsumedPathsFromRealRegistry(t *tes
 		{
 			name: "external write source repo path", facade: "publish_review", operation: "post",
 			input: map[string]any{"source": map[string]any{"repo_path": `C:\work\other-repo`}}, wantField: "source.repo_path",
+			wantSuggested: "arguments.repo",
+		},
+		{
+			name: "read symbols injected baseline", facade: "read", operation: "symbols",
+			input: map[string]any{"context": map[string]any{"repo_path": `C:\work\other-repo`}}, wantField: "context.repo_path",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -60,8 +70,8 @@ func TestFacadeRepositoryValidationRejectsUnconsumedPathsFromRealRegistry(t *tes
 			require.NoError(t, json.Unmarshal([]byte(toolResultText(result)), &structured))
 			require.Equal(t, ErrCodeInvalidArgument, structured.ErrorCode)
 			require.Equal(t, test.wantField, structured.Data["field"])
-			if test.wantSuggested {
-				require.Equal(t, "options.repo", structured.Data["suggested_field"])
+			if test.wantSuggested != "" {
+				require.Equal(t, test.wantSuggested, structured.Data["suggested_field"])
 			}
 		})
 	}
@@ -131,4 +141,67 @@ func TestFacadeRepositoryValidationLeavesNonSelectorCompatibilityAlone(t *testin
 		"operation": "detect",
 		"source":    map[string]any{"base": "HEAD", "mystery": true},
 	}))
+}
+
+func TestFacadeRepositoryValidationRejectsInvalidCanonicalSelectors(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	for _, test := range []struct {
+		name      string
+		facade    string
+		operation string
+		input     map[string]any
+		wantField string
+	}{
+		{
+			name: "empty common selector", facade: "change", operation: "detect",
+			input: map[string]any{"options": map[string]any{"repo": "  "}}, wantField: "options.repo",
+		},
+		{
+			name: "non-string common selector", facade: "change", operation: "detect",
+			input: map[string]any{"options": map[string]any{"repo": 42}}, wantField: "options.repo",
+		},
+		{
+			name: "empty cold selector", facade: "pr", operation: "risk",
+			input: map[string]any{"arguments": map[string]any{"repo": ""}}, wantField: "arguments.repo",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spec, ok := srv.facades.operation(test.facade, test.operation)
+			require.True(t, ok)
+			test.input["operation"] = test.operation
+
+			result := srv.validateFacadeInput(spec, test.input)
+			require.NotNil(t, result)
+			require.True(t, result.IsError)
+			var structured StructuredError
+			require.NoError(t, json.Unmarshal([]byte(toolResultText(result)), &structured))
+			require.Equal(t, test.wantField, structured.Data["field"])
+			require.Equal(t, "non-empty string", structured.Data["expected_type"])
+		})
+	}
+}
+
+func TestFacadeEditFileRejectsUnconsumedRepositoryBeforeWrite(t *testing.T) {
+	srv, root := setupTestServer(t)
+	target := filepath.Join(root, "main.go")
+	before, err := os.ReadFile(target)
+	require.NoError(t, err)
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Name = "edit"
+	req.Params.Arguments = map[string]any{
+		"operation":   "file",
+		"target":      map[string]any{"file": "main.go"},
+		"match":       string(before),
+		"replacement": string(before) + "\n// must not be written\n",
+		"options":     map[string]any{"repo": t.TempDir()},
+	}
+	result, err := srv.handleFacade(context.Background(), "edit", req)
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+
+	after, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
 }
