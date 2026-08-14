@@ -641,21 +641,11 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 		return nil
 	}
 
-	fileSymbols := s.buildFileSymbolIndexForTargetsContext(ctx, targets)
-	lookup := func(graphPath string, line int) (string, string) {
-		idx := fileSymbols[graphPath]
-		if idx == nil {
-			return "", ""
-		}
-		return idx.find(line)
-	}
-
 	var collected []astquery.Match
 	for _, d := range bundle {
 		res, runErr := astquery.Run(ctx, astquery.Options{
 			Detector:     d.Name,
 			Targets:      targets,
-			SymbolLookup: lookup,
 			Resolver:     astquery.DefaultLanguageResolver,
 			Limit:        5000,
 			ExcludeTests: true,
@@ -668,8 +658,10 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 
 	// Graph-grounding post-pass: drop the N+1 / check-then-act rows the resolved
 	// call / loop metadata refutes. This is the same FP-reduction the analyze
-	// review path applies. Grounding keys off the match's symbol id, so the
-	// path is only rewritten once the rows that survive are known.
+	// review path applies. Grounding keys off the match's symbol id, so bounded
+	// post-match enrichment must precede it; path rewriting still happens only
+	// after the surviving rows are known.
+	s.enrichASTMatchesContext(ctx, collected)
 	kept := review.GroundReviewMatches(s.graph, collected)
 	for i := range kept {
 		kept[i].File = reviewRepoRelPath(kept[i].File, repoPrefix)

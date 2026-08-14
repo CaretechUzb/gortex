@@ -16,31 +16,82 @@ import (
 // to answer "which symbol contains this?" -- they share this code so
 // the answer stays consistent.
 
-// buildFileSymbolIndexForTargetsContext builds bounded enclosing-symbol
-// indexes for AST targets in their first-seen graph-path order. AST targets
-// describe on-disk files selected from the durable graph, so this path reads
-// the base store explicitly even when the request carries an editor overlay.
-// Duplicate grammar targets (for example TypeScript + TSX) consume one file
-// projection and all calls share the request-wide localization budget.
-func (s *Server) buildFileSymbolIndexForTargetsContext(
+const astPostMatchFileLimit = 64
+
+// astPostMatchSymbolLookupContext builds enclosing-symbol indexes only for the
+// first 64 distinct files that survived a caller's stable ordering and result
+// limit. AST targets come from the durable graph, so enrichment deliberately
+// reads s.graph even when the request carries an editor overlay.
+func (s *Server) astPostMatchSymbolLookupContext(
 	ctx context.Context,
-	targets []astquery.Target,
-) map[string]*fileSymbolIndex {
-	paths := make([]string, 0, len(targets))
-	seen := make(map[string]struct{}, len(targets))
-	for _, target := range targets {
-		if target.GraphPath == "" {
-			continue
-		}
-		if _, duplicate := seen[target.GraphPath]; duplicate {
-			continue
-		}
-		seen[target.GraphPath] = struct{}{}
-		paths = append(paths, target.GraphPath)
+	count int,
+	pathAt func(int) string,
+) astquery.SymbolLookup {
+	if s == nil || s.graph == nil || count <= 0 || pathAt == nil || ctx.Err() != nil {
+		return nil
 	}
-	return s.buildFileSymbolIndexForOrderedPathsScopedReaderContext(
+	paths := make([]string, 0, astPostMatchFileLimit)
+	admitted := make(map[string]struct{}, astPostMatchFileLimit)
+	for index := 0; index < count && len(paths) < astPostMatchFileLimit; index++ {
+		path := pathAt(index)
+		if path == "" {
+			continue
+		}
+		if _, duplicate := admitted[path]; duplicate {
+			continue
+		}
+		admitted[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	indexes := s.buildFileSymbolIndexForOrderedPathsScopedReaderContext(
 		ctx, s.graph, paths, query.QueryOptions{},
 	)
+	return func(path string, line int) (string, string) {
+		if _, ok := admitted[path]; !ok {
+			return "", ""
+		}
+		idx := indexes[path]
+		if idx == nil || idx.saturated {
+			return "", ""
+		}
+		return idx.find(line)
+	}
+}
+
+func (s *Server) enrichASTMatchesContext(ctx context.Context, matches []astquery.Match) {
+	lookup := s.astPostMatchSymbolLookupContext(ctx, len(matches), func(index int) string {
+		return matches[index].File
+	})
+	for index := range matches {
+		matches[index].SymbolID = ""
+		matches[index].SymbolName = ""
+		if lookup != nil {
+			matches[index].SymbolID, matches[index].SymbolName = lookup(matches[index].File, matches[index].Line)
+		}
+	}
+}
+
+func (s *Server) enrichASTSymbolIDsContext(
+	ctx context.Context,
+	count int,
+	pathAt func(int) string,
+	lineAt func(int) int,
+	set func(int, string),
+) {
+	if pathAt == nil || lineAt == nil || set == nil {
+		return
+	}
+	lookup := s.astPostMatchSymbolLookupContext(ctx, count, pathAt)
+	for index := 0; index < count; index++ {
+		id := ""
+		if lookup != nil {
+			id, _ = lookup(pathAt(index), lineAt(index))
+		}
+		set(index, id)
+	}
 }
 
 // fileSymbolIndex is the per-file lookup used by the SymbolLookup

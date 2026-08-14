@@ -99,6 +99,8 @@ func TestReviewRulepackMatches_JoinsRepoRelativeChangedFiles(t *testing.T) {
 	// Findings travel onward to rule resolution, the risk ranking, and the
 	// forge comment API — all of which speak repo-relative paths.
 	for _, m := range matches {
+		require.NotEmpty(t, m.SymbolID,
+			"review grounding must receive post-match enclosing-symbol enrichment")
 		require.Equal(t, "pkg/widget.go", m.File,
 			"match paths must be repo-relative, not graph-prefixed")
 	}

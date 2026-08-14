@@ -122,25 +122,15 @@ func (s *Server) handleAnalyzeNamed(ctx context.Context, req mcp.CallToolRequest
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	fileSymbols := s.buildFileSymbolIndexForTargetsContext(ctx, targets)
-	lookup := func(graphPath string, line int) (string, string) {
-		idx := fileSymbols[graphPath]
-		if idx == nil {
-			return "", ""
-		}
-		return idx.find(line)
-	}
-
 	rows := make([]sastRow, 0, 64)
 	summary := make(map[string]*sastSummary, len(detectors))
 	var errsAcc []string
 	for _, d := range detectors {
 		opts := astquery.Options{
-			Detector:     d.Name,
-			Targets:      targets,
-			SymbolLookup: lookup,
-			Resolver:     astquery.DefaultLanguageResolver,
-			Limit:        5000,
+			Detector: d.Name,
+			Targets:  targets,
+			Resolver: astquery.DefaultLanguageResolver,
+			Limit:    5000,
 		}
 		if excludeTestsSet {
 			opts.ExcludeTests = excludeTests
@@ -206,6 +196,13 @@ func (s *Server) handleAnalyzeNamed(ctx context.Context, req mcp.CallToolRequest
 		rows = rows[:limit]
 		truncated = true
 	}
+	s.enrichASTSymbolIDsContext(
+		ctx,
+		len(rows),
+		func(index int) string { return rows[index].File },
+		func(index int) int { return rows[index].Line },
+		func(index int, id string) { rows[index].Symbol = id },
+	)
 
 	summaries := make([]sastSummary, 0, len(summary))
 	for _, e := range summary {

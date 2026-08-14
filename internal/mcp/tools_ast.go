@@ -97,28 +97,13 @@ func (s *Server) handleSearchAST(ctx context.Context, req mcp.CallToolRequest) (
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// Build a per-file enclosing-symbol index lazily. Each file
-	// is a small list of function/method/closure nodes; the
-	// lookup is amortised by caching the per-file index on first
-	// hit. The graph walk is single-pass so even big indexes
-	// pay it once per `search_ast` call.
-	fileSymbols := s.buildFileSymbolIndexForTargetsContext(ctx, targets)
-	lookup := func(graphPath string, line int) (string, string) {
-		idx := fileSymbols[graphPath]
-		if idx == nil {
-			return "", ""
-		}
-		return idx.find(line)
-	}
-
 	opts := astquery.Options{
-		Pattern:      pattern,
-		Detector:     detector,
-		Language:     language,
-		Targets:      targets,
-		SymbolLookup: lookup,
-		Resolver:     astquery.DefaultLanguageResolver,
-		Limit:        limit,
+		Pattern:  pattern,
+		Detector: detector,
+		Language: language,
+		Targets:  targets,
+		Resolver: astquery.DefaultLanguageResolver,
+		Limit:    limit,
 	}
 	// Honor explicit override; otherwise let the engine apply
 	// its per-mode default (true for detectors, false for raw
@@ -133,6 +118,7 @@ func (s *Server) handleSearchAST(ctx context.Context, req mcp.CallToolRequest) (
 	if runErr != nil {
 		return mcp.NewToolResultError(runErr.Error()), nil
 	}
+	s.enrichASTMatchesContext(ctx, res.Matches)
 
 	if minFanIn > 0 {
 		res.Matches = filterByMinFanIn(s.graph, res.Matches, minFanIn)

@@ -93,10 +93,18 @@ func Bounded() {
 	panic("boom")
 }
 `)
+	quietAbs := writeTempGoFile(t, "quiet.go", `package x
+
+func Quiet() {}
+`)
 	backing := graph.New()
 	backing.AddNode(&graph.Node{
 		ID: abs, Kind: graph.KindFile, Name: abs,
 		FilePath: abs, Language: "go", StartLine: 1, EndLine: 5,
+	})
+	backing.AddNode(&graph.Node{
+		ID: quietAbs, Kind: graph.KindFile, Name: quietAbs,
+		FilePath: quietAbs, Language: "go", StartLine: 1, EndLine: 3,
 	})
 	owner := &graph.Node{
 		ID: abs + "::Bounded", Kind: graph.KindFunction, Name: "Bounded",

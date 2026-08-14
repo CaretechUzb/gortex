@@ -78,17 +78,6 @@ func (s *Server) handleAnalyzeUnsafePatterns(ctx context.Context, req mcp.CallTo
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// Per-file enclosing-symbol index — shared across detectors so
-	// every row gets symbol enrichment without re-building.
-	fileSymbols := s.buildFileSymbolIndexForTargetsContext(ctx, targets)
-	lookup := func(graphPath string, line int) (string, string) {
-		idx := fileSymbols[graphPath]
-		if idx == nil {
-			return "", ""
-		}
-		return idx.find(line)
-	}
-
 	// Reject unknown detector names early so the agent gets a
 	// pointed error instead of an empty result.
 	if len(detectorFilter) > 0 {
@@ -123,10 +112,9 @@ func (s *Server) handleAnalyzeUnsafePatterns(ctx context.Context, req mcp.CallTo
 			}
 		}
 		opts := astquery.Options{
-			Detector:     name,
-			Targets:      targets,
-			SymbolLookup: lookup,
-			Resolver:     astquery.DefaultLanguageResolver,
+			Detector: name,
+			Targets:  targets,
+			Resolver: astquery.DefaultLanguageResolver,
 			// Generous per-detector cap; the outer `limit` is the
 			// agent-facing budget. Picking 5000 protects against a
 			// pathological repo where one detector returns tens of
@@ -212,6 +200,13 @@ func (s *Server) handleAnalyzeUnsafePatterns(ctx context.Context, req mcp.CallTo
 		rows = rows[:limit]
 		truncated = true
 	}
+	s.enrichASTSymbolIDsContext(
+		ctx,
+		len(rows),
+		func(index int) string { return rows[index].File },
+		func(index int) int { return rows[index].Line },
+		func(index int, id string) { rows[index].Symbol = id },
+	)
 
 	summaries := make([]unsafePatternSummary, 0, len(summary))
 	for _, name := range astquery.UnsafePatternDetectors {
