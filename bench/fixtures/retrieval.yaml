@@ -67,7 +67,7 @@ cases:
   - { id: exact-NewBM25,             tier: exact, query: "NewBM25",                     expected: [internal/search/bm25.go::NewBM25] }
   - { id: exact-HybridBackend,       tier: exact, query: "HybridBackend",               expected: [internal/search/hybrid.go::HybridBackend] }
   - { id: exact-NewHybrid,           tier: exact, query: "NewHybrid",                   expected: [internal/search/hybrid.go::NewHybrid] }
-  - { id: exact-rrfFuse,             tier: exact, query: "rrfFuse",                     expected: [internal/search/hybrid.go::rrfFuse] }
+  - { id: exact-alphaFuse,           tier: exact, query: "alphaFuse",                   expected: [internal/search/hybrid.go::alphaFuse] }
   - { id: exact-VectorBackend,       tier: exact, query: "VectorBackend",               expected: [internal/search/vector.go::VectorBackend] }
   - { id: exact-SearchBackend,       tier: exact, query: "search.Backend",              expected: [internal/search/search.go::Backend] }
   - { id: exact-SearchResult,        tier: exact, query: "SearchResult",                expected: [internal/search/search.go::SearchResult] }
@@ -121,7 +121,7 @@ cases:
   - { id: concept-evict-repo,        tier: concept, query: "drop every node for a repository prefix",       expected: [internal/graph/graph.go::Graph.EvictRepo] }
   - { id: concept-bm25-index,        tier: concept, query: "text search backend with TF-IDF ranking",       expected: [internal/search/bm25.go::BM25Backend] }
   - { id: concept-hybrid-fuse,       tier: concept, query: "combine text and vector search with RRF",       expected: [internal/search/hybrid.go::HybridBackend] }
-  - { id: concept-rrf-algorithm,     tier: concept, query: "reciprocal rank fusion",                        expected: [internal/search/hybrid.go::rrfFuse] }
+  - { id: concept-adaptive-alpha,    tier: concept, query: "adaptive alpha weighted reciprocal rank fusion", expected: [internal/search/hybrid.go::alphaFuse] }
   - { id: concept-swap-backend,      tier: concept, query: "hot-swap the in-memory search backend",         expected: [internal/search/swappable.go::Swappable] }
   - { id: concept-glove-embed,       tier: concept, query: "built-in GloVe word vector embedder",           expected: [internal/embedding/static.go::StaticProvider] }
   - { id: concept-mcp-server,        tier: concept, query: "MCP server type holding engine and graph",      expected: [internal/mcp/server.go::Server] }

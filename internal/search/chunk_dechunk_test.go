@@ -87,9 +87,9 @@ func TestHybridSearch_DeChunkPreservesOrder(t *testing.T) {
 		"b.go::B#chunk0": "b.go::B",
 	})
 
-	// Empty text backend so only the vector channel decides ordering.
+	// Keep construction realistic; this assertion exercises the vector
+	// de-chunk order directly, before channel fusion.
 	h := NewHybrid(NewBM25(), vec, fixedEmbedder{dims: dims})
-	h.SetAutoAlpha(false) // plain RRF — vector ranks drive the order
 
 	got := h.dechunkVectorIDs(vec.Search([]float32{1, 0, 0}, 8), 8)
 	require.Len(t, got, 2)
