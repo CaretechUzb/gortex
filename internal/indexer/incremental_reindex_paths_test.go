@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -309,6 +310,26 @@ func TestIncrementalReindexPathsReportsRepoFileCountNotScopeSize(t *testing.T) {
 // TestIncrementalReindexPathsFileCountTracksAddsAndDeletes verifies the
 // repo-wide count still moves when the repo itself changes size, so the
 // fix reports a live total rather than a frozen one.
+func TestIncrementalReindexPaths_DoesNotReembedTheWholeUnchangedCorpus(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "main.py")
+	writeFile(t, path, "def alpha():\n    return 1\n")
+	emb := &poolEmbedder{}
+	idx := newVectorPersistIndexer(t, graph.New(), emb)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	before := emb.calls
+	require.Greater(t, before, int32(0))
+
+	writeFile(t, path, "def alpha():\n    return 2\n")
+	future := time.Now().Add(time.Second)
+	require.NoError(t, os.Chtimes(path, future, future))
+	_, err = idx.IncrementalReindexPaths(root, []string{path})
+	require.NoError(t, err)
+	require.Equal(t, before, emb.calls,
+		"changed-file reconciliation must not trigger a paid full-corpus embedding pass")
+}
+
 func TestIncrementalReindexPathsFileCountTracksAddsAndDeletes(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "a.go"), "package main\n\nfunc A() {}\n")

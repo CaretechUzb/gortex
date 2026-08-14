@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -282,24 +281,14 @@ type Indexer struct {
 	// embedder is the optional embedding provider for semantic search.
 	embedder embedding.Provider
 
-	// bulkVectorSink holds the disk store captured at the bulk-load
-	// shadow swap, so buildSearchIndex can still persist the vector
-	// index to the backend while idx.graph points at the in-memory
-	// shadow (which does not implement graph.VectorSearcher). Without
-	// it the embedding pass under the bulk loader builds vectors only
-	// in the in-process HNSW — they never reach the `vectors` table and
-	// are lost on the next daemon restart, forcing a paid re-embed.
-	// Set during the shadow swap, cleared when idx.graph is restored.
-	bulkVectorSink graph.VectorSearcher
-
-	// contentSink mirrors bulkVectorSink for the content full-text index:
+	// contentSink captures the durable content full-text index during a shadow:
 	// the disk store captured at the shadow swap, so the per-file content
 	// stream reaches content_fts on disk even while idx.graph points at the
 	// in-memory shadow (which does not implement graph.ContentSearcher).
 	// Set during the shadow swap, cleared when idx.graph is restored.
 	contentSink graph.ContentSearcher
 
-	// contractStateSink mirrors bulkVectorSink for the contract-tier
+	// contractStateSink captures the durable contract-tier store during a shadow:
 	// completion marker: the disk store captured at the shadow swap, so the
 	// inline contract pass records the marker on the backend even while
 	// idx.graph points at the in-memory shadow (which does not implement
@@ -2500,6 +2489,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	//     state.
 	var diskTarget graph.Store
 	var inMemShadow *graph.Graph
+	var deferredVectorPlan *preparedVectorPlan
 	var shadowEstimate graph.RepoMemoryEstimate
 	var shadowEstimateReady bool
 	bl, blOK := idx.graph.(graph.BulkLoader)
@@ -2673,12 +2663,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		diskTarget = idx.graph
 		inMemShadow = idx.newStructuralIntegrityShadow(diskTarget, graph.StructuralPathShadowCold)
 		idx.graph = inMemShadow
-		// Capture the disk store as the vector sink: buildSearchIndex runs
-		// while idx.graph is the shadow (no VectorSearcher), so without this
-		// the embedded vectors never land on disk. The `vectors` table has no
-		// FK to `nodes`, so upserting before FlushBulk persists the nodes is
-		// safe. Cleared when idx.graph is restored below.
-		idx.bulkVectorSink, _ = diskTarget.(graph.VectorSearcher)
 		// Same capture for the content index: the per-file content stream
 		// must reach content_fts on disk while idx.graph is the shadow.
 		idx.contentSink, _ = diskTarget.(graph.ContentSearcher)
@@ -2697,8 +2681,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		}
 		defer func() {
 			if retErr != nil {
+				if deferredVectorPlan != nil {
+					deferredVectorPlan.Release()
+					deferredVectorPlan = nil
+				}
 				idx.graph = diskTarget
-				idx.bulkVectorSink = nil
 				idx.contentSink = nil
 				idx.contractStateSink = nil
 				if idx.resolver != nil {
@@ -2853,16 +2840,25 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 			reporter.Report("persisting bulk graph", 1, 1)
 			idx.graph = diskTarget
-			idx.bulkVectorSink = nil
 			idx.contentSink = nil
 			idx.contractStateSink = nil
 			// Mirror of the SetGraph(inMemShadow) above: the resolver
-			// must follow the graph pointer back to the disk store, or
-			// every post-index per-file resolve (the watcher save path,
-			// incremental reindex) reads the drained — now empty —
-			// shadow and silently resolves nothing.
+			// must follow the graph pointer back to the disk store before vector
+			// ownership validation and every later incremental operation.
 			if idx.resolver != nil {
 				idx.resolver.SetGraph(diskTarget)
+			}
+			if deferredVectorPlan != nil {
+				if retErr == nil {
+					plan := deferredVectorPlan
+					deferredVectorPlan = nil
+					if err := idx.installVectorPlan(ctx, diskTarget, plan); err != nil {
+						retErr = fmt.Errorf("indexer: publish vector corpus after shadow drain: %w", err)
+					}
+				} else {
+					deferredVectorPlan.Release()
+					deferredVectorPlan = nil
+				}
 			}
 		}()
 	} else if diskTarget == nil && idx.graph.NodeCount() == 0 && idx.graph.EdgeCount() == 0 {
@@ -3809,8 +3805,20 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	}
 
 	reporter.Report("building search index", 0, 0)
-	// Build search index.
-	idx.buildSearchIndex()
+	// Prepare embeddings exactly once. Cold-shadow publication is deferred until
+	// the graph has drained and ownership validation can see durable nodes;
+	// direct and streaming paths already point at the durable store here.
+	vectorPlan, vectorErr := idx.prepareSearchIndexForPublication(ctx)
+	if vectorErr != nil {
+		return nil, vectorErr
+	}
+	if shadowTaken {
+		deferredVectorPlan = vectorPlan
+	} else if vectorPlan != nil {
+		if err := idx.installVectorPlan(ctx, idx.graph, vectorPlan); err != nil {
+			return nil, fmt.Errorf("indexer: publish vector corpus: %w", err)
+		}
+	}
 
 	if !idx.deferResolve.Load() {
 		// Contracts were already extracted inline during parse (per file,
@@ -3972,13 +3980,31 @@ func (idx *Indexer) repoNodeEdgeCount() (int, int) {
 // incremental pipeline after ChangedSinceMtimes has already proved the tree
 // unchanged. It preserves the one necessary side effect for non-persistent
 // search backends without repeating filesystem discovery.
-func (idx *Indexer) cleanCensusResult(detected int, started time.Time) *IndexResult {
+func (idx *Indexer) cleanCensusResult(ctx context.Context, detected int, started time.Time) (*IndexResult, error) {
 	if idx.totalDetected == 0 {
 		idx.totalDetected = detected
 	}
-	if !isSymbolSearcherBackend(idx.search) {
-		idx.buildSearchIndex()
+
+	// A populated durable corpus can be republished from cheap statistics with
+	// no paid embedding pass. An empty corpus (including the v10 migration that
+	// deliberately discarded legacy vectors) triggers one vector-only rebuild
+	// from the already-persisted graph.
+	restored, restoreErr := idx.restoreDurableVectorBackend(ctx, idx.graph)
+	if restoreErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		idx.lastVectorBuildErr = restoreErr
+		idx.logger.Warn("restore durable vector corpus failed; rebuilding", zap.Error(restoreErr))
 	}
+	if restored {
+		idx.rebuildTextSearchIndex()
+	} else if !isSymbolSearcherBackend(idx.search) || idx.embedder != nil {
+		if err := idx.buildSearchIndexCtx(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	nodes, edges := idx.repoNodeEdgeCount()
 	fileCount := idx.trackedFileCount()
 	if fileCount == 0 {
@@ -3991,7 +4017,7 @@ func (idx *Indexer) cleanCensusResult(detected int, started time.Time) *IndexRes
 		DurationMs: time.Since(started).Milliseconds(),
 	}
 	idx.warnIfEdgeSanityViolated(result)
-	return result
+	return result, nil
 }
 
 // warnIfEdgeSanityViolated logs a loud warning when an index pass
@@ -5114,10 +5140,14 @@ type embedChunkBatch struct {
 // embedFn already layers the deadline-halving retry on top of each
 // batch.
 func (idx *Indexer) embedAllChunks(
+	parent context.Context,
 	texts []string,
 	batchSize int,
 	embedFn func(ctx context.Context, items []string) ([][]float32, error),
 ) ([][]float32, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	if len(texts) == 0 {
 		return nil, nil
 	}
@@ -5155,10 +5185,13 @@ func (idx *Indexer) embedAllChunks(
 	}
 
 	if !apiBacked || concurrency <= 1 {
-		// Serial path — unchanged behaviour for in-process embedders.
-		ctx := context.Background()
+		// Serial path — unchanged behaviour for in-process embedders, now
+		// honoring cancellation from the owning index operation.
 		for _, b := range batches {
-			vecs, err := embedFn(ctx, b.texts)
+			if err := parent.Err(); err != nil {
+				return nil, err
+			}
+			vecs, err := embedFn(parent, b.texts)
 			if err != nil {
 				return nil, err
 			}
@@ -5171,7 +5204,7 @@ func (idx *Indexer) embedAllChunks(
 	// A cancellable group context means the first failure stops every
 	// in-flight worker; the indexer's existing per-batch retry still
 	// runs underneath embedFn.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
 	jobs := make(chan embedChunkBatch)
@@ -5222,6 +5255,12 @@ func (idx *Indexer) embedAllChunks(
 	close(jobs)
 	wg.Wait()
 
+	// A provider is expected to honor ctx, but cancellation still belongs to
+	// the owning index operation even if a provider returns successfully after
+	// its context was cancelled. Never publish a partial/late vector batch.
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
 	if firstErr != nil {
 		return nil, firstErr
 	}
@@ -5242,302 +5281,14 @@ func flattenEmbedResults(results [][][]float32) [][]float32 {
 	return out
 }
 
-// buildSearchIndex populates the search backend from the current graph.
-// When an embedder is set, also builds a vector index and wraps both
-// in a HybridBackend with RRF fusion.
-//
-// In multi-repo mode the search backend is shared across every repo
-// (Indexer.search is wired to MultiIndexer.search at construction).
-// Re-reading every graph node would mean each freshly-tracked repo pays an
-// O(workspace) re-index pass over all
-// previously-tracked repos' nodes — quadratic in repo count and the
-// dominant cost of warming up a 260-repo workspace. So when this
-// indexer carries a non-empty repoPrefix we walk only that repo's
-// byRepo bucket; the other repos' entries are already in the shared
-// backend from when they were tracked. Single-repo mode uses the store's
-// non-content projection with an empty repo namespace.
+// buildSearchIndex is the compatibility entry point for direct and focused
+// callers. Full indexing uses the context-aware preparation/publication split
+// so a cold shadow can defer publication until its durable drain succeeds.
 func (idx *Indexer) buildSearchIndex() {
-	// Start every build from a clean vector-build error: the degraded vector
-	// paths below set it, and a successful build (or a benign skip / no embedder)
-	// leaves it nil, so LastVectorBuildError always reflects the current pass.
-	idx.lastVectorBuildErr = nil
-
-	// Install the learned sub-word boundary table before populating an
-	// in-process BM25 backend. Capability detection happens before graph
-	// enumeration, so the native SQLite FTS does no boundary census.
-	search.BuildAndInstallNgramBoundaries(idx.search, idx.graph)
-
-	nativeText := isSymbolSearcherBackend(idx.search)
-	buildVectors := idx.embedder != nil
-	if nativeText && !buildVectors {
-		// SQLite maintains symbol_fts in the graph mutation path. Backend.Add
-		// only adjusts a process-local approximate counter, so walking and
-		// decoding every node here cannot add searchable data.
-		return
+	if err := idx.buildSearchIndexCtx(context.Background()); err != nil {
+		idx.lastVectorBuildErr = err
+		idx.logger.Warn("vector index build canceled", zap.Error(err))
 	}
-
-	// Code-only enumeration: content (data_class=content) sections live in
-	// the content index, never the symbol search or the vector store, so the
-	// FTS loop below and collectEmbedTexts both skip them anyway. Fetching
-	// the non-content set up front means a content-heavy repo's hundreds of
-	// thousands of sections never enter memory here (the disk backend filters
-	// them in SQL), instead of being materialised only to be skipped.
-	nodes := graph.RepoCodeNodes(idx.graph, idx.repoPrefix)
-
-	// Build the text index only for in-process backends. Native SQLite FTS is
-	// already updated transactionally by graph mutations; its Add method is a
-	// counting compatibility shim rather than an indexing operation.
-	if !nativeText {
-		for _, n := range nodes {
-			if !idx.shouldIndexForSearch(n) {
-				continue
-			}
-			idx.search.Add(n.ID, searchIndexFields(n, idx.projectName)...)
-		}
-	}
-
-	// With no embedder set, text indexing is complete.
-	if !buildVectors {
-		return
-	}
-
-	// Provisional dimensionality: trust the embedder's own report.
-	// A provider that can't state its width yet (an APIProvider before
-	// its first call returns 0) gets a neutral placeholder — the value
-	// is overwritten below from the first real vector, so it never
-	// reaches the persisted index. The old hard-coded 300 was wrong for
-	// the default static GloVe provider (50d) and misrepresented the
-	// index width in the interim; deriving from Dimensions() keeps it
-	// honest for every provider.
-	dims := embeddingDimsOrDefault(idx.embedder)
-
-	// Collect texts and IDs for batch embedding. Nodes matching
-	// Semantic.SkipEmbed (e.g. CSS custom properties, terraform blocks,
-	// YAML/TOML/shell config vars) are kept in the text index but
-	// excluded from the vector index — embedding them is pure cost
-	// with no semantic payoff and on big monorepos dominates RAM.
-	//
-	// A symbol whose source span exceeds the chunk threshold is split
-	// into AST windows: each window is embedded as its own vector under
-	// a synthetic ID ("<symbolID>#chunkK"), and chunkMap records the
-	// chunk → parent mapping so query-time de-chunking maps a chunk hit
-	// back to the symbol. A small symbol stays a single metadata-only
-	// vector under its own ID. chunkMap is empty when nothing was split.
-	texts, ids, chunkMap, skipped := idx.collectEmbedTexts(nodes)
-	if skipped > 0 {
-		idx.logger.Info("skipped embedding for low-value nodes",
-			zap.Int("count", skipped),
-			zap.Int("embedded", len(texts)))
-	}
-
-	if len(texts) == 0 {
-		return
-	}
-
-	// Embedding scaling guards. Hard-cap the vector index for repos
-	// big enough that the cost no longer pays off — BM25 alone is a
-	// fine fallback and an OOM during initial index is much worse than
-	// missing the semantic boost. Chunk the EmbedBatch calls so any
-	// single API request stays small (matters for hosted embedders
-	// with per-request token limits).
-	//
-	// embedChunkTimeout is generous because ONNX inference (Hugot) has
-	// long tail latency: a 60s budget made one in ~30 chunks miss its
-	// deadline, which under the old fail-fast policy threw away every
-	// already-embedded chunk and silently degraded to BM25 with no
-	// signal to the user. 5 minutes covers observed worst-case spikes
-	// without changing steady-state behaviour. On a true hang the
-	// caller can still cancel the parent indexing call.
-	const (
-		defaultEmbedMaxSymbols = 100_000
-		embedChunkSize         = 500
-		embedChunkTimeout      = 5 * time.Minute
-	)
-
-	// The cap is over the embeddable-text count, which with AST
-	// sub-chunking can exceed the symbol count. embedding.max_symbols
-	// overrides the built-in default for users with memory headroom.
-	embedMaxSymbols := defaultEmbedMaxSymbols
-	if idx.embedMaxSymbols > 0 {
-		embedMaxSymbols = idx.embedMaxSymbols
-	}
-	// Env override wins over both the default and the config-wired cap —
-	// a reliable knob independent of the config plumbing. Lets an operator
-	// lift the vector-index size guard for a large repo without editing
-	// (or debugging) the layered config.
-	if env := os.Getenv("GORTEX_EMBEDDINGS_MAX_SYMBOLS"); env != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(env)); err == nil && n > 0 {
-			embedMaxSymbols = n
-		}
-	}
-	if len(texts) > embedMaxSymbols {
-		idx.logger.Warn("vector index disabled — embedding text count exceeds threshold",
-			zap.Int("texts", len(texts)),
-			zap.Int("threshold", embedMaxSymbols),
-			zap.String("hint", "BM25 text search remains active; raise embedding.max_symbols if you have memory headroom"))
-		idx.lastVectorBuildErr = fmt.Errorf("embedding text count %d exceeds threshold %d (raise embedding.max_symbols)", len(texts), embedMaxSymbols)
-		return
-	}
-
-	// embedWithRetry runs one chunk under ctx; on a context-deadline
-	// failure it splits the chunk in half and retries each half once.
-	// A single slow batch shouldn't throw away every already-embedded
-	// chunk and silently demote the backend to BM25. ctx is the group
-	// context, so once one chunk fails everywhere the in-flight retries
-	// here see the cancellation and stop too.
-	var embedWithRetry func(ctx context.Context, items []string) ([][]float32, error)
-	embedWithRetry = func(ctx context.Context, items []string) ([][]float32, error) {
-		chunkCtx, cancel := context.WithTimeout(ctx, embedChunkTimeout)
-		out, err := idx.embedder.EmbedBatch(chunkCtx, items)
-		cancel()
-		if err == nil {
-			return out, nil
-		}
-		// Only retry on deadline-style failures; auth/protocol errors
-		// won't get better with smaller batches. A cancellation from
-		// the group context (a sibling chunk already failed) is not a
-		// retry case either.
-		if ctx.Err() != nil || !errors.Is(err, context.DeadlineExceeded) || len(items) <= 1 {
-			return nil, err
-		}
-		idx.logger.Warn("embed chunk timed out, retrying with halved batch",
-			zap.Int("size", len(items)),
-			zap.Error(err))
-		mid := len(items) / 2
-		left, lerr := embedWithRetry(ctx, items[:mid])
-		if lerr != nil {
-			return nil, lerr
-		}
-		right, rerr := embedWithRetry(ctx, items[mid:])
-		if rerr != nil {
-			return nil, rerr
-		}
-		return append(left, right...), nil
-	}
-
-	// Embed every chunk. For an API-backed embedder the chunks are run
-	// through a bounded worker pool (a hosted round-trip dominates
-	// indexing time, so overlapping requests is a real win); local
-	// in-process backends serialise on an inference mutex, so they keep
-	// the simple serial path. Either way the abort-on-any-error
-	// contract holds — one chunk failure means no vector index ships.
-	vectors, err := idx.embedAllChunks(texts, embedChunkSize, embedWithRetry)
-	if err != nil {
-		// A partial vector index would mis-score later queries (some
-		// symbols semantically findable, others not) — bail to
-		// text-only search rather than ship an inconsistent hybrid
-		// backend.
-		idx.logger.Warn("vector index aborted on chunk failure", zap.Error(err))
-		idx.lastVectorBuildErr = fmt.Errorf("chunk embedding failed: %w", err)
-		return
-	}
-
-	// Detect actual dimensions from first vector.
-	if len(vectors) > 0 && len(vectors[0]) > 0 {
-		dims = len(vectors[0])
-	}
-
-	vecBackend := search.NewVector(dims)
-	// VectorSearcher capability bridging: if the underlying store
-	// has a native HNSW, install it as the in-process backend's
-	// delegate — Add becomes a no-op, Search forwards to the
-	// engine, and we don't allocate `dim × 4 × N` bytes of heap
-	// for a parallel in-process HNSW. The indexer still drives
-	// the writes (BulkUpsertEmbeddings below) so the engine
-	// index lands with the same corpus the in-process one would
-	// have built.
-	vecSearcher, _ := idx.graph.(graph.VectorSearcher)
-	if vecSearcher != nil {
-		vecBackend.SetDelegate(&vectorSearcherDelegate{s: vecSearcher})
-	}
-	// persistSink is where the embedded vectors are written to the backend
-	// so they survive a restart. Normally it is the active graph (a disk
-	// store). Under the bulk loader idx.graph is the in-memory shadow, which
-	// does not implement VectorSearcher; fall back to the disk store captured
-	// at the shadow swap (bulkVectorSink) so the vector index still reaches
-	// the `vectors` table instead of living only in the in-process HNSW and
-	// vanishing on the next restart (which would force a paid re-embed).
-	persistSink := vecSearcher
-	if persistSink == nil {
-		persistSink = idx.bulkVectorSink
-	}
-	var backendItems []graph.VectorItem
-	if persistSink != nil {
-		backendItems = make([]graph.VectorItem, 0, len(vectors))
-	}
-	// Add only well-formed vectors. A nil or wrong-width vector would poison
-	// the index — a mis-scored or panicking query — so drop it, count it, and
-	// keep a sample of offending node IDs for the log.
-	var droppedVectors int
-	var droppedSample []string
-	for i, vec := range vectors {
-		if len(vec) != dims {
-			droppedVectors++
-			if len(droppedSample) < 5 {
-				droppedSample = append(droppedSample, ids[i])
-			}
-			continue
-		}
-		vecBackend.Add(ids[i], vec)
-		if persistSink != nil {
-			backendItems = append(backendItems, graph.VectorItem{
-				NodeID: ids[i],
-				Vec:    vec,
-			})
-		}
-	}
-	// If every vector was invalid there is nothing to search on. Ship text-only
-	// rather than a silently empty vector index that mis-scores every query —
-	// the same all-or-nothing contract as the chunk-failure abort above.
-	if len(vectors) > 0 && vecBackend.Count() == 0 {
-		idx.logger.Warn("vector index aborted — all embeddings invalid",
-			zap.Int("dropped", droppedVectors),
-			zap.Int("dimensions", dims),
-			zap.Strings("sample_ids", droppedSample))
-		idx.lastVectorBuildErr = fmt.Errorf("all %d embedding vectors were invalid (want width %d)", droppedVectors, dims)
-		return
-	}
-	if persistSink != nil && len(backendItems) > 0 {
-		if err := persistSink.BulkUpsertEmbeddings(backendItems); err != nil {
-			idx.logger.Warn("indexer: backend vector bulk upsert failed",
-				zap.Error(err))
-		} else if err := persistSink.BuildVectorIndex(dims); err != nil {
-			idx.logger.Warn("indexer: backend vector index build failed",
-				zap.Error(err))
-		}
-	}
-	// Install the chunk → parent-symbol mapping so HybridBackend can
-	// de-chunk vector hits back to symbols at query time. Empty when no
-	// symbol was large enough to split.
-	if len(chunkMap) > 0 {
-		vecBackend.SetChunkMap(chunkMap)
-	}
-
-	// Publish the vector channel atomically. ReplaceHybridVector pins the
-	// active text backend, flattens any legacy hybrid layers, and retires the
-	// previous vector only after every reader has drained.
-	idx.swappable().ReplaceHybridVector(vecBackend, idx.embedder)
-	if droppedVectors > 0 {
-		idx.logger.Warn("indexer: dropped invalid embedding vectors",
-			zap.Int("dropped", droppedVectors),
-			zap.Int("dimensions", dims),
-			zap.Strings("sample_ids", droppedSample))
-	}
-	fields := []zap.Field{
-		zap.Int("vectors", vecBackend.Count()),
-		zap.Int("chunk_vectors", len(chunkMap)),
-		zap.Int("dimensions", dims),
-		zap.Int("dropped", droppedVectors),
-	}
-	// Surface the actual token spend of a paid embedding pass when the
-	// backend reports usage (API providers do; in-process ones don't).
-	// Without this the cost of an embedding run is invisible after the fact.
-	if acc, ok := idx.embedder.(interface{ TokensUsed() int64 }); ok {
-		if tokens := acc.TokensUsed(); tokens > 0 {
-			fields = append(fields, zap.Int64("embed_tokens", tokens))
-		}
-	}
-	idx.logger.Info("vector index built", fields...)
 }
 
 // dirIgnoreFiles are the per-directory ignore-file basenames honored by

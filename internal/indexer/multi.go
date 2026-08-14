@@ -2955,7 +2955,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			result, err = fullRetrack()
 		case churn == 0 && !idx.merkleEnabled():
 			route = "census_noop"
-			result = idx.cleanCensusResult(detected, start)
+			result, err = idx.cleanCensusResult(ctx, detected, start)
 		case churn == 0:
 			// The mtime census cannot prove a Merkle-enabled repository clean:
 			// a missing baseline or extractor-salt change still requires the
@@ -3220,32 +3220,42 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 		idx.trigramBudget().forget(idx)
 	}
 
-	// Every repo's nodes live in its byRepo bucket, so the sidecar-aware
-	// purge covers all of them. Single-repo-mode nodes used to carry an
-	// empty RepoPrefix, never entered that bucket, and needed a
-	// file-by-file EvictFile loop — which took the branch BELOW the
-	// capability probe and so skipped PurgeRepo entirely, leaking fifteen
-	// repo_prefix-keyed sidecar tables on every solo untrack.
+	// Every repo's nodes live in its byRepo bucket. Serialize the complete
+	// sidecar/vector purge and aggregate vector publication with sibling repo
+	// installs; otherwise an older stats snapshot can be published after a newer
+	// corpus commit. The callback holds no mi.mu and releases every SQLite write
+	// transaction before ReplaceHybridVector waits for pinned search readers.
 	var nodesRemoved, edgesRemoved int
-	if purger, ok := mi.graph.(interface{ PurgeRepo(string) error }); ok {
-		// Prefer the full sidecar-aware purge. EvictRepo drops only
-		// nodes+edges and leaves fifteen repo_prefix-keyed sidecar tables
-		// (file_mtimes, *_enrichment, symbol_fts, content_fts, ...) behind,
-		// which accumulate across untrack/retrack cycles until they dominate
-		// a long-lived store. PurgeRepo clears them in one transaction. It
-		// returns no counts, so report the repo's last-index metadata as the
-		// removed estimate; fall back to EvictRepo (real counts) on error.
-		if err := purger.PurgeRepo(repoPrefix); err != nil {
-			mi.logger.Warn("purge repo failed; falling back to node/edge eviction",
-				zap.String("prefix", repoPrefix), zap.Error(err))
-			nodesRemoved, edgesRemoved = mi.graph.EvictRepo(repoPrefix)
-		} else {
-			nodesRemoved, edgesRemoved = meta.NodeCount, meta.EdgeCount
+	purgeRepo := func() {
+		if purger, ok := mi.graph.(interface{ PurgeRepo(string) error }); ok {
+			// Prefer the full sidecar-aware purge. It returns no counts, so report
+			// the last-index metadata as the estimate; fall back to EvictRepo on
+			// error. The subsequent empty corpus replacement also cleans legacy
+			// synthetic chunk rows that are not graph node IDs.
+			if err := purger.PurgeRepo(repoPrefix); err != nil {
+				mi.logger.Warn("purge repo failed; falling back to node/edge eviction",
+					zap.String("prefix", repoPrefix), zap.Error(err))
+				nodesRemoved, edgesRemoved = mi.graph.EvictRepo(repoPrefix)
+			} else {
+				nodesRemoved, edgesRemoved = meta.NodeCount, meta.EdgeCount
+			}
+			return
 		}
-	} else {
-		// Backends without the purge capability (the in-memory store has no
-		// sidecars, so EvictRepo is already complete there).
+		// Backends without sidecars are complete after ordinary eviction.
 		nodesRemoved, edgesRemoved = mi.graph.EvictRepo(repoPrefix)
+	}
+	refresh := func(sw *search.Swappable) error {
+		purgeRepo()
+		return mi.publishVectorCorpusAfterRepoRemoval(context.Background(), repoPrefix, sw)
+	}
+	if sw, ok := mi.search.(*search.Swappable); ok {
+		if err := sw.SerializeVectorUpdate(func() error { return refresh(sw) }); err != nil {
+			mi.logger.Warn("refresh vector corpus after untrack failed",
+				zap.String("prefix", repoPrefix), zap.Error(err))
+		}
+	} else if err := refresh(nil); err != nil {
+		mi.logger.Warn("remove vector corpus after untrack failed",
+			zap.String("prefix", repoPrefix), zap.Error(err))
 	}
 
 	// Remove from global config.
