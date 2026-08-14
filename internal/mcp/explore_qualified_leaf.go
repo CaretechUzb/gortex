@@ -9,6 +9,8 @@ import (
 	"github.com/zzet/gortex/internal/search/rerank"
 )
 
+const exploreQualifiedLeafEndpointLimit = exploreSyntacticAnchorFetch * exploreExactNameAnchorOwnerScan
+
 func exploreQualifiedAnchorParts(qualifiedName string) (owner, member string, ok bool) {
 	dot := strings.LastIndexByte(qualifiedName, '.')
 	if dot <= 0 || dot == len(qualifiedName)-1 {
@@ -181,23 +183,40 @@ func (s *Server) exploreQualifiedLeafCandidate(
 		return nil
 	}
 
-	ids := make([]string, 0, len(matches))
+	endpoints := make([]graph.TypedEdgeEndpoint, 0, len(matches)*exploreExactNameAnchorOwnerScan)
 	for _, match := range matches {
-		if !match.proven {
-			ids = append(ids, match.node.ID)
+		if match.proven {
+			continue
+		}
+		for ownerID := range match.ownerIDs {
+			endpoints = append(endpoints, graph.TypedEdgeEndpoint{
+				From: match.node.ID, To: ownerID, Kind: graph.EdgeMemberOf,
+			})
+			if len(endpoints) > exploreQualifiedLeafEndpointLimit {
+				return nil
+			}
 		}
 	}
-	if len(ids) > 0 {
-		outEdges := reader.GetOutEdgesByNodeIDs(ids)
+	if len(endpoints) > 0 {
+		bounded, ok := reader.(graph.BoundedEdgeExistenceReader)
+		if !ok {
+			return nil
+		}
+		existing, err := bounded.FindExistingEdgeEndpoints(
+			ctx, endpoints, exploreQualifiedLeafEndpointLimit,
+		)
+		if err != nil || ctx.Err() != nil {
+			return nil
+		}
 		for index := range matches {
 			if matches[index].proven {
 				continue
 			}
-			for _, edge := range outEdges[matches[index].node.ID] {
-				if edge == nil || edge.Kind != graph.EdgeMemberOf {
-					continue
+			for ownerID := range matches[index].ownerIDs {
+				key := graph.TypedEdgeEndpoint{
+					From: matches[index].node.ID, To: ownerID, Kind: graph.EdgeMemberOf,
 				}
-				if _, exactOwner := matches[index].ownerIDs[edge.To]; exactOwner {
+				if _, exactOwner := existing[key]; exactOwner {
 					matches[index].proven = true
 					break
 				}
