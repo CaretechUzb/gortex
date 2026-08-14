@@ -129,16 +129,16 @@ func TestPartitionZones_ShortConversation(t *testing.T) {
 	}
 }
 
-func TestMaybeCompact_SyncReducesBelowLowWater(t *testing.T) {
+func TestMaybeCompact_AsyncReducesBelowLowWater(t *testing.T) {
 	// A big conversation: 12 rounds of long filler so it crosses the trigger.
 	filler := strings.Repeat("lorem ipsum dolor sit amet ", 40)
 	conv := buildConv(12, filler)
 
-	c := NewRollingCompactor(&stubSummarizer{
+	stub := &stubSummarizer{
 		summary: "compact summary of earlier work",
 		usage:   llm.TokenUsage{InputTokens: 500, OutputTokens: 20},
-	}, 4, 3000, 100)
-	c.sync = true
+	}
+	c := NewRollingCompactor(stub, 4, 3000, 100)
 
 	pre := estimateConvTokens(conv, llm.TokenUsage{})
 	if pre < c.CompressTriggerTokens {
@@ -147,9 +147,18 @@ func TestMaybeCompact_SyncReducesBelowLowWater(t *testing.T) {
 
 	var usage llm.TokenUsage
 	var mu sync.Mutex
+	first, did := c.maybeCompact(context.Background(), conv, pre, &usage, &mu)
+	if did {
+		t.Fatal("first async call compacted synchronously")
+	}
+	if len(first) != len(conv) {
+		t.Fatal("first async call mutated the conversation")
+	}
+	c.wait()
+
 	out, did := c.maybeCompact(context.Background(), conv, pre, &usage, &mu)
 	if !did {
-		t.Fatal("maybeCompact did not compact a conversation over the high-water mark")
+		t.Fatal("ready asynchronous summary was not spliced")
 	}
 	post := estimateConvTokens(out, llm.TokenUsage{})
 	if post >= pre {
@@ -228,7 +237,7 @@ func TestMaybeCompact_LateSummaryDroppedOnCancel(t *testing.T) {
 		block:   block,
 		started: started,
 	}
-	c := NewRollingCompactor(stub, 4, 3000, 100) // async (sync=false)
+	c := NewRollingCompactor(stub, 4, 3000, 100) // async path
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var usage llm.TokenUsage
@@ -341,7 +350,6 @@ func TestRun_CompactionWiredIntoRun(t *testing.T) {
 		usage:   llm.TokenUsage{InputTokens: 7, OutputTokens: 1},
 	}
 	comp := NewRollingCompactor(summ, 2, 200, 50)
-	comp.sync = true // deterministic in-test compaction
 
 	ag, err := New(tp, []Tool{{
 		Name:        "noop",
