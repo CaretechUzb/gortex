@@ -7,7 +7,7 @@ import (
 
 func TestRulePreambleRoutesExplicitFileReadsDirectly(t *testing.T) {
 	got := rulePreamble()
-	direct := `read(operation:"file", target:{file:"<path>"})`
+	direct := `read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})`
 	localize := "`mcp__gortex__explore` (never a bare `explore`) with `operation:\"localize\"`"
 
 	if !strings.Contains(got, "explicitly named file") || !strings.Contains(got, direct) {

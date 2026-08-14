@@ -203,9 +203,8 @@ func TestAnalyzeAdvertisedTargetMatchesAcceptedTarget(t *testing.T) {
 			aliased++
 		}
 		capability := srv.facadeCapability(spec, true)
-		shape, _ := capability["request_shape"].(map[string]any)
-		arguments, _ := shape["arguments"].(map[string]any)
-		_, publishesTarget := arguments["target"]
+		requestShape, _ := capability["request_shape"].(map[string]any)
+		_, publishesTarget := requestShape["target"]
 
 		id++
 		result := call(id, "analyze", map[string]any{

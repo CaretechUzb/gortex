@@ -123,19 +123,26 @@ func TestCompactToolsListIsStaticAndBudgeted(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &parsed))
 	require.Len(t, parsed.Result.Tools, 21)
 	foundExplore := false
+	foundRead := false
 	for _, tool := range parsed.Result.Tools {
 		require.True(t, isFacadeToolName(tool.Name), "legacy tool leaked into facade-v1: %s", tool.Name)
-		if tool.Name != "explore" {
-			continue
+		switch tool.Name {
+		case "explore":
+			foundExplore = true
+			operation := tool.InputSchema.Properties["operation"].(map[string]any)
+			require.Contains(t, operation["enum"], "localize")
+			require.Contains(t, operation["enum"], "task")
+			require.Contains(t, operation["description"], "Use localize")
+			require.Contains(t, operation["description"], "Use task only")
+		case "read":
+			foundRead = true
+			options := tool.InputSchema.Properties["options"].(map[string]any)
+			require.Contains(t, options["description"], "new_user_task=true")
+			require.Contains(t, options["description"], "read.file")
 		}
-		foundExplore = true
-		operation := tool.InputSchema.Properties["operation"].(map[string]any)
-		require.Contains(t, operation["enum"], "localize")
-		require.Contains(t, operation["enum"], "task")
-		require.Contains(t, operation["description"], "Use localize")
-		require.Contains(t, operation["description"], "Use task only")
 	}
 	require.True(t, foundExplore, "runtime tools/list omitted explore")
+	require.True(t, foundRead, "runtime tools/list omitted read")
 }
 
 func TestFacadeSchemasAcceptUniversalCLIOutput(t *testing.T) {
@@ -532,11 +539,11 @@ func TestCodingAgentInstructionsStayTerseAndDirective(t *testing.T) {
 	srv := &Server{}
 	got := srv.stateAwareInstructionsForClient("", "generic-harness")
 	require.Equal(t, codingAgentInstructions, got)
-	require.Less(t, len(got), 500)
+	require.Less(t, len(got), 550)
 	for _, implementationTerm := range []string{"codex", "facade", "version", "preset", "tools/list", "tools_search"} {
 		require.NotContains(t, strings.ToLower(got), implementationTerm)
 	}
-	for _, directive := range []string{"MUST use Gortex MCP", "Explicit file read/review", `read(operation:"file", target:{file:"<path>"})`, "do not localize", "Unknown file/symbol/evidence", `explore(operation:"localize")`, "completion.required_action", "stop at answer_ready", "Diagnosis/change", `explore(operation:"task")`, `change(operation:"impact")`, "Mutate only via edit/refactor", `change(operation:"detect")`, "capabilities only if fields unknown"} {
+	for _, directive := range []string{"MUST use Gortex MCP", "First explicit-file read per new user request", `read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})`, "do not localize", "Unknown file/symbol/evidence", `explore(operation:"localize")`, "completion.required_action", "stop at answer_ready", "Diagnosis/change", `explore(operation:"task")`, `change(operation:"impact")`, "Mutate only via edit/refactor", `change(operation:"detect")`, "capabilities only if fields unknown"} {
 		require.Contains(t, got, directive)
 	}
 }
@@ -1047,14 +1054,18 @@ func TestFacadeCapabilitiesReturnsOperationSchema(t *testing.T) {
 	require.Equal(t, "file", out["operation"])
 	require.Equal(t, true, out["available"])
 	require.NotEmpty(t, out["schema_hash"])
-	require.NotNil(t, out["input_schema"])
-	shape, ok := out["request_shape"].(map[string]any)
+	inputSchema, ok := out["input_schema"].(map[string]any)
 	require.True(t, ok)
-	require.Equal(t, "read", shape["tool"])
-	arguments, ok := shape["arguments"].(map[string]any)
+	schemaProperties := inputSchema["properties"].(map[string]any)
+	options := schemaProperties["options"].(map[string]any)
+	optionProperties := options["properties"].(map[string]any)
+	boundary := optionProperties["new_user_task"].(map[string]any)
+	require.Equal(t, "boolean", boundary["type"])
+	require.Contains(t, boundary["description"], "first read.file")
+	requestShape, ok := out["request_shape"].(map[string]any)
 	require.True(t, ok)
-	require.Equal(t, "file", arguments["operation"])
-	require.Equal(t, map[string]any{"file": "<file>"}, arguments["target"])
+	require.Equal(t, "file", requestShape["operation"])
+	require.Equal(t, map[string]any{"file": "<file>"}, requestShape["target"])
 }
 
 func TestFacadeCapabilitiesChangeImpactUsesPublicTargetSchema(t *testing.T) {
@@ -1094,8 +1105,8 @@ func TestFacadeCapabilitiesChangeImpactUsesPublicTargetSchema(t *testing.T) {
 	for _, field := range []string{"summary_only", "offset", "limit", "format", "max_bytes"} {
 		require.Contains(t, outputProperties, field)
 	}
-	shape := out["request_shape"].(map[string]any)["arguments"].(map[string]any)
-	require.Equal(t, map[string]any{"symbol": "<symbol>"}, shape["target"])
+	requestShape := out["request_shape"].(map[string]any)
+	require.Equal(t, map[string]any{"symbol": "<symbol>"}, requestShape["target"])
 }
 
 func TestFacadeCapabilitiesRequestShapesUsePublicMutationFields(t *testing.T) {
@@ -1135,11 +1146,9 @@ func TestFacadeCapabilitiesRequestShapesUsePublicMutationFields(t *testing.T) {
 		result, err := srv.handleCapabilities(context.Background(), req)
 		require.NoError(t, err)
 		out := unmarshalResult(t, result)
-		shape, ok := out["request_shape"].(map[string]any)
+		requestShape, ok := out["request_shape"].(map[string]any)
 		require.True(t, ok)
-		arguments, ok := shape["arguments"].(map[string]any)
-		require.True(t, ok)
-		return arguments
+		return requestShape
 	}
 
 	edit := requestShape("edit", "file")
@@ -1202,8 +1211,8 @@ func TestFacadeCapabilitiesDiscoversNativeAnalyzeKinds(t *testing.T) {
 	out := unmarshalResult(t, result)
 	require.Equal(t, true, out["available"])
 	require.Equal(t, AnalyzeKindDescription("todos"), out["summary"])
-	shape := out["request_shape"].(map[string]any)["arguments"].(map[string]any)
-	require.Equal(t, "todos", shape["kind"])
+	requestShape := out["request_shape"].(map[string]any)
+	require.Equal(t, "todos", requestShape["kind"])
 	schema := out["input_schema"].(map[string]any)
 	schemaProperties := schema["properties"].(map[string]any)
 	optionsProperties := schemaProperties["options"].(map[string]any)["properties"].(map[string]any)
@@ -1299,15 +1308,15 @@ func TestFacadeCapabilitiesCollapseSessionSubscriptionChannels(t *testing.T) {
 	schemaReq.Params.Arguments = map[string]any{"domain": "session", "operation": "subscribe", "detail": "schema"}
 	schemaResult, err := srv.handleCapabilities(context.Background(), schemaReq)
 	require.NoError(t, err)
-	shape := unmarshalResult(t, schemaResult)["request_shape"].(map[string]any)["arguments"].(map[string]any)
-	require.Equal(t, "subscribe", shape["operation"])
-	require.Equal(t, "<channel>", shape["channel"])
+	requestShape := unmarshalResult(t, schemaResult)["request_shape"].(map[string]any)
+	require.Equal(t, "subscribe", requestShape["operation"])
+	require.Equal(t, "<channel>", requestShape["channel"])
 
 	cursorReq := mcpgo.CallToolRequest{}
 	cursorReq.Params.Arguments = map[string]any{"domain": "session", "operation": "cursor", "detail": "schema"}
 	cursorResult, err := srv.handleCapabilities(context.Background(), cursorReq)
 	require.NoError(t, err)
-	cursorShape := unmarshalResult(t, cursorResult)["request_shape"].(map[string]any)["arguments"].(map[string]any)
+	cursorShape := unmarshalResult(t, cursorResult)["request_shape"].(map[string]any)
 	require.Equal(t, "cursor", cursorShape["operation"])
 	require.Equal(t, "<action>", cursorShape["arguments"].(map[string]any)["action"])
 
@@ -1469,6 +1478,11 @@ func TestFacadeReadSchemaAdvertisesExactlyOneTargetSelector(t *testing.T) {
 	require.Equal(t, 1, target["maxProperties"])
 	require.Contains(t, target["description"], "exactly one selector")
 	require.Contains(t, target["description"], "symbol for one source symbol")
+	options := tool.InputSchema.Properties["options"].(map[string]any)
+	properties := options["properties"].(map[string]any)
+	boundary := properties["new_user_task"].(map[string]any)
+	require.Equal(t, "boolean", boundary["type"])
+	require.Contains(t, boundary["description"], "first read.file")
 }
 
 func TestFacadeReadSelectorCardinalityDefaultsAndAliases(t *testing.T) {
