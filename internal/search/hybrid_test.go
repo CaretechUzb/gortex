@@ -7,6 +7,33 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type hybridCountTextBackend struct {
+	count int
+}
+
+func (*hybridCountTextBackend) Add(string, ...string)             {}
+func (*hybridCountTextBackend) Remove(string)                     {}
+func (*hybridCountTextBackend) Search(string, int) []SearchResult { return nil }
+func (b *hybridCountTextBackend) Count() int                      { return b.count }
+func (*hybridCountTextBackend) Close()                            {}
+
+func TestHybridCountUsesVectorWhenTextIsEmpty(t *testing.T) {
+	vector := NewVector(2)
+	vector.Add("semantic-only", []float32{1, 0})
+
+	hybrid := NewHybrid(NewNull(), vector, nil)
+	require.Equal(t, 1, hybrid.Count(), "a populated vector channel is a searchable corpus")
+
+	textAuthoritative := NewHybrid(&hybridCountTextBackend{count: 3}, vector, nil)
+	assert.Equal(t, 3, textAuthoritative.Count(), "text and vector counts describe the same corpus and must not be summed")
+
+	empty := NewHybrid(NewNull(), nil, nil)
+	assert.Zero(t, empty.Count(), "an empty hybrid must report no corpus")
+
+	var nilHybrid *HybridBackend
+	assert.Zero(t, nilHybrid.Count(), "a nil hybrid must report no corpus")
+}
+
 func TestAlphaFuse_EqualWeights(t *testing.T) {
 	textResults := []SearchResult{
 		{ID: "a", Score: 10},

@@ -220,8 +220,23 @@ func (h *HybridBackend) dechunkVectorIDs(rawIDs []string, want int) []string {
 	return out
 }
 
-// Count returns the text backend document count.
-func (h *HybridBackend) Count() int { return h.text.Count() }
+// Count reports the corpus visible to hybrid retrieval. A positive text count
+// remains authoritative; vector-only hybrids fall back to their vector count.
+// The channel counts are alternatives, not additive views of the same symbols.
+func (h *HybridBackend) Count() int {
+	if h == nil {
+		return 0
+	}
+	if h.text != nil {
+		if count := h.text.Count(); count > 0 {
+			return count
+		}
+	}
+	if h.vector != nil {
+		return h.vector.Count()
+	}
+	return 0
+}
 
 // Close releases resources owned by the hybrid. The embedding provider and a
 // delegated vector searcher are externally owned; VectorBackend.Close only

@@ -5,12 +5,13 @@ package search
 // Remove and Close are no-ops, Search returns no hits, and Count
 // always reports zero.
 //
-// Reporting an empty corpus is the point. The query Engine gates its
-// ranked path on the backend having something to answer with
-// (Engine.backendHasCorpus) and otherwise falls through to its own
-// substring scan over the graph, which needs no text index at all.
-// NullBackend therefore routes such a store onto exactly the path an
-// Engine with no search backend at all already takes in production —
+// Reporting an empty text corpus is the point. When used on its own, the query
+// Engine gates its ranked path on the backend having something to answer with
+// (Engine.backendHasCorpus) and otherwise falls through to its own substring
+// scan over the graph, which needs no text index at all. When NullBackend is the
+// text side of a HybridBackend, the hybrid's vector count can still establish a
+// searchable corpus. A bare NullBackend therefore routes such a store onto
+// exactly the path an Engine with no search backend at all takes in production —
 // see the Engine built by pkg/gortex.New, which wires query.NewEngine
 // and never calls SetSearch.
 //

@@ -147,6 +147,42 @@ type unknownCountBackend struct{ warmStoreBackend }
 
 func (b *unknownCountBackend) DocCount() (int, bool) { return 12345, false }
 
+// TestGatherSymbolCandidates_VectorOnlyHybridUsesBackend proves that the corpus
+// gate recognizes a populated vector channel even when its text side is the
+// deliberately empty NullBackend. The concept query shares no substring with
+// the symbol name, so the candidate can only arrive through semantic search.
+func TestGatherSymbolCandidates_VectorOnlyHybridUsesBackend(t *testing.T) {
+	g := graph.New()
+	n := &graph.Node{
+		ID:         "app/snapshot.go::SnapshotCoordinator",
+		Name:       "SnapshotCoordinator",
+		Kind:       graph.KindType,
+		RepoPrefix: "app",
+	}
+	g.AddNode(n)
+
+	vector := search.NewVector(2)
+	vector.Add(n.ID, []float32{1, 0})
+	backend := search.NewSwappable(search.NewNull())
+	backend.ReplaceHybridVector(vector, &fakeEmbedder{queryVec: []float32{1, 0}})
+	defer backend.Close()
+
+	engine := NewEngine(g)
+	engine.SetSearch(backend)
+	got := engine.GatherSymbolCandidates(
+		"durable state persistence",
+		5,
+		QueryOptions{SkipInnerRerank: true},
+		nil,
+	)
+	if len(got) != 1 || got[0].Node.ID != n.ID {
+		t.Fatalf("vector-only hybrid was bypassed (substring fallback?); got %#v", got)
+	}
+	if got[0].TextRank != -1 || got[0].VectorRank != 0 {
+		t.Fatalf("vector-only hit must preserve channel ranks; got %#v", got[0])
+	}
+}
+
 // TestGatherSymbolCandidates_EmptyBackendStillFallsBack: no delta
 // count AND no doc count keeps the substring fallback for genuinely
 // empty in-process backends.
