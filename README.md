@@ -50,7 +50,7 @@ High-quality parsing 257 languages/grammars through tree-sitter AST analysis, in
 - **Zero external dependencies** — single binary, everything in-process. No network, no model download to get started. Install, start daemon, use.
 - **Agent integrations (19)** — `gortex init` configures every detected coding assistant on the machine → [docs/agents.md](docs/agents.md)
 - **100+ MCP tools, 16 resources, 3 prompts** — symbol lookup, call chains, blast radius, dataflow, clone detection, refactoring, code actions → [docs/mcp.md](docs/mcp.md)
-- **Semantic search default-on** — baked GloVe-50d (3.8 MB embedded), hybrid BM25 + vector + RRF, zero deps; opt-in MiniLM / Ollama / OpenAI → [docs/semantic-search.md](docs/semantic-search.md)
+- **Semantic search default-on** — baked GloVe-50d (3.8 MB embedded), store-native FTS5/BM25 + vector with adaptive alpha fusion, zero deps; opt-in MiniLM / Ollama / OpenAI → [docs/semantic-search.md](docs/semantic-search.md)
 - **Speculative execution** — `preview_edit` / `simulate_chain` answer "what would change if I applied this WorkspaceEdit?" without touching disk
 - **Live editor overlays** — push unsaved buffers as a shadow graph; tools read through it. Branching for parallel speculative sessions
 - **GCX1 wire format** — published, round-trippable. **An additional −27% tokens vs JSON** at same fidelity → [docs/wire-format.md](docs/wire-format.md)
