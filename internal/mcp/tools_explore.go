@@ -3008,9 +3008,12 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 	}
 	if exploreQueryIsConceptTask(task) && len(targets) > len(artifactTargets) {
-		symbolTargets := promoteExploreDivergentDefaultOwner(task, targets[len(artifactTargets):], s.graph, maxSymbols, func(node *graph.Node) string {
-			return s.manifestSymbolSource(ctx, node)
-		}, s.divergentDefaultFallbackSLOOverride)
+		symbolTargets := promoteExploreDivergentDefaultOwner(
+			ctx, task, targets[len(artifactTargets):], eng.Reader(), s.localizationNodeScope(ctx, opts), maxSymbols,
+			func(node *graph.Node) string {
+				return s.manifestSymbolSource(ctx, node)
+			}, s.divergentDefaultFallbackSLOOverride,
+		)
 		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
 	}
 	// Causal-change promotion is the second concept lane over the same ranked
@@ -3020,17 +3023,20 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if len(targets) > len(artifactTargets) {
 		symbolTargets := targets[len(artifactTargets):]
 		if exploreDivergentDefaultOwnerSymbol(symbolTargets) == "" {
-			symbolTargets = promoteExploreCausalChangeTargets(task, symbolTargets, s.graph, maxSymbols, func(node *graph.Node) string {
-				return s.manifestSymbolSource(ctx, node)
-			}, func(node *graph.Node) ([]*graph.Node, bool) {
-				callees := eng.GetCallChain(node.ID, ringOpts)
-				if callees == nil {
-					return nil, false
-				}
-				direct, projectionComplete := ringNeighborsProjection(callees.Nodes, node.ID, exploreRingCap)
-				complete := !callees.Truncated && !callees.BudgetHit && !callees.LowerBound && projectionComplete
-				return direct, complete
-			})
+			symbolTargets = promoteExploreCausalChangeTargets(
+				ctx, task, symbolTargets, eng.Reader(), s.localizationNodeScope(ctx, opts), maxSymbols,
+				func(node *graph.Node) string {
+					return s.manifestSymbolSource(ctx, node)
+				}, func(node *graph.Node) ([]*graph.Node, bool) {
+					callees := eng.GetCallChain(node.ID, ringOpts)
+					if callees == nil {
+						return nil, false
+					}
+					direct, projectionComplete := ringNeighborsProjection(callees.Nodes, node.ID, exploreRingCap)
+					complete := !callees.Truncated && !callees.BudgetHit && !callees.LowerBound && projectionComplete
+					return direct, complete
+				},
+			)
 			targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
 		}
 	}

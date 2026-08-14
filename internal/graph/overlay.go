@@ -59,6 +59,9 @@ type OverlayLayer struct {
 	// filter base hits whose enclosing file is overlaid but whose
 	// id disappeared from the overlay's node list.
 	nameRemoved map[string]map[string]bool
+	// removedByID is the immutable identity-side index for bounded point and
+	// adjacency projections. It avoids rescanning every name bucket per ID.
+	removedByID map[string]bool
 }
 
 // overlayFileEntry carries one file's overlay state inside the
@@ -83,6 +86,7 @@ func NewOverlayLayer() *OverlayLayer {
 		nodesByName: make(map[string][]*Node),
 		nodesByQual: make(map[string]*Node),
 		nameRemoved: make(map[string]map[string]bool),
+		removedByID: make(map[string]bool),
 	}
 }
 
@@ -205,6 +209,7 @@ func (l *OverlayLayer) MarkRemoved(baseName, baseID string) {
 		l.nameRemoved[baseName] = set
 	}
 	set[baseID] = true
+	l.removedByID[baseID] = true
 }
 
 // HasFile reports whether the overlay covers a particular graph path
@@ -407,37 +412,8 @@ func (v *OverlaidView) GetNode(id string) *Node {
 // fans out as a single batched lookup against the base store. Missing
 // IDs are simply absent from the returned map.
 func (v *OverlaidView) GetNodesByIDs(ids []string) map[string]*Node {
-	if len(ids) == 0 {
-		return nil
-	}
-	out := make(map[string]*Node, len(ids))
-	baseIDs := ids[:0:0] // fresh backing array — never aliases caller's slice
-	for _, id := range ids {
-		if id == "" {
-			continue
-		}
-		if _, dup := out[id]; dup {
-			continue
-		}
-		if v.layer != nil && v.nodeBelongsToOverlay(id) {
-			if n := v.layer.nodeByID[id]; n != nil {
-				out[id] = n
-			}
-			// Overlay tombstone — ID is hidden, do not fall back to base.
-			continue
-		}
-		// Track for the single base round-trip; reserve a slot in `out`
-		// only after the batched lookup returns.
-		baseIDs = append(baseIDs, id)
-	}
-	if len(baseIDs) > 0 && v.base != nil {
-		for id, n := range v.base.GetNodesByIDs(baseIDs) {
-			if n != nil {
-				out[id] = n
-			}
-		}
-	}
-	return out
+	nodes, _ := v.GetNodesByIDsContext(nil, ids)
+	return nodes
 }
 
 // GetNodeByQualName: overlay first, then base. Base hits are filtered

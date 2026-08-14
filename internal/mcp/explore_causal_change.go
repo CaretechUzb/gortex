@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"sort"
 	"strings"
 
@@ -45,9 +46,11 @@ type exploreCausalChangeHydrator func(*graph.Node) ([]*graph.Node, bool)
 // never scans a repository, reads at most one source body, and replaces only
 // unprotected retrieval-tail rows.
 func promoteExploreCausalChangeTargets(
+	ctx context.Context,
 	task string,
 	targets []exploreTarget,
-	store graph.Store,
+	reader graph.Reader,
+	scope graph.LocalizationNodeScope,
 	maxSymbols int,
 	readSource func(*graph.Node) string,
 	hydrateBridges ...exploreCausalChangeHydrator,
@@ -59,7 +62,7 @@ func promoteExploreCausalChangeTargets(
 	if len(hydrateBridges) > 0 {
 		hydrateBridge = hydrateBridges[0]
 	}
-	candidate, ok := selectExploreCausalChangeTargetWithConsumers(task, targets, store)
+	candidate, ok := selectExploreCausalChangeTargetWithConsumers(ctx, task, targets, reader)
 	if !ok {
 		return targets
 	}
@@ -96,7 +99,7 @@ func promoteExploreCausalChangeTargets(
 	var owner exploreTarget
 	ownerPresent := false
 	if candidate.crossFile {
-		if node := exploreCausalChangeOwner(task, candidate.node, store); node != nil {
+		if node := exploreCausalChangeOwner(ctx, task, candidate.node, reader, scope); node != nil {
 			owner, ownerPresent = exploreTargetByID(targets, node.ID)
 			owner.node = node
 			owner.causalChangeOwner = true
@@ -271,12 +274,13 @@ func selectExploreCausalContinuation(task string, bridge exploreTarget, hinted *
 }
 
 func selectExploreCausalChangeTargetWithConsumers(
+	ctx context.Context,
 	task string,
 	targets []exploreTarget,
-	store graph.Store,
+	reader graph.Reader,
 ) (exploreCausalChangeCandidate, bool) {
 	direct, directOK := selectExploreCausalChangeTarget(task, targets)
-	consumer, consumerOK := selectExploreCausalConsumerTarget(task, targets, store)
+	consumer, consumerOK := selectExploreCausalConsumerTarget(ctx, task, targets, reader)
 	switch {
 	case !consumerOK:
 		return direct, directOK
@@ -295,11 +299,15 @@ func selectExploreCausalChangeTargetWithConsumers(
 // it prevents a generic high-fanout caller walk from becoming another broad
 // search channel.
 func selectExploreCausalConsumerTarget(
+	ctx context.Context,
 	task string,
 	targets []exploreTarget,
-	store graph.Store,
+	reader graph.Reader,
 ) (exploreCausalChangeCandidate, bool) {
-	if store == nil || len(targets) == 0 {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if reader == nil || len(targets) == 0 || ctx.Err() != nil {
 		return exploreCausalChangeCandidate{}, false
 	}
 	terms := exploreTerminalTerms(shapeExploreQuery(task))
@@ -360,20 +368,18 @@ func selectExploreCausalConsumerTarget(
 			for index, node := range frontier {
 				ids[index] = node.ID
 			}
-			incoming := store.GetInEdgesByNodeIDs(ids)
+			incoming, complete := exploreIncomingSourcesBounded(
+				ctx, reader, ids, graph.EdgeCalls, exploreCausalConsumerNodeFanoutCap,
+			)
+			if !complete {
+				return exploreCausalChangeCandidate{}, false
+			}
 			callerSet := make(map[string]struct{}, exploreCausalConsumerFrontierCap)
 			for _, id := range ids {
-				local := make(map[string]struct{}, exploreCausalConsumerNodeFanoutCap+1)
-				for _, edge := range incoming[id] {
-					if edge == nil || edge.Kind != graph.EdgeCalls || edge.From == "" {
-						continue
-					}
-					local[edge.From] = struct{}{}
-				}
-				if len(local) > exploreCausalConsumerNodeFanoutCap {
+				if incoming.Truncated[id] {
 					continue
 				}
-				for callerID := range local {
+				for _, callerID := range incoming.Sources[id] {
 					callerSet[callerID] = struct{}{}
 				}
 			}
@@ -385,7 +391,12 @@ func selectExploreCausalConsumerTarget(
 			if len(callerIDs) > exploreCausalConsumerFrontierCap {
 				callerIDs = callerIDs[:exploreCausalConsumerFrontierCap]
 			}
-			nodes := store.GetNodesByIDs(callerIDs)
+			nodes, complete := exploreNodesByIDsBounded(
+				ctx, reader, callerIDs, exploreCausalConsumerFrontierCap,
+			)
+			if !complete {
+				return exploreCausalChangeCandidate{}, false
+			}
 			next := make([]*graph.Node, 0, len(callerIDs))
 			for _, callerID := range callerIDs {
 				if _, exists := expanded[callerID]; exists {
@@ -559,18 +570,45 @@ func exploreCausalChangeLess(left, right exploreCausalChangeCandidate) bool {
 	return exploreDraftNodeKey(left.node) < exploreDraftNodeKey(right.node)
 }
 
-func exploreCausalChangeOwner(task string, leaf *graph.Node, store graph.Store) *graph.Node {
-	if leaf == nil || leaf.FilePath == "" || store == nil {
+func exploreCausalChangeOwner(
+	ctx context.Context,
+	task string,
+	leaf *graph.Node,
+	reader graph.Reader,
+	scope graph.LocalizationNodeScope,
+) *graph.Node {
+	if leaf == nil || leaf.FilePath == "" || reader == nil {
 		return nil
 	}
-	fileNodes := store.GetFileNodesByPaths([]string{leaf.FilePath})[leaf.FilePath]
-	if len(fileNodes) == 0 || len(fileNodes) > exploreCausalChangeFileNodeCap {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	page, complete := boundedLocalizationFileNodes(
+		ctx,
+		reader,
+		localizationFileBudgetFor(ctx),
+		leaf.FilePath,
+		graph.LocalizationNodeScope{},
+		exploreCausalChangeFileNodeCap,
+	)
+	if !complete || len(page.Nodes) == 0 {
 		return nil
 	}
-	types := make([]*graph.Node, 0, 8)
-	for _, node := range fileNodes {
+	typeIDs := make([]string, 0, len(page.Nodes))
+	for _, summary := range page.Nodes {
+		if summary != nil && summary.Kind == graph.KindType && summary.ID != "" {
+			typeIDs = append(typeIDs, summary.ID)
+		}
+	}
+	full, complete := exploreNodesByIDsBounded(ctx, reader, typeIDs, exploreCausalChangeFileNodeCap)
+	if !complete {
+		return nil
+	}
+	types := make([]*graph.Node, 0, len(typeIDs))
+	for _, id := range typeIDs {
+		node := full[id]
 		if node == nil || node.Kind != graph.KindType || exploreDraftIsTestNode(node) ||
-			!exploreNodesShareExactScope(leaf, node) {
+			!scope.Allows(node) || !exploreNodesShareExactScope(leaf, node) {
 			continue
 		}
 		types = append(types, node)

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"slices"
 	"testing"
 
@@ -17,6 +18,34 @@ func causalChangeTestNode(id, name, file string, kind graph.NodeKind, signature 
 		Language: "rust", RepoPrefix: "repo", WorkspaceID: "workspace", ProjectID: "project",
 		StartLine: 10, EndLine: 20, Meta: meta,
 	}
+}
+
+func promoteExploreCausalChangeTargetsForTest(
+	task string,
+	targets []exploreTarget,
+	reader graph.Reader,
+	maxSymbols int,
+	readSource func(*graph.Node) string,
+	hydrateBridges ...exploreCausalChangeHydrator,
+) []exploreTarget {
+	return promoteExploreCausalChangeTargets(
+		context.Background(), task, targets, reader, graph.LocalizationNodeScope{},
+		maxSymbols, readSource, hydrateBridges...,
+	)
+}
+
+func exploreCausalChangeOwnerForTest(task string, leaf *graph.Node, reader graph.Reader) *graph.Node {
+	return exploreCausalChangeOwner(
+		context.Background(), task, leaf, reader, graph.LocalizationNodeScope{},
+	)
+}
+
+func selectExploreCausalConsumerTargetForTest(
+	task string,
+	targets []exploreTarget,
+	reader graph.Reader,
+) (exploreCausalChangeCandidate, bool) {
+	return selectExploreCausalConsumerTarget(context.Background(), task, targets, reader)
 }
 
 func causalChangeTargetIDs(targets []exploreTarget) []string {
@@ -48,7 +77,7 @@ func TestPromoteExploreCausalChangeTargetsReservesDelegatedLeaf(t *testing.T) {
 		{node: causalChangeTestNode("repo/router/errors.go::invalidNodeDiagnostic", "invalidNodeDiagnostic", "router/errors.go", graph.KindFunction, "func invalidNodeDiagnostic()")},
 	}
 	task := "Request execution panics during case insensitive path fallback instead of returning not found"
-	got := promoteExploreCausalChangeTargets(task, targets, nil, len(targets), func(node *graph.Node) string {
+	got := promoteExploreCausalChangeTargetsForTest(task, targets, nil, len(targets), func(node *graph.Node) string {
 		if node.ID == leaf.ID {
 			return "func resolveCaseInsensitivePathRec(path string) []byte { return nil }"
 		}
@@ -106,7 +135,7 @@ func TestPromoteExploreCausalChangeTargetsPrefersGraphCallerOverKeywordOnlyTail(
 		{node: keywordOnly},
 	}
 	task := "Multiline replace duplicates output when replacement captures span several lines"
-	got := promoteExploreCausalChangeTargets(task, targets, g, len(targets), func(node *graph.Node) string {
+	got := promoteExploreCausalChangeTargetsForTest(task, targets, g, len(targets), func(node *graph.Node) string {
 		if node.ID == leaf.ID {
 			return "fn apply_replacements(&mut self) -> io::Result<()> { Ok(()) }"
 		}
@@ -144,7 +173,7 @@ func TestExploreCausalChangeOwnerPrefersUniquelyReturnedStateType(t *testing.T) 
 	g.AddNode(builder)
 	g.AddNode(state)
 
-	got := exploreCausalChangeOwner("parallel roots leak rule state between traversals", leaf, g)
+	got := exploreCausalChangeOwnerForTest("parallel roots leak rule state between traversals", leaf, g)
 	if got == nil || got.ID != state.ID {
 		t.Fatalf("change owner = %#v, want uniquely returned state type %q", got, state.ID)
 	}
@@ -193,7 +222,7 @@ func TestPromoteExploreCausalChangeTargetsCarriesCrossFileBridgeToContinuationAn
 
 	readCalls, hydrateCalls := 0, 0
 	task := "The replace with captures at path should replace all matches while preserving captures in their surrounding context"
-	got := promoteExploreCausalChangeTargets(task, []exploreTarget{{
+	got := promoteExploreCausalChangeTargetsForTest(task, []exploreTarget{{
 		node: seed, source: "replace_with_captures_at replaces captures", callers: []*graph.Node{bridge},
 	}}, store, 4, func(node *graph.Node) string {
 		readCalls++
@@ -257,7 +286,7 @@ func TestPromoteExploreCausalChangeTargetsUsesNestedDelegationHint(t *testing.T)
 		causalCallees: []exploreCausalNeighbor{{node: bridge, hop: 1}, {node: continuation, hop: 2}},
 	}}
 	task := "The redirect fixed path fallback should follow case insensitive path lookup recursively without cleaning away valid request segments"
-	got := promoteExploreCausalChangeTargets(task, targets, nil, 3, func(node *graph.Node) string {
+	got := promoteExploreCausalChangeTargetsForTest(task, targets, nil, 3, func(node *graph.Node) string {
 		if node.ID != bridge.ID {
 			t.Fatalf("source read for %q, want hinted bridge %q", node.ID, bridge.ID)
 		}
@@ -303,7 +332,7 @@ func TestPromoteExploreCausalChangeTargetsContinuesInheritedCaller(t *testing.T)
 		"combineRecords", "HipChatHandler.combineRecords", "src/Handler/HipChatHandler.php", graph.KindMethod,
 	)
 	task := "The Hip Chat handler should handle each batch by combining records before checking handling and writing messages to the API"
-	got := promoteExploreCausalChangeTargets(task, []exploreTarget{{
+	got := promoteExploreCausalChangeTargetsForTest(task, []exploreTarget{{
 		node: seed, source: "isHandling checks every record", callers: []*graph.Node{genericCaller, bridge},
 	}}, nil, 3, func(node *graph.Node) string {
 		if node.ID != bridge.ID {
@@ -357,7 +386,7 @@ func TestPromoteExploreCausalChangeTargetsContinuationFailsClosed(t *testing.T) 
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := promoteExploreCausalChangeTargets(task, []exploreTarget{{
+			got := promoteExploreCausalChangeTargetsForTest(task, []exploreTarget{{
 				node: seed, source: "resolveRequestPath dispatches request work", callers: []*graph.Node{bridge},
 			}}, nil, 3, func(*graph.Node) string {
 				return "func dispatchRequest() { dispatchPrimaryWork(); dispatchBackupWork() }"
