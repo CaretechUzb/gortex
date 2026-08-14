@@ -120,6 +120,12 @@ func fallbackChunkerEnv(specs []config.FallbackChunkerSpec) string {
 // on. Returns (nil, nil) if no worker can spawn, so the caller falls
 // back to in-process extraction.
 func (idx *Indexer) sharedParsePool() (*crashpool.Pool, *crashpool.Quarantine) {
+	releaseLifecycle, err := idx.extractionLifecycle.admit()
+	if err != nil {
+		return nil, nil
+	}
+	defer releaseLifecycle()
+
 	idx.parsePoolMu.Lock()
 	defer idx.parsePoolMu.Unlock()
 	if idx.parsePool != nil {
@@ -146,9 +152,9 @@ func (idx *Indexer) sharedParsePool() (*crashpool.Pool, *crashpool.Quarantine) {
 	return idx.parsePool, idx.parseQuar
 }
 
-// CloseParsePool tears down the long-lived crash-isolation pool if one
+// closeParsePool tears down the long-lived crash-isolation pool if one
 // was created. It is safe to call when none exists, and idempotent.
-func (idx *Indexer) CloseParsePool() {
+func (idx *Indexer) closeParsePool() {
 	idx.parsePoolMu.Lock()
 	defer idx.parsePoolMu.Unlock()
 	if idx.parsePool != nil {
@@ -320,7 +326,15 @@ func (idx *Indexer) extractFileCtxWithRawLease(
 			true, fmt.Errorf("skipped quarantined file %s", relPath)
 	}
 
-	res := submitWithRetry(func() crashpool.Result { return pool.Submit(relPath, lang, src) })
+	releaseLifecycle, lifecycleErr := idx.extractionLifecycle.admit()
+	if lifecycleErr != nil {
+		return nil, false, lifecycleErr
+	}
+	defer releaseLifecycle()
+	helperNames := idx.extractionOptionsValue().TemporalEnvHelpers()
+	res := submitWithRetry(func() crashpool.Result {
+		return pool.SubmitWithOptions(relPath, lang, src, helperNames)
+	})
 	switch {
 	case res.Crashed || res.Panicked:
 		q.Add(relPath, res.Err, mtime)

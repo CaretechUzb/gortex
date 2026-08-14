@@ -576,6 +576,18 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 		}
 	}
 	s.MultiIndexer = mi
+	// Appended after backendCleanup but before MCP background drain. LIFO
+	// teardown therefore drains background work first, then closes per-repo
+	// parser workers, then the standalone Indexer, and only then the graph and
+	// store lock.
+	s.cleanup = append(s.cleanup, func() {
+		if mi != nil {
+			if err := mi.Close(context.Background()); err != nil {
+				logger.Warn("serverstack: multi-indexer shutdown failed", zap.Error(err))
+			}
+		}
+		idx.Close()
+	})
 
 	toolPolicyCfg := gortexmcp.ToolPolicyConfig{
 		Preset:         conf.MCP.Tools.Preset,

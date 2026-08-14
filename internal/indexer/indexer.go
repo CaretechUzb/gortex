@@ -222,6 +222,14 @@ type Indexer struct {
 	parseQuar   *crashpool.Quarantine
 	parsePoolMu sync.Mutex
 
+	// extractionLifecycle rejects new parses once Close begins and waits for
+	// every admitted in-process, crash-worker, streaming, and overlay request.
+	extractionLifecycle extractionLifecycle
+	// extractionOptions is loaded once after the repository root is established.
+	// The pointed-to value is immutable for the Indexer's lifetime.
+	extractionOptionsOnce sync.Once
+	extractionOptions     atomic.Pointer[parser.ExtractionOptions]
+
 	// Trigram code-search index, lazily built on first GrepText call
 	// and rebuilt only when indexGen advances past the build it was
 	// made from. indexGen is bumped by every full or incremental
@@ -1446,6 +1454,7 @@ func (idx *Indexer) storeRootPath(absRoot string) {
 	if idx.rootPath != absRoot {
 		idx.rootPath = absRoot
 	}
+	idx.initializeExtractionOptions(absRoot)
 }
 
 // populateCppIncludeDirs reconstructs each C/C++ source file's include search

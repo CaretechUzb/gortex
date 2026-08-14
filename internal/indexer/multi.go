@@ -62,13 +62,22 @@ type MultiIndexer struct {
 	indexers  map[string]*Indexer      // repoPrefix → per-repo indexer
 	configMgr *config.ConfigManager
 	logger    *zap.Logger
-	mu        sync.RWMutex
+	// newIndexer is instance-local so lifecycle tests can observe a constructor
+	// failure without publishing the candidate Indexer. Production instances set
+	// it to New; every per-repository construction flows through this factory.
+	newIndexer func(graph.Store, *parser.Registry, config.IndexConfig, *zap.Logger) *Indexer
+	mu         sync.RWMutex
 
 	// repositoryMutations owns one stable mutation lane per repository prefix.
 	// The slot survives Indexer replacement so an explicit re-index cannot race
 	// an old watcher instance on a second lane.
 	repositoryMutationMu sync.Mutex
 	repositoryMutations  map[string]*repositoryMutationCoordinator
+	// lifecycleClosed is guarded by repositoryMutationMu so closing admission
+	// is atomic with stable-lane creation. closeMu serializes idempotent teardown.
+	lifecycleClosed   bool
+	lifecycleComplete bool
+	closeMu           sync.Mutex
 
 	// batchMutationGate makes a batch-mode transition atomic with respect to
 	// complete repository mutation pipelines. Stable coordinators take the read
@@ -312,7 +321,13 @@ func (mi *MultiIndexer) newPerRepoIndexerGuardedWithMode(
 	cfg config.IndexConfig,
 	mode multiIndexerBatchMode,
 ) *Indexer {
-	idx := New(mi.graph, mi.registry, cfg, mi.logger)
+	factory := mi.newIndexer
+	if factory == nil {
+		// Preserve hand-built zero-value MultiIndexer fixtures while keeping
+		// every production instance on the constructor installed above.
+		factory = New
+	}
+	idx := factory(mi.graph, mi.registry, cfg, mi.logger)
 	idx.shadowAdmission = mi.shadowAdmission
 	idx.parseAdmission.Store(mi.parseAdmission.Load())
 	idx.nativeParseAdmission.Store(mi.nativeParseAdmission.Load())
@@ -1850,6 +1865,7 @@ func NewMultiIndexer(
 		indexers:        make(map[string]*Indexer),
 		configMgr:       cm,
 		logger:          logger,
+		newIndexer:      New,
 		shadowAdmission: processShadowAdmission,
 	}
 }
@@ -2088,7 +2104,13 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 
 					result, err := idx.indexCtxRaw(context.Background(), r.absPath)
 					if err != nil {
+						idx.Close()
 						resultCh <- repoResult{prefix: r.prefix, err: fmt.Errorf("indexing %s: %w", r.absPath, err)}
+						return
+					}
+					if result == nil {
+						idx.Close()
+						resultCh <- repoResult{prefix: r.prefix, err: fmt.Errorf("indexing %s returned a nil result", r.absPath)}
 						return
 					}
 					result.RepoPrefix = r.prefix
@@ -2133,12 +2155,19 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 				completed = append(completed, rr)
 				results[rr.prefix] = rr.result
 			}
+			oldIndexers := make([]*Indexer, 0, len(completed))
 			mi.mu.Lock()
 			for _, rr := range completed {
+				if old := mi.indexers[rr.prefix]; old != nil && old != rr.idx {
+					oldIndexers = append(oldIndexers, old)
+				}
 				mi.repos[rr.prefix] = rr.meta
 				mi.indexers[rr.prefix] = rr.idx
 			}
 			mi.mu.Unlock()
+			for _, old := range oldIndexers {
+				old.Close()
+			}
 			if coordinatedBulkActive {
 				if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
 					return nil, fmt.Errorf("multi-repo bulk-load finalize: %w", err)
@@ -2234,6 +2263,7 @@ func (mi *MultiIndexer) IndexRepo(repoPrefix string) (*IndexResult, error) {
 func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 	mi.mu.RLock()
 	meta, ok := mi.repos[repoPrefix]
+	oldIdx := mi.indexers[repoPrefix]
 	mi.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("repository not found: %s", repoPrefix)
@@ -2247,6 +2277,12 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 	mi.configMgr.LoadWorkspaceConfig(repoPrefix, meta.RootPath)
 	cfg := mi.configMgr.GetRepoConfig(repoPrefix)
 	idx := mi.newPerRepoIndexerGuarded(cfg.Index)
+	installed := false
+	defer func() {
+		if !installed {
+			idx.Close()
+		}
+	}()
 	// Always stamp the repo prefix, even when this is the only tracked repo.
 	// The multi-repo cold path (indexMultiRepo) already prefixes
 	// unconditionally; gating the single-repo re-index on repo count left the
@@ -2285,6 +2321,10 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 	}
 	mi.indexers[repoPrefix] = idx
 	mi.mu.Unlock()
+	installed = true
+	if oldIdx != nil && oldIdx != idx {
+		oldIdx.Close()
+	}
 
 	// TODO: After re-indexing, run CrossRepoResolver.ResolveForRepo(repoPrefix)
 	// to update cross-repo edges. This will be implemented in Task 7.1.
@@ -2735,6 +2775,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	idx.SetProjectID(resolveProjectID(&entryCopy, cfg, prefix))
 
 	var result *IndexResult
+	installed := false
 	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
 		// lane and transition generation are held, reapply the authoritative mode.
@@ -2789,6 +2830,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 		}
 		mi.indexers[prefix] = idx
 		mi.mu.Unlock()
+		installed = true
 
 		// Add to global config.
 		entry.Path = absPath
@@ -2806,6 +2848,9 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 		}
 		return nil
 	})
+	if !installed {
+		idx.Close()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -2880,6 +2925,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	idx.SetFileMtimes(priorMtimes)
 
 	var result *IndexResult
+	installed := false
 	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
 		// lane and transition generation are held, reapply the authoritative mode.
@@ -3013,6 +3059,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		}
 		mi.indexers[prefix] = idx
 		mi.mu.Unlock()
+		installed = true
 
 		entry.Path = absPath
 		if err := mi.configMgr.Global().AddRepo(entry); err != nil {
@@ -3054,6 +3101,9 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		topologyChanged = incrementalTopologyChanged(result)
 		return nil
 	})
+	if !installed {
+		idx.Close()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -3150,6 +3200,9 @@ func (mi *MultiIndexer) ReconcileAllCtx(ctx context.Context) map[string]*IndexRe
 
 // UntrackRepo evicts a repo from the graph and removes it from config.
 func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
+	if mi.isClosed() {
+		return 0, 0
+	}
 	// Snapshot the exact live registry generation first. Legacy restores and
 	// direct-map fixtures may not have a stable lane yet; backfill one only
 	// while both metadata and Indexer pointers still match this generation.
@@ -3202,6 +3255,12 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 	delete(mi.repos, repoPrefix)
 	delete(mi.indexers, repoPrefix)
 	mi.mu.Unlock()
+
+	// The stable mutation lane is drained and this exact generation is detached;
+	// now wait for any overlay/direct extraction before terminating its workers.
+	if idx != nil {
+		idx.Close()
+	}
 
 	// The process-wide trigram budget otherwise retains the removed Indexer
 	// (and its full-text cache) until an unrelated search happens to evict it.

@@ -280,14 +280,16 @@ func (c *repositoryMutationCoordinator) runExclusiveMode(
 	return fn()
 }
 
-func (c *repositoryMutationCoordinator) closeAndWait(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+func (c *repositoryMutationCoordinator) closeAdmission() {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
+}
 
+func (c *repositoryMutationCoordinator) wait(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	done := make(chan struct{})
 	go func() {
 		c.work.Wait()
@@ -299,6 +301,11 @@ func (c *repositoryMutationCoordinator) closeAndWait(ctx context.Context) error 
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func (c *repositoryMutationCoordinator) closeAndWait(ctx context.Context) error {
+	c.closeAdmission()
+	return c.wait(ctx)
 }
 
 type repositoryMutationCoordinatorStats struct {
@@ -324,6 +331,13 @@ func (c *repositoryMutationCoordinator) stats() repositoryMutationCoordinatorSta
 func (mi *MultiIndexer) repositoryMutationCoordinator(repoPrefix string) *repositoryMutationCoordinator {
 	mi.repositoryMutationMu.Lock()
 	defer mi.repositoryMutationMu.Unlock()
+	if mi.lifecycleClosed {
+		coordinator := newRepositoryMutationCoordinator(func([]string) (*IndexResult, error) {
+			return nil, errMultiIndexerClosed
+		})
+		coordinator.closeAdmission()
+		return coordinator
+	}
 	if mi.repositoryMutations == nil {
 		mi.repositoryMutations = make(map[string]*repositoryMutationCoordinator)
 	}
@@ -487,7 +501,7 @@ func (idx *Indexer) ensureRepositoryMutationRoot(root string) error {
 	idx.repositoryMutationMu.Lock()
 	defer idx.repositoryMutationMu.Unlock()
 	if idx.rootPath == "" {
-		idx.rootPath = absRoot
+		idx.storeRootPath(absRoot)
 		return nil
 	}
 	current, err := filepath.Abs(idx.rootPath)

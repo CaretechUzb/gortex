@@ -30,18 +30,23 @@ func (e *extractorPanicError) Error() string {
 	return fmt.Sprintf("extractor panic on %s: %v", e.file, e.value)
 }
 
-// safeExtract runs ext.Extract guarded by a recover so a panic on a
-// single malformed file becomes an error instead of crashing the whole
-// indexing run. This is the in-process last line of defence behind the
-// subprocess crash-isolation pool (which only runs when enabled).
-func safeExtract(ext parser.Extractor, relPath string, src []byte) (result *parser.ExtractionResult, err error) {
+// safeExtractWithOptions runs the central extraction dispatcher guarded by a
+// recover so a panic on one malformed file becomes an error instead of
+// crashing the whole indexing run. The request options are immutable and
+// repository-scoped.
+func safeExtractWithOptions(
+	ext parser.Extractor,
+	relPath string,
+	src []byte,
+	opts parser.ExtractionOptions,
+) (result *parser.ExtractionResult, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			result = nil
 			err = &extractorPanicError{file: relPath, value: rec, stack: debug.Stack()}
 		}
 	}()
-	return ext.Extract(relPath, src)
+	return parser.Extract(ext, relPath, src, opts)
 }
 
 // skippedFile records a file dropped by the size cap or a full-index
@@ -118,10 +123,20 @@ func (idx *Indexer) extractWithTimeoutDone(
 	if done == nil {
 		done = func() {}
 	}
+	releaseLifecycle, err := idx.extractionLifecycle.admit()
+	if err != nil {
+		done()
+		return nil, err
+	}
+	finish := func() {
+		defer releaseLifecycle()
+		done()
+	}
+	opts := idx.extractionOptionsValue()
 	budget := effectiveExtractBudget(idx.config.MaxExtractMillis, len(src))
 	if budget <= 0 {
-		defer done()
-		return safeExtract(ext, relPath, src)
+		defer finish()
+		return safeExtractWithOptions(ext, relPath, src, opts)
 	}
 	type outcome struct {
 		result *parser.ExtractionResult
@@ -129,8 +144,8 @@ func (idx *Indexer) extractWithTimeoutDone(
 	}
 	ch := make(chan outcome, 1)
 	go func() {
-		r, err := safeExtract(ext, relPath, src)
-		done()
+		r, err := safeExtractWithOptions(ext, relPath, src, opts)
+		finish()
 		ch <- outcome{result: r, err: err}
 	}()
 	timer := time.NewTimer(time.Duration(budget) * time.Millisecond)
