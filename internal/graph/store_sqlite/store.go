@@ -68,6 +68,13 @@ type Store struct {
 	// re-indexes don't re-upsert identical stubs on every batch.
 	builtinSeen sync.Map
 
+	// Structural integrity is owned by this logical store. Shadows forward
+	// rejected attempts into the same recorder; warnings are rate-limited per
+	// Store so independent workspaces never suppress each other's diagnostics.
+	structuralIntegrity   graph.StructuralIntegrityMeter
+	structuralWriteWarned atomic.Bool
+	structuralReadWarned  atomic.Bool
+
 	// preparedSQL registers every statement prepared at Open so the plan
 	// fence can EXPLAIN the entire prepared surface against a fixture and
 	// reject big-table scans mechanically.
@@ -1047,12 +1054,12 @@ func scanNodeSummary(scanner interface {
 
 // scanEdgeCursor is cursor-only: metadata is decoded before Rows.Next, so the
 // driver-owned RawBytes never escapes into the returned edge.
-func scanEdgeCursor(scanner rowScanner) (*graph.Edge, error) {
+func (s *Store) scanEdgeCursor(scanner rowScanner) (*graph.Edge, error) {
 	var metaBlob sql.RawBytes
-	return scanEdgeWithMeta(scanner, &metaBlob)
+	return scanEdgeWithMeta(s, scanner, &metaBlob)
 }
 
-func scanEdgeWithMeta[B ~[]byte](scanner rowScanner, metaBlob *B) (*graph.Edge, error) {
+func scanEdgeWithMeta[B ~[]byte](store *Store, scanner rowScanner, metaBlob *B) (*graph.Edge, error) {
 	var (
 		e         graph.Edge
 		crossRepo int64
@@ -1079,35 +1086,10 @@ func scanEdgeWithMeta[B ~[]byte](scanner rowScanner, metaBlob *B) (*graph.Edge, 
 	// is left alone so any blob-carried value survives.
 	restorePromotedEdgeMeta(&e, p)
 	if graph.StructuralEdgeTargetInvalid(e.Kind, e.To) {
-		noteStructuralReadDrop()
+		store.noteStructuralReadDrop(graph.StructuralPathSQLiteFullRead, &e)
 		return nil, nil
 	}
 	return &e, nil
-}
-
-// structuralReadDrops counts structurally invalid rows healed on read from
-// stores written before the write-funnel backstop existed. Every read path
-// dropping such a row means the on-disk store carries pre-gate corruption:
-// the first occurrence logs an engineer-facing signal (the feedback loop for
-// "something impossible reached disk"), and the audit battery reads the
-// counter. New stores must never increment it — the write backstop drops the
-// shape before it lands.
-var (
-	structuralReadDrops     atomic.Int64
-	structuralReadDropsOnce sync.Once
-)
-
-func noteStructuralReadDrop() {
-	structuralReadDrops.Add(1)
-	structuralReadDropsOnce.Do(func() {
-		log.Printf("store_sqlite: store contains structurally invalid edges (pre-backstop corruption); healing on read — rebuild or audit the store (see store_audit.sql A1)")
-	})
-}
-
-// StructuralReadDrops reports how many structurally invalid edge rows read
-// paths have healed since process start.
-func StructuralReadDrops() int64 {
-	return structuralReadDrops.Load()
 }
 
 // scanEdgeLight scans an edge WITHOUT decoding its meta blob -- for hot
@@ -1115,7 +1097,13 @@ func StructuralReadDrops() int64 {
 // kind, and line. Skipping the meta column avoids the JSON decode + map
 // allocation that dominates large edge scans on this backend; the
 // returned edge's Meta is nil.
-func scanEdgeLight(scanner interface {
+func (s *Store) scanEdgeLight(scanner interface {
+	Scan(...any) error
+}) (*graph.Edge, error) {
+	return scanEdgeLightForStore(s, scanner)
+}
+
+func scanEdgeLightForStore(store *Store, scanner interface {
 	Scan(...any) error
 }) (*graph.Edge, error) {
 	var (
@@ -1132,7 +1120,7 @@ func scanEdgeLight(scanner interface {
 	}
 	e.CrossRepo = crossRepo != 0
 	if graph.StructuralEdgeTargetInvalid(e.Kind, e.To) {
-		noteStructuralReadDrop()
+		store.noteStructuralReadDrop(graph.StructuralPathSQLiteLightRead, &e)
 		return nil, nil
 	}
 	return &e, nil
@@ -1194,6 +1182,10 @@ func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) (bool, error) {
 // upgrades through SetEdgeProvenance).
 func (s *Store) AddEdge(e *graph.Edge) {
 	if e == nil || graph.IsProxyID(e.From) || graph.IsProxyID(e.To) {
+		return
+	}
+	if graph.StructuralEdgeTargetInvalid(e.Kind, e.To) {
+		s.recordStructuralEdge(graph.StructuralDropWrite, graph.StructuralPathSQLiteAddEdge, s.structuralWriteRepo(e, nil), e)
 		return
 	}
 	// Route through the set-oriented writer. During a coordinated cold load the
@@ -1969,7 +1961,7 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		e, err := scanEdgeCursor(rows)
+		e, err := s.scanEdgeCursor(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out
@@ -2501,7 +2493,7 @@ func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		e, err := scanEdgeCursor(rows)
+		e, err := s.scanEdgeCursor(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out

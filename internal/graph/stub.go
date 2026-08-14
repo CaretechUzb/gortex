@@ -170,27 +170,24 @@ func StructuralEdgeTargetInvalid(kind EdgeKind, toID string) bool {
 	return strings.Contains(toID, "#param:") || strings.Contains(toID, "#local:")
 }
 
-// FilterStructuralEdgeViolations drops edges StructuralEdgeTargetInvalid
-// rejects, copying the slice only when a violation exists — the clean path
-// (every real batch) allocates nothing. Returns the kept slice and the
-// number dropped, so write funnels can surface a one-line count instead of
-// silently eating mapper bugs.
-func FilterStructuralEdgeViolations(edges []*Edge) ([]*Edge, int) {
-	dropped := 0
-	kept := edges
-	for i, e := range edges {
-		if e != nil && StructuralEdgeTargetInvalid(e.Kind, e.To) {
-			if dropped == 0 {
+// FilterStructuralEdgeViolations is a pure partition. It copies only after a
+// violation appears, returning both kept and rejected edges so the first write
+// boundary can attribute every rejected attempt exactly once.
+func FilterStructuralEdgeViolations(edges []*Edge) (kept, rejected []*Edge) {
+	kept = edges
+	for i, edge := range edges {
+		if edge != nil && StructuralEdgeTargetInvalid(edge.Kind, edge.To) {
+			if len(rejected) == 0 {
 				kept = append(make([]*Edge, 0, len(edges)), edges[:i]...)
 			}
-			dropped++
+			rejected = append(rejected, edge)
 			continue
 		}
-		if dropped > 0 {
-			kept = append(kept, e)
+		if len(rejected) > 0 {
+			kept = append(kept, edge)
 		}
 	}
-	return kept, dropped
+	return kept, rejected
 }
 
 func IsUnresolvedTarget(id string) bool {

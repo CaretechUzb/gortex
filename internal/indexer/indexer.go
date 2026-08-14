@@ -2788,7 +2788,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// and edge through as it is parsed.
 		idx.indexCount.Add(1)
 		diskTarget = idx.graph
-		inMemShadow = graph.New()
+		inMemShadow = idx.newStructuralIntegrityShadow(diskTarget, graph.StructuralPathShadowCold)
 		idx.graph = inMemShadow
 		// Capture the disk store as the vector sink: buildSearchIndex runs
 		// while idx.graph is the shadow (no VectorSearcher), so without this
@@ -3631,7 +3631,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			zap.Int("chunk_size", chunkSize))
 		for chunkStart := 0; chunkStart < len(files); chunkStart += chunkSize {
 			chunkEnd := min(chunkStart+chunkSize, len(files))
-			chunkShadow := graph.New()
+			chunkShadow := idx.newStructuralIntegrityShadow(streamingDisk, graph.StructuralPathShadowStreaming)
 			idx.graph = chunkShadow
 			parseChunk(files[chunkStart:chunkEnd])
 			if err := ctx.Err(); err != nil {

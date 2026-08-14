@@ -1063,10 +1063,11 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 	// of Status.
 
 	resp := daemon.StatusResponse{
-		TrackedRepos:  tracked,
-		MemoryBytes:   mem.Alloc,
-		SearchBackend: searchBackendForResponse,
-		TrigramCache:  trigramCacheForResponse(),
+		TrackedRepos:   tracked,
+		MemoryBytes:    mem.Alloc,
+		SearchBackend:  searchBackendForResponse,
+		TrigramCache:   trigramCacheForResponse(),
+		GraphIntegrity: daemon.GraphIntegrityStatusFor(g),
 		Runtime: daemon.RuntimeStats{
 			Alloc:        mem.Alloc,
 			Sys:          mem.Sys,

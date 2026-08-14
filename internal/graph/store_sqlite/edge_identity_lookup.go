@@ -108,7 +108,7 @@ func (s *Store) findEdgesByIdentities(identities []graph.EdgeIdentity) (map[grap
 		}
 
 		for rows.Next() {
-			edge, scanErr := scanEdgeCursor(rows)
+			edge, scanErr := s.scanEdgeCursor(rows)
 			if scanErr != nil {
 				_ = rows.Close()
 				panicOnFatal(scanErr)

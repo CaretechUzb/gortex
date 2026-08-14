@@ -47,7 +47,7 @@ func (s *Store) queryEdgesLightSQL(q string, args ...any) []*graph.Edge {
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		e, err := scanEdgeLight(rows)
+		e, err := s.scanEdgeLight(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out

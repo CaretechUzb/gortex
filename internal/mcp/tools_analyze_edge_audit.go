@@ -48,9 +48,10 @@ func (s *Server) handleAnalyzeEdgeAudit(ctx context.Context, req mcp.CallToolReq
 
 	edgeTiers := map[string]int{}
 	callTiers := map[string]int{}
-	inCalls := map[string][]string{}  // target → caller IDs
-	implemented := map[string]bool{}  // interface ID → has an implementor
-	var weakCalls []string            // text-matched "from -> to"
+	inCalls := map[string][]string{} // target → caller IDs
+	implemented := map[string]bool{} // interface ID → has an implementor
+	visibleRepos := map[string]struct{}{}
+	var weakCalls []string // text-matched "from -> to"
 
 	// When the request narrows scope (workspace-bound session or repo
 	// allow-set), drop edges/nodes outside it so every count map and
@@ -84,6 +85,9 @@ func (s *Server) handleAnalyzeEdgeAudit(ctx context.Context, req mcp.CallToolReq
 	for _, n := range s.graph.AllNodes() {
 		if scoped && !s.analyzeNodeVisible(ctx, n) {
 			continue
+		}
+		if scoped && n.RepoPrefix != "" {
+			visibleRepos[n.RepoPrefix] = struct{}{}
 		}
 		switch n.Kind {
 		case graph.KindInterface:
@@ -126,6 +130,19 @@ func (s *Server) handleAnalyzeEdgeAudit(ctx context.Context, req mcp.CallToolReq
 		highPct = float64(highConf) * 100 / float64(totalCalls)
 	}
 
+	var scopedRepos []string
+	if scoped {
+		scopedRepos = make([]string, 0, len(visibleRepos))
+		for repo := range visibleRepos {
+			scopedRepos = append(scopedRepos, repo)
+		}
+		sort.Strings(scopedRepos)
+	}
+	integrity, err := s.edgeAuditGraphIntegrity(ctx, sample, scoped, scopedRepos)
+	if err != nil {
+		return nil, err
+	}
+
 	payload := map[string]any{
 		"edge_tiers": edgeTiers,
 		"call_tiers": callTiers,
@@ -137,6 +154,7 @@ func (s *Server) handleAnalyzeEdgeAudit(ctx context.Context, req mcp.CallToolReq
 		"unimplemented_interfaces": auditBucket(unimplemented, sample),
 		"test_only_targets":        auditBucket(testOnly, sample),
 		"weak_call_edges":          auditBucket(weakCalls, sample),
+		"graph_integrity":          integrity,
 	}
 
 	if s.isGCX(ctx, req) {
@@ -147,6 +165,9 @@ func (s *Server) handleAnalyzeEdgeAudit(ctx context.Context, req mcp.CallToolReq
 		fmt.Fprintf(&b, "edges=%d calls=%d high_conf=%.1f%%\n", totalEdges, totalCalls, highPct)
 		fmt.Fprintf(&b, "unimplemented_interfaces=%d test_only_targets=%d weak_call_edges=%d\n",
 			len(unimplemented), len(testOnly), len(weakCalls))
+		fmt.Fprintf(&b, "graph_integrity since_open_status=%s writes=%d reads=%d persisted_status=%s persisted_rows=%d\n",
+			integrity.SinceOpen.Status, integrity.SinceOpen.Totals.WriteRejected,
+			integrity.SinceOpen.Totals.ReadSuppressed, integrity.Persisted.Status, integrity.Persisted.TotalRows)
 		return mcp.NewToolResultText(b.String()), nil
 	}
 	return s.respondJSONOrTOON(ctx, req, payload)

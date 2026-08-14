@@ -221,7 +221,7 @@ func (s *Store) queryDataflowLightActive(query string, args ...any) []*graph.Edg
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		edge, err := scanEdgeLight(rows)
+		edge, err := s.scanEdgeLight(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out

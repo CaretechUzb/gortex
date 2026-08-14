@@ -295,6 +295,10 @@ type StatusResponse struct {
 	// the daemon — while SearchBackend above may simultaneously report
 	// the symbol index as disk-resident. Nil when no indexer is wired.
 	TrigramCache *TrigramCacheStats `json:"trigram_cache,omitempty"`
+	// GraphIntegrity is present only after the store has contained at least
+	// one structural edge violation. It is warning telemetry and does not
+	// change Ready because the invalid edge was rejected or suppressed.
+	GraphIntegrity *GraphIntegrityStatus `json:"graph_integrity,omitempty"`
 	// CountsUnknown marks a response assembled without the aggregate pass —
 	// the per-repo and whole-store counters are zero because they were never
 	// computed, not because the graph is empty. Set when a caller fell back

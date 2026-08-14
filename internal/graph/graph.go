@@ -555,6 +555,15 @@ type Graph struct {
 	// absent from disk stores until they can provide the same completeness
 	// guarantee.
 	mutationReceipts mutationReceiptState
+
+	// structuralIntegrity is the store-scoped since-open recorder. Shadows may
+	// forward through structuralIntegritySink so rejected attempts survive the
+	// throwaway graph; the explicit repo and fixed path prevent attribution
+	// from guessing ownership from unprefixed node IDs.
+	structuralIntegrity     StructuralIntegrityMeter
+	structuralIntegritySink StructuralIntegrityEventRecorder
+	structuralIntegrityRepo string
+	structuralIntegrityPath StructuralDropPath
 }
 
 // cloneShingleEntry is one in-memory clone_shingles row: the owning
@@ -2583,8 +2592,10 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 	if len(nodes) == 0 && len(edges) == 0 {
 		return
 	}
-	// Structural-shape backstop: see StructuralEdgeTargetInvalid.
-	edges, _ = FilterStructuralEdgeViolations(edges)
+	// Structural-shape backstop: the first rejecting boundary owns the event.
+	var rejected []*Edge
+	edges, rejected = FilterStructuralEdgeViolations(edges)
+	g.recordStructuralRejections(StructuralPathGraphAddBatch, rejected, nodes)
 	// Lazy builtin-sentinel materialization: see BuiltinStubNodes. The
 	// per-store seen-set keeps it one upsert per stub per store lifetime.
 	if stubs := BuiltinStubNodes(edges); len(stubs) > 0 {
@@ -2712,8 +2723,12 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 // adjacency-list length is unchanged. Drops the double-edge problem
 // that used to surface after daemon restarts (bug B1).
 func (g *Graph) AddEdge(e *Edge) {
-	// Structural-shape backstop: see StructuralEdgeTargetInvalid.
-	if e != nil && StructuralEdgeTargetInvalid(e.Kind, e.To) {
+	if e == nil {
+		return
+	}
+	// Structural-shape backstop: the first rejecting boundary owns the event.
+	if StructuralEdgeTargetInvalid(e.Kind, e.To) {
+		g.recordStructuralRejections(StructuralPathGraphAddEdge, []*Edge{e}, nil)
 		return
 	}
 	receiptActive := g.beginReceiptMutation()

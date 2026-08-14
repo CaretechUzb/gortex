@@ -190,7 +190,7 @@ func (s *Store) streamScopedEdges(query string, args []any, maxID int64, yield f
 		page := make([]*graph.Edge, 0, scopedProjectionPage)
 		for rows.Next() {
 			var edgeID int64
-			edge, scanErr := scanEdgeCursor(edgeIDScanner{scanner: rows, id: &edgeID})
+			edge, scanErr := s.scanEdgeCursor(edgeIDScanner{scanner: rows, id: &edgeID})
 			if scanErr != nil {
 				_ = rows.Close()
 				panicOnFatal(scanErr)
