@@ -23,6 +23,189 @@ type renameEdit struct {
 	Reason     string `json:"reason"`
 }
 
+// unindexedRenameRecovery distinguishes an invalid symbol ID from an existing
+// file that semantic rename cannot see. When the configured language extractor
+// identifies exactly one requested declaration, it returns a guarded exact-line
+// edit for that declaration only. References remain outside the recovery scope.
+func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string, dryRun bool) map[string]any {
+	filePart, requestedSymbol, ok := strings.Cut(id, "::")
+	if !ok || strings.TrimSpace(filePart) == "" || strings.TrimSpace(requestedSymbol) == "" {
+		return nil
+	}
+
+	absPath, relPath, err := s.resolveFilePath(filePart)
+	if err != nil {
+		return nil
+	}
+	info, err := os.Lstat(absPath)
+	if err != nil || !info.Mode().IsRegular() {
+		// Refuse symlink leaves: an atomic edit of the link path would replace
+		// the link object while leaving its target unchanged.
+		return nil
+	}
+
+	file := s.graphPathSpelling(relPath)
+	if indexed := s.engineFor(ctx).GetFileSymbols(file); indexed != nil && indexed.TotalNodes > 0 {
+		return nil
+	}
+
+	content, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil
+	}
+	extracted, err := s.indexer.ExtractSource(ctx, relPath, content)
+	if err != nil || extracted == nil {
+		return nil
+	}
+	defer extracted.ReleaseTree()
+
+	var declarationName string
+	var declarationLine int
+	for _, node := range extracted.Nodes {
+		_, suffix, hasSuffix := strings.Cut(node.ID, "::")
+		if !hasSuffix || suffix != requestedSymbol {
+			continue
+		}
+		if declarationName != "" {
+			return nil
+		}
+		declarationName = node.Name
+		declarationLine = node.StartLine
+	}
+	if declarationName == "" || declarationLine <= 0 {
+		return nil
+	}
+
+	oldLine, newLine, ok := s.verifiedDeclarationRename(
+		ctx, relPath, content, declarationLine, requestedSymbol, declarationName, newName,
+	)
+	if !ok {
+		return nil
+	}
+
+	return map[string]any{
+		"status":                   "refused",
+		"symbol_id":                id,
+		"requested_symbol":         requestedSymbol,
+		"declaration_name":         declarationName,
+		"new_name":                 newName,
+		"file":                     file,
+		"occurrences":              1,
+		"semantic_rename_complete": false,
+		"written":                  false,
+		"dry_run":                  dryRun,
+		"safe_fallback": map[string]any{
+			"tool": "edit",
+			"request": map[string]any{
+				"operation":   "file",
+				"target":      map[string]any{"file": file},
+				"match":       oldLine,
+				"replacement": newLine,
+				"guard": map[string]any{
+					"expected_occurrences": 1,
+					"base_sha":             gitBlobSHA(content),
+				},
+			},
+			"scope": "declaration_only",
+			"guidance": []string{
+				"Apply this exact contextual edit only after reviewing the declaration line.",
+				"Update same-file and cross-file references separately; completeness is not proven.",
+			},
+		},
+		"warning": "Only the parsed declaration is anchored. Same-file and cross-file references are not proven because this symbol is unavailable to the semantic graph. No text was changed.",
+	}
+}
+
+const (
+	maxUnindexedRenameLineBytes  = 16 << 10
+	maxUnindexedRenameCandidates = 8
+)
+
+// verifiedDeclarationRename tries each whole-identifier occurrence on the
+// declaration line and reparses the resulting file. It accepts exactly one
+// candidate: the edit must remove the requested symbol ID and create the
+// expected renamed ID on the same declaration line. This avoids relying on
+// optional extractor columns, which may point at the start of the declaration
+// rather than at its name.
+func (s *Server) verifiedDeclarationRename(
+	ctx context.Context,
+	relPath string,
+	content []byte,
+	declarationLine int,
+	requestedSymbol, declarationName, newName string,
+) (string, string, bool) {
+	if ctx.Err() != nil {
+		return "", "", false
+	}
+	lines := splitLinesKeepEnds(string(content))
+	if declarationLine > len(lines) {
+		return "", "", false
+	}
+	oldLine := lines[declarationLine-1]
+	body, term := splitLineTerminator(oldLine)
+	if len(body) > maxUnindexedRenameLineBytes {
+		return "", "", false
+	}
+
+	if !strings.HasSuffix(requestedSymbol, declarationName) {
+		return "", "", false
+	}
+	expectedSymbol := strings.TrimSuffix(requestedSymbol, declarationName) + newName
+
+	offsets := make([]int, 0, maxUnindexedRenameCandidates)
+	for from := 0; ; {
+		nameOffset := indexIdentifier(body, declarationName, from)
+		if nameOffset < 0 {
+			break
+		}
+		if len(offsets) == maxUnindexedRenameCandidates {
+			return "", "", false
+		}
+		offsets = append(offsets, nameOffset)
+		from = nameOffset + 1
+	}
+
+	var accepted string
+	for _, nameOffset := range offsets {
+		if ctx.Err() != nil {
+			return "", "", false
+		}
+		candidateLine := body[:nameOffset] + newName + body[nameOffset+len(declarationName):] + term
+		candidateLines := append([]string(nil), lines...)
+		candidateLines[declarationLine-1] = candidateLine
+		candidateContent := []byte(strings.Join(candidateLines, ""))
+
+		candidate, err := s.indexer.ExtractSource(ctx, relPath, candidateContent)
+		if err == nil && candidate != nil {
+			originalPresent := false
+			expectedAtDeclaration := 0
+			for _, node := range candidate.Nodes {
+				_, suffix, hasSuffix := strings.Cut(node.ID, "::")
+				if !hasSuffix {
+					continue
+				}
+				if suffix == requestedSymbol {
+					originalPresent = true
+				}
+				if suffix == expectedSymbol && node.StartLine == declarationLine {
+					expectedAtDeclaration++
+				}
+			}
+			candidate.ReleaseTree()
+			if !originalPresent && expectedAtDeclaration == 1 {
+				if accepted != "" {
+					return "", "", false
+				}
+				accepted = candidateLine
+			}
+		}
+	}
+	if accepted == "" {
+		return "", "", false
+	}
+	return oldLine, accepted, true
+}
+
 // indexIdentifier returns the byte offset of the first whole-identifier
 // occurrence of name at or after from, or -1 when there is none. A candidate
 // is whole only when neither neighbouring rune is an identifier rune, so
