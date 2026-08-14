@@ -60,7 +60,7 @@ func returnUsageServer(t *testing.T) (*Server, string) {
 	})
 
 	eng := query.NewEngine(g)
-	eng.SetSearch(search.NewBM25())
+	eng.SetSearch(search.NewNull())
 	return NewServer(eng, g, nil, nil, zap.NewNop(), nil), fetch.ID
 }
 
@@ -233,7 +233,7 @@ func relay() int {
 	}
 
 	eng := query.NewEngine(g)
-	eng.SetSearch(search.NewBM25())
+	eng.SetSearch(search.NewNull())
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 
 	edges := findUsagesEdges(t, srv, map[string]any{"id": "main.go::helper"})

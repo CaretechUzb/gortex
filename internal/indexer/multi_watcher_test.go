@@ -50,7 +50,7 @@ func HelloB() {}
 		{Path: repoBDir, Name: "repo-b"},
 	}
 
-	mi := NewMultiIndexer(g, reg, search.NewAuto(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err := mi.IndexAll()
 	require.NoError(t, err)
 
@@ -111,7 +111,7 @@ func Hello() {}
 		{Path: repoDir, Name: "valid"},
 	}
 
-	mi := NewMultiIndexer(g, reg, search.NewAuto(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err := mi.IndexAll()
 	require.NoError(t, err)
 

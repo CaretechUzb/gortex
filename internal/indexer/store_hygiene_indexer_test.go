@@ -37,7 +37,7 @@ func newSqliteMultiIndexer(t *testing.T, repos []config.RepoEntry) (*MultiIndexe
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 
-	mi := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	return mi, s
 }
 

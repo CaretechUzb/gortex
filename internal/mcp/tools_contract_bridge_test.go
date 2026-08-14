@@ -126,7 +126,7 @@ func fetchUsers() {
 	preg := testRegistry()
 
 	g := graph.New()
-	mi := indexer.NewMultiIndexer(g, preg, search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, preg, search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 

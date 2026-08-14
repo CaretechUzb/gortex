@@ -111,7 +111,7 @@ func TestReconcileContractEdges_BridgesConsumerToProvider(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
@@ -205,7 +205,7 @@ func TestReconcileContractEdges_TemplateLiteralConsumer(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err, "track %s", entry.Name)
@@ -287,7 +287,7 @@ func TestReconcileContractEdges_DartConsumer(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err, "track %s", entry.Name)
@@ -447,7 +447,7 @@ func TestInlineWrappers_TuckShape(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err, "track %s", entry.Name)
@@ -553,7 +553,7 @@ func TestReconcileContractEdges_TopicBridge(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err)
@@ -607,7 +607,7 @@ func TestEnvConsumer_SymbolIDSet(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err)
@@ -724,7 +724,7 @@ func TestReconcileContractEdges_GRPCBridge(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err)
@@ -840,7 +840,7 @@ func TestReconcileContractEdges_OpenAPIBridge(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newMultiLangRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err)
@@ -911,7 +911,7 @@ func TestReconcileContractEdges_PurgesStaleOnUntrack(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err)

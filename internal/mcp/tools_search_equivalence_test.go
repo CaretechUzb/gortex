@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -12,26 +13,39 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
-	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
 // equivalenceTestServer builds a single-repo server with no LLM
 // provider, so any expansion observed comes purely from the
 // deterministic equivalence channel.
+//
+// Retrieval ordering: a symbol answers to its own lowercased name and
+// to each of that name's camelCase/snake_case parts ("LoginService" ->
+// loginservice, login, service), in declaration order, and to nothing
+// else. The vocabulary the query itself uses ("auth", "delete",
+// "blast") is deliberately absent, so a bridged symbol is reachable
+// only if the rewrite actually emitted one of its tokens — the rewrite
+// stays the thing under test rather than a ranker's tolerance.
 func equivalenceTestServer(t *testing.T, names []string, equivEnabled *bool) *Server {
 	t.Helper()
 	g := graph.New()
-	bm := search.NewBM25()
+	ob := newOrderedBackend()
 	for i, n := range names {
 		id := "pkg/" + n + ".go::" + n
 		g.AddNode(&graph.Node{
 			ID: id, Kind: graph.KindFunction, Name: n,
 			FilePath: "pkg/" + n + ".go", StartLine: i + 1, EndLine: i + 5, Language: "go",
 		})
-		bm.Add(id, n, "pkg/"+n+".go", "")
+		ob.put(n, id)
+		for _, tok := range rerank.Tokenize(n) {
+			if tok != strings.ToLower(n) {
+				ob.put(tok, id)
+			}
+		}
 	}
 	eng := query.NewEngine(g)
-	eng.SetSearch(bm)
+	eng.SetSearch(ob)
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 	srv.SetSearchConfig(config.SearchConfig{EquivalenceClasses: equivEnabled})
 	srv.RunAnalysis() // builds the auto-concept vocabulary
@@ -73,7 +87,7 @@ func TestSearchSymbols_EquivalenceBridgesVocabulary(t *testing.T) {
 }
 
 // TestSearchSymbols_EquivalenceDeleteRemove confirms the delete/remove
-// bridge works in both directions through the BM25 OR-merge.
+// bridge works in both directions through the expansion OR-merge.
 func TestSearchSymbols_EquivalenceDeleteRemove(t *testing.T) {
 	srv := equivalenceTestServer(t, []string{
 		"RemoveUser", "DropTable", "FetchProfile",

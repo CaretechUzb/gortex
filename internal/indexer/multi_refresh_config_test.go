@@ -35,7 +35,7 @@ func Dropped() {}
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 	require.NotEmpty(t, g.FindNodesByName("Dropped"), "precondition: drop.go is indexed")
@@ -58,6 +58,6 @@ func Dropped() {}
 }
 
 func TestMultiIndexer_RefreshRepoConfigs_NoConfigManager(t *testing.T) {
-	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewBM25(), nil, zap.NewNop())
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewNull(), nil, zap.NewNop())
 	assert.Equal(t, 0, mi.RefreshRepoConfigs())
 }

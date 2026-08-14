@@ -201,7 +201,7 @@ type MultiIndexer struct {
 // SetEmbedder installs the embedding provider every per-repo indexer
 // should use. Must be called before IndexAll / TrackRepo for vectors
 // to land in the graph — without this the fresh Indexer created per
-// repo has embedder=nil and buildSearchIndex skips the vector pass.
+// repo has embedder=nil and vector-plan preparation skips the embedding pass.
 // Safe to call zero or one times; subsequent calls silently replace.
 func (mi *MultiIndexer) SetEmbedder(e embedding.Provider) {
 	mi.mu.Lock()

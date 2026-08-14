@@ -27,7 +27,7 @@ type Swappable struct {
 }
 
 // NewSwappable wraps b. Panics if b is nil — every Indexer must start
-// with a real backend, even if it's the in-memory NewAuto() default.
+// with a real backend, even if it's the NewNull() no-op default.
 func NewSwappable(b Backend) *Swappable {
 	if b == nil {
 		panic("search.NewSwappable: nil backend")
@@ -105,16 +105,6 @@ func (s *Swappable) AcquireBackend() (backend Backend, release func()) {
 	return s.inner, func() {
 		once.Do(s.mu.RUnlock)
 	}
-}
-
-// Inner returns an unpinned snapshot of the currently-active backend. It is
-// retained for tests and diagnostics only: production callers must not keep or
-// dereference the result because replacement may retire it immediately after
-// this method returns. Use AcquireBackend or a forwarded capability instead.
-func (s *Swappable) Inner() Backend {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.inner
 }
 
 // Embedder returns the active hybrid's externally-owned embedding provider.
@@ -230,7 +220,7 @@ func (s *Swappable) SearchSymbolBundlesScoped(query string, repoAllow []string, 
 
 // VectorChannelOnly forwards to the inner backend when it implements
 // the vector-only channel pull (today: HybridBackend). Lets the
-// engine fetch the vector channel without re-running text BM25 —
+// engine fetch the vector channel without re-running the text search —
 // the bundle path already has the text hits. Returns (nil, zero
 // timings) when the inner backend isn't vector-aware.
 func (s *Swappable) VectorChannelOnly(query string, limit int) ([]string, ChannelTimings) {

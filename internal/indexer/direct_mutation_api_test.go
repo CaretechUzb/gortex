@@ -94,7 +94,7 @@ func TestDirectMutationAPIsUseStableLaneAndCurrentIndexer(t *testing.T) {
 	reg.Register(languages.NewGoExtractor())
 	cfg := config.Default()
 	cfg.Index.Workers = 1
-	mi := NewMultiIndexer(g, reg, search.NewAuto(), nil, zap.NewNop())
+	mi := NewMultiIndexer(g, reg, search.NewNull(), nil, zap.NewNop())
 	current := mi.newPerRepoIndexer(cfg.Index)
 	current.SetRepoPrefix("repo")
 	// Fixture construction mirrors TrackRepo/IndexRepo: the per-repository

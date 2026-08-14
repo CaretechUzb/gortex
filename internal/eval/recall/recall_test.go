@@ -5,8 +5,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-
-	"github.com/zzet/gortex/internal/search"
 )
 
 // staticRanker returns a predetermined ranked list regardless of query.
@@ -133,26 +131,6 @@ func TestMarkdownSkippedRankerRow(t *testing.T) {
 	report.Rankers[0].Skipped = "no embedder"
 	md := Markdown(report)
 	assert.Contains(t, md, "skipped: no embedder")
-}
-
-// TestBM25Ranker_AgainstRealBackend wires the adapter to a live BM25
-// backend and spot-checks ranked output.
-func TestBM25Ranker_AgainstRealBackend(t *testing.T) {
-	backend := search.NewBM25()
-	backend.Add("pkg/a.go::Foo", "Foo", "pkg/a.go", "")
-	backend.Add("pkg/b.go::Bar", "Bar", "pkg/b.go", "")
-
-	r := BM25Ranker("bm25", backend)
-	hits := r.Search("Foo", 5)
-	assert.NotEmpty(t, hits)
-	assert.Equal(t, "pkg/a.go::Foo", hits[0])
-
-	fixture := Fixture{Cases: []Case{
-		{Query: "Bar", Tier: TierExact, Expected: []string{"pkg/b.go::Bar"}},
-		{Query: "Foo", Tier: TierExact, Expected: []string{"pkg/a.go::Foo"}},
-	}}
-	report := Run(fixture, []Ranker{r}, nil)
-	assert.Equal(t, 2, report.Rankers[0].Hits[1])
 }
 
 func TestAdaptCasesForFileRanker(t *testing.T) {

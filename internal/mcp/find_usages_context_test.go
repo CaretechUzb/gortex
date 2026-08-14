@@ -31,7 +31,7 @@ func usagesContextServer(t *testing.T) (*Server, string) {
 	g.AddEdge(&graph.Edge{From: field.ID, To: foo.ID, Kind: graph.EdgeTypedAs, FilePath: "pkg/b.go", Line: 3})
 
 	eng := query.NewEngine(g)
-	eng.SetSearch(search.NewBM25())
+	eng.SetSearch(search.NewNull())
 	return NewServer(eng, g, nil, nil, zap.NewNop(), nil), foo.ID
 }
 

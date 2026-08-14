@@ -42,8 +42,8 @@ func (stubEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float32, 
 func (stubEmbedder) Dimensions() int { return 4 }
 func (stubEmbedder) Close() error    { return nil }
 
-// indexedVectorBackend indexes dir with the given chunk options and
-// returns the vector backend buildSearchIndex produced.
+// indexedVectorBackend indexes dir with the given chunk options and returns
+// the published vector backend, pinned for the remainder of the test.
 func indexedVectorBackend(t *testing.T, dir string, opts embedding.ChunkOptions) *search.VectorBackend {
 	t.Helper()
 	g := graph.New()
@@ -62,16 +62,17 @@ func indexedVectorBackend(t *testing.T, dir string, opts embedding.ChunkOptions)
 
 	sw, ok := idx.Search().(*search.Swappable)
 	require.True(t, ok)
-	hyb, ok := sw.Inner().(*search.HybridBackend)
+	backend, release := sw.AcquireBackend()
+	t.Cleanup(release)
+	hyb, ok := backend.(*search.HybridBackend)
 	require.True(t, ok, "an embedder-equipped index must produce a HybridBackend")
 	return hyb.VectorIndex()
 }
 
-// TestBuildSearchIndex_LongSymbolYieldsMultipleChunks proves the
-// pipeline change: a function whose source span exceeds the chunk
-// threshold is split into several chunk vectors, and the chunk →
-// parent mapping is recorded on the vector backend.
-func TestBuildSearchIndex_LongSymbolYieldsMultipleChunks(t *testing.T) {
+// TestVectorPublication_LongSymbolYieldsMultipleChunks proves that a function
+// whose source span exceeds the chunk threshold is split into several chunk
+// vectors and the chunk → parent mapping is recorded on the vector backend.
+func TestVectorPublication_LongSymbolYieldsMultipleChunks(t *testing.T) {
 	dir := t.TempDir()
 	var b strings.Builder
 	b.WriteString("package main\n\nfunc BigFunc() {\n")
@@ -100,8 +101,8 @@ func TestBuildSearchIndex_LongSymbolYieldsMultipleChunks(t *testing.T) {
 		"BigFunc must be split into at least two chunk vectors")
 }
 
-// bigFuncChunkID builds the synthetic chunk ID buildSearchIndex stamps
-// on BigFunc's i-th window.
+// bigFuncChunkID builds the synthetic chunk ID vector preparation stamps on
+// BigFunc's i-th window.
 func bigFuncChunkID(i int) string {
 	return "big.go::BigFunc#chunk" + itoa(i)
 }
@@ -118,10 +119,10 @@ func itoa(i int) string {
 	return string(digits)
 }
 
-// TestBuildSearchIndex_ShortSymbolStaysWhole proves the inverse: a file
-// of only small functions produces no chunk vectors — every symbol is
-// embedded under its own ID.
-func TestBuildSearchIndex_ShortSymbolStaysWhole(t *testing.T) {
+// TestVectorPublication_ShortSymbolStaysWhole proves the inverse: a file of
+// only small functions produces no chunk vectors — every symbol is embedded
+// under its own ID.
+func TestVectorPublication_ShortSymbolStaysWhole(t *testing.T) {
 	dir := t.TempDir()
 	src := `package main
 
@@ -141,10 +142,10 @@ func AlsoTiny() {
 	assert.Greater(t, vec.Count(), 0, "the symbols must still be embedded")
 }
 
-// TestBuildSearchIndex_ChunkedSymbolNotDuplicatedInSearch proves the
-// end-to-end de-chunk contract through a real index: searching for a
-// long symbol returns it once, and no synthetic chunk ID surfaces.
-func TestBuildSearchIndex_ChunkedSymbolNotDuplicatedInSearch(t *testing.T) {
+// TestVectorPublication_ChunkedSymbolNotDuplicatedInSearch proves the end-to-end
+// de-chunk contract through a real index: searching for a long symbol returns
+// it once, and no synthetic chunk ID surfaces.
+func TestVectorPublication_ChunkedSymbolNotDuplicatedInSearch(t *testing.T) {
 	dir := t.TempDir()
 	var b strings.Builder
 	b.WriteString("package main\n\nfunc ValidateRequestPayload() {\n")
@@ -154,16 +155,31 @@ func TestBuildSearchIndex_ChunkedSymbolNotDuplicatedInSearch(t *testing.T) {
 	b.WriteString("}\n\nfunc checkField() {}\n")
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "v.go"), []byte(b.String()), 0o644))
 
-	g := graph.New()
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewGoExtractor())
 	cfg := config.Default().Index
 	cfg.Workers = 1
-	idx := New(g, reg, cfg, zap.NewNop())
-	idx.SetEmbedder(stubEmbedder{})
-	idx.SetEmbeddingChunkOptions(embedding.ChunkOptions{ThresholdLines: 20, WindowLines: 15})
-	_, err := idx.Index(dir)
+	idx, store := newFTSIndexer(t, dir, reg, cfg, func(idx *Indexer) {
+		idx.SetEmbedder(stubEmbedder{})
+		idx.SetEmbeddingChunkOptions(embedding.ChunkOptions{ThresholdLines: 20, WindowLines: 15})
+	})
+
+	const symbolID = "v.go::ValidateRequestPayload"
+
+	// Probe the text half of the hybrid on its own first. The fused result
+	// below cannot carry this claim: the stub embedder maps every text to the
+	// same direction, so the vector channel returns the whole corpus for any
+	// query and would answer "is the symbol retrievable" no matter what the
+	// text side did. The query is multi-word on purpose — an identifier-shaped
+	// query is short-circuited on an exact FindNodesByName hit (store_fts.go
+	// tier 0) and never reaches the ranked FTS tier.
+	ftsHits, err := store.SearchSymbols("validate request payload", 20)
 	require.NoError(t, err)
+	ftsIDs := make([]string, 0, len(ftsHits))
+	for _, h := range ftsHits {
+		ftsIDs = append(ftsIDs, h.NodeID)
+	}
+	require.Contains(t, ftsIDs, symbolID, "the chunked symbol must be in the symbol FTS corpus")
 
 	results := idx.Search().Search("ValidateRequestPayload", 20)
 	require.NotEmpty(t, results)
@@ -174,6 +190,6 @@ func TestBuildSearchIndex_ChunkedSymbolNotDuplicatedInSearch(t *testing.T) {
 			"a chunk ID must never appear in search output")
 		seen[r.ID]++
 	}
-	assert.LessOrEqual(t, seen["v.go::ValidateRequestPayload"], 1,
-		"the chunked symbol must not be returned more than once")
+	assert.Equal(t, 1, seen[symbolID],
+		"the chunked symbol must be returned exactly once")
 }

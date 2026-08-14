@@ -47,7 +47,7 @@ func prefixedServerOver(t *testing.T, dir, name string) (*Server, string) {
 	reg.Register(languages.NewGoExtractor())
 
 	g := graph.New()
-	mi := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 

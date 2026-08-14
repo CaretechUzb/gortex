@@ -202,7 +202,7 @@ func TestIndexer_IndexFileNoResolve_SkipsResolver(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 
 	// IndexFileNoResolve populates the graph but defers cross-file

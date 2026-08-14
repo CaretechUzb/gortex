@@ -9,27 +9,29 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
-	"github.com/zzet/gortex/internal/search"
 )
 
-// floodTestServer builds a server whose BM25 head for the token
-// "extensions" is fully occupied by doc-section nodes: one real code
-// symbol (WidgetExtensions) plus docCount KindDoc nodes that all
-// outrank it (single-token name, tripled term frequency). With the
-// default corpus=code filter, every fetched candidate is dropped —
-// the shape a suffix-convention query takes on a repo whose doc/junk
-// files share the naming tokens.
+// floodTestServer builds a server whose candidate ordering for the
+// token "extensions" is docCount KindDoc sections and nothing else:
+// the junk sections own the token outright, so with the default
+// corpus=code filter every candidate a bounded fetch reaches is
+// dropped — the shape a suffix-convention query takes on a repo whose
+// doc/junk files share the naming tokens. The one real code symbol
+// (WidgetExtensions) is NOT in that ordering; it carries the token
+// only as part of its full name, so it is reachable solely through
+// the engine's substring fill, whose budget is the fetch depth. That
+// is what makes the escalation depth observable — a fetch deep enough
+// to leave slack past the doc flood is the only one that rescues it.
 func floodTestServer(t *testing.T, docCount int) *Server {
 	t.Helper()
 	g := graph.New()
-	bm := search.NewBM25()
+	ob := newOrderedBackend()
 
 	id := "pkg/WidgetExtensions.go::WidgetExtensions"
 	g.AddNode(&graph.Node{
 		ID: id, Kind: graph.KindType, Name: "WidgetExtensions",
 		FilePath: "pkg/WidgetExtensions.go", StartLine: 1, EndLine: 5, Language: "go",
 	})
-	bm.Add(id, "WidgetExtensions", "pkg/WidgetExtensions.go", "")
 
 	for i := 0; i < docCount; i++ {
 		docID := fmt.Sprintf("junk/list%d.txt::sec%d", i, i)
@@ -37,11 +39,14 @@ func floodTestServer(t *testing.T, docCount int) *Server {
 			ID: docID, Kind: graph.KindDoc, Name: "Extensions",
 			FilePath: fmt.Sprintf("junk/list%d.txt", i), StartLine: 1, EndLine: 3, Language: "text",
 		})
-		bm.Add(docID, "Extensions Extensions Extensions")
+		ob.put("extensions", docID)
 	}
+	// The spelled-out name is its own token and answers with the code
+	// symbol alone — a query for it is never flooded.
+	ob.put("widgetextensions", id)
 
 	eng := query.NewEngine(g)
-	eng.SetSearch(bm)
+	eng.SetSearch(ob)
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 	srv.RunAnalysis()
 	return srv
@@ -50,11 +55,15 @@ func floodTestServer(t *testing.T, docCount int) *Server {
 // floodTestServerN is floodTestServer with codeCount rescuable code
 // symbols behind the doc flood — the multi-page rescue shape from the
 // PR review: a partially-successful shallow rescue must not strand a
-// later cursor page a deeper fetch would fill.
+// later cursor page a deeper fetch would fill. Same ordering premise as
+// floodTestServer — the doc sections are the whole "extensions"
+// ordering and the code symbols ride the substring fill — so the depth
+// a fetch reaches decides how many of them survive the corpus filter:
+// docCount+5 of budget rescues 5, a deeper fetch rescues all.
 func floodTestServerN(t *testing.T, docCount, codeCount int) *Server {
 	t.Helper()
 	g := graph.New()
-	bm := search.NewBM25()
+	ob := newOrderedBackend()
 
 	for i := 0; i < codeCount; i++ {
 		id := fmt.Sprintf("pkg/w%d.go::WidgetExtensions%d", i, i)
@@ -62,7 +71,6 @@ func floodTestServerN(t *testing.T, docCount, codeCount int) *Server {
 			ID: id, Kind: graph.KindType, Name: fmt.Sprintf("WidgetExtensions%d", i),
 			FilePath: fmt.Sprintf("pkg/w%d.go", i), StartLine: 1, EndLine: 5, Language: "go",
 		})
-		bm.Add(id, fmt.Sprintf("WidgetExtensions%d", i), fmt.Sprintf("pkg/w%d.go", i), "")
 	}
 	for i := 0; i < docCount; i++ {
 		docID := fmt.Sprintf("junk/list%d.txt::sec%d", i, i)
@@ -70,11 +78,11 @@ func floodTestServerN(t *testing.T, docCount, codeCount int) *Server {
 			ID: docID, Kind: graph.KindDoc, Name: "Extensions",
 			FilePath: fmt.Sprintf("junk/list%d.txt", i), StartLine: 1, EndLine: 3, Language: "text",
 		})
-		bm.Add(docID, "Extensions Extensions Extensions")
+		ob.put("extensions", docID)
 	}
 
 	eng := query.NewEngine(g)
-	eng.SetSearch(bm)
+	eng.SetSearch(ob)
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 	srv.RunAnalysis()
 	return srv
@@ -101,21 +109,22 @@ func TestSearchSymbols_EscalationReachesCursorWindow(t *testing.T) {
 // TestSearchSymbols_EscalationSkipsDuplicateDepth: once the depth cap
 // clamps a multiplier, the next multiplier collapses to the same
 // effective depth — an identical re-query cannot change the outcome and
-// must be skipped, not paid a second time.
+// must be skipped, not paid a second time. The ordering is all-doc, so
+// no depth can ever rescue a code symbol and the escalation loop runs
+// to its own stopping rule.
 func TestSearchSymbols_EscalationSkipsDuplicateDepth(t *testing.T) {
 	g := graph.New()
-	bm := search.NewBM25()
+	ob := newOrderedBackend()
 	for i := 0; i < 2100; i++ {
 		docID := fmt.Sprintf("junk/list%d.txt::sec%d", i, i)
 		g.AddNode(&graph.Node{
 			ID: docID, Kind: graph.KindDoc, Name: "Extensions",
 			FilePath: fmt.Sprintf("junk/list%d.txt", i), StartLine: 1, EndLine: 3, Language: "text",
 		})
-		bm.Add(docID, "Extensions Extensions Extensions")
+		ob.put("extensions", docID)
 	}
-	counter := &countingBackend{BM25Backend: bm}
 	eng := query.NewEngine(g)
-	eng.SetSearch(counter)
+	eng.SetSearch(ob)
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 	srv.RunAnalysis()
 
@@ -123,27 +132,16 @@ func TestSearchSymbols_EscalationSkipsDuplicateDepth(t *testing.T) {
 		"query": "Extensions", "limit": 100, "cursor": encodeCursor(400),
 	})
 	require.Empty(t, respIDs(resp), "an all-doc corpus yields no code page")
-	require.NotEmpty(t, counter.limits, "counting backend must intercept Search calls")
+	limits := ob.searchLimits()
+	require.NotEmpty(t, limits, "the ordered backend must have intercepted the Search calls")
 	deep := 0
-	for _, l := range counter.limits {
+	for _, l := range limits {
 		if l >= 2000 {
 			deep++
 		}
 	}
 	require.LessOrEqualf(t, deep, 1,
-		"capped escalation depths must not repeat an identical query; deep-call limits: %v", counter.limits)
-}
-
-// countingBackend wraps the BM25 backend and records every Search
-// limit, so a test can prove an identical capped depth is not re-paid.
-type countingBackend struct {
-	*search.BM25Backend
-	limits []int
-}
-
-func (c *countingBackend) Search(q string, limit int) []search.SearchResult {
-	c.limits = append(c.limits, limit)
-	return c.BM25Backend.Search(q, limit)
+		"capped escalation depths must not repeat an identical query; call limits: %v", limits)
 }
 
 // TestSearchSymbols_EscalatesWhenPostFilterEmptiesFetch is the core

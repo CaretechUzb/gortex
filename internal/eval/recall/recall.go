@@ -7,18 +7,18 @@
 // Recall is reported as any-hit set-level recall: a retrieval counts as
 // correct at rank K if *any* of the Expected IDs for a case appears in
 // the ranker's top-K results. Multiple Expected IDs per case are OK —
-// they represent valid alternative targets (e.g. a type and its
-// constructor both being reasonable answers to "BM25 backend").
+// they represent valid alternative targets (e.g. a backend type and its
+// constructor both being reasonable answers to "store-native text search").
 //
 // Cases are tiered so per-tier weakness is visible:
 //
 //   - exact:     symbol-name queries. Tests the basic "can you find a
-//     named symbol I already know about" case. BM25 should
-//     dominate here; a retrieval tool that can't ace exact
-//     tier is broken.
+//     named symbol I already know about" case. Store-native lexical
+//     retrieval should dominate here; a retrieval tool that can't ace
+//     exact tier is broken.
 //   - concept:   natural-language paraphrase queries. Tests semantic
-//     understanding. This is where BM25 starts losing to
-//     semantic / RRF.
+//     understanding. This is where lexical retrieval starts losing to
+//     vector search and adaptive fusion.
 //   - multi_hop: relational queries accepting several valid expected
 //     IDs (any-hit). Tests graph-aware retrieval.
 //

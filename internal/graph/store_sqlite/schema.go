@@ -768,6 +768,15 @@ CREATE INDEX IF NOT EXISTS blame_by_repo ON blame_enrichment(repo_prefix) WHERE 
 -- on its next open + reindex.
 CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts USING fts5(node_id UNINDEXED, repo_prefix UNINDEXED, tokens);
 
+-- symbol_fts_state records which deterministic token-normalization mode built
+-- each repository's durable symbol corpus. The marker advances only after an
+-- authoritative replacement succeeds, so a crash can cause a harmless repeat
+-- rebuild but can never certify a corpus written with a different mode.
+CREATE TABLE IF NOT EXISTS symbol_fts_state (
+    repo_prefix  TEXT PRIMARY KEY,
+    normalization TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+
 -- symbol_fts_rowid maps a node_id to the rowid (FTS5 docid) of its row in
 -- symbol_fts. node_id is UNINDEXED in the FTS5 vtable, so deleting a node's
 -- prior row with "DELETE … WHERE node_id = ?" full-scans the entire index

@@ -28,7 +28,7 @@ func TestTrackRepo_FirstRepoIsPrefixedFromTheStart(t *testing.T) {
 
 	cm := newTestConfigManager(t)
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	ctx := context.Background()
 	_, err := mi.TrackRepoCtx(ctx, config.RepoEntry{Path: dirA, Name: "repo-a"})
@@ -58,7 +58,7 @@ func TestUntrackRepo_EvictsTheReposNodes(t *testing.T) {
 
 	cm := newTestConfigManager(t)
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err := mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: dir, Name: "repo-a"})
 	require.NoError(t, err)
@@ -92,7 +92,7 @@ func TestRepoRoot_EmptyPrefixResolvesTheSoleRepo(t *testing.T) {
 
 	cm := newTestConfigManager(t)
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	ctx := context.Background()
 	_, err := mi.TrackRepoCtx(ctx, config.RepoEntry{Path: dirA, Name: "repo-a"})
@@ -135,7 +135,7 @@ func TestResolveFilePath_RepoNameMatchingOwnSubdirectory(t *testing.T) {
 
 	cm := newTestConfigManager(t)
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err := mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: dir, Name: "api"})
 	require.NoError(t, err)
 

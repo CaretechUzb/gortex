@@ -180,7 +180,7 @@ func TestParseFailedSkipResult_RecordsError(t *testing.T) {
 // file's prior nodes through a transient failure (see
 // TestPatchGraphModify_ParseFailureKeepsPriorNodes).
 func TestIndex_ParseFailedSkipTelemetry(t *testing.T) {
-	idx, ext := newToggleIndexer(t)
+	idx, ext, _ := newToggleIndexer(t)
 	ext.setFail(true) // every extraction returns an error
 
 	dir := t.TempDir()

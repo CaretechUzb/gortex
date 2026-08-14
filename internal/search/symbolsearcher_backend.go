@@ -2,8 +2,6 @@ package search
 
 import (
 	"strings"
-	"sync"
-	"sync/atomic"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -11,14 +9,15 @@ import (
 // SymbolSearcherBackend adapts a graph.SymbolSearcher into the
 // search.Backend the daemon's search-symbols path consumes.
 // Engine.gatherBackendCandidates and the rerank pipeline don't need
-// to know whether the backend is BM25 or native FTS — they
-// see a plain search.Backend and call Search on it.
+// to know where the ranking comes from — they see a plain
+// search.Backend and call Search on it.
 //
 // Production wiring: when the indexer detects that the backing
 // graph.Store also implements graph.SymbolSearcher, it constructs
-// this adapter as the initial
-// search.Backend wrapped by search.NewSwappable. The in-process
-// BM25 build path is then bypassed entirely.
+// this adapter as the initial search.Backend wrapped by
+// search.NewSwappable. A store without that capability gets
+// NullBackend instead, and the engine falls back to its substring
+// scan — no text index is ever built in this process.
 //
 // Add / Remove are no-ops on the adapter because the indexer
 // already drives the SymbolSearcher writes directly:
@@ -35,13 +34,6 @@ import (
 // happen through the direct SymbolSearcher surface.
 type SymbolSearcherBackend struct {
 	s graph.SymbolSearcher
-
-	// count is lazily seeded from the authoritative persisted FTS count on its
-	// first read, then follows the indexer's incremental Add/Remove deltas. Lazy
-	// initialization avoids a discarded global count query for each per-repo
-	// Indexer constructed by MultiIndexer.
-	countInit sync.Once
-	count     atomic.Int64
 }
 
 // NewSymbolSearcherBackend wraps a SymbolSearcher in the
@@ -153,48 +145,28 @@ func (b *SymbolSearcherBackend) Search(query string, limit int) []SearchResult {
 }
 
 // Add is a no-op — the indexer drives UpsertSymbolFTS on the wrapped
-// SymbolSearcher directly. count is bumped immediately so deltas that arrive
-// before the first Count call are preserved when the persisted snapshot is
-// added.
-func (b *SymbolSearcherBackend) Add(id string, _ ...string) {
-	if b == nil || id == "" {
-		return
-	}
-	b.count.Add(1)
-}
+// SymbolSearcher directly.
+func (b *SymbolSearcherBackend) Add(string, ...string) {}
 
-// Remove is a no-op for the same reason as Add — the per-call
-// removal path (when one lands) routes through SymbolSearcher
-// directly, not through the search.Backend contract. count is
-// decremented so the Count() figure stays roughly consistent.
-func (b *SymbolSearcherBackend) Remove(id string) {
-	if b == nil || id == "" {
-		return
-	}
-	b.count.Add(-1)
-}
+// Remove is a no-op for the same reason as Add — the removal path routes
+// through SymbolSearcher directly, not through the search.Backend contract.
+func (b *SymbolSearcherBackend) Remove(string) {}
 
-// Count returns the persisted corpus snapshot observed on its first call plus
-// subsequent Add/Remove deltas. It is suitable for readiness gates and rough
-// magnitude only; DocCount reads the authoritative current size.
+// Count returns the authoritative persisted corpus size when the wrapped store
+// exposes it. Add and Remove deliberately do not maintain a second local count:
+// their corresponding FTS writes happen directly on the store, so applying the
+// same deltas here would double-count them.
 func (b *SymbolSearcherBackend) Count() int {
-	if b == nil {
+	count, ok := b.DocCount()
+	if !ok {
 		return 0
 	}
-	b.countInit.Do(func() {
-		if counter, ok := b.s.(graph.SymbolFTSCounter); ok {
-			if count, err := counter.SymbolFTSCount(); err == nil && count > 0 {
-				b.count.Add(int64(count))
-			}
-		}
-	})
-	return int(b.count.Load())
+	return count
 }
 
-// DocCounter is the capability interface for the authoritative corpus
-// size — distinct from Backend.Count(), which is a process-local
-// Add/Remove delta. The engine's has-corpus gate asserts this;
-// Swappable and HybridBackend forward it.
+// DocCounter is the capability interface for the authoritative corpus size.
+// The engine's has-corpus gate asserts this; Swappable and HybridBackend
+// forward it.
 type DocCounter interface {
 	DocCount() (int, bool)
 }
@@ -202,10 +174,8 @@ type DocCounter interface {
 // DocCount returns the authoritative number of indexed documents, straight
 // from the underlying index, and reports whether it could be obtained.
 //
-// Count() must not be used for this: its cached readiness snapshot can drift as
-// direct store maintenance and best-effort Add/Remove deltas diverge. Anything
-// user-facing asks here and omits the figure when the authoritative answer is
-// unavailable.
+// Count delegates to this method as well, so readiness checks and user-facing
+// status observe the same store-owned value.
 func (b *SymbolSearcherBackend) DocCount() (int, bool) {
 	if b == nil || b.s == nil {
 		return 0, false

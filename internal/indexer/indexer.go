@@ -298,14 +298,14 @@ type Indexer struct {
 	// Set during the shadow swap, cleared when idx.graph is restored.
 	contractStateSink graph.ContractStateStore
 
-	// embedChunkOpts tunes the AST sub-chunking buildSearchIndex applies
-	// to large symbols before embedding. The zero value makes the
-	// chunker fall back to its package defaults.
+	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
+	// vector publication plan. The zero value makes the chunker fall back to
+	// its package defaults.
 	embedChunkOpts embedding.ChunkOptions
 
-	// embedMaxSymbols overrides the built-in cap on how many texts the
-	// vector index will hold before buildSearchIndex skips the embed
-	// pass. Zero keeps the built-in default.
+	// embedMaxSymbols overrides the built-in cap on how many texts the vector
+	// preparation pass accepts before skipping embeddings. Zero keeps the
+	// built-in default.
 	embedMaxSymbols int
 
 	// embedAPIConcurrency bounds how many embedding requests run in
@@ -314,8 +314,8 @@ type Indexer struct {
 	// inference mutex.
 	embedAPIConcurrency int
 
-	// lastVectorBuildErr records why the most recent buildSearchIndex pass
-	// shipped text-only instead of a vector index (chunk-embed failure,
+	// lastVectorBuildErr records why the most recent vector prepare/install
+	// pass did not publish a vector index (chunk-embed failure,
 	// all-vectors-invalid, or the symbol-count guard). Nil after a build that
 	// produced a vector index. Read via LastVectorBuildError once a build has
 	// finished — it lets `gortex eval embedders` report the real cause instead
@@ -501,7 +501,11 @@ type contractCacheEntry struct {
 // Any backend (in-memory, SQLite-on-disk, remote) is acceptable — the
 // indexer's mutation paths go through the Store interface methods only,
 // so swapping backends is a zero-code-change configuration choice for
-// callers.
+// callers. Text search belongs to the store: a store implementing
+// graph.SymbolSearcher answers queries from its own FTS, and every other
+// store gets a null text backend whose empty corpus routes the query
+// engine to its substring fallback. The indexer builds no text index of
+// its own for either.
 func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *zap.Logger) *Indexer {
 	idx := &Indexer{
 		graph:                g,
@@ -514,13 +518,11 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 		// Subsequent reassignments to idx.search should use the swap
 		// helpers below.
 		//
-		// When the backing store implements graph.SymbolSearcher
-		// (today only store_sqlite), the initial backend is a thin
-		// adapter that forwards Search to the store's native FTS.
-		// The in-process BM25 build path is then bypassed entirely —
-		// saving ~100MB heap on a Vscode-scale repo and putting
-		// search in the same address space as the rest of the graph
-		// queries.
+		// initialSearchBackend picks the text side: the store's own FTS
+		// when it implements graph.SymbolSearcher (today only
+		// store_sqlite), otherwise the null backend. Neither holds a
+		// corpus in this process, so search costs no heap beyond what the
+		// store already spends on the graph itself.
 		search:        search.NewSwappable(initialSearchBackend(g)),
 		config:        cfg,
 		transforms:    newTransformPipeline(cfg.Transforms, logger),
@@ -646,10 +648,10 @@ func docSummary(doc string) string {
 	return doc
 }
 
-// vectorSearcherDelegate is the search.VectorDelegate-shaped
-// adapter the indexer hands to VectorBackend.SetDelegate when the
-// underlying store implements graph.VectorSearcher. SimilarTo just
-// forwards — search.VectorDelegate is defined to return
+// vectorSearcherDelegate is the search.VectorDelegate-shaped adapter the
+// indexer passes to search.NewDelegatedVector when the underlying store
+// implements graph.VectorSearcher. SimilarTo just forwards —
+// search.VectorDelegate is defined to return
 // graph.VectorHit slices directly, so there's no translation work
 // here, just a small struct so the in-process search package
 // doesn't depend on graph.VectorSearcher's full surface.
@@ -667,47 +669,30 @@ func (d *vectorSearcherDelegate) SimilarTo(vec []float32, limit int) ([]graph.Ve
 // initialSearchBackend picks the search.Backend the indexer wraps
 // in its Swappable on construction. When the underlying store
 // implements graph.SymbolSearcher (today only store_sqlite), a
-// thin adapter routes Search calls through the store's native FTS
-// — the in-process BM25 build path is bypassed entirely. Otherwise
-// falls through to search.NewAuto's in-memory BM25 index.
+// thin adapter routes Search calls through the store's native FTS.
+// Every other store gets the null backend: it indexes nothing and
+// reports an empty corpus, so the query engine answers from its own
+// substring scan rather than from a second, in-process copy of the
+// corpus. Those are the only two shapes, which is why no code path
+// builds a text index in this process.
 func initialSearchBackend(g graph.Store) search.Backend {
 	if s, ok := g.(graph.SymbolSearcher); ok {
 		return search.NewSymbolSearcherBackend(s)
 	}
-	return search.NewAuto()
-}
-
-// isSymbolSearcherBackend reports whether the swappable's currently
-// active backend is the SymbolSearcher adapter. Used to suppress the
-// in-process index builds — if the active backend is already a native
-// FTS, re-indexing the same corpus into a parallel in-process index
-// would defeat the FTS path and pin the ~100MB heap the FTS
-// integration was meant to release.
-func isSymbolSearcherBackend(b search.Backend) bool {
-	switch backend := b.(type) {
-	case *search.SymbolSearcherBackend:
-		return true
-	case *search.Swappable:
-		inner, release := backend.AcquireBackend()
-		defer release()
-		return isSymbolSearcherBackend(inner)
-	case *search.HybridBackend:
-		return isSymbolSearcherBackend(backend.TextBackend())
-	default:
-		return false
-	}
+	return search.NewNull()
 }
 
 // ftsTokensFor produces the pre-tokenised text the backend FTS path
 // indexes. Mirrors searchIndexFields' field selection but joins
 // every field through search.Tokenize (camelCase / snake_case /
-// path-segment splitter) so the resulting token list matches the
-// in-process BM25 corpus contract — the same query produces the
-// same recall against either backend. Joined with spaces so the
+// path-segment splitter) — the same splitter buildFTSMatch runs over
+// an incoming query, so a query token can only match a document token
+// that was split the same way. Diverge here and identifier queries
+// stop reaching the symbols that carry them. Joined with spaces so the
 // downstream COPY FROM sees a single STRING column value.
 func ftsTokensFor(n *graph.Node, projectName string) string {
 	// searchIndexFields includes the resolver qualifier or its retrieval-only
-	// replacement, so both BM25 backends and embeddings see the same token bag.
+	// replacement, so both the FTS documents and embeddings see the same token bag.
 	fields := searchIndexFields(n, projectName)
 	tokens := make([]string, 0, 16)
 	for _, f := range fields {
@@ -716,6 +701,7 @@ func ftsTokensFor(n *graph.Node, projectName string) string {
 		}
 		tokens = append(tokens, search.Tokenize(f)...)
 	}
+	tokens = search.NormalizeFTSTokens(tokens)
 	if len(tokens) == 0 {
 		return ""
 	}
@@ -741,8 +727,9 @@ const (
 // Nodes stream through the store's bounded scoped projection instead of a
 // whole-repository read: the caller reached this path precisely because the
 // repository does not fit in memory. Backends without the replace/projection
-// capabilities (test fixtures) are a no-op — their search index is populated
-// by buildSearchIndex instead.
+// capabilities (test fixtures and in-memory stores) are a no-op — their
+// search backend stays empty and the query engine uses its graph substring
+// fallback.
 //
 // The replacement is one atomic unit: a rebuild that fails part-way leaves the
 // corpus the repository already had. Wiping first and appending chunk by chunk
@@ -824,8 +811,8 @@ func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
 // searchable symbols. Beyond that, config.SkipSearch filters out
 // (language, kind) pairs that would only add noise — JSON/YAML/TOML
 // keys, CSS tokens, Terraform blocks, shell/build variables. Every
-// text-index call site (buildSearchIndex bulk loop, indexFile
-// incremental add) must go through this predicate so they can't drift.
+// FTS writer (shadow drain, direct rebuild, and incremental mutation) must go
+// through this predicate so the persisted corpora cannot drift.
 func (idx *Indexer) shouldIndexForSearch(n *graph.Node) bool {
 	// Cross-daemon proxy-edge nodes stand in for remote symbols; they
 	// are never surfaced in local name search. Inert until
@@ -1480,8 +1467,8 @@ func (idx *Indexer) SetProjectID(id string) { idx.projectID = id }
 // ProjectID returns the project slug this indexer stamps on nodes.
 func (idx *Indexer) ProjectID() string { return idx.projectID }
 
-// SetEmbedder sets the embedding provider for semantic search.
-// When set, buildSearchIndex will create a HybridBackend with vector search.
+// SetEmbedder sets the embedding provider for semantic search. When set, the
+// vector prepare/install pipeline publishes a HybridBackend with vector search.
 func (idx *Indexer) SetEmbedder(p embedding.Provider) { idx.embedder = p }
 
 // SetEmbeddingChunkOptions tunes the AST sub-chunking applied to large
@@ -1492,8 +1479,8 @@ func (idx *Indexer) SetEmbeddingChunkOptions(opts embedding.ChunkOptions) {
 }
 
 // SetEmbeddingMaxSymbols overrides the cap on how many texts the vector
-// index will hold before buildSearchIndex skips the embed pass. Zero
-// keeps the built-in default.
+// preparation pass accepts before skipping embeddings. Zero keeps the built-in
+// default.
 func (idx *Indexer) SetEmbeddingMaxSymbols(n int) { idx.embedMaxSymbols = n }
 
 // SetEmbeddingAPIConcurrency overrides how many embedding requests run
@@ -2660,6 +2647,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// into the durable store, which is far cheaper than writing each node
 		// and edge through as it is parsed.
 		idx.indexCount.Add(1)
+		if err := idx.markSymbolFTSNormalizationPending(idx.graph); err != nil {
+			return nil, err
+		}
 		diskTarget = idx.graph
 		inMemShadow = idx.newStructuralIntegrityShadow(diskTarget, graph.StructuralPathShadowCold)
 		idx.graph = inMemShadow
@@ -2836,6 +2826,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						retErr = fmt.Errorf("indexer: finalize backend FTS: %w", ferr)
 					}
 				}
+				if retErr == nil && ftsReady {
+					if err := idx.markSymbolFTSNormalization(diskTarget); err != nil {
+						retErr = err
+					}
+				}
 				reporter.Report("building symbol fts", 1, 1)
 			}
 			reporter.Report("persisting bulk graph", 1, 1)
@@ -2889,7 +2884,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if retErr != nil {
 				return
 			}
+			if err := idx.markSymbolFTSNormalizationPending(idx.graph); err != nil {
+				retErr = err
+				return
+			}
 			if err := idx.populateSymbolFTS(reporter); err != nil {
+				retErr = err
+				return
+			}
+			if err := idx.markSymbolFTSNormalization(idx.graph); err != nil {
 				retErr = err
 			}
 		}()
@@ -3978,8 +3981,9 @@ func (idx *Indexer) repoNodeEdgeCount() (int, int) {
 
 // cleanCensusResult publishes the same zero-delta state as the full-root
 // incremental pipeline after ChangedSinceMtimes has already proved the tree
-// unchanged. It preserves the one necessary side effect for non-persistent
-// search backends without repeating filesystem discovery.
+// unchanged. The store already owns the native text corpus, but the process-local
+// vector channel must still be restored from durable corpus statistics (or rebuilt
+// once when migration left that corpus empty).
 func (idx *Indexer) cleanCensusResult(ctx context.Context, detected int, started time.Time) (*IndexResult, error) {
 	if idx.totalDetected == 0 {
 		idx.totalDetected = detected
@@ -3997,12 +4001,13 @@ func (idx *Indexer) cleanCensusResult(ctx context.Context, detected int, started
 		idx.lastVectorBuildErr = restoreErr
 		idx.logger.Warn("restore durable vector corpus failed; rebuilding", zap.Error(restoreErr))
 	}
-	if restored {
-		idx.rebuildTextSearchIndex()
-	} else if !isSymbolSearcherBackend(idx.search) || idx.embedder != nil {
+	if !restored && idx.embedder != nil {
 		if err := idx.buildSearchIndexCtx(ctx); err != nil {
 			return nil, err
 		}
+	}
+	if _, err := idx.reconcileSymbolFTSNormalization(nil); err != nil {
+		return nil, err
 	}
 
 	nodes, edges := idx.repoNodeEdgeCount()
@@ -4956,8 +4961,8 @@ func (idx *Indexer) restubIncomingRefs(graphPath string) {
 // embeddingDimsOrDefault returns the embedder's reported vector width,
 // falling back to a neutral placeholder only when the provider cannot
 // state its width yet (Dimensions() == 0, the APIProvider-before-first-
-// call case). The fallback is never persisted: buildSearchIndex
-// overwrites it with the true width taken from a real vector. Kept as a
+// call case). The fallback is never persisted: vector-plan preparation
+// replaces it with the true width taken from a real vector. Kept as a
 // named helper so the vector-dimension default has one definition
 // instead of a scattered magic number.
 func embeddingDimsOrDefault(p embedding.Provider) int {
@@ -5279,16 +5284,6 @@ func flattenEmbedResults(results [][][]float32) [][]float32 {
 		out = append(out, r...)
 	}
 	return out
-}
-
-// buildSearchIndex is the compatibility entry point for direct and focused
-// callers. Full indexing uses the context-aware preparation/publication split
-// so a cold shadow can defer publication until its durable drain succeeds.
-func (idx *Indexer) buildSearchIndex() {
-	if err := idx.buildSearchIndexCtx(context.Background()); err != nil {
-		idx.lastVectorBuildErr = err
-		idx.logger.Warn("vector index build canceled", zap.Error(err))
-	}
 }
 
 // dirIgnoreFiles are the per-directory ignore-file basenames honored by
@@ -5698,6 +5693,13 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	}
 	idx.storeRootPath(absRoot)
 
+	// Reconcile the complete durable corpus before any scoped mutation writes
+	// rows with this process's normalization mode. Doing this after a partial
+	// update would leave unchanged symbols in the previous mode.
+	if _, err := idx.reconcileSymbolFTSNormalization(nil); err != nil {
+		return nil, err
+	}
+
 	// scopeRels holds the repo-relative slash-paths the caller asked to
 	// reindex — used both to drive the discovery walk and to bound
 	// deletion detection to the scoped subtree.
@@ -5944,15 +5946,10 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		idx.reresolveCSharpGlobalUsingDependents(evictedGlobalsFiles, evicted)
 	}
 
-	// Structural and metadata refreshes maintain both the in-memory search
-	// backend and persistent FTS one symbol at a time; deletions remove the
-	// prior symbols above. Rebuilding the whole corpus after a tiny edit would
-	// re-embed every unchanged symbol. The only rebuild retained here is the
-	// zero-delta bootstrap for a non-persistent backend restored beside an
-	// already-populated graph.
-	if len(staleFiles) == 0 && len(deletedFiles) == 0 && !isSymbolSearcherBackend(idx.search) {
-		idx.buildSearchIndex()
-	}
+	// No search rebuild here. Structural and metadata refreshes maintain the
+	// store's FTS one symbol at a time and deletions remove the prior symbols
+	// above, so the text corpus is already current; rebuilding it after a tiny
+	// edit would only re-embed every unchanged symbol.
 
 	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
 		// Contract extraction is file-bounded even for body-only and metadata

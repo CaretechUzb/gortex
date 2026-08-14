@@ -59,28 +59,6 @@ func TestChangedSinceMtimesCensusDeletesNewlyExcludedTrackedFile(t *testing.T) {
 	assert.Zero(t, detected)
 }
 
-func TestCleanCensusResultBootstrapsNonPersistentSearch(t *testing.T) {
-	g := graph.New()
-	g.AddNode(&graph.Node{
-		ID:       "function::Alpha",
-		Kind:     graph.KindFunction,
-		Name:     "Alpha",
-		FilePath: "a.go",
-	})
-	idx := newTestIndexer(g)
-	idx.search = search.NewBM25()
-	idx.SetFileMtimes(map[string]int64{"a.go": 1})
-
-	result, err := idx.cleanCensusResult(t.Context(), 1, time.Now())
-	require.NoError(t, err)
-	require.NotNil(t, result)
-	assert.Equal(t, 1, result.FileCount)
-	assert.Equal(t, 1, result.NodeCount)
-	assert.Equal(t, 1, idx.TotalDetected())
-	assert.Equal(t, 1, idx.search.Count())
-	require.NotEmpty(t, idx.search.Search("Alpha", 10))
-}
-
 func TestCleanCensusRestoresDurableVectorsWithoutEmbedding(t *testing.T) {
 	root := vectorPersistFixture(t, 1)
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
@@ -171,14 +149,14 @@ func TestReconcileRepoCtxUsesCleanCensusNoOp(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 
-	seed := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	seed := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = seed.IndexAll()
 	require.NoError(t, err)
 	prior := seed.GetIndexer("repo").FileMtimes()
 	before := store.Stats()
 
 	core, logs := observer.New(zap.DebugLevel)
-	restarted := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewBM25(), cm, zap.New(core))
+	restarted := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewNull(), cm, zap.New(core))
 	result, err := restarted.ReconcileRepoCtx(t.Context(), entry, prior)
 	require.NoError(t, err)
 	require.NotNil(t, result)

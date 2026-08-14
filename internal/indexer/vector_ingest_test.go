@@ -103,16 +103,18 @@ func indexWithEmbedder(t *testing.T, emb interface {
 	return idx
 }
 
-// TestBuildSearchIndex_DropsInvalidVectors: a mix of valid/nil/short vectors
+// TestVectorPublication_DropsInvalidVectors: a mix of valid/nil/short vectors
 // yields a vector index populated with only the valid ones — the bad vectors
 // are dropped rather than poisoning the index or aborting a viable build.
-func TestBuildSearchIndex_DropsInvalidVectors(t *testing.T) {
+func TestVectorPublication_DropsInvalidVectors(t *testing.T) {
 	emb := &mixedEmbedder{}
 	idx := indexWithEmbedder(t, emb)
 
 	sw, ok := idx.Search().(*search.Swappable)
 	require.True(t, ok)
-	hybrid, ok := sw.Inner().(*search.HybridBackend)
+	backend, release := sw.AcquireBackend()
+	defer release()
+	hybrid, ok := backend.(*search.HybridBackend)
 	require.True(t, ok, "a viable subset of vectors must still produce a HybridBackend")
 	require.NotNil(t, hybrid.VectorIndex())
 
@@ -124,14 +126,16 @@ func TestBuildSearchIndex_DropsInvalidVectors(t *testing.T) {
 		"a partially-valid build is a success, not a recorded failure")
 }
 
-// TestBuildSearchIndex_AllInvalidAbortsToTextOnly: when every vector is invalid
+// TestVectorPublication_AllInvalidAbortsToTextOnly: when every vector is invalid
 // the build must abort to text-only search, not ship a silently empty index.
-func TestBuildSearchIndex_AllInvalidAbortsToTextOnly(t *testing.T) {
+func TestVectorPublication_AllInvalidAbortsToTextOnly(t *testing.T) {
 	idx := indexWithEmbedder(t, nilEmbedder{})
 
 	sw, ok := idx.Search().(*search.Swappable)
 	require.True(t, ok)
-	_, isHybrid := sw.Inner().(*search.HybridBackend)
+	backend, release := sw.AcquireBackend()
+	defer release()
+	_, isHybrid := backend.(*search.HybridBackend)
 	assert.False(t, isHybrid,
 		"an all-invalid embedding pass must leave a text-only backend, not an empty vector index")
 	assert.Error(t, idx.LastVectorBuildError(),

@@ -222,12 +222,21 @@ versus an LLM-judged setup.
 
 Per-tier R@5 (bm25): exact **96.8%** · concept 25.4% · multi_hop 30.0%.
 
+_The `bm25` row key is historical. The row measures the shipping
+lexical path — the store's native symbol FTS queried through
+`Engine.SearchSymbols`, the same call `search_symbols` makes — not an
+in-process BM25 index. The key is kept unchanged so older runs stay
+joinable._
+
 **Headline**: the `search_symbols` text path (`bm25`) lands
 **R@5 = 55.1%** / **R@20 = 63.5%**, and **96.8%** on exact
 symbol-name queries — 3.2× ripgrep's R@5 floor. Enabling Porter
 stemming (`GORTEX_FTS_STEMMING=1`) trades a little exact-tier
 precision for breadth — R@20 +5.7pp, exact-tier R@5 −3.1pp — so it
-ships opt-in. The `semantic` and `rrf` rankers require `--embeddings`
+ships opt-in. The mode is read at process start; on a later restart,
+gortex automatically rebuilds a repository's native symbol FTS when
+its persisted normalization marker differs. The `semantic` and `rrf`
+rankers require `--embeddings`
 and are omitted here; the `graph` ranker scores only graph-traversal
 fixtures.
 

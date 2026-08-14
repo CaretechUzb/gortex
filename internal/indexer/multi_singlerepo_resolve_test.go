@@ -29,7 +29,7 @@ func indexSingleRepoForTest(t *testing.T) (*MultiIndexer, string) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 	return mi, dir
@@ -54,7 +54,7 @@ func indexTwoReposForTest(t *testing.T) (*MultiIndexer, string, string) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 	return mi, repoA, repoB
@@ -135,7 +135,7 @@ func TestMultiIndexer_RunPreEnrichResolve_BindsInboundCrossRepoEdge(t *testing.T
 	inbound := &graph.Edge{From: "repo-a/a.go::Caller", To: "unresolved::Foo", Kind: graph.EdgeCalls, FilePath: "repo-a/a.go", Line: 5}
 	g.AddEdge(inbound)
 
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	// Scoped warm restart: only the provider repo-b re-indexed.
 	require.NoError(t, mi.RunPreEnrichResolve(context.Background(), map[string]struct{}{"repo-b": {}}, nil))

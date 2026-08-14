@@ -48,7 +48,7 @@ func TestReconcileRepoCtx_EvictsOfflineDeletions(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	g := graph.Store(s)
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
@@ -66,7 +66,7 @@ func TestReconcileRepoCtx_EvictsOfflineDeletions(t *testing.T) {
 
 	// Second "daemon run": fresh MultiIndexer, graph already populated
 	// from the "snapshot", reconcile with prior mtimes.
-	mi2 := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi2 := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi2.ReconcileRepoCtx(context.Background(), config.RepoEntry{Path: repoPath, Name: "repo"}, priorMtimes)
 	require.NoError(t, err)
 
@@ -97,7 +97,7 @@ func TestReconcileRepoCtx_DoesNotDuplicateUnchanged(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
@@ -105,7 +105,7 @@ func TestReconcileRepoCtx_DoesNotDuplicateUnchanged(t *testing.T) {
 	priorMtimes := mi.FileMtimes("repo")
 
 	// Simulate restart: fresh MultiIndexer on the same graph, reconcile.
-	mi2 := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi2 := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi2.ReconcileRepoCtx(context.Background(), config.RepoEntry{Path: repoPath, Name: "repo"}, priorMtimes)
 	require.NoError(t, err)
 
@@ -140,7 +140,7 @@ func TestReconcileRepoCtx_RunsDerivedPassesForOfflineChange(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	g := graph.Store(s)
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 	priorMtimes := mi.FileMtimes("repo")
@@ -150,7 +150,7 @@ import "os/exec"
 func Run() error { return exec.Command("true").Run() }
 `)
 
-	mi2 := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi2 := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	result, err := mi2.ReconcileRepoCtx(
 		context.Background(), config.RepoEntry{Path: repoPath, Name: "repo"}, priorMtimes,
 	)
@@ -178,7 +178,7 @@ func TestReconcileAll_RunsDerivedPassesForMissedChange(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
@@ -215,7 +215,7 @@ func TestReconcileAllCtx_PreservesExistingBatchFlags(t *testing.T) {
 	cm, err := config.NewConfigManager(cfgPath)
 	require.NoError(t, err)
 
-	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
@@ -268,7 +268,7 @@ func TestReconcileAll_CatchesJanitorTargets(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 

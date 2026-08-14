@@ -60,7 +60,7 @@ func TestGitWatcher_BranchSwitchReconciles(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(repoDir)
 	_, err := idx.IndexCtx(testCtx(), repoDir)
 	require.NoError(t, err)
@@ -83,7 +83,7 @@ func TestGitWatcher_BranchSwitchReconciles(t *testing.T) {
 	// started on main" by re-indexing explicitly.
 	g2 := graph.New()
 	idx2 := New(g2, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx2.search = search.NewBM25()
+	idx2.search = search.NewNull()
 	idx2.SetRootPath(repoDir)
 	_, err = idx2.IndexCtx(testCtx(), repoDir)
 	require.NoError(t, err)
@@ -146,7 +146,7 @@ func TestGitWatcher_ReconcileSingleFlight(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(repoDir)
 	_, err := idx.IndexCtx(testCtx(), repoDir)
 	require.NoError(t, err)
@@ -229,7 +229,7 @@ func TestGitWatcher_NoopWhenHeadUnchanged(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(repoDir)
 	_, err := idx.IndexCtx(testCtx(), repoDir)
 	require.NoError(t, err)
@@ -308,7 +308,7 @@ func TestGitWatcher_UntrackedFileStaysIndexed(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(repoDir)
 	_, err := idx.IndexCtx(testCtx(), repoDir)
 	require.NoError(t, err)

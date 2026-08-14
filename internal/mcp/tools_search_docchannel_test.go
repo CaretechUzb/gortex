@@ -8,12 +8,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
-	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/indexer"
-	"github.com/zzet/gortex/internal/query"
 )
 
 // docChannelServer indexes MANY code symbols whose names share the
@@ -38,15 +34,7 @@ func docChannelServer(t *testing.T) *Server {
 		[]byte("# Guide\n\n## Deployment\n\n"+
 			"To deploy the service push the container image and apply the manifest.\n"), 0o644))
 
-	g := graph.New()
-	reg := testRegistry()
-	cfg := config.Default()
-	idx := indexer.New(g, reg, cfg.Index, zap.NewNop())
-	_, err := idx.Index(dir)
-	require.NoError(t, err)
-	eng := query.NewEngine(g)
-	eng.SetSearchProvider(idx.Search)
-	return NewServer(eng, g, idx, nil, zap.NewNop(), nil)
+	return newFTSServer(t, dir, config.Default().Index)
 }
 
 // TestSearchSymbols_DocChannelRescuesCrowdedProse is the core feature

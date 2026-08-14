@@ -11,9 +11,9 @@ import (
 )
 
 // countingSearch records Add/Remove calls so a test can assert that a node
-// admitted by shouldIndexForSearch is the only kind ever removed. The real
-// backend's Remove is an unconditional decrement, so an eviction predicate
-// broader than the admit predicate silently corrupts its count.
+// admitted by shouldIndexForSearch is the only kind ever removed. Production
+// backends differ in how they store search state, but their admit and eviction
+// predicates must remain symmetric.
 type countingSearch struct {
 	added   []string
 	removed []string
@@ -45,7 +45,7 @@ func TestRemoveFromSearchOnlyEvictsWhatWouldBeIndexed(t *testing.T) {
 		idx.removeFromSearch(n)
 	}
 	require.Empty(t, spy.removed,
-		"a node the admit predicate rejects must never reach Remove — the backend decrements unconditionally")
+		"a node the admit predicate rejects must never reach Remove")
 
 	admitted := &graph.Node{ID: "pkg/a.go::Fn", Kind: graph.KindFunction, Name: "Fn", Language: "go"}
 	require.True(t, idx.shouldIndexForSearch(admitted))
@@ -53,9 +53,9 @@ func TestRemoveFromSearchOnlyEvictsWhatWouldBeIndexed(t *testing.T) {
 	require.Equal(t, []string{"pkg/a.go::Fn"}, spy.removed)
 }
 
-// The count only stays honest if the two predicates agree. Simulating a
-// reconcile — evict the prior nodes, re-add the fresh ones — must be
-// count-neutral for an unchanged file.
+// Search membership only stays stable if the two predicates agree. Simulating
+// a reconcile — evict the prior nodes, re-add the fresh ones — must be neutral
+// for an unchanged file.
 func TestReconcileOfUnchangedFileIsCountNeutral(t *testing.T) {
 	spy := &countingSearch{}
 	idx := &Indexer{search: spy, config: config.IndexConfig{}}

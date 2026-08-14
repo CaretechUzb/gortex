@@ -286,8 +286,7 @@ func anchorTermsToVocabulary(terms []string, ac *search.AutoConcepts) []string {
 // expansion hits append in their own BM25 order with duplicates
 // skipped.
 //
-// Both BM25 backends (BM25Backend and the on-disk backend's FTS)
-// treat a multi-token query as an OR-style union
+// The store's FTS treats a multi-token query as an OR-style union
 // with a single global BM25 score, so one combined call replaces
 // the prior N per-term fan-out (the N+1 round-trip pattern dominated
 // the search hot path on disk backends).
@@ -649,9 +648,9 @@ func verifyWithLLM(ctx context.Context, s *Server, query string, nodes []*graph.
 //
 // Before partitioning into head/tail, nodes are re-sorted so callable
 // kinds (function / method) come before everything else — preserving
-// BM25 order within each bucket. Without this, a high-scoring param
-// or field node (e.g. `BM25Backend.Search#param:limit`) can pre-empt
-// the enclosing method (`BM25Backend.Search`) inside the rerank
+// retrieval order within each bucket. Without this, a high-scoring
+// param or field node (e.g. `Engine.SearchSymbols#param:limit`) can
+// pre-empt the enclosing method (`Engine.SearchSymbols`) inside the rerank
 // window, leaving the model unable to surface the real callable.
 func rerankWithLLM(ctx context.Context, s *Server, query string, nodes []*graph.Node) []*graph.Node {
 	if s.llmService == nil || !s.llmService.Enabled() || len(nodes) < 2 {

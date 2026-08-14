@@ -110,7 +110,8 @@ func TestStatusResponse_EnrichmentJSONRoundTrip(t *testing.T) {
 
 // TestSearchBackendStats_DiskResidentJSONRoundTrip locks in that the
 // DiskResident flag survives the wire round trip and is omitted when
-// false (the in-process BM25 backend never sets it).
+// false (only the store-native FTS index sets it; a backend reporting a
+// heap figure leaves it clear).
 func TestSearchBackendStats_DiskResidentJSONRoundTrip(t *testing.T) {
 	sb := daemon.SearchBackendStats{Name: "sqlite-fts5", DocCount: 48572, DiskResident: true}
 	raw, err := json.Marshal(sb)
@@ -121,8 +122,8 @@ func TestSearchBackendStats_DiskResidentJSONRoundTrip(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &round))
 	assert.True(t, round.DiskResident)
 
-	bm25 := daemon.SearchBackendStats{Name: "bm25", DocCount: 10}
-	raw2, err := json.Marshal(bm25)
+	heapResident := daemon.SearchBackendStats{Name: "unknown", DocCount: 10}
+	raw2, err := json.Marshal(heapResident)
 	require.NoError(t, err)
 	assert.NotContains(t, string(raw2), "disk_resident")
 }

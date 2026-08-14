@@ -20,10 +20,10 @@ type VectorDelegate interface {
 
 // VectorBackend stores and searches embedding vectors using HNSW index.
 //
-// When a delegate is installed, the in-process HNSW is absent: Add tracks
-// compatibility-path writes without allocating, and Search forwards to the
-// delegate's SimilarTo. Durable hits carry their parent IDs, so chunk results
-// can be collapsed without retaining a process-local chunk map.
+// When a delegate is installed, the in-process HNSW is absent: Add ignores
+// process-local writes, while Search forwards to the delegate's SimilarTo.
+// Durable hits carry their parent IDs, so chunk results can be collapsed
+// without retaining a process-local chunk map.
 type VectorBackend struct {
 	graph *hnsw.Graph[string]
 	count int
@@ -112,11 +112,10 @@ func (v *VectorBackend) Add(id string, vector []float32) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.delegate != nil {
-		// Legacy compatibility for callers that install a delegate before
-		// pushing vectors themselves. New publication must construct the
-		// backend with NewDelegatedVector and complete durable statistics.
-		// Either way Add never allocates an in-process HNSW in delegated mode.
-		v.delegateCount++
+		// The durable corpus is authoritative. Publication replaces it through
+		// the store and constructs a fresh backend with NewDelegatedVector;
+		// accepting a process-local Add here would fabricate Count without
+		// persisting searchable data.
 		return
 	}
 	v.graph.Add(hnsw.Node[string]{
@@ -124,26 +123,6 @@ func (v *VectorBackend) Add(id string, vector []float32) {
 		Value: hnsw.Vector(vector),
 	})
 	v.count++
-}
-
-// SetDelegate is the legacy compatibility switch for callers that select a
-// delegate before writing their corpus. It releases all prior heap and chunk
-// state atomically; subsequent Add calls only advance this process's accepted
-// write count. New and warm-start publication must use NewDelegatedVector so
-// Count and HasChunks describe the complete durable corpus immediately.
-func (v *VectorBackend) SetDelegate(d VectorDelegate) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	// Switching modes must also release the old heap index. Merely routing
-	// reads to d would leave the complete HNSW graph, its count, and chunk
-	// ownership map retained for the lifetime of the daemon.
-	v.graph = nil
-	v.count = 0
-	v.chunkMap = nil
-	v.delegate = d
-	v.delegateCount = 0
-	v.delegateChunkCount = 0
 }
 
 // Search returns the k nearest neighbors to the query vector.

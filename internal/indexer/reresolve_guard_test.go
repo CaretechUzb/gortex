@@ -17,7 +17,7 @@ import (
 // edge demoted from a concrete target to a stub keeps the incident-edge total
 // identical.
 func TestCountResolvedFileEdges(t *testing.T) {
-	idx, _ := newToggleIndexer(t)
+	idx, _, _ := newToggleIndexer(t)
 	g := idx.graph
 	g.AddBatch([]*graph.Node{
 		{ID: "a.go", Kind: graph.KindFile, Name: "a.go", FilePath: "a.go"},
@@ -39,7 +39,7 @@ func TestCountResolvedFileEdges(t *testing.T) {
 // enqueues a forced scoped re-resolve and bumps the regression counter, while
 // below-floor / symbol-removal / modest-drop cases stay quiet.
 func TestGuardResolvedEdgeRegression(t *testing.T) {
-	idx, _ := newToggleIndexer(t)
+	idx, _, _ := newToggleIndexer(t)
 	w, err := NewWatcher(idx, config.WatchConfig{Enabled: true, DebounceMs: 10}, zap.NewNop())
 	require.NoError(t, err)
 

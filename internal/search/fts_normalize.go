@@ -9,20 +9,35 @@ import (
 )
 
 // ftsStemmingEnabled gates the token-normalization pass — stopword
-// removal plus Porter stemming — applied to the full-text-search index
-// and query paths. Default OFF: on the recall fixture stemming trades
+// removal plus Porter stemming — applied to the native symbol FTS index
+// and query paths. Content FTS intentionally keeps raw body tokens.
+// Default OFF: on the recall fixture stemming trades
 // exact-symbol-lookup precision (exact-tier R@5 −3.1pp) for broader
 // recall (R@20 +5.7pp), so it ships as an opt-in rather than quietly
 // reranking every identifier query. Enable it with
 // GORTEX_FTS_STEMMING=1 (also true / yes / on).
 //
-// Read once at process start, like the bigram-typo flag: the index
+// Read once at process start: the index
 // built during a daemon's lifetime and every query against it share a
 // single setting, so a mid-session toggle can't desynchronise stemmed
 // postings from stemmed query terms. When enabled, the same
 // normalization runs on both the posting list and the query, so the
 // two never disagree.
 var ftsStemmingEnabled = ftsStemmingFromEnv()
+
+const ftsNormalizationPorterV1 = "porter-v1"
+
+// FTSNormalizationMode returns the stable identifier persisted beside each
+// repository's native symbol FTS corpus. The empty string is the historical
+// unnormalised mode, so stores created before the marker existed remain
+// compatible while stemming is disabled. A non-empty change requires the
+// indexer to rebuild the repository's symbol FTS before serving it.
+func FTSNormalizationMode() string {
+	if ftsStemmingEnabled {
+		return ftsNormalizationPorterV1
+	}
+	return ""
+}
 
 func ftsStemmingFromEnv() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("GORTEX_FTS_STEMMING"))) {
@@ -47,11 +62,11 @@ var ftsStopWords = map[string]struct{}{
 	"it": {}, "its": {}, "so": {}, "such": {}, "via": {}, "per": {},
 }
 
-// NormalizeFTSTokens applies the FR63 stopword filter and Porter stemmer
-// to a token list produced by Tokenize / TokenizeQuery. The index path
-// (BM25Backend.Add) and the query path (BM25Backend.Search) both
-// call it, so a stemmed
-// posting list is always probed with stemmed query terms.
+// NormalizeFTSTokens applies the stopword filter and Porter stemmer to
+// a token list produced by Tokenize / TokenizeQuery. Every producer of
+// FTS terms routes through it — both the tokens written into the index
+// and the tokens a query is lowered into — so a stemmed posting list is
+// always probed with stemmed query terms.
 //
 // Stopwords are dropped before stemming so a stemmed form can never
 // collide with a stopword entry. The result is a freshly allocated

@@ -26,7 +26,7 @@ func newBatchTransitionTestMulti(g graph.Store) *MultiIndexer {
 	if g == nil {
 		g = graph.New()
 	}
-	return NewMultiIndexer(g, parser.NewRegistry(), search.NewBM25(), nil, zap.NewNop())
+	return NewMultiIndexer(g, parser.NewRegistry(), search.NewNull(), nil, zap.NewNop())
 }
 
 func requireBatchTransitionBlocked(t *testing.T, done <-chan struct{}) {
@@ -51,7 +51,7 @@ func TestIndexAllWorkersDoNotReenterRegistryLock(t *testing.T) {
 		cm.Global().Repos = append(cm.Global().Repos, config.RepoEntry{Path: root, Name: name})
 	}
 
-	mi := NewMultiIndexer(g, reg, search.NewAuto(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	done := make(chan error, 1)
 	go func() {
 		_, err := mi.IndexAll()

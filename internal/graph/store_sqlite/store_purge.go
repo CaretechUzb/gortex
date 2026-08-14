@@ -35,6 +35,7 @@ import (
 var purgeSidecarTables = []string{
 	"file_mtimes",
 	"repo_index_state",
+	"symbol_fts_state",
 	"enrichment_state",
 	"contract_state",
 	"semantic_binding_types",
@@ -143,6 +144,7 @@ var orphanScanTables = []string{
 	"nodes",
 	"file_mtimes",
 	"repo_index_state",
+	"symbol_fts_state",
 	"enrichment_state",
 	"files",
 	"semantic_binding_types",
@@ -302,6 +304,17 @@ func (s *Store) RekeyRepoPrefix(oldPrefix, newPrefix string) error {
 		if n, rowsErr := res.RowsAffected(); rowsErr == nil && n > 0 {
 			changed = true
 		}
+	}
+	// The symbol FTS corpus above is dropped rather than relabeled because its
+	// node IDs change. Invalidate both possible markers in the same transaction:
+	// moving the old marker would falsely certify the now-empty destination,
+	// while retaining a prior destination marker would do the same after merge.
+	stateRes, err := tx.Exec(`DELETE FROM symbol_fts_state WHERE repo_prefix IN (?, ?)`, oldPrefix, newPrefix)
+	if err != nil {
+		return fmt.Errorf("store_sqlite: RekeyRepoPrefix invalidate symbol FTS normalization: %w", err)
+	}
+	if n, rowsErr := stateRes.RowsAffected(); rowsErr == nil && n > 0 {
+		changed = true
 	}
 	// Vectors are handled explicitly instead of joining rekeyDropTables because
 	// that shared list is also used by the historical v6→v7 migration, whose

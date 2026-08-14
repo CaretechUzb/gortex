@@ -2,11 +2,58 @@ package search
 
 import (
 	"context"
+	"slices"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// mapText is a map-backed text Backend for the hybrid fixtures. The
+// production text side is the store-native FTS, which lives behind a
+// graph.SymbolSearcher this package must not reach for; these tests
+// only need *a* text channel next to the vector one, so the double
+// keeps the corpus in a map and ranks by how many query tokens a
+// document's own tokens cover, ties broken by ID for determinism.
+type mapText struct{ docs map[string][]string }
+
+func newMapText() *mapText { return &mapText{docs: make(map[string][]string)} }
+
+func (m *mapText) Add(id string, fields ...string) {
+	m.docs[id] = Tokenize(strings.Join(fields, " "))
+}
+
+func (m *mapText) Remove(id string) { delete(m.docs, id) }
+func (m *mapText) Count() int       { return len(m.docs) }
+func (m *mapText) Close()           {}
+
+func (m *mapText) Search(query string, limit int) []SearchResult {
+	terms := TokenizeQuery(query)
+	var out []SearchResult
+	for id, tokens := range m.docs {
+		matched := 0
+		for _, tok := range tokens {
+			if slices.Contains(terms, tok) {
+				matched++
+			}
+		}
+		if matched > 0 {
+			out = append(out, SearchResult{ID: id, Score: float64(matched)})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Score != out[j].Score {
+			return out[i].Score > out[j].Score
+		}
+		return out[i].ID < out[j].ID
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
 
 // fixedEmbedder is a deterministic test embedding provider: every query
 // embeds to the same constant vector, so HybridBackend.Search exercises
@@ -54,7 +101,7 @@ func TestHybridSearch_DeChunksToParent(t *testing.T) {
 		"big.go::Big#chunk2": "big.go::Big",
 	})
 
-	text := NewBM25()
+	text := newMapText()
 	text.Add("big.go::Big", "Big", "big.go", "")
 	text.Add("small.go::Small", "Small", "small.go", "")
 
@@ -87,9 +134,8 @@ func TestHybridSearch_DeChunkPreservesOrder(t *testing.T) {
 		"b.go::B#chunk0": "b.go::B",
 	})
 
-	// Keep construction realistic; this assertion exercises the vector
-	// de-chunk order directly, before channel fusion.
-	h := NewHybrid(NewBM25(), vec, fixedEmbedder{dims: dims})
+	// Empty text backend so only the vector channel decides ordering.
+	h := NewHybrid(newMapText(), vec, fixedEmbedder{dims: dims})
 
 	got := h.dechunkVectorIDs(vec.Search([]float32{1, 0, 0}, 8), 8)
 	require.Len(t, got, 2)
@@ -106,7 +152,7 @@ func TestHybridSearch_NoChunkMapUnaffected(t *testing.T) {
 	vec.Add("b.go::B", []float32{0, 1, 0})
 	require.False(t, vec.HasChunks(), "no SetChunkMap → HasChunks must be false")
 
-	h := NewHybrid(NewBM25(), vec, fixedEmbedder{dims: dims})
+	h := NewHybrid(newMapText(), vec, fixedEmbedder{dims: dims})
 	results := h.Search("anything", 10)
 	for _, r := range results {
 		assert.NotContains(t, r.ID, "#chunk")

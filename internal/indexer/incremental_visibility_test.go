@@ -51,7 +51,7 @@ func newCSVisIndexer(t *testing.T, dir string) (graph.Store, *Indexer) {
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewCSharpExtractor())
 	idx := New(g, reg, config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.IndexCtx(testCtx(), dir)
 	require.NoError(t, err)

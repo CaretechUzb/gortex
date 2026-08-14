@@ -14,37 +14,15 @@ import (
 	"github.com/zzet/gortex/internal/search"
 )
 
-// BM25Ranker adapts a plain search.Backend to the Ranker shape. Works
-// for either a raw text backend — the in-process BM25 index the evals
-// build, or the store-native FTS adapter production wires up — or a
-// HybridBackend's text side extracted via HybridBackend.TextBackend().
-//
-// Note: Gortex's indexer tokenizes symbol names at ingest time
-// (Tokenize — camelCase-aware), but the query side (TokenizeQuery) does
-// NOT split camelCase — so `backend.Search("NewServer", ...)` matches
-// zero documents because the inverted index has `new` and `server`
-// separately. The user-facing MCP search_symbols path avoids this by
-// running through Engine.SearchSymbols, which adds a substring
-// fallback. Use EngineRanker (below) to measure that full call path;
-// use BM25Ranker only when you want the raw backend's behaviour.
-func BM25Ranker(name string, backend search.Backend) Ranker {
-	return Ranker{
-		Name: name,
-		Search: func(query string, limit int) []string {
-			hits := backend.Search(query, limit)
-			out := make([]string, len(hits))
-			for i, h := range hits {
-				out[i] = h.ID
-			}
-			return out
-		},
-	}
-}
-
 // EngineRanker measures what a real MCP caller sees via
-// Engine.SearchSymbols — text-backend results + camelCase-friendly
-// substring fallback. This is the recommended default for "bm25"-
-// style evaluation; it reflects production behaviour.
+// Engine.SearchSymbols — store-native FTS results plus the
+// camelCase-friendly substring fallback. It is the only lexical
+// adapter this package ships, and it backs the report's "bm25" row.
+//
+// The fallback is load-bearing: the indexer tokenizes symbol names at
+// ingest time (camelCase-aware), but the query side does not split
+// camelCase, so a raw backend query for "NewServer" matches nothing
+// while Engine.SearchSymbols still finds it.
 func EngineRanker(name string, searchFn func(query string, limit int) []string) Ranker {
 	return Ranker{Name: name, Search: searchFn}
 }
@@ -106,9 +84,9 @@ func SemanticRanker(name string, vector *search.VectorBackend, embedder embeddin
 	}
 }
 
-// RRFRanker adapts a HybridBackend (BM25 + vector fused via RRF) to the
-// Ranker shape. Uses Search() which runs both sides and fuses when the
-// vector backend has data — otherwise it degrades to BM25 gracefully.
+// RRFRanker preserves the historical eval row key while adapting the live
+// HybridBackend (native symbol FTS + vector with adaptive-alpha fusion) to the
+// Ranker shape. Callers install it only when the vector backend has data.
 func RRFRanker(name string, hybrid *search.HybridBackend) Ranker {
 	return Ranker{
 		Name: name,

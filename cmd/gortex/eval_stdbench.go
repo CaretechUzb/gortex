@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/zzet/gortex/internal/eval/stdbench"
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/search"
 )
 
@@ -22,8 +23,9 @@ var (
 var evalStdbenchCmd = &cobra.Command{
 	Use:   "stdbench",
 	Short: "Run a standardized retrieval benchmark (CoIR / SWE-ContextBench / ContextBench)",
-	Long: `Runs Gortex's BM25 text retrieval against a standardized code-retrieval
-benchmark and reports Recall@K, Precision@K, NDCG@10, and MRR.
+	Long: `Runs Gortex's shipping text retrieval — the store-native symbol FTS
+search_symbols queries — against a standardized code-retrieval benchmark
+and reports Recall@K, Precision@K, NDCG@10, and MRR.
 
 Benchmarks (--bench):
   coir              CoIR (Code Information Retrieval, ACL 2025). --dataset is
@@ -84,22 +86,76 @@ func runEvalStdbench(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("benchmark %q carries no relevance judgements to score against", evalStdbenchBench)
 	}
 
-	// Index the corpus into Gortex's BM25 backend — the same text
-	// retrieval search_symbols runs — and rank doc IDs per query.
-	bm := search.NewBM25()
-	for _, d := range ds.Corpus {
-		bm.Add(d.ID, d.Text)
+	// Index the corpus into a throwaway SQLite store's native symbol FTS —
+	// the text retrieval search_symbols actually runs — and rank doc IDs
+	// per query. Note the corpus goes in through the store's FTS writer
+	// directly, never through search.Backend.Add: the shipping backend is
+	// an adapter over this same FTS whose Add is a no-op, so routing the
+	// corpus through it would index nothing and report a silent 0.0.
+	st, closeStore, err := newEvalStore("stdbench")
+	if err != nil {
+		return fmt.Errorf("opening the eval store: %w", err)
 	}
+	defer closeStore()
+
+	searcher, ok := st.(graph.SymbolSearcher)
+	if !ok {
+		return fmt.Errorf("the eval store does not expose native symbol search")
+	}
+	counter, ok := st.(graph.SymbolFTSCounter)
+	if !ok {
+		return fmt.Errorf("the eval store does not report its symbol FTS document count")
+	}
+
+	items := make([]graph.SymbolFTSItem, 0, len(ds.Corpus))
+	for _, d := range ds.Corpus {
+		// Mirrors the indexer's ftsTokensFor: the write side splits with
+		// search.Tokenize so the read side's query tokenisation lands on
+		// the same terms.
+		tokens := search.NormalizeFTSTokens(search.Tokenize(d.Text))
+		items = append(items, graph.SymbolFTSItem{
+			NodeID: d.ID,
+			Tokens: strings.Join(tokens, " "),
+		})
+	}
+	// One call, not a chunked loop: BulkUpsertSymbolFTS wipes the prefix
+	// before inserting, so a second call under the same prefix would erase
+	// the first. It bounds its own INSERT statements internally.
+	if err := searcher.BulkUpsertSymbolFTS("", items); err != nil {
+		return fmt.Errorf("indexing the %s corpus: %w", ds.Name, err)
+	}
+	if err := searcher.BuildSymbolIndex(); err != nil {
+		return fmt.Errorf("building the symbol index: %w", err)
+	}
+	indexed, err := counter.SymbolFTSCount()
+	if err != nil {
+		return fmt.Errorf("counting the indexed corpus: %w", err)
+	}
+	if indexed != len(ds.Corpus) {
+		return fmt.Errorf("indexed %d of %d corpus documents — scoring a partial corpus "+
+			"would report a retrieval number no user can reproduce", indexed, len(ds.Corpus))
+	}
+
+	var retrieveErr error
 	retrieve := func(query string, k int) []string {
-		hits := bm.Search(query, k)
+		hits, err := searcher.SearchSymbols(query, k)
+		if err != nil {
+			if retrieveErr == nil {
+				retrieveErr = err
+			}
+			return nil
+		}
 		ids := make([]string, 0, len(hits))
 		for _, h := range hits {
-			ids = append(ids, h.ID)
+			ids = append(ids, h.NodeID)
 		}
 		return ids
 	}
 
 	metrics := stdbench.Evaluate(ds, retrieve, nil)
+	if retrieveErr != nil {
+		return fmt.Errorf("searching the corpus: %w", retrieveErr)
+	}
 
 	var rendered string
 	if strings.EqualFold(evalStdbenchFormat, "json") {
