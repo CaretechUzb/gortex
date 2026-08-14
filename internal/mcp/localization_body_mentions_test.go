@@ -48,7 +48,7 @@ func TestPromoteLocalizationBodyMentionsUsesRealPageDeclarations(t *testing.T) {
 	digest := newLocalizationEvidenceDigestForTask("fix sibling and External", envelope)
 
 	packed, packedDigest := promoteLocalizationBodyMentions(
-		"fix sibling and External", envelope, newLocalizationFileDeclarationCache(reader), 1<<20, digest,
+		"fix sibling and External", envelope, newLocalizationDeclarationTestCache(reader), 1<<20, digest,
 	)
 
 	require.Equal(t, []string{sibling.ID, external.ID}, []string{packed.Evidence[2].ID, packed.Evidence[3].ID})
@@ -92,7 +92,7 @@ func TestPromoteLocalizationBodyMentionsIsCappedAndCached(t *testing.T) {
 	}
 
 	packed, _ := promoteLocalizationBodyMentions(
-		"trace the calls", envelope, newLocalizationFileDeclarationCache(reader), 1<<20,
+		"trace the calls", envelope, newLocalizationDeclarationTestCache(reader), 1<<20,
 		newLocalizationEvidenceDigestForTask("trace the calls", envelope),
 	)
 
@@ -124,7 +124,7 @@ func TestPromoteLocalizationBodyMentionsUsesPackedSourceWindow(t *testing.T) {
 	}
 
 	packed, packedDigest := promoteLocalizationBodyMentions(
-		"find sibling", envelope, newLocalizationFileDeclarationCache(reader), 1<<20,
+		"find sibling", envelope, newLocalizationDeclarationTestCache(reader), 1<<20,
 		newLocalizationEvidenceDigestForTask("find sibling", envelope),
 	)
 
@@ -161,13 +161,15 @@ func TestPromoteLocalizationBodyMentionsBoundsDeclarationsPerFile(t *testing.T) 
 	}
 
 	packed, _ := promoteLocalizationBodyMentions(
-		"find Inside and Outside", envelope, newLocalizationFileDeclarationCache(reader), 1<<20,
+		"find Inside and Outside", envelope, newLocalizationDeclarationTestCache(reader), 1<<20,
 		newLocalizationEvidenceDigestForTask("find Inside and Outside", envelope),
 	)
 
 	require.Contains(t, packed.Symbols, inside.ID)
 	require.NotContains(t, packed.Symbols, outside.ID)
 	require.Equal(t, 1, reader.fileCalls["src/generated.go"])
+	require.Len(t, reader.calls, 1)
+	require.Equal(t, localizationBodyMentionDeclarationCap, reader.calls[0].limit)
 }
 
 func TestPromoteLocalizationBodyMentionsHonorsEnvelopeBudget(t *testing.T) {
@@ -190,11 +192,42 @@ func TestPromoteLocalizationBodyMentionsHonorsEnvelopeBudget(t *testing.T) {
 	digest := newLocalizationEvidenceDigestForTask("find sibling", envelope)
 
 	packed, packedDigest := promoteLocalizationBodyMentions(
-		"find sibling", envelope, newLocalizationFileDeclarationCache(reader), len(body), digest,
+		"find sibling", envelope, newLocalizationDeclarationTestCache(reader), len(body), digest,
 	)
 
 	require.Equal(t, envelope, packed)
 	require.Same(t, digest, packedDigest)
+}
+
+func TestPromoteLocalizationBodyMentionsBoundsTheTenFileProjection(t *testing.T) {
+	reader := &localizationDeclarationSpyReader{files: make(map[string][]*graph.Node)}
+	envelope := localizationExploreEnvelope{Completion: newLocalizationCompletion(true, "")}
+	for index := 0; index < localizationBodyMentionFileCap; index++ {
+		file := fmt.Sprintf("src/file-%02d.go", index)
+		ownerID := file + "::owner"
+		reader.files[file] = []*graph.Node{
+			localizationBodyMentionTestNode(file, "Mentioned", index+2),
+		}
+		envelope.Files = append(envelope.Files, file)
+		envelope.Symbols = append(envelope.Symbols, ownerID)
+		envelope.Evidence = append(envelope.Evidence, localizationEvidence{
+			Rank: index + 1, ID: ownerID, Name: "owner", Kind: string(graph.KindFunction),
+			File: file, Line: 1, Source: "func owner() { Mentioned() }",
+		})
+	}
+
+	promoteLocalizationBodyMentions(
+		"find Mentioned", envelope, newLocalizationDeclarationTestCache(reader), 1<<20,
+		newLocalizationEvidenceDigestForTask("find Mentioned", envelope),
+	)
+
+	require.Len(t, reader.calls, localizationBodyMentionFileCap)
+	consumed := 0
+	for _, call := range reader.calls {
+		require.LessOrEqual(t, call.limit, localizationBodyMentionDeclarationCap)
+		consumed += call.limit
+	}
+	require.LessOrEqual(t, consumed, localizationFileRequestLimit)
 }
 
 func TestLocalizationDigestReservesBodyMentionTail(t *testing.T) {

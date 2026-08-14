@@ -283,6 +283,48 @@ func TestFindFileNodesBoundedFindsProductionRowsBehindTests(t *testing.T) {
 	}
 }
 
+func TestFindFileNodesBoundedFindsDefinitionsBehindExcludedKinds(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	const filePath = "repo/generated.go"
+	nodes := make([]*graph.Node, 0, 310)
+	for index := 0; index < 300; index++ {
+		nodes = append(nodes, &graph.Node{
+			ID: fmt.Sprintf("repo/generated.go::a-param-%03d", index), Name: "arg",
+			Kind: graph.KindParam, FilePath: filePath,
+		})
+	}
+	for index := 0; index < 10; index++ {
+		nodes = append(nodes, &graph.Node{
+			ID: fmt.Sprintf("repo/generated.go::z-function-%03d", index), Name: "function",
+			Kind: graph.KindFunction, FilePath: filePath,
+		})
+	}
+	store.BeginBulkLoad()
+	store.AddBatch(nodes, nil)
+	store.FlushBulk()
+
+	page, err := store.FindFileNodesBounded(
+		context.Background(), filePath,
+		graph.LocalizationNodeScope{ExcludeKinds: map[graph.NodeKind]bool{graph.KindParam: true}}, 8,
+	)
+	if err != nil {
+		t.Fatalf("bounded file lookup: %v", err)
+	}
+	if page.Total != 9 || !page.Truncated || len(page.Nodes) != 8 {
+		t.Fatalf("page = %#v, want definition sentinel behind excluded params", page)
+	}
+	for _, node := range page.Nodes {
+		if node.Kind != graph.KindFunction {
+			t.Fatalf("excluded kind consumed the cap: %#v", node)
+		}
+	}
+}
+
 func TestFindFileNodesBoundedDoesNotTransferMetadataWhenTestsIncluded(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	if err != nil {
@@ -326,8 +368,9 @@ func TestFindFileNodesBoundedPlanUsesFileIndexWithoutSorter(t *testing.T) {
 
 	predicate, args := localizationFileNodePredicate("repo/file.go", graph.LocalizationNodeScope{
 		WorkspaceID: "workspace", ProjectID: "project",
-		RepoAllow: map[string]bool{"repo": true},
-		Kinds:     map[graph.NodeKind]bool{graph.KindFunction: true, graph.KindMethod: true},
+		RepoAllow:    map[string]bool{"repo": true},
+		Kinds:        map[graph.NodeKind]bool{graph.KindFunction: true, graph.KindMethod: true},
+		ExcludeKinds: map[graph.NodeKind]bool{graph.KindParam: true, graph.KindLocal: true},
 	})
 	args = append(args, "", 257)
 	rows, err := store.db.Query(

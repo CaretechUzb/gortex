@@ -1131,6 +1131,33 @@ func TestOutlineTermFormsMatchConservativeInflections(t *testing.T) {
 	}
 }
 
+func TestTruncatedOutlineCarriesAnExplicitLowerBound(t *testing.T) {
+	declarations := outlineDeclaredFile(2)
+	outline := newLocalizationFileOutlineForDeclarations(
+		outlineLeadingFile,
+		localizationFileDeclarations{
+			Nodes: declarations, Declared: len(declarations) + 1,
+			DeclaredKnown: false, Truncated: true,
+		},
+		nil, localizationOutlineCompleteRows,
+	)
+	if outline == nil || !outline.Truncated || outline.Declared != 3 || outline.Elided != 1 {
+		t.Fatalf("truncated outline = %#v, want lower bound 3 with at least one elided", outline)
+	}
+	if !localizationOutlineAddsUnrankedDeclaration(
+		outline, []exploreTarget{{node: declarations[0]}, {node: declarations[1]}},
+	) {
+		t.Fatal("a saturated outline was treated as completely covered by ranked rows")
+	}
+	body, err := json.Marshal(outline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"truncated":true`) {
+		t.Fatalf("truncation lower bound is absent from JSON: %s", body)
+	}
+}
+
 func TestOutlinePrivateIdentityDoesNotSerialize(t *testing.T) {
 	outline := newLocalizationFileOutline(outlineLeadingFile, outlineDeclaredFile(2))
 	body, err := json.Marshal(outline)

@@ -260,6 +260,39 @@ func TestFindFileNodesBoundedFiltersTestsBeforeCap(t *testing.T) {
 	}
 }
 
+func TestFindFileNodesBoundedExcludesKindsBeforeCap(t *testing.T) {
+	graph := New()
+	const filePath = "repo/generated.go"
+	for index := 0; index < 32; index++ {
+		graph.AddNode(&Node{
+			ID: fmt.Sprintf("repo/generated.go::a-param-%03d", index), Name: "arg",
+			Kind: KindParam, FilePath: filePath,
+		})
+	}
+	for index := 0; index < 10; index++ {
+		graph.AddNode(&Node{
+			ID: fmt.Sprintf("repo/generated.go::z-function-%03d", index), Name: "function",
+			Kind: KindFunction, FilePath: filePath,
+		})
+	}
+
+	page, err := graph.FindFileNodesBounded(
+		context.Background(), filePath,
+		LocalizationNodeScope{ExcludeKinds: map[NodeKind]bool{KindParam: true}}, 8,
+	)
+	if err != nil {
+		t.Fatalf("bounded file lookup: %v", err)
+	}
+	if page.Total != 9 || !page.Truncated || len(page.Nodes) != 8 {
+		t.Fatalf("page = %#v, want definition sentinel behind excluded params", page)
+	}
+	for _, node := range page.Nodes {
+		if node.Kind != KindFunction {
+			t.Fatalf("excluded kind consumed the cap: %#v", node)
+		}
+	}
+}
+
 func TestOverlaidViewFindFileNodesBoundedReplacesAndTombstones(t *testing.T) {
 	base := New()
 	const filePath = "repo/handler.go"
@@ -276,7 +309,7 @@ func TestOverlaidViewFindFileNodesBoundedReplacesAndTombstones(t *testing.T) {
 
 	page, err := view.FindFileNodesBounded(
 		context.Background(), filePath,
-		LocalizationNodeScope{Kinds: map[NodeKind]bool{KindFunction: true}}, 8,
+		LocalizationNodeScope{ExcludeKinds: map[NodeKind]bool{KindVariable: true}}, 8,
 	)
 	if err != nil {
 		t.Fatalf("bounded overlay file lookup: %v", err)

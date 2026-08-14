@@ -243,6 +243,21 @@ func localizationScopePredicate(scope graph.LocalizationNodeScope) ([]string, []
 			}
 		}
 	}
+	if len(scope.ExcludeKinds) > 0 {
+		kinds := make([]string, 0, len(scope.ExcludeKinds))
+		for kind, excluded := range scope.ExcludeKinds {
+			if excluded {
+				kinds = append(kinds, string(kind))
+			}
+		}
+		sort.Strings(kinds)
+		if len(kinds) > 0 {
+			clauses = append(clauses, `kind NOT IN (`+inPlaceholders(len(kinds))+`)`)
+			for _, kind := range kinds {
+				args = append(args, kind)
+			}
+		}
+	}
 	if scope.WorkspaceID != "" {
 		clauses = append(clauses, `COALESCE(NULLIF(workspace_id, ''), repo_prefix) = ?`)
 		args = append(args, scope.WorkspaceID)

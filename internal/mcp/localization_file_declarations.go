@@ -1,15 +1,16 @@
 package mcp
 
 import (
+	"context"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
 
 // localizationFileDeclarations carries a bounded declaration page together with
-// the count observed while scanning the file. DeclaredKnown distinguishes a
-// complete count from fallback evidence, while Truncated says Nodes intentionally
-// retains only a prefix of that known declaration set.
+// the count observed while scanning the file. DeclaredKnown distinguishes an
+// exact count from a saturation lower bound. Truncated means Nodes is only a
+// prefix and Declared is therefore an "at least" count.
 type localizationFileDeclarations struct {
 	Nodes         []*graph.Node
 	Declared      int
@@ -17,31 +18,71 @@ type localizationFileDeclarations struct {
 	Truncated     bool
 }
 
-// localizationFileDeclarationCache enumerates declarations through the
-// node-only Reader path and remembers both hits and misses for one localization
-// request. Outlines never need file adjacency, so decoding edges here is pure
-// overhead and can multiply across the page's distinct files.
+var localizationDeclarationExcludedKinds = []graph.NodeKind{
+	graph.KindFile, graph.KindImport, graph.KindLocal, graph.KindParam,
+	graph.KindClosure, graph.KindGenericParam, graph.KindBuiltin,
+}
+
+// localizationFileDeclarationCache keeps one request's bounded lightweight
+// declaration pages. It deliberately depends on BoundedFileNodeReader: a store
+// without that capability fails closed instead of falling back to full-row
+// GetFileNodes decoding.
 type localizationFileDeclarationCache struct {
+	ctx             context.Context
 	reader          graph.Reader
+	bounded         graph.BoundedFileNodeReader
+	scope           graph.LocalizationNodeScope
+	budget          *localizationFileRequestBudget
 	byFile          map[string]localizationFileDeclarations
 	definitionLimit int
 }
 
-func newLocalizationFileDeclarationCache(reader graph.Reader) *localizationFileDeclarationCache {
-	return newBoundedLocalizationFileDeclarationCache(reader, 0)
+func newLocalizationFileDeclarationCache(
+	ctx context.Context,
+	reader graph.Reader,
+	scope graph.LocalizationNodeScope,
+) *localizationFileDeclarationCache {
+	return newBoundedLocalizationFileDeclarationCache(ctx, reader, scope, localizationFileNodeLimit)
 }
 
-func newBoundedLocalizationFileDeclarationCache(reader graph.Reader, definitionLimit int) *localizationFileDeclarationCache {
-	return &localizationFileDeclarationCache{
-		reader:          reader,
-		byFile:          make(map[string]localizationFileDeclarations),
-		definitionLimit: max(definitionLimit, 0),
+func newBoundedLocalizationFileDeclarationCache(
+	ctx context.Context,
+	reader graph.Reader,
+	scope graph.LocalizationNodeScope,
+	definitionLimit int,
+) *localizationFileDeclarationCache {
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	bounded, _ := reader.(graph.BoundedFileNodeReader)
+	return &localizationFileDeclarationCache{
+		ctx:             ctx,
+		reader:          reader,
+		bounded:         bounded,
+		scope:           localizationDeclarationScope(scope),
+		budget:          localizationFileBudgetFor(ctx),
+		byFile:          make(map[string]localizationFileDeclarations),
+		definitionLimit: min(max(definitionLimit, 0), localizationFileNodeLimit),
+	}
+}
+
+func localizationDeclarationScope(scope graph.LocalizationNodeScope) graph.LocalizationNodeScope {
+	excluded := make(map[graph.NodeKind]bool, len(scope.ExcludeKinds)+len(localizationDeclarationExcludedKinds))
+	for kind, omit := range scope.ExcludeKinds {
+		if omit {
+			excluded[kind] = true
+		}
+	}
+	for _, kind := range localizationDeclarationExcludedKinds {
+		excluded[kind] = true
+	}
+	scope.ExcludeKinds = excluded
+	return scope
 }
 
 func (cache *localizationFileDeclarationCache) definitions(file string) localizationFileDeclarations {
 	file = strings.TrimSpace(file)
-	if cache == nil || cache.reader == nil || file == "" {
+	if cache == nil || file == "" {
 		return localizationFileDeclarations{}
 	}
 	if declarations, cached := cache.byFile[file]; cached {
@@ -52,13 +93,13 @@ func (cache *localizationFileDeclarationCache) definitions(file string) localiza
 	return declarations
 }
 
-// boundedDefinitions avoids retaining a generated file's entire declaration
-// set for callers that need only bounded supporting evidence. A cached outline
-// page can be sliced safely; an uncached file is filtered into a short-lived
-// bounded slice and deliberately does not poison the outline cache.
+// boundedDefinitions avoids retaining a generated file's whole declaration set
+// for supporting body evidence. A cached outline page can be sliced safely; an
+// uncached file gets its own bounded projection and does not poison the outline
+// cache with a shallower page.
 func (cache *localizationFileDeclarationCache) boundedDefinitions(file string, limit int) []*graph.Node {
 	file = strings.TrimSpace(file)
-	if cache == nil || cache.reader == nil || file == "" || limit <= 0 {
+	if cache == nil || file == "" || limit <= 0 {
 		return nil
 	}
 	if declarations, cached := cache.byFile[file]; cached {
@@ -68,26 +109,39 @@ func (cache *localizationFileDeclarationCache) boundedDefinitions(file string, l
 }
 
 func (cache *localizationFileDeclarationCache) readDefinitions(file string, limit int) localizationFileDeclarations {
-	nodes := cache.reader.GetFileNodes(file)
-	capacity := len(nodes)
-	if limit > 0 {
-		capacity = min(capacity, limit)
+	incomplete := localizationFileDeclarations{Truncated: true}
+	if cache == nil || cache.bounded == nil || cache.ctx == nil || cache.ctx.Err() != nil || file == "" {
+		return incomplete
 	}
-	definitions := make([]*graph.Node, 0, capacity)
-	declared := 0
-	for _, node := range nodes {
-		if node == nil || isNonDefinitionNode(node.Kind) {
-			continue
-		}
-		declared++
-		if limit <= 0 || len(definitions) < limit {
-			definitions = append(definitions, node)
-		}
+	if limit <= 0 || limit > localizationFileNodeLimit {
+		limit = localizationFileNodeLimit
+	}
+	reserved := cache.budget.reserve(limit)
+	if reserved <= 0 {
+		return incomplete
+	}
+	page, err := cache.bounded.FindFileNodesBounded(cache.ctx, file, cache.scope, reserved)
+	if err != nil || cache.ctx.Err() != nil {
+		// The amount inspected is uncertain, so the reservation remains charged.
+		return incomplete
+	}
+	consumed := max(page.Total, len(page.Nodes))
+	cache.budget.finish(reserved, consumed)
+
+	nodes := page.Nodes
+	truncated := page.Truncated
+	if len(nodes) > reserved {
+		nodes = nodes[:reserved]
+		truncated = true
+	}
+	declared := max(page.Total, len(nodes))
+	if truncated {
+		declared = max(declared, len(nodes)+1)
 	}
 	return localizationFileDeclarations{
-		Nodes:         definitions,
+		Nodes:         nodes,
 		Declared:      declared,
-		DeclaredKnown: true,
-		Truncated:     declared > len(definitions),
+		DeclaredKnown: !truncated,
+		Truncated:     truncated,
 	}
 }

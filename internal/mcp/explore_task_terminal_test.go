@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -146,12 +147,19 @@ func TestExploreTaskOutlineProviderUsesSelectedReader(t *testing.T) {
 		files:     map[string][]*graph.Node{"retry.go": {targets[0].node}},
 		fileCalls: make(map[string]int),
 	}
-	provider := newExploreTaskPageOutlineProvider(selected, "retry policy")
+	provider := newExploreTaskPageOutlineProvider(
+		context.Background(), selected, "retry policy",
+		graph.LocalizationNodeScope{RepoAllow: map[string]bool{"repo": true}},
+	)
 	if provider == nil || provider(targets) == nil {
 		t.Fatal("selected reader did not produce an outline")
 	}
 	if selected.fileCalls["retry.go"] != 1 {
 		t.Fatalf("selected reader called %d times, want 1", selected.fileCalls["retry.go"])
+	}
+	if len(selected.calls) != 1 || !selected.calls[0].scope.RepoAllow["repo"] ||
+		!selected.calls[0].scope.ExcludeKinds[graph.KindParam] {
+		t.Fatalf("selected reader scope = %#v, want request scope plus declaration exclusions", selected.calls)
 	}
 }
 
@@ -175,23 +183,29 @@ func TestExploreTaskOutlineProviderPreservesBoundedDeclarationCounts(t *testing.
 		files:     map[string][]*graph.Node{file: nodes},
 		fileCalls: make(map[string]int),
 	}
-	provider := newExploreTaskPageOutlineProvider(selected, "generated declarations")
+	provider := newExploreTaskPageOutlineProvider(
+		context.Background(), selected, "generated declarations", graph.LocalizationNodeScope{},
+	)
 	page := provider([]exploreTarget{{node: nodes[0]}})
 
 	if page == nil || page.Leading == nil {
 		t.Fatal("task provider did not produce a leading outline")
 	}
-	if page.Leading.Declared != declared {
-		t.Fatalf("declared = %d, want %d", page.Leading.Declared, declared)
+	if page.Leading.Declared != exploreTaskDeclarationRetentionLimit+1 || !page.Leading.Truncated {
+		t.Fatalf("outline count = %#v, want saturated lower bound %d", page.Leading, exploreTaskDeclarationRetentionLimit+1)
 	}
-	if page.Leading.Elided != declared-exploreTaskDeclarationRetentionLimit {
-		t.Fatalf("elided = %d, want %d", page.Leading.Elided, declared-exploreTaskDeclarationRetentionLimit)
+	if page.Leading.Elided != 1 {
+		t.Fatalf("elided lower bound = %d, want 1", page.Leading.Elided)
 	}
 	if len(page.Leading.Rows) != exploreTaskDeclarationRetentionLimit {
 		t.Fatalf("rows = %d, want %d", len(page.Leading.Rows), exploreTaskDeclarationRetentionLimit)
 	}
 	if selected.fileCalls[file] != 1 {
 		t.Fatalf("selected reader called %d times, want 1", selected.fileCalls[file])
+	}
+	rendered := formatExploreTaskOutlines(page)
+	if !strings.Contains(rendered, "at least 129 declaration(s), at least 1 elided") {
+		t.Fatalf("truncated task outline presented an exact count:\n%s", rendered)
 	}
 }
 

@@ -3039,11 +3039,14 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// structured responses can reserve a source body without a broad read.
 	targets = s.materializeExploreStructuralSource(ctx, task, targets, opts)
 
+	declarationScope := s.localizationNodeScopeWithTests(ctx, opts, false)
 	if !localize {
-		outlineProvider := newExploreTaskPageOutlineProvider(eng.Reader(), task)
+		outlineProvider := newExploreTaskPageOutlineProvider(
+			ctx, eng.Reader(), task, declarationScope,
+		)
 		return mcp.NewToolResultText(s.renderExploreTask(task, targets, budget, outlineProvider)), nil
 	}
-	declarations := newLocalizationFileDeclarationCache(eng.Reader())
+	declarations := newLocalizationFileDeclarationCache(ctx, eng.Reader(), declarationScope)
 	symbolTargets = targets[len(artifactTargets):]
 	// An implementation-intent query expands abstract seeds into their
 	// concrete implementors before terminality is judged, so the envelope

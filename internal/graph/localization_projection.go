@@ -16,6 +16,10 @@ type LocalizationNodeScope struct {
 	// Kinds is an optional declaration-kind pushdown. It keeps homonym counts
 	// meaningful for a caller that can only localize selected node classes.
 	Kinds map[NodeKind]bool
+	// ExcludeKinds is the complementary pushdown for open-ended declaration
+	// sets. It lets callers exclude structural/body-internal kinds without a
+	// brittle allow-list that would hide future definition kinds.
+	ExcludeKinds map[NodeKind]bool
 	// ExcludeTests preserves localization's production-anchor gate. SQLite
 	// evaluates the legacy is_test metadata while keyset-paging bounded rows.
 	ExcludeTests bool
@@ -34,6 +38,9 @@ func (s LocalizationNodeScope) Allows(n *Node) bool {
 		return false
 	}
 	if len(s.Kinds) > 0 && !s.Kinds[n.Kind] {
+		return false
+	}
+	if s.ExcludeKinds[n.Kind] {
 		return false
 	}
 	if s.ExcludeTests {

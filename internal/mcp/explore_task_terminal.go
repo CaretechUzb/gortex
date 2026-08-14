@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -22,13 +23,20 @@ type exploreTaskOutlineProvider func([]exploreTarget) *localizationPageOutline
 // used by localize pages. It captures the reader selected for this request, so
 // session overlays cannot fall back to the server's base engine. Enumeration is
 // deferred until the renderer proves a useful outline can fit.
-func newExploreTaskPageOutlineProvider(reader graph.Reader, task string) exploreTaskOutlineProvider {
+func newExploreTaskPageOutlineProvider(
+	ctx context.Context,
+	reader graph.Reader,
+	task string,
+	scope graph.LocalizationNodeScope,
+) exploreTaskOutlineProvider {
 	if reader == nil {
 		return nil
 	}
 	terms := exploreTerminalTerms(task)
 	return func(targets []exploreTarget) *localizationPageOutline {
-		declarations := newBoundedLocalizationFileDeclarationCache(reader, exploreTaskDeclarationRetentionLimit)
+		declarations := newBoundedLocalizationFileDeclarationCache(
+			ctx, reader, scope, exploreTaskDeclarationRetentionLimit,
+		)
 		provider := localizationPageOutlineProvider(nil, targets, terms, declarations.definitions)
 		if provider == nil {
 			return nil
@@ -155,9 +163,17 @@ func formatExploreTaskOutlines(page *localizationPageOutline) string {
 		if outline == nil {
 			return
 		}
-		fmt.Fprintf(&b, "\n### %s — %d declaration(s)", outline.File, outline.Declared)
+		if outline.Truncated {
+			fmt.Fprintf(&b, "\n### %s — at least %d declaration(s)", outline.File, outline.Declared)
+		} else {
+			fmt.Fprintf(&b, "\n### %s — %d declaration(s)", outline.File, outline.Declared)
+		}
 		if outline.Elided > 0 {
-			fmt.Fprintf(&b, ", %d elided", outline.Elided)
+			if outline.Truncated {
+				fmt.Fprintf(&b, ", at least %d elided", outline.Elided)
+			} else {
+				fmt.Fprintf(&b, ", %d elided", outline.Elided)
+			}
 		}
 		b.WriteByte('\n')
 		for _, row := range outline.Rows {
