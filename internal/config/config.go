@@ -162,20 +162,6 @@ func (a ArchitectureConfig) IsEmpty() bool {
 	return len(a.Layers) == 0 && len(a.Rules) == 0
 }
 
-// MultiRepoConfig holds workspace-discovery settings used by the
-// multi-repo bootstrapper. Carries the (formerly `workspace.auto_detect`)
-// flag — moved out from under `workspace:` because that key is now
-// reclaimed for the workspace-identity slug.
-type MultiRepoConfig struct {
-	// AutoDetect — when true, tracking a parent directory walks its
-	// immediate subdirectories looking for `.git/`, treating each
-	// match as a tracked repo. The legacy YAML key
-	// `workspace.auto_detect: true` is still accepted by the custom
-	// Config unmarshaller for one release; the canonical key going
-	// forward is `multi.auto_detect`.
-	AutoDetect bool `mapstructure:"auto_detect" yaml:"auto_detect,omitempty"`
-}
-
 // ProjectGlob declares a project's path-globs inside a monorepo.
 //
 //	projects:
@@ -510,9 +496,8 @@ type Config struct {
 	Artifacts []ArtifactEntry `mapstructure:"artifacts" yaml:"artifacts,omitempty"`
 	// Queries are named, reusable detector bundles runnable via
 	// `analyze kind=named`.
-	Queries  []NamedQuery    `mapstructure:"queries" yaml:"queries,omitempty"`
-	Multi    MultiRepoConfig `mapstructure:"multi"    yaml:"multi,omitempty"`
-	Semantic SemanticConfig  `mapstructure:"semantic" yaml:"semantic,omitempty"`
+	Queries  []NamedQuery   `mapstructure:"queries" yaml:"queries,omitempty"`
+	Semantic SemanticConfig `mapstructure:"semantic" yaml:"semantic,omitempty"`
 	// LLM configures the LLM service that backs the `ask` MCP tool and
 	// the search-assist passes. Empty by default — daemon skips LLM
 	// wiring entirely when the active provider has no model configured.
@@ -1803,9 +1788,6 @@ func Default() *Config {
 				Mode:   "defer",
 			},
 		},
-		Multi: MultiRepoConfig{
-			AutoDetect: false,
-		},
 		Semantic: SemanticConfig{
 			Enabled:         true,
 			TimeoutSeconds:  120,
@@ -1819,13 +1801,6 @@ func Default() *Config {
 
 // Load reads config from file, environment, and returns a merged Config.
 // configPath may be empty; in that case only default locations are searched.
-//
-// Legacy-shape handling: previously the `workspace:` key held a struct
-// (`workspace: { auto_detect: true }`). The new schema
-// reclaims `workspace:` as a scalar slug. Existing configs are migrated
-// in place — `workspace.auto_detect` lifts into `multi.auto_detect`,
-// and the loader emits a one-line deprecation note via the returned
-// error chain (callers can choose whether to surface or swallow it).
 func Load(configPath string) (*Config, error) {
 	v := viper.New()
 	v.SetConfigName(".gortex")
@@ -1851,13 +1826,6 @@ func Load(configPath string) (*Config, error) {
 		// No config file found — use defaults + env.
 	}
 
-	// Migrate legacy `workspace:` mapping shape (held a struct with
-	// `auto_detect`) into the new `multi:` block so the v.Unmarshal
-	// below decodes the new schema cleanly. We do the migration on the
-	// viper key map so env-var overrides and viper's own merge logic
-	// stay consistent.
-	migrateLegacyWorkspaceKey(v)
-
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, err
 	}
@@ -1871,50 +1839,6 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	return cfg, nil
-}
-
-// migrateLegacyWorkspaceKey rewrites `workspace.auto_detect` → `multi.auto_detect`
-// in the viper key store before unmarshal, so a `.gortex.yaml` written
-// against the legacy schema still produces a working Config without the
-// caller seeing a parse error. The migration is silent — there's no
-// global logger here — but the audit step (`gortex audit_agent_config`,
-// reserved for a follow-up) can flag the deprecated key.
-//
-// Only the documented legacy field is migrated. Any other map under
-// `workspace:` is rejected by `validateWorkspaceSchema` so unknown
-// shapes don't get silently ignored.
-func migrateLegacyWorkspaceKey(v *viper.Viper) {
-	raw := v.Get("workspace")
-	if raw == nil {
-		return
-	}
-	switch t := raw.(type) {
-	case string:
-		// Already in new shape; nothing to do.
-	case map[string]interface{}:
-		if ad, ok := t["auto_detect"]; ok {
-			// Move to the new home unless `multi.auto_detect`
-			// is already set explicitly (caller wins).
-			if v.Get("multi.auto_detect") == nil {
-				v.Set("multi.auto_detect", ad)
-			}
-		}
-		// The old shape never carried a workspace identity slug,
-		// so we clear the polymorphic key so v.Unmarshal doesn't
-		// fail trying to coerce a map into a string.
-		v.Set("workspace", "")
-	case map[interface{}]interface{}:
-		// yaml.v2 / older path — same semantics.
-		if ad, ok := t["auto_detect"]; ok {
-			if v.Get("multi.auto_detect") == nil {
-				v.Set("multi.auto_detect", ad)
-			}
-		}
-		v.Set("workspace", "")
-	default:
-		// Unrecognised shape; downstream coercion will surface
-		// a precise error rather than us silently dropping it.
-	}
 }
 
 // validateWorkspaceSchema enforces the defaults / boundaries that

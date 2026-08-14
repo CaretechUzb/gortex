@@ -249,4 +249,3 @@ Scoped tool responses carry a `scope_applied` meta field plus a one-line widen h
 - **Cross-repo edges** — the resolver links symbols across repo boundaries with same-repo preference. Cross-repo edges carry a `cross_repo: true` flag.
 - **Impact analysis** — `explain_change_impact`, `verify_change`, and `get_test_targets` follow cross-repo edges automatically, grouping results by repository.
 - **Shared repos** — the same repo can appear in multiple projects with different reference tags. It's indexed once and shared across projects.
-- **Auto-detection** — set `workspace.auto_detect: true` in `.gortex.yaml` to auto-discover Git repos in a parent directory.
