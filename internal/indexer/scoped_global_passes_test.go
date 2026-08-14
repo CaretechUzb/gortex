@@ -111,7 +111,7 @@ func TestCloneRepoNodes_ScopedNeverMaterialisesOtherRepo(t *testing.T) {
 	cs := newIdxCountingStore(twoRepoFuncGraph())
 
 	// Detect for repoA: finalise + detect both walk cloneRepoNodes(repoA).
-	detectClonesAndEmitEdgesCtx(context.Background(), cs, "repoA", 0.8)
+	detectClonesAndEmitEdgesWithBaselineCtx(context.Background(), cs, "repoA", 0.8)
 	// Incremental index rebuild for repoA reseeds from the same repo's nodes.
 	ci := newIncrementalCloneIndex()
 	ci.Rebuild(cs, "repoA")
@@ -131,7 +131,7 @@ func TestCloneRepoNodes_ScopedNeverMaterialisesOtherRepo(t *testing.T) {
 // single-repo/shadow regime does not regress to a graph-wide snapshot.
 func TestCloneRepoNodes_EmptyPrefixUsesExactRepoProjection(t *testing.T) {
 	cs := newIdxCountingStore(twoRepoFuncGraph())
-	detectClonesAndEmitEdgesCtx(context.Background(), cs, "", 0.8)
+	detectClonesAndEmitEdgesWithBaselineCtx(context.Background(), cs, "", 0.8)
 	if cs.allNodes != 0 {
 		t.Errorf("empty-prefix clone detect must not call AllNodes(); got %d calls", cs.allNodes)
 	}

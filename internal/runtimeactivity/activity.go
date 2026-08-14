@@ -40,9 +40,6 @@ type Tracker struct {
 
 	kindsMu sync.Mutex
 	byKind  map[string]int64
-
-	hooksMu sync.RWMutex
-	hooks   []func(string)
 }
 
 // NewTracker returns an independent tracker. Most production code uses the
@@ -82,10 +79,8 @@ func (t *Tracker) End(kind string) {
 	}
 	kind = normalizeKind(kind)
 	t.gate.RLock()
-	remaining := t.active.Add(-1)
-	if remaining < 0 {
+	if t.active.Add(-1) < 0 {
 		t.active.Store(0)
-		remaining = 0
 	}
 	t.epoch.Add(1)
 	t.lastNano.Store(time.Now().UnixNano())
@@ -97,10 +92,6 @@ func (t *Tracker) End(kind string) {
 	}
 	t.kindsMu.Unlock()
 	t.gate.RUnlock()
-
-	if remaining == 0 {
-		t.notifyIdle(kind)
-	}
 }
 
 // Snapshot returns process activity without blocking a running maintenance
@@ -154,41 +145,6 @@ func (t *Tracker) RunIfQuiet(quiet time.Duration, fn func()) (ran bool, retryAft
 	return true, 0
 }
 
-// RegisterIdleHook registers a process-lifetime callback invoked after tracked
-// activity transitions to zero. Hooks must return quickly; schedulers should
-// launch their expensive work asynchronously. The returned function unregisters
-// the hook and is primarily useful to tests.
-func (t *Tracker) RegisterIdleHook(hook func(string)) func() {
-	if t == nil || hook == nil {
-		return func() {}
-	}
-	t.hooksMu.Lock()
-	t.hooks = append(t.hooks, hook)
-	idx := len(t.hooks) - 1
-	t.hooksMu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			t.hooksMu.Lock()
-			if idx < len(t.hooks) {
-				t.hooks[idx] = nil
-			}
-			t.hooksMu.Unlock()
-		})
-	}
-}
-
-func (t *Tracker) notifyIdle(kind string) {
-	t.hooksMu.RLock()
-	hooks := append([]func(string){}, t.hooks...)
-	t.hooksMu.RUnlock()
-	for _, hook := range hooks {
-		if hook != nil {
-			hook(kind)
-		}
-	}
-}
-
 func normalizeKind(kind string) string {
 	if kind == "" {
 		return "unspecified"
@@ -211,6 +167,3 @@ func Current() Snapshot { return process.Snapshot() }
 func RunIfQuiet(quiet time.Duration, fn func()) (bool, time.Duration) {
 	return process.RunIfQuiet(quiet, fn)
 }
-
-// RegisterIdleHook registers a process-wide idle-transition callback.
-func RegisterIdleHook(hook func(string)) func() { return process.RegisterIdleHook(hook) }

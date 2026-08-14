@@ -123,7 +123,8 @@ func serveOne(reg *parser.Registry, req extractRequest) (resp extractResponse) {
 		resp.Err = "crashpool: no extractor for language " + req.Language
 		return resp
 	}
-	result, err := ext.Extract(req.RelPath, req.Content)
+	opts := parser.NewExtractionOptions(req.TemporalEnvHelpers)
+	result, err := parser.Extract(ext, req.RelPath, req.Content, opts)
 	if err != nil {
 		resp.Err = err.Error()
 		return resp

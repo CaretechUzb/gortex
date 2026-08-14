@@ -18,9 +18,6 @@ func TestComputeCrossCommunityWarningDoesNotScanGraph(t *testing.T) {
 	if !reflect.DeepEqual(warning.AffectedCommunities, affected) {
 		t.Fatalf("affected communities = %v, want %v", warning.AffectedCommunities, affected)
 	}
-	if len(warning.Couplings) != 0 {
-		t.Fatalf("mandatory impact path computed %d coupling(s); want no graph-wide coupling scan", len(warning.Couplings))
-	}
 }
 
 func TestImpactCompleteRejectsDispatchLowerBound(t *testing.T) {

@@ -62,10 +62,8 @@ var (
 	StyleBox     = styleBox
 )
 
-// PaletteFg / PaletteAccent / PaletteErr expose the resolved lipgloss colors
-// for callers that need to apply them to a freshly-built style (rather than
-// re-using one of the pre-composed styles above). Returned values are
-// lipgloss.Color, ready to feed into any lipgloss.NewStyle().Foreground call.
-func PaletteFg() lipgloss.Color     { return colFg }
-func PaletteAccent() lipgloss.Color { return colAccent }
-func PaletteErr() lipgloss.Color    { return colErr }
+// PaletteFg exposes the resolved lipgloss foreground color for callers that
+// need to apply it to a freshly-built style (rather than re-using one of the
+// pre-composed styles above). The returned value is a lipgloss.Color, ready to
+// feed into any lipgloss.NewStyle().Foreground call.
+func PaletteFg() lipgloss.Color { return colFg }

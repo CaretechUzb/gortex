@@ -274,31 +274,33 @@ const (
 // any query; a remote that does not advertise read_only is treated as
 // read-only (fail-safe) by the consumer.
 type HealthResponse struct {
-	Status        string   `json:"status"`
-	Indexed       bool     `json:"indexed"`
-	Nodes         int      `json:"nodes"`
-	Edges         int      `json:"edges"`
-	Version       string   `json:"version"`
-	UptimeSeconds float64  `json:"uptime_seconds"`
-	SchemaVersion int      `json:"schema_version"`
-	APIVersion    int      `json:"api_version"`
-	ReadOnly      bool     `json:"read_only"`
-	Capabilities  []string `json:"capabilities,omitempty"`
+	Status         string                       `json:"status"`
+	Indexed        bool                         `json:"indexed"`
+	Nodes          int                          `json:"nodes"`
+	Edges          int                          `json:"edges"`
+	Version        string                       `json:"version"`
+	UptimeSeconds  float64                      `json:"uptime_seconds"`
+	SchemaVersion  int                          `json:"schema_version"`
+	APIVersion     int                          `json:"api_version"`
+	ReadOnly       bool                         `json:"read_only"`
+	Capabilities   []string                     `json:"capabilities,omitempty"`
+	GraphIntegrity *daemon.GraphIntegrityStatus `json:"graph_integrity,omitempty"`
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	stats := h.graph.Stats()
 	resp := HealthResponse{
-		Status:        "ok",
-		Indexed:       stats.TotalNodes > 0,
-		Nodes:         stats.TotalNodes,
-		Edges:         stats.TotalEdges,
-		Version:       h.version,
-		UptimeSeconds: time.Since(h.startTime).Seconds(),
-		SchemaVersion: SchemaVersion,
-		APIVersion:    APIVersion,
-		ReadOnly:      h.readOnly,
-		Capabilities:  h.advertisedCapabilities(),
+		Status:         "ok",
+		Indexed:        stats.TotalNodes > 0,
+		Nodes:          stats.TotalNodes,
+		Edges:          stats.TotalEdges,
+		Version:        h.version,
+		UptimeSeconds:  time.Since(h.startTime).Seconds(),
+		SchemaVersion:  SchemaVersion,
+		APIVersion:     APIVersion,
+		ReadOnly:       h.readOnly,
+		Capabilities:   h.advertisedCapabilities(),
+		GraphIntegrity: daemon.GraphIntegrityStatusFor(h.graph),
 	}
 	WriteJSON(w, http.StatusOK, resp)
 }

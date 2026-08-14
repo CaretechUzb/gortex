@@ -116,7 +116,7 @@ func TestMultiIndexer_RunDeferredEnrich_GatesUnchangedRepos(t *testing.T) {
 
 	// Drive the same per-repo dispatch the warmup's parallel enrich loop uses.
 	mi := newEmptyMultiIndexer(t, g)
-	mi.runDeferredEnrichParallel([]*Indexer{changed, unchanged})
+	mi.runDeferredEnrichPool([]*Indexer{changed, unchanged})
 
 	assert.Equal(t, []string{"repo-changed"}, spy.invoked(),
 		"only the changed repo should have its enrichment dispatched")

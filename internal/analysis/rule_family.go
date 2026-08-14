@@ -18,20 +18,6 @@ type RuleFamily interface {
 	Evaluate(g graph.Store, changedSet []string) []GuardViolation
 }
 
-// GuardsFamily adapts the flat guards: list (co-change / boundary rules).
-type GuardsFamily struct {
-	Rules []config.GuardRule
-}
-
-func (f GuardsFamily) Name() string { return "guards" }
-
-func (f GuardsFamily) Evaluate(g graph.Store, changedSet []string) []GuardViolation {
-	if len(f.Rules) == 0 {
-		return nil
-	}
-	return EvaluateGuards(g, f.Rules, changedSet)
-}
-
 // ArchitectureFamily adapts the declarative architecture: layer DSL.
 type ArchitectureFamily struct {
 	Config config.ArchitectureConfig

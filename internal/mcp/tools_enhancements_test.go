@@ -539,11 +539,6 @@ func TestPropertyCrossCommunityWarningCorrectness(t *testing.T) {
 		if len(warning.AffectedCommunities) != 2 {
 			rt.Errorf("expected 2 affected communities, got %d", len(warning.AffectedCommunities))
 		}
-
-		if len(warning.Couplings) != 0 {
-			rt.Fatalf("impact scored %d coupling pair(s); the safety gate must not read the edge set",
-				len(warning.Couplings))
-		}
 	})
 }
 

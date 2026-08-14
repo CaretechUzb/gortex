@@ -135,10 +135,6 @@ func (r *facadeRegistry) availableOperations(facade string) []facadeOperationSpe
 	return out
 }
 
-func (r *facadeRegistry) mapsLegacy(name string) bool {
-	return r != nil && len(r.byLegacy[name]) > 0
-}
-
 func facadeToolNames() []string {
 	return []string{
 		"analyze", "ask", "capabilities", "change", "edit", "explore",
@@ -148,21 +144,9 @@ func facadeToolNames() []string {
 	}
 }
 
-// FacadeToolNames returns the complete stable facade-v1 tool roster. The
-// returned slice is a fresh copy so CLI/help callers cannot mutate the server's
-// canonical surface.
-func FacadeToolNames() []string {
-	return append([]string(nil), facadeToolNames()...)
-}
-
 // IsFacadeToolName reports whether name belongs to the public facade-v1
 // surface.
 func IsFacadeToolName(name string) bool { return isFacadeToolName(name) }
-
-// IsDedicatedFacadeToolName reports whether name exists only on facade-v1.
-// Shared names such as analyze/explore/review/ask retain legacy meanings and
-// are deliberately excluded.
-func IsDedicatedFacadeToolName(name string) bool { return isDedicatedFacadeTool(name) }
 
 // PublicOperationForLegacy resolves an implementation-era tool name to the
 // compact public domain and operation used in user-facing migration guidance.

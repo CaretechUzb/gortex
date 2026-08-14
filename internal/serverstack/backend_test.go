@@ -14,7 +14,7 @@ import (
 // database. The error has to name the replacement.
 func TestOpenBackend_MemoryIsRetired(t *testing.T) {
 	for _, name := range []string{"memory", "mem", "in-memory", "In-Memory", "  memory  "} {
-		store, _, err := OpenBackend(name, "", 0, zap.NewNop(), false)
+		store, _, err := OpenBackend(name, "", zap.NewNop(), false)
 		if err == nil {
 			t.Fatalf("OpenBackend(%q): want an error, got a store", name)
 		}
@@ -35,7 +35,7 @@ func TestOpenBackend_MemoryIsRetired(t *testing.T) {
 // caller did not name a backend explicitly.
 func TestOpenBackend_EmptyNameOpensSqlite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
-	store, cleanup, err := OpenBackend("", path, 0, zap.NewNop(), true)
+	store, cleanup, err := OpenBackend("", path, zap.NewNop(), true)
 	if err != nil {
 		t.Fatalf(`OpenBackend(""): %v`, err)
 	}
@@ -49,7 +49,7 @@ func TestOpenBackend_EmptyNameOpensSqlite(t *testing.T) {
 // creates) a store at the resolved path.
 func TestOpenBackend_SqliteOpensFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
-	store, cleanup, err := OpenBackend("sqlite", path, 0, zap.NewNop(), true)
+	store, cleanup, err := OpenBackend("sqlite", path, zap.NewNop(), true)
 	if err != nil {
 		t.Fatalf("OpenBackend(sqlite): %v", err)
 	}
@@ -62,7 +62,7 @@ func TestOpenBackend_SqliteOpensFile(t *testing.T) {
 // TestOpenBackend_Unknown asserts a stale backend name (e.g. the removed
 // ladybug) errors rather than silently falling back.
 func TestOpenBackend_Unknown(t *testing.T) {
-	if _, _, err := OpenBackend("ladybug", "", 0, zap.NewNop(), false); err == nil {
+	if _, _, err := OpenBackend("ladybug", "", zap.NewNop(), false); err == nil {
 		t.Fatal("an unknown backend must error")
 	}
 }

@@ -232,19 +232,6 @@ func putArena(a *nodeArena) {
 	arenaPool.Put(a)
 }
 
-// WrapNode wraps a value Node from the new API into our shim. It derives
-// the language key eagerly so navigation from the result stays alloc-free,
-// and seeds a fresh arena so the subtree walk below it allocates in chunks.
-func WrapNode(n ts.Node) *Node {
-	a := newNodeArena()
-	nn := a.alloc()
-	nn.inner = n
-	nn.valid = true
-	nn.langKey = unsafe.Pointer(n.Language().Inner)
-	nn.arena = a
-	return nn
-}
-
 // WrapVal wraps a ts.Node reached from n (e.g. a query capture),
 // carrying n's language key so Type() on the result and its descendants
 // needs neither CGO nor allocation.
@@ -540,9 +527,6 @@ type Tree struct {
 	inner *ts.Tree
 	arena *nodeArena // pooled; taken lazily on first RootNode, returned on Close
 }
-
-// WrapTree wraps a *ts.Tree for internal use by the parser package.
-func WrapTree(t *ts.Tree) *Tree { return &Tree{inner: t} }
 
 // Inner exposes the underlying *ts.Tree for internal use.
 func (t *Tree) Inner() *ts.Tree { return t.inner }

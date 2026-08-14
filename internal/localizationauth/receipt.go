@@ -158,14 +158,6 @@ func Consume(token string) (Receipt, bool) {
 	return envelope.Receipt, true
 }
 
-// Discard removes a pending receipt without exposing its contents.
-func Discard(token string) {
-	path, _, ok := receiptPath(token)
-	if ok {
-		_ = os.Remove(path)
-	}
-}
-
 func validReceipt(receipt Receipt) bool {
 	return receipt.FinalResponse != "" && len(receipt.FinalResponse) <= maxFinalResponseSize &&
 		receipt.ContractVersion >= contractVersionV2

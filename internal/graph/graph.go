@@ -555,6 +555,15 @@ type Graph struct {
 	// absent from disk stores until they can provide the same completeness
 	// guarantee.
 	mutationReceipts mutationReceiptState
+
+	// structuralIntegrity is the store-scoped since-open recorder. Shadows may
+	// forward through structuralIntegritySink so rejected attempts survive the
+	// throwaway graph; the explicit repo and fixed path prevent attribution
+	// from guessing ownership from unprefixed node IDs.
+	structuralIntegrity     StructuralIntegrityMeter
+	structuralIntegritySink StructuralIntegrityEventRecorder
+	structuralIntegrityRepo string
+	structuralIntegrityPath StructuralDropPath
 }
 
 // cloneShingleEntry is one in-memory clone_shingles row: the owning
@@ -1695,43 +1704,6 @@ func (g *Graph) AllEdgesLight(kinds ...EdgeKind) []*Edge {
 	return out
 }
 
-// EdgesForKindsLight returns the edges of the given kinds (an empty kinds list
-// means every kind) for a whole-graph scan, preferring the meta-less
-// LightEdgeScanner capability when the store implements it (skips the per-edge
-// Meta decode on disk backends) and otherwise falling back to AllEdges() with a
-// Go-side kind filter. See LightEdgeScanner for the Meta-presence contract:
-// callers must read only the promoted edge fields, never arbitrary Meta.
-func EdgesForKindsLight(g Store, kinds ...EdgeKind) []*Edge {
-	if g == nil {
-		return nil
-	}
-	if sc, ok := g.(LightEdgeScanner); ok {
-		return sc.AllEdgesLight(kinds...)
-	}
-	all := g.AllEdges()
-	if len(kinds) == 0 {
-		return all
-	}
-	want := make(map[EdgeKind]struct{}, len(kinds))
-	for _, k := range kinds {
-		if k != "" {
-			want[k] = struct{}{}
-		}
-	}
-	if len(want) == 0 {
-		return nil
-	}
-	out := make([]*Edge, 0, len(all))
-	for _, e := range all {
-		if e != nil {
-			if _, ok := want[e.Kind]; ok {
-				out = append(out, e)
-			}
-		}
-	}
-	return out
-}
-
 // DeadCodeCandidates is the in-memory reference implementation of
 // DeadCodeCandidator. Iterates the requested node kinds and filters
 // out anything whose incoming-edge bucket contains an allowlist match
@@ -2620,8 +2592,10 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 	if len(nodes) == 0 && len(edges) == 0 {
 		return
 	}
-	// Structural-shape backstop: see StructuralEdgeTargetInvalid.
-	edges, _ = FilterStructuralEdgeViolations(edges)
+	// Structural-shape backstop: the first rejecting boundary owns the event.
+	var rejected []*Edge
+	edges, rejected = FilterStructuralEdgeViolations(edges)
+	g.recordStructuralRejections(StructuralPathGraphAddBatch, rejected, nodes)
 	// Lazy builtin-sentinel materialization: see BuiltinStubNodes. The
 	// per-store seen-set keeps it one upsert per stub per store lifetime.
 	if stubs := BuiltinStubNodes(edges); len(stubs) > 0 {
@@ -2749,9 +2723,12 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 // adjacency-list length is unchanged. Drops the double-edge problem
 // that used to surface after daemon restarts (bug B1).
 func (g *Graph) AddEdge(e *Edge) {
-	// Structural-shape backstop: see StructuralEdgeTargetInvalid.
-	if e != nil && StructuralEdgeTargetInvalid(e.Kind, e.To) {
-		structuralWriteDrops.Add(1)
+	if e == nil {
+		return
+	}
+	// Structural-shape backstop: the first rejecting boundary owns the event.
+	if StructuralEdgeTargetInvalid(e.Kind, e.To) {
+		g.recordStructuralRejections(StructuralPathGraphAddEdge, []*Edge{e}, nil)
 		return
 	}
 	receiptActive := g.beginReceiptMutation()

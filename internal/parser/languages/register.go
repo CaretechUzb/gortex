@@ -230,24 +230,3 @@ func ConfigureTemporalJavaInvokers(reg *parser.Registry, invokers, methods []str
 		}
 	}
 }
-
-// EnvHelperConfigurable is implemented by extractors that accept a per-repo
-// Temporal env-helper allow-list. Only the Go extractor implements it today.
-type EnvHelperConfigurable interface {
-	SetEnvHelperNames(names []string)
-}
-
-// ConfigureTemporalEnvHelpers installs the per-repo corporate env-helper
-// allow-list (loaded from a git-ignored `.gortex/temporal-allowlist.yaml`) onto
-// every registered extractor that supports it. No-op when names is empty, so
-// callers can pass the loader result unconditionally.
-func ConfigureTemporalEnvHelpers(reg *parser.Registry, names []string) {
-	if len(names) == 0 {
-		return
-	}
-	if ext, ok := reg.GetByLanguage("go"); ok {
-		if c, ok := ext.(EnvHelperConfigurable); ok {
-			c.SetEnvHelperNames(names)
-		}
-	}
-}

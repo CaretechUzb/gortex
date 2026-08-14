@@ -2,6 +2,8 @@ package parser
 
 import (
 	"io"
+	"sort"
+	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -11,6 +13,62 @@ type Extractor interface {
 	Language() string
 	Extensions() []string
 	Extract(filePath string, src []byte) (*ExtractionResult, error)
+}
+
+// ExtractionOptions is immutable request-scoped parser configuration. Its
+// fields remain private so an extractor cannot mutate repository-owned state.
+// Use NewExtractionOptions to construct a normalized value and accessors to
+// obtain defensive copies for serialization.
+type ExtractionOptions struct {
+	temporalEnvHelpers []string
+}
+
+// NewExtractionOptions normalizes Temporal helper names by trimming whitespace,
+// dropping empty entries, exact case-sensitive deduplication, and sorting. The
+// stable order makes crash-worker serialization deterministic without changing
+// Go identifier semantics.
+func NewExtractionOptions(temporalEnvHelpers []string) ExtractionOptions {
+	if len(temporalEnvHelpers) == 0 {
+		return ExtractionOptions{}
+	}
+	seen := make(map[string]struct{}, len(temporalEnvHelpers))
+	normalized := make([]string, 0, len(temporalEnvHelpers))
+	for _, name := range temporalEnvHelpers {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		normalized = append(normalized, name)
+	}
+	if len(normalized) == 0 {
+		return ExtractionOptions{}
+	}
+	sort.Strings(normalized)
+	return ExtractionOptions{temporalEnvHelpers: normalized}
+}
+
+// TemporalEnvHelpers returns a defensive copy of the configured names.
+func (o ExtractionOptions) TemporalEnvHelpers() []string {
+	return append([]string(nil), o.temporalEnvHelpers...)
+}
+
+// OptionsExtractor is an optional capability. Extractor remains unchanged so
+// existing languages and external plugins keep their source compatibility.
+type OptionsExtractor interface {
+	ExtractWithOptions(filePath string, src []byte, opts ExtractionOptions) (*ExtractionResult, error)
+}
+
+// Extract dispatches one request through the optional options-aware capability,
+// falling back to the base Extractor contract for ordinary languages/plugins.
+func Extract(e Extractor, filePath string, src []byte, opts ExtractionOptions) (*ExtractionResult, error) {
+	if oe, ok := e.(OptionsExtractor); ok {
+		return oe.ExtractWithOptions(filePath, src, opts)
+	}
+	return e.Extract(filePath, src)
 }
 
 // PreParser is an optional Extractor capability: a source-rewriting hook run

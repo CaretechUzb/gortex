@@ -104,13 +104,6 @@ func TestBM25Backend(t *testing.T) {
 	runBackendTests(t, "BM25", backend)
 }
 
-func TestBleveBackend(t *testing.T) {
-	backend, err := NewBleve()
-	require.NoError(t, err)
-	defer backend.Close()
-	runBackendTests(t, "Bleve", backend)
-}
-
 func TestBM25_RankingQuality(t *testing.T) {
 	b := NewBM25()
 	defer b.Close()
@@ -142,24 +135,6 @@ func TestBM25_DuplicateTokensCollapse(t *testing.T) {
 
 func BenchmarkBM25_Search(b *testing.B) {
 	backend := NewBM25()
-	for i := 0; i < 10000; i++ {
-		backend.Add(
-			"pkg/file.go::func"+string(rune('A'+i%26))+string(rune('0'+i%10)),
-			"getUserById", "internal/auth/service.go", "func getUserById(id string) User",
-		)
-	}
-	b.ResetTimer()
-	for b.Loop() {
-		backend.Search("get user auth", 20)
-	}
-}
-
-func BenchmarkBleve_Search(b *testing.B) {
-	backend, err := NewBleve()
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer backend.Close()
 	for i := 0; i < 10000; i++ {
 		backend.Add(
 			"pkg/file.go::func"+string(rune('A'+i%26))+string(rune('0'+i%10)),

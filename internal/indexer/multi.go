@@ -1,7 +1,6 @@
 package indexer
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -63,13 +62,22 @@ type MultiIndexer struct {
 	indexers  map[string]*Indexer      // repoPrefix → per-repo indexer
 	configMgr *config.ConfigManager
 	logger    *zap.Logger
-	mu        sync.RWMutex
+	// newIndexer is instance-local so lifecycle tests can observe a constructor
+	// failure without publishing the candidate Indexer. Production instances set
+	// it to New; every per-repository construction flows through this factory.
+	newIndexer func(graph.Store, *parser.Registry, config.IndexConfig, *zap.Logger) *Indexer
+	mu         sync.RWMutex
 
 	// repositoryMutations owns one stable mutation lane per repository prefix.
 	// The slot survives Indexer replacement so an explicit re-index cannot race
 	// an old watcher instance on a second lane.
 	repositoryMutationMu sync.Mutex
 	repositoryMutations  map[string]*repositoryMutationCoordinator
+	// lifecycleClosed is guarded by repositoryMutationMu so closing admission
+	// is atomic with stable-lane creation. closeMu serializes idempotent teardown.
+	lifecycleClosed   bool
+	lifecycleComplete bool
+	closeMu           sync.Mutex
 
 	// batchMutationGate makes a batch-mode transition atomic with respect to
 	// complete repository mutation pipelines. Stable coordinators take the read
@@ -119,7 +127,7 @@ type MultiIndexer struct {
 	// deferGlobalPasses, when set, propagates SetDeferGlobalPasses(true)
 	// to every per-repo Indexer constructed by this MultiIndexer. Batch
 	// warmup callers flip it on around their loop and
-	// invoke RunGlobalGraphPasses once at the end so the O(global) walks
+	// invoke the shared global-pass pipeline once at the end so the O(global) walks
 	// (InferImplements / InferOverrides / markTestSymbolsAndEmitEdges)
 	// don't run R times against an R-repo graph.
 	deferGlobalPasses bool
@@ -129,13 +137,13 @@ type MultiIndexer struct {
 	// parallel warmup path: per-repo ResolveAll / contract extract /
 	// semantic enrich mutate the shared graph, so running them in
 	// parallel across repos races. With this flag the parallel loop
-	// just parses; RunDeferredPassesAll runs the per-repo passes
+	// just parses; RunDeferredPassesAllResult runs the per-repo passes
 	// serially after the loop. Independent of deferGlobalPasses — that
 	// flag covers a separate (cheaper) set of O(global) walks.
 	deferResolve bool
 
 	// batchChangedPrefixes scopes the per-repo clone-detection and
-	// clone-index Rebuild passes in RunGlobalGraphPasses to the repos that
+	// clone-index Rebuild passes in the shared global-pass pipeline to the repos that
 	// actually re-indexed in the current batch. nil — the default, and what
 	// every one-off EndBatch caller leaves it as — means "run the clone
 	// passes for every tracked repo", the prior whole-workspace behaviour.
@@ -145,7 +153,7 @@ type MultiIndexer struct {
 	// disk. Clone edges are per-repo (no cross-repo pair is ever formed),
 	// so an unchanged repo's persisted edges stay valid; its in-memory
 	// incremental clone index is reseeded lazily on its first later edit.
-	// Consumed and cleared by RunGlobalGraphPasses. Guarded by mi.mu.
+	// Consumed and cleared by the shared global-pass pipeline. Guarded by mi.mu.
 	batchChangedPrefixes map[string]struct{}
 	// batchCensusEligible is the daemon's one-shot full-coverage attestation
 	// for the armed batch scope — see ArmBatchCensusEligible.
@@ -153,7 +161,7 @@ type MultiIndexer struct {
 
 	// resolverLSPHelper is the resolve-time LSP helper propagated
 	// onto every per-repo Indexer and onto the global post-pass
-	// resolver in RunDeferredPassesAll. nil means no LSP hot-path
+	// resolver in RunDeferredPassesAllResult. nil means no LSP hot-path
 	// (heuristic-only resolution, the pre-N5 behaviour). The
 	// daemon installs the helper via SetResolverLSPHelper after
 	// constructing the LSP router; a multi-repo composite helper
@@ -167,16 +175,6 @@ type MultiIndexer struct {
 	// against the LSPHelper registry so dynamically-tracked repos
 	// participate in the N5 hot path without daemon restart.
 	onRepoTracked func(prefix, absPath string)
-
-	// skipVectorBuild, when set, propagates SetSkipVectorBuild(true) to
-	// every per-repo Indexer this MultiIndexer constructs, so their
-	// buildSearchIndex passes populate only the text index and never
-	// embed. The daemon flips it on for the warmup loop when a snapshot
-	// already carries the workspace vector index — re-embedding 30k+
-	// symbols only to overwrite them with the cached index is the
-	// dominant restart cost. After warmup it restores the cached index
-	// once via ImportVectorIndex and clears the flag.
-	skipVectorBuild bool
 
 	// embedChunkOpts is the AST sub-chunking configuration propagated
 	// to every per-repo Indexer this MultiIndexer constructs. The zero
@@ -323,7 +321,13 @@ func (mi *MultiIndexer) newPerRepoIndexerGuardedWithMode(
 	cfg config.IndexConfig,
 	mode multiIndexerBatchMode,
 ) *Indexer {
-	idx := New(mi.graph, mi.registry, cfg, mi.logger)
+	factory := mi.newIndexer
+	if factory == nil {
+		// Preserve hand-built zero-value MultiIndexer fixtures while keeping
+		// every production instance on the constructor installed above.
+		factory = New
+	}
+	idx := factory(mi.graph, mi.registry, cfg, mi.logger)
 	idx.shadowAdmission = mi.shadowAdmission
 	idx.parseAdmission.Store(mi.parseAdmission.Load())
 	idx.nativeParseAdmission.Store(mi.nativeParseAdmission.Load())
@@ -333,7 +337,6 @@ func (mi *MultiIndexer) newPerRepoIndexerGuardedWithMode(
 		idx.SetEmbedder(mi.embedder)
 	}
 	applyMultiIndexerBatchMode(idx, mode)
-	idx.SetSkipVectorBuild(mi.skipVectorBuild)
 	idx.SetEmbeddingChunkOptions(mi.embedChunkOpts)
 	idx.SetEmbeddingMaxSymbols(mi.embedMaxSymbols)
 	idx.SetEmbeddingAPIConcurrency(mi.embedAPIConcurrency)
@@ -416,29 +419,9 @@ func (mi *MultiIndexer) SetSemanticManager(m *semantic.Manager) {
 	}
 }
 
-// SetSkipVectorBuild controls whether per-repo Indexers constructed
-// from now on skip the embedding pass in buildSearchIndex (text index
-// only). The daemon enables it for the warmup loop when a snapshot
-// already carries the workspace vector index, then disables it and
-// restores the cached index once warmup finishes. It also re-applies
-// the flag to every per-repo Indexer already constructed so a flag
-// flip mid-lifecycle takes effect everywhere.
-func (mi *MultiIndexer) SetSkipVectorBuild(skip bool) {
-	mi.mu.Lock()
-	mi.skipVectorBuild = skip
-	live := make([]*Indexer, 0, len(mi.indexers))
-	for _, idx := range mi.indexers {
-		live = append(live, idx)
-	}
-	mi.mu.Unlock()
-	for _, idx := range live {
-		idx.SetSkipVectorBuild(skip)
-	}
-}
-
 // SetResolverLSPHelper installs the resolve-time LSP helper used by
 // every per-repo Indexer this MultiIndexer constructs from now on,
-// and by the global post-pass resolver in RunDeferredPassesAll. Pass
+// and by the global post-pass resolver in RunDeferredPassesAllResult. Pass
 // nil to detach. Safe to call zero or one times; subsequent calls
 // silently replace and propagate to every existing per-repo indexer.
 func (mi *MultiIndexer) SetResolverLSPHelper(h resolver.LSPHelper) {
@@ -491,7 +474,7 @@ func (mi *MultiIndexer) BeginBatch() {
 // indexing loop across goroutines (warmup) — the parallel parsers
 // must not race each other inside ResolveAll / contract extract /
 // semantic enrich, which all mutate the shared graph. Pair with
-// EndBatch; call RunDeferredPassesAll between the parallel parse and
+// EndBatch; call RunDeferredPassesAllResult between the parallel parse and
 // EndBatch to run the deferred per-repo passes serially.
 func (mi *MultiIndexer) BeginParallelBatch() {
 	mi.batchMutationGate.Lock()
@@ -507,26 +490,10 @@ func (mi *MultiIndexer) BeginParallelBatch() {
 	}
 }
 
-// RunDeferredPassesAll drains the deferred per-repo passes (semantic
-// enrich / contract extract+commit) serially across the indexers the
-// parallel parse populated. Pairs with BeginParallelBatch: the parallel
-// loop parses with deferResolve on; this serial loop runs the passes that
-// would otherwise race on the shared graph. The references-completeness
-// resolve runs ahead of this in RunPreEnrichResolve (so the daemon can mark
-// itself queryable before enrichment); the per-repo resolver pass is
-// suppressed here because resolver.ResolveAll walks the entire shared graph
-// — paying it R times is O(R · E). One master resolver.New(graph).ResolveAll
-// runs at the end to lift the placeholder edges enrichment + contracts added.
-//
-// Returns the number of repos whose deferred semantic enrichment was
-// actually dispatched (pendingEnrich set, or forced via
-// GORTEX_WARMUP_FORCE_ENRICH) rather than skipped as unchanged. Sampled
-// before runDeferredEnrichParallel runs, since a successful non-partial
-// pass clears the flag it reads.
 // SeedPendingEnrichAll re-arms the deferred-enrichment gate for every tracked
 // repo whose persisted enrichment is known-incomplete at its current clean HEAD
 // (see Indexer.MaybeSeedPendingEnrich). The daemon warmup calls it after the
-// parallel parse and before RunDeferredPassesAll so a repo left partial or
+// parallel parse and before RunDeferredPassesAllResult so a repo left partial or
 // abandoned by a prior process resumes even when no file changed this run.
 // Returns the number of repos that will enrich (already pending plus newly
 // seeded) — the caller uses a non-zero count to run the deferred passes on a
@@ -576,13 +543,9 @@ func (mi *MultiIndexer) GraphMutationRevision() (uint64, bool) {
 	return revisioner.MutationRevision(), true
 }
 
-func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) int {
-	return mi.RunDeferredPassesAllResult(ctx).EnrichScheduled
-}
-
 // RunDeferredPassesAllResult is the result-bearing orchestration form used by
 // lifecycle callers that must decide whether a later global safety sweep is
-// still required. RunDeferredPassesAll preserves the compatibility surface.
+// still required.
 func (mi *MultiIndexer) RunDeferredPassesAllResult(ctx context.Context) DeferredPassesResult {
 	return mi.BeginDeferredPasses(ctx, nil).FinishTailResult()
 }
@@ -654,11 +617,11 @@ func (r *DeferredPassesRun) BeginApplyMutationReceipt() {
 
 // BeginDeferredPasses selects the repos with deferred work, prepares the
 // mutation-receipt window, materialises go.mod dependencies, and launches the
-// enrichment pool on its own goroutine. The caller must call FinishTail (which
+// enrichment pool on its own goroutine. The caller must call FinishTailResult (which
 // joins the pool) exactly once. applyGate, when non-nil, parks every
 // provider's graph-apply phase until the caller closes it — the caller MUST
 // first call BeginApplyMutationReceipt after its resolve phase, then close the
-// gate, or FinishTail deadlocks.
+// gate, or FinishTailResult deadlocks.
 //
 // Without an apply gate the receipt opens here. With overlap, delaying it until
 // the apply boundary excludes resolver writes while still observing every
@@ -743,11 +706,6 @@ func (mi *MultiIndexer) BeginDeferredPasses(_ context.Context, applyGate <-chan 
 
 // Wait blocks until every enrichment lane has drained.
 func (r *DeferredPassesRun) Wait() { <-r.poolDone }
-
-// FinishTail preserves the compatibility result used by existing callers.
-func (r *DeferredPassesRun) FinishTail() int {
-	return r.FinishTailResult().EnrichScheduled
-}
 
 // FinishTailResult joins the enrichment pool, runs the contract passes, closes
 // the receipt window, and performs the deferred-mutation catch-up resolve.
@@ -1113,15 +1071,6 @@ func (mi *MultiIndexer) RunDeferredGoModAll() {
 	mi.runDeferredGoModAll()
 }
 
-// runDeferredEnrichParallel runs each indexer's semantic enrichment in a
-// bounded worker pool. Concurrency is capped so at most a few LSP servers
-// background-index at once (the memory-sensitive part). The manager pins each
-// repo's LSP provider in-use for the duration of its pass, so the router's
-// LRU evictor never closes a provider another repo is still enriching against.
-func (mi *MultiIndexer) runDeferredEnrichParallel(indexers []*Indexer) {
-	mi.runDeferredEnrichPool(indexers)
-}
-
 // runDeferredEnrichPool drains per-repo semantic enrichment through a
 // bounded worker pool with no inter-repo barriers. The old fixed batches
 // made every batch wait for its slowest member and gave each heavy-Go repo
@@ -1409,7 +1358,7 @@ func enrichConcurrency(repos int) int {
 // the per-Indexer flag too so a subsequent one-off TrackRepoCtx call
 // runs the passes inline as expected.
 // ArmBatchScope records the prefixes of the repos that re-indexed in the
-// batch about to be ended, so the next RunGlobalGraphPasses runs the
+// batch about to be ended, so the next shared global-pass run executes the
 // per-repo clone-detection + clone-index Rebuild passes only for those
 // repos instead of for every tracked repo. An empty set, or scoped global
 // passes being disabled, leaves the scope nil (run all). Only the daemon
@@ -1502,8 +1451,8 @@ func (mi *MultiIndexer) EndBatch() {
 // derivation passes. It is the warm-restart fast-path counterpart to
 // EndBatch: when the warmup reconcile loop observed zero changed files
 // across every repo, the persistent backend already holds every resolved
-// and derived edge from the prior run, so RunGlobalGraphPasses (plus the
-// RunDeferredPassesAll / RunGlobalResolve the caller also skips) would
+// and derived edge from the prior run, so the shared global-pass pipeline (plus
+// RunDeferredPassesAllResult / RunGlobalResolve, which the caller also skips) would
 // only recompute what's already on disk — the work that turns a warm
 // restart into a 30s–500s stall. The per-Indexer SetDeferGlobalPasses
 // flag is still restored so a later watch-triggered TrackRepoCtx /
@@ -1522,21 +1471,6 @@ func (mi *MultiIndexer) ResetBatch() {
 	for _, idx := range mi.indexers {
 		applyMultiIndexerBatchMode(idx, mode)
 	}
-}
-
-// RunGlobalGraphPasses runs the graph-wide derivation passes once
-// against the shared graph: InferImplements (structural interface
-// satisfaction), InferOverrides (method-level overrides on
-// extends/implements/composes parents), and markTestSymbolsAndEmitEdges
-// (test→subject EdgeTests). Idempotent — graph.AddEdge dedupes by
-// edgeKey and the resolver passes skip already-present parents.
-func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
-	// Direct callers own no transition gate. Exclude repository mutation
-	// pipelines for the complete unscoped derivation run; callers already under
-	// a batch gate use runGlobalGraphPasses directly.
-	mi.batchMutationGate.Lock()
-	defer mi.batchMutationGate.Unlock()
-	mi.runGlobalGraphPasses(ctx, nil, false)
 }
 
 // runGlobalGraphPasses owns the reachability topology writer for callers that
@@ -1882,6 +1816,7 @@ func NewMultiIndexer(
 		indexers:        make(map[string]*Indexer),
 		configMgr:       cm,
 		logger:          logger,
+		newIndexer:      New,
 		shadowAdmission: processShadowAdmission,
 	}
 }
@@ -2115,12 +2050,18 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 					// race against each other across goroutines on the shared
 					// graph. They run serially below via RunDeferredPasses after
 					// wg.Wait(). The graph-wide derivation passes run once after
-					// the loop via mi.RunGlobalGraphPasses().
+					// the loop via the shared global-pass pipeline.
 					idx.SetDeferResolve(true)
 
 					result, err := idx.indexCtxRaw(context.Background(), r.absPath)
 					if err != nil {
+						idx.Close()
 						resultCh <- repoResult{prefix: r.prefix, err: fmt.Errorf("indexing %s: %w", r.absPath, err)}
+						return
+					}
+					if result == nil {
+						idx.Close()
+						resultCh <- repoResult{prefix: r.prefix, err: fmt.Errorf("indexing %s returned a nil result", r.absPath)}
 						return
 					}
 					result.RepoPrefix = r.prefix
@@ -2165,12 +2106,19 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 				completed = append(completed, rr)
 				results[rr.prefix] = rr.result
 			}
+			oldIndexers := make([]*Indexer, 0, len(completed))
 			mi.mu.Lock()
 			for _, rr := range completed {
+				if old := mi.indexers[rr.prefix]; old != nil && old != rr.idx {
+					oldIndexers = append(oldIndexers, old)
+				}
 				mi.repos[rr.prefix] = rr.meta
 				mi.indexers[rr.prefix] = rr.idx
 			}
 			mi.mu.Unlock()
+			for _, old := range oldIndexers {
+				old.Close()
+			}
 			if coordinatedBulkActive {
 				if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
 					return nil, fmt.Errorf("multi-repo bulk-load finalize: %w", err)
@@ -2266,6 +2214,7 @@ func (mi *MultiIndexer) IndexRepo(repoPrefix string) (*IndexResult, error) {
 func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 	mi.mu.RLock()
 	meta, ok := mi.repos[repoPrefix]
+	oldIdx := mi.indexers[repoPrefix]
 	mi.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("repository not found: %s", repoPrefix)
@@ -2279,6 +2228,12 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 	mi.configMgr.LoadWorkspaceConfig(repoPrefix, meta.RootPath)
 	cfg := mi.configMgr.GetRepoConfig(repoPrefix)
 	idx := mi.newPerRepoIndexerGuarded(cfg.Index)
+	installed := false
+	defer func() {
+		if !installed {
+			idx.Close()
+		}
+	}()
 	// Always stamp the repo prefix, even when this is the only tracked repo.
 	// The multi-repo cold path (indexMultiRepo) already prefixes
 	// unconditionally; gating the single-repo re-index on repo count left the
@@ -2317,6 +2272,10 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 	}
 	mi.indexers[repoPrefix] = idx
 	mi.mu.Unlock()
+	installed = true
+	if oldIdx != nil && oldIdx != idx {
+		oldIdx.Close()
+	}
 
 	// TODO: After re-indexing, run CrossRepoResolver.ResolveForRepo(repoPrefix)
 	// to update cross-repo edges. This will be implemented in Task 7.1.
@@ -2767,6 +2726,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	idx.SetProjectID(resolveProjectID(&entryCopy, cfg, prefix))
 
 	var result *IndexResult
+	installed := false
 	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
 		// lane and transition generation are held, reapply the authoritative mode.
@@ -2821,6 +2781,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 		}
 		mi.indexers[prefix] = idx
 		mi.mu.Unlock()
+		installed = true
 
 		// Add to global config.
 		entry.Path = absPath
@@ -2838,6 +2799,9 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 		}
 		return nil
 	})
+	if !installed {
+		idx.Close()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -2912,6 +2876,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	idx.SetFileMtimes(priorMtimes)
 
 	var result *IndexResult
+	installed := false
 	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
 		// lane and transition generation are held, reapply the authoritative mode.
@@ -2990,7 +2955,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			result, err = fullRetrack()
 		case churn == 0 && !idx.merkleEnabled():
 			route = "census_noop"
-			result = idx.cleanCensusResult(detected, start)
+			result, err = idx.cleanCensusResult(ctx, detected, start)
 		case churn == 0:
 			// The mtime census cannot prove a Merkle-enabled repository clean:
 			// a missing baseline or extractor-salt change still requires the
@@ -3045,6 +3010,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		}
 		mi.indexers[prefix] = idx
 		mi.mu.Unlock()
+		installed = true
 
 		entry.Path = absPath
 		if err := mi.configMgr.Global().AddRepo(entry); err != nil {
@@ -3086,6 +3052,9 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		topologyChanged = incrementalTopologyChanged(result)
 		return nil
 	})
+	if !installed {
+		idx.Close()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -3182,6 +3151,9 @@ func (mi *MultiIndexer) ReconcileAllCtx(ctx context.Context) map[string]*IndexRe
 
 // UntrackRepo evicts a repo from the graph and removes it from config.
 func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
+	if mi.isClosed() {
+		return 0, 0
+	}
 	// Snapshot the exact live registry generation first. Legacy restores and
 	// direct-map fixtures may not have a stable lane yet; backfill one only
 	// while both metadata and Indexer pointers still match this generation.
@@ -3235,6 +3207,12 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 	delete(mi.indexers, repoPrefix)
 	mi.mu.Unlock()
 
+	// The stable mutation lane is drained and this exact generation is detached;
+	// now wait for any overlay/direct extraction before terminating its workers.
+	if idx != nil {
+		idx.Close()
+	}
+
 	// The process-wide trigram budget otherwise retains the removed Indexer
 	// (and its full-text cache) until an unrelated search happens to evict it.
 	if idx != nil {
@@ -3242,32 +3220,42 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 		idx.trigramBudget().forget(idx)
 	}
 
-	// Every repo's nodes live in its byRepo bucket, so the sidecar-aware
-	// purge covers all of them. Single-repo-mode nodes used to carry an
-	// empty RepoPrefix, never entered that bucket, and needed a
-	// file-by-file EvictFile loop — which took the branch BELOW the
-	// capability probe and so skipped PurgeRepo entirely, leaking fifteen
-	// repo_prefix-keyed sidecar tables on every solo untrack.
+	// Every repo's nodes live in its byRepo bucket. Serialize the complete
+	// sidecar/vector purge and aggregate vector publication with sibling repo
+	// installs; otherwise an older stats snapshot can be published after a newer
+	// corpus commit. The callback holds no mi.mu and releases every SQLite write
+	// transaction before ReplaceHybridVector waits for pinned search readers.
 	var nodesRemoved, edgesRemoved int
-	if purger, ok := mi.graph.(interface{ PurgeRepo(string) error }); ok {
-		// Prefer the full sidecar-aware purge. EvictRepo drops only
-		// nodes+edges and leaves fifteen repo_prefix-keyed sidecar tables
-		// (file_mtimes, *_enrichment, symbol_fts, content_fts, ...) behind,
-		// which accumulate across untrack/retrack cycles until they dominate
-		// a long-lived store. PurgeRepo clears them in one transaction. It
-		// returns no counts, so report the repo's last-index metadata as the
-		// removed estimate; fall back to EvictRepo (real counts) on error.
-		if err := purger.PurgeRepo(repoPrefix); err != nil {
-			mi.logger.Warn("purge repo failed; falling back to node/edge eviction",
-				zap.String("prefix", repoPrefix), zap.Error(err))
-			nodesRemoved, edgesRemoved = mi.graph.EvictRepo(repoPrefix)
-		} else {
-			nodesRemoved, edgesRemoved = meta.NodeCount, meta.EdgeCount
+	purgeRepo := func() {
+		if purger, ok := mi.graph.(interface{ PurgeRepo(string) error }); ok {
+			// Prefer the full sidecar-aware purge. It returns no counts, so report
+			// the last-index metadata as the estimate; fall back to EvictRepo on
+			// error. The subsequent empty corpus replacement also cleans legacy
+			// synthetic chunk rows that are not graph node IDs.
+			if err := purger.PurgeRepo(repoPrefix); err != nil {
+				mi.logger.Warn("purge repo failed; falling back to node/edge eviction",
+					zap.String("prefix", repoPrefix), zap.Error(err))
+				nodesRemoved, edgesRemoved = mi.graph.EvictRepo(repoPrefix)
+			} else {
+				nodesRemoved, edgesRemoved = meta.NodeCount, meta.EdgeCount
+			}
+			return
 		}
-	} else {
-		// Backends without the purge capability (the in-memory store has no
-		// sidecars, so EvictRepo is already complete there).
+		// Backends without sidecars are complete after ordinary eviction.
 		nodesRemoved, edgesRemoved = mi.graph.EvictRepo(repoPrefix)
+	}
+	refresh := func(sw *search.Swappable) error {
+		purgeRepo()
+		return mi.publishVectorCorpusAfterRepoRemoval(context.Background(), repoPrefix, sw)
+	}
+	if sw, ok := mi.search.(*search.Swappable); ok {
+		if err := sw.SerializeVectorUpdate(func() error { return refresh(sw) }); err != nil {
+			mi.logger.Warn("refresh vector corpus after untrack failed",
+				zap.String("prefix", repoPrefix), zap.Error(err))
+		}
+	} else if err := refresh(nil); err != nil {
+		mi.logger.Warn("remove vector corpus after untrack failed",
+			zap.String("prefix", repoPrefix), zap.Error(err))
 	}
 
 	// Remove from global config.
@@ -4419,128 +4407,4 @@ func (mi *MultiIndexer) applyRemoteStitch(cr *resolver.CrossRepoResolver) {
 // Search returns the shared search backend.
 func (mi *MultiIndexer) Search() search.Backend {
 	return mi.search
-}
-
-// ExportVectorIndex serializes the workspace-global semantic-search
-// vector index — there is one shared HNSW index across every tracked
-// repo, not one per repo. Returns nil, 0, 0 when no vector index is
-// active (embeddings disabled, or the backend is still text-only).
-// Used by the daemon snapshot path so a default-on daemon does not
-// re-embed the whole graph on every restart.
-func (mi *MultiIndexer) ExportVectorIndex() ([]byte, int, int) {
-	sw, ok := mi.search.(*search.Swappable)
-	if !ok {
-		return nil, 0, 0
-	}
-	hybrid, ok := sw.Inner().(*search.HybridBackend)
-	if !ok {
-		return nil, 0, 0
-	}
-	vec := hybrid.VectorIndex()
-	if vec == nil || vec.Count() == 0 {
-		return nil, 0, 0
-	}
-	var buf bytes.Buffer
-	if err := vec.Save(&buf); err != nil {
-		mi.logger.Warn("failed to export vector index", zap.Error(err))
-		return nil, 0, 0
-	}
-	return buf.Bytes(), vec.Dims(), vec.Count()
-}
-
-// ImportVectorIndex restores a previously-exported vector index into
-// the shared search backend, wrapping the current text backend in a
-// HybridBackend. It is a no-op when embeddings are disabled (no
-// configured embedder) or when the cached index's dimensionality does
-// not match the active embedder — a provider switch (GloVe 50d → ONNX
-// 384d) makes the cached vectors meaningless, so the indexer re-embeds
-// instead. Returns an error only on a structurally corrupt index blob.
-func (mi *MultiIndexer) ImportVectorIndex(data []byte, dims, count int) error {
-	if len(data) == 0 || mi.embedder == nil {
-		return nil
-	}
-	if embedderDims := mi.embedder.Dimensions(); embedderDims > 0 && embedderDims != dims {
-		mi.logger.Info("vector index dims mismatch, will re-embed",
-			zap.Int("cached_dims", dims), zap.Int("embedder_dims", embedderDims))
-		return nil
-	}
-	sw, ok := mi.search.(*search.Swappable)
-	if !ok {
-		return nil
-	}
-	vec := search.NewVector(dims)
-	if err := vec.LoadFrom(bytes.NewReader(data)); err != nil {
-		return fmt.Errorf("import vector index: %w", err)
-	}
-	vec.SetCount(count)
-
-	// Unwrap an existing HybridBackend to its text side before
-	// re-wrapping so we never nest Hybrids (each retains a stale
-	// vector index — see buildSearchIndex for the memory rationale).
-	inner := sw.Inner()
-	if hyb, ok := inner.(*search.HybridBackend); ok {
-		inner = hyb.TextBackend()
-	}
-	sw.Swap(search.NewHybrid(inner, vec, mi.embedder))
-	mi.logger.Info("restored vector index from snapshot",
-		zap.Int("vectors", count), zap.Int("dims", dims))
-	return nil
-}
-
-// AutoDetectRepos walks immediate subdirectories of parentPath looking for
-// .git directories. If parentPath itself is a Git repo, it returns a single
-// entry (the caller should index it as single-repo). If zero Git repos are
-// found, it returns nil so the caller can fall back to single-repo mode.
-// This is gated by the workspace.auto_detect config flag.
-func (mi *MultiIndexer) AutoDetectRepos(parentPath string) []config.RepoEntry {
-	absPath, err := filepath.Abs(parentPath)
-	if err != nil {
-		mi.logger.Warn("auto-detect: failed to resolve path", zap.String("path", parentPath), zap.Error(err))
-		return nil
-	}
-
-	// If the path itself is a Git repo, return it as a single repo.
-	if isGitRepo(absPath) {
-		return []config.RepoEntry{{
-			Path: absPath,
-			Name: filepath.Base(absPath),
-		}}
-	}
-
-	// Walk immediate subdirectories (not recursive) for .git dirs.
-	entries, err := os.ReadDir(absPath)
-	if err != nil {
-		mi.logger.Warn("auto-detect: failed to read directory", zap.String("path", absPath), zap.Error(err))
-		return nil
-	}
-
-	var repos []config.RepoEntry
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		subDir := filepath.Join(absPath, entry.Name())
-		if isGitRepo(subDir) {
-			repos = append(repos, config.RepoEntry{
-				Path: subDir,
-				Name: entry.Name(), // Derive RepoPrefix from subdirectory name.
-			})
-		}
-	}
-
-	// If zero Git repos found, return nil — caller falls back to single-repo.
-	if len(repos) == 0 {
-		return nil
-	}
-
-	return repos
-}
-
-// isGitRepo checks whether the given directory contains a .git subdirectory.
-func isGitRepo(dir string) bool {
-	info, err := os.Stat(filepath.Join(dir, ".git"))
-	if err != nil {
-		return false
-	}
-	return info.IsDir()
 }

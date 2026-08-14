@@ -260,8 +260,8 @@ func TestClones_PerRepo_NoCrossRepoEdges(t *testing.T) {
 	require.NoError(t, err)
 
 	// Per-repo batch clone pass (the new MultiIndexer loop).
-	csA := detectClonesAndEmitEdgesCtx(ctx, gBatch, "repoA", 0)
-	csB := detectClonesAndEmitEdgesCtx(ctx, gBatch, "repoB", 0)
+	csA, _ := detectClonesAndEmitEdgesWithBaselineCtx(ctx, gBatch, "repoA", 0)
+	csB, _ := detectClonesAndEmitEdgesWithBaselineCtx(ctx, gBatch, "repoB", 0)
 	require.Positive(t, csA.Items, "repoA must have clone-eligible bodies")
 	require.Positive(t, csB.Items, "repoB must have clone-eligible bodies")
 

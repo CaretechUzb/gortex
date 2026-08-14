@@ -71,8 +71,9 @@ func TestOpenV6PurgesUnprefixedSoloRepoRows(t *testing.T) {
 			}
 		}
 
-		// Embeddings are keyed by node_id alone (vectors has no repo_prefix
-		// column), so they are only reachable through node membership.
+		// Legacy embeddings have no trustworthy repository or chunk-parent
+		// ownership. The later v10 vector-only migration clears this derived
+		// table while preserving the graph topology exercised above.
 		for _, id := range []string{"internal/foo.go::Bar", "repo/internal/foo.go::Bar"} {
 			if _, err := db.Exec(
 				`INSERT INTO vectors (node_id, dims, vec) VALUES (?, 1, ?)`, id, []byte{0}); err != nil {
@@ -119,7 +120,7 @@ func TestOpenV6PurgesUnprefixedSoloRepoRows(t *testing.T) {
 		[]string{"repo/internal/foo.go::Bar -> dep::go.uber.org/zap::Logger"})
 
 	vectors := queryIDs(t, s.db, `SELECT node_id FROM vectors ORDER BY node_id`)
-	assertStringsEqual(t, "surviving vectors", vectors, []string{"repo/internal/foo.go::Bar"})
+	assertStringsEqual(t, "vectors after v10 derived-cache reset", vectors, nil)
 
 	mtimes := queryIDs(t, s.db, `SELECT repo_prefix || ':' || file_path FROM file_mtimes ORDER BY 1`)
 	assertStringsEqual(t, "surviving file_mtimes", mtimes, []string{"repo:repo/internal/foo.go"})

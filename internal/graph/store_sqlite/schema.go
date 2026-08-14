@@ -421,6 +421,18 @@ CREATE TABLE IF NOT EXISTS analysis_blobs (
 ) WITHOUT ROWID;
 `
 
+const vectorTableSQL = `
+CREATE TABLE IF NOT EXISTS vectors (
+    node_id     TEXT PRIMARY KEY,
+    repo_prefix TEXT NOT NULL DEFAULT '',
+    parent_id   TEXT NOT NULL DEFAULT '',
+    dims        INTEGER NOT NULL,
+    vec         BLOB NOT NULL
+) WITHOUT ROWID;
+`
+
+const vectorRepoIndexSQL = `CREATE INDEX IF NOT EXISTS vectors_by_repo ON vectors(repo_prefix, node_id)`
+
 // schemaSQL is the canonical DDL applied on Open. Statements are
 // idempotent (IF NOT EXISTS) so they run cleanly against a fresh DB
 // and against an existing one.
@@ -689,11 +701,7 @@ CREATE INDEX IF NOT EXISTS ref_facts_by_file ON ref_facts(repo_prefix, file_path
 -- ref_facts scan — the PK leads with from_id, not to_id.
 CREATE INDEX IF NOT EXISTS ref_facts_by_target ON ref_facts(repo_prefix, to_id);
 
-CREATE TABLE IF NOT EXISTS vectors (
-    node_id TEXT PRIMARY KEY,
-    dims    INTEGER NOT NULL,
-    vec     BLOB NOT NULL
-) WITHOUT ROWID;
+` + vectorTableSQL + `
 
 -- churn_enrichment is the per-node git-churn sidecar (change A: move
 -- enrichment OUT of nodes.meta so the node hot path stops encoding
@@ -747,7 +755,7 @@ CREATE TABLE IF NOT EXISTS blame_enrichment (
 CREATE INDEX IF NOT EXISTS blame_by_repo ON blame_enrichment(repo_prefix) WHERE repo_prefix <> '';
 
 -- symbol_fts is the FTS5 full-text index over pre-tokenised symbol
--- names. It replaces the multi-GB in-heap Bleve/BM25 index with an
+-- names. It replaces the multi-GB in-heap BM25 index with an
 -- on-disk inverted index the SymbolSearcher / SymbolBundleSearcher
 -- query through. A standard (NOT contentless) FTS5 table; individual
 -- rows are deleted by their FTS5 docid via the symbol_fts_rowid sidecar

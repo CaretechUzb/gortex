@@ -77,8 +77,8 @@ func prepareOnReader(t *testing.T, store *Store, q string) *sql.Stmt {
 
 // TestEdgeScansSurfaceRowIterationErrors pins the contract that a driver error
 // raised part-way through an edge cursor is reported rather than silently
-// shortening the returned slice. Both edge scanners take a prepared statement,
-// so the failure is injected through the statement's own SQL.
+// shortening the returned slice. The scanner takes a prepared statement, so
+// the failure is injected through the statement's own SQL.
 func TestEdgeScansSurfaceRowIterationErrors(t *testing.T) {
 	store := newScanErrorStore(t)
 
@@ -86,16 +86,9 @@ func TestEdgeScansSurfaceRowIterationErrors(t *testing.T) {
 	if got := len(store.queryEdges(healthy)); got != 3 {
 		t.Fatalf("healthy edge scan returned %d edges, want 3", got)
 	}
-	healthyLight := prepareOnReader(t, store, `SELECT `+edgeColsLight+` FROM edges`)
-	if got := len(store.queryEdgesLight(healthyLight)); got != 3 {
-		t.Fatalf("healthy light edge scan returned %d edges, want 3", got)
-	}
-
 	poisoned := prepareOnReader(t, store, `SELECT `+lookupEdgeCols+` FROM edges`+poisonAfterFirstEdge)
 	assertScanFailureSurfaces(t, "queryEdges", func() { store.queryEdges(poisoned) })
 
-	poisonedLight := prepareOnReader(t, store, `SELECT `+edgeColsLight+` FROM edges`+poisonAfterFirstEdge)
-	assertScanFailureSurfaces(t, "queryEdgesLight", func() { store.queryEdgesLight(poisonedLight) })
 }
 
 // TestInlineSQLScansSurfaceQueryAndRowErrors covers the raw-SQL siblings used

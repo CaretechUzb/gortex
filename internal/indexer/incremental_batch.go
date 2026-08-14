@@ -1290,10 +1290,7 @@ func affectedByDeltaFromExtraction(
 }
 
 type affectedByBatchPlan struct {
-	files    []string
-	passes   int64
-	resolved int64
-	dropped  int64
+	files []string
 }
 
 func (b *reparsePendingEnrichmentBatch) mergeDeferredAffected(plan affectedByBatchPlan) {
@@ -1308,9 +1305,6 @@ func (b *reparsePendingEnrichmentBatch) mergeDeferredAffected(plan affectedByBat
 			b.deferredAffectedFiles[filePath] = struct{}{}
 		}
 	}
-	b.deferredAffectedPasses += plan.passes
-	b.deferredAffectedResolved += plan.resolved
-	b.deferredAffectedDropped += plan.dropped
 }
 
 func (b *reparsePendingEnrichmentBatch) deferredAffectedPlan() affectedByBatchPlan {
@@ -1322,10 +1316,7 @@ func (b *reparsePendingEnrichmentBatch) deferredAffectedPlan() affectedByBatchPl
 		files = append(files, filePath)
 	}
 	sort.Strings(files)
-	return affectedByBatchPlan{
-		files: files, passes: b.deferredAffectedPasses,
-		resolved: b.deferredAffectedResolved, dropped: b.deferredAffectedDropped,
-	}
+	return affectedByBatchPlan{files: files}
 }
 
 func (idx *Indexer) planAffectedByStages(stages []*incrementalBatchStage) affectedByBatchPlan {
@@ -1406,14 +1397,11 @@ func (idx *Indexer) planAffectedByStages(stages []*incrementalBatchStage) affect
 			idx.logger.Debug("affected-by: re-resolve set truncated",
 				zap.String("file", changedPath), zap.Int("affected", len(files)),
 				zap.Int("cap", maxFiles), zap.Int("dropped", len(files)-maxFiles))
-			plan.dropped += int64(len(files) - maxFiles)
 			files = files[:maxFiles]
 		}
 		if len(files) == 0 {
 			continue
 		}
-		plan.passes++
-		plan.resolved += int64(len(files))
 		for _, filePath := range files {
 			union[filePath] = struct{}{}
 		}
@@ -1427,14 +1415,9 @@ func (idx *Indexer) planAffectedByStages(stages []*incrementalBatchStage) affect
 }
 
 func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) {
-	if plan.dropped > 0 {
-		idx.affectedByDropped.Add(plan.dropped)
-	}
 	if len(plan.files) == 0 {
 		return
 	}
-	idx.affectedByPasses.Add(plan.passes)
-	idx.affectedByFilesResolved.Add(plan.resolved)
 	idx.observeIncrementalCatchup("affected_by", plan.files)
 	idx.resolver.ResolveFilesAndIncoming(plan.files)
 	resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), plan.files)

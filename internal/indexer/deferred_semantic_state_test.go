@@ -50,7 +50,7 @@ func TestDeferredEnrichmentReleasesEveryRepoStateAfterDrain(t *testing.T) {
 		})
 	}
 
-	scheduled := mi.RunDeferredPassesAll(context.Background())
+	scheduled := mi.RunDeferredPassesAllResult(context.Background()).EnrichScheduled
 	if scheduled != repoCount {
 		t.Fatalf("scheduled enrichment = %d, want %d", scheduled, repoCount)
 	}

@@ -15,8 +15,6 @@
 package review
 
 import (
-	"strings"
-
 	"github.com/zzet/gortex/internal/astquery"
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -138,16 +136,4 @@ func loopDepth(n *graph.Node) int {
 		return int(v)
 	}
 	return 0
-}
-
-// IsReviewDetector reports whether a detector name belongs to the
-// review rulepack's undecidable set — exposed so the review flow can
-// decide which matches still need grounding when it reuses
-// pre-computed rulepack results.
-func IsReviewDetector(name string) bool {
-	switch strings.TrimSpace(name) {
-	case detectorLoopQueryGo, detectorLoopQueryPy, detectorCheckActMapGo, detectorCheckActDictPy:
-		return true
-	}
-	return false
 }

@@ -727,6 +727,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			continue
 		}
 
+		definitionContexts := buildGoDefinitionContexts(pkg.Syntax)
 		for ident, obj := range pkg.TypesInfo.Defs {
 			if obj == nil || ident.Pos() == token.NoPos {
 				continue
@@ -740,10 +741,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			graphPath := scopedGraphPath(repoPrefix, relPath)
 
 			fileNodes := nodesByFile[graphPath]
-			node := matchRepoNodeByFileLine(fileNodes, pos.Line)
-			if node == nil {
-				node = matchRepoNodeByName(fileNodes, ident.Name)
-			}
+			node := matchRepoDefinitionNode(fileNodes, pos, ident.Name, obj, definitionContexts[ident])
 			if node != nil {
 				objToNode[obj] = node.ID
 				result.SymbolsCovered++
@@ -2020,12 +2018,12 @@ func resolveGoUse(
 
 // enrichImplements confirms existing EdgeImplements edges using go/types.
 // implementsInterfaceNode reports whether nodeID can legitimately stand as
-// the interface side of an implements edge. Phase-1 maps go/types objects to
-// graph nodes by innermost file/line containment, and on a signature line the
-// innermost node is a PARAMETER — one interface object mis-mapped that way
-// fanned a single empty interface into 130,250 implements edges targeting a
-// lone `#param:ctx` node (57% of the workspace's implements set). Node kind
-// is the exact guard: only an interface-kind node may host an interface.
+// the interface side of an implements edge. Phase 1 now rejects incompatible
+// identities before mapping; this kind check remains defense in depth for
+// persisted or legacy projections. The historical line-first matcher once
+// mapped an interface to a same-line parameter and fanned it into 130,250
+// implements edges targeting one `#param:ctx` node. Only an interface-kind
+// node may host an interface.
 func implementsInterfaceNode(nodesByID map[string]*graph.Node, nodeID string) bool {
 	node := nodesByID[nodeID]
 	return node != nil && node.Kind == graph.KindInterface
@@ -2273,57 +2271,6 @@ func findContainingFuncInNodes(nodes []*graph.Node, line int) *graph.Node {
 		}
 	}
 	return best
-}
-
-// matchRepoNodeByFileLine mirrors semantic.MatchNodeByFileLine over an
-// already-materialized file slice. Keeping the exact innermost-then-nearest
-// policy preserves matching behavior while removing the per-object store read.
-func matchRepoNodeByFileLine(nodes []*graph.Node, line int) *graph.Node {
-	var best *graph.Node
-	bestSize := int(^uint(0) >> 1)
-	for _, n := range nodes {
-		if n == nil || n.Kind == graph.KindFile || n.Kind == graph.KindImport {
-			continue
-		}
-		if n.StartLine <= line && line <= n.EndLine {
-			size := n.EndLine - n.StartLine
-			if size < bestSize {
-				best = n
-				bestSize = size
-			}
-		}
-	}
-	if best != nil {
-		return best
-	}
-
-	bestDist := int(^uint(0) >> 1)
-	for _, n := range nodes {
-		if n == nil || n.Kind == graph.KindFile || n.Kind == graph.KindImport {
-			continue
-		}
-		dist := n.StartLine - line
-		if dist < 0 {
-			dist = -dist
-		}
-		if dist < bestDist {
-			best = n
-			bestDist = dist
-		}
-	}
-	if bestDist <= 2 {
-		return best
-	}
-	return nil
-}
-
-func matchRepoNodeByName(nodes []*graph.Node, name string) *graph.Node {
-	for _, n := range nodes {
-		if n != nil && n.Name == name {
-			return n
-		}
-	}
-	return nil
 }
 
 // inferEdgeKindFromObj determines the edge kind from a go/types object.

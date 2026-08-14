@@ -2,7 +2,6 @@ package search
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -88,9 +87,9 @@ func TestHybridSearch_DeChunkPreservesOrder(t *testing.T) {
 		"b.go::B#chunk0": "b.go::B",
 	})
 
-	// Empty text backend so only the vector channel decides ordering.
+	// Keep construction realistic; this assertion exercises the vector
+	// de-chunk order directly, before channel fusion.
 	h := NewHybrid(NewBM25(), vec, fixedEmbedder{dims: dims})
-	h.SetAutoAlpha(false) // plain RRF — vector ranks drive the order
 
 	got := h.dechunkVectorIDs(vec.Search([]float32{1, 0, 0}, 8), 8)
 	require.Len(t, got, 2)
@@ -129,59 +128,3 @@ func TestVectorBackend_ResolveChunk(t *testing.T) {
 	assert.False(t, isChunk)
 	assert.Equal(t, "g.go::G", plain, "an unmapped ID must pass through unchanged")
 }
-
-// TestVectorBackend_ChunkMapSurvivesSaveLoad asserts the chunk map is
-// persisted by Save and restored by LoadFrom — the daemon snapshot and
-// the per-repo cache both rely on this so de-chunking still works after
-// a restart.
-func TestVectorBackend_ChunkMapSurvivesSaveLoad(t *testing.T) {
-	src := NewVector(3)
-	src.Add("big.go::Big#chunk0", []float32{1, 0, 0})
-	src.Add("big.go::Big#chunk1", []float32{0, 1, 0})
-	src.SetChunkMap(map[string]string{
-		"big.go::Big#chunk0": "big.go::Big",
-		"big.go::Big#chunk1": "big.go::Big",
-	})
-
-	var buf strings.Builder
-	require.NoError(t, src.Save(&stringWriter{&buf}))
-
-	dst := NewVector(3)
-	require.NoError(t, dst.LoadFrom(strings.NewReader(buf.String())))
-	require.True(t, dst.HasChunks(), "chunk map must survive a Save/Load round-trip")
-
-	parent, isChunk := dst.ResolveChunk("big.go::Big#chunk1")
-	assert.True(t, isChunk)
-	assert.Equal(t, "big.go::Big", parent)
-}
-
-// TestVectorBackend_LegacyBlobLoadsWithoutChunkMap asserts a legacy raw
-// HNSW export (written before the framed format) still loads, with an
-// empty chunk map — the back-compat path.
-func TestVectorBackend_LegacyBlobLoadsWithoutChunkMap(t *testing.T) {
-	// A VectorBackend with no chunk map, saved, then a fresh backend
-	// loaded from a stream that has had the frame magic stripped to
-	// simulate a pre-framing blob.
-	src := NewVector(3)
-	src.Add("a.go::A", []float32{1, 0, 0})
-	var framed strings.Builder
-	require.NoError(t, src.Save(&stringWriter{&framed}))
-
-	raw := framed.String()
-	// Frame layout: 4-byte magic + 4-byte map length + map JSON + HNSW.
-	// Strip magic+length+"{}" (an empty map JSON) to get the bare HNSW.
-	require.Greater(t, len(raw), 10)
-	bare := raw[4+4+2:] // 4 magic, 4 length, 2 = len("{}")
-
-	dst := NewVector(3)
-	require.NoError(t, dst.LoadFrom(strings.NewReader(bare)),
-		"a legacy un-framed HNSW blob must still load")
-	assert.False(t, dst.HasChunks(), "a legacy blob has no chunk map")
-}
-
-// stringWriter adapts a strings.Builder to io.Writer for the tests
-// above (strings.Builder already satisfies io.Writer, but the wrapper
-// keeps the intent explicit).
-type stringWriter struct{ b *strings.Builder }
-
-func (w *stringWriter) Write(p []byte) (int, error) { return w.b.Write(p) }

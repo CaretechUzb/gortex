@@ -14,6 +14,12 @@ import (
 // and recovers any per-document panic (mirroring safeExtract) so a malformed
 // asset isolates to a failed file rather than crashing the pass.
 func (idx *Indexer) extractStreaming(se parser.StreamingExtractor, path, relPath string) (res *parser.ExtractionResult, err error) {
+	releaseLifecycle, admissionErr := idx.extractionLifecycle.admit()
+	if admissionErr != nil {
+		return nil, admissionErr
+	}
+	defer releaseLifecycle()
+
 	f, oerr := os.Open(path)
 	if oerr != nil {
 		return nil, oerr

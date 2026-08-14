@@ -100,11 +100,11 @@ cases:
       query: NewHybid
       expected:
         - internal/search/hybrid.go::NewHybrid
-    - id: exact-rrfFuse-typo
+    - id: exact-alphaFuse-typo
       tier: exact
-      query: rrfFse
+      query: alphaFse
       expected:
-        - internal/search/hybrid.go::rrfFuse
+        - internal/search/hybrid.go::alphaFuse
     - id: exact-VectorBackend-typo
       tier: exact
       query: VectorBcakend
@@ -345,11 +345,11 @@ cases:
       query: comlbine text and vector search with RRF
       expected:
         - internal/search/hybrid.go::HybridBackend
-    - id: concept-rrf-algorithm-typo
+    - id: concept-adaptive-alpha-typo
       tier: concept
-      query: reciprocal randk fusion
+      query: adaptive alpha weighted reciprocal randk fusion
       expected:
-        - internal/search/hybrid.go::rrfFuse
+        - internal/search/hybrid.go::alphaFuse
     - id: concept-swap-backend-typo
       tier: concept
       query: hot-swap the in-memory searich backend
@@ -673,7 +673,7 @@ cases:
       query: search backend implementatsions
       expected:
         - internal/search/bm25.go::BM25Backend
-        - internal/search/bleve.go::BleveBackend
+        - internal/search/symbolsearcher_backend.go::SymbolSearcherBackend
         - internal/search/hybrid.go::HybridBackend
         - internal/search/vector.go::VectorBackend
         - internal/search/swappable.go::Swappable

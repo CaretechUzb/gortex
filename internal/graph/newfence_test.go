@@ -22,9 +22,7 @@ import (
 // stagingCallers lists the non-test files allowed to construct it. Keeping the
 // list this short is the point: a new entry means some production path is about
 // to hold graph data that no restart can recover.
-var stagingCallers = []string{
-	"internal/indexer/indexer.go",
-}
+var stagingCallers []string
 
 // graphImportPath is the package under fence. The scan resolves whatever local
 // name each file binds it to, so an alias or a dot import is caught the same as

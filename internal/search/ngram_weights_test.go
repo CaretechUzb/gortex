@@ -162,13 +162,19 @@ func TestInstallNgramBoundaries_BM25Chain(t *testing.T) {
 	defer sw.Close()
 	assert.True(t, InstallNgramBoundaries(sw, tbl))
 
-	// A backend with no BM25 layer: no-op, returns false. Bleve has no
-	// BM25 inner.
-	blv, err := NewBleve()
-	require.NoError(t, err)
-	defer blv.Close()
-	assert.False(t, InstallNgramBoundaries(blv, tbl))
+	// A backend with no BM25 layer: no-op, returns false.
+	assert.False(t, InstallNgramBoundaries(nonBM25Backend{}, tbl))
 }
+
+// nonBM25Backend is an inert Backend with no BM25 anywhere in its
+// unwrap chain — the shape the ngram installers must refuse.
+type nonBM25Backend struct{}
+
+func (nonBM25Backend) Add(string, ...string)             {}
+func (nonBM25Backend) Remove(string)                     {}
+func (nonBM25Backend) Search(string, int) []SearchResult { return nil }
+func (nonBM25Backend) Count() int                        { return 0 }
+func (nonBM25Backend) Close()                            {}
 
 func TestBuildAndInstallNgramBoundaries_ChecksCapabilityBeforeGraphScan(t *testing.T) {
 	g := &countingNgramReader{Reader: boundaryFixtureGraph([]string{
@@ -176,10 +182,7 @@ func TestBuildAndInstallNgramBoundaries_ChecksCapabilityBeforeGraphScan(t *testi
 		"alphaToken", "betaToken", "tokenize", "tokenizer",
 	})}
 
-	blv, err := NewBleve()
-	require.NoError(t, err)
-	defer blv.Close()
-	assert.False(t, BuildAndInstallNgramBoundaries(blv, g))
+	assert.False(t, BuildAndInstallNgramBoundaries(nonBM25Backend{}, g))
 	assert.Zero(t, g.allNodesCalls, "a backend without BM25 must not enumerate the graph")
 
 	bm := NewBM25()

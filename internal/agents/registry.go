@@ -49,27 +49,6 @@ func (r *Registry) All() []Adapter {
 	return out
 }
 
-// Names returns the sorted list of registered adapter names. Used by
-// the --agents flag's help text and the unknown-name error message.
-func (r *Registry) Names() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	out := make([]string, 0, len(r.byName))
-	for name := range r.byName {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// Lookup returns the adapter with the given name, or nil when no
-// adapter is registered under that name.
-func (r *Registry) Lookup(name string) Adapter {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.byName[name]
-}
-
 // Filter returns the subset of adapters selected by allow/skip lists.
 // allowCSV:
 //   - "" (empty) or "auto" selects every registered adapter (the

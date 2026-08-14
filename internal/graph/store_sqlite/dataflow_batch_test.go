@@ -11,7 +11,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-func TestScanDataflowEdgesBatchedUsesFixedHighWaterAcrossReindex(t *testing.T) {
+func TestScanEdgesByKindsBatchedUsesFixedHighWaterAcrossReindex(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
@@ -30,7 +30,7 @@ func TestScanDataflowEdgesBatchedUsesFixedHighWaterAcrossReindex(t *testing.T) {
 
 	seen := make(map[string]int, count)
 	batches := 0
-	store.ScanDataflowEdgesBatched(3, func(batch []*graph.Edge) bool {
+	store.ScanEdgesByKindsBatched([]graph.EdgeKind{graph.EdgeArgOf, graph.EdgeReturnsTo}, 3, func(batch []*graph.Edge) bool {
 		batches++
 		reindexes := make([]graph.EdgeReindex, 0, len(batch))
 		for _, edge := range batch {

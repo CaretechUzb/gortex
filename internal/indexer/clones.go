@@ -659,8 +659,8 @@ func finaliseCloneSignaturesFromNodes(g graph.Store, repoPrefix string) ([]clone
 	return items, len(bodies)
 }
 
-// CloneDetectionStats summarises one detectClonesAndEmitEdges run for
-// the caller's logger. Exposed so the orchestrator can surface what the
+// CloneDetectionStats summarises one clone-detection run for the caller's
+// logger. Exposed so the orchestrator can surface what the
 // per-bucket cap dropped — a high skippedBucketItems means the
 // workspace has a lot of templated boilerplate that LSH would have
 // over-fanned-out on.
@@ -672,44 +672,6 @@ type CloneDetectionStats struct {
 	SkippedBucketItems int // total items inside the dropped buckets
 	DiffusedPairs      int // semantically-related pairs surviving threshold+cap
 	DiffusedEdges      int // EdgeSemanticallyRelated emitted (= 2·DiffusedPairs)
-}
-
-// detectClonesAndEmitEdges is the graph-wide half of clone detection.
-// It collects every function/method node carrying a clone_sig, runs
-// the MinHash + LSH pass over their signatures, and materialises a
-// symmetric pair of EdgeSimilarTo edges for each detected clone pair.
-//
-// threshold is the Jaccard similarity cutoff; pass 0 to use the
-// clones package default. Returns clone stats including the per-bucket
-// cap telemetry — the orchestrator logs that so a high skip count is
-// visible during warmup.
-//
-// The pass is a full recompute and is idempotent: graph.AddEdge dedupes
-// by edgeKey so re-emitting an unchanged pair is a no-op, and stale
-// edges cannot survive — when either endpoint's file is reindexed,
-// EvictFile removes that node's edges in both directions before this
-// pass re-runs.
-//
-// repoPrefix scopes the pass to one repository's nodes: every whole-graph
-// walk it drives (finalise, item gather, diffusion) is filtered to
-// n.RepoPrefix == repoPrefix so no cross-repo candidate pair is ever
-// formed. A standalone single-repo Indexer passes "" and its nodes carry
-// RepoPrefix == "", so the equality matches all nodes and the single-repo
-// result is unchanged.
-func detectClonesAndEmitEdges(g graph.Store, repoPrefix string, threshold float64) CloneDetectionStats {
-	return detectClonesAndEmitEdgesCtx(context.Background(), g, repoPrefix, threshold)
-}
-
-// detectClonesAndEmitEdgesCtx is the context-aware sibling of
-// detectClonesAndEmitEdges. It emits sub-stage progress markers via
-// the reporter attached to ctx (see progress.WithReporter): clone
-// detection is the longest single stage on monorepo-scale graphs and
-// without intra-stage reporters an operator sees just one
-// "clone detection pass" marker followed by minutes of silence — no
-// way to tell finalise-signatures from LSH from edge-emission.
-func detectClonesAndEmitEdgesCtx(ctx context.Context, g graph.Store, repoPrefix string, threshold float64) CloneDetectionStats {
-	stats, _ := detectClonesAndEmitEdgesWithBaselineCtx(ctx, g, repoPrefix, threshold)
-	return stats
 }
 
 // detectClonesAndEmitEdgesWithBaselineCtx performs the context-aware clone

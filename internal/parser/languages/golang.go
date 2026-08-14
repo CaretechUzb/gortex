@@ -197,31 +197,6 @@ const qGoAll = `
 type GoExtractor struct {
 	lang *sitter.Language
 	qAll *parser.PreparedQuery
-	// envHelperExtra is the per-repo corporate env-helper allow-list (lower-
-	// cased names) loaded from the git-ignored `.gortex/temporal-allowlist.yaml`.
-	// Names here are merged with the built-in goEnvHelperNames when recognising
-	// a Temporal env-or-default dispatch helper, promoting the resolved edge to
-	// the inferred (visible) tier. Empty/nil when no local allow-list is loaded.
-	envHelperExtra map[string]bool
-}
-
-// SetEnvHelperNames installs the per-repo corporate env-helper allow-list on
-// the extractor. Names are stored lower-cased for case-insensitive matching.
-// Called once during extractor registration (config is not available at parse
-// time); a nil / empty slice clears it. Safe to call before indexing begins;
-// must not be called concurrently with Extract.
-func (e *GoExtractor) SetEnvHelperNames(names []string) {
-	if len(names) == 0 {
-		e.envHelperExtra = nil
-		return
-	}
-	m := make(map[string]bool, len(names))
-	for _, n := range names {
-		if n = strings.TrimSpace(n); n != "" {
-			m[strings.ToLower(n)] = true
-		}
-	}
-	e.envHelperExtra = m
 }
 
 func NewGoExtractor() *GoExtractor {
@@ -375,6 +350,17 @@ type goDeferredValueIdent struct {
 }
 
 func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
+	return e.ExtractWithOptions(filePath, src, parser.ExtractionOptions{})
+}
+
+// ExtractWithOptions applies request-scoped repository configuration without
+// mutating this shared extractor. Configured Temporal helpers extend the
+// built-in helper set for this extraction only.
+func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parser.ExtractionOptions) (*parser.ExtractionResult, error) {
+	envHelperExtra := make(map[string]bool)
+	for _, name := range opts.TemporalEnvHelpers() {
+		envHelperExtra[name] = true
+	}
 	tree, err := parser.ParseFile(src, e.lang)
 	if err != nil {
 		return nil, err
@@ -547,7 +533,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 					// variable, try to resolve it to an env-var-with-literal
 					// -default so the dispatch lands on the default activity.
 					if argNode != nil && argNode.Type() == "identifier" {
-						if litDef, constName, source, ok := goTemporalEnvDefaultName(expr.Node, name, src, e.envHelperExtra); ok {
+						if litDef, constName, source, ok := goTemporalEnvDefaultName(expr.Node, name, src, envHelperExtra); ok {
 							dc.tempEnvDefault = true
 							dc.tempEnvSource = source
 							if constName != "" {

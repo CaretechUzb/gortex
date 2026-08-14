@@ -27,9 +27,9 @@ type embedderProvider interface {
 }
 
 // backendEmbedder extracts the query embedder from a search backend,
-// unwrapping one level of Swappable. Returns nil when no embedder is
-// reachable — the caller treats that as "vector channel inactive" and
-// skips the refinement entirely.
+// through the backend's lock-scoped capability surface. Returns nil when no
+// embedder is reachable — the caller treats that as "vector channel inactive"
+// and skips the refinement entirely.
 func backendEmbedder(b search.Backend) embedding.Provider {
 	if b == nil {
 		return nil
@@ -37,11 +37,6 @@ func backendEmbedder(b search.Backend) embedding.Provider {
 	if ep, ok := b.(embedderProvider); ok {
 		if e := ep.Embedder(); e != nil {
 			return e
-		}
-	}
-	if sw, ok := b.(*search.Swappable); ok {
-		if ep, ok := sw.Inner().(embedderProvider); ok {
-			return ep.Embedder()
 		}
 	}
 	return nil

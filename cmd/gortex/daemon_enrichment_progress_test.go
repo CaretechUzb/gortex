@@ -108,9 +108,9 @@ func TestStatusResponse_EnrichmentJSONRoundTrip(t *testing.T) {
 	assert.NotContains(t, string(rawEmpty), `"enrichment"`, "Enrichment must be omitted (omitempty) when nil")
 }
 
-// TestSearchBackendStats_DiskResidentJSONRoundTrip locks in the new
+// TestSearchBackendStats_DiskResidentJSONRoundTrip locks in that the
 // DiskResident flag survives the wire round trip and is omitted when
-// false (the existing bleve/bm25 backends never set it).
+// false (the in-process BM25 backend never sets it).
 func TestSearchBackendStats_DiskResidentJSONRoundTrip(t *testing.T) {
 	sb := daemon.SearchBackendStats{Name: "sqlite-fts5", DocCount: 48572, DiskResident: true}
 	raw, err := json.Marshal(sb)

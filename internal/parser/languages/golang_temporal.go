@@ -1254,7 +1254,7 @@ func goEnvHelperDefaultLiteral(call *sitter.Node, src []byte, extra map[string]b
 			break
 		}
 	}
-	if !matched && extra[strings.ToLower(callee)] {
+	if !matched && extra[callee] {
 		matched = true
 	}
 	if !matched {

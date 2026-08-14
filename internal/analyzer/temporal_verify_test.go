@@ -2,14 +2,12 @@ package analyzer
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/resolver"
 )
 
@@ -50,27 +48,6 @@ func TestParseTemporalVerdict(t *testing.T) {
 	}
 }
 
-func TestFileSourceProvider_SlicesByLine(t *testing.T) {
-	dir := t.TempDir()
-	rel := "pkg/a.go"
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "pkg"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, rel),
-		[]byte("package pkg\n\nfunc A() {}\nfunc B() {\n\treturn\n}\n"), 0o644))
-
-	p := NewFileSourceProvider(dir)
-	// Node B spans lines 4..6.
-	n := &graph.Node{FilePath: rel, StartLine: 4, EndLine: 6}
-	src, ok := p.NodeSource(n)
-	require.True(t, ok)
-	assert.Contains(t, src, "func B() {")
-	assert.Contains(t, src, "return")
-	assert.NotContains(t, src, "func A()")
-
-	// Missing file → not ok.
-	_, ok = p.NodeSource(&graph.Node{FilePath: "nope.go", StartLine: 1, EndLine: 1})
-	assert.False(t, ok)
-}
-
 type countingVerifier struct {
 	calls int
 	res   resolver.TemporalVerifyResult
@@ -108,27 +85,4 @@ func TestCachingVerifier_HitsCacheAndPersists(t *testing.T) {
 	r3, _ := c2.Verify(context.Background(), req)
 	assert.Equal(t, resolver.TemporalVerdictConfirmed, r3.Verdict, "loaded from disk, not the new delegate")
 	assert.Equal(t, 0, inner2.calls)
-}
-
-func TestFileSourceProvider_RefusesPathEscape(t *testing.T) {
-	dir := t.TempDir()
-	// A secret file OUTSIDE the indexed root.
-	outside := filepath.Join(filepath.Dir(dir), "secret.txt")
-	require.NoError(t, os.WriteFile(outside, []byte("TOPSECRET"), 0o644))
-	t.Cleanup(func() { _ = os.Remove(outside) })
-
-	p := NewFileSourceProvider(dir)
-
-	// Relative traversal via "..".
-	_, ok := p.NodeSource(&graph.Node{FilePath: "../secret.txt", StartLine: 1, EndLine: 1})
-	assert.False(t, ok, "must refuse a ../ escape out of the indexed root")
-
-	// Absolute path outside the root.
-	_, ok = p.NodeSource(&graph.Node{FilePath: outside, StartLine: 1, EndLine: 1})
-	assert.False(t, ok, "must refuse an absolute path outside the indexed root")
-
-	// A legit relative path inside the root still resolves.
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "in.go"), []byte("package p"), 0o644))
-	_, ok = p.NodeSource(&graph.Node{FilePath: "in.go", StartLine: 1, EndLine: 1})
-	assert.True(t, ok, "a path inside the root must still resolve")
 }

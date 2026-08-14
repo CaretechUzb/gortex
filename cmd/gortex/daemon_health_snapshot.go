@@ -116,6 +116,9 @@ func buildDaemonHealthSnapshot(
 		}
 	}
 	if state != nil && state.graph != nil {
+		if integrity := daemon.GraphIntegrityStatusFor(state.graph); integrity != nil {
+			out["graph_integrity"] = integrity
+		}
 		if reporter, ok := state.graph.(graph.DBStatReporter); ok {
 			dbBytes, walBytes := reporter.DBStats()
 			if dbBytes > 0 || walBytes > 0 {

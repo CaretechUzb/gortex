@@ -38,7 +38,7 @@ func TestRunDeferredPassesAllSkipsIdleRepositoriesBeforeStatsScan(t *testing.T) 
 		},
 	}
 
-	if scheduled := mi.RunDeferredPassesAll(context.Background()); scheduled != 0 {
+	if scheduled := mi.RunDeferredPassesAllResult(context.Background()).EnrichScheduled; scheduled != 0 {
 		t.Fatalf("scheduled enrichments = %d, want 0", scheduled)
 	}
 	if store.repoStatsCalls != 0 {
