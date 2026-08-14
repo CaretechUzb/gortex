@@ -40,23 +40,21 @@ func TestResolveSearchBackend_SymbolSearcherBackend(t *testing.T) {
 	assert.Equal(t, "sqlite-fts5", info.Name)
 	assert.True(t, info.DiskResident, "the FTS5 index lives inside the graph store, not in-process heap")
 	assert.Zero(t, info.Bytes, "no fabricated byte count for a disk-resident backend")
-	// Count() is a since-construction Add/Remove delta, not a corpus size —
-	// it goes negative as soon as an eviction path drops more than the admit
-	// predicate ever added. A store that cannot answer the real count must
-	// leave the figure unreported rather than have the delta stand in for it.
-	assert.False(t, info.DocCountKnown, "the delta must never be reported as a document count")
+	// Add and Remove are no-ops because the native store owns the corpus.
+	// A store that cannot answer the authoritative count must leave the figure
+	// unreported rather than fabricate an adapter-local document count.
+	assert.False(t, info.DocCountKnown, "an unavailable count must remain unknown")
 	assert.Zero(t, info.DocCount)
 }
 
 func TestResolveSearchBackend_SymbolSearcherBackend_CountFromIndex(t *testing.T) {
-	// Adds and removes move the adapter's delta. Count combines that delta
-	// with the persisted baseline, while status still reports the index's own
-	// authoritative count.
+	// Adds and removes are no-ops. Count and status both report the native
+	// index's authoritative corpus size without duplicating write-path deltas.
 	b := search.NewSymbolSearcherBackend(countingSymbolSearcher{count: 48572})
 	b.Add("node-1")
 	b.Remove("node-2")
 	b.Remove("node-3")
-	assert.Equal(t, 48571, b.Count(), "Count must combine the persisted baseline with the adapter delta")
+	assert.Equal(t, 48572, b.Count(), "Count must come from the native index")
 
 	info := resolveSearchBackend(b)
 
