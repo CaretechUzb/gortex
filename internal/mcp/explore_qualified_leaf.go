@@ -135,13 +135,26 @@ func (s *Server) exploreQualifiedLeafCandidate(
 	if len(files) == 0 {
 		return nil
 	}
+	nodeScope := s.localizationNodeScope(
+		ctx, scope, graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindMacro,
+	)
+	budget := localizationFileBudgetFor(ctx)
 	matches := make([]exploreQualifiedLeafMatch, 0, exploreSyntacticAnchorFetch)
 	seen := make(map[string]struct{}, exploreSyntacticAnchorFetch)
 	for _, file := range files {
-		if ctx.Err() != nil || len(matches) == exploreSyntacticAnchorFetch {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if len(matches) == exploreSyntacticAnchorFetch {
 			break
 		}
-		for _, node := range reader.GetFileNodes(file.path) {
+		page, complete := boundedLocalizationFileNodes(
+			ctx, reader, budget, file.path, nodeScope, localizationFileNodeLimit,
+		)
+		if !complete {
+			return nil
+		}
+		for _, node := range page.Nodes {
 			if node == nil || !exploreQualifiedLeafMatchesNode(node, member) ||
 				!exploreSyntacticAnchorEligibleNode(node) || !scope.ScopeAllows(node) ||
 				!s.nodeInSessionScope(ctx, node) {

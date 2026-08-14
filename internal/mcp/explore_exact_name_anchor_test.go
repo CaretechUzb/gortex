@@ -400,8 +400,11 @@ func TestExploreExactNameCaseVariantsAreBoundedAndUnicodeSafe(t *testing.T) {
 
 type exactNameAnchorCountingReader struct {
 	graph.Reader
-	nameLookups []string
-	fileLookups []string
+	nameLookups    []string
+	fileLookups    []string
+	fileLimits     []int
+	fileScopes     []graph.LocalizationNodeScope
+	fileProjection func(context.Context, string, graph.LocalizationNodeScope, int) (graph.BoundedNodeProjection, error)
 }
 
 func (reader *exactNameAnchorCountingReader) FindNodesByName(string) []*graph.Node {
@@ -422,9 +425,27 @@ func (reader *exactNameAnchorCountingReader) FindNodesByNameBounded(
 	return bounded.FindNodesByNameBounded(ctx, name, scope, limit)
 }
 
-func (reader *exactNameAnchorCountingReader) GetFileNodes(path string) []*graph.Node {
+func (*exactNameAnchorCountingReader) GetFileNodes(string) []*graph.Node {
+	panic("ranked-file localization must not use full-row GetFileNodes")
+}
+
+func (reader *exactNameAnchorCountingReader) FindFileNodesBounded(
+	ctx context.Context,
+	path string,
+	scope graph.LocalizationNodeScope,
+	limit int,
+) (graph.BoundedNodeProjection, error) {
 	reader.fileLookups = append(reader.fileLookups, path)
-	return reader.Reader.GetFileNodes(path)
+	reader.fileLimits = append(reader.fileLimits, limit)
+	reader.fileScopes = append(reader.fileScopes, scope)
+	if reader.fileProjection != nil {
+		return reader.fileProjection(ctx, path, scope, limit)
+	}
+	bounded, ok := reader.Reader.(graph.BoundedFileNodeReader)
+	if !ok {
+		return graph.BoundedNodeProjection{}, graph.ErrBoundedLocalizationUnavailable
+	}
+	return bounded.FindFileNodesBounded(ctx, path, scope, limit)
 }
 
 func (*exactNameAnchorCountingReader) FindNodesByNameContaining(string, int) []*graph.Node {
@@ -470,5 +491,100 @@ func TestExploreTaskAnchorsCaseFoldedRecoveryHasRequestWideBudgets(t *testing.T)
 	if len(reader.fileLookups) != exploreExactNameAnchorCaseFoldMaxFiles {
 		t.Fatalf("file lookups = %d (%#v), want request-wide cap %d",
 			len(reader.fileLookups), reader.fileLookups, exploreExactNameAnchorCaseFoldMaxFiles)
+	}
+	totalLimit := 0
+	for index, limit := range reader.fileLimits {
+		if limit <= 0 || limit > localizationFileNodeLimit {
+			t.Fatalf("file limit[%d] = %d, want (0, %d]", index, limit, localizationFileNodeLimit)
+		}
+		totalLimit += limit
+		scope := reader.fileScopes[index]
+		if !scope.ExcludeTests || len(scope.Kinds) != 4 ||
+			!scope.Kinds[graph.KindFunction] || !scope.Kinds[graph.KindMethod] ||
+			!scope.Kinds[graph.KindType] || !scope.Kinds[graph.KindMacro] {
+			t.Fatalf("file scope[%d] = %#v, want production function/method/type/macro declarations", index, scope)
+		}
+	}
+	if totalLimit > localizationFileRequestLimit {
+		t.Fatalf("aggregate file limit = %d, want <= %d", totalLimit, localizationFileRequestLimit)
+	}
+}
+
+type exactNameOnlyBoundedReader struct {
+	graph.Reader
+}
+
+func (reader *exactNameOnlyBoundedReader) FindNodesByNameBounded(
+	ctx context.Context,
+	name string,
+	scope graph.LocalizationNodeScope,
+	limit int,
+) (graph.BoundedNodeProjection, error) {
+	return reader.Reader.(graph.BoundedExactNameReader).FindNodesByNameBounded(ctx, name, scope, limit)
+}
+
+func TestExploreTaskAnchorsRankedFileProjectionFailsClosed(t *testing.T) {
+	target := &graph.Node{
+		ID: "pkg/render.go::buildContent", Name: "buildContent",
+		Kind: graph.KindFunction, FilePath: "pkg/render.go", StartLine: 31,
+	}
+	ranked := &graph.Node{
+		ID: "pkg/render.go::render", Name: "render",
+		Kind: graph.KindFunction, FilePath: "pkg/render.go", StartLine: 7,
+	}
+	tests := []struct {
+		name       string
+		readerBase func(*graph.Graph) graph.Reader
+		projection func(context.CancelFunc) func(context.Context, string, graph.LocalizationNodeScope, int) (graph.BoundedNodeProjection, error)
+	}{
+		{
+			name:       "truncated",
+			readerBase: func(base *graph.Graph) graph.Reader { return base },
+			projection: func(context.CancelFunc) func(context.Context, string, graph.LocalizationNodeScope, int) (graph.BoundedNodeProjection, error) {
+				return func(context.Context, string, graph.LocalizationNodeScope, int) (graph.BoundedNodeProjection, error) {
+					return graph.BoundedNodeProjection{Nodes: []*graph.Node{target}, Total: 2, Truncated: true}, nil
+				}
+			},
+		},
+		{
+			name: "unsupported",
+			readerBase: func(base *graph.Graph) graph.Reader {
+				return &exactNameOnlyBoundedReader{Reader: base}
+			},
+		},
+		{
+			name:       "canceled",
+			readerBase: func(base *graph.Graph) graph.Reader { return base },
+			projection: func(cancel context.CancelFunc) func(context.Context, string, graph.LocalizationNodeScope, int) (graph.BoundedNodeProjection, error) {
+				return func(context.Context, string, graph.LocalizationNodeScope, int) (graph.BoundedNodeProjection, error) {
+					cancel()
+					return graph.BoundedNodeProjection{}, context.Canceled
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			base := graph.New()
+			base.AddNode(target)
+			base.AddNode(ranked)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			reader := &exactNameAnchorCountingReader{Reader: test.readerBase(base)}
+			if test.projection != nil {
+				reader.fileProjection = test.projection(cancel)
+			}
+			ctx = WithOverlayView(ctx, graph.NewOverlaidView(reader, graph.NewOverlayLayer()))
+			server := &Server{graph: base}
+			anchors := server.exploreTaskAnchors(
+				ctx, "buildcontent", []*rerank.Candidate{{Node: ranked}}, query.QueryOptions{},
+			)
+			if len(anchors) != 0 {
+				t.Fatalf("anchors = %#v, want incomplete ranked-file lane to fail closed", anchors)
+			}
+			if len(reader.fileLookups) != 1 {
+				t.Fatalf("file lookups = %#v, want one bounded attempt", reader.fileLookups)
+			}
+		})
 	}
 }

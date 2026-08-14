@@ -81,3 +81,41 @@ func boundedLocalizationExactName(
 	}
 	return page, true
 }
+
+// boundedLocalizationFileNodes performs one metadata-free file projection
+// under the request-wide localization budget. Incomplete pages are not usable
+// evidence: ranked-file recovery makes uniqueness and ownership decisions, so
+// accepting a prefix could fabricate an unambiguous declaration.
+func boundedLocalizationFileNodes(
+	ctx context.Context,
+	reader graph.Reader,
+	budget *localizationFileRequestBudget,
+	path string,
+	scope graph.LocalizationNodeScope,
+	limit int,
+) (graph.BoundedNodeProjection, bool) {
+	bounded, ok := reader.(graph.BoundedFileNodeReader)
+	if !ok || path == "" || ctx.Err() != nil {
+		return graph.BoundedNodeProjection{}, false
+	}
+	if limit > localizationFileNodeLimit {
+		limit = localizationFileNodeLimit
+	}
+	reserved := budget.reserve(limit)
+	if reserved <= 0 {
+		return graph.BoundedNodeProjection{}, false
+	}
+	page, err := bounded.FindFileNodesBounded(ctx, path, scope, reserved)
+	if err != nil || ctx.Err() != nil {
+		return graph.BoundedNodeProjection{}, false
+	}
+	consumed := page.Total
+	if len(page.Nodes) > consumed {
+		consumed = len(page.Nodes)
+	}
+	budget.finish(reserved, consumed)
+	if page.Truncated {
+		return graph.BoundedNodeProjection{}, false
+	}
+	return page, true
+}

@@ -216,4 +216,67 @@ func TestExploreQualifiedLeafHasRankedFileBudgetAndNoCorpusScan(t *testing.T) {
 	if len(reader.fileLookups) != exploreQualifiedLeafMaxFiles {
 		t.Fatalf("file lookups = %d (%#v), want cap %d", len(reader.fileLookups), reader.fileLookups, exploreQualifiedLeafMaxFiles)
 	}
+	totalLimit := 0
+	for index, limit := range reader.fileLimits {
+		if limit <= 0 || limit > localizationFileNodeLimit {
+			t.Fatalf("file limit[%d] = %d, want (0, %d]", index, limit, localizationFileNodeLimit)
+		}
+		totalLimit += limit
+		scope := reader.fileScopes[index]
+		if !scope.ExcludeTests || len(scope.Kinds) != 4 ||
+			!scope.Kinds[graph.KindFunction] || !scope.Kinds[graph.KindMethod] ||
+			!scope.Kinds[graph.KindType] || !scope.Kinds[graph.KindMacro] {
+			t.Fatalf("file scope[%d] = %#v, want production function/method/type/macro declarations", index, scope)
+		}
+	}
+	if totalLimit > localizationFileRequestLimit {
+		t.Fatalf("aggregate file limit = %d, want <= %d", totalLimit, localizationFileRequestLimit)
+	}
+}
+
+func TestExploreQualifiedLeafProjectionFailsClosed(t *testing.T) {
+	anchor, owner, member := qualifiedLeafFixture()
+	tests := []struct {
+		name       string
+		readerBase func(*graph.Graph) graph.Reader
+		projection func(context.Context, string, graph.LocalizationNodeScope, int) (graph.BoundedNodeProjection, error)
+	}{
+		{
+			name:       "truncated",
+			readerBase: func(base *graph.Graph) graph.Reader { return base },
+			projection: func(context.Context, string, graph.LocalizationNodeScope, int) (graph.BoundedNodeProjection, error) {
+				return graph.BoundedNodeProjection{Nodes: []*graph.Node{member}, Total: 2, Truncated: true}, nil
+			},
+		},
+		{
+			name: "unsupported",
+			readerBase: func(base *graph.Graph) graph.Reader {
+				return &exactNameOnlyBoundedReader{Reader: base}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			base := graph.New()
+			base.AddNode(owner)
+			base.AddNode(member)
+			reader := &exactNameAnchorCountingReader{
+				Reader: test.readerBase(base), fileProjection: test.projection,
+			}
+			ctx := WithOverlayView(
+				context.Background(), graph.NewOverlaidView(reader, graph.NewOverlayLayer()),
+			)
+			server := &Server{graph: base}
+			got := server.exploreExactQualifiedAnchorCandidate(
+				ctx, anchor, []*rerank.Candidate{{Node: owner}}, query.QueryOptions{},
+				map[string]struct{}{}, map[string]struct{}{},
+			)
+			if got != nil {
+				t.Fatalf("qualified leaf = %#v, want incomplete file projection to fail closed", got)
+			}
+			if len(reader.fileLookups) != 1 {
+				t.Fatalf("file lookups = %#v, want one bounded attempt", reader.fileLookups)
+			}
+		})
+	}
 }
