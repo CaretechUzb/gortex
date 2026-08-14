@@ -11,14 +11,27 @@ import (
 	"github.com/zzet/gortex/internal/search/rerank"
 )
 
+type exploreTypedAnchorAdjacencyRequest struct {
+	ids   []string
+	kinds []graph.EdgeKind
+	limit int
+}
+
 type exploreTypedAnchorTestReader struct {
-	nodes       map[string]*graph.Node
-	in          map[string][]*graph.Edge
-	out         map[string][]*graph.Edge
-	delay       time.Duration
-	nodeBatches int
-	inBatches   int
-	outBatches  int
+	nodes map[string]*graph.Node
+	in    map[string][]*graph.Edge
+	out   map[string][]*graph.Edge
+	delay time.Duration
+
+	nodeBatches        int
+	legacyInBatches    int
+	legacyOutBatches   int
+	nodeRequests       [][]string
+	incomingRequests   []exploreTypedAnchorAdjacencyRequest
+	outgoingRequests   []exploreTypedAnchorAdjacencyRequest
+	nodeProjection     func(context.Context, []string) (map[string]*graph.Node, error)
+	incomingProjection func(context.Context, []string, []graph.EdgeKind, int) (graph.BoundedEdgeIdentityProjection, error)
+	outgoingProjection func(context.Context, []string, []graph.EdgeKind, int) (graph.BoundedEdgeIdentityProjection, error)
 }
 
 func newExploreTypedAnchorTestReader(nodes ...*graph.Node) *exploreTypedAnchorTestReader {
@@ -40,35 +53,119 @@ func (r *exploreTypedAnchorTestReader) addEdge(from, to string, kind graph.EdgeK
 }
 
 func (r *exploreTypedAnchorTestReader) GetNodesByIDs(ids []string) map[string]*graph.Node {
+	nodes, _ := r.GetNodesByIDsContext(context.Background(), ids)
+	return nodes
+}
+
+func (r *exploreTypedAnchorTestReader) GetNodesByIDsContext(
+	ctx context.Context,
+	ids []string,
+) (map[string]*graph.Node, error) {
 	r.nodeBatches++
+	r.nodeRequests = append(r.nodeRequests, append([]string(nil), ids...))
 	time.Sleep(r.delay)
+	if r.nodeProjection != nil {
+		return r.nodeProjection(ctx, ids)
+	}
 	result := make(map[string]*graph.Node, len(ids))
 	for _, id := range ids {
 		if node := r.nodes[id]; node != nil {
 			result[id] = node
 		}
 	}
-	return result
+	return result, nil
 }
 
-func (r *exploreTypedAnchorTestReader) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
-	r.inBatches++
-	time.Sleep(r.delay)
-	result := make(map[string][]*graph.Edge, len(ids))
-	for _, id := range ids {
-		result[id] = r.in[id]
-	}
-	return result
+func (r *exploreTypedAnchorTestReader) GetInEdgesByNodeIDs([]string) map[string][]*graph.Edge {
+	r.legacyInBatches++
+	panic("typed-anchor projection used legacy incoming adjacency")
 }
 
-func (r *exploreTypedAnchorTestReader) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
-	r.outBatches++
+func (r *exploreTypedAnchorTestReader) GetOutEdgesByNodeIDs([]string) map[string][]*graph.Edge {
+	r.legacyOutBatches++
+	panic("typed-anchor projection used legacy outgoing adjacency")
+}
+
+func (r *exploreTypedAnchorTestReader) FindIncomingEdgeIdentitiesBounded(
+	ctx context.Context,
+	ids []string,
+	kinds []graph.EdgeKind,
+	limit int,
+) (graph.BoundedEdgeIdentityProjection, error) {
+	r.incomingRequests = append(r.incomingRequests, exploreTypedAnchorAdjacencyRequest{
+		ids: append([]string(nil), ids...), kinds: append([]graph.EdgeKind(nil), kinds...), limit: limit,
+	})
 	time.Sleep(r.delay)
-	result := make(map[string][]*graph.Edge, len(ids))
-	for _, id := range ids {
-		result[id] = r.out[id]
+	if r.incomingProjection != nil {
+		return r.incomingProjection(ctx, ids, kinds, limit)
 	}
-	return result
+	return exploreTypedAnchorTestEdgeProjection(ctx, ids, kinds, limit, r.in)
+}
+
+func (r *exploreTypedAnchorTestReader) FindOutgoingEdgeIdentitiesBounded(
+	ctx context.Context,
+	ids []string,
+	kinds []graph.EdgeKind,
+	limit int,
+) (graph.BoundedEdgeIdentityProjection, error) {
+	r.outgoingRequests = append(r.outgoingRequests, exploreTypedAnchorAdjacencyRequest{
+		ids: append([]string(nil), ids...), kinds: append([]graph.EdgeKind(nil), kinds...), limit: limit,
+	})
+	time.Sleep(r.delay)
+	if r.outgoingProjection != nil {
+		return r.outgoingProjection(ctx, ids, kinds, limit)
+	}
+	return exploreTypedAnchorTestEdgeProjection(ctx, ids, kinds, limit, r.out)
+}
+
+func exploreTypedAnchorTestEdgeProjection(
+	ctx context.Context,
+	ids []string,
+	kinds []graph.EdgeKind,
+	limit int,
+	edgesByID map[string][]*graph.Edge,
+) (graph.BoundedEdgeIdentityProjection, error) {
+	projection := graph.BoundedEdgeIdentityProjection{
+		ByEndpoint: make(map[string][]graph.EdgeIdentity),
+		Truncated:  make(map[string]bool),
+	}
+	allowed := make(map[graph.EdgeKind]struct{}, len(kinds))
+	for _, kind := range kinds {
+		allowed[kind] = struct{}{}
+	}
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return graph.BoundedEdgeIdentityProjection{}, err
+		}
+		seen := make(map[graph.EdgeIdentity]struct{})
+		identities := make([]graph.EdgeIdentity, 0, limit)
+		for _, edge := range edgesByID[id] {
+			if edge == nil {
+				continue
+			}
+			if _, ok := allowed[edge.Kind]; !ok {
+				continue
+			}
+			identity := graph.EdgeIdentity{
+				From: edge.From, To: edge.To, Kind: edge.Kind,
+				FilePath: edge.FilePath, Line: edge.Line,
+			}
+			if _, duplicate := seen[identity]; duplicate {
+				continue
+			}
+			seen[identity] = struct{}{}
+			if len(identities) == limit {
+				projection.Truncated[id] = true
+				identities = nil
+				break
+			}
+			identities = append(identities, identity)
+		}
+		if len(identities) > 0 {
+			projection.ByEndpoint[id] = identities
+		}
+	}
+	return projection, nil
 }
 
 func removeExploreTypedAnchorTestEdge(edges []*graph.Edge, from, to string, kind graph.EdgeKind) []*graph.Edge {
@@ -323,7 +420,7 @@ func TestProjectExploreTypedAnchorCandidatesUsesFixedBatchPipelineDespiteDelay(t
 	fixture := newExploreTypedAnchorFixture(
 		"rs", "--replace causes duplicate output", "replacer", "Replacer<M>", "replace", "replace_all", false,
 	)
-	fixture.reader.delay = 3 * time.Millisecond // seven stages exceed the removed 10 ms cutoff
+	fixture.reader.delay = 3 * time.Millisecond // eight stages exceed the removed 10 ms cutoff
 	got := projectExploreTypedAnchorCandidates(
 		context.Background(), fixture.task, fixture.candidates, fixture.reader,
 		exploreTypedAnchorTestScope(), len(fixture.candidates), fixture.protected, "",
@@ -331,9 +428,13 @@ func TestProjectExploreTypedAnchorCandidatesUsesFixedBatchPipelineDespiteDelay(t
 	if exploreTypedAnchorCandidateByID(got, fixture.member.ID) == nil {
 		t.Fatal("scheduler/database delay changed a structurally complete projection")
 	}
-	if fixture.reader.inBatches != 1 || fixture.reader.outBatches != 3 || fixture.reader.nodeBatches != 3 {
-		t.Fatalf("batch pipeline = in:%d out:%d nodes:%d, want 1/3/3",
-			fixture.reader.inBatches, fixture.reader.outBatches, fixture.reader.nodeBatches)
+	if len(fixture.reader.incomingRequests) != 2 || len(fixture.reader.outgoingRequests) != 3 || fixture.reader.nodeBatches != 3 {
+		t.Fatalf("batch pipeline = in:%d out:%d nodes:%d, want 2/3/3",
+			len(fixture.reader.incomingRequests), len(fixture.reader.outgoingRequests), fixture.reader.nodeBatches)
+	}
+	if fixture.reader.legacyInBatches != 0 || fixture.reader.legacyOutBatches != 0 {
+		t.Fatalf("legacy adjacency calls = in:%d out:%d, want 0/0",
+			fixture.reader.legacyInBatches, fixture.reader.legacyOutBatches)
 	}
 }
 
@@ -496,6 +597,9 @@ func BenchmarkProjectExploreTypedAnchorCandidates(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		fixture.reader.nodeRequests = fixture.reader.nodeRequests[:0]
+		fixture.reader.incomingRequests = fixture.reader.incomingRequests[:0]
+		fixture.reader.outgoingRequests = fixture.reader.outgoingRequests[:0]
 		got := projectExploreTypedAnchorCandidates(
 			context.Background(), fixture.task, fixture.candidates, fixture.reader,
 			scope, len(fixture.candidates), fixture.protected, "",

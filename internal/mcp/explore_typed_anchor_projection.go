@@ -20,14 +20,164 @@ const (
 	exploreTypedAnchorProjectionSignal   = "typed_anchor_projection"
 )
 
-// exploreTypedAnchorBatchReader deliberately exposes only batched graph reads.
-// The SQLite implementation turns each stage into one bounded IN query, while
-// query overlays preserve request-local edits. A point-reader interface here
-// previously amplified one projection into dozens of SQLite round trips.
+// exploreTypedAnchorBatchReader deliberately exposes only exact batched node
+// hydration. Every adjacency stage below requires the optional metadata-free
+// bounded capabilities; unsupported readers fail the whole projection closed
+// rather than falling back to legacy full-row edge reads.
 type exploreTypedAnchorBatchReader interface {
 	GetNodesByIDs([]string) map[string]*graph.Node
-	GetInEdgesByNodeIDs([]string) map[string][]*graph.Edge
-	GetOutEdgesByNodeIDs([]string) map[string][]*graph.Edge
+}
+
+func exploreTypedAnchorNodesByIDsBounded(
+	ctx context.Context,
+	reader exploreTypedAnchorBatchReader,
+	ids []string,
+	limit int,
+) (map[string]*graph.Node, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	boundedIDs, complete := exploreBoundedNodeIDs(ids, limit)
+	if reader == nil || !complete || ctx.Err() != nil {
+		return nil, false
+	}
+	if len(boundedIDs) == 0 {
+		return map[string]*graph.Node{}, true
+	}
+	var (
+		nodes map[string]*graph.Node
+		err   error
+	)
+	if contextual, supported := reader.(exploreContextNodesReader); supported {
+		nodes, err = contextual.GetNodesByIDsContext(ctx, boundedIDs)
+	} else {
+		nodes = reader.GetNodesByIDs(boundedIDs)
+	}
+	if err != nil || ctx.Err() != nil || len(nodes) != len(boundedIDs) {
+		return nil, false
+	}
+	for _, id := range boundedIDs {
+		if nodes[id] == nil {
+			return nil, false
+		}
+	}
+	if ctx.Err() != nil {
+		return nil, false
+	}
+	return nodes, true
+}
+
+func exploreTypedAnchorOutgoingIdentitiesBounded(
+	ctx context.Context,
+	reader exploreTypedAnchorBatchReader,
+	ids []string,
+	kinds []graph.EdgeKind,
+	limit int,
+) (map[string][]graph.EdgeIdentity, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	bounded, supported := reader.(graph.BoundedOutgoingEdgeIdentityReader)
+	if !supported || ctx.Err() != nil {
+		return nil, false
+	}
+	ids = exploreTypedAnchorSortedIDs(ids)
+	projection, err := bounded.FindOutgoingEdgeIdentitiesBounded(ctx, ids, kinds, limit)
+	if err != nil || ctx.Err() != nil {
+		return nil, false
+	}
+	if !exploreTypedAnchorValidIdentityProjection(projection, ids, kinds, limit, true) || ctx.Err() != nil {
+		return nil, false
+	}
+	return projection.ByEndpoint, true
+}
+
+func exploreTypedAnchorIncomingIdentitiesBounded(
+	ctx context.Context,
+	reader exploreTypedAnchorBatchReader,
+	ids []string,
+	kinds []graph.EdgeKind,
+	limit int,
+) (map[string][]graph.EdgeIdentity, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	bounded, supported := reader.(graph.BoundedIncomingEdgeIdentityReader)
+	if !supported || ctx.Err() != nil {
+		return nil, false
+	}
+	ids = exploreTypedAnchorSortedIDs(ids)
+	projection, err := bounded.FindIncomingEdgeIdentitiesBounded(ctx, ids, kinds, limit)
+	if err != nil || ctx.Err() != nil {
+		return nil, false
+	}
+	if !exploreTypedAnchorValidIdentityProjection(projection, ids, kinds, limit, false) || ctx.Err() != nil {
+		return nil, false
+	}
+	return projection.ByEndpoint, true
+}
+
+func exploreTypedAnchorValidIdentityProjection(
+	projection graph.BoundedEdgeIdentityProjection,
+	ids []string,
+	kinds []graph.EdgeKind,
+	limit int,
+	outgoing bool,
+) bool {
+	if limit < 1 || len(kinds) == 0 || len(projection.ByEndpoint) > len(ids) || len(projection.Truncated) > len(ids) {
+		return false
+	}
+	requested := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		requested[id] = struct{}{}
+	}
+	allowed := make(map[graph.EdgeKind]struct{}, len(kinds))
+	for _, kind := range kinds {
+		allowed[kind] = struct{}{}
+	}
+	for id, truncated := range projection.Truncated {
+		if _, ok := requested[id]; !ok || truncated {
+			return false
+		}
+	}
+	for id, identities := range projection.ByEndpoint {
+		if _, ok := requested[id]; !ok || len(identities) > limit || projection.Truncated[id] {
+			return false
+		}
+		seen := make(map[graph.EdgeIdentity]struct{}, len(identities))
+		for _, identity := range identities {
+			if _, ok := allowed[identity.Kind]; !ok || identity.From == "" || identity.To == "" {
+				return false
+			}
+			if outgoing && identity.From != id || !outgoing && identity.To != id {
+				return false
+			}
+			if _, duplicate := seen[identity]; duplicate {
+				return false
+			}
+			seen[identity] = struct{}{}
+		}
+	}
+	return true
+}
+
+func exploreTypedAnchorSortIdentities(identities []graph.EdgeIdentity) {
+	sort.SliceStable(identities, func(i, j int) bool {
+		left, right := identities[i], identities[j]
+		if left.Kind != right.Kind {
+			return left.Kind < right.Kind
+		}
+		if left.From != right.From {
+			return left.From < right.From
+		}
+		if left.To != right.To {
+			return left.To < right.To
+		}
+		if left.FilePath != right.FilePath {
+			return left.FilePath < right.FilePath
+		}
+		return left.Line < right.Line
+	})
 }
 
 type exploreTypedAnchorField struct {
@@ -91,7 +241,7 @@ func projectExploreTypedAnchorCandidates(
 		return candidates
 	}
 	projection, ok := findExploreTypedAnchorProjection(ctx, task, candidates, reader, scope, protectedAnchors)
-	if !ok {
+	if !ok || ctx.Err() != nil {
 		return candidates
 	}
 	reserved := exploreTypedAnchorReservedCandidateIDs(candidates, protectedAnchors, protectedImplementationID)
@@ -167,27 +317,37 @@ func hydrateExploreTypedAnchorFields(
 	for _, field := range fields {
 		fieldIDs = append(fieldIDs, field.field.ID)
 	}
-	out := reader.GetOutEdgesByNodeIDs(exploreTypedAnchorSortedIDs(fieldIDs))
-	if ctx.Err() != nil {
+	out, complete := exploreTypedAnchorOutgoingIdentitiesBounded(
+		ctx,
+		reader,
+		fieldIDs,
+		[]graph.EdgeKind{graph.EdgeMemberOf, graph.EdgeTypedAs},
+		exploreTypedAnchorFieldRelationLimit,
+	)
+	if !complete {
 		return false
 	}
 
-	relations := make(map[string][]*graph.Edge, len(fields))
-	endpointIDs := make([]string, 0, len(fields)*2)
+	relations := make(map[string][]graph.EdgeIdentity, len(fields))
+	endpointIDs := make([]string, 0, len(fields)*exploreTypedAnchorFieldRelationLimit)
 	for _, field := range fields {
-		edges, overflow := exploreTypedAnchorBoundedEdges(
-			out[field.field.ID], exploreTypedAnchorFieldRelationLimit, graph.EdgeMemberOf, graph.EdgeTypedAs,
-		)
-		if overflow {
-			return false
-		}
+		edges := append([]graph.EdgeIdentity(nil), out[field.field.ID]...)
+		exploreTypedAnchorSortIdentities(edges)
 		relations[field.field.ID] = edges
 		for _, edge := range edges {
+			if edge.From != field.field.ID || edge.To == "" {
+				return false
+			}
 			endpointIDs = append(endpointIDs, edge.To)
 		}
 	}
-	nodes := reader.GetNodesByIDs(exploreTypedAnchorSortedIDs(endpointIDs))
-	if ctx.Err() != nil {
+	nodes, complete := exploreTypedAnchorNodesByIDsBounded(
+		ctx,
+		reader,
+		endpointIDs,
+		exploreTypedAnchorFieldLimit*exploreTypedAnchorFieldRelationLimit,
+	)
+	if !complete {
 		return false
 	}
 
@@ -195,13 +355,8 @@ func hydrateExploreTypedAnchorFields(
 	for _, field := range fields {
 		owners := make(map[string]*graph.Node)
 		field.typedIDs = make(map[string]struct{})
-		complete := true
 		for _, edge := range relations[field.field.ID] {
 			node := nodes[edge.To]
-			if node == nil {
-				complete = false
-				break
-			}
 			if !exploreNodeWithinQueryScope(node, scope) {
 				continue
 			}
@@ -216,7 +371,7 @@ func hydrateExploreTypedAnchorFields(
 				}
 			}
 		}
-		if !complete || len(owners) != 1 || (len(field.typedIDs) == 0 && field.canonicalType == "") {
+		if len(owners) != 1 || (len(field.typedIDs) == 0 && field.canonicalType == "") {
 			continue
 		}
 		for _, owner := range owners {
@@ -239,18 +394,36 @@ func hydrateExploreTypedAnchorConsumers(
 ) ([]*exploreTypedAnchorConsumer, bool) {
 	// hydrateExploreTypedAnchorFields filters in place but cannot resize its
 	// caller's slice. Ignore any cleared or unhydrated seed here.
-	queryIDs := make([]string, 0, len(fields)*2)
+	fieldIDs := make([]string, 0, len(fields))
+	ownerIDs := make([]string, 0, len(fields))
 	for _, field := range fields {
 		if field == nil || field.owner == nil {
 			continue
 		}
-		queryIDs = append(queryIDs, field.field.ID, field.owner.ID)
+		fieldIDs = append(fieldIDs, field.field.ID)
+		ownerIDs = append(ownerIDs, field.owner.ID)
 	}
-	if len(queryIDs) == 0 {
+	if len(fieldIDs) == 0 {
 		return nil, false
 	}
-	in := reader.GetInEdgesByNodeIDs(exploreTypedAnchorSortedIDs(queryIDs))
-	if ctx.Err() != nil {
+	fieldIn, complete := exploreTypedAnchorIncomingIdentitiesBounded(
+		ctx,
+		reader,
+		fieldIDs,
+		[]graph.EdgeKind{graph.EdgeReads, graph.EdgeWrites, graph.EdgeAccessesField},
+		exploreTypedAnchorConsumerLimit,
+	)
+	if !complete {
+		return nil, false
+	}
+	ownerIn, complete := exploreTypedAnchorIncomingIdentitiesBounded(
+		ctx,
+		reader,
+		ownerIDs,
+		[]graph.EdgeKind{graph.EdgeMemberOf},
+		exploreTypedAnchorOwnerMemberLimit,
+	)
+	if !complete {
 		return nil, false
 	}
 
@@ -259,29 +432,26 @@ func hydrateExploreTypedAnchorConsumers(
 		direct bool
 	}
 	rawByField := make(map[string]map[string]rawConsumer, len(fields))
-	consumerIDs := make([]string, 0, len(fields)*exploreTypedAnchorConsumerLimit)
+	consumerIDs := make([]string, 0, len(fields)*exploreTypedAnchorOwnerMemberLimit)
 	for _, field := range fields {
 		if field == nil || field.owner == nil {
 			continue
 		}
-		direct, overflow := exploreTypedAnchorBoundedEdges(
-			in[field.field.ID], exploreTypedAnchorConsumerLimit,
-			graph.EdgeReads, graph.EdgeWrites, graph.EdgeAccessesField,
-		)
-		if overflow {
-			return nil, false
-		}
-		members, overflow := exploreTypedAnchorBoundedEdges(
-			in[field.owner.ID], exploreTypedAnchorOwnerMemberLimit, graph.EdgeMemberOf,
-		)
-		if overflow {
-			return nil, false
-		}
+		direct := append([]graph.EdgeIdentity(nil), fieldIn[field.field.ID]...)
+		members := append([]graph.EdgeIdentity(nil), ownerIn[field.owner.ID]...)
+		exploreTypedAnchorSortIdentities(direct)
+		exploreTypedAnchorSortIdentities(members)
 		byID := make(map[string]rawConsumer, len(direct)+len(members))
 		for _, edge := range members {
+			if edge.From == "" || edge.To != field.owner.ID {
+				return nil, false
+			}
 			byID[edge.From] = rawConsumer{id: edge.From}
 		}
 		for _, edge := range direct {
+			if edge.From == "" || edge.To != field.field.ID {
+				return nil, false
+			}
 			consumer, member := byID[edge.From]
 			if !member {
 				// A field read outside the owning type does not prove the
@@ -296,8 +466,13 @@ func hydrateExploreTypedAnchorConsumers(
 			consumerIDs = append(consumerIDs, id)
 		}
 	}
-	nodes := reader.GetNodesByIDs(exploreTypedAnchorSortedIDs(consumerIDs))
-	if ctx.Err() != nil {
+	nodes, complete := exploreTypedAnchorNodesByIDsBounded(
+		ctx,
+		reader,
+		consumerIDs,
+		exploreTypedAnchorFieldLimit*exploreTypedAnchorOwnerMemberLimit,
+	)
+	if !complete {
 		return nil, false
 	}
 
@@ -353,16 +528,28 @@ func hydrateExploreTypedAnchorCalls(
 		consumerIDs = append(consumerIDs, consumer.node.ID)
 		consumerByID[consumer.node.ID] = append(consumerByID[consumer.node.ID], consumer)
 	}
-	out := reader.GetOutEdgesByNodeIDs(exploreTypedAnchorSortedIDs(consumerIDs))
-	if ctx.Err() != nil {
+	out, complete := exploreTypedAnchorOutgoingIdentitiesBounded(
+		ctx,
+		reader,
+		consumerIDs,
+		[]graph.EdgeKind{graph.EdgeCalls},
+		exploreTypedAnchorCallLimit,
+	)
+	if !complete {
 		return nil, false
 	}
 
 	calls := make([]exploreTypedAnchorCall, 0, exploreTypedAnchorCallLimit)
 	seenCalls := make(map[string]struct{})
 	for _, consumerID := range exploreTypedAnchorSortedIDs(consumerIDs) {
-		edges, overflow := exploreTypedAnchorBoundedEdges(out[consumerID], exploreTypedAnchorCallLimit, graph.EdgeCalls)
-		if overflow || len(calls)+len(edges)*len(consumerByID[consumerID]) > exploreTypedAnchorCallLimit {
+		edges := append([]graph.EdgeIdentity(nil), out[consumerID]...)
+		exploreTypedAnchorSortIdentities(edges)
+		for _, edge := range edges {
+			if edge.From != consumerID || edge.To == "" {
+				return nil, false
+			}
+		}
+		if len(calls)+len(edges)*len(consumerByID[consumerID]) > exploreTypedAnchorCallLimit {
 			return nil, false
 		}
 		for _, consumer := range consumerByID[consumerID] {
@@ -384,27 +571,37 @@ func hydrateExploreTypedAnchorCalls(
 	for _, call := range calls {
 		memberIDs = append(memberIDs, call.memberID)
 	}
-	memberOut := reader.GetOutEdgesByNodeIDs(exploreTypedAnchorSortedIDs(memberIDs))
-	if ctx.Err() != nil {
+	memberOut, complete := exploreTypedAnchorOutgoingIdentitiesBounded(
+		ctx,
+		reader,
+		memberIDs,
+		[]graph.EdgeKind{graph.EdgeMemberOf},
+		exploreTypedAnchorMemberOwnerLimit,
+	)
+	if !complete {
 		return nil, false
 	}
-	memberRelations := make(map[string][]*graph.Edge)
-	ownerIDs := make([]string, 0, len(memberIDs))
+	memberRelations := make(map[string][]graph.EdgeIdentity)
+	ownerIDs := make([]string, 0, len(memberIDs)*exploreTypedAnchorMemberOwnerLimit)
 	for _, memberID := range exploreTypedAnchorSortedIDs(memberIDs) {
-		edges, overflow := exploreTypedAnchorBoundedEdges(
-			memberOut[memberID], exploreTypedAnchorMemberOwnerLimit, graph.EdgeMemberOf,
-		)
-		if overflow {
-			return nil, false
-		}
+		edges := append([]graph.EdgeIdentity(nil), memberOut[memberID]...)
+		exploreTypedAnchorSortIdentities(edges)
 		memberRelations[memberID] = edges
 		for _, edge := range edges {
+			if edge.From != memberID || edge.To == "" {
+				return nil, false
+			}
 			ownerIDs = append(ownerIDs, edge.To)
 		}
 	}
 	hydrationIDs := append(exploreTypedAnchorSortedIDs(memberIDs), ownerIDs...)
-	nodes := reader.GetNodesByIDs(exploreTypedAnchorSortedIDs(hydrationIDs))
-	if ctx.Err() != nil {
+	nodes, complete := exploreTypedAnchorNodesByIDsBounded(
+		ctx,
+		reader,
+		hydrationIDs,
+		exploreTypedAnchorCallLimit*(exploreTypedAnchorMemberOwnerLimit+1),
+	)
+	if !complete {
 		return nil, false
 	}
 
@@ -443,7 +640,7 @@ func hydrateExploreTypedAnchorCalls(
 
 func exploreTypedAnchorMemberTypeProof(
 	field *exploreTypedAnchorField,
-	edges []*graph.Edge,
+	edges []graph.EdgeIdentity,
 	nodes map[string]*graph.Node,
 	scope query.QueryOptions,
 ) (exact, matches, complete bool) {
@@ -602,48 +799,6 @@ func exploreTypedAnchorCanonicalTypeMatches(fieldIdentity string, owner *graph.N
 		return fieldIdentity == exploreTypedAnchorCanonicalType(owner.Name)
 	}
 	return fieldIdentity == exploreTypedAnchorCanonicalType(owner.QualName)
-}
-
-func exploreTypedAnchorBoundedEdges(edges []*graph.Edge, limit int, kinds ...graph.EdgeKind) ([]*graph.Edge, bool) {
-	if limit < 1 || len(edges) == 0 || len(kinds) == 0 {
-		return nil, false
-	}
-	allowed := make(map[graph.EdgeKind]struct{}, len(kinds))
-	for _, kind := range kinds {
-		allowed[kind] = struct{}{}
-	}
-	bounded := make([]*graph.Edge, 0, min(limit+1, len(edges)))
-	for _, edge := range edges {
-		if edge == nil {
-			continue
-		}
-		if _, ok := allowed[edge.Kind]; ok {
-			bounded = append(bounded, edge)
-		}
-	}
-	sort.SliceStable(bounded, func(i, j int) bool {
-		left, right := bounded[i], bounded[j]
-		if left.Kind != right.Kind {
-			return left.Kind < right.Kind
-		}
-		if left.From != right.From {
-			return left.From < right.From
-		}
-		if left.To != right.To {
-			return left.To < right.To
-		}
-		if left.FilePath != right.FilePath {
-			return left.FilePath < right.FilePath
-		}
-		if left.Line != right.Line {
-			return left.Line < right.Line
-		}
-		return left.Origin < right.Origin
-	})
-	if len(bounded) > limit {
-		return nil, true
-	}
-	return bounded, false
 }
 
 func exploreTypedAnchorSortedIDs(ids []string) []string {
