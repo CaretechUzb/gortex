@@ -81,6 +81,28 @@ func localizationDeclarationScope(scope graph.LocalizationNodeScope) graph.Local
 }
 
 func (cache *localizationFileDeclarationCache) definitions(file string) localizationFileDeclarations {
+	if cache == nil {
+		return localizationFileDeclarations{}
+	}
+	return cache.definitionsAtLimit(file, cache.definitionLimit)
+}
+
+// outlineDefinitions gives the first two distinct page files the full bounded
+// declaration projection and spends only a shallow page on every later file.
+// The first read wins: a lower-ranked cached page is never silently upgraded by
+// a later consumer, so one file cannot be charged twice against the request.
+func (cache *localizationFileDeclarationCache) outlineDefinitions(file string, rank int) localizationFileDeclarations {
+	if cache == nil {
+		return localizationFileDeclarations{}
+	}
+	limit := localizationOutlineFileFetchLimit(rank)
+	if cache.definitionLimit > 0 {
+		limit = min(limit, cache.definitionLimit)
+	}
+	return cache.definitionsAtLimit(file, limit)
+}
+
+func (cache *localizationFileDeclarationCache) definitionsAtLimit(file string, limit int) localizationFileDeclarations {
 	file = strings.TrimSpace(file)
 	if cache == nil || file == "" {
 		return localizationFileDeclarations{}
@@ -88,7 +110,7 @@ func (cache *localizationFileDeclarationCache) definitions(file string) localiza
 	if declarations, cached := cache.byFile[file]; cached {
 		return declarations
 	}
-	declarations := cache.readDefinitions(file, cache.definitionLimit)
+	declarations := cache.readDefinitions(file, limit)
 	cache.byFile[file] = declarations
 	return declarations
 }

@@ -10,11 +10,10 @@ import (
 )
 
 const (
-	exploreTaskOutlineBudgetShare        = 4
-	exploreTaskOutlineHeading            = "## File outlines"
-	exploreTaskMinimumOutlineTokens      = 64
-	exploreTaskDeclarationRetentionLimit = 128
-	exploreTaskSectionSeparatorTokens    = 2
+	exploreTaskOutlineBudgetShare     = 4
+	exploreTaskOutlineHeading         = "## File outlines"
+	exploreTaskMinimumOutlineTokens   = 64
+	exploreTaskSectionSeparatorTokens = 2
 )
 
 type exploreTaskOutlineProvider func([]exploreTarget) *localizationPageOutline
@@ -34,10 +33,8 @@ func newExploreTaskPageOutlineProvider(
 	}
 	terms := exploreTerminalTerms(task)
 	return func(targets []exploreTarget) *localizationPageOutline {
-		declarations := newBoundedLocalizationFileDeclarationCache(
-			ctx, reader, scope, exploreTaskDeclarationRetentionLimit,
-		)
-		provider := localizationPageOutlineProvider(nil, targets, terms, declarations.definitions)
+		declarations := newLocalizationFileDeclarationCache(ctx, reader, scope)
+		provider := localizationPageOutlineProvider(nil, targets, terms, declarations.outlineDefinitions)
 		if provider == nil {
 			return nil
 		}

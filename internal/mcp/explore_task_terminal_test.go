@@ -157,55 +157,123 @@ func TestExploreTaskOutlineProviderUsesSelectedReader(t *testing.T) {
 	if selected.fileCalls["retry.go"] != 1 {
 		t.Fatalf("selected reader called %d times, want 1", selected.fileCalls["retry.go"])
 	}
-	if len(selected.calls) != 1 || !selected.calls[0].scope.RepoAllow["repo"] ||
-		!selected.calls[0].scope.ExcludeKinds[graph.KindParam] {
-		t.Fatalf("selected reader scope = %#v, want request scope plus declaration exclusions", selected.calls)
+	if len(selected.calls) != 1 || selected.calls[0].limit != localizationFileNodeLimit ||
+		!selected.calls[0].scope.RepoAllow["repo"] || !selected.calls[0].scope.ExcludeKinds[graph.KindParam] {
+		t.Fatalf("selected reader call = %#v, want 1024-node request scope plus declaration exclusions", selected.calls)
 	}
 }
 
 func TestExploreTaskOutlineProviderPreservesBoundedDeclarationCounts(t *testing.T) {
-	const (
-		file     = "generated.go"
-		declared = 140
-	)
-	nodes := make([]*graph.Node, 0, declared)
-	for index := 0; index < declared; index++ {
-		name := fmt.Sprintf("Declaration%03d", index)
-		nodes = append(nodes, &graph.Node{
-			ID:        file + "::" + name,
-			Name:      name,
-			Kind:      graph.KindFunction,
-			FilePath:  file,
-			StartLine: index + 1,
+	const file = "generated.go"
+	for _, test := range []struct {
+		name          string
+		declared      int
+		wantRows      int
+		wantDeclared  int
+		wantTruncated bool
+		wantRendered  string
+	}{
+		{
+			name: "complete retained top file", declared: 140, wantRows: 140,
+			wantDeclared: 140, wantRendered: "140 declaration(s)",
+		},
+		{
+			name: "saturated top file lower bound", declared: localizationFileNodeLimit + 1,
+			wantRows: localizationFileNodeLimit, wantDeclared: localizationFileNodeLimit + 1,
+			wantTruncated: true, wantRendered: "at least 1025 declaration(s), at least 1 elided",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			nodes := make([]*graph.Node, 0, test.declared)
+			for index := 0; index < test.declared; index++ {
+				name := fmt.Sprintf("Declaration%04d", index)
+				nodes = append(nodes, &graph.Node{
+					ID: file + "::" + name, Name: name, Kind: graph.KindFunction,
+					FilePath: file, StartLine: index + 1,
+				})
+			}
+			selected := &localizationDeclarationSpyReader{
+				files: map[string][]*graph.Node{file: nodes}, fileCalls: make(map[string]int),
+			}
+			provider := newExploreTaskPageOutlineProvider(
+				context.Background(), selected, "generated declarations", graph.LocalizationNodeScope{},
+			)
+			page := provider([]exploreTarget{{node: nodes[0]}})
+
+			if page == nil || page.Leading == nil {
+				t.Fatal("task provider did not produce a leading outline")
+			}
+			if page.Leading.Declared != test.wantDeclared || page.Leading.Truncated != test.wantTruncated ||
+				len(page.Leading.Rows) != test.wantRows {
+				t.Fatalf("outline = %#v, want rows=%d declared=%d truncated=%v",
+					page.Leading, test.wantRows, test.wantDeclared, test.wantTruncated)
+			}
+			wantElided := test.wantDeclared - test.wantRows
+			if page.Leading.Elided != wantElided {
+				t.Fatalf("elided = %d, want %d", page.Leading.Elided, wantElided)
+			}
+			if selected.fileCalls[file] != 1 || len(selected.calls) != 1 ||
+				selected.calls[0].limit != localizationFileNodeLimit {
+				t.Fatalf("selected reader calls = %#v, want one 1024-node read", selected.calls)
+			}
+			rendered := formatExploreTaskOutlines(page)
+			if !strings.Contains(rendered, test.wantRendered) {
+				t.Fatalf("task outline did not render the truthful count %q:\n%s", test.wantRendered, rendered)
+			}
+			if !test.wantTruncated && strings.Contains(rendered, "at least") {
+				t.Fatalf("complete task outline presented a lower bound:\n%s", rendered)
+			}
 		})
 	}
-	selected := &localizationDeclarationSpyReader{
-		files:     map[string][]*graph.Node{file: nodes},
-		fileCalls: make(map[string]int),
-	}
-	provider := newExploreTaskPageOutlineProvider(
-		context.Background(), selected, "generated declarations", graph.LocalizationNodeScope{},
-	)
-	page := provider([]exploreTarget{{node: nodes[0]}})
+}
 
-	if page == nil || page.Leading == nil {
-		t.Fatal("task provider did not produce a leading outline")
+func TestExploreTaskAndStructuredOutlinesShareRankAwareFetchPlan(t *testing.T) {
+	files := make(map[string][]*graph.Node, localizationOutlineFileCap)
+	targets := make([]exploreTarget, 0, localizationOutlineFileCap)
+	for rank := 0; rank < localizationOutlineFileCap; rank++ {
+		file := fmt.Sprintf("repo/file-%d.go", rank)
+		ranked := &graph.Node{
+			ID: file + "::ranked", Name: "ranked", Kind: graph.KindFunction,
+			FilePath: file, StartLine: 1,
+		}
+		files[file] = []*graph.Node{
+			ranked,
+			{ID: file + "::sibling", Name: "sibling", Kind: graph.KindFunction, FilePath: file, StartLine: 2},
+		}
+		targets = append(targets, exploreTarget{node: ranked})
 	}
-	if page.Leading.Declared != exploreTaskDeclarationRetentionLimit+1 || !page.Leading.Truncated {
-		t.Fatalf("outline count = %#v, want saturated lower bound %d", page.Leading, exploreTaskDeclarationRetentionLimit+1)
+	newReader := func() *localizationDeclarationSpyReader {
+		return &localizationDeclarationSpyReader{files: files, fileCalls: make(map[string]int)}
 	}
-	if page.Leading.Elided != 1 {
-		t.Fatalf("elided lower bound = %d, want 1", page.Leading.Elided)
+
+	taskReader := newReader()
+	taskProvider := newExploreTaskPageOutlineProvider(
+		context.Background(), taskReader, "ranked declarations", graph.LocalizationNodeScope{},
+	)
+	taskPage := taskProvider(targets)
+
+	structuredReader := newReader()
+	structuredCache := newLocalizationFileDeclarationCache(
+		context.Background(), structuredReader, graph.LocalizationNodeScope{},
+	)
+	structuredProvider := boundedLocalizationPageOutlineProvider(
+		nil, targets, exploreTerminalTerms("ranked declarations"), structuredCache.outlineDefinitions,
+	)
+	structuredPage := structuredProvider()
+	if taskPage == nil || structuredPage == nil {
+		t.Fatalf("task/structured pages = %#v / %#v, want both", taskPage, structuredPage)
 	}
-	if len(page.Leading.Rows) != exploreTaskDeclarationRetentionLimit {
-		t.Fatalf("rows = %d, want %d", len(page.Leading.Rows), exploreTaskDeclarationRetentionLimit)
+	if len(taskReader.calls) != localizationOutlineFileCap || len(structuredReader.calls) != localizationOutlineFileCap {
+		t.Fatalf("task/structured calls = %d/%d, want %d each",
+			len(taskReader.calls), len(structuredReader.calls), localizationOutlineFileCap)
 	}
-	if selected.fileCalls[file] != 1 {
-		t.Fatalf("selected reader called %d times, want 1", selected.fileCalls[file])
-	}
-	rendered := formatExploreTaskOutlines(page)
-	if !strings.Contains(rendered, "at least 129 declaration(s), at least 1 elided") {
-		t.Fatalf("truncated task outline presented an exact count:\n%s", rendered)
+	for rank := 0; rank < localizationOutlineFileCap; rank++ {
+		want := localizationOutlineFileFetchLimit(rank)
+		taskCall, structuredCall := taskReader.calls[rank], structuredReader.calls[rank]
+		if taskCall.file != structuredCall.file || taskCall.limit != want || structuredCall.limit != want {
+			t.Fatalf("rank %d task/structured calls = %#v / %#v, want identical limit %d",
+				rank, taskCall, structuredCall, want)
+		}
 	}
 }
 

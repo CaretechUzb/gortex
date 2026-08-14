@@ -37,39 +37,35 @@ const (
 	// localizationOutlineFloorRows is the smallest index still worth its bytes.
 	// Budget pressure shrinks an outline to this floor before it may drop one.
 	localizationOutlineFloorRows = 8
-	// localizationOutlineSecondFileRowCap is the depth the file ranked directly
-	// after the leading one gets. Every file after that starts at the floor.
-	localizationOutlineSecondFileRowCap = 12
-	// localizationOutlineFileCap bounds how many of the page's distinct files
-	// are indexed at all, leading file included. Eight covers the ranked page's
-	// useful breadth without serializing two low-rank declaration indexes whose
-	// evidence rows remain independently visible.
-	localizationOutlineFileCap = 8
-	// The page's first two files keep their complete indexes until every lower
-	// ranked file has yielded its expendable depth and breadth.
+	// Later page files need enough declarations to expose siblings without
+	// spending the request-wide projection budget reserved for the leading pair.
+	localizationOutlineTrailingFileFetchLimit = 128
+	// localizationOutlineFileCap covers the first ten distinct ranked files:
+	// two complete bounded indexes plus eight shallow sibling indexes.
+	localizationOutlineFileCap = 10
+	// The page's first two files keep their complete retained indexes until every
+	// lower-ranked file has yielded its expendable depth and breadth.
 	localizationOutlineProtectedFileCount = 2
 )
 
-// localizationOutlineFileRowCap is the depth ladder over a page's files. The
-// protected leading pair remain the deepest indexes, but start bounded: the
-// leading file gets forty task-prioritized head/tail rows, the second gets
-// twelve, and later files start where shrinking would stop anyway.
+// localizationOutlineFileRowCap is the initial wire depth over a page's files.
+// The first two files expose every declaration retained by their bounded read;
+// later files start at the relief floor.
 func localizationOutlineFileRowCap(rank int) int {
-	switch rank {
-	case 0:
-		return localizationOutlineRowCap
-	case 1:
-		return localizationOutlineSecondFileRowCap
-	default:
-		return localizationOutlineFloorRows
-	}
-}
-
-func localizationCompleteOutlineFileRowCap(rank int) int {
 	if rank >= 0 && rank < localizationOutlineProtectedFileCount {
 		return localizationOutlineCompleteRows
 	}
 	return localizationOutlineFloorRows
+}
+
+// localizationOutlineFileFetchLimit bounds the lightweight declaration read
+// before wire projection. The first two distinct files receive the full typed
+// backend page and the remaining eight receive a shallow page.
+func localizationOutlineFileFetchLimit(rank int) int {
+	if rank >= 0 && rank < localizationOutlineProtectedFileCount {
+		return localizationFileNodeLimit
+	}
+	return localizationOutlineTrailingFileFetchLimit
 }
 
 // localizationPageOutline is the page's declaration index: the leading file's
@@ -128,13 +124,13 @@ func localizationPageOutlineProvider(
 	enumerate any,
 ) func() *localizationPageOutline {
 	return localizationPageOutlineProviderWithCaps(
-		pool, targets, terms, enumerate, localizationCompleteOutlineFileRowCap,
+		pool, targets, terms, enumerate, localizationOutlineFileRowCap,
 	)
 }
 
-// boundedLocalizationPageOutlineProvider applies the compact wire caps used by
-// structured localize responses. Task-mode rendering keeps the complete retained
-// declaration set and applies its own token-budget relief after rendering.
+// boundedLocalizationPageOutlineProvider applies the shared initial row policy
+// to structured localize responses. Structured and task pages both start with
+// the complete retained leading pair and relieve their own copies under budget.
 func boundedLocalizationPageOutlineProvider(
 	pool []*rerank.Candidate,
 	targets []exploreTarget,
@@ -167,7 +163,7 @@ func localizationPageOutlineProviderWithCaps(
 		}
 		built = true
 		index := func(file string, rank int) *localizationFileOutline {
-			declarations := enumerateDeclarations(file)
+			declarations := enumerateDeclarations(file, rank)
 			if len(declarations.Nodes) == 0 && !declarations.Truncated {
 				// Nothing to enumerate leaves the nodes this page already
 				// fetched, which is the whole of what it knows about that file.
@@ -223,12 +219,16 @@ func localizationPageOutlineProviderWithCaps(
 // localizationOutlineDeclarationEnumerator keeps direct outline helpers that
 // enumerate raw nodes source-compatible while allowing bounded caches to carry
 // an exact declaration count alongside their retained page.
-func localizationOutlineDeclarationEnumerator(enumerate any) func(string) localizationFileDeclarations {
+func localizationOutlineDeclarationEnumerator(enumerate any) func(string, int) localizationFileDeclarations {
 	switch enumerate := enumerate.(type) {
-	case func(string) localizationFileDeclarations:
+	case func(string, int) localizationFileDeclarations:
 		return enumerate
+	case func(string) localizationFileDeclarations:
+		return func(file string, _ int) localizationFileDeclarations {
+			return enumerate(file)
+		}
 	case func(string) []*graph.Node:
-		return func(file string) localizationFileDeclarations {
+		return func(file string, _ int) localizationFileDeclarations {
 			return localizationFileDeclarations{Nodes: enumerate(file)}
 		}
 	default:

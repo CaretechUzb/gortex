@@ -218,3 +218,52 @@ func TestLocalizationFileDeclarationCacheSharesRequestBudgetInPriorityOrder(t *t
 		require.Equal(t, localizationFileNodeLimit, call.limit)
 	}
 }
+
+func TestLocalizationFileDeclarationCacheBudgetsRankedOutlinesWithoutUpgrades(t *testing.T) {
+	reader := &localizationDeclarationSpyReader{files: make(map[string][]*graph.Node)}
+	ctx := withLocalizationFileRequestBudget(context.Background())
+	cache := newLocalizationFileDeclarationCache(ctx, reader, graph.LocalizationNodeScope{})
+
+	for rank := 0; rank < localizationOutlineFileCap; rank++ {
+		file := fmt.Sprintf("src/outline-%d.go", rank)
+		limit := localizationOutlineFileFetchLimit(rank)
+		declared := limit + 1
+		if rank == 0 {
+			declared = limit
+		}
+		for index := 0; index < declared; index++ {
+			reader.files[file] = append(reader.files[file], &graph.Node{
+				ID:   fmt.Sprintf("%s::owner-%04d", file, index),
+				Name: fmt.Sprintf("owner%04d", index), Kind: graph.KindFunction,
+				FilePath: file, StartLine: index + 1,
+			})
+		}
+
+		page := cache.outlineDefinitions(file, rank)
+		require.Len(t, page.Nodes, limit)
+		require.Equal(t, limit, reader.calls[rank].limit)
+		if rank == 0 {
+			require.False(t, page.Truncated)
+			require.True(t, page.DeclaredKnown)
+			require.Equal(t, localizationFileNodeLimit, page.Declared)
+		} else {
+			require.True(t, page.Truncated)
+			require.False(t, page.DeclaredKnown)
+			require.Equal(t, limit+1, page.Declared)
+		}
+	}
+
+	require.Len(t, reader.calls, localizationOutlineFileCap)
+	shallow := cache.outlineDefinitions("src/outline-2.go", 0)
+	require.Len(t, shallow.Nodes, localizationOutlineTrailingFileFetchLimit)
+	require.Len(t, reader.calls, localizationOutlineFileCap, "a cached shallow page must not be upgraded")
+
+	wantConsumed := localizationOutlineProtectedFileCount*localizationFileNodeLimit +
+		(localizationOutlineFileCap-localizationOutlineProtectedFileCount)*localizationOutlineTrailingFileFetchLimit
+	require.Equal(t, 3072, wantConsumed)
+	cache.budget.mu.Lock()
+	remaining := cache.budget.remaining
+	cache.budget.mu.Unlock()
+	require.Equal(t, localizationFileRequestLimit-wantConsumed, remaining)
+	require.LessOrEqual(t, wantConsumed, 3072)
+}

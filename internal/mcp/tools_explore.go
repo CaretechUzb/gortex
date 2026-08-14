@@ -3103,7 +3103,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// along so a bounded index keeps the declarations the task named.
 	pageOutline := boundedLocalizationPageOutlineProvider(
 		localizationRankedPool, pageTargets, exploreTerminalTerms(task),
-		declarations.definitions,
+		declarations.outlineDefinitions,
 	)
 	// File evidence can make localization answer-ready, but it never becomes a
 	// synthetic exact-symbol read. Exact reads remain declaration-only.
