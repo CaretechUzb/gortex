@@ -1346,8 +1346,9 @@ func localizationRecoveryRejectedResult(completion localizationCompletion, facad
 // An inactive session admits its first localization without a boundary flag.
 // Once a contract exists, only the first explore call for a genuinely new user
 // request may cross it, and the caller must say so explicitly. Localize stages
-// its returned completion; task stages inactive navigation. The old contract
-// remains live until finishLocalize commits the successful replacement.
+// its returned completion; task and explicit direct-read boundaries stage
+// inactive navigation. The old contract remains live until finishLocalize
+// commits the successful replacement.
 func (s *localizationTerminalState) beginLocalize(task string, newUserTask bool) (uint64, *mcpgo.CallToolResult) {
 	if s == nil {
 		return 0, nil

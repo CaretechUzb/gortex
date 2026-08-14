@@ -54,19 +54,21 @@ func TestBatchEditItemKind(t *testing.T) {
 	require.Equal(t, "edit_file", batchEditItem{Path: "p"}.kind(), "a path infers edit_file")
 	require.Equal(t, "edit_file", batchEditItem{Op: "edit_file", Path: "p"}.kind())
 	require.Equal(t, "edit_symbol", batchEditItem{Op: "edit_symbol", Path: "p"}.kind(), "explicit op wins over inference")
+	require.Equal(t, "move_file", batchEditItem{Op: "move_file"}.kind())
+	require.Equal(t, "delete_file", batchEditItem{Op: "delete_file"}.kind())
 }
 
 func TestBatchEditItemsSchemaOneOf(t *testing.T) {
 	schema := batchEditItemsSchema()
 	branches, ok := schema["oneOf"].([]any)
 	require.True(t, ok, "items schema must be a oneOf")
-	require.Len(t, branches, 2)
+	require.Len(t, branches, 4)
 	for _, b := range branches {
 		m := b.(map[string]any)
 		require.Equal(t, "object", m["type"])
 		props := m["properties"].(map[string]any)
 		op := props["op"].(map[string]any)
-		require.Contains(t, []any{"edit_symbol", "edit_file"}, op["const"], "each branch is discriminated by an op const")
+		require.Contains(t, []any{"edit_symbol", "edit_file", "move_file", "delete_file"}, op["const"], "each branch is discriminated by an op const")
 		require.NotEmpty(t, m["required"], "each branch declares required fields")
 	}
 }

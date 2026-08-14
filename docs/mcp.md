@@ -357,7 +357,7 @@ The in-graph coverage tools above (`analyze kind=coverage*`, `index_health` lang
 | Tool | Description |
 |------|-------------|
 | `scaffold` | Generate code, registration wiring, and test stubs from an example symbol |
-| `batch_edit` | Apply multiple edits in dependency order, re-index between steps |
+| `batch_edit` | Atomically apply `edit_symbol`, `edit_file`, `move_file`, and `delete_file` operations with durable rollback receipts |
 | `diff_context` | Git diff enriched with callers, callees, community, processes, per-file risk |
 | `prefetch_context` | Predict needed symbols from task description and recent activity. Accepts `max_bytes` / `max_tokens` budget caps |
 

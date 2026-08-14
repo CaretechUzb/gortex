@@ -40,6 +40,31 @@ func TestParseBatchEditsInfersCompleteLegacyShapes(t *testing.T) {
 	require.Equal(t, "edit_symbol", legacy[0].Op)
 }
 
+func TestParseBatchEditsAcceptsExplicitLifecycleShapes(t *testing.T) {
+	const digest = "0000000000000000000000000000000000000000000000000000000000000000"
+	branches := batchEditItemsSchema()["oneOf"].([]any)
+	for _, index := range []int{2, 3} {
+		required := branches[index].(map[string]any)["required"].([]any)
+		require.Contains(t, required, "op", "lifecycle operations must be explicitly discriminated")
+	}
+
+	items, err := parseBatchEdits([]any{
+		map[string]any{
+			"op": "move_file", "source": "old.txt", "destination": "new.txt",
+			"expected_sha256": digest,
+		},
+		map[string]any{"op": "delete_file", "path": "obsolete.txt"},
+	})
+	require.NoError(t, err)
+	require.Len(t, items, 2)
+	require.Equal(t, "move_file", items[0].Op)
+	require.Equal(t, "old.txt", items[0].SourcePath)
+	require.Equal(t, "new.txt", items[0].DestinationPath)
+	require.Equal(t, digest, items[0].ExpectedSHA256)
+	require.Equal(t, "delete_file", items[1].Op)
+	require.Equal(t, "obsolete.txt", items[1].Path)
+}
+
 func TestParseBatchEditsRejectsUnknownOpInLegacyJSONString(t *testing.T) {
 	_, err := parseBatchEdits(`[{"op":"replace_file","path":"a.go","old_string":"before","new_string":"after"}]`)
 	require.Error(t, err)
@@ -71,6 +96,18 @@ func TestParseBatchEditsRejectsAmbiguousAndIncompleteShapes(t *testing.T) {
 			name: "unrecognized-alias",
 			item: map[string]any{"file": "a.go"},
 			want: "does not match a supported batch edit shape",
+		},
+		{
+			name: "lifecycle-without-discriminator",
+			item: map[string]any{"source": "old.txt", "destination": "new.txt"},
+			want: "move_file and delete_file require an explicit op",
+		},
+		{
+			name: "mixed-lifecycle",
+			item: map[string]any{
+				"op": "move_file", "source": "old.txt", "destination": "new.txt", "path": "other.txt",
+			},
+			want: "mixes fields from multiple batch edit operations",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -110,8 +147,8 @@ func TestBatchEditUnknownDiscriminatorIsStructuredAndWritesNothing(t *testing.T)
 	require.Contains(t, payload["message"], `unknown op "replace_file"`)
 	data := payload["data"].(map[string]any)
 	require.Equal(t, float64(1), data["item_index"])
-	require.ElementsMatch(t, []any{"edit_file", "edit_symbol"}, data["accepted_values"])
-	require.Len(t, data["accepted_shapes"], 2)
+	require.ElementsMatch(t, []any{"edit_file", "edit_symbol", "move_file", "delete_file"}, data["accepted_values"])
+	require.Len(t, data["accepted_shapes"], 4)
 
 	content, err := os.ReadFile(path)
 	require.NoError(t, err)

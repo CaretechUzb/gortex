@@ -295,9 +295,9 @@ func (s *Server) registerEnhancementTools() {
 	// batch_edit
 	s.addTool(
 		mcp.NewTool("batch_edit",
-			mcp.WithDescription("Atomically applies a dependency-ordered edit set. Every guard and replacement is evaluated against one locked snapshot before any file is written; a commit failure restores all touched files. The durable transaction receipt survives response loss and daemon restart. Retry with the same transaction_id and identical edits to receive the original result without writing again, or omit edits and pass transaction_id to query status. Each edit is one of two operations selected by `op`:\n  • edit_symbol (default): {id, old_source, new_source} — replace a fragment inside a symbol's body.\n  • edit_file: {op:\"edit_file\", path, old_string, new_string, replace_all?} — replace a string in any file (imports, config, comments).\nPass `edits` as a JSON array of objects (a JSON-encoded string is accepted for compatibility)."),
+			mcp.WithDescription("Atomically applies a dependency-ordered edit set. Every guard and replacement is evaluated against one locked snapshot before any file is written; a commit failure restores all touched files. The durable transaction receipt survives response loss and daemon restart. Retry with the same transaction_id and identical edits to receive the original result without writing again, or omit edits and pass transaction_id to query status. Each edit is one of four operations selected by `op`:\n  • edit_symbol (default): {id, old_source, new_source} — replace a fragment inside a symbol's body.\n  • edit_file: {op:\"edit_file\", path, old_string, new_string, replace_all?} — replace a string in any file (imports, config, comments).\n  • move_file: {op:\"move_file\", source, destination, expected_sha256?} — move one regular file without overwriting the destination.\n  • delete_file: {op:\"delete_file\", path, expected_sha256?} — delete one regular file.\nPass `edits` as a JSON array of objects (a JSON-encoded string is accepted for compatibility)."),
 			mcp.WithArray("edits",
-				mcp.Description("Edit operations. Required for execution; omit only when querying an existing transaction. Each item is an edit_symbol or edit_file object selected by `op`."),
+				mcp.Description("Edit operations. Required for execution; omit only when querying an existing transaction. Each item is an edit_symbol, edit_file, move_file, or delete_file object selected by `op`."),
 				mcp.Items(batchEditItemsSchema()),
 			),
 			mcp.WithString("transaction_id", mcp.Description("Stable caller-chosen idempotency key. Reusing it with identical edits returns the same receipt; a different payload is rejected. When omitted, the server creates a unique transaction ID.")),
@@ -3682,24 +3682,29 @@ func (s *Server) handleGetSymbolHistory(ctx context.Context, req mcp.CallToolReq
 // 10.11 handleBatchEdit
 // ---------------------------------------------------------------------------
 
-// batchEditItem represents a single edit in a batch.
 // batchEditItem is one operation in a batch_edit call. It is a discriminated
 // union over `op`: an edit_symbol op carries {id, old_source, new_source}; an
 // edit_file op carries {path, old_string, new_string, replace_all?}. When `op`
 // is omitted it is inferred only from one complete, unambiguous field set, so
 // both legacy item shapes remain supported without silently misclassifying
-// malformed payloads.
+// malformed payloads. move_file and delete_file require an explicit op and may
+// pin source bytes with expected_sha256 under the transaction lock.
 type batchEditItem struct {
 	Op string `json:"op,omitempty"`
 	// edit_symbol
 	SymbolID  string `json:"id,omitempty"`
 	OldSource string `json:"old_source,omitempty"`
 	NewSource string `json:"new_source,omitempty"`
-	// edit_file
+	// edit_file and delete_file
 	Path       string `json:"path,omitempty"`
 	OldString  string `json:"old_string,omitempty"`
 	NewString  string `json:"new_string,omitempty"`
 	ReplaceAll bool   `json:"replace_all,omitempty"`
+	// move_file
+	SourcePath      string `json:"source,omitempty"`
+	DestinationPath string `json:"destination,omitempty"`
+	// move_file and delete_file
+	ExpectedSHA256 string `json:"expected_sha256,omitempty"`
 }
 
 // kind returns a normalized operation kind. Runtime payloads are normalized by
@@ -3720,6 +3725,7 @@ type batchEditResult struct {
 	Op                       string `json:"op,omitempty"`
 	SymbolID                 string `json:"id,omitempty"`
 	FilePath                 string `json:"path"`
+	DestinationPath          string `json:"destination,omitempty"`
 	Status                   string `json:"status"` // "applied", "failed", "skipped"
 	Error                    string `json:"error,omitempty"`
 	Reindexed                bool   `json:"reindexed"`
@@ -3765,13 +3771,36 @@ func batchEditItemsSchema() map[string]any {
 				},
 				"required": []any{"path", "old_string", "new_string"},
 			},
+			map[string]any{
+				"type":        "object",
+				"description": "Move a whole file atomically within an indexed repository.",
+				"properties": map[string]any{
+					"op":              map[string]any{"const": "move_file"},
+					"source":          map[string]any{"type": "string", "description": "Existing source path (repo-relative or absolute)."},
+					"destination":     map[string]any{"type": "string", "description": "Non-existing destination path in the same indexed repository."},
+					"expected_sha256": map[string]any{"type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "Optional SHA-256 precondition for the complete source bytes."},
+				},
+				"required": []any{"op", "source", "destination"},
+			},
+			map[string]any{
+				"type":        "object",
+				"description": "Delete a whole file atomically within an indexed repository.",
+				"properties": map[string]any{
+					"op":              map[string]any{"const": "delete_file"},
+					"path":            map[string]any{"type": "string", "description": "Existing file path (repo-relative or absolute)."},
+					"expected_sha256": map[string]any{"type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "Optional SHA-256 precondition for the complete file bytes."},
+				},
+				"required": []any{"op", "path"},
+			},
 		},
 	}
 }
 
-var batchEditAcceptedShapes = [2]string{
+var batchEditAcceptedShapes = [...]string{
 	`{"op":"edit_file","path":"<file>","old_string":"<text>","new_string":"<text>"}`,
 	`{"op":"edit_symbol","id":"<symbol_id>","old_source":"<source>","new_source":"<source>"}`,
+	`{"op":"move_file","source":"<file>","destination":"<file>"}`,
+	`{"op":"delete_file","path":"<file>"}`,
 }
 
 type batchEditArgumentError struct {
@@ -3780,7 +3809,7 @@ type batchEditArgumentError struct {
 }
 
 func (e *batchEditArgumentError) Error() string {
-	return fmt.Sprintf("edits[%d]: %s; accepted shapes: %s or %s", e.index, e.reason, batchEditAcceptedShapes[0], batchEditAcceptedShapes[1])
+	return fmt.Sprintf("edits[%d]: %s; accepted shapes: %s", e.index, e.reason, strings.Join(batchEditAcceptedShapes[:], " or "))
 }
 
 func batchEditHasAny(fields map[string]json.RawMessage, names ...string) bool {
@@ -3803,24 +3832,28 @@ func missingBatchEditFields(fields map[string]json.RawMessage, names ...string) 
 }
 
 func classifyBatchEditItem(fields map[string]json.RawMessage, op string) (string, error) {
-	hasFileFields := batchEditHasAny(fields, "path", "old_string", "new_string", "replace_all")
+	hasPath := batchEditHasAny(fields, "path")
+	hasFileFields := batchEditHasAny(fields, "old_string", "new_string", "replace_all")
 	hasSymbolFields := batchEditHasAny(fields, "id", "old_source", "new_source")
+	hasMoveFields := batchEditHasAny(fields, "source", "destination")
+	hasDigest := batchEditHasAny(fields, "expected_sha256")
 
 	if _, explicit := fields["op"]; explicit {
 		switch op {
-		case "edit_file", "edit_symbol":
+		case "edit_file", "edit_symbol", "move_file", "delete_file":
 		default:
-			return "", fmt.Errorf("unknown op %q (accepted values: edit_file, edit_symbol)", op)
+			return "", fmt.Errorf("unknown op %q (accepted values: edit_file, edit_symbol, move_file, delete_file)", op)
 		}
-	}
-	if hasFileFields && hasSymbolFields {
-		return "", fmt.Errorf("item mixes edit_file and edit_symbol fields")
 	}
 
 	kind := op
 	if kind == "" {
 		switch {
-		case hasFileFields:
+		case hasMoveFields || hasDigest:
+			return "", fmt.Errorf("move_file and delete_file require an explicit op")
+		case (hasPath || hasFileFields) && hasSymbolFields:
+			return "", fmt.Errorf("item mixes edit_file and edit_symbol fields")
+		case hasPath || hasFileFields:
 			kind = "edit_file"
 		case hasSymbolFields:
 			kind = "edit_symbol"
@@ -3830,10 +3863,27 @@ func classifyBatchEditItem(fields map[string]json.RawMessage, op string) (string
 	}
 
 	var missing []string
-	if kind == "edit_file" {
+	switch kind {
+	case "edit_file":
+		if hasSymbolFields || hasMoveFields || hasDigest {
+			return "", fmt.Errorf("item mixes fields from multiple batch edit operations")
+		}
 		missing = missingBatchEditFields(fields, "path", "old_string", "new_string")
-	} else {
+	case "edit_symbol":
+		if hasPath || hasFileFields || hasMoveFields || hasDigest {
+			return "", fmt.Errorf("item mixes edit_file and edit_symbol fields")
+		}
 		missing = missingBatchEditFields(fields, "id", "old_source", "new_source")
+	case "move_file":
+		if hasPath || hasFileFields || hasSymbolFields {
+			return "", fmt.Errorf("item mixes fields from multiple batch edit operations")
+		}
+		missing = missingBatchEditFields(fields, "source", "destination")
+	case "delete_file":
+		if hasFileFields || hasSymbolFields || hasMoveFields {
+			return "", fmt.Errorf("item mixes fields from multiple batch edit operations")
+		}
+		missing = missingBatchEditFields(fields, "path")
 	}
 	if len(missing) > 0 {
 		return "", fmt.Errorf("incomplete %s shape (missing: %s)", kind, strings.Join(missing, ", "))
@@ -3886,7 +3936,7 @@ func parseBatchEdits(raw any) ([]batchEditItem, error) {
 
 func batchEditInvalidArgumentResult(err error) *mcp.CallToolResult {
 	data := map[string]any{
-		"accepted_values": []string{"edit_file", "edit_symbol"},
+		"accepted_values": []string{"edit_file", "edit_symbol", "move_file", "delete_file"},
 		"accepted_shapes": batchEditAcceptedShapes[:],
 	}
 	if itemErr, ok := err.(*batchEditArgumentError); ok {

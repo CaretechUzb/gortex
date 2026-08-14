@@ -28,6 +28,7 @@ func TestRulePreambleRoutesByOutcomeAndPreservesExactIdentifiers(t *testing.T) {
 	briefing := rulePreamble()
 	for _, required := range []string{
 		"For an explicitly named file",
+		"options:{new_user_task:true}",
 		"choose by requested output",
 		"requested output is files, symbols, or supporting evidence",
 		"localize task may be concise",

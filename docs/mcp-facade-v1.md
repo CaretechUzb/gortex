@@ -207,7 +207,7 @@ Each facade advertises only its high-frequency stable fields. A read request ill
 
 The dispatcher flattens the advertised `arguments`, `options`, `source`, `context`, `guard`, and `output` objects into the selected legacy handler's arguments. Common top-level fields win where the adapter defines a friendly alias. Operation-specific fields that are not worth mounting in every model turn remain discoverable through `capabilities`.
 
-`operation` is a normalized string rather than an ever-growing schema enum. It MAY be omitted when a selector uniquely determines the common read/edit default. The public description lists common operations, while `capabilities(domain=<tool>, operation=<operation>, detail="schema")` returns both the exact operation-specific public input schema and a `request_shape`. The dispatcher MUST reject unknown values and return the valid operation names. Capability lists use the public keys `domains` and `domain`; compatibility terminology is not exposed to callers.
+`operation` is a normalized string rather than an ever-growing schema enum. It MAY be omitted when a selector uniquely determines the common read/edit default. The public description lists common operations, while `capabilities(domain=<tool>, operation=<operation>, detail="schema")` returns both the exact operation-specific public input schema and a `request_shape`. The `request_shape` object is the caller-level argument object: pass its fields directly to the named facade tool, without nesting it under an `arguments` or `params` key. The dispatcher MUST reject unknown values and return the valid operation names. Capability lists use the public keys `domains` and `domain`; compatibility terminology is not exposed to callers.
 
 ### 8.2 Target references
 

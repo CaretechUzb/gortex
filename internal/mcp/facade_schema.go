@@ -28,7 +28,7 @@ func facadePublicCapabilitySchema(
 ) map[string]any {
 	definition := facadeToolDefinition(spec.Facade)
 	staticProperties := definition.InputSchema.Properties
-	requestArguments, _ := requestShape["arguments"].(map[string]any)
+	requestArguments := requestShape
 
 	properties := make(map[string]any)
 	requiredTop := make(map[string]struct{})
@@ -129,6 +129,12 @@ func facadePublicCapabilitySchema(
 			continue
 		}
 		addCandidate(facadePublicPath{field: field}, value, true)
+	}
+	// new_user_task is a facade control field, not a legacy read_file
+	// argument. Keep the exact operation schema aligned with tools/list even
+	// though the legacy schema and minimal request example cannot discover it.
+	if spec.Facade == "read" && spec.Operation == "file" {
+		addCandidate(facadePublicPath{container: "options", field: "new_user_task"}, false, true)
 	}
 
 	// Stable documented top-level aliases are available only when the actual
