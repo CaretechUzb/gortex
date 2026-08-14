@@ -223,9 +223,36 @@ func (h *HybridBackend) dechunkVectorIDs(rawIDs []string, want int) []string {
 // Count returns the text backend document count.
 func (h *HybridBackend) Count() int { return h.text.Count() }
 
-// Close releases resources.
+// Close releases resources owned by the hybrid. The embedding provider and a
+// delegated vector searcher are externally owned; VectorBackend.Close only
+// releases process-local vector state.
 func (h *HybridBackend) Close() {
-	h.text.Close()
+	if h == nil {
+		return
+	}
+	text := h.text
+	vector := h.vector
+	h.text = nil
+	h.vector = nil
+	h.embedder = nil
+	if vector != nil {
+		vector.Close()
+	}
+	if text != nil {
+		text.Close()
+	}
+}
+
+// detachTextBackend transfers text-backend ownership to a replacement hybrid.
+// It is intentionally private and may only be called after all users of h have
+// drained (Swappable.ReplaceHybridVector holds the write lock when calling it).
+func (h *HybridBackend) detachTextBackend() Backend {
+	if h == nil {
+		return nil
+	}
+	text := h.text
+	h.text = nil
+	return text
 }
 
 // TextBackend returns the underlying text search backend.

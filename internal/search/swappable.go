@@ -1,6 +1,10 @@
 package search
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/zzet/gortex/internal/embedding"
+)
 
 // Swappable wraps a Backend and lets an in-place swap be performed
 // concurrently with reads. Used by the indexer to re-wrap the active
@@ -39,13 +43,89 @@ func (s *Swappable) Swap(b Backend) {
 	}
 }
 
-// Inner returns the currently-active backend. Used internally to test
-// upgrade outcomes; production code should always go through the
-// Backend interface methods on Swappable itself.
+// ReplaceHybridVector atomically publishes a new vector channel while
+// retaining the active text backend. Acquiring the write lock first drains all
+// readers of the old backend. Existing hybrid layers are then peeled under the
+// lock, transferring their text ownership into exactly one replacement hybrid.
+// After publication, the retired hybrids release only their vector state.
+//
+// This operation is the safe alternative to composing Inner, NewHybrid, and
+// Swap: that sequence can race a reader, nest hybrids, and close the text
+// backend that the replacement just reused. ReplaceHybridVector panics when
+// vector is nil or the Swappable has already been closed.
+func (s *Swappable) ReplaceHybridVector(vector *VectorBackend, embedder embedding.Provider) {
+	if vector == nil {
+		panic("search.Swappable.ReplaceHybridVector: nil vector backend")
+	}
+
+	s.mu.Lock()
+	if s.inner == nil {
+		s.mu.Unlock()
+		panic("search.Swappable.ReplaceHybridVector: closed swappable")
+	}
+
+	text := s.inner
+	retired := make([]*HybridBackend, 0, 1)
+	for {
+		hybrid, ok := text.(*HybridBackend)
+		if !ok {
+			break
+		}
+		retired = append(retired, hybrid)
+		text = hybrid.TextBackend()
+	}
+	if text == nil {
+		s.mu.Unlock()
+		panic("search.Swappable.ReplaceHybridVector: hybrid has no text backend")
+	}
+	for _, hybrid := range retired {
+		hybrid.detachTextBackend()
+	}
+	s.inner = NewHybrid(text, vector, embedder)
+	s.mu.Unlock()
+
+	for _, hybrid := range retired {
+		hybrid.Close()
+	}
+}
+
+// AcquireBackend pins the currently active backend until release is called.
+// Callers that need a capability not forwarded by Swappable must defer the
+// returned release immediately and must not retain the backend beyond that
+// scope. Holding the pin prevents Swap, ReplaceHybridVector, and Close from
+// retiring the backend underneath the caller. release is idempotent.
+func (s *Swappable) AcquireBackend() (backend Backend, release func()) {
+	s.mu.RLock()
+	var once sync.Once
+	return s.inner, func() {
+		once.Do(s.mu.RUnlock)
+	}
+}
+
+// Inner returns an unpinned snapshot of the currently-active backend. It is
+// retained for tests and diagnostics only: production callers must not keep or
+// dereference the result because replacement may retire it immediately after
+// this method returns. Use AcquireBackend or a forwarded capability instead.
 func (s *Swappable) Inner() Backend {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.inner
+}
+
+// Embedder returns the active hybrid's externally-owned embedding provider.
+// The lookup is protected by the Swappable read lock; replacement never closes
+// the provider, so the returned provider remains under its original owner's
+// lifecycle rather than the retired HybridBackend's lifecycle.
+func (s *Swappable) Embedder() embedding.Provider {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	type embedderProvider interface {
+		Embedder() embedding.Provider
+	}
+	if provider, ok := s.inner.(embedderProvider); ok {
+		return provider.Embedder()
+	}
+	return nil
 }
 
 // --- Backend interface ------------------------------------------------
@@ -121,14 +201,12 @@ func (s *Swappable) SearchSymbolBundles(query string, limit int) []SymbolBundle 
 // warm-started daemon over a populated disk FTS isn't mistaken for an
 // empty backend.
 func (s *Swappable) DocCount() (int, bool) {
-	// Snapshot the inner backend under the lock but run the count
-	// outside it — DocCount can be a real store query and holding
-	// the RLock across it would stall a pending Swap (and, behind
-	// it, every new reader).
+	// Hold the read lock for the complete call. Replacement owns and retires
+	// the old backend after acquiring the write lock, so merely snapshotting
+	// the pointer here would let it close underneath a live store query.
 	s.mu.RLock()
-	inner := s.inner
-	s.mu.RUnlock()
-	if dc, ok := inner.(DocCounter); ok {
+	defer s.mu.RUnlock()
+	if dc, ok := s.inner.(DocCounter); ok {
 		return dc.DocCount()
 	}
 	return 0, false

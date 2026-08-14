@@ -156,7 +156,9 @@ func runEvalRecall(_ *cobra.Command, _ []string) error {
 	// HybridBackend is what RRF queries.
 	inner := idx.Search()
 	if sw, ok := inner.(*search.Swappable); ok {
-		inner = sw.Inner()
+		var release func()
+		inner, release = sw.AcquireBackend()
+		defer release()
 	}
 	hybrid, _ := inner.(*search.HybridBackend)
 	var textBackend search.Backend

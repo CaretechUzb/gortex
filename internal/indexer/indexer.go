@@ -699,7 +699,9 @@ func isSymbolSearcherBackend(b search.Backend) bool {
 	case *search.SymbolSearcherBackend:
 		return true
 	case *search.Swappable:
-		return isSymbolSearcherBackend(backend.Inner())
+		inner, release := backend.AcquireBackend()
+		defer release()
+		return isSymbolSearcherBackend(inner)
 	case *search.HybridBackend:
 		return isSymbolSearcherBackend(backend.TextBackend())
 	default:
@@ -5511,23 +5513,10 @@ func (idx *Indexer) buildSearchIndex() {
 		vecBackend.SetChunkMap(chunkMap)
 	}
 
-	// Wrap text + vector into hybrid backend, swapping it in atomically
-	// so any concurrent searches keep seeing a coherent backend.
-	//
-	// Unwrap any existing HybridBackend to its text side before
-	// re-wrapping. Without this, buildSearchIndex called again (e.g.
-	// once per tracked repo during daemon warmup) would stack a fresh
-	// Hybrid on top of the previous one — nested Hybrids retain all
-	// their stale vector indexes, ballooning live memory by an order
-	// of magnitude. The text backend has already been
-	// updated with every node via idx.search.Add above; a single
-	// Hybrid wrapping it + the latest vecBackend is all we need.
-	sw := idx.swappable()
-	inner := sw.Inner()
-	if hyb, ok := inner.(*search.HybridBackend); ok {
-		inner = hyb.TextBackend()
-	}
-	sw.Swap(search.NewHybrid(inner, vecBackend, idx.embedder))
+	// Publish the vector channel atomically. ReplaceHybridVector pins the
+	// active text backend, flattens any legacy hybrid layers, and retires the
+	// previous vector only after every reader has drained.
+	idx.swappable().ReplaceHybridVector(vecBackend, idx.embedder)
 	if droppedVectors > 0 {
 		idx.logger.Warn("indexer: dropped invalid embedding vectors",
 			zap.Int("dropped", droppedVectors),

@@ -636,20 +636,25 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 		return out
 	}
 
-	// 1) Unwrap Swappable so we see the currently-active inner.
+	// 1) Pin Swappable so the inspected backend cannot be retired while
+	// status derives its type, counts, and sizes.
 	inner := b
 	if sw, ok := inner.(*search.Swappable); ok {
-		inner = sw.Inner()
+		var release func()
+		inner, release = sw.AcquireBackend()
+		defer release()
 	}
 	// 2) If Hybrid is in play, split its text/vector sizes and keep
 	//    drilling into the text side for name/doc-count identification.
 	if hyb, ok := inner.(*search.HybridBackend); ok {
 		out.vectorBytes = hyb.VectorSizeBytes()
 		inner = hyb.TextBackend()
-		// TextBackend() itself could be a Swappable in some setups —
-		// unlikely today but cheap to guard.
+		// TextBackend() itself could be a Swappable in some setups. Pin it
+		// too so a nested replacement cannot invalidate this inspection.
 		if sw, ok := inner.(*search.Swappable); ok {
-			inner = sw.Inner()
+			var release func()
+			inner, release = sw.AcquireBackend()
+			defer release()
 		}
 	}
 
@@ -676,9 +681,9 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 		out.DocCount, out.DocCountKnown = back.DocCount()
 	default:
 		out.Name = "unknown"
-		out.DocCount = b.Count()
+		out.DocCount = inner.Count()
 		out.DocCountKnown = true
-		out.Bytes = search.BackendSize(b)
+		out.Bytes = search.BackendSize(inner)
 	}
 	return out
 }
