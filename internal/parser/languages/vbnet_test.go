@@ -1,12 +1,15 @@
 package languages
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser"
 )
 
 // vbFind returns the first node with the given name, or nil.
@@ -285,4 +288,435 @@ func TestVBNetExtractor_EmptyInput(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, res.Nodes, 1)
 	assert.Equal(t, graph.KindFile, res.Nodes[0].Kind)
+}
+
+// vbSnapshot renders an extraction into a stable, comparable form: every node
+// and edge in emission order with the fields a consumer keys on. Used both to
+// assert LF/CRLF equivalence and to pin determinism.
+func vbSnapshot(res *parser.ExtractionResult) string {
+	var b strings.Builder
+	for _, n := range res.Nodes {
+		fmt.Fprintf(&b, "N\t%s\t%s\t%s\t%d\t%d\t%v\t%v\t%v\n",
+			n.ID, n.Kind, n.Name, n.StartLine, n.EndLine,
+			n.Meta["receiver"], n.Meta["visibility"], n.Meta["scope_ns"])
+	}
+	for _, e := range res.Edges {
+		fmt.Fprintf(&b, "E\t%s\t%s\t%s\t%d\n", e.Kind, e.From, e.To, e.Line)
+	}
+	return b.String()
+}
+
+// The corpus this extractor was built for is Windows-origin: real .vb files are
+// CRLF. Every other fixture in this file is LF, so without this test the CRLF
+// path is entirely unexercised. helpers_indent.trimmed strips \r for block-end
+// detection; the declaration patterns capture \w+ so no name absorbs one. The
+// contract is therefore the strong one: CRLF input must produce a byte-identical
+// extraction to the same source with LF endings, including line numbers.
+func TestVBNetExtractor_CRLFEquivalence(t *testing.T) {
+	lf := `Imports System.Data
+
+Namespace Ltk.Demo
+
+    Public Class OrderService
+        Inherits ServiceBase
+        Implements IOrderService, IDisposable
+
+        Public Property OrderCount As Integer
+
+        Public Sub New()
+            _count = 0
+        End Sub
+
+        Public Function Total(ByVal id As Integer) As Decimal
+            Dim repo As New OrderRepository
+            Return repo.Sum(id)
+        End Function
+    End Class
+
+End Namespace
+`
+	crlf := strings.ReplaceAll(lf, "\n", "\r\n")
+	require.NotEqual(t, lf, crlf, "fixture must actually differ in line endings")
+	require.Contains(t, crlf, "\r\n")
+
+	e := NewVBNetExtractor()
+	resLF, err := e.Extract("Order.vb", []byte(lf))
+	require.NoError(t, err)
+	resCRLF, err := e.Extract("Order.vb", []byte(crlf))
+	require.NoError(t, err)
+
+	assert.Equal(t, vbSnapshot(resLF), vbSnapshot(resCRLF),
+		"CRLF input must extract identically to LF input")
+
+	// Spot-check the line numbers directly rather than trusting only the
+	// snapshot equality, so a regression that shifts BOTH consistently is
+	// still caught.
+	cls := vbFind(resCRLF.Nodes, "OrderService")
+	require.NotNil(t, cls)
+	assert.Equal(t, 5, cls.StartLine)
+	assert.Equal(t, 19, cls.EndLine, "End Class line under CRLF")
+	total := vbFind(resCRLF.Nodes, "Total")
+	require.NotNil(t, total)
+	assert.Equal(t, 15, total.StartLine)
+	assert.Equal(t, 18, total.EndLine, "End Function line under CRLF")
+}
+
+// Mixed and lone-CR endings must not shift line numbering either. A lone \r is
+// NOT a line separator for this extractor (lines are split on \n), which is the
+// correct reading for .NET tooling; the assertion documents that.
+func TestVBNetExtractor_MixedLineEndings(t *testing.T) {
+	src := []byte("Public Class A\r\n    Public Sub One()\r\n    End Sub\n    Public Sub Two()\n    End Sub\r\nEnd Class\r\n")
+	res, err := NewVBNetExtractor().Extract("mix.vb", src)
+	require.NoError(t, err)
+
+	one := vbFind(res.Nodes, "One")
+	require.NotNil(t, one)
+	assert.Equal(t, 2, one.StartLine)
+	assert.Equal(t, 3, one.EndLine)
+
+	two := vbFind(res.Nodes, "Two")
+	require.NotNil(t, two)
+	assert.Equal(t, 4, two.StartLine)
+	assert.Equal(t, 5, two.EndLine)
+
+	cls := vbFind(res.Nodes, "A")
+	require.NotNil(t, cls)
+	assert.Equal(t, 6, cls.EndLine)
+}
+
+// Encoding normalisation is the indexer's job, not the extractor's: the
+// transform pipeline runs bomStripTransform on EVERY file before any extractor
+// sees it (internal/indexer/transform.go), and no extractor in this package
+// strips a BOM itself. This test pins both halves of that contract so the
+// coupling is explicit rather than assumed:
+//
+//   - After the pipeline's strip, a BOM'd file extracts identically to a clean
+//     one. This is the production path, and it is what must never regress.
+//   - Handed raw BOM'd bytes directly, a declaration sitting on line 1 does not
+//     match, because `^[ \t]*` cannot skip the three BOM bytes. Declarations on
+//     any later line are unaffected.
+//
+// Real .vb files in the corpus this was built for open with `Imports` or a
+// comment, and sibling .aspx files are the ones carrying BOMs, so the raw-bytes
+// case is a direct-API-caller concern rather than a production one. It is
+// deliberately not fixed inside this extractor: doing so here alone would put
+// encoding normalisation in one language instead of the shared pipeline that
+// already owns it for all of them.
+func TestVBNetExtractor_LeadingBOM(t *testing.T) {
+	const utf8BOM = "\xEF\xBB\xBF"
+	// Line 1 is a comment, which is the common shape for a real .vb file and
+	// means nothing extractable sits on the line the BOM occupies.
+	body := `' Copyright header
+Imports System
+
+Public Class Widget
+    Public Sub Go()
+        Trace.WriteLine("x")
+    End Sub
+End Class
+`
+	e := NewVBNetExtractor()
+
+	clean, err := e.Extract("w.vb", []byte(body))
+	require.NoError(t, err)
+	withBOM, err := e.Extract("w.vb", []byte(utf8BOM+body))
+	require.NoError(t, err)
+
+	// Everything below line 1 is untouched by the BOM: same nodes, same edges,
+	// same line numbers. This is the assertion that could genuinely fail --
+	// the BOM shifts every byte offset in the file by three.
+	assert.NotNil(t, vbFind(withBOM.Nodes, "Widget"), "class survives a BOM")
+	assert.NotNil(t, vbFind(withBOM.Nodes, "Go"), "member survives a BOM")
+	assert.Equal(t, vbSnapshot(clean), vbSnapshot(withBOM),
+		"a BOM must not perturb declarations below line 1")
+
+	// Raw bytes with something extractable ON line 1: the BOM masks it, because
+	// `^[ \t]*` cannot skip the three BOM bytes. Documents the extractor's
+	// dependence on the indexer's bomStripTransform.
+	masked, err := e.Extract("f.vb", []byte(utf8BOM+"Imports System\nPublic Class First\nEnd Class\n"))
+	require.NoError(t, err)
+	assert.False(t, vbHasEdge(masked.Edges, graph.EdgeImports, "f.vb", "unresolved::import::System"),
+		"line-1 Imports is masked by a raw BOM; the indexer strips it first")
+	// Degradation stays local to line 1 -- line 2 onward still extracts.
+	assert.NotNil(t, vbFind(masked.Nodes, "First"),
+		"declaration on line 2 is unaffected")
+}
+
+// Same input twice must yield identical IDs, kinds, ordering and line numbers.
+// Worth pinning specifically because disambiguateID's _L<line> suffix depends on
+// the order collisions are encountered, and because Go map iteration order is
+// randomised -- any future change that derives emission order from a map would
+// break here rather than silently producing an unstable graph.
+func TestVBNetExtractor_Deterministic(t *testing.T) {
+	src := []byte(`Public Class A
+    Public Sub Run()
+    End Sub
+    Public Sub Run(ByVal n As Integer)
+    End Sub
+    Public Sub New()
+    End Sub
+    Public Property Name As String
+End Class
+
+Public Class B
+    Public Sub Run()
+    End Sub
+    Public Sub New()
+    End Sub
+End Class
+
+Public Module M
+    Public Function Helper() As Integer
+        Return Util.Compute(1)
+    End Function
+End Module
+`)
+	e := NewVBNetExtractor()
+	first, err := e.Extract("d.vb", src)
+	require.NoError(t, err)
+	want := vbSnapshot(first)
+
+	// Sanity: the fixture must actually exercise the collision path, otherwise
+	// this test would pass trivially.
+	require.Contains(t, want, "_L", "fixture must produce at least one _L-disambiguated ID")
+
+	for i := 0; i < 25; i++ {
+		res, err := e.Extract("d.vb", src)
+		require.NoError(t, err)
+		require.Equal(t, want, vbSnapshot(res), "extraction differed on pass %d", i+2)
+	}
+
+	// A fresh extractor instance must agree too -- no state may persist on the
+	// receiver between files.
+	other, err := NewVBNetExtractor().Extract("d.vb", src)
+	require.NoError(t, err)
+	assert.Equal(t, want, vbSnapshot(other))
+}
+
+// Table-driven coverage of the modifier runs. The declaration patterns accept
+// the modifier keywords in any order and any combination, so the risk is a
+// modifier that silently prevents a match (or is captured as the member name).
+func TestVBNetExtractor_ModifierMatrix(t *testing.T) {
+	cases := []struct {
+		name       string
+		decl       string
+		wantName   string
+		wantKind   graph.NodeKind
+		wantVis    string
+		wantInType bool
+	}{
+		{"public sub", "Public Sub Alpha()", "Alpha", graph.KindMethod, VisibilityPublic, true},
+		{"private sub", "Private Sub Alpha()", "Alpha", graph.KindMethod, VisibilityPrivate, true},
+		{"protected sub", "Protected Sub Alpha()", "Alpha", graph.KindMethod, VisibilityProtected, true},
+		{"friend maps to internal", "Friend Sub Alpha()", "Alpha", graph.KindMethod, VisibilityInternal, true},
+		{"protected friend", "Protected Friend Sub Alpha()", "Alpha", graph.KindMethod, VisibilityProtected, true},
+		{"shared", "Public Shared Sub Alpha()", "Alpha", graph.KindMethod, VisibilityPublic, true},
+		{"overrides", "Public Overrides Sub Alpha()", "Alpha", graph.KindMethod, VisibilityPublic, true},
+		{"overridable", "Public Overridable Sub Alpha()", "Alpha", graph.KindMethod, VisibilityPublic, true},
+		{"notoverridable", "Public NotOverridable Overrides Sub Alpha()", "Alpha", graph.KindMethod, VisibilityPublic, true},
+		{"shadows", "Public Shadows Sub Alpha()", "Alpha", graph.KindMethod, VisibilityPublic, true},
+		{"partial", "Private Partial Sub Alpha()", "Alpha", graph.KindMethod, VisibilityPrivate, true},
+		{"async", "Public Async Sub Alpha()", "Alpha", graph.KindMethod, VisibilityPublic, true},
+		{"shared before visibility", "Shared Public Sub Alpha()", "Alpha", graph.KindMethod, "", true},
+		{"no modifier at all", "Sub Alpha()", "Alpha", graph.KindMethod, "", true},
+		{"long run", "Public Shared Shadows Overridable Sub Alpha()", "Alpha", graph.KindMethod, VisibilityPublic, true},
+
+		{"function", "Public Function Beta() As Integer", "Beta", graph.KindMethod, VisibilityPublic, true},
+		{"async function", "Public Async Function Beta() As Task", "Beta", graph.KindMethod, VisibilityPublic, true},
+		{"iterator function", "Public Iterator Function Beta() As IEnumerable", "Beta", graph.KindMethod, VisibilityPublic, true},
+		{"mustoverride function", "Protected MustOverride Function Beta() As Integer", "Beta", graph.KindMethod, VisibilityProtected, true},
+		{"shared function", "Friend Shared Function Beta() As Integer", "Beta", graph.KindMethod, VisibilityInternal, true},
+
+		{"property", "Public Property Gamma As String", "Gamma", graph.KindField, VisibilityPublic, true},
+		{"readonly property", "Public ReadOnly Property Gamma As String", "Gamma", graph.KindField, VisibilityPublic, true},
+		{"writeonly property", "Public WriteOnly Property Gamma As String", "Gamma", graph.KindField, VisibilityPublic, true},
+		{"default property", "Public Default Property Gamma As String", "Gamma", graph.KindField, VisibilityPublic, true},
+		{"shared readonly property", "Private Shared ReadOnly Property Gamma As String", "Gamma", graph.KindField, VisibilityPrivate, true},
+		{"overrides property", "Public Overrides ReadOnly Property Gamma As String", "Gamma", graph.KindField, VisibilityPublic, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := []byte("Public Class Host\n    " + tc.decl + "\nEnd Class\n")
+			res, err := NewVBNetExtractor().Extract("mods.vb", src)
+			require.NoError(t, err)
+
+			n := vbFind(res.Nodes, tc.wantName)
+			require.NotNil(t, n, "declaration %q produced no node", tc.decl)
+			assert.Equal(t, tc.wantKind, n.Kind)
+			if tc.wantVis == "" {
+				assert.Nil(t, n.Meta["visibility"],
+					"no leading access modifier must not be guessed")
+			} else {
+				assert.Equal(t, tc.wantVis, n.Meta["visibility"])
+			}
+			if tc.wantInType {
+				assert.Equal(t, "Host", n.Meta["receiver"])
+				assert.Equal(t, "mods.vb::Host."+tc.wantName, n.ID)
+			}
+		})
+	}
+}
+
+// Case-insensitive modifier runs: VB source in the wild mixes casing freely.
+func TestVBNetExtractor_ModifierCasing(t *testing.T) {
+	for _, decl := range []string{
+		"PUBLIC SHARED SUB Alpha()",
+		"public shared sub Alpha()",
+		"Public SHARED Sub Alpha()",
+		"pUbLiC sHaReD sUb Alpha()",
+	} {
+		src := []byte("Public Class Host\n    " + decl + "\nEnd Class\n")
+		res, err := NewVBNetExtractor().Extract("c.vb", src)
+		require.NoError(t, err)
+		n := vbFind(res.Nodes, "Alpha")
+		require.NotNil(t, n, "declaration %q produced no node", decl)
+		assert.Equal(t, graph.KindMethod, n.Kind)
+		assert.Equal(t, VisibilityPublic, n.Meta["visibility"])
+	}
+}
+
+// `New X.Y(...)` is a type instantiation. Emitting it as a call to a member
+// named Y is the single largest source of false CALLS edges in designer-heavy
+// VB (measured: thousands on a real estate), so the filter is load-bearing and
+// gets its own guard.
+func TestVBNetExtractor_NewIsNotACall(t *testing.T) {
+	src := []byte(`Public Class Form1
+    Public Sub Build()
+        Me.Size = New System.Drawing.Size(120, 40)
+        Dim list As New Collections.Generic.List(Of String)()
+        Me.Panel.Controls.Add(list)
+    End Sub
+End Class
+`)
+	res, err := NewVBNetExtractor().Extract("f.vb", src)
+	require.NoError(t, err)
+
+	build := vbFind(res.Nodes, "Build")
+	require.NotNil(t, build)
+
+	// The instantiated type is recorded as a reference...
+	assert.True(t, vbHasEdge(res.Edges, graph.EdgeReferences, "f.vb", "unresolved::Size"),
+		"New System.Drawing.Size(...) recorded as a type reference")
+	assert.True(t, vbHasEdge(res.Edges, graph.EdgeReferences, "f.vb", "unresolved::List"),
+		"New ...List(Of String) recorded as a type reference")
+
+	// ...and must NOT appear as a call to a member named Size.
+	assert.False(t, vbHasEdge(res.Edges, graph.EdgeCalls, build.ID, "unresolved::Size"),
+		"New ...Size(...) must not emit a CALLS edge")
+
+	// A genuine qualified invocation on the same body still lands.
+	assert.True(t, vbHasEdge(res.Edges, graph.EdgeCalls, build.ID, "unresolved::Add"),
+		"Controls.Add(list) is a real call")
+}
+
+// KNOWN LIMITATION, pinned deliberately rather than left implicit.
+//
+// VB uses `(` for indexed/default property access as well as invocation, so
+// `dt.Rows(0)` is syntactically indistinguishable from a method call without
+// type information this extractor does not have. Such accesses are therefore
+// still emitted as CALLS edges. A hardcoded accessor blocklist (Rows/Cells/
+// Fields/...) was rejected as too framework-specific to be correct upstream.
+//
+// This test asserts the CURRENT behaviour so the limitation is visible in the
+// suite and any future fix shows up as an intentional change here.
+func TestVBNetExtractor_IndexedPropertyAccessIsEmittedAsCall(t *testing.T) {
+	src := []byte(`Public Class Repo
+    Public Sub Scan(ByVal dt As DataTable)
+        Dim v As Object = dt.Rows(0)
+    End Sub
+End Class
+`)
+	res, err := NewVBNetExtractor().Extract("r.vb", src)
+	require.NoError(t, err)
+
+	scan := vbFind(res.Nodes, "Scan")
+	require.NotNil(t, scan)
+	assert.True(t, vbHasEdge(res.Edges, graph.EdgeCalls, scan.ID, "unresolved::Rows"),
+		"indexed property access is currently emitted as a call (documented limitation)")
+}
+
+// Malformed, truncated and non-UTF8 input must not panic, and degradation must
+// stay local: the extractor should still return the file node and whatever
+// declarations it could recognise.
+func TestVBNetExtractor_Robustness(t *testing.T) {
+	cases := []struct {
+		name string
+		src  []byte
+	}{
+		{"class with no End Class at EOF", []byte("Public Class Orphan\n    Public Sub M()\n    End Sub\n")},
+		{"sub with no End Sub at EOF", []byte("Public Class A\n    Public Sub M()\n        x = 1\n")},
+		{"truncated mid-declaration", []byte("Public Class A\n    Public Sub Half(")},
+		{"truncated mid-keyword", []byte("Public Cla")},
+		{"only comments", []byte("' first\n' second\nREM third\n")},
+		{"only whitespace", []byte("   \n\t\n \n")},
+		{"no trailing newline", []byte("Public Class A\nEnd Class")},
+		{"lone CR only", []byte("Public Class A\rEnd Class\r")},
+		{"nul bytes", []byte("Public Class A\x00\n    Public Sub M()\x00\n    End Sub\nEnd Class\n")},
+		{"invalid utf8 latin1", []byte("Public Class Caf\xE9\n    Public Sub M()\n    End Sub\nEnd Class\n")},
+		{"invalid utf8 mid-body", append([]byte("Public Class A\n    Public Sub M()\n        s = \""), append([]byte{0xFF, 0xFE, 0xFD}, []byte("\"\n    End Sub\nEnd Class\n")...)...)},
+		{"utf16 bom then garbage", append([]byte{0xFF, 0xFE}, []byte("P\x00u\x00b\x00l\x00i\x00c\x00")...)},
+		{"unterminated namespace", []byte("Namespace A.B\n    Public Class C\n")},
+		{"End without opener", []byte("End Class\nEnd Sub\nEnd Namespace\n")},
+		{"deeply nested unterminated", []byte(strings.Repeat("Namespace N\n", 200))},
+		{"very long single line", []byte("Public Class A\n    Public Sub M()\n        x = " + strings.Repeat("obj.Call(1) + ", 2000) + "0\n    End Sub\nEnd Class\n")},
+		{"many overloads colliding", []byte("Public Class A\n" + strings.Repeat("    Public Sub Dup()\n    End Sub\n", 500) + "End Class\n")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var res *parser.ExtractionResult
+			var err error
+			require.NotPanics(t, func() {
+				res, err = NewVBNetExtractor().Extract("x.vb", tc.src)
+			}, "extractor panicked")
+			require.NoError(t, err)
+			require.NotNil(t, res)
+
+			// The file node is always present and is always first.
+			require.GreaterOrEqual(t, len(res.Nodes), 1)
+			assert.Equal(t, graph.KindFile, res.Nodes[0].Kind)
+
+			// Structural invariants that must hold for ANY input.
+			ids := map[string]bool{}
+			for _, n := range res.Nodes {
+				assert.NotEmpty(t, n.ID, "node with empty ID")
+				assert.False(t, ids[n.ID], "duplicate node ID %q", n.ID)
+				ids[n.ID] = true
+				assert.GreaterOrEqual(t, n.StartLine, 1, "node %q StartLine", n.ID)
+				assert.GreaterOrEqual(t, n.EndLine, n.StartLine,
+					"node %q EndLine before StartLine", n.ID)
+			}
+			for _, e := range res.Edges {
+				assert.NotEmpty(t, e.From, "edge with empty From")
+				assert.NotEmpty(t, e.To, "edge with empty To")
+				// Every edge originating inside this file must name a node the
+				// extraction actually emitted -- no dangling internal source.
+				if strings.HasPrefix(e.From, "x.vb") {
+					assert.True(t, ids[e.From], "edge From %q names no emitted node", e.From)
+				}
+			}
+		})
+	}
+}
+
+// An unterminated block must degrade to a point extent rather than swallowing
+// the rest of the file or producing an inverted range.
+func TestVBNetExtractor_UnterminatedBlockExtent(t *testing.T) {
+	src := []byte("Public Class Orphan\n    Public Sub M()\n        x = 1\n")
+	res, err := NewVBNetExtractor().Extract("o.vb", src)
+	require.NoError(t, err)
+
+	cls := vbFind(res.Nodes, "Orphan")
+	require.NotNil(t, cls)
+	assert.Equal(t, cls.StartLine, cls.EndLine,
+		"no End Class: extent collapses to the declaration line")
+
+	m := vbFind(res.Nodes, "M")
+	require.NotNil(t, m)
+	assert.Equal(t, m.StartLine, m.EndLine,
+		"no End Sub: extent collapses to the declaration line")
+	// With the class extent collapsed, M no longer sits inside it, so it is a
+	// free function. Documents the degradation shape.
+	assert.Equal(t, graph.KindFunction, m.Kind)
 }
