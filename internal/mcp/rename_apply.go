@@ -37,8 +37,10 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 	if err != nil {
 		return nil
 	}
-	info, err := os.Stat(absPath)
+	info, err := os.Lstat(absPath)
 	if err != nil || !info.Mode().IsRegular() {
+		// Refuse symlink leaves: an atomic edit of the link path would replace
+		// the link object while leaving its target unchanged.
 		return nil
 	}
 
@@ -51,7 +53,7 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 	if err != nil {
 		return nil
 	}
-	extracted, err := s.indexer.ExtractSource(relPath, content)
+	extracted, err := s.indexer.ExtractSource(ctx, relPath, content)
 	if err != nil || extracted == nil {
 		return nil
 	}
@@ -75,7 +77,7 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 	}
 
 	oldLine, newLine, ok := s.verifiedDeclarationRename(
-		relPath, content, declarationLine, requestedSymbol, declarationName, newName,
+		ctx, relPath, content, declarationLine, requestedSymbol, declarationName, newName,
 	)
 	if !ok {
 		return nil
@@ -114,6 +116,11 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 	}
 }
 
+const (
+	maxUnindexedRenameLineBytes  = 16 << 10
+	maxUnindexedRenameCandidates = 8
+)
+
 // verifiedDeclarationRename tries each whole-identifier occurrence on the
 // declaration line and reparses the resulting file. It accepts exactly one
 // candidate: the edit must remove the requested symbol ID and create the
@@ -121,35 +128,54 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 // optional extractor columns, which may point at the start of the declaration
 // rather than at its name.
 func (s *Server) verifiedDeclarationRename(
+	ctx context.Context,
 	relPath string,
 	content []byte,
 	declarationLine int,
 	requestedSymbol, declarationName, newName string,
 ) (string, string, bool) {
+	if ctx.Err() != nil {
+		return "", "", false
+	}
 	lines := splitLinesKeepEnds(string(content))
 	if declarationLine > len(lines) {
 		return "", "", false
 	}
 	oldLine := lines[declarationLine-1]
 	body, term := splitLineTerminator(oldLine)
+	if len(body) > maxUnindexedRenameLineBytes {
+		return "", "", false
+	}
 
 	if !strings.HasSuffix(requestedSymbol, declarationName) {
 		return "", "", false
 	}
 	expectedSymbol := strings.TrimSuffix(requestedSymbol, declarationName) + newName
 
-	var accepted string
+	offsets := make([]int, 0, maxUnindexedRenameCandidates)
 	for from := 0; ; {
 		nameOffset := indexIdentifier(body, declarationName, from)
 		if nameOffset < 0 {
 			break
+		}
+		if len(offsets) == maxUnindexedRenameCandidates {
+			return "", "", false
+		}
+		offsets = append(offsets, nameOffset)
+		from = nameOffset + 1
+	}
+
+	var accepted string
+	for _, nameOffset := range offsets {
+		if ctx.Err() != nil {
+			return "", "", false
 		}
 		candidateLine := body[:nameOffset] + newName + body[nameOffset+len(declarationName):] + term
 		candidateLines := append([]string(nil), lines...)
 		candidateLines[declarationLine-1] = candidateLine
 		candidateContent := []byte(strings.Join(candidateLines, ""))
 
-		candidate, err := s.indexer.ExtractSource(relPath, candidateContent)
+		candidate, err := s.indexer.ExtractSource(ctx, relPath, candidateContent)
 		if err == nil && candidate != nil {
 			originalPresent := false
 			expectedAtDeclaration := 0
@@ -173,7 +199,6 @@ func (s *Server) verifiedDeclarationRename(
 				accepted = candidateLine
 			}
 		}
-		from = nameOffset + 1
 	}
 	if accepted == "" {
 		return "", "", false

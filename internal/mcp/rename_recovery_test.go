@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -122,6 +123,88 @@ func TestRenameSymbol_SubIdentifierIsNotADeclaration(t *testing.T) {
 	got, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, source, string(got))
+}
+
+func TestRenameSymbol_IgnoredMinifiedRecoveryIsRefused(t *testing.T) {
+	srv, dir := setupRenameServer(t, renameTargetSrc, renameCallerSrc)
+	source := "const foo=1;function use(){return " + strings.Repeat("foo+", 4096) + "0}\n"
+	path := filepath.Join(dir, "ignored.js")
+	require.NoError(t, os.WriteFile(path, []byte(source), 0o644))
+	srv.indexer.SetExcludePatterns([]string{"ignored.js"})
+	_, err := srv.indexer.Index(dir)
+	require.NoError(t, err)
+
+	res := callToolByName(t, srv, context.Background(), "rename_symbol", map[string]any{
+		"id": "ignored.js::foo", "new_name": "renamed",
+	})
+	require.True(t, res.IsError)
+	require.Contains(t, toolResultText(res), "symbol not found: ignored.js::foo")
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, source, string(got))
+}
+
+func TestRenameSymbol_OneLineCandidateBudgetRefusesRecovery(t *testing.T) {
+	srv, dir := setupRenameServer(t, renameTargetSrc, renameCallerSrc)
+	source := "package main; func Many() {}; func Use() { " + strings.Repeat("Many(); ", maxUnindexedRenameCandidates) + "Many() }\n"
+	path := filepath.Join(dir, "late.go")
+	require.NoError(t, os.WriteFile(path, []byte(source), 0o644))
+
+	extracted, err := srv.indexer.ExtractSource(context.Background(), "late.go", []byte(source))
+	require.NoError(t, err)
+	defer extracted.ReleaseTree()
+	found := false
+	for _, node := range extracted.Nodes {
+		_, suffix, ok := strings.Cut(node.ID, "::")
+		if ok && suffix == "Many" {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "fixture must reach the candidate-budget gate with a parsed declaration")
+
+	require.Nil(t, srv.unindexedRenameRecovery(context.Background(), "late.go::Many", "Renamed", false))
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, source, string(got))
+}
+
+func TestRenameSymbol_CancelledRecoveryDoesNotParseOrOfferFallback(t *testing.T) {
+	srv, dir := setupRenameServer(t, renameTargetSrc, renameCallerSrc)
+	const source = "package main\n\nfunc Late() {}\n"
+	path := filepath.Join(dir, "late.go")
+	require.NoError(t, os.WriteFile(path, []byte(source), 0o644))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.Nil(t, srv.unindexedRenameRecovery(ctx, "late.go::Late", "Renamed", false))
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, source, string(got))
+}
+
+func TestRenameSymbol_SymlinkRecoveryIsRefused(t *testing.T) {
+	srv, dir := setupRenameServer(t, renameTargetSrc, renameCallerSrc)
+	const source = "package main\n\nfunc Linked() {}\n"
+	targetPath := filepath.Join(dir, "symlink-target.go")
+	linkPath := filepath.Join(dir, "late.go")
+	require.NoError(t, os.WriteFile(targetPath, []byte(source), 0o644))
+	if err := os.Symlink("symlink-target.go", linkPath); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	res := callToolByName(t, srv, context.Background(), "rename_symbol", map[string]any{
+		"id": "late.go::Linked", "new_name": "Renamed",
+	})
+	require.True(t, res.IsError)
+	require.Contains(t, toolResultText(res), "symbol not found: late.go::Linked")
+
+	got, err := os.ReadFile(targetPath)
+	require.NoError(t, err)
+	require.Equal(t, source, string(got))
+	info, err := os.Lstat(linkPath)
+	require.NoError(t, err)
+	require.NotZero(t, info.Mode()&os.ModeSymlink)
 }
 
 func TestRenameSymbol_InvalidTargetStaysNotFound(t *testing.T) {
