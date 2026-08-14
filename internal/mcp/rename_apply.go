@@ -165,21 +165,6 @@ func identifierBoundary(line string, start, end int) bool {
 	return true
 }
 
-// countIdentifierOccurrences returns the number of whole-identifier matches in
-// content. The same boundary rule used by rename planning keeps a requested
-// name from matching inside a longer identifier.
-func countIdentifierOccurrences(content, name string) int {
-	count := 0
-	for from := 0; ; {
-		idx := indexIdentifier(content, name, from)
-		if idx < 0 {
-			return count
-		}
-		count++
-		from = idx + len(name)
-	}
-}
-
 // replaceIdentifierAll rewrites every whole-identifier occurrence of old and
 // returns the new line plus the number of replacements. Replacing every
 // occurrence (not just the first) matters on lines such as
