@@ -47,9 +47,26 @@ type rangeSpecJSON struct {
 // the hits plus the display paths of any files that could not be resolved or
 // carry no indexed symbols, so the caller can report partial coverage rather
 // than silently dropping them.
+type loweredRanges struct {
+	hits       []rangeSymbolHit
+	unresolved []string
+	saturated  []string
+}
+
 func (s *Server) lowerRanges(specs []rangeSpec) ([]rangeSymbolHit, []string) {
+	return s.lowerRangesContext(context.Background(), specs)
+}
+
+func (s *Server) lowerRangesContext(ctx context.Context, specs []rangeSpec) ([]rangeSymbolHit, []string) {
+	lowered := s.lowerRangesDetailedContext(ctx, specs)
+	unresolved := append(append([]string(nil), lowered.unresolved...), lowered.saturated...)
+	sort.Strings(unresolved)
+	return lowered.hits, dedupeStrings(unresolved)
+}
+
+func (s *Server) lowerRangesDetailedContext(ctx context.Context, specs []rangeSpec) loweredRanges {
 	if s == nil || s.graph == nil || len(specs) == 0 {
-		return nil, nil
+		return loweredRanges{}
 	}
 	byGraphPath := make(map[string][]rangeSpec)
 	displayOf := make(map[string]string)
@@ -65,19 +82,25 @@ func (s *Server) lowerRanges(specs []rangeSpec) ([]rangeSymbolHit, []string) {
 		displayOf[gp] = relPath
 	}
 	if len(byGraphPath) == 0 {
-		return nil, unresolved
+		sort.Strings(unresolved)
+		return loweredRanges{unresolved: dedupeStrings(unresolved)}
 	}
 
 	want := make(map[string]struct{}, len(byGraphPath))
 	for gp := range byGraphPath {
 		want[gp] = struct{}{}
 	}
-	indexes := s.buildFileSymbolIndexForPaths(want)
+	indexes := s.buildFileSymbolIndexForPathsContext(ctx, want)
 
 	seen := make(map[string]struct{})
 	var hits []rangeSymbolHit
+	var saturated []string
 	for gp, specsForFile := range byGraphPath {
 		idx := indexes[gp]
+		if idx != nil && idx.saturated {
+			saturated = append(saturated, displayOf[gp])
+			continue
+		}
 		if idx == nil {
 			unresolved = append(unresolved, displayOf[gp])
 			continue
@@ -106,7 +129,10 @@ func (s *Server) lowerRanges(specs []rangeSpec) ([]rangeSymbolHit, []string) {
 		return hits[a].StartLine < hits[b].StartLine
 	})
 	sort.Strings(unresolved)
-	return hits, dedupeStrings(unresolved)
+	sort.Strings(saturated)
+	return loweredRanges{
+		hits: hits, unresolved: dedupeStrings(unresolved), saturated: dedupeStrings(saturated),
+	}
 }
 
 // parseRangeSpecs reads range specs from a request. Two forms are accepted:
@@ -164,7 +190,7 @@ func (s *Server) handleSymbolsForRanges(ctx context.Context, req mcp.CallToolReq
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	hits, unresolved := s.lowerRanges(specs)
+	hits, unresolved := s.lowerRangesContext(ctx, specs)
 	if hits == nil {
 		hits = []rangeSymbolHit{}
 	}

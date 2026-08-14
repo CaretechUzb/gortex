@@ -131,6 +131,11 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// tool call (GORTEX_AUTOINDEX=1). Cheap getenv + sync.Once on the
 		// request path; all real work runs on a background goroutine.
 		s.maybeAutoIndexCWD()
+		// Every bounded file-summary lookup descended from this tools/call
+		// shares one request-local allowance. Overlay preparation and facade
+		// forwarding derive child contexts, so the pointer survives both paths;
+		// idempotence prevents nested preparation from resetting the budget.
+		ctx = withLocalizationFileRequestBudget(ctx)
 		if injectOverlay {
 			var err error
 			ctx, _, err = s.prepareOverlayRequest(ctx)

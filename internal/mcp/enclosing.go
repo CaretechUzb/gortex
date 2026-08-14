@@ -265,7 +265,7 @@ func (s *Server) buildFileSymbolIndexForOrderedPathsScopedContext(
 
 	scope := s.localizationNodeScopeWithTests(ctx, opts, false, localizationFileIndexKinds...)
 	out := make(map[string]*fileSymbolIndex, len(paths))
-	remaining := localizationFileRequestLimit
+	budget := localizationFileBudgetFor(ctx)
 	for _, path := range paths {
 		if path == "" {
 			continue
@@ -276,23 +276,20 @@ func (s *Server) buildFileSymbolIndexForOrderedPathsScopedContext(
 		if ctx.Err() != nil {
 			return saturateMissingFileSymbolIndexes(out, paths)
 		}
-		if remaining <= 0 {
+		limit := budget.reserve(localizationFileNodeLimit)
+		if limit <= 0 {
 			out[path] = &fileSymbolIndex{saturated: true}
 			continue
-		}
-		limit := localizationFileNodeLimit
-		if remaining < limit {
-			limit = remaining
 		}
 		page, err := bounded.FindFileNodesBounded(ctx, path, scope, limit)
 		if err != nil || ctx.Err() != nil {
 			return saturateMissingFileSymbolIndexes(out, paths)
 		}
 		consumed := page.Total
-		if consumed > remaining {
-			consumed = remaining
+		if len(page.Nodes) > consumed {
+			consumed = len(page.Nodes)
 		}
-		remaining -= consumed
+		budget.finish(limit, consumed)
 		if page.Truncated {
 			out[path] = &fileSymbolIndex{saturated: true}
 			continue
