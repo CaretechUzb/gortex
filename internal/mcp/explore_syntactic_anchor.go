@@ -388,6 +388,104 @@ func exploreSourceRangeGraphPathAliases(graphPath string) []string {
 	return out
 }
 
+// exploreSourceRangeScopedGraphPathAliases maps a task's logical repo label to
+// the sole request-scoped graph prefix without consulting the filesystem. Replay
+// workspaces commonly index monolog/src/... as monolog-1800/src/.... A resolved
+// exact spelling remains authoritative; the scoped spelling is only a bounded
+// fallback. Multiple-repo scopes and paths resolved to a foreign repo never use
+// that fallback.
+func exploreSourceRangeScopedGraphPathAliases(
+	rawPath, resolvedGraphPath, resolvedRepoPrefix string,
+	scope query.QueryOptions,
+) []string {
+	resolved := exploreSourceRangeGraphPathAliases(resolvedGraphPath)
+	if resolvedRepoPrefix != "" && len(scope.RepoAllow) > 0 &&
+		!repoNarrowAdmits(scope.RepoAllow, resolvedRepoPrefix) {
+		return nil
+	}
+	repoPrefix := exploreSourceLiteralSingleRepoPrefix(scope)
+	normalizedRaw := strings.ReplaceAll(strings.TrimSpace(rawPath), "\\", "/")
+	if exploreSourceRangeTraversalPath(normalizedRaw) {
+		return nil
+	}
+	if repoPrefix == "" {
+		return resolved
+	}
+	if exploreSourceRangeAbsolutePath(normalizedRaw) {
+		if len(resolved) == 0 {
+			return nil
+		}
+		return resolved[:1]
+	}
+	raw := filepath.ToSlash(filepath.Clean(normalizedRaw))
+	raw = strings.TrimPrefix(raw, "./")
+	if raw == "" || raw == "." || raw == ".." || strings.HasPrefix(raw, "../") {
+		return resolved
+	}
+
+	relative := raw
+	if strings.HasPrefix(relative, repoPrefix+"/") {
+		relative = strings.TrimPrefix(relative, repoPrefix+"/")
+	} else if slash := strings.IndexByte(relative, '/'); slash > 0 &&
+		exploreSourceRangeLogicalRepoLabel(repoPrefix, relative[:slash]) {
+		relative = relative[slash+1:]
+	}
+	scopedPath := repoPrefix + "/" + relative
+	out := make([]string, 0, exploreSourceRangeMaxAliases)
+	seen := make(map[string]struct{}, exploreSourceRangeMaxAliases)
+	add := func(path string) {
+		if path == "" || len(out) == exploreSourceRangeMaxAliases {
+			return
+		}
+		if _, duplicate := seen[path]; duplicate {
+			return
+		}
+		seen[path] = struct{}{}
+		out = append(out, path)
+	}
+	if len(resolved) > 0 {
+		add(resolved[0])
+	}
+	add(scopedPath)
+	return out
+}
+
+func exploreSourceRangeAbsolutePath(path string) bool {
+	if path == "" {
+		return false
+	}
+	if filepath.IsAbs(filepath.FromSlash(path)) || strings.HasPrefix(path, "//") {
+		return true
+	}
+	return len(path) >= 2 && path[1] == ':' &&
+		((path[0] >= 'a' && path[0] <= 'z') || (path[0] >= 'A' && path[0] <= 'Z'))
+}
+
+func exploreSourceRangeTraversalPath(path string) bool {
+	for _, component := range strings.Split(path, "/") {
+		if component == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func exploreSourceRangeLogicalRepoLabel(repoPrefix, label string) bool {
+	if strings.EqualFold(repoPrefix, label) {
+		return true
+	}
+	if len(repoPrefix) <= len(label)+1 || repoPrefix[len(label)] != '-' ||
+		!strings.EqualFold(repoPrefix[:len(label)], label) {
+		return false
+	}
+	for _, r := range repoPrefix[len(label)+1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // exploreSourceRangeIndex chooses the exact indexed path when present. If it is
 // absent, exactly one suffix alias may resolve; multiple suffix hits are
 // deliberately rejected so an explicit citation never promotes an ambiguous
@@ -437,10 +535,17 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 	seenPaths := make(map[string]struct{}, len(specs)*exploreSourceRangeMaxAliases)
 	for _, spec := range specs {
 		absPath, relPath, err := s.resolveFilePath(spec.File)
-		if err != nil {
-			continue
+		resolvedGraphPath := ""
+		resolvedRepoPrefix := ""
+		if err == nil {
+			resolvedGraphPath = s.resolveOverlayGraphPath(relPath, absPath)
+			if s.multiIndexer != nil {
+				resolvedRepoPrefix = matchedRepoPrefix(s.multiIndexer, relPath)
+			}
 		}
-		graphPaths := exploreSourceRangeGraphPathAliases(s.resolveOverlayGraphPath(relPath, absPath))
+		graphPaths := exploreSourceRangeScopedGraphPathAliases(
+			spec.File, resolvedGraphPath, resolvedRepoPrefix, scope,
+		)
 		if len(graphPaths) == 0 {
 			continue
 		}
@@ -456,9 +561,15 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 		return ordinary
 	}
 	indexes := s.buildFileSymbolIndexForOrderedPathsScopedContext(ctx, orderedPaths, scope)
+	if ctx.Err() != nil {
+		return ordinary
+	}
 	exactNodes := make([]*graph.Node, 0, len(resolved))
 	seenNodes := make(map[string]struct{}, len(resolved))
 	for _, item := range resolved {
+		if ctx.Err() != nil {
+			return ordinary
+		}
 		index := exploreSourceRangeIndex(indexes, item.graphPaths)
 		for _, node := range exploreSourceRangeDefinitions(index, item.spec.StartLine, item.spec.EndLine) {
 			if node == nil || !exploreLocalizableKind(node.Kind) || !scope.ScopeAllows(node) ||
@@ -478,7 +589,7 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 			break
 		}
 	}
-	if len(exactNodes) == 0 {
+	if ctx.Err() != nil || len(exactNodes) == 0 {
 		return ordinary
 	}
 	ordinaryByID := make(map[string]*rerank.Candidate, len(ordinary))
@@ -508,6 +619,9 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 			continue
 		}
 		out = append(out, candidate)
+	}
+	if ctx.Err() != nil {
+		return ordinary
 	}
 	return out
 }
