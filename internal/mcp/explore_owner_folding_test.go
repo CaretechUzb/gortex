@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"go.uber.org/zap"
@@ -35,7 +36,7 @@ func TestFoldMemberOwnersPromotesSharedOwner(t *testing.T) {
 		{node: g.GetNode("repo/mw/other.ts::unrelated"), score: 0.9},
 		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.hydrate"), score: 0.8},
 	}
-	folded := s.foldMemberOwners(context.Background(), targets)
+	folded := s.foldMemberOwners(context.Background(), targets, graph.LocalizationNodeScope{})
 	if folded[0].node.ID != "repo/mw/persist.ts::PersistOptions" {
 		t.Fatalf("owner not promoted ahead of first member: head=%s", folded[0].node.ID)
 	}
@@ -48,7 +49,7 @@ func TestFoldMemberOwnersPromotesSharedOwner(t *testing.T) {
 		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.serialize"), score: 1.0},
 		{node: g.GetNode("repo/mw/other.ts::unrelated"), score: 0.9},
 	}
-	unfolded := s.foldMemberOwners(context.Background(), single)
+	unfolded := s.foldMemberOwners(context.Background(), single, graph.LocalizationNodeScope{})
 	if unfolded[0].node.ID != "repo/mw/persist.ts::PersistOptions.serialize" {
 		t.Fatal("a lone member must not trigger folding")
 	}
@@ -59,9 +60,92 @@ func TestFoldMemberOwnersPromotesSharedOwner(t *testing.T) {
 		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.serialize"), score: 0.9},
 		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.hydrate"), score: 0.8},
 	}
-	same := s.foldMemberOwners(context.Background(), led)
+	same := s.foldMemberOwners(context.Background(), led, graph.LocalizationNodeScope{})
 	if len(same) != 3 || same[0].node.ID != "repo/mw/persist.ts::PersistOptions" {
 		t.Fatalf("leading owner must be untouched, got %d entries head=%s", len(same), same[0].node.ID)
+	}
+}
+
+func TestFoldMemberOwnersBoundedRelationCapAndKindFilter(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		extra    int
+		wantFold bool
+	}{
+		{name: "exact", extra: exploreOwnerFoldRelationLimit - 1, wantFold: true},
+		{name: "plus one", extra: exploreOwnerFoldRelationLimit, wantFold: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, g := newOwnerFoldFixture(t)
+			members := []string{
+				"repo/mw/persist.ts::PersistOptions.serialize",
+				"repo/mw/persist.ts::PersistOptions.hydrate",
+			}
+			for index := 0; index < test.extra; index++ {
+				ownerID := fmt.Sprintf("repo/mw/persist.ts::OtherOwner%02d", index)
+				g.AddNode(&graph.Node{ID: ownerID, Kind: graph.KindType, Name: fmt.Sprintf("OtherOwner%02d", index), FilePath: "repo/mw/persist.ts"})
+				for _, memberID := range members {
+					g.AddEdge(&graph.Edge{From: memberID, To: ownerID, Kind: graph.EdgeMemberOf})
+				}
+			}
+			// Unrequested kinds must be filtered before the per-member cap.
+			for index := 0; index < 32; index++ {
+				for _, memberID := range members {
+					g.AddEdge(&graph.Edge{From: memberID, To: fmt.Sprintf("irrelevant-%02d", index), Kind: graph.EdgeReads, Line: index + 1})
+				}
+			}
+			targets := []exploreTarget{
+				{node: g.GetNode(members[0]), score: 1},
+				{node: g.GetNode(members[1]), score: .9},
+			}
+			folded := s.foldMemberOwners(context.Background(), targets, graph.LocalizationNodeScope{})
+			gotFold := len(folded) == len(targets)+1 && folded[0].node != nil && folded[0].foldedOwner
+			if gotFold != test.wantFold {
+				t.Fatalf("folded=%v at %d relevant owner rows, want %v: %#v", gotFold, test.extra+1, test.wantFold, folded)
+			}
+		})
+	}
+}
+
+func TestFoldMemberOwnersScopesHydratedOwners(t *testing.T) {
+	const (
+		workspace = "workspace"
+		project   = "project"
+		repo      = "repo"
+	)
+	scope := graph.LocalizationNodeScope{
+		WorkspaceID: workspace, ProjectID: project,
+		RepoAllow: map[string]bool{repo: true}, ExcludeTests: true,
+	}
+	g := graph.New()
+	memberA := &graph.Node{ID: "repo/owner.go::Owner.a", Kind: graph.KindMethod, Name: "a", FilePath: "repo/owner.go", WorkspaceID: workspace, ProjectID: project, RepoPrefix: repo}
+	memberB := &graph.Node{ID: "repo/owner.go::Owner.b", Kind: graph.KindMethod, Name: "b", FilePath: "repo/owner.go", WorkspaceID: workspace, ProjectID: project, RepoPrefix: repo}
+	allowedOwner := &graph.Node{ID: "repo/owner.go::ZOwner", Kind: graph.KindType, Name: "ZOwner", FilePath: "repo/owner.go", WorkspaceID: workspace, ProjectID: project, RepoPrefix: repo}
+	blockedOwners := []*graph.Node{
+		{ID: "repo/owner.go::AWorkspace", Kind: graph.KindType, Name: "AWorkspace", FilePath: "repo/owner.go", WorkspaceID: "other", ProjectID: project, RepoPrefix: repo},
+		{ID: "repo/owner.go::BProject", Kind: graph.KindType, Name: "BProject", FilePath: "repo/owner.go", WorkspaceID: workspace, ProjectID: "other", RepoPrefix: repo},
+		{ID: "repo/owner.go::CRepo", Kind: graph.KindType, Name: "CRepo", FilePath: "repo/owner.go", WorkspaceID: workspace, ProjectID: project, RepoPrefix: "other"},
+		{ID: "repo/owner.go::DTest", Kind: graph.KindType, Name: "DTest", FilePath: "repo/owner.go", WorkspaceID: workspace, ProjectID: project, RepoPrefix: repo, Meta: map[string]any{"is_test": true}},
+	}
+	g.AddBatch([]*graph.Node{memberA, memberB, allowedOwner}, nil)
+	for _, owner := range append(blockedOwners, allowedOwner) {
+		if owner != allowedOwner {
+			g.AddNode(owner)
+		}
+		g.AddEdge(&graph.Edge{From: memberA.ID, To: owner.ID, Kind: graph.EdgeMemberOf})
+		g.AddEdge(&graph.Edge{From: memberB.ID, To: owner.ID, Kind: graph.EdgeMemberOf})
+	}
+	server := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil)
+	targets := []exploreTarget{{node: memberA, score: 1}, {node: memberB, score: .9}}
+	folded := server.foldMemberOwners(context.Background(), targets, scope)
+	if len(folded) != 3 || folded[0].node.ID != allowedOwner.ID {
+		t.Fatalf("scope-filtered owner fold = %#v", folded)
+	}
+	disjoint := scope
+	disjoint.WorkspaceID = "other-workspace"
+	unfolded := server.foldMemberOwners(context.Background(), targets, disjoint)
+	if len(unfolded) != len(targets) || unfolded[0].node.ID != memberA.ID {
+		t.Fatalf("out-of-scope owners changed fold: %#v", unfolded)
 	}
 }
 
@@ -72,7 +156,7 @@ func TestLimitExploreFoldedTargetsPreservesReservationsAndCap(t *testing.T) {
 		{node: g.GetNode("repo/mw/other.ts::unrelated"), score: 0.9},
 		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.hydrate"), score: 0.8, sourceLiteral: true},
 	}
-	folded := s.foldMemberOwners(context.Background(), targets)
+	folded := s.foldMemberOwners(context.Background(), targets, graph.LocalizationNodeScope{})
 	bounded := limitExploreFoldedTargets("", folded, len(targets), map[string]struct{}{
 		targets[0].node.ID: {},
 		targets[2].node.ID: {},
@@ -102,7 +186,7 @@ func TestLimitExploreFoldedTargetsDropsSyntheticOwnerWhenEveryDirectTargetIsRese
 	for _, target := range targets {
 		reserved[target.node.ID] = struct{}{}
 	}
-	folded := s.foldMemberOwners(context.Background(), targets)
+	folded := s.foldMemberOwners(context.Background(), targets, graph.LocalizationNodeScope{})
 	if len(folded) != len(targets)+1 || !folded[0].foldedOwner {
 		t.Fatalf("fixture did not insert a tagged synthetic owner: %#v", folded)
 	}
@@ -129,7 +213,7 @@ func TestLimitExploreFoldedTargetsNeverEvictsDirectWindowForSyntheticOwner(t *te
 		{node: g.GetNode("repo/mw/other.ts::unrelated"), score: 0.9},
 		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.hydrate"), score: 0.8},
 	}
-	folded := s.foldMemberOwners(context.Background(), direct)
+	folded := s.foldMemberOwners(context.Background(), direct, graph.LocalizationNodeScope{})
 	if len(folded) != len(direct)+1 || !folded[0].foldedOwner {
 		t.Fatalf("fixture did not insert a tagged synthetic owner: %#v", folded)
 	}
@@ -161,7 +245,7 @@ func TestLimitExploreFoldedTargetsRetainsDraftSelectedTypeOwnerAtCap(t *testing.
 		{node: g.GetNode("repo/mw/other.ts::unrelated"), score: 0.9},
 		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.hydrate"), score: 0.8},
 	}
-	folded := s.foldMemberOwners(context.Background(), direct)
+	folded := s.foldMemberOwners(context.Background(), direct, graph.LocalizationNodeScope{})
 	bounded := limitExploreFoldedTargets(
 		"Find the persist middleware options type that owns serialize and hydrate behavior.",
 		folded,
@@ -246,7 +330,7 @@ func TestLimitExploreFoldedTargetsGenericTypeWordsDoNotRetainUnrelatedOwner(t *t
 		{node: g.GetNode("repo/mw/other.ts::unrelated"), score: 0.9},
 		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.hydrate"), score: 0.8},
 	}
-	folded := s.foldMemberOwners(context.Background(), direct)
+	folded := s.foldMemberOwners(context.Background(), direct, graph.LocalizationNodeScope{})
 	bounded := limitExploreFoldedTargets(
 		"Find the type config options that own this behavior.",
 		folded,

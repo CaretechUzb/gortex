@@ -3058,13 +3058,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// concrete implementors before terminality is judged, so the envelope
 	// carries the code that changes and answer_ready can see it.
 	if exploreImplementationIntent(task) {
-		symbolTargets = s.expandImplementationTargets(ctx, symbolTargets)
+		symbolTargets = s.expandImplementationTargets(ctx, symbolTargets, declarationScope)
 		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
 	} else if queryClass == rerank.QueryClassConcept {
 		// Concept answers prefer the owning type when several of its members
 		// rank together; implementation-intent queries are exempt because
 		// they ask for exactly those members.
-		symbolTargets = preserveExploreDivergentDefaultOrder(s.foldMemberOwners(ctx, symbolTargets))
+		symbolTargets = preserveExploreDivergentDefaultOrder(s.foldMemberOwners(ctx, symbolTargets, declarationScope))
 		// Owner folding is weaker than a unique source-literal callsite whose
 		// callee was resolved and hydrated. Re-promote that proof after folding
 		// so terminality is judged against the same strongest evidence that the
@@ -3080,7 +3080,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	answerReady := exploreAnswerReady(task, symbolTargets) || artifactLane.ready
 	if answerReady && !artifactLane.ready {
 		eng := s.engineFor(ctx)
-		if eng != nil && exploreImplementationAnswerBlocked(task, symbolTargets, eng.GetOutEdges, eng.GetSymbol) {
+		if eng != nil && exploreImplementationAnswerBlocked(ctx, task, symbolTargets, eng.Reader(), declarationScope) {
 			// Only abstract declarations in evidence for an implementation
 			// question: stay nonterminal so the permitted refinement read
 			// can reach the concrete side.
