@@ -683,7 +683,7 @@ func exploreCausalChangeAdmissionProtected(task string, targets []exploreTarget,
 	}
 	return target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
 		target.divergentDefaultOwner || target.divergentDefaultType ||
-		target.conceptImplementation || target.conceptComplement ||
+		target.conceptImplementation || target.conceptComplement || target.sourceRange ||
 		target.exactContent || target.exactContentAmbiguous ||
 		target.sourceLiteral || target.typedAnchorProjection ||
 		exploreLocalizationExplicitAnchor(task, target.node)

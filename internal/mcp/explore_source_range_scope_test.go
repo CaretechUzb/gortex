@@ -102,7 +102,10 @@ func TestPromoteExploreSourceRangeCandidatesUsesSingleScopedRepoPrefix(t *testin
 	}
 	g := graph.New()
 	g.AddBatch([]*graph.Node{owner, flush}, nil)
-	s := &Server{graph: g}
+	// The request engine can be bound to a different reader than Server.graph.
+	// Source-range recovery must follow the same reader as the ranked request.
+	s := &Server{graph: graph.New(), engine: query.NewEngine(g)}
+	reader := s.engineFor(context.Background()).Reader()
 	ordinary := []*rerank.Candidate{{Node: &graph.Node{
 		ID:   "monolog-1800/src/Utils.php::pcreLastErrorMessage",
 		Name: "pcreLastErrorMessage", Kind: graph.KindMethod,
@@ -114,6 +117,7 @@ func TestPromoteExploreSourceRangeCandidatesUsesSingleScopedRepoPrefix(t *testin
 		context.Background(),
 		"Investigate monolog/src/Monolog/Handler/FingersCrossedHandler.php Lines 185–187.",
 		ordinary,
+		reader,
 		scope,
 	)
 	require.Len(t, got, 2)
@@ -125,6 +129,7 @@ func TestPromoteExploreSourceRangeCandidatesUsesSingleScopedRepoPrefix(t *testin
 		context.Background(),
 		"Investigate monolog/src/Monolog/Handler/FingersCrossedHandler.php Lines 185–187.",
 		ordinary,
+		reader,
 		query.QueryOptions{RepoAllow: map[string]bool{
 			"monolog-1800": true,
 			"monolog-1900": true,
@@ -137,6 +142,7 @@ func TestPromoteExploreSourceRangeCandidatesUsesSingleScopedRepoPrefix(t *testin
 		context.Background(),
 		"Investigate monolog/src/Monolog/Handler/FingersCrossedHandler.php Lines 185–187.",
 		ordinary,
+		reader,
 		query.QueryOptions{RepoAllow: map[string]bool{"monolog-1900": true}},
 	)
 	require.Len(t, outOfScope, 1)
@@ -148,8 +154,19 @@ func TestPromoteExploreSourceRangeCandidatesUsesSingleScopedRepoPrefix(t *testin
 		canceledCtx,
 		"Investigate monolog/src/Monolog/Handler/FingersCrossedHandler.php Lines 185–187.",
 		ordinary,
+		reader,
 		scope,
 	)
 	require.Len(t, canceled, 1)
 	require.Same(t, ordinary[0], canceled[0])
+
+	noReader := s.promoteExploreSourceRangeCandidates(
+		context.Background(),
+		"Investigate monolog/src/Monolog/Handler/FingersCrossedHandler.php Lines 185–187.",
+		ordinary,
+		nil,
+		scope,
+	)
+	require.Len(t, noReader, 1)
+	require.Same(t, ordinary[0], noReader[0])
 }

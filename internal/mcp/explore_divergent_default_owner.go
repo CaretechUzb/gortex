@@ -160,10 +160,14 @@ func placeExploreDivergentDefaultOwner(task string, targets []exploreTarget, mat
 		maxSymbols = len(targets)
 	}
 	missing := 0
-	if exploreTargetIndex(targets, match.constructor.ID) < 0 && exploreTargetIndex(targets, match.baseCtor.ID) < 0 {
+	constructorIndex := exploreTargetIndex(targets, match.constructor.ID)
+	baseConstructorIndex := exploreTargetIndex(targets, match.baseCtor.ID)
+	if constructorIndex < 0 && (baseConstructorIndex < 0 || targets[baseConstructorIndex].sourceRange) {
 		missing++
 	}
-	if exploreTargetIndex(targets, match.owner.ID) < 0 && exploreTargetIndex(targets, match.baseOwner.ID) < 0 {
+	ownerIndex := exploreTargetIndex(targets, match.owner.ID)
+	baseOwnerIndex := exploreTargetIndex(targets, match.baseOwner.ID)
+	if ownerIndex < 0 && (baseOwnerIndex < 0 || targets[baseOwnerIndex].sourceRange) {
 		missing++
 	}
 	overflow := len(targets) + missing - maxSymbols
@@ -193,8 +197,10 @@ func placeExploreDivergentDefaultOwner(task string, targets []exploreTarget, mat
 			return
 		}
 		if index := exploreTargetIndex(replaced, baseID); index >= 0 {
-			replaced[index] = candidate
-			return
+			if !replaced[index].sourceRange {
+				replaced[index] = candidate
+				return
+			}
 		}
 		replaced = append(replaced, candidate)
 	}
@@ -213,7 +219,7 @@ func exploreDivergentDefaultAdmissionProtected(task string, target exploreTarget
 		return true
 	}
 	return target.divergentDefaultOwner || target.divergentDefaultType || target.conceptImplementation ||
-		target.exactContent || target.exactContentAmbiguous || target.sourceLiteral ||
+		target.sourceRange || target.exactContent || target.exactContentAmbiguous || target.sourceLiteral ||
 		exploreLocalizationExplicitAnchor(task, target.node)
 }
 

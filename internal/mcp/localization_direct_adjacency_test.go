@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
 type localizationDirectAdjacencyReader struct {
@@ -573,6 +574,86 @@ func TestTaskCitedAdjacencyPrimarySurvivesDigestPressureAndMerge(t *testing.T) {
 	if got := localizationFinalResponsePrimaryIDs(task, nil, merged.Evidence); !reflect.DeepEqual(got, wantPrimary) {
 		t.Fatalf("merged primary IDs = %v, want %v", got, wantPrimary)
 	}
+}
+
+func TestSourceRangeEvidenceSurvivesFreezeAndDirectAdjacency(t *testing.T) {
+	task := "Investigate head() using src/Handler.php lines 185-187"
+	head := exploreTarget{node: &graph.Node{
+		ID: "head", Name: "head", Kind: graph.KindFunction,
+		FilePath: "src/Entry.php", StartLine: 10,
+	}}
+	rangeCandidate := &rerank.Candidate{
+		Node: &graph.Node{
+			ID: "flush", Name: "flushBuffer", Kind: graph.KindMethod,
+			FilePath: "src/Handler.php", StartLine: 181, EndLine: 195,
+		},
+		Signals: map[string]float64{exploreSourceRangeSignal: 1},
+	}
+	rangeTarget := exploreTargetFromCandidate(rangeCandidate, "", false)
+	if !rangeTarget.sourceRange {
+		t.Fatal("source-range candidate signal was not projected onto the target")
+	}
+	targets := []exploreTarget{head}
+	for index := 0; index < localizationReplayEvidenceLimit-2; index++ {
+		targets = append(targets, exploreTarget{node: &graph.Node{
+			ID: fmt.Sprintf("weak-%d", index), Name: "ordinaryCandidate",
+			Kind: graph.KindFunction, FilePath: "src/Weak.php", StartLine: index + 20,
+		}})
+	}
+	targets = append(targets, rangeTarget)
+	draft := make([]exploreDraftEntry, 0, len(targets))
+	for _, target := range targets {
+		draft = append(draft, exploreDraftEntry{node: target.node})
+	}
+	selected := localizationEvidenceTargetsFromDraft(task, "", targets, draft)
+	if len(selected) != len(targets) {
+		t.Fatalf("selected rows = %d, want %d", len(selected), len(targets))
+	}
+	if selected[0].node.ID != head.node.ID || selected[1].node.ID != rangeTarget.node.ID {
+		t.Fatalf("selected head = [%s, %s], want explicit head then source range", selected[0].node.ID, selected[1].node.ID)
+	}
+
+	evidence := make([]localizationEvidence, 0, len(selected))
+	for index, target := range selected {
+		evidence = append(evidence, localizationEvidence{
+			Rank: index + 1, ID: target.node.ID, Name: target.node.Name,
+			Kind: string(target.node.Kind), File: target.node.FilePath,
+			Line: target.node.StartLine, EndLine: target.node.EndLine,
+		})
+	}
+	relationIDs := make([]string, 0, localizationDirectAdjacencyCap)
+	reader := &localizationDirectAdjacencyReader{nodes: make(map[string]*graph.Node)}
+	for index := 0; index < localizationDirectAdjacencyCap; index++ {
+		id := fmt.Sprintf("adjacent-%d", index)
+		relationIDs = append(relationIDs, id)
+		reader.nodes[id] = nodeForDirectAdjacency(id, "adjacent", "src/Adjacent.php", 100+index)
+	}
+	evidence[0].Callees = relationIDs
+	envelope := localizationExploreEnvelope{Evidence: evidence}
+	digest := newLocalizationEvidenceDigestForTask(task, envelope)
+	freezeLocalizationPrimaryCohort(task, &envelope, digest)
+
+	promoted, promotedDigest := promoteLocalizationDirectAdjacency(
+		task, envelope, reader, localizationReplayEvidenceLimit, 1<<20, digest,
+	)
+	if len(promoted.Evidence) != localizationReplayEvidenceLimit {
+		t.Fatalf("evidence rows = %d, want %d", len(promoted.Evidence), localizationReplayEvidenceLimit)
+	}
+	if got := localizationFinalResponsePrimaryIDs(task, nil, promotedDigest.Evidence); !containsString(got, rangeTarget.node.ID) {
+		t.Fatalf("primary IDs = %v, missing source-range owner %q", got, rangeTarget.node.ID)
+	}
+	if !containsLocalizationEvidenceID(promoted.Evidence, rangeTarget.node.ID) {
+		t.Fatalf("promoted evidence lost source-range owner %q", rangeTarget.node.ID)
+	}
+}
+
+func containsLocalizationEvidenceID(rows []localizationEvidence, id string) bool {
+	for _, row := range rows {
+		if row.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func nodeForDirectAdjacency(id, name, file string, line int) *graph.Node {

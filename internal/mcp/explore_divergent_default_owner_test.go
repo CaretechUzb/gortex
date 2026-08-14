@@ -254,6 +254,82 @@ func TestDivergentDefaultOwnerAdmissionAtCapacityEvictsOnlyUnprotectedTail(t *te
 	require.True(t, unchanged[2].conceptImplementation)
 }
 
+func TestDivergentDefaultOwnerPreservesSourceRangeBaseSeats(t *testing.T) {
+	task := `StreamHandler::write reports "could not be opened: Permission denied" after a rotating handler applies chmod`
+	fixture := monologDivergentDefaultFixture()
+	tail := divergentDefaultTestNode("src/Noise.php::Noise.tail", graph.KindMethod, "tail", "src/Noise.php", "function tail()")
+	match := exploreDivergentDefaultOwner{
+		constructor: fixture.childCtor,
+		owner:       fixture.childType,
+		baseCtor:    fixture.baseCtor,
+		baseOwner:   fixture.baseType,
+		consumerID:  fixture.write.ID,
+	}
+	constructor := exploreTarget{node: fixture.childCtor, divergentDefaultOwner: true}
+	owner := exploreTarget{node: fixture.childType, divergentDefaultType: true}
+
+	for _, test := range []struct {
+		name     string
+		baseCtor bool
+	}{
+		{name: "constructor", baseCtor: true},
+		{name: "owner"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			targets := []exploreTarget{{node: fixture.write}, {node: fixture.baseType}, {node: fixture.baseCtor}, {node: tail}}
+			protectedID := fixture.baseType.ID
+			if test.baseCtor {
+				targets[2].sourceRange = true
+				protectedID = fixture.baseCtor.ID
+			} else {
+				targets[1].sourceRange = true
+			}
+
+			got, ok := placeExploreDivergentDefaultOwner(task, targets, match, constructor, owner, len(targets))
+			require.True(t, ok)
+			require.Len(t, got, len(targets))
+			protectedIndex := exploreTargetIndex(got, protectedID)
+			require.NotEqual(t, -1, protectedIndex, "exact source-range owner was replaced")
+			require.True(t, got[protectedIndex].sourceRange)
+			require.NotEqual(t, -1, exploreTargetIndex(got, fixture.childCtor.ID))
+			require.NotEqual(t, -1, exploreTargetIndex(got, fixture.childType.ID))
+			require.Equal(t, -1, exploreTargetIndex(got, tail.ID), "ordinary tail should fund the proven child pair")
+		})
+	}
+}
+
+func TestDivergentDefaultOwnerRejectsPromotionWhenSourceRangeBaseAndTailAreProtected(t *testing.T) {
+	task := `StreamHandler::write reports "could not be opened: Permission denied" after a rotating handler applies chmod`
+	fixture := monologDivergentDefaultFixture()
+	tail := divergentDefaultTestNode("src/Noise.php::Noise.tail", graph.KindMethod, "tail", "src/Noise.php", "function tail()")
+	targets := []exploreTarget{
+		{node: fixture.write},
+		{node: fixture.baseType},
+		{node: fixture.baseCtor, sourceRange: true},
+		{node: tail, sourceLiteral: true},
+	}
+	match := exploreDivergentDefaultOwner{
+		constructor: fixture.childCtor,
+		owner:       fixture.childType,
+		baseCtor:    fixture.baseCtor,
+		baseOwner:   fixture.baseType,
+		consumerID:  fixture.write.ID,
+	}
+
+	got, ok := placeExploreDivergentDefaultOwner(
+		task,
+		targets,
+		match,
+		exploreTarget{node: fixture.childCtor, divergentDefaultOwner: true},
+		exploreTarget{node: fixture.childType, divergentDefaultType: true},
+		len(targets),
+	)
+	require.False(t, ok)
+	require.Nil(t, got)
+	require.True(t, targets[2].sourceRange, "failed promotion mutated the cited base")
+	require.True(t, targets[3].sourceLiteral, "failed promotion mutated the protected tail")
+}
+
 func TestDivergentDefaultOwnerCallableFallbackFailsClosed(t *testing.T) {
 	task := `StreamHandler::write reports "could not be opened: Permission denied" after a rotating handler applies chmod; find the divergent filePermission default and owning type`
 	t.Run("no output capacity", func(t *testing.T) {

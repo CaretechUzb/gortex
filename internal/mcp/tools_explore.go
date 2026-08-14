@@ -109,6 +109,7 @@ type exploreTarget struct {
 	conceptImplementation  bool   // primary identifier-backed callable; may establish answer readiness
 	conceptComplement      bool   // marginal concept callable protected as evidence, never as terminal proof
 	syntacticAnchor        bool   // task-spelled flag/identifier owner protected by bounded lexical competition
+	sourceRange            bool   // exact task path+line owner reserved for presentation, never completion authority
 	exactContent           bool   // verified full quoted-literal hit from content_fts
 	exactContentAmbiguous  bool   // exact evidence has visible or possibly truncated peers
 	sourceLiteral          bool   // exact source-body hit that must survive final envelope packing
@@ -120,6 +121,41 @@ type exploreTarget struct {
 	foldedOwner            bool   // synthetic owner inserted by concept member folding
 	leadingFileDepth       bool   // sibling of the ranked leading file, admitted into the expendable breadth tail
 	localizationRelation   string // direct_caller/direct_callee row promoted only into the bounded terminal projection
+}
+
+func exploreTargetFromCandidate(
+	candidate *rerank.Candidate,
+	protectedImplementationID string,
+	literalPrimaryEligible bool,
+) exploreTarget {
+	if candidate == nil || candidate.Node == nil {
+		return exploreTarget{}
+	}
+	target := exploreTarget{
+		node: candidate.Node, score: candidate.Score,
+		conceptImplementation: candidate.Node.ID == protectedImplementationID,
+	}
+	if candidate.Signals == nil {
+		return target
+	}
+	target.conceptComplement = candidate.Signals[exploreConceptComplementSignal] > 0
+	target.syntacticAnchor = candidate.Signals[exploreSyntacticAnchorSignal] > 0
+	target.sourceRange = candidate.Signals[exploreSourceRangeSignal] > 0
+	target.exactContent = candidate.Signals[exploreContentRecallExactSignal] > 0
+	target.exactContentAmbiguous = candidate.Signals[exploreContentRecallAmbiguousSignal] > 0
+	target.sourceLiteral = candidate.Signals[exploreSourceLiteralSignal] > 0
+	target.sourceLiteralCallee = candidate.Signals[exploreSourceLiteralCalleeSignal] > 0
+	target.sourceLiteralAligned = candidate.Signals[exploreSourceLiteralTaskAlignSignal] > 0
+	target.typedAnchorProjection = candidate.Signals[exploreTypedAnchorProjectionSignal] > 0
+	if literalPrimaryEligible && (target.sourceLiteral || target.exactContent) {
+		target.literalPrimaryEligible = true
+		matches := candidate.Signals[exploreContentRecallTermSignal]
+		if coverage := candidate.Signals[exploreSourceLiteralCoverageSignal]; coverage > matches {
+			matches = coverage
+		}
+		target.literalMatchCount = int(matches)
+	}
+	return target
 }
 
 type exploreCausalNeighbor struct {
@@ -2800,7 +2836,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// Exact source citations in issue bodies are stronger than semantic ranking:
 	// map each bounded file/line range to its smallest enclosing declaration and
 	// place those task-spelled candidates at the head before final selection.
-	ranked = s.promoteExploreSourceRangeCandidates(ctx, task, ranked, opts)
+	ranked = s.promoteExploreSourceRangeCandidates(ctx, task, ranked, eng.Reader(), opts)
 	// Resilience ladder: a warm-restarted daemon can transiently return an
 	// empty scoped ranked result (workspace stamps not yet backfilled, or
 	// search bundles served before their node payloads re-materialise)
@@ -2933,28 +2969,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			continue
 		}
 		n := c.Node
-		t := exploreTarget{
-			node: n, score: c.Score,
-			conceptImplementation: n.ID == protectedImplementationID,
-		}
-		if c.Signals != nil {
-			t.conceptComplement = c.Signals[exploreConceptComplementSignal] > 0
-			t.syntacticAnchor = c.Signals[exploreSyntacticAnchorSignal] > 0
-			t.exactContent = c.Signals[exploreContentRecallExactSignal] > 0
-			t.exactContentAmbiguous = c.Signals[exploreContentRecallAmbiguousSignal] > 0
-			t.sourceLiteral = c.Signals[exploreSourceLiteralSignal] > 0
-			t.sourceLiteralCallee = c.Signals[exploreSourceLiteralCalleeSignal] > 0
-			t.sourceLiteralAligned = c.Signals[exploreSourceLiteralTaskAlignSignal] > 0
-			t.typedAnchorProjection = c.Signals[exploreTypedAnchorProjectionSignal] > 0
-			if literalPrimaryEligible && (t.sourceLiteral || t.exactContent) {
-				t.literalPrimaryEligible = true
-				matches := c.Signals[exploreContentRecallTermSignal]
-				if coverage := c.Signals[exploreSourceLiteralCoverageSignal]; coverage > matches {
-					matches = coverage
-				}
-				t.literalMatchCount = int(matches)
-			}
-		}
+		t := exploreTargetFromCandidate(c, protectedImplementationID, literalPrimaryEligible)
 		t.source = s.manifestSymbolSource(ctx, n)
 		if callers := eng.GetCallers(n.ID, ringOpts); callers != nil {
 			t.callers = ringNeighbors(callers.Nodes, n.ID, exploreRingCap)
@@ -3624,6 +3639,14 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 			}
 		}
 	}
+	// An exact task path+line citation authenticates the enclosing declaration
+	// as presentation evidence. Reserve every already-bounded range owner before
+	// generic draft rows, while leaving completion authority unchanged.
+	for _, target := range targets {
+		if target.sourceRange {
+			appendTarget(target)
+		}
+	}
 	// A graph-proven causal constructor and its owning type outrank the
 	// downstream retrieval seed. Their explicit admission metadata survives
 	// draft ranking, owner folding, and byte-budget packing, so this ordering is
@@ -3844,7 +3867,7 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 		if index < localizationDirectEvidenceReserve || target.node.ID == requiredID ||
 			target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
 			target.divergentDefaultOwner || target.divergentDefaultType || target.conceptImplementation || target.conceptComplement ||
-			target.exactContent || target.sourceLiteral || target.typedAnchorProjection ||
+			target.sourceRange || target.exactContent || target.sourceLiteral || target.typedAnchorProjection ||
 			// Depth rows already paid for the tail they occupy; a relationship
 			// row must not reclaim the same slot a second time.
 			target.leadingFileDepth {
@@ -3852,7 +3875,7 @@ func interleaveLocalizationDirectRelationsWithRoutes(
 		}
 		if target.node.ID == requiredID || target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
 			target.divergentDefaultOwner || target.divergentDefaultType ||
-			target.conceptImplementation || target.conceptComplement ||
+			target.conceptImplementation || target.conceptComplement || target.sourceRange ||
 			target.exactContent || target.sourceLiteral || target.typedAnchorProjection {
 			orderedPrefix = index + 1
 		}

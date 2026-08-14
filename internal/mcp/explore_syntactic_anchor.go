@@ -247,8 +247,8 @@ const (
 )
 
 var (
-	exploreSourceRangeLineRE   = regexp.MustCompile(`(?i)\blines?\s+([0-9]{1,8})(?:\s+(?:to|-)\s+([0-9]{1,8}))?`)
-	exploreSourceRangeInlineRE = regexp.MustCompile(`^\s*:([0-9]{1,8})(?:-([0-9]{1,8}))?`)
+	exploreSourceRangeLineRE   = regexp.MustCompile(`(?i)\blines?\s+([0-9]{1,8})(?:(?:\s+to\s+|\s*[-–—]\s*)([0-9]{1,8}))?`)
+	exploreSourceRangeInlineRE = regexp.MustCompile(`^\s*:([0-9]{1,8})(?:[-–—]([0-9]{1,8}))?`)
 )
 
 // exploreSourceRangeSpecs pairs an explicit source path with the line citation
@@ -520,10 +520,11 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 	ctx context.Context,
 	task string,
 	ordinary []*rerank.Candidate,
+	reader graph.Reader,
 	scope query.QueryOptions,
 ) []*rerank.Candidate {
 	specs := exploreSourceRangeSpecs(task)
-	if s == nil || s.graph == nil || len(specs) == 0 || ctx.Err() != nil {
+	if s == nil || reader == nil || len(specs) == 0 || ctx.Err() != nil {
 		return ordinary
 	}
 	type resolvedRange struct {
@@ -560,7 +561,7 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 	if len(resolved) == 0 {
 		return ordinary
 	}
-	indexes := s.buildFileSymbolIndexForOrderedPathsScopedContext(ctx, orderedPaths, scope)
+	indexes := s.buildFileSymbolIndexForOrderedPathsScopedReaderContext(ctx, reader, orderedPaths, scope)
 	if ctx.Err() != nil {
 		return ordinary
 	}
