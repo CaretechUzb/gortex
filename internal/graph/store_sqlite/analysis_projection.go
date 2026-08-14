@@ -51,7 +51,7 @@ func (s *Store) EdgesLightSeq(kinds ...graph.EdgeKind) iter.Seq[*graph.Edge] {
 		}
 		defer rows.Close()
 		for rows.Next() {
-			edge, scanErr := scanEdgeLight(rows)
+			edge, scanErr := s.scanEdgeLight(rows)
 			if scanErr != nil {
 				panicOnFatal(scanErr)
 				return

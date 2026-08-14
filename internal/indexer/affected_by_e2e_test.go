@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
@@ -33,8 +34,7 @@ func newSQLiteIndexer(t *testing.T) (*Indexer, *store_sqlite.Store) {
 // TestAffectedBy_SignatureChange_ReresolvesCaller is the headline case
 // on the in-memory backend (whose reverse lookup is the pre-evict
 // in-edge snapshot): b.go calls F defined in a.go; changing F's
-// SIGNATURE re-resolves b.go — its call edge lands on the fresh F node
-// and exactly one bounded affected-by pass ran over exactly one file.
+// SIGNATURE re-resolves b.go — its call edge lands on the fresh F node.
 func TestAffectedBy_SignatureChange_ReresolvesCaller(t *testing.T) {
 	dir := t.TempDir()
 	aPath := filepath.Join(dir, "a.go")
@@ -59,11 +59,6 @@ func TestAffectedBy_SignatureChange_ReresolvesCaller(t *testing.T) {
 	newFID := fnNodeID(t, g, "a.go", "F")
 	assert.Equal(t, newFID, callTargetFrom(t, g, callerID),
 		"after F's signature changed, Caller's edge must be re-resolved to the fresh F")
-
-	passes, files, dropped := idx.AffectedByCounts()
-	assert.Equal(t, int64(1), passes, "a signature change must trigger exactly one affected-by pass")
-	assert.Equal(t, int64(1), files, "the pass must re-resolve exactly the one referencing file")
-	assert.Equal(t, int64(0), dropped)
 }
 
 // TestAffectedBy_BodyOnlyEdit_NoFanout proves the gate: an edit that
@@ -83,14 +78,21 @@ func TestAffectedBy_BodyOnlyEdit_NoFanout(t *testing.T) {
 	require.NoError(t, err)
 	callerID := fnNodeID(t, g, "b.go", "Caller")
 
+	snap := idx.snapshotAffectedBy("a.go")
+	require.NotNil(t, snap)
 	bumpMtime(t, aPath, "package p\n\nfunc F(x int) int { return x + 1 }\n")
 	res, err := idx.IncrementalReindexPaths(dir, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, res.StaleFileCount)
 
-	passes, files, _ := idx.AffectedByCounts()
-	assert.Equal(t, int64(0), passes, "a body-only edit must not trigger an affected-by pass")
-	assert.Equal(t, int64(0), files)
+	var fresh []*graph.Node
+	for _, node := range g.AllNodes() {
+		if node != nil && node.FilePath == "a.go" {
+			fresh = append(fresh, node)
+		}
+	}
+	assert.Empty(t, affectedByDelta(g, snap, fresh),
+		"a body-only edit must not produce an affected-by frontier")
 
 	// The caller's edge still survives the definition re-index via the
 	// existing restub + reverse-resolve pair.
@@ -116,10 +118,8 @@ func TestAffectedBy_PerSaveIndexFile_ReresolvesCaller(t *testing.T) {
 	writeFile(t, aPath, "package p\n\nfunc F(n int) int { return n }\n")
 	require.NoError(t, idx.IndexFile(aPath))
 
-	assert.Equal(t, fnNodeID(t, g, "a.go", "F"), callTargetFrom(t, g, callerID))
-	passes, files, _ := idx.AffectedByCounts()
-	assert.Equal(t, int64(1), passes, "the per-save IndexFile route must run the pass")
-	assert.Equal(t, int64(1), files)
+	assert.Equal(t, fnNodeID(t, g, "a.go", "F"), callTargetFrom(t, g, callerID),
+		"the per-save IndexFile route must re-resolve the caller")
 }
 
 // TestAffectedBy_RemovedSymbol_SQLite removes a called symbol from its
@@ -164,8 +164,6 @@ func TestAffectedBy_RemovedSymbol_SQLite(t *testing.T) {
 		assert.NotEqual(t, fID, f.ToID,
 			"the stale fact pointing at the removed symbol must be re-persisted away")
 	}
-	passes, _, _ := idx.AffectedByCounts()
-	assert.Equal(t, int64(1), passes)
 }
 
 // TestAffectedBy_SidecarDiscovery_SQLite proves the persisted reverse
@@ -199,17 +197,13 @@ func TestAffectedBy_SidecarDiscovery_SQLite(t *testing.T) {
 	_, err = idx.IncrementalReindexPaths(dir, []string{aPath})
 	require.NoError(t, err)
 
-	passes, files, _ := idx.AffectedByCounts()
-	assert.Equal(t, int64(1), passes,
-		"the pass must run even with no live in-edges — discovery comes from the sidecar")
-	assert.Equal(t, int64(1), files)
 	assert.Equal(t, fnNodeID(t, g, "a.go", "F"), callTargetFrom(t, g, callerID),
 		"the sidecar-discovered caller must be re-resolved to the fresh F")
 }
 
 // TestAffectedBy_CapBoundsFanout configures a fan-out cap of 1 with
-// three referencing files: the pass must re-resolve exactly one file
-// and account for the two it dropped — the cap is loud, not silent.
+// three referencing files. The live truncation warning must report the
+// exact bounded set and the two files it dropped.
 func TestAffectedBy_CapBoundsFanout(t *testing.T) {
 	dir := t.TempDir()
 	aPath := filepath.Join(dir, "a.go")
@@ -224,7 +218,8 @@ func TestAffectedBy_CapBoundsFanout(t *testing.T) {
 	cfg := config.Default().Index
 	cfg.Workers = 1
 	cfg.AffectedByReresolveMax = 1
-	idx := New(g, reg, cfg, zap.NewNop())
+	core, observed := observer.New(zap.DebugLevel)
+	idx := New(g, reg, cfg, zap.New(core))
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 
@@ -232,10 +227,12 @@ func TestAffectedBy_CapBoundsFanout(t *testing.T) {
 	_, err = idx.IncrementalReindexPaths(dir, []string{aPath})
 	require.NoError(t, err)
 
-	passes, files, dropped := idx.AffectedByCounts()
-	assert.Equal(t, int64(1), passes)
-	assert.Equal(t, int64(1), files, "the cap must bound the re-resolve set")
-	assert.Equal(t, int64(2), dropped, "the truncated files must be accounted, not silently lost")
+	entries := observed.FilterMessage("affected-by: re-resolve set truncated").All()
+	require.Len(t, entries, 1)
+	fields := entries[0].ContextMap()
+	assert.EqualValues(t, 3, fields["affected"])
+	assert.EqualValues(t, 1, fields["cap"])
+	assert.EqualValues(t, 2, fields["dropped"])
 }
 
 // TestAffectedBy_DeferredBatchPath_NoFanout proves the batch guard: a
@@ -246,10 +243,17 @@ func TestAffectedBy_DeferredBatchPath_NoFanout(t *testing.T) {
 	dir := t.TempDir()
 	aPath := filepath.Join(dir, "a.go")
 	writeFile(t, aPath, "package p\n\nfunc F(x int) int { return x }\n")
-	writeFile(t, filepath.Join(dir, "b.go"), "package p\n\nfunc Caller() int { return F(1) }\n")
+	writeFile(t, filepath.Join(dir, "b.go"), "package p\n\nfunc CallerB() int { return F(1) }\n")
+	writeFile(t, filepath.Join(dir, "c.go"), "package p\n\nfunc CallerC() int { return F(2) }\n")
 
 	g := graph.New()
-	idx := newTestIndexer(g)
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	cfg := config.Default().Index
+	cfg.Workers = 1
+	cfg.AffectedByReresolveMax = 1
+	core, observed := observer.New(zap.DebugLevel)
+	idx := New(g, reg, cfg, zap.New(core))
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 
@@ -257,7 +261,6 @@ func TestAffectedBy_DeferredBatchPath_NoFanout(t *testing.T) {
 	bumpMtime(t, aPath, "package p\n\nfunc F(x int, y int) int { return x + y }\n")
 	require.NoError(t, idx.IndexFile(aPath))
 
-	passes, _, _ := idx.AffectedByCounts()
-	assert.Equal(t, int64(0), passes,
+	assert.Empty(t, observed.FilterMessage("affected-by: re-resolve set truncated").All(),
 		"deferred-batch indexing must not fan out per file — the batch caller resolves once at the end")
 }

@@ -280,7 +280,9 @@ func benchVariant(name string, probeTexts []string, fixture recall.Fixture, cfg 
 	// Pull the hybrid backend's vector side and run semantic-only.
 	inner := idx.Search()
 	if sw, ok := inner.(*search.Swappable); ok {
-		inner = sw.Inner()
+		var release func()
+		inner, release = sw.AcquireBackend()
+		defer release()
 	}
 	hybrid, _ := inner.(*search.HybridBackend)
 	if hybrid == nil || hybrid.VectorIndex() == nil || hybrid.VectorIndex().Count() == 0 {

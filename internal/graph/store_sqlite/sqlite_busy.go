@@ -27,21 +27,6 @@ const (
 	sqliteBusyRetryMaxDelay       = 250 * time.Millisecond
 )
 
-// SQLiteBusyRetryStats is a monotonic process-local view of transaction-level
-// lock contention. Retries counts whole transaction replays; Exhausted counts
-// operations that still failed after the bounded retry window.
-type SQLiteBusyRetryStats struct {
-	Retries   uint64
-	Exhausted uint64
-}
-
-func (s *Store) BusyRetryStats() SQLiteBusyRetryStats {
-	return SQLiteBusyRetryStats{
-		Retries:   s.busyRetries.Load(),
-		Exhausted: s.busyRetryExhausted.Load(),
-	}
-}
-
 // isSQLiteBusyErr matches both primary and extended BUSY/LOCKED result codes.
 // Extended codes keep the primary result in the low byte.
 func isSQLiteBusyErr(err error) bool {
@@ -107,13 +92,11 @@ func (s *Store) withSQLiteBusyRetry(
 
 		remaining := time.Until(retryDeadline)
 		if remaining <= 0 {
-			s.busyRetryExhausted.Add(1)
 			log.Printf("store_sqlite: sqlite busy exhausted operation=%s retries=%d elapsed=%s error=%q", operation, retries, time.Since(started), lastBusy)
 			return fmt.Errorf("%s: %w", operation, errors.Join(errSQLiteBusyRetryExhausted, lastBusy, context.DeadlineExceeded))
 		}
 
 		retries++
-		s.busyRetries.Add(1)
 		wait := minDuration(delay, remaining)
 		timer := time.NewTimer(wait)
 		select {
@@ -122,7 +105,6 @@ func (s *Store) withSQLiteBusyRetry(
 			if !timer.Stop() {
 				<-timer.C
 			}
-			s.busyRetryExhausted.Add(1)
 			log.Printf("store_sqlite: sqlite busy exhausted operation=%s retries=%d elapsed=%s error=%q", operation, retries, time.Since(started), lastBusy)
 			return fmt.Errorf("%s: %w", operation, errors.Join(errSQLiteBusyRetryExhausted, lastBusy, parent.Err()))
 		}

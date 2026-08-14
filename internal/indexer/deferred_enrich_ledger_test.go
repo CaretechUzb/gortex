@@ -278,7 +278,7 @@ func TestSeedPendingEnrichAll_ResumesNonGitRepo(t *testing.T) {
 	assert.True(t, plain.pendingEnrich.Load())
 	assert.False(t, complete.pendingEnrich.Load())
 
-	mi.runDeferredEnrichParallel([]*Indexer{complete, plain})
+	mi.runDeferredEnrichPool([]*Indexer{complete, plain})
 	assert.Equal(t, []string{filepath.Join("plain", "watched.go")}, spy.enrichedFiles(),
 		"only the resumed repo should have its enrichment dispatched")
 	assert.Empty(t, spy.invoked(),

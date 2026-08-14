@@ -135,25 +135,6 @@ func MeshLogo(tick int) string {
 	return strings.Join(lines[:], "\n")
 }
 
-// MeshFrame returns the gortex mark with label (bold) and sub (dim) beside
-// it. Used by watch loops or custom views that want the brand block without
-// owning a live tracker.
-func MeshFrame(tick int, label, sub string) string {
-	mesh := MeshLogo(tick)
-	if label == "" && sub == "" {
-		return mesh + "\n"
-	}
-	right := lipgloss.JoinVertical(
-		lipgloss.Left,
-		"",
-		styleLabel.Render(label),
-		"",
-		styleSub.Render(sub),
-		"",
-	)
-	return lipgloss.JoinHorizontal(lipgloss.Top, mesh, "    ", right) + "\n"
-}
-
 // MeshLogoLines returns the number of vertical rows the mark occupies.
 // Exported so wizard / dashboard layouts can reserve space without re-counting
 // the constant.

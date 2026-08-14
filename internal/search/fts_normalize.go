@@ -49,8 +49,8 @@ var ftsStopWords = map[string]struct{}{
 
 // NormalizeFTSTokens applies the FR63 stopword filter and Porter stemmer
 // to a token list produced by Tokenize / TokenizeQuery. The index path
-// (BM25Backend.Add, BleveBackend.Add) and the query path
-// (BM25Backend.Search, BleveBackend.Search) both call it, so a stemmed
+// (BM25Backend.Add) and the query path (BM25Backend.Search) both
+// call it, so a stemmed
 // posting list is always probed with stemmed query terms.
 //
 // Stopwords are dropped before stemming so a stemmed form can never

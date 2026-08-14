@@ -32,7 +32,7 @@ func (s *slowExtractor) Extract(filePath string, _ []byte) (*parser.ExtractionRe
 
 func TestExtractWithTimeout_NoBudget(t *testing.T) {
 	idx := newTestIndexer(graph.New()) // MaxExtractMillis = 0
-	r, err := idx.extractWithTimeout(&slowExtractor{delay: 5 * time.Millisecond}, "x.slow", []byte("x"))
+	r, err := idx.extractWithTimeoutDone(&slowExtractor{delay: 5 * time.Millisecond}, "x.slow", []byte("x"), nil)
 	require.NoError(t, err)
 	require.NotNil(t, r)
 }
@@ -40,7 +40,7 @@ func TestExtractWithTimeout_NoBudget(t *testing.T) {
 func TestExtractWithTimeout_FastFileUnderBudget(t *testing.T) {
 	idx := newTestIndexer(graph.New())
 	idx.config.MaxExtractMillis = 2000
-	r, err := idx.extractWithTimeout(&slowExtractor{delay: 5 * time.Millisecond}, "x.slow", []byte("x"))
+	r, err := idx.extractWithTimeoutDone(&slowExtractor{delay: 5 * time.Millisecond}, "x.slow", []byte("x"), nil)
 	require.NoError(t, err)
 	require.NotNil(t, r)
 }
@@ -48,7 +48,7 @@ func TestExtractWithTimeout_FastFileUnderBudget(t *testing.T) {
 func TestExtractWithTimeout_SlowFileTimesOut(t *testing.T) {
 	idx := newTestIndexer(graph.New())
 	idx.config.MaxExtractMillis = 50
-	_, err := idx.extractWithTimeout(&slowExtractor{delay: 800 * time.Millisecond}, "x.slow", []byte("x"))
+	_, err := idx.extractWithTimeoutDone(&slowExtractor{delay: 800 * time.Millisecond}, "x.slow", []byte("x"), nil)
 	require.ErrorIs(t, err, errExtractTimeout)
 }
 

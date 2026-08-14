@@ -24,10 +24,11 @@ import (
 )
 
 // TestBackendBench cold-indexes GORTEX_BENCH_ROOT through the full indexer
-// pipeline into the backend named by GORTEX_BENCH_BACKEND (memory | sqlite),
-// then runs a fixed query workload. Reports cold-index time, graph size,
-// process RSS, and query throughput so the sqlite backend can be compared
-// head-to-head with the in-memory baseline on real repositories.
+// pipeline into the sink named by GORTEX_BENCH_BACKEND, then runs a fixed
+// query workload. Reports cold-index time, graph size, process RSS, and query
+// throughput. "sqlite" is the shipping store; "memory" is not a backend any
+// more — that arm drains into the indexer's cold-index staging shadow and
+// stands in as the ceiling the sqlite path is measured against.
 //
 //	GORTEX_BENCH_ROOT=/path/to/gortex \
 //	GORTEX_BENCH_BACKEND=sqlite \

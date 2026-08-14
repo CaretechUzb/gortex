@@ -3,55 +3,50 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"sort"
+	"reflect"
 	"testing"
 )
 
-func writeTemporalAllowlist(t *testing.T, repoPath, body string) {
+func writeTemporalAllowlist(t *testing.T, root, content string) {
 	t.Helper()
-	dir := filepath.Join(repoPath, ".gortex")
+	dir := filepath.Join(root, ".gortex")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
+		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "temporal-allowlist.yaml"), []byte(body), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-}
-
-func TestLoadLocalTemporalEnvHelpers_GateOff(t *testing.T) {
-	dir := t.TempDir()
-	writeTemporalAllowlist(t, dir, "env_helpers:\n  - FetchActivityName\n")
-	t.Setenv(LocalTemporalOptInEnv, "") // not opted in
-	if got := LoadLocalTemporalEnvHelpers(dir); got != nil {
-		t.Fatalf("expected nil without opt-in, got %v", got)
+	if err := os.WriteFile(filepath.Join(dir, "temporal-allowlist.yaml"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestLoadLocalTemporalEnvHelpers_GateOnReadsFile(t *testing.T) {
-	dir := t.TempDir()
-	writeTemporalAllowlist(t, dir, "env_helpers:\n  - FetchActivityName\n  - GetActivity\n  - \"\"\n")
-	t.Setenv(LocalTemporalOptInEnv, "1")
-	got := LoadLocalTemporalEnvHelpers(dir)
-	sort.Strings(got)
-	want := []string{"FetchActivityName", "GetActivity"}
-	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Fatalf("got %v, want %v (blank entries dropped)", got, want)
+func TestLoadLocalTemporalEnvHelpersGateAndNormalization(t *testing.T) {
+	root := t.TempDir()
+	writeTemporalAllowlist(t, root, "env_helpers:\n  - ' HelperA '\n  - ''\n  - HelperB\n")
+
+	t.Setenv(LocalTemporalOptInEnv, "")
+	if got := LoadLocalTemporalEnvHelpers(root); got != nil {
+		t.Fatalf("gate off returned %#v", got)
+	}
+
+	for _, truthy := range []string{"1", " 1 ", "true", " TrUe "} {
+		t.Run(truthy, func(t *testing.T) {
+			t.Setenv(LocalTemporalOptInEnv, truthy)
+			want := []string{"HelperA", "HelperB"}
+			if got := LoadLocalTemporalEnvHelpers(root); !reflect.DeepEqual(got, want) {
+				t.Fatalf("got %#v, want %#v", got, want)
+			}
+		})
 	}
 }
 
-func TestLoadLocalTemporalEnvHelpers_GateOnNoFile(t *testing.T) {
-	dir := t.TempDir()
+func TestLoadLocalTemporalEnvHelpersFailSoft(t *testing.T) {
 	t.Setenv(LocalTemporalOptInEnv, "true")
-	if got := LoadLocalTemporalEnvHelpers(dir); got != nil {
-		t.Fatalf("expected nil when file absent, got %v", got)
+	if got := LoadLocalTemporalEnvHelpers(t.TempDir()); got != nil {
+		t.Fatalf("missing file returned %#v", got)
 	}
-}
 
-func TestLoadLocalTemporalEnvHelpers_GateOnMalformed(t *testing.T) {
-	dir := t.TempDir()
-	writeTemporalAllowlist(t, dir, "env_helpers: : not yaml :::\n")
-	t.Setenv(LocalTemporalOptInEnv, "1")
-	if got := LoadLocalTemporalEnvHelpers(dir); got != nil {
-		t.Fatalf("expected nil on malformed file (fail-soft), got %v", got)
+	root := t.TempDir()
+	writeTemporalAllowlist(t, root, "env_helpers: [")
+	if got := LoadLocalTemporalEnvHelpers(root); got != nil {
+		t.Fatalf("malformed file returned %#v", got)
 	}
 }

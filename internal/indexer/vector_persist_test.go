@@ -2,8 +2,12 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -13,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/search"
 )
 
 // TestBulkLoad_PersistsVectorsToBackend guards the fix where the embedding
@@ -22,10 +27,9 @@ import (
 // reached the in-process HNSW and never the sqlite `vectors` table. They were
 // lost on the next daemon restart, forcing a full (paid) re-embed every time.
 //
-// The fix captures the disk store at the shadow swap (idx.bulkVectorSink) and
-// persists the vectors against it. This test indexes a tiny repo into a sqlite
-// store with an embedder wired in, then asserts the backend's vectors table is
-// populated — it was empty before the fix.
+// The fix prepares an immutable vector plan while the shadow is live, then
+// installs it only after the graph has drained and idx.graph points back to the
+// durable store. This test asserts both persistence and delegated publication.
 func TestBulkLoad_PersistsVectorsToBackend(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "app.py"), `
@@ -68,4 +72,224 @@ def store(value):
 	require.NotEmpty(t, embs,
 		"embedded vectors must be persisted to the sqlite backend under the bulk loader "+
 			"(regression: vectors lived only in the in-process HNSW and were lost on restart)")
+	assertDelegatedVectorPublication(t, idx)
+}
+
+type vectorPublicationProbeStore struct {
+	*store_sqlite.Store
+	flushStarted  chan struct{}
+	flushRelease  chan struct{}
+	replaceCalled chan struct{}
+	flushOnce     sync.Once
+	replaceOnce   sync.Once
+	flushErr      error
+	replaceErr    error
+	replaceCalls  atomic.Int32
+}
+
+func newVectorPublicationProbeStore(store *store_sqlite.Store) *vectorPublicationProbeStore {
+	return &vectorPublicationProbeStore{
+		Store:         store,
+		flushStarted:  make(chan struct{}),
+		replaceCalled: make(chan struct{}),
+	}
+}
+
+func (s *vectorPublicationProbeStore) FlushBulk() error {
+	s.flushOnce.Do(func() { close(s.flushStarted) })
+	if s.flushRelease != nil {
+		<-s.flushRelease
+	}
+	if s.flushErr != nil {
+		return s.flushErr
+	}
+	return s.Store.FlushBulk()
+}
+
+func (s *vectorPublicationProbeStore) ReplaceVectorCorpus(
+	ctx context.Context,
+	repoPrefix string,
+	dims int,
+	items []graph.VectorCorpusItem,
+) (graph.VectorCorpusStats, error) {
+	s.replaceCalls.Add(1)
+	s.replaceOnce.Do(func() { close(s.replaceCalled) })
+	if s.replaceErr != nil {
+		return graph.VectorCorpusStats{}, s.replaceErr
+	}
+	return s.Store.ReplaceVectorCorpus(ctx, repoPrefix, dims, items)
+}
+
+func vectorPersistFixture(t *testing.T, files int) string {
+	t.Helper()
+	dir := t.TempDir()
+	for i := 0; i < files; i++ {
+		writeFile(t, filepath.Join(dir, "app"+string(rune('a'+i))+".py"), `
+def fetch(url):
+    return url
+
+def store(value):
+    return value
+`)
+	}
+	return dir
+}
+
+func newVectorPersistIndexer(t *testing.T, store graph.Store, emb *poolEmbedder) *Indexer {
+	t.Helper()
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewPythonExtractor())
+	cfg := config.Default().Index
+	cfg.Workers = 2
+	idx := New(store, reg, cfg, zap.NewNop())
+	idx.SetEmbedder(emb)
+	return idx
+}
+
+func assertDelegatedVectorPublication(t *testing.T, idx *Indexer) {
+	t.Helper()
+	backend, release := idx.swappable().AcquireBackend()
+	defer release()
+	hybrid, ok := backend.(*search.HybridBackend)
+	require.True(t, ok, "vector publication must install a hybrid backend")
+	require.NotNil(t, hybrid.VectorIndex())
+	require.Greater(t, hybrid.VectorIndex().Count(), 0)
+	require.Zero(t, hybrid.VectorSizeBytes(), "durable delegation must retain no heap HNSW")
+}
+
+func waitForVectorPublicationSignal(t *testing.T, signal <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
+	}
+}
+
+func TestBulkLoad_PublishesVectorsOnlyAfterDurableFlush(t *testing.T) {
+	t.Setenv("GORTEX_SHADOW_MAX_FILES", "1000000")
+	t.Setenv("GORTEX_SHADOW_MAX_BYTES", "1073741824")
+	t.Setenv("GORTEX_STREAMING_FLUSH", "0")
+	dir := vectorPersistFixture(t, 1)
+	base, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = base.Close() })
+	probe := newVectorPublicationProbeStore(base)
+	probe.flushRelease = make(chan struct{})
+	idx := newVectorPersistIndexer(t, probe, &poolEmbedder{})
+
+	before, release := idx.swappable().AcquireBackend()
+	release()
+	done := make(chan error, 1)
+	go func() {
+		_, indexErr := idx.IndexCtx(context.Background(), dir)
+		done <- indexErr
+	}()
+
+	waitForVectorPublicationSignal(t, probe.flushStarted, "bulk flush")
+	select {
+	case <-probe.replaceCalled:
+		t.Fatal("vector corpus was installed before the shadow graph completed its durable flush")
+	default:
+	}
+	during, release := idx.swappable().AcquireBackend()
+	release()
+	if during != before {
+		t.Fatal("active search backend changed before durable graph flush")
+	}
+
+	close(probe.flushRelease)
+	select {
+	case indexErr := <-done:
+		require.NoError(t, indexErr)
+	case <-time.After(10 * time.Second):
+		t.Fatal("index did not finish after releasing the durable flush")
+	}
+	waitForVectorPublicationSignal(t, probe.replaceCalled, "vector corpus replacement")
+	require.Equal(t, int32(1), probe.replaceCalls.Load())
+	assertDelegatedVectorPublication(t, idx)
+}
+
+func TestBulkLoad_FlushFailureDoesNotPublishVectors(t *testing.T) {
+	t.Setenv("GORTEX_SHADOW_MAX_FILES", "1000000")
+	t.Setenv("GORTEX_SHADOW_MAX_BYTES", "1073741824")
+	t.Setenv("GORTEX_STREAMING_FLUSH", "0")
+	dir := vectorPersistFixture(t, 1)
+	base, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = base.Close() })
+	probe := newVectorPublicationProbeStore(base)
+	probe.flushErr = errors.New("injected flush failure")
+	idx := newVectorPersistIndexer(t, probe, &poolEmbedder{})
+	before, release := idx.swappable().AcquireBackend()
+	release()
+
+	_, err = idx.IndexCtx(context.Background(), dir)
+	require.ErrorIs(t, err, probe.flushErr)
+	require.Zero(t, probe.replaceCalls.Load(), "failed graph persistence must not install vectors")
+	after, release := idx.swappable().AcquireBackend()
+	release()
+	if after != before {
+		t.Fatal("failed shadow drain changed the active search backend")
+	}
+}
+
+func TestBulkLoad_NativeVectorFailureFallsBackWithoutReembedding(t *testing.T) {
+	t.Setenv("GORTEX_SHADOW_MAX_FILES", "1000000")
+	t.Setenv("GORTEX_SHADOW_MAX_BYTES", "1073741824")
+	t.Setenv("GORTEX_STREAMING_FLUSH", "0")
+	dir := vectorPersistFixture(t, 1)
+	base, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = base.Close() })
+	probe := newVectorPublicationProbeStore(base)
+	probe.replaceErr = errors.New("injected vector replacement failure")
+	emb := &poolEmbedder{}
+	idx := newVectorPersistIndexer(t, probe, emb)
+
+	_, err = idx.IndexCtx(context.Background(), dir)
+	require.NoError(t, err, "single-repository indexing may degrade to the prepared heap fallback")
+	require.Equal(t, int32(1), emb.calls, "fallback must reuse the prepared vectors without a second paid pass")
+	require.ErrorIs(t, idx.LastVectorBuildError(), probe.replaceErr)
+
+	backend, release := idx.swappable().AcquireBackend()
+	defer release()
+	hybrid, ok := backend.(*search.HybridBackend)
+	require.True(t, ok)
+	require.Greater(t, hybrid.VectorIndex().Count(), 0)
+	require.Greater(t, hybrid.VectorSizeBytes(), uint64(0), "fallback must be the process-local heap backend")
+}
+
+func TestDirectSQLiteIndexPublishesDelegatedVectorCorpus(t *testing.T) {
+	t.Setenv("GORTEX_SHADOW_MAX_FILES", "0")
+	t.Setenv("GORTEX_STREAMING_FLUSH", "0")
+	dir := vectorPersistFixture(t, 1)
+	base, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = base.Close() })
+	probe := newVectorPublicationProbeStore(base)
+	idx := newVectorPersistIndexer(t, probe, &poolEmbedder{})
+
+	_, err = idx.IndexCtx(context.Background(), dir)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), probe.replaceCalls.Load())
+	assertDelegatedVectorPublication(t, idx)
+}
+
+func TestStreamingFlush_PublishesOneDelegatedVectorCorpus(t *testing.T) {
+	t.Setenv("GORTEX_SHADOW_MAX_FILES", "0")
+	t.Setenv("GORTEX_STREAMING_FLUSH", "1")
+	t.Setenv("GORTEX_STREAMING_CHUNK_SIZE", "1")
+	dir := vectorPersistFixture(t, 2)
+	base, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = base.Close() })
+	probe := newVectorPublicationProbeStore(base)
+	idx := newVectorPersistIndexer(t, probe, &poolEmbedder{})
+
+	_, err = idx.IndexCtx(context.Background(), dir)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), probe.replaceCalls.Load(),
+		"streaming chunks must prepare once and publish only after the final chunk")
+	assertDelegatedVectorPublication(t, idx)
 }

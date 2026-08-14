@@ -13,7 +13,7 @@ import (
 // This file implements graph.SymbolSearcher + graph.SymbolBundleSearcher
 // on the SQLite backend using the FTS5 virtual table declared in
 // schema.go (symbol_fts). It is the on-disk replacement for the
-// multi-GB in-heap Bleve/BM25 index: the FTS5 inverted index lives in
+// multi-GB in-heap BM25 index: the FTS5 inverted index lives in
 // the same .sqlite file as the graph, and a tier-0 exact-name boost
 // short-circuits identifier queries so
 // search quality holds or improves while the heap shrinks.

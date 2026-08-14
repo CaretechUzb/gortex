@@ -1,7 +1,6 @@
 package indexer
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
@@ -11,7 +10,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -223,6 +221,14 @@ type Indexer struct {
 	parseQuar   *crashpool.Quarantine
 	parsePoolMu sync.Mutex
 
+	// extractionLifecycle rejects new parses once Close begins and waits for
+	// every admitted in-process, crash-worker, streaming, and overlay request.
+	extractionLifecycle extractionLifecycle
+	// extractionOptions is loaded once after the repository root is established.
+	// The pointed-to value is immutable for the Indexer's lifetime.
+	extractionOptionsOnce sync.Once
+	extractionOptions     atomic.Pointer[parser.ExtractionOptions]
+
 	// Trigram code-search index, lazily built on first GrepText call
 	// and rebuilt only when indexGen advances past the build it was
 	// made from. indexGen is bumped by every full or incremental
@@ -275,33 +281,14 @@ type Indexer struct {
 	// embedder is the optional embedding provider for semantic search.
 	embedder embedding.Provider
 
-	// skipVectorBuild, when true, makes buildSearchIndex populate only
-	// the text index and never run the embedding pass — even with an
-	// embedder set. The daemon flips it on for the warmup re-index loop
-	// when a snapshot already carries the workspace vector index, so
-	// the graph is not re-embedded only to have the cached index
-	// overwrite it. Off by default; a normal index always builds
-	// vectors when an embedder is present.
-	skipVectorBuild bool
-
-	// bulkVectorSink holds the disk store captured at the bulk-load
-	// shadow swap, so buildSearchIndex can still persist the vector
-	// index to the backend while idx.graph points at the in-memory
-	// shadow (which does not implement graph.VectorSearcher). Without
-	// it the embedding pass under the bulk loader builds vectors only
-	// in the in-process HNSW — they never reach the `vectors` table and
-	// are lost on the next daemon restart, forcing a paid re-embed.
-	// Set during the shadow swap, cleared when idx.graph is restored.
-	bulkVectorSink graph.VectorSearcher
-
-	// contentSink mirrors bulkVectorSink for the content full-text index:
+	// contentSink captures the durable content full-text index during a shadow:
 	// the disk store captured at the shadow swap, so the per-file content
 	// stream reaches content_fts on disk even while idx.graph points at the
 	// in-memory shadow (which does not implement graph.ContentSearcher).
 	// Set during the shadow swap, cleared when idx.graph is restored.
 	contentSink graph.ContentSearcher
 
-	// contractStateSink mirrors bulkVectorSink for the contract-tier
+	// contractStateSink captures the durable contract-tier store during a shadow:
 	// completion marker: the disk store captured at the shadow swap, so the
 	// inline contract pass records the marker on the backend even while
 	// idx.graph points at the in-memory shadow (which does not implement
@@ -338,12 +325,6 @@ type Indexer struct {
 	// semanticMgr is the optional semantic enrichment manager.
 	semanticMgr *semantic.Manager
 
-	// resolverLSPHelper, when non-nil, is the resolve-time LSP
-	// helper installed on idx.resolver. Held here so MultiIndexer
-	// can mirror it onto the global post-pass resolver in
-	// RunDeferredPassesAll. See SetResolverLSPHelper.
-	resolverLSPHelper resolver.LSPHelper
-
 	// npmAliasOnce builds npmAlias lazily on the first resolve-time
 	// import-rewrite request. Lazy because the repo root and prefix
 	// are set after New(); by the time the resolver runs they are
@@ -379,19 +360,6 @@ type Indexer struct {
 	contractCache   map[string]*contractCacheEntry
 	contractCacheMu sync.RWMutex
 
-	// upgradeOnce gates the BM25→Bleve auto-upgrade to exactly one
-	// goroutine per indexer lifetime. Without this, every post-threshold
-	// IndexCtx — which fires once per tracked repo during multi-repo
-	// warmup — would spawn a fresh upgradeSearchToBleve goroutine.
-	// Each rebuilds ~N-doc Bleve indexes (≈32 KiB/doc), so overlapping
-	// upgrades peak memory far above steady-state and waste CPU on
-	// rebuilds that the next Swap immediately discards. Also counts
-	// scheduled upgrades so tests can observe gating decisions
-	// without relying on log scrapes or timing.
-	upgradeOnce      sync.Once
-	upgradeSpawnedMu sync.Mutex
-	upgradeSpawned   int
-
 	// deferResolve, when set, makes IndexCtx skip the cross-cutting passes
 	// (per-repo ResolveAll / semantic enrichment / contract extraction +
 	// commit) so the multi-repo orchestrator can run them serially after
@@ -422,7 +390,7 @@ type Indexer struct {
 	// graph-apply phase until the channel closes. Set by BeginDeferredPasses
 	// before the pool launches (so the pool's compute may overlap the warmup
 	// resolve without its applies starving the resolver) and cleared by
-	// FinishTail.
+	// FinishTailResult.
 	deferredApplyGate <-chan struct{}
 
 	// deferredEnrichFiles holds a deduplicated, repo-scoped Go frontier for
@@ -467,14 +435,14 @@ type Indexer struct {
 	// entire shared graph, so running them per-repo inside a batch loop
 	// (warmup, ReconcileAll) is O(R · global_size) — quadratic for repo
 	// counts in the hundreds. The batch caller is responsible for invoking
-	// RunGlobalGraphPasses exactly once at the end. Has no effect on the
+	// the shared global-pass pipeline exactly once at the end. Has no effect on the
 	// deferResolve path (multi-repo IndexCtx already skips those passes).
 	deferGlobalPasses atomic.Bool
 
 	// skipResolveInDeferred, when set, makes RunDeferredPasses skip the
 	// per-repo resolver.ResolveAll() call. ResolveAll walks the entire
 	// shared graph, so paying it once per indexer across hundreds of
-	// repos is O(R · E). MultiIndexer.RunDeferredPassesAll sets this
+	// repos is O(R · E). MultiIndexer.RunDeferredPassesAllResult sets this
 	// flag on every indexer and runs a single resolver.New(graph).ResolveAll
 	// once at the end, which picks up every placeholder edge at once.
 	// Has no effect on direct (non-batch) callers of RunDeferredPasses.
@@ -505,16 +473,6 @@ type Indexer struct {
 	// between the probe and graph patch.
 	preparedMu sync.Mutex
 	prepared   map[string]*preparedExtraction
-
-	// affectedByPasses / affectedByFilesResolved / affectedByDropped
-	// count the affected-by re-resolution activity (see affected_by.go):
-	// passes that found a signature delta and ran, referencing files
-	// re-resolved by them, and files dropped by the fan-out cap.
-	// Exposed via AffectedByCounts so tests and diagnostics can observe
-	// that a body-only edit triggered no fan-out.
-	affectedByPasses        atomic.Int64
-	affectedByFilesResolved atomic.Int64
-	affectedByDropped       atomic.Int64
 
 	// repositoryMutation is the single discovery/parse/resolve/derived lane
 	// for this repository. It is lazy so focused Indexer fixtures do not need
@@ -551,18 +509,18 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 		indexMemoryAdmission: processIndexMemoryAdmission,
 		registry:             reg,
 		resolver:             resolver.New(g),
-		// Wrap in Swappable so the auto-upgrade to Bleve at large
-		// corpus sizes can happen in a background goroutine without
-		// racing with concurrent searches. Subsequent reassignments to
-		// idx.search (Hybrid wrap, etc.) should use swap helpers below.
+		// Wrap in Swappable so the later Hybrid re-wrap (text +
+		// vector) can happen without racing with concurrent searches.
+		// Subsequent reassignments to idx.search should use the swap
+		// helpers below.
 		//
 		// When the backing store implements graph.SymbolSearcher
 		// (today only store_sqlite), the initial backend is a thin
 		// adapter that forwards Search to the store's native FTS.
-		// The in-process Bleve / BM25 build path is then bypassed
-		// entirely — saving ~100MB heap on a Vscode-scale repo and
-		// putting search in the same address space as the rest of
-		// the graph queries.
+		// The in-process BM25 build path is then bypassed entirely —
+		// saving ~100MB heap on a Vscode-scale repo and putting
+		// search in the same address space as the rest of the graph
+		// queries.
 		search:        search.NewSwappable(initialSearchBackend(g)),
 		config:        cfg,
 		transforms:    newTransformPipeline(cfg.Transforms, logger),
@@ -710,10 +668,8 @@ func (d *vectorSearcherDelegate) SimilarTo(vec []float32, limit int) ([]graph.Ve
 // in its Swappable on construction. When the underlying store
 // implements graph.SymbolSearcher (today only store_sqlite), a
 // thin adapter routes Search calls through the store's native FTS
-// — the in-process BM25 / Bleve build path is bypassed entirely.
-// Otherwise falls through to search.NewAuto which picks BM25 for
-// small corpora and auto-upgrades to Bleve once the size warrants
-// it.
+// — the in-process BM25 build path is bypassed entirely. Otherwise
+// falls through to search.NewAuto's in-memory BM25 index.
 func initialSearchBackend(g graph.Store) search.Backend {
 	if s, ok := g.(graph.SymbolSearcher); ok {
 		return search.NewSymbolSearcherBackend(s)
@@ -722,18 +678,19 @@ func initialSearchBackend(g graph.Store) search.Backend {
 }
 
 // isSymbolSearcherBackend reports whether the swappable's currently
-// active backend is the SymbolSearcher adapter. Used to suppress
-// the Bleve auto-upgrade goroutine — if the active backend is
-// already a native FTS, upgrading to Bleve would re-index the same
-// corpus into a parallel in-process Bleve and silently swap it in,
-// defeating the FTS path and pinning the ~100MB heap the FTS
+// active backend is the SymbolSearcher adapter. Used to suppress the
+// in-process index builds — if the active backend is already a native
+// FTS, re-indexing the same corpus into a parallel in-process index
+// would defeat the FTS path and pin the ~100MB heap the FTS
 // integration was meant to release.
 func isSymbolSearcherBackend(b search.Backend) bool {
 	switch backend := b.(type) {
 	case *search.SymbolSearcherBackend:
 		return true
 	case *search.Swappable:
-		return isSymbolSearcherBackend(backend.Inner())
+		inner, release := backend.AcquireBackend()
+		defer release()
+		return isSymbolSearcherBackend(inner)
 	case *search.HybridBackend:
 		return isSymbolSearcherBackend(backend.TextBackend())
 	default:
@@ -863,13 +820,12 @@ func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
 }
 
 // shouldIndexForSearch reports whether a node should be added to the
-// text search index (BM25/Bleve). File and Import nodes are never
+// text search index. File and Import nodes are never
 // searchable symbols. Beyond that, config.SkipSearch filters out
 // (language, kind) pairs that would only add noise — JSON/YAML/TOML
-// keys, CSS tokens, Terraform blocks, shell/build variables. All three
-// text-index call sites (buildSearchIndex bulk loop, indexFile
-// incremental add, upgradeSearchToBleve repopulate) must go through
-// this predicate so they can't drift.
+// keys, CSS tokens, Terraform blocks, shell/build variables. Every
+// text-index call site (buildSearchIndex bulk loop, indexFile
+// incremental add) must go through this predicate so they can't drift.
 func (idx *Indexer) shouldIndexForSearch(n *graph.Node) bool {
 	// Cross-daemon proxy-edge nodes stand in for remote symbols; they
 	// are never surfaced in local name search. Inert until
@@ -941,121 +897,6 @@ func (idx *Indexer) removeFromSearch(n *graph.Node) {
 	idx.search.Remove(n.ID)
 }
 
-// upgradeSearchToBleve constructs a Bleve backend from the current graph
-// and atomically swaps it in. Designed to run in a background goroutine
-// triggered by IndexCtx after the initial index completes. Does nothing
-// if Bleve construction fails (caller already hit AutoThreshold but the
-// in-memory backend keeps serving correctly, just with worse memory
-// characteristics).
-// bleveUpgradeEntry is one row of the snapshot the upgrade goroutine
-// works from. Snapshotting (id, name, file, signature) up front in
-// the foreground — before the goroutine starts reading them — keeps
-// the goroutine race-free against subsequent Index calls' Meta-writing
-// passes (reach.BuildIndex, ResolveTemporalCalls, ...).
-type bleveUpgradeEntry struct {
-	id string
-	// fields is the BM25 text payload for the node, as produced by
-	// searchIndexFields: name + file + signature for a code symbol,
-	// name + file + section body for a KindDoc prose section.
-	fields []string
-}
-
-// snapshotBleveEntries captures every node currently eligible for the
-// search index plus its `signature` Meta string. Called synchronously
-// from IndexCtx after every Node.Meta mutating pass has returned, so
-// the read of n.Meta happens with no concurrent writer.
-func (idx *Indexer) snapshotBleveEntries() []bleveUpgradeEntry {
-	nodes := graph.RepoCodeNodes(idx.graph, idx.repoPrefix)
-	out := make([]bleveUpgradeEntry, 0, len(nodes))
-	for _, n := range nodes {
-		if !idx.shouldIndexForSearch(n) {
-			continue
-		}
-		out = append(out, bleveUpgradeEntry{id: n.ID, fields: searchIndexFields(n, idx.projectName)})
-	}
-	return out
-}
-
-func (idx *Indexer) upgradeSearchToBleve(snapshot []bleveUpgradeEntry) {
-	// Defensive early-return: if the active text backend is already
-	// Bleve, there is nothing to upgrade. IndexCtx's sync.Once guard
-	// prevents re-entry from the auto-upgrade path, but direct
-	// callers (tests, manual invocation from tooling) could still
-	// hit this function twice; a second run would pointlessly
-	// rebuild a full Bleve index and Swap it over an identical one.
-	inner := idx.swappable().Inner()
-	if _, ok := inner.(*search.BleveBackend); ok {
-		return
-	}
-	if hyb, ok := inner.(*search.HybridBackend); ok {
-		if _, ok := hyb.TextBackend().(*search.BleveBackend); ok {
-			return
-		}
-	}
-
-	// Opt-in disk backend. Scorch stores the inverted index on disk
-	// (~10-20× less heap than upsidedown+gtreap) at the cost of file
-	// I/O during build. Users point GORTEX_BLEVE_DISK_DIR at a
-	// writable path; we manage the file lifecycle inside it.
-	diskDir := os.Getenv("GORTEX_BLEVE_DISK_DIR")
-
-	var (
-		blv *search.BleveBackend
-		err error
-	)
-	if diskDir != "" {
-		blv, err = search.NewBleveDisk(diskDir)
-		if err != nil {
-			idx.logger.Warn("search: bleve disk construction failed, falling back to in-memory",
-				zap.String("dir", diskDir), zap.Error(err))
-		}
-	}
-	if blv == nil {
-		blv, err = search.NewBleve()
-		if err != nil {
-			idx.logger.Warn("search: bleve construction failed, staying on in-memory",
-				zap.Error(err))
-			return
-		}
-	}
-
-	// Use the foreground snapshot the spawner captured rather than
-	// re-walking idx.graph here: the goroutine outlives the spawning
-	// IndexCtx call, and subsequent Index calls' Meta-writing passes
-	// (reach.BuildIndex, ResolveTemporalCalls, ...) mutate Node.Meta
-	// on the same Node objects. Reading sig from a live n.Meta here
-	// would race with those writes.
-	for _, e := range snapshot {
-		blv.Add(e.id, e.fields...)
-	}
-
-	// Preserve the vector index if one is wired up. The previous inner
-	// is normally a HybridBackend wrapping text + vector + embedder;
-	// swapping in raw Bleve would let Swap's old.Close() run on the
-	// old Hybrid, which closes only its text side (hybrid.Close) but
-	// leaves the resulting inner — raw *BleveBackend — unwrapped, so
-	// every downstream hybrid/semantic query silently degrades to
-	// BM25 until the daemon restarts. Rewrap the fresh Bleve in a new
-	// Hybrid carrying the old vector + embedder. The vector backend
-	// itself is never closed by Hybrid.Close, so it stays alive even
-	// after the old Hybrid is torn down by Swap.
-	sw := idx.swappable()
-	var replacement search.Backend = blv
-	if oldHybrid, ok := sw.Inner().(*search.HybridBackend); ok {
-		replacement = search.NewHybrid(blv, oldHybrid.VectorIndex(), oldHybrid.Embedder())
-	}
-	sw.Swap(replacement)
-
-	mode := "memory"
-	if blv.DiskPath() != "" {
-		mode = "disk"
-	}
-	idx.logger.Info("search: upgraded to Bleve backend (background)",
-		zap.Int("symbols", blv.Count()),
-		zap.String("mode", mode),
-		zap.String("disk_path", blv.DiskPath()))
-}
-
 // Graph returns the underlying graph.
 func (idx *Indexer) Graph() graph.Store { return idx.graph }
 
@@ -1101,119 +942,10 @@ func (idx *Indexer) SetSkipResolveInDeferred(v bool) { idx.skipResolveInDeferred
 // SetDeferGlobalPasses toggles whether the graph-wide derivation passes
 // (InferImplements, InferOverrides, markTestSymbolsAndEmitEdges) run
 // inline at the end of IndexCtx / IncrementalReindexPaths. Set true when the
-// caller drives a batch (e.g. daemon warmup) and will invoke
-// RunGlobalGraphPasses once at the end. See the deferGlobalPasses field
+// caller drives a batch (e.g. daemon warmup) and will invoke the shared
+// multi-repository global-pass pipeline once at the end. See the deferGlobalPasses field
 // comment.
 func (idx *Indexer) SetDeferGlobalPasses(v bool) { idx.deferGlobalPasses.Store(v) }
-
-// RunGlobalGraphPasses runs the graph-wide derivation passes once
-// against the indexer's shared graph. Safe to call against a graph that
-// already has these edges — InferImplements / InferOverrides skip
-// existing parents, and graph.AddEdge dedupes by edgeKey so EdgeTests
-// re-emission is a no-op. Logs counts for telemetry. Use when batching
-// multiple per-repo TrackRepoCtx / IncrementalReindexPaths calls under
-// SetDeferGlobalPasses(true).
-func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
-	if idx.graph == nil {
-		return
-	}
-	reporter := progress.FromContext(ctx)
-	if added := idx.resolver.InferImplements(); added > 0 {
-		idx.logger.Info("inferred implements (global)", zap.Int("added", added))
-	}
-	if added := idx.resolver.InferOverrides(); added > 0 {
-		idx.logger.Info("inferred overrides (global)", zap.Int("added", added))
-	}
-	marked, emitted := markTestSymbolsAndEmitEdges(idx.graph)
-	if marked > 0 || emitted > 0 {
-		idx.logger.Info("test edges emitted (global)",
-			zap.Int("test_symbols", marked),
-			zap.Int("edges", emitted),
-		)
-	}
-	if ctrl := entrypoints.PropagateEntryPointsDownHierarchy(idx.graph); ctrl > 0 {
-		idx.logger.Info("entry-point hierarchy stamped (global)", zap.Int("stamped", ctrl))
-	}
-	if re, ep, fa := synthesizeCapabilityEdges(idx.graph); re > 0 || ep > 0 || fa > 0 {
-		idx.logger.Info("capability edges emitted (global)",
-			zap.Int("reads_env", re),
-			zap.Int("executes_process", ep),
-			zap.Int("accesses_field", fa),
-		)
-	}
-	reporter.Report("clone detection pass (global)", 0, 0)
-	cs, cloneBaseline := detectClonesAndEmitEdgesWithBaselineCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold())
-	if cs.Items > 0 {
-		idx.logger.Info("clone edges emitted (global)",
-			zap.Int("items", cs.Items),
-			zap.Int("clone_pairs", cs.Pairs),
-			zap.Int("edges", cs.Edges),
-			zap.Int("skipped_buckets", cs.SkippedBuckets),
-			zap.Int("skipped_bucket_items", cs.SkippedBucketItems),
-			zap.Int("diffused_pairs", cs.DiffusedPairs),
-			zap.Int("diffused_edges", cs.DiffusedEdges),
-		)
-	}
-	// Adopt the freshly-finalized CMS/corpus seed so steady-state single-file
-	// edits go incremental without paging the same compact corpus again.
-	if idx.cloneIndex != nil {
-		idx.cloneIndex.AdoptBaselineOrRebuild(idx.graph, idx.repoPrefix, cloneBaseline)
-	}
-	// Framework dynamic-dispatch synthesis (gRPC stubs, Temporal
-	// workflow→activity, in-process / native event channels, native
-	// bridges). Runs after InferImplements/InferOverrides (the
-	// interface-satisfaction signals several synthesizers depend on) and
-	// before DetectCrossRepoEdges so a cross-repo synthesized call gets
-	// its parallel cross_repo_calls edge.
-	reporter.Report("framework dispatch synthesis (global)", 0, 0)
-	if rep := resolver.RunFrameworkSynthesizers(idx.graph); rep.Total > 0 {
-		idx.logger.Info("framework dispatch calls synthesized (global)",
-			zap.Int("edges", rep.Total),
-			zap.Any("per_synthesizer", rep.Per),
-		)
-	}
-	// External-call placeholder synthesis (opt-in). Runs after the
-	// resolver and the gRPC/Temporal stub passes so every edge that
-	// could land on a real node already has; the leftover external
-	// terminals are then materialised into synthetic call-chain nodes.
-	reporter.Report("external-call synthesis (global)", 0, 0)
-	if extCalls := resolver.SynthesizeExternalCalls(idx.graph, idx.externalCallSynthesisEnabled()); extCalls > 0 {
-		idx.logger.Info("external-call placeholders synthesized (global)",
-			zap.Int("edges", extCalls),
-		)
-	}
-	// Speculative dynamic-dispatch synthesis (opt-in, default off). Mints
-	// best-guess hidden-by-default call edges for blind-spot shapes.
-	if spec := resolver.ResolveSpeculativeDispatch(idx.graph, idx.speculativeDispatchEnabled()); spec > 0 {
-		idx.logger.Info("speculative dispatch edges synthesized (global)",
-			zap.Int("edges", spec),
-		)
-	}
-	// Content -> code "why" links. Runs before DetectCrossRepoEdges so a
-	// chunk that motivates a symbol in another repo gets its parallel
-	// cross_repo_motivates edge minted by the cross-repo pass below.
-	reporter.Report("content links (global)", 0, 0)
-	idx.linkContentToCode()
-	// Cross-repo edge layer. Runs after InferImplements / InferOverrides
-	// so cross-repo implements / extends edges pick up their parallel
-	// cross_repo_* edges. No-op on single-repo graphs (no RepoPrefix).
-	reporter.Report("cross-repo edges (global)", 0, 0)
-	if crossRepoEdges := resolver.DetectCrossRepoEdges(idx.graph); crossRepoEdges > 0 {
-		idx.logger.Info("cross-repo edges emitted (global)",
-			zap.Int("edges", crossRepoEdges),
-		)
-	}
-	// Reachability index — used to be precomputed here for every
-	// impact seed. The eager pass was retired because the breakeven
-	// math doesn't work: on a 200 k-seed graph (k8s) the build took
-	// ~2000 s of cold-index wall time to save ~10 ms per
-	// AnalyzeImpact call, requiring ~200 k queries to pay off — well
-	// beyond any realistic agent session. Lookups are now
-	// compute-on-first-use; we just invalidate the cache so any
-	// surviving stamps from a previous build don't shadow the fresh
-	// graph state.
-	reach.InvalidateIndex()
-}
 
 // cloneThreshold returns the configured Jaccard similarity cutoff for
 // clone detection (0 = use the clones package default).
@@ -1230,7 +962,7 @@ func (idx *Indexer) cloneThreshold() float64 {
 // The graph-wide derivation passes (InferImplements, InferOverrides,
 // markTestSymbolsAndEmitEdges) intentionally do NOT run here. They walk
 // the entire shared graph, so the multi-repo orchestrator must invoke
-// MultiIndexer.RunGlobalGraphPasses exactly once after every repo has
+// its shared global-pass pipeline exactly once after every repo has
 // finished its deferred per-repo work.
 func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 	if idx.pendingContractReg == nil {
@@ -1594,6 +1326,7 @@ func (idx *Indexer) storeRootPath(absRoot string) {
 	if idx.rootPath != absRoot {
 		idx.rootPath = absRoot
 	}
+	idx.initializeExtractionOptions(absRoot)
 }
 
 // populateCppIncludeDirs reconstructs each C/C++ source file's include search
@@ -1751,13 +1484,6 @@ func (idx *Indexer) ProjectID() string { return idx.projectID }
 // When set, buildSearchIndex will create a HybridBackend with vector search.
 func (idx *Indexer) SetEmbedder(p embedding.Provider) { idx.embedder = p }
 
-// SetSkipVectorBuild toggles the embedding pass in buildSearchIndex.
-// When true, buildSearchIndex builds only the text index — used by the
-// daemon warmup path when a snapshot already carries the workspace
-// vector index, so the graph is not needlessly re-embedded. When false
-// (the default) an indexer with an embedder set always builds vectors.
-func (idx *Indexer) SetSkipVectorBuild(skip bool) { idx.skipVectorBuild = skip }
-
 // SetEmbeddingChunkOptions tunes the AST sub-chunking applied to large
 // symbols before embedding (threshold and window line counts). The
 // zero value leaves the chunker on its built-in defaults.
@@ -1797,66 +1523,12 @@ func (idx *Indexer) SemanticManager() *semantic.Manager { return idx.semanticMgr
 //
 // Pass nil to detach. Must be called before ResolveAll / ResolveFile;
 // the resolver caches no LSP state across passes, so mid-pass swaps
-// are racy and not supported.
+// are racy and not supported. The resolver owns the helper — this is a
+// pass-through, not a second place it is stored.
 func (idx *Indexer) SetResolverLSPHelper(h resolver.LSPHelper) {
 	if idx.resolver != nil {
 		idx.resolver.SetLSPHelper(h)
 	}
-	idx.resolverLSPHelper = h
-}
-
-// ResolverLSPHelper returns the currently installed resolver-time LSP
-// helper, or nil. Exported so MultiIndexer can mirror the helper onto
-// the global post-pass resolver in RunDeferredPassesAll.
-func (idx *Indexer) ResolverLSPHelper() resolver.LSPHelper { return idx.resolverLSPHelper }
-
-// ExportVectorIndex returns the serialized vector index bytes, dims, and count.
-// Returns nil, 0, 0 if no vector index is active.
-func (idx *Indexer) ExportVectorIndex() ([]byte, int, int) {
-	hybrid, ok := idx.swappable().Inner().(*search.HybridBackend)
-	if !ok {
-		return nil, 0, 0
-	}
-	vec := hybrid.VectorIndex()
-	if vec == nil || vec.Count() == 0 {
-		return nil, 0, 0
-	}
-
-	var buf bytes.Buffer
-	if err := vec.Save(&buf); err != nil {
-		idx.logger.Warn("failed to export vector index", zap.Error(err))
-		return nil, 0, 0
-	}
-	return buf.Bytes(), vec.Dims(), vec.Count()
-}
-
-// ImportVectorIndex restores a vector index from serialized data and wraps
-// the current text search backend into a HybridBackend.
-func (idx *Indexer) ImportVectorIndex(data []byte, dims, count int) error {
-	if len(data) == 0 || idx.embedder == nil {
-		return nil
-	}
-
-	// Validate dimensions match the current embedder to avoid mismatches
-	// when switching providers (e.g., GloVe 50d → ONNX 384d).
-	embedderDims := idx.embedder.Dimensions()
-	if embedderDims > 0 && embedderDims != dims {
-		idx.logger.Info("vector index dims mismatch, will re-embed",
-			zap.Int("cached_dims", dims), zap.Int("embedder_dims", embedderDims))
-		return nil // skip import, buildSearchIndex will re-embed
-	}
-
-	vec := search.NewVector(dims)
-	if err := vec.LoadFrom(bytes.NewReader(data)); err != nil {
-		return fmt.Errorf("import vector index: %w", err)
-	}
-	vec.SetCount(count)
-
-	sw := idx.swappable()
-	sw.Swap(search.NewHybrid(sw.Inner(), vec, idx.embedder))
-	idx.logger.Info("restored vector index from cache",
-		zap.Int("vectors", count), zap.Int("dims", dims))
-	return nil
 }
 
 // prefixPath prepends the repoPrefix to a relative path when in multi-repo mode.
@@ -2817,6 +2489,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	//     state.
 	var diskTarget graph.Store
 	var inMemShadow *graph.Graph
+	var deferredVectorPlan *preparedVectorPlan
 	var shadowEstimate graph.RepoMemoryEstimate
 	var shadowEstimateReady bool
 	bl, blOK := idx.graph.(graph.BulkLoader)
@@ -2988,14 +2661,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// and edge through as it is parsed.
 		idx.indexCount.Add(1)
 		diskTarget = idx.graph
-		inMemShadow = graph.New()
+		inMemShadow = idx.newStructuralIntegrityShadow(diskTarget, graph.StructuralPathShadowCold)
 		idx.graph = inMemShadow
-		// Capture the disk store as the vector sink: buildSearchIndex runs
-		// while idx.graph is the shadow (no VectorSearcher), so without this
-		// the embedded vectors never land on disk. The `vectors` table has no
-		// FK to `nodes`, so upserting before FlushBulk persists the nodes is
-		// safe. Cleared when idx.graph is restored below.
-		idx.bulkVectorSink, _ = diskTarget.(graph.VectorSearcher)
 		// Same capture for the content index: the per-file content stream
 		// must reach content_fts on disk while idx.graph is the shadow.
 		idx.contentSink, _ = diskTarget.(graph.ContentSearcher)
@@ -3014,8 +2681,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		}
 		defer func() {
 			if retErr != nil {
+				if deferredVectorPlan != nil {
+					deferredVectorPlan.Release()
+					deferredVectorPlan = nil
+				}
 				idx.graph = diskTarget
-				idx.bulkVectorSink = nil
 				idx.contentSink = nil
 				idx.contractStateSink = nil
 				if idx.resolver != nil {
@@ -3170,16 +2840,25 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 			reporter.Report("persisting bulk graph", 1, 1)
 			idx.graph = diskTarget
-			idx.bulkVectorSink = nil
 			idx.contentSink = nil
 			idx.contractStateSink = nil
 			// Mirror of the SetGraph(inMemShadow) above: the resolver
-			// must follow the graph pointer back to the disk store, or
-			// every post-index per-file resolve (the watcher save path,
-			// incremental reindex) reads the drained — now empty —
-			// shadow and silently resolves nothing.
+			// must follow the graph pointer back to the disk store before vector
+			// ownership validation and every later incremental operation.
 			if idx.resolver != nil {
 				idx.resolver.SetGraph(diskTarget)
+			}
+			if deferredVectorPlan != nil {
+				if retErr == nil {
+					plan := deferredVectorPlan
+					deferredVectorPlan = nil
+					if err := idx.installVectorPlan(ctx, diskTarget, plan); err != nil {
+						retErr = fmt.Errorf("indexer: publish vector corpus after shadow drain: %w", err)
+					}
+				} else {
+					deferredVectorPlan.Release()
+					deferredVectorPlan = nil
+				}
 			}
 		}()
 	} else if diskTarget == nil && idx.graph.NodeCount() == 0 && idx.graph.EdgeCount() == 0 {
@@ -3831,7 +3510,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			zap.Int("chunk_size", chunkSize))
 		for chunkStart := 0; chunkStart < len(files); chunkStart += chunkSize {
 			chunkEnd := min(chunkStart+chunkSize, len(files))
-			chunkShadow := graph.New()
+			chunkShadow := idx.newStructuralIntegrityShadow(streamingDisk, graph.StructuralPathShadowStreaming)
 			idx.graph = chunkShadow
 			parseChunk(files[chunkStart:chunkEnd])
 			if err := ctx.Err(); err != nil {
@@ -4126,8 +3805,20 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	}
 
 	reporter.Report("building search index", 0, 0)
-	// Build search index.
-	idx.buildSearchIndex()
+	// Prepare embeddings exactly once. Cold-shadow publication is deferred until
+	// the graph has drained and ownership validation can see durable nodes;
+	// direct and streaming paths already point at the durable store here.
+	vectorPlan, vectorErr := idx.prepareSearchIndexForPublication(ctx)
+	if vectorErr != nil {
+		return nil, vectorErr
+	}
+	if shadowTaken {
+		deferredVectorPlan = vectorPlan
+	} else if vectorPlan != nil {
+		if err := idx.installVectorPlan(ctx, idx.graph, vectorPlan); err != nil {
+			return nil, fmt.Errorf("indexer: publish vector corpus: %w", err)
+		}
+	}
 
 	if !idx.deferResolve.Load() {
 		// Contracts were already extracted inline during parse (per file,
@@ -4184,7 +3875,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// Framework dynamic-dispatch synthesis — runs once the call
 			// graph and interface inference are final. Skipped under
 			// deferGlobalPasses; the batch caller folds it into
-			// RunGlobalGraphPasses.
+			// shared multi-repository global-pass pipeline.
 			reporter.Report("framework dispatch synthesis", 0, 0)
 			if rep := resolver.RunFrameworkSynthesizers(idx.graph); rep.Total > 0 {
 				idx.logger.Info("framework dispatch calls synthesized",
@@ -4218,40 +3909,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// graph state.
 			reach.InvalidateIndex()
 		}
-	}
-
-	// Auto-upgrade to Bleve if above threshold. Run in the background
-	// so the foreground IndexCtx returns immediately — populating
-	// Bleve with 50k+ symbols takes 30-60s and adding that to the
-	// initial-index latency was the dominant tail. Searches against
-	// idx.search keep hitting the in-memory backend until the swap
-	// completes; nothing observes a half-built Bleve.
-	//
-	// upgradeOnce gates the spawn so multi-repo warmup, which calls
-	// IndexCtx once per tracked repo, doesn't launch one upgrade
-	// goroutine per post-threshold repo. One per indexer lifetime.
-	//
-	// Skip the upgrade when the active search backend is the
-	// SymbolSearcher adapter: the disk store's native FTS is
-	// already serving search at engine-native latency, and
-	// spawning a parallel Bleve build would (a) waste ~100MB heap
-	// re-indexing the same corpus and (b) silently swap the
-	// adapter out for Bleve on completion — defeating the whole
-	// FTS path. The Swappable's current backend tells us which
-	// branch we're on.
-	if !isSymbolSearcherBackend(idx.search) && idx.search.Count() >= search.AutoThreshold {
-		idx.upgradeOnce.Do(func() {
-			reporter.Report("scheduling search backend upgrade", 0, 0)
-			idx.upgradeSpawnedMu.Lock()
-			idx.upgradeSpawned++
-			idx.upgradeSpawnedMu.Unlock()
-			// Snapshot upfront so the background goroutine doesn't
-			// read Node.Meta concurrently with subsequent Index
-			// calls' Meta-writing passes (reach.BuildIndex,
-			// ResolveTemporalCalls, ...).
-			snapshot := idx.snapshotBleveEntries()
-			go idx.upgradeSearchToBleve(snapshot)
-		})
 	}
 
 	// Persist the parser quarantine so a file that crashed the parser
@@ -4323,13 +3980,31 @@ func (idx *Indexer) repoNodeEdgeCount() (int, int) {
 // incremental pipeline after ChangedSinceMtimes has already proved the tree
 // unchanged. It preserves the one necessary side effect for non-persistent
 // search backends without repeating filesystem discovery.
-func (idx *Indexer) cleanCensusResult(detected int, started time.Time) *IndexResult {
+func (idx *Indexer) cleanCensusResult(ctx context.Context, detected int, started time.Time) (*IndexResult, error) {
 	if idx.totalDetected == 0 {
 		idx.totalDetected = detected
 	}
-	if !isSymbolSearcherBackend(idx.search) {
-		idx.buildSearchIndex()
+
+	// A populated durable corpus can be republished from cheap statistics with
+	// no paid embedding pass. An empty corpus (including the v10 migration that
+	// deliberately discarded legacy vectors) triggers one vector-only rebuild
+	// from the already-persisted graph.
+	restored, restoreErr := idx.restoreDurableVectorBackend(ctx, idx.graph)
+	if restoreErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		idx.lastVectorBuildErr = restoreErr
+		idx.logger.Warn("restore durable vector corpus failed; rebuilding", zap.Error(restoreErr))
 	}
+	if restored {
+		idx.rebuildTextSearchIndex()
+	} else if !isSymbolSearcherBackend(idx.search) || idx.embedder != nil {
+		if err := idx.buildSearchIndexCtx(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	nodes, edges := idx.repoNodeEdgeCount()
 	fileCount := idx.trackedFileCount()
 	if fileCount == 0 {
@@ -4342,7 +4017,7 @@ func (idx *Indexer) cleanCensusResult(detected int, started time.Time) *IndexRes
 		DurationMs: time.Since(started).Milliseconds(),
 	}
 	idx.warnIfEdgeSanityViolated(result)
-	return result
+	return result, nil
 }
 
 // warnIfEdgeSanityViolated logs a loud warning when an index pass
@@ -5281,11 +4956,10 @@ func (idx *Indexer) restubIncomingRefs(graphPath string) {
 // embeddingDimsOrDefault returns the embedder's reported vector width,
 // falling back to a neutral placeholder only when the provider cannot
 // state its width yet (Dimensions() == 0, the APIProvider-before-first-
-// call case). The fallback is never persisted: buildSearchIndex and
-// ImportVectorIndex both overwrite it with the true width taken from a
-// real vector / the cached header. Kept as a named helper so the
-// vector-dimension default has one definition instead of a scattered
-// magic number.
+// call case). The fallback is never persisted: buildSearchIndex
+// overwrites it with the true width taken from a real vector. Kept as a
+// named helper so the vector-dimension default has one definition
+// instead of a scattered magic number.
 func embeddingDimsOrDefault(p embedding.Provider) int {
 	if p == nil {
 		return 0
@@ -5466,10 +5140,14 @@ type embedChunkBatch struct {
 // embedFn already layers the deadline-halving retry on top of each
 // batch.
 func (idx *Indexer) embedAllChunks(
+	parent context.Context,
 	texts []string,
 	batchSize int,
 	embedFn func(ctx context.Context, items []string) ([][]float32, error),
 ) ([][]float32, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	if len(texts) == 0 {
 		return nil, nil
 	}
@@ -5507,10 +5185,13 @@ func (idx *Indexer) embedAllChunks(
 	}
 
 	if !apiBacked || concurrency <= 1 {
-		// Serial path — unchanged behaviour for in-process embedders.
-		ctx := context.Background()
+		// Serial path — unchanged behaviour for in-process embedders, now
+		// honoring cancellation from the owning index operation.
 		for _, b := range batches {
-			vecs, err := embedFn(ctx, b.texts)
+			if err := parent.Err(); err != nil {
+				return nil, err
+			}
+			vecs, err := embedFn(parent, b.texts)
 			if err != nil {
 				return nil, err
 			}
@@ -5523,7 +5204,7 @@ func (idx *Indexer) embedAllChunks(
 	// A cancellable group context means the first failure stops every
 	// in-flight worker; the indexer's existing per-batch retry still
 	// runs underneath embedFn.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
 	jobs := make(chan embedChunkBatch)
@@ -5574,6 +5255,12 @@ func (idx *Indexer) embedAllChunks(
 	close(jobs)
 	wg.Wait()
 
+	// A provider is expected to honor ctx, but cancellation still belongs to
+	// the owning index operation even if a provider returns successfully after
+	// its context was cancelled. Never publish a partial/late vector batch.
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
 	if firstErr != nil {
 		return nil, firstErr
 	}
@@ -5594,316 +5281,14 @@ func flattenEmbedResults(results [][][]float32) [][]float32 {
 	return out
 }
 
-// buildSearchIndex populates the search backend from the current graph.
-// When an embedder is set, also builds a vector index and wraps both
-// in a HybridBackend with RRF fusion.
-//
-// In multi-repo mode the search backend is shared across every repo
-// (Indexer.search is wired to MultiIndexer.search at construction).
-// Re-reading every graph node would mean each freshly-tracked repo pays an
-// O(workspace) re-index pass over all
-// previously-tracked repos' nodes — quadratic in repo count and the
-// dominant cost of warming up a 260-repo workspace. So when this
-// indexer carries a non-empty repoPrefix we walk only that repo's
-// byRepo bucket; the other repos' entries are already in the shared
-// backend from when they were tracked. Single-repo mode uses the store's
-// non-content projection with an empty repo namespace.
+// buildSearchIndex is the compatibility entry point for direct and focused
+// callers. Full indexing uses the context-aware preparation/publication split
+// so a cold shadow can defer publication until its durable drain succeeds.
 func (idx *Indexer) buildSearchIndex() {
-	// Start every build from a clean vector-build error: the degraded vector
-	// paths below set it, and a successful build (or a benign skip / no embedder)
-	// leaves it nil, so LastVectorBuildError always reflects the current pass.
-	idx.lastVectorBuildErr = nil
-
-	// Install the learned sub-word boundary table before populating an
-	// in-process BM25 backend. Capability detection happens before graph
-	// enumeration, so native SQLite FTS and Bleve do no boundary census.
-	search.BuildAndInstallNgramBoundaries(idx.search, idx.graph)
-
-	nativeText := isSymbolSearcherBackend(idx.search)
-	buildVectors := idx.embedder != nil && !idx.skipVectorBuild
-	if nativeText && !buildVectors {
-		// SQLite maintains symbol_fts in the graph mutation path. Backend.Add
-		// only adjusts a process-local approximate counter, so walking and
-		// decoding every node here cannot add searchable data.
-		return
+	if err := idx.buildSearchIndexCtx(context.Background()); err != nil {
+		idx.lastVectorBuildErr = err
+		idx.logger.Warn("vector index build canceled", zap.Error(err))
 	}
-
-	// Code-only enumeration: content (data_class=content) sections live in
-	// the content index, never the symbol search or the vector store, so the
-	// FTS loop below and collectEmbedTexts both skip them anyway. Fetching
-	// the non-content set up front means a content-heavy repo's hundreds of
-	// thousands of sections never enter memory here (the disk backend filters
-	// them in SQL), instead of being materialised only to be skipped.
-	nodes := graph.RepoCodeNodes(idx.graph, idx.repoPrefix)
-
-	// Build the text index only for in-process backends. Native SQLite FTS is
-	// already updated transactionally by graph mutations; its Add method is a
-	// counting compatibility shim rather than an indexing operation.
-	if !nativeText {
-		for _, n := range nodes {
-			if !idx.shouldIndexForSearch(n) {
-				continue
-			}
-			idx.search.Add(n.ID, searchIndexFields(n, idx.projectName)...)
-		}
-	}
-
-	// With no requested vector build, text indexing is complete. This covers
-	// both a missing embedder and snapshot warmup's skipVectorBuild path.
-	if !buildVectors {
-		return
-	}
-
-	// Provisional dimensionality: trust the embedder's own report.
-	// A provider that can't state its width yet (an APIProvider before
-	// its first call returns 0) gets a neutral placeholder — the value
-	// is overwritten below from the first real vector, so it never
-	// reaches the persisted index. The old hard-coded 300 was wrong for
-	// the default static GloVe provider (50d) and misrepresented the
-	// index width in the interim; deriving from Dimensions() keeps it
-	// honest for every provider.
-	dims := embeddingDimsOrDefault(idx.embedder)
-
-	// Collect texts and IDs for batch embedding. Nodes matching
-	// Semantic.SkipEmbed (e.g. CSS custom properties, terraform blocks,
-	// YAML/TOML/shell config vars) are kept in the text index but
-	// excluded from the vector index — embedding them is pure cost
-	// with no semantic payoff and on big monorepos dominates RAM.
-	//
-	// A symbol whose source span exceeds the chunk threshold is split
-	// into AST windows: each window is embedded as its own vector under
-	// a synthetic ID ("<symbolID>#chunkK"), and chunkMap records the
-	// chunk → parent mapping so query-time de-chunking maps a chunk hit
-	// back to the symbol. A small symbol stays a single metadata-only
-	// vector under its own ID. chunkMap is empty when nothing was split.
-	texts, ids, chunkMap, skipped := idx.collectEmbedTexts(nodes)
-	if skipped > 0 {
-		idx.logger.Info("skipped embedding for low-value nodes",
-			zap.Int("count", skipped),
-			zap.Int("embedded", len(texts)))
-	}
-
-	if len(texts) == 0 {
-		return
-	}
-
-	// Embedding scaling guards. Hard-cap the vector index for repos
-	// big enough that the cost no longer pays off — BM25 alone is a
-	// fine fallback and an OOM during initial index is much worse than
-	// missing the semantic boost. Chunk the EmbedBatch calls so any
-	// single API request stays small (matters for hosted embedders
-	// with per-request token limits).
-	//
-	// embedChunkTimeout is generous because ONNX inference (Hugot) has
-	// long tail latency: a 60s budget made one in ~30 chunks miss its
-	// deadline, which under the old fail-fast policy threw away every
-	// already-embedded chunk and silently degraded to BM25 with no
-	// signal to the user. 5 minutes covers observed worst-case spikes
-	// without changing steady-state behaviour. On a true hang the
-	// caller can still cancel the parent indexing call.
-	const (
-		defaultEmbedMaxSymbols = 100_000
-		embedChunkSize         = 500
-		embedChunkTimeout      = 5 * time.Minute
-	)
-
-	// The cap is over the embeddable-text count, which with AST
-	// sub-chunking can exceed the symbol count. embedding.max_symbols
-	// overrides the built-in default for users with memory headroom.
-	embedMaxSymbols := defaultEmbedMaxSymbols
-	if idx.embedMaxSymbols > 0 {
-		embedMaxSymbols = idx.embedMaxSymbols
-	}
-	// Env override wins over both the default and the config-wired cap —
-	// a reliable knob independent of the config plumbing. Lets an operator
-	// lift the vector-index size guard for a large repo without editing
-	// (or debugging) the layered config.
-	if env := os.Getenv("GORTEX_EMBEDDINGS_MAX_SYMBOLS"); env != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(env)); err == nil && n > 0 {
-			embedMaxSymbols = n
-		}
-	}
-	if len(texts) > embedMaxSymbols {
-		idx.logger.Warn("vector index disabled — embedding text count exceeds threshold",
-			zap.Int("texts", len(texts)),
-			zap.Int("threshold", embedMaxSymbols),
-			zap.String("hint", "BM25 text search remains active; raise embedding.max_symbols if you have memory headroom"))
-		idx.lastVectorBuildErr = fmt.Errorf("embedding text count %d exceeds threshold %d (raise embedding.max_symbols)", len(texts), embedMaxSymbols)
-		return
-	}
-
-	// embedWithRetry runs one chunk under ctx; on a context-deadline
-	// failure it splits the chunk in half and retries each half once.
-	// A single slow batch shouldn't throw away every already-embedded
-	// chunk and silently demote the backend to BM25. ctx is the group
-	// context, so once one chunk fails everywhere the in-flight retries
-	// here see the cancellation and stop too.
-	var embedWithRetry func(ctx context.Context, items []string) ([][]float32, error)
-	embedWithRetry = func(ctx context.Context, items []string) ([][]float32, error) {
-		chunkCtx, cancel := context.WithTimeout(ctx, embedChunkTimeout)
-		out, err := idx.embedder.EmbedBatch(chunkCtx, items)
-		cancel()
-		if err == nil {
-			return out, nil
-		}
-		// Only retry on deadline-style failures; auth/protocol errors
-		// won't get better with smaller batches. A cancellation from
-		// the group context (a sibling chunk already failed) is not a
-		// retry case either.
-		if ctx.Err() != nil || !errors.Is(err, context.DeadlineExceeded) || len(items) <= 1 {
-			return nil, err
-		}
-		idx.logger.Warn("embed chunk timed out, retrying with halved batch",
-			zap.Int("size", len(items)),
-			zap.Error(err))
-		mid := len(items) / 2
-		left, lerr := embedWithRetry(ctx, items[:mid])
-		if lerr != nil {
-			return nil, lerr
-		}
-		right, rerr := embedWithRetry(ctx, items[mid:])
-		if rerr != nil {
-			return nil, rerr
-		}
-		return append(left, right...), nil
-	}
-
-	// Embed every chunk. For an API-backed embedder the chunks are run
-	// through a bounded worker pool (a hosted round-trip dominates
-	// indexing time, so overlapping requests is a real win); local
-	// in-process backends serialise on an inference mutex, so they keep
-	// the simple serial path. Either way the abort-on-any-error
-	// contract holds — one chunk failure means no vector index ships.
-	vectors, err := idx.embedAllChunks(texts, embedChunkSize, embedWithRetry)
-	if err != nil {
-		// A partial vector index would mis-score later queries (some
-		// symbols semantically findable, others not) — bail to
-		// text-only search rather than ship an inconsistent hybrid
-		// backend.
-		idx.logger.Warn("vector index aborted on chunk failure", zap.Error(err))
-		idx.lastVectorBuildErr = fmt.Errorf("chunk embedding failed: %w", err)
-		return
-	}
-
-	// Detect actual dimensions from first vector.
-	if len(vectors) > 0 && len(vectors[0]) > 0 {
-		dims = len(vectors[0])
-	}
-
-	vecBackend := search.NewVector(dims)
-	// VectorSearcher capability bridging: if the underlying store
-	// has a native HNSW, install it as the in-process backend's
-	// delegate — Add becomes a no-op, Search forwards to the
-	// engine, and we don't allocate `dim × 4 × N` bytes of heap
-	// for a parallel in-process HNSW. The indexer still drives
-	// the writes (BulkUpsertEmbeddings below) so the engine
-	// index lands with the same corpus the in-process one would
-	// have built.
-	vecSearcher, _ := idx.graph.(graph.VectorSearcher)
-	if vecSearcher != nil {
-		vecBackend.SetDelegate(&vectorSearcherDelegate{s: vecSearcher})
-	}
-	// persistSink is where the embedded vectors are written to the backend
-	// so they survive a restart. Normally it is the active graph (a disk
-	// store). Under the bulk loader idx.graph is the in-memory shadow, which
-	// does not implement VectorSearcher; fall back to the disk store captured
-	// at the shadow swap (bulkVectorSink) so the vector index still reaches
-	// the `vectors` table instead of living only in the in-process HNSW and
-	// vanishing on the next restart (which would force a paid re-embed).
-	persistSink := vecSearcher
-	if persistSink == nil {
-		persistSink = idx.bulkVectorSink
-	}
-	var backendItems []graph.VectorItem
-	if persistSink != nil {
-		backendItems = make([]graph.VectorItem, 0, len(vectors))
-	}
-	// Add only well-formed vectors. A nil or wrong-width vector would poison
-	// the index — a mis-scored or panicking query — so drop it, count it, and
-	// keep a sample of offending node IDs for the log.
-	var droppedVectors int
-	var droppedSample []string
-	for i, vec := range vectors {
-		if len(vec) != dims {
-			droppedVectors++
-			if len(droppedSample) < 5 {
-				droppedSample = append(droppedSample, ids[i])
-			}
-			continue
-		}
-		vecBackend.Add(ids[i], vec)
-		if persistSink != nil {
-			backendItems = append(backendItems, graph.VectorItem{
-				NodeID: ids[i],
-				Vec:    vec,
-			})
-		}
-	}
-	// If every vector was invalid there is nothing to search on. Ship text-only
-	// rather than a silently empty vector index that mis-scores every query —
-	// the same all-or-nothing contract as the chunk-failure abort above.
-	if len(vectors) > 0 && vecBackend.Count() == 0 {
-		idx.logger.Warn("vector index aborted — all embeddings invalid",
-			zap.Int("dropped", droppedVectors),
-			zap.Int("dimensions", dims),
-			zap.Strings("sample_ids", droppedSample))
-		idx.lastVectorBuildErr = fmt.Errorf("all %d embedding vectors were invalid (want width %d)", droppedVectors, dims)
-		return
-	}
-	if persistSink != nil && len(backendItems) > 0 {
-		if err := persistSink.BulkUpsertEmbeddings(backendItems); err != nil {
-			idx.logger.Warn("indexer: backend vector bulk upsert failed",
-				zap.Error(err))
-		} else if err := persistSink.BuildVectorIndex(dims); err != nil {
-			idx.logger.Warn("indexer: backend vector index build failed",
-				zap.Error(err))
-		}
-	}
-	// Install the chunk → parent-symbol mapping so HybridBackend can
-	// de-chunk vector hits back to symbols at query time. Empty when no
-	// symbol was large enough to split.
-	if len(chunkMap) > 0 {
-		vecBackend.SetChunkMap(chunkMap)
-	}
-
-	// Wrap text + vector into hybrid backend, swapping it in atomically
-	// so any concurrent searches keep seeing a coherent backend.
-	//
-	// Unwrap any existing HybridBackend to its text side before
-	// re-wrapping. Without this, buildSearchIndex called again (e.g.
-	// once per tracked repo during daemon warmup) would stack a fresh
-	// Hybrid on top of the previous one — nested Hybrids retain all
-	// their stale vector indexes, ballooning live memory by an order
-	// of magnitude. The text backend (BM25 or Bleve) has already been
-	// updated with every node via idx.search.Add above; a single
-	// Hybrid wrapping it + the latest vecBackend is all we need.
-	sw := idx.swappable()
-	inner := sw.Inner()
-	if hyb, ok := inner.(*search.HybridBackend); ok {
-		inner = hyb.TextBackend()
-	}
-	sw.Swap(search.NewHybrid(inner, vecBackend, idx.embedder))
-	if droppedVectors > 0 {
-		idx.logger.Warn("indexer: dropped invalid embedding vectors",
-			zap.Int("dropped", droppedVectors),
-			zap.Int("dimensions", dims),
-			zap.Strings("sample_ids", droppedSample))
-	}
-	fields := []zap.Field{
-		zap.Int("vectors", vecBackend.Count()),
-		zap.Int("chunk_vectors", len(chunkMap)),
-		zap.Int("dimensions", dims),
-		zap.Int("dropped", droppedVectors),
-	}
-	// Surface the actual token spend of a paid embedding pass when the
-	// backend reports usage (API providers do; in-process ones don't).
-	// Without this the cost of an embedding run is invisible after the fact.
-	if acc, ok := idx.embedder.(interface{ TokensUsed() int64 }); ok {
-		if tokens := acc.TokensUsed(); tokens > 0 {
-			fields = append(fields, zap.Int64("embed_tokens", tokens))
-		}
-	}
-	idx.logger.Info("vector index built", fields...)
 }
 
 // dirIgnoreFiles are the per-directory ignore-file basenames honored by
@@ -6196,15 +5581,6 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 	return idx.coordinateRepositoryReindex(context.Background(), canonical)
 }
 
-// incrementalDiscoverPaths discovers and refreshes files beneath paths without
-// treating absent tracked files as deletions. Watcher directory-create scans
-// use this mode because their job is to recover creates that happened before a
-// nested watch was attached. A concurrent file-delete event must remain the
-// sole owner of eviction so it can publish the pre-delete symbol snapshot.
-func (idx *Indexer) incrementalDiscoverPaths(root string, paths []string) (*IndexResult, error) {
-	return idx.incrementalReindexPaths(root, paths, false)
-}
-
 // incrementalPathMode keeps forced point semantics private to the caller that
 // owns an explicit filesystem receipt. Reconcile, storm, and discovery callers
 // retain their historical mtime/Merkle filtering.
@@ -6297,17 +5673,6 @@ func (idx *Indexer) incrementalPathOwned(absPath string) bool {
 	}
 	_, ok = rows[graphPath]
 	return ok
-}
-
-func (idx *Indexer) incrementalReindexPaths(
-	root string,
-	paths []string,
-	detectDeletions bool,
-	markerBatches ...*reparsePendingEnrichmentBatch,
-) (*IndexResult, error) {
-	return idx.incrementalReindexPathsMode(root, paths, incrementalPathMode{
-		detectDeletions: detectDeletions,
-	}, markerBatches...)
 }
 
 func (idx *Indexer) incrementalReindexPathsMode(

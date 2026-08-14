@@ -11,8 +11,8 @@ import (
 
 // A store written BEFORE the write backstop existed can carry structurally
 // impossible edges. Read paths must heal them — never materialize the junk
-// into Go objects (pure GC pressure) — and the drop counter must move, the
-// engineer-facing signal that the on-disk store needs an audit/rebuild.
+// into Go objects (pure GC pressure) — and the store-scoped integrity signal
+// must move so operators know the on-disk store needs an audit/rebuild.
 func TestReadPathsHealStructurallyInvalidRows(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "heal.sqlite"))
 	require.NoError(t, err)
@@ -31,11 +31,12 @@ func TestReadPathsHealStructurallyInvalidRows(t *testing.T) {
   VALUES ('a/t.go::T', 'a/f.go::F#param:ctx', 'implements', 'a/t.go', 1, 1.0, 'EXTRACTED', 'lsp_dispatch', '', 0, NULL)`)
 	require.NoError(t, err)
 
-	before := StructuralReadDrops()
+	before := s.StructuralIntegritySnapshot(graph.StructuralIntegritySnapshotOptions{}).Totals.ReadSuppressed
 	out := s.GetOutEdges("a/t.go::T")
 	for _, e := range out {
 		assert.NotEqual(t, graph.EdgeImplements, e.Kind, "junk implements row must be healed on read")
 	}
 	require.Len(t, out, 1, "the legitimate call edge must survive the heal")
-	assert.Greater(t, StructuralReadDrops(), before, "healing must move the engineer-facing counter")
+	after := s.StructuralIntegritySnapshot(graph.StructuralIntegritySnapshotOptions{}).Totals.ReadSuppressed
+	assert.Greater(t, after, before, "healing must move the store-scoped integrity signal")
 }

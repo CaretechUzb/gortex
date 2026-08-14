@@ -514,7 +514,7 @@ type SymbolFTSItem struct {
 // expose engine-native full-text search over the graph's symbol
 // names. When the backing store implements it, the daemon's
 // search_symbols path routes through the backend FTS instead of
-// building a parallel in-process Bleve/BM25 index — saving ~100MB
+// building a parallel in-process BM25 index — saving ~100MB
 // of heap on a vscode-scale repo and putting the search latency in
 // the same address space as the rest of the graph.
 //
@@ -789,6 +789,7 @@ type VectorItem struct {
 // translate via `1 - distance` for cosine.
 type VectorHit struct {
 	NodeID   string
+	ParentID string
 	Distance float64
 }
 
@@ -845,6 +846,44 @@ type VectorSearcher interface {
 	BuildVectorIndex(dims int) error
 	SimilarTo(vec []float32, limit int) ([]VectorHit, error)
 	GetEmbeddings(ids []string) map[string][]float32
+}
+
+// VectorCorpusItem is one row in an atomically replaceable repository vector
+// corpus. ParentID is empty for an ordinary symbol vector and identifies the
+// owning symbol for a synthetic chunk vector.
+type VectorCorpusItem struct {
+	NodeID   string
+	ParentID string
+	Vec      []float32
+}
+
+// VectorCorpusStats describes the complete committed durable corpus for one
+// embedding dimension. ChunkCount counts rows with a non-empty ParentID. The
+// Repository fields are populated by replacement and repo-scoped discovery so
+// warm startup can distinguish "another repo has vectors" from "this repo's
+// migration-cleared corpus still needs rebuilding".
+type VectorCorpusStats struct {
+	VectorCount           int
+	ChunkCount            int
+	RepositoryVectorCount int
+	RepositoryChunkCount  int
+	Dims                  int
+}
+
+// AtomicVectorCorpusInstaller is an optional durable-store capability. A
+// replacement validates the complete input before mutation, swaps exactly one
+// repository's rows in one transaction, and returns complete post-commit stats
+// for dims across every repository in the store. An empty item slice is an
+// authoritative empty corpus and therefore removes stale rows for repoPrefix.
+//
+// VectorCorpusStats filters by dims when dims is positive. When dims is zero or
+// negative, an empty store returns zero stats, a single-dimension store returns
+// that resolved dimension, and a mixed-dimension store returns an error rather
+// than guessing which corpus a warm-start delegate should publish.
+type AtomicVectorCorpusInstaller interface {
+	ReplaceVectorCorpus(ctx context.Context, repoPrefix string, dims int, items []VectorCorpusItem) (VectorCorpusStats, error)
+	VectorCorpusStats(ctx context.Context, dims int) (VectorCorpusStats, error)
+	VectorCorpusStatsForRepo(ctx context.Context, repoPrefix string, dims int) (VectorCorpusStats, error)
 }
 
 // PageRankOpts tunes the PageRank computation. Zero values request

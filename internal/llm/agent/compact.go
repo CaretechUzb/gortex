@@ -51,14 +51,6 @@ type RollingCompactor struct {
 
 	summarizer llm.Provider
 
-	// sync forces synchronous-but-throttled compaction. When the agent's
-	// Run deadline is too short to safely outlive a background summarizer
-	// round (so the derived ctx would routinely cancel summaries mid-flight),
-	// the compactor summarizes inline on the compaction turn instead of
-	// spawning a goroutine. The agent loop already has a bounded step count,
-	// so a synchronous summarize is bounded.
-	sync bool
-
 	// pending guards the in-flight / completed async summary state.
 	pendingMu sync.Mutex
 	inflight  bool   // a background summarizer goroutine is running
@@ -102,18 +94,6 @@ type AgentOption func(*Agent)
 // to its un-compacted behaviour.
 func WithCompactor(c *RollingCompactor) AgentOption {
 	return func(a *Agent) { a.compactor = c }
-}
-
-// WithSyncCompaction is a test/throttling seam that forces synchronous
-// (inline) summarization. Used when the run deadline is too short for the
-// async path. It is exposed as an option so callers that already know their
-// per-call deadline is tight can opt in without reflection.
-func WithSyncCompaction() AgentOption {
-	return func(a *Agent) {
-		if a.compactor != nil {
-			a.compactor.sync = true
-		}
-	}
 }
 
 // enabled reports whether the compactor can actually compact (it has a
@@ -209,9 +189,8 @@ func estimateConvTokens(conv []llm.Message, lastUsage llm.TokenUsage) int {
 //     site checks summCtx.Err()==nil before applying.
 //   - The summarizer's own token usage is attributed: it is folded into the
 //     passed *usage under mu, so background spend is never unaccounted.
-//   - When sync==true (deadline too short for the async path) the summarize
-//     runs inline; otherwise a single background goroutine is spawned and the
-//     result is spliced on the next turn that finds it ready.
+//   - A single background goroutine is spawned; its result is spliced on the
+//     next turn that finds it ready.
 func (c *RollingCompactor) maybeCompact(runCtx context.Context, conv []llm.Message, sizeTokens int, usage *llm.TokenUsage, mu *sync.Mutex) (compacted []llm.Message, didCompact bool) {
 	if !c.enabled() {
 		return conv, false
@@ -227,28 +206,13 @@ func (c *RollingCompactor) maybeCompact(runCtx context.Context, conv []llm.Messa
 		return conv, false
 	}
 
-	frozen, compress, active := partitionZones(conv, c.ActiveRounds)
+	_, compress, _ := partitionZones(conv, c.ActiveRounds)
 	if countRounds(compress) < 2 {
 		return conv, false // nothing eligible to fold yet
 	}
 
-	// Synchronous path: summarize inline and splice now.
-	if c.sync {
-		summCtx, cancel := context.WithCancel(runCtx)
-		defer cancel()
-		summary, u, err := c.summarizeZone(summCtx, compress)
-		// Attribute the summarizer's spend regardless of splice outcome.
-		mu.Lock()
-		usage.Add(u)
-		mu.Unlock()
-		if err != nil || summCtx.Err() != nil || strings.TrimSpace(summary) == "" {
-			return conv, false
-		}
-		return c.spliceSummary(conv, frozen, active, summary), true
-	}
-
-	// Async path: spawn a single background summarizer. The next turn that
-	// finds the result ready splices it (above).
+	// Spawn a single background summarizer. The next turn that finds the result
+	// ready splices it (above).
 	c.spawnSummarize(runCtx, compress, usage, mu)
 	return conv, false
 }

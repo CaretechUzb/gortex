@@ -135,7 +135,7 @@ func BuildNgramBoundaries(g graph.Reader) *NgramTable {
 // tokenizer's split decisions become data-driven. The production
 // backend is a Swappable wrapping either a HybridBackend (text+vector)
 // or a bare BM25Backend; this unwraps both. Backends with no BM25 layer
-// (Bleve, SymbolSearcher) do not run the sparse-ngram stage, so there
+// (SymbolSearcher) do not run the sparse-ngram stage, so there
 // is nothing to install and the call is a harmless no-op returning
 // false.
 //
@@ -147,6 +147,11 @@ func BuildNgramBoundaries(g graph.Reader) *NgramTable {
 // them while the gate is on — callers re-install only as part of a
 // fresh (re)index, never against a live, already-populated index.
 func InstallNgramBoundaries(backend Backend, table NgramBoundaries) bool {
+	if swappable, ok := backend.(*Swappable); ok {
+		inner, release := swappable.AcquireBackend()
+		defer release()
+		return InstallNgramBoundaries(inner, table)
+	}
 	bm := bm25Of(backend)
 	if bm == nil {
 		return false
@@ -157,9 +162,14 @@ func InstallNgramBoundaries(backend Backend, table NgramBoundaries) bool {
 
 // BuildAndInstallNgramBoundaries mines and installs a boundary table only
 // when backend actually contains a BM25 layer. Capability detection must
-// precede BuildNgramBoundaries: native SQLite FTS and Bleve never consume the
+// precede BuildNgramBoundaries: the native SQLite FTS never consumes the
 // table, and walking the whole graph for them is pure allocation and I/O.
 func BuildAndInstallNgramBoundaries(backend Backend, g graph.Reader) bool {
+	if swappable, ok := backend.(*Swappable); ok {
+		inner, release := swappable.AcquireBackend()
+		defer release()
+		return BuildAndInstallNgramBoundaries(inner, g)
+	}
 	bm := bm25Of(backend)
 	if bm == nil {
 		return false
@@ -168,16 +178,14 @@ func BuildAndInstallNgramBoundaries(backend Backend, g graph.Reader) bool {
 	return true
 }
 
-// bm25Of unwraps a backend down to its *BM25Backend, or returns nil
-// when the backend has no BM25 layer. Mirrors the unwrap chain the
-// engine uses for the bundle fast path: Swappable → HybridBackend →
-// BM25Backend.
+// bm25Of unwraps a non-swappable backend down to its *BM25Backend, or
+// returns nil when the backend has no BM25 layer. Swappable callers are
+// handled by the public installation functions so the returned pointer is
+// consumed while its AcquireBackend pin remains held.
 func bm25Of(backend Backend) *BM25Backend {
 	switch b := backend.(type) {
 	case *BM25Backend:
 		return b
-	case *Swappable:
-		return bm25Of(b.Inner())
 	case *HybridBackend:
 		return bm25Of(b.TextBackend())
 	default:

@@ -326,7 +326,7 @@ func (s *Store) RepoEdgesByKinds(repoPrefixes []string, kinds []graph.EdgeKind) 
 	var out []graph.RepoEdgeRow
 	for rows.Next() {
 		var repoPrefix string
-		edge, err := scanEdgeCursor(repoPrefixedEdgeScanner{scanner: rows, repo: &repoPrefix})
+		edge, err := s.scanEdgeCursor(repoPrefixedEdgeScanner{scanner: rows, repo: &repoPrefix})
 		if err != nil {
 			panicOnFatal(err)
 			return out

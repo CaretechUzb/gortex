@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser"
 )
 
 // runGoExtract is a small harness used by the function-shape tests
@@ -39,8 +40,8 @@ func runGoExtract(t *testing.T, src string) *extractedFixture {
 func runGoExtractWithEnvHelpers(t *testing.T, src string, envHelpers []string) *extractedFixture {
 	t.Helper()
 	ext := NewGoExtractor()
-	ext.SetEnvHelperNames(envHelpers)
-	result, err := ext.Extract("pkg/foo.go", []byte(src))
+	opts := parser.NewExtractionOptions(envHelpers)
+	result, err := ext.ExtractWithOptions("pkg/foo.go", []byte(src), opts)
 	if err != nil {
 		t.Fatalf("extract: %v", err)
 	}

@@ -65,10 +65,6 @@ func New(signals []Signal, weights map[string]float64) *Pipeline {
 // NewDefault is shorthand for New(DefaultSignals(), DefaultWeights()).
 func NewDefault() *Pipeline { return New(DefaultSignals(), DefaultWeights()) }
 
-// Signals returns the signal list. Order is stable but not
-// load-bearing — scores are computed independently per signal.
-func (p *Pipeline) Signals() []Signal { return p.signals }
-
 // Weights returns a copy of the current weight map.
 func (p *Pipeline) Weights() map[string]float64 {
 	out := make(map[string]float64, len(p.weights))
@@ -248,16 +244,6 @@ func sameSliceHeader(a, b []*Candidate) bool {
 		return false
 	}
 	return &a[0] == &b[0]
-}
-
-// Nodes is a convenience that unwraps a result slice into the
-// underlying graph nodes in score order.
-func Nodes(cands []*Candidate) []*graph.Node {
-	out := make([]*graph.Node, 0, len(cands))
-	for _, c := range cands {
-		out = append(out, c.Node)
-	}
-	return out
 }
 
 // DefaultSignals returns the canonical signal lineup in stable order.

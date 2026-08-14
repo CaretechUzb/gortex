@@ -1167,13 +1167,9 @@ func (mi *MultiIndexer) reExportsFor(src, srcPath string) []reExportEdge {
 	return out
 }
 
-// followReExportChain returns the set of concrete file paths reachable
-// from startFile by following re-exports of `name` — startFile itself
-// plus every module a transparent `export *` / `export { name }`
-// (TypeScript) or `pub use` (Rust) chain forwards through, up to
-// maxReExportDepth. A symbol's real definition is in one of the
-// returned files, so a caller matching an import target against graph
-// nodes resolves through the barrel / re-exporting module.
+// reExportChainResult records concrete files and symbol names reached while
+// following TypeScript or Rust re-exports, plus whether ambiguity made the
+// chain unsafe to use for resolution.
 type reExportChainResult struct {
 	files  map[string]bool
 	names  map[string]map[string]bool
@@ -1188,10 +1184,6 @@ func addReExportChainTarget(result *reExportChainResult, file, name string) {
 		}
 		result.names[candidate][name] = true
 	}
-}
-
-func (mi *MultiIndexer) followReExportChain(startFile, name string, srcCache map[string][]byte) map[string]bool {
-	return mi.followReExportChainDetailed(startFile, name, srcCache).files
 }
 
 func (mi *MultiIndexer) followReExportChainChecked(startFile, name string, srcCache map[string][]byte) (map[string]bool, bool) {

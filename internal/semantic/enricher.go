@@ -24,19 +24,6 @@ func RefuteEdge(g graph.Store, e *graph.Edge) bool {
 	return g.RemoveEdge(e.From, e.To, e.Kind)
 }
 
-// PersistEdge round-trips an in-place edge mutation (ConfirmEdge, an
-// Origin promotion, a Meta stamp) through the backend's edge-attribute
-// write path. On the in-memory backend edge reads hand back the live
-// *Edge pointer, so the mutation is already durable and this is a
-// no-op. Disk backends return detached row copies — without this
-// round-trip every enrichment-pass promotion silently evaporates and
-// the read path keeps serving the stale heuristic tier.
-func PersistEdge(g graph.Store, e *graph.Edge) {
-	if w, ok := g.(graph.EdgePersister); ok {
-		w.PersistEdgeAttributes(e)
-	}
-}
-
 // AddSemanticEdge adds a new edge discovered by semantic analysis. Origin is
 // tagged LSP-grade (see ConfirmEdge).
 func AddSemanticEdge(g graph.Store, from, to string, kind graph.EdgeKind, filePath string, line int, provider string) *graph.Edge {
@@ -90,17 +77,6 @@ func FindMatchingEdge(g graph.Store, from, to string, kind graph.EdgeKind) *grap
 	edges := g.GetOutEdges(from)
 	for _, e := range edges {
 		if e.To == to && e.Kind == kind {
-			return e
-		}
-	}
-	return nil
-}
-
-// FindEdgeByTarget searches for an edge from a node to a target with any kind.
-func FindEdgeByTarget(g graph.Store, from, to string) *graph.Edge {
-	edges := g.GetOutEdges(from)
-	for _, e := range edges {
-		if e.To == to {
 			return e
 		}
 	}

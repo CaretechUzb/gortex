@@ -315,10 +315,6 @@ func (s *Server) constructOverlayLayer(files []daemon.OverlayFile) (*graph.Overl
 		if !ok {
 			continue
 		}
-		ext, _ := reg.GetByLanguage(lang)
-		if ext == nil {
-			continue
-		}
 		root := idx.RootPath()
 		relPath := graphPath
 		if idx.RepoPrefix() != "" {
@@ -328,7 +324,7 @@ func (s *Server) constructOverlayLayer(files []daemon.OverlayFile) (*graph.Overl
 				relPath = filepath.ToSlash(r)
 			}
 		}
-		result, err := ext.Extract(relPath, []byte(ov.Content))
+		result, err := idx.ExtractBuffer(lang, relPath, []byte(ov.Content))
 		if err != nil {
 			return nil, nil, fmt.Errorf("overlay parse %s: %w", ov.Path, err)
 		}

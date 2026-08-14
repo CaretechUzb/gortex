@@ -161,7 +161,7 @@ func TestSeedPendingEnrichAll_ResumesOnlyIncompleteRepos(t *testing.T) {
 	assert.False(t, complete.pendingEnrich.Load())
 
 	// The parallel enrich driver then dispatches only the re-armed repo.
-	mi.runDeferredEnrichParallel([]*Indexer{complete, incomplete})
+	mi.runDeferredEnrichPool([]*Indexer{complete, incomplete})
 	assert.Equal(t, []string{"incomplete"}, spy.invoked(),
 		"only the resumed repo should have its enrichment dispatched")
 }

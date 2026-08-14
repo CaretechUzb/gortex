@@ -1,7 +1,6 @@
 package indexer
 
 import (
-	"context"
 	"sort"
 	"testing"
 
@@ -11,6 +10,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/resolver"
 )
 
 func TestContentLinkEdgeBudget(t *testing.T) {
@@ -73,7 +73,8 @@ func TestContentLinkingAndGlobalPassAvoidAllNodesWithCrossRepoParity(t *testing.
 	require.Equal(t, want, contentLinkTargets(counting, graph.EdgeMotivates))
 
 	global := &allNodesCountingGraph{Graph: contentLinkFixture()}
-	newIndexer(global).RunGlobalGraphPasses(context.Background())
+	newIndexer(global).linkContentToCode()
+	resolver.DetectCrossRepoEdges(global)
 	require.Zero(t, global.allNodesCalls, "the automatic global cold path must never request a node snapshot")
 	require.Equal(t, want, contentLinkTargets(global, graph.EdgeMotivates))
 	require.Equal(t, []string{"repoB/pkg/b.go::SharedSymbol"},

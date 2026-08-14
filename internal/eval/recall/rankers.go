@@ -15,8 +15,9 @@ import (
 )
 
 // BM25Ranker adapts a plain search.Backend to the Ranker shape. Works
-// for either a raw BM25/Bleve backend or a HybridBackend's text side
-// extracted via HybridBackend.TextBackend().
+// for either a raw text backend — the in-process BM25 index the evals
+// build, or the store-native FTS adapter production wires up — or a
+// HybridBackend's text side extracted via HybridBackend.TextBackend().
 //
 // Note: Gortex's indexer tokenizes symbol names at ingest time
 // (Tokenize — camelCase-aware), but the query side (TokenizeQuery) does
@@ -41,7 +42,7 @@ func BM25Ranker(name string, backend search.Backend) Ranker {
 }
 
 // EngineRanker measures what a real MCP caller sees via
-// Engine.SearchSymbols — BM25/Bleve results + camelCase-friendly
+// Engine.SearchSymbols — text-backend results + camelCase-friendly
 // substring fallback. This is the recommended default for "bm25"-
 // style evaluation; it reflects production behaviour.
 func EngineRanker(name string, searchFn func(query string, limit int) []string) Ranker {

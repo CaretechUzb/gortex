@@ -68,7 +68,7 @@ func TestFollowReExportChain_DefaultAsSvelte(t *testing.T) {
 		"src/lib/index.ts":      []byte(`export { default as Button } from './Button.svelte';`),
 		"src/lib/Button.svelte": []byte(`<script lang="ts">export let label = "";</script>`),
 	}
-	reachable := mi.followReExportChain("src/lib/index.ts", "Button", srcCache)
+	reachable := mi.followReExportChainDetailed("src/lib/index.ts", "Button", srcCache).files
 	require.True(t, reachable["src/lib/Button.svelte"],
 		"the `default as` re-export must reach the .svelte component file")
 }
@@ -103,7 +103,7 @@ func TestFollowReExportChain_BarrelToTerminal(t *testing.T) {
 		"src/components/index.ts":  []byte(`export * from './Widget';`),
 		"src/components/Widget.ts": []byte(`export interface Widget { id: string }`),
 	}
-	reachable := mi.followReExportChain("src/index.ts", "Widget", srcCache)
+	reachable := mi.followReExportChainDetailed("src/index.ts", "Widget", srcCache).files
 	require.True(t, reachable["src/components/Widget.ts"],
 		"re-export chain must reach the terminal module")
 }
@@ -114,7 +114,7 @@ func TestFollowReExportChain_RenamedExport(t *testing.T) {
 		"pkg/index.ts": []byte(`export { Internal as Public } from './impl';`),
 		"pkg/impl.ts":  []byte(`export class Internal {}`),
 	}
-	reachable := mi.followReExportChain("pkg/index.ts", "Public", srcCache)
+	reachable := mi.followReExportChainDetailed("pkg/index.ts", "Public", srcCache).files
 	require.True(t, reachable["pkg/impl.ts"], "must follow the `as` rename to the source module")
 }
 
@@ -124,7 +124,7 @@ func TestFollowReExportChain_CircularTerminates(t *testing.T) {
 		"a.ts": []byte(`export * from './b';`),
 		"b.ts": []byte(`export * from './a';`),
 	}
-	reachable := mi.followReExportChain("a.ts", "X", srcCache)
+	reachable := mi.followReExportChainDetailed("a.ts", "X", srcCache).files
 	require.True(t, reachable["a.ts"])
 	require.True(t, reachable["b.ts"])
 }
@@ -304,7 +304,7 @@ func TestFollowReExportChain_WildcardMultiHop(t *testing.T) {
 		"pkg/terminal.ts":  []byte(`export class Engine {}`),
 		"pkg/unrelated.ts": []byte(`export class Engine {}`),
 	}
-	reachable := mi.followReExportChain("pkg/index.ts", "Engine", srcCache)
+	reachable := mi.followReExportChainDetailed("pkg/index.ts", "Engine", srcCache).files
 	require.True(t, reachable["pkg/terminal.ts"],
 		"multi-hop `export *` chain must reach the terminal module")
 	require.False(t, reachable["pkg/unrelated.ts"],
@@ -321,7 +321,7 @@ func TestFollowReExportChain_WildcardThroughNamed(t *testing.T) {
 		"src/theme.ts":  []byte(`export * from './tokens';`),
 		"src/tokens.ts": []byte(`export interface Theme { name: string }`),
 	}
-	reachable := mi.followReExportChain("src/index.ts", "Theme", srcCache)
+	reachable := mi.followReExportChainDetailed("src/index.ts", "Theme", srcCache).files
 	require.True(t, reachable["src/tokens.ts"],
 		"named → wildcard re-export chain must reach the definition module")
 }
@@ -365,7 +365,7 @@ func TestFollowReExportChain_RustPubUseMultiHop(t *testing.T) {
 		"crate/src/domain.rs":    []byte(`pub struct User { id: u64 }`),
 		"crate/src/unrelated.rs": []byte(`pub struct User;`),
 	}
-	reachable := mi.followReExportChain("crate/src/lib.rs", "User", srcCache)
+	reachable := mi.followReExportChainDetailed("crate/src/lib.rs", "User", srcCache).files
 	require.True(t, reachable["crate/src/domain.rs"],
 		"multi-hop `pub use` chain must reach the defining module")
 	require.False(t, reachable["crate/src/unrelated.rs"],
@@ -381,7 +381,7 @@ func TestFollowReExportChain_RustGlobAndModDir(t *testing.T) {
 		"src/shapes/mod.rs":    []byte(`pub use self::circle::Circle;`),
 		"src/shapes/circle.rs": []byte(`pub struct Circle { r: f64 }`),
 	}
-	reachable := mi.followReExportChain("src/lib.rs", "Circle", srcCache)
+	reachable := mi.followReExportChainDetailed("src/lib.rs", "Circle", srcCache).files
 	require.True(t, reachable["src/shapes/circle.rs"],
 		"glob re-export into a mod.rs directory module must reach the leaf")
 }
@@ -398,7 +398,7 @@ func TestFollowReExportChain_RustPrivateUseNotForwarded(t *testing.T) {
 		"src/api.rs":    []byte(`use crate::secret::Token;`),
 		"src/secret.rs": []byte(`pub struct Token;`),
 	}
-	reachable := mi.followReExportChain("src/lib.rs", "Token", srcCache)
+	reachable := mi.followReExportChainDetailed("src/lib.rs", "Token", srcCache).files
 	require.False(t, reachable["src/secret.rs"],
 		"a privately-`use`d symbol must not resolve through the re-export chain")
 }

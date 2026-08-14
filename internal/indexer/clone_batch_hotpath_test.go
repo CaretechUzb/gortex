@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -73,7 +74,7 @@ func TestDetectClonesBatchesEndpointReadsAndEdgeWrites(t *testing.T) {
 	base.AddBatch(nodes, nil)
 	store := &cloneIOCountingStore{Store: base}
 
-	stats := detectClonesAndEmitEdges(store, "", 0)
+	stats, _ := detectClonesAndEmitEdgesWithBaselineCtx(context.Background(), store, "", 0)
 	if stats.Items != 3 || stats.Pairs != 3 || stats.Edges != 6 {
 		t.Fatalf("clone stats = items:%d pairs:%d edges:%d, want 3/3/6", stats.Items, stats.Pairs, stats.Edges)
 	}

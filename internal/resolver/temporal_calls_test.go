@@ -257,6 +257,23 @@ func TestResolveTemporalCalls_EnvDefaultResolvesSpeculative(t *testing.T) {
 	assert.Equal(t, true, call.Meta[graph.MetaSpeculative], "env-default edge must be hidden-by-default")
 }
 
+func TestResolveTemporalCalls_AllowlistedEnvDefaultResolvesInferred(t *testing.T) {
+	b := newTemporalTestGraph()
+	b.addGoFunc("wf/workflow.go::OrderWorkflow", "OrderWorkflow", "wf/workflow.go", "svc")
+	call := b.addStubCallEnvDefault("wf/workflow.go::OrderWorkflow", "activity", "ChargeCard", "wf/workflow.go")
+	call.Meta["temporal_env_source"] = "allowlist"
+	activity := b.addGoFunc("wf/activity.go::ChargeCard", "ChargeCard", "wf/activity.go", "svc")
+	b.addGoFunc("wf/main.go::setupWorker", "setupWorker", "wf/main.go", "svc")
+	b.addGoRegister("wf/main.go::setupWorker", "activity", "ChargeCard", "wf/main.go")
+
+	resolved := ResolveTemporalCalls(b.g)
+	assert.Equal(t, 1, resolved)
+	assert.Equal(t, activity.ID, call.To)
+	assert.Equal(t, graph.OriginASTInferred, call.Origin)
+	assert.GreaterOrEqual(t, call.Confidence, 0.6)
+	assert.NotEqual(t, true, call.Meta[graph.MetaSpeculative], "allow-listed default must be visible")
+}
+
 func TestResolveTemporalCalls_EnvDefaultUnresolvedStaysPlaceholder(t *testing.T) {
 	b := newTemporalTestGraph()
 	b.addGoFunc("wf/workflow.go::WF", "WF", "wf/workflow.go", "svc")

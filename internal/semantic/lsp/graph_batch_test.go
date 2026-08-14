@@ -140,3 +140,43 @@ func TestLSPMutationBatchCollapsesWrites(t *testing.T) {
 			counting.reindexBatchCalls, counting.addBatchCalls, counting.persistEdgeBatchCalls)
 	}
 }
+
+func TestMatchCallableByFileLineUsesLiveGraphProjection(t *testing.T) {
+	const filePath = "callable.go"
+	function := &graph.Node{ID: "callable.go::Outer", Kind: graph.KindFunction, Name: "Outer", FilePath: filePath, StartLine: 10, EndLine: 20}
+	parameter := &graph.Node{ID: function.ID + "#param:value", Kind: graph.KindParam, Name: "value", FilePath: filePath, StartLine: 10}
+	closure := &graph.Node{ID: function.ID + "#closure@14", Kind: graph.KindClosure, Name: "closure@14", FilePath: filePath, StartLine: 14, EndLine: 16}
+	method := &graph.Node{ID: "callable.go::Widget.Run", Kind: graph.KindMethod, Name: "Run", FilePath: filePath, StartLine: 30, EndLine: 35}
+	variable := &graph.Node{ID: "callable.go::value", Kind: graph.KindVariable, Name: "value", FilePath: filePath, StartLine: 40, EndLine: 40}
+	view := newLSPGraphView([]*graph.Node{parameter, function, closure, method, variable}, nil)
+
+	for _, test := range []struct {
+		name string
+		line int
+		want string
+	}{
+		{name: "function wins over same-line parameter", line: 10, want: function.ID},
+		{name: "function body", line: 12, want: function.ID},
+		{name: "inner closure", line: 15, want: closure.ID},
+		{name: "method body", line: 32, want: method.ID},
+		{name: "two-line tolerance", line: 28, want: method.ID},
+		{name: "unrelated variable", line: 40, want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			matched := view.matchCallableByFileLine(filePath, test.line)
+			if test.want == "" {
+				if matched != nil {
+					t.Fatalf("expected no callable, got %s", matched.ID)
+				}
+				return
+			}
+			if matched == nil || matched.ID != test.want {
+				got := "<nil>"
+				if matched != nil {
+					got = matched.ID
+				}
+				t.Fatalf("expected %s, got %s", test.want, got)
+			}
+		})
+	}
+}

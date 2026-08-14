@@ -81,20 +81,108 @@ func csharpCallTypeArgCount(inv *sitter.Node) (int, bool) {
 	return n, n > 0
 }
 
-// csharpParamArity summarises a declaration's parameter list: the total
-// declared count, how many a caller MUST supply, and whether a `params`
-// array lifts the upper bound. The `this` parameter of an extension
-// method is counted like any other — the consumer knows whether the call
-// site writes extension form or static form and adjusts.
-//
-// ok=false when the list is absent OR when the grammar did not resolve
-// every entry into a `parameter` node. The vendored C# grammar flattens
-// a `params object[] rest` entry into loose `array_type` + `identifier`
-// siblings instead of a parameter, so a naive count would report one
-// parameter for a two-parameter method — and an overload narrowed on
-// that count would be excluded for argument counts it actually accepts.
-// A list we cannot read in full yields no evidence at all, which leaves
-// the method universally applicable rather than wrongly excluded.
+// csharpParamEntry is the normalized signature fact shared by arity stamps and
+// function-shape nodes. It represents both ordinary `parameter` nodes and the
+// vendored grammar's flattened `params` form.
+type csharpParamEntry struct {
+	name       string
+	typeRaw    string
+	variadic   bool
+	hasDefault bool
+	position   int
+	startLine  int
+	endLine    int
+}
+
+// csharpParamEntries normalizes the two parameter shapes emitted by the
+// vendored grammar. Ordinary entries are `parameter` nodes; a `params` entry
+// is flattened into the anonymous `params` token followed by loose type and
+// identifier siblings. Unknown shapes make complete=false so arity narrowing
+// remains fail-open, while recognized entries can still supply shape nodes.
+func csharpParamEntries(params *sitter.Node, src []byte) (entries []csharpParamEntry, complete bool) {
+	if params == nil {
+		return nil, false
+	}
+	complete = true
+	segment := make([]*sitter.Node, 0, 3)
+	declaredPos := 0
+	flush := func() {
+		if len(segment) == 0 {
+			return
+		}
+		entry, ok := csharpParamEntryFromSegment(segment, src)
+		if !ok {
+			complete = false
+		} else {
+			entry.position = declaredPos
+			entries = append(entries, entry)
+		}
+		declaredPos++
+		segment = segment[:0]
+	}
+	for i, nc := 0, int(params.ChildCount()); i < nc; i++ {
+		child := params.Child(i)
+		if child == nil {
+			continue
+		}
+		switch child.Type() {
+		case "(", ")":
+			flush()
+		case ",":
+			flush()
+		case "comment":
+			continue
+		default:
+			segment = append(segment, child)
+		}
+	}
+	flush()
+	return entries, complete
+}
+
+func csharpParamEntryFromSegment(segment []*sitter.Node, src []byte) (csharpParamEntry, bool) {
+	if len(segment) == 1 && segment[0].Type() == "parameter" {
+		param := segment[0]
+		name := param.ChildByFieldName("name")
+		typeNode := param.ChildByFieldName("type")
+		if name == nil || typeNode == nil {
+			return csharpParamEntry{}, false
+		}
+		return csharpParamEntry{
+			name:       name.Content(src),
+			typeRaw:    strings.TrimSpace(typeNode.Content(src)),
+			variadic:   csharpParamIsVariadic(param, src),
+			hasDefault: csharpParamHasDefault(param),
+			startLine:  int(param.StartPoint().Row) + 1,
+			endLine:    int(param.EndPoint().Row) + 1,
+		}, true
+	}
+
+	// tree-sitter-c-sharp v0.23.5 hides `_parameter_array`, leaving exactly
+	// `params`, the complete type subtree, and the bound identifier at list
+	// level. Keep this strict so a grammar bump fails safely instead of
+	// inventing arity from a partially understood segment.
+	if len(segment) != 3 || segment[0].Content(src) != "params" || segment[2].Type() != "identifier" {
+		return csharpParamEntry{}, false
+	}
+	typeRaw := strings.TrimSpace(segment[1].Content(src))
+	name := segment[2].Content(src)
+	if typeRaw == "" || name == "" {
+		return csharpParamEntry{}, false
+	}
+	return csharpParamEntry{
+		name:      name,
+		typeRaw:   typeRaw,
+		variadic:  true,
+		startLine: int(segment[0].StartPoint().Row) + 1,
+		endLine:   int(segment[2].EndPoint().Row) + 1,
+	}, true
+}
+
+// csharpParamArity summarises a declaration's total parameter count, required
+// count, and variadic upper bound. The extension receiver counts as an ordinary
+// declaration slot; the consumer adjusts for extension-call form. Unknown
+// grammar shapes return ok=false so overload narrowing remains fail-open.
 func csharpParamArity(decl *sitter.Node, src []byte) (count, required int, variadic bool, ok bool) {
 	if decl == nil {
 		return 0, 0, false, false
@@ -103,22 +191,18 @@ func csharpParamArity(decl *sitter.Node, src []byte) (count, required int, varia
 	if params == nil {
 		return 0, 0, false, false
 	}
-	for i, nc := 0, int(params.NamedChildCount()); i < nc; i++ {
-		p := params.NamedChild(i)
-		if p == nil || p.Type() == "comment" {
-			continue
-		}
-		if p.Type() != "parameter" {
-			return 0, 0, false, false
-		}
+	entries, complete := csharpParamEntries(params, src)
+	if !complete {
+		return 0, 0, false, false
+	}
+	for _, entry := range entries {
 		count++
-		isVariadic := csharpParamIsVariadic(p, src)
-		if isVariadic {
+		if entry.variadic {
 			variadic = true
 		}
 		// A defaulted parameter (`int retries = 3`) and a `params`
 		// array are both omissible at the call site.
-		if isVariadic || csharpParamHasDefault(p) {
+		if entry.variadic || entry.hasDefault {
 			continue
 		}
 		required++

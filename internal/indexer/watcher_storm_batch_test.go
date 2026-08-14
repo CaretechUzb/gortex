@@ -533,10 +533,6 @@ func TestMultiWatcherThreeChunksRunEveryCatchupTailOnce(t *testing.T) {
 	require.Len(t, provider.batches, 1)
 	require.Len(t, provider.batches[0], len(paths))
 
-	passes, resolved, dropped := idx.AffectedByCounts()
-	require.Equal(t, int64(1), passes)
-	require.Equal(t, int64(1), resolved)
-	require.Zero(t, dropped)
 	require.Equal(t, fnNodeID(t, g, "repo/target.go", "Target"), callTargetFrom(t, g, callerID),
 		"the one affected-by catch-up must preserve the caller binding")
 }

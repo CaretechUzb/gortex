@@ -186,6 +186,33 @@ namespace App {
 		"one argument fits only the two-parameter overload")
 }
 
+// This is the extractor-to-resolver regression for params arity. Without the
+// extractor stamp, the params overload has no applicability window and stays a
+// universal candidate, leaving the nullary call ambiguous. With the stamp, the
+// required fmt argument excludes that overload and the nullary sibling binds.
+func TestResolveCSharpExtension_ExtractedParamsRequiredArgExcludesOverload(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Ext.cs": `namespace Lib {
+    public interface ILogger { }
+    public static class LogExt {
+        public static void Log(this ILogger logger) { }
+        public static void Log(this ILogger logger, string fmt, params object[] args) { }
+    }
+}`,
+		"Caller.cs": `using Lib;
+namespace App {
+    public class Runner {
+        public void Run(ILogger logger) { logger.Log(); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	assert.Equal(t, "Ext.cs::LogExt.Log",
+		namedCallTarget(t, g, "Caller.cs::Runner.Run", "Log"),
+		"the params overload still requires fmt, so only the nullary sibling applies")
+}
+
 // A defaulted parameter widens an overload's acceptable arity, so a
 // zero-argument call fits BOTH members here. Narrowing must not
 // manufacture a winner — the refusal is the correct answer, and a

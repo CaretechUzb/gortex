@@ -491,8 +491,10 @@ func (e *Engine) GetCluster(nodeID string, opts QueryOptions) *SubGraph {
 }
 
 // SearchSymbols performs full-text search across all nodes.
-// When a search backend is configured, uses BM25/Bleve ranking with
-// camelCase-aware tokenization. Falls back to substring matching otherwise.
+// When a search backend is configured, uses that backend's ranking —
+// the in-process BM25 index in tests and evals, the store-native FTS
+// index in production — with camelCase-aware tokenization. Falls back
+// to substring matching otherwise.
 func (e *Engine) SearchSymbols(query string, limit int) []*graph.Node {
 	return e.SearchSymbolsScoped(query, limit, QueryOptions{})
 }

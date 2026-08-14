@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRRFFuse(t *testing.T) {
+func TestAlphaFuse_EqualWeights(t *testing.T) {
 	textResults := []SearchResult{
 		{ID: "a", Score: 10},
 		{ID: "b", Score: 8},
@@ -15,7 +15,7 @@ func TestRRFFuse(t *testing.T) {
 	}
 	vecIDs := []string{"b", "d", "a"}
 
-	results := rrfFuse(textResults, vecIDs, 60, 10)
+	results := alphaFuse(textResults, vecIDs, 0.5, 60, 10)
 	require.GreaterOrEqual(t, len(results), 3)
 
 	// "a" and "b" appear in both lists → highest RRF scores.
@@ -33,28 +33,28 @@ func TestRRFFuse(t *testing.T) {
 	}
 }
 
-func TestRRFFuse_EmptyVec(t *testing.T) {
+func TestAlphaFuse_EmptyVec(t *testing.T) {
 	textResults := []SearchResult{
 		{ID: "a", Score: 10},
 		{ID: "b", Score: 8},
 	}
-	results := rrfFuse(textResults, nil, 60, 10)
+	results := alphaFuse(textResults, nil, 0.5, 60, 10)
 	// With no vec results, only text results contribute.
 	assert.Len(t, results, 2)
 	assert.Equal(t, "a", results[0].ID)
 }
 
-func TestRRFFuse_Limit(t *testing.T) {
+func TestAlphaFuse_Limit(t *testing.T) {
 	textResults := []SearchResult{
 		{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d"}, {ID: "e"},
 	}
 	vecIDs := []string{"f", "g", "h", "i", "j"}
 
-	results := rrfFuse(textResults, vecIDs, 60, 3)
+	results := alphaFuse(textResults, vecIDs, 0.5, 60, 3)
 	assert.Len(t, results, 3)
 }
 
-// --- alphaFuse + auto-α coverage -------------------------------------
+// --- adaptive alphaFuse coverage -------------------------------------
 
 func TestAlphaFuse_SmallAlphaFavorsText(t *testing.T) {
 	// Text-only candidate "t" and vector-only candidate "v" at the
@@ -109,20 +109,5 @@ func TestAlphaFuse_DeterministicTieBreak(t *testing.T) {
 		if res[0].ID != "alpha" {
 			t.Fatalf("alphaFuse ordering not stable; got %v", res[0].ID)
 		}
-	}
-}
-
-func TestNewHybrid_AutoAlphaDefaultOn(t *testing.T) {
-	h := NewHybrid(nil, nil, nil)
-	if !h.AutoAlpha() {
-		t.Errorf("NewHybrid().AutoAlpha() = false, want true (auto-α default)")
-	}
-	h.SetAutoAlpha(false)
-	if h.AutoAlpha() {
-		t.Errorf("SetAutoAlpha(false) did not take effect")
-	}
-	h.SetAutoAlpha(true)
-	if !h.AutoAlpha() {
-		t.Errorf("SetAutoAlpha(true) did not take effect")
 	}
 }

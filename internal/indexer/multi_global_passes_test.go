@@ -113,10 +113,10 @@ func TestMultiIndexer_IndexAll_GlobalPassesProduceEdges(t *testing.T) {
 	assert.GreaterOrEqual(t, testFuncs, 2, "is_test should be stamped on TestRunGreet in each repo")
 }
 
-// TestMultiIndexer_RunGlobalGraphPasses_Idempotent verifies that running
-// the global passes a second time does not mutate edge counts (graph
-// dedup + resolver passes skip already-present edges).
-func TestMultiIndexer_RunGlobalGraphPasses_Idempotent(t *testing.T) {
+// TestMultiIndexer_GlobalGraphPassPipeline_Idempotent verifies that running
+// the live global-pass pipeline a second time does not mutate edge counts
+// (graph dedup + resolver passes skip already-present edges).
+func TestMultiIndexer_GlobalGraphPassPipeline_Idempotent(t *testing.T) {
 	repoA := setupRepoWithTestAndIface(t, "repo-a")
 	repoB := setupRepoWithTestAndIface(t, "repo-b")
 
@@ -145,8 +145,8 @@ func TestMultiIndexer_RunGlobalGraphPasses_Idempotent(t *testing.T) {
 	require.Greater(t, testsBefore, 0)
 
 	// Re-run the global passes. None of the three should add duplicates.
-	mi.RunGlobalGraphPasses(context.Background())
-	mi.RunGlobalGraphPasses(context.Background())
+	mi.runGlobalGraphPasses(context.Background(), nil, false)
+	mi.runGlobalGraphPasses(context.Background(), nil, false)
 
 	assert.Equal(t, implsBefore, countEdges(g, graph.EdgeImplements),
 		"InferImplements re-emission should be idempotent")

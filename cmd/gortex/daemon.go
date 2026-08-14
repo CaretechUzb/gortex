@@ -55,9 +55,12 @@ var (
 	daemonHTTPConversationAllow []string
 	daemonBackend               string
 	daemonBackendPath           string
-	daemonBackendBufferPoolMB   uint64
 	daemonTools                 string
 	daemonToolsMode             string
+	// daemonBackendBufferPoolMBIgnored is the sink for the retired
+	// --backend-buffer-pool-mb flag. Nothing reads it: SQLite sizes its page
+	// cache via a pragma, so there is no advisory cap to honour.
+	daemonBackendBufferPoolMBIgnored uint64
 )
 
 var daemonCmd = &cobra.Command{
@@ -144,8 +147,12 @@ func init() {
 		"storage backend: sqlite (pure-Go embedded SQL, persists to --backend-path so warm restarts skip re-indexing). It is the only backend; point --backend-path at a throwaway file for a store that does not outlive the run")
 	daemonStartCmd.Flags().StringVar(&daemonBackendPath, "backend-path", "",
 		"path to the store file (its parent directory is created if absent). Defaults to ~/.gortex/store/store.sqlite")
-	daemonStartCmd.Flags().Uint64Var(&daemonBackendBufferPoolMB, "backend-buffer-pool-mb", 0,
-		"advisory page-cache cap (MiB) for the store. 0 reads $GORTEX_DAEMON_BUFFER_POOL_MB or lets the backend choose its own default; sqlite manages its own cache and ignores it")
+	daemonStartCmd.Flags().Uint64Var(&daemonBackendBufferPoolMBIgnored, "backend-buffer-pool-mb", 0,
+		"deprecated no-op; sqlite sizes its page cache via a pragma, so there is no advisory cap to set")
+	// Hidden rather than removed: cobra hard-errors on an unknown flag, so a
+	// deletion would break existing daemon-start scripts and the detach
+	// re-exec path. Nothing should learn it from --help.
+	_ = daemonStartCmd.Flags().MarkHidden("backend-buffer-pool-mb")
 	daemonStartCmd.Flags().StringVar(&daemonTools, "tools", "",
 		"restrict the published MCP tool surface to a preset: core (default)|full|readonly|edit|nav (optionally with ,+tool / ,-tool deltas). GORTEX_TOOLS overrides this")
 	daemonStartCmd.Flags().StringVar(&daemonToolsMode, "tools-mode", "",
@@ -1277,11 +1284,6 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			return fmt.Sprintf("docs=%d  ", sb.DocCount)
 		}
 		switch {
-		case sb.DiskPath != "":
-			t.AppendRow(table.Row{"search", fmt.Sprintf(
-				"%s  %sheap=%s  disk=%s  path=%s",
-				sb.Name, formatSearchDocs(sb), formatBytes(sb.Bytes),
-				formatBytes(sb.DiskBytes), sb.DiskPath)})
 		case sb.DiskResident:
 			// No heap footprint to report — the index lives inside the
 			// graph store's own file, not a separate in-memory
@@ -1443,18 +1445,6 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 		return rows[i].Memory.TotalBytes > rows[j].Memory.TotalBytes
 	})
 
-	// The disk_b column only appears when any repo actually has disk
-	// usage — i.e. Bleve is running in disk mode. Keeping it
-	// conditional stops the default in-memory output from carrying a
-	// dead column users would (rightly) ask about.
-	showDisk := false
-	for _, r := range rows {
-		if r.Memory.DiskBytes > 0 {
-			showDisk = true
-			break
-		}
-	}
-
 	fmt.Fprintln(w, "\ntracked repos:")
 	t := table.NewWriter()
 	t.SetOutputMirror(w)
@@ -1500,10 +1490,6 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 	for i := 0; i < 8; i++ {
 		colConfigs = append(colConfigs, table.ColumnConfig{Number: len(colConfigs) + 1, Align: text.AlignRight})
 	}
-	if showDisk {
-		header = append(header, "disk_b")
-		colConfigs = append(colConfigs, table.ColumnConfig{Number: len(colConfigs) + 1, Align: text.AlignRight})
-	}
 	header = append(header, "path")
 	colConfigs = append(colConfigs, table.ColumnConfig{Number: len(colConfigs) + 1, Align: text.AlignLeft})
 	t.AppendHeader(header)
@@ -1533,9 +1519,6 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 			formatBytes(r.Memory.SearchBytes),
 			formatBytes(r.Memory.VectorsBytes),
 		)
-		if showDisk {
-			row = append(row, formatBytes(r.Memory.DiskBytes))
-		}
 		row = append(row, r.Path)
 		t.AppendRow(row)
 	}
@@ -1550,9 +1533,6 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 			footer = append(footer, "")
 		}
 		footer = append(footer, formatBytes(other), "", "", "", "", "", "", "")
-		if showDisk {
-			footer = append(footer, "")
-		}
 		footer = append(footer, "embedder + runtime + caches (not attributed)")
 		t.AppendFooter(footer)
 	}
@@ -1768,21 +1748,6 @@ func daemonControlClient() (*daemon.Client, error) {
 		return nil, fmt.Errorf("daemon not reachable (%v) — is it running? Try `gortex daemon start`", err)
 	}
 	return c, nil
-}
-
-// resolveDaemonBufferPoolMB returns the effective buffer-pool cap.
-// Precedence: --backend-buffer-pool-mb flag > GORTEX_DAEMON_BUFFER_POOL_MB env > 0
-// (which Open then maps to DefaultBufferPoolMB inside the store).
-func resolveDaemonBufferPoolMB() uint64 {
-	if daemonBackendBufferPoolMB != 0 {
-		return daemonBackendBufferPoolMB
-	}
-	if env := strings.TrimSpace(os.Getenv("GORTEX_DAEMON_BUFFER_POOL_MB")); env != "" {
-		if v, err := strconv.ParseUint(env, 10, 64); err == nil {
-			return v
-		}
-	}
-	return 0
 }
 
 // killByPID is the fallback stop path for stale daemons that have a PID

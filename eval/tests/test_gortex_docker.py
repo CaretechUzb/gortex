@@ -1,7 +1,7 @@
 """Unit tests for eval/environments/gortex_docker.py.
 
-Tests focus on pure logic (cache key, failure recording, properties)
-and mock Docker interactions to avoid requiring a running Docker daemon.
+Tests focus on pure logic (failure recording, properties) and mock
+Docker interactions to avoid requiring a running Docker daemon.
 """
 
 from __future__ import annotations
@@ -20,28 +20,7 @@ from environments.gortex_docker import (
     DEFAULT_EVAL_SERVER_PORT,
     DEFAULT_GORTEX_TIMEOUT,
     GortexDockerEnvironment,
-    _make_cache_key,
 )
-
-
-# -- _make_cache_key ---------------------------------------------------------
-
-class TestMakeCacheKey:
-    def test_basic(self):
-        assert _make_cache_key("django", "abc123") == "django_abc123"
-
-    def test_slash_in_repo_name(self):
-        assert _make_cache_key("django/django", "abc123") == "django__django_abc123"
-
-    def test_deterministic(self):
-        k1 = _make_cache_key("repo", "commit")
-        k2 = _make_cache_key("repo", "commit")
-        assert k1 == k2
-
-    def test_different_inputs_different_keys(self):
-        k1 = _make_cache_key("repo_a", "commit1")
-        k2 = _make_cache_key("repo_b", "commit2")
-        assert k1 != k2
 
 
 # -- GortexDockerEnvironment init -------------------------------------------
@@ -66,13 +45,11 @@ class TestInit:
             gortex_binary="/tmp/gortex",
             gortex_timeout=60,
             eval_server_port=9999,
-            cache_dir="/tmp/cache",
             instance_id="django__django-1234",
         )
         assert env.gortex_binary == Path("/tmp/gortex")
         assert env.gortex_timeout == 60
         assert env.eval_server_port == 9999
-        assert env.cache_dir == Path("/tmp/cache")
         assert env.instance_id == "django__django-1234"
 
 

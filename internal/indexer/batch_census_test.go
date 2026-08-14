@@ -1,7 +1,6 @@
 package indexer
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -23,14 +22,6 @@ func TestBatchScopeAndCensusBelongOnlyToEndBatch(t *testing.T) {
 	first["caller-mutation"] = struct{}{}
 	mi.ArmBatchScope(map[string]struct{}{"repo-b": {}})
 	mi.ArmBatchCensusEligible()
-
-	// An unrelated public run is explicitly unscoped and cannot steal the
-	// one-shot state that belongs to EndBatch.
-	mi.RunGlobalGraphPasses(context.Background())
-	mi.mu.RLock()
-	assert.Equal(t, map[string]struct{}{"repo-a": {}, "repo-b": {}}, mi.batchChangedPrefixes)
-	assert.True(t, mi.batchCensusEligible)
-	mi.mu.RUnlock()
 
 	mi.EndBatch()
 	mi.mu.RLock()

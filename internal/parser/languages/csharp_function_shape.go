@@ -29,51 +29,30 @@ func emitCSharpFunctionShape(ownerID string, methodNode *sitter.Node, src []byte
 }
 
 func emitCSharpParamNodes(ownerID string, params *sitter.Node, src []byte, filePath string, declLine int, result *parser.ExtractionResult) {
-	declaredPos := 0
-	for i, _nc := 0, int(params.NamedChildCount()); i < _nc; i++ {
-		decl := params.NamedChild(i)
-		if decl == nil {
+	entries, _ := csharpParamEntries(params, src)
+	for _, entry := range entries {
+		if entry.name == "" {
 			continue
 		}
-		if decl.Type() != "parameter" {
-			continue
-		}
-		// Every `parameter` child holds a position, whether or not it
-		// gets a node below: a discard (`void Foo(int _, string name)`)
-		// still occupies slot 0, so skipping it silently would shift
-		// every later parameter's recorded position down by one.
-		pos := declaredPos
-		declaredPos++
-		var name, typeRaw string
-		if n := decl.ChildByFieldName("name"); n != nil {
-			name = n.Content(src)
-		}
-		if t := decl.ChildByFieldName("type"); t != nil {
-			typeRaw = strings.TrimSpace(t.Content(src))
-		}
-		variadic := csharpParamIsVariadic(decl, src)
-		if name == "" || name == "_" {
-			continue
-		}
-		paramID := ownerID + "#param:" + name + "@" + strconv.Itoa(pos)
-		meta := map[string]any{"position": pos}
-		if variadic {
+		paramID := ownerID + "#param:" + entry.name + "@" + strconv.Itoa(entry.position)
+		meta := map[string]any{"position": entry.position}
+		if entry.variadic {
 			meta["variadic"] = true
 		}
-		if typeRaw != "" {
-			meta["type"] = typeRaw
+		if entry.typeRaw != "" {
+			meta["type"] = entry.typeRaw
 		}
-		startLine := int(decl.StartPoint().Row) + 1
+		startLine := entry.startLine
 		if startLine == 0 {
 			startLine = declLine
 		}
 		result.Nodes = append(result.Nodes, &graph.Node{
 			ID:        paramID,
 			Kind:      graph.KindParam,
-			Name:      name,
+			Name:      entry.name,
 			FilePath:  filePath,
 			StartLine: startLine,
-			EndLine:   int(decl.EndPoint().Row) + 1,
+			EndLine:   entry.endLine,
 			Language:  "csharp",
 			Meta:      meta,
 		})
@@ -85,7 +64,7 @@ func emitCSharpParamNodes(ownerID string, params *sitter.Node, src []byte, fileP
 			Line:     startLine,
 			Origin:   graph.OriginASTResolved,
 		})
-		if canon := canonicalizeCSharpTypeRef(typeRaw); canon != "" && !isCSharpPrimitive(canon) {
+		if canon := canonicalizeCSharpTypeRef(entry.typeRaw); canon != "" && !isCSharpPrimitive(canon) {
 			result.Edges = append(result.Edges, &graph.Edge{
 				From:     paramID,
 				To:       "unresolved::" + canon,

@@ -13,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/procio"
 )
@@ -165,12 +166,18 @@ func (w *procWorker) roundTrip(req *extractRequest, resp *extractResponse) error
 	return nil
 }
 
-// Submit extracts one file in a worker subprocess. It blocks until a
-// worker is free, then runs the round-trip under requestTimeout. A
-// crashed or hung worker is killed, replaced, and reported via
-// Result.Crashed; the pool stays at full strength so the caller can
-// keep submitting.
+// Submit extracts one file with empty request options. It preserves the base
+// pool API for ordinary callers and tests.
 func (p *Pool) Submit(relPath, language string, content []byte) Result {
+	return p.SubmitWithOptions(relPath, language, content, nil)
+}
+
+// SubmitWithOptions extracts one file in a worker subprocess. It blocks until
+// a worker is free, then runs the round-trip under requestTimeout. Temporal
+// helper names are normalized into the request and never mutate worker state.
+// A crashed or hung worker is killed, replaced, and reported via Result.Crashed;
+// the pool stays at full strength so the caller can keep submitting.
+func (p *Pool) SubmitWithOptions(relPath, language string, content []byte, temporalEnvHelpers []string) Result {
 	p.mu.Lock()
 	closed := p.closed
 	p.mu.Unlock()
@@ -184,10 +191,11 @@ func (p *Pool) Submit(relPath, language string, content []byte) Result {
 	}
 
 	req := extractRequest{
-		Seq:      p.seq.Add(1),
-		RelPath:  relPath,
-		Language: language,
-		Content:  content,
+		Seq:                p.seq.Add(1),
+		RelPath:            relPath,
+		Language:           language,
+		Content:            content,
+		TemporalEnvHelpers: parser.NewExtractionOptions(temporalEnvHelpers).TemporalEnvHelpers(),
 	}
 	var resp extractResponse
 	done := make(chan error, 1)

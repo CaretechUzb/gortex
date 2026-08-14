@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -65,18 +64,6 @@ type enrichResult struct {
 	reason  string
 }
 
-// RunPreToolUse reads a PreToolUse hook payload from stdin and handles it
-// in the legacy deny posture. Kept as a public entry point for
-// backward compatibility; new callers should use Run which dispatches
-// based on hook_event_name and respects the configured Mode.
-func RunPreToolUse(gortexPort int) {
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return
-	}
-	runPreToolUse(data, gortexPort, ModeDeny)
-}
-
 // gortexMCPToolPrefix is the namespace Claude Code gives Gortex's own
 // MCP tools (server name "gortex"). A tool call whose name starts with
 // this prefix is a graph query — the in-process hook sees it like any
@@ -84,8 +71,8 @@ func RunPreToolUse(gortexPort int) {
 // the adaptive-nudge streak reset work without an external signal.
 const gortexMCPToolPrefix = "mcp__gortex__"
 
-// runPreToolUse is the bytes-accepting helper used by both RunPreToolUse and
-// the generic Run dispatcher. In ModeEnrich the deny branch is downgraded
+// runPreToolUse is the bytes-accepting helper the generic Run dispatcher
+// and the Codex bridge share. In ModeEnrich the deny branch is downgraded
 // to an additionalContext message — the agent is informed about the graph
 // alternative but the original call still runs and PostToolUse can layer
 // graph context on the actual output.
