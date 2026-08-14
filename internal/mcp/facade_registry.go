@@ -135,10 +135,6 @@ func (r *facadeRegistry) availableOperations(facade string) []facadeOperationSpe
 	return out
 }
 
-func (r *facadeRegistry) mapsLegacy(name string) bool {
-	return r != nil && len(r.byLegacy[name]) > 0
-}
-
 func facadeToolNames() []string {
 	return []string{
 		"analyze", "ask", "capabilities", "change", "edit", "explore",
@@ -146,13 +142,6 @@ func facadeToolNames() []string {
 		"relations", "remember", "response", "review", "search", "session",
 		"trace", "workspace", "workspace_admin",
 	}
-}
-
-// FacadeToolNames returns the complete stable facade-v1 tool roster. The
-// returned slice is a fresh copy so CLI/help callers cannot mutate the server's
-// canonical surface.
-func FacadeToolNames() []string {
-	return append([]string(nil), facadeToolNames()...)
 }
 
 // IsFacadeToolName reports whether name belongs to the public facade-v1

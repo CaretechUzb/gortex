@@ -29,7 +29,7 @@ func TestFacadeRegistryCoversRegisteredLegacyCatalog(t *testing.T) {
 		if isFacadeToolName(descriptor.Name) {
 			continue
 		}
-		if !srv.facades.mapsLegacy(descriptor.Name) {
+		if len(srv.facades.byLegacy[descriptor.Name]) == 0 {
 			missing = append(missing, descriptor.Name)
 		}
 	}
@@ -1449,7 +1449,7 @@ func TestFacadeDispatchRecordsOperationTelemetry(t *testing.T) {
 	require.Equal(t, 1, latencyCounts["analyze.coverage"])
 	require.Equal(t, 1, latencyCounts["analyze.unknown"])
 
-	long := facadeTelemetryDimension(facadeOperationSpec{Facade: "session", Operation: "unsubscribe_workspace_readiness"})
+	long := boundedFacadeTelemetryDimension("session", "unsubscribe_workspace_readiness")
 	require.LessOrEqual(t, len(long), 32)
 }
 

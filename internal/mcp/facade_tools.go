@@ -1586,10 +1586,6 @@ const (
 	facadeOutcomeEmptyResult      = "empty_result"
 )
 
-func facadeTelemetryDimension(spec facadeOperationSpec) string {
-	return boundedFacadeTelemetryDimension(spec.Facade, spec.Operation)
-}
-
 // boundedFacadeTelemetryDimension joins fixed, low-cardinality tokens and
 // deterministically folds long combinations under telemetry's 32-byte guard.
 // Callers must pass registry values or fixed sentinels, never request values.
