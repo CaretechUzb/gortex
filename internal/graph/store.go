@@ -858,11 +858,16 @@ type VectorCorpusItem struct {
 }
 
 // VectorCorpusStats describes the complete committed durable corpus for one
-// embedding dimension. ChunkCount counts rows with a non-empty ParentID.
+// embedding dimension. ChunkCount counts rows with a non-empty ParentID. The
+// Repository fields are populated by replacement and repo-scoped discovery so
+// warm startup can distinguish "another repo has vectors" from "this repo's
+// migration-cleared corpus still needs rebuilding".
 type VectorCorpusStats struct {
-	VectorCount int
-	ChunkCount  int
-	Dims        int
+	VectorCount           int
+	ChunkCount            int
+	RepositoryVectorCount int
+	RepositoryChunkCount  int
+	Dims                  int
 }
 
 // AtomicVectorCorpusInstaller is an optional durable-store capability. A
@@ -878,6 +883,7 @@ type VectorCorpusStats struct {
 type AtomicVectorCorpusInstaller interface {
 	ReplaceVectorCorpus(ctx context.Context, repoPrefix string, dims int, items []VectorCorpusItem) (VectorCorpusStats, error)
 	VectorCorpusStats(ctx context.Context, dims int) (VectorCorpusStats, error)
+	VectorCorpusStatsForRepo(ctx context.Context, repoPrefix string, dims int) (VectorCorpusStats, error)
 }
 
 // PageRankOpts tunes the PageRank computation. Zero values request

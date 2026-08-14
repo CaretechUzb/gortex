@@ -27,7 +27,11 @@ func TestReplaceVectorCorpusIsAtomicPerRepositoryAndReportsStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertVectorCorpusStats(t, stats, graph.VectorCorpusStats{VectorCount: 2, ChunkCount: 1, Dims: 2})
+	assertVectorCorpusStats(t, stats, graph.VectorCorpusStats{
+		VectorCount: 2, ChunkCount: 1,
+		RepositoryVectorCount: 2, RepositoryChunkCount: 1,
+		Dims: 2,
+	})
 
 	stats, err = store.ReplaceVectorCorpus(ctx, "B", 2, []graph.VectorCorpusItem{
 		{NodeID: "B/keep", Vec: []float32{1, 1}},
@@ -35,7 +39,11 @@ func TestReplaceVectorCorpusIsAtomicPerRepositoryAndReportsStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertVectorCorpusStats(t, stats, graph.VectorCorpusStats{VectorCount: 3, ChunkCount: 1, Dims: 2})
+	assertVectorCorpusStats(t, stats, graph.VectorCorpusStats{
+		VectorCount: 3, ChunkCount: 1,
+		RepositoryVectorCount: 1,
+		Dims:                  2,
+	})
 
 	stats, err = store.ReplaceVectorCorpus(ctx, "A", 2, []graph.VectorCorpusItem{
 		{NodeID: "A/new", Vec: []float32{1, -1}},
@@ -43,7 +51,11 @@ func TestReplaceVectorCorpusIsAtomicPerRepositoryAndReportsStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertVectorCorpusStats(t, stats, graph.VectorCorpusStats{VectorCount: 2, Dims: 2})
+	assertVectorCorpusStats(t, stats, graph.VectorCorpusStats{
+		VectorCount:           2,
+		RepositoryVectorCount: 1,
+		Dims:                  2,
+	})
 	assertVectorCorpusRows(t, store, []vectorCorpusTestRow{
 		{nodeID: "A/new", repoPrefix: "A", dims: 2},
 		{nodeID: "B/keep", repoPrefix: "B", dims: 2},
@@ -56,6 +68,53 @@ func TestReplaceVectorCorpusIsAtomicPerRepositoryAndReportsStats(t *testing.T) {
 	assertVectorCorpusStats(t, stats, graph.VectorCorpusStats{VectorCount: 1, Dims: 2})
 	assertVectorCorpusRows(t, store, []vectorCorpusTestRow{
 		{nodeID: "B/keep", repoPrefix: "B", dims: 2},
+	})
+}
+
+func TestVectorCorpusStatsForRepoReportsGlobalAndScopedCounts(t *testing.T) {
+	store := openVectorCorpusTestStore(t, filepath.Join(t.TempDir(), "repo-stats.sqlite"))
+	ctx := context.Background()
+	addVectorCorpusNodes(t, store, "A", "A/one", "A/two")
+	addVectorCorpusNodes(t, store, "B", "B/keep")
+
+	if _, err := store.ReplaceVectorCorpus(ctx, "A", 2, []graph.VectorCorpusItem{
+		{NodeID: "A/one", Vec: []float32{1, 0}},
+		{NodeID: "A/two#chunk0", ParentID: "A/two", Vec: []float32{0, 1}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReplaceVectorCorpus(ctx, "B", 2, []graph.VectorCorpusItem{
+		{NodeID: "B/keep", Vec: []float32{1, 1}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := store.VectorCorpusStatsForRepo(ctx, "A", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertVectorCorpusStats(t, stats, graph.VectorCorpusStats{
+		VectorCount: 3, ChunkCount: 1,
+		RepositoryVectorCount: 2, RepositoryChunkCount: 1,
+		Dims: 2,
+	})
+
+	stats, err = store.VectorCorpusStatsForRepo(ctx, "B", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertVectorCorpusStats(t, stats, graph.VectorCorpusStats{
+		VectorCount: 3, ChunkCount: 1,
+		RepositoryVectorCount: 1,
+		Dims:                  2,
+	})
+
+	stats, err = store.VectorCorpusStatsForRepo(ctx, "missing", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertVectorCorpusStats(t, stats, graph.VectorCorpusStats{
+		VectorCount: 3, ChunkCount: 1, Dims: 2,
 	})
 }
 

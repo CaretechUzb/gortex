@@ -53,7 +53,7 @@ func (s *Store) ReplaceVectorCorpus(
 	if err := insertVectorCorpusTx(ctx, tx, repoPrefix, dims, items); err != nil {
 		return graph.VectorCorpusStats{}, err
 	}
-	stats, err := vectorCorpusStatsForDims(ctx, tx, dims)
+	stats, err := vectorCorpusStatsForRepoDims(ctx, tx, repoPrefix, dims)
 	if err != nil {
 		return graph.VectorCorpusStats{}, err
 	}
@@ -108,6 +108,50 @@ LIMIT 2`)
 	}
 	if err := rows.Err(); err != nil {
 		return graph.VectorCorpusStats{}, err
+	}
+	return stats, nil
+}
+
+// VectorCorpusStatsForRepo returns global publication counts together with the
+// selected repository's contribution. Discovery mode resolves the sole stored
+// dimension in one aggregate query, avoiding a cross-query generation race.
+func (s *Store) VectorCorpusStatsForRepo(
+	ctx context.Context,
+	repoPrefix string,
+	dims int,
+) (graph.VectorCorpusStats, error) {
+	if err := ctx.Err(); err != nil {
+		return graph.VectorCorpusStats{}, err
+	}
+	if dims > 0 {
+		return vectorCorpusStatsForRepoDims(ctx, s.db, repoPrefix, dims)
+	}
+
+	var stats graph.VectorCorpusStats
+	var distinctDims int
+	err := s.db.QueryRowContext(ctx, `
+SELECT COALESCE(MIN(dims), 0),
+       COUNT(DISTINCT dims),
+       COUNT(*),
+       COALESCE(SUM(CASE WHEN parent_id <> '' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN repo_prefix = ? THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN repo_prefix = ? AND parent_id <> '' THEN 1 ELSE 0 END), 0)
+FROM vectors`, repoPrefix, repoPrefix).Scan(
+		&stats.Dims,
+		&distinctDims,
+		&stats.VectorCount,
+		&stats.ChunkCount,
+		&stats.RepositoryVectorCount,
+		&stats.RepositoryChunkCount,
+	)
+	if err != nil {
+		return graph.VectorCorpusStats{}, err
+	}
+	if distinctDims > 1 {
+		return graph.VectorCorpusStats{}, errVectorCorpusAmbiguousDims
+	}
+	if stats.VectorCount > 0 && stats.Dims <= 0 {
+		return graph.VectorCorpusStats{}, fmt.Errorf("store_sqlite: durable vector corpus has invalid dimension %d", stats.Dims)
 	}
 	return stats, nil
 }
@@ -319,6 +363,31 @@ SELECT COUNT(*),
        COALESCE(SUM(CASE WHEN parent_id <> '' THEN 1 ELSE 0 END), 0)
 FROM vectors
 WHERE dims = ?`, dims).Scan(&stats.VectorCount, &stats.ChunkCount)
+	if err != nil {
+		return graph.VectorCorpusStats{}, err
+	}
+	return stats, nil
+}
+
+func vectorCorpusStatsForRepoDims(
+	ctx context.Context,
+	q vectorCorpusStatsQuerier,
+	repoPrefix string,
+	dims int,
+) (graph.VectorCorpusStats, error) {
+	stats := graph.VectorCorpusStats{Dims: dims}
+	err := q.QueryRowContext(ctx, `
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN parent_id <> '' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN repo_prefix = ? THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN repo_prefix = ? AND parent_id <> '' THEN 1 ELSE 0 END), 0)
+FROM vectors
+WHERE dims = ?`, repoPrefix, repoPrefix, dims).Scan(
+		&stats.VectorCount,
+		&stats.ChunkCount,
+		&stats.RepositoryVectorCount,
+		&stats.RepositoryChunkCount,
+	)
 	if err != nil {
 		return graph.VectorCorpusStats{}, err
 	}
