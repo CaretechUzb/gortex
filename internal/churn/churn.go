@@ -31,7 +31,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os/exec"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -378,9 +378,6 @@ func stripRepoPrefix(filePath, repoRoot string) string {
 	if !strings.Contains(filePath, "/") {
 		return filePath
 	}
-	if _, err := exec.LookPath("git"); err != nil {
-		return filePath
-	}
 	abs := filepath.Join(repoRoot, filePath)
 	if fileExists(abs) {
 		return filePath
@@ -394,9 +391,16 @@ func stripRepoPrefix(filePath, repoRoot string) string {
 	return filePath
 }
 
+// fileExists is split out so tests can stub it. os.Stat follows symlinks,
+// and Mode().IsRegular matches the previous `test -f` semantics without
+// spawning a process for every lookup. Shelling out here cost one child
+// process per indexed file on every enrichment pass, and was outright
+// wrong on Windows, where there is no `test` executable: every lookup
+// failed, so multi-repo paths were never stripped and the enricher
+// silently produced no churn data.
 var fileExists = func(path string) bool {
-	cmd := exec.Command("test", "-f", path)
-	return cmd.Run() == nil
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // runGit shells out and returns trimmed stdout, or "" on error. Used
