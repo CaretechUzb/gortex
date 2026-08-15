@@ -95,10 +95,10 @@ func TestInitWizard_AdvancesThroughStepsAndCollectsChoices(t *testing.T) {
 	m := newInitWizardModel(".", sampleRegistered(), sampleDetected(), defaultDefaults())
 
 	// Step 1: agents — toggle codex on, then advance.
-	m = pressKey(m, "j")     // cursor → cursor
-	m = pressKey(m, "j")     // → aider
-	m = pressKey(m, "j")     // → codex
-	m = pressKey(m, " ")     // pick codex
+	m = pressKey(m, "j") // cursor → cursor
+	m = pressKey(m, "j") // → aider
+	m = pressKey(m, "j") // → codex
+	m = pressKey(m, " ") // pick codex
 	m = pressSpecial(m, tea.KeyEnter)
 	assert.Equal(t, stepOptions, m.step)
 
