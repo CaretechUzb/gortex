@@ -18,10 +18,24 @@ func DefaultConfigPaths() []string {
 		".cursorrules",
 		".cursor/rules",
 		".github/copilot-instructions.md",
+		// Path-scoped Copilot instructions. The CLI reads every
+		// *.instructions.md under here in addition to the single
+		// copilot-instructions.md above, so auditing only the latter
+		// misses whatever a repo scoped to its TypeScript or Go files.
+		".github/instructions",
 		".windsurfrules",
 		".windsurf/rules",
 		".antigravity/rules",
 		".aider.conf.yml",
+		// Skill trees. These carry the same stale symbol refs and dead
+		// paths as a rules file, and Gortex now writes into them, so a
+		// drift audit that skips them under-reports its own output.
+		// `.agents/skills` is the cross-agent location Codex and
+		// OpenCode both read.
+		".agents/skills",
+		".opencode/skills",
+		".opencode/commands",
+		".github/skills",
 	}
 }
 
