@@ -3,6 +3,7 @@ package copilotcli
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -165,6 +166,103 @@ func TestCuratedSkillIsNeverOverwritten(t *testing.T) {
 	}
 	if got := readFile(t, path); got != custom {
 		t.Fatalf("customised skill was overwritten:\n%s", got)
+	}
+}
+
+// profileSubset is the three-skill shape an instruction profile like
+// `localization` narrows the pack to.
+var profileSubset = []string{"gortex-explore", "gortex-guide", "gortex-debug"}
+
+// installedSkillIDs lists the skill directories that still hold a
+// SKILL.md. Directory presence alone is not the question a profile
+// switch asks — what the CLI loads is.
+func installedSkillIDs(t *testing.T, root string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read dir %s: %v", root, err)
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(root, e.Name(), skillFileName)); err == nil {
+			out = append(out, e.Name())
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestSyncSkillsNarrowsToProfileSubset is the point of the whole
+// exercise: `gortex instructions switch localization` must leave the
+// Copilot CLI holding three playbooks, not twenty-one. Before this
+// existed, only Claude Code's picker shrank.
+func TestSyncSkillsNarrowsToProfileSubset(t *testing.T) {
+	env, _ := globalEnv(t)
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	root := filepath.Join(env.Home, copilotConfigDirName, skillsDirName)
+	if got := len(installedSkillIDs(t, root)); got != len(CuratedSkillNames()) {
+		t.Fatalf("install left %d skills, want the full pack (%d)", got, len(CuratedSkillNames()))
+	}
+
+	if _, err := SyncSkills(env.Stderr, env.Home, profileSubset, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("SyncSkills: %v", err)
+	}
+	want := append([]string(nil), profileSubset...)
+	sort.Strings(want)
+	if got := installedSkillIDs(t, root); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("after the switch %v remain, want %v", got, want)
+	}
+}
+
+// TestSyncSkillsKeepsCustomisedSkill: a profile is not worth a user's
+// edits. An out-of-profile playbook the user rewrote stays byte for
+// byte, and the switch warns instead of silently widening the surface.
+func TestSyncSkillsKeepsCustomisedSkill(t *testing.T) {
+	env, _ := globalEnv(t)
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	path := filepath.Join(env.Home, copilotConfigDirName, skillsDirName, "gortex-rename", skillFileName)
+	const mine = "---\nname: gortex-rename\ndescription: mine\n---\nmy own steps\n"
+	if err := os.WriteFile(path, []byte(mine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	log := &strings.Builder{}
+	if _, err := SyncSkills(log, env.Home, profileSubset, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("SyncSkills: %v", err)
+	}
+	if got := readFile(t, path); got != mine {
+		t.Fatalf("customised skill was deleted or rewritten:\n%s", got)
+	}
+	if !strings.Contains(log.String(), "gortex-rename") {
+		t.Fatalf("expected a warning naming the kept skill, got:\n%s", log.String())
+	}
+}
+
+// TestSyncSkillsWithoutAnInstalledRootIsANoOp: most machines run one or
+// two of the supported hosts. Switching a profile must not conjure a
+// Copilot skills tree on a machine that never ran `gortex install`, and
+// must not fail because the tree is absent.
+func TestSyncSkillsWithoutAnInstalledRootIsANoOp(t *testing.T) {
+	env, _ := globalEnv(t)
+	actions, err := SyncSkills(env.Stderr, env.Home, profileSubset, agents.ApplyOpts{})
+	if err != nil {
+		t.Fatalf("SyncSkills on an uninstalled machine: %v", err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("actions = %v, want none", actions)
+	}
+	if _, err := os.Stat(filepath.Join(env.Home, copilotConfigDirName, skillsDirName)); !os.IsNotExist(err) {
+		t.Fatalf("a switch created the skills root (stat err = %v)", err)
 	}
 }
 

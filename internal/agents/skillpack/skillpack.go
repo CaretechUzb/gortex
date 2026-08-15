@@ -16,13 +16,14 @@
 // bodies stay where they are; callers pass the raw map in. The
 // tempting inversion — skillpack reaching into claudecode for the
 // bodies — deadlocks the moment an adapter wants to call back into
-// skillpack (a later phase adds a Sync entry point driven from
-// cmd/gortex), because Go rejects the import cycle. Keeping the arrow
-// one-way means any number of adapters can depend on skillpack without
-// ever constraining each other.
+// skillpack (Sync, in sync.go, is exactly that), because Go rejects the
+// import cycle. Keeping the arrow one-way means any number of adapters
+// can depend on skillpack without ever constraining each other.
 //
-// Only the stdlib is imported here, deliberately: a leaf package with
-// no internal dependencies can never participate in a cycle.
+// This file imports only the stdlib. sync.go additionally imports
+// internal/agents and internal/agents/internalutil for the shared file
+// actions, writers and log prefixes; see the note there for why those
+// two — and only those two — cannot close a cycle.
 package skillpack
 
 import (

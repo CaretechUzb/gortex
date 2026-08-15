@@ -1,6 +1,8 @@
 package copilotcli
 
 import (
+	"io"
+	"os"
 	"path/filepath"
 	"sort"
 
@@ -89,13 +91,24 @@ func copilotSkillFromClaude(skill skillpack.Skill) string {
 	}) + skill.Body
 }
 
-// curatedSkillPath is ~/.copilot/skills/<id>/SKILL.md.
-func curatedSkillPath(env agents.Env, id string) string {
+// curatedSkillsRoot is ~/.copilot/skills — the only user-level skills
+// root the CLI still honours (see the file header for the two it
+// dropped). Empty when the Env has no resolvable config home.
+func curatedSkillsRoot(env agents.Env) string {
 	home := copilotConfigHome(env)
 	if home == "" {
 		return ""
 	}
-	return filepath.Join(home, skillsDirName, id, skillFileName)
+	return filepath.Join(home, skillsDirName)
+}
+
+// curatedSkillPath is ~/.copilot/skills/<id>/SKILL.md.
+func curatedSkillPath(env agents.Env, id string) string {
+	root := curatedSkillsRoot(env)
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(root, id, skillFileName)
 }
 
 // generatedSkillPath is <root>/.github/skills/<DirName>/SKILL.md — flat,
@@ -116,26 +129,63 @@ func generatedSkillPath(root, dirName string) string {
 //
 // An existing file is never overwritten — a user who tuned a playbook's
 // description or trimmed its steps keeps that work across re-installs.
+//
+// `allowed` is nil here: install materialises the whole pack, and
+// `gortex instructions switch` narrows it afterwards through SyncSkills.
+// Both go through the same reconciler so an install and a profile switch
+// can never disagree about what belongs on disk.
 func installCuratedSkills(env agents.Env, opts agents.ApplyOpts) []agents.FileAction {
-	skills := CuratedSkills()
-	out := make([]agents.FileAction, 0, len(skills))
-	for _, id := range CuratedSkillNames() {
-		body, ok := skills[id]
-		if !ok {
-			continue
-		}
-		path := curatedSkillPath(env, id)
-		if path == "" {
-			continue
-		}
-		action, err := agents.WriteIfNotExists(env.Stderr, path, body, opts)
-		if err != nil {
-			internalutil.Warnf(env.Stderr, "copilot-cli skill %s: %v", id, err)
-			continue
-		}
-		out = append(out, action)
+	out, err := syncCuratedSkills(env.Stderr, curatedSkillsRoot(env), nil, opts)
+	if err != nil {
+		// Partial progress is still reported: a single unreadable skill
+		// must not hide the ones that did land.
+		internalutil.Warnf(env.Stderr, "copilot-cli skills: %v", err)
 	}
 	return out
+}
+
+// SyncSkills reshapes an ALREADY-INSTALLED ~/.copilot/skills tree to the
+// allowed subset (nil = every shipped skill). This is the entry point
+// `gortex instructions switch` drives.
+//
+// A missing skills root is a silent no-op, not an install: switching a
+// profile must never conjure a Copilot CLI surface on a machine that
+// never ran `gortex install`, and most machines carry only one or two of
+// the supported hosts.
+//
+// home is taken rather than an agents.Env so every host's switch entry
+// point has the same shape; it is wrapped back into an Env because
+// $COPILOT_HOME may relocate the whole config directory, and that
+// override is only honoured for the machine's real home.
+func SyncSkills(w io.Writer, home string, allowed []string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
+	if home == "" {
+		return nil, nil
+	}
+	root := curatedSkillsRoot(agents.Env{Home: home, Stderr: w})
+	if root == "" {
+		return nil, nil
+	}
+	if _, err := os.Stat(root); err != nil {
+		return nil, nil
+	}
+	return syncCuratedSkills(w, root, allowed, opts)
+}
+
+// syncCuratedSkills is the one reconciler both entry points reach. The
+// deletion rule (never remove a customised file) lives in skillpack, not
+// here, so all four skill-aware hosts enforce it identically.
+func syncCuratedSkills(w io.Writer, root string, allowed []string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
+	if root == "" {
+		return nil, nil
+	}
+	// KnownHashes stays unset: this pack has only ever shipped one
+	// rendering, so the byte compare against CuratedSkills() is the
+	// complete definition of "still ours".
+	return skillpack.Sync(w, skillpack.SyncSpec{
+		Dir:      root,
+		FileName: skillFileName,
+		Rendered: CuratedSkills(),
+	}, allowed, opts)
 }
 
 // installGeneratedSkills writes the per-community skills the caller

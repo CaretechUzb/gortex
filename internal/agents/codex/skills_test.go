@@ -331,6 +331,82 @@ func TestCodexSkillsDryRunTouchesNothing(t *testing.T) {
 	}
 }
 
+// profileSubset is the three-skill shape an instruction profile like
+// `localization` narrows the pack to.
+var profileSubset = []string{"gortex-explore", "gortex-guide", "gortex-debug"}
+
+// TestCodexSyncSkillsNarrowsToProfileSubset is the point of the whole
+// exercise: `gortex instructions switch localization` must leave Codex
+// holding three playbooks, not twenty-one. Before this existed, only
+// Claude Code's picker shrank and every other host kept the full pack.
+func TestCodexSyncSkillsNarrowsToProfileSubset(t *testing.T) {
+	env := codexGlobalEnv(t)
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	root := filepath.Join(env.Home, ".agents", "skills")
+	if got := len(skillDirNames(t, root)); got != curatedSkillCount(t) {
+		t.Fatalf("install left %d skills, want the full pack (%d)", got, curatedSkillCount(t))
+	}
+
+	if _, err := SyncSkills(env.Stderr, env.Home, profileSubset, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("SyncSkills: %v", err)
+	}
+	want := append([]string(nil), profileSubset...)
+	sort.Strings(want)
+	if got := skillDirNames(t, root); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("after the switch %v remain, want %v", got, want)
+	}
+}
+
+// TestCodexSyncSkillsKeepsCustomisedSkill: a profile is not worth a
+// user's edits. An out-of-profile playbook the user rewrote stays, byte
+// for byte, and the switch says so instead of silently shipping a wider
+// surface than requested.
+func TestCodexSyncSkillsKeepsCustomisedSkill(t *testing.T) {
+	env := codexGlobalEnv(t)
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	root := filepath.Join(env.Home, ".agents", "skills")
+	path := filepath.Join(root, "gortex-rename", "SKILL.md")
+	const mine = "---\nname: gortex-rename\ndescription: mine\n---\n\n# my own steps\n"
+	if err := os.WriteFile(path, []byte(mine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	log := &bytes.Buffer{}
+	if _, err := SyncSkills(log, env.Home, profileSubset, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("SyncSkills: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("customised skill was deleted to satisfy a profile: %v", err)
+	}
+	if string(data) != mine {
+		t.Fatalf("customised skill was rewritten:\n%s", data)
+	}
+	if !strings.Contains(log.String(), "gortex-rename") {
+		t.Fatalf("expected a warning naming the kept skill, got:\n%s", log.String())
+	}
+}
+
+// TestCodexSyncSkillsWithoutAnInstalledRootIsANoOp: most machines run
+// one or two of the supported hosts. Switching a profile must not
+// conjure a Codex skills tree on a machine that never ran `gortex
+// install`, and must not fail because the tree is absent.
+func TestCodexSyncSkillsWithoutAnInstalledRootIsANoOp(t *testing.T) {
+	env := codexGlobalEnv(t)
+	actions, err := SyncSkills(env.Stderr, env.Home, profileSubset, agents.ApplyOpts{})
+	if err != nil {
+		t.Fatalf("SyncSkills on an uninstalled machine: %v", err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("actions = %v, want none", actions)
+	}
+	assertNoSkillsDir(t, filepath.Join(env.Home, ".agents", "skills"))
+}
+
 // codexProjectEnv is the ModeProject counterpart to codexGlobalEnv:
 // codex detected via ~/.codex, a stubbed version probe, and the
 // generated-skill fixture agentstest seeds.

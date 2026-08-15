@@ -26,8 +26,6 @@ package codex
 // in as direct children like everything else.
 
 import (
-	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -106,22 +104,55 @@ func applySkills(env agents.Env, opts agents.ApplyOpts) ([]agents.FileAction, er
 // An existing file that differs from the shipped body is the user's:
 // it is left alone (ActionSkip "customised"), the same never-clobber
 // posture as claudecode's writeAgentArtifact.
+//
+// `allowed` is nil here — install materialises the whole pack, and
+// `gortex instructions switch` narrows it afterwards through SyncSkills.
+// Both go through the same reconciler so an install and a profile switch
+// can never disagree about what belongs on disk.
 func installCuratedSkills(env agents.Env, opts agents.ApplyOpts) ([]agents.FileAction, error) {
+	return syncCuratedSkills(env.Stderr, codexSkillsRoot(env.Home), nil, opts)
+}
+
+// SyncSkills reshapes an ALREADY-INSTALLED `$HOME/.agents/skills` tree
+// to the allowed subset (nil = every shipped skill). This is the entry
+// point `gortex instructions switch` drives.
+//
+// A missing skills root is a silent no-op, not an install: switching a
+// profile must never conjure a Codex surface on a machine that never ran
+// `gortex install`, and most machines carry only one or two of the
+// supported hosts. That is the one behavioural difference from
+// installCuratedSkills, which shares the reconciler below.
+func SyncSkills(w io.Writer, home string, allowed []string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
+	if home == "" {
+		return nil, nil
+	}
+	root := codexSkillsRoot(home)
+	if _, err := os.Stat(root); err != nil {
+		return nil, nil
+	}
+	return syncCuratedSkills(w, root, allowed, opts)
+}
+
+// syncCuratedSkills is the one reconciler both entry points reach. The
+// deletion rule (never remove a customised file) lives in skillpack, not
+// here, so all four skill-aware hosts enforce it identically.
+func syncCuratedSkills(w io.Writer, root string, allowed []string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
 	skills, err := Skills()
 	if err != nil {
 		return nil, err
 	}
-	root := codexSkillsRoot(env.Home)
-	out := make([]agents.FileAction, 0, len(skills))
+	rendered := make(map[string]string, len(skills))
 	for _, s := range skills {
-		path := filepath.Join(root, s.ID, skillFileName)
-		action, err := writeSkillFile(env.Stderr, path, renderSkill(s), opts)
-		if err != nil {
-			return out, fmt.Errorf("skill %s: %w", s.ID, err)
-		}
-		out = append(out, action)
+		rendered[s.ID] = renderSkill(s)
 	}
-	return out, nil
+	// KnownHashes stays unset: this pack has only ever shipped one
+	// rendering, so the byte compare against `rendered` is the complete
+	// definition of "still ours".
+	return skillpack.Sync(w, skillpack.SyncSpec{
+		Dir:      root,
+		FileName: skillFileName,
+		Rendered: rendered,
+	}, allowed, opts)
 }
 
 // installGeneratedSkills materialises the per-community skills the
@@ -203,25 +234,4 @@ func planSkills(env agents.Env) ([]agents.FileAction, error) {
 		})
 	}
 	return out, nil
-}
-
-// writeSkillFile installs content at path only when nothing is there,
-// and never overwrites a file the user has edited.
-//
-// Replicated from claudecode's writeAgentArtifact rather than shared:
-// that helper is unexported and carries claudecode's v0.60.0 migration
-// hashes, which describe artifacts this adapter has never shipped.
-func writeSkillFile(w io.Writer, path, content string, opts agents.ApplyOpts) (agents.FileAction, error) {
-	existing, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return agents.WriteIfNotExists(w, path, content, opts)
-	}
-	if err != nil {
-		return agents.FileAction{}, fmt.Errorf("read %s: %w", path, err)
-	}
-	if string(existing) == content {
-		return agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "unchanged"}, nil
-	}
-	internalutil.Warnf(w, "keeping customised skill %s", path)
-	return agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "customised"}, nil
 }

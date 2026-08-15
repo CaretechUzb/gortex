@@ -163,25 +163,19 @@ func applySkills(env agents.Env, opts agents.ApplyOpts) ([]agents.FileAction, er
 // An existing file that differs from the shipped body is the user's and
 // is left alone (ActionSkip "customised"), the same never-clobber posture
 // as claudecode's writeAgentArtifact.
+//
+// The skills half goes through the shared reconciler with a nil allowed
+// set — install materialises the whole pack, and `gortex instructions
+// switch` narrows it afterwards through SyncSkills, so the two can never
+// disagree about what belongs on disk.
 func installCuratedPack(env agents.Env, opts agents.ApplyOpts) ([]agents.FileAction, error) {
-	skills, err := Skills()
+	out, err := syncCuratedSkills(env.Stderr, globalSkillsDir(env.Home), nil, opts)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	commands, err := Commands()
 	if err != nil {
-		return nil, err
-	}
-	out := make([]agents.FileAction, 0, len(skills)+len(commands))
-
-	skillsRoot := globalSkillsDir(env.Home)
-	for _, s := range skills {
-		path := filepath.Join(skillsRoot, s.ID, skillFileName)
-		action, err := writeCuratedFile(env.Stderr, path, renderSkill(s), opts)
-		if err != nil {
-			return out, fmt.Errorf("skill %s: %w", s.ID, err)
-		}
-		out = append(out, action)
+		return out, err
 	}
 
 	commandsRoot := globalCommandsDir(env.Home)
@@ -194,6 +188,53 @@ func installCuratedPack(env agents.Env, opts agents.ApplyOpts) ([]agents.FileAct
 		out = append(out, action)
 	}
 	return out, nil
+}
+
+// SyncSkills reshapes an ALREADY-INSTALLED `~/.config/opencode/skills`
+// tree to the allowed subset (nil = every shipped skill). This is the
+// entry point `gortex instructions switch` drives.
+//
+// A missing skills root is a silent no-op, not an install: switching a
+// profile must never conjure an OpenCode surface on a machine that never
+// ran `gortex install`, and most machines carry only one or two of the
+// supported hosts.
+//
+// Only skills are reconciled, not the command pack — matching Claude
+// Code, whose profile subset governs `~/.claude/skills` and leaves
+// `~/.claude/commands` whole. A slash command is invoked deliberately by
+// name; a skill is auto-selected into the model's context, which is the
+// cost an instruction profile exists to control.
+func SyncSkills(w io.Writer, home string, allowed []string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
+	if home == "" {
+		return nil, nil
+	}
+	root := globalSkillsDir(home)
+	if _, err := os.Stat(root); err != nil {
+		return nil, nil
+	}
+	return syncCuratedSkills(w, root, allowed, opts)
+}
+
+// syncCuratedSkills is the one reconciler both entry points reach. The
+// deletion rule (never remove a customised file) lives in skillpack, not
+// here, so all four skill-aware hosts enforce it identically.
+func syncCuratedSkills(w io.Writer, root string, allowed []string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
+	skills, err := Skills()
+	if err != nil {
+		return nil, err
+	}
+	rendered := make(map[string]string, len(skills))
+	for _, s := range skills {
+		rendered[s.ID] = renderSkill(s)
+	}
+	// KnownHashes stays unset: this pack has only ever shipped one
+	// rendering, so the byte compare against `rendered` is the complete
+	// definition of "still ours".
+	return skillpack.Sync(w, skillpack.SyncSpec{
+		Dir:      root,
+		FileName: skillFileName,
+		Rendered: rendered,
+	}, allowed, opts)
 }
 
 // installGeneratedSkills materialises the per-community skills the skills
