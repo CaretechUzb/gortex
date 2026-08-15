@@ -23,9 +23,24 @@
 //	}
 //
 // We preserve any existing $schema reference and add one if absent.
+//
+// # What lands where
+//
+//	ModeProject: <root>/opencode.json               (mcp stanza)
+//	             <root>/AGENTS.md                   (community routing, --skills)
+//	             <root>/.opencode/skills/<dir>/SKILL.md  (generated community skills)
+//
+//	ModeGlobal:  <home>/.config/opencode/skills/<id>/SKILL.md   (curated pack)
+//	             <home>/.config/opencode/commands/<id>.md       (slash commands)
+//	             <home>/.config/opencode/plugin/gortex.js       (enforcement bridge)
+//
+// skills.go explains the split (codebase-agnostic playbooks are a
+// user-level concern, repo-derived skills are not) and plugin.go explains
+// why the one executable artifact is user-level only.
 package opencode
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,28 +90,37 @@ func projectConfigPath(root string) string {
 }
 
 func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
-	p := &agents.Plan{Files: []agents.FileAction{
-		{Path: projectConfigPath(env.Root), Action: agents.ActionWouldMerge, Keys: []string{"mcp"}},
-	}}
-	if env.Mode != agents.ModeGlobal && env.SkillsRouting != "" {
+	p := &agents.Plan{}
+	if env.Mode != agents.ModeGlobal {
 		p.Files = append(p.Files, agents.FileAction{
-			Path: filepath.Join(env.Root, "AGENTS.md"), Action: agents.ActionWouldMerge,
-			Keys: []string{"communities-block"},
+			Path: projectConfigPath(env.Root), Action: agents.ActionWouldMerge, Keys: []string{"mcp"},
 		})
+		if env.SkillsRouting != "" {
+			p.Files = append(p.Files, agents.FileAction{
+				Path: filepath.Join(env.Root, "AGENTS.md"), Action: agents.ActionWouldMerge,
+				Keys: []string{"communities-block"},
+			})
+		}
 	}
+	p.Files = append(p.Files, planPlugin(env)...)
+	skillFiles, err := planSkills(env)
+	if err != nil {
+		return nil, err
+	}
+	p.Files = append(p.Files, skillFiles...)
 	return p, nil
 }
 
 func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, error) {
 	res := &agents.Result{Name: Name, DocsURL: DocsURL}
-	if env.Mode == agents.ModeGlobal {
-		return res, nil
-	}
 	detected, _ := a.Detect(env)
 	res.Detected = detected
 	if !detected && !opts.ForceDetect {
 		internalutil.Logf(env.Stderr, "[gortex init] skip OpenCode setup (OpenCode not detected)")
 		return res, nil
+	}
+	if env.Mode == agents.ModeGlobal {
+		return res, a.applyGlobal(env, opts, res)
 	}
 	internalutil.Logf(env.Stderr, "[gortex init] setting up OpenCode integration...")
 
@@ -150,6 +174,44 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		res.Files = append(res.Files, routingAction)
 	}
 
+	// Generated community skills describe this repo, so they are the one
+	// skill set that belongs in the repo tree. skills.go documents the
+	// flat layout and the kebab-case gate.
+	skillActions, err := applySkills(env, opts)
+	if err != nil {
+		return res, fmt.Errorf("opencode skills: %w", err)
+	}
+	res.Files = append(res.Files, skillActions...)
+
 	res.Configured = true
 	return res, nil
+}
+
+// applyGlobal handles `gortex install`: the codebase-agnostic artifacts
+// that belong to the user, not to any one repo — the curated playbook and
+// slash-command packs, plus the enforcement bridge.
+//
+// There is no user-level MCP stanza to write here: `gortex init` puts the
+// server in the repo's own opencode.json, which is where a per-project
+// daemon scope belongs.
+func (a *Adapter) applyGlobal(env agents.Env, opts agents.ApplyOpts, res *agents.Result) error {
+	if env.Home == "" {
+		return fmt.Errorf("opencode: global mode requires a resolved home directory")
+	}
+	internalutil.Logf(env.Stderr, "[gortex install] setting up OpenCode integration...")
+
+	pluginActions, err := applyPlugin(env, opts)
+	if err != nil {
+		return fmt.Errorf("opencode plugin: %w", err)
+	}
+	res.Files = append(res.Files, pluginActions...)
+
+	skillActions, err := applySkills(env, opts)
+	if err != nil {
+		return fmt.Errorf("opencode skills: %w", err)
+	}
+	res.Files = append(res.Files, skillActions...)
+
+	res.Configured = true
+	return nil
 }

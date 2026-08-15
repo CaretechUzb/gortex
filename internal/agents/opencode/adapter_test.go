@@ -27,9 +27,10 @@ func TestOpenCodeUsesMCPSectionKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	// Two creates: opencode.json for MCP plus AGENTS.md for the
-	// instructions block OpenCode reads on every task.
-	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 2})
+	// Three creates: opencode.json for MCP, AGENTS.md for the
+	// instructions block OpenCode reads on every task, and the one
+	// generated community skill NewEnv seeds.
+	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 3})
 
 	// The MCP config must be the root opencode.json, not the ignored
 	// .opencode/config.json.
