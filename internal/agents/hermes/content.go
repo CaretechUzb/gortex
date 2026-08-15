@@ -7,6 +7,7 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/claudecode"
+	"github.com/zzet/gortex/internal/agents/skillpack"
 	yaml "gopkg.in/yaml.v3"
 )
 
@@ -143,7 +144,8 @@ func masterSkillCommands() string {
 //
 // The bodies are the single source of truth in
 // internal/agents/claudecode (reused verbatim so the two agents never
-// drift) re-wrapped with Hermes frontmatter. Hermes also turns every
+// drift); internal/agents/skillpack strips the Claude frontmatter off
+// them and Hermes' own envelope goes back on. Hermes also turns every
 // installed skill into a `/skill-name` slash command, so the
 // `/gortex-explore`-style cross-references in the bodies resolve to the
 // sibling skills installed here.
@@ -157,7 +159,17 @@ func RoutingSkills() map[string]string {
 		if name == "gortex-guide" {
 			continue
 		}
-		out[name] = hermesSkillFromClaude(name, claudeBody)
+		skill, err := skillpack.Parse(name, claudeBody)
+		if err != nil {
+			// The Claude bodies are compile-time constants, so this can
+			// only fire if that package is edited into a shape skillpack
+			// rejects (a non-kebab id, an unclosed frontmatter fence).
+			// Skip rather than install a skill whose frontmatter we could
+			// not rewrite — skillpack's test over claudecode.GlobalSkills
+			// is what turns the mistake into a red build.
+			continue
+		}
+		out[name] = hermesSkillFromClaude(skill)
 	}
 	return out
 }
@@ -174,20 +186,24 @@ func RoutingSkillNames() []string {
 	return names
 }
 
-// hermesSkillFromClaude re-frames one Claude Code skill as a Hermes
-// skill: it keeps the body verbatim and swaps the Claude frontmatter
-// (name + description) for Hermes frontmatter (name + description +
-// version + metadata.hermes.{tags,category}).
-func hermesSkillFromClaude(name, claudeContent string) string {
-	desc := claudeFrontmatterField(claudeContent, "description")
-	body := stripClaudeFrontmatter(claudeContent)
-	tags, category := routingSkillTaxonomy(name)
+// hermesSkillFromClaude re-frames one parsed skill as a Hermes skill:
+// it keeps the body verbatim and puts Hermes frontmatter (name +
+// description + version + metadata.hermes.{tags,category}) in front of
+// it.
+//
+// The frontmatter is built here rather than with
+// skillpack.RenderFrontmatter because Hermes' block is a nested mapping
+// with flow sequences, which the flat ordered-pair renderer cannot
+// express. Only the description scalar goes through skillpack, so the
+// prose quoting rule stays shared with every other host.
+func hermesSkillFromClaude(skill skillpack.Skill) string {
+	tags, category := routingSkillTaxonomy(skill.ID)
 
 	var b strings.Builder
 	b.WriteString("---\n")
-	b.WriteString("name: " + name + "\n")
-	if desc != "" {
-		b.WriteString("description: " + desc + "\n")
+	b.WriteString("name: " + skill.ID + "\n")
+	if skill.Description != "" {
+		b.WriteString("description: " + skillpack.QuoteYAMLValue(skill.Description) + "\n")
 	}
 	b.WriteString("version: 1.0.0\n")
 	b.WriteString("metadata:\n")
@@ -197,46 +213,8 @@ func hermesSkillFromClaude(name, claudeContent string) string {
 	b.WriteString("    platforms: [linux, macos, windows]\n")
 	b.WriteString("    related_skills: [" + SkillName + "]\n")
 	b.WriteString("---\n")
-	b.WriteString(body)
+	b.WriteString(skill.Body)
 	return b.String()
-}
-
-// stripClaudeFrontmatter drops the leading `---`-fenced YAML block from
-// a Claude skill body, returning just the markdown. The skill bodies
-// always start with `---\n`; the first `\n---\n` after it closes the
-// frontmatter.
-func stripClaudeFrontmatter(s string) string {
-	const open = "---\n"
-	if !strings.HasPrefix(s, open) {
-		return s
-	}
-	rest := s[len(open):]
-	if _, after, found := strings.Cut(rest, "\n---\n"); found {
-		return after
-	}
-	return s
-}
-
-// claudeFrontmatterField extracts a single-line scalar field from the
-// leading frontmatter block, value verbatim (quotes and inner escapes
-// preserved — the Claude descriptions are already valid YAML double-
-// quoted scalars). Returns "" when the field is absent.
-func claudeFrontmatterField(s, field string) string {
-	const open = "---\n"
-	if !strings.HasPrefix(s, open) {
-		return ""
-	}
-	block := s[len(open):]
-	if before, _, found := strings.Cut(block, "\n---\n"); found {
-		block = before
-	}
-	prefix := field + ":"
-	for line := range strings.SplitSeq(block, "\n") {
-		if rest, ok := strings.CutPrefix(line, prefix); ok {
-			return strings.TrimSpace(rest)
-		}
-	}
-	return ""
 }
 
 // routingSkillTaxonomy assigns Hermes discovery tags + a category to a
