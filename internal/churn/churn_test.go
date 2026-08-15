@@ -203,3 +203,61 @@ func currentBranch(t *testing.T, dir string) string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+// TestStripRepoPrefix_NeedsNoExternalBinaries pins the fix for the
+// subprocess fan-out: resolving whether a path exists is a filesystem
+// question, and answering it must not depend on anything being on PATH.
+// The previous implementation gated on `exec.LookPath("git")` and then
+// shelled out to `test -f` once per indexed file, so on a host where
+// neither resolves — every Windows box, since there is no `test`
+// executable — the prefix was never stripped and the enricher silently
+// produced no churn data.
+func TestStripRepoPrefix_NeedsNoExternalBinaries(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "internal"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "internal", "foo.go")
+	if err := os.WriteFile(target, []byte("package internal\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing is resolvable on PATH — the old implementation bailed here.
+	t.Setenv("PATH", "")
+
+	if got := stripRepoPrefix("myrepo/internal/foo.go", root); got != "internal/foo.go" {
+		t.Errorf("prefixed path: got %q, want %q", got, "internal/foo.go")
+	}
+	if got := stripRepoPrefix("internal/foo.go", root); got != "internal/foo.go" {
+		t.Errorf("repo-relative path: got %q, want %q", got, "internal/foo.go")
+	}
+	// A path that resolves under neither spelling is returned untouched.
+	if got := stripRepoPrefix("myrepo/internal/absent.go", root); got != "myrepo/internal/absent.go" {
+		t.Errorf("unresolvable path: got %q, want it unchanged", got)
+	}
+}
+
+// TestFileExists_MatchesTestF keeps the os.Stat replacement honest about
+// the `test -f` semantics it replaced: regular files only, symlinks
+// followed, directories and missing paths rejected.
+func TestFileExists_MatchesTestF(t *testing.T) {
+	dir := t.TempDir()
+	regular := filepath.Join(dir, "regular")
+	if err := os.WriteFile(regular, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !fileExists(regular) {
+		t.Error("regular file reported missing")
+	}
+	if fileExists(dir) {
+		t.Error("directory reported as a regular file")
+	}
+	if fileExists(filepath.Join(dir, "missing")) {
+		t.Error("missing path reported as a regular file")
+	}
+
+	link := filepath.Join(dir, "regular-link")
+	if err := os.Symlink(regular, link); err == nil && !fileExists(link) {
+		t.Error("symlink to a regular file reported missing")
+	}
+}
