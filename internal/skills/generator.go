@@ -88,18 +88,25 @@ func (g *Generator) GenerateAll() []GeneratedSkill {
 	return skills
 }
 
-// GenerateRouting produces the shared agent routing table between markers.
+// GenerateRouting produces the shared community-routing payload. Callers
+// embed this verbatim inside their own CommunitiesStartMarker/
+// CommunitiesEndMarker fence (agents.UpsertMarkedBlock) — this payload must
+// not carry a marker pair of its own, or every adapter ends up writing a
+// doubly-fenced block that the outer idempotent-replace can never clean up.
+//
+// The routing column names a graph query rather than a slash command:
+// slash commands only resolve on Claude Code, while every other adapter
+// this block reaches (Codex, Cursor, Windsurf, ...) only has the MCP/CLI
+// graph tools, so the invocation must work there too.
 func (g *Generator) GenerateRouting(skills []GeneratedSkill) string {
 	var sb strings.Builder
-	sb.WriteString("<!-- gortex:skills:start -->\n")
 	sb.WriteString("## Community Skills\n\n")
-	sb.WriteString("| Area | Description | Skill |\n")
-	sb.WriteString("|------|-------------|-------|\n")
+	sb.WriteString("| Area | Description | Explore |\n")
+	sb.WriteString("|------|-------------|---------|\n")
 	for _, s := range skills {
 		title := capitalizeWords(strings.ReplaceAll(s.Label, "-", " "))
-		fmt.Fprintf(&sb, "| %s | %d symbols | `/gortex-%s` |\n", title, g.CommunitySize(s.CommunityID), s.Label)
+		fmt.Fprintf(&sb, "| %s | %d symbols | `analyze(operation:\"communities\", id:\"%s\")` |\n", title, g.CommunitySize(s.CommunityID), s.CommunityID)
 	}
-	sb.WriteString("<!-- gortex:skills:end -->\n")
 	return sb.String()
 }
 
@@ -192,13 +199,17 @@ func (g *Generator) renderSkill(c analysis.Community, crossComm map[string]map[s
 		sb.WriteString("\n")
 	}
 
-	// How to explore.
+	// How to explore. Names the public facade tools (explore/analyze/
+	// relations), not the one-tool-per-operation names they front — the
+	// legacy names are implementation detail and drift as operations get
+	// regrouped, while the facade surface is the stable public contract
+	// every adapter is told to use (see facade_registry.go).
 	sb.WriteString("## How to Explore\n\n")
 	sb.WriteString("```\n")
-	fmt.Fprintf(&sb, "get_communities with id: \"%s\"\n", c.ID)
-	fmt.Fprintf(&sb, "smart_context with task: \"understand %s\", format: \"gcx\"\n", label)
+	fmt.Fprintf(&sb, "analyze(operation:\"communities\", id:\"%s\")\n", c.ID)
+	fmt.Fprintf(&sb, "explore(operation:\"context\", task:\"understand %s\", format:\"gcx\")\n", label)
 	if len(entryPoints) > 0 {
-		fmt.Fprintf(&sb, "find_usages with id: \"%s\", format: \"gcx\"\n", entryPoints[0])
+		fmt.Fprintf(&sb, "relations(operation:\"usages\", target:{symbol:\"%s\"}, format:\"gcx\")\n", entryPoints[0])
 	}
 	sb.WriteString("```\n\n")
 	sb.WriteString("_`format: \"gcx\"` returns the [GCX1 compact wire format](../../docs/wire-format.md) — round-trippable, ~27% fewer tokens than JSON. Drop it for JSON output; agents using `@gortex/wire` or the Go `github.com/gortexhq/gcx-go` package decode either._\n")

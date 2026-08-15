@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -10,6 +11,9 @@ import (
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/codex"
+	"github.com/zzet/gortex/internal/agents/copilotcli"
+	"github.com/zzet/gortex/internal/agents/hermes"
+	"github.com/zzet/gortex/internal/agents/opencode"
 	"github.com/zzet/gortex/internal/profiles"
 )
 
@@ -20,6 +24,35 @@ import (
 func fileContains(path, needle string) bool {
 	data, err := os.ReadFile(path)
 	return err == nil && strings.Contains(string(data), needle)
+}
+
+// hostSkillSyncs is every host whose installed skill tree a profile
+// switch has to reshape. Each entry reconciles that host's own root
+// against the profile's subset, and each already knows how to enforce
+// the one rule that matters: a skill the user edited is kept, never
+// deleted to satisfy a profile.
+//
+// The table lives here, in cmd, deliberately. Routing the other hosts
+// through claudecode would make one adapter depend on three others and
+// invert exactly the direction internal/agents/skillpack was extracted
+// to protect (adapters -> skillpack, never adapter -> adapter). The
+// orchestrator is the layer allowed to know about all of them.
+//
+// Only Claude Code's entry installs missing skills on a machine that
+// never ran `gortex install`; the three newer hosts no-op when their
+// skills root is absent. That asymmetry is intentional — it preserves
+// the behaviour `instructions switch` has always had for Claude Code
+// while keeping a switch from conjuring a Codex / OpenCode / Copilot
+// surface the user never asked for.
+var hostSkillSyncs = []struct {
+	name string
+	sync func(w io.Writer, home string, allowed []string, opts agents.ApplyOpts) ([]agents.FileAction, error)
+}{
+	{"claude code", claudecode.SyncGlobalSkills},
+	{"codex", codex.SyncSkills},
+	{"opencode", opencode.SyncSkills},
+	{"copilot cli", copilotcli.SyncSkills},
+	{"hermes", hermes.SyncSkills},
 }
 
 // instructions.go is the `gortex instructions` command tree — the CLI
@@ -120,15 +153,21 @@ func runInstructionsSwitch(cmd *cobra.Command, args []string) error {
 	}
 	cmd.Printf("Switched to the %q instruction profile (active copy: %s/%s).\n", p.Name, dir, profiles.ActiveFileName)
 
-	// Reconcile the installed skills with the profile's subset. Best
-	// effort: a missing home or an unwritable skills dir downgrades to
-	// a warning, the profile switch itself has already landed.
+	// Reconcile the installed skills with the profile's subset, on every
+	// skill-aware host — a profile that keeps three playbooks is a lie
+	// if the other eighteen are still sitting in Codex's or OpenCode's
+	// picker. Best effort: a missing home or an unwritable skills dir
+	// downgrades to a warning, the profile switch itself has already
+	// landed.
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		actions, err := claudecode.SyncGlobalSkills(cmd.ErrOrStderr(), home, p.Skills, agents.ApplyOpts{})
-		if err != nil {
-			fmt.Fprintf(cmd.ErrOrStderr(), "warning: skills sync incomplete: %v\n", err)
-		} else {
-			installed, removed := 0, 0
+		installed, removed := 0, 0
+		for _, host := range hostSkillSyncs {
+			actions, err := host.sync(cmd.ErrOrStderr(), home, p.Skills, agents.ApplyOpts{})
+			if err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s skills sync incomplete: %v\n", host.name, err)
+			}
+			// Counted even on error: the actions returned before the
+			// failure describe files that really did change.
 			for _, a := range actions {
 				switch a.Action {
 				case agents.ActionCreate:
@@ -137,9 +176,9 @@ func runInstructionsSwitch(cmd *cobra.Command, args []string) error {
 					removed++
 				}
 			}
-			if installed+removed > 0 {
-				cmd.Printf("Skills reconciled: %d installed, %d removed.\n", installed, removed)
-			}
+		}
+		if installed+removed > 0 {
+			cmd.Printf("Skills reconciled: %d installed, %d removed.\n", installed, removed)
 		}
 		// Nudge when the pointer block was never installed — the
 		// profile only reaches agents through the @-include.

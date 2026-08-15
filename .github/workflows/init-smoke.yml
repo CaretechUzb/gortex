@@ -68,6 +68,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/repo/.omp"
           # OpenClaw
           mkdir -p "$RUNNER_TEMP/home/.openclaw"
+          # GitHub Copilot CLI — the standalone `copilot` binary, not the
+          # VS Code extension the `vscode` adapter targets.
+          mkdir -p "$RUNNER_TEMP/home/.copilot"
 
       - name: Run gortex init --dry-run --json
         id: run
@@ -88,9 +91,12 @@ jobs:
           agents = {a["name"]: a for a in data["agents"]}
           expected = [
               "claude-code", "aider", "cline", "codex", "continue",
-              "cursor", "gemini", "kilocode", "kiro", "oh-my-pi", "opencode",
-              "openclaw", "vscode", "windsurf", "zed",
+              "copilot-cli", "cursor", "gemini", "kilocode", "kiro",
+              "oh-my-pi", "opencode", "openclaw", "vscode", "windsurf", "zed",
               # "antigravity" always true when HOME is set; not a detection test.
+              # hermes, kimi and pi have no sentinel here yet — the list is
+              # hand-maintained, so a new adapter is only covered once it is
+              # added in both places above.
           ]
           failed = []
           for name in expected:

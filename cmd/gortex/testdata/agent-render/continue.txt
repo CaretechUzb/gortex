@@ -1,4 +1,4 @@
-=== root/.continue/mcpServers/gortex.json ===
+=== project/root/.continue/mcpServers/gortex.json ===
 {
   "mcpServers": {
     "gortex": {
@@ -12,7 +12,7 @@
     }
   }
 }
-=== root/.continue/rules/gortex-communities.md ===
+=== project/root/.continue/rules/gortex-communities.md ===
 <!-- gortex:communities:start -->
 - [example-community](.claude/skills/example/SKILL.md) — example routing block
 

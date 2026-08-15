@@ -48,7 +48,7 @@ High-quality parsing 257 languages/grammars through tree-sitter AST analysis, in
 - **Cross-repo by default** — N repos in one graph; contracts, references, and call chains span repo boundaries with evidence-gated resolution, contract matching, impact analysis, per-session isolation → [docs/multi-repo.md](docs/multi-repo.md)
 - **Extreamly fast analysis** — a precomputed depth-3 reach index turns blast-radius queries into O(seeds × reach) map lookups. Safe to ask "what breaks if I change this?" on every edit. No dozens of tool calls to grasp context.
 - **Zero external dependencies** — single binary, everything in-process. No network, no model download to get started. Install, start daemon, use.
-- **Agent integrations (19)** — `gortex init` configures every detected coding assistant on the machine → [docs/agents.md](docs/agents.md)
+- **Agent integrations (20)** — `gortex init` configures every detected coding assistant on the machine → [docs/agents.md](docs/agents.md)
 - **100+ MCP tools, 16 resources, 3 prompts** — symbol lookup, call chains, blast radius, dataflow, clone detection, refactoring, code actions → [docs/mcp.md](docs/mcp.md)
 - **Semantic search default-on** — baked GloVe-50d (3.8 MB embedded), store-native FTS5/BM25 + vector with adaptive alpha fusion, zero deps; opt-in MiniLM / Ollama / OpenAI → [docs/semantic-search.md](docs/semantic-search.md)
 - **Speculative execution** — `preview_edit` / `simulate_chain` answer "what would change if I applied this WorkspaceEdit?" without touching disk
@@ -162,7 +162,7 @@ Data flow, graph schema (node and edge kinds, multi-repo fields, test taxonomy),
 | Optional LLM features | [llm.md](docs/llm.md) |
 | LSP integration | [lsp.md](docs/lsp.md) |
 | Per-community skills & agent usage | [skills.md](docs/skills.md) |
-| AI agent adapters (19) | [agents.md](docs/agents.md) |
+| AI agent adapters (20) | [agents.md](docs/agents.md) |
 | Supported languages (257) | [languages.md](docs/languages.md) |
 | Token savings | [savings.md](docs/savings.md) |
 | GCX1 wire format | [wire-format.md](docs/wire-format.md) |

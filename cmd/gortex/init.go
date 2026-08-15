@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/agents/cline"
 	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/agents/continuedev"
+	"github.com/zzet/gortex/internal/agents/copilotcli"
 	"github.com/zzet/gortex/internal/agents/cursor"
 	"github.com/zzet/gortex/internal/agents/gemini"
 	"github.com/zzet/gortex/internal/agents/hermes"
@@ -126,6 +127,7 @@ func buildRegistry() *agents.Registry {
 	r.Register(cline.New())
 	r.Register(codex.New())
 	r.Register(continuedev.New())
+	r.Register(copilotcli.New())
 	r.Register(gemini.New())
 	r.Register(hermes.New())
 	r.Register(kimi.New())

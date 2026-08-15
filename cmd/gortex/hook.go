@@ -14,7 +14,7 @@ var (
 
 var hookCmd = &cobra.Command{
 	Use:    "hook",
-	Short:  "Agent hook handler (Claude Code by default; --agent for Gemini / Antigravity / Hermes / Kimi)",
+	Short:  "Agent hook handler (Claude Code by default; --agent for Codex / Copilot CLI / Kimi / Hermes / Pi / OpenCode / Gemini / Antigravity)",
 	Hidden: true, // Not for direct user invocation.
 	Run: func(_ *cobra.Command, _ []string) {
 		// --agent selects the hook wire protocol. Empty (the default) is the
@@ -22,10 +22,10 @@ var hookCmd = &cobra.Command{
 		// remaining external agents share the hookSpecificOutput.additionalContext
 		// wire shape.
 		// Attribute every telemetry row this process writes to the harness that
-	// invoked it, before any handler runs.
-	hooks.SetAgent(hookAgent)
+		// invoked it, before any handler runs.
+		hooks.SetAgent(hookAgent)
 
-	switch hookAgent {
+		switch hookAgent {
 		case "hermes":
 			// Hermes (NousResearch hermes-agent) sends
 			// snake_case events and expects an action/message decision shape, so
@@ -37,6 +37,20 @@ var hookCmd = &cobra.Command{
 			// shells `gortex hook --agent=pi`, sending a normalized event
 			// envelope on stdin and applying the PiDecision read back.
 			hooks.RunPi(hookPort, hooks.ParseMode(hookMode))
+			return
+		case "opencode":
+			// OpenCode has no hook configuration at all — its Gortex plugin
+			// (JS) shells `gortex hook --agent=opencode` from
+			// tool.execute.before / permission.ask / chat.message and applies
+			// the BridgeDecision read back, so it shares Pi's bridge core.
+			hooks.RunOpenCode(hookPort, hooks.ParseMode(hookMode))
+			return
+		case "copilot-cli":
+			// GitHub Copilot CLI: camelCase lifecycle events and a flat,
+			// per-event stdout shape (permissionDecision / modifiedPrompt /
+			// additionalContext) rather than Claude's hookSpecificOutput
+			// envelope, over a lowercase tool vocabulary of its own.
+			hooks.RunCopilot(hookPort, hooks.ParseMode(hookMode))
 			return
 		case "codex":
 			// Codex defaults to advisory context. Explicit postures add hard
@@ -65,6 +79,6 @@ func init() {
 	hookCmd.Flags().StringVar(&hookMode, "mode", "",
 		"hook posture: Claude defaults to deny and accepts deny|enrich|consult-unlock|nudge; Codex defaults to enrich and accepts enrich|deny|rewrite|suppress")
 	hookCmd.Flags().StringVar(&hookAgent, "agent", "",
-		"hook wire protocol: empty/'claude' (Claude Code lifecycle hooks), 'codex' (Codex Bash/MCP/apply_patch hooks), 'kimi' (Kimi Code CLI hooks), 'hermes' (NousResearch hermes-agent hooks), 'pi' (Pi extension bridge), or 'gemini'/'antigravity'. Default (empty) is Claude Code.")
+		"hook wire protocol: empty/'claude' (Claude Code lifecycle hooks), 'codex' (Codex Bash/MCP/apply_patch hooks), 'copilot-cli' (GitHub Copilot CLI hooks), 'kimi' (Kimi Code CLI hooks), 'hermes' (NousResearch hermes-agent hooks), 'pi' (Pi extension bridge), 'opencode' (OpenCode plugin bridge), or 'gemini'/'antigravity'. Default (empty) is Claude Code.")
 	rootCmd.AddCommand(hookCmd)
 }

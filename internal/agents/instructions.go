@@ -150,64 +150,12 @@ This harness has no native MCP transport. Invoke public Gortex tools only as ` +
 4. Use ` + "`" + `gortex call capabilities` + "`" + ` only when exact operation fields are unknown.
 `
 
-// AppendInstructions appends body to path, creating the file if
-// missing. Idempotent: when `sentinel` is already present anywhere in
-// the file we skip with ActionSkip and log the reason. Callers pass
-// the adapter's ApplyOpts through so --dry-run / --global / --force
-// all flow to the right FileAction status.
-//
-// Not atomic. Rules files are plaintext a human edits, matching the
-// historical CLAUDE.md append behaviour — a concurrent external writer
-// during init is extraordinarily unlikely and atomic rename of a file
-// a human is editing would fight their editor.
-func AppendInstructions(w io.Writer, path, body, sentinel string, opts ApplyOpts) (FileAction, error) {
-	existing, readErr := os.ReadFile(path)
-	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-		return FileAction{}, fmt.Errorf("read %s: %w", path, readErr)
-	}
-	existed := readErr == nil
-	if existed && strings.Contains(string(existing), sentinel) {
-		if w != nil {
-			fmt.Fprintf(w, "[gortex init] skip %s (Gortex block already present)\n", path)
-		}
-		return FileAction{Path: path, Action: ActionSkip, Reason: "block-present"}, nil
-	}
-
-	if opts.DryRun {
-		action := ActionWouldMerge
-		if !existed {
-			action = ActionWouldCreate
-		}
-		return FileAction{Path: path, Action: action, Keys: []string{"gortex-block"}}, nil
-	}
-
-	// Two blank lines between existing content and the block so the
-	// appended section reads as a separate document and doesn't glue
-	// onto the last paragraph the user wrote.
-	prefix := ""
-	if existed && len(existing) > 0 {
-		prefix = "\n\n"
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return FileAction{}, err
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return FileAction{}, err
-	}
-	defer f.Close()
-	if _, err := f.WriteString(prefix + body); err != nil {
-		return FileAction{}, err
-	}
-	if w != nil {
-		fmt.Fprintf(w, "[gortex init] appended Gortex block to %s\n", path)
-	}
-	action := ActionMerge
-	if !existed {
-		action = ActionCreate
-	}
-	return FileAction{Path: path, Action: action, Keys: []string{"gortex-block"}}, nil
-}
+// UpsertMarkedBlock is the only supported way to put a Gortex block into
+// a human-edited instructions file. The older sentinel-guarded append it
+// replaced could not update a block in place — it detected the sentinel
+// and skipped, so a changed body never reached a file that already had
+// one — and it wrote non-atomically. Adapters must not reintroduce that
+// pattern; see UpsertMarkedBlock below.
 
 // CursorMDCFrontmatter wraps the instructions body in the YAML
 // frontmatter Cursor expects for MDC rules files. Cursor reads

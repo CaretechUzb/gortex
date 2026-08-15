@@ -1,9 +1,27 @@
-=== root/AGENTS.md ===
+=== project/root/.opencode/skills/gortex-example-one/SKILL.md ===
+---
+name: gortex-example-one
+description: Example generated community skill used by the render drift fence.
+---
+
+# example-one
+
+Routing stub for the example-one community.
+=== project/root/.opencode/skills/gortex-example-two/SKILL.md ===
+---
+name: gortex-example-two
+description: Example generated community skill used by the render drift fence.
+---
+
+# example-two
+
+Routing stub for the example-two community.
+=== project/root/AGENTS.md ===
 <!-- gortex:communities:start -->
 - [example-community](.claude/skills/example/SKILL.md) — example routing block
 
 <!-- gortex:communities:end -->
-=== root/opencode.json ===
+=== project/root/opencode.json ===
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
@@ -20,3 +38,1183 @@
     }
   }
 }
+=== global/home/.config/opencode/commands/gortex-add-test.md ===
+---
+description: "Add tests for under-tested code and coverage gaps."
+---
+
+# Add Tests with Gortex
+
+1. Localize the behavior with `explore`.
+2. Confirm the specific gap with `change({operation: "tests", source: {symbols: ["<id>"]}})`. Use repository-wide `analyze({kind: "untested"})` or path-scoped `analyze({kind: "coverage_gaps", options: {path_prefix: "<path>"}})` only for broader coverage discovery.
+3. Inspect callers with `relations({operation: "callers", target: {symbol: "<id>"}})` and request targets with `change({operation: "tests", source: {symbols: ["<id>"]}})`.
+4. Add the narrowest test with `edit({operation: "file", target: {file: "<existing test path>"}, ...})`; use operation `write` for a new test file.
+5. Run the test, then require `change` operations `detect` and `guards`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-architecture-review.md ===
+---
+description: "Graph-grounded architectural read of a repo."
+---
+
+# Review Architecture with Gortex
+
+1. Build the map with `explore({operation: "outline"})` and `analyze` kinds `architecture` and `communities`.
+2. Measure boundaries with `analyze({kind: "coupling"})` and cycles with `analyze({kind: "cycles"})`.
+3. Trace representative paths with `trace` and inspect public boundaries with `analyze({kind: "contracts", options: {action: "list"}})`.
+4. Deliver observed structure, intended structure, violations, consequences, and prioritized changes. Cite graph evidence for every finding.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-co-change.md ===
+---
+description: "Find what changes together and hidden coupling."
+---
+
+# Analyze Co-Change with Gortex
+
+1. Resolve the anchor with `search({operation: "symbols", query: "<name>"})`.
+2. Call symbol-scoped `analyze({kind: "co_change", target: {symbol: "<id>"}})` and repository-wide `analyze({kind: "churn"})`.
+3. Compare structural coupling through `relations` operations `cluster` and `dependents`.
+4. Report strong historical pairs, graph-confirmed dependencies, likely hidden coupling, and an actionable boundary or guard.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-cross-repo-usage.md ===
+---
+description: "Find who uses a symbol across all consumer repos."
+---
+
+# Find Cross-Repository Usage with Gortex
+
+1. Confirm tracked repositories with `workspace({operation: "repos"})`.
+2. Resolve the provider symbol with `search({operation: "symbols", query: "<name>", options: {repo: "<provider>"}})`.
+3. Call `relations({operation: "usages", target: {symbol: "<id>"}})` and group results by repository.
+4. Add `analyze({kind: "cross_repo", options: {repo: "<provider>"}})` for repository boundaries and `analyze({kind: "contracts", options: {action: "bridge", mode: "impact", symbol: "<id>"}})` for wire-level consumers.
+5. Report indexed coverage and name any untracked repositories as an explicit gap.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-dataflow-trace.md ===
+---
+description: "Trace where a value flows through the code."
+---
+
+# Trace Data Flow with Gortex
+
+1. Call `explore({operation: "task", task: "trace <value> from <source> to <sink>"})`.
+2. Resolve endpoints with `search({operation: "symbols", query: "<source or sink>"})`.
+3. Use `trace({operation: "flow", target: {symbol: "<source-id>"}, to: {symbol: "<sink-id>"}})`. Use operation `taint` when source/sink security semantics matter.
+4. Cross-check control flow with operation `call_chain` when the data-flow graph has a gap.
+5. Report each hop with its symbol ID and confidence; distinguish no path from incomplete indexing.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-debug.md ===
+---
+description: "Debug a bug, trace an error, or find why something fails."
+---
+
+# Debug with Gortex
+
+1. Localize the exact symptom with `explore({operation: "task", task: "<error and observed behavior>"})`.
+2. For a literal error, call `search({operation: "text", query: "<exact text>"})`. For a name, use operation `symbols`.
+3. Walk toward the cause with `relations({operation: "callers", target: {symbol: "<id>"}})` and `trace({operation: "call_chain", target: {symbol: "<id>"}})`. Use `flow` or `taint` only after resolving both `target` and `to` endpoints.
+4. Confirm repository-wide error propagation with `analyze({kind: "error_surface"})`; use `options.repo` to narrow a multi-repository workspace.
+5. Before fixing, run `change({operation: "impact", source: {symbols: ["<id>"]}})`. After fixing, run `change` operations `detect`, `tests`, and `guards`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-episode-replay.md ===
+---
+description: "Reconstruct what changed in a window (postmortem, release, PR)."
+---
+
+# Replay a Change Episode with Gortex
+
+1. Run `analyze({kind: "replay", options: {from: "<start>", to: "<end>"}})` for the requested window.
+2. Project the relevant diff with `change({operation: "detect", source: {scope: "<scope>"}})`.
+3. Surface decisions with `recall({operation: "surface", arguments: {task: "<episode>"}})`.
+4. Trace important before/after paths using `trace` and identify which change altered behavior.
+5. Produce a timestamped narrative with evidence links, impact, missed signals, and remaining uncertainty.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-explore.md ===
+---
+description: "Understand how code works or trace an execution flow."
+---
+
+# Explore a Codebase with Gortex
+
+1. Call `explore({operation: "task", task: "<question>"})`.
+2. Read only a returned anchor with `read({target: {symbol: "<id>"}})`.
+3. Choose the needed relationship (`callers`, `usages`, or `dependencies`), for example `relations({operation: "callers", target: {symbol: "<id>"}})`; use `trace({operation: "call_chain", target: {symbol: "<id>"}})` for execution order.
+4. Answer with the execution path, file locations, symbol IDs, and any graph uncertainty.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-extract-function.md ===
+---
+description: "Extract code into a function or method via LSP refactor."
+---
+
+# Extract a Function with Gortex
+
+1. Inspect the file with `read({operation: "editing_context", target: {file: "<path>"}})`.
+2. Resolve the selected range with `change({operation: "ranges", source: {file: "<path>", range: {...}}})`.
+3. Request extraction actions with `change({operation: "code_actions", source: {file: "<path>", range: {...}}})`.
+4. Apply the selected action through `refactor({operation: "apply_code_action", target: {file: "<path>"}, options: {...}})`.
+5. Run `change` operations `detect`, `tests`, `guards`, and `contract`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-fix-all.md ===
+---
+description: "Clear LSP diagnostics — one error, a file, or source.fixAll."
+---
+
+# Fix Diagnostics with Gortex
+
+1. Read diagnostics using `change({operation: "diagnostics", source: {file: "<path>"}})`.
+2. Fetch applicable fixes with `change({operation: "code_actions", source: {file: "<path>"}})`.
+3. Apply one reviewed action with `refactor({operation: "apply_code_action", target: {file: "<path>"}, options: {...}})`, or use operation `fix_all` only when the user asked for all safe fixes.
+4. Re-run diagnostics, then run `change` operations `detect` and `tests`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-guide.md ===
+---
+description: "Gortex reference: available tools, graph schema, and workflow."
+---
+
+# Gortex Guide
+
+Use this sequence for codebase work:
+
+1. `explore({operation: "task", task: "<goal or bug>"})` — localize the task and obtain the working set.
+2. `search({operation: "symbols", query: "<name>"})` or `search({operation: "text", query: "<literal>"})` — resolve a precise anchor.
+3. `read({operation: "source", target: {symbol: "<id>"}})` — read only the source needed.
+4. `relations({operation: "usages", target: {symbol: "<id>"}})` or `trace({operation: "call_chain", target: {symbol: "<id>"}})` — follow verified graph edges.
+5. `change({operation: "impact", source: {symbols: ["<id>"]}})` — assess a planned change.
+6. Apply with `edit` or `refactor`, then run `change` operations `detect`, `guards`, and `tests`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-impact.md ===
+---
+description: "Assess what breaks if you change X before editing it."
+---
+
+# Assess Change Impact with Gortex
+
+1. Resolve the target with `search({operation: "symbols", query: "<name>"})`.
+2. Query `relations` operations `usages`, `dependents`, and `implementations` for the resolved symbol.
+3. Call `change({operation: "impact", source: {symbols: ["<id>"]}})`; add operation `api_impact` for a public API.
+4. For a signature change, require `change({operation: "verify", source: {changes: [{symbol_id: "<id>", new_signature: "<signature>"}]}})`.
+5. Report direct callers, transitive risk, interfaces, contracts, and the tests returned by `change({operation: "tests", source: {symbols: ["<id>"]}})`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-incident-investigation.md ===
+---
+description: "Walk a production symptom back to its root cause."
+---
+
+# Investigate an Incident with Gortex
+
+1. Paste the exact symptom into `explore({operation: "task", task: "<alert, error, and time window>"})`.
+2. Search exact error text with `search({operation: "text", query: "<literal>"})`.
+3. Walk `relations` operation `callers` and `trace` operations `call_chain`, `flow`, or `taint` from symptom toward cause.
+4. Correlate repository-wide `analyze({kind: "recent_changes"})` with symbol-scoped `recall({operation: "surface", arguments: {symbol_ids: "<id>", task: "<symptom>"}})`.
+5. Separate evidence, hypothesis, and unknowns. Gate any fix through `change` before and after the mutation.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-onboarding.md ===
+---
+description: "Structured tour of an unfamiliar repo."
+---
+
+# Onboard to a Repository with Gortex
+
+1. Call `explore({operation: "outline"})`, then `explore({operation: "task", task: "explain the repository's main responsibilities and entry points"})`.
+2. Run `analyze` with kinds `architecture`, `communities`, and `processes`.
+3. Trace one representative request or job with `trace({operation: "call_chain", target: {symbol: "<entry-id>"}})`.
+4. Read only the key returned symbols. Deliver a concise map of entry points, boundaries, data flow, tests, and operational risks.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-pr-review-agent.md ===
+---
+description: "Coding-agent review verdict via the gortex review verb."
+---
+
+# Review a Change as a Sub-Agent
+
+## MCP-capable harness
+
+Native Gortex MCP is mandatory. Call `review({operation: "run", source: {scope: "<scope>"}})`, then use `change` operations `guards`, `tests`, and `contract`. When the proposed signature is known, run operation `verify` before mutation. If the configured callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or use the Bash path below.
+
+## Bash-only harness
+
+Use this path only when the harness has no MCP transport by design:
+
+```bash
+gortex review --audience agent --format json
+```
+
+In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actionable findings with severity and `file:line`. Do not replace graph-backed review with ad-hoc `git diff` inspection.
+=== global/home/.config/opencode/commands/gortex-pr-review.md ===
+---
+description: "Graph-grounded review of a pending change or PR."
+---
+
+# Review a Change with Gortex
+
+1. Project the working tree with `change({operation: "detect", source: {scope: "unstaged"}})`; use `staged` or `compare` only when that is the requested review scope.
+2. Build review context with `review({operation: "run", source: {scope: "<scope>"}})` and operation `diff_context` when per-file context is needed.
+3. Require `change` operations `guards`, `tests`, and `contract`. When the proposed signature is known, run operation `verify` before mutation.
+4. Check wire boundaries with `analyze({kind: "contracts", options: {action: "check"}})` when APIs or events changed.
+5. Report only actionable findings with severity, `file:line`, evidence, consequence, and correction. State an explicit clean verdict when none remain.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-quality-audit.md ===
+---
+description: "Repo-scale quality scan — dead code, hotspots, clones."
+---
+
+# Audit Repository Quality with Gortex
+
+1. Establish scope with `workspace({operation: "info"})` and `explore({operation: "outline"})`.
+2. Run `analyze` for `health`, `dead_code`, `hotspots`, `cycles`, and `clones`.
+3. Validate high-risk findings with `read` and `relations`; do not report an unverified heuristic as a fact.
+4. Rank findings by evidence, impact, and remediation cost. Include exact paths, symbol IDs, and a smallest-first action plan.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-refactor.md ===
+---
+description: "Rename, extract, split, or restructure code safely."
+---
+
+# Refactor with Gortex
+
+1. Call `explore({operation: "task", task: "<refactor goal>"})` and resolve every target with `search`.
+2. Run `change({operation: "impact", source: {symbols: ["<id>"]}})`. Before altering a signature, also run `change({operation: "verify", source: {changes: [{symbol_id: "<id>", new_signature: "<signature>"}]}})`.
+3. Choose exactly one `refactor` operation: `rename`, `move`, `inline`, `delete`, or `apply_code_action`. For example: `refactor({operation: "rename", target: {symbol: "<id>"}, new_name: "<name>"})`.
+4. Require `change` operations `detect`, `tests`, `guards`, and `contract` after the mutation. Resolve every violation before finishing.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-rename.md ===
+---
+description: "Rename a symbol and update every reference atomically."
+---
+
+# Rename a Symbol with Gortex
+
+1. Resolve exactly one symbol with `search({operation: "symbols", query: "<old name>"})`.
+2. Enumerate references and implementations with `relations` operations `usages` and `implementations`.
+3. Run `change({operation: "impact", source: {symbols: ["<id>"]}})`. For a public signature rename, also run `change({operation: "verify", source: {changes: [{symbol_id: "<id>", new_signature: "<signature with new name>"}]}})`.
+4. Preview with `refactor({operation: "rename", target: {symbol: "<id>"}, new_name: "<new>", dry_run: true})`, then repeat it with `dry_run: false` to apply.
+5. Require `change` operations `detect`, `guards`, and `tests`; confirm no old usages remain.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/commands/gortex-safe-edit.md ===
+---
+description: "Preview an edit's blast radius on the shadow graph before writing."
+---
+
+# Make a Safe Edit with Gortex
+
+1. Localize with `explore` and inspect `read({operation: "editing_context", target: {file: "<path>"}})`.
+2. Run `change({operation: "impact", source: {symbols: ["<id>"]}})` before editing.
+3. Choose `edit` operation `file`, `symbol`, or `batch`. Preview with `dry_run: true`; after review, repeat the same guarded request with `dry_run: false`. Use `change({operation: "simulate", source: {steps: "<WorkspaceEdit JSON array>"}})` for a multi-step semantic edit.
+4. Run `change` operations `detect`, `tests`, `guards`, and `contract`. Signature verification belongs before mutation with the proposed signature.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/plugin/gortex.js ===
+// Gortex plugin for OpenCode (1.18.18).
+//
+// OpenCode has no lifecycle-hook configuration at all — there is no
+// settings key that runs a command on session start or before a tool
+// call. A JS/TS plugin is its only enforcement surface, so this file is
+// the OpenCode half of the Gortex bridge: on each relevant plugin hook it
+// shells `gortex hook --agent=opencode`, writes a BridgeEvent envelope to
+// stdin, and applies the BridgeDecision it reads back.
+//
+// Every policy decision — the deny / enrich / consult-unlock / nudge
+// postures, indexed-source classification, telemetry — stays in Go
+// (internal/hooks/opencode.go + pi.go). Re-implementing any of it here
+// would give OpenCode a second, drifting copy of rules every other host
+// reads from one place.
+//
+// This file is written verbatim by the `opencode` adapter except for
+// three sentinels, each replaced with a JSON literal at install time:
+//
+//   GORTEX_BIN        -> string:  resolved `gortex` binary path
+//   GORTEX_HOOK_ARGV  -> array:   full hook argv, argv[0] included
+//   GORTEX_ENFORCE    -> boolean: false when installed with --no-hooks
+//
+// Zero package dependencies, deliberately: OpenCode installs plugin
+// dependencies from `.opencode/package.json` with a bun install at
+// startup. Anything beyond a `node:` built-in would need a package.json
+// this installer does not own, and a failed install would take the plugin
+// down with it.
+
+import { execFileSync } from "node:child_process";
+
+const GORTEX_BIN = "gortex";
+const HOOK_ARGV = ["gortex","hook","--agent=opencode"];
+
+// The adapter does not write this file at all under --no-hooks, so a
+// rendered `false` only ever reaches disk via a hand-copied or downgraded
+// install. Honouring it anyway costs one branch and means the documented
+// off switch still works on a file that outlived its installer.
+const ENFORCE = true;
+
+// How long a single bridge call may take before we give up and let the
+// tool through. The Go side answers from a local daemon in single-digit
+// milliseconds; this ceiling exists for the pathological case (daemon
+// mid-restart, machine swapping), where waiting longer would be felt as
+// the agent hanging.
+const HOOK_TIMEOUT_MS = 5000;
+
+// Cap on the per-call decision map. A session is thousands of tool calls
+// long and OpenCode gives no "call finished" signal we can trust for
+// cleanup, so the map is cleared wholesale once it grows past this. The
+// only cost of a clear is that an in-flight call loses its parked tip.
+const DECISION_CACHE_MAX = 256;
+
+// OpenCode's built-in tool vocabulary, mapped onto the Claude names the
+// shared Go enrichment switches on. Deliberately the same seven entries
+// as openCodeToolNames in internal/hooks/opencode.go, in the same order,
+// so the two tables can be diffed by eye. Anything unrecognised is passed
+// through untouched; the Go classifier ignores names it does not know,
+// which is the fail-open default this whole file is built around.
+const TOOL_NAMES = {
+  read: "Read",
+  write: "Write",
+  edit: "Edit",
+  bash: "Bash",
+  grep: "Grep",
+  glob: "Glob",
+  task: "Task",
+};
+
+// A tool call that IS a Gortex graph query. OpenCode exposes MCP tools as
+// `<server>_<tool>`, and our server is registered as `gortex`, so the
+// prefix identifies them; the `mcp__gortex__` spelling is accepted too in
+// case a future OpenCode adopts Claude's naming. The flag matters to the
+// Go side: consult-unlock uses a graph query as the handshake that
+// unlocks fallback reads, and adaptive-nudge resets its streak on one.
+const GORTEX_TOOL_PATTERN = /^(gortex[_.]|mcp__gortex__)/;
+
+function isGortexTool(name) {
+  return GORTEX_TOOL_PATTERN.test(String(name || ""));
+}
+
+function normalizeToolName(name) {
+  const raw = String(name || "").trim();
+  return TOOL_NAMES[raw.toLowerCase()] || raw;
+}
+
+function firstString(obj, keys) {
+  if (!obj || typeof obj !== "object") return undefined;
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === "string" && value !== "") return value;
+  }
+  return undefined;
+}
+
+// normalizeToolInput maps OpenCode's argument keys onto the canonical
+// `file_path` / `pattern` / `command` shape the Go enrichment reads.
+// OpenCode spells the first one `filePath`; without this the classifier
+// would see no path on any read or edit and quietly classify nothing,
+// which looks exactly like a healthy install that enforces nothing.
+// Original keys are kept alongside the canonical ones — the envelope is
+// ours, and dropping them would lose context for future rules.
+function normalizeToolInput(args) {
+  const out = args && typeof args === "object" ? { ...args } : {};
+  const path = firstString(out, ["file_path", "filePath", "path", "file", "filepath"]);
+  if (path !== undefined) out.file_path = path;
+  const pattern = firstString(out, ["pattern", "glob", "query"]);
+  if (pattern !== undefined) out.pattern = pattern;
+  const command = firstString(out, ["command", "cmd", "script"]);
+  if (command !== undefined) out.command = command;
+  return out;
+}
+
+// callHook sends one envelope to `gortex hook --agent=opencode` and
+// parses the decision it writes back.
+//
+// Fail-open and silent by construction: a missing binary, a non-zero
+// exit, a timeout, or unparsable stdout all land in the catch and return
+// an empty decision, which every caller below treats as "do nothing". A
+// broken bridge must never be able to break the user's session. The
+// child's stderr is discarded rather than inherited so a Go-side warning
+// cannot scribble over OpenCode's TUI.
+function callHook(envelope) {
+  try {
+    const out = execFileSync(GORTEX_BIN, HOOK_ARGV.slice(1), {
+      input: JSON.stringify(envelope),
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+      timeout: HOOK_TIMEOUT_MS,
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    const trimmed = String(out || "").trim();
+    if (!trimmed) return {};
+    const decision = JSON.parse(trimmed);
+    return decision && typeof decision === "object" ? decision : {};
+  } catch {
+    return {};
+  }
+}
+
+// messageText joins the text parts of a chat message, which is what the
+// Go side scores for "indexed symbols relevant to this turn".
+function messageText(parts) {
+  if (!Array.isArray(parts)) return "";
+  return parts
+    .filter((p) => p && p.type === "text" && typeof p.text === "string")
+    .map((p) => p.text)
+    .join("\n");
+}
+
+// appendToLastTextPart injects context by extending the last text part in
+// place rather than pushing a new one. A part carries identity fields
+// (id, sessionID, messageID) whose shape is OpenCode's, not ours;
+// fabricating one risks a malformed message where the worst case is a
+// broken session, while appending to an existing string cannot be
+// structurally wrong.
+function appendToLastTextPart(parts, text) {
+  if (!Array.isArray(parts) || !text) return;
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i];
+    if (part && part.type === "text" && typeof part.text === "string") {
+      part.text = part.text + "\n\n" + text;
+      return;
+    }
+  }
+}
+
+export const GortexPlugin = async ({ directory, worktree }) => {
+  // The repo the Go side resolves indexed-source coverage against.
+  // `worktree` is the git root and `directory` the CWD OpenCode started
+  // in; prefer the former so a session opened in a subdirectory is still
+  // recognised as covered.
+  const cwd = worktree || directory || process.cwd();
+
+  // callID -> soft guidance parked by tool.execute.before for
+  // tool.execute.after to deliver. Presence of a key also records "this
+  // call was already decided", which is what keeps permission.ask from
+  // asking the same question twice for one tool call.
+  const decided = new Map();
+
+  // The session briefing is a once-per-session injection; OpenCode has no
+  // session-start hook in the stable set, so the first chat message is
+  // where it goes.
+  let oriented = false;
+
+  function remember(callID, tip) {
+    if (!callID) return;
+    if (decided.size >= DECISION_CACHE_MAX) decided.clear();
+    decided.set(callID, tip || "");
+  }
+
+  return {
+    // Throwing from tool.execute.before is OpenCode's documented way to
+    // refuse a tool call: the throw becomes the tool's error and the
+    // model reads the message. That makes the thrown reason the deny
+    // text, which is why it is the Go decision's Reason verbatim.
+    "tool.execute.before": async (input, output) => {
+      if (!ENFORCE) return;
+      const tool = String(input?.tool ?? "");
+      const gortexTool = isGortexTool(tool);
+      const callID = String(input?.callID ?? "");
+
+      const decision = callHook({
+        event: "tool.execute.before",
+        tool_name: gortexTool ? tool : normalizeToolName(tool),
+        tool_input: normalizeToolInput(output?.args),
+        cwd,
+        session_id: String(input?.sessionID ?? ""),
+        is_gortex_tool: gortexTool,
+      });
+
+      remember(callID, decision.additional_context);
+      if (decision.block) {
+        throw new Error(
+          decision.reason || "[Gortex] blocked — use the Gortex graph tools instead of raw file reads.",
+        );
+      }
+    },
+
+    // This hook deliberately does NOT shell the bridge. The Go router
+    // maps no "after" phase, so every call would spend a subprocess to
+    // receive a guaranteed-empty decision. What it is for is delivery:
+    // it is the only stable hook that can put text in front of the model
+    // without blocking anything, so it hands over the soft guidance the
+    // before-hook parked (the enrich and nudge postures' whole output).
+    "tool.execute.after": async (input, output) => {
+      const callID = String(input?.callID ?? "");
+      if (!callID || !decided.has(callID)) return;
+      const tip = decided.get(callID);
+      decided.delete(callID);
+      if (!tip) return;
+      try {
+        if (output && typeof output.output === "string") {
+          output.output = output.output + "\n\n" + tip;
+        }
+      } catch {
+        // Never let context delivery break a tool result.
+      }
+    },
+
+    // permission.ask is a second gate, not a duplicate one: OpenCode
+    // raises it from inside a tool that needs approval, after
+    // tool.execute.before has already run for that callID. Deferring to
+    // the earlier decision keeps one tool call from being scored twice —
+    // double-counting would inflate doctor's run tallies and, under
+    // consult-unlock / adaptive-nudge, move per-session state twice for
+    // one action. A permission with no matching before-hook is still
+    // asked about.
+    "permission.ask": async (input, output) => {
+      if (!ENFORCE) return;
+      const callID = String(input?.callID ?? "");
+      if (callID && decided.has(callID)) return;
+      const type = String(input?.type ?? "");
+      if (isGortexTool(type)) return;
+
+      const decision = callHook({
+        event: "permission.ask",
+        tool_name: normalizeToolName(type),
+        tool_input: normalizeToolInput(input?.metadata),
+        cwd,
+        session_id: String(input?.sessionID ?? ""),
+      });
+
+      remember(callID, "");
+      if (decision.block) {
+        output.status = "deny";
+      }
+    },
+
+    // chat.message carries the user's turn with a mutable parts array —
+    // the one place a bridged host can inject context the way Claude's
+    // UserPromptSubmit hook does. Two envelopes go out on the first turn:
+    // the session briefing (once) and the per-turn symbol context.
+    "chat.message": async (input, output) => {
+      const role = output?.message?.role;
+      if (role && role !== "user") return;
+      const sessionID = String(output?.message?.sessionID ?? input?.sessionID ?? "");
+      const injected = [];
+
+      if (!oriented) {
+        oriented = true;
+        const briefing = callHook({ event: "session", cwd, session_id: sessionID });
+        if (briefing.orientation) injected.push(briefing.orientation);
+      }
+
+      const decision = callHook({
+        event: "chat.message",
+        prompt: messageText(output?.parts),
+        cwd,
+        session_id: sessionID,
+      });
+      if (decision.additional_context) injected.push(decision.additional_context);
+
+      if (injected.length > 0) {
+        try {
+          appendToLastTextPart(output?.parts, injected.join("\n\n"));
+        } catch {
+          // Best effort — never break message assembly.
+        }
+      }
+    },
+  };
+};
+=== global/home/.config/opencode/skills/gortex-add-test/SKILL.md ===
+---
+name: gortex-add-test
+description: "Add tests for under-tested code and coverage gaps."
+---
+
+# Add Tests with Gortex
+
+1. Localize the behavior with `explore`.
+2. Confirm the specific gap with `change({operation: "tests", source: {symbols: ["<id>"]}})`. Use repository-wide `analyze({kind: "untested"})` or path-scoped `analyze({kind: "coverage_gaps", options: {path_prefix: "<path>"}})` only for broader coverage discovery.
+3. Inspect callers with `relations({operation: "callers", target: {symbol: "<id>"}})` and request targets with `change({operation: "tests", source: {symbols: ["<id>"]}})`.
+4. Add the narrowest test with `edit({operation: "file", target: {file: "<existing test path>"}, ...})`; use operation `write` for a new test file.
+5. Run the test, then require `change` operations `detect` and `guards`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-architecture-review/SKILL.md ===
+---
+name: gortex-architecture-review
+description: "Graph-grounded architectural read of a repo."
+---
+
+# Review Architecture with Gortex
+
+1. Build the map with `explore({operation: "outline"})` and `analyze` kinds `architecture` and `communities`.
+2. Measure boundaries with `analyze({kind: "coupling"})` and cycles with `analyze({kind: "cycles"})`.
+3. Trace representative paths with `trace` and inspect public boundaries with `analyze({kind: "contracts", options: {action: "list"}})`.
+4. Deliver observed structure, intended structure, violations, consequences, and prioritized changes. Cite graph evidence for every finding.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-cli/SKILL.md ===
+---
+name: gortex-cli
+description: "Bash-only mirror of Gortex MCP tools for harnesses without MCP support."
+---
+
+# Gortex from a Bash-Only Harness
+
+Use this skill only in a harness that has no MCP transport by design. If a Gortex MCP server is configured but its callable tools are missing, report an integration failure; do not use this skill as a fallback.
+
+Every public MCP tool has the same name through `gortex call`:
+
+```bash
+gortex call explore --arg task='locate the authentication flow'
+gortex call search --arg operation=symbols --arg query=UserStore
+gortex call read --arg target='{"symbol":"internal/store.go::UserStore"}'
+gortex call relations --arg operation=usages --arg target='{"symbol":"internal/store.go::UserStore"}'
+gortex call change --arg operation=impact --arg target='{"symbol":"internal/store.go::UserStore"}'
+gortex call edit --arg target='{"file":"internal/store.go"}' --arg match='old text' --arg replacement='new text'
+gortex call change --arg operation=detect --arg source='{"scope":"all"}'
+```
+
+For an exact operation schema:
+
+```bash
+gortex call capabilities --arg domain=read --arg operation=source --arg detail=schema
+```
+
+The required order is `explore` → targeted `search/read/relations/trace` → pre-change `change` → `edit/refactor` → post-change `change`. Do not use shell file reads or search as a substitute.
+=== global/home/.config/opencode/skills/gortex-co-change/SKILL.md ===
+---
+name: gortex-co-change
+description: "Find what changes together and hidden coupling."
+---
+
+# Analyze Co-Change with Gortex
+
+1. Resolve the anchor with `search({operation: "symbols", query: "<name>"})`.
+2. Call symbol-scoped `analyze({kind: "co_change", target: {symbol: "<id>"}})` and repository-wide `analyze({kind: "churn"})`.
+3. Compare structural coupling through `relations` operations `cluster` and `dependents`.
+4. Report strong historical pairs, graph-confirmed dependencies, likely hidden coupling, and an actionable boundary or guard.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-cross-repo-usage/SKILL.md ===
+---
+name: gortex-cross-repo-usage
+description: "Find who uses a symbol across all consumer repos."
+---
+
+# Find Cross-Repository Usage with Gortex
+
+1. Confirm tracked repositories with `workspace({operation: "repos"})`.
+2. Resolve the provider symbol with `search({operation: "symbols", query: "<name>", options: {repo: "<provider>"}})`.
+3. Call `relations({operation: "usages", target: {symbol: "<id>"}})` and group results by repository.
+4. Add `analyze({kind: "cross_repo", options: {repo: "<provider>"}})` for repository boundaries and `analyze({kind: "contracts", options: {action: "bridge", mode: "impact", symbol: "<id>"}})` for wire-level consumers.
+5. Report indexed coverage and name any untracked repositories as an explicit gap.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-dataflow-trace/SKILL.md ===
+---
+name: gortex-dataflow-trace
+description: "Trace where a value flows through the code."
+---
+
+# Trace Data Flow with Gortex
+
+1. Call `explore({operation: "task", task: "trace <value> from <source> to <sink>"})`.
+2. Resolve endpoints with `search({operation: "symbols", query: "<source or sink>"})`.
+3. Use `trace({operation: "flow", target: {symbol: "<source-id>"}, to: {symbol: "<sink-id>"}})`. Use operation `taint` when source/sink security semantics matter.
+4. Cross-check control flow with operation `call_chain` when the data-flow graph has a gap.
+5. Report each hop with its symbol ID and confidence; distinguish no path from incomplete indexing.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-debug/SKILL.md ===
+---
+name: gortex-debug
+description: "Debug a bug, trace an error, or find why something fails."
+---
+
+# Debug with Gortex
+
+1. Localize the exact symptom with `explore({operation: "task", task: "<error and observed behavior>"})`.
+2. For a literal error, call `search({operation: "text", query: "<exact text>"})`. For a name, use operation `symbols`.
+3. Walk toward the cause with `relations({operation: "callers", target: {symbol: "<id>"}})` and `trace({operation: "call_chain", target: {symbol: "<id>"}})`. Use `flow` or `taint` only after resolving both `target` and `to` endpoints.
+4. Confirm repository-wide error propagation with `analyze({kind: "error_surface"})`; use `options.repo` to narrow a multi-repository workspace.
+5. Before fixing, run `change({operation: "impact", source: {symbols: ["<id>"]}})`. After fixing, run `change` operations `detect`, `tests`, and `guards`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-episode-replay/SKILL.md ===
+---
+name: gortex-episode-replay
+description: "Reconstruct what changed in a window (postmortem, release, PR)."
+---
+
+# Replay a Change Episode with Gortex
+
+1. Run `analyze({kind: "replay", options: {from: "<start>", to: "<end>"}})` for the requested window.
+2. Project the relevant diff with `change({operation: "detect", source: {scope: "<scope>"}})`.
+3. Surface decisions with `recall({operation: "surface", arguments: {task: "<episode>"}})`.
+4. Trace important before/after paths using `trace` and identify which change altered behavior.
+5. Produce a timestamped narrative with evidence links, impact, missed signals, and remaining uncertainty.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-explore/SKILL.md ===
+---
+name: gortex-explore
+description: "Understand how code works or trace an execution flow."
+---
+
+# Explore a Codebase with Gortex
+
+1. Call `explore({operation: "task", task: "<question>"})`.
+2. Read only a returned anchor with `read({target: {symbol: "<id>"}})`.
+3. Choose the needed relationship (`callers`, `usages`, or `dependencies`), for example `relations({operation: "callers", target: {symbol: "<id>"}})`; use `trace({operation: "call_chain", target: {symbol: "<id>"}})` for execution order.
+4. Answer with the execution path, file locations, symbol IDs, and any graph uncertainty.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-extract-function/SKILL.md ===
+---
+name: gortex-extract-function
+description: "Extract code into a function or method via LSP refactor."
+---
+
+# Extract a Function with Gortex
+
+1. Inspect the file with `read({operation: "editing_context", target: {file: "<path>"}})`.
+2. Resolve the selected range with `change({operation: "ranges", source: {file: "<path>", range: {...}}})`.
+3. Request extraction actions with `change({operation: "code_actions", source: {file: "<path>", range: {...}}})`.
+4. Apply the selected action through `refactor({operation: "apply_code_action", target: {file: "<path>"}, options: {...}})`.
+5. Run `change` operations `detect`, `tests`, `guards`, and `contract`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-fix-all/SKILL.md ===
+---
+name: gortex-fix-all
+description: "Clear LSP diagnostics — one error, a file, or source.fixAll."
+---
+
+# Fix Diagnostics with Gortex
+
+1. Read diagnostics using `change({operation: "diagnostics", source: {file: "<path>"}})`.
+2. Fetch applicable fixes with `change({operation: "code_actions", source: {file: "<path>"}})`.
+3. Apply one reviewed action with `refactor({operation: "apply_code_action", target: {file: "<path>"}, options: {...}})`, or use operation `fix_all` only when the user asked for all safe fixes.
+4. Re-run diagnostics, then run `change` operations `detect` and `tests`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-guide/SKILL.md ===
+---
+name: gortex-guide
+description: "Gortex reference: available tools, graph schema, and workflow."
+---
+
+# Gortex Guide
+
+Use this sequence for codebase work:
+
+1. `explore({operation: "task", task: "<goal or bug>"})` — localize the task and obtain the working set.
+2. `search({operation: "symbols", query: "<name>"})` or `search({operation: "text", query: "<literal>"})` — resolve a precise anchor.
+3. `read({operation: "source", target: {symbol: "<id>"}})` — read only the source needed.
+4. `relations({operation: "usages", target: {symbol: "<id>"}})` or `trace({operation: "call_chain", target: {symbol: "<id>"}})` — follow verified graph edges.
+5. `change({operation: "impact", source: {symbols: ["<id>"]}})` — assess a planned change.
+6. Apply with `edit` or `refactor`, then run `change` operations `detect`, `guards`, and `tests`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-impact/SKILL.md ===
+---
+name: gortex-impact
+description: "Assess what breaks if you change X before editing it."
+---
+
+# Assess Change Impact with Gortex
+
+1. Resolve the target with `search({operation: "symbols", query: "<name>"})`.
+2. Query `relations` operations `usages`, `dependents`, and `implementations` for the resolved symbol.
+3. Call `change({operation: "impact", source: {symbols: ["<id>"]}})`; add operation `api_impact` for a public API.
+4. For a signature change, require `change({operation: "verify", source: {changes: [{symbol_id: "<id>", new_signature: "<signature>"}]}})`.
+5. Report direct callers, transitive risk, interfaces, contracts, and the tests returned by `change({operation: "tests", source: {symbols: ["<id>"]}})`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-incident-investigation/SKILL.md ===
+---
+name: gortex-incident-investigation
+description: "Walk a production symptom back to its root cause."
+---
+
+# Investigate an Incident with Gortex
+
+1. Paste the exact symptom into `explore({operation: "task", task: "<alert, error, and time window>"})`.
+2. Search exact error text with `search({operation: "text", query: "<literal>"})`.
+3. Walk `relations` operation `callers` and `trace` operations `call_chain`, `flow`, or `taint` from symptom toward cause.
+4. Correlate repository-wide `analyze({kind: "recent_changes"})` with symbol-scoped `recall({operation: "surface", arguments: {symbol_ids: "<id>", task: "<symptom>"}})`.
+5. Separate evidence, hypothesis, and unknowns. Gate any fix through `change` before and after the mutation.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-onboarding/SKILL.md ===
+---
+name: gortex-onboarding
+description: "Structured tour of an unfamiliar repo."
+---
+
+# Onboard to a Repository with Gortex
+
+1. Call `explore({operation: "outline"})`, then `explore({operation: "task", task: "explain the repository's main responsibilities and entry points"})`.
+2. Run `analyze` with kinds `architecture`, `communities`, and `processes`.
+3. Trace one representative request or job with `trace({operation: "call_chain", target: {symbol: "<entry-id>"}})`.
+4. Read only the key returned symbols. Deliver a concise map of entry points, boundaries, data flow, tests, and operational risks.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-pr-review-agent/SKILL.md ===
+---
+name: gortex-pr-review-agent
+description: "Coding-agent review verdict via the gortex review verb."
+---
+
+# Review a Change as a Sub-Agent
+
+## MCP-capable harness
+
+Native Gortex MCP is mandatory. Call `review({operation: "run", source: {scope: "<scope>"}})`, then use `change` operations `guards`, `tests`, and `contract`. When the proposed signature is known, run operation `verify` before mutation. If the configured callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or use the Bash path below.
+
+## Bash-only harness
+
+Use this path only when the harness has no MCP transport by design:
+
+```bash
+gortex review --audience agent --format json
+```
+
+In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actionable findings with severity and `file:line`. Do not replace graph-backed review with ad-hoc `git diff` inspection.
+=== global/home/.config/opencode/skills/gortex-pr-review/SKILL.md ===
+---
+name: gortex-pr-review
+description: "Graph-grounded review of a pending change or PR."
+---
+
+# Review a Change with Gortex
+
+1. Project the working tree with `change({operation: "detect", source: {scope: "unstaged"}})`; use `staged` or `compare` only when that is the requested review scope.
+2. Build review context with `review({operation: "run", source: {scope: "<scope>"}})` and operation `diff_context` when per-file context is needed.
+3. Require `change` operations `guards`, `tests`, and `contract`. When the proposed signature is known, run operation `verify` before mutation.
+4. Check wire boundaries with `analyze({kind: "contracts", options: {action: "check"}})` when APIs or events changed.
+5. Report only actionable findings with severity, `file:line`, evidence, consequence, and correction. State an explicit clean verdict when none remain.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-quality-audit/SKILL.md ===
+---
+name: gortex-quality-audit
+description: "Repo-scale quality scan — dead code, hotspots, clones."
+---
+
+# Audit Repository Quality with Gortex
+
+1. Establish scope with `workspace({operation: "info"})` and `explore({operation: "outline"})`.
+2. Run `analyze` for `health`, `dead_code`, `hotspots`, `cycles`, and `clones`.
+3. Validate high-risk findings with `read` and `relations`; do not report an unverified heuristic as a fact.
+4. Rank findings by evidence, impact, and remediation cost. Include exact paths, symbol IDs, and a smallest-first action plan.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-refactor/SKILL.md ===
+---
+name: gortex-refactor
+description: "Rename, extract, split, or restructure code safely."
+---
+
+# Refactor with Gortex
+
+1. Call `explore({operation: "task", task: "<refactor goal>"})` and resolve every target with `search`.
+2. Run `change({operation: "impact", source: {symbols: ["<id>"]}})`. Before altering a signature, also run `change({operation: "verify", source: {changes: [{symbol_id: "<id>", new_signature: "<signature>"}]}})`.
+3. Choose exactly one `refactor` operation: `rename`, `move`, `inline`, `delete`, or `apply_code_action`. For example: `refactor({operation: "rename", target: {symbol: "<id>"}, new_name: "<name>"})`.
+4. Require `change` operations `detect`, `tests`, `guards`, and `contract` after the mutation. Resolve every violation before finishing.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-rename/SKILL.md ===
+---
+name: gortex-rename
+description: "Rename a symbol and update every reference atomically."
+---
+
+# Rename a Symbol with Gortex
+
+1. Resolve exactly one symbol with `search({operation: "symbols", query: "<old name>"})`.
+2. Enumerate references and implementations with `relations` operations `usages` and `implementations`.
+3. Run `change({operation: "impact", source: {symbols: ["<id>"]}})`. For a public signature rename, also run `change({operation: "verify", source: {changes: [{symbol_id: "<id>", new_signature: "<signature with new name>"}]}})`.
+4. Preview with `refactor({operation: "rename", target: {symbol: "<id>"}, new_name: "<new>", dry_run: true})`, then repeat it with `dry_run: false` to apply.
+5. Require `change` operations `detect`, `guards`, and `tests`; confirm no old usages remain.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/skills/gortex-safe-edit/SKILL.md ===
+---
+name: gortex-safe-edit
+description: "Preview an edit's blast radius on the shadow graph before writing."
+---
+
+# Make a Safe Edit with Gortex
+
+1. Localize with `explore` and inspect `read({operation: "editing_context", target: {file: "<path>"}})`.
+2. Run `change({operation: "impact", source: {symbols: ["<id>"]}})` before editing.
+3. Choose `edit` operation `file`, `symbol`, or `batch`. Preview with `dry_run: true`; after review, repeat the same guarded request with `dry_run: false`. Use `change({operation: "simulate", source: {steps: "<WorkspaceEdit JSON array>"}})` for a multi-step semantic edit.
+4. Run `change` operations `detect`, `tests`, `guards`, and `contract`. Signature verification belongs before mutation with the proposed signature.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.

@@ -1,4 +1,4 @@
-=== home/.hermes/config.yaml ===
+=== project/home/.hermes/config.yaml ===
 mcp_servers:
   gortex:
     command: gortex
@@ -7,7 +7,15 @@ mcp_servers:
     timeout: 120
 platform_toolsets:
   cli: true
-=== home/.hermes/skills/analysis/gortex-architecture-review/SKILL.md ===
+hooks:
+  pre_tool_call:
+    - matcher: "read_file|terminal"
+      command: "gortex hook --agent hermes"
+      timeout: 5
+  pre_llm_call:
+    - command: "gortex hook --agent hermes"
+      timeout: 5
+=== project/home/.hermes/skills/analysis/gortex-architecture-review/SKILL.md ===
 ---
 name: gortex-architecture-review
 description: "Graph-grounded architectural read of a repo."
@@ -34,7 +42,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/analysis/gortex-co-change/SKILL.md ===
+=== project/home/.hermes/skills/analysis/gortex-co-change/SKILL.md ===
 ---
 name: gortex-co-change
 description: "Find what changes together and hidden coupling."
@@ -61,7 +69,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/analysis/gortex-episode-replay/SKILL.md ===
+=== project/home/.hermes/skills/analysis/gortex-episode-replay/SKILL.md ===
 ---
 name: gortex-episode-replay
 description: "Reconstruct what changed in a window (postmortem, release, PR)."
@@ -89,7 +97,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/analysis/gortex-impact/SKILL.md ===
+=== project/home/.hermes/skills/analysis/gortex-impact/SKILL.md ===
 ---
 name: gortex-impact
 description: "Assess what breaks if you change X before editing it."
@@ -117,7 +125,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/analysis/gortex-pr-review-agent/SKILL.md ===
+=== project/home/.hermes/skills/analysis/gortex-pr-review-agent/SKILL.md ===
 ---
 name: gortex-pr-review-agent
 description: "Coding-agent review verdict via the gortex review verb."
@@ -144,7 +152,7 @@ gortex review --audience agent --format json
 ```
 
 In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actionable findings with severity and `file:line`. Do not replace graph-backed review with ad-hoc `git diff` inspection.
-=== home/.hermes/skills/analysis/gortex-pr-review/SKILL.md ===
+=== project/home/.hermes/skills/analysis/gortex-pr-review/SKILL.md ===
 ---
 name: gortex-pr-review
 description: "Graph-grounded review of a pending change or PR."
@@ -172,7 +180,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/analysis/gortex-quality-audit/SKILL.md ===
+=== project/home/.hermes/skills/analysis/gortex-quality-audit/SKILL.md ===
 ---
 name: gortex-quality-audit
 description: "Repo-scale quality scan — dead code, hotspots, clones."
@@ -199,7 +207,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/code-intelligence/gortex-cli/SKILL.md ===
+=== project/home/.hermes/skills/code-intelligence/gortex-cli/SKILL.md ===
 ---
 name: gortex-cli
 description: "Bash-only mirror of Gortex MCP tools for harnesses without MCP support."
@@ -234,7 +242,7 @@ gortex call capabilities --arg domain=read --arg operation=source --arg detail=s
 ```
 
 The required order is `explore` → targeted `search/read/relations/trace` → pre-change `change` → `edit/refactor` → post-change `change`. Do not use shell file reads or search as a substitute.
-=== home/.hermes/skills/code-intelligence/gortex/SKILL.md ===
+=== project/home/.hermes/skills/code-intelligence/gortex/SKILL.md ===
 ---
 name: gortex
 description: "Use Gortex for indexed-code exploration, reads, relationships, impact checks, edits, and refactors."
@@ -286,7 +294,7 @@ Use `workspace` for local index, repository, and project state. Use `workspace_a
 - `/gortex-refactor`
 - `/gortex-rename`
 - `/gortex-safe-edit`
-=== home/.hermes/skills/debugging/gortex-debug/SKILL.md ===
+=== project/home/.hermes/skills/debugging/gortex-debug/SKILL.md ===
 ---
 name: gortex-debug
 description: "Debug a bug, trace an error, or find why something fails."
@@ -314,7 +322,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/debugging/gortex-incident-investigation/SKILL.md ===
+=== project/home/.hermes/skills/debugging/gortex-incident-investigation/SKILL.md ===
 ---
 name: gortex-incident-investigation
 description: "Walk a production symptom back to its root cause."
@@ -342,7 +350,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/navigation/gortex-cross-repo-usage/SKILL.md ===
+=== project/home/.hermes/skills/navigation/gortex-cross-repo-usage/SKILL.md ===
 ---
 name: gortex-cross-repo-usage
 description: "Find who uses a symbol across all consumer repos."
@@ -370,7 +378,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/navigation/gortex-dataflow-trace/SKILL.md ===
+=== project/home/.hermes/skills/navigation/gortex-dataflow-trace/SKILL.md ===
 ---
 name: gortex-dataflow-trace
 description: "Trace where a value flows through the code."
@@ -398,7 +406,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/navigation/gortex-explore/SKILL.md ===
+=== project/home/.hermes/skills/navigation/gortex-explore/SKILL.md ===
 ---
 name: gortex-explore
 description: "Understand how code works or trace an execution flow."
@@ -425,7 +433,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/navigation/gortex-onboarding/SKILL.md ===
+=== project/home/.hermes/skills/navigation/gortex-onboarding/SKILL.md ===
 ---
 name: gortex-onboarding
 description: "Structured tour of an unfamiliar repo."
@@ -452,7 +460,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/refactoring/gortex-extract-function/SKILL.md ===
+=== project/home/.hermes/skills/refactoring/gortex-extract-function/SKILL.md ===
 ---
 name: gortex-extract-function
 description: "Extract code into a function or method via LSP refactor."
@@ -480,7 +488,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/refactoring/gortex-fix-all/SKILL.md ===
+=== project/home/.hermes/skills/refactoring/gortex-fix-all/SKILL.md ===
 ---
 name: gortex-fix-all
 description: "Clear LSP diagnostics — one error, a file, or source.fixAll."
@@ -507,7 +515,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/refactoring/gortex-refactor/SKILL.md ===
+=== project/home/.hermes/skills/refactoring/gortex-refactor/SKILL.md ===
 ---
 name: gortex-refactor
 description: "Rename, extract, split, or restructure code safely."
@@ -534,7 +542,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/refactoring/gortex-rename/SKILL.md ===
+=== project/home/.hermes/skills/refactoring/gortex-rename/SKILL.md ===
 ---
 name: gortex-rename
 description: "Rename a symbol and update every reference atomically."
@@ -562,7 +570,7 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/refactoring/gortex-safe-edit/SKILL.md ===
+=== project/home/.hermes/skills/refactoring/gortex-safe-edit/SKILL.md ===
 ---
 name: gortex-safe-edit
 description: "Preview an edit's blast radius on the shadow graph before writing."
@@ -589,7 +597,634 @@ metadata:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-=== home/.hermes/skills/testing/gortex-add-test/SKILL.md ===
+=== project/home/.hermes/skills/testing/gortex-add-test/SKILL.md ===
+---
+name: gortex-add-test
+description: "Add tests for under-tested code and coverage gaps."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, add-test]
+    category: testing
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Add Tests with Gortex
+
+1. Localize the behavior with `explore`.
+2. Confirm the specific gap with `change({operation: "tests", source: {symbols: ["<id>"]}})`. Use repository-wide `analyze({kind: "untested"})` or path-scoped `analyze({kind: "coverage_gaps", options: {path_prefix: "<path>"}})` only for broader coverage discovery.
+3. Inspect callers with `relations({operation: "callers", target: {symbol: "<id>"}})` and request targets with `change({operation: "tests", source: {symbols: ["<id>"]}})`.
+4. Add the narrowest test with `edit({operation: "file", target: {file: "<existing test path>"}, ...})`; use operation `write` for a new test file.
+5. Run the test, then require `change` operations `detect` and `guards`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/config.yaml ===
+mcp_servers:
+  gortex:
+    command: gortex
+    args: [mcp]
+    connect_timeout: 60
+    timeout: 120
+platform_toolsets:
+  cli: true
+hooks:
+  pre_tool_call:
+    - matcher: "read_file|terminal"
+      command: "gortex hook --agent hermes"
+      timeout: 5
+  pre_llm_call:
+    - command: "gortex hook --agent hermes"
+      timeout: 5
+=== global/home/.hermes/skills/analysis/gortex-architecture-review/SKILL.md ===
+---
+name: gortex-architecture-review
+description: "Graph-grounded architectural read of a repo."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, architecture-review]
+    category: analysis
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Review Architecture with Gortex
+
+1. Build the map with `explore({operation: "outline"})` and `analyze` kinds `architecture` and `communities`.
+2. Measure boundaries with `analyze({kind: "coupling"})` and cycles with `analyze({kind: "cycles"})`.
+3. Trace representative paths with `trace` and inspect public boundaries with `analyze({kind: "contracts", options: {action: "list"}})`.
+4. Deliver observed structure, intended structure, violations, consequences, and prioritized changes. Cite graph evidence for every finding.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/analysis/gortex-co-change/SKILL.md ===
+---
+name: gortex-co-change
+description: "Find what changes together and hidden coupling."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, co-change]
+    category: analysis
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Analyze Co-Change with Gortex
+
+1. Resolve the anchor with `search({operation: "symbols", query: "<name>"})`.
+2. Call symbol-scoped `analyze({kind: "co_change", target: {symbol: "<id>"}})` and repository-wide `analyze({kind: "churn"})`.
+3. Compare structural coupling through `relations` operations `cluster` and `dependents`.
+4. Report strong historical pairs, graph-confirmed dependencies, likely hidden coupling, and an actionable boundary or guard.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/analysis/gortex-episode-replay/SKILL.md ===
+---
+name: gortex-episode-replay
+description: "Reconstruct what changed in a window (postmortem, release, PR)."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, episode-replay]
+    category: analysis
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Replay a Change Episode with Gortex
+
+1. Run `analyze({kind: "replay", options: {from: "<start>", to: "<end>"}})` for the requested window.
+2. Project the relevant diff with `change({operation: "detect", source: {scope: "<scope>"}})`.
+3. Surface decisions with `recall({operation: "surface", arguments: {task: "<episode>"}})`.
+4. Trace important before/after paths using `trace` and identify which change altered behavior.
+5. Produce a timestamped narrative with evidence links, impact, missed signals, and remaining uncertainty.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/analysis/gortex-impact/SKILL.md ===
+---
+name: gortex-impact
+description: "Assess what breaks if you change X before editing it."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, impact]
+    category: analysis
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Assess Change Impact with Gortex
+
+1. Resolve the target with `search({operation: "symbols", query: "<name>"})`.
+2. Query `relations` operations `usages`, `dependents`, and `implementations` for the resolved symbol.
+3. Call `change({operation: "impact", source: {symbols: ["<id>"]}})`; add operation `api_impact` for a public API.
+4. For a signature change, require `change({operation: "verify", source: {changes: [{symbol_id: "<id>", new_signature: "<signature>"}]}})`.
+5. Report direct callers, transitive risk, interfaces, contracts, and the tests returned by `change({operation: "tests", source: {symbols: ["<id>"]}})`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/analysis/gortex-pr-review-agent/SKILL.md ===
+---
+name: gortex-pr-review-agent
+description: "Coding-agent review verdict via the gortex review verb."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, pr-review-agent]
+    category: analysis
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Review a Change as a Sub-Agent
+
+## MCP-capable harness
+
+Native Gortex MCP is mandatory. Call `review({operation: "run", source: {scope: "<scope>"}})`, then use `change` operations `guards`, `tests`, and `contract`. When the proposed signature is known, run operation `verify` before mutation. If the configured callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or use the Bash path below.
+
+## Bash-only harness
+
+Use this path only when the harness has no MCP transport by design:
+
+```bash
+gortex review --audience agent --format json
+```
+
+In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actionable findings with severity and `file:line`. Do not replace graph-backed review with ad-hoc `git diff` inspection.
+=== global/home/.hermes/skills/analysis/gortex-pr-review/SKILL.md ===
+---
+name: gortex-pr-review
+description: "Graph-grounded review of a pending change or PR."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, pr-review]
+    category: analysis
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Review a Change with Gortex
+
+1. Project the working tree with `change({operation: "detect", source: {scope: "unstaged"}})`; use `staged` or `compare` only when that is the requested review scope.
+2. Build review context with `review({operation: "run", source: {scope: "<scope>"}})` and operation `diff_context` when per-file context is needed.
+3. Require `change` operations `guards`, `tests`, and `contract`. When the proposed signature is known, run operation `verify` before mutation.
+4. Check wire boundaries with `analyze({kind: "contracts", options: {action: "check"}})` when APIs or events changed.
+5. Report only actionable findings with severity, `file:line`, evidence, consequence, and correction. State an explicit clean verdict when none remain.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/analysis/gortex-quality-audit/SKILL.md ===
+---
+name: gortex-quality-audit
+description: "Repo-scale quality scan — dead code, hotspots, clones."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, quality-audit]
+    category: analysis
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Audit Repository Quality with Gortex
+
+1. Establish scope with `workspace({operation: "info"})` and `explore({operation: "outline"})`.
+2. Run `analyze` for `health`, `dead_code`, `hotspots`, `cycles`, and `clones`.
+3. Validate high-risk findings with `read` and `relations`; do not report an unverified heuristic as a fact.
+4. Rank findings by evidence, impact, and remediation cost. Include exact paths, symbol IDs, and a smallest-first action plan.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/code-intelligence/gortex-cli/SKILL.md ===
+---
+name: gortex-cli
+description: "Bash-only mirror of Gortex MCP tools for harnesses without MCP support."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, cli]
+    category: code-intelligence
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Gortex from a Bash-Only Harness
+
+Use this skill only in a harness that has no MCP transport by design. If a Gortex MCP server is configured but its callable tools are missing, report an integration failure; do not use this skill as a fallback.
+
+Every public MCP tool has the same name through `gortex call`:
+
+```bash
+gortex call explore --arg task='locate the authentication flow'
+gortex call search --arg operation=symbols --arg query=UserStore
+gortex call read --arg target='{"symbol":"internal/store.go::UserStore"}'
+gortex call relations --arg operation=usages --arg target='{"symbol":"internal/store.go::UserStore"}'
+gortex call change --arg operation=impact --arg target='{"symbol":"internal/store.go::UserStore"}'
+gortex call edit --arg target='{"file":"internal/store.go"}' --arg match='old text' --arg replacement='new text'
+gortex call change --arg operation=detect --arg source='{"scope":"all"}'
+```
+
+For an exact operation schema:
+
+```bash
+gortex call capabilities --arg domain=read --arg operation=source --arg detail=schema
+```
+
+The required order is `explore` → targeted `search/read/relations/trace` → pre-change `change` → `edit/refactor` → post-change `change`. Do not use shell file reads or search as a substitute.
+=== global/home/.hermes/skills/code-intelligence/gortex/SKILL.md ===
+---
+name: gortex
+description: "Use Gortex for indexed-code exploration, reads, relationships, impact checks, edits, and refactors."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, code-search, navigation, refactoring, mcp]
+    category: code-intelligence
+    platforms: [linux, macos, windows]
+    related_skills: [gortex-add-test, gortex-architecture-review, gortex-cli, gortex-co-change, gortex-cross-repo-usage, gortex-dataflow-trace, gortex-debug, gortex-episode-replay, gortex-explore, gortex-extract-function, gortex-fix-all, gortex-impact, gortex-incident-investigation, gortex-onboarding, gortex-pr-review, gortex-pr-review-agent, gortex-quality-audit, gortex-refactor, gortex-rename, gortex-safe-edit]
+---
+
+# Gortex code intelligence
+
+Use Gortex MCP tools for indexed code. This is mandatory.
+
+1. Start every coding task with `explore` using `operation: "task"` and the task text.
+2. Use `search` for symbols, text, files, or AST shapes. Use `read` for source, summaries, files, or editing context.
+3. Use `relations` for usages, callers, dependencies, dependents, and implementations. Use `trace` for call chains and dataflow.
+4. Before mutation, call `change` with `operation: "impact"`; for a signature change, also call operation `verify` with the proposed signature.
+5. Mutate only with `edit` or `refactor`. After mutation, call `change` operations `detect`, `tests`, `guards`, and `contract`.
+6. Call `capabilities` with `domain`, `operation`, and `detail: "schema"` when exact arguments are not visible.
+
+Do not replace graph reads or searches with terminal commands. If the configured Gortex tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop; do not start a daemon or use a CLI/shell fallback.
+
+Use `workspace` for local index, repository, and project state. Use `workspace_admin` only when the user asks to change that state. Use `recall` before editing known code and `remember` for durable decisions or invariants.
+
+## Task playbooks (slash commands)
+
+`gortex install` also registers these per-task playbooks as Hermes slash commands. Reach for the one that matches your task:
+
+- `/gortex-add-test`
+- `/gortex-architecture-review`
+- `/gortex-cli`
+- `/gortex-co-change`
+- `/gortex-cross-repo-usage`
+- `/gortex-dataflow-trace`
+- `/gortex-debug`
+- `/gortex-episode-replay`
+- `/gortex-explore`
+- `/gortex-extract-function`
+- `/gortex-fix-all`
+- `/gortex-impact`
+- `/gortex-incident-investigation`
+- `/gortex-onboarding`
+- `/gortex-pr-review`
+- `/gortex-pr-review-agent`
+- `/gortex-quality-audit`
+- `/gortex-refactor`
+- `/gortex-rename`
+- `/gortex-safe-edit`
+=== global/home/.hermes/skills/debugging/gortex-debug/SKILL.md ===
+---
+name: gortex-debug
+description: "Debug a bug, trace an error, or find why something fails."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, debug]
+    category: debugging
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Debug with Gortex
+
+1. Localize the exact symptom with `explore({operation: "task", task: "<error and observed behavior>"})`.
+2. For a literal error, call `search({operation: "text", query: "<exact text>"})`. For a name, use operation `symbols`.
+3. Walk toward the cause with `relations({operation: "callers", target: {symbol: "<id>"}})` and `trace({operation: "call_chain", target: {symbol: "<id>"}})`. Use `flow` or `taint` only after resolving both `target` and `to` endpoints.
+4. Confirm repository-wide error propagation with `analyze({kind: "error_surface"})`; use `options.repo` to narrow a multi-repository workspace.
+5. Before fixing, run `change({operation: "impact", source: {symbols: ["<id>"]}})`. After fixing, run `change` operations `detect`, `tests`, and `guards`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/debugging/gortex-incident-investigation/SKILL.md ===
+---
+name: gortex-incident-investigation
+description: "Walk a production symptom back to its root cause."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, incident-investigation]
+    category: debugging
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Investigate an Incident with Gortex
+
+1. Paste the exact symptom into `explore({operation: "task", task: "<alert, error, and time window>"})`.
+2. Search exact error text with `search({operation: "text", query: "<literal>"})`.
+3. Walk `relations` operation `callers` and `trace` operations `call_chain`, `flow`, or `taint` from symptom toward cause.
+4. Correlate repository-wide `analyze({kind: "recent_changes"})` with symbol-scoped `recall({operation: "surface", arguments: {symbol_ids: "<id>", task: "<symptom>"}})`.
+5. Separate evidence, hypothesis, and unknowns. Gate any fix through `change` before and after the mutation.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/navigation/gortex-cross-repo-usage/SKILL.md ===
+---
+name: gortex-cross-repo-usage
+description: "Find who uses a symbol across all consumer repos."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, cross-repo-usage]
+    category: navigation
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Find Cross-Repository Usage with Gortex
+
+1. Confirm tracked repositories with `workspace({operation: "repos"})`.
+2. Resolve the provider symbol with `search({operation: "symbols", query: "<name>", options: {repo: "<provider>"}})`.
+3. Call `relations({operation: "usages", target: {symbol: "<id>"}})` and group results by repository.
+4. Add `analyze({kind: "cross_repo", options: {repo: "<provider>"}})` for repository boundaries and `analyze({kind: "contracts", options: {action: "bridge", mode: "impact", symbol: "<id>"}})` for wire-level consumers.
+5. Report indexed coverage and name any untracked repositories as an explicit gap.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/navigation/gortex-dataflow-trace/SKILL.md ===
+---
+name: gortex-dataflow-trace
+description: "Trace where a value flows through the code."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, dataflow-trace]
+    category: navigation
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Trace Data Flow with Gortex
+
+1. Call `explore({operation: "task", task: "trace <value> from <source> to <sink>"})`.
+2. Resolve endpoints with `search({operation: "symbols", query: "<source or sink>"})`.
+3. Use `trace({operation: "flow", target: {symbol: "<source-id>"}, to: {symbol: "<sink-id>"}})`. Use operation `taint` when source/sink security semantics matter.
+4. Cross-check control flow with operation `call_chain` when the data-flow graph has a gap.
+5. Report each hop with its symbol ID and confidence; distinguish no path from incomplete indexing.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/navigation/gortex-explore/SKILL.md ===
+---
+name: gortex-explore
+description: "Understand how code works or trace an execution flow."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, explore]
+    category: navigation
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Explore a Codebase with Gortex
+
+1. Call `explore({operation: "task", task: "<question>"})`.
+2. Read only a returned anchor with `read({target: {symbol: "<id>"}})`.
+3. Choose the needed relationship (`callers`, `usages`, or `dependencies`), for example `relations({operation: "callers", target: {symbol: "<id>"}})`; use `trace({operation: "call_chain", target: {symbol: "<id>"}})` for execution order.
+4. Answer with the execution path, file locations, symbol IDs, and any graph uncertainty.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/navigation/gortex-onboarding/SKILL.md ===
+---
+name: gortex-onboarding
+description: "Structured tour of an unfamiliar repo."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, onboarding]
+    category: navigation
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Onboard to a Repository with Gortex
+
+1. Call `explore({operation: "outline"})`, then `explore({operation: "task", task: "explain the repository's main responsibilities and entry points"})`.
+2. Run `analyze` with kinds `architecture`, `communities`, and `processes`.
+3. Trace one representative request or job with `trace({operation: "call_chain", target: {symbol: "<entry-id>"}})`.
+4. Read only the key returned symbols. Deliver a concise map of entry points, boundaries, data flow, tests, and operational risks.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/refactoring/gortex-extract-function/SKILL.md ===
+---
+name: gortex-extract-function
+description: "Extract code into a function or method via LSP refactor."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, extract-function]
+    category: refactoring
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Extract a Function with Gortex
+
+1. Inspect the file with `read({operation: "editing_context", target: {file: "<path>"}})`.
+2. Resolve the selected range with `change({operation: "ranges", source: {file: "<path>", range: {...}}})`.
+3. Request extraction actions with `change({operation: "code_actions", source: {file: "<path>", range: {...}}})`.
+4. Apply the selected action through `refactor({operation: "apply_code_action", target: {file: "<path>"}, options: {...}})`.
+5. Run `change` operations `detect`, `tests`, `guards`, and `contract`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/refactoring/gortex-fix-all/SKILL.md ===
+---
+name: gortex-fix-all
+description: "Clear LSP diagnostics — one error, a file, or source.fixAll."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, fix-all]
+    category: refactoring
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Fix Diagnostics with Gortex
+
+1. Read diagnostics using `change({operation: "diagnostics", source: {file: "<path>"}})`.
+2. Fetch applicable fixes with `change({operation: "code_actions", source: {file: "<path>"}})`.
+3. Apply one reviewed action with `refactor({operation: "apply_code_action", target: {file: "<path>"}, options: {...}})`, or use operation `fix_all` only when the user asked for all safe fixes.
+4. Re-run diagnostics, then run `change` operations `detect` and `tests`.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/refactoring/gortex-refactor/SKILL.md ===
+---
+name: gortex-refactor
+description: "Rename, extract, split, or restructure code safely."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, refactor]
+    category: refactoring
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Refactor with Gortex
+
+1. Call `explore({operation: "task", task: "<refactor goal>"})` and resolve every target with `search`.
+2. Run `change({operation: "impact", source: {symbols: ["<id>"]}})`. Before altering a signature, also run `change({operation: "verify", source: {changes: [{symbol_id: "<id>", new_signature: "<signature>"}]}})`.
+3. Choose exactly one `refactor` operation: `rename`, `move`, `inline`, `delete`, or `apply_code_action`. For example: `refactor({operation: "rename", target: {symbol: "<id>"}, new_name: "<name>"})`.
+4. Require `change` operations `detect`, `tests`, `guards`, and `contract` after the mutation. Resolve every violation before finishing.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/refactoring/gortex-rename/SKILL.md ===
+---
+name: gortex-rename
+description: "Rename a symbol and update every reference atomically."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, rename]
+    category: refactoring
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Rename a Symbol with Gortex
+
+1. Resolve exactly one symbol with `search({operation: "symbols", query: "<old name>"})`.
+2. Enumerate references and implementations with `relations` operations `usages` and `implementations`.
+3. Run `change({operation: "impact", source: {symbols: ["<id>"]}})`. For a public signature rename, also run `change({operation: "verify", source: {changes: [{symbol_id: "<id>", new_signature: "<signature with new name>"}]}})`.
+4. Preview with `refactor({operation: "rename", target: {symbol: "<id>"}, new_name: "<new>", dry_run: true})`, then repeat it with `dry_run: false` to apply.
+5. Require `change` operations `detect`, `guards`, and `tests`; confirm no old usages remain.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/refactoring/gortex-safe-edit/SKILL.md ===
+---
+name: gortex-safe-edit
+description: "Preview an edit's blast radius on the shadow graph before writing."
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, safe-edit]
+    category: refactoring
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+# Make a Safe Edit with Gortex
+
+1. Localize with `explore` and inspect `read({operation: "editing_context", target: {file: "<path>"}})`.
+2. Run `change({operation: "impact", source: {symbols: ["<id>"]}})` before editing.
+3. Choose `edit` operation `file`, `symbol`, or `batch`. Preview with `dry_run: true`; after review, repeat the same guarded request with `dry_run: false`. Use `change({operation: "simulate", source: {steps: "<WorkspaceEdit JSON array>"}})` for a multi-step semantic edit.
+4. Run `change` operations `detect`, `tests`, `guards`, and `contract`. Signature verification belongs before mutation with the proposed signature.
+
+## Required behavior
+
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.hermes/skills/testing/gortex-add-test/SKILL.md ===
 ---
 name: gortex-add-test
 description: "Add tests for under-tested code and coverage gaps."

@@ -118,6 +118,12 @@ func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 			Keys: []string{"communities-block"},
 		})
 	}
+	skillFiles, err := planSkills(env)
+	if err != nil {
+		return nil, err
+	}
+	p.Files = append(p.Files, skillFiles...)
+	p.Files = append(p.Files, planSubAgents(env)...)
 	return p, nil
 }
 
@@ -229,6 +235,23 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		}
 		res.Files = append(res.Files, routingAction)
 	}
+
+	// Skills. ModeGlobal installs the curated playbook pack under
+	// $HOME/.agents/skills; ModeProject materialises the generated
+	// community skills under <root>/.agents/skills. skills.go documents
+	// why neither ever goes near ~/.codex.
+	skillActions, err := applySkills(env, opts)
+	if err != nil {
+		return res, fmt.Errorf("codex skills: %w", err)
+	}
+	res.Files = append(res.Files, skillActions...)
+
+	// Sub-agents → ~/.codex/agents/*.toml. ModeGlobal only: the
+	// project-scoped agents directory is only scanned for a TRUSTED
+	// project, so writing there is a gamble on state the installer cannot
+	// see — and it would put Gortex files in the user's working tree.
+	// subagents.go documents the rest of the vendor surface.
+	res.Files = append(res.Files, installSubAgents(env, opts)...)
 
 	res.Configured = true
 	return res, nil

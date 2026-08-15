@@ -1,4 +1,4 @@
-=== root/.kiro/hooks/gortex-post-edit.json ===
+=== project/root/.kiro/hooks/gortex-post-edit.json ===
 {
   "name": "Gortex: Post-Edit Check",
   "version": "1.0.0",
@@ -12,7 +12,7 @@
     "prompt": "Call Gortex change with operation detect for unstaged changes. Use its affected symbol IDs with operations tests, guards, and contract; run the selected tests and report every result."
   }
 }
-=== root/.kiro/hooks/gortex-pre-read.json ===
+=== project/root/.kiro/hooks/gortex-pre-read.json ===
 {
   "name": "Gortex: Enrich Source Read",
   "version": "1.0.0",
@@ -23,7 +23,7 @@
     "prompt": "For indexed source code, use Gortex read with operation editing_context or source instead of a raw file read. Skip generated files, metadata, documentation, configuration, and non-source assets."
   }
 }
-=== root/.kiro/hooks/gortex-smart-context.json ===
+=== project/root/.kiro/hooks/gortex-smart-context.json ===
 {
   "name": "Gortex: Task Context",
   "version": "1.0.0",
@@ -34,7 +34,7 @@
     "prompt": "For a coding task, call Gortex explore with operation task and the user's task text before reading or searching files. Skip this only for non-coding conversation."
   }
 }
-=== root/.kiro/settings/mcp.json ===
+=== project/root/.kiro/settings/mcp.json ===
 {
   "mcpServers": {
     "gortex": {
@@ -62,7 +62,7 @@
     }
   }
 }
-=== root/.kiro/steering/gortex-debug.md ===
+=== project/root/.kiro/steering/gortex-debug.md ===
 ---
 inclusion: manual
 ---
@@ -74,7 +74,7 @@ inclusion: manual
 3. Use `relations({operation:"callers", ...})` and `trace({operation:"call_chain", ...})` to follow execution.
 4. Use `trace` with `flow` or `taint` when the bug concerns values crossing helpers.
 5. Read only the suspect symbols, then state the root cause and evidence.
-=== root/.kiro/steering/gortex-explore.md ===
+=== project/root/.kiro/steering/gortex-explore.md ===
 ---
 inclusion: manual
 ---
@@ -86,7 +86,7 @@ inclusion: manual
 3. Read only the needed source with `read` (`source`/`summary`/`editing_context`).
 4. Prove relationships with `relations` or execution paths with `trace`.
 5. Return symbol IDs, file:line locations, and the shortest evidence needed.
-=== root/.kiro/steering/gortex-impact.md ===
+=== project/root/.kiro/steering/gortex-impact.md ===
 ---
 inclusion: manual
 ---
@@ -98,7 +98,7 @@ inclusion: manual
 3. For signature changes, call `change` with `operation:"verify"`.
 4. Check `relations` usages/dependents and `analyze` contracts when boundaries are involved.
 5. Call `change` with `operation:"tests"` and report concrete tests.
-=== root/.kiro/steering/gortex-refactor.md ===
+=== project/root/.kiro/steering/gortex-refactor.md ===
 ---
 inclusion: manual
 ---
@@ -110,7 +110,7 @@ inclusion: manual
 3. Use `refactor` for rename, move, inline, delete, or code actions. Use `edit` for file, symbol, batch, or new-file changes.
 4. After writing, call `change` operations `detect`, `tests`, `guards`, and `contract`.
 5. Run the project tests selected by the graph.
-=== root/.kiro/steering/gortex-workflow.md ===
+=== project/root/.kiro/steering/gortex-workflow.md ===
 ---
 inclusion: always
 ---
@@ -129,3 +129,31 @@ Use Gortex MCP tools for indexed code. This is mandatory.
 Do not replace graph reads or searches with shell commands. If the configured Gortex tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop; do not start a daemon or use a CLI/shell fallback.
 
 For durable context, use `recall` (`surface`/`notes`/`memories`) before editing known code and `remember` (`note`/`memory`) for decisions and invariants.
+=== global/home/.kiro/settings/mcp.json ===
+{
+  "mcpServers": {
+    "gortex": {
+      "args": [
+        "mcp"
+      ],
+      "autoApprove": [
+        "analyze",
+        "capabilities",
+        "change",
+        "explore",
+        "read",
+        "recall",
+        "relations",
+        "response",
+        "search",
+        "trace",
+        "workspace"
+      ],
+      "command": "gortex",
+      "disabled": false,
+      "env": {
+        "GORTEX_INDEX_WORKERS": "8"
+      }
+    }
+  }
+}

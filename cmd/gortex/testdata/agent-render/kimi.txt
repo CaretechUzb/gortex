@@ -1,4 +1,38 @@
-=== root/.kimi-code/mcp.json ===
+=== project/root/.kimi-code/mcp.json ===
+{
+  "mcpServers": {
+    "gortex": {
+      "args": [
+        "mcp"
+      ],
+      "command": "gortex",
+      "env": {
+        "GORTEX_INDEX_WORKERS": "8"
+      }
+    }
+  }
+}
+=== global/home/.kimi-code/config.toml ===
+[[hooks]]
+command = 'gortex hook --agent=kimi'
+event = 'UserPromptSubmit'
+timeout = 5
+
+[[hooks]]
+command = 'gortex hook --agent=kimi'
+event = 'PreToolUse'
+timeout = 5
+
+[[hooks]]
+command = 'gortex hook --agent=kimi'
+event = 'Stop'
+timeout = 30
+
+[[hooks]]
+command = 'gortex hook --agent=kimi'
+event = 'SubagentStart'
+timeout = 15
+=== global/home/.kimi-code/mcp.json ===
 {
   "mcpServers": {
     "gortex": {
