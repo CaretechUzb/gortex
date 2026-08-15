@@ -1575,6 +1575,12 @@ func (s *Server) validateFacadeRepositoryFields(spec facadeOperationSpec, input 
 			if canonicalPath != "" {
 				data["suggested_field"] = canonicalPath
 				message += fmt.Sprintf("; use %s to select a repository", canonicalPath)
+			} else {
+				// Refusing without saying why leaves the caller retrying
+				// spellings of a selector this operation will never accept.
+				data["reason"] = "no_repository_selector"
+				message += fmt.Sprintf("; %s.%s accepts no repository selector and runs against the active project"+
+					" — switch it with workspace_admin.set_active_project", spec.Facade, spec.Operation)
 			}
 			return NewStructuredErrorResult(StructuredError{
 				ErrorCode: ErrCodeInvalidArgument,
@@ -1606,7 +1612,27 @@ func (s *Server) facadeFieldConsumed(spec facadeOperationSpec, containerName, fi
 	return false
 }
 
+// facadePublicRepositoryField reports where the operation's published schema
+// exposes its repository selector, as a dotted path, or "" when the operation
+// has none.
+//
+// Building the published schema re-materialises the immutable operation table
+// and re-runs the lowering probe for every legacy property, which costs two
+// orders of magnitude more than the rest of facade dispatch. The answer depends
+// only on the spec and the captured legacy schema, so it is memoized per
+// registry and invalidated whenever a late registration changes what is
+// captured.
 func (s *Server) facadePublicRepositoryField(spec facadeOperationSpec) string {
+	key := spec.Facade + "." + spec.Operation
+	if cached, ok := s.facades.cachedRepositoryField(key); ok {
+		return cached
+	}
+	field := s.resolveFacadePublicRepositoryField(spec)
+	s.facades.cacheRepositoryField(key, field)
+	return field
+}
+
+func (s *Server) resolveFacadePublicRepositoryField(spec facadeOperationSpec) string {
 	capability := s.facadeCapability(spec, true)
 	schema, _ := capability["input_schema"].(map[string]any)
 	properties, _ := schema["properties"].(map[string]any)

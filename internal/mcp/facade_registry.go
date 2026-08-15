@@ -50,6 +50,10 @@ type facadeRegistry struct {
 	byFacade map[string]map[string]facadeOperationSpec
 	byLegacy map[string][]facadeOperationSpec
 	captured map[string]capturedFacadeTool
+	// repoFields memoizes facadePublicRepositoryField, whose input is the
+	// captured tool set. capture drops it so a late registration is never
+	// answered from a pre-registration result.
+	repoFields sync.Map
 }
 
 func newFacadeRegistry() *facadeRegistry {
@@ -82,6 +86,26 @@ func (r *facadeRegistry) capture(tool mcpgo.Tool, handler server.ToolHandlerFunc
 	r.mu.Lock()
 	r.captured[tool.Name] = capturedFacadeTool{tool: tool, handler: handler}
 	r.mu.Unlock()
+	r.repoFields.Clear()
+}
+
+func (r *facadeRegistry) cachedRepositoryField(key string) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	cached, ok := r.repoFields.Load(key)
+	if !ok {
+		return "", false
+	}
+	field, ok := cached.(string)
+	return field, ok
+}
+
+func (r *facadeRegistry) cacheRepositoryField(key, field string) {
+	if r == nil {
+		return
+	}
+	r.repoFields.Store(key, field)
 }
 
 func (r *facadeRegistry) operation(facade, operation string) (facadeOperationSpec, bool) {
