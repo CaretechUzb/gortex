@@ -84,6 +84,59 @@ func TestFacadeSelectorClassExcludesOverloadedNames(t *testing.T) {
 	}
 }
 
+// The friendly match/replacement pair belongs to the edit facade. Translating
+// it everywhere silently dropped remember.edit_memory's replacement into a
+// field edit_memory does not declare, so the memory was edited with no
+// replacement text and the call still reported success.
+func TestFacadeEditMemoryReceivesItsOwnReplacementVocabulary(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	spec, ok := srv.facades.operation("remember", "edit_memory")
+	require.True(t, ok)
+	require.True(t, srv.legacyDeclaresField(spec.Legacy, "replacement"),
+		"edit_memory speaks replacement natively; the premise of this test is that it must receive it")
+
+	captured, ok := srv.facades.legacy(spec.Legacy)
+	require.True(t, ok)
+	var got map[string]any
+	srv.facades.capture(captured.tool, func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		got = req.GetArguments()
+		return mcpgo.NewToolResultText("{}"), nil
+	})
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Name = "remember"
+	req.Params.Arguments = map[string]any{
+		"operation": "edit_memory",
+		"arguments": map[string]any{"id": "mem-1", "pattern": "old", "replacement": "new"},
+	}
+	result, err := srv.handleFacade(context.Background(), "remember", req)
+	require.NoError(t, err)
+	require.False(t, result.IsError, "%s", toolResultText(result))
+
+	require.Equal(t, "new", got["replacement"], "the handler must receive the caller's replacement")
+	require.NotContains(t, got, "new_string", "the edit facade's vocabulary must not leak here")
+}
+
+// The edit facade still translates its own published vocabulary.
+func TestFacadeEditAliasTranslationMatchesPublishedVocabulary(t *testing.T) {
+	for _, facade := range facadeToolNames() {
+		properties := facadeToolDefinition(facade).InputSchema.Properties
+		_, publishesMatch := properties["match"]
+		_, publishesReplacement := properties["replacement"]
+		require.Equal(t, publishesMatch && publishesReplacement, facadeTranslatesEditAliases(facade),
+			"%s translates match/replacement only if it publishes them", facade)
+	}
+
+	srv, _ := setupTestServer(t)
+	spec, ok := srv.facades.operation("edit", "file")
+	require.True(t, ok)
+	lowered := normalizeFacadeArguments(spec, map[string]any{
+		"operation": "file", "match": "old", "replacement": "new",
+	})
+	require.Equal(t, "old", lowered["old_string"])
+	require.Equal(t, "new", lowered["new_string"])
+}
+
 // A refusal names the operation and, where one exists, the selector to use.
 func TestFacadeInventedSelectorRefusalIsActionable(t *testing.T) {
 	srv, _ := setupTestServer(t)

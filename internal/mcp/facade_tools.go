@@ -1634,6 +1634,14 @@ func facadeUnknownFieldResult(
 	})
 }
 
+// facadeTranslatesEditAliases reports whether the facade publishes the friendly
+// match/replacement pair that normalizeFacadeArguments lowers into the legacy
+// old_string/new_string vocabulary. TestFacadeEditAliasTranslationMatchesPublishedVocabulary
+// pins this to the facade definitions so the two cannot drift.
+func facadeTranslatesEditAliases(facade string) bool {
+	return facade == "edit"
+}
+
 // isFacadeEnvelopeKey reports whether a top-level key belongs to the request
 // envelope rather than to the operation's arguments. normalizeFacadeArguments
 // drops exactly these before merging, so the two must agree.
@@ -1917,22 +1925,27 @@ func normalizeFacadeArguments(spec facadeOperationSpec, input map[string]any) ma
 			out["to_"+key] = value
 		}
 	}
-	// Friendly edit aliases become the exact legacy vocabulary.
-	if match, ok := out["match"]; ok {
-		if spec.Legacy == "edit_symbol" {
-			out["old_source"] = match
-		} else {
-			out["old_string"] = match
+	// Friendly edit aliases become the exact legacy vocabulary. Only the facade
+	// that publishes them may translate: elsewhere `match` and `replacement` are
+	// a handler's own vocabulary, and rewriting them drops the caller's value
+	// into a field nobody reads.
+	if facadeTranslatesEditAliases(spec.Facade) {
+		if match, ok := out["match"]; ok {
+			if spec.Legacy == "edit_symbol" {
+				out["old_source"] = match
+			} else {
+				out["old_string"] = match
+			}
+			delete(out, "match")
 		}
-		delete(out, "match")
-	}
-	if replacement, ok := out["replacement"]; ok {
-		if spec.Legacy == "edit_symbol" {
-			out["new_source"] = replacement
-		} else {
-			out["new_string"] = replacement
+		if replacement, ok := out["replacement"]; ok {
+			if spec.Legacy == "edit_symbol" {
+				out["new_source"] = replacement
+			} else {
+				out["new_string"] = replacement
+			}
+			delete(out, "replacement")
 		}
-		delete(out, "replacement")
 	}
 	normalizeFacadeAliases(spec, input, out)
 	for key, value := range spec.Fixed {
