@@ -2,7 +2,7 @@
 
 `gortex install` (once per machine) and `gortex init` (once per repo)
 auto-configure Gortex for every AI coding assistant detected on your
-machine. Nineteen adapters ship today.
+machine. 20 adapters ship today.
 
 - `gortex install` writes user-level machinery: `~/.claude.json` MCP,
   `~/.claude/skills/gortex-*`, `~/.claude/commands/gortex-*.md`,
