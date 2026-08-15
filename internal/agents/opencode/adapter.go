@@ -44,6 +44,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/internalutil"
@@ -89,9 +90,77 @@ func projectConfigPath(root string) string {
 	return filepath.Join(root, "opencode.json")
 }
 
+// GlobalConfigPath is the user-level config OpenCode reads for every
+// project, `~/.config/opencode/opencode.json`. An existing `.jsonc` wins
+// for the same reason it does per-repo: a hand-authored, comment-bearing
+// config keeps its extension, and writing the sibling `.json` would
+// leave the user with two configs and no clue which one OpenCode reads.
+//
+// $OPENCODE_CONFIG overrides the location entirely. It is honoured only
+// when Home is the machine's real home, so the render fence and the
+// adapter tests — which set a sandbox Home but inherit the process
+// environment — cannot be steered into the developer's real config by an
+// exported variable.
+func GlobalConfigPath(home string) string {
+	if override := strings.TrimSpace(os.Getenv("OPENCODE_CONFIG")); override != "" && isRealUserHome(home) {
+		return override
+	}
+	dir := filepath.Join(home, ".config", "opencode")
+	for _, name := range []string{"opencode.jsonc", "opencode.json"} {
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return filepath.Join(dir, "opencode.json")
+}
+
+// isRealUserHome reports whether home is the machine's actual home, so
+// environment overrides apply to a real install but never to a sandbox.
+func isRealUserHome(home string) bool {
+	real, err := os.UserHomeDir()
+	return err == nil && real != "" && real == home
+}
+
+// upsertMCPServer returns the mutation both scopes share. Project and
+// user configs take the identical `mcp.gortex` entry, and OpenCode's
+// schema differs enough from the canonical shape (a `command` array
+// rather than command+args, `environment` rather than `env`) that a
+// second copy of it would be a standing invitation to drift.
+func upsertMCPServer(opts agents.ApplyOpts) func(map[string]any, bool) (bool, error) {
+	return func(root map[string]any, _ bool) (bool, error) {
+		mcpSection, ok := root["mcp"].(map[string]any)
+		if !ok {
+			mcpSection = make(map[string]any)
+		}
+		if _, exists := mcpSection["gortex"]; exists && !opts.Force {
+			return false, nil
+		}
+		mcpSection["gortex"] = map[string]any{
+			"type":    "local",
+			"command": []string{"gortex", "mcp"},
+			"environment": map[string]string{
+				"GORTEX_INDEX_WORKERS": "8",
+			},
+			"enabled": true,
+		}
+		root["mcp"] = mcpSection
+		if _, hasSchema := root["$schema"]; !hasSchema {
+			root["$schema"] = SchemaURL
+		}
+		return true, nil
+	}
+}
+
 func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 	p := &agents.Plan{}
-	if env.Mode != agents.ModeGlobal {
+	if env.Mode == agents.ModeGlobal {
+		if env.Home != "" {
+			p.Files = append(p.Files, agents.FileAction{
+				Path: GlobalConfigPath(env.Home), Action: agents.ActionWouldMerge, Keys: []string{"mcp"},
+			})
+		}
+	} else {
 		p.Files = append(p.Files, agents.FileAction{
 			Path: projectConfigPath(env.Root), Action: agents.ActionWouldMerge, Keys: []string{"mcp"},
 		})
@@ -133,28 +202,7 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 			internalutil.Logf(env.Stderr, "[gortex init] note: %s is no longer read by OpenCode; writing the MCP config to %s instead", legacy, filepath.Base(path))
 		}
 	}
-	action, err := agents.MergeJSON(env.Stderr, path, func(root map[string]any, _ bool) (bool, error) {
-		mcpSection, ok := root["mcp"].(map[string]any)
-		if !ok {
-			mcpSection = make(map[string]any)
-		}
-		if _, exists := mcpSection["gortex"]; exists && !opts.Force {
-			return false, nil
-		}
-		mcpSection["gortex"] = map[string]any{
-			"type":    "local",
-			"command": []string{"gortex", "mcp"},
-			"environment": map[string]string{
-				"GORTEX_INDEX_WORKERS": "8",
-			},
-			"enabled": true,
-		}
-		root["mcp"] = mcpSection
-		if _, hasSchema := root["$schema"]; !hasSchema {
-			root["$schema"] = SchemaURL
-		}
-		return true, nil
-	}, opts)
+	action, err := agents.MergeJSON(env.Stderr, path, upsertMCPServer(opts), opts)
 	if err != nil {
 		return res, err
 	}
@@ -188,17 +236,28 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 }
 
 // applyGlobal handles `gortex install`: the codebase-agnostic artifacts
-// that belong to the user, not to any one repo — the curated playbook and
-// slash-command packs, plus the enforcement bridge.
+// that belong to the user, not to any one repo — the MCP server, the
+// curated playbook and slash-command packs, and the enforcement bridge.
 //
-// There is no user-level MCP stanza to write here: `gortex init` puts the
-// server in the repo's own opencode.json, which is where a per-project
-// daemon scope belongs.
+// The MCP registration is the load-bearing one and it must stay here.
+// This function also installs 21 skills and a plugin that tell the model
+// to reach for the Gortex tools on every turn; without a server entry
+// those tools are not mounted, so the user gets an OpenCode that has
+// been taught to ask for something it cannot call. Registering per-repo
+// from `gortex init` alone is not a substitute — a user who runs only
+// `gortex install`, which is the documented machine-wide step, would
+// never get a server at all.
 func (a *Adapter) applyGlobal(env agents.Env, opts agents.ApplyOpts, res *agents.Result) error {
 	if env.Home == "" {
 		return fmt.Errorf("opencode: global mode requires a resolved home directory")
 	}
 	internalutil.Logf(env.Stderr, "[gortex install] setting up OpenCode integration...")
+
+	mcpAction, err := agents.MergeJSON(env.Stderr, GlobalConfigPath(env.Home), upsertMCPServer(opts), opts)
+	if err != nil {
+		return fmt.Errorf("opencode global config: %w", err)
+	}
+	res.Files = append(res.Files, mcpAction)
 
 	pluginActions, err := applyPlugin(env, opts)
 	if err != nil {

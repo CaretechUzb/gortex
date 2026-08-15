@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,11 +9,10 @@ import (
 	"github.com/zzet/gortex/internal/agents"
 )
 
-// userGlobalOpenCodeConfig is the user's own ~/.config/opencode/opencode.json.
-// Gortex never writes at this scope (its MCP stanza goes in the repo's
-// opencode.json), so RemoveGlobal must leave the file byte-identical —
-// including a gortex-looking entry, which could only have been put there
-// by hand.
+// userGlobalOpenCodeConfig is the user's own ~/.config/opencode/opencode.json,
+// carrying a server of their own. `gortex install` adds `mcp.gortex`
+// alongside it and RemoveGlobal takes only that key back out — the file
+// itself, the user's own server, and every other key must survive.
 const userGlobalOpenCodeConfig = `{
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
@@ -106,14 +106,29 @@ func TestOpenCodeRemoveGlobalLeavesNoGortexArtifact(t *testing.T) {
 		t.Errorf("the user's skill changed:\n%s", skillAfter)
 	}
 
-	// The user's global config is untouched — Gortex never wrote it, so a
-	// cleanup that edited it would be deleting config it did not install.
+	// The global config keeps everything except our own server entry. It
+	// is re-marshalled on the way through, so compare the parsed shape
+	// rather than the bytes.
 	got, err := os.ReadFile(filepath.Join(globalConfigDir(env.Home), "opencode.json"))
 	if err != nil {
 		t.Fatalf("the user's global config was deleted: %v", err)
 	}
-	if string(got) != userGlobalOpenCodeConfig {
-		t.Errorf("the user's global config changed:\n%s", got)
+	var root map[string]any
+	if err := json.Unmarshal(got, &root); err != nil {
+		t.Fatalf("global config is no longer valid JSON: %v\n%s", err, got)
+	}
+	section, ok := root["mcp"].(map[string]any)
+	if !ok {
+		t.Fatalf("the user's mcp section was removed along with ours:\n%s", got)
+	}
+	if _, exists := section["gortex"]; exists {
+		t.Errorf("the gortex server entry survived removal:\n%s", got)
+	}
+	if _, exists := section["other"]; !exists {
+		t.Errorf("the user's own server entry was removed:\n%s", got)
+	}
+	if root["$schema"] != "https://opencode.ai/config.json" {
+		t.Errorf("the user's $schema was lost:\n%s", got)
 	}
 
 	if got := GlobalArtifacts(env.Home); len(got) != 0 {
