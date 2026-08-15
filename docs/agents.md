@@ -26,7 +26,7 @@ commands accept `--agents=<csv>` to constrain setup and
 | `aider`         | `.aiderignore` block, `CONVENTIONS.md` communities block                                        | project    | https://aider.chat/docs/config/aider_conf.html                      |
 | `antigravity`   | `~/.gemini/antigravity/mcp_config.json` + Knowledge Item                                        | user       | https://antigravity.google/docs/mcp                                 |
 | `cline`         | `cline_mcp_settings.json` (per VS Code / Cursor globalStorage), `.clinerules/gortex-communities.md` | both     | https://docs.cline.bot/mcp/mcp-overview                             |
-| `codex`         | `~/.codex/config.toml` (`[mcp_servers.gortex]` + `SessionStart`, `UserPromptSubmit`, Bash/Gortex-read `PreToolUse`, and Bash/`apply_patch` `PostToolUse` hooks), `~/.codex/AGENTS.md` rule block, `~/.agents/skills/gortex-*`, repo `AGENTS.md` communities block, repo `.agents/skills/gortex-*` | both       | https://learn.chatgpt.com/docs/extend/mcp                           |
+| `codex`         | `~/.codex/config.toml` (`[mcp_servers.gortex]` + `SessionStart`, `UserPromptSubmit`, Bash/Gortex-read `PreToolUse`, and Bash/`apply_patch` `PostToolUse` hooks), `~/.codex/AGENTS.md` rule block, `~/.agents/skills/gortex-*`, `~/.codex/agents/gortex-*.toml`, repo `AGENTS.md` communities block, repo `.agents/skills/gortex-*` | both       | https://learn.chatgpt.com/docs/extend/mcp                           |
 | `copilot-cli`   | `~/.copilot/mcp-config.json` (`mcpServers`), `~/.copilot/copilot-instructions.md` rule block, `~/.copilot/skills/gortex-*`, `~/.copilot/agents/gortex-*.agent.md`, `~/.copilot/hooks/gortex.json`, repo `.github/copilot-instructions.md` communities block, repo `.github/skills/gortex-*` | both       | https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers |
 | `continue`      | `.continue/mcpServers/gortex.json`, `.continue/rules/gortex-communities.md`                     | project    | https://docs.continue.dev/customize/deep-dives/mcp                  |
 | `cursor`        | `.cursor/mcp.json` (project) or `~/.cursor/mcp.json`, `.cursor/rules/gortex-communities.mdc`    | both       | https://docs.cursor.com/en/context/mcp                              |
@@ -64,7 +64,7 @@ describe that specific codebase, are written into the repo.
 | Host | Skills | Slash commands | Sub-agents | Enforcement hooks |
 | --- | --- | --- | --- | --- |
 | Claude Code | `~/.claude/skills/` | `~/.claude/commands/` | `~/.claude/agents/` | native, `deny` / `enrich` postures |
-| Codex CLI | `~/.agents/skills/` | **no** — see below | not written | native, 4 events |
+| Codex CLI | `~/.agents/skills/` | **no** — see below | `~/.codex/agents/*.toml` | native, 4 events |
 | OpenCode | `~/.config/opencode/skills/` | `~/.config/opencode/commands/` | not written | **no hook system** — JS plugin bridge |
 | GitHub Copilot CLI | `~/.copilot/skills/` | **no** — see below | `~/.copilot/agents/` | native, 4 of 14 events |
 
@@ -87,6 +87,25 @@ The gaps are the hosts', not ours:
 - **OpenCode sub-agents are not written.** Their `tools` map is keyed by
   tool name and the spelling for an MCP-served tool is unverified; a
   wrong key silently grants nothing.
+- **No sub-agent gets a tool allowlist except Claude Code's.** Codex has
+  no per-agent allowlist at all, and Copilot's `tools` key expects names
+  that Claude's `mcp__gortex__*` spelling does not resolve to. An
+  unrecognised entry grants nothing rather than falling back to the full
+  toolbox, so both inherit the session's tools instead.
+
+Codex sub-agents are worth one extra note, because the file format has
+two ways to fail that leave no error behind. Codex rejects an agent file
+outright on a single unknown key, and its `mcp_servers` field is a table
+of full server definitions rather than a list of server names — the
+intuitive `mcp_servers = ["gortex"]` voids the whole agent. Gortex
+therefore emits four keys and no `mcp_servers`; omitting it inherits the
+session's servers, which is what we want anyway. Project-scoped
+`.codex/agents/` is skipped entirely unless the project is trusted, so
+these install user-level only.
+
+Verify a Codex install with `codex doctor`: a rejected agent file shows
+up there as a startup warning mentioning `agent role`, while the exit
+code stays 0 and everything else loads normally.
 
 `~/.agents/skills` is a shared cross-agent root that both Codex and
 OpenCode scan, so one write serves both. Copilot CLI dropped it in

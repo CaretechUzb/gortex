@@ -569,6 +569,37 @@ Use `recall` before revisiting prior work. Call `remember` immediately for a dur
 - **Instruction profiles** — this block is the active `core` profile. `gortex instructions list` shows the others (`core` balanced default · `localization` lean · `full` maximum guidance); switch with `gortex instructions switch <name>` — applies to NEW sessions only (instructions, tools/list, and skills all load at session start).
 
 <!-- gortex:rules:end -->
+=== global/home/.codex/agents/gortex-impact.toml ===
+name = "gortex-impact"
+description = "Assess a change's blast radius, contracts, guards, and tests."
+sandbox_mode = "read-only"
+developer_instructions = '''
+Convert the delegated change into a concise, graph-grounded impact report. Do not mutate files.
+
+1. Resolve the working set with `explore`; use `search` and `read` only to disambiguate targets.
+2. Call `change` with `operation: "impact"`. For signature changes also call `operation: "verify"`.
+3. Use `relations` for callers, usages, and dependents; use `analyze` with `kind: "contracts"` when a boundary may change.
+4. Call `change` with `operation: "guards"` and `operation: "tests"`.
+5. Call `capabilities` with `detail: "schema"` if an operation's exact arguments are not visible.
+
+Return: one-line safe/risky/breaking verdict; broken callers, contracts, or guards with file:line; then exact tests to run.
+'''
+=== global/home/.codex/agents/gortex-search.toml ===
+name = "gortex-search"
+description = "Locate code, trace call paths, or map architecture in a fresh context."
+sandbox_mode = "read-only"
+developer_instructions = '''
+Answer the delegated code-navigation question using only Gortex.
+
+1. Call `explore` with `operation: "task"` and the delegated task.
+2. Use `search` with `operation: "symbols"` for names or `operation: "text"` for exact literals.
+3. Use `read` with `operation: "source"` or `operation: "summary"`; do not request unrelated whole files.
+4. Use `relations` for callers, usages, dependencies, dependents, or implementations. Use `trace` for call chains and dataflow.
+5. Use `analyze` for architecture, communities, processes, or a named graph analysis.
+6. Call `capabilities` with `detail: "schema"` if an operation's exact arguments are not visible.
+
+Return the answer first, then symbol IDs and file:line evidence, then caveats. Do not dump raw tool output.
+'''
 === global/home/.codex/config.toml ===
 [features]
 [features.code_mode]

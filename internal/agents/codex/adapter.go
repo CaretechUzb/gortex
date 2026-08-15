@@ -123,6 +123,7 @@ func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 		return nil, err
 	}
 	p.Files = append(p.Files, skillFiles...)
+	p.Files = append(p.Files, planSubAgents(env)...)
 	return p, nil
 }
 
@@ -244,6 +245,13 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		return res, fmt.Errorf("codex skills: %w", err)
 	}
 	res.Files = append(res.Files, skillActions...)
+
+	// Sub-agents → ~/.codex/agents/*.toml. ModeGlobal only: the
+	// project-scoped agents directory is only scanned for a TRUSTED
+	// project, so writing there is a gamble on state the installer cannot
+	// see — and it would put Gortex files in the user's working tree.
+	// subagents.go documents the rest of the vendor surface.
+	res.Files = append(res.Files, installSubAgents(env, opts)...)
 
 	res.Configured = true
 	return res, nil

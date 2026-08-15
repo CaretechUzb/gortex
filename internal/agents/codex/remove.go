@@ -19,6 +19,11 @@ package codex
 // even when the active profile says it should not be installed. Losing a
 // user's edits to a cleanup command is not a trade worth making.
 //
+// `~/.codex/agents` is a shared root for the same reason — it holds the
+// user's own custom agents beside our two — so the sub-agent files get
+// the identical byte-compare treatment, and the directory itself is only
+// pruned when our removals are what emptied it.
+//
 // Merged config files are edited, never removed: the Gortex MCP stanza,
 // the direct-namespace opt-in and the Gortex lifecycle hooks come out of
 // ~/.codex/config.toml, and every other server, feature and hook in it
@@ -91,6 +96,11 @@ func (a *Adapter) RemoveGlobal(env agents.Env, opts agents.ApplyOpts) (removed i
 	removed += skillsRemoved
 	failures = append(failures, skillFailures...)
 
+	// 4. ~/.codex/agents/<id>.toml — the sub-agents.
+	subAgentsRemoved, subAgentFailures := removeSubAgents(env, opts)
+	removed += subAgentsRemoved
+	failures = append(failures, subAgentFailures...)
+
 	return removed, failures
 }
 
@@ -123,9 +133,19 @@ func GlobalArtifacts(home string) []string {
 		root := codexSkillsRoot(home)
 		for _, s := range skills {
 			path := filepath.Join(root, s.ID, skillFileName)
-			if isShippedCodexSkill(path, renderSkill(s)) {
+			if isShippedCodexFile(path, renderSkill(s)) {
 				present = append(present, path)
 			}
+		}
+	}
+	subAgents := SubAgents()
+	for _, id := range SubAgentNames() {
+		body, ok := subAgents[id]
+		if !ok {
+			continue
+		}
+		if path := subAgentPath(home, id); path != "" && isShippedCodexFile(path, body) {
+			present = append(present, path)
 		}
 	}
 
@@ -302,9 +322,35 @@ func removeOwnedFile(w io.Writer, path, shipped string, opts agents.ApplyOpts) (
 	return 1, nil
 }
 
-// isShippedCodexSkill is the read-only half of removeOwnedFile, so the
+// removeSubAgents deletes ~/.codex/agents/<id>.toml for each sub-agent
+// whose bytes are still ours, and prunes the agents directory only when
+// our removals are what emptied it. That directory is the user's own
+// agent root — a hand-written agent sitting beside ours keeps it alive,
+// exactly as a user skill keeps the shared skills root alive.
+func removeSubAgents(env agents.Env, opts agents.ApplyOpts) (removed int, failures []string) {
+	defs := SubAgents()
+	for _, id := range SubAgentNames() {
+		body, ok := defs[id]
+		if !ok {
+			continue
+		}
+		path := subAgentPath(env.Home, id)
+		if path == "" {
+			continue
+		}
+		n, f := removeOwnedFile(env.Stderr, path, body, opts)
+		removed += n
+		failures = append(failures, f...)
+	}
+	if removed > 0 && !opts.DryRun {
+		pruneEmptyDir(subAgentsDir(env.Home))
+	}
+	return removed, failures
+}
+
+// isShippedCodexFile is the read-only half of removeOwnedFile, so the
 // preview and the deletion cannot disagree about what is ours.
-func isShippedCodexSkill(path, shipped string) bool {
+func isShippedCodexFile(path, shipped string) bool {
 	data, err := os.ReadFile(path)
 	return err == nil && string(data) == shipped
 }

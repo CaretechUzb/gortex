@@ -293,7 +293,7 @@ func TestCodexSkillsIdempotent(t *testing.T) {
 			t.Fatalf("apply: %v", err)
 		}
 		agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{
-			agents.ActionCreate: 1 + curatedSkillCount(t),
+			agents.ActionCreate: 1 + curatedSkillCount(t) + subAgentCount(),
 		})
 		agentstest.AssertIdempotent(t, a, env)
 	})

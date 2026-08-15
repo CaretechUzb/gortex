@@ -140,6 +140,18 @@ func TestCodexRemoveGlobalLeavesNoGortexArtifact(t *testing.T) {
 		}
 	}
 
+	// Both sub-agents are gone and the directory they had to themselves
+	// is pruned. subagents_test.go covers the shared-root case, where a
+	// user's own agent keeps the directory alive.
+	for _, id := range SubAgentNames() {
+		if _, err := os.Stat(subAgentPath(env.Home, id)); !os.IsNotExist(err) {
+			t.Errorf("sub-agent %s survived removal (stat err=%v)", id, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(env.Home, ".codex", "agents")); !os.IsNotExist(err) {
+		t.Errorf("the emptied agents directory was not pruned (stat err=%v)", err)
+	}
+
 	// The user's own skill in that same root is byte-identical.
 	after, err := os.ReadFile(userSkill)
 	if err != nil {
