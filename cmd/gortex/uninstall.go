@@ -95,6 +95,11 @@ var (
 	}
 	uninstallDirs = []string{
 		".claude/commands",
+		// Claude Code's per-community skills, unlike the three shared
+		// trees below, sit under a `generated/` level that exists for
+		// exactly this reason: nothing but Gortex writes there, so the
+		// whole directory can go without inspecting its entries.
+		".claude/skills/generated",
 		".kiro/steering",
 		".kiro/hooks",
 		".kiro/settings",
