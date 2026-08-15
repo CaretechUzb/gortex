@@ -109,7 +109,16 @@ func applySkills(env agents.Env, opts agents.ApplyOpts) ([]agents.FileAction, er
 // `gortex instructions switch` narrows it afterwards through SyncSkills.
 // Both go through the same reconciler so an install and a profile switch
 // can never disagree about what belongs on disk.
+// An empty Home is refused rather than defaulted. codexSkillsRoot joins
+// onto it, so an unresolved home turns "$HOME/.agents/skills" into the
+// relative ".agents/skills" and the curated pack lands in whatever
+// directory the process happens to be in — most often the user's repo,
+// which is exactly where this pack must never go. planSkills already
+// guards for it; this is the same guard on the write side.
 func installCuratedSkills(env agents.Env, opts agents.ApplyOpts) ([]agents.FileAction, error) {
+	if env.Home == "" {
+		return nil, nil
+	}
 	return syncCuratedSkills(env.Stderr, codexSkillsRoot(env.Home), nil, opts)
 }
 

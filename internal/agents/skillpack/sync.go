@@ -80,6 +80,24 @@ type SyncSpec struct {
 	// pruned. Optional: a pack that has only ever shipped one rendering
 	// leaves this nil and relies on the byte compare alone.
 	KnownHashes map[string]string
+
+	// DirFor overrides where one skill's directory lives, for a host
+	// that groups skills below the root instead of placing them
+	// directly under it — Hermes files each skill under a category
+	// (skills/<category>/<id>/). Optional; nil means <Dir>/<id>.
+	//
+	// It returns the directory, not the file, because pruning removes
+	// the directory whole and the reconciler must not have to guess how
+	// far up the tree the skill's own scope ends.
+	DirFor func(id string) string
+}
+
+// skillDir resolves one skill's directory under this spec.
+func (s SyncSpec) skillDir(id string) string {
+	if s.DirFor != nil {
+		return s.DirFor(id)
+	}
+	return filepath.Join(s.Dir, id)
 }
 
 // Sync reconciles a host's installed skill tree with the allowed
@@ -134,7 +152,7 @@ func Sync(w io.Writer, spec SyncSpec, allowed []string, opts agents.ApplyOpts) (
 	out := make([]agents.FileAction, 0, len(spec.Rendered))
 	for _, id := range sortedIDs(spec.Rendered) {
 		content := spec.Rendered[id]
-		dir := filepath.Join(spec.Dir, id)
+		dir := spec.skillDir(id)
 		path := filepath.Join(dir, fileName)
 
 		var (

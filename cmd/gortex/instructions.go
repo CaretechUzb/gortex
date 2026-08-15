@@ -12,6 +12,7 @@ import (
 	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/agents/copilotcli"
+	"github.com/zzet/gortex/internal/agents/hermes"
 	"github.com/zzet/gortex/internal/agents/opencode"
 	"github.com/zzet/gortex/internal/profiles"
 )
@@ -51,6 +52,7 @@ var hostSkillSyncs = []struct {
 	{"codex", codex.SyncSkills},
 	{"opencode", opencode.SyncSkills},
 	{"copilot cli", copilotcli.SyncSkills},
+	{"hermes", hermes.SyncSkills},
 }
 
 // instructions.go is the `gortex instructions` command tree — the CLI
