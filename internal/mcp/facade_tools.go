@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -982,10 +983,6 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 			Data:      map[string]any{"facade": spec.Facade, "operation": spec.Operation, "legacy_tool": spec.Legacy},
 		}), nil
 	}
-	if invalid := s.validateFacadeInput(spec, req.GetArguments()); invalid != nil {
-		outcome = facadeOutcomeInvalidArgument
-		return invalid, nil
-	}
 	normalized := normalizeFacadeArguments(spec, req.GetArguments())
 	if targetErr := normalizeFacadeChangeTargets(spec, req.GetArguments(), normalized); targetErr != nil {
 		outcome = facadeOutcomeInvalidArgument
@@ -1457,7 +1454,7 @@ func (s *Server) facadeAcceptedTopLevelFields(spec facadeOperationSpec) []string
 }
 
 func (s *Server) validateFacadeInput(spec facadeOperationSpec, input map[string]any) *mcpgo.CallToolResult {
-	for _, field := range []string{"arguments", "options", "source", "context", "guard", "output"} {
+	for _, field := range facadeContainerKeys {
 		value, present := input[field]
 		if !present || value == nil {
 			continue
@@ -1488,6 +1485,9 @@ func (s *Server) validateFacadeInput(spec facadeOperationSpec, input map[string]
 				Data:      map[string]any{"field": field},
 			})
 		}
+	}
+	if invalid := s.validateFacadeRepositoryFields(spec, input); invalid != nil {
+		return invalid
 	}
 	for _, field := range []string{"target", "to"} {
 		if raw, present := input[field]; present && raw != nil {
@@ -1526,6 +1526,110 @@ func (s *Server) validateFacadeInput(spec facadeOperationSpec, input map[string]
 		})
 	}
 	return nil
+}
+
+// validateFacadeRepositoryFields rejects repository-selector spellings only
+// when the selected legacy handler cannot consume their normalized form. This
+// preserves working compatibility aliases while closing every top-level and
+// nested-container path that would otherwise silently target the active repo.
+func (s *Server) validateFacadeRepositoryFields(spec facadeOperationSpec, input map[string]any) *mcpgo.CallToolResult {
+	locations := append([]string{""}, facadeContainerKeys...)
+	for _, containerName := range locations {
+		fields := input
+		if containerName != "" {
+			var ok bool
+			fields, ok = input[containerName].(map[string]any)
+			if !ok {
+				continue
+			}
+		}
+		for _, field := range sortedFacadeMapKeys(fields) {
+			if !facadeRepositorySelectorLike(field) {
+				continue
+			}
+			path := field
+			if containerName != "" {
+				path = containerName + "." + field
+			}
+			canonicalPath := s.facadePublicRepositoryField(spec)
+			if path == canonicalPath {
+				value, ok := fields[field].(string)
+				if !ok || strings.TrimSpace(value) == "" {
+					return NewStructuredErrorResult(StructuredError{
+						ErrorCode: ErrCodeInvalidArgument,
+						Message:   fmt.Sprintf("%s must be a non-empty string", path),
+						Data: map[string]any{
+							"field": path, "expected_type": "non-empty string",
+						},
+					})
+				}
+			}
+			if s.facadeFieldConsumed(spec, containerName, field, fields[field]) {
+				continue
+			}
+			data := map[string]any{"field": path}
+			if containerName != "" {
+				data["container"] = containerName
+			}
+			message := fmt.Sprintf("unknown field %q", path)
+			if canonicalPath != "" {
+				data["suggested_field"] = canonicalPath
+				message += fmt.Sprintf("; use %s to select a repository", canonicalPath)
+			}
+			return NewStructuredErrorResult(StructuredError{
+				ErrorCode: ErrCodeInvalidArgument,
+				Message:   message,
+				Data:      data,
+			})
+		}
+	}
+	return nil
+}
+
+func (s *Server) facadeFieldConsumed(spec facadeOperationSpec, containerName, field string, value any) bool {
+	baseline := normalizeFacadeArguments(spec, map[string]any{"operation": spec.Operation})
+	probe := map[string]any{"operation": spec.Operation}
+	if containerName == "" {
+		probe[field] = value
+	} else {
+		probe[containerName] = map[string]any{field: value}
+	}
+	for lowered, candidateValue := range normalizeFacadeArguments(spec, probe) {
+		if _, fixed := spec.Fixed[lowered]; fixed || !s.legacyDeclaresField(spec.Legacy, lowered) {
+			continue
+		}
+		baselineValue, existed := baseline[lowered]
+		if !existed || !reflect.DeepEqual(baselineValue, candidateValue) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) facadePublicRepositoryField(spec facadeOperationSpec) string {
+	capability := s.facadeCapability(spec, true)
+	schema, _ := capability["input_schema"].(map[string]any)
+	properties, _ := schema["properties"].(map[string]any)
+	if _, ok := properties["repo"]; ok {
+		return "repo"
+	}
+	for _, container := range facadeContainerKeys {
+		containerSchema, _ := properties[container].(map[string]any)
+		containerProperties, _ := containerSchema["properties"].(map[string]any)
+		if _, ok := containerProperties["repo"]; ok {
+			return container + ".repo"
+		}
+	}
+	return ""
+}
+
+func facadeRepositorySelectorLike(field string) bool {
+	switch strings.ToLower(strings.TrimSpace(field)) {
+	case "repo", "repo_path", "repository", "repository_path":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateFacadeSelector(field string, raw any) *mcpgo.CallToolResult {
