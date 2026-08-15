@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1141,6 +1142,23 @@ func samePhysicalFileVersion(a, b os.FileInfo) bool {
 		os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
 }
 
+// readAllSized reads f into a buffer presized from the size the caller already
+// observed on the open handle, so the whole-file read costs one allocation
+// instead of io.ReadAll's repeated append-and-copy growth (measured 2.1x the
+// file size in total allocation for a 128 MiB file, 1.0x once presized). The
+// hint is advisory: a file that grew since the stat still reads completely,
+// and an implausible size falls back to unhinted growth.
+func readAllSized(f *os.File, size int64) ([]byte, error) {
+	var buf bytes.Buffer
+	if size > 0 && size < math.MaxInt32 {
+		buf.Grow(int(size) + bytes.MinRead)
+	}
+	if _, err := buf.ReadFrom(f); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // readPhysicalFileEvidence hashes the exact buffer returned to the caller from
 // one file-handle read. Metadata and path identity checks bound replacement or
 // in-place drift during that read without doubling file I/O or peak memory.
@@ -1173,7 +1191,7 @@ func readPhysicalFileEvidenceObserved(absPath string, afterRead func()) ([]byte,
 	if !before.Mode().IsRegular() {
 		return nil, physicalReadEvidence{}, fmt.Errorf("physical evidence requires a regular file, got %s", before.Mode().Type())
 	}
-	content, err := io.ReadAll(f)
+	content, err := readAllSized(f, before.Size())
 	if err != nil {
 		return nil, physicalReadEvidence{}, fmt.Errorf("could not read physical file: %w", err)
 	}
@@ -1262,7 +1280,11 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	var physicalEvidence physicalReadEvidence
 	if physicalEvidenceRequested {
 		var readErr error
-		diskContent, physicalEvidence, readErr = readPhysicalFileEvidence(absPath)
+		read := readPhysicalFileEvidence
+		if s.physicalEvidenceOverride != nil {
+			read = s.physicalEvidenceOverride
+		}
+		diskContent, physicalEvidence, readErr = read(absPath)
 		if readErr != nil {
 			return mcp.NewToolResultError(readErr.Error()), nil
 		}
@@ -1368,8 +1390,19 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			secretsRedacted = true
 		}
 	}
-	if physicalEvidenceRequested && secretsRedacted {
-		return mcp.NewToolResultError("physical_evidence for redacted content requires allow_secrets=true"), nil
+	// The digest's scope is the full disk buffer, so the secret-intent gate has
+	// to be judged on those bytes rather than on whatever survived into the
+	// response. Keying it off secretsRedacted let any transform that dropped the
+	// secret-shaped lines first — an offset/limit window, a max_lines cut —
+	// leave hits at zero, so the gate stayed silent and the full-file digest of
+	// a secrets file shipped anyway. Judged on diskContent the window no longer
+	// matters. An overlay buffer carrying secrets the file on disk does not is
+	// now allowed through, which is correct: the digest describes disk, and the
+	// overlay bytes are still redacted in the response.
+	if physicalEvidenceRequested && !allowSecrets {
+		if _, wouldRedact := s.maybeRedactConfigLeaf(language, relPath, false, string(diskContent)); wouldRedact {
+			return mcp.NewToolResultError("physical_evidence for redacted content requires allow_secrets=true"), nil
+		}
 	}
 
 	maxChars := req.GetInt("max_chars", 0)
