@@ -138,12 +138,21 @@ func TestGenerateRouting(t *testing.T) {
 	skills := gen.GenerateAll()
 	routing := gen.GenerateRouting(skills)
 
-	assert.Contains(t, routing, "<!-- gortex:skills:start -->")
-	assert.Contains(t, routing, "<!-- gortex:skills:end -->")
 	assert.Contains(t, routing, "| Parser |")
 	assert.Contains(t, routing, "| Server |")
-	assert.Contains(t, routing, "`/gortex-parser`")
-	assert.Contains(t, routing, "`/gortex-server`")
+	assert.Contains(t, routing, "community-0")
+	assert.Contains(t, routing, "community-1")
+
+	// The payload must not fence itself — adapters wrap it in their own
+	// CommunitiesStartMarker/CommunitiesEndMarker (see
+	// internal/agents/instructions.go); a nested marker pair here would
+	// double-fence the block every adapter writes.
+	assert.NotContains(t, routing, "gortex:skills:")
+
+	// No slash-command invocation: it only resolves on Claude Code, and
+	// this block also reaches hosts (Codex, Cursor, Windsurf, ...) that
+	// have no such command.
+	assert.NotContains(t, routing, "/gortex-")
 }
 
 func TestGenerateAll_NilCommunities(t *testing.T) {
@@ -167,7 +176,26 @@ func TestGenerateAll_HowToExplore(t *testing.T) {
 	skills := gen.GenerateAll()
 	for _, s := range skills {
 		assert.True(t, strings.Contains(s.Content, "## How to Explore"), "skill %s should have How to Explore section", s.Label)
-		assert.True(t, strings.Contains(s.Content, "get_communities"), "skill %s should reference get_communities tool", s.Label)
-		assert.True(t, strings.Contains(s.Content, "smart_context"), "skill %s should reference smart_context tool", s.Label)
+		assert.True(t, strings.Contains(s.Content, "analyze(operation:"), "skill %s should reference the analyze facade tool", s.Label)
+		assert.True(t, strings.Contains(s.Content, "explore(operation:"), "skill %s should reference the explore facade tool", s.Label)
+	}
+}
+
+// TestGenerateAll_NoLegacyToolNames pins the facade migration: generated
+// skill bodies must steer agents at the public facade tools (explore,
+// search, read, relations, change, trace, recall), not the one-tool-per-
+// operation names those front. Legacy names are implementation detail that
+// drift as operations get regrouped in facade_registry.go; the facade
+// surface is the stable public contract every adapter is told to use.
+func TestGenerateAll_NoLegacyToolNames(t *testing.T) {
+	g, communities, processes := testGraph()
+	gen := New(communities, processes, g)
+
+	skills := gen.GenerateAll()
+	legacyNames := []string{"get_communities", "smart_context", "find_usages", "get_symbol_source"}
+	for _, s := range skills {
+		for _, legacy := range legacyNames {
+			assert.NotContains(t, s.Content, legacy, "skill %s should not reference legacy tool name %s", s.Label, legacy)
+		}
 	}
 }
