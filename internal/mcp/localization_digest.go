@@ -3,6 +3,7 @@ package mcp
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -261,6 +262,32 @@ func mergeLocalizationDigestStrings(primary, supplementary []string) []string {
 	return merged
 }
 
+// localizationProvenanceMergeStrength orders provenance labels for merge
+// retention. A literal observation is a claim a later graph hop cannot
+// substitute: once a row has been seen as a content or source literal, a
+// re-observation through adjacency must not erase that mark.
+func localizationProvenanceMergeStrength(provenance string) int {
+	switch provenance {
+	case localizationProvenanceSourceLiteralCallee:
+		return 6
+	case localizationProvenanceContentLiteral:
+		return 5
+	case localizationProvenanceDivergentDefault,
+		localizationProvenanceImplementationTarget,
+		localizationProvenanceTypedAnchorProjection,
+		localizationProvenanceDivergentDefaultType,
+		localizationProvenancePermittedReadSource,
+		localizationProvenanceImplementationRoute:
+		return 4
+	case localizationProvenanceDirectAdjacency, "direct_caller", "direct_callee":
+		return 2
+	case "":
+		return 0
+	default:
+		return 3
+	}
+}
+
 // mergeLocalizationDigestRowEvidence preserves the first-ranked identity while
 // filling metadata and unioning bounded graph evidence from a later observation.
 // File disagreement is deliberately not repaired here: one ID cannot authorize
@@ -284,7 +311,8 @@ func mergeLocalizationDigestRowEvidence(primary, supplementary localizationDiges
 	if primary.Signature == "" {
 		primary.Signature = supplementary.Signature
 	}
-	if primary.Provenance == "" {
+	if localizationProvenanceMergeStrength(supplementary.Provenance) >
+		localizationProvenanceMergeStrength(primary.Provenance) {
 		primary.Provenance = supplementary.Provenance
 	}
 	primary.literalPrimaryEligible = primary.literalPrimaryEligible || supplementary.literalPrimaryEligible
@@ -660,6 +688,13 @@ const (
 	// One authenticated source-literal callee may pre-seat ahead of the ranked
 	// cohort. Further literal rows compete only through ordinary ranking.
 	localizationFinalResponseLiteralReserve = 1
+	// A task-named row may claim a seat regardless of its admission lane, but
+	// only on a substantive identifier match: six runes keeps short prose
+	// words from promoting whatever row happens to contain them.
+	localizationTaskAlignedSeatMinTerm = 6
+	// The task-aligned pass stops one seat short of the primary block so the
+	// ranked order always keeps at least one seat of its own.
+	localizationTaskAlignedSeatCeiling = localizationFinalResponsePrimaryLimit - 1
 	// localizationDigestShrinkFloorRows is the smallest answer the envelope
 	// shed loop may shrink the digest to under extreme budget pressure. It is
 	// deliberately narrower than the primary block: the primary width is what
@@ -1016,6 +1051,41 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 			appendPrimary(rows[bestTaskMatch])
 		}
 	}
+
+	// Every remaining task-named row competes for the open seats in score
+	// order before rank order fills the rest. The admission lane must not
+	// decide presentation authority: a declaration the task names is what the
+	// caller asked about, whether it arrived through ranked retrieval,
+	// leading-file completeness, or a body mention. Adjacency neighbors stay
+	// supporting — sharing an identifier with the task does not make a graph
+	// hop the subject of the report.
+	if len(primaries) < localizationTaskAlignedSeatCeiling && len(taskTerms) > 0 {
+		type taskAlignedCandidate struct {
+			index int
+			score localizationFinalResponseTaskScore
+		}
+		aligned := make([]taskAlignedCandidate, 0, len(rows))
+		for index, row := range rows {
+			if _, exists := selected[strings.TrimSpace(row.ID)]; exists {
+				continue
+			}
+			if row.Provenance == localizationProvenanceDirectAdjacency {
+				continue
+			}
+			score := scoreLocalizationFinalResponseTask(taskTerms, row)
+			if score.matched == 0 || score.longest < localizationTaskAlignedSeatMinTerm {
+				continue
+			}
+			aligned = append(aligned, taskAlignedCandidate{index: index, score: score})
+		}
+		sort.SliceStable(aligned, func(left, right int) bool {
+			return localizationFinalResponseBetterTaskScore(aligned[left].score, aligned[right].score)
+		})
+		for _, candidate := range aligned {
+			appendRow(&primaries, localizationTaskAlignedSeatCeiling, rows[candidate.index])
+		}
+	}
+
 	for _, row := range rows {
 		// Further authenticated literal callees may still win through ordinary
 		// rank; only the pre-seated reserve above is capped at one.

@@ -64,7 +64,7 @@ func TestPromoteLocalizationBodyMentionsUsesRealPageDeclarations(t *testing.T) {
 
 	for _, row := range localizationFinalResponseRows("fix sibling and External", nil, packedDigest.Evidence) {
 		if row.row.Provenance == localizationProvenanceBodyMention {
-			require.False(t, row.primary, "body-derived declarations are supporting evidence only")
+			require.True(t, row.primary, "a body-derived declaration the task names seats as primary")
 		}
 	}
 }
@@ -132,7 +132,7 @@ func TestPromoteLocalizationBodyMentionsUsesPackedSourceWindow(t *testing.T) {
 	require.True(t, localizationBodyMentionDigestContains(packedDigest, sibling.ID))
 	for _, row := range localizationFinalResponseRows("find sibling", nil, packedDigest.Evidence) {
 		if row.row.ID == sibling.ID {
-			require.False(t, row.primary, "window-derived rows must remain supporting-only")
+			require.True(t, row.primary, "a window-derived row the task names seats as primary")
 		}
 	}
 }
