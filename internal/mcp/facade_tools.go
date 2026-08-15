@@ -1486,7 +1486,7 @@ func (s *Server) validateFacadeInput(spec facadeOperationSpec, input map[string]
 			})
 		}
 	}
-	if invalid := s.validateFacadeRepositoryFields(spec, input); invalid != nil {
+	if invalid := s.validateFacadeRequestFields(spec, input); invalid != nil {
 		return invalid
 	}
 	for _, field := range []string{"target", "to"} {
@@ -1528,11 +1528,52 @@ func (s *Server) validateFacadeInput(spec facadeOperationSpec, input map[string]
 	return nil
 }
 
-// validateFacadeRepositoryFields rejects repository-selector spellings only
-// when the selected legacy handler cannot consume their normalized form. This
-// preserves working compatibility aliases while closing every top-level and
-// nested-container path that would otherwise silently target the active repo.
-func (s *Server) validateFacadeRepositoryFields(spec facadeOperationSpec, input map[string]any) *mcpgo.CallToolResult {
+// validateFacadeRequestFields refuses any top-level or container field the
+// selected operation can neither advertise nor consume.
+//
+// The published per-operation schema closes every container, so a field outside
+// it reaches no handler: normalization copies it into the legacy arguments and
+// nothing reads it. Dropping it silently is not neutral — the caller stated an
+// intent the server then ignored, and for a field that names a target (a
+// repository, a workspace, a path) the operation proceeds against the active
+// one instead. On a write that is a write to the wrong place, with a success
+// result. Refusing costs a retry; accepting-and-ignoring costs correctness the
+// caller cannot audit.
+//
+// A field the published schema omits is still accepted when it actually reaches
+// the handler, which keeps every working compatibility alias alive.
+func (s *Server) validateFacadeRequestFields(spec facadeOperationSpec, input map[string]any) *mcpgo.CallToolResult {
+	canonicalPath := s.facadePublicRepositoryField(spec)
+	return forEachFacadeRequestField(input, func(containerName, field, path string, value any) *mcpgo.CallToolResult {
+		if !facadeRepositorySelectorLike(field) {
+			return nil
+		}
+		if path == canonicalPath {
+			text, ok := value.(string)
+			if !ok || strings.TrimSpace(text) == "" {
+				return NewStructuredErrorResult(StructuredError{
+					ErrorCode: ErrCodeInvalidArgument,
+					Message:   fmt.Sprintf("%s must be a non-empty string", path),
+					Data: map[string]any{
+						"field": path, "expected_type": "non-empty string",
+					},
+				})
+			}
+		}
+		if s.facadeFieldConsumed(spec, containerName, field, value) {
+			return nil
+		}
+		return facadeUnknownFieldResult(spec, canonicalPath, containerName, path, field)
+	})
+}
+
+// forEachFacadeRequestField walks the top level and every container in a stable
+// order, skipping the envelope keys the dispatcher consumes itself, and returns
+// the first refusal a check produces.
+func forEachFacadeRequestField(
+	input map[string]any,
+	check func(containerName, field, path string, value any) *mcpgo.CallToolResult,
+) *mcpgo.CallToolResult {
 	locations := append([]string{""}, facadeContainerKeys...)
 	for _, containerName := range locations {
 		fields := input
@@ -1544,54 +1585,80 @@ func (s *Server) validateFacadeRepositoryFields(spec facadeOperationSpec, input 
 			}
 		}
 		for _, field := range sortedFacadeMapKeys(fields) {
-			if !facadeRepositorySelectorLike(field) {
+			if containerName == "" && isFacadeEnvelopeKey(field) {
+				// The dispatcher consumes these itself and they never reach the
+				// handler as fields, so no operation schema enumerates them.
+				// Container bodies are walked by this same loop; target and to
+				// are checked by validateFacadeSelector.
 				continue
 			}
 			path := field
 			if containerName != "" {
 				path = containerName + "." + field
 			}
-			canonicalPath := s.facadePublicRepositoryField(spec)
-			if path == canonicalPath {
-				value, ok := fields[field].(string)
-				if !ok || strings.TrimSpace(value) == "" {
-					return NewStructuredErrorResult(StructuredError{
-						ErrorCode: ErrCodeInvalidArgument,
-						Message:   fmt.Sprintf("%s must be a non-empty string", path),
-						Data: map[string]any{
-							"field": path, "expected_type": "non-empty string",
-						},
-					})
-				}
+			if refusal := check(containerName, field, path, fields[field]); refusal != nil {
+				return refusal
 			}
-			if s.facadeFieldConsumed(spec, containerName, field, fields[field]) {
-				continue
-			}
-			data := map[string]any{"field": path}
-			if containerName != "" {
-				data["container"] = containerName
-			}
-			message := fmt.Sprintf("unknown field %q", path)
-			if canonicalPath != "" {
-				data["suggested_field"] = canonicalPath
-				message += fmt.Sprintf("; use %s to select a repository", canonicalPath)
-			} else {
-				// Refusing without saying why leaves the caller retrying
-				// spellings of a selector this operation will never accept.
-				data["reason"] = "no_repository_selector"
-				message += fmt.Sprintf("; %s.%s accepts no repository selector and runs against the active project"+
-					" — switch it with workspace_admin.set_active_project", spec.Facade, spec.Operation)
-			}
-			return NewStructuredErrorResult(StructuredError{
-				ErrorCode: ErrCodeInvalidArgument,
-				Message:   message,
-				Data:      data,
-			})
 		}
 	}
 	return nil
 }
 
+// facadeUnknownFieldResult explains a refusal in the terms the caller can act
+// on: where the operation does take a repository, or that it takes none, or
+// which fields the container advertises.
+func facadeUnknownFieldResult(
+	spec facadeOperationSpec,
+	canonicalPath, containerName, path, field string,
+) *mcpgo.CallToolResult {
+	data := map[string]any{"field": path}
+	if containerName != "" {
+		data["container"] = containerName
+	}
+	message := fmt.Sprintf("unknown field %q", path)
+	switch {
+	case canonicalPath != "":
+		data["suggested_field"] = canonicalPath
+		message += fmt.Sprintf("; use %s to select a repository", canonicalPath)
+	default:
+		// Refusing without saying why leaves the caller retrying spellings of a
+		// selector this operation will never accept.
+		data["reason"] = "no_repository_selector"
+		message += fmt.Sprintf("; %s.%s accepts no repository selector and runs against the active project"+
+			" — switch it with workspace_admin.set_active_project", spec.Facade, spec.Operation)
+	}
+	return NewStructuredErrorResult(StructuredError{
+		ErrorCode: ErrCodeInvalidArgument,
+		Message:   message,
+		Data:      data,
+	})
+}
+
+// facadeTranslatesEditAliases reports whether the facade publishes the friendly
+// match/replacement pair that normalizeFacadeArguments lowers into the legacy
+// old_string/new_string vocabulary. TestFacadeEditAliasTranslationMatchesPublishedVocabulary
+// pins this to the facade definitions so the two cannot drift.
+func facadeTranslatesEditAliases(facade string) bool {
+	return facade == "edit"
+}
+
+// isFacadeEnvelopeKey reports whether a top-level key belongs to the request
+// envelope rather than to the operation's arguments. normalizeFacadeArguments
+// drops exactly these before merging, so the two must agree.
+func isFacadeEnvelopeKey(key string) bool {
+	switch key {
+	case "operation", "arguments", "options", "source", "context", "guard", "output", "target", "to":
+		return true
+	default:
+		return false
+	}
+}
+
+// facadeFieldConsumed reports whether the field, lowered through the same
+// normalization the dispatcher applies, reaches the selected handler as a field
+// that handler declares. The probe is diffed against an operation-only baseline
+// so a key the normalizer injects unconditionally cannot make every field look
+// consumed, and fixed arguments do not count: the caller's value is discarded.
 func (s *Server) facadeFieldConsumed(spec facadeOperationSpec, containerName, field string, value any) bool {
 	baseline := normalizeFacadeArguments(spec, map[string]any{"operation": spec.Operation})
 	probe := map[string]any{"operation": spec.Operation}
@@ -1613,15 +1680,7 @@ func (s *Server) facadeFieldConsumed(spec facadeOperationSpec, containerName, fi
 }
 
 // facadePublicRepositoryField reports where the operation's published schema
-// exposes its repository selector, as a dotted path, or "" when the operation
-// has none.
-//
-// Building the published schema re-materialises the immutable operation table
-// and re-runs the lowering probe for every legacy property, which costs two
-// orders of magnitude more than the rest of facade dispatch. The answer depends
-// only on the spec and the captured legacy schema, so it is memoized per
-// registry and invalidated whenever a late registration changes what is
-// captured.
+// exposes its repository selector, as a dotted path, or "" when it has none.
 func (s *Server) facadePublicRepositoryField(spec facadeOperationSpec) string {
 	key := spec.Facade + "." + spec.Operation
 	if cached, ok := s.facades.cachedRepositoryField(key); ok {
@@ -1649,9 +1708,31 @@ func (s *Server) resolveFacadePublicRepositoryField(spec facadeOperationSpec) st
 	return ""
 }
 
+// facadeRepositorySelectorLike reports whether a field name states WHERE an
+// operation should act — the repository, workspace, project, or path it should
+// target.
+//
+// This is the class where dropping a field silently is not merely wasteful but
+// wrong: the operation proceeds against the active target while the caller
+// believes it addressed the one they named, and on a write that is a write to
+// the wrong place reported as success. Every name here is checked against the
+// consumption probe, so an operation that genuinely reads one still gets it;
+// only the spellings that reach no reader are refused.
+//
+// The list is deliberately wider than the vocabulary the surface publishes.
+// A caller who invents `repo_root` or `cwd` has stated the same intent as one
+// who writes `repo`, and answering about a different target is equally wrong.
+//
+// It stops at names that unambiguously address a repository or workspace.
+// `path` and `scope` are excluded on purpose: across this surface they far more
+// often mean a file path or a working-tree scope than a repository, so treating
+// them as target selectors would refuse working calls to buy nothing.
 func facadeRepositorySelectorLike(field string) bool {
 	switch strings.ToLower(strings.TrimSpace(field)) {
-	case "repo", "repo_path", "repository", "repository_path":
+	case "repo", "repo_path", "repository", "repository_path",
+		"repo_root", "repository_root", "repopath", "repo-path", "repo_dir",
+		"root", "cwd", "dir", "worktree", "work_tree", "base_repo",
+		"workspace", "project":
 		return true
 	default:
 		return false
@@ -1831,8 +1912,7 @@ func normalizeFacadeArguments(spec facadeOperationSpec, input map[string]any) ma
 	mergeFacadeObject(out, input["guard"])
 	mergeFacadeObject(out, input["output"])
 	for key, value := range input {
-		switch key {
-		case "operation", "arguments", "options", "source", "context", "guard", "output", "target", "to":
+		if isFacadeEnvelopeKey(key) {
 			continue
 		}
 		out[key] = value
@@ -1845,22 +1925,27 @@ func normalizeFacadeArguments(spec facadeOperationSpec, input map[string]any) ma
 			out["to_"+key] = value
 		}
 	}
-	// Friendly edit aliases become the exact legacy vocabulary.
-	if match, ok := out["match"]; ok {
-		if spec.Legacy == "edit_symbol" {
-			out["old_source"] = match
-		} else {
-			out["old_string"] = match
+	// Friendly edit aliases become the exact legacy vocabulary. Only the facade
+	// that publishes them may translate: elsewhere `match` and `replacement` are
+	// a handler's own vocabulary, and rewriting them drops the caller's value
+	// into a field nobody reads.
+	if facadeTranslatesEditAliases(spec.Facade) {
+		if match, ok := out["match"]; ok {
+			if spec.Legacy == "edit_symbol" {
+				out["old_source"] = match
+			} else {
+				out["old_string"] = match
+			}
+			delete(out, "match")
 		}
-		delete(out, "match")
-	}
-	if replacement, ok := out["replacement"]; ok {
-		if spec.Legacy == "edit_symbol" {
-			out["new_source"] = replacement
-		} else {
-			out["new_string"] = replacement
+		if replacement, ok := out["replacement"]; ok {
+			if spec.Legacy == "edit_symbol" {
+				out["new_source"] = replacement
+			} else {
+				out["new_string"] = replacement
+			}
+			delete(out, "replacement")
 		}
-		delete(out, "replacement")
 	}
 	normalizeFacadeAliases(spec, input, out)
 	for key, value := range spec.Fixed {
