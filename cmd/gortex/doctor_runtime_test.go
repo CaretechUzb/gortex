@@ -158,9 +158,7 @@ func TestDoctorRuntimeReportsInstallStateForEveryHost(t *testing.T) {
 		{codex.Name, true, filepath.Join(home, ".codex", "config.toml")},
 		{hooks.AgentClaudeCode, true, ""},
 		{copilotcli.Name, true, filepath.Join(home, ".copilot", "hooks", "gortex.json")},
-		// OpenCode registers no user-level MCP server: `gortex init` puts
-		// the stanza in the repo's own opencode.json.
-		{opencode.Name, false, opencode.PluginPath(home)},
+		{opencode.Name, true, opencode.PluginPath(home)},
 	} {
 		t.Run(tc.agent, func(t *testing.T) {
 			got, ok := byAgent[tc.agent]

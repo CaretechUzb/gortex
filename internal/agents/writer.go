@@ -337,6 +337,13 @@ func isJSONCPath(path string) bool {
 	}
 }
 
+// StripJSONComments is the exported form, for an adapter that has to
+// READ a host config MergeJSON is not writing — an uninstall preview
+// deciding whether a stanza is actually present, say. Reaching for
+// encoding/json directly on a host that permits JSONC silently reports
+// every commented config as unparseable.
+func StripJSONComments(b []byte) []byte { return stripJSONComments(b) }
+
 // stripJSONComments rewrites JSONC / JSON5-style input into strict JSON
 // that encoding/json can parse: it drops `//` line comments, `/* */`
 // block comments, and trailing commas before `}` / `]`. String literals

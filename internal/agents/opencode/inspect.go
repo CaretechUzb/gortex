@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/skillpack"
 )
 
@@ -77,11 +78,16 @@ func Inspect(home string) InstallState {
 		return state
 	}
 
-	state.ConfigPath = filepath.Join(globalConfigDir(home), "opencode.json")
+	// Resolve the same file the writer targets, and strip comments before
+	// parsing. A hand-authored config is usually `opencode.jsonc`, and
+	// reading a fixed `opencode.json` with a bare json.Unmarshal reports
+	// exactly the machine this probe exists to catch — server installed,
+	// doctor says it is not — as a clean bill of health.
+	state.ConfigPath = GlobalConfigPath(home)
 	if data, err := os.ReadFile(state.ConfigPath); err == nil {
 		state.ConfigPresent = true
 		root := map[string]any{}
-		if json.Unmarshal(data, &root) == nil {
+		if json.Unmarshal(agents.StripJSONComments(data), &root) == nil {
 			if servers, ok := root["mcp"].(map[string]any); ok {
 				_, state.MCPServer = servers["gortex"]
 			}

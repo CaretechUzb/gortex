@@ -452,6 +452,23 @@ description: "Preview an edit's blast radius on the shadow graph before writing.
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+=== global/home/.config/opencode/opencode.json ===
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "gortex": {
+      "command": [
+        "gortex",
+        "mcp"
+      ],
+      "enabled": true,
+      "environment": {
+        "GORTEX_INDEX_WORKERS": "8"
+      },
+      "type": "local"
+    }
+  }
+}
 === global/home/.config/opencode/plugin/gortex.js ===
 // Gortex plugin for OpenCode (1.18.18).
 //

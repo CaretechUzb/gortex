@@ -18,17 +18,19 @@ package opencode
 // checked: `plugin/gortex.js` is deleted only when it carries PluginMarker,
 // so a same-named plugin somebody else wrote is left alone.
 //
-// # Stop-line: no MCP stanza and no instructions block at user scope
+// The user-level `mcp.gortex` entry is stripped from
+// ~/.config/opencode/opencode.json, leaving every other server and every
+// other top-level key untouched. The file itself is never deleted: it is
+// the user's config, and we only ever added one key to it.
 //
-// applyGlobal writes neither, so RemoveGlobal removes neither. OpenCode's
-// gortex MCP entry lives in the repo's own opencode.json (written by
-// `gortex init`, removed by the repo-level half of `gortex uninstall`) and
-// the community routing block lives in the repo's AGENTS.md. A `mcp.gortex`
-// entry in `~/.config/opencode/opencode.json` was put there by the user,
-// and a cleanup command that deletes config it never wrote is a cleanup
-// command nobody runs twice.
+// # Stop-line: no instructions block at user scope
+//
+// applyGlobal writes none, so RemoveGlobal removes none. OpenCode's
+// community routing block lives in the repo's AGENTS.md and comes out
+// with the repo-level half of `gortex uninstall`.
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -61,7 +63,49 @@ func (a *Adapter) RemoveGlobal(env agents.Env, opts agents.ApplyOpts) (removed i
 	removed += packRemoved
 	failures = append(failures, packFailures...)
 
+	// 3. The user-level mcp.gortex entry.
+	mcpRemoved, mcpFailures := removeGlobalMCPServer(env, opts)
+	removed += mcpRemoved
+	failures = append(failures, mcpFailures...)
+
 	return removed, failures
+}
+
+// removeGlobalMCPServer strips `mcp.gortex` from the user config. The
+// `mcp` map itself is dropped only when our entry was the last one in it,
+// so a user who also runs other servers keeps their section — and the
+// config file is never deleted, because everything else in it is theirs.
+//
+// agents.RemoveMCPServer cannot be reused: it is hardcoded to the
+// canonical `mcpServers` key, and OpenCode spells the section `mcp`.
+func removeGlobalMCPServer(env agents.Env, opts agents.ApplyOpts) (removed int, failures []string) {
+	path := GlobalConfigPath(env.Home)
+	if _, err := os.Stat(path); err != nil {
+		return 0, nil
+	}
+	action, err := agents.MergeJSON(env.Stderr, path, func(root map[string]any, _ bool) (bool, error) {
+		section, ok := root["mcp"].(map[string]any)
+		if !ok {
+			return false, nil
+		}
+		if _, exists := section["gortex"]; !exists {
+			return false, nil
+		}
+		delete(section, "gortex")
+		if len(section) == 0 {
+			delete(root, "mcp")
+		} else {
+			root["mcp"] = section
+		}
+		return true, nil
+	}, opts)
+	if err != nil {
+		return 0, []string{fmt.Sprintf("opencode: %s: %v", path, err)}
+	}
+	if action.Action == agents.ActionSkip {
+		return 0, nil
+	}
+	return 1, nil
 }
 
 // GlobalArtifacts lists the user-level OpenCode paths that currently carry
@@ -77,6 +121,12 @@ func GlobalArtifacts(home string) []string {
 	var present []string
 
 	if path := PluginPath(home); opencodeFileContains(path, PluginMarker) {
+		present = append(present, path)
+	}
+	// The config is listed only when our server entry is actually in it,
+	// so the preview matches what removal will do rather than naming a
+	// file that will be left byte-identical.
+	if path := GlobalConfigPath(home); hasGortexMCPServer(path) {
 		present = append(present, path)
 	}
 	for path, shipped := range ownedPackFiles(home) {
@@ -211,4 +261,27 @@ func opencodeFileContains(path, needle string) bool {
 		return false
 	}
 	return strings.Contains(string(data), needle)
+}
+
+// hasGortexMCPServer reports whether the config at path actually carries
+// our server entry. It parses rather than substring-matching: "gortex"
+// appears in a user's config for plenty of innocent reasons, and the
+// uninstall preview must not claim a file it will then leave alone.
+// An unreadable or malformed config reads as "nothing of ours", which is
+// the safe direction — removal will skip it too.
+func hasGortexMCPServer(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var root map[string]any
+	if err := json.Unmarshal(agents.StripJSONComments(data), &root); err != nil {
+		return false
+	}
+	section, ok := root["mcp"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, exists := section["gortex"]
+	return exists
 }
