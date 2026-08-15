@@ -143,6 +143,48 @@ func TestFacadeRepositoryValidationLeavesNonSelectorCompatibilityAlone(t *testin
 	}))
 }
 
+// Most operations publish no repository selector at all. Refusing one with a
+// bare "unknown field" leaves the caller retrying spellings that can never be
+// accepted, so the refusal has to say that no selector exists and how to change
+// scope instead.
+func TestFacadeRepositoryValidationExplainsOperationsWithoutASelector(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	spec, ok := srv.facades.operation("read", "file")
+	require.True(t, ok)
+	require.Empty(t, srv.facadePublicRepositoryField(spec), "read.file publishes no repository selector")
+
+	result := srv.validateFacadeInput(spec, map[string]any{
+		"operation": "file",
+		"target":    map[string]any{"file": "main.go"},
+		"options":   map[string]any{"repo": "other-repo"},
+	})
+	require.NotNil(t, result)
+	require.True(t, result.IsError)
+
+	var structured StructuredError
+	require.NoError(t, json.Unmarshal([]byte(toolResultText(result)), &structured))
+	require.Equal(t, ErrCodeInvalidArgument, structured.ErrorCode)
+	require.Equal(t, "options.repo", structured.Data["field"])
+	require.Equal(t, "no_repository_selector", structured.Data["reason"])
+	require.NotContains(t, structured.Data, "suggested_field", "there is no selector to suggest")
+	require.Contains(t, structured.Message, "read.file accepts no repository selector")
+	require.Contains(t, structured.Message, "workspace_admin.set_active_project")
+
+	// An operation that does publish one keeps pointing at it.
+	detect, ok := srv.facades.operation("change", "detect")
+	require.True(t, ok)
+	rejected := srv.validateFacadeInput(detect, map[string]any{
+		"operation": "detect",
+		"source":    map[string]any{"repo_path": "/work/other-repo"},
+	})
+	require.NotNil(t, rejected)
+	var suggested StructuredError
+	require.NoError(t, json.Unmarshal([]byte(toolResultText(rejected)), &suggested))
+	require.Equal(t, "options.repo", suggested.Data["suggested_field"])
+	require.NotContains(t, suggested.Data, "reason")
+}
+
 func TestFacadeRepositoryValidationRejectsInvalidCanonicalSelectors(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
