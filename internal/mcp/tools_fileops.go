@@ -1368,8 +1368,19 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			secretsRedacted = true
 		}
 	}
-	if physicalEvidenceRequested && secretsRedacted {
-		return mcp.NewToolResultError("physical_evidence for redacted content requires allow_secrets=true"), nil
+	// The digest's scope is the full disk buffer, so the secret-intent gate has
+	// to be judged on those bytes rather than on whatever survived into the
+	// response. Keying it off secretsRedacted let any transform that dropped the
+	// secret-shaped lines first — an offset/limit window, a max_lines cut —
+	// leave hits at zero, so the gate stayed silent and the full-file digest of
+	// a secrets file shipped anyway. Judged on diskContent the window no longer
+	// matters. An overlay buffer carrying secrets the file on disk does not is
+	// now allowed through, which is correct: the digest describes disk, and the
+	// overlay bytes are still redacted in the response.
+	if physicalEvidenceRequested && !allowSecrets {
+		if _, wouldRedact := s.maybeRedactConfigLeaf(language, relPath, false, string(diskContent)); wouldRedact {
+			return mcp.NewToolResultError("physical_evidence for redacted content requires allow_secrets=true"), nil
+		}
 	}
 
 	maxChars := req.GetInt("max_chars", 0)
