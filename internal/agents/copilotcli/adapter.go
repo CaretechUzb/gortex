@@ -26,11 +26,17 @@
 // that entry in place (reconcileRepoMCPJSON) instead of letting a stale
 // file shadow the user-level config we just wrote.
 //
-// Two surfaces this adapter deliberately does NOT write:
-//   - ~/.claude/* — the CLI stopped loading Claude's directories in
+// Three surfaces this adapter deliberately does NOT write:
+//   - ~/.claude/* — the CLI stopped loading Claude's home directories in
 //     v1.0.36, so anything written there is dead weight.
+//   - ~/.agents/skills/ — same story, retired in v1.0.66.
 //   - .github/prompts/*.prompt.md — prompt files are a VS Code chat
 //     feature the CLI has never supported.
+//
+// The surfaces it does write beyond MCP + instructions live in sibling
+// files, each with its own vendor notes: skills.go (Agent Skills),
+// subagents.go (custom agents), hooks.go (lifecycle hooks) and
+// inspect.go (the read-only view `gortex doctor` consumes).
 //
 // Docs: https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers
 package copilotcli
@@ -47,6 +53,7 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/internalutil"
+	"github.com/zzet/gortex/internal/agents/skillpack"
 )
 
 const (
@@ -178,11 +185,46 @@ func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 			})
 		}
 	}
+	if env.Mode == agents.ModeGlobal {
+		// Curated skills + sub-agents are codebase-agnostic, so they are
+		// user-level only; the hook config is machine-local posture.
+		for _, id := range CuratedSkillNames() {
+			if path := curatedSkillPath(env, id); path != "" {
+				p.Files = append(p.Files, agents.FileAction{
+					Path: path, Action: agents.ActionWouldCreate, Keys: []string{"skill"},
+				})
+			}
+		}
+		for _, id := range SubAgentNames() {
+			if path := subAgentPath(env, id); path != "" {
+				p.Files = append(p.Files, agents.FileAction{
+					Path: path, Action: agents.ActionWouldCreate, Keys: []string{"sub-agent"},
+				})
+			}
+		}
+		if env.InstallHooks {
+			if path := HookConfigPath(env); path != "" {
+				p.Files = append(p.Files, agents.FileAction{
+					Path: path, Action: agents.ActionWouldMerge, Keys: []string{"hooks"},
+				})
+			}
+		}
+	}
 	if env.Mode != agents.ModeGlobal {
 		if env.SkillsRouting != "" {
 			p.Files = append(p.Files, agents.FileAction{
 				Path: repoInstructionsPath(env.Root), Action: agents.ActionWouldMerge,
 				Keys: []string{"communities-block"},
+			})
+		}
+		// Generated community skills are per-repo by construction.
+		for _, s := range env.GeneratedSkills {
+			if !skillpack.ValidID(s.DirName) {
+				continue
+			}
+			p.Files = append(p.Files, agents.FileAction{
+				Path: generatedSkillPath(env.Root, s.DirName), Action: agents.ActionWouldCreate,
+				Keys: []string{"skill"},
 			})
 		}
 		// Only planned when the file is already there with an entry we
@@ -231,6 +273,28 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		res.Files = append(res.Files, insAction)
 	}
 
+	if env.Mode == agents.ModeGlobal {
+		// Curated Agent Skills → ~/.copilot/skills/. User-level because
+		// the pack is codebase-agnostic; see skills.go for why every
+		// other discovery root the CLI once honoured is now dead.
+		res.Files = append(res.Files, installCuratedSkills(env, opts)...)
+
+		// Custom agents → ~/.copilot/agents/. A home agent shadows a repo
+		// agent of the same name, so this is the only level worth writing.
+		res.Files = append(res.Files, installSubAgents(env, opts)...)
+
+		// Lifecycle hooks → ~/.copilot/hooks/gortex.json. Never
+		// .github/hooks/: that file is committed and would fire on every
+		// teammate's clone.
+		if env.InstallHooks {
+			hookAction, err := installHooks(env, opts)
+			if err != nil {
+				return res, fmt.Errorf("copilot-cli hooks: %w", err)
+			}
+			res.Files = append(res.Files, hookAction)
+		}
+	}
+
 	if env.Mode != agents.ModeGlobal {
 		if env.SkillsRouting != "" {
 			routingAction, err := agents.UpsertMarkedBlock(env.Stderr, repoInstructionsPath(env.Root), env.SkillsRouting,
@@ -240,6 +304,8 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 			}
 			res.Files = append(res.Files, routingAction)
 		}
+		// Generated community skills → <root>/.github/skills/, flat.
+		res.Files = append(res.Files, installGeneratedSkills(env, opts)...)
 		repoAction, wrote, err := reconcileRepoMCPJSON(env, opts)
 		if err != nil {
 			return res, err
