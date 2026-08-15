@@ -1,4 +1,4 @@
-=== home/.config/zed/settings.json ===
+=== project/home/.config/zed/settings.json ===
 {
   "context_servers": {
     "gortex": {
@@ -13,8 +13,23 @@
     }
   }
 }
-=== root/.rules ===
+=== project/root/.rules ===
 <!-- gortex:communities:start -->
 - [example-community](.claude/skills/example/SKILL.md) — example routing block
 
 <!-- gortex:communities:end -->
+=== global/home/.config/zed/settings.json ===
+{
+  "context_servers": {
+    "gortex": {
+      "args": [
+        "mcp"
+      ],
+      "command": "gortex",
+      "env": {
+        "GORTEX_INDEX_WORKERS": "8"
+      },
+      "source": "custom"
+    }
+  }
+}

@@ -1,4 +1,4 @@
-=== root/.kilocoderules ===
+=== project/root/.kilocoderules ===
 <!-- gortex:communities:start -->
 - [example-community](.claude/skills/example/SKILL.md) — example routing block
 

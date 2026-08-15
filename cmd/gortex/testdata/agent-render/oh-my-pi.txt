@@ -1,4 +1,4 @@
-=== root/.omp/mcp.json ===
+=== project/root/.omp/mcp.json ===
 {
   "mcpServers": {
     "gortex": {
