@@ -118,6 +118,11 @@ func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 			Keys: []string{"communities-block"},
 		})
 	}
+	skillFiles, err := planSkills(env)
+	if err != nil {
+		return nil, err
+	}
+	p.Files = append(p.Files, skillFiles...)
 	return p, nil
 }
 
@@ -229,6 +234,16 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		}
 		res.Files = append(res.Files, routingAction)
 	}
+
+	// Skills. ModeGlobal installs the curated playbook pack under
+	// $HOME/.agents/skills; ModeProject materialises the generated
+	// community skills under <root>/.agents/skills. skills.go documents
+	// why neither ever goes near ~/.codex.
+	skillActions, err := applySkills(env, opts)
+	if err != nil {
+		return res, fmt.Errorf("codex skills: %w", err)
+	}
+	res.Files = append(res.Files, skillActions...)
 
 	res.Configured = true
 	return res, nil
