@@ -164,6 +164,43 @@ func TestInitWizard_HookModeSelectCycles(t *testing.T) {
 	assert.Equal(t, "deny", m.options.Selects[0].Value(), "left cycles back")
 }
 
+// TestInitWizard_CopilotCLISurvivesLabelRoundTrip pins the silent-drop
+// trap in collectChoices: the wizard renders a checklist of *labels* and
+// maps them back to slugs through agentLabels, so a slug that is
+// registered but missing from that table still renders (title-cased) and
+// then vanishes on confirmation — the user's pick never runs. It also
+// pins that the CLI adapter's label is distinguishable from the VS Code
+// one, since two identical labels would collide in the same reverse map.
+func TestInitWizard_CopilotCLISurvivesLabelRoundTrip(t *testing.T) {
+	registered := []agents.Adapter{
+		&fakeAdapter{name: "claude-code", detected: true},
+		&fakeAdapter{name: "copilot-cli", detected: true},
+		&fakeAdapter{name: "vscode", detected: true},
+	}
+	detected := map[string]bool{"claude-code": true, "copilot-cli": true, "vscode": true}
+
+	m := newInitWizardModel(".", registered, detected, defaultDefaults())
+	assert.Contains(t, m.collectPickedLabels(), "GitHub Copilot CLI")
+	assert.NotEqual(t, agentLabel("vscode"), agentLabel("copilot-cli"),
+		"the CLI and the VS Code host must not share a label — the label→slug map is keyed by label")
+
+	m.collectChoices()
+	assert.Contains(t, m.pickedAgents, "copilot-cli",
+		"copilot-cli must survive the label→slug round-trip; a missing agentLabels entry drops it silently")
+	assert.Contains(t, m.pickedAgents, "vscode")
+}
+
+// TestInitWizard_EveryRegisteredAdapterHasALabel generalises the trap
+// above: any adapter reachable from buildRegistry must be in agentLabels,
+// or the wizard will offer it and then discard the pick.
+func TestInitWizard_EveryRegisteredAdapterHasALabel(t *testing.T) {
+	for _, a := range buildRegistry().All() {
+		if _, ok := agentLabels[a.Name()]; !ok {
+			t.Errorf("adapter %q is registered but missing from agentLabels — collectChoices would drop the user's pick", a.Name())
+		}
+	}
+}
+
 func TestInitWizard_ViewIncludesBannerAndStepLine(t *testing.T) {
 	m := newInitWizardModel("/tmp/demo", sampleRegistered(), sampleDetected(), defaultDefaults())
 
