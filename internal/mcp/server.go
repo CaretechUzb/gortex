@@ -1274,15 +1274,6 @@ func (ss *sessionState) attributedConsumptionBatch(ids []string) (string, []stri
 	return ss.lastSearch.query, matched
 }
 
-// hasFreshSearch reports whether a search is recent enough to attribute
-// a consume to. A cheap gate so file-open handlers skip the work of
-// enumerating a file's symbols when nothing could be credited anyway.
-func (ss *sessionState) hasFreshSearch() bool {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	return ss.lastSearch.query != "" && time.Since(ss.lastSearch.at) <= comboWindow
-}
-
 // drainSkippedNegatives computes the implicit "skip-above" negatives for
 // the current last-search: the results ranked above the deepest one the
 // agent actually consumed but that were themselves never consumed — i.e.

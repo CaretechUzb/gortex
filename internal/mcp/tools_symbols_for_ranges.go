@@ -42,19 +42,14 @@ type rangeSpecJSON struct {
 	EndLine   int    `json:"end_line"`
 }
 
-// lowerRanges resolves each (file, range) spec to the symbols that enclose any
-// line in the range, deduplicated across all specs by symbol ID. It returns
-// the hits plus the display paths of any files that could not be resolved or
-// carry no indexed symbols, so the caller can report partial coverage rather
-// than silently dropping them.
+// loweredRanges holds the symbols each (file, range) spec resolved to,
+// deduplicated across all specs by symbol ID, plus the display paths of any
+// files that could not be resolved or carry no indexed symbols, so the caller
+// can report partial coverage rather than silently dropping them.
 type loweredRanges struct {
 	hits       []rangeSymbolHit
 	unresolved []string
 	saturated  []string
-}
-
-func (s *Server) lowerRanges(specs []rangeSpec) ([]rangeSymbolHit, []string) {
-	return s.lowerRangesContext(context.Background(), specs)
 }
 
 func (s *Server) lowerRangesContext(ctx context.Context, specs []rangeSpec) ([]rangeSymbolHit, []string) {

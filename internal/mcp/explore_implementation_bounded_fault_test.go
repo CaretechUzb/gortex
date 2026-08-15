@@ -75,7 +75,7 @@ func (r *exploreImplementationFaultReader) GetNodesByIDsContext(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return r.Reader.GetNodesByIDs(ids), nil
+	return r.GetNodesByIDs(ids), nil
 }
 
 type exploreImplementationLegacyOnlyReader struct{ graph.Reader }

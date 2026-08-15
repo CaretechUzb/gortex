@@ -228,18 +228,11 @@ func graphMatchPathKey(path string, repoPrefixed bool) string {
 	return filepath.FromSlash(path)
 }
 
-// enrichTextMatches decorates every trigram match with its enclosing graph
-// symbol through the bounded file projection. The compatibility wrapper keeps
-// non-request tests/callers bounded; request paths use enrichTextMatchesContext
-// so storage receives the effective request/session scope.
-func (s *Server) enrichTextMatches(matches []trigram.Match) []enrichedTextMatch {
-	enriched, _ := s.enrichTextMatchesContext(context.Background(), matches, query.QueryOptions{})
-	return enriched
-}
-
-// enrichTextMatchesContext returns the same file indexes used for enrichment so
-// localization evidence capture never repeats the file scan. Exact and Windows
-// path spellings share the request-wide 4096-node budget.
+// enrichTextMatchesContext decorates every trigram match with its enclosing
+// graph symbol through the bounded file projection, and returns the same file
+// indexes used for enrichment so localization evidence capture never repeats
+// the file scan. Storage receives the effective request/session scope; exact
+// and Windows path spellings share the request-wide 4096-node budget.
 func (s *Server) enrichTextMatchesContext(
 	ctx context.Context,
 	matches []trigram.Match,

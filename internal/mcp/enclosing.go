@@ -278,10 +278,6 @@ func (s *Server) buildFileSymbolIndexForPathsScopedContext(
 	return s.buildFileSymbolIndexForOrderedPathsScopedContext(ctx, ordered, opts)
 }
 
-func (s *Server) buildFileSymbolIndexForOrderedPathsContext(ctx context.Context, paths []string) map[string]*fileSymbolIndex {
-	return s.buildFileSymbolIndexForOrderedPathsScopedContext(ctx, paths, query.QueryOptions{})
-}
-
 // buildFileSymbolIndexForOrderedPathsScopedContext preserves caller priority,
 // applies request/session scope before each storage cap, and shares one strict
 // node budget across the request. Saturated and unavailable paths retain an
