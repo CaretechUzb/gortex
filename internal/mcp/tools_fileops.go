@@ -1262,7 +1262,11 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	var physicalEvidence physicalReadEvidence
 	if physicalEvidenceRequested {
 		var readErr error
-		diskContent, physicalEvidence, readErr = readPhysicalFileEvidence(absPath)
+		read := readPhysicalFileEvidence
+		if s.physicalEvidenceOverride != nil {
+			read = s.physicalEvidenceOverride
+		}
+		diskContent, physicalEvidence, readErr = read(absPath)
 		if readErr != nil {
 			return mcp.NewToolResultError(readErr.Error()), nil
 		}

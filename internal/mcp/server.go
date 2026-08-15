@@ -373,6 +373,14 @@ type Server struct {
 	batchWriteOverride      func(string, []byte, os.FileMode) error
 	batchDurabilityOverride *batchDurabilityOps
 
+	// physicalEvidenceOverride is a narrow fault-injection seam for read_file's
+	// physical-evidence path. The post-read confinement guards only fire when
+	// the observed resolution disagrees with the requested path, which on a real
+	// filesystem needs a won symlink-flip race — untestable without this. Tests
+	// hand back a resolution outside every repo root and assert the handler
+	// refuses. Production leaves it nil.
+	physicalEvidenceOverride func(string) ([]byte, physicalReadEvidence, error)
+
 	// packCache retains recent smart_context pack views keyed by pack
 	// root so a later call with delta_from=<root> returns only the
 	// added/removed/changed symbols vs that prior pack. Always non-nil
