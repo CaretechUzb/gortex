@@ -99,8 +99,10 @@ func TestLocalizationEvidenceTargetsFromDraftReservesOneIndependentCitation(t *t
 	}
 	digest := newLocalizationEvidenceDigestForTask(task, envelope)
 	freezeLocalizationPrimaryCohort(task, &envelope, digest)
-	if len(digest.primaryIDs) != localizationFinalResponsePrimaryLimit {
-		t.Fatalf("PRIMARY count = %d, want %d: %v", len(digest.primaryIDs), localizationFinalResponsePrimaryLimit, digest.primaryIDs)
+	// LATER_MACRO is task-cited, so it rides one task-named extra seat past
+	// the ranked block; the ranked width itself stays at the primary limit.
+	if len(digest.primaryIDs) != localizationFinalResponsePrimaryLimit+1 {
+		t.Fatalf("PRIMARY count = %d, want %d: %v", len(digest.primaryIDs), localizationFinalResponsePrimaryLimit+1, digest.primaryIDs)
 	}
 	macroPrimary := false
 	for _, id := range digest.primaryIDs {

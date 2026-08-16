@@ -79,6 +79,7 @@ type localizationDigestRow struct {
 	taskCitedPrimaryEligible bool
 	primaryCohortOrder       int
 	supportingOnly           bool
+	leadingFileDepth         bool
 	authorizationPriority    bool
 }
 
@@ -120,6 +121,7 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 			taskCitedPrimaryEligible: row.taskCitedPrimaryEligible,
 			primaryCohortOrder:       row.primaryCohortOrder,
 			supportingOnly:           row.supportingOnly || localizationSupportingOnlyProvenance(row.Provenance),
+			leadingFileDepth:         row.leadingFileDepth,
 			authorizationPriority:    authorizationPriority,
 		})
 		return true
@@ -321,6 +323,7 @@ func mergeLocalizationDigestRowEvidence(primary, supplementary localizationDiges
 	// An identity that was independently ranked remains cohort-eligible when a
 	// later supplemental observation of the same row is merged into it.
 	primary.supportingOnly = primary.supportingOnly && supplementary.supportingOnly
+	primary.leadingFileDepth = primary.leadingFileDepth || supplementary.leadingFileDepth
 	if primary.primaryCohortOrder == 0 ||
 		(supplementary.primaryCohortOrder > 0 && supplementary.primaryCohortOrder < primary.primaryCohortOrder) {
 		primary.primaryCohortOrder = supplementary.primaryCohortOrder
@@ -694,9 +697,10 @@ const (
 	// row's own name, six for an owner segment.
 	localizationTaskNameMinRunes  = 5
 	localizationTaskOwnerMinRunes = 6
-	// The task-aligned pass stops one seat short of the primary block so the
-	// ranked order always keeps at least one seat of its own.
-	localizationTaskAlignedSeatCeiling = localizationFinalResponsePrimaryLimit - 1
+	// Task-named rows never displace a ranked seat. They may extend the
+	// primary block past its ranked width by at most this many extra seats:
+	// a proven ranked conversion is never traded for a hoped-for one.
+	localizationTaskAlignedExtraSeats = 2
 	// localizationDigestShrinkFloorRows is the smallest answer the envelope
 	// shed loop may shrink the digest to under extreme budget pressure. It is
 	// deliberately narrower than the primary block: the primary width is what
@@ -1130,16 +1134,23 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 		}
 	}
 
-	// Every remaining task-named row competes for the open seats in score
-	// order before rank order fills the rest. The admission lane must not
-	// decide presentation authority: a declaration the task names is what the
-	// caller asked about, whether it arrived through ranked retrieval,
-	// leading-file completeness, or a body mention. Naming means the raw task
-	// carries the row's identifier as a whole word, case-sensitively — prose
-	// substrings do not reseat the answer. Adjacency neighbors stay
-	// supporting — sharing an identifier with the task does not make a graph
-	// hop the subject of the report.
-	if len(primaries) < localizationTaskAlignedSeatCeiling && strings.TrimSpace(task) != "" {
+	for _, row := range rows {
+		// Further authenticated literal callees may still win through ordinary
+		// rank; only the pre-seated reserve above is capped at one.
+		appendPrimary(row)
+	}
+
+	// After every ranked seat is filled, remaining task-named rows extend the
+	// block by bounded extra seats. The admission lane must not decide
+	// presentation authority: a declaration the task names is what the caller
+	// asked about, whether it arrived through ranked retrieval, leading-file
+	// completeness, or a body mention. Naming means the raw task carries the
+	// row's identifier as a whole word, case-sensitively — prose substrings
+	// do not extend the answer. Adjacency neighbors stay supporting: sharing
+	// an identifier with the task does not make a graph hop the subject of
+	// the report.
+	if strings.TrimSpace(task) != "" {
+		extendedLimit := localizationFinalResponsePrimaryLimit + localizationTaskAlignedExtraSeats
 		type taskAlignedCandidate struct {
 			index int
 			score localizationFinalResponseTaskScore
@@ -1150,6 +1161,12 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 				continue
 			}
 			if row.Provenance == localizationProvenanceDirectAdjacency {
+				continue
+			}
+			// Only the leading-file-depth writer of supportingOnly may be
+			// overridden by task naming; a supplemental row stays supporting
+			// no matter how well it matches the task.
+			if localizationFinalResponseSupportingOnly(row) && !row.leadingFileDepth {
 				continue
 			}
 			if !localizationTaskNamesRow(task, row) {
@@ -1163,23 +1180,18 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 			return localizationFinalResponseBetterTaskScore(aligned[left].score, aligned[right].score)
 		})
 		for _, candidate := range aligned {
-			appendRow(&primaries, localizationTaskAlignedSeatCeiling, rows[candidate.index])
+			appendRow(&primaries, extendedLimit, rows[candidate.index])
 		}
 	}
 
-	for _, row := range rows {
-		// Further authenticated literal callees may still win through ordinary
-		// rank; only the pre-seated reserve above is capped at one.
-		appendPrimary(row)
-	}
-
+	supportingLimit := localizationReplayEvidenceLimit - len(primaries)
 	for _, row := range rows {
 		if localizationFinalResponseDirectRelation(row, primaries) {
-			appendRow(&supporting, localizationFinalResponseSupportingLimit, row)
+			appendRow(&supporting, supportingLimit, row)
 		}
 	}
 	for _, row := range rows {
-		appendRow(&supporting, localizationFinalResponseSupportingLimit, row)
+		appendRow(&supporting, supportingLimit, row)
 	}
 
 	presented := make([]localizationFinalResponseRow, 0, len(primaries)+len(supporting))

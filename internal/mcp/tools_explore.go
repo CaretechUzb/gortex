@@ -3259,6 +3259,10 @@ type localizationEvidence struct {
 	taskCitedPrimaryEligible bool
 	primaryCohortOrder       int
 	supportingOnly           bool
+	// leadingFileDepth separates the two supportingOnly writers: a row the
+	// initial page admitted for leading-file completeness may still earn a
+	// task-named seat, while a post-terminal supplemental row never does.
+	leadingFileDepth bool
 }
 
 func (s *Server) completeEmptyLocalization(ctx context.Context, task string, budget int) *mcp.CallToolResult {
@@ -4445,6 +4449,7 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 
 			literalPrimaryEligible: target.literalPrimaryEligible || localizationStrongSourceLiteralCallee(target),
 			supportingOnly:         target.leadingFileDepth,
+			leadingFileDepth:       target.leadingFileDepth,
 		}
 
 		candidate := envelope

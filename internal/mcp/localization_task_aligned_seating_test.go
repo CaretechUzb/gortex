@@ -9,7 +9,7 @@ func TestTaskNamedLeadingFileRowSeatsPrimaryOverRankFill(t *testing.T) {
 	rows := []localizationDigestRow{
 		{ID: "repo/errors.go::ErrorSink.register", Name: "register", QualName: "ErrorSink.register", Kind: "method", File: "repo/errors.go", Line: 12},
 		{ID: "repo/socket.go::PacketSocket.open", Name: "open", QualName: "PacketSocket.open", Kind: "method", File: "repo/socket.go", Line: 28},
-		{ID: "repo/publisher.go::DatagramPublisher.start", Name: "start", QualName: "DatagramPublisher.start", Kind: "method", File: "repo/publisher.go", Line: 62, supportingOnly: true},
+		{ID: "repo/publisher.go::DatagramPublisher.start", Name: "start", QualName: "DatagramPublisher.start", Kind: "method", File: "repo/publisher.go", Line: 62, supportingOnly: true, leadingFileDepth: true},
 		{ID: "repo/socket.go::PacketSocket.close", Name: "close", QualName: "PacketSocket.close", Kind: "method", File: "repo/socket.go", Line: 52},
 		{ID: "repo/socket.go::PacketSocket.send", Name: "send", QualName: "PacketSocket.send", Kind: "method", File: "repo/socket.go", Line: 60},
 		{ID: "repo/cube.go::CubeSink.connect", Name: "connect", QualName: "CubeSink.connect", Kind: "method", File: "repo/cube.go", Line: 73},
@@ -23,7 +23,7 @@ func TestTaskNamedLeadingFileRowSeatsPrimaryOverRankFill(t *testing.T) {
 	}
 }
 
-func TestTaskAlignedSeatingLeavesRankOrderTheLastSeat(t *testing.T) {
+func TestTaskAlignedSeatsExtendWithoutDisplacingRankedRows(t *testing.T) {
 	rows := []localizationDigestRow{
 		{ID: "repo/pipeline.go::Pipeline.ingest", Name: "ingest", QualName: "Pipeline.ingest", Kind: "method", File: "repo/pipeline.go", Line: 10},
 		{ID: "repo/journal.go::JournalWriter.append", Name: "append", QualName: "JournalWriter.append", Kind: "method", File: "repo/journal.go", Line: 20},
@@ -34,34 +34,46 @@ func TestTaskAlignedSeatingLeavesRankOrderTheLastSeat(t *testing.T) {
 	}
 	response := renderLocalizationFinalResponseForTask(
 		"journal overflow: append, seal, compact, replayTail and truncate misbehave under JournalWriter load", nil, rows)
-	want := "- PRIMARY — repo/pipeline.go:10 — repo/pipeline.go::Pipeline.ingest"
-	if !strings.Contains(response, want) {
-		t.Fatalf("rank-leading row lost its reserved seat to task alignment:\n%s", response)
+	// The ranked lead keeps its seat even though it is the only row the task
+	// does not name; the sixth row rides an extra seat instead.
+	for _, want := range []string{
+		"- PRIMARY — repo/pipeline.go:10 — repo/pipeline.go::Pipeline.ingest",
+		"- PRIMARY — repo/journal.go:75 — repo/journal.go::JournalWriter.truncate",
+	} {
+		if !strings.Contains(response, want) {
+			t.Fatalf("expected %q as primary:\n%s", want, response)
+		}
 	}
-	if got := strings.Count(response, "- PRIMARY —"); got != localizationFinalResponsePrimaryLimit {
-		t.Fatalf("primary rows = %d, want %d:\n%s", got, localizationFinalResponsePrimaryLimit, response)
+	if got := strings.Count(response, "- PRIMARY —"); got != localizationFinalResponsePrimaryLimit+1 {
+		t.Fatalf("primary rows = %d, want %d:\n%s", got, localizationFinalResponsePrimaryLimit+1, response)
 	}
 }
 
-func TestBodyMentionRowSeatsOnlyWhenTaskNamedAndAdjacencyStaysSupporting(t *testing.T) {
+func TestTaskMentionSeatsWhileScanLanesStaySupporting(t *testing.T) {
 	rows := []localizationDigestRow{
 		{ID: "repo/loop.go::EventLoop.tick", Name: "tick", QualName: "EventLoop.tick", Kind: "method", File: "repo/loop.go", Line: 9},
 		{ID: "repo/queue.go::WorkQueue.drain", Name: "drain", QualName: "WorkQueue.drain", Kind: "method", File: "repo/queue.go", Line: 21},
 		{ID: "repo/state.go::StateCache.load", Name: "load", QualName: "StateCache.load", Kind: "method", File: "repo/state.go", Line: 33},
 		{ID: "repo/codec.go::RingBufferCodec.flushSegment", Name: "flushSegment", QualName: "RingBufferCodec.flushSegment", Kind: "method", File: "repo/codec.go", Line: 47,
-			Provenance: localizationProvenanceBodyMention, supportingOnly: true},
+			Provenance: localizationProvenanceTaskMention},
 		{ID: "repo/codec.go::RingBufferCodec.reset", Name: "reset", QualName: "RingBufferCodec.reset", Kind: "method", File: "repo/codec.go", Line: 68,
 			Provenance: localizationProvenanceDirectAdjacency},
+		{ID: "repo/codec.go::RingBufferCodec.scanTail", Name: "scanTail", QualName: "RingBufferCodec.scanTail", Kind: "method", File: "repo/codec.go", Line: 84,
+			Provenance: localizationProvenanceBodyMention, supportingOnly: true},
 	}
 	response := renderLocalizationFinalResponseForTask(
 		"overflow inside RingBufferCodec during flush", nil, rows)
 	seated := "- PRIMARY — repo/codec.go:47 — repo/codec.go::RingBufferCodec.flushSegment"
 	if !strings.Contains(response, seated) {
-		t.Fatalf("task-named body-mention row was not seated:\n%s", response)
+		t.Fatalf("task-mention row was not seated:\n%s", response)
 	}
-	adjacency := "- PRIMARY — repo/codec.go:68 — repo/codec.go::RingBufferCodec.reset"
-	if strings.Contains(response, adjacency) {
-		t.Fatalf("task-named adjacency neighbor claimed a primary seat:\n%s", response)
+	for _, blocked := range []string{
+		"- PRIMARY — repo/codec.go:68 — repo/codec.go::RingBufferCodec.reset",
+		"- PRIMARY — repo/codec.go:84 — repo/codec.go::RingBufferCodec.scanTail",
+	} {
+		if strings.Contains(response, blocked) {
+			t.Fatalf("scan-lane row claimed a primary seat:\n%s", response)
+		}
 	}
 }
 
