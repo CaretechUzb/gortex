@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
+	"unicode/utf8"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -185,7 +187,7 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 		inserts = conversionPlan.fallbackInserts
 
 		updated, statements, repairDeletes, repairInserts, updateErr :=
-			updateSQLiteResolvedConversionsTxLimited(tx, mutations, conversionPlan, false, &variableLimit)
+			updateSQLiteResolvedConversionsTxLimited(tx, mutations, conversionPlan, false)
 		if updateErr != nil {
 			return stats, false, false, nil, updateErr
 		}
@@ -195,7 +197,7 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 		inserts = append(inserts, repairInserts...)
 
 		updated, statements, repairDeletes, repairInserts, updateErr =
-			updateSQLiteResolvedConversionsTxLimited(tx, mutations, conversionPlan, true, &variableLimit)
+			updateSQLiteResolvedConversionsTxLimited(tx, mutations, conversionPlan, true)
 		if updateErr != nil {
 			return stats, false, false, nil, updateErr
 		}
@@ -401,7 +403,6 @@ func updateSQLiteResolvedConversionsTxLimited(
 	mutations []sqliteReindexMutation,
 	plan sqliteResolvedConversionPlan,
 	updateKind bool,
-	variableLimit *int,
 ) (
 	updatedRows int,
 	statements int,
@@ -414,9 +415,19 @@ func updateSQLiteResolvedConversionsTxLimited(
 	}
 	candidates := make([]sqliteReindexMutation, 0, len(mutations))
 	for _, mutation := range mutations {
-		if plan.updateCandidate(mutation, updateKind) {
-			candidates = append(candidates, mutation)
+		if !plan.updateCandidate(mutation, updateKind) {
+			continue
 		}
+		if !jsonSafeResolvedConversion(mutation) {
+			// json.Marshal would corrupt this row (invalid UTF-8 rewrites to
+			// U+FFFD — fatal on a SET column, where the mangled value would
+			// commit — and a non-finite confidence fails the whole Marshal).
+			// The repair path binds raw bytes and keeps it exact.
+			repairDeletes = append(repairDeletes, mutation.oldKey)
+			repairInserts = append(repairInserts, mutation.newRow)
+			continue
+		}
+		candidates = append(candidates, mutation)
 	}
 	query := sqliteResolvedConversionUpdateJSONStatement(updateKind)
 	for start := 0; start < len(candidates); {
@@ -456,13 +467,39 @@ func updateSQLiteResolvedConversionsTxLimited(
 	return updatedRows, statements, repairDeletes, repairInserts, nil
 }
 
+// jsonSafeResolvedConversion reports whether every value the JSON transport
+// would carry survives json.Marshal byte-exact: strings must be valid UTF-8
+// (Marshal rewrites invalid bytes to U+FFFD — on a WHERE column that is a
+// self-healing miss, but on a SET column the mangled value would commit) and
+// confidence must be finite (Marshal rejects NaN/Inf outright). meta is
+// exempt — it rides hex-armored.
+func jsonSafeResolvedConversion(mutation sqliteReindexMutation) bool {
+	row := mutation.newRow
+	if math.IsNaN(row.confidence) || math.IsInf(row.confidence, 0) {
+		return false
+	}
+	for _, s := range []string{
+		mutation.oldKey.fromID, mutation.oldKey.toID, mutation.oldKey.kind,
+		mutation.oldKey.filePath, row.key.toID, row.key.kind,
+		row.confidenceLabel, row.origin, row.tier,
+		row.resolveTerminalReason.String, row.semanticSource.String,
+	} {
+		if !utf8.ValidString(s) {
+			return false
+		}
+	}
+	return true
+}
+
 // encodeResolvedConversionRows marshals a bounded prefix of the candidates as
 // one json_each relation: positional arrays in patch-column order. meta rides
 // hex-encoded — its compact binary encoding is not UTF-8-safe inside JSON,
 // and unhex() restores the exact bytes — while NULL-able columns become JSON
 // null. Bounded by reindexRowMaxChunkSize rows and sqliteBatchMaxBoundBytes
 // of estimated payload; the first row is always taken, so every call makes
-// progress.
+// progress. The estimate counts raw bytes and ignores JSON escaping
+// inflation (~2x on backslash-heavy ids) — it is a soft memory bound, far
+// below SQLite's bound-length limit, not an exact guard.
 func encodeResolvedConversionRows(candidates []sqliteReindexMutation, updateKind bool) (string, int, error) {
 	rows := make([]any, 0, minInt(len(candidates), reindexRowMaxChunkSize))
 	estimated := 0
