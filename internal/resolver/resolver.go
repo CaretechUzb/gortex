@@ -4531,10 +4531,12 @@ func (r *Resolver) buildReachabilityIndexForPending(pending []*graph.Edge, sourc
 // reused by overlapping pages, while unresolved imports are rebuilt because
 // resolving such an edge may change its target during the pass.
 
-// reachabilityStableFileCap bounds the pass-scoped stable-reachability cache.
-// Entries are one file path plus a handful of directory strings, so even a
-// workspace-wide cache is a few megabytes; the cap exists only to guard
-// pathological inputs.
+// reachabilityStableFileCap bounds both pass-scoped retentions. Stable-
+// reachability entries are one file path plus a handful of directory
+// strings; adjacency-retention entries carry the file's raw imported node
+// IDs and are the heavier of the two — roughly 5 MB on a production-sized
+// workspace and tens of MB at the cap. The cap guards pathological inputs,
+// not a working-set target.
 const reachabilityStableFileCap = 1 << 16
 
 // reachabilityPageStats reports how much of one page's reachability build was
@@ -4547,8 +4549,8 @@ type reachabilityPageStats struct {
 	missing   int
 	unstable  int
 	adjCached int
-	fallback  int
-	retained  int
+	fallback  bool
+	occupancy int
 	project   time.Duration
 	place     time.Duration
 	match     time.Duration
@@ -4662,7 +4664,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 		if !complete {
 			// complete=false is a canonicality signal, not a cacheable
 			// answer — fallback results are never retained.
-			stats.fallback = 1
+			stats.fallback = true
 			projected = r.legacyImportTargetsByFile(projectFiles)
 		} else if adjacency != nil {
 			// Retain raw projections for every projected file, including
@@ -4727,7 +4729,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 		}
 	}
 	stats.match = time.Since(matchStart)
-	stats.retained = len(adjacency)
+	stats.occupancy = len(adjacency)
 	r.reachableDirsByFile = reachable
 	r.dirByFilePath = dirs
 	return true, stats
@@ -4776,17 +4778,21 @@ func (r *Resolver) clearReachabilityIndex() {
 // the common provenance-carrying writes.
 //
 // Write-site audit (every ReindexEdges / ReindexUnresolvedEdgeTargets /
-// AddBatch call in this package):
-//   - precise invalidation via noteImportEdgeReindexes/noteImportTargetReindexes:
-//     main page commit + incremental commit (resolver.go),
-//     deferred-LSP terminal clears and page reindexes (resolver.go,
-//     lsp_resolve.go), attribution batches (attribution_reindex_batch.go,
-//     go_builtins_attribution.go, incremental_attribution_cache.go),
-//     import-flavored retargets (relative_imports.go, lua_imports.go,
-//     razor_using.go, godot_res_paths.go), module attribution reindexes
+// AddBatch / RemoveEdge call in this package):
+//   - precise invalidation via noteImportEdgeReindexes/noteImportTargetReindexes/
+//     noteImportEdgeRemovals: main page commit + incremental commit
+//     (resolver.go), deferred-LSP terminal clears and page reindexes
+//     (resolver.go, lsp_resolve.go), attribution batches
+//     (attribution_reindex_batch.go, go_builtins_attribution.go,
+//     incremental_attribution_cache.go), import-flavored retargets
+//     (relative_imports.go, lua_imports.go, godot_res_paths.go), razor
+//     @using marker removals (razor_using.go — its reference retargets
+//     never touch an imports row), module attribution reindexes
 //     (module_attribution.go).
 //   - no bump, kind-bounded: generic_param_bind.go (EdgesByKind over
-//     non-import kinds), cross_pkg_guard.go (call-edge guard reverts).
+//     non-import kinds), cross_pkg_guard.go (call-edge guard reverts),
+//     csharp_partial_merge.go (implements/extends moves between type
+//     nodes — imports edges never originate at a type).
 //   - no bump, outside any live pass retention: exported framework/registry
 //     synthesis passes (celery/mediatr/express/fastapi/django/rails/vapor/
 //     grpc/rtk/redux/vuex/ngrx/react/swiftui/uikit/sidekiq/spring/sql/
@@ -4821,10 +4827,12 @@ func (r *Resolver) noteImportEdgeReindexes(batch []graph.EdgeReindex) {
 		if !importsRow {
 			continue
 		}
-		// Frontier revisits rewrite still-unresolved import edges for pure
-		// bookkeeping (meta, confidence, terminality). A rewrite that keeps
-		// target, kind, and file cannot change stored adjacency — dirtying
-		// it would evict exactly the unstable files the retention serves.
+		// An identity-preserving rewrite cannot change stored adjacency, so
+		// it must not evict the unstable files the retention serves. The one
+		// writer producing this shape is the deferred-LSP terminal clears
+		// (terminality is meta-only, so OldTo equals the target); they run
+		// after the pass's final prepare, making this a guard on the
+		// invariant rather than a hot path.
 		if reindex.Edge != nil && reindex.OldTo == reindex.Edge.To &&
 			reindex.OldKind == "" && reindex.OldFilePath == "" {
 			continue
@@ -4841,6 +4849,23 @@ func (r *Resolver) noteImportEdgeReindexes(batch []graph.EdgeReindex) {
 		if !marked {
 			r.noteImportEdgeWrite()
 		}
+	}
+}
+
+// noteImportEdgeRemovals is the removal-side sibling of
+// noteImportEdgeReindexes: deleting an imports-kind edge rewrites the caller
+// file's stored adjacency exactly like a retarget. Provenance-less removals
+// fall back to the wholesale generation.
+func (r *Resolver) noteImportEdgeRemovals(edges []*graph.Edge) {
+	for _, e := range edges {
+		if e == nil || e.Kind != graph.EdgeImports {
+			continue
+		}
+		if e.FilePath == "" {
+			r.noteImportEdgeWrite()
+			continue
+		}
+		r.markImportDirty(e.FilePath)
 	}
 }
 

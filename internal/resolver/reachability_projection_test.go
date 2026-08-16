@@ -457,3 +457,43 @@ func TestAdjacencyRetentionClearedWholesaleByProvenancelessImportWrite(t *testin
 		t.Fatalf("projection calls = %d, want 2: the retention must re-arm once the generation is re-synced", store.projectionCalls)
 	}
 }
+
+// The razor pass consumes its @using markers by removing them from the graph —
+// an imports-row mutation that travels RemoveEdge, not ReindexEdges. Driving
+// the production pass (not the note funcs) pins that the removal invalidates
+// the retention; without it the razor file's stale adjacency survives.
+func TestAdjacencyRetentionInvalidatedByRazorMarkerRemoval(t *testing.T) {
+	g, store, r, indexes, _ := newReachabilityProjectionFixture(t)
+	defer indexes.close()
+	g.AddBatch([]*graph.Node{
+		{ID: "repo/View.razor", Kind: graph.KindFile, Name: "View.razor",
+			FilePath: "repo/View.razor", RepoPrefix: "repo", Language: "razor"},
+	}, []*graph.Edge{{
+		From: "repo/View.razor", To: graph.UnresolvedMarker + "razor_using::Widgets",
+		Kind: graph.EdgeImports, FilePath: "repo/View.razor", Line: 1,
+	}})
+	// The marker target is unresolved, so the file is never stable-cached —
+	// the adjacency retention is the only thing standing between a page and
+	// a re-projection, which is exactly what the removal must invalidate.
+	store.projected["repo/View.razor"] = []string{graph.UnresolvedMarker + "razor_using::Widgets"}
+	pending := []*graph.Edge{{
+		From: "repo/View.razor::View", To: graph.UnresolvedMarker + "Work",
+		Kind: graph.EdgeCalls, FilePath: "repo/View.razor",
+	}}
+
+	indexes.prepare(pending)
+	indexes.clearPage()
+	if store.projectionCalls != 1 {
+		t.Fatalf("projection calls = %d, want 1 before the razor pass", store.projectionCalls)
+	}
+
+	// Production path: resolveRazorUsings removes the consumed markers.
+	// No note* call in this test body.
+	r.resolveRazorUsings()
+
+	indexes.prepare(pending)
+	defer indexes.clearPage()
+	if store.projectionCalls != 2 {
+		t.Fatalf("projection calls = %d, want 2: marker removal must invalidate the retained adjacency", store.projectionCalls)
+	}
+}
