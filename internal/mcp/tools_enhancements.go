@@ -2996,25 +2996,29 @@ func (s *Server) handleIndexHealth(ctx context.Context, req mcp.CallToolRequest)
 	if s.indexer == nil {
 		return mcp.NewToolResultError("no indexer available"), nil
 	}
-	result, err := s.buildIndexHealthPayloadCtx(ctx)
-	if err != nil {
-		return mcp.NewToolResultError(
-			"index_health was cancelled before it finished: the scan is proportional to workspace size " +
-				"(one stat per tracked file plus a graph scan) and the caller's deadline expired first. " +
-				"Retry when indexing settles, or pass compact:true for the cheaper summary."), nil
+	if err := ctx.Err(); err != nil {
+		return mcp.NewToolResultError("index_health was cancelled before it finished: " + err.Error()), nil
+	}
+
+	result, updatedAt, refreshing := s.indexHealthSnapshot()
+	if result == nil || s.indexHealthNeedsRefresh(updatedAt) {
+		s.refreshIndexHealthInBackground()
+		result, updatedAt, refreshing = s.indexHealthSnapshot()
 	}
 
 	if isCompact(req) {
-		stale, _ := result["stale_files"].([]string)
-		failures, _ := result["parse_failures"].(map[string]string)
-		line := fmt.Sprintf("health=%.1f%% nodes=%d stale=%d failures=%d",
-			result["health_score"], result["node_count"], len(stale), len(failures))
-		if _, ok := result["recommendation"]; ok {
-			line += " [needs re-index]"
+		if result == nil {
+			return mcp.NewToolResultText("health=unknown nodes=unknown stale=unknown failures=unknown status=refreshing\n"), nil
 		}
-		return mcp.NewToolResultText(line + "\n"), nil
+		return mcp.NewToolResultText(compactIndexHealth(result, updatedAt, refreshing)), nil
 	}
 
+	if result == nil {
+		return s.respondJSONOrTOON(ctx, req, map[string]any{
+			"status":  "refreshing",
+			"message": "index health is being computed in the background; retry for the completed report",
+		})
+	}
 	return s.respondJSONOrTOON(ctx, req, result)
 }
 

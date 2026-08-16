@@ -423,6 +423,7 @@ type Server struct {
 	// periodic ticker. Eagerly constructed in NewServer; the daemon
 	// entrypoint wires the snapshot fn via AttachHealthSnapshot.
 	healthBroadcaster *healthBroadcaster
+	indexHealth       indexHealthCache
 
 	// staleRefsBroadcaster fans `notifications/stale_refs` per session
 	// when the watcher reports symbol churn in a file the session has
