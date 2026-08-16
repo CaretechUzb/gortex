@@ -688,9 +688,11 @@ const (
 	// usually within the top five. Slots below stay SUPPORTING so the page
 	// keeps an explicit confidence order.
 	localizationFinalResponsePrimaryLimit = 5
-	// One authenticated source-literal callee may pre-seat ahead of the ranked
-	// cohort. Further literal rows compete only through ordinary ranking.
-	localizationFinalResponseLiteralReserve = 1
+	// Authenticated literal rows may pre-seat ahead of the ranked cohort. The
+	// second seat is granted only for a second proven file, so a literal
+	// registered in one place and consumed in another presents both sites
+	// while same-file corroboration still competes through ordinary ranking.
+	localizationFinalResponseLiteralReserve = 2
 	// A row is task-named only when the raw task text carries its identifier
 	// as a whole word, case-sensitively. The rune floors keep short prose
 	// words from naming whatever row happens to share them: five for the
@@ -1052,14 +1054,20 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 		}
 	}
 
-	// A graph-authenticated source-literal callee may reserve one seat before
-	// ordinary task/rank selection. Exact content rows retain their truthful
-	// provenance but never gain presentation authority from the literal alone.
-	literalReserveUsed := false
+	// Authenticated literal rows reserve bounded seats before ordinary
+	// task/rank selection. The second seat must bring a second proven file:
+	// two owners of the same registration site add nothing over one.
+	literalReserveUsed := 0
+	literalReserveFiles := make(map[string]struct{}, localizationFinalResponseLiteralReserve)
+	claimReserve := func(row localizationDigestRow) {
+		literalReserveUsed++
+		if file := strings.TrimSpace(row.File); file != "" {
+			literalReserveFiles[file] = struct{}{}
+		}
+	}
 	for _, row := range primaries {
 		if row.Provenance == localizationProvenanceSourceLiteralCallee && row.literalPrimaryEligible {
-			literalReserveUsed = true
-			break
+			claimReserve(row)
 		}
 	}
 	for _, row := range rows {
@@ -1069,11 +1077,16 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 		literal := row.Provenance == localizationProvenanceContentLiteral ||
 			row.Provenance == localizationProvenanceSourceLiteralCallee
 		if literal {
-			if literalReserveUsed {
+			if literalReserveUsed >= localizationFinalResponseLiteralReserve {
 				continue
 			}
+			if literalReserveUsed > 0 {
+				if _, sameFile := literalReserveFiles[strings.TrimSpace(row.File)]; sameFile {
+					continue
+				}
+			}
 			if appendPrimary(row) {
-				literalReserveUsed = true
+				claimReserve(row)
 			}
 			continue
 		}

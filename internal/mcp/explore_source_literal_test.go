@@ -451,7 +451,8 @@ func TestMapExploreSourceLiteralMatchesPreservesFirstSeenExactPathsBeforeAliases
 		exploreSourceLiteralHit{nodeID: exactB.ID, rank: 0},
 		exploreSourceLiteralHit{nodeID: exactA.ID, rank: 1},
 	)
-	require.True(t, recall.ambiguous)
+	// Two owners from a complete search are two settled sites, not noise.
+	require.False(t, recall.ambiguous)
 }
 
 func TestMapExploreSourceLiteralMatchesChoosesSmallestEnclosingSymbol(t *testing.T) {
@@ -479,7 +480,9 @@ func TestMapExploreSourceLiteralMatchesKeepsCommonLiteralNonTerminal(t *testing.
 	}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
 	require.Len(t, recall.hits, 2)
-	require.True(t, recall.ambiguous)
+	// A complete two-owner recall is settled evidence for both sites; the
+	// ambiguity mark is reserved for saturated or owner-cap-overflowing terms.
+	require.False(t, recall.ambiguous)
 	targets := []exploreTarget{
 		{node: left, exactContent: true, exactContentAmbiguous: true},
 		{node: right, exactContent: true, exactContentAmbiguous: true},
@@ -685,11 +688,11 @@ func TestRetainExploreSourceLiteralOwnersDiversifiesFilesWithinCaps(t *testing.T
 
 	hits, files, reason := retainExploreSourceLiteralOwners(recall)
 
-	require.Equal(t, []string{"first-a", "second", "first-b"}, []string{
+	require.Equal(t, []string{"first-a", "second", "third"}, []string{
 		hits[0].nodeID, hits[1].nodeID, hits[2].nodeID,
 	})
 	require.Equal(t, exploreSourceLiteralRecallMaxFilesPerTerm, files)
-	require.Equal(t, "file_cap", reason)
+	require.Equal(t, "owner_cap", reason)
 }
 
 func TestRetainExploreSourceLiteralOwnersPrefersResolvedCalleeWithinFileDiverseCaps(t *testing.T) {
@@ -714,7 +717,7 @@ func TestRetainExploreSourceLiteralOwnersPrefersResolvedCalleeWithinFileDiverseC
 		hits[0].nodeID, hits[1].nodeID, hits[2].nodeID,
 	})
 	require.True(t, hits[0].callee)
-	require.Equal(t, exploreSourceLiteralRecallMaxFilesPerTerm, files)
+	require.Equal(t, 2, files)
 	require.Equal(t, "owner_cap", reason)
 }
 
@@ -809,7 +812,8 @@ func TestGatherExploreSourceLiteralRecallAggregatesCompactAnchorsAcrossLanguages
 			require.NotNil(t, secondCandidate)
 			require.Equal(t, float64(1), firstCandidate.Signals[exploreSourceLiteralCoverageSignal])
 			require.Equal(t, float64(2), secondCandidate.Signals[exploreSourceLiteralCoverageSignal])
-			require.Positive(t, firstCandidate.Signals[exploreContentRecallAmbiguousSignal])
+			require.Zero(t, firstCandidate.Signals[exploreContentRecallAmbiguousSignal],
+				"a complete two-owner recall settles both sites")
 			require.Zero(t, secondCandidate.Signals[exploreContentRecallAmbiguousSignal])
 		})
 	}
@@ -900,7 +904,8 @@ func TestGatherExploreSourceLiteralRecallKeepsMultiAnchorOwnerUnderNearCapCompet
 	targetCandidate := candidateByID(sourceCandidates, target.ID)
 	require.NotNil(t, targetCandidate)
 	require.Equal(t, float64(2), targetCandidate.Signals[exploreSourceLiteralCoverageSignal])
-	require.Positive(t, targetCandidate.Signals[exploreContentRecallAmbiguousSignal])
+	require.Zero(t, targetCandidate.Signals[exploreContentRecallAmbiguousSignal],
+		"a complete two-owner recall settles the multi-anchor owner")
 	ordinary := []*rerank.Candidate{
 		sourcePreservationCandidate("semantic-0", 0, 0),
 		sourcePreservationCandidate("semantic-1", 1, 0),
@@ -915,18 +920,18 @@ func TestGatherExploreSourceLiteralRecallKeepsMultiAnchorOwnerUnderNearCapCompet
 }
 
 func TestGatherExploreSourceLiteralRecallRecordsTermCapDiagnostic(t *testing.T) {
-	// "cc" must be reported as term_cap, not as a deadline the runner caused.
+	// "ee" must be reported as term_cap, not as a deadline the runner caused.
 	server := pinExploreSourceLiteralRecallBudget(&Server{logger: zap.NewNop()})
 	recall := server.gatherExploreSourceLiteralRecall(
-		context.Background(), []string{"aa", "bb", "cc"}, "demo", query.QueryOptions{},
+		context.Background(), []string{"aa", "bb", "cc", "dd", "ee"}, "demo", query.QueryOptions{},
 	)
 
-	require.Len(t, recall.diagnostics, 3)
+	require.Len(t, recall.diagnostics, 5)
 	byLiteral := make(map[string]exploreSourceLiteralDiagnostic, len(recall.diagnostics))
 	for _, diagnostic := range recall.diagnostics {
 		byLiteral[diagnostic.literal] = diagnostic
 	}
-	require.Equal(t, "term_cap", byLiteral["cc"].reason)
+	require.Equal(t, "term_cap", byLiteral["ee"].reason)
 }
 
 func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.T) {
@@ -1118,10 +1123,17 @@ func TestExploreCompactLiteralIgnoresTestMetadataAndPrefersSpecificProductionCal
 		}
 	}
 	require.NotEqual(t, -1, specificRank, "construction-aligned source evidence must survive final packing")
-	require.Equal(t, localizationStateNeedsRefinement, envelope.Completion.State)
-	require.False(t, envelope.Terminal)
-	require.False(t, envelope.Completion.Enforceable, "ambiguous production literal sites remain advisory")
-	require.Contains(t, envelope.Completion.AllowedSymbols, specificID)
+	// Two settled production registration sites are the complete answer, not
+	// grounds for another recovery turn: the page terminal-claims with both
+	// sites presented.
+	require.Equal(t, localizationStateAnswerReady, envelope.Completion.State)
+	require.True(t, envelope.Terminal)
+	evidenceIDs := make([]string, 0, len(envelope.Evidence))
+	for _, evidence := range envelope.Evidence {
+		evidenceIDs = append(evidenceIDs, evidence.ID)
+	}
+	require.Contains(t, evidenceIDs, specificID)
+	require.Contains(t, evidenceIDs, genericID, "both settled production sites must be presented")
 }
 
 func TestGatherExploreSourceLiteralRecallBoundsMappingByRequestDeadline(t *testing.T) {

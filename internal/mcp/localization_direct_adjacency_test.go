@@ -589,7 +589,7 @@ func TestSourceRangeEvidenceSurvivesFreezeAndDirectAdjacency(t *testing.T) {
 		},
 		Signals: map[string]float64{exploreSourceRangeSignal: 1},
 	}
-	rangeTarget := exploreTargetFromCandidate(rangeCandidate, "", false)
+	rangeTarget := exploreTargetFromCandidate(rangeCandidate, "", false, false)
 	if !rangeTarget.sourceRange {
 		t.Fatal("source-range candidate signal was not projected onto the target")
 	}

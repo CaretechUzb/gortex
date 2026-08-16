@@ -20,9 +20,9 @@ const (
 	exploreSourceLiteralRecallMaxHits          = 24
 	exploreSourceLiteralRecallMaxFiles         = 0
 	exploreSourceLiteralRecallBudget           = 75 * time.Millisecond
-	exploreSourceLiteralRecallMaxTerms         = 2
+	exploreSourceLiteralRecallMaxTerms         = 4
 	exploreSourceLiteralRecallMaxOwnersPerTerm = 3
-	exploreSourceLiteralRecallMaxFilesPerTerm  = 2
+	exploreSourceLiteralRecallMaxFilesPerTerm  = 3
 	exploreSourceLiteralCallEdgesPerSite       = 8
 	exploreSourceLiteralCalleeHydrationLimit   = exploreSourceLiteralRecallMaxHits * exploreSourceLiteralCallEdgesPerSite
 )
@@ -119,6 +119,42 @@ func exploreCompactSourceLiteral(term string, runeCount int) bool {
 		}
 	}
 	return true
+}
+
+// appendExploreSourceLiteralProseTerms fills the remaining bounded term slots
+// with non-compact literals, longest first: a longer quoted value carries more
+// information and greps with less noise. Compact codes keep the slots they
+// already reserved.
+func appendExploreSourceLiteralProseTerms(attemptTerms, terms []string) []string {
+	if len(attemptTerms) >= exploreSourceLiteralRecallMaxTerms {
+		return attemptTerms
+	}
+	seen := make(map[string]struct{}, len(attemptTerms)+len(terms))
+	for _, term := range attemptTerms {
+		seen[strings.ToLower(term)] = struct{}{}
+	}
+	prose := make([]string, 0, len(terms))
+	for _, term := range terms {
+		if exploreCompactSourceLiteral(term, utf8.RuneCountInString(term)) {
+			continue
+		}
+		key := strings.ToLower(term)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		prose = append(prose, term)
+	}
+	sort.SliceStable(prose, func(i, j int) bool {
+		return utf8.RuneCountInString(prose[i]) > utf8.RuneCountInString(prose[j])
+	})
+	for _, term := range prose {
+		if len(attemptTerms) >= exploreSourceLiteralRecallMaxTerms {
+			break
+		}
+		attemptTerms = append(attemptTerms, term)
+	}
+	return attemptTerms
 }
 
 func exploreSourceLiteralFallback(terms []string, primary string) string {
@@ -245,10 +281,12 @@ func retainExploreSourceLiteralOwners(recall exploreSourceLiteralRecall) (hits [
 }
 
 // gatherExploreSourceLiteralRecall reuses the bounded raw-text path behind
-// search(operation:"text") only when content_fts could not produce an exact
-// symbol candidates. It searches one repository and at most two compact
-// literals, maps 1-based hits to their smallest enclosing declarations, and
-// returns a file-diverse owner set for the caller's existing batch hydration.
+// search(operation:"text") for every admitted task literal whose value is not
+// already visible in a ranked declaration. Compact codes keep their reserved
+// slots, then the longest remaining literals fill the bounded term budget. It
+// searches one repository, maps 1-based hits to their smallest enclosing
+// declarations, and returns a file-diverse owner set for the caller's
+// existing batch hydration.
 func (s *Server) gatherExploreSourceLiteralRecall(
 	ctx context.Context,
 	terms []string,
@@ -259,18 +297,18 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 		return exploreSourceLiteralRecall{}
 	}
 	attemptTerms := exploreCompactSourceLiteralTerms(terms)
-	if len(attemptTerms) == 0 {
-		if primary := explorePreferredSourceLiteral(terms); primary != "" {
-			attemptTerms = append(attemptTerms, primary)
-		}
-	}
+	attemptTerms = appendExploreSourceLiteralProseTerms(attemptTerms, terms)
 	if len(attemptTerms) == 0 {
 		return exploreSourceLiteralRecall{}
 	}
 
 	recallBudget := s.sourceLiteralRecallBudget()
 	started := time.Now()
-	boundedCtx, cancelBounded := context.WithTimeout(ctx, 2*recallBudget)
+	// The end-to-end wall grows with the admitted term count so a page that
+	// quotes several distinct literals can ground each of them, while a page
+	// with one literal keeps the original two-slice bound.
+	wallSlices := time.Duration(max(2, len(attemptTerms)))
+	boundedCtx, cancelBounded := context.WithTimeout(ctx, wallSlices*recallBudget)
 	defer cancelBounded()
 	type literalAttempt struct {
 		term       string
@@ -341,7 +379,6 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 		})
 		for _, hit := range retained {
 			hit.anchor = anchor
-			hit.ambiguous = result.recall.ambiguous
 			aggregate.hits = append(aggregate.hits, hit)
 			if file := result.recall.ownerFiles[hit.nodeID]; file != "" {
 				aggregate.ownerFiles[hit.nodeID] = file
@@ -376,12 +413,9 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 		if _, ok := attempted[strings.ToLower(term)]; ok {
 			continue
 		}
-		reason := "not_compact"
-		if exploreCompactSourceLiteral(term, utf8.RuneCountInString(term)) {
-			reason = "term_cap"
-			if boundedCtx.Err() != nil {
-				reason = "request_deadline"
-			}
+		reason := "term_cap"
+		if boundedCtx.Err() != nil {
+			reason = "request_deadline"
 		}
 		aggregate.diagnostics = append(aggregate.diagnostics, exploreSourceLiteralDiagnostic{
 			literal: term,
@@ -659,9 +693,18 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 		})
 		ownerFiles[node.ID] = node.FilePath
 	}
+	// Ambiguity is a property of the term's evidence, not of having company:
+	// a complete search that maps to a handful of distinct owners has settled
+	// each of them — a literal registered in one file and used in another is
+	// two pieces of evidence, not mutual noise. Only a truncated search, or a
+	// literal so common it overflows the owner cap, leaves owners unproven.
+	ambiguous := saturated || len(hits) > exploreSourceLiteralRecallMaxOwnersPerTerm
+	for index := range hits {
+		hits[index].ambiguous = ambiguous
+	}
 	return exploreSourceLiteralRecall{
 		hits:       hits,
-		ambiguous:  saturated || len(hits) > 1,
+		ambiguous:  ambiguous,
 		ownerFiles: ownerFiles,
 	}
 }

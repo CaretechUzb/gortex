@@ -176,7 +176,9 @@ func TestMapExploreSourceLiteralMatchesCapsCalleeHydrationAt192(t *testing.T) {
 		"needle", matches, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
 	)
 
-	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: owner.ID, rank: 0})
+	// A recall that filled its hit cap is saturated: the single mapped owner
+	// stays ambiguous because the search cannot prove it is alone.
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: owner.ID, rank: 0, ambiguous: true})
 	require.Equal(t, 1, counting.outSiteBatchCalls)
 	require.Len(t, counting.lastSites, exploreSourceLiteralRecallMaxHits)
 	require.Equal(t, 1, counting.nodeLookupBatches)

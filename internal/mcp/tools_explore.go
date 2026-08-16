@@ -127,6 +127,7 @@ func exploreTargetFromCandidate(
 	candidate *rerank.Candidate,
 	protectedImplementationID string,
 	literalPrimaryEligible bool,
+	quotedLiteralTask bool,
 ) exploreTarget {
 	if candidate == nil || candidate.Node == nil {
 		return exploreTarget{}
@@ -147,7 +148,14 @@ func exploreTargetFromCandidate(
 	target.sourceLiteralCallee = candidate.Signals[exploreSourceLiteralCalleeSignal] > 0
 	target.sourceLiteralAligned = candidate.Signals[exploreSourceLiteralTaskAlignSignal] > 0
 	target.typedAnchorProjection = candidate.Signals[exploreTypedAnchorProjectionSignal] > 0
-	if literalPrimaryEligible && (target.sourceLiteral || target.exactContent) {
+	// Eligibility is per-row for evidence grounded in a literal the caller
+	// quoted: that the task also names a file or symbol does not make the
+	// quoted value's registration site less of an answer. Only the inferred
+	// bare-literal lane — whose literals are Gortex's own guess — remains
+	// gated on the page having no explicit anchor.
+	eligible := literalPrimaryEligible ||
+		quotedLiteralTask && !target.exactContentAmbiguous
+	if eligible && (target.sourceLiteral || target.exactContent) {
 		target.literalPrimaryEligible = true
 		matches := candidate.Signals[exploreContentRecallTermSignal]
 		if coverage := candidate.Signals[exploreSourceLiteralCoverageSignal]; coverage > matches {
@@ -2960,6 +2968,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	explicitTarget := exploreHasExplicitCandidateTarget(searchQuery, cands)
 	artifactTargets := artifactLane.targets
 	literalPrimaryEligible := exploreLiteralEvidenceEligible(searchQuery, cands, protectedSyntacticAnchors)
+	quotedLiteralTask := len(exploreQuotedRecallTerms(task)) > 0
 	targets := make([]exploreTarget, 0, len(artifactTargets)+len(cands))
 	// Artifact evidence leads only when the strong classifier activated its
 	// lane. Ordinary source localization retains the exact prior target order.
@@ -2969,7 +2978,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			continue
 		}
 		n := c.Node
-		t := exploreTargetFromCandidate(c, protectedImplementationID, literalPrimaryEligible)
+		t := exploreTargetFromCandidate(c, protectedImplementationID, literalPrimaryEligible, quotedLiteralTask)
 		t.source = s.manifestSymbolSource(ctx, n)
 		if callers := eng.GetCallers(n.ID, ringOpts); callers != nil {
 			t.callers = ringNeighbors(callers.Nodes, n.ID, exploreRingCap)
@@ -5628,16 +5637,12 @@ func exploreQuotedRecallHasExactSourceNode(
 	if exploreDraftIsTestNode(node) && !exploreQueryHasTestIntent(task) {
 		return false
 	}
-	// The explicit-anchor short-circuit answers "is this node named by the
-	// request", not "is this term already covered". A compact value — a locale,
-	// protocol, or configuration code — is never a declaration identity, so a
-	// candidate that merely matches some other anchor of the same request must
-	// not mark that value as covered: doing so suppresses the one bounded lane
-	// able to find where the value is registered. Declaration text below still
-	// settles compact coverage exactly as before.
-	if !exploreQuotedRecallCompactTerms(terms) && exploreLocalizationExplicitAnchor(task, node) {
-		return true
-	}
+	// Coverage means the term is visible in this node's own declaration text —
+	// name, signature, or qualified name. That a candidate happens to be some
+	// other anchor of the same request says nothing about where a quoted value
+	// lives; treating it as coverage suppressed the one bounded lane able to
+	// find the value's registration site on exactly the tasks that both quote
+	// a literal and name a file.
 	retrieval := node.RetrievalMetadata()
 	for _, term := range terms {
 		// Compact values such as locale and protocol codes are usually source
@@ -6427,8 +6432,16 @@ func reserveExploreSourceLiteralCandidate(candidates, bounded []*rerank.Candidat
 	sources := make([]*rerank.Candidate, 0, exploreSourceLiteralReservationMax)
 	seenSourceIDs := make(map[string]struct{}, exploreSourceLiteralReservationMax)
 	for _, candidate := range candidates {
-		if candidate == nil || candidate.Node == nil || candidate.Node.ID == "" || candidate.Signals == nil ||
-			candidate.Signals[exploreSourceLiteralSignal] <= 0 {
+		if candidate == nil || candidate.Node == nil || candidate.Node.ID == "" || candidate.Signals == nil {
+			continue
+		}
+		// A code definition holding an exact content match is literal evidence
+		// with the same standing as a grep-lane owner: without a slot here it
+		// falls off the ranked cut on every non-concept query class.
+		literalEvidence := candidate.Signals[exploreSourceLiteralSignal] > 0 ||
+			candidate.Signals[exploreContentRecallExactSignal] > 0 &&
+				exploreCodeDefinitionKind(candidate.Node.Kind)
+		if !literalEvidence {
 			continue
 		}
 		if _, duplicate := seenSourceIDs[candidate.Node.ID]; duplicate {
@@ -6477,13 +6490,15 @@ func reserveExploreSourceLiteralCandidate(candidates, bounded []*rerank.Candidat
 		return callableSpecificity(sources[i]) > callableSpecificity(sources[j])
 	})
 	selectedSources := sources[:0]
+	// A crowded source field is collision evidence: when more owners carry
+	// literal signals than the reservation could ever seat, a second
+	// single-anchor slot would spend the answer on one literal's noise. A
+	// lone extra settled owner is the opposite — a distinct proven site.
+	crowded := len(sources) > exploreSourceLiteralReservationMax
 	for _, source := range sources {
 		coverage := source.Signals[exploreSourceLiteralCoverageSignal]
 		settled := source.Signals[exploreContentRecallAmbiguousSignal] <= 0
-		// One ambiguous single-anchor owner may preserve recall, but allowing a
-		// second would spend most of a three-slot answer on collision evidence.
-		// Multi-anchor corroboration is strong enough to keep despite ambiguity.
-		if len(selectedSources) > 0 && coverage < 2 && !settled {
+		if len(selectedSources) > 0 && coverage < 2 && (!settled || crowded) {
 			continue
 		}
 		selectedSources = append(selectedSources, source)
