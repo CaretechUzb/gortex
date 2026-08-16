@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -14,11 +16,9 @@ const (
 	// writes that cancel do not invalidate analysis or inflate receipts. SQL is
 	// issued in VALUES relations bounded by the probed connection variable
 	// limit and the shared argument-byte budget.
-	reindexKeyParamsPerRow                = 5
-	reindexRowParamsPerRow                = edgeInsertParams
-	reindexRowMaxChunkSize                = edgeInsertMaxChunkSize
-	reindexResolvedUpdateParamsPerRow     = 15
-	reindexResolvedKindUpdateParamsPerRow = 16
+	reindexKeyParamsPerRow = 5
+	reindexRowParamsPerRow = edgeInsertParams
+	reindexRowMaxChunkSize = edgeInsertMaxChunkSize
 )
 
 type sqliteReindexKey struct {
@@ -412,60 +412,19 @@ func updateSQLiteResolvedConversionsTxLimited(
 	if len(mutations) == 0 {
 		return 0, 0, nil, nil, nil
 	}
-	if variableLimit == nil || *variableLimit <= 0 {
-		fallback := sqliteFallbackVariableLimit
-		variableLimit = &fallback
+	candidates := make([]sqliteReindexMutation, 0, len(mutations))
+	for _, mutation := range mutations {
+		if plan.updateCandidate(mutation, updateKind) {
+			candidates = append(candidates, mutation)
+		}
 	}
-
-	paramsPerRow := reindexResolvedUpdateParamsPerRow
-	if updateKind {
-		paramsPerRow = reindexResolvedKindUpdateParamsPerRow
-	}
-	rowLimit := batchRowsForVariableLimit(*variableLimit, paramsPerRow, reindexRowMaxChunkSize)
-	for pos := 0; pos < len(mutations); {
-		chunkStart := pos
-		args := make([]any, 0, rowLimit*paramsPerRow)
-		argBytes := 0
-		rowCount := 0
-		for pos < len(mutations) && rowCount < rowLimit {
-			mutation := mutations[pos]
-			if !plan.updateCandidate(mutation, updateKind) {
-				pos++
-				continue
-			}
-			row := mutation.newRow
-			argStart := len(args)
-			args = append(args,
-				mutation.oldKey.fromID, mutation.oldKey.toID, mutation.oldKey.kind,
-				mutation.oldKey.filePath, mutation.oldKey.line, row.key.toID,
-			)
-			if updateKind {
-				args = append(args, row.key.kind)
-			}
-			args = append(args,
-				row.confidence, row.confidenceLabel, row.origin, row.tier,
-				row.crossRepo, row.meta, row.resolveTerminal, row.resolveTerminalReason, row.semanticSource,
-			)
-			rowBytes := sqliteBoundArgsBytes(args[argStart:])
-			if rowCount > 0 && argBytes+rowBytes > sqliteBatchMaxBoundBytes {
-				args = args[:argStart]
-				break
-			}
-			pos++
-			rowCount++
-			argBytes += rowBytes
+	query := sqliteResolvedConversionUpdateJSONStatement(updateKind)
+	for start := 0; start < len(candidates); {
+		payload, rowCount, encodeErr := encodeResolvedConversionRows(candidates[start:], updateKind)
+		if encodeErr != nil {
+			return updatedRows, statements, repairDeletes, repairInserts, encodeErr
 		}
-		if rowCount == 0 {
-			continue
-		}
-
-		query := sqliteResolvedConversionUpdateStatement(rowCount, updateKind)
-		result, execErr := tx.Exec(query, args...)
-		if tooManySQLVariables(execErr) && rowCount > 1 {
-			rowLimit = lowerBatchVariableLimit(variableLimit, paramsPerRow, rowCount)
-			pos = chunkStart
-			continue
-		}
+		result, execErr := tx.Exec(query, payload)
 		if execErr != nil {
 			return updatedRows, statements, repairDeletes, repairInserts, execErr
 		}
@@ -487,25 +446,117 @@ func updateSQLiteResolvedConversionsTxLimited(
 			// materializing RETURNING rows. Replaying the whole bounded chunk is
 			// exact: successful rows already occupy their destination, while
 			// missing sources and destination collisions are repaired below.
-			for _, mutation := range mutations[chunkStart:pos] {
-				if !plan.updateCandidate(mutation, updateKind) {
-					continue
-				}
+			for _, mutation := range candidates[start : start+rowCount] {
 				repairDeletes = append(repairDeletes, mutation.oldKey)
 				repairInserts = append(repairInserts, mutation.newRow)
 			}
 		}
+		start += rowCount
 	}
 	return updatedRows, statements, repairDeletes, repairInserts, nil
 }
 
-func sqliteResolvedConversionUpdateStatement(rowCount int, updateKind bool) string {
+// encodeResolvedConversionRows marshals a bounded prefix of the candidates as
+// one json_each relation: positional arrays in patch-column order. meta rides
+// hex-encoded — its compact binary encoding is not UTF-8-safe inside JSON,
+// and unhex() restores the exact bytes — while NULL-able columns become JSON
+// null. Bounded by reindexRowMaxChunkSize rows and sqliteBatchMaxBoundBytes
+// of estimated payload; the first row is always taken, so every call makes
+// progress.
+func encodeResolvedConversionRows(candidates []sqliteReindexMutation, updateKind bool) (string, int, error) {
+	rows := make([]any, 0, minInt(len(candidates), reindexRowMaxChunkSize))
+	estimated := 0
+	for _, mutation := range candidates {
+		if len(rows) >= reindexRowMaxChunkSize {
+			break
+		}
+		size := resolvedConversionRowEstimate(mutation)
+		if len(rows) > 0 && estimated+size > sqliteBatchMaxBoundBytes {
+			break
+		}
+		rows = append(rows, resolvedConversionJSONRow(mutation, updateKind))
+		estimated += size
+	}
+	encoded, err := json.Marshal(rows)
+	if err != nil {
+		return "", 0, err
+	}
+	return string(encoded), len(rows), nil
+}
+
+func resolvedConversionRowEstimate(mutation sqliteReindexMutation) int {
+	row := mutation.newRow
+	return len(mutation.oldKey.fromID) + len(mutation.oldKey.toID) +
+		len(mutation.oldKey.kind) + len(mutation.oldKey.filePath) +
+		len(row.key.toID) + len(row.key.kind) + len(row.confidenceLabel) +
+		len(row.origin) + len(row.tier) + 2*len(row.meta) +
+		len(row.resolveTerminalReason.String) + len(row.semanticSource.String) + 64
+}
+
+func resolvedConversionJSONRow(mutation sqliteReindexMutation, updateKind bool) []any {
+	row := mutation.newRow
+	out := make([]any, 0, 16)
+	out = append(out,
+		mutation.oldKey.fromID, mutation.oldKey.toID, mutation.oldKey.kind,
+		mutation.oldKey.filePath, mutation.oldKey.line, row.key.toID,
+	)
 	if updateKind {
-		return `WITH patch(
-		old_from_id, old_to_id, old_kind, file_path, line, new_to_id, new_kind,
-		confidence, confidence_label, origin, tier, cross_repo, meta,
-		resolve_terminal, resolve_terminal_reason, semantic_source
-	) AS (VALUES ` + multiValues(rowCount, reindexResolvedKindUpdateParamsPerRow) + `)
+		out = append(out, row.key.kind)
+	}
+	var meta any
+	if row.meta != nil {
+		meta = hex.EncodeToString(row.meta)
+	}
+	var terminal any
+	if row.resolveTerminal.Valid {
+		if row.resolveTerminal.Bool {
+			terminal = 1
+		} else {
+			terminal = 0
+		}
+	}
+	var reason any
+	if row.resolveTerminalReason.Valid {
+		reason = row.resolveTerminalReason.String
+	}
+	var semantic any
+	if row.semanticSource.Valid {
+		semantic = row.semanticSource.String
+	}
+	out = append(out,
+		row.confidence, row.confidenceLabel, row.origin, row.tier,
+		row.crossRepo, meta, terminal, reason, semantic,
+	)
+	return out
+}
+
+// sqliteResolvedConversionUpdateJSONStatement is the resolved-conversion
+// update arm over a json_each relation: the whole chunk rides ONE bound
+// variable, where the per-row VALUES form paid the driver's bind cost for
+// 15-16 parameters per row. meta travels hex-encoded (binary; see
+// encodeResolvedConversionRows) and unhex() restores the exact bytes; JSON
+// numbers and nulls land as INTEGER/REAL/NULL, with column affinity settling
+// confidence to REAL.
+func sqliteResolvedConversionUpdateJSONStatement(updateKind bool) string {
+	if updateKind {
+		return `WITH patch AS (SELECT
+		value ->> 0 AS old_from_id,
+		value ->> 1 AS old_to_id,
+		value ->> 2 AS old_kind,
+		value ->> 3 AS file_path,
+		value ->> 4 AS line,
+		value ->> 5 AS new_to_id,
+		value ->> 6 AS new_kind,
+		CAST(value ->> 7 AS REAL) AS confidence,
+		value ->> 8 AS confidence_label,
+		value ->> 9 AS origin,
+		value ->> 10 AS tier,
+		value ->> 11 AS cross_repo,
+		unhex(value ->> 12) AS meta,
+		value ->> 13 AS resolve_terminal,
+		value ->> 14 AS resolve_terminal_reason,
+		value ->> 15 AS semantic_source
+	FROM json_each(?))
 	UPDATE OR IGNORE edges AS e
 	SET to_id = p.new_to_id,
 		kind = p.new_kind,
@@ -525,11 +576,23 @@ func sqliteResolvedConversionUpdateStatement(rowCount int, updateKind bool) stri
 		AND e.file_path = p.file_path
 		AND e.line = p.line`
 	}
-	return `WITH patch(
-		old_from_id, old_to_id, kind, file_path, line, new_to_id,
-		confidence, confidence_label, origin, tier, cross_repo, meta,
-		resolve_terminal, resolve_terminal_reason, semantic_source
-	) AS (VALUES ` + multiValues(rowCount, reindexResolvedUpdateParamsPerRow) + `)
+	return `WITH patch AS (SELECT
+		value ->> 0 AS old_from_id,
+		value ->> 1 AS old_to_id,
+		value ->> 2 AS kind,
+		value ->> 3 AS file_path,
+		value ->> 4 AS line,
+		value ->> 5 AS new_to_id,
+		CAST(value ->> 6 AS REAL) AS confidence,
+		value ->> 7 AS confidence_label,
+		value ->> 8 AS origin,
+		value ->> 9 AS tier,
+		value ->> 10 AS cross_repo,
+		unhex(value ->> 11) AS meta,
+		value ->> 12 AS resolve_terminal,
+		value ->> 13 AS resolve_terminal_reason,
+		value ->> 14 AS semantic_source
+	FROM json_each(?))
 	UPDATE OR IGNORE edges AS e
 	SET to_id = p.new_to_id,
 		confidence = p.confidence,
