@@ -19,10 +19,15 @@ const (
 	localizationBodyMentionTokenByteCap       = 256
 	localizationBodyMentionTotalSourceByteCap = 64 << 10
 	localizationProvenanceBodyMention         = "body_mention"
+	// A declaration the raw task names as a whole word is the caller's own
+	// subject, not a scan inference; it carries its own provenance and is not
+	// confined to supporting placement.
+	localizationProvenanceTaskMention = "task_mention"
 )
 
 type localizationBodyMentionCandidate struct {
 	node       *graph.Node
+	taskNamed  bool
 	sameFile   bool
 	overlap    int
 	longest    int
@@ -96,12 +101,16 @@ scan:
 					if !ok {
 						continue
 					}
-					if _, mentioned := source.tokens[name]; !mentioned {
+					_, mentioned := source.tokens[name]
+					taskNamed := localizationTaskNamesIdentifier(
+						task, strings.TrimSpace(node.Name), localizationTaskNameMinRunes)
+					if !mentioned && !taskNamed {
 						continue
 					}
 					overlap, longest := exploreDraftTermOverlap(taskTerms, node)
 					candidate := localizationBodyMentionCandidate{
 						node:       node,
+						taskNamed:  taskNamed,
 						sameFile:   sameFile,
 						overlap:    overlap,
 						longest:    longest,
@@ -131,6 +140,10 @@ scan:
 			Provenance: localizationProvenanceBodyMention,
 
 			supportingOnly: true,
+		}
+		if mention.taskNamed {
+			row.Provenance = localizationProvenanceTaskMention
+			row.supportingOnly = false
 		}
 		candidate := envelope
 		// Files, Symbols, and Evidence are positional arrays. Repeated file
@@ -321,6 +334,9 @@ func localizationBodyMentionDirect(owner localizationEvidence, id string) bool {
 }
 
 func localizationBodyMentionLess(left, right localizationBodyMentionCandidate) bool {
+	if left.taskNamed != right.taskNamed {
+		return left.taskNamed
+	}
 	if left.sameFile != right.sameFile {
 		return left.sameFile
 	}
@@ -350,7 +366,11 @@ func localizationBodyMentionDigestContains(digest *localizationEvidenceDigest, i
 		return false
 	}
 	for _, row := range digest.Evidence {
-		if row.ID == id && row.Provenance == localizationProvenanceBodyMention {
+		if row.ID != id {
+			continue
+		}
+		if row.Provenance == localizationProvenanceBodyMention ||
+			row.Provenance == localizationProvenanceTaskMention {
 			return true
 		}
 	}

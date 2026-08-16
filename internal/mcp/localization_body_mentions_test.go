@@ -52,8 +52,8 @@ func TestPromoteLocalizationBodyMentionsUsesRealPageDeclarations(t *testing.T) {
 	)
 
 	require.Equal(t, []string{sibling.ID, external.ID}, []string{packed.Evidence[2].ID, packed.Evidence[3].ID})
-	require.Equal(t, localizationProvenanceBodyMention, packed.Evidence[2].Provenance)
-	require.Equal(t, localizationProvenanceBodyMention, packed.Evidence[3].Provenance)
+	require.Equal(t, localizationProvenanceTaskMention, packed.Evidence[2].Provenance)
+	require.Equal(t, localizationProvenanceTaskMention, packed.Evidence[3].Provenance)
 	require.Empty(t, packed.Evidence[2].Source)
 	require.NotContains(t, packed.Symbols, fragment.ID, "identifier fragments must not promote declarations")
 	require.Equal(t, map[string]int{"src/a.go": 1, "src/b.go": 1}, reader.fileCalls)
@@ -62,11 +62,14 @@ func TestPromoteLocalizationBodyMentionsUsesRealPageDeclarations(t *testing.T) {
 	require.True(t, localizationBodyMentionDigestContains(packedDigest, sibling.ID))
 	require.True(t, localizationBodyMentionDigestContains(packedDigest, external.ID))
 
+	seatedMentions := 0
 	for _, row := range localizationFinalResponseRows("fix sibling and External", nil, packedDigest.Evidence) {
-		if row.row.Provenance == localizationProvenanceBodyMention {
+		if row.row.Provenance == localizationProvenanceTaskMention {
 			require.True(t, row.primary, "a body-derived declaration the task names seats as primary")
+			seatedMentions++
 		}
 	}
+	require.Equal(t, 2, seatedMentions)
 }
 
 func TestPromoteLocalizationBodyMentionsIsCappedAndCached(t *testing.T) {
@@ -271,4 +274,43 @@ func TestShedLocalizationDigestSupportingOnlyBeforeOrdinaryRows(t *testing.T) {
 	retained, removed = shedLocalizationDigestSupportingOnly(retained)
 	require.False(t, removed)
 	require.Equal(t, []string{"ordinary", "protected", "tail"}, []string{retained[0].ID, retained[1].ID, retained[2].ID})
+}
+
+func TestPromoteLocalizationTaskNamedDeclarationWithoutBodyMention(t *testing.T) {
+	target := localizationBodyMentionTestNode("src/a.go", "RotateJournal", 40)
+	reader := &localizationDeclarationSpyReader{
+		files:     map[string][]*graph.Node{"src/a.go": {target}},
+		fileCalls: make(map[string]int),
+	}
+	envelope := localizationExploreEnvelope{
+		Completion: newLocalizationCompletion(true, ""),
+		Files:      []string{"src/a.go"},
+		Symbols:    []string{"src/a.go::owner"},
+		Evidence: []localizationEvidence{{
+			Rank: 1, ID: "src/a.go::owner", Name: "owner", Kind: string(graph.KindFunction),
+			File: "src/a.go", Line: 1, Source: "func owner() { unrelated() }",
+		}},
+	}
+	task := "RotateJournal drops entries during shutdown"
+
+	packed, packedDigest := promoteLocalizationBodyMentions(
+		task, envelope, newLocalizationDeclarationTestCache(reader), 1<<20,
+		newLocalizationEvidenceDigestForTask(task, envelope),
+	)
+
+	require.Contains(t, packed.Symbols, target.ID)
+	var provenance string
+	for _, row := range packed.Evidence {
+		if row.ID == target.ID {
+			provenance = row.Provenance
+		}
+	}
+	require.Equal(t, localizationProvenanceTaskMention, provenance)
+	seated := false
+	for _, row := range localizationFinalResponseRows(task, nil, packedDigest.Evidence) {
+		if row.row.ID == target.ID {
+			seated = row.primary
+		}
+	}
+	require.True(t, seated, "a task-named declaration seats as primary without a body mention")
 }

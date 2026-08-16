@@ -33,7 +33,7 @@ func TestTaskAlignedSeatingLeavesRankOrderTheLastSeat(t *testing.T) {
 		{ID: "repo/journal.go::JournalWriter.truncate", Name: "truncate", QualName: "JournalWriter.truncate", Kind: "method", File: "repo/journal.go", Line: 75},
 	}
 	response := renderLocalizationFinalResponseForTask(
-		"journal overflow after replaying the tail", nil, rows)
+		"journal overflow: append, seal, compact, replayTail and truncate misbehave under JournalWriter load", nil, rows)
 	want := "- PRIMARY — repo/pipeline.go:10 — repo/pipeline.go::Pipeline.ingest"
 	if !strings.Contains(response, want) {
 		t.Fatalf("rank-leading row lost its reserved seat to task alignment:\n%s", response)
@@ -62,6 +62,27 @@ func TestBodyMentionRowSeatsOnlyWhenTaskNamedAndAdjacencyStaysSupporting(t *test
 	adjacency := "- PRIMARY — repo/codec.go:68 — repo/codec.go::RingBufferCodec.reset"
 	if strings.Contains(response, adjacency) {
 		t.Fatalf("task-named adjacency neighbor claimed a primary seat:\n%s", response)
+	}
+}
+
+func TestLocalizationTaskNamesIdentifierWholeWord(t *testing.T) {
+	cases := []struct {
+		task, identifier string
+		minRunes         int
+		want             bool
+	}{
+		{"w.Written() is true after headers", "Written", 5, true},
+		{"constructing SyslogUdpHandler fails", "SyslogUdpHandler", 6, true},
+		{"a task about starting the daemon", "start", 5, false},
+		{"the writer is written to disk", "Written", 5, false},
+		{"getStorage returns the persist storage", "Storage", 5, false},
+		{"Flush()", "Flush", 5, true},
+	}
+	for _, tc := range cases {
+		if got := localizationTaskNamesIdentifier(tc.task, tc.identifier, tc.minRunes); got != tc.want {
+			t.Fatalf("localizationTaskNamesIdentifier(%q, %q) = %v, want %v",
+				tc.task, tc.identifier, got, tc.want)
+		}
 	}
 }
 

@@ -688,10 +688,12 @@ const (
 	// One authenticated source-literal callee may pre-seat ahead of the ranked
 	// cohort. Further literal rows compete only through ordinary ranking.
 	localizationFinalResponseLiteralReserve = 1
-	// A task-named row may claim a seat regardless of its admission lane, but
-	// only on a substantive identifier match: six runes keeps short prose
-	// words from promoting whatever row happens to contain them.
-	localizationTaskAlignedSeatMinTerm = 6
+	// A row is task-named only when the raw task text carries its identifier
+	// as a whole word, case-sensitively. The rune floors keep short prose
+	// words from naming whatever row happens to share them: five for the
+	// row's own name, six for an owner segment.
+	localizationTaskNameMinRunes  = 5
+	localizationTaskOwnerMinRunes = 6
 	// The task-aligned pass stops one seat short of the primary block so the
 	// ranked order always keeps at least one seat of its own.
 	localizationTaskAlignedSeatCeiling = localizationFinalResponsePrimaryLimit - 1
@@ -811,6 +813,53 @@ func localizationFinalResponseBareName(row localizationDigestRow) string {
 		name = name[cut+1:]
 	}
 	return name
+}
+
+func localizationIdentifierByte(b byte) bool {
+	return b == '_' || b == '$' ||
+		('0' <= b && b <= '9') || ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z')
+}
+
+// localizationTaskNamesIdentifier reports whether the raw task text contains
+// identifier as a whole word, case-sensitively. Substring hits inside a longer
+// identifier do not count: a task about "starting" does not name "start".
+func localizationTaskNamesIdentifier(task, identifier string, minRunes int) bool {
+	if identifier == "" || task == "" || utf8.RuneCountInString(identifier) < minRunes {
+		return false
+	}
+	for offset := 0; offset+len(identifier) <= len(task); {
+		index := strings.Index(task[offset:], identifier)
+		if index < 0 {
+			return false
+		}
+		start := offset + index
+		end := start + len(identifier)
+		if (start == 0 || !localizationIdentifierByte(task[start-1])) &&
+			(end == len(task) || !localizationIdentifierByte(task[end])) {
+			return true
+		}
+		offset = start + 1
+	}
+	return false
+}
+
+// localizationTaskNamesRow reports whether the task names the row itself or
+// the owner the row belongs to.
+func localizationTaskNamesRow(task string, row localizationDigestRow) bool {
+	name := localizationFinalResponseBareName(row)
+	if localizationTaskNamesIdentifier(task, name, localizationTaskNameMinRunes) {
+		return true
+	}
+	qual := strings.TrimSpace(row.QualName)
+	for _, segment := range strings.FieldsFunc(qual, func(r rune) bool { return r == '.' || r == ':' }) {
+		if segment == name {
+			continue
+		}
+		if localizationTaskNamesIdentifier(task, segment, localizationTaskOwnerMinRunes) {
+			return true
+		}
+	}
+	return false
 }
 
 // localizationFinalResponseAnchorRank orders the provenance flags that can name
@@ -1056,10 +1105,12 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 	// order before rank order fills the rest. The admission lane must not
 	// decide presentation authority: a declaration the task names is what the
 	// caller asked about, whether it arrived through ranked retrieval,
-	// leading-file completeness, or a body mention. Adjacency neighbors stay
+	// leading-file completeness, or a body mention. Naming means the raw task
+	// carries the row's identifier as a whole word, case-sensitively — prose
+	// substrings do not reseat the answer. Adjacency neighbors stay
 	// supporting — sharing an identifier with the task does not make a graph
 	// hop the subject of the report.
-	if len(primaries) < localizationTaskAlignedSeatCeiling && len(taskTerms) > 0 {
+	if len(primaries) < localizationTaskAlignedSeatCeiling && strings.TrimSpace(task) != "" {
 		type taskAlignedCandidate struct {
 			index int
 			score localizationFinalResponseTaskScore
@@ -1072,11 +1123,12 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 			if row.Provenance == localizationProvenanceDirectAdjacency {
 				continue
 			}
-			score := scoreLocalizationFinalResponseTask(taskTerms, row)
-			if score.matched == 0 || score.longest < localizationTaskAlignedSeatMinTerm {
+			if !localizationTaskNamesRow(task, row) {
 				continue
 			}
-			aligned = append(aligned, taskAlignedCandidate{index: index, score: score})
+			aligned = append(aligned, taskAlignedCandidate{
+				index: index, score: scoreLocalizationFinalResponseTask(taskTerms, row),
+			})
 		}
 		sort.SliceStable(aligned, func(left, right int) bool {
 			return localizationFinalResponseBetterTaskScore(aligned[left].score, aligned[right].score)
