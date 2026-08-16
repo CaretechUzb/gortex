@@ -844,22 +844,51 @@ func localizationTaskNamesIdentifier(task, identifier string, minRunes int) bool
 }
 
 // localizationTaskNamesRow reports whether the task names the row itself or
-// the owner the row belongs to.
+// the type the row is declared on. Only the immediate declaring owner counts:
+// qualified names carry namespace and package segments, and the repository's
+// own name sits in almost every namespace chain and almost every task, so a
+// wider match would name the whole page.
 func localizationTaskNamesRow(task string, row localizationDigestRow) bool {
 	name := localizationFinalResponseBareName(row)
 	if localizationTaskNamesIdentifier(task, name, localizationTaskNameMinRunes) {
 		return true
 	}
-	qual := strings.TrimSpace(row.QualName)
-	for _, segment := range strings.FieldsFunc(qual, func(r rune) bool { return r == '.' || r == ':' }) {
-		if segment == name {
-			continue
+	segments := strings.FieldsFunc(strings.TrimSpace(row.QualName), func(r rune) bool {
+		return r == '.' || r == ':'
+	})
+	if len(segments) < 2 {
+		return false
+	}
+	owner := segments[len(segments)-2]
+	if owner == name || strings.EqualFold(owner, localizationDigestRowRepoIdentifier(row)) {
+		return false
+	}
+	return localizationTaskNamesIdentifier(task, owner, localizationTaskOwnerMinRunes)
+}
+
+// localizationDigestRowRepoIdentifier extracts the repository name that
+// prefixes the row's node ID, without any trailing checkout discriminator.
+func localizationDigestRowRepoIdentifier(row localizationDigestRow) string {
+	id := strings.TrimSpace(row.ID)
+	slash := strings.IndexByte(id, '/')
+	if slash <= 0 {
+		return ""
+	}
+	repo := id[:slash]
+	if dash := strings.LastIndexByte(repo, '-'); dash > 0 {
+		digits := repo[dash+1:]
+		numeric := digits != ""
+		for _, r := range digits {
+			if r < '0' || r > '9' {
+				numeric = false
+				break
+			}
 		}
-		if localizationTaskNamesIdentifier(task, segment, localizationTaskOwnerMinRunes) {
-			return true
+		if numeric {
+			repo = repo[:dash]
 		}
 	}
-	return false
+	return repo
 }
 
 // localizationFinalResponseAnchorRank orders the provenance flags that can name

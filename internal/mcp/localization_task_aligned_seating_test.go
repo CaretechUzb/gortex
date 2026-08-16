@@ -86,6 +86,34 @@ func TestLocalizationTaskNamesIdentifierWholeWord(t *testing.T) {
 	}
 }
 
+func TestTaskNamesRowIgnoresNamespaceAndRepoSegments(t *testing.T) {
+	task := "Localize bug: in the pre-fix Humanizer checkout, Taxes is singularized wrongly"
+	namespaceRow := localizationDigestRow{
+		ID:       "humanizer-1499/src/A.cs::src.Humanizer.TimeSpanHumanizeExtensions.GetNormalCaseTimeAsInteger",
+		Name:     "GetNormalCaseTimeAsInteger",
+		QualName: "src.Humanizer.TimeSpanHumanizeExtensions.GetNormalCaseTimeAsInteger",
+	}
+	if localizationTaskNamesRow(task, namespaceRow) {
+		t.Fatalf("a namespace segment named the row")
+	}
+	repoOwnedType := localizationDigestRow{
+		ID:       "humanizer-1499/src/B.cs::src.Humanizer.NumberToWordsExtension",
+		Name:     "NumberToWordsExtension",
+		QualName: "src.Humanizer.NumberToWordsExtension",
+	}
+	if localizationTaskNamesRow(task, repoOwnedType) {
+		t.Fatalf("the repository namespace named a top-level type")
+	}
+	declaredOwner := localizationDigestRow{
+		ID:       "monolog-1569/src/H.php::SyslogUdpHandler.__construct",
+		Name:     "__construct",
+		QualName: "SyslogUdpHandler.__construct",
+	}
+	if !localizationTaskNamesRow("constructing SyslogUdpHandler fails", declaredOwner) {
+		t.Fatalf("the declaring owner did not name the row")
+	}
+}
+
 func TestMergeLocalizationDigestRowEvidenceKeepsStrongestProvenance(t *testing.T) {
 	base := localizationDigestRow{ID: "repo/a.go::Parser.scan", File: "repo/a.go"}
 	adjacency := base
