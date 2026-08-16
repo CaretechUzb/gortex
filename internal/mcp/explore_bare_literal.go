@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -17,9 +18,97 @@ const (
 	exploreBareDiagnosticMinRunes  = 12
 	exploreBareDiagnosticMinWords  = 3
 	exploreBareDiagnosticMaxWords  = 6
+
+	exploreDistinctiveBareTokenMaxTerms        = 5
+	exploreDistinctiveBareTokenMinRunes        = 4
+	exploreDistinctiveBareTokenPlainMinRunes   = 10
+	exploreDistinctiveBareTokenSegmentMinRunes = 6
+	exploreDistinctiveBareTokenScanCap         = 128
 )
 
 var exploreBareLiteralWordRE = regexp.MustCompile(`[\pL\pN_][\pL\pN_'-]*`)
+
+var (
+	exploreDistinctiveBareTokenRE = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_.]{3,}`)
+	exploreCamelTransitionRE      = regexp.MustCompile(`[a-z][A-Z]`)
+)
+
+// exploreDistinctiveBareTokens mines the identifier-shaped tokens a caller
+// would grep for verbatim: camel-case, underscore, dotted, or digit-bearing
+// tokens, plus long plain words. Issue prose names its subject far more often
+// than it quotes it, and these tokens feed the same bounded source-literal
+// recall as quoted terms — retrieval only, never authored claims. A dotted
+// token also contributes its final segment, since a member cited as
+// `owner.method` is greppable only by the method name.
+func exploreDistinctiveBareTokens(task, repoPrefix string) []string {
+	task = exploreBareLiteralBoundedTask(task)
+	if strings.TrimSpace(task) == "" {
+		return nil
+	}
+	repoBase := strings.ToLower(strings.TrimSpace(repoPrefix))
+	if cut := strings.LastIndexByte(repoBase, '-'); cut > 0 {
+		if digits := repoBase[cut+1:]; digits != "" && strings.TrimLeft(digits, "0123456789") == "" {
+			repoBase = repoBase[:cut]
+		}
+	}
+	type minedToken struct {
+		term       string
+		structured bool
+	}
+	mined := make([]minedToken, 0, exploreDistinctiveBareTokenScanCap)
+	seen := make(map[string]struct{}, exploreDistinctiveBareTokenScanCap)
+	appendToken := func(term string, structured bool) {
+		term = strings.Trim(term, "-_.:")
+		if utf8.RuneCountInString(term) < exploreDistinctiveBareTokenMinRunes {
+			return
+		}
+		key := strings.ToLower(term)
+		if key == repoBase {
+			return
+		}
+		if _, stop := assistStopWords[key]; stop {
+			return
+		}
+		if _, generic := exploreTerminalGenericTerms[key]; generic {
+			return
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return
+		}
+		seen[key] = struct{}{}
+		mined = append(mined, minedToken{term: term, structured: structured})
+	}
+	for _, raw := range exploreDistinctiveBareTokenRE.FindAllString(task, exploreDistinctiveBareTokenScanCap) {
+		raw = strings.TrimRight(raw, ".")
+		structured := exploreCamelTransitionRE.MatchString(raw) ||
+			strings.Contains(raw, "_") || strings.Contains(raw, ".") ||
+			strings.ContainsAny(raw, "0123456789")
+		if !structured && utf8.RuneCountInString(raw) < exploreDistinctiveBareTokenPlainMinRunes {
+			continue
+		}
+		appendToken(raw, structured)
+		if dot := strings.LastIndexByte(raw, '.'); dot >= 0 {
+			segment := raw[dot+1:]
+			if utf8.RuneCountInString(segment) >= exploreDistinctiveBareTokenSegmentMinRunes {
+				appendToken(segment, exploreCamelTransitionRE.MatchString(segment) || strings.Contains(segment, "_"))
+			}
+		}
+	}
+	sort.SliceStable(mined, func(i, j int) bool {
+		if mined[i].structured != mined[j].structured {
+			return mined[i].structured
+		}
+		return utf8.RuneCountInString(mined[i].term) > utf8.RuneCountInString(mined[j].term)
+	})
+	out := make([]string, 0, exploreDistinctiveBareTokenMaxTerms)
+	for _, token := range mined {
+		if len(out) == exploreDistinctiveBareTokenMaxTerms {
+			break
+		}
+		out = append(out, token.term)
+	}
+	return out
+}
 
 // exploreBareLiteralRecallTerms mines only high-signal source values the
 // requester wrote without quotes. It is intentionally separate from quoted

@@ -2968,7 +2968,8 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	explicitTarget := exploreHasExplicitCandidateTarget(searchQuery, cands)
 	artifactTargets := artifactLane.targets
 	literalPrimaryEligible := exploreLiteralEvidenceEligible(searchQuery, cands, protectedSyntacticAnchors)
-	quotedLiteralTask := len(exploreQuotedRecallTerms(task)) > 0
+	quotedLiteralTask := len(exploreQuotedRecallTerms(task)) > 0 ||
+		len(exploreDistinctiveBareTokens(task, "")) > 0
 	targets := make([]exploreTarget, 0, len(artifactTargets)+len(cands))
 	// Artifact evidence leads only when the strong classifier activated its
 	// lane. Ordinary source localization retains the exact prior target order.
@@ -5775,9 +5776,6 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 	// Durable content FTS remains the discovery backend. Overlay-owned files
 	// are filtered below before any snippet can authenticate a candidate.
 	content, hasContent := s.graph.(graph.ContentSearcher)
-	if len(terms) == 0 {
-		return nil
-	}
 	perTerm := clampInt(limit/3, 4, exploreQuotedRecallMaxPerTerm)
 	repoPrefix := ""
 	if len(scope.RepoAllow) == 1 {
@@ -5789,6 +5787,13 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 	}
 	if repoPrefix == "" {
 		repoPrefix, _ = s.sessionLocality(ctx)
+	}
+	// A task that quotes nothing still names its subject: identifier-shaped
+	// prose tokens feed the same bounded source-literal recall below, so an
+	// unquoted issue is not blind to source bodies.
+	bareTokens := exploreDistinctiveBareTokens(task, repoPrefix)
+	if len(terms) == 0 && len(bareTokens) == 0 {
+		return nil
 	}
 
 	type recallPage struct {
@@ -5902,8 +5907,14 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 	// symbol-like term must not suppress a different compact value whose only
 	// useful evidence is inside a registration body. The selected missing term
 	// still feeds one bounded source scan, so this preserves the fixed I/O cap.
-	sourceRecallTerms := make([]string, 0, len(terms))
-	for _, term := range terms {
+	sourceRecallTerms := make([]string, 0, len(terms)+len(bareTokens))
+	seenRecallTerms := make(map[string]struct{}, len(terms)+len(bareTokens))
+	appendRecallTerm := func(term string) {
+		key := strings.ToLower(term)
+		if _, duplicate := seenRecallTerms[key]; duplicate {
+			return
+		}
+		seenRecallTerms[key] = struct{}{}
 		oneTerm := []string{term}
 		exactSourceFound := exploreQuotedRecallHasExactSourceCandidate(task, oneTerm, ordinary, scope)
 		if !exactSourceFound {
@@ -5917,6 +5928,18 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 		if !exactSourceFound {
 			sourceRecallTerms = append(sourceRecallTerms, term)
 		}
+	}
+	for _, term := range terms {
+		appendRecallTerm(term)
+	}
+	// Quoted values keep priority in the bounded term budget; mined tokens
+	// fill behind them and are subject to the same declaration-coverage test,
+	// so a token already visible in ranked metadata never triggers a scan.
+	for _, term := range bareTokens {
+		if len(sourceRecallTerms) >= exploreSourceLiteralRecallMaxTerms+2 {
+			break
+		}
+		appendRecallTerm(term)
 	}
 
 	// content_fts stores content-class nodes rather than ordinary source bodies.
