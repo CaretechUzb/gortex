@@ -730,6 +730,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	}
 
 	passStart := time.Now()
+	// The first page fetched above predates the pass clock: drop it from
+	// page_load so the interior buckets stay inside compute_loop — on a
+	// scoped pass that first fetch dominates load time and would overrun it.
+	loadElapsed = 0
 	r.logger.Info("resolver: pass start",
 		zap.Int("pending", pendingBefore),
 		zap.Int("first_page", len(pending)),
@@ -1706,11 +1710,16 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// dispatch, terminal reconcile) run serially under the resolve lock and
 	// are otherwise unlogged — this is the split used to target cold-index
 	// resolve optimisation. page_load / prepare_indexes / compute_workers /
-	// commit_apply attribute compute_loop's interior; their shortfall against
-	// it is chunk-yield gaps and loop bookkeeping. The apply_* fields split
-	// commit_apply itself — liveness reads, import-invalidation notes, the
-	// store reindex write, placeholder reconcile, guard-spool append — with
-	// the remainder being the job-apply loop and guard bookkeeping.
+	// commit_apply attribute compute_loop's interior (page_load counts
+	// in-pass fetches only); their shortfall against it is chunk-yield gaps,
+	// revision loads, the set-oriented liveness preload, deferred-LSP
+	// spooling and post-interleave index refreshes. The apply_* fields split
+	// commit_apply itself — apply_liveness times only the unknown-store
+	// fallback (the set-oriented preload runs pre-workers, outside every
+	// bucket), then import-invalidation notes, the store reindex write,
+	// placeholder reconcile, guard-spool append — with the remainder being
+	// the job-apply loop, post-reindex revision reloads and guard
+	// bookkeeping.
 	r.logger.Info("resolver: pass complete",
 		zap.Duration("total", time.Since(passStart)),
 		zap.Duration("warm_lookup", warmElapsed),
