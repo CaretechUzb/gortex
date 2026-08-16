@@ -16,6 +16,9 @@ import (
 // A page is deliberately capped by both files and encoded bytes. Facts from a
 // single source file are indivisible, but source parsing already rejects files
 // larger than maxFileBytes, so even that exception has a hard upstream bound.
+// The byte cap charges only the paged class's payloads; the imports side-fetch
+// that hydrates every non-imports page rides on top, so peak page bytes can
+// modestly exceed it.
 const (
 	tstypesFactPageFiles = 32
 	tstypesFactPageBytes = 4 << 20
@@ -173,6 +176,8 @@ const (
 	classMetas
 	classAliases
 	classCalls
+
+	factClassCount = int(classCalls) + 1
 )
 
 // marshalClassPayloads encodes one file's facts as per-class JSON arrays,
@@ -301,8 +306,8 @@ func (s *factSpool) appendFiles(records []stagedFileFacts) error {
 		end := min(start+tstypesSQLChunkRows, len(records))
 		fileValues := make([]string, 0, end-start)
 		fileArgs := make([]any, 0, (end-start)*2)
-		classValues := make([]string, 0, (end-start)*4)
-		classArgs := make([]any, 0, (end-start)*4*4)
+		classValues := make([]string, 0, (end-start)*factClassCount)
+		classArgs := make([]any, 0, (end-start)*factClassCount*4)
 		for _, record := range records[start:end] {
 			if record.facts == nil {
 				continue

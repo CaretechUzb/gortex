@@ -156,7 +156,10 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 	// Coverage walk: every staged file, no payload decode. The supers phase
 	// no longer sees files without inheritance facts, so coverage counting
 	// cannot ride on it; this walk also pre-warms the per-file node groups
-	// for all four phases.
+	// for all four phases. It is the first work under the pass deadline and
+	// flushes no edges, so an expiry during it yields a zero-edge partial —
+	// accepted because the walk is decode-free: a budget too small for it
+	// could not have completed any apply phase either.
 	after := ""
 	for {
 		if err := ctx.Err(); err != nil {
