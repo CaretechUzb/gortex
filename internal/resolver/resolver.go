@@ -844,6 +844,11 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	prepareElapsed := time.Duration(0)
 	workersElapsed := time.Duration(0)
 	applyElapsed := time.Duration(0)
+	applyLivenessElapsed := time.Duration(0)
+	applyNoteElapsed := time.Duration(0)
+	applyStoreElapsed := time.Duration(0)
+	applyPlaceholderElapsed := time.Duration(0)
+	applyGuardSpoolElapsed := time.Duration(0)
 	for {
 		if err := ctx.Err(); err != nil {
 			return resolveError(err)
@@ -995,6 +1000,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			var liveJobs resolveJobLiveness
 			validateLiveJobs := false
 			if r.validateLiveness {
+				livenessStart := time.Now()
 				switch {
 				case !pageRevisionKnown:
 					// Unknown stores cannot prove that the page stayed stable.
@@ -1004,6 +1010,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 					liveJobs = pageLiveness
 					validateLiveJobs = true
 				}
+				applyLivenessElapsed += time.Since(livenessStart)
 			}
 			reindexBatch := make([]graph.EdgeReindex, 0, resolveJobCount(perWorkerJobs))
 			for i := range perWorkerJobs {
@@ -1037,9 +1044,15 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				perWorkerJobs[i] = kept
 			}
 			if len(reindexBatch) > 0 {
+				noteStart := time.Now()
 				r.noteImportEdgeReindexes(reindexBatch)
+				applyNoteElapsed += time.Since(noteStart)
+				storeStart := time.Now()
 				r.graph.ReindexEdges(reindexBatch)
+				applyStoreElapsed += time.Since(storeStart)
+				placeholderStart := time.Now()
 				reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
+				applyPlaceholderElapsed += time.Since(placeholderStart)
 				reindexTotal += len(reindexBatch)
 				if pageRevisionKnown {
 					// Ignore this pass's own committed mutations. A later delta
@@ -1051,7 +1064,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				}
 			}
 			if guardSpoolErr == nil {
+				spoolStart := time.Now()
 				guardSpoolErr = guardSpool.appendJobs(perWorkerJobs)
+				applyGuardSpoolElapsed += time.Since(spoolStart)
 				if guardSpoolErr != nil {
 					r.logger.Error("resolver: append guard spool", zap.Error(guardSpoolErr))
 				}
@@ -1692,7 +1707,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// are otherwise unlogged — this is the split used to target cold-index
 	// resolve optimisation. page_load / prepare_indexes / compute_workers /
 	// commit_apply attribute compute_loop's interior; their shortfall against
-	// it is chunk-yield gaps, liveness validation, and loop bookkeeping.
+	// it is chunk-yield gaps and loop bookkeeping. The apply_* fields split
+	// commit_apply itself — liveness reads, import-invalidation notes, the
+	// store reindex write, placeholder reconcile, guard-spool append — with
+	// the remainder being the job-apply loop and guard bookkeeping.
 	r.logger.Info("resolver: pass complete",
 		zap.Duration("total", time.Since(passStart)),
 		zap.Duration("warm_lookup", warmElapsed),
@@ -1701,6 +1719,11 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		zap.Duration("prepare_indexes", prepareElapsed),
 		zap.Duration("compute_workers", workersElapsed),
 		zap.Duration("commit_apply", applyElapsed),
+		zap.Duration("apply_liveness", applyLivenessElapsed),
+		zap.Duration("apply_note_reindex", applyNoteElapsed),
+		zap.Duration("apply_store_reindex", applyStoreElapsed),
+		zap.Duration("apply_placeholder", applyPlaceholderElapsed),
+		zap.Duration("apply_guard_spool", applyGuardSpoolElapsed),
 		zap.Int("terminal_loaded", terminalLoaded),
 		zap.Duration("deferred_lsp", lspElapsed),
 		zap.Duration("guard", tAfterGuard.Sub(tailStart)),
