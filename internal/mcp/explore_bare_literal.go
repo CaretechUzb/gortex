@@ -21,7 +21,6 @@ const (
 
 	exploreDistinctiveBareTokenMaxTerms        = 5
 	exploreDistinctiveBareTokenMinRunes        = 4
-	exploreDistinctiveBareTokenPlainMinRunes   = 10
 	exploreDistinctiveBareTokenSegmentMinRunes = 6
 	exploreDistinctiveBareTokenScanCap         = 128
 )
@@ -80,10 +79,14 @@ func exploreDistinctiveBareTokens(task, repoPrefix string) []string {
 	}
 	for _, raw := range exploreDistinctiveBareTokenRE.FindAllString(task, exploreDistinctiveBareTokenScanCap) {
 		raw = strings.TrimRight(raw, ".")
+		// Only structurally identifier-shaped tokens qualify. Long plain words
+		// ("connection", "completion") reach gold files too, but they are hub
+		// vocabulary: their grep pages map to dozens of owners and the rows
+		// they admit displace real evidence under the bounded page.
 		structured := exploreCamelTransitionRE.MatchString(raw) ||
 			strings.Contains(raw, "_") || strings.Contains(raw, ".") ||
 			strings.ContainsAny(raw, "0123456789")
-		if !structured && utf8.RuneCountInString(raw) < exploreDistinctiveBareTokenPlainMinRunes {
+		if !structured {
 			continue
 		}
 		appendToken(raw, structured)
