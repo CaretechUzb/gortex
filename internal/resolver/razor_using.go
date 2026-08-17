@@ -151,11 +151,14 @@ func (r *Resolver) resolveRazorUsings() {
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 	}
 	if len(reindexBatch) > 0 {
-		r.noteImportEdgeReindexes(reindexBatch)
 		r.graph.ReindexEdges(reindexBatch)
 	}
 	// The marker edges were scaffolding for this pass — remove them so they do
-	// not linger as unresolved imports.
+	// not linger as unresolved imports. The removal rewrites each file's
+	// imports rows, so it must dirty the adjacency retention like any other
+	// imports-kind write; the reference retargets above cannot (references
+	// never carry an imports row).
+	r.noteImportEdgeRemovals(markerEdges)
 	for _, e := range markerEdges {
 		r.graph.RemoveEdge(e.From, e.To, e.Kind)
 	}
