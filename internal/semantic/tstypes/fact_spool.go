@@ -177,7 +177,7 @@ const (
 	classAliases
 	classCalls
 
-	factClassCount = int(classCalls) + 1
+	factClassCount = iota // 5 — auto-tracks any class added above
 )
 
 // marshalClassPayloads encodes one file's facts as per-class JSON arrays,
