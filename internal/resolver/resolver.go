@@ -658,8 +658,12 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	var pendingLoaded atomic.Int64
 	pendingTotal.Store(int64(pendingBefore))
 	terminalSkipped := 0
+	terminalLoaded := 0
+	loadElapsed := time.Duration(0)
 	streamDone := false
 	loadPendingPage := func() ([]*graph.Edge, error) {
+		loadStart := time.Now()
+		defer func() { loadElapsed += time.Since(loadStart) }()
 		for {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -681,6 +685,13 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				var skipped int
 				pending, skipped = filterTerminalSkip(pending, r.scope)
 				terminalSkipped += skipped
+			}
+			// Durably-terminal edges that still enter compute — the volume a
+			// terminal skip on this pass's shape would have saved.
+			for _, e := range pending {
+				if edgeTerminalFlag(e) {
+					terminalLoaded++
+				}
 			}
 			pendingAfter += len(pending)
 			pendingLoaded.Store(int64(pendingAfter))
@@ -719,6 +730,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	}
 
 	passStart := time.Now()
+	// The first page fetched above predates the pass clock: drop it from
+	// page_load so the interior buckets stay inside compute_loop — on a
+	// scoped pass that first fetch dominates load time and would overrun it.
+	loadElapsed = 0
 	r.logger.Info("resolver: pass start",
 		zap.Int("pending", pendingBefore),
 		zap.Int("first_page", len(pending)),
@@ -826,7 +841,18 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// origin upgrades, re-corrections of already-resolved edges).
 	reindexConversions := 0
 	reindexChurn := 0
+	churnRetargeted := 0
+	churnKindPromoted := 0
+	churnAttrsOnly := 0
 	warmElapsed := time.Duration(0)
+	prepareElapsed := time.Duration(0)
+	workersElapsed := time.Duration(0)
+	applyElapsed := time.Duration(0)
+	applyLivenessElapsed := time.Duration(0)
+	applyNoteElapsed := time.Duration(0)
+	applyStoreElapsed := time.Duration(0)
+	applyPlaceholderElapsed := time.Duration(0)
+	applyGuardSpoolElapsed := time.Duration(0)
 	for {
 		if err := ctx.Err(); err != nil {
 			return resolveError(err)
@@ -845,7 +871,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		var pageLiveness resolveJobLiveness
 		var pageDeferredLSP []deferredLSPEdge
 		if len(pending) > 0 {
+			prepareStart := time.Now()
 			sources := passIndexes.prepare(pending)
+			prepareElapsed += time.Since(prepareStart)
 			warmStart := time.Now()
 			r.warmLookupCacheWithSources(pending, sources)
 			warmElapsed += time.Since(warmStart)
@@ -872,6 +900,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				}
 			}
 
+			workersStart := time.Now()
 			workers := runtime.NumCPU()
 			if workers < 1 {
 				workers = 1
@@ -960,9 +989,11 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				}(w, scPending[start:end])
 			}
 			wg.Wait()
+			workersElapsed += time.Since(workersStart)
 			if err := ctx.Err(); err != nil {
 				return resolveError(err)
 			}
+			applyStart := time.Now()
 
 			// Apply this chunk's mutations under the lock. An edit during a PRIOR
 			// inter-chunk yield may have evicted an edge this chunk resolved;
@@ -973,6 +1004,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			var liveJobs resolveJobLiveness
 			validateLiveJobs := false
 			if r.validateLiveness {
+				livenessStart := time.Now()
 				switch {
 				case !pageRevisionKnown:
 					// Unknown stores cannot prove that the page stayed stable.
@@ -982,6 +1014,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 					liveJobs = pageLiveness
 					validateLiveJobs = true
 				}
+				applyLivenessElapsed += time.Since(livenessStart)
 			}
 			reindexBatch := make([]graph.EdgeReindex, 0, resolveJobCount(perWorkerJobs))
 			for i := range perWorkerJobs {
@@ -1001,15 +1034,29 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 						reindexConversions++
 					} else {
 						reindexChurn++
+						switch churnShape(j.oldTo, j.newTo, j.oldKind, j.kind) {
+						case churnShapeRetarget:
+							churnRetargeted++
+						case churnShapeKind:
+							churnKindPromoted++
+						default:
+							churnAttrsOnly++
+						}
 					}
 					kept = append(kept, j)
 				}
 				perWorkerJobs[i] = kept
 			}
 			if len(reindexBatch) > 0 {
+				noteStart := time.Now()
 				r.noteImportEdgeReindexes(reindexBatch)
+				applyNoteElapsed += time.Since(noteStart)
+				storeStart := time.Now()
 				r.graph.ReindexEdges(reindexBatch)
+				applyStoreElapsed += time.Since(storeStart)
+				placeholderStart := time.Now()
 				reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
+				applyPlaceholderElapsed += time.Since(placeholderStart)
 				reindexTotal += len(reindexBatch)
 				if pageRevisionKnown {
 					// Ignore this pass's own committed mutations. A later delta
@@ -1021,7 +1068,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				}
 			}
 			if guardSpoolErr == nil {
+				spoolStart := time.Now()
 				guardSpoolErr = guardSpool.appendJobs(perWorkerJobs)
+				applyGuardSpoolElapsed += time.Since(spoolStart)
 				if guardSpoolErr != nil {
 					r.logger.Error("resolver: append guard spool", zap.Error(guardSpoolErr))
 				}
@@ -1033,6 +1082,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 					}
 				}
 			}
+			applyElapsed += time.Since(applyStart)
 			for i := range perWorkerStats {
 				total.Resolved += perWorkerStats[i].Resolved
 				total.Unresolved += perWorkerStats[i].Unresolved
@@ -1424,6 +1474,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		zap.Int("reindex_batch", reindexTotal),
 		zap.Int("reindex_conversions", reindexConversions),
 		zap.Int("reindex_churn", reindexChurn),
+		zap.Int("churn_retargeted", churnRetargeted),
+		zap.Int("churn_kind_promoted", churnKindPromoted),
+		zap.Int("churn_attrs_only", churnAttrsOnly),
 		zap.Int("super_chunk", superChunk),
 		zap.Int("lsp_deferred", lspDeferred),
 		zap.Int("lsp_attempted", lspResult.attempted),
@@ -1656,11 +1709,31 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// compute loop is parallel; the tail passes (guard, Go/lang attribution,
 	// dispatch, terminal reconcile) run serially under the resolve lock and
 	// are otherwise unlogged — this is the split used to target cold-index
-	// resolve optimisation.
+	// resolve optimisation. page_load / prepare_indexes / compute_workers /
+	// commit_apply attribute compute_loop's interior (page_load counts
+	// in-pass fetches only); their shortfall against it is chunk-yield gaps,
+	// revision loads, the set-oriented liveness preload, deferred-LSP
+	// spooling and post-interleave index refreshes. The apply_* fields split
+	// commit_apply itself — apply_liveness times only the unknown-store
+	// fallback (the set-oriented preload runs pre-workers, outside every
+	// bucket), then import-invalidation notes, the store reindex write,
+	// placeholder reconcile, guard-spool append — with the remainder being
+	// the job-apply loop, post-reindex revision reloads and guard
+	// bookkeeping.
 	r.logger.Info("resolver: pass complete",
 		zap.Duration("total", time.Since(passStart)),
 		zap.Duration("warm_lookup", warmElapsed),
 		zap.Duration("compute_loop", loopElapsed),
+		zap.Duration("page_load", loadElapsed),
+		zap.Duration("prepare_indexes", prepareElapsed),
+		zap.Duration("compute_workers", workersElapsed),
+		zap.Duration("commit_apply", applyElapsed),
+		zap.Duration("apply_liveness", applyLivenessElapsed),
+		zap.Duration("apply_note_reindex", applyNoteElapsed),
+		zap.Duration("apply_store_reindex", applyStoreElapsed),
+		zap.Duration("apply_placeholder", applyPlaceholderElapsed),
+		zap.Duration("apply_guard_spool", applyGuardSpoolElapsed),
+		zap.Int("terminal_loaded", terminalLoaded),
 		zap.Duration("deferred_lsp", lspElapsed),
 		zap.Duration("guard", tAfterGuard.Sub(tailStart)),
 		zap.Duration("go_attribution", tAfterAttrib.Sub(tAfterGuard)),

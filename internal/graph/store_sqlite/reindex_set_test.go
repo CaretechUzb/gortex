@@ -210,8 +210,11 @@ func TestReindexEdgesNetCancellationAcrossSQLChunksIsNoop(t *testing.T) {
 	assert.Equal(t, "preserve", persisted[0].Meta["opaque"])
 }
 
-func TestReindexEdgesUsesRuntimeVariableBudget(t *testing.T) {
+func TestReindexEdgesResolvedConversionChunksByRows(t *testing.T) {
 	const edgeCount = 2000
+	// The resolved-conversion arm rides one json_each variable per statement,
+	// so the connection variable limit no longer shapes it: both budget
+	// extremes must produce the identical row-bounded statement count.
 	for _, variableLimit := range []int{sqliteFallbackVariableLimit, sqliteBatchVariableHardCap} {
 		t.Run(fmt.Sprintf("limit_%d", variableLimit), func(t *testing.T) {
 			store := openReindexReceiptTestStore(t)
@@ -237,9 +240,10 @@ func TestReindexEdgesUsesRuntimeVariableBudget(t *testing.T) {
 
 			stats, err := store.reindexEdgesSetOriented(batch)
 			require.NoError(t, err)
-			updateRows := batchRowsForVariableLimit(variableLimit, reindexResolvedUpdateParamsPerRow, reindexRowMaxChunkSize)
 			assert.Zero(t, stats.selectStatements, "resolved conversions must not prefetch full edge rows")
-			assert.Equal(t, (edgeCount+updateRows-1)/updateRows, stats.updateStatements)
+			wantStatements := (edgeCount + reindexRowMaxChunkSize - 1) / reindexRowMaxChunkSize
+			assert.Equal(t, wantStatements, stats.updateStatements,
+				"json_each chunks by rows, not by the connection variable limit")
 			assert.Equal(t, edgeCount, stats.updatedRows)
 			assert.Zero(t, stats.deleteStatements)
 			assert.Zero(t, stats.insertStatements)
@@ -275,12 +279,23 @@ func TestReindexInsertChunksRespectBoundArgumentBytes(t *testing.T) {
 }
 
 func TestReindexEdgesDownshiftsConnectionVariableLimit(t *testing.T) {
+	// The resolved-conversion arm no longer binds per-row variables, so the
+	// downshift is exercised through the generic simulator path: mixing
+	// conversion directions disqualifies the fast path, and the prefetch /
+	// delete / insert arms still bind bounded per-row VALUES relations that
+	// must discover and persist a lowered connection limit.
 	store := openReindexReceiptTestStore(t)
 	oldEdges := make([]*graph.Edge, 0, 120)
 	batch := make([]graph.EdgeReindex, 0, 120)
 	for i := 0; i < 120; i++ {
 		from := fmt.Sprintf("repo/caller-%03d.go::Caller", i)
 		oldTo := fmt.Sprintf("unresolved::Old%03d", i)
+		newTo := fmt.Sprintf("repo/target-%03d.go::Target", i)
+		if i%2 == 1 {
+			// Reverse conversion (guard-revert shape) breaks direction
+			// uniformity for the whole batch.
+			oldTo, newTo = newTo, oldTo
+		}
 		oldEdges = append(oldEdges, &graph.Edge{
 			From: from, To: oldTo, Kind: graph.EdgeCalls,
 			FilePath: "repo/callers.go", Line: i + 1,
@@ -288,7 +303,7 @@ func TestReindexEdgesDownshiftsConnectionVariableLimit(t *testing.T) {
 		batch = append(batch, graph.EdgeReindex{
 			OldTo: oldTo,
 			Edge: &graph.Edge{
-				From: from, To: fmt.Sprintf("repo/target-%03d.go::Target", i),
+				From: from, To: newTo,
 				Kind: graph.EdgeCalls, FilePath: "repo/callers.go", Line: i + 1,
 			},
 		})
@@ -305,14 +320,11 @@ func TestReindexEdgesDownshiftsConnectionVariableLimit(t *testing.T) {
 
 	stats, err := store.reindexEdgesSetOriented(batch)
 	require.NoError(t, err)
-	assert.Equal(t, len(batch), stats.updatedRows)
-	assert.Zero(t, stats.deletedRows)
-	assert.Zero(t, stats.insertedRows)
+	assert.Equal(t, len(batch), stats.deletedRows)
+	assert.Equal(t, len(batch), stats.insertedRows)
+	assert.Zero(t, stats.updatedRows)
 	assert.LessOrEqual(t, store.batchVariableLimit, connectionLimit)
-	assert.Zero(t, stats.selectStatements, "resolved conversions must not prefetch full edge rows")
-	assert.Greater(t, stats.updateStatements, 1, "the first oversized update must downshift and retry")
-	assert.Zero(t, stats.deleteStatements)
-	assert.Zero(t, stats.insertStatements)
+	assert.Greater(t, stats.selectStatements, 1, "the first oversized prefetch must downshift and retry")
 	assert.Equal(t, len(batch), store.EdgeCount())
 }
 
