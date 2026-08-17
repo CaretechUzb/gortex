@@ -53,15 +53,20 @@ const (
 
 	// filepath.Dir for normalized graph paths, expressed with built-in SQLite
 	// string functions so it can back an index on existing databases without
-	// materializing or backfilling another copy of the value.
+	// materializing or backfilling another copy of the value. The file
+	// segment is separator-normalized like fileDirColumnDDL so the rebind
+	// join's two sides agree on native-separator stores; changing the
+	// expression needs a schemaMigrations entry, like file_dir.
+	memberReceiverNormFileExpr = `replace(` + memberReceiverFileExpr + `, '\', '/')`
+
 	memberReceiverDirColumnDDL = `member_receiver_dir TEXT GENERATED ALWAYS AS (
     CASE WHEN kind <> 'member_of' OR instr(to_id, '::') <= 1
               OR ` + memberReceiverNameExpr + ` = '' THEN NULL
-         WHEN instr(` + memberReceiverFileExpr + `, '/') = 0 THEN '.'
-         WHEN rtrim(rtrim(` + memberReceiverFileExpr + `,
-                         replace(` + memberReceiverFileExpr + `, '/', '')), '/') = '' THEN '/'
-         ELSE rtrim(rtrim(` + memberReceiverFileExpr + `,
-                         replace(` + memberReceiverFileExpr + `, '/', '')), '/') END
+         WHEN instr(` + memberReceiverNormFileExpr + `, '/') = 0 THEN '.'
+         WHEN rtrim(rtrim(` + memberReceiverNormFileExpr + `,
+                         replace(` + memberReceiverNormFileExpr + `, '/', '')), '/') = '' THEN '/'
+         ELSE rtrim(rtrim(` + memberReceiverNormFileExpr + `,
+                         replace(` + memberReceiverNormFileExpr + `, '/', '')), '/') END
 ) VIRTUAL`
 )
 
@@ -208,11 +213,20 @@ const isStubColumnDDL = `is_stub INTEGER GENERATED ALWAYS AS (
 // column. It adds no row payload and is migration-safe on populated stores;
 // the receiver-rebind join uses it to seek directly to Go types/interfaces in
 // the phantom receiver's package instead of loading every type into memory.
+// Stored paths keep the writing platform's native separators below the repo
+// prefix, so the expression normalizes '\' to '/' before trimming — the SQL
+// mirror of graphpath.Norm + Dir. Without it a Windows-written store
+// collapses every file_dir to the repo prefix and the rebind join
+// degenerates from "same package dir" to "same repo". Changing this
+// expression needs a schemaMigrations entry: a generated column on an
+// existing store is rebuilt, never altered in place.
+const fileDirSourceExpr = `replace(file_path, '\', '/')`
+
 const fileDirColumnDDL = `file_dir TEXT GENERATED ALWAYS AS (
     CASE WHEN file_path = '' THEN NULL
-         WHEN instr(file_path, '/') = 0 THEN '.'
-         WHEN rtrim(rtrim(file_path, replace(file_path, '/', '')), '/') = '' THEN '/'
-         ELSE rtrim(rtrim(file_path, replace(file_path, '/', '')), '/') END
+         WHEN instr(` + fileDirSourceExpr + `, '/') = 0 THEN '.'
+         WHEN rtrim(rtrim(` + fileDirSourceExpr + `, replace(` + fileDirSourceExpr + `, '/', '')), '/') = '' THEN '/'
+         ELSE rtrim(rtrim(` + fileDirSourceExpr + `, replace(` + fileDirSourceExpr + `, '/', '')), '/') END
 ) VIRTUAL`
 
 // nodeGeneratedColumns is the nodes-table sibling of edgeGeneratedColumns.

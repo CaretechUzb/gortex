@@ -9,8 +9,8 @@ import (
 )
 
 func TestOpenV10AddsSymbolFTSStateWithoutRebuildingCorpus(t *testing.T) {
-	if currentSchemaVersion != 11 {
-		t.Fatalf("currentSchemaVersion = %d, want 11 for the symbol FTS state migration", currentSchemaVersion)
+	if currentSchemaVersion < 11 {
+		t.Fatalf("currentSchemaVersion = %d, want >= 11 for the symbol FTS state migration", currentSchemaVersion)
 	}
 	var v11 *schemaMigration
 	for i := range schemaMigrations {
