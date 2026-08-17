@@ -1,9 +1,35 @@
 package lsp
 
 import (
+	"strings"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/semantic"
 )
+
+// viewPathKey normalizes a graph file path for nodesByFile keying and
+// comparisons. Store vintages carry both separator spellings — older
+// Windows rows use `\` after the repo prefix while newer rows and every
+// URI-derived path use `/` — so any join between a server answer and a
+// node path must use the slash-normalized spelling. Mirrors the store's
+// own file_dir separator normalization.
+func viewPathKey(p string) string { return strings.ReplaceAll(p, `\`, "/") }
+
+// storePathSpellings returns the scoped-path spellings a store row may
+// carry for a repo-relative path: the slash spelling plus, when the rel
+// has separators, the backslash spelling older Windows rows use. Store
+// lookups by file_path are exact string matches, so a URI-derived
+// slash-relative path must query both.
+func storePathSpellings(repoPrefix, rel string) []string {
+	if rel == "" {
+		return nil
+	}
+	spellings := []string{scopedPath(repoPrefix, rel)}
+	if back := strings.ReplaceAll(rel, "/", `\`); back != rel {
+		spellings = append(spellings, scopedPath(repoPrefix, back))
+	}
+	return spellings
+}
 
 type lspEdgeKey struct {
 	from     string
@@ -46,24 +72,26 @@ func (v *lspGraphView) addNodes(nodes []*graph.Node) {
 		}
 		if old, exists := v.nodesByID[n.ID]; exists {
 			v.nodesByID[n.ID] = n
-			bucket := v.nodesByFile[old.FilePath]
+			oldKey, newKey := viewPathKey(old.FilePath), viewPathKey(n.FilePath)
+			bucket := v.nodesByFile[oldKey]
 			for i, candidate := range bucket {
 				if candidate.ID != n.ID {
 					continue
 				}
-				if old.FilePath == n.FilePath {
+				if oldKey == newKey {
 					bucket[i] = n
-					v.nodesByFile[old.FilePath] = bucket
+					v.nodesByFile[oldKey] = bucket
 				} else {
-					v.nodesByFile[old.FilePath] = append(bucket[:i], bucket[i+1:]...)
-					v.nodesByFile[n.FilePath] = append(v.nodesByFile[n.FilePath], n)
+					v.nodesByFile[oldKey] = append(bucket[:i], bucket[i+1:]...)
+					v.nodesByFile[newKey] = append(v.nodesByFile[newKey], n)
 				}
 				break
 			}
 			continue
 		}
 		v.nodesByID[n.ID] = n
-		v.nodesByFile[n.FilePath] = append(v.nodesByFile[n.FilePath], n)
+		key := viewPathKey(n.FilePath)
+		v.nodesByFile[key] = append(v.nodesByFile[key], n)
 	}
 }
 
@@ -83,6 +111,7 @@ func (v *lspGraphView) addEdges(edges []*graph.Edge) {
 }
 
 func (v *lspGraphView) matchNodeByFileLine(filePath string, line int) *graph.Node {
+	filePath = viewPathKey(filePath)
 	var best *graph.Node
 	bestSize := int(^uint(0) >> 1)
 	for _, n := range v.nodesByFile[filePath] {
@@ -118,6 +147,7 @@ func (v *lspGraphView) matchNodeByFileLine(filePath string, line int) *graph.Nod
 }
 
 func (v *lspGraphView) matchCallableByFileLine(filePath string, line int) *graph.Node {
+	filePath = viewPathKey(filePath)
 	callable := func(k graph.NodeKind) bool {
 		return k == graph.KindFunction || k == graph.KindMethod || k == graph.KindClosure
 	}
@@ -156,6 +186,7 @@ func (v *lspGraphView) matchCallableByFileLine(filePath string, line int) *graph
 }
 
 func (v *lspGraphView) findDeclarationNode(filePath string, oneBasedLine int, name string) *graph.Node {
+	filePath = viewPathKey(filePath)
 	var near *graph.Node
 	for _, n := range v.nodesByFile[filePath] {
 		if n == nil || n.Name != name {

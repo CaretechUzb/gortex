@@ -125,13 +125,14 @@ func (p *Provider) groupConfirmTargets(nodesByID map[string]*graph.Node, targets
 // containment in the caller's span. Pure over its inputs, so it is safe to call
 // from the parallel sweep.
 func (p *Provider) confirmRefMatchesSite(refs []Location, absRoot, repoPrefix string, t enrichTarget) bool {
-	callerRel := nodeRelPath(t.node)
-	siteRel := edgeSiteRelPath(t.edge, repoPrefix, callerRel)
+	callerRel := viewPathKey(nodeRelPath(t.node))
+	siteRel := viewPathKey(edgeSiteRelPath(t.edge, repoPrefix, callerRel))
 	siteLine := t.edge.Line
 	for _, ref := range refs {
 		// uriToPath returns a repo-relative path while node/edge FilePaths are
-		// prefixed, so compare against stripped paths.
-		refPath := uriToPath(ref.URI, absRoot)
+		// prefixed, so compare against stripped paths — slash-normalized, since
+		// store rows may spell separators either way.
+		refPath := viewPathKey(uriToPath(ref.URI, absRoot))
 		refLine := ref.Range.Start.Line + 1
 		if siteLine > 0 {
 			if refPath == siteRel && refLine >= siteLine-1 && refLine <= siteLine+1 {
