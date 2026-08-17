@@ -58,6 +58,28 @@ func TestCSharpSolutionForEnvIgnoredOutsideRoot(t *testing.T) {
 		"absolute env path outside the root must fall through to auto-detect")
 }
 
+func TestCSharpSolutionForListPinsPerRoot(t *testing.T) {
+	// One daemon-global value, several tracked repos: a path-list entry
+	// (PATH-style separator) pins each root via the first entry that
+	// resolves inside it.
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	writeSolutionFile(t, rootA, filepath.Join("projects", "All.slnx"))
+	writeSolutionFile(t, rootA, "Extra.sln") // multi-solution: no auto-pick
+	writeSolutionFile(t, rootB, filepath.Join("src", "Other.sln"))
+	writeSolutionFile(t, rootB, "Extra.sln")
+
+	t.Setenv(CSharpSolutionEnv,
+		filepath.Join("projects", "All.slnx")+string(os.PathListSeparator)+filepath.Join("src", "Other.sln"))
+	assert.Equal(t, filepath.Join("projects", "All.slnx"), csharpSolutionFor(rootA))
+	assert.Equal(t, filepath.Join("src", "Other.sln"), csharpSolutionFor(rootB))
+
+	// A root where no entry resolves still falls through to auto-detect.
+	rootC := t.TempDir()
+	writeSolutionFile(t, rootC, "Only.sln")
+	assert.Equal(t, "Only.sln", csharpSolutionFor(rootC))
+}
+
 func TestCSharpSolutionForAutoDetect(t *testing.T) {
 	t.Setenv(CSharpSolutionEnv, "")
 

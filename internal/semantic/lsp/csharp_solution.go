@@ -7,13 +7,15 @@ import (
 )
 
 // CSharpSolutionEnv names the solution file csharp-ls should load and the C#
-// pre-restore should target — relative to the workspace root, or absolute
-// inside it. The variable is daemon-global while solutions are per-workspace,
-// so a value that does not resolve inside a given root is ignored for that
-// root: one setting serves a multi-repo daemon without breaking the repos it
-// does not name. Empty (the default) auto-detects: a workspace root carrying
-// exactly one .sln/.slnx uses it; anything else keeps the server's own
-// discovery.
+// pre-restore should target — a PATH-style list of candidates (relative to
+// the workspace root, or absolute inside it), each root using the first
+// entry that resolves inside it. The variable is daemon-global while
+// solutions are per-workspace, so per-root resolution is what makes one
+// setting serve a multi-repo daemon: entries that do not resolve inside a
+// given root are ignored for that root, and several repos with different
+// solutions each pick their own entry. Empty (the default), or no entry
+// resolving, auto-detects: a workspace root carrying exactly one .sln/.slnx
+// uses it; anything else keeps the server's own discovery.
 const CSharpSolutionEnv = "GORTEX_LSP_CSHARP_SOLUTION"
 
 // isCSharpLSCommand reports whether a resolved LSP command is csharp-ls,
@@ -29,13 +31,17 @@ func isCSharpLSCommand(command string) bool {
 // file name for an auto-detected root solution; both resolve against the
 // server's working directory, which is the workspace root.
 func csharpSolutionFor(workspaceRoot string) string {
-	if env := strings.TrimSpace(os.Getenv(CSharpSolutionEnv)); env != "" {
-		abs := env
+	for _, entry := range strings.Split(os.Getenv(CSharpSolutionEnv), string(os.PathListSeparator)) {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		abs := entry
 		if !filepath.IsAbs(abs) {
-			abs = filepath.Join(workspaceRoot, env)
+			abs = filepath.Join(workspaceRoot, entry)
 		}
 		if pathInsideRoot(workspaceRoot, abs) && solutionFileExists(abs) {
-			return env
+			return entry
 		}
 	}
 	entries, err := os.ReadDir(workspaceRoot)
