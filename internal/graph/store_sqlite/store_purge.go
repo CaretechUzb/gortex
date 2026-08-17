@@ -30,12 +30,12 @@ import (
 // column a plain `DELETE ... WHERE repo_prefix = ?` keys on. The two FTS5
 // vtables (symbol_fts, content_fts) carry repo_prefix UNINDEXED, so their
 // delete is a full scan — acceptable for a purge (a rare, whole-repo op),
-// unlike the per-edit hot path. `vectors` is deliberately absent: it has NO
-// repo_prefix column (keyed by node_id alone), so PurgeRepo deletes its rows
-// by node-id membership instead (see deleteByIDColumnsTx below).
+// unlike the per-edit hot path. Vectors are repo-keyed too; deleting them by
+// repo_prefix is essential because synthetic chunk IDs are not graph node IDs.
 var purgeSidecarTables = []string{
 	"file_mtimes",
 	"repo_index_state",
+	"symbol_fts_state",
 	"enrichment_state",
 	"contract_state",
 	"semantic_binding_types",
@@ -44,6 +44,7 @@ var purgeSidecarTables = []string{
 	"constant_values",
 	"files",
 	"ref_facts",
+	"vectors",
 	"churn_enrichment",
 	"coverage_enrichment",
 	"release_enrichment",
@@ -92,11 +93,10 @@ func (s *Store) PurgeRepo(prefix string) error {
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
-	// Collect this repo's node IDs first: edges and vectors are keyed off
-	// them (edges by from_id/to_id, vectors by node_id — neither carries a
-	// repo_prefix column). Edge deletion semantics mirror scope eviction's
-	// (store.go): delete every edge touching one of these nodes, then the
-	// nodes themselves.
+	// Collect this repo's node IDs first for edge deletion. Vectors are removed
+	// below by repo_prefix so synthetic chunk rows are covered too. Edge deletion
+	// semantics mirror scope eviction's (store.go): delete every edge touching
+	// one of these nodes, then the nodes themselves.
 	ids, err := repoNodeIDsTx(tx, prefix)
 	if err != nil {
 		return err
@@ -104,10 +104,6 @@ func (s *Store) PurgeRepo(prefix string) error {
 	if err := deleteByIDColumnsTx(tx, "edges", []string{"from_id", "to_id"}, ids); err != nil {
 		return fmt.Errorf("store_sqlite: PurgeRepo edges: %w", err)
 	}
-	if err := deleteByIDColumnsTx(tx, "vectors", []string{"node_id"}, ids); err != nil {
-		return fmt.Errorf("store_sqlite: PurgeRepo vectors: %w", err)
-	}
-
 	changed := len(ids) > 0
 	for _, table := range purgeSidecarTables {
 		res, err := tx.Exec(`DELETE FROM `+table+` WHERE repo_prefix = ?`, prefix)
@@ -138,23 +134,22 @@ func (s *Store) PurgeRepo(prefix string) error {
 }
 
 // orphanScanTables are the tables OrphanRepoPrefixes unions DISTINCT
-// repo_prefix over. These six span the residue space: nodes (the primary
-// keyed store), file_mtimes + repo_index_state (the warm-restart provenance
-// that lingers when nodes are gone but sidecars survive — the exact shape a
-// leaked untrack leaves), enrichment_state (per-provider provenance), files
-// (per-file metadata), and semantic_binding_types (compiler-derived contract
-// bindings). A prefix whose nodes are gone but whose
-// sidecars remain is invisible to a nodes-only scan, which is why the
-// sidecar tables are unioned in; scanning still more tables would only
-// rediscover the same prefixes at higher cost.
+// repo_prefix over. They span the primary graph, warm-restart provenance,
+// enrichment/file metadata, compiler-derived bindings, clone corpus state,
+// and durable vectors. Vector coverage matters because a failed legacy
+// untrack can leave only synthetic chunk rows after graph nodes are gone.
+// A prefix whose nodes are gone but whose sidecars remain is invisible to a
+// nodes-only scan, which is why the sidecar tables are unioned in.
 var orphanScanTables = []string{
 	"nodes",
 	"file_mtimes",
 	"repo_index_state",
+	"symbol_fts_state",
 	"enrichment_state",
 	"files",
 	"semantic_binding_types",
 	"clone_corpus_state",
+	"vectors",
 }
 
 // OrphanRepoPrefixes returns every repo_prefix present in the store but
@@ -310,11 +305,28 @@ func (s *Store) RekeyRepoPrefix(oldPrefix, newPrefix string) error {
 			changed = true
 		}
 	}
-	// vectors is intentionally omitted: it has NO repo_prefix column (keyed
-	// by node_id alone), so it cannot be addressed here by prefix. Any ''
-	// embeddings are node_id-keyed against now-evicted unprefixed ids —
-	// dangling, and absent in the common case (embeddings are opt-in). They
-	// are left to a node-membership vector GC rather than guessed at here.
+	// The symbol FTS corpus above is dropped rather than relabeled because its
+	// node IDs change. Invalidate both possible markers in the same transaction:
+	// moving the old marker would falsely certify the now-empty destination,
+	// while retaining a prior destination marker would do the same after merge.
+	stateRes, err := tx.Exec(`DELETE FROM symbol_fts_state WHERE repo_prefix IN (?, ?)`, oldPrefix, newPrefix)
+	if err != nil {
+		return fmt.Errorf("store_sqlite: RekeyRepoPrefix invalidate symbol FTS normalization: %w", err)
+	}
+	if n, rowsErr := stateRes.RowsAffected(); rowsErr == nil && n > 0 {
+		changed = true
+	}
+	// Vectors are handled explicitly instead of joining rekeyDropTables because
+	// that shared list is also used by the historical v6→v7 migration, whose
+	// vector schema predates repo_prefix. At the current schema the old node and
+	// parent IDs cannot be relabeled safely, so drop the complete old corpus.
+	res, err := tx.Exec(`DELETE FROM vectors WHERE repo_prefix = ?`, oldPrefix)
+	if err != nil {
+		return fmt.Errorf("store_sqlite: RekeyRepoPrefix drop vectors: %w", err)
+	}
+	if n, rowsErr := res.RowsAffected(); rowsErr == nil && n > 0 {
+		changed = true
+	}
 
 	if err := tx.Commit(); err != nil {
 		return err

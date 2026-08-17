@@ -40,23 +40,21 @@ func TestResolveSearchBackend_SymbolSearcherBackend(t *testing.T) {
 	assert.Equal(t, "sqlite-fts5", info.Name)
 	assert.True(t, info.DiskResident, "the FTS5 index lives inside the graph store, not in-process heap")
 	assert.Zero(t, info.Bytes, "no fabricated byte count for a disk-resident backend")
-	// Count() is a since-construction Add/Remove delta, not a corpus size —
-	// it goes negative as soon as an eviction path drops more than the admit
-	// predicate ever added. A store that cannot answer the real count must
-	// leave the figure unreported rather than have the delta stand in for it.
-	assert.False(t, info.DocCountKnown, "the delta must never be reported as a document count")
+	// Add and Remove are no-ops because the native store owns the corpus.
+	// A store that cannot answer the authoritative count must leave the figure
+	// unreported rather than fabricate an adapter-local document count.
+	assert.False(t, info.DocCountKnown, "an unavailable count must remain unknown")
 	assert.Zero(t, info.DocCount)
 }
 
 func TestResolveSearchBackend_SymbolSearcherBackend_CountFromIndex(t *testing.T) {
-	// Adds and removes move the adapter's delta. Count combines that delta
-	// with the persisted baseline, while status still reports the index's own
-	// authoritative count.
+	// Adds and removes are no-ops. Count and status both report the native
+	// index's authoritative corpus size without duplicating write-path deltas.
 	b := search.NewSymbolSearcherBackend(countingSymbolSearcher{count: 48572})
 	b.Add("node-1")
 	b.Remove("node-2")
 	b.Remove("node-3")
-	assert.Equal(t, 48571, b.Count(), "Count must combine the persisted baseline with the adapter delta")
+	assert.Equal(t, 48572, b.Count(), "Count must come from the native index")
 
 	info := resolveSearchBackend(b)
 
@@ -72,6 +70,29 @@ func TestResolveSearchBackend_SymbolSearcherBackend_ThroughSwappable(t *testing.
 
 	assert.Equal(t, "sqlite-fts5", info.Name)
 	assert.True(t, info.DiskResident)
+}
+
+func TestResolveSearchBackend_NullBackend(t *testing.T) {
+	// A store with no native symbol search carries the null text backend.
+	// Status must name it, not report it as an unrecognised backend: the
+	// difference between "nothing is indexing text here" and "we could not
+	// identify what is" is exactly what a user reads this row for.
+	info := resolveSearchBackend(search.NewNull())
+
+	assert.Equal(t, "none", info.Name)
+	assert.False(t, info.DiskResident, "there is no index on disk either")
+	assert.Zero(t, info.Bytes)
+	assert.True(t, info.DocCountKnown, "zero documents is a known count, not an unanswerable one")
+	assert.Zero(t, info.DocCount)
+}
+
+func TestRenderDaemonHeader_SearchBackendRow_NullBackend(t *testing.T) {
+	st := sampleStatus()
+	st.SearchBackend = daemon.SearchBackendStats{Name: "none", DocCountKnown: true}
+	var buf bytes.Buffer
+	renderDaemonHeader(&buf, st)
+	assert.Contains(t, buf.String(), "none  docs=0  heap=0 B",
+		"an empty backend still gets a row, with its zeros stated plainly")
 }
 
 func TestRenderDaemonHeader_SearchBackendRow_SymbolSearcher(t *testing.T) {

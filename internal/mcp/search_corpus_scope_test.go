@@ -57,7 +57,7 @@ func newWorkspaceRootBoundServer(t *testing.T) (s *Server, root string) {
 
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewGoExtractor())
-	mi := indexer.NewMultiIndexer(store, reg, search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(store, reg, search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 

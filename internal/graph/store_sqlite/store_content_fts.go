@@ -502,7 +502,7 @@ func (s *Store) SearchContent(query, repoPrefix string, limit int) ([]graph.Cont
 	if limit <= 0 {
 		limit = 20
 	}
-	match := s.buildFTSMatch(query)
+	match := s.buildFTSMatch(query, false)
 	if match == "" {
 		return nil, nil
 	}

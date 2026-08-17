@@ -73,24 +73,6 @@ type daemonState struct {
 	backendPath string
 }
 
-// lspDisabledSet builds the set of LSP spec names that should NOT be
-// auto-registered by Router.RegisterAvailable. Two inputs are merged:
-//
-//  1. Per-spec config overrides — any entry in `semantic.providers`
-//     with `enabled: false` whose name matches a known LSP spec.
-//     Already-disabled-by-config users keep their opt-out without
-//     having to also set the env var.
-//  2. The GORTEX_LSP_DISABLE env var — comma-separated spec names.
-//     The literal value "all" or "*" disables auto-registration
-//     entirely (the explicit-config loop above still runs).
-//
-// The special key "__all__" in the returned map signals
-// "skip auto-register everywhere" and is checked separately by
-// callers; per-spec keys carry the spec.Name.
-func lspDisabledSet(providers []config.SemanticProviderConfig, envVar string) map[string]bool {
-	return serverstack.LspDisabledSet(providers, envVar)
-}
-
 // buildDaemonState builds the daemon's stack through the shared
 // serverstack constructor and returns the long-lived daemonState the
 // warmup loop and controller share.
@@ -106,14 +88,13 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	applyToolPresetFlags(cfg, daemonTools, daemonToolsMode)
 
 	ss, err := serverstack.NewSharedServer(serverstack.SharedServerConfig{
-		Lifecycle:    serverstack.LifecycleDaemon,
-		Backend:      daemonBackend,
-		BackendPath:  daemonBackendPath,
-		BufferPoolMB: resolveDaemonBufferPoolMB(),
-		Config:       cfg,
-		Global:       gc,
-		Logger:       logger,
-		Version:      version,
+		Lifecycle:   serverstack.LifecycleDaemon,
+		Backend:     daemonBackend,
+		BackendPath: daemonBackendPath,
+		Config:      cfg,
+		Global:      gc,
+		Logger:      logger,
+		Version:     version,
 		Embedder: serverstack.EmbedderRequest{
 			FlagChanged: daemonEmbeddingsChanged,
 			FlagEnabled: daemonEmbeddings,

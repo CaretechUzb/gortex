@@ -1,115 +1,12 @@
 package agents
 
 import (
-	"bytes"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
-
-// TestAppendInstructions_CreateThenSkip pins the behaviour every
-// doc-aware adapter depends on: first call creates the file, second
-// call with the same body is a no-op ActionSkip. If this regresses,
-// running `gortex init` twice would append the block twice to every
-// agent's rules file — the user-visible pain we extracted this helper
-// to eliminate.
-func TestAppendInstructions_CreateThenSkip(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "nested", "rules.md")
-
-	var buf bytes.Buffer
-	action, err := AppendInstructions(&buf, path, InstructionsBody, InstructionsSentinel, ApplyOpts{})
-	require.NoError(t, err)
-	assert.Equal(t, ActionCreate, action.Action)
-
-	contents, err := os.ReadFile(path)
-	require.NoError(t, err)
-	assert.Contains(t, string(contents), InstructionsSentinel,
-		"first write must land the full sentinel-bearing block")
-
-	// Second call is idempotent — no duplicate append.
-	action, err = AppendInstructions(&buf, path, InstructionsBody, InstructionsSentinel, ApplyOpts{})
-	require.NoError(t, err)
-	assert.Equal(t, ActionSkip, action.Action)
-	assert.Equal(t, "block-present", action.Reason)
-
-	after, err := os.ReadFile(path)
-	require.NoError(t, err)
-	assert.Equal(t, len(contents), len(after),
-		"second call must not grow the file")
-}
-
-// TestAppendInstructions_PreservesExistingContent guards the merge
-// path — the helper must not clobber a hand-written file, it must
-// append the block after the user's content with a blank-line gap.
-func TestAppendInstructions_PreservesExistingContent(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "AGENTS.md")
-	existing := "# Team conventions\n\nUse tabs, not spaces.\n"
-	require.NoError(t, os.WriteFile(path, []byte(existing), 0o644))
-
-	action, err := AppendInstructions(nil, path, InstructionsBody, InstructionsSentinel, ApplyOpts{})
-	require.NoError(t, err)
-	assert.Equal(t, ActionMerge, action.Action)
-
-	data, err := os.ReadFile(path)
-	require.NoError(t, err)
-	text := string(data)
-
-	assert.True(t, strings.HasPrefix(text, existing),
-		"user content must remain at the top of the file")
-	assert.Contains(t, text, InstructionsSentinel,
-		"block must be appended below the user's content")
-}
-
-// TestAppendInstructions_SharedSentinelAcrossAdapters is the scenario
-// that matters when two adapters target the same file (Codex and
-// Opencode both write AGENTS.md). The second adapter must detect the
-// first adapter's write via the shared InstructionsSentinel and skip,
-// rather than duplicating the block. This is why the sentinel lives
-// in the shared package, not each adapter.
-func TestAppendInstructions_SharedSentinelAcrossAdapters(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "AGENTS.md")
-
-	// Simulate Codex writing first.
-	_, err := AppendInstructions(nil, path, InstructionsBody, InstructionsSentinel, ApplyOpts{})
-	require.NoError(t, err)
-
-	// Simulate Opencode running afterwards against the same repo.
-	action, err := AppendInstructions(nil, path, InstructionsBody, InstructionsSentinel, ApplyOpts{})
-	require.NoError(t, err)
-	assert.Equal(t, ActionSkip, action.Action,
-		"second adapter targeting the same file must skip, not append again")
-}
-
-// TestAppendInstructions_DryRunReportsAction verifies --dry-run never
-// touches the filesystem and reports ActionWouldCreate / ActionWouldMerge
-// correctly. Users rely on the planning output to preview what init
-// will do; a silent write during dry-run would be a real footgun.
-func TestAppendInstructions_DryRunReportsAction(t *testing.T) {
-	dir := t.TempDir()
-	newPath := filepath.Join(dir, "NEW.md")
-	existingPath := filepath.Join(dir, "EXISTING.md")
-	require.NoError(t, os.WriteFile(existingPath, []byte("preexisting\n"), 0o644))
-
-	action, err := AppendInstructions(nil, newPath, InstructionsBody, InstructionsSentinel, ApplyOpts{DryRun: true})
-	require.NoError(t, err)
-	assert.Equal(t, ActionWouldCreate, action.Action)
-	_, err = os.Stat(newPath)
-	assert.True(t, os.IsNotExist(err), "dry-run must not create the file")
-
-	action, err = AppendInstructions(nil, existingPath, InstructionsBody, InstructionsSentinel, ApplyOpts{DryRun: true})
-	require.NoError(t, err)
-	assert.Equal(t, ActionWouldMerge, action.Action)
-	data, _ := os.ReadFile(existingPath)
-	assert.Equal(t, "preexisting\n", string(data),
-		"dry-run must not mutate an existing file")
-}
 
 // TestCursorMDCFrontmatter proves the MDC wrapper emits the two keys
 // Cursor needs — `description` so users can see the rule in the UI

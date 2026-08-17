@@ -37,7 +37,7 @@ func (a *Adapter) DocsURL() string { return DocsURL }
 
 // aiderIgnoreLines is the set of cache paths Aider should never
 // ingest as source. Keeping them out of the chat avoids wasting
-// tokens on Gortex's own binary index and Bleve scorer data.
+// tokens on Gortex's own graph store and cache artifacts.
 var aiderIgnoreLines = []string{
 	"# Added by `gortex init` — Gortex cache artifacts are not source",
 	".gortex/",

@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -41,12 +40,6 @@ const (
 	// project slug doesn't (e.g. monorepo missing the named project).
 	ErrCodeProjectUnknown ErrorCode = "project_unknown"
 
-	// ErrCodeCrossWorkspaceDenied — the source workspace's
-	// `cross_workspace_deps` doesn't declare the target workspace
-	// (or the import path doesn't match a declared module). The
-	// query is refused at the matcher / resolver boundary.
-	ErrCodeCrossWorkspaceDenied ErrorCode = "cross_workspace_denied"
-
 	// ErrCodeRepoNotTracked — the cwd wasn't found in any tracked
 	// repo's root tree. Used by the daemon's MCP front-door.
 	ErrCodeRepoNotTracked ErrorCode = "repo_not_tracked"
@@ -54,6 +47,10 @@ const (
 	// ErrCodeSymbolNotFound — the requested symbol id is not in the
 	// index. Recoverable: the agent can search for it instead.
 	ErrCodeSymbolNotFound ErrorCode = "symbol_not_found"
+
+	// ErrCodeSymbolNotIndexed — the symbol's file exists and is in scope but
+	// carries no indexed symbols, so semantic rename cannot see it.
+	ErrCodeSymbolNotIndexed ErrorCode = "symbol_not_indexed"
 
 	// ErrCodeFileNotIndexed — no symbols are indexed for the requested
 	// file (new / ignored / unsupported language). Recoverable.
@@ -164,69 +161,3 @@ func newStructuredErrorResult(err StructuredError, explicitRetriable bool) *mcp.
 	res.IsError = true
 	return res
 }
-
-// Common constructors for the codes above so handlers can call
-// `mcp.WorkspaceUnknownError(slug)` instead of building structs by
-// hand.
-
-func WorkspaceUnknownError(workspace string) *mcp.CallToolResult {
-	return NewStructuredErrorResult(StructuredError{
-		ErrorCode: ErrCodeWorkspaceUnknown,
-		Message:   fmt.Sprintf("workspace %q is not known to this server", workspace),
-		Retriable: false,
-		Data:      map[string]any{"workspace": workspace},
-	})
-}
-
-func ProjectUnknownError(workspace, project string) *mcp.CallToolResult {
-	return NewStructuredErrorResult(StructuredError{
-		ErrorCode: ErrCodeProjectUnknown,
-		Message:   fmt.Sprintf("project %q does not exist in workspace %q", project, workspace),
-		Retriable: false,
-		Data:      map[string]any{"workspace": workspace, "project": project},
-	})
-}
-
-func CrossWorkspaceDeniedError(source, target, importPath string) *mcp.CallToolResult {
-	msg := fmt.Sprintf("cross-workspace access from %q to %q is not declared in cross_workspace_deps", source, target)
-	if importPath != "" {
-		msg = fmt.Sprintf("%s (import path %q)", msg, importPath)
-	}
-	return NewStructuredErrorResult(StructuredError{
-		ErrorCode: ErrCodeCrossWorkspaceDenied,
-		Message:   msg,
-		Retriable: false,
-		Data: map[string]any{
-			"source_workspace": source,
-			"target_workspace": target,
-			"import_path":      importPath,
-		},
-	})
-}
-
-// AsStructuredError unwraps a typed error from the package's known
-// sentinel set, returning a CallToolResult on hit. Returns (nil,
-// false) when err isn't one of the recognised sentinels — caller
-// falls back to its own error handling.
-func AsStructuredError(err error) (*mcp.CallToolResult, bool) {
-	if err == nil {
-		return nil, false
-	}
-	// Future: extend with errors.Is checks for daemon.Err* sentinels
-	// once the daemon's errors are imported here. For now we only
-	// match generic shapes used by handlers.
-	switch {
-	case errors.Is(err, errInvalidArgument):
-		return NewStructuredErrorResult(StructuredError{
-			ErrorCode: ErrCodeInvalidArgument,
-			Message:   err.Error(),
-		}), true
-	}
-	return nil, false
-}
-
-// errInvalidArgument is the canonical sentinel a tool can return when
-// its args fail validation; AsStructuredError converts it to the
-// structured form. Wrapping (`fmt.Errorf("%w: ...", errInvalidArgument)`)
-// is supported via errors.Is.
-var errInvalidArgument = errors.New("invalid argument")

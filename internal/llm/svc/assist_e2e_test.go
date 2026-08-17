@@ -141,9 +141,9 @@ func TestE2E_AssistAgainstRealModel(t *testing.T) {
 		t.Logf("VERDICT(hash-passwords): kept HashPassword=%v, dropped hashDiagnostics=%v", kept, dropped)
 	})
 
-	t.Run("VerifyRelevance_BM25", func(t *testing.T) {
-		query := "how does the BM25 search rank symbols"
-		cands := verifyBM25Scenario()
+	t.Run("VerifyRelevance_SymbolSearch", func(t *testing.T) {
+		query := "how does symbol search rank results"
+		cands := verifySymbolSearchScenario()
 		t0 := time.Now()
 		got, err := svcInst.VerifyRelevance(ctx, query, cands)
 		t.Logf("VerifyRelevance %q → kept=%v dropped=%d (%v)", query, got.Keep, len(cands)-len(got.Keep), time.Since(t0))
@@ -152,11 +152,11 @@ func TestE2E_AssistAgainstRealModel(t *testing.T) {
 		}
 		assertVerifySubset(t, got.Keep, cands)
 
-		expectKept := "real.NewBM25"
+		expectKept := "real.NewSymbolSearcherBackend"
 		expectDropped := "synthetic.unrelated.parseTSConfig"
 		kept := containsID(got.Keep, expectKept)
 		dropped := !containsID(got.Keep, expectDropped)
-		t.Logf("VERDICT(BM25): kept NewBM25=%v, dropped parseTSConfig=%v", kept, dropped)
+		t.Logf("VERDICT(symbol-search): kept NewSymbolSearcherBackend=%v, dropped parseTSConfig=%v", kept, dropped)
 	})
 }
 
@@ -244,39 +244,36 @@ func verifyHashPasswordsScenario() []llm.VerifyCandidate {
 	}
 }
 
-// verifyBM25Scenario tests the model's ability to keep the genuine
-// BM25 ranking implementation while dropping unrelated parsers /
+// verifySymbolSearchScenario tests the model's ability to keep the
+// genuine symbol-search ranking path while dropping unrelated parsers /
 // fixtures.
-func verifyBM25Scenario() []llm.VerifyCandidate {
+func verifySymbolSearchScenario() []llm.VerifyCandidate {
 	return []llm.VerifyCandidate{
 		{
-			ID:        "real.NewBM25",
-			Name:      "NewBM25",
-			Signature: "func NewBM25() *BM25Backend",
-			Body: `func NewBM25() *BM25Backend {
-	return &BM25Backend{
-		inverted: make(map[string][]posting),
-		bigrams:  make(map[string]map[string]struct{}),
-		docs:     make(map[string]doc),
-	}
+			ID:        "real.NewSymbolSearcherBackend",
+			Name:      "NewSymbolSearcherBackend",
+			Signature: "func NewSymbolSearcherBackend(s graph.SymbolSearcher) *SymbolSearcherBackend",
+			Body: `func NewSymbolSearcherBackend(s graph.SymbolSearcher) *SymbolSearcherBackend {
+	return &SymbolSearcherBackend{s: s}
 }`,
 			Callers: []llm.CallerInfo{
 				{Name: "indexer.New", Signature: "func New(g *graph.Graph, ...) *Indexer"},
 			},
 		},
 		{
-			ID:        "real.BM25Backend.Search",
+			ID:        "real.SymbolSearcherBackend.Search",
 			Name:      "Search",
-			Signature: "func (b *BM25Backend) Search(query string, limit int) []scored",
-			Body: `func (b *BM25Backend) Search(query string, limit int) []scored {
-	terms := tokenize(query)
-	scores := map[string]float64{}
-	for _, t := range terms {
-		for _, p := range b.inverted[t] {
-			scores[p.id] += b.bm25Score(p, t)
-		}
+			Signature: "func (b *SymbolSearcherBackend) Search(query string, limit int) []SearchResult",
+			Body: `func (b *SymbolSearcherBackend) Search(query string, limit int) []SearchResult {
+	hits, err := b.s.SearchSymbols(query, limit)
+	if err != nil || len(hits) == 0 {
+		return nil
 	}
-	return topK(scores, limit)
+	out := make([]SearchResult, len(hits))
+	for i, h := range hits {
+		out[i] = SearchResult{ID: h.NodeID, Score: h.Score}
+	}
+	return out
 }`,
 			Callers: []llm.CallerInfo{
 				{Name: "Engine.SearchSymbolsScoped", Signature: "func (e *Engine) SearchSymbolsScoped(q string, limit int, opts QueryOptions) []*graph.Node"},

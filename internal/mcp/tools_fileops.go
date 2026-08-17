@@ -1,13 +1,19 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -351,10 +357,6 @@ func pathContainedIn(abs, root string) bool {
 // target, or a control client with no known roots, is left to the normal read
 // path — there is nothing to leak.
 func (s *Server) guardSymlinkWithinRepo(absPath string) error {
-	roots := s.guardRepoRoots()
-	if len(roots) == 0 {
-		return nil // no known roots (control client / unindexed) — nothing to enforce
-	}
 	real, err := filepath.EvalSymlinks(absPath)
 	if err != nil {
 		// Not-yet-created file (or broken symlink): EvalSymlinks can't resolve
@@ -365,12 +367,26 @@ func (s *Server) guardSymlinkWithinRepo(absPath string) error {
 		// refused below.
 		real = resolveNearestExistingAncestor(absPath)
 	}
+	return s.guardResolvedPathWithinRepo(absPath, real)
+}
+
+// guardResolvedPathWithinRepo validates the resolved target that was actually
+// observed, not a fresh resolution of the caller's path. Physical reads use
+// this to bind repository confinement to the file handle whose bytes were
+// hashed, even if a symlink is retargeted out of the repo and restored before
+// the request returns.
+func (s *Server) guardResolvedPathWithinRepo(requestedPath, resolvedPath string) error {
+	roots := s.guardRepoRoots()
+	if len(roots) == 0 {
+		return nil // no known roots (control client / unindexed) — nothing to enforce
+	}
+	real := filepath.Clean(resolvedPath)
 	for _, root := range roots {
 		if pathContainedIn(real, root) {
 			return nil
 		}
 	}
-	return fmt.Errorf("%w: %q resolves to %q, outside every indexed repository root", errPathEscape, absPath, real)
+	return fmt.Errorf("%w: %q resolves to %q, outside every indexed repository root", errPathEscape, requestedPath, real)
 }
 
 // resolveNearestExistingAncestor symlink-resolves the longest existing prefix
@@ -1113,6 +1129,119 @@ func capReadFileContent(content []byte, maxChars int, binary bool) ([]byte, bool
 	return []byte(strings.ToValidUTF8(string(prefix), "")), true
 }
 
+type physicalReadEvidence struct {
+	resolvedPath    string
+	contentSHA256   string
+	byteCount       int
+	symlinkResolved bool
+	readAt          time.Time
+}
+
+func samePhysicalFileVersion(a, b os.FileInfo) bool {
+	return a != nil && b != nil && a.Mode().IsRegular() && b.Mode().IsRegular() &&
+		os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
+}
+
+// readAllSized reads f into a buffer presized from the size the caller already
+// observed on the open handle, so the whole-file read costs one allocation
+// instead of io.ReadAll's repeated append-and-copy growth (measured 2.1x the
+// file size in total allocation for a 128 MiB file, 1.0x once presized). The
+// hint is advisory: a file that grew since the stat still reads completely,
+// and an implausible size falls back to unhinted growth.
+func readAllSized(f *os.File, size int64) ([]byte, error) {
+	var buf bytes.Buffer
+	if size > 0 && size < math.MaxInt32 {
+		buf.Grow(int(size) + bytes.MinRead)
+	}
+	if _, err := buf.ReadFrom(f); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// readPhysicalFileEvidence hashes the exact buffer returned to the caller from
+// one file-handle read. Metadata and path identity checks bound replacement or
+// in-place drift during that read without doubling file I/O or peak memory.
+func readPhysicalFileEvidence(absPath string) ([]byte, physicalReadEvidence, error) {
+	return readPhysicalFileEvidenceObserved(absPath, nil)
+}
+
+func readPhysicalFileEvidenceObserved(absPath string, afterRead func()) ([]byte, physicalReadEvidence, error) {
+	linkInfo, err := os.Lstat(absPath)
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not inspect physical path: %w", err)
+	}
+	if !linkInfo.Mode().IsRegular() && linkInfo.Mode()&os.ModeSymlink == 0 {
+		return nil, physicalReadEvidence{}, fmt.Errorf("physical evidence requires a regular file, got %s", linkInfo.Mode().Type())
+	}
+	resolvedBefore, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not resolve physical file: %w", err)
+	}
+	f, err := openPhysicalEvidenceFile(absPath)
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not open physical file: %w", err)
+	}
+	defer f.Close()
+
+	before, err := f.Stat()
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not stat physical file: %w", err)
+	}
+	if !before.Mode().IsRegular() {
+		return nil, physicalReadEvidence{}, fmt.Errorf("physical evidence requires a regular file, got %s", before.Mode().Type())
+	}
+	content, err := readAllSized(f, before.Size())
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not read physical file: %w", err)
+	}
+	sum := sha256.Sum256(content)
+	if afterRead != nil {
+		afterRead()
+	}
+
+	// Verify the snapshot with a second streaming hash on the same handle.
+	// This doubles I/O only for explicit physical evidence, while retaining one
+	// full buffer and detecting in-place same-size rewrites whose mtime was
+	// restored. Metadata-only checks cannot prove that invariant.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not rewind physical file for verification: %w", err)
+	}
+	verificationHash := sha256.New()
+	if _, err := io.Copy(verificationHash, f); err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical file content: %w", err)
+	}
+	if !bytes.Equal(sum[:], verificationHash.Sum(nil)) {
+		return nil, physicalReadEvidence{}, errors.New("physical file changed while it was being read; retry")
+	}
+
+	after, err := f.Stat()
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not restat physical file: %w", err)
+	}
+	pathInfo, err := os.Stat(absPath)
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path: %w", err)
+	}
+	resolvedAfter, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path resolution: %w", err)
+	}
+	if filepath.Clean(resolvedBefore) != filepath.Clean(resolvedAfter) ||
+		!samePhysicalFileVersion(before, after) ||
+		!samePhysicalFileVersion(after, pathInfo) {
+		return nil, physicalReadEvidence{}, errors.New("physical file changed while it was being read; retry")
+	}
+
+	return content, physicalReadEvidence{
+		resolvedPath:    resolvedAfter,
+		contentSHA256:   fmt.Sprintf("%x", sum),
+		byteCount:       len(content),
+		symlinkResolved: linkInfo.Mode()&os.ModeSymlink != 0,
+		readAt:          time.Now().UTC(),
+	}, nil
+}
+
 func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	rawPath, err := req.RequireString("path")
 	if err != nil {
@@ -1132,6 +1261,45 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if info.IsDir() {
 		return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
 	}
+
+	physicalEvidenceRequested := req.GetBool("physical_evidence", false)
+	digest := strings.ToLower(strings.TrimSpace(req.GetString("digest", "")))
+	if digest != "" && !physicalEvidenceRequested {
+		return mcp.NewToolResultError("digest requires physical_evidence=true"), nil
+	}
+	if physicalEvidenceRequested {
+		if digest == "" {
+			digest = "sha256"
+		}
+		if digest != "sha256" {
+			return mcp.NewToolResultError(fmt.Sprintf("unsupported physical evidence digest %q; only sha256 is supported", digest)), nil
+		}
+	}
+
+	var diskContent []byte
+	var physicalEvidence physicalReadEvidence
+	if physicalEvidenceRequested {
+		var readErr error
+		read := readPhysicalFileEvidence
+		if s.physicalEvidenceOverride != nil {
+			read = s.physicalEvidenceOverride
+		}
+		diskContent, physicalEvidence, readErr = read(absPath)
+		if readErr != nil {
+			return mcp.NewToolResultError(readErr.Error()), nil
+		}
+		// Bind confinement to the resolved target that supplied the hashed
+		// bytes. Re-resolving only absPath is insufficient when a symlink is
+		// retargeted outside the repo for the read and restored afterward.
+		if guardErr := s.guardResolvedPathWithinRepo(absPath, physicalEvidence.resolvedPath); guardErr != nil {
+			return mcp.NewToolResultError(guardErr.Error()), nil
+		}
+		// Also reject a path retargeted outside after the evidence snapshot.
+		if guardErr := s.guardSymlinkWithinRepo(absPath); guardErr != nil {
+			return mcp.NewToolResultError(guardErr.Error()), nil
+		}
+	}
+
 	// Honour the editor-buffer overlay if one is active for this path. A
 	// drifted overlay is already rejected upstream by the overlay view
 	// guard; what reaches here is a live buffer, which we flag as such so
@@ -1141,6 +1309,8 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if buf, ok := s.overlayContentFor(ctx, absPath); ok {
 		content = []byte(buf)
 		servedFromOverlay = true
+	} else if physicalEvidenceRequested {
+		content = diskContent
 	} else {
 		b, rerr := os.ReadFile(absPath)
 		if rerr != nil {
@@ -1213,10 +1383,25 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	// caller explicitly opts out. Keys stay readable; only secret-shaped values
 	// are replaced.
 	secretsRedacted := false
+	allowSecrets := req.GetBool("allow_secrets", false)
 	if !isBinary {
-		if red, did := s.maybeRedactConfigLeaf(language, relPath, req.GetBool("allow_secrets", false), string(content)); did {
+		if red, did := s.maybeRedactConfigLeaf(language, relPath, allowSecrets, string(content)); did {
 			content = []byte(red)
 			secretsRedacted = true
+		}
+	}
+	// The digest's scope is the full disk buffer, so the secret-intent gate has
+	// to be judged on those bytes rather than on whatever survived into the
+	// response. Keying it off secretsRedacted let any transform that dropped the
+	// secret-shaped lines first — an offset/limit window, a max_lines cut —
+	// leave hits at zero, so the gate stayed silent and the full-file digest of
+	// a secrets file shipped anyway. Judged on diskContent the window no longer
+	// matters. An overlay buffer carrying secrets the file on disk does not is
+	// now allowed through, which is correct: the digest describes disk, and the
+	// overlay bytes are still redacted in the response.
+	if physicalEvidenceRequested && !allowSecrets {
+		if _, wouldRedact := s.maybeRedactConfigLeaf(language, relPath, false, string(diskContent)); wouldRedact {
+			return mcp.NewToolResultError("physical_evidence for redacted content requires allow_secrets=true"), nil
 		}
 	}
 
@@ -1255,6 +1440,24 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			"end_line":    winEnd,
 			"total_lines": winTotal,
 		}
+	}
+	if physicalEvidenceRequested {
+		contentAltered := servedFromOverlay || isBinary || bodiesElided || salienceTruncated || windowed || secretsRedacted || contentTruncated || !utf8.Valid(content)
+		contentSource := "disk"
+		if servedFromOverlay {
+			contentSource = "overlay"
+		}
+		result["resolved_path"] = physicalEvidence.resolvedPath
+		result["file_kind"] = "regular"
+		result["byte_count"] = physicalEvidence.byteCount
+		result["content_sha256"] = physicalEvidence.contentSHA256
+		result["hash_algorithm"] = "sha256"
+		result["hash_scope"] = "full_file"
+		result["hash_source"] = "disk"
+		result["content_source"] = contentSource
+		result["disk_verified"] = true
+		result["same_buffer_as_content"] = !contentAltered
+		result["symlink_resolved"] = physicalEvidence.symlinkResolved
 	}
 
 	// Omission notes: tell the model what the payload deliberately
@@ -1297,6 +1500,11 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		return notModifiedResult(etag), nil
 	}
 	result["etag"] = etag
+	if physicalEvidenceRequested {
+		// Keep the observation timestamp outside the ETag so conditional reads
+		// remain stable while the verified disk bytes are unchanged.
+		result["read_at"] = physicalEvidence.readAt.Format(time.RFC3339Nano)
+	}
 
 	// Server-side accounting only — read_file is the heaviest source
 	// fetch and must show up in the savings ledger even when nothing

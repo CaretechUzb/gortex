@@ -26,7 +26,7 @@ func newBatchTransitionTestMulti(g graph.Store) *MultiIndexer {
 	if g == nil {
 		g = graph.New()
 	}
-	return NewMultiIndexer(g, parser.NewRegistry(), search.NewBM25(), nil, zap.NewNop())
+	return NewMultiIndexer(g, parser.NewRegistry(), search.NewNull(), nil, zap.NewNop())
 }
 
 func requireBatchTransitionBlocked(t *testing.T, done <-chan struct{}) {
@@ -51,7 +51,7 @@ func TestIndexAllWorkersDoNotReenterRegistryLock(t *testing.T) {
 		cm.Global().Repos = append(cm.Global().Repos, config.RepoEntry{Path: root, Name: name})
 	}
 
-	mi := NewMultiIndexer(g, reg, search.NewAuto(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	done := make(chan error, 1)
 	go func() {
 		_, err := mi.IndexAll()
@@ -322,7 +322,7 @@ func (s *blockingBatchPurgeStore) PurgeRepo(string) error {
 	return nil
 }
 
-func TestUntrackTeardownBlocksDirectGlobalPass(t *testing.T) {
+func TestUntrackTeardownBlocksReachLookup(t *testing.T) {
 	releasePurge := make(chan struct{})
 	store := &blockingBatchPurgeStore{
 		Store:   graph.New(),
@@ -354,20 +354,6 @@ func TestUntrackTeardownBlocksDirectGlobalPass(t *testing.T) {
 		t.Fatal("UntrackRepo did not reach the repository purge")
 	}
 
-	globalSubmitted := make(chan struct{})
-	globalDone := make(chan struct{})
-	go func() {
-		close(globalSubmitted)
-		mi.RunGlobalGraphPasses(context.Background())
-		close(globalDone)
-	}()
-	<-globalSubmitted
-	select {
-	case <-globalDone:
-		t.Fatal("direct global pass crossed an in-flight untrack teardown")
-	case <-time.After(75 * time.Millisecond):
-	}
-
 	lookupStarted := make(chan struct{})
 	lookupDone := make(chan struct{})
 	go func() {
@@ -388,11 +374,6 @@ func TestUntrackTeardownBlocksDirectGlobalPass(t *testing.T) {
 		assert.Equal(t, removalCounts{nodes: 1, edges: 2}, removed)
 	case <-time.After(batchTransitionTestTimeout):
 		t.Fatal("UntrackRepo did not finish after purge release")
-	}
-	select {
-	case <-globalDone:
-	case <-time.After(batchTransitionTestTimeout):
-		t.Fatal("direct global pass did not resume after untrack teardown")
 	}
 	select {
 	case <-lookupDone:

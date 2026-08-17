@@ -343,8 +343,3 @@ func putMatchScratch(s *matchScratch) {
 // set), and preserve-across-calls made it worse as the growing map
 // slowed every lookup. The text copy in Utf8Text is fine as-is — keep
 // pooling, drop interning.
-
-// NodeText extracts the text content of a tree-sitter node from source bytes.
-func NodeText(node *sitter.Node, src []byte) string {
-	return node.Content(src)
-}

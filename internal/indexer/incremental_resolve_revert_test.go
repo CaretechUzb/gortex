@@ -68,7 +68,7 @@ func TestIncrementalReindex_DoubleCycle_Sqlite_IntraFileCaller(t *testing.T) {
 
 	g := newSqliteGraph(t)
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.IndexCtx(testCtx(), dir)
 	require.NoError(t, err)
@@ -113,7 +113,7 @@ func TestReresolveFileScoped_RebindsDroppedIncomingEdges(t *testing.T) {
 
 	g := newSqliteGraph(t)
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.IndexCtx(testCtx(), dir)
 	require.NoError(t, err)

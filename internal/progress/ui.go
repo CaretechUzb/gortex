@@ -137,12 +137,6 @@ func Card(title, body string) string {
 	return styleBox.Border(activeGlyphs().Border).Render(body) + "\n"
 }
 
-// Indent prefixes every line of s with the given number of spaces.
-func Indent(s string, n int) string {
-	pad := strings.Repeat(" ", n)
-	return pad + strings.ReplaceAll(s, "\n", "\n"+pad)
-}
-
 // SortStrings is a small convenience used by callers preparing chip lists.
 func SortStrings(s []string) []string {
 	out := append([]string(nil), s...)

@@ -234,7 +234,14 @@ func TestCall_AllCompactNamesUseFacadeRelay(t *testing.T) {
 		callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade
 	})
 
-	for _, name := range gortexmcp.FacadeToolNames() {
+	facadeNames := []string{
+		"analyze", "ask", "capabilities", "change", "edit", "explore",
+		"overlay", "pr", "publish_review", "read", "recall", "refactor",
+		"relations", "remember", "response", "review", "search", "session",
+		"trace", "workspace", "workspace_admin",
+	}
+	for _, name := range facadeNames {
+		require.True(t, gortexmcp.IsFacadeToolName(name), "%q must remain a registered facade name", name)
 		t.Run(name, func(t *testing.T) {
 			var facadeTool string
 			callDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {

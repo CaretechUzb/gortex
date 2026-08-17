@@ -1,24 +1,12 @@
 package search
 
 import (
-	"bytes"
-	"encoding/binary"
-	"encoding/json"
-	"fmt"
-	"io"
 	"sync"
 
 	"github.com/coder/hnsw"
 
 	"github.com/zzet/gortex/internal/graph"
 )
-
-// vectorFrameMagic prefixes the framed VectorBackend.Save format: a
-// 4-byte magic, a uint32 chunk-map JSON length, the chunk-map JSON,
-// then the raw HNSW export. A blob lacking the magic is a legacy
-// (pre-chunking) raw HNSW export and is loaded with an empty chunk
-// map — so old snapshots keep working.
-var vectorFrameMagic = [4]byte{'G', 'V', 'X', '1'}
 
 // VectorDelegate is the subset of graph.VectorSearcher the
 // VectorBackend shim consults when it's been told to delegate
@@ -32,33 +20,27 @@ type VectorDelegate interface {
 
 // VectorBackend stores and searches embedding vectors using HNSW index.
 //
-// When delegate is set (via SetDelegate), the in-process HNSW is
-// bypassed entirely: Add becomes a no-op (the indexer drives the
-// delegate's bulk-upsert directly), Search forwards to the
-// delegate's SimilarTo. The dims and chunkMap stay live so callers
-// that need them (HybridBackend.dechunkVectorIDs) keep working
-// against the same VectorBackend surface.
+// When a delegate is installed, the in-process HNSW is absent: Add ignores
+// process-local writes, while Search forwards to the delegate's SimilarTo.
+// Durable hits carry their parent IDs, so chunk results can be collapsed
+// without retaining a process-local chunk map.
 type VectorBackend struct {
 	graph *hnsw.Graph[string]
 	count int
 	dims  int
 	// chunkMap maps a synthetic chunk vector ID ("<symbolID>#chunkK")
-	// to its parent symbol ID. It is non-empty only when AST
-	// sub-chunking split one or more symbols into multiple vectors.
-	// Search results are de-chunked through it so a symbol is never
-	// returned twice and chunk IDs never leak to callers.
+	// to its parent symbol ID. It is non-empty only for the legacy
+	// in-process build path; durable delegates return ParentID with each hit.
 	chunkMap map[string]string
 	mu       sync.RWMutex
 
-	// delegate is the optional engine-native vector searcher (today
-	// only graph.SymbolSearcher-implementing stores). Set means
-	// "don't build the in-process HNSW; route reads through here".
-	// The wrapped delegateCount tracks Add-call deltas so Count()
-	// reports a non-zero figure once the indexer has finished its
-	// bulk upsert — HybridBackend gates the vector channel on
-	// Count() > 0.
-	delegate      VectorDelegate
-	delegateCount int
+	// delegate is the optional durable vector searcher. Delegated backends
+	// never retain an in-process HNSW graph. delegateCount is the complete
+	// durable corpus size; delegateChunkCount is the number of vectors that
+	// represent chunks rather than whole symbols.
+	delegate           VectorDelegate
+	delegateCount      int
+	delegateChunkCount int
 }
 
 // NewVector creates a vector search backend for the given embedding dimensions.
@@ -68,6 +50,31 @@ func NewVector(dims int) *VectorBackend {
 	return &VectorBackend{
 		graph: g,
 		dims:  dims,
+	}
+}
+
+// NewDelegatedVector creates a vector backend that routes searches to a
+// durable store without allocating an in-process HNSW graph. vectorCount and
+// chunkCount describe the complete durable corpus, not just this process's
+// writes, so warm-started hybrid search is enabled immediately.
+func NewDelegatedVector(dims int, delegate VectorDelegate, vectorCount, chunkCount int) *VectorBackend {
+	if delegate == nil {
+		panic("search.NewDelegatedVector: nil delegate")
+	}
+	if dims <= 0 {
+		panic("search.NewDelegatedVector: non-positive dimensions")
+	}
+	if vectorCount < 0 {
+		panic("search.NewDelegatedVector: negative vector count")
+	}
+	if chunkCount < 0 || chunkCount > vectorCount {
+		panic("search.NewDelegatedVector: invalid chunk count")
+	}
+	return &VectorBackend{
+		dims:               dims,
+		delegate:           delegate,
+		delegateCount:      vectorCount,
+		delegateChunkCount: chunkCount,
 	}
 }
 
@@ -97,7 +104,7 @@ func (v *VectorBackend) ResolveChunk(id string) (string, bool) {
 func (v *VectorBackend) HasChunks() bool {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return len(v.chunkMap) > 0
+	return v.delegateChunkCount > 0 || len(v.chunkMap) > 0
 }
 
 // Add indexes a symbol with its embedding vector.
@@ -105,13 +112,10 @@ func (v *VectorBackend) Add(id string, vector []float32) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.delegate != nil {
-		// Delegated mode: the indexer pushes vectors to the
-		// engine-native HNSW via the graph.VectorSearcher
-		// interface directly. Add here is a no-op so the
-		// in-process hnsw.Graph never allocates memory for what
-		// the delegate already owns; count tracks deltas so
-		// Count()'s "is the index populated" gate fires.
-		v.delegateCount++
+		// The durable corpus is authoritative. Publication replaces it through
+		// the store and constructs a fresh backend with NewDelegatedVector;
+		// accepting a process-local Add here would fabricate Count without
+		// persisting searchable data.
 		return
 	}
 	v.graph.Add(hnsw.Node[string]{
@@ -121,40 +125,60 @@ func (v *VectorBackend) Add(id string, vector []float32) {
 	v.count++
 }
 
-// SetDelegate routes Search / Count through an engine-native vector
-// searcher (the disk store's graph.VectorSearcher). After
-// the call:
-//   - Add is a no-op (the indexer talks to the delegate directly via
-//     graph.VectorSearcher.BulkUpsertEmbeddings / UpsertEmbedding),
-//   - Search forwards to delegate.SimilarTo,
-//   - Count reflects the delegate-delta count (not the in-process
-//     graph), so HybridBackend.searchChannels's `v.Count() > 0` gate
-//     fires once the indexer has populated the backend.
-func (v *VectorBackend) SetDelegate(d VectorDelegate) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.delegate = d
-}
-
 // Search returns the k nearest neighbors to the query vector.
 func (v *VectorBackend) Search(query []float32, k int) []string {
+	if k <= 0 {
+		return nil
+	}
 	v.mu.RLock()
 	d := v.delegate
+	delegateCount := v.delegateCount
+	delegateChunks := v.delegateChunkCount
 	v.mu.RUnlock()
 	if d != nil {
-		hits, err := d.SimilarTo(query, k)
+		// Similarity rows are vector-ranked, but several top rows may be sibling
+		// chunks of one parent. Overfetch by the complete chunk population (capped
+		// by the corpus size), then stop after k unique symbols so de-duplication
+		// cannot silently under-fill an otherwise sufficient result set.
+		fetch := k
+		if delegateChunks > 0 {
+			if delegateCount-k <= delegateChunks {
+				fetch = delegateCount
+			} else {
+				fetch = k + delegateChunks
+			}
+			if fetch < k {
+				fetch = k
+			}
+		}
+		hits, err := d.SimilarTo(query, fetch)
 		if err != nil || len(hits) == 0 {
 			return nil
 		}
-		ids := make([]string, len(hits))
-		for i, h := range hits {
-			ids[i] = h.NodeID
+		ids := make([]string, 0, min(k, len(hits)))
+		seen := make(map[string]struct{}, len(hits))
+		for _, h := range hits {
+			id := h.NodeID
+			if h.ParentID != "" {
+				id = h.ParentID
+			}
+			if id == "" {
+				continue
+			}
+			if _, duplicate := seen[id]; duplicate {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+			if len(ids) == k {
+				break
+			}
 		}
 		return ids
 	}
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	if v.count == 0 {
+	if v.count == 0 || v.graph == nil {
 		return nil
 	}
 	results := v.graph.Search(hnsw.Vector(query), k)
@@ -189,7 +213,7 @@ func (v *VectorBackend) Dims() int { return v.dims }
 func (v *VectorBackend) SizeBytes() uint64 {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	if v.count == 0 {
+	if v.delegate != nil || v.count == 0 || v.graph == nil {
 		return 0
 	}
 	const hnswOverhead = 5900 // neighbor lists + map headers + priority-queue slack
@@ -197,80 +221,19 @@ func (v *VectorBackend) SizeBytes() uint64 {
 	return uint64(v.count) * perVector
 }
 
-// Save writes the vector index to a writer in the framed format:
-// magic + chunk-map JSON + raw HNSW export. The chunk map is persisted
-// so query-time de-chunking still works after a daemon restart.
-func (v *VectorBackend) Save(w io.Writer) error {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-
-	mapJSON := []byte("{}")
-	if len(v.chunkMap) > 0 {
-		b, err := json.Marshal(v.chunkMap)
-		if err != nil {
-			return fmt.Errorf("marshal chunk map: %w", err)
-		}
-		mapJSON = b
+// Close releases all process-local vector state. A delegate is externally
+// owned (normally by the durable graph store), so it is detached but never
+// closed here.
+func (v *VectorBackend) Close() {
+	if v == nil {
+		return
 	}
-	if _, err := w.Write(vectorFrameMagic[:]); err != nil {
-		return fmt.Errorf("write vector frame magic: %w", err)
-	}
-	var lenBuf [4]byte
-	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(mapJSON)))
-	if _, err := w.Write(lenBuf[:]); err != nil {
-		return fmt.Errorf("write chunk map length: %w", err)
-	}
-	if _, err := w.Write(mapJSON); err != nil {
-		return fmt.Errorf("write chunk map: %w", err)
-	}
-	if err := v.graph.Export(w); err != nil {
-		return fmt.Errorf("export vector index: %w", err)
-	}
-	return nil
-}
-
-// LoadFrom restores the vector index from a reader. It accepts both
-// the framed format (magic + chunk map + HNSW) and the legacy raw
-// HNSW export written before AST sub-chunking shipped — a legacy blob
-// has no magic and loads with an empty chunk map.
-func (v *VectorBackend) LoadFrom(r io.Reader) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-
-	// Buffer the whole blob so a missing magic can be replayed into the
-	// HNSW importer. Vector index blobs are small relative to the graph.
-	all, err := io.ReadAll(r)
-	if err != nil {
-		return fmt.Errorf("read vector index: %w", err)
-	}
-	hnswBytes := all
+	v.graph = nil
+	v.count = 0
 	v.chunkMap = nil
-	if len(all) >= 8 && bytes.Equal(all[:4], vectorFrameMagic[:]) {
-		mapLen := binary.LittleEndian.Uint32(all[4:8])
-		if int(mapLen)+8 > len(all) {
-			return fmt.Errorf("vector index frame: chunk map length %d exceeds blob", mapLen)
-		}
-		mapJSON := all[8 : 8+mapLen]
-		hnswBytes = all[8+mapLen:]
-		if mapLen > 0 {
-			m := make(map[string]string)
-			if err := json.Unmarshal(mapJSON, &m); err != nil {
-				return fmt.Errorf("unmarshal chunk map: %w", err)
-			}
-			if len(m) > 0 {
-				v.chunkMap = m
-			}
-		}
-	}
-	if err := v.graph.Import(bytes.NewReader(hnswBytes)); err != nil {
-		return fmt.Errorf("import vector index: %w", err)
-	}
-	return nil
-}
-
-// SetCount sets the node count (used after loading from persistence).
-func (v *VectorBackend) SetCount(n int) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.count = n
+	v.delegate = nil
+	v.delegateCount = 0
+	v.delegateChunkCount = 0
 }

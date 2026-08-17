@@ -7,21 +7,6 @@ type ConfigNodeBatchEvicter interface {
 	EvictConfigNodesByIDs(ids []string) (nodesRemoved, edgesRemoved int)
 }
 
-// EvictConfigNodesByIDs dispatches only to the set-oriented capability.
-// Production Graph and SQLite stores implement it; adapters report unsupported
-// instead of hiding a point-delete loop.
-func EvictConfigNodesByIDs(store Store, ids []string) (nodesRemoved, edgesRemoved int, supported bool) {
-	if store == nil || len(ids) == 0 {
-		return 0, 0, true
-	}
-	evicter, ok := store.(ConfigNodeBatchEvicter)
-	if !ok {
-		return 0, 0, false
-	}
-	nodesRemoved, edgesRemoved = evicter.EvictConfigNodesByIDs(ids)
-	return nodesRemoved, edgesRemoved, true
-}
-
 // EvictConfigNodesByIDs implements the bounded in-memory capability while
 // holding all shard locks once. Unknown and non-config-key IDs are ignored.
 func (g *Graph) EvictConfigNodesByIDs(ids []string) (nodesRemoved, edgesRemoved int) {

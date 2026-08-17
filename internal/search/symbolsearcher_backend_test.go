@@ -30,30 +30,25 @@ func (s *countedSymbolSearcherStub) SymbolFTSCount() (int, error) {
 	return s.count, s.err
 }
 
-func TestNewSymbolSearcherBackendSeedsPersistedCountLazily(t *testing.T) {
+func TestSymbolSearcherBackendCountUsesAuthoritativeCorpus(t *testing.T) {
 	store := &countedSymbolSearcherStub{count: 37}
 	backend := NewSymbolSearcherBackend(store)
 	if store.calls != 0 {
 		t.Fatalf("constructor SymbolFTSCount calls = %d, want 0", store.calls)
 	}
 
-	backend.Add("new-before-first-count")
-	if got := backend.Count(); got != 38 {
-		t.Fatalf("first Count() = %d, want persisted count plus prior delta 38", got)
-	}
-	if store.calls != 1 {
-		t.Fatalf("SymbolFTSCount calls = %d, want 1", store.calls)
-	}
-	if got := backend.Count(); got != 38 {
-		t.Fatalf("second Count() = %d, want cached count 38", got)
-	}
-	if store.calls != 1 {
-		t.Fatalf("repeated Count SymbolFTSCount calls = %d, want 1", store.calls)
+	backend.Add("already-persisted")
+	if got := backend.Count(); got != 37 {
+		t.Fatalf("Count() = %d, want persisted count 37", got)
 	}
 
-	backend.Remove("new-before-first-count")
-	if got := backend.Count(); got != 37 {
-		t.Fatalf("Count() after balanced delta = %d, want 37", got)
+	store.count = 41
+	backend.Remove("already-removed")
+	if got := backend.Count(); got != 41 {
+		t.Fatalf("Count() after store update = %d, want 41", got)
+	}
+	if store.calls != 2 {
+		t.Fatalf("SymbolFTSCount calls = %d, want one authoritative read per Count", store.calls)
 	}
 }
 

@@ -32,8 +32,9 @@ func TestCodexWritesMcpServersTOMLTable(t *testing.T) {
 		t.Fatalf("apply: %v", err)
 	}
 	// Two creates: ~/.codex/config.toml for MCP plus AGENTS.md, the
-	// per-repo instructions file Codex CLI reads on every task.
-	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 2})
+	// per-repo instructions file Codex CLI reads on every task. Plus one
+	// SKILL.md per generated community skill under <root>/.agents/skills.
+	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 2 + len(env.GeneratedSkills)})
 
 	data, err := os.ReadFile(filepath.Join(env.Home, ".codex", "config.toml"))
 	if err != nil {
@@ -168,7 +169,7 @@ command = "other"
 	if err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
-	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionSkip: 1})
+	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionSkip: 1 + curatedSkillCount(t) + subAgentCount()})
 }
 
 func TestCodexDirectNamespaceUpgradesBooleanFeatureForm(t *testing.T) {
@@ -316,7 +317,7 @@ func TestCodexInstallsSessionStartHook(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 1})
+	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 1 + curatedSkillCount(t) + subAgentCount()})
 
 	cfg := readCodexConfig(t, env)
 	entries := sessionStartEntries(t, cfg)
@@ -355,7 +356,7 @@ func TestCodexInstallsPreToolUseHook(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 1})
+	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 1 + curatedSkillCount(t) + subAgentCount()})
 
 	cfg := readCodexConfig(t, env)
 	entries := preToolUseEntries(t, cfg)
@@ -393,7 +394,7 @@ func TestCodexInstallsPostToolUseHook(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 1})
+	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 1 + curatedSkillCount(t) + subAgentCount()})
 
 	cfg := readCodexConfig(t, env)
 	entries := postToolUseEntries(t, cfg)
@@ -466,7 +467,7 @@ func TestCodexInstallsUserPromptSubmitHook(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 1})
+	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 1 + curatedSkillCount(t) + subAgentCount()})
 
 	cfg := readCodexConfig(t, env)
 	entries := userPromptSubmitEntries(t, cfg)
@@ -719,7 +720,7 @@ func TestCodexSessionStartHookIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
-	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionSkip: 1})
+	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionSkip: 1 + curatedSkillCount(t) + subAgentCount()})
 
 	cfg := readCodexConfig(t, env)
 	if count := gortexSessionStartHookCount(t, cfg); count != 1 {
@@ -830,7 +831,7 @@ statusMessage = "User PostToolUse"
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionMerge: 1})
+	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionMerge: 1, agents.ActionCreate: curatedSkillCount(t) + subAgentCount()})
 
 	cfg := readCodexConfig(t, env)
 	if cfg["model"] != "gpt-5-codex" {
@@ -909,7 +910,7 @@ statusMessage = "Old Gortex MCP Read PreToolUse"
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionMerge: 1})
+	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionMerge: 1, agents.ActionCreate: curatedSkillCount(t) + subAgentCount()})
 
 	cfg := readCodexConfig(t, env)
 	preEntries := preToolUseEntries(t, cfg)
@@ -948,8 +949,10 @@ func TestCodexNoHooksSkipsSessionStartHook(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	if len(plan.Files) != 1 {
-		t.Fatalf("plan files=%d want 1", len(plan.Files))
+	// config.toml, one planned SKILL.md per curated skill, and one
+	// planned .toml per sub-agent.
+	if want := 1 + curatedSkillCount(t) + subAgentCount(); len(plan.Files) != want {
+		t.Fatalf("plan files=%d want %d", len(plan.Files), want)
 	}
 	for _, key := range plan.Files[0].Keys {
 		if key == "hooks" {

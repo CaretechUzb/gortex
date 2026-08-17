@@ -5,12 +5,11 @@ Manages the full container lifecycle for a single eval instance:
   2. Copy gortex binary and tool bridge scripts (native/native_augment modes)
   3. Start eval-server inside container, health-check with configurable timeout
   4. Extract patch (git diff) before teardown
-  5. Mount/copy cached indexes when available
-  6. Record setup failures gracefully — never raise, return failure result
+  5. Record setup failures gracefully — never raise, return failure result
 
 Architecture:
   Agent bash cmd → /usr/local/bin/gortex-search → curl localhost:4747/tool/search_symbols
-    → eval-server → in-memory graph
+    → eval-server → graph store
   Fallback: → gortex CLI (cold path)
 """
 
@@ -29,7 +28,6 @@ logger = logging.getLogger("gortex_docker")
 
 DEFAULT_EVAL_SERVER_PORT = 4747
 DEFAULT_GORTEX_TIMEOUT = 120
-DEFAULT_CACHE_DIR = Path.home() / ".gortex-eval-cache"
 HEALTH_CHECK_INTERVAL = 2.0
 CONTAINER_WORKDIR = "/testbed"
 GORTEX_BINARY_CONTAINER_PATH = "/usr/local/bin/gortex"
@@ -44,12 +42,6 @@ _BRIDGE_SCRIPTS = [
     "gortex-usages",
     "gortex-augment",
 ]
-
-
-def _make_cache_key(repo_name: str, commit_hash: str) -> str:
-    """Build a deterministic cache directory name from repo and commit."""
-    safe_repo = repo_name.replace("/", "__")
-    return f"{safe_repo}_{commit_hash}"
 
 
 class GortexDockerEnvironment:
@@ -71,7 +63,6 @@ class GortexDockerEnvironment:
         gortex_binary: str | Path | None = None,
         gortex_timeout: int = DEFAULT_GORTEX_TIMEOUT,
         eval_server_port: int = DEFAULT_EVAL_SERVER_PORT,
-        cache_dir: str | Path | None = None,
         instance_id: str = "",
     ) -> None:
         self.image = image
@@ -80,7 +71,6 @@ class GortexDockerEnvironment:
         self.gortex_binary = Path(gortex_binary) if gortex_binary else None
         self.gortex_timeout = gortex_timeout
         self.eval_server_port = eval_server_port
-        self.cache_dir = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
         self.instance_id = instance_id
 
         self._client: docker.DockerClient | None = None
@@ -111,7 +101,6 @@ class GortexDockerEnvironment:
             start = time.time()
             self._copy_gortex_binary()
             self._copy_bridge_scripts()
-            self._restore_or_skip_cache()
             self._start_eval_server()
             self._wait_for_health()
             self.index_time = time.time() - start
@@ -263,45 +252,12 @@ class GortexDockerEnvironment:
             copied += 1
         logger.info("Copied %d bridge scripts into container", copied)
 
-    def _restore_or_skip_cache(self) -> None:
-        """Mount/copy a cached index into the container if one exists."""
-        repo_name, commit_hash = self._get_repo_identity()
-        cache_key = _make_cache_key(repo_name, commit_hash)
-        cache_path = self.cache_dir / cache_key
-
-        if not cache_path.is_dir():
-            logger.info("No cached index for %s, eval-server will index fresh", cache_key)
-            return
-
-        tarball = cache_path / "index.tar.gz"
-        if not tarball.is_file():
-            logger.info("Cache dir exists but no tarball for %s, skipping", cache_key)
-            return
-
-        logger.info("Restoring cached index %s into container", cache_key)
-        try:
-            cache_dest = "/root/.gortex-cache"
-            self._container.exec_run(["mkdir", "-p", cache_dest])
-            with open(tarball, "rb") as f:
-                self._container.put_archive(cache_dest, f.read())
-            logger.info("Cached index restored to %s", cache_dest)
-        except Exception as exc:
-            logger.warning("Cache restore failed, will index fresh: %s", exc)
-
     def _start_eval_server(self) -> None:
         """Start ``gortex eval-server`` as a background process in the container."""
-        cache_flag = ""
-        cache_dest = "/root/.gortex-cache"
-        # Check if cache was restored
-        exit_code, _ = self._container.exec_run(["test", "-d", cache_dest])
-        if exit_code == 0:
-            cache_flag = f"--cache-dir {cache_dest}"
-
         cmd = (
             f"nohup /usr/local/bin/gortex eval-server "
             f"--port {self.eval_server_port} "
             f"--index {self.repo_path} "
-            f"{cache_flag} "
             f"> /tmp/gortex-eval-server.log 2>&1 &"
         )
         logger.info("Starting eval-server on port %d", self.eval_server_port)
@@ -348,20 +304,6 @@ class GortexDockerEnvironment:
             f"Eval-server health check timed out after {self.gortex_timeout}s "
             f"for instance {self.instance_id}. Server log tail:\n{log_tail}"
         )
-
-    def _get_repo_identity(self) -> tuple[str, str]:
-        """Extract (repo_name, commit_hash) from the container's /testbed repo."""
-        _, repo_out = self._container.exec_run(
-            ["bash", "-c", "basename $(git remote get-url origin 2>/dev/null || basename $(pwd)) .git"],
-            workdir=self.repo_path,
-        )
-        _, commit_out = self._container.exec_run(
-            ["bash", "-c", "git rev-parse HEAD 2>/dev/null || echo unknown"],
-            workdir=self.repo_path,
-        )
-        repo_name = repo_out.decode("utf-8", errors="replace").strip() or "unknown"
-        commit_hash = commit_out.decode("utf-8", errors="replace").strip() or "unknown"
-        return repo_name, commit_hash
 
     def _put_file_in_container(
         self,

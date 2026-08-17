@@ -2,7 +2,6 @@ package runtimeactivity
 
 import (
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -68,38 +67,6 @@ func TestTrackerExclusiveMaintenanceBlocksNewWork(t *testing.T) {
 	case <-workStarted:
 	case <-time.After(time.Second):
 		t.Fatal("work remained blocked after maintenance")
-	}
-}
-
-func TestTrackerIdleHookCoversLostWakeupTransition(t *testing.T) {
-	tracker := NewTracker()
-	var calls atomic.Int64
-	called := make(chan struct{}, 2)
-	unregister := tracker.RegisterIdleHook(func(kind string) {
-		if kind != "analysis" {
-			t.Errorf("idle kind = %q, want analysis", kind)
-		}
-		calls.Add(1)
-		called <- struct{}{}
-	})
-	defer unregister()
-
-	tracker.Begin("analysis")
-	tracker.End("analysis")
-	select {
-	case <-called:
-	case <-time.After(time.Second):
-		t.Fatal("idle hook was lost")
-	}
-	tracker.Begin("analysis")
-	tracker.End("analysis")
-	select {
-	case <-called:
-	case <-time.After(time.Second):
-		t.Fatal("second idle hook was lost")
-	}
-	if got := calls.Load(); got != 2 {
-		t.Fatalf("idle hook calls = %d, want 2", got)
 	}
 }
 

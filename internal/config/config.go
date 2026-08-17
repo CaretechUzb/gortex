@@ -162,20 +162,6 @@ func (a ArchitectureConfig) IsEmpty() bool {
 	return len(a.Layers) == 0 && len(a.Rules) == 0
 }
 
-// MultiRepoConfig holds workspace-discovery settings used by the
-// multi-repo bootstrapper. Carries the (formerly `workspace.auto_detect`)
-// flag — moved out from under `workspace:` because that key is now
-// reclaimed for the workspace-identity slug.
-type MultiRepoConfig struct {
-	// AutoDetect — when true, tracking a parent directory walks its
-	// immediate subdirectories looking for `.git/`, treating each
-	// match as a tracked repo. The legacy YAML key
-	// `workspace.auto_detect: true` is still accepted by the custom
-	// Config unmarshaller for one release; the canonical key going
-	// forward is `multi.auto_detect`.
-	AutoDetect bool `mapstructure:"auto_detect" yaml:"auto_detect,omitempty"`
-}
-
 // ProjectGlob declares a project's path-globs inside a monorepo.
 //
 //	projects:
@@ -264,15 +250,14 @@ type SemanticConfig struct {
 	SkipEmbed []SkipEmbedRule `mapstructure:"skip_embed" yaml:"skip_embed,omitempty"`
 
 	// SkipSearch lists (language, kind) combinations that should be
-	// kept in the graph but excluded from the text search index
-	// (BM25/Bleve). Same shape as SkipEmbed but targets a different
-	// index. The motivating case: a big monorepo with ~135k JSON
-	// `variable` nodes (package.json keys, tsconfig entries, etc.)
-	// pushed total symbol count over search.AutoThreshold and
-	// triggered an auto-upgrade from BM25 (~900 B/doc) to Bleve
-	// (~32 KiB/doc). Those config-key nodes aren't useful search
-	// targets — users who want to find them by name still can via
-	// graph queries. Defaults are a superset of SkipEmbed because
+	// kept in the graph but excluded from the text search index.
+	// Same shape as SkipEmbed but targets a different index. The
+	// motivating case: a big monorepo with ~135k JSON `variable`
+	// nodes (package.json keys, tsconfig entries, etc.) inflated the
+	// symbol corpus without ever being searched by name. Those
+	// config-key nodes aren't useful search targets — users who want
+	// to find them by name still can via graph queries. Defaults are
+	// a superset of SkipEmbed because
 	// anything that isn't worth embedding usually isn't worth
 	// full-text-indexing either. See DefaultSkipSearch.
 	SkipSearch []SkipEmbedRule `mapstructure:"skip_search" yaml:"skip_search,omitempty"`
@@ -343,9 +328,9 @@ func DefaultSkipEmbed() []SkipEmbedRule {
 
 // DefaultSkipSearch returns the baseline (language, kind) pairs that
 // are kept out of the text search index. Superset of DefaultSkipEmbed:
-// if a node isn't worth a vector slot it generally isn't worth a BM25/
-// Bleve slot either, and on big monorepos these config-key nodes are
-// what pushes the backend into its Bleve auto-upgrade (~32 KiB/doc).
+// if a node isn't worth a vector slot it generally isn't worth a
+// full-text slot either, and on big monorepos these config-key nodes
+// dominate the corpus without ever being searched by name.
 // JSON is the heaviest of the additions — tsconfig / package.json /
 // lockfile keys alone can account for >100k variable nodes.
 func DefaultSkipSearch() []SkipEmbedRule {
@@ -511,9 +496,8 @@ type Config struct {
 	Artifacts []ArtifactEntry `mapstructure:"artifacts" yaml:"artifacts,omitempty"`
 	// Queries are named, reusable detector bundles runnable via
 	// `analyze kind=named`.
-	Queries  []NamedQuery    `mapstructure:"queries" yaml:"queries,omitempty"`
-	Multi    MultiRepoConfig `mapstructure:"multi"    yaml:"multi,omitempty"`
-	Semantic SemanticConfig  `mapstructure:"semantic" yaml:"semantic,omitempty"`
+	Queries  []NamedQuery   `mapstructure:"queries" yaml:"queries,omitempty"`
+	Semantic SemanticConfig `mapstructure:"semantic" yaml:"semantic,omitempty"`
 	// LLM configures the LLM service that backs the `ask` MCP tool and
 	// the search-assist passes. Empty by default — daemon skips LLM
 	// wiring entirely when the active provider has no model configured.
@@ -605,13 +589,14 @@ type IndexConfig struct {
 	// SkipSearch is the effective text-index skip rules resolved from
 	// Semantic.SkipSearch, same propagation pattern as SkipEmbed.
 	// Users configure this under semantic.skip_search; the indexer
-	// reads it here. Controls what goes into BM25/Bleve — unlike
-	// SkipEmbed it doesn't affect the graph or vector index.
+	// reads it here. Controls what goes into the store-native FTS
+	// text index — unlike SkipEmbed it doesn't affect the graph or
+	// vector index.
 	SkipSearch []SkipEmbedRule `mapstructure:"-" yaml:"-"`
 	// IndexProse is the effective prose-indexing toggle resolved from
 	// Search.IndexProse -- same `-` (not on-disk) propagation pattern
 	// as SkipSearch. When false, Markdown KindDoc prose-section nodes
-	// are kept out of the BM25 search index. Defaults to true.
+	// are kept out of the text search index. Defaults to true.
 	IndexProse bool `mapstructure:"-" yaml:"-"`
 	// MaxFileSize skips files larger than this during indexing. Zero
 	// (the default) disables the cap — full coverage is preferred so
@@ -1802,9 +1787,6 @@ func Default() *Config {
 				Mode:   "defer",
 			},
 		},
-		Multi: MultiRepoConfig{
-			AutoDetect: false,
-		},
 		Semantic: SemanticConfig{
 			Enabled:         true,
 			TimeoutSeconds:  120,
@@ -1818,13 +1800,6 @@ func Default() *Config {
 
 // Load reads config from file, environment, and returns a merged Config.
 // configPath may be empty; in that case only default locations are searched.
-//
-// Legacy-shape handling: previously the `workspace:` key held a struct
-// (`workspace: { auto_detect: true }`). The new schema
-// reclaims `workspace:` as a scalar slug. Existing configs are migrated
-// in place — `workspace.auto_detect` lifts into `multi.auto_detect`,
-// and the loader emits a one-line deprecation note via the returned
-// error chain (callers can choose whether to surface or swallow it).
 func Load(configPath string) (*Config, error) {
 	v := viper.New()
 	v.SetConfigName(".gortex")
@@ -1850,13 +1825,6 @@ func Load(configPath string) (*Config, error) {
 		// No config file found — use defaults + env.
 	}
 
-	// Migrate legacy `workspace:` mapping shape (held a struct with
-	// `auto_detect`) into the new `multi:` block so the v.Unmarshal
-	// below decodes the new schema cleanly. We do the migration on the
-	// viper key map so env-var overrides and viper's own merge logic
-	// stay consistent.
-	migrateLegacyWorkspaceKey(v)
-
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, err
 	}
@@ -1870,50 +1838,6 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	return cfg, nil
-}
-
-// migrateLegacyWorkspaceKey rewrites `workspace.auto_detect` → `multi.auto_detect`
-// in the viper key store before unmarshal, so a `.gortex.yaml` written
-// against the legacy schema still produces a working Config without the
-// caller seeing a parse error. The migration is silent — there's no
-// global logger here — but the audit step (`gortex audit_agent_config`,
-// reserved for a follow-up) can flag the deprecated key.
-//
-// Only the documented legacy field is migrated. Any other map under
-// `workspace:` is rejected by `validateWorkspaceSchema` so unknown
-// shapes don't get silently ignored.
-func migrateLegacyWorkspaceKey(v *viper.Viper) {
-	raw := v.Get("workspace")
-	if raw == nil {
-		return
-	}
-	switch t := raw.(type) {
-	case string:
-		// Already in new shape; nothing to do.
-	case map[string]interface{}:
-		if ad, ok := t["auto_detect"]; ok {
-			// Move to the new home unless `multi.auto_detect`
-			// is already set explicitly (caller wins).
-			if v.Get("multi.auto_detect") == nil {
-				v.Set("multi.auto_detect", ad)
-			}
-		}
-		// The old shape never carried a workspace identity slug,
-		// so we clear the polymorphic key so v.Unmarshal doesn't
-		// fail trying to coerce a map into a string.
-		v.Set("workspace", "")
-	case map[interface{}]interface{}:
-		// yaml.v2 / older path — same semantics.
-		if ad, ok := t["auto_detect"]; ok {
-			if v.Get("multi.auto_detect") == nil {
-				v.Set("multi.auto_detect", ad)
-			}
-		}
-		v.Set("workspace", "")
-	default:
-		// Unrecognised shape; downstream coercion will surface
-		// a precise error rather than us silently dropping it.
-	}
 }
 
 // validateWorkspaceSchema enforces the defaults / boundaries that

@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -58,26 +59,83 @@ func TestChangedSinceMtimesCensusDeletesNewlyExcludedTrackedFile(t *testing.T) {
 	assert.Zero(t, detected)
 }
 
-func TestCleanCensusResultBootstrapsNonPersistentSearch(t *testing.T) {
-	g := graph.New()
-	g.AddNode(&graph.Node{
-		ID:       "function::Alpha",
-		Kind:     graph.KindFunction,
-		Name:     "Alpha",
-		FilePath: "a.go",
-	})
-	idx := newTestIndexer(g)
-	idx.search = search.NewBM25()
-	idx.SetFileMtimes(map[string]int64{"a.go": 1})
+func TestCleanCensusRestoresDurableVectorsWithoutEmbedding(t *testing.T) {
+	root := vectorPersistFixture(t, 1)
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 
-	result := idx.cleanCensusResult(1, time.Now())
+	seedEmbedder := &poolEmbedder{}
+	seed := newVectorPersistIndexer(t, store, seedEmbedder)
+	_, err = seed.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	require.Greater(t, seedEmbedder.calls, int32(0))
 
+	restartEmbedder := &poolEmbedder{failOnText: "every call would fail"}
+	restarted := newVectorPersistIndexer(t, store, restartEmbedder)
+	result, err := restarted.cleanCensusResult(context.Background(), 1, time.Now())
+	require.NoError(t, err)
 	require.NotNil(t, result)
-	assert.Equal(t, 1, result.FileCount)
-	assert.Equal(t, 1, result.NodeCount)
-	assert.Equal(t, 1, idx.TotalDetected())
-	assert.Equal(t, 1, idx.search.Count())
-	require.NotEmpty(t, idx.search.Search("Alpha", 10))
+	require.Zero(t, restartEmbedder.calls,
+		"warm restoration must publish durable corpus statistics without a paid embedding pass")
+	assertDelegatedVectorPublication(t, restarted)
+}
+
+func TestCleanCensusRebuildsMigrationClearedVectorCorpus(t *testing.T) {
+	root := vectorPersistFixture(t, 1)
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	seed := newVectorPersistIndexer(t, store, &poolEmbedder{})
+	_, err = seed.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	_, err = store.ReplaceVectorCorpus(context.Background(), "", 3, nil)
+	require.NoError(t, err)
+
+	rebuildEmbedder := &poolEmbedder{}
+	restarted := newVectorPersistIndexer(t, store, rebuildEmbedder)
+	_, err = restarted.cleanCensusResult(context.Background(), 1, time.Now())
+	require.NoError(t, err)
+	require.Greater(t, rebuildEmbedder.calls, int32(0),
+		"an empty durable sidecar with live graph nodes must be rebuilt once")
+	stats, err := store.VectorCorpusStatsForRepo(context.Background(), "", 3)
+	require.NoError(t, err)
+	require.Greater(t, stats.RepositoryVectorCount, 0)
+	assertDelegatedVectorPublication(t, restarted)
+}
+
+func TestRestoreDurableVectorBackendRequiresCurrentRepositoryCorpus(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	store.AddBatch([]*graph.Node{
+		{ID: "A/alpha", Kind: graph.KindFunction, Name: "alpha", FilePath: "A/a.go", RepoPrefix: "A"},
+		{ID: "B/beta", Kind: graph.KindFunction, Name: "beta", FilePath: "B/b.go", RepoPrefix: "B"},
+	}, nil)
+	_, err = store.ReplaceVectorCorpus(context.Background(), "B", 3, []graph.VectorCorpusItem{
+		{NodeID: "B/beta", Vec: []float32{1, 0, 0}},
+	})
+	require.NoError(t, err)
+
+	emb := &poolEmbedder{}
+	idx := newVectorPersistIndexer(t, store, emb)
+	idx.SetRepoPrefix("A")
+	restored, err := idx.restoreDurableVectorBackend(context.Background(), store)
+	require.NoError(t, err)
+	require.False(t, restored,
+		"another repository's vectors must not suppress this repository's rebuild")
+	require.Zero(t, emb.calls)
+
+	_, err = store.ReplaceVectorCorpus(context.Background(), "A", 3, []graph.VectorCorpusItem{
+		{NodeID: "A/alpha", Vec: []float32{0, 1, 0}},
+	})
+	require.NoError(t, err)
+	restored, err = idx.restoreDurableVectorBackend(context.Background(), store)
+	require.NoError(t, err)
+	require.True(t, restored)
+	require.Zero(t, emb.calls, "repository-scoped restore must never invoke embedding")
+	assertDelegatedVectorPublication(t, idx)
 }
 
 func TestReconcileRepoCtxUsesCleanCensusNoOp(t *testing.T) {
@@ -91,14 +149,14 @@ func TestReconcileRepoCtxUsesCleanCensusNoOp(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 
-	seed := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	seed := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = seed.IndexAll()
 	require.NoError(t, err)
 	prior := seed.GetIndexer("repo").FileMtimes()
 	before := store.Stats()
 
 	core, logs := observer.New(zap.DebugLevel)
-	restarted := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewBM25(), cm, zap.New(core))
+	restarted := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewNull(), cm, zap.New(core))
 	result, err := restarted.ReconcileRepoCtx(t.Context(), entry, prior)
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -140,7 +198,9 @@ func BenchmarkCleanReconcileDiscovery(b *testing.B) {
 			if err != nil || len(changed) != 0 || len(deleted) != 0 {
 				b.Fatalf("clean census: changed=%d deleted=%d err=%v", len(changed), len(deleted), err)
 			}
-			idx.cleanCensusResult(detected, time.Now())
+			if _, err := idx.cleanCensusResult(context.Background(), detected, time.Now()); err != nil {
+				b.Fatalf("clean result: %v", err)
+			}
 		}
 	})
 

@@ -33,8 +33,11 @@ order of operations."
    `parser.ExtractionResult`; `Indexer.processExtraction` writes
    them into the `graph.Graph` and accumulates incoming-edge
    tracking for the next phase.
-4. `Indexer.buildSearchIndex` (BM25 / Bleve) + `idx.embedder`
-   (if set) populate the search backends.
+4. The backing store owns the symbol FTS corpus: shadow drains bulk-publish it,
+   direct-store passes rebuild it, and incremental mutations upsert or delete
+   affected rows. The vector pipeline prepares an immutable plan with
+   `Indexer.prepareSearchIndexForPublication`, then publishes it through
+   `Indexer.installVectorPlan` after the durable shadow drain succeeds.
 5. Semantic enrichment (`internal/semantic`) runs LSP / SCIP
    providers in parallel; resolved edges get
    `Origin=lsp_resolved` for tier filtering.

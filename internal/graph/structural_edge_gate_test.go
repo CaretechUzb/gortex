@@ -38,7 +38,8 @@ func TestFilterStructuralEdgeViolationsCopiesOnlyOnViolation(t *testing.T) {
 		{From: "a::T3", To: "a::I", Kind: EdgeExtends},
 	}
 	kept, dropped = FilterStructuralEdgeViolations(mixed)
-	assert.Equal(t, 1, dropped)
+	require.Len(t, dropped, 1)
+	assert.Same(t, mixed[1], dropped[0])
 	require.Len(t, kept, 2)
 	assert.Equal(t, "a::I", kept[0].To)
 	assert.Equal(t, "a::I", kept[1].To)

@@ -77,38 +77,6 @@ func TestSpinnerDoneIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestMultiFansOutAndSkipsNil(t *testing.T) {
-	a := &countingReporter{}
-	b := &countingReporter{}
-	r := Multi(a, nil, b)
-
-	r.Report("walk", 1, 10)
-	r.Report("parse", 0, 0)
-
-	if a.calls != 2 || b.calls != 2 {
-		t.Errorf("expected 2 calls each, got a=%d b=%d", a.calls, b.calls)
-	}
-}
-
-func TestMultiCollapsesToSingle(t *testing.T) {
-	a := &countingReporter{}
-	r := Multi(nil, a, nil)
-	if r != a {
-		t.Errorf("expected Multi with one non-nil to return that reporter directly")
-	}
-}
-
-func TestMultiAllNilReturnsNop(t *testing.T) {
-	r := Multi(nil, nil)
-	if _, ok := r.(Nop); !ok {
-		t.Errorf("expected Nop when all inputs nil, got %T", r)
-	}
-}
-
-type countingReporter struct{ calls int }
-
-func (c *countingReporter) Report(string, int, int) { c.calls++ }
-
 // TestASCIIGlyphFallbackOnOEMCodepage proves the F8 contract: a terminal that
 // cannot render UTF-8 (a legacy OEM codepage, a linux virtual console, or an
 // explicit GORTEX_ASCII) gets an ASCII glyph set for the spinner finish

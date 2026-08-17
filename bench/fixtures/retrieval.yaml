@@ -27,11 +27,11 @@
 # Cases are tiered so per-tier weakness is visible:
 #
 #   tier: exact      — symbol-name queries. Tests "find this named
-#                      thing." BM25 should dominate; a retrieval stack
-#                      that can't ace exact tier is broken.
+#                      thing." Store-native lexical search should dominate;
+#                      a retrieval stack that can't ace exact tier is broken.
 #   tier: concept    — natural-language paraphrase queries. Tests
-#                      semantic understanding. Where BM25 starts losing
-#                      to semantic / RRF if the embedder is competent.
+#                      semantic understanding. Where lexical retrieval starts
+#                      losing to vector/adaptive fusion if the embedder is competent.
 #   tier: multi_hop  — relational queries with several valid expected
 #                      IDs (any-hit semantics). Tests graph-aware
 #                      retrieval: "things that handle X" / "extractors
@@ -63,11 +63,11 @@ cases:
   - { id: exact-AddNode,             tier: exact, query: "AddNode",                     expected: [internal/graph/graph.go::Graph.AddNode] }
   - { id: exact-AtomicWriteFile,     tier: exact, query: "AtomicWriteFile",             expected: [internal/agents/writer.go::AtomicWriteFile] }
   - { id: exact-WriteIfNotExists,    tier: exact, query: "WriteIfNotExists",            expected: [internal/agents/writer.go::WriteIfNotExists] }
-  - { id: exact-BM25Backend,         tier: exact, query: "BM25Backend",                 expected: [internal/search/bm25.go::BM25Backend] }
-  - { id: exact-NewBM25,             tier: exact, query: "NewBM25",                     expected: [internal/search/bm25.go::NewBM25] }
+  - { id: exact-SymbolSearcherBackend, tier: exact, query: "SymbolSearcherBackend",       expected: [internal/search/symbolsearcher_backend.go::SymbolSearcherBackend] }
+  - { id: exact-NewSymbolSearcherBackend, tier: exact, query: "NewSymbolSearcherBackend", expected: [internal/search/symbolsearcher_backend.go::NewSymbolSearcherBackend] }
   - { id: exact-HybridBackend,       tier: exact, query: "HybridBackend",               expected: [internal/search/hybrid.go::HybridBackend] }
   - { id: exact-NewHybrid,           tier: exact, query: "NewHybrid",                   expected: [internal/search/hybrid.go::NewHybrid] }
-  - { id: exact-rrfFuse,             tier: exact, query: "rrfFuse",                     expected: [internal/search/hybrid.go::rrfFuse] }
+  - { id: exact-alphaFuse,           tier: exact, query: "alphaFuse",                   expected: [internal/search/hybrid.go::alphaFuse] }
   - { id: exact-VectorBackend,       tier: exact, query: "VectorBackend",               expected: [internal/search/vector.go::VectorBackend] }
   - { id: exact-SearchBackend,       tier: exact, query: "search.Backend",              expected: [internal/search/search.go::Backend] }
   - { id: exact-SearchResult,        tier: exact, query: "SearchResult",                expected: [internal/search/search.go::SearchResult] }
@@ -119,10 +119,10 @@ cases:
   - { id: concept-reindex-one-file,  tier: concept, query: "reindex a single file after an edit",           expected: [internal/indexer/indexer.go::Indexer.IndexFile] }
   - { id: concept-evict-file,        tier: concept, query: "remove all nodes belonging to a file",          expected: [internal/graph/graph.go::Graph.EvictFile] }
   - { id: concept-evict-repo,        tier: concept, query: "drop every node for a repository prefix",       expected: [internal/graph/graph.go::Graph.EvictRepo] }
-  - { id: concept-bm25-index,        tier: concept, query: "text search backend with TF-IDF ranking",       expected: [internal/search/bm25.go::BM25Backend] }
-  - { id: concept-hybrid-fuse,       tier: concept, query: "combine text and vector search with RRF",       expected: [internal/search/hybrid.go::HybridBackend] }
-  - { id: concept-rrf-algorithm,     tier: concept, query: "reciprocal rank fusion",                        expected: [internal/search/hybrid.go::rrfFuse] }
-  - { id: concept-swap-backend,      tier: concept, query: "hot-swap the in-memory search backend",         expected: [internal/search/swappable.go::Swappable] }
+  - { id: concept-store-native-text, tier: concept, query: "adapt store-native symbol search into the search backend", expected: [internal/search/symbolsearcher_backend.go::SymbolSearcherBackend] }
+  - { id: concept-hybrid-fuse,       tier: concept, query: "combine store-native text and vector search with adaptive alpha", expected: [internal/search/hybrid.go::HybridBackend] }
+  - { id: concept-adaptive-alpha,    tier: concept, query: "adaptive alpha weighted text and vector fusion", expected: [internal/search/hybrid.go::alphaFuse] }
+  - { id: concept-swap-backend,      tier: concept, query: "atomically replace the vector channel while preserving the live text backend", expected: [internal/search/swappable.go::Swappable.ReplaceHybridVector] }
   - { id: concept-glove-embed,       tier: concept, query: "built-in GloVe word vector embedder",           expected: [internal/embedding/static.go::StaticProvider] }
   - { id: concept-mcp-server,        tier: concept, query: "MCP server type holding engine and graph",      expected: [internal/mcp/server.go::Server] }
   - { id: concept-session-state,     tier: concept, query: "per-client session activity tracking",          expected: [internal/mcp/server.go::sessionState] }
@@ -154,7 +154,7 @@ cases:
   - { id: concept-ts-extract,        tier: concept, query: "TypeScript language extractor",                 expected: [internal/parser/languages/typescript.go::TypeScriptExtractor] }
   - { id: concept-detect-lang,       tier: concept, query: "detect language from file extension",           expected: [internal/parser/registry.go::Registry.GetByExtension] }
   - { id: concept-register-all,      tier: concept, query: "register every language extractor",             expected: [internal/parser/languages/register.go::RegisterAll] }
-  - { id: concept-ranker-bm25,       tier: concept, query: "eval ranker adapter for BM25",                  expected: [internal/eval/recall/rankers.go::BM25Ranker] }
+  - { id: concept-ranker-engine,     tier: concept, query: "eval ranker adapter for engine search",         expected: [internal/eval/recall/rankers.go::EngineRanker] }
   - { id: concept-ranker-rrf,        tier: concept, query: "eval ranker adapter for RRF hybrid",            expected: [internal/eval/recall/rankers.go::RRFRanker] }
   - { id: concept-ranker-semantic,   tier: concept, query: "eval ranker for vector-only semantic",          expected: [internal/eval/recall/rankers.go::SemanticRanker] }
   - { id: concept-ranker-winnow,     tier: concept, query: "eval ranker wrapping graph-aware winnow",       expected: [internal/eval/recall/rankers.go::WinnowRanker] }
@@ -163,7 +163,7 @@ cases:
   - { id: concept-repo-for-file,     tier: concept, query: "find which repo contains a given file",         expected: [internal/indexer/multi.go::MultiIndexer.RepoForFile] }
   - { id: concept-set-embedder,      tier: concept, query: "attach embedding provider to the indexer",      expected: [internal/indexer/indexer.go::Indexer.SetEmbedder] }
   - { id: concept-new-server,        tier: concept, query: "construct a new MCP server instance",           expected: [internal/mcp/server.go::NewServer] }
-  - { id: concept-new-hybrid,        tier: concept, query: "construct a hybrid BM25+vector backend",        expected: [internal/search/hybrid.go::NewHybrid] }
+  - { id: concept-new-hybrid,        tier: concept, query: "construct a hybrid store-native text and vector backend", expected: [internal/search/hybrid.go::NewHybrid] }
   - { id: concept-reindex-all,       tier: concept, query: "incremental reindex after file changes",        expected: [internal/indexer/indexer.go::Indexer.IncrementalReindexPaths] }
   - { id: concept-new-vector,        tier: concept, query: "HNSW vector index backend",                     expected: [internal/search/vector.go::VectorBackend] }
   - { id: concept-api-embedder,      tier: concept, query: "OpenAI-compatible embeddings API provider",     expected: [internal/embedding/api.go::APIProvider] }
@@ -229,8 +229,8 @@ cases:
     tier: multi_hop
     query: "search backend implementations"
     expected:
-      - internal/search/bm25.go::BM25Backend
-      - internal/search/bleve.go::BleveBackend
+      - internal/search/null.go::NullBackend
+      - internal/search/symbolsearcher_backend.go::SymbolSearcherBackend
       - internal/search/hybrid.go::HybridBackend
       - internal/search/vector.go::VectorBackend
       - internal/search/swappable.go::Swappable
@@ -269,7 +269,7 @@ cases:
     tier: multi_hop
     query: "ranker adapters in the eval package"
     expected:
-      - internal/eval/recall/rankers.go::BM25Ranker
+      - internal/eval/recall/rankers.go::EngineRanker
       - internal/eval/recall/rankers.go::SemanticRanker
       - internal/eval/recall/rankers.go::RRFRanker
       - internal/eval/recall/rankers.go::WinnowRanker
@@ -410,15 +410,15 @@ cases:
       - internal/config/config.go::Load
       - internal/config/config.go::Default
 
-  - id: mh-bm25-api
+  - id: mh-null-backend-api
     tier: multi_hop
-    query: "BM25 backend public API"
+    query: "null search backend public API"
     expected:
-      - internal/search/bm25.go::BM25Backend.Add
-      - internal/search/bm25.go::BM25Backend.Remove
-      - internal/search/bm25.go::BM25Backend.Search
-      - internal/search/bm25.go::BM25Backend.Count
-      - internal/search/bm25.go::NewBM25
+      - internal/search/null.go::NullBackend.Add
+      - internal/search/null.go::NullBackend.Remove
+      - internal/search/null.go::NullBackend.Search
+      - internal/search/null.go::NullBackend.Count
+      - internal/search/null.go::NewNull
 
   - id: mh-tool-registrations
     tier: multi_hop

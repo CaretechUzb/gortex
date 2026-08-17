@@ -341,11 +341,16 @@ func FindDeadCode(g graph.Store, processes *ProcessResult, excludePatterns []str
 
 		// Skip implicitly-called constructors/initializers.
 		// Go: init() is called by the runtime.
-		// Python: __init__ is called when a class is instantiated.
+		// Python: every __dunder__ is invoked by the runtime or a builtin
+		// rather than through a written call site -- __init__ on
+		// instantiation, __repr__ by repr()/str(), __enter__/__exit__ by
+		// `with`, __len__ by len(), __iter__ by `for`. They therefore always
+		// look dead, the same way generated symbols and framework entry
+		// points do above.
 		if n.Name == "init" && n.Language == "go" {
 			continue
 		}
-		if n.Name == "__init__" && n.Language == "python" {
+		if n.Language == "python" && isPythonDunder(n.Name) {
 			continue
 		}
 
@@ -1003,6 +1008,15 @@ func isWellKnownInterfaceMethod(name, lang string) bool {
 		return false
 	}
 	return goWellKnownMethods[name]
+}
+
+// isPythonDunder reports whether name is a __dunder__ special method. Python
+// invokes these implicitly -- via an operator, a builtin, or a statement -- so
+// they carry no hand-written call site and always look dead to the graph.
+func isPythonDunder(name string) bool {
+	return len(name) > 4 &&
+		strings.HasPrefix(name, "__") &&
+		strings.HasSuffix(name, "__")
 }
 
 // isVendoredOrGenerated checks if a file is vendored or generated code that

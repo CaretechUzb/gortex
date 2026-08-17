@@ -132,7 +132,7 @@ func TestEmbedAllChunks_PoolRespectsConcurrencyCap(t *testing.T) {
 	idx := newPoolTestIndexer(t, emb, cap)
 
 	texts := makeTexts(60) // 60 texts, batch 5 → 12 batches > cap
-	vectors, err := idx.embedAllChunks(texts, 5, passthroughEmbedFn(idx))
+	vectors, err := idx.embedAllChunks(context.Background(), texts, 5, passthroughEmbedFn(idx))
 	require.NoError(t, err)
 
 	require.Len(t, vectors, len(texts), "every text must be embedded")
@@ -155,16 +155,16 @@ func TestEmbedAllChunks_AbortsOnError(t *testing.T) {
 	emb := &poolEmbedder{delay: 5 * time.Millisecond, failOnText: "t37"}
 	idx := newPoolTestIndexer(t, emb, 4)
 
-	vectors, err := idx.embedAllChunks(makeTexts(80), 5, passthroughEmbedFn(idx))
+	vectors, err := idx.embedAllChunks(context.Background(), makeTexts(80), 5, passthroughEmbedFn(idx))
 	require.Error(t, err, "one failing chunk must fail the whole embed")
 	assert.Nil(t, vectors, "a failed embed must return no partial result")
 	assert.Contains(t, err.Error(), "t37")
 }
 
-// TestBuildSearchIndex_AbortOnEmbedErrorKeepsTextOnly asserts the
-// end-to-end abort contract: when embedding fails, buildSearchIndex
-// leaves the search backend text-only — no HybridBackend is swapped in.
-func TestBuildSearchIndex_AbortOnEmbedErrorKeepsTextOnly(t *testing.T) {
+// TestBuildSearchIndexCtx_AbortOnEmbedErrorKeepsTextOnly asserts the end-to-end
+// abort contract: when embedding fails, vector publication leaves the search
+// backend text-only — no HybridBackend is swapped in.
+func TestBuildSearchIndexCtx_AbortOnEmbedErrorKeepsTextOnly(t *testing.T) {
 	g := graph.New()
 	// Two function nodes; their embed metadata text is
 	// "function <Name> ...". poolEmbedder fails on an exact text
@@ -176,15 +176,18 @@ func TestBuildSearchIndex_AbortOnEmbedErrorKeepsTextOnly(t *testing.T) {
 	emb := &poolEmbedder{failOnText: "function Alpha  a.go"}
 	idx.SetEmbedder(emb)
 
-	idx.buildSearchIndex()
+	require.NoError(t, idx.buildSearchIndexCtx(context.Background()))
+	require.Error(t, idx.LastVectorBuildError())
 
 	// The backend must NOT be a HybridBackend — embedding aborted, so
 	// the search stays text-only.
 	sw, ok := idx.Search().(*search.Swappable)
 	require.True(t, ok)
-	_, isHybrid := sw.Inner().(*search.HybridBackend)
+	backend, release := sw.AcquireBackend()
+	defer release()
+	_, isHybrid := backend.(*search.HybridBackend)
 	assert.False(t, isHybrid,
-		"buildSearchIndex must not install a HybridBackend when embedding fails")
+		"vector publication must not install a HybridBackend when embedding fails")
 }
 
 // TestEmbedAllChunks_DeterministicRegardlessOfOrder runs the pool many
@@ -197,7 +200,7 @@ func TestEmbedAllChunks_DeterministicRegardlessOfOrder(t *testing.T) {
 		idx := newPoolTestIndexer(t, emb, 6)
 
 		texts := makeTexts(50)
-		vectors, err := idx.embedAllChunks(texts, 3, passthroughEmbedFn(idx))
+		vectors, err := idx.embedAllChunks(context.Background(), texts, 3, passthroughEmbedFn(idx))
 		require.NoError(t, err)
 		require.Len(t, vectors, len(texts))
 		for i := range texts {
@@ -217,11 +220,67 @@ func TestEmbedAllChunks_SerialForNonConcurrentEmbedder(t *testing.T) {
 	idx.SetEmbedder(emb)
 	idx.SetEmbeddingAPIConcurrency(8)
 
-	vectors, err := idx.embedAllChunks(makeTexts(30), 3, passthroughEmbedFn(idx))
+	vectors, err := idx.embedAllChunks(context.Background(), makeTexts(30), 3, passthroughEmbedFn(idx))
 	require.NoError(t, err)
 	require.Len(t, vectors, 30)
 	assert.Equal(t, 1, emb.peak,
 		"an embedder without Concurrent() must be driven serially (peak in-flight 1)")
+}
+
+func TestEmbedAllChunks_SerialHonorsParentCancellation(t *testing.T) {
+	emb := &serialOnlyEmbedder{}
+	idx := newPoolTestIndexer(t, emb, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	vectors, err := idx.embedAllChunks(ctx, makeTexts(3), 1, passthroughEmbedFn(idx))
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, vectors)
+	assert.Equal(t, 0, emb.peak, "a cancelled owner must not start serial embedding")
+}
+
+func TestEmbedAllChunks_ParallelHonorsCancellationWhenProviderReturnsLate(t *testing.T) {
+	idx := newPoolTestIndexer(t, &poolEmbedder{}, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+
+	done := make(chan struct {
+		vectors [][]float32
+		err     error
+	}, 1)
+	go func() {
+		vectors, err := idx.embedAllChunks(ctx, makeTexts(4), 1, func(_ context.Context, items []string) ([][]float32, error) {
+			startedOnce.Do(func() { close(started) })
+			<-release // Model a provider that ignores cancellation and returns late.
+			vectors := make([][]float32, len(items))
+			for i := range vectors {
+				vectors[i] = []float32{1, 0, 0}
+			}
+			return vectors, nil
+		})
+		done <- struct {
+			vectors [][]float32
+			err     error
+		}{vectors: vectors, err: err}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("parallel embedding did not start")
+	}
+	cancel()
+	close(release)
+
+	select {
+	case result := <-done:
+		require.ErrorIs(t, result.err, context.Canceled)
+		assert.Nil(t, result.vectors, "cancelled embedding must not return late vectors")
+	case <-time.After(5 * time.Second):
+		t.Fatal("parallel embedding did not stop after cancellation")
+	}
 }
 
 // TestEmbedAllChunks_ConcurrencyCapIsBinding proves the configured cap
@@ -242,7 +301,7 @@ func TestEmbedAllChunks_ConcurrencyCapIsBinding(t *testing.T) {
 	texts := makeTexts(30) // batch 2 → 15 batches
 	done := make(chan error, 1)
 	go func() {
-		_, err := idx.embedAllChunks(texts, 2, passthroughEmbedFn(idx))
+		_, err := idx.embedAllChunks(context.Background(), texts, 2, passthroughEmbedFn(idx))
 		done <- err
 	}()
 
@@ -276,7 +335,7 @@ func TestEmbedAllChunks_ZeroCapUsesDefault(t *testing.T) {
 
 	// More batches than the default so the pool can saturate it.
 	texts := makeTexts(40) // batch 2 → 20 batches
-	vectors, err := idx.embedAllChunks(texts, 2, passthroughEmbedFn(idx))
+	vectors, err := idx.embedAllChunks(context.Background(), texts, 2, passthroughEmbedFn(idx))
 	require.NoError(t, err)
 	require.Len(t, vectors, len(texts))
 
@@ -296,7 +355,7 @@ func TestSetEmbeddingAPIConcurrency_FlowsToPool(t *testing.T) {
 	emb := &poolEmbedder{delay: 5 * time.Millisecond}
 	idx := newPoolTestIndexer(t, emb, 1) // cap 1 → no overlap
 
-	vectors, err := idx.embedAllChunks(makeTexts(20), 2, passthroughEmbedFn(idx))
+	vectors, err := idx.embedAllChunks(context.Background(), makeTexts(20), 2, passthroughEmbedFn(idx))
 	require.NoError(t, err)
 	require.Len(t, vectors, 20)
 	assert.Equal(t, 1, emb.peak,

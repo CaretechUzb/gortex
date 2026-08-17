@@ -1,4 +1,4 @@
-=== home/.codeium/mcp_config.json ===
+=== project/home/.codeium/mcp_config.json ===
 {
   "mcpServers": {
     "gortex": {
@@ -12,8 +12,22 @@
     }
   }
 }
-=== root/.windsurfrules ===
+=== project/root/.windsurfrules ===
 <!-- gortex:communities:start -->
 - [example-community](.claude/skills/example/SKILL.md) — example routing block
 
 <!-- gortex:communities:end -->
+=== global/home/.codeium/mcp_config.json ===
+{
+  "mcpServers": {
+    "gortex": {
+      "args": [
+        "mcp"
+      ],
+      "command": "gortex",
+      "env": {
+        "GORTEX_INDEX_WORKERS": "8"
+      }
+    }
+  }
+}

@@ -182,12 +182,9 @@ func persistFileMetaRows(target graph.Store, repoPrefix string, rows []graph.Fil
 const reparsePendingEnrichmentBatchSize = 256
 
 type reparsePendingEnrichmentBatch struct {
-	byFile                   map[string]bool
-	deferResolverCatchup     bool
-	deferredAffectedFiles    map[string]struct{}
-	deferredAffectedPasses   int64
-	deferredAffectedResolved int64
-	deferredAffectedDropped  int64
+	byFile                map[string]bool
+	deferResolverCatchup  bool
+	deferredAffectedFiles map[string]struct{}
 }
 
 func (b *reparsePendingEnrichmentBatch) add(graphPath string, pending bool) bool {

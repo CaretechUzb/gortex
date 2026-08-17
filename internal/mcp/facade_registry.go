@@ -50,6 +50,10 @@ type facadeRegistry struct {
 	byFacade map[string]map[string]facadeOperationSpec
 	byLegacy map[string][]facadeOperationSpec
 	captured map[string]capturedFacadeTool
+	// repoFields memoizes facadePublicRepositoryField, whose input is the
+	// captured tool set. capture drops it so a late registration is never
+	// answered from a pre-registration result.
+	repoFields sync.Map
 }
 
 func newFacadeRegistry() *facadeRegistry {
@@ -82,6 +86,26 @@ func (r *facadeRegistry) capture(tool mcpgo.Tool, handler server.ToolHandlerFunc
 	r.mu.Lock()
 	r.captured[tool.Name] = capturedFacadeTool{tool: tool, handler: handler}
 	r.mu.Unlock()
+	r.repoFields.Clear()
+}
+
+func (r *facadeRegistry) cachedRepositoryField(key string) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	cached, ok := r.repoFields.Load(key)
+	if !ok {
+		return "", false
+	}
+	field, ok := cached.(string)
+	return field, ok
+}
+
+func (r *facadeRegistry) cacheRepositoryField(key, field string) {
+	if r == nil {
+		return
+	}
+	r.repoFields.Store(key, field)
 }
 
 func (r *facadeRegistry) operation(facade, operation string) (facadeOperationSpec, bool) {
@@ -135,10 +159,6 @@ func (r *facadeRegistry) availableOperations(facade string) []facadeOperationSpe
 	return out
 }
 
-func (r *facadeRegistry) mapsLegacy(name string) bool {
-	return r != nil && len(r.byLegacy[name]) > 0
-}
-
 func facadeToolNames() []string {
 	return []string{
 		"analyze", "ask", "capabilities", "change", "edit", "explore",
@@ -148,21 +168,9 @@ func facadeToolNames() []string {
 	}
 }
 
-// FacadeToolNames returns the complete stable facade-v1 tool roster. The
-// returned slice is a fresh copy so CLI/help callers cannot mutate the server's
-// canonical surface.
-func FacadeToolNames() []string {
-	return append([]string(nil), facadeToolNames()...)
-}
-
 // IsFacadeToolName reports whether name belongs to the public facade-v1
 // surface.
 func IsFacadeToolName(name string) bool { return isFacadeToolName(name) }
-
-// IsDedicatedFacadeToolName reports whether name exists only on facade-v1.
-// Shared names such as analyze/explore/review/ask retain legacy meanings and
-// are deliberately excluded.
-func IsDedicatedFacadeToolName(name string) bool { return isDedicatedFacadeTool(name) }
 
 // PublicOperationForLegacy resolves an implementation-era tool name to the
 // compact public domain and operation used in user-facing migration guidance.

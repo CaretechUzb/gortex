@@ -51,7 +51,7 @@ func TestCursorMetadataDecodedBeforeRowsNext(t *testing.T) {
 	}
 	var edges []*graph.Edge
 	for edgeRows.Next() {
-		edge, scanErr := scanEdgeCursor(edgeRows)
+		edge, scanErr := store.scanEdgeCursor(edgeRows)
 		if scanErr != nil {
 			_ = edgeRows.Close()
 			t.Fatal(scanErr)
@@ -211,10 +211,10 @@ func benchmarkEdgeMetadataCursor(b *testing.B, store *Store, raw bool) {
 		for rows.Next() {
 			var edge *graph.Edge
 			if raw {
-				edge, err = scanEdgeCursor(rows)
+				edge, err = store.scanEdgeCursor(rows)
 			} else {
 				var metaBlob []byte
-				edge, err = scanEdgeWithMeta(rows, &metaBlob)
+				edge, err = scanEdgeWithMeta(store, rows, &metaBlob)
 			}
 			if err != nil {
 				_ = rows.Close()

@@ -67,7 +67,7 @@ func TestGCVanishedWorktrees_EvictsRemovedWorktree(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
@@ -132,7 +132,7 @@ func TestGCVanishedWorktrees_LeavesVanishedMainCheckout(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 	require.False(t, mi.GetMetadata("plain").IsWorktree,
@@ -180,7 +180,7 @@ func TestLinkedWorktreeRoots(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 

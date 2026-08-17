@@ -299,10 +299,10 @@ func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
 		out.Index.SkipEmbed = DefaultSkipEmbed()
 	}
 	// Same plumbing for semantic.skip_search — controls what goes into
-	// the BM25/Bleve text index. Separate from SkipEmbed so users can
-	// tune the two filters independently (e.g. a tiny-repo user who
-	// doesn't care about text-index memory can clear SkipSearch while
-	// keeping SkipEmbed's embedding-cost savings).
+	// the store-native text search index. Separate from SkipEmbed so
+	// users can tune the two filters independently (e.g. a tiny-repo
+	// user who doesn't care about text-index size can clear SkipSearch
+	// while keeping SkipEmbed's embedding-cost savings).
 	if len(out.Semantic.SkipSearch) > 0 {
 		out.Index.SkipSearch = out.Semantic.SkipSearch
 	} else {

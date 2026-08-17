@@ -1,6 +1,6 @@
 # Semantic search
 
-**Default-on.** A baked GloVe-50d table (~3.8 MB embedded in the binary, top 20k tokens) gives every install hybrid BM25 + vector search out of the box — no flag, no model download, no native dependency. Reciprocal Rank Fusion blends the two channels, and the BM25↔vector balance is scored *continuously* from the query's shape (identifier density, separators, stopwords) rather than bucketed into a discrete class — so a half-identifier query lands between the symbol and natural-language blends instead of jumping a whole tier. After ranking, an optional pure-cosine refinement pass re-scores the top results with the exact embedding distance the rank-based fusion discards.
+**Default-on.** A baked GloVe-50d table (~3.8 MB embedded in the binary, top 20k tokens) gives every install hybrid store-native FTS5/BM25 + vector search out of the box — no flag, no model download, no native dependency. Adaptive alpha-weighted rank fusion blends the two channels, and the text↔vector balance is scored *continuously* from the query's shape (identifier density, separators, stopwords) rather than bucketed into a discrete class — so a half-identifier query lands between the symbol and natural-language blends instead of jumping a whole tier. After ranking, an optional pure-cosine refinement pass re-scores the top results with the exact embedding distance the rank-based fusion discards.
 
 ## Configuration
 
@@ -63,13 +63,9 @@ Centrality (HITS + PageRank) and a dedicated rerank signal weight call/reference
 - **Generated-file demotion** — a generated file (`*.pb.go`, `mock_*.go`, `*_pb2.py`, …) is ranked below a real same-named hand-written implementation, but only when one exists.
 - **Source over test** — when a query surfaces both an implementation and its test, the implementation is lifted above the test (only when both co-occur, so it never shifts the rest of the page).
 
-### Sparse sub-word tokenization (opt-in)
-
-An optional tokenizer stage emits sub-word n-grams whose split points come from a per-repo boundary table learned from symbol names at index time, trading exact-identifier precision for recall on typo/fragment queries. Off by default (it is reindex-required and precision-sensitive); enable with `GORTEX_SPARSE_NGRAM=1`. Applies to the BM25 backend.
-
 ## Keyword-soup defense
 
-Boolean / OR-soup queries (`A OR B OR 'no access' OR …`) — and operator-free keyword lists (`parse decode unmarshal token jwt cache`) and comma-enumerations — defeat embedding retrieval. The query classifier detects all three, skips wasted LLM expansion, and splits the soup into terms fused via the existing BM25 expansion path; a `query_advice` nudge rides on the response. Genuine natural-language questions stay classified as concept. Tune via `search.keyword_soup_rewrite: split | nudge | off`.
+Boolean / OR-soup queries (`A OR B OR 'no access' OR …`) — and operator-free keyword lists (`parse decode unmarshal token jwt cache`) and comma-enumerations — defeat embedding retrieval. The query classifier detects all three, skips wasted LLM expansion, and splits the soup into terms fused via the store-native lexical expansion path; a `query_advice` nudge rides on the response. Genuine natural-language questions stay classified as concept. Tune via `search.keyword_soup_rewrite: split | nudge | off`.
 
 ## Prose corpus
 
@@ -115,7 +111,7 @@ Semantic search degrading to text-only (BM25 / FTS5) is always logged — match 
 
 - `auto` (default) — skips LLM for identifier queries, expands NL queries
 - `on` — forces expansion + rerank
-- `off` — pure BM25
+- `off` — store-native FTS5/BM25 only
 - `deep` — adds a body-grounded verification pass; +1.5–4 s; quality is highly model-dependent — unreliable on 3B local models, fine on 7B+ or hosted
 
 See [llm.md](llm.md) for provider configuration.

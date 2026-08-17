@@ -619,58 +619,45 @@ type searchBackendInfo struct {
 
 // resolveSearchBackend inspects the live search backend and produces
 // the stats needed by status rendering: which backend is active, total
-// document count, its heap footprint, and (for disk-backed Bleve) the
-// on-disk size.
+// document count, and its heap footprint.
 //
 // Real-world unwrap order: Swappable → HybridBackend → (text, vector).
-// The text side is itself a concrete BM25/Bleve/SymbolSearcherBackend.
 // Both layers have to be peeled; if we stop early we fall into the
 // default branch and the status reports "unknown" — which was the bug
-// users saw. When the store implements graph.SymbolSearcher, the
-// indexer wires up a *search.SymbolSearcherBackend instead of building
-// an in-process BM25/Bleve index at all (see initialSearchBackend in
-// internal/indexer/indexer.go) — that case has to be matched
-// explicitly too, or it falls into the same "unknown" default.
+// users saw. The text side is a concrete backend that has to be matched
+// explicitly, or it lands in that same "unknown" default: the indexer
+// wires up a *search.SymbolSearcherBackend when the store implements
+// graph.SymbolSearcher and a *search.NullBackend when it does not (see
+// initialSearchBackend in internal/indexer/indexer.go).
 func resolveSearchBackend(b search.Backend) searchBackendInfo {
 	out := searchBackendInfo{}
 	if b == nil {
 		return out
 	}
 
-	// 1) Unwrap Swappable so we see the currently-active inner.
+	// 1) Pin Swappable so the inspected backend cannot be retired while
+	// status derives its type, counts, and sizes.
 	inner := b
 	if sw, ok := inner.(*search.Swappable); ok {
-		inner = sw.Inner()
+		var release func()
+		inner, release = sw.AcquireBackend()
+		defer release()
 	}
 	// 2) If Hybrid is in play, split its text/vector sizes and keep
 	//    drilling into the text side for name/doc-count identification.
 	if hyb, ok := inner.(*search.HybridBackend); ok {
 		out.vectorBytes = hyb.VectorSizeBytes()
 		inner = hyb.TextBackend()
-		// TextBackend() itself could be a Swappable in some setups —
-		// unlikely today but cheap to guard.
+		// TextBackend() itself could be a Swappable in some setups. Pin it
+		// too so a nested replacement cannot invalidate this inspection.
 		if sw, ok := inner.(*search.Swappable); ok {
-			inner = sw.Inner()
+			var release func()
+			inner, release = sw.AcquireBackend()
+			defer release()
 		}
 	}
 
 	switch back := inner.(type) {
-	case *search.BleveBackend:
-		if path := back.DiskPath(); path != "" {
-			out.Name = "bleve-disk"
-			out.DiskPath = path
-			out.DiskBytes = back.DiskBytes()
-		} else {
-			out.Name = "bleve-memory"
-		}
-		out.DocCount = back.Count()
-		out.DocCountKnown = true
-		out.Bytes = back.SizeBytes()
-	case *search.BM25Backend:
-		out.Name = "bm25"
-		out.DocCount = back.Count()
-		out.DocCountKnown = true
-		out.Bytes = back.SizeBytes()
 	case *search.SymbolSearcherBackend:
 		// The FTS5 index lives inside the graph store's own file, not a
 		// separate in-memory structure — there is no honest byte count
@@ -686,11 +673,20 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 		out.Name = "sqlite-fts5"
 		out.DiskResident = true
 		out.DocCount, out.DocCountKnown = back.DocCount()
+	case *search.NullBackend:
+		// A store with no native symbol search gets the null text
+		// backend: it indexes nothing and the engine falls back to its
+		// substring path. Say so — an empty backend is a fact worth
+		// reporting, whereas the "unknown" default would imply we failed
+		// to recognise whatever is serving queries. Doc count and heap
+		// stay zero because both are honestly zero.
+		out.Name = "none"
+		out.DocCountKnown = true
 	default:
 		out.Name = "unknown"
-		out.DocCount = b.Count()
+		out.DocCount = inner.Count()
 		out.DocCountKnown = true
-		out.Bytes = search.BackendSize(b)
+		out.Bytes = search.BackendSize(inner)
 	}
 	return out
 }
@@ -985,7 +981,6 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 				share := float64(nodes) / float64(totalNodes)
 				mem.SearchBytes = uint64(float64(backendStats.Bytes) * share)
 				mem.VectorsBytes = uint64(float64(backendStats.vectorBytes) * share)
-				mem.DiskBytes = uint64(float64(backendStats.DiskBytes) * share)
 			}
 			mem.TotalBytes = mem.NodesBytes + mem.EdgesBytes + mem.SearchBytes + mem.VectorsBytes
 
@@ -1076,10 +1071,11 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 	// of Status.
 
 	resp := daemon.StatusResponse{
-		TrackedRepos:  tracked,
-		MemoryBytes:   mem.Alloc,
-		SearchBackend: searchBackendForResponse,
-		TrigramCache:  trigramCacheForResponse(),
+		TrackedRepos:   tracked,
+		MemoryBytes:    mem.Alloc,
+		SearchBackend:  searchBackendForResponse,
+		TrigramCache:   trigramCacheForResponse(),
+		GraphIntegrity: daemon.GraphIntegrityStatusFor(g),
 		Runtime: daemon.RuntimeStats{
 			Alloc:        mem.Alloc,
 			Sys:          mem.Sys,

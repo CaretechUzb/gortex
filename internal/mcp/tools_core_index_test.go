@@ -59,7 +59,7 @@ func TestHandleIndexRepository_MultiRepoRoutesThroughMultiIndexer(t *testing.T) 
 	reg.Register(languages.NewGoExtractor())
 
 	g := graph.New()
-	mi := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 	require.True(t, mi.IsMultiRepo())
@@ -145,7 +145,7 @@ func TestHandleIndexRepository_ReconcilesFromPersistedConfig(t *testing.T) {
 	g := graph.New()
 	// Intentionally DO NOT call IndexAll / TrackRepoCtx — simulates the
 	// warmup-drift state: config persisted, but MultiIndexer empty.
-	mi := indexer.NewMultiIndexer(g, preg, search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, preg, search.NewNull(), cm, zap.NewNop())
 	require.Empty(t, mi.AllMetadata(),
 		"precondition: MultiIndexer must start empty to reproduce drift")
 
@@ -195,7 +195,7 @@ func TestHandleIndexRepository_MultiRepoRejectsUntrackedPath(t *testing.T) {
 	reg.Register(languages.NewGoExtractor())
 
 	g := graph.New()
-	mi := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 

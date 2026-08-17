@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -146,96 +144,4 @@ func TestEvalServerLifecycle(t *testing.T) {
 	})
 
 	// --- Shutdown is implicit: ts.Close() in defer ---
-}
-
-// TestIndexCacheRoundTrip is an integration test that exercises the full
-// cache lifecycle: create files → store → load → verify integrity → evict.
-func TestIndexCacheRoundTrip(t *testing.T) {
-	cacheDir := t.TempDir()
-	version := "0.2.0-test"
-
-	cache, err := NewCache(cacheDir, version)
-	require.NoError(t, err)
-
-	// --- Step 1: Create a realistic index directory with multiple files ---
-	indexDir := t.TempDir()
-	require.NoError(t, os.WriteFile(
-		filepath.Join(indexDir, "graph.bin"),
-		[]byte("serialized-graph-data-with-nodes-and-edges"),
-		0o644,
-	))
-	// Create a nested directory simulating search.bleve/
-	bleveDir := filepath.Join(indexDir, "search.bleve")
-	require.NoError(t, os.MkdirAll(bleveDir, 0o755))
-	require.NoError(t, os.WriteFile(
-		filepath.Join(bleveDir, "store"),
-		[]byte("bleve-store-data"),
-		0o644,
-	))
-	require.NoError(t, os.WriteFile(
-		filepath.Join(bleveDir, "index_meta.json"),
-		[]byte(`{"version":1}`),
-		0o644,
-	))
-
-	repo := "django/django"
-	commit := "a1b2c3d4e5f6"
-
-	// --- Step 2: Verify cache is empty initially ---
-	assert.False(t, cache.Check(repo, commit), "cache should be empty initially")
-
-	// --- Step 3: Store the index ---
-	require.NoError(t, cache.Store(repo, commit, indexDir))
-
-	// --- Step 4: Verify cache entry exists ---
-	assert.True(t, cache.Check(repo, commit), "cache should have entry after store")
-
-	// --- Step 5: Load and verify path ---
-	loadedPath, err := cache.Load(repo, commit)
-	require.NoError(t, err)
-	expectedPath := filepath.Join(cacheDir, CacheKey(repo, commit))
-	assert.Equal(t, expectedPath, loadedPath)
-
-	// --- Step 6: Verify all files are intact ---
-	graphData, err := os.ReadFile(filepath.Join(loadedPath, "graph.bin"))
-	require.NoError(t, err)
-	assert.Equal(t, "serialized-graph-data-with-nodes-and-edges", string(graphData))
-
-	bleveStore, err := os.ReadFile(filepath.Join(loadedPath, "search.bleve", "store"))
-	require.NoError(t, err)
-	assert.Equal(t, "bleve-store-data", string(bleveStore))
-
-	bleveMeta, err := os.ReadFile(filepath.Join(loadedPath, "search.bleve", "index_meta.json"))
-	require.NoError(t, err)
-	assert.Equal(t, `{"version":1}`, string(bleveMeta))
-
-	// --- Step 7: Validate version compatibility ---
-	assert.True(t, cache.Validate(repo, commit), "version should match")
-
-	// --- Step 8: Version mismatch detection ---
-	cacheV2, err := NewCache(cacheDir, "0.3.0-different")
-	require.NoError(t, err)
-	assert.False(t, cacheV2.Validate(repo, commit), "different version should fail validation")
-
-	// --- Step 9: Re-store with updated content ---
-	indexDir2 := t.TempDir()
-	require.NoError(t, os.WriteFile(
-		filepath.Join(indexDir2, "graph.bin"),
-		[]byte("updated-graph-data"),
-		0o644,
-	))
-	require.NoError(t, cache.Store(repo, commit, indexDir2))
-
-	loadedPath2, err := cache.Load(repo, commit)
-	require.NoError(t, err)
-	updatedData, err := os.ReadFile(filepath.Join(loadedPath2, "graph.bin"))
-	require.NoError(t, err)
-	assert.Equal(t, "updated-graph-data", string(updatedData))
-
-	// --- Step 10: Evict and verify removal ---
-	require.NoError(t, cache.Evict(repo, commit))
-	assert.False(t, cache.Check(repo, commit), "cache should be empty after eviction")
-
-	_, err = cache.Load(repo, commit)
-	assert.Error(t, err, "load after eviction should fail")
 }

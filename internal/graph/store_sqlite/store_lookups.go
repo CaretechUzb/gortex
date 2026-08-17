@@ -282,7 +282,7 @@ func (s *Store) GetOutEdgesByNodeIDsContext(ctx context.Context, ids []string, l
 			return out, true, err
 		}
 		for rows.Next() {
-			e, scanErr := scanEdgeLight(rows)
+			e, scanErr := s.scanEdgeLight(rows)
 			if scanErr != nil {
 				_ = rows.Close()
 				return out, true, scanErr
@@ -336,7 +336,7 @@ func (s *Store) GetInEdgesByNodeIDsContext(ctx context.Context, ids []string, li
 			return out, true, err
 		}
 		for rows.Next() {
-			e, scanErr := scanEdgeLight(rows)
+			e, scanErr := s.scanEdgeLight(rows)
 			if scanErr != nil {
 				_ = rows.Close()
 				return out, true, scanErr
@@ -556,7 +556,7 @@ func (s *Store) queryEdgeCandidatesSQL(query string, args ...any) ([]*graph.Edge
 	}
 	var out []*graph.Edge
 	for rows.Next() {
-		edge, scanErr := scanEdgeCursor(rows)
+		edge, scanErr := s.scanEdgeCursor(rows)
 		if scanErr != nil {
 			_ = rows.Close()
 			return nil, scanErr

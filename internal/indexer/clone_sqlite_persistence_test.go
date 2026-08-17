@@ -121,7 +121,10 @@ func TestSQLiteCloneCorpusSurvivesReloadAndWarmReplay(t *testing.T) {
 	counted.writeRows = 0
 	beforeEdges := reopened.EdgeCount()
 	replayed := newTestIndexer(counted)
-	replayed.RunGlobalGraphPasses(context.Background())
+	_, cloneBaseline := detectClonesAndEmitEdgesWithBaselineCtx(
+		context.Background(), counted, "", replayed.cloneThreshold(),
+	)
+	replayed.cloneIndex.AdoptBaselineOrRebuild(counted, "", cloneBaseline)
 	require.Equal(t, 1, counted.pageCalls, "warm global pass must scan the finalized corpus exactly once")
 	require.Zero(t, counted.writeCalls, "warm finalized corpus must not rewrite signatures")
 	require.Zero(t, counted.writeRows)

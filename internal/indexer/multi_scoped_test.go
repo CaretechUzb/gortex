@@ -40,7 +40,7 @@ func TestMultiIndexer_IndexScoped_WorkspaceFromGortexYAML(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	results, err := mi.IndexScoped("alpha", "")
 	require.NoError(t, err)
@@ -72,7 +72,7 @@ func TestMultiIndexer_IndexScoped_RepoEntryOverride(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	// Override wins over .gortex.yaml: "upstream" matches nothing.
 	_, err = mi.IndexScoped("upstream", "")
@@ -105,7 +105,7 @@ func TestMultiIndexer_IndexScoped_FallsBackToRepoPrefix(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	results, err := mi.IndexScoped("repo-b", "")
 	require.NoError(t, err)
@@ -139,7 +139,7 @@ func TestMultiIndexer_IndexScoped_ProjectNarrowsInsideWorkspace(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	results, err := mi.IndexScoped("shared", "api")
 	require.NoError(t, err)
@@ -164,7 +164,7 @@ func TestMultiIndexer_IndexScoped_NoMatchErrors(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err = mi.IndexScoped("nonexistent", "")
 	require.Error(t, err)
@@ -195,7 +195,7 @@ func TestMultiIndexer_IndexScoped_EmptyFiltersEqualsIndexAll(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	results, err := mi.IndexScoped("", "")
 	require.NoError(t, err)

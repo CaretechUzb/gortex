@@ -7,7 +7,8 @@ import (
 )
 
 // Retriever is the pluggable candidate-producer protocol. The existing
-// hybrid pipeline (BM25 + vector + RRF) is one implementation; others
+// hybrid pipeline (native symbol FTS + vector + adaptive fusion) is one
+// implementation; others
 // — graph_completion, an in-house embedding model, a research-grade
 // LLM-as-retriever — plug in by implementing this interface.
 //

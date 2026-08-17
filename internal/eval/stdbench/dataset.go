@@ -4,9 +4,9 @@
 // with the textbook Recall@K / Precision@K / NDCG@K / MRR metrics.
 //
 // The loaders parse the on-disk formats; the actual retrieval is left
-// to the caller (the `gortex eval stdbench` verb wires Gortex's BM25
-// backend in), so the same harness measures whatever retriever is
-// handed to Evaluate.
+// to the caller (the `gortex eval stdbench` verb wires in the
+// store-native symbol FTS search_symbols runs), so the same harness
+// measures whatever retriever is handed to Evaluate.
 package stdbench
 
 // Doc is one corpus document — a code snippet, file, or symbol the

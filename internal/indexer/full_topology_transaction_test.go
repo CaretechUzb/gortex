@@ -27,7 +27,7 @@ func TestIndexCtxStaleHandleUsesCurrentIndexerAndMetadata(t *testing.T) {
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewGoExtractor())
 	cm := newTestConfigManager(t)
-	mi := NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	entry := config.RepoEntry{Path: root, Name: "repo"}
 
 	beforeTrack := reach.BuildCounter()
@@ -81,13 +81,13 @@ func TestReconcileTopologyGenerationChangesOnlyForRealMutation(t *testing.T) {
 	reg.Register(languages.NewGoExtractor())
 	cm := newTestConfigManager(t)
 	entry := config.RepoEntry{Path: root, Name: "repo"}
-	seed := NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	seed := NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err := seed.TrackRepo(entry)
 	require.NoError(t, err)
 	prior := seed.GetIndexer("repo").FileMtimes()
 
 	writeFile(t, filepath.Join(root, "added.go"), "package sample\nfunc Added() {}\n")
-	changed := NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	changed := NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	beforeChanged := reach.BuildCounter()
 	changedResult, err := changed.ReconcileRepoCtx(context.Background(), entry, prior)
 	require.NoError(t, err)
@@ -95,7 +95,7 @@ func TestReconcileTopologyGenerationChangesOnlyForRealMutation(t *testing.T) {
 	require.Greater(t, reach.BuildCounter(), beforeChanged)
 
 	unchangedPrior := changed.GetIndexer("repo").FileMtimes()
-	unchanged := NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	unchanged := NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	beforeUnchanged := reach.BuildCounter()
 	unchangedResult, err := unchanged.ReconcileRepoCtx(context.Background(), entry, unchangedPrior)
 	require.NoError(t, err)
@@ -148,7 +148,7 @@ func TestIndexAllHoldsEveryLaneAndTopologyThroughPublication(t *testing.T) {
 		cm.Global().Repos = append(cm.Global().Repos, config.RepoEntry{Path: root, Name: name})
 	}
 	store := &armableBlockingAddBatchStore{Store: graph.New()}
-	mi := NewMultiIndexer(store, reg, search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(store, reg, search.NewNull(), cm, zap.NewNop())
 	_, err := mi.IndexAll()
 	require.NoError(t, err)
 	oldA := mi.GetIndexer("repo-a")
@@ -260,7 +260,7 @@ func TestIndexAllDeduplicatesIdenticalRepositoryEntries(t *testing.T) {
 			cm.Global().Repos = append(cm.Global().Repos, config.RepoEntry{Path: root, Name: "repo"})
 		}
 		store := &countingIndexAllStore{Store: graph.New()}
-		mi := NewMultiIndexer(store, reg, search.NewBM25(), cm, zap.NewNop())
+		mi := NewMultiIndexer(store, reg, search.NewNull(), cm, zap.NewNop())
 		results, err := mi.IndexAll()
 		require.NoError(t, err)
 		require.Len(t, results, 1)
@@ -279,7 +279,7 @@ func TestTrackRepoRechecksSamePathAcrossDifferentPrefixLanes(t *testing.T) {
 	writeFile(t, filepath.Join(root, "main.go"), "package sample\nfunc Existing() {}\n")
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewGoExtractor())
-	mi := NewMultiIndexer(graph.New(), reg, search.NewBM25(), newTestConfigManager(t), zap.NewNop())
+	mi := NewMultiIndexer(graph.New(), reg, search.NewNull(), newTestConfigManager(t), zap.NewNop())
 
 	arrived := make(chan struct{}, 2)
 	release := make(chan struct{})

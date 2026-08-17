@@ -13,7 +13,7 @@ import (
 // This file implements graph.SymbolSearcher + graph.SymbolBundleSearcher
 // on the SQLite backend using the FTS5 virtual table declared in
 // schema.go (symbol_fts). It is the on-disk replacement for the
-// multi-GB in-heap Bleve/BM25 index: the FTS5 inverted index lives in
+// multi-GB in-heap BM25 index: the FTS5 inverted index lives in
 // the same .sqlite file as the graph, and a tier-0 exact-name boost
 // short-circuits identifier queries so
 // search quality holds or improves while the heap shrinks.
@@ -40,7 +40,7 @@ import (
 // Compile-time assertions: *Store satisfies the symbol-search
 // capabilities. The indexer auto-engages these when the active backend
 // implements them, routing search_symbols through on-disk FTS5 instead
-// of the in-process BM25 index.
+// of the engine's index-free substring fallback.
 var (
 	_ graph.SymbolSearcher             = (*Store)(nil)
 	_ graph.SymbolFTSBatchUpserter     = (*Store)(nil)
@@ -664,7 +664,7 @@ func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit 
 		}
 	}
 
-	match := s.buildFTSMatch(query)
+	match := s.buildFTSMatch(query, true)
 	if match == "" {
 		return nil, nil
 	}
@@ -730,17 +730,22 @@ func tier0ShortCircuitKind(k graph.NodeKind) bool {
 // buildFTSMatch tokenises the query with the write-side splitter and
 // builds an FTS5 MATCH expression: each token becomes a quoted prefix
 // term ("tok"*) and the terms are OR-joined so any token match counts.
+// normalize selects the symbol-FTS normalization pass. Content FTS keeps raw
+// bodies for snippets and scans, so its query path must remain unnormalised.
 // Returns "" when the query degenerates to no tokens.
-func (s *Store) buildFTSMatch(query string) string {
+func (s *Store) buildFTSMatch(query string, normalize bool) string {
 	tokens := search.Tokenize(query)
 	if len(tokens) == 0 {
 		// Fallback: when Tokenize drops everything (e.g. a single
 		// sub-2-char token like "go"), use the looser query tokeniser so
 		// the search still reaches the engine instead of returning empty.
 		tokens = search.TokenizeQuery(query)
-		if len(tokens) == 0 {
-			return ""
-		}
+	}
+	if normalize {
+		tokens = search.NormalizeFTSTokens(tokens)
+	}
+	if len(tokens) == 0 {
+		return ""
 	}
 	parts := make([]string, 0, len(tokens))
 	for _, t := range tokens {

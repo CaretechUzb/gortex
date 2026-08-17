@@ -174,7 +174,7 @@ func TestSharedParsePool_Reused(t *testing.T) {
 	g := graph.New()
 	idx := newTestIndexer(g)
 	idx.SetRootPath(t.TempDir())
-	defer idx.CloseParsePool()
+	defer idx.Close()
 
 	p1, _ := idx.sharedParsePool()
 	require.NotNil(t, p1)
@@ -197,7 +197,7 @@ func TestIndexFile_CrashIsolationReusesPool(t *testing.T) {
 	idx := newTestIndexer(g)
 	_, err := idx.Index(dir) // cold index also anchors rootPath
 	require.NoError(t, err)
-	defer idx.CloseParsePool()
+	defer idx.Close()
 
 	require.NoError(t, idx.IndexFile(filepath.Join(dir, "a.go")))
 	require.NotNil(t, idx.parsePool, "first IndexFile must create the shared pool")

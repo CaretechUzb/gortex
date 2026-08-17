@@ -3,7 +3,6 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
-	"log"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -514,9 +513,13 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	// and AddBatch route here; the bulk JSONB chunks are emitted below).
 	// See graph.StructuralEdgeTargetInvalid for the mapper-bug class this
 	// stops at the door.
-	if kept, dropped := graph.FilterStructuralEdgeViolations(edges); dropped > 0 {
+	if kept, rejected := graph.FilterStructuralEdgeViolations(edges); len(rejected) > 0 {
 		edges = kept
-		log.Printf("store_sqlite: dropped %d structurally invalid edges (kind cannot target a param/local node)", dropped)
+		inputRepos := structuralInputNodeRepos(nodes)
+		for _, edge := range rejected {
+			repo := s.structuralWriteRepo(edge, inputRepos)
+			s.recordStructuralEdge(graph.StructuralDropWrite, graph.StructuralPathSQLiteAddBatch, repo, edge)
+		}
 	}
 	// Lazy builtin-sentinel materialization, mirroring Graph.AddBatch: give
 	// every ::builtin:: edge target a real KindBuiltin node so those edges

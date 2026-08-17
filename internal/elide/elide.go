@@ -508,20 +508,6 @@ func getSpec(lang string) *languageSpec {
 	return specs[normalizeLang(lang)]
 }
 
-// Languages reports the canonical language codes elide knows how to
-// compress. The returned slice is sorted and safe for the caller to
-// retain; it is recomputed on every call so test-only manipulations
-// don't bleed across goroutines.
-func Languages() []string {
-	specsOnce.Do(initSpecs)
-	out := make([]string, 0, len(specs))
-	for k := range specs {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
 func normalizeLang(lang string) string {
 	switch strings.ToLower(lang) {
 	case "c++", "cpp", "cxx", "cc":

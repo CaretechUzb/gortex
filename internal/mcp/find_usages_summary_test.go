@@ -42,7 +42,7 @@ func usagesSummaryServer(t *testing.T) (srv *Server, fooID, unusedID string) {
 	g.AddEdge(&graph.Edge{From: testUse.ID, To: foo.ID, Kind: graph.EdgeCalls, FilePath: "pkg/foo_test.go", Line: 12})
 
 	eng := query.NewEngine(g)
-	eng.SetSearch(search.NewBM25())
+	eng.SetSearch(search.NewNull())
 	return NewServer(eng, g, nil, nil, zap.NewNop(), nil), foo.ID, unused.ID
 }
 

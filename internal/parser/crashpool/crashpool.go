@@ -35,10 +35,11 @@ func init() {
 
 // extractRequest is one unit of parse work sent parent → worker.
 type extractRequest struct {
-	Seq      uint64
-	RelPath  string
-	Language string
-	Content  []byte
+	Seq                uint64
+	RelPath            string
+	Language           string
+	Content            []byte
+	TemporalEnvHelpers []string
 }
 
 // extractResponse is the worker → parent reply for one request.

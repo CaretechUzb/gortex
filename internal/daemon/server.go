@@ -940,9 +940,6 @@ func (s *Server) untrackConn(c net.Conn) {
 // Sessions exposes the registry for inspection (status command, tests).
 func (s *Server) Sessions() *SessionRegistry { return s.sessions }
 
-// StartedAt returns the time Listen() completed — used for uptime math.
-func (s *Server) StartedAt() time.Time { return s.started }
-
 // unmarshalParams decodes RawMessage into a typed struct, treating empty
 // or null params as an empty struct (zero value) so callers don't need
 // to special-case missing params.

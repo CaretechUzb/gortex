@@ -546,21 +546,9 @@ func (idx *Indexer) reresolveAffectedBy(changedPath string, snap *affectedBySnap
 			zap.Int("affected", len(files)),
 			zap.Int("cap", maxFiles),
 			zap.Int("dropped", len(files)-maxFiles))
-		idx.affectedByDropped.Add(int64(len(files) - maxFiles))
 		files = files[:maxFiles]
 	}
-	idx.affectedByPasses.Add(1)
-	idx.affectedByFilesResolved.Add(int64(len(files)))
-
 	idx.resolver.ResolveFilesAndIncoming(files)
 	resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), files)
 	idx.persistRefFactsForFiles(files)
-}
-
-// AffectedByCounts reports the affected-by pass activity for this
-// indexer: passes run, referencing files re-resolved, and files dropped
-// by the fan-out cap. Diagnostic/test hook — the body-only-edit gate is
-// observable as an unchanged pass count.
-func (idx *Indexer) AffectedByCounts() (passes, files, dropped int64) {
-	return idx.affectedByPasses.Load(), idx.affectedByFilesResolved.Load(), idx.affectedByDropped.Load()
 }

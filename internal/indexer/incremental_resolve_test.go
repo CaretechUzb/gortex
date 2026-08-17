@@ -71,7 +71,7 @@ func TestIncrementalReindex_PreservesIncomingCallerEdges(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.IndexCtx(testCtx(), dir)
 	require.NoError(t, err)
@@ -119,7 +119,7 @@ func TestIncrementalReindex_DoubleCycle_PreservesIncomingTier(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.IndexCtx(testCtx(), dir)
 	require.NoError(t, err)
@@ -164,7 +164,7 @@ func TestIncrementalReindex_DeletedDefinition_NoStaleTierOnStub(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.IndexCtx(testCtx(), dir)
 	require.NoError(t, err)
@@ -189,7 +189,7 @@ func TestIncrementalReindex_DeletedDefinition_NoStaleTierOnStub(t *testing.T) {
 // cascade: deleting a file drops its nodes' churn/coverage/blame
 // sidecar rows, leaving no orphan enrichment.
 func TestEvictFile_DropsEnrichmentSidecars(t *testing.T) {
-	idx, _ := newToggleIndexer(t)
+	idx, _, _ := newToggleIndexer(t)
 	dir := t.TempDir()
 	idx.SetRootPath(dir)
 	g := idx.graph
@@ -227,7 +227,7 @@ func TestIncrementalReuse_SameFileEdge_KeepsTier(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.IndexCtx(testCtx(), dir)
 	require.NoError(t, err)

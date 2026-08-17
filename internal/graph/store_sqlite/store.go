@@ -51,9 +51,7 @@ type Store struct {
 	// busyRetryTimeout is the whole-transaction contention budget. The zero
 	// value selects defaultSQLiteBusyRetryTimeout; tests shorten it to exercise
 	// persistent-lock exhaustion deterministically.
-	busyRetryTimeout   time.Duration
-	busyRetries        atomic.Uint64
-	busyRetryExhausted atomic.Uint64
+	busyRetryTimeout time.Duration
 
 	// passiveCheckpointTimeout bounds one periodic PASSIVE checkpoint. The zero
 	// value selects walPassiveCheckpointTimeout; tests shorten it to exercise
@@ -69,6 +67,13 @@ type Store struct {
 	// as KindBuiltin stub nodes (see graph.BuiltinStubNodes), so warm
 	// re-indexes don't re-upsert identical stubs on every batch.
 	builtinSeen sync.Map
+
+	// Structural integrity is owned by this logical store. Shadows forward
+	// rejected attempts into the same recorder; warnings are rate-limited per
+	// Store so independent workspaces never suppress each other's diagnostics.
+	structuralIntegrity   graph.StructuralIntegrityMeter
+	structuralWriteWarned atomic.Bool
+	structuralReadWarned  atomic.Bool
 
 	// preparedSQL registers every statement prepared at Open so the plan
 	// fence can EXPLAIN the entire prepared surface against a fixture and
@@ -205,7 +210,6 @@ type Store struct {
 	stmtInsertEdge       *sql.Stmt
 	unresolvedInserts    atomic.Uint64
 	stmtOutEdges         *sql.Stmt
-	stmtOutEdgesLight    *sql.Stmt
 	stmtInEdges          *sql.Stmt
 	stmtRepoEdges        *sql.Stmt
 	stmtAllEdges         *sql.Stmt
@@ -481,6 +485,13 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
 		}
+	}
+	// The repository index references columns introduced by the v10 vector
+	// migration, so create it only after pending migrations have rebuilt the
+	// legacy table. On current and fresh stores this is an idempotent no-op.
+	if _, err := db.Exec(vectorRepoIndexSQL); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite vector repository index: %w", err)
 	}
 	// A schema transition invalidates any generation produced against the old
 	// graph shape. The v4 migration also drops the unreleased blob-only table.
@@ -780,7 +791,7 @@ func (s *Store) Close() error {
 		s.stmtAllRepoCountsNodes, s.stmtAllRepoCountsEdges,
 		s.stmtAllRepoStateCounts,
 		s.stmtStatsByKind, s.stmtStatsByLanguage,
-		s.stmtInsertEdge, s.stmtOutEdges, s.stmtOutEdgesLight, s.stmtInEdges,
+		s.stmtInsertEdge, s.stmtOutEdges, s.stmtInEdges,
 		s.stmtRepoEdges,
 		s.stmtAllEdges, s.stmtEdgeCount, s.stmtRemoveEdge,
 		s.stmtUpdateEdgeOrigin, s.stmtUpdateEdgeAttrs, s.stmtSelectEdgeOrigin, s.stmtDeleteEdgeByKey,
@@ -912,12 +923,6 @@ func (s *Store) prepare() error {
 	// b-tree.
 	prep(&s.stmtOutEdges,
 		`SELECT `+edgeCols+` FROM edges WHERE from_id = ? ORDER BY line, id`)
-	// edgeColsLight is the package-level meta-less projection (store_light_edges.go),
-	// shared with AllEdgesLight so this prepared statement and the whole-graph scan
-	// can never drift apart. The ordering must match stmtOutEdges for the same
-	// reason: callers switch between the two purely to skip the Meta blob.
-	prep(&s.stmtOutEdgesLight,
-		`SELECT `+edgeColsLight+` FROM edges WHERE from_id = ? ORDER BY line, id`)
 	prep(&s.stmtInEdges,
 		`SELECT `+edgeCols+` FROM edges WHERE to_id = ? ORDER BY kind, id`)
 	prep(&s.stmtRepoEdges,
@@ -1056,12 +1061,12 @@ func scanNodeSummary(scanner interface {
 
 // scanEdgeCursor is cursor-only: metadata is decoded before Rows.Next, so the
 // driver-owned RawBytes never escapes into the returned edge.
-func scanEdgeCursor(scanner rowScanner) (*graph.Edge, error) {
+func (s *Store) scanEdgeCursor(scanner rowScanner) (*graph.Edge, error) {
 	var metaBlob sql.RawBytes
-	return scanEdgeWithMeta(scanner, &metaBlob)
+	return scanEdgeWithMeta(s, scanner, &metaBlob)
 }
 
-func scanEdgeWithMeta[B ~[]byte](scanner rowScanner, metaBlob *B) (*graph.Edge, error) {
+func scanEdgeWithMeta[B ~[]byte](store *Store, scanner rowScanner, metaBlob *B) (*graph.Edge, error) {
 	var (
 		e         graph.Edge
 		crossRepo int64
@@ -1088,35 +1093,10 @@ func scanEdgeWithMeta[B ~[]byte](scanner rowScanner, metaBlob *B) (*graph.Edge, 
 	// is left alone so any blob-carried value survives.
 	restorePromotedEdgeMeta(&e, p)
 	if graph.StructuralEdgeTargetInvalid(e.Kind, e.To) {
-		noteStructuralReadDrop()
+		store.noteStructuralReadDrop(graph.StructuralPathSQLiteFullRead, &e)
 		return nil, nil
 	}
 	return &e, nil
-}
-
-// structuralReadDrops counts structurally invalid rows healed on read from
-// stores written before the write-funnel backstop existed. Every read path
-// dropping such a row means the on-disk store carries pre-gate corruption:
-// the first occurrence logs an engineer-facing signal (the feedback loop for
-// "something impossible reached disk"), and the audit battery reads the
-// counter. New stores must never increment it — the write backstop drops the
-// shape before it lands.
-var (
-	structuralReadDrops     atomic.Int64
-	structuralReadDropsOnce sync.Once
-)
-
-func noteStructuralReadDrop() {
-	structuralReadDrops.Add(1)
-	structuralReadDropsOnce.Do(func() {
-		log.Printf("store_sqlite: store contains structurally invalid edges (pre-backstop corruption); healing on read — rebuild or audit the store (see store_audit.sql A1)")
-	})
-}
-
-// StructuralReadDrops reports how many structurally invalid edge rows read
-// paths have healed since process start.
-func StructuralReadDrops() int64 {
-	return structuralReadDrops.Load()
 }
 
 // scanEdgeLight scans an edge WITHOUT decoding its meta blob -- for hot
@@ -1124,7 +1104,13 @@ func StructuralReadDrops() int64 {
 // kind, and line. Skipping the meta column avoids the JSON decode + map
 // allocation that dominates large edge scans on this backend; the
 // returned edge's Meta is nil.
-func scanEdgeLight(scanner interface {
+func (s *Store) scanEdgeLight(scanner interface {
+	Scan(...any) error
+}) (*graph.Edge, error) {
+	return scanEdgeLightForStore(s, scanner)
+}
+
+func scanEdgeLightForStore(store *Store, scanner interface {
 	Scan(...any) error
 }) (*graph.Edge, error) {
 	var (
@@ -1141,7 +1127,7 @@ func scanEdgeLight(scanner interface {
 	}
 	e.CrossRepo = crossRepo != 0
 	if graph.StructuralEdgeTargetInvalid(e.Kind, e.To) {
-		noteStructuralReadDrop()
+		store.noteStructuralReadDrop(graph.StructuralPathSQLiteLightRead, &e)
 		return nil, nil
 	}
 	return &e, nil
@@ -1203,6 +1189,10 @@ func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) (bool, error) {
 // upgrades through SetEdgeProvenance).
 func (s *Store) AddEdge(e *graph.Edge) {
 	if e == nil || graph.IsProxyID(e.From) || graph.IsProxyID(e.To) {
+		return
+	}
+	if graph.StructuralEdgeTargetInvalid(e.Kind, e.To) {
+		s.recordStructuralEdge(graph.StructuralDropWrite, graph.StructuralPathSQLiteAddEdge, s.structuralWriteRepo(e, nil), e)
 		return
 	}
 	// Route through the set-oriented writer. During a coordinated cold load the
@@ -1908,13 +1898,6 @@ func (s *Store) EdgeExists(from, to string, kind graph.EdgeKind, filePath string
 	return true
 }
 
-// GetOutEdgesLight returns a node's out-edges without decoding the
-// per-edge Meta blob -- for hot dataflow lookups that need only
-// endpoints/kind/line. The returned edges have a nil Meta.
-func (s *Store) GetOutEdgesLight(nodeID string) []*graph.Edge {
-	return s.queryEdgesLight(s.stmtOutEdgesLight, nodeID)
-}
-
 func (s *Store) GetInEdges(nodeID string) []*graph.Edge {
 	return s.queryEdges(s.stmtInEdges, nodeID)
 }
@@ -1985,7 +1968,7 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		e, err := scanEdgeCursor(rows)
+		e, err := s.scanEdgeCursor(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out
@@ -1998,34 +1981,6 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 	// A driver failure part-way through the cursor ends the loop exactly like
 	// a clean exhaust. Without this check the caller would receive a silently
 	// truncated slice and treat it as the complete result.
-	if err := rows.Err(); err != nil {
-		panicOnFatal(err)
-	}
-	return out
-}
-
-// queryEdgesLight mirrors queryEdges but scans each row without its
-// meta blob (scanEdgeLight), leaving Meta nil. Only for callers that
-// never read edge Meta.
-func (s *Store) queryEdgesLight(stmt *sql.Stmt, args ...any) []*graph.Edge {
-	rows, err := stmt.Query(args...)
-	if err != nil {
-		panicOnFatal(err)
-		return nil
-	}
-	defer rows.Close()
-	var out []*graph.Edge
-	for rows.Next() {
-		e, err := scanEdgeLight(rows)
-		if err != nil {
-			panicOnFatal(err)
-			return out
-		}
-		if e == nil {
-			continue
-		}
-		out = append(out, e)
-	}
 	if err := rows.Err(); err != nil {
 		panicOnFatal(err)
 	}
@@ -2545,7 +2500,7 @@ func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
-		e, err := scanEdgeCursor(rows)
+		e, err := s.scanEdgeCursor(rows)
 		if err != nil {
 			panicOnFatal(err)
 			return out

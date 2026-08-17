@@ -1,4 +1,4 @@
-=== root/.clinerules/gortex-communities.md ===
+=== project/root/.clinerules/gortex-communities.md ===
 <!-- gortex:communities:start -->
 - [example-community](.claude/skills/example/SKILL.md) — example routing block
 

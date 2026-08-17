@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // withStemming pins the FTS normalization gate to a known value for
@@ -62,23 +61,9 @@ func TestStemFTSToken_LeavesShortAndNonAlphaTokens(t *testing.T) {
 	}
 }
 
-func TestBM25_StemmedRecall(t *testing.T) {
+func TestNormalizeFTSTokens_AllStopWordsYieldsNoTokens(t *testing.T) {
 	withStemming(t, true)
-	b := NewBM25()
-	defer b.Close()
-	b.Add("svc::UserService", "UserService", "user/service.go")
-	// A query in a different grammatical number still reaches it.
-	res := b.Search("users", 10)
-	require.NotEmpty(t, res)
-	assert.Equal(t, "svc::UserService", res[0].ID)
-}
-
-func TestBM25_StopWordQueryYieldsNoTokens(t *testing.T) {
-	withStemming(t, true)
-	b := NewBM25()
-	defer b.Close()
-	b.Add("a::Auth", "Auth", "auth.go")
-	// An all-stopword query produces no FTS tokens, so BM25 returns
-	// nothing and the engine layer's substring fallback takes over.
-	assert.Empty(t, b.Search("the and of", 10))
+	// An all-stopword query normalizes to nothing, so the caller issues
+	// no FTS match at all and the engine's substring fallback takes over.
+	assert.Empty(t, NormalizeFTSTokens([]string{"the", "and", "of"}))
 }

@@ -86,7 +86,7 @@ func newEmptyMultiIndexer(t *testing.T, g graph.Store) *MultiIndexer {
 	require.NoError(t, gc.Save())
 	cm, err := config.NewConfigManager(tmpCfg)
 	require.NoError(t, err)
-	return NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	return NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 }
 
 // TestMultiIndexer_RunDeferredEnrich_GatesUnchangedRepos is the core
@@ -116,7 +116,7 @@ func TestMultiIndexer_RunDeferredEnrich_GatesUnchangedRepos(t *testing.T) {
 
 	// Drive the same per-repo dispatch the warmup's parallel enrich loop uses.
 	mi := newEmptyMultiIndexer(t, g)
-	mi.runDeferredEnrichParallel([]*Indexer{changed, unchanged})
+	mi.runDeferredEnrichPool([]*Indexer{changed, unchanged})
 
 	assert.Equal(t, []string{"repo-changed"}, spy.invoked(),
 		"only the changed repo should have its enrichment dispatched")

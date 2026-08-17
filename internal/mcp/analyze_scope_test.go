@@ -80,7 +80,7 @@ func newAnalyzeServer(t *testing.T, flagOn bool, repos ...analyzeRepoSpec) (*Ser
 
 	g := graph.New()
 	reg := testRegistry()
-	bm := search.NewBM25()
+	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
 	_, err = mi.IndexScoped("", "")
 	require.NoError(t, err)

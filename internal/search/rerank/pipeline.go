@@ -21,10 +21,9 @@ import (
 type Candidate struct {
 	Node *graph.Node
 
-	// TextRank is the 0-based BM25 rank. -1 means the candidate did
-	// not appear in the text-search result list (e.g. a substring or
-	// bigram-rescue fallback hit, or a candidate added by another
-	// retrieval channel).
+	// TextRank is the 0-based text-search rank. -1 means the candidate
+	// did not appear in the text-search result list (e.g. a substring
+	// fallback hit, or a candidate added by another retrieval channel).
 	TextRank int
 	// VectorRank is the 0-based vector-search rank. -1 means absent.
 	VectorRank int
@@ -64,10 +63,6 @@ func New(signals []Signal, weights map[string]float64) *Pipeline {
 
 // NewDefault is shorthand for New(DefaultSignals(), DefaultWeights()).
 func NewDefault() *Pipeline { return New(DefaultSignals(), DefaultWeights()) }
-
-// Signals returns the signal list. Order is stable but not
-// load-bearing — scores are computed independently per signal.
-func (p *Pipeline) Signals() []Signal { return p.signals }
 
 // Weights returns a copy of the current weight map.
 func (p *Pipeline) Weights() map[string]float64 {
@@ -248,16 +243,6 @@ func sameSliceHeader(a, b []*Candidate) bool {
 		return false
 	}
 	return &a[0] == &b[0]
-}
-
-// Nodes is a convenience that unwraps a result slice into the
-// underlying graph nodes in score order.
-func Nodes(cands []*Candidate) []*graph.Node {
-	out := make([]*graph.Node, 0, len(cands))
-	for _, c := range cands {
-		out = append(out, c.Node)
-	}
-	return out
 }
 
 // DefaultSignals returns the canonical signal lineup in stable order.

@@ -21,7 +21,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from environments.gortex_docker import GortexDockerEnvironment, _make_cache_key
+from environments.gortex_docker import GortexDockerEnvironment
 
 
 # --- Docker availability check ---
@@ -152,15 +152,3 @@ class TestDockerEnvironmentMocked:
         assert result is not None
         assert result["exit_status"] == "setup_failure"
         assert "fail-test" in result["instance_id"]
-
-    def test_cache_key_determinism(self) -> None:
-        """Cache key for same inputs is always the same."""
-        k1 = _make_cache_key("repo", "abc123")
-        k2 = _make_cache_key("repo", "abc123")
-        assert k1 == k2
-
-    def test_cache_key_uniqueness(self) -> None:
-        """Different inputs produce different cache keys."""
-        k1 = _make_cache_key("repo_a", "commit1")
-        k2 = _make_cache_key("repo_b", "commit2")
-        assert k1 != k2

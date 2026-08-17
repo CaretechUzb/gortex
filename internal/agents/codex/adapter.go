@@ -13,6 +13,7 @@
 package codex
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -21,10 +22,12 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/internalutil"
 	"github.com/zzet/gortex/internal/mcp"
+	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/version"
 )
 
@@ -124,6 +127,12 @@ func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 			Keys: []string{"communities-block"},
 		})
 	}
+	skillFiles, err := planSkills(env)
+	if err != nil {
+		return nil, err
+	}
+	p.Files = append(p.Files, skillFiles...)
+	p.Files = append(p.Files, planSubAgents(env)...)
 	return p, nil
 }
 
@@ -235,6 +244,23 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		}
 		res.Files = append(res.Files, routingAction)
 	}
+
+	// Skills. ModeGlobal installs the curated playbook pack under
+	// $HOME/.agents/skills; ModeProject materialises the generated
+	// community skills under <root>/.agents/skills. skills.go documents
+	// why neither ever goes near ~/.codex.
+	skillActions, err := applySkills(env, opts)
+	if err != nil {
+		return res, fmt.Errorf("codex skills: %w", err)
+	}
+	res.Files = append(res.Files, skillActions...)
+
+	// Sub-agents → ~/.codex/agents/*.toml. ModeGlobal only: the
+	// project-scoped agents directory is only scanned for a TRUSTED
+	// project, so writing there is a gamble on state the installer cannot
+	// see — and it would put Gortex files in the user's working tree.
+	// subagents.go documents the rest of the vendor surface.
+	res.Files = append(res.Files, installSubAgents(env, opts)...)
 
 	res.Configured = true
 	return res, nil
@@ -409,13 +435,27 @@ func codexStartupTimeoutAtLeast(value any, minimum int) bool {
 	}
 }
 
+// codexVersionProbeTimeout bounds the `codex --version` probe. A version
+// banner is instant; anything slower is a wedged binary, and without a
+// deadline the probe blocks the install indefinitely and leaks a child
+// process that never exits. Failing the probe is cheap — the caller reads
+// an error as "unknown install" and keeps direct tool exposure on.
+// Overridable so the timeout test does not have to sleep for the real one.
+var codexVersionProbeTimeout = 5 * time.Second
+
 // codexVersionOutput is a seam for hermetic adapter tests.
 var codexVersionOutput = func() ([]byte, error) {
 	path, err := exec.LookPath("codex")
 	if err != nil {
 		return nil, err
 	}
-	return exec.Command(path, "--version").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), codexVersionProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "--version")
+	// The probe also runs from surfaces with no console of their own; without
+	// this, Windows hands the child a fresh console window.
+	platform.ConfigureBackgroundCommand(cmd)
+	return cmd.Output()
 }
 
 func codexSupportsDirectToolNamespaces() (supported bool, detectedVersion string) {

@@ -250,7 +250,6 @@ def process_instance(
             gortex_binary=env_cfg.get("gortex_binary"),
             gortex_timeout=int(env_cfg.get("gortex_timeout", 120)),
             eval_server_port=int(env_cfg.get("eval_server_port", 4747)),
-            cache_dir=env_cfg.get("cache_dir"),
             instance_id=instance_id,
         )
         env.setup()

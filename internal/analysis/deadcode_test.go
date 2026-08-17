@@ -719,6 +719,64 @@ func TestDeadCode_GeneratedFilesExcluded(t *testing.T) {
 	assert.Empty(t, result, "symbols in generated files should be excluded")
 }
 
+// TestDeadCode_PythonDundersExcluded verifies that Python special methods are
+// not reported as dead. Python invokes them implicitly -- via an operator, a
+// builtin, or a statement -- so they never carry a written call site.
+func TestDeadCode_PythonDundersExcluded(t *testing.T) {
+	g := graph.New()
+
+	dunders := []string{
+		"__init__",  // instantiation
+		"__repr__",  // repr()
+		"__str__",   // str()/print()
+		"__eq__",    // ==
+		"__len__",   // len()
+		"__iter__",  // for
+		"__enter__", // with
+		"__exit__",  // with
+		"__bool__",  // truthiness
+		"__getitem__",
+	}
+
+	for _, name := range dunders {
+		g.AddNode(&graph.Node{
+			ID: "pkg/mod.py::Cls." + name, Kind: graph.KindMethod,
+			Name: name, FilePath: "pkg/mod.py", StartLine: 1, EndLine: 3,
+			Language: "python",
+		})
+	}
+
+	result := FindDeadCode(g, nil, nil)
+	assert.Empty(t, result, "python dunder methods should be excluded")
+}
+
+// TestDeadCode_PythonNonDundersStillReported guards the exemption against
+// over-reach: an ordinary uncalled helper is still dead, and so is a name that
+// merely starts with underscores.
+func TestDeadCode_PythonNonDundersStillReported(t *testing.T) {
+	g := graph.New()
+
+	// All leading-underscore, so the pre-existing "skip exported symbols" rule
+	// does not apply and only the dunder exemption is under test. None of these
+	// is a dunder: the name must both start and end with "__" and have
+	// something between.
+	for _, name := range []string{"_helper", "__private", "____"} {
+		g.AddNode(&graph.Node{
+			ID: "pkg/mod.py::" + name, Kind: graph.KindFunction,
+			Name: name, FilePath: "pkg/mod.py", StartLine: 1, EndLine: 3,
+			Language: "python",
+		})
+	}
+
+	result := FindDeadCode(g, nil, nil)
+	reported := make([]string, 0, len(result))
+	for _, entry := range result {
+		reported = append(reported, entry.Name)
+	}
+	assert.ElementsMatch(t, []string{"_helper", "__private", "____"}, reported,
+		"non-dunder python symbols should still be reported")
+}
+
 // TestDeadCode_MainFunctionExcluded verifies that Go main() is not reported as dead.
 func TestDeadCode_MainFunctionExcluded(t *testing.T) {
 	g := graph.New()

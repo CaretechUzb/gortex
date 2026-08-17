@@ -18,7 +18,7 @@ import (
 // whose members are genuinely interchangeable in code identifiers
 // belong here. Domain-bearing words that mean different things in
 // different codebases are left out -- a false synonym inflates the
-// BM25 candidate pool with noise.
+// text candidate pool with noise.
 type EquivalenceTable struct {
 	// member maps each lowercased word to the index of its class in
 	// classes. A word in two classes keeps the first; the curated

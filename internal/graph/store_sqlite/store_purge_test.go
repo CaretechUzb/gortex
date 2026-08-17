@@ -28,6 +28,7 @@ func openPurgeStore(t *testing.T) *Store {
 func seedRepoRows(t *testing.T, db *sql.DB, prefix string) {
 	t.Helper()
 	nodeID := prefix + "::a.go::X"
+	chunkID := nodeID + "#chunk0"
 	exec := func(q string, args ...any) {
 		t.Helper()
 		_, err := db.Exec(q, args...)
@@ -38,7 +39,8 @@ func seedRepoRows(t *testing.T, db *sql.DB, prefix string) {
 	// must delete this edge (its from_id is a repo node) but NEVER the ''
 	// target node.
 	exec(`INSERT INTO edges (from_id, to_id, kind) VALUES (?, 'external_call::dep:shared', 'calls')`, nodeID)
-	exec(`INSERT INTO vectors (node_id, dims, vec) VALUES (?, 1, X'00')`, nodeID)
+	exec(`INSERT INTO vectors (node_id, repo_prefix, parent_id, dims, vec) VALUES (?, ?, '', 1, X'00')`, nodeID, prefix)
+	exec(`INSERT INTO vectors (node_id, repo_prefix, parent_id, dims, vec) VALUES (?, ?, ?, 1, X'00')`, chunkID, prefix, nodeID)
 
 	exec(`INSERT INTO file_mtimes (repo_prefix, file_path, mtime_ns) VALUES (?, 'a.go', 123)`, prefix)
 	exec(`INSERT INTO repo_index_state (repo_prefix, indexed_sha) VALUES (?, 'sha')`, prefix)
@@ -70,15 +72,6 @@ func countByPrefix(t *testing.T, db *sql.DB, table, prefix string) int {
 	return n
 }
 
-// countByNodeIDLike reports how many rows a node_id-keyed table (vectors)
-// holds whose node_id starts with `<prefix>::`.
-func countByNodeIDLike(t *testing.T, db *sql.DB, table, prefix string) int {
-	t.Helper()
-	var n int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE node_id LIKE ?`, prefix+"::%").Scan(&n))
-	return n
-}
-
 // prefixKeyedTables is every repo_prefix-keyed table PurgeRepo/Rekey touch,
 // minus nodes (asserted separately) — used to loop assertions.
 var prefixKeyedTables = []string{
@@ -101,7 +94,7 @@ func TestPurgeRepo_ClearsEveryTable_LeavesOthersAndGlobals(t *testing.T) {
 
 	// repoA: nodes, edges, vectors, and every sidecar cleared.
 	assert.Equal(t, 0, countByPrefix(t, s.db, "nodes", "repoA"), "repoA nodes gone")
-	assert.Equal(t, 0, countByNodeIDLike(t, s.db, "vectors", "repoA"), "repoA vectors gone")
+	assert.Equal(t, 0, countByPrefix(t, s.db, "vectors", "repoA"), "repoA ordinary and chunk vectors gone")
 	for _, tbl := range prefixKeyedTables {
 		assert.Equal(t, 0, countByPrefix(t, s.db, tbl, "repoA"), "repoA %s cleared", tbl)
 	}
@@ -111,7 +104,7 @@ func TestPurgeRepo_ClearsEveryTable_LeavesOthersAndGlobals(t *testing.T) {
 
 	// repoB untouched across the board.
 	assert.Equal(t, 1, countByPrefix(t, s.db, "nodes", "repoB"), "repoB nodes intact")
-	assert.Equal(t, 1, countByNodeIDLike(t, s.db, "vectors", "repoB"), "repoB vectors intact")
+	assert.Equal(t, 2, countByPrefix(t, s.db, "vectors", "repoB"), "repoB ordinary and chunk vectors intact")
 	for _, tbl := range prefixKeyedTables {
 		assert.Equal(t, 1, countByPrefix(t, s.db, tbl, "repoB"), "repoB %s intact", tbl)
 	}
@@ -137,17 +130,23 @@ func TestOrphanRepoPrefixes_SidecarOnlyResidue(t *testing.T) {
 	require.NoError(t, err)
 	_, err = s.writerDB.Exec(`INSERT INTO repo_index_state (repo_prefix) VALUES ('gone')`)
 	require.NoError(t, err)
+	// A vector-only legacy leak must also be discoverable even when every graph
+	// node and other sidecar for the repository is gone.
+	_, err = s.writerDB.Exec(`INSERT INTO vectors (node_id, repo_prefix, parent_id, dims, vec) VALUES ('vector-only::ghost#chunk0', 'vector-only', 'vector-only::ghost', 1, X'00')`)
+	require.NoError(t, err)
 	seedRepoRows(t, s.writerDB, "live")
 	// A '' row must never be reported as an orphan.
 	_, err = s.writerDB.Exec(`INSERT INTO file_mtimes (repo_prefix, file_path, mtime_ns) VALUES ('', 'g.go', 1)`)
 	require.NoError(t, err)
 
 	orphans := s.OrphanRepoPrefixes([]string{"live"})
-	assert.Equal(t, []string{"gone"}, orphans, "only the nodes-less residue prefix is an orphan")
+	assert.ElementsMatch(t, []string{"gone", "vector-only"}, orphans,
+		"both sidecar-only and vector-only residue must be reported")
 
 	// Case-fold safety net: a case-only spelling drift of a tracked repo is
 	// NOT an orphan.
-	assert.Empty(t, s.OrphanRepoPrefixes([]string{"LIVE", "GONE"}), "case-insensitive known set covers both prefixes")
+	assert.Empty(t, s.OrphanRepoPrefixes([]string{"LIVE", "GONE", "VECTOR-ONLY"}),
+		"case-insensitive known set covers every prefix")
 }
 
 func TestRekeyRepoPrefix_MovesProvenanceDropsNodeIDKeyed(t *testing.T) {
@@ -175,6 +174,8 @@ func TestRekeyRepoPrefix_MovesProvenanceDropsNodeIDKeyed(t *testing.T) {
 		assert.Equal(t, 0, countByPrefix(t, s.db, tbl, ""), "%s '' rows dropped", tbl)
 		assert.Equal(t, 0, countByPrefix(t, s.db, tbl, "drools"), "%s NOT relabeled to new prefix", tbl)
 	}
+	assert.Equal(t, 0, countByPrefix(t, s.db, "vectors", ""), "old-prefix vectors dropped")
+	assert.Equal(t, 0, countByPrefix(t, s.db, "vectors", "drools"), "vectors are not relabeled to new IDs")
 
 	assert.Error(t, s.RekeyRepoPrefix("repoA", ""), "rekey INTO the empty prefix is refused")
 }

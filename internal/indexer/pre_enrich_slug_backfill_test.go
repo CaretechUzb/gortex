@@ -106,7 +106,7 @@ func newPreEnrichSlugFixture(t *testing.T, stamped bool) (*MultiIndexer, *graph.
 	call := &graph.Edge{From: "a/a.go::Call", To: "unresolved::Serve", Kind: graph.EdgeCalls, FilePath: "a/a.go", Line: 3}
 	base.AddEdge(call)
 	store := base
-	mi := NewMultiIndexer(store, newTestRegistry(), search.NewBM25(), configMgr, zap.NewNop())
+	mi := NewMultiIndexer(store, newTestRegistry(), search.NewNull(), configMgr, zap.NewNop())
 	mi.repos = map[string]*RepoMetadata{
 		"a": {RepoPrefix: "a", RootPath: roots["a"]},
 		"b": {RepoPrefix: "b", RootPath: roots["b"]},

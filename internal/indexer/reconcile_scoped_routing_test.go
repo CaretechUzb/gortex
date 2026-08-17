@@ -94,7 +94,7 @@ func TestReconcileRepoCtx_ScopedEqualsFullIndex(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 
-	mi := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 	priorMtimes := mi.FileMtimes("repo")
@@ -108,7 +108,7 @@ func TestReconcileRepoCtx_ScopedEqualsFullIndex(t *testing.T) {
 
 	// Second "daemon run": a fresh MultiIndexer over the same persisted
 	// store reconciles from the snapshot.
-	mi2 := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi2 := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	res, err := mi2.ReconcileRepoCtx(context.Background(), config.RepoEntry{Path: repoPath, Name: "repo"}, priorMtimes)
 	require.NoError(t, err)
 	require.NotNil(t, res)
@@ -134,7 +134,7 @@ func TestReconcileRepoCtx_ScopedEqualsFullIndex(t *testing.T) {
 	s2, err := store_sqlite.Open(filepath.Join(t.TempDir(), "golden.sqlite"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s2.Close() })
-	miGold := NewMultiIndexer(graph.Store(s2), newTestRegistry(), search.NewBM25(), cm2, zap.NewNop())
+	miGold := NewMultiIndexer(graph.Store(s2), newTestRegistry(), search.NewNull(), cm2, zap.NewNop())
 	_, err = miGold.IndexAll()
 	require.NoError(t, err)
 
@@ -166,7 +166,7 @@ func TestReconcileRepoCtx_Routing(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = s.Close() })
 
-		mi := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+		mi := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 		_, err = mi.IndexAll()
 		require.NoError(t, err)
 		return s, cm, mi.FileMtimes("repo")
@@ -174,7 +174,7 @@ func TestReconcileRepoCtx_Routing(t *testing.T) {
 
 	reconcile := func(t *testing.T, s *store_sqlite.Store, cm *config.ConfigManager, repoPath string, prior map[string]int64) *IndexResult {
 		t.Helper()
-		mi := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+		mi := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 		res, err := mi.ReconcileRepoCtx(context.Background(), config.RepoEntry{Path: repoPath, Name: "repo"}, prior)
 		require.NoError(t, err)
 		require.NotNil(t, res)

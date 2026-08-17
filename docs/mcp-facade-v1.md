@@ -194,16 +194,13 @@ Each facade advertises only its high-frequency stable fields. A read request ill
 ```json
 {
   "target": {"file": "internal/mcp/server.go"},
-  "context": {"start_line": 100, "end_line": 180},
-  "options": {"repo": "gortex"},
-  "output": {
-    "format": "json",
-    "max_bytes": 20000,
-    "cursor": "opaque",
-    "fields": "path,content"
-  }
+  "context": {"compress_bodies": true},
+  "options": {"offset": 100, "limit": 80},
+  "output": {"max_bytes": 20000}
 }
 ```
+
+Every field above is published by `read.file`. Containers are closed per operation, so an envelope is only portable across operations to the extent that `capabilities(...detail="schema")` says it is — `read.file` takes a line window as `options.offset`/`options.limit`, while another operation may spell the same intent differently or not accept it at all.
 
 The dispatcher flattens the advertised `arguments`, `options`, `source`, `context`, `guard`, and `output` objects into the selected legacy handler's arguments. Common top-level fields win where the adapter defines a friendly alias. Operation-specific fields that are not worth mounting in every model turn remain discoverable through `capabilities`.
 
@@ -229,6 +226,14 @@ Examples are `{"file":"internal/mcp/server.go"}` and `{"symbol":"Server.addTool"
 High-frequency fields are direct and typed. In particular, `edit` advertises `match`, `replacement`, `content`, `guard`, `changes`, and `dry_run` at the top level. `refactor` similarly advertises `new_name`, `destination`, and `dry_run`. The adapter translates friendly fields such as `match`/`replacement` into the selected legacy handler's vocabulary.
 
 Cold domain tools accept an `arguments` object; common tools may additionally accept `options`, `source`, or `context`. Repository/project/scope fields use the operation schema returned by `capabilities` and are passed through to the handler. `output` is a stable open object for response shaping such as `format`, `max_bytes`, `limit`, `cursor`, and `fields`; adding another response control does not change the outer tool schema. Cursors remain opaque.
+
+A field that states **which repository or workspace** an operation should act on MUST be refused with `invalid_argument` when the selected operation cannot consume it. Silently dropping it answers about the active repository while the caller believes another one was addressed, which is a wrong answer the caller cannot detect, and on a write operation it is a write to the wrong repository.
+
+The rule applies at the top level and in every container, in any letter case, and covers the spellings a caller may reasonably invent as well as the published one: `repo`, `repo_path`, `repository`, `repository_path`, `repo_root`, `repository_root`, `repoPath`, `repo-path`, `repo_dir`, `root`, `cwd`, `dir`, `worktree`, `work_tree`, `base_repo`, `workspace`, `project`. Inventing a name does not make the intent less clear, so it must not make the failure quieter. `path` and `scope` are deliberately excluded: on this surface they name a file or a working-tree scope far more often than a repository.
+
+Refusal is decided per operation by whether the field reaches a reader, not by the name alone — an operation that genuinely consumes `workspace` or `root` still receives it. Most operations consume no repository selector at all and run against the active project; their refusal carries `data.reason = "no_repository_selector"` and names `workspace_admin.set_active_project` as the way to change scope. An operation that does publish one names it in `data.suggested_field` — `options.repo` for the common domains, `arguments.repo` for cold domains. `capabilities(...detail="schema")` is authoritative for which selector, if any, an operation accepts.
+
+Fields outside this class that an operation does not consume are still forwarded and ignored. Closing that wider gap requires enumerating every server-side reader — the handler, the response layer, and facade middleware each read from the normalized arguments — and an incomplete enumeration would refuse working calls, so the guarantee here is deliberately limited to fields that name a target.
 
 ### 8.4 Response compatibility and metadata
 

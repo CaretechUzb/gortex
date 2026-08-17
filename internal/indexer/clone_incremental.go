@@ -296,12 +296,6 @@ func (ci *incrementalCloneIndex) Pending() bool {
 	return ci.pending
 }
 
-// CloneIndexPending reports whether clone-derived edges are awaiting an
-// explicit global/clone-consuming rebuild.
-func (idx *Indexer) CloneIndexPending() bool {
-	return idx != nil && idx.cloneIndex != nil && idx.cloneIndex.Pending()
-}
-
 // EvictFuncs removes a set of function/method nodes from the index: it
 // decrements their shingles out of the CMS, drops them from the LSH index
 // and the in-memory cache, and deletes their rows from the persisted

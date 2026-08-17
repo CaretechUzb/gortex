@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -323,11 +322,4 @@ func Remove(dir string) error {
 		return err
 	}
 	return nil
-}
-
-// SortedEagerTools is a display helper for `gortex instructions list`.
-func (p Profile) SortedEagerTools() []string {
-	out := append([]string(nil), p.EagerTools...)
-	sort.Strings(out)
-	return out
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 )
@@ -70,6 +71,54 @@ func newTestIndexer(g graph.Store) *Indexer {
 	cfg := config.Default().Index
 	cfg.Workers = 2
 	return New(g, reg, cfg, zap.NewNop())
+}
+
+// newFTSStore opens a throwaway sqlite store — the only Store that carries a
+// native symbol FTS, and the one production always runs on.
+func newFTSStore(t *testing.T) *store_sqlite.Store {
+	t.Helper()
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "fts.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+// newFTSIndexer indexes dir into a real sqlite store and returns both. It is
+// the fixture for every assertion about what indexing makes SEARCHABLE:
+// production always runs on a store whose native FTS answers symbol search, so
+// idx.Search() here is the SymbolSearcherBackend reading store.SearchSymbols
+// rather than an in-process index the daemon never builds.
+//
+// prepare runs on the indexer before Index, for the SetEmbedder /
+// SetEmbeddingChunkOptions wiring some fixtures need.
+func newFTSIndexer(
+	t *testing.T,
+	dir string,
+	reg *parser.Registry,
+	cfg config.IndexConfig,
+	prepare ...func(*Indexer),
+) (*Indexer, *store_sqlite.Store) {
+	t.Helper()
+	store := newFTSStore(t)
+	idx := New(store, reg, cfg, zap.NewNop())
+	for _, p := range prepare {
+		p(idx)
+	}
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+	requireSymbolFTS(t, store)
+	return idx, store
+}
+
+// requireSymbolFTS fails unless the store's symbol corpus actually holds
+// something. An empty corpus satisfies every "must NOT be searchable"
+// assertion for the wrong reason and turns the whole fixture into a silent
+// pass, so no search test may run without this gate.
+func requireSymbolFTS(t *testing.T, store *store_sqlite.Store) {
+	t.Helper()
+	count, err := store.SymbolFTSCount()
+	require.NoError(t, err)
+	require.Greater(t, count, 0, "fixture left the symbol FTS empty — search assertions would be vacuous")
 }
 
 // newTestIndexerGoJava registers both the Go and Java extractors — used by

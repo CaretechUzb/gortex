@@ -53,7 +53,7 @@ func TestStatus_TrackedRepoRowFollowsTheLiveGraph(t *testing.T) {
 	g := graph.New()
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
-	mi := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
@@ -129,7 +129,7 @@ func TestStatus_TwoReposEachReportTheirOwnBucket(t *testing.T) {
 
 	// A is indexed while it is the only configured repo.
 	g := graph.New()
-	mi1 := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	mi1 := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err = mi1.IndexAll()
 	require.NoError(t, err)
 	var priorA map[string]int64
@@ -141,7 +141,7 @@ func TestStatus_TwoReposEachReportTheirOwnBucket(t *testing.T) {
 	// B is added while the daemon is "down", then a warm restart reconciles
 	// A from its persisted mtimes and tracks B fresh.
 	require.NoError(t, cm.Global().AddRepo(config.RepoEntry{Path: dirB}))
-	mi2 := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	mi2 := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
 	_, err = mi2.ReconcileRepoCtx(context.Background(), config.RepoEntry{Path: dirA}, priorA)
 	require.NoError(t, err)
 	_, err = mi2.TrackRepoCtx(context.Background(), config.RepoEntry{Path: dirB})

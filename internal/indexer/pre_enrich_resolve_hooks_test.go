@@ -36,7 +36,7 @@ func TestRunPreEnrichResolveFiresComputeDoneHook(t *testing.T) {
 	inbound := &graph.Edge{From: "repo-a/a.go::Caller", To: "unresolved::Foo", Kind: graph.EdgeCalls, FilePath: "repo-a/a.go", Line: 5}
 	g.AddEdge(inbound)
 
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	var order []string
 	require.NoError(t, mi.RunPreEnrichResolve(context.Background(), nil,

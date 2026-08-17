@@ -137,6 +137,8 @@ func (s *Server) registerCodingTools() {
 			mcp.WithNumber("limit", mcp.Description("Maximum number of lines to return starting at offset. Omit or 0 to read to end of file. Set this (with or without offset) to read a bounded window instead of the whole file.")),
 			mcp.WithBoolean("compress_bodies", mcp.Description("Replace function/method bodies with elided stubs (default: false)")),
 			mcp.WithBoolean("allow_secrets", mcp.Description("Serve secret-shaped values in config / data-leaf files (.env, *.yaml, *.toml, *.properties, ...) verbatim. By default such values are withheld and only their keys are shown. Default: false.")),
+			mcp.WithBoolean("physical_evidence", mcp.Description("Return disk evidence. Includes SHA-256, byte count, resolved path, provenance, and same-buffer status for the full regular file. The digest covers raw disk bytes before transforms or editor overlays. Default: false.")),
+			mcp.WithString("digest", mcp.Description("Select the digest. Only sha256 is supported; defaults to sha256 when physical_evidence=true.")),
 			mcp.WithString("keep", mcp.Description("Comma-separated symbol names, IDs, or node kinds whose bodies stay verbatim when compress_bodies is set — every other body in the file is still stubbed. Ignored unless compress_bodies is true.")),
 			mcp.WithString("fidelity_globs", mcp.Description(fidelityGlobsParamDescription)),
 			mcp.WithNumber("max_lines", mcp.Description("When the file exceeds this many lines, collapse runs of leaf statements inside function bodies into `… N lines elided …` markers while keeping declarations and the control-flow skeleton. Falls back to a plain head cut for non-code files. Omit or 0 to disable.")),
@@ -175,7 +177,7 @@ func (s *Server) registerCodingTools() {
 
 	s.addTool(
 		mcp.NewTool("rename_symbol",
-			mcp.WithDescription("Applies a coordinated multi-file rename for a symbol. Rewrites the definition, every graph usage (calls / references / instantiates), receiver lines when renaming a type, and test-function names that embed the old identifier. Returns status (applied / would_apply / no_edits), the {file, line, old_text, new_text, confidence, reason} edit list, and per-file {bytes_written, new_sha, reindexed}. Every affected line is re-verified against disk and parse-gated before anything is written, so the rename either lands completely or is refused. Pass dry_run=true to preview the identical edit list without writing."),
+			mcp.WithDescription("Applies a coordinated multi-file rename for a symbol. Rewrites the definition, every graph usage (calls / references / instantiates), receiver lines when renaming a type, and test-function names that embed the old identifier. Returns status (applied / would_apply / no_edits), the {file, line, old_text, new_text, confidence, reason} edit list, and per-file {bytes_written, new_sha, reindexed}. An existing but unindexed target returns a structured symbol_not_indexed error only when the configured extractor anchors the requested declaration; its guarded edit/file fallback is an exact declaration-line edit and does not claim reference completeness. The refusal itself writes nothing. Every affected line is re-verified against disk and parse-gated before anything is written, so the rename either lands completely or is refused. Pass dry_run=true to preview the identical edit list without writing."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol ID to rename (e.g. auth/token.go::validateToken)")),
 			mcp.WithString("new_name", mcp.Required(), mcp.Description("New name for the symbol")),
 			mcp.WithBoolean("dry_run", mcp.Description("Preview only: compute and verify every edit but write nothing. Returns status \"would_apply\" with the same edits and per-file new_sha the real call would produce. Default false — the call writes.")),
@@ -2556,6 +2558,13 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 
 	node := s.engineFor(ctx).GetSymbol(id)
 	if node == nil {
+		if recovery := s.unindexedRenameRecovery(ctx, id, newName, dryRun); recovery != nil {
+			return NewStructuredErrorResult(StructuredError{
+				ErrorCode: ErrCodeSymbolNotIndexed,
+				Message:   fmt.Sprintf("semantic rename cannot resolve %s because its file has no indexed symbols", id),
+				Data:      recovery,
+			}), nil
+		}
 		return mcp.NewToolResultError("symbol not found: " + id), nil
 	}
 

@@ -19,6 +19,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/search"
 )
@@ -78,19 +79,33 @@ func (e *toggleExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	return &parser.ExtractionResult{Nodes: nodes}, nil
 }
 
-func newToggleIndexer(t *testing.T) (*Indexer, *toggleExtractor) {
+func newToggleIndexer(t *testing.T) (*Indexer, *toggleExtractor, *store_sqlite.Store) {
 	t.Helper()
 	ext := &toggleExtractor{}
 	reg := parser.NewRegistry()
 	reg.Register(ext)
-	g := graph.New()
-	idx := New(g, reg, config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
-	return idx, ext
+	// A real sqlite store, so idx.search is the production
+	// SymbolSearcherBackend over the store's native symbol FTS: the
+	// "search entry survived / was evicted" assertions below then pin the
+	// corpus the daemon actually serves. The store rides out so a test can
+	// gate on a non-empty corpus before trusting any of them.
+	store := newFTSStore(t)
+	idx := New(store, reg, config.IndexConfig{Workers: 1}, zap.NewNop())
+	return idx, ext, store
 }
 
+// tier0Dodge is appended to every searchHasID query. The sqlite backend
+// short-circuits an identifier-shaped query on an exact FindNodesByName hit
+// and returns before the ranked FTS tier runs (store_fts.go tier 0), so
+// asking for "Alpha" would be answered straight out of the graph — these
+// assertions would then restate the GetNode check on the line above them and
+// prove nothing about the search corpus. A second whitespace-separated token
+// makes the query non-identifier-shaped. It matches no document and the MATCH
+// expression is a prefix-OR, so the real term still decides the answer.
+const tier0Dodge = " zznosuchtokenzz"
+
 func searchHasID(idx *Indexer, query, id string) bool {
-	for _, r := range idx.search.Search(query, 50) {
+	for _, r := range idx.search.Search(query+tier0Dodge, 50) {
 		if r.ID == id {
 			return true
 		}
@@ -108,7 +123,7 @@ func searchHasID(idx *Indexer, query, id string) bool {
 // evicted the graph + search entries before parsing and returned early
 // on result == nil, leaving the file at zero nodes.
 func TestIndexFile_ParseFailureKeepsPriorNodes(t *testing.T) {
-	idx, ext := newToggleIndexer(t)
+	idx, ext, store := newToggleIndexer(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "main.fk")
 	idx.SetRootPath(dir)
@@ -121,6 +136,7 @@ func TestIndexFile_ParseFailureKeepsPriorNodes(t *testing.T) {
 
 	funcID := "main.fk::Alpha"
 	require.NotNil(t, idx.graph.GetNode(funcID), "Alpha must be indexed before the bad edit")
+	requireSymbolFTS(t, store)
 	require.True(t, searchHasID(idx, "Alpha", funcID), "Alpha must be in the search index before the bad edit")
 	nodesBefore := len(idx.graph.GetFileNodes("main.fk"))
 	require.Equal(t, 2, nodesBefore, "file node + Alpha")
@@ -164,7 +180,7 @@ func TestIndexFile_ParseFailureKeepsPriorNodes(t *testing.T) {
 // must leave the file's prior nodes / search entries intact, and a clean
 // modify must still swap. Against the pre-fix patchGraph this FAILS.
 func TestPatchGraphModify_ParseFailureKeepsPriorNodes(t *testing.T) {
-	idx, ext := newToggleIndexer(t)
+	idx, ext, store := newToggleIndexer(t)
 	dir := t.TempDir()
 	idx.SetRootPath(dir)
 	path := filepath.Join(dir, "main.fk")
@@ -180,6 +196,7 @@ func TestPatchGraphModify_ParseFailureKeepsPriorNodes(t *testing.T) {
 
 	funcID := "main.fk::Alpha"
 	require.NotNil(t, idx.graph.GetNode(funcID), "Alpha must be indexed via the create patch")
+	requireSymbolFTS(t, store)
 	require.True(t, searchHasID(idx, "Alpha", funcID))
 	nodesBefore := len(idx.graph.GetFileNodes("main.fk"))
 	require.Equal(t, 2, nodesBefore, "file node + Alpha")
@@ -237,7 +254,7 @@ func TestPollGitHead_DiffFailureRetriesRange(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(repoDir)
 	_, err = idx.IndexCtx(testCtx(), repoDir)
 	require.NoError(t, err)
@@ -290,7 +307,7 @@ func haveGit(t *testing.T) bool {
 // seam stands in for full-tree reconciliation so the assertion is
 // deterministic and platform-independent.
 func TestWatcher_OverflowEventTriggersReconcile(t *testing.T) {
-	idx, _ := newToggleIndexer(t)
+	idx, _, _ := newToggleIndexer(t)
 	idx.SetRootPath(t.TempDir())
 	w, err := NewWatcher(idx, config.WatchConfig{Enabled: true, DebounceMs: 10}, zap.NewNop())
 	require.NoError(t, err)
@@ -321,7 +338,7 @@ func TestWatcher_OverflowEventTriggersReconcile(t *testing.T) {
 // signals collapses into at most one reconcile in flight — the loop is
 // never blocked and the tree isn't re-walked per dropped event.
 func TestWatcher_OverflowReconcileCoalesces(t *testing.T) {
-	idx, _ := newToggleIndexer(t)
+	idx, _, _ := newToggleIndexer(t)
 	idx.SetRootPath(t.TempDir())
 	w, err := NewWatcher(idx, config.WatchConfig{Enabled: true, DebounceMs: 10}, zap.NewNop())
 	require.NoError(t, err)
@@ -378,7 +395,7 @@ func TestWatcher_OverflowReconcileIndexesMissedFile(t *testing.T) {
 	reg.Register(ext)
 	g := graph.New()
 	idx := New(g, reg, config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 
 	ext.setFail(false)
@@ -432,7 +449,7 @@ func TestWatcher_NewSubdirScanIndexesPreWatchFile(t *testing.T) {
 	reg.Register(ext)
 	g := graph.New()
 	idx := New(g, reg, config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 
 	ext.setFail(false)
@@ -477,7 +494,7 @@ func TestWatcher_NewSubdirScanIndexesPreWatchFile(t *testing.T) {
 // changes inside an existing directory fire their own file events. Uses
 // the scanFn seam.
 func TestWatcher_DirEventScanGating(t *testing.T) {
-	idx, _ := newToggleIndexer(t)
+	idx, _, _ := newToggleIndexer(t)
 	dir := t.TempDir()
 	idx.SetRootPath(dir)
 	subdir := filepath.Join(dir, "sub")
@@ -545,7 +562,7 @@ func TestWatcher_PatchPanicRecoveredNotCrash(t *testing.T) {
 	reg.Register(ext)
 	store := &panicOnReadStore{Store: graph.New()}
 	idx := New(store, reg, config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	dir := t.TempDir()
 	idx.SetRootPath(dir)
 	path := filepath.Join(dir, "main.fk")

@@ -45,79 +45,79 @@ cases:
       query: IndexFileNozResolve
       expected:
         - internal/indexer/indexer.go::Indexer.IndexFileNoResolve
-    - id: exact-IncrementalReindex-typo
+    - id: exact-IncrementalReindexPaths-typo
       tier: exact
-      query: IncrementalPeindex
+      query: IncrementalReigdexPaths
       expected:
         - internal/indexer/indexer.go::Indexer.IncrementalReindexPaths
     - id: exact-SetEmbedder-typo
       tier: exact
-      query: SetEmbeeder
+      query: SetEmbedde
       expected:
         - internal/indexer/indexer.go::Indexer.SetEmbedder
     - id: exact-EvictFile-typo
       tier: exact
-      query: EvictFife
+      query: EvictFilq
       expected:
         - internal/graph/graph.go::Graph.EvictFile
     - id: exact-EvictRepo-typo
       tier: exact
-      query: EvkctRepo
+      query: EiictRepo
       expected:
         - internal/graph/graph.go::Graph.EvictRepo
     - id: exact-AddNode-typo
       tier: exact
-      query: AddNode
+      query: AddoNde
       expected:
         - internal/graph/graph.go::Graph.AddNode
     - id: exact-AtomicWriteFile-typo
       tier: exact
-      query: AtomicnWriteFile
+      query: AtomicWriteile
       expected:
         - internal/agents/writer.go::AtomicWriteFile
     - id: exact-WriteIfNotExists-typo
       tier: exact
-      query: WrilteIfNotExists
+      query: WriteIfNotExisks
       expected:
         - internal/agents/writer.go::WriteIfNotExists
-    - id: exact-BM25Backend-typo
+    - id: exact-SymbolSearcherBackend-typo
       tier: exact
-      query: BM25Backejd
+      query: SymbolSearcherackend
       expected:
-        - internal/search/bm25.go::BM25Backend
-    - id: exact-NewBM25-typo
+        - internal/search/symbolsearcher_backend.go::SymbolSearcherBackend
+    - id: exact-NewSymbolSearcherBackend-typo
       tier: exact
-      query: NenBM25
+      query: NewSymboSlearcherBackend
       expected:
-        - internal/search/bm25.go::NewBM25
+        - internal/search/symbolsearcher_backend.go::NewSymbolSearcherBackend
     - id: exact-HybridBackend-typo
       tier: exact
-      query: HybridBfckend
+      query: HybridUackend
       expected:
         - internal/search/hybrid.go::HybridBackend
     - id: exact-NewHybrid-typo
       tier: exact
-      query: NewHybid
+      query: NtwHybrid
       expected:
         - internal/search/hybrid.go::NewHybrid
-    - id: exact-rrfFuse-typo
+    - id: exact-alphaFuse-typo
       tier: exact
-      query: rrfFse
+      query: agphaFuse
       expected:
-        - internal/search/hybrid.go::rrfFuse
+        - internal/search/hybrid.go::alphaFuse
     - id: exact-VectorBackend-typo
       tier: exact
-      query: VectorBcakend
+      query: VectorBackedd
       expected:
         - internal/search/vector.go::VectorBackend
     - id: exact-SearchBackend-typo
       tier: exact
-      query: search.Backeod
+      query: sewarch.Backend
       expected:
         - internal/search/search.go::Backend
     - id: exact-SearchResult-typo
       tier: exact
-      query: SearchResutl
+      query: SearchResuzt
       expected:
         - internal/search/search.go::SearchResult
     - id: exact-Swappable-typo
@@ -335,26 +335,26 @@ cases:
       query: drop every node for a rpeository prefix
       expected:
         - internal/graph/graph.go::Graph.EvictRepo
-    - id: concept-bm25-index-typo
+    - id: concept-store-native-text-typo
       tier: concept
-      query: text search backend wtih TF-IDF ranking
+      query: adapt store-native symbol search itno the search backend
       expected:
-        - internal/search/bm25.go::BM25Backend
+        - internal/search/symbolsearcher_backend.go::SymbolSearcherBackend
     - id: concept-hybrid-fuse-typo
       tier: concept
-      query: comlbine text and vector search with RRF
+      query: combine store-native text and lvector search with adaptive alpha
       expected:
         - internal/search/hybrid.go::HybridBackend
-    - id: concept-rrf-algorithm-typo
+    - id: concept-adaptive-alpha-typo
       tier: concept
-      query: reciprocal randk fusion
+      query: adaptive alpha weightded text and vector fusion
       expected:
-        - internal/search/hybrid.go::rrfFuse
+        - internal/search/hybrid.go::alphaFuse
     - id: concept-swap-backend-typo
       tier: concept
-      query: hot-swap the in-memory searich backend
+      query: atomically replace the vectior channel while preserving the live text backend
       expected:
-        - internal/search/swappable.go::Swappable
+        - internal/search/swappable.go::Swappable.ReplaceHybridVector
     - id: concept-glove-embed-typo
       tier: concept
       query: built-in GloVe owrd vector embedder
@@ -510,11 +510,11 @@ cases:
       query: register every language extactor
       expected:
         - internal/parser/languages/register.go::RegisterAll
-    - id: concept-ranker-bm25-typo
+    - id: concept-ranker-engine-typo
       tier: concept
-      query: eval rnker adapter for BM25
+      query: eval rnker adapter for engine search
       expected:
-        - internal/eval/recall/rankers.go::BM25Ranker
+        - internal/eval/recall/rankers.go::EngineRanker
     - id: concept-ranker-rrf-typo
       tier: concept
       query: eval ranker dapter for RRF hybrid
@@ -557,7 +557,7 @@ cases:
         - internal/mcp/server.go::NewServer
     - id: concept-new-hybrid-typo
       tier: concept
-      query: construct a hbyrid BM25+vector backend
+      query: construct a hybrid stroe-native text and vector backend
       expected:
         - internal/search/hybrid.go::NewHybrid
     - id: concept-reindex-all-typo
@@ -672,8 +672,8 @@ cases:
       tier: multi_hop
       query: search backend implementatsions
       expected:
-        - internal/search/bm25.go::BM25Backend
-        - internal/search/bleve.go::BleveBackend
+        - internal/search/null.go::NullBackend
+        - internal/search/symbolsearcher_backend.go::SymbolSearcherBackend
         - internal/search/hybrid.go::HybridBackend
         - internal/search/vector.go::VectorBackend
         - internal/search/swappable.go::Swappable
@@ -708,7 +708,7 @@ cases:
       tier: multi_hop
       query: ranker adapters in the eval packapge
       expected:
-        - internal/eval/recall/rankers.go::BM25Ranker
+        - internal/eval/recall/rankers.go::EngineRanker
         - internal/eval/recall/rankers.go::SemanticRanker
         - internal/eval/recall/rankers.go::RRFRanker
         - internal/eval/recall/rankers.go::WinnowRanker
@@ -832,15 +832,15 @@ cases:
       expected:
         - internal/config/config.go::Load
         - internal/config/config.go::Default
-    - id: mh-bm25-api-typo
+    - id: mh-null-backend-api-typo
       tier: multi_hop
-      query: BM25 backend pubilc API
+      query: null seacrh backend public API
       expected:
-        - internal/search/bm25.go::BM25Backend.Add
-        - internal/search/bm25.go::BM25Backend.Remove
-        - internal/search/bm25.go::BM25Backend.Search
-        - internal/search/bm25.go::BM25Backend.Count
-        - internal/search/bm25.go::NewBM25
+        - internal/search/null.go::NullBackend.Add
+        - internal/search/null.go::NullBackend.Remove
+        - internal/search/null.go::NullBackend.Search
+        - internal/search/null.go::NullBackend.Count
+        - internal/search/null.go::NewNull
     - id: mh-tool-registrations-typo
       tier: multi_hop
       query: MCP tool registration functuons

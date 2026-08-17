@@ -12,27 +12,29 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
-	"github.com/zzet/gortex/internal/search"
 )
 
-// soupTestServer builds a single-repo server whose BM25 index holds a
-// handful of distinct, single-token symbols so a soup query's split
-// disjuncts each retrieve a known node.
+// soupTestServer builds a single-repo server whose retrieval ordering
+// is one token per symbol: each symbol answers to its own lowercased
+// name and to nothing else. So a disjunct that the soup handling
+// actually queries retrieves exactly its own node, and a symbol no
+// disjunct names ("Unrelated") is unreachable — the merged result is a
+// readout of which terms were queried, not of how they ranked.
 func soupTestServer(t *testing.T, soupMode string) *Server {
 	t.Helper()
 	g := graph.New()
 	names := []string{"AuthHandler", "LoginService", "SigninFlow", "CredentialStore", "Unrelated"}
-	bm := search.NewBM25()
+	ob := newOrderedBackend()
 	for _, n := range names {
 		id := "pkg/" + n + ".go::" + n
 		g.AddNode(&graph.Node{
 			ID: id, Kind: graph.KindFunction, Name: n,
 			FilePath: "pkg/" + n + ".go", StartLine: 1, EndLine: 5, Language: "go",
 		})
-		bm.Add(id, n, "pkg/"+n+".go", "")
+		ob.put(n, id)
 	}
 	eng := query.NewEngine(g)
-	eng.SetSearch(bm)
+	eng.SetSearch(ob)
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 	srv.SetSearchConfig(config.SearchConfig{KeywordSoupRewrite: soupMode})
 	return srv
@@ -54,8 +56,8 @@ func runSoupSearch(t *testing.T, srv *Server, args map[string]any) map[string]an
 // TestSearchSymbols_SoupSplitMerge confirms a degenerate OR-soup query
 // in the default "split" mode (a) reports the keyword_soup class, (b)
 // attaches a query_advice nudge with the split disjuncts, and (c) the
-// BM25 OR-merge over the disjuncts surfaces every targeted symbol --
-// none of which the raw soup string would rank well on its own.
+// OR-merge over those disjuncts surfaces every targeted symbol and
+// nothing else -- a symbol none of the disjuncts names stays out.
 func TestSearchSymbols_SoupSplitMerge(t *testing.T) {
 	srv := soupTestServer(t, config.KeywordSoupSplit)
 	resp := runSoupSearch(t, srv, map[string]any{
@@ -83,6 +85,8 @@ func TestSearchSymbols_SoupSplitMerge(t *testing.T) {
 	} {
 		require.Truef(t, ids[want], "soup split-merge missed %s; got %v", want, ids)
 	}
+	require.Falsef(t, ids["pkg/Unrelated.go::Unrelated"],
+		"no disjunct names Unrelated, so the merge must not surface it; got %v", ids)
 }
 
 // TestSearchSymbols_SoupOffMode confirms KeywordSoupRewrite:"off"

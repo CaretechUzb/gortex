@@ -26,6 +26,9 @@ var agentLabels = map[string]string{
 	"cline":       "Cline",
 	"codex":       "Codex CLI",
 	"continue":    "Continue.dev",
+	// Distinct from "vscode" below: that adapter is Copilot inside VS
+	// Code, this one is the standalone `copilot` terminal binary.
+	"copilot-cli": "GitHub Copilot CLI",
 	"gemini":      "Gemini CLI",
 	"hermes":      "Hermes",
 	"kimi":        "Kimi Code CLI",
@@ -50,6 +53,7 @@ var agentDetails = map[string]string{
 	"cline":       ".clinerules + cline_mcp_settings.json",
 	"codex":       "AGENTS.md + config.toml hooks",
 	"continue":    ".continue/config.json",
+	"copilot-cli": "~/.copilot/mcp-config.json + copilot-instructions.md",
 	"gemini":      ".gemini/settings.json",
 	"hermes":      "~/.hermes/config.yaml + profiles + skills",
 	"kimi":        ".kimi-code/mcp.json · user hook via install",

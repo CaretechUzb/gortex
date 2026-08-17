@@ -82,7 +82,7 @@ func TestMultiIndexer_IndexAll_GlobalPassesProduceEdges(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	results, err := mi.IndexAll()
 	require.NoError(t, err)
@@ -113,10 +113,10 @@ func TestMultiIndexer_IndexAll_GlobalPassesProduceEdges(t *testing.T) {
 	assert.GreaterOrEqual(t, testFuncs, 2, "is_test should be stamped on TestRunGreet in each repo")
 }
 
-// TestMultiIndexer_RunGlobalGraphPasses_Idempotent verifies that running
-// the global passes a second time does not mutate edge counts (graph
-// dedup + resolver passes skip already-present edges).
-func TestMultiIndexer_RunGlobalGraphPasses_Idempotent(t *testing.T) {
+// TestMultiIndexer_GlobalGraphPassPipeline_Idempotent verifies that running
+// the live global-pass pipeline a second time does not mutate edge counts
+// (graph dedup + resolver passes skip already-present edges).
+func TestMultiIndexer_GlobalGraphPassPipeline_Idempotent(t *testing.T) {
 	repoA := setupRepoWithTestAndIface(t, "repo-a")
 	repoB := setupRepoWithTestAndIface(t, "repo-b")
 
@@ -134,7 +134,7 @@ func TestMultiIndexer_RunGlobalGraphPasses_Idempotent(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
@@ -145,8 +145,8 @@ func TestMultiIndexer_RunGlobalGraphPasses_Idempotent(t *testing.T) {
 	require.Greater(t, testsBefore, 0)
 
 	// Re-run the global passes. None of the three should add duplicates.
-	mi.RunGlobalGraphPasses(context.Background())
-	mi.RunGlobalGraphPasses(context.Background())
+	mi.runGlobalGraphPasses(context.Background(), nil, false)
+	mi.runGlobalGraphPasses(context.Background(), nil, false)
 
 	assert.Equal(t, implsBefore, countEdges(g, graph.EdgeImplements),
 		"InferImplements re-emission should be idempotent")
@@ -173,7 +173,7 @@ func TestMultiIndexer_BeginEndBatch_DefersGlobalPasses(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	mi.BeginBatch()
 
@@ -213,7 +213,7 @@ func TestMultiIndexer_TrackRepoCtx_NoBatch_RunsGlobalPassesInline(t *testing.T) 
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
 	_, err = mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: repoA, Name: "repo-a"})
 	require.NoError(t, err)

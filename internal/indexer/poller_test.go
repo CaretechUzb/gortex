@@ -101,7 +101,7 @@ func TestPoller_DetectsFilesystemChangeMissedByFsnotify(t *testing.T) {
 
 	g := graph.New()
 	idx := newTestIndexer(g)
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
@@ -138,7 +138,7 @@ func TestPoller_DetectsDeletedFileMissedByFsnotify(t *testing.T) {
 
 	g := graph.New()
 	idx := newTestIndexer(g)
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
@@ -184,7 +184,7 @@ func TestPoller_DetectsGitHeadMoveMissedByFsnotify(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(repoDir)
 	_, err := idx.IndexCtx(testCtx(), repoDir)
 	require.NoError(t, err)
@@ -345,7 +345,7 @@ func TestPoller_SweepHookReportsWork(t *testing.T) {
 
 	g := graph.New()
 	idx := newTestIndexer(g)
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
@@ -461,7 +461,7 @@ func TestPoller_SweepUnionsGitAndFilesystemPathsIntoOneBatch(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(repoDir)
 	_, err := idx.IndexCtx(testCtx(), repoDir)
 	require.NoError(t, err)
@@ -519,7 +519,7 @@ func TestPoller_GitSHAAdvancesOnlyAfterSuccessfulBatch(t *testing.T) {
 
 	g := graph.New()
 	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
-	idx.search = search.NewBM25()
+	idx.search = search.NewNull()
 	idx.SetRootPath(repoDir)
 	_, err := idx.IndexCtx(testCtx(), repoDir)
 	require.NoError(t, err)

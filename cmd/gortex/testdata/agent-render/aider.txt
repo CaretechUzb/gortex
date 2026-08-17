@@ -1,8 +1,8 @@
-=== root/.aiderignore ===
+=== project/root/.aiderignore ===
 # Added by `gortex init` — Gortex cache artifacts are not source
 .gortex/
 *.gortex-cache
-=== root/CONVENTIONS.md ===
+=== project/root/CONVENTIONS.md ===
 <!-- gortex:communities:start -->
 - [example-community](.claude/skills/example/SKILL.md) — example routing block
 

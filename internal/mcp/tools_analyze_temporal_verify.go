@@ -34,9 +34,9 @@ import (
 )
 
 // maxTemporalNodeSourceBytes caps the per-node source handed to the LLM so a
-// giant function body can't blow the prompt budget. Mirrors the cap baked into
-// analyzer.NewFileSourceProvider; restated here because this handler resolves
-// paths through the server (resolveNodePath) rather than a bare root join.
+// giant function body can't blow the prompt budget. Source reading lives here
+// because this handler resolves paths through the server's multi-repository and
+// worktree-aware resolveNodePath logic.
 const maxTemporalNodeSourceBytes = 6000
 
 // serverSourceProvider implements resolver.TemporalSourceProvider by reading a

@@ -325,17 +325,6 @@ func (m *OverlayManager) Touch(sessionID string) error {
 	return nil
 }
 
-// IdleTTL returns the configured idle expiry duration. Exposed so the
-// overlay_list tool can compute and surface an `expires_at` hint to
-// editor extensions that want to schedule a keepalive proactively.
-// Zero means "no expiry" (test-mode).
-func (m *OverlayManager) IdleTTL() time.Duration {
-	if m == nil {
-		return 0
-	}
-	return m.idleTTL
-}
-
 // SessionStatus is the per-session liveness snapshot reported through
 // overlay_list. Callers compare `IdleSeconds` to `IdleTTLSeconds` to
 // decide when to push a keepalive; `ExpiresAt` (RFC3339) is the
@@ -583,18 +572,6 @@ func (m *OverlayManager) Files(sessionID string) (map[string]OverlayFile, error)
 		out[k] = v
 	}
 	return out, nil
-}
-
-// SessionWorkspace returns the workspace slug captured at Register.
-// ErrSessionNotFound when the session doesn't exist.
-func (m *OverlayManager) SessionWorkspace(sessionID string) (string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	sess, ok := m.sessions[sessionID]
-	if !ok {
-		return "", ErrSessionNotFound
-	}
-	return sess.WorkspaceID, nil
 }
 
 // SweepIdle drops sessions whose LastUsed is older than IdleTTL.
@@ -1058,24 +1035,6 @@ func (m *OverlayManager) PushToBranch(sessionID, branchName string, overlay Over
 		return ErrBranchNotFound
 	}
 	br.files[overlay.Path] = overlay
-	sess.LastUsed = time.Now()
-	return nil
-}
-
-// DeleteFromBranch removes one overlay file from a specific branch.
-// Companion to PushToBranch; does not change the active pointer.
-func (m *OverlayManager) DeleteFromBranch(sessionID, branchName, path string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	sess, ok := m.sessions[sessionID]
-	if !ok {
-		return ErrSessionNotFound
-	}
-	br, ok := sess.branches[branchName]
-	if !ok {
-		return ErrBranchNotFound
-	}
-	delete(br.files, path)
 	sess.LastUsed = time.Now()
 	return nil
 }

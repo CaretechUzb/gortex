@@ -658,8 +658,12 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	var pendingLoaded atomic.Int64
 	pendingTotal.Store(int64(pendingBefore))
 	terminalSkipped := 0
+	terminalLoaded := 0
+	loadElapsed := time.Duration(0)
 	streamDone := false
 	loadPendingPage := func() ([]*graph.Edge, error) {
+		loadStart := time.Now()
+		defer func() { loadElapsed += time.Since(loadStart) }()
 		for {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -681,6 +685,13 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				var skipped int
 				pending, skipped = filterTerminalSkip(pending, r.scope)
 				terminalSkipped += skipped
+			}
+			// Durably-terminal edges that still enter compute — the volume a
+			// terminal skip on this pass's shape would have saved.
+			for _, e := range pending {
+				if edgeTerminalFlag(e) {
+					terminalLoaded++
+				}
 			}
 			pendingAfter += len(pending)
 			pendingLoaded.Store(int64(pendingAfter))
@@ -719,6 +730,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	}
 
 	passStart := time.Now()
+	// The first page fetched above predates the pass clock: drop it from
+	// page_load so the interior buckets stay inside compute_loop — on a
+	// scoped pass that first fetch dominates load time and would overrun it.
+	loadElapsed = 0
 	r.logger.Info("resolver: pass start",
 		zap.Int("pending", pendingBefore),
 		zap.Int("first_page", len(pending)),
@@ -826,7 +841,18 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// origin upgrades, re-corrections of already-resolved edges).
 	reindexConversions := 0
 	reindexChurn := 0
+	churnRetargeted := 0
+	churnKindPromoted := 0
+	churnAttrsOnly := 0
 	warmElapsed := time.Duration(0)
+	prepareElapsed := time.Duration(0)
+	workersElapsed := time.Duration(0)
+	applyElapsed := time.Duration(0)
+	applyLivenessElapsed := time.Duration(0)
+	applyNoteElapsed := time.Duration(0)
+	applyStoreElapsed := time.Duration(0)
+	applyPlaceholderElapsed := time.Duration(0)
+	applyGuardSpoolElapsed := time.Duration(0)
 	for {
 		if err := ctx.Err(); err != nil {
 			return resolveError(err)
@@ -845,7 +871,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		var pageLiveness resolveJobLiveness
 		var pageDeferredLSP []deferredLSPEdge
 		if len(pending) > 0 {
+			prepareStart := time.Now()
 			sources := passIndexes.prepare(pending)
+			prepareElapsed += time.Since(prepareStart)
 			warmStart := time.Now()
 			r.warmLookupCacheWithSources(pending, sources)
 			warmElapsed += time.Since(warmStart)
@@ -872,6 +900,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				}
 			}
 
+			workersStart := time.Now()
 			workers := runtime.NumCPU()
 			if workers < 1 {
 				workers = 1
@@ -960,9 +989,11 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				}(w, scPending[start:end])
 			}
 			wg.Wait()
+			workersElapsed += time.Since(workersStart)
 			if err := ctx.Err(); err != nil {
 				return resolveError(err)
 			}
+			applyStart := time.Now()
 
 			// Apply this chunk's mutations under the lock. An edit during a PRIOR
 			// inter-chunk yield may have evicted an edge this chunk resolved;
@@ -973,6 +1004,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			var liveJobs resolveJobLiveness
 			validateLiveJobs := false
 			if r.validateLiveness {
+				livenessStart := time.Now()
 				switch {
 				case !pageRevisionKnown:
 					// Unknown stores cannot prove that the page stayed stable.
@@ -982,6 +1014,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 					liveJobs = pageLiveness
 					validateLiveJobs = true
 				}
+				applyLivenessElapsed += time.Since(livenessStart)
 			}
 			reindexBatch := make([]graph.EdgeReindex, 0, resolveJobCount(perWorkerJobs))
 			for i := range perWorkerJobs {
@@ -1001,15 +1034,29 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 						reindexConversions++
 					} else {
 						reindexChurn++
+						switch churnShape(j.oldTo, j.newTo, j.oldKind, j.kind) {
+						case churnShapeRetarget:
+							churnRetargeted++
+						case churnShapeKind:
+							churnKindPromoted++
+						default:
+							churnAttrsOnly++
+						}
 					}
 					kept = append(kept, j)
 				}
 				perWorkerJobs[i] = kept
 			}
 			if len(reindexBatch) > 0 {
+				noteStart := time.Now()
 				r.noteImportEdgeReindexes(reindexBatch)
+				applyNoteElapsed += time.Since(noteStart)
+				storeStart := time.Now()
 				r.graph.ReindexEdges(reindexBatch)
+				applyStoreElapsed += time.Since(storeStart)
+				placeholderStart := time.Now()
 				reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
+				applyPlaceholderElapsed += time.Since(placeholderStart)
 				reindexTotal += len(reindexBatch)
 				if pageRevisionKnown {
 					// Ignore this pass's own committed mutations. A later delta
@@ -1021,7 +1068,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				}
 			}
 			if guardSpoolErr == nil {
+				spoolStart := time.Now()
 				guardSpoolErr = guardSpool.appendJobs(perWorkerJobs)
+				applyGuardSpoolElapsed += time.Since(spoolStart)
 				if guardSpoolErr != nil {
 					r.logger.Error("resolver: append guard spool", zap.Error(guardSpoolErr))
 				}
@@ -1033,6 +1082,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 					}
 				}
 			}
+			applyElapsed += time.Since(applyStart)
 			for i := range perWorkerStats {
 				total.Resolved += perWorkerStats[i].Resolved
 				total.Unresolved += perWorkerStats[i].Unresolved
@@ -1424,6 +1474,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		zap.Int("reindex_batch", reindexTotal),
 		zap.Int("reindex_conversions", reindexConversions),
 		zap.Int("reindex_churn", reindexChurn),
+		zap.Int("churn_retargeted", churnRetargeted),
+		zap.Int("churn_kind_promoted", churnKindPromoted),
+		zap.Int("churn_attrs_only", churnAttrsOnly),
 		zap.Int("super_chunk", superChunk),
 		zap.Int("lsp_deferred", lspDeferred),
 		zap.Int("lsp_attempted", lspResult.attempted),
@@ -1656,11 +1709,31 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// compute loop is parallel; the tail passes (guard, Go/lang attribution,
 	// dispatch, terminal reconcile) run serially under the resolve lock and
 	// are otherwise unlogged — this is the split used to target cold-index
-	// resolve optimisation.
+	// resolve optimisation. page_load / prepare_indexes / compute_workers /
+	// commit_apply attribute compute_loop's interior (page_load counts
+	// in-pass fetches only); their shortfall against it is chunk-yield gaps,
+	// revision loads, the set-oriented liveness preload, deferred-LSP
+	// spooling and post-interleave index refreshes. The apply_* fields split
+	// commit_apply itself — apply_liveness times only the unknown-store
+	// fallback (the set-oriented preload runs pre-workers, outside every
+	// bucket), then import-invalidation notes, the store reindex write,
+	// placeholder reconcile, guard-spool append — with the remainder being
+	// the job-apply loop, post-reindex revision reloads and guard
+	// bookkeeping.
 	r.logger.Info("resolver: pass complete",
 		zap.Duration("total", time.Since(passStart)),
 		zap.Duration("warm_lookup", warmElapsed),
 		zap.Duration("compute_loop", loopElapsed),
+		zap.Duration("page_load", loadElapsed),
+		zap.Duration("prepare_indexes", prepareElapsed),
+		zap.Duration("compute_workers", workersElapsed),
+		zap.Duration("commit_apply", applyElapsed),
+		zap.Duration("apply_liveness", applyLivenessElapsed),
+		zap.Duration("apply_note_reindex", applyNoteElapsed),
+		zap.Duration("apply_store_reindex", applyStoreElapsed),
+		zap.Duration("apply_placeholder", applyPlaceholderElapsed),
+		zap.Duration("apply_guard_spool", applyGuardSpoolElapsed),
+		zap.Int("terminal_loaded", terminalLoaded),
 		zap.Duration("deferred_lsp", lspElapsed),
 		zap.Duration("guard", tAfterGuard.Sub(tailStart)),
 		zap.Duration("go_attribution", tAfterAttrib.Sub(tAfterGuard)),
@@ -4531,10 +4604,12 @@ func (r *Resolver) buildReachabilityIndexForPending(pending []*graph.Edge, sourc
 // reused by overlapping pages, while unresolved imports are rebuilt because
 // resolving such an edge may change its target during the pass.
 
-// reachabilityStableFileCap bounds the pass-scoped stable-reachability cache.
-// Entries are one file path plus a handful of directory strings, so even a
-// workspace-wide cache is a few megabytes; the cap exists only to guard
-// pathological inputs.
+// reachabilityStableFileCap bounds both pass-scoped retentions. Stable-
+// reachability entries are one file path plus a handful of directory
+// strings; adjacency-retention entries carry the file's raw imported node
+// IDs and are the heavier of the two — roughly 5 MB on a production-sized
+// workspace and tens of MB at the cap. The cap guards pathological inputs,
+// not a working-set target.
 const reachabilityStableFileCap = 1 << 16
 
 // reachabilityPageStats reports how much of one page's reachability build was
@@ -4547,8 +4622,8 @@ type reachabilityPageStats struct {
 	missing   int
 	unstable  int
 	adjCached int
-	fallback  int
-	retained  int
+	fallback  bool
+	occupancy int
 	project   time.Duration
 	place     time.Duration
 	match     time.Duration
@@ -4662,7 +4737,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 		if !complete {
 			// complete=false is a canonicality signal, not a cacheable
 			// answer — fallback results are never retained.
-			stats.fallback = 1
+			stats.fallback = true
 			projected = r.legacyImportTargetsByFile(projectFiles)
 		} else if adjacency != nil {
 			// Retain raw projections for every projected file, including
@@ -4727,7 +4802,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 		}
 	}
 	stats.match = time.Since(matchStart)
-	stats.retained = len(adjacency)
+	stats.occupancy = len(adjacency)
 	r.reachableDirsByFile = reachable
 	r.dirByFilePath = dirs
 	return true, stats
@@ -4776,17 +4851,21 @@ func (r *Resolver) clearReachabilityIndex() {
 // the common provenance-carrying writes.
 //
 // Write-site audit (every ReindexEdges / ReindexUnresolvedEdgeTargets /
-// AddBatch call in this package):
-//   - precise invalidation via noteImportEdgeReindexes/noteImportTargetReindexes:
-//     main page commit + incremental commit (resolver.go),
-//     deferred-LSP terminal clears and page reindexes (resolver.go,
-//     lsp_resolve.go), attribution batches (attribution_reindex_batch.go,
-//     go_builtins_attribution.go, incremental_attribution_cache.go),
-//     import-flavored retargets (relative_imports.go, lua_imports.go,
-//     razor_using.go, godot_res_paths.go), module attribution reindexes
+// AddBatch / RemoveEdge call in this package):
+//   - precise invalidation via noteImportEdgeReindexes/noteImportTargetReindexes/
+//     noteImportEdgeRemovals: main page commit + incremental commit
+//     (resolver.go), deferred-LSP terminal clears and page reindexes
+//     (resolver.go, lsp_resolve.go), attribution batches
+//     (attribution_reindex_batch.go, go_builtins_attribution.go,
+//     incremental_attribution_cache.go), import-flavored retargets
+//     (relative_imports.go, lua_imports.go, godot_res_paths.go), razor
+//     @using marker removals (razor_using.go — its reference retargets
+//     never touch an imports row), module attribution reindexes
 //     (module_attribution.go).
 //   - no bump, kind-bounded: generic_param_bind.go (EdgesByKind over
-//     non-import kinds), cross_pkg_guard.go (call-edge guard reverts).
+//     non-import kinds), cross_pkg_guard.go (call-edge guard reverts),
+//     csharp_partial_merge.go (implements/extends moves between type
+//     nodes — imports edges never originate at a type).
 //   - no bump, outside any live pass retention: exported framework/registry
 //     synthesis passes (celery/mediatr/express/fastapi/django/rails/vapor/
 //     grpc/rtk/redux/vuex/ngrx/react/swiftui/uikit/sidekiq/spring/sql/
@@ -4821,10 +4900,12 @@ func (r *Resolver) noteImportEdgeReindexes(batch []graph.EdgeReindex) {
 		if !importsRow {
 			continue
 		}
-		// Frontier revisits rewrite still-unresolved import edges for pure
-		// bookkeeping (meta, confidence, terminality). A rewrite that keeps
-		// target, kind, and file cannot change stored adjacency — dirtying
-		// it would evict exactly the unstable files the retention serves.
+		// An identity-preserving rewrite cannot change stored adjacency, so
+		// it must not evict the unstable files the retention serves. The one
+		// writer producing this shape is the deferred-LSP terminal clears
+		// (terminality is meta-only, so OldTo equals the target); they run
+		// after the pass's final prepare, making this a guard on the
+		// invariant rather than a hot path.
 		if reindex.Edge != nil && reindex.OldTo == reindex.Edge.To &&
 			reindex.OldKind == "" && reindex.OldFilePath == "" {
 			continue
@@ -4841,6 +4922,23 @@ func (r *Resolver) noteImportEdgeReindexes(batch []graph.EdgeReindex) {
 		if !marked {
 			r.noteImportEdgeWrite()
 		}
+	}
+}
+
+// noteImportEdgeRemovals is the removal-side sibling of
+// noteImportEdgeReindexes: deleting an imports-kind edge rewrites the caller
+// file's stored adjacency exactly like a retarget. Provenance-less removals
+// fall back to the wholesale generation.
+func (r *Resolver) noteImportEdgeRemovals(edges []*graph.Edge) {
+	for _, e := range edges {
+		if e == nil || e.Kind != graph.EdgeImports {
+			continue
+		}
+		if e.FilePath == "" {
+			r.noteImportEdgeWrite()
+			continue
+		}
+		r.markImportDirty(e.FilePath)
 	}
 }
 

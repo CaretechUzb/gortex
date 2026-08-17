@@ -74,7 +74,7 @@ func TestReconcileContractEdges_TopicEdges_KafkaPair(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err)
@@ -141,7 +141,7 @@ func TestReconcileContractEdges_TopicEdges_CrossBrokerIsolation(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err)
@@ -188,7 +188,7 @@ func TestReconcileContractEdges_TopicEdges_MultiConsumerFanout(t *testing.T) {
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err)
@@ -249,7 +249,7 @@ func TestReconcileContractEdges_TopicEdges_CrossWorkspaceIsolation(t *testing.T)
 	require.NoError(t, err)
 
 	g := graph.New()
-	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	for _, entry := range cm.Global().Repos {
 		_, err := mi.TrackRepoCtx(context.Background(), entry)
 		require.NoError(t, err)

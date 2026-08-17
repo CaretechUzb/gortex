@@ -1,9 +1,9 @@
-// Package exporter writes the in-memory graph to portable formats so users
-// can load it into external visualization and query tools (Neo4j, Memgraph
-// via Cypher; yEd, Gephi, Cytoscape via GraphML).
+// Package exporter walks a graph store and writes it to portable formats so
+// users can load it into external visualization and query tools (Neo4j,
+// Memgraph via Cypher; yEd, Gephi, Cytoscape via GraphML).
 //
-// The exporter is read-only and operates on a snapshot — it never mutates
-// the graph. Filters (repo, kinds) are applied during emission.
+// The exporter is read-only — it never mutates the graph. Filters (repo,
+// kinds) are applied during emission.
 package exporter
 
 import (

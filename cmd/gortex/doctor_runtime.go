@@ -13,6 +13,8 @@ import (
 
 	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/codex"
+	"github.com/zzet/gortex/internal/agents/copilotcli"
+	"github.com/zzet/gortex/internal/agents/opencode"
 	"github.com/zzet/gortex/internal/doctor"
 	"github.com/zzet/gortex/internal/hooks"
 	"github.com/zzet/gortex/internal/savings"
@@ -105,7 +107,7 @@ func collectRuntime(home string, days int) doctorRuntime {
 		Savings:  collectSavings(since),
 	}
 	for _, probe := range doctorAgentProbes(home) {
-		out.Agents = append(out.Agents, probe(since, activity, now))
+		out.Agents = append(out.Agents, probe.run(since, activity, now))
 	}
 	if doctorRedact {
 		out.Hooks.Path = doctorPath(out.Hooks.Path)
@@ -113,15 +115,31 @@ func collectRuntime(home string, days int) doctorRuntime {
 	return out
 }
 
-// agentProbe collects one agent's runtime slice.
-type agentProbe func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime
+// agentProbe collects one agent's runtime slice. The agent name is carried
+// beside the closure rather than only inside it so the coverage guard in
+// doctor_runtime_test.go can enumerate what doctor speaks about without
+// running a probe — a probe reads the real home and scans session
+// transcripts, which is not something a unit test should be doing.
+type agentProbe struct {
+	agent string
+	run   func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime
+}
 
 // doctorAgentProbes returns a probe per agent doctor can speak about. Adding
 // an agent here is the whole cost of covering it — the finding rules, the
 // per-agent log partition, and the renderer are all already generic.
+//
+// The `agent` string is not cosmetic: it is the key the invocation log is
+// partitioned by (hooks.EffectivenessSummary.ForAgent), and the writer side
+// stamps whatever `gortex hook --agent=<x>` was invoked with, normalised
+// through hooks.SetAgent. A probe naming an agent the hook handler does not
+// report reads zero runs forever and turns a healthy install into a
+// permanent "configured but none has run" blocker, so each entry below uses
+// the adapter's own Name constant — the same value the adapters bake into
+// their hook command lines.
 func doctorAgentProbes(home string) []agentProbe {
 	return []agentProbe{
-		func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
+		{agent: codex.Name, run: func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
 			state := codex.Inspect(home)
 			return buildAgentRuntime(agentRuntimeInput{
 				agent:      codex.Name,
@@ -138,8 +156,8 @@ func doctorAgentProbes(home string) []agentProbe {
 				trustRemedy:   codex.TrustRemedy,
 				adoption:      doctor.ScanCodexSessions(doctor.CodexHome(), since, 10),
 			}, activity, now)
-		},
-		func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
+		}},
+		{agent: hooks.AgentClaudeCode, run: func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
 			state := claudecode.Inspect(home)
 			return buildAgentRuntime(agentRuntimeInput{
 				agent:      hooks.AgentClaudeCode,
@@ -151,7 +169,58 @@ func doctorAgentProbes(home string) []agentProbe {
 				},
 				adoption: doctor.ScanClaudeSessions(doctor.ClaudeHome(), since, 10),
 			}, activity, now)
-		},
+		}},
+		{agent: copilotcli.Name, run: func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
+			state := copilotcli.Inspect(home)
+			return buildAgentRuntime(agentRuntimeInput{
+				agent:      copilotcli.Name,
+				hookEvents: copilotcli.HookEvents,
+				install: doctorAgentInstall{
+					ConfigPath: state.ConfigPath, ConfigPresent: state.ConfigPresent,
+					MCPServer: state.MCPServer, Hooks: state.Hooks,
+					InstructionsPath: state.InstructionsPath, InstructionsWired: state.InstructionsWired,
+				},
+				// No per-hook trust gate: the Copilot CLI runs whatever is in
+				// hooks/*.json, so "configured but never ran" here means the
+				// hook is broken rather than unapproved, and pointing the user
+				// at an approval flow that does not exist would be worse than
+				// the generic remedy.
+				//
+				// STOP-LINE: no adoption scan. Copilot CLI keeps its session
+				// history in ~/.copilot/session-store.db — SQLite with an
+				// undocumented, unversioned schema and no export path.
+				// Reverse-engineering private tables buys a number that
+				// silently turns into zeros after any patch release, so the
+				// Adoption slice stays at its zero value on purpose and
+				// doctor reports "adoption could not be measured".
+			}, activity, now)
+		}},
+		{agent: opencode.Name, run: func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
+			state := opencode.Inspect(home)
+			return buildAgentRuntime(agentRuntimeInput{
+				agent: opencode.Name,
+				// Three events, not four: opencode.HookEvents deliberately
+				// omits PostToolUse because the plugin's after-hook never
+				// shells the bridge and so can never log a run.
+				hookEvents: opencode.HookEvents,
+				install: doctorAgentInstall{
+					ConfigPath: state.ConfigPath, ConfigPresent: state.ConfigPresent,
+					MCPServer: state.MCPServer, Hooks: state.Hooks,
+					// No InstructionsPath: OpenCode has no user-level rules
+					// file Gortex writes (its routing block is per-repo in
+					// AGENTS.md), and naming one would produce a permanent
+					// "no Gortex rule block" warning about a file nothing
+					// ever writes.
+				},
+				// No per-hook trust gate — the plugin runs as soon as
+				// OpenCode loads it.
+				//
+				// STOP-LINE: no adoption scan. OpenCode keeps no session log
+				// Gortex can read, so there is no transcript to count tool
+				// calls from. Passing no adoption data is the honest answer;
+				// inventing one would be a fabricated metric.
+			}, activity, now)
+		}},
 	}
 }
 
@@ -292,10 +361,18 @@ func printDoctorRuntime(w io.Writer, r doctorRuntime) {
 
 func printAgentRuntime(w io.Writer, a doctorAgentRuntime, summary hooks.EffectivenessSummary) {
 	fmt.Fprintf(w, "\n  %s — install\n", a.Agent)
-	if !a.Install.ConfigPresent {
-		fmt.Fprintf(w, "    %s %s missing\n", glyphAbsent, a.Install.ConfigPath)
-	} else {
+	if a.Install.ConfigPresent {
 		fmt.Fprintf(w, "    %s mcp server registered\n", mark(a.Install.MCPServer))
+	} else {
+		fmt.Fprintf(w, "    %s %s missing\n", glyphAbsent, a.Install.ConfigPath)
+	}
+	// Hook lines print whenever the config carries them OR hooks are wired
+	// at all. The second half is not redundant: OpenCode has no hook
+	// configuration to read back — its hook surface is the bridge plugin,
+	// which lives nowhere near ConfigPath — so gating on ConfigPresent
+	// would render a fully wired OpenCode install as one line about a
+	// missing opencode.json and nothing else.
+	if a.Install.ConfigPresent || anyHookConfigured(a.Install.Hooks) {
 		for _, event := range a.HookEvents {
 			fmt.Fprintf(w, "    %s hook %-17s %d configured\n", mark(a.Install.Hooks[event] > 0), event, a.Install.Hooks[event])
 		}
@@ -429,6 +506,17 @@ func doctorTruncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// anyHookConfigured reports whether the agent declares at least one Gortex
+// hook, regardless of which file (if any) that declaration lives in.
+func anyHookConfigured(hooks map[string]int) bool {
+	for _, n := range hooks {
+		if n > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func mark(ok bool) string {

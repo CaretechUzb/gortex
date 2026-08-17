@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sort"
 	"testing"
 
 	"github.com/zzet/gortex/internal/agents"
@@ -167,16 +166,4 @@ func WriteYAML(t *testing.T, path string, obj map[string]any) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-}
-
-// SortedFilePaths returns the Paths from a result's Files in sorted
-// order. Makes golden assertions invariant to adapter iteration
-// order over maps.
-func SortedFilePaths(res *agents.Result) []string {
-	out := make([]string, 0, len(res.Files))
-	for _, f := range res.Files {
-		out = append(out, f.Path)
-	}
-	sort.Strings(out)
-	return out
 }

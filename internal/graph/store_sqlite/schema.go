@@ -53,15 +53,20 @@ const (
 
 	// filepath.Dir for normalized graph paths, expressed with built-in SQLite
 	// string functions so it can back an index on existing databases without
-	// materializing or backfilling another copy of the value.
+	// materializing or backfilling another copy of the value. The file
+	// segment is separator-normalized like fileDirColumnDDL so the rebind
+	// join's two sides agree on native-separator stores; changing the
+	// expression needs a schemaMigrations entry, like file_dir.
+	memberReceiverNormFileExpr = `replace(` + memberReceiverFileExpr + `, '\', '/')`
+
 	memberReceiverDirColumnDDL = `member_receiver_dir TEXT GENERATED ALWAYS AS (
     CASE WHEN kind <> 'member_of' OR instr(to_id, '::') <= 1
               OR ` + memberReceiverNameExpr + ` = '' THEN NULL
-         WHEN instr(` + memberReceiverFileExpr + `, '/') = 0 THEN '.'
-         WHEN rtrim(rtrim(` + memberReceiverFileExpr + `,
-                         replace(` + memberReceiverFileExpr + `, '/', '')), '/') = '' THEN '/'
-         ELSE rtrim(rtrim(` + memberReceiverFileExpr + `,
-                         replace(` + memberReceiverFileExpr + `, '/', '')), '/') END
+         WHEN instr(` + memberReceiverNormFileExpr + `, '/') = 0 THEN '.'
+         WHEN rtrim(rtrim(` + memberReceiverNormFileExpr + `,
+                         replace(` + memberReceiverNormFileExpr + `, '/', '')), '/') = '' THEN '/'
+         ELSE rtrim(rtrim(` + memberReceiverNormFileExpr + `,
+                         replace(` + memberReceiverNormFileExpr + `, '/', '')), '/') END
 ) VIRTUAL`
 )
 
@@ -208,11 +213,20 @@ const isStubColumnDDL = `is_stub INTEGER GENERATED ALWAYS AS (
 // column. It adds no row payload and is migration-safe on populated stores;
 // the receiver-rebind join uses it to seek directly to Go types/interfaces in
 // the phantom receiver's package instead of loading every type into memory.
+// Stored paths keep the writing platform's native separators below the repo
+// prefix, so the expression normalizes '\' to '/' before trimming — the SQL
+// mirror of graphpath.Norm + Dir. Without it a Windows-written store
+// collapses every file_dir to the repo prefix and the rebind join
+// degenerates from "same package dir" to "same repo". Changing this
+// expression needs a schemaMigrations entry: a generated column on an
+// existing store is rebuilt, never altered in place.
+const fileDirSourceExpr = `replace(file_path, '\', '/')`
+
 const fileDirColumnDDL = `file_dir TEXT GENERATED ALWAYS AS (
     CASE WHEN file_path = '' THEN NULL
-         WHEN instr(file_path, '/') = 0 THEN '.'
-         WHEN rtrim(rtrim(file_path, replace(file_path, '/', '')), '/') = '' THEN '/'
-         ELSE rtrim(rtrim(file_path, replace(file_path, '/', '')), '/') END
+         WHEN instr(` + fileDirSourceExpr + `, '/') = 0 THEN '.'
+         WHEN rtrim(rtrim(` + fileDirSourceExpr + `, replace(` + fileDirSourceExpr + `, '/', '')), '/') = '' THEN '/'
+         ELSE rtrim(rtrim(` + fileDirSourceExpr + `, replace(` + fileDirSourceExpr + `, '/', '')), '/') END
 ) VIRTUAL`
 
 // nodeGeneratedColumns is the nodes-table sibling of edgeGeneratedColumns.
@@ -420,6 +434,18 @@ CREATE TABLE IF NOT EXISTS analysis_blobs (
     PRIMARY KEY (generation_id, component)
 ) WITHOUT ROWID;
 `
+
+const vectorTableSQL = `
+CREATE TABLE IF NOT EXISTS vectors (
+    node_id     TEXT PRIMARY KEY,
+    repo_prefix TEXT NOT NULL DEFAULT '',
+    parent_id   TEXT NOT NULL DEFAULT '',
+    dims        INTEGER NOT NULL,
+    vec         BLOB NOT NULL
+) WITHOUT ROWID;
+`
+
+const vectorRepoIndexSQL = `CREATE INDEX IF NOT EXISTS vectors_by_repo ON vectors(repo_prefix, node_id)`
 
 // schemaSQL is the canonical DDL applied on Open. Statements are
 // idempotent (IF NOT EXISTS) so they run cleanly against a fresh DB
@@ -689,11 +715,7 @@ CREATE INDEX IF NOT EXISTS ref_facts_by_file ON ref_facts(repo_prefix, file_path
 -- ref_facts scan — the PK leads with from_id, not to_id.
 CREATE INDEX IF NOT EXISTS ref_facts_by_target ON ref_facts(repo_prefix, to_id);
 
-CREATE TABLE IF NOT EXISTS vectors (
-    node_id TEXT PRIMARY KEY,
-    dims    INTEGER NOT NULL,
-    vec     BLOB NOT NULL
-) WITHOUT ROWID;
+` + vectorTableSQL + `
 
 -- churn_enrichment is the per-node git-churn sidecar (change A: move
 -- enrichment OUT of nodes.meta so the node hot path stops encoding
@@ -747,7 +769,7 @@ CREATE TABLE IF NOT EXISTS blame_enrichment (
 CREATE INDEX IF NOT EXISTS blame_by_repo ON blame_enrichment(repo_prefix) WHERE repo_prefix <> '';
 
 -- symbol_fts is the FTS5 full-text index over pre-tokenised symbol
--- names. It replaces the multi-GB in-heap Bleve/BM25 index with an
+-- names. It replaces the multi-GB in-heap BM25 index with an
 -- on-disk inverted index the SymbolSearcher / SymbolBundleSearcher
 -- query through. A standard (NOT contentless) FTS5 table; individual
 -- rows are deleted by their FTS5 docid via the symbol_fts_rowid sidecar
@@ -759,6 +781,15 @@ CREATE INDEX IF NOT EXISTS blame_by_repo ON blame_enrichment(repo_prefix) WHERE 
 -- idempotent on every Open, so an existing .sqlite gains the vtable
 -- on its next open + reindex.
 CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts USING fts5(node_id UNINDEXED, repo_prefix UNINDEXED, tokens);
+
+-- symbol_fts_state records which deterministic token-normalization mode built
+-- each repository's durable symbol corpus. The marker advances only after an
+-- authoritative replacement succeeds, so a crash can cause a harmless repeat
+-- rebuild but can never certify a corpus written with a different mode.
+CREATE TABLE IF NOT EXISTS symbol_fts_state (
+    repo_prefix  TEXT PRIMARY KEY,
+    normalization TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
 
 -- symbol_fts_rowid maps a node_id to the rowid (FTS5 docid) of its row in
 -- symbol_fts. node_id is UNINDEXED in the FTS5 vtable, so deleting a node's

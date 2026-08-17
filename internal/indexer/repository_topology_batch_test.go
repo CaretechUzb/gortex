@@ -53,7 +53,7 @@ func TestRunRepositoryTopologyBatchAllowsParallelTrackAndBlocksReach(t *testing.
 	registry := parser.NewRegistry()
 	registry.Register(&topologyBatchBlockingExtractor{entered: entered, release: release})
 	store := graph.New()
-	mi := NewMultiIndexer(store, registry, search.NewBM25(), configManager, zap.NewNop())
+	mi := NewMultiIndexer(store, registry, search.NewNull(), configManager, zap.NewNop())
 	mi.BeginParallelBatch()
 	defer mi.ResetBatch()
 

@@ -367,12 +367,22 @@ type Server struct {
 
 	// batchTransactions holds daemon-lifetime delivery receipts for atomic
 	// batch edits. sync.Map's zero value keeps directly-constructed test and
-	// embedded servers usable without constructor wiring. batchWriteOverride is
-	// a narrow target-write fault-injection seam; batchDurabilityOverride covers
-	// journal, fsync, rollback, and cleanup ordering. Production leaves both nil.
+	// embedded servers usable without constructor wiring. The write/remove
+	// overrides are narrow target-mutation fault-injection seams;
+	// batchDurabilityOverride covers journal, fsync, rollback, and cleanup
+	// ordering. Production leaves all three nil.
 	batchTransactions       sync.Map
 	batchWriteOverride      func(string, []byte, os.FileMode) error
+	batchRemoveOverride     func(string) error
 	batchDurabilityOverride *batchDurabilityOps
+
+	// physicalEvidenceOverride is a narrow fault-injection seam for read_file's
+	// physical-evidence path. The post-read confinement guards only fire when
+	// the observed resolution disagrees with the requested path, which on a real
+	// filesystem needs a won symlink-flip race — untestable without this. Tests
+	// hand back a resolution outside every repo root and assert the handler
+	// refuses. Production leaves it nil.
+	physicalEvidenceOverride func(string) ([]byte, physicalReadEvidence, error)
 
 	// packCache retains recent smart_context pack views keyed by pack
 	// root so a later call with delta_from=<root> returns only the
@@ -414,6 +424,7 @@ type Server struct {
 	// periodic ticker. Eagerly constructed in NewServer; the daemon
 	// entrypoint wires the snapshot fn via AttachHealthSnapshot.
 	healthBroadcaster *healthBroadcaster
+	indexHealth       indexHealthCache
 
 	// staleRefsBroadcaster fans `notifications/stale_refs` per session
 	// when the watcher reports symbol churn in a file the session has

@@ -63,7 +63,7 @@ func TestTransformPipeline_OffsetPreserving(t *testing.T) {
 	t.Run("length-changing pre-parse transform is rejected", func(t *testing.T) {
 		src := []byte("hello world")
 		p := newTransformPipeline(nil, nil)
-		p.addPrePass(shrinkingPreParse{})
+		p.prePass = append(p.prePass, shrinkingPreParse{})
 		out := p.run("x.txt", src)
 		if !bytes.Equal(out, src) {
 			t.Errorf("a length-changing pre-parse transform must be dropped; got %q", out)

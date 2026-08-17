@@ -412,18 +412,6 @@ func (r *Router) EffectiveEnabledRemotes(sess *Session) []ServerEntry {
 	return out
 }
 
-// EncodeJSON is a small helper for callers that want to marshal a
-// scope override + tool args into the body bytes RouteToolCall
-// expects. Round-trippable on the proxy side because the local
-// server's POST /v1/tools/<name> handler is the same Mux route the
-// MCP client originally hit.
-func EncodeJSON(v any) ([]byte, error) {
-	if v == nil {
-		return []byte("{}"), nil
-	}
-	return json.Marshal(v)
-}
-
 // LookupForCwd exposes RouteForCwd against the router's own
 // servers.toml + roster cache + cwd resolver. Callers (notably the
 // daemon's MCP dispatcher) use this to decide whether a session's

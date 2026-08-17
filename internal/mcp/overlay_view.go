@@ -570,10 +570,6 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		if !ok {
 			continue
 		}
-		ext, _ := reg.GetByLanguage(lang)
-		if ext == nil {
-			continue
-		}
 		root := idx.RootPath()
 		relPath := graphPath
 		if idx.RepoPrefix() != "" {
@@ -594,7 +590,8 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 			boundedLimits parser.ExtractionLimits
 			bounded       bool
 		)
-		if boundedExtractor, ok := ext.(parser.BoundedExtractor); ok {
+		ext, extractorOK := reg.GetByLanguage(lang)
+		if boundedExtractor, isBounded := ext.(parser.BoundedExtractor); extractorOK && isBounded {
 			bounded = true
 			boundedLimits = parser.DefaultExtractionLimits()
 			boundedLimits.MaxNodes = overlayLayerParsedNodesMax - parsedNodeCount
@@ -606,7 +603,9 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 				ctx, relPath, content, boundedLimits,
 			)
 		} else {
-			result, extractErr = ext.Extract(relPath, content)
+			// Legacy extractors go through the indexer's admission lifecycle
+			// so overlay parses share its crash isolation.
+			result, extractErr = idx.ExtractBuffer(lang, relPath, content)
 		}
 		if result != nil {
 			// Overlay construction never retains parse trees or constant-value

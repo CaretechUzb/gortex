@@ -151,30 +151,6 @@ var javaComplexitySkip = map[string]bool{
 	"class_declaration":       true,
 }
 
-// GoComplexity / TSComplexity / PyComplexity / RustComplexity /
-// JavaComplexity — convenience wrappers picking the right table.
-// Pass the function/method's body block (not the whole declaration)
-// so the count excludes any header-side noise.
-func GoComplexity(body *sitter.Node) int {
-	return CyclomaticComplexity(body, goComplexityNodes, goComplexitySkip)
-}
-
-func TSComplexity(body *sitter.Node) int {
-	return CyclomaticComplexity(body, tsComplexityNodes, tsComplexitySkip)
-}
-
-func PyComplexity(body *sitter.Node) int {
-	return CyclomaticComplexity(body, pyComplexityNodes, pyComplexitySkip)
-}
-
-func RustComplexity(body *sitter.Node) int {
-	return CyclomaticComplexity(body, rustComplexityNodes, rustComplexitySkip)
-}
-
-func JavaComplexity(body *sitter.Node) int {
-	return CyclomaticComplexity(body, javaComplexityNodes, javaComplexitySkip)
-}
-
 // --- Cognitive complexity & loop depth (NEW-CBM-1) ------------------
 //
 // Cyclomatic complexity counts decision points flatly; cognitive

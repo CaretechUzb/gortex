@@ -5,13 +5,18 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/claudecode"
+	"github.com/zzet/gortex/internal/agents/codex"
+	"github.com/zzet/gortex/internal/agents/copilotcli"
+	"github.com/zzet/gortex/internal/agents/opencode"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/tui"
@@ -35,15 +40,21 @@ var uninstallCmd = &cobra.Command{
 	Long: `Removes the per-repo Gortex footprint from the current directory:
 
   .mcp.json
+  .opencode/plugin/gortex.js
   .claude/commands/
   .kiro/{steering,hooks,settings}/
+  the gortex-* skills inside .agents/skills/, .opencode/skills/ and
+  .github/skills/ (those trees are shared — your own skills stay)
 
 Counterpart to ` + "`gortex init`" + `. For machine-wide setup (user MCP config,
-~/.claude/CLAUDE.md block, user hooks) installed by ` + "`gortex install`" + `,
-pass --global to also strip the user-level Claude Code footprint (MCP
-config, permission allowlist, hooks, the CLAUDE.md rule block, and the
-gortex skills / commands / sub-agents). --global honors
-$CLAUDE_CONFIG_DIR; target a specific profile with --claude-config-dir.
+rule blocks, user hooks) installed by ` + "`gortex install`" + `, pass --global
+to also strip the user-level footprint of every host Gortex configures —
+Claude Code, Codex, GitHub Copilot CLI and OpenCode: MCP entries,
+permission allowlists, hooks, the rule blocks, and the gortex skills /
+commands / sub-agents / bridge plugin. Merged files keep everything that
+is not ours, and a gortex skill you have edited is kept, not deleted.
+--global honors $CLAUDE_CONFIG_DIR; target a specific Claude Code profile
+with --claude-config-dir.
 
 Pass --purge to additionally tear down the machine-level runtime: stop the
 daemon, remove its OS service unit (launchd / systemd / Task Scheduler),
@@ -64,7 +75,7 @@ docs / scripts / muscle memory still work.`,
 
 func init() {
 	uninstallCmd.Flags().BoolVarP(&uninstallYes, "yes", "y", false, "skip the confirmation prompt (required when stdin is not a TTY)")
-	uninstallCmd.Flags().BoolVar(&uninstallGlobal, "global", false, "also remove the machine-level Claude Code footprint (user MCP config, settings, CLAUDE.md rule block, skills/commands/agents) installed by `gortex install`")
+	uninstallCmd.Flags().BoolVar(&uninstallGlobal, "global", false, "also remove the machine-level footprint of every configured host (Claude Code, Codex, Copilot CLI, OpenCode): user MCP entries, settings, rule blocks, hooks, skills/commands/agents/plugin, as installed by `gortex install`")
 	uninstallCmd.Flags().BoolVar(&uninstallPurge, "purge", false, "also tear down the machine-level runtime: stop the daemon, remove its OS service unit, and delete the ~/.gortex data/cache/config tree (and the binary, for an installer-script install)")
 	uninstallCmd.Flags().StringVar(&uninstallClaudeConfigDir, "claude-config-dir", "", "Claude Code config root to clean (implies --global); overrides $CLAUDE_CONFIG_DIR, defaults to ~/.claude")
 	uninstallCmd.Flags().StringVar(&uninstallClaudeConfigDir, "config-root", "", "alias for --claude-config-dir")
@@ -77,14 +88,73 @@ func init() {
 var (
 	uninstallFiles = []string{
 		".mcp.json",
+		// The OpenCode bridge is user-level today, but an install from
+		// before that split could have left one in the repo tree. The name
+		// is Gortex's alone, so removing it here is safe.
+		".opencode/plugin/gortex.js",
 	}
 	uninstallDirs = []string{
 		".claude/commands",
+		// Claude Code's per-community skills, unlike the three shared
+		// trees below, sit under a `generated/` level that exists for
+		// exactly this reason: nothing but Gortex writes there, so the
+		// whole directory can go without inspecting its entries.
+		".claude/skills/generated",
 		".kiro/steering",
 		".kiro/hooks",
 		".kiro/settings",
 	}
 )
+
+// uninstallOwnedDir is a target the slice-of-paths form above cannot
+// express: "only the entries we own inside this directory".
+//
+// The three skill trees below are SHARED. `.agents/skills` is the
+// vendor-neutral root Codex reads, `.opencode/skills` is OpenCode's and
+// `.github/skills` is the Copilot CLI's, and in every one of them a team's
+// own hand-written skills sit directly beside the ones `gortex init`
+// generated. Adding any of these to uninstallDirs would delete the user's
+// work, which is why they get a typed target rather than a bent slice.
+//
+// Ownership is the `gortex-` directory prefix — the same signal `gortex
+// uninstall` already uses for `.kiro/steering` files, and the only one
+// available here: generated community skills track the current graph, so
+// unlike the curated user-level pack there is no stable shipped body to
+// byte-compare against. The generators enforce that prefix on every
+// DirName they emit (see each adapter's skills.go), so a `gortex-` skill
+// directory in one of these trees is one we wrote.
+type uninstallOwnedDir struct {
+	// dir is the shared tree, repo-relative.
+	dir string
+	// prefix marks the entries inside it that are ours.
+	prefix string
+}
+
+var uninstallOwnedDirs = []uninstallOwnedDir{
+	{dir: ".agents/skills", prefix: "gortex-"},   // codex
+	{dir: ".opencode/skills", prefix: "gortex-"}, // opencode
+	{dir: ".github/skills", prefix: "gortex-"},   // copilot-cli
+}
+
+// ownedEntries lists the entries inside t.dir that are Gortex's, as
+// repo-relative paths. Resolving the typed target down to concrete paths
+// is what lets the confirm wizard preview exactly what will be deleted:
+// preview and deletion read the same list rather than two descriptions of
+// it that can drift.
+func (t uninstallOwnedDir) ownedEntries() []string {
+	entries, err := os.ReadDir(t.dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), t.prefix) {
+			continue
+		}
+		out = append(out, filepath.Join(t.dir, e.Name()))
+	}
+	return out
+}
 
 // runUninstall is the per-repo removal entry point. Used by both
 // `gortex uninstall` and `gortex clean` (the legacy alias) — same flow,
@@ -109,10 +179,12 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 	// when nothing exists feels noisy.
 	presentFiles, presentDirs := filterPresentUninstallTargets()
 
-	// --global also strips the user-level Claude Code footprint that
-	// `gortex install` wrote. GlobalArtifacts lists only paths that
-	// actually carry a Gortex footprint, honoring any config-dir
-	// override resolved above.
+	// --global also strips the user-level footprint that `gortex install`
+	// wrote, for every host that has one. Each adapter's GlobalArtifacts
+	// lists only paths that actually carry a Gortex footprint — and applies
+	// the same ownership tests its RemoveGlobal does, so a skill the user
+	// customised never shows up in a preview that would then keep it.
+	// claudecode honors any config-dir override resolved above.
 	var (
 		home        string
 		globalItems []string
@@ -123,7 +195,7 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 			return fmt.Errorf("--global needs a home directory: %w", err)
 		}
 		home = h
-		globalItems = claudecode.GlobalArtifacts(home)
+		globalItems = globalUninstallArtifacts(home)
 	}
 
 	// --purge extends the removal to the machine-level runtime that `gortex
@@ -171,9 +243,11 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 	globalCleaned := false
 	if uninstallGlobal && len(globalItems) > 0 {
 		env := agents.Env{Home: home, Mode: agents.ModeGlobal}
-		gRemoved, gFailures := claudecode.New().RemoveGlobal(env, agents.ApplyOpts{})
-		removed += gRemoved
-		failures = append(failures, gFailures...)
+		for _, host := range globalHosts() {
+			gRemoved, gFailures := host.remove(env, agents.ApplyOpts{})
+			removed += gRemoved
+			failures = append(failures, gFailures...)
+		}
 		globalCleaned = true
 	}
 
@@ -192,9 +266,14 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
-// filterPresentUninstallTargets returns the subset of uninstallFiles /
-// uninstallDirs that actually exist on disk. Lets the wizard preview the
-// real blast radius and skip the "nothing to uninstall" branch in one pass.
+// filterPresentUninstallTargets resolves every target — the flat file and
+// directory lists, plus the owned-entries-inside-a-shared-tree targets —
+// down to the concrete paths that exist on disk right now.
+//
+// Lowering uninstallOwnedDirs here rather than at deletion time is what
+// keeps the wizard honest: it previews the same list executeUninstall
+// deletes, so it can neither promise to remove a user's own skill nor stay
+// silent about a Gortex one it is about to delete.
 func filterPresentUninstallTargets() ([]string, []string) {
 	var pf, pd []string
 	for _, f := range uninstallFiles {
@@ -207,7 +286,45 @@ func filterPresentUninstallTargets() ([]string, []string) {
 			pd = append(pd, d)
 		}
 	}
+	for _, owned := range uninstallOwnedDirs {
+		pd = append(pd, owned.ownedEntries()...)
+	}
 	return pf, pd
+}
+
+// globalHost pairs one host's user-level footprint reporter with its
+// remover.
+//
+// They are one row rather than two lists on purpose: that is the shape
+// that makes the two halves impossible to get out of step. A host present
+// only in the preview promises a deletion nothing performs; a host present
+// only in the remover deletes files the confirm wizard never showed the
+// user. Both are the same bug, and neither is representable here.
+type globalHost struct {
+	artifacts func(home string) []string
+	remove    func(env agents.Env, opts agents.ApplyOpts) (removed int, failures []string)
+}
+
+// globalHosts is every adapter with a user-level footprint `gortex
+// install` writes and `gortex uninstall --global` must take back.
+func globalHosts() []globalHost {
+	return []globalHost{
+		{artifacts: claudecode.GlobalArtifacts, remove: claudecode.New().RemoveGlobal},
+		{artifacts: codex.GlobalArtifacts, remove: codex.New().RemoveGlobal},
+		{artifacts: copilotcli.GlobalArtifacts, remove: copilotcli.New().RemoveGlobal},
+		{artifacts: opencode.GlobalArtifacts, remove: opencode.New().RemoveGlobal},
+	}
+}
+
+// globalUninstallArtifacts is the union of every host's user-level Gortex
+// footprint, sorted so the wizard's list is stable across runs.
+func globalUninstallArtifacts(home string) []string {
+	var out []string
+	for _, host := range globalHosts() {
+		out = append(out, host.artifacts(home)...)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // runUninstallConfirmWizard renders a confirm wizard listing every target
@@ -284,6 +401,21 @@ func executeUninstall(files, dirs []string) (int, []string) {
 		}
 		removed++
 	}
+	// A shared skill tree we emptied is ours to tidy; one that still holds
+	// the user's own skills is not, and os.Remove refusing a non-empty
+	// directory is exactly that distinction. Only trees we actually took an
+	// entry out of are considered: an empty `.github/skills` the user made
+	// and we never wrote to was not in the wizard's preview, so removing it
+	// would be a deletion nobody agreed to.
+	for _, owned := range uninstallOwnedDirs {
+		cleaned := filepath.Clean(owned.dir)
+		for _, d := range dirs {
+			if filepath.Dir(d) == cleaned {
+				_ = os.Remove(owned.dir)
+				break
+			}
+		}
+	}
 	return removed, failures
 }
 
@@ -315,11 +447,12 @@ func emitUninstallSummary(w io.Writer, removed int, failures []string, totalPres
 		}
 		fmt.Fprintf(w, "[gortex uninstall] done (%d/%d items removed)\n", removed, totalPresent)
 		if globalCleaned {
-			fmt.Fprintln(w, "Note: the user-level Claude Code footprint was removed (CLAUDE.md rule block, MCP config, hooks, skills/commands/agents). Other content in those files was preserved.")
+			fmt.Fprintln(w, "Note: the user-level footprint was removed for Claude Code, Codex, Copilot CLI and OpenCode (rule blocks, MCP entries, hooks, skills/commands/agents/plugin). Other content in those files was preserved, and any gortex skill you had edited was kept.")
 		} else {
 			fmt.Fprintln(w, "Note: CLAUDE.md was not modified — remove the Gortex block manually if needed (or re-run with --global).")
 		}
 		fmt.Fprintln(w, "Note: .kiro/steering/ files with 'gortex-' prefix were removed. Other .kiro/ files were preserved.")
+		fmt.Fprintln(w, "Note: only 'gortex-' skills were removed from .agents/skills/, .opencode/skills/ and .github/skills/ — those trees are shared, so your own skills were preserved.")
 		fmt.Fprintln(w, "Note: Antigravity KIs are global and were not removed. Manually delete ~/.gemini/antigravity/knowledge/gortex-workflow if desired.")
 		fmt.Fprintln(w, "Note: Hermes config is global and was not removed. Manually delete the gortex entry in ~/.hermes/config.yaml (+ profiles), the gortex pre_tool_call / pre_llm_call entries under its `hooks:` block, and the gortex / gortex-* skill directories under ~/.hermes/skills/ if desired.")
 		return
@@ -344,11 +477,13 @@ func emitUninstallSummary(w io.Writer, removed int, failures []string, totalPres
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "     "+progress.Heading("preserved"))
 	if globalCleaned {
-		fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("non-Gortex content in CLAUDE.md / settings / .claude.json (Gortex entries removed)"))
+		fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("non-Gortex content in every merged config (Gortex entries removed)"))
+		fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("gortex skills you had edited — a customised copy is never deleted"))
 	} else {
 		fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("CLAUDE.md — remove the Gortex block manually if needed (or re-run with --global)"))
 	}
 	fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render(".kiro/ files without the 'gortex-' prefix"))
+	fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("your own skills in .agents/skills/, .opencode/skills/ and .github/skills/"))
 	fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("~/.gemini/antigravity/knowledge/gortex-workflow (global)"))
 	fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("~/.hermes/config.yaml + skills (global)"))
 	fmt.Fprintln(w)

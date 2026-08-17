@@ -152,13 +152,6 @@ func hookCommands(hook string, opts InstallOpts) []string {
 	return cmds
 }
 
-// HookPath resolves the absolute path of the post-commit hook for the
-// repository rooted at repoRoot. Honours core.hooksPath when set.
-// Thin wrapper over HookPathFor — preserved for backwards compatibility.
-func HookPath(repoRoot string) (string, error) {
-	return HookPathFor(repoRoot, "post-commit")
-}
-
 // HookPathFor resolves the absolute path of the named hook file in
 // the repository rooted at repoRoot. Honours core.hooksPath when set.
 // hook is a bare hook name from SupportedHooks ("post-commit",
@@ -190,46 +183,6 @@ func HookPathFor(repoRoot, hook string) (string, error) {
 		return "", fmt.Errorf("githooks: create hooks dir %q: %w", hooksDir, err)
 	}
 	return filepath.Join(hooksDir, hook), nil
-}
-
-// StatusReport describes the current state of the post-commit hook.
-type StatusReport struct {
-	HookPath string `json:"hook_path"`
-	Exists   bool   `json:"exists"`
-	Managed  bool   `json:"managed"` // true iff our marker block is present
-	Body     string `json:"body,omitempty"`
-}
-
-// Status reports the current state of the post-commit hook. Never
-// modifies anything.
-func Status(repoRoot string) (StatusReport, error) {
-	path, err := HookPath(repoRoot)
-	if err != nil {
-		return StatusReport{}, err
-	}
-	body, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return StatusReport{HookPath: path}, nil
-		}
-		return StatusReport{}, fmt.Errorf("githooks: read %q: %w", path, err)
-	}
-	rep := StatusReport{
-		HookPath: path,
-		Exists:   true,
-		Body:     string(body),
-	}
-	if bytes.Contains(body, []byte(MarkerBegin)) && bytes.Contains(body, []byte(MarkerEnd)) {
-		rep.Managed = true
-	}
-	return rep, nil
-}
-
-// InstallPostCommit is a backwards-compatible wrapper over InstallHook
-// that installs the post-commit hook. New callers should reach for
-// InstallHook directly so they can install post-merge too.
-func InstallPostCommit(repoRoot string, opts InstallOpts) (string, error) {
-	return InstallHook(repoRoot, "post-commit", opts)
 }
 
 // InstallHook writes the named hook with the configured commands
@@ -298,11 +251,6 @@ func InstallHook(repoRoot, hook string, opts InstallOpts) (string, error) {
 	// Make sure the bit is set even if the file already existed.
 	_ = os.Chmod(hookPath, 0o755)
 	return hookPath, nil
-}
-
-// UninstallPostCommit is a backwards-compatible wrapper.
-func UninstallPostCommit(repoRoot string) (string, bool, error) {
-	return UninstallHook(repoRoot, "post-commit")
 }
 
 // UninstallHook removes the gortex-managed block from the named hook.

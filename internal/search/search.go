@@ -1,11 +1,16 @@
 // Package search provides full-text search over code symbols with
-// camelCase/snake_case-aware tokenization and BM25 ranking.
+// camelCase/snake_case-aware tokenization.
 //
-// Two backends are available:
-//   - BM25Backend: custom in-memory inverted index (fast, zero deps)
-//   - BleveBackend: bleve-based index (better for large repos, multi-repo)
+// The package owns no text index of its own. Search runs on
+// SymbolSearcherBackend, a thin adapter over the graph store's own FTS
+// index, and this package contributes the tokenization and query
+// normalization both sides of that index agree on. A store that
+// exposes no native symbol search gets NullBackend, whose empty corpus
+// routes the query engine to its substring fallback.
 //
-// Use AutoBackend to pick the right one based on symbol count.
+// HybridBackend layers the optional vector channel on top of whichever
+// text Backend it is given; Swappable lets the indexer replace the
+// backend under a live engine.
 package search
 
 // SearchResult is a single search hit.
@@ -34,10 +39,11 @@ type Backend interface {
 
 // ChannelSearcher is an optional interface a Backend can implement to
 // expose its per-channel raw retrieval output. The rerank pipeline
-// queries it so BM25 and semantic (vector) ranks can contribute as
+// queries it so text and semantic (vector) ranks can contribute as
 // separate signals instead of being collapsed via RRF before scoring.
-// Backends that only do text search (BM25 / Bleve) don't satisfy this
-// interface; callers fall through to plain Search().
+// Backends that only do text search (the store-native FTS adapter)
+// don't satisfy this interface; callers fall through to plain
+// Search().
 type ChannelSearcher interface {
 	SearchChannels(query string, limit int) (textResults []SearchResult, vectorIDs []string)
 }
@@ -60,28 +66,4 @@ func BackendSize(b Backend) uint64 {
 		return s.SizeBytes()
 	}
 	return 0
-}
-
-// AutoThreshold is the symbol count above which BleveBackend is used.
-// Calibrated against real daemon runs: Bleve (upsidedown + gtreap) costs
-// ~32 KiB per document live, so a 500k-doc in-memory Bleve would cost
-// ~16 GiB of heap — painful but not catastrophic on a dev machine with
-// a real code monorepo that has earned it. BM25 stays plenty fast at
-// that size (roughly 450 MiB at ~900 B/doc), so the threshold is set
-// to match the point where BM25 query quality starts to trail Bleve's
-// richer tokenization and phrase support, not the point where BM25
-// runs out of speed. Users who cross the line and can't afford the
-// in-memory cost should set GORTEX_BLEVE_DISK_DIR (disk-backed scorch,
-// 10-20× smaller heap at the cost of file I/O).
-//
-// Declared as a var rather than a const so tests that exercise the
-// auto-upgrade path (idempotency, single-fire gating) can drop it to
-// a small value without having to seed a huge corpus. Production
-// code never writes to it.
-var AutoThreshold = 500000
-
-// NewAuto creates a BM25Backend initially. Call Upgrade() after indexing
-// if the count exceeds AutoThreshold and multi-repo mode is desired.
-func NewAuto() Backend {
-	return NewBM25()
 }

@@ -14,7 +14,11 @@ import (
 
 func TestFacadeExplorePathLowersToExplicitRepoSelector(t *testing.T) {
 	registry := newFacadeRegistry()
-	registry.capture(mcpgo.NewTool("explore", mcpgo.WithString("task", mcpgo.Required())), func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	registry.capture(mcpgo.NewTool(
+		"explore",
+		mcpgo.WithString("task", mcpgo.Required()),
+		mcpgo.WithString("repo"),
+	), func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 		return mcpgo.NewToolResultJSON(req.GetArguments())
 	})
 	server := &Server{facades: registry, localization: newLocalizationTerminalState()}

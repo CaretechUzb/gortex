@@ -2,7 +2,6 @@ package graph
 
 import (
 	"strings"
-	"sync/atomic"
 )
 
 // Stub-node identifier conventions.
@@ -107,10 +106,8 @@ var stubKinds = []string{
 
 // IsStdlibStub etc are convenience predicates that don't make
 // the caller compare StubKind's return against a literal.
-func IsStdlibStub(id string) bool       { return StubKind(id) == StubKindStdlib }
-func IsBuiltinStub(id string) bool      { return StubKind(id) == StubKindBuiltin }
-func IsExternalCallStub(id string) bool { return StubKind(id) == StubKindExternalCall }
-func IsModuleStub(id string) bool       { return StubKind(id) == StubKindModule }
+func IsStdlibStub(id string) bool  { return StubKind(id) == StubKindStdlib }
+func IsBuiltinStub(id string) bool { return StubKind(id) == StubKindBuiltin }
 
 // StubRest returns the kind-specific tail of a stub id (the
 // portion after "<repo>::<kind>::" or "<kind>::"). Returns "" if
@@ -173,42 +170,24 @@ func StructuralEdgeTargetInvalid(kind EdgeKind, toID string) bool {
 	return strings.Contains(toID, "#param:") || strings.Contains(toID, "#local:")
 }
 
-// structuralWriteDrops counts edges the write funnels refused — the
-// feedback-loop counter: every increment means an upstream pass produced a
-// structurally impossible edge and a gate (not luck) stopped it. Exposed via
-// StructuralEdgeDropCount for the audit battery and tests.
-var structuralWriteDrops atomic.Int64
-
-// StructuralEdgeDropCount reports how many structurally invalid edges write
-// funnels have refused since process start.
-func StructuralEdgeDropCount() int64 {
-	return structuralWriteDrops.Load()
-}
-
-// FilterStructuralEdgeViolations drops edges StructuralEdgeTargetInvalid
-// rejects, copying the slice only when a violation exists — the clean path
-// (every real batch) allocates nothing. Returns the kept slice and the
-// number dropped, so write funnels can surface a one-line count instead of
-// silently eating mapper bugs.
-func FilterStructuralEdgeViolations(edges []*Edge) ([]*Edge, int) {
-	dropped := 0
-	kept := edges
-	for i, e := range edges {
-		if e != nil && StructuralEdgeTargetInvalid(e.Kind, e.To) {
-			if dropped == 0 {
+// FilterStructuralEdgeViolations is a pure partition. It copies only after a
+// violation appears, returning both kept and rejected edges so the first write
+// boundary can attribute every rejected attempt exactly once.
+func FilterStructuralEdgeViolations(edges []*Edge) (kept, rejected []*Edge) {
+	kept = edges
+	for i, edge := range edges {
+		if edge != nil && StructuralEdgeTargetInvalid(edge.Kind, edge.To) {
+			if len(rejected) == 0 {
 				kept = append(make([]*Edge, 0, len(edges)), edges[:i]...)
 			}
-			dropped++
+			rejected = append(rejected, edge)
 			continue
 		}
-		if dropped > 0 {
-			kept = append(kept, e)
+		if len(rejected) > 0 {
+			kept = append(kept, edge)
 		}
 	}
-	if dropped > 0 {
-		structuralWriteDrops.Add(int64(dropped))
-	}
-	return kept, dropped
+	return kept, rejected
 }
 
 func IsUnresolvedTarget(id string) bool {

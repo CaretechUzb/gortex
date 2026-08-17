@@ -29,7 +29,7 @@ func TestFacadeRegistryCoversRegisteredLegacyCatalog(t *testing.T) {
 		if isFacadeToolName(descriptor.Name) {
 			continue
 		}
-		if !srv.facades.mapsLegacy(descriptor.Name) {
+		if len(srv.facades.byLegacy[descriptor.Name]) == 0 {
 			missing = append(missing, descriptor.Name)
 		}
 	}
@@ -1449,7 +1449,7 @@ func TestFacadeDispatchRecordsOperationTelemetry(t *testing.T) {
 	require.Equal(t, 1, latencyCounts["analyze.coverage"])
 	require.Equal(t, 1, latencyCounts["analyze.unknown"])
 
-	long := facadeTelemetryDimension(facadeOperationSpec{Facade: "session", Operation: "unsubscribe_workspace_readiness"})
+	long := boundedFacadeTelemetryDimension("session", "unsubscribe_workspace_readiness")
 	require.LessOrEqual(t, len(long), 32)
 }
 
@@ -1609,12 +1609,12 @@ func TestBatchEditPreflightsAllItemsBeforeFirstWrite(t *testing.T) {
 
 func TestFacadeReadResolvesOnlyUniqueSymbolShorthand(t *testing.T) {
 	g := graph.New()
-	bm := search.NewBM25()
 	first := &graph.Node{ID: "pkg/a.go::UniqueReadTarget", Name: "UniqueReadTarget", Kind: graph.KindFunction, FilePath: "pkg/a.go"}
 	g.AddNode(first)
-	bm.Add(first.ID, first.Name, first.FilePath, first.Name)
 	eng := query.NewEngine(g)
-	eng.SetSearch(bm)
+	// The shorthand resolver reads FindNodesByName off the graph, never
+	// the text backend, so an inert one keeps the fixture honest.
+	eng.SetSearch(search.NewNull())
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 
 	resolved, ambiguous := srv.resolveFacadeSymbolShorthand(context.Background(), "UniqueReadTarget")
@@ -1623,7 +1623,6 @@ func TestFacadeReadResolvesOnlyUniqueSymbolShorthand(t *testing.T) {
 
 	second := &graph.Node{ID: "pkg/b.go::UniqueReadTarget", Name: "UniqueReadTarget", Kind: graph.KindFunction, FilePath: "pkg/b.go"}
 	g.AddNode(second)
-	bm.Add(second.ID, second.Name, second.FilePath, second.Name)
 	resolved, ambiguous = srv.resolveFacadeSymbolShorthand(context.Background(), "UniqueReadTarget")
 	require.Equal(t, "UniqueReadTarget", resolved)
 	require.ElementsMatch(t, []string{first.ID, second.ID}, ambiguous)

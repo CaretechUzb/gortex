@@ -631,9 +631,8 @@ func scanWorkspaceField(data []byte) string {
 		// Strip quotes.
 		v = strings.Trim(v, `"' `)
 		if v == "" {
-			// Could be a struct shape (e.g. `workspace:\n  auto_detect: true`)
-			// — that's the legacy config.WorkspaceConfig shape, now
-			// migrated to `multi:` instead. Skip.
+			// Empty or mapping-valued workspace declarations do not identify
+			// a workspace slug.
 			continue
 		}
 		// A workspace slug may never collide with the reserved local
