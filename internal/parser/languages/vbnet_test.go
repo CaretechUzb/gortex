@@ -35,7 +35,7 @@ func TestVBNetExtractor_Basics(t *testing.T) {
 	src := []byte(`Imports System.Data
 Imports Alias = System.Text
 
-Namespace Ltk.Demo
+Namespace Acme.Demo
 
     Public Class OrderService
         Inherits ServiceBase
@@ -67,7 +67,7 @@ End Namespace
 	require.NoError(t, err)
 
 	// Namespace is a package node.
-	ns := vbFind(res.Nodes, "Ltk.Demo")
+	ns := vbFind(res.Nodes, "Acme.Demo")
 	require.NotNil(t, ns, "namespace node")
 	assert.Equal(t, graph.KindPackage, ns.Kind)
 
@@ -77,9 +77,10 @@ End Namespace
 	assert.Equal(t, graph.KindType, cls.Kind)
 	assert.Equal(t, "class", cls.Meta["type_flavor"])
 	assert.Equal(t, VisibilityPublic, cls.Meta["visibility"])
-	assert.Equal(t, "Ltk.Demo", cls.Meta["scope_ns"])
-	// End Class is line 26 of the fixture; the range must be real, not a point.
+	assert.Equal(t, "Acme.Demo", cls.Meta["scope_ns"])
+	// End Class is line 24 of the fixture; the range must be real, not a point.
 	assert.Greater(t, cls.EndLine, cls.StartLine)
+	assert.Equal(t, 24, cls.EndLine, "class extent ends at End Class")
 
 	// Members are methods owned by the class, not free functions.
 	total := vbFind(res.Nodes, "Total")
@@ -315,7 +316,7 @@ func vbSnapshot(res *parser.ExtractionResult) string {
 func TestVBNetExtractor_CRLFEquivalence(t *testing.T) {
 	lf := `Imports System.Data
 
-Namespace Ltk.Demo
+Namespace Acme.Demo
 
     Public Class OrderService
         Inherits ServiceBase

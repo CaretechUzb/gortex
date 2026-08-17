@@ -23,9 +23,10 @@ import (
 //
 // Deliberately NOT emitted:
 //   - Plain fields / `Dim` / `WithEvents` declarations. In real VB estates
-//     these are dominated by designer-generated control fields (measured:
-//     1319 `WithEvents` lines across 196 files vs 2872 declarations total),
-//     which would swamp the graph with low-value nodes.
+//     these are dominated by designer-generated control fields (measured on
+//     a 196-file estate: 1319 `WithEvents` lines, against the 2945
+//     declaration nodes this extractor emits for those same files), which
+//     would swamp the graph with low-value nodes.
 //   - Bare parenthesised calls. VB uses `(` for array indexing, default
 //     properties and conversions as well as invocation, so `foo(i)` is
 //     genuinely ambiguous without types. Only qualified (`x.M(`) and
