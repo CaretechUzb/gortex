@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"sync"
@@ -59,6 +60,9 @@ type OverlayLayer struct {
 	// filter base hits whose enclosing file is overlaid but whose
 	// id disappeared from the overlay's node list.
 	nameRemoved map[string]map[string]bool
+	// removedByID is the immutable identity-side index for bounded point and
+	// adjacency projections. It avoids rescanning every name bucket per ID.
+	removedByID map[string]bool
 }
 
 // overlayFileEntry carries one file's overlay state inside the
@@ -83,6 +87,7 @@ func NewOverlayLayer() *OverlayLayer {
 		nodesByName: make(map[string][]*Node),
 		nodesByQual: make(map[string]*Node),
 		nameRemoved: make(map[string]map[string]bool),
+		removedByID: make(map[string]bool),
 	}
 }
 
@@ -111,6 +116,17 @@ func (l *OverlayLayer) AddNode(graphPath string, n *Node) {
 		// Tombstone: silently drop. Caller bug — but cheap to absorb.
 		return
 	}
+	if old := l.nodeByID[n.ID]; old != nil {
+		for index, candidate := range entry.Nodes {
+			if candidate == nil || candidate.ID != n.ID {
+				continue
+			}
+			entry.Nodes[index] = n
+			l.nodeByID[n.ID] = n
+			l.replaceNodeIndexes(old, n)
+			return
+		}
+	}
 	entry.Nodes = append(entry.Nodes, n)
 	l.nodeByID[n.ID] = n
 	if n.Name != "" {
@@ -118,6 +134,50 @@ func (l *OverlayLayer) AddNode(graphPath string, n *Node) {
 	}
 	if n.QualName != "" {
 		l.nodesByQual[n.QualName] = n
+	}
+}
+
+func (l *OverlayLayer) replaceNodeIndexes(old, replacement *Node) {
+	if old.Name == replacement.Name {
+		if old.Name != "" {
+			replaced := false
+			for index, candidate := range l.nodesByName[old.Name] {
+				if candidate != nil && candidate.ID == replacement.ID {
+					l.nodesByName[old.Name][index] = replacement
+					replaced = true
+				}
+			}
+			if !replaced {
+				l.nodesByName[old.Name] = append(l.nodesByName[old.Name], replacement)
+			}
+		}
+	} else {
+		if old.Name != "" {
+			bucket := l.nodesByName[old.Name]
+			filtered := bucket[:0]
+			for _, candidate := range bucket {
+				if candidate == nil || candidate.ID != replacement.ID {
+					filtered = append(filtered, candidate)
+				}
+			}
+			if len(filtered) == 0 {
+				delete(l.nodesByName, old.Name)
+			} else {
+				l.nodesByName[old.Name] = filtered
+			}
+		}
+		if replacement.Name != "" {
+			l.nodesByName[replacement.Name] = append(l.nodesByName[replacement.Name], replacement)
+		}
+	}
+
+	if old.QualName != "" && old.QualName != replacement.QualName {
+		if current := l.nodesByQual[old.QualName]; current != nil && current.ID == replacement.ID {
+			delete(l.nodesByQual, old.QualName)
+		}
+	}
+	if replacement.QualName != "" {
+		l.nodesByQual[replacement.QualName] = replacement
 	}
 }
 
@@ -150,6 +210,7 @@ func (l *OverlayLayer) MarkRemoved(baseName, baseID string) {
 		l.nameRemoved[baseName] = set
 	}
 	set[baseID] = true
+	l.removedByID[baseID] = true
 }
 
 // HasFile reports whether the overlay covers a particular graph path
@@ -257,6 +318,21 @@ func (l *OverlayLayer) nodesForFile(graphPath string) []*Node {
 	return out
 }
 
+// nodesForFileReadOnly exposes the immutable layer's backing slice to internal
+// bounded readers. Overlay construction is complete before an OverlaidView is
+// published, so scanning this slice cannot race a writer and avoids an O(N)
+// snapshot allocation before cancellation can be observed.
+func (l *OverlayLayer) nodesForFileReadOnly(graphPath string) []*Node {
+	if l == nil {
+		return nil
+	}
+	entry := l.entries[graphPath]
+	if entry == nil || entry.Deleted {
+		return nil
+	}
+	return entry.Nodes
+}
+
 // OverlaidView composes an immutable base Reader with a per-session
 // overlay layer. Every read path consults the layer first for paths
 // the overlay covers; falls through to base otherwise. The base is
@@ -337,37 +413,8 @@ func (v *OverlaidView) GetNode(id string) *Node {
 // fans out as a single batched lookup against the base store. Missing
 // IDs are simply absent from the returned map.
 func (v *OverlaidView) GetNodesByIDs(ids []string) map[string]*Node {
-	if len(ids) == 0 {
-		return nil
-	}
-	out := make(map[string]*Node, len(ids))
-	baseIDs := ids[:0:0] // fresh backing array — never aliases caller's slice
-	for _, id := range ids {
-		if id == "" {
-			continue
-		}
-		if _, dup := out[id]; dup {
-			continue
-		}
-		if v.layer != nil && v.nodeBelongsToOverlay(id) {
-			if n := v.layer.nodeByID[id]; n != nil {
-				out[id] = n
-			}
-			// Overlay tombstone — ID is hidden, do not fall back to base.
-			continue
-		}
-		// Track for the single base round-trip; reserve a slot in `out`
-		// only after the batched lookup returns.
-		baseIDs = append(baseIDs, id)
-	}
-	if len(baseIDs) > 0 && v.base != nil {
-		for id, n := range v.base.GetNodesByIDs(baseIDs) {
-			if n != nil {
-				out[id] = n
-			}
-		}
-	}
-	return out
+	nodes, _ := v.GetNodesByIDsContext(context.Background(), ids)
+	return nodes
 }
 
 // GetNodeByQualName: overlay first, then base. Base hits are filtered

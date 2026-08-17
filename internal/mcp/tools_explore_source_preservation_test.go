@@ -117,6 +117,23 @@ func TestSelectFinalExploreCandidatesPrefersTaskAlignedAmbiguousCallee(t *testin
 	require.Nil(t, candidateByID(selected, third.Node.ID), "three-way collision noise must stay outside the bounded answer")
 }
 
+func TestSelectFinalExploreCandidatesPrefersGraphResolvedCalleeWithinOneLiteralSeat(t *testing.T) {
+	owner := sourcePreservationCandidate("settled-owner", 4, 1)
+	owner.Signals[exploreSourceLiteralCoverageSignal] = 1
+	callee := sourcePreservationCandidate("ambiguous-callee", 9, 0.5)
+	callee.Signals[exploreSourceLiteralCoverageSignal] = 1
+	callee.Signals[exploreContentRecallAmbiguousSignal] = 1
+	callee.Signals[exploreSourceLiteralCalleeSignal] = 1
+	selected := selectFinalExploreCandidates([]*rerank.Candidate{
+		sourcePreservationCandidate("semantic-head", 0, 0), owner, callee,
+	}, nil, 2)
+
+	require.Len(t, selected, 2)
+	require.Equal(t, "semantic-head", selected[0].Node.ID)
+	require.Equal(t, callee.Node.ID, selected[1].Node.ID)
+	require.Nil(t, candidateByID(selected, owner.Node.ID))
+}
+
 func TestSelectFinalExploreCandidatesDeduplicatesSourceOwnersAndHonorsSmallLimits(t *testing.T) {
 	head := sourcePreservationCandidate("head", 0, 0)
 	source := sourcePreservationCandidate("aligned-source", 8, 0.5)
@@ -297,6 +314,24 @@ func TestExploreAnswerReadyKeepsQuotedNonExactConceptNonTerminal(t *testing.T) {
 
 	require.True(t, exploreAnswerReady("locate locale registry pipeline", []exploreTarget{head}), "the fixture must otherwise satisfy ordinary concept terminality")
 	require.False(t, exploreAnswerReady(`locate locale registry pipeline for "ku"`, []exploreTarget{head}))
+}
+
+func TestLocalizationEvidenceOrdersEligibleLiteralRowsByDistinctMatches(t *testing.T) {
+	semantic := exploreTarget{node: &graph.Node{ID: "repo/semantic.go::Semantic", Name: "Semantic", FilePath: "repo/semantic.go"}}
+	low := exploreTarget{
+		node:          &graph.Node{ID: "repo/low.go::Low", Name: "Low", FilePath: "repo/low.go"},
+		sourceLiteral: true, literalPrimaryEligible: true, literalMatchCount: 1,
+	}
+	high := exploreTarget{
+		node:          &graph.Node{ID: "repo/high.go::High", Name: "High", FilePath: "repo/high.go"},
+		sourceLiteral: true, literalPrimaryEligible: true, literalMatchCount: 3,
+	}
+
+	ordered := localizationEvidenceTargetsFromDraft("find the handler", "", []exploreTarget{semantic, low, high}, nil)
+	require.Len(t, ordered, 3)
+	require.Equal(t, semantic.node.ID, ordered[0].node.ID)
+	require.Equal(t, high.node.ID, ordered[1].node.ID)
+	require.Equal(t, low.node.ID, ordered[2].node.ID)
 }
 
 func BenchmarkLimitExploreCandidatesPreservingSourceLiteral80(b *testing.B) {

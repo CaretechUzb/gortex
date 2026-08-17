@@ -90,40 +90,11 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	// Terminal enforcement is deliberately the first policy branch. It is a
 	// local marker lookup, so it neither waits for the daemon nor gets bypassed
 	// by permissive permission modes. A new user prompt clears the marker.
+	if enforceLocalizationTerminalPreToolUse(input, started) {
+		return
+	}
 	terminalTurn, terminalTurnReady := currentLocalizationTurnState(input.SessionID, input.PromptID, input.AgentID, input.CWD)
 	terminalIdentity := terminalTurn.Identity
-	if terminalTurnReady {
-		if marker, marked := localizationTerminalMarkerFor(terminalIdentity); marked {
-			reason := ""
-			switch {
-			case !marker.Advisory:
-				reason = localizationTerminalDenyReason
-			case localizationNavigationTool(input.ToolName):
-				reason = localizationAdvisoryDenyReason
-			case localizationRedirectedHostTool(input.ToolName):
-				// Left to the access policy this deny becomes "call a Gortex
-				// graph tool instead", and the branch above then refuses that
-				// call. Prescribing a step we will not honour spends the
-				// caller's turn and teaches it nothing, so answer here instead.
-				reason = localizationAdvisoryDenyReason
-			}
-			if reason != "" {
-				// Hand the answer back with the refusal. A bare "you are done"
-				// leaves the caller with nothing to act on, so it reaches for the
-				// next tool and the turn budget drains one denial at a time.
-				if answer := strings.TrimSpace(marker.FinalResponse); answer != "" {
-					reason += "\n\n" + answer
-				}
-				emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
-					HookEventName:            "PreToolUse",
-					PermissionDecision:       "deny",
-					PermissionDecisionReason: reason,
-				}})
-				localizationTerminalTelemetry("denied", true, started)
-				return
-			}
-		}
-	}
 	localizationAuthToken := ""
 	if terminalTurnReady {
 		// Correlate the current turn with this exact tool invocation. The nonce is
@@ -264,6 +235,46 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 
 	emitted = true
 	emitPreToolUse(output)
+}
+
+// enforceLocalizationTerminalPreToolUse applies only the local terminal
+// contract and reports whether it emitted a deny. Keeping this seam separate
+// lets hosts with specialized per-tool behavior (notably Codex) enforce the
+// same all-tool terminal policy before dispatching to those handlers.
+func enforceLocalizationTerminalPreToolUse(input HookInput, started time.Time) bool {
+	terminalTurn, ready := currentLocalizationTurnState(input.SessionID, input.PromptID, input.AgentID, input.CWD)
+	if !ready {
+		return false
+	}
+	marker, marked := localizationTerminalMarkerFor(terminalTurn.Identity)
+	if !marked {
+		return false
+	}
+
+	reason := ""
+	switch {
+	case !marker.Advisory:
+		reason = localizationTerminalDenyReason
+	case localizationNavigationTool(input.ToolName):
+		reason = localizationAdvisoryDenyReason
+	case localizationRedirectedHostTool(input.ToolName):
+		// Left to the access policy this deny becomes "call a Gortex graph
+		// tool instead", and the navigation branch then refuses that call.
+		reason = localizationAdvisoryDenyReason
+	}
+	if reason == "" {
+		return false
+	}
+	if answer := strings.TrimSpace(marker.FinalResponse); answer != "" {
+		reason += "\n\n" + answer
+	}
+	emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
+		HookEventName:            "PreToolUse",
+		PermissionDecision:       "deny",
+		PermissionDecisionReason: reason,
+	}})
+	localizationTerminalTelemetry("denied", true, started)
+	return true
 }
 
 func hookAlternationSegmentCount(input HookInput) int {

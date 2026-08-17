@@ -257,7 +257,14 @@ func (s *Server) lowerEditSource(ctx context.Context, req mcp.CallToolRequest) (
 	}
 	// Edited ranges that did not add/remove a symbol still touch their
 	// enclosing symbol — lower the edit's ranges so a body change counts.
-	for _, h := range s.lowerWorkspaceEditRanges(edit) {
+	loweredEdit := s.lowerWorkspaceEditRanges(ctx, edit)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(loweredEdit.saturated) > 0 {
+		return nil, saturatedRangeLoweringError(loweredEdit.saturated)
+	}
+	for _, h := range loweredEdit.hits {
 		ids = append(ids, h.ID)
 	}
 	ids = dedupeStrings(ids)
@@ -322,10 +329,10 @@ func (s *Server) workspaceEditVerificationFiles(edit lsp.WorkspaceEdit) ([]verif
 }
 
 // lowerWorkspaceEditRanges maps each TextEdit's range to its enclosing symbols.
-func (s *Server) lowerWorkspaceEditRanges(edit lsp.WorkspaceEdit) []rangeSymbolHit {
+func (s *Server) lowerWorkspaceEditRanges(ctx context.Context, edit lsp.WorkspaceEdit) loweredRanges {
 	fileEdits, err := s.groupEditByFile(edit)
 	if err != nil {
-		return nil
+		return loweredRanges{}
 	}
 	var specs []rangeSpec
 	for _, fe := range fileEdits {
@@ -342,8 +349,13 @@ func (s *Server) lowerWorkspaceEditRanges(edit lsp.WorkspaceEdit) []rangeSymbolH
 			})
 		}
 	}
-	hits, _ := s.lowerRanges(specs)
-	return hits
+	return s.lowerRangesDetailedContext(ctx, specs)
+}
+
+func saturatedRangeLoweringError(paths []string) error {
+	paths = append([]string(nil), paths...)
+	sort.Strings(paths)
+	return fmt.Errorf("bounded range ownership is unavailable for: %s", strings.Join(dedupeStrings(paths), ", "))
 }
 
 func (s *Server) lowerRangeSource(ctx context.Context, req mcp.CallToolRequest) (*prediction, error) {
@@ -351,7 +363,14 @@ func (s *Server) lowerRangeSource(ctx context.Context, req mcp.CallToolRequest) 
 	if err != nil {
 		return nil, err
 	}
-	hits, _ := s.lowerRanges(specs)
+	lowered := s.lowerRangesDetailedContext(ctx, specs)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(lowered.saturated) > 0 {
+		return nil, saturatedRangeLoweringError(lowered.saturated)
+	}
+	hits := lowered.hits
 	ids := make([]string, 0, len(hits))
 	changed := make([]changedSymbolRef, 0, len(hits))
 	files := make([]string, 0, len(hits))
@@ -875,6 +894,9 @@ func (s *Server) handleChangeContract(ctx context.Context, req mcp.CallToolReque
 	}
 	p, err := s.lowerChange(ctx, req)
 	if err != nil {
+		if ctxErr := requestContextError(ctx, err); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	if req.GetBool("ack", false) {

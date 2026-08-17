@@ -277,7 +277,10 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 
 	// --- section: simulate_chain (gated on an explicit overlay session) ---
 	if wantSimulate {
-		sim, gate := s.buildPRReviewSimulation(ctx, req)
+		sim, gate, simErr := s.buildPRReviewSimulation(ctx, req)
+		if simErr != nil {
+			return nil, simErr
+		}
 		out.Simulation = sim
 		out.Gates = append(out.Gates, gate)
 	}
@@ -431,7 +434,7 @@ func (s *Server) buildConfigAuditSection(repoRoot string) *audit.Report {
 // (via the `session_id` param or the request context) the section is omitted
 // with a note rather than run against a phantom session. The base graph is
 // never mutated regardless.
-func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRequest) (*prReviewSimulation, reviewGate) {
+func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRequest) (*prReviewSimulation, reviewGate, error) {
 	editsArg := strings.TrimSpace(req.GetString("edits", ""))
 	if editsArg == "" {
 		return &prReviewSimulation{
@@ -440,7 +443,7 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 			}, reviewGate{
 				Name: "simulate_chain", Status: prReviewPass,
 				Detail: "skipped: no edits supplied",
-			}
+			}, nil
 	}
 
 	sessionID := strings.TrimSpace(req.GetString("session_id", ""))
@@ -454,7 +457,7 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 			}, reviewGate{
 				Name: "simulate_chain", Status: prReviewPass,
 				Detail: "skipped: no overlay session id",
-			}
+			}, nil
 	}
 
 	edits, err := parsePRReviewEdits(editsArg)
@@ -465,7 +468,7 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 			}, reviewGate{
 				Name: "simulate_chain", Status: prReviewWarn,
 				Detail: "invalid edits: " + err.Error(),
-			}
+			}, nil
 	}
 
 	// Run the chain on top of the named session's overlay. buildSimulation
@@ -474,13 +477,16 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 	simCtx := WithSessionID(ctx, sessionID)
 	sim, simErr := s.buildSimulation(simCtx, edits, true)
 	if simErr != nil {
+		if ctxErr := requestContextError(simCtx, simErr); ctxErr != nil {
+			return nil, reviewGate{}, ctxErr
+		}
 		return &prReviewSimulation{
 				Ran: false, GraphUntouched: true, SessionID: sessionID,
 				Note: "simulation failed: " + simErr.Error(),
 			}, reviewGate{
 				Name: "simulate_chain", Status: prReviewWarn,
 				Detail: "simulation failed: " + simErr.Error(),
-			}
+			}, nil
 	}
 
 	steps := make([]map[string]any, 0, len(sim.steps))
@@ -512,18 +518,24 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 		status = prReviewBlock
 		detail = detailf("%d step(s) introduce broken callers / implementors", len(sim.steps))
 	}
-	return out, reviewGate{Name: "simulate_chain", Status: status, Detail: detail}
+	return out, reviewGate{Name: "simulate_chain", Status: status, Detail: detail}, nil
 }
 
 // parsePRReviewEdits parses the `edits` JSON array into WorkspaceEdits,
 // reusing the same per-edit parser the simulate_chain handler uses.
 func parsePRReviewEdits(raw string) ([]lsp.WorkspaceEdit, error) {
+	if len(raw) > overlaySimulationInputMaxBytes {
+		return nil, fmt.Errorf("edits input exceeds limit %d bytes", overlaySimulationInputMaxBytes)
+	}
 	var rawEdits []json.RawMessage
 	if err := json.Unmarshal([]byte(raw), &rawEdits); err != nil {
 		return nil, errors.New("edits must be a JSON array of WorkspaceEdit objects: " + err.Error())
 	}
 	if len(rawEdits) == 0 {
 		return nil, errors.New("edits array is empty")
+	}
+	if len(rawEdits) > overlaySimulationMaxSteps {
+		return nil, fmt.Errorf("edits exceed limit %d", overlaySimulationMaxSteps)
 	}
 	edits := make([]lsp.WorkspaceEdit, 0, len(rawEdits))
 	for i, re := range rawEdits {

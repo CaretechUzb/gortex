@@ -39,6 +39,150 @@ func requireLocalizationHostContractMatchesVisible(
 	return host
 }
 
+func TestLocalizationTargetProvenanceSeparatesLiteralObservationFromPrimarySeating(t *testing.T) {
+	node := &graph.Node{ID: "repo/service.go::Handle", Name: "Handle", FilePath: "repo/service.go"}
+	weak := exploreTarget{node: node, sourceLiteral: true}
+	if got := localizationTargetProvenance(localizationCompletion{}, weak); got != localizationProvenanceContentLiteral {
+		t.Fatalf("anchored literal provenance = %q, want %q", got, localizationProvenanceContentLiteral)
+	}
+	if localizationFinalResponsePrimaryProvenance(localizationDigestRow{Provenance: localizationProvenanceContentLiteral}) {
+		t.Fatal("anchored literal provenance must not reserve a PRIMARY seat")
+	}
+
+	weak.literalPrimaryEligible = true
+	if got := localizationTargetProvenance(localizationCompletion{}, weak); got != localizationProvenanceContentLiteral {
+		t.Fatalf("unanchored literal provenance = %q, want %q", got, localizationProvenanceContentLiteral)
+	}
+	if !localizationFinalResponsePrimaryProvenance(localizationDigestRow{
+		Provenance: localizationProvenanceContentLiteral, literalPrimaryEligible: true,
+	}) {
+		t.Fatal("eligible unanchored literal must retain its bounded PRIMARY reservation")
+	}
+	proof := localizationStrongEvidenceForCompletion(
+		newLocalizationCompletion(true, ""), []exploreTarget{weak},
+	)
+	if proof.provenance != "" {
+		t.Fatalf("unanchored content seating became strong terminal proof: %#v", proof)
+	}
+}
+
+func TestLocalizationEligibleContentLiteralReachesPrimaryThroughPackedEnvelope(t *testing.T) {
+	const literalID = "repo/literal.go::LiteralOwner"
+	ordinary := []struct {
+		id   string
+		name string
+		file string
+	}{
+		{"repo/a.go::Alpha", "Alpha", "repo/a.go"},
+		{"repo/b.go::Bravo", "Bravo", "repo/b.go"},
+		{"repo/c.go::Charlie", "Charlie", "repo/c.go"},
+		{"repo/d.go::Delta", "Delta", "repo/d.go"},
+		{"repo/e.go::Echo", "Echo", "repo/e.go"},
+	}
+	buildTargets := func(eligible bool) []exploreTarget {
+		targets := make([]exploreTarget, 0, len(ordinary)+1)
+		for _, item := range ordinary {
+			targets = append(targets, exploreTarget{node: &graph.Node{
+				ID: item.id, Name: item.name, Kind: graph.KindFunction, FilePath: item.file,
+			}})
+		}
+		targets = append(targets, exploreTarget{
+			node: &graph.Node{
+				ID: literalID, Name: "LiteralOwner", Kind: graph.KindFunction, FilePath: "repo/literal.go",
+			},
+			exactContent: true, sourceLiteral: true, syntacticAnchor: !eligible,
+			literalPrimaryEligible: eligible,
+		})
+		return targets
+	}
+
+	for _, test := range []struct {
+		name     string
+		eligible bool
+	}{
+		{name: "authenticated unanchored literal reserves one primary seat", eligible: true},
+		{name: "anchored literal observation remains rank only", eligible: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, _, digest, _ := buildLocalizationExploreResultForTaskFinalized(
+				newLocalizationCompletion(true, ""), "", buildTargets(test.eligible),
+				exploreDefaultBudgetTokens,
+			)
+			require.NotNil(t, digest)
+			require.LessOrEqual(t, len(digest.primaryIDs), localizationFinalResponsePrimaryLimit)
+
+			body, ok := singleTextContent(result)
+			require.True(t, ok)
+			var envelope localizationExploreEnvelope
+			require.NoError(t, json.Unmarshal([]byte(body), &envelope))
+			found := false
+			for _, row := range envelope.Evidence {
+				if row.ID == literalID {
+					found = true
+					require.Equal(t, localizationProvenanceContentLiteral, row.Provenance)
+				}
+			}
+			require.True(t, found, "literal evidence must survive production packing")
+			retainedEligible := false
+			for _, row := range digest.Evidence {
+				if row.ID == literalID {
+					retainedEligible = row.literalPrimaryEligible
+				}
+			}
+			require.Equal(t, test.eligible, retainedEligible)
+			require.Contains(t, digest.primaryIDs, literalID, "ordinary ranking may still seat either literal")
+			if test.eligible {
+				require.Equal(t, literalID, digest.primaryIDs[0], "the bounded literal reserve must pre-seat the eligible row")
+			} else {
+				require.NotEqual(t, literalID, digest.primaryIDs[0], "an ineligible literal must not claim the reserve")
+			}
+		})
+	}
+}
+
+func TestLocalizationLiteralProvenanceSurvivesFinalProjection(t *testing.T) {
+	tests := []struct {
+		name        string
+		target      exploreTarget
+		provenance  string
+		enforceable bool
+	}{
+		{
+			name: "authenticated content observation remains advisory",
+			target: exploreTarget{
+				node:   &graph.Node{ID: "repo/service.go::Handle", Name: "Handle", Kind: graph.KindFunction, FilePath: "repo/service.go"},
+				source: "func Handle() {}", exactContent: true,
+			},
+			provenance: localizationProvenanceContentLiteral,
+		},
+		{
+			name: "unique graph-resolved literal callee remains strong",
+			target: exploreTarget{
+				node:   &graph.Node{ID: "repo/registry.go::Register", Name: "Register", Kind: graph.KindFunction, FilePath: "repo/registry.go"},
+				source: "func Register(value string) {}", exactContent: true,
+				sourceLiteral: true, sourceLiteralCallee: true,
+			},
+			provenance:  localizationProvenanceSourceLiteralCallee,
+			enforceable: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, _, _, completion := buildLocalizationExploreResultForTaskFinalized(
+				newLocalizationCompletion(true, ""), `locate the value "wire-key"`,
+				[]exploreTarget{test.target}, exploreDefaultBudgetTokens,
+			)
+			body, ok := singleTextContent(result)
+			require.True(t, ok)
+			var envelope localizationExploreEnvelope
+			require.NoError(t, json.Unmarshal([]byte(body), &envelope))
+			require.Len(t, envelope.Evidence, 1)
+			require.Equal(t, test.provenance, envelope.Evidence[0].Provenance)
+			require.Equal(t, test.enforceable, completion.Enforceable)
+		})
+	}
+}
+
 func TestLocalizationEvidencePolicyHoldsWeakOwnerForOneBoundedCallFromSQLiteCSharpIndex(t *testing.T) {
 	root := t.TempDir()
 	rel := "src/Humanizer/Localisation/Localiser.cs"
@@ -113,7 +257,7 @@ func TestLocalizationEvidencePolicyHoldsWeakOwnerForOneBoundedCallFromSQLiteCSha
 	require.Equal(t, localizationStateNeedsRecovery, envelope.Completion.State)
 	require.False(t, envelope.Completion.Enforceable)
 	require.Len(t, envelope.Evidence, 1)
-	require.Empty(t, envelope.Evidence[0].Provenance)
+	require.Equal(t, localizationProvenanceContentLiteral, envelope.Evidence[0].Provenance)
 
 	wire, err := json.Marshal(result)
 	require.NoError(t, err)

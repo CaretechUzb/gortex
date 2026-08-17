@@ -62,11 +62,20 @@ const (
 	v060CodexSessionStartMessage        = "IMPORTANT: Prefer Gortex MCP tools (search_symbols, get_callers, get_file_summary, edit_file) over Read/Grep/Glob/Edit."
 	v060CodexSessionStartCommand        = "printf '%s\\n' '" + v060CodexSessionStartMessage + "'"
 	v060CodexSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + v060CodexSessionStartMessage + "'\""
-	codexPreToolUseMatcher              = "^Bash$"
-	codexMCPReadPreToolUseMatcher       = "^mcp__gortex__read$"
-	codexPostToolUseMatcher             = "^(Bash|apply_patch)$"
-	codexHookTimeoutSeconds             = 5
-	codexHookModeEnvVar                 = "GORTEX_CODEX_HOOK_MODE"
+	// Codex matchers are regular expressions. A match-all PreToolUse hook is
+	// required because terminal localization covers every local tool routed
+	// through Codex's hook path; hosted and specialized opt-out tools remain
+	// outside the host's hook boundary. Without a marker the handler is a
+	// strict local no-op.
+	codexPreToolUseMatcher = ".*"
+	// Retained as migration fingerprints in tests: upsertCodexHookSet removes
+	// both split predecessors by managed command identity before installing the
+	// singleton match-all hook.
+	codexLegacyBashPreToolUseMatcher          = "^Bash$"
+	codexLegacyMCPNavigationPreToolUseMatcher = "^(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze)$"
+	codexPostToolUseMatcher                   = "^(Bash|apply_patch|(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze))$"
+	codexHookTimeoutSeconds                   = 5
+	codexHookModeEnvVar                       = "GORTEX_CODEX_HOOK_MODE"
 	// Codex merges its home instructions file into every session ahead of
 	// the repo's own AGENTS.md, preferring the override name when present.
 	codexGlobalInstructionsFile         = "AGENTS.md"
@@ -550,11 +559,77 @@ func upsertSessionStartHook(root map[string]any, env agents.Env, opts agents.App
 }
 
 func upsertPreToolUseHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
-	desired := []map[string]any{
-		codexPreToolUseHookEntry(env),
-		codexMCPReadPreToolUseHookEntry(env),
+	// Codex permits several handlers in one matcher group. Normalize at handler
+	// granularity before replacing legacy Gortex matchers: this preserves every
+	// co-located user handler while collapsing duplicate managed invocations.
+	splitChanged := splitMixedCodexPreToolUseGroups(root)
+	desired := []map[string]any{codexPreToolUseHookEntry(env)}
+	upsertChanged := upsertCodexHookSet(root, "PreToolUse", codexHookEntryIsGortexPreToolUse, desired, opts)
+	return splitChanged || upsertChanged
+}
+
+func splitMixedCodexPreToolUseGroups(root map[string]any) bool {
+	hooks, ok := root["hooks"].(map[string]any)
+	if !ok {
+		return false
 	}
-	return upsertCodexHookSet(root, "PreToolUse", codexHookEntryIsGortexPreToolUse, desired, opts)
+	entries, ok := codexHookList(hooks["PreToolUse"])
+	if !ok {
+		return false
+	}
+
+	normalized := make([]any, 0, len(entries))
+	changed := false
+	for _, entry := range entries {
+		group, ok := entry.(map[string]any)
+		if !ok {
+			normalized = append(normalized, entry)
+			continue
+		}
+		handlers, ok := codexHookList(group["hooks"])
+		if !ok {
+			normalized = append(normalized, entry)
+			continue
+		}
+		managed := 0
+		kept := make([]any, 0, len(handlers))
+		for _, handler := range handlers {
+			fields, ok := handler.(map[string]any)
+			if ok {
+				command, _ := fields["command"].(string)
+				if codexCommandInvokesCodexHook(command) {
+					managed++
+					continue
+				}
+			}
+			kept = append(kept, handler)
+		}
+		switch {
+		case managed == 0:
+			normalized = append(normalized, entry)
+		case managed == 1 && len(handlers) == 1:
+			// Leave a singleton managed group for upsertCodexHookSet to
+			// validate or replace. A current singleton remains idempotent.
+			normalized = append(normalized, entry)
+		default:
+			changed = true
+			if len(kept) == 0 {
+				continue
+			}
+			preserved := make(map[string]any, len(group))
+			for key, value := range group {
+				preserved[key] = value
+			}
+			preserved["hooks"] = kept
+			normalized = append(normalized, preserved)
+		}
+	}
+	if !changed {
+		return false
+	}
+	hooks["PreToolUse"] = normalized
+	root["hooks"] = hooks
+	return true
 }
 
 func upsertPostToolUseHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
@@ -563,6 +638,10 @@ func upsertPostToolUseHook(root map[string]any, env agents.Env, opts agents.Appl
 
 func upsertUserPromptSubmitHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
 	return upsertCodexHookSet(root, "UserPromptSubmit", codexHookEntryIsGortexUserPromptSubmit, []map[string]any{codexUserPromptSubmitHookEntry(env)}, opts)
+}
+
+func upsertStopHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
+	return upsertCodexHookSet(root, "Stop", codexHookEntryIsGortexStop, []map[string]any{codexStopHookEntry(env)}, opts)
 }
 
 // InstallHooksOnly refreshes the Codex lifecycle hooks in configPath without
@@ -585,7 +664,8 @@ func upsertCodexHooks(root map[string]any, env agents.Env, opts agents.ApplyOpts
 	preChanged := upsertPreToolUseHook(root, env, opts)
 	postChanged := upsertPostToolUseHook(root, env, opts)
 	promptChanged := upsertUserPromptSubmitHook(root, env, opts)
-	return sessionChanged || preChanged || postChanged || promptChanged
+	stopChanged := upsertStopHook(root, env, opts)
+	return sessionChanged || preChanged || postChanged || promptChanged || stopChanged
 }
 
 func upsertCodexHookSet(root map[string]any, event string, isGortex func(any) bool, desired []map[string]any, opts agents.ApplyOpts) bool {
@@ -734,6 +814,10 @@ func codexHookEntryIsGortexUserPromptSubmit(entry any) bool {
 	return codexHookEntryInvokesCodexHook(entry)
 }
 
+func codexHookEntryIsGortexStop(entry any) bool {
+	return codexHookEntryInvokesCodexHook(entry)
+}
+
 func codexHookEntryInvokesCodexHook(entry any) bool {
 	group, ok := entry.(map[string]any)
 	if !ok {
@@ -789,21 +873,7 @@ func codexPreToolUseHookEntry(env agents.Env) map[string]any {
 				"type":          "command",
 				"command":       codexPreToolUseCommand(env),
 				"timeout":       codexHookTimeoutSeconds,
-				"statusMessage": "Loading Gortex Bash guidance...",
-			},
-		},
-	}
-}
-
-func codexMCPReadPreToolUseHookEntry(env agents.Env) map[string]any {
-	return map[string]any{
-		"matcher": codexMCPReadPreToolUseMatcher,
-		"hooks": []any{
-			map[string]any{
-				"type":          "command",
-				"command":       codexPreToolUseCommand(env),
-				"timeout":       codexHookTimeoutSeconds,
-				"statusMessage": "Loading Gortex read guidance...",
+				"statusMessage": "Loading Gortex tool guidance...",
 			},
 		},
 	}
@@ -836,6 +906,22 @@ func codexUserPromptSubmitHookEntry(env agents.Env) map[string]any {
 				"command":       codexHookCommand(env),
 				"timeout":       codexHookTimeoutSeconds,
 				"statusMessage": "Surfacing Gortex graph context for your prompt...",
+			},
+		},
+	}
+}
+
+// codexStopHookEntry has no matcher: Stop applies to every final response.
+// Older Codex hosts that omit last_assistant_message remain fail-open in the
+// shared Stop handler.
+func codexStopHookEntry(env agents.Env) map[string]any {
+	return map[string]any{
+		"hooks": []any{
+			map[string]any{
+				"type":          "command",
+				"command":       codexHookCommand(env),
+				"timeout":       codexHookTimeoutSeconds,
+				"statusMessage": "Checking Gortex evidence authority...",
 			},
 		},
 	}

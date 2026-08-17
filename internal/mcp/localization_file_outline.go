@@ -23,8 +23,13 @@ import (
 // carries outlines; a terminal page's caller is answering, not choosing.
 
 const (
-	// localizationOutlineRowCap bounds the rows the leading file's outline may
-	// serialize.
+	// localizationOutlineCompleteRows is the internal no-cap sentinel used only
+	// while re-projecting an already bounded outline during relief tests and
+	// compatibility paths. Page construction never selects it.
+	localizationOutlineCompleteRows = -1
+	// localizationOutlineRowCap bounds the leading file's declaration index.
+	// Forty task-prioritized head/tail rows preserve useful navigation without
+	// letting one large file consume an otherwise healthy localization page.
 	localizationOutlineRowCap = 40
 	// localizationOutlineHeadRows splits an elided outline between the file's
 	// opening declarations and its closing ones.
@@ -32,25 +37,35 @@ const (
 	// localizationOutlineFloorRows is the smallest index still worth its bytes.
 	// Budget pressure shrinks an outline to this floor before it may drop one.
 	localizationOutlineFloorRows = 8
-	// localizationOutlineSecondFileRowCap is the depth the file ranked directly
-	// after the leading one gets. Every file after that starts at the floor.
-	localizationOutlineSecondFileRowCap = 12
-	// localizationOutlineFileCap bounds how many of the page's distinct files
-	// are indexed at all, leading file included.
-	localizationOutlineFileCap = 6
+	// Later page files need enough declarations to expose siblings without
+	// spending the request-wide projection budget reserved for the leading pair.
+	localizationOutlineTrailingFileFetchLimit = 128
+	// localizationOutlineFileCap covers the first ten distinct ranked files:
+	// two complete bounded indexes plus eight shallow sibling indexes.
+	localizationOutlineFileCap = 10
+	// The page's first two files keep their complete retained indexes until every
+	// lower-ranked file has yielded its expendable depth and breadth.
+	localizationOutlineProtectedFileCount = 2
 )
 
-// localizationOutlineFileRowCap is the depth ladder over a page's files: the
-// leading file keeps the whole index, the next one a third of it, and the rest
-// start where shrinking would stop anyway.
+// localizationOutlineFileRowCap is the initial wire depth over a page's files.
+// The first two files expose every declaration retained by their bounded read;
+// later files start at the relief floor.
 func localizationOutlineFileRowCap(rank int) int {
-	switch rank {
-	case 0:
-		return localizationOutlineRowCap
-	case 1:
-		return localizationOutlineSecondFileRowCap
+	if rank >= 0 && rank < localizationOutlineProtectedFileCount {
+		return localizationOutlineCompleteRows
 	}
 	return localizationOutlineFloorRows
+}
+
+// localizationOutlineFileFetchLimit bounds the lightweight declaration read
+// before wire projection. The first two distinct files receive the full typed
+// backend page and the remaining eight receive a shallow page.
+func localizationOutlineFileFetchLimit(rank int) int {
+	if rank >= 0 && rank < localizationOutlineProtectedFileCount {
+		return localizationFileNodeLimit
+	}
+	return localizationOutlineTrailingFileFetchLimit
 }
 
 // localizationPageOutline is the page's declaration index: the leading file's
@@ -66,23 +81,26 @@ type localizationOutlineRow struct {
 	// Kind is a one-rune hint. The row is a locator, so a coarse hint costs a
 	// byte and the name still decides.
 	Kind string `json:"kind,omitempty"`
+	key  string
 }
 
 // localizationFileOutline is the bounded declaration index of a page file.
-// Declared counts what the file declares; Elided counts the rows the cap
-// dropped from the middle.
+// Declared is exact unless Truncated is true, in which case it is a lower bound.
+// Elided follows the same rule and counts declarations not represented in Rows.
 //
-// The unexported fields are the whole file in line order plus the task-term
-// priority over it, retained so the same outline can be re-elided at a smaller
-// cap without re-reading the graph. They are never serialized.
+// The unexported fields are the retained declarations in line order plus the
+// task-term priority over them, kept so the same outline can be re-elided at a
+// smaller cap without re-reading the graph. They are never serialized.
 type localizationFileOutline struct {
-	File     string                   `json:"file"`
-	Declared int                      `json:"declared"`
-	Elided   int                      `json:"elided,omitempty"`
-	Rows     []localizationOutlineRow `json:"rows"`
+	File      string                   `json:"file"`
+	Declared  int                      `json:"declared"`
+	Elided    int                      `json:"elided,omitempty"`
+	Truncated bool                     `json:"truncated,omitempty"`
+	Rows      []localizationOutlineRow `json:"rows"`
 
 	all      []localizationOutlineRow
 	priority []int
+	rank     int
 }
 
 // localizationPageAcceptsOutline admits the outline on the states whose caller
@@ -103,9 +121,36 @@ func localizationPageOutlineProvider(
 	pool []*rerank.Candidate,
 	targets []exploreTarget,
 	terms map[string]struct{},
-	enumerate func(string) []*graph.Node,
+	enumerate any,
 ) func() *localizationPageOutline {
-	if enumerate == nil {
+	return localizationPageOutlineProviderWithCaps(
+		pool, targets, terms, enumerate, localizationOutlineFileRowCap,
+	)
+}
+
+// boundedLocalizationPageOutlineProvider applies the shared initial row policy
+// to structured localize responses. Structured and task pages both start with
+// the complete retained leading pair and relieve their own copies under budget.
+func boundedLocalizationPageOutlineProvider(
+	pool []*rerank.Candidate,
+	targets []exploreTarget,
+	terms map[string]struct{},
+	enumerate any,
+) func() *localizationPageOutline {
+	return localizationPageOutlineProviderWithCaps(
+		pool, targets, terms, enumerate, localizationOutlineFileRowCap,
+	)
+}
+
+func localizationPageOutlineProviderWithCaps(
+	pool []*rerank.Candidate,
+	targets []exploreTarget,
+	terms map[string]struct{},
+	enumerate any,
+	rowCap func(int) int,
+) func() *localizationPageOutline {
+	enumerateDeclarations := localizationOutlineDeclarationEnumerator(enumerate)
+	if enumerateDeclarations == nil {
 		return nil
 	}
 	var (
@@ -118,13 +163,19 @@ func localizationPageOutlineProvider(
 		}
 		built = true
 		index := func(file string, rank int) *localizationFileOutline {
-			nodes := enumerate(file)
-			if len(nodes) == 0 {
+			declarations := enumerateDeclarations(file, rank)
+			if len(declarations.Nodes) == 0 && !declarations.Truncated {
 				// Nothing to enumerate leaves the nodes this page already
 				// fetched, which is the whole of what it knows about that file.
-				nodes = localizationOutlineFetchedNodes(pool, targets)
+				declarations = localizationFileDeclarations{
+					Nodes: localizationOutlineFetchedNodes(pool, targets),
+				}
 			}
-			return newLocalizationFileOutlineForTerms(file, nodes, terms, localizationOutlineFileRowCap(rank))
+			outline := newLocalizationFileOutlineForDeclarations(file, declarations, terms, rowCap(rank))
+			if outline != nil {
+				outline.rank = rank
+			}
+			return outline
 		}
 		// A page whose ranking never settled on one file has no leading slice to
 		// give — but its rows still name files, and every one of them declares
@@ -142,13 +193,18 @@ func localizationPageOutlineProvider(
 				leading = ""
 			}
 		}
-		ranked := localizationOutlinePageRowCounts(targets)
-		for _, file := range localizationOutlineFollowingFiles(targets, leading, following) {
-			other := index(file, len(page.Others)+1)
-			if other == nil || other.Declared <= ranked[file] {
-				// A file whose every declaration is already a row on this page
-				// is a file the caller can already see. Indexing it costs bytes
-				// the deeper files would rather have.
+		followingFiles := localizationOutlineFollowingFiles(targets, leading, following)
+		for indexInPage, file := range followingFiles {
+			rank := indexInPage
+			if leading != "" {
+				rank++
+			}
+			other := index(file, rank)
+			if other == nil || rank >= localizationOutlineProtectedFileCount &&
+				!localizationOutlineAddsUnrankedDeclaration(other, targets) {
+				// Lower-ranked files whose declarations are all already visible
+				// add no navigation value. The top two remain explicit even when
+				// counts happen to match: identity, not cardinality, is the proof.
 				continue
 			}
 			page.Others = append(page.Others, other)
@@ -157,6 +213,26 @@ func localizationPageOutlineProvider(
 			page = nil
 		}
 		return page
+	}
+}
+
+// localizationOutlineDeclarationEnumerator keeps direct outline helpers that
+// enumerate raw nodes source-compatible while allowing bounded caches to carry
+// an exact declaration count alongside their retained page.
+func localizationOutlineDeclarationEnumerator(enumerate any) func(string, int) localizationFileDeclarations {
+	switch enumerate := enumerate.(type) {
+	case func(string, int) localizationFileDeclarations:
+		return enumerate
+	case func(string) localizationFileDeclarations:
+		return func(file string, _ int) localizationFileDeclarations {
+			return enumerate(file)
+		}
+	case func(string) []*graph.Node:
+		return func(file string, _ int) localizationFileDeclarations {
+			return localizationFileDeclarations{Nodes: enumerate(file)}
+		}
+	default:
+		return nil
 	}
 }
 
@@ -207,19 +283,36 @@ func localizationOutlineLeadingFile(pool []*rerank.Candidate, targets []exploreT
 	return exploreLeadingRankedFile(ranked)
 }
 
-// localizationOutlinePageRowCounts counts how many of a file's declarations the
-// page already names as ranked rows.
-func localizationOutlinePageRowCounts(targets []exploreTarget) map[string]int {
-	counts := make(map[string]int, len(targets))
+// localizationOutlineAddsUnrankedDeclaration checks actual declaration
+// identities. Counts cannot prove coverage when ranked rows repeat one identity
+// or omit a different sibling.
+func localizationOutlineAddsUnrankedDeclaration(outline *localizationFileOutline, targets []exploreTarget) bool {
+	if outline == nil {
+		return false
+	}
+	if outline.Truncated {
+		return true
+	}
+	visible := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
-		if target.node == nil {
+		if target.node == nil || nodeDisplayPath(target.node) != outline.File {
 			continue
 		}
-		if file := nodeDisplayPath(target.node); file != "" {
-			counts[file]++
+		key := target.node.ID
+		if key == "" {
+			key = strings.TrimSpace(target.node.QualName)
+			if key == "" {
+				key = strings.TrimSpace(target.node.Name)
+			}
+		}
+		visible[key] = struct{}{}
+	}
+	for _, row := range outline.all {
+		if _, covered := visible[row.key]; !covered {
+			return true
 		}
 	}
-	return counts
+	return false
 }
 
 func localizationOutlineFetchedNodes(pool []*rerank.Candidate, targets []exploreTarget) []*graph.Node {
@@ -253,13 +346,22 @@ func newLocalizationFileOutlineForTerms(
 	terms map[string]struct{},
 	rowCap int,
 ) *localizationFileOutline {
+	return newLocalizationFileOutlineForDeclarations(file, localizationFileDeclarations{Nodes: nodes}, terms, rowCap)
+}
+
+func newLocalizationFileOutlineForDeclarations(
+	file string,
+	declarations localizationFileDeclarations,
+	terms map[string]struct{},
+	rowCap int,
+) *localizationFileOutline {
 	file = strings.TrimSpace(file)
 	if file == "" {
 		return nil
 	}
-	rows := make([]localizationOutlineRow, 0, len(nodes))
-	seen := make(map[string]struct{}, len(nodes))
-	for _, node := range nodes {
+	rows := make([]localizationOutlineRow, 0, len(declarations.Nodes))
+	seen := make(map[string]struct{}, len(declarations.Nodes))
+	for _, node := range declarations.Nodes {
 		if node == nil || nodeDisplayPath(node) != file || isNonDefinitionNode(node.Kind) {
 			continue
 		}
@@ -282,6 +384,7 @@ func newLocalizationFileOutlineForTerms(
 			Name: compactLocalizationField(name, localizationMaxNameRunes),
 			Line: node.StartLine,
 			Kind: localizationOutlineKindLetter(node.Kind),
+			key:  key,
 		})
 	}
 	if len(rows) == 0 {
@@ -293,11 +396,16 @@ func newLocalizationFileOutlineForTerms(
 		}
 		return rows[first].Name < rows[second].Name
 	})
+	declared := max(len(rows), declarations.Declared)
+	if declarations.Truncated {
+		declared = max(declared, len(rows)+1)
+	}
 	outline := &localizationFileOutline{
-		File:     file,
-		Declared: len(rows),
-		all:      rows,
-		priority: localizationOutlinePriority(rows, terms),
+		File:      file,
+		Declared:  declared,
+		Truncated: declarations.Truncated,
+		all:       rows,
+		priority:  localizationOutlinePriority(rows, terms),
 	}
 	outline.elide(rowCap)
 	return outline
@@ -311,9 +419,10 @@ func localizationOutlinePriority(rows []localizationOutlineRow, terms map[string
 		return nil
 	}
 	type match struct{ index, matched, longest int }
+	wanted := localizationOutlineTerms(terms)
 	matches := make([]match, 0, len(rows))
 	for index, row := range rows {
-		matched, longest := localizationOutlineRowTermMatch(row.Name, terms)
+		matched, longest := localizationOutlineRowTermMatchExpanded(row.Name, wanted)
 		if matched == 0 {
 			continue
 		}
@@ -339,28 +448,68 @@ func localizationOutlinePriority(rows []localizationOutlineRow, terms map[string
 // name carries, over the same camel/snake tokenization and the same root form
 // the task's own terms were built with.
 func localizationOutlineRowTermMatch(name string, terms map[string]struct{}) (matched, longest int) {
-	if len(terms) == 0 {
+	return localizationOutlineRowTermMatchExpanded(name, localizationOutlineTerms(terms))
+}
+
+func localizationOutlineRowTermMatchExpanded(name string, wanted map[string]struct{}) (matched, longest int) {
+	if len(wanted) == 0 {
 		return 0, 0
 	}
-	seen := make(map[string]struct{}, len(terms))
+	seen := make(map[string]struct{}, len(wanted))
 	for _, raw := range rerank.Tokenize(name) {
-		token := exploreTerminalTermRoot(strings.ToLower(strings.TrimSpace(raw)))
-		if token == "" {
+		forms := localizationOutlineTermForms(strings.ToLower(strings.TrimSpace(raw)))
+		matchedForm := ""
+		for _, form := range forms {
+			if _, ok := wanted[form]; ok {
+				matchedForm = form
+				break
+			}
+		}
+		if matchedForm == "" {
 			continue
 		}
-		if _, ok := terms[token]; !ok {
+		if _, duplicate := seen[matchedForm]; duplicate {
 			continue
 		}
-		if _, duplicate := seen[token]; duplicate {
-			continue
-		}
-		seen[token] = struct{}{}
+		seen[matchedForm] = struct{}{}
 		matched++
-		if len(token) > longest {
-			longest = len(token)
+		if len(matchedForm) > longest {
+			longest = len(matchedForm)
 		}
 	}
 	return matched, longest
+}
+
+func localizationOutlineTerms(terms map[string]struct{}) map[string]struct{} {
+	forms := make(map[string]struct{}, len(terms)*2)
+	for term := range terms {
+		for _, form := range localizationOutlineTermForms(term) {
+			forms[form] = struct{}{}
+		}
+	}
+	return forms
+}
+
+// localizationOutlineTermForms is deliberately outline-local: conservative
+// inflection alternatives improve declaration indexing without widening answer
+// readiness or the global semantic ranker. The exact spelling always remains.
+func localizationOutlineTermForms(term string) []string {
+	term = strings.ToLower(strings.TrimSpace(term))
+	if term == "" {
+		return nil
+	}
+	forms := []string{term}
+	for _, suffix := range []string{"ing", "ed", "er", "s"} {
+		if !strings.HasSuffix(term, suffix) {
+			continue
+		}
+		stem := strings.TrimSuffix(term, suffix)
+		if len([]rune(stem)) >= 4 && stem != term {
+			forms = append(forms, stem)
+		}
+		break
+	}
+	return forms
 }
 
 // elide re-projects the retained rows at rowCap. The declarations the task names
@@ -370,12 +519,17 @@ func (o *localizationFileOutline) elide(rowCap int) {
 	if o == nil {
 		return
 	}
+	if rowCap == localizationOutlineCompleteRows {
+		o.Rows = o.all
+		o.Elided = max(o.Declared-len(o.Rows), 0)
+		return
+	}
 	if rowCap < 0 {
 		rowCap = 0
 	}
 	if len(o.all) <= rowCap {
 		o.Rows = o.all
-		o.Elided = 0
+		o.Elided = max(o.Declared-len(o.Rows), 0)
 		return
 	}
 	// The task's own matches lead, but never take the whole index: a task whose
@@ -410,7 +564,7 @@ func (o *localizationFileOutline) elide(rowCap int) {
 		}
 	}
 	o.Rows = rows
-	o.Elided = len(o.all) - len(rows)
+	o.Elided = max(o.Declared-len(rows), 0)
 }
 
 // clone detaches an outline from the provider's cache. One request can pack
@@ -438,47 +592,85 @@ func (p *localizationPageOutline) clone() *localizationPageOutline {
 	return copied
 }
 
-// relieve gives back one increment of outline payload. An index that no longer
-// fits shrinks toward its floor before it is dropped: a shorter index still
-// names the file and still carries the declarations the task asked about, where
-// no index at all sends the caller back to search for what it is already
-// looking at. Depth goes before breadth — the deepest index gives back first,
-// and only once every file is at its floor does a file go, shallowest first.
+// dropUnprotectedFloorFile gives back one rank-two-or-later outline after all
+// of its depth has already yielded. Envelope packing uses this before stripping
+// independently useful evidence detail; the protected leading pair is untouched.
+func (p *localizationPageOutline) dropUnprotectedFloorFile() bool {
+	if p == nil {
+		return false
+	}
+	for index := len(p.Others) - 1; index >= 0; index-- {
+		outline := p.Others[index]
+		if outline == nil || p.otherRank(index) < localizationOutlineProtectedFileCount ||
+			len(outline.Rows) > localizationOutlineFloorRows {
+			continue
+		}
+		p.Others = append(p.Others[:index], p.Others[index+1:]...)
+		return true
+	}
+	return false
+}
+
+// relieve gives back one increment of outline payload. Every rank-two-or-later
+// file shrinks and then drops before either of the top two files changes. Under
+// further pressure rank one yields before rank zero. This makes completeness a
+// real preference while leaving the envelope's hard byte bound authoritative.
 func (p *localizationPageOutline) relieve() {
 	if p == nil {
 		return
 	}
-	floor := p.leadingFloor()
-	deepest, rows := (*localizationFileOutline)(nil), floor
-	if p.Leading != nil && len(p.Leading.Rows) > rows {
-		deepest, rows = p.Leading, len(p.Leading.Rows)
+	// Lower-ranked depth yields from the tail inward.
+	for index := len(p.Others) - 1; index >= 0; index-- {
+		outline := p.Others[index]
+		if outline == nil || p.otherRank(index) < localizationOutlineProtectedFileCount ||
+			len(outline.Rows) <= localizationOutlineFloorRows {
+			continue
+		}
+		outline.elide(localizationOutlineNextRowCap(len(outline.Rows)))
+		return
 	}
-	for _, other := range p.Others {
-		if other != nil && len(other.Rows) >= rows && len(other.Rows) > localizationOutlineFloorRows {
-			deepest, rows, floor = other, len(other.Rows), localizationOutlineFloorRows
+	// Once all lower-ranked files reached their floor, give back their breadth
+	// before touching the protected pair.
+	for index := len(p.Others) - 1; index >= 0; index-- {
+		outline := p.Others[index]
+		if outline == nil || p.otherRank(index) < localizationOutlineProtectedFileCount {
+			continue
+		}
+		p.Others = append(p.Others[:index], p.Others[index+1:]...)
+		return
+	}
+	// The second-ranked file is the next expendable block.
+	for index := len(p.Others) - 1; index >= 0; index-- {
+		outline := p.Others[index]
+		if outline == nil || p.otherRank(index) != 1 {
+			continue
+		}
+		if len(outline.Rows) > localizationOutlineFloorRows {
+			outline.elide(localizationOutlineNextRowCap(len(outline.Rows)))
+		} else {
+			p.Others = append(p.Others[:index], p.Others[index+1:]...)
+		}
+		return
+	}
+	if p.Leading != nil {
+		if len(p.Leading.Rows) > localizationOutlineFloorRows {
+			p.Leading.elide(localizationOutlineNextRowCap(len(p.Leading.Rows)))
+		} else {
+			p.Leading = nil
 		}
 	}
-	if deepest != nil {
-		deepest.elide(max(localizationOutlineNextRowCap(rows), floor))
-		return
-	}
-	if last := len(p.Others); last > 0 {
-		p.Others = p.Others[:last-1]
-		return
-	}
-	p.Leading = nil
 }
 
-// leadingFloor is where the leading file's index stops shrinking. While the page
-// still indexes further files, they are what a tight page gives back — measured,
-// spending the leading file's depth on a neighbour's first twelve rows loses the
-// answer more often than it finds one. Once no further file is left, the leading
-// index may shrink to the same floor as any other.
-func (p *localizationPageOutline) leadingFloor() int {
-	if len(p.Others) > 0 {
-		return localizationOutlineSecondFileRowCap
+// otherRank preserves compatibility with directly-constructed outline blocks:
+// an unset rank on an Others entry means its positional page rank.
+func (p *localizationPageOutline) otherRank(index int) int {
+	if p == nil || index < 0 || index >= len(p.Others) || p.Others[index] == nil {
+		return index + 1
 	}
-	return localizationOutlineFloorRows
+	if rank := p.Others[index].rank; rank > 0 {
+		return rank
+	}
+	return index + 1
 }
 
 // empty reports a block with nothing left to give.
@@ -492,7 +684,7 @@ func (p *localizationPageOutline) atFloor() bool {
 	if p == nil {
 		return true
 	}
-	if p.Leading != nil && len(p.Leading.Rows) > p.leadingFloor() {
+	if p.Leading != nil && len(p.Leading.Rows) > localizationOutlineFloorRows {
 		return false
 	}
 	for _, other := range p.Others {

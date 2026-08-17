@@ -24,13 +24,14 @@ const postTaskScopePhrase = "uncommitted (staged + unstaged) changes to tracked 
 // Stop hook asked the agent to continue) — we must skip in that case to
 // avoid recursion.
 type PostTaskInput struct {
-	HookEventName  string `json:"hook_event_name"`
-	SessionID      string `json:"session_id"`
-	PromptID       string `json:"prompt_id"`
-	AgentID        string `json:"agent_id"`
-	TranscriptPath string `json:"transcript_path"`
-	CWD            string `json:"cwd"`
-	StopHookActive bool   `json:"stop_hook_active"`
+	HookEventName        string `json:"hook_event_name"`
+	SessionID            string `json:"session_id"`
+	PromptID             string `json:"prompt_id"`
+	AgentID              string `json:"agent_id"`
+	TranscriptPath       string `json:"transcript_path"`
+	CWD                  string `json:"cwd"`
+	LastAssistantMessage string `json:"last_assistant_message"`
+	StopHookActive       bool   `json:"stop_hook_active"`
 }
 
 // runPostTask handles a Stop hook invocation with the raw stdin bytes.
@@ -56,6 +57,15 @@ func runPostTask(data []byte, port int) {
 	}()
 	// Prevent recursion — if we're already rerunning a Stop hook, don't fire again.
 	if input.StopHookActive {
+		return
+	}
+	if claimCheck := localizationClaimCheck(input); claimCheck != "" {
+		output := HookOutput{Decision: "block", Reason: claimCheck}
+		out, err := json.Marshal(output)
+		if err == nil {
+			emitted = true
+			fmt.Print(string(out))
+		}
 		return
 	}
 

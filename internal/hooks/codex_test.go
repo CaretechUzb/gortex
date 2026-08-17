@@ -68,6 +68,110 @@ func TestRunCodexIgnoresNonBash(t *testing.T) {
 	}
 }
 
+func TestRunCodexPreToolUseTerminalGateCoversHookObservableLocalTools(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	identity := beginTestLocalizationTurn(t, "codex-terminal-families", "prompt-1", t.TempDir())
+	const finalResponse = "Use the retained localization evidence."
+	if !markLocalizationTerminalWithStrength(identity, localizationTerminalContractV2, false, finalResponse) {
+		t.Fatal("mark enforceable terminal localization")
+	}
+
+	tests := []struct {
+		name string
+		tool string
+		mode CodexMode
+	}{
+		{name: "apply patch mutation", tool: "apply_patch"},
+		{name: "local plan update", tool: "update_plan"},
+		{name: "subagent", tool: "spawn_agent"},
+		{name: "image read", tool: "view_image"},
+		{name: "bash deny posture", tool: "Bash", mode: CodexModeDeny},
+		{name: "bash rewrite posture", tool: "Bash", mode: CodexModeRewrite},
+		{name: "gortex navigation", tool: gortexMCPToolPrefix + "search"},
+		{name: "gortex change contract", tool: gortexMCPToolPrefix + "change"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := preToolPayload(t, tt.tool, "tool-1", identity, map[string]any{})
+			out := captureHookStdout(t, func() { runCodex(data, 0, tt.mode) })
+			hso := decodeHookOutput(t, out).HookSpecificOutput
+			if hso == nil || hso.PermissionDecision != "deny" {
+				t.Fatalf("terminal %s output=%q want deny", tt.tool, out)
+			}
+			if !strings.HasPrefix(hso.PermissionDecisionReason, localizationTerminalDenyReason) {
+				t.Fatalf("terminal reason=%q want prefix %q", hso.PermissionDecisionReason, localizationTerminalDenyReason)
+			}
+			if !strings.Contains(hso.PermissionDecisionReason, finalResponse) {
+				t.Fatalf("terminal reason omitted retained response: %q", hso.PermissionDecisionReason)
+			}
+		})
+	}
+}
+
+func TestRunCodexPreToolUseTerminalGateAcceptsAnyToolInputShape(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	identity := beginTestLocalizationTurn(t, "codex-terminal-input-shapes", "prompt-1", t.TempDir())
+	if !markLocalizationTerminalWithStrength(identity, localizationTerminalContractV2, false, "Use retained evidence.") {
+		t.Fatal("mark enforceable terminal localization")
+	}
+
+	for _, tt := range []struct {
+		name  string
+		input any
+	}{
+		{name: "null", input: nil},
+		{name: "scalar", input: "freeform input"},
+		{name: "array", input: []any{"one", 2}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := mustJSON(t, map[string]any{
+				"hook_event_name": "PreToolUse",
+				"tool_name":       "custom_local_tool",
+				"tool_input":      tt.input,
+				"session_id":      identity.SessionID,
+				"prompt_id":       identity.PromptID,
+				"agent_id":        identity.AgentID,
+				"cwd":             identity.CWD,
+			})
+			out := captureHookStdout(t, func() { runCodex(data, 0) })
+			hso := decodeHookOutput(t, out).HookSpecificOutput
+			if hso == nil || hso.PermissionDecision != "deny" {
+				t.Fatalf("terminal input %T output=%q want deny", tt.input, out)
+			}
+		})
+	}
+}
+
+func TestRunCodexPreToolUseAdvisoryTerminalPreservesContractOperations(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	identity := beginTestLocalizationTurn(t, "codex-advisory-contract", "prompt-1", t.TempDir())
+	if !markLocalizationTerminalWithStrength(identity, localizationTerminalContractV2, true, "Advisory localization.") {
+		t.Fatal("mark advisory terminal localization")
+	}
+
+	for _, tool := range []string{gortexMCPToolPrefix + "change", gortexCodexMCPToolPrefix + "change"} {
+		t.Run(tool, func(t *testing.T) {
+			data := preToolPayload(t, tool, "tool-1", identity, map[string]any{"operation": "impact"})
+			if out := captureHookStdout(t, func() { runCodex(data, 0) }); out != "" {
+				t.Fatalf("advisory terminal blocked non-navigation contract operation %s: %q", tool, out)
+			}
+		})
+	}
+}
+
+func TestRunCodexPreToolUseWithoutTerminalPreservesBuiltins(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	identity := beginTestLocalizationTurn(t, "codex-no-terminal", "prompt-1", t.TempDir())
+	for _, tool := range []string{"apply_patch", "update_plan", "view_image", gortexMCPToolPrefix + "change"} {
+		t.Run(tool, func(t *testing.T) {
+			data := preToolPayload(t, tool, "tool-1", identity, map[string]any{})
+			if out := captureHookStdout(t, func() { runCodex(data, 0) }); out != "" {
+				t.Fatalf("non-terminal operation %s emitted %q", tool, out)
+			}
+		})
+	}
+}
+
 func TestRunCodexPreToolUseBashSoftAdditionalContext(t *testing.T) {
 	oldProbe := grepProbe
 	grepProbe = func(string, time.Duration) ([]grepSymbolHit, error) {

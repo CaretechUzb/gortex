@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/localizationauth"
 )
 
 func TestRunPostTask_RejectsWrongEvent(t *testing.T) {
@@ -421,6 +422,127 @@ func TestRunPostTask_OwnsAll_SkipsImpactCall(t *testing.T) {
 	}
 	if strings.Contains(out, "Also dirty") {
 		t.Errorf("nothing should be unattributed here:\n%s", out)
+	}
+}
+
+func claimCheckTestInput(t *testing.T, message string) PostTaskInput {
+	t.Helper()
+	primary := []string{"repo/a.go::Writer.write", "repo/b.go::Reader.read", "repo/c.go::Store.load", "repo/d.go::Cache.get", "repo/e.go::Index.find"}
+	evidence := append(append([]string(nil), primary...), "repo/f.go::Helper.close")
+	return claimCheckTestInputWithEvidence(t, message, primary, evidence)
+}
+
+func claimCheckTestInputWithEvidence(t *testing.T, message string, primary, evidence []string) PostTaskInput {
+	t.Helper()
+	configureLocalizationTerminalTestHome(t)
+	identity := beginTestLocalizationTurn(t, t.Name(), "prompt", t.TempDir())
+	if !markLocalizationTerminalReceipt(identity, localizationauth.Receipt{
+		FinalResponse: "answer", PrimaryIDs: primary, EvidenceIDs: evidence,
+		ContractVersion: localizationTerminalContractV2, Enforceable: true,
+	}) {
+		t.Fatal("terminal marker was not written")
+	}
+	return PostTaskInput{
+		HookEventName: "Stop", SessionID: identity.SessionID, PromptID: identity.PromptID,
+		AgentID: identity.AgentID, CWD: identity.CWD, LastAssistantMessage: message,
+	}
+}
+
+func TestLocalizationClaimCheckAcceptsAuthenticatedClaim(t *testing.T) {
+	input := claimCheckTestInput(t, "SYMBOLS:\n- write")
+	if got := localizationClaimCheck(input); got != "" {
+		t.Fatalf("matching evidence was challenged: %q", got)
+	}
+	input.LastAssistantMessage = "The implementation is in repo/a.go."
+	if got := localizationClaimCheck(input); got != "" {
+		t.Fatalf("a file path in prose was treated as a symbol claim: %q", got)
+	}
+}
+
+func TestLocalizationClaimCheckNormalizesCommonMethodNotation(t *testing.T) {
+	input := claimCheckTestInput(t, "SYMBOLS:\n- Writer.write()")
+	if got := localizationClaimCheck(input); got != "" {
+		t.Fatalf("qualified method call was challenged: %q", got)
+	}
+	input.LastAssistantMessage = "SYMBOLS:\n- (*Writer).write"
+	if got := localizationClaimCheck(input); got != "" {
+		t.Fatalf("pointer-receiver method was challenged: %q", got)
+	}
+}
+
+func TestLocalizationClaimCheckRequiresEveryMaterialClaim(t *testing.T) {
+	input := claimCheckTestInput(t, "SYMBOLS:\n- Writer.write\n- Fabricated.flush")
+	if got := localizationClaimCheck(input); got == "" {
+		t.Fatal("a fabricated claim beside an authenticated claim was not challenged")
+	}
+}
+
+func TestLocalizationClaimCheckAcceptsExplicitNoneFitsOnly(t *testing.T) {
+	input := claimCheckTestInput(t, "SYMBOLS:\n- none fits")
+	if got := localizationClaimCheck(input); got != "" {
+		t.Fatalf("explicit none-fits response was challenged: %q", got)
+	}
+	input.LastAssistantMessage = "SYMBOLS:\n- none fits\n- flush"
+	if got := localizationClaimCheck(input); got == "" {
+		t.Fatal("an unsupported claim hidden beside none-fits was not challenged")
+	}
+}
+
+func TestLocalizationClaimCheckChallengesWrongBareSymbolWithinBound(t *testing.T) {
+	input := claimCheckTestInput(t, "SYMBOLS:\n- flush")
+	got := localizationClaimCheck(input)
+	if got == "" {
+		t.Fatal("wrong structured bare symbol was not challenged")
+	}
+	if len(got) > localizationClaimCheckMaxChars {
+		t.Fatalf("claim check is %d chars, max %d", len(got), localizationClaimCheckMaxChars)
+	}
+	for _, want := range []string{"repo/a.go::Writer.write", "repo/e.go::Index.find", "explicitly confirm", "Do not retrieve"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("claim check missing %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "repo/f.go::Helper.close") {
+		t.Fatalf("claim check exposed non-PRIMARY evidence: %s", got)
+	}
+}
+
+func TestLocalizationClaimCheckFailsOpenWithoutMessageAuthorityOrOnRetry(t *testing.T) {
+	input := claimCheckTestInput(t, "SYMBOLS:\n- wrong")
+	input.StopHookActive = true
+	if got := localizationClaimCheck(input); got != "" {
+		t.Fatalf("retry was challenged twice: %q", got)
+	}
+	input.StopHookActive = false
+	input.LastAssistantMessage = ""
+	if got := localizationClaimCheck(input); got != "" {
+		t.Fatalf("missing final message did not fail open: %q", got)
+	}
+	input.LastAssistantMessage = "SYMBOLS:\n- wrong"
+	input.SessionID = "unsupported-host-without-authority"
+	if got := localizationClaimCheck(input); got != "" {
+		t.Fatalf("missing terminal authority did not fail open: %q", got)
+	}
+}
+
+func TestRunPostTaskClaimCheckBlocksOnceWithoutDaemonRetrieval(t *testing.T) {
+	input := claimCheckTestInput(t, "SYMBOLS:\n- flush")
+	data, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() { runPostTask(data, 0) })
+	var payload HookOutput
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("decode claim-check output %q: %v", out, err)
+	}
+	if payload.Decision != "block" || !strings.Contains(payload.Reason, "claim_check") {
+		t.Fatalf("Stop was not blocked with a claim check: %#v", payload)
+	}
+	input.StopHookActive = true
+	data, _ = json.Marshal(input)
+	if retry := captureStdout(t, func() { runPostTask(data, 0) }); retry != "" {
+		t.Fatalf("second Stop response was not accepted: %q", retry)
 	}
 }
 

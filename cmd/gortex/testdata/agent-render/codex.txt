@@ -5,7 +5,7 @@ direct_only_tool_namespaces = ['mcp__gortex', 'gortex']
 
 [hooks]
 [[hooks.PostToolUse]]
-matcher = '^(Bash|apply_patch)$'
+matcher = '^(Bash|apply_patch|(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze))$'
 
 [[hooks.PostToolUse.hooks]]
 command = 'gortex hook --agent=codex --mode=enrich'
@@ -14,20 +14,11 @@ timeout = 5
 type = 'command'
 
 [[hooks.PreToolUse]]
-matcher = '^Bash$'
+matcher = '.*'
 
 [[hooks.PreToolUse.hooks]]
 command = 'gortex hook --agent=codex --mode=enrich'
-statusMessage = 'Loading Gortex Bash guidance...'
-timeout = 5
-type = 'command'
-
-[[hooks.PreToolUse]]
-matcher = '^mcp__gortex__read$'
-
-[[hooks.PreToolUse.hooks]]
-command = 'gortex hook --agent=codex --mode=enrich'
-statusMessage = 'Loading Gortex read guidance...'
+statusMessage = 'Loading Gortex tool guidance...'
 timeout = 5
 type = 'command'
 
@@ -37,6 +28,13 @@ matcher = 'startup|resume|clear|compact'
 [[hooks.SessionStart.hooks]]
 command = 'gortex hook --agent=codex --mode=enrich'
 statusMessage = 'Loading Gortex graph orientation...'
+timeout = 5
+type = 'command'
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+command = 'gortex hook --agent=codex --mode=enrich'
+statusMessage = 'Checking Gortex evidence authority...'
 timeout = 5
 type = 'command'
 
@@ -607,7 +605,7 @@ direct_only_tool_namespaces = ['mcp__gortex', 'gortex']
 
 [hooks]
 [[hooks.PostToolUse]]
-matcher = '^(Bash|apply_patch)$'
+matcher = '^(Bash|apply_patch|(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze))$'
 
 [[hooks.PostToolUse.hooks]]
 command = 'gortex hook --agent=codex --mode=enrich'
@@ -616,20 +614,11 @@ timeout = 5
 type = 'command'
 
 [[hooks.PreToolUse]]
-matcher = '^Bash$'
+matcher = '.*'
 
 [[hooks.PreToolUse.hooks]]
 command = 'gortex hook --agent=codex --mode=enrich'
-statusMessage = 'Loading Gortex Bash guidance...'
-timeout = 5
-type = 'command'
-
-[[hooks.PreToolUse]]
-matcher = '^mcp__gortex__read$'
-
-[[hooks.PreToolUse.hooks]]
-command = 'gortex hook --agent=codex --mode=enrich'
-statusMessage = 'Loading Gortex read guidance...'
+statusMessage = 'Loading Gortex tool guidance...'
 timeout = 5
 type = 'command'
 
@@ -639,6 +628,13 @@ matcher = 'startup|resume|clear|compact'
 [[hooks.SessionStart.hooks]]
 command = 'gortex hook --agent=codex --mode=enrich'
 statusMessage = 'Loading Gortex graph orientation...'
+timeout = 5
+type = 'command'
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+command = 'gortex hook --agent=codex --mode=enrich'
+statusMessage = 'Checking Gortex evidence authority...'
 timeout = 5
 type = 'command'
 

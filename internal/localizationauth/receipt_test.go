@@ -3,6 +3,7 @@ package localizationauth
 import (
 	"encoding/json"
 	"os"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -51,7 +52,7 @@ func TestReceiptRoundTripPreservesFinalResponseVerbatim(t *testing.T) {
 	if !ok {
 		t.Fatal("Consume failed")
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("receipt mismatch\n got: %#v\nwant: %#v", got, want)
 	}
 	if _, ok := Consume(token); ok {

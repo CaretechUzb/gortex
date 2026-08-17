@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,8 +82,17 @@ type exploreDivergentDefaultProjection struct {
 // cannot depend on machine load — see the note on
 // exploreDefaultOwnerFallbackSLO. Left variadic so the fifteen call sites that
 // never reach the fallback stay untouched.
-func promoteExploreDivergentDefaultOwner(task string, targets []exploreTarget, store graph.Store, maxSymbols int, readSource func(*graph.Node) string, fallbackSLO ...time.Duration) []exploreTarget {
-	if store == nil || readSource == nil || len(targets) == 0 || !exploreQueryIsConceptTask(task) {
+func promoteExploreDivergentDefaultOwner(
+	ctx context.Context,
+	task string,
+	targets []exploreTarget,
+	reader graph.Reader,
+	scope graph.LocalizationNodeScope,
+	maxSymbols int,
+	readSource func(*graph.Node) string,
+	fallbackSLO ...time.Duration,
+) []exploreTarget {
+	if reader == nil || readSource == nil || len(targets) == 0 || !exploreQueryIsConceptTask(task) {
 		return targets
 	}
 	taskTerms := exploreTerminalTerms(task)
@@ -96,12 +106,14 @@ func promoteExploreDivergentDefaultOwner(task string, targets []exploreTarget, s
 			slo = fallbackSLO[0]
 		}
 		deadline := time.Now().Add(slo)
-		bases, ok = exploreDivergentDefaultBasesFromRankedCallables(taskTerms, targets, store, deadline)
+		bases, ok = exploreDivergentDefaultBasesFromRankedCallables(
+			ctx, taskTerms, targets, reader, scope, deadline,
+		)
 		if !ok || len(bases) == 0 {
 			return targets
 		}
 	}
-	projection, ok := projectExploreDivergentDefaultOwners(store, bases)
+	projection, ok := projectExploreDivergentDefaultOwners(ctx, reader, bases)
 	if !ok {
 		return targets
 	}
@@ -148,10 +160,14 @@ func placeExploreDivergentDefaultOwner(task string, targets []exploreTarget, mat
 		maxSymbols = len(targets)
 	}
 	missing := 0
-	if exploreTargetIndex(targets, match.constructor.ID) < 0 && exploreTargetIndex(targets, match.baseCtor.ID) < 0 {
+	constructorIndex := exploreTargetIndex(targets, match.constructor.ID)
+	baseConstructorIndex := exploreTargetIndex(targets, match.baseCtor.ID)
+	if constructorIndex < 0 && (baseConstructorIndex < 0 || targets[baseConstructorIndex].sourceRange) {
 		missing++
 	}
-	if exploreTargetIndex(targets, match.owner.ID) < 0 && exploreTargetIndex(targets, match.baseOwner.ID) < 0 {
+	ownerIndex := exploreTargetIndex(targets, match.owner.ID)
+	baseOwnerIndex := exploreTargetIndex(targets, match.baseOwner.ID)
+	if ownerIndex < 0 && (baseOwnerIndex < 0 || targets[baseOwnerIndex].sourceRange) {
 		missing++
 	}
 	overflow := len(targets) + missing - maxSymbols
@@ -181,8 +197,10 @@ func placeExploreDivergentDefaultOwner(task string, targets []exploreTarget, mat
 			return
 		}
 		if index := exploreTargetIndex(replaced, baseID); index >= 0 {
-			replaced[index] = candidate
-			return
+			if !replaced[index].sourceRange {
+				replaced[index] = candidate
+				return
+			}
 		}
 		replaced = append(replaced, candidate)
 	}
@@ -201,7 +219,7 @@ func exploreDivergentDefaultAdmissionProtected(task string, target exploreTarget
 		return true
 	}
 	return target.divergentDefaultOwner || target.divergentDefaultType || target.conceptImplementation ||
-		target.exactContent || target.exactContentAmbiguous || target.sourceLiteral ||
+		target.sourceRange || target.exactContent || target.exactContentAmbiguous || target.sourceLiteral ||
 		exploreLocalizationExplicitAnchor(task, target.node)
 }
 
@@ -512,16 +530,32 @@ type exploreRankedCallableOwner struct {
 // exploreDivergentDefaultBasesFromRankedCallables is the strictly bounded
 // recovery path for a common ranking gap: the consuming method is present but
 // its constructor/type pair is not. It follows only the callable's exact
-// enclosing owner, hydrates those owners in one batch, and reads only their
-// indexed file-node sets in one batch. It never scans a repository or source
-// tree, and ambiguous/oversized projections are rejected.
-func exploreDivergentDefaultBasesFromRankedCallables(taskTerms map[string]struct{}, targets []exploreTarget, store graph.Store, deadline time.Time) ([]exploreDivergentDefaultBase, bool) {
-	if store == nil || len(taskTerms) == 0 || time.Now().After(deadline) {
+// enclosing owner, hydrates those owners in one batch, and reads each distinct
+// owner file through a capped metadata-free projection. It never scans a
+// repository or source tree, and ambiguous/oversized projections are rejected.
+func exploreDivergentDefaultBasesFromRankedCallables(
+	ctx context.Context,
+	taskTerms map[string]struct{},
+	targets []exploreTarget,
+	reader graph.Reader,
+	scope graph.LocalizationNodeScope,
+	deadline time.Time,
+) ([]exploreDivergentDefaultBase, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if reader == nil || len(taskTerms) == 0 || ctx.Err() != nil || time.Now().After(deadline) {
 		return nil, false
 	}
+	readCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
 	owners := make([]exploreRankedCallableOwner, 0, exploreDefaultOwnerFileCap)
 	seenOwners := make(map[string]struct{}, exploreDefaultOwnerFileCap)
 	for _, target := range targets {
+		if readCtx.Err() != nil {
+			return nil, false
+		}
 		callable := target.node
 		if callable == nil || (callable.Kind != graph.KindMethod && callable.Kind != graph.KindFunction) ||
 			exploreConstructorNode(callable) || exploreDraftIsTestNode(callable) {
@@ -553,8 +587,8 @@ func exploreDivergentDefaultBasesFromRankedCallables(taskTerms map[string]struct
 	for _, candidate := range owners {
 		ownerIDs = append(ownerIDs, candidate.ownerID)
 	}
-	hydrated := store.GetNodesByIDs(ownerIDs)
-	if time.Now().After(deadline) || len(hydrated) != len(ownerIDs) {
+	hydrated, complete := exploreNodesByIDsBounded(readCtx, reader, ownerIDs, exploreDefaultOwnerFileCap)
+	if !complete {
 		return nil, false
 	}
 	filePaths := make([]string, 0, len(owners))
@@ -576,27 +610,67 @@ func exploreDivergentDefaultBasesFromRankedCallables(taskTerms map[string]struct
 		return nil, len(coherent) == 0
 	}
 
-	fileNodes := store.GetFileNodesByPaths(filePaths)
-	if time.Now().After(deadline) {
-		return nil, false
-	}
-	total := 0
+	budget := localizationFileBudgetFor(ctx)
+	fileCandidates := make(map[string][]string, len(filePaths))
+	constructorIDs := make([]string, 0, exploreDefaultOwnerTotalCap)
+	seenConstructors := make(map[string]struct{}, exploreDefaultOwnerTotalCap)
+	totalRows := 0
 	for _, path := range filePaths {
-		nodes := fileNodes[path]
-		if len(nodes) > exploreDefaultOwnerFileNodeCap {
+		if readCtx.Err() != nil {
 			return nil, false
 		}
-		total += len(nodes)
-		if total > exploreDefaultOwnerTotalCap {
+		remaining := exploreDefaultOwnerTotalCap - totalRows
+		pageLimit := exploreDefaultOwnerFileNodeCap
+		if remaining < pageLimit {
+			pageLimit = remaining
+		}
+		if pageLimit <= 0 {
+			// A one-row sentinel distinguishes an empty remaining file from a
+			// total-cap overflow without opening an unbounded scan.
+			pageLimit = 1
+		}
+		page, complete := boundedLocalizationFileNodes(
+			readCtx, reader, budget, path, graph.LocalizationNodeScope{}, pageLimit,
+		)
+		if !complete {
 			return nil, false
+		}
+		rows := page.Total
+		if len(page.Nodes) > rows {
+			rows = len(page.Nodes)
+		}
+		if rows > exploreDefaultOwnerFileNodeCap || totalRows+rows > exploreDefaultOwnerTotalCap {
+			return nil, false
+		}
+		totalRows += rows
+		for _, summary := range page.Nodes {
+			if !exploreConstructorNode(summary) || summary.ID == "" {
+				continue
+			}
+			if _, duplicate := seenConstructors[summary.ID]; duplicate {
+				continue
+			}
+			seenConstructors[summary.ID] = struct{}{}
+			constructorIDs = append(constructorIDs, summary.ID)
+			fileCandidates[path] = append(fileCandidates[path], summary.ID)
 		}
 	}
 
+	constructors, complete := exploreNodesByIDsBounded(
+		readCtx, reader, constructorIDs, exploreDefaultOwnerTotalCap,
+	)
+	if !complete {
+		return nil, false
+	}
 	bases := make([]exploreDivergentDefaultBase, 0, len(coherent))
 	for _, candidate := range coherent {
+		if !scope.Allows(candidate.owner) {
+			continue
+		}
 		var viable []exploreDivergentDefaultBase
-		for _, node := range fileNodes[candidate.owner.FilePath] {
-			if !exploreConstructorNode(node) || exploreDraftIsTestNode(node) {
+		for _, id := range fileCandidates[candidate.owner.FilePath] {
+			node := constructors[id]
+			if !exploreConstructorNode(node) || exploreDraftIsTestNode(node) || !scope.Allows(node) {
 				continue
 			}
 			ownerID, _ := graph.EnclosingFromID(node.ID, node.Kind)
@@ -629,7 +703,7 @@ func exploreDivergentDefaultBasesFromRankedCallables(taskTerms map[string]struct
 			}
 		}
 	}
-	return bases, true
+	return bases, readCtx.Err() == nil
 }
 
 func exploreRankedCallableOwnerCoherent(callable, owner *graph.Node) bool {
@@ -660,46 +734,59 @@ func exploreNodesShareExactScope(left, right *graph.Node) bool {
 // preserves the relationship kind and full node metadata needed by this proof.
 // Any oversized or partially hydrated projection is rejected rather than
 // interpreted as evidence that no competing child exists.
-func projectExploreDivergentDefaultOwners(store graph.Store, bases []exploreDivergentDefaultBase) (exploreDivergentDefaultProjection, bool) {
-	if store == nil || len(bases) == 0 || len(bases) > exploreDefaultOwnerBaseCap {
+func projectExploreDivergentDefaultOwners(
+	ctx context.Context,
+	reader graph.Reader,
+	bases []exploreDivergentDefaultBase,
+) (exploreDivergentDefaultProjection, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if reader == nil || len(bases) == 0 || len(bases) > exploreDefaultOwnerBaseCap || ctx.Err() != nil {
 		return exploreDivergentDefaultProjection{}, false
 	}
-	seedIDs := make([]string, 0, len(bases)*2)
+	constructorIDs := make([]string, 0, len(bases))
+	ownerIDs := make([]string, 0, len(bases))
 	for _, base := range bases {
-		seedIDs = append(seedIDs, base.constructor.ID, base.owner.ID)
+		if base.constructor == nil || base.constructor.ID == "" || base.owner == nil || base.owner.ID == "" {
+			return exploreDivergentDefaultProjection{}, false
+		}
+		constructorIDs = append(constructorIDs, base.constructor.ID)
+		ownerIDs = append(ownerIDs, base.owner.ID)
 	}
-	incoming := store.GetInEdgesByNodeIDs(seedIDs)
+	callers, complete := exploreIncomingSourcesBounded(
+		ctx, reader, constructorIDs, graph.EdgeCalls, exploreDefaultOwnerEdgeCap,
+	)
+	if !complete {
+		return exploreDivergentDefaultProjection{}, false
+	}
+	extenders, complete := exploreIncomingSourcesBounded(
+		ctx, reader, ownerIDs, graph.EdgeExtends, exploreDefaultOwnerEdgeCap,
+	)
+	if !complete {
+		return exploreDivergentDefaultProjection{}, false
+	}
 	projection := exploreDivergentDefaultProjection{
 		callers:   make(map[string][]string, len(bases)),
 		extenders: make(map[string][]string, len(bases)),
 	}
-	endpointIDs := make(map[string]struct{})
-	appendEndpoint := func(targetID string, edge *graph.Edge, kind graph.EdgeKind, destinations map[string][]string) bool {
-		if edge == nil || edge.Kind != kind || edge.To != targetID || edge.From == "" {
-			return true
-		}
-		for _, existing := range destinations[targetID] {
-			if existing == edge.From {
-				return true
-			}
-		}
-		destinations[targetID] = append(destinations[targetID], edge.From)
-		if len(destinations[targetID]) > exploreDefaultOwnerEdgeCap {
-			return false
-		}
-		endpointIDs[edge.From] = struct{}{}
-		return len(endpointIDs) <= exploreDefaultOwnerEndpointCap
-	}
+	endpointIDs := make(map[string]struct{}, exploreDefaultOwnerEndpointCap)
 	for _, base := range bases {
-		for _, edge := range incoming[base.constructor.ID] {
-			if !appendEndpoint(base.constructor.ID, edge, graph.EdgeCalls, projection.callers) {
-				return exploreDivergentDefaultProjection{}, false
-			}
+		constructorID := base.constructor.ID
+		ownerID := base.owner.ID
+		if callers.Truncated[constructorID] || extenders.Truncated[ownerID] {
+			return exploreDivergentDefaultProjection{}, false
 		}
-		for _, edge := range incoming[base.owner.ID] {
-			if !appendEndpoint(base.owner.ID, edge, graph.EdgeExtends, projection.extenders) {
-				return exploreDivergentDefaultProjection{}, false
-			}
+		projection.callers[constructorID] = append([]string(nil), callers.Sources[constructorID]...)
+		projection.extenders[ownerID] = append([]string(nil), extenders.Sources[ownerID]...)
+		for _, id := range projection.callers[constructorID] {
+			endpointIDs[id] = struct{}{}
+		}
+		for _, id := range projection.extenders[ownerID] {
+			endpointIDs[id] = struct{}{}
+		}
+		if len(endpointIDs) > exploreDefaultOwnerEndpointCap {
+			return exploreDivergentDefaultProjection{}, false
 		}
 	}
 	ids := make([]string, 0, len(endpointIDs))
@@ -707,8 +794,10 @@ func projectExploreDivergentDefaultOwners(store graph.Store, bases []exploreDive
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	projection.nodes = store.GetNodesByIDs(ids)
-	if len(projection.nodes) != len(ids) {
+	projection.nodes, complete = exploreNodesByIDsBounded(
+		ctx, reader, ids, exploreDefaultOwnerEndpointCap,
+	)
+	if !complete {
 		return exploreDivergentDefaultProjection{}, false
 	}
 	return projection, true

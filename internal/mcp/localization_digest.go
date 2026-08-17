@@ -3,7 +3,10 @@ package mcp
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 )
@@ -49,6 +52,10 @@ type localizationEvidenceDigest struct {
 	// session that ends holding nothing is the one outcome with no recovery, so
 	// every state carries a page — labelled for what it is.
 	provisionalResponse string
+	// primaryIDs is the exact bounded PRIMARY projection used to render the
+	// final response. It stays out of retained digest JSON to avoid counting the
+	// same identities twice, but is copied into authenticated host authority.
+	primaryIDs []string
 }
 
 type localizationDigestRow struct {
@@ -63,6 +70,17 @@ type localizationDigestRow struct {
 	Callers    []string `json:"callers,omitempty"`
 	Callees    []string `json:"callees,omitempty"`
 	Provenance string   `json:"provenance,omitempty"`
+
+	// Kept only in the request-local/session-retained projection. They separate
+	// truthful provenance from presentation authority without spending response
+	// bytes on internal policy state. primaryCohortOrder freezes the ranked
+	// PRIMARY projection before supplemental evidence is materialized.
+	literalPrimaryEligible   bool
+	taskCitedPrimaryEligible bool
+	primaryCohortOrder       int
+	supportingOnly           bool
+	leadingFileDepth         bool
+	authorizationPriority    bool
 }
 
 // newLocalizationEvidenceDigestForTask retains only concrete ranked evidence
@@ -77,39 +95,75 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 	priorityIDs := localizationDigestPriorityIDs(envelope.Completion, envelope.Evidence)
 
 	seen := make(map[string]struct{}, localizationReplayEvidenceLimit)
-	appendRows := func(priority bool) {
-		for _, row := range envelope.Evidence {
-			if len(digest.Evidence) >= localizationReplayEvidenceLimit {
-				return
-			}
-			if row.ID == "" || row.File == "" {
-				continue
-			}
-			_, prioritized := priorityIDs[row.ID]
-			if prioritized != priority {
-				continue
-			}
-			if _, exists := seen[row.ID]; exists {
-				continue
-			}
-			seen[row.ID] = struct{}{}
-			digest.Evidence = append(digest.Evidence, localizationDigestRow{
-				Rank:       row.Rank,
-				ID:         row.ID,
-				Name:       row.Name,
-				QualName:   row.QualName,
-				Kind:       row.Kind,
-				File:       row.File,
-				Line:       row.Line,
-				Signature:  row.Signature,
-				Callers:    append([]string(nil), row.Callers...),
-				Callees:    append([]string(nil), row.Callees...),
-				Provenance: row.Provenance,
-			})
+	appendRow := func(row localizationEvidence) bool {
+		if row.ID == "" || row.File == "" || len(digest.Evidence) >= localizationReplayEvidenceLimit {
+			return false
+		}
+		if _, exists := seen[row.ID]; exists {
+			return false
+		}
+		seen[row.ID] = struct{}{}
+		_, authorizationPriority := priorityIDs[row.ID]
+		digest.Evidence = append(digest.Evidence, localizationDigestRow{
+			Rank:       row.Rank,
+			ID:         row.ID,
+			Name:       row.Name,
+			QualName:   row.QualName,
+			Kind:       row.Kind,
+			File:       row.File,
+			Line:       row.Line,
+			Signature:  row.Signature,
+			Callers:    append([]string(nil), row.Callers...),
+			Callees:    append([]string(nil), row.Callees...),
+			Provenance: row.Provenance,
+
+			literalPrimaryEligible:   row.literalPrimaryEligible,
+			taskCitedPrimaryEligible: row.taskCitedPrimaryEligible,
+			primaryCohortOrder:       row.primaryCohortOrder,
+			supportingOnly:           row.supportingOnly || localizationSupportingOnlyProvenance(row.Provenance),
+			leadingFileDepth:         row.leadingFileDepth,
+			authorizationPriority:    authorizationPriority,
+		})
+		return true
+	}
+	// Proof/authorization identities and the one task-cited supplemental
+	// PRIMARY remain the immutable prefix. The latter is presentation evidence,
+	// not authorization, so it is reserved without entering priorityIDs.
+	for _, row := range envelope.Evidence {
+		_, prioritized := priorityIDs[row.ID]
+		if prioritized || localizationEvidenceTaskCitedPrimary(row) {
+			appendRow(row)
 		}
 	}
-	appendRows(true)
-	appendRows(false)
+	// Reserve tail capacity for real body-derived declarations before ordinary
+	// non-priority rows fill the replay window. Visible envelope rows are never
+	// removed; only the weakest retained digest tail yields.
+	bodyIDs := make(map[string]struct{}, localizationBodyMentionCap)
+	for _, row := range envelope.Evidence {
+		if row.Provenance == localizationProvenanceBodyMention && row.ID != "" {
+			if _, already := seen[row.ID]; !already {
+				bodyIDs[row.ID] = struct{}{}
+			}
+		}
+	}
+	bodyReserve := min(len(bodyIDs), localizationReplayEvidenceLimit-len(digest.Evidence))
+	ordinaryLimit := localizationReplayEvidenceLimit - bodyReserve
+	for _, row := range envelope.Evidence {
+		if len(digest.Evidence) >= ordinaryLimit {
+			break
+		}
+		if localizationSupportingOnlyProvenance(row.Provenance) {
+			continue
+		}
+		if _, prioritized := priorityIDs[row.ID]; !prioritized && !localizationEvidenceTaskCitedPrimary(row) {
+			appendRow(row)
+		}
+	}
+	for _, row := range envelope.Evidence {
+		if localizationSupportingOnlyProvenance(row.Provenance) {
+			appendRow(row)
+		}
+	}
 
 	for {
 		rebuildLocalizationDigestSkeleton(digest)
@@ -120,6 +174,10 @@ func newLocalizationEvidenceDigestForTask(task string, envelope localizationExpl
 		}
 		if len(digest.Evidence) == 0 {
 			return digest
+		}
+		if retained, removed := shedLocalizationDigestSupportingOnly(digest.Evidence); removed {
+			digest.Evidence = retained
+			continue
 		}
 		last := len(digest.Evidence) - 1
 		if shedLocalizationDigestOptionalFields(digest.Evidence) {
@@ -206,6 +264,32 @@ func mergeLocalizationDigestStrings(primary, supplementary []string) []string {
 	return merged
 }
 
+// localizationProvenanceMergeStrength orders provenance labels for merge
+// retention. A literal observation is a claim a later graph hop cannot
+// substitute: once a row has been seen as a content or source literal, a
+// re-observation through adjacency must not erase that mark.
+func localizationProvenanceMergeStrength(provenance string) int {
+	switch provenance {
+	case localizationProvenanceSourceLiteralCallee:
+		return 6
+	case localizationProvenanceContentLiteral:
+		return 5
+	case localizationProvenanceDivergentDefault,
+		localizationProvenanceImplementationTarget,
+		localizationProvenanceTypedAnchorProjection,
+		localizationProvenanceDivergentDefaultType,
+		localizationProvenancePermittedReadSource,
+		localizationProvenanceImplementationRoute:
+		return 4
+	case localizationProvenanceDirectAdjacency, "direct_caller", "direct_callee":
+		return 2
+	case "":
+		return 0
+	default:
+		return 3
+	}
+}
+
 // mergeLocalizationDigestRowEvidence preserves the first-ranked identity while
 // filling metadata and unioning bounded graph evidence from a later observation.
 // File disagreement is deliberately not repaired here: one ID cannot authorize
@@ -229,8 +313,20 @@ func mergeLocalizationDigestRowEvidence(primary, supplementary localizationDiges
 	if primary.Signature == "" {
 		primary.Signature = supplementary.Signature
 	}
-	if primary.Provenance == "" {
+	if localizationProvenanceMergeStrength(supplementary.Provenance) >
+		localizationProvenanceMergeStrength(primary.Provenance) {
 		primary.Provenance = supplementary.Provenance
+	}
+	primary.literalPrimaryEligible = primary.literalPrimaryEligible || supplementary.literalPrimaryEligible
+	primary.taskCitedPrimaryEligible = primary.taskCitedPrimaryEligible || supplementary.taskCitedPrimaryEligible
+	primary.authorizationPriority = primary.authorizationPriority || supplementary.authorizationPriority
+	// An identity that was independently ranked remains cohort-eligible when a
+	// later supplemental observation of the same row is merged into it.
+	primary.supportingOnly = primary.supportingOnly && supplementary.supportingOnly
+	primary.leadingFileDepth = primary.leadingFileDepth || supplementary.leadingFileDepth
+	if primary.primaryCohortOrder == 0 ||
+		(supplementary.primaryCohortOrder > 0 && supplementary.primaryCohortOrder < primary.primaryCohortOrder) {
+		primary.primaryCohortOrder = supplementary.primaryCohortOrder
 	}
 	primary.Callers = mergeLocalizationDigestStrings(primary.Callers, supplementary.Callers)
 	primary.Callees = mergeLocalizationDigestStrings(primary.Callees, supplementary.Callees)
@@ -293,6 +389,10 @@ func mergeLocalizationEvidenceDigest(current []localizationDigestRow, retained *
 		}
 		if len(digest.Evidence) == 0 {
 			return digest
+		}
+		if retained, removed := shedLocalizationDigestSupportingOnly(digest.Evidence); removed {
+			digest.Evidence = retained
+			continue
 		}
 		last := len(digest.Evidence) - 1
 		if shedLocalizationDigestOptionalFields(digest.Evidence) {
@@ -385,6 +485,84 @@ func localizationTaskAwareRetainedRows(task string, current []localizationDigest
 	return ordered
 }
 
+func localizationIdentifierRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '$'
+}
+
+func localizationTaskExactIdentifierOffset(task, value string) int {
+	value = strings.TrimSpace(value)
+	if value == "" || len(task) < len(value) {
+		return -1
+	}
+	quoted := false
+	for _, quote := range []string{"`", "'", "\""} {
+		if strings.Contains(task, quote+value+quote) {
+			quoted = true
+			break
+		}
+	}
+	if !localizationRecoveryConcreteIdentifier(value) &&
+		!exploreQueryHasCallAnchor(task, value) && !quoted {
+		return -1
+	}
+	for offset := 0; offset <= len(task)-len(value); {
+		relative := strings.Index(task[offset:], value)
+		if relative < 0 {
+			return -1
+		}
+		start := offset + relative
+		end := start + len(value)
+		leftBoundary := start == 0
+		if !leftBoundary {
+			r, _ := utf8.DecodeLastRuneInString(task[:start])
+			leftBoundary = !localizationIdentifierRune(r)
+		}
+		rightBoundary := end == len(task)
+		if !rightBoundary {
+			r, _ := utf8.DecodeRuneInString(task[end:])
+			rightBoundary = !localizationIdentifierRune(r)
+		}
+		if leftBoundary && rightBoundary {
+			return start
+		}
+		offset = start + 1
+	}
+	return -1
+}
+
+func localizationTaskCitesExactIdentifier(task, value string) bool {
+	return localizationTaskExactIdentifierOffset(task, value) >= 0
+}
+
+func localizationEvidenceTaskCitationOffset(task string, row localizationEvidence) int {
+	best := -1
+	for _, value := range []string{row.ID, row.Name, row.QualName} {
+		offset := localizationTaskExactIdentifierOffset(task, value)
+		if offset >= 0 && (best < 0 || offset < best) {
+			best = offset
+		}
+	}
+	return best
+}
+
+func localizationEvidenceTaskCited(task string, row localizationEvidence) bool {
+	return localizationEvidenceTaskCitationOffset(task, row) >= 0
+}
+
+func localizationEvidenceTaskCitedPrimary(row localizationEvidence) bool {
+	return row.taskCitedPrimaryEligible && row.primaryCohortOrder > 0 &&
+		row.Provenance == localizationProvenanceDirectAdjacency
+}
+
+func localizationDigestRowIdentifierTaskCited(task string, row localizationDigestRow) bool {
+	for _, value := range []string{row.ID, row.Name, row.QualName} {
+		if localizationTaskCitesExactIdentifier(task, value) {
+			return true
+		}
+	}
+	return false
+}
+
 func localizationDigestRowTaskCited(task string, row localizationDigestRow) bool {
 	for _, value := range []string{row.ID, row.Name, row.QualName, row.File, row.Signature} {
 		if localizationTaskCitesConcreteEvidence(task, value) {
@@ -471,6 +649,22 @@ func shedLocalizationDigestOptionalFields(rows []localizationDigestRow) bool {
 	return false
 }
 
+// Supplemental rows yield before richer metadata or independently ranked
+// evidence under retained-state pressure, regardless of where a later merge
+// placed them. An identity required by the live completion is protected even
+// when its only visible observation has supplemental provenance.
+func shedLocalizationDigestSupportingOnly(rows []localizationDigestRow) ([]localizationDigestRow, bool) {
+	for index := len(rows) - 1; index >= 0; index-- {
+		if !localizationFinalResponseSupportingOnly(rows[index]) || rows[index].authorizationPriority {
+			continue
+		}
+		copy(rows[index:], rows[index+1:])
+		rows[len(rows)-1] = localizationDigestRow{}
+		return rows[:len(rows)-1], true
+	}
+	return rows, false
+}
+
 func rebuildLocalizationDigestSkeleton(digest *localizationEvidenceDigest) {
 	digest.Files = digest.Files[:0]
 	digest.Symbols = digest.Symbols[:0]
@@ -494,6 +688,21 @@ const (
 	// usually within the top five. Slots below stay SUPPORTING so the page
 	// keeps an explicit confidence order.
 	localizationFinalResponsePrimaryLimit = 5
+	// Authenticated literal rows may pre-seat ahead of the ranked cohort. The
+	// second seat is granted only for a second proven file, so a literal
+	// registered in one place and consumed in another presents both sites
+	// while same-file corroboration still competes through ordinary ranking.
+	localizationFinalResponseLiteralReserve = 2
+	// A row is task-named only when the raw task text carries its identifier
+	// as a whole word, case-sensitively. The rune floors keep short prose
+	// words from naming whatever row happens to share them: five for the
+	// row's own name, six for an owner segment.
+	localizationTaskNameMinRunes  = 5
+	localizationTaskOwnerMinRunes = 6
+	// Task-named rows never displace a ranked seat. They may extend the
+	// primary block past its ranked width by at most this many extra seats:
+	// a proven ranked conversion is never traded for a hoped-for one.
+	localizationTaskAlignedExtraSeats = 2
 	// localizationDigestShrinkFloorRows is the smallest answer the envelope
 	// shed loop may shrink the digest to under extreme budget pressure. It is
 	// deliberately narrower than the primary block: the primary width is what
@@ -521,8 +730,10 @@ type localizationFinalResponseTaskScore struct {
 	callable bool
 }
 
-func localizationFinalResponsePrimaryProvenance(provenance string) bool {
-	switch provenance {
+func localizationFinalResponsePrimaryProvenance(row localizationDigestRow) bool {
+	switch row.Provenance {
+	case localizationProvenanceContentLiteral:
+		return row.literalPrimaryEligible
 	case localizationProvenanceSourceLiteralCallee,
 		localizationProvenanceDivergentDefault,
 		localizationProvenanceImplementationTarget,
@@ -534,10 +745,19 @@ func localizationFinalResponsePrimaryProvenance(provenance string) bool {
 	}
 }
 
+func localizationFinalResponseSupportingOnly(row localizationDigestRow) bool {
+	if row.taskCitedPrimaryEligible && row.primaryCohortOrder > 0 &&
+		row.Provenance == localizationProvenanceDirectAdjacency {
+		return false
+	}
+	return row.supportingOnly || localizationSupportingOnlyProvenance(row.Provenance)
+}
+
 func localizationFinalResponseSupportingProvenance(provenance string) bool {
 	switch provenance {
 	case localizationProvenanceDivergentDefaultType,
 		localizationProvenanceImplementationRoute,
+		localizationProvenanceDirectAdjacency,
 		"direct_caller", "direct_callee":
 		return true
 	default:
@@ -599,6 +819,82 @@ func localizationFinalResponseBareName(row localizationDigestRow) string {
 		name = name[cut+1:]
 	}
 	return name
+}
+
+func localizationIdentifierByte(b byte) bool {
+	return b == '_' || b == '$' ||
+		('0' <= b && b <= '9') || ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z')
+}
+
+// localizationTaskNamesIdentifier reports whether the raw task text contains
+// identifier as a whole word, case-sensitively. Substring hits inside a longer
+// identifier do not count: a task about "starting" does not name "start".
+func localizationTaskNamesIdentifier(task, identifier string, minRunes int) bool {
+	if identifier == "" || task == "" || utf8.RuneCountInString(identifier) < minRunes {
+		return false
+	}
+	for offset := 0; offset+len(identifier) <= len(task); {
+		index := strings.Index(task[offset:], identifier)
+		if index < 0 {
+			return false
+		}
+		start := offset + index
+		end := start + len(identifier)
+		if (start == 0 || !localizationIdentifierByte(task[start-1])) &&
+			(end == len(task) || !localizationIdentifierByte(task[end])) {
+			return true
+		}
+		offset = start + 1
+	}
+	return false
+}
+
+// localizationTaskNamesRow reports whether the task names the row itself or
+// the type the row is declared on. Only the immediate declaring owner counts:
+// qualified names carry namespace and package segments, and the repository's
+// own name sits in almost every namespace chain and almost every task, so a
+// wider match would name the whole page.
+func localizationTaskNamesRow(task string, row localizationDigestRow) bool {
+	name := localizationFinalResponseBareName(row)
+	if localizationTaskNamesIdentifier(task, name, localizationTaskNameMinRunes) {
+		return true
+	}
+	segments := strings.FieldsFunc(strings.TrimSpace(row.QualName), func(r rune) bool {
+		return r == '.' || r == ':'
+	})
+	if len(segments) < 2 {
+		return false
+	}
+	owner := segments[len(segments)-2]
+	if owner == name || strings.EqualFold(owner, localizationDigestRowRepoIdentifier(row)) {
+		return false
+	}
+	return localizationTaskNamesIdentifier(task, owner, localizationTaskOwnerMinRunes)
+}
+
+// localizationDigestRowRepoIdentifier extracts the repository name that
+// prefixes the row's node ID, without any trailing checkout discriminator.
+func localizationDigestRowRepoIdentifier(row localizationDigestRow) string {
+	id := strings.TrimSpace(row.ID)
+	slash := strings.IndexByte(id, '/')
+	if slash <= 0 {
+		return ""
+	}
+	repo := id[:slash]
+	if dash := strings.LastIndexByte(repo, '-'); dash > 0 {
+		digits := repo[dash+1:]
+		numeric := digits != ""
+		for _, r := range digits {
+			if r < '0' || r > '9' {
+				numeric = false
+				break
+			}
+		}
+		if numeric {
+			repo = repo[:dash]
+		}
+	}
+	return repo
 }
 
 // localizationFinalResponseAnchorRank orders the provenance flags that can name
@@ -740,13 +1036,61 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 	for _, row := range rows {
 		rowsByID[strings.TrimSpace(row.ID)] = row
 	}
-	// Fresh rows already lead the merged evidence order. Primary status is earned
-	// from proof, task alignment, or owner coherence below; arrival time alone
-	// must not displace stronger retained evidence.
-	for _, row := range rows {
-		if localizationFinalResponsePrimaryProvenance(row.Provenance) {
-			appendRow(&primaries, localizationFinalResponsePrimaryLimit, row)
+	// Fresh rows already lead the merged evidence order. Once the initial ranked
+	// cohort has been frozen, later supplemental projections cannot reshuffle it:
+	// replay and permitted-read merges recover the exact original order first.
+	appendPrimary := func(row localizationDigestRow) bool {
+		if localizationFinalResponseSupportingOnly(row) {
+			return false
 		}
+		return appendRow(&primaries, localizationFinalResponsePrimaryLimit, row)
+	}
+	for order := 1; order <= localizationFinalResponsePrimaryLimit; order++ {
+		for _, row := range rows {
+			if row.primaryCohortOrder == order {
+				appendPrimary(row)
+				break
+			}
+		}
+	}
+
+	// Authenticated literal rows reserve bounded seats before ordinary
+	// task/rank selection. The second seat must bring a second proven file:
+	// two owners of the same registration site add nothing over one.
+	literalReserveUsed := 0
+	literalReserveFiles := make(map[string]struct{}, localizationFinalResponseLiteralReserve)
+	claimReserve := func(row localizationDigestRow) {
+		literalReserveUsed++
+		if file := strings.TrimSpace(row.File); file != "" {
+			literalReserveFiles[file] = struct{}{}
+		}
+	}
+	for _, row := range primaries {
+		if row.Provenance == localizationProvenanceSourceLiteralCallee && row.literalPrimaryEligible {
+			claimReserve(row)
+		}
+	}
+	for _, row := range rows {
+		if !localizationFinalResponsePrimaryProvenance(row) {
+			continue
+		}
+		literal := row.Provenance == localizationProvenanceContentLiteral ||
+			row.Provenance == localizationProvenanceSourceLiteralCallee
+		if literal {
+			if literalReserveUsed >= localizationFinalResponseLiteralReserve {
+				continue
+			}
+			if literalReserveUsed > 0 {
+				if _, sameFile := literalReserveFiles[strings.TrimSpace(row.File)]; sameFile {
+					continue
+				}
+			}
+			if appendPrimary(row) {
+				claimReserve(row)
+			}
+			continue
+		}
+		appendPrimary(row)
 	}
 
 	taskTerms := exploreTerminalTerms(task)
@@ -779,7 +1123,7 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 			}
 		}
 		if bestSameOwner >= 0 {
-			appendRow(&primaries, localizationFinalResponsePrimaryLimit, rows[bestSameOwner])
+			appendPrimary(rows[bestSameOwner])
 		}
 	}
 
@@ -799,20 +1143,68 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 			}
 		}
 		if bestTaskMatch >= 0 {
-			appendRow(&primaries, localizationFinalResponsePrimaryLimit, rows[bestTaskMatch])
+			appendPrimary(rows[bestTaskMatch])
 		}
-	}
-	for _, row := range rows {
-		appendRow(&primaries, localizationFinalResponsePrimaryLimit, row)
 	}
 
 	for _, row := range rows {
+		// Further authenticated literal callees may still win through ordinary
+		// rank; only the pre-seated reserve above is capped at one.
+		appendPrimary(row)
+	}
+
+	// After every ranked seat is filled, remaining task-named rows extend the
+	// block by bounded extra seats. The admission lane must not decide
+	// presentation authority: a declaration the task names is what the caller
+	// asked about, whether it arrived through ranked retrieval, leading-file
+	// completeness, or a body mention. Naming means the raw task carries the
+	// row's identifier as a whole word, case-sensitively — prose substrings
+	// do not extend the answer. Adjacency neighbors stay supporting: sharing
+	// an identifier with the task does not make a graph hop the subject of
+	// the report.
+	if strings.TrimSpace(task) != "" {
+		extendedLimit := localizationFinalResponsePrimaryLimit + localizationTaskAlignedExtraSeats
+		type taskAlignedCandidate struct {
+			index int
+			score localizationFinalResponseTaskScore
+		}
+		aligned := make([]taskAlignedCandidate, 0, len(rows))
+		for index, row := range rows {
+			if _, exists := selected[strings.TrimSpace(row.ID)]; exists {
+				continue
+			}
+			if row.Provenance == localizationProvenanceDirectAdjacency {
+				continue
+			}
+			// Only the leading-file-depth writer of supportingOnly may be
+			// overridden by task naming; a supplemental row stays supporting
+			// no matter how well it matches the task.
+			if localizationFinalResponseSupportingOnly(row) && !row.leadingFileDepth {
+				continue
+			}
+			if !localizationTaskNamesRow(task, row) {
+				continue
+			}
+			aligned = append(aligned, taskAlignedCandidate{
+				index: index, score: scoreLocalizationFinalResponseTask(taskTerms, row),
+			})
+		}
+		sort.SliceStable(aligned, func(left, right int) bool {
+			return localizationFinalResponseBetterTaskScore(aligned[left].score, aligned[right].score)
+		})
+		for _, candidate := range aligned {
+			appendRow(&primaries, extendedLimit, rows[candidate.index])
+		}
+	}
+
+	supportingLimit := localizationReplayEvidenceLimit - len(primaries)
+	for _, row := range rows {
 		if localizationFinalResponseDirectRelation(row, primaries) {
-			appendRow(&supporting, localizationFinalResponseSupportingLimit, row)
+			appendRow(&supporting, supportingLimit, row)
 		}
 	}
 	for _, row := range rows {
-		appendRow(&supporting, localizationFinalResponseSupportingLimit, row)
+		appendRow(&supporting, supportingLimit, row)
 	}
 
 	presented := make([]localizationFinalResponseRow, 0, len(primaries)+len(supporting))
@@ -823,6 +1215,61 @@ func localizationFinalResponseRows(task string, current, rows []localizationDige
 		presented = append(presented, localizationFinalResponseRow{row: row})
 	}
 	return presented
+}
+
+func localizationFinalResponsePrimaryIDs(task string, current, rows []localizationDigestRow) []string {
+	presented := localizationFinalResponseRows(task, current, rows)
+	ids := make([]string, 0, localizationFinalResponsePrimaryLimit)
+	for _, item := range presented {
+		if !item.primary {
+			break
+		}
+		if id := strings.TrimSpace(item.row.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// freezeLocalizationPrimaryCohort records the exact initial PRIMARY projection
+// immediately before supplemental evidence is materialized. The order is
+// request-local policy state: it is retained across digest rebuilds and reads,
+// but never serialized into the response payload.
+func freezeLocalizationPrimaryCohort(
+	task string,
+	envelope *localizationExploreEnvelope,
+	digest *localizationEvidenceDigest,
+) {
+	if envelope == nil || digest == nil {
+		return
+	}
+	primaryIDs := append([]string(nil), digest.primaryIDs...)
+	if len(primaryIDs) == 0 {
+		primaryIDs = localizationFinalResponsePrimaryIDs(task, nil, digest.Evidence)
+	}
+	if len(primaryIDs) > localizationFinalResponsePrimaryLimit {
+		primaryIDs = primaryIDs[:localizationFinalResponsePrimaryLimit]
+	}
+	orders := make(map[string]int, len(primaryIDs))
+	for index, id := range primaryIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			orders[id] = index + 1
+		}
+	}
+	for index := range envelope.Evidence {
+		row := &envelope.Evidence[index]
+		if order := orders[strings.TrimSpace(row.ID)]; order > 0 && !row.supportingOnly &&
+			!localizationSupportingOnlyProvenance(row.Provenance) {
+			row.primaryCohortOrder = order
+		}
+	}
+	for index := range digest.Evidence {
+		row := &digest.Evidence[index]
+		if order := orders[strings.TrimSpace(row.ID)]; order > 0 && !localizationFinalResponseSupportingOnly(*row) {
+			row.primaryCohortOrder = order
+		}
+	}
+	refreshLocalizationDigestResponses(digest, task, nil)
 }
 
 func renderLocalizationFinalResponse(rows []localizationDigestRow) string {
@@ -948,6 +1395,7 @@ func refreshLocalizationDigestResponses(digest *localizationEvidenceDigest, task
 	if digest == nil {
 		return
 	}
+	digest.primaryIDs = localizationFinalResponsePrimaryIDs(task, current, digest.Evidence)
 	digest.finalResponse = renderLocalizationFinalResponseForTask(task, current, digest.Evidence)
 	digest.provisionalResponse = renderLocalizationProvisionalResponseForTask(task, current, digest.Evidence)
 }
@@ -1241,6 +1689,7 @@ type localizationHostEnvelope struct {
 	Version        int                          `json:"version"`
 	FallbackFormat string                       `json:"fallback_format"`
 	Evidence       *localizationEvidenceDigest  `json:"evidence"`
+	PrimaryIDs     []string                     `json:"primary_ids,omitempty"`
 	Contract       localizationTerminalContract `json:"contract"`
 }
 
@@ -1279,10 +1728,15 @@ func attachLocalizationHostEnvelope(result *mcpgo.CallToolResult, completion loc
 	if result.Meta.AdditionalFields == nil {
 		result.Meta.AdditionalFields = make(map[string]any)
 	}
+	primaryIDs := []string(nil)
+	if digest != nil {
+		primaryIDs = append(primaryIDs, digest.primaryIDs...)
+	}
 	result.Meta.AdditionalFields[localizationHostMetaKey] = localizationHostEnvelope{
 		Version:        1,
 		FallbackFormat: "{file}:{line} — {id} ({signature})",
 		Evidence:       digest,
+		PrimaryIDs:     primaryIDs,
 		Contract:       contract,
 	}
 	return result

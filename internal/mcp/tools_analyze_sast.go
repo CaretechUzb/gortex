@@ -59,6 +59,39 @@ type sastCWEBucket struct {
 	Count int    `json:"count"`
 }
 
+func sortSASTMatchesByPriority(matches []astquery.Match) {
+	sort.SliceStable(matches, func(i, j int) bool {
+		ri, rj := severityRank(matches[i].Severity), severityRank(matches[j].Severity)
+		if ri != rj {
+			return ri > rj
+		}
+		if matches[i].Detector != matches[j].Detector {
+			return matches[i].Detector < matches[j].Detector
+		}
+		if matches[i].File != matches[j].File {
+			return matches[i].File < matches[j].File
+		}
+		return matches[i].Line < matches[j].Line
+	})
+}
+
+func (s *Server) prepareReviewSASTMatchesContext(
+	ctx context.Context,
+	matches []astquery.Match,
+	limit int,
+	enrich bool,
+) {
+	sortSASTMatchesByPriority(matches)
+	if !enrich {
+		return
+	}
+	enrichCount := len(matches)
+	if limit > 0 && enrichCount > limit {
+		enrichCount = limit
+	}
+	s.enrichASTMatchesContext(ctx, matches[:enrichCount])
+}
+
 // handleAnalyzeSAST runs the category bundle (sast or hygiene).
 func (s *Server) handleAnalyzeSAST(ctx context.Context, req mcp.CallToolRequest, kind string) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
@@ -83,15 +116,6 @@ func (s *Server) handleAnalyzeSAST(ctx context.Context, req mcp.CallToolRequest,
 	targets, err := s.buildASTTargets("", pathPrefix, allowedRepos)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	fileSymbols := s.buildFileSymbolIndex(targets)
-	lookup := func(graphPath string, line int) (string, string) {
-		idx := fileSymbols[graphPath]
-		if idx == nil {
-			return "", ""
-		}
-		return idx.find(line)
 	}
 
 	bundle := astquery.DetectorsByCategory(kind)
@@ -158,11 +182,10 @@ func (s *Server) handleAnalyzeSAST(ctx context.Context, req mcp.CallToolRequest,
 		detMeta[d.Name] = d
 
 		opts := astquery.Options{
-			Detector:     d.Name,
-			Targets:      targets,
-			SymbolLookup: lookup,
-			Resolver:     astquery.DefaultLanguageResolver,
-			Limit:        5000,
+			Detector: d.Name,
+			Targets:  targets,
+			Resolver: astquery.DefaultLanguageResolver,
+			Limit:    5000,
 		}
 		if excludeTestsSet {
 			opts.ExcludeTests = excludeTests
@@ -206,6 +229,11 @@ func (s *Server) handleAnalyzeSAST(ctx context.Context, req mcp.CallToolRequest,
 	// the resolved call / loop metadata refutes. Only the review
 	// bundle is grounded; sast / hygiene / domain pass through.
 	if kind == "review" {
+		// Establish the same global priority the final rows use before the
+		// bounded enrichment pass. Grounding preserves this order. Only the
+		// requested result prefix is enriched: grounding may drop a prefix
+		// row, but admitting later rows would exceed the caller's work bound.
+		s.prepareReviewSASTMatchesContext(ctx, collected, limit, !kindsOnly)
 		collected = review.GroundReviewMatches(s.graph, collected)
 	}
 
@@ -262,6 +290,15 @@ func (s *Server) handleAnalyzeSAST(ctx context.Context, req mcp.CallToolRequest,
 	if limit > 0 && len(rows) > limit {
 		rows = rows[:limit]
 		truncated = true
+	}
+	if !kindsOnly && kind != "review" {
+		s.enrichASTSymbolIDsContext(
+			ctx,
+			len(rows),
+			func(index int) string { return rows[index].File },
+			func(index int) int { return rows[index].Line },
+			func(index int, id string) { rows[index].Symbol = id },
+		)
 	}
 
 	summaries := make([]sastSummary, 0, len(summary))

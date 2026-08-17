@@ -655,8 +655,18 @@ func publishLocalizationAuthReceipt(token string, result *mcpgo.CallToolResult) 
 		return
 	}
 	completion := host.Contract.Completion
+	evidenceIDs := make([]string, 0, localizationReplayEvidenceLimit)
+	if host.Evidence != nil {
+		for _, row := range host.Evidence.Evidence {
+			if id := strings.TrimSpace(row.ID); id != "" {
+				evidenceIDs = append(evidenceIDs, id)
+			}
+		}
+	}
 	localizationauth.Publish(token, localizationauth.Receipt{
 		FinalResponse:   completion.FinalResponse,
+		PrimaryIDs:      append([]string(nil), host.PrimaryIDs...),
+		EvidenceIDs:     evidenceIDs,
 		ContractVersion: completion.ContractVersion,
 		Enforceable:     completion.Enforceable,
 	})
@@ -703,18 +713,20 @@ func captureLocalizationSearchSymbols(ctx context.Context, nodes []*graph.Node) 
 }
 
 // captureLocalizationSearchText promotes only graph-backed identities from the
-// typed search.text page. A file-level literal may have no enclosing SymbolID;
-// in that case the matching path and line are resolved back to the narrowest
-// in-scope graph declaration, or finally to the graph's file node. Rendered MCP
-// Content is never parsed as evidence.
-func (s *Server) captureLocalizationSearchText(ctx context.Context, matches []enrichedTextMatch) {
+// typed search.text page. It reuses the exact bounded file indexes built for
+// enrichment, so a permitted-evidence capture never repeats a file scan.
+func (s *Server) captureLocalizationSearchText(
+	ctx context.Context,
+	matches []enrichedTextMatch,
+	indexes map[string]*fileSymbolIndex,
+) {
 	capture, _ := ctx.Value(localizationPermittedEvidenceCaptureKey{}).(*localizationPermittedEvidenceCapture)
 	if capture == nil {
 		return
 	}
 	rows := make([]localizationDigestRow, 0, len(matches))
 	for _, match := range matches {
-		node, provenance := s.localizationTextMatchNode(ctx, match)
+		node, provenance := s.localizationTextMatchNode(ctx, match, indexes)
 		if row, ok := localizationDigestRowFromNode(node, provenance); ok {
 			if match.Line > 0 {
 				row.Line = match.Line
@@ -725,12 +737,22 @@ func (s *Server) captureLocalizationSearchText(ctx context.Context, matches []en
 	captureLocalizationRows(ctx, rows)
 }
 
-func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTextMatch) (*graph.Node, string) {
-	if s == nil || s.graph == nil {
+func (s *Server) localizationTextMatchNode(
+	ctx context.Context,
+	match enrichedTextMatch,
+	indexes map[string]*fileSymbolIndex,
+) (*graph.Node, string) {
+	if s == nil {
 		return nil, ""
 	}
+	reader := s.readerFor(ctx)
+	if reader == nil {
+		return nil, ""
+	}
+	// Preserve the typed SymbolID path exactly: an already-enriched hit needs
+	// one identity lookup, not another file projection.
 	if id := strings.TrimSpace(match.SymbolID); id != "" {
-		if node := s.graph.GetNode(id); node != nil && s.nodeInSessionScope(ctx, node) {
+		if node := reader.GetNode(id); node != nil && s.nodeInSessionScope(ctx, node) {
 			return node, "permitted_search_text"
 		}
 		return nil, ""
@@ -739,45 +761,15 @@ func (s *Server) localizationTextMatchNode(ctx context.Context, match enrichedTe
 	if path == "" {
 		return nil, ""
 	}
-	var owner *graph.Node
-	var fileNode *graph.Node
-	ownerSpan := int(^uint(0) >> 1)
-	for _, node := range s.graph.GetFileNodes(path) {
-		if node == nil || !s.nodeInSessionScope(ctx, node) {
-			continue
-		}
-		if node.Kind == graph.KindFile {
-			if fileNode == nil || node.ID < fileNode.ID {
-				fileNode = node
-			}
-			continue
-		}
-		if match.Line <= 0 || node.StartLine <= 0 || node.StartLine > match.Line || !exploreLocalizableKind(node.Kind) {
-			continue
-		}
-		end := node.EndLine
-		if end <= 0 {
-			end = node.StartLine
-		}
-		if end < match.Line {
-			continue
-		}
-		span := end - node.StartLine
-		if owner == nil || span < ownerSpan || (span == ownerSpan && node.ID < owner.ID) {
-			owner = node
-			ownerSpan = span
-		}
+	index := fileSymbolIndexForPath(indexes, path)
+	if index == nil || index.saturated {
+		return nil, ""
 	}
-	if owner != nil {
+	if owner := index.smallestEnclosing(match.Line); owner != nil && s.nodeInSessionScope(ctx, owner) {
 		return owner, "permitted_search_text_owner"
 	}
-	if fileNode == nil {
-		if node := s.graph.GetNode(path); node != nil && node.Kind == graph.KindFile && s.nodeInSessionScope(ctx, node) {
-			fileNode = node
-		}
-	}
-	if fileNode != nil {
-		return fileNode, "permitted_search_text_file"
+	if index.fileNode != nil && s.nodeInSessionScope(ctx, index.fileNode) {
+		return index.fileNode, "permitted_search_text_file"
 	}
 	return nil, ""
 }
@@ -1102,14 +1094,15 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		outcome = facadeOutcomeInvalidArgument
 		return invalid, nil
 	}
-	if OverlayViewFromContext(ctx) == nil && !facadeLegacyManagesOwnOverlay(spec.Legacy) {
-		view, viewErr := s.buildOverlayViewForCtx(ctx)
+	if !facadeLegacyManagesOwnOverlay(spec.Legacy) {
+		var viewErr error
+		ctx, _, viewErr = s.prepareOverlayRequest(ctx)
 		if viewErr != nil {
+			if ctxErr := requestContextError(ctx, viewErr); ctxErr != nil {
+				return nil, ctxErr
+			}
 			outcome = facadeOutcomeToolError
 			return mcpgo.NewToolResultError(viewErr.Error()), nil
-		}
-		if view != nil {
-			ctx = WithOverlayView(ctx, view)
 		}
 	}
 	forwarded := req

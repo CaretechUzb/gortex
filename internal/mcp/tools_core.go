@@ -837,21 +837,6 @@ func stripNonDefinitionNodes(sg *query.SubGraph) *query.SubGraph {
 	}
 }
 
-// fileDefinitionNodes enumerates one file's declared symbols through the same
-// graph query and definition filter get_file_summary answers from, without the
-// tool layer's freshness, encoding, and accounting passes. The path must
-// already be in the graph's stored form.
-func fileDefinitionNodes(eng *query.Engine, filePath string) []*graph.Node {
-	if eng == nil || strings.TrimSpace(filePath) == "" {
-		return nil
-	}
-	sg := stripNonDefinitionNodes(eng.GetFileSymbols(filePath))
-	if sg == nil {
-		return nil
-	}
-	return sg.Nodes
-}
-
 // compactSubGraph formats a SubGraph as compact text.
 func compactSubGraph(sg *query.SubGraph) string {
 	var b strings.Builder
@@ -1917,10 +1902,6 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		}
 	}
 
-	// Remember the returned IDs for attribution on later consume calls.
-	// Cap at top limit so unseen "overflow" results don't get credited.
-	recordLastSearchFromNodes(sess, q, nodes, limit)
-
 	total := len(nodes)
 	// Slice the (offset, limit) window. nextCursor is empty when the
 	// last row in `nodes` is included.
@@ -1932,6 +1913,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		offset = total
 	}
 	page := nodes[offset:end]
+	// Record only the actual post-cursor page. Empty and out-of-range pages
+	// deliberately clear any prior attribution state.
+	recordLastSearchFromNodes(sess, q, page)
 	// Decorate the page with absolute file paths so every output format
 	// below surfaces an openable path alongside the repo-relative one.
 	page = s.withAbsPaths(page)

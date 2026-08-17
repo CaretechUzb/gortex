@@ -3,6 +3,7 @@ package hooks
 import (
 	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -174,6 +175,26 @@ func TestLocalizationReceiptMarkerStrengthControlsPreToolUse(t *testing.T) {
 	}
 }
 
+func TestLocalizationTerminalMarkerRetainsAuthenticatedEvidenceIDs(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	identity := beginTestLocalizationTurn(t, t.Name(), "prompt", t.TempDir())
+	primary := []string{"repo/a.go::A", "repo/b.go::B"}
+	evidence := []string{"repo/a.go::A", "repo/b.go::B", "repo/c.go::C"}
+	if !markLocalizationTerminalReceipt(identity, localizationauth.Receipt{
+		FinalResponse: "answer", PrimaryIDs: primary, EvidenceIDs: evidence,
+		ContractVersion: localizationTerminalContractV2, Enforceable: true,
+	}) {
+		t.Fatal("marker was not written")
+	}
+	marker, ok := localizationTerminalMarkerFor(identity)
+	if !ok {
+		t.Fatal("marker was not readable")
+	}
+	if !slices.Equal(marker.PrimaryIDs, primary) || !slices.Equal(marker.EvidenceIDs, evidence) {
+		t.Fatalf("marker evidence authority = primary %#v evidence %#v", marker.PrimaryIDs, marker.EvidenceIDs)
+	}
+}
+
 func TestLocalizationTerminalMarkerStrengthIsMonotonic(t *testing.T) {
 	configureLocalizationTerminalTestHome(t)
 	identity := beginTestLocalizationTurn(t, "monotonic-strength", "prompt", t.TempDir())
@@ -251,7 +272,7 @@ func TestLocalizationAdvisoryMarkerRotatesAndDelayedPostCannotPoisonNewTurn(t *t
 	if _, observed := observeLocalizationTerminal(pendingPost); observed {
 		t.Fatal("pending pre-rotation advisory receipt armed the next turn")
 	}
-	if !markLocalizationTerminalReceipt(oldTurn, localizationTerminalContractV2, false, "") {
+	if !markLocalizationTerminalReceipt(oldTurn, localizationauth.Receipt{ContractVersion: localizationTerminalContractV2}) {
 		t.Fatal("simulate delayed advisory marker write")
 	}
 	if _, marked := localizationTerminalMarkerFor(newTurn); marked {

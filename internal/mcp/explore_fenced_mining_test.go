@@ -50,7 +50,7 @@ func TestExploreTaskAnchorsResolveExactNameOnlyInsideFence(t *testing.T) {
 	require.Len(t, anchors[0].exactNodes, 1)
 
 	got := server.exploreExactAnchorCandidate(
-		context.Background(), anchors[0], query.QueryOptions{},
+		context.Background(), anchors[0], nil, query.QueryOptions{},
 		map[string]struct{}{}, map[string]struct{}{},
 	)
 	require.NotNil(t, got)
@@ -105,12 +105,14 @@ func TestExploreQuotedRecallTermsKeepProseTermsAheadOfMinedLiterals(t *testing.T
 		"debug: reader ignored the pending manifest entry\n" +
 		"trace: writer flushed the pending batch to disk\n" +
 		"info: registry rebuilt from the durable snapshot\n" +
+		"notice: registry verified after snapshot recovery\n" +
 		"```\n"
 	terms := exploreQuotedRecallTerms(task)
 	require.Len(t, terms, exploreQuotedRecallMaxMinedTerms)
 	require.Equal(t, "tenant registry cleared", terms[0], "prose literals keep the leading slots: %#v", terms)
 	require.Contains(t, terms, "tenant registry rollback discarded entry")
-	require.NotContains(t, terms, "registry rebuilt from the durable snapshot",
+	require.Contains(t, terms, "registry rebuilt from the durable snapshot")
+	require.NotContains(t, terms, "registry verified after snapshot recovery",
 		"mined literals stop at the total cap: %#v", terms)
 }
 

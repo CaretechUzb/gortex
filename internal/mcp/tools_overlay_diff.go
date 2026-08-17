@@ -50,8 +50,11 @@ func (s *Server) handleCompareWithOverlay(ctx context.Context, req mcp.CallToolR
 	if SessionIDFromContext(ctx) == "" {
 		return mcp.NewToolResultError("compare_with_overlay requires an MCP session; connect via the daemon or set Mcp-Session-Id"), nil
 	}
-	view, viewErr := s.buildOverlayViewForCtx(ctx)
+	ctx, view, viewErr := s.prepareOverlayRequest(ctx)
 	if viewErr != nil {
+		if ctxErr := requestContextError(ctx, viewErr); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return mcp.NewToolResultError(viewErr.Error()), nil
 	}
 	if view == nil {

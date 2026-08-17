@@ -73,6 +73,7 @@ FROM seq`)
 	}
 	wantIndexes := []string{
 		"edges_by_from_line",
+		"edges_by_from_line_kind",
 		"edges_by_kind",
 		"nodes_by_file",
 		"nodes_by_kind",
@@ -99,8 +100,8 @@ FROM seq`)
 	plan = explainPlannerQueryPlan(t, store.db,
 		`SELECT to_id FROM edges WHERE from_id = ? AND line = ? AND kind = ?`,
 		"hub", 1, "calls")
-	if !strings.Contains(plan, "edges_by_from_line") {
-		t.Fatalf("exact-site query missed edges_by_from_line after stats refresh:\n%s", plan)
+	if !strings.Contains(plan, "edges_by_from_line_kind") {
+		t.Fatalf("exact-site query missed edges_by_from_line_kind after stats refresh:\n%s", plan)
 	}
 
 	// These indexes have no competing left-prefix path. They remain selected

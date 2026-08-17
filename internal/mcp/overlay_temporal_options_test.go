@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -41,7 +42,7 @@ func Run(ctx workflow.Context) {
 	workflow.ExecuteActivity(ctx, name)
 }
 `
-	layer, paths, err := srv.constructOverlayLayer([]daemon.OverlayFile{{Path: "overlay.go", Content: source}})
+	layer, paths, err := srv.constructOverlayLayer(context.Background(), []daemon.OverlayFile{{Path: "overlay.go", Content: source}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -41,20 +41,62 @@ type countingDivergentDefaultStore struct {
 
 func (s *countingDivergentDefaultStore) GetNodesByIDs(ids []string) map[string]*graph.Node {
 	s.nodeBatchCalls++
-	if s.nodeBatchDelay > 0 {
-		time.Sleep(s.nodeBatchDelay)
-	}
 	return s.Store.GetNodesByIDs(ids)
 }
 
-func (s *countingDivergentDefaultStore) GetFileNodesByPaths(paths []string) map[string][]*graph.Node {
-	s.fileBatchCalls++
-	return s.Store.GetFileNodesByPaths(paths)
+func (s *countingDivergentDefaultStore) GetNodesByIDsContext(ctx context.Context, ids []string) (map[string]*graph.Node, error) {
+	s.nodeBatchCalls++
+	if s.nodeBatchDelay > 0 {
+		timer := time.NewTimer(s.nodeBatchDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if contextual, ok := s.Store.(interface {
+		GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error)
+	}); ok {
+		return contextual.GetNodesByIDsContext(ctx, ids)
+	}
+	return s.Store.GetNodesByIDs(ids), ctx.Err()
 }
 
-func (s *countingDivergentDefaultStore) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+func (s *countingDivergentDefaultStore) GetFileNodesByPaths([]string) map[string][]*graph.Node {
+	panic("legacy full file-node batch must not be used")
+}
+
+func (s *countingDivergentDefaultStore) FindFileNodesBounded(
+	ctx context.Context,
+	path string,
+	scope graph.LocalizationNodeScope,
+	limit int,
+) (graph.BoundedNodeProjection, error) {
+	s.fileBatchCalls++
+	bounded, ok := s.Store.(graph.BoundedFileNodeReader)
+	if !ok {
+		return graph.BoundedNodeProjection{}, graph.ErrBoundedLocalizationUnavailable
+	}
+	return bounded.FindFileNodesBounded(ctx, path, scope, limit)
+}
+
+func (s *countingDivergentDefaultStore) GetInEdgesByNodeIDs([]string) map[string][]*graph.Edge {
+	panic("legacy full incoming-edge batch must not be used")
+}
+
+func (s *countingDivergentDefaultStore) FindIncomingSourcesBounded(
+	ctx context.Context,
+	targetIDs []string,
+	kind graph.EdgeKind,
+	limit int,
+) (graph.BoundedIncomingSourceProjection, error) {
 	s.inBatchCalls++
-	return s.Store.GetInEdgesByNodeIDs(ids)
+	bounded, ok := s.Store.(graph.BoundedIncomingSourceReader)
+	if !ok {
+		return graph.BoundedIncomingSourceProjection{}, graph.ErrBoundedLocalizationUnavailable
+	}
+	return bounded.FindIncomingSourcesBounded(ctx, targetIDs, kind, limit)
 }
 
 func divergentDefaultTestSource(node *graph.Node) string {
@@ -105,6 +147,19 @@ func monologDivergentDefaultFixture() divergentDefaultFixture {
 	}
 }
 
+func promoteExploreDivergentDefaultOwnerForTest(
+	task string,
+	targets []exploreTarget,
+	reader graph.Reader,
+	maxSymbols int,
+	readSource func(*graph.Node) string,
+	fallbackSLO ...time.Duration,
+) []exploreTarget {
+	return promoteExploreDivergentDefaultOwner(
+		context.Background(), task, targets, reader, graph.LocalizationNodeScope{}, maxSymbols, readSource, fallbackSLO...,
+	)
+}
+
 func TestDivergentDefaultOwnerPromotesFromStoreProjectionWithoutEviction(t *testing.T) {
 	task := `StreamHandler::write throws UnexpectedValueException "could not be opened: Permission denied" after upgrade, likely due to chmod and file permission handling`
 	fixture := monologDivergentDefaultFixture()
@@ -115,7 +170,7 @@ func TestDivergentDefaultOwnerPromotesFromStoreProjectionWithoutEviction(t *test
 	fixture.targets = append(fixture.targets, exploreTarget{node: protected, conceptImplementation: true})
 	originalCount := len(fixture.targets)
 	reads := 0
-	promoted := promoteExploreDivergentDefaultOwner(task, fixture.targets, fixture.store, len(fixture.targets), func(node *graph.Node) string {
+	promoted := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, fixture.store, len(fixture.targets), func(node *graph.Node) string {
 		reads++
 		require.Equal(t, fixture.childCtor.ID, node.ID)
 		return monologForwardingConstructorSource
@@ -160,7 +215,7 @@ func TestDivergentDefaultOwnerRecoversBasePairFromRankedCallableOwner(t *testing
 	fixture.targets = fixture.targets[:1]
 	counted := &countingDivergentDefaultStore{Store: fixture.store}
 	reads := 0
-	promoted := promoteExploreDivergentDefaultOwner(task, fixture.targets, counted, 3, func(node *graph.Node) string {
+	promoted := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, counted, 3, func(node *graph.Node) string {
 		reads++
 		require.Equal(t, fixture.childCtor.ID, node.ID)
 		return monologForwardingConstructorSource
@@ -169,9 +224,9 @@ func TestDivergentDefaultOwnerRecoversBasePairFromRankedCallableOwner(t *testing
 	require.Equal(t, []string{fixture.childCtor.ID, fixture.childType.ID, fixture.write.ID}, []string{
 		promoted[0].node.ID, promoted[1].node.ID, promoted[2].node.ID,
 	})
-	require.Equal(t, 2, counted.nodeBatchCalls, "owner discovery and endpoint hydration must each be batched")
+	require.Equal(t, 3, counted.nodeBatchCalls, "owner, constructor, and endpoint hydration must each be bounded batches")
 	require.Equal(t, 1, counted.fileBatchCalls)
-	require.Equal(t, 1, counted.inBatchCalls)
+	require.Equal(t, 2, counted.inBatchCalls, "CALLS and EXTENDS must use separate bounded projections")
 	require.Equal(t, 1, reads)
 }
 
@@ -182,7 +237,7 @@ func TestDivergentDefaultOwnerAdmissionAtCapacityEvictsOnlyUnprotectedTail(t *te
 	distractorTwo := divergentDefaultTestNode("src/Noise.php::Noise.two", graph.KindMethod, "two", "src/Noise.php", "function two()")
 	fixture.targets = []exploreTarget{{node: fixture.write}, {node: distractorOne}, {node: distractorTwo}}
 
-	promoted := promoteExploreDivergentDefaultOwner(task, fixture.targets, fixture.store, len(fixture.targets), divergentDefaultTestSource)
+	promoted := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, fixture.store, len(fixture.targets), divergentDefaultTestSource)
 	require.Len(t, promoted, len(fixture.targets))
 	require.Equal(t, []string{fixture.childCtor.ID, fixture.childType.ID, fixture.write.ID}, []string{
 		promoted[0].node.ID, promoted[1].node.ID, promoted[2].node.ID,
@@ -191,7 +246,7 @@ func TestDivergentDefaultOwnerAdmissionAtCapacityEvictsOnlyUnprotectedTail(t *te
 	protectedLiteral := exploreTarget{node: distractorOne, sourceLiteral: true}
 	protectedImplementation := exploreTarget{node: distractorTwo, conceptImplementation: true}
 	fixture.targets = []exploreTarget{{node: fixture.write}, protectedLiteral, protectedImplementation}
-	unchanged := promoteExploreDivergentDefaultOwner(task, fixture.targets, fixture.store, len(fixture.targets), divergentDefaultTestSource)
+	unchanged := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, fixture.store, len(fixture.targets), divergentDefaultTestSource)
 	require.Equal(t, []string{fixture.write.ID, distractorOne.ID, distractorTwo.ID}, []string{
 		unchanged[0].node.ID, unchanged[1].node.ID, unchanged[2].node.ID,
 	})
@@ -199,18 +254,94 @@ func TestDivergentDefaultOwnerAdmissionAtCapacityEvictsOnlyUnprotectedTail(t *te
 	require.True(t, unchanged[2].conceptImplementation)
 }
 
+func TestDivergentDefaultOwnerPreservesSourceRangeBaseSeats(t *testing.T) {
+	task := `StreamHandler::write reports "could not be opened: Permission denied" after a rotating handler applies chmod`
+	fixture := monologDivergentDefaultFixture()
+	tail := divergentDefaultTestNode("src/Noise.php::Noise.tail", graph.KindMethod, "tail", "src/Noise.php", "function tail()")
+	match := exploreDivergentDefaultOwner{
+		constructor: fixture.childCtor,
+		owner:       fixture.childType,
+		baseCtor:    fixture.baseCtor,
+		baseOwner:   fixture.baseType,
+		consumerID:  fixture.write.ID,
+	}
+	constructor := exploreTarget{node: fixture.childCtor, divergentDefaultOwner: true}
+	owner := exploreTarget{node: fixture.childType, divergentDefaultType: true}
+
+	for _, test := range []struct {
+		name     string
+		baseCtor bool
+	}{
+		{name: "constructor", baseCtor: true},
+		{name: "owner"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			targets := []exploreTarget{{node: fixture.write}, {node: fixture.baseType}, {node: fixture.baseCtor}, {node: tail}}
+			protectedID := fixture.baseType.ID
+			if test.baseCtor {
+				targets[2].sourceRange = true
+				protectedID = fixture.baseCtor.ID
+			} else {
+				targets[1].sourceRange = true
+			}
+
+			got, ok := placeExploreDivergentDefaultOwner(task, targets, match, constructor, owner, len(targets))
+			require.True(t, ok)
+			require.Len(t, got, len(targets))
+			protectedIndex := exploreTargetIndex(got, protectedID)
+			require.NotEqual(t, -1, protectedIndex, "exact source-range owner was replaced")
+			require.True(t, got[protectedIndex].sourceRange)
+			require.NotEqual(t, -1, exploreTargetIndex(got, fixture.childCtor.ID))
+			require.NotEqual(t, -1, exploreTargetIndex(got, fixture.childType.ID))
+			require.Equal(t, -1, exploreTargetIndex(got, tail.ID), "ordinary tail should fund the proven child pair")
+		})
+	}
+}
+
+func TestDivergentDefaultOwnerRejectsPromotionWhenSourceRangeBaseAndTailAreProtected(t *testing.T) {
+	task := `StreamHandler::write reports "could not be opened: Permission denied" after a rotating handler applies chmod`
+	fixture := monologDivergentDefaultFixture()
+	tail := divergentDefaultTestNode("src/Noise.php::Noise.tail", graph.KindMethod, "tail", "src/Noise.php", "function tail()")
+	targets := []exploreTarget{
+		{node: fixture.write},
+		{node: fixture.baseType},
+		{node: fixture.baseCtor, sourceRange: true},
+		{node: tail, sourceLiteral: true},
+	}
+	match := exploreDivergentDefaultOwner{
+		constructor: fixture.childCtor,
+		owner:       fixture.childType,
+		baseCtor:    fixture.baseCtor,
+		baseOwner:   fixture.baseType,
+		consumerID:  fixture.write.ID,
+	}
+
+	got, ok := placeExploreDivergentDefaultOwner(
+		task,
+		targets,
+		match,
+		exploreTarget{node: fixture.childCtor, divergentDefaultOwner: true},
+		exploreTarget{node: fixture.childType, divergentDefaultType: true},
+		len(targets),
+	)
+	require.False(t, ok)
+	require.Nil(t, got)
+	require.True(t, targets[2].sourceRange, "failed promotion mutated the cited base")
+	require.True(t, targets[3].sourceLiteral, "failed promotion mutated the protected tail")
+}
+
 func TestDivergentDefaultOwnerCallableFallbackFailsClosed(t *testing.T) {
 	task := `StreamHandler::write reports "could not be opened: Permission denied" after a rotating handler applies chmod; find the divergent filePermission default and owning type`
 	t.Run("no output capacity", func(t *testing.T) {
 		fixture := monologDivergentDefaultFixture()
 		fixture.targets = fixture.targets[:1]
-		got := promoteExploreDivergentDefaultOwner(task, fixture.targets, fixture.store, 2, divergentDefaultTestSource)
+		got := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, fixture.store, 2, divergentDefaultTestSource)
 		require.Equal(t, []exploreTarget{fixture.targets[0]}, got)
 	})
 	t.Run("irrelevant ranked callable", func(t *testing.T) {
 		fixture := monologDivergentDefaultFixture()
 		fixture.targets = fixture.targets[:1]
-		got := promoteExploreDivergentDefaultOwner("Investigate queue retry scheduling and backoff policy", fixture.targets, fixture.store, 3, divergentDefaultTestSource)
+		got := promoteExploreDivergentDefaultOwnerForTest("Investigate queue retry scheduling and backoff policy", fixture.targets, fixture.store, 3, divergentDefaultTestSource)
 		require.Equal(t, fixture.write.ID, got[0].node.ID)
 		require.Len(t, got, 1)
 	})
@@ -225,7 +356,7 @@ func TestDivergentDefaultOwnerCallableFallbackFailsClosed(t *testing.T) {
 			`function StreamHandler($filePermission = null)`,
 		)
 		fixture.store.AddNode(alternate)
-		got := promoteExploreDivergentDefaultOwner(task, fixture.targets, fixture.store, 3, divergentDefaultTestSource)
+		got := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, fixture.store, 3, divergentDefaultTestSource)
 		require.Equal(t, fixture.write.ID, got[0].node.ID)
 		require.Len(t, got, 1)
 	})
@@ -241,15 +372,15 @@ func TestDivergentDefaultOwnerCallableFallbackFailsClosed(t *testing.T) {
 				"function helper()",
 			))
 		}
-		got := promoteExploreDivergentDefaultOwner(task, fixture.targets, fixture.store, 3, divergentDefaultTestSource)
+		got := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, fixture.store, 3, divergentDefaultTestSource)
 		require.Equal(t, fixture.write.ID, got[0].node.ID)
 		require.Len(t, got, 1)
 	})
 	t.Run("owner hydration exceeds admission budget", func(t *testing.T) {
 		fixture := monologDivergentDefaultFixture()
 		fixture.targets = fixture.targets[:1]
-		counted := &countingDivergentDefaultStore{Store: fixture.store, nodeBatchDelay: exploreDefaultOwnerFallbackSLO + time.Millisecond}
-		got := promoteExploreDivergentDefaultOwner(task, fixture.targets, counted, 3, divergentDefaultTestSource)
+		counted := &countingDivergentDefaultStore{Store: fixture.store, nodeBatchDelay: 2 * exploreDefaultOwnerFallbackSLO}
+		got := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, counted, 3, divergentDefaultTestSource)
 		require.Equal(t, fixture.write.ID, got[0].node.ID)
 		require.Len(t, got, 1)
 		require.Equal(t, 1, counted.nodeBatchCalls)
@@ -284,7 +415,7 @@ func TestDivergentDefaultOwnerFailsClosedOnMissingOrInvalidStoreEvidence(t *test
 		t.Run(test.name, func(t *testing.T) {
 			fixture := monologDivergentDefaultFixture()
 			test.mutate(fixture)
-			got := promoteExploreDivergentDefaultOwner(task, fixture.targets, fixture.store, len(fixture.targets), divergentDefaultTestSource)
+			got := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, fixture.store, len(fixture.targets), divergentDefaultTestSource)
 			require.Equal(t, fixture.write.ID, got[0].node.ID)
 			require.False(t, got[0].divergentDefaultOwner)
 		})
@@ -301,7 +432,7 @@ func TestDivergentDefaultOwnerRejectsAmbiguousOrOversizedInboundProjection(t *te
 			{From: secondCtor.ID, To: fixture.baseCtor.ID, Kind: graph.EdgeCalls},
 			{From: secondType.ID, To: fixture.baseType.ID, Kind: graph.EdgeExtends},
 		})
-		got := promoteExploreDivergentDefaultOwner(task, fixture.targets, fixture.store, len(fixture.targets), divergentDefaultTestSource)
+		got := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, fixture.store, len(fixture.targets), divergentDefaultTestSource)
 		require.Equal(t, fixture.write.ID, got[0].node.ID)
 	})
 	t.Run("edge cap", func(t *testing.T) {
@@ -314,7 +445,7 @@ func TestDivergentDefaultOwnerRejectsAmbiguousOrOversizedInboundProjection(t *te
 			edges = append(edges, &graph.Edge{From: node.ID, To: fixture.baseCtor.ID, Kind: graph.EdgeCalls})
 		}
 		fixture.store.AddBatch(nodes, edges)
-		got := promoteExploreDivergentDefaultOwner(task, fixture.targets, fixture.store, len(fixture.targets), divergentDefaultTestSource)
+		got := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, fixture.store, len(fixture.targets), divergentDefaultTestSource)
 		require.Equal(t, fixture.write.ID, got[0].node.ID)
 	})
 }
@@ -367,7 +498,7 @@ func TestDivergentDefaultOwnerRequiresExecutableForwardingIntoProvenBaseCall(t *
 	}
 	for _, source := range negative {
 		fixture := monologDivergentDefaultFixture()
-		got := promoteExploreDivergentDefaultOwner(task, fixture.targets, fixture.store, len(fixture.targets), func(*graph.Node) string { return source })
+		got := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, fixture.store, len(fixture.targets), func(*graph.Node) string { return source })
 		require.Equal(t, fixture.write.ID, got[0].node.ID, "non-executable forwarding was accepted: %q", source)
 	}
 }
@@ -406,7 +537,7 @@ func TestHandleExplorePromotesDivergentDefaultOwnerFromSQLitePHPIndex(t *testing
 	require.True(t, hasFixtureEdge(store.GetInEdges(serializableContract.ID), statusType.ID, serializableContract.ID, graph.EdgeImplements), "PHP index must resolve enum conformance")
 
 	task := `StreamHandler::write reports "could not be opened: Permission denied" after a rotating handler applies chmod; find the divergent filePermission default and owning type`
-	direct := promoteExploreDivergentDefaultOwner(task, []exploreTarget{{node: write}, {node: baseType}, {node: baseCtor}}, store, 3, func(node *graph.Node) string {
+	direct := promoteExploreDivergentDefaultOwnerForTest(task, []exploreTarget{{node: write}, {node: baseType}, {node: baseCtor}}, store, 3, func(node *graph.Node) string {
 		return server.manifestSymbolSource(context.Background(), node)
 	}, pinnedDivergentDefaultFallbackSLO)
 	require.Equal(t, childCtor.ID, direct[0].node.ID, "real store projection did not promote child constructor")
@@ -415,7 +546,7 @@ func TestHandleExplorePromotesDivergentDefaultOwnerFromSQLitePHPIndex(t *testing
 	// ranked-callable projection runs and its batched SQLite reads must finish
 	// inside the slice. This assertion is about WHICH owner is promoted, not
 	// about how fast the machine is, so the slice is pinned.
-	fallback := promoteExploreDivergentDefaultOwner(task, []exploreTarget{{node: write}}, store, 3, func(node *graph.Node) string {
+	fallback := promoteExploreDivergentDefaultOwnerForTest(task, []exploreTarget{{node: write}}, store, 3, func(node *graph.Node) string {
 		return server.manifestSymbolSource(context.Background(), node)
 	}, pinnedDivergentDefaultFallbackSLO)
 	require.Equal(t, childCtor.ID, fallback[0].node.ID, "real store callable-owner fallback did not promote child constructor")
@@ -577,7 +708,7 @@ func BenchmarkPromoteExploreDivergentDefaultOwner24(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for index := 0; index < b.N; index++ {
-		if got := promoteExploreDivergentDefaultOwner(task, fixture.targets, fixture.store, len(fixture.targets), divergentDefaultTestSource); !got[0].divergentDefaultOwner {
+		if got := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, fixture.store, len(fixture.targets), divergentDefaultTestSource); !got[0].divergentDefaultOwner {
 			b.Fatal("expected promotion")
 		}
 	}
@@ -594,7 +725,7 @@ func BenchmarkPromoteExploreDivergentDefaultOwnerFromCallable24(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for index := 0; index < b.N; index++ {
-		if got := promoteExploreDivergentDefaultOwner(task, fixture.targets, fixture.store, 26, divergentDefaultTestSource); !got[0].divergentDefaultOwner {
+		if got := promoteExploreDivergentDefaultOwnerForTest(task, fixture.targets, fixture.store, 26, divergentDefaultTestSource); !got[0].divergentDefaultOwner {
 			b.Fatal("expected promotion")
 		}
 	}

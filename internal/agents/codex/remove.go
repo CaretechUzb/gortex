@@ -238,6 +238,7 @@ func removeCodexHooks(root map[string]any) bool {
 		"UserPromptSubmit": codexHookEntryIsGortexUserPromptSubmit,
 		"PreToolUse":       codexHookEntryIsGortexPreToolUse,
 		"PostToolUse":      codexHookEntryIsGortexPostToolUse,
+		"Stop":             codexHookEntryIsGortexStop,
 	}
 	changed := false
 	for event, isGortex := range recognisers {

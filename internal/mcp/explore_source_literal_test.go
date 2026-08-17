@@ -28,9 +28,21 @@ import (
 
 type exploreSourceLiteralCountingStore struct {
 	graph.Store
-	allNodesCalls     int
-	outEdgeBatchCalls int
-	nodeLookupBatches int
+	allNodesCalls         int
+	outEdgeBatchCalls     int
+	outSiteBatchCalls     int
+	outEndpointBatchCalls int
+	nodeLookupBatches     int
+	lastSites             []graph.EdgeSourceSite
+	lastSiteKinds         []graph.EdgeKind
+	lastSiteLimit         int
+	lastEndpointIDs       []string
+	lastEndpointKinds     []graph.EdgeKind
+	lastEndpointLimit     int
+	lastNodeIDs           []string
+	siteLookup            func(context.Context, []graph.EdgeSourceSite, []graph.EdgeKind, int) (graph.BoundedSiteEdgeIdentityProjection, error)
+	endpointLookup        func(context.Context, []string, []graph.EdgeKind, int) (graph.BoundedEdgeIdentityProjection, error)
+	nodeLookup            func(context.Context, []string) (map[string]*graph.Node, error)
 }
 
 func (s *exploreSourceLiteralCountingStore) AllNodes() []*graph.Node {
@@ -45,7 +57,63 @@ func (s *exploreSourceLiteralCountingStore) GetOutEdgesByNodeIDs(ids []string) m
 
 func (s *exploreSourceLiteralCountingStore) GetNodesByIDs(ids []string) map[string]*graph.Node {
 	s.nodeLookupBatches++
+	s.lastNodeIDs = append([]string(nil), ids...)
 	return s.Store.GetNodesByIDs(ids)
+}
+
+func (s *exploreSourceLiteralCountingStore) GetNodesByIDsContext(
+	ctx context.Context,
+	ids []string,
+) (map[string]*graph.Node, error) {
+	s.nodeLookupBatches++
+	s.lastNodeIDs = append([]string(nil), ids...)
+	if s.nodeLookup != nil {
+		return s.nodeLookup(ctx, ids)
+	}
+	return s.Store.(exploreContextNodesReader).GetNodesByIDsContext(ctx, ids)
+}
+
+func (s *exploreSourceLiteralCountingStore) FindOutgoingSiteEdgeIdentitiesBounded(
+	ctx context.Context,
+	sites []graph.EdgeSourceSite,
+	kinds []graph.EdgeKind,
+	limit int,
+) (graph.BoundedSiteEdgeIdentityProjection, error) {
+	s.outSiteBatchCalls++
+	s.lastSites = append([]graph.EdgeSourceSite(nil), sites...)
+	s.lastSiteKinds = append([]graph.EdgeKind(nil), kinds...)
+	s.lastSiteLimit = limit
+	if s.siteLookup != nil {
+		return s.siteLookup(ctx, sites, kinds, limit)
+	}
+	return s.Store.(graph.BoundedOutgoingSiteEdgeIdentityReader).
+		FindOutgoingSiteEdgeIdentitiesBounded(ctx, sites, kinds, limit)
+}
+
+func (s *exploreSourceLiteralCountingStore) FindOutgoingEdgeIdentitiesBounded(
+	ctx context.Context,
+	ids []string,
+	kinds []graph.EdgeKind,
+	limit int,
+) (graph.BoundedEdgeIdentityProjection, error) {
+	s.outEndpointBatchCalls++
+	s.lastEndpointIDs = append([]string(nil), ids...)
+	s.lastEndpointKinds = append([]graph.EdgeKind(nil), kinds...)
+	s.lastEndpointLimit = limit
+	if s.endpointLookup != nil {
+		return s.endpointLookup(ctx, ids, kinds, limit)
+	}
+	return s.Store.(graph.BoundedOutgoingEdgeIdentityReader).
+		FindOutgoingEdgeIdentitiesBounded(ctx, ids, kinds, limit)
+}
+
+func (s *exploreSourceLiteralCountingStore) FindFileNodesBounded(
+	ctx context.Context,
+	path string,
+	scope graph.LocalizationNodeScope,
+	limit int,
+) (graph.BoundedNodeProjection, error) {
+	return s.Store.(graph.BoundedFileNodeReader).FindFileNodesBounded(ctx, path, scope, limit)
 }
 
 type exploreSourceLiteralBlockingStore struct {
@@ -53,13 +121,18 @@ type exploreSourceLiteralBlockingStore struct {
 	started chan struct{}
 }
 
-func (s *exploreSourceLiteralBlockingStore) GetFileNodesContext(ctx context.Context, _ string) []*graph.Node {
+func (s *exploreSourceLiteralBlockingStore) FindFileNodesBounded(
+	ctx context.Context,
+	_ string,
+	_ graph.LocalizationNodeScope,
+	_ int,
+) (graph.BoundedNodeProjection, error) {
 	select {
 	case s.started <- struct{}{}:
 	default:
 	}
 	<-ctx.Done()
-	return nil
+	return graph.BoundedNodeProjection{}, ctx.Err()
 }
 
 type exploreSourceLiteralOrderedStore struct {
@@ -69,13 +142,26 @@ type exploreSourceLiteralOrderedStore struct {
 	calls       []string
 }
 
-func (s *exploreSourceLiteralOrderedStore) GetFileNodesContext(ctx context.Context, path string) []*graph.Node {
+func (s *exploreSourceLiteralOrderedStore) FindFileNodesBounded(
+	ctx context.Context,
+	path string,
+	_ graph.LocalizationNodeScope,
+	limit int,
+) (graph.BoundedNodeProjection, error) {
 	s.calls = append(s.calls, path)
 	if path == s.blockPath {
 		<-ctx.Done()
-		return nil
+		return graph.BoundedNodeProjection{}, ctx.Err()
 	}
-	return s.nodesByPath[path]
+	nodes := s.nodesByPath[path]
+	if len(nodes) <= limit {
+		return graph.BoundedNodeProjection{Nodes: nodes, Total: len(nodes)}, nil
+	}
+	return graph.BoundedNodeProjection{
+		Nodes:     nodes[:limit],
+		Total:     limit + 1,
+		Truncated: true,
+	}, nil
 }
 
 func (s *exploreSourceLiteralOrderedStore) GetOutEdgesByNodeIDs([]string) map[string][]*graph.Edge {
@@ -125,6 +211,21 @@ func sourceLiteralNode(id, name, path string, kind graph.NodeKind, start, end in
 		ID: id, Name: name, QualName: id, Kind: kind,
 		FilePath: path, RepoPrefix: "demo", Language: "csharp",
 		StartLine: start, EndLine: end,
+	}
+}
+
+func requireSourceLiteralHitIdentity(t testing.TB, hits []exploreSourceLiteralHit, expected ...exploreSourceLiteralHit) {
+	t.Helper()
+	require.Len(t, hits, len(expected))
+	for index := range expected {
+		require.Equal(t, expected[index].nodeID, hits[index].nodeID)
+		require.Equal(t, expected[index].rank, hits[index].rank)
+		require.Equal(t, expected[index].anchor, hits[index].anchor)
+		require.Equal(t, expected[index].ambiguous, hits[index].ambiguous)
+		require.Equal(t, expected[index].callee, hits[index].callee)
+		require.NotEmpty(t, hits[index].matchPath)
+		require.Positive(t, hits[index].matchLine)
+		require.NotEmpty(t, hits[index].literal)
 	}
 }
 
@@ -179,10 +280,14 @@ func TestMapExploreSourceLiteralMatchesPromotesUniqueDirectCalleeAcrossLanguages
 				Path: path, Line: 3, Text: test.line,
 			}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-			require.Equal(t, []exploreSourceLiteralHit{{nodeID: callee.ID, rank: 0, callee: true}}, recall.hits)
+			requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: callee.ID, rank: 0, callee: true})
 			require.Equal(t, callee.FilePath, recall.ownerFiles[callee.ID])
 			require.Zero(t, counting.allNodesCalls, "callee promotion must remain batch- and file-bounded")
-			require.Equal(t, 1, counting.outEdgeBatchCalls)
+			require.Zero(t, counting.outEdgeBatchCalls, "legacy adjacency must not be queried")
+			require.Equal(t, 1, counting.outSiteBatchCalls)
+			require.Equal(t, []graph.EdgeSourceSite{{From: owner.ID, Line: 3}}, counting.lastSites)
+			require.Equal(t, []graph.EdgeKind{graph.EdgeCalls}, counting.lastSiteKinds)
+			require.Equal(t, exploreSourceLiteralCallEdgesPerSite, counting.lastSiteLimit)
 			require.Equal(t, 1, counting.nodeLookupBatches)
 		})
 	}
@@ -202,7 +307,13 @@ func TestMapExploreSourceLiteralMatchesDoesNotPromoteAmbiguousCallee(t *testing.
 		Path: path, Line: 3, Text: `RegisterDefaultFormatter("ku");`,
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: owner.ID, rank: 0}}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: owner.ID, rank: 0})
+	target := exploreTarget{
+		node: owner, source: "void configure() {}", exactContent: true,
+		sourceLiteral: true, sourceLiteralCallee: recall.hits[0].callee,
+	}
+	require.Equal(t, localizationProvenanceContentLiteral, localizationTargetProvenance(localizationCompletion{}, target))
+	require.False(t, localizationStrongSourceLiteralCallee(target), "ambiguous call edges must remain advisory")
 }
 
 func TestMapExploreSourceLiteralMatchesDoesNotPromoteAssignment(t *testing.T) {
@@ -217,9 +328,15 @@ func TestMapExploreSourceLiteralMatchesDoesNotPromoteAssignment(t *testing.T) {
 		Path: path, Line: 3, Text: `const locale = "ku";`,
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: owner.ID, rank: 0}}, recall.hits,
-		"an unrelated same-line edge must not turn an assignment into a callsite")
-	require.Zero(t, counting.outEdgeBatchCalls, "non-call literal hits must not query graph adjacency")
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: owner.ID, rank: 0})
+	target := exploreTarget{
+		node: owner, source: "void configure() {}", exactContent: true,
+		sourceLiteral: true, sourceLiteralCallee: recall.hits[0].callee,
+	}
+	require.Equal(t, localizationProvenanceContentLiteral, localizationTargetProvenance(localizationCompletion{}, target))
+	require.False(t, localizationStrongSourceLiteralCallee(target), "assignment literals must remain advisory")
+	require.Zero(t, counting.outEdgeBatchCalls, "non-call literal hits must not query legacy graph adjacency")
+	require.Zero(t, counting.outSiteBatchCalls, "non-call literal hits must not query graph adjacency")
 	require.Zero(t, counting.nodeLookupBatches, "non-call literal hits must not query callee nodes")
 }
 
@@ -228,6 +345,20 @@ func TestExploreSourceLiteralLocalCalleeRejectsCrossRepositoryTarget(t *testing.
 	callee := sourceLiteralNode("other/registry.cs::register", "RegisterDefaultFormatter", "other/registry.cs", graph.KindMethod, 7, 9)
 	callee.RepoPrefix = "other"
 	require.False(t, exploreSourceLiteralLocalCallee(owner, callee, "RegisterDefaultFormatter", query.QueryOptions{}))
+
+	server, _ := newExploreSourceLiteralGraphServer(t, []*graph.Node{owner, callee}, []*graph.Edge{{
+		From: owner.ID, To: callee.ID, Kind: graph.EdgeCalls, FilePath: owner.FilePath, Line: 3,
+	}})
+	recall := server.mapExploreSourceLiteralMatches("ku", []trigram.Match{{
+		Path: owner.FilePath, Line: 3, Text: `RegisterDefaultFormatter("ku");`,
+	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: owner.ID, rank: 0})
+	target := exploreTarget{
+		node: owner, source: "void configure() {}", exactContent: true,
+		sourceLiteral: true, sourceLiteralCallee: recall.hits[0].callee,
+	}
+	require.Equal(t, localizationProvenanceContentLiteral, localizationTargetProvenance(localizationCompletion{}, target))
+	require.False(t, localizationStrongSourceLiteralCallee(target), "cross-repository edges must remain advisory")
 }
 
 func TestSourceLiteralCalleeRemainsAuthorizedForRefinement(t *testing.T) {
@@ -259,7 +390,7 @@ func TestMapExploreSourceLiteralMatchesFindsCSharpConstructor(t *testing.T) {
 		Path: path, Line: 24, Text: `Register("ku", new CentralKurdishFormatter());`,
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: constructor.ID, rank: 0}}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: constructor.ID, rank: 0})
 	require.False(t, recall.ambiguous)
 }
 
@@ -276,7 +407,7 @@ func TestMapExploreSourceLiteralMatchesFallsBackToSingleRepoUnprefixedPath(t *te
 		Path: matchPath, Line: 24, Text: `RegisterDefaultFormatter("ku");`,
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"humanizer-1059": true}})
 
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: constructor.ID, rank: 0}}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: constructor.ID, rank: 0})
 	require.False(t, recall.ambiguous)
 }
 
@@ -293,10 +424,10 @@ func TestMapExploreSourceLiteralMatchesPrefersExactPathOverAlias(t *testing.T) {
 		Path: matchPath, Line: 24, Text: `RegisterDefaultFormatter("ku");`,
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"humanizer-1059": true}})
 
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: exact.ID, rank: 0}}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: exact.ID, rank: 0})
 }
 
-func TestMapExploreSourceLiteralMatchesQueriesExactPathsBeforeAliases(t *testing.T) {
+func TestMapExploreSourceLiteralMatchesPreservesFirstSeenExactPathsBeforeAliases(t *testing.T) {
 	exactA := sourceLiteralNode("demo/src/a.cs::Register", "RegisterA", "demo/src/a.cs", graph.KindMethod, 1, 5)
 	exactB := sourceLiteralNode("demo/src/b.cs::Register", "RegisterB", "demo/src/b.cs", graph.KindMethod, 1, 5)
 	store := &exploreSourceLiteralOrderedStore{
@@ -315,12 +446,13 @@ func TestMapExploreSourceLiteralMatchesQueriesExactPathsBeforeAliases(t *testing
 		{Path: exactA.FilePath, Line: 3, Text: `Register("ku")`},
 	}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-	require.Equal(t, []string{"demo/src/a.cs", "demo/src/b.cs", "src/a.cs"}, store.calls)
-	require.Equal(t, []exploreSourceLiteralHit{
-		{nodeID: exactB.ID, rank: 0},
-		{nodeID: exactA.ID, rank: 1},
-	}, recall.hits)
-	require.True(t, recall.ambiguous)
+	require.Equal(t, []string{"demo/src/b.cs", "demo/src/a.cs", "src/b.cs", "src/a.cs"}, store.calls)
+	requireSourceLiteralHitIdentity(t, recall.hits,
+		exploreSourceLiteralHit{nodeID: exactB.ID, rank: 0},
+		exploreSourceLiteralHit{nodeID: exactA.ID, rank: 1},
+	)
+	// Two owners from a complete search are two settled sites, not noise.
+	require.False(t, recall.ambiguous)
 }
 
 func TestMapExploreSourceLiteralMatchesChoosesSmallestEnclosingSymbol(t *testing.T) {
@@ -334,7 +466,7 @@ func TestMapExploreSourceLiteralMatchesChoosesSmallestEnclosingSymbol(t *testing
 		Path: path, Line: 23, Text: `register("ku")`,
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: closure.ID, rank: 0}}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: closure.ID, rank: 0})
 }
 
 func TestMapExploreSourceLiteralMatchesKeepsCommonLiteralNonTerminal(t *testing.T) {
@@ -348,7 +480,9 @@ func TestMapExploreSourceLiteralMatchesKeepsCommonLiteralNonTerminal(t *testing.
 	}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
 	require.Len(t, recall.hits, 2)
-	require.True(t, recall.ambiguous)
+	// A complete two-owner recall is settled evidence for both sites; the
+	// ambiguity mark is reserved for saturated or owner-cap-overflowing terms.
+	require.False(t, recall.ambiguous)
 	targets := []exploreTarget{
 		{node: left, exactContent: true, exactContentAmbiguous: true},
 		{node: right, exactContent: true, exactContentAmbiguous: true},
@@ -399,7 +533,7 @@ func TestMapDiscoveredExploreSourceLiteralMatchesPreservesHitsAfterDiscoveryDead
 	)
 
 	require.NoError(t, mappingErr)
-	require.Equal(t, []exploreSourceLiteralHit{{nodeID: constructor.ID, rank: 0}}, recall.hits)
+	requireSourceLiteralHitIdentity(t, recall.hits, exploreSourceLiteralHit{nodeID: constructor.ID, rank: 0})
 	require.True(t, recall.ambiguous, "deadline-truncated discovery must remain non-terminal")
 }
 
@@ -554,11 +688,37 @@ func TestRetainExploreSourceLiteralOwnersDiversifiesFilesWithinCaps(t *testing.T
 
 	hits, files, reason := retainExploreSourceLiteralOwners(recall)
 
-	require.Equal(t, []string{"first-a", "second", "first-b"}, []string{
+	require.Equal(t, []string{"first-a", "second", "third"}, []string{
 		hits[0].nodeID, hits[1].nodeID, hits[2].nodeID,
 	})
 	require.Equal(t, exploreSourceLiteralRecallMaxFilesPerTerm, files)
-	require.Equal(t, "file_cap", reason)
+	require.Equal(t, "owner_cap", reason)
+}
+
+func TestRetainExploreSourceLiteralOwnersPrefersResolvedCalleeWithinFileDiverseCaps(t *testing.T) {
+	recall := exploreSourceLiteralRecall{
+		hits: []exploreSourceLiteralHit{
+			{nodeID: "owner-a", rank: 0},
+			{nodeID: "owner-b", rank: 1},
+			{nodeID: "other-file", rank: 2},
+			{nodeID: "resolved-callee", rank: 3, callee: true},
+		},
+		ownerFiles: map[string]string{
+			"owner-a":         "src/first.go",
+			"owner-b":         "src/first.go",
+			"other-file":      "src/second.go",
+			"resolved-callee": "src/first.go",
+		},
+	}
+
+	hits, files, reason := retainExploreSourceLiteralOwners(recall)
+
+	require.Equal(t, []string{"resolved-callee", "other-file", "owner-a"}, []string{
+		hits[0].nodeID, hits[1].nodeID, hits[2].nodeID,
+	})
+	require.True(t, hits[0].callee)
+	require.Equal(t, 2, files)
+	require.Equal(t, "owner_cap", reason)
 }
 
 func TestGatherExploreSourceLiteralRecallAggregatesCompactAnchorsAcrossLanguages(t *testing.T) {
@@ -652,7 +812,8 @@ func TestGatherExploreSourceLiteralRecallAggregatesCompactAnchorsAcrossLanguages
 			require.NotNil(t, secondCandidate)
 			require.Equal(t, float64(1), firstCandidate.Signals[exploreSourceLiteralCoverageSignal])
 			require.Equal(t, float64(2), secondCandidate.Signals[exploreSourceLiteralCoverageSignal])
-			require.Positive(t, firstCandidate.Signals[exploreContentRecallAmbiguousSignal])
+			require.Zero(t, firstCandidate.Signals[exploreContentRecallAmbiguousSignal],
+				"a complete two-owner recall settles both sites")
 			require.Zero(t, secondCandidate.Signals[exploreContentRecallAmbiguousSignal])
 		})
 	}
@@ -743,7 +904,8 @@ func TestGatherExploreSourceLiteralRecallKeepsMultiAnchorOwnerUnderNearCapCompet
 	targetCandidate := candidateByID(sourceCandidates, target.ID)
 	require.NotNil(t, targetCandidate)
 	require.Equal(t, float64(2), targetCandidate.Signals[exploreSourceLiteralCoverageSignal])
-	require.Positive(t, targetCandidate.Signals[exploreContentRecallAmbiguousSignal])
+	require.Zero(t, targetCandidate.Signals[exploreContentRecallAmbiguousSignal],
+		"a complete two-owner recall settles the multi-anchor owner")
 	ordinary := []*rerank.Candidate{
 		sourcePreservationCandidate("semantic-0", 0, 0),
 		sourcePreservationCandidate("semantic-1", 1, 0),
@@ -758,18 +920,18 @@ func TestGatherExploreSourceLiteralRecallKeepsMultiAnchorOwnerUnderNearCapCompet
 }
 
 func TestGatherExploreSourceLiteralRecallRecordsTermCapDiagnostic(t *testing.T) {
-	// "cc" must be reported as term_cap, not as a deadline the runner caused.
+	// "ee" must be reported as term_cap, not as a deadline the runner caused.
 	server := pinExploreSourceLiteralRecallBudget(&Server{logger: zap.NewNop()})
 	recall := server.gatherExploreSourceLiteralRecall(
-		context.Background(), []string{"aa", "bb", "cc"}, "demo", query.QueryOptions{},
+		context.Background(), []string{"aa", "bb", "cc", "dd", "ee"}, "demo", query.QueryOptions{},
 	)
 
-	require.Len(t, recall.diagnostics, 3)
+	require.Len(t, recall.diagnostics, 5)
 	byLiteral := make(map[string]exploreSourceLiteralDiagnostic, len(recall.diagnostics))
 	for _, diagnostic := range recall.diagnostics {
 		byLiteral[diagnostic.literal] = diagnostic
 	}
-	require.Equal(t, "term_cap", byLiteral["cc"].reason)
+	require.Equal(t, "term_cap", byLiteral["ee"].reason)
 }
 
 func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.T) {
@@ -832,6 +994,11 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	require.NotEmpty(t, envelope.Evidence)
 	require.Equal(t, "RegisterDefaultFormatter", envelope.Evidence[0].Name, "invoked source evidence must lead the final localization envelope")
 	require.Equal(t, localizationProvenanceSourceLiteralCallee, envelope.Evidence[0].Provenance)
+	require.NotNil(t, envelope.SourceWindow)
+	require.Equal(t, rel, envelope.SourceWindow.Path)
+	require.Equal(t, 3, envelope.SourceWindow.MatchLine)
+	require.Equal(t, envelope.Evidence[0].ID, envelope.SourceWindow.AnchorSymbol)
+	require.Contains(t, envelope.SourceWindow.Content, `RegisterDefaultFormatter("ku")`)
 	require.Equal(t, localizationStateAnswerReady, envelope.Completion.State)
 	require.True(t, envelope.Terminal)
 	require.True(t, envelope.Completion.Enforceable)
@@ -956,10 +1123,17 @@ func TestExploreCompactLiteralIgnoresTestMetadataAndPrefersSpecificProductionCal
 		}
 	}
 	require.NotEqual(t, -1, specificRank, "construction-aligned source evidence must survive final packing")
-	require.Equal(t, localizationStateNeedsRefinement, envelope.Completion.State)
-	require.False(t, envelope.Terminal)
-	require.False(t, envelope.Completion.Enforceable, "ambiguous production literal sites remain advisory")
-	require.Contains(t, envelope.Completion.AllowedSymbols, specificID)
+	// Two settled production registration sites are the complete answer, not
+	// grounds for another recovery turn: the page terminal-claims with both
+	// sites presented.
+	require.Equal(t, localizationStateAnswerReady, envelope.Completion.State)
+	require.True(t, envelope.Terminal)
+	evidenceIDs := make([]string, 0, len(envelope.Evidence))
+	for _, evidence := range envelope.Evidence {
+		evidenceIDs = append(evidenceIDs, evidence.ID)
+	}
+	require.Contains(t, evidenceIDs, specificID)
+	require.Contains(t, evidenceIDs, genericID, "both settled production sites must be presented")
 }
 
 func TestGatherExploreSourceLiteralRecallBoundsMappingByRequestDeadline(t *testing.T) {

@@ -300,8 +300,8 @@ func TestLocalizationBudgetLeavesRoomForOutlineBesideEvidence(t *testing.T) {
 		t.Fatalf("envelope = %d bytes, budget = %d",
 			bytes, localizationDefaultBudgetTokens*localizationEnvelopeBytesPerToken)
 	}
-	if envelope.Outline == nil || len(envelope.Outline.Rows) != localizationOutlineRowCap {
-		t.Fatalf("outline = %#v, want %d rows beside the evidence", envelope.Outline, localizationOutlineRowCap)
+	if envelope.Outline == nil || len(envelope.Outline.Rows) != len(declared) || envelope.Outline.Elided != 0 {
+		t.Fatalf("outline = %#v, want all %d rows beside the evidence", envelope.Outline, len(declared))
 	}
 	if len(envelope.Evidence) != len(targets) {
 		t.Fatalf("evidence rows = %d, want all %d ranked rows beside the outline",
@@ -774,17 +774,18 @@ func TestFurtherFilesGiveWayBeforeTheLeadingFilesDepth(t *testing.T) {
 		})
 	}
 	leading.Declared = len(leading.all)
-	leading.elide(localizationOutlineRowCap)
+	leading.elide(localizationOutlineCompleteRows)
 	page := &localizationPageOutline{Leading: leading}
-	for _, file := range []string{"repo/second.go", "repo/third.go"} {
-		other := &localizationFileOutline{File: file}
-		for index := 0; index < 20; index++ {
+	for index, file := range []string{"repo/second.go", "repo/third.go"} {
+		rank := index + 1
+		other := &localizationFileOutline{File: file, rank: rank}
+		for row := 0; row < 20; row++ {
 			other.all = append(other.all, localizationOutlineRow{
-				Name: fmt.Sprintf("Other%02d", index), Line: index + 1, Kind: "f",
+				Name: fmt.Sprintf("Other%02d", row), Line: row + 1, Kind: "f",
 			})
 		}
 		other.Declared = len(other.all)
-		other.elide(localizationOutlineSecondFileRowCap)
+		other.elide(localizationOutlineFileRowCap(rank))
 		page.Others = append(page.Others, other)
 	}
 
@@ -809,9 +810,9 @@ func TestFurtherFilesGiveWayBeforeTheLeadingFilesDepth(t *testing.T) {
 		t.Fatalf("further files dropped %d times, want 2", len(depthWhenAFileWent))
 	}
 	for _, depth := range depthWhenAFileWent {
-		if depth < localizationOutlineSecondFileRowCap {
-			t.Fatalf("a further file survived the leading file's depth falling to %d, floor %d",
-				depth, localizationOutlineSecondFileRowCap)
+		if depth != len(leading.all) {
+			t.Fatalf("a further file outlived the leading file's complete %d-row depth: %d",
+				len(leading.all), depth)
 		}
 	}
 }
@@ -959,6 +960,256 @@ func TestOutlineElisionRanksStrongerTaskTermMatchesFirst(t *testing.T) {
 	}
 }
 
+func TestOutlineTopTwoFilesKeepAllRetainedDeclarations(t *testing.T) {
+	leading := outlineDeclaredFile(localizationOutlineRowCap + 7)
+	secondFile := "repo/second.go"
+	secondCount := localizationOutlineFloorRows + 13
+	second := make([]*graph.Node, 0, secondCount)
+	for index := 0; index < secondCount; index++ {
+		second = append(second, outlineFileDeclaration(secondFile, fmt.Sprintf("Second%02d", index), index+1))
+	}
+	targets := []exploreTarget{{node: leading[0]}, {node: second[0]}}
+	page := boundedLocalizationPageOutlineProvider(
+		outlinePool(leading[0]), targets, nil,
+		func(file string) []*graph.Node {
+			if file == outlineLeadingFile {
+				return leading
+			}
+			return second
+		},
+	)()
+
+	if page == nil || page.Leading == nil || len(page.Others) != 1 {
+		t.Fatalf("page = %#v, want complete retained top-two outlines", page)
+	}
+	if got := len(page.Leading.Rows); got != len(leading) {
+		t.Fatalf("leading rows = %d, want all %d retained declarations", got, len(leading))
+	}
+	if page.Leading.Declared != len(leading) || page.Leading.Elided != 0 || page.Leading.Truncated {
+		t.Fatalf("leading counts = %#v, want exact complete retained outline", page.Leading)
+	}
+	if got := len(page.Others[0].Rows); got != len(second) {
+		t.Fatalf("second rows = %d, want all %d retained declarations", got, len(second))
+	}
+	if page.Others[0].Declared != len(second) || page.Others[0].Elided != 0 || page.Others[0].Truncated {
+		t.Fatalf("second counts = %#v, want exact complete retained outline", page.Others[0])
+	}
+}
+
+func TestRankAwareOutlinePagesReportTruncationLowerBounds(t *testing.T) {
+	files := []string{outlineLeadingFile, "repo/second.go", "repo/third.go"}
+	byFile := make(map[string]localizationFileDeclarations, len(files))
+	for rank, file := range files {
+		limit := localizationOutlineFileFetchLimit(rank)
+		nodes := make([]*graph.Node, 0, limit)
+		for index := 0; index < limit; index++ {
+			nodes = append(nodes, outlineFileDeclaration(file, fmt.Sprintf("Declaration%04d", index), index+1))
+		}
+		byFile[file] = localizationFileDeclarations{
+			Nodes: nodes, Declared: limit + 1, DeclaredKnown: false, Truncated: true,
+		}
+	}
+	targets := []exploreTarget{
+		{node: byFile[files[0]].Nodes[0]},
+		{node: byFile[files[1]].Nodes[0]},
+		{node: byFile[files[2]].Nodes[0]},
+	}
+	page := boundedLocalizationPageOutlineProvider(
+		outlinePool(targets[0].node), targets, nil,
+		func(file string, _ int) localizationFileDeclarations { return byFile[file] },
+	)()
+	if page == nil || page.Leading == nil || len(page.Others) != 2 {
+		t.Fatalf("page = %#v, want three ranked outlines", page)
+	}
+	for _, outline := range []*localizationFileOutline{page.Leading, page.Others[0]} {
+		if !outline.Truncated || outline.Declared != localizationFileNodeLimit+1 ||
+			outline.Elided != 1 || len(outline.Rows) != localizationFileNodeLimit {
+			t.Fatalf("protected truncated outline = %#v, want 1024 rows and lower bound 1025", outline)
+		}
+	}
+	trailing := page.Others[1]
+	wantTrailingElided := localizationOutlineTrailingFileFetchLimit + 1 - localizationOutlineFloorRows
+	if !trailing.Truncated || trailing.Declared != localizationOutlineTrailingFileFetchLimit+1 ||
+		trailing.Elided != wantTrailingElided || len(trailing.Rows) != localizationOutlineFloorRows {
+		t.Fatalf("trailing truncated outline = %#v, want 8 rows and lower bound 129", trailing)
+	}
+}
+
+func TestOutlineProviderEnumeratesAtMostTenDistinctFiles(t *testing.T) {
+	if localizationOutlineFileCap != 10 {
+		t.Fatalf("outline file cap = %d, want 10", localizationOutlineFileCap)
+	}
+	targets := outlineBreadthTargets(localizationOutlineFileCap + 1)
+	enumerated := 0
+	page := localizationPageOutlineProvider(nil, targets, nil, func(file string) []*graph.Node {
+		enumerated++
+		return []*graph.Node{
+			outlineFileDeclaration(file, "Ranked", 1),
+			outlineFileDeclaration(file, "Unranked", 2),
+		}
+	})()
+	if page == nil {
+		t.Fatal("page outline is absent")
+	}
+	if enumerated != localizationOutlineFileCap {
+		t.Fatalf("enumerated %d files, want cap %d", enumerated, localizationOutlineFileCap)
+	}
+	if got := len(page.Others); got > localizationOutlineFileCap {
+		t.Fatalf("serialized %d outlines, cap %d", got, localizationOutlineFileCap)
+	}
+}
+
+func TestOutlineSkipUsesDeclarationIdentity(t *testing.T) {
+	leading := outlineDeclaration("Lead", 1)
+	secondFile := "repo/second.go"
+	thirdFile := "repo/third.go"
+	fourthFile := "repo/fourth.go"
+	second := outlineFileDeclaration(secondFile, "Second", 1)
+	thirdRanked := outlineFileDeclaration(thirdFile, "ThirdRanked", 1)
+	thirdMissing := outlineFileDeclaration(thirdFile, "ThirdMissing", 2)
+	fourthA := outlineFileDeclaration(fourthFile, "FourthA", 1)
+	fourthB := outlineFileDeclaration(fourthFile, "FourthB", 2)
+	targets := []exploreTarget{
+		{node: leading}, {node: second},
+		{node: thirdRanked}, {node: thirdRanked},
+		{node: fourthA}, {node: fourthB},
+	}
+	byFile := map[string][]*graph.Node{
+		outlineLeadingFile: {leading},
+		secondFile:         {second},
+		thirdFile:          {thirdRanked, thirdMissing},
+		fourthFile:         {fourthA, fourthB},
+	}
+	page := localizationPageOutlineProvider(
+		outlinePool(leading), targets, nil, func(file string) []*graph.Node { return byFile[file] },
+	)()
+	if page == nil || len(page.Others) != 2 {
+		t.Fatalf("others = %#v, want protected second plus identity-missing third", page)
+	}
+	if page.Others[0].File != secondFile || page.Others[1].File != thirdFile {
+		t.Fatalf("others = %#v, fully covered fourth file should be skipped", page.Others)
+	}
+}
+
+func TestOutlineReliefProtectsTopTwoFiles(t *testing.T) {
+	outline := func(file string, rank int) *localizationFileOutline {
+		rows := make([]localizationOutlineRow, 30)
+		for index := range rows {
+			rows[index] = localizationOutlineRow{Name: fmt.Sprintf("Row%02d", index), Line: index + 1}
+		}
+		result := &localizationFileOutline{File: file, Declared: len(rows), all: rows, rank: rank}
+		result.elide(localizationOutlineCompleteRows)
+		return result
+	}
+	page := &localizationPageOutline{
+		Leading: outline("repo/lead.go", 0),
+		Others: []*localizationFileOutline{
+			outline("repo/second.go", 1), outline("repo/third.go", 2),
+		},
+	}
+	leadingRows, secondRows := len(page.Leading.Rows), len(page.Others[0].Rows)
+	page.relieve()
+	if len(page.Leading.Rows) != leadingRows || len(page.Others[0].Rows) != secondRows || len(page.Others[1].Rows) >= 30 {
+		t.Fatalf("first relief changed protected outlines: %#v", page)
+	}
+	for len(page.Others) > 1 {
+		page.relieve()
+	}
+	if len(page.Leading.Rows) != leadingRows || len(page.Others[0].Rows) != secondRows {
+		t.Fatalf("lower-ranked file outlived protected depth: %#v", page)
+	}
+	page.relieve()
+	if len(page.Leading.Rows) != leadingRows || len(page.Others[0].Rows) >= secondRows {
+		t.Fatalf("rank one did not yield before rank zero: %#v", page)
+	}
+}
+
+func TestOutlineDropsUnprotectedFloorBeforeEvidenceRelief(t *testing.T) {
+	outline := func(file string, rank int) *localizationFileOutline {
+		rows := make([]localizationOutlineRow, localizationOutlineFloorRows)
+		for index := range rows {
+			rows[index] = localizationOutlineRow{Name: fmt.Sprintf("Row%02d", index), Line: index + 1}
+		}
+		return &localizationFileOutline{File: file, Declared: len(rows), Rows: rows, all: rows, rank: rank}
+	}
+	page := &localizationPageOutline{
+		Leading: outline("repo/lead.go", 0),
+		Others: []*localizationFileOutline{
+			outline("repo/second.go", 1), outline("repo/third.go", 2),
+		},
+	}
+	if !page.dropUnprotectedFloorFile() {
+		t.Fatal("rank-two floor outline was not dropped")
+	}
+	if len(page.Others) != 1 || page.Others[0].File != "repo/second.go" || page.Leading == nil {
+		t.Fatalf("protected outline changed: %#v", page)
+	}
+	if page.dropUnprotectedFloorFile() {
+		t.Fatal("protected leading pair was dropped")
+	}
+}
+
+func TestOutlineTermFormsMatchConservativeInflections(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		query string
+		row   string
+	}{
+		{name: "ing", query: "buffering", row: "buffer"},
+		{name: "ed", query: "matched", row: "match"},
+		{name: "er", query: "reader", row: "read"},
+		{name: "exact retained", query: "render", row: "render"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			matched, _ := localizationOutlineRowTermMatch(test.row, map[string]struct{}{test.query: {}})
+			if matched != 1 {
+				t.Fatalf("%q did not match %q", test.query, test.row)
+			}
+		})
+	}
+	if matched, _ := localizationOutlineRowTermMatch("go", map[string]struct{}{"going": {}}); matched != 0 {
+		t.Fatal("a stem shorter than four characters matched")
+	}
+}
+
+func TestTruncatedOutlineCarriesAnExplicitLowerBound(t *testing.T) {
+	declarations := outlineDeclaredFile(2)
+	outline := newLocalizationFileOutlineForDeclarations(
+		outlineLeadingFile,
+		localizationFileDeclarations{
+			Nodes: declarations, Declared: len(declarations) + 1,
+			DeclaredKnown: false, Truncated: true,
+		},
+		nil, localizationOutlineCompleteRows,
+	)
+	if outline == nil || !outline.Truncated || outline.Declared != 3 || outline.Elided != 1 {
+		t.Fatalf("truncated outline = %#v, want lower bound 3 with at least one elided", outline)
+	}
+	if !localizationOutlineAddsUnrankedDeclaration(
+		outline, []exploreTarget{{node: declarations[0]}, {node: declarations[1]}},
+	) {
+		t.Fatal("a saturated outline was treated as completely covered by ranked rows")
+	}
+	body, err := json.Marshal(outline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"truncated":true`) {
+		t.Fatalf("truncation lower bound is absent from JSON: %s", body)
+	}
+}
+
+func TestOutlinePrivateIdentityDoesNotSerialize(t *testing.T) {
+	outline := newLocalizationFileOutline(outlineLeadingFile, outlineDeclaredFile(2))
+	body, err := json.Marshal(outline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), `"key"`) || strings.Contains(string(body), `"rank"`) {
+		t.Fatalf("private outline fields leaked into JSON: %s", body)
+	}
+}
+
 func TestScatteredRankingIndexesThePageFilesWithoutALeadingOne(t *testing.T) {
 	var pool []*rerank.Candidate
 	var targets []exploreTarget
@@ -1007,9 +1258,12 @@ func TestScatteredRankingIndexesThePageFilesWithoutALeadingOne(t *testing.T) {
 		t.Fatalf("scattered ranking paid %d graph enumerations, cap %d",
 			enumerated, localizationOutlineFileCap)
 	}
-	for _, other := range page.Others {
-		if len(other.Rows) > localizationOutlineSecondFileRowCap {
-			t.Fatalf("a file on a page with no leading one took the deepest slice: %#v", other)
+	for rank, other := range page.Others {
+		if got, want := len(other.Rows), len(declared[other.File]); got != want {
+			t.Fatalf("rank %d retained %d rows, want all %d available declarations: %#v", rank, got, want, other)
+		}
+		if rank >= localizationOutlineProtectedFileCount && len(other.Rows) > localizationOutlineFloorRows {
+			t.Fatalf("unprotected scattered rank %d exceeded the relief floor: %#v", rank, other)
 		}
 	}
 }

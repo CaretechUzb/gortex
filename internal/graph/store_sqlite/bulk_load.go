@@ -82,6 +82,11 @@ const coldFTSMergePages = 64
 //
 // Dropping/recreating these is a runtime operation on identical DDL — it is
 // NOT a schema change, so it does not touch the persisted schema version.
+const (
+	edgesByFromLineIndexDDL     = `CREATE INDEX IF NOT EXISTS edges_by_from_line ON edges(from_id, line)`
+	edgesByFromLineKindIndexDDL = `CREATE INDEX IF NOT EXISTS edges_by_from_line_kind ON edges(from_id, line, kind)`
+)
+
 var bulkDroppableIndexes = []bulkDroppableIndex{
 	{"nodes_by_name", `CREATE INDEX IF NOT EXISTS nodes_by_name ON nodes(name)`},
 	{"nodes_by_kind", `CREATE INDEX IF NOT EXISTS nodes_by_kind ON nodes(kind)`},
@@ -113,7 +118,13 @@ var bulkDroppableIndexes = []bulkDroppableIndex{
 	// into tens of milliseconds, and the cross-package guard alone paid ~980s
 	// of a 28-repo cold index that way. With the index the full candidate
 	// path measured ~30 → ~116k sites/s on a production store copy.
-	{"edges_by_from_line", `CREATE INDEX IF NOT EXISTS edges_by_from_line ON edges(from_id, line)`},
+	// Preserve this exact two-column shape: ordered outgoing projections rely
+	// on the rowid/primary-key suffix after line and otherwise need a temp sort.
+	{"edges_by_from_line", edgesByFromLineIndexDDL},
+	// Bounded exact-site adjacency also constrains kind before LIMIT. Keep that
+	// predicate-shaped index separate so it cannot perturb the legacy ordered
+	// outgoing plan; both participate in the same bulk drop/rebuild lifecycle.
+	{"edges_by_from_line_kind", edgesByFromLineKindIndexDDL},
 	{"edges_by_to", `CREATE INDEX IF NOT EXISTS edges_by_to ON edges(to_id, kind)`},
 	{"edges_by_kind", `CREATE INDEX IF NOT EXISTS edges_by_kind ON edges(kind)`},
 	// Exact changed-file frontiers (watcher and partial indexing) must not

@@ -88,6 +88,9 @@ func (s *Server) searchSymbolsContentFallback(
 	search := s.searchExploreSourceLiteral(
 		boundedCtx, term, "", scope, searchSymbolsContentFallbackMaxMatches,
 	)
+	if ctx.Err() != nil {
+		return nil
+	}
 	if len(search.matches) == 0 {
 		return nil
 	}
@@ -109,7 +112,7 @@ func (s *Server) searchSymbolsContentFallback(
 		return nil
 	}
 
-	enriched := s.enrichTextMatches(exact)
+	enriched, _ := s.enrichTextMatchesContext(boundedCtx, exact, scope)
 	if len(enriched) == 0 {
 		return nil
 	}

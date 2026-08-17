@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/zzet/gortex/internal/localizationauth"
 )
 
 // A refusal must never be the answer to advice this same hook just gave. When
@@ -17,7 +19,7 @@ func TestAdvisoryMarkerAnswersTheHostToolsItWouldOtherwiseRedirect(t *testing.T)
 		t.Run(tool, func(t *testing.T) {
 			configureLocalizationTerminalTestHome(t)
 			identity := beginTestLocalizationTurn(t, t.Name(), "prompt", t.TempDir())
-			if !markLocalizationTerminalReceipt(identity, localizationTerminalContractV2, false, answer) {
+			if !markLocalizationTerminalReceipt(identity, localizationauth.Receipt{FinalResponse: answer, ContractVersion: localizationTerminalContractV2}) {
 				t.Fatal("advisory marker was not written")
 			}
 			input := map[string]any{"file_path": "storage/disk.go", "pattern": "Load"}
@@ -56,7 +58,7 @@ func TestAdvisoryMarkerAnswersTheHostToolsItWouldOtherwiseRedirect(t *testing.T)
 func TestAdvisoryMarkerStillPassesThroughUnrelatedTools(t *testing.T) {
 	configureLocalizationTerminalTestHome(t)
 	identity := beginTestLocalizationTurn(t, t.Name(), "prompt", t.TempDir())
-	if !markLocalizationTerminalReceipt(identity, localizationTerminalContractV2, false, "answer") {
+	if !markLocalizationTerminalReceipt(identity, localizationauth.Receipt{FinalResponse: "answer", ContractVersion: localizationTerminalContractV2}) {
 		t.Fatal("advisory marker was not written")
 	}
 	for _, tool := range []string{"WebSearch", "Write"} {

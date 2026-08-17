@@ -209,6 +209,122 @@ func TestDigestLifecycleAndLegacyFallback(t *testing.T) {
 	requireLocalizationTerminalReplay(t, blocked, "search", "symbols")
 }
 
+func TestOnlyAuthenticatedSourceLiteralCalleeReservesOnePrimarySeat(t *testing.T) {
+	rows := []localizationDigestRow{
+		{ID: "repo/d.go::Semantic", Name: "Semantic", File: "repo/d.go"},
+		{ID: "repo/e.go::RankedTwo", Name: "RankedTwo", File: "repo/e.go"},
+		{ID: "repo/f.go::RankedThree", Name: "RankedThree", File: "repo/f.go"},
+		{ID: "repo/g.go::RankedFour", Name: "RankedFour", File: "repo/g.go"},
+		{ID: "repo/h.go::RankedFive", Name: "RankedFive", File: "repo/h.go"},
+		{ID: "repo/b.go::FirstCallee", Name: "FirstCallee", File: "repo/b.go", Provenance: localizationProvenanceSourceLiteralCallee, literalPrimaryEligible: true},
+		{ID: "repo/c.go::SecondCallee", Name: "SecondCallee", File: "repo/c.go", Provenance: localizationProvenanceSourceLiteralCallee},
+		{ID: "repo/a.go::Content", Name: "Content", File: "repo/a.go", Provenance: localizationProvenanceContentLiteral},
+	}
+
+	presented := localizationFinalResponseRows("find the semantic handler", nil, rows)
+	reservedLiteralPrimaries := 0
+	contentLiteralPrimary := false
+	semanticPrimary := false
+	for _, row := range presented {
+		if !row.primary {
+			continue
+		}
+		if row.row.Provenance == localizationProvenanceSourceLiteralCallee {
+			reservedLiteralPrimaries++
+		}
+		if row.row.Provenance == localizationProvenanceContentLiteral {
+			contentLiteralPrimary = true
+		}
+		if row.row.ID == "repo/d.go::Semantic" {
+			semanticPrimary = true
+		}
+	}
+	if reservedLiteralPrimaries != localizationFinalResponseLiteralReserve {
+		t.Fatalf("reserved literal PRIMARY rows = %d, want %d", reservedLiteralPrimaries, localizationFinalResponseLiteralReserve)
+	}
+	if contentLiteralPrimary {
+		t.Fatal("generic content literal gained PRIMARY authority from the literal alone")
+	}
+	if !semanticPrimary {
+		t.Fatal("literal reserve consumed the semantic PRIMARY opportunity")
+	}
+}
+
+func TestFrozenPrimaryCohortSurvivesSupplementalRows(t *testing.T) {
+	cases := []struct {
+		name string
+		task string
+		gold string
+	}{
+		{name: "aiohttp anchored import", task: "import aiohttp fails when zstd is not installed", gold: "aiohttp/compression_utils.py::ZSTDDecompressor.__init__"},
+		{name: "fmt anchored print", task: "ostream print fails with constant conditional warning", gold: "include/fmt/ostream.h::print"},
+		{name: "vue anchored hydrate", task: "skip detached async component hydration", gold: "packages/runtime-core/src/apiAsyncComponent.ts::performHydrate"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envelope := localizationExploreEnvelope{Evidence: []localizationEvidence{
+				{ID: tc.gold, Name: "gold", File: strings.Split(tc.gold, "::")[0]},
+				{ID: "repo/second.go::Second", Name: "Second", File: "repo/second.go"},
+				{ID: "repo/third.go::Third", Name: "Third", File: "repo/third.go"},
+				{ID: "repo/fourth.go::Fourth", Name: "Fourth", File: "repo/fourth.go"},
+				{ID: "repo/fifth.go::Fifth", Name: "Fifth", File: "repo/fifth.go"},
+			}}
+			digest := newLocalizationEvidenceDigestForTask(tc.task, envelope)
+			before := append([]string(nil), digest.primaryIDs...)
+			freezeLocalizationPrimaryCohort(tc.task, &envelope, digest)
+			for index := 0; index < 4; index++ {
+				envelope.Evidence = append(envelope.Evidence, localizationEvidence{
+					ID:   fmt.Sprintf("repo/supplement%02d.go::HydratePrint", index),
+					Name: "HydratePrint", File: fmt.Sprintf("repo/supplement%02d.go", index),
+					Provenance: localizationProvenanceDirectAdjacency, supportingOnly: true,
+				})
+			}
+			afterDigest := newLocalizationEvidenceDigestForTask(tc.task, envelope)
+			after := localizationFinalResponsePrimaryIDs(tc.task, nil, afterDigest.Evidence)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("PRIMARY cohort changed after supplemental rows:\nbefore=%v\nafter=%v", before, after)
+			}
+			if len(after) != localizationFinalResponsePrimaryLimit || after[0] != tc.gold {
+				t.Fatalf("PRIMARY cohort lost anchored candidate or count: %v", after)
+			}
+		})
+	}
+}
+
+func TestSupplementalRowsStaySupportingAcrossEverySelectorLoop(t *testing.T) {
+	rows := []localizationDigestRow{
+		{ID: "repo/base.go::First", Name: "First", File: "repo/base.go", primaryCohortOrder: 1},
+		{ID: "repo/base.go::Second", Name: "Second", File: "repo/base.go", primaryCohortOrder: 2},
+		{ID: "repo/base.go::Third", Name: "Third", File: "repo/base.go", primaryCohortOrder: 3},
+		{ID: "repo/base.go::Fourth", Name: "Fourth", File: "repo/base.go", primaryCohortOrder: 4},
+		{ID: "repo/supp.go::ExactTaskMatch", Name: "ExactTaskMatch", Kind: "method", File: "repo/supp.go", supportingOnly: true},
+		{ID: "repo/body.go::Body", Name: "Body", File: "repo/body.go", Provenance: localizationProvenanceBodyMention, supportingOnly: true},
+		{ID: "repo/adj.go::Adjacent", Name: "Adjacent", File: "repo/adj.go", Provenance: localizationProvenanceDirectAdjacency, supportingOnly: true},
+	}
+	current := []localizationDigestRow{{ID: "repo/supp.go::Current", Name: "Current", QualName: "Owner.Current", Kind: "method", File: "repo/supp.go"}}
+	first := localizationFinalResponseRows("ExactTaskMatch", current, rows)
+	second := localizationFinalResponseRows("ExactTaskMatch", current, rows)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatal("selector output is not deterministic")
+	}
+	for _, item := range first {
+		if item.primary && localizationFinalResponseSupportingOnly(item.row) {
+			t.Fatalf("supplemental row became PRIMARY: %+v", item.row)
+		}
+	}
+}
+
+func TestContentLiteralProvenanceDoesNotBecomeStrongTerminalProof(t *testing.T) {
+	rows := map[string]localizationDigestRow{
+		"repo/a.go::First": {
+			ID: "repo/a.go::First", File: "repo/a.go", Provenance: localizationProvenanceContentLiteral,
+		},
+	}
+	if localizationDigestStrongProofRetained(rows, "repo/a.go::First") {
+		t.Fatal("ordinary content evidence became enforceable terminal proof")
+	}
+}
+
 func TestDigestByteCapShedsOptionalMetadataBeforeEvidenceTail(t *testing.T) {
 	envelope := localizationExploreEnvelope{}
 	for i := 0; i < 400; i++ {
@@ -252,6 +368,85 @@ func TestDigestByteCapShedsOptionalMetadataBeforeEvidenceTail(t *testing.T) {
 	if len(digest.finalResponse) > localizationFinalResponseMaxBytes {
 		t.Fatalf("final_response = %d bytes, want <= %d", len(digest.finalResponse), localizationFinalResponseMaxBytes)
 	}
+}
+
+func TestDigestPressureShedsSupplementalRowsBeforeRankedEvidence(t *testing.T) {
+	const (
+		protectedID = "repo/protected.go::Protected"
+		bodyID      = "repo/body.go::BodyMention"
+		adjacentID  = "repo/adjacent.go::Adjacent"
+		ordinary    = 13
+	)
+	largeSignature := strings.Repeat("large optional signature ", 120)
+	completion := newLocalizationRefinementCompletion(protectedID)
+	evidence := []localizationEvidence{{
+		Rank: 1, ID: protectedID, Name: "Protected", Kind: "function",
+		File: "repo/protected.go", Signature: largeSignature,
+		Provenance: localizationProvenanceDirectAdjacency, supportingOnly: true,
+	}}
+	for index := 0; index < ordinary; index++ {
+		evidence = append(evidence, localizationEvidence{
+			Rank: len(evidence) + 1,
+			ID:   fmt.Sprintf("repo/ordinary%02d.go::Ordinary%02d", index, index),
+			Name: fmt.Sprintf("Ordinary%02d", index), Kind: "function",
+			File: fmt.Sprintf("repo/ordinary%02d.go", index), Signature: largeSignature,
+		})
+	}
+	evidence = append(evidence,
+		localizationEvidence{Rank: len(evidence) + 1, ID: bodyID, Name: "BodyMention", Kind: "function", File: "repo/body.go", Signature: largeSignature, Provenance: localizationProvenanceBodyMention, supportingOnly: true},
+		localizationEvidence{Rank: len(evidence) + 2, ID: adjacentID, Name: "Adjacent", Kind: "function", File: "repo/adjacent.go", Signature: largeSignature, Provenance: localizationProvenanceDirectAdjacency, supportingOnly: true},
+	)
+
+	assertRetained := func(t *testing.T, digest *localizationEvidenceDigest) {
+		t.Helper()
+		ids := make(map[string]localizationDigestRow, len(digest.Evidence))
+		for index, row := range digest.Evidence {
+			ids[row.ID] = row
+			if row.Rank != index+1 || digest.Files[index] != row.File || digest.Symbols[index] != row.ID {
+				t.Fatalf("unaligned retained row %d: %#v", index+1, row)
+			}
+		}
+		if _, exists := ids[bodyID]; exists {
+			t.Fatal("body supplement survived retained-state pressure")
+		}
+		if _, exists := ids[adjacentID]; exists {
+			t.Fatal("direct adjacency supplement survived retained-state pressure")
+		}
+		protected, exists := ids[protectedID]
+		if !exists || !protected.authorizationPriority {
+			t.Fatalf("authorized supplemental identity was shed or lost priority: %#v", protected)
+		}
+		for index := 0; index < ordinary; index++ {
+			id := fmt.Sprintf("repo/ordinary%02d.go::Ordinary%02d", index, index)
+			if _, exists := ids[id]; !exists {
+				t.Fatalf("independently ranked row %q was shed before supplements", id)
+			}
+		}
+		encoded, err := json.Marshal(digest)
+		if err != nil || len(encoded) > localizationDigestMaxBytes || len(digest.finalResponse) > localizationFinalResponseMaxBytes {
+			t.Fatalf("unbounded digest bytes=%d final=%d err=%v", len(encoded), len(digest.finalResponse), err)
+		}
+	}
+
+	t.Run("initial digest", func(t *testing.T) {
+		digest := newLocalizationEvidenceDigestForTask("find Protected", localizationExploreEnvelope{
+			Completion: completion,
+			Evidence:   evidence,
+		})
+		assertRetained(t, digest)
+	})
+	t.Run("post-read merge", func(t *testing.T) {
+		rows := make([]localizationDigestRow, 0, len(evidence))
+		for _, row := range evidence {
+			rows = append(rows, localizationDigestRow{
+				Rank: row.Rank, ID: row.ID, Name: row.Name, Kind: row.Kind,
+				File: row.File, Signature: row.Signature, Provenance: row.Provenance,
+				supportingOnly:        row.supportingOnly,
+				authorizationPriority: row.ID == protectedID,
+			})
+		}
+		assertRetained(t, mergeLocalizationEvidenceDigest(nil, &localizationEvidenceDigest{Evidence: rows}))
+	})
 }
 
 func authorizationAwareDigestFixture() (localizationExploreEnvelope, []string) {
@@ -832,8 +1027,8 @@ func TestTaskAwareDigestMergeDoesNotCohortQualifiedFunctions(t *testing.T) {
 
 func TestDigestByteCapRetainsSingleMandatoryRowAfterSheddingOptionalFields(t *testing.T) {
 	envelope := localizationExploreEnvelope{Evidence: []localizationEvidence{{
-		Rank:      1,
-		ID:        "repo/registry.go::Registry.Configure",
+		Rank: 1,
+		ID:   "repo/registry.go::Registry.Configure",
 		// Each optional field scales with the retention cap so every shed
 		// step is still forced: after callers, callees, and the signature go,
 		// the qual-name alone still busts the cap and must go too.

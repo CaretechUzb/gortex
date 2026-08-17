@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -87,6 +88,93 @@ func candidateByID(candidates []*rerank.Candidate, id string) *rerank.Candidate 
 	return nil
 }
 
+func TestExploreQuotedRecallTermsAdmitsSixExplicitLiterals(t *testing.T) {
+	terms := exploreQuotedRecallTerms(`find "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", and "golf"`)
+	require.Equal(t, []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot"}, terms)
+}
+
+func TestGatherExploreQuotedContentCandidatesUsesBoundedWidePages(t *testing.T) {
+	terms := []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot"}
+	hits := make(map[string][]graph.ContentHit, len(terms))
+	for _, term := range terms {
+		hits[term] = quotedRecallHits(term, 1, 0)
+	}
+	server, store := newQuotedRecallCountingServer(t, hits)
+	candidates := server.gatherExploreQuotedContentCandidates(
+		context.Background(), `find "alpha", "bravo", "charlie", "delta", "echo", and "foxtrot"`, nil, 72,
+		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+	)
+
+	require.Len(t, candidates, len(terms))
+	require.Equal(t, []int{24, 24, 24, 24, 24, 24}, store.searchLimits)
+	require.Equal(t, 1, store.graphLookups, "all term pages must share one graph lookup")
+}
+
+func TestGatherExploreContentCandidatesForBareTermsUsesSharedBounds(t *testing.T) {
+	hits := map[string][]graph.ContentHit{
+		"DISKFULL": {{
+			NodeID: "demo/storage.go::persist", FilePath: "demo/storage.go",
+			Snippet: `return errors.New("DISKFULL")`,
+		}},
+	}
+	server, store := newQuotedRecallCountingServer(t, hits)
+	candidates := server.gatherExploreContentCandidatesForTerms(
+		context.Background(), "the daemon emits DISKFULL while persisting", []string{"DISKFULL"}, nil, 72,
+		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+	)
+
+	require.Equal(t, []int{exploreQuotedRecallMaxPerTerm}, store.searchLimits)
+	require.Equal(t, 1, store.graphLookups)
+	exact := candidateByID(candidates, "demo/storage.go::persist")
+	require.NotNil(t, exact)
+	require.Equal(t, float64(1), exact.Signals[exploreContentRecallExactSignal])
+}
+
+func TestSourceWindowCollectionAddsNoContentSearchOrGraphLookup(t *testing.T) {
+	hits := map[string][]graph.ContentHit{
+		"needle": {{
+			NodeID: "demo/needle.go::candidate", FilePath: "demo/needle.go",
+			Snippet: `register("needle")`,
+		}},
+	}
+	ordinary := []*rerank.Candidate{{Node: &graph.Node{
+		ID: "demo/owner.go::needle", Name: "needle", Kind: graph.KindFunction,
+		FilePath: "demo/owner.go", RepoPrefix: "demo",
+	}}}
+	baselineServer, baselineStore := newQuotedRecallCountingServer(t, hits)
+	baseline := baselineServer.gatherExploreQuotedContentCandidates(
+		context.Background(), `find "needle"`, ordinary, 12, query.QueryOptions{},
+	)
+	collectingServer, collectingStore := newQuotedRecallCountingServer(t, hits)
+	collector := &localizationSourceWindowHitCollector{}
+	collected := collectingServer.gatherExploreQuotedContentCandidatesCollecting(
+		context.Background(), `find "needle"`, ordinary, 12, query.QueryOptions{}, collector,
+	)
+
+	require.Equal(t, baselineStore.searchLimits, collectingStore.searchLimits)
+	require.Equal(t, baselineStore.searchRows, collectingStore.searchRows)
+	require.Equal(t, baselineStore.graphLookups, collectingStore.graphLookups)
+	require.Equal(t, len(baseline), len(collected))
+	require.Empty(t, collector.hits, "content metadata without an existing trigram coordinate cannot fabricate a window")
+}
+
+func TestGatherExploreContentCandidatesForBareTermsCapsSearchesAndHydratesOnce(t *testing.T) {
+	terms := []string{"ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO"}
+	hits := make(map[string][]graph.ContentHit, len(terms))
+	for _, term := range terms {
+		hits[term] = quotedRecallHits(term, exploreQuotedRecallMaxPerTerm, -1)
+	}
+	server, store := newQuotedRecallCountingServer(t, hits)
+	candidates := server.gatherExploreContentCandidatesForTerms(
+		context.Background(), strings.Join(terms, " "), terms, nil, 72,
+		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+	)
+
+	require.NotEmpty(t, candidates)
+	require.LessOrEqual(t, len(store.searchLimits), exploreBareLiteralMaxTerms+1)
+	require.Equal(t, 1, store.graphLookups, "all bare term pages must share one graph lookup")
+}
+
 func TestGatherExploreQuotedContentCandidatesRetriesOneSaturatedTermWithinBounds(t *testing.T) {
 	hits := map[string][]graph.ContentHit{
 		"ku": quotedRecallHits("ku", exploreQuotedRecallRetryMaxRows, 17),
@@ -100,8 +188,8 @@ func TestGatherExploreQuotedContentCandidatesRetriesOneSaturatedTermWithinBounds
 	)
 
 	require.LessOrEqual(t, len(store.searchLimits), exploreQuotedRecallMaxTerms+1)
-	require.Equal(t, []int{5, 5, 5, exploreQuotedRecallRetryMaxRows}, store.searchLimits)
-	require.Equal(t, []int{5, 5, 5, exploreQuotedRecallRetryMaxRows}, store.searchRows)
+	require.Equal(t, []int{6, 6, 6, exploreQuotedRecallRetryMaxRows}, store.searchLimits)
+	require.Equal(t, []int{6, 6, 6, exploreQuotedRecallRetryMaxRows}, store.searchRows)
 	require.LessOrEqual(t, store.searchRows[len(store.searchRows)-1], exploreQuotedRecallRetryMaxRows)
 	require.Equal(t, 1, store.graphLookups, "all final pages must share one graph lookup")
 
@@ -126,7 +214,7 @@ func TestGatherExploreQuotedContentCandidatesKeepsUniqueExactFastPath(t *testing
 		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
 	)
 
-	require.Equal(t, []int{4}, store.searchLimits)
+	require.Equal(t, []int{5}, store.searchLimits)
 	require.Equal(t, 1, store.graphLookups)
 	exact := candidateByID(candidates, "demo/exact.go::candidate")
 	require.NotNil(t, exact)

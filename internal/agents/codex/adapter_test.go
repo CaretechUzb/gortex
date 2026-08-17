@@ -3,6 +3,7 @@ package codex
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -359,26 +360,26 @@ func TestCodexInstallsPreToolUseHook(t *testing.T) {
 
 	cfg := readCodexConfig(t, env)
 	entries := preToolUseEntries(t, cfg)
-	if len(entries) != 2 {
-		t.Fatalf("PreToolUse entries=%d want Bash+MCP read entries: %#v", len(entries), entries)
+	if len(entries) != 1 {
+		t.Fatalf("PreToolUse entries=%d want one match-all entry: %#v", len(entries), entries)
 	}
 	assertGortexPreToolUseHooks(t, cfg)
 
-	bashHandler := requireHookEntry(t, cfg, "PreToolUse", codexPreToolUseMatcher, testCodexHookCommand)
-	mcpHandler := requireHookEntry(t, cfg, "PreToolUse", codexMCPReadPreToolUseMatcher, testCodexHookCommand)
-	for name, handler := range map[string]map[string]any{"Bash": bashHandler, "MCP read": mcpHandler} {
-		if handler["type"] != "command" {
-			t.Errorf("%s hook type=%v want command", name, handler["type"])
-		}
-		if handler["timeout"] != int64(codexHookTimeoutSeconds) {
-			t.Errorf("%s timeout=%v want %d", name, handler["timeout"], codexHookTimeoutSeconds)
-		}
+	handler := requireHookEntry(t, cfg, "PreToolUse", codexPreToolUseMatcher, testCodexHookCommand)
+	if handler["type"] != "command" {
+		t.Errorf("hook type=%v want command", handler["type"])
 	}
-	if bashHandler["statusMessage"] != "Loading Gortex Bash guidance..." {
-		t.Errorf("Bash statusMessage=%v", bashHandler["statusMessage"])
+	if handler["timeout"] != int64(codexHookTimeoutSeconds) {
+		t.Errorf("timeout=%v want %d", handler["timeout"], codexHookTimeoutSeconds)
 	}
-	if mcpHandler["statusMessage"] != "Loading Gortex read guidance..." {
-		t.Errorf("MCP read statusMessage=%v", mcpHandler["statusMessage"])
+	if handler["statusMessage"] != "Loading Gortex tool guidance..." {
+		t.Errorf("statusMessage=%v", handler["statusMessage"])
+	}
+	matcher := regexp.MustCompile(codexPreToolUseMatcher)
+	for _, tool := range []string{"Bash", "apply_patch", "Read", "WebSearch", "mcp__gortex__search", "mcp__gortex__change"} {
+		if !matcher.MatchString(tool) {
+			t.Errorf("match-all PreToolUse matcher missed %q", tool)
+		}
 	}
 }
 
@@ -450,8 +451,8 @@ func TestCodexHookModeIsOptInAndMigratesInPlace(t *testing.T) {
 	if hasHookCommand(t, cfg, "PreToolUse", "/tmp/test-gortex hook --agent=codex --mode=deny") {
 		t.Fatalf("stale deny hook survived posture migration: %#v", preToolUseEntries(t, cfg))
 	}
-	if count := gortexPreToolUseHookCount(t, cfg); count != 2 {
-		t.Fatalf("posture migration duplicated PreToolUse hooks: %d", count)
+	if count := gortexPreToolUseHookCount(t, cfg); count != 1 {
+		t.Fatalf("posture migration duplicated match-all PreToolUse hook: %d", count)
 	}
 }
 
@@ -751,6 +752,13 @@ matcher = "^mcp__gortex__(read_file|get_editing_context)$"
 [[hooks.PreToolUse.hooks]]
 type = "command"
 command = "` + testCodexHookCommand + `"
+
+[[hooks.PreToolUse]]
+matcher = "` + codexLegacyMCPNavigationPreToolUseMatcher + `"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "` + testCodexHookCommand + `"
 `
 	if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
 		t.Fatalf("seed config: %v", err)
@@ -766,11 +774,16 @@ command = "` + testCodexHookCommand + `"
 	if !hasSessionStartCommand(t, cfg, testCodexHookCommand) {
 		t.Fatalf("managed SessionStart hook missing after static-command migration: %#v", sessionStartEntries(t, cfg))
 	}
-	if count := hookMatcherCommandCount(t, cfg, "PreToolUse", codexMCPReadPreToolUseMatcher, testCodexHookCommand); count != 1 {
-		t.Fatalf("compact read matcher count=%d want 1: %#v", count, preToolUseEntries(t, cfg))
+	if count := hookMatcherCommandCount(t, cfg, "PreToolUse", codexPreToolUseMatcher, testCodexHookCommand); count != 1 {
+		t.Fatalf("match-all matcher count=%d want 1: %#v", count, preToolUseEntries(t, cfg))
 	}
-	if count := hookMatcherCommandCount(t, cfg, "PreToolUse", v060CodexMCPReadPreToolUseMatcher, testCodexHookCommand); count != 0 {
-		t.Fatalf("v0.60.0 read matcher survived upgrade: %#v", preToolUseEntries(t, cfg))
+	for _, stale := range []string{codexLegacyBashPreToolUseMatcher, codexLegacyMCPNavigationPreToolUseMatcher, v060CodexMCPReadPreToolUseMatcher} {
+		if count := hookMatcherCommandCount(t, cfg, "PreToolUse", stale, testCodexHookCommand); count != 0 {
+			t.Fatalf("stale matcher %q survived upgrade: %#v", stale, preToolUseEntries(t, cfg))
+		}
+	}
+	if count := gortexPreToolUseHookCount(t, cfg); count != 1 {
+		t.Fatalf("split hooks were not collapsed: got %d entries %#v", count, preToolUseEntries(t, cfg))
 	}
 }
 
@@ -839,8 +852,8 @@ statusMessage = "User PostToolUse"
 		t.Fatalf("Gortex SessionStart hooks=%d want 1", count)
 	}
 	preEntries := preToolUseEntries(t, cfg)
-	if len(preEntries) != 3 {
-		t.Fatalf("PreToolUse entries=%d want user+Bash+MCP read entries: %#v", len(preEntries), preEntries)
+	if len(preEntries) != 2 {
+		t.Fatalf("PreToolUse entries=%d want user+match-all entries: %#v", len(preEntries), preEntries)
 	}
 	if !hasHookCommand(t, cfg, "PreToolUse", "echo user-pretooluse") {
 		t.Fatalf("user PreToolUse hook was not preserved: %#v", preEntries)
@@ -898,8 +911,8 @@ statusMessage = "Old Gortex MCP Read PreToolUse"
 
 	cfg := readCodexConfig(t, env)
 	preEntries := preToolUseEntries(t, cfg)
-	if len(preEntries) != 3 {
-		t.Fatalf("PreToolUse entries=%d want user+Bash+MCP read entries: %#v", len(preEntries), preEntries)
+	if len(preEntries) != 2 {
+		t.Fatalf("PreToolUse entries=%d want user+match-all entries: %#v", len(preEntries), preEntries)
 	}
 	if !hasHookCommand(t, cfg, "PreToolUse", "echo user-pretooluse") {
 		t.Fatalf("Force removed user PreToolUse hook: %#v", preEntries)
@@ -1038,14 +1051,11 @@ func gortexPreToolUseHookCount(t *testing.T, cfg map[string]any) int {
 
 func assertGortexPreToolUseHooks(t *testing.T, cfg map[string]any) {
 	t.Helper()
-	if count := gortexPreToolUseHookCount(t, cfg); count != 2 {
-		t.Fatalf("Gortex PreToolUse hooks=%d want Bash+MCP read hooks: %#v", count, preToolUseEntries(t, cfg))
+	if count := gortexPreToolUseHookCount(t, cfg); count != 1 {
+		t.Fatalf("Gortex PreToolUse hooks=%d want one match-all hook: %#v", count, preToolUseEntries(t, cfg))
 	}
 	if count := hookMatcherCommandCount(t, cfg, "PreToolUse", codexPreToolUseMatcher, testCodexHookCommand); count != 1 {
-		t.Fatalf("Bash PreToolUse hook count=%d want 1: %#v", count, preToolUseEntries(t, cfg))
-	}
-	if count := hookMatcherCommandCount(t, cfg, "PreToolUse", codexMCPReadPreToolUseMatcher, testCodexHookCommand); count != 1 {
-		t.Fatalf("MCP read PreToolUse hook count=%d want 1: %#v", count, preToolUseEntries(t, cfg))
+		t.Fatalf("match-all PreToolUse hook count=%d want 1: %#v", count, preToolUseEntries(t, cfg))
 	}
 }
 

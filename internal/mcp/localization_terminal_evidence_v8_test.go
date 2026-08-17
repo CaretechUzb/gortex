@@ -409,7 +409,8 @@ func TestSearchTextCaptureResolvesInScopeOwnerThenFileEvidence(t *testing.T) {
 	ownerGraph.AddNode(owner)
 	ownerServer := &Server{graph: ownerGraph}
 	ctx := withLocalizationPermittedEvidenceCapture(context.Background(), 71)
-	ownerServer.captureLocalizationSearchText(ctx, []enrichedTextMatch{{Path: "repo/config.go", Line: 24, Text: "register marker"}})
+	ownerIndexes := ownerServer.buildFileSymbolIndexForPaths(map[string]struct{}{"repo/config.go": {}})
+	ownerServer.captureLocalizationSearchText(ctx, []enrichedTextMatch{{Path: "repo/config.go", Line: 24, Text: "register marker"}}, ownerIndexes)
 	rows, recorded := localizationEvidenceForPermittedCall(ctx, "search", "text", 71)
 	if !recorded || len(rows) != 1 || rows[0].ID != owner.ID || rows[0].Line != 24 || rows[0].Provenance != "permitted_search_text_owner" {
 		t.Fatalf("file-level text owner capture = %#v, recorded=%v", rows, recorded)
@@ -420,14 +421,16 @@ func TestSearchTextCaptureResolvesInScopeOwnerThenFileEvidence(t *testing.T) {
 	fileGraph.AddNode(fileOnly)
 	fileServer := &Server{graph: fileGraph}
 	fileCtx := withLocalizationPermittedEvidenceCapture(context.Background(), 72)
-	fileServer.captureLocalizationSearchText(fileCtx, []enrichedTextMatch{{Path: "repo/root.go", Line: 3, Text: "package marker"}})
+	fileIndexes := fileServer.buildFileSymbolIndexForPaths(map[string]struct{}{"repo/root.go": {}})
+	fileServer.captureLocalizationSearchText(fileCtx, []enrichedTextMatch{{Path: "repo/root.go", Line: 3, Text: "package marker"}}, fileIndexes)
 	rows, recorded = localizationEvidenceForPermittedCall(fileCtx, "search", "text", 72)
 	if !recorded || len(rows) != 1 || rows[0].ID != fileOnly.ID || rows[0].File != fileOnly.FilePath || rows[0].Line != 3 || rows[0].Provenance != "permitted_search_text_file" {
 		t.Fatalf("file text evidence capture = %#v, recorded=%v", rows, recorded)
 	}
 
 	missingCtx := withLocalizationPermittedEvidenceCapture(context.Background(), 73)
-	fileServer.captureLocalizationSearchText(missingCtx, []enrichedTextMatch{{Path: "repo/missing.go", Line: 8, Text: "unattributed marker"}})
+	missingIndexes := fileServer.buildFileSymbolIndexForPaths(map[string]struct{}{"repo/missing.go": {}})
+	fileServer.captureLocalizationSearchText(missingCtx, []enrichedTextMatch{{Path: "repo/missing.go", Line: 8, Text: "unattributed marker"}}, missingIndexes)
 	if rows, recorded = localizationEvidenceForPermittedCall(missingCtx, "search", "text", 73); !recorded || len(rows) != 0 {
 		t.Fatalf("unvalidated text path became evidence: %#v, recorded=%v", rows, recorded)
 	}

@@ -106,7 +106,7 @@ func TestExploreExactQualifiedAnchorCandidateFindsParserName(t *testing.T) {
 	})
 	server := &Server{graph: g}
 	got := server.exploreExactQualifiedAnchorCandidate(
-		context.Background(), anchors[1], query.QueryOptions{},
+		context.Background(), anchors[1], nil, query.QueryOptions{},
 		map[string]struct{}{}, map[string]struct{}{},
 	)
 	if got == nil || got.Node == nil {
@@ -134,6 +134,39 @@ func TestExploreSourceRangeSpecsPairPathsWithFollowingLines(t *testing.T) {
 	}
 }
 
+func TestExploreSourceRangeSpecsAcceptCompactUnicodeBounds(t *testing.T) {
+	tests := []struct {
+		name string
+		task string
+	}{
+		{name: "compact ASCII", task: "src/Handler.php lines 185-187"},
+		{name: "en dash", task: "src/Handler.php lines 185–187"},
+		{name: "em dash", task: "src/Handler.php lines 185—187"},
+		{name: "inline en dash", task: "src/Handler.php:185–187"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			specs := exploreSourceRangeSpecs(test.task)
+			if len(specs) != 1 || specs[0].StartLine != 185 || specs[0].EndLine != 187 {
+				t.Fatalf("source range specs = %#v, want 185-187", specs)
+			}
+		})
+	}
+}
+
+func TestExploreSourceRangeDefinitionsCoverEveryDeclarationInRange(t *testing.T) {
+	idx := &fileSymbolIndex{}
+	first := &graph.Node{ID: "handler.php::before", Name: "before", Kind: graph.KindMethod, StartLine: 250, EndLine: 255}
+	second := &graph.Node{ID: "handler.php::testPassthruOnClose", Name: "testPassthruOnClose", Kind: graph.KindMethod, StartLine: 256, EndLine: 270}
+	idx.add(first)
+	idx.add(second)
+	idx.finalise()
+	got := exploreSourceRangeDefinitions(idx, 253, 265)
+	if len(got) != 2 || got[0].ID != first.ID || got[1].ID != second.ID {
+		t.Fatalf("source range definitions = %#v, want both declarations in cited range", got)
+	}
+}
+
 func TestExploreSourceRangeDefinitionsPreferNamedOwnerOverClosure(t *testing.T) {
 	idx := &fileSymbolIndex{}
 	idx.add(&graph.Node{ID: "handler.php::flushBuffer", Name: "flushBuffer", Kind: graph.KindMethod, StartLine: 170, EndLine: 200})
@@ -151,7 +184,7 @@ func TestPromoteExploreSourceRangeCandidatesMapsToEnclosingMethod(t *testing.T) 
 	stop := store.GetNode(navFindMethod(t, store, "Stop"))
 	task := fmt.Sprintf("svc.go\nLines %d to %d", start.StartLine, start.EndLine)
 	ordinary := []*rerank.Candidate{{Node: stop, TextRank: 0, VectorRank: -1}}
-	got := server.promoteExploreSourceRangeCandidates(context.Background(), task, ordinary, query.QueryOptions{})
+	got := server.promoteExploreSourceRangeCandidates(context.Background(), task, ordinary, store, query.QueryOptions{})
 	if len(got) != 2 || got[0].Node.ID != start.ID || got[1].Node.ID != stop.ID {
 		t.Fatalf("promoted candidates = %#v, want cited Start then ordinary Stop", got)
 	}
@@ -166,7 +199,7 @@ func TestPromoteExploreSourceRangeCandidatesStripsIsolatedRepoLabel(t *testing.T
 	stop := store.GetNode(navFindMethod(t, store, "Stop"))
 	task := fmt.Sprintf("monolog/svc.go\nLines %d to %d", start.StartLine, start.EndLine)
 	ordinary := []*rerank.Candidate{{Node: stop, TextRank: 0, VectorRank: -1}}
-	got := server.promoteExploreSourceRangeCandidates(context.Background(), task, ordinary, query.QueryOptions{})
+	got := server.promoteExploreSourceRangeCandidates(context.Background(), task, ordinary, store, query.QueryOptions{})
 	if len(got) != 2 || got[0].Node.ID != start.ID || got[1].Node.ID != stop.ID {
 		t.Fatalf("promoted candidates = %#v, want repo-prefixed citation to resolve indexed svc.go", got)
 	}

@@ -5,12 +5,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/gofrs/flock"
 
 	"github.com/zzet/gortex/internal/localizationauth"
 )
@@ -29,6 +33,7 @@ const (
 	localizationTerminalDenyReason = "[Gortex] Localization for this task is complete, so this tool call is blocked. Answer now from the retained evidence below, naming what you rely on; if it does not fit the request, say so in your answer."
 	localizationAdvisoryDenyReason = "[Gortex] Localization for this task is complete, so this additional Gortex navigation call was not run. Answer now from the retained evidence below, naming what you rely on; if it does not fit the request, say so in your answer."
 	gortexPluginMCPToolPrefix      = "mcp__plugin_gortex_gortex__"
+	gortexCodexMCPToolPrefix       = "gortex__"
 	localizationHostMetaKey        = "gortex/localization"
 )
 
@@ -106,7 +111,10 @@ type localizationTerminalMarker struct {
 	// FinalResponse rides the marker so a blocked call can hand back the answer
 	// itself. A refusal that only says "you are done" gives the caller nothing
 	// to act on and it tries the next tool; the answer ends the turn.
-	FinalResponse string `json:"final_response,omitempty"`
+	FinalResponse      string   `json:"final_response,omitempty"`
+	PrimaryIDs         []string `json:"primary_ids,omitempty"`
+	EvidenceIDs        []string `json:"evidence_ids,omitempty"`
+	ClaimCheckConsumed bool     `json:"claim_check_consumed,omitempty"`
 }
 
 type localizationTerminalHookInput struct {
@@ -182,7 +190,7 @@ func observeLocalizationTerminal(data []byte) (localizationTerminalHookInput, bo
 	// PreToolUse snapshot. Visible tool JSON is never an authority on this path.
 	if authToken != "" {
 		if receipt, authenticated := localizationauth.Consume(authToken); authenticated {
-			if !markLocalizationTerminalReceipt(identity, receipt.ContractVersion, receipt.Enforceable, receipt.FinalResponse) {
+			if !markLocalizationTerminalReceipt(identity, receipt) {
 				return localizationTerminalHookInput{}, false
 			}
 			input.TerminalReceipt = receipt
@@ -197,7 +205,10 @@ func observeLocalizationTerminal(data []byte) (localizationTerminalHookInput, bo
 	if !ok || !answerReadyLocalizationTerminalContract(contract) {
 		return localizationTerminalHookInput{}, false
 	}
-	if !markLocalizationTerminalReceipt(identity, contract.Completion.ContractVersion, contract.Completion.Enforceable, contract.Completion.FinalResponse) {
+	if !markLocalizationTerminalReceipt(identity, localizationauth.Receipt{
+		FinalResponse: contract.Completion.FinalResponse, ContractVersion: contract.Completion.ContractVersion,
+		Enforceable: contract.Completion.Enforceable,
+	}) {
 		return localizationTerminalHookInput{}, false
 	}
 	input.TerminalReceipt = localizationauth.Receipt{
@@ -348,7 +359,8 @@ func localizationNavigationTool(tool string) bool {
 }
 
 func isGortexMCPToolName(tool string) bool {
-	return strings.HasPrefix(tool, gortexMCPToolPrefix) || strings.HasPrefix(tool, gortexPluginMCPToolPrefix)
+	return strings.HasPrefix(tool, gortexMCPToolPrefix) || strings.HasPrefix(tool, gortexPluginMCPToolPrefix) ||
+		strings.HasPrefix(tool, gortexCodexMCPToolPrefix)
 }
 
 func preToolUsePolicyTool(tool string) bool {
@@ -641,14 +653,24 @@ func markLocalizationTerminal(identity localizationTerminalIdentity, contractVer
 	return markLocalizationTerminalWithStrength(identity, contractVersion, false, "")
 }
 
-func markLocalizationTerminalReceipt(
-	identity localizationTerminalIdentity, contractVersion int, enforceable bool, finalResponse string,
-) bool {
-	return markLocalizationTerminalWithStrength(identity, contractVersion, !enforceable, finalResponse)
+func markLocalizationTerminalReceipt(identity localizationTerminalIdentity, receipt localizationauth.Receipt) bool {
+	primaryIDs, evidenceIDs, ok := localizationauth.NormalizeEvidenceIDs(receipt.PrimaryIDs, receipt.EvidenceIDs)
+	if !ok {
+		return false
+	}
+	return markLocalizationTerminalWithEvidence(identity, receipt.ContractVersion, !receipt.Enforceable,
+		receipt.FinalResponse, primaryIDs, evidenceIDs)
 }
 
 func markLocalizationTerminalWithStrength(
 	identity localizationTerminalIdentity, contractVersion int, advisory bool, finalResponse string,
+) bool {
+	return markLocalizationTerminalWithEvidence(identity, contractVersion, advisory, finalResponse, nil, nil)
+}
+
+func markLocalizationTerminalWithEvidence(
+	identity localizationTerminalIdentity, contractVersion int, advisory bool, finalResponse string,
+	primaryIDs, evidenceIDs []string,
 ) bool {
 	if identity.SessionID == "" || identity.CWD == "" || identity.TurnToken == "" ||
 		contractVersion < localizationTerminalContractV2 {
@@ -661,6 +683,8 @@ func markLocalizationTerminalWithStrength(
 		ObservedUnixNano: time.Now().UnixNano(),
 		Advisory:         advisory,
 		FinalResponse:    strings.TrimSpace(finalResponse),
+		PrimaryIDs:       append([]string(nil), primaryIDs...),
+		EvidenceIDs:      append([]string(nil), evidenceIDs...),
 	}
 	path := localizationTerminalMarkerPath(identity)
 	if advisory {
@@ -677,6 +701,103 @@ func localizationTerminalMarkerFor(identity localizationTerminalIdentity) (local
 		return marker, true
 	}
 	return localizationTerminalMarker{}, false
+}
+
+// consumeLocalizationClaimCheck serializes one enforceable terminal marker's
+// challenge without ever removing the marker from its canonical path. Keeping
+// that path readable closes the window in which a concurrent PreToolUse could
+// bypass terminal enforcement. Host-retried Stop hooks still fail open after
+// the first successful challenge, even when the host omits stop_hook_active.
+func consumeLocalizationClaimCheck(identity localizationTerminalIdentity, claims []string) (localizationTerminalMarker, bool) {
+	if len(claims) == 0 {
+		return localizationTerminalMarker{}, false
+	}
+	path := localizationTerminalMarkerPath(identity)
+	release, ok := acquireLocalizationClaimCheck(path)
+	if !ok {
+		return localizationTerminalMarker{}, false
+	}
+	defer release()
+
+	marker, ok := readLocalizationTerminalMarker(path, identity)
+	if !ok || marker.Advisory || marker.ClaimCheckConsumed || len(marker.PrimaryIDs) == 0 || len(marker.EvidenceIDs) == 0 {
+		return localizationTerminalMarker{}, false
+	}
+	allAuthenticated := true
+	for _, claim := range claims {
+		matched := false
+		for _, evidenceID := range marker.EvidenceIDs {
+			if localizationClaimMatchesEvidence(claim, evidenceID) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			allAuthenticated = false
+			break
+		}
+	}
+	if allAuthenticated {
+		return localizationTerminalMarker{}, false
+	}
+	marker.ClaimCheckConsumed = true
+	if !writeLocalizationState(path, marker) {
+		return localizationTerminalMarker{}, false
+	}
+	return marker, true
+}
+
+func acquireLocalizationClaimCheck(path string) (func(), bool) {
+	// Kernel-backed advisory locking makes the sidecar reusable: a process
+	// crash releases ownership automatically, so a stale path can never wedge
+	// future claim checks. Do not remove the sidecar on unlock; another process
+	// may already have opened the same inode while waiting to contend.
+	lock := flock.New(path + ".claim-check")
+	locked, err := lock.TryLock()
+	if err != nil || !locked {
+		return nil, false
+	}
+	return func() { releaseLocalizationClaimLock(lock) }, true
+}
+
+const localizationClaimLockReleaseAttempts = 3
+
+func releaseLocalizationClaimLock(lock *flock.Flock) {
+	releaseLocalizationClaimLockObserved(lock, func(candidate *flock.Flock) error {
+		// Close is gofrs/flock's documented release API: it unlocks and closes
+		// the underlying descriptor while leaving the reusable sidecar in place.
+		return candidate.Close()
+	})
+}
+
+func releaseLocalizationClaimLockObserved(lock *flock.Flock, release func(*flock.Flock) error) bool {
+	started := time.Now()
+	if releaseLocalizationClaimLockWith(lock, release) {
+		return true
+	}
+	// Lock-release telemetry describes an internal failure; no user-visible
+	// hook context was emitted by this path.
+	localizationTerminalTelemetry("claim_lock_release_failed", false, started)
+	return false
+}
+
+func releaseLocalizationClaimLockWith(lock *flock.Flock, release func(*flock.Flock) error) bool {
+	if lock == nil {
+		return true
+	}
+	if release == nil {
+		return false
+	}
+	for attempt := 0; attempt < localizationClaimLockReleaseAttempts; attempt++ {
+		err := release(lock)
+		if err == nil {
+			return true
+		}
+		if !errors.Is(err, syscall.EINTR) {
+			return false
+		}
+	}
+	return false
 }
 
 func readLocalizationTerminalMarker(path string, identity localizationTerminalIdentity) (localizationTerminalMarker, bool) {

@@ -22,61 +22,110 @@ import (
 // members, and Q2's expansion exists to surface exactly those.
 
 const (
-	exploreOwnerFoldScan = 8
-	exploreOwnerFoldMax  = 2
+	exploreOwnerFoldScan          = 8
+	exploreOwnerFoldMax           = 2
+	exploreOwnerFoldRelationLimit = 8
 )
 
 // foldMemberOwners promotes an owner type above its members when at least
 // two of the scanned top candidates belong to it. The owner node is pulled
 // from the candidate list when it is already present (its later occurrence
 // is removed), or fetched by one bounded member_of hop otherwise.
-func (s *Server) foldMemberOwners(ctx context.Context, targets []exploreTarget) []exploreTarget {
+func (s *Server) foldMemberOwners(
+	ctx context.Context,
+	targets []exploreTarget,
+	declarationScope graph.LocalizationNodeScope,
+) []exploreTarget {
 	eng := s.engineFor(ctx)
 	if eng == nil || len(targets) < 2 {
 		return targets
 	}
-	ownerOf := func(n *graph.Node) *graph.Node {
-		if n == nil || (n.Kind != graph.KindMethod && n.Kind != graph.KindFunction && n.Kind != graph.KindField) {
-			return nil
+	reader := eng.Reader()
+	if reader == nil || ctx.Err() != nil {
+		return targets
+	}
+	originalTargets := targets
+	memberIDs := make([]string, 0, min(len(targets), exploreOwnerFoldScan))
+	for index, target := range targets {
+		if index >= exploreOwnerFoldScan {
+			break
 		}
-		for _, e := range eng.GetOutEdges(n.ID) {
-			if e == nil || e.Kind != graph.EdgeMemberOf {
+		if target.node == nil || (target.node.Kind != graph.KindMethod &&
+			target.node.Kind != graph.KindFunction && target.node.Kind != graph.KindField) {
+			continue
+		}
+		memberIDs = append(memberIDs, target.node.ID)
+	}
+	if len(memberIDs) == 0 {
+		return targets
+	}
+	relations, complete := exploreBoundedEdgeIdentities(
+		ctx, reader, memberIDs, []graph.EdgeKind{graph.EdgeMemberOf},
+		exploreOwnerFoldRelationLimit, exploreBoundedOutgoing,
+	)
+	if !complete {
+		return originalTargets
+	}
+	ownerIDs := make([]string, 0, len(memberIDs)*exploreOwnerFoldRelationLimit)
+	for _, memberID := range memberIDs {
+		for _, edge := range relations[memberID] {
+			ownerIDs = append(ownerIDs, edge.To)
+		}
+	}
+	owners, complete := exploreNodesByIDsBounded(
+		ctx, reader, ownerIDs, exploreOwnerFoldScan*exploreOwnerFoldRelationLimit,
+	)
+	if !complete {
+		return originalTargets
+	}
+	ownerOf := func(memberID string) (*graph.Node, bool) {
+		for _, edge := range relations[memberID] {
+			owner := owners[edge.To]
+			if owner == nil || owner.ID != edge.To {
+				return nil, false
+			}
+			if !declarationScope.Allows(owner) {
 				continue
 			}
-			if owner := eng.GetSymbol(e.To); owner != nil &&
-				(owner.Kind == graph.KindType || owner.Kind == graph.KindInterface) {
-				return owner
+			if owner.Kind == graph.KindType || owner.Kind == graph.KindInterface {
+				return owner, true
 			}
 		}
-		return nil
+		return nil, true
 	}
 
 	type ownerGroup struct {
-		owner       *graph.Node
-		firstMember int
-		members     int
+		owner         *graph.Node
+		firstMemberID string
+		members       int
 	}
 	groups := map[string]*ownerGroup{}
 	order := make([]string, 0, exploreOwnerFoldScan)
 	rankOf := map[string]int{}
-	for index, t := range targets {
-		if t.node != nil {
-			rankOf[t.node.ID] = index
+	for index, target := range targets {
+		if target.node != nil {
+			rankOf[target.node.ID] = index
 		}
-		if index >= exploreOwnerFoldScan || t.node == nil {
+		if index >= exploreOwnerFoldScan || target.node == nil {
 			continue
 		}
-		owner := ownerOf(t.node)
+		owner, complete := ownerOf(target.node.ID)
+		if !complete {
+			return originalTargets
+		}
 		if owner == nil {
 			continue
 		}
-		g, ok := groups[owner.ID]
+		group, ok := groups[owner.ID]
 		if !ok {
-			g = &ownerGroup{owner: owner, firstMember: index}
-			groups[owner.ID] = g
+			group = &ownerGroup{owner: owner, firstMemberID: target.node.ID}
+			groups[owner.ID] = group
 			order = append(order, owner.ID)
 		}
-		g.members++
+		group.members++
+	}
+	if ctx.Err() != nil {
+		return originalTargets
 	}
 
 	folded := 0
@@ -84,11 +133,15 @@ func (s *Server) foldMemberOwners(ctx context.Context, targets []exploreTarget) 
 		if folded >= exploreOwnerFoldMax {
 			break
 		}
-		g := groups[ownerID]
-		if g.members < 2 {
+		group := groups[ownerID]
+		if group.members < 2 {
 			continue
 		}
-		if existing, present := rankOf[ownerID]; present && existing <= g.firstMember {
+		firstMember, present := rankOf[group.firstMemberID]
+		if !present {
+			return originalTargets
+		}
+		if existing, present := rankOf[ownerID]; present && existing <= firstMember {
 			continue // the owner already leads its members
 		}
 		// Remove a lower-ranked occurrence of the owner, then insert it
@@ -96,18 +149,18 @@ func (s *Server) foldMemberOwners(ctx context.Context, targets []exploreTarget) 
 		kept := make([]exploreTarget, 0, len(targets)+1)
 		var ownerTarget exploreTarget
 		found := false
-		for _, t := range targets {
-			if t.node != nil && t.node.ID == ownerID {
-				ownerTarget = t
+		for _, target := range targets {
+			if target.node != nil && target.node.ID == ownerID {
+				ownerTarget = target
 				found = true
 				continue
 			}
-			kept = append(kept, t)
+			kept = append(kept, target)
 		}
 		if !found {
-			ownerTarget = exploreTarget{node: g.owner, foldedOwner: true}
+			ownerTarget = exploreTarget{node: group.owner, foldedOwner: true}
 		}
-		insertAt := g.firstMember
+		insertAt := firstMember
 		if insertAt > len(kept) {
 			insertAt = len(kept)
 		}
@@ -117,11 +170,14 @@ func (s *Server) foldMemberOwners(ctx context.Context, targets []exploreTarget) 
 		targets = append(kept[:insertAt:insertAt], append([]exploreTarget{ownerTarget}, kept[insertAt:]...)...)
 		folded++
 		rankOf = map[string]int{}
-		for index, t := range targets {
-			if t.node != nil {
-				rankOf[t.node.ID] = index
+		for index, target := range targets {
+			if target.node != nil {
+				rankOf[target.node.ID] = index
 			}
 		}
+	}
+	if ctx.Err() != nil {
+		return originalTargets
 	}
 	return targets
 }
@@ -272,7 +328,7 @@ func exploreFoldedTargetMandatory(target exploreTarget, reserved map[string]stru
 	}
 	return target.sourceLiteral || target.sourceLiteralCallee || target.exactContent ||
 		target.causalChangeBridge || target.causalChangeLeaf || target.causalChangeOwner ||
-		target.conceptImplementation || target.conceptComplement || target.syntacticAnchor || target.typedAnchorProjection ||
+		target.conceptImplementation || target.conceptComplement || target.syntacticAnchor || target.sourceRange || target.typedAnchorProjection ||
 		target.divergentDefaultOwner || target.divergentDefaultType
 }
 

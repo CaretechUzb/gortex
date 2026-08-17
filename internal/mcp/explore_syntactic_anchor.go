@@ -19,6 +19,9 @@ const (
 	exploreSyntacticAnchorMaxTerms         = 3
 	exploreSyntacticAnchorFetch            = 10
 	exploreSyntacticAnchorCompetitionFetch = 32
+	// A qualified leaf may inspect only the first four ranked files that
+	// contain an exact owner declaration.
+	exploreQualifiedLeafMaxFiles = 4
 )
 
 // exploreSyntacticAnchor is a bounded, implementation-shaped clue copied
@@ -244,8 +247,8 @@ const (
 )
 
 var (
-	exploreSourceRangeLineRE   = regexp.MustCompile(`(?i)\blines?\s+([0-9]{1,8})(?:\s+(?:to|-)\s+([0-9]{1,8}))?`)
-	exploreSourceRangeInlineRE = regexp.MustCompile(`^\s*:([0-9]{1,8})(?:-([0-9]{1,8}))?`)
+	exploreSourceRangeLineRE   = regexp.MustCompile(`(?i)\blines?\s+([0-9]{1,8})(?:(?:\s+to\s+|\s*[-–—]\s*)([0-9]{1,8}))?`)
+	exploreSourceRangeInlineRE = regexp.MustCompile(`^\s*:([0-9]{1,8})(?:[-–—]([0-9]{1,8}))?`)
 )
 
 // exploreSourceRangeSpecs pairs an explicit source path with the line citation
@@ -318,7 +321,7 @@ func exploreSourceRangeLines(tail string) (int, int, bool) {
 // line falls inside one, the enclosing named method/function remains the useful
 // localization symbol (for example FingersCrossedHandler::flushBuffer).
 func exploreSourceRangeDefinitions(index *fileSymbolIndex, start, end int) []*graph.Node {
-	if index == nil {
+	if index == nil || index.saturated {
 		return nil
 	}
 	if end < start {
@@ -385,6 +388,104 @@ func exploreSourceRangeGraphPathAliases(graphPath string) []string {
 	return out
 }
 
+// exploreSourceRangeScopedGraphPathAliases maps a task's logical repo label to
+// the sole request-scoped graph prefix without consulting the filesystem. Replay
+// workspaces commonly index monolog/src/... as monolog-1800/src/.... A resolved
+// exact spelling remains authoritative; the scoped spelling is only a bounded
+// fallback. Multiple-repo scopes and paths resolved to a foreign repo never use
+// that fallback.
+func exploreSourceRangeScopedGraphPathAliases(
+	rawPath, resolvedGraphPath, resolvedRepoPrefix string,
+	scope query.QueryOptions,
+) []string {
+	resolved := exploreSourceRangeGraphPathAliases(resolvedGraphPath)
+	if resolvedRepoPrefix != "" && len(scope.RepoAllow) > 0 &&
+		!repoNarrowAdmits(scope.RepoAllow, resolvedRepoPrefix) {
+		return nil
+	}
+	repoPrefix := exploreSourceLiteralSingleRepoPrefix(scope)
+	normalizedRaw := strings.ReplaceAll(strings.TrimSpace(rawPath), "\\", "/")
+	if exploreSourceRangeTraversalPath(normalizedRaw) {
+		return nil
+	}
+	if repoPrefix == "" {
+		return resolved
+	}
+	if exploreSourceRangeAbsolutePath(normalizedRaw) {
+		if len(resolved) == 0 {
+			return nil
+		}
+		return resolved[:1]
+	}
+	raw := filepath.ToSlash(filepath.Clean(normalizedRaw))
+	raw = strings.TrimPrefix(raw, "./")
+	if raw == "" || raw == "." || raw == ".." || strings.HasPrefix(raw, "../") {
+		return resolved
+	}
+
+	relative := raw
+	if strings.HasPrefix(relative, repoPrefix+"/") {
+		relative = strings.TrimPrefix(relative, repoPrefix+"/")
+	} else if slash := strings.IndexByte(relative, '/'); slash > 0 &&
+		exploreSourceRangeLogicalRepoLabel(repoPrefix, relative[:slash]) {
+		relative = relative[slash+1:]
+	}
+	scopedPath := repoPrefix + "/" + relative
+	out := make([]string, 0, exploreSourceRangeMaxAliases)
+	seen := make(map[string]struct{}, exploreSourceRangeMaxAliases)
+	add := func(path string) {
+		if path == "" || len(out) == exploreSourceRangeMaxAliases {
+			return
+		}
+		if _, duplicate := seen[path]; duplicate {
+			return
+		}
+		seen[path] = struct{}{}
+		out = append(out, path)
+	}
+	if len(resolved) > 0 {
+		add(resolved[0])
+	}
+	add(scopedPath)
+	return out
+}
+
+func exploreSourceRangeAbsolutePath(path string) bool {
+	if path == "" {
+		return false
+	}
+	if filepath.IsAbs(filepath.FromSlash(path)) || strings.HasPrefix(path, "//") {
+		return true
+	}
+	return len(path) >= 2 && path[1] == ':' &&
+		((path[0] >= 'a' && path[0] <= 'z') || (path[0] >= 'A' && path[0] <= 'Z'))
+}
+
+func exploreSourceRangeTraversalPath(path string) bool {
+	for _, component := range strings.Split(path, "/") {
+		if component == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func exploreSourceRangeLogicalRepoLabel(repoPrefix, label string) bool {
+	if strings.EqualFold(repoPrefix, label) {
+		return true
+	}
+	if len(repoPrefix) <= len(label)+1 || repoPrefix[len(label)] != '-' ||
+		!strings.EqualFold(repoPrefix[:len(label)], label) {
+		return false
+	}
+	for _, r := range repoPrefix[len(label)+1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // exploreSourceRangeIndex chooses the exact indexed path when present. If it is
 // absent, exactly one suffix alias may resolve; multiple suffix hits are
 // deliberately rejected so an explicit citation never promotes an ambiguous
@@ -419,10 +520,11 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 	ctx context.Context,
 	task string,
 	ordinary []*rerank.Candidate,
+	reader graph.Reader,
 	scope query.QueryOptions,
 ) []*rerank.Candidate {
 	specs := exploreSourceRangeSpecs(task)
-	if s == nil || s.graph == nil || len(specs) == 0 || ctx.Err() != nil {
+	if s == nil || reader == nil || len(specs) == 0 || ctx.Err() != nil {
 		return ordinary
 	}
 	type resolvedRange struct {
@@ -434,10 +536,17 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 	seenPaths := make(map[string]struct{}, len(specs)*exploreSourceRangeMaxAliases)
 	for _, spec := range specs {
 		absPath, relPath, err := s.resolveFilePath(spec.File)
-		if err != nil {
-			continue
+		resolvedGraphPath := ""
+		resolvedRepoPrefix := ""
+		if err == nil {
+			resolvedGraphPath = s.resolveOverlayGraphPath(relPath, absPath)
+			if s.multiIndexer != nil {
+				resolvedRepoPrefix = matchedRepoPrefix(s.multiIndexer, relPath)
+			}
 		}
-		graphPaths := exploreSourceRangeGraphPathAliases(s.resolveOverlayGraphPath(relPath, absPath))
+		graphPaths := exploreSourceRangeScopedGraphPathAliases(
+			spec.File, resolvedGraphPath, resolvedRepoPrefix, scope,
+		)
 		if len(graphPaths) == 0 {
 			continue
 		}
@@ -452,10 +561,16 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 	if len(resolved) == 0 {
 		return ordinary
 	}
-	indexes := s.buildFileSymbolIndexForOrderedPathsContext(ctx, orderedPaths)
+	indexes := s.buildFileSymbolIndexForOrderedPathsScopedReaderContext(ctx, reader, orderedPaths, scope)
+	if ctx.Err() != nil {
+		return ordinary
+	}
 	exactNodes := make([]*graph.Node, 0, len(resolved))
 	seenNodes := make(map[string]struct{}, len(resolved))
 	for _, item := range resolved {
+		if ctx.Err() != nil {
+			return ordinary
+		}
 		index := exploreSourceRangeIndex(indexes, item.graphPaths)
 		for _, node := range exploreSourceRangeDefinitions(index, item.spec.StartLine, item.spec.EndLine) {
 			if node == nil || !exploreLocalizableKind(node.Kind) || !scope.ScopeAllows(node) ||
@@ -475,7 +590,7 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 			break
 		}
 	}
-	if len(exactNodes) == 0 {
+	if ctx.Err() != nil || len(exactNodes) == 0 {
 		return ordinary
 	}
 	ordinaryByID := make(map[string]*rerank.Candidate, len(ordinary))
@@ -505,6 +620,9 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 			continue
 		}
 		out = append(out, candidate)
+	}
+	if ctx.Err() != nil {
+		return ordinary
 	}
 	return out
 }
@@ -799,16 +917,21 @@ func exploreSyntacticAnchorReusesProtected(
 // exploreExactQualifiedAnchorCandidate resolves the parser's exact member name
 // before the bounded lexical lane. Graph nodes commonly store only the terminal
 // method Name while the ID tail carries Owner.member, so query both exact forms.
-// This lookup is restricted to explicit Owner::member task syntax and still
-// applies session, query, kind, and diversity filters through the ordinary
-// anchor selector.
+// If those exact point lookups cannot select a qualified node, one final lane
+// may inspect up to four already-ranked files that contain an exact owner
+// declaration. It never performs a substring or corpus-wide scan.
 func (s *Server) exploreExactQualifiedAnchorCandidate(
 	ctx context.Context,
 	anchor exploreSyntacticAnchor,
+	ordinary []*rerank.Candidate,
 	scope query.QueryOptions,
 	usedIDs, usedFiles map[string]struct{},
 ) *rerank.Candidate {
-	if s == nil || s.graph == nil || anchor.qualifiedName == "" || ctx.Err() != nil {
+	if s == nil || anchor.qualifiedName == "" || ctx.Err() != nil {
+		return nil
+	}
+	reader := s.readerFor(ctx)
+	if reader == nil {
 		return nil
 	}
 	names := []string{anchor.qualifiedName}
@@ -818,7 +941,21 @@ func (s *Server) exploreExactQualifiedAnchorCandidate(
 	candidates := make([]*rerank.Candidate, 0, exploreSyntacticAnchorFetch)
 	seen := make(map[string]struct{}, exploreSyntacticAnchorFetch)
 	for _, name := range names {
-		for _, node := range s.graph.FindNodesByName(name) {
+		remaining := exploreSyntacticAnchorFetch - len(candidates)
+		if remaining <= 0 {
+			break
+		}
+		page, ok := boundedLocalizationExactName(
+			ctx,
+			reader,
+			name,
+			s.localizationNodeScope(ctx, scope, graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindInterface, graph.KindMacro),
+			remaining,
+		)
+		if !ok {
+			return nil
+		}
+		for _, node := range page.Nodes {
 			if node == nil || !s.nodeInSessionScope(ctx, node) {
 				continue
 			}
@@ -835,7 +972,10 @@ func (s *Server) exploreExactQualifiedAnchorCandidate(
 			break
 		}
 	}
-	return exploreSyntacticAnchorCandidate(anchor, candidates, scope, usedIDs, usedFiles)
+	if candidate := exploreSyntacticAnchorCandidate(anchor, candidates, scope, usedIDs, usedFiles); candidate != nil {
+		return candidate
+	}
+	return s.exploreQualifiedLeafCandidate(ctx, reader, anchor, ordinary, scope, usedIDs, usedFiles)
 }
 
 // gatherExploreSyntacticAnchorCandidates performs a tiny lexical retrieval for
@@ -879,13 +1019,14 @@ func exploreAnchorPoolCandidate(
 	return candidate, false
 }
 
-func (s *Server) gatherExploreSyntacticAnchorCandidates(
+func (s *Server) gatherExploreSyntacticAnchorCandidatesCollecting(
 	ctx context.Context,
 	task string,
 	ordinary []*rerank.Candidate,
 	eng *query.Engine,
 	scope query.QueryOptions,
 	rctx *rerank.Context,
+	collector *localizationSourceWindowHitCollector,
 ) ([]*rerank.Candidate, map[int]string) {
 	if s == nil || s.graph == nil || eng == nil || ctx.Err() != nil {
 		return nil, nil
@@ -927,7 +1068,7 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 			protected[index] = reused
 			continue
 		}
-		if exactCandidate := s.exploreExactAnchorCandidate(ctx, anchor, scope, usedIDs, usedFiles); exactCandidate != nil {
+		if exactCandidate := s.exploreExactAnchorCandidate(ctx, anchor, ordinary, scope, usedIDs, usedFiles); exactCandidate != nil {
 			protectedCandidate, pooled := exploreAnchorPoolCandidate(ordinary, exactCandidate)
 			if !pooled {
 				additions = append(additions, protectedCandidate)
@@ -1003,7 +1144,7 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 	for _, hit := range recall.hits {
 		ids = append(ids, hit.nodeID)
 	}
-	nodes := s.graph.GetNodesByIDs(ids)
+	nodes := s.readerFor(ctx).GetNodesByIDs(ids)
 	for localIndex, anchorIndex := range missed {
 		var fallback *graph.Node
 		var selected *graph.Node
@@ -1034,6 +1175,12 @@ func (s *Server) gatherExploreSyntacticAnchorCandidates(
 		}
 		if selected == nil {
 			continue
+		}
+		for _, hit := range recall.hits {
+			if hit.anchor == localIndex && hit.nodeID == selected.ID && hit.rank == selectedRank {
+				collector.add(hit)
+				break
+			}
 		}
 		sourceRank := 1.0
 		if selectedRank > 0 {
