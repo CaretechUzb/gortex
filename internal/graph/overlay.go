@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"sync"
@@ -412,7 +413,7 @@ func (v *OverlaidView) GetNode(id string) *Node {
 // fans out as a single batched lookup against the base store. Missing
 // IDs are simply absent from the returned map.
 func (v *OverlaidView) GetNodesByIDs(ids []string) map[string]*Node {
-	nodes, _ := v.GetNodesByIDsContext(nil, ids)
+	nodes, _ := v.GetNodesByIDsContext(context.Background(), ids)
 	return nodes
 }
 

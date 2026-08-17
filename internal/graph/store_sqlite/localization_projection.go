@@ -49,7 +49,7 @@ func (s *Store) FindNodesByNameBounded(
 	if err != nil {
 		return graph.BoundedNodeProjection{}, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	const rawPageSize = 256
 	sentinel := limit + 1
@@ -137,7 +137,7 @@ func (s *Store) FindFileNodesBounded(
 	if err != nil {
 		return graph.BoundedNodeProjection{}, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	columns := lookupNodeSummaryCols
 	if scope.ExcludeTests {

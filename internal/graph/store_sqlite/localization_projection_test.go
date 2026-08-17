@@ -42,7 +42,9 @@ func TestFindNodesByNameBoundedCapsTenThousandHomonyms(t *testing.T) {
 	)
 	store.BeginBulkLoad()
 	store.AddBatch(nodes, nil)
-	store.FlushBulk()
+	if err := store.FlushBulk(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 
 	page, err := store.FindNodesByNameBounded(
 		context.Background(),
@@ -104,7 +106,9 @@ func TestFindNodesByNameBoundedFindsProductionRowsBehindTests(t *testing.T) {
 	}
 	store.BeginBulkLoad()
 	store.AddBatch(nodes, nil)
-	store.FlushBulk()
+	if err := store.FlushBulk(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 
 	page, err := store.FindNodesByNameBounded(
 		context.Background(), "handle", graph.LocalizationNodeScope{ExcludeTests: true}, 8,
@@ -193,7 +197,9 @@ func TestOverlaidViewFindNodesByNameBoundedAppliesSQLiteScopeWithoutMutatingCall
 	)
 	store.BeginBulkLoad()
 	store.AddBatch(nodes, nil)
-	store.FlushBulk()
+	if err := store.FlushBulk(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 
 	layer := graph.NewOverlayLayer()
 	layer.MarkFile("repo/a-overlay-hidden.go", true)
@@ -252,7 +258,9 @@ func TestFindFileNodesBoundedCapsScopesKindsAndDropsPayloads(t *testing.T) {
 	}
 	store.BeginBulkLoad()
 	store.AddBatch(nodes, nil)
-	store.FlushBulk()
+	if err := store.FlushBulk(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 
 	page, err := store.FindFileNodesBounded(
 		context.Background(), filePath,
@@ -315,7 +323,9 @@ func TestFindFileNodesBoundedFindsProductionRowsBehindTests(t *testing.T) {
 	}
 	store.BeginBulkLoad()
 	store.AddBatch(nodes, nil)
-	store.FlushBulk()
+	if err := store.FlushBulk(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 
 	page, err := store.FindFileNodesBounded(
 		context.Background(), filePath, graph.LocalizationNodeScope{ExcludeTests: true}, 8,
@@ -356,7 +366,9 @@ func TestFindFileNodesBoundedFindsDefinitionsBehindExcludedKinds(t *testing.T) {
 	}
 	store.BeginBulkLoad()
 	store.AddBatch(nodes, nil)
-	store.FlushBulk()
+	if err := store.FlushBulk(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 
 	page, err := store.FindFileNodesBounded(
 		context.Background(), filePath,

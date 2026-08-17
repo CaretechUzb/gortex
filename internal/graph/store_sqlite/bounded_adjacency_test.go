@@ -227,6 +227,9 @@ func TestSQLiteBoundedAdjacencyMidScanCancellationReturnsNoPartial(t *testing.T)
 	if !errors.Is(err, context.Canceled) || len(identities) != 0 || truncated {
 		t.Fatalf("canceled scan leaked partial identities: len=%d truncated=%v err=%v", len(identities), truncated, err)
 	}
+	if err := rows.Err(); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("rows: %v", err)
+	}
 	store.AddEdge(&graph.Edge{From: "after-cancel", To: "target", Kind: graph.EdgeCalls})
 }
 
@@ -257,6 +260,9 @@ func TestSQLiteBoundedAdjacencyPlansUsePredicateIndexes(t *testing.T) {
 					t.Fatalf("scan plan: %v", err)
 				}
 				details = append(details, detail)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatalf("plan rows: %v", err)
 			}
 			plan := strings.ToUpper(strings.Join(details, "\n"))
 			if strings.Contains(plan, "SCAN EDGES") || strings.Contains(plan, "ORDER BY") || strings.Contains(plan, "TEMP B-TREE") {
@@ -303,6 +309,9 @@ func TestSQLiteEdgesByFromLineIndexesCoexistAndOpenIdempotently(t *testing.T) {
 			}
 			columns = append(columns, name)
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("index info rows: %v", err)
+		}
 		_ = rows.Close()
 		if !reflect.DeepEqual(columns, []string{"from_id", "line"}) {
 			t.Fatalf("reopen %d legacy columns = %#v", reopen, columns)
@@ -319,6 +328,9 @@ func TestSQLiteEdgesByFromLineIndexesCoexistAndOpenIdempotently(t *testing.T) {
 				t.Fatalf("scan bounded-site index info: %v", err)
 			}
 			columns = append(columns, name)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("bounded-site index rows: %v", err)
 		}
 		_ = rows.Close()
 		if !reflect.DeepEqual(columns, []string{"from_id", "line", "kind"}) {

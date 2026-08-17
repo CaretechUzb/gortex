@@ -375,12 +375,9 @@ func TestCodexInstallsPreToolUseHook(t *testing.T) {
 	if handler["statusMessage"] != "Loading Gortex tool guidance..." {
 		t.Errorf("statusMessage=%v", handler["statusMessage"])
 	}
+	matcher := regexp.MustCompile(codexPreToolUseMatcher)
 	for _, tool := range []string{"Bash", "apply_patch", "Read", "WebSearch", "mcp__gortex__search", "mcp__gortex__change"} {
-		matched, err := regexp.MatchString(codexPreToolUseMatcher, tool)
-		if err != nil {
-			t.Fatalf("compile matcher: %v", err)
-		}
-		if !matched {
+		if !matcher.MatchString(tool) {
 			t.Errorf("match-all PreToolUse matcher missed %q", tool)
 		}
 	}
