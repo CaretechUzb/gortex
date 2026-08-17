@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 11
+const currentSchemaVersion = 12
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -79,6 +79,48 @@ var schemaMigrations = []schemaMigration{
 	// derived vector sidecar rather than discarding otherwise-valid topology.
 	{version: 10, name: "rebuild vector corpus ownership and parents", inPlace: rebuildVectorCorpusSchema},
 	{version: 11, name: "add symbol FTS normalization state", inPlace: createSymbolFTSNormalizationStateTable},
+	{version: 12, name: "normalize dir column separators", inPlace: normalizeDirColumnSeparators},
+}
+
+// normalizeDirColumnSeparators rebuilds the two generated dir columns whose
+// pre-v12 expressions trimmed at '/' only. Stored paths keep the writing
+// platform's native separators below the repo prefix, so a Windows-written
+// store collapsed both dirs to the repo prefix and the Go receiver-rebind
+// join degenerated from "same package dir" to "same repo". A generated
+// column cannot be redefined in place: drop the index over file_dir, drop
+// and re-add both columns with the current DDL, and recreate the index from
+// the shared always-live set so its DDL cannot drift. Idempotent — a re-run
+// re-adds the same expressions, and the existence guards tolerate a store
+// where a column is already absent or already current.
+func normalizeDirColumnSeparators(tx *sql.Tx) error {
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS nodes_go_receiver_type`); err != nil {
+		return err
+	}
+	for _, col := range []struct{ table, name, ddl string }{
+		{"nodes", "file_dir", fileDirColumnDDL},
+		{"edges", "member_receiver_dir", memberReceiverDirColumnDDL},
+	} {
+		var count int
+		q := fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_xinfo('%s') WHERE name = ?`, col.table)
+		if err := tx.QueryRow(q, col.name).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			if _, err := tx.Exec(`ALTER TABLE ` + col.table + ` DROP COLUMN ` + col.name); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(`ALTER TABLE ` + col.table + ` ADD COLUMN ` + col.ddl); err != nil {
+			return err
+		}
+	}
+	for _, idx := range bulkAlwaysLiveIndexes {
+		if idx.name == "nodes_go_receiver_type" {
+			_, err := tx.Exec(idx.ddl)
+			return err
+		}
+	}
+	return fmt.Errorf("nodes_go_receiver_type missing from bulkAlwaysLiveIndexes")
 }
 
 // createSymbolFTSNormalizationStateTable is the explicit v11 migration for
