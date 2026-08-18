@@ -9,7 +9,7 @@ import (
 func TestBuildPerFileContractExtractors_IncludesHtmx(t *testing.T) {
 	idx := &Indexer{}
 	_, byLang := idx.buildPerFileContractExtractors()
-	for _, lang := range []string{"html", "gotmpl", "htmldjango"} {
+	for _, lang := range []string{"html", "gotmpl", "templ"} {
 		found := false
 		for _, ex := range byLang[lang] {
 			if _, ok := ex.(*contracts.HtmxExtractor); ok {

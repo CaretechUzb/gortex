@@ -18,12 +18,21 @@ const htmxFixture = `<!doctype html>
 <a hx-get="">empty</a>
 <div hx-get="/ui/parts/{{.P.ID}}/exp">dup same path other element</div>
 <a hx-get="?sort=mpn&dir=asc">sort</a>
+<!-- <button hx-get="/commented/route"> -->
+<!--
+<button hx-get="/also/commented">inside multi-line comment</button>
+-->
+<a hx-get="/after-comment-block">after multi-line comment</a>
+<a hx-get="/api/{{if .V2}}/v2{{else}}/v1{{end}}/items">cond</a>
+<a hx-get=" ?sort=mpn&dir=asc">leading-space sort</a>
+<a hx-get="JavaScript:void(0)">JS uri</a>
+<button data-hx-get="/health2">data- prefixed</button>
 </body></html>
 `
 
 func TestHtmxExtractor_SupportedLanguages(t *testing.T) {
 	got := (&HtmxExtractor{}).SupportedLanguages()
-	want := []string{"html", "gotmpl", "htmldjango"}
+	want := []string{"html", "gotmpl", "templ"}
 	if len(got) != len(want) {
 		t.Fatalf("SupportedLanguages() = %v, want %v", got, want)
 	}
@@ -37,8 +46,8 @@ func TestHtmxExtractor_SupportedLanguages(t *testing.T) {
 func TestHtmxExtractor_Extract(t *testing.T) {
 	fileNodes := []*graph.Node{{ID: "ui/internal/templates/parts.html", Kind: graph.KindFile}}
 	out := (&HtmxExtractor{}).Extract("ui/internal/templates/parts.html", []byte(htmxFixture), fileNodes, nil)
-	if len(out) != 5 {
-		t.Fatalf("got %d contracts, want 5 (4 ids + the line-10 re-occurrence; none from skip shapes): %+v", len(out), out)
+	if len(out) != 7 {
+		t.Fatalf("got %d contracts, want 7 (5 distinct ids + the line-3/line-10 re-occurrence pair + data-hx pin; none from skip or commented shapes): %+v", len(out), out)
 	}
 
 	byID := make(map[string]Contract)
@@ -46,13 +55,18 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 		byID[c.ID] = c
 	}
 
-	// Export + the duplicate div share one contract ID (dup is a second
-	// occurrence of the same route; both recorded, keyed by ID here).
+	// The full expected ID set. Export + the duplicate div share one
+	// contract ID (dup is a second occurrence of the same route; both
+	// recorded, keyed by ID here). /after-comment-block proves the
+	// multi-line comment strip (line 16, true to the file), /health2
+	// pins the data-hx-* prefix form.
 	wantIDs := map[string]bool{
 		"http::GET::/ui/parts/{p1}/exp":    false,
 		"http::POST::/ui/parts/{p1}/reset": false,
 		"http::DELETE::/ui/parts/{p1}":     false,
 		"http::GET::/health":               false,
+		"http::GET::/after-comment-block":  false,
+		"http::GET::/health2":              false,
 	}
 	for id := range wantIDs {
 		c, ok := byID[id]
@@ -82,11 +96,16 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 	}
 
 	// Skipped shapes produce nothing — including a query-only value, whose
-	// stripped raw_path ("") must never reach a contract.
+	// stripped raw_path ("") must never reach a contract, and the
+	// leading-space variant whose untrimmed form used to bypass the guard.
 	for _, id := range byID {
 		if id.Meta["raw_path"] == "#section" || id.Meta["raw_path"] == "" ||
 			id.Meta["raw_path"] == "?sort=mpn&dir=asc" ||
 			id.Meta["raw_path"] == "javascript:void(0)" ||
+			id.Meta["raw_path"] == "JavaScript:void(0)" ||
+			id.Meta["raw_path"] == "/commented/route" ||
+			id.Meta["raw_path"] == "/also/commented" ||
+			id.Meta["raw_path"] == "/api/{{if .V2}}/v2{{else}}/v1{{end}}/items" ||
 			id.Meta["raw_path"] == "{{ if .Edit }}/edit{{ else }}/new{{ end }}" {
 			t.Fatalf("skip-shape extracted: %+v", id)
 		}
@@ -107,10 +126,20 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 		}
 	}
 
-	// Line numbers point at the attributes: the fixture places the
-	// /health attribute on line 5, and lineNumber is 1-based.
+	// Line numbers point at the attributes and are computed from the
+	// ORIGINAL source (lineNumber is 1-based), even though scanning runs
+	// on the comment-stripped copy: /health sits on line 5, the
+	// after-comment-block attribute on line 16 — AFTER a comment
+	// spanning lines 13-15, whose equal-length space replacement keeps
+	// every byte offset true to the file — and the data-hx pin on line 20.
 	if c := byID["http::GET::/health"]; c.Line != 5 {
 		t.Fatalf("GET /health Line=%d, want 5", c.Line)
+	}
+	if c := byID["http::GET::/after-comment-block"]; c.Line != 16 {
+		t.Fatalf("GET /after-comment-block Line=%d, want 16 (after multi-line comment)", c.Line)
+	}
+	if c := byID["http::GET::/health2"]; c.Line != 20 {
+		t.Fatalf("GET /health2 Line=%d, want 20 (data-hx-get pin)", c.Line)
 	}
 }
 

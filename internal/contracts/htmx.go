@@ -1,6 +1,7 @@
 package contracts
 
 import (
+	"bytes"
 	"fmt"
 	"regexp"
 	"strings"
@@ -16,14 +17,31 @@ import (
 // normalizeHtmxPath, which maps whole-segment template expressions
 // ({{.P.ID}}) onto the same {p1} placeholder space as a provider's
 // declared {id} params before delegating to NormalizeHTTPPathWithParams.
+//
+// Coverage gaps: .gohtml carries Go-template htmx pages but has no
+// registered language in the parser (nothing maps the extension), and
+// .tpl is claimed by the Helm extractor ahead of the forest gotmpl
+// grammar — so htmx attributes in those files are not scanned.
 type HtmxExtractor struct{}
 
 // htmxAttrRe matches the five request-issuing htmx attributes with either
 // quote style. Group 1: verb; group 2: double-quoted value; group 3:
 // single-quoted value. Deliberately an attribute-level scan, not an HTML
 // parse — Go/Jinja/ERB templates are routinely not well-formed HTML until
-// rendered ({{if}} blocks split tags mid-element).
+// rendered ({{if}} blocks split tags mid-element). The \b prefix
+// intentionally also admits htmx's official data-hx-* prefix form
+// (data-hx-get="..."): "data-hx-get" hyphen-precedes "hx-get", \b holds
+// at the boundary, and the attribute is the same request either way.
 var htmxAttrRe = regexp.MustCompile(`(?i)\bhx-(get|post|put|patch|delete)\s*=\s*(?:"([^"]*)"|'([^']*)')`)
+
+// htmxCommentRe matches HTML comments and Go template comments (the
+// {{- /* ... */ -}} form, trim markers optional). (?s) lets HTML
+// comments span lines. Matches
+// are blanked with an equal-length run of spaces before scanning, so a
+// commented-out hx-* attribute emits no contract while every byte offset
+// — and therefore every Line number, computed from the ORIGINAL source —
+// stays true to the file.
+var htmxCommentRe = regexp.MustCompile(`(?s)<!--.*?-->|\{\{-?\s*/\*.*?\*/\s*-?\}\}`)
 
 // htmxTemplateSegment matches a path segment that is entirely a template
 // expression — {{...}} (Go/Jinja values), {%...%} (Jinja statements),
@@ -60,27 +78,47 @@ func normalizeHtmxPath(raw string) (path string, ok bool) {
 }
 
 // SupportedLanguages covers the registered template languages that carry
-// htmx attributes: html (.html/.htm), gotmpl (.tpl/.gotmpl/.tmpl), and
-// htmldjango (.djhtml).
+// htmx attributes in standard quoted form: html (.html/.htm), gotmpl
+// (.gotmpl/.tmpl), and templ (.templ).
+//
+// htmldjango (.djhtml) is deliberately dropped, not overlooked:
+// plain-Django providers mint method-less http::ANY::<path> IDs, which
+// never collide with this extractor's verb-specific consumers, and
+// Django's idiomatic {% url 'name' %} indirection is a skip-shape anyway
+// — so scanning .djhtml adds unpairable noise. Revisit when upstream
+// bridges ANY providers into verb-specific identity.
 func (e *HtmxExtractor) SupportedLanguages() []string {
-	return []string{"html", "gotmpl", "htmldjango"}
+	return []string{"html", "gotmpl", "templ"}
 }
 
 // Extract emits one consumer contract per htmx attribute occurrence,
-// deduplicated per (verb, normalized path, line).
+// deduplicated per (verb, normalized path, line). HTML and Go template
+// comments are blanked from the scanned copy first — commented-out
+// attributes are dead markup, not consumers.
 func (e *HtmxExtractor) Extract(filePath string, src []byte, fileNodes []*graph.Node, _ []*graph.Edge) []Contract {
 	var out []Contract
-	text := string(src)
-	lines := strings.Split(text, "\n")
+	// Line numbers come from the ORIGINAL source; only the scanned copy
+	// is comment-stripped, each comment replaced by an equal-length run
+	// of spaces so byte offsets in the stripped copy map 1:1 onto src.
+	// Newlines inside a multi-line comment become spaces in the scanned
+	// copy — which is exactly why `lines` must be split from src, not
+	// from the stripped text, for Line numbers to stay true to the file.
+	lines := strings.Split(string(src), "\n")
+	scan := string(htmxCommentRe.ReplaceAllFunc(src, func(m []byte) []byte {
+		return bytes.Repeat([]byte{' '}, len(m))
+	}))
 	seen := make(map[string]struct{})
-	for _, m := range htmxAttrRe.FindAllStringSubmatchIndex(text, -1) {
-		verb := strings.ToUpper(text[m[2]:m[3]])
+	for _, m := range htmxAttrRe.FindAllStringSubmatchIndex(scan, -1) {
+		verb := strings.ToUpper(scan[m[2]:m[3]])
 		raw := ""
 		if m[4] != -1 {
-			raw = text[m[4]:m[5]]
+			// Trim immediately: a leading-space value (" ?sort=x")
+			// otherwise survives the query strip as " " and the
+			// normalizer widens it to the root path — a junk contract.
+			raw = strings.TrimSpace(scan[m[4]:m[5]])
 		}
 		if m[6] != -1 {
-			raw = text[m[6]:m[7]]
+			raw = strings.TrimSpace(scan[m[6]:m[7]])
 		}
 		if skipHtmxValue(raw) {
 			continue
@@ -121,12 +159,13 @@ func (e *HtmxExtractor) Extract(filePath string, src []byte, fileNodes []*graph.
 }
 
 // skipHtmxValue filters attribute values that are not route references:
-// empty values, same-page anchors, javascript: URIs, and values that are
-// (or start with) an unrendered control/interpolation expression — a
-// dynamically assembled URL has no path we can match.
+// empty values, same-page anchors, javascript: URIs (case-insensitive —
+// "JavaScript:void(0)" is the same no-op), and values that are (or start
+// with) an unrendered control/interpolation expression — a dynamically
+// assembled URL has no path we can match.
 func skipHtmxValue(v string) bool {
 	v = strings.TrimSpace(v)
-	if v == "" || strings.HasPrefix(v, "#") || strings.HasPrefix(v, "javascript:") {
+	if v == "" || strings.HasPrefix(v, "#") || strings.HasPrefix(strings.ToLower(v), "javascript:") {
 		return true
 	}
 	for _, open := range []string{"{{", "{%", "<%"} {
