@@ -1250,6 +1250,20 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 	})
 	t.AppendRow(table.Row{"daemon", st.Version})
 	t.AppendRow(table.Row{"pid", st.PID})
+	// Upgrade-skew facts belong next to the daemon version they qualify.
+	// The cli row appears only when this binary's build differs from the
+	// daemon's — the same compare runProxy warns on at connect time — so
+	// a matching pair keeps the table exactly as terse as before. The
+	// binary row surfaces the daemon's own on-disk drift probe and only
+	// when it actually ran: an unchecked binary is unknown, not fresh,
+	// and must not be reported as either.
+	local := canonicalVersion()
+	if warn := daemonSkewWarning(st.Version, local); warn != "" {
+		t.AppendRow(table.Row{"cli", local + " (differs from daemon — see warning)"})
+	}
+	if st.BinaryChecked && st.BinaryStale {
+		t.AppendRow(table.Row{"binary", "stale — on-disk image newer than running image; run 'gortex daemon restart'"})
+	}
 	t.AppendRow(table.Row{"socket", st.SocketPath})
 	t.AppendRow(table.Row{"uptime", formatDuration(time.Duration(st.UptimeSeconds) * time.Second)})
 	switch {
