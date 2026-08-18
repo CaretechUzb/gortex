@@ -95,3 +95,32 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 
 // keysOf is already declared in http_test.go (same signature, same body);
 // the brief's copy would redeclare it in this package.
+
+func TestHtmxConsumerIDCollidesWithProvider(t *testing.T) {
+	tmpl := `<button hx-get="/ui/parts/{{.P.ID}}/exp">Export</button>`
+	consumers := (&HtmxExtractor{}).Extract("ui/internal/templates/parts.html", []byte(tmpl), nil, nil)
+	if len(consumers) != 1 {
+		t.Fatalf("got %d contracts, want 1: %+v", len(consumers), consumers)
+	}
+
+	// Provider side: what route_ast_go / http_filebased build for a
+	// declared route — same normalizer, same ID format.
+	norm, _ := NormalizeHTTPPathWithParams("/ui/parts/{id}/exp")
+	providerID := "http::GET::" + norm
+	if consumers[0].ID != providerID {
+		t.Fatalf("consumer ID %q != provider ID %q — matcher will orphan the route",
+			consumers[0].ID, providerID)
+	}
+
+	// Registry round-trip: both sides land in the same workspace bucket.
+	reg := NewRegistry()
+	reg.AddAllScoped([]Contract{{
+		ID: providerID, Type: ContractHTTP, Role: RoleProvider,
+		FilePath: "ui/internal/router.go", Line: 42,
+	}}, "go-parts", "", "")
+	reg.AddAllScoped(consumers, "go-parts", "", "")
+	bucket := reg.ByWorkspace("go-parts")
+	if len(bucket) != 2 {
+		t.Fatalf("workspace bucket has %d contracts, want 2", len(bucket))
+	}
+}
