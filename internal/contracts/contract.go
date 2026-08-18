@@ -107,6 +107,18 @@ var tplBasePrefix = regexp.MustCompile(`^/?\$\{[^}]+\}`)
 // so consumer paths align with provider route declarations.
 var tplInlineParam = regexp.MustCompile(`\$\{([^}]+)\}|\$([a-zA-Z_][a-zA-Z0-9_]*)`)
 
+// tplWholeSegment matches a path segment that is ENTIRELY a template
+// expression — Go {{...}}, Jinja {%...%}, or ERB <%...%>. Interpolated
+// request-path slots (e.g. /ui/parts/{{.P.ID}}/exp) normalise to path
+// parameters exactly like a provider's :id / {id} declaration. Segments
+// that only CONTAIN an expression (/items-{{.ID}}) are left literal.
+var tplWholeSegment = regexp.MustCompile(`^\{\{.*\}\}$|^\{%.*%\}$|^<%.*%>$`)
+
+// tplParamName is the synthetic name handed to the positional normaliser
+// for whole-segment template expressions. paramPatterns renumbers it to
+// {p1}, {p2}, ... alongside declared params, in path order.
+const tplParamName = "{tplparam}"
+
 // NormalizeHTTPPath converts path parameters from various frameworks into the
 // canonical {param} form.  Examples:
 //
@@ -148,6 +160,32 @@ func NormalizeHTTPPathWithParams(path string) (string, []string) {
 			path = "/"
 		}
 	}
+
+	// Whole-segment template expressions are interpolated path slots. A
+	// LEADING one followed by more segments is the base-URL slot
+	// ({{.Base}}/v1/users) — strip it like tplBasePrefix below strips
+	// ${BASE}. Any other whole-segment expression becomes a path
+	// parameter so it lands in the same {p1}, {p2}, ... space as the
+	// provider's declared params.
+	segs := strings.Split(path, "/")
+	first := 0
+	for first < len(segs) && segs[first] == "" {
+		first++
+	}
+	strippedBase := false
+	for i := first; i < len(segs); i++ {
+		if segs[i] == "" || !tplWholeSegment.MatchString(segs[i]) {
+			continue
+		}
+		if i == first && len(segs)-first > 1 && !strippedBase {
+			segs = append(segs[:i], segs[i+1:]...)
+			strippedBase = true
+			i--
+			continue
+		}
+		segs[i] = tplParamName
+	}
+	path = strings.Join(segs, "/")
 
 	// Strip a leading template-literal placeholder (with optional leading
 	// slash) — the base-URL slot that a consumer interpolates. After this
