@@ -105,6 +105,39 @@ func TestCSharpSolutionForAutoDetect(t *testing.T) {
 	assert.Equal(t, "", csharpSolutionFor(t.TempDir()))
 }
 
+func TestCSharpSolutionForOffSentinelDisablesPinning(t *testing.T) {
+	// One env var covers the whole feature: a path list pins, empty
+	// auto-detects, and an explicit falsy value switches injection AND
+	// auto-detect off so the server's own discovery runs untouched.
+	root := t.TempDir()
+	writeSolutionFile(t, root, "Only.sln")
+	for _, v := range []string{"off", "none", "0", "false", "no", "OFF"} {
+		t.Setenv(CSharpSolutionEnv, v)
+		assert.Equal(t, "", csharpSolutionFor(root), "sentinel %q must disable auto-detect", v)
+	}
+}
+
+func TestCSharpSolutionResolutionReportsSourceAndIgnored(t *testing.T) {
+	// Callers log how the solution was chosen and which env entries were
+	// dropped — a silently ignored mis-spelled entry otherwise presents
+	// as the exact symptom the pin exists to fix.
+	root := t.TempDir()
+	writeSolutionFile(t, root, "Only.sln")
+
+	t.Setenv(CSharpSolutionEnv, "")
+	choice := csharpSolutionResolution(root)
+	assert.Equal(t, "Only.sln", choice.solution)
+	assert.Equal(t, "auto-detect", choice.source)
+	assert.Empty(t, choice.ignored)
+
+	t.Setenv(CSharpSolutionEnv, "missing.sln"+string(os.PathListSeparator)+"Only.sln")
+	choice = csharpSolutionResolution(root)
+	assert.Equal(t, "Only.sln", choice.solution)
+	assert.Equal(t, "env", choice.source)
+	require.Len(t, choice.ignored, 1)
+	assert.Contains(t, choice.ignored[0], "missing.sln")
+}
+
 func TestCSharpSolutionArgs(t *testing.T) {
 	root := t.TempDir()
 	writeSolutionFile(t, root, "Only.sln")
@@ -114,11 +147,16 @@ func TestCSharpSolutionArgs(t *testing.T) {
 	assert.Equal(t, []string{"--stdio", "--solution", "Only.sln"},
 		csharpSolutionArgs([]string{"--stdio"}, root))
 
-	// A caller-supplied solution wins, in either spelling.
+	// A caller-supplied solution wins, in every spelling — bare token
+	// and the =-joined form config args can carry.
 	explicit := []string{"--solution", "Custom.sln"}
 	assert.Equal(t, explicit, csharpSolutionArgs(explicit, root))
 	short := []string{"-s", "Custom.sln"}
 	assert.Equal(t, short, csharpSolutionArgs(short, root))
+	joined := []string{"--solution=Custom.sln"}
+	assert.Equal(t, joined, csharpSolutionArgs(joined, root))
+	shortJoined := []string{"-s=Custom.sln"}
+	assert.Equal(t, shortJoined, csharpSolutionArgs(shortJoined, root))
 
 	// No resolvable solution leaves the argv untouched.
 	empty := t.TempDir()

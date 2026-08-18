@@ -1914,11 +1914,28 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 	if isJdtlsCommand(p.command) {
 		args = jdtlsDataArgs(args, workspaceRoot)
 	}
-	// csharp-ls with no --solution auto-discovers only a lone root .sln; pin
-	// the workspace's resolved solution (env or single root .sln/.slnx) so
-	// multi-solution and .slnx umbrella roots load — see csharpSolutionArgs.
+	// Pin the workspace's resolved solution (env or lone root .sln/.slnx)
+	// so the loaded workspace is deterministic and matches the targeted
+	// pre-restore — see csharpSolutionArgs. Log the choice and any dropped
+	// env entries: a silently ignored mis-spelling otherwise presents as an
+	// unpinned workspace with no explanation.
 	if isCSharpLSCommand(p.command) {
+		before := len(args)
 		args = csharpSolutionArgs(args, workspaceRoot)
+		if p.logger != nil {
+			choice := csharpSolutionResolution(workspaceRoot)
+			for _, entry := range choice.ignored {
+				p.logger.Warn("lsp: csharp solution env entry ignored",
+					zap.String("entry", entry),
+					zap.String("workspace", workspaceRoot))
+			}
+			if len(args) > before {
+				p.logger.Info("lsp: csharp solution pinned",
+					zap.String("solution", choice.solution),
+					zap.String("source", choice.source),
+					zap.String("workspace", workspaceRoot))
+			}
+		}
 	}
 	return NewClient(p.command, args, p.env, workspaceRoot, p.logger)
 }
@@ -2125,7 +2142,8 @@ func (p *Provider) maybeCSharpPreRestore(workspaceRoot string) {
 	}
 	if p.logger != nil {
 		p.logger.Info("lsp: csharp pre-restore complete (NuGetAudit suppressed)",
-			zap.String("workspace", workspaceRoot))
+			zap.String("workspace", workspaceRoot),
+			zap.String("solution", csharpSolutionFor(workspaceRoot)))
 	}
 }
 

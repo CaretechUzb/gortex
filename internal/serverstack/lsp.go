@@ -113,8 +113,9 @@ const CSharpResolverEnv = "GORTEX_LSP_RESOLVER_CSHARP"
 // csharpResolverHelperEnabled reports whether the resolve-time C# helper may
 // be wired for repos with C# intent.
 func csharpResolverHelperEnabled() bool {
-	v := strings.TrimSpace(os.Getenv(CSharpResolverEnv))
-	return v == "1" || strings.EqualFold(v, "true")
+	// Set-and-not-falsy, mirroring the sibling GORTEX_LSP_RESOLVER's
+	// value vocabulary — "on"/"yes" enable instead of failing silently.
+	return strings.TrimSpace(os.Getenv(CSharpResolverEnv)) != "" && !IsFalsyEnv(CSharpResolverEnv)
 }
 
 // BuildResolverLSPHelper constructs the resolve-time LSP helper for a

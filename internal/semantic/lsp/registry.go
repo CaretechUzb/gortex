@@ -461,9 +461,12 @@ var Servers = []ServerSpec{
 		Daemon:      true,
 		MaxParallel: 6,
 		// csharp-ls is a Roslyn stdio LSP (`dotnet tool install csharp-ls`)
-		// that speaks plain LSP with no args and auto-discovers a lone .sln
-		// under the workspace root; multi-solution and .slnx roots get their
-		// solution pinned at spawn via csharpSolutionArgs. It is far more
+		// that speaks plain LSP with no args. Current versions discover
+		// solutions on their own (recursive .sln/.slnx glob, most-projects
+		// heuristic since 0.19.0); gortex still pins the resolved solution
+		// at spawn via csharpSolutionArgs for determinism, to name the
+		// same file the targeted pre-restore uses, and as the operator
+		// override when the server's heuristic picks wrong. It is far more
 		// commonly installed than OmniSharp on dev machines, so try it when
 		// omnisharp is not on PATH.
 		AlternativeCommands: []ServerAlt{

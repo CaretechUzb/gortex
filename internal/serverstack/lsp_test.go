@@ -98,14 +98,19 @@ func TestCSharpResolverHelperOptIn(t *testing.T) {
 	if csharpResolverHelperEnabled() {
 		t.Fatalf("resolve-time C# LSP must be opt-in: unset means disabled")
 	}
-	for _, v := range []string{"1", "true", "TRUE"} {
+	// Any set, non-falsy value enables — the same value vocabulary
+	// IsFalsyEnv uses, so "on"/"yes" behave like the sibling
+	// GORTEX_LSP_RESOLVER instead of being silently ignored.
+	for _, v := range []string{"1", "true", "TRUE", "on", "yes"} {
 		t.Setenv(CSharpResolverEnv, v)
 		if !csharpResolverHelperEnabled() {
 			t.Fatalf("%q should enable the resolve-time C# helper", v)
 		}
 	}
-	t.Setenv(CSharpResolverEnv, "0")
-	if csharpResolverHelperEnabled() {
-		t.Fatalf("explicit 0 should disable the resolve-time C# helper")
+	for _, v := range []string{"0", "false", "no", "off", "n"} {
+		t.Setenv(CSharpResolverEnv, v)
+		if csharpResolverHelperEnabled() {
+			t.Fatalf("%q should disable the resolve-time C# helper", v)
+		}
 	}
 }
