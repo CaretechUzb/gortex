@@ -1259,7 +1259,7 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 	// and must not be reported as either.
 	local := canonicalVersion()
 	if warn := daemonSkewWarning(st.Version, local); warn != "" {
-		t.AppendRow(table.Row{"cli", local + " (differs from daemon — see warning)"})
+		t.AppendRow(table.Row{"cli", local + " (differs from daemon)"})
 	}
 	if st.BinaryChecked && st.BinaryStale {
 		t.AppendRow(table.Row{"binary", "stale — on-disk image newer than running image; run 'gortex daemon restart'"})

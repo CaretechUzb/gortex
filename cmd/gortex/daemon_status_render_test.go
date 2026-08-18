@@ -289,7 +289,7 @@ func TestRenderDaemonHeader_SkewRow(t *testing.T) {
 		renderDaemonHeader(&buf, st)
 		out := buf.String()
 		assert.Contains(t, out, "cli")
-		assert.Contains(t, out, "v0.63.3+deadbee (differs from daemon")
+		assert.Contains(t, out, "v0.63.3+deadbee (differs from daemon)")
 	})
 
 	t.Run("matching versions omit the row", func(t *testing.T) {
