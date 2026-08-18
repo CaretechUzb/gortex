@@ -109,6 +109,77 @@ func TestCSharpOverloadArity_ReceiverlessSameFilePick(t *testing.T) {
 	require.Equal(t, 2, pc, "receiverless arg_count=2 must bind the 2-param overload, got %s", to.ID)
 }
 
+func TestCSharpOverloadArity_NamedArgumentsCount(t *testing.T) {
+	// Named arguments are `argument` nodes like positional ones — three
+	// named args must pick the 3-param overload declared second. Also a
+	// named arg that skips an optional (window [1,3]) must keep binding.
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Svc/Gauge.cs": `namespace App.Svc {
+    public class Gauge {
+        public void Tune(string tag) { }
+        public void Tune(string tag, int level, bool loud) { }
+        public void Adjust(string tag, int scale = 1, bool loud = false) { }
+        public void Run() {
+            Gauge g = new Gauge();
+            g.Tune(tag: "a", level: 2, loud: true);
+            g.Adjust("a", loud: true);
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	tune := csharpBoundCallTo(t, g, "Svc/Gauge.cs::Gauge.Run", "Tune")
+	pc, _ := tune.Meta["param_count"].(int)
+	require.Equal(t, 3, pc, "three named args must bind the 3-param overload, got %s", tune.ID)
+
+	adjust := csharpBoundCallTo(t, g, "Svc/Gauge.cs::Gauge.Run", "Adjust")
+	require.Equal(t, "Adjust", adjust.Name, "optional-skipping named call must stay bound")
+}
+
+func TestCSharpOverloadArity_GenericOverloadByTypeArgs(t *testing.T) {
+	// Explicit type arguments split a generic/non-generic ordinary pair:
+	// Pack<int>(5) must bind the generic overload declared second.
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Svc/Boxer.cs": `namespace App.Svc {
+    public class Boxer {
+        public void Pack(string s) { }
+        public void Pack<T>(T item) { }
+        public void Run() {
+            Boxer b = new Boxer();
+            b.Pack<int>(5);
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	to := csharpBoundCallTo(t, g, "Svc/Boxer.cs::Boxer.Run", "Pack")
+	tp, _ := to.Meta["method_type_params"].(string)
+	require.NotEmpty(t, tp, "explicit <int> must bind the generic overload, got %s", to.ID)
+}
+
+func TestCSharpOverloadArity_OutVarArgumentCounts(t *testing.T) {
+	// `out var n` is one argument — the 2-arg receiverless call must
+	// bind the out-parameter overload declared second.
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Svc/Splitter.cs": `namespace App.Svc {
+    public class Splitter {
+        public bool TryCut(string s) { return false; }
+        public bool TryCut(string s, out int n) { n = 0; return true; }
+        public void Run() {
+            TryCut("a", out var n);
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	to := csharpBoundCallTo(t, g, "Svc/Splitter.cs::Splitter.Run", "TryCut")
+	pc, _ := to.Meta["param_count"].(int)
+	require.Equal(t, 2, pc, "out var counts as an argument, got %s", to.ID)
+}
+
 func TestCSharpMethodAcceptsArgCount_ZeroParamIsRealArity(t *testing.T) {
 	// For an ordinary method, param_count == 0 is a genuine arity —
 	// unlike an extension method, which always declares its `this`

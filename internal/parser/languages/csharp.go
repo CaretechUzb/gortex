@@ -1268,10 +1268,22 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	// Extension method: a static method whose first parameter carries the
 	// `this` modifier. Record the receiver type it extends so member-call
 	// resolution can bind `x.Foo()` to it (the id stays <StaticClass>.<name>).
+	// The method's own type parameters are applicability evidence for
+	// EVERY method, not just extensions: an explicit `Foo<int>(x)` call
+	// splits a generic/non-generic ordinary overload pair only when the
+	// generic one is stamped (#559).
+	tparams := csharpMethodTypeParamNames(def.Node, src)
+	if len(tparams) > 0 {
+		names := make([]string, 0, len(tparams))
+		for n := range tparams {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		meta["method_type_params"] = strings.Join(names, ",")
+	}
 	if extType := csharpExtensionReceiverType(def.Node, src); extType != "" {
 		meta["extension"] = true
 		meta["this_param_type"] = extType
-		tparams := csharpMethodTypeParamNames(def.Node, src)
 		// `Foo<T>(this T v)` — the this-param names the method's own
 		// type parameter, i.e. it matches any receiver; the binder must
 		// not treat it as a concrete type named "T". A `where T : X`
@@ -1289,14 +1301,6 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 			if shape := csharpCanonTypeShape(raw); shape != "" && shape != extType {
 				meta["this_param_shape"] = shape
 			}
-		}
-		if len(tparams) > 0 {
-			names := make([]string, 0, len(tparams))
-			for n := range tparams {
-				names = append(names, n)
-			}
-			sort.Strings(names)
-			meta["method_type_params"] = strings.Join(names, ",")
 		}
 	}
 	// Parameter arity — the evidence that splits a same-name overload set
