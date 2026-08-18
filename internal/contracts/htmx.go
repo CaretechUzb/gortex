@@ -57,6 +57,12 @@ var htmxTemplateSegment = regexp.MustCompile(`^\{\{[^{}]*\}\}$`)
 // action rather than a value interpolation.
 var htmxControlAction = regexp.MustCompile(`^\{\{-?\s*(if|else|end|range|with|define|template|block|break|continue|nil)\b`)
 
+// htmxExternalSchemeRe matches an absolute URL whose scheme sits at the
+// START of the value — the only position where "://" marks a knowably
+// external origin. A scheme deeper in the value is inside a query
+// parameter (/login?next=https://app.example/) and the route is local.
+var htmxExternalSchemeRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*://`)
+
 // normalizeHtmxPath applies template-aware segment collapsing BEFORE the
 // shared normalizer, so template semantics stay local to this extractor
 // and provider-side (and every other consumer's) identity is untouched.
@@ -76,6 +82,10 @@ func normalizeHtmxPath(raw string) (path string, ok bool) {
 		// skipped from collapsing, not from the loop — so the residue check
 		// below still sees the {{ and rejects the whole value.
 		if seg == "" || !htmxTemplateSegment.MatchString(seg) || htmxControlAction.MatchString(seg) {
+			continue
+		}
+		// Declaration actions ({{$id := .ID}}, {{x = y}}) assign rather than interpolate — left literal so the residue check rejects the value.
+		if strings.Contains(seg, ":=") || strings.Contains(seg, " = ") {
 			continue
 		}
 		segs[i] = "{tplparam}"
@@ -137,12 +147,15 @@ func (e *HtmxExtractor) Extract(filePath string, src []byte, fileNodes []*graph.
 		if m[8] != -1 {
 			raw = strings.TrimSpace(scan[m[8]:m[9]])
 		}
-		if skipHtmxValue(raw) {
-			continue
-		}
 		// Query strings and fragments never appear in route registrations.
+		// Strip them BEFORE the external-URL check: skipHtmxValue rejects
+		// scheme-bearing values, and a legitimate local route with a URL
+		// in its query (/login?next=https://app.example/) must survive it.
 		if i := strings.IndexAny(raw, "?#"); i >= 0 {
 			raw = raw[:i]
+		}
+		if skipHtmxValue(raw) {
+			continue
 		}
 		// A query-only value ("?sort=mpn") strips to the empty string,
 		// which NormalizeHTTPPathWithParams would widen to "/" — a junk
@@ -186,10 +199,13 @@ func (e *HtmxExtractor) Extract(filePath string, src []byte, fileNodes []*graph.
 // expression — a dynamically assembled URL has no path we can match.
 func skipHtmxValue(v string) bool {
 	v = strings.TrimSpace(v)
-	// A literal scheme or protocol-relative origin is knowably external —
+	// A LEADING scheme or protocol-relative origin is knowably external —
 	// pairing it with a local provider after host-stripping would be a false
-	// match. (Variable bases like {{.Base}}/x are handled by the template rules.)
-	if strings.Contains(v, "://") || strings.HasPrefix(v, "//") {
+	// match. Only a scheme at the start counts (htmxExternalSchemeRe): a
+	// "://" deeper in the value sits inside a query string
+	// (/login?next=https://app.example/), whose route is still local.
+	// (Variable bases like {{.Base}}/x are handled by the template rules.)
+	if htmxExternalSchemeRe.MatchString(v) || strings.HasPrefix(v, "//") {
 		return true
 	}
 	if v == "" || strings.HasPrefix(v, "#") || strings.HasPrefix(strings.ToLower(v), "javascript:") {

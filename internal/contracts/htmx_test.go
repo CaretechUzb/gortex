@@ -33,6 +33,8 @@ const htmxFixture = `<!doctype html>
 <a hx-get="//cdn.example.com/x">protocol-relative — knowably external</a>
 <my-widget track-hx-get="/x">hyphen-prefixed lookalike</my-widget>
 <div data-doc="hx-get='/y'">hx inside another attribute's value</div>
+<a hx-get="/login?next=https://app.example/">local route with URL in query</a>
+<a hx-get="/orders/{{$id := .ID}}/items">declaration action</a>
 </body></html>
 `
 
@@ -52,8 +54,8 @@ func TestHtmxExtractor_SupportedLanguages(t *testing.T) {
 func TestHtmxExtractor_Extract(t *testing.T) {
 	fileNodes := []*graph.Node{{ID: "ui/internal/templates/parts.html", Kind: graph.KindFile}}
 	out := (&HtmxExtractor{}).Extract("ui/internal/templates/parts.html", []byte(htmxFixture), fileNodes, nil)
-	if len(out) != 10 {
-		t.Fatalf("got %d contracts, want 10 (9 distinct ids + the line-3/line-10 re-occurrence pair; none from skip, external, lookalike, or commented shapes): %+v", len(out), out)
+	if len(out) != 11 {
+		t.Fatalf("got %d contracts, want 11 (10 distinct ids + the line-3/line-10 re-occurrence pair; none from skip, external, lookalike, commented, query-URL, or declaration shapes): %+v", len(out), out)
 	}
 
 	byID := make(map[string]Contract)
@@ -83,6 +85,9 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 		"http::PUT::/ui/parts/{p1}/archive": false,
 		"http::PATCH::/ui/parts/{p1}":       false,
 		"http::GET::/y":                     false,
+		// N1 pin: a local route with a URL embedded in its query string
+		// must survive the external-URL check (query stripped first).
+		"http::GET::/login": false,
 	}
 	for id := range wantIDs {
 		c, ok := byID[id]
@@ -116,8 +121,11 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 	// variant whose untrimmed form used to bypass the guard, the two
 	// knowably-external URLs (literal scheme + protocol-relative — pairing
 	// either with a local provider after host-stripping would be a false
-	// match), and the hyphen-prefixed attribute lookalike track-hx-get,
-	// which the quote/whitespace attribute boundary must not admit.
+	// match), the hyphen-prefixed attribute lookalike track-hx-get,
+	// which the quote/whitespace attribute boundary must not admit, and
+	// the declaration action ({{$id := .ID}}) — it assigns rather than
+	// interpolates, so the whole value must be rejected, not collapsed
+	// to a param.
 	for _, id := range byID {
 		if id.Meta["raw_path"] == "#section" || id.Meta["raw_path"] == "" ||
 			id.Meta["raw_path"] == "?sort=mpn&dir=asc" ||
@@ -130,6 +138,7 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 			id.Meta["raw_path"] == "//cdn.example.com/x" ||
 			id.Meta["raw_path"] == "/x" ||
 			id.Meta["raw_path"] == "/v1/charge" ||
+			id.Meta["raw_path"] == "/orders/{{$id := .ID}}/items" ||
 			id.Meta["raw_path"] == "{{ if .Edit }}/edit{{ else }}/new{{ end }}" {
 			t.Fatalf("skip-shape extracted: %+v", id)
 		}
@@ -175,6 +184,11 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 	if c := byID["http::GET::/y"]; c.Line != 26 {
 		t.Fatalf("GET /y Line=%d, want 26 (known limitation)", c.Line)
 	}
+	// N1 pin: the query-URL value on line 27 must yield the local route
+	// path, not be discarded as knowably external.
+	if c := byID["http::GET::/login"]; c.Line != 27 {
+		t.Fatalf("GET /login Line=%d, want 27 (query-URL pin)", c.Line)
+	}
 }
 
 // TestNormalizeHtmxPath pins the extractor-local template pre-pass:
@@ -201,6 +215,10 @@ func TestNormalizeHtmxPath(t *testing.T) {
 		// A control action renders nothing and must not become a param:
 		// left literal, the residue check rejects the whole value.
 		{"control action segment rejected", "/api/{{if .V2}}/items", "", false},
+		// A declaration action ({{$id := .ID}}) assigns rather than
+		// interpolates — left literal so the residue check rejects the
+		// value instead of minting a bogus param slot.
+		{"declaration action segment rejected", "/orders/{{$id := .ID}}/items", "", false},
 		{"two template params", "/a/{{.A}}/b/{{.B}}", "/a/{p1}/b/{p2}", true},
 		{"declared then template param", "/w/{wid}/t/{{.TID}}", "/w/{p1}/t/{p2}", true},
 		// A partial-segment expression leaves {{...}} in the normalized
