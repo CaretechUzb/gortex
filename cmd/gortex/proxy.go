@@ -119,6 +119,9 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 	}
 
 	logProxyConnection(os.Stderr, client, false)
+	if warn := daemonSkewWarning(client.Ack.DaemonVersion, canonicalVersion()); warn != "" {
+		fmt.Fprintln(os.Stderr, "[gortex mcp] "+warn)
+	}
 	if surface != nil && surface.Active() {
 		fmt.Fprintf(os.Stderr, "[gortex mcp] tool surface restricted (preset %q)\n", surface.Preset())
 	}
@@ -138,6 +141,20 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 		return true, fmt.Errorf("proxy relay: %w", err)
 	}
 	return true, nil
+}
+
+// daemonSkewWarning returns a one-line stderr warning when the daemon
+// reports a different build than this binary, or "" when they match,
+// the daemon did not report a version, or this is a dev build (no
+// injected identity — comparing against it would noise every dev run).
+// Implements the documented intent in docs/versioning.md: the daemon
+// exposes DaemonVersion so "clients can feature-gate or warn on
+// mismatch"; this warns and continues — never gates.
+func daemonSkewWarning(daemonVer, localVer string) string {
+	if daemonVer == "" || localVer == "" || localVer == "v0.0.0-dev" || daemonVer == localVer {
+		return ""
+	}
+	return fmt.Sprintf("warning: daemon %s != binary %s — run 'gortex daemon restart'", daemonVer, localVer)
 }
 
 func newProxyLogicalSessionID() string {
