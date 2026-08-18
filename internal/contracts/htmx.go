@@ -57,6 +57,10 @@ var htmxTemplateSegment = regexp.MustCompile(`^\{\{.*\}\}$|^\{%.*%\}$|^<%.*%>$`)
 // still containing template syntax after normalization (control flow
 // like /api/{{if}}/v2{{else}}/v1{{end}}/items), or normalizing to root
 // from an empty-ish value.
+//
+// Note: a LEADING whole-segment expression ({{.Base}}/v1/users) is treated
+// as a path parameter here, not a base-URL slot — so it pairs only with a
+// provider declaring a first param (/{base}/v1/users), never with /v1/users.
 func normalizeHtmxPath(raw string) (path string, ok bool) {
 	segs := strings.Split(raw, "/")
 	changed := false
