@@ -2829,12 +2829,15 @@ func (p *Provider) ConfirmSymbolRefs(g graph.Store, repoRoot string, n *graph.No
 		if otherPath == "" {
 			continue
 		}
-		path := scopedPath(n.RepoPrefix, otherPath)
-		if _, seen := seenPath[path]; seen {
-			continue
+		// Store rows may spell separators either way, and the file_path
+		// lookup is an exact match — fetch every spelling a row may carry.
+		for _, path := range storePathSpellings(n.RepoPrefix, otherPath) {
+			if _, seen := seenPath[path]; seen {
+				continue
+			}
+			seenPath[path] = struct{}{}
+			paths = append(paths, path)
 		}
-		seenPath[path] = struct{}{}
-		paths = append(paths, path)
 	}
 	if len(paths) == 0 {
 		return 0, nil
