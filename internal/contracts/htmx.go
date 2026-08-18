@@ -54,6 +54,13 @@ func (e *HtmxExtractor) Extract(filePath string, src []byte, fileNodes []*graph.
 		if i := strings.IndexAny(raw, "?#"); i >= 0 {
 			raw = raw[:i]
 		}
+		// A query-only value ("?sort=mpn") strips to the empty string,
+		// which NormalizeHTTPPathWithParams would widen to "/" — a junk
+		// root-path consumer that can falsely pair with a real homepage
+		// provider. Skip it instead.
+		if raw == "" {
+			continue
+		}
 		norm, _ := NormalizeHTTPPathWithParams(raw)
 		ln := lineNumber(lines, m[0])
 		key := fmt.Sprintf("%s::%s::%d", verb, norm, ln)

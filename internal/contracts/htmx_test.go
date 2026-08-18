@@ -1,6 +1,7 @@
 package contracts
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -16,6 +17,7 @@ const htmxFixture = `<!doctype html>
 <a hx-put="{{ if .Edit }}/edit{{ else }}/new{{ end }}">dyn</a>
 <a hx-get="">empty</a>
 <div hx-get="/ui/parts/{{.P.ID}}/exp">dup same path other element</div>
+<a hx-get="?sort=mpn&dir=asc">sort</a>
 </body></html>
 `
 
@@ -35,6 +37,9 @@ func TestHtmxExtractor_SupportedLanguages(t *testing.T) {
 func TestHtmxExtractor_Extract(t *testing.T) {
 	fileNodes := []*graph.Node{{ID: "ui/internal/templates/parts.html", Kind: graph.KindFile}}
 	out := (&HtmxExtractor{}).Extract("ui/internal/templates/parts.html", []byte(htmxFixture), fileNodes, nil)
+	if len(out) != 5 {
+		t.Fatalf("got %d contracts, want 5 (4 ids + the line-10 re-occurrence; none from skip shapes): %+v", len(out), out)
+	}
 
 	byID := make(map[string]Contract)
 	for _, c := range out {
@@ -63,6 +68,12 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 		if c.Meta["framework"] != "htmx" || c.Meta["raw_path"] == nil {
 			t.Fatalf("%q: Meta=%v", id, c.Meta)
 		}
+		if c.Meta["method"] == nil || c.Meta["method"] == "" {
+			t.Fatalf("%q: Meta[method] empty", id)
+		}
+		if c.Confidence != 0.9 {
+			t.Fatalf("%q: Confidence=%v, want 0.9", id, c.Confidence)
+		}
 	}
 
 	// Query string stripped before normalization.
@@ -70,12 +81,22 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 		t.Fatalf("query not stripped: raw_path=%v", c.Meta["raw_path"])
 	}
 
-	// Skipped shapes produce nothing.
+	// Skipped shapes produce nothing — including a query-only value, whose
+	// stripped raw_path ("") must never reach a contract.
 	for _, id := range byID {
 		if id.Meta["raw_path"] == "#section" || id.Meta["raw_path"] == "" ||
+			id.Meta["raw_path"] == "?sort=mpn&dir=asc" ||
 			id.Meta["raw_path"] == "javascript:void(0)" ||
 			id.Meta["raw_path"] == "{{ if .Edit }}/edit{{ else }}/new{{ end }}" {
 			t.Fatalf("skip-shape extracted: %+v", id)
+		}
+	}
+	// No contract for this fixture may normalize to the root path: a
+	// query-only hx value must not widen to a junk http::<VERB>::/
+	// consumer that could falsely pair with a real homepage provider.
+	for id := range byID {
+		if strings.HasSuffix(id, "::/") {
+			t.Fatalf("root-path contract %q extracted from fixture", id)
 		}
 	}
 
@@ -86,15 +107,12 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 		}
 	}
 
-	// Line numbers point at the attributes. /health is on fixture line 5
-	// (the brief said 6; lineNumber is 1-based, see grpc.go).
+	// Line numbers point at the attributes: the fixture places the
+	// /health attribute on line 5, and lineNumber is 1-based.
 	if c := byID["http::GET::/health"]; c.Line != 5 {
 		t.Fatalf("GET /health Line=%d, want 5", c.Line)
 	}
 }
-
-// keysOf is already declared in http_test.go (same signature, same body);
-// the brief's copy would redeclare it in this package.
 
 func TestHtmxConsumerIDCollidesWithProvider(t *testing.T) {
 	tmpl := `<button hx-get="/ui/parts/{{.P.ID}}/exp">Export</button>`
@@ -124,3 +142,6 @@ func TestHtmxConsumerIDCollidesWithProvider(t *testing.T) {
 		t.Fatalf("workspace bucket has %d contracts, want 2", len(bucket))
 	}
 }
+
+// keysOf is already declared in http_test.go (same signature, same body);
+// reuse it here rather than redeclaring it in this package.
