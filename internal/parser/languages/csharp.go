@@ -389,16 +389,17 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
 			}, expr.Node))
 
-		// A receiverless call carries no applicability stamps: nothing
-		// resolves it through the extension binder, and the scope rules
-		// that do bind it never consult arity.
+		// Receiverless calls carry applicability stamps too: the
+		// same-file and locality tiers pick among ordinary overload
+		// sets, and without arg_count that pick is declaration order
+		// (#559).
 		case m.Captures["call.expr"] != nil:
 			expr := m.Captures["call.expr"]
-			calls = append(calls, csharpDeferredCall{
+			calls = append(calls, withCSharpCallArity(csharpDeferredCall{
 				name:        m.Captures["call.name"].Text,
 				line:        expr.StartLine + 1,
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
-			})
+			}, expr.Node))
 
 		case m.Captures["maccess.expr"] != nil:
 			accesses = append(accesses, csharpDeferredAccess{
@@ -714,6 +715,22 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		edge := &graph.Edge{
 			From: callerID, To: "unresolved::" + c.name,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+		}
+		// Applicability evidence rides receiverless calls too: the
+		// resolver's same-file and locality tiers pick among ordinary
+		// overload sets, and without arg_count that pick is declaration
+		// order (#559).
+		if c.argKnown {
+			if edge.Meta == nil {
+				edge.Meta = map[string]any{}
+			}
+			edge.Meta["arg_count"] = c.argCount
+		}
+		if c.typeArgKnown {
+			if edge.Meta == nil {
+				edge.Meta = map[string]any{}
+			}
+			edge.Meta["type_arg_count"] = c.typeArgCount
 		}
 		stampReturnUsage(edge, c.returnUsage)
 		result.Edges = append(result.Edges, edge)
