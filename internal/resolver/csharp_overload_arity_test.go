@@ -180,6 +180,79 @@ func TestCSharpOverloadArity_OutVarArgumentCounts(t *testing.T) {
 	require.Equal(t, 2, pc, "out var counts as an argument, got %s", to.ID)
 }
 
+func TestCSharpOverloadArity_ArgumentExpressionShapes(t *testing.T) {
+	// A nested invocation, a lambda, and out-of-order named arguments
+	// each count as ordinary arguments. Every call targets the
+	// SECOND-declared overload, so declaration order would fail each pin.
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Svc/Relay.cs": `namespace App.Svc {
+    public class Relay {
+        public string Make(int a, int b) { return ""; }
+
+        public void Send(string s, int n) { }
+        public void Send(object o) { }
+
+        public void Apply(string s, int n) { }
+        public void Apply(object o) { }
+
+        public void Order(string tag) { }
+        public void Order(string tag, int level, bool loud) { }
+
+        public void Run() {
+            Send(Make(1, 2));
+            Apply(x => x);
+            Order(loud: true, tag: "a", level: 2);
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	send := csharpBoundCallTo(t, g, "Svc/Relay.cs::Relay.Run", "Send")
+	pc, _ := send.Meta["param_count"].(int)
+	require.Equal(t, 1, pc, "a nested invocation is one argument, got %s", send.ID)
+
+	apply := csharpBoundCallTo(t, g, "Svc/Relay.cs::Relay.Run", "Apply")
+	pc, _ = apply.Meta["param_count"].(int)
+	require.Equal(t, 1, pc, "a lambda is one argument, got %s", apply.ID)
+
+	order := csharpBoundCallTo(t, g, "Svc/Relay.cs::Relay.Run", "Order")
+	pc, _ = order.Meta["param_count"].(int)
+	require.Equal(t, 3, pc, "out-of-order named args still count 3, got %s", order.ID)
+}
+
+func TestCSharpOverloadArity_EmptyParamsCallAndGenericArity(t *testing.T) {
+	// `Pour()` fits only the params overload (required 0); an explicit
+	// <A, B> spelling fits only the two-type-parameter overload. Both
+	// targets are declared second.
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Svc/Cellar.cs": `namespace App.Svc {
+    public class Cellar {
+        public void Pour(string tag) { }
+        public void Pour(params int[] xs) { }
+
+        public void Wrap<T>(T item) { }
+        public void Wrap<T, U>(T item) { }
+
+        public void Run() {
+            Pour();
+            Cellar c = new Cellar();
+            c.Wrap<int, string>(5);
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	pour := csharpBoundCallTo(t, g, "Svc/Cellar.cs::Cellar.Run", "Pour")
+	variadic, _ := pour.Meta["param_variadic"].(bool)
+	require.True(t, variadic, "an empty call fits only the params overload, got %s", pour.ID)
+
+	wrap := csharpBoundCallTo(t, g, "Svc/Cellar.cs::Cellar.Run", "Wrap")
+	tp, _ := wrap.Meta["method_type_params"].(string)
+	require.Equal(t, "T,U", tp, "explicit <A,B> must bind the two-type-param overload, got %s", wrap.ID)
+}
+
 func TestCSharpMethodAcceptsArgCount_ZeroParamIsRealArity(t *testing.T) {
 	// For an ordinary method, param_count == 0 is a genuine arity —
 	// unlike an extension method, which always declares its `this`
