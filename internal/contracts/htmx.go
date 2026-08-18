@@ -25,14 +25,17 @@ import (
 type HtmxExtractor struct{}
 
 // htmxAttrRe matches the five request-issuing htmx attributes with either
-// quote style. Group 1: verb; group 2: double-quoted value; group 3:
-// single-quoted value. Deliberately an attribute-level scan, not an HTML
-// parse — Go/Jinja/ERB templates are routinely not well-formed HTML until
-// rendered ({{if}} blocks split tags mid-element). The \b prefix
-// intentionally also admits htmx's official data-hx-* prefix form
-// (data-hx-get="..."): "data-hx-get" hyphen-precedes "hx-get", \b holds
-// at the boundary, and the attribute is the same request either way.
-var htmxAttrRe = regexp.MustCompile(`(?i)\bhx-(get|post|put|patch|delete)\s*=\s*(?:"([^"]*)"|'([^']*)')`)
+// quote style. The attribute name must be preceded by a whitespace or
+// quote character, and admits exactly hx-* and the official data-hx-*
+// form — nothing hyphen-prefixed beyond that (track-hx-get and friends
+// never match). Group 1: full attribute name; group 2: verb; group 3:
+// double-quoted value; group 4: single-quoted value. Deliberately an
+// attribute-level scan, not an HTML parse — Go templates are routinely
+// not well-formed HTML until rendered ({{if}} blocks split tags
+// mid-element). Known limitation: an hx-* written inside ANOTHER
+// attribute's value (data-doc="hx-get='/y'") is quote-preceded and still
+// matches; full tag-context scanning is an upstream follow-up.
+var htmxAttrRe = regexp.MustCompile(`(?i)[\s"']((?:data-)?hx-(get|post|put|patch|delete))\s*=\s*(?:"([^"]*)"|'([^']*)')`)
 
 // htmxCommentRe matches HTML comments and Go template comments (the
 // {{- /* ... */ -}} form, trim markers optional). (?s) lets HTML
@@ -43,12 +46,16 @@ var htmxAttrRe = regexp.MustCompile(`(?i)\bhx-(get|post|put|patch|delete)\s*=\s*
 // stays true to the file.
 var htmxCommentRe = regexp.MustCompile(`(?s)<!--.*?-->|\{\{-?\s*/\*.*?\*/\s*-?\}\}`)
 
-// htmxTemplateSegment matches a path segment that is entirely a template
-// expression — {{...}} (Go/Jinja values), {%...%} (Jinja statements),
-// <%...%> (ERB). Interpolated path slots collapse to {tplparam} so the
-// shared positional normalizer assigns {p1}, {p2}, ... identically to a
-// provider's declared :id / {id} params.
-var htmxTemplateSegment = regexp.MustCompile(`^\{\{.*\}\}$|^\{%.*%\}$|^<%.*%>$`)
+// htmxTemplateSegment matches a path segment that is entirely a Go template
+// value expression — {{…}} output forms only. Control actions ({{if…}},
+// {{range…}}, {{end}}, …) render nothing and must not become params; other
+// template families ({%…%}, <%…%>) are statement syntax and are not scanned
+// (only Go-template languages are in SupportedLanguages).
+var htmxTemplateSegment = regexp.MustCompile(`^\{\{[^{}]*\}\}$`)
+
+// htmxControlAction reports whether a {{…}} segment is a Go template control
+// action rather than a value interpolation.
+var htmxControlAction = regexp.MustCompile(`^\{\{-?\s*(if|else|end|range|with|define|template|block|break|continue|nil)\b`)
 
 // normalizeHtmxPath applies template-aware segment collapsing BEFORE the
 // shared normalizer, so template semantics stay local to this extractor
@@ -65,7 +72,10 @@ func normalizeHtmxPath(raw string) (path string, ok bool) {
 	segs := strings.Split(raw, "/")
 	changed := false
 	for i, seg := range segs {
-		if seg == "" || !htmxTemplateSegment.MatchString(seg) {
+		// Control-action segments ({{if…}}, {{end}}, …) are left LITERAL —
+		// skipped from collapsing, not from the loop — so the residue check
+		// below still sees the {{ and rejects the whole value.
+		if seg == "" || !htmxTemplateSegment.MatchString(seg) || htmxControlAction.MatchString(seg) {
 			continue
 		}
 		segs[i] = "{tplparam}"
@@ -113,16 +123,19 @@ func (e *HtmxExtractor) Extract(filePath string, src []byte, fileNodes []*graph.
 	}))
 	seen := make(map[string]struct{})
 	for _, m := range htmxAttrRe.FindAllStringSubmatchIndex(scan, -1) {
-		verb := strings.ToUpper(scan[m[2]:m[3]])
+		// Group 1 is the full attribute name ((?:data-)?hx-verb); the
+		// verb itself moved to group 2 and the value groups to 3/4 when
+		// the leading \b was replaced by the [\s"'] delimiter group.
+		verb := strings.ToUpper(scan[m[4]:m[5]])
 		raw := ""
-		if m[4] != -1 {
+		if m[6] != -1 {
 			// Trim immediately: a leading-space value (" ?sort=x")
 			// otherwise survives the query strip as " " and the
 			// normalizer widens it to the root path — a junk contract.
-			raw = strings.TrimSpace(scan[m[4]:m[5]])
-		}
-		if m[6] != -1 {
 			raw = strings.TrimSpace(scan[m[6]:m[7]])
+		}
+		if m[8] != -1 {
+			raw = strings.TrimSpace(scan[m[8]:m[9]])
 		}
 		if skipHtmxValue(raw) {
 			continue
@@ -142,7 +155,11 @@ func (e *HtmxExtractor) Extract(filePath string, src []byte, fileNodes []*graph.
 		if !ok {
 			continue
 		}
-		ln := lineNumber(lines, m[0])
+		// Anchor the line number on the attribute-name group (m[2]), not
+		// the whole match (m[0]): the leading [\s"'] delimiter is one
+		// byte back, which lands on the PREVIOUS line when an attribute
+		// directly follows a newline.
+		ln := lineNumber(lines, m[2])
 		key := fmt.Sprintf("%s::%s::%d", verb, norm, ln)
 		if _, dup := seen[key]; dup {
 			continue
@@ -163,12 +180,18 @@ func (e *HtmxExtractor) Extract(filePath string, src []byte, fileNodes []*graph.
 }
 
 // skipHtmxValue filters attribute values that are not route references:
-// empty values, same-page anchors, javascript: URIs (case-insensitive —
-// "JavaScript:void(0)" is the same no-op), and values that are (or start
-// with) an unrendered control/interpolation expression — a dynamically
-// assembled URL has no path we can match.
+// knowably-external URLs, empty values, same-page anchors, javascript:
+// URIs (case-insensitive — "JavaScript:void(0)" is the same no-op), and
+// values that are (or start with) an unrendered control/interpolation
+// expression — a dynamically assembled URL has no path we can match.
 func skipHtmxValue(v string) bool {
 	v = strings.TrimSpace(v)
+	// A literal scheme or protocol-relative origin is knowably external —
+	// pairing it with a local provider after host-stripping would be a false
+	// match. (Variable bases like {{.Base}}/x are handled by the template rules.)
+	if strings.Contains(v, "://") || strings.HasPrefix(v, "//") {
+		return true
+	}
 	if v == "" || strings.HasPrefix(v, "#") || strings.HasPrefix(strings.ToLower(v), "javascript:") {
 		return true
 	}

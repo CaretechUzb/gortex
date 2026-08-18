@@ -27,6 +27,12 @@ const htmxFixture = `<!doctype html>
 <a hx-get=" ?sort=mpn&dir=asc">leading-space sort</a>
 <a hx-get="JavaScript:void(0)">JS uri</a>
 <button data-hx-get="/health2">data- prefixed</button>
+<button hx-put="/ui/parts/{{.P.ID}}/archive">archive</button>
+<button hx-patch="/ui/parts/{{.P.ID}}">patch</button>
+<a hx-get="https://api.vendor.com/v1/charge">literal scheme — knowably external</a>
+<a hx-get="//cdn.example.com/x">protocol-relative — knowably external</a>
+<my-widget track-hx-get="/x">hyphen-prefixed lookalike</my-widget>
+<div data-doc="hx-get='/y'">hx inside another attribute's value</div>
 </body></html>
 `
 
@@ -46,8 +52,8 @@ func TestHtmxExtractor_SupportedLanguages(t *testing.T) {
 func TestHtmxExtractor_Extract(t *testing.T) {
 	fileNodes := []*graph.Node{{ID: "ui/internal/templates/parts.html", Kind: graph.KindFile}}
 	out := (&HtmxExtractor{}).Extract("ui/internal/templates/parts.html", []byte(htmxFixture), fileNodes, nil)
-	if len(out) != 7 {
-		t.Fatalf("got %d contracts, want 7 (5 distinct ids + the line-3/line-10 re-occurrence pair + data-hx pin; none from skip or commented shapes): %+v", len(out), out)
+	if len(out) != 10 {
+		t.Fatalf("got %d contracts, want 10 (9 distinct ids + the line-3/line-10 re-occurrence pair; none from skip, external, lookalike, or commented shapes): %+v", len(out), out)
 	}
 
 	byID := make(map[string]Contract)
@@ -59,14 +65,24 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 	// contract ID (dup is a second occurrence of the same route; both
 	// recorded, keyed by ID here). /after-comment-block proves the
 	// multi-line comment strip (line 16, true to the file), /health2
-	// pins the data-hx-* prefix form.
+	// pins the data-hx-* prefix form, the PUT/PATCH pair pins the two
+	// verbs the fixture previously never exercised positively.
+	//
+	// http::GET::/y is the KNOWN LIMITATION pinned deliberately: an
+	// hx-* attribute written inside ANOTHER attribute's value
+	// (data-doc="hx-get='/y'") is quote-preceded and still matches.
+	// The attribute boundary cannot see tag context without a real
+	// HTML parse; full tag-context scanning is an upstream follow-up.
 	wantIDs := map[string]bool{
-		"http::GET::/ui/parts/{p1}/exp":    false,
-		"http::POST::/ui/parts/{p1}/reset": false,
-		"http::DELETE::/ui/parts/{p1}":     false,
-		"http::GET::/health":               false,
-		"http::GET::/after-comment-block":  false,
-		"http::GET::/health2":              false,
+		"http::GET::/ui/parts/{p1}/exp":     false,
+		"http::POST::/ui/parts/{p1}/reset":  false,
+		"http::DELETE::/ui/parts/{p1}":      false,
+		"http::GET::/health":                false,
+		"http::GET::/after-comment-block":   false,
+		"http::GET::/health2":               false,
+		"http::PUT::/ui/parts/{p1}/archive": false,
+		"http::PATCH::/ui/parts/{p1}":       false,
+		"http::GET::/y":                     false,
 	}
 	for id := range wantIDs {
 		c, ok := byID[id]
@@ -96,8 +112,12 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 	}
 
 	// Skipped shapes produce nothing — including a query-only value, whose
-	// stripped raw_path ("") must never reach a contract, and the
-	// leading-space variant whose untrimmed form used to bypass the guard.
+	// stripped raw_path ("") must never reach a contract, the leading-space
+	// variant whose untrimmed form used to bypass the guard, the two
+	// knowably-external URLs (literal scheme + protocol-relative — pairing
+	// either with a local provider after host-stripping would be a false
+	// match), and the hyphen-prefixed attribute lookalike track-hx-get,
+	// which the quote/whitespace attribute boundary must not admit.
 	for _, id := range byID {
 		if id.Meta["raw_path"] == "#section" || id.Meta["raw_path"] == "" ||
 			id.Meta["raw_path"] == "?sort=mpn&dir=asc" ||
@@ -106,6 +126,10 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 			id.Meta["raw_path"] == "/commented/route" ||
 			id.Meta["raw_path"] == "/also/commented" ||
 			id.Meta["raw_path"] == "/api/{{if .V2}}/v2{{else}}/v1{{end}}/items" ||
+			id.Meta["raw_path"] == "https://api.vendor.com/v1/charge" ||
+			id.Meta["raw_path"] == "//cdn.example.com/x" ||
+			id.Meta["raw_path"] == "/x" ||
+			id.Meta["raw_path"] == "/v1/charge" ||
 			id.Meta["raw_path"] == "{{ if .Edit }}/edit{{ else }}/new{{ end }}" {
 			t.Fatalf("skip-shape extracted: %+v", id)
 		}
@@ -132,6 +156,10 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 	// after-comment-block attribute on line 16 — AFTER a comment
 	// spanning lines 13-15, whose equal-length space replacement keeps
 	// every byte offset true to the file — and the data-hx pin on line 20.
+	// The PUT pin (line 21) and the known-limitation /y pin (line 26,
+	// inside another attribute's value) anchor on the attribute-name
+	// group, not the whole match, whose leading delimiter character
+	// could sit on the previous line.
 	if c := byID["http::GET::/health"]; c.Line != 5 {
 		t.Fatalf("GET /health Line=%d, want 5", c.Line)
 	}
@@ -140,6 +168,12 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 	}
 	if c := byID["http::GET::/health2"]; c.Line != 20 {
 		t.Fatalf("GET /health2 Line=%d, want 20 (data-hx-get pin)", c.Line)
+	}
+	if c := byID["http::PUT::/ui/parts/{p1}/archive"]; c.Line != 21 {
+		t.Fatalf("PUT archive Line=%d, want 21", c.Line)
+	}
+	if c := byID["http::GET::/y"]; c.Line != 26 {
+		t.Fatalf("GET /y Line=%d, want 26 (known limitation)", c.Line)
 	}
 }
 
@@ -157,14 +191,26 @@ func TestNormalizeHtmxPath(t *testing.T) {
 	}{
 		{"go template param", "/ui/parts/{{.P.ID}}/exp", "/ui/parts/{p1}/exp", true},
 		{"go template param with spaces", "/orders/{{ order.ID }}", "/orders/{p1}", true},
-		{"jinja expression segment", "/shop/{% sku %}/edit", "/shop/{p1}/edit", true},
-		{"erb segment", "/shop/<%= sku %>/edit", "/shop/{p1}/edit", true},
+		{"bare go template param", "/items/{{.ID}}", "/items/{p1}", true},
+		// {%…%} and <%…%> are statement syntax of template families this
+		// extractor does not scan (SupportedLanguages covers Go-template
+		// languages only) — the segments stay literal and the post-
+		// normalization residue check rejects the value.
+		{"jinja statement segment not scanned", "/shop/{% sku %}/edit", "", false},
+		{"erb statement segment not scanned", "/shop/<%= sku %>/edit", "", false},
+		// A control action renders nothing and must not become a param:
+		// left literal, the residue check rejects the whole value.
+		{"control action segment rejected", "/api/{{if .V2}}/items", "", false},
 		{"two template params", "/a/{{.A}}/b/{{.B}}", "/a/{p1}/b/{p2}", true},
 		{"declared then template param", "/w/{wid}/t/{{.TID}}", "/w/{p1}/t/{p2}", true},
 		// A partial-segment expression leaves {{...}} in the normalized
 		// path, so normalizeHtmxPath rejects it (no trustworthy route ID)
 		// rather than minting a contract with template syntax in its ID.
+		// The same residue rejection covers two value expressions
+		// concatenated inside ONE segment: [^{}]* refuses the nested
+		// braces, the segment stays literal, the value is rejected.
 		{"partial-segment template rejected", "/items-{{.ID}}", "", false},
+		{"concatenated expressions in one segment rejected", "/x/{{.A}}{{.B}}", "", false},
 		{"control flow survives normalization", "/api/{{if .V2}}/v2{{else}}/v1{{end}}/items", "", false},
 	}
 	for _, tc := range cases {
@@ -221,6 +267,25 @@ func TestHtmxConsumerIDCollidesWithProvider(t *testing.T) {
 	bucket := reg.ByWorkspace("go-parts")
 	if len(bucket) != 2 {
 		t.Fatalf("workspace bucket has %d contracts, want 2", len(bucket))
+	}
+
+	// Real matcher pass: the htmx consumer must rescue the provider —
+	// the pair appears in Matched and the provider is NOT an orphan.
+	res := Match(reg)
+	matched := false
+	for _, link := range res.Matched {
+		if link.ContractID == providerID && link.Consumer.ID == consumers[0].ID {
+			matched = true
+		}
+	}
+	if !matched {
+		t.Fatalf("Match() did not pair provider %q with the htmx consumer; matched=%d orphans(prov=%d cons=%d)",
+			providerID, len(res.Matched), len(res.OrphanProviders), len(res.OrphanConsumers))
+	}
+	for _, p := range res.OrphanProviders {
+		if p.ID == providerID {
+			t.Fatalf("provider %q left in OrphanProviders despite the htmx consumer", providerID)
+		}
 	}
 }
 
