@@ -114,6 +114,58 @@ func TestHtmxExtractor_Extract(t *testing.T) {
 	}
 }
 
+// TestNormalizeHtmxPath pins the extractor-local template pre-pass:
+// whole-segment expressions collapse to positional params so consumer
+// IDs collide with provider route IDs, while control-flow templates
+// that survive normalization are rejected (ok=false) rather than
+// minting a junk contract.
+func TestNormalizeHtmxPath(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"go template param", "/ui/parts/{{.P.ID}}/exp", "/ui/parts/{p1}/exp", true},
+		{"go template param with spaces", "/orders/{{ order.ID }}", "/orders/{p1}", true},
+		{"jinja expression segment", "/shop/{% sku %}/edit", "/shop/{p1}/edit", true},
+		{"erb segment", "/shop/<%= sku %>/edit", "/shop/{p1}/edit", true},
+		{"two template params", "/a/{{.A}}/b/{{.B}}", "/a/{p1}/b/{p2}", true},
+		{"declared then template param", "/w/{wid}/t/{{.TID}}", "/w/{p1}/t/{p2}", true},
+		// A partial-segment expression leaves {{...}} in the normalized
+		// path, so normalizeHtmxPath rejects it (no trustworthy route ID)
+		// rather than minting a contract with template syntax in its ID.
+		{"partial-segment template rejected", "/items-{{.ID}}", "", false},
+		{"control flow survives normalization", "/api/{{if .V2}}/v2{{else}}/v1{{end}}/items", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := normalizeHtmxPath(tc.in)
+			if ok != tc.wantOK {
+				t.Fatalf("normalizeHtmxPath(%q) ok = %v, want %v (path %q)", tc.in, ok, tc.wantOK, got)
+			}
+			if got != tc.want {
+				t.Fatalf("normalizeHtmxPath(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	// Position parity: the collapsed consumer path must equal what the
+	// provider side normalizes for a declared {id} param — same {p1}
+	// slot, so the matcher pairs them.
+	provider, _ := NormalizeHTTPPathWithParams("/ui/parts/{id}/exp")
+	consumer, ok := normalizeHtmxPath("/ui/parts/{{.P.ID}}/exp")
+	if !ok || consumer != provider {
+		t.Fatalf("consumer %q (ok=%v) != provider %q — matcher will orphan the route", consumer, ok, provider)
+	}
+
+	// Whole-value expressions are owned by the skip layer, not this
+	// function: skipHtmxValue drops them before normalizeHtmxPath runs.
+	if !skipHtmxValue("{{ if .Edit }}/edit{{ else }}/new{{ end }}") {
+		t.Fatalf("whole-value expression should be skipped before normalizeHtmxPath")
+	}
+}
+
 func TestHtmxConsumerIDCollidesWithProvider(t *testing.T) {
 	tmpl := `<button hx-get="/ui/parts/{{.P.ID}}/exp">Export</button>`
 	consumers := (&HtmxExtractor{}).Extract("ui/internal/templates/parts.html", []byte(tmpl), nil, nil)

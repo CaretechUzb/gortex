@@ -13,8 +13,9 @@ import (
 // side of each request: the template instructs the browser to call that
 // route, so a route consumed only from a template is not an orphan
 // provider. Canonical IDs collide with provider route contracts through
-// NormalizeHTTPPathWithParams, which maps whole-segment template
-// expressions ({{.P.ID}}) onto the same {p1} placeholder space.
+// normalizeHtmxPath, which maps whole-segment template expressions
+// ({{.P.ID}}) onto the same {p1} placeholder space as a provider's
+// declared {id} params before delegating to NormalizeHTTPPathWithParams.
 type HtmxExtractor struct{}
 
 // htmxAttrRe matches the five request-issuing htmx attributes with either
@@ -23,6 +24,40 @@ type HtmxExtractor struct{}
 // parse — Go/Jinja/ERB templates are routinely not well-formed HTML until
 // rendered ({{if}} blocks split tags mid-element).
 var htmxAttrRe = regexp.MustCompile(`(?i)\bhx-(get|post|put|patch|delete)\s*=\s*(?:"([^"]*)"|'([^']*)')`)
+
+// htmxTemplateSegment matches a path segment that is entirely a template
+// expression — {{...}} (Go/Jinja values), {%...%} (Jinja statements),
+// <%...%> (ERB). Interpolated path slots collapse to {tplparam} so the
+// shared positional normalizer assigns {p1}, {p2}, ... identically to a
+// provider's declared :id / {id} params.
+var htmxTemplateSegment = regexp.MustCompile(`^\{\{.*\}\}$|^\{%.*%\}$|^<%.*%>$`)
+
+// normalizeHtmxPath applies template-aware segment collapsing BEFORE the
+// shared normalizer, so template semantics stay local to this extractor
+// and provider-side (and every other consumer's) identity is untouched.
+// Returns ok=false for values that cannot produce a trustworthy route ID:
+// still containing template syntax after normalization (control flow
+// like /api/{{if}}/v2{{else}}/v1{{end}}/items), or normalizing to root
+// from an empty-ish value.
+func normalizeHtmxPath(raw string) (path string, ok bool) {
+	segs := strings.Split(raw, "/")
+	changed := false
+	for i, seg := range segs {
+		if seg == "" || !htmxTemplateSegment.MatchString(seg) {
+			continue
+		}
+		segs[i] = "{tplparam}"
+		changed = true
+	}
+	if changed {
+		raw = strings.Join(segs, "/")
+	}
+	norm, _ := NormalizeHTTPPathWithParams(raw)
+	if strings.Contains(norm, "{{") || strings.Contains(norm, "{%") || strings.Contains(norm, "<%") {
+		return "", false
+	}
+	return norm, true
+}
 
 // SupportedLanguages covers the registered template languages that carry
 // htmx attributes: html (.html/.htm), gotmpl (.tpl/.gotmpl/.tmpl), and
@@ -61,7 +96,10 @@ func (e *HtmxExtractor) Extract(filePath string, src []byte, fileNodes []*graph.
 		if raw == "" {
 			continue
 		}
-		norm, _ := NormalizeHTTPPathWithParams(raw)
+		norm, ok := normalizeHtmxPath(raw)
+		if !ok {
+			continue
+		}
 		ln := lineNumber(lines, m[0])
 		key := fmt.Sprintf("%s::%s::%d", verb, norm, ln)
 		if _, dup := seen[key]; dup {

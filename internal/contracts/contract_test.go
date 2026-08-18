@@ -2,17 +2,28 @@ package contracts
 
 import "testing"
 
+// TestNormalizeHTTPPathWithParams_TemplateSegments pins the shared
+// normalizer's pre-htmx-branch behavior, restored by scoping template
+// handling to the htmx extractor: template expressions (Go {{...}},
+// Jinja {%...%}, ERB <%...%>) are NOT path parameters and NOT base-URL
+// slots at this layer — they stay literal. Only the htmx extractor's
+// normalizeHtmxPath collapses them, so every other caller (route_ast_go,
+// http_filebased, TS fetch sites, ...) sees template syntax as opaque
+// text exactly as it did before the htmx branch existed.
 func TestNormalizeHTTPPathWithParams_TemplateSegments(t *testing.T) {
 	cases := []struct{ name, in, want string }{
-		{"go template param", "/ui/parts/{{.P.ID}}/exp", "/ui/parts/{p1}/exp"},
-		{"go template param with spaces", "/orders/{{ order.ID }}", "/orders/{p1}"},
-		{"bare double-brace id", "/u/{{ID}}/x", "/u/{p1}/x"},
-		{"two template params", "/a/{{.A}}/b/{{.B}}", "/a/{p1}/b/{p2}"},
-		{"declared then template param", "/w/{wid}/t/{{.TID}}", "/w/{p1}/t/{p2}"},
-		{"jinja expression segment", "/shop/{% sku %}/edit", "/shop/{p1}/edit"},
-		{"erb segment", "/shop/<%= sku %>/edit", "/shop/{p1}/edit"},
-		{"leading base slot stripped", "{{.Base}}/v1/users", "/v1/users"},
-		{"leading base slot with slash", "/{{.Base}}/v1/users", "/v1/users"},
+		{"go template param stays literal", "/ui/parts/{{.P.ID}}/exp", "/ui/parts/{{.P.ID}}/exp"},
+		// Pre-branch quirk, verified against b55b9a0d: a BARE identifier
+		// between double braces ({{ID}}) contains an inner {ID} brace
+		// param, so the positional renamer rewrites it to {{p1}} — the
+		// outer braces survive. Dotted forms ({{.P.ID}}) stay fully
+		// literal because "." cannot start the \w+ param name.
+		{"bare double-brace id keeps inner brace param", "/u/{{ID}}/x", "/u/{{p1}}/x"},
+		{"two template params stay literal", "/a/{{.A}}/b/{{.B}}", "/a/{{.A}}/b/{{.B}}"},
+		{"jinja expression segment stays literal", "/shop/{% sku %}/edit", "/shop/{% sku %}/edit"},
+		{"erb segment stays literal", "/shop/<%= sku %>/edit", "/shop/<%= sku %>/edit"},
+		{"leading base slot no longer stripped", "{{.Base}}/v1/users", "/{{.Base}}/v1/users"},
+		{"leading base slot with slash no longer stripped", "/{{.Base}}/v1/users", "/{{.Base}}/v1/users"},
 		{"partial-segment stays literal", "/items-{{.ID}}", "/items-{{.ID}}"},
 		{"query untouched by normalizer", "/s?q={{.Q}}", "/s?q={{.Q}}"},
 	}
