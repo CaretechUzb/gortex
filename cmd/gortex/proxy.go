@@ -148,8 +148,10 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 
 // daemonSkewWarning returns a one-line stderr warning when the daemon
 // reports a different build than this binary, or "" when they match,
-// the daemon did not report a version, or this is a dev build (no
-// injected identity — comparing against it would noise every dev run).
+// the daemon did not report a version, or either side is a dev build
+// (no injected identity — comparing against a dev build would noise
+// every dev run, and a dev-built daemon cannot be "upgraded" by a
+// restart, so the remedy advice would be wrong for it too).
 // The remedy is direction-aware: an older daemon should be restarted
 // (a restart respawns it from this newer binary), while a newer daemon
 // means this binary is the stale side and upgrading it is the fix —
@@ -161,7 +163,7 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 // can feature-gate or warn on mismatch"; this warns and continues —
 // never gates.
 func daemonSkewWarning(daemonVer, localVer string) string {
-	if daemonVer == "" || localVer == "" || localVer == "v0.0.0-dev" || daemonVer == localVer {
+	if daemonVer == "" || localVer == "" || localVer == "v0.0.0-dev" || daemonVer == "v0.0.0-dev" || daemonVer == localVer {
 		return ""
 	}
 	base := fmt.Sprintf("warning: daemon %s != binary %s", daemonVer, localVer)
