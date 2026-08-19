@@ -68,6 +68,10 @@ func TestEnrichGrepDeniesAnyPatternInTrackedScope(t *testing.T) {
 
 func TestEnrichGrepUntrackedRegexFallsBackSoftly(t *testing.T) {
 	stubTrackedScope(t, false)
+	// The probe must never reach a live daemon — a real index with hits
+	// for a segment of the pattern would flip this soft path to a deny.
+	stubProbe(t, nil, nil)
+	redirectTelemetry(t)
 
 	result := enrichGrep(map[string]any{"pattern": "e.x|ex"}, 0, "/untracked")
 	if result.deny || result.context == "" {
