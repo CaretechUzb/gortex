@@ -53,7 +53,12 @@ const (
 // follow-up reader). Measured cost after the addition: 27883 bytes —
 // the ceiling keeps ~300 bytes of slack, so any further description
 // creep still fails loudly.
-const agentPresetByteCeiling = 28200
+//
+// Re-based 28200 → 29050 when every structured schema began publishing
+// `additionalProperties:false` (#597) — ~27 bytes per tool so the
+// contract states what dispatch now enforces. Measured after the stamp:
+// 28743 bytes; ~300 bytes of slack again.
+const agentPresetByteCeiling = 29050
 
 // localizationPresetByteCeiling is the hard budget for the diet
 // localization preset (the `localization` instruction profile's tool
@@ -66,7 +71,11 @@ const agentPresetByteCeiling = 28200
 // session without a multi-symbol read). Measured after the growth:
 // 20432 bytes — still ~27% under the agent floor, with slack so any
 // further description creep fails loudly.
-const localizationPresetByteCeiling = 21000
+//
+// Re-based 21000 → 21250 alongside the #597 `additionalProperties:false`
+// stamp (~27 bytes per tool): measured 20922 bytes, restoring ~300
+// bytes of slack the stamp had eaten.
+const localizationPresetByteCeiling = 21250
 
 // TestToolsListByteCeilings is the permanent measurement gate: it prints the
 // cold tools/list byte cost of every preset and asserts the agent preset
