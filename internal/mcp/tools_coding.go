@@ -125,6 +125,8 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("new_source", mcp.Required(), mcp.Description("Replacement source fragment")),
 			mcp.WithString("base_sha", mcp.Description("Optional git blob SHA-1 the caller observed at read time. When set, the call refuses to write if the on-disk file's current SHA differs (drift guard against silent clobbers).")),
 			mcp.WithBoolean("dry_run", mcp.Description("Validate the edit and return a unified-diff preview without writing (status: would_apply). Use to review the change before committing it.")),
+			mcp.WithBoolean("physical_evidence", mcp.Description(mutationEvidenceParamDescription)),
+			mcp.WithString("digest", mcp.Description(evidenceDigestParamDescription)),
 		),
 		s.handleEditSymbol,
 	)
@@ -138,7 +140,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithBoolean("compress_bodies", mcp.Description("Replace function/method bodies with elided stubs (default: false)")),
 			mcp.WithBoolean("allow_secrets", mcp.Description("Serve secret-shaped values in config / data-leaf files (.env, *.yaml, *.toml, *.properties, ...) verbatim. By default such values are withheld and only their keys are shown. Default: false.")),
 			mcp.WithBoolean("physical_evidence", mcp.Description("Return disk evidence. Includes SHA-256, byte count, resolved path, provenance, and same-buffer status for the full regular file. The digest covers raw disk bytes before transforms or editor overlays. Default: false.")),
-			mcp.WithString("digest", mcp.Description("Select the digest. Only sha256 is supported; defaults to sha256 when physical_evidence=true.")),
+			mcp.WithString("digest", mcp.Description(evidenceDigestParamDescription)),
 			mcp.WithString("keep", mcp.Description("Comma-separated symbol names, IDs, or node kinds whose bodies stay verbatim when compress_bodies is set — every other body in the file is still stubbed. Ignored unless compress_bodies is true.")),
 			mcp.WithString("fidelity_globs", mcp.Description(fidelityGlobsParamDescription)),
 			mcp.WithNumber("max_lines", mcp.Description("When the file exceeds this many lines, collapse runs of leaf statements inside function bodies into `… N lines elided …` markers while keeping declarations and the control-flow skeleton. Falls back to a plain head cut for non-code files. Omit or 0 to disable.")),
@@ -159,6 +161,8 @@ func (s *Server) registerCodingTools() {
 			mcp.WithBoolean("dry_run", mcp.Description("Validate the replacement and report what would change without writing (default: false)")),
 			mcp.WithString("base_sha", mcp.Description("Optional git blob SHA-1 the caller observed at read time. When set, the call refuses to write if the on-disk file's current SHA differs (drift guard against silent clobbers).")),
 			mcp.WithBoolean("allow_parse_errors", mcp.Description("Bypass the pre-write parse gate. By default an edit that would introduce new tree-sitter parse errors (leaving the file more syntactically broken than before) is refused before the atomic write; set true to write anyway.")),
+			mcp.WithBoolean("physical_evidence", mcp.Description(mutationEvidenceParamDescription)),
+			mcp.WithString("digest", mcp.Description(evidenceDigestParamDescription)),
 		),
 		s.handleEditFile,
 	)
@@ -171,6 +175,8 @@ func (s *Server) registerCodingTools() {
 			mcp.WithBoolean("dry_run", mcp.Description("Report would_create / would_overwrite without writing (default: false)")),
 			mcp.WithString("base_sha", mcp.Description("Optional git blob SHA-1 the caller observed at read time. When set, write_file refuses to overwrite a divergent on-disk file (or write to a path the caller expected to exist but no longer does). Drift guard against silent clobbers on existing files; leave empty when creating a new file.")),
 			mcp.WithBoolean("allow_parse_errors", mcp.Description("Bypass the pre-write parse gate. By default a write that would introduce new tree-sitter parse errors (relative to the prior content, or any error in a brand-new file) is refused before the atomic write; set true to write anyway.")),
+			mcp.WithBoolean("physical_evidence", mcp.Description(mutationEvidenceParamDescription)),
+			mcp.WithString("digest", mcp.Description(evidenceDigestParamDescription)),
 		),
 		s.handleWriteFile,
 	)
@@ -2811,6 +2817,13 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	}
 	baseSHA := normalizeExpectedSHA(req.GetString("base_sha", ""))
 	dryRun := req.GetBool("dry_run", false)
+	evidenceRequested, evidenceErr := parsePhysicalEvidenceRequest(req)
+	if evidenceErr != nil {
+		return mcp.NewToolResultError(evidenceErr.Error()), nil
+	}
+	if evidenceRequested && dryRun {
+		return mcp.NewToolResultError(errEvidenceDryRun), nil
+	}
 
 	if oldSource == newSource {
 		return mcp.NewToolResultError("old_source and new_source are identical"), nil
@@ -2846,6 +2859,13 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	}
 	if baseSHA != "" && gitBlobSHA(content) != baseSHA {
 		return mcp.NewToolResultError(errBaseSHADrift), nil
+	}
+	// Before anything is written, so a withheld receipt never leaves a
+	// half-applied edit behind.
+	if evidenceRequested {
+		if err := s.guardMutationEvidenceIntent(s.detectLanguageForPath(ctx, absPath, node.FilePath), node.FilePath, content); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 	}
 
 	fileStr := string(content)
@@ -2998,6 +3018,9 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, node.FilePath, absPath, reindexOutcome)
+	if evidenceRequested {
+		s.attachMutationPhysicalEvidence(resp, absPath, content, true)
+	}
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
