@@ -152,6 +152,161 @@ func TestLocalizationDemotionPermutesOnlyInsideEachFilesOwnSlots(t *testing.T) {
 	require.Equal(t, memberDemotionNames(out), memberDemotionNames(demoteLocalizationFileMembers(out)), "the reorder is idempotent")
 }
 
+func memberDemotionTarget(file, name string, kind graph.NodeKind) exploreTarget {
+	return exploreTarget{node: memberDemotionCandidate(file, name, kind).Node}
+}
+
+func memberDemotionTargetNames(targets []exploreTarget) []string {
+	names := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if target.node == nil {
+			names = append(names, "")
+			continue
+		}
+		names = append(names, target.node.Name)
+	}
+	return names
+}
+
+func memberDemotionTargetFiles(targets []exploreTarget) []string {
+	files := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if target.node == nil {
+			files = append(files, "")
+			continue
+		}
+		files = append(files, target.node.FilePath)
+	}
+	return files
+}
+
+func TestLocalizationEvidenceDemotionSeatsSiblingCallableBehindFoldedOwner(t *testing.T) {
+	owner := memberDemotionTarget("config.swift", "DirectoryConfiguration", graph.KindType)
+	owner.foldedOwner = true
+	constructor := memberDemotionTarget("config.swift", "DirectoryConfiguration.<init>", graph.KindMethod)
+	constructor.conceptImplementation = true
+	in := []exploreTarget{owner, constructor, memberDemotionTarget("config.swift", "detect", graph.KindMethod)}
+
+	out := demoteLocalizationEvidenceMembers("directory configuration detection is broken", "", in)
+
+	require.Equal(t, []string{
+		"DirectoryConfiguration", "detect", "DirectoryConfiguration.<init>",
+	}, memberDemotionTargetNames(out))
+}
+
+func TestLocalizationEvidenceDemotionSeatsSiblingCallableAheadOfLeadingField(t *testing.T) {
+	field := memberDemotionTarget("lighting.dart", "shaderSlots", graph.KindField)
+	field.conceptImplementation = true
+	in := []exploreTarget{
+		field,
+		memberDemotionTarget("lighting.dart", "LightingInfo", graph.KindType),
+		memberDemotionTarget("lighting.dart", "bindShaders", graph.KindMethod),
+	}
+
+	out := demoteLocalizationEvidenceMembers("lighting info shader slots are wrong", "", in)
+
+	require.Equal(t, []string{"LightingInfo", "bindShaders", "shaderSlots"}, memberDemotionTargetNames(out))
+}
+
+func TestLocalizationEvidenceDemotionNeedsASameFileSiblingOnThePage(t *testing.T) {
+	in := []exploreTarget{
+		memberDemotionTarget("config.swift", "DirectoryConfiguration.<init>", graph.KindMethod),
+		memberDemotionTarget("cache.swift", "warm", graph.KindMethod),
+		memberDemotionTarget("cache.swift", "ShaderCache", graph.KindType),
+	}
+
+	require.Equal(t, memberDemotionTargetNames(in), memberDemotionTargetNames(
+		demoteLocalizationEvidenceMembers("directory configuration detection is broken", "", in),
+	), "a member with no sibling of its own file on the page keeps its seat")
+}
+
+func TestLocalizationEvidenceDemotionKeepsReservedSeats(t *testing.T) {
+	proven := memberDemotionTarget("config.swift", "DirectoryConfiguration.<init>", graph.KindMethod)
+	proven.divergentDefaultOwner = true
+	projected := memberDemotionTarget("cache.swift", "slots", graph.KindField)
+	projected.typedAnchorProjection = true
+	tests := []struct {
+		name       string
+		task       string
+		requiredID string
+		in         []exploreTarget
+	}{
+		{
+			name: "graph proven constructor",
+			task: "directory configuration detection is broken",
+			in: []exploreTarget{
+				proven,
+				memberDemotionTarget("config.swift", "detect", graph.KindMethod),
+			},
+		},
+		{
+			name: "typed anchor field",
+			task: "shader cache slots are wrong",
+			in: []exploreTarget{
+				projected,
+				memberDemotionTarget("cache.swift", "warm", graph.KindMethod),
+			},
+		},
+		{
+			name: "identifier the task cites",
+			task: "shaderSlots is never reset",
+			in: []exploreTarget{
+				memberDemotionTarget("config.swift", "shaderSlots", graph.KindField),
+				memberDemotionTarget("config.swift", "detect", graph.KindMethod),
+			},
+		},
+		{
+			name:       "prescribed refinement symbol",
+			task:       "directory configuration detection is broken",
+			requiredID: "fixture/config.swift::DirectoryConfiguration.<init>",
+			in: []exploreTarget{
+				memberDemotionTarget("config.swift", "DirectoryConfiguration.<init>", graph.KindMethod),
+				memberDemotionTarget("config.swift", "detect", graph.KindMethod),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, memberDemotionTargetNames(test.in), memberDemotionTargetNames(
+				demoteLocalizationEvidenceMembers(test.task, test.requiredID, test.in),
+			))
+		})
+	}
+}
+
+func TestLocalizationEvidenceDemotionKeepsCrossFileOrderAndSelection(t *testing.T) {
+	in := []exploreTarget{
+		memberDemotionTarget("config.swift", "DirectoryConfiguration.<init>", graph.KindMethod),
+		memberDemotionTarget("cache.dart", "slots", graph.KindField),
+		memberDemotionTarget("config.swift", "detect", graph.KindMethod),
+		memberDemotionTarget("cache.dart", "warm", graph.KindMethod),
+		{},
+		memberDemotionTarget("config.swift", "root", graph.KindField),
+	}
+	files := memberDemotionTargetFiles(in)
+	ids := make(map[string]int, len(in))
+	for _, target := range in {
+		if target.node != nil {
+			ids[target.node.ID]++
+		}
+	}
+
+	out := demoteLocalizationEvidenceMembers("directory configuration detection is broken", "", in)
+
+	require.Equal(t, len(in), len(out), "the projection keeps the same number of rows")
+	require.Equal(t, files, memberDemotionTargetFiles(out), "no row moves into another file's slot")
+	outIDs := make(map[string]int, len(out))
+	for _, target := range out {
+		if target.node != nil {
+			outIDs[target.node.ID]++
+		}
+	}
+	require.Equal(t, ids, outIDs, "the draft's selection is unchanged")
+	require.Equal(t, []string{
+		"detect", "warm", "DirectoryConfiguration.<init>", "slots", "", "root",
+	}, memberDemotionTargetNames(out))
+}
+
 func newIndexedSwiftMemberDemotionServer(t *testing.T) *Server {
 	t.Helper()
 
@@ -279,4 +434,41 @@ func TestIndexedSwiftMemberDemotionAppliesOnlyToTheLocalizePage(t *testing.T) {
 	require.GreaterOrEqual(t, plainField, 0, "explore lists the ranked field: %s", plain.Text)
 	require.GreaterOrEqual(t, plainMethod, 0, "explore lists the ranked method: %s", plain.Text)
 	require.Less(t, plainField, plainMethod, "the non-localize page is untouched by localization demotion: %s", plain.Text)
+}
+
+func TestIndexedSwiftMemberDemotionOrdersTheLocalizationPageLeadingFile(t *testing.T) {
+	const (
+		task = "directory configuration detection is broken"
+		file = "swift-fixture/Sources/DirectoryConfiguration.swift"
+	)
+	server := newIndexedSwiftMemberDemotionServer(t)
+	request := mcpgo.CallToolRequest{}
+	request.Params.Arguments = map[string]any{
+		"task":          task,
+		"localize":      true,
+		"max_symbols":   8,
+		"token_budget":  2400,
+		"repository_id": "swift-fixture",
+	}
+	result, err := server.handleExplore(context.Background(), request)
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+	text, ok := result.Content[0].(mcpgo.TextContent)
+	require.True(t, ok)
+	var envelope localizationExploreEnvelope
+	require.NoError(t, json.Unmarshal([]byte(text.Text), &envelope))
+
+	leading := make([]string, 0, len(envelope.Evidence))
+	for _, evidence := range envelope.Evidence {
+		if evidence.File == file {
+			leading = append(leading, evidence.Name)
+		}
+	}
+	// Owner folding seats the type ahead of its members; the members that follow
+	// are ordered by tier, and every one of them stays on the page.
+	require.Equal(t, []string{
+		"DirectoryConfiguration", "detect", "reload",
+		"DirectoryConfiguration.<init>", "deinit",
+		"root", "shaderSlots",
+	}, leading, "unexpected leading-file order: %#v", envelope.Evidence)
 }

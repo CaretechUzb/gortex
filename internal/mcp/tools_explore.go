@@ -4341,6 +4341,10 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 		requiredSymbol = completion.refinementSymbol
 	}
 	targets = localizationEvidenceTargetsFromDraft(task, requiredSymbol, targets, draft)
+	// The draft's selection is final here; only its presentation order is not.
+	// Applying the tiers before the relation, refinement, and complement lanes
+	// leaves each of them authoritative over the seats they claim.
+	targets = demoteLocalizationEvidenceMembers(task, requiredSymbol, targets)
 	if refinementFirst {
 		targets = prioritizeLocalizationEvidenceTarget(requiredSymbol, targets)
 		// A divergent-default refinement is one causal unit: keep the prescribed
@@ -5053,6 +5057,92 @@ func demoteLocalizationFileMembers(cands []*rerank.Candidate) []*rerank.Candidat
 		for _, tier := range tiers {
 			for _, cand := range tier {
 				out[positions[written]] = cand
+				written++
+			}
+		}
+	}
+	return out
+}
+
+// localizationEvidenceSeatReserved reports whether an evidence row owes its seat
+// to a proof lane or to the task naming that exact identifier, rather than to
+// ranking. Such a row keeps its exact position: the reservation is a contract,
+// and presentation tiering is never allowed to overrule proven or explicitly
+// named evidence. Citation is deliberately identifier-level — a task that names
+// the file, or the type whose name every member inherits, has not asked for the
+// constructor over the method.
+func localizationEvidenceSeatReserved(task, requiredID string, target exploreTarget) bool {
+	if target.node == nil {
+		return true
+	}
+	if requiredID != "" && target.node.ID == requiredID {
+		return true
+	}
+	// Proof lanes: the task's own literal text, an exact cited range, or a graph
+	// proof. Each identifies a row by something a member cannot inherit.
+	if target.sourceRange || target.divergentDefaultOwner || target.divergentDefaultType ||
+		target.typedAnchorProjection || target.sourceLiteral || target.sourceLiteralCallee ||
+		target.sourceLiteralAligned || target.literalPrimaryEligible || target.exactContent ||
+		target.causalChangeOwner || target.causalChangeBridge || target.causalChangeLeaf ||
+		target.localizationRelation != "" {
+		return true
+	}
+	if localizationDirectAdjacencyNodeTaskCitationOffset(task, target.node) >= 0 {
+		return true
+	}
+	// The name-term lanes are the ones a member rides in on: a constructor or a
+	// field matches the task's wording only because its identifier carries the
+	// owner type's terms. They hold a seat for declarations named by intent.
+	return localizationMemberTier(target.node) == localizationMemberTierBehavioral &&
+		(target.conceptImplementation || target.conceptComplement || target.syntacticAnchor)
+}
+
+// demoteLocalizationEvidenceMembers applies the same member tiers to the
+// projection the draft already selected. Owner folding and draft ranking can
+// re-seat a member the ranked window demoted, because both read the owner type's
+// name terms off the member's own name. The reorder changes no selection: it
+// permutes only rows the draft chose, only inside the slots one file already
+// holds, and only among rows no lane reserved — so a constructor-spelled or data
+// member yields its seat exactly when an ordinary sibling callable from the same
+// file is already on the page, and otherwise keeps it.
+func demoteLocalizationEvidenceMembers(task, requiredID string, targets []exploreTarget) []exploreTarget {
+	if len(targets) < 2 {
+		return targets
+	}
+	slots := make(map[string][]int, len(targets))
+	files := make([]string, 0, len(targets))
+	demotable := false
+	for index, target := range targets {
+		if localizationEvidenceSeatReserved(task, requiredID, target) || target.node.FilePath == "" {
+			continue
+		}
+		key := target.node.RepoPrefix + "\x00" + target.node.FilePath
+		if _, ok := slots[key]; !ok {
+			files = append(files, key)
+		}
+		slots[key] = append(slots[key], index)
+		if localizationMemberTier(target.node) != localizationMemberTierBehavioral {
+			demotable = true
+		}
+	}
+	if !demotable {
+		return targets
+	}
+	out := append([]exploreTarget(nil), targets...)
+	for _, key := range files {
+		positions := slots[key]
+		if len(positions) < 2 {
+			continue
+		}
+		var tiers [localizationMemberTierCount][]exploreTarget
+		for _, position := range positions {
+			tier := localizationMemberTier(targets[position].node)
+			tiers[tier] = append(tiers[tier], targets[position])
+		}
+		written := 0
+		for _, tier := range tiers {
+			for _, target := range tier {
+				out[positions[written]] = target
 				written++
 			}
 		}
