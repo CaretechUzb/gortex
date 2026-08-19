@@ -308,9 +308,10 @@ jobs:
 
       # goreleaser's checksums.txt only hashed its own (linux + nfpm)
       # artifacts. Append the darwin tarballs so install.sh — which verifies
-      # every download against checksums.txt — and the cask both resolve. Done
-      # before cosign so the signature covers the final checksums.txt. (The
-      # release-windows job appends the windows zip the same way.)
+      # every download against checksums.txt — and the cask both resolve.
+      # Done before cosign, but the signature produced there is NOT the final
+      # one: release-windows appends the windows zip afterwards and re-signs.
+      # Whichever job writes checksums.txt last owns its signature.
       - name: Append darwin checksums
         run: |
           set -euo pipefail
@@ -576,13 +577,39 @@ jobs:
           # the one-line installer (scripts/install.ps1, which verifies
           # against checksums.txt) covers windows too — the unix goreleaser
           # run only hashed its own artifacts. needs:release guarantees
-          # checksums.txt already exists.
+          # checksums.txt already exists, so a failed download is a real
+          # error and must stop the job: falling back to an empty file would
+          # make the --clobber below replace the release's checksums.txt with
+          # a windows-only one, breaking sha256 verification on every other
+          # platform.
           sha="$(sha256sum gortex_windows_amd64.zip | awk '{print $1}')"
-          gh release download "$TAG" --pattern checksums.txt --clobber 2>/dev/null || : > checksums.txt
-          if ! grep -q "gortex_windows_amd64.zip" checksums.txt; then
-            printf '%s  gortex_windows_amd64.zip\n' "$sha" >> checksums.txt
-            gh release upload "$TAG" checksums.txt --clobber
-          fi
+          gh release download "$TAG" --pattern checksums.txt --clobber \
+            || { echo "FATAL: could not download checksums.txt from $TAG"; exit 1; }
+          [ -s checksums.txt ] || { echo "FATAL: downloaded checksums.txt is empty"; exit 1; }
+          grep -q " gortex_windows_amd64.zip$" checksums.txt \
+            || printf '%s  gortex_windows_amd64.zip\n' "$sha" >> checksums.txt
+          sort -o checksums.txt checksums.txt
+
+          # This job is the LAST writer of checksums.txt, so it must also be
+          # the one that signs it. The `release` job signed the file it knew
+          # about (linux + darwin); appending the windows line above
+          # invalidates that signature, so re-sign the final content and
+          # clobber all three assets together. Skipping this shipped a
+          # checksums.txt.sig that verified against nothing on every release
+          # from v0.35.3 to v0.63.5 (issue #625). Keyless signing here yields
+          # the same certificate identity as the `release` job — same
+          # workflow ref, same tag — so the documented verification command
+          # is unchanged.
+          cosign sign-blob \
+            --output-signature checksums.txt.sig \
+            --output-certificate checksums.txt.pem \
+            checksums.txt
+          gh release upload "$TAG" \
+            checksums.txt \
+            checksums.txt.sig \
+            checksums.txt.pem \
+            --clobber
+          cat checksums.txt
 
       - name: Publish Scoop manifest
         # Push a refreshed `gortex` manifest to gortexhq/scoop-bucket so
