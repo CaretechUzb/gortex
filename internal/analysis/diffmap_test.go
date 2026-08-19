@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -372,5 +374,358 @@ func TestMapGitDiffUnchanged(t *testing.T) {
 	}
 	if !sawFoo {
 		t.Fatalf("expected Foo among changed symbols: %#v", res.ChangedSymbols)
+	}
+}
+
+// --- file-level change detection (issue #546) ---------------------------------
+
+// newDeleteRepo commits gone.go (two symbols) plus a non-symbol README so the
+// delete/rename cases have both an indexed and an unindexed file to move.
+func newDeleteRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	run("config", "diff.mnemonicPrefix", "false")
+	run("config", "diff.noprefix", "false")
+
+	src := "package foo\n\nfunc Gone() int {\n\treturn 2\n}\n\nfunc AlsoGone() int {\n\treturn 3\n}\n"
+	if err := os.WriteFile(filepath.Join(dir, "gone.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# doc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-m", "base")
+	return dir
+}
+
+// deleteRepoGraph indexes the two symbols gone.go holds before the change.
+func deleteRepoGraph() *graph.Graph {
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "gone.go::Gone", Kind: graph.KindFunction, Name: "Gone",
+		FilePath: "gone.go", StartLine: 3, EndLine: 5, Language: "go",
+	})
+	g.AddNode(&graph.Node{
+		ID: "gone.go::AlsoGone", Kind: graph.KindFunction, Name: "AlsoGone",
+		FilePath: "gone.go", StartLine: 7, EndLine: 9, Language: "go",
+	})
+	return g
+}
+
+func gitIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func hasFile(files []string, want string) bool {
+	for _, f := range files {
+		if f == want {
+			return true
+		}
+	}
+	return false
+}
+
+func symbolIDs(syms []ChangedSymbol) []string {
+	out := make([]string, 0, len(syms))
+	for _, s := range syms {
+		out = append(out, s.ID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func findFileChange(changes []FileChange, path string) (FileChange, bool) {
+	for _, c := range changes {
+		if c.Path == path {
+			return c, true
+		}
+	}
+	return FileChange{}, false
+}
+
+// TestMapGitDiffDeletedFile pins the headline defect of issue #546: a deleted
+// file's new side is /dev/null, so the pre-fix parser cleared the current path
+// and skipped the @@ header that followed. The delete produced no hunk, no
+// changed file and no changed symbol — a delete-only change was reported as a
+// clean tree in every scope.
+func TestMapGitDiffDeletedFile(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stage  bool
+		scopes []string
+	}{
+		{name: "worktree", scopes: []string{"unstaged", "all"}},
+		{name: "staged", stage: true, scopes: []string{"staged", "all"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := newDeleteRepo(t)
+			if tc.stage {
+				gitIn(t, dir, "rm", "-q", "gone.go")
+			} else if err := os.Remove(filepath.Join(dir, "gone.go")); err != nil {
+				t.Fatal(err)
+			}
+
+			for _, scope := range tc.scopes {
+				res, err := MapGitDiff(deleteRepoGraph(), dir, "", scope, "main")
+				if err != nil {
+					t.Fatalf("MapGitDiff(%s): %v", scope, err)
+				}
+				if !hasFile(res.ChangedFiles, "gone.go") {
+					t.Fatalf("scope %s: deleted file missing from ChangedFiles: %#v", scope, res.ChangedFiles)
+				}
+				fc, ok := findFileChange(res.FileChanges, "gone.go")
+				if !ok || fc.Kind != FileDeleted {
+					t.Fatalf("scope %s: want a deleted FileChange for gone.go, got %#v", scope, res.FileChanges)
+				}
+				// Every symbol the graph still holds for the file is gone with it.
+				if got := symbolIDs(res.ChangedSymbols); len(got) != 2 ||
+					got[0] != "gone.go::AlsoGone" || got[1] != "gone.go::Gone" {
+					t.Fatalf("scope %s: want both deleted symbols, got %#v", scope, got)
+				}
+			}
+		})
+	}
+}
+
+// TestMapGitDiffDeletedFileHunkIsOldSide pins the line numbers a deleted file
+// reports. There is no new side to number, so the range must be the old-side
+// span the file occupied — that is what overlaps the still-indexed symbols —
+// and it must be flagged so a consumer never anchors it as a new-side line.
+func TestMapGitDiffDeletedFileHunkIsOldSide(t *testing.T) {
+	dir := newDeleteRepo(t)
+	if err := os.Remove(filepath.Join(dir, "gone.go")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := MapGitDiff(deleteRepoGraph(), dir, "", "all", "main")
+	if err != nil {
+		t.Fatalf("MapGitDiff: %v", err)
+	}
+	var found bool
+	for _, h := range res.Hunks {
+		if h.FilePath != "gone.go" {
+			continue
+		}
+		found = true
+		if !h.Deleted {
+			t.Fatalf("deleted-file hunk must be flagged Deleted: %#v", h)
+		}
+		if h.StartLine != 1 || h.EndLine != 9 {
+			t.Fatalf("want the old-side span 1..9 the file occupied, got %d..%d", h.StartLine, h.EndLine)
+		}
+	}
+	if !found {
+		t.Fatalf("no hunk for the deleted file: %#v", res.Hunks)
+	}
+}
+
+// TestMapGitDiffDeletedEmptyFile covers the delete that carries no @@ header at
+// all: git emits only the "deleted file mode" header for an empty file. The
+// file-level record is the only thing that can keep it visible.
+func TestMapGitDiffDeletedEmptyFile(t *testing.T) {
+	dir := newDeleteRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "empty.txt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", ".")
+	gitIn(t, dir, "commit", "-m", "empty")
+	gitIn(t, dir, "rm", "-q", "empty.txt")
+
+	res, err := MapGitDiff(deleteRepoGraph(), dir, "", "all", "main")
+	if err != nil {
+		t.Fatalf("MapGitDiff: %v", err)
+	}
+	if !hasFile(res.ChangedFiles, "empty.txt") {
+		t.Fatalf("deleted empty file missing from ChangedFiles: %#v", res.ChangedFiles)
+	}
+	if fc, ok := findFileChange(res.FileChanges, "empty.txt"); !ok || fc.Kind != FileDeleted {
+		t.Fatalf("want a deleted FileChange for empty.txt, got %#v", res.FileChanges)
+	}
+}
+
+// TestMapGitDiffRename pins the second half of issue #546: a 100%-similar
+// rename carries rename from/to headers and no @@ header whatsoever, so a
+// hunk-driven parser reported a pure `git mv` as an empty diff. Both paths must
+// surface, linked, and the symbols indexed under the old path must come with it.
+func TestMapGitDiffRename(t *testing.T) {
+	for _, tc := range []struct{ name, edit string }{
+		{name: "pure"},
+		{name: "with_edits", edit: "package foo\n\nfunc Gone() int {\n\treturn 99\n}\n\nfunc AlsoGone() int {\n\treturn 3\n}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := newDeleteRepo(t)
+			gitIn(t, dir, "mv", "gone.go", "moved.go")
+			if tc.edit != "" {
+				if err := os.WriteFile(filepath.Join(dir, "moved.go"), []byte(tc.edit), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			res, err := MapGitDiff(deleteRepoGraph(), dir, "", "all", "main")
+			if err != nil {
+				t.Fatalf("MapGitDiff: %v", err)
+			}
+			if !hasFile(res.ChangedFiles, "gone.go") || !hasFile(res.ChangedFiles, "moved.go") {
+				t.Fatalf("a rename changes both paths, got ChangedFiles %#v", res.ChangedFiles)
+			}
+			fc, ok := findFileChange(res.FileChanges, "moved.go")
+			if !ok || fc.Kind != FileRenamed || fc.PreviousPath != "gone.go" {
+				t.Fatalf("want moved.go renamed from gone.go, got %#v", res.FileChanges)
+			}
+			// The graph still indexes the symbols under the old path; moving
+			// the file affects every one of them, and no line range says so.
+			if got := symbolIDs(res.ChangedSymbols); len(got) != 2 ||
+				got[0] != "gone.go::AlsoGone" || got[1] != "gone.go::Gone" {
+				t.Fatalf("want both moved symbols, got %#v", got)
+			}
+		})
+	}
+}
+
+// TestMapGitDiffFileChangeKinds pins the remaining kinds, including the
+// non-symbol files issue #546 calls out: a changed manifest or doc has no
+// indexed symbol, so the file-level record is the only evidence it changed.
+func TestMapGitDiffFileChangeKinds(t *testing.T) {
+	dir := newDeleteRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# doc\nmore\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "added.json"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", ".")
+
+	res, err := MapGitDiff(deleteRepoGraph(), dir, "", "all", "main")
+	if err != nil {
+		t.Fatalf("MapGitDiff: %v", err)
+	}
+	for path, want := range map[string]FileChangeKind{
+		"README.md":  FileModified,
+		"added.json": FileAdded,
+	} {
+		fc, ok := findFileChange(res.FileChanges, path)
+		if !ok || fc.Kind != want {
+			t.Fatalf("want %s classified %q, got %#v", path, want, res.FileChanges)
+		}
+		if !hasFile(res.ChangedFiles, path) {
+			t.Fatalf("%s missing from ChangedFiles: %#v", path, res.ChangedFiles)
+		}
+	}
+	if len(res.ChangedSymbols) != 0 {
+		t.Fatalf("neither file holds an indexed symbol, got %#v", res.ChangedSymbols)
+	}
+}
+
+// TestMapGitDiffModeOnlyChange covers the entry that carries no ---/+++ and no
+// rename header: chmod. The "diff --git a/P b/P" line is its only path source.
+func TestMapGitDiffModeOnlyChange(t *testing.T) {
+	dir := newDeleteRepo(t)
+	if err := os.Chmod(filepath.Join(dir, "README.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Skip on a filesystem git cannot see the mode bit through — but decide
+	// that from git itself, so the skip can never stand in for a real miss.
+	cmd := exec.Command("git", "diff", "--name-only", "HEAD")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git diff --name-only: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "README.md") {
+		t.Skipf("git does not report the mode change on this filesystem: %q", out)
+	}
+
+	res, err := MapGitDiff(deleteRepoGraph(), dir, "", "all", "main")
+	if err != nil {
+		t.Fatalf("MapGitDiff: %v", err)
+	}
+	if !hasFile(res.ChangedFiles, "README.md") {
+		t.Fatalf("mode-only change missing from ChangedFiles: %#v", res.ChangedFiles)
+	}
+	if fc, ok := findFileChange(res.FileChanges, "README.md"); !ok || fc.Kind != FileModified {
+		t.Fatalf("want README.md modified, got %#v", res.FileChanges)
+	}
+}
+
+// TestParseDiffGitPaths pins the same-path recovery, including a path with a
+// space, and the deliberate refusal to guess when the two sides differ.
+func TestParseDiffGitPaths(t *testing.T) {
+	for _, tc := range []struct{ line, want string }{
+		{"diff --git a/pkg/foo.go b/pkg/foo.go", "pkg/foo.go"},
+		{"diff --git a/my dir/foo.go b/my dir/foo.go", "my dir/foo.go"},
+		// Differing sides are a rename or a copy; the rename headers below
+		// carry the truth, so guessing a split here would only be wrong.
+		{"diff --git a/old.go b/new.go", ""},
+		{`diff --git "a/od\td.go" "b/od\td.go"`, ""},
+		{"diff --git nonsense", ""},
+	} {
+		if got := parseDiffGitPaths(tc.line); got != tc.want {
+			t.Fatalf("parseDiffGitPaths(%q) = %q, want %q", tc.line, got, tc.want)
+		}
+	}
+}
+
+// TestMapGitDiffSurfacesGitFailure pins the third defect: MapGitDiff used to
+// discard the error whenever stdout happened to be empty, so an unknown base
+// ref or a root that is not a work tree returned a clean, confident "no
+// changes" result. Both must now fail loudly.
+func TestMapGitDiffSurfacesGitFailure(t *testing.T) {
+	t.Run("unknown_base_ref", func(t *testing.T) {
+		dir := newDeleteRepo(t)
+		if _, err := MapGitDiff(deleteRepoGraph(), dir, "", "compare", "no-such-branch"); err == nil {
+			t.Fatal("an unknown base ref must not be reported as an empty diff")
+		}
+	})
+	t.Run("not_a_work_tree", func(t *testing.T) {
+		if _, err := MapGitDiff(deleteRepoGraph(), t.TempDir(), "", "unstaged", "main"); err == nil {
+			t.Fatal("a root that is not a git work tree must not be reported as an empty diff")
+		}
+	})
+	t.Run("with_lines", func(t *testing.T) {
+		if _, _, err := MapGitDiffWithLines(deleteRepoGraph(), t.TempDir(), "", "unstaged", "main"); err == nil {
+			t.Fatal("MapGitDiffWithLines must surface the same failure")
+		}
+	})
+}
+
+// TestMapGitDiffUntrackedStaysUnobserved pins the documented limitation rather
+// than a defect: `git diff` never lists untracked files, so no scope can see
+// them. detect_changes says so in its response note; this keeps the two honest
+// with each other, and keeps the fix above from silently growing an
+// ignored-tree walk (issue #324).
+func TestMapGitDiffUntrackedStaysUnobserved(t *testing.T) {
+	dir := newDeleteRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "new.go"), []byte("package foo\n\nfunc New() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := MapGitDiff(deleteRepoGraph(), dir, "", "all", "main")
+	if err != nil {
+		t.Fatalf("MapGitDiff: %v", err)
+	}
+	if hasFile(res.ChangedFiles, "new.go") {
+		t.Fatalf("git diff cannot observe untracked files; ChangedFiles = %#v", res.ChangedFiles)
 	}
 }
