@@ -53,6 +53,12 @@ type Provider struct {
 	// true for every server that has not opted out. See ServerSpec.NoDidOpen
 	// for why a barrier-scheduling server wants this off.
 	opensDocs bool
+	// noHeavyRequests disables the textDocument/references and
+	// callHierarchy/incomingCalls legs of the enrichment pass. Set from
+	// ServerSpec.NoHeavyRequests for servers whose FindReferences machinery
+	// leaks per request (csharp-ls); ambiguous edges are confirmed through
+	// the definition pass at their call sites instead.
+	noHeavyRequests bool
 	// spec is the ServerSpec this provider was built from (when the
 	// caller used NewProviderFromSpec). nil for legacy NewProvider
 	// invocations — those fall back to single-language routing.
@@ -257,6 +263,7 @@ func NewProviderFromSpec(spec *ServerSpec, logger *zap.Logger) *Provider {
 		daemon:             spec.Daemon,
 		maxParallel:        maxParallel,
 		opensDocs:          resolveOpensDocs("", spec),
+		noHeavyRequests:    spec.NoHeavyRequests,
 		logger:             logger,
 		spec:               spec,
 		docVersions:        map[string]int{},
@@ -511,6 +518,14 @@ func (p *Provider) definitionNodeAtSite(view *lspGraphView, repoPrefix, absRoot,
 		return nil, true
 	}
 	node := findDeclarationNode(view, scopedPath(repoPrefix, defPath), locs[0].Range.Start.Line+1, name)
+	if node == nil {
+		// A definition can land on a member declaration INSIDE the target
+		// type — `new T(...)` answers the constructor's line, not the type's,
+		// and the ctor node carries its own name. A type declaration named
+		// exactly `name` whose span contains the answered line is the same
+		// verdict: the site binds to that type.
+		node = view.findEnclosingTypeNamed(scopedPath(repoPrefix, defPath), locs[0].Range.Start.Line+1, name)
+	}
 	cache[key] = node
 	return node, true
 }
@@ -1055,7 +1070,21 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	var confirmMu sync.Mutex
 	confirmPromotions := make(map[*graph.Edge]struct{})
 	var fallback []enrichTarget
-	{
+	if p.noHeavyRequests {
+		// This server leaks per references request (ServerSpec.NoHeavyRequests)
+		// — the reference sweep never runs. Every sited target goes straight
+		// to the definition pass below, which reaches the same confirm /
+		// rebind verdicts from the call site at position-request cost.
+		// Targets without a recorded site line are left at their heuristic
+		// tier: there is no site to ask definition at.
+		for _, grp := range confirmGroups {
+			for _, t := range grp.targets {
+				if t.edge.Line > 0 {
+					fallback = append(fallback, t)
+				}
+			}
+		}
+	} else {
 		sem := make(chan struct{}, p.maxParallel)
 		var wg sync.WaitGroup
 		for _, grp := range confirmGroups {
@@ -1227,6 +1256,26 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			fallbackMutations.stagePersist(t.edge)
 			rmu.Unlock()
 			result.EdgesConfirmed++
+		case view.declaredDispatchMember(cand) && view.implementsDeclaredMember(toNode, cand):
+			// The compiler answers the DECLARED member — the site's static
+			// receiver is the interface / abstract base, so the stored edge
+			// to one of its concrete impls is a devirtualization inference
+			// definition cannot vouch for. Add the compiler-proven edge to
+			// the declared member and leave the inference exactly as it was
+			// (not retargeted, not promoted): impl reachability flows
+			// through the declared member's dispatch fan-out, and the
+			// heuristic tier keeps the guess honestly labeled. A target
+			// UNRELATED to the declared member is not this case — that is a
+			// plain misbind and falls through to the rebind below.
+			if !edgeExistsAt(view, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line) {
+				declared := newLSPResolvedEdge(t.edge.From, cand.ID, t.edge.Kind,
+					t.edge.FilePath, t.edge.Line, p.Name(), graph.OriginLSPResolved)
+				rmu.Lock()
+				if fallbackMutations.stageAdd(view, declared) {
+					result.EdgesAdded++
+				}
+				rmu.Unlock()
+			}
 		case rebindTargetAcceptable(cand.Kind) && !edgeExistsAt(view, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line):
 			rmu.Lock()
 			// Mutate the full edge state before staging the set-oriented
@@ -1241,7 +1290,8 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 	}
 	releaseSite()
-	if len(fallbackMutations.reindexes) > 0 || len(fallbackMutations.persists) > 0 {
+	if len(fallbackMutations.reindexes) > 0 || len(fallbackMutations.persists) > 0 ||
+		len(fallbackMutations.adds) > 0 {
 		rmu.Lock()
 		fallbackMutations.apply(g, nil)
 		rmu.Unlock()
@@ -1285,7 +1335,8 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// never ADDED. Ask textDocument/references per declaration and mint those
 	// call edges. Runs under the targeted budget (before the hover sweep) so
 	// a deadline cut sheds hover work, not the recall-bearing add.
-	if p.Supports("textDocument/references") && !p.Supports("textDocument/prepareCallHierarchy") {
+	if !p.noHeavyRequests &&
+		p.Supports("textDocument/references") && !p.Supports("textDocument/prepareCallHierarchy") {
 		p.referencesAddPass(targetedCtx, g, view, repoPrefix, absRoot, langNodes, rmu, session, result)
 	}
 
@@ -1585,8 +1636,13 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						// (or under a full sweep). Demand-first file ordering
 						// sweeps the demand-bearing callers before any deadline
 						// cut, so a skipped incoming costs no reachable edge.
-						wantIncoming := sweepMode == sweepModeFull ||
-							nodeDispatch[n.ID] || nodeDemand[n.ID]
+						// incomingCalls rides the same FindReferences
+						// machinery as references — a NoHeavyRequests
+						// server never gets the round trip, whatever the
+						// sweep mode says.
+						wantIncoming := !p.noHeavyRequests &&
+							(sweepMode == sweepModeFull ||
+								nodeDispatch[n.ID] || nodeDemand[n.ID])
 						for _, item := range items {
 							if outs, oerr := p.outgoingCalls(item); oerr == nil {
 								for _, oc := range outs {
