@@ -1219,6 +1219,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			fallbackMutations.stagePersist(t.edge)
 			rmu.Unlock()
 			result.EdgesConfirmed++
+			// Both fallback arms are yield the productivity checkpoint must
+			// see: on a degraded pass this loop can be the ONLY source of
+			// progress, and without these the checkpoint reads a pass that
+			// settles thousands of edges here as zero-yield and cancels it.
+			usefulYield.Add(1)
 		case rebindTargetAcceptable(cand.Kind) && !edgeExistsAt(view, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line):
 			rmu.Lock()
 			// Mutate the full edge state before staging the set-oriented
@@ -1230,6 +1235,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			fallbackMutations.stageReindex(view, t.edge, oldTo)
 			rmu.Unlock()
 			result.EdgesRebound++
+			usefulYield.Add(1)
 		}
 	}
 	releaseSite()
