@@ -751,6 +751,13 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	replaceAll := req.GetBool("replace_all", false)
 	dryRun := req.GetBool("dry_run", false)
 	baseSHA := normalizeExpectedSHA(req.GetString("base_sha", ""))
+	evidenceRequested, evidenceErr := parsePhysicalEvidenceRequest(req)
+	if evidenceErr != nil {
+		return mcp.NewToolResultError(evidenceErr.Error()), nil
+	}
+	if evidenceRequested && dryRun {
+		return mcp.NewToolResultError(errEvidenceDryRun), nil
+	}
 
 	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
 	if resolveErr != nil {
@@ -771,6 +778,13 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	// overlay-push error shape so callers can re-read and retry.
 	if baseSHA != "" && gitBlobSHA(content) != baseSHA {
 		return mcp.NewToolResultError(errBaseSHADrift), nil
+	}
+	// Before anything is written, so a withheld receipt never leaves a
+	// half-applied edit behind.
+	if evidenceRequested {
+		if err := s.guardMutationEvidenceIntent(s.detectLanguageForPath(ctx, absPath, relPath), relPath, content); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 	}
 	fileStr := string(content)
 
@@ -882,6 +896,9 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
+	if evidenceRequested {
+		s.attachMutationPhysicalEvidence(resp, absPath, content, true)
+	}
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
@@ -896,6 +913,13 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	}
 	dryRun := req.GetBool("dry_run", false)
 	baseSHA := normalizeExpectedSHA(req.GetString("base_sha", ""))
+	evidenceRequested, evidenceErr := parsePhysicalEvidenceRequest(req)
+	if evidenceErr != nil {
+		return mcp.NewToolResultError(evidenceErr.Error()), nil
+	}
+	if evidenceRequested && dryRun {
+		return mcp.NewToolResultError(errEvidenceDryRun), nil
+	}
 
 	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
 	if resolveErr != nil {
@@ -939,13 +963,23 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	contentBytes := []byte(content)
 	newSHA := gitBlobSHA(contentBytes)
 
+	// Read the prior bytes once: the parse gate compares against them, and an
+	// evidence receipt digests them as before_sha256.
+	var priorContent []byte
+	if fileExists {
+		priorContent, _ = os.ReadFile(absPath)
+	}
+	// Before anything is written, so a withheld receipt never leaves an
+	// overwritten file behind.
+	if evidenceRequested && fileExists {
+		if err := s.guardMutationEvidenceIntent(s.detectLanguageForPath(ctx, absPath, relPath), relPath, priorContent); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+	}
+
 	allowParseErrors := req.GetBool("allow_parse_errors", false)
 	var gate parseGateResult
 	if parseGateEnabled() {
-		var priorContent []byte
-		if fileExists {
-			priorContent, _ = os.ReadFile(absPath)
-		}
 		gate = checkParseGate(relPath, priorContent, contentBytes)
 		if gate.Blocked && !allowParseErrors && !dryRun {
 			return mcp.NewToolResultError(parseGateError(relPath, gate)), nil
@@ -1000,6 +1034,9 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
+	if evidenceRequested {
+		s.attachMutationPhysicalEvidence(resp, absPath, priorContent, fileExists)
+	}
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
@@ -1262,18 +1299,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
 	}
 
-	physicalEvidenceRequested := req.GetBool("physical_evidence", false)
-	digest := strings.ToLower(strings.TrimSpace(req.GetString("digest", "")))
-	if digest != "" && !physicalEvidenceRequested {
-		return mcp.NewToolResultError("digest requires physical_evidence=true"), nil
-	}
-	if physicalEvidenceRequested {
-		if digest == "" {
-			digest = "sha256"
-		}
-		if digest != "sha256" {
-			return mcp.NewToolResultError(fmt.Sprintf("unsupported physical evidence digest %q; only sha256 is supported", digest)), nil
-		}
+	physicalEvidenceRequested, evidenceErr := parsePhysicalEvidenceRequest(req)
+	if evidenceErr != nil {
+		return mcp.NewToolResultError(evidenceErr.Error()), nil
 	}
 
 	var diskContent []byte
