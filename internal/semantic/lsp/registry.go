@@ -122,7 +122,10 @@ type ServerSpec struct {
 	// completes. For such a server the enrichment pass skips both request
 	// classes: ambiguous edges are confirmed through textDocument/definition
 	// at their call sites (a clean position request) and dispatch fan-out
-	// stays with the graph-side interface-dispatch synthesis.
+	// stays with the graph-side interface-dispatch synthesis. The
+	// GORTEX_LSP_HEAVY env override wins over this flag both ways — an
+	// operator running a server build without the leak sets it "on" to
+	// restore the heavy legs.
 	NoHeavyRequests bool
 	// ProjectReady, when non-nil, reports whether a workspace has the
 	// project setup this server needs to resolve anything at all — e.g.

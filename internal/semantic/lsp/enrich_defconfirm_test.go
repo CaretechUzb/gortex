@@ -265,3 +265,39 @@ func TestLSP_Enrich_DefConfirm_DispatchedCallAddsDeclaredMemberEdge(t *testing.T
 	assert.Equal(t, graph.OriginLSPResolved, declared.Origin)
 	assert.Equal(t, 2, declared.Line, "the added edge carries the call site")
 }
+
+// GORTEX_LSP_HEAVY overrides the heavy-request opt-out in both directions:
+// "on" restores references / incomingCalls for a spec that opted out (the
+// operator runs a patched server without the leak), "off" force-disables
+// them for every server. Empty or unrecognised falls through to the spec.
+func TestResolveNoHeavyRequests_Precedence(t *testing.T) {
+	csharp := SpecByName("omnisharp")
+	require.NotNil(t, csharp)
+
+	t.Run("default follows the spec", func(t *testing.T) {
+		t.Setenv(HeavyRequestsEnv, "")
+		assert.False(t, resolveNoHeavyRequests(nil), "spec-less providers keep the heavy legs")
+		assert.True(t, resolveNoHeavyRequests(csharp))
+	})
+	t.Run("env on re-enables heavies for an opted-out spec", func(t *testing.T) {
+		t.Setenv(HeavyRequestsEnv, "on")
+		assert.False(t, resolveNoHeavyRequests(csharp))
+	})
+	t.Run("env off disables heavies for every server", func(t *testing.T) {
+		t.Setenv(HeavyRequestsEnv, "off")
+		assert.True(t, resolveNoHeavyRequests(nil))
+	})
+	t.Run("unrecognised value falls through to the spec", func(t *testing.T) {
+		t.Setenv(HeavyRequestsEnv, "garbage")
+		assert.True(t, resolveNoHeavyRequests(csharp))
+		assert.False(t, resolveNoHeavyRequests(nil))
+	})
+	t.Run("constructors plumb the override", func(t *testing.T) {
+		t.Setenv(HeavyRequestsEnv, "on")
+		p := NewProviderFromSpec(csharp, nil)
+		assert.False(t, p.noHeavyRequests, "a patched server's operator can restore references/incoming")
+		t.Setenv(HeavyRequestsEnv, "off")
+		def := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
+		assert.True(t, def.noHeavyRequests)
+	})
+}
