@@ -128,10 +128,16 @@ var ErrWorkspaceNotReady = errors.New("semantic: workspace did not become ready 
 
 // EnrichResult contains statistics from an enrichment pass.
 type EnrichResult struct {
-	Provider        string  `json:"provider"`
-	Language        string  `json:"language"`
-	EdgesConfirmed  int     `json:"edges_confirmed"`
-	EdgesRefuted    int     `json:"edges_refuted"`
+	Provider       string `json:"provider"`
+	Language       string `json:"language"`
+	EdgesConfirmed int    `json:"edges_confirmed"`
+	EdgesRefuted   int    `json:"edges_refuted"`
+	// EdgesRebound counts unconfirmed edges whose target the definition
+	// answer REWROTE to a different same-name declaration (tagged
+	// rebound_from on the edge). A rebind corrects the heuristic graph —
+	// kept out of EdgesConfirmed so that count only ever means "the
+	// heuristic target was right".
+	EdgesRebound    int     `json:"edges_rebound"`
 	EdgesAdded      int     `json:"edges_added"`
 	NodesEnriched   int     `json:"nodes_enriched"`
 	SymbolsCovered  int     `json:"symbols_covered"`
@@ -218,6 +224,7 @@ type EnrichmentStatus struct {
 	DeadlineSeconds float64   `json:"deadline_seconds,omitempty"`
 	DurationMs      int64     `json:"duration_ms,omitempty"`
 	EdgesConfirmed  int       `json:"edges_confirmed"`
+	EdgesRebound    int       `json:"edges_rebound"`
 	EdgesAdded      int       `json:"edges_added"`
 	NodesEnriched   int       `json:"nodes_enriched"`
 	// Add-phase coverage — the targets eligible for the hover/references

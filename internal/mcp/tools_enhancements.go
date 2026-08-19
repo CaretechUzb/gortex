@@ -3295,7 +3295,7 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 			continue
 		}
 		label := st.Provider + " in " + st.Repo
-		landed := st.EdgesConfirmed + st.EdgesAdded + st.NodesEnriched + st.SymbolsCovered
+		landed := st.EdgesConfirmed + st.EdgesRebound + st.EdgesAdded + st.NodesEnriched + st.SymbolsCovered
 		// A provider that degrades for a language the graph does not contain is
 		// correct and expected — the Go pass on a Rust tree is the case the
 		// module gate exists to skip cheaply. Only a language actually present
@@ -3430,7 +3430,7 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 			if st.Language == "" {
 				continue
 			}
-			lspEdgesByLang[st.Language] += st.EdgesAdded + st.EdgesConfirmed
+			lspEdgesByLang[st.Language] += st.EdgesAdded + st.EdgesConfirmed + st.EdgesRebound
 		}
 		if len(lspEdgesByLang) > 0 {
 			result["lsp_resolved_edges_by_language"] = lspEdgesByLang
