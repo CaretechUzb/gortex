@@ -126,7 +126,12 @@ func TestLSP_Enrich_DefaultStillOpensDocuments(t *testing.T) {
 
 	require.NoError(t, runEnrich(t, p, g, repoRoot, 10*time.Second))
 
-	_, opens, closes := server.stats()
+	_, opens, _ := server.stats()
 	assert.Greater(t, opens, 0, "default pass still opens documents")
-	assert.Equal(t, opens, closes, "opens and closes stay paired")
+	// closeAll's didClose is a fire-and-forget notification; wait for it to
+	// land rather than racing the pipe.
+	assert.Eventually(t, func() bool {
+		_, o, c := server.stats()
+		return o > 0 && c == o
+	}, 2*time.Second, 10*time.Millisecond, "opens and closes stay paired")
 }
