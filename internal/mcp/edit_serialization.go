@@ -398,6 +398,10 @@ func (s *Server) mutationReceiptState(id string) (mutationReindexOutcome, bool) 
 // unnecessary source re-read.
 func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath string, outcome mutationReindexOutcome) {
 	resp["reindexed"] = outcome.Reindexed
+	// graph_status is the freshness half of the mutation contract, named so it
+	// reads next to disk_status (mutation_commit.go) rather than having to be
+	// inferred from the reindexed / reindex_pending / reindex_error triple.
+	resp["graph_status"] = graphStatusFor(outcome)
 	if outcome.Generation > 0 {
 		resp["reindex_generation"] = outcome.Generation
 	}

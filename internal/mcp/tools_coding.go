@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,7 +13,6 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
@@ -127,6 +127,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithBoolean("dry_run", mcp.Description("Validate the edit and return a unified-diff preview without writing (status: would_apply). Use to review the change before committing it.")),
 			mcp.WithBoolean("physical_evidence", mcp.Description(mutationEvidenceParamDescription)),
 			mcp.WithString("digest", mcp.Description(evidenceDigestParamDescription)),
+			mcp.WithString("mutation_id", mcp.Description(mutationIDParamDescription)),
 		),
 		s.handleEditSymbol,
 	)
@@ -163,6 +164,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithBoolean("allow_parse_errors", mcp.Description("Bypass the pre-write parse gate. By default an edit that would introduce new tree-sitter parse errors (leaving the file more syntactically broken than before) is refused before the atomic write; set true to write anyway.")),
 			mcp.WithBoolean("physical_evidence", mcp.Description(mutationEvidenceParamDescription)),
 			mcp.WithString("digest", mcp.Description(evidenceDigestParamDescription)),
+			mcp.WithString("mutation_id", mcp.Description(mutationIDParamDescription)),
 		),
 		s.handleEditFile,
 	)
@@ -177,8 +179,19 @@ func (s *Server) registerCodingTools() {
 			mcp.WithBoolean("allow_parse_errors", mcp.Description("Bypass the pre-write parse gate. By default a write that would introduce new tree-sitter parse errors (relative to the prior content, or any error in a brand-new file) is refused before the atomic write; set true to write anyway.")),
 			mcp.WithBoolean("physical_evidence", mcp.Description(mutationEvidenceParamDescription)),
 			mcp.WithString("digest", mcp.Description(evidenceDigestParamDescription)),
+			mcp.WithString("mutation_id", mcp.Description(mutationIDParamDescription)),
 		),
 		s.handleWriteFile,
+	)
+
+	s.addTool(
+		mcp.NewTool("mutation_status",
+			mcp.WithDescription("Reports what a file mutation actually did, after the fact. Use it when an edit_file / write_file / edit_symbol call was abandoned at its deadline (\"the work may still complete in the background\"): instead of retrying blindly, ask here. Returns disk_status (committed / not_applied / failed / in_flight) separately from graph_status (fresh / pending / stale / failed), because the bytes reaching disk and the graph catching up are different questions. disk_status=committed means the edit is already applied — re-applying it by any route would duplicate it. Select a record by receipt, by mutation_id, or by path; with no argument it lists the most recent mutations. Receipts are retained for 30 minutes."),
+			mcp.WithString("receipt", mcp.Description("Mutation receipt id from an edit response (`mutation_receipt`) or from the `mutation_commit=` block on an abandoned-call error.")),
+			mcp.WithString("mutation_id", mcp.Description("Caller-chosen idempotency key passed to the original edit.")),
+			mcp.WithString("path", mcp.Description("File path — returns the most recent mutation recorded for it. Use when the response was lost entirely and no receipt id was ever seen.")),
+		),
+		s.handleMutationStatus,
 	)
 
 	s.addTool(
@@ -2824,6 +2837,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	if evidenceRequested && dryRun {
 		return mcp.NewToolResultError(errEvidenceDryRun), nil
 	}
+	mutationID := strings.TrimSpace(req.GetString("mutation_id", ""))
 
 	if oldSource == newSource {
 		return mcp.NewToolResultError("old_source and new_source are identical"), nil
@@ -2848,6 +2862,17 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError("edit cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
 	defer releaseMutation()
+
+	// Replay under the path lock, before the snapshot read: once the edit has
+	// landed old_source no longer matches, so an un-replayed retry would be
+	// refused rather than answered with the original result.
+	fingerprint := mutationFingerprint("edit_symbol", id, absPath, oldSource, newSource)
+	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+		if conflict != "" {
+			return mcp.NewToolResultError(conflict), nil
+		}
+		return s.respondJSONOrTOON(ctx, req, replay)
+	}
 
 	// Read the entire file ONCE — both the drift check and the
 	// patch operate on the same byte snapshot so a concurrent
@@ -2989,14 +3014,19 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	if info, statErr := os.Stat(absPath); statErr == nil {
 		perm = info.Mode().Perm()
 	}
-	if err := agents.AtomicWriteFile(absPath, newContentBytes, perm); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", err)), nil
+	commit, writeErr := s.commitFileMutation(ctx, "edit_symbol", mutationID, fingerprint, node.FilePath, absPath, newContentBytes, perm)
+	if writeErr != nil {
+		if errors.Is(writeErr, errMutationNotApplied) {
+			return mcp.NewToolResultError(mutationNotAppliedMessage("edit", commit, writeErr)), nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
 	sess := s.sessionFor(ctx)
 	sess.recordModified(node.FilePath)
 	sess.recordSymbol(id)
 
 	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	commit.recordGraph(reindexOutcome)
 
 	// Count lines changed.
 	oldLines := strings.Count(oldSource, "\n") + 1
@@ -3021,6 +3051,10 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(resp, absPath, content, true)
 	}
+	attachMutationCommit(resp, commit)
+	// Retained last so a replayed retry returns the complete original payload,
+	// physical evidence included.
+	commit.retainResponse(resp)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
