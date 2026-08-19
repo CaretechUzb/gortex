@@ -366,3 +366,130 @@ func TestWhollyAmbiguousWindowReportsUncertainty(t *testing.T) {
 		t.Errorf("must not accuse on evidence that cannot decide: %+v", findings)
 	}
 }
+
+// TestHooksTurnedOffPreemptsTheTrustRemedy — an agent configured not to run
+// hooks explains an idle install completely. Sending the user to approve
+// hooks, or to check PATH, would be advice about something that is not broken.
+func TestHooksTurnedOffPreemptsTheTrustRemedy(t *testing.T) {
+	agent := codexAgent()
+	agent.HooksDisabled = true
+	agent.HooksDisabledRemedy = "set `hooks = true` under `[features]`"
+
+	findings := Diagnose(agent, activity(nil), Adoption{}, time.Now())
+
+	got := findingWith(t, findings, "hook execution is turned off")
+	if got.Severity != SeverityBlocker {
+		t.Errorf("severity=%s want BLOCKER", got.Severity)
+	}
+	if got.Remedy != agent.HooksDisabledRemedy {
+		t.Errorf("remedy=%q want %q", got.Remedy, agent.HooksDisabledRemedy)
+	}
+	assertNoFindingWith(t, findings, "none has run")
+	assertNoFindingWith(t, findings, "has no Gortex lifecycle hooks configured")
+}
+
+// TestHooksTurnedOffWithNothingConfigured keeps the missing-install case
+// ahead of the feature switch: there is nothing for the switch to stop.
+func TestHooksTurnedOffWithNothingConfigured(t *testing.T) {
+	agent := codexAgent()
+	agent.Configured = map[string]int{}
+	agent.HooksDisabled = true
+	agent.HooksDisabledRemedy = "set `hooks = true` under `[features]`"
+
+	findings := Diagnose(agent, activity(nil), Adoption{}, time.Now())
+
+	// Both facts matter: there is nothing installed, AND installing would not
+	// help until execution is switched back on.
+	findingWith(t, findings, "has no Gortex lifecycle hooks configured")
+	off := findingWith(t, findings, "hook execution turned off")
+	if off.Severity != SeverityBlocker {
+		t.Errorf("severity=%s want BLOCKER", off.Severity)
+	}
+}
+
+// TestDuplicateHookEventIsAWarning — an event declared in two files of one
+// layer runs twice, because the agent merges the files. Nothing else on the
+// machine names that except a startup warning inside the agent.
+func TestDuplicateHookEventIsAWarning(t *testing.T) {
+	agent := codexAgent()
+	agent.DuplicateHookEvents = []string{"SessionStart"}
+	agent.DuplicateHookSources = []string{"/home/u/.codex/hooks.json", "/home/u/.codex/config.toml"}
+	agent.ManagedHookFile = "/home/u/.codex/config.toml"
+
+	findings := Diagnose(agent, activity(map[string]hooks.EventActivity{
+		"SessionStart": {Runs: 3, Emitted: 3},
+	}), Adoption{}, time.Now())
+
+	got := findingWith(t, findings, "declares SessionStart in both")
+	if got.Severity != SeverityWarn {
+		t.Errorf("severity=%s want WARN", got.Severity)
+	}
+	for _, want := range []string{"hooks.json", "config.toml", "once per declaration"} {
+		if !strings.Contains(got.Summary, want) {
+			t.Errorf("summary should name %q, got %q", want, got.Summary)
+		}
+	}
+	// Cleaning the managed file is undone by the next install, so the remedy
+	// has to point at the other one.
+	if !strings.Contains(got.Remedy, "remove SessionStart from /home/u/.codex/hooks.json") {
+		t.Errorf("remedy should send the user to the unmanaged file, got %q", got.Remedy)
+	}
+	if strings.Contains(got.Remedy, "remove SessionStart from /home/u/.codex/config.toml") {
+		t.Errorf("remedy points at the file `gortex install` rewrites: %q", got.Remedy)
+	}
+}
+
+// TestDisjointHookSourcesAreNotADuplicate is the case that made the per-file
+// version of this finding dangerous: two files, no shared event, nothing
+// running twice — and a remedy phrased around the files would have deleted
+// four working hooks to fix a duplicate that did not exist.
+func TestDisjointHookSourcesAreNotADuplicate(t *testing.T) {
+	agent := codexAgent()
+	agent.DuplicateHookEvents = nil
+	agent.DuplicateHookSources = []string{"/home/u/.codex/hooks.json", "/home/u/.codex/config.toml"}
+	agent.ManagedHookFile = "/home/u/.codex/config.toml"
+
+	findings := Diagnose(agent, activity(map[string]hooks.EventActivity{
+		"SessionStart": {Runs: 3, Emitted: 3},
+	}), Adoption{}, time.Now())
+
+	assertNoFindingWith(t, findings, "in both")
+}
+
+// TestSingleHookSourceIsNotADuplicate — the ordinary install declares its
+// hooks in exactly one file. One declaring file can never be a duplicate, no
+// matter what events it carries.
+func TestSingleHookSourceIsNotADuplicate(t *testing.T) {
+	agent := codexAgent()
+	agent.DuplicateHookEvents = []string{"SessionStart"}
+	agent.DuplicateHookSources = []string{"/home/u/.codex/config.toml"}
+	agent.ManagedHookFile = "/home/u/.codex/config.toml"
+
+	findings := Diagnose(agent, activity(map[string]hooks.EventActivity{
+		"SessionStart": {Runs: 3, Emitted: 3},
+	}), Adoption{}, time.Now())
+
+	assertNoFindingWith(t, findings, "in both")
+}
+
+// TestHooksTurnedOffSuppressesThePerEventTrustRemedy closes the gap the switch
+// alone left open: `ran > 0` survives the switch being flipped, because runs
+// earlier in the window still count, and the per-event rule then handed out
+// the trust remedy event by event on a machine that simply has hooks off.
+func TestHooksTurnedOffSuppressesThePerEventTrustRemedy(t *testing.T) {
+	agent := codexAgent()
+	agent.HooksDisabled = true
+	agent.HooksDisabledRemedy = "set `hooks = true` under `[features]`"
+
+	findings := Diagnose(agent, activity(map[string]hooks.EventActivity{
+		"SessionStart": {Runs: 3, Emitted: 3},
+	}), Adoption{}, time.Now())
+
+	findingWith(t, findings, "hook execution is turned off")
+	assertNoFindingWith(t, findings, "configured but never ran, while other hooks did")
+	for _, f := range findings {
+		if strings.Contains(f.Remedy, "/hooks") {
+			t.Errorf("trust remedy offered while execution is turned off: %+v", f)
+		}
+	}
+}

@@ -219,6 +219,11 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 	if hooksChanged {
 		res.Warnings = append(res.Warnings, codexHookTrustNotice)
 	}
+	if env.InstallHooks {
+		if notice := codexDuplicateHookFileNotice(path); notice != "" {
+			res.Warnings = append(res.Warnings, notice)
+		}
+	}
 
 	// User-level instructions → ~/.codex/AGENTS.md. This is the surface
 	// that makes Codex reach for the graph tools on every turn; see
@@ -264,6 +269,32 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 
 	res.Configured = true
 	return res, nil
+}
+
+// codexDuplicateHookFileNotice reports that the hooks.json beside configPath
+// already declares Gortex hooks, which Codex merges with the inline [hooks]
+// tables written into configPath — running each event declared in both once
+// per declaration.
+//
+// Keyed off configPath rather than the home directory because Codex merges per
+// layer: the repo-local pair merges with each other, not with the user's.
+//
+// The installer still writes its own representation: that is what it was asked
+// to do, and the hooks.json entries are the user's, not ours to edit. Saying so
+// is the part that was missing, because the only other signal is a startup
+// warning inside Codex that nobody attributes to `gortex install`.
+func codexDuplicateHookFileNotice(configPath string) string {
+	if configPath == "" {
+		return ""
+	}
+	hooksJSON := filepath.Join(filepath.Dir(configPath), "hooks.json")
+	src, ok := inspectJSONHookFile(hooksJSON)
+	if !ok || src.Total == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%s already declares %d Gortex hook(s); Codex merges it with the [hooks] tables in %s, so any event declared in both runs twice — remove those events from %s",
+		hooksJSON, src.Total, filepath.Base(configPath), hooksJSON)
 }
 
 func codexHasDirectToolNamespaces(root map[string]any) bool {
@@ -655,6 +686,11 @@ func InstallHooksOnly(w io.Writer, configPath string, env agents.Env, opts agent
 	}
 	if action.Action != agents.ActionSkip {
 		action.Keys = []string{"hooks"}
+	}
+	// `init --hooks-only` writes the same inline tables Apply does, so it can
+	// create the same silent duplicate and has to say the same thing.
+	if notice := codexDuplicateHookFileNotice(configPath); notice != "" {
+		internalutil.Warnf(w, "%s", notice)
 	}
 	return action, nil
 }

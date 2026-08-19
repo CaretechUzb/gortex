@@ -56,8 +56,15 @@ func defaultServiceActive() bool {
 		if _, err := os.Stat(path); err != nil {
 			return false
 		}
-		// `launchctl list <label>` exits 0 when the agent is loaded.
-		return exec.Command("launchctl", "list", daemonServiceName).Run() == nil
+		// Ask the domains the agent is actually bootstrapped into. The legacy
+		// `launchctl list <label>` searches only the caller's own domain, so
+		// it reported a loaded agent as absent and sent stop and restart down
+		// the manual path — which is precisely what this detector exists to
+		// avoid, because a hand-started daemon orphans itself from the unit
+		// that owns it. defaultServiceStop and defaultServiceRestart below
+		// already address the service by its full domain path; this brings
+		// the detector that gates them into line.
+		return launchdServiceLoaded(os.Getuid(), launchctlPrint)
 	default:
 		return false
 	}
