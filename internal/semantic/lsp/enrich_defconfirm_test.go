@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -300,4 +301,84 @@ func TestResolveNoHeavyRequests_Precedence(t *testing.T) {
 		def := NewProvider("fake-lsp", nil, []string{"go"}, false, 2, nil)
 		assert.True(t, def.noHeavyRequests)
 	})
+}
+
+// The definition pass fans out across site files. The serial loop predates
+// the NoDidOpen lifecycle — it existed to keep document opens from
+// overlapping — but with no didOpen to serialize, a heavy-opt-out server
+// answering 46k definitions one at a time is the pass's longest pole. Six
+// site files with a slow definition handler must overlap.
+func TestLSP_Enrich_DefinitionPassRunsSiteFilesInParallel(t *testing.T) {
+	t.Setenv(SweepEnv, "full")
+	repoRoot := t.TempDir()
+	g := graph.New()
+
+	const n = 6
+	for i := 0; i < n; i++ {
+		defFile := fmt.Sprintf("def%d.go", i)
+		callFile := fmt.Sprintf("call%d.go", i)
+		require.NoError(t, os.WriteFile(filepath.Join(repoRoot, defFile),
+			[]byte(fmt.Sprintf("package p\nfunc target%d() {}\n", i)), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(repoRoot, callFile),
+			[]byte(fmt.Sprintf("package p\nfunc caller%d() { target%d() }\n", i, i)), 0o644))
+		g.AddNode(&graph.Node{ID: fmt.Sprintf("%s::target%d", defFile, i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("target%d", i), FilePath: defFile, StartLine: 2, EndLine: 2, Language: "go"})
+		g.AddNode(&graph.Node{ID: fmt.Sprintf("%s::caller%d", callFile, i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("caller%d", i), FilePath: callFile, StartLine: 2, EndLine: 2, Language: "go"})
+		g.AddEdge(&graph.Edge{
+			From: fmt.Sprintf("%s::caller%d", callFile, i), To: fmt.Sprintf("%s::target%d", defFile, i),
+			Kind: graph.EdgeCalls, FilePath: callFile, Line: 2,
+			Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched,
+		})
+	}
+
+	// The instrumented rig dispatches each request in its own goroutine, so
+	// concurrency is genuinely observable (fakeLSPServer answers inline in
+	// its read loop and would pin in-flight at 1 regardless of the client).
+	server := newInstrumentedServer()
+	var inflight, maxInflight atomic.Int64
+	server.handle("textDocument/definition", func(params json.RawMessage) (any, *jsonRPCError) {
+		cur := inflight.Add(1)
+		for {
+			prev := maxInflight.Load()
+			if cur <= prev || maxInflight.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+		inflight.Add(-1)
+		var req struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		_ = json.Unmarshal(params, &req)
+		var idx int
+		if _, err := fmt.Sscanf(filepath.Base(uriToAbsPath(req.TextDocument.URI)), "call%d.go", &idx); err != nil {
+			return []Location{}, nil
+		}
+		return []Location{{
+			URI:   pathToURI(filepath.Join(repoRoot, fmt.Sprintf("def%d.go", idx))),
+			Range: Range{Start: Position{Line: 1, Character: 5}, End: Position{Line: 1, Character: 12}},
+		}}, nil
+	})
+	server.handle("textDocument/hover", func(json.RawMessage) (any, *jsonRPCError) { return nil, nil })
+
+	p, cleanup := providerWithInstrumentedServer(t, server, []string{"go"}, 4)
+	defer cleanup()
+	p.noHeavyRequests = true
+
+	require.NoError(t, runEnrich(t, p, g, repoRoot, 10*time.Second))
+
+	assert.GreaterOrEqual(t, maxInflight.Load(), int64(2),
+		"definition requests for distinct site files must overlap")
+	confirmed := 0
+	for i := 0; i < n; i++ {
+		for _, e := range g.GetOutEdges(fmt.Sprintf("call%d.go::caller%d", i, i)) {
+			if e.Kind == graph.EdgeCalls && e.Origin == graph.OriginLSPResolved {
+				confirmed++
+			}
+		}
+	}
+	assert.Equal(t, n, confirmed, "parallelism must not cost any confirm verdict")
 }

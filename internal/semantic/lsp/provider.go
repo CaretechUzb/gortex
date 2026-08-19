@@ -1205,115 +1205,130 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		rmu.Unlock()
 	}
 
-	// Serial definition-rebind fallback: for a site the reference sweep did
-	// not tie to the edge's target, ask the server what the site actually
-	// resolves to (textDocument/definition at the site identifier). When the
-	// definition lands back on the target we confirm anyway (reference lists
-	// can be incomplete); when it names a DIFFERENT known declaration we
-	// rebind the edge to the correct target instead of leaving a
-	// misattribution behind. Runs after the parallel sweep so arbitrary
-	// call-site document opens never overlap across goroutines.
+	// Definition-rebind pass: for a site the reference sweep did not tie to
+	// the edge's target, ask the server what the site actually resolves to
+	// (textDocument/definition at the site identifier). When the definition
+	// lands back on the target we confirm anyway (reference lists can be
+	// incomplete); when it names a DIFFERENT known declaration we rebind the
+	// edge to the correct target instead of leaving a misattribution behind.
 	//
-	// Sites are ordered by their call-site file so one session acquire
-	// serves every site in a file — a caller with many misbound sites in
-	// one file is opened once, not once per site. Stable so sites keep
-	// their relative order within a file.
+	// Sites are grouped by their call-site file — one session acquire and
+	// one definition cache serve every site in the file — and the groups fan
+	// out across maxParallel. The serial loop this replaces existed to keep
+	// call-site document opens from overlapping across goroutines; for a
+	// heavy-opt-out server this pass carries the whole confirm load (tens of
+	// thousands of definitions on a large solution), and a position request
+	// needs no such serialization. Stable sort so sites keep their relative
+	// order within a file.
 	sort.SliceStable(fallback, func(i, j int) bool {
 		return edgeSiteRelPath(fallback[i].edge, repoPrefix, nodeRelPath(fallback[i].node)) <
 			edgeSiteRelPath(fallback[j].edge, repoPrefix, nodeRelPath(fallback[j].node))
 	})
-	defSiteCache := map[string]*graph.Node{}
-	var (
-		curSiteRel string
-		curContent []byte
-		relSite    func()
-		siteOpen   bool
-	)
-	releaseSite := func() {
-		if siteOpen {
-			relSite()
-			siteOpen = false
-		}
-		curContent = nil
+	type defSiteGroup struct {
+		rel     string
+		targets []enrichTarget
 	}
-	fallbackMutations := newLSPMutationBatch()
+	var defGroups []defSiteGroup
 	for _, t := range fallback {
-		if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
-			break
-		}
-		toNode := view.nodesByID[t.edge.To]
-		if toNode == nil {
-			continue
-		}
-		callerRel := nodeRelPath(t.node)
-		siteRel := edgeSiteRelPath(t.edge, repoPrefix, callerRel)
+		siteRel := edgeSiteRelPath(t.edge, repoPrefix, nodeRelPath(t.node))
 		if !p.servesFile(siteRel) {
 			continue // never open a call-site file this server can't compile
 		}
 		if degradedSkipFile != nil && degradedSkipFile(siteRel) {
 			continue // degraded mode: never open this call-site (e.g. a header)
 		}
-		// Hold one open document per run of same-file sites: acquire on the
-		// first site of a file, release when the file changes (and once more
-		// after the loop). A failed acquire yields nil content, which
-		// definitionNodeAtSite treats as a no-verdict — the same outcome the
-		// per-site openDocument failure produced before.
-		if siteRel != curSiteRel {
-			releaseSite()
-			curSiteRel = siteRel
-			content, release, err := session.acquire(p.client, filepath.Join(absRoot, siteRel))
-			if err == nil {
-				curContent = content
-				relSite = release
-				siteOpen = true
-			}
+		if len(defGroups) == 0 || defGroups[len(defGroups)-1].rel != siteRel {
+			defGroups = append(defGroups, defSiteGroup{rel: siteRel})
 		}
-		siteLine := t.edge.Line
-		cand, ok := p.definitionNodeAtSite(view, repoPrefix, absRoot, siteRel, siteLine, toNode.Name, curContent, defSiteCache)
-		switch {
-		case !ok || cand == nil:
-			// No verdict — leave the edge at its heuristic tier so
-			// min_tier filtering excludes it.
-		case cand.ID == toNode.ID:
-			rmu.Lock()
-			semantic.ConfirmEdge(t.edge, p.Name())
-			fallbackMutations.stagePersist(t.edge)
-			rmu.Unlock()
-			result.EdgesConfirmed++
-		case view.declaredDispatchMember(cand) && view.implementsDeclaredMember(toNode, cand):
-			// The compiler answers the DECLARED member — the site's static
-			// receiver is the interface / abstract base, so the stored edge
-			// to one of its concrete impls is a devirtualization inference
-			// definition cannot vouch for. Add the compiler-proven edge to
-			// the declared member and leave the inference exactly as it was
-			// (not retargeted, not promoted): impl reachability flows
-			// through the declared member's dispatch fan-out, and the
-			// heuristic tier keeps the guess honestly labeled. A target
-			// UNRELATED to the declared member is not this case — that is a
-			// plain misbind and falls through to the rebind below.
-			if !edgeExistsAt(view, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line) {
-				declared := newLSPResolvedEdge(t.edge.From, cand.ID, t.edge.Kind,
-					t.edge.FilePath, t.edge.Line, p.Name(), graph.OriginLSPResolved)
-				rmu.Lock()
-				if fallbackMutations.stageAdd(view, declared) {
-					result.EdgesAdded++
-				}
-				rmu.Unlock()
-			}
-		case rebindTargetAcceptable(cand.Kind) && !edgeExistsAt(view, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line):
-			rmu.Lock()
-			// Mutate the full edge state before staging the set-oriented
-			// reindex so the backend persists the complete confirmed payload.
-			oldTo := t.edge.To
-			t.edge.To = cand.ID
-			semantic.ConfirmEdge(t.edge, p.Name())
-			t.edge.Meta["rebound_from"] = oldTo
-			fallbackMutations.stageReindex(view, t.edge, oldTo)
-			rmu.Unlock()
-			result.EdgesConfirmed++
-		}
+		defGroups[len(defGroups)-1].targets = append(defGroups[len(defGroups)-1].targets, t)
 	}
-	releaseSite()
+	fallbackMutations := newLSPMutationBatch()
+	{
+		sem := make(chan struct{}, p.maxParallel)
+		var wg sync.WaitGroup
+		for i := range defGroups {
+			if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
+				break
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(grp *defSiteGroup) {
+				defer func() {
+					<-sem
+					wg.Done()
+				}()
+				if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
+					return
+				}
+				// The file is unique to this group, so no two goroutines
+				// open it. A failed acquire yields nil content, which
+				// definitionNodeAtSite treats as a no-verdict — the same
+				// outcome the per-site openDocument failure produced before.
+				var content []byte
+				if c, release, err := session.acquire(p.client, filepath.Join(absRoot, grp.rel)); err == nil {
+					content = c
+					defer release()
+				}
+				// Cache keys carry the site file, so the cache is
+				// group-local by construction — no sharing to guard.
+				cache := map[string]*graph.Node{}
+				for _, t := range grp.targets {
+					if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
+						return
+					}
+					toNode := view.nodesByID[t.edge.To]
+					if toNode == nil {
+						continue
+					}
+					cand, ok := p.definitionNodeAtSite(view, repoPrefix, absRoot, grp.rel, t.edge.Line, toNode.Name, content, cache)
+					// The verdict switch reads the view's edge indexes
+					// (edgeExistsAt, the dispatch-member helpers) that the
+					// staged mutations also update, so the whole switch —
+					// counters included — runs under rmu. The expensive
+					// part, the definition round trip above, stays outside.
+					rmu.Lock()
+					switch {
+					case !ok || cand == nil:
+						// No verdict — leave the edge at its heuristic tier
+						// so min_tier filtering excludes it.
+					case cand.ID == toNode.ID:
+						semantic.ConfirmEdge(t.edge, p.Name())
+						fallbackMutations.stagePersist(t.edge)
+						result.EdgesConfirmed++
+					case view.declaredDispatchMember(cand) && view.implementsDeclaredMember(toNode, cand):
+						// The compiler answers the DECLARED member — the site's static
+						// receiver is the interface / abstract base, so the stored edge
+						// to one of its concrete impls is a devirtualization inference
+						// definition cannot vouch for. Add the compiler-proven edge to
+						// the declared member and leave the inference exactly as it was
+						// (not retargeted, not promoted): impl reachability flows
+						// through the declared member's dispatch fan-out, and the
+						// heuristic tier keeps the guess honestly labeled. A target
+						// UNRELATED to the declared member is not this case — that is a
+						// plain misbind and falls through to the rebind below.
+						if !edgeExistsAt(view, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line) {
+							declared := newLSPResolvedEdge(t.edge.From, cand.ID, t.edge.Kind,
+								t.edge.FilePath, t.edge.Line, p.Name(), graph.OriginLSPResolved)
+							if fallbackMutations.stageAdd(view, declared) {
+								result.EdgesAdded++
+							}
+						}
+					case rebindTargetAcceptable(cand.Kind) && !edgeExistsAt(view, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line):
+						// Mutate the full edge state before staging the set-oriented
+						// reindex so the backend persists the complete confirmed payload.
+						oldTo := t.edge.To
+						t.edge.To = cand.ID
+						semantic.ConfirmEdge(t.edge, p.Name())
+						t.edge.Meta["rebound_from"] = oldTo
+						fallbackMutations.stageReindex(view, t.edge, oldTo)
+						result.EdgesConfirmed++
+					}
+					rmu.Unlock()
+				}
+			}(&defGroups[i])
+		}
+		wg.Wait()
+	}
 	if len(fallbackMutations.reindexes) > 0 || len(fallbackMutations.persists) > 0 ||
 		len(fallbackMutations.adds) > 0 {
 		rmu.Lock()
