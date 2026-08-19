@@ -98,12 +98,27 @@ func Run(ctx workflow.Context) {
 		t.Fatalf("constant reference = %#v", got)
 	}
 
-	wrongCase, err := ext.ExtractWithOptions("case.go", temporalOptionSource("CorporateHelper", ""), parser.NewExtractionOptions([]string{"corporatehelper"}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := temporalDispatchMeta(t, wrongCase)["temporal_env_source"]; got != nil {
-		t.Fatalf("case-insensitive local match = %#v", got)
+	// A repo-local allow-list entry matches its call site case-insensitively,
+	// exactly like a built-in goEnvHelperNames entry does. The YAML author
+	// must not have to reproduce the call site's capitalisation: a near-miss
+	// used to fail silently, dropping the dispatch to the hidden heuristic
+	// tier (or off the graph entirely for a name without an "env" marker).
+	for _, tc := range []struct{ entry, callSite string }{
+		{entry: "corporatehelper", callSite: "CorporateHelper"},
+		{entry: "CorporateHelper", callSite: "corporatehelper"},
+	} {
+		mixedCase, err := ext.ExtractWithOptions(
+			"case.go",
+			temporalOptionSource(tc.callSite, ""),
+			parser.NewExtractionOptions([]string{tc.entry}),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := temporalDispatchMeta(t, mixedCase)["temporal_env_source"]; got != "allowlist" {
+			t.Fatalf("entry %q vs call site %q: source = %#v, want %q",
+				tc.entry, tc.callSite, got, "allowlist")
+		}
 	}
 }
 
