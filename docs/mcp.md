@@ -293,6 +293,71 @@ over a very large tree, or `ask` against a slow local model.
 | `set_planning_mode` | Switch the session between a guaranteed no-writes planning phase and editing mode |
 | `workflow` | Drive a phase-enforcement state machine (explore → implement → verify) — editing tools are gated until the implement phase |
 
+### Content hashes: five fields, five meanings
+
+Several tools return a hash and none of them are interchangeable. Pick by what
+you need to prove, not by which field is nearest.
+
+| Field | Algorithm | Covers | Observed when |
+|---|---|---|---|
+| `base_sha` (request) | git blob SHA-1 | the full file the caller read earlier | — (a value you supply) |
+| `new_sha` (response) | git blob SHA-1 | the bytes the tool was **about to** write | **before** the write |
+| `content_sha256` (`read_file`) | SHA-256 | the full file on disk | during the read |
+| `before_sha256` / `after_sha256` (mutations) | SHA-256 | the full file on disk, before and after | before / **after** the write |
+| `etag` | SHA-256 of the response payload | the returned representation, not the file | as the response is built |
+
+Two consequences worth internalising:
+
+- **`new_sha` is a pipelining token, not physical evidence.** It is a git blob
+  SHA-1 (`sha1("blob <len>\0" + data)`, the same value `git hash-object` prints)
+  computed from the in-memory buffer *before* `AtomicWriteFile` runs. It is what
+  you feed to the next call's `base_sha`. It is not a SHA-256, it is not read
+  back from disk, and `dry_run` returns one for bytes that were never written.
+- **`etag` is not a file hash.** It covers the JSON response — window, elision,
+  redaction and all — so two reads of an unchanged file with different options
+  carry different ETags.
+
+To prove what is actually on disk, ask for it explicitly with
+`physical_evidence: true` (see below). Anything else is a prediction or a
+cache key.
+
+### Disk-verified receipts (`physical_evidence`)
+
+`read_file`, `edit_file`, `write_file` and `edit_symbol` accept
+`physical_evidence: true` (with an optional `digest`, `sha256` only, which is
+also the default). The read side returns `content_sha256` plus `hash_scope`,
+`content_source`, `same_buffer_as_content` and `resolved_path`; the mutation
+side returns `before_sha256` / `after_sha256` re-read from disk **after** the
+atomic write, plus `resolved_path`, `byte_count` and `verified_at`. Both are
+`hash_algorithm: sha256`, `hash_scope: full_file`, `content_source: disk`.
+
+Contract details that matter for an evidence workflow:
+
+- **The mutation digest is an observation, not a prediction.** The file is read
+  back through the same hardened path `read_file` uses — non-regular files
+  refused, symlink resolution recorded, repo-root confinement re-checked against
+  the target that supplied the bytes.
+- **A creating `write_file` reports `before_absent: true`** instead of a
+  `before_sha256`, so "no prior bytes" is distinguishable from "not requested".
+- **`dry_run` + `physical_evidence` is refused.** A dry run writes nothing, so
+  there are no disk bytes to attest.
+- **Evidence failure never fails the call.** If the read-back cannot be
+  completed or confinement is violated, the write is still reported as applied
+  and the response carries `evidence_error` with no digests — failing the call
+  would invite a retry that applies the edit twice.
+- **Secret-shaped config leaves are withheld.** `before_sha256` digests bytes
+  the caller did not supply, so a `.env`-shaped file refuses the receipt (the
+  edit itself still works). Read its digest with
+  `read_file{allow_secrets: true}` if you genuinely need it.
+- Multi-file mutations (`rename_symbol`, `batch_edit`) do not yet take the flag;
+  `batch_edit`'s transaction journal carries its own `before_sha256` /
+  `after_sha256`, computed from in-memory buffers for crash recovery — not a
+  disk observation.
+
+Whether the graph caught up with the write is a separate question, answered by
+the `reindexed` / `reindex_pending` / `reindex_generation` fields every mutation
+already returns.
+
 ## Agent-optimized (token efficiency)
 
 | Tool | Description |
