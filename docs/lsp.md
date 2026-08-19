@@ -464,3 +464,7 @@ for repositories you trust.
 - One `*lsp.Provider` per spec, regardless of how many MCP sessions
   hit it. Concurrency is bounded by `ServerSpec.MaxParallel` (6-10
   inflight requests per server depending on the spec).
+  `GORTEX_LSP_MAX_PARALLEL` overrides the spec's cap for every spawned
+  server — an operator-experiment knob for a machine whose servers
+  multiplex better than the conservative default assumes. Ignored when
+  zero, negative, or unparseable.

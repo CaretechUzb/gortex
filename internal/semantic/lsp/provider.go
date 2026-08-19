@@ -218,6 +218,14 @@ func NewProvider(command string, args []string, languages []string, daemon bool,
 	}
 }
 
+// MaxParallelEnv overrides every spawned server's concurrent-request cap,
+// winning over the spec default — the same operator-experiment shape as
+// GORTEX_LSP_SWEEP. The probe-measured levers differ per machine (a server
+// that multiplexes well takes a higher cap than its conservative spec
+// default), so the knob lets an operator try a value for one run without
+// editing the registry. Zero, negative, or unparseable values are ignored.
+const MaxParallelEnv = "GORTEX_LSP_MAX_PARALLEL"
+
 // NewProviderFromSpec builds a Provider directly from a ServerSpec.
 // Mostly equivalent to NewProvider but lets the runtime router resolve
 // the right `languageId` per file extension and pick the first
@@ -239,6 +247,9 @@ func NewProviderFromSpec(spec *ServerSpec, logger *zap.Logger) *Provider {
 		}
 	}
 	maxParallel := spec.MaxParallel
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(MaxParallelEnv))); err == nil && v > 0 {
+		maxParallel = v
+	}
 	if maxParallel <= 0 {
 		maxParallel = 10
 	}
