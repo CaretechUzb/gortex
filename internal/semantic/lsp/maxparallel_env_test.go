@@ -37,3 +37,19 @@ func TestNewProviderFromSpec_MaxParallelEnvOverride(t *testing.T) {
 	t.Setenv(MaxParallelEnv, "4")
 	assert.Equal(t, 4, NewProviderFromSpec(bare, zap.NewNop()).maxParallel)
 }
+
+// The durable operator home is config (`semantic.lsp_max_parallel`), with
+// the same precedence shape as the sweep mode: env override wins over the
+// configured value, which wins over the spec default.
+func TestResolveMaxParallel_Precedence(t *testing.T) {
+	t.Setenv(MaxParallelEnv, "")
+	assert.Equal(t, 6, resolveMaxParallel(0, 6), "spec default when env + config are unset")
+	assert.Equal(t, 12, resolveMaxParallel(12, 6), "configured value wins over the spec default")
+	assert.Equal(t, 6, resolveMaxParallel(-3, 6), "non-positive config is ignored")
+	assert.Equal(t, 10, resolveMaxParallel(0, 0), "package default when nothing names a cap")
+
+	t.Setenv(MaxParallelEnv, "16")
+	assert.Equal(t, 16, resolveMaxParallel(12, 6), "env wins over config and spec")
+	t.Setenv(MaxParallelEnv, "junk")
+	assert.Equal(t, 12, resolveMaxParallel(12, 6), "unusable env falls through to config")
+}
