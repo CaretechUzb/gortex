@@ -60,7 +60,7 @@ func TestCodexWritesMcpServersTOMLTable(t *testing.T) {
 	agentstest.AssertIdempotent(t, a, env)
 }
 
-func TestCodexMakesGortexToolsDirectAndRequired(t *testing.T) {
+func TestCodexMakesGortexToolsDirectWithoutHardDependency(t *testing.T) {
 	env := codexGlobalEnv(t)
 	env.InstallHooks = false
 	a := New()
@@ -71,8 +71,13 @@ func TestCodexMakesGortexToolsDirectAndRequired(t *testing.T) {
 	cfg := readCodexConfig(t, env)
 	servers := cfg["mcp_servers"].(map[string]any)
 	server := servers["gortex"].(map[string]any)
-	if server["required"] != true {
-		t.Fatalf("mcp_servers.gortex.required=%v want true", server["required"])
+	// A required server Codex cannot start aborts the whole session, so a
+	// Gortex outage would take the user's CLI down with it (#607).
+	if _, exists := server["required"]; exists {
+		t.Fatalf("Gortex must not declare itself a required Codex dependency: %#v", server)
+	}
+	if want := agents.ResolveGortexLaunchBinary(); server["command"] != want {
+		t.Fatalf("mcp_servers.gortex.command=%v want %q", server["command"], want)
 	}
 	if server["startup_timeout_sec"] != int64(codexMCPStartupTimeoutSeconds) {
 		t.Fatalf("mcp_servers.gortex.startup_timeout_sec=%v want %d", server["startup_timeout_sec"], codexMCPStartupTimeoutSeconds)
@@ -127,8 +132,10 @@ command = "other"
 	}
 	servers := cfg["mcp_servers"].(map[string]any)
 	server := servers["gortex"].(map[string]any)
-	if server["command"] != "gortex" {
-		t.Fatalf("custom command changed: %#v", server)
+	// The seed's bare "gortex" is what earlier releases wrote, not a user
+	// choice, so it is upgraded to the absolute path Codex can always find.
+	if want := agents.ResolveGortexLaunchBinary(); server["command"] != want {
+		t.Fatalf("command=%v want the pinned launch binary %q", server["command"], want)
 	}
 	args, ok := codexStringList(server["args"])
 	if !ok || len(args) != 2 || args[1] != "--custom" {
@@ -137,8 +144,9 @@ command = "other"
 	if server["tool_timeout_sec"] != int64(321) {
 		t.Fatalf("custom tool timeout changed: %#v", server)
 	}
-	if server["required"] != true {
-		t.Fatalf("required=%v want true", server["required"])
+	// An explicit opt-out is already the safe posture; only `true` is pruned.
+	if server["required"] != false {
+		t.Fatalf("user's required=false was not preserved: %#v", server)
 	}
 	if server["startup_timeout_sec"] != int64(codexMCPStartupTimeoutSeconds) {
 		t.Fatalf("startup timeout=%v want %d", server["startup_timeout_sec"], codexMCPStartupTimeoutSeconds)
@@ -229,9 +237,8 @@ func TestCodexMCPServerPreservesLongerStartupTimeout(t *testing.T) {
 	root := map[string]any{
 		"mcp_servers": map[string]any{
 			"gortex": map[string]any{
-				"command":             "gortex",
+				"command":             agents.ResolveGortexLaunchBinary(),
 				"args":                []any{"mcp"},
-				"required":            true,
 				"startup_timeout_sec": int64(180),
 			},
 		},
@@ -242,6 +249,87 @@ func TestCodexMCPServerPreservesLongerStartupTimeout(t *testing.T) {
 	server := root["mcp_servers"].(map[string]any)["gortex"].(map[string]any)
 	if server["startup_timeout_sec"] != int64(180) {
 		t.Fatalf("longer startup timeout changed: %#v", server)
+	}
+}
+
+// TestCodexUpgradeRemovesRequiredFlag covers the migration for everyone who
+// already ran an affected release: their config carries `required = true` on
+// disk, so leaving it there would keep their Codex unable to start whenever
+// the daemon is down (#607).
+func TestCodexUpgradeRemovesRequiredFlag(t *testing.T) {
+	env := codexGlobalEnv(t)
+	env.InstallHooks = false
+	path := codexConfigPath(env)
+	seed := `[mcp_servers.gortex]
+args = ['mcp']
+command = 'gortex'
+required = true
+startup_timeout_sec = 90
+
+[mcp_servers.gortex.env]
+GORTEX_INDEX_WORKERS = '8'
+`
+	if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	server := readCodexConfig(t, env)["mcp_servers"].(map[string]any)["gortex"].(map[string]any)
+	if _, exists := server["required"]; exists {
+		t.Fatalf("upgrade left the session-blocking required flag behind: %#v", server)
+	}
+	if server["startup_timeout_sec"] != int64(codexMCPStartupTimeoutSeconds) {
+		t.Fatalf("startup timeout lost during the migration: %#v", server)
+	}
+}
+
+func TestCodexPruneManagedRequired(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		entry   map[string]any
+		changed bool
+		want    any
+		present bool
+	}{
+		{name: "managed true is removed", entry: map[string]any{"required": true}, changed: true},
+		{name: "explicit opt-out is preserved", entry: map[string]any{"required": false}, want: false, present: true},
+		{name: "absent stays absent", entry: map[string]any{}},
+		{
+			// A non-boolean is a shape we did not write and cannot judge.
+			name: "non-boolean is left alone", entry: map[string]any{"required": "yes"},
+			want: "yes", present: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pruneManagedCodexRequired(tc.entry); got != tc.changed {
+				t.Fatalf("changed=%v want %v", got, tc.changed)
+			}
+			got, present := tc.entry["required"]
+			if present != tc.present || (present && got != tc.want) {
+				t.Fatalf("required=(%#v, present=%v) want (%#v, present=%v)", got, present, tc.want, tc.present)
+			}
+		})
+	}
+}
+
+func TestCodexPinsBareGortexCommandOnly(t *testing.T) {
+	pinned := agents.ResolveGortexLaunchBinary()
+	if pinned == "gortex" {
+		t.Skip("no installed gortex binary to pin to on this machine")
+	}
+	entry := map[string]any{"command": "gortex"}
+	if !pinCodexBareGortexCommand(entry) {
+		t.Fatal("bare command should be pinned to the installed binary")
+	}
+	if entry["command"] != pinned {
+		t.Fatalf("command=%v want %q", entry["command"], pinned)
+	}
+	// An absolute path is a deliberate choice — a user's, or an earlier run's.
+	absolute := map[string]any{"command": "/opt/custom/build/gortex"}
+	if pinCodexBareGortexCommand(absolute) {
+		t.Fatalf("an absolute command must survive: %#v", absolute)
 	}
 }
 
@@ -281,8 +369,11 @@ func TestCodexOldVersionSkipsUnsupportedDirectNamespaceConfig(t *testing.T) {
 		t.Fatalf("Codex 0.141 must not receive unsupported features.code_mode fields: %#v", cfg["features"])
 	}
 	server := cfg["mcp_servers"].(map[string]any)["gortex"].(map[string]any)
-	if server["required"] != true || server["startup_timeout_sec"] != int64(codexMCPStartupTimeoutSeconds) {
-		t.Fatalf("version gate must not weaken MCP startup safety: %#v", server)
+	if server["startup_timeout_sec"] != int64(codexMCPStartupTimeoutSeconds) {
+		t.Fatalf("version gate must not weaken the MCP startup timeout: %#v", server)
+	}
+	if _, exists := server["required"]; exists {
+		t.Fatalf("old Codex must not receive the session-blocking required flag either: %#v", server)
 	}
 }
 
