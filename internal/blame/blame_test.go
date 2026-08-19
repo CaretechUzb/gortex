@@ -427,7 +427,5 @@ func (e *cmdError) Error() string {
 }
 
 func writeFile(path, content string) error {
-	cmd := exec.Command("sh", "-c", "cat > "+path)
-	cmd.Stdin = strings.NewReader(content)
-	return cmd.Run()
+	return os.WriteFile(path, []byte(content), 0o600)
 }
