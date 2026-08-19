@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -14,10 +15,38 @@ import (
 )
 
 // DiffHunk represents a changed range in a file.
+//
+// StartLine/EndLine are new-side (post-change) line numbers, except when
+// Deleted is set: a deleted file has no new side at all, so its range is the
+// old-side span the file occupied before it was removed. That is the span
+// that joins the still-indexed pre-delete symbols.
 type DiffHunk struct {
 	FilePath  string `json:"file_path"`
 	StartLine int    `json:"start_line"`
 	EndLine   int    `json:"end_line"`
+	Deleted   bool   `json:"deleted,omitempty"`
+}
+
+// FileChangeKind classifies one file entry in a diff.
+type FileChangeKind string
+
+const (
+	FileAdded    FileChangeKind = "added"
+	FileModified FileChangeKind = "modified"
+	FileDeleted  FileChangeKind = "deleted"
+	FileRenamed  FileChangeKind = "renamed"
+)
+
+// FileChange is one file-level entry in a diff, carried independently of the
+// hunks. Two common change kinds carry no usable hunk at all — a deleted file
+// (new side is /dev/null) and a 100%-similar rename (no @@ header is emitted) —
+// so a hunk-only view of a diff reports them as no change whatsoever.
+// Path is the file's post-change path, or its pre-change path when the change
+// removed it; PreviousPath is set only for a rename.
+type FileChange struct {
+	Path         string         `json:"path"`
+	PreviousPath string         `json:"previous_path,omitempty"`
+	Kind         FileChangeKind `json:"change_kind"`
 }
 
 // ChangedSymbol is a symbol affected by a git diff hunk.
@@ -30,10 +59,16 @@ type ChangedSymbol struct {
 }
 
 // DiffResult is the output of git diff → symbol mapping.
+//
+// FileChanges is the file-granular view and is authoritative for *what* the
+// diff touched: ChangedSymbols is empty for any file the graph does not index
+// (docs, manifests, fixtures) and for deletes/renames the graph still indexes
+// under the old path, so an empty ChangedSymbols never means "nothing changed".
 type DiffResult struct {
 	Hunks          []DiffHunk      `json:"hunks"`
 	ChangedSymbols []ChangedSymbol `json:"changed_symbols"`
 	ChangedFiles   []string        `json:"changed_files"`
+	FileChanges    []FileChange    `json:"file_changes"`
 }
 
 // MapGitDiff parses git diff output and maps changed lines to symbols in the graph.
@@ -55,15 +90,15 @@ func MapGitDiff(g graph.Store, repoRoot, repoPrefix, scope, baseRef string) (*Di
 	// trim) so the parsed diff stays byte-identical to the pre-gitcmd output.
 	output, err := gitcmd.Run(ctx, repoRoot, args...)
 	if err != nil {
-		// If git diff returns empty, that's fine
-		if len(output) == 0 {
-			return &DiffResult{}, nil
-		}
+		// A failed `git diff` is not an empty diff. Swallowing the error
+		// whenever stdout happened to be empty is how an unknown base ref, a
+		// repo root that is not a work tree, or a git that never ran at all
+		// became a confident "no changes" answer.
 		return nil, fmt.Errorf("git diff failed: %w", err)
 	}
 
-	hunks := parseDiffHunks(string(output))
-	return joinHunksToSymbols(g, repoPrefix, hunks), nil
+	hunks, files := parseDiffFiles(string(output))
+	return joinHunksToSymbols(g, repoPrefix, hunks, files), nil
 }
 
 // JoinFileNodes maps one repo-relative changed-file path to the graph nodes
@@ -103,39 +138,64 @@ func JoinFilePath(g graph.Store, repoPrefix, path string) string {
 // hunk in its file, deduped, plus the changed-file set. ChangedFiles keeps
 // the diff-relative paths (callers re-join them with git pathspecs); only
 // the node lookup is prefix-aware.
-func joinHunksToSymbols(g graph.Store, repoPrefix string, hunks []DiffHunk) *DiffResult {
-	result := &DiffResult{Hunks: hunks}
+func joinHunksToSymbols(g graph.Store, repoPrefix string, hunks []DiffHunk, files []FileChange) *DiffResult {
+	result := &DiffResult{Hunks: hunks, FileChanges: files}
 
 	fileSet := make(map[string]bool)
 	symbolSeen := make(map[string]bool)
+
+	addSymbol := func(n *graph.Node) {
+		if n.Kind == graph.KindFile || symbolSeen[n.ID] {
+			return
+		}
+		symbolSeen[n.ID] = true
+		result.ChangedSymbols = append(result.ChangedSymbols, ChangedSymbol{
+			ID:       n.ID,
+			Name:     n.Name,
+			Kind:     string(n.Kind),
+			FilePath: n.FilePath,
+			Line:     n.StartLine,
+		})
+	}
 
 	for _, hunk := range hunks {
 		fileSet[hunk.FilePath] = true
 
 		// Find symbols whose line range overlaps the hunk
 		for _, n := range JoinFileNodes(g, repoPrefix, hunk.FilePath) {
-			if n.Kind == graph.KindFile {
-				continue
-			}
 			// Check if symbol's line range overlaps with the hunk
 			if n.StartLine <= hunk.EndLine && n.EndLine >= hunk.StartLine {
-				if !symbolSeen[n.ID] {
-					symbolSeen[n.ID] = true
-					result.ChangedSymbols = append(result.ChangedSymbols, ChangedSymbol{
-						ID:       n.ID,
-						Name:     n.Name,
-						Kind:     string(n.Kind),
-						FilePath: n.FilePath,
-						Line:     n.StartLine,
-					})
-				}
+				addSymbol(n)
 			}
+		}
+	}
+
+	// A file record reaches ChangedFiles even when it carried no hunk, which
+	// is how a delete of an empty file or a 100%-similar rename stays visible.
+	// Removing or moving a file affects every symbol the graph still indexes
+	// under its old path, and no line range in the diff describes that — so
+	// those symbols are taken whole rather than by overlap.
+	for _, fc := range files {
+		if fc.Path != "" {
+			fileSet[fc.Path] = true
+		}
+		vanished := fc.PreviousPath
+		if fc.Kind == FileDeleted {
+			vanished = fc.Path
+		}
+		if vanished == "" {
+			continue
+		}
+		fileSet[vanished] = true
+		for _, n := range JoinFileNodes(g, repoPrefix, vanished) {
+			addSymbol(n)
 		}
 	}
 
 	for f := range fileSet {
 		result.ChangedFiles = append(result.ChangedFiles, f)
 	}
+	sort.Strings(result.ChangedFiles)
 
 	return result
 }
@@ -320,50 +380,196 @@ func MapGitDiffWithLines(g graph.Store, repoRoot, repoPrefix, scope, baseRef str
 	// never dropped; gitcmd injects `-C repoRoot` for us.
 	output, err := gitcmd.Run(ctx, repoRoot, args...)
 	if err != nil {
-		if len(output) == 0 {
-			return &DiffResult{}, map[string][]HunkLine{}, nil
-		}
+		// See MapGitDiff: an error here means the diff was never observed,
+		// which is not the same answer as "the diff was empty".
 		return nil, nil, fmt.Errorf("git diff failed: %w", err)
 	}
 
 	text := string(output)
-	hunks := parseDiffHunks(text)
+	hunks, files := parseDiffFiles(text)
 	lines := parseDiffLines(text)
 
-	return joinHunksToSymbols(g, repoPrefix, hunks), lines, nil
+	return joinHunksToSymbols(g, repoPrefix, hunks, files), lines, nil
 }
 
+// parseDiffHunks returns only the changed line ranges. Callers that need to
+// know a file changed at all — including the deletes and renames that carry no
+// hunk — want parseDiffFiles instead.
 func parseDiffHunks(output string) []DiffHunk {
-	var hunks []DiffHunk
-	var currentFile string
-
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Detect file path from diff header
-		if strings.HasPrefix(line, "+++ b/") {
-			currentFile = strings.TrimPrefix(line, "+++ b/")
-			continue
-		}
-		if strings.HasPrefix(line, "+++ /dev/null") {
-			currentFile = ""
-			continue
-		}
-
-		// Parse @@ hunk header for the new file's line range
-		if strings.HasPrefix(line, "@@") && currentFile != "" {
-			hunk := parseHunkHeader(line, currentFile)
-			if hunk != nil {
-				hunks = append(hunks, *hunk)
-			}
-		}
-	}
-
+	hunks, _ := parseDiffFiles(output)
 	return hunks
 }
 
-func parseHunkHeader(line, filePath string) *DiffHunk {
+// fileDiffState accumulates the header facts parseDiffFiles has seen for the
+// diff entry it is currently inside.
+type fileDiffState struct {
+	oldPath string
+	newPath string
+	added   bool
+	deleted bool
+	renamed bool
+}
+
+// change projects the accumulated header facts onto a FileChange. Rename is
+// checked first: a rename carries both an old and a new path, and describing
+// it as a delete of one plus an add of the other loses the link between them.
+func (s fileDiffState) change() FileChange {
+	switch {
+	case s.renamed:
+		return FileChange{Path: s.newPath, PreviousPath: s.oldPath, Kind: FileRenamed}
+	case s.deleted:
+		return FileChange{Path: s.oldPath, Kind: FileDeleted}
+	case s.added:
+		return FileChange{Path: s.newPath, Kind: FileAdded}
+	default:
+		return FileChange{Path: s.newPath, Kind: FileModified}
+	}
+}
+
+// parseDiffFiles walks unified diff output and returns the changed line ranges
+// together with a file-level record for every entry in the diff — including
+// the entries that carry no hunk at all.
+//
+// Anchoring only on "+++ b/" and "@@" — the pre-fix parser — silently drops
+// two change kinds that are squarely inside every scope this package serves:
+//
+//   - a deleted file, whose new side is "+++ /dev/null", so clearing the
+//     current path there also skips the "@@" that follows it;
+//   - a 100%-similar rename, which git reports with "rename from"/"rename to"
+//     headers and no "@@" header whatsoever.
+//
+// Both produced zero hunks, so the file never reached ChangedFiles and its
+// symbols never reached ChangedSymbols: a delete-only or rename-only change
+// read as an empty diff. Deletes are therefore parsed off the old side and
+// renames off their rename headers.
+func parseDiffFiles(output string) ([]DiffHunk, []FileChange) {
+	var (
+		hunks   []DiffHunk
+		changes []FileChange
+		cur     fileDiffState
+		inEntry bool
+	)
+
+	flush := func() {
+		if !inEntry {
+			return
+		}
+		if change := cur.change(); change.Path != "" {
+			changes = append(changes, change)
+		}
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			flush()
+			cur = fileDiffState{}
+			inEntry = true
+			// Only a same-path header parses unambiguously (see
+			// parseDiffGitPaths). Every other entry shape carries an
+			// explicit ---/+++ or rename header below, which overrides this.
+			cur.oldPath = parseDiffGitPaths(line)
+			cur.newPath = cur.oldPath
+			continue
+		case strings.HasPrefix(line, "deleted file mode "):
+			cur.deleted = true
+			continue
+		case strings.HasPrefix(line, "new file mode "):
+			cur.added = true
+			continue
+		case strings.HasPrefix(line, "rename from "):
+			cur.renamed = true
+			cur.oldPath = cleanDiffPath(strings.TrimPrefix(line, "rename from "))
+			continue
+		case strings.HasPrefix(line, "rename to "):
+			cur.renamed = true
+			cur.newPath = cleanDiffPath(strings.TrimPrefix(line, "rename to "))
+			continue
+		case strings.HasPrefix(line, "--- a/"):
+			cur.oldPath = cleanDiffPath(strings.TrimPrefix(line, "--- a/"))
+			continue
+		case strings.HasPrefix(line, "--- /dev/null"):
+			cur.added = true
+			continue
+		case strings.HasPrefix(line, "+++ b/"):
+			cur.newPath = cleanDiffPath(strings.TrimPrefix(line, "+++ b/"))
+			continue
+		case strings.HasPrefix(line, "+++ /dev/null"):
+			cur.deleted = true
+			continue
+		case !strings.HasPrefix(line, "@@"):
+			continue
+		}
+
+		// A deleted file has no new side, so its only line numbers are
+		// old-side — and they span exactly the lines the file used to hold,
+		// which is what joins the symbols the graph still indexes for it.
+		if cur.deleted && !cur.renamed {
+			if hunk := parseHunkHeader(line, cur.oldPath, "-"); hunk != nil {
+				hunk.Deleted = true
+				hunks = append(hunks, *hunk)
+			}
+			continue
+		}
+		if hunk := parseHunkHeader(line, cur.newPath, "+"); hunk != nil {
+			hunks = append(hunks, *hunk)
+		}
+	}
+	flush()
+
+	return hunks, changes
+}
+
+// cleanDiffPath normalizes a path lifted out of a diff header the same way
+// DiffHunk.FilePath and parseDiffLines do, so a hunk and its file record join.
+func cleanDiffPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	return filepath.Clean(path)
+}
+
+// parseDiffGitPaths recovers the path from a "diff --git a/P b/P" header. It is
+// the only path source for an entry that carries no ---/+++ and no rename
+// header — a mode-only change (chmod) is the common case.
+//
+// The header is ambiguous in general: git separates the two paths with a bare
+// space, which a path may itself contain. When both sides name the same file
+// the line is exactly "a/P b/P", so P is recoverable by length regardless of
+// its spaces. When they differ, the entry is a rename or a copy and carries
+// explicit rename headers, so this returns "" and lets those win.
+func parseDiffGitPaths(line string) string {
+	rest := strings.TrimPrefix(line, "diff --git ")
+	// Git quotes paths containing control or non-ASCII bytes; decoding that
+	// quoting here would be guesswork, and every quoted entry that matters
+	// also carries an explicit header below.
+	if !strings.HasPrefix(rest, "a/") || strings.Contains(rest, `"`) {
+		return ""
+	}
+	// len("a/") + len(P) + len(" ") + len("b/") + len(P)
+	pathLen := (len(rest) - 5) / 2
+	if pathLen <= 0 || len(rest) != 2*pathLen+5 {
+		return ""
+	}
+	old, next := rest[2:2+pathLen], rest[2+pathLen:]
+	if !strings.HasPrefix(next, " b/") || next[3:] != old {
+		return ""
+	}
+	return cleanDiffPath(old)
+}
+
+// parseHunkHeader reads one "@@ -old,count +new,count @@" header and returns
+// the range on the requested side ("+" for the new side, "-" for the old side
+// of a deleted file), attributed to filePath.
+func parseHunkHeader(line, filePath, side string) *DiffHunk {
+	if filePath == "" {
+		return nil
+	}
 	// Format: @@ -old,count +new,count @@
 	parts := strings.SplitN(line, "@@", 3)
 	if len(parts) < 2 {
@@ -373,8 +579,8 @@ func parseHunkHeader(line, filePath string) *DiffHunk {
 	fields := strings.Fields(ranges)
 
 	for _, f := range fields {
-		if strings.HasPrefix(f, "+") {
-			f = strings.TrimPrefix(f, "+")
+		if strings.HasPrefix(f, side) {
+			f = strings.TrimPrefix(f, side)
 			rangeP := strings.SplitN(f, ",", 2)
 			start, err := strconv.Atoi(rangeP[0])
 			if err != nil {

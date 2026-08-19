@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -40,7 +41,7 @@ func (s *Server) registerAnalysisTools() {
 
 	s.addTool(
 		mcp.NewTool("detect_changes",
-			mcp.WithDescription("Maps uncommitted git changes to symbols in the graph and runs blast radius analysis. The key pre-commit review tool."),
+			mcp.WithDescription("Maps uncommitted git changes to symbols in the graph and runs blast radius analysis. The key pre-commit review tool. changed_files and file_changes are the file-granular view (added/modified/deleted/renamed) and stay populated for changes that carry no indexed symbol, so an empty changed_symbols never means 'nothing changed'. Untracked and ignored files are not observed — every scope reads `git diff`."),
 			mcp.WithString("scope", mcp.Description("unstaged (default), staged, all, or compare")),
 			mcp.WithString("base_ref", mcp.Description("Branch/commit for compare scope (default: main)")),
 			mcp.WithString("repo", mcp.Description("Repository prefix or path (multi-repo mode); defaults to the lone tracked repo or the session's cwd-bound repo")),
@@ -303,6 +304,22 @@ func uniqueRepoPrefixesFromSteps(steps []analysis.Step) []string {
 	return out
 }
 
+// detectUnobservedNote names what `git diff` cannot see, so a caller reading an
+// empty or short result knows which changes this tool never had a chance to
+// report rather than concluding the working tree is clean.
+const detectUnobservedNote = "untracked and ignored files are not observed: every scope reads `git diff`, which lists tracked files only"
+
+// detectEmptySymbolSummary distinguishes the two causes of an empty symbol set.
+// Files that carry no indexed symbol — docs, manifests, fixtures — and files
+// deleted or moved wholesale are real changes with a real blast radius, and
+// reporting them with the same sentence as a clean tree hides them.
+func detectEmptySymbolSummary(changedFiles int) string {
+	if changedFiles == 0 {
+		return "no changes detected in tracked files"
+	}
+	return fmt.Sprintf("%d changed file(s), none mapping to indexed symbols — see changed_files and file_changes", changedFiles)
+}
+
 func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	scope := req.GetString("scope", "unstaged")
 	baseRef := req.GetString("base_ref", "main")
@@ -323,12 +340,29 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
+	changedFiles := diff.ChangedFiles
+	if changedFiles == nil {
+		// Never answer with a null file list: a caller cannot tell a null
+		// apart from "the field was omitted", and this branch is exactly
+		// where that reads as "nothing changed".
+		changedFiles = []string{}
+	}
+	fileChanges := diff.FileChanges
+	if fileChanges == nil {
+		fileChanges = []analysis.FileChange{}
+	}
+
 	if len(diff.ChangedSymbols) == 0 {
 		return s.respondJSONOrTOON(ctx, req, map[string]any{
 			"changed_symbols": []any{},
-			"changed_files":   diff.ChangedFiles,
+			"changed_files":   changedFiles,
+			"file_changes":    fileChanges,
 			"risk":            "NONE",
-			"summary":         "no indexed symbols affected by current changes",
+			// An empty symbol set has two very different causes, and calling
+			// both of them "no changes" is what makes a delete-only or
+			// docs-only change look like a clean tree.
+			"summary": detectEmptySymbolSummary(len(changedFiles)),
+			"note":    detectUnobservedNote,
 			// Echo the resolved scope so a caller can name the tree it got
 			// answered about. diffRepoScope prefers an explicit selector, then
 			// the lone tracked repo, then the session cwd — so the caller
@@ -349,7 +383,8 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 
 	detectResult := map[string]any{
 		"changed_symbols":      diff.ChangedSymbols,
-		"changed_files":        diff.ChangedFiles,
+		"changed_files":        changedFiles,
+		"file_changes":         fileChanges,
 		"risk":                 impact.Risk,
 		"summary":              impact.Summary,
 		"by_depth":             impact.ByDepth,

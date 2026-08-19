@@ -325,7 +325,7 @@ Gortex captures every large tool response into a bounded per-session ring; these
 |------|-------------|
 | `get_communities` | Functional clusters (Louvain). Without `id`: list all. With `id`: members and cohesion for one community. Members and files are clamped to the session workspace; the partition is global, so a `repo`/`project`/`scope` narrowing is widened to the workspace and the response discloses it |
 | `get_processes` | Discovered execution flows. Without `id`: list all. With `id`: step-by-step trace. Clamped to the session workspace and narrowed further by `repo`/`project`/`scope` — out-of-scope steps are excised by subtree so the surviving chain keeps its real call shape |
-| `detect_changes` | Git diff mapped to affected symbols |
+| `detect_changes` | Git diff mapped to affected symbols, plus a file-level view (`changed_files` / `file_changes` with added/modified/deleted/renamed) that stays populated for changes carrying no indexed symbol. Untracked and ignored files are not observed — every scope reads `git diff`. |
 | `index_repository` | Index or re-index a repository path |
 | `reindex_repository` | Incrementally re-index a tracked repository — whole-root, or scoped to an optional `paths` subset. Multi-repo aware |
 | `contracts` | API contracts. `action: "list"` (default): detected HTTP/gRPC/GraphQL/topics/WebSocket/env/OpenAPI. `action: "check"`: orphan providers/consumers |
