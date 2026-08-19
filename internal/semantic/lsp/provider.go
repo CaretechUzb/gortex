@@ -1229,7 +1229,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			t.edge.Meta["rebound_from"] = oldTo
 			fallbackMutations.stageReindex(view, t.edge, oldTo)
 			rmu.Unlock()
-			result.EdgesConfirmed++
+			result.EdgesRebound++
 		}
 	}
 	releaseSite()
@@ -1260,6 +1260,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				zap.String("repo_prefix", repoPrefix),
 				zap.Bool("degraded", true),
 				zap.Int("edges_confirmed", result.EdgesConfirmed),
+				zap.Int("edges_rebound", result.EdgesRebound),
 				zap.Int("did_opens", didOpens),
 				zap.Int("reopened_files", reopenedFiles),
 				zap.Int("doc_evictions", docEvictions),
@@ -1782,7 +1783,8 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	)
 
 	if targetedBreaker.isTripped() && hoverBreaker.isTripped() &&
-		result.EdgesConfirmed == 0 && result.EdgesAdded == 0 && result.NodesEnriched == 0 {
+		result.EdgesConfirmed == 0 && result.EdgesRebound == 0 &&
+		result.EdgesAdded == 0 && result.NodesEnriched == 0 {
 		result.DegradedReason = "language server answered no request for this workspace; pass abandoned by zero-yield breaker"
 	}
 
@@ -1805,6 +1807,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		p.logger.Warn("LSP enrich: pass cancelled at deadline; completed work already landed",
 			zap.String("repo_prefix", repoPrefix),
 			zap.Int("edges_confirmed", result.EdgesConfirmed),
+			zap.Int("edges_rebound", result.EdgesRebound),
 			zap.Int("edges_added", result.EdgesAdded),
 			zap.Int("nodes_enriched", result.NodesEnriched),
 			zap.Error(ctx.Err()),

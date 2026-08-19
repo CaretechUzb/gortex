@@ -1084,6 +1084,7 @@ func (idx *Indexer) runDeferredEnrich() {
 					zap.Int("confirmed", result.EdgesConfirmed),
 					zap.Int("added", result.EdgesAdded),
 					zap.Int("refuted", result.EdgesRefuted),
+					zap.Int("rebound", result.EdgesRebound),
 					zap.Float64("coverage", result.CoveragePercent),
 				)
 				if result.Partial {
@@ -1131,6 +1132,7 @@ func (idx *Indexer) runDeferredEnrich() {
 			zap.Int("confirmed", r.EdgesConfirmed),
 			zap.Int("added", r.EdgesAdded),
 			zap.Int("refuted", r.EdgesRefuted),
+			zap.Int("rebound", r.EdgesRebound),
 			zap.Float64("coverage", r.CoveragePercent),
 		)
 	}
@@ -3800,6 +3802,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						zap.Int("confirmed", r.EdgesConfirmed),
 						zap.Int("added", r.EdgesAdded),
 						zap.Int("refuted", r.EdgesRefuted),
+						zap.Int("rebound", r.EdgesRebound),
 						zap.Float64("coverage", r.CoveragePercent),
 					)
 				}
