@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/agents/copilotcli"
 	"github.com/zzet/gortex/internal/agents/opencode"
+	"github.com/zzet/gortex/internal/doctor"
 	"github.com/zzet/gortex/internal/hooks"
 	"github.com/zzet/gortex/internal/testenv"
 )
@@ -209,6 +211,202 @@ func TestDoctorRuntimeReportsInstallStateForEveryHost(t *testing.T) {
 	for _, agent := range []string{codex.Name, hooks.AgentClaudeCode, copilotcli.Name, opencode.Name} {
 		if !strings.Contains(string(blob), `"agent":"`+agent+`"`) {
 			t.Errorf("the --json report never names %s", agent)
+		}
+	}
+}
+
+// codexHomeWithHooksJSON writes a Codex home whose only Gortex hooks live in
+// hooks.json — the representation Codex supports and Gortex does not write.
+func codexHomeWithHooksJSON(t *testing.T, home, configTOML string) string {
+	t.Helper()
+	dir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hooksJSON := filepath.Join(dir, "hooks.json")
+	body := `{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "/tmp/test-gortex hook --agent=codex --mode=enrich"}]}
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "/tmp/test-gortex hook --agent=codex --mode=enrich"}]}
+    ]
+  }
+}
+`
+	if err := os.WriteFile(hooksJSON, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(configTOML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Everything else about this home is healthy, so any reinstall advice
+	// doctor produces can only be about the hooks.
+	rules := "<!-- gortex:rules:start -->\nMANDATORY: Use Gortex MCP\n<!-- gortex:rules:end -->\n"
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(rules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return hooksJSON
+}
+
+// TestDoctorCountsCodexHooksDeclaredInJSON is the reported false negative at
+// the level the user sees it: a machine whose Codex hooks are configured in
+// hooks.json was told it had none, and sent to `gortex install` — which would
+// have added a second declaration of the hooks it already had.
+func TestDoctorCountsCodexHooksDeclaredInJSON(t *testing.T) {
+	home := t.TempDir()
+	testenv.SandboxAt(t, home)
+	hooksJSON := codexHomeWithHooksJSON(t, home, "[features]\nhooks = true\n")
+
+	got := codexRuntime(t, collectRuntime(home, 7))
+
+	if got.Install.Hooks["SessionStart"] == 0 {
+		t.Errorf("SessionStart reported 0 configured while %s declares one", hooksJSON)
+	}
+	if got.Install.Hooks["UserPromptSubmit"] == 0 {
+		t.Error("UserPromptSubmit reported 0 configured while hooks.json declares one")
+	}
+	assertNoDoctorFinding(t, got, "has no Gortex lifecycle hooks configured")
+	assertNoDoctorRemedy(t, got, "gortex install")
+
+	// The counts must also say which files they came from, so a zero can
+	// never be read as "nothing anywhere".
+	var buf bytes.Buffer
+	printAgentRuntime(&buf, got, hooks.EffectivenessSummary{})
+	if !strings.Contains(buf.String(), hooksJSON) {
+		t.Errorf("the report does not name %s:\n%s", hooksJSON, buf.String())
+	}
+}
+
+// TestDoctorWarnsAboutDuplicateCodexHookDeclarations — once both files declare
+// the same hooks, Codex merges them and runs each one twice. Nothing else on
+// the machine reports that except a Codex startup warning.
+func TestDoctorWarnsAboutDuplicateCodexHookDeclarations(t *testing.T) {
+	home := t.TempDir()
+	testenv.SandboxAt(t, home)
+	env := agents.Env{
+		Root:         t.TempDir(),
+		Home:         home,
+		HookCommand:  "/tmp/test-gortex hook",
+		Mode:         agents.ModeGlobal,
+		InstallHooks: true,
+	}
+	if _, err := codex.New().Apply(env, agents.ApplyOpts{ForceDetect: true}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	// Only hooks.json is added here; config.toml keeps what Apply wrote.
+	hooksJSON := filepath.Join(home, ".codex", "hooks.json")
+	body := `{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "/tmp/test-gortex hook --agent=codex --mode=enrich"}]}]}}`
+	if err := os.WriteFile(hooksJSON, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := codexRuntime(t, collectRuntime(home, 7))
+
+	found := doctorFinding(t, got, "in both")
+	for _, want := range []string{"SessionStart", hooksJSON, filepath.Join(home, ".codex", "config.toml"), "once per declaration"} {
+		if !strings.Contains(found.Summary, want) {
+			t.Errorf("summary should name %q, got %q", want, found.Summary)
+		}
+	}
+	// SessionStart is the only event in both files; the other four live only
+	// in config.toml and are working configuration.
+	for _, untouched := range []string{"PreToolUse", "PostToolUse", "Stop", "UserPromptSubmit"} {
+		if strings.Contains(found.Summary, untouched) {
+			t.Errorf("%s is declared once, so it is not a duplicate: %q", untouched, found.Summary)
+		}
+	}
+	if !strings.Contains(found.Remedy, hooksJSON) {
+		t.Errorf("remedy must point at the file `gortex install` does not rewrite, got %q", found.Remedy)
+	}
+}
+
+// TestDoctorDoesNotCallDisjointHookFilesADuplicate is the destructive case the
+// per-file version of this finding produced: hooks split across the two files
+// with no event in common. Nothing runs twice, and a remedy phrased around the
+// files would have deleted every hook in one of them.
+func TestDoctorDoesNotCallDisjointHookFilesADuplicate(t *testing.T) {
+	home := t.TempDir()
+	testenv.SandboxAt(t, home)
+	dir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// hooks.json declares SessionStart only; config.toml declares PreToolUse only.
+	hooksJSON := filepath.Join(dir, "hooks.json")
+	body := `{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "/tmp/test-gortex hook --agent=codex --mode=enrich"}]}]}}`
+	if err := os.WriteFile(hooksJSON, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	config := "[features]\nhooks = true\n\n" +
+		"[[hooks.PreToolUse]]\nmatcher = \"Bash\"\n\n" +
+		"[[hooks.PreToolUse.hooks]]\ntype = \"command\"\n" +
+		"command = \"/tmp/test-gortex hook --agent=codex --mode=enrich\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := codexRuntime(t, collectRuntime(home, 7))
+
+	if got.Install.Hooks["SessionStart"] != 1 || got.Install.Hooks["PreToolUse"] != 1 {
+		t.Fatalf("fixture is wrong: %+v", got.Install.Hooks)
+	}
+	assertNoDoctorFinding(t, got, "in both")
+}
+
+// TestDoctorReportsCodexHooksTurnedOff — hooks that are declared and switched
+// off must not be diagnosed as untrusted; the remedy for the two is different.
+func TestDoctorReportsCodexHooksTurnedOff(t *testing.T) {
+	home := t.TempDir()
+	testenv.SandboxAt(t, home)
+	codexHomeWithHooksJSON(t, home, "[features]\nhooks = false\n")
+
+	got := codexRuntime(t, collectRuntime(home, 7))
+
+	found := doctorFinding(t, got, "hook execution is turned off")
+	if !strings.Contains(found.Remedy, "[features]") {
+		t.Errorf("remedy should name the feature switch, got %q", found.Remedy)
+	}
+	assertNoDoctorFinding(t, got, "none has run")
+}
+
+func codexRuntime(t *testing.T, runtime doctorRuntime) doctorAgentRuntime {
+	t.Helper()
+	for _, a := range runtime.Agents {
+		if a.Agent == codex.Name {
+			return a
+		}
+	}
+	t.Fatal("doctor reported nothing for codex")
+	return doctorAgentRuntime{}
+}
+
+func doctorFinding(t *testing.T, agent doctorAgentRuntime, substr string) doctor.Finding {
+	t.Helper()
+	for _, f := range agent.Findings {
+		if strings.Contains(f.Summary, substr) {
+			return f
+		}
+	}
+	t.Fatalf("no finding containing %q in %+v", substr, agent.Findings)
+	return doctor.Finding{}
+}
+
+func assertNoDoctorFinding(t *testing.T, agent doctorAgentRuntime, substr string) {
+	t.Helper()
+	for _, f := range agent.Findings {
+		if strings.Contains(f.Summary, substr) {
+			t.Fatalf("unexpected finding %q: %+v", substr, f)
+		}
+	}
+}
+
+func assertNoDoctorRemedy(t *testing.T, agent doctorAgentRuntime, remedy string) {
+	t.Helper()
+	for _, f := range agent.Findings {
+		if f.Remedy == remedy {
+			t.Fatalf("doctor recommended %q for %q", remedy, f.Summary)
 		}
 	}
 }

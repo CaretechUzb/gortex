@@ -122,8 +122,12 @@ func GlobalArtifacts(home string) []string {
 	// in config.toml nowhere else.
 	configPath := filepath.Join(home, ".codex", "config.toml")
 	state := Inspect(home)
+	// Scoped to this file on purpose. Inspect's merged Hooks count also
+	// carries entries from hooks.json, which RemoveGlobal does not touch and
+	// Gortex never wrote — counting those here would list config.toml for a
+	// deletion that would not happen.
 	if state.ConfigPresent &&
-		(state.MCPServer || configuredHookCount(state.Hooks) > 0 || codexFileContains(configPath, codexGortexToolNamespace)) {
+		(state.MCPServer || state.HookCountIn(configPath) > 0 || codexFileContains(configPath, codexGortexToolNamespace)) {
 		present = append(present, configPath)
 	}
 	if ins := GlobalInstructionsPath(home); codexFileContains(ins, agents.GlobalRulesStartMarker) {
@@ -361,14 +365,6 @@ func isShippedCodexFile(path, shipped string) bool {
 // sitting next to a skill we deleted keeps its directory alive.
 func pruneEmptyDir(dir string) {
 	_ = os.Remove(dir)
-}
-
-func configuredHookCount(hooks map[string]int) int {
-	total := 0
-	for _, n := range hooks {
-		total += n
-	}
-	return total
 }
 
 func codexFileContains(path, needle string) bool {
