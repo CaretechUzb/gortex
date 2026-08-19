@@ -24,23 +24,37 @@ import (
 // that opts in via ServerSpec.NoDidOpen gets a pass that sends no document
 // lifecycle at all.
 
-// resolveOpensDocs precedence: env override > spec opt-out > open-by-default.
+// resolveOpensDocs precedence: env override > configured value (yaml
+// `semantic.lsp_open_docs`) > spec opt-out > open-by-default.
 func TestResolveOpensDocs_Precedence(t *testing.T) {
 	optOut := &ServerSpec{Name: "x", NoDidOpen: true}
 
 	t.Setenv(OpenDocsEnv, "")
-	assert.True(t, resolveOpensDocs(nil), "no spec, no env: lifecycle stays on")
-	assert.True(t, resolveOpensDocs(&ServerSpec{Name: "x"}), "spec without opt-out: lifecycle stays on")
-	assert.False(t, resolveOpensDocs(optOut), "spec opt-out wins when env is silent")
+	assert.True(t, resolveOpensDocs("", nil), "no spec, no env, no config: lifecycle stays on")
+	assert.True(t, resolveOpensDocs("", &ServerSpec{Name: "x"}), "spec without opt-out: lifecycle stays on")
+	assert.False(t, resolveOpensDocs("", optOut), "spec opt-out wins when env and config are silent")
+
+	assert.False(t, resolveOpensDocs("off", nil), "config off skips the lifecycle")
+	assert.True(t, resolveOpensDocs("on", optOut), "config on overrides the spec opt-out")
+	assert.False(t, resolveOpensDocs("garbage", optOut), "unrecognised config falls through to the spec")
 
 	t.Setenv(OpenDocsEnv, "0")
-	assert.False(t, resolveOpensDocs(nil), "env 0 skips the lifecycle for every server")
+	assert.False(t, resolveOpensDocs("", nil), "env 0 skips the lifecycle for every server")
+	assert.False(t, resolveOpensDocs("on", nil), "env wins over config")
 
 	t.Setenv(OpenDocsEnv, "false")
-	assert.False(t, resolveOpensDocs(&ServerSpec{Name: "x"}), "env false spelling")
+	assert.False(t, resolveOpensDocs("", &ServerSpec{Name: "x"}), "env false spelling")
 
 	t.Setenv(OpenDocsEnv, "1")
-	assert.True(t, resolveOpensDocs(optOut), "env 1 is the kill switch: lifecycle forced on over the opt-out")
+	assert.True(t, resolveOpensDocs("off", optOut), "env 1 is the kill switch: lifecycle forced on over config and spec")
+}
+
+// The yaml knob must reach the provider through the router's spawn path,
+// exactly like lsp_sweep does.
+func TestRouterWithEnrichOpenDocs_PlumbsToProvider(t *testing.T) {
+	t.Setenv(OpenDocsEnv, "")
+	r := NewRouter("", zap.NewNop()).WithEnrichOpenDocs("off")
+	assert.Equal(t, "off", r.enrichOpenDocs)
 }
 
 // The spec flag must reach the provider on the FromSpec construction path —
