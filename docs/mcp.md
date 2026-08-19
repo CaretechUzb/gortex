@@ -286,6 +286,7 @@ over a very large tree, or `ask` against a slow local model.
 | `edit_symbol` | Edit a symbol's source directly by ID — no Read needed. Line-ending tolerant: an LF-authored `old_source` matches a CRLF file (and vice versa) and the replacement adopts the file's endings (`eol_normalized: true` rides on the response). Optional `base_sha` content-hash guard refuses the write when the on-disk SHA has drifted; every success carries `new_sha` so the next edit can pipeline without re-reading |
 | `edit_file` | Edit any file (markdown, config, spec, template, source) by exact string replacement — accepts absolute paths or repo-rooted paths. Line-ending tolerant: an LF-authored `old_string` matches a CRLF file (and vice versa) and the replacement is written with the file's own endings (`eol_normalized: true` rides on the response). Same `base_sha` / `new_sha` drift guard. Kills Read-before-Edit for files not in the graph |
 | `write_file` | Create or overwrite any file — atomic temp+rename, re-indexes on write. Same `base_sha` / `new_sha` drift guard |
+| `mutation_status` | What a file mutation actually did, after the fact. Reports `disk_status` (`committed` / `not_applied` / `failed` / `in_flight`) separately from `graph_status` (`fresh` / `pending` / `stale` / `failed`), selected by `receipt`, `mutation_id`, or `path`. Use it instead of retrying when an edit call was abandoned at its deadline |
 | `rename_symbol` | Coordinated multi-file rename with all references — definition, graph usages, receiver lines, and test names that embed the old identifier. Replacement is whole-identifier, so renaming `Get` leaves `GetUser` intact. Every target line is re-verified against disk and every affected file is parse-gated before anything is written, so the rename lands completely or is refused; `dry_run: true` returns the identical edit list without writing. Successful responses carry `status` (`applied` / `would_apply` / `no_edits`) plus per-file `bytes_written` / `new_sha` / `reindexed`. An existing unindexed target returns a structured `symbol_not_indexed` error only when the configured extractor anchors the requested declaration. Its `safe_fallback.request` is a guarded exact edit of that declaration line (`scope: declaration_only`); same-file and cross-file references remain explicitly unproven, and the refusal itself writes no bytes |
 | `move_symbol` | Relocate a function / method / type / variable / const to another file. Cross-package moves rewrite every qualified reference, drop the source import, add the target import, synthesise the target file if missing. Go for now |
 | `inline_symbol` | Replace every callsite of a trivial single-statement / single-expression callee with the body — refuses cleanly on defer, spawn, close-over-scope, multi-return, or side-effecting arg. `delete_after: true` removes the declaration. Go for now |
@@ -355,8 +356,37 @@ Contract details that matter for an evidence workflow:
   disk observation.
 
 Whether the graph caught up with the write is a separate question, answered by
-the `reindexed` / `reindex_pending` / `reindex_generation` fields every mutation
-already returns.
+`graph_status` (and the `reindexed` / `reindex_pending` / `reindex_generation`
+fields behind it) on every mutation response. Whether the write happened *at
+all* is a third question — see the next section.
+
+### Mutating tools and the transport deadline
+
+A tool call is bounded (`GORTEX_MCP_TOOL_TIMEOUT`, default 60s). When a handler
+outruns that budget the transport is released and the handler keeps running, so
+a write can land *after* the client was answered. The mutating tools make that
+observable instead of leaving it unknown:
+
+- **Before the disk commit**, a cancelled request is refused and nothing is
+  written. The response says `disk_status=not_applied` and retrying is safe.
+- **After the disk commit**, the abandoned-call error names what landed —
+  path, `new_sha`, and a receipt id — and carries a machine-readable
+  `mutation_commit={...}` tail. Re-applying the edit would duplicate it.
+- **Either way**, the receipt is queryable for 30 minutes with
+  `mutation_status` (facade: `change` with `operation: "receipt"`), which
+  reports the disk state and the graph-freshness state independently.
+- `edit_file` / `write_file` / `edit_symbol` accept an optional `mutation_id`
+  idempotency key. Retrying with the same key and the identical edit replays
+  the original result without writing again; reusing it for a different edit is
+  refused. `batch_edit` has the equivalent `transaction_id`.
+
+Successful edit responses carry `disk_status`, `graph_status`, and
+`mutation_receipt` alongside the existing `new_sha` / `reindexed` fields.
+
+`physical_evidence` and `disk_status` answer different questions and compose:
+the first attests *what bytes* are on disk, the second whether the write
+happened at all. A call abandoned before its response returns no evidence block
+— only the receipt — which is exactly when `disk_status` is the field you need.
 
 ## Agent-optimized (token efficiency)
 

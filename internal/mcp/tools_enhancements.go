@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/audit"
 	"github.com/zzet/gortex/internal/blame"
@@ -4069,7 +4068,8 @@ func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem, w
 	if info, statErr := os.Stat(absPath); statErr == nil {
 		perm = info.Mode().Perm()
 	}
-	if writeErr := agents.AtomicWriteFile(absPath, []byte(newContent), perm); writeErr != nil {
+	commit, writeErr := s.commitFileMutation(ctx, "batch_edit", "", "", node.FilePath, absPath, []byte(newContent), perm)
+	if writeErr != nil {
 		res.Status, res.Error = "failed", fmt.Sprintf("could not write file: %v", writeErr)
 		return res
 	}
@@ -4077,6 +4077,7 @@ func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem, w
 	sess.recordModified(node.FilePath)
 	sess.recordSymbol(edit.SymbolID)
 	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	commit.recordGraph(reindexOutcome)
 	res.Reindexed, res.ReindexPending = reindexOutcome.Reindexed, reindexOutcome.Pending
 	res.ReindexReceipt = reindexOutcome.Receipt
 	res.ReindexGeneration = reindexOutcome.Generation
@@ -4162,12 +4163,14 @@ func (s *Server) applyBatchFileEdit(ctx context.Context, edit batchEditItem, wri
 	if info, statErr := os.Stat(absPath); statErr == nil {
 		perm = info.Mode().Perm()
 	}
-	if writeErr := agents.AtomicWriteFile(absPath, []byte(newContent), perm); writeErr != nil {
+	commit, writeErr := s.commitFileMutation(ctx, "batch_edit", "", "", relPath, absPath, []byte(newContent), perm)
+	if writeErr != nil {
 		res.Status, res.Error = "failed", fmt.Sprintf("could not write file: %v", writeErr)
 		return res
 	}
 	s.sessionFor(ctx).recordModified(relPath)
 	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	commit.recordGraph(reindexOutcome)
 	res.Reindexed, res.ReindexPending = reindexOutcome.Reindexed, reindexOutcome.Pending
 	res.ReindexReceipt = reindexOutcome.Receipt
 	res.ReindexGeneration = reindexOutcome.Generation

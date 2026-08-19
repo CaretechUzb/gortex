@@ -11,13 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
-	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
@@ -758,6 +758,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if evidenceRequested && dryRun {
 		return mcp.NewToolResultError(errEvidenceDryRun), nil
 	}
+	mutationID := strings.TrimSpace(req.GetString("mutation_id", ""))
 
 	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
 	if resolveErr != nil {
@@ -768,6 +769,17 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 		return mcp.NewToolResultError("edit cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
 	defer releaseMutation()
+
+	// Replay before reading the file: a landed edit has already consumed
+	// old_string, so an un-replayed retry would fail the match check with a
+	// confusing "not found" instead of returning the original result.
+	fingerprint := mutationFingerprint("edit_file", absPath, oldString, newString, strconv.FormatBool(replaceAll))
+	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+		if conflict != "" {
+			return mcp.NewToolResultError(conflict), nil
+		}
+		return s.respondJSONOrTOON(ctx, req, replay)
+	}
 
 	content, err := os.ReadFile(absPath)
 	if err != nil {
@@ -870,14 +882,19 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if info, err := os.Stat(absPath); err == nil {
 		perm = info.Mode().Perm()
 	}
-	if err := agents.AtomicWriteFile(absPath, newContentBytes, perm); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", err)), nil
+	commit, writeErr := s.commitFileMutation(ctx, "edit_file", mutationID, fingerprint, relPath, absPath, newContentBytes, perm)
+	if writeErr != nil {
+		if errors.Is(writeErr, errMutationNotApplied) {
+			return mcp.NewToolResultError(mutationNotAppliedMessage("edit", commit, writeErr)), nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
 
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
 	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	commit.recordGraph(reindexOutcome)
 
 	resp := map[string]any{
 		"path":          relPath,
@@ -899,6 +916,10 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(resp, absPath, content, true)
 	}
+	attachMutationCommit(resp, commit)
+	// Retained last so a replayed retry returns the complete original payload,
+	// physical evidence included.
+	commit.retainResponse(resp)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
@@ -920,6 +941,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	if evidenceRequested && dryRun {
 		return mcp.NewToolResultError(errEvidenceDryRun), nil
 	}
+	mutationID := strings.TrimSpace(req.GetString("mutation_id", ""))
 
 	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
 	if resolveErr != nil {
@@ -930,6 +952,17 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		return mcp.NewToolResultError("write cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
 	defer releaseMutation()
+
+	// Idempotency runs under the path lock so a retry that races the original
+	// call waits for it and then sees a terminal record, rather than both
+	// deciding independently that they are the first.
+	fingerprint := mutationFingerprint("write_file", absPath, content)
+	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+		if conflict != "" {
+			return mcp.NewToolResultError(conflict), nil
+		}
+		return s.respondJSONOrTOON(ctx, req, replay)
+	}
 
 	status := "created"
 	perm := os.FileMode(0o644)
@@ -1012,14 +1045,19 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		return s.respondJSONOrTOON(ctx, req, preview)
 	}
 
-	if err := agents.AtomicWriteFile(absPath, contentBytes, perm); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", err)), nil
+	commit, writeErr := s.commitFileMutation(ctx, "write_file", mutationID, fingerprint, relPath, absPath, contentBytes, perm)
+	if writeErr != nil {
+		if errors.Is(writeErr, errMutationNotApplied) {
+			return mcp.NewToolResultError(mutationNotAppliedMessage("write", commit, writeErr)), nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
 
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
 	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	commit.recordGraph(reindexOutcome)
 
 	resp := map[string]any{
 		"path":          relPath,
@@ -1037,6 +1075,10 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(resp, absPath, priorContent, fileExists)
 	}
+	attachMutationCommit(resp, commit)
+	// Retained last so a replayed retry returns the complete original payload,
+	// physical evidence included.
+	commit.retainResponse(resp)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 

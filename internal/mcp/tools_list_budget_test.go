@@ -62,6 +62,10 @@ const (
 // slack. Note the blurbs are shared constants and the schema compactor
 // is not monotonic in description length — a shorter blurb measured
 // *larger* here (28551), so shrink by measuring, never by eyeballing.
+//
+// The `mutation_id` idempotency key on the same two floor tools then took
+// another 148 bytes (28527 → 28675), sharing one blurb constant for the same
+// reason. The ceiling still holds; the remaining slack is ~175 bytes.
 const agentPresetByteCeiling = 28850
 
 // localizationPresetByteCeiling is the hard budget for the diet
