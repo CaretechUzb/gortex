@@ -128,10 +128,10 @@ var ErrWorkspaceNotReady = errors.New("semantic: workspace did not become ready 
 
 // EnrichResult contains statistics from an enrichment pass.
 type EnrichResult struct {
-	Provider        string  `json:"provider"`
-	Language        string  `json:"language"`
-	EdgesConfirmed  int     `json:"edges_confirmed"`
-	EdgesRefuted    int     `json:"edges_refuted"`
+	Provider       string `json:"provider"`
+	Language       string `json:"language"`
+	EdgesConfirmed int    `json:"edges_confirmed"`
+	EdgesRefuted   int    `json:"edges_refuted"`
 	// EdgesRebound counts unconfirmed edges whose target the definition
 	// answer REWROTE to a different same-name declaration (tagged
 	// rebound_from on the edge). A rebind corrects the heuristic graph —
