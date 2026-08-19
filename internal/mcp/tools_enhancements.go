@@ -3456,6 +3456,31 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 		result["tracked_repo_paths_ok"] = true
 	}
 
+	// A tracked repo holding zero indexed files is the one failure that
+	// looks identical to success from every query: find_usages answers
+	// "no callers", analyze answers "likely unused", and nothing marks the
+	// answer as coming from an empty index (#624). Like a dead
+	// registration, it can only be seen from here.
+	if emptyRepos := s.emptyTrackedRepos(); len(emptyRepos) > 0 {
+		result["empty_repos"] = emptyRepos
+		result["repos_hold_files_ok"] = false
+		subject := "Tracked repository"
+		if len(emptyRepos) > 1 {
+			subject = "Tracked repositories"
+		}
+		msg := subject + " holding no indexed files: " + strings.Join(emptyRepos, ", ") +
+			". Every query scoped to them returns an empty answer that reads like a real one. Either the path holds no " +
+			"source Gortex can parse, or an ignore rule (.gitignore, .gortexignore, .gortex.yaml excludes) excluded all of " +
+			"it — the daemon log names the pattern. Re-index with index_repository path \".\" once it is fixed."
+		if recommendation == "" {
+			recommendation = msg
+		} else {
+			recommendation = msg + " " + recommendation
+		}
+	} else {
+		result["repos_hold_files_ok"] = true
+	}
+
 	if recommendation != "" {
 		result["recommendation"] = recommendation
 	}
@@ -3594,6 +3619,42 @@ func (s *Server) buildIndexHealthFileRollup(repoPrefixes map[string]struct{}) (f
 		}
 	}
 	return filesWithErrors, indexedFileCount
+}
+
+// emptyTrackedRepos names every tracked repository whose last index pass
+// admitted no source file at all.
+//
+// This is the failure behind #624, and it is invisible from everywhere
+// else in the payload: an ignore rule that matches every path leaves a
+// repo tracked, loaded, and answering — with an empty graph. find_usages
+// says "no callers", analyze says "likely unused", and nothing marks the
+// answer as coming from a repo that indexed nothing.
+//
+// The per-repo file count is the authoritative measure, not the graph's
+// file nodes: a repo that indexed zero files can still hold a synthetic
+// file node minted from a root manifest (go.mod, package.json,
+// pyproject.toml), which is exactly what made the pandas report read as
+// a one-file index. A repo that has never finished an index pass is
+// pending, not empty, and is skipped.
+func (s *Server) emptyTrackedRepos() []string {
+	if s.multiIndexer == nil {
+		return nil
+	}
+	var empty []string
+	for _, meta := range s.multiIndexer.AllMetadata() {
+		if meta == nil || meta.LastIndexTime.IsZero() || meta.FileCount > 0 {
+			continue
+		}
+		name := meta.RepoPrefix
+		if name == "" {
+			name = meta.RootPath
+		}
+		if name != "" {
+			empty = append(empty, name)
+		}
+	}
+	sort.Strings(empty)
+	return empty
 }
 
 // ---------------------------------------------------------------------------
