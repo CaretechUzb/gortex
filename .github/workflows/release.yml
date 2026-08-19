@@ -457,6 +457,28 @@ jobs:
             generate_completions_from_executable "gortex",
               shell_parameter_format: :cobra
 
+            # A running daemon holds the previous binary's image and the
+            # store lock across an upgrade; stop it first (only when one
+            # is actually answering) and restart onto the new binary after
+            # install. Fresh installs and CI never launch a daemon — the
+            # marker file records "was running" between the two hooks.
+            pre_install do
+              bin = File.join(HOMEBREW_PREFIX, "bin", "gortex")
+              next unless File.executable?(bin)
+              status = system_command(bin, args: ["daemon", "status"])
+              next unless status.success?
+              File.write(File.join(Dir.tmpdir, "gortex-cask-daemon-was-running"), "1")
+              system_command(bin, args: ["daemon", "stop"])
+            end
+            post_install do
+              marker = File.join(Dir.tmpdir, "gortex-cask-daemon-was-running")
+              if File.exist?(marker)
+                File.delete(marker)
+                system_command(File.join(HOMEBREW_PREFIX, "bin", "gortex"),
+                               args: ["daemon", "restart"])
+              end
+            end
+
             # No zap stanza required
           end
           EOF
