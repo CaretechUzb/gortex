@@ -357,9 +357,13 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 // mutating this shared extractor. Configured Temporal helpers extend the
 // built-in helper set for this extraction only.
 func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parser.ExtractionOptions) (*parser.ExtractionResult, error) {
+	// Keys are lower-cased so a repo-local helper name matches its call site
+	// the same case-insensitive way a built-in goEnvHelperNames entry does.
+	// Without this, `env_helpers: [getCorpValue]` silently fails to promote a
+	// `GetCorpValue(...)` dispatch — see goEnvHelperDefaultLiteral.
 	envHelperExtra := make(map[string]bool)
 	for _, name := range opts.TemporalEnvHelpers() {
-		envHelperExtra[name] = true
+		envHelperExtra[strings.ToLower(name)] = true
 	}
 	tree, err := parser.ParseFile(src, e.lang)
 	if err != nil {
