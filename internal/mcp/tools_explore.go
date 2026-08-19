@@ -2949,6 +2949,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			protectedSyntacticAnchors, protectedImplementationID,
 		)
 	}
+	if localize {
+		// Presentation ordering for the localization page only, applied after the
+		// final window is fixed so membership cannot change: each file's own slots
+		// are permuted, cross-file rank is untouched, and every member remains
+		// searchable and readable through every other lane.
+		cands = demoteLocalizationFileMembers(cands)
+	}
 	protectedFinalCandidateIDs := exploreFinalReservedCandidateIDs(
 		cands, protectedSyntacticAnchors, protectedImplementationID,
 	)
@@ -4951,6 +4958,106 @@ func diversifyRepeatedExploreNames(cands []*rerank.Candidate, class rerank.Query
 		head = append(head, cand)
 	}
 	return append(head, duplicates...)
+}
+
+// Localization member tiers order one file's own candidate slots. Extracted
+// members inherit their owner type's name terms and win callable tie-breaks, so
+// without an explicit tier they seat above the sibling declaration a task is
+// actually about.
+const (
+	localizationMemberTierBehavioral = iota
+	localizationMemberTierConstructor
+	localizationMemberTierData
+	localizationMemberTierCount
+)
+
+// exploreConstructorSpelledName reports the cross-language spellings of a
+// declaration named by its keyword rather than by intent: `<Type>.<init>`
+// (Java, C#, Swift) and Swift's bare `deinit` / `subscript`. The comparison is
+// on the bare name after the last dot, so both the qualified and the bare
+// spelling classify identically.
+func exploreConstructorSpelledName(name string) bool {
+	bare := name
+	if dot := strings.LastIndexByte(bare, '.'); dot >= 0 {
+		bare = bare[dot+1:]
+	}
+	switch bare {
+	case "<init>", "deinit", "subscript":
+		return true
+	}
+	return false
+}
+
+// localizationMemberTier classifies one candidate for per-file ordering. Kinds
+// outside the classification stay in the leading tier so ranking they already
+// earned is preserved; types lead alongside ordinary callables because a type
+// declaration is the owner a task names, not a member of one.
+func localizationMemberTier(n *graph.Node) int {
+	switch n.Kind {
+	case graph.KindFunction, graph.KindMethod:
+		if exploreConstructorSpelledName(n.Name) {
+			return localizationMemberTierConstructor
+		}
+		return localizationMemberTierBehavioral
+	case graph.KindField, graph.KindEnumMember:
+		return localizationMemberTierData
+	default:
+		return localizationMemberTierBehavioral
+	}
+}
+
+// demoteLocalizationFileMembers reorders localization candidates inside the
+// index positions each file already occupies. Nothing is dropped, added, or
+// moved across files: a file's tiered candidates are written back into that
+// file's own slots in slot order, so the window keeps the same members at the
+// same count and every upstream reservation — including the typed-anchor
+// projection's field — survives. Relative order inside a tier is preserved, so
+// the reorder is stable and idempotent. Candidates without a node or a file
+// path cannot be attributed to a file and keep their position.
+func demoteLocalizationFileMembers(cands []*rerank.Candidate) []*rerank.Candidate {
+	if len(cands) < 2 {
+		return cands
+	}
+	slots := make(map[string][]int, len(cands))
+	files := make([]string, 0, len(cands))
+	demotable := false
+	for i, cand := range cands {
+		if cand == nil || cand.Node == nil || cand.Node.FilePath == "" {
+			continue
+		}
+		key := cand.Node.RepoPrefix + "\x00" + cand.Node.FilePath
+		if _, ok := slots[key]; !ok {
+			files = append(files, key)
+		}
+		slots[key] = append(slots[key], i)
+		if localizationMemberTier(cand.Node) != localizationMemberTierBehavioral {
+			demotable = true
+		}
+	}
+	if !demotable {
+		return cands
+	}
+	out := append([]*rerank.Candidate(nil), cands...)
+	for _, key := range files {
+		positions := slots[key]
+		if len(positions) < 2 {
+			continue
+		}
+		var tiers [localizationMemberTierCount][]*rerank.Candidate
+		for _, position := range positions {
+			cand := cands[position]
+			tier := localizationMemberTier(cand.Node)
+			tiers[tier] = append(tiers[tier], cand)
+		}
+		written := 0
+		for _, tier := range tiers {
+			for _, cand := range tier {
+				out[positions[written]] = cand
+				written++
+			}
+		}
+	}
+	return out
 }
 
 // exploreLocalizableKind reports whether a node kind is a place a
