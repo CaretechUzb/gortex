@@ -330,21 +330,6 @@ func enrichNodeHasUnresolvedDemandFromView(view *lspGraphView, n *graph.Node) bo
 	return view.hasUnresolvedDemand(n)
 }
 
-// enrichNodeIsDispatchRelevant reports whether a declaration's super/subtype
-// hierarchy the per-file sweep must interrogate: a type or interface whose
-// extends / supertype / subtype edges the AST extractor commonly misses (they
-// are cross-file or resolved dynamically). Such declarations never contribute
-// unresolved-call demand — enrichNodeHasUnresolvedDemand only counts callables —
-// so a file whose only enrichable work is a type hierarchy would score zero
-// demand and be skipped under the demand default. Marking it dispatch-relevant
-// keeps that file in the sweep so its hierarchy edges are still recovered.
-func enrichNodeIsDispatchRelevant(n *graph.Node) bool {
-	if n == nil {
-		return false
-	}
-	return n.Kind == graph.KindType || n.Kind == graph.KindInterface
-}
-
 // enrichCallableIsDispatchRelevant reports whether a function or method takes
 // part in dynamic dispatch, so its incoming callers name concrete targets the
 // outgoing side of the sweep cannot reach. Every intra-repo static call is
@@ -381,6 +366,17 @@ func enrichCallableIsDispatchRelevant(g graph.Store, n *graph.Node) bool {
 
 func enrichCallableIsDispatchRelevantFromView(view *lspGraphView, n *graph.Node) bool {
 	return view.callableIsDispatchRelevant(n)
+}
+
+// enrichTypeIsDispatchRelevantFromView is the type half of the per-file sweep
+// gate: an interface, or a class involved in a super/subtype hierarchy — see
+// lspGraphView.typeIsDispatchRelevant. Such declarations never contribute
+// unresolved-call demand (demand only counts callables), so a file whose only
+// enrichable work is a type hierarchy would score zero demand and be skipped
+// under the demand default; this signal keeps exactly those files in while a
+// bare data type no longer admits its whole file.
+func enrichTypeIsDispatchRelevantFromView(view *lspGraphView, n *graph.Node) bool {
+	return view.typeIsDispatchRelevant(n)
 }
 
 // nodeHasSemanticType reports whether a node already carries a non-empty
@@ -1382,9 +1378,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// goroutine starts staging new hierarchy edges into that projection.
 	nodeDemand := make(map[string]bool, len(langNodes))
 	nodeDispatch := make(map[string]bool, len(langNodes))
+	nodeTypeDispatch := make(map[string]bool, len(langNodes))
 	for _, n := range langNodes {
 		nodeDemand[n.ID] = enrichNodeHasUnresolvedDemandFromView(view, n)
 		nodeDispatch[n.ID] = enrichCallableIsDispatchRelevantFromView(view, n)
+		nodeTypeDispatch[n.ID] = enrichTypeIsDispatchRelevantFromView(view, n)
 	}
 
 	// Group enrichment targets by file so each file's open/close lifecycle
@@ -1394,7 +1392,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		rel      string
 		nodes    []*graph.Node
 		demand   int  // declarations still carrying unresolved same-name candidates
-		dispatch bool // carries a type / interface whose hierarchy the sweep interrogates
+		dispatch bool // carries a dispatch-relevant callable, or a type involved in a hierarchy
 	}
 	var fileList []*fileTargets
 	fileIndex := map[string]*fileTargets{}
@@ -1413,7 +1411,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if nodeDemand[n.ID] {
 			ft.demand++
 		}
-		if enrichNodeIsDispatchRelevant(n) {
+		if nodeDispatch[n.ID] || nodeTypeDispatch[n.ID] {
 			ft.dispatch = true
 		}
 	}
