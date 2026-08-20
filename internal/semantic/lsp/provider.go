@@ -1103,9 +1103,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// so each file is opened once (per-goroutine, via enrichOpenDoc) and
 	// serves every target sharing it — turning the ~7 edges/s sequential
 	// round-trip loop into maxParallel-wide throughput. The definition-rebind
-	// fallback opens arbitrary call-site files, so it runs serially afterward
-	// over the targets the sweep left unconfirmed, keeping document open/close
-	// from overlapping across goroutines.
+	// fallback that follows fans out the same way over the targets the sweep
+	// left unconfirmed, grouped by call-site file — each site file is owned
+	// by exactly one goroutine, so document open/close never overlaps on the
+	// same document.
 	confirmGroups := p.groupConfirmTargets(view.nodesByID, targets, degradedSkipFile)
 	var confirmMu sync.Mutex
 	confirmPromotions := make(map[*graph.Edge]struct{})
