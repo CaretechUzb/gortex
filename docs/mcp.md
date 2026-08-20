@@ -161,6 +161,8 @@ A spec whose first token isn't a known preset (`search_symbols,find_files,…`) 
 
 **Prompt-injection screening.** Every tool call is screened by middleware that scans arguments and result text for injection patterns. On a hit it attaches a non-blocking `_meta.gortex_security` advisory — the call still succeeds and the result body is never mutated. Disable with `GORTEX_MCP_SANITIZE=0`.
 
+**Unknown-option guard.** Tools published with a closed schema (`additionalProperties: false`) enforce it at dispatch. By default an unknown option still executes the call and the result carries an `_ignored_options` rider naming the unknown keys and the valid ones — the self-correct signal for a mistyped or hallucinated option (#597). `GORTEX_TOOL_ARG_GUARD=reject` upgrades that to a refusal before the handler runs; `GORTEX_TOOL_ARG_GUARD=0` / `false` / `off` / `no` disables enforcement. Response-shaping keys generic layers honor on any tool (`format`, `fields`, `max_bytes`, `max_tokens`, `cursor`) are always accepted, and facade tools are exempt — their compatibility wrappers deliberately take legacy call shapes.
+
 ## Core navigation
 
 | Tool | Description |
