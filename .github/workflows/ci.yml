@@ -72,6 +72,18 @@ jobs:
       - name: Test sidecar handle release
         run: go test -timeout=5m -count=1 -run TestCloseSidecar ./internal/persistence
 
+      # Same asymmetry, different holder: the plan-lock fixture opens an
+      # on-disk Store, so a missing Close pins plan_lock.sqlite and fails
+      # its t.TempDir() cleanup here while passing everywhere else. Every
+      # assertion in these tests is platform-neutral — only the cleanup
+      # distinguishes the runners — so nothing but this step can protect
+      # the fixture's Close from being dropped again.
+      - name: Test plan-lock fixture handle release
+        run: >
+          go test -timeout=10m -count=1
+          -run 'PlanLock|PlansLocked|PlansNeverScan'
+          ./internal/graph/store_sqlite
+
       # os.UserHomeDir reads %USERPROFILE% here and $HOME everywhere else, so
       # a test that isolates itself with HOME alone keeps resolving the real
       # profile on Windows — and writes to it. That is invisible to the
