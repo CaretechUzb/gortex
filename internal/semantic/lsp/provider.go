@@ -517,7 +517,14 @@ func edgeExistsAt(view *lspGraphView, from, to string, kind graph.EdgeKind, line
 // from disk by the caller (via the shared document session). A nil content
 // yields a no-verdict, matching the pre-session behaviour when the site
 // file could not be opened.
-func (p *Provider) definitionNodeAtSite(view *lspGraphView, repoPrefix, absRoot, siteRel string, siteLine int, name string, content []byte, cache map[string]*graph.Node) (*graph.Node, bool) {
+//
+// breaker (nilable) observes each definition round trip: under the heavy
+// opt-out this pass carries the whole confirm load, so a server that
+// errors every request must trip the failure streak instead of grinding
+// through every sited target at one timeout each. Only transport results
+// feed it — a cache hit or an identifier miss never reaches the server,
+// and an answered-but-empty response counts as success.
+func (p *Provider) definitionNodeAtSite(view *lspGraphView, repoPrefix, absRoot, siteRel string, siteLine int, name string, content []byte, breaker *phaseBreaker, cache map[string]*graph.Node) (*graph.Node, bool) {
 	if siteRel == "" || siteLine <= 0 || name == "" {
 		return nil, false
 	}
@@ -532,6 +539,9 @@ func (p *Provider) definitionNodeAtSite(view *lspGraphView, repoPrefix, absRoot,
 		return nil, false
 	}
 	locs, err := p.FindDefinition(absRoot, siteRel, siteLine-1, col, lspCallTimeout())
+	if breaker != nil {
+		breaker.observe(err == nil)
+	}
 	if err != nil || len(locs) == 0 {
 		return nil, false
 	}
@@ -1287,7 +1297,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					if toNode == nil {
 						continue
 					}
-					cand, ok := p.definitionNodeAtSite(view, repoPrefix, absRoot, grp.rel, t.edge.Line, toNode.Name, content, cache)
+					cand, ok := p.definitionNodeAtSite(view, repoPrefix, absRoot, grp.rel, t.edge.Line, toNode.Name, content, targetedBreaker, cache)
 					// The verdict switch reads the view's edge indexes
 					// (edgeExistsAt, the dispatch-member helpers) that the
 					// staged mutations also update, so the whole switch —
