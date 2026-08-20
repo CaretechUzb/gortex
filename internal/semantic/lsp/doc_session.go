@@ -27,7 +27,9 @@ type docSession struct {
 	// opensDocs resolved off — see ServerSpec.NoDidOpen) the session keeps
 	// its entry / LRU machinery purely as a bounded content cache: acquire
 	// still reads and caches file bytes, but no didOpen / didClose is ever
-	// sent, and the open-lifecycle telemetry honestly reports zero.
+	// sent, and the open-lifecycle telemetry (didOpens, curOpen, peakOpen)
+	// honestly reports zero. Evictions still count — they track the cache
+	// churn either way.
 	sendOpens bool
 
 	mu        sync.Mutex
@@ -122,10 +124,13 @@ func (s *docSession) acquire(c *Client, absPath string) ([]byte, func(), error) 
 		evPath := front.Value.(string)
 		cd.lru.Remove(front)
 		delete(cd.open, evPath)
+		// Evictions count the cache churn, not the didClose traffic — a
+		// lifecycle-off session evicts entries all the same and hiding that
+		// would blind the content-cache telemetry.
+		s.evictions++
 		if s.sendOpens {
 			_ = s.p.enrichCloseDoc(c, evPath)
 			s.curOpen--
-			s.evictions++
 		}
 	}
 
