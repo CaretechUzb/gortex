@@ -183,7 +183,11 @@ func doctorAgentProbes(home string) []agentProbe {
 					MCPServer: state.MCPServer, Hooks: state.Hooks,
 					InstructionsPath: state.InstructionsPath, InstructionsWired: state.InstructionsWired,
 				},
-				adoption: doctor.ScanClaudeSessions(doctor.ClaudeHome(), since, 10),
+				// Deny-posture installs never expect PostToolUse context
+				// injections (its matcher only watches Gortex tools); the
+				// flag keeps Diagnose from warning on that steady state.
+				postToolUseDeny: state.PostToolUseDenyPosture,
+				adoption:        doctor.ScanClaudeSessions(doctor.ClaudeHome(), since, 10),
 			}, activity, now)
 		}},
 		{agent: copilotcli.Name, run: func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
@@ -287,6 +291,7 @@ type agentRuntimeInput struct {
 	agent               string
 	hookEvents          []string
 	install             doctorAgentInstall
+	postToolUseDeny     bool
 	requiresTrust       bool
 	trustRemedy         string
 	hooksDisabledRemedy string
@@ -311,13 +316,14 @@ func buildAgentRuntime(in agentRuntimeInput, activity hooks.EffectivenessSummary
 	}
 	duplicateEvents, duplicateFiles := duplicateHookDeclarations(in.install.HookSources)
 	out.Findings = doctor.Diagnose(doctor.AgentHooks{
-		Agent:               in.agent,
-		Configured:          in.install.Hooks,
-		RequiresTrust:       in.requiresTrust,
-		TrustRemedy:         in.trustRemedy,
-		HooksDisabled:       in.install.HooksDisabled,
-		HooksDisabledRemedy: in.hooksDisabledRemedy,
-		DuplicateHookEvents: duplicateEvents,
+		Agent:                  in.agent,
+		Configured:             in.install.Hooks,
+		PostToolUseDenyPosture: in.postToolUseDeny,
+		RequiresTrust:          in.requiresTrust,
+		TrustRemedy:            in.trustRemedy,
+		HooksDisabled:          in.install.HooksDisabled,
+		HooksDisabledRemedy:    in.hooksDisabledRemedy,
+		DuplicateHookEvents:    duplicateEvents,
 		// ConfigPath is the file the adapter's installer rewrites, so it is
 		// the one a duplicate must NOT be cleaned out of.
 		DuplicateHookSources: duplicateFiles,
