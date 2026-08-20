@@ -57,13 +57,27 @@ type doctorAgentRuntime struct {
 // doctorAgentInstall is the shape both adapters' Inspect calls lower into, so
 // the renderer does not branch per agent.
 type doctorAgentInstall struct {
-	ConfigPath        string         `json:"config_path"`
-	ConfigPresent     bool           `json:"config_present"`
-	MCPServer         bool           `json:"mcp_server"`
-	Hooks             map[string]int `json:"hooks"`
-	InstructionsPath  string         `json:"instructions_path,omitempty"`
-	InstructionsWired bool           `json:"instructions_wired"`
-	ShadowedBy        string         `json:"shadowed_by,omitempty"`
+	ConfigPath    string         `json:"config_path"`
+	ConfigPresent bool           `json:"config_present"`
+	MCPServer     bool           `json:"mcp_server"`
+	Hooks         map[string]int `json:"hooks"`
+	// HookSources is the per-file breakdown behind Hooks. An agent that reads
+	// hooks from more than one file needs it: the merged count alone cannot
+	// say which file a hook came from, nor that two of them declare the same
+	// hook twice.
+	HookSources []doctorHookSource `json:"hook_sources,omitempty"`
+	// HooksDisabled marks a config that switches hook execution off.
+	HooksDisabled     bool   `json:"hooks_disabled,omitempty"`
+	InstructionsPath  string `json:"instructions_path,omitempty"`
+	InstructionsWired bool   `json:"instructions_wired"`
+	ShadowedBy        string `json:"shadowed_by,omitempty"`
+}
+
+// doctorHookSource is one file an agent reads hook declarations from.
+type doctorHookSource struct {
+	Path  string         `json:"path"`
+	Hooks map[string]int `json:"hooks,omitempty"`
+	Total int            `json:"total"`
 }
 
 type doctorSavings struct {
@@ -147,14 +161,16 @@ func doctorAgentProbes(home string) []agentProbe {
 				install: doctorAgentInstall{
 					ConfigPath: state.ConfigPath, ConfigPresent: state.ConfigPresent,
 					MCPServer: state.MCPServer, Hooks: state.Hooks,
+					HookSources: codexHookSources(state), HooksDisabled: state.HooksDisabled,
 					InstructionsPath: state.InstructionsPath, InstructionsWired: state.InstructionsWired,
 					ShadowedBy: state.ShadowedBy,
 				},
 				// Codex is the one harness that gates hook execution on an
 				// explicit per-hook approval.
-				requiresTrust: true,
-				trustRemedy:   codex.TrustRemedy,
-				adoption:      doctor.ScanCodexSessions(doctor.CodexHome(), since, 10),
+				requiresTrust:       true,
+				trustRemedy:         codex.TrustRemedy,
+				hooksDisabledRemedy: codex.HooksDisabledRemedy,
+				adoption:            doctor.ScanCodexSessions(doctor.CodexHome(), since, 10),
 			}, activity, now)
 		}},
 		{agent: hooks.AgentClaudeCode, run: func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
@@ -167,7 +183,11 @@ func doctorAgentProbes(home string) []agentProbe {
 					MCPServer: state.MCPServer, Hooks: state.Hooks,
 					InstructionsPath: state.InstructionsPath, InstructionsWired: state.InstructionsWired,
 				},
-				adoption: doctor.ScanClaudeSessions(doctor.ClaudeHome(), since, 10),
+				// Deny-posture installs never expect PostToolUse context
+				// injections (its matcher only watches Gortex tools); the
+				// flag keeps Diagnose from warning on that steady state.
+				postToolUseDeny: state.PostToolUseDenyPosture,
+				adoption:        doctor.ScanClaudeSessions(doctor.ClaudeHome(), since, 10),
 			}, activity, now)
 		}},
 		{agent: copilotcli.Name, run: func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
@@ -224,13 +244,58 @@ func doctorAgentProbes(home string) []agentProbe {
 	}
 }
 
+// codexHookSources lowers the adapter's per-file hook breakdown into the
+// renderer's shape.
+func codexHookSources(state codex.InstallState) []doctorHookSource {
+	out := make([]doctorHookSource, 0, len(state.HookSources))
+	for _, src := range state.HookSources {
+		out = append(out, doctorHookSource{Path: src.Path, Hooks: src.Hooks, Total: src.Total})
+	}
+	return out
+}
+
+// duplicateHookDeclarations reports the lifecycle events declared in more than
+// one hook file, and the files that declare them.
+//
+// The unit is the event, not the file. Two files each carrying Gortex hooks is
+// a valid split as long as they declare different events — only an event
+// present in both is merged into two runs. Answering this per file instead
+// would flag that split and send the user to delete working hooks.
+func duplicateHookDeclarations(sources []doctorHookSource) (events, files []string) {
+	perEvent := map[string]int{}
+	for _, src := range sources {
+		for event, n := range src.Hooks {
+			if n > 0 {
+				perEvent[event]++
+			}
+		}
+	}
+	for event, declaringFiles := range perEvent {
+		if declaringFiles > 1 {
+			events = append(events, event)
+		}
+	}
+	if len(events) == 0 {
+		return nil, nil
+	}
+	sort.Strings(events)
+	for _, src := range sources {
+		if src.Total > 0 {
+			files = append(files, src.Path)
+		}
+	}
+	return events, files
+}
+
 type agentRuntimeInput struct {
-	agent         string
-	hookEvents    []string
-	install       doctorAgentInstall
-	requiresTrust bool
-	trustRemedy   string
-	adoption      doctor.Adoption
+	agent               string
+	hookEvents          []string
+	install             doctorAgentInstall
+	postToolUseDeny     bool
+	requiresTrust       bool
+	trustRemedy         string
+	hooksDisabledRemedy string
+	adoption            doctor.Adoption
 }
 
 func buildAgentRuntime(in agentRuntimeInput, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
@@ -238,6 +303,9 @@ func buildAgentRuntime(in agentRuntimeInput, activity hooks.EffectivenessSummary
 		in.install.ConfigPath = doctorPath(in.install.ConfigPath)
 		in.install.InstructionsPath = doctorPath(in.install.InstructionsPath)
 		in.install.ShadowedBy = doctorPath(in.install.ShadowedBy)
+		for i := range in.install.HookSources {
+			in.install.HookSources[i].Path = doctorPath(in.install.HookSources[i].Path)
+		}
 	}
 	out := doctorAgentRuntime{
 		Agent:      in.agent,
@@ -246,11 +314,20 @@ func buildAgentRuntime(in agentRuntimeInput, activity hooks.EffectivenessSummary
 		Activity:   activity.ForAgent(in.agent),
 		Adoption:   in.adoption,
 	}
+	duplicateEvents, duplicateFiles := duplicateHookDeclarations(in.install.HookSources)
 	out.Findings = doctor.Diagnose(doctor.AgentHooks{
-		Agent:                in.agent,
-		Configured:           in.install.Hooks,
-		RequiresTrust:        in.requiresTrust,
-		TrustRemedy:          in.trustRemedy,
+		Agent:                  in.agent,
+		Configured:             in.install.Hooks,
+		PostToolUseDenyPosture: in.postToolUseDeny,
+		RequiresTrust:          in.requiresTrust,
+		TrustRemedy:            in.trustRemedy,
+		HooksDisabled:          in.install.HooksDisabled,
+		HooksDisabledRemedy:    in.hooksDisabledRemedy,
+		DuplicateHookEvents:    duplicateEvents,
+		// ConfigPath is the file the adapter's installer rewrites, so it is
+		// the one a duplicate must NOT be cleaned out of.
+		DuplicateHookSources: duplicateFiles,
+		ManagedHookFile:      in.install.ConfigPath,
 		InstructionsPath:     in.install.InstructionsPath,
 		InstructionsWired:    in.install.InstructionsWired,
 		InstructionsShadowed: in.install.ShadowedBy,
@@ -376,6 +453,19 @@ func printAgentRuntime(w io.Writer, a doctorAgentRuntime, summary hooks.Effectiv
 		for _, event := range a.HookEvents {
 			fmt.Fprintf(w, "    %s hook %-17s %d configured\n", mark(a.Install.Hooks[event] > 0), event, a.Install.Hooks[event])
 		}
+	}
+	// Naming the files the counts came from is what bounds them. Without it a
+	// zero reads as "nothing is configured anywhere" when it can only ever
+	// mean "nothing in the files listed here".
+	if len(a.Install.HookSources) > 0 {
+		parts := make([]string, 0, len(a.Install.HookSources))
+		for _, src := range a.Install.HookSources {
+			parts = append(parts, fmt.Sprintf("%s (%d)", src.Path, src.Total))
+		}
+		fmt.Fprintf(w, "      counted in %s\n", joinComma(parts))
+	}
+	if a.Install.HooksDisabled {
+		fmt.Fprintf(w, "    %s hook execution is turned off in %s\n", glyphWarn, a.Install.ConfigPath)
 	}
 	if a.Install.InstructionsPath != "" {
 		fmt.Fprintf(w, "    %s rule block in %s\n", mark(a.Install.InstructionsWired), a.Install.InstructionsPath)

@@ -11,13 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
-	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
@@ -751,6 +751,14 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	replaceAll := req.GetBool("replace_all", false)
 	dryRun := req.GetBool("dry_run", false)
 	baseSHA := normalizeExpectedSHA(req.GetString("base_sha", ""))
+	evidenceRequested, evidenceErr := parsePhysicalEvidenceRequest(req)
+	if evidenceErr != nil {
+		return mcp.NewToolResultError(evidenceErr.Error()), nil
+	}
+	if evidenceRequested && dryRun {
+		return mcp.NewToolResultError(errEvidenceDryRun), nil
+	}
+	mutationID := strings.TrimSpace(req.GetString("mutation_id", ""))
 
 	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
 	if resolveErr != nil {
@@ -762,6 +770,17 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 	defer releaseMutation()
 
+	// Replay before reading the file: a landed edit has already consumed
+	// old_string, so an un-replayed retry would fail the match check with a
+	// confusing "not found" instead of returning the original result.
+	fingerprint := mutationFingerprint("edit_file", absPath, oldString, newString, strconv.FormatBool(replaceAll))
+	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+		if conflict != "" {
+			return mcp.NewToolResultError(conflict), nil
+		}
+		return s.respondJSONOrTOON(ctx, req, replay)
+	}
+
 	content, err := os.ReadFile(absPath)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("could not read file: %v", err)), nil
@@ -771,6 +790,13 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	// overlay-push error shape so callers can re-read and retry.
 	if baseSHA != "" && gitBlobSHA(content) != baseSHA {
 		return mcp.NewToolResultError(errBaseSHADrift), nil
+	}
+	// Before anything is written, so a withheld receipt never leaves a
+	// half-applied edit behind.
+	if evidenceRequested {
+		if err := s.guardMutationEvidenceIntent(s.detectLanguageForPath(ctx, absPath, relPath), relPath, content); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 	}
 	fileStr := string(content)
 
@@ -856,14 +882,19 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if info, err := os.Stat(absPath); err == nil {
 		perm = info.Mode().Perm()
 	}
-	if err := agents.AtomicWriteFile(absPath, newContentBytes, perm); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", err)), nil
+	commit, writeErr := s.commitFileMutation(ctx, "edit_file", mutationID, fingerprint, relPath, absPath, newContentBytes, perm)
+	if writeErr != nil {
+		if errors.Is(writeErr, errMutationNotApplied) {
+			return mcp.NewToolResultError(mutationNotAppliedMessage("edit", commit, writeErr)), nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
 
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
 	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	commit.recordGraph(reindexOutcome)
 
 	resp := map[string]any{
 		"path":          relPath,
@@ -882,6 +913,13 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
+	if evidenceRequested {
+		s.attachMutationPhysicalEvidence(resp, absPath, content, true)
+	}
+	attachMutationCommit(resp, commit)
+	// Retained last so a replayed retry returns the complete original payload,
+	// physical evidence included.
+	commit.retainResponse(resp)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
@@ -896,6 +934,14 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	}
 	dryRun := req.GetBool("dry_run", false)
 	baseSHA := normalizeExpectedSHA(req.GetString("base_sha", ""))
+	evidenceRequested, evidenceErr := parsePhysicalEvidenceRequest(req)
+	if evidenceErr != nil {
+		return mcp.NewToolResultError(evidenceErr.Error()), nil
+	}
+	if evidenceRequested && dryRun {
+		return mcp.NewToolResultError(errEvidenceDryRun), nil
+	}
+	mutationID := strings.TrimSpace(req.GetString("mutation_id", ""))
 
 	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
 	if resolveErr != nil {
@@ -906,6 +952,17 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		return mcp.NewToolResultError("write cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
 	defer releaseMutation()
+
+	// Idempotency runs under the path lock so a retry that races the original
+	// call waits for it and then sees a terminal record, rather than both
+	// deciding independently that they are the first.
+	fingerprint := mutationFingerprint("write_file", absPath, content)
+	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+		if conflict != "" {
+			return mcp.NewToolResultError(conflict), nil
+		}
+		return s.respondJSONOrTOON(ctx, req, replay)
+	}
 
 	status := "created"
 	perm := os.FileMode(0o644)
@@ -939,13 +996,23 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	contentBytes := []byte(content)
 	newSHA := gitBlobSHA(contentBytes)
 
+	// Read the prior bytes once: the parse gate compares against them, and an
+	// evidence receipt digests them as before_sha256.
+	var priorContent []byte
+	if fileExists {
+		priorContent, _ = os.ReadFile(absPath)
+	}
+	// Before anything is written, so a withheld receipt never leaves an
+	// overwritten file behind.
+	if evidenceRequested && fileExists {
+		if err := s.guardMutationEvidenceIntent(s.detectLanguageForPath(ctx, absPath, relPath), relPath, priorContent); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+	}
+
 	allowParseErrors := req.GetBool("allow_parse_errors", false)
 	var gate parseGateResult
 	if parseGateEnabled() {
-		var priorContent []byte
-		if fileExists {
-			priorContent, _ = os.ReadFile(absPath)
-		}
 		gate = checkParseGate(relPath, priorContent, contentBytes)
 		if gate.Blocked && !allowParseErrors && !dryRun {
 			return mcp.NewToolResultError(parseGateError(relPath, gate)), nil
@@ -978,14 +1045,19 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		return s.respondJSONOrTOON(ctx, req, preview)
 	}
 
-	if err := agents.AtomicWriteFile(absPath, contentBytes, perm); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", err)), nil
+	commit, writeErr := s.commitFileMutation(ctx, "write_file", mutationID, fingerprint, relPath, absPath, contentBytes, perm)
+	if writeErr != nil {
+		if errors.Is(writeErr, errMutationNotApplied) {
+			return mcp.NewToolResultError(mutationNotAppliedMessage("write", commit, writeErr)), nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
 
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
 	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	commit.recordGraph(reindexOutcome)
 
 	resp := map[string]any{
 		"path":          relPath,
@@ -1000,6 +1072,13 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
+	if evidenceRequested {
+		s.attachMutationPhysicalEvidence(resp, absPath, priorContent, fileExists)
+	}
+	attachMutationCommit(resp, commit)
+	// Retained last so a replayed retry returns the complete original payload,
+	// physical evidence included.
+	commit.retainResponse(resp)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
@@ -1262,18 +1341,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
 	}
 
-	physicalEvidenceRequested := req.GetBool("physical_evidence", false)
-	digest := strings.ToLower(strings.TrimSpace(req.GetString("digest", "")))
-	if digest != "" && !physicalEvidenceRequested {
-		return mcp.NewToolResultError("digest requires physical_evidence=true"), nil
-	}
-	if physicalEvidenceRequested {
-		if digest == "" {
-			digest = "sha256"
-		}
-		if digest != "sha256" {
-			return mcp.NewToolResultError(fmt.Sprintf("unsupported physical evidence digest %q; only sha256 is supported", digest)), nil
-		}
+	physicalEvidenceRequested, evidenceErr := parsePhysicalEvidenceRequest(req)
+	if evidenceErr != nil {
+		return mcp.NewToolResultError(evidenceErr.Error()), nil
 	}
 
 	var diskContent []byte

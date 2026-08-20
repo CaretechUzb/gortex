@@ -53,7 +53,20 @@ const (
 // follow-up reader). Measured cost after the addition: 27883 bytes —
 // the ceiling keeps ~300 bytes of slack, so any further description
 // creep still fails loudly.
-const agentPresetByteCeiling = 28200
+//
+// Re-based 28200 → 28850 when edit_file and write_file gained the
+// physical_evidence / digest receipt options (the mutation half of the
+// disk-verified SHA-256 contract read_file already carries). The tool
+// count did not change; two options on two floor tools did. Measured
+// cost after the addition: 28527 bytes, keeping the same ~300 bytes of
+// slack. Note the blurbs are shared constants and the schema compactor
+// is not monotonic in description length — a shorter blurb measured
+// *larger* here (28551), so shrink by measuring, never by eyeballing.
+//
+// The `mutation_id` idempotency key on the same two floor tools then took
+// another 148 bytes (28527 → 28675), sharing one blurb constant for the same
+// reason. The ceiling still holds; the remaining slack is ~175 bytes.
+const agentPresetByteCeiling = 28850
 
 // localizationPresetByteCeiling is the hard budget for the diet
 // localization preset (the `localization` instruction profile's tool

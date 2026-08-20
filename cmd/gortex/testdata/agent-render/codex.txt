@@ -49,7 +49,6 @@ type = 'command'
 [mcp_servers.gortex]
 args = ['mcp']
 command = 'gortex'
-required = true
 startup_timeout_sec = 90
 
 [mcp_servers.gortex.env]
@@ -649,7 +648,6 @@ type = 'command'
 [mcp_servers.gortex]
 args = ['mcp']
 command = 'gortex'
-required = true
 startup_timeout_sec = 90
 
 [mcp_servers.gortex.env]

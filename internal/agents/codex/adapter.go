@@ -219,6 +219,11 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 	if hooksChanged {
 		res.Warnings = append(res.Warnings, codexHookTrustNotice)
 	}
+	if env.InstallHooks {
+		if notice := codexDuplicateHookFileNotice(path); notice != "" {
+			res.Warnings = append(res.Warnings, notice)
+		}
+	}
 
 	// User-level instructions → ~/.codex/AGENTS.md. This is the surface
 	// that makes Codex reach for the graph tools on every turn; see
@@ -266,6 +271,32 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 	return res, nil
 }
 
+// codexDuplicateHookFileNotice reports that the hooks.json beside configPath
+// already declares Gortex hooks, which Codex merges with the inline [hooks]
+// tables written into configPath — running each event declared in both once
+// per declaration.
+//
+// Keyed off configPath rather than the home directory because Codex merges per
+// layer: the repo-local pair merges with each other, not with the user's.
+//
+// The installer still writes its own representation: that is what it was asked
+// to do, and the hooks.json entries are the user's, not ours to edit. Saying so
+// is the part that was missing, because the only other signal is a startup
+// warning inside Codex that nobody attributes to `gortex install`.
+func codexDuplicateHookFileNotice(configPath string) string {
+	if configPath == "" {
+		return ""
+	}
+	hooksJSON := filepath.Join(filepath.Dir(configPath), "hooks.json")
+	src, ok := inspectJSONHookFile(hooksJSON)
+	if !ok || src.Total == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%s already declares %d Gortex hook(s); Codex merges it with the [hooks] tables in %s, so any event declared in both runs twice — remove those events from %s",
+		hooksJSON, src.Total, filepath.Base(configPath), hooksJSON)
+}
+
 func codexHasDirectToolNamespaces(root map[string]any) bool {
 	features, ok := root["features"].(map[string]any)
 	if !ok {
@@ -279,20 +310,24 @@ func codexHasDirectToolNamespaces(root map[string]any) bool {
 	return exists
 }
 
-// upsertCodexMCPServer makes Gortex a required Codex dependency and gives its
-// first-start daemon path enough time to publish the initial snapshot. Codex's
-// default MCP startup timeout can expire before that path's 60-second wait.
-// Existing Gortex-authored launch, environment, approval, and tool-timeout
-// settings are preserved; only these two availability invariants are managed.
+// upsertCodexMCPServer registers Gortex and gives its first-start daemon path
+// enough time to publish the initial snapshot: Codex's default MCP startup
+// timeout can expire before that path's 60-second wait. Existing
+// Gortex-authored launch, environment, approval, and tool-timeout settings are
+// preserved; only the startup timeout is managed, plus the one-time removal of
+// the `required` flag earlier releases wrote (see pruneManagedCodexRequired).
+//
+// The command is pinned to an absolute path rather than the bare name, because
+// Codex launches this process itself and its PATH is not the PATH `gortex init`
+// ran under — see ResolveGortexLaunchBinary.
 func upsertCodexMCPServer(root map[string]any, opts agents.ApplyOpts) bool {
 	servers, ok := root["mcp_servers"].(map[string]any)
 	if !ok {
 		servers = make(map[string]any)
 	}
 	desired := map[string]any{
-		"command":             "gortex",
+		"command":             agents.ResolveGortexLaunchBinary(),
 		"args":                []string{"mcp"},
-		"required":            true,
 		"startup_timeout_sec": codexMCPStartupTimeoutSeconds,
 		"env": map[string]any{
 			"GORTEX_INDEX_WORKERS": "8",
@@ -312,8 +347,10 @@ func upsertCodexMCPServer(root map[string]any, opts agents.ApplyOpts) bool {
 		return false
 	}
 	changed := migrateCodexFacadeToolApprovals(entry)
-	if required, _ := entry["required"].(bool); !required {
-		entry["required"] = true
+	if pruneManagedCodexRequired(entry) {
+		changed = true
+	}
+	if pinCodexBareGortexCommand(entry) {
 		changed = true
 	}
 	if !codexStartupTimeoutAtLeast(entry["startup_timeout_sec"], codexMCPStartupTimeoutSeconds) {
@@ -325,6 +362,67 @@ func upsertCodexMCPServer(root map[string]any, opts agents.ApplyOpts) bool {
 		root["mcp_servers"] = servers
 	}
 	return changed
+}
+
+// pruneManagedCodexRequired removes the `required = true` flag that gortex
+// v0.61.0 through v0.63.x wrote into its own Codex MCP entry, and reports
+// whether it removed anything.
+//
+// Codex treats a required MCP server as a hard precondition for the session:
+// if the server does not complete the initialize handshake, Codex aborts with
+// "Failed to initialize session: required MCP servers failed to initialize"
+// and the whole CLI does not start. The intent was that a broken integration
+// should fail loudly rather than leave the agent with graph-tool instructions
+// it cannot follow, but the flag makes ordinary Gortex states fatal to the
+// user's editor:
+//
+//   - the daemon is not running, so `gortex mcp` fails closed and exits
+//     without answering initialize — the state after `gortex daemon stop`,
+//     under GORTEX_AUTOSTART=0, and during the spawn-failure cooldown;
+//   - the binary is not on the PATH Codex was launched with;
+//   - the handshake outruns startup_timeout_sec on a cold daemon start.
+//
+// None of those are Codex's to recover from, and a coding assistant must not
+// be able to take its host down. Without the flag the same failures degrade to
+// a Codex session with no Gortex tools, which `gortex doctor` reports.
+//
+// Only `true` is pruned. A user who has written `required = false` keeps it:
+// that value is already the safe posture, and rewriting it would repeat the
+// mistake this function exists to undo. See gortexhq/gortex#607.
+func pruneManagedCodexRequired(entry map[string]any) bool {
+	if required, ok := entry["required"].(bool); !ok || !required {
+		return false
+	}
+	delete(entry, "required")
+	return true
+}
+
+// pinCodexBareGortexCommand upgrades the bare `command = "gortex"` that
+// earlier releases wrote to the absolute path of the installed binary, and
+// reports whether it rewrote anything.
+//
+// The bare name only resolves if the process that launches Codex inherited the
+// PATH `gortex init` ran under. A GUI-launched Codex does not, so the server
+// silently never starts and the session has no Gortex tools. Pinning is the
+// same choice the hook writer in this file already makes.
+//
+// Only the bare name is rewritten. An absolute path is left alone whether a
+// user pinned a specific build or an earlier run pinned it: re-pinning on every
+// install would overwrite a deliberate choice to serve one that is almost
+// always identical.
+func pinCodexBareGortexCommand(entry map[string]any) bool {
+	cmd, _ := entry["command"].(string)
+	if cmd != "gortex" && cmd != "gortex.exe" {
+		// A path (ours or the user's), or a wrapper we do not own.
+		return false
+	}
+	pinned := agents.ResolveGortexLaunchBinary()
+	if pinned == cmd {
+		// Nothing installed that we can name more precisely.
+		return false
+	}
+	entry["command"] = pinned
+	return true
 }
 
 // migrateCodexFacadeToolApprovals upgrades per-tool approval entries from the
@@ -655,6 +753,11 @@ func InstallHooksOnly(w io.Writer, configPath string, env agents.Env, opts agent
 	}
 	if action.Action != agents.ActionSkip {
 		action.Keys = []string{"hooks"}
+	}
+	// `init --hooks-only` writes the same inline tables Apply does, so it can
+	// create the same silent duplicate and has to say the same thing.
+	if notice := codexDuplicateHookFileNotice(configPath); notice != "" {
+		internalutil.Warnf(w, "%s", notice)
 	}
 	return action, nil
 }

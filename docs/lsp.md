@@ -206,6 +206,10 @@ ambiguous. A pass runs up to five phases:
 3. **Definition-rebind fallback** — for edges the confirm pass could not settle
    from references alone, asks for the call site's definition
    (`textDocument/definition`) and rebinds the edge to the concrete target.
+   An answer that agrees with the heuristic target counts as
+   `edges_confirmed`; an answer naming a different same-name declaration
+   rewrites the edge (tagged `rebound_from`) and counts as `edges_rebound` —
+   a correction of the heuristic graph, not a confirmation of it.
 4. **References-add pass** — only for servers that expose references but not a
    call hierarchy; recovers the caller edges a declaration's references imply.
 5. **Per-file sweep** — the whole-repo hover / hierarchy phase. Per function or
@@ -314,8 +318,11 @@ cross-file signal to show for the cost. Rather than drive that churn, the pass
 **degrades to reference confirmation**: it runs the confirm and rebind passes
 (which work inside the fallback translation unit on fallback flags) and skips
 the interface pass, the references-add pass, the entire per-file sweep, and all
-header files. Edge tiers and confirmed / refuted edges are unaffected; hover
-type strings and call / type-hierarchy edges are absent for that pass.
+header files. Edge tiers are unaffected, and the pass's yield lands under
+`edges_confirmed` / `edges_rebound` as usual — a degraded pass that settles
+most of its edges through the definition fallback reports mostly rebinds, not
+zero yield. Hover type strings and call / type-hierarchy edges are absent for
+that pass.
 
 A degraded pass warns once with the remediation and marks its result
 `degraded`. `index_health` surfaces a recommendation naming the repository and

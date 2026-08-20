@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -45,6 +46,11 @@ func Caller() {
 	Target()
 }
 `), 0o644))
+	// A committed, clean work tree. These tests only ever want an empty diff
+	// from the fixture, and before MapGitDiff stopped swallowing failures they
+	// got one by accident: git refused to diff a directory that was not a repo
+	// at all, and the error was returned as "no changes".
+	initCleanGitRepo(t, dir)
 
 	g := graph.New()
 	reg := testRegistry()
@@ -59,6 +65,30 @@ func Caller() {
 	srv.SetOverlayManager(daemon.NewOverlayManager(time.Minute))
 	srv.RunAnalysis()
 	return srv, dir, targetFile, callerFile
+}
+
+// initCleanGitRepo turns dir into a git work tree whose HEAD holds everything
+// already written there, so every diff scope reports a genuinely empty diff.
+func initCleanGitRepo(t *testing.T, dir string) {
+	t.Helper()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-b", "main")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	run("config", "diff.mnemonicPrefix", "false")
+	run("config", "diff.noprefix", "false")
+	run("add", ".")
+	run("commit", "-m", "base")
 }
 
 func callToolByName(t *testing.T, srv *Server, ctx context.Context, name string, args map[string]any) *mcplib.CallToolResult {

@@ -727,6 +727,7 @@ func (m *Manager) setEnrichStatus(repo, provider, lang, state string, deadline t
 	if result != nil {
 		st.DurationMs = result.DurationMs
 		st.EdgesConfirmed = result.EdgesConfirmed
+		st.EdgesRebound = result.EdgesRebound
 		st.EdgesAdded = result.EdgesAdded
 		st.NodesEnriched = result.NodesEnriched
 		st.SymbolsTotal = result.SymbolsTotal
@@ -1207,6 +1208,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 			zap.Int("confirmed", result.EdgesConfirmed),
 			zap.Int("added", result.EdgesAdded),
 			zap.Int("refuted", result.EdgesRefuted),
+			zap.Int("rebound", result.EdgesRebound),
 			zap.Int("nodes_enriched", result.NodesEnriched),
 			zap.Float64("coverage", result.CoveragePercent),
 			zap.Int64("duration_ms", result.DurationMs),

@@ -459,7 +459,7 @@ Requirements:
 8. Each MCP-capable integration harness SHOULD compare the raw MCP roster with the functions exposed by its client bridge. If the bridge drops a tool, telemetry and diagnostics MUST identify the missing facade rather than recommend an uncallable name.
 9. A Bash-only harness with no native MCP function exposure MUST be able to invoke the same compact names and argument objects through `gortex call`; this CLI path is a direct mirror, not a translation to legacy tool names.
 10. An agent adapter MUST use the host's supported eager/direct namespace control when the host otherwise defers MCP tools. Discovery in a settings screen or a successful raw `tools/list` is not sufficient: the facade functions MUST be present in the model-visible callable registry on the first turn.
-11. An agent adapter SHOULD mark Gortex as required when the host supports required MCP servers. Startup or discovery failure must fail visibly instead of silently leaving the agent with source-access guidance that it cannot follow.
+11. An agent adapter MUST NOT make Gortex a hard precondition for the host starting. Startup or discovery failure should fail visibly rather than silently leaving the agent with source-access guidance it cannot follow, but "visibly" MUST stop short of taking the host down: a coding assistant that cannot be started is worse than one running without graph tools. Where a host offers a required-server flag (Codex's `required`), the adapter MUST leave it alone — Gortex has ordinary states, such as a stopped daemon, in which its server does not answer the initialize handshake. Surface that state through `gortex doctor` instead.
 12. Guidance installed for an MCP-capable host MUST NOT recommend daemon startup or the Bash mirror when a Gortex callable handle is missing. That state is a host integration failure and MUST be surfaced. `gortex call` remains the mirror only for a harness that genuinely has no MCP transport.
 
 For Codex 0.142.0 and newer, `gortex init` adds the current `mcp__gortex`
@@ -467,11 +467,23 @@ namespace and its non-prefixed `gortex` form to
 `features.code_mode.direct_only_tool_namespaces` without removing
 user-configured namespaces. This is the host-supported bypass for deferral: the
 active Gortex namespace remains a direct model tool even when other MCP
-namespaces are available only through tool search. The adapter also writes
-`required = true` and a startup timeout long enough for Gortex's bounded daemon
-autostart. Older Codex releases reject that field, so the adapter version-gates
-it rather than invalidating their config. These are transport/host settings,
-not agent instructions and not part of the facade request schema.
+namespaces are available only through tool search. Older Codex releases reject
+that field, so the adapter version-gates it rather than invalidating their
+config.
+
+The adapter also writes a startup timeout long enough for Gortex's bounded
+daemon autostart, and pins `command` to the absolute path of the installed
+binary. Codex launches the server itself, so the bare name is only resolvable
+when Codex inherits the PATH `gortex init` ran under — a GUI-launched Codex
+does not.
+
+Releases v0.61.0 through v0.63.x also wrote `required = true`. That was a
+mistake: Codex aborts the session outright when a required server fails to
+initialize, so a stopped daemon or an unresolvable binary stopped the CLI from
+starting at all (gortexhq/gortex#607). The adapter now removes the flag from
+its own entry on the next `gortex install` / `gortex init`, and never writes
+it. An explicit user `required = false` is preserved. These are transport/host
+settings, not agent instructions and not part of the facade request schema.
 
 ## 13. Telemetry and privacy
 

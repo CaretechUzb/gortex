@@ -286,12 +286,107 @@ over a very large tree, or `ask` against a slow local model.
 | `edit_symbol` | Edit a symbol's source directly by ID — no Read needed. Line-ending tolerant: an LF-authored `old_source` matches a CRLF file (and vice versa) and the replacement adopts the file's endings (`eol_normalized: true` rides on the response). Optional `base_sha` content-hash guard refuses the write when the on-disk SHA has drifted; every success carries `new_sha` so the next edit can pipeline without re-reading |
 | `edit_file` | Edit any file (markdown, config, spec, template, source) by exact string replacement — accepts absolute paths or repo-rooted paths. Line-ending tolerant: an LF-authored `old_string` matches a CRLF file (and vice versa) and the replacement is written with the file's own endings (`eol_normalized: true` rides on the response). Same `base_sha` / `new_sha` drift guard. Kills Read-before-Edit for files not in the graph |
 | `write_file` | Create or overwrite any file — atomic temp+rename, re-indexes on write. Same `base_sha` / `new_sha` drift guard |
+| `mutation_status` | What a file mutation actually did, after the fact. Reports `disk_status` (`committed` / `not_applied` / `failed` / `in_flight`) separately from `graph_status` (`fresh` / `pending` / `stale` / `failed`), selected by `receipt`, `mutation_id`, or `path`. Use it instead of retrying when an edit call was abandoned at its deadline |
 | `rename_symbol` | Coordinated multi-file rename with all references — definition, graph usages, receiver lines, and test names that embed the old identifier. Replacement is whole-identifier, so renaming `Get` leaves `GetUser` intact. Every target line is re-verified against disk and every affected file is parse-gated before anything is written, so the rename lands completely or is refused; `dry_run: true` returns the identical edit list without writing. Successful responses carry `status` (`applied` / `would_apply` / `no_edits`) plus per-file `bytes_written` / `new_sha` / `reindexed`. An existing unindexed target returns a structured `symbol_not_indexed` error only when the configured extractor anchors the requested declaration. Its `safe_fallback.request` is a guarded exact edit of that declaration line (`scope: declaration_only`); same-file and cross-file references remain explicitly unproven, and the refusal itself writes no bytes |
 | `move_symbol` | Relocate a function / method / type / variable / const to another file. Cross-package moves rewrite every qualified reference, drop the source import, add the target import, synthesise the target file if missing. Go for now |
 | `inline_symbol` | Replace every callsite of a trivial single-statement / single-expression callee with the body — refuses cleanly on defer, spawn, close-over-scope, multi-return, or side-effecting arg. `delete_after: true` removes the declaration. Go for now |
 | `safe_delete_symbol` | Atomic dead-code removal with a graph-aware safety gate. A `cascade` parameter (`off` / `preview` / `apply`) drives a fixed-point orphan-propagation pass; cross-workspace and out-of-closure callers (and, by default, test-only callers) disqualify a candidate |
 | `set_planning_mode` | Switch the session between a guaranteed no-writes planning phase and editing mode |
 | `workflow` | Drive a phase-enforcement state machine (explore → implement → verify) — editing tools are gated until the implement phase |
+
+### Content hashes: five fields, five meanings
+
+Several tools return a hash and none of them are interchangeable. Pick by what
+you need to prove, not by which field is nearest.
+
+| Field | Algorithm | Covers | Observed when |
+|---|---|---|---|
+| `base_sha` (request) | git blob SHA-1 | the full file the caller read earlier | — (a value you supply) |
+| `new_sha` (response) | git blob SHA-1 | the bytes the tool was **about to** write | **before** the write |
+| `content_sha256` (`read_file`) | SHA-256 | the full file on disk | during the read |
+| `before_sha256` / `after_sha256` (mutations) | SHA-256 | the full file on disk, before and after | before / **after** the write |
+| `etag` | SHA-256 of the response payload | the returned representation, not the file | as the response is built |
+
+Two consequences worth internalising:
+
+- **`new_sha` is a pipelining token, not physical evidence.** It is a git blob
+  SHA-1 (`sha1("blob <len>\0" + data)`, the same value `git hash-object` prints)
+  computed from the in-memory buffer *before* `AtomicWriteFile` runs. It is what
+  you feed to the next call's `base_sha`. It is not a SHA-256, it is not read
+  back from disk, and `dry_run` returns one for bytes that were never written.
+- **`etag` is not a file hash.** It covers the JSON response — window, elision,
+  redaction and all — so two reads of an unchanged file with different options
+  carry different ETags.
+
+To prove what is actually on disk, ask for it explicitly with
+`physical_evidence: true` (see below). Anything else is a prediction or a
+cache key.
+
+### Disk-verified receipts (`physical_evidence`)
+
+`read_file`, `edit_file`, `write_file` and `edit_symbol` accept
+`physical_evidence: true` (with an optional `digest`, `sha256` only, which is
+also the default). The read side returns `content_sha256` plus `hash_scope`,
+`content_source`, `same_buffer_as_content` and `resolved_path`; the mutation
+side returns `before_sha256` / `after_sha256` re-read from disk **after** the
+atomic write, plus `resolved_path`, `byte_count` and `verified_at`. Both are
+`hash_algorithm: sha256`, `hash_scope: full_file`, `content_source: disk`.
+
+Contract details that matter for an evidence workflow:
+
+- **The mutation digest is an observation, not a prediction.** The file is read
+  back through the same hardened path `read_file` uses — non-regular files
+  refused, symlink resolution recorded, repo-root confinement re-checked against
+  the target that supplied the bytes.
+- **A creating `write_file` reports `before_absent: true`** instead of a
+  `before_sha256`, so "no prior bytes" is distinguishable from "not requested".
+- **`dry_run` + `physical_evidence` is refused.** A dry run writes nothing, so
+  there are no disk bytes to attest.
+- **Evidence failure never fails the call.** If the read-back cannot be
+  completed or confinement is violated, the write is still reported as applied
+  and the response carries `evidence_error` with no digests — failing the call
+  would invite a retry that applies the edit twice.
+- **Secret-shaped config leaves are withheld.** `before_sha256` digests bytes
+  the caller did not supply, so a `.env`-shaped file refuses the receipt (the
+  edit itself still works). Read its digest with
+  `read_file{allow_secrets: true}` if you genuinely need it.
+- Multi-file mutations (`rename_symbol`, `batch_edit`) do not yet take the flag;
+  `batch_edit`'s transaction journal carries its own `before_sha256` /
+  `after_sha256`, computed from in-memory buffers for crash recovery — not a
+  disk observation.
+
+Whether the graph caught up with the write is a separate question, answered by
+`graph_status` (and the `reindexed` / `reindex_pending` / `reindex_generation`
+fields behind it) on every mutation response. Whether the write happened *at
+all* is a third question — see the next section.
+
+### Mutating tools and the transport deadline
+
+A tool call is bounded (`GORTEX_MCP_TOOL_TIMEOUT`, default 60s). When a handler
+outruns that budget the transport is released and the handler keeps running, so
+a write can land *after* the client was answered. The mutating tools make that
+observable instead of leaving it unknown:
+
+- **Before the disk commit**, a cancelled request is refused and nothing is
+  written. The response says `disk_status=not_applied` and retrying is safe.
+- **After the disk commit**, the abandoned-call error names what landed —
+  path, `new_sha`, and a receipt id — and carries a machine-readable
+  `mutation_commit={...}` tail. Re-applying the edit would duplicate it.
+- **Either way**, the receipt is queryable for 30 minutes with
+  `mutation_status` (facade: `change` with `operation: "receipt"`), which
+  reports the disk state and the graph-freshness state independently.
+- `edit_file` / `write_file` / `edit_symbol` accept an optional `mutation_id`
+  idempotency key. Retrying with the same key and the identical edit replays
+  the original result without writing again; reusing it for a different edit is
+  refused. `batch_edit` has the equivalent `transaction_id`.
+
+Successful edit responses carry `disk_status`, `graph_status`, and
+`mutation_receipt` alongside the existing `new_sha` / `reindexed` fields.
+
+`physical_evidence` and `disk_status` answer different questions and compose:
+the first attests *what bytes* are on disk, the second whether the write
+happened at all. A call abandoned before its response returns no evidence block
+— only the receipt — which is exactly when `disk_status` is the field you need.
 
 ## Agent-optimized (token efficiency)
 
@@ -325,7 +420,7 @@ Gortex captures every large tool response into a bounded per-session ring; these
 |------|-------------|
 | `get_communities` | Functional clusters (Louvain). Without `id`: list all. With `id`: members and cohesion for one community. Members and files are clamped to the session workspace; the partition is global, so a `repo`/`project`/`scope` narrowing is widened to the workspace and the response discloses it |
 | `get_processes` | Discovered execution flows. Without `id`: list all. With `id`: step-by-step trace. Clamped to the session workspace and narrowed further by `repo`/`project`/`scope` — out-of-scope steps are excised by subtree so the surviving chain keeps its real call shape |
-| `detect_changes` | Git diff mapped to affected symbols |
+| `detect_changes` | Git diff mapped to affected symbols, plus a file-level view (`changed_files` / `file_changes` with added/modified/deleted/renamed) that stays populated for changes carrying no indexed symbol. Untracked and ignored files are not observed — every scope reads `git diff`. |
 | `index_repository` | Index or re-index a repository path |
 | `reindex_repository` | Incrementally re-index a tracked repository — whole-root, or scoped to an optional `paths` subset. Multi-repo aware |
 | `contracts` | API contracts. `action: "list"` (default): detected HTTP/gRPC/GraphQL/topics/WebSocket/env/OpenAPI. `action: "check"`: orphan providers/consumers |

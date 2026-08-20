@@ -365,6 +365,22 @@ type Server struct {
 	mutationReindexWait time.Duration
 	mutationSafetyWait  time.Duration
 
+	// mutationCommits is the durable disk-commit ledger for the single-file
+	// mutating tools (mutation_commit.go). It answers the question the
+	// transport cannot: when a tool call is abandoned at its deadline, did the
+	// bytes actually land? The zero value is usable, so directly-constructed
+	// test and embedded servers need no constructor wiring.
+	mutationCommits mutationCommitLedger
+
+	// mutationPreCommitHook is a fault-injection seam, nil in production. It
+	// fires between registering a commit and the cancellation gate that guards
+	// the write — the window a real deadline hits when it lands after the
+	// mutation lock was taken but before the bytes are renamed into place.
+	// That window cannot be entered from outside: the handler crosses it in
+	// microseconds, so without this seam the gate is untestable and could
+	// regress unnoticed.
+	mutationPreCommitHook func(*mutationCommitRecord)
+
 	// batchTransactions holds daemon-lifetime delivery receipts for atomic
 	// batch edits. sync.Map's zero value keeps directly-constructed test and
 	// embedded servers usable without constructor wiring. The write/remove
