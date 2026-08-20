@@ -12,6 +12,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 // #597: tool schemas promise additionalProperties:false but dispatch read
@@ -368,6 +369,29 @@ func helper() {}
 		"fixture sanity: the drifted file must fire the freshness rider")
 	assert.Contains(t, text, "_ignored_options",
 		"the warn rider must survive the freshness rebuild")
+	assert.Contains(t, text, "line_range")
+}
+
+// The warming decorator is the second rebuild seam: a graph tool called
+// mid-warmup gets its result rebuilt around the `warming` envelope, and the
+// rider must survive that rebuild exactly as it survives freshness.
+func TestWarnRiderSurvivesWarmingRebuildE2E(t *testing.T) {
+	t.Setenv("GORTEX_TOOLS", "full")
+	srv, _ := setupTestServer(t)
+	// Put the server mid-warmup the way the daemon does: a published
+	// readiness phase that is not yet ready.
+	srv.readinessBroadcaster = newReadinessBroadcaster(&fakeSpecificSender{}, zap.NewNop())
+	srv.readinessBroadcaster.publish(map[string]any{"phase": "parallel_parse", "ready": false})
+	ctx := guardE2ESession(t, srv, "arg_guard_warming_e2e")
+	t.Setenv(toolArgGuardEnv, "")
+
+	res := guardE2ECall(t, srv, ctx, 2, "read_file", map[string]any{"path": "main.go", "line_range": []any{1, 2}})
+	require.False(t, res.IsError, guardResultText(res))
+	text := guardResultText(res)
+	require.Contains(t, text, "warming",
+		"fixture sanity: a mid-warmup read must carry the warming envelope")
+	assert.Contains(t, text, "_ignored_options",
+		"the warn rider must survive the warming rebuild")
 	assert.Contains(t, text, "line_range")
 }
 
