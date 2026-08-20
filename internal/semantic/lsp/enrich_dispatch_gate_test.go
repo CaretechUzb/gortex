@@ -99,6 +99,18 @@ func TestEnrichLanguageHasHierarchyEvidence(t *testing.T) {
 	assert.False(t, probe(callEdge), "non-hierarchy kinds never count")
 	assert.True(t, probe(lspEdge, csEdge, astEdge), "one qualifying edge among noise is enough")
 	assert.False(t, probe(nil), "nil edges are skipped")
+
+	// A confirmed extractor edge keeps its provenance: ConfirmEdge flips the
+	// origin to LSP grade but records the prior origin, so confirmation does
+	// not decay the evidence the gate depends on.
+	confirmedEdge := &graph.Edge{From: goImpl.ID, To: goIface.ID, Kind: graph.EdgeImplements,
+		Origin: graph.OriginLSPResolved,
+		Meta:   map[string]any{"confirmed_from_origin": string(graph.OriginASTResolved)}}
+	assert.True(t, probe(confirmedEdge), "a confirmed extractor edge remains evidence via its preserved provenance")
+	confirmedStub := &graph.Edge{From: goImpl.ID, To: goIface.ID, Kind: graph.EdgeExtends,
+		Origin: graph.OriginLSPResolved,
+		Meta:   map[string]any{"confirmed_from_origin": ""}}
+	assert.True(t, probe(confirmedStub), "marker presence is the signal — an empty prior origin still counts")
 }
 
 // TestLSP_Enrich_SweepGate drives one pass over three files under the demand
@@ -284,4 +296,84 @@ func TestLSP_Enrich_SweepGate_LSPRecoveredEdgesAreNotEvidence(t *testing.T) {
 	defer mu.Unlock()
 	assert.True(t, hovered["fresh.go"],
 		"sweep-recovered edges are not extractor evidence — a new bare class must still be admitted")
+}
+
+// The decay scenario: an extractor-minted extends edge is confirmed by the
+// sweep's typeHierarchy hop, which flips its origin to lsp_resolved — exactly
+// what the evidence probe excludes. Confirmation must preserve the prior
+// provenance so the NEXT pass still sees extractor evidence; without that the
+// gate is self-defeating (admit hierarchy types → sweep confirms their edges →
+// evidence gone → permissive fallback), oscillating on every enrich/reindex
+// cycle.
+func TestLSP_Enrich_SweepGate_ConfirmationDoesNotDecayEvidence(t *testing.T) {
+	t.Setenv(SweepEnv, "") // demand default
+
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "hier.go"),
+		[]byte("package p\n\ntype Base struct{}\n\ntype Derived struct{ Base }\n"), 0o644))
+
+	server := newInstrumentedServer()
+	server.handle("textDocument/hover", func(json.RawMessage) (any, *jsonRPCError) { return nil, nil })
+	derivedItem := TypeHierarchyItem{
+		Name: "Derived", URI: pathToURI(filepath.Join(repoRoot, "hier.go")),
+		SelectionRange: Range{Start: Position{Line: 4, Character: 5}, End: Position{Line: 4, Character: 12}},
+	}
+	baseItem := TypeHierarchyItem{
+		Name: "Base", URI: pathToURI(filepath.Join(repoRoot, "hier.go")),
+		SelectionRange: Range{Start: Position{Line: 2, Character: 5}, End: Position{Line: 2, Character: 9}},
+	}
+	server.handle("textDocument/prepareTypeHierarchy", func(params json.RawMessage) (any, *jsonRPCError) {
+		var req struct {
+			Position Position `json:"position"`
+		}
+		_ = json.Unmarshal(params, &req)
+		if req.Position.Line == 4 {
+			return []TypeHierarchyItem{derivedItem}, nil
+		}
+		return []TypeHierarchyItem{baseItem}, nil
+	})
+	server.handle("typeHierarchy/supertypes", func(params json.RawMessage) (any, *jsonRPCError) {
+		var req struct {
+			Item TypeHierarchyItem `json:"item"`
+		}
+		_ = json.Unmarshal(params, &req)
+		if req.Item.Name == "Derived" {
+			// The compiler agrees with the extractor: Derived extends Base.
+			return []TypeHierarchyItem{baseItem}, nil
+		}
+		return []TypeHierarchyItem{}, nil
+	})
+	server.handle("typeHierarchy/subtypes", func(params json.RawMessage) (any, *jsonRPCError) {
+		return []TypeHierarchyItem{}, nil
+	})
+
+	p, cleanup := providerWithInstrumentedServer(t, server, []string{"go"}, 4)
+	defer cleanup()
+	p.caps = ServerCapabilities{TypeHierarchyProvider: true}
+
+	derived := &graph.Node{ID: "hier.go::Derived", Kind: graph.KindType, Name: "Derived",
+		FilePath: "hier.go", StartLine: 5, EndLine: 5, Language: "go"}
+	base := &graph.Node{ID: "hier.go::Base", Kind: graph.KindType, Name: "Base",
+		FilePath: "hier.go", StartLine: 3, EndLine: 3, Language: "go"}
+	edge := &graph.Edge{From: derived.ID, To: base.ID, Kind: graph.EdgeExtends,
+		FilePath: "hier.go", Line: 5,
+		Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginASTResolved}
+	g := graph.New()
+	g.AddNode(derived)
+	g.AddNode(base)
+	g.AddEdge(edge)
+
+	require.NoError(t, runEnrich(t, p, g, repoRoot, 3*time.Second))
+
+	// The confirm happened — origin flipped to the excluded grade…
+	require.Equal(t, graph.OriginLSPResolved, edge.Origin,
+		"fixture sanity: the sweep must confirm the extractor edge in place")
+	require.Equal(t, 1.0, edge.Confidence)
+
+	// …and the probe, over the post-pass edge set, still sees evidence.
+	edges := []*graph.Edge{edge}
+	view := newLSPGraphView([]*graph.Node{derived, base}, edges)
+	assert.True(t,
+		enrichLanguageHasHierarchyEvidence(view, edges, func(lang string) bool { return lang == "go" }),
+		"confirmation must not decay the evidence the gate depends on")
 }

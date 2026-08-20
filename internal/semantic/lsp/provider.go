@@ -390,19 +390,28 @@ func enrichTypeIsDispatchRelevantFromView(view *lspGraphView, n *graph.Node, hie
 // tstypes lane) the sweep's typeHierarchy hop is the ONLY producer of
 // hierarchy edges, so requiring an existing edge for admission would demand
 // as input exactly what the sweep exists to produce, and a class-only file's
-// hierarchy would never be recovered. Edges the sweep itself recovered
-// (lsp_resolved / lsp_dispatch) are excluded: counting the sweep's own output
-// would flip such a language onto the strict gate one run later and silently
-// drop every class added after that. One pass over the repo's projected
-// edges, attributed to a language via the source node — no per-language
-// table.
+// hierarchy would never be recovered. Edges the sweep itself MINTED
+// (lsp_resolved / lsp_dispatch, no provenance marker) are excluded: counting
+// the sweep's own output would flip such a language onto the strict gate one
+// run later and silently drop every class added after that. An LSP-origin
+// edge carrying meta confirmed_from_origin still counts: ConfirmEdge flips
+// the origin in place when the sweep agrees with a non-LSP lane's edge, and
+// without the preserved provenance every confirm would decay exactly the
+// evidence this probe depends on. One pass over the repo's projected edges,
+// attributed to a language via the source node — no per-language table.
 func enrichLanguageHasHierarchyEvidence(view *lspGraphView, repoEdges []*graph.Edge, languageMatches func(string) bool) bool {
 	for _, e := range repoEdges {
 		if e == nil || (e.Kind != graph.EdgeImplements && e.Kind != graph.EdgeExtends) {
 			continue
 		}
 		if e.Origin == graph.OriginLSPResolved || e.Origin == graph.OriginLSPDispatch {
-			continue
+			confirmed := false
+			if e.Meta != nil {
+				_, confirmed = e.Meta["confirmed_from_origin"]
+			}
+			if !confirmed {
+				continue
+			}
 		}
 		if from := view.nodesByID[e.From]; from != nil && languageMatches(from.Language) {
 			return true
