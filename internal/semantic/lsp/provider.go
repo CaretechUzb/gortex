@@ -996,6 +996,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	targetedBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "targeted", repoPrefix)
 	hoverBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "hover", repoPrefix)
 
+	// Phase boundary timestamps: the completion log breaks the pass wall time
+	// out per phase (phase_*_ms) — an aggregate duration cannot say which pass
+	// owns the minutes when a run needs speed forensics.
+	setupDone := time.Now()
+
 	// Query implementations for interface nodes. A degraded pass skips this:
 	// the query opens each interface's file, and a database-less clangd cannot
 	// resolve implementations across translation units regardless. Graph
@@ -1071,6 +1076,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		interfaceMutations.apply(g, nil)
 		rmu.Unlock()
 	}
+	implsDone := time.Now()
 
 	// Query references for AMBIGUOUS edges to confirm/refute. Promotion
 	// to the lsp tier is identity-anchored: the server's evidence must
@@ -1204,6 +1210,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		mutations.apply(g, nil)
 		rmu.Unlock()
 	}
+	confirmDone := time.Now()
 
 	// Definition-rebind pass: for a site the reference sweep did not tie to
 	// the edge's target, ask the server what the site actually resolves to
@@ -1335,6 +1342,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		fallbackMutations.apply(g, nil)
 		rmu.Unlock()
 	}
+	defsDone := time.Now()
 
 	// Degraded finalisation: the interface pass, the references-add pass, and
 	// the per-file hover / hierarchy sweep are all skipped when a needed
@@ -1378,6 +1386,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		p.Supports("textDocument/references") && !p.Supports("textDocument/prepareCallHierarchy") {
 		p.referencesAddPass(targetedCtx, g, view, repoPrefix, absRoot, langNodes, rmu, session, result)
 	}
+	refsAddDone := time.Now()
 
 	// Per-file document lifecycle + bounded concurrency. The original
 	// implementation bulk-opened every target file up front and closed
@@ -1865,6 +1874,12 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.Int("reopened_files", reopenedFiles),
 		zap.Int("doc_evictions", docEvictions),
 		zap.Int("peak_open_docs", peakOpenDocs),
+		zap.Int64("phase_setup_ms", setupDone.Sub(start).Milliseconds()),
+		zap.Int64("phase_impls_ms", implsDone.Sub(setupDone).Milliseconds()),
+		zap.Int64("phase_confirm_ms", confirmDone.Sub(implsDone).Milliseconds()),
+		zap.Int64("phase_definitions_ms", defsDone.Sub(confirmDone).Milliseconds()),
+		zap.Int64("phase_refs_add_ms", refsAddDone.Sub(defsDone).Milliseconds()),
+		zap.Int64("phase_sweep_ms", time.Since(refsAddDone).Milliseconds()),
 		zap.Int64("req_references", p.reqStats.references.Load()),
 		zap.Int64("req_implementations", p.reqStats.implementations.Load()),
 		zap.Int64("req_definitions", p.reqStats.definitions.Load()),
