@@ -117,10 +117,11 @@ func sweepFile(mode string, demand int, dispatch bool) bool {
 // server. Empty falls through to the spec's NoDidOpen.
 const OpenDocsEnv = "GORTEX_LSP_OPEN_DOCS"
 
-// normalizeOpenDocs canonicalises an open-docs override to "on" / "off".
-// An empty or unrecognised value returns "" so the caller falls through to
-// the next precedence source.
-func normalizeOpenDocs(v string) string {
+// normalizeOnOff canonicalises an on/off override value ("on" / "1" /
+// "true", "off" / "0" / "false") — the shared vocabulary of the open-docs
+// and heavy-requests overrides. An empty or unrecognised value returns ""
+// so the caller falls through to the next precedence source.
+func normalizeOnOff(v string) string {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "on", "1", "true":
 		return "on"
@@ -138,10 +139,10 @@ func normalizeOpenDocs(v string) string {
 // which wins over the open-by-default fallback. An unrecognised value at
 // any level is ignored (falls through) rather than failing the pass.
 func resolveOpensDocs(configured string, spec *ServerSpec) bool {
-	if env := normalizeOpenDocs(os.Getenv(OpenDocsEnv)); env != "" {
+	if env := normalizeOnOff(os.Getenv(OpenDocsEnv)); env != "" {
 		return env == "on"
 	}
-	if cfg := normalizeOpenDocs(configured); cfg != "" {
+	if cfg := normalizeOnOff(configured); cfg != "" {
 		return cfg == "on"
 	}
 	if spec != nil && spec.NoDidOpen {
@@ -164,7 +165,7 @@ const HeavyRequestsEnv = "GORTEX_LSP_HEAVY"
 // wins over the spec's NoHeavyRequests, which wins over the allow-by-default
 // fallback. Shares the on/off vocabulary of the open-docs override.
 func resolveNoHeavyRequests(spec *ServerSpec) bool {
-	if env := normalizeOpenDocs(os.Getenv(HeavyRequestsEnv)); env != "" {
+	if env := normalizeOnOff(os.Getenv(HeavyRequestsEnv)); env != "" {
 		return env == "off"
 	}
 	return spec != nil && spec.NoHeavyRequests

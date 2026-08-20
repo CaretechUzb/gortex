@@ -1107,7 +1107,6 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// left unconfirmed, grouped by call-site file — each site file is owned
 	// by exactly one goroutine, so document open/close never overlaps on the
 	// same document.
-	confirmGroups := p.groupConfirmTargets(view.nodesByID, targets, degradedSkipFile)
 	var confirmMu sync.Mutex
 	confirmPromotions := make(map[*graph.Edge]struct{})
 	var fallback []enrichTarget
@@ -1130,6 +1129,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			}
 		}
 	} else {
+		confirmGroups := p.groupConfirmTargets(view.nodesByID, targets, degradedSkipFile)
 		sem := make(chan struct{}, p.maxParallel)
 		var wg sync.WaitGroup
 		for _, grp := range confirmGroups {
