@@ -209,7 +209,13 @@ ambiguous. A pass runs up to five phases:
    An answer that agrees with the heuristic target counts as
    `edges_confirmed`; an answer naming a different same-name declaration
    rewrites the edge (tagged `rebound_from`) and counts as `edges_rebound` —
-   a correction of the heuristic graph, not a confirmation of it.
+   a correction of the heuristic graph, not a confirmation of it. One
+   exception: an answer naming the *declared* dispatch member (interface /
+   abstract base) while the stored target is one of its concrete
+   implementations does not rewrite anything — the stored edge is a
+   devirtualization guess definition cannot vouch for, so the compiler-proven
+   edge to the declared member is added (`edges_added`) and the guess keeps
+   its heuristic tier.
 4. **References-add pass** — only for servers that expose references but not a
    call hierarchy; recovers the caller edges a declaration's references imply.
 5. **Per-file sweep** — the whole-repo hover / hierarchy phase. Per function or
@@ -255,6 +261,48 @@ session degrades to a pure content cache (file bytes still read from disk
 once per file) and the pass sends zero document notifications. The
 `GORTEX_LSP_OPEN_DOCS` env var overrides in both directions: `1` forces
 the lifecycle back on, `0` skips it for every server.
+
+### Servers that skip the heavy request classes
+
+A server whose spec sets `NoHeavyRequests` never receives the two request
+classes that ride its find-references machinery: `textDocument/references`
+and `callHierarchy/incomingCalls`. For the one spec that sets it today — C#
+(`omnisharp`, including its `csharp-ls` fallback command) — the reason is a
+memory leak, not throughput: released csharp-ls builds (≤ 0.26) hold ~10MB
+plus a set of OS handles per references round trip and ~0.7MB per
+incomingCalls, released only at process exit. A full enrichment pass over a
+large repo pushes tens of GB through that leak, and a long-lived daemon
+answering usage queries accumulates it one request at a time.
+
+What changes under the opt-out:
+
+- **Edge confirmation moves to definition.** The references confirm pass
+  (phase 2) is skipped and the definition pass (phase 3) becomes the primary
+  confirm source, covering every sited ambiguous edge — the same verdicts at
+  position-request cost. Edge tiers and recall are unaffected.
+- **`callHierarchy/incomingCalls` is never sent.** Dispatch fan-out stays
+  with the graph-side interface-dispatch synthesizer; the outgoing side of
+  the call hierarchy still runs.
+- **The references-add pass (phase 4) is skipped** — it exists for servers
+  without a call hierarchy and is references-driven by definition.
+- **On-demand confirmation is disabled.** The query-time path that upgrades
+  `find_usages` / `get_callers` answers with a live LSP round trip returns
+  immediately for these servers, so C# usage queries answer from the stored
+  graph tiers alone.
+
+The `GORTEX_LSP_HEAVY` env var overrides the spec in both directions, with
+the same value vocabulary as `GORTEX_LSP_OPEN_DOCS`: `on` / `1` / `true`
+restores references and incomingCalls for an opted-out server, `off` / `0`
+/ `false` disables them for every server, and an empty or unrecognised
+value falls through to the spec. The knob is deliberately env-only: it
+exists to match a specific server *build*, not a workspace, and a durable
+config key would outlive the build it was set for.
+
+> **Warning:** set `GORTEX_LSP_HEAVY=on` for C# only on a csharp-ls build
+> that carries the FindReferences leak fix
+> ([razzmatazz/csharp-language-server#410](https://github.com/razzmatazz/csharp-language-server/pull/410)).
+> On any released build up to 0.26, a full heavy pass over a large repo can
+> push ~30GB through the leak and OOM the server mid-pass.
 
 ### Sweep modes
 
