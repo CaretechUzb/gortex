@@ -47,6 +47,91 @@ var toolArgShapingKeys = map[string]struct{}{
 	"cursor":     {},
 }
 
+// The echoed unknown-key list is caller-controlled text: bound it in count
+// and per-key length so the rider stays a nudge and the reject error stays
+// an error, whatever the caller sent.
+const (
+	toolArgGuardMaxEchoedKeys = 5
+	toolArgGuardMaxKeyRunes   = 80
+)
+
+// toolArgGuardEcho renders the capped unknown-key list shared by the rider
+// and the reject error: at most toolArgGuardMaxEchoedKeys keys, each cut at
+// toolArgGuardMaxKeyRunes runes, with an overflow tail naming the rest.
+func toolArgGuardEcho(unknown []string) string {
+	echo := make([]string, 0, len(unknown)+1)
+	for i, k := range unknown {
+		if i == toolArgGuardMaxEchoedKeys {
+			echo = append(echo, fmt.Sprintf("(+%d more)", len(unknown)-toolArgGuardMaxEchoedKeys))
+			break
+		}
+		if r := []rune(k); len(r) > toolArgGuardMaxKeyRunes {
+			k = string(r[:toolArgGuardMaxKeyRunes]) + "…"
+		}
+		echo = append(echo, k)
+	}
+	return strings.Join(echo, ", ")
+}
+
+// argGuardPendingRider carries one warn verdict from the guard (which runs
+// deep inside the handler chain) out to the dispatch wrapper, which attaches
+// it AFTER the warming / freshness decorators: both rebuild the text result
+// from Content[0] (rebuildTextResult), so a rider block appended mid-chain
+// would be silently dropped exactly when the freshness rider fires — a file
+// drifted on disk mid-edit, the case the guard exists for.
+type argGuardPendingRider struct {
+	text    string // the rider content block
+	ignored string // capped key list, mirrored into StructuredContent
+}
+
+type argGuardRiderSlotKey struct{}
+
+// withArgGuardRiderSlot arms the deferred rider attach for one dispatch.
+func withArgGuardRiderSlot(ctx context.Context) context.Context {
+	return context.WithValue(ctx, argGuardRiderSlotKey{}, &argGuardPendingRider{})
+}
+
+func pendingArgGuardRider(ctx context.Context) *argGuardPendingRider {
+	p, _ := ctx.Value(argGuardRiderSlotKey{}).(*argGuardPendingRider)
+	return p
+}
+
+// attachRiderToResult appends the rider content block and mirrors the capped
+// key list into a structured payload that carries one. Error results never
+// gain the rider: their error text stays clean.
+func attachRiderToResult(res *mcp.CallToolResult, text, ignored string) {
+	if res == nil || res.IsError || text == "" {
+		return
+	}
+	res.Content = append(res.Content, mcp.NewTextContent(text))
+	if sc, ok := res.StructuredContent.(map[string]any); ok {
+		if _, taken := sc["_ignored_options"]; !taken {
+			sc["_ignored_options"] = ignored
+		}
+	}
+}
+
+// attachPendingArgGuardRider lands the deferred rider at the end of the
+// dispatch chain. It runs after the injection screen (sanitize wraps the
+// handler, not the decorators), so the rider — whose key names are caller
+// text — is screened here with the same detector; an existing security
+// notice is never overwritten.
+func (s *Server) attachPendingArgGuardRider(ctx context.Context, res *mcp.CallToolResult) *mcp.CallToolResult {
+	pending := pendingArgGuardRider(ctx)
+	if pending == nil || pending.text == "" {
+		return res
+	}
+	attachRiderToResult(res, pending.text, pending.ignored)
+	if s.sanitizeInjection && res != nil && !res.IsError {
+		if hits := detectInjection(pending.text); len(hits) > 0 {
+			if res.Meta == nil || res.Meta.AdditionalFields["gortex_security"] == nil {
+				annotateSecurityMeta(res, nil, hits)
+			}
+		}
+	}
+	return res
+}
+
 // toolArgGuardKeys extracts a tool's declared top-level option names and
 // whether its schema closes itself. Only an explicit
 // additionalProperties:false on a structured schema closes it — one left
@@ -106,25 +191,28 @@ func wrapToolArgGuard(tool mcp.Tool, handler server.ToolHandlerFunc) server.Tool
 			return handler(ctx, req)
 		}
 		sort.Strings(unknown)
+		ignored := toolArgGuardEcho(unknown)
 		if mode == "reject" {
 			return mcp.NewToolResultError(fmt.Sprintf(
 				"%s does not accept option(s): %s; %s. The call was not executed — resend it with declared options only.",
-				name, strings.Join(unknown, ", "), validGloss)), nil
+				name, ignored, validGloss)), nil
 		}
 		res, err := handler(ctx, req)
 		// The rider is a nudge on a successful result only: an error result
 		// keeps its error text clean, and structured readers get the same
 		// nudge mirrored into the structured payload — Content alone is
-		// invisible to them.
+		// invisible to them. When the dispatch wrapper armed the deferred
+		// slot, the rider is recorded there and attached after the
+		// warming / freshness decorators — appending it here would hand it
+		// to rebuildTextResult to drop. A slot-less call (direct handler
+		// invocation) attaches inline, where no decorator runs.
 		if err == nil && res != nil && !res.IsError {
-			ignored := strings.Join(unknown, ", ")
-			res.Content = append(res.Content, mcp.NewTextContent(fmt.Sprintf(
-				"_ignored_options: %s — not options of %s; %s",
-				ignored, name, validGloss)))
-			if sc, ok := res.StructuredContent.(map[string]any); ok {
-				if _, taken := sc["_ignored_options"]; !taken {
-					sc["_ignored_options"] = ignored
-				}
+			text := fmt.Sprintf("_ignored_options: %s — not options of %s; %s",
+				ignored, name, validGloss)
+			if slot := pendingArgGuardRider(ctx); slot != nil {
+				slot.text, slot.ignored = text, ignored
+			} else {
+				attachRiderToResult(res, text, ignored)
 			}
 		}
 		return res, err

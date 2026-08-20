@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -329,6 +331,69 @@ func TestCLIShapedFramesSurviveGuardE2E(t *testing.T) {
 		require.NotContains(t, guardResultText(res), "does not accept option", c.name)
 		require.NotContains(t, guardResultText(res), "_ignored_options", "%s must not warn on the format pin", c.name)
 	}
+}
+
+// The warn rider must survive the response decorators.
+// decorateResultWithWarming and decorateResultWithFreshness both end in
+// rebuildTextResult, which rebuilds the result from Content[0] and drops
+// every other block — so a rider appended mid-chain vanishes exactly when
+// the freshness rider fires: a file drifted on disk mid-edit, the #597
+// poster child. This drives the real dispatch path with a drifted file and
+// pins that BOTH signals arrive.
+func TestWarnRiderSurvivesFreshnessRebuildE2E(t *testing.T) {
+	t.Setenv("GORTEX_TOOLS", "full")
+	srv, dir := setupTestServer(t)
+	ctx := guardE2ESession(t, srv, "arg_guard_drift_e2e")
+	t.Setenv(toolArgGuardEnv, "")
+
+	// Drift the file on disk after indexing — the normal mid-edit state.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(`package main
+
+type Config struct {
+	Port int
+	Host string
+}
+
+func main() {
+	helper()
+}
+
+func helper() {}
+`), 0o644))
+
+	res := guardE2ECall(t, srv, ctx, 2, "read_file", map[string]any{"path": "main.go", "line_range": []any{1, 2}})
+	require.False(t, res.IsError, guardResultText(res))
+	text := guardResultText(res)
+	require.Contains(t, text, "freshness",
+		"fixture sanity: the drifted file must fire the freshness rider")
+	assert.Contains(t, text, "_ignored_options",
+		"the warn rider must survive the freshness rebuild")
+	assert.Contains(t, text, "line_range")
+}
+
+// The echoed unknown-key list is caller-controlled, so the rider and the
+// reject error bound it in both count and per-key length.
+func TestGuardEchoedKeyListIsCapped(t *testing.T) {
+	tool, calls := guardFixture(t)
+	long := strings.Repeat("k", 300)
+	args := map[string]any{
+		"aaa": 1, "bbb": 1, "ccc": 1, "ddd": 1, "eee": 1, "fff": 1, "ggg": 1,
+		long: 1,
+	}
+
+	t.Setenv(toolArgGuardEnv, "")
+	res := callGuarded(t, tool, calls, args)
+	text := guardResultText(res)
+	assert.Contains(t, text, "_ignored_options")
+	assert.Contains(t, text, "more)", "overflow keys collapse to a (+N more) tail")
+	assert.NotContains(t, text, long, "an oversized key is truncated, never echoed whole")
+
+	t.Setenv(toolArgGuardEnv, "reject")
+	res = callGuarded(t, tool, calls, args)
+	require.True(t, res.IsError)
+	text = guardResultText(res)
+	assert.Contains(t, text, "more)")
+	assert.NotContains(t, text, long)
 }
 
 // Handler-honored keys must be declared: read_file reads max_chars

@@ -136,6 +136,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// forwarding derive child contexts, so the pointer survives both paths;
 		// idempotence prevents nested preparation from resetting the budget.
 		ctx = withLocalizationFileRequestBudget(ctx)
+		// Arm the arg guard's deferred-rider slot: the guard runs inside the
+		// handler chain, but its warn rider must attach AFTER the decorators
+		// below (see attachPendingArgGuardRider).
+		ctx = withArgGuardRiderSlot(ctx)
 		if injectOverlay {
 			var err error
 			ctx, _, err = s.prepareOverlayRequest(ctx)
@@ -190,6 +194,14 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 				// or vanished on disk is flagged with per-repo provenance.
 				res = s.decorateListResultWithFreshness(res)
 			}
+		}
+		// The arg guard's warn rider lands here — after the warming and
+		// freshness decorators, both of which rebuild the text result from
+		// Content[0] and would drop a rider block attached any earlier. This
+		// is what keeps the unknown-option signal alive on the case it
+		// exists for: a drifted file mid-edit carrying both riders.
+		if hErr == nil {
+			res = s.attachPendingArgGuardRider(ctx, res)
 		}
 		// Capture large successful responses into the session ring so
 		// the post-filter tools can re-cut them without re-querying.
