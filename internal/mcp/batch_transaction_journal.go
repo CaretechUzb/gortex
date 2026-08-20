@@ -33,8 +33,7 @@ func batchManifestPath(transactionID string) string {
 }
 
 func digestBatchBytes(content []byte) string {
-	sum := sha256.Sum256(content)
-	return hex.EncodeToString(sum[:])
+	return sha256Hex(content)
 }
 
 func (s *Server) persistBatchManifest(receipt batchTransactionReceipt) error {

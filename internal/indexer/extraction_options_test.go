@@ -127,3 +127,54 @@ func TestRepositoryExtractionOptionsIsolationAndOverlayParity(t *testing.T) {
 		}
 	}
 }
+
+// TestRepositoryExtractionOptionsMatchHelperCaseInsensitively walks the whole
+// opt-in chain — env gate, repo-local allow-list file, indexer options, Go
+// extractor — and asserts a declared helper name matches its call site
+// regardless of capitalisation. A case near-miss used to fail silently: the
+// dispatch fell back to the hidden "heuristic" tier when the callee carried an
+// "env" marker, and left the graph entirely when it did not.
+func TestRepositoryExtractionOptionsMatchHelperCaseInsensitively(t *testing.T) {
+	t.Setenv(config.LocalTemporalOptInEnv, "true")
+
+	for _, testCase := range []struct {
+		name     string
+		declared string
+		callSite string
+	}{
+		{name: "exact", declared: "CorpEnvLookup", callSite: "CorpEnvLookup"},
+		{name: "declared lower", declared: "corpenvlookup", callSite: "CorpEnvLookup"},
+		{name: "declared upper", declared: "CORPENVLOOKUP", callSite: "CorpEnvLookup"},
+		// No "env" marker in the name, so a miss here drops the edge's env
+		// attribution entirely instead of degrading it to the heuristic tier.
+		{name: "no env marker", declared: "getCorpValue", callSite: "GetCorpValue"},
+		// Entries are bare function names; only the call site's trailing
+		// identifier is matched, so a package-qualified call still resolves.
+		{name: "package qualified call", declared: "corpEnvLookup", callSite: "cfgutil.CorpEnvLookup"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeIndexerTemporalAllowlist(t, root, testCase.declared)
+
+			reg := parser.NewRegistry()
+			languages.RegisterAll(reg)
+			idx := New(graph.New(), reg, config.IndexConfig{}, zap.NewNop())
+			idx.SetRootPath(root)
+			defer idx.Close()
+
+			result, err := idx.ExtractBuffer("go", "sample.go", indexerTemporalSource(testCase.callSite))
+			if err != nil {
+				t.Fatal(err)
+			}
+			meta := indexerTemporalMeta(result)
+			if meta == nil {
+				t.Fatalf("declared %q vs call site %q: Temporal edge missing",
+					testCase.declared, testCase.callSite)
+			}
+			if got := meta["temporal_env_source"]; got != "allowlist" {
+				t.Fatalf("declared %q vs call site %q: temporal_env_source = %#v, want %q",
+					testCase.declared, testCase.callSite, got, "allowlist")
+			}
+		})
+	}
+}

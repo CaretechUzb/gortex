@@ -188,6 +188,26 @@ func resolveGortexCommandFrom(exe string, exeErr error, lookPath string, lookErr
 // than the bare name. The returned value is a bare binary reference
 // with no subcommand — callers append " hook" (and any --mode suffix).
 func ResolveGortexHookBinary() string {
+	return ResolveGortexLaunchBinary()
+}
+
+// ResolveGortexLaunchBinary returns the gortex binary reference to bake
+// into an MCP server stanza for a host that launches the server itself
+// rather than through the user's login shell. It is the same value (and
+// the same decision core) as ResolveGortexHookBinary; the two names
+// exist so each call site reads as what it is.
+//
+// ResolveGortexCommand is the wrong resolver for such a host. It
+// collapses to the bare "gortex" whenever PATH resolves to the running
+// binary — correct for Claude Code, which keys OAuth tokens on the
+// command string and must match the portable project template, but the
+// bare name is only findable if the launching process inherits the PATH
+// that `gortex init` ran under. A GUI-launched host does not: on macOS
+// it inherits launchd's PATH, which carries neither Homebrew's
+// /opt/homebrew/bin nor ~/.local/bin nor ~/go/bin, so the spawn fails
+// with ENOENT. Pinning the absolute path is what the hook writer
+// already does for exactly this reason (gortexhq/gortex#607).
+func ResolveGortexLaunchBinary() string {
 	exe, exeErr := os.Executable()
 	lp, lpErr := exec.LookPath("gortex")
 	return resolveGortexHookBinaryFrom(exe, exeErr, lp, lpErr, sameFile)
