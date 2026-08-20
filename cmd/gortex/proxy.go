@@ -155,7 +155,11 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 // The remedy is direction-aware: an older daemon should be restarted
 // (a restart respawns it from this newer binary), while a newer daemon
 // means this binary is the stale side and upgrading it is the fix —
-// restarting would downgrade the daemon to this older build. When
+// restarting would downgrade the daemon to this older build. The
+// upgrade remedy is 'gortex upgrade' rather than a package-manager
+// specific command: it upgrades the way gortex was installed (brew,
+// scoop, go install, or the install script) and restarts the daemon
+// around the binary swap. When
 // either side does not parse as semver, or only the build metadata
 // differs (which SemVer precedence ignores), a generic remedy that
 // covers both directions is emitted. Implements the documented intent
@@ -170,15 +174,15 @@ func daemonSkewWarning(daemonVer, localVer string) string {
 	d, dErr := semver.Parse(daemonVer)
 	l, lErr := semver.Parse(localVer)
 	if dErr != nil || lErr != nil {
-		return base + " — run 'gortex daemon restart' or upgrade this binary"
+		return base + " — run 'gortex daemon restart' or 'gortex upgrade'"
 	}
 	switch compareSemver(d, l) {
 	case -1: // daemon older — restarting respawns it from this newer binary
 		return base + " — run 'gortex daemon restart' to upgrade the daemon"
 	case 1: // daemon newer — this binary is the stale side
-		return base + " — this binary is older than the running daemon — upgrade it (e.g. brew upgrade gortex)"
+		return base + " — this binary is older than the running daemon — run 'gortex upgrade'"
 	default: // same precedence, different build metadata
-		return base + " — run 'gortex daemon restart' or upgrade this binary"
+		return base + " — run 'gortex daemon restart' or 'gortex upgrade'"
 	}
 }
 
