@@ -254,7 +254,14 @@ func (v *lspGraphView) hasUnresolvedDemand(n *graph.Node) bool {
 // cross-file / dynamic hierarchy edges is the sweep's whole value for types.
 // A bare data type with neither buys nothing from hover or hierarchy
 // interrogation, and no longer keeps its file in the demand-gated sweep.
-func (v *lspGraphView) typeIsDispatchRelevant(n *graph.Node) bool {
+//
+// That strict check presumes SOME lane other than the sweep can mint the
+// qualifying edge. hierarchyEvidence says whether one has (see
+// enrichLanguageHasHierarchyEvidence); when it has not, every class is
+// treated as hierarchy-involved — the pre-gate permissive behaviour — because
+// in such a language the sweep is the only producer of the very edge the
+// strict check would require.
+func (v *lspGraphView) typeIsDispatchRelevant(n *graph.Node, hierarchyEvidence bool) bool {
 	if n == nil {
 		return false
 	}
@@ -263,6 +270,9 @@ func (v *lspGraphView) typeIsDispatchRelevant(n *graph.Node) bool {
 	}
 	if n.Kind != graph.KindType {
 		return false
+	}
+	if !hierarchyEvidence {
+		return true
 	}
 	for _, e := range v.outByID[n.ID] {
 		if e.Kind == graph.EdgeImplements || e.Kind == graph.EdgeExtends {

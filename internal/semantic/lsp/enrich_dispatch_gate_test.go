@@ -49,13 +49,56 @@ func TestEnrichTypeIsDispatchRelevantFromView(t *testing.T) {
 		},
 	)
 
-	assert.True(t, enrichTypeIsDispatchRelevantFromView(view, iface), "an interface is always dispatch surface")
-	assert.True(t, enrichTypeIsDispatchRelevantFromView(view, impl), "a type implementing an interface")
-	assert.True(t, enrichTypeIsDispatchRelevantFromView(view, unresolvedBase), "an unresolvable base list still counts — the sweep is the only path that recovers it")
-	assert.True(t, enrichTypeIsDispatchRelevantFromView(view, superType), "a type something else extends")
-	assert.False(t, enrichTypeIsDispatchRelevantFromView(view, poco), "a bare data type is not")
-	assert.False(t, enrichTypeIsDispatchRelevantFromView(view, method), "callables have their own predicate")
-	assert.False(t, enrichTypeIsDispatchRelevantFromView(view, nil))
+	assert.True(t, enrichTypeIsDispatchRelevantFromView(view, iface, true), "an interface is always dispatch surface")
+	assert.True(t, enrichTypeIsDispatchRelevantFromView(view, impl, true), "a type implementing an interface")
+	assert.True(t, enrichTypeIsDispatchRelevantFromView(view, unresolvedBase, true), "an unresolvable base list still counts — the sweep is the only path that recovers it")
+	assert.True(t, enrichTypeIsDispatchRelevantFromView(view, superType, true), "a type something else extends")
+	assert.False(t, enrichTypeIsDispatchRelevantFromView(view, poco, true), "a bare data type is not")
+	assert.False(t, enrichTypeIsDispatchRelevantFromView(view, method, true), "callables have their own predicate")
+	assert.False(t, enrichTypeIsDispatchRelevantFromView(view, nil, true))
+
+	// Without hierarchy evidence the strict check is circular (the sweep is
+	// the only producer of the qualifying edge) — every type falls back to
+	// permissive admission while non-types stay out.
+	assert.True(t, enrichTypeIsDispatchRelevantFromView(view, poco, false), "no evidence → a bare data type is admitted permissively")
+	assert.True(t, enrichTypeIsDispatchRelevantFromView(view, iface, false))
+	assert.False(t, enrichTypeIsDispatchRelevantFromView(view, method, false), "the fallback widens types only, never callables")
+	assert.False(t, enrichTypeIsDispatchRelevantFromView(view, nil, false))
+}
+
+// The self-tuning switch for the type gate: evidence is an extends /
+// implements edge some non-LSP lane minted for THIS language. The sweep's own
+// recoveries (lsp_resolved / lsp_dispatch) and other languages' edges do not
+// count — either would flip a hierarchy-blind language onto the circular
+// strict gate.
+func TestEnrichLanguageHasHierarchyEvidence(t *testing.T) {
+	goImpl := &graph.Node{ID: "a.go::Circle", Kind: graph.KindType, Name: "Circle", Language: "go"}
+	goIface := &graph.Node{ID: "a.go::Shape", Kind: graph.KindInterface, Name: "Shape", Language: "go"}
+	csImpl := &graph.Node{ID: "b.cs::Disc", Kind: graph.KindType, Name: "Disc", Language: "csharp"}
+	csIface := &graph.Node{ID: "b.cs::IShape", Kind: graph.KindInterface, Name: "IShape", Language: "csharp"}
+	nodes := []*graph.Node{goImpl, goIface, csImpl, csIface}
+	matchGo := func(lang string) bool { return lang == "go" }
+
+	astEdge := &graph.Edge{From: goImpl.ID, To: goIface.ID, Kind: graph.EdgeImplements, Origin: graph.OriginASTResolved}
+	bareEdge := &graph.Edge{From: goImpl.ID, To: graph.UnresolvedMarker + "Base", Kind: graph.EdgeExtends}
+	lspEdge := &graph.Edge{From: goImpl.ID, To: goIface.ID, Kind: graph.EdgeImplements, Origin: graph.OriginLSPResolved}
+	dispatchEdge := &graph.Edge{From: goImpl.ID, To: goIface.ID, Kind: graph.EdgeImplements, Origin: graph.OriginLSPDispatch}
+	csEdge := &graph.Edge{From: csImpl.ID, To: csIface.ID, Kind: graph.EdgeImplements, Origin: graph.OriginASTResolved}
+	callEdge := &graph.Edge{From: goImpl.ID, To: goIface.ID, Kind: graph.EdgeCalls, Origin: graph.OriginASTResolved}
+
+	probe := func(edges ...*graph.Edge) bool {
+		return enrichLanguageHasHierarchyEvidence(newLSPGraphView(nodes, edges), edges, matchGo)
+	}
+
+	assert.True(t, probe(astEdge), "an extractor-produced implements edge is evidence")
+	assert.True(t, probe(bareEdge), "an unresolved-target base-list edge (empty origin) is evidence — the extractor minted it")
+	assert.False(t, probe(), "no edges, no evidence")
+	assert.False(t, probe(lspEdge), "the sweep's own lsp_resolved recovery is not evidence")
+	assert.False(t, probe(dispatchEdge), "lsp_dispatch is not evidence either")
+	assert.False(t, probe(csEdge), "another language's edge is not evidence for this one")
+	assert.False(t, probe(callEdge), "non-hierarchy kinds never count")
+	assert.True(t, probe(lspEdge, csEdge, astEdge), "one qualifying edge among noise is enough")
+	assert.False(t, probe(nil), "nil edges are skipped")
 }
 
 // TestLSP_Enrich_SweepGate drives one pass over three files under the demand
@@ -128,4 +171,117 @@ func TestLSP_Enrich_SweepGate(t *testing.T) {
 		"a type involved in a hierarchy keeps its file in the sweep")
 	assert.True(t, hoveredURIs[pathToURI(filepath.Join(repoRoot, "want.go"))],
 		"unresolved demand keeps a type-less file in the sweep")
+}
+
+// The strict gate is circular in languages whose extractor emits no base-list
+// edges and that have no supplemental type lane (c, cpp, objc, swift): there
+// the sweep's typeHierarchy hop is the ONLY producer of extends / implements
+// edges, so requiring such an edge for admission demands as input exactly
+// what the sweep exists to produce, and the hierarchy is never recovered.
+// When the language's edge set carries zero extractor-produced hierarchy
+// edges the gate must fall back to the permissive kind check.
+func TestLSP_Enrich_SweepGate_PermissiveFallbackWithoutHierarchyEvidence(t *testing.T) {
+	t.Setenv(SweepEnv, "") // demand default
+
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "poco.go"),
+		[]byte("package p\n\ntype Box struct{}\n\nfunc (b Box) Size() int { return 0 }\n"), 0o644))
+
+	server := newInstrumentedServer()
+	mu, hovered := hoverURIRecorder(server)
+
+	p, cleanup := providerWithInstrumentedServer(t, server, []string{"go"}, 4)
+	defer cleanup()
+
+	// A bare class-only graph: no extends / implements edge exists anywhere in
+	// the language — the extractor for this language cannot produce one.
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "poco.go::Box", Kind: graph.KindType, Name: "Box",
+		FilePath: "poco.go", StartLine: 3, EndLine: 3, Language: "go"})
+	g.AddNode(&graph.Node{ID: "poco.go::Box.Size", Kind: graph.KindMethod, Name: "Size",
+		FilePath: "poco.go", StartLine: 5, EndLine: 5, Language: "go"})
+	g.AddEdge(&graph.Edge{From: "poco.go::Box.Size", To: "poco.go::Box", Kind: graph.EdgeMemberOf})
+
+	require.NoError(t, runEnrich(t, p, g, repoRoot, 3*time.Second))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.True(t, hovered["poco.go"],
+		"with zero hierarchy edges in the language the type gate must fall back to permissive — the sweep is the only producer of those edges")
+}
+
+// The evidence probe is per-language: another language's hierarchy edges say
+// nothing about what THIS language's extractor can produce. A repo mixing C#
+// (extractor emits implements) with a hierarchy-blind language must not let
+// the C# edges flip the blind language onto the strict gate.
+func TestLSP_Enrich_SweepGate_OtherLanguageEvidenceDoesNotCount(t *testing.T) {
+	t.Setenv(SweepEnv, "") // demand default
+
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "poco.go"),
+		[]byte("package p\n\ntype Box struct{}\n\nfunc (b Box) Size() int { return 0 }\n"), 0o644))
+
+	server := newInstrumentedServer()
+	mu, hovered := hoverURIRecorder(server)
+
+	p, cleanup := providerWithInstrumentedServer(t, server, []string{"go"}, 4)
+	defer cleanup()
+
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "poco.go::Box", Kind: graph.KindType, Name: "Box",
+		FilePath: "poco.go", StartLine: 3, EndLine: 3, Language: "go"})
+	// Hierarchy evidence exists in the repo — but in a DIFFERENT language.
+	g.AddNode(&graph.Node{ID: "s.cs::IShape", Kind: graph.KindInterface, Name: "IShape",
+		FilePath: "s.cs", StartLine: 1, EndLine: 1, Language: "csharp"})
+	g.AddNode(&graph.Node{ID: "s.cs::Circle", Kind: graph.KindType, Name: "Circle",
+		FilePath: "s.cs", StartLine: 3, EndLine: 3, Language: "csharp"})
+	g.AddEdge(&graph.Edge{From: "s.cs::Circle", To: "s.cs::IShape", Kind: graph.EdgeImplements,
+		FilePath: "s.cs", Line: 3})
+
+	require.NoError(t, runEnrich(t, p, g, repoRoot, 3*time.Second))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.True(t, hovered["poco.go"],
+		"hierarchy evidence from another language must not put this language on the strict gate")
+}
+
+// Edges the sweep itself recovered (lsp_resolved / lsp_dispatch) are not
+// evidence the extractor can produce them: counting the sweep's own output
+// would flip a hierarchy-blind language onto the strict gate on the second
+// run, and every class added after that would carry no edge, be dropped, and
+// never have its hierarchy recovered.
+func TestLSP_Enrich_SweepGate_LSPRecoveredEdgesAreNotEvidence(t *testing.T) {
+	t.Setenv(SweepEnv, "") // demand default
+
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "hier.go"),
+		[]byte("package p\n\ntype Base struct{}\n\ntype Derived struct{ Base }\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "fresh.go"),
+		[]byte("package p\n\ntype Fresh struct{}\n"), 0o644))
+
+	server := newInstrumentedServer()
+	mu, hovered := hoverURIRecorder(server)
+
+	p, cleanup := providerWithInstrumentedServer(t, server, []string{"go"}, 4)
+	defer cleanup()
+
+	// The only hierarchy edge in the language is one a PRIOR sweep recovered.
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "hier.go::Base", Kind: graph.KindType, Name: "Base",
+		FilePath: "hier.go", StartLine: 3, EndLine: 3, Language: "go"})
+	g.AddNode(&graph.Node{ID: "hier.go::Derived", Kind: graph.KindType, Name: "Derived",
+		FilePath: "hier.go", StartLine: 5, EndLine: 5, Language: "go"})
+	g.AddEdge(&graph.Edge{From: "hier.go::Derived", To: "hier.go::Base", Kind: graph.EdgeExtends,
+		FilePath: "hier.go", Line: 5,
+		Confidence: 1.0, ConfidenceLabel: "CONFIRMED", Origin: graph.OriginLSPResolved})
+	g.AddNode(&graph.Node{ID: "fresh.go::Fresh", Kind: graph.KindType, Name: "Fresh",
+		FilePath: "fresh.go", StartLine: 3, EndLine: 3, Language: "go"})
+
+	require.NoError(t, runEnrich(t, p, g, repoRoot, 3*time.Second))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.True(t, hovered["fresh.go"],
+		"sweep-recovered edges are not extractor evidence — a new bare class must still be admitted")
 }

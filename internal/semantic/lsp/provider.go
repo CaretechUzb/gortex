@@ -374,9 +374,41 @@ func enrichCallableIsDispatchRelevantFromView(view *lspGraphView, n *graph.Node)
 // unresolved-call demand (demand only counts callables), so a file whose only
 // enrichable work is a type hierarchy would score zero demand and be skipped
 // under the demand default; this signal keeps exactly those files in while a
-// bare data type no longer admits its whole file.
-func enrichTypeIsDispatchRelevantFromView(view *lspGraphView, n *graph.Node) bool {
-	return view.typeIsDispatchRelevant(n)
+// bare data type no longer admits its whole file. hierarchyEvidence is the
+// per-language self-tuning switch computed by
+// enrichLanguageHasHierarchyEvidence: without it the strict check would be
+// circular and the gate stays permissive.
+func enrichTypeIsDispatchRelevantFromView(view *lspGraphView, n *graph.Node, hierarchyEvidence bool) bool {
+	return view.typeIsDispatchRelevant(n, hierarchyEvidence)
+}
+
+// enrichLanguageHasHierarchyEvidence reports whether the language's edge set
+// carries at least one extends / implements edge some non-LSP lane produced —
+// the AST extractor, the tstypes supplemental lane, or resolver inference.
+// The strict type gate is meaningful only where such a lane exists: in
+// languages with none (c, cpp, objc, swift — no base-list extraction, no
+// tstypes lane) the sweep's typeHierarchy hop is the ONLY producer of
+// hierarchy edges, so requiring an existing edge for admission would demand
+// as input exactly what the sweep exists to produce, and a class-only file's
+// hierarchy would never be recovered. Edges the sweep itself recovered
+// (lsp_resolved / lsp_dispatch) are excluded: counting the sweep's own output
+// would flip such a language onto the strict gate one run later and silently
+// drop every class added after that. One pass over the repo's projected
+// edges, attributed to a language via the source node — no per-language
+// table.
+func enrichLanguageHasHierarchyEvidence(view *lspGraphView, repoEdges []*graph.Edge, languageMatches func(string) bool) bool {
+	for _, e := range repoEdges {
+		if e == nil || (e.Kind != graph.EdgeImplements && e.Kind != graph.EdgeExtends) {
+			continue
+		}
+		if e.Origin == graph.OriginLSPResolved || e.Origin == graph.OriginLSPDispatch {
+			continue
+		}
+		if from := view.nodesByID[e.From]; from != nil && languageMatches(from.Language) {
+			return true
+		}
+	}
+	return false
 }
 
 // nodeHasSemanticType reports whether a node already carries a non-empty
@@ -1376,13 +1408,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// Demand/dispatch decisions are immutable during the concurrent sweep.
 	// Compute them once from the repo adjacency projection before any file
 	// goroutine starts staging new hierarchy edges into that projection.
+	langHierarchyEvidence := enrichLanguageHasHierarchyEvidence(view, repoEdges, p.languageMatches)
 	nodeDemand := make(map[string]bool, len(langNodes))
 	nodeDispatch := make(map[string]bool, len(langNodes))
 	nodeTypeDispatch := make(map[string]bool, len(langNodes))
 	for _, n := range langNodes {
 		nodeDemand[n.ID] = enrichNodeHasUnresolvedDemandFromView(view, n)
 		nodeDispatch[n.ID] = enrichCallableIsDispatchRelevantFromView(view, n)
-		nodeTypeDispatch[n.ID] = enrichTypeIsDispatchRelevantFromView(view, n)
+		nodeTypeDispatch[n.ID] = enrichTypeIsDispatchRelevantFromView(view, n, langHierarchyEvidence)
 	}
 
 	// Group enrichment targets by file so each file's open/close lifecycle
