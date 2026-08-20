@@ -1,6 +1,6 @@
 module github.com/zzet/gortex
 
-go 1.26.6
+go 1.27.0
 
 require (
 	github.com/alexaandru/go-sitter-forest/ada v1.9.0

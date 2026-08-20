@@ -438,12 +438,12 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 	editsArg := strings.TrimSpace(req.GetString("edits", ""))
 	if editsArg == "" {
 		return &prReviewSimulation{
-				Ran: false, GraphUntouched: true,
-				Note: "no `edits` supplied — pass a JSON array of WorkspaceEdit objects to run the simulation section",
-			}, reviewGate{
-				Name: "simulate_chain", Status: prReviewPass,
-				Detail: "skipped: no edits supplied",
-			}, nil
+			Ran: false, GraphUntouched: true,
+			Note: "no `edits` supplied — pass a JSON array of WorkspaceEdit objects to run the simulation section",
+		}, reviewGate{
+			Name: "simulate_chain", Status: prReviewPass,
+			Detail: "skipped: no edits supplied",
+		}, nil
 	}
 
 	sessionID := strings.TrimSpace(req.GetString("session_id", ""))
@@ -452,23 +452,23 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 	}
 	if sessionID == "" {
 		return &prReviewSimulation{
-				Ran: false, GraphUntouched: true,
-				Note: "simulation section skipped: pass an explicit `session_id` (an overlay session) — the simulation is not run against a synthesized or empty session",
-			}, reviewGate{
-				Name: "simulate_chain", Status: prReviewPass,
-				Detail: "skipped: no overlay session id",
-			}, nil
+			Ran: false, GraphUntouched: true,
+			Note: "simulation section skipped: pass an explicit `session_id` (an overlay session) — the simulation is not run against a synthesized or empty session",
+		}, reviewGate{
+			Name: "simulate_chain", Status: prReviewPass,
+			Detail: "skipped: no overlay session id",
+		}, nil
 	}
 
 	edits, err := parsePRReviewEdits(editsArg)
 	if err != nil {
 		return &prReviewSimulation{
-				Ran: false, GraphUntouched: true, SessionID: sessionID,
-				Note: "invalid edits: " + err.Error(),
-			}, reviewGate{
-				Name: "simulate_chain", Status: prReviewWarn,
-				Detail: "invalid edits: " + err.Error(),
-			}, nil
+			Ran: false, GraphUntouched: true, SessionID: sessionID,
+			Note: "invalid edits: " + err.Error(),
+		}, reviewGate{
+			Name: "simulate_chain", Status: prReviewWarn,
+			Detail: "invalid edits: " + err.Error(),
+		}, nil
 	}
 
 	// Run the chain on top of the named session's overlay. buildSimulation
@@ -481,12 +481,12 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 			return nil, reviewGate{}, ctxErr
 		}
 		return &prReviewSimulation{
-				Ran: false, GraphUntouched: true, SessionID: sessionID,
-				Note: "simulation failed: " + simErr.Error(),
-			}, reviewGate{
-				Name: "simulate_chain", Status: prReviewWarn,
-				Detail: "simulation failed: " + simErr.Error(),
-			}, nil
+			Ran: false, GraphUntouched: true, SessionID: sessionID,
+			Note: "simulation failed: " + simErr.Error(),
+		}, reviewGate{
+			Name: "simulate_chain", Status: prReviewWarn,
+			Detail: "simulation failed: " + simErr.Error(),
+		}, nil
 	}
 
 	steps := make([]map[string]any, 0, len(sim.steps))

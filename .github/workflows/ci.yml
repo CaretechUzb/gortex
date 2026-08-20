@@ -12,7 +12,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-        go-version: ['1.26']
+        go-version: ['1.27']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -27,7 +27,7 @@ jobs:
         run: go test -race -timeout=30m -coverprofile=coverage.out ./...
 
       - name: Upload coverage
-        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.26'
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.27'
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
         with:
           files: coverage.out
@@ -177,7 +177,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.11.4
+          version: v2.13.1
           args: --timeout=10m
 
       # goreleaser used to run `go mod tidy` as a release before-hook, which
