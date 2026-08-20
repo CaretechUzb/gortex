@@ -621,11 +621,12 @@ func (v *OverlaidView) GetRepoNodes(repoPrefix string) []*Node {
 	out := make([]*Node, 0, len(baseNodes))
 	for _, n := range baseNodes {
 		if v.layer.HasFile(IDFile(n.ID)) {
-			// File is overlaid. Surface only if the overlay
-			// re-emitted this exact ID; otherwise it's hidden.
-			if v.layer.nodeByID[n.ID] == nil {
-				continue
-			}
+			// File is overlaid: the layer owns every node in it.
+			// Re-emitted IDs come back below from the layer's own
+			// per-file list (with the layer's payload, not base's);
+			// IDs the overlay dropped stay hidden. Either way base's
+			// copy is skipped, so a re-emitted ID is returned once.
+			continue
 		}
 		out = append(out, n)
 	}
@@ -638,10 +639,37 @@ func (v *OverlaidView) GetRepoNodes(repoPrefix string) []*Node {
 	return out
 }
 
+// baseEdgeVisible is the single predicate every reader applies to a
+// base edge, so point, batched and bulk reads all expose the same
+// edge relation.
+//
+// Source side: once the layer owns the source identity it owns that
+// source's whole adjacency, so base's edges out of it are dropped —
+// whether the overlay re-emitted the source or deleted it.
+//
+// Target side: the edge survives while the target identity is still
+// visible through the view. A target the overlay re-emitted under the
+// same ID keeps the edge (the logical symbol is still there); a
+// target the overlay hid removes it.
+//
+// Both sides read through the same ownership helpers the bounded
+// adjacency readers use, so every edge surface answers alike.
+func (v *OverlaidView) baseEdgeVisible(e *Edge) bool {
+	if e == nil {
+		return false
+	}
+	if v.layer == nil {
+		return true
+	}
+	if v.overlayOwnsIdentity(e.From) {
+		return false
+	}
+	return v.overlayTargetVisible(e.To)
+}
+
 // GetOutEdges: when the source node's file is overlaid, use the
 // overlay's resolved out-edges. Otherwise return base's edges but
-// drop any whose target points into an overlaid file at a node ID
-// the overlay no longer carries (target deleted in buffer).
+// drop any whose target the overlay hid (deleted in buffer).
 func (v *OverlaidView) GetOutEdges(nodeID string) []*Edge {
 	if v.layer != nil && v.nodeBelongsToOverlay(nodeID) {
 		src := v.layer.outEdges[nodeID]
@@ -658,10 +686,8 @@ func (v *OverlaidView) GetOutEdges(nodeID string) []*Edge {
 	}
 	out := edges[:0:0]
 	for _, e := range edges {
-		if v.layer.HasFile(IDFile(e.To)) {
-			if v.layer.nodeByID[e.To] == nil {
-				continue // target deleted in overlay
-			}
+		if !v.baseEdgeVisible(e) {
+			continue
 		}
 		out = append(out, e)
 	}
@@ -681,13 +707,7 @@ func (v *OverlaidView) GetInEdges(nodeID string) []*Edge {
 	var out []*Edge
 	if v.base != nil {
 		for _, e := range v.base.GetInEdges(nodeID) {
-			if v.layer.HasFile(IDFile(e.From)) {
-				// Source is overlaid — the overlay's version of this
-				// edge wins (or the overlay simply deleted the call).
-				continue
-			}
-			if v.layer.HasFile(IDFile(e.To)) && v.layer.nodeByID[e.To] == nil {
-				// Target was deleted by the overlay.
+			if !v.baseEdgeVisible(e) {
 				continue
 			}
 			out = append(out, e)
@@ -736,10 +756,8 @@ func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
 			}
 			filtered := edges[:0:0]
 			for _, e := range edges {
-				if v.layer.HasFile(IDFile(e.To)) {
-					if v.layer.nodeByID[e.To] == nil {
-						continue // target deleted in overlay
-					}
+				if !v.baseEdgeVisible(e) {
+					continue
 				}
 				filtered = append(filtered, e)
 			}
@@ -783,11 +801,8 @@ func (v *OverlaidView) GetInEdgesByNodeIDs(ids []string) map[string][]*Edge {
 			}
 			filtered := edges[:0:0]
 			for _, e := range edges {
-				if v.layer.HasFile(IDFile(e.From)) {
-					continue // source is overlaid — overlay's version wins
-				}
-				if v.layer.HasFile(IDFile(e.To)) && v.layer.nodeByID[e.To] == nil {
-					continue // target was deleted by overlay
+				if !v.baseEdgeVisible(e) {
+					continue
 				}
 				filtered = append(filtered, e)
 			}
@@ -835,8 +850,13 @@ func (v *OverlaidView) AllNodes() []*Node {
 	return out
 }
 
-// AllEdges returns base's edges minus those involving overlaid
-// files, plus every overlay-introduced edge.
+// AllEdges returns the base edges that survive the overlay plus every
+// overlay-introduced edge. Survival uses the same baseEdgeVisible
+// predicate the point and batched readers apply, so a bulk read is
+// set-equivalent to walking GetOutEdges over every visible source: a
+// base edge from an unchanged source into a target the overlay
+// re-emitted under the same ID stays, and it goes only when the
+// overlay hid the target.
 func (v *OverlaidView) AllEdges() []*Edge {
 	if v.base == nil {
 		return nil
@@ -847,7 +867,7 @@ func (v *OverlaidView) AllEdges() []*Edge {
 	}
 	out := make([]*Edge, 0, len(baseEdges))
 	for _, e := range baseEdges {
-		if v.layer.HasFile(IDFile(e.From)) || v.layer.HasFile(IDFile(e.To)) {
+		if !v.baseEdgeVisible(e) {
 			continue
 		}
 		out = append(out, e)
@@ -867,6 +887,16 @@ func (v *OverlaidView) NodeCount() int {
 	if v.layer == nil {
 		return v.base.NodeCount()
 	}
+	return v.base.NodeCount() + v.nodeCountDelta()
+}
+
+// nodeCountDelta is the overlay's net effect on any base node total:
+// every covered file trades its base nodes for the layer's (none, for
+// a tombstone). Walks the overlay's footprint only — never the graph.
+func (v *OverlaidView) nodeCountDelta() int {
+	if v.base == nil || v.layer == nil {
+		return 0
+	}
 	delta := 0
 	for path, entry := range v.layer.entries {
 		baseCount := len(v.base.GetFileNodes(path))
@@ -876,7 +906,7 @@ func (v *OverlaidView) NodeCount() int {
 		}
 		delta += len(entry.Nodes) - baseCount
 	}
-	return v.base.NodeCount() + delta
+	return delta
 }
 
 func (v *OverlaidView) EdgeCount() int {
@@ -889,9 +919,10 @@ func (v *OverlaidView) EdgeCount() int {
 	return len(v.AllEdges())
 }
 
-// EdgeIdentityRevisions delegates to the base graph: provenance churn
-// is a property of the persistent graph, and an overlay layer is a
-// non-mutating per-session shadow that never upgrades edge provenance.
+// EdgeIdentityRevisions stays base-derived under an overlay:
+// provenance churn is a property of the persistent graph, and an
+// overlay layer is a non-mutating per-session shadow that never
+// upgrades edge provenance, so it contributes no revisions.
 func (v *OverlaidView) EdgeIdentityRevisions() int {
 	if v.base == nil {
 		return 0
@@ -899,30 +930,145 @@ func (v *OverlaidView) EdgeIdentityRevisions() int {
 	return v.base.EdgeIdentityRevisions()
 }
 
-// Stats is best-effort under overlay: we report base's stats (the
-// analyzer-shaped GraphStats requires per-kind / per-language
-// breakdowns that the overlay layer doesn't expose cheaply). Caching
-// keeps repeated Stats() calls inside one request to a single base
-// lookup.
+// Stats reports base's analyzer-shaped stats with the overlay folded
+// into the totals: TotalNodes carries the same node delta NodeCount
+// applies, TotalEdges the same delta EdgeCount applies, so the three
+// counters agree on one graph size.
+//
+// Base-derived under an overlay (deliberately not adjusted):
+//   - ByKind and ByLanguage — the layer keeps no per-kind /
+//     per-language rollup, and recomputing one means walking every
+//     node in the graph.
+//
+// Caching keeps repeated Stats() calls inside one request to a single
+// base lookup.
 func (v *OverlaidView) Stats() GraphStats {
 	if v.base == nil {
 		return GraphStats{}
 	}
 	v.statsOnce.Do(func() {
 		v.stats = v.base.Stats()
+		if v.layer == nil {
+			return
+		}
+		v.stats.TotalNodes += v.nodeCountDelta()
+		v.stats.TotalEdges += v.EdgeCount() - v.base.EdgeCount()
 	})
 	return v.stats
 }
 
-// RepoStats — same conservatism as Stats; overlay deltas are
-// excluded. The handful of tools that read RepoStats are bookkeeping
-// rather than load-bearing, and the overlay-affected nodes are still
-// reachable through the per-node read paths.
+// RepoStats returns base's per-repo rollup with the overlay's node and
+// edge deltas folded into the repo each covered file belongs to. Only
+// the overlay's own footprint is walked — the covered files' base
+// nodes and the layer's replacements — so the call stays proportional
+// to the overlay, not to the graph.
+//
+// Base-derived under an overlay (deliberately not adjusted):
+//   - ByKind and ByLanguage — same reason as Stats.
 func (v *OverlaidView) RepoStats() map[string]GraphStats {
 	if v.base == nil {
 		return nil
 	}
-	return v.base.RepoStats()
+	stats := v.base.RepoStats()
+	if v.layer == nil {
+		return stats
+	}
+	nodeDelta, edgeDelta := v.repoCountDeltas()
+	if len(nodeDelta) == 0 && len(edgeDelta) == 0 {
+		return stats
+	}
+	if stats == nil {
+		stats = make(map[string]GraphStats, len(nodeDelta))
+	}
+	apply := func(prefix string) {
+		entry := stats[prefix]
+		entry.TotalNodes += nodeDelta[prefix]
+		entry.TotalEdges += edgeDelta[prefix]
+		stats[prefix] = entry
+	}
+	for prefix := range nodeDelta {
+		apply(prefix)
+	}
+	for prefix := range edgeDelta {
+		if _, done := nodeDelta[prefix]; done {
+			continue
+		}
+		apply(prefix)
+	}
+	return stats
+}
+
+// repoCountDeltas returns the per-repo node and edge deltas the
+// overlay induces, keyed by repo prefix. Edges are charged to the
+// source node's repo, the same attribution base's RepoStats uses, and
+// an edge counts as gone exactly when baseEdgeVisible says the readers
+// hide it. Nodes and edges outside a repo (empty prefix) are skipped —
+// base leaves them out of the per-repo rollup too.
+//
+// Every lookup is keyed off the overlay's own footprint: the covered
+// files' base nodes, their adjacency, and the layer's replacements.
+func (v *OverlaidView) repoCountDeltas() (map[string]int, map[string]int) {
+	nodes := make(map[string]int)
+	edges := make(map[string]int)
+	// Sources outside the covered files that lose an edge because the
+	// overlay hid its target. Charged to the source's repo, so the
+	// sources are resolved in one batched node lookup at the end.
+	lostBySource := make(map[string]int)
+	for path, entry := range v.layer.entries {
+		baseNodes := v.base.GetFileNodes(path)
+		repoByID := make(map[string]string, len(baseNodes))
+		baseIDs := make([]string, 0, len(baseNodes))
+		for _, n := range baseNodes {
+			if n == nil || n.RepoPrefix == "" {
+				continue
+			}
+			nodes[n.RepoPrefix]--
+			repoByID[n.ID] = n.RepoPrefix
+			baseIDs = append(baseIDs, n.ID)
+		}
+		if len(baseIDs) > 0 {
+			// Everything leaving a covered file is replaced by the
+			// layer's own out-edges for that source.
+			for id, outEdges := range v.base.GetOutEdgesByNodeIDs(baseIDs) {
+				if prefix := repoByID[id]; prefix != "" {
+					edges[prefix] -= len(outEdges)
+				}
+			}
+			for _, inEdges := range v.base.GetInEdgesByNodeIDs(baseIDs) {
+				for _, e := range inEdges {
+					if e == nil || v.baseEdgeVisible(e) {
+						continue
+					}
+					if v.layer.HasFile(IDFile(e.From)) {
+						continue // already charged on the out-edge side
+					}
+					lostBySource[e.From]++
+				}
+			}
+		}
+		if entry.Deleted {
+			continue
+		}
+		for _, n := range entry.Nodes {
+			if n == nil || n.RepoPrefix == "" {
+				continue
+			}
+			nodes[n.RepoPrefix]++
+			edges[n.RepoPrefix] += len(v.layer.outEdges[n.ID])
+		}
+	}
+	if len(lostBySource) > 0 {
+		sourceIDs := make([]string, 0, len(lostBySource))
+		for id := range lostBySource {
+			sourceIDs = append(sourceIDs, id)
+		}
+		for id, n := range v.base.GetNodesByIDs(sourceIDs) {
+			if n != nil && n.RepoPrefix != "" {
+				edges[n.RepoPrefix] -= lostBySource[id]
+			}
+		}
+	}
+	return nodes, edges
 }
 
 // Compile-time assertion that *OverlaidView satisfies Reader.
