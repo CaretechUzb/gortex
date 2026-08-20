@@ -201,19 +201,18 @@ func TestLSP_Enrich_DefConfirm_CtorHitConfirmsTypeTarget(t *testing.T) {
 	assert.Equal(t, "dom.go::Crate", edge.To, "the edge keeps its type target — no retarget to the ctor")
 }
 
-// A dispatched call site: definition answers the interface's declared member
-// while the stored edge targets one concrete impl. The declared-member edge is
-// added at LSP grade; the impl edge — an inference the compiler cannot vouch
-// for — is left exactly as it was: not retargeted, not demoted, not promoted.
-func TestLSP_Enrich_DefConfirm_DispatchedCallAddsDeclaredMemberEdge(t *testing.T) {
-	t.Setenv(SweepEnv, "full")
-	repoRoot := t.TempDir()
+// dispatchedCallFixture seeds a dispatched call site: an interface with a
+// declared member, one concrete impl, and a stored AST-inferred call edge
+// targeting the impl. The fake server's definition answers the interface's
+// declared member — the compiler vouching for the declaration, not the
+// devirtualization guess. Returns the live impl edge.
+func dispatchedCallFixture(t *testing.T, repoRoot string, g graph.Store, server *fakeLSPServer) *graph.Edge {
+	t.Helper()
 	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "scales.go"),
 		[]byte("package p\ntype IScale interface {\n\tWeigh() int\n}\n\ntype DrumScale struct{\n\tWeighImpl int\n}\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "station.go"),
 		[]byte("package p\nfunc station() { Weigh() }\n"), 0o644))
 
-	g := graph.New()
 	g.AddNode(&graph.Node{ID: "scales.go::IScale", Kind: graph.KindInterface, Name: "IScale",
 		FilePath: "scales.go", StartLine: 2, EndLine: 4, Language: "go"})
 	g.AddNode(&graph.Node{ID: "scales.go::IScale.Weigh", Kind: graph.KindMethod, Name: "Weigh",
@@ -234,7 +233,6 @@ func TestLSP_Enrich_DefConfirm_DispatchedCallAddsDeclaredMemberEdge(t *testing.T
 	}
 	g.AddEdge(implEdge)
 
-	server := newFakeLSPServer()
 	server.handle("textDocument/definition", func(json.RawMessage) (any, *jsonRPCError) {
 		// The compiler's answer: the interface's declared member (0-based 2).
 		return []Location{{
@@ -243,6 +241,19 @@ func TestLSP_Enrich_DefConfirm_DispatchedCallAddsDeclaredMemberEdge(t *testing.T
 		}}, nil
 	})
 	server.handle("textDocument/hover", func(json.RawMessage) (any, *jsonRPCError) { return nil, nil })
+	return implEdge
+}
+
+// A dispatched call site: definition answers the interface's declared member
+// while the stored edge targets one concrete impl. The declared-member edge is
+// added at LSP grade; the impl edge — an inference the compiler cannot vouch
+// for — is left exactly as it was: not retargeted, not demoted, not promoted.
+func TestLSP_Enrich_DefConfirm_DispatchedCallAddsDeclaredMemberEdge(t *testing.T) {
+	t.Setenv(SweepEnv, "full")
+	repoRoot := t.TempDir()
+	g := graph.New()
+	server := newFakeLSPServer()
+	implEdge := dispatchedCallFixture(t, repoRoot, g, server)
 
 	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
 	defer cleanup()
@@ -263,6 +274,51 @@ func TestLSP_Enrich_DefConfirm_DispatchedCallAddsDeclaredMemberEdge(t *testing.T
 		}
 	}
 	require.NotNil(t, declared, "the compiler-proven edge to the declared member must be added")
+	assert.Equal(t, graph.OriginLSPResolved, declared.Origin)
+	assert.Equal(t, 2, declared.Line, "the added edge carries the call site")
+}
+
+// The declared-member arm lives in the shared definition-rebind pass, so it is
+// default-path behavior, not part of the heavy opt-out. With the heavy legs ON
+// and references answering empty, the unconfirmed site falls through to the
+// definition pass — and the verdict must be the same add-not-rebind: previously
+// this path REBOUND the impl edge to the declared member, so a gopls/tsserver/
+// pyright repo now keeps the devirtualization guess AND gains the declared edge.
+func TestLSP_Enrich_HeavyDefault_DispatchedCallAddsDeclaredMemberEdge(t *testing.T) {
+	t.Setenv(SweepEnv, "full")
+	repoRoot := t.TempDir()
+	g := graph.New()
+	server := newFakeLSPServer()
+	implEdge := dispatchedCallFixture(t, repoRoot, g, server)
+
+	// The references sweep runs first and must yield no verdict, leaving the
+	// site to the definition pass.
+	refs := &atomic.Int64{}
+	server.handle("textDocument/references", func(json.RawMessage) (any, *jsonRPCError) {
+		refs.Add(1)
+		return []Location{}, nil
+	})
+
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	// noHeavyRequests stays false — this is every spec-less server's path.
+
+	require.NoError(t, runEnrich(t, p, g, repoRoot, 5*time.Second))
+
+	assert.Positive(t, refs.Load(), "the default path must still run its references sweep")
+	assert.Equal(t, "scales.go::DrumScale.Weigh", implEdge.To,
+		"the impl edge keeps its target — the devirtualization guess is not destroyed")
+	assert.Equal(t, graph.OriginASTInferred, implEdge.Origin,
+		"the impl edge keeps its origin — an inference stays labeled as one")
+	assert.Equal(t, 0.7, implEdge.Confidence)
+
+	var declared *graph.Edge
+	for _, e := range g.GetOutEdges("station.go::station") {
+		if e.To == "scales.go::IScale.Weigh" && e.Kind == graph.EdgeCalls {
+			declared = e
+		}
+	}
+	require.NotNil(t, declared, "the compiler-proven edge must be added on the default path too")
 	assert.Equal(t, graph.OriginLSPResolved, declared.Origin)
 	assert.Equal(t, 2, declared.Line, "the added edge carries the call site")
 }
