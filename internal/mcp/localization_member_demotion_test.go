@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,6 +151,137 @@ func TestLocalizationDemotionPermutesOnlyInsideEachFilesOwnSlots(t *testing.T) {
 		"detect", "warm", "reload", "", "ShaderCache.<init>", "floating", "shaderSlots",
 	}, memberDemotionNames(out))
 	require.Equal(t, memberDemotionNames(out), memberDemotionNames(demoteLocalizationFileMembers(out)), "the reorder is idempotent")
+}
+
+func memberDemotionSignalCandidate(file, name string, kind graph.NodeKind, signal string) *rerank.Candidate {
+	candidate := memberDemotionCandidate(file, name, kind)
+	candidate.Signals = map[string]float64{signal: 1}
+	return candidate
+}
+
+func memberDemotionWindowFiles(cands []*rerank.Candidate, maxSymbols int) map[string]int {
+	counts := make(map[string]int, maxSymbols)
+	for index, cand := range cands {
+		if index >= maxSymbols || cand == nil || cand.Node == nil {
+			continue
+		}
+		counts[cand.Node.FilePath]++
+	}
+	return counts
+}
+
+func TestLocalizationSiblingLiftTradesAMemberSlotForItsOrdinarySibling(t *testing.T) {
+	tests := []struct {
+		name   string
+		member string
+		kind   graph.NodeKind
+		lifted string
+	}{
+		{name: "constructor", member: "DirectoryConfiguration.<init>", kind: graph.KindMethod, lifted: "userInboundEventTriggered"},
+		{name: "field", member: "shaderSlots", kind: graph.KindField, lifted: "applyPointLights"},
+		{name: "enum member", member: "ShaderStage.vertex", kind: graph.KindEnumMember, lifted: "applyPointLights"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			in := []*rerank.Candidate{
+				memberDemotionCandidate("config.swift", test.member, test.kind),
+				memberDemotionCandidate("cache.swift", "warm", graph.KindMethod),
+				memberDemotionCandidate("config.swift", test.lifted, graph.KindMethod),
+			}
+			before := memberDemotionWindowFiles(in, 2)
+
+			out := liftLocalizationSiblingCallables("directory configuration detection is broken", in, 2, nil)
+
+			require.Equal(t, []string{test.lifted, "warm", test.member}, memberDemotionNames(out))
+			require.Equal(t, before, memberDemotionWindowFiles(out, 2), "the file keeps exactly the slots it won")
+			require.Equal(t, memberDemotionFiles(in), memberDemotionFiles(out), "no candidate crosses into another file's slot")
+		})
+	}
+}
+
+func TestLocalizationSiblingLiftKeepsProvenAndCitedMemberSlots(t *testing.T) {
+	tests := []struct {
+		name   string
+		task   string
+		member *rerank.Candidate
+		lift   func(cands []*rerank.Candidate) []*rerank.Candidate
+	}{
+		{
+			name:   "source literal",
+			task:   "directory configuration detection is broken",
+			member: memberDemotionSignalCandidate("config.swift", "shaderSlots", graph.KindField, exploreSourceLiteralSignal),
+		},
+		{
+			name:   "exact content",
+			task:   "directory configuration detection is broken",
+			member: memberDemotionSignalCandidate("config.swift", "shaderSlots", graph.KindField, exploreContentRecallExactSignal),
+		},
+		{
+			name:   "syntactic anchor",
+			task:   "directory configuration detection is broken",
+			member: memberDemotionSignalCandidate("config.swift", "DirectoryConfiguration.<init>", graph.KindMethod, exploreSyntacticAnchorSignal),
+		},
+		{
+			name:   "identifier the task cites",
+			task:   "shaderSlots is never reset",
+			member: memberDemotionCandidate("config.swift", "shaderSlots", graph.KindField),
+		},
+		{
+			name:   "protected anchor owner",
+			task:   "directory configuration detection is broken",
+			member: memberDemotionCandidate("config.swift", "shaderSlots", graph.KindField),
+			lift: func(cands []*rerank.Candidate) []*rerank.Candidate {
+				return liftLocalizationSiblingCallables(
+					"directory configuration detection is broken", cands, 2,
+					map[int]string{0: cands[0].Node.ID},
+				)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			in := []*rerank.Candidate{
+				test.member,
+				memberDemotionCandidate("cache.swift", "warm", graph.KindMethod),
+				memberDemotionCandidate("config.swift", "detect", graph.KindMethod),
+			}
+			lift := test.lift
+			if lift == nil {
+				lift = func(cands []*rerank.Candidate) []*rerank.Candidate {
+					return liftLocalizationSiblingCallables(test.task, cands, 2, nil)
+				}
+			}
+			require.Equal(t, memberDemotionNames(in), memberDemotionNames(lift(in)))
+		})
+	}
+}
+
+func TestLocalizationSiblingLiftIsANoOpWithoutAComparableSibling(t *testing.T) {
+	member := memberDemotionCandidate("config.swift", "DirectoryConfiguration.<init>", graph.KindMethod)
+	tail := func(extra ...*rerank.Candidate) []*rerank.Candidate {
+		return append([]*rerank.Candidate{member, memberDemotionCandidate("cache.swift", "warm", graph.KindMethod)}, extra...)
+	}
+	distant := make([]*rerank.Candidate, 0, localizationSiblingLiftReach+1)
+	for i := 0; i < localizationSiblingLiftReach; i++ {
+		distant = append(distant, memberDemotionCandidate("cache.swift", fmt.Sprintf("warm%d", i), graph.KindMethod))
+	}
+	distant = append(distant, memberDemotionCandidate("config.swift", "detect", graph.KindMethod))
+
+	tests := []struct {
+		name string
+		in   []*rerank.Candidate
+	}{
+		{name: "sibling never retrieved", in: tail(memberDemotionCandidate("cache.swift", "reload", graph.KindMethod))},
+		{name: "only members below the cut", in: tail(memberDemotionCandidate("config.swift", "root", graph.KindField))},
+		{name: "sibling past the reach", in: tail(distant...)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, memberDemotionNames(test.in), memberDemotionNames(
+				liftLocalizationSiblingCallables("directory configuration detection is broken", test.in, 2, nil),
+			))
+		})
+	}
 }
 
 func memberDemotionTarget(file, name string, kind graph.NodeKind) exploreTarget {
@@ -434,6 +566,36 @@ func TestIndexedSwiftMemberDemotionAppliesOnlyToTheLocalizePage(t *testing.T) {
 	require.GreaterOrEqual(t, plainField, 0, "explore lists the ranked field: %s", plain.Text)
 	require.GreaterOrEqual(t, plainMethod, 0, "explore lists the ranked method: %s", plain.Text)
 	require.Less(t, plainField, plainMethod, "the non-localize page is untouched by localization demotion: %s", plain.Text)
+}
+
+func TestIndexedSwiftMemberDemotionKeepsAnEditableSiblingInATightWindow(t *testing.T) {
+	const task = "directory configuration detection is broken"
+	server := newIndexedSwiftMemberDemotionServer(t)
+	request := mcpgo.CallToolRequest{}
+	request.Params.Arguments = map[string]any{
+		"task":          task,
+		"localize":      true,
+		"max_symbols":   3,
+		"token_budget":  2400,
+		"repository_id": "swift-fixture",
+	}
+	result, err := server.handleExplore(context.Background(), request)
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+	text, ok := result.Content[0].(mcpgo.TextContent)
+	require.True(t, ok)
+	var envelope localizationExploreEnvelope
+	require.NoError(t, json.Unmarshal([]byte(text.Text), &envelope))
+
+	names := make([]string, 0, len(envelope.Evidence))
+	for _, evidence := range envelope.Evidence {
+		names = append(names, evidence.Name)
+	}
+	// Ranking hands this file's three slots to its type, constructor and a
+	// field; the sibling methods are retrieved but lose the cut, and no later
+	// stage can recover a candidate the cut dropped.
+	require.Equal(t, []string{"DirectoryConfiguration", "detect", "reload"}, names,
+		"unexpected tight-window page: %#v", envelope.Evidence)
 }
 
 func TestIndexedSwiftMemberDemotionOrdersTheLocalizationPageLeadingFile(t *testing.T) {

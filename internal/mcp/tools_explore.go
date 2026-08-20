@@ -2925,6 +2925,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		prod, maxSymbols,
 		exploreFinalReservedCandidateIDs(prod, protectedSyntacticAnchors, protectedImplementationID),
 	)
+	if localize {
+		// Last chance to keep an editable declaration from the file: once the cut
+		// drops a candidate, no later reordering can bring it back. Trades happen
+		// inside one file's own competition, so the per-file and cross-file
+		// allocation the lanes above settled is carried through unchanged.
+		prod = liftLocalizationSiblingCallables(task, prod, maxSymbols, protectedSyntacticAnchors)
+	}
 	cands := selectFinalExploreCandidates(prod, test, maxSymbols)
 	if len(protectedSyntacticAnchors) > 0 {
 		// Source-literal selection owns its own final-slot guarantees. Re-union
@@ -5062,6 +5069,131 @@ func demoteLocalizationFileMembers(cands []*rerank.Candidate) []*rerank.Candidat
 		}
 	}
 	return out
+}
+
+// localizationSiblingLiftReach bounds "comparable standing" to the tail
+// immediately past the cut: a sibling that lost by a wide margin lost on its own
+// merits, and lifting it would be a ranking change rather than a tie-break.
+const localizationSiblingLiftReach = 8
+
+// localizationMemberSlotGuard decides which member candidates may not be traded
+// out of the final window. Beyond the reserved-seat rule the projection uses,
+// this boundary also protects the inputs of the lanes that run after the cut:
+// dropping one of those is not a reordering, it silently disables a proof.
+type localizationMemberSlotGuard struct {
+	task    string
+	ids     map[string]struct{}
+	anchors []exploreSyntacticAnchor
+	active  []int
+}
+
+func newLocalizationMemberSlotGuard(task string, protectedAnchors map[int]string) localizationMemberSlotGuard {
+	guard := localizationMemberSlotGuard{task: task, ids: make(map[string]struct{}, len(protectedAnchors))}
+	for _, id := range protectedAnchors {
+		if id != "" {
+			guard.ids[id] = struct{}{}
+		}
+	}
+	if len(protectedAnchors) > 0 {
+		guard.anchors = exploreSyntacticAnchors(task)
+		guard.active = exploreTypedAnchorActiveIndexes(guard.anchors, protectedAnchors)
+	}
+	return guard
+}
+
+// protects keeps a member's slot when a proof lane identified it by something no
+// member inherits from its owner type — the task's own literal text, an exact
+// cited range, a graph proof, or the task naming that exact identifier — or when
+// the candidate is a typed field the anchor projection may still lower into its
+// owner/consumer/member proof.
+func (g localizationMemberSlotGuard) protects(candidate *rerank.Candidate) bool {
+	if candidate == nil || candidate.Node == nil {
+		return true
+	}
+	if _, anchored := g.ids[candidate.Node.ID]; anchored {
+		return true
+	}
+	for _, signal := range []string{
+		exploreSourceRangeSignal, exploreContentRecallExactSignal,
+		exploreSourceLiteralSignal, exploreSourceLiteralCalleeSignal,
+		exploreSourceLiteralTaskAlignSignal, exploreTypedAnchorProjectionSignal,
+		exploreSyntacticAnchorSignal,
+	} {
+		if candidate.Signals[signal] > 0 {
+			return true
+		}
+	}
+	if candidate.Node.Kind == graph.KindField && len(g.active) > 0 &&
+		len(exploreTypedAnchorMatchingIndexes(
+			g.anchors, g.active, candidate.Node, exploreTypedAnchorFieldType(candidate.Node),
+		)) > 0 {
+		return true
+	}
+	return localizationDirectAdjacencyNodeTaskCitationOffset(g.task, candidate.Node) >= 0
+}
+
+// liftLocalizationSiblingCallables trades a window slot a member won back to the
+// ordinary sibling declaration it displaced. A file's slot count is fixed: the
+// two candidates always come from the same file, one inside the cut and one in
+// the bounded tail just past it, so no file gains or loses a slot and no
+// cross-file allocation moves. The trade is a strict no-op when the file has no
+// ordinary sibling in that tail — an unretrieved sibling cannot be selected, and
+// this lane never widens retrieval to look for one.
+func liftLocalizationSiblingCallables(
+	task string,
+	candidates []*rerank.Candidate,
+	maxSymbols int,
+	protectedAnchors map[int]string,
+) []*rerank.Candidate {
+	if maxSymbols <= 0 || len(candidates) <= maxSymbols {
+		return candidates
+	}
+	guard := newLocalizationMemberSlotGuard(task, protectedAnchors)
+	reach := min(len(candidates), maxSymbols+localizationSiblingLiftReach)
+	lifted := candidates
+	copied := false
+	traded := make(map[int]struct{}, maxSymbols)
+	for index := 0; index < maxSymbols; index++ {
+		candidate := lifted[index]
+		if candidate == nil || candidate.Node == nil || candidate.Node.FilePath == "" {
+			continue
+		}
+		if localizationMemberTier(candidate.Node) == localizationMemberTierBehavioral {
+			continue
+		}
+		if guard.protects(candidate) {
+			continue
+		}
+		sibling := -1
+		for below := maxSymbols; below < reach; below++ {
+			if _, used := traded[below]; used {
+				continue
+			}
+			other := lifted[below]
+			if other == nil || other.Node == nil {
+				continue
+			}
+			if other.Node.FilePath != candidate.Node.FilePath ||
+				other.Node.RepoPrefix != candidate.Node.RepoPrefix {
+				continue
+			}
+			if localizationMemberTier(other.Node) != localizationMemberTierBehavioral {
+				continue
+			}
+			sibling = below
+			break
+		}
+		if sibling < 0 {
+			continue
+		}
+		if !copied {
+			lifted = append([]*rerank.Candidate(nil), candidates...)
+			copied = true
+		}
+		lifted[index], lifted[sibling] = lifted[sibling], lifted[index]
+		traded[sibling] = struct{}{}
+	}
+	return lifted
 }
 
 // localizationEvidenceSeatReserved reports whether an evidence row owes its seat
