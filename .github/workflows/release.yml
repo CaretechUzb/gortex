@@ -720,7 +720,11 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/}"
           mkdir -p verify
           cd verify
-          gh release download "$TAG" --clobber
+          # --repo is required: this job deliberately skips actions/checkout
+          # (it verifies published bytes, not the source tree), so there is no
+          # git remote for gh to infer the repository from and the command
+          # would abort with "not a git repository".
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --clobber
 
           shopt -s nullglob
           # Keyless certs live ~10 minutes, so verify-blob resolves the
