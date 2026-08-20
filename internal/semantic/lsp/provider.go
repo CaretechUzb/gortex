@@ -1115,13 +1115,17 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		// — the reference sweep never runs. Every sited target goes straight
 		// to the definition pass below, which reaches the same confirm /
 		// rebind verdicts from the call site at position-request cost.
-		// Targets without a recorded site line are left at their heuristic
-		// tier: there is no site to ask definition at.
-		for _, grp := range confirmGroups {
-			for _, t := range grp.targets {
-				if t.edge.Line > 0 {
-					fallback = append(fallback, t)
-				}
+		// Built from the raw target list, not confirmGroups: the grouping
+		// drops targets on referent-side conditions (no position, unserved
+		// referent file) that exist only because findReferences opens the
+		// REFERENT's file, and a misbound edge with an unusable stored
+		// target is exactly what the rebind arm is for. The definition pass
+		// applies its own call-site filters when it groups. Targets without
+		// a recorded site line are left at their heuristic tier: there is
+		// no site to ask definition at.
+		for _, t := range targets {
+			if t.edge.Line > 0 {
+				fallback = append(fallback, t)
 			}
 		}
 	} else {
@@ -1309,9 +1313,15 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						// No verdict — leave the edge at its heuristic tier
 						// so min_tier filtering excludes it.
 					case cand.ID == toNode.ID:
+						// Yield feeds the productivity checkpoint: under the
+						// heavy opt-out this pass is the only confirm source
+						// until the hover phase, and without these the
+						// checkpoint reads a pass that settles thousands of
+						// edges here as zero-yield and cancels it.
 						semantic.ConfirmEdge(t.edge, p.Name())
 						fallbackMutations.stagePersist(t.edge)
 						result.EdgesConfirmed++
+						usefulYield.Add(1)
 					case view.declaredDispatchMember(cand) && view.implementsDeclaredMember(toNode, cand):
 						// The compiler answers the DECLARED member — the site's static
 						// receiver is the interface / abstract base, so the stored edge
@@ -1328,6 +1338,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 								t.edge.FilePath, t.edge.Line, p.Name(), graph.OriginLSPResolved)
 							if fallbackMutations.stageAdd(view, declared) {
 								result.EdgesAdded++
+								usefulYield.Add(1)
 							}
 						}
 					case rebindTargetAcceptable(cand.Kind) && !edgeExistsAt(view, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line):
@@ -1339,6 +1350,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						t.edge.Meta["rebound_from"] = oldTo
 						fallbackMutations.stageReindex(view, t.edge, oldTo)
 						result.EdgesConfirmed++
+						usefulYield.Add(1)
 					}
 					rmu.Unlock()
 				}
@@ -2931,6 +2943,13 @@ func (p *Provider) EnsureFileOpen(repoRoot, relPath string) error {
 // unlocked; the graph mutations are batched under the resolve mutex.
 func (p *Provider) ConfirmSymbolRefs(g graph.Store, repoRoot string, n *graph.Node) (int, error) {
 	if n == nil || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
+		return 0, nil
+	}
+	if p.noHeavyRequests {
+		// incomingCalls rides the same FindReferences machinery the sweep
+		// skips for this server (ServerSpec.NoHeavyRequests) — a long-lived
+		// daemon answering find_usages would accumulate the leak one query
+		// at a time.
 		return 0, nil
 	}
 	if !p.Supports("textDocument/prepareCallHierarchy") {

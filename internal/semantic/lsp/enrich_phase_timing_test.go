@@ -12,12 +12,13 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// The completion log must break the enrich wall time out per pass. The Fleet
-// forensics hit a wall without this: 241k requests took the same 26 minutes at
-// maxParallel 6 and 12, so the pole is NOT slot starvation — but the single
-// aggregate duration cannot say which pass owns the minutes. Every phase
-// boundary already exists in EnrichRepoContext; this pins that their wall
-// times ride the log the forensics scripts scrape.
+// The completion log must break the enrich wall time out per pass. Speed
+// forensics on a production C# monorepo hit a wall without this: 241k
+// requests took the same 26 minutes at maxParallel 6 and 12, so the pole was
+// NOT slot starvation — but the single aggregate duration cannot say which
+// pass owns the minutes. Every phase boundary already exists in
+// EnrichRepoContext; this pins that their wall times ride the log the
+// forensics scripts scrape.
 func TestLSP_Enrich_CompletionLogCarriesPhaseTimings(t *testing.T) {
 	t.Setenv(SweepEnv, "full")
 	repoRoot := t.TempDir()

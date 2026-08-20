@@ -482,7 +482,9 @@ for repositories you trust.
   hit it. Concurrency is bounded by `ServerSpec.MaxParallel` (6-10
   inflight requests per server depending on the spec).
   `semantic.lsp_max_parallel` in config overrides the spec's cap for
-  every spawned server — the durable knob for a machine whose servers
-  multiplex better than the conservative default assumes. The
+  every router-spawned server — the durable knob for a machine whose
+  servers multiplex better than the conservative default assumes. The
   `GORTEX_LSP_MAX_PARALLEL` env override wins over both for one-run
-  experiments. Non-positive or unparseable values fall through.
+  experiments (and also reaches resolver-pool providers, which take env +
+  spec only; legacy config-declared providers keep their explicit
+  setting). Non-positive or unparseable values fall through.

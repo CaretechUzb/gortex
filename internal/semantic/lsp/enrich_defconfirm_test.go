@@ -382,3 +382,54 @@ func TestLSP_Enrich_DefinitionPassRunsSiteFilesInParallel(t *testing.T) {
 	}
 	assert.Equal(t, n, confirmed, "parallelism must not cost any confirm verdict")
 }
+
+// The no-heavy fallback must include every SITED target, not just those the
+// references sweep could serve: groupConfirmTargets drops targets on
+// referent-side conditions (no position, unserved referent file) that exist
+// only because findReferences opens the referent's file. The definition pass
+// opens the call-site file, so a misbound edge whose stored target has no
+// usable position must still reach the pass — and get rebound to the real
+// declaration.
+func TestLSP_Enrich_NoHeavy_RebindsSitedEdgeWithPositionlessTarget(t *testing.T) {
+	t.Setenv(SweepEnv, "full")
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "def.go"),
+		[]byte("package p\nfunc target() {}\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "call.go"),
+		[]byte("package p\nfunc caller() { target() }\n"), 0o644))
+
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "def.go::target", Kind: graph.KindFunction, Name: "target",
+		FilePath: "def.go", StartLine: 2, EndLine: 2, Language: "go"})
+	// The heuristically-bound target: same name, NO position — the exact
+	// shape groupConfirmTargets cannot serve.
+	g.AddNode(&graph.Node{ID: "ghost.go::target", Kind: graph.KindFunction, Name: "target",
+		FilePath: "ghost.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "call.go::caller", Kind: graph.KindFunction, Name: "caller",
+		FilePath: "call.go", StartLine: 2, EndLine: 2, Language: "go"})
+	edge := &graph.Edge{
+		From: "call.go::caller", To: "ghost.go::target", Kind: graph.EdgeCalls,
+		FilePath: "call.go", Line: 2,
+		Confidence: 0.7, ConfidenceLabel: "INFERRED", Origin: graph.OriginTextMatched,
+	}
+	g.AddEdge(edge)
+
+	server := newFakeLSPServer()
+	server.handle("textDocument/definition", func(json.RawMessage) (any, *jsonRPCError) {
+		return []Location{{
+			URI:   pathToURI(filepath.Join(repoRoot, "def.go")),
+			Range: Range{Start: Position{Line: 1, Character: 5}, End: Position{Line: 1, Character: 11}},
+		}}, nil
+	})
+	server.handle("textDocument/hover", func(json.RawMessage) (any, *jsonRPCError) { return nil, nil })
+
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+	p.noHeavyRequests = true
+
+	require.NoError(t, runEnrich(t, p, g, repoRoot, 5*time.Second))
+
+	assert.Equal(t, "def.go::target", edge.To,
+		"the sited edge must be rebound to the declaration the compiler names")
+	assert.Equal(t, 1.0, edge.Confidence)
+}
