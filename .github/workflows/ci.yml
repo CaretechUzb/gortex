@@ -162,6 +162,21 @@ jobs:
           version: v2.11.4
           args: --timeout=10m
 
+      # goreleaser used to run `go mod tidy` as a release before-hook, which
+      # meant an untidy go.mod was silently rewritten inside the release
+      # container — the shipped binaries could be built against a module set
+      # no CI job had ever compiled. That hook is gone; tidiness is asserted
+      # here instead, on the PR that introduces the drift, and it FAILS rather
+      # than rewrites.
+      - name: go.mod is tidy
+        run: |
+          set -euo pipefail
+          go mod tidy
+          if ! git diff --exit-code --stat go.mod go.sum; then
+            echo "FATAL: go.mod/go.sum are not tidy — run \`go mod tidy\` and commit the result" >&2
+            exit 1
+          fi
+
   build-onnx:
     runs-on: ubuntu-latest
     steps:
