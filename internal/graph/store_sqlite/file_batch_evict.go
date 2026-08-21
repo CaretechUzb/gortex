@@ -66,6 +66,10 @@ func (s *Store) evictByPredicateResult(predicate string, arg any) (nodesRemoved,
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
 	ctx := context.Background()
+	// Generation-unscoped on purpose, like the repo sweeps in store_purge.go:
+	// this path also serves EvictRepo, and the node/edge deletes below reach
+	// every generation, so leaving a binding row behind in another one would
+	// strand it against nodes that no longer exist.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_binding_types WHERE `+predicate, arg); err != nil {
 		return 0, 0, err
 	}

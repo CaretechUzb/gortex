@@ -424,9 +424,9 @@ func TestSweepWarnPlanLocks(t *testing.T) {
 	}{
 		{
 			name:   "blame_enrichment_by_repo",
-			query:  "SELECT node_id FROM blame_enrichment WHERE repo_prefix = ? AND repo_prefix <> \x27\x27",
-			args:   1,
-			want:   []string{"blame_by_repo (repo_prefix=?)"},
+			query:  "SELECT node_id FROM blame_enrichment WHERE view_gen = ? AND repo_prefix = ? AND repo_prefix <> \x27\x27",
+			args:   2,
+			want:   []string{"blame_by_repo (view_gen=? AND repo_prefix=?)"},
 			forbid: []string{"SCAN blame_enrichment"},
 		},
 		{

@@ -518,12 +518,14 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
 		}
 	}
-	// The repository index references columns introduced by the v10 vector
-	// migration, so create it only after pending migrations have rebuilt the
-	// legacy table. On current and fresh stores this is an idempotent no-op.
-	if _, err := db.Exec(vectorRepoIndexSQL); err != nil {
+	// Every generation-keyed sidecar index spans columns a migration step
+	// introduces — view_gen for all of them, plus the vector ownership columns
+	// the v10 rebuild adds — so they are created only after pending steps have
+	// re-keyed their tables. On current and fresh stores this is an idempotent
+	// no-op.
+	if err := createSidecarIndexes(db); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("sqlite vector repository index: %w", err)
+		return nil, fmt.Errorf("sqlite sidecar index: %w", err)
 	}
 	// A schema transition invalidates any generation produced against the old
 	// graph shape. The v4 migration also drops the unreleased blob-only table.
@@ -945,7 +947,7 @@ func (s *Store) prepare() error {
 	// WITHOUT ROWID, so its primary key IS the table: this reads one row per
 	// tracked repo with no scan of nodes or edges.
 	prep(&s.stmtAllRepoStateCounts,
-		`SELECT repo_prefix, node_count, edge_count FROM repo_index_state`)
+		`SELECT repo_prefix, node_count, edge_count FROM repo_index_state WHERE view_gen = ?`)
 
 	prep(&s.stmtStatsByKind,
 		`SELECT kind, COUNT(*) FROM nodes GROUP BY kind`)
@@ -2258,7 +2260,7 @@ func (s *Store) RepoMemoryEstimate(repoPrefix string) graph.RepoMemoryEstimate {
 // renders.
 func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
 	out := map[string]graph.RepoMemoryEstimate{}
-	rows, err := s.stmtAllRepoStateCounts.Query()
+	rows, err := s.stmtAllRepoStateCounts.Query(s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return out

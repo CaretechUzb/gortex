@@ -25,6 +25,14 @@ import (
 // the shared externals out from under every repo, or wipe the lone repo.
 // Every method here refuses or excludes ''.
 
+// GENERATION SCOPE — every statement driven by the four table lists in this
+// file is deliberately generation-UNSCOPED, and so is the EvictRepo path in
+// store.go. Untracking or re-keying a repository removes it from the store
+// entirely, not from one payload view of it: a row left behind in another
+// generation would be residue no later call could reach, which is exactly what
+// these sweeps exist to prevent. Ordinary per-repo reads and writes carry the
+// caller's view_gen; these do not.
+//
 // purgeSidecarTables are the repo_prefix-keyed sidecar tables PurgeRepo
 // clears for a prefix, alongside nodes+edges. Each carries a repo_prefix
 // column a plain `DELETE ... WHERE repo_prefix = ?` keys on. The two FTS5

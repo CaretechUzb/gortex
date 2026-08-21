@@ -652,7 +652,7 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 		return stats, err
 	}
 	if corpusRows := cloneCorpusRowsFromNodes(nodes); len(corpusRows) > 0 {
-		if err := upsertCloneCorpusTx(tx, "", corpusRows); err != nil {
+		if err := upsertCloneCorpusTx(tx, s.viewGen, "", corpusRows); err != nil {
 			return stats, err
 		}
 	}

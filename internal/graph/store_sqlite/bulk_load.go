@@ -682,6 +682,10 @@ func shouldBackoffBulkRowCheckpoint(err error) bool {
 // edges must both be empty, and neither durable warm-restart sidecar may carry
 // prior lifecycle state. Any query error fails closed to the ordinary indexed
 // writer path.
+//
+// The sidecar probes are deliberately generation-unscoped: a store holding any
+// generation's lifecycle rows has been indexed before, whichever view wrote
+// them, so it is not the cold store this fast path is for.
 func coldGraphStoreEmpty(ctx context.Context, conn *sql.Conn) bool {
 	var empty int
 	err := conn.QueryRowContext(ctx, `

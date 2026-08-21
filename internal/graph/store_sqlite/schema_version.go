@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 14
+const currentSchemaVersion = 15
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -82,6 +82,66 @@ var schemaMigrations = []schemaMigration{
 	{version: 12, name: "normalize dir column separators", inPlace: normalizeDirColumnSeparators},
 	{version: 13, name: "add checkout lifecycle catalog", inPlace: createCheckoutCatalogTables},
 	{version: 14, name: "add edges view generation column", inPlace: addEdgeViewGenerationColumn},
+	{version: 15, name: "key payload sidecars by view generation", inPlace: addSidecarViewGenerationKeys},
+}
+
+// addSidecarViewGenerationKeys re-keys every WITHOUT ROWID payload sidecar on
+// a leading view_gen column. A sidecar row belongs to exactly one payload view
+// generation, so the generation has to lead the primary key: without it a
+// second generation's row for the same (repo, file) or node id would collide
+// with the base corpus's row instead of sitting beside it.
+//
+// A primary key cannot be altered in place, so each table is rebuilt: create
+// the replacement, copy every row across at generation 0 through an explicit
+// column list, drop the old table, rename, and recreate its secondary indexes
+// under their existing names. Generation 0 is the single base corpus every
+// existing row already belongs to, so the copy preserves all data and needs no
+// reindex. The whole registry runs inside the one migration transaction, so a
+// failure on any table leaves the store exactly as it was.
+//
+// Idempotent: a table that already carries view_gen is skipped. schemaSQL runs
+// before the migration steps, so on a fresh store every sidecar is already
+// re-keyed when this runs, and the v10 vector rebuild creates its table from
+// the same registry body.
+func addSidecarViewGenerationKeys(tx *sql.Tx) error {
+	for _, sidecar := range viewGenSidecars {
+		if err := rebuildSidecarAtBaseGeneration(tx, sidecar); err != nil {
+			return fmt.Errorf("%s: %w", sidecar.table, err)
+		}
+	}
+	return nil
+}
+
+func rebuildSidecarAtBaseGeneration(tx *sql.Tx, sidecar viewGenSidecar) error {
+	var count int
+	probe := fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_xinfo('%s') WHERE name = ?`, sidecar.table)
+	if err := tx.QueryRow(probe, sidecarViewGenColumnName).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	rebuilt := sidecar.table + "_view_gen_rebuild"
+	if _, err := tx.Exec(`CREATE TABLE ` + rebuilt + sidecar.body); err != nil {
+		return err
+	}
+	copyRows := `INSERT INTO ` + rebuilt + ` (` + sidecarViewGenColumnName + `, ` + sidecar.columns + `)
+SELECT 0, ` + sidecar.columns + ` FROM ` + sidecar.table
+	if _, err := tx.Exec(copyRows); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE ` + sidecar.table); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE ` + rebuilt + ` RENAME TO ` + sidecar.table); err != nil {
+		return err
+	}
+	for _, ddl := range sidecar.indexes {
+		if _, err := tx.Exec(ddl); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // addEdgeViewGenerationColumn adds edges.view_gen to a store whose edges table
