@@ -742,6 +742,20 @@ CREATE TABLE IF NOT EXISTS vectors (
 
 const vectorRepoIndexSQL = `CREATE INDEX IF NOT EXISTS vectors_by_repo ON vectors(repo_prefix, node_id)`
 
+// edgeViewGenColumnDDL is the edges.view_gen column: the payload generation
+// an edge row belongs to. Generation 0 is the single base corpus every row
+// written so far belongs to, which is exactly what the NOT NULL DEFAULT 0
+// gives a row that predates the column — so the addition costs no backfill.
+// A plain column, not one of the generated ones above: nothing in an edge's
+// existing values can compute which generation wrote it.
+//
+// Shared between schemaSQL's CREATE TABLE (fresh stores) and the ALTER TABLE
+// that adds it to an older store, so the two definitions cannot drift.
+const (
+	edgeViewGenColumnName = "view_gen"
+	edgeViewGenColumnDDL  = `view_gen INTEGER NOT NULL DEFAULT 0`
+)
+
 // schemaSQL is the canonical DDL applied on Open. Statements are
 // idempotent (IF NOT EXISTS) so they run cleanly against a fresh DB
 // and against an existing one.
@@ -832,6 +846,7 @@ CREATE TABLE IF NOT EXISTS edges (
     origin           TEXT NOT NULL DEFAULT '',
     tier             TEXT NOT NULL DEFAULT '',
     cross_repo       INTEGER NOT NULL DEFAULT 0,
+    ` + edgeViewGenColumnDDL + `,
     meta             BLOB,
     UNIQUE(from_id, to_id, kind, file_path, line)
 );

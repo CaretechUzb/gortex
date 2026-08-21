@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 13
+const currentSchemaVersion = 14
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -81,6 +81,32 @@ var schemaMigrations = []schemaMigration{
 	{version: 11, name: "add symbol FTS normalization state", inPlace: createSymbolFTSNormalizationStateTable},
 	{version: 12, name: "normalize dir column separators", inPlace: normalizeDirColumnSeparators},
 	{version: 13, name: "add checkout lifecycle catalog", inPlace: createCheckoutCatalogTables},
+	{version: 14, name: "add edges view generation column", inPlace: addEdgeViewGenerationColumn},
+}
+
+// addEdgeViewGenerationColumn adds edges.view_gen to a store whose edges table
+// was created before the column existed. Purely additive: every existing row
+// takes the column default, generation 0, which is the single base corpus they
+// already belong to — no backfill, no reindex.
+//
+// schemaSQL owns the fresh-store definition and runs before the migration
+// steps, so this is a no-op there. The probe reads pragma_table_xinfo rather
+// than table_info for the same reason ensureEdgeColumns does: table_info omits
+// generated columns, and one probe shape that lists every column is the one
+// worth reusing. Idempotent — a second run finds the column and returns.
+func addEdgeViewGenerationColumn(tx *sql.Tx) error {
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_xinfo('edges') WHERE name = ?`,
+		edgeViewGenColumnName,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	_, err := tx.Exec(`ALTER TABLE edges ADD COLUMN ` + edgeViewGenColumnDDL)
+	return err
 }
 
 // createCheckoutCatalogTables is the explicit v13 migration for existing
