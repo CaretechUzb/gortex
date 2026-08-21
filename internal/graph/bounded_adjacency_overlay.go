@@ -7,7 +7,7 @@ var (
 	_ BoundedIncomingEdgeIdentityReader = (*OverlaidView)(nil)
 )
 
-func overlayAdjacencyCompensatedLimit(layer *OverlayLayer, limit int) int {
+func overlayAdjacencyCompensatedLimit(layer OverlayLayerReader, limit int) int {
 	if layer == nil {
 		return limit
 	}
@@ -17,13 +17,29 @@ func overlayAdjacencyCompensatedLimit(layer *OverlayLayer, limit int) int {
 	return MaxBoundedAdjacencyRowsPerKey
 }
 
+// overlayOwnsIdentity reports whether the layer speaks for a node
+// identity: it covers the file the ID belongs to, carries a node under
+// the ID, or marked the ID removed.
 func (v *OverlaidView) overlayOwnsIdentity(id string) bool {
 	return v != nil && v.layer != nil &&
-		(v.nodeBelongsToOverlay(id) || v.layer.ownsNodeIdentity(id))
+		(v.nodeBelongsToOverlay(id) || v.layer.OwnsNodeIdentity(id))
 }
 
-func (v *OverlaidView) overlayTargetVisible(id string) bool {
-	return !v.overlayOwnsIdentity(id) || v.layer.nodeByID[id] != nil
+// overlayOwnsOutEdges reports whether the layer speaks for a node's
+// whole outgoing edge set. It is the wider claim: a layer that only
+// retargets what an untouched node points at owns its adjacency while
+// the node itself keeps coming from base.
+func (v *OverlaidView) overlayOwnsOutEdges(id string) bool {
+	return v != nil && v.layer != nil && v.layer.OwnsOutEdges(id)
+}
+
+// overlayIdentityVisible reports whether a node identity is still
+// visible through the view: either the layer does not speak for it, or
+// it does and kept a node under that ID. Both endpoints of an edge are
+// tested with it, so a source and a target disappear under the same
+// rule.
+func (v *OverlaidView) overlayIdentityVisible(id string) bool {
+	return !v.overlayOwnsIdentity(id) || v.layer.NodeByID(id) != nil
 }
 
 func appendBoundedBaseIdentities(
@@ -124,8 +140,8 @@ func (v *OverlaidView) FindOutgoingEdgeIdentitiesBounded(
 	baseIDs := make([]string, 0, len(ids))
 	overlayIDs := make(map[string]bool, len(ids))
 	for _, id := range ids {
-		if v.overlayOwnsIdentity(id) {
-			overlayIDs[id] = v.layer.nodeByID[id] != nil
+		if v.overlayOwnsOutEdges(id) {
+			overlayIDs[id] = v.overlayIdentityVisible(id)
 			continue
 		}
 		baseIDs = append(baseIDs, id)
@@ -154,8 +170,8 @@ func (v *OverlaidView) FindOutgoingEdgeIdentitiesBounded(
 				continue
 			}
 			identities, truncated, scanErr := scanBoundedEdgeIdentities(
-				ctx, v.layer.outEdges[sourceID], kindSet, limit, nil, budget,
-				func(identity EdgeIdentity) bool { return v.overlayTargetVisible(identity.To) },
+				ctx, v.layer.OutEdges(sourceID), kindSet, limit, nil, budget,
+				func(identity EdgeIdentity) bool { return v.overlayIdentityVisible(identity.To) },
 			)
 			if scanErr != nil {
 				return BoundedEdgeIdentityProjection{}, scanErr
@@ -176,7 +192,7 @@ func (v *OverlaidView) FindOutgoingEdgeIdentitiesBounded(
 		identities, truncated, mergeErr := appendBoundedBaseIdentities(
 			ctx, baseProjection.ByEndpoint[sourceID], limit, budget,
 			func(identity EdgeIdentity) bool {
-				return identity.From == sourceID && v.overlayTargetVisible(identity.To) && kindRequested(kindSet, identity.Kind)
+				return identity.From == sourceID && v.overlayIdentityVisible(identity.To) && kindRequested(kindSet, identity.Kind)
 			},
 		)
 		if mergeErr != nil {
@@ -238,7 +254,7 @@ func (v *OverlaidView) FindIncomingEdgeIdentitiesBounded(
 	baseIDs := make([]string, 0, len(ids))
 	removedTargets := make(map[string]bool)
 	for _, id := range ids {
-		if v.overlayOwnsIdentity(id) && v.layer.nodeByID[id] == nil {
+		if v.overlayOwnsIdentity(id) && v.layer.NodeByID(id) == nil {
 			removedTargets[id] = true
 			continue
 		}
@@ -273,8 +289,8 @@ func (v *OverlaidView) FindIncomingEdgeIdentitiesBounded(
 		baseIdentities, baseTruncated, mergeErr := appendBoundedBaseIdentities(
 			ctx, baseProjection.ByEndpoint[targetID], limit, budget,
 			func(identity EdgeIdentity) bool {
-				return identity.To == targetID && !v.overlayOwnsIdentity(identity.From) &&
-					v.overlayTargetVisible(identity.To) && kindRequested(kindSet, identity.Kind)
+				return identity.To == targetID && !v.overlayOwnsOutEdges(identity.From) &&
+					v.overlayIdentityVisible(identity.To) && kindRequested(kindSet, identity.Kind)
 			},
 		)
 		if mergeErr != nil {
@@ -285,10 +301,10 @@ func (v *OverlaidView) FindIncomingEdgeIdentitiesBounded(
 			continue
 		}
 		overlayIdentities, overlayTruncated, scanErr := scanBoundedEdgeIdentities(
-			ctx, v.layer.inEdges[targetID], kindSet, limit, nil, budget,
+			ctx, v.layer.InEdges(targetID), kindSet, limit, nil, budget,
 			func(identity EdgeIdentity) bool {
-				return identity.To == targetID && v.overlayTargetVisible(identity.To) &&
-					v.overlayOwnsIdentity(identity.From) && v.layer.nodeByID[identity.From] != nil
+				return identity.To == targetID && v.overlayIdentityVisible(identity.To) &&
+					v.overlayOwnsOutEdges(identity.From) && v.overlayIdentityVisible(identity.From)
 			},
 		)
 		if scanErr != nil {

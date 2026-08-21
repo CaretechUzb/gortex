@@ -199,19 +199,17 @@ func (v *OverlaidView) FindExistingEdgeEndpoints(
 			end++
 		}
 		from := keys[start].From
-		sourceOwned := v.nodeBelongsToOverlay(from) || v.layer.ownsNodeIdentity(from)
-		if sourceOwned {
-			// A covered or detached tombstone owns the identity but carries no
-			// current adjacency. Never authenticate a stray staged edge for a
+		if v.overlayOwnsOutEdges(from) {
+			// A covered or detached tombstone owns the adjacency but carries no
+			// current declaration. Never authenticate a stray staged edge for a
 			// source declaration the overlay removed.
-			if v.layer.nodeByID[from] == nil {
+			if !v.overlayIdentityVisible(from) {
 				start = end
 				continue
 			}
 			wanted := make(map[typedEdgeTarget]TypedEdgeEndpoint, end-start)
 			for _, endpoint := range keys[start:end] {
-				targetOwned := v.nodeBelongsToOverlay(endpoint.To) || v.layer.ownsNodeIdentity(endpoint.To)
-				if targetOwned && v.layer.nodeByID[endpoint.To] == nil {
+				if !v.overlayIdentityVisible(endpoint.To) {
 					continue
 				}
 				wanted[typedEdgeTarget{to: endpoint.To, kind: endpoint.Kind}] = endpoint
@@ -220,7 +218,7 @@ func (v *OverlaidView) FindExistingEdgeEndpoints(
 				start = end
 				continue
 			}
-			for index, edge := range v.layer.outEdges[from] {
+			for index, edge := range v.layer.OutEdges(from) {
 				if index&127 == 0 {
 					if err := ctx.Err(); err != nil {
 						return nil, err
@@ -244,8 +242,7 @@ func (v *OverlaidView) FindExistingEdgeEndpoints(
 			continue
 		}
 		for _, endpoint := range keys[start:end] {
-			targetOwned := v.nodeBelongsToOverlay(endpoint.To) || v.layer.ownsNodeIdentity(endpoint.To)
-			if targetOwned && v.layer.nodeByID[endpoint.To] == nil {
+			if !v.overlayIdentityVisible(endpoint.To) {
 				continue
 			}
 			baseKeys = append(baseKeys, endpoint)

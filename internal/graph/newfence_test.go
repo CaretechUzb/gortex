@@ -24,6 +24,22 @@ import (
 // to hold graph data that no restart can recover.
 var stagingCallers []string
 
+// harnessCallers lists the non-test files that construct it for a test and are
+// only reachable from one.
+//
+// A _test.go file is already exempt: its store dies with the test. A shared
+// harness is the same store with the same lifetime, in a plain .go file for the
+// single reason that Go compiles a package's _test.go files only when testing
+// that package, so a matrix more than one package runs cannot live in one. Each
+// entry names a package that exists to be imported from tests and nothing else,
+// which is the claim to check before adding one.
+var harnessCallers = []string{
+	// The overlay composition matrix, run against every implementation of
+	// graph.OverlayLayerReader — the in-memory layer from this package and the
+	// persisted generation layer from internal/graphview.
+	"internal/graph/overlaytest/conformance.go",
+}
+
 // graphImportPath is the package under fence. The scan resolves whatever local
 // name each file binds it to, so an alias or a dot import is caught the same as
 // the ordinary qualified form.
@@ -45,13 +61,14 @@ func TestNewIsFencedToIndexerStaging(t *testing.T) {
 		t.Fatalf("locating repository root: %v", err)
 	}
 
-	allowed := make(map[string]struct{}, len(stagingCallers))
-	for _, p := range stagingCallers {
+	declared := append(append([]string{}, stagingCallers...), harnessCallers...)
+	allowed := make(map[string]struct{}, len(declared))
+	for _, p := range declared {
 		allowed[p] = struct{}{}
 	}
 
 	var offenders []string
-	seen := make(map[string]struct{}, len(stagingCallers))
+	seen := make(map[string]struct{}, len(declared))
 
 	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -103,13 +120,14 @@ func TestNewIsFencedToIndexerStaging(t *testing.T) {
 			"restart, and no other process can read it. Production code that needs a graph should "+
 			"accept a Store from its caller or open a durable one. If you really are adding an "+
 			"indexer staging buffer that is drained into a durable store, add the file to "+
-			"stagingCallers in this test and say why in the commit.",
+			"stagingCallers in this test and say why in the commit. A test harness a _test.go "+
+			"file cannot hold goes in harnessCallers instead.",
 			strings.Join(offenders, "\n  "))
 	}
 
-	for _, p := range stagingCallers {
+	for _, p := range declared {
 		if _, ok := seen[p]; !ok {
-			t.Errorf("%s no longer constructs the in-memory Store — drop it from stagingCallers", p)
+			t.Errorf("%s no longer constructs the in-memory Store — drop it from the allow list", p)
 		}
 	}
 }
