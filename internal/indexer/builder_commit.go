@@ -8,7 +8,6 @@ import (
 	"sort"
 
 	"github.com/zzet/gortex/internal/gitcmd"
-	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer/source"
 )
 
@@ -32,7 +31,7 @@ type CommitLayerRequest struct {
 
 	// Base is the reader for the layer beneath this one — the corpus at
 	// BaseTreeOID. The affected closure is computed against it.
-	Base graph.Store
+	Base LayerBase
 
 	// RepoDir is the git repository (or worktree) the trees are read from.
 	RepoDir string

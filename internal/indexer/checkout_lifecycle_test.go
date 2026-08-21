@@ -187,12 +187,18 @@ func (f *lifecycleFixture) open() {
 // config file — a daemon stop and start, with everything durable intact.
 func (f *lifecycleFixture) restart() {
 	f.t.Helper()
+	require.NoError(f.t, f.lc.Close())
 	require.NoError(f.t, f.mi.Close(context.Background()))
 	require.NoError(f.t, f.store.Close())
 	f.open()
 }
 
+// close tears the stack down in the order the daemon does. The coordinators go
+// first: each one may be part way through a build against this store, and
+// closing the store under a live build is the one teardown order that turns a
+// background write into a failure.
 func (f *lifecycleFixture) close() {
+	_ = f.lc.Close()
 	_ = f.mi.Close(context.Background())
 	_ = f.store.Close()
 }
@@ -555,10 +561,14 @@ func TestCheckoutLifecycleSweepReachesAConfiguredButUnindexedRepo(t *testing.T) 
 	assert.Zero(t, held.RemovalDetectedAt, "an outage never starts the removal clock")
 }
 
-// TestCheckoutLifecycleSeedIsIdempotent runs the startup migration twice and
-// asserts the second pass writes the same rows as the first — including the
-// stored path sample, whose generation counter would otherwise drift on
-// every restart.
+// TestCheckoutLifecycleSeedIsIdempotent runs the startup path twice and
+// asserts the second pass mints nothing the first already minted.
+//
+// Seeding is a migration followed by the boot reconciliation. The migration
+// half must leave an existing identity exactly as it found it — a re-keyed
+// checkout or a second intent per restart is the bug this guards — while the
+// reconciliation half is an observation and moves the clocks and the path
+// sample it takes, exactly as the janitor's pass does an hour later.
 func TestCheckoutLifecycleSeedIsIdempotent(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()
@@ -582,8 +592,19 @@ func TestCheckoutLifecycleSeedIsIdempotent(t *testing.T) {
 	secondEvidence, _, err := f.catalog.GetCheckoutPathEvidence(ctx, second.CheckoutID)
 	require.NoError(t, err)
 
-	assert.Equal(t, first, second, "a second seeding pass changes nothing, clocks included")
-	assert.Equal(t, firstEvidence, secondEvidence, "the stored sample is not re-taken")
+	assert.Equal(t, first.CheckoutID, second.CheckoutID, "the identity is reused, not minted again")
+	assert.Equal(t, first.Incarnation, second.Incarnation, "the row is not re-keyed")
+	assert.Equal(t, first.AdminName, second.AdminName)
+	assert.Equal(t, first.RootPath, second.RootPath)
+	assert.Equal(t, first.State, second.State)
+	assert.Equal(t, first.DesiredMode, second.DesiredMode)
+	assert.Equal(t, first.EffectiveMode, second.EffectiveMode)
+	assert.Zero(t, second.UnavailableSince, "a reachable root starts no availability clock")
+	assert.Zero(t, second.RemovalDetectedAt, "a reachable root starts no removal clock")
+
+	assert.Equal(t, firstEvidence.CheckoutID, secondEvidence.CheckoutID)
+	assert.Equal(t, firstEvidence.RootPathIdentity, secondEvidence.RootPathIdentity,
+		"the sample still describes the same root")
 
 	intents, err := f.catalog.ListTrackingIntents(ctx, first.CheckoutID)
 	require.NoError(t, err)
@@ -694,6 +715,50 @@ func TestCheckoutLifecycleImplicitRegistrationSurvivesRestartWithoutIntent(t *te
 	intents, err := f.catalog.ListTrackingIntents(ctx, checkout.CheckoutID)
 	require.NoError(t, err)
 	assert.Empty(t, intents, "a boot does not turn an observation into intent")
+}
+
+// TestCheckoutLifecycleRegistrationBringsUpCoordinators pins the timing the
+// janitor's tick is far too coarse for.
+//
+// Tracking a repository whose worktrees already exist has to give those
+// worktrees a routed view within the registration, not within the hour the
+// default reconcile interval puts between janitor passes. Registering one of
+// them explicitly afterwards is the opposite transition: the working copy gets
+// a corpus of its own and stops being served through a composed view.
+func TestCheckoutLifecycleRegistrationBringsUpCoordinators(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	ctx := context.Background()
+
+	main := f.gitRepo("register-main")
+	worktree := f.worktreeOf(main, "register-wt")
+
+	tracked, err := f.lc.Register(ctx, config.RepoEntry{Path: main, Name: "register-main"}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, tracked.CatalogErr)
+
+	checkouts, err := f.catalog.ListCheckouts(ctx, tracked.FamilyID)
+	require.NoError(t, err)
+	var automatic *store_sqlite.Checkout
+	for i := range checkouts {
+		if checkouts[i].CheckoutID != tracked.CheckoutID {
+			automatic = &checkouts[i]
+		}
+	}
+	require.NotNil(t, automatic, "the worktree that already existed got no identity")
+	assert.Equal(t, store_sqlite.CheckoutModeAutomatic, automatic.EffectiveMode)
+	assert.True(t, f.lc.SignalCheckout(automatic.CheckoutID, "test"),
+		"the worktree has no coordinator until a sweep runs")
+
+	retracked, err := f.lc.Register(ctx, config.RepoEntry{Path: worktree, Name: "register-wt"}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, retracked.CatalogErr)
+	assert.Equal(t, automatic.CheckoutID, retracked.CheckoutID,
+		"an explicit track adopts the observed identity rather than minting a second one")
+	assert.Equal(t, store_sqlite.CheckoutModeDedicated, f.checkoutOf(retracked.Prefix).EffectiveMode,
+		"tracking a worktree explicitly gives it a corpus of its own")
+	assert.False(t, f.lc.SignalCheckout(automatic.CheckoutID, "test"),
+		"a dedicated checkout is read from its own corpus, so it keeps no coordinator")
 }
 
 // TestCheckoutLifecycleAdminNameIdentity states the identity rule the whole

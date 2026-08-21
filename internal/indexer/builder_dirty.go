@@ -8,7 +8,6 @@ import (
 	"sort"
 
 	"github.com/zzet/gortex/internal/gitstate"
-	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer/source"
 )
 
@@ -59,7 +58,7 @@ type DirtyLayerRequest struct {
 	// generation composed over the corpus. The affected closure is computed
 	// against it, so a dependent of a dirty file is found in the committed
 	// state the working tree diverged from.
-	Base graph.Store
+	Base LayerBase
 
 	// CheckoutRoot is the working tree the layer describes.
 	CheckoutRoot string

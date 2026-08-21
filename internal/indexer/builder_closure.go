@@ -125,7 +125,7 @@ func (b *SparseGenerationBuilder) affectedClosure(
 
 // builderSeedNodeIDs reads every node the base layer carries at the seed
 // paths, in one batched read.
-func builderSeedNodeIDs(base graph.Store, seeds []string) []string {
+func builderSeedNodeIDs(base LayerBase, seeds []string) []string {
 	nodesByFile := base.GetFileNodesByPaths(seeds)
 	seen := make(map[string]struct{})
 	var ids []string
@@ -217,7 +217,7 @@ func (b *SparseGenerationBuilder) collectDependencies(
 // The identity's own file component is used as a fallback when the base layer
 // has no node under it: an edge may point at a symbol whose definition row was
 // evicted, and the ID still names the file the reference was resolved into.
-func builderAddNodeFiles(base graph.Store, ids map[string]struct{}, out map[string]struct{}) {
+func builderAddNodeFiles(base LayerBase, ids map[string]struct{}, out map[string]struct{}) {
 	if len(ids) == 0 {
 		return
 	}

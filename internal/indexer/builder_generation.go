@@ -134,6 +134,20 @@ type GenerationIdentity struct {
 	CreatedAt int64 // unix seconds; 0 stamps the wall clock
 }
 
+// LayerBase is the reader a build computes its affected closure against: the
+// layer the generation will sit on.
+//
+// It is an interface rather than the store itself because the layer beneath is
+// not always a store. A commit layer sits on the base corpus, which is a store
+// handle; a working-tree layer sits on that corpus with the checkout's commit
+// generation composed over it, which is a reader. Both answer the identity
+// reads the closure walks and the batched file read it seeds from, and that is
+// the whole of what a base has to do.
+type LayerBase interface {
+	graph.Reader
+	GetFileNodesByPaths(filePaths []string) map[string][]*graph.Node
+}
+
 // BuildRequest is one sparse generation build.
 type BuildRequest struct {
 	// Identity names the generation in the catalog.
@@ -141,7 +155,7 @@ type BuildRequest struct {
 
 	// Base is the reader the affected closure is computed against: the layer
 	// the generation will sit on. It is read, never written.
-	Base graph.Store
+	Base LayerBase
 
 	// Target serves the content of the state being built. The builder narrows
 	// it to the generation's file set and does not close it — the caller owns
