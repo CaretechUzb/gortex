@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitcmd"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/llm"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/review"
@@ -633,7 +634,12 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 	}
 	targets := make([]astquery.Target, 0, len(allTargets))
 	for _, t := range allTargets {
-		if changed[filepath.Clean(t.GraphPath)] {
+		// Normalize, do not Clean. A graph path is "<prefix>/" + the rest in
+		// native separators, so filepath.Clean rewrites the prefix slash on
+		// Windows ("repo-a/pkg\widget.go" -> "repo-a\pkg\widget.go") and the
+		// key the changeset built no longer matches. graphpath.Norm is the
+		// canonical comparison form and is the identity on POSIX.
+		if changed[graphpath.Norm(t.GraphPath)] {
 			targets = append(targets, t)
 		}
 	}
@@ -682,7 +688,11 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 func reviewChangedGraphPaths(changedFiles []string, repoPrefix string) map[string]bool {
 	changed := make(map[string]bool, len(changedFiles))
 	for _, f := range changedFiles {
-		f = filepath.Clean(strings.TrimSpace(f))
+		// Clean collapses "./" and "..", then Norm puts both vocabularies in
+		// the one comparison spelling — git already speaks '/', and a caller
+		// handing in a graph-keyed path carries native separators after the
+		// prefix. Identity on POSIX.
+		f = graphpath.Norm(filepath.Clean(strings.TrimSpace(f)))
 		if f == "" || f == "." {
 			continue
 		}
@@ -698,7 +708,12 @@ func reviewChangedGraphPaths(changedFiles []string, repoPrefix string) map[strin
 // repo-relative spelling the rest of the review pipeline speaks: the rule
 // resolver matches `.gortex.yaml` globs against it, rankFileRisk keys its rows
 // on it, and post_review hands it to the forge's comment API.
+// Every one of those consumers speaks '/', so the result is normalized: a
+// graph path carries native separators after the prefix, and handing
+// `pkg\widget.go` to a `.gortex.yaml` glob or the forge comment API would
+// match nothing and anchor a comment nowhere. Identity on POSIX.
 func reviewRepoRelPath(path, repoPrefix string) string {
+	path = graphpath.Norm(path)
 	if repoPrefix == "" {
 		return path
 	}
