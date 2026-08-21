@@ -12,7 +12,7 @@ import (
 // callback may safely re-enter Store and no long-lived read snapshot pins WAL
 // checkpoints while ranking candidates.
 func (s *Store) ScanNodeSearchKeys(ctx context.Context, pageSize int, yield func([]graph.NodeSearchKey) bool) error {
-	if s == nil || yield == nil {
+	if s.coreless() || yield == nil {
 		return nil
 	}
 	if ctx == nil {

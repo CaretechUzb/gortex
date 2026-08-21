@@ -34,7 +34,7 @@ var (
 )
 
 func (s *Store) RecordStructuralIntegrityEvent(event graph.StructuralIntegrityEvent) {
-	if s == nil {
+	if s.coreless() {
 		return
 	}
 	s.structuralIntegrity.Record(event)
@@ -51,7 +51,7 @@ func (s *Store) RecordStructuralIntegrityEvent(event graph.StructuralIntegrityEv
 }
 
 func (s *Store) StructuralIntegritySnapshot(opts graph.StructuralIntegritySnapshotOptions) graph.StructuralIntegritySnapshot {
-	if s == nil {
+	if s.coreless() {
 		return graph.StructuralIntegritySnapshot{}
 	}
 	return s.structuralIntegrity.Snapshot(opts)

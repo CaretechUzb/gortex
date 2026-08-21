@@ -34,7 +34,7 @@ func (s *Store) FindNodesByNameBounded(
 	scope graph.LocalizationNodeScope,
 	limit int,
 ) (graph.BoundedNodeProjection, error) {
-	if s == nil || s.db == nil || name == "" || limit <= 0 {
+	if s.coreless() || s.db == nil || name == "" || limit <= 0 {
 		return graph.BoundedNodeProjection{}, nil
 	}
 	if ctx == nil {
@@ -119,7 +119,7 @@ func (s *Store) FindFileNodesBounded(
 	scope graph.LocalizationNodeScope,
 	limit int,
 ) (graph.BoundedNodeProjection, error) {
-	if s == nil || s.db == nil || filePath == "" || limit <= 0 {
+	if s.coreless() || s.db == nil || filePath == "" || limit <= 0 {
 		return graph.BoundedNodeProjection{}, nil
 	}
 	if ctx == nil {

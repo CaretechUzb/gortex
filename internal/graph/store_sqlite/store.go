@@ -39,8 +39,11 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Store is the SQLite-backed graph.Store implementation.
-type Store struct {
+// storeCore holds the connection pools, prepared statements, caches and
+// mutation state of one open SQLite database. Exactly one storeCore exists
+// per Open; every Store handle over that database points at it, so they all
+// share the same pools, locks and caches.
+type storeCore struct {
 	// db is the bounded, logically read-dedicated pool for on-disk stores.
 	// writerDB is a separate read-write pool capped at one physical connection. In-memory
 	// stores use the same max-one handle for both because independent
@@ -221,6 +224,35 @@ type Store struct {
 	stmtDeleteEdgeByKey  *sql.Stmt
 	stmtEdgeExists       *sql.Stmt
 }
+
+// Store is the SQLite-backed graph.Store implementation. It is a handle over
+// a storeCore pinned to one payload view generation: every method reads and
+// writes through the embedded core, so the pools, prepared statements, caches
+// and write gate are shared by every handle over the same database.
+//
+// Open returns the owning handle. AtGeneration derives further handles that
+// differ only in viewGen; a derived handle must never tear the core down, so
+// only the owning handle's Close does any work (see ownsCore).
+type Store struct {
+	*storeCore
+
+	// viewGen is the payload view generation this handle reads and writes.
+	// Generation 0 is the base corpus every store starts with.
+	viewGen int64
+
+	// ownsCore marks the single handle Open returned. It gates teardown:
+	// pools, prepared statements and the checkpoint loop belong to the core,
+	// and closing them from a derived handle would break every other handle
+	// still using the same database.
+	ownsCore bool
+}
+
+// coreless reports a handle with nothing behind it: a nil pointer, or a zero
+// Store value whose core was never attached. Both used to be inert wherever a
+// method guarded on a nil receiver, because every field lived on Store itself.
+// Now that the fields live on storeCore, those guards must also cover a nil
+// core or the very next field read panics.
+func (s *Store) coreless() bool { return s == nil || s.storeCore == nil }
 
 // Compile-time assertion: *Store satisfies graph.Store.
 var _ graph.Store = (*Store)(nil)
@@ -515,7 +547,13 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		}
 	}
 
-	s := &Store{db: readDB, writerDB: db, dbPath: path, wiped: didWipe}
+	// The handle openWith returns owns the core: it is the only one allowed to
+	// close the pools and prepared statements. Handles derived later by
+	// AtGeneration share this core and leave teardown to this one.
+	s := &Store{
+		storeCore: &storeCore{db: readDB, writerDB: db, dbPath: path, wiped: didWipe},
+		ownsCore:  true,
+	}
 	// Initialise the bundle cache at construction so its pointer is
 	// never written after Open — concurrent SearchSymbolBundles reads
 	// and SetBundleFingerprints writes then race only on the cache's
@@ -749,7 +787,15 @@ func (s *Store) stopCheckpointLoop() {
 // first stops the WAL-checkpoint loop and issues one final TRUNCATE
 // checkpoint so the -wal file is drained and shrunk on graceful shutdown
 // rather than lingering at its high-water mark until the next open.
+//
+// Only the handle Open returned tears the core down. Closing a handle
+// derived by AtGeneration is a no-op that returns nil: the derived handle
+// borrows pools and statements it does not own, and closing them would break
+// every other handle over the same database.
 func (s *Store) Close() error {
+	if !s.ownsCore {
+		return nil
+	}
 	s.stopCheckpointLoop()
 	// A caller normally ends an outer cold-load window explicitly, but Close is
 	// also the last durability boundary on cancellation or startup failure.
