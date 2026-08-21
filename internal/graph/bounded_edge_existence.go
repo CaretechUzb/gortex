@@ -162,6 +162,15 @@ func (g *Graph) FindExistingEdgeEndpoints(
 // overlay. A source owned by the overlay uses only current overlay edges. For an
 // untouched source, base evidence survives unless the exact target identity is
 // tombstoned by the overlay; a same-ID replacement preserves that base edge.
+//
+// Ownership here is decided per SOURCE, not per edge as everywhere else,
+// because a {from,to,kind} key names no recorded file to ask the layer about.
+// The two readings a file would separate — a call the overlay deleted from the
+// covered buffer, and a base edge out of a covered symbol that some other file
+// recorded — are the same key at this surface, so the reader keeps the answer
+// that never authenticates a deleted declaration. An existence probe that must
+// see the second kind reads the outgoing identity projection, whose keys carry
+// the path.
 func (v *OverlaidView) FindExistingEdgeEndpoints(
 	ctx context.Context,
 	endpoints []TypedEdgeEndpoint,
@@ -199,7 +208,7 @@ func (v *OverlaidView) FindExistingEdgeEndpoints(
 			end++
 		}
 		from := keys[start].From
-		if v.overlayOwnsOutEdges(from) {
+		if v.overlayOwnsSourceAdjacency(from) {
 			// A covered or detached tombstone owns the adjacency but carries no
 			// current declaration. Never authenticate a stray staged edge for a
 			// source declaration the overlay removed.

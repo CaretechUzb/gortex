@@ -238,9 +238,15 @@ func TestGenerationLayerEdgeSourceMarker(t *testing.T) {
 	if got := len(layer.OutEdges(caller)); got != 1 {
 		t.Fatalf("OutEdges(%q) returned %d edges, want the retargeted one", caller, got)
 	}
-	// The claimed file still answers the ordinary way.
-	if !layer.OwnsOutEdges(renamed) || !layer.OwnsNodeIdentity(renamed) {
-		t.Fatalf("the replaced file's symbol lost its ownership claims")
+	// The claimed file answers the ordinary way, and claiming it is not
+	// the marker's claim: a file mask replaces the edges recorded in that
+	// file, which the composition settles per edge against HasFile, so the
+	// symbol living there owns its identity and no adjacency beyond it.
+	if !layer.OwnsNodeIdentity(renamed) {
+		t.Fatalf("the replaced file's symbol lost its identity claim")
+	}
+	if layer.OwnsOutEdges(renamed) {
+		t.Fatalf("OwnsOutEdges(%q) = true — a file mask is not a claim on every edge out of its symbols", renamed)
 	}
 }
 

@@ -41,15 +41,24 @@ type OverlayLayerReader interface {
 	OwnsNodeIdentity(id string) bool
 
 	// OwnsOutEdges reports whether the layer speaks for a node's whole
-	// outgoing edge set, so base's edges out of it are hidden and the
-	// layer's are the only ones the view exposes.
+	// outgoing edge set wherever base recorded those edges, so every
+	// base edge out of it is hidden no matter which file holds it.
 	//
-	// It is a wider claim than OwnsNodeIdentity and a separate one: a
-	// layer may replace what a node points at while the node itself
-	// keeps living in the layer below, which is what happens when a
-	// rename in one file retargets the calls made from an untouched
-	// one. Answering yes here says nothing about whether the layer
-	// carries the node — that stays OwnsNodeIdentity's question.
+	// It is the claim a file list cannot express, and it is narrower
+	// than "the layer covers the node's file". Re-deriving a file
+	// re-derives the edges RECORDED in that file and no others: a
+	// symbol's callers hold edges out of it in their own files, and
+	// those are the caller's file to replace. The composition settles
+	// them with HasFile on each edge's own path, so a layer must NOT
+	// answer yes here merely because it covers the node's file.
+	//
+	// What is left for this method is the adjacency no file claim can
+	// reach: an identity the layer removed or re-emitted from outside
+	// the files it covers, and a source whose edge set it replaced
+	// without claiming any file — which is what happens when a rename
+	// in one file retargets the calls made from an untouched one.
+	// Answering yes here says nothing about whether the layer carries
+	// the node — that stays OwnsNodeIdentity's question.
 	OwnsOutEdges(id string) bool
 
 	// IsRemovedID reports whether the layer marked a base ID removed.
@@ -127,13 +136,16 @@ func (l *OverlayLayer) OwnsNodeIdentity(id string) bool {
 	return l.nodeByID[id] != nil || l.removedByID[id]
 }
 
-// OwnsOutEdges reports whether the layer speaks for a node's outgoing
-// edge set. An in-memory layer parses whole buffers, so it owns exactly
-// the adjacency of the identities it owns: a covered file's symbols and
-// the identities it marked removed. It never replaces the adjacency of a
-// node it does not otherwise speak for.
+// OwnsOutEdges reports whether the layer replaces a node's adjacency
+// wherever base recorded it. An in-memory layer re-extracts whole
+// buffers, and a buffer yields the edges written in it — so a covered
+// file's own edges are claimed by the covered path and settled per
+// edge, not here. What is left is the identities the layer speaks for
+// from outside its covered files: a removal marker for a symbol in an
+// untouched file hides that symbol's edges wherever they were recorded,
+// and so does a node re-emitted at a path the layer does not cover.
 func (l *OverlayLayer) OwnsOutEdges(id string) bool {
-	return l.CoversNodeID(id) || l.OwnsNodeIdentity(id)
+	return l.OwnsNodeIdentity(id) && !l.CoversNodeID(id)
 }
 
 // IsRemovedID reports whether MarkRemoved recorded this base ID.

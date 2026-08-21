@@ -261,7 +261,16 @@ func TestOverlaidViewBoundedSiteReplacementAndTombstoneParity(t *testing.T) {
 		{name: "detached", source: "legacy-source", target: "legacy-target"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			baseEdge := &Edge{From: test.source, To: test.target, Kind: EdgeCalls, FilePath: "base.go", Line: 10}
+			// A call site is recorded in the file that holds it, which is
+			// how covering the source's file reaches base's row: ownership
+			// is per edge, keyed on the path the edge was recorded at. The
+			// detached source lives at no file, so its row stays where a
+			// path claim cannot reach it and only the identity claim can.
+			baseFile := test.sourceFile
+			if baseFile == "" {
+				baseFile = "base.go"
+			}
+			baseEdge := &Edge{From: test.source, To: test.target, Kind: EdgeCalls, FilePath: baseFile, Line: 10}
 			base := New()
 			base.AddEdge(baseEdge)
 			site := EdgeSourceSite{From: test.source, Line: 10}

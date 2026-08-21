@@ -167,6 +167,7 @@ func Run(t *testing.T, newLayer LayerFactory) {
 		{"re-emitted file node surfaces once", assertReEmittedFileNodeSurfacesOnce},
 		{"covered file node hidden without re-emission", assertCoveredFileNodeHiddenWithoutReEmission},
 		{"file node edge visibility", assertFileNodeEdgeVisibility},
+		{"edges recorded outside a covered file survive", assertEdgesRecordedElsewhereSurvive},
 		{"uncovered tombstone hides the identity", assertUncoveredTombstoneHidesTheIdentity},
 		{"kind scans stop early", assertKindScansStopEarly},
 	}
@@ -1046,6 +1047,137 @@ func assertFileNodeEdgeVisibility(t *testing.T, newLayer LayerFactory) {
 				t.Fatalf("AllEdges = %v, union of GetOutEdges over visible sources = %v", got, want)
 			}
 			for kind := range map[graph.EdgeKind]bool{graph.EdgeImports: true, graph.EdgeReferences: true, graph.EdgeDefines: true} {
+				got := edgeKeys(collectEdgeSeq(view.EdgesByKind(kind)))
+				want := edgeKeys(edgesOfKind(view.AllEdges(), kind))
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("EdgesByKind(%q) = %v, AllEdges filtered = %v", kind, got, want)
+				}
+			}
+		})
+	}
+}
+
+// elsewhereFixture stages the case where one source's outgoing edges are
+// recorded in two files, only one of which the layer covers.
+//
+//	base: Kept -calls->      Keeper   recorded in edit.go (covered)
+//	      Kept -value_flow-> Keeper   recorded in keep.go (untouched)
+//	      Keeper -calls->    Kept     recorded in keep.go (untouched)
+//	layer: Kept' -calls->    Keeper   recorded in edit.go
+//
+// The value flow is the row a source-granular ownership rule loses: it
+// leaves a covered file's symbol, so a layer that read "I cover edit.go"
+// as "I speak for everything Kept points at" would hide it — while the
+// layer carries no copy, because re-extracting edit.go cannot produce an
+// edge keep.go holds.
+//
+// reEmit false drops Kept from the covered file instead of replacing it,
+// which is the case where the row must go after all: its source is gone.
+func elsewhereFixture(newLayer LayerFactory, reEmit bool) (*graph.Graph, graph.OverlayLayerReader) {
+	base := graph.New()
+	base.AddNode(&graph.Node{ID: consistencyKeepID, Name: "Keeper", Kind: graph.KindFunction,
+		FilePath: consistencyKeepFil, RepoPrefix: consistencyRepo})
+	base.AddNode(&graph.Node{ID: consistencyKeptID, Name: "Kept", Kind: graph.KindFunction,
+		FilePath: consistencyEditFil, RepoPrefix: consistencyRepo, StartLine: 10})
+	base.AddEdge(&graph.Edge{From: consistencyKeptID, To: consistencyKeepID, Kind: graph.EdgeCalls,
+		FilePath: consistencyEditFil, Line: 20})
+	base.AddEdge(&graph.Edge{From: consistencyKeptID, To: consistencyKeepID, Kind: graph.EdgeValueFlow,
+		FilePath: consistencyKeepFil, Line: 4})
+	base.AddEdge(&graph.Edge{From: consistencyKeepID, To: consistencyKeptID, Kind: graph.EdgeCalls,
+		FilePath: consistencyKeepFil, Line: 4})
+
+	layer := newLayer()
+	layer.MarkFile(consistencyEditFil, false)
+	if !reEmit {
+		layer.MarkRemoved("Kept", consistencyKeptID)
+		return base, layer.Freeze()
+	}
+	layer.AddNode(consistencyEditFil, &graph.Node{ID: consistencyKeptID, Name: "Kept",
+		Kind: graph.KindFunction, FilePath: consistencyEditFil, RepoPrefix: consistencyRepo, StartLine: 40})
+	layer.AddEdge(&graph.Edge{From: consistencyKeptID, To: consistencyKeepID, Kind: graph.EdgeCalls,
+		FilePath: consistencyEditFil, Line: 41})
+	return base, layer.Freeze()
+}
+
+// assertEdgesRecordedElsewhereSurvive pins whose edge a covered file
+// replaces: the edges RECORDED in it, not every edge leaving its
+// symbols. A base row some other file holds stays visible, because the
+// layer never re-derived the file that produced it and carries nothing
+// to put in its place — and it goes only when the row's own source or
+// target stops being visible.
+func assertEdgesRecordedElsewhereSurvive(t *testing.T, newLayer LayerFactory) {
+	elsewhere := overlayEdgeKey(&graph.Edge{From: consistencyKeptID, To: consistencyKeepID,
+		Kind: graph.EdgeValueFlow, FilePath: consistencyKeepFil, Line: 4})
+	inbound := overlayEdgeKey(&graph.Edge{From: consistencyKeepID, To: consistencyKeptID,
+		Kind: graph.EdgeCalls, FilePath: consistencyKeepFil, Line: 4})
+	replaced := overlayEdgeKey(&graph.Edge{From: consistencyKeptID, To: consistencyKeepID,
+		Kind: graph.EdgeCalls, FilePath: consistencyEditFil, Line: 41})
+
+	cases := []struct {
+		name        string
+		reEmit      bool
+		wantKeptOut []string
+		wantKeepIn  []string
+	}{
+		{
+			name:        "re-emitted source keeps the row its caller's file holds",
+			reEmit:      true,
+			wantKeptOut: []string{elsewhere, replaced},
+			wantKeepIn:  []string{elsewhere, replaced},
+		},
+		{
+			name:        "a dropped source loses it with everything else",
+			reEmit:      false,
+			wantKeptOut: []string{},
+			wantKeepIn:  []string{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base, layer := elsewhereFixture(newLayer, tc.reEmit)
+			view := graph.NewOverlaidViewWithLayer(base, layer)
+
+			sort.Strings(tc.wantKeptOut)
+			sort.Strings(tc.wantKeepIn)
+			if got := edgeKeys(view.GetOutEdges(consistencyKeptID)); !reflect.DeepEqual(got, tc.wantKeptOut) {
+				t.Fatalf("GetOutEdges(%q) = %v, want %v", consistencyKeptID, got, tc.wantKeptOut)
+			}
+			if got := edgeKeys(view.GetInEdges(consistencyKeepID)); !reflect.DeepEqual(got, tc.wantKeepIn) {
+				t.Fatalf("GetInEdges(%q) = %v, want %v", consistencyKeepID, got, tc.wantKeepIn)
+			}
+			// The untouched file's own call into the covered symbol
+			// follows the ordinary target rule.
+			wantKeepOut := []string{}
+			if tc.reEmit {
+				wantKeepOut = []string{inbound}
+			}
+			if got := edgeKeys(view.GetOutEdges(consistencyKeepID)); !reflect.DeepEqual(got, wantKeepOut) {
+				t.Fatalf("GetOutEdges(%q) = %v, want %v", consistencyKeepID, got, wantKeepOut)
+			}
+
+			ids := []string{consistencyKeepID, consistencyKeptID}
+			batchedOut := view.GetOutEdgesByNodeIDs(ids)
+			batchedIn := view.GetInEdgesByNodeIDs(ids)
+			for _, id := range ids {
+				if got, want := edgeKeys(batchedOut[id]), edgeKeys(view.GetOutEdges(id)); !reflect.DeepEqual(got, want) {
+					t.Fatalf("GetOutEdgesByNodeIDs[%q] = %v, GetOutEdges = %v", id, got, want)
+				}
+				if got, want := edgeKeys(batchedIn[id]), edgeKeys(view.GetInEdges(id)); !reflect.DeepEqual(got, want) {
+					t.Fatalf("GetInEdgesByNodeIDs[%q] = %v, GetInEdges = %v", id, got, want)
+				}
+			}
+
+			var union []*graph.Edge
+			for _, n := range view.AllNodes() {
+				union = append(union, view.GetOutEdges(n.ID)...)
+			}
+			if got, want := edgeKeys(view.AllEdges()), edgeKeys(union); !reflect.DeepEqual(got, want) {
+				t.Fatalf("AllEdges = %v, union of GetOutEdges over visible sources = %v", got, want)
+			}
+			if got, want := view.EdgeCount(), len(view.AllEdges()); got != want {
+				t.Fatalf("EdgeCount = %d, AllEdges has %d", got, want)
+			}
+			for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeValueFlow} {
 				got := edgeKeys(collectEdgeSeq(view.EdgesByKind(kind)))
 				want := edgeKeys(edgesOfKind(view.AllEdges(), kind))
 				if !reflect.DeepEqual(got, want) {

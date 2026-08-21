@@ -25,12 +25,42 @@ func (v *OverlaidView) overlayOwnsIdentity(id string) bool {
 		(v.nodeBelongsToOverlay(id) || v.layer.OwnsNodeIdentity(id))
 }
 
-// overlayOwnsOutEdges reports whether the layer speaks for a node's
-// whole outgoing edge set. It is the wider claim: a layer that only
-// retargets what an untouched node points at owns its adjacency while
-// the node itself keeps coming from base.
-func (v *OverlaidView) overlayOwnsOutEdges(id string) bool {
-	return v != nil && v.layer != nil && v.layer.OwnsOutEdges(id)
+// overlayOwnsBaseEdge reports whether the layer supersedes one base
+// edge. Ownership follows the file the edge was RECORDED in, because
+// that is the file whose re-derivation produced it: covering a file
+// replaces the edges written in it and nothing else. A base edge out of
+// a covered file's symbol that base recorded somewhere else — the
+// reverse value flow a caller's own file holds, say — belongs to that
+// other file, and hiding it would drop a row nothing in the layer
+// re-creates.
+//
+// filePath is the edge's recorded path, empty when base wrote none.
+// Without a path there is no file to ask the question with, so the
+// coarse source-side claim answers instead. Either way the source's own
+// OwnsOutEdges claim still applies: it is the claim no file list can
+// express, reaching edges wherever they were recorded — a layer that
+// only retargets what an untouched node points at speaks for that
+// node's adjacency while the node itself keeps coming from base.
+func (v *OverlaidView) overlayOwnsBaseEdge(from, filePath string) bool {
+	if v == nil || v.layer == nil {
+		return false
+	}
+	if filePath == "" {
+		return v.overlayOwnsSourceAdjacency(from)
+	}
+	return v.layer.HasFile(filePath) || v.layer.OwnsOutEdges(from)
+}
+
+// overlayOwnsSourceAdjacency reports whether the layer speaks for a
+// source's edges at all — because it covers the file the source lives
+// in, or because it replaced that source's adjacency outright. It is the
+// coarse claim, and it is what the readers that hold no recorded path
+// have to decide on: the layer's own staged edges, whose provenance is
+// the source they were staged for, and the existence probe, whose key
+// carries no file.
+func (v *OverlaidView) overlayOwnsSourceAdjacency(id string) bool {
+	return v != nil && v.layer != nil &&
+		(v.layer.CoversNodeID(id) || v.layer.OwnsOutEdges(id))
 }
 
 // overlayIdentityVisible reports whether a node identity is still
@@ -96,9 +126,12 @@ func mergeBoundedIdentitySlices(left, right []EdgeIdentity, limit int) ([]EdgeId
 }
 
 // FindOutgoingEdgeIdentitiesBounded preserves GetOutEdges replacement and
-// tombstone semantics without materializing Edge payloads. Overlay-owned
-// sources use only current overlay adjacency; durable rows targeting removed
-// overlay identities are filtered before the caller-visible cap.
+// tombstone semantics without materializing Edge payloads. Durable rows the
+// layer supersedes are dropped by the same per-edge rule — the identity key
+// carries the recorded path, so the projection can ask it — and the layer's
+// own adjacency is merged in; rows touching a removed overlay identity are
+// filtered before the caller-visible cap. A source the layer hid contributes
+// nothing at all.
 func (v *OverlaidView) FindOutgoingEdgeIdentitiesBounded(
 	ctx context.Context,
 	sourceIDs []string,
@@ -138,10 +171,10 @@ func (v *OverlaidView) FindOutgoingEdgeIdentitiesBounded(
 	}
 
 	baseIDs := make([]string, 0, len(ids))
-	overlayIDs := make(map[string]bool, len(ids))
+	hiddenSources := make(map[string]bool)
 	for _, id := range ids {
-		if v.overlayOwnsOutEdges(id) {
-			overlayIDs[id] = v.overlayIdentityVisible(id)
+		if v.overlayOwnsIdentity(id) && v.layer.NodeByID(id) == nil {
+			hiddenSources[id] = true
 			continue
 		}
 		baseIDs = append(baseIDs, id)
@@ -165,39 +198,40 @@ func (v *OverlaidView) FindOutgoingEdgeIdentitiesBounded(
 		if err := ctx.Err(); err != nil {
 			return BoundedEdgeIdentityProjection{}, err
 		}
-		if current, owned := overlayIDs[sourceID]; owned {
-			if !current {
-				continue
-			}
-			identities, truncated, scanErr := scanBoundedEdgeIdentities(
-				ctx, v.layer.OutEdges(sourceID), kindSet, limit, nil, budget,
-				func(identity EdgeIdentity) bool { return v.overlayIdentityVisible(identity.To) },
-			)
-			if scanErr != nil {
-				return BoundedEdgeIdentityProjection{}, scanErr
-			}
-			if truncated {
-				projection.Truncated[sourceID] = true
-				continue
-			}
-			if len(identities) > 0 {
-				projection.ByEndpoint[sourceID] = identities
-			}
+		if hiddenSources[sourceID] {
 			continue
 		}
 		if baseProjection.Truncated[sourceID] {
 			projection.Truncated[sourceID] = true
 			continue
 		}
-		identities, truncated, mergeErr := appendBoundedBaseIdentities(
+		baseIdentities, baseTruncated, mergeErr := appendBoundedBaseIdentities(
 			ctx, baseProjection.ByEndpoint[sourceID], limit, budget,
 			func(identity EdgeIdentity) bool {
-				return identity.From == sourceID && v.overlayIdentityVisible(identity.To) && kindRequested(kindSet, identity.Kind)
+				return identity.From == sourceID &&
+					!v.overlayOwnsBaseEdge(identity.From, identity.FilePath) &&
+					v.overlayIdentityVisible(identity.To) && kindRequested(kindSet, identity.Kind)
 			},
 		)
 		if mergeErr != nil {
 			return BoundedEdgeIdentityProjection{}, mergeErr
 		}
+		if baseTruncated {
+			projection.Truncated[sourceID] = true
+			continue
+		}
+		overlayIdentities, overlayTruncated, scanErr := scanBoundedEdgeIdentities(
+			ctx, v.layer.OutEdges(sourceID), kindSet, limit, nil, budget,
+			func(identity EdgeIdentity) bool { return v.overlayIdentityVisible(identity.To) },
+		)
+		if scanErr != nil {
+			return BoundedEdgeIdentityProjection{}, scanErr
+		}
+		if overlayTruncated {
+			projection.Truncated[sourceID] = true
+			continue
+		}
+		identities, truncated := mergeBoundedIdentitySlices(baseIdentities, overlayIdentities, limit)
 		if truncated {
 			projection.Truncated[sourceID] = true
 			continue
@@ -289,7 +323,9 @@ func (v *OverlaidView) FindIncomingEdgeIdentitiesBounded(
 		baseIdentities, baseTruncated, mergeErr := appendBoundedBaseIdentities(
 			ctx, baseProjection.ByEndpoint[targetID], limit, budget,
 			func(identity EdgeIdentity) bool {
-				return identity.To == targetID && !v.overlayOwnsOutEdges(identity.From) &&
+				return identity.To == targetID &&
+					!v.overlayOwnsBaseEdge(identity.From, identity.FilePath) &&
+					v.overlayIdentityVisible(identity.From) &&
 					v.overlayIdentityVisible(identity.To) && kindRequested(kindSet, identity.Kind)
 			},
 		)
@@ -304,7 +340,7 @@ func (v *OverlaidView) FindIncomingEdgeIdentitiesBounded(
 			ctx, v.layer.InEdges(targetID), kindSet, limit, nil, budget,
 			func(identity EdgeIdentity) bool {
 				return identity.To == targetID && v.overlayIdentityVisible(identity.To) &&
-					v.overlayOwnsOutEdges(identity.From) && v.overlayIdentityVisible(identity.From)
+					v.overlayOwnsSourceAdjacency(identity.From) && v.overlayIdentityVisible(identity.From)
 			},
 		)
 		if scanErr != nil {

@@ -26,7 +26,11 @@ import (
 // # What the masks mean here
 //
 //   - A file mask covers a path whether it says replace or delete;
-//     either way the layer below stops showing through. A delete mask
+//     either way the layer below stops showing through for the nodes
+//     that live at the path and the edges recorded there. Edges the
+//     layer below recorded in OTHER paths keep showing through even
+//     when they leave a symbol at a claimed one — the generation did
+//     not re-derive the file that holds them. A delete mask
 //     additionally reports the path as a tombstone, so the composition
 //     answers it as empty rather than from the layer's own payload.
 //   - A node tombstone removes one identity the generation did not
@@ -213,17 +217,18 @@ func (l *GenerationLayer) OwnsNodeIdentity(id string) bool {
 	return l.CoversNodeID(id) && l.NodeByID(id) != nil
 }
 
-// OwnsOutEdges reports whether the generation speaks for a node's whole
-// outgoing edge set: it claims the node's file, it speaks for the
-// identity, or it carries an edge-source replacement marker for it. The
-// marker is the case a file-granular layer cannot express — the node
-// stays where it was and only what it points at moved.
+// OwnsOutEdges reports whether the generation replaces a node's whole
+// outgoing edge set wherever the layer below recorded it. Claiming the
+// node's file is deliberately NOT such a claim: re-deriving a file
+// re-derives the edges recorded in it, and the composition settles
+// those against the generation's file masks, edge by edge. What is left
+// here is the adjacency no file mask reaches — a tombstoned identity,
+// and an edge-source replacement marker, which is the case a
+// file-granular layer cannot express: the node stays where it was and
+// only what it points at moved.
 func (l *GenerationLayer) OwnsOutEdges(id string) bool {
-	if id == "" {
+	if id == "" || l.CoversNodeID(id) {
 		return false
-	}
-	if l.CoversNodeID(id) {
-		return true
 	}
 	if _, marked := l.edgeSources[id]; marked {
 		return true

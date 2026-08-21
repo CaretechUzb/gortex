@@ -665,16 +665,20 @@ func (v *OverlaidView) GetRepoNodes(repoPrefix string) []*Node {
 // base edge, so point, batched and bulk reads all expose the same
 // edge relation.
 //
-// Source side: once the layer owns a source's outgoing edge set, base's
-// edges out of it are dropped — whether the overlay re-emitted the
-// source, deleted it, or only retargeted what it points at.
+// Recording side: the edge is dropped once the layer speaks for it —
+// because it covers the file base recorded the edge in, or because it
+// replaced the source's adjacency wherever that adjacency lives. An
+// edge base recorded in a file the layer never claimed is not the
+// layer's to replace and stays, even when its source lives in a covered
+// file: re-deriving a symbol re-derives the edges its own file holds,
+// and the edges a caller's file holds into it are the caller's.
 //
-// Target side: the edge survives while the target identity is still
-// visible through the view. A target the overlay re-emitted under the
-// same ID keeps the edge (the logical symbol is still there); a
-// target the overlay hid removes it.
+// Endpoint side: the edge survives while both identities are still
+// visible through the view. An endpoint the overlay re-emitted under the
+// same ID keeps the edge (the logical symbol is still there); one the
+// overlay hid removes it, source and target alike.
 //
-// Both sides read through the same ownership helpers the bounded
+// Every side reads through the same ownership helpers the bounded
 // adjacency readers use, so every edge surface answers alike.
 func (v *OverlaidView) baseEdgeVisible(e *Edge) bool {
 	if e == nil {
@@ -683,47 +687,38 @@ func (v *OverlaidView) baseEdgeVisible(e *Edge) bool {
 	if v.layer == nil {
 		return true
 	}
-	if v.overlayOwnsOutEdges(e.From) {
+	if v.overlayOwnsBaseEdge(e.From, e.FilePath) {
 		return false
 	}
-	return v.overlayIdentityVisible(e.To)
+	return v.overlayIdentityVisible(e.From) && v.overlayIdentityVisible(e.To)
 }
 
-// GetOutEdges: when the layer owns the source's outgoing edge set, use
-// the overlay's resolved out-edges. Otherwise return base's edges but
-// drop any whose target the overlay hid (deleted in buffer).
+// GetOutEdges merges the base edges out of a node that survive the
+// overlay with the layer's own edges out of it, the way GetInEdges
+// merges the inbound direction.
 //
-// Ownership here is the wider OwnsOutEdges claim the bounded adjacency
-// readers apply, not "the source's file is covered". It therefore also
-// serves the layer's adjacency for a detached identity — an ID whose
-// file the layer does not cover but which it re-emitted or marked
-// removed — and for a source whose edge set the layer replaced without
-// claiming the node. Base's edges out of such a source were already
-// hidden by baseEdgeVisible, so consulting the layer is what stops the
-// plain reader from answering "no edges" where the bounded readers and
-// AllEdges answer with the layer's.
+// The merge is what the per-edge ownership rule requires: a covered
+// file's symbol keeps the base edges other files recorded out of it
+// while the layer supplies the ones its own file holds, so neither side
+// alone is the answer. baseEdgeVisible has already dropped everything
+// the layer speaks for, so nothing surfaces twice.
 func (v *OverlaidView) GetOutEdges(nodeID string) []*Edge {
-	if v.overlayOwnsOutEdges(nodeID) {
-		src := v.layer.OutEdges(nodeID)
-		out := make([]*Edge, len(src))
-		copy(out, src)
-		return out
-	}
-	if v.base == nil {
-		return nil
-	}
-	edges := v.base.GetOutEdges(nodeID)
 	if v.layer == nil {
-		return edges
-	}
-	out := edges[:0:0]
-	for _, e := range edges {
-		if !v.baseEdgeVisible(e) {
-			continue
+		if v.base == nil {
+			return nil
 		}
-		out = append(out, e)
+		return v.base.GetOutEdges(nodeID)
 	}
-	return out
+	var out []*Edge
+	if v.base != nil {
+		for _, e := range v.base.GetOutEdges(nodeID) {
+			if !v.baseEdgeVisible(e) {
+				continue
+			}
+			out = append(out, e)
+		}
+	}
+	return append(out, v.layer.OutEdges(nodeID)...)
 }
 
 // GetInEdges merges base's incoming edges (filtered to drop those
@@ -750,18 +745,20 @@ func (v *OverlaidView) GetInEdges(nodeID string) []*Edge {
 }
 
 // GetOutEdgesByNodeIDs returns the overlay-aware outgoing-edge map for
-// every input id. Overlay-owned ids short-circuit to the per-session
-// layer; the remainder fans out as a single batched lookup against
-// the base store. Output mirrors GetOutEdges's per-id semantics
-// (target-side overlay deletions filtered out), but in one cgo
-// round-trip per direction instead of N.
+// every input id. It is GetOutEdges's per-id semantics in one batched
+// base round-trip: base's edges out of each id, filtered by the same
+// visibility predicate, merged with the layer's own edges out of it.
+//
+// Every id goes to base, covered ones included, because a covered
+// file's symbol can still hold base edges other files recorded out of
+// it — a claim that is per edge and cannot be settled from the id.
 func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
 	if len(ids) == 0 {
 		return nil
 	}
 	out := make(map[string][]*Edge, len(ids))
-	baseIDs := ids[:0:0]
 	seen := make(map[string]struct{}, len(ids))
+	uniq := ids[:0:0]
 	for _, id := range ids {
 		if id == "" {
 			continue
@@ -770,18 +767,15 @@ func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
 			continue
 		}
 		seen[id] = struct{}{}
-		if v.overlayOwnsOutEdges(id) {
-			src := v.layer.OutEdges(id)
-			cp := make([]*Edge, len(src))
-			copy(cp, src)
-			out[id] = cp
-			continue
-		}
-		baseIDs = append(baseIDs, id)
+		uniq = append(uniq, id)
 	}
-	if len(baseIDs) > 0 && v.base != nil {
-		base := v.base.GetOutEdgesByNodeIDs(baseIDs)
-		for id, edges := range base {
+	if len(uniq) == 0 {
+		return out
+	}
+	if v.base != nil {
+		base := v.base.GetOutEdgesByNodeIDs(uniq)
+		for _, id := range uniq {
+			edges := base[id]
 			if v.layer == nil {
 				out[id] = edges
 				continue
@@ -794,6 +788,13 @@ func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
 				filtered = append(filtered, e)
 			}
 			out[id] = filtered
+		}
+	}
+	if v.layer != nil {
+		for _, id := range uniq {
+			if extras := v.layer.OutEdges(id); len(extras) > 0 {
+				out[id] = append(out[id], extras...)
+			}
 		}
 	}
 	return out
@@ -1177,11 +1178,19 @@ func (v *OverlaidView) repoCountDeltas() (map[string]int, map[string]int) {
 			baseIDs = append(baseIDs, n.ID)
 		}
 		if len(baseIDs) > 0 {
-			// Everything leaving a covered file is replaced by the
-			// layer's own out-edges for that source.
+			// A covered file replaces the edges recorded in it, not
+			// every edge leaving its symbols, so each base row is
+			// priced by the predicate the readers apply to it.
 			for id, outEdges := range v.base.GetOutEdgesByNodeIDs(baseIDs) {
-				if prefix := repoByID[id]; prefix != "" {
-					edges[prefix] -= len(outEdges)
+				prefix := repoByID[id]
+				if prefix == "" {
+					continue
+				}
+				for _, e := range outEdges {
+					if e == nil || v.baseEdgeVisible(e) {
+						continue
+					}
+					edges[prefix]--
 				}
 			}
 			for _, inEdges := range v.base.GetInEdgesByNodeIDs(baseIDs) {
