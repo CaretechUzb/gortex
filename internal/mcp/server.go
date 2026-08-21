@@ -2335,8 +2335,11 @@ func (s *Server) nodeInSessionScope(ctx context.Context, n *graph.Node) bool {
 // untested, resource rollups, …) iterate this instead of
 // graph.AllNodes() so a workspace-bound session can never observe
 // another workspace's nodes — not even in aggregate counts.
+//
+// The scan runs on the request's reader, so an overlay-active call sees
+// the pushed buffers instead of what is on disk.
 func (s *Server) scopedNodes(ctx context.Context) []*graph.Node {
-	return s.scopeNodes(ctx, s.graph.AllNodes())
+	return s.scopeNodes(ctx, s.readerFor(ctx).AllNodes())
 }
 
 // scopedNodesLight is scopedNodes over the projected node scan: the same
@@ -2355,8 +2358,12 @@ func (s *Server) scopedNodes(ctx context.Context) []*graph.Node {
 // the in-memory graph has no projection and hands back canonical nodes
 // with full Meta, so a wrong call site passes every in-memory test and
 // fails only against SQLite.
+//
+// The projection is asked of the request's reader. An overlay view is not
+// a light scanner, so an overlay-active call falls back to AllNodes and
+// gets fully materialized nodes — the conservative direction.
 func (s *Server) scopedNodesLight(ctx context.Context) []*graph.Node {
-	return s.scopeNodes(ctx, graph.AllNodesLight(s.graph))
+	return s.scopeNodes(ctx, graph.AllNodesLight(s.readerFor(ctx)))
 }
 
 // scopeNodes applies the session's workspace / repo scope to an
@@ -2426,16 +2433,22 @@ func (s *Server) scopeOptionsWithRepoNarrow(ctx context.Context, narrow map[stri
 //
 // Empty kinds returns nil — defensive against caller bugs that would
 // otherwise drop into the full-AllNodes fallback path.
+//
+// The pushdown is probed on the request's reader, never on the base
+// store: an overlay view does not implement the scanner, so an
+// overlay-active call takes the AllNodes fallback and reads the pushed
+// buffers rather than the backend's kind index.
 func (s *Server) scopedNodesByKinds(ctx context.Context, kinds []graph.NodeKind) []*graph.Node {
 	if len(kinds) == 0 {
 		return nil
 	}
+	reader := s.readerFor(ctx)
 	var nodes []*graph.Node
-	if scan, ok := s.graph.(graph.NodesByKindsScanner); ok {
+	if scan, ok := reader.(graph.NodesByKindsScanner); ok {
 		nodes = scan.NodesByKinds(kinds)
 	} else {
 		// Fallback: same behaviour as scopedNodes, kind-filtered Go-side.
-		all := s.graph.AllNodes()
+		all := reader.AllNodes()
 		allowed := make(map[graph.NodeKind]struct{}, len(kinds))
 		for _, k := range kinds {
 			allowed[k] = struct{}{}

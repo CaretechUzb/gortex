@@ -204,7 +204,7 @@ func (s *Server) handleGenerateSkill(ctx context.Context, req mcp.CallToolReques
 	// most-referenced symbols under the bundled directory (with their
 	// signatures) tell the agent what the region's API surface is —
 	// far more useful than a bare list of file paths.
-	symbols := s.collectSkillSymbols(absDir, refs)
+	symbols := s.collectSkillSymbols(ctx, absDir, refs)
 	if descAuto {
 		description = defaultSkillDescription(skillName, rawDir, len(refs), len(symbols))
 	}
@@ -297,8 +297,9 @@ func buildSkillMarkdown(name, description string, refs []generateSkillRef, symbo
 // generated skill leads with the region's most load-bearing API. It is
 // best-effort: a region the daemon hasn't indexed yields no symbols and
 // the skill falls back to its plain reference list.
-func (s *Server) collectSkillSymbols(absDir string, refs []generateSkillRef) []skillSymbol {
-	if s.graph == nil {
+func (s *Server) collectSkillSymbols(ctx context.Context, absDir string, refs []generateSkillRef) []skillSymbol {
+	g := s.readerFor(ctx)
+	if g == nil {
 		return nil
 	}
 	var ids []string
@@ -306,7 +307,7 @@ func (s *Server) collectSkillSymbols(absDir string, refs []generateSkillRef) []s
 	relByID := map[string]string{}
 	for _, r := range refs {
 		fp := s.repoRelative(filepath.Join(absDir, r.RelPath))
-		for _, n := range s.graph.GetFileNodes(fp) {
+		for _, n := range g.GetFileNodes(fp) {
 			if n == nil || !isSkillSymbolKind(n.Kind) {
 				continue
 			}
@@ -323,7 +324,7 @@ func (s *Server) collectSkillSymbols(absDir string, refs []generateSkillRef) []s
 	}
 
 	fan := make(map[string]int, len(ids))
-	for id, edges := range s.graph.GetInEdgesByNodeIDs(ids) {
+	for id, edges := range g.GetInEdgesByNodeIDs(ids) {
 		fan[id] = len(edges)
 	}
 

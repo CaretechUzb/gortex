@@ -56,6 +56,10 @@ func (s *Server) handleAnalyzeConstructorsMissingFields(ctx context.Context, req
 	for _, n := range scoped {
 		scopedSet[n.ID] = n
 	}
+	// The node set already comes from the request's reader; the edge
+	// walks below must come from the same one or a buffer's literal
+	// would be scored against the indexed field set.
+	reader := s.readerFor(ctx)
 
 	// Step 1: index types → their member fields.
 	typeFields := map[string]map[string]*graph.Node{} // typeID → {fieldName: fieldNode}
@@ -63,7 +67,7 @@ func (s *Server) handleAnalyzeConstructorsMissingFields(ctx context.Context, req
 		if n.Kind != graph.KindField {
 			continue
 		}
-		for _, e := range s.graph.GetOutEdges(n.ID) {
+		for _, e := range reader.GetOutEdges(n.ID) {
 			if e.Kind != graph.EdgeMemberOf {
 				continue
 			}
@@ -102,7 +106,7 @@ func (s *Server) handleAnalyzeConstructorsMissingFields(ctx context.Context, req
 		}
 
 		// Step 2: every function that instantiates this type.
-		for _, e := range s.graph.GetInEdges(typeID) {
+		for _, e := range reader.GetInEdges(typeID) {
 			if e.Kind != graph.EdgeInstantiates {
 				continue
 			}
@@ -116,11 +120,11 @@ func (s *Server) handleAnalyzeConstructorsMissingFields(ctx context.Context, req
 
 			// Step 3: which member fields does F reference?
 			referenced := map[string]bool{}
-			for _, ref := range s.graph.GetOutEdges(f.ID) {
+			for _, ref := range reader.GetOutEdges(f.ID) {
 				if ref.Kind != graph.EdgeReferences {
 					continue
 				}
-				target := s.graph.GetNode(ref.To)
+				target := reader.GetNode(ref.To)
 				if target == nil || target.Kind != graph.KindField {
 					continue
 				}

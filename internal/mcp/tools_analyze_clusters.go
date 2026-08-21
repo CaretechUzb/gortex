@@ -66,10 +66,10 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 			fullGraphBurst = true
 		}
 	case "louvain":
-		cr = analysis.DetectCommunitiesLouvain(s.graph)
+		cr = analysis.DetectCommunitiesLouvain(s.readerFor(ctx))
 		fullGraphBurst = true
 	case "spectral":
-		cr = analysis.SpectralClusters(s.graph)
+		cr = analysis.SpectralClusters(s.readerFor(ctx))
 		fullGraphBurst = true
 	default:
 		return mcp.NewToolResultError("analyze clusters: unknown algorithm " + algorithm +
@@ -191,8 +191,9 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 		sampleSets = append(sampleSets, set)
 		sampleMemberIDs = append(sampleMemberIDs, members...)
 	}
-	memberNodes := s.graph.GetNodesByIDs(sampleMemberIDs)
-	memberOutEdges := s.graph.GetOutEdgesByNodeIDs(sampleMemberIDs)
+	clusterReader := s.readerFor(ctx)
+	memberNodes := clusterReader.GetNodesByIDs(sampleMemberIDs)
+	memberOutEdges := clusterReader.GetOutEdgesByNodeIDs(sampleMemberIDs)
 
 	rows := make([]clusterRow, 0, len(survivors))
 	for i, p := range survivors {

@@ -37,7 +37,7 @@ func (s *Server) handleAnalyzeSynthesizers(ctx context.Context, req mcp.CallTool
 	if wsRepos, bound := s.sessionWorkspaceRepoSet(ctx); bound {
 		opts = append(opts, analyzer.WithSynthesizerRepoScope(wsRepos))
 	}
-	result := analyzer.AnalyzeSynthesizers(s.graph, opts...)
+	result := analyzer.AnalyzeSynthesizers(s.readerFor(ctx), opts...)
 
 	if isCompact(req) {
 		var b strings.Builder

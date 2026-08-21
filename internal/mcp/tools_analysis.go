@@ -490,11 +490,12 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 		// cheaply — so the safety gate is armed everywhere, not only on small
 		// embedded graphs.
 		var caveats []graph.ZeroImpactCaveat
+		reader := s.readerFor(ctx)
 		for _, id := range ids {
 			if id == "" {
 				continue
 			}
-			if c := graph.CaveatForZeroEdge(s.graph, id); c != nil {
+			if c := graph.CaveatForZeroEdge(reader, id); c != nil {
 				caveats = append(caveats, graph.ZeroImpactCaveat{
 					ID:      id,
 					Class:   c.Class,
@@ -657,13 +658,14 @@ func (s *Server) computeContractImpactContext(ctx context.Context, changedIDs []
 		}
 	}
 	aborted := false
+	reader := s.readerFor(ctx)
 	lookup := contracts.ShapeLookup(func(id string) *contracts.Shape {
-		if ctx.Err() != nil || s.graph == nil {
+		if ctx.Err() != nil || reader == nil {
 			aborted = true
 			return nil
 		}
 		var n *graph.Node
-		if getter, ok := s.graph.(contractImpactNodeContextGetter); ok {
+		if getter, ok := reader.(contractImpactNodeContextGetter); ok {
 			var err error
 			n, err = getter.GetNodeContext(ctx, id)
 			if err != nil {
@@ -678,7 +680,7 @@ func (s *Server) computeContractImpactContext(ctx context.Context, changedIDs []
 				aborted = true
 				return nil
 			}
-			n = s.graph.GetNode(id)
+			n = reader.GetNode(id)
 			if ctx.Err() != nil {
 				aborted = true
 				return nil

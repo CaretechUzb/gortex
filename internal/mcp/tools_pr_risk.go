@@ -42,6 +42,7 @@ func (s *Server) handlePRRisk(ctx context.Context, req mcp.CallToolRequest) (*mc
 
 	var symbolIDs []string
 	var changedFiles []string
+	reader := s.readerFor(ctx)
 
 	switch {
 	case idsStr != "":
@@ -54,7 +55,7 @@ func (s *Server) handlePRRisk(ctx context.Context, req mcp.CallToolRequest) (*mc
 		// security axis (path-based) still has signal on the ids path.
 		fileSeen := make(map[string]bool)
 		for _, id := range symbolIDs {
-			if n := s.graph.GetNode(id); n != nil && n.FilePath != "" && !fileSeen[n.FilePath] {
+			if n := reader.GetNode(id); n != nil && n.FilePath != "" && !fileSeen[n.FilePath] {
 				fileSeen[n.FilePath] = true
 				changedFiles = append(changedFiles, n.FilePath)
 			}

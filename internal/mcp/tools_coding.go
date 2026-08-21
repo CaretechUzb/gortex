@@ -319,7 +319,7 @@ func resolveKeepPredicate(keep string, symbols []*graph.Node) (func(elide.Decl) 
 // rows. We carry the node IDs only on the wire, but a `keep` token
 // can target a node by id, name, or kind — so we re-resolve every
 // defines row to a node here. Used only when compress_bodies=true.
-func (s *Server) editingContextSymbolNodes(filePath string, defines []map[string]any) []*graph.Node {
+func (s *Server) editingContextSymbolNodes(ctx context.Context, filePath string, defines []map[string]any) []*graph.Node {
 	if len(defines) == 0 {
 		return nil
 	}
@@ -332,7 +332,7 @@ func (s *Server) editingContextSymbolNodes(filePath string, defines []map[string
 	if len(ids) == 0 {
 		return nil
 	}
-	nodes := s.graph.GetNodesByIDs(ids)
+	nodes := s.readerFor(ctx).GetNodesByIDs(ids)
 	out := make([]*graph.Node, 0, len(ids))
 	for _, id := range ids {
 		if n, ok := nodes[id]; ok && n != nil {
@@ -369,7 +369,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	// round-trips instead of the per-symbol GetCallers / GetCallChain
 	// loop. The fallback retains the previous engine-based shape so
 	// the in-memory backend is unaffected.
-	if fc, ok := s.graph.(graph.FileEditingContext); ok {
+	if fc, ok := s.readerFor(ctx).(graph.FileEditingContext); ok {
 		bundle := fc.FileEditingContext(fp, []graph.NodeKind{graph.KindFunction, graph.KindMethod})
 		if bundle == nil || (bundle.FileNode == nil && len(bundle.Defines) == 0) {
 			return mcp.NewToolResultError("no symbols found for file: " + fp), nil
@@ -559,7 +559,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 				// verbatim bodies while the rest of the file is still
 				// stubbed — keep the functions being edited at full
 				// source and compress everything else.
-				keepNodes := s.editingContextSymbolNodes(fp, out.Defines)
+				keepNodes := s.editingContextSymbolNodes(ctx, fp, out.Defines)
 				keepPred, resolved := resolveKeepPredicate(req.GetString("keep", ""), keepNodes)
 				keptSymbols = resolved
 				decide := fidelityDecideForPath(parseFidelityGlobs(req.GetString("fidelity_globs", "")), fp)
@@ -2318,10 +2318,10 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 
 	// Pack-assembly passes: recover the edges between pack symbols a many-rooted
 	// retrieval leaves disconnected, and surface class-hierarchy siblings.
-	if rec := s.recoverPackEdges(relevantSymbols); len(rec) > 0 {
+	if rec := s.recoverPackEdges(ctx, relevantSymbols); len(rec) > 0 {
 		result["recovered_edges"] = rec
 	}
-	if sibs := s.packHierarchySiblings(relevantSymbols); len(sibs) > 0 {
+	if sibs := s.packHierarchySiblings(ctx, relevantSymbols); len(sibs) > 0 {
 		result["hierarchy_siblings"] = sibs
 	}
 

@@ -119,7 +119,7 @@ func (s *Server) handleSaveNote(ctx context.Context, req mcp.CallToolRequest) (*
 	repoPrefix, _ := s.sessionLocality(ctx)
 
 	if symbolID != "" {
-		if node := s.graph.GetNode(symbolID); node != nil {
+		if node := s.readerFor(ctx).GetNode(symbolID); node != nil {
 			if workspaceID == "" {
 				workspaceID = node.WorkspaceID
 			}
@@ -261,11 +261,12 @@ func (s *Server) handleDistillSession(ctx context.Context, req mcp.CallToolReque
 		projectID = proj
 	}
 
+	reader := s.readerFor(ctx)
 	res := s.notes.DistillSession(sessionID, workspaceID, projectID, opts, func(id string) *graph.Node {
-		if s.graph == nil {
+		if reader == nil {
 			return nil
 		}
-		return s.graph.GetNode(id)
+		return reader.GetNode(id)
 	})
 	return s.respondJSONOrTOON(ctx, req, res)
 }

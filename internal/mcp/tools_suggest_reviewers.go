@@ -101,7 +101,8 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 	// Ownership signal — recent authors of the changed symbols / files.
 	// The changed-file paths are repo-relative (git / forge), so the node
 	// join is prefix-aware in multi-repo mode.
-	blame := blameRowsByID(s.graph)
+	reader := s.readerFor(ctx)
+	blame := blameRowsByID(reader)
 	authorCounts := map[string]int{}
 	for _, f := range changedFiles {
 		for _, n := range analysis.JoinFileNodes(s.graph, repoPrefix, f) {
@@ -117,7 +118,7 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 	coChangeCounts := map[string]int{}
 	for _, f := range changedFiles {
 		for partner := range s.coChangeScores(analysis.JoinFilePath(s.graph, repoPrefix, f)) {
-			for _, n := range s.graph.GetFileNodes(partner) {
+			for _, n := range reader.GetFileNodes(partner) {
 				if la, ok := lastAuthoredFrom(blame, n); ok && la.Email != "" {
 					coChangeCounts[normalizeReviewer(la.Email)]++
 				}
@@ -151,6 +152,7 @@ func (s *Server) resolveReviewerChangeset(ctx context.Context, req mcp.CallToolR
 
 	switch {
 	case idsStr != "":
+		reader := s.readerFor(ctx)
 		fileSeen := map[string]bool{}
 		for _, id := range strings.Split(idsStr, ",") {
 			id = strings.TrimSpace(id)
@@ -158,7 +160,7 @@ func (s *Server) resolveReviewerChangeset(ctx context.Context, req mcp.CallToolR
 				continue
 			}
 			symbolIDs = append(symbolIDs, id)
-			if n := s.graph.GetNode(id); n != nil && n.FilePath != "" && !fileSeen[n.FilePath] {
+			if n := reader.GetNode(id); n != nil && n.FilePath != "" && !fileSeen[n.FilePath] {
 				fileSeen[n.FilePath] = true
 				files = append(files, n.FilePath)
 			}

@@ -131,7 +131,7 @@ type prReviewSimulation struct {
 // changed set without the caller having to hand-author proposed signatures —
 // the broken-edge gate is "does this symbol's surface still hold for everyone
 // who depends on it". Symbols with no recorded signature are skipped.
-func changedSymbolsToSignatureChanges(g graph.Store, changed []analysis.ChangedSymbol) []analysis.SignatureChange {
+func changedSymbolsToSignatureChanges(g graph.Reader, changed []analysis.ChangedSymbol) []analysis.SignatureChange {
 	if g == nil {
 		return nil
 	}
@@ -180,7 +180,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 		ids  []string
 	)
 	if idsArg := strings.TrimSpace(req.GetString("ids", "")); idsArg != "" {
-		diff = s.prReviewDiffFromIDs(idsArg)
+		diff = s.prReviewDiffFromIDs(ctx, idsArg)
 		for _, cs := range diff.ChangedSymbols {
 			ids = append(ids, cs.ID)
 		}
@@ -218,9 +218,9 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 		verifyGate   *reviewGate
 	)
 	if wantVerify {
-		changes := changedSymbolsToSignatureChanges(s.graph, diff.ChangedSymbols)
+		changes := changedSymbolsToSignatureChanges(s.readerFor(ctx), diff.ChangedSymbols)
 		if len(changes) > 0 {
-			verifyResult = analysis.VerifyChanges(s.graph, s.engine, changes)
+			verifyResult = analysis.VerifyChanges(s.graph, s.engineFor(ctx), changes)
 			out.Verify = verifyResult
 			g := prReviewVerifyGate(verifyResult)
 			verifyGate = &g
@@ -287,7 +287,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 
 	// --- section: audit_agent_config ---
 	if wantAudit {
-		report := s.buildConfigAuditSection(repoRoot)
+		report := s.buildConfigAuditSection(ctx, repoRoot)
 		out.ConfigAudit = report
 		out.Gates = append(out.Gates, prReviewAuditGate(report))
 	}
@@ -313,8 +313,9 @@ func (s *Server) prReviewRepoRoot(ctx context.Context, req mcp.CallToolRequest) 
 // prReviewDiffFromIDs synthesises a DiffResult from caller-supplied symbol
 // IDs so the rollup can run without a working tree. Each ID resolves to its
 // graph node for the name / kind / file, and the file set is unioned.
-func (s *Server) prReviewDiffFromIDs(idsArg string) *analysis.DiffResult {
+func (s *Server) prReviewDiffFromIDs(ctx context.Context, idsArg string) *analysis.DiffResult {
 	diff := &analysis.DiffResult{}
+	reader := s.readerFor(ctx)
 	fileSet := map[string]bool{}
 	for _, raw := range strings.Split(idsArg, ",") {
 		id := strings.TrimSpace(raw)
@@ -322,7 +323,7 @@ func (s *Server) prReviewDiffFromIDs(idsArg string) *analysis.DiffResult {
 			continue
 		}
 		cs := analysis.ChangedSymbol{ID: id}
-		if node := s.graph.GetNode(id); node != nil {
+		if node := reader.GetNode(id); node != nil {
 			cs.Name = node.Name
 			cs.Kind = string(node.Kind)
 			cs.FilePath = node.FilePath
@@ -345,6 +346,7 @@ func (s *Server) prReviewDiffFromIDs(idsArg string) *analysis.DiffResult {
 func (s *Server) buildDiffContextSection(ctx context.Context, diff *analysis.DiffResult, communities *analysis.CommunityResult, processes *analysis.ProcessResult) []diffContextSymbol {
 	const cap = 50
 	engine := s.engineFor(ctx)
+	reader := s.readerFor(ctx)
 
 	// Pre-compute per-file risk so every symbol in a file shares one tier.
 	fileIDs := map[string][]string{}
@@ -352,7 +354,7 @@ func (s *Server) buildDiffContextSection(ctx context.Context, diff *analysis.Dif
 		if cs.ID == "" {
 			continue
 		}
-		node := s.graph.GetNode(cs.ID)
+		node := reader.GetNode(cs.ID)
 		if node == nil || node.FilePath == "" {
 			continue
 		}
@@ -369,7 +371,7 @@ func (s *Server) buildDiffContextSection(ctx context.Context, diff *analysis.Dif
 		if len(syms) >= cap {
 			break
 		}
-		node := s.graph.GetNode(cs.ID)
+		node := reader.GetNode(cs.ID)
 		if node == nil {
 			continue
 		}
@@ -411,7 +413,7 @@ func (s *Server) buildDiffContextSection(ctx context.Context, diff *analysis.Dif
 
 // buildConfigAuditSection runs the agent-config drift audit over the repo's
 // discovered config files. Returns nil when no root or no config files.
-func (s *Server) buildConfigAuditSection(repoRoot string) *audit.Report {
+func (s *Server) buildConfigAuditSection(ctx context.Context, repoRoot string) *audit.Report {
 	root := repoRoot
 	if root == "" && s.indexer != nil {
 		root = s.indexer.RootPath()
@@ -423,7 +425,7 @@ func (s *Server) buildConfigAuditSection(repoRoot string) *audit.Report {
 	if len(files) == 0 {
 		return &audit.Report{Root: root, FilesScanned: 0}
 	}
-	return audit.Audit(s.graph, root, files)
+	return audit.Audit(s.readerFor(ctx), root, files)
 }
 
 // buildPRReviewSimulation runs the optional simulation section. It is gated

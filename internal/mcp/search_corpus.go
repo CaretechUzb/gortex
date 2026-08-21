@@ -148,7 +148,11 @@ func (s *Server) mergeContentChannel(ctx context.Context, query string, nodes []
 	if strings.TrimSpace(query) == "" {
 		return nodes
 	}
-	cs, ok := s.graph.(graph.ContentSearcher)
+	// The content-index capability is asserted on the request reader, so an
+	// overlay-active call finds no searcher and merges nothing rather than
+	// pulling durable rows for files the editor buffer already changed.
+	reader := s.readerFor(ctx)
+	cs, ok := reader.(graph.ContentSearcher)
 	if !ok {
 		return nodes
 	}
@@ -194,7 +198,7 @@ func (s *Server) mergeContentChannel(ctx context.Context, query string, nodes []
 		if _, dup := seen[h.NodeID]; dup {
 			continue
 		}
-		n := s.graph.GetNode(h.NodeID)
+		n := reader.GetNode(h.NodeID)
 		if n == nil {
 			continue
 		}

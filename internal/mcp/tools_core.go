@@ -2277,7 +2277,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		"truncated":   sg.Truncated,
 		"etag":        etag,
 	}
-	s.attachFileDependents(result, fp)
+	s.attachFileDependents(ctx, result, fp)
 	if payload, merr := json.Marshal(result); merr == nil {
 		s.recordFileBaselineSavings(ctx, "get_file_summary", fp, summaryLang, string(payload))
 	}
@@ -2424,7 +2424,7 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 		// Same adaptive default as find_usages: hide the name-only
 		// fan-out once resolver-verified callers exist.
 		sg.SuppressRedundantTextMatches()
-		s.attachSuppressionCaveat(sg, id)
+		s.attachSuppressionCaveat(ctx, sg, id)
 	}
 	s.attachNameOnlyCandidates(eng, sg, id, minTier, opts)
 	enrichSubGraphEdges(sg)
@@ -2435,7 +2435,7 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 		// removed them. Classifying on top would double-report it, and
 		// now that classification weighs provenance it would report the
 		// very tier the caller asked to exclude.
-		sg.Caveat = graph.CaveatForZeroEdge(s.graph, id)
+		sg.Caveat = graph.CaveatForZeroEdge(s.readerFor(ctx), id)
 	} else if len(sg.Edges) > 0 && graph.WeakUsageEvidenceOnly(sg.Edges) {
 		// Populated, but every caller is a bare-name match — the shape a
 		// common method name (`Get`, `Run`, `Close`) produces. Left
@@ -2447,13 +2447,13 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 	// Epistemic lower bound: a caller walk over in-edges cannot see callers
 	// that reach this symbol through interface dispatch the resolver left
 	// unbound. Flag the floor + name the interface so the agent can widen it.
-	if bs := graph.CallerBoundaries(s.graph, []string{id}, 0); len(bs) > 0 {
+	if bs := graph.CallerBoundaries(s.readerFor(ctx), []string{id}, 0); len(bs) > 0 {
 		sg.Boundaries = bs
 		sg.LowerBound = graph.LowerBoundCaveat(bs)
 		// The reach is a floor because dispatch is dynamic — scan the seed's
 		// body for the exact runtime-dispatch sites so the agent gets
 		// {site, form, key, candidates} instead of a read-spiral.
-		if db := s.dynamicBoundariesForSymbol(s.graph.GetNode(id)); len(db) > 0 {
+		if db := s.dynamicBoundariesForSymbol(s.readerFor(ctx).GetNode(id)); len(db) > 0 {
 			sg.DynamicBoundaries = db
 		}
 	}
@@ -2704,7 +2704,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 		// text_matched fan-out is noise — suppress it and report the count
 		// via text_matched_suppressed. min_tier:"text_matched" restores it.
 		sg.SuppressRedundantTextMatches()
-		s.attachSuppressionCaveat(sg, id)
+		s.attachSuppressionCaveat(ctx, sg, id)
 	}
 	s.attachNameOnlyCandidates(eng, sg, id, minTier, opts)
 	enrichSubGraphEdges(sg)
@@ -2720,12 +2720,12 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// structural flavor (the enclosing owner type for a type flavor; the
 	// FROM node's own ui_component for `component`). Orphan nodes left
 	// with no incident edge are pruned.
-	s.filterUsagesByFlavor(sg, id, strings.TrimSpace(req.GetString("flavor", "")))
+	s.filterUsagesByFlavor(ctx, sg, id, strings.TrimSpace(req.GetString("flavor", "")))
 	if len(sg.Edges) == 0 && sg.TierFiltered == nil {
 		// A tier_filtered emptiness is not "no usages" — FilterByMinTier
 		// already recorded why. Only reach for the extraction-gap / unused
 		// classification when the emptiness was NOT caused by min_tier.
-		sg.Caveat = graph.CaveatForZeroEdge(s.graph, id)
+		sg.Caveat = graph.CaveatForZeroEdge(s.readerFor(ctx), id)
 	} else if len(sg.Edges) > 0 && graph.WeakUsageEvidenceOnly(sg.Edges) {
 		// Populated, but every usage is a bare-name match — the shape a
 		// common symbol name produces. Left uncaveated this reads as proof
@@ -2760,7 +2760,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	format := req.GetString("format", "")
 	if !s.isTOON(ctx, req) && !isCompact(req) && format != "mermaid" && format != "dot" {
 		sg.Nodes = s.withAbsPaths(sg.Nodes)
-		return s.respondScopedJSONOrTOON(ctx, req, newUsageResponse(sg, s.graph), resolved)
+		return s.respondScopedJSONOrTOON(ctx, req, newUsageResponse(sg, s.readerFor(ctx)), resolved)
 	}
 	return s.returnScopedSubGraph(ctx, req, sg, resolved)
 }
@@ -2815,11 +2815,11 @@ func (s *Server) attachNameOnlyCandidates(eng *query.Engine, sg *query.SubGraph,
 // hidden-but-real usage is diagnosable instead of silently dropped. No-op when
 // nothing was suppressed or the file is not stale; the existing
 // text_matched_suppressed count carries the number in every response either way.
-func (s *Server) attachSuppressionCaveat(sg *query.SubGraph, id string) {
+func (s *Server) attachSuppressionCaveat(ctx context.Context, sg *query.SubGraph, id string) {
 	if sg == nil || sg.TextMatchedSuppressed == 0 {
 		return
 	}
-	if !s.suppressionMayBeStale(id) {
+	if !s.suppressionMayBeStale(ctx, id) {
 		return
 	}
 	sg.SuppressionCaveat = fmt.Sprintf(
@@ -2835,12 +2835,13 @@ func (s *Server) attachSuppressionCaveat(sg *query.SubGraph, id string) {
 // real ones. Reads graph.MetaReparsePendingEnrichment, which the indexer
 // stamps on the file's KindFile node. Conservative: false whenever the marker
 // is absent (no rider rather than a false alarm on a converged graph).
-func (s *Server) suppressionMayBeStale(id string) bool {
-	n := s.graph.GetNode(id)
+func (s *Server) suppressionMayBeStale(ctx context.Context, id string) bool {
+	g := s.readerFor(ctx)
+	n := g.GetNode(id)
 	if n == nil || n.FilePath == "" {
 		return false
 	}
-	for _, fn := range s.graph.GetFileNodes(n.FilePath) {
+	for _, fn := range g.GetFileNodes(n.FilePath) {
 		if fn.Kind != graph.KindFile {
 			continue
 		}
@@ -2853,7 +2854,7 @@ func (s *Server) suppressionMayBeStale(id string) bool {
 
 // newUsageResponse resolves the from_* fields for each node (pure read
 // — never mutates the graph) and wraps the SubGraph for JSON output.
-func newUsageResponse(sg *query.SubGraph, g graph.Store) *usageResponse {
+func newUsageResponse(sg *query.SubGraph, g graph.Reader) *usageResponse {
 	wrapped := make([]usageNode, 0, len(sg.Nodes))
 	for _, n := range sg.Nodes {
 		tf, uc := usageFromFlavor(g, n.ID, n)
@@ -2926,7 +2927,7 @@ func annotateAndFilterReturnUsage(sg *query.SubGraph, usageFilter string) {
 // node's enclosing owner type, because callers are functions / methods
 // that never carry type_flavor themselves. Nil-safe: a FROM node absent
 // from both the supplied lookup and the graph yields empty strings.
-func usageFromFlavor(g graph.Store, fromID string, fromNode *graph.Node) (typeFlavor, uiComponent string) {
+func usageFromFlavor(g graph.Reader, fromID string, fromNode *graph.Node) (typeFlavor, uiComponent string) {
 	if fromNode == nil && g != nil {
 		fromNode = g.GetNode(fromID)
 	}
@@ -2952,7 +2953,7 @@ func usageFromFlavor(g graph.Store, fromID string, fromNode *graph.Node) (typeFl
 // resolve to a matching structural flavor, then prunes nodes left with
 // no incident edge (the queried target is always kept). An empty flavor
 // argument is a no-op.
-func (s *Server) filterUsagesByFlavor(sg *query.SubGraph, targetID, flavorArg string) {
+func (s *Server) filterUsagesByFlavor(ctx context.Context, sg *query.SubGraph, targetID, flavorArg string) {
 	flavors := splitFlavors(flavorArg)
 	if sg == nil || len(flavors) == 0 {
 		return
@@ -2961,9 +2962,10 @@ func (s *Server) filterUsagesByFlavor(sg *query.SubGraph, targetID, flavorArg st
 	for _, n := range sg.Nodes {
 		nodeByID[n.ID] = n
 	}
+	g := s.readerFor(ctx)
 	kept := sg.Edges[:0]
 	for _, e := range sg.Edges {
-		tf, uc := usageFromFlavor(s.graph, e.From, nodeByID[e.From])
+		tf, uc := usageFromFlavor(g, e.From, nodeByID[e.From])
 		if flavorMatchesResolved(tf, uc, flavors) {
 			kept = append(kept, e)
 		}

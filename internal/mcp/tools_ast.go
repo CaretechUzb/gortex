@@ -121,7 +121,7 @@ func (s *Server) handleSearchAST(ctx context.Context, req mcp.CallToolRequest) (
 	s.enrichASTMatchesContext(ctx, res.Matches)
 
 	if minFanIn > 0 {
-		res.Matches = filterByMinFanIn(s.graph, res.Matches, minFanIn)
+		res.Matches = filterByMinFanIn(s.readerFor(ctx), res.Matches, minFanIn)
 		res.Total = len(res.Matches)
 	}
 
@@ -201,7 +201,7 @@ func (s *Server) buildASTTargets(language, pathPrefix string, allowedRepos map[s
 // than `min` incoming edges. Without an enclosing symbol, the
 // match is preserved (we'd otherwise silently swallow file-level
 // matches that legitimately have no caller graph).
-func filterByMinFanIn(g graph.Store, matches []astquery.Match, min int) []astquery.Match {
+func filterByMinFanIn(g graph.Reader, matches []astquery.Match, min int) []astquery.Match {
 	if g == nil || min <= 0 {
 		return matches
 	}

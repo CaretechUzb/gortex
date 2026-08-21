@@ -101,8 +101,9 @@ var packRecoveryKinds = map[graph.EdgeKind]bool{
 // overrides) that exist between the pack's symbols — the internal connectivity
 // a many-rooted retrieval leaves out. Returns nil when fewer than two symbols
 // are in the pack or none are connected.
-func (s *Server) recoverPackEdges(symbols []*graph.Node) []map[string]any {
-	if s.graph == nil || len(symbols) < 2 {
+func (s *Server) recoverPackEdges(ctx context.Context, symbols []*graph.Node) []map[string]any {
+	g := s.readerFor(ctx)
+	if g == nil || len(symbols) < 2 {
 		return nil
 	}
 	ids := make(map[string]bool, len(symbols))
@@ -117,7 +118,7 @@ func (s *Server) recoverPackEdges(symbols []*graph.Node) []map[string]any {
 	seen := map[string]bool{}
 	var out []map[string]any
 	for _, id := range ordered {
-		for _, e := range s.graph.GetOutEdges(id) {
+		for _, e := range g.GetOutEdges(id) {
 			if e == nil || !packRecoveryKinds[e.Kind] || !ids[e.To] {
 				continue
 			}
@@ -136,8 +137,9 @@ func (s *Server) recoverPackEdges(symbols []*graph.Node) []map[string]any {
 // type — its siblings in the class hierarchy (e.g. a pack's InternalEngine and
 // the sibling ReadOnlyEngine that both extend Engine). Already-packed types are
 // excluded; the result is capped.
-func (s *Server) packHierarchySiblings(symbols []*graph.Node) []map[string]any {
-	if s.graph == nil {
+func (s *Server) packHierarchySiblings(ctx context.Context, symbols []*graph.Node) []map[string]any {
+	g := s.readerFor(ctx)
+	if g == nil {
 		return nil
 	}
 	inPack := map[string]bool{}
@@ -151,7 +153,7 @@ func (s *Server) packHierarchySiblings(symbols []*graph.Node) []map[string]any {
 		if n == nil || (n.Kind != graph.KindType && n.Kind != graph.KindInterface) {
 			continue
 		}
-		for _, e := range s.graph.GetOutEdges(n.ID) {
+		for _, e := range g.GetOutEdges(n.ID) {
 			if e != nil && (e.Kind == graph.EdgeExtends || e.Kind == graph.EdgeImplements) {
 				parents[e.To] = true
 			}
@@ -169,7 +171,7 @@ func (s *Server) packHierarchySiblings(symbols []*graph.Node) []map[string]any {
 	sibSeen := map[string]bool{}
 	var out []map[string]any
 	for _, parent := range parentIDs {
-		for _, e := range s.graph.GetInEdges(parent) {
+		for _, e := range g.GetInEdges(parent) {
 			if e == nil || (e.Kind != graph.EdgeExtends && e.Kind != graph.EdgeImplements) {
 				continue
 			}
@@ -177,7 +179,7 @@ func (s *Server) packHierarchySiblings(symbols []*graph.Node) []map[string]any {
 			if inPack[sib] || sibSeen[sib] {
 				continue
 			}
-			n := s.graph.GetNode(sib)
+			n := g.GetNode(sib)
 			if n == nil {
 				continue
 			}

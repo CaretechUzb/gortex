@@ -1098,17 +1098,18 @@ func matchLocationsHint(fileStr, oldString string) string {
 // fileDependents returns the distinct source files that import the given file —
 // the files a change to it would ripple into. Only import edges into the file
 // node count, so the header reflects real file-to-file dependencies.
-func (s *Server) fileDependents(fileID string) []string {
-	if s.graph == nil || fileID == "" {
+func (s *Server) fileDependents(ctx context.Context, fileID string) []string {
+	g := s.readerFor(ctx)
+	if g == nil || fileID == "" {
 		return nil
 	}
 	seen := map[string]bool{}
 	var deps []string
-	for _, e := range s.graph.GetInEdges(fileID) {
+	for _, e := range g.GetInEdges(fileID) {
 		if e == nil || e.Kind != graph.EdgeImports {
 			continue
 		}
-		f := s.fileOfNode(e.From)
+		f := fileOfNode(g, e.From)
 		if f == "" || f == fileID || seen[f] {
 			continue
 		}
@@ -1121,8 +1122,8 @@ func (s *Server) fileDependents(fileID string) []string {
 
 // fileOfNode returns the source file a node belongs to: a file node is its own
 // file, any other node reports its FilePath; falls back to the id.
-func (s *Server) fileOfNode(id string) string {
-	if n := s.graph.GetNode(id); n != nil {
+func fileOfNode(g graph.Reader, id string) string {
+	if n := g.GetNode(id); n != nil {
 		if n.Kind == graph.KindFile {
 			return n.ID
 		}
@@ -1154,8 +1155,8 @@ func fileDependentsNote(deps []string) string {
 
 // attachFileDependents records the dependents list + one-line header on a file
 // tool's result map, when the file has any importers.
-func (s *Server) attachFileDependents(result map[string]any, fileID string) {
-	if deps := s.fileDependents(fileID); len(deps) > 0 {
+func (s *Server) attachFileDependents(ctx context.Context, result map[string]any, fileID string) {
+	if deps := s.fileDependents(ctx, fileID); len(deps) > 0 {
 		result["dependents"] = deps
 		result["dependents_header"] = fileDependentsNote(deps)
 	}
@@ -1592,7 +1593,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		s.tokenStatsFor(ctx).record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)
 	}
 
-	s.attachFileDependents(result, relPath)
+	s.attachFileDependents(ctx, result, relPath)
 
 	if s.isTOON(ctx, req) {
 		return returnTOON(result)

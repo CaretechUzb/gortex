@@ -232,6 +232,7 @@ func (s *Server) resolveImpactTarget(ctx context.Context, symbol, file string) (
 		})
 	}
 
+	reader := s.readerFor(ctx)
 	scope := &impactTargetScope{Depth: map[string]int{}, ByDepth: map[int]int{}}
 	if symbol != "" {
 		canonical, ambiguous := s.resolveFacadeSymbolShorthand(ctx, symbol)
@@ -242,7 +243,7 @@ func (s *Server) resolveImpactTarget(ctx context.Context, symbol, file string) (
 				Data:      map[string]any{"field": "target.symbol", "symbol": symbol, "candidates": ambiguous},
 			})
 		}
-		node := s.graph.GetNode(canonical)
+		node := reader.GetNode(canonical)
 		if node == nil || !s.nodeInSessionScope(ctx, node) {
 			return nil, NewStructuredErrorResult(StructuredError{
 				ErrorCode: ErrCodeSymbolNotFound,
@@ -254,7 +255,7 @@ func (s *Server) resolveImpactTarget(ctx context.Context, symbol, file string) (
 		scope.Seeds = []string{node.ID}
 	} else {
 		scope.File = file
-		for _, node := range s.graph.GetFileNodes(file) {
+		for _, node := range reader.GetFileNodes(file) {
 			if node == nil || !reach.ImpactSeedKind(node.Kind) || !s.nodeInSessionScope(ctx, node) {
 				continue
 			}
@@ -416,7 +417,8 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 	// candidate id set) and falls back to a per-kind EdgesByKind
 	// stream otherwise. fanOutKinds is empty -- impact only reads
 	// fan-in.
-	fanIn, _ := analysis.CollectFanCounts(s.graph, candidateIDs,
+	reader := s.readerFor(ctx)
+	fanIn, _ := analysis.CollectFanCounts(reader, candidateIDs,
 		[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
 		nil,
 	)
@@ -449,8 +451,8 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		// reference edge in the graph. addComm already ignores
 		// non-candidates, so either endpoint may be the candidate.
 		for _, byNode := range []map[string][]*graph.Edge{
-			s.graph.GetInEdgesByNodeIDs(candidateIDs),
-			s.graph.GetOutEdgesByNodeIDs(candidateIDs),
+			reader.GetInEdgesByNodeIDs(candidateIDs),
+			reader.GetOutEdgesByNodeIDs(candidateIDs),
 		} {
 			for _, edges := range byNode {
 				for _, e := range edges {
@@ -464,7 +466,7 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		}
 	} else {
 		for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
-			for e := range s.graph.EdgesByKind(kind) {
+			for e := range reader.EdgesByKind(kind) {
 				if e == nil {
 					continue
 				}

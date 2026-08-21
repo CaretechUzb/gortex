@@ -141,13 +141,14 @@ type prediction struct {
 
 // nodesForIDs resolves symbol IDs to graph nodes, dropping any that no longer
 // exist.
-func (s *Server) nodesForIDs(ids []string) []*graph.Node {
-	if s.graph == nil {
+func (s *Server) nodesForIDs(ctx context.Context, ids []string) []*graph.Node {
+	g := s.readerFor(ctx)
+	if g == nil {
 		return nil
 	}
 	out := make([]*graph.Node, 0, len(ids))
 	for _, id := range ids {
-		if n := s.graph.GetNode(id); n != nil {
+		if n := g.GetNode(id); n != nil {
 			out = append(out, n)
 		}
 	}
@@ -269,7 +270,7 @@ func (s *Server) lowerEditSource(ctx context.Context, req mcp.CallToolRequest) (
 	}
 	ids = dedupeStrings(ids)
 
-	nodes := s.nodesForIDs(ids)
+	nodes := s.nodesForIDs(ctx, ids)
 	changed := make([]changedSymbolRef, 0, len(nodes))
 	for _, n := range nodes {
 		changed = append(changed, refFromNode(n))
@@ -380,7 +381,7 @@ func (s *Server) lowerRangeSource(ctx context.Context, req mcp.CallToolRequest) 
 		files = append(files, h.File)
 	}
 	ids = dedupeStrings(ids)
-	nodes := s.nodesForIDs(ids)
+	nodes := s.nodesForIDs(ctx, ids)
 	return &prediction{
 		source:            "ranges",
 		changed:           changed,
@@ -398,7 +399,7 @@ func (s *Server) lowerSymbolSource(ctx context.Context, req mcp.CallToolRequest)
 		return nil, fmt.Errorf("source=symbols requires a comma-separated `symbols` list")
 	}
 	ids = dedupeStrings(ids)
-	nodes := s.nodesForIDs(ids)
+	nodes := s.nodesForIDs(ctx, ids)
 	changed := make([]changedSymbolRef, 0, len(nodes))
 	files := make([]string, 0, len(nodes))
 	for _, n := range nodes {
@@ -444,7 +445,7 @@ func (s *Server) lowerDiffSource(ctx context.Context, req mcp.CallToolRequest) (
 		source:       "diff",
 		changed:      changed,
 		changedIDs:   ids,
-		nodes:        s.nodesForIDs(ids),
+		nodes:        s.nodesForIDs(ctx, ids),
 		impact:       s.analyzeImpactLazy(ctx, ids),
 		touchedFiles: diff.ChangedFiles,
 		repoPrefixes: []string{repoPrefix},
@@ -770,7 +771,7 @@ func buildStopCondition(p *prediction, risk changeRisk, verCmd string) string {
 
 // assembleEnvelope is the EMIT stage — fold prediction + violations + risk +
 // classification into one verdict.
-func (s *Server) assembleEnvelope(p *prediction, violations []analysis.GuardViolation) changeEnvelope {
+func (s *Server) assembleEnvelope(ctx context.Context, p *prediction, violations []analysis.GuardViolation) changeEnvelope {
 	risk := s.scoreChangeRisk(p)
 	verdict := verdictAllow
 	var reasons []changeReason
@@ -835,7 +836,7 @@ func (s *Server) assembleEnvelope(p *prediction, violations []analysis.GuardViol
 
 	// Risk gate: load-bearing symbols need a fresh impact-review ack.
 	if p.riskGate {
-		for _, r := range s.riskGateReasons(p, risk) {
+		for _, r := range s.riskGateReasons(ctx, p, risk) {
 			reasons = append(reasons, r)
 			verdict = escalate(verdict, verdictForSeverity(r.Severity))
 		}
@@ -866,7 +867,7 @@ func (s *Server) assembleEnvelope(p *prediction, violations []analysis.GuardViol
 		Risk:                risk,
 		VerificationCommand: verCmd,
 		StopCondition:       stopCondition,
-		EditStrategy:        s.buildEditStrategy(p),
+		EditStrategy:        s.buildEditStrategy(ctx, p),
 		APISurface:          apiSurface,
 	}
 	if p.impact != nil {
@@ -903,6 +904,6 @@ func (s *Server) handleChangeContract(ctx context.Context, req mcp.CallToolReque
 		return s.handleRiskAck(ctx, req, p)
 	}
 	violations := s.evaluateChange(p)
-	env := s.assembleEnvelope(p, violations)
+	env := s.assembleEnvelope(ctx, p, violations)
 	return s.respondJSONOrTOON(ctx, req, env)
 }

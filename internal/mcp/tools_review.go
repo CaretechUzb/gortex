@@ -261,7 +261,7 @@ func (s *Server) handleSiblingDiffContext(ctx context.Context, req mcp.CallToolR
 
 	// Resolve the focus set: explicit focus_files / focus_file plus the file
 	// of any focus_symbol_id.
-	focus := s.resolveFocusFiles(req)
+	focus := s.resolveFocusFiles(ctx, req)
 	focusList := make([]string, 0, len(focus))
 	for f := range focus {
 		focusList = append(focusList, f)
@@ -282,7 +282,7 @@ func (s *Server) handleSiblingDiffContext(ctx context.Context, req mcp.CallToolR
 		if derr != nil || strings.TrimSpace(raw) == "" {
 			continue
 		}
-		relation, score := s.siblingRelation(f, focusList)
+		relation, score := s.siblingRelation(ctx, f, focusList)
 		siblings = append(siblings, siblingDiffRow{
 			File:     f,
 			Relation: relation,
@@ -325,7 +325,7 @@ func siblingDiffScope(req mcp.CallToolRequest) (scope, baseRef string) {
 // resolveFocusFiles collects the focus file set from focus_files / focus_file
 // (paths) and focus_symbol_id (the symbol's file). Paths are cleaned so they
 // join the MapGitDiff ChangedFiles keys.
-func (s *Server) resolveFocusFiles(req mcp.CallToolRequest) map[string]bool {
+func (s *Server) resolveFocusFiles(ctx context.Context, req mcp.CallToolRequest) map[string]bool {
 	focus := map[string]bool{}
 	add := func(p string) {
 		p = filepath.Clean(strings.TrimSpace(p))
@@ -340,7 +340,7 @@ func (s *Server) resolveFocusFiles(req mcp.CallToolRequest) map[string]bool {
 		add(ff)
 	}
 	if id := strings.TrimSpace(req.GetString("focus_symbol_id", "")); id != "" {
-		if n := s.graph.GetNode(id); n != nil && n.FilePath != "" {
+		if n := s.readerFor(ctx).GetNode(id); n != nil && n.FilePath != "" {
 			add(n.FilePath)
 		}
 	}
@@ -358,18 +358,19 @@ func (s *Server) resolveFocusFiles(req mcp.CallToolRequest) map[string]bool {
 //
 // Score is a coarse band per relation (plus a co-change magnitude bump) so the
 // ranking is deterministic and the bands stay separable.
-func (s *Server) siblingRelation(file string, focusFiles []string) (string, float64) {
+func (s *Server) siblingRelation(ctx context.Context, file string, focusFiles []string) (string, float64) {
 	if len(focusFiles) == 0 {
 		return "none", 0
 	}
 
 	// community / process sharing, evaluated symbol-wise across both sides.
+	reader := s.readerFor(ctx)
 	communities := s.getCommunities()
 	processes := s.getProcesses()
 	focusCommunities := map[string]bool{}
 	focusProcesses := map[string]bool{}
 	for _, ff := range focusFiles {
-		for _, n := range s.graph.GetFileNodes(ff) {
+		for _, n := range reader.GetFileNodes(ff) {
 			if communities != nil {
 				if c, ok := communities.NodeToComm[n.ID]; ok && c != "" {
 					focusCommunities[c] = true
@@ -385,14 +386,14 @@ func (s *Server) siblingRelation(file string, focusFiles []string) (string, floa
 		}
 	}
 	if communities != nil && len(focusCommunities) > 0 {
-		for _, n := range s.graph.GetFileNodes(file) {
+		for _, n := range reader.GetFileNodes(file) {
 			if c, ok := communities.NodeToComm[n.ID]; ok && focusCommunities[c] {
 				return "community", 100
 			}
 		}
 	}
 	if processes != nil && len(focusProcesses) > 0 {
-		for _, n := range s.graph.GetFileNodes(file) {
+		for _, n := range reader.GetFileNodes(file) {
 			for _, p := range processes.NodeToProcs[n.ID] {
 				if focusProcesses[p] {
 					return "process", 80
@@ -662,7 +663,7 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 	// post-match enrichment must precede it; path rewriting still happens only
 	// after the surviving rows are known.
 	s.enrichASTMatchesContext(ctx, collected)
-	kept := review.GroundReviewMatches(s.graph, collected)
+	kept := review.GroundReviewMatches(s.readerFor(ctx), collected)
 	for i := range kept {
 		kept[i].File = reviewRepoRelPath(kept[i].File, repoPrefix)
 	}
@@ -1160,7 +1161,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	// Per-symbol semantic classification, graph-grounded on the diff-hunk text.
-	changedSyms := s.classifyChangedSymbols(diff, impact)
+	changedSyms := s.classifyChangedSymbols(ctx, diff, impact)
 
 	verCmd := review.VerificationCommand(testTargets, reviewPackLang(diff))
 
@@ -1192,7 +1193,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 		Cost:                report.Cost,
 	}
 	if requestBoolDefault(req, "include_pack", false) {
-		env.Pack = s.buildReviewPack(diff, impact, intArg(req.GetArguments(), "max_tokens", 0))
+		env.Pack = s.buildReviewPack(ctx, diff, impact, intArg(req.GetArguments(), "max_tokens", 0))
 	}
 
 	payload := reviewPackPayload(env)
@@ -1209,14 +1210,15 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 // classifyChangedSymbols stamps a change class + impact-risk tier on every
 // changed symbol. The class is graph-grounded on the symbol's diff-hunk text;
 // the risk tier is the symbol's AnalyzeImpact tier (LOW when no impact entry).
-func (s *Server) classifyChangedSymbols(diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult) []classifiedSymbol {
+func (s *Server) classifyChangedSymbols(ctx context.Context, diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult) []classifiedSymbol {
 	if diff == nil {
 		return []classifiedSymbol{}
 	}
+	reader := s.readerFor(ctx)
 	view, _ := s.reviewChangeView(diff)
 	out := make([]classifiedSymbol, 0, len(diff.ChangedSymbols))
 	for _, cs := range diff.ChangedSymbols {
-		hunk := review.SymbolHunk(s.graph, view, cs)
+		hunk := review.SymbolHunk(reader, view, cs)
 		risk := string(analysis.RiskLow)
 		if impact != nil {
 			if ir := impact[cs.ID]; ir != nil && ir.Risk != "" {
@@ -1226,7 +1228,7 @@ func (s *Server) classifyChangedSymbols(diff *analysis.DiffResult, impact map[st
 		out = append(out, classifiedSymbol{
 			ID:    cs.ID,
 			Name:  cs.Name,
-			Class: review.ClassifyChange(s.graph, cs, hunk),
+			Class: review.ClassifyChange(reader, cs, hunk),
 			Risk:  risk,
 		})
 	}
@@ -1401,12 +1403,12 @@ func (s *Server) reviewReceipt(ids []string, diff *analysis.DiffResult, ci *cont
 
 // buildReviewPack renders the FG9 tiered review pack for the envelope: changed
 // symbols as diff hunks, direct callers as full source, the rest as an outline.
-func (s *Server) buildReviewPack(diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult, budget int) *review.ReviewPack {
+func (s *Server) buildReviewPack(ctx context.Context, diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult, budget int) *review.ReviewPack {
 	if diff == nil {
 		return nil
 	}
 	view, _ := s.reviewChangeView(diff)
-	return review.BuildReviewPack(s.graph, view, diff, review.MergeImpact(impact), budget)
+	return review.BuildReviewPack(s.readerFor(ctx), view, diff, review.MergeImpact(impact), budget)
 }
 
 // reviewFindingsToComments projects the report's findings onto the line-anchored

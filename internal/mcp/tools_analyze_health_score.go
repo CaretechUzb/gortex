@@ -193,14 +193,15 @@ func (s *Server) handleAnalyzeHealthScore(ctx context.Context, req mcp.CallToolR
 		}
 		candidateIDs = append(candidateIDs, n.ID)
 	}
-	fanIn, fanOut := analysis.CollectFanCounts(s.graph, candidateIDs,
+	reader := s.readerFor(ctx)
+	fanIn, fanOut := analysis.CollectFanCounts(reader, candidateIDs,
 		[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
 		[]graph.EdgeKind{graph.EdgeCalls},
 	)
 
 	crossings := map[string]int{}
 	for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
-		for e := range s.graph.EdgesByKind(kind) {
+		for e := range reader.EdgesByKind(kind) {
 			if e == nil {
 				continue
 			}
@@ -219,8 +220,8 @@ func (s *Server) handleAnalyzeHealthScore(ctx context.Context, req mcp.CallToolR
 
 	now := time.Now()
 
-	covRows := s.coverageByID()
-	blame := blameRowsByID(s.graph)
+	covRows := coverageRowsByID(reader)
+	blame := blameRowsByID(reader)
 	rows := make([]healthScoreRow, 0, 128)
 	for _, n := range scoped {
 		if n == nil {

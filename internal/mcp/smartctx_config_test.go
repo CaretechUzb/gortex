@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -280,7 +281,7 @@ func TestSmartContextAssembly(t *testing.T) {
 	s := &Server{graph: g}
 	pack := []*graph.Node{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 
-	rec := s.recoverPackEdges(pack)
+	rec := s.recoverPackEdges(context.Background(), pack)
 	if len(rec) != 2 {
 		t.Fatalf("expected 2 recovered edges (a→b, b→c), got %d: %+v", len(rec), rec)
 	}
@@ -313,7 +314,7 @@ func TestSmartContextSiblings(t *testing.T) {
 	s := &Server{graph: g}
 	pack := []*graph.Node{{ID: "InternalEngine", Kind: graph.KindType}}
 
-	sibs := s.packHierarchySiblings(pack)
+	sibs := s.packHierarchySiblings(context.Background(), pack)
 	if len(sibs) != 1 || sibs[0]["id"] != "ReadOnlyEngine" || sibs[0]["parent"] != "Engine" {
 		t.Fatalf("expected ReadOnlyEngine sibling via Engine, got %+v", sibs)
 	}

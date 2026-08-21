@@ -1039,8 +1039,8 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 					}), nil
 				}
 				var node *graph.Node
-				if s.graph != nil {
-					node = s.graph.GetNode(canonical)
+				if reader := s.readerFor(ctx); reader != nil {
+					node = reader.GetNode(canonical)
 				}
 				if node == nil || node.FilePath == "" || !s.nodeInSessionScope(ctx, node) {
 					outcome = facadeOutcomeInvalidArgument
@@ -1138,7 +1138,8 @@ func decorateFacadeResultIdentity(result *mcpgo.CallToolResult, spec facadeOpera
 
 func (s *Server) resolveFacadeSymbolShorthand(ctx context.Context, id string) (string, []string) {
 	resolved := s.resolveSymbolID(ctx, id)
-	if s.graph == nil || s.graph.GetNode(resolved) != nil || strings.Contains(id, "::") {
+	reader := s.readerFor(ctx)
+	if reader == nil || reader.GetNode(resolved) != nil || strings.Contains(id, "::") {
 		return resolved, nil
 	}
 	eng := s.engineFor(ctx)
