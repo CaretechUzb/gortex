@@ -142,10 +142,12 @@ type QueryOptions struct {
 	// soft breadth control inside any workspace boundary, not a
 	// replacement for caller-side workspace isolation.
 	RepoAllow map[string]bool `json:"repo_allow,omitempty"`
-	// ExcludeTests, when true, drops edges originating from a function
-	// flagged as a test (Node.Meta["is_test"] = true) — set by the
-	// indexer's test-edge pass. Lets find_usages / get_callers answer
-	// "who depends on X *in production*" without test-noise dilution.
+	// ExcludeTests, when true, drops edges originating in test code —
+	// nodes flagged by the indexer's test-edge pass (Node.Meta["is_test"]
+	// = true) plus unflagged node kinds whose file path matches the
+	// canonical test predicate (see isTestSource). Lets find_usages /
+	// get_callers answer "who depends on X *in production*" without
+	// test-noise dilution.
 	ExcludeTests bool `json:"exclude_tests,omitempty"`
 
 	// IncludeDispatch makes a forward call-graph walk (get_call_chain /

@@ -12,6 +12,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/search/rerank"
+	"github.com/zzet/gortex/internal/testpath"
 )
 
 // SearchProvider is a function that returns the current search backend.
@@ -1801,15 +1802,24 @@ func isCodeSymbolKind(n *graph.Node) bool {
 	return n != nil && (n.Kind == graph.KindFunction || n.Kind == graph.KindMethod)
 }
 
-// isTestSource reports whether a node was flagged as a test by the
-// indexer's test-edge pass. Used by QueryOptions.ExcludeTests to drop
-// callers/users that originate in tests, leaving production callers.
+// isTestSource reports whether a node originates in test code. Used by
+// QueryOptions.ExcludeTests to drop callers/users that originate in
+// tests, leaving production callers.
+//
+// The indexer's test-edge pass stamps Meta["is_test"] on function and
+// method symbols only — a file-level from-node under a test directory
+// carries is_test_file instead, and parameter nodes carry no flag at
+// all. Trusting the stamp alone leaks exactly those kinds into a
+// production-only answer, so unflagged nodes fall back to the canonical
+// path predicate — the same signal the stamp is derived from.
 func isTestSource(n *graph.Node) bool {
-	if n == nil || n.Meta == nil {
+	if n == nil {
 		return false
 	}
-	v, _ := n.Meta["is_test"].(bool)
-	return v
+	if v, _ := n.Meta["is_test"].(bool); v {
+		return true
+	}
+	return testpath.IsTestFile(n.FilePath)
 }
 
 func dedup(edges []*graph.Edge) []*graph.Edge {
