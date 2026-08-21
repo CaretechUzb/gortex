@@ -220,6 +220,9 @@ type sqliteTxBeginner interface {
 }
 
 func (s *Store) beginWriteContext(ctx context.Context) (*sql.Tx, error) {
+	if err := s.refuseSealedPayloadWrite(); err != nil {
+		return nil, err
+	}
 	if s.bulkConn != nil {
 		return s.beginWriteOnConnContext(ctx, s.bulkConn)
 	}
@@ -244,6 +247,9 @@ func (s *Store) beginWriteOnContext(ctx context.Context, beginner sqliteTxBeginn
 // writes on the pinned bulk connection when one is active. Callers hold
 // writeMu, which guards bulkConn for the full operation.
 func (s *Store) execActiveWriteLocked(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if err := s.refuseSealedPayloadWrite(); err != nil {
+		return nil, err
+	}
 	if s.bulkConn != nil {
 		return s.bulkConn.ExecContext(ctx, query, args...)
 	}

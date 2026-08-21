@@ -71,6 +71,12 @@ type storeCore struct {
 	// re-indexes don't re-upsert identical stubs on every batch.
 	builtinSeen sync.Map
 
+	// payloadSeals maps a derived payload generation to the write-admission
+	// flag every handle over that generation shares, so publishing one
+	// generation refuses the next write through every handle that holds it.
+	// Keyed by int64 generation; values are *payloadSeal.
+	payloadSeals sync.Map
+
 	// Structural integrity is owned by this logical store. Shadows forward
 	// rejected attempts into the same recorder; warnings are rate-limited per
 	// Store so independent workspaces never suppress each other's diagnostics.
@@ -239,6 +245,11 @@ type Store struct {
 	// viewGen is the payload view generation this handle reads and writes.
 	// Generation 0 is the base corpus every store starts with.
 	viewGen int64
+
+	// seal is the write-admission flag for viewGen, shared with every other
+	// handle over the same generation. It is nil on the base handle, which is
+	// never published and therefore never sealed.
+	seal *payloadSeal
 
 	// ownsCore marks the single handle Open returned. It gates teardown:
 	// pools, prepared statements and the checkpoint loop belong to the core,

@@ -928,7 +928,8 @@ func createGraphCoreIndexes(db schemaColumnDB) error {
 // ordering vectors_by_repo has needed since v10. The nodes / edges indexes are
 // created afterwards too (createGraphCoreIndexes), because the v16 step rebuilds
 // both tables and a dropped table takes its indexes with it.
-var schemaSQL = graphSchemaSQL + sidecarSchemaSQL + analysisGenerationSchemaSQL + checkoutCatalogSchemaSQL
+var schemaSQL = graphSchemaSQL + sidecarSchemaSQL + generationMaskSchemaSQL +
+	analysisGenerationSchemaSQL + checkoutCatalogSchemaSQL
 
 // graphSchemaSQL is the node/edge core plus the two FTS5 virtual tables — the
 // part of the schema that is not a generation-keyed payload sidecar.
@@ -1486,4 +1487,107 @@ func createSidecarIndexes(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// The sparse ownership masks.
+//
+// A payload row says what a generation CARRIES. Nothing in the payload can say
+// what a generation OWNS: a generation holding no node for a file is
+// indistinguishable from one that deleted the file, and a generation holding
+// no edge out of a symbol is indistinguishable from one that emptied its edge
+// set. The mask tables are that missing statement, written explicitly and only
+// for the rows a generation actually claims — sparse, so an unmentioned path is
+// simply inherited from the layer below.
+//
+// Every mask is addressed by (view_gen, <key>) and read one whole generation at
+// a time, so the generation LEADS every primary key here and no entry needs a
+// secondary index: the enumerating read seeks the key's leading column and the
+// point read matches the whole key. Unlike the v15 sidecars, view_gen carries
+// no DEFAULT: a mask at the base generation is meaningless (the base corpus
+// owns everything it carries and nothing else), so a row that failed to name
+// its generation must be a constraint failure rather than a silent base-
+// generation claim. The write path refuses the base generation for the same
+// reason — see ErrMasksAtBaseGeneration.
+//
+// The vocabulary columns (ownership_mode, state) are plain TEXT validated in
+// Go, matching the checkout catalog: extending a vocabulary is then a code
+// change, not a migration of every installed database.
+
+// generationMaskTable is one ownership-mask table. body is everything after
+// the table name, so the fresh-store DDL and the v18 migration build the same
+// shape from one string — the arrangement viewGenSidecars uses.
+type generationMaskTable struct {
+	table string
+	body  string
+}
+
+// generation_file_masks names the files a generation owns. 'replace' means the
+// generation's payload for the path supersedes the layer below it, including
+// when that payload is empty; 'delete' means the path is gone and nothing below
+// may show through.
+const generationFileMasksTableBody = ` (
+    view_gen       INTEGER NOT NULL,
+    repo_prefix    TEXT NOT NULL,
+    file_path      TEXT NOT NULL,
+    ownership_mode TEXT NOT NULL,
+    PRIMARY KEY (view_gen, repo_prefix, file_path)
+) WITHOUT ROWID`
+
+// generation_node_tombstones removes one node identity without claiming its
+// whole file. A file-level mask is the coarse instrument; a node that moved
+// away, or that a narrower producer withdrew, needs the fine one.
+const generationNodeTombstonesTableBody = ` (
+    view_gen INTEGER NOT NULL,
+    node_id  TEXT NOT NULL,
+    PRIMARY KEY (view_gen, node_id)
+) WITHOUT ROWID`
+
+// generation_edge_sources marks a source node whose outgoing edge set this
+// generation replaces wholesale while its FILE is not covered by a file mask —
+// the case a file mask cannot express, because the edges of one symbol may be
+// re-derived (a resolver pass, an enrichment lane) without the file itself
+// being re-extracted. Only 'replace' is meaningful today: withdrawing a
+// source's edges without replacing them is what an empty replacement already
+// says.
+const generationEdgeSourcesTableBody = ` (
+    view_gen       INTEGER NOT NULL,
+    source_id      TEXT NOT NULL,
+    ownership_mode TEXT NOT NULL,
+    PRIMARY KEY (view_gen, source_id)
+) WITHOUT ROWID`
+
+// generation_producer_completeness records, per producer, whether the payload
+// this generation carries from it is whole. A consumer reading a generation
+// whose resolver lane is 'incomplete' can say so instead of reporting an
+// absence as a fact; reason carries the human-readable why.
+const generationProducerCompletenessTableBody = ` (
+    view_gen INTEGER NOT NULL,
+    producer TEXT NOT NULL,
+    state    TEXT NOT NULL,
+    reason   TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (view_gen, producer)
+) WITHOUT ROWID`
+
+var generationMaskTables = []generationMaskTable{
+	{table: "generation_file_masks", body: generationFileMasksTableBody},
+	{table: "generation_node_tombstones", body: generationNodeTombstonesTableBody},
+	{table: "generation_edge_sources", body: generationEdgeSourcesTableBody},
+	{table: "generation_producer_completeness", body: generationProducerCompletenessTableBody},
+}
+
+// generationMaskSchemaSQL is the fresh-store CREATE TABLE DDL for every entry
+// in generationMaskTables, in registry order. The v18 migration executes the
+// same string, so a migrated store and a fresh one cannot drift.
+var generationMaskSchemaSQL = buildGenerationMaskSchemaSQL()
+
+func buildGenerationMaskSchemaSQL() string {
+	var b strings.Builder
+	b.WriteByte('\n')
+	for _, mask := range generationMaskTables {
+		b.WriteString("CREATE TABLE IF NOT EXISTS ")
+		b.WriteString(mask.table)
+		b.WriteString(mask.body)
+		b.WriteString(";\n")
+	}
+	return b.String()
 }

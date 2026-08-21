@@ -33,7 +33,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 17
+const currentSchemaVersion = 18
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -86,6 +86,19 @@ var schemaMigrations = []schemaMigration{
 	{version: 15, name: "key payload sidecars by view generation", inPlace: addSidecarViewGenerationKeys},
 	{version: 16, name: "key nodes and edges by view generation", inPlace: keyGraphCoreByViewGeneration},
 	{version: 17, name: "add sparse view-generation enumeration indexes", inPlace: addGenerationEnumerationIndexes},
+	{version: 18, name: "add sparse generation ownership masks", inPlace: createGenerationMaskTables},
+}
+
+// createGenerationMaskTables is the explicit v18 migration. The mask tables are
+// purely additive — they sit beside the payload tables and re-key nothing — so
+// an older store gains them without a reindex, and an existing generation
+// simply has no masks until something writes them. schemaSQL owns the canonical
+// fresh-store definition and runs first; this step repeats the same idempotent
+// DDL so the addition is part of the versioned contract rather than an
+// unversioned side effect of Open.
+func createGenerationMaskTables(tx *sql.Tx) error {
+	_, err := tx.Exec(generationMaskSchemaSQL)
+	return err
 }
 
 // addGenerationEnumerationIndexes is the explicit migration step for the two

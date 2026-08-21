@@ -171,6 +171,20 @@ const (
 
 var routeStates = []RouteState{RoutePending, RouteActive, RouteRetired}
 
+// RouteSlot names one of the two generation pointers a checkout's route
+// carries: the generation built from the checkout's commit, and the one built
+// from its uncommitted working tree.
+type RouteSlot string
+
+const (
+	// RouteSlotCommit is the commit_generation_id pointer.
+	RouteSlotCommit RouteSlot = "commit"
+	// RouteSlotDirty is the dirty_generation_id pointer.
+	RouteSlotDirty RouteSlot = "dirty"
+)
+
+var routeSlots = []RouteSlot{RouteSlotCommit, RouteSlotDirty}
+
 // CleanupPhase is how far a journal entry has progressed.
 type CleanupPhase string
 
@@ -503,6 +517,18 @@ type FlipCheckoutRouteRequest struct {
 	GraphID            string
 	CommitGenerationID int64
 	DirtyGenerationID  int64
+	State              RouteState
+}
+
+// FlipCheckoutRouteSlotRequest repoints one slot of a checkout's route.
+// ExpectedRouteEpoch is the compare-and-set token; a successful flip stores
+// epoch+1. A GenerationID of 0 clears the slot. The other slot is not named by
+// the statement and keeps whatever it held.
+type FlipCheckoutRouteSlotRequest struct {
+	CheckoutID         string
+	Slot               RouteSlot
+	GenerationID       int64
+	ExpectedRouteEpoch int64
 	State              RouteState
 }
 

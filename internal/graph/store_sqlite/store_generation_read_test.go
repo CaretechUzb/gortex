@@ -2,6 +2,7 @@ package store_sqlite
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -1535,6 +1536,116 @@ func TestGenerationFTSIsolation(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestGenerationMaskIsolation extends the fence to the ownership masks. They
+// are not payload, so the probe table above cannot carry them: the base
+// generation is not merely empty of masks, it REFUSES to hold any, and the
+// symmetric half of the fence therefore runs between two derived generations.
+func TestGenerationMaskIsolation(t *testing.T) {
+	base, one := openGenerationReadPair(t)
+	two := base.AtGeneration(2)
+	if two == nil {
+		t.Fatal("AtGeneration(2) returned nil")
+	}
+
+	// Each derived generation claims one shared path plus a set of rows marked
+	// with its own name, so a read that dropped its generation predicate
+	// surfaces the other generation's mark.
+	masked := []struct {
+		store *Store
+		mark  string
+		other string
+	}{
+		{one, "MaskGenOne", "MaskGenTwo"},
+		{two, "MaskGenTwo", "MaskGenOne"},
+	}
+	for _, tc := range masked {
+		if err := tc.store.SetFileMasks([]FileMask{
+			{RepoPrefix: genReadRepo, FilePath: genReadFileA, Mode: OwnershipReplace},
+			{RepoPrefix: genReadRepo, FilePath: "repo::pkg/" + tc.mark + ".go", Mode: OwnershipDelete},
+		}); err != nil {
+			t.Fatalf("SetFileMasks at generation %d: %v", tc.store.ViewGeneration(), err)
+		}
+		if err := tc.store.SetNodeTombstones([]string{"repo::pkg/a.go::" + tc.mark}); err != nil {
+			t.Fatalf("SetNodeTombstones at generation %d: %v", tc.store.ViewGeneration(), err)
+		}
+		if err := tc.store.SetEdgeSourceMasks([]EdgeSourceMask{
+			{SourceID: "repo::pkg/a.go::Source" + tc.mark, Mode: OwnershipReplace},
+		}); err != nil {
+			t.Fatalf("SetEdgeSourceMasks at generation %d: %v", tc.store.ViewGeneration(), err)
+		}
+		if err := tc.store.SetProducerState(ProducerCompleteness{
+			Producer: "resolver", State: ProducerStateIncomplete, Reason: "stopped at " + tc.mark,
+		}); err != nil {
+			t.Fatalf("SetProducerState at generation %d: %v", tc.store.ViewGeneration(), err)
+		}
+	}
+
+	// Neither derived generation may see the other's claims, in either
+	// direction — enumerated or point-read.
+	for _, tc := range masked {
+		rendered := renderMaskState(t, tc.store)
+		if strings.Contains(rendered, tc.other) {
+			t.Fatalf("generation %d leaked %s masks:\n%s", tc.store.ViewGeneration(), tc.other, rendered)
+		}
+		if !strings.Contains(rendered, tc.mark) {
+			t.Fatalf("generation %d cannot read its own masks:\n%s", tc.store.ViewGeneration(), rendered)
+		}
+		mode, ok, err := tc.store.FileMaskFor(genReadRepo, "repo::pkg/"+tc.other+".go")
+		if err != nil || ok {
+			t.Fatalf("generation %d point-read the other generation's mask: %q, %v, %v",
+				tc.store.ViewGeneration(), mode, ok, err)
+		}
+	}
+
+	// The base generation sees none of it and cannot write any of its own.
+	if rendered := renderMaskState(t, base); rendered != "" {
+		t.Fatalf("base handle sees derived masks:\n%s", rendered)
+	}
+	if err := base.SetFileMasks([]FileMask{
+		{RepoPrefix: genReadRepo, FilePath: genReadFileA, Mode: OwnershipReplace},
+	}); !errors.Is(err, ErrMasksAtBaseGeneration) {
+		t.Fatalf("base handle mask write = %v, want ErrMasksAtBaseGeneration", err)
+	}
+}
+
+// renderMaskState renders every mask a handle can read to sorted text, so one
+// substring test covers a leaked row, a leaked key and a leaked payload column
+// alike — the same shape the probe renderer above uses.
+func renderMaskState(t *testing.T, s *Store) string {
+	t.Helper()
+	var tokens []string
+	masks, err := s.FileMasks()
+	if err != nil {
+		t.Fatalf("FileMasks: %v", err)
+	}
+	for _, mask := range masks {
+		tokens = append(tokens, fmt.Sprintf("file %s|%s|%s", mask.RepoPrefix, mask.FilePath, mask.Mode))
+	}
+	tombstones, err := s.NodeTombstones()
+	if err != nil {
+		t.Fatalf("NodeTombstones: %v", err)
+	}
+	for _, id := range tombstones {
+		tokens = append(tokens, "tombstone "+id)
+	}
+	sources, err := s.EdgeSourceMasks()
+	if err != nil {
+		t.Fatalf("EdgeSourceMasks: %v", err)
+	}
+	for _, source := range sources {
+		tokens = append(tokens, fmt.Sprintf("source %s|%s", source.SourceID, source.Mode))
+	}
+	states, err := s.ProducerStates()
+	if err != nil {
+		t.Fatalf("ProducerStates: %v", err)
+	}
+	for _, state := range states {
+		tokens = append(tokens, fmt.Sprintf("producer %s|%s|%s", state.Producer, state.State, state.Reason))
+	}
+	sort.Strings(tokens)
+	return strings.Join(tokens, "\n")
 }
 
 // --- capability checklist -------------------------------------------------

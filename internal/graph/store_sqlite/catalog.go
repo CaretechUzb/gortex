@@ -3,7 +3,9 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 )
 
 // Catalog is the accessor for the checkout-lifecycle control plane — the
@@ -22,8 +24,11 @@ type Catalog struct {
 	store *Store
 }
 
-// Catalog returns the control-plane accessor for this store.
-func (s *Store) Catalog() *Catalog { return &Catalog{store: s} }
+// Catalog returns the control-plane accessor for this store. It is pinned to
+// the base handle: none of it is payload, so a catalog write must go through
+// even when the caller holds a handle on a generation that no longer accepts
+// payload writes.
+func (s *Store) Catalog() *Catalog { return &Catalog{store: s.atBase()} }
 
 // exec runs one control-plane statement under the mutation gate.
 func (c *Catalog) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
@@ -789,16 +794,14 @@ const viewGenerationColumns = `owner_kind, graph_id, layer_id, checkout_id, gene
 	extractor_versions, resolver_version, state, covered_files, affected_files, storage_bytes,
 	completeness, created_at, published_at, last_selected, error`
 
-// CreateViewGeneration inserts a generation and returns its assigned id. The
-// row is written exactly once; afterwards only PublishViewGeneration may
-// change it, and only out of the building state.
-func (c *Catalog) CreateViewGeneration(ctx context.Context, generation ViewGeneration) (int64, error) {
-	if err := generation.validate(); err != nil {
-		return 0, err
-	}
-	result, err := c.exec(ctx, `
-INSERT INTO view_generations (`+viewGenerationColumns+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+const insertViewGenerationSQL = `
+INSERT INTO view_generations (` + viewGenerationColumns + `)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+// viewGenerationInsertArgs binds one generation row in viewGenerationColumns
+// order, so the plain insert and the coalescing one cannot drift.
+func viewGenerationInsertArgs(generation ViewGeneration) []any {
+	return []any{
 		generation.OwnerKind, generation.GraphID,
 		catalogNullString(generation.LayerID), catalogNullString(generation.CheckoutID),
 		generation.GenerationKind, catalogNullInt(generation.BaseGenerationID),
@@ -807,7 +810,18 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		generation.ExtractorVersions, generation.ResolverVersion, string(generation.State),
 		generation.CoveredFiles, generation.AffectedFiles, generation.StorageBytes,
 		generation.Completeness, generation.CreatedAt, generation.PublishedAt,
-		generation.LastSelected, generation.Error)
+		generation.LastSelected, generation.Error,
+	}
+}
+
+// CreateViewGeneration inserts a generation and returns its assigned id. The
+// row is written exactly once; afterwards only PublishViewGeneration may
+// change it, and only out of the building state.
+func (c *Catalog) CreateViewGeneration(ctx context.Context, generation ViewGeneration) (int64, error) {
+	if err := generation.validate(); err != nil {
+		return 0, err
+	}
+	result, err := c.exec(ctx, insertViewGenerationSQL, viewGenerationInsertArgs(generation)...)
 	if err != nil {
 		return 0, err
 	}
@@ -861,6 +875,136 @@ UPDATE view_generations SET state = ?, published_at = ?
 		string(ViewGenerationReady), publishedAt, generationID, string(ViewGenerationBuilding))
 }
 
+// buildingViewGenerationMatchSQL finds the in-flight generation a repeat build
+// request may adopt. Every column of the build identity is compared, so two
+// requests coalesce only when they would produce the same payload. The
+// nullable columns are folded to their zero value first: SQLite compares NULL
+// to anything as NULL, which would make an unset layer match nothing including
+// itself.
+const buildingViewGenerationMatchSQL = `
+SELECT generation_id FROM view_generations
+ WHERE state = ? AND graph_id = ? AND owner_kind = ? AND generation_kind = ?
+   AND IFNULL(layer_id, '') = ? AND IFNULL(checkout_id, '') = ?
+   AND IFNULL(base_generation_id, 0) = ?
+   AND lower_view_fingerprint = ? AND tree_oid = ?
+   AND IFNULL(provenance_commit_oid, '') = ? AND config_hash = ?
+   AND extractor_versions = ? AND resolver_version = ?
+ ORDER BY generation_id LIMIT 1`
+
+// AdoptOrCreateViewGeneration returns the id of the building generation this
+// request may share, creating one when none matches. The bool reports adoption.
+//
+// Coalescing follows ref_view_builds_single_inflight: two requests for the same
+// inputs share one in-flight build instead of racing to produce the same
+// generation twice. A generation with no layer is deliberately outside the rule
+// — the same exclusion that index makes for a build with no base generation —
+// so an unnamed build always gets its own generation.
+//
+// The lookup and the insert run in one transaction under the mutation gate,
+// which is what makes the check-then-insert atomic against a concurrent begin.
+func (c *Catalog) AdoptOrCreateViewGeneration(ctx context.Context, generation ViewGeneration) (int64, bool, error) {
+	if err := generation.validate(); err != nil {
+		return 0, false, err
+	}
+	if generation.State != ViewGenerationBuilding {
+		return 0, false, fmt.Errorf("%w: state %q, want %q",
+			ErrCatalogInvalidValue, generation.State, ViewGenerationBuilding)
+	}
+	var (
+		generationID int64
+		adopted      bool
+	)
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		if generation.LayerID != "" {
+			err := tx.QueryRowContext(ctx, buildingViewGenerationMatchSQL,
+				string(ViewGenerationBuilding), generation.GraphID, generation.OwnerKind,
+				generation.GenerationKind, generation.LayerID, generation.CheckoutID,
+				generation.BaseGenerationID, generation.LowerViewFingerprint,
+				generation.TreeOID, generation.ProvenanceCommitOID, generation.ConfigHash,
+				generation.ExtractorVersions, generation.ResolverVersion).Scan(&generationID)
+			if err == nil {
+				adopted = true
+				return nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+		result, err := tx.ExecContext(ctx, insertViewGenerationSQL, viewGenerationInsertArgs(generation)...)
+		if err != nil {
+			return err
+		}
+		generationID, err = result.LastInsertId()
+		return err
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	return generationID, adopted, nil
+}
+
+// SetViewGenerationState moves a generation to another lifecycle state. The
+// expected states are the compare-and-set guard; passing none accepts whatever
+// the row currently holds, which is what retirement needs — a crashed build and
+// a superseded publish are both collectable.
+func (c *Catalog) SetViewGenerationState(ctx context.Context, generationID int64, next ViewGenerationState, expected ...ViewGenerationState) error {
+	if generationID <= 0 {
+		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
+	}
+	if err := requireCatalogValue("state", next, viewGenerationStates); err != nil {
+		return err
+	}
+	query := `UPDATE view_generations SET state = ? WHERE generation_id = ?`
+	args := []any{string(next), generationID}
+	if len(expected) > 0 {
+		placeholders := make([]string, len(expected))
+		for i, state := range expected {
+			if err := requireCatalogValue("expected_state", state, viewGenerationStates); err != nil {
+				return err
+			}
+			placeholders[i] = "?"
+			args = append(args, string(state))
+		}
+		query += ` AND state IN (` + strings.Join(placeholders, ", ") + `)`
+	}
+	return c.execGuarded(ctx, fmt.Sprintf("view generation %d cannot become %s", generationID, next), query, args...)
+}
+
+// UpdateViewGenerationRollup records the payload measurements taken just
+// before a publish. It is guarded on the building state for the same reason
+// PublishViewGeneration is: a published generation's row is immutable.
+func (c *Catalog) UpdateViewGenerationRollup(ctx context.Context, generationID, coveredFiles, affectedFiles, storageBytes int64) error {
+	if generationID <= 0 {
+		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
+	}
+	return c.execGuarded(ctx, fmt.Sprintf("view generation %d is not building", generationID), `
+UPDATE view_generations SET covered_files = ?, affected_files = ?, storage_bytes = ?
+ WHERE generation_id = ? AND state = ?`,
+		coveredFiles, affectedFiles, storageBytes, generationID, string(ViewGenerationBuilding))
+}
+
+// ViewGenerationReferenced reports whether anything still points at a
+// generation. It asks exactly what DeleteViewGeneration's guard asks, so a
+// caller about to delete a generation's payload can refuse before it starts
+// instead of after.
+func (c *Catalog) ViewGenerationReferenced(ctx context.Context, generationID int64) (bool, error) {
+	if generationID <= 0 {
+		return false, fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
+	}
+	var referenced bool
+	err := c.store.db.QueryRowContext(ctx, viewGenerationReferencedSQL,
+		generationID, generationID, generationID, generationID, generationID).Scan(&referenced)
+	return referenced, err
+}
+
+// viewGenerationReferencedSQL is the reference guard shared by
+// ViewGenerationReferenced and DeleteViewGeneration.
+const viewGenerationReferencedSQL = `
+SELECT EXISTS(SELECT 1 FROM checkout_routes WHERE commit_generation_id = ? OR dirty_generation_id = ?)
+    OR EXISTS(SELECT 1 FROM ref_views WHERE active_generation_id = ?)
+    OR EXISTS(SELECT 1 FROM view_generations WHERE base_generation_id = ?)
+    OR EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?)`
+
 // DeleteViewGeneration removes a generation nothing points at. SQLite's own
 // foreign keys already refuse a delete under a route, a ref view, or another
 // generation's base pointer (a non-deferred NO ACTION constraint is enforced
@@ -873,11 +1017,7 @@ func (c *Catalog) DeleteViewGeneration(ctx context.Context, generationID int64) 
 	}
 	return c.withTx(ctx, func(tx *sql.Tx) error {
 		var referenced bool
-		if err := tx.QueryRowContext(ctx, `
-SELECT EXISTS(SELECT 1 FROM checkout_routes WHERE commit_generation_id = ? OR dirty_generation_id = ?)
-    OR EXISTS(SELECT 1 FROM ref_views WHERE active_generation_id = ?)
-    OR EXISTS(SELECT 1 FROM view_generations WHERE base_generation_id = ?)
-    OR EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?)`,
+		if err := tx.QueryRowContext(ctx, viewGenerationReferencedSQL,
 			generationID, generationID, generationID, generationID, generationID,
 		).Scan(&referenced); err != nil {
 			return err
@@ -1022,6 +1162,41 @@ UPDATE checkout_routes
  WHERE checkout_id = ? AND route_epoch = ?`,
 		req.GraphID, catalogNullInt(req.CommitGenerationID), catalogNullInt(req.DirtyGenerationID),
 		string(req.State), req.CheckoutID, req.ExpectedRouteEpoch)
+}
+
+// flipRouteSlotSQL is one guarded statement per slot. Naming a single column
+// leaves the other slot's pointer exactly as it was without reading it first,
+// so a flip of the dirty generation can never revert a commit generation a
+// concurrent flip installed.
+var flipRouteSlotSQL = map[RouteSlot]string{
+	RouteSlotCommit: `
+UPDATE checkout_routes
+   SET commit_generation_id = ?, route_epoch = route_epoch + 1, state = ?
+ WHERE checkout_id = ? AND route_epoch = ?`,
+	RouteSlotDirty: `
+UPDATE checkout_routes
+   SET dirty_generation_id = ?, route_epoch = route_epoch + 1, state = ?
+ WHERE checkout_id = ? AND route_epoch = ?`,
+}
+
+// FlipCheckoutRouteSlot repoints one of a route's two generation pointers and
+// bumps its epoch, leaving the other pointer untouched. A generation id of 0
+// clears the slot. Like FlipCheckoutRoute, a stale epoch changes nothing and
+// reports ErrCatalogStaleGuard.
+func (c *Catalog) FlipCheckoutRouteSlot(ctx context.Context, req FlipCheckoutRouteSlotRequest) error {
+	if err := requireCatalogID("checkout_id", req.CheckoutID); err != nil {
+		return err
+	}
+	if err := requireCatalogValue("slot", req.Slot, routeSlots); err != nil {
+		return err
+	}
+	if err := requireCatalogValue("state", req.State, routeStates); err != nil {
+		return err
+	}
+	return c.execGuarded(ctx,
+		fmt.Sprintf("%s slot of route for checkout %s at epoch %d", req.Slot, req.CheckoutID, req.ExpectedRouteEpoch),
+		flipRouteSlotSQL[req.Slot],
+		catalogNullInt(req.GenerationID), string(req.State), req.CheckoutID, req.ExpectedRouteEpoch)
 }
 
 // --- ref views ----------------------------------------------------------

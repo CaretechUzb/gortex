@@ -19,7 +19,19 @@ func (s *Store) AtGeneration(g int64) *Store {
 	if g < baseViewGeneration {
 		return nil
 	}
-	return &Store{storeCore: s.storeCore, viewGen: g}
+	if g == baseViewGeneration {
+		return s.atBase()
+	}
+	return &Store{storeCore: s.storeCore, viewGen: g, seal: s.payloadSealFor(g)}
+}
+
+// atBase returns a handle over the same core pinned to the base corpus. The
+// control plane uses it: nothing in the catalog is payload, so a catalog write
+// must not be refused because the caller happened to hold a published
+// generation's handle. It always allocates rather than returning the receiver,
+// so the derived handle can never inherit the owning handle's teardown duty.
+func (s *Store) atBase() *Store {
+	return &Store{storeCore: s.storeCore}
 }
 
 // ViewGeneration reports the payload view generation this handle is pinned to.
