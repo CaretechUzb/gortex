@@ -1115,7 +1115,7 @@ func (s *Server) registerCoreTools() {
 		mcp.NewTool("find_usages",
 			mcp.WithDescription("Use instead of Grep to find every reference to a symbol across the codebase. Returns precise locations with zero false positives. For just the call sites of a function use get_callers; for the concrete types that implement an interface use find_implementations."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Node ID")),
-			mcp.WithNumber("limit", mcp.Description("Max nodes (default: 50)")),
+			mcp.WithNumber("limit", mcp.Description("Max usage rows returned (default: 50; 0 = no cap). A capped response is marked truncated and total_edges keeps the full count.")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
@@ -2742,6 +2742,10 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// find_implementations (once per session). Additive — the only response
 	// content the diet adds.
 	s.attachRelatedToolsCue(ctx, sg, id)
+	// Row cap last, after every filter and after the completeness rollup —
+	// the summary stays a statement about the whole usage set while the
+	// page below it is bounded. limit:0 opts out, mirroring max_bytes.
+	truncateUsageRows(sg, req.GetInt("limit", 50), id)
 	// group_by:"file" buckets the usages by the file each reference
 	// originates in -- an opt-in shape for callers that want a
 	// per-file rollup. The flat SubGraph stays the default so
@@ -2749,7 +2753,9 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	if gb := strings.ToLower(strings.TrimSpace(req.GetString("group_by", ""))); gb == "file" {
 		return s.respondScopedJSONOrTOON(ctx, req, groupUsagesByFile(sg), resolved)
 	}
-	if s.isGCX(ctx, req) {
+	// compact is an explicit caller choice, so it beats the session's
+	// gcx default — the same precedence returnSubGraph applies.
+	if s.isGCX(ctx, req) && !isCompact(req) {
 		res, err := s.gcxResponseWithBudget(req)(encodeFindUsages(sg, s.graph))
 		return withScopeResult(res, err, resolved)
 	}
@@ -3054,6 +3060,34 @@ func groupUsagesByFile(sg *query.SubGraph) map[string]any {
 		"groups":     out,
 		"truncated":  sg.Truncated,
 	}
+}
+
+// truncateUsageRows enforces find_usages' advertised `limit` on the
+// usage rows (edges). Totals keep the full post-filter counts and
+// Truncated marks the cut, so a capped page is legible as partial
+// rather than complete. Nodes no longer referenced by a surviving edge
+// are pruned; the queried target always stays. A non-positive limit
+// opts out of the cap.
+func truncateUsageRows(sg *query.SubGraph, limit int, targetID string) {
+	if sg == nil || limit <= 0 || len(sg.Edges) <= limit {
+		return
+	}
+	sg.TotalEdges = len(sg.Edges)
+	sg.TotalNodes = len(sg.Nodes)
+	sg.Edges = sg.Edges[:limit]
+	referenced := map[string]struct{}{targetID: {}}
+	for _, e := range sg.Edges {
+		referenced[e.From] = struct{}{}
+		referenced[e.To] = struct{}{}
+	}
+	nodes := make([]*graph.Node, 0, len(referenced))
+	for _, n := range sg.Nodes {
+		if _, ok := referenced[n.ID]; ok {
+			nodes = append(nodes, n)
+		}
+	}
+	sg.Nodes = nodes
+	sg.Truncated = true
 }
 
 // usageSummaryOf computes the compact completeness rollup attached to a

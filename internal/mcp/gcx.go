@@ -457,6 +457,14 @@ func tierFilteredCaveatMeta(c *graph.TierFilteredCaveat) []string {
 func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
 	var buf bytes.Buffer
 	meta := []string{"edges", fmt.Sprintf("%d", len(sg.Edges))}
+	// Truncation meta rides only on a capped result so an uncapped
+	// response keeps its wire shape byte-for-byte.
+	if sg.Truncated {
+		meta = append(meta,
+			"truncated", "true",
+			"total_edges", fmt.Sprintf("%d", sg.TotalEdges),
+		)
+	}
 	meta = append(meta, zeroEdgeCaveatMeta(sg.Caveat)...)
 	meta = append(meta, tierFilteredCaveatMeta(sg.TierFiltered)...)
 	if sg.TextMatchedSuppressed > 0 {
