@@ -37,6 +37,55 @@ func TestCallToolStrict_MissingTool(t *testing.T) {
 	assert.Contains(t, err.Error(), "not registered")
 }
 
+// TestCallToolStrict_PromotesDeferredTool simulates the defer-mode lazy
+// tool catalog: a tool that is not yet registered on the live MCP server
+// (so GetTool returns nil) but becomes registered as a side effect of the
+// promoter callback — mirroring Server.EnsureToolPromoted promoting a
+// deferred tool into the live registry. CallToolStrict must retry GetTool
+// after a successful promotion instead of failing on the first miss. This
+// is the fix for dashboard routes (get_processes, get_communities, ...)
+// 500ing under the shipped core-preset defer-mode default.
+func TestCallToolStrict_PromotesDeferredTool(t *testing.T) {
+	g := graph.New()
+	srv := mcpserver.NewMCPServer("gortex-test", "0.0.1-test",
+		mcpserver.WithToolCapabilities(false),
+	)
+	h := NewHandler(srv, g, "0.0.1-test", zap.NewNop())
+
+	promoteCalls := 0
+	h.SetToolPromoter(func(name string) bool {
+		promoteCalls++
+		if name != "deferred_tool" {
+			return false
+		}
+		srv.AddTool(
+			mcp.NewTool("deferred_tool", mcp.WithDescription("registered on promotion")),
+			func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return mcp.NewToolResultText("promoted"), nil
+			},
+		)
+		return true
+	})
+
+	text, err := h.CallToolStrict(context.Background(), "deferred_tool", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "promoted", text)
+	assert.Equal(t, 1, promoteCalls, "promoter should be consulted exactly once on the registry miss")
+}
+
+// TestCallToolStrict_PromoterDeclines_StillMissing keeps the original
+// "not registered" error when the promoter is consulted but has nothing
+// to offer (name truly unknown, or already deferred-and-declined).
+func TestCallToolStrict_PromoterDeclines_StillMissing(t *testing.T) {
+	h := newTestHandler(t)
+	h.SetToolPromoter(func(string) bool { return false })
+
+	_, err := h.CallToolStrict(context.Background(), "no-such-tool", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no-such-tool")
+	assert.Contains(t, err.Error(), "not registered")
+}
+
 // TestCallToolStrict_ToolErrorResult promotes an MCP IsError=true result to
 // a Go error. This is the contract that handleContracts depends on to surface
 // 5xx instead of pretending the call succeeded with empty content.
