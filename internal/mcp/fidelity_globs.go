@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -89,7 +90,8 @@ func fidelityDecideForPath(rules []fidelityRule, relPath string) func(elide.Decl
 // matchFidelityGlob matches a glob against a forward-slash relative
 // path. It extends matchPathPattern's basename/prefix semantics with
 // explicit `**` support so the documented `internal/**` / `**/*.go`
-// forms work as written (Go's filepath.Match never crosses `/`).
+// forms work as written (a single `*` never crosses `/` — see
+// matchSegmentGlob for why that requires path.Match, not filepath.Match).
 func matchFidelityGlob(pattern, rel string) bool {
 	pattern = filepath.ToSlash(pattern)
 	rel = filepath.ToSlash(rel)
@@ -125,13 +127,20 @@ func matchFidelityGlob(pattern, rel string) bool {
 }
 
 // matchSegmentGlob applies the single-segment glob semantics shared
-// with matchPathPattern: filepath.Match against the full path and the
+// with matchPathPattern: a glob match against the full path and the
 // basename, plus a bare directory-prefix shortcut.
+//
+// path.Match, not filepath.Match. Both callers hand this function a
+// forward-slash path, and filepath.Match's separator is the platform's:
+// on Windows '/' is an ordinary character there, so `*` crosses it and
+// `internal/*.go` matches `internal/sub/x.go`. path.Match's separator is
+// always '/', which is the semantics this file's `**` handling — and its
+// own doc-comment — already assume.
 func matchSegmentGlob(pattern, rel string) bool {
-	if ok, _ := filepath.Match(pattern, rel); ok {
+	if ok, _ := path.Match(pattern, rel); ok {
 		return true
 	}
-	if ok, _ := filepath.Match(pattern, filepath.Base(rel)); ok {
+	if ok, _ := path.Match(pattern, path.Base(rel)); ok {
 		return true
 	}
 	if strings.HasSuffix(pattern, "/*") {
