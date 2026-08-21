@@ -240,10 +240,14 @@ func TestResourceReadReflectsOverlay(t *testing.T) {
 	assert.True(t, baseQuestions["indexed question"], "a plain read reports the indexed TODO")
 	assert.True(t, baseQuestions["kept question"], "a plain read reports the untouched file's TODO")
 
-	// The buffer drops the TODO and replaces the one function with two.
+	// The buffer drops the TODO and replaces the one function with three,
+	// so the buffer's file holds more nodes than the indexed one — a net
+	// gain the count assertion below can see. (The file node itself is a
+	// node in both, and the layer's copy replaces base's rather than
+	// adding to it.)
 	require.NoError(t, srv.OverlayManager().Push(sessionID, daemon.OverlayFile{
 		Path:    editedFile,
-		Content: "package main\n\nfunc Alpha() {}\n\nfunc Beta() {}\n",
+		Content: "package main\n\nfunc Alpha() {}\n\nfunc Beta() {}\n\nfunc Gamma() {}\n",
 	}, nil))
 	sessionCtx := WithSessionID(context.Background(), sessionID)
 

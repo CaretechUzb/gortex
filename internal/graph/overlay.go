@@ -373,6 +373,10 @@ func (v *OverlaidView) Layer() *OverlayLayer { return v.layer }
 // `<filepath>::<symbol>[.member][#param:name]` so the file prefix is
 // the substring before the first `::`. Module / package / virtual
 // nodes use other prefixes that won't match an overlay path.
+//
+// A file node's ID is the bare path with no `::`, so this returns "" for
+// it — callers that need the file an arbitrary node ID belongs to must
+// handle that case; overlay ownership does it in coversNodeID.
 func IDFile(id string) string {
 	if id == "" {
 		return ""
@@ -383,13 +387,29 @@ func IDFile(id string) string {
 	return ""
 }
 
+// coversNodeID reports whether the layer covers the file an ID belongs
+// to. A symbol ID carries its file before the `::` separator, so IDFile
+// answers for it. A file node's ID is the bare path with no separator,
+// so IDFile returns "" and the file the ID belongs to is the ID itself —
+// checked against the layer's covered-path set, never guessed. IDs of
+// other bare shapes are not paths, so they simply miss that set.
+func (l *OverlayLayer) coversNodeID(id string) bool {
+	if l == nil || id == "" {
+		return false
+	}
+	if file := IDFile(id); file != "" {
+		return l.HasFile(file)
+	}
+	return l.HasFile(id)
+}
+
 // nodeBelongsToOverlay reports whether an ID's file is covered by
 // the layer.
 func (v *OverlaidView) nodeBelongsToOverlay(id string) bool {
 	if v.layer == nil {
 		return false
 	}
-	return v.layer.HasFile(IDFile(id))
+	return v.layer.coversNodeID(id)
 }
 
 // GetNode returns the overlay's version of a node when the ID
@@ -430,7 +450,7 @@ func (v *OverlaidView) GetNodeByQualName(qualName string) *Node {
 		return nil
 	}
 	n := v.base.GetNodeByQualName(qualName)
-	if n != nil && v.layer != nil && v.layer.HasFile(IDFile(n.ID)) {
+	if n != nil && v.layer != nil && v.layer.coversNodeID(n.ID) {
 		// Base hit landed in an overlaid file but the overlay didn't
 		// re-emit a node with this qualified name → it's gone.
 		return nil
@@ -496,7 +516,7 @@ func (v *OverlaidView) GetNodesByQualNames(qualNames []string) map[string][]*Nod
 		}
 		for _, hits := range baseHits {
 			for _, n := range hits {
-				if n != nil && v.layer != nil && v.layer.HasFile(IDFile(n.ID)) {
+				if n != nil && v.layer != nil && v.layer.coversNodeID(n.ID) {
 					continue
 				}
 				add(n)
@@ -523,7 +543,7 @@ func (v *OverlaidView) FindNodesByName(name string) []*Node {
 	}
 	for _, n := range v.base.FindNodesByName(name) {
 		if v.layer != nil {
-			if v.layer.HasFile(IDFile(n.ID)) {
+			if v.layer.coversNodeID(n.ID) {
 				// Overlaid file: base's node for this name is
 				// always hidden. If the overlay re-emitted the same
 				// ID it's already in `out` from the layer's
@@ -577,7 +597,7 @@ func (v *OverlaidView) FindNodesByNameContaining(substr string, limit int) []*No
 	}
 	for _, n := range v.base.FindNodesByNameContaining(substr, fetch) {
 		if v.layer != nil {
-			if v.layer.HasFile(IDFile(n.ID)) {
+			if v.layer.coversNodeID(n.ID) {
 				continue
 			}
 			if v.layer.nameRemoved[n.Name] != nil && v.layer.nameRemoved[n.Name][n.ID] {
@@ -621,7 +641,7 @@ func (v *OverlaidView) GetRepoNodes(repoPrefix string) []*Node {
 	}
 	out := make([]*Node, 0, len(baseNodes))
 	for _, n := range baseNodes {
-		if v.layer.HasFile(IDFile(n.ID)) {
+		if v.layer.coversNodeID(n.ID) {
 			// File is overlaid: the layer owns every node in it.
 			// Re-emitted IDs come back below from the layer's own
 			// per-file list (with the layer's payload, not base's);
@@ -834,7 +854,7 @@ func (v *OverlaidView) AllNodes() []*Node {
 	}
 	out := make([]*Node, 0, len(baseNodes))
 	for _, n := range baseNodes {
-		if v.layer.HasFile(IDFile(n.ID)) {
+		if v.layer.coversNodeID(n.ID) {
 			if v.layer.nodeByID[n.ID] == nil {
 				continue
 			}
@@ -925,7 +945,7 @@ func (v *OverlaidView) NodesByKind(kind NodeKind) iter.Seq[*Node] {
 			return
 		}
 		for n := range v.base.NodesByKind(kind) {
-			if v.layer != nil && n != nil && v.layer.HasFile(IDFile(n.ID)) {
+			if v.layer != nil && n != nil && v.layer.coversNodeID(n.ID) {
 				continue
 			}
 			if !yield(n) {
@@ -1107,7 +1127,7 @@ func (v *OverlaidView) repoCountDeltas() (map[string]int, map[string]int) {
 					if e == nil || v.baseEdgeVisible(e) {
 						continue
 					}
-					if v.layer.HasFile(IDFile(e.From)) {
+					if v.layer.coversNodeID(e.From) {
 						continue // already charged on the out-edge side
 					}
 					lostBySource[e.From]++

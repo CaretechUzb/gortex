@@ -248,7 +248,7 @@ func (v *OverlaidView) FindIncomingSourcesBounded(
 			return nil
 		}
 		shadowIDs[id] = struct{}{}
-		if filePath := IDFile(id); filePath != "" && v.layer.HasFile(filePath) {
+		if v.layer.coversNodeID(id) {
 			standardShadows++
 			if standardShadows > overlayExactNameInspectionLimit {
 				return &BoundedLocalizationLimitError{
@@ -318,12 +318,12 @@ func (v *OverlaidView) FindIncomingSourcesBounded(
 			return BoundedIncomingSourceProjection{}, err
 		}
 		targetRemoved := v.layer.removedByID[targetID]
-		if (targetRemoved || v.layer.HasFile(IDFile(targetID))) && v.layer.nodeByID[targetID] == nil {
+		if (targetRemoved || v.layer.coversNodeID(targetID)) && v.layer.nodeByID[targetID] == nil {
 			continue
 		}
 		seen := make(map[string]struct{}, limit+1)
 		for _, sourceID := range baseProjection.Sources[targetID] {
-			if _, shadowed := shadowIDs[sourceID]; shadowed || v.layer.HasFile(IDFile(sourceID)) {
+			if _, shadowed := shadowIDs[sourceID]; shadowed || v.layer.coversNodeID(sourceID) {
 				continue
 			}
 			seen[sourceID] = struct{}{}

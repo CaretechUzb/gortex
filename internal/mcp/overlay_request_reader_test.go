@@ -191,6 +191,10 @@ func TestSearchTextScopeAttributionReadsRequestReader(t *testing.T) {
 	session.AddNode(fileNode(textAttrNewFl))
 	layer := graph.NewOverlayLayer()
 	layer.MarkFile(textAttrNewFl, false)
+	// A covered file's node list carries the file's own node: the parse of
+	// the buffer emits one, and the layer owns every node in the file it
+	// covers — including the one attribution looks up by path.
+	layer.AddNode(textAttrNewFl, fileNode(textAttrNewFl))
 	layer.AddNode(textAttrNewFl, &graph.Node{
 		ID: textAttrMovedID, Name: "Moved", Kind: graph.KindFunction,
 		FilePath: textAttrNewFl, RepoPrefix: textAttrRepo, WorkspaceID: textAttrRepo, StartLine: 3,

@@ -589,6 +589,291 @@ func TestOverlaidViewKindScansHonourOverlayPayload(t *testing.T) {
 	}
 }
 
+const (
+	fileNodeKeepName = "keep.go"
+	fileNodeEditName = "edit.go"
+)
+
+// fileNodeCoverage selects what the layer does with the covered file's
+// own KindFile node.
+type fileNodeCoverage int
+
+const (
+	// fileNodeReEmitted is what an extractor pass produces: the overlay
+	// parses the buffer and emits the file node under the same ID.
+	fileNodeReEmitted fileNodeCoverage = iota
+	// fileNodeDropped covers the file without re-emitting its node and
+	// records base's ID in the removal index.
+	fileNodeDropped
+	// fileNodeDroppedUnmarked is the same without the removal marker, so
+	// only the covered-path rule can hide base's file node. A layer
+	// builder that truncates its read of base's node list produces this.
+	fileNodeDroppedUnmarked
+)
+
+// fileNodeFixture builds a base graph that carries a KindFile node for
+// each file next to the symbols in it, plus a layer covering the edit
+// file. A file node's ID is its bare path — no "::" separator — so this
+// is the case where an ownership check that only reads the part before
+// "::" sees no file at all.
+//
+// Edges exercise a file node on both sides:
+//
+//	keep.go -imports->    edit.go   (uncovered file node into the covered one)
+//	Keeper  -references-> edit.go   (uncovered symbol into the covered file node)
+//	edit.go -defines->    Kept      (the covered file node's own out-edge)
+//
+// A re-emitted file node must answer every reader once with the layer's
+// payload; a dropped one must disappear from base as well.
+func fileNodeFixture(coverage fileNodeCoverage) (*Graph, *OverlayLayer, *Node) {
+	base := New()
+	base.AddNode(&Node{ID: consistencyKeepFil, Name: fileNodeKeepName, Kind: KindFile,
+		FilePath: consistencyKeepFil, RepoPrefix: consistencyRepo, StartLine: 1, EndLine: 10})
+	base.AddNode(&Node{ID: consistencyEditFil, Name: fileNodeEditName, Kind: KindFile,
+		FilePath: consistencyEditFil, RepoPrefix: consistencyRepo, StartLine: 1, EndLine: 20})
+	base.AddNode(&Node{ID: consistencyKeepID, Name: "Keeper", Kind: KindFunction,
+		FilePath: consistencyKeepFil, RepoPrefix: consistencyRepo})
+	base.AddNode(&Node{ID: consistencyKeptID, Name: "Kept", Kind: KindFunction,
+		FilePath: consistencyEditFil, RepoPrefix: consistencyRepo, StartLine: 10})
+	base.AddEdge(&Edge{From: consistencyKeepFil, To: consistencyEditFil, Kind: EdgeImports,
+		FilePath: consistencyKeepFil, Line: 1})
+	base.AddEdge(&Edge{From: consistencyKeepID, To: consistencyEditFil, Kind: EdgeReferences,
+		FilePath: consistencyKeepFil, Line: 5})
+	base.AddEdge(&Edge{From: consistencyEditFil, To: consistencyKeptID, Kind: EdgeDefines,
+		FilePath: consistencyEditFil, Line: 10})
+
+	layer := NewOverlayLayer()
+	layer.MarkFile(consistencyEditFil, false)
+	layer.AddNode(consistencyEditFil, &Node{ID: consistencyKeptID, Name: "Kept", Kind: KindFunction,
+		FilePath: consistencyEditFil, RepoPrefix: consistencyRepo, StartLine: 40})
+	if coverage != fileNodeReEmitted {
+		if coverage == fileNodeDropped {
+			layer.MarkRemoved(fileNodeEditName, consistencyEditFil)
+		}
+		return base, layer, nil
+	}
+	replacement := &Node{ID: consistencyEditFil, Name: fileNodeEditName, Kind: KindFile,
+		FilePath: consistencyEditFil, RepoPrefix: consistencyRepo, StartLine: 1, EndLine: 99}
+	layer.AddNode(consistencyEditFil, replacement)
+	layer.AddEdge(&Edge{From: consistencyEditFil, To: consistencyKeptID, Kind: EdgeDefines,
+		FilePath: consistencyEditFil, Line: 40})
+	return base, layer, replacement
+}
+
+func copiesOf(nodes []*Node, id string) []*Node {
+	var out []*Node
+	for _, n := range nodes {
+		if n != nil && n.ID == id {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// TestOverlaidViewReEmittedFileNodeSurfacesOnce pins the file-node half
+// of the one-copy rule: a covered file whose KindFile node the overlay
+// re-emitted answers every node reader once, with the layer's payload.
+func TestOverlaidViewReEmittedFileNodeSurfacesOnce(t *testing.T) {
+	base, layer, replacement := fileNodeFixture(fileNodeReEmitted)
+	view := NewOverlaidView(base, layer)
+
+	if got := view.GetNode(consistencyEditFil); got != replacement {
+		t.Fatalf("GetNode(%q) = %#v, want the layer's file node (end line %d)",
+			consistencyEditFil, got, replacement.EndLine)
+	}
+	if got := view.GetNodesByIDs([]string{consistencyEditFil})[consistencyEditFil]; got != replacement {
+		t.Fatalf("GetNodesByIDs[%q] = %#v, want the layer's file node", consistencyEditFil, got)
+	}
+
+	readers := map[string][]*Node{
+		"AllNodes":     view.AllNodes(),
+		"GetRepoNodes": view.GetRepoNodes(consistencyRepo),
+		"GetFileNodes": view.GetFileNodes(consistencyEditFil),
+		"NodesByKind":  collectNodeSeq(view.NodesByKind(KindFile)),
+	}
+	for name, nodes := range readers {
+		t.Run(name, func(t *testing.T) {
+			hits := copiesOf(nodes, consistencyEditFil)
+			if len(hits) != 1 {
+				t.Fatalf("%s returned %d copies of the file node %s, want exactly 1",
+					name, len(hits), consistencyEditFil)
+			}
+			if hits[0] != replacement {
+				t.Fatalf("%s returned base's file node (end line %d), want the layer's (end line %d)",
+					name, hits[0].EndLine, replacement.EndLine)
+			}
+		})
+	}
+
+	// The kind scan and the bulk read must describe the same file set.
+	if got, want := nodeKeys(collectNodeSeq(view.NodesByKind(KindFile))),
+		nodeKeys(nodesOfKind(view.AllNodes(), KindFile)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("NodesByKind(file) = %v, AllNodes filtered to file = %v", got, want)
+	}
+	// The untouched file keeps base's single copy.
+	if hits := copiesOf(view.AllNodes(), consistencyKeepFil); len(hits) != 1 {
+		t.Fatalf("AllNodes returned %d copies of the untouched file node %s, want 1",
+			len(hits), consistencyKeepFil)
+	}
+	// Name lookup answers with the layer's node, not base's.
+	byName := view.FindNodesByName(fileNodeEditName)
+	if len(byName) != 1 || byName[0] != replacement {
+		t.Fatalf("FindNodesByName(%q) = %v, want exactly the layer's file node",
+			fileNodeEditName, nodeKeys(byName))
+	}
+}
+
+// TestOverlaidViewCoveredFileNodeHiddenWithoutReEmission pins the other
+// direction: when the overlay covers a file but its node list carries no
+// KindFile node, base's copy must not survive — the same rule every
+// dropped symbol follows.
+func TestOverlaidViewCoveredFileNodeHiddenWithoutReEmission(t *testing.T) {
+	for name, build := range map[string]func() (*Graph, *OverlayLayer){
+		"covered without re-emission": func() (*Graph, *OverlayLayer) {
+			base, layer, _ := fileNodeFixture(fileNodeDropped)
+			return base, layer
+		},
+		"covered without a removal marker": func() (*Graph, *OverlayLayer) {
+			base, layer, _ := fileNodeFixture(fileNodeDroppedUnmarked)
+			return base, layer
+		},
+		"tombstoned file": func() (*Graph, *OverlayLayer) {
+			base, _, _ := fileNodeFixture(fileNodeDroppedUnmarked)
+			layer := NewOverlayLayer()
+			layer.MarkFile(consistencyEditFil, true)
+			layer.MarkRemoved(fileNodeEditName, consistencyEditFil)
+			layer.MarkRemoved("Kept", consistencyKeptID)
+			return base, layer
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			base, layer := build()
+			view := NewOverlaidView(base, layer)
+
+			if got := view.GetNode(consistencyEditFil); got != nil {
+				t.Fatalf("GetNode(%q) = %#v, want nil — the overlay covers the file and kept no node for it",
+					consistencyEditFil, got)
+			}
+			if got, ok := view.GetNodesByIDs([]string{consistencyEditFil})[consistencyEditFil]; ok {
+				t.Fatalf("GetNodesByIDs resurfaced the hidden file node %#v", got)
+			}
+			readers := map[string][]*Node{
+				"AllNodes":     view.AllNodes(),
+				"GetRepoNodes": view.GetRepoNodes(consistencyRepo),
+				"GetFileNodes": view.GetFileNodes(consistencyEditFil),
+				"NodesByKind":  collectNodeSeq(view.NodesByKind(KindFile)),
+			}
+			for reader, nodes := range readers {
+				if hits := copiesOf(nodes, consistencyEditFil); len(hits) != 0 {
+					t.Fatalf("%s resurfaced the hidden file node %s", reader, consistencyEditFil)
+				}
+			}
+			if got := view.FindNodesByName(fileNodeEditName); len(got) != 0 {
+				t.Fatalf("FindNodesByName(%q) = %v, want none", fileNodeEditName, nodeKeys(got))
+			}
+			// The untouched file node is unaffected.
+			if view.GetNode(consistencyKeepFil) == nil {
+				t.Fatalf("GetNode(%q) dropped the untouched file node", consistencyKeepFil)
+			}
+		})
+	}
+}
+
+// TestOverlaidViewFileNodeEdgeVisibility pins the edge side: a file node
+// is an ordinary endpoint, so edges into and out of it follow the same
+// ownership rules a symbol endpoint follows, across the point, batched
+// and bulk readers.
+func TestOverlaidViewFileNodeEdgeVisibility(t *testing.T) {
+	layerDefines := overlayEdgeKey(&Edge{From: consistencyEditFil, To: consistencyKeptID,
+		Kind: EdgeDefines, FilePath: consistencyEditFil, Line: 40})
+	baseImports := overlayEdgeKey(&Edge{From: consistencyKeepFil, To: consistencyEditFil,
+		Kind: EdgeImports, FilePath: consistencyKeepFil, Line: 1})
+	baseReferences := overlayEdgeKey(&Edge{From: consistencyKeepID, To: consistencyEditFil,
+		Kind: EdgeReferences, FilePath: consistencyKeepFil, Line: 5})
+
+	cases := []struct {
+		name     string
+		coverage fileNodeCoverage
+		wantOut  []string // out-edges of the covered file node
+		wantIn   []string // in-edges of the covered file node
+		wantKeep []string // out-edges of the untouched file node
+	}{
+		{
+			name:     "re-emitted file node keeps its inbound edges and swaps its own",
+			coverage: fileNodeReEmitted,
+			wantOut:  []string{layerDefines},
+			wantIn:   []string{baseImports, baseReferences},
+			wantKeep: []string{baseImports},
+		},
+		{
+			name:     "hidden file node drops every edge in both directions",
+			coverage: fileNodeDropped,
+			wantOut:  []string{},
+			wantIn:   []string{},
+			wantKeep: []string{},
+		},
+		{
+			name:     "coverage alone hides the edges without a removal marker",
+			coverage: fileNodeDroppedUnmarked,
+			wantOut:  []string{},
+			wantIn:   []string{},
+			wantKeep: []string{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base, layer, _ := fileNodeFixture(tc.coverage)
+			view := NewOverlaidView(base, layer)
+
+			sort.Strings(tc.wantIn)
+			if got := edgeKeys(view.GetOutEdges(consistencyEditFil)); !reflect.DeepEqual(got, tc.wantOut) {
+				t.Fatalf("GetOutEdges(%q) = %v, want %v", consistencyEditFil, got, tc.wantOut)
+			}
+			if got := edgeKeys(view.GetInEdges(consistencyEditFil)); !reflect.DeepEqual(got, tc.wantIn) {
+				t.Fatalf("GetInEdges(%q) = %v, want %v", consistencyEditFil, got, tc.wantIn)
+			}
+			if got := edgeKeys(view.GetOutEdges(consistencyKeepFil)); !reflect.DeepEqual(got, tc.wantKeep) {
+				t.Fatalf("GetOutEdges(%q) = %v, want %v", consistencyKeepFil, got, tc.wantKeep)
+			}
+			// A symbol's edge into the file node follows the same rule.
+			wantSymbolOut := []string{}
+			if tc.coverage == fileNodeReEmitted {
+				wantSymbolOut = []string{baseReferences}
+			}
+			if got := edgeKeys(view.GetOutEdges(consistencyKeepID)); !reflect.DeepEqual(got, wantSymbolOut) {
+				t.Fatalf("GetOutEdges(%q) = %v, want %v", consistencyKeepID, got, wantSymbolOut)
+			}
+
+			ids := []string{consistencyKeepFil, consistencyEditFil, consistencyKeepID, consistencyKeptID}
+			batchedOut := view.GetOutEdgesByNodeIDs(ids)
+			batchedIn := view.GetInEdgesByNodeIDs(ids)
+			for _, id := range ids {
+				if got, want := edgeKeys(batchedOut[id]), edgeKeys(view.GetOutEdges(id)); !reflect.DeepEqual(got, want) {
+					t.Fatalf("GetOutEdgesByNodeIDs[%q] = %v, GetOutEdges = %v", id, got, want)
+				}
+				if got, want := edgeKeys(batchedIn[id]), edgeKeys(view.GetInEdges(id)); !reflect.DeepEqual(got, want) {
+					t.Fatalf("GetInEdgesByNodeIDs[%q] = %v, GetInEdges = %v", id, got, want)
+				}
+			}
+
+			var union []*Edge
+			for _, n := range view.AllNodes() {
+				union = append(union, view.GetOutEdges(n.ID)...)
+			}
+			if got, want := edgeKeys(view.AllEdges()), edgeKeys(union); !reflect.DeepEqual(got, want) {
+				t.Fatalf("AllEdges = %v, union of GetOutEdges over visible sources = %v", got, want)
+			}
+			for kind := range map[EdgeKind]bool{EdgeImports: true, EdgeReferences: true, EdgeDefines: true} {
+				got := edgeKeys(collectEdgeSeq(view.EdgesByKind(kind)))
+				want := edgeKeys(edgesOfKind(view.AllEdges(), kind))
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("EdgesByKind(%q) = %v, AllEdges filtered = %v", kind, got, want)
+				}
+			}
+		})
+	}
+}
+
 // TestOverlaidViewKindScansStopEarly pins the iterator contract the
 // Reader doc-comment promises: a consumer that breaks out of the range
 // stops the scan instead of draining both legs.
