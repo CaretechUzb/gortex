@@ -2203,6 +2203,19 @@ func (s *Server) sessionScope(ctx context.Context) (workspaceID, projectID strin
 		return ss.scopeWorkspaceID, ss.scopeProjectID, true
 	}
 
+	// cwd lies inside no tracked repo and contains none — but the view
+	// catalog may still know it as an automatic checkout of a tracked
+	// family. That is a directory the repository registry never covers, so
+	// without this arm a session sitting in a worktree binds the unresolved
+	// form below and every scope-narrowed read comes back empty, including
+	// the reads its own routed view was built to serve.
+	if ws, proj, prefix, resolved := s.scopeForAutomaticCheckout(ctx, cwd); resolved {
+		ss.scopeWorkspaceID = ws
+		ss.scopeProjectID = proj
+		ss.scopeRepoPrefix = prefix
+		return ss.scopeWorkspaceID, ss.scopeProjectID, true
+	}
+
 	// cwd neither lives inside nor contains a tracked repo. The daemon
 	// dispatcher rejects unreachable cwds before dispatch, so this is
 	// defensive: the sentinel matches no node, so the session sees

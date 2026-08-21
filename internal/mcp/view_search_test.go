@@ -169,12 +169,10 @@ func appendSearchContent(t *testing.T, handle *store_sqlite.Store, filePath, nod
 	}
 }
 
-// routedArgs names the worktree explicitly. The automatic (cwd) binding routes
-// the same view, but a session sitting in a worktree resolves its workspace
-// scope from a directory no repository entry covers, and every result is then
-// dropped by the scope filter before search composition is even reached — a
-// separate seam. Naming the view from inside the repository exercises the
-// composition with a workspace the scope filter admits.
+// routedArgs names the worktree explicitly, from a session sitting in the
+// repository. The automatic (cwd) binding routes the same view — see
+// TestRoutedSearchFromTheWorktreeCWD, which drives the same composition with
+// no selector at all — so the two arms differ only in how the view is chosen.
 func routedArgs() map[string]any {
 	return map[string]any{"view": map[string]any{
 		"kind": "worktree", "checkout_id": viewTestWorktree,
@@ -225,6 +223,34 @@ func TestRoutedSearchSymbolsFindsAGenerationOnlySymbol(t *testing.T) {
 	body := singleTextOrFail(t, res)
 	if !strings.Contains(body, searchDirtyID) {
 		t.Fatalf("search_symbols did not surface the generation-only symbol: %s", body)
+	}
+	if strings.Contains(body, searchHiddenID) {
+		t.Fatalf("search_symbols answered with a symbol the view deleted: %s", body)
+	}
+}
+
+// TestRoutedSearchFromTheWorktreeCWD is the same search with nobody naming a
+// view: the session's working directory IS the automatic checkout, so the cwd
+// binding both routes the request and has to produce a scope the routed
+// answers survive. It is the whole seam end to end — the worktree lies inside
+// no tracked repository, so a session that failed to bind it would apply the
+// unresolved-workspace form and drop every row the composition just built.
+func TestRoutedSearchFromTheWorktreeCWD(t *testing.T) {
+	v := newSearchViewStack(t)
+
+	res, err := v.callWithView(t, v.worktreeRoot, "search_symbols", nil,
+		func(ctx context.Context) (*mcplib.CallToolResult, error) {
+			if view := requestViewFromContext(ctx); !view.routed() {
+				t.Fatal("the cwd binding did not route the request through the worktree's view")
+			}
+			return v.srv.handleSearchSymbols(ctx, searchToolRequest(searchProseQuery))
+		})
+	if err != nil {
+		t.Fatalf("search_symbols from the worktree cwd: %v", err)
+	}
+	body := singleTextOrFail(t, res)
+	if !strings.Contains(body, searchDirtyID) {
+		t.Fatalf("a session bound in the worktree did not surface the generation-only symbol: %s", body)
 	}
 	if strings.Contains(body, searchHiddenID) {
 		t.Fatalf("search_symbols answered with a symbol the view deleted: %s", body)
