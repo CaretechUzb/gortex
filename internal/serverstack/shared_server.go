@@ -18,6 +18,8 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/parser"
@@ -649,6 +651,25 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	// after it exists. Every lifecycle side effect — including the ones the
 	// daemon controller drives — reaches sessions through it from here on.
 	s.CheckoutLifecycle.SetNotifier(srv)
+	// One materializer per stack, over the same store and catalog every other
+	// collaborator uses, so a routed view and the sweep that retires its
+	// generations agree on which leases are live. The lease manager must be
+	// the lifecycle's own: retirement runs in the coordinators with that
+	// manager as its in-use predicate, so a request leasing through any other
+	// manager would be invisible to the sweep and its generations could be
+	// deleted mid-read. A backend without a catalog hands the server nothing
+	// and every request stays on the base corpus.
+	if store, ok := g.(*store_sqlite.Store); ok {
+		leases := s.CheckoutLifecycle.ViewLeases()
+		if leases == nil {
+			leases = graphview.NewLeaseManager()
+		}
+		srv.SetMaterializer(&graphview.Materializer{
+			Store:   store,
+			Catalog: store.Catalog(),
+			Leases:  leases,
+		})
+	}
 	srv.SetArchitecture(conf.Architecture)
 	srv.SetEventRules(conf.Events.Rules)
 	srv.SetArtifacts(conf.Artifacts)

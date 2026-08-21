@@ -119,6 +119,14 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 				retErr = nil
 			}
 		}()
+		// The view argument is request context, not a tool parameter: it is
+		// read and stripped here so every tool honours it and no handler or
+		// schema has to know about it. Stripping precedes reconciliation so
+		// the alias matcher cannot rewrite it into a tool's own parameter.
+		selector, selectorErr := takeViewSelector(&req)
+		if selectorErr != nil {
+			return mcp.NewToolResultError(selectorErr.Error()), nil
+		}
 		// Tolerate hallucinated / mistyped parameter names before the
 		// handler reads arguments (e.g. "symbol" accepted as "id").
 		s.reconcileToolParams(&req)
@@ -140,6 +148,24 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// handler chain, but its warn rider must attach AFTER the decorators
 		// below (see attachPendingArgGuardRider).
 		ctx = withArgGuardRiderSlot(ctx)
+		// Which view answers this request: the selector the caller named, the
+		// checkout its cwd sits in, or the base corpus. Resolved before the
+		// overlay so a session's editor buffers layer on top of whatever
+		// answers here. The lease the materialized view holds is released
+		// with the request, on the same lifecycle that discards the overlay.
+		view, viewErr := s.resolveRequestView(ctx, selector)
+		if viewErr != nil {
+			return mcp.NewToolResultError(viewErr.Error()), nil
+		}
+		if view != nil {
+			ctx = withRequestView(ctx, view)
+			defer view.close()
+		}
+		// A write issued while reading a routed view would land in the
+		// canonical checkout, not the one the answer came from.
+		if refused := s.refuseRoutedViewMutation(ctx, req.Params.Name); refused != nil {
+			return refused, nil
+		}
 		if injectOverlay {
 			var err error
 			ctx, _, err = s.prepareOverlayRequest(ctx)
@@ -194,6 +220,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 				// or vanished on disk is flagged with per-repo provenance.
 				res = s.decorateListResultWithFreshness(res)
 			}
+			// Which view answered rides in that same block: a response that
+			// came from somewhere other than the base — or fell back to it —
+			// must say so where the caller already looks for provenance.
+			res = s.attachViewRider(ctx, res)
 		}
 		// The arg guard's warn rider lands here — after the warming and
 		// freshness decorators, both of which rebuild the text result from

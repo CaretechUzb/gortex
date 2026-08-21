@@ -150,9 +150,9 @@ func OverlayViewFromContext(ctx context.Context) *graph.OverlaidView {
 
 // readerFor returns the graph.Reader the calling tool handler should
 // read through. When ctx carries an overlay view, that view is the
-// reader and base is consulted through it. Otherwise the base graph
-// is returned directly. The single helper keeps every read site
-// overlay-aware with one line of plumbing.
+// reader and base is consulted through it. Otherwise the request's
+// base reader is returned directly. The single helper keeps every read
+// site overlay-aware with one line of plumbing.
 //
 // Never nil unless the server itself has no graph wired (test-only
 // state). Callers that hot-loop on this should hoist the lookup —
@@ -161,6 +161,16 @@ func OverlayViewFromContext(ctx context.Context) *graph.OverlaidView {
 func (s *Server) readerFor(ctx context.Context) graph.Reader {
 	if v := OverlayViewFromContext(ctx); v != nil {
 		return v
+	}
+	return s.requestBaseReader(ctx)
+}
+
+// requestBaseReader is what this request reads when no editor buffer is in
+// play, and what a buffer overlay composes on top of: the routed checkout
+// view when the request resolved to one, the indexed corpus otherwise.
+func (s *Server) requestBaseReader(ctx context.Context) graph.Reader {
+	if view := requestViewFromContext(ctx); view.routed() {
+		return view.reader
 	}
 	return s.graph
 }
@@ -181,6 +191,9 @@ func (s *Server) engineFor(ctx context.Context) *query.Engine {
 	}
 	if v := OverlayViewFromContext(ctx); v != nil {
 		return s.engine.WithReader(v)
+	}
+	if view := requestViewFromContext(ctx); view.routed() {
+		return s.engine.WithReader(view.reader)
 	}
 	return s.engine
 }
@@ -380,13 +393,18 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 	}
 
 	hash := hashOverlayFiles(files)
+	// The buffer layer composes over whatever answers THIS request — the
+	// indexed corpus, or the routed checkout view the session's cwd bound to.
+	// The parsed layer itself is base-independent, which is what lets the
+	// cache below stay keyed by content alone.
+	base := s.requestBaseReader(ctx)
 
 	// Cache hit: same session pushed the same buffers; reuse the
 	// parsed layer. The cache stores up to one entry per session; a
 	// changed content hash evicts the prior entry.
 	if v, ok := s.overlayLayerCache.Load(sessID); ok {
 		if entry := v.(*overlayLayerCacheEntry); entry.hash == hash {
-			return graph.NewOverlaidView(s.graph, entry.layer), nil
+			return graph.NewOverlaidView(base, entry.layer), nil
 		}
 		s.overlayLayerCache.Delete(sessID)
 	}
@@ -398,7 +416,7 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 	defer s.overlayLayerBuildMu.Unlock()
 	if v, ok := s.overlayLayerCache.Load(sessID); ok {
 		if entry := v.(*overlayLayerCacheEntry); entry.hash == hash {
-			return graph.NewOverlaidView(s.graph, entry.layer), nil
+			return graph.NewOverlaidView(base, entry.layer), nil
 		}
 	}
 
@@ -414,7 +432,7 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 		layer: layer,
 		files: paths,
 	})
-	return graph.NewOverlaidView(s.graph, layer), nil
+	return graph.NewOverlaidView(base, layer), nil
 }
 
 // resolveOverlayAbsPath turns the overlay's caller-supplied path into

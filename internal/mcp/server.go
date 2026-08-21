@@ -24,6 +24,7 @@ import (
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm"
 	"github.com/zzet/gortex/internal/llm/registry"
@@ -550,6 +551,12 @@ type Server struct {
 	// immutable base graph. Wired post-construction by
 	// SetOverlayManager.
 	overlays *daemon.OverlayManager
+
+	// materializer builds the composed reader a routed checkout is served
+	// through. Nil when the backing store carries no view catalog, in which
+	// case every request reads the base corpus exactly as it did before
+	// routed views existed. Wired post-construction by SetMaterializer.
+	materializer *graphview.Materializer
 
 	// overlayLayerCache memoises per-session parsed overlay layers
 	// keyed by (sessionID, content-hash sum). Cache hits avoid the
