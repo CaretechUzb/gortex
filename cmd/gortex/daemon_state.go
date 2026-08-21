@@ -36,7 +36,11 @@ type daemonState struct {
 	indexer       *indexer.Indexer
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
-	mcpServer     *gortexmcp.Server
+	// lifecycle is the shared owner of checkout lifecycle side effects —
+	// track, forget, reload, the periodic sweep. The controller, the MCP
+	// tools and the janitor all drive this one instance.
+	lifecycle *indexer.CheckoutLifecycle
+	mcpServer *gortexmcp.Server
 	// proxyHydrator lazily fills cross-daemon proxy-edge nodes from the
 	// owning remote's /v1/subgraph. nil unless federation.edges is on;
 	// the read path hydrates a proxy target before traversing it.
@@ -120,6 +124,7 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		indexer:             ss.Indexer,
 		multiIndexer:        ss.MultiIndexer,
 		configManager:       ss.ConfigMgr,
+		lifecycle:           ss.CheckoutLifecycle,
 		mcpServer:           ss.MCP,
 		overlays:            ss.Overlays,
 		shared:              ss,

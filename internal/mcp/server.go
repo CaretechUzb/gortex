@@ -140,6 +140,8 @@ type Server struct {
 	watcher       watcherHistory
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
+	// lifecycle is the shared owner of checkout track / forget side effects.
+	lifecycle     *indexer.CheckoutLifecycle
 	activeProject string
 	// testIndexProbe caches, per repo prefix, which language families the
 	// graph carries test symbols for (see testLangsIndexed). The answer
@@ -1366,7 +1368,11 @@ func prependUnique(slice []string, item string, maxLen int) []string {
 type MultiRepoOptions struct {
 	MultiIndexer  *indexer.MultiIndexer
 	ConfigManager *config.ConfigManager
-	ActiveProject string
+	// CheckoutLifecycle owns every side effect of tracking and forgetting a
+	// checkout. Nil leaves the track / untrack tools unavailable rather than
+	// letting them run a second, divergent copy of that sequence.
+	CheckoutLifecycle *indexer.CheckoutLifecycle
+	ActiveProject     string
 	// ScopeWorkspace is the workspace slug filter applied as the
 	// default scope on every query. Set by `gortex server --workspace
 	// <slug>`. Empty disables the filter.
@@ -1696,12 +1702,34 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		o := opts[0]
 		s.multiIndexer = o.MultiIndexer
 		s.configManager = o.ConfigManager
+		s.lifecycle = o.CheckoutLifecycle
 		s.activeProject = o.ActiveProject
 		s.scopeWorkspace = o.ScopeWorkspace
 		s.scopeProject = o.ScopeProject
 		if o.ScopeIntentDefaults != nil {
 			s.scopeIntentDefaults = *o.ScopeIntentDefaults
 		}
+		// A stack-built server is handed the lifecycle every other entry
+		// point shares. A server constructed on its own — the embedded and
+		// test paths — owns the only tracked set there is, so it builds the
+		// same coordinator over the same inputs rather than growing a second
+		// copy of the track / forget sequence.
+		if s.lifecycle == nil && s.multiIndexer != nil {
+			lifecycle, err := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{
+				MultiIndexer:  s.multiIndexer,
+				ConfigManager: s.configManager,
+				Graph:         g,
+				Logger:        logger,
+			})
+			if err != nil {
+				if logger != nil {
+					logger.Warn("mcp: could not build the checkout lifecycle", zap.Error(err))
+				}
+			} else {
+				s.lifecycle = lifecycle
+			}
+		}
+		s.lifecycle.SetNotifier(s)
 	}
 
 	// Proactive-notification broadcasters. Constructed up-front so

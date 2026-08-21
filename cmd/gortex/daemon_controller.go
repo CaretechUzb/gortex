@@ -53,6 +53,11 @@ type realController struct {
 	indexer       *indexer.Indexer
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
+	// lifecycle owns every checkout lifecycle side effect. It is the same
+	// instance the MCP tools drive, so a track over the control socket and a
+	// track over MCP leave identical state behind. Nil only in tests that
+	// build a controller by hand; the methods that need it say so.
+	lifecycle *indexer.CheckoutLifecycle
 	// multiWatcher is an atomic pointer, not a mu-guarded field: the daemon's
 	// teardown hook reads it, and reading it under mu is what kept `daemon
 	// stop` queued behind a running track / reload / enrichment. One writer
@@ -117,57 +122,41 @@ func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.
 	if err != nil {
 		return nil, fmt.Errorf("resolve path: %w", err)
 	}
+	if c.lifecycle == nil {
+		return nil, fmt.Errorf("checkout lifecycle not initialized")
+	}
 	entry := config.RepoEntry{Path: absPath, Name: p.Name, Ref: p.Ref, AsWorktree: p.AsWorktree}
-	result, err := c.multiIndexer.TrackRepoCtx(ctx, entry)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		// Already tracked — idempotent.
-		return json.RawMessage(fmt.Sprintf(`{"status":"already_tracked","path":%q}`, absPath)), nil
-	}
-	// TrackRepoCtx may have derived a worktree-instance prefix that the
-	// by-value entry above can't see — read the prefix it actually
-	// registered under for the watcher attach and the response.
-	prefix := result.RepoPrefix
-	if prefix == "" {
-		prefix = config.ResolvePrefix(entry)
-	}
 
 	// Project association from TrackParams.Project isn't wired yet — the
 	// config package doesn't expose an AddRepoToProject helper. Callers
 	// who need project scoping can edit ~/.gortex/config.yaml and
 	// run `gortex daemon reload`; track from the daemon-v1 surface just
 	// adds to the top-level repo list.
-
-	// Attach a watcher to the newly-tracked repo so file edits in it
-	// flow back into the graph live without a manual reload. Failures
-	// here are logged but don't fail the track — an indexed-but-
-	// unwatched repo is still queryable, just stale if edited.
-	if mw := c.watcher(); mw != nil && c.configManager != nil {
-		wcfg := c.configManager.GetRepoConfig(prefix).Watch
-		if err := mw.AddRepo(prefix, wcfg); err != nil {
-			c.logger.Warn("track: attach watcher failed",
-				zap.String("prefix", prefix), zap.Error(err))
-		}
+	//
+	// Everything else — the index, the catalog identity, the CLI tracking
+	// intent, the watcher attach, the config flush and the session
+	// invalidation — is the shared registration path, so this surface and
+	// the MCP tool leave the same state behind.
+	result, err := c.lifecycle.Register(ctx, entry, indexer.TrackSourceCLI)
+	if err != nil {
+		return nil, err
 	}
-
-	// Persist the config change. TrackRepoCtx mutates the in-memory
-	// GlobalConfig via AddRepo but does not flush to disk; without this
-	// Save the new repo vanishes on daemon restart. Mirrors Untrack.
-	if c.configManager != nil {
-		if err := c.configManager.Global().Save(); err != nil {
-			c.logger.Warn("track: save config failed", zap.Error(err))
-		}
+	if result.CatalogErr != nil {
+		c.logger.Warn("track: recording the checkout identity failed",
+			zap.String("path", absPath), zap.Error(result.CatalogErr))
+	}
+	if result.AlreadyTracked {
+		// Already tracked — idempotent.
+		return json.RawMessage(fmt.Sprintf(`{"status":"already_tracked","path":%q}`, absPath)), nil
 	}
 
 	return json.Marshal(map[string]any{
 		"status":     "tracked",
 		"path":       absPath,
-		"prefix":     prefix,
-		"file_count": result.FileCount,
-		"node_count": result.NodeCount,
-		"edge_count": result.EdgeCount,
+		"prefix":     result.Prefix,
+		"file_count": result.Index.FileCount,
+		"node_count": result.Index.NodeCount,
+		"edge_count": result.Index.EdgeCount,
 	})
 }
 
@@ -411,58 +400,43 @@ func (c *realController) EnrichCochange(ctx context.Context, p daemon.EnrichCoch
 
 // Untrack evicts a repo from the graph and drops it from config.
 // PathOrPrefix accepts either an absolute path or a repo prefix.
-func (c *realController) Untrack(_ context.Context, p daemon.UntrackParams) (json.RawMessage, error) {
+func (c *realController) Untrack(ctx context.Context, p daemon.UntrackParams) (json.RawMessage, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.multiIndexer == nil {
 		return nil, fmt.Errorf("multi-repo indexer not initialized")
 	}
-
-	prefix := p.PathOrPrefix
-	// Resolve path → prefix if an absolute path was given. Absolutise (to
-	// Clean) and compare with fold-aware EqualPaths so a case-variant
-	// spelling of a tracked root on a case-insensitive filesystem still
-	// resolves to the right prefix.
-	if filepath.IsAbs(p.PathOrPrefix) {
-		abs, err := filepath.Abs(p.PathOrPrefix)
-		if err != nil {
-			abs = p.PathOrPrefix
-		}
-		for pfx, meta := range c.multiIndexer.AllMetadata() {
-			if pathkey.EqualPaths(meta.RootPath, abs) {
-				prefix = pfx
-				break
-			}
-		}
+	if c.lifecycle == nil {
+		return nil, fmt.Errorf("checkout lifecycle not initialized")
 	}
 
-	// Detach the watcher before evicting from the graph — otherwise a
-	// late fsnotify event could race the eviction and try to re-index
-	// files whose nodes are already gone.
-	if mw := c.watcher(); mw != nil {
-		if err := mw.RemoveRepo(prefix); err != nil {
-			c.logger.Debug("untrack: detach watcher",
-				zap.String("prefix", prefix), zap.Error(err))
-		}
+	// The lifecycle resolves the selector, revokes every revocable tracking
+	// intent, and runs the forget saga — which detaches the watcher before
+	// evicting from the graph (a late fsnotify event must not race the
+	// eviction), then persists the config and invalidates every session.
+	result, err := c.lifecycle.Untrack(ctx, p.PathOrPrefix)
+	if err != nil {
+		return nil, err
 	}
 
-	nodesRemoved, edgesRemoved := c.multiIndexer.UntrackRepo(prefix)
-
-	// Persist the config change.
-	if c.configManager != nil {
-		_ = c.configManager.Global().RemoveRepo(prefix)
-		if err := c.configManager.Global().Save(); err != nil {
-			c.logger.Warn("untrack: save config failed", zap.Error(err))
-		}
-	}
-
-	return json.Marshal(map[string]any{
+	payload := map[string]any{
 		"status":        "untracked",
-		"prefix":        prefix,
-		"nodes_removed": nodesRemoved,
-		"edges_removed": edgesRemoved,
-	})
+		"prefix":        result.Prefix,
+		"nodes_removed": result.NodesRemoved,
+		"edges_removed": result.EdgesRemoved,
+	}
+	if len(result.Revoked) > 0 {
+		payload["revoked_intents"] = result.Revoked
+	}
+	if len(result.Dependents) > 0 {
+		dependents := make([]string, 0, len(result.Dependents))
+		for _, dep := range result.Dependents {
+			dependents = append(dependents, dep.Detail)
+		}
+		payload["dependents"] = dependents
+	}
+	return json.Marshal(payload)
 }
 
 // Reload re-reads the global config, indexes new repos that were added
@@ -531,64 +505,27 @@ func (c *realController) Reload(ctx context.Context) (json.RawMessage, error) {
 	if err := c.configManager.Reload(); err != nil {
 		return nil, fmt.Errorf("reload config: %w", err)
 	}
-
-	// Re-read every already-tracked repo's `.gortex.yaml` and push the
-	// refreshed excludes into its live indexer. The tracked-repo diff
-	// below keeps such repos by root path and never re-tracks them, so
-	// without this an edit to a per-repo config could not reach a running
-	// daemon at all: reload was global-config-only in practice.
-	refreshed := c.multiIndexer.RefreshRepoConfigs()
-
-	var added, removed int
-
-	// Match configured entries to currently-tracked instances by ROOT
-	// PATH, not by a recomputed prefix. A worktree tracked as an
-	// independent instance registers under a derived `<base>@<workspace>`
-	// prefix, so keying the diff on config.ResolvePrefix(entry) (the bare
-	// basename) would fail to recognise it as wanted and untrack it on
-	// every reload. The root path is the stable identity of a checkout.
-	trackedByRoot := make(map[string]string) // absolute RootPath → prefix
-	for prefix, meta := range c.multiIndexer.AllMetadata() {
-		if meta != nil {
-			trackedByRoot[meta.RootPath] = prefix
-		}
+	if c.lifecycle == nil {
+		return nil, fmt.Errorf("checkout lifecycle not initialized")
 	}
 
-	wantedPrefixes := make(map[string]bool)
-	for _, entry := range c.configManager.Global().Repos {
-		abs, err := filepath.Abs(entry.Path)
-		if err != nil {
-			abs = entry.Path
-		}
-		if prefix, ok := trackedByRoot[abs]; ok {
-			// Already tracked (under whatever prefix it registered) — keep it.
-			wantedPrefixes[prefix] = true
-			continue
-		}
-		res, trackErr := c.multiIndexer.TrackRepoCtx(ctx, entry)
-		if trackErr != nil {
-			c.logger.Warn("reload: track failed",
-				zap.String("path", entry.Path), zap.Error(trackErr))
-			continue
-		}
-		added++
-		if res != nil && res.RepoPrefix != "" {
-			wantedPrefixes[res.RepoPrefix] = true
-		}
-	}
-
-	for prefix := range c.multiIndexer.AllMetadata() {
-		if wantedPrefixes[prefix] {
-			continue
-		}
-		c.multiIndexer.UntrackRepo(prefix)
-		removed++
+	// The diff itself is unchanged — configured entries are matched to
+	// tracked instances by root path, never by a recomputed prefix — but both
+	// halves now run through the lifecycle: an added entry gets the same
+	// identity, watcher and invalidation an explicit track would give it, and
+	// a removed one goes through the reconciler's retirement rule instead of
+	// a direct eviction, so a config edit can no longer delete a corpus that
+	// nothing else can serve.
+	result, err := c.lifecycle.ApplyReload(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	return json.Marshal(map[string]any{
-		"added":     added,
-		"removed":   removed,
-		"refreshed": refreshed,
+		"added":     result.Added,
+		"removed":   result.Removed,
+		"pending":   result.Pending,
+		"refreshed": result.Refreshed,
 	})
 }
 
@@ -1446,12 +1383,22 @@ func probeSymbolHit(n *graph.Node) daemon.SymbolHit {
 }
 
 // AttachWatcher is called by warmup to hand over the MultiWatcher once
-// it has been initialized. Until this is called, realController.Track
-// skips the per-repo watcher attach — a newly-tracked repo gets its
-// watcher when the warmup-constructed MultiWatcher iterates
-// mi.AllMetadata() at startup.
+// it has been initialized. Until this is called, the lifecycle skips the
+// per-repo watcher attach — a newly-tracked repo gets its watcher when the
+// warmup-constructed MultiWatcher iterates mi.AllMetadata() at startup.
+//
+// The lifecycle reads the watcher through this same pointer, so every
+// surface's attach and detach hit the one live watcher.
 func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
 	c.multiWatcher.Store(mw)
+	c.lifecycle.SetWatcherSource(func() indexer.RepoWatcher {
+		// A typed nil in an interface is not nil; return the untyped one so
+		// the lifecycle's "is there a watcher yet" test stays honest.
+		if live := c.watcher(); live != nil {
+			return live
+		}
+		return nil
+	})
 }
 
 // watcher reads the attached MultiWatcher without touching the coarse mutex.

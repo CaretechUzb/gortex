@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/reconcile"
 )
 
 // trackAcceptedHeadroom is how long before the MCP request deadline the
@@ -139,8 +141,12 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		})
 	}
 
+	if s.lifecycle == nil {
+		return mcp.NewToolResultError("checkout lifecycle is not wired"), nil
+	}
+
 	type trackOutcome struct {
-		result *indexer.IndexResult
+		result indexer.RegisterResult
 		err    error
 	}
 	done := make(chan trackOutcome, 1)
@@ -149,24 +155,18 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		// WithoutCancel keeps the request's values (progress token, session)
 		// while dropping its cancellation, so the daemon's request lifetime
 		// can no longer kill a half-written first index.
-		res, trackErr := s.multiIndexer.TrackRepoCtx(
-			s.progressCtx(context.WithoutCancel(ctx), req), entry)
-		if trackErr == nil && res != nil {
-			// Persist and refresh here rather than in the caller: the caller
-			// may already have answered `accepted` and returned.
-			if s.configManager != nil {
-				if saveErr := s.configManager.Global().Save(); saveErr != nil {
-					s.logger.Warn("failed to persist config after tracking repo",
-						zap.String("path", path), zap.Error(saveErr))
-				}
-			}
-			// The tracked-repo set just changed, so every session's
-			// cached workspace binding is stale. Without this the
-			// session that ran `track` to repair its own uncovered cwd
-			// keeps the boundary it latched before the call and stays
-			// blind to the repo it just added.
-			s.InvalidateSessionScopes()
-			s.RunAnalysis()
+		//
+		// Registration also persists the config, attaches the watcher and
+		// invalidates every session's cached workspace binding — the last of
+		// which is what stops the session that ran `track` to repair its own
+		// uncovered cwd from staying blind to the repo it just added. It
+		// happens inside the goroutine because the caller may already have
+		// answered `accepted` and returned.
+		res, trackErr := s.lifecycle.Register(
+			s.progressCtx(context.WithoutCancel(ctx), req), entry, indexer.TrackSourceMCP)
+		if trackErr == nil && res.CatalogErr != nil {
+			s.logger.Warn("track: recording the checkout identity failed",
+				zap.String("path", path), zap.Error(res.CatalogErr))
 		}
 		done <- trackOutcome{result: res, err: trackErr}
 	}()
@@ -186,11 +186,12 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		if out.err != nil {
 			return mcp.NewToolResultError(out.err.Error()), nil
 		}
-		// Already tracked — TrackRepo returns nil result when repo exists.
-		if out.result == nil {
+		// Already tracked — the corpus held the repo, so only its identity
+		// and side effects were brought up to date.
+		if out.result.AlreadyTracked {
 			return mcp.NewToolResultText("repository already tracked"), nil
 		}
-		prefix := out.result.RepoPrefix
+		prefix := out.result.Prefix
 		if prefix == "" {
 			prefix = config.ResolvePrefix(entry)
 		}
@@ -198,9 +199,9 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 			"status":     "tracked",
 			"path":       path,
 			"prefix":     prefix,
-			"file_count": out.result.FileCount,
-			"node_count": out.result.NodeCount,
-			"edge_count": out.result.EdgeCount,
+			"file_count": out.result.Index.FileCount,
+			"node_count": out.result.Index.NodeCount,
+			"edge_count": out.result.Index.EdgeCount,
 		})
 	case <-answerBy:
 		return s.respondJSONOrTOON(ctx, req, map[string]any{
@@ -221,38 +222,46 @@ func (s *Server) handleUntrackRepository(ctx context.Context, req mcp.CallToolRe
 	if s.multiIndexer == nil {
 		return mcp.NewToolResultError("multi-repo indexing is not enabled"), nil
 	}
+	if s.lifecycle == nil {
+		return mcp.NewToolResultError("checkout lifecycle is not wired"), nil
+	}
 
-	// Try to find the repo by prefix or by path.
-	prefix := s.resolveRepoPrefix(path)
-	if prefix == "" {
-		// Untracking something already untracked is a no-op the agent can act
-		// on, not a session-ending failure — return success-shaped guidance.
+	// Untracking something already untracked is a no-op the agent can act on,
+	// not a session-ending failure — return success-shaped guidance.
+	if s.lifecycle.ResolvePrefix(path) == "" {
 		return repoNotTrackedGuidance(path), nil
 	}
 
-	nodesRemoved, edgesRemoved := s.multiIndexer.UntrackRepo(prefix)
-
-	// Persist updated config.
-	if s.configManager != nil {
-		if saveErr := s.configManager.Global().Save(); saveErr != nil {
-			s.logger.Warn("failed to persist config after untracking repo",
-				zap.String("path", path), zap.Error(saveErr))
+	// The lifecycle revokes the tracking intents, runs the forget saga and
+	// drives every side effect from it: watcher detach, graph eviction,
+	// config persist, session invalidation, analysis rerun.
+	result, err := s.lifecycle.Untrack(ctx, path)
+	if err != nil {
+		if errors.Is(err, reconcile.ErrIntentNotRevocable) {
+			return mcp.NewToolResultError(fmt.Sprintf(
+				"cannot untrack %s: it is still wanted by another tracking source (%v)",
+				path, err)), nil
 		}
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// The tracked-repo set changed: drop cached session bindings so a
-	// session does not keep serving a repo that is no longer tracked.
-	s.InvalidateSessionScopes()
-
-	// Re-run analysis after removing a repo.
-	s.RunAnalysis()
-
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	payload := map[string]any{
 		"status":        "untracked",
-		"prefix":        prefix,
-		"nodes_removed": nodesRemoved,
-		"edges_removed": edgesRemoved,
-	})
+		"prefix":        result.Prefix,
+		"nodes_removed": result.NodesRemoved,
+		"edges_removed": result.EdgesRemoved,
+	}
+	if len(result.Revoked) > 0 {
+		payload["revoked_intents"] = result.Revoked
+	}
+	if len(result.Dependents) > 0 {
+		dependents := make([]string, 0, len(result.Dependents))
+		for _, dep := range result.Dependents {
+			dependents = append(dependents, dep.Detail)
+		}
+		payload["dependents"] = dependents
+	}
+	return s.respondJSONOrTOON(ctx, req, payload)
 }
 
 // handleSetActiveProject validates the project name, updates the active project,

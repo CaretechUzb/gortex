@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -251,6 +252,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		indexer:       state.indexer,
 		multiIndexer:  state.multiIndexer,
 		configManager: state.configManager,
+		lifecycle:     state.lifecycle,
 		logger:        logger,
 	}
 	if state.mcpServer != nil {
@@ -480,7 +482,8 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// event-queue overflow). Default interval 1 h; override via
 	// GORTEX_RECONCILE_INTERVAL (a Go duration string, e.g. "15m").
 	// Set to "0" to disable.
-	stopJanitor := startReconcileJanitor(state.multiIndexer, reconcileInterval(), logger)
+	stopJanitor := startReconcileJanitor(
+		state.multiIndexer, state.lifecycle, reconcileInterval(), logger)
 	defer stopJanitor()
 
 	if err := srv.Listen(); err != nil {
@@ -515,6 +518,18 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 
 		start := time.Now()
 		logger.Info("daemon: warmup starting")
+		// Bring the checkout catalog in line with the configured repos
+		// before anything re-indexes them. It is the migration path for an
+		// installation that predates the catalog and the restart path for
+		// one that does not: identities that already exist keep their rows
+		// and their clocks (a repo that was mid-grace when the daemon
+		// stopped resumes where it was, it does not restart the wait), and
+		// any teardown interrupted by the stop is resumed.
+		if state.lifecycle != nil {
+			if err := state.lifecycle.Seed(context.Background()); err != nil {
+				logger.Warn("daemon: seeding the checkout catalog was incomplete", zap.Error(err))
+			}
+		}
 		// markReady fires once references are resolved and the graph is
 		// queryable — ahead of the slow enrichment pass — so clients can
 		// start issuing find_usages / get_callers immediately. Enrichment
@@ -662,18 +677,27 @@ func reconcileInterval() time.Duration {
 }
 
 // startReconcileJanitor launches a background goroutine that, on every
-// interval tick, garbage-collects the index of any linked git worktree
-// whose root directory has vanished from disk and then calls
+// interval tick, runs the checkout lifecycle sweep and then calls
 // MultiIndexer.ReconcileAll. interval=0 is a no-op; the returned stop
 // function can be called unconditionally.
 //
-// The worktree GC runs *before* ReconcileAll on purpose: a removed
-// worktree's root no longer exists, so ReconcileAll's IncrementalReindexPaths
-// would only error on the missing path without evicting anything.
-// Pruning the vanished worktrees first keeps the reconcile sweep
-// working on live repos and stops a deleted worktree's snapshot slot
-// and graph nodes from leaking forever.
-func startReconcileJanitor(mi *indexer.MultiIndexer, interval time.Duration, logger *zap.Logger) func() {
+// The sweep runs *before* ReconcileAll on purpose: a removed checkout's root
+// no longer exists, so ReconcileAll's IncrementalReindexPaths would only
+// error on the missing path without evicting anything. Sweeping first keeps
+// the reconcile pass working on live repos and stops a removed checkout's
+// snapshot slot and graph nodes from leaking forever.
+//
+// The sweep is evidence-and-clock driven: it resumes any teardown interrupted
+// by a restart, then reconciles every known family, so an unreachable root
+// waits out its availability grace instead of being evicted on one failed
+// stat, and a genuinely removed one is forgotten only after its removal grace
+// expires. The old check could tell neither apart.
+func startReconcileJanitor(
+	mi *indexer.MultiIndexer,
+	lifecycle *indexer.CheckoutLifecycle,
+	interval time.Duration,
+	logger *zap.Logger,
+) func() {
 	if mi == nil || interval <= 0 {
 		logger.Info("daemon: reconcile janitor disabled")
 		return func() {}
@@ -690,10 +714,18 @@ func startReconcileJanitor(mi *indexer.MultiIndexer, interval time.Duration, log
 					runtimeactivity.Begin("reconcile")
 					defer runtimeactivity.End("reconcile")
 
-					gced := mi.GCVanishedWorktrees()
-					if len(gced) > 0 {
-						logger.Info("janitor: pruned vanished worktrees",
-							zap.Int("count", len(gced)))
+					swept := 0
+					if lifecycle != nil {
+						report, err := lifecycle.Sweep(context.Background())
+						if err != nil {
+							logger.Warn("janitor: checkout sweep incomplete", zap.Error(err))
+						}
+						swept = report.Removed
+						if swept > 0 {
+							logger.Info("janitor: pruned vanished checkouts",
+								zap.Int("count", swept),
+								zap.Int("families", report.Families))
+						}
 					}
 					results := mi.ReconcileAll()
 					reconciled := 0
@@ -702,7 +734,7 @@ func startReconcileJanitor(mi *indexer.MultiIndexer, interval time.Duration, log
 							reconciled += r.StaleFileCount + r.DeletedFileCount
 						}
 					}
-					return len(gced), reconciled
+					return swept, reconciled
 				}()
 				// Only a tick that changed the graph schedules reclamation. The
 				// process-wide quiet gate postpones it if another subsystem is busy.

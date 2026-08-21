@@ -137,6 +137,11 @@ type SharedServer struct {
 	MCP          *gortexmcp.Server
 	ConfigMgr    *config.ConfigManager
 	Overlays     *daemon.OverlayManager
+	// CheckoutLifecycle owns every checkout lifecycle side effect — track,
+	// forget, reload, the periodic sweep — for every entry point wired to
+	// this stack. Nil in single-repo standalone, where there is no
+	// multi-repo indexer to own a tracked set.
+	CheckoutLifecycle *indexer.CheckoutLifecycle
 	// StorePath is the graph store file this stack actually opened: the
 	// caller's BackendPath expanded to an absolute path, or the platform
 	// default when it was empty. Entry points publish it so out-of-band
@@ -580,6 +585,23 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 		}
 	}
 	s.MultiIndexer = mi
+	// One reconciler per stack, built here so every entry point — the daemon
+	// controller, the MCP tools, the auto-index path, the janitor — drives
+	// the same identities, clocks and cleanup hooks. It binds to the store's
+	// catalog when the backend has one and degrades to the plain
+	// index/watcher/config side effects when it does not.
+	if mi != nil {
+		lifecycle, lerr := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{
+			MultiIndexer:  mi,
+			ConfigManager: cm,
+			Graph:         g,
+			Logger:        logger,
+		})
+		if lerr != nil {
+			return nil, fmt.Errorf("build checkout lifecycle: %w", lerr)
+		}
+		s.CheckoutLifecycle = lifecycle
+	}
 	// Appended after backendCleanup but before MCP background drain. LIFO
 	// teardown therefore drains background work first, then closes per-repo
 	// parser workers, then the standalone Indexer, and only then the graph and
@@ -604,6 +626,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	multiOpts := []gortexmcp.MultiRepoOptions{{
 		MultiIndexer:        mi,
 		ConfigManager:       cm,
+		CheckoutLifecycle:   s.CheckoutLifecycle,
 		ActiveProject:       cfg.ActiveProject,
 		ScopeWorkspace:      cfg.ScopeWorkspace,
 		ScopeProject:        cfg.ScopeProject,
@@ -622,6 +645,10 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	// detached store-writing goroutines (analysis-generation prune) before
 	// the backend store closes underneath them.
 	s.cleanup = append(s.cleanup, srv.DrainBackground)
+	// The server is the session/analysis fan-out, so it can only be bound
+	// after it exists. Every lifecycle side effect — including the ones the
+	// daemon controller drives — reaches sessions through it from here on.
+	s.CheckoutLifecycle.SetNotifier(srv)
 	srv.SetArchitecture(conf.Architecture)
 	srv.SetEventRules(conf.Events.Rules)
 	srv.SetArtifacts(conf.Artifacts)
