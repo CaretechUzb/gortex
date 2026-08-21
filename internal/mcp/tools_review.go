@@ -254,7 +254,7 @@ func (s *Server) handleSiblingDiffContext(ctx context.Context, req mcp.CallToolR
 	}
 
 	// Enumerate the whole changeset.
-	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
+	diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -555,7 +555,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 		changedFiles []string
 	)
 	if diffText == "" {
-		diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
+		diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -564,7 +564,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, repoPrefix, allowedRepos)
-		impact = s.reviewImpact(diff.ChangedSymbols)
+		impact = s.reviewImpact(ctx, diff.ChangedSymbols)
 		changedFiles = diff.ChangedFiles
 	}
 
@@ -575,7 +575,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 	gen := s.reviewLLMGenWithUsage(useLLM)
 
 	suppStore, suppRepoKey := s.reviewSuppressions()
-	report, err := review.RunWithUsage(ctx, s.graph, gen, s.reviewPricing(), review.Options{
+	report, err := review.RunWithUsage(ctx, s.readerFor(ctx), gen, s.reviewPricing(), review.Options{
 		RepoRoot:        repoRoot,
 		RepoPrefix:      repoPrefix,
 		CoverageKnown:   s.coverageKnownForDiff(repoPrefix, changedFiles),
@@ -752,6 +752,9 @@ func (s *Server) testLangsIndexed(repoPrefix string) map[string]bool {
 	if v, ok := s.testIndexProbe.Load(repoPrefix); ok {
 		return v.(map[string]bool)
 	}
+	// The probe is a per-repo cache shared by every session, so it scans the
+	// base corpus even when the calling request carries an overlay: reading
+	// one session's buffers here would answer every other session from them.
 	var nodes []*graph.Node
 	if repoPrefix != "" {
 		nodes = s.graph.GetRepoNodes(repoPrefix)
@@ -805,7 +808,7 @@ func (s *Server) coverageKnownForDiff(repoPrefix string, changedFiles []string) 
 
 // reviewImpact builds the per-changed-symbol blast-radius map review.Run uses to
 // rank per-file risk. A symbol whose impact analysis is empty is omitted.
-func (s *Server) reviewImpact(changed []analysis.ChangedSymbol) map[string]*analysis.ImpactResult {
+func (s *Server) reviewImpact(ctx context.Context, changed []analysis.ChangedSymbol) map[string]*analysis.ImpactResult {
 	if len(changed) == 0 {
 		return nil
 	}
@@ -816,7 +819,7 @@ func (s *Server) reviewImpact(changed []analysis.ChangedSymbol) map[string]*anal
 		if cs.ID == "" {
 			continue
 		}
-		if ir := analysis.AnalyzeImpact(s.graph, []string{cs.ID}, communities, processes); ir != nil {
+		if ir := analysis.AnalyzeImpact(s.readerFor(ctx), []string{cs.ID}, communities, processes); ir != nil {
 			out[cs.ID] = ir
 		}
 	}
@@ -1093,7 +1096,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 		ids      []string
 	)
 	if diffText == "" {
-		d, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
+		d, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -1103,7 +1106,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, repoPrefix, allowedRepos)
-		impact = s.reviewImpact(diff.ChangedSymbols)
+		impact = s.reviewImpact(ctx, diff.ChangedSymbols)
 		for _, cs := range diff.ChangedSymbols {
 			if cs.ID != "" {
 				ids = append(ids, cs.ID)
@@ -1123,7 +1126,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	useLLM := requestBoolDefault(req, "use_llm", false)
 	gen := s.reviewLLMGenWithUsage(useLLM)
 	suppStore, suppRepoKey := s.reviewSuppressions()
-	report, err := review.RunWithUsage(ctx, s.graph, gen, s.reviewPricing(), review.Options{
+	report, err := review.RunWithUsage(ctx, s.readerFor(ctx), gen, s.reviewPricing(), review.Options{
 		RepoRoot:        repoRoot,
 		RepoPrefix:      repoPrefix,
 		CoverageKnown:   len(testTargets) > 0 || (diff != nil && s.coverageKnownForDiff(repoPrefix, diff.ChangedFiles)),
@@ -1149,8 +1152,9 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	// Gate: guard + architecture rules.
 	var guards []analysis.GuardViolation
 	if len(ids) > 0 && (s.hasGuardRules(ids) || !s.architecture.IsEmpty()) {
-		guards = s.evaluateGuards(ids)
-		guards = append(guards, analysis.EvaluateArchitecture(s.graph, s.architecture, ids)...)
+		guardReader := s.readerFor(ctx)
+		guards = s.evaluateGuards(guardReader, ids)
+		guards = append(guards, analysis.EvaluateArchitecture(guardReader, s.architecture, ids)...)
 	}
 
 	// Verdict = the review report's worst-of, upgraded to BLOCK on any contract
@@ -1174,7 +1178,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 
 	// Privacy-safe risk receipt over the whole changeset.
 	scrub := requestBoolDefault(req, "scrub", false)
-	receipt := s.reviewReceipt(ids, diff, contracts, guards, scrub)
+	receipt := s.reviewReceipt(ctx, ids, diff, contracts, guards, scrub)
 
 	env := reviewEnvelope{
 		Verdict:             string(verdict),
@@ -1215,7 +1219,7 @@ func (s *Server) classifyChangedSymbols(ctx context.Context, diff *analysis.Diff
 		return []classifiedSymbol{}
 	}
 	reader := s.readerFor(ctx)
-	view, _ := s.reviewChangeView(diff)
+	view, _ := s.reviewChangeView(ctx, diff)
 	out := make([]classifiedSymbol, 0, len(diff.ChangedSymbols))
 	for _, cs := range diff.ChangedSymbols {
 		hunk := review.SymbolHunk(reader, view, cs)
@@ -1238,12 +1242,12 @@ func (s *Server) classifyChangedSymbols(ctx context.Context, diff *analysis.Diff
 
 // reviewChangeView builds the ChangeView the classify/pack rendering reads its
 // diff-hunk text from. Errors degrade to a nil view (the renderers tolerate it).
-func (s *Server) reviewChangeView(diff *analysis.DiffResult) (*review.ChangeView, *analysis.DiffResult) {
+func (s *Server) reviewChangeView(ctx context.Context, diff *analysis.DiffResult) (*review.ChangeView, *analysis.DiffResult) {
 	repoRoot := ""
 	if s.indexer != nil {
 		repoRoot = s.indexer.RootPath()
 	}
-	view, err := review.BuildChangeView(s.graph, repoRoot, s.diffJoinPrefix(repoRoot), "", "")
+	view, err := review.BuildChangeView(s.readerFor(ctx), repoRoot, s.diffJoinPrefix(repoRoot), "", "")
 	if err != nil {
 		return nil, diff
 	}
@@ -1339,6 +1343,8 @@ func (s *Server) highRiskPreviews(ctx context.Context, diff *analysis.DiffResult
 // yields the symbol's broken-callers / impact preview without changing disk. Only
 // nodes with a known range under the indexed root are eligible.
 func (s *Server) identityEditForSymbol(id string) (lsp.WorkspaceEdit, bool) {
+	// Base read on purpose: this range is the "before" side the simulation
+	// is compared against.
 	n := s.graph.GetNode(id)
 	if n == nil || n.StartLine <= 0 || n.FilePath == "" {
 		return lsp.WorkspaceEdit{}, false
@@ -1380,7 +1386,7 @@ func (s *Server) identityEditForSymbol(id string) (lsp.WorkspaceEdit, bool) {
 // reviewReceipt scores PR-level risk over the changeset and projects it to the
 // privacy-safe receipt. A contract break or guard violation flags the
 // out-of-band hard blocker so the receipt's merge_blocker reflects the gates.
-func (s *Server) reviewReceipt(ids []string, diff *analysis.DiffResult, ci *contractImpact, guards []analysis.GuardViolation, scrub bool) analysis.ReviewReceipt {
+func (s *Server) reviewReceipt(ctx context.Context, ids []string, diff *analysis.DiffResult, ci *contractImpact, guards []analysis.GuardViolation, scrub bool) analysis.ReviewReceipt {
 	var changedFiles []string
 	if diff != nil {
 		changedFiles = diff.ChangedFiles
@@ -1390,7 +1396,7 @@ func (s *Server) reviewReceipt(ids []string, diff *analysis.DiffResult, ci *cont
 	if communities != nil {
 		nodeToComm = communities.NodeToComm
 	}
-	result := analysis.ScorePRRisk(s.graph, analysis.PRRiskInput{
+	result := analysis.ScorePRRisk(s.readerFor(ctx), analysis.PRRiskInput{
 		SymbolIDs:    ids,
 		ChangedFiles: changedFiles,
 		NodeToComm:   nodeToComm,
@@ -1407,7 +1413,7 @@ func (s *Server) buildReviewPack(ctx context.Context, diff *analysis.DiffResult,
 	if diff == nil {
 		return nil
 	}
-	view, _ := s.reviewChangeView(diff)
+	view, _ := s.reviewChangeView(ctx, diff)
 	return review.BuildReviewPack(s.readerFor(ctx), view, diff, review.MergeImpact(impact), budget)
 }
 

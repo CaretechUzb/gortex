@@ -192,6 +192,79 @@ func TestFindClonesReflectsOverlay(t *testing.T) {
 	assert.Len(t, srv.graph.AllEdges(), 6, "the overlay request must not mutate the base store")
 }
 
+const (
+	rollupFile  = "svc/handler.go"
+	rollupSymID = rollupFile + "::Handle"
+)
+
+// rollupKeys drives analyze health_score with a repo rollup and returns
+// the rollup keys it reported.
+func rollupKeys(t *testing.T, s *Server, ctx context.Context) []string {
+	t.Helper()
+	res, err := s.handleAnalyzeHealthScore(ctx, makeReq("analyze", map[string]any{"roll_up": "repo"}))
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.False(t, res.IsError, "analyze health_score errored: %s", toolResultText(res))
+	var payload struct {
+		Rollup []struct {
+			Key     string `json:"key"`
+			Symbols int    `json:"symbols"`
+		} `json:"rollup"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(toolResultText(res)), &payload))
+	out := make([]string, 0, len(payload.Rollup))
+	for _, row := range payload.Rollup {
+		require.Equal(t, 1, row.Symbols, "the fixture grades exactly one symbol per key")
+		out = append(out, row.Key)
+	}
+	return out
+}
+
+// TestHealthScoreRepoRollupReadsRequestReader pins the repo rollup key to
+// the request's reader. The key is the repo prefix stamped on the file
+// node that owns a row's path, and the request's reader — not the
+// server's store — is the authority on which repo owns that path: a
+// session view keeps its own base, where the file has already been
+// re-homed. Reading the key off the server's store keys the aggregate off
+// an attribution the caller never asked about.
+func TestHealthScoreRepoRollupReadsRequestReader(t *testing.T) {
+	store := func(filePrefix string) *graph.Graph {
+		g := graph.New()
+		g.AddNode(&graph.Node{
+			ID: rollupFile, Name: "handler.go", Kind: graph.KindFile,
+			FilePath: rollupFile, RepoPrefix: filePrefix,
+		})
+		g.AddNode(&graph.Node{
+			ID: rollupSymID, Name: "Handle", Kind: graph.KindFunction,
+			FilePath: rollupFile, RepoPrefix: "svc", StartLine: 10,
+		})
+		return g
+	}
+	base := store("svc")
+	srv := &Server{
+		graph:      base,
+		session:    newSessionState(),
+		sessions:   newSessionMap(),
+		tokenStats: &tokenStats{},
+		symHistory: &symbolHistory{entries: make(map[string][]SymbolModification)},
+		toolScopes: newScopeRegistry(),
+	}
+
+	assert.Equal(t, []string{"svc"}, rollupKeys(t, srv, context.Background()),
+		"a plain request keys the rollup off the indexed file node")
+
+	viewCtx := WithOverlayView(
+		context.Background(),
+		graph.NewOverlaidView(store("billing"), graph.NewOverlayLayer()),
+	)
+	assert.Equal(t, []string{"billing"}, rollupKeys(t, srv, viewCtx),
+		"the rollup must key off the file node the request's reader owns")
+
+	require.NotNil(t, base.GetNode(rollupFile))
+	assert.Equal(t, "svc", base.GetNode(rollupFile).RepoPrefix,
+		"the request must not mutate the base store")
+}
+
 // TestSidecarRowsDropCapabilityUnderOverlay pins the conservative
 // contract for the coverage and release sidecars: the capability
 // assertion runs on the request reader, so an overlay-active request

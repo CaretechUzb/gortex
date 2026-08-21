@@ -2,10 +2,16 @@ package mcp
 
 import (
 	"context"
+	"path"
+	"reflect"
+	"strings"
 	"testing"
+
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search"
 )
 
 const (
@@ -149,5 +155,189 @@ func TestWhyEntriesReadThroughRequestReader(t *testing.T) {
 	}
 	if entries[0].Text != "buffer text" {
 		t.Fatalf("whyEntriesFor served base's rationale text %q, want the buffer's", entries[0].Text)
+	}
+}
+
+const (
+	navBarrelFl  = "src/index.ts"
+	navFileFwdFl = "src/barrel.ts"
+	navImplFl    = "src/impl.ts"
+	navAltFl     = "src/alt.ts"
+	navBarrelID  = navBarrelFl + "::persist"
+	navFileFwdID = navFileFwdFl + "::persist"
+	navImplID    = navImplFl + "::persist"
+	navAltID     = navAltFl + "::persist"
+
+	// The two consumer sites that make the canonicalization observable in a
+	// find_usages answer: one calls the indexed declaration, the other calls
+	// the declaration the buffer forwards to.
+	navUseImplFl = "src/use_impl.ts"
+	navUseAltFl  = "src/use_alt.ts"
+	navUseImplID = navUseImplFl + "::useImpl"
+	navUseAltID  = navUseAltFl + "::useAlt"
+)
+
+// navBarrelServer wires the two shapes find_usages canonicalizes through
+// before it answers: a barrel binding that exists as its own re-export
+// node (src/index.ts::persist) and a file-level forward that mints no
+// node of its own (src/barrel.ts::persist). The layer is what one editor
+// session would push: the barrel buffer now forwards to src/alt.ts, and
+// the src/impl.ts buffer no longer declares persist at all.
+func navBarrelServer(t *testing.T) (*Server, *graph.OverlayLayer) {
+	t.Helper()
+	tsFile := func(p string) *graph.Node {
+		return &graph.Node{ID: p, Name: path.Base(p), Kind: graph.KindFile, FilePath: p, RepoPrefix: navRepo, Language: "typescript"}
+	}
+	reExport := func(id, file string) *graph.Node {
+		return &graph.Node{
+			ID: id, Name: "persist", Kind: graph.KindFunction, FilePath: file, RepoPrefix: navRepo,
+			Meta: map[string]any{"reexport": true},
+		}
+	}
+
+	base := graph.New()
+	base.AddNode(tsFile(navBarrelFl))
+	base.AddNode(tsFile(navFileFwdFl))
+	base.AddNode(tsFile(navImplFl))
+	base.AddNode(tsFile(navAltFl))
+	base.AddNode(tsFile(navUseImplFl))
+	base.AddNode(tsFile(navUseAltFl))
+	base.AddNode(&graph.Node{ID: navImplID, Name: "persist", Kind: graph.KindFunction, FilePath: navImplFl, RepoPrefix: navRepo})
+	base.AddNode(&graph.Node{ID: navAltID, Name: "persist", Kind: graph.KindFunction, FilePath: navAltFl, RepoPrefix: navRepo})
+	base.AddNode(reExport(navBarrelID, navBarrelFl))
+	base.AddEdge(&graph.Edge{From: navBarrelID, To: navImplID, Kind: graph.EdgeReExports, FilePath: navBarrelFl, Line: 1})
+	// One consumer per declaration, both outside the buffered files so only
+	// the canonicalization target decides which one an answer carries.
+	base.AddNode(&graph.Node{ID: navUseImplID, Name: "useImpl", Kind: graph.KindFunction, FilePath: navUseImplFl, RepoPrefix: navRepo})
+	base.AddNode(&graph.Node{ID: navUseAltID, Name: "useAlt", Kind: graph.KindFunction, FilePath: navUseAltFl, RepoPrefix: navRepo})
+	base.AddEdge(&graph.Edge{From: navUseImplID, To: navImplID, Kind: graph.EdgeCalls, FilePath: navUseImplFl, Line: 5})
+	base.AddEdge(&graph.Edge{From: navUseAltID, To: navAltID, Kind: graph.EdgeCalls, FilePath: navUseAltFl, Line: 5})
+	// The file-level forward carries only the pre-resolution import target,
+	// so the binding id src/barrel.ts::persist has no node behind it.
+	base.AddEdge(&graph.Edge{
+		From: navFileFwdFl, To: "unresolved::import::./impl::persist",
+		Kind: graph.EdgeReExports, FilePath: navFileFwdFl, Line: 1,
+	})
+
+	layer := graph.NewOverlayLayer()
+	layer.MarkFile(navBarrelFl, false)
+	layer.AddNode(navBarrelFl, reExport(navBarrelID, navBarrelFl))
+	layer.AddEdge(&graph.Edge{From: navBarrelID, To: navAltID, Kind: graph.EdgeReExports, FilePath: navBarrelFl, Line: 1})
+	layer.MarkFile(navImplFl, false)
+	layer.MarkRemoved("persist", navImplID)
+
+	eng := query.NewEngine(base)
+	eng.SetSearch(search.NewNull())
+	return NewServer(eng, base, nil, nil, zap.NewNop(), nil), layer
+}
+
+// barrelUsageIDs drives find_usages over one barrel id and returns the
+// consumer ids the answer carries.
+func barrelUsageIDs(t *testing.T, s *Server, ctx context.Context, id string) []string {
+	t.Helper()
+	res, err := s.handleFindUsages(ctx, makeReq("find_usages", map[string]any{
+		"id": id, "min_tier": "text_matched",
+	}))
+	if err != nil {
+		t.Fatalf("find_usages(%s): %v", id, err)
+	}
+	if res.IsError {
+		// A binding that canonicalizes onto nothing is a clean not-found,
+		// not a failure — it carries no usages, which is the answer.
+		return nil
+	}
+	text := toolResultText(res)
+	var out []string
+	for _, candidate := range []string{navUseImplID, navUseAltID} {
+		if strings.Contains(text, candidate) {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+// TestReExportCanonicalizationReadsThroughRequestReader drives find_usages
+// itself over the two barrel resolve-through shapes: an overlay-active call
+// answers with the consumers of the buffer's forward instead of the indexed
+// one, and stops canonicalizing onto a declaration the buffer deleted rather
+// than answering with the usages of a symbol that is gone. Driving the
+// handler is what makes a revert to the base store fail here — calling the
+// helpers with an explicit reader would only catch a type change.
+func TestReExportCanonicalizationReadsThroughRequestReader(t *testing.T) {
+	server, layer := navBarrelServer(t)
+	plain := context.Background()
+	overlaid := overlayCtx(t, server, layer)
+
+	// Re-export node: base merges impl's usages, the buffer forwards to alt.
+	if got := barrelUsageIDs(t, server, plain, navBarrelID); !reflect.DeepEqual(got, []string{navUseImplID}) {
+		t.Fatalf("find_usages(%s) over the base store = %v, want [%s]", navBarrelID, got, navUseImplID)
+	}
+	if got := barrelUsageIDs(t, server, overlaid, navBarrelID); !reflect.DeepEqual(got, []string{navUseAltID}) {
+		t.Fatalf("find_usages(%s) over the request reader = %v, want the buffer's forward's consumer [%s]", navBarrelID, got, navUseAltID)
+	}
+
+	// File-level forward: base canonicalizes onto impl's declaration and
+	// answers with its consumer; the buffer deleted that declaration, so the
+	// overlay canonicalizes onto nothing and answers with no usages at all.
+	if got := barrelUsageIDs(t, server, plain, navFileFwdID); !reflect.DeepEqual(got, []string{navUseImplID}) {
+		t.Fatalf("find_usages(%s) over the base store = %v, want [%s]", navFileFwdID, got, navUseImplID)
+	}
+	if got := barrelUsageIDs(t, server, overlaid, navFileFwdID); len(got) != 0 {
+		t.Fatalf("find_usages(%s) answered with the usages of a declaration the buffer deleted: %v", navFileFwdID, got)
+	}
+
+	// The base store must not have been touched by the overlay request.
+	if n := server.graph.GetNode(navImplID); n == nil {
+		t.Fatal("the overlay request removed the declaration from the base store")
+	}
+	if edges := server.graph.GetOutEdges(navBarrelID); len(edges) != 1 || edges[0].To != navImplID {
+		t.Fatalf("the overlay request rewrote the base store's forward: %+v", edges)
+	}
+}
+
+// TestGraphExportReadsThroughRequestReader drives the export_graph handler:
+// an overlay-active export writes the buffer's symbols and omits the ones the
+// buffer deleted, instead of shipping a snapshot of the indexed tree the
+// caller has already moved past. Going through the handler is what makes a
+// revert of its reader wiring fail here.
+func TestGraphExportReadsThroughRequestReader(t *testing.T) {
+	server, layer := navOverlayServer(t)
+
+	render := func(ctx context.Context, format string) string {
+		t.Helper()
+		res, err := server.handleExportGraph(ctx, makeReq("export_graph", map[string]any{"format": format}))
+		if err != nil {
+			t.Fatalf("export_graph(%s): %v", format, err)
+		}
+		if res.IsError {
+			t.Fatalf("export_graph(%s) errored: %s", format, toolResultText(res))
+		}
+		return toolResultText(res)
+	}
+
+	for _, format := range []string{"cypher", "graphml"} {
+		base := render(context.Background(), format)
+		if !strings.Contains(base, navDroppedID) {
+			t.Fatalf("%s export over the base store omitted %s:\n%s", format, navDroppedID, base)
+		}
+		if strings.Contains(base, navFreshID) {
+			t.Fatalf("%s export over the base store invented %s:\n%s", format, navFreshID, base)
+		}
+
+		overlaid := render(overlayCtx(t, server, layer), format)
+		if strings.Contains(overlaid, navDroppedID) {
+			t.Fatalf("%s export shipped a symbol the buffer deleted:\n%s", format, overlaid)
+		}
+		if !strings.Contains(overlaid, navFreshID) {
+			t.Fatalf("%s export omitted the buffer-only symbol %s:\n%s", format, navFreshID, overlaid)
+		}
+	}
+
+	// The base store must not have been touched by the overlay request.
+	if n := server.graph.GetNode(navFreshID); n != nil {
+		t.Fatalf("the overlay export wrote a buffer symbol into the base store: %+v", n)
+	}
+	if n := server.graph.GetNode(navDroppedID); n == nil {
+		t.Fatal("the overlay export removed a symbol from the base store")
 	}
 }

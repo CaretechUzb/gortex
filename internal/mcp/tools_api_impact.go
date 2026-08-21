@@ -253,7 +253,7 @@ func (s *Server) buildAPIImpactReport(ctx context.Context, p contracts.Contract,
 	// Blast radius + execution flows from the real impact analysis.
 	var impact *analysis.ImpactResult
 	if p.SymbolID != "" {
-		impact = analysis.AnalyzeImpact(s.graph, []string{p.SymbolID}, s.getCommunities(), s.getProcesses())
+		impact = analysis.AnalyzeImpact(s.readerFor(ctx), []string{p.SymbolID}, s.getCommunities(), s.getProcesses())
 	}
 	if impact != nil {
 		rep.ExecutionFlows = impact.AffectedProcesses

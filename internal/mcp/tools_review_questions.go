@@ -227,7 +227,7 @@ func (s *Server) resolveReviewQuestionTargets(ctx context.Context, req mcp.CallT
 		if repoRoot == "" {
 			return nil, errReviewQuestionsNoRoot
 		}
-		diff, derr := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, "compare", base)
+		diff, derr := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, "compare", base)
 		if derr != nil {
 			return nil, derr
 		}

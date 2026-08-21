@@ -105,7 +105,7 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 	blame := blameRowsByID(reader)
 	authorCounts := map[string]int{}
 	for _, f := range changedFiles {
-		for _, n := range analysis.JoinFileNodes(s.graph, repoPrefix, f) {
+		for _, n := range analysis.JoinFileNodes(reader, repoPrefix, f) {
 			if la, ok := lastAuthoredFrom(blame, n); ok && la.Email != "" {
 				authorCounts[normalizeReviewer(la.Email)]++
 			}
@@ -117,7 +117,7 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 	// candidate experts; the count is the number of co-change links.
 	coChangeCounts := map[string]int{}
 	for _, f := range changedFiles {
-		for partner := range s.coChangeScores(analysis.JoinFilePath(s.graph, repoPrefix, f)) {
+		for partner := range s.coChangeScores(analysis.JoinFilePath(reader, repoPrefix, f)) {
 			for _, n := range reader.GetFileNodes(partner) {
 				if la, ok := lastAuthoredFrom(blame, n); ok && la.Email != "" {
 					coChangeCounts[normalizeReviewer(la.Email)]++
@@ -171,7 +171,7 @@ func (s *Server) resolveReviewerChangeset(ctx context.Context, req mcp.CallToolR
 		if repoRoot == "" {
 			return nil, nil, fmt.Errorf("could not resolve a repository root for the base diff")
 		}
-		diff, derr := analysis.MapGitDiff(s.graph, repoRoot, s.diffJoinPrefix(repoRoot), "compare", base)
+		diff, derr := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, s.diffJoinPrefix(repoRoot), "compare", base)
 		if derr != nil {
 			return nil, nil, fmt.Errorf("git diff against %q failed: %v", base, derr)
 		}

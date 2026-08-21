@@ -86,8 +86,9 @@ func (s *Server) handleGenerateWiki(ctx context.Context, req mcp.CallToolRequest
 	}
 	// reader serves the node / edge reads the wiki renders, so an
 	// overlay-active caller documents its own buffers. The community,
-	// process, hotspot and cycle passes below stay on the base store:
-	// they are whole-graph analyses, not per-request reads.
+	// process, hotspot and cycle passes below build their own indexes over a
+	// graph.Store, so those four sections are computed over the base corpus
+	// even when the request carries an overlay view.
 	reader := s.readerFor(ctx)
 	communities := analysis.DetectCommunities(g)
 	processes := analysis.DiscoverProcesses(g)

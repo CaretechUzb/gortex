@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -118,6 +119,7 @@ func TestFilterTextMatchesByResolvedScope_BelowRepoRoot(t *testing.T) {
 			"fixture invariant: several tracked repos mint prefixed node ids")
 
 		got := srv.filterTextMatchesByResolvedScope(
+			context.Background(),
 			[]trigram.Match{{Path: "beta/pkg/sub/main.go", Line: 3, Text: "// marker"}},
 			ResolvedScope{WorkspaceID: "shared", RepoAllow: map[string]bool{"beta": true}},
 		)
@@ -135,6 +137,7 @@ func TestFilterTextMatchesByResolvedScope_BelowRepoRoot(t *testing.T) {
 			"fixture invariant: a lone repo's node ids carry its prefix")
 
 		got := srv.filterTextMatchesByResolvedScope(
+			context.Background(),
 			[]trigram.Match{{Path: "solo/pkg/sub/main.go", Line: 3, Text: "// marker"}},
 			ResolvedScope{WorkspaceID: "shared", RepoAllow: map[string]bool{"solo": true}},
 		)

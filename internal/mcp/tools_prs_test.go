@@ -186,7 +186,7 @@ func TestChangedSymbolsForFiles_RepoPrefixJoin(t *testing.T) {
 	g.AddNode(&graph.Node{ID: prefixedID, Kind: graph.KindFunction, Name: "ValidateToken", FilePath: "myrepo/internal/auth/login.go", StartLine: 1, EndLine: 10})
 	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil)
 
-	files, nodes := srv.changedSymbolsForFiles("myrepo", []string{"internal/auth/login.go"})
+	files, nodes := srv.changedSymbolsForFiles(context.Background(), "myrepo", []string{"internal/auth/login.go"})
 	require.Equal(t, []string{"internal/auth/login.go"}, files,
 		"the reported changed files keep the forge-relative paths")
 	require.Len(t, nodes, 1, "the prefixed retry must find the symbol")
@@ -194,11 +194,11 @@ func TestChangedSymbolsForFiles_RepoPrefixJoin(t *testing.T) {
 
 	// Without a prefix the relative path misses — the unprefixed single-repo
 	// graph shape keeps its exact-match behavior.
-	_, nodes = srv.changedSymbolsForFiles("", []string{"internal/auth/login.go"})
+	_, nodes = srv.changedSymbolsForFiles(context.Background(), "", []string{"internal/auth/login.go"})
 	require.Empty(t, nodes)
 
 	// Already-prefixed input hits raw and is not double-prefixed.
-	_, nodes = srv.changedSymbolsForFiles("myrepo", []string{"myrepo/internal/auth/login.go"})
+	_, nodes = srv.changedSymbolsForFiles(context.Background(), "myrepo", []string{"myrepo/internal/auth/login.go"})
 	require.Len(t, nodes, 1)
 	require.Equal(t, prefixedID, nodes[0].ID)
 }

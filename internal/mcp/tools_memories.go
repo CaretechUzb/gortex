@@ -173,7 +173,7 @@ func (s *Server) handleStoreMemory(ctx context.Context, req mcp.CallToolRequest)
 			patch.SupersededBy = &supersededBy
 		}
 		if !noAutolink && body != "" {
-			patch.AddLinks = autoLinkBody(body, s.graph, sessionWorkspaceIDOrEmpty(s, ctx), defaultAutoLinkOptions())
+			patch.AddLinks = autoLinkBody(body, s.readerFor(ctx), sessionWorkspaceIDOrEmpty(s, ctx), defaultAutoLinkOptions())
 		}
 		updated, err := store.Update(id, patch)
 		if err != nil {
@@ -217,7 +217,7 @@ func (s *Server) handleStoreMemory(ctx context.Context, req mcp.CallToolRequest)
 
 	var autoLinks []string
 	if !noAutolink && body != "" {
-		autoLinks = autoLinkBody(body, s.graph, workspaceID, defaultAutoLinkOptions())
+		autoLinks = autoLinkBody(body, s.readerFor(ctx), workspaceID, defaultAutoLinkOptions())
 	}
 
 	entry := persistence.MemoryEntry{

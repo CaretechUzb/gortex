@@ -20,7 +20,9 @@ import (
 func (s *Server) smartContextSections(args map[string]any, relPath string) config.SmartContextSections {
 	cfg := config.SmartContextConfig{}
 	if s.configManager != nil {
-		cfg = s.configManager.GetRepoConfig(repoPrefixForPath(s, relPath)).MCP.SmartContext
+		// Base read: the repo prefix keys a config lookup, and config is a
+		// property of the indexed repo, not of a session's edits.
+		cfg = s.configManager.GetRepoConfig(repoPrefixForPath(s.graph, relPath)).MCP.SmartContext
 	}
 	return cfg.Resolve(
 		boolPtrArg(args, "include_call_paths"),
@@ -42,7 +44,7 @@ func boolPtrArg(args map[string]any, key string) *bool {
 // assembled pack under result["in_pack"]. Only sections with content are
 // written, so the default pack stays untouched; later passes attach the flow
 // spine and confidence verdict to the same block.
-func (s *Server) attachInPackSections(result map[string]any, sections config.SmartContextSections, symbols []*graph.Node) {
+func (s *Server) attachInPackSections(ctx context.Context, result map[string]any, sections config.SmartContextSections, symbols []*graph.Node) {
 	block := map[string]any{}
 	if sections.CallPaths {
 		if cp := s.inPackCallPaths(symbols); len(cp) > 0 {
@@ -50,7 +52,7 @@ func (s *Server) attachInPackSections(result map[string]any, sections config.Sma
 		}
 	}
 	if sections.Flows {
-		if fl := s.inPackFlows(symbols); fl != nil {
+		if fl := s.inPackFlows(ctx, symbols); fl != nil {
 			block["flows"] = fl
 		}
 	}
@@ -64,12 +66,12 @@ func (s *Server) attachInPackSections(result map[string]any, sections config.Sma
 // hits — call sites whose target the static graph cannot resolve, where the
 // flow would continue at runtime. Returns nil when there is no multi-node spine
 // and no boundary to announce.
-func (s *Server) inPackFlows(symbols []*graph.Node) map[string]any {
-	if s.graph == nil || len(symbols) == 0 || symbols[0] == nil {
+func (s *Server) inPackFlows(ctx context.Context, symbols []*graph.Node) map[string]any {
+	if s.readerFor(ctx) == nil || len(symbols) == 0 || symbols[0] == nil {
 		return nil
 	}
 	budget := s.inPackBudget()
-	spine, boundaries := s.flowSpine(symbols[0].ID, budget.FlowDepth)
+	spine, boundaries := s.flowSpine(ctx, symbols[0].ID, budget.FlowDepth)
 	if len(boundaries) > budget.MaxBoundaries {
 		boundaries = boundaries[:budget.MaxBoundaries]
 	}
@@ -396,14 +398,18 @@ func slashDir(p string) string {
 // edges (smallest target id first, for determinism), returning the chain of
 // node ids it traverses and the dynamic-dispatch boundaries — out-edges to
 // unresolved targets — encountered along the way.
-func (s *Server) flowSpine(focus string, maxDepth int) (spine []string, boundaries []map[string]any) {
+func (s *Server) flowSpine(ctx context.Context, focus string, maxDepth int) (spine []string, boundaries []map[string]any) {
+	g := s.readerFor(ctx)
+	if g == nil {
+		return nil, nil
+	}
 	visited := map[string]bool{focus: true}
 	bseen := map[string]bool{}
 	spine = []string{focus}
 	cur := focus
 	for depth := 0; depth < maxDepth; depth++ {
 		next := ""
-		for _, e := range s.graph.GetOutEdges(cur) {
+		for _, e := range g.GetOutEdges(cur) {
 			if e == nil || (e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences) {
 				continue
 			}
@@ -451,6 +457,9 @@ func (s *Server) inPackCallPaths(symbols []*graph.Node) []map[string]any {
 			roots = append(roots, n.ID)
 		}
 	}
+	// callpath.New builds its traversal state over a graph.Store, so these
+	// paths are computed over the base corpus even when the request carries
+	// an overlay view.
 	anchored := callpath.New(s.graph).PathsToAnchor(roots, anchor, callpath.Options{MaxDepth: 8})
 	if len(anchored) == 0 {
 		return nil

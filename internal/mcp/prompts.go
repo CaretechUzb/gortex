@@ -82,7 +82,7 @@ func (s *Server) handlePromptPreCommit(ctx context.Context, req mcp.GetPromptReq
 		return promptError(rootErr.Error()), nil
 	}
 
-	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, "main")
+	diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, "main")
 	if err != nil {
 		return promptError("Could not analyze git changes: " + err.Error()), nil
 	}

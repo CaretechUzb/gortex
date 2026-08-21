@@ -188,7 +188,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 		if repoRoot == "" {
 			return mcp.NewToolResultError("could not resolve a repository root for the changeset diff"), nil
 		}
-		d, err := analysis.MapGitDiff(s.graph, repoRoot, s.diffJoinPrefix(repoRoot), scope, baseRef)
+		d, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, s.diffJoinPrefix(repoRoot), scope, baseRef)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -220,7 +220,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 	if wantVerify {
 		changes := changedSymbolsToSignatureChanges(s.readerFor(ctx), diff.ChangedSymbols)
 		if len(changes) > 0 {
-			verifyResult = analysis.VerifyChanges(s.graph, s.engineFor(ctx), changes)
+			verifyResult = analysis.VerifyChanges(s.readerFor(ctx), s.engineFor(ctx), changes)
 			out.Verify = verifyResult
 			g := prReviewVerifyGate(verifyResult)
 			verifyGate = &g
@@ -237,7 +237,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 
 	// --- composite impact (verdict input; also exposed) ---
 	if len(ids) > 0 {
-		imp := analysis.AnalyzeImpact(s.graph, ids, communities, processes)
+		imp := analysis.AnalyzeImpact(s.readerFor(ctx), ids, communities, processes)
 		out.Impact = &prReviewImpact{
 			Risk:          string(imp.Risk),
 			TotalAffected: imp.TotalAffected,
@@ -269,8 +269,9 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 
 	// --- guards gate (architecture + co-change / boundary rules) ---
 	if len(ids) > 0 && (s.hasGuardRules(ids) || !s.architecture.IsEmpty()) {
-		guards := s.evaluateGuards(ids)
-		guards = append(guards, analysis.EvaluateArchitecture(s.graph, s.architecture, ids)...)
+		guardReader := s.readerFor(ctx)
+		guards := s.evaluateGuards(guardReader, ids)
+		guards = append(guards, analysis.EvaluateArchitecture(guardReader, s.architecture, ids)...)
 		out.Guards = guards
 		out.Gates = append(out.Gates, prReviewGuardGate(guards))
 	}
@@ -362,7 +363,7 @@ func (s *Server) buildDiffContextSection(ctx context.Context, diff *analysis.Dif
 	}
 	fileRisk := map[string]string{}
 	for fp, fids := range fileIDs {
-		imp := analysis.AnalyzeImpact(s.graph, fids, communities, processes)
+		imp := analysis.AnalyzeImpact(reader, fids, communities, processes)
 		fileRisk[fp] = string(imp.Risk)
 	}
 

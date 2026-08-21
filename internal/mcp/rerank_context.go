@@ -25,7 +25,9 @@ func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.C
 		RepoPrefix:        repo,
 		ProjectID:         project,
 		AnalysisMetricsOf: s.rerankAnalysisMetrics,
-		BatchedCentrality: s.rerankBoundedCentrality,
+		BatchedCentrality: func(seeds, candidateIDs []string) rerank.CentralityResult {
+			return s.rerankBoundedCentrality(ctx, seeds, candidateIDs)
+		},
 	}
 
 	if s.combo != nil {

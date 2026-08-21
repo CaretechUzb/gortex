@@ -79,7 +79,7 @@ type DiffResult struct {
 // The daemon keys every file path as "<prefix>/<rel>" while git emits
 // repo-relative paths; empty only for the standalone Indexer, which
 // mints unprefixed paths.
-func MapGitDiff(g graph.Store, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, error) {
+func MapGitDiff(g graph.Reader, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, error) {
 	if err := gitcmd.ValidateRef(baseRef); err != nil {
 		return nil, err
 	}
@@ -106,7 +106,7 @@ func MapGitDiff(g graph.Store, repoRoot, repoPrefix, scope, baseRef string) (*Di
 // mode ("<prefix>/<rel>") while git and forge APIs emit repo-relative paths,
 // so the raw lookup is tried first (single-repo / already-prefixed input)
 // and the prefixed form second.
-func JoinFileNodes(g graph.Store, repoPrefix, path string) []*graph.Node {
+func JoinFileNodes(g graph.Reader, repoPrefix, path string) []*graph.Node {
 	if nodes := g.GetFileNodes(path); len(nodes) > 0 {
 		return nodes
 	}
@@ -120,7 +120,7 @@ func JoinFileNodes(g graph.Store, repoPrefix, path string) []*graph.Node {
 // the raw path when it resolves (or no prefix applies), otherwise the prefixed
 // form when that resolves. Falls back to the raw path when neither does, so
 // the caller's downstream lookup misses exactly as it would have anyway.
-func JoinFilePath(g graph.Store, repoPrefix, path string) string {
+func JoinFilePath(g graph.Reader, repoPrefix, path string) string {
 	if repoPrefix == "" || strings.HasPrefix(path, repoPrefix+"/") {
 		return path
 	}
@@ -138,7 +138,7 @@ func JoinFilePath(g graph.Store, repoPrefix, path string) string {
 // hunk in its file, deduped, plus the changed-file set. ChangedFiles keeps
 // the diff-relative paths (callers re-join them with git pathspecs); only
 // the node lookup is prefix-aware.
-func joinHunksToSymbols(g graph.Store, repoPrefix string, hunks []DiffHunk, files []FileChange) *DiffResult {
+func joinHunksToSymbols(g graph.Reader, repoPrefix string, hunks []DiffHunk, files []FileChange) *DiffResult {
 	result := &DiffResult{Hunks: hunks, FileChanges: files}
 
 	fileSet := make(map[string]bool)
@@ -369,7 +369,7 @@ func parseNewStart(line string) (int, bool) {
 // The returned *DiffResult is computed with the same logic as MapGitDiff (only
 // the diff's context width differs), so symbol overlap is unaffected.
 // repoPrefix anchors the node join exactly as in MapGitDiff.
-func MapGitDiffWithLines(g graph.Store, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, map[string][]HunkLine, error) {
+func MapGitDiffWithLines(g graph.Reader, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, map[string][]HunkLine, error) {
 	if err := gitcmd.ValidateRef(baseRef); err != nil {
 		return nil, nil, err
 	}

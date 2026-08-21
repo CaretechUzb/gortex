@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -317,7 +318,7 @@ func TestFilterTextMatchesByResolvedScope_FailsClosed(t *testing.T) {
 	// Active narrowing (workspace ceiling + repo allow-set): the
 	// unattributable ghost match is dropped; the node-backed real match
 	// survives.
-	narrowed := srv.filterTextMatchesByResolvedScope(in, ResolvedScope{
+	narrowed := srv.filterTextMatchesByResolvedScope(context.Background(), in, ResolvedScope{
 		WorkspaceID: "shared",
 		RepoAllow:   map[string]bool{"beta": true},
 	})
@@ -331,7 +332,7 @@ func TestFilterTextMatchesByResolvedScope_FailsClosed(t *testing.T) {
 
 	// No narrowing active: pass-through unchanged — the ghost match is kept
 	// (exactly the legacy behaviour the early-return preserves).
-	passthrough := srv.filterTextMatchesByResolvedScope(in, ResolvedScope{})
+	passthrough := srv.filterTextMatchesByResolvedScope(context.Background(), in, ResolvedScope{})
 	require.Len(t, passthrough, len(in),
 		"with no narrowing active the filter must pass every match through untouched")
 }

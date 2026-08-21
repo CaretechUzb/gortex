@@ -152,6 +152,8 @@ func (s *Server) buildASTTargets(language, pathPrefix string, allowedRepos map[s
 	// Repo / language / path filters compose AND, so they stay Go-
 	// side — they can't be projected onto the bucket index without
 	// duplicating the predicate set across both call sites.
+	// Base read on purpose: these nodes only supply absolute paths, and the
+	// engine re-parses each file from disk anyway.
 	for n := range s.graph.NodesByKind(graph.KindFile) {
 		if n == nil {
 			continue

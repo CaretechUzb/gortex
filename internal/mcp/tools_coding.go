@@ -2299,7 +2299,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 
 	// Opt-in in-pack enrichment sections (off by default).
 	inPackSections := s.smartContextSections(req.GetArguments(), entryPoint)
-	s.attachInPackSections(result, inPackSections, relevantSymbols)
+	s.attachInPackSections(ctx, result, inPackSections, relevantSymbols)
 	if inPackSections.Confidence {
 		if v := s.inPackConfidence(ctx, task); v != nil {
 			addInPackSection(result, "confidence", v)

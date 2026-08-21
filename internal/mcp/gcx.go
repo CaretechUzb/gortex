@@ -454,7 +454,7 @@ func tierFilteredCaveatMeta(c *graph.TierFilteredCaveat) []string {
 // encodeFindUsages emits one row per usage edge. Each row names the
 // caller symbol, its location, the edge kind, and the origin tier so
 // agents can filter without a second call.
-func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
+func encodeFindUsages(sg *query.SubGraph, g graph.Reader) ([]byte, error) {
 	var buf bytes.Buffer
 	meta := []string{"edges", fmt.Sprintf("%d", len(sg.Edges))}
 	meta = append(meta, zeroEdgeCaveatMeta(sg.Caveat)...)

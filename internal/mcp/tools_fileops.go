@@ -704,6 +704,8 @@ func (s *Server) fileSyntaxHealth(relPath, absPath string) map[string]any {
 		return nil
 	}
 	graphPath := s.resolveOverlayGraphPath(relPath, absPath)
+	// Base read on purpose: the parse-error stamp this reads back is written
+	// by the indexer after the file lands on disk.
 	for _, n := range s.graph.GetFileNodes(graphPath) {
 		if n == nil || n.Kind != graph.KindFile || n.Meta == nil {
 			continue

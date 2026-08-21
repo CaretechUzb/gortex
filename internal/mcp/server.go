@@ -212,7 +212,7 @@ type Server struct {
 	analysisRun analysisRunState
 	// hotspotsFn is a test seam for deterministic concurrency/invalidation
 	// tests. Production leaves it nil and uses analysis.FindHotspots.
-	hotspotsFn func(graph.Store, *analysis.CommunityResult, float64) []analysis.HotspotEntry
+	hotspotsFn func(graph.Reader, *analysis.CommunityResult, float64) []analysis.HotspotEntry
 	// adjacency is the compact CSR snapshot of the call / reference
 	// graph, built once per RunAnalysis pass so seeded random-walk
 	// queries (context_closure proximity ranking) never re-scan

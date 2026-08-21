@@ -6102,9 +6102,11 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 	if reader == nil {
 		return nil
 	}
-	// Durable content FTS remains the discovery backend. Overlay-owned files
-	// are filtered below before any snippet can authenticate a candidate.
-	content, hasContent := s.graph.(graph.ContentSearcher)
+	// The content-index capability is asserted on the request reader, so an
+	// overlay-active call finds no searcher and recalls nothing here instead
+	// of authenticating candidates from durable rows the editor buffer has
+	// already changed. Overlay-owned files are filtered below as well.
+	content, hasContent := reader.(graph.ContentSearcher)
 	perTerm := clampInt(limit/3, 4, exploreQuotedRecallMaxPerTerm)
 	repoPrefix := ""
 	if len(scope.RepoAllow) == 1 {

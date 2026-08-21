@@ -226,3 +226,59 @@ func TestSuggestedReviewQuestionsReflectsOverlay(t *testing.T) {
 
 	assert.Len(t, srv.graph.AllNodes(), 4, "the overlay request must not mutate the base store")
 }
+
+// TestChangedSymbolsForFilesReflectsOverlay pins the forge-file → symbol
+// join (analysis.JoinFileNodes) to the request reader. It is the read every
+// PR-shaped handler starts from, so reverting it to s.graph reports a symbol
+// the buffer deleted as changed and dates the surviving one to the index.
+func TestChangedSymbolsForFilesReflectsOverlay(t *testing.T) {
+	srv, layer := reviewFamilyFixture(t)
+	files := []string{rfKeptFile, rfGoneFile}
+
+	lineByID := func(nodes []*graph.Node) map[string]int {
+		m := make(map[string]int, len(nodes))
+		for _, n := range nodes {
+			m[n.ID] = n.StartLine
+		}
+		return m
+	}
+
+	baseFiles, baseNodes := srv.changedSymbolsForFiles(context.Background(), "", files)
+	assert.Equal(t, files, baseFiles, "the reported file list keeps the caller's paths")
+	base := lineByID(baseNodes)
+	assert.Equal(t, 10, base[rfKeptID], "a plain request joins the indexed payload")
+	assert.Contains(t, base, rfGoneID, "a plain request still joins the indexed symbol")
+
+	viewFiles, viewNodes := srv.changedSymbolsForFiles(overlayCtx(t, srv, layer), "", files)
+	assert.Equal(t, files, viewFiles, "the file list is the caller's either way")
+	view := lineByID(viewNodes)
+	assert.Equal(t, 40, view[rfKeptID], "the buffer's payload must replace the indexed one")
+	assert.NotContains(t, view, rfGoneID, "a symbol the buffer deleted must not join")
+
+	assert.Len(t, srv.graph.AllNodes(), 2, "the overlay request must not mutate the base store")
+}
+
+// TestReviewReceiptReflectsOverlay pins the PR-risk scorer
+// (analysis.ScorePRRisk and its covering-test walk) to the request reader.
+// Reverting it to s.graph reads the indexed tests edge and calls a change
+// merge-ready whose buffer has already deleted the only covering test.
+func TestReviewReceiptReflectsOverlay(t *testing.T) {
+	srv, layer := reviewQuestionsFixture(t)
+	diff := &analysis.DiffResult{
+		ChangedFiles:   []string{"p/hub.go"},
+		ChangedSymbols: []analysis.ChangedSymbol{{ID: rqHubID, Name: "Hub", FilePath: "p/hub.go"}},
+	}
+	ids := []string{rqHubID}
+
+	onBase := srv.reviewReceipt(context.Background(), ids, diff, nil, nil, false)
+	assert.Equal(t, 0, onBase.UncoveredCount, "the indexed tests edge covers the hub")
+	assert.Equal(t, "merge-ready", onBase.NextSafeAction)
+
+	onView := srv.reviewReceipt(overlayCtx(t, srv, layer), ids, diff, nil, nil, false)
+	assert.Equal(t, 1, onView.UncoveredCount,
+		"deleting the covering test in the buffer must leave the hub uncovered")
+	assert.Equal(t, "add-tests", onView.NextSafeAction,
+		"the receipt must ask for tests the buffer no longer has")
+
+	assert.Len(t, srv.graph.AllNodes(), 4, "the overlay request must not mutate the base store")
+}

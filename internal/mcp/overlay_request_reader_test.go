@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/search/trigram"
 )
 
 // overlayCtx is the shared seam for handler tests that need an
@@ -158,6 +159,63 @@ func TestBlameRowsByIDDropsCapabilityUnderOverlay(t *testing.T) {
 	}
 	if rows := blameRowsByID(server.readerFor(overlayCtx(t, server, layer))); rows != nil {
 		t.Fatalf("blameRowsByID served base's sidecar under an overlay: %v", rows)
+	}
+}
+
+const (
+	textAttrRepo    = "textrepo"
+	textAttrOldFl   = textAttrRepo + "/old.go"
+	textAttrNewFl   = textAttrRepo + "/new.go"
+	textAttrMovedID = textAttrNewFl + "::Moved"
+)
+
+// TestSearchTextScopeAttributionReadsRequestReader pins search_text's
+// scope attribution to the request's reader. The reader is whatever view
+// the request carries, and that view keeps its own base — here a session
+// that renamed a file, so the file node lives under the new path there
+// and under the old one in the server's store. A literal hit in the
+// renamed file can only be attributed to an in-scope node through the
+// request's reader; attributing it against the server's store finds no
+// node and the fail-closed drop empties the result.
+func TestSearchTextScopeAttributionReadsRequestReader(t *testing.T) {
+	fileNode := func(path string) *graph.Node {
+		return &graph.Node{
+			ID: path, Name: path, Kind: graph.KindFile, FilePath: path,
+			RepoPrefix: textAttrRepo, WorkspaceID: textAttrRepo,
+		}
+	}
+	base := graph.New()
+	base.AddNode(fileNode(textAttrOldFl))
+
+	session := graph.New()
+	session.AddNode(fileNode(textAttrNewFl))
+	layer := graph.NewOverlayLayer()
+	layer.MarkFile(textAttrNewFl, false)
+	layer.AddNode(textAttrNewFl, &graph.Node{
+		ID: textAttrMovedID, Name: "Moved", Kind: graph.KindFunction,
+		FilePath: textAttrNewFl, RepoPrefix: textAttrRepo, WorkspaceID: textAttrRepo, StartLine: 3,
+	})
+
+	server := &Server{graph: base}
+	matches := []trigram.Match{{Path: textAttrNewFl, Line: 3, Text: "// marker"}}
+	resolved := ResolvedScope{
+		WorkspaceID: textAttrRepo,
+		RepoAllow:   map[string]bool{textAttrRepo: true},
+	}
+
+	onBase := server.filterTextMatchesByResolvedScope(context.Background(), matches, resolved)
+	if len(onBase) != 0 {
+		t.Fatalf("plain request kept %d matches, want the fail-closed drop for an unknown path", len(onBase))
+	}
+
+	ctx := WithOverlayView(context.Background(), graph.NewOverlaidView(session, layer))
+	onView := server.filterTextMatchesByResolvedScope(ctx, matches, resolved)
+	if len(onView) != 1 || onView[0].Path != textAttrNewFl {
+		t.Fatalf("request-reader attribution = %v, want the renamed file's match kept", onView)
+	}
+
+	if n := base.GetNode(textAttrNewFl); n != nil {
+		t.Fatalf("the request mutated the base store: %v", n)
 	}
 }
 

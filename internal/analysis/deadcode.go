@@ -671,7 +671,7 @@ const hotspotBetweennessWeight = 0.4
 // centrality component — how often the symbol lies on a shortest path between
 // other symbols — that augments the fan-in/out signals rather than replacing them.
 // If threshold <= 0, the default threshold is mean + 2*stddev.
-func FindHotspots(g graph.Store, communities *CommunityResult, threshold float64) []HotspotEntry {
+func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float64) []HotspotEntry {
 	// Pull only function/method node IDs — the hotspots ranking is
 	// callable-only, and the scoring math doesn't touch any column
 	// beyond the id. NodeIDsByKinds returns the projection from a

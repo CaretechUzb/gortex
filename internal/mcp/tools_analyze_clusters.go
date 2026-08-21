@@ -62,6 +62,10 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 			cr, incrStats = s.incrementalCommunities()
 			fullGraphBurst = !incrStats.Incremental
 		} else {
+			// Leiden reads the whole corpus through the store's kind-scoped
+			// edge projection, which a request overlay view does not provide,
+			// so the partition is computed over the base corpus even when the
+			// call carries an overlay.
 			cr = analysis.DetectCommunitiesLeidenWith(s.graph, analysis.LeidenOptions{Resolution: resolution})
 			fullGraphBurst = true
 		}

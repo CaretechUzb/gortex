@@ -104,7 +104,7 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 		}
 		matches = filterTextMatchesByPath(matches, pathFilter, repoPrefixes)
 	}
-	matches = s.filterTextMatchesByResolvedScope(matches, resolved)
+	matches = s.filterTextMatchesByResolvedScope(ctx, matches, resolved)
 	if needsFinalLimit {
 		matches = limitTextMatches(matches, limit)
 	}
@@ -152,7 +152,7 @@ func limitTextMatches(matches []trigram.Match, limit int) []trigram.Match {
 	return matches
 }
 
-func (s *Server) filterTextMatchesByResolvedScope(matches []trigram.Match, resolved ResolvedScope) []trigram.Match {
+func (s *Server) filterTextMatchesByResolvedScope(ctx context.Context, matches []trigram.Match, resolved ResolvedScope) []trigram.Match {
 	if resolved.WorkspaceID == "" && resolved.ProjectID == "" && len(resolved.RepoAllow) == 0 {
 		return matches
 	}
@@ -161,6 +161,9 @@ func (s *Server) filterTextMatchesByResolvedScope(matches []trigram.Match, resol
 		ProjectID:   resolved.ProjectID,
 		RepoAllow:   resolved.RepoAllow,
 	}
+	// Every match in the batch is attributed through the same reader,
+	// so the request-reader lookup is hoisted out of the loop.
+	reader := s.readerFor(ctx)
 	out := make([]trigram.Match, 0, len(matches))
 	for _, m := range matches {
 		repo, _, ok := strings.Cut(m.Path, "/")
@@ -181,10 +184,10 @@ func (s *Server) filterTextMatchesByResolvedScope(matches []trigram.Match, resol
 		// graph never turned into a node) cannot be proven in-scope, so
 		// dropping it is the safe choice — keeping it was a latent
 		// cross-scope leak.
-		if s.graph == nil {
+		if reader == nil {
 			continue
 		}
-		n := s.graph.GetNode(m.Path)
+		n := reader.GetNode(m.Path)
 		if n == nil {
 			// A trigram match path is always forward-slash, but node IDs
 			// keep the repo-relative remainder in the OS separator. The two
@@ -192,7 +195,7 @@ func (s *Server) filterTextMatchesByResolvedScope(matches []trigram.Match, resol
 			// Windows every match below the root failed attribution here and
 			// the fail-closed drop below emptied the entire result set.
 			if key := graphMatchPathKey(m.Path, knownRepo); key != m.Path {
-				n = s.graph.GetNode(key)
+				n = reader.GetNode(key)
 			}
 		}
 		// GrepTextForRepos stamps the registry prefix onto every match path,

@@ -84,6 +84,9 @@ func (s *Server) handleFlowBetween(ctx context.Context, req mcp.CallToolRequest)
 	maxPaths := req.GetInt("max_paths", dataflow.DefaultMaxPaths)
 	minTier := req.GetString("min_tier", "")
 
+	// dataflow.New builds its traversal state over a graph.Store, so these
+	// paths are computed over the base corpus even when the request carries
+	// an overlay view.
 	engine := dataflow.New(s.graph).WithRefiner(s.dataflowRefiner(ctx))
 	paths := engine.FlowBetweenWithTier(source, sink, maxDepth, maxPaths, minTier)
 
@@ -120,6 +123,9 @@ func (s *Server) handleTracePath(ctx context.Context, req mcp.CallToolRequest) (
 		MinTier:           req.GetString("min_tier", ""),
 		IncludeReferences: req.GetBool("include_references", true),
 	}
+	// callpath.New builds its traversal state over a graph.Store, so this
+	// path is computed over the base corpus even when the request carries an
+	// overlay view.
 	res := callpath.New(s.graph).ShortestPath(source, sink, opts)
 
 	if s.isGCX(ctx, req) {
@@ -154,6 +160,9 @@ func (s *Server) handleTaintPaths(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError("sink_pattern matched no clauses"), nil
 	}
 
+	// dataflow.New builds its traversal state over a graph.Store, so these
+	// findings are computed over the base corpus even when the request
+	// carries an overlay view.
 	engine := dataflow.New(s.graph).WithRefiner(s.dataflowRefiner(ctx))
 	findings := engine.TaintPathsWithTier(src, sink, maxDepth, limit, minTier)
 
@@ -202,6 +211,10 @@ func (s *Server) dataflowRefiner(ctx context.Context) *dataflow.Refiner {
 		}
 		return dataflow.FuncSource{Src: []byte(src), StartLine: fromLine}, nil
 	}
+	// dataflow.NewRefiner caches per-function analyses keyed off a
+	// graph.Store, so its symbol lookups read the base corpus even when the
+	// request carries an overlay view; only the source resolver above is
+	// overlay-aware.
 	return dataflow.NewRefiner(s.graph, resolve, 0)
 }
 

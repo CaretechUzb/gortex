@@ -335,7 +335,7 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		return mcp.NewToolResultError("change detection refused a stale graph: " + freshnessErr.Error()), nil
 	}
 
-	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
+	diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -379,7 +379,7 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		symbolIDs[i] = cs.ID
 	}
 
-	impact := analysis.AnalyzeImpact(s.graph, symbolIDs, s.getCommunities(), s.getProcesses())
+	impact := analysis.AnalyzeImpact(s.readerFor(ctx), symbolIDs, s.getCommunities(), s.getProcesses())
 
 	detectResult := map[string]any{
 		"changed_symbols":      diff.ChangedSymbols,
@@ -441,7 +441,7 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 	impactCtx, cancelImpact := context.WithTimeout(ctx, 3*time.Second)
 	defer cancelImpact()
 	communities, processes := s.tryImpactAnalysisSnapshots()
-	impact := analysis.AnalyzeImpactContext(impactCtx, s.graph, ids, communities, processes)
+	impact := analysis.AnalyzeImpactContext(impactCtx, s.readerFor(ctx), ids, communities, processes)
 
 	result := map[string]any{
 		"risk":                 impact.Risk,

@@ -102,7 +102,7 @@ func (s *Server) handleSaveNote(ctx context.Context, req mcp.CallToolRequest) (*
 		pinnedPtr := &pinned
 		var addLinks []string
 		if !noAutolink && body != "" {
-			addLinks = append(addLinks, autoLinkBody(body, s.graph, sessionWorkspaceIDOrEmpty(s, ctx), defaultAutoLinkOptions())...)
+			addLinks = append(addLinks, autoLinkBody(body, s.readerFor(ctx), sessionWorkspaceIDOrEmpty(s, ctx), defaultAutoLinkOptions())...)
 		}
 		addLinks = append(addLinks, links...)
 		updated, err := s.notes.Update(id, bodyPtr, tags, pinnedPtr, addLinks)
@@ -134,7 +134,7 @@ func (s *Server) handleSaveNote(ctx context.Context, req mcp.CallToolRequest) (*
 
 	autoLinks := links
 	if !noAutolink && body != "" {
-		autoLinks = append(autoLinks, autoLinkBody(body, s.graph, workspaceID, defaultAutoLinkOptions())...)
+		autoLinks = append(autoLinks, autoLinkBody(body, s.readerFor(ctx), workspaceID, defaultAutoLinkOptions())...)
 	}
 	// Always ensure the explicit symbol_id ends up on the link list
 	// so query_notes by symbol_id matches even when the body did not

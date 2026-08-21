@@ -1859,7 +1859,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 	var rerankBreakdown []*rerank.Candidate
 	var rerankPrepare, rerankSignals time.Duration
-	nodes, rerankPrepare, rerankSignals = applyRerankBoostsTimed(s, nodes, q, rctx, &rerankBreakdown)
+	nodes, rerankPrepare, rerankSignals = applyRerankBoostsTimed(ctx, s, nodes, q, rctx, &rerankBreakdown)
 
 	// Post-rerank exact-cosine refinement. The merged rerank above
 	// scores the semantic channel by RRF rank and discards the raw
@@ -2447,13 +2447,14 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 	// Epistemic lower bound: a caller walk over in-edges cannot see callers
 	// that reach this symbol through interface dispatch the resolver left
 	// unbound. Flag the floor + name the interface so the agent can widen it.
-	if bs := graph.CallerBoundaries(s.readerFor(ctx), []string{id}, 0); len(bs) > 0 {
+	boundaryReader := s.readerFor(ctx)
+	if bs := graph.CallerBoundaries(boundaryReader, []string{id}, 0); len(bs) > 0 {
 		sg.Boundaries = bs
 		sg.LowerBound = graph.LowerBoundCaveat(bs)
 		// The reach is a floor because dispatch is dynamic — scan the seed's
 		// body for the exact runtime-dispatch sites so the agent gets
 		// {site, form, key, candidates} instead of a read-spiral.
-		if db := s.dynamicBoundariesForSymbol(s.readerFor(ctx).GetNode(id)); len(db) > 0 {
+		if db := s.dynamicBoundariesForSymbol(boundaryReader, boundaryReader.GetNode(id)); len(db) > 0 {
 			sg.DynamicBoundaries = db
 		}
 	}
@@ -2665,7 +2666,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// symbol's result is never altered.
 	node := eng.GetSymbol(id)
 	if node == nil {
-		if canon := reExportBindingCanonical(s.graph, id, 0); canon != "" {
+		if canon := reExportBindingCanonical(s.readerFor(ctx), id, 0); canon != "" {
 			id = canon
 			node = eng.GetSymbol(id)
 		}
@@ -2691,7 +2692,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// deduped. So the façade an agent actually imports answers with the full
 	// usage set instead of only the forwarding site.
 	if isReExportNode(node) {
-		if canon := reExportNodeCanonical(s.graph, id, 0); canon != "" && canon != id {
+		if canon := reExportNodeCanonical(s.readerFor(ctx), id, 0); canon != "" && canon != id {
 			mergeUsageSubGraph(sg, eng.FindUsagesScoped(canon, opts))
 		}
 	}
@@ -2750,7 +2751,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 		return s.respondScopedJSONOrTOON(ctx, req, groupUsagesByFile(sg), resolved)
 	}
 	if s.isGCX(ctx, req) {
-		res, err := s.gcxResponseWithBudget(req)(encodeFindUsages(sg, s.graph))
+		res, err := s.gcxResponseWithBudget(req)(encodeFindUsages(sg, s.readerFor(ctx)))
 		return withScopeResult(res, err, resolved)
 	}
 	// Plain JSON gets curated usage rows that promote the resolved

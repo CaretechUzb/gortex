@@ -8,6 +8,8 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 // The graph-algorithm analyzers (components, clusters, role,
@@ -146,4 +148,72 @@ func TestAnalyzeConnectivityHealthReflectsOverlay(t *testing.T) {
 	assert.Equal(t, float64(2), onView["leaf"],
 		"the entry point becomes a leaf once its call into the deleted symbol is gone")
 	assert.Equal(t, float64(0), onView["isolated"])
+}
+
+const (
+	impCoreFile = "p/core.go"
+	impCoreID   = impCoreFile + "::Core"
+	impKeptID   = "p/keep.go::KeptCaller"
+	impDropFile = "p/drop.go"
+	impDropID   = impDropFile + "::DroppedCaller"
+)
+
+// overlayImpactFixture wires a symbol with two indexed callers plus the
+// layer an editor session would push once one of those call sites is gone:
+// drop.go is re-parsed empty, so its caller and its call edge disappear.
+func overlayImpactFixture(t *testing.T) (*Server, *graph.OverlayLayer) {
+	t.Helper()
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: impCoreID, Name: "Core", Kind: graph.KindFunction, FilePath: impCoreFile, Language: "go", StartLine: 5, EndLine: 9})
+	g.AddNode(&graph.Node{ID: impKeptID, Name: "KeptCaller", Kind: graph.KindFunction, FilePath: "p/keep.go", Language: "go", StartLine: 3, EndLine: 6})
+	g.AddNode(&graph.Node{ID: impDropID, Name: "DroppedCaller", Kind: graph.KindFunction, FilePath: impDropFile, Language: "go", StartLine: 3, EndLine: 6})
+	g.AddEdge(&graph.Edge{From: impKeptID, To: impCoreID, Kind: graph.EdgeCalls})
+	g.AddEdge(&graph.Edge{From: impDropID, To: impCoreID, Kind: graph.EdgeCalls})
+
+	layer := graph.NewOverlayLayer()
+	layer.MarkFile(impDropFile, false)
+	layer.MarkRemoved("DroppedCaller", impDropID)
+
+	return reviewFamilyServer(t, g), layer
+}
+
+// TestExplainChangeImpactReflectsOverlay pins the blast-radius read
+// (analysis.AnalyzeImpactContext) to the request reader. The precomputed
+// reach index is built over the base corpus and is therefore skipped under
+// an overlay; the live walk that replaces it must count the buffer's
+// callers, not the indexed ones, or the pre-edit safety gate reports a
+// dependent the caller has already removed.
+func TestExplainChangeImpactReflectsOverlay(t *testing.T) {
+	srv, layer := overlayImpactFixture(t)
+
+	depthOneIDs := func(out map[string]any) map[string]bool {
+		byDepth, _ := out["by_depth"].(map[string]any)
+		rows, _ := byDepth["1"].([]any)
+		ids := make(map[string]bool, len(rows))
+		for _, raw := range rows {
+			row, _ := raw.(map[string]any)
+			if id, ok := row["id"].(string); ok {
+				ids[id] = true
+			}
+		}
+		return ids
+	}
+	run := func(ctx context.Context) map[string]any {
+		return analyzerJSON(t, ctx, "explain_change_impact",
+			map[string]any{"ids": impCoreID}, srv.handleEnhancedChangeImpact)
+	}
+
+	onBase := run(context.Background())
+	assert.Equal(t, float64(2), onBase["total_affected"], "both indexed callers count")
+	baseIDs := depthOneIDs(onBase)
+	assert.True(t, baseIDs[impKeptID] && baseIDs[impDropID], "a plain request reports both callers")
+
+	onView := run(overlayCtx(t, srv, layer))
+	assert.Equal(t, float64(1), onView["total_affected"],
+		"the caller the buffer deleted must leave the blast radius")
+	viewIDs := depthOneIDs(onView)
+	assert.True(t, viewIDs[impKeptID], "the surviving caller stays a direct dependent")
+	assert.False(t, viewIDs[impDropID], "a caller the buffer deleted must not be reported")
+
+	assert.Len(t, srv.graph.AllNodes(), 3, "the overlay request must not mutate the base store")
 }

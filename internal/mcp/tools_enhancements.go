@@ -409,7 +409,7 @@ func (s *Server) handleVerifyChange(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError("changes array is empty"), nil
 	}
 
-	result := analysis.VerifyChanges(s.graph, s.engine, changes)
+	result := analysis.VerifyChanges(s.readerFor(ctx), s.engineFor(ctx), changes)
 
 	if isCompact(req) {
 		var b strings.Builder
@@ -478,8 +478,9 @@ func (s *Server) handleCheckGuards(ctx context.Context, req mcp.CallToolRequest)
 		return s.respondJSONOrTOON(ctx, req, empty)
 	}
 
-	violations := s.evaluateGuards(ids)
-	violations = append(violations, analysis.EvaluateArchitecture(s.graph, s.architecture, ids)...)
+	guardReader := s.readerFor(ctx)
+	violations := s.evaluateGuards(guardReader, ids)
+	violations = append(violations, analysis.EvaluateArchitecture(guardReader, s.architecture, ids)...)
 
 	if isCompact(req) {
 		var b strings.Builder
@@ -2837,7 +2838,7 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 		return mcp.NewToolResultError(rootErr.Error()), nil
 	}
 
-	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
+	diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -2936,7 +2937,7 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 		for i, sym := range syms {
 			symbolIDs[i] = sym.ID
 		}
-		impact := analysis.AnalyzeImpact(s.graph, symbolIDs, communities, processes)
+		impact := analysis.AnalyzeImpact(reader, symbolIDs, communities, processes)
 
 		groups = append(groups, diffFileGroup{
 			FilePath: fp,
@@ -4643,6 +4644,8 @@ func (s *Server) handleValidateContracts(ctx context.Context, req mcp.CallToolRe
 	// indexer attaches it during commitContracts (see
 	// snapshotContractShapes in internal/indexer/indexer.go).
 	lookup := contracts.ShapeLookup(func(symbolID string) *contracts.Shape {
+		// Base read on purpose: only the indexer stamps the shape meta this
+		// reads, so no other view can carry it.
 		n := s.graph.GetNode(symbolID)
 		if n == nil || n.Meta == nil {
 			return nil
@@ -5088,6 +5091,9 @@ func (s *Server) handleAuditAgentConfig(ctx context.Context, req mcp.CallToolReq
 		})
 	}
 
+	// The audit scans config files on disk against the indexed corpus, so its
+	// stale-ref verdicts are computed over the base corpus even when the
+	// request carries an overlay view.
 	report := audit.Audit(s.graph, root, files)
 
 	if isCompact(req) {

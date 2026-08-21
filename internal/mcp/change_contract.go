@@ -430,7 +430,7 @@ func (s *Server) lowerDiffSource(ctx context.Context, req mcp.CallToolRequest) (
 	if rootErr != nil {
 		return nil, rootErr
 	}
-	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, base)
+	diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, base)
 	if err != nil {
 		return nil, err
 	}
@@ -475,14 +475,17 @@ func (s *Server) extraRuleFamilies() []analysis.RuleFamily {
 	return fams
 }
 
-// evaluateChange runs every registered rule family over the changed set.
-func (s *Server) evaluateChange(p *prediction) []analysis.GuardViolation {
+// evaluateChange runs every registered rule family over the changed set,
+// reading through the request's reader so a gate fires on the caller's own
+// buffers rather than on the last-indexed state.
+func (s *Server) evaluateChange(ctx context.Context, p *prediction) []analysis.GuardViolation {
 	if len(p.changedIDs) == 0 {
 		return nil
 	}
+	reader := s.readerFor(ctx)
 	var violations []analysis.GuardViolation
 	for _, fam := range s.ruleFamilies() {
-		violations = append(violations, fam.Evaluate(s.graph, p.changedIDs)...)
+		violations = append(violations, fam.Evaluate(reader, p.changedIDs)...)
 	}
 	return violations
 }
@@ -827,7 +830,7 @@ func (s *Server) assembleEnvelope(ctx context.Context, p *prediction, violations
 	var apiSurface []apiSurfaceEntry
 	if p.lens == "api" {
 		var apiReasons []changeReason
-		apiReasons, apiSurface = s.apiDriftReasons(p)
+		apiReasons, apiSurface = s.apiDriftReasons(ctx, p)
 		for _, r := range apiReasons {
 			reasons = append(reasons, r)
 			verdict = escalate(verdict, verdictForSeverity(r.Severity))
@@ -903,7 +906,7 @@ func (s *Server) handleChangeContract(ctx context.Context, req mcp.CallToolReque
 	if req.GetBool("ack", false) {
 		return s.handleRiskAck(ctx, req, p)
 	}
-	violations := s.evaluateChange(p)
+	violations := s.evaluateChange(ctx, p)
 	env := s.assembleEnvelope(ctx, p, violations)
 	return s.respondJSONOrTOON(ctx, req, env)
 }
