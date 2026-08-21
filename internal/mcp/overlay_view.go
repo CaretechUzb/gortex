@@ -82,11 +82,17 @@ func validateBoundedOverlayExtractionUsage(
 }
 
 type stagedOverlayFile struct {
-	graphPath  string
-	deleted    bool
-	repoPrefix string
-	baseNodes  []*graph.Node
-	result     *parser.ExtractionResult
+	graphPath string
+	deleted   bool
+	// repoPrefix / workspaceID / projectID are the repo identity stamped
+	// onto every node this file contributes to the layer. All three are
+	// resolved once per file at staging time so one layer build cannot
+	// hand two nodes of the same file different scope identities.
+	repoPrefix  string
+	workspaceID string
+	projectID   string
+	baseNodes   []*graph.Node
+	result      *parser.ExtractionResult
 }
 
 // overlayRequestSnapshot is the immutable raw-buffer cohort used to build one
@@ -654,11 +660,14 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		if err != nil {
 			return nil, nil, err
 		}
+		workspaceID, projectID := overlayScopeIdentity(baseNodes, graphPath, idx)
 		staged = append(staged, stagedOverlayFile{
-			graphPath:  graphPath,
-			repoPrefix: idx.RepoPrefix(),
-			baseNodes:  baseNodes,
-			result:     cloneOverlayExtractionResult(result),
+			graphPath:   graphPath,
+			repoPrefix:  idx.RepoPrefix(),
+			workspaceID: workspaceID,
+			projectID:   projectID,
+			baseNodes:   baseNodes,
+			result:      cloneOverlayExtractionResult(result),
 		})
 	}
 
@@ -685,10 +694,10 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 			continue
 		}
 
-		// The staged result is an owned, unprefixed clone captured before the
-		// next Extract call. Prefix it only after the full cohort preflight.
+		// The staged result is an owned, unstamped clone captured before the
+		// next Extract call. Stamp it only after the full cohort preflight.
 		result := file.result
-		applyRepoPrefixToResult(result, file.repoPrefix)
+		applyRepoIdentityToResult(result, file.repoPrefix, file.workspaceID, file.projectID)
 
 		baseIDsByName := make(map[string]map[string]bool)
 		for _, node := range file.baseNodes {
@@ -892,12 +901,39 @@ func requestContextError(ctx context.Context, _ error) error {
 	return ctx.Err()
 }
 
-// applyRepoPrefixToResult prepends repoPrefix to every node/edge in
-// an extraction result so IDs match base's shape in multi-repo mode.
-// Mirrors `Indexer.applyRepoPrefix` but kept here to avoid having to
-// expose that helper to non-indexer packages.
-func applyRepoPrefixToResult(result *parser.ExtractionResult, repoPrefix string) {
-	if result == nil || repoPrefix == "" {
+// applyRepoIdentityToResult stamps one repository's identity onto every
+// node/edge in an extraction result: the repo prefix on IDs and file paths
+// so they match base's shape in multi-repo mode, and the workspace /
+// project slugs so the nodes carry the same scope identity as the base
+// nodes of that repo. Mirrors `Indexer.applyRepoPrefix` but kept here to
+// avoid having to expose that helper to non-indexer packages.
+//
+// Prefix and slugs are independent. A repo can declare a workspace without
+// being prefixed (single-repo mode), and the base path stamps the slugs
+// before its own prefix check for exactly that reason. Stamping only the
+// prefix leaves the node with an empty WorkspaceID, which every reader's
+// scope gate reads as "no workspace declared" and falls back to the repo
+// prefix — so an overlay node in a repo whose workspace slug differs from
+// its prefix is dropped by any scope-narrowed read.
+//
+// Like the base path, a slug is written only where the extractor left the
+// field empty, so a node that already carries an identity keeps it.
+func applyRepoIdentityToResult(result *parser.ExtractionResult, repoPrefix, workspaceID, projectID string) {
+	if result == nil {
+		return
+	}
+	for _, n := range result.Nodes {
+		if n == nil {
+			continue
+		}
+		if workspaceID != "" && n.WorkspaceID == "" {
+			n.WorkspaceID = workspaceID
+		}
+		if projectID != "" && n.ProjectID == "" {
+			n.ProjectID = projectID
+		}
+	}
+	if repoPrefix == "" {
 		return
 	}
 	for _, n := range result.Nodes {
@@ -919,6 +955,48 @@ func applyRepoPrefixToResult(result *parser.ExtractionResult, repoPrefix string)
 			e.To = repoPrefix + "/" + e.To
 		}
 	}
+}
+
+// overlayScopeIdentity resolves the workspace / project slugs one overlay
+// file's nodes must carry. It runs once per staged file, so every node the
+// file contributes to the layer gets the same pair.
+//
+// Precedence, highest first:
+//
+//  1. The base file node for this path. It is what the repo's own indexer
+//     stamped for this exact file, so copying it keeps the buffer and the
+//     file it shadows on the same side of every scope boundary.
+//  2. The base sibling with the smallest ID among those carrying a
+//     workspace slug — for a file whose extractor emits no file node. The
+//     smallest ID makes the pick independent of projection order.
+//  3. The repo indexer's own binding, which is the value
+//     `Indexer.applyRepoPrefix` stamps at indexing time. This is the only
+//     source for a file that is new in the buffer and has no base nodes.
+//
+// Both slugs come from a single source. Mixing them could place a node in
+// one stamping generation's workspace under another's project slug, and a
+// project narrow would then drop it.
+func overlayScopeIdentity(baseNodes []*graph.Node, graphPath string, idx *indexer.Indexer) (workspaceID, projectID string) {
+	var donor *graph.Node
+	for _, node := range baseNodes {
+		if node == nil || node.WorkspaceID == "" {
+			continue
+		}
+		if node.ID == graphPath {
+			donor = node
+			break
+		}
+		if donor == nil || node.ID < donor.ID {
+			donor = node
+		}
+	}
+	if donor != nil {
+		return donor.WorkspaceID, donor.ProjectID
+	}
+	if idx == nil {
+		return "", ""
+	}
+	return idx.WorkspaceID(), idx.ProjectID()
 }
 
 // unresolvedPrefix matches the resolver's prefix for placeholder
