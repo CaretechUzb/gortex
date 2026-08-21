@@ -33,7 +33,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 16
+const currentSchemaVersion = 17
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -85,6 +85,21 @@ var schemaMigrations = []schemaMigration{
 	{version: 14, name: "add edges view generation column", inPlace: addEdgeViewGenerationColumn},
 	{version: 15, name: "key payload sidecars by view generation", inPlace: addSidecarViewGenerationKeys},
 	{version: 16, name: "key nodes and edges by view generation", inPlace: keyGraphCoreByViewGeneration},
+	{version: 17, name: "add sparse view-generation enumeration indexes", inPlace: addGenerationEnumerationIndexes},
+}
+
+// addGenerationEnumerationIndexes is the explicit migration step for the two
+// partial view-generation indexes. createGraphCoreIndexes already builds them
+// on every Open from the same shared DDL, so this step exists to make the
+// addition part of the versioned contract: a store stamped v17 is one whose
+// sparse-generation enumeration path is known to be indexed.
+func addGenerationEnumerationIndexes(tx *sql.Tx) error {
+	for _, ddl := range []string{nodesByGenerationIndexDDL, edgesByGenerationIndexDDL} {
+		if _, err := tx.Exec(ddl); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // keyGraphCoreByViewGeneration re-keys the two core payload tables on the view

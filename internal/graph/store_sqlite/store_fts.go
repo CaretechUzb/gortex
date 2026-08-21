@@ -231,14 +231,18 @@ func upsertSymbolFTSChunkTx(tx *sql.Tx, viewGen int64, chunk []graph.SymbolFTSIt
 		lookup.WriteString(`(?, ?)`)
 		lookupArgs = append(lookupArgs, i, item.NodeID)
 	}
+	// Both LEFT JOINs bind the same generation: the owning repo prefix must be
+	// read from the node this generation carries, not a same-id node another
+	// generation happens to hold, or the row would be filed under the wrong
+	// repository in this generation's index.
 	lookup.WriteString(`)
 SELECT wanted.ord, COALESCE(nodes.repo_prefix, ''), symbol_fts_rowid.fts_rowid
 FROM wanted
-LEFT JOIN nodes ON nodes.id = wanted.node_id
+LEFT JOIN nodes ON nodes.id = wanted.node_id AND nodes.view_gen = ?
 LEFT JOIN symbol_fts_rowid
        ON symbol_fts_rowid.view_gen = ? AND symbol_fts_rowid.node_id = wanted.node_id
 ORDER BY wanted.ord`)
-	lookupArgs = append(lookupArgs, viewGen)
+	lookupArgs = append(lookupArgs, viewGen, viewGen)
 	rows, err := tx.Query(lookup.String(), lookupArgs...)
 	if err != nil {
 		return err
@@ -679,13 +683,22 @@ func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit 
 		return nil, nil
 	}
 
-	q := `SELECT node_id, bm25(symbol_fts) FROM symbol_fts WHERE symbol_fts MATCH ?`
-	args := []any{match}
+	// symbol_fts is one shared virtual table across every generation, so the
+	// MATCH alone would rank rows this handle cannot see. The rowid map carries
+	// the generation and its symbol_fts_rowid_by_rowid index is UNIQUE on
+	// fts_rowid, so the join is a per-candidate point seek and the bm25
+	// ordering below is untouched.
+	q := `SELECT symbol_fts.node_id, bm25(symbol_fts)
+FROM symbol_fts
+JOIN symbol_fts_rowid
+  ON symbol_fts_rowid.fts_rowid = symbol_fts.rowid AND symbol_fts_rowid.view_gen = ?
+WHERE symbol_fts MATCH ?`
+	args := []any{s.viewGen, match}
 	if len(repoAllow) > 0 {
 		// The empty prefix always passes: unowned rows (synthetic
 		// externals) are admitted by every repo-narrow predicate — see
 		// QueryOptions.ScopeAllows for the invariant.
-		q += ` AND repo_prefix IN ('', ?` + strings.Repeat(`,?`, len(repoAllow)-1) + `)`
+		q += ` AND symbol_fts.repo_prefix IN ('', ?` + strings.Repeat(`,?`, len(repoAllow)-1) + `)`
 		for _, r := range repoAllow {
 			args = append(args, r)
 		}
@@ -835,7 +848,7 @@ func (s *Store) bundlesForHits(hits []graph.SymbolHit) ([]graph.SymbolBundle, er
 	if s.bundles != nil {
 		missIDs = missIDs[:0:0]
 		for _, id := range ids {
-			if b, ok := s.bundles.lookup(id); ok {
+			if b, ok := s.bundles.lookup(s.viewGen, id); ok {
 				cached[id] = b
 				continue
 			}
@@ -877,7 +890,7 @@ func (s *Store) bundlesForHits(hits []graph.SymbolHit) ([]graph.SymbolBundle, er
 			InEdges:  in[id],
 		}
 		if s.bundles != nil {
-			s.bundles.store(b)
+			s.bundles.store(s.viewGen, b)
 		}
 		bundles = append(bundles, b)
 	}

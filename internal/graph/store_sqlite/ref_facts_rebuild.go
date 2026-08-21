@@ -54,12 +54,16 @@ WITH selected AS (
            n.file_path, n.language
 `
 
-// The trailing view_gen placeholder is bound LAST: SQLite numbers unnamed
+// Two view_gen placeholders trail every caller's own: SQLite numbers unnamed
 // parameters by their position in the statement text, and every placeholder a
-// caller supplies lives in the CTE's FROM clause, ahead of this projection.
+// caller supplies lives in the CTE's FROM clause, ahead of these. The first
+// scopes the source corpus the facts are derived from, the second stamps the
+// generation the rows are written at; the joins pair the two endpoint sides
+// with the edge so a foreign-generation node cannot name a fact here.
 const refFactInsertSuffix = `
-    LEFT JOIN nodes AS t ON t.id = e.to_id
+    LEFT JOIN nodes AS t ON t.id = e.to_id AND t.view_gen = e.view_gen
     WHERE ` + refFactEligiblePredicate + `
+      AND n.view_gen = ?
 )
 SELECT ?, repo_prefix, from_id, to_id, kind, ref_name, line, effective_origin,
        CASE effective_origin
@@ -100,8 +104,8 @@ func (s *Store) rebuildRefFactsForRepos(repoPrefixes []string) (statements int, 
 		}
 		statements++
 		insert = refFactInsertPrefix + `    FROM nodes AS n
-    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id` + refFactInsertSuffix
-		if _, err := tx.Exec(insert, s.viewGen); err != nil {
+    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id AND e.view_gen = n.view_gen` + refFactInsertSuffix
+		if _, err := tx.Exec(insert, s.viewGen, s.viewGen); err != nil {
 			return statements, err
 		}
 		statements++
@@ -121,8 +125,8 @@ WHERE view_gen = ?
 		statements++
 		insert = refFactInsertPrefix + `    FROM json_each(?) AS requested
     JOIN nodes AS n ON n.repo_prefix = CAST(requested.value AS TEXT)
-    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id` + refFactInsertSuffix
-		if _, err := tx.Exec(insert, string(reposJSON), s.viewGen); err != nil {
+    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id AND e.view_gen = n.view_gen` + refFactInsertSuffix
+		if _, err := tx.Exec(insert, string(reposJSON), s.viewGen, s.viewGen); err != nil {
 			return statements, err
 		}
 		statements++
@@ -170,8 +174,8 @@ WHERE view_gen = ?
 	insert := refFactInsertPrefix + `    FROM json_each(?) AS requested
     JOIN nodes AS n
       ON n.repo_prefix = ? AND n.file_path = CAST(requested.value AS TEXT)
-    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id` + refFactInsertSuffix
-	if _, err := tx.Exec(insert, string(filesJSON), repoPrefix, s.viewGen); err != nil {
+    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id AND e.view_gen = n.view_gen` + refFactInsertSuffix
+	if _, err := tx.Exec(insert, string(filesJSON), repoPrefix, s.viewGen, s.viewGen); err != nil {
 		return statements, fmt.Errorf("ref-facts refill: %w", err)
 	}
 	statements++

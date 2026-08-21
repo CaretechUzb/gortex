@@ -78,6 +78,7 @@ func TestFindEdgesByIdentitiesSQLiteUsesExistingUniqueIndexWithoutTempTree(t *te
 	rows, err := store.db.Query("EXPLAIN QUERY PLAN "+query,
 		"a", "b", graph.EdgeCalls, "a.go", 1,
 		"c", "d", graph.EdgeCalls, "c.go", 2,
+		baseViewGeneration,
 	)
 	require.NoError(t, err)
 	defer rows.Close()

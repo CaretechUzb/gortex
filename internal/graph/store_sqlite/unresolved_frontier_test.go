@@ -87,7 +87,7 @@ func TestSQLiteUnresolvedFrontierIsOneGroupedIndexedQuery(t *testing.T) {
 
 	assertFrontier(store)
 
-	plan := strings.ToLower(sqliteExplainPlan(t, store.db, unresolvedFrontierSQL))
+	plan := strings.ToLower(sqliteExplainPlan(t, store.db, unresolvedFrontierSQL, baseViewGeneration))
 	if !strings.Contains(plan, "edges_by_unresolved") {
 		t.Fatalf("frontier query did not use unresolved index:\n%s", plan)
 	}

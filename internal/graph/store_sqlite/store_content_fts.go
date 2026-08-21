@@ -522,10 +522,19 @@ func (s *Store) SearchContent(query, repoPrefix string, limit int) ([]graph.Cont
 	// ellipsis for elision, ~16 tokens of context. CAST(ordinal AS INTEGER)
 	// forces integer affinity so the FTS5 text column scans cleanly into an
 	// int.
-	sb.WriteString(`SELECT node_id, file_path, CAST(ordinal AS INTEGER), snippet(content_fts, 4, '', '', '…', 16), bm25(content_fts) FROM content_fts WHERE content_fts MATCH ?`)
-	args := []any{match}
+	// The rowid map carries the generation content_fts itself cannot: one
+	// shared virtual table holds every generation's sections, so the MATCH is
+	// joined back through content_fts_rowid (whose primary key IS fts_rowid) to
+	// keep hidden generations out of the candidate set. bm25 ordering is
+	// unchanged.
+	sb.WriteString(`SELECT content_fts.node_id, content_fts.file_path, CAST(content_fts.ordinal AS INTEGER), snippet(content_fts, 4, '', '', '…', 16), bm25(content_fts)
+FROM content_fts
+JOIN content_fts_rowid
+  ON content_fts_rowid.fts_rowid = content_fts.rowid AND content_fts_rowid.view_gen = ?
+WHERE content_fts MATCH ?`)
+	args := []any{s.viewGen, match}
 	if repoPrefix != "" {
-		sb.WriteString(` AND repo_prefix = ?`)
+		sb.WriteString(` AND content_fts.repo_prefix = ?`)
 		args = append(args, repoPrefix)
 	}
 	sb.WriteString(` ORDER BY bm25(content_fts) LIMIT ?`)
@@ -573,10 +582,16 @@ func (s *Store) SearchContent(query, repoPrefix string, limit int) ([]graph.Cont
 func (s *Store) ScanContent(repoPrefix string, fn func(nodeID, filePath, body string) bool) error {
 	var rows *sql.Rows
 	var err error
+	// Same rowid-map join as SearchContent: the virtual table is shared, so the
+	// generation filter has to come from the ownership sidecar.
+	const scan = `SELECT content_fts.node_id, content_fts.file_path, content_fts.body
+FROM content_fts
+JOIN content_fts_rowid
+  ON content_fts_rowid.fts_rowid = content_fts.rowid AND content_fts_rowid.view_gen = ?`
 	if repoPrefix == "" {
-		rows, err = s.db.Query(`SELECT node_id, file_path, body FROM content_fts`)
+		rows, err = s.db.Query(scan, s.viewGen)
 	} else {
-		rows, err = s.db.Query(`SELECT node_id, file_path, body FROM content_fts WHERE repo_prefix = ?`, repoPrefix)
+		rows, err = s.db.Query(scan+` WHERE content_fts.repo_prefix = ?`, s.viewGen, repoPrefix)
 	}
 	if err != nil {
 		return err

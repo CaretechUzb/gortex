@@ -142,10 +142,32 @@ var bulkDroppableIndexes = []bulkDroppableIndex{
 	{"edges_by_file", `CREATE INDEX IF NOT EXISTS edges_by_file ON edges(file_path, kind)`},
 }
 
+// nodes_by_generation / edges_by_generation serve sparse-generation
+// enumeration and garbage collection: "which rows belong to generation g" and
+// "drop every row of generation g". Every other read binds its generation as a
+// residual conjunct on an existing access path, so these two are the only keys
+// in the package that lead with view_gen.
+//
+// The WHERE view_gen > 0 predicate is what makes them affordable. A store that
+// has only ever been plainly indexed holds nothing but generation-0 rows, so
+// both indexes stay empty and cost nothing to maintain; a sparse derived
+// generation gets a full leading seek. A reader must restate the predicate
+// literally — SQLite cannot prove a bound parameter is greater than zero — so
+// an ordinary `view_gen = ?` read keeps the plan it already had.
+const (
+	nodesByGenerationIndexName = "nodes_by_generation"
+	edgesByGenerationIndexName = "edges_by_generation"
+
+	nodesByGenerationIndexDDL = `CREATE INDEX IF NOT EXISTS nodes_by_generation ON nodes(view_gen, id) WHERE view_gen > 0`
+	edgesByGenerationIndexDDL = `CREATE INDEX IF NOT EXISTS edges_by_generation ON edges(view_gen, id) WHERE view_gen > 0`
+)
+
 // bulkAlwaysLiveIndexes are sparse partial indexes. Their predicates keep
 // maintenance bounded, while leaving them live preserves resolver and
 // repository projections as soon as the first repository publishes.
 var bulkAlwaysLiveIndexes = []bulkDroppableIndex{
+	{nodesByGenerationIndexName, nodesByGenerationIndexDDL},
+	{edgesByGenerationIndexName, edgesByGenerationIndexDDL},
 	{"nodes_repo_files", `CREATE INDEX IF NOT EXISTS nodes_repo_files ON nodes(repo_prefix, workspace_id, language, file_path, id) WHERE kind = 'file'`},
 	{"edges_by_unresolved", `CREATE INDEX IF NOT EXISTS edges_by_unresolved ON edges(is_unresolved) WHERE is_unresolved = 1`},
 	{"edges_fnvalue_prefixed", `CREATE INDEX IF NOT EXISTS edges_fnvalue_prefixed ON edges(to_id) WHERE to_id LIKE '%::unresolved::fnvalue::%'`},
@@ -693,16 +715,20 @@ func shouldBackoffBulkRowCheckpoint(err error) bool {
 // prior lifecycle state. Any query error fails closed to the ordinary indexed
 // writer path.
 //
-// The sidecar probes are deliberately generation-unscoped: a store holding any
-// generation's lifecycle rows has been indexed before, whichever view wrote
-// them, so it is not the cold store this fast path is for.
+// The node/edge probes name generation 0 explicitly rather than a handle's
+// generation: this fast path exists for the first index of the base corpus,
+// which is the only thing a cold load writes. The sidecar probes are
+// deliberately generation-unscoped: a store holding any generation's lifecycle
+// rows has been indexed before, whichever view wrote them, so it is not the
+// cold store this fast path is for.
 func coldGraphStoreEmpty(ctx context.Context, conn *sql.Conn) bool {
 	var empty int
 	err := conn.QueryRowContext(ctx, `
-SELECT NOT EXISTS(SELECT 1 FROM nodes)
-   AND NOT EXISTS(SELECT 1 FROM edges)
+SELECT NOT EXISTS(SELECT 1 FROM nodes WHERE view_gen = ?)
+   AND NOT EXISTS(SELECT 1 FROM edges WHERE view_gen = ?)
    AND NOT EXISTS(SELECT 1 FROM file_mtimes)
-   AND NOT EXISTS(SELECT 1 FROM repo_index_state)`).Scan(&empty)
+   AND NOT EXISTS(SELECT 1 FROM repo_index_state)`,
+		baseViewGeneration, baseViewGeneration).Scan(&empty)
 	return err == nil && empty == 1
 }
 

@@ -24,6 +24,7 @@ WITH pending AS (
         substr(to_id, instr(to_id, 'unresolved::') + length('unresolved::')) AS target_tail
     FROM edges INDEXED BY edges_by_unresolved
     WHERE ` + unresolvedEdgePredicate + `
+      AND view_gen = ?
 )
 SELECT
     kind,
@@ -52,7 +53,7 @@ var _ graph.UnresolvedFrontierCounter = (*Store)(nil)
 // follow-up queries.
 func (s *Store) CountUnresolvedFrontier() (graph.UnresolvedFrontierStats, error) {
 	stats := graph.UnresolvedFrontierStats{QueryCount: 1}
-	rows, err := s.db.Query(unresolvedFrontierSQL)
+	rows, err := s.db.Query(unresolvedFrontierSQL, s.viewGen)
 	if err != nil {
 		return stats, fmt.Errorf("count unresolved frontier: %w", err)
 	}

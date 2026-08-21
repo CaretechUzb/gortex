@@ -29,8 +29,9 @@ func (s *Store) BeginUnresolvedEdgeScan(ctx context.Context) (graph.UnresolvedEd
 	err := s.db.QueryRowContext(ctx, `SELECT id
 FROM edges INDEXED BY edges_by_unresolved
 WHERE `+unresolvedEdgePredicate+`
+  AND view_gen = ?
 ORDER BY id DESC
-LIMIT 1`).Scan(&scan.HighWaterID)
+LIMIT 1`, s.viewGen).Scan(&scan.HighWaterID)
 	if errors.Is(err, sql.ErrNoRows) {
 		scan.PendingBefore = 0
 		return scan, nil
@@ -112,7 +113,10 @@ func (s *Store) ReadUnresolvedEdgePage(ctx context.Context, scan graph.Unresolve
 		cond += `)`
 		predicate += ` AND ` + cond
 	}
-	args = append(args, maxRows)
+	// The generation binds last among the predicate's parameters, after every
+	// optional anchor clause, so the argument list follows the SQL text.
+	predicate += ` AND view_gen = ?`
+	args = append(args, s.viewGen, maxRows)
 	rows, err := s.db.QueryContext(ctx, `SELECT id, `+lookupEdgeCols+`
 FROM edges
 WHERE id > ? AND id <= ? AND `+predicate+`

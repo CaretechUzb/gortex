@@ -3,12 +3,19 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"strconv"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 	modernsqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
+
+// builtinSeenKey namespaces a materialised builtin stub by the generation it
+// was written into.
+func builtinSeenKey(viewGen int64, id string) string {
+	return strconv.FormatInt(viewGen, 10) + "\x00" + id
+}
 
 // view_gen leads both insert column lists: it is part of the nodes primary key
 // and of the edges dedup key, and every writer binds the handle's pinned
@@ -532,11 +539,15 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	// Lazy builtin-sentinel materialization, mirroring Graph.AddBatch: give
 	// every ::builtin:: edge target a real KindBuiltin node so those edges
 	// stop reading as orphans. The per-store seen-set keeps warm re-indexes
-	// from re-upserting identical stubs on every batch.
+	// from re-upserting identical stubs on every batch. It is keyed by
+	// generation: the set is shared by every handle over one core, so a stub
+	// the base corpus already holds must not suppress the same stub in a
+	// derived generation that has never had it written.
 	if stubs := graph.BuiltinStubNodes(edges); len(stubs) > 0 {
 		var fresh []*graph.Node
 		for _, stub := range stubs {
-			if _, dup := s.builtinSeen.LoadOrStore(stub.ID, struct{}{}); !dup {
+			key := builtinSeenKey(s.viewGen, stub.ID)
+			if _, dup := s.builtinSeen.LoadOrStore(key, struct{}{}); !dup {
 				fresh = append(fresh, stub)
 			}
 		}
@@ -629,7 +640,7 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 				ids = append(ids, edge.From)
 			}
 		}
-		identities, err = mutationNodeIdentitiesTx(tx, ids)
+		identities, err = mutationNodeIdentitiesTx(tx, s.viewGen, ids)
 		if err != nil {
 			identityExact = false
 			identities = make(map[string]sqliteMutationNodeIdentity)

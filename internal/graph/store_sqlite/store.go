@@ -870,11 +870,17 @@ func (s *Store) prepare() error {
 	// graph topology.
 	prepWrite(&s.stmtInsertNode,
 		`INSERT INTO nodes (`+nodeInsertColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`+nodeUpsertClause)
-	// view_gen is bound here, unlike every other read, because this statement
-	// probes the nodes PRIMARY KEY exactly: without it the same id can name one
-	// row per generation and the lookup returns whichever of them the seek
-	// reached first. The conjuncts follow the key order, so this is the full
-	// key rather than the id prefix a generation-blind read still seeks.
+	// Every read below binds the handle's generation as a trailing residual
+	// conjunct. It is never woven into an existing index key, so each statement
+	// keeps the access path it already had; on nodes (WITHOUT ROWID) the
+	// primary-key suffix rides along in every secondary index entry, so the
+	// filter is covering there.
+	//
+	// This one is not a residual at all: it probes the nodes PRIMARY KEY
+	// exactly, and the conjuncts follow the key order, so the generation
+	// completes the seek instead of filtering after it. Without it the same id
+	// names one row per generation and the lookup returns whichever the seek
+	// reached first.
 	prep(&s.stmtGetNode,
 		`SELECT `+nodeCols+` FROM nodes WHERE id = ? AND view_gen = ?`)
 	// The literal qual_name <> '' conjunct is what makes the partial
@@ -883,48 +889,52 @@ func (s *Store) prepare() error {
 	// on resolver hot paths (measured against a production store). Every
 	// reader of a partial index must restate its predicate literally.
 	prep(&s.stmtGetNodeByQual,
-		`SELECT `+nodeCols+` FROM nodes WHERE qual_name = ? AND qual_name <> '' ORDER BY id LIMIT 1`)
+		`SELECT `+nodeCols+` FROM nodes WHERE qual_name = ? AND qual_name <> '' AND view_gen = ? ORDER BY id LIMIT 1`)
 	prep(&s.stmtFindByName,
-		`SELECT `+nodeCols+` FROM nodes WHERE name = ?`)
+		`SELECT `+nodeCols+` FROM nodes WHERE name = ? AND view_gen = ?`)
 	prep(&s.stmtFindByNameInRepo,
-		`SELECT `+nodeCols+` FROM nodes WHERE name = ? AND repo_prefix = ?`)
+		`SELECT `+nodeCols+` FROM nodes WHERE name = ? AND repo_prefix = ? AND view_gen = ?`)
 	prep(&s.stmtFileNodes,
-		`SELECT `+nodeCols+` FROM nodes WHERE file_path = ?`)
+		`SELECT `+nodeCols+` FROM nodes WHERE file_path = ? AND view_gen = ?`)
 	prep(&s.stmtRepoNodes,
-		`SELECT `+nodeCols+` FROM nodes WHERE repo_prefix = ?`)
-	// ORDER BY id: nodes is WITHOUT ROWID keyed on id, so the scan already
-	// walks primary-key order and the clause costs nothing (no temp b-tree in
-	// the query plan). Stating it makes whole-graph enumeration reproducible
-	// instead of merely happening to be stable.
+		`SELECT `+nodeCols+` FROM nodes WHERE repo_prefix = ? AND view_gen = ?`)
+	// ORDER BY id: nodes is WITHOUT ROWID keyed on (id, view_gen), so the scan
+	// already walks primary-key order and the clause costs nothing (no temp
+	// b-tree in the query plan). Stating it makes whole-graph enumeration
+	// reproducible instead of merely happening to be stable.
 	prep(&s.stmtAllNodes,
-		`SELECT `+nodeCols+` FROM nodes ORDER BY id`)
+		`SELECT `+nodeCols+` FROM nodes WHERE view_gen = ? ORDER BY id`)
 	prep(&s.stmtNodeCount,
-		`SELECT COUNT(*) FROM nodes`)
+		`SELECT COUNT(*) FROM nodes WHERE view_gen = ?`)
 	prep(&s.stmtRepoPrefixes,
-		`SELECT DISTINCT repo_prefix FROM nodes WHERE repo_prefix <> ''`)
+		`SELECT DISTINCT repo_prefix FROM nodes WHERE repo_prefix <> '' AND view_gen = ?`)
 
 	prep(&s.stmtRepoStatsNodes,
-		`SELECT repo_prefix, kind, language, COUNT(*) FROM nodes WHERE repo_prefix <> '' GROUP BY repo_prefix, kind, language`)
+		`SELECT repo_prefix, kind, language, COUNT(*) FROM nodes WHERE repo_prefix <> '' AND view_gen = ? GROUP BY repo_prefix, kind, language`)
+	// The nodes-edges endpoint JOINs pair generations in the ON clause and
+	// bind the pair once in the WHERE. Without the pairing an edge in this
+	// generation could be attributed to a repository through a node of
+	// another, and the row would count twice as generations accumulate.
 	prep(&s.stmtRepoStatsEdges,
 		`SELECT n.repo_prefix, COUNT(*)
 		 FROM edges e
-		 JOIN nodes n ON n.id = e.from_id
-		 WHERE n.repo_prefix <> ''
+		 JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
+		 WHERE n.repo_prefix <> '' AND e.view_gen = ?
 		 GROUP BY n.repo_prefix`)
 	prep(&s.stmtRepoNodeCount,
-		`SELECT COUNT(*) FROM nodes WHERE repo_prefix = ?`)
+		`SELECT COUNT(*) FROM nodes WHERE repo_prefix = ? AND view_gen = ?`)
 	prep(&s.stmtRepoEdgeCount,
 		`SELECT COUNT(*)
 		 FROM edges e
-		 JOIN nodes n ON n.id = e.from_id
-		 WHERE n.repo_prefix = ?`)
+		 JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
+		 WHERE n.repo_prefix = ? AND e.view_gen = ?`)
 	prep(&s.stmtAllRepoCountsNodes,
-		`SELECT repo_prefix, COUNT(*) FROM nodes WHERE repo_prefix <> '' GROUP BY repo_prefix`)
+		`SELECT repo_prefix, COUNT(*) FROM nodes WHERE repo_prefix <> '' AND view_gen = ? GROUP BY repo_prefix`)
 	prep(&s.stmtAllRepoCountsEdges,
 		`SELECT n.repo_prefix, COUNT(*)
 		 FROM edges e
-		 JOIN nodes n ON n.id = e.from_id
-		 WHERE n.repo_prefix <> ''
+		 JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
+		 WHERE n.repo_prefix <> '' AND e.view_gen = ?
 		 GROUP BY n.repo_prefix`)
 	// The counters the indexer persists on the way in. repo_index_state is
 	// WITHOUT ROWID, so its primary key IS the table: this reads one row per
@@ -933,9 +943,9 @@ func (s *Store) prepare() error {
 		`SELECT repo_prefix, node_count, edge_count FROM repo_index_state WHERE view_gen = ?`)
 
 	prep(&s.stmtStatsByKind,
-		`SELECT kind, COUNT(*) FROM nodes GROUP BY kind`)
+		`SELECT kind, COUNT(*) FROM nodes WHERE view_gen = ? GROUP BY kind`)
 	prep(&s.stmtStatsByLanguage,
-		`SELECT language, COUNT(*) FROM nodes GROUP BY language`)
+		`SELECT language, COUNT(*) FROM nodes WHERE view_gen = ? GROUP BY language`)
 
 	const edgeCols = lookupEdgeCols
 
@@ -953,35 +963,40 @@ func (s *Store) prepare() error {
 	// key, so the planner satisfies them from the index walk with no temp
 	// b-tree.
 	prep(&s.stmtOutEdges,
-		`SELECT `+edgeCols+` FROM edges WHERE from_id = ? ORDER BY line, id`)
+		`SELECT `+edgeCols+` FROM edges WHERE from_id = ? AND view_gen = ? ORDER BY line, id`)
 	prep(&s.stmtInEdges,
-		`SELECT `+edgeCols+` FROM edges WHERE to_id = ? ORDER BY kind, id`)
+		`SELECT `+edgeCols+` FROM edges WHERE to_id = ? AND view_gen = ? ORDER BY kind, id`)
 	prep(&s.stmtRepoEdges,
 		`SELECT `+lookupQualifiedEdgeCols+`
 		   FROM edges e
-		   JOIN nodes n ON n.id = e.from_id
-		  WHERE n.repo_prefix = ?`)
+		   JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
+		  WHERE n.repo_prefix = ? AND e.view_gen = ?`)
 	// id is the rowid alias, so the full scan already yields insertion order
 	// and the clause adds no sorter — same reasoning as stmtAllNodes above.
 	prep(&s.stmtAllEdges,
-		`SELECT `+edgeCols+` FROM edges ORDER BY id`)
+		`SELECT `+edgeCols+` FROM edges WHERE view_gen = ? ORDER BY id`)
 	prep(&s.stmtEdgeCount,
-		`SELECT COUNT(*) FROM edges`)
+		`SELECT COUNT(*) FROM edges WHERE view_gen = ?`)
+	// The edge mutation statements all bind the handle's generation as a
+	// trailing residual conjunct: they rewrite or delete rows this handle
+	// owns, and an identical edge in another generation belongs to another
+	// corpus. The conjunct is appended, never woven into the existing key
+	// order, so each statement keeps the index it already sought through.
 	prepWrite(&s.stmtRemoveEdge,
-		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ?`)
+		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND view_gen = ?`)
 
 	prep(&s.stmtSelectEdgeOrigin,
-		`SELECT origin FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
+		`SELECT origin FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ?`)
 	prepWrite(&s.stmtUpdateEdgeOrigin,
-		`UPDATE edges SET origin = ?, tier = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
+		`UPDATE edges SET origin = ?, tier = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ?`)
 	prepWrite(&s.stmtUpdateEdgeAttrs,
-		`UPDATE edges SET confidence = ?, confidence_label = ?, origin = ?, tier = ?, meta = ?, resolve_terminal = ?, resolve_terminal_reason = ?, semantic_source = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
+		`UPDATE edges SET confidence = ?, confidence_label = ?, origin = ?, tier = ?, meta = ?, resolve_terminal = ?, resolve_terminal_reason = ?, semantic_source = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ?`)
 	prepWrite(&s.stmtDeleteEdgeByKey,
-		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
-	// The second statement that binds view_gen: this one probes the edges
-	// UNIQUE key, which now ends with the generation. It answers "would the
-	// INSERT OR IGNORE that writes this edge be a no-op", so an identical edge
-	// in another generation must not read as present.
+		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ?`)
+	// This one probes the edges UNIQUE key, which ends with the generation, so
+	// the conjunct completes the seek rather than filtering after it. It
+	// answers "would the INSERT OR IGNORE that writes this edge be a no-op",
+	// so an identical edge in another generation must not read as present.
 	prep(&s.stmtEdgeExists,
 		`SELECT 1 FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ? LIMIT 1`)
 
@@ -1293,7 +1308,7 @@ func (s *Store) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
 	// detached copy whose Origin already matches newOrigin even though
 	// the row still has the old value.
 	var storedOrigin string
-	row := s.stmtSelectEdgeOrigin.QueryRow(e.From, e.To, string(e.Kind), e.FilePath, e.Line)
+	row := s.stmtSelectEdgeOrigin.QueryRow(e.From, e.To, string(e.Kind), e.FilePath, e.Line, s.viewGen)
 	if err := row.Scan(&storedOrigin); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false
@@ -1312,8 +1327,8 @@ func (s *Store) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
 		newTier = graph.ResolvedBy(newOrigin)
 	}
 	if _, err := s.execActiveWriteLocked(context.Background(),
-		`UPDATE edges SET origin = ?, tier = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`,
-		newOrigin, newTier, e.From, e.To, string(e.Kind), e.FilePath, e.Line,
+		`UPDATE edges SET origin = ?, tier = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ?`,
+		newOrigin, newTier, e.From, e.To, string(e.Kind), e.FilePath, e.Line, s.viewGen,
 	); err != nil {
 		panicOnFatal(err)
 		return false
@@ -1352,10 +1367,10 @@ func (s *Store) PersistEdgeAttributes(e *graph.Edge) {
 		return
 	}
 	res, err := s.execActiveWriteLocked(context.Background(),
-		`UPDATE edges SET confidence = ?, confidence_label = ?, origin = ?, tier = ?, meta = ?, resolve_terminal = ?, resolve_terminal_reason = ?, semantic_source = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`,
+		`UPDATE edges SET confidence = ?, confidence_label = ?, origin = ?, tier = ?, meta = ?, resolve_terminal = ?, resolve_terminal_reason = ?, semantic_source = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ?`,
 		e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier, metaBlob,
 		p.resolveTerminal, p.resolveTerminalReason, p.semanticSource,
-		e.From, e.To, string(e.Kind), e.FilePath, e.Line,
+		e.From, e.To, string(e.Kind), e.FilePath, e.Line, s.viewGen,
 	)
 	if err != nil {
 		panicOnFatal(err)
@@ -1385,7 +1400,8 @@ func (s *Store) PersistEdgeAttributesBatch(edges []*graph.Edge) {
 	}
 }
 
-// Thirteen bound values are carried per logical edge. Seventy-five rows use 975 host
+// Thirteen bound values are carried per logical edge, plus one trailing
+// generation binding for the whole statement. Seventy-five rows use 976 host
 // parameters, leaving headroom below SQLite's conservative 999-variable
 // limit while collapsing the former one-UPDATE-per-edge loop.
 const (
@@ -1418,7 +1434,7 @@ func (s *Store) persistEdgeAttributesBatch(edges []*graph.Edge) (statements int,
 		chunkChanged := false
 		for j := i; j < end; j += edgeAttributeUpdateChunkSize {
 			batchEnd := minInt(j+edgeAttributeUpdateChunkSize, end)
-			query, args, err := edgeAttributeUpdateStatement(edges[j:batchEnd])
+			query, args, err := edgeAttributeUpdateStatement(s.viewGen, edges[j:batchEnd])
 			if err != nil {
 				_ = tx.Rollback()
 				return statements, err
@@ -1463,7 +1479,7 @@ func (s *Store) persistEdgeAttributesBatch(edges []*graph.Edge) (statements int,
 // logical keys within a chunk retain their last value, matching the former
 // ordered per-edge loop; duplicates across chunks are naturally overwritten
 // by the later statement.
-func edgeAttributeUpdateStatement(edges []*graph.Edge) (string, []any, error) {
+func edgeAttributeUpdateStatement(viewGen int64, edges []*graph.Edge) (string, []any, error) {
 	updates := make([]*graph.Edge, 0, len(edges))
 	positions := make(map[edgeAttributeKey]int, len(edges))
 	for _, edge := range edges {
@@ -1504,6 +1520,9 @@ func edgeAttributeUpdateStatement(edges []*graph.Edge) (string, []any, error) {
 			edge.From, edge.To, string(edge.Kind), edge.FilePath, edge.Line,
 		)
 	}
+	// The generation rides one bound value for the whole statement, after the
+	// per-row VALUES arguments the placeholders above consumed.
+	args = append(args, viewGen)
 
 	query := `WITH updates(
 		confidence, confidence_label, origin, tier, meta,
@@ -1525,6 +1544,7 @@ func edgeAttributeUpdateStatement(edges []*graph.Edge) (string, []any, error) {
 		AND e.kind = u.kind
 		AND e.file_path = u.file_path
 		AND e.line = u.line
+		AND e.view_gen = ?
 		AND (e.confidence IS NOT u.confidence
 			OR e.confidence_label IS NOT u.confidence_label
 			OR e.origin IS NOT u.origin
@@ -1574,7 +1594,7 @@ func (s *Store) ReindexEdge(e *graph.Edge, oldTo string) {
 	insertStmt := tx.Stmt(s.stmtInsertEdge)
 	defer insertStmt.Close()
 
-	res, err := deleteStmt.Exec(e.From, oldTo, string(e.Kind), e.FilePath, e.Line)
+	res, err := deleteStmt.Exec(e.From, oldTo, string(e.Kind), e.FilePath, e.Line, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return
@@ -1665,8 +1685,8 @@ func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 		return false
 	}
 	res, err := s.execActiveWriteLocked(context.Background(),
-		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ?`,
-		from, to, string(kind),
+		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND view_gen = ?`,
+		from, to, string(kind), s.viewGen,
 	)
 	if err != nil {
 		panicOnFatal(err)
@@ -1689,7 +1709,7 @@ func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 // that touches one of those nodes. Returns (nodesRemoved,
 // edgesRemoved).
 func (s *Store) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
-	return s.evictByPredicate(evictFilePredicate, filePath)
+	return s.evictByPredicate(evictFilePredicate, filePath, evictThisGeneration)
 }
 
 // EvictRepo removes every node in repoPrefix and every edge that
@@ -1706,6 +1726,9 @@ func (s *Store) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
 // The divergence expires once every repo carries a prefix: "" then names
 // only the synthetic global externals, which no caller should ever bulk
 // evict, and this can refuse "" the way PurgeRepo already does.
+//
+// Generation-unscoped by design: a repository leaving the store leaves every
+// payload view generation with it, the same rule PurgeRepo follows.
 func (s *Store) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
 	predicate := evictRepoPredicate
 	if repoPrefix != "" {
@@ -1713,7 +1736,7 @@ func (s *Store) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
 		// that compact index for ordinary named repositories.
 		predicate = evictNonEmptyRepoPredicate
 	}
-	return s.evictByPredicate(predicate, repoPrefix)
+	return s.evictByPredicate(predicate, repoPrefix, evictAllGenerations)
 }
 
 // -- reads ---------------------------------------------------------------
@@ -1735,7 +1758,7 @@ func (s *Store) GetNodeByQualName(qualName string) *graph.Node {
 	if qualName == "" {
 		return nil
 	}
-	row := s.stmtGetNodeByQual.QueryRow(qualName)
+	row := s.stmtGetNodeByQual.QueryRow(qualName, s.viewGen)
 	n, err := scanNode(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1748,11 +1771,11 @@ func (s *Store) GetNodeByQualName(qualName string) *graph.Node {
 }
 
 func (s *Store) FindNodesByName(name string) []*graph.Node {
-	return s.queryNodes(s.stmtFindByName, name)
+	return s.queryNodes(s.stmtFindByName, name, s.viewGen)
 }
 
 func (s *Store) FindNodesByNameInRepo(name, repoPrefix string) []*graph.Node {
-	return s.queryNodes(s.stmtFindByNameInRepo, name, repoPrefix)
+	return s.queryNodes(s.stmtFindByNameInRepo, name, repoPrefix, s.viewGen)
 }
 
 func (s *Store) GetFileNodes(filePath string) []*graph.Node {
@@ -1763,11 +1786,11 @@ func (s *Store) GetFileNodes(filePath string) []*graph.Node {
 // localization. QueryContext covers both pool acquisition and SQLite execution,
 // so a busy store cannot extend a request beyond its context budget.
 func (s *Store) GetFileNodesContext(ctx context.Context, filePath string) []*graph.Node {
-	return s.queryNodesContext(ctx, s.stmtFileNodes, filePath)
+	return s.queryNodesContext(ctx, s.stmtFileNodes, filePath, s.viewGen)
 }
 
 func (s *Store) GetRepoNodes(repoPrefix string) []*graph.Node {
-	return s.queryNodes(s.stmtRepoNodes, repoPrefix)
+	return s.queryNodes(s.stmtRepoNodes, repoPrefix, s.viewGen)
 }
 
 func (s *Store) GetRepoNodesByLanguage(repoPrefix, language string) []*graph.Node {
@@ -1775,13 +1798,13 @@ func (s *Store) GetRepoNodesByLanguage(repoPrefix, language string) []*graph.Nod
 		return nil
 	}
 	return s.queryNodesSQL(
-		`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND language = ? ORDER BY id`,
-		repoPrefix, language,
+		`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND language = ? AND view_gen = ? ORDER BY id`,
+		repoPrefix, language, s.viewGen,
 	)
 }
 
 func (s *Store) AllNodes() []*graph.Node {
-	return s.queryNodes(s.stmtAllNodes)
+	return s.queryNodes(s.stmtAllNodes, s.viewGen)
 }
 
 func (s *Store) queryNodes(stmt *sql.Stmt, args ...any) []*graph.Node {
@@ -1828,16 +1851,16 @@ func (s *Store) queryNodesContext(ctx context.Context, stmt *sql.Stmt, args ...a
 func (s *Store) GetRepoNonContentNodes(repoPrefix string) []*graph.Node {
 	const filter = `COALESCE(data_class, CASE WHEN json_valid(CAST(meta AS TEXT)) THEN json_extract(CAST(meta AS TEXT), '$.data_class') END) IS NOT 'content'`
 	if repoPrefix == "" {
-		return s.scanNodeQuery(`SELECT ` + lookupNodeCols + ` FROM nodes WHERE ` + filter)
+		return s.scanNodeQuery(`SELECT `+lookupNodeCols+` FROM nodes WHERE `+filter+` AND view_gen = ?`, s.viewGen)
 	}
-	return s.scanNodeQuery(`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND `+filter, repoPrefix)
+	return s.scanNodeQuery(`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND `+filter+` AND view_gen = ?`, repoPrefix, s.viewGen)
 }
 
 // AllNodesLight implements graph.NodeLightScanner with the identity/location
 // projection only. Whole-graph analyses avoid both the opaque metadata blob and
 // promoted docs/signatures, so returned nodes always have nil Meta.
 func (s *Store) AllNodesLight() []*graph.Node {
-	rows, err := s.db.Query(`SELECT ` + lookupNodeSummaryCols + ` FROM nodes`)
+	rows, err := s.db.Query(`SELECT `+lookupNodeSummaryCols+` FROM nodes WHERE view_gen = ?`, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -1862,7 +1885,7 @@ func (s *Store) AllNodesLight() []*graph.Node {
 // only need promoted structural fields. This keeps an already-enriched repo's
 // metadata blobs out of the driver and decoder hot path.
 func (s *Store) GetRepoNodesLight(repoPrefix string) []*graph.Node {
-	rows, err := s.db.Query(`SELECT `+lookupNodeColsLight+` FROM nodes WHERE repo_prefix = ?`, repoPrefix)
+	rows, err := s.db.Query(`SELECT `+lookupNodeColsLight+` FROM nodes WHERE repo_prefix = ? AND view_gen = ?`, repoPrefix, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -1912,7 +1935,7 @@ func (s *Store) scanNodeQuery(query string, args ...any) []*graph.Node {
 }
 
 func (s *Store) GetOutEdges(nodeID string) []*graph.Edge {
-	return s.queryEdges(s.stmtOutEdges, nodeID)
+	return s.queryEdges(s.stmtOutEdges, nodeID, s.viewGen)
 }
 
 // EdgeExists reports whether an edge with exactly this identity is present --
@@ -1936,7 +1959,7 @@ func (s *Store) EdgeExists(from, to string, kind graph.EdgeKind, filePath string
 }
 
 func (s *Store) GetInEdges(nodeID string) []*graph.Edge {
-	return s.queryEdges(s.stmtInEdges, nodeID)
+	return s.queryEdges(s.stmtInEdges, nodeID, s.viewGen)
 }
 
 // GetOutEdgesForNodes fetches the out-edges of many nodes in one batched query
@@ -1965,12 +1988,13 @@ func (s *Store) GetOutEdgesForNodes(ids []string) map[string][]*graph.Edge {
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
 		ph := make([]string, len(chunk))
-		args := make([]any, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
 		for j, id := range chunk {
 			ph[j] = "?"
-			args[j] = id
+			args = append(args, id)
 		}
-		q := `SELECT ` + lookupEdgeCols + ` FROM edges WHERE from_id IN (` + strings.Join(ph, ",") + `)`
+		args = append(args, s.viewGen)
+		q := `SELECT ` + lookupEdgeCols + ` FROM edges WHERE from_id IN (` + strings.Join(ph, ",") + `) AND view_gen = ?`
 		for _, e := range s.queryEdgesSQL(q, args...) {
 			out[e.From] = append(out[e.From], e)
 		}
@@ -1979,7 +2003,7 @@ func (s *Store) GetOutEdgesForNodes(ids []string) map[string][]*graph.Edge {
 }
 
 func (s *Store) AllEdges() []*graph.Edge {
-	return s.queryEdges(s.stmtAllEdges)
+	return s.queryEdges(s.stmtAllEdges, s.viewGen)
 }
 
 // GetRepoEdges returns every edge whose source node has the given
@@ -1993,7 +2017,7 @@ func (s *Store) GetRepoEdges(repoPrefix string) []*graph.Edge {
 	if repoPrefix == "" {
 		return nil
 	}
-	return s.queryEdges(s.stmtRepoEdges, repoPrefix)
+	return s.queryEdges(s.stmtRepoEdges, repoPrefix, s.viewGen)
 }
 
 func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
@@ -2028,7 +2052,7 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 
 func (s *Store) NodeCount() int {
 	var n int
-	if err := s.stmtNodeCount.QueryRow().Scan(&n); err != nil {
+	if err := s.stmtNodeCount.QueryRow(s.viewGen).Scan(&n); err != nil {
 		panicOnFatal(err)
 		return 0
 	}
@@ -2037,7 +2061,7 @@ func (s *Store) NodeCount() int {
 
 func (s *Store) EdgeCount() int {
 	var n int
-	if err := s.stmtEdgeCount.QueryRow().Scan(&n); err != nil {
+	if err := s.stmtEdgeCount.QueryRow(s.viewGen).Scan(&n); err != nil {
 		panicOnFatal(err)
 		return 0
 	}
@@ -2052,7 +2076,7 @@ func (s *Store) Stats() graph.GraphStats {
 	st.TotalNodes = s.NodeCount()
 	st.TotalEdges = s.EdgeCount()
 
-	rows, err := s.stmtStatsByKind.Query()
+	rows, err := s.stmtStatsByKind.Query(s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return st
@@ -2077,7 +2101,7 @@ func (s *Store) Stats() graph.GraphStats {
 	}
 	_ = rows.Close()
 
-	rows, err = s.stmtStatsByLanguage.Query()
+	rows, err = s.stmtStatsByLanguage.Query(s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return st
@@ -2103,7 +2127,7 @@ func (s *Store) Stats() graph.GraphStats {
 
 func (s *Store) RepoStats() map[string]graph.GraphStats {
 	out := map[string]graph.GraphStats{}
-	rows, err := s.stmtRepoStatsNodes.Query()
+	rows, err := s.stmtRepoStatsNodes.Query(s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return out
@@ -2132,7 +2156,7 @@ func (s *Store) RepoStats() map[string]graph.GraphStats {
 	}
 	_ = rows.Close()
 
-	rows, err = s.stmtRepoStatsEdges.Query()
+	rows, err = s.stmtRepoStatsEdges.Query(s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return out
@@ -2162,7 +2186,7 @@ func (s *Store) RepoStats() map[string]graph.GraphStats {
 }
 
 func (s *Store) RepoPrefixes() []string {
-	rows, err := s.stmtRepoPrefixes.Query()
+	rows, err := s.stmtRepoPrefixes.Query(s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -2211,11 +2235,11 @@ const (
 func (s *Store) RepoMemoryEstimate(repoPrefix string) graph.RepoMemoryEstimate {
 	var est graph.RepoMemoryEstimate
 	var n, e int
-	if err := s.stmtRepoNodeCount.QueryRow(repoPrefix).Scan(&n); err != nil {
+	if err := s.stmtRepoNodeCount.QueryRow(repoPrefix, s.viewGen).Scan(&n); err != nil {
 		panicOnFatal(err)
 		return est
 	}
-	if err := s.stmtRepoEdgeCount.QueryRow(repoPrefix).Scan(&e); err != nil {
+	if err := s.stmtRepoEdgeCount.QueryRow(repoPrefix, s.viewGen).Scan(&e); err != nil {
 		panicOnFatal(err)
 		return est
 	}
@@ -2318,7 +2342,7 @@ func (s *Store) ScanRepoMemoryEstimates(ctx context.Context) (map[string]graph.R
 // scanRepoCounts runs one COUNT … GROUP BY repo_prefix scan to completion.
 // A scan cut short by the caller's deadline is an error, never a short map.
 func (s *Store) scanRepoCounts(ctx context.Context, stmt *sql.Stmt) (map[string]int, error) {
-	rows, err := stmt.QueryContext(ctx)
+	rows, err := stmt.QueryContext(ctx, s.viewGen)
 	if err != nil {
 		if ctx.Err() == nil {
 			panicOnFatal(err)
@@ -2452,7 +2476,7 @@ func isStoreClosedErr(err error) bool {
 func (s *Store) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
 		out := s.queryEdgesSQL(`SELECT `+lookupEdgeCols+`
-FROM edges WHERE kind = ?`, string(kind))
+FROM edges WHERE kind = ? AND view_gen = ?`, string(kind), s.viewGen)
 		for _, e := range out {
 			if !yield(e) {
 				return
@@ -2464,7 +2488,7 @@ FROM edges WHERE kind = ?`, string(kind))
 // NodesByKind: indexed SELECT on the (kind) column.
 func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 	return func(yield func(*graph.Node) bool) {
-		out := s.queryNodesSQL(`SELECT `+lookupNodeCols+` FROM nodes WHERE kind = ?`, string(kind))
+		out := s.queryNodesSQL(`SELECT `+lookupNodeCols+` FROM nodes WHERE kind = ? AND view_gen = ?`, string(kind), s.viewGen)
 		for _, n := range out {
 			if !yield(n) {
 				return
@@ -2613,11 +2637,12 @@ func (s *Store) GetNodesByIDs(ids []string) map[string]*graph.Node {
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
 		placeholders := strings.Repeat(",?", len(chunk))[1:]
-		q := `SELECT ` + nodeCols + ` FROM nodes WHERE id IN (` + placeholders + `)`
-		args := make([]any, len(chunk))
-		for j, id := range chunk {
-			args[j] = id
+		q := `SELECT ` + nodeCols + ` FROM nodes WHERE id IN (` + placeholders + `) AND view_gen = ?`
+		args := make([]any, 0, len(chunk)+1)
+		for _, id := range chunk {
+			args = append(args, id)
 		}
+		args = append(args, s.viewGen)
 		for _, n := range s.queryNodesSQL(q, args...) {
 			if n != nil {
 				out[n.ID] = n
@@ -2654,11 +2679,12 @@ func (s *Store) FindNodesByNames(names []string) map[string][]*graph.Node {
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
 		placeholders := strings.Repeat(",?", len(chunk))[1:]
-		q := `SELECT ` + nodeCols + ` FROM nodes WHERE name IN (` + placeholders + `)`
-		args := make([]any, len(chunk))
-		for j, name := range chunk {
-			args[j] = name
+		q := `SELECT ` + nodeCols + ` FROM nodes WHERE name IN (` + placeholders + `) AND view_gen = ?`
+		args := make([]any, 0, len(chunk)+1)
+		for _, name := range chunk {
+			args = append(args, name)
 		}
+		args = append(args, s.viewGen)
 		for _, n := range s.queryNodesSQL(q, args...) {
 			if n == nil {
 				continue

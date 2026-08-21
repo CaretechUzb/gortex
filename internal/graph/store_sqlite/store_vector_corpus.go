@@ -235,7 +235,8 @@ func validateVectorCorpusOwnershipTx(
 			stmt = append(stmt, '?')
 			args = append(args, id)
 		}
-		stmt = append(stmt, ')')
+		stmt = append(stmt, ") AND view_gen = ?"...)
+		args = append(args, viewGen)
 
 		rows, err := tx.QueryContext(ctx, string(stmt), args...)
 		if err != nil {

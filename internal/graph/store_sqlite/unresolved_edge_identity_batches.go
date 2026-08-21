@@ -65,12 +65,13 @@ func (s *Store) unresolvedEdgeIdentityPage(
 	WHERE id > ? AND id <= ? AND kind IN (` + inPlaceholders(len(kinds)) + `)
 	  AND (substr(to_id, 1, 12) = 'unresolved::'
 	       OR instr(to_id, '::unresolved::') > 0)
+	  AND view_gen = ?
 	ORDER BY id
 	LIMIT ?`
-	args := make([]any, 0, len(kinds)+3)
+	args := make([]any, 0, len(kinds)+4)
 	args = append(args, after, highWater)
 	args = append(args, toAnyArgs(kinds)...)
-	args = append(args, limit)
+	args = append(args, s.viewGen, limit)
 	rows, err := s.queryActiveWriteLocked(context.Background(), query, args...)
 	if err != nil {
 		panicOnFatal(err)
@@ -216,12 +217,12 @@ func (s *Store) reindexUnresolvedEdgeTargetsTransactionLocked(
 
 	var repairDeletes []sqliteReindexKey
 	stats.updatedRows, stats.updateStatements, repairDeletes, err =
-		updateSQLiteUnresolvedTargetsTxLimited(tx, mutations, variableLimit)
+		updateSQLiteUnresolvedTargetsTxLimited(tx, s.viewGen, mutations, variableLimit)
 	if err != nil {
 		return stats, false, false, err
 	}
 	stats.deletedRows, stats.deleteStatements, err =
-		deleteSQLiteReindexRowsTxLimited(tx, repairDeletes, variableLimit)
+		deleteSQLiteReindexRowsTxLimited(tx, s.viewGen, repairDeletes, variableLimit)
 	if err != nil {
 		return stats, false, false, err
 	}
@@ -276,6 +277,7 @@ func sqliteUnresolvedTargetMutations(
 
 func updateSQLiteUnresolvedTargetsTxLimited(
 	tx *sql.Tx,
+	viewGen int64,
 	mutations []sqliteUnresolvedTargetMutation,
 	variableLimit *int,
 ) (updatedRows, statements int, repairDeletes []sqliteReindexKey, err error) {
@@ -292,7 +294,7 @@ func updateSQLiteUnresolvedTargetsTxLimited(
 	)
 	for pos := 0; pos < len(mutations); {
 		chunkStart := pos
-		args := make([]any, 0, rowLimit*unresolvedTargetUpdateParamsPerRow)
+		args := make([]any, 0, rowLimit*unresolvedTargetUpdateParamsPerRow+1)
 		argBytes := 0
 		rowCount := 0
 		for pos < len(mutations) && rowCount < rowLimit {
@@ -311,6 +313,7 @@ func updateSQLiteUnresolvedTargetsTxLimited(
 			rowCount++
 			argBytes += rowBytes
 		}
+		args = append(args, viewGen)
 
 		query := `WITH patch(old_from_id, old_to_id, kind, file_path, line, new_to_id) AS (VALUES ` +
 			multiValues(rowCount, unresolvedTargetUpdateParamsPerRow) + `)
@@ -321,7 +324,8 @@ func updateSQLiteUnresolvedTargetsTxLimited(
 			AND e.to_id = p.old_to_id
 			AND e.kind = p.kind
 			AND e.file_path = p.file_path
-			AND e.line = p.line`
+			AND e.line = p.line
+			AND e.view_gen = ?`
 		result, execErr := tx.Exec(query, args...)
 		if tooManySQLVariables(execErr) && rowCount > 1 {
 			rowLimit = lowerBatchVariableLimit(variableLimit, unresolvedTargetUpdateParamsPerRow, rowCount)

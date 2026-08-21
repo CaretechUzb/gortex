@@ -162,15 +162,15 @@ WHERE view_gen = ? AND repo_prefix = ? AND node_id IN (` + placeholders + `)`
 
 		// The nodes.clone_sig mirror reads back the signature this handle just
 		// wrote, so its subqueries carry the same generation scope.
-		nodeArgs := make([]any, 0, len(ids)+3)
+		nodeArgs := make([]any, 0, len(ids)+4)
 		nodeArgs = append(nodeArgs, viewGen)
 		for _, id := range ids {
 			nodeArgs = append(nodeArgs, id)
 		}
-		nodeArgs = append(nodeArgs, repoPrefix, viewGen)
+		nodeArgs = append(nodeArgs, repoPrefix, viewGen, viewGen)
 		updateNodes := `UPDATE nodes
 SET clone_sig = NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id AND view_gen = ?), '')
-WHERE id IN (` + placeholders + `) AND repo_prefix = ?
+WHERE id IN (` + placeholders + `) AND repo_prefix = ? AND view_gen = ?
   AND clone_sig IS NOT NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id AND view_gen = ?), '')`
 		if _, err := tx.Exec(updateNodes, nodeArgs...); err != nil {
 			return err
@@ -193,7 +193,7 @@ func (s *Store) ReplaceCloneCorpus(repoPrefix string, rows []graph.CloneCorpusRo
 	if _, err := tx.Exec(`DELETE FROM clone_shingles WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE nodes SET clone_sig = NULL WHERE repo_prefix = ? AND clone_sig IS NOT NULL`, repoPrefix); err != nil {
+	if _, err := tx.Exec(`UPDATE nodes SET clone_sig = NULL WHERE repo_prefix = ? AND view_gen = ? AND clone_sig IS NOT NULL`, repoPrefix, s.viewGen); err != nil {
 		return err
 	}
 	if err := upsertCloneCorpusTx(tx, s.viewGen, repoPrefix, rows); err != nil {
@@ -265,15 +265,15 @@ WHERE clone_shingles.repo_prefix IS NOT excluded.repo_prefix
 			continue
 		}
 		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-		updateArgs := make([]any, 0, len(ids)+2)
+		updateArgs := make([]any, 0, len(ids)+3)
 		updateArgs = append(updateArgs, viewGen)
 		for i := range ids {
 			updateArgs = append(updateArgs, ids[i])
 		}
-		updateArgs = append(updateArgs, viewGen)
+		updateArgs = append(updateArgs, viewGen, viewGen)
 		update := `UPDATE nodes
 SET clone_sig = NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id AND view_gen = ?), '')
-WHERE id IN (` + placeholders + `)
+WHERE id IN (` + placeholders + `) AND view_gen = ?
   AND clone_sig IS NOT NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id AND view_gen = ?), '')`
 		if _, err := tx.Exec(update, updateArgs...); err != nil {
 			return err

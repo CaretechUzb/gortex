@@ -59,10 +59,10 @@ func (s *Store) FindNodesByNameBounded(
 		if err := ctx.Err(); err != nil {
 			return graph.BoundedNodeProjection{}, err
 		}
-		pageArgs := append(append([]any(nil), args...), lastID, rawPageSize)
+		pageArgs := append(append([]any(nil), args...), s.viewGen, lastID, rawPageSize)
 		rows, queryErr := tx.QueryContext(
 			ctx,
-			`SELECT `+lookupLocalizationNodeCols+` FROM nodes WHERE `+predicate+` AND id > ? ORDER BY id LIMIT ?`,
+			`SELECT `+lookupLocalizationNodeCols+` FROM nodes WHERE `+predicate+` AND view_gen = ? AND id > ? ORDER BY id LIMIT ?`,
 			pageArgs...,
 		)
 		if queryErr != nil {
@@ -151,10 +151,10 @@ func (s *Store) FindFileNodesBounded(
 		if err := ctx.Err(); err != nil {
 			return graph.BoundedNodeProjection{}, err
 		}
-		pageArgs := append(append([]any(nil), args...), lastID, rawPageSize)
+		pageArgs := append(append([]any(nil), args...), s.viewGen, lastID, rawPageSize)
 		rows, queryErr := tx.QueryContext(
 			ctx,
-			`SELECT `+columns+` FROM nodes WHERE `+predicate+` AND id > ? ORDER BY id LIMIT ?`,
+			`SELECT `+columns+` FROM nodes WHERE `+predicate+` AND view_gen = ? AND id > ? ORDER BY id LIMIT ?`,
 			pageArgs...,
 		)
 		if queryErr != nil {
