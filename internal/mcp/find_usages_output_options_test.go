@@ -97,6 +97,25 @@ func TestFindUsages_LimitTruncationMetaGCX(t *testing.T) {
 	require.NotContains(t, full, "truncated=true", "an uncapped response must not carry truncation meta")
 }
 
+// TestFindUsages_GroupByFileHonorsLimit pins the row cap on the
+// group_by:"file" shape: the buckets cover the capped page, and a
+// truncated grouped response carries the full total alongside its
+// per-page counts so the cut stays legible.
+func TestFindUsages_GroupByFileHonorsLimit(t *testing.T) {
+	srv, hotID := usagesLimitServer(t, 6)
+
+	var resp struct {
+		TotalUses  int  `json:"total_uses"`
+		TotalEdges int  `json:"total_edges"`
+		Truncated  bool `json:"truncated"`
+	}
+	out := findUsagesText(t, srv, map[string]any{"id": hotID, "limit": 2, "group_by": "file"})
+	require.NoError(t, json.Unmarshal([]byte(out), &resp))
+	require.Equal(t, 2, resp.TotalUses, "the grouped page covers the capped rows")
+	require.True(t, resp.Truncated)
+	require.Equal(t, 6, resp.TotalEdges, "a truncated grouped page must carry the full total")
+}
+
 // TestFindUsages_CompactWinsOverGCX pins the `compact` option against
 // the GCX format path: compact is an explicit caller choice, so it
 // takes precedence exactly as it does in the shared returnSubGraph

@@ -3053,13 +3053,19 @@ func groupUsagesByFile(sg *query.SubGraph) map[string]any {
 		}
 		return out[i].File < out[j].File
 	})
-	return map[string]any{
+	grouped := map[string]any{
 		"grouped_by": "file",
 		"file_count": len(out),
 		"total_uses": len(sg.Edges),
 		"groups":     out,
 		"truncated":  sg.Truncated,
 	}
+	// On a capped page total_uses counts only the rows below; carry the
+	// full row count alongside so the cut stays legible in this shape too.
+	if sg.Truncated {
+		grouped["total_edges"] = sg.TotalEdges
+	}
+	return grouped
 }
 
 // truncateUsageRows enforces find_usages' advertised `limit` on the
