@@ -435,6 +435,301 @@ CREATE TABLE IF NOT EXISTS analysis_blobs (
 ) WITHOUT ROWID;
 `
 
+// checkoutCatalogSchemaSQL is the checkout-lifecycle control plane: which
+// working copies the daemon knows about, what it intends to do with each one,
+// which graph and view generation a checkout currently routes to, and what is
+// queued for cleanup. It is a CONTROL plane, not a payload one — no table here
+// references nodes / edges / files / vectors, and nothing here re-keys them.
+// Payload rows are replaced wholesale by an incremental reindex, so a foreign
+// key into them would either erase control-plane state or turn a one-file edit
+// into a large cascade; the same reasoning keeps analysis generations detached.
+//
+// Foreign keys inside the catalog are load-bearing and rely on the store's
+// per-connection foreign_keys(ON) pragma (see sqlitePerConnectionPragmasBase):
+//
+//   - ON DELETE CASCADE ties a checkout's intents, its in-flight intent
+//     transition and its path evidence to the checkout row, so forgetting a
+//     checkout cannot strand them.
+//   - ON DELETE RESTRICT on every generation pointer (checkout_routes,
+//     ref_views, view_generations.base_generation_id) and on the ownership
+//     edges (a checkout's family, a dedicated graph's family and owner, a
+//     route's checkout) refuses the delete instead of silently rewriting the
+//     child. SQLite's own default — NO ACTION on a non-deferred constraint —
+//     already refuses it; naming RESTRICT makes the intent readable and
+//     matches analysis_active_generation. Go's guarded delete helper reports
+//     the same refusal as a typed error before SQLite has to.
+//   - cleanup_journal deliberately carries NO foreign keys. It records work
+//     that outlives the rows it is cleaning up, so the row whose deletion the
+//     journal entry describes must be free to disappear first.
+//
+// State columns are plain TEXT; the Go layer owns their vocabularies (see
+// catalog_types.go) because a CHECK constraint would freeze the enum into
+// every installed database file and force a migration to extend it.
+//
+// Timestamp columns are unix seconds supplied by the caller, like
+// repo_index_state.indexed_at — no helper here reads the clock, so a guarded
+// transition is reproducible in a test.
+const checkoutCatalogSchemaSQL = `
+CREATE TABLE IF NOT EXISTS repository_families (
+    family_id           TEXT PRIMARY KEY,
+    common_dir_identity TEXT NOT NULL UNIQUE,
+    display_remote      TEXT NOT NULL DEFAULT '',
+    state               TEXT NOT NULL,
+    primary_epoch       INTEGER NOT NULL DEFAULT 0,
+    created_at          INTEGER NOT NULL DEFAULT 0,
+    last_seen           INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
+-- One row per working copy (a primary checkout or a linked worktree).
+-- incarnation distinguishes a path that was removed and recreated from the
+-- one the daemon has been tracking, so every guarded write carries it and a
+-- write aimed at the previous incarnation changes nothing. The UNIQUE key
+-- also serves family-scoped listing, so no separate by-family index exists.
+CREATE TABLE IF NOT EXISTS checkouts (
+    checkout_id                 TEXT PRIMARY KEY,
+    incarnation                 TEXT NOT NULL,
+    family_id                   TEXT NOT NULL
+        REFERENCES repository_families(family_id) ON DELETE RESTRICT,
+    root_path                   TEXT NOT NULL,
+    git_dir                     TEXT NOT NULL,
+    admin_name                  TEXT NOT NULL,
+    state                       TEXT NOT NULL,
+    desired_mode                TEXT NOT NULL,
+    effective_mode              TEXT NOT NULL,
+    locked                      INTEGER NOT NULL DEFAULT 0,
+    prunable                    INTEGER NOT NULL DEFAULT 0,
+    head_ref                    TEXT NOT NULL DEFAULT '',
+    head_commit                 TEXT NOT NULL DEFAULT '',
+    head_tree                   TEXT NOT NULL DEFAULT '',
+    last_accessible             INTEGER NOT NULL DEFAULT 0,
+    unavailable_since           INTEGER NOT NULL DEFAULT 0,
+    availability_deadline       INTEGER NOT NULL DEFAULT 0,
+    removal_detected_at         INTEGER NOT NULL DEFAULT 0,
+    removal_deadline            INTEGER NOT NULL DEFAULT 0,
+    removal_evidence            TEXT NOT NULL DEFAULT '',
+    active_intent_transition_id TEXT,
+    last_seen                   INTEGER NOT NULL DEFAULT 0,
+    last_error                  TEXT NOT NULL DEFAULT '',
+    UNIQUE (family_id, admin_name, incarnation)
+) WITHOUT ROWID;
+
+-- Why the daemon tracks a checkout at all. Several sources may independently
+-- ask for the same checkout; the UNIQUE key makes a repeated request from one
+-- source an update instead of a duplicate, and revoking one source leaves the
+-- others intact. It also backs the per-checkout listing.
+CREATE TABLE IF NOT EXISTS tracking_intents (
+    intent_id      TEXT PRIMARY KEY,
+    checkout_id    TEXT NOT NULL REFERENCES checkouts(checkout_id) ON DELETE CASCADE,
+    source_kind    TEXT NOT NULL,
+    source_locator TEXT NOT NULL,
+    active         INTEGER NOT NULL,
+    created_at     INTEGER NOT NULL DEFAULT 0,
+    revoked_at     INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT NOT NULL DEFAULT '',
+    UNIQUE (checkout_id, source_kind, source_locator)
+) WITHOUT ROWID;
+
+-- The single in-flight mode change for a checkout. UNIQUE(checkout_id) is the
+-- concurrency control: a second transition cannot begin while one is
+-- outstanding, and the prior_* columns capture what to restore if it fails.
+CREATE TABLE IF NOT EXISTS intent_transitions (
+    transition_id        TEXT PRIMARY KEY,
+    checkout_id          TEXT NOT NULL UNIQUE
+        REFERENCES checkouts(checkout_id) ON DELETE CASCADE,
+    cause                TEXT NOT NULL,
+    prior_desired_mode   TEXT,
+    prior_effective_mode TEXT,
+    requested_mode       TEXT,
+    prior_checkout_state TEXT,
+    source_snapshot_hash TEXT,
+    state                TEXT NOT NULL,
+    created_at           INTEGER NOT NULL DEFAULT 0,
+    last_progress        INTEGER NOT NULL DEFAULT 0,
+    last_error           TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+
+-- What the filesystem looked like the last time a checkout's path was
+-- sampled. It answers "is this path gone, or is its volume merely detached"
+-- without re-walking the filesystem, so an unmounted disk does not read as a
+-- deletion. One row per checkout, replaced by each sample.
+CREATE TABLE IF NOT EXISTS checkout_path_evidence (
+    checkout_id                    TEXT PRIMARY KEY
+        REFERENCES checkouts(checkout_id) ON DELETE CASCADE,
+    root_path_identity             TEXT NOT NULL DEFAULT '',
+    root_volume_kind               TEXT NOT NULL DEFAULT '',
+    root_volume_token              TEXT NOT NULL DEFAULT '',
+    nearest_existing_ancestor_path TEXT NOT NULL DEFAULT '',
+    ancestor_volume_kind           TEXT NOT NULL DEFAULT '',
+    ancestor_volume_token          TEXT NOT NULL DEFAULT '',
+    common_dir_volume_kind         TEXT NOT NULL DEFAULT '',
+    common_dir_volume_token        TEXT NOT NULL DEFAULT '',
+    sampled_at                     INTEGER NOT NULL DEFAULT 0,
+    sample_generation              INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
+-- A graph built for one checkout. repo_prefix is UNIQUE because it is the
+-- namespace its nodes carry, and owner_checkout_id is UNIQUE because a
+-- checkout owns at most one dedicated graph. active_generation_id is a plain
+-- integer rather than a foreign key: a dedicated graph outlives the
+-- generations it publishes, and the guarded delete helper checks this pointer
+-- in Go so pruning a generation cannot silently strand a graph.
+CREATE TABLE IF NOT EXISTS dedicated_graphs (
+    graph_id             TEXT PRIMARY KEY,
+    owner_checkout_id    TEXT UNIQUE
+        REFERENCES checkouts(checkout_id) ON DELETE RESTRICT,
+    repo_prefix          TEXT NOT NULL UNIQUE,
+    family_id            TEXT NOT NULL
+        REFERENCES repository_families(family_id) ON DELETE RESTRICT,
+    is_primary_base      INTEGER NOT NULL DEFAULT 0,
+    active_generation_id INTEGER,
+    state                TEXT NOT NULL
+) WITHOUT ROWID;
+-- At most one primary base per family. Partial, so the many non-primary rows
+-- of a family do not collide with each other.
+CREATE UNIQUE INDEX IF NOT EXISTS dedicated_graphs_primary_base
+    ON dedicated_graphs(family_id) WHERE is_primary_base = 1;
+
+-- An immutable-once-ready build of a view. Named view_generations rather than
+-- "generations" so it cannot be confused with the analysis_generations cache,
+-- which is a different lifecycle over the same word. base_generation_id is
+-- self-referential: an overlay generation names the committed generation it
+-- was layered onto, and that parent cannot be deleted while it does.
+CREATE TABLE IF NOT EXISTS view_generations (
+    generation_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_kind             TEXT NOT NULL,
+    graph_id               TEXT NOT NULL DEFAULT '',
+    layer_id               TEXT,
+    checkout_id            TEXT,
+    generation_kind        TEXT NOT NULL,
+    base_generation_id     INTEGER
+        REFERENCES view_generations(generation_id) ON DELETE RESTRICT,
+    lower_view_fingerprint TEXT NOT NULL DEFAULT '',
+    tree_oid               TEXT NOT NULL DEFAULT '',
+    provenance_commit_oid  TEXT,
+    config_hash            TEXT NOT NULL DEFAULT '',
+    extractor_versions     TEXT NOT NULL DEFAULT '',
+    resolver_version       TEXT NOT NULL DEFAULT '',
+    state                  TEXT NOT NULL,
+    covered_files          INTEGER NOT NULL DEFAULT 0,
+    affected_files         INTEGER NOT NULL DEFAULT 0,
+    storage_bytes          INTEGER NOT NULL DEFAULT 0,
+    completeness           TEXT NOT NULL DEFAULT '',
+    created_at             INTEGER NOT NULL DEFAULT 0,
+    published_at           INTEGER NOT NULL DEFAULT 0,
+    last_selected          INTEGER NOT NULL DEFAULT 0,
+    error                  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS view_generations_by_graph_state
+    ON view_generations(graph_id, state, generation_id DESC);
+-- Indexes the child side of the self-reference so the delete guard, and
+-- SQLite's own foreign-key check, probe instead of scanning the table.
+CREATE INDEX IF NOT EXISTS view_generations_by_base
+    ON view_generations(base_generation_id) WHERE base_generation_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS view_layers (
+    layer_id      TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL,
+    graph_id      TEXT NOT NULL,
+    checkout_id   TEXT,
+    target_ref    TEXT,
+    target_commit TEXT NOT NULL DEFAULT '',
+    target_tree   TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+
+-- Where a checkout's queries land right now. route_epoch is the compare-and-
+-- set token for a route flip: a flip that carries a stale epoch changes
+-- nothing, so two reconcilers cannot interleave halves of two different
+-- routes. The two partial indexes keep the generation delete guard (and
+-- SQLite's foreign-key check) off a table scan.
+CREATE TABLE IF NOT EXISTS checkout_routes (
+    checkout_id          TEXT PRIMARY KEY
+        REFERENCES checkouts(checkout_id) ON DELETE RESTRICT,
+    graph_id             TEXT NOT NULL,
+    commit_generation_id INTEGER
+        REFERENCES view_generations(generation_id) ON DELETE RESTRICT,
+    dirty_generation_id  INTEGER
+        REFERENCES view_generations(generation_id) ON DELETE RESTRICT,
+    route_epoch          INTEGER NOT NULL DEFAULT 0,
+    state                TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS checkout_routes_by_commit_generation
+    ON checkout_routes(commit_generation_id) WHERE commit_generation_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS checkout_routes_by_dirty_generation
+    ON checkout_routes(dirty_generation_id) WHERE dirty_generation_id IS NOT NULL;
+
+-- A named view of one graph at a selector (a branch, a tag, a commit). The
+-- desired_* columns are what was asked for; the active_* columns are what is
+-- actually serving, and they diverge while a build is in flight.
+CREATE TABLE IF NOT EXISTS ref_views (
+    ref_view_id               TEXT PRIMARY KEY,
+    graph_id                  TEXT NOT NULL,
+    selector_kind             TEXT NOT NULL,
+    selector_value            TEXT NOT NULL,
+    desired_ref               TEXT NOT NULL DEFAULT '',
+    desired_commit            TEXT NOT NULL DEFAULT '',
+    desired_tree              TEXT NOT NULL DEFAULT '',
+    active_generation_id      INTEGER
+        REFERENCES view_generations(generation_id) ON DELETE RESTRICT,
+    active_ref                TEXT,
+    active_commit             TEXT,
+    active_tree               TEXT,
+    enrichment_profile        TEXT NOT NULL,
+    desired_build_fingerprint TEXT NOT NULL DEFAULT '',
+    active_build_fingerprint  TEXT,
+    route_epoch               INTEGER NOT NULL DEFAULT 0,
+    state                     TEXT NOT NULL,
+    exact_view                INTEGER NOT NULL DEFAULT 1,
+    last_resolved             INTEGER NOT NULL DEFAULT 0,
+    last_selected             INTEGER NOT NULL DEFAULT 0,
+    last_error                TEXT NOT NULL DEFAULT '',
+    UNIQUE (graph_id, selector_kind, selector_value, enrichment_profile)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ref_views_by_active_generation
+    ON ref_views(active_generation_id) WHERE active_generation_id IS NOT NULL;
+
+-- One build attempt for a ref view. build_token is UNIQUE so a worker can
+-- prove it still owns the attempt it started.
+CREATE TABLE IF NOT EXISTS ref_view_builds (
+    build_id             TEXT PRIMARY KEY,
+    ref_view_id          TEXT NOT NULL REFERENCES ref_views(ref_view_id) ON DELETE CASCADE,
+    desired_ref          TEXT NOT NULL DEFAULT '',
+    desired_commit       TEXT NOT NULL DEFAULT '',
+    desired_tree         TEXT NOT NULL DEFAULT '',
+    base_generation_id   INTEGER,
+    enrichment_profile   TEXT NOT NULL DEFAULT '',
+    build_fingerprint    TEXT NOT NULL,
+    generation_id        INTEGER,
+    captured_route_epoch INTEGER NOT NULL,
+    state                TEXT NOT NULL,
+    build_token          TEXT NOT NULL UNIQUE,
+    created_at           INTEGER NOT NULL DEFAULT 0,
+    last_progress        INTEGER NOT NULL DEFAULT 0,
+    error                TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+-- Coalescing: two requests for the same tree, base and fingerprint share one
+-- in-flight build instead of racing to produce the same generation twice.
+-- Only 'building' rows participate, so finished attempts accumulate freely.
+-- SQLite treats NULLs as distinct in a unique index, so a build with no base
+-- generation is deliberately outside the coalescing rule.
+CREATE UNIQUE INDEX IF NOT EXISTS ref_view_builds_single_inflight
+    ON ref_view_builds(ref_view_id, desired_tree, base_generation_id, build_fingerprint)
+    WHERE state = 'building';
+
+-- Deferred deletion work. Targets are recorded as an opaque encoded list,
+-- never as foreign keys: the whole point of the journal is to survive the
+-- disappearance of the rows it names.
+CREATE TABLE IF NOT EXISTS cleanup_journal (
+    cleanup_id        TEXT PRIMARY KEY,
+    opaque_target_ids TEXT NOT NULL,
+    reason            TEXT NOT NULL,
+    phase             TEXT NOT NULL,
+    grace_deadline    INTEGER NOT NULL DEFAULT 0,
+    primary_epoch     INTEGER NOT NULL DEFAULT 0,
+    last_progress     INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+`
+
 const vectorTableSQL = `
 CREATE TABLE IF NOT EXISTS vectors (
     node_id     TEXT PRIMARY KEY,
@@ -838,4 +1133,4 @@ CREATE INDEX IF NOT EXISTS content_fts_rowid_by_repo_file
     ON content_fts_rowid(repo_prefix, file_path, fts_rowid);
 CREATE INDEX IF NOT EXISTS content_fts_rowid_by_file
     ON content_fts_rowid(file_path, fts_rowid);
-` + analysisGenerationSchemaSQL
+` + analysisGenerationSchemaSQL + checkoutCatalogSchemaSQL

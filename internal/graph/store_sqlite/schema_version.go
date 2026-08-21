@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 12
+const currentSchemaVersion = 13
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -80,6 +80,18 @@ var schemaMigrations = []schemaMigration{
 	{version: 10, name: "rebuild vector corpus ownership and parents", inPlace: rebuildVectorCorpusSchema},
 	{version: 11, name: "add symbol FTS normalization state", inPlace: createSymbolFTSNormalizationStateTable},
 	{version: 12, name: "normalize dir column separators", inPlace: normalizeDirColumnSeparators},
+	{version: 13, name: "add checkout lifecycle catalog", inPlace: createCheckoutCatalogTables},
+}
+
+// createCheckoutCatalogTables is the explicit v13 migration for existing
+// stores. The catalog is purely additive — it adds tables beside the payload
+// ones and re-keys nothing — so an older store gains it without a reindex.
+// schemaSQL owns the canonical fresh-store definition and runs first; this
+// step repeats the same idempotent DDL so the addition is part of the
+// versioned contract rather than an unversioned side effect of Open.
+func createCheckoutCatalogTables(tx *sql.Tx) error {
+	_, err := tx.Exec(checkoutCatalogSchemaSQL)
+	return err
 }
 
 // normalizeDirColumnSeparators rebuilds the two generated dir columns whose
