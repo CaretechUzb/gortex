@@ -448,6 +448,52 @@ type UpdateCheckoutStateRequest struct {
 	LastError     string
 }
 
+// UpdateCheckoutObservationRequest is everything one reconciliation pass may
+// change about a checkout it just looked at: the state axis, the availability
+// clock, the removal clock, and the git / filesystem facts it observed.
+//
+// Incarnation is the expectation, not a new value — the same guard
+// UpdateCheckoutStateRequest carries. The identity columns are absent on
+// purpose: an observation describes the row it found, it never re-keys it.
+// The mode columns are absent for the same kind of reason: how a checkout is
+// served is the mode transition's business, and an observer that carried the
+// modes along would be able to revert one it never meant to touch.
+type UpdateCheckoutObservationRequest struct {
+	CheckoutID  string
+	Incarnation string
+
+	State CheckoutState
+
+	RootPath string
+	GitDir   string
+	Locked   bool
+	Prunable bool
+
+	HeadRef    string
+	HeadCommit string
+	HeadTree   string
+
+	LastAccessible       int64 // unix seconds
+	UnavailableSince     int64 // unix seconds
+	AvailabilityDeadline int64 // unix seconds
+	RemovalDetectedAt    int64 // unix seconds
+	RemovalDeadline      int64 // unix seconds
+	RemovalEvidence      string
+
+	LastSeen  int64 // unix seconds
+	LastError string
+}
+
+func (r UpdateCheckoutObservationRequest) validate() error {
+	if err := requireCatalogID("checkout_id", r.CheckoutID); err != nil {
+		return err
+	}
+	if err := requireCatalogID("incarnation", r.Incarnation); err != nil {
+		return err
+	}
+	return requireCatalogValue("state", r.State, checkoutStates)
+}
+
 // FlipCheckoutRouteRequest repoints one checkout's route. ExpectedRouteEpoch
 // is the compare-and-set token; a successful flip stores epoch+1. Generation
 // pointers of 0 clear the corresponding column.

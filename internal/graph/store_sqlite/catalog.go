@@ -50,6 +50,24 @@ func (c *Catalog) execGuarded(ctx context.Context, subject string, query string,
 	return nil
 }
 
+// deleteOne runs a delete addressed at a single row and reports a no-op as
+// ErrCatalogNotFound, so a caller can tell "it was already gone" from "the
+// statement failed" without inspecting driver errors.
+func (c *Catalog) deleteOne(ctx context.Context, subject string, query string, args ...any) error {
+	result, err := c.exec(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return fmt.Errorf("%w: %s", ErrCatalogNotFound, subject)
+	}
+	return nil
+}
+
 // withTx runs a multi-statement guarded transition as one transaction under
 // the mutation gate.
 func (c *Catalog) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
@@ -142,6 +160,17 @@ SELECT common_dir_identity, display_remote, state, primary_epoch, created_at, la
 	return family, true, nil
 }
 
+// DeleteRepositoryFamily removes a family. Checkouts and dedicated graphs
+// reference it with ON DELETE RESTRICT, so SQLite refuses the delete until the
+// family is empty — the row is the last thing a family teardown removes.
+func (c *Catalog) DeleteRepositoryFamily(ctx context.Context, familyID string) error {
+	if err := requireCatalogID("family_id", familyID); err != nil {
+		return err
+	}
+	return c.deleteOne(ctx, fmt.Sprintf("family %s", familyID),
+		`DELETE FROM repository_families WHERE family_id = ?`, familyID)
+}
+
 // --- checkouts ---------------------------------------------------------
 
 const checkoutColumns = `incarnation, family_id, root_path, git_dir, admin_name, state,
@@ -190,6 +219,43 @@ ON CONFLICT(checkout_id) DO UPDATE SET
 		catalogNullString(checkout.ActiveIntentTransitionID),
 		checkout.LastSeen, checkout.LastError)
 	return err
+}
+
+// AllocateCheckout mints the identity for a working copy the catalog has never
+// seen. Unlike UpsertCheckout it refuses to add a second live identity for a
+// (family_id, admin_name) that already has one: the insert carries its own
+// existence test, so two actors racing to allocate the same working copy end
+// with one row, and the loser gets ErrCatalogStaleGuard.
+//
+// The table's UNIQUE key cannot serve as that backstop — it includes the
+// incarnation precisely so a removed-and-recreated path can be re-keyed under
+// the same name — and the test is written into the statement rather than run
+// as a read before it, because a separate read would leave open the very
+// window it is meant to close.
+func (c *Catalog) AllocateCheckout(ctx context.Context, checkout Checkout) error {
+	if err := checkout.validate(); err != nil {
+		return err
+	}
+	// The guard is keyed on the administrative name, so an allocation without
+	// one cannot be guarded at all.
+	if err := requireCatalogID("admin_name", checkout.AdminName); err != nil {
+		return err
+	}
+	subject := fmt.Sprintf("family %s already holds admin name %s", checkout.FamilyID, checkout.AdminName)
+	return c.execGuarded(ctx, subject, `
+INSERT INTO checkouts (checkout_id, `+checkoutColumns+`)
+SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+ WHERE NOT EXISTS (SELECT 1 FROM checkouts WHERE family_id = ? AND admin_name = ?)`,
+		checkout.CheckoutID, checkout.Incarnation, checkout.FamilyID, checkout.RootPath,
+		checkout.GitDir, checkout.AdminName, string(checkout.State),
+		string(checkout.DesiredMode), string(checkout.EffectiveMode),
+		catalogBoolInt(checkout.Locked), catalogBoolInt(checkout.Prunable),
+		checkout.HeadRef, checkout.HeadCommit, checkout.HeadTree,
+		checkout.LastAccessible, checkout.UnavailableSince, checkout.AvailabilityDeadline,
+		checkout.RemovalDetectedAt, checkout.RemovalDeadline, checkout.RemovalEvidence,
+		catalogNullString(checkout.ActiveIntentTransitionID),
+		checkout.LastSeen, checkout.LastError,
+		checkout.FamilyID, checkout.AdminName)
 }
 
 // scanCheckout reads the checkoutColumns projection in order.
@@ -287,6 +353,47 @@ UPDATE checkouts
 		req.LastSeen, req.LastError, req.CheckoutID, req.Incarnation)
 }
 
+// UpdateCheckoutObservation is the guarded write a reconciliation pass makes
+// after looking at a checkout: it moves the state axis, both durable clock
+// axes and the observed git / filesystem facts in one statement, under the
+// same incarnation guard UpdateCheckoutState uses.
+//
+// It exists beside UpdateCheckoutState because the two answer different
+// questions. UpdateCheckoutState is the mode-transition write and touches only
+// what a promotion or demotion changes. This is the observation write, and the
+// clocks have to land in the same statement as the state they justify: split
+// across two statements, a crash between them leaves a state whose deadline
+// says something else. The identity columns (checkout_id, incarnation,
+// family_id, admin_name) are deliberately absent — an observation never
+// re-keys the row it observed.
+//
+// The two mode columns are absent for a different reason. An observer reads
+// what git and the filesystem say; it has nothing to say about how a checkout
+// is served. Writing back the modes it happened to read would let a pass whose
+// read predates a promotion revert it, because the incarnation guard does not
+// move on a mode transition. The two writers touch disjoint columns instead,
+// so neither can lose the other's update.
+func (c *Catalog) UpdateCheckoutObservation(ctx context.Context, req UpdateCheckoutObservationRequest) error {
+	if err := req.validate(); err != nil {
+		return err
+	}
+	return c.execGuarded(ctx, fmt.Sprintf("checkout %s incarnation %s", req.CheckoutID, req.Incarnation), `
+UPDATE checkouts
+   SET state = ?,
+       root_path = ?, git_dir = ?, locked = ?, prunable = ?,
+       head_ref = ?, head_commit = ?, head_tree = ?,
+       last_accessible = ?, unavailable_since = ?, availability_deadline = ?,
+       removal_detected_at = ?, removal_deadline = ?, removal_evidence = ?,
+       last_seen = ?, last_error = ?
+ WHERE checkout_id = ? AND incarnation = ?`,
+		string(req.State),
+		req.RootPath, req.GitDir, catalogBoolInt(req.Locked), catalogBoolInt(req.Prunable),
+		req.HeadRef, req.HeadCommit, req.HeadTree,
+		req.LastAccessible, req.UnavailableSince, req.AvailabilityDeadline,
+		req.RemovalDetectedAt, req.RemovalDeadline, req.RemovalEvidence,
+		req.LastSeen, req.LastError, req.CheckoutID, req.Incarnation)
+}
+
 // DeleteCheckout removes a checkout. Its tracking intents, in-flight intent
 // transition and path evidence go with it through ON DELETE CASCADE; a route
 // does not cascade, so a routed checkout must be un-routed first and SQLite
@@ -295,18 +402,8 @@ func (c *Catalog) DeleteCheckout(ctx context.Context, checkoutID string) error {
 	if err := requireCatalogID("checkout_id", checkoutID); err != nil {
 		return err
 	}
-	result, err := c.exec(ctx, `DELETE FROM checkouts WHERE checkout_id = ?`, checkoutID)
-	if err != nil {
-		return err
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if changed == 0 {
-		return fmt.Errorf("%w: checkout %s", ErrCatalogNotFound, checkoutID)
-	}
-	return nil
+	return c.deleteOne(ctx, fmt.Sprintf("checkout %s", checkoutID),
+		`DELETE FROM checkouts WHERE checkout_id = ?`, checkoutID)
 }
 
 // --- tracking intents --------------------------------------------------
@@ -586,6 +683,52 @@ SELECT owner_checkout_id, repo_prefix, family_id, is_primary_base, active_genera
 	return dedicated, true, nil
 }
 
+// ListDedicatedGraphs returns one family's dedicated graphs, ordered by graph
+// id so two passes over an unchanged family see the same order. It is how a
+// caller finds the family's primary base and the graph a given checkout owns,
+// neither of which is addressable by a graph id it does not know yet.
+func (c *Catalog) ListDedicatedGraphs(ctx context.Context, familyID string) ([]DedicatedGraph, error) {
+	rows, err := c.store.db.QueryContext(ctx, `
+SELECT graph_id, owner_checkout_id, repo_prefix, is_primary_base, active_generation_id, state
+  FROM dedicated_graphs WHERE family_id = ? ORDER BY graph_id`, familyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DedicatedGraph
+	for rows.Next() {
+		dedicated := DedicatedGraph{FamilyID: familyID}
+		var (
+			owner         sql.NullString
+			activeGen     sql.NullInt64
+			isPrimaryBase int
+		)
+		if err := rows.Scan(&dedicated.GraphID, &owner, &dedicated.RepoPrefix,
+			&isPrimaryBase, &activeGen, &dedicated.State); err != nil {
+			return nil, err
+		}
+		dedicated.OwnerCheckoutID = owner.String
+		dedicated.ActiveGenerationID = activeGen.Int64
+		dedicated.IsPrimaryBase = isPrimaryBase != 0
+		out = append(out, dedicated)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DeleteDedicatedGraph removes a dedicated-graph row. The graph's generations
+// are not touched: active_generation_id is a plain integer, so a caller that
+// wants them gone prunes them itself.
+func (c *Catalog) DeleteDedicatedGraph(ctx context.Context, graphID string) error {
+	if err := requireCatalogID("graph_id", graphID); err != nil {
+		return err
+	}
+	return c.deleteOne(ctx, fmt.Sprintf("dedicated graph %s", graphID),
+		`DELETE FROM dedicated_graphs WHERE graph_id = ?`, graphID)
+}
+
 // SetPrimaryDedicatedGraph moves the family's primary base to one graph. The
 // family's primary_epoch is the compare-and-set token: a promotion carrying a
 // stale epoch changes nothing and reports ErrCatalogStaleGuard, so two
@@ -847,6 +990,17 @@ SELECT graph_id, commit_generation_id, dirty_generation_id, route_epoch, state
 	return route, true, nil
 }
 
+// DeleteCheckoutRoute withdraws a checkout's route. The route row is the one
+// child of a checkout that does not cascade, so removing it is what unblocks
+// DeleteCheckout.
+func (c *Catalog) DeleteCheckoutRoute(ctx context.Context, checkoutID string) error {
+	if err := requireCatalogID("checkout_id", checkoutID); err != nil {
+		return err
+	}
+	return c.deleteOne(ctx, fmt.Sprintf("route for checkout %s", checkoutID),
+		`DELETE FROM checkout_routes WHERE checkout_id = ?`, checkoutID)
+}
+
 // FlipCheckoutRoute repoints a route and bumps its epoch in one guarded
 // statement. A flip carrying a stale epoch changes nothing and reports
 // ErrCatalogStaleGuard, so two reconcilers cannot interleave halves of two
@@ -918,27 +1072,21 @@ ON CONFLICT(ref_view_id) DO UPDATE SET
 	return err
 }
 
-// GetRefView returns one ref view.
-func (c *Catalog) GetRefView(ctx context.Context, refViewID string) (RefView, bool, error) {
-	view := RefView{RefViewID: refViewID}
+// scanRefView reads the refViewColumns projection in order.
+func scanRefView(scan func(...any) error, view *RefView) error {
 	var (
 		activeGeneration                                       sql.NullInt64
 		activeRef, activeCommit, activeTree, activeFingerprint sql.NullString
 		state                                                  string
 		exactView                                              int
 	)
-	err := c.store.db.QueryRowContext(ctx,
-		`SELECT `+refViewColumns+` FROM ref_views WHERE ref_view_id = ?`, refViewID).Scan(
+	if err := scan(
 		&view.GraphID, &view.SelectorKind, &view.SelectorValue, &view.DesiredRef,
 		&view.DesiredCommit, &view.DesiredTree, &activeGeneration, &activeRef,
 		&activeCommit, &activeTree, &view.EnrichmentProfile,
 		&view.DesiredBuildFingerprint, &activeFingerprint, &view.RouteEpoch,
-		&state, &exactView, &view.LastResolved, &view.LastSelected, &view.LastError)
-	if err == sql.ErrNoRows {
-		return RefView{}, false, nil
-	}
-	if err != nil {
-		return RefView{}, false, err
+		&state, &exactView, &view.LastResolved, &view.LastSelected, &view.LastError); err != nil {
+		return err
 	}
 	view.ActiveGenerationID = activeGeneration.Int64
 	view.ActiveRef = activeRef.String
@@ -947,6 +1095,60 @@ func (c *Catalog) GetRefView(ctx context.Context, refViewID string) (RefView, bo
 	view.ActiveBuildFingerprint = activeFingerprint.String
 	view.State = RefViewState(state)
 	view.ExactView = exactView != 0
+	return nil
+}
+
+// ListRefViews returns every named view rooted in one graph, ordered by view
+// id. Retiring a graph has to find its views without knowing their ids, and
+// the ref_views UNIQUE selector key makes graph_id the leading column of a
+// usable index for the scan.
+func (c *Catalog) ListRefViews(ctx context.Context, graphID string) ([]RefView, error) {
+	rows, err := c.store.db.QueryContext(ctx,
+		`SELECT ref_view_id, `+refViewColumns+` FROM ref_views WHERE graph_id = ? ORDER BY ref_view_id`, graphID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RefView
+	for rows.Next() {
+		var view RefView
+		err := scanRefView(func(dest ...any) error {
+			return rows.Scan(append([]any{&view.RefViewID}, dest...)...)
+		}, &view)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, view)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DeleteRefView removes a ref view. Its build attempts go with it through ON
+// DELETE CASCADE; the generation it pointed at does not, because the pointer
+// is the child side of the reference.
+func (c *Catalog) DeleteRefView(ctx context.Context, refViewID string) error {
+	if err := requireCatalogID("ref_view_id", refViewID); err != nil {
+		return err
+	}
+	return c.deleteOne(ctx, fmt.Sprintf("ref view %s", refViewID),
+		`DELETE FROM ref_views WHERE ref_view_id = ?`, refViewID)
+}
+
+// GetRefView returns one ref view.
+func (c *Catalog) GetRefView(ctx context.Context, refViewID string) (RefView, bool, error) {
+	view := RefView{RefViewID: refViewID}
+	row := c.store.db.QueryRowContext(ctx,
+		`SELECT `+refViewColumns+` FROM ref_views WHERE ref_view_id = ?`, refViewID)
+	err := scanRefView(row.Scan, &view)
+	if err == sql.ErrNoRows {
+		return RefView{}, false, nil
+	}
+	if err != nil {
+		return RefView{}, false, err
+	}
 	return view, true, nil
 }
 
@@ -1057,4 +1259,46 @@ SELECT opaque_target_ids, reason, phase, grace_deadline, primary_epoch, last_pro
 	}
 	entry.Phase = CleanupPhase(phase)
 	return entry, true, nil
+}
+
+// ListCleanupEntries returns the whole journal, ordered by cleanup id. It is
+// the recovery read: after a restart nobody knows which deletions were left
+// half-done, so the resume pass enumerates the journal rather than addressing
+// entries it would have to remember the ids of.
+func (c *Catalog) ListCleanupEntries(ctx context.Context) ([]CleanupEntry, error) {
+	rows, err := c.store.db.QueryContext(ctx, `
+SELECT cleanup_id, opaque_target_ids, reason, phase, grace_deadline, primary_epoch,
+       last_progress, last_error
+  FROM cleanup_journal ORDER BY cleanup_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CleanupEntry
+	for rows.Next() {
+		var (
+			entry CleanupEntry
+			phase string
+		)
+		if err := rows.Scan(&entry.CleanupID, &entry.OpaqueTargetIDs, &entry.Reason, &phase,
+			&entry.GraceDeadline, &entry.PrimaryEpoch, &entry.LastProgress, &entry.LastError); err != nil {
+			return nil, err
+		}
+		entry.Phase = CleanupPhase(phase)
+		out = append(out, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DeleteCleanupEntry removes one journal row. A cleanup deletes its own entry
+// last, so the entry's absence is the record that the work finished.
+func (c *Catalog) DeleteCleanupEntry(ctx context.Context, cleanupID string) error {
+	if err := requireCatalogID("cleanup_id", cleanupID); err != nil {
+		return err
+	}
+	return c.deleteOne(ctx, fmt.Sprintf("cleanup entry %s", cleanupID),
+		`DELETE FROM cleanup_journal WHERE cleanup_id = ?`, cleanupID)
 }

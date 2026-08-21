@@ -1118,3 +1118,401 @@ func TestCatalogWriteValidationRejectsUnknownVocabulary(t *testing.T) {
 		}
 	}
 }
+
+// TestCatalogObservationWriteMovesBothClocks covers the guarded write a
+// reconciliation pass makes. The two clock axes are the point: they are stored
+// columns, so they have to survive a restart, and they have to move
+// independently of one another.
+func TestCatalogObservationWriteMovesBothClocks(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+
+	req := UpdateCheckoutObservationRequest{
+		CheckoutID:           "wt",
+		Incarnation:          "inc-1",
+		State:                CheckoutStateAvailabilityGrace,
+		RootPath:             "/moved/wt",
+		GitDir:               "/moved/wt/.git",
+		Locked:               true,
+		Prunable:             true,
+		HeadRef:              "refs/heads/feature",
+		HeadCommit:           "beef",
+		HeadTree:             "cafe",
+		LastAccessible:       10,
+		UnavailableSince:     20,
+		AvailabilityDeadline: 30,
+		RemovalDetectedAt:    40,
+		RemovalDeadline:      50,
+		RemovalEvidence:      "evidence_prunable_confirmed",
+		LastSeen:             60,
+		LastError:            "volume detached",
+	}
+	if err := catalog.UpdateCheckoutObservation(ctx, req); err != nil {
+		t.Fatalf("UpdateCheckoutObservation: %v", err)
+	}
+	checkout, ok, err := catalog.GetCheckout(ctx, "wt")
+	if err != nil || !ok {
+		t.Fatalf("GetCheckout = %v %v", ok, err)
+	}
+	if checkout.State != CheckoutStateAvailabilityGrace || checkout.RootPath != "/moved/wt" {
+		t.Fatalf("state columns = %+v", checkout)
+	}
+	if !checkout.Locked || !checkout.Prunable || checkout.HeadTree != "cafe" {
+		t.Fatalf("observed facts = %+v", checkout)
+	}
+	if checkout.UnavailableSince != 20 || checkout.AvailabilityDeadline != 30 {
+		t.Fatalf("availability clock = (%d, %d)", checkout.UnavailableSince, checkout.AvailabilityDeadline)
+	}
+	if checkout.RemovalDetectedAt != 40 || checkout.RemovalDeadline != 50 {
+		t.Fatalf("removal clock = (%d, %d)", checkout.RemovalDetectedAt, checkout.RemovalDeadline)
+	}
+	if checkout.RemovalEvidence != "evidence_prunable_confirmed" || checkout.LastError != "volume detached" {
+		t.Fatalf("evidence columns = %+v", checkout)
+	}
+	// The identity columns are not the observation's to change.
+	if checkout.Incarnation != "inc-1" || checkout.AdminName != "wt" || checkout.FamilyID != "fam" {
+		t.Fatalf("an observation re-keyed the row: %+v", checkout)
+	}
+
+	stale := req
+	stale.Incarnation = "inc-0"
+	stale.State = CheckoutStateUnavailable
+	if err := catalog.UpdateCheckoutObservation(ctx, stale); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("stale observation = %v, want ErrCatalogStaleGuard", err)
+	}
+	if again, _, _ := catalog.GetCheckout(ctx, "wt"); again.State != CheckoutStateAvailabilityGrace {
+		t.Fatalf("a stale observation advanced the state to %q", again.State)
+	}
+
+	for name, bad := range map[string]UpdateCheckoutObservationRequest{
+		"no checkout id": {Incarnation: "inc-1", State: CheckoutStateReady},
+		"no incarnation": {CheckoutID: "wt", State: CheckoutStateReady},
+		"unknown state":  {CheckoutID: "wt", Incarnation: "inc-1", State: "invented"},
+	} {
+		if err := catalog.UpdateCheckoutObservation(ctx, bad); !errors.Is(err, ErrCatalogInvalidValue) {
+			t.Errorf("%s = %v, want ErrCatalogInvalidValue", name, err)
+		}
+	}
+}
+
+// TestCatalogObservationLeavesTheModeAxisAlone pins the column split between
+// the two writers on a checkout row. A mode transition that commits between an
+// observation's read and its write must survive: the incarnation guard does
+// not move on a promotion, so the observation write is only safe as long as it
+// names no mode column.
+func TestCatalogObservationLeavesTheModeAxisAlone(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+
+	// What a pass reads at its start: the checkout is served automatically.
+	observed, ok, err := catalog.GetCheckout(ctx, "wt")
+	if err != nil || !ok {
+		t.Fatalf("GetCheckout = %v %v", ok, err)
+	}
+	if observed.EffectiveMode != CheckoutModeAutomatic {
+		t.Fatalf("seeded mode = %q", observed.EffectiveMode)
+	}
+
+	// A promotion commits while the pass is still deciding.
+	err = catalog.UpdateCheckoutState(ctx, UpdateCheckoutStateRequest{
+		CheckoutID:    "wt",
+		Incarnation:   "inc-1",
+		State:         CheckoutStateReconciling,
+		DesiredMode:   CheckoutModeDedicated,
+		EffectiveMode: CheckoutModeDedicated,
+	})
+	if err != nil {
+		t.Fatalf("UpdateCheckoutState: %v", err)
+	}
+
+	// The pass writes what it observed, under an incarnation that is still
+	// current, so the write lands.
+	err = catalog.UpdateCheckoutObservation(ctx, UpdateCheckoutObservationRequest{
+		CheckoutID:     "wt",
+		Incarnation:    "inc-1",
+		State:          CheckoutStateReady,
+		RootPath:       observed.RootPath,
+		GitDir:         observed.GitDir,
+		LastAccessible: 77,
+		LastSeen:       77,
+	})
+	if err != nil {
+		t.Fatalf("UpdateCheckoutObservation: %v", err)
+	}
+
+	after, _, err := catalog.GetCheckout(ctx, "wt")
+	if err != nil {
+		t.Fatalf("GetCheckout: %v", err)
+	}
+	if after.DesiredMode != CheckoutModeDedicated || after.EffectiveMode != CheckoutModeDedicated {
+		t.Fatalf("an observation reverted the promotion: %q/%q", after.DesiredMode, after.EffectiveMode)
+	}
+	if after.State != CheckoutStateReady || after.LastAccessible != 77 {
+		t.Fatalf("the observation itself did not land: %+v", after)
+	}
+}
+
+// TestCatalogAllocateCheckoutRefusesASecondIdentity covers the allocation-time
+// backstop. The table's UNIQUE key spans the incarnation, so it happily takes
+// a second live row for one (family_id, admin_name); the guarded insert is
+// what does not, and that is the only thing standing between two racing
+// allocators and a family with two identities for one working copy.
+func TestCatalogAllocateCheckoutRefusesASecondIdentity(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+
+	rival := Checkout{
+		CheckoutID:    "wt-2",
+		Incarnation:   "inc-2",
+		FamilyID:      "fam",
+		RootPath:      "/tmp/wt",
+		GitDir:        "/tmp/wt/.git",
+		AdminName:     "wt",
+		State:         CheckoutStateReady,
+		DesiredMode:   CheckoutModeAutomatic,
+		EffectiveMode: CheckoutModeAutomatic,
+	}
+	if err := catalog.AllocateCheckout(ctx, rival); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("second allocation = %v, want ErrCatalogStaleGuard", err)
+	}
+	rows, err := catalog.ListCheckouts(ctx, "fam")
+	if err != nil {
+		t.Fatalf("ListCheckouts: %v", err)
+	}
+	if len(rows) != 1 || rows[0].CheckoutID != "wt" {
+		t.Fatalf("family holds %+v, want only the first identity", rows)
+	}
+
+	// Another administrative name is another working copy, and the same name
+	// in another family is not taken here.
+	sibling := rival
+	sibling.CheckoutID, sibling.AdminName = "wt-sibling", "sibling"
+	if err := catalog.AllocateCheckout(ctx, sibling); err != nil {
+		t.Fatalf("allocating a second admin name = %v", err)
+	}
+	seedFamilyAndCheckout(t, catalog, "other", "other-wt", "inc-1")
+	elsewhere := rival
+	elsewhere.CheckoutID, elsewhere.FamilyID = "wt-elsewhere", "other"
+	if err := catalog.AllocateCheckout(ctx, elsewhere); err != nil {
+		t.Fatalf("allocating the same name in another family = %v", err)
+	}
+
+	// A name freed by a teardown may be allocated again — that is a path that
+	// was removed and recreated.
+	if err := catalog.DeleteCheckout(ctx, "wt"); err != nil {
+		t.Fatalf("DeleteCheckout: %v", err)
+	}
+	if err := catalog.AllocateCheckout(ctx, rival); err != nil {
+		t.Fatalf("re-allocating a freed name = %v", err)
+	}
+
+	nameless := rival
+	nameless.CheckoutID, nameless.AdminName = "wt-nameless", ""
+	if err := catalog.AllocateCheckout(ctx, nameless); !errors.Is(err, ErrCatalogInvalidValue) {
+		t.Fatalf("allocation without an admin name = %v, want ErrCatalogInvalidValue", err)
+	}
+	invalid := rival
+	invalid.CheckoutID, invalid.State = "wt-invalid", "invented"
+	if err := catalog.AllocateCheckout(ctx, invalid); !errors.Is(err, ErrCatalogInvalidValue) {
+		t.Fatalf("allocation with an unknown state = %v, want ErrCatalogInvalidValue", err)
+	}
+}
+
+// TestCatalogListsAreScopedAndOrdered covers the three listings a lifecycle
+// caller needs to find rows it does not already know the ids of.
+func TestCatalogListsAreScopedAndOrdered(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+	seedFamilyAndCheckout(t, catalog, "other", "other-wt", "inc-1")
+
+	for _, dedicated := range []DedicatedGraph{
+		{GraphID: "g-b", RepoPrefix: "p-b", FamilyID: "fam", State: "graph_ready"},
+		{GraphID: "g-a", RepoPrefix: "p-a", FamilyID: "fam", IsPrimaryBase: true,
+			OwnerCheckoutID: "wt", ActiveGenerationID: 0, State: "graph_ready"},
+		{GraphID: "g-z", RepoPrefix: "p-z", FamilyID: "other", State: "graph_ready"},
+	} {
+		if err := catalog.UpsertDedicatedGraph(ctx, dedicated); err != nil {
+			t.Fatalf("UpsertDedicatedGraph %s: %v", dedicated.GraphID, err)
+		}
+	}
+	graphs, err := catalog.ListDedicatedGraphs(ctx, "fam")
+	if err != nil {
+		t.Fatalf("ListDedicatedGraphs: %v", err)
+	}
+	if len(graphs) != 2 || graphs[0].GraphID != "g-a" || graphs[1].GraphID != "g-b" {
+		t.Fatalf("ListDedicatedGraphs = %+v", graphs)
+	}
+	if !graphs[0].IsPrimaryBase || graphs[0].OwnerCheckoutID != "wt" || graphs[0].FamilyID != "fam" {
+		t.Fatalf("primary row round trip = %+v", graphs[0])
+	}
+	if graphs[1].IsPrimaryBase || graphs[1].OwnerCheckoutID != "" {
+		t.Fatalf("an unowned non-primary row read back as %+v", graphs[1])
+	}
+	if empty, err := catalog.ListDedicatedGraphs(ctx, "no-such-family"); err != nil || len(empty) != 0 {
+		t.Fatalf("ListDedicatedGraphs on an unknown family = %v, %v", empty, err)
+	}
+
+	for _, view := range []RefView{
+		{RefViewID: "v-b", GraphID: "g-a", SelectorKind: "branch", SelectorValue: "b",
+			EnrichmentProfile: "default", State: RefViewReady, ExactView: true, ActiveRef: "refs/heads/b"},
+		{RefViewID: "v-a", GraphID: "g-a", SelectorKind: "branch", SelectorValue: "a",
+			EnrichmentProfile: "default", State: RefViewPending},
+		{RefViewID: "v-other", GraphID: "g-b", SelectorKind: "branch", SelectorValue: "a",
+			EnrichmentProfile: "default", State: RefViewReady},
+	} {
+		if err := catalog.UpsertRefView(ctx, view); err != nil {
+			t.Fatalf("UpsertRefView %s: %v", view.RefViewID, err)
+		}
+	}
+	views, err := catalog.ListRefViews(ctx, "g-a")
+	if err != nil {
+		t.Fatalf("ListRefViews: %v", err)
+	}
+	if len(views) != 2 || views[0].RefViewID != "v-a" || views[1].RefViewID != "v-b" {
+		t.Fatalf("ListRefViews = %+v", views)
+	}
+	if views[1].ActiveRef != "refs/heads/b" || !views[1].ExactView || views[1].State != RefViewReady {
+		t.Fatalf("ref view round trip through the listing = %+v", views[1])
+	}
+	// The listing and the single read must agree column for column.
+	single, ok, err := catalog.GetRefView(ctx, "v-b")
+	if err != nil || !ok {
+		t.Fatalf("GetRefView = %v %v", ok, err)
+	}
+	if single != views[1] {
+		t.Fatalf("GetRefView = %+v, listing = %+v", single, views[1])
+	}
+
+	for _, entry := range []CleanupEntry{
+		{CleanupID: "c-b", OpaqueTargetIDs: "b", Reason: "forget_checkout", Phase: CleanupPhaseDeleting, PrimaryEpoch: 3},
+		{CleanupID: "c-a", OpaqueTargetIDs: "a", Reason: "purge_checkout_layers", Phase: CleanupPhaseDone},
+	} {
+		if err := catalog.UpsertCleanupEntry(ctx, entry); err != nil {
+			t.Fatalf("UpsertCleanupEntry %s: %v", entry.CleanupID, err)
+		}
+	}
+	entries, err := catalog.ListCleanupEntries(ctx)
+	if err != nil {
+		t.Fatalf("ListCleanupEntries: %v", err)
+	}
+	if len(entries) != 2 || entries[0].CleanupID != "c-a" || entries[1].CleanupID != "c-b" {
+		t.Fatalf("ListCleanupEntries = %+v", entries)
+	}
+	if entries[0].Phase != CleanupPhaseDone || entries[1].PrimaryEpoch != 3 {
+		t.Fatalf("cleanup round trip = %+v", entries)
+	}
+}
+
+// TestCatalogDeletesAreAddressedAndGuarded covers the row-at-a-time deletes a
+// cleanup saga walks through, including the refusal that keeps a family from
+// being deleted out from under its checkouts.
+func TestCatalogDeletesAreAddressedAndGuarded(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+
+	if err := catalog.UpsertDedicatedGraph(ctx, DedicatedGraph{
+		GraphID: "g-a", RepoPrefix: "p-a", FamilyID: "fam", State: "graph_ready",
+	}); err != nil {
+		t.Fatalf("UpsertDedicatedGraph: %v", err)
+	}
+	if err := catalog.UpsertRefView(ctx, RefView{
+		RefViewID: "v-a", GraphID: "g-a", SelectorKind: "branch", SelectorValue: "a",
+		EnrichmentProfile: "default", State: RefViewReady,
+	}); err != nil {
+		t.Fatalf("UpsertRefView: %v", err)
+	}
+	if err := catalog.UpsertCheckoutRoute(ctx, CheckoutRoute{
+		CheckoutID: "wt", GraphID: "g-a", State: RouteActive,
+	}); err != nil {
+		t.Fatalf("UpsertCheckoutRoute: %v", err)
+	}
+	if err := catalog.UpsertCleanupEntry(ctx, CleanupEntry{
+		CleanupID: "c-a", OpaqueTargetIDs: "a", Reason: "forget_checkout", Phase: CleanupPhasePending,
+	}); err != nil {
+		t.Fatalf("UpsertCleanupEntry: %v", err)
+	}
+
+	// A family cannot go while its checkouts and graphs still reference it.
+	if err := catalog.DeleteRepositoryFamily(ctx, "fam"); err == nil {
+		t.Fatal("deleting a populated family succeeded")
+	}
+	if _, ok, _ := catalog.GetRepositoryFamily(ctx, "fam"); !ok {
+		t.Fatal("the refused delete removed the family anyway")
+	}
+
+	// A route blocks its checkout until it is withdrawn.
+	if err := catalog.DeleteCheckout(ctx, "wt"); err == nil {
+		t.Fatal("deleting a routed checkout succeeded")
+	}
+
+	for _, step := range []struct {
+		name   string
+		delete func() error
+		gone   func() bool
+	}{
+		{
+			name:   "route",
+			delete: func() error { return catalog.DeleteCheckoutRoute(ctx, "wt") },
+			gone:   func() bool { _, ok, _ := catalog.GetCheckoutRoute(ctx, "wt"); return !ok },
+		},
+		{
+			name:   "ref view",
+			delete: func() error { return catalog.DeleteRefView(ctx, "v-a") },
+			gone:   func() bool { _, ok, _ := catalog.GetRefView(ctx, "v-a"); return !ok },
+		},
+		{
+			name:   "dedicated graph",
+			delete: func() error { return catalog.DeleteDedicatedGraph(ctx, "g-a") },
+			gone:   func() bool { _, ok, _ := catalog.GetDedicatedGraph(ctx, "g-a"); return !ok },
+		},
+		{
+			name:   "cleanup entry",
+			delete: func() error { return catalog.DeleteCleanupEntry(ctx, "c-a") },
+			gone:   func() bool { _, ok, _ := catalog.GetCleanupEntry(ctx, "c-a"); return !ok },
+		},
+		{
+			name:   "checkout",
+			delete: func() error { return catalog.DeleteCheckout(ctx, "wt") },
+			gone:   func() bool { _, ok, _ := catalog.GetCheckout(ctx, "wt"); return !ok },
+		},
+		{
+			name:   "family",
+			delete: func() error { return catalog.DeleteRepositoryFamily(ctx, "fam") },
+			gone:   func() bool { _, ok, _ := catalog.GetRepositoryFamily(ctx, "fam"); return !ok },
+		},
+	} {
+		if err := step.delete(); err != nil {
+			t.Fatalf("delete %s: %v", step.name, err)
+		}
+		if !step.gone() {
+			t.Fatalf("%s survived its delete", step.name)
+		}
+		// A second delete reports the row as missing rather than succeeding
+		// silently, so a caller can tell the two apart.
+		if err := step.delete(); !errors.Is(err, ErrCatalogNotFound) {
+			t.Errorf("second delete of %s = %v, want ErrCatalogNotFound", step.name, err)
+		}
+	}
+
+	for name, delete := range map[string]func() error{
+		"route":           func() error { return catalog.DeleteCheckoutRoute(ctx, "") },
+		"ref view":        func() error { return catalog.DeleteRefView(ctx, "") },
+		"dedicated graph": func() error { return catalog.DeleteDedicatedGraph(ctx, "") },
+		"cleanup entry":   func() error { return catalog.DeleteCleanupEntry(ctx, "") },
+		"family":          func() error { return catalog.DeleteRepositoryFamily(ctx, "") },
+	} {
+		if err := delete(); !errors.Is(err, ErrCatalogInvalidValue) {
+			t.Errorf("empty %s id = %v, want ErrCatalogInvalidValue", name, err)
+		}
+	}
+}
