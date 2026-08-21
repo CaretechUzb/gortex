@@ -6102,11 +6102,13 @@ func (s *Server) gatherExploreContentCandidatesForTermsCollecting(
 	if reader == nil {
 		return nil
 	}
-	// The content-index capability is asserted on the request reader, so an
-	// overlay-active call finds no searcher and recalls nothing here instead
-	// of authenticating candidates from durable rows the editor buffer has
-	// already changed. Overlay-owned files are filtered below as well.
-	content, hasContent := reader.(graph.ContentSearcher)
+	// The content-index capability comes from the request reader on a base
+	// call and from the routed stack's own corpora on a composed one; an
+	// overlay-active call finds no searcher either way and recalls nothing
+	// here instead of authenticating candidates from durable rows the editor
+	// buffer has already changed. Overlay-owned files are filtered below as
+	// well.
+	content, hasContent := s.contentSearcherFor(ctx)
 	perTerm := clampInt(limit/3, 4, exploreQuotedRecallMaxPerTerm)
 	repoPrefix := ""
 	if len(scope.RepoAllow) == 1 {

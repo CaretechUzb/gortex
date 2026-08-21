@@ -29,6 +29,29 @@ type Materializer struct {
 	Leases *LeaseManager
 }
 
+// GenerationSource is one persisted generation of a view's stack seen by
+// a caller that has to query the generation's own indexes rather than
+// read through the composed graph.
+//
+// The composed Reader answers node and edge questions for the whole
+// stack, but a full-text index is not a read the composition can serve:
+// each generation carries its own rows and a handle only ever matches
+// the generation it is pinned to. A caller enumerating candidates
+// therefore queries every generation itself, and needs both halves of
+// this pair — the Handle to ask, and the Layer whose ownership claims
+// say what this generation hides from the ones below it.
+type GenerationSource struct {
+	// Generation is the payload generation this source reads.
+	Generation int64
+	// Handle is pinned to Generation, so every index it queries answers
+	// with that generation's rows alone.
+	Handle *store_sqlite.Store
+	// Layer is the same ownership contract the composed reader applies
+	// for this generation: which paths it claims and which identities it
+	// speaks for.
+	Layer graph.OverlayLayerReader
+}
+
 // RepoView is one materialized repository view: the identity that names
 // its content, the reader that serves it, what it can answer, and the
 // lease that keeps it readable.
@@ -45,6 +68,7 @@ type RepoView struct {
 	Completeness Completeness
 
 	generations []int64
+	sources     []GenerationSource
 	lease       *Lease
 	closeOnce   sync.Once
 }
@@ -58,6 +82,23 @@ func (v *RepoView) Generations() []int64 {
 	}
 	out := make([]int64, len(v.generations))
 	copy(out, v.generations)
+	return out
+}
+
+// GenerationSources lists the stack's generations bottom first, in the
+// order they compose: the commit generation, then the working-tree one
+// when the route named it. The indexed corpus underneath them is not in
+// the list — it is not a generation and the caller already reads it
+// through its own handle.
+//
+// The sources are valid for as long as the view is: every handle is
+// pinned to a generation the view's lease keeps from retiring.
+func (v *RepoView) GenerationSources() []GenerationSource {
+	if v == nil {
+		return nil
+	}
+	out := make([]GenerationSource, len(v.sources))
+	copy(out, v.sources)
 	return out
 }
 
@@ -203,12 +244,16 @@ func (m *Materializer) assemble(
 	lease *Lease,
 ) (*RepoView, error) {
 	handles := make([]*store_sqlite.Store, 0, len(generations))
+	sources := make([]GenerationSource, 0, len(generations))
 
 	commitHandle, commitLayer, _, err := m.openGeneration(ctx, generations[0])
 	if err != nil {
 		return nil, err
 	}
 	handles = append(handles, commitHandle)
+	sources = append(sources, GenerationSource{
+		Generation: generations[0], Handle: commitHandle, Layer: commitLayer,
+	})
 	base := graph.NewOverlaidViewWithLayer(m.Store.AtGeneration(0), commitLayer)
 
 	var (
@@ -225,6 +270,9 @@ func (m *Materializer) assemble(
 			return nil, err
 		}
 		handles = append(handles, handle)
+		sources = append(sources, GenerationSource{
+			Generation: generationID, Handle: handle, Layer: layer,
+		})
 		layers = append(layers, layer)
 		layerRefs = append(layerRefs, ref)
 	}
@@ -246,6 +294,7 @@ func (m *Materializer) assemble(
 		Reader:       reader,
 		Completeness: completeness,
 		generations:  generations,
+		sources:      sources,
 		lease:        lease,
 	}, nil
 }

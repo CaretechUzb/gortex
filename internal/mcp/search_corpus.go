@@ -148,11 +148,13 @@ func (s *Server) mergeContentChannel(ctx context.Context, query string, nodes []
 	if strings.TrimSpace(query) == "" {
 		return nodes
 	}
-	// The content-index capability is asserted on the request reader, so an
-	// overlay-active call finds no searcher and merges nothing rather than
-	// pulling durable rows for files the editor buffer already changed.
+	// The content-index capability comes from the request reader on a base
+	// call and from the routed stack's own corpora on a composed one; an
+	// overlay-active call finds no searcher either way and merges nothing
+	// rather than pulling durable rows for files the editor buffer already
+	// changed.
 	reader := s.readerFor(ctx)
-	cs, ok := reader.(graph.ContentSearcher)
+	cs, ok := s.contentSearcherFor(ctx)
 	if !ok {
 		return nodes
 	}

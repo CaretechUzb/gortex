@@ -47,6 +47,11 @@ type Engine struct {
 	// pre-materialised (the bundle fast path) predates the overlay and
 	// has to be re-read through the reader before it can be trusted.
 	overlay *graph.OverlayLayer
+	// viewLayers are the persisted generations stacked in the reader,
+	// bottom first, empty for a plain base reader. Each carries its own
+	// text corpus, so candidate enumeration queries them alongside the
+	// backend's — see viewTextCandidates.
+	viewLayers []ViewLayerSource
 }
 
 // overlayLayered is the view side of the reader swap: a reader that
@@ -67,6 +72,10 @@ func (e *Engine) WithReader(r graph.Reader) *Engine {
 	clone := *e
 	clone.g = r
 	clone.overlay = nil
+	// A reader swap re-decides which corpora answer, so the stack the
+	// previous reader named never carries over — WithViewLayers is the
+	// only way one is bound.
+	clone.viewLayers = nil
 	if view, ok := r.(overlayLayered); ok {
 		clone.overlay = view.Layer()
 	}
@@ -724,6 +733,29 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 	backend := e.getSearch()
 	timings := opts.SearchTimings
 
+	// A composed view is answered corpus by corpus: the backend below
+	// covers the indexed corpus, and viewTextCandidates queries each
+	// stacked generation on its own handle and composes the results.
+	//
+	// The vector channel does not compose. Vectors are generation-scoped
+	// rows like the text ones, but the channel reaching them is a
+	// process-wide index — one embedder and one ANN structure, built over
+	// the indexed corpus and owned by the search backend, with no way to
+	// ask it for a generation's vectors short of standing up an embedder
+	// and an index per generation per request. Serving the base corpus's
+	// vectors as the view's would be the one thing worse than not
+	// answering: they describe files the view has replaced or deleted, and
+	// nothing downstream could tell. So a composed view ranks from the
+	// text lanes alone. The exact-per-view-statistics successor named in
+	// MergeRankedSources is where vector composition belongs — it needs
+	// the same per-view corpus that makes scores comparable.
+	//
+	// The post-rerank cosine refinement is structurally out already:
+	// RefineByCosine asks the reader for graph.VectorSearcher and a
+	// composed view does not implement it.
+	viewLayered := e.viewLayersActive()
+	skipVectorChannel := opts.SkipVectorChannel || viewLayered
+
 	// Bundle fast path. The SymbolBundleSearcherBackend assertion
 	// chains through Swappable → HybridBackend → SymbolSearcherBackend
 	// in production; both Swappable and HybridBackend forward when
@@ -782,7 +814,11 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		// every hit falls through to the view-aware batched lookup
 		// below, which substitutes the overlay's node and omits the IDs
 		// the view no longer exposes.
-		rehydrateThroughReader := e.overlay != nil
+		//
+		// A composed view invalidates it for the same reason one level
+		// down: the bundle's payload is the indexed corpus's row, and a
+		// generation in the stack may have replaced or deleted it.
+		rehydrateThroughReader := e.overlay != nil || viewLayered
 		if len(bundles) > 0 {
 			bundleHandled = true
 			textResults = make([]search.SearchResult, 0, len(bundles))
@@ -837,7 +873,7 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		// classWeightTable already proves semantic contributes near-
 		// zero signal vs the BM25 channel — see classWeightTable in
 		// internal/search/rerank/query_kind.go.
-		if vectorOnlyOK && !opts.SkipVectorChannel {
+		if vectorOnlyOK && !skipVectorChannel {
 			vecIDs, stats := vectorOnlyBackend.VectorChannelOnly(query, limit*2)
 			vectorIDs = vecIDs
 			if timings != nil {
@@ -861,7 +897,7 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 			SearchChannelsTimed(query string, limit int) ([]search.SearchResult, []string, search.ChannelTimings)
 		}
 		switch {
-		case opts.SkipVectorChannel:
+		case skipVectorChannel:
 			// Identifier-shape fast path: skip the vector channel
 			// (no embed, no ANN) and run text-only Search. The cost
 			// saved is the per-call embedder + vector index hit; the
@@ -895,6 +931,15 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 				}
 			}
 		}
+	}
+
+	// Composed view: everything above answered for the indexed corpus
+	// alone. Enumerate the stack's generations, compose the results, and
+	// hand one merged ranked list to the materialisation below — which is
+	// where every surviving candidate is resolved through the composed
+	// reader and anything the view hides falls out.
+	if viewLayered {
+		textResults = e.viewTextCandidates(query, limit*2, textResults)
 	}
 
 	// Collect every ID NOT covered by the bundle path (vector hits +

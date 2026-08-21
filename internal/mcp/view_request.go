@@ -12,6 +12,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/reconcile"
 )
 
@@ -28,6 +29,11 @@ type requestView struct {
 	reader graph.Reader
 	// materialized is the leased view behind reader, released on request end.
 	materialized *graphview.RepoView
+	// candidates and content are the stack expressed as search corpora —
+	// what reader cannot serve, since no composition carries an index. Both
+	// are bound once at materialization; see bindSources.
+	candidates []query.ViewLayerSource
+	content    *viewContentSearcher
 	// rider travels on the response whenever the caller named a view or
 	// something other than the base answered.
 	rider *graphview.ViewRider
@@ -285,7 +291,9 @@ func (s *Server) materializeRequestView(
 	rider.MarkExact(requested.String())
 	rider.GraphID = view.ID.BaseGraphID
 	rider.CheckoutID = checkout.CheckoutID
-	return &requestView{reader: view.Reader, materialized: view, rider: rider}, nil
+	routed := &requestView{reader: view.Reader, materialized: view, rider: rider}
+	routed.bindSources(view.GenerationSources(), s.graph)
+	return routed, nil
 }
 
 // viewFallback either propagates the failure (an explicit selector) or serves

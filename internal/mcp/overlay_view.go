@@ -185,15 +185,21 @@ func (s *Server) requestBaseReader(ctx context.Context) graph.Reader {
 // Cheap: WithReader is a shallow clone (one struct copy, shares
 // search provider and rerank pipeline). Safe to call inside hot
 // tool-handler paths.
+// A routed request additionally hands the engine the stack it reads
+// through, so candidate enumeration covers every generation's corpus
+// and not just the indexed one underneath them. The layer slice is nil
+// on a base request and WithViewLayers is then WithReader exactly, so
+// nothing on that path changes.
 func (s *Server) engineFor(ctx context.Context) *query.Engine {
 	if s == nil || s.engine == nil {
 		return nil
 	}
+	view := requestViewFromContext(ctx)
 	if v := OverlayViewFromContext(ctx); v != nil {
-		return s.engine.WithReader(v)
+		return s.engine.WithViewLayers(v, view.candidateLayers())
 	}
-	if view := requestViewFromContext(ctx); view.routed() {
-		return s.engine.WithReader(view.reader)
+	if view.routed() {
+		return s.engine.WithViewLayers(view.reader, view.candidateLayers())
 	}
 	return s.engine
 }
