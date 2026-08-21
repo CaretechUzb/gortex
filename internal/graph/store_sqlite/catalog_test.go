@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1514,5 +1515,153 @@ func TestCatalogDeletesAreAddressedAndGuarded(t *testing.T) {
 		if err := delete(); !errors.Is(err, ErrCatalogInvalidValue) {
 			t.Errorf("empty %s id = %v, want ErrCatalogInvalidValue", name, err)
 		}
+	}
+}
+
+// TestCatalogListViewGenerationsFilters covers the enumeration retirement
+// recovers its work list from: each filter axis on its own, the axes combined,
+// the ordering, and the empty answers.
+func TestCatalogListViewGenerationsFilters(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+
+	// Seeded oldest first, so the expected orderings below are these layer
+	// ids reversed: generation ids ascend and the listing is newest first.
+	for _, generation := range []ViewGeneration{
+		{LayerID: "a-ready", OwnerKind: "dedicated_graph", GraphID: "graph-a", CheckoutID: "wt-a",
+			GenerationKind: "commit", State: ViewGenerationReady, CreatedAt: 10},
+		{LayerID: "a-super", OwnerKind: "dedicated_graph", GraphID: "graph-a", CheckoutID: "wt-a",
+			GenerationKind: "dirty", State: ViewGenerationSuperseded, CreatedAt: 11},
+		{LayerID: "a-retiring", OwnerKind: "dedicated_graph", GraphID: "graph-a", CheckoutID: "wt-b",
+			GenerationKind: "commit", State: ViewGenerationRetiring, CreatedAt: 12},
+		{LayerID: "b-ready", OwnerKind: "ref_view", GraphID: "graph-b",
+			GenerationKind: "commit", State: ViewGenerationReady, CreatedAt: 13},
+		{LayerID: "b-building", OwnerKind: "dedicated_graph", GraphID: "graph-b", CheckoutID: "wt-a",
+			GenerationKind: "dirty", State: ViewGenerationBuilding, CreatedAt: 14},
+	} {
+		if _, err := catalog.CreateViewGeneration(ctx, generation); err != nil {
+			t.Fatalf("CreateViewGeneration %s: %v", generation.LayerID, err)
+		}
+	}
+
+	listed := func(filter ViewGenerationFilter) []string {
+		t.Helper()
+		rows, err := catalog.ListViewGenerations(ctx, filter)
+		if err != nil {
+			t.Fatalf("ListViewGenerations %+v: %v", filter, err)
+		}
+		out := make([]string, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, row.LayerID)
+		}
+		return out
+	}
+
+	for _, tc := range []struct {
+		name   string
+		filter ViewGenerationFilter
+		want   []string
+	}{
+		{"unfiltered is newest first", ViewGenerationFilter{},
+			[]string{"b-building", "b-ready", "a-retiring", "a-super", "a-ready"}},
+		{"the states retirement asks for", ViewGenerationFilter{
+			States: []ViewGenerationState{ViewGenerationSuperseded, ViewGenerationRetiring}},
+			[]string{"a-retiring", "a-super"}},
+		{"one graph", ViewGenerationFilter{GraphID: "graph-a"},
+			[]string{"a-retiring", "a-super", "a-ready"}},
+		{"one owner kind", ViewGenerationFilter{OwnerKind: "ref_view"},
+			[]string{"b-ready"}},
+		// wt-a spans both graphs, and the generation that names no checkout at
+		// all is stored as NULL rather than as the empty string — it must not
+		// answer a filter for a checkout.
+		{"one checkout", ViewGenerationFilter{CheckoutID: "wt-a"},
+			[]string{"b-building", "a-super", "a-ready"}},
+		{"every axis at once", ViewGenerationFilter{
+			States:     []ViewGenerationState{ViewGenerationReady},
+			GraphID:    "graph-a",
+			OwnerKind:  "dedicated_graph",
+			CheckoutID: "wt-a",
+		}, []string{"a-ready"}},
+		{"the limit takes the newest", ViewGenerationFilter{Limit: 2},
+			[]string{"b-building", "b-ready"}},
+		{"an unknown graph", ViewGenerationFilter{GraphID: "graph-nowhere"}, nil},
+		{"an unknown checkout", ViewGenerationFilter{CheckoutID: "wt-nowhere"}, nil},
+		{"a state nothing is in", ViewGenerationFilter{
+			States: []ViewGenerationState{ViewGenerationFailed}}, nil},
+		{"a combination no row satisfies", ViewGenerationFilter{
+			GraphID: "graph-b", CheckoutID: "wt-b"}, nil},
+	} {
+		if got := listed(tc.filter); !slices.Equal(got, tc.want) {
+			t.Errorf("%s = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// The listing and the single read must agree column for column, the
+	// nullable ones included.
+	rows, err := catalog.ListViewGenerations(ctx, ViewGenerationFilter{OwnerKind: "ref_view"})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("ListViewGenerations = %+v, %v", rows, err)
+	}
+	if rows[0].CheckoutID != "" || rows[0].BaseGenerationID != 0 {
+		t.Fatalf("an unset checkout read back as %+v", rows[0])
+	}
+	single, ok, err := catalog.GetViewGeneration(ctx, rows[0].GenerationID)
+	if err != nil || !ok {
+		t.Fatalf("GetViewGeneration = %v %v", ok, err)
+	}
+	if single != rows[0] {
+		t.Fatalf("GetViewGeneration = %+v, listing = %+v", single, rows[0])
+	}
+
+	if _, err := catalog.ListViewGenerations(ctx, ViewGenerationFilter{
+		States: []ViewGenerationState{"reticent"},
+	}); !errors.Is(err, ErrCatalogInvalidValue) {
+		t.Errorf("an unknown state = %v, want ErrCatalogInvalidValue", err)
+	}
+	if _, err := catalog.ListViewGenerations(ctx, ViewGenerationFilter{Limit: -1}); !errors.Is(err, ErrCatalogInvalidValue) {
+		t.Errorf("a negative limit = %v, want ErrCatalogInvalidValue", err)
+	}
+}
+
+// TestCatalogListViewGenerationsCapsOneScan pins the bound. A janitor pass
+// reads this listing every time it runs, so an unset — or an over-ambitious —
+// limit must still cost one bounded read.
+func TestCatalogListViewGenerationsCapsOneScan(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+
+	var newest int64
+	for i := 0; i < maxViewGenerationListing+3; i++ {
+		id, err := catalog.CreateViewGeneration(ctx, ViewGeneration{
+			OwnerKind: "dedicated_graph", GraphID: "graph-cap", GenerationKind: "commit",
+			State: ViewGenerationReady, CreatedAt: int64(i),
+		})
+		if err != nil {
+			t.Fatalf("CreateViewGeneration %d: %v", i, err)
+		}
+		newest = id
+	}
+
+	for _, limit := range []int{0, maxViewGenerationListing, maxViewGenerationListing + 100} {
+		rows, err := catalog.ListViewGenerations(ctx, ViewGenerationFilter{Limit: limit})
+		if err != nil {
+			t.Fatalf("ListViewGenerations limit %d: %v", limit, err)
+		}
+		if len(rows) != maxViewGenerationListing {
+			t.Fatalf("limit %d returned %d rows, want the cap %d", limit, len(rows), maxViewGenerationListing)
+		}
+		// The cap must take the newest page rather than an arbitrary one: a
+		// layer has to be offered before the generation it sits on, and
+		// descending id is that order.
+		if rows[0].GenerationID != newest {
+			t.Fatalf("limit %d starts at generation %d, want the newest %d", limit, rows[0].GenerationID, newest)
+		}
+	}
+
+	under, err := catalog.ListViewGenerations(ctx, ViewGenerationFilter{Limit: 7})
+	if err != nil || len(under) != 7 {
+		t.Fatalf("ListViewGenerations limit 7 = %d rows, %v", len(under), err)
 	}
 }

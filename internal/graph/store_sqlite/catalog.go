@@ -828,17 +828,16 @@ func (c *Catalog) CreateViewGeneration(ctx context.Context, generation ViewGener
 	return result.LastInsertId()
 }
 
-// GetViewGeneration returns one generation.
-func (c *Catalog) GetViewGeneration(ctx context.Context, generationID int64) (ViewGeneration, bool, error) {
-	generation := ViewGeneration{GenerationID: generationID}
+// scanViewGeneration reads one row in viewGenerationColumns order, folding the
+// nullable columns back to their zero value. The single read and the listing
+// share it so the two cannot drift.
+func scanViewGeneration(scan func(...any) error, generation *ViewGeneration) error {
 	var (
 		layerID, checkoutID, provenance sql.NullString
 		baseGeneration                  sql.NullInt64
 		state                           string
 	)
-	err := c.store.db.QueryRowContext(ctx,
-		`SELECT `+viewGenerationColumns+` FROM view_generations WHERE generation_id = ?`,
-		generationID).Scan(
+	err := scan(
 		&generation.OwnerKind, &generation.GraphID, &layerID, &checkoutID,
 		&generation.GenerationKind, &baseGeneration, &generation.LowerViewFingerprint,
 		&generation.TreeOID, &provenance, &generation.ConfigHash,
@@ -846,18 +845,118 @@ func (c *Catalog) GetViewGeneration(ctx context.Context, generationID int64) (Vi
 		&generation.CoveredFiles, &generation.AffectedFiles, &generation.StorageBytes,
 		&generation.Completeness, &generation.CreatedAt, &generation.PublishedAt,
 		&generation.LastSelected, &generation.Error)
-	if err == sql.ErrNoRows {
-		return ViewGeneration{}, false, nil
-	}
 	if err != nil {
-		return ViewGeneration{}, false, err
+		return err
 	}
 	generation.LayerID = layerID.String
 	generation.CheckoutID = checkoutID.String
 	generation.ProvenanceCommitOID = provenance.String
 	generation.BaseGenerationID = baseGeneration.Int64
 	generation.State = ViewGenerationState(state)
+	return nil
+}
+
+// GetViewGeneration returns one generation.
+func (c *Catalog) GetViewGeneration(ctx context.Context, generationID int64) (ViewGeneration, bool, error) {
+	generation := ViewGeneration{GenerationID: generationID}
+	row := c.store.db.QueryRowContext(ctx,
+		`SELECT `+viewGenerationColumns+` FROM view_generations WHERE generation_id = ?`,
+		generationID)
+	err := scanViewGeneration(row.Scan, &generation)
+	if err == sql.ErrNoRows {
+		return ViewGeneration{}, false, nil
+	}
+	if err != nil {
+		return ViewGeneration{}, false, err
+	}
 	return generation, true, nil
+}
+
+// maxViewGenerationListing bounds one ListViewGenerations call, whether or not
+// the caller asked for a bound.
+//
+// The scan's only caller is a janitor pass that offers what it finds for
+// retirement, and a pass that returned the whole table would grow with the
+// installation while collecting the same handful of generations each time. 512
+// is far more than the layers a family accumulates between two sweeps, so a
+// healthy store is enumerated whole; a store that somehow holds more is
+// collected across several passes instead of in one unbounded read.
+const maxViewGenerationListing = 512
+
+// ListViewGenerations enumerates generations, newest id first.
+//
+// It is the recovery read for retirement. Every other handle on a generation is
+// something that points at it, so the set of generations nobody should be
+// keeping is exactly the set nothing names — which cannot be derived from the
+// pointers. The listing is what lets a caller re-derive it from the rows.
+//
+// A filter that names a graph rides view_generations_by_graph_state, whose
+// trailing generation_id DESC is this ordering; one that does not scans the
+// table under the same bound.
+func (c *Catalog) ListViewGenerations(ctx context.Context, filter ViewGenerationFilter) ([]ViewGeneration, error) {
+	if filter.Limit < 0 {
+		return nil, fmt.Errorf("%w: limit %d", ErrCatalogInvalidValue, filter.Limit)
+	}
+	limit := filter.Limit
+	if limit == 0 || limit > maxViewGenerationListing {
+		limit = maxViewGenerationListing
+	}
+
+	var (
+		clauses []string
+		args    []any
+	)
+	if filter.GraphID != "" {
+		clauses = append(clauses, `graph_id = ?`)
+		args = append(args, filter.GraphID)
+	}
+	if len(filter.States) > 0 {
+		placeholders := make([]string, len(filter.States))
+		for i, state := range filter.States {
+			if err := requireCatalogValue("state", state, viewGenerationStates); err != nil {
+				return nil, err
+			}
+			placeholders[i] = "?"
+			args = append(args, string(state))
+		}
+		clauses = append(clauses, `state IN (`+strings.Join(placeholders, ", ")+`)`)
+	}
+	if filter.OwnerKind != "" {
+		clauses = append(clauses, `owner_kind = ?`)
+		args = append(args, filter.OwnerKind)
+	}
+	if filter.CheckoutID != "" {
+		clauses = append(clauses, `checkout_id = ?`)
+		args = append(args, filter.CheckoutID)
+	}
+
+	query := `SELECT generation_id, ` + viewGenerationColumns + ` FROM view_generations`
+	if len(clauses) > 0 {
+		query += ` WHERE ` + strings.Join(clauses, " AND ")
+	}
+	query += ` ORDER BY generation_id DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := c.store.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ViewGeneration
+	for rows.Next() {
+		var generation ViewGeneration
+		err := scanViewGeneration(func(dest ...any) error {
+			return rows.Scan(append([]any{&generation.GenerationID}, dest...)...)
+		}, &generation)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, generation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // PublishViewGeneration is the building -> ready transition and the only write

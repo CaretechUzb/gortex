@@ -368,6 +368,33 @@ type ViewGeneration struct {
 	Error                string
 }
 
+// ViewGenerationFilter narrows a ListViewGenerations scan. Every field is
+// optional and the ones that are set are ANDed, so the zero filter enumerates
+// the newest generations in the table.
+//
+// It exists because a generation is otherwise only reachable through something
+// that points at it — a route, a ref view, a base pointer, or an id an owner
+// happens to still be holding. A process that dies between superseding a
+// generation and retiring it drops the last of those, and without an
+// enumeration the payload is unreachable for the life of the database.
+type ViewGenerationFilter struct {
+	// States restricts the scan to these lifecycle states. Empty accepts all
+	// of them.
+	States []ViewGenerationState
+	// CheckoutID restricts the scan to the generations built for one
+	// checkout. Empty accepts all of them, including the generations that
+	// name no checkout at all.
+	CheckoutID string
+	// GraphID restricts the scan to one graph. Empty accepts all of them.
+	GraphID string
+	// OwnerKind restricts the scan to one owner vocabulary. Empty accepts all
+	// of them.
+	OwnerKind string
+	// Limit bounds the rows one call returns. 0 — and anything above the cap —
+	// takes maxViewGenerationListing.
+	Limit int
+}
+
 // ViewLayer names the git state a generation is built over.
 type ViewLayer struct {
 	LayerID      string
