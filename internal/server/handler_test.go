@@ -146,6 +146,39 @@ func TestToolCallUnknownTool(t *testing.T) {
 	assert.Contains(t, available, "echo")
 }
 
+// TestToolCallPromotesDeferredTool covers the same defer-mode promotion
+// fix as TestCallToolStrict_PromotesDeferredTool (handler_strict_test.go),
+// but through the public POST /v1/tools/{name} HTTP path (handleToolCall)
+// rather than the internal CallToolStrict caller — both routes share the
+// new getToolOrPromote helper, and this pins the HTTP-facing contract
+// separately since it serializes a different response shape (ToolResponse,
+// not a plain string).
+func TestToolCallPromotesDeferredTool(t *testing.T) {
+	h := newTestHandler(t)
+	h.SetToolPromoter(func(name string) bool {
+		if name != "deferred_tool" {
+			return false
+		}
+		h.mcpServer.AddTool(
+			mcp.NewTool("deferred_tool", mcp.WithDescription("registered on promotion")),
+			func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return mcp.NewToolResultText("promoted"), nil
+			},
+		)
+		return true
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/tools/deferred_tool", strings.NewReader("{}"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp ToolResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	require.Len(t, resp.Content, 1)
+	assert.Equal(t, "promoted", resp.Content[0].Text)
+}
+
 func TestToolCallMalformedJSON(t *testing.T) {
 	h := newTestHandler(t)
 	req := httptest.NewRequest(http.MethodPost, "/v1/tools/echo", strings.NewReader("{bad"))

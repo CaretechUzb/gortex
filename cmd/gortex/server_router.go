@@ -33,6 +33,12 @@ func newLocalToolExecutor(srv *gortexmcp.Server, logger *zap.Logger) daemon.Loca
 	}
 	return func(ctx context.Context, toolName string, body []byte) ([]byte, int, error) {
 		tool := srv.MCPServer().GetTool(toolName)
+		if tool == nil && srv.EnsureToolPromoted(toolName) {
+			// Deferred/lazy catalog under the defer-mode tools_search
+			// split (the shipped core-preset default) — not yet in the
+			// live registry until promoted just now.
+			tool = srv.MCPServer().GetTool(toolName)
+		}
 		if tool == nil {
 			payload := map[string]any{
 				"error":   "tool_not_found",

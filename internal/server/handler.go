@@ -92,6 +92,20 @@ func (h *Handler) SetToolPromoter(f func(name string) bool) {
 	h.promoteTool = f
 }
 
+// getToolOrPromote looks up a tool in the live MCP registry, and — on a
+// miss — asks the wired promoter to pull it out of the deferred/lazy
+// catalog (the defer-mode tools_search split) before giving up. Shared by
+// every internal-dispatch call site (CallToolStrict, handleToolCall) so a
+// tool is reachable by name here exactly as it is via the CLI's
+// `gortex call`, regardless of whether tools_search has run yet.
+func (h *Handler) getToolOrPromote(toolName string) *mcpserver.ServerTool {
+	tool := h.mcpServer.GetTool(toolName)
+	if tool == nil && h.promoteTool != nil && h.promoteTool(toolName) {
+		tool = h.mcpServer.GetTool(toolName)
+	}
+	return tool
+}
+
 // NewHandler creates an HTTP handler that dispatches to MCP tools.
 func NewHandler(mcpServer *mcpserver.MCPServer, g graph.Store, version string, logger *zap.Logger) *Handler {
 	h := &Handler{
@@ -429,7 +443,7 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		// dispatch below.
 	}
 
-	tool := h.mcpServer.GetTool(toolName)
+	tool := h.getToolOrPromote(toolName)
 	if tool == nil {
 		available := h.availableToolNames()
 		WriteJSON(w, http.StatusNotFound, map[string]any{
@@ -584,13 +598,7 @@ func (h *Handler) CallTool(ctx context.Context, toolName string, args map[string
 // error cases — callers that want to render the message verbatim can do so
 // regardless of whether they treat it as an error.
 func (h *Handler) CallToolStrict(ctx context.Context, toolName string, args map[string]any) (string, error) {
-	tool := h.mcpServer.GetTool(toolName)
-	if tool == nil && h.promoteTool != nil && h.promoteTool(toolName) {
-		// The tool was sitting in the deferred/lazy catalog (defer-mode
-		// tools_search split) and unknown to the live registry until
-		// promoted just now — re-fetch it.
-		tool = h.mcpServer.GetTool(toolName)
-	}
+	tool := h.getToolOrPromote(toolName)
 	if tool == nil {
 		return "", fmt.Errorf("tool %q is not registered", toolName)
 	}
