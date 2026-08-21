@@ -432,7 +432,7 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	// existed (CREATE TABLE IF NOT EXISTS won't alter an existing table).
 	// Must run before prepare(), whose node INSERT references the promoted
 	// columns too.
-	if err := ensureNodeColumns(db); err != nil {
+	if err := ensureNodeColumns(db, "nodes"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite node columns: %w", err)
 	}
@@ -446,45 +446,16 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	}
 	// nodes.is_stub generated column — see ensureNodeGeneratedColumns for why
 	// this is a separate function from ensureNodeColumns above.
-	if err := ensureNodeGeneratedColumns(db); err != nil {
+	if err := ensureNodeGeneratedColumns(db, "nodes"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite node generated columns: %w", err)
 	}
 	// Same treatment for the edges table's is_unresolved generated column —
-	// must run before the droppable-index loop below, which creates an index
+	// must run before createGraphCoreIndexes below, which creates an index
 	// over it.
-	if err := ensureEdgeColumns(db); err != nil {
+	if err := ensureEdgeColumns(db, "edges"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite edge columns: %w", err)
-	}
-	// Create the droppable secondary indexes from the shared set so their
-	// initial-creation DDL is byte-identical to the DDL the bulk-load fast
-	// path rebuilds them with (BeginBulkLoad drops these, FlushBulk
-	// recreates them — see bulk_load.go). Kept out of schemaSQL so the two
-	// sites cannot drift.
-	for _, idx := range bulkDroppableIndexes {
-		if _, err := db.Exec(idx.ddl); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("sqlite create index %s: %w", idx.name, err)
-		}
-	}
-	// Sparse partial indexes remain live through a cold load, but share the
-	// same explicit DDL ownership rather than drifting into schemaSQL.
-	for _, idx := range bulkAlwaysLiveIndexes {
-		if _, err := db.Exec(idx.ddl); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("sqlite create index %s: %w", idx.name, err)
-		}
-	}
-	// edges_external is a partial index over exactly the external-call
-	// terminals, so ExternalCallCandidateEdges scans a tiny index instead
-	// of the full edges table. Built from the shared predicate const (not
-	// inlined in schemaSQL) so the index WHERE and the query WHERE stay
-	// byte-identical — SQLite only uses a partial index when the query's
-	// WHERE matches the index's.
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS edges_external ON edges(kind) WHERE ` + externalCallTargetPredicate); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("sqlite edges_external index: %w", err)
 	}
 	// Backfill the FTS rowid sidecar for databases built before it existed,
 	// so the first incremental UpsertSymbolFTS on an already-indexed symbol
@@ -518,11 +489,16 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
 		}
 	}
-	// Every generation-keyed sidecar index spans columns a migration step
-	// introduces — view_gen for all of them, plus the vector ownership columns
-	// the v10 rebuild adds — so they are created only after pending steps have
-	// re-keyed their tables. On current and fresh stores this is an idempotent
-	// no-op.
+	// Both index sets are created after the pending steps, for two different
+	// reasons. The core indexes because the v16 step rebuilds nodes and edges,
+	// and dropping a table takes its indexes with it. The sidecar ones because
+	// they span columns a step introduces — view_gen (v15) and the vector
+	// ownership columns the v10 rebuild adds. On current and fresh stores both
+	// calls are idempotent no-ops.
+	if err := createGraphCoreIndexes(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite core index: %w", err)
+	}
 	if err := createSidecarIndexes(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite sidecar index: %w", err)
@@ -882,7 +858,9 @@ func (s *Store) prepare() error {
 		prepOn(s.writerDB, out, q)
 	}
 
-	const nodeCols = nodeInsertColumns
+	// The insert list leads with view_gen; the read list does not, because a
+	// scanned row becomes a graph.Node, which carries no generation.
+	const nodeCols = lookupNodeCols
 
 	// Never use INSERT OR REPLACE here. SQLite implements REPLACE as
 	// DELETE+INSERT; the DELETE fires the nodes->edges ON DELETE CASCADE and
@@ -891,9 +869,14 @@ func (s *Store) prepare() error {
 	// A true UPSERT updates the existing row in place and therefore preserves
 	// graph topology.
 	prepWrite(&s.stmtInsertNode,
-		`INSERT INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`+nodeUpsertClause)
+		`INSERT INTO nodes (`+nodeInsertColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`+nodeUpsertClause)
+	// view_gen is bound here, unlike every other read, because this statement
+	// probes the nodes PRIMARY KEY exactly: without it the same id can name one
+	// row per generation and the lookup returns whichever of them the seek
+	// reached first. The conjuncts follow the key order, so this is the full
+	// key rather than the id prefix a generation-blind read still seeks.
 	prep(&s.stmtGetNode,
-		`SELECT `+nodeCols+` FROM nodes WHERE id = ?`)
+		`SELECT `+nodeCols+` FROM nodes WHERE id = ? AND view_gen = ?`)
 	// The literal qual_name <> '' conjunct is what makes the partial
 	// nodes_by_qual index usable: SQLite cannot prove a bound parameter is
 	// non-empty, so without it this statement is a full node scan per call
@@ -954,10 +937,10 @@ func (s *Store) prepare() error {
 	prep(&s.stmtStatsByLanguage,
 		`SELECT language, COUNT(*) FROM nodes GROUP BY language`)
 
-	const edgeCols = edgeInsertColumns
+	const edgeCols = lookupEdgeCols
 
 	prepWrite(&s.stmtInsertEdge,
-		`INSERT OR IGNORE INTO edges (`+edgeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		`INSERT OR IGNORE INTO edges (`+edgeInsertColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	// The adjacency reads carry an explicit total order. Several callers take
 	// the FIRST edge matching a predicate (the semantic enricher's
 	// matching-edge lookup, for one), so several edges sharing
@@ -995,8 +978,12 @@ func (s *Store) prepare() error {
 		`UPDATE edges SET confidence = ?, confidence_label = ?, origin = ?, tier = ?, meta = ?, resolve_terminal = ?, resolve_terminal_reason = ?, semantic_source = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
 	prepWrite(&s.stmtDeleteEdgeByKey,
 		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
+	// The second statement that binds view_gen: this one probes the edges
+	// UNIQUE key, which now ends with the generation. It answers "would the
+	// INSERT OR IGNORE that writes this edge be a no-op", so an identical edge
+	// in another generation must not read as present.
 	prep(&s.stmtEdgeExists,
-		`SELECT 1 FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? LIMIT 1`)
+		`SELECT 1 FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ? LIMIT 1`)
 
 	return err
 }
@@ -1210,6 +1197,7 @@ func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) (bool, error) {
 		return false, err
 	}
 	res, err := stmt.Exec(
+		s.viewGen,
 		n.ID, string(n.Kind), n.Name, n.QualName, n.FilePath,
 		n.StartLine, n.EndLine, n.StartColumn, n.EndColumn, n.Language,
 		n.RepoPrefix, n.WorkspaceID, n.ProjectID,
@@ -1269,6 +1257,7 @@ func (s *Store) insertEdgeLocked(stmt *sql.Stmt, e *graph.Edge) (bool, error) {
 		crossRepo = 1
 	}
 	res, err := stmt.Exec(
+		s.viewGen,
 		e.From, e.To, string(e.Kind), e.FilePath, e.Line,
 		e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier,
 		crossRepo, metaBlob, p.resolveTerminal, p.resolveTerminalReason, p.semanticSource,
@@ -1730,7 +1719,7 @@ func (s *Store) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
 // -- reads ---------------------------------------------------------------
 
 func (s *Store) GetNode(id string) *graph.Node {
-	row := s.stmtGetNode.QueryRow(id)
+	row := s.stmtGetNode.QueryRow(id, s.viewGen)
 	n, err := scanNode(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1935,7 +1924,7 @@ func (s *Store) GetOutEdges(nodeID string) []*graph.Edge {
 // dominant share of resolve cost on a large graph.
 func (s *Store) EdgeExists(from, to string, kind graph.EdgeKind, filePath string, line int) bool {
 	var one int
-	err := s.stmtEdgeExists.QueryRow(from, to, string(kind), filePath, line).Scan(&one)
+	err := s.stmtEdgeExists.QueryRow(from, to, string(kind), filePath, line, s.viewGen).Scan(&one)
 	if err == sql.ErrNoRows {
 		return false
 	}

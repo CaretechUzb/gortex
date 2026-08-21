@@ -129,7 +129,7 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`,
 			// so the walk itself satisfies it. A sorter here would tax every
 			// out-edge lookup in the daemon.
 			name:   "out_edges_ordered",
-			query:  `SELECT ` + edgeInsertColumns + ` FROM edges WHERE from_id = ? ORDER BY line, id`,
+			query:  `SELECT ` + lookupEdgeCols + ` FROM edges WHERE from_id = ? ORDER BY line, id`,
 			args:   1,
 			want:   []string{"SEARCH edges USING INDEX edges_by_from_line (from_id=?)"},
 			forbid: []string{"SCAN edges", "TEMP B-TREE"},
@@ -138,7 +138,7 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`,
 			// store.go stmtInEdges: same contract on the reverse adjacency,
 			// riding edges_by_to's (to_id, kind) prefix plus the rowid.
 			name:   "in_edges_ordered",
-			query:  `SELECT ` + edgeInsertColumns + ` FROM edges WHERE to_id = ? ORDER BY kind, id`,
+			query:  `SELECT ` + lookupEdgeCols + ` FROM edges WHERE to_id = ? ORDER BY kind, id`,
 			args:   1,
 			want:   []string{"SEARCH edges USING INDEX edges_by_to (to_id=?)"},
 			forbid: []string{"SCAN edges", "TEMP B-TREE"},
@@ -192,7 +192,7 @@ func TestAdjacencyPlanLocksDuringBulkLoad(t *testing.T) {
 			// leading column, so the lookup stays a search; only the order
 			// has to be built.
 			name:   "out_edges_ordered_bulk_load",
-			query:  `SELECT ` + edgeInsertColumns + ` FROM edges WHERE from_id = ? ORDER BY line, id`,
+			query:  `SELECT ` + lookupEdgeCols + ` FROM edges WHERE from_id = ? ORDER BY line, id`,
 			want:   []string{"SEARCH edges USING INDEX sqlite_autoindex_edges_1 (from_id=?)", "USE TEMP B-TREE FOR ORDER BY"},
 			forbid: []string{"SCAN edges"},
 		},
@@ -200,7 +200,7 @@ func TestAdjacencyPlanLocksDuringBulkLoad(t *testing.T) {
 			// stmtInEdges: nothing left indexes to_id, so the reverse
 			// adjacency degrades all the way to a table scan plus a sort.
 			name:  "in_edges_ordered_bulk_load",
-			query: `SELECT ` + edgeInsertColumns + ` FROM edges WHERE to_id = ? ORDER BY kind, id`,
+			query: `SELECT ` + lookupEdgeCols + ` FROM edges WHERE to_id = ? ORDER BY kind, id`,
 			want:  []string{"SCAN edges", "USE TEMP B-TREE FOR ORDER BY"},
 		},
 	}

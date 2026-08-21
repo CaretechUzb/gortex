@@ -37,15 +37,17 @@ func openSeededGenerationStore(t *testing.T) *Store {
 	return s
 }
 
-// generationReadView is what a handle answers across the read surface. Two
-// handles over the same core must produce equal values today, because nothing
-// reads viewGen yet.
+// generationReadView is the still generation-blind part of the read surface:
+// counts, whole-graph exports and adjacency read every generation's rows. Two
+// handles over the same core must answer identically here whichever generation
+// each is pinned to. The two point statements that DO bind the generation
+// (GetNode, EdgeExists) are deliberately excluded — they are asserted per
+// handle instead.
 type generationReadView struct {
 	nodeCount  int
 	edgeCount  int
 	nodeIDs    []string
 	callTarget []string
-	callerName string
 	repos      []string
 }
 
@@ -65,9 +67,6 @@ func readThroughHandle(t *testing.T, s *Store) generationReadView {
 		view.callTarget = append(view.callTarget, e.To)
 	}
 	sort.Strings(view.callTarget)
-	if n := s.GetNode(genCallerID); n != nil {
-		view.callerName = n.Name
-	}
 	return view
 }
 
@@ -75,6 +74,13 @@ func readThroughHandle(t *testing.T, s *Store) generationReadView {
 // handle is a second view over one open database, not a second database. It
 // carries the requested generation, borrows the core, and sees writes made
 // through any other handle immediately.
+//
+// "Sees" means the rows are in the one shared database, not that every read
+// returns them: since the core tables carry a generation in their identity
+// keys, a write through a handle pinned to generation 7 lands at generation 7,
+// and the point statements that probe those keys answer per generation. There
+// is no read-through to the base corpus — a generation is a corpus of its own,
+// the same rule the payload sidecars have followed since they were keyed.
 func TestAtGenerationDerivedHandleSharesCore(t *testing.T) {
 	base := openSeededGenerationStore(t)
 	t.Cleanup(func() { _ = base.Close() })
@@ -103,22 +109,42 @@ func TestAtGenerationDerivedHandleSharesCore(t *testing.T) {
 		t.Fatalf("deriving mutated the base handle: ViewGeneration = %d", got)
 	}
 
-	// Nothing reads viewGen yet, so both handles must answer identically.
+	// The generation-blind reads answer identically through both handles.
 	if got, want := readThroughHandle(t, derived), readThroughHandle(t, base); !reflect.DeepEqual(got, want) {
 		t.Fatalf("derived handle read view = %+v, want the base handle's %+v", got, want)
 	}
+	// The seeded rows belong to the base corpus, so only the base handle's
+	// point read returns one.
+	if n := base.GetNode(genCallerID); n == nil || n.Name != "Caller" {
+		t.Fatalf("base handle point read = %+v, want the seeded node", n)
+	}
+	if n := derived.GetNode(genCallerID); n != nil {
+		t.Fatalf("derived handle point read = %+v, want nothing from another generation", n)
+	}
 
-	// A write through the derived handle lands in the shared core, so the base
-	// handle sees it without reopening anything.
+	// A write through the derived handle lands in the shared core: the
+	// generation-blind reads on the base handle see it without reopening
+	// anything, while the point read stays scoped to the writer's generation.
 	const thirdID = "repo/third.go::Third"
 	derived.AddBatch([]*graph.Node{
 		{ID: thirdID, Kind: graph.KindFunction, Name: "Third", FilePath: "repo/third.go", RepoPrefix: "repo"},
 	}, nil)
-	if n := base.GetNode(thirdID); n == nil {
-		t.Fatal("a node written through the derived handle is invisible to the base handle")
+	if got := base.NodeCount(); got != 4 {
+		t.Fatalf("base handle node count after a derived write = %d, want 4", got)
 	}
 	if got, want := readThroughHandle(t, base), readThroughHandle(t, derived); !reflect.DeepEqual(got, want) {
 		t.Fatalf("handles diverged after a shared-core write: base %+v, derived %+v", got, want)
+	}
+	if n := derived.GetNode(thirdID); n == nil {
+		t.Fatal("the derived handle cannot read back the node it just wrote")
+	}
+	if n := base.GetNode(thirdID); n != nil {
+		t.Fatalf("base handle point read = %+v, want nothing from the derived generation", n)
+	}
+	// A second handle at the same generation reads the write, which is what
+	// sharing the core buys: one database, one write, any number of views.
+	if n := base.AtGeneration(7).GetNode(thirdID); n == nil {
+		t.Fatal("a second handle at the writer's generation cannot see the write")
 	}
 
 	// Deriving from a derived handle keeps the same core, so generations chain
@@ -148,6 +174,15 @@ func TestAtGenerationZeroMatchesBase(t *testing.T) {
 	}
 	if got, want := readThroughHandle(t, atZero), readThroughHandle(t, base); !reflect.DeepEqual(got, want) {
 		t.Fatalf("generation-0 handle read view = %+v, want the base handle's %+v", got, want)
+	}
+	// Including the generation-scoped point reads, which is what makes this
+	// handle indistinguishable from the one Open returned rather than merely
+	// equal on the generation-blind surface.
+	if n := atZero.GetNode(genCallerID); n == nil || n.Name != "Caller" {
+		t.Fatalf("generation-0 handle point read = %+v, want the seeded node", n)
+	}
+	if !atZero.EdgeExists(genCallerID, genFirstID, graph.EdgeCalls, "repo/caller.go", 3) {
+		t.Fatal("generation-0 handle cannot see the base corpus's edge")
 	}
 }
 

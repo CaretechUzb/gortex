@@ -189,7 +189,7 @@ func (s *Store) GetNodeContext(ctx context.Context, id string) (*graph.Node, err
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	row := s.stmtGetNode.QueryRowContext(ctx, id)
+	row := s.stmtGetNode.QueryRowContext(ctx, id, s.viewGen)
 	n, err := scanNode(row)
 	if err == sql.ErrNoRows {
 		return nil, nil

@@ -79,8 +79,8 @@ func TestSchemaV13StoreGainsEdgeViewGenerationColumn(t *testing.T) {
 		t.Fatalf("create current store: %v", err)
 	}
 	// A fresh store gets the column straight from schemaSQL's CREATE TABLE.
-	if !hasEdgeColumn(t, seed.writerDB, edgeViewGenColumnName) {
-		t.Fatalf("fresh store is missing edges.%s", edgeViewGenColumnName)
+	if !hasEdgeColumn(t, seed.writerDB, viewGenColumnName) {
+		t.Fatalf("fresh store is missing edges.%s", viewGenColumnName)
 	}
 	seed.AddBatch([]*graph.Node{
 		{ID: callerID, Kind: graph.KindFunction, Name: "Caller", FilePath: "repo/caller.go", RepoPrefix: "repo"},
@@ -95,11 +95,22 @@ func TestSchemaV13StoreGainsEdgeViewGenerationColumn(t *testing.T) {
 	}
 
 	// Recreate the exact pre-v14 shape: the graph exists, the column does not,
-	// and the file is stamped at the version before the column shipped.
+	// and the file is stamped at the version before the column shipped. The
+	// column cannot simply be dropped — since v16 it is part of the edges
+	// unique key, and SQLite refuses to drop a constrained column — so the
+	// table is rebuilt at its v13 shape, the same way the shipped build would
+	// have left it. nodes is downgraded alongside it so the v16 step has both
+	// tables in their pre-v16 shape.
 	withRawDB(t, path, func(db *sql.DB) {
-		if _, err := db.Exec(`ALTER TABLE edges DROP COLUMN ` + edgeViewGenColumnName); err != nil {
-			t.Fatalf("drop post-v13 column: %v", err)
-		}
+		downgradeCoreTable(t, db, "nodes", legacyNodesTableBody, legacyNodeIndexes,
+			func(table string) error {
+				if err := ensureNodeColumns(db, table); err != nil {
+					return err
+				}
+				return ensureNodeGeneratedColumns(db, table)
+			})
+		downgradeCoreTable(t, db, "edges", legacyEdgesTableBodyV13, legacyEdgeIndexes,
+			func(table string) error { return ensureEdgeColumns(db, table) })
 		if _, err := db.Exec(`PRAGMA user_version = 13`); err != nil {
 			t.Fatalf("stamp v13: %v", err)
 		}
@@ -114,8 +125,8 @@ func TestSchemaV13StoreGainsEdgeViewGenerationColumn(t *testing.T) {
 	if migrated.NeedsRebuild() {
 		t.Fatal("an additive column upgrade must not signal a wipe/reindex")
 	}
-	if !hasEdgeColumn(t, migrated.writerDB, edgeViewGenColumnName) {
-		t.Fatalf("migrated store is missing edges.%s", edgeViewGenColumnName)
+	if !hasEdgeColumn(t, migrated.writerDB, viewGenColumnName) {
+		t.Fatalf("migrated store is missing edges.%s", viewGenColumnName)
 	}
 	if version, err := readUserVersion(migrated.writerDB); err != nil || version != currentSchemaVersion {
 		t.Fatalf("post-migration user_version = %d (err %v), want %d", version, err, currentSchemaVersion)
@@ -176,7 +187,7 @@ func TestSchemaEdgeViewGenerationMigrationIsIdempotent(t *testing.T) {
 			t.Fatalf("commit migration tx %d: %v", i, err)
 		}
 	}
-	if !hasEdgeColumn(t, store.writerDB, edgeViewGenColumnName) {
-		t.Fatalf("store is missing edges.%s after repeated migration runs", edgeViewGenColumnName)
+	if !hasEdgeColumn(t, store.writerDB, viewGenColumnName) {
+		t.Fatalf("store is missing edges.%s after repeated migration runs", viewGenColumnName)
 	}
 }

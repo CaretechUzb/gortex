@@ -62,8 +62,18 @@ const coldFTSMergePages = 64
 
 // bulkDroppableIndexes is the single source of truth for the dense secondary
 // indexes whose per-row maintenance is worth deferring for the bounded head of
-// a proven cold load. Open creates them, BeginBulkLoad drops them by name, and
-// the first deterministic seal recreates them from the exact same DDL.
+// a proven cold load. createGraphCoreIndexes creates them, BeginBulkLoad drops
+// them by name, and the first deterministic seal recreates them from the exact
+// same DDL.
+//
+// None of these keys names view_gen. Only the two identity keys — the nodes
+// primary key and the edges UNIQUE constraint — are taken per payload view
+// generation, because only they decide whether a write collides with an
+// existing row. These secondary keys serve generation-blind reads, and putting
+// view_gen in front of them would leave every such read unable to seek any
+// prefix. A WITHOUT ROWID secondary index entry carries the primary key, so
+// each nodes entry ends in (id, view_gen) regardless — which is why the
+// ID-projecting reads below stay index-only and their ORDER BY id stays free.
 //
 // These are exactly the standalone, NON-UNIQUE CREATE INDEX statements over
 // the large nodes / edges tables. Maintaining them per-row across a
@@ -74,11 +84,11 @@ const coldFTSMergePages = 64
 //   - nodes_by_qual: resolver lookups use INDEXED BY and must fail closed
 //     rather than scan the full nodes table. Keeping the compact partial index
 //     live preserves that contract during every bulk-load phase.
-//   - the edges UNIQUE(from_id, …) table constraint and every WITHOUT ROWID
+//   - the edges UNIQUE(from_id, …, view_gen) table constraint and every WITHOUT ROWID
 //     primary-key index: not standalone indexes; they cannot be dropped while
 //     the table/constraint exists.
 //   - edges_external (partial): a tiny index over external-call terminals,
-//     created from a shared predicate in Open; not worth dropping.
+//     created from a shared predicate const; not worth dropping.
 //
 // Dropping/recreating these is a runtime operation on identical DDL — it is
 // NOT a schema change, so it does not touch the persisted schema version.
@@ -101,8 +111,8 @@ var bulkDroppableIndexes = []bulkDroppableIndex{
 	// repo_prefix <> '', so a partial index is structurally unusable there —
 	// which is precisely why the partial nodes_by_repo never served these
 	// queries and they fell back to kind-range scans. WITHOUT ROWID keys
-	// make each entry (repo_prefix, kind, id), so ID projections are
-	// index-only.
+	// make each entry (repo_prefix, kind, id, view_gen), so ID projections
+	// are index-only.
 	{"nodes_by_repo_kind", `CREATE INDEX IF NOT EXISTS nodes_by_repo_kind ON nodes(repo_prefix, kind)`},
 	// Resolver warmup selects definitions by exact repository, compatible
 	// language family, and a bounded page of names. Keep the key minimal: kind

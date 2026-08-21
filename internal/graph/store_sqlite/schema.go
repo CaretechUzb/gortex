@@ -138,19 +138,31 @@ var edgePromotedColumns = []struct {
 	{"semantic_source", "semantic_source TEXT"},
 }
 
+// schemaColumnDB is the write surface the column-reconciling helpers need. It
+// is satisfied by both *sql.DB (Open) and *sql.Tx (a migration step rebuilding
+// a table inside the single migration transaction), so one implementation
+// serves both without a second copy of the PRAGMA scan.
+type schemaColumnDB interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
 // ensureEdgeColumns adds edgeGeneratedColumns + edgePromotedColumns to an
-// edges table created before they existed. Mirrors ensureNodeColumns'
+// edges-shaped table created before they existed. Mirrors ensureNodeColumns'
 // PRAGMA + conditional ALTER pattern, but queries table_xinfo rather than
 // table_info: table_info silently OMITS generated columns from its result
 // set (verified against the pinned modernc.org/sqlite driver — a reopened
 // store's is_unresolved column is invisible to table_info, so the existence
 // check always came back false and every reopen re-ran the ALTER, failing
 // with "duplicate column name"). table_xinfo lists every column, generated
-// ones included, with an extra hidden column (3 == generated) table_info
-// doesn't have — and works identically for the plain promoted columns too,
-// so one scan serves both lists.
-func ensureEdgeColumns(db *sql.DB) error {
-	rows, err := db.Query(`PRAGMA table_xinfo(edges)`)
+// ones included, with an extra hidden column table_info doesn't have — and
+// works identically for the plain promoted columns too, so one scan serves
+// both lists.
+//
+// table is a parameter because the v16 rebuild reconciles the replacement
+// table before the rows are copied into it, under its temporary name.
+func ensureEdgeColumns(db schemaColumnDB, table string) error {
+	rows, err := db.Query(`PRAGMA table_xinfo(` + table + `)`)
 	if err != nil {
 		return err
 	}
@@ -176,7 +188,7 @@ func ensureEdgeColumns(db *sql.DB) error {
 		if existing[c.name] {
 			continue
 		}
-		if _, err := db.Exec(`ALTER TABLE edges ADD COLUMN ` + c.ddl); err != nil {
+		if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + c.ddl); err != nil {
 			return err
 		}
 	}
@@ -184,7 +196,7 @@ func ensureEdgeColumns(db *sql.DB) error {
 		if existing[c.name] {
 			continue
 		}
-		if _, err := db.Exec(`ALTER TABLE edges ADD COLUMN ` + c.ddl); err != nil {
+		if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + c.ddl); err != nil {
 			return err
 		}
 	}
@@ -248,11 +260,11 @@ var nodeGeneratedColumns = []struct {
 	{"file_dir", fileDirColumnDDL},
 }
 
-// ensureNodeGeneratedColumns adds nodeGeneratedColumns to a nodes table
+// ensureNodeGeneratedColumns adds nodeGeneratedColumns to a nodes-shaped table
 // created before they existed. See ensureEdgeColumns for the table_xinfo
-// vs table_info rationale this mirrors.
-func ensureNodeGeneratedColumns(db *sql.DB) error {
-	rows, err := db.Query(`PRAGMA table_xinfo(nodes)`)
+// vs table_info rationale, and for why table is a parameter.
+func ensureNodeGeneratedColumns(db schemaColumnDB, table string) error {
+	rows, err := db.Query(`PRAGMA table_xinfo(` + table + `)`)
 	if err != nil {
 		return err
 	}
@@ -278,11 +290,35 @@ func ensureNodeGeneratedColumns(db *sql.DB) error {
 		if existing[c.name] {
 			continue
 		}
-		if _, err := db.Exec(`ALTER TABLE nodes ADD COLUMN ` + c.ddl); err != nil {
+		if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + c.ddl); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// nonGeneratedColumns lists the columns of table whose values a rebuild has to
+// carry across: everything table_xinfo reports as an ordinary column. A
+// generated column has hidden = 2 (VIRTUAL) or 3 (STORED) and is recomputed by
+// SQLite, so INSERT ... SELECT may not name it on either side.
+func nonGeneratedColumns(db schemaColumnDB, table string) ([]string, error) {
+	rows, err := db.Query(`SELECT name FROM pragma_table_xinfo(?) WHERE hidden IN (0, 1)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // analysisGenerationSchemaSQL is the normalized, generation-addressed
@@ -743,19 +779,143 @@ const vectorTableSQL = "CREATE TABLE IF NOT EXISTS vectors" + vectorsTableBody +
 // schemaSQL, because it spans columns the v10 and v15 rebuilds introduce.
 const vectorRepoIndexSQL = `CREATE INDEX IF NOT EXISTS vectors_by_repo ON vectors(view_gen, repo_prefix, node_id)`
 
-// edgeViewGenColumnDDL is the edges.view_gen column: the payload generation
-// an edge row belongs to. Generation 0 is the single base corpus every row
-// written so far belongs to, which is exactly what the NOT NULL DEFAULT 0
-// gives a row that predates the column — so the addition costs no backfill.
-// A plain column, not one of the generated ones above: nothing in an edge's
-// existing values can compute which generation wrote it.
+// view_gen is the payload generation a row belongs to. Generation 0 is the
+// single base corpus every row written so far belongs to, which is exactly what
+// the NOT NULL DEFAULT 0 gives a row that predates the column — so the addition
+// costs no backfill. A plain column, not one of the generated ones above:
+// nothing in a row's existing values can compute which generation wrote it.
 //
-// Shared between schemaSQL's CREATE TABLE (fresh stores) and the ALTER TABLE
-// that adds it to an older store, so the two definitions cannot drift.
+// edgeViewGenColumnDDL is shared between schemaSQL's CREATE TABLE (fresh
+// stores) and the ALTER TABLE that adds the column to an older one, so the two
+// definitions cannot drift. viewGenColumnName is the name alone, for the sites
+// that name the column rather than declare it: nodes gains it in the v16
+// rebuild and every payload sidecar has carried it since v15, and all of them
+// probe for it and supply it by this one name.
 const (
-	edgeViewGenColumnName = "view_gen"
-	edgeViewGenColumnDDL  = `view_gen INTEGER NOT NULL DEFAULT 0`
+	viewGenColumnName    = "view_gen"
+	edgeViewGenColumnDDL = `view_gen INTEGER NOT NULL DEFAULT 0`
 )
+
+// nodesTableBody is everything after the table name in the nodes CREATE
+// statement, so the fresh-store DDL and the v16 rebuild build the same shape
+// from one string — the same arrangement viewGenSidecars uses.
+//
+// view_gen joins the primary key because a node row belongs to exactly one
+// payload view generation: without it a second generation's row for an id would
+// collide with the base corpus's row instead of sitting beside it. It is the
+// LAST key column, not the first. Uniqueness is the same either way, but every
+// read in the package still probes by id alone, and a leading view_gen would
+// leave all of them unable to seek any prefix of the key — or of any secondary
+// index, since a WITHOUT ROWID index entry ends in the primary key. Trailing, it
+// is a residual filter for a generation-blind read and the exact seek for the
+// two statements that bind it. Leading it becomes worthwhile only once the
+// reads are retargeted, which is a migration of its own.
+//
+// The ALTER-added promoted / struct columns (see promotedMetaColumns and
+// structNodeColumns) are deliberately absent here, exactly as they were when
+// the columns were spelled out inline: ensureNodeColumns reconciles them on
+// both a fresh table and a rebuilt one, so there is a single owner of their
+// DDL. The generated columns (is_stub, file_dir) are likewise added by
+// ensureNodeGeneratedColumns.
+const nodesTableBody = ` (
+    id            TEXT NOT NULL,
+    view_gen      INTEGER NOT NULL DEFAULT 0,
+    kind          TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    qual_name     TEXT NOT NULL DEFAULT '',
+    file_path     TEXT NOT NULL,
+    start_line    INTEGER NOT NULL DEFAULT 0,
+    end_line      INTEGER NOT NULL DEFAULT 0,
+    start_column  INTEGER NOT NULL DEFAULT 0,
+    end_column    INTEGER NOT NULL DEFAULT 0,
+    language      TEXT NOT NULL DEFAULT '',
+    repo_prefix   TEXT NOT NULL DEFAULT '',
+    workspace_id  TEXT NOT NULL DEFAULT '',
+    project_id    TEXT NOT NULL DEFAULT '',
+    signature     TEXT,
+    visibility    TEXT,
+    doc           TEXT,
+    external      INTEGER,
+    return_type   TEXT,
+    is_async      INTEGER,
+    is_static     INTEGER,
+    is_abstract   INTEGER,
+    is_exported   INTEGER,
+    updated_at    INTEGER,
+    data_class    TEXT,
+    clone_sig     TEXT,
+    meta          BLOB,
+    PRIMARY KEY (id, view_gen)
+) WITHOUT ROWID`
+
+// edgesTableBody is the same arrangement for edges. The synthetic AUTOINCREMENT
+// primary key is unchanged — it names a physical row, not a logical edge — and
+// the logical dedup key gains view_gen, again as its last column, so the same
+// edge may exist once per generation while a five-column identity probe still
+// seeks the key's prefix. The promoted and generated columns are added by
+// ensureEdgeColumns.
+const edgesTableBody = ` (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_id          TEXT NOT NULL,
+    to_id            TEXT NOT NULL,
+    kind             TEXT NOT NULL,
+    file_path        TEXT NOT NULL DEFAULT '',
+    line             INTEGER NOT NULL DEFAULT 0,
+    confidence       REAL NOT NULL DEFAULT 1.0,
+    confidence_label TEXT NOT NULL DEFAULT '',
+    origin           TEXT NOT NULL DEFAULT '',
+    tier             TEXT NOT NULL DEFAULT '',
+    cross_repo       INTEGER NOT NULL DEFAULT 0,
+    ` + edgeViewGenColumnDDL + `,
+    meta             BLOB,
+    UNIQUE(from_id, to_id, kind, file_path, line, view_gen)
+)`
+
+// nodesByQualIndexSQL backs GetNodeByQualName. Qualified names are
+// language-level lookup labels, not graph identities: forks, worktrees,
+// manifest overlays and independent repositories may emit the same value. Keep
+// this index non-unique and let repository/workspace-aware callers disambiguate
+// candidates. It is excluded from bulkDroppableIndexes because resolver lookups
+// reach it through INDEXED BY and must fail closed rather than scan the table.
+const nodesByQualIndexSQL = `CREATE INDEX IF NOT EXISTS nodes_by_qual ON nodes(qual_name) WHERE qual_name <> ''`
+
+// edgesExternalIndexSQL is a partial index over exactly the external-call
+// terminals, so ExternalCallCandidateEdges scans a tiny index instead of the
+// full edges table. Built from the shared predicate const so the index WHERE
+// and the query WHERE stay byte-identical — SQLite only uses a partial index
+// when the query's WHERE matches the index's.
+const edgesExternalIndexSQL = `CREATE INDEX IF NOT EXISTS edges_external ON edges(kind) WHERE ` + externalCallTargetPredicate
+
+// createGraphCoreIndexes builds every secondary index over nodes and edges.
+//
+// Called after the migration steps because the v16 step drops and rebuilds both
+// tables, which takes their indexes with them; recreating from one function
+// afterwards means the migrated store and a fresh one get identical DDL. The
+// droppable set is created from the shared DDL so its initial-creation text is
+// byte-identical to what the bulk-load fast path rebuilds it with (BeginBulkLoad
+// drops these, FlushBulk recreates them — see bulk_load.go); the sparse partial
+// indexes stay live through a cold load but share the same ownership.
+//
+// No key here spans view_gen, so this runs unchanged against a store pinned to
+// a schema version older than v16, whose nodes table has no such column.
+func createGraphCoreIndexes(db schemaColumnDB) error {
+	for _, idx := range bulkDroppableIndexes {
+		if _, err := db.Exec(idx.ddl); err != nil {
+			return fmt.Errorf("%s: %w", idx.name, err)
+		}
+	}
+	for _, idx := range bulkAlwaysLiveIndexes {
+		if _, err := db.Exec(idx.ddl); err != nil {
+			return fmt.Errorf("%s: %w", idx.name, err)
+		}
+	}
+	for _, ddl := range []string{nodesByQualIndexSQL, edgesExternalIndexSQL} {
+		if _, err := db.Exec(ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // schemaSQL is the canonical DDL applied on Open. Statements are
 // idempotent (IF NOT EXISTS) so they run cleanly against a fresh DB
@@ -765,7 +925,9 @@ const (
 // statements here. Their secondary indexes span view_gen, a column an older
 // store gains in the v15 step, and schemaSQL runs BEFORE the migration steps
 // — so those indexes are created afterwards instead (see openWith), the same
-// ordering vectors_by_repo has needed since v10.
+// ordering vectors_by_repo has needed since v10. The nodes / edges indexes are
+// created afterwards too (createGraphCoreIndexes), because the v16 step rebuilds
+// both tables and a dropped table takes its indexes with it.
 var schemaSQL = graphSchemaSQL + sidecarSchemaSQL + analysisGenerationSchemaSQL + checkoutCatalogSchemaSQL
 
 // graphSchemaSQL is the node/edge core plus the two FTS5 virtual tables — the
@@ -773,15 +935,18 @@ var schemaSQL = graphSchemaSQL + sidecarSchemaSQL + analysisGenerationSchemaSQL 
 //
 // Schema choices
 //
-//   - nodes.id is the primary key; INSERT OR REPLACE on the id column
-//     gives idempotent re-adds with last-write-wins on every other
-//     column, matching the in-memory store's behaviour.
+//   - (id, view_gen) is the nodes primary key; the upsert conflict target
+//     names both columns, giving idempotent re-adds with last-write-wins on
+//     every other column, matching the in-memory store's behaviour. Every row
+//     a plain index writes sits at generation 0, so one graph behaves exactly
+//     as it did when id alone was the key — down to the query plans, because
+//     id is still the key's leading column.
 //
 //   - edges has a synthetic INTEGER PRIMARY KEY plus a UNIQUE
-//     constraint over (from_id, to_id, kind, file_path, line) -- the
-//     logical edge key the in-memory store uses for dedup. INSERT OR
-//     IGNORE on that constraint matches the in-memory "second AddEdge
-//     for the same key is a no-op" semantics.
+//     constraint over (from_id, to_id, kind, file_path, line, view_gen) --
+//     the logical edge key the in-memory store uses for dedup, taken per
+//     generation. INSERT OR IGNORE on that constraint matches the in-memory
+//     "second AddEdge for the same key is a no-op" semantics.
 //
 //   - meta is a JSON document (see meta_json.go). nil / empty Meta is
 //     stored as NULL. Four universal, hot-read node keys are promoted to
@@ -807,64 +972,16 @@ var schemaSQL = graphSchemaSQL + sidecarSchemaSQL + analysisGenerationSchemaSQL 
 //     second hop)
 //     edges_by_to        -- GetInEdges
 const graphSchemaSQL = `
-CREATE TABLE IF NOT EXISTS nodes (
-    id            TEXT PRIMARY KEY,
-    kind          TEXT NOT NULL,
-    name          TEXT NOT NULL,
-    qual_name     TEXT NOT NULL DEFAULT '',
-    file_path     TEXT NOT NULL,
-    start_line    INTEGER NOT NULL DEFAULT 0,
-    end_line      INTEGER NOT NULL DEFAULT 0,
-    start_column  INTEGER NOT NULL DEFAULT 0,
-    end_column    INTEGER NOT NULL DEFAULT 0,
-    language      TEXT NOT NULL DEFAULT '',
-    repo_prefix   TEXT NOT NULL DEFAULT '',
-    workspace_id  TEXT NOT NULL DEFAULT '',
-    project_id    TEXT NOT NULL DEFAULT '',
-    signature     TEXT,
-    visibility    TEXT,
-    doc           TEXT,
-    external      INTEGER,
-    return_type   TEXT,
-    is_async      INTEGER,
-    is_static     INTEGER,
-    is_abstract   INTEGER,
-    is_exported   INTEGER,
-    updated_at    INTEGER,
-    data_class    TEXT,
-    clone_sig     TEXT,
-    meta          BLOB
-) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS nodes` + nodesTableBody + `;
 
--- nodes_by_name / _kind / _file / _repo are created from the shared
--- bulkDroppableIndexes set (see bulk_load.go), not here, so the bulk-load
--- fast path can drop and rebuild the EXACT same DDL without drift.
--- Qualified names are language-level lookup labels, not graph identities:
--- forks, worktrees, manifest overlays and independent repositories may emit
--- the same value. Keep this index non-unique and let repository/workspace-aware
--- callers disambiguate candidates.
-CREATE INDEX IF NOT EXISTS nodes_by_qual ON nodes(qual_name) WHERE qual_name <> '';
+-- nodes_by_name / _kind / _file / _repo / _qual are created from
+-- createGraphCoreIndexes (after the migration steps), not here, so the
+-- bulk-load fast path rebuilds the EXACT same DDL without drift and the v16
+-- table rebuild leaves the same shape behind.
 
-CREATE TABLE IF NOT EXISTS edges (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    from_id          TEXT NOT NULL,
-    to_id            TEXT NOT NULL,
-    kind             TEXT NOT NULL,
-    file_path        TEXT NOT NULL DEFAULT '',
-    line             INTEGER NOT NULL DEFAULT 0,
-    confidence       REAL NOT NULL DEFAULT 1.0,
-    confidence_label TEXT NOT NULL DEFAULT '',
-    origin           TEXT NOT NULL DEFAULT '',
-    tier             TEXT NOT NULL DEFAULT '',
-    cross_repo       INTEGER NOT NULL DEFAULT 0,
-    ` + edgeViewGenColumnDDL + `,
-    meta             BLOB,
-    UNIQUE(from_id, to_id, kind, file_path, line)
-);
+CREATE TABLE IF NOT EXISTS edges` + edgesTableBody + `;
 
--- edges_by_from / _to / _kind are created from the shared
--- bulkDroppableIndexes set (see bulk_load.go), not here, so the bulk-load
--- fast path can drop and rebuild the EXACT same DDL without drift.
+-- edges_by_from / _to / _kind are created from createGraphCoreIndexes too.
 -- edges_by_kind backs EdgesByKind / EdgesByKinds (resolver whole-graph
 -- passes probe single kinds like provides/imports on every file save);
 -- without it those are full edges-table scans — edges_by_from/to lead

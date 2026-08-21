@@ -65,12 +65,12 @@ WHERE kind IN (?, ?, ?)
 		result.EdgesRemoved = int(rows)
 	}
 
-	nodesChanged, _, _, err := insertNodeChunksTx(tx, replacement.Nodes, false)
+	nodesChanged, _, _, err := insertNodeChunksTx(tx, s.viewGen, replacement.Nodes, false)
 	if err != nil {
 		return graph.ContractOwnerReplaceResult{}, err
 	}
 	result.NodesChanged = nodesChanged
-	edgesAdded, _, _, err := insertEdgeChunksTx(tx, replacement.Edges, false)
+	edgesAdded, _, _, err := insertEdgeChunksTx(tx, s.viewGen, replacement.Edges, false)
 	if err != nil {
 		return graph.ContractOwnerReplaceResult{}, err
 	}

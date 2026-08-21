@@ -95,12 +95,12 @@ DELETE FROM nodes WHERE id IN (SELECT id FROM bridges)`, bridgeJSON, string(grap
 		result.NodesRemoved += int(rows)
 	}
 
-	nodesChanged, _, _, err := insertNodeChunksTx(tx, replacement.Nodes, false)
+	nodesChanged, _, _, err := insertNodeChunksTx(tx, s.viewGen, replacement.Nodes, false)
 	if err != nil {
 		return graph.DerivedContractReplaceResult{}, err
 	}
 	result.NodesChanged = nodesChanged
-	edgesAdded, _, _, err := insertEdgeChunksTx(tx, replacement.Edges, false)
+	edgesAdded, _, _, err := insertEdgeChunksTx(tx, s.viewGen, replacement.Edges, false)
 	if err != nil {
 		return graph.DerivedContractReplaceResult{}, err
 	}

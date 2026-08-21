@@ -219,7 +219,7 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	if err != nil {
 		return stats, false, false, nil, err
 	}
-	stats.insertedRows, stats.insertStatements, err = insertSQLiteReindexRowsTxLimited(tx, inserts, &variableLimit)
+	stats.insertedRows, stats.insertStatements, err = insertSQLiteReindexRowsTxLimited(tx, s.viewGen, inserts, &variableLimit)
 	if err != nil {
 		return stats, false, false, nil, err
 	}
@@ -831,7 +831,7 @@ func deleteSQLiteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, varia
 	return changed, statements, nil
 }
 
-func insertSQLiteReindexRowsTxLimited(tx *sql.Tx, rows []sqliteReindexRow, variableLimit *int) (int, int, error) {
+func insertSQLiteReindexRowsTxLimited(tx *sql.Tx, viewGen int64, rows []sqliteReindexRow, variableLimit *int) (int, int, error) {
 	if len(rows) == 0 {
 		return 0, 0, nil
 	}
@@ -852,6 +852,7 @@ func insertSQLiteReindexRowsTxLimited(tx *sql.Tx, rows []sqliteReindexRow, varia
 			row := rows[pos]
 			argStart := len(args)
 			args = append(args,
+				viewGen,
 				row.key.fromID, row.key.toID, row.key.kind, row.key.filePath, row.key.line,
 				row.confidence, row.confidenceLabel, row.origin, row.tier,
 				row.crossRepo, row.meta, row.resolveTerminal, row.resolveTerminalReason, row.semanticSource,
