@@ -207,6 +207,11 @@ type Indexer struct {
 	dirIgnore     *excludes.Hierarchical
 	dirIgnoreOnce sync.Once
 	rootPath      string
+	// contentSrc is the optional immutable snapshot every content read
+	// goes through; nil reads the working tree with the os package. Held
+	// in an atomic pointer because reindex paths read it without a lock,
+	// the same way they read rootPath.
+	contentSrc atomic.Pointer[contentSourceRef]
 	// projectName is the repo's own name (go.mod module / package.json /
 	// dir), computed once per index. Stripped from the BM25-indexed file
 	// path so a query word matching it doesn't earn a useless uniform
@@ -2373,62 +2378,97 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	var skippedByContent []skippedFile
 	var skippedContentBytes int64
 	var parseFailedFiles []skippedFile
-	err = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	// admitWalkedFile applies the two gates that sit above the shared walk
+	// admission: the git-aware untracked-asset gate and the content-admission
+	// gate. Both walks below feed it, and both account for an over-cap file the
+	// same way, so a source-backed index admits what a filesystem index of the
+	// same bytes would — save for the per-directory ignore files a snapshot
+	// cannot consult, which shouldExclude names and the producer state
+	// declares.
+	admitWalkedFile := func(wf walkedFile) {
+		if reason, skip := untrackedGate.skip(wf.lang, wf.path); skip {
+			skippedContentBytes += wf.size
+			rel, _ := filepath.Rel(absRoot, wf.path)
+			skippedByContent = append(skippedByContent, skippedFile{
+				relPath: pathkey.Normalize(rel), lang: wf.lang, size: wf.size, reason: reason,
+			})
+			return
 		}
-		if d.IsDir() {
-			if idx.shouldPruneDir(path, absRoot) {
-				return filepath.SkipDir
+		if reason, skip := contentGate.skip(wf.lang, wf.size); skip {
+			skippedContentBytes += wf.size
+			rel, _ := filepath.Rel(absRoot, wf.path)
+			skippedByContent = append(skippedByContent, skippedFile{
+				relPath: pathkey.Normalize(rel), lang: wf.lang, size: wf.size, reason: reason,
+			})
+			return
+		}
+		files = append(files, wf)
+	}
+	if src := idx.contentSource(); src != nil {
+		// A snapshot enumerates itself, through the same gate and with the
+		// same accounting. An over-cap entry is bucketed here rather than
+		// dropped inside the walk: the size-skip node it earns is what leaves
+		// a trace at that path, and a sparse generation needs that trace to
+		// claim the path at all — without it the layer below keeps showing its
+		// stale symbols through where a flat index of the same bytes shows a
+		// skip stub.
+		err = idx.walkSource(ctx, src, func(wf walkedFile, adm walkAdmission) error {
+			if adm.oversize {
+				skippedLarge++
+				skippedBytes += wf.size
+				rel, _ := filepath.Rel(absRoot, wf.path)
+				skippedBySize = append(skippedBySize, skippedFile{
+					relPath: pathkey.Normalize(rel), lang: wf.lang, size: wf.size,
+				})
+				return nil
 			}
+			admitWalkedFile(wf)
 			return nil
-		}
-		lang, ok := idx.effectiveLanguage(path, nil)
-		if !ok {
-			return nil
-		}
-		if idx.shouldExclude(path, absRoot, false) {
-			return nil
-		}
-		info, statErr := d.Info()
-		if statErr != nil {
-			// Couldn't read FileInfo (race with deletion, broken
-			// symlink, …). Skip — the worker would fail too.
-			return nil
-		}
-		if maxSize > 0 && info.Size() > maxSize {
-			skippedLarge++
-			skippedBytes += info.Size()
-			rel, _ := filepath.Rel(absRoot, path)
-			skippedBySize = append(skippedBySize, skippedFile{
-				relPath: pathkey.Normalize(rel), lang: lang, size: info.Size(),
-			})
-			return nil
-		}
-		if reason, skip := untrackedGate.skip(lang, path); skip {
-			skippedContentBytes += info.Size()
-			rel, _ := filepath.Rel(absRoot, path)
-			skippedByContent = append(skippedByContent, skippedFile{
-				relPath: pathkey.Normalize(rel), lang: lang, size: info.Size(), reason: reason,
-			})
-			return nil
-		}
-		if reason, skip := contentGate.skip(lang, info.Size()); skip {
-			skippedContentBytes += info.Size()
-			rel, _ := filepath.Rel(absRoot, path)
-			skippedByContent = append(skippedByContent, skippedFile{
-				relPath: pathkey.Normalize(rel), lang: lang, size: info.Size(), reason: reason,
-			})
-			return nil
-		}
-		files = append(files, walkedFile{
-			path:      path,
-			lang:      lang,
-			size:      info.Size(),
-			mtimeNano: info.ModTime().UnixNano(),
 		})
-		return nil
-	})
+	} else {
+		err = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if idx.admitWalkEntry(absRoot, path, -1, true).pruneDir {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			// The FileInfo is taken before the admission gate rather than
+			// between its stages, because the gate needs the size for the cap.
+			// It costs one lstat on a file the language or exclude check would
+			// have rejected without any — the price of both walks sharing one
+			// gate instead of two copies that can drift.
+			info, statErr := d.Info()
+			if statErr != nil {
+				// Couldn't read FileInfo (race with deletion, broken
+				// symlink, …). Skip — the worker would fail too.
+				return nil
+			}
+			adm := idx.admitWalkEntry(absRoot, path, info.Size(), false)
+			if adm.oversize {
+				skippedLarge++
+				skippedBytes += info.Size()
+				rel, _ := filepath.Rel(absRoot, path)
+				skippedBySize = append(skippedBySize, skippedFile{
+					relPath: pathkey.Normalize(rel), lang: adm.lang, size: info.Size(),
+				})
+				return nil
+			}
+			if !adm.admit {
+				return nil
+			}
+			admitWalkedFile(walkedFile{
+				path:      path,
+				lang:      adm.lang,
+				size:      info.Size(),
+				mtimeNano: info.ModTime().UnixNano(),
+			})
+			return nil
+		})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -2515,7 +2555,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	maxShadowBytes := shadowMaxBytes()
 	belowShadowBytes := totalFileBytes <= maxShadowBytes
 	shadowWeight := shadowAdmissionWeight(len(files), totalFileBytes)
-	shadowLocallyEligible := blOK && firstIndex && belowShadowMax && belowShadowBytes
+	// A handle pinned to a derived payload generation is disqualified outright.
+	// The drain evicts the repository's persisted rows before its INSERT-only
+	// bulk load, and that eviction spans every generation — right for a
+	// re-track of the base corpus, and a wipe of the very corpus a sparse
+	// generation exists to leave alone. See derivedGenerationTarget.
+	shadowLocallyEligible := blOK && firstIndex && belowShadowMax && belowShadowBytes &&
+		!derivedGenerationTarget(idx.graph)
 
 	// Acquire a queued shadow slot before the shared repository-memory envelope.
 	// Waiting candidates therefore hold no general memory reservation. Every
@@ -3086,11 +3132,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	largeReadGate := make(chan struct{}, largeFileReadParallelism(workers))
 	readFile := func(wf walkedFile) ([]byte, error) {
 		if wf.size < largeFileReadThresholdBytes {
-			return os.ReadFile(wf.path)
+			return idx.readFileContent(wf.path)
 		}
 		largeReadGate <- struct{}{}
 		defer func() { <-largeReadGate }()
-		return os.ReadFile(wf.path)
+		return idx.readFileContent(wf.path)
 	}
 
 	// recordStreamedMtime persists a file's mtime incrementally, in batches,
@@ -3205,7 +3251,16 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// file themselves — one page/slide/sheet at a time — instead
 					// of materialising the whole file. Only the in-process route
 					// streams; the crash-isolation subprocess route keeps bytes.
-					if walkExt, found := idx.registry.GetByLanguage(wf.lang); found && parsePool == nil {
+					//
+					// The stream opens the path by handle, which is the working
+					// tree and not the snapshot a content source serves, so
+					// under a source the file falls through to the ordinary
+					// byte path below. A StreamingExtractor is an Extractor
+					// too, so the same extractor runs on the same content; what
+					// is given up is the O(one unit) memory bound, and that is
+					// worth less than reading the state the pass is describing.
+					streamable := idx.contentSource() == nil
+					if walkExt, found := idx.registry.GetByLanguage(wf.lang); found && parsePool == nil && streamable {
 						if se, ok := walkExt.(parser.StreamingExtractor); ok {
 							result, serr := idx.extractStreaming(se, path, relPath)
 							if serr != nil {
@@ -4233,7 +4288,7 @@ func (idx *Indexer) indexFile(
 		if err != nil {
 			return err
 		}
-		src, readVersion, err = readFileWithVersion(absPath)
+		src, readVersion, err = idx.readFileWithVersion(absPath)
 		if err != nil {
 			return err
 		}
@@ -4636,6 +4691,12 @@ func (idx *Indexer) recordFileReadVersion(relPath, absPath string, version fileR
 	if !version.valid {
 		return false
 	}
+	if version.snapshot {
+		// An immutable snapshot has nothing to restat and no disk mtime
+		// worth stamping: the staleness ledger tracks the working tree,
+		// which this read never touched.
+		return true
+	}
 	current, err := os.Stat(absPath)
 	if err != nil || !sameFileVersion(version.info, current) {
 		return false
@@ -5002,8 +5063,10 @@ func (idx *Indexer) collectEmbedTexts(nodes []*graph.Node) (texts []string, ids 
 	if threshold <= 0 {
 		threshold = embedding.DefaultChunkThresholdLines
 	}
-	// fileCache memoizes one os.ReadFile per source file — many symbols
-	// share a file, and the chunker only needs the bytes once.
+	// fileCache memoizes one read per source file — many symbols share a
+	// file, and the chunker only needs the bytes once. The read goes
+	// through the content seam so the vectors describe the state the rest
+	// of the pass indexed, not whatever the working tree holds.
 	fileCache := make(map[string][]byte)
 	readFile := func(graphPath string) []byte {
 		if cached, ok := fileCache[graphPath]; ok {
@@ -5011,7 +5074,7 @@ func (idx *Indexer) collectEmbedTexts(nodes []*graph.Node) (texts []string, ids 
 		}
 		var data []byte
 		if abs := idx.ResolveFilePath(graphPath); abs != "" {
-			if b, err := os.ReadFile(abs); err == nil {
+			if b, err := idx.readFileContent(abs); err == nil {
 				data = b
 			}
 		}
@@ -5334,6 +5397,17 @@ func (idx *Indexer) shouldExclude(path, root string, isDir bool) bool {
 	if m := idx.excludeMatcher(); m != nil && m.MatchAbsDir(path, root, isDir) {
 		return true
 	}
+	if idx.contentSource() != nil {
+		// Per-directory ignore files are a working-tree fact: the
+		// hierarchical matcher reads them off disk, while a snapshot
+		// source serves a revision whose ignore files may differ from the
+		// checkout's — or not be on disk at all. A snapshot is therefore
+		// admitted by the layered config excludes alone, and an index
+		// built from one should declare that omission in its producer
+		// state rather than claim per-directory ignore coverage it never
+		// had.
+		return false
+	}
 	return idx.dirIgnoreMatcher(root).Match(path, isDir)
 }
 
@@ -5464,7 +5538,10 @@ func (idx *Indexer) shouldPruneDir(path, root string) bool {
 			return false
 		}
 	}
-	if idx.dirIgnoreMatcher(root).HasNegatedDescendant(path) {
+	// Same bypass as shouldExclude: under a snapshot source the
+	// per-directory ignore files are not part of the decision, so the
+	// matcher is not built at all.
+	if idx.contentSource() == nil && idx.dirIgnoreMatcher(root).HasNegatedDescendant(path) {
 		return false
 	}
 	return true
@@ -5875,15 +5952,12 @@ func (idx *Indexer) incrementalReindexPathsMode(
 					return nil
 				}
 				if d.IsDir() {
-					if idx.shouldPruneDir(path, absRoot) {
+					if idx.admitWalkEntry(absRoot, path, -1, true).pruneDir {
 						return filepath.SkipDir
 					}
 					return nil
 				}
-				if _, ok := idx.effectiveLanguage(path, nil); !ok && !idx.isIncrementalContractManifest(path) {
-					return nil
-				}
-				if idx.shouldExclude(path, absRoot, false) {
+				if !idx.admitScopedWalkFile(absRoot, path) {
 					return nil
 				}
 				// relKey (slash + NFC) keeps the disk set keyed
@@ -5903,10 +5977,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 
 		// Single file. Apply the same language / exclude gate so a
 		// caller can't force a non-source or excluded file in.
-		if _, ok := idx.effectiveLanguage(absPath, nil); !ok && !idx.isIncrementalContractManifest(absPath) {
-			continue
-		}
-		if idx.shouldExclude(absPath, absRoot, false) {
+		if !idx.admitScopedWalkFile(absRoot, absPath) {
 			continue
 		}
 		// relKey (slash + NFC) — same canonical key the graph and
@@ -6579,17 +6650,18 @@ func (idx *Indexer) routerPrefixScanFiles(reg *contracts.Registry) []string {
 	)
 }
 
-// contractFileSrc reads the on-disk source for a contract FilePath
-// (which is repo-prefixed when the indexer uses a repo prefix). Returns
-// nil when the file can't be read. Mirrors the disk-resolution logic in
-// resolveProviderHandlers so cross-file passes share one access pattern.
+// contractFileSrc reads the source behind a contract FilePath (which is
+// repo-prefixed when the indexer uses a repo prefix). Returns nil when the
+// file can't be read. Every cross-file contract pass goes through it, so the
+// bytes they see come from the same place the parse pipeline read: the
+// installed content source when there is one, and the working tree otherwise.
 func (idx *Indexer) contractFileSrc(filePath string) []byte {
 	diskPath := filePath
 	if idx.repoPrefix != "" && strings.HasPrefix(diskPath, idx.repoPrefix+"/") {
 		diskPath = strings.TrimPrefix(diskPath, idx.repoPrefix+"/")
 	}
 	diskPath = filepath.Join(idx.rootPath, diskPath)
-	data, err := os.ReadFile(diskPath)
+	data, err := idx.readFileContent(diskPath)
 	if err != nil {
 		return nil
 	}
@@ -6777,18 +6849,9 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		handlerNode := item.handler
 		src, ok := fileSrc[handlerNode.FilePath]
 		if !ok {
-			diskPath := handlerNode.FilePath
-			if idx.repoPrefix != "" && strings.HasPrefix(diskPath, idx.repoPrefix+"/") {
-				diskPath = strings.TrimPrefix(diskPath, idx.repoPrefix+"/")
-			}
-			diskPath = filepath.Join(idx.rootPath, diskPath)
-			data, err := os.ReadFile(diskPath)
-			if err != nil {
-				fileSrc[handlerNode.FilePath] = nil
-				continue
-			}
-			fileSrc[handlerNode.FilePath] = data
-			src = data
+			// Cache misses too (nil) — one read attempt per file.
+			src = idx.contractFileSrc(handlerNode.FilePath)
+			fileSrc[handlerNode.FilePath] = src
 		}
 		if src == nil {
 			continue
@@ -7947,20 +8010,9 @@ func (idx *Indexer) snapshotContractShapes(reg *contracts.Registry) {
 		}
 		src, ok := srcCache[node.FilePath]
 		if !ok {
-			// File paths in the graph are repo-prefixed; trim the
-			// prefix for disk I/O.
-			diskPath := node.FilePath
-			if idx.repoPrefix != "" && strings.HasPrefix(diskPath, idx.repoPrefix+"/") {
-				diskPath = strings.TrimPrefix(diskPath, idx.repoPrefix+"/")
-			}
-			diskPath = filepath.Join(idx.rootPath, diskPath)
-			data, err := os.ReadFile(diskPath)
-			if err != nil {
-				srcCache[node.FilePath] = nil
-				continue
-			}
-			srcCache[node.FilePath] = data
-			src = data
+			// Cache misses too (nil) — one read attempt per file.
+			src = idx.contractFileSrc(node.FilePath)
+			srcCache[node.FilePath] = src
 		}
 		if src == nil {
 			continue
@@ -8215,7 +8267,7 @@ func (idx *Indexer) extractExternalModules() {
 // from extractExternalModules's per-manifest dispatch.
 func (idx *Indexer) extractOneModuleManifest(relPath string, parse func([]byte) []modules.Spec, ownPathFromSrc func([]byte) string) {
 	manifestAbs := filepath.Join(idx.rootPath, relPath)
-	src, err := os.ReadFile(manifestAbs)
+	src, err := idx.readFileContent(manifestAbs)
 	if err != nil {
 		return
 	}
@@ -8429,7 +8481,7 @@ func readGoModModulePath(src []byte) string {
 // graph (UpgradeBareTypeRefs, resolveProviderHandlers).
 func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 	goModPath := filepath.Join(idx.rootPath, "go.mod")
-	goModSrc, err := os.ReadFile(goModPath)
+	goModSrc, err := idx.readFileContent(goModPath)
 	if err != nil {
 		return
 	}
@@ -8545,12 +8597,11 @@ func (idx *Indexer) extractContracts() {
 		}
 
 		absPath := filepath.Join(idx.rootPath, relPath)
-		info, statErr := os.Stat(absPath)
-		if statErr != nil {
+		currentMtime, _, readable := idx.contentFileVersion(absPath)
+		if !readable {
 			continue
 		}
 		seenFiles[fileNode.FilePath] = struct{}{}
-		currentMtime := info.ModTime().UnixNano()
 
 		// Cache hit: replay the previously-extracted contracts without
 		// re-reading the file or re-running the 8 extractors. This is
@@ -8567,7 +8618,7 @@ func (idx *Indexer) extractContracts() {
 			continue
 		}
 
-		src, err := os.ReadFile(absPath)
+		src, err := idx.readFileContent(absPath)
 		if err != nil {
 			continue
 		}

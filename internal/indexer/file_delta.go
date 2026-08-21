@@ -112,7 +112,7 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 	relPath := idx.graphRelKey(absPath)
 
 	started := time.Now()
-	src, readVersion, err := readFileWithVersion(absPath)
+	src, readVersion, err := idx.readFileWithVersion(absPath)
 	probe.read = time.Since(started)
 	if err != nil {
 		return probe, false, false
@@ -248,7 +248,7 @@ func (idx *Indexer) takePreparedRefresh(filePath string) (*preparedExtraction, b
 	if !ok {
 		return nil, false
 	}
-	current, readVersion, err := readFileWithVersion(absPath)
+	current, readVersion, err := idx.readFileWithVersion(absPath)
 	if err != nil {
 		prepared.release()
 		return nil, false
