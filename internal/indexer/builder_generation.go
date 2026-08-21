@@ -728,6 +728,29 @@ func (b *SparseGenerationBuilder) declareProducers(
 		vector.Reason = ""
 	}
 
+	// Near-duplicate detection is a whole-CORPUS statistic: the boilerplate
+	// filter is derived from shingle frequencies across every body in the
+	// corpus, the LSH bands are populated from that same population, and a
+	// diffusion pass runs over the resulting clone graph. A sparse generation
+	// carries part of a corpus by construction, so the pass sees a different
+	// population and can emit a different relation for the very same bodies.
+	// Two things follow, and the closure can only fix one of them: a pair the
+	// BASE already records joins the generation whole, because the counterpart
+	// file is reachable along the recorded edge — but a pair the change
+	// CREATES, between a claimed file and an untouched one, has no base edge
+	// to walk, so the generation replaces the claimed file's payload without
+	// the counterpart's half of the pair ever being written.
+	similarity := store_sqlite.ProducerCompleteness{
+		Producer: string(graphview.CapSimilarity),
+		State:    store_sqlite.ProducerStateDisabledByConfig,
+		Reason:   "near-duplicate detection is switched off for the build",
+	}
+	if b.Config.Coverage.IsEnabled("clones") {
+		similarity.State = store_sqlite.ProducerStateIncomplete
+		similarity.Reason = "near-duplicate detection ranks bodies against a corpus; " +
+			"a sparse generation ranks them against its file set"
+	}
+
 	rows := []store_sqlite.ProducerCompleteness{
 		{Producer: string(graphview.CapSourceSnapshot), State: store_sqlite.ProducerStateComplete},
 		{Producer: string(graphview.CapSourceConfig), State: store_sqlite.ProducerStateComplete, Reason: configReason},
@@ -737,6 +760,7 @@ func (b *SparseGenerationBuilder) declareProducers(
 		{Producer: string(graphview.CapSearchSymbols), State: store_sqlite.ProducerStateComplete},
 		{Producer: string(graphview.CapSearchContent), State: store_sqlite.ProducerStateComplete},
 		vector,
+		similarity,
 		{
 			Producer: string(graphview.CapResolutionCrossRepo),
 			State:    store_sqlite.ProducerStateIncomplete,
@@ -765,16 +789,21 @@ func (b *SparseGenerationBuilder) declareProducers(
 	if report.ClosureTruncated {
 		// The syntax and resolution the generation carries are whole for the
 		// files it re-derived; what is not whole is the set of files it should
-		// have re-derived, and a dependent past the cap keeps reading a stale
-		// resolution from the layer below.
+		// have re-derived. A file past the cap keeps reading a stale resolution
+		// from the layer below — and it is also a file whose references into
+		// this generation's symbols were never re-derived, so the reverse index
+		// is missing exactly the edges that file would have contributed. Both
+		// producers are narrowed; the generation is published either way, and
+		// what a knowingly incomplete capability is worth is the reader's call.
+		truncated := fmt.Sprintf(
+			"the affected closure was truncated at %d files; files past the cap were not re-resolved",
+			report.ClosureCap)
 		for i := range rows {
-			if rows[i].Producer != string(graphview.CapResolutionLocal) {
-				continue
+			switch rows[i].Producer {
+			case string(graphview.CapResolutionLocal), string(graphview.CapIncomingEdges):
+				rows[i].State = store_sqlite.ProducerStateIncomplete
+				rows[i].Reason = truncated
 			}
-			rows[i].State = store_sqlite.ProducerStateIncomplete
-			rows[i].Reason = fmt.Sprintf(
-				"the affected closure was truncated at %d files; dependents past the cap were not re-resolved",
-				report.ClosureCap)
 		}
 	}
 	for _, row := range rows {

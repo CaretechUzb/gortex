@@ -24,6 +24,11 @@ const (
 	CapResolutionCrossRepo CapabilityID = "graph.resolution.cross_repo"
 	// CapIncomingEdges reads the reverse index — who points at a node.
 	CapIncomingEdges CapabilityID = "graph.incoming_edges"
+	// CapSimilarity reads the near-duplicate relation between bodies. It is
+	// separate from the syntax graph because it is not derived from one file:
+	// the pass that writes it ranks every body against every other, so how
+	// much of the repository the producer saw decides what it emits.
+	CapSimilarity CapabilityID = "graph.similarity"
 	// CapSearchSymbols runs symbol search over the view.
 	CapSearchSymbols CapabilityID = "search.symbols"
 	// CapSearchContent runs content search over the view.
@@ -53,6 +58,7 @@ var knownCapabilities = []CapabilityID{
 	CapResolutionLocal,
 	CapResolutionCrossRepo,
 	CapIncomingEdges,
+	CapSimilarity,
 	CapSearchSymbols,
 	CapSearchContent,
 	CapSearchVector,

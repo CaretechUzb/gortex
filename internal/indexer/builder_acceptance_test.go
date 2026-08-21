@@ -580,6 +580,136 @@ func TestCommitLayerComposesLikeAFlatIndex(t *testing.T) {
 	builderAssertMasksValidate(t, store, generationID)
 }
 
+// --- acceptance 2: edges recorded outside the generation's files ---------
+
+// builderReverseFlowTreeA is the smallest tree where one symbol's outgoing
+// edges are recorded in more than one file.
+//
+// A tail call makes the callee's Result flow into the caller, and the resolver
+// records that flow at the CALLER's file while its source is the callee. So
+// helper.go::Helper has two outgoing value flows — alpha.go's and core.go's —
+// and neither one lives in helper.go.
+func builderReverseFlowTreeA() map[string]string {
+	return map[string]string{
+		"types.go": `package fixture
+
+type Options struct{}
+
+type Result struct{}
+`,
+		"helper.go": `package fixture
+
+func Helper(o Options) Result {
+	return Result{}
+}
+`,
+		"alpha.go": `package fixture
+
+func Alpha(o Options) Result {
+	return Helper(o)
+}
+`,
+		"core.go": `package fixture
+
+func Core(o Options) Result {
+	return Helper(o)
+}
+`,
+	}
+}
+
+func builderReverseFlowTreeB() map[string]string {
+	tree := builderReverseFlowTreeA()
+	tree["core.go"] = `package fixture
+
+func Core(o Options) Result {
+	// revision 1
+	return Helper(o)
+}
+`
+	return tree
+}
+
+// TestCommitLayerKeepsEdgesRecordedOutsideItsFiles pins whose edge a generation
+// replaces: the file the edge was RECORDED in, not the file its source lives
+// in.
+//
+// Only core.go changes, so the closure carries helper.go — core.go resolves
+// into it — and stops there: alpha.go is a dependent of helper.go, not of a
+// seed, and one hop does not reach it. The generation therefore claims
+// helper.go and re-derives every edge helper.go holds, which does not include
+// alpha.go's value flow out of Helper. A layer that read its claim on
+// helper.go as a claim on Helper's whole adjacency would hide that base row
+// and put nothing back, and the flat index of the same tree still has it.
+func TestCommitLayerKeepsEdgesRecordedOutsideItsFiles(t *testing.T) {
+	builderIsolateGit(t)
+	repoDir := builderTempDir(t, "repo")
+	builderGit(t, repoDir, "init", "--initial-branch=main")
+
+	builderWriteTree(t, repoDir, builderReverseFlowTreeA())
+	builderGit(t, repoDir, "add", "-A")
+	builderGit(t, repoDir, "commit", "-m", "A")
+	treeA := builderGit(t, repoDir, "rev-parse", "HEAD^{tree}")
+
+	dirA := builderTempDir(t, "checkout-a")
+	builderWriteTree(t, dirA, builderReverseFlowTreeA())
+
+	builderWriteTree(t, repoDir, builderReverseFlowTreeB())
+	builderGit(t, repoDir, "add", "-A")
+	builderGit(t, repoDir, "commit", "-m", "B")
+	treeB := builderGit(t, repoDir, "rev-parse", "HEAD^{tree}")
+	commitB := builderGit(t, repoDir, "rev-parse", "HEAD")
+
+	store := builderOpenStore(t, "base")
+	builderIndex(t, store, dirA)
+
+	generationID, report, err := builderNewBuilder(store).BuildCommitLayer(context.Background(), CommitLayerRequest{
+		Identity: GenerationIdentity{
+			OwnerKind:           "dedicated_graph",
+			GraphID:             "graph-fixture",
+			LayerID:             "layer-" + treeB,
+			CheckoutID:          "checkout-fixture",
+			ProvenanceCommitOID: commitB,
+		},
+		Base:          store,
+		RepoDir:       repoDir,
+		BaseTreeOID:   treeA,
+		TargetTreeOID: treeB,
+		RootPath:      dirA,
+		RepoPrefix:    builderRepoPrefix,
+		WorkspaceID:   builderRepoPrefix,
+		ProjectID:     builderRepoPrefix,
+	})
+	if err != nil {
+		t.Fatalf("BuildCommitLayer: %v", err)
+	}
+	// The case only bites while the generation claims the callee's file and
+	// not the untouched caller's.
+	if !slices.Contains(report.ClosurePaths, "helper.go") {
+		t.Fatalf("closure %v does not carry helper.go — core.go's callee must be re-derived", report.ClosurePaths)
+	}
+	if slices.Contains(report.IndexedPaths, "alpha.go") {
+		t.Fatalf("alpha.go is in the generation's file set %v — the untouched caller must stay below",
+			report.IndexedPaths)
+	}
+
+	flat := builderOpenStore(t, "flat")
+	dirB := builderTempDir(t, "checkout-b")
+	builderWriteTree(t, dirB, builderReverseFlowTreeB())
+	builderIndex(t, flat, dirB)
+
+	composed := builderComposed(t, store, generationID)
+	helper := builderRepoPrefix + "/helper.go::Helper"
+	alphaFlow := builderRenderEdges(flat.GetOutEdges(helper))
+	if len(alphaFlow) == 0 {
+		t.Fatal("the flat index records no edge out of Helper — the fixture no longer produces a reverse flow")
+	}
+	builderSameStrings(t, "GetOutEdges("+helper+") lost a row recorded in an unclaimed file",
+		builderRenderEdges(composed.GetOutEdges(helper)), alphaFlow)
+	builderAssertReadersAgree(t, composed, flat)
+	builderAssertMasksValidate(t, store, generationID)
+}
+
 // --- the pathless identities a file mask cannot reach --------------------
 
 // TestSparseGenerationClaimsPathlessIdentities pins the one class of payload a

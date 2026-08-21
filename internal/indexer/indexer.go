@@ -8167,32 +8167,27 @@ func (idx *Indexer) inlineEnvelopeShapes(reg *contracts.Registry) {
 	}
 }
 
-// extractExternalModules parses the repo's go.mod once and writes
-// KindModule nodes plus EdgeDependsOnModule edges into the graph.
-// A synthetic KindFile node is emitted for go.mod itself so the
-// edges have a real source endpoint that survives applyRepoPrefix.
-// Safe to call when no go.mod exists. Other manifest formats
-// (package.json, pnpm-lock, requirements.txt, Cargo.toml, …) are
-// future additions — each lands as another switch case here.
+// rootManifest is one dependency manifest the pass reads from the repository
+// root. Each produces an independent Spec list and gets its own synthetic file
+// node — the file→module edge stays scoped to the originating manifest so
+// cross-ecosystem queries (e.g. "what does package.json declare") don't bleed
+// into go.mod's answer.
+type rootManifest struct {
+	path           string
+	parse          func([]byte) []modules.Spec
+	ownPathFromSrc func([]byte) string
+}
+
+// rootManifests is the manifest formats the indexer recognises at a repository
+// root, in the order they are read.
 //
-// Import-node → module-node edges (per the broader coverage spec)
-// are deferred to v2; the v1 file-level edge is already enough for
-// agents asking "what does this repo depend on".
-func (idx *Indexer) extractExternalModules() {
-	if !idx.config.Coverage.IsEnabled("modules") {
-		return
-	}
-	// Walk known manifest formats at the repo root. Each manifest
-	// produces an independent Spec list and gets its own synthetic
-	// file node — the file→module edge stays scoped to the
-	// originating manifest so cross-ecosystem queries (e.g. "what
-	// does package.json declare") don't bleed into go.mod's
-	// answer.
-	manifests := []struct {
-		path           string
-		parse          func([]byte) []modules.Spec
-		ownPathFromSrc func([]byte) string
-	}{
+// It is a function rather than a table inlined in extractExternalModules
+// because the sparse-generation builder reads the same list: a manifest states
+// the repository's own module identity and its dependency set, so a generation
+// built without one classifies a module-local import as external and mints
+// stubs for it. The two callers must not be able to drift apart.
+func rootManifests() []rootManifest {
+	return []rootManifest{
 		{
 			path:           "go.mod",
 			parse:          modules.ParseGoMod,
@@ -8250,8 +8245,22 @@ func (idx *Indexer) extractExternalModules() {
 			ownPathFromSrc: nil,
 		},
 	}
+}
 
-	for _, m := range manifests {
+// extractExternalModules reads every manifest rootManifests names and writes
+// KindModule nodes plus EdgeDependsOnModule edges into the graph.
+// A synthetic KindFile node is emitted for each manifest itself so the
+// edges have a real source endpoint that survives applyRepoPrefix.
+// Safe to call when a manifest does not exist.
+//
+// Import-node → module-node edges (per the broader coverage spec)
+// are deferred to v2; the v1 file-level edge is already enough for
+// agents asking "what does this repo depend on".
+func (idx *Indexer) extractExternalModules() {
+	if !idx.config.Coverage.IsEnabled("modules") {
+		return
+	}
+	for _, m := range rootManifests() {
 		idx.extractOneModuleManifest(m.path, m.parse, m.ownPathFromSrc)
 	}
 

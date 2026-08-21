@@ -1,0 +1,579 @@
+package indexer
+
+import (
+	"context"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
+)
+
+// The closure's reference-driven cases.
+//
+// Each one is a minimised reproducer of a way the closure can come up short of
+// "what else must this generation carry": a reference the change INTRODUCES has
+// no base edge to walk, an added file has no base nodes at all, a definition
+// the change introduces has untouched files already parked on its placeholder,
+// a module-local import names a package no base edge points at, a closure
+// file's own references sit one hop further out than the seeds', and a clone
+// pair is recorded in two files at once.
+//
+// They are stated the same way — build the layer, then require the composition
+// to answer like a plain whole index of the tree it describes — with the
+// closure's own path list asserted alongside, so a case that starts passing for
+// an unrelated reason is still caught naming the file it was about.
+//
+// The two producer cases are the exception. They cover what the generation says
+// about itself where no closure walk can close the gap: a corpus statistic
+// computed over a file set, and a closure the cap cut short.
+
+// closureCase is one built commit layer: the two trees, the report, and both
+// halves of the differential.
+type closureCase struct {
+	store    *store_sqlite.Store
+	report   BuildReport
+	composed graph.Reader
+	flat     graph.Reader
+}
+
+// buildClosureCase commits treeA, indexes it as the base corpus, commits treeB
+// over it, and builds the commit layer spanning the two.
+func buildClosureCase(t *testing.T, treeA, treeB map[string]string) closureCase {
+	t.Helper()
+	builderIsolateGit(t)
+	dir := builderTempDir(t, "repo")
+	builderGit(t, dir, "init", "--initial-branch=main")
+	builderWriteTree(t, dir, treeA)
+	builderGit(t, dir, "add", "-A")
+	builderGit(t, dir, "commit", "-m", "A")
+	baseTree := builderGit(t, dir, "rev-parse", "HEAD^{tree}")
+
+	store := builderOpenStore(t, "base")
+	builderIndex(t, store, dir)
+
+	builderWriteTree(t, dir, treeB)
+	builderGit(t, dir, "add", "-A")
+	builderGit(t, dir, "commit", "-m", "B")
+	targetTree := builderGit(t, dir, "rev-parse", "HEAD^{tree}")
+	commitOID := builderGit(t, dir, "rev-parse", "HEAD")
+
+	generationID, report, err := builderNewBuilder(store).BuildCommitLayer(context.Background(), CommitLayerRequest{
+		Identity: GenerationIdentity{
+			OwnerKind:           "dedicated_graph",
+			GraphID:             "graph-closure",
+			LayerID:             "layer-" + targetTree,
+			CheckoutID:          "checkout-closure",
+			ProvenanceCommitOID: commitOID,
+		},
+		Base:          store,
+		RepoDir:       dir,
+		BaseTreeOID:   baseTree,
+		TargetTreeOID: targetTree,
+		RootPath:      dir,
+		RepoPrefix:    builderRepoPrefix,
+		WorkspaceID:   builderRepoPrefix,
+		ProjectID:     builderRepoPrefix,
+	})
+	if err != nil {
+		t.Fatalf("BuildCommitLayer: %v", err)
+	}
+	if report.ClosureTruncated {
+		t.Fatalf("closure truncated at %d files — not what this case is about", report.ClosureCap)
+	}
+
+	flat := builderOpenStore(t, "flat")
+	builderIndex(t, flat, dir)
+	return closureCase{
+		store:    store,
+		report:   report,
+		composed: builderComposed(t, store, generationID),
+		flat:     flat,
+	}
+}
+
+// assertClosureCarries requires every named path to be in the closure — the
+// files the walk had to discover, spelled repo-relative.
+func assertClosureCarries(t *testing.T, report BuildReport, paths ...string) {
+	t.Helper()
+	for _, want := range paths {
+		if !slices.Contains(report.ClosurePaths, want) {
+			t.Errorf("the closure does not carry %q; it carries %v", want, report.ClosurePaths)
+		}
+	}
+}
+
+// closureFixtureTypes is the type file every case below is written against. A
+// repository-local type keeps the resolver from minting a pathless stub, which
+// is a composition gap of its own and not what these cases are about.
+const closureFixtureTypes = `package fixture
+
+type Options struct{}
+
+type Result struct{}
+`
+
+// TestClosureCarriesIntroducedCallTarget pins the reference a change
+// INTRODUCES. core.go gains a call to Helper, which it did not make before, so
+// no base edge out of core.go names helper.go: a closure that walks only base
+// edges re-derives core.go against a world its new call cannot bind in.
+func TestClosureCarriesIntroducedCallTarget(t *testing.T) {
+	treeA := map[string]string{
+		"types.go": closureFixtureTypes,
+		"core.go": `package fixture
+
+func Compute(o Options) Result {
+	return Result{}
+}
+`,
+		"helper.go": `package fixture
+
+func Helper() Result {
+	return Result{}
+}
+`,
+		"island.go": `package fixture
+
+func Island() Result {
+	return Result{}
+}
+`,
+	}
+	treeB := map[string]string{}
+	for path, body := range treeA {
+		treeB[path] = body
+	}
+	treeB["core.go"] = `package fixture
+
+func Compute(o Options) Result {
+	return Helper()
+}
+`
+
+	c := buildClosureCase(t, treeA, treeB)
+	assertClosureCarries(t, c.report, "helper.go")
+	builderAssertReadersAgree(t, c.composed, c.flat)
+}
+
+// TestClosureResolvesAddedFileAgainstBase pins the added file. added.go has no
+// base nodes at all, so a closure seeded from the base layer's edges is empty
+// for it and the pass re-derives it against an empty world — its own parameter
+// type and its call both park on stubs a whole index of the same tree binds.
+func TestClosureResolvesAddedFileAgainstBase(t *testing.T) {
+	treeA := map[string]string{
+		"types.go": closureFixtureTypes,
+		"helper.go": `package fixture
+
+func Helper() Result {
+	return Result{}
+}
+`,
+		"island.go": `package fixture
+
+func Island() Result {
+	return Result{}
+}
+`,
+	}
+	treeB := map[string]string{}
+	for path, body := range treeA {
+		treeB[path] = body
+	}
+	treeB["added.go"] = `package fixture
+
+func Added(o Options) Result {
+	return Helper()
+}
+`
+
+	c := buildClosureCase(t, treeA, treeB)
+	assertClosureCarries(t, c.report, "helper.go", "types.go")
+	builderAssertReadersAgree(t, c.composed, c.flat)
+}
+
+// TestClosureCarriesPlaceholderReferrers pins the reverse direction of an
+// INTRODUCED definition. caller.go calls Helper in the base tree, where nothing
+// defines it, so the base parks the call on an `unresolved::Helper`
+// placeholder. The change adds helper.go — a file with no base nodes, so no
+// base edge and no reference fact links it to caller.go, and a reverse frontier
+// walked from the seeds' base nodes finds nothing. A whole index of the target
+// tree binds the call; a generation that never re-derives caller.go leaves the
+// stale placeholder edge showing through from below.
+func TestClosureCarriesPlaceholderReferrers(t *testing.T) {
+	treeA := map[string]string{
+		"types.go": closureFixtureTypes,
+		"caller.go": `package fixture
+
+func Call(o Options) Result {
+	return Helper()
+}
+`,
+		"island.go": `package fixture
+
+func Island() Result {
+	return Result{}
+}
+`,
+	}
+	treeB := map[string]string{}
+	for path, body := range treeA {
+		treeB[path] = body
+	}
+	treeB["helper.go"] = `package fixture
+
+func Helper() Result {
+	return Result{}
+}
+`
+
+	c := buildClosureCase(t, treeA, treeB)
+	assertClosureCarries(t, c.report, "caller.go")
+	builderAssertReadersAgree(t, c.composed, c.flat)
+}
+
+// TestClosureResolvesModuleLocalImport pins the module-local import. core.go
+// gains an import of a package inside its own module; without the package's
+// files and the module manifest in the generation, the pass cannot confirm the
+// package exists, classifies the path as stdlib, and mints PERMANENT PATHLESS
+// stubs for it — identities no file mask can reach.
+//
+// The assertion is therefore stated twice: the composition must agree with a
+// whole index, AND the generation must carry no pathless identity at all. A
+// tombstoned stub would satisfy the first on its own reads while still being
+// the wrong payload.
+func TestClosureResolvesModuleLocalImport(t *testing.T) {
+	treeA := map[string]string{
+		"go.mod":   "module fixture\n\ngo 1.22\n",
+		"types.go": closureFixtureTypes,
+		"sub/sub.go": `package sub
+
+type Payload struct{}
+
+func Assist() Payload {
+	return Payload{}
+}
+`,
+		"core.go": `package fixture
+
+func Compute(o Options) Result {
+	return Result{}
+}
+`,
+		"island.go": `package fixture
+
+func Island() Result {
+	return Result{}
+}
+`,
+	}
+	treeB := map[string]string{}
+	for path, body := range treeA {
+		treeB[path] = body
+	}
+	treeB["core.go"] = `package fixture
+
+import "fixture/sub"
+
+func Compute(o Options) Result {
+	sub.Assist()
+	return Result{}
+}
+`
+
+	c := buildClosureCase(t, treeA, treeB)
+	assertClosureCarries(t, c.report, "sub/sub.go", "go.mod")
+	if c.report.UnmaskedPayloadNodes != 0 {
+		t.Errorf("the generation carries %d pathless identities, want none; tombstones=%d",
+			c.report.UnmaskedPayloadNodes, c.report.NodeTombstones)
+	}
+	for _, node := range c.store.AtGeneration(c.report.GenerationID).AllNodes() {
+		if node != nil && node.FilePath == "" {
+			t.Errorf("the generation carries a pathless identity %q (kind %s)", node.ID, node.Kind)
+		}
+	}
+	builderAssertReadersAgree(t, c.composed, c.flat)
+}
+
+// TestClosureIteratesToFixedPoint pins the hop bound. Only core.go changes;
+// mid.go is one hop out and deep.go is two, so a one-hop closure re-derives
+// mid.go against a world its own call into deep.go cannot bind in.
+func TestClosureIteratesToFixedPoint(t *testing.T) {
+	treeA := map[string]string{
+		"types.go": closureFixtureTypes,
+		"core.go": `package fixture
+
+func Compute(o Options) Result {
+	return Mid()
+}
+`,
+		"mid.go": `package fixture
+
+func Mid() Result {
+	return Deep()
+}
+`,
+		"deep.go": `package fixture
+
+func Deep() Result {
+	return Result{}
+}
+`,
+		"island.go": `package fixture
+
+func Island() Result {
+	return Result{}
+}
+`,
+	}
+	treeB := map[string]string{}
+	for path, body := range treeA {
+		treeB[path] = body
+	}
+	treeB["core.go"] = `package fixture
+
+func Compute(o Options, again Options) Result {
+	return Mid()
+}
+`
+
+	c := buildClosureCase(t, treeA, treeB)
+	assertClosureCarries(t, c.report, "mid.go", "deep.go")
+	builderAssertReadersAgree(t, c.composed, c.flat)
+}
+
+// closureCloneBody is a function body long enough to carry a clone signature —
+// near-duplicate detection ignores anything under a couple of dozen normalised
+// tokens — written so two copies of it normalise to the same token stream.
+const closureCloneBody = `	a := o
+	b := a
+	c := b
+	d := c
+	e := d
+	f := e
+	_ = f
+	return Result{}
+`
+
+// TestClosureCarriesCloneCounterpart pins the similarity relation. mid.go is
+// pulled into the closure because core.go calls it, and twin.go is its
+// near-duplicate — a relation the base layer records as a symmetric PAIR of
+// edges, one in each file. Claiming mid.go without twin.go replaces mid.go's
+// half of the pair with nothing while twin.go's half keeps showing through
+// from below, which is a composed graph where a symmetric relation points only
+// one way.
+func TestClosureCarriesCloneCounterpart(t *testing.T) {
+	treeA := map[string]string{
+		"types.go": closureFixtureTypes,
+		"core.go": `package fixture
+
+func Compute(o Options) Result {
+	return Mid(o)
+}
+`,
+		"mid.go":  "package fixture\n\nfunc Mid(o Options) Result {\n" + closureCloneBody + "}\n",
+		"twin.go": "package fixture\n\nfunc Twin(o Options) Result {\n" + closureCloneBody + "}\n",
+	}
+	treeB := map[string]string{}
+	for path, body := range treeA {
+		treeB[path] = body
+	}
+	treeB["core.go"] = `package fixture
+
+func Compute(o Options, again Options) Result {
+	return Mid(o)
+}
+`
+
+	c := buildClosureCase(t, treeA, treeB)
+	// The pair has to exist in the base at all, or the case is testing nothing.
+	if len(c.flat.GetOutEdges(builderRepoPrefix+"/mid.go::Mid")) == 0 {
+		t.Fatal("the fixture's two bodies are not clones; the case cannot show anything")
+	}
+	assertClosureCarries(t, c.report, "mid.go", "twin.go")
+	builderAssertReadersAgree(t, c.composed, c.flat)
+	// The closure reaches a pair the base already records. It cannot reach a
+	// pair the change CREATES between a claimed file and an untouched one, and
+	// it cannot re-derive a corpus statistic from part of a corpus, so the build
+	// says so rather than letting the reader assume the relation is whole.
+	assertProducerState(t, c.report, string(graphview.CapSimilarity),
+		store_sqlite.ProducerStateIncomplete, "corpus")
+}
+
+// TestSimilarityProducerFollowsTheClonePass pins the other state: with
+// near-duplicate detection switched off, the generation writes no similarity at
+// all, which is a different fact from writing a partial one and is reported as
+// one.
+func TestSimilarityProducerFollowsTheClonePass(t *testing.T) {
+	builderIsolateGit(t)
+	dir := builderTempDir(t, "repo")
+	builderGit(t, dir, "init", "--initial-branch=main")
+	tree := map[string]string{
+		"types.go": closureFixtureTypes,
+		"core.go": `package fixture
+
+func Compute(o Options) Result {
+	return Result{}
+}
+`,
+	}
+	builderWriteTree(t, dir, tree)
+	builderGit(t, dir, "add", "-A")
+	builderGit(t, dir, "commit", "-m", "A")
+	baseTree := builderGit(t, dir, "rev-parse", "HEAD^{tree}")
+
+	store := builderOpenStore(t, "base")
+	builderIndex(t, store, dir)
+
+	tree["core.go"] = `package fixture
+
+func Compute(o Options, again Options) Result {
+	return Result{}
+}
+`
+	builderWriteTree(t, dir, tree)
+	builderGit(t, dir, "add", "-A")
+	builderGit(t, dir, "commit", "-m", "B")
+	targetTree := builderGit(t, dir, "rev-parse", "HEAD^{tree}")
+
+	builder := builderNewBuilder(store)
+	off := false
+	builder.Config.Coverage.Clones.Enabled = &off
+	_, report, err := builder.BuildCommitLayer(context.Background(), CommitLayerRequest{
+		Identity: GenerationIdentity{
+			OwnerKind:  "dedicated_graph",
+			GraphID:    "graph-closure",
+			LayerID:    "layer-" + targetTree,
+			CheckoutID: "checkout-closure",
+		},
+		Base:          store,
+		RepoDir:       dir,
+		BaseTreeOID:   baseTree,
+		TargetTreeOID: targetTree,
+		RootPath:      dir,
+		RepoPrefix:    builderRepoPrefix,
+		WorkspaceID:   builderRepoPrefix,
+		ProjectID:     builderRepoPrefix,
+	})
+	if err != nil {
+		t.Fatalf("BuildCommitLayer: %v", err)
+	}
+	assertProducerState(t, report, string(graphview.CapSimilarity),
+		store_sqlite.ProducerStateDisabledByConfig, "switched off")
+}
+
+// assertProducerState requires the build to have declared producer in state,
+// for a reason naming want.
+func assertProducerState(
+	t *testing.T,
+	report BuildReport,
+	producer string,
+	state store_sqlite.ProducerState,
+	reason string,
+) {
+	t.Helper()
+	for _, row := range report.Producers {
+		if row.Producer != producer {
+			continue
+		}
+		if row.State != state {
+			t.Errorf("%s is %q, want %q", producer, row.State, state)
+		}
+		if !strings.Contains(row.Reason, reason) {
+			t.Errorf("%s reason %q does not say %q", producer, row.Reason, reason)
+		}
+		return
+	}
+	t.Errorf("the build declared nothing for %q: %v", producer, report.Producers)
+}
+
+// TestClosureTruncationNarrowsProducers pins what a cut closure says about
+// itself. The cap is set below the number of files the walk would take, so the
+// generation is knowingly missing files it should have re-derived: the build
+// publishes anyway and narrows the two producers whose completeness the cut
+// actually costs — local resolution, and the incoming-edge index that a
+// dependent past the cap would have contributed to.
+func TestClosureTruncationNarrowsProducers(t *testing.T) {
+	builderIsolateGit(t)
+	dir := builderTempDir(t, "repo")
+	builderGit(t, dir, "init", "--initial-branch=main")
+	treeA := map[string]string{
+		"types.go": closureFixtureTypes,
+		"core.go": `package fixture
+
+func Compute(o Options) Result {
+	return Mid()
+}
+`,
+		"mid.go": `package fixture
+
+func Mid() Result {
+	return Deep()
+}
+`,
+		"deep.go": `package fixture
+
+func Deep() Result {
+	return Result{}
+}
+`,
+	}
+	builderWriteTree(t, dir, treeA)
+	builderGit(t, dir, "add", "-A")
+	builderGit(t, dir, "commit", "-m", "A")
+	baseTree := builderGit(t, dir, "rev-parse", "HEAD^{tree}")
+
+	store := builderOpenStore(t, "base")
+	builderIndex(t, store, dir)
+
+	treeA["core.go"] = `package fixture
+
+func Compute(o Options, again Options) Result {
+	return Mid()
+}
+`
+	builderWriteTree(t, dir, treeA)
+	builderGit(t, dir, "add", "-A")
+	builderGit(t, dir, "commit", "-m", "B")
+	targetTree := builderGit(t, dir, "rev-parse", "HEAD^{tree}")
+
+	builder := builderNewBuilder(store)
+	builder.Config.AffectedByReresolveMax = 1
+	_, report, err := builder.BuildCommitLayer(context.Background(), CommitLayerRequest{
+		Identity: GenerationIdentity{
+			OwnerKind:  "dedicated_graph",
+			GraphID:    "graph-closure",
+			LayerID:    "layer-" + targetTree,
+			CheckoutID: "checkout-closure",
+		},
+		Base:          store,
+		RepoDir:       dir,
+		BaseTreeOID:   baseTree,
+		TargetTreeOID: targetTree,
+		RootPath:      dir,
+		RepoPrefix:    builderRepoPrefix,
+		WorkspaceID:   builderRepoPrefix,
+		ProjectID:     builderRepoPrefix,
+	})
+	if err != nil {
+		t.Fatalf("BuildCommitLayer: %v", err)
+	}
+	if !report.ClosureTruncated {
+		t.Fatalf("the closure was not truncated at a cap of 1: closure=%v", report.ClosurePaths)
+	}
+	if report.ClosureCap != 1 {
+		t.Errorf("ClosureCap = %d, want 1", report.ClosureCap)
+	}
+	if len(report.ClosurePaths) != 1 {
+		t.Errorf("the closure carries %v, want one path", report.ClosurePaths)
+	}
+	for _, producer := range []string{
+		string(graphview.CapResolutionLocal),
+		string(graphview.CapIncomingEdges),
+	} {
+		// The reason has to name the cap the walk hit, or a reader is told the
+		// generation is thin without being told how thin.
+		assertProducerState(t, report, producer, store_sqlite.ProducerStateIncomplete, "1")
+	}
+}
