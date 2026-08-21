@@ -127,7 +127,7 @@ func CalleeBoundaries(g Store, nodeIDs []string, limit int) []EpistemicBoundary 
 // overrides an interface method may be reached through that interface by
 // callers not attributed to it directly. It names the interface so an agent
 // can run find_implementations / get_callers on it to widen the picture.
-func CallerBoundaries(g Store, nodeIDs []string, limit int) []EpistemicBoundary {
+func CallerBoundaries(g Reader, nodeIDs []string, limit int) []EpistemicBoundary {
 	out, _ := CallerBoundariesContext(context.Background(), g, nodeIDs, limit)
 	return out
 }
@@ -143,7 +143,7 @@ type callerBoundaryNodesContextStore interface {
 // CallerBoundariesContext reports interface-dispatch boundaries without
 // allowing SQLite reads to outlive ctx. Stores may opt into cancellable batch
 // reads; the legacy path remains available for in-memory implementations.
-func CallerBoundariesContext(ctx context.Context, g Store, nodeIDs []string, limit int) ([]EpistemicBoundary, bool) {
+func CallerBoundariesContext(ctx context.Context, g Reader, nodeIDs []string, limit int) ([]EpistemicBoundary, bool) {
 	if g == nil {
 		return nil, false
 	}
@@ -202,7 +202,7 @@ func CallerBoundariesContext(ctx context.Context, g Store, nodeIDs []string, lim
 	return sortBoundaries(out), truncated
 }
 
-func callerBoundaryOutEdgesContext(ctx context.Context, g Store, nodeIDs []string, limit int) (map[string][]*Edge, bool) {
+func callerBoundaryOutEdgesContext(ctx context.Context, g Reader, nodeIDs []string, limit int) (map[string][]*Edge, bool) {
 	if reader, ok := g.(callerBoundaryOutgoingContextStore); ok {
 		out, truncated, err := reader.GetOutEdgesByNodeIDsContext(ctx, nodeIDs, limit)
 		return out, truncated || err != nil
@@ -224,7 +224,7 @@ func callerBoundaryOutEdgesContext(ctx context.Context, g Store, nodeIDs []strin
 	return out, false
 }
 
-func callerBoundaryNodesContext(ctx context.Context, g Store, nodeIDs []string) (map[string]*Node, error) {
+func callerBoundaryNodesContext(ctx context.Context, g Reader, nodeIDs []string) (map[string]*Node, error) {
 	if reader, ok := g.(callerBoundaryNodesContextStore); ok {
 		return reader.GetNodesByIDsContext(ctx, nodeIDs)
 	}

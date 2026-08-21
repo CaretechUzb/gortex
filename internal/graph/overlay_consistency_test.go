@@ -2,6 +2,7 @@ package graph
 
 import (
 	"fmt"
+	"iter"
 	"reflect"
 	"sort"
 	"testing"
@@ -376,4 +377,239 @@ func TestOverlaidViewStatsReflectOverlay(t *testing.T) {
 			t.Fatalf("RepoStats.TotalEdges = %d, EdgeCount = %d", repo.TotalEdges, addedView.EdgeCount())
 		}
 	})
+}
+
+const (
+	churnKeepFil  = "repo/handler.go"
+	churnEditFil  = "repo/morph.go"
+	churnHandleID = churnKeepFil + "::Handler"
+	churnConfigID = churnKeepFil + "::Config"
+	churnMorphID  = churnEditFil + "::Morph"
+	churnDropID   = churnEditFil + "::Dropped"
+	churnFreshID  = churnEditFil + "::Fresh"
+)
+
+// kindChurnFixture is the kind-bounded readers' hard case: the overlay
+// re-emits one covered symbol under the same ID but a *different* Kind,
+// introduces a symbol of a third Kind, hides a fourth, and replaces the
+// covered file's outgoing edges with edges of two kinds. A kind-bounded
+// reader that trusted base's kind index alone would report the stale
+// kind for the re-emitted ID.
+func kindChurnFixture() (*Graph, *OverlayLayer) {
+	base := New()
+	base.AddNode(&Node{ID: churnHandleID, Name: "Handler", Kind: KindFunction, FilePath: churnKeepFil, RepoPrefix: consistencyRepo})
+	base.AddNode(&Node{ID: churnConfigID, Name: "Config", Kind: KindType, FilePath: churnKeepFil, RepoPrefix: consistencyRepo})
+	base.AddNode(&Node{ID: churnMorphID, Name: "Morph", Kind: KindFunction, FilePath: churnEditFil, RepoPrefix: consistencyRepo, StartLine: 5})
+	base.AddNode(&Node{ID: churnDropID, Name: "Dropped", Kind: KindType, FilePath: churnEditFil, RepoPrefix: consistencyRepo})
+	base.AddEdge(&Edge{From: churnHandleID, To: churnMorphID, Kind: EdgeCalls, FilePath: churnKeepFil, Line: 3})
+	base.AddEdge(&Edge{From: churnHandleID, To: churnDropID, Kind: EdgeReferences, FilePath: churnKeepFil, Line: 4})
+	base.AddEdge(&Edge{From: churnMorphID, To: churnConfigID, Kind: EdgeReferences, FilePath: churnEditFil, Line: 6})
+
+	layer := NewOverlayLayer()
+	layer.MarkFile(churnEditFil, false)
+	layer.AddNode(churnEditFil, &Node{ID: churnMorphID, Name: "Morph", Kind: KindMethod, FilePath: churnEditFil, RepoPrefix: consistencyRepo, StartLine: 50})
+	layer.AddNode(churnEditFil, &Node{ID: churnFreshID, Name: "Fresh", Kind: KindType, FilePath: churnEditFil, RepoPrefix: consistencyRepo, StartLine: 60})
+	layer.MarkRemoved("Dropped", churnDropID)
+	layer.AddEdge(&Edge{From: churnMorphID, To: churnHandleID, Kind: EdgeCalls, FilePath: churnEditFil, Line: 51})
+	layer.AddEdge(&Edge{From: churnFreshID, To: churnConfigID, Kind: EdgeReferences, FilePath: churnEditFil, Line: 61})
+	return base, layer
+}
+
+// overlayNodeKey renders one node's identity *and* payload, so a
+// comparison catches a reader that returned base's copy where the layer
+// re-emitted the ID.
+func overlayNodeKey(n *Node) string {
+	return fmt.Sprintf("%s|%s|%s:%d", n.ID, n.Kind, n.FilePath, n.StartLine)
+}
+
+func nodeKeys(nodes []*Node) []string {
+	out := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n != nil {
+			out = append(out, overlayNodeKey(n))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func collectNodeSeq(seq iter.Seq[*Node]) []*Node {
+	var out []*Node
+	for n := range seq {
+		out = append(out, n)
+	}
+	return out
+}
+
+func collectEdgeSeq(seq iter.Seq[*Edge]) []*Edge {
+	var out []*Edge
+	for e := range seq {
+		out = append(out, e)
+	}
+	return out
+}
+
+func nodesOfKind(nodes []*Node, kind NodeKind) []*Node {
+	var out []*Node
+	for _, n := range nodes {
+		if n != nil && n.Kind == kind {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func edgesOfKind(edges []*Edge, kind EdgeKind) []*Edge {
+	var out []*Edge
+	for _, e := range edges {
+		if e != nil && e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// overlayKindFixtures are the (base, layer) pairs the kind-bounded
+// assertions run over: an unlayered pass-through, a covered file whose
+// symbols are partly re-emitted and partly hidden, a tombstoned file,
+// and the kind-churn case.
+func overlayKindFixtures(t *testing.T) map[string]func() (*Graph, *OverlayLayer) {
+	t.Helper()
+	return map[string]func() (*Graph, *OverlayLayer){
+		"no layer": func() (*Graph, *OverlayLayer) {
+			base, _, _ := consistencyFixture(t)
+			return base, nil
+		},
+		"replaced file": func() (*Graph, *OverlayLayer) {
+			base, layer, _ := consistencyFixture(t)
+			return base, layer
+		},
+		"tombstoned file": func() (*Graph, *OverlayLayer) {
+			base, _, _ := consistencyFixture(t)
+			layer := NewOverlayLayer()
+			layer.MarkFile(consistencyEditFil, true)
+			layer.MarkRemoved("Kept", consistencyKeptID)
+			layer.MarkRemoved("Gone", consistencyGoneID)
+			return base, layer
+		},
+		"kind churn": kindChurnFixture,
+	}
+}
+
+// TestOverlaidViewKindScansMatchBulkReads is the equivalence contract
+// for the kind-bounded readers: NodesByKind(k) must be exactly AllNodes
+// filtered to k, and EdgesByKind(k) exactly AllEdges filtered to k, for
+// every kind either side carries — plus a kind nobody carries, which
+// must come back empty rather than leaking base rows.
+func TestOverlaidViewKindScansMatchBulkReads(t *testing.T) {
+	for name, build := range overlayKindFixtures(t) {
+		t.Run(name, func(t *testing.T) {
+			base, layer := build()
+			view := NewOverlaidView(base, layer)
+			allNodes := view.AllNodes()
+			allEdges := view.AllEdges()
+
+			nodeKindSet := map[NodeKind]bool{KindImport: true}
+			for _, n := range base.AllNodes() {
+				nodeKindSet[n.Kind] = true
+			}
+			for _, n := range allNodes {
+				nodeKindSet[n.Kind] = true
+			}
+			for kind := range nodeKindSet {
+				got := nodeKeys(collectNodeSeq(view.NodesByKind(kind)))
+				want := nodeKeys(nodesOfKind(allNodes, kind))
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("NodesByKind(%q) = %v, AllNodes filtered = %v", kind, got, want)
+				}
+			}
+
+			edgeKindSet := map[EdgeKind]bool{EdgeImports: true}
+			for _, e := range base.AllEdges() {
+				edgeKindSet[e.Kind] = true
+			}
+			for _, e := range allEdges {
+				edgeKindSet[e.Kind] = true
+			}
+			for kind := range edgeKindSet {
+				got := edgeKeys(collectEdgeSeq(view.EdgesByKind(kind)))
+				want := edgeKeys(edgesOfKind(allEdges, kind))
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("EdgesByKind(%q) = %v, AllEdges filtered = %v", kind, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestOverlaidViewKindScansHonourOverlayPayload pins the two things the
+// equivalence check can't state outright: a re-emitted ID comes back
+// once carrying the layer's payload (including its new Kind), and a
+// symbol the overlay hid never resurfaces through the kind index.
+func TestOverlaidViewKindScansHonourOverlayPayload(t *testing.T) {
+	base, layer := kindChurnFixture()
+	view := NewOverlaidView(base, layer)
+
+	// Base filed Morph under "function"; the layer re-emitted it as a
+	// method. The stale kind must be gone and the fresh one present.
+	wantFunctions := nodeKeys([]*Node{base.GetNode(churnHandleID)})
+	if got := nodeKeys(collectNodeSeq(view.NodesByKind(KindFunction))); !reflect.DeepEqual(got, wantFunctions) {
+		t.Fatalf("NodesByKind(function) = %v, want only the untouched Handler %v", got, wantFunctions)
+	}
+	methods := collectNodeSeq(view.NodesByKind(KindMethod))
+	if len(methods) != 1 || methods[0].ID != churnMorphID {
+		t.Fatalf("NodesByKind(method) = %v, want exactly the re-emitted %s", nodeKeys(methods), churnMorphID)
+	}
+	if methods[0].StartLine != 50 {
+		t.Fatalf("NodesByKind(method) returned base's payload (line %d), want the layer's (line 50)", methods[0].StartLine)
+	}
+
+	// Dropped was hidden: it must be absent from its own kind scan, and
+	// base's reference into it must be absent from the edge scan.
+	for _, n := range collectNodeSeq(view.NodesByKind(KindType)) {
+		if n.ID == churnDropID {
+			t.Fatalf("NodesByKind(type) resurfaced the hidden %s", churnDropID)
+		}
+	}
+	for _, e := range collectEdgeSeq(view.EdgesByKind(EdgeReferences)) {
+		if e.To == churnDropID {
+			t.Fatalf("EdgesByKind(references) kept an edge into the hidden %s", churnDropID)
+		}
+		if e.From == churnMorphID {
+			t.Fatalf("EdgesByKind(references) kept base's edge out of the re-emitted %s", churnMorphID)
+		}
+	}
+	calls := edgeKeys(collectEdgeSeq(view.EdgesByKind(EdgeCalls)))
+	wantCalls := edgeKeys([]*Edge{
+		{From: churnHandleID, To: churnMorphID, Kind: EdgeCalls, FilePath: churnKeepFil, Line: 3},
+		{From: churnMorphID, To: churnHandleID, Kind: EdgeCalls, FilePath: churnEditFil, Line: 51},
+	})
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("EdgesByKind(calls) = %v, want %v", calls, wantCalls)
+	}
+}
+
+// TestOverlaidViewKindScansStopEarly pins the iterator contract the
+// Reader doc-comment promises: a consumer that breaks out of the range
+// stops the scan instead of draining both legs.
+func TestOverlaidViewKindScansStopEarly(t *testing.T) {
+	base, layer := kindChurnFixture()
+	view := NewOverlaidView(base, layer)
+
+	seen := 0
+	for range view.NodesByKind(KindType) {
+		seen++
+		break
+	}
+	if seen != 1 {
+		t.Fatalf("NodesByKind yielded %d nodes after an early break, want 1", seen)
+	}
+	seen = 0
+	for range view.EdgesByKind(EdgeCalls) {
+		seen++
+		break
+	}
+	if seen != 1 {
+		t.Fatalf("EdgesByKind yielded %d edges after an early break, want 1", seen)
+	}
 }

@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"iter"
 	"sort"
 	"strings"
 	"sync"
@@ -876,6 +877,73 @@ func (v *OverlaidView) AllEdges() []*Edge {
 		out = append(out, edges...)
 	}
 	return out
+}
+
+// EdgesByKind is the kind-bounded sibling of AllEdges and yields the
+// same relation filtered to one kind: base edges of that kind that
+// survive baseEdgeVisible, then the layer's own edges of that kind.
+// The base scan stays kind-bounded, so a disk backend still serves it
+// from the kind index instead of materialising every edge.
+func (v *OverlaidView) EdgesByKind(kind EdgeKind) iter.Seq[*Edge] {
+	return func(yield func(*Edge) bool) {
+		if v.base == nil {
+			return
+		}
+		for e := range v.base.EdgesByKind(kind) {
+			if v.layer != nil && !v.baseEdgeVisible(e) {
+				continue
+			}
+			if !yield(e) {
+				return
+			}
+		}
+		if v.layer == nil {
+			return
+		}
+		for _, edges := range v.layer.outEdges {
+			for _, e := range edges {
+				if e == nil || e.Kind != kind {
+					continue
+				}
+				if !yield(e) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// NodesByKind is the kind-bounded sibling of AllNodes and yields the
+// same relation filtered to one kind: base nodes of that kind whose
+// file the overlay does not cover, then the layer's own nodes of that
+// kind. A node the overlay re-emitted under a base ID surfaces exactly
+// once, carrying the layer's payload — base's copy is skipped whether
+// the overlay replaced it or dropped it.
+func (v *OverlaidView) NodesByKind(kind NodeKind) iter.Seq[*Node] {
+	return func(yield func(*Node) bool) {
+		if v.base == nil {
+			return
+		}
+		for n := range v.base.NodesByKind(kind) {
+			if v.layer != nil && n != nil && v.layer.HasFile(IDFile(n.ID)) {
+				continue
+			}
+			if !yield(n) {
+				return
+			}
+		}
+		if v.layer == nil {
+			return
+		}
+		for _, n := range v.layer.nodeByID {
+			if n == nil || n.Kind != kind {
+				continue
+			}
+			if !yield(n) {
+				return
+			}
+		}
+	}
 }
 
 // NodeCount / EdgeCount — derived from base counters adjusted by the
