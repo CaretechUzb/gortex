@@ -1,13 +1,23 @@
-// Package graphview holds the vocabulary for request-pinned graph views: the
+// Package graphview holds the vocabulary for request-pinned graph views — the
 // identity of a view, the capabilities a view can serve, the selector a caller
 // uses to ask for one, the stable error codes a view request fails with, and
 // the lease accounting that keeps a pinned generation alive while a request
-// still reads it.
+// still reads it — together with the machinery that turns that vocabulary into
+// a readable graph: a persisted generation read as an overlay layer, the
+// stacking of such layers over a base corpus, and the routed materialization
+// of one checkout's view.
 //
-// The package is stdlib-only on purpose. Every layer that has to speak about
-// views — the server, the query engine, the indexer — can import it without
-// dragging in storage or indexing code, and none of them can drift on what a
-// view identity or a capability state means.
+// The vocabulary half is stdlib-only on purpose, and this file, capability.go,
+// errors.go, selector.go, lease.go and rider.go carry all of it: nothing in
+// them depends on more than the standard library and internal/graph. That is a
+// property of the files, not of the import. Go links whole packages, so
+// generation_layer.go, compose.go and materialize.go put the storage layer —
+// store_sqlite and the CGo SQLite driver under it — into the binary of every
+// graphview importer. A consumer that has to stay storage-free needs the
+// vocabulary lifted into a package of its own; what the split buys today is
+// that every layer speaking about views — the server, the query engine, the
+// indexer — reads one definition of a view identity and a capability state and
+// none of them can drift on it.
 package graphview
 
 import (
