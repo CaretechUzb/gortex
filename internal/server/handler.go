@@ -75,6 +75,21 @@ type Handler struct {
 	convDir     string
 	convAllow   []string
 	convTokenFn func() string
+
+	// promoteTool, when set, is called by CallToolStrict on a registry
+	// miss to promote a deferred (lazy-catalog) tool into the live MCP
+	// server before giving up. Wired via SetToolPromoter with
+	// (*mcp.Server).EnsureToolPromoted so internal dashboard callers can
+	// reach any tool regardless of the eager/defer tools_search split.
+	// nil is safe (no-op) — e.g. in tests that construct Handler directly.
+	promoteTool func(name string) bool
+}
+
+// SetToolPromoter wires the deferred-tool promotion hook used by
+// CallToolStrict. Pass (*mcp.Server).EnsureToolPromoted from the caller that
+// owns the MCP server's lazy tool registry.
+func (h *Handler) SetToolPromoter(f func(name string) bool) {
+	h.promoteTool = f
 }
 
 // NewHandler creates an HTTP handler that dispatches to MCP tools.
@@ -570,6 +585,12 @@ func (h *Handler) CallTool(ctx context.Context, toolName string, args map[string
 // regardless of whether they treat it as an error.
 func (h *Handler) CallToolStrict(ctx context.Context, toolName string, args map[string]any) (string, error) {
 	tool := h.mcpServer.GetTool(toolName)
+	if tool == nil && h.promoteTool != nil && h.promoteTool(toolName) {
+		// The tool was sitting in the deferred/lazy catalog (defer-mode
+		// tools_search split) and unknown to the live registry until
+		// promoted just now — re-fetch it.
+		tool = h.mcpServer.GetTool(toolName)
+	}
 	if tool == nil {
 		return "", fmt.Errorf("tool %q is not registered", toolName)
 	}
