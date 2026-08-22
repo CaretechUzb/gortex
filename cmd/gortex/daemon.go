@@ -261,6 +261,11 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			preset, mode := srv.ActivePreset()
 			return preset, mode, srv.LearnedToolCount()
 		}
+		// The stack builds exactly one materializer, over the lifecycle's own
+		// lease manager. Taking it from here rather than building a second is
+		// what keeps a control-socket probe's lease visible to the retirement
+		// sweep the coordinators run.
+		controller.viewMaterializer = srv.Materializer()
 	}
 	// Teardown is wired into every exit path, not just the control-socket
 	// one. A SIGINT/SIGTERM is handled inside the daemon server: it calls

@@ -172,6 +172,17 @@ const (
 	// ControlEnrichCochange dispatches to Controller.EnrichCochange —
 	// co-change edge mining against the daemon's in-process graph.
 	ControlEnrichCochange = "enrich_cochange"
+	// ControlFileCoverage answers whether one file on disk is covered by the
+	// graph the caller's path actually reads through, and how many definition
+	// symbols that graph holds for it. It is the coverage half of the hook
+	// front door — the deny decision — where ControlSearchSymbols is the
+	// evidence half.
+	//
+	// It exists on the control surface rather than on the tool surface
+	// because the caller is a PreToolUse hook on a sub-second budget that
+	// must not set up an MCP session, and because only the daemon can turn a
+	// worktree path into the composed view that serves it.
+	ControlFileCoverage = "file_coverage"
 )
 
 // DefaultControlTimeout bounds the control kinds that are supposed to answer
@@ -517,6 +528,13 @@ type SearchSymbolsParams struct {
 	Query string `json:"query"`
 	Limit int    `json:"limit,omitempty"`
 	Repo  string `json:"repo,omitempty"`
+	// Path is the file or directory the probe is about. It is what lets the
+	// daemon answer out of the graph that path actually reads through — a
+	// worktree served by the family's automatic lane reads a composed view,
+	// not the primary's corpus. Empty means "answer from the base corpus",
+	// which is what every client that predates routed views sends and what
+	// it still gets, field for field.
+	Path string `json:"path,omitempty"`
 }
 
 // SymbolHit is one entry in SearchSymbolsResult.Hits.
@@ -531,6 +549,71 @@ type SymbolHit struct {
 // successful ControlSearchSymbols call.
 type SearchSymbolsResult struct {
 	Hits []SymbolHit `json:"hits"`
+	// View names the graph that answered. It is present only when the
+	// request carried a Path, so an older client's response keeps the shape
+	// it has always had.
+	View *ProbeView `json:"view,omitempty"`
+}
+
+// Probe view kinds. They name where a path-scoped answer came from, not what
+// the caller asked for — a probe never names a view.
+const (
+	// ProbeViewBase is the indexed corpus: the answer for a dedicated
+	// checkout, for the family primary, and for any path no checkout owns.
+	ProbeViewBase = "base"
+	// ProbeViewWorktree is an automatic checkout's composed view — the
+	// primary's corpus with that working copy's routed generations on top.
+	ProbeViewWorktree = "worktree"
+	// ProbeViewUnrouted is a registered automatic checkout with no composed
+	// view yet. Nothing can answer for it truthfully, so nothing does.
+	ProbeViewUnrouted = "unrouted"
+)
+
+// Probe fallback reasons. Kept to a short stable vocabulary so a caller can
+// log or branch on them without parsing prose.
+const (
+	// FallbackViewBuilding means the checkout's route does not name both
+	// generations yet.
+	FallbackViewBuilding = "view_building"
+	// FallbackCheckoutInaccessible means the catalog could not be read, so
+	// which view serves the path is unknown.
+	FallbackCheckoutInaccessible = "checkout_inaccessible"
+)
+
+// ProbeView is what a path-scoped probe answered from.
+//
+// Exact is the honesty bit: false says the answer came from somewhere other
+// than the path's own view, and FallbackReason says why. A consumer must
+// never present a fallback answer as if the path's own graph produced it.
+type ProbeView struct {
+	Kind       string `json:"kind"`
+	CheckoutID string `json:"checkout_id,omitempty"`
+	RepoPrefix string `json:"repo_prefix,omitempty"`
+	Exact      bool   `json:"exact"`
+	// FallbackReason is set exactly when Exact is false.
+	FallbackReason string `json:"fallback_reason,omitempty"`
+}
+
+// FileCoverageParams is the payload for ControlFileCoverage. Path is the file
+// being probed; a relative path is resolved against the daemon's own working
+// directory, so callers send an absolute one.
+type FileCoverageParams struct {
+	Path string `json:"path"`
+}
+
+// FileCoverageResult is the payload returned under Result for a successful
+// ControlFileCoverage call.
+//
+// Covered reports that the graph serving Path holds definition symbols for
+// it — the fact a hook turns into a deny. Symbols is how many, which is the
+// evidence the deny cites. Both are false/zero for a path whose view is not
+// built yet: an unbuilt view knows nothing about the file, and reporting the
+// primary's answer instead would deny a read on another working copy's
+// content.
+type FileCoverageResult struct {
+	Covered bool       `json:"covered"`
+	Symbols int        `json:"symbols"`
+	View    *ProbeView `json:"view,omitempty"`
 }
 
 // EnrichChurnParams is the payload for ControlEnrichChurn.

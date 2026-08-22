@@ -21,6 +21,7 @@ import (
 	"github.com/zzet/gortex/internal/coverage"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/reconcile"
@@ -59,6 +60,23 @@ type realController struct {
 	// track over MCP leave identical state behind. Nil only in tests that
 	// build a controller by hand; the methods that need it say so.
 	lifecycle *indexer.CheckoutLifecycle
+	// viewMaterializer composes the routed stack a probing path reads. It
+	// MUST be the one the rest of the stack materializes through: retirement
+	// runs with that instance's lease manager as its in-use predicate, so a
+	// probe leasing through a second manager would be invisible to the sweep
+	// and could have its generations deleted mid-read. Nil leaves every probe
+	// on the base corpus.
+	viewMaterializer *graphview.Materializer
+
+	// probeNudgeMu guards probeNudgedAt alone. It is deliberately not mu: the
+	// whole point of the nudge is to be raised from the probe path, which
+	// must never queue behind a track / reload / enrichment.
+	probeNudgeMu  sync.Mutex
+	probeNudgedAt map[string]time.Time
+	// probeReconcile is the reconciliation a probe asks for when a working
+	// copy has no composed view. nil routes to the lifecycle's own per-family
+	// path; tests substitute it to observe the debounce.
+	probeReconcile func(familyID string)
 	// multiWatcher is an atomic pointer, not a mu-guarded field: the daemon's
 	// teardown hook reads it, and reading it under mu is what kept `daemon
 	// stop` queued behind a running track / reload / enrichment. One writer
@@ -1343,14 +1361,36 @@ const (
 // graph, so on a multi-repo daemon this probe queued behind the indexer's
 // shard writers and blew past the hook's 200ms budget. The hook then logged
 // probed_miss / timed_out and never once produced a hit.
-func (c *realController) SearchSymbols(_ context.Context, p daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
+//
+// Path scopes the probe to the graph that path reads through. Without one the
+// base corpus answers and the response carries no view block at all, which is
+// what every client that predates routed views sends and still receives.
+func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
 	// No mu: graph is write-once at construction (see the field comment), and
 	// this is the probe path a hook calls on a sub-second budget. Taking mu
 	// here is what made it wait out an in-flight reindex.
-	g := c.graph
+	var g graph.Reader = c.graph
 
 	if g == nil || p.Query == "" {
 		return daemon.SearchSymbolsResult{}, nil
+	}
+
+	// The lease is held for exactly as long as the answer is being built: the
+	// hits are copied out of the composed reader below, so nothing the caller
+	// receives outlives the generations that produced it.
+	view := c.resolveProbeView(ctx, p.Path)
+	defer view.release()
+	if !view.servable {
+		// A registered working copy with no composed view. Reporting the
+		// primary's symbols would cite another working copy's code as
+		// evidence about this one.
+		return daemon.SearchSymbolsResult{Hits: []daemon.SymbolHit{}, View: view.answer}, nil
+	}
+	if view.reader != nil {
+		g = view.reader
+	}
+	if p.Repo == "" {
+		p.Repo = view.searchScope
 	}
 
 	limit := p.Limit
@@ -1375,7 +1415,7 @@ func (c *realController) SearchSymbols(_ context.Context, p daemon.SearchSymbols
 		}
 	}
 	if len(hits) > 0 {
-		return daemon.SearchSymbolsResult{Hits: hits}, nil
+		return daemon.SearchSymbolsResult{Hits: hits, View: view.answer}, nil
 	}
 
 	// Substring fallback, for patterns that name part of a symbol. The name
@@ -1417,7 +1457,7 @@ func (c *realController) SearchSymbols(_ context.Context, p daemon.SearchSymbols
 		}
 		fetch *= 4
 	}
-	return daemon.SearchSymbolsResult{Hits: hits}, nil
+	return daemon.SearchSymbolsResult{Hits: hits, View: view.answer}, nil
 }
 
 // probeSymbolCandidate reports whether n can answer a symbol probe. File and
