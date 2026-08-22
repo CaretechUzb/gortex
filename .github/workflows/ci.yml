@@ -9,6 +9,9 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    # The suite runs ~30m on the ubuntu runners and slower on macos, so the
+    # per-step budget needs headroom; this job-level cap still bounds a hang.
+    timeout-minutes: 60
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -24,7 +27,7 @@ jobs:
         run: go build -o gortex ./cmd/gortex/
 
       - name: Test
-        run: go test -race -timeout=30m -coverprofile=coverage.out ./...
+        run: go test -race -timeout=45m -coverprofile=coverage.out ./...
 
       - name: Upload coverage
         if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.27'
