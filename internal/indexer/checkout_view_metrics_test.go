@@ -125,6 +125,54 @@ func TestCoordinatorTornBuildIsCountedAsRescheduledNotCASLost(t *testing.T) {
 	}
 }
 
+// TestCommittedUnderTheCycleIsCountedAsHeadMoved separates the third condition
+// that leaves a cycle rescheduled. A checkout that committed while its commit
+// layer was being built is not a torn working tree and not a lost route flip:
+// nothing raced this coordinator and nothing was left half written — the cycle
+// simply built for a head the checkout has left, and the answer is another
+// cycle. Reading one number for all three would hide the one that says commit
+// builds are slower than the checkout moves.
+func TestCommittedUnderTheCycleIsCountedAsHeadMoved(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	ctx := context.Background()
+
+	base, err := c.primaryBase(ctx)
+	if err != nil {
+		t.Fatalf("primaryBase: %v", err)
+	}
+	route, err := c.ensureRoute(ctx, base)
+	if err != nil {
+		t.Fatalf("ensureRoute: %v", err)
+	}
+	treeA := builderGit(t, f.worktree, "rev-parse", "HEAD^{tree}")
+	var out CheckoutCycle
+	commitGeneration, err := c.reconcileCommitSlot(ctx, base, treeA, &route, &out)
+	if err != nil {
+		t.Fatalf("reconcileCommitSlot: %v", err)
+	}
+	f.commitTreeB()
+
+	before := viewmetrics.Read()
+	if err := c.reconcileDirtySlot(ctx, commitGeneration, treeA, &route, &out); err != nil {
+		t.Fatalf("reconcileDirtySlot: %v", err)
+	}
+	after := viewmetrics.Read()
+
+	if got := counterDelta(before, after, cycleKey(viewmetrics.OutcomeHeadMoved)); got != 1 {
+		t.Fatalf("head_moved = %d, want 1", got)
+	}
+	if got := counterDelta(before, after, cycleKey(viewmetrics.OutcomeRescheduled)); got != 0 {
+		t.Fatalf("a checkout that committed was counted as a torn working tree (%d)", got)
+	}
+	if got := counterDelta(before, after, cycleKey(viewmetrics.OutcomeCASLost)); got != 0 {
+		t.Fatalf("a checkout that committed was counted as a lost route flip (%d)", got)
+	}
+	if got := counterDelta(before, after, cycleKey(viewmetrics.OutcomeBuiltDirty)); got != 0 {
+		t.Fatalf("a cycle that routed nothing reported a dirty build (%d)", got)
+	}
+}
+
 func refViewSelectionKey(outcome string) string {
 	return viewmetrics.RefViewSelectionTotal + "{outcome=" + outcome + "}"
 }

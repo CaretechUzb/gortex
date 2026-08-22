@@ -166,6 +166,7 @@ const (
 	OutcomeSuperseded    = "superseded"
 	OutcomeRescheduled   = "rescheduled"
 	OutcomeCASLost       = "cas_lost"
+	OutcomeHeadMoved     = "head_moved"
 	OutcomeFailed        = "failed"
 )
 
@@ -312,7 +313,7 @@ var catalog = map[string]spec{
 		{name: LabelOutcome, values: []string{
 			OutcomeBuiltCommit, OutcomeAdoptedCommit, OutcomeBuiltDirty,
 			OutcomeSkipped, OutcomeSuperseded, OutcomeRescheduled,
-			OutcomeCASLost, OutcomeFailed,
+			OutcomeCASLost, OutcomeHeadMoved, OutcomeFailed,
 		}},
 	}},
 	CoordinatorBuildSeconds: {kind: kindDuration, labels: []labelSpec{

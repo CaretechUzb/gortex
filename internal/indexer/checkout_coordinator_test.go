@@ -541,6 +541,82 @@ func Helper() {
 	}
 }
 
+// TestCoordinatorCleanCheckoutReachesAReadyRoute pins the state an automatic
+// worktree spends most of its life in: committed past the base corpus and with
+// nothing uncommitted at all.
+//
+// Its working-tree layer describes no change, which is a whole answer and not
+// an absence — a route naming a commit generation and no dirty one is not
+// servable, so a checkout that stops there serves the base corpus forever. The
+// cycle that flips the commit slot has to settle the dirty slot too, and it has
+// to do it from the loop's own scheduling: an automatic checkout with a quiet
+// working tree receives no filesystem event to nudge it with.
+func TestCoordinatorCleanCheckoutReachesAReadyRoute(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	// The commit layer has real work to do — the checkout's tree is not the
+	// corpus's — while the working tree holds nothing the commit does not.
+	f.commitTreeB()
+
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var cycles []CheckoutCycle
+		c := f.coordinator(t, CheckoutCoordinatorConfig{
+			Debounce:     300 * time.Millisecond,
+			PollInterval: 15 * time.Second,
+			cycleDone: func(cycle CheckoutCycle) {
+				mu.Lock()
+				cycles = append(cycles, cycle)
+				mu.Unlock()
+			},
+		})
+
+		// The one signal the lifecycle raises when it installs a coordinator.
+		// Nothing else touches this checkout: the working tree is quiet, so no
+		// watcher event follows.
+		c.Signal("checkout registered")
+		time.Sleep(time.Second)
+		synctest.Wait()
+
+		mu.Lock()
+		ran := slices.Clone(cycles)
+		mu.Unlock()
+		if len(ran) == 0 {
+			t.Fatal("the registration signal ran no cycle")
+		}
+		for _, cycle := range ran {
+			if cycle.Err != nil {
+				t.Fatalf("a cycle failed: %v", cycle.Err)
+			}
+		}
+
+		route := f.route()
+		if route.State != store_sqlite.RouteActive {
+			t.Fatalf("the route is %q, want an active one: %+v", route.State, route)
+		}
+		if route.CommitGenerationID == 0 || route.DirtyGenerationID == 0 {
+			t.Fatalf("a clean checkout settled on a half-routed stack: %+v", route)
+		}
+
+		row, found := f.generation(route.DirtyGenerationID)
+		if !found || !servableGeneration(row.State) {
+			t.Fatalf("the routed working-tree generation %d is %q", route.DirtyGenerationID, row.State)
+		}
+		if row.GenerationKind != DirtyLayerGenerationKind {
+			t.Fatalf("the dirty slot names a %q generation", row.GenerationKind)
+		}
+		if row.BaseGenerationID != route.CommitGenerationID {
+			t.Fatalf("the working-tree layer sits on %d, want the routed commit generation %d",
+				row.BaseGenerationID, route.CommitGenerationID)
+		}
+		if row.CoveredFiles != 0 {
+			t.Fatalf("a clean working tree's layer covers %d files, want none", row.CoveredFiles)
+		}
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+}
+
 // --- a checkout that moves under a build --------------------------------
 
 // TestCoordinatorRebuildsOnceWhenTheWorkingTreeMoves pins the single retry: a
@@ -790,6 +866,94 @@ func TestCoordinatorNeverRoutesAWorkingTreeLayerOverAnotherTree(t *testing.T) {
 	}
 	if _, found := f.generation(first.DirtyGenerationID); found {
 		t.Fatalf("the withdrawn working-tree generation %d was left behind", first.DirtyGenerationID)
+	}
+}
+
+// TestCoordinatorRefusesAWorkingTreeLayerOverAStaleHead is the same invariant
+// read across the other seam a cycle has: the HEAD the cycle started from.
+//
+// A commit layer takes minutes on a real repository, and a checkout is free to
+// move while one is being built for it. The working-tree layer is sampled after
+// that build lands, so it describes the checkout's NEW head — and stacking it on
+// a commit layer built for the head the cycle started from composes one tree's
+// content with another tree's absence of uncommitted change, which is a state
+// the checkout has never been in. Worse, the pair is coherent enough to publish
+// and route, so the checkout goes ready serving it.
+//
+// The two halves of the cycle are driven by hand because that is the interleaving
+// itself: the commit slot is settled against the head the cycle sampled, the
+// checkout commits, and only then is the working-tree slot reconciled.
+func TestCoordinatorRefusesAWorkingTreeLayerOverAStaleHead(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	ctx := context.Background()
+
+	base, err := c.primaryBase(ctx)
+	if err != nil {
+		t.Fatalf("primaryBase: %v", err)
+	}
+	route, err := c.ensureRoute(ctx, base)
+	if err != nil {
+		t.Fatalf("ensureRoute: %v", err)
+	}
+	treeA := builderGit(t, f.worktree, "rev-parse", "HEAD^{tree}")
+
+	var out CheckoutCycle
+	commitGeneration, err := c.reconcileCommitSlot(ctx, base, treeA, &route, &out)
+	if err != nil {
+		t.Fatalf("reconcileCommitSlot: %v", err)
+	}
+	if !out.CommitBuilt || commitGeneration == 0 {
+		t.Fatalf("the commit slot was not settled: %+v", out)
+	}
+
+	// The checkout commits while the layer for A is being built. Its working
+	// tree is clean again the moment it lands, so nothing about the sample the
+	// dirty half takes says that the tree underneath it has moved.
+	f.commitTreeB()
+
+	if err := c.reconcileDirtySlot(ctx, commitGeneration, treeA, &route, &out); err != nil {
+		t.Fatalf("reconcileDirtySlot: %v", err)
+	}
+	if !out.Rescheduled {
+		t.Fatalf("the cycle settled the dirty slot against a head it did not build for: %+v", out)
+	}
+	if out.DirtyGenerationID != 0 {
+		t.Fatalf("the cycle routed working-tree generation %d over a commit layer for another tree",
+			out.DirtyGenerationID)
+	}
+	for _, row := range f.generations() {
+		if row.GenerationKind == DirtyLayerGenerationKind {
+			t.Fatalf("generation %d describes a working tree over a commit layer for another tree",
+				row.GenerationID)
+		}
+	}
+
+	stored := f.route()
+	if stored.DirtyGenerationID != 0 {
+		t.Fatalf("the route names working-tree generation %d: %+v", stored.DirtyGenerationID, stored)
+	}
+	if graphview.RouteReady(stored) {
+		t.Fatalf("the route reported itself ready over a stale commit layer: %+v", stored)
+	}
+	if len(c.signal) != 1 {
+		t.Fatal("the coordinator did not signal itself for another window")
+	}
+
+	// The next cycle is what settles it: it samples the head the checkout is
+	// really at, rebuilds the commit slot for it, and only then lays the working
+	// tree over it.
+	settled := coordinatorReconcile(t, c)
+	if !settled.CommitBuilt || !settled.DirtyBuilt {
+		t.Fatalf("the follow-up cycle did not rebuild both slots: %+v", settled)
+	}
+	row, found := f.generation(settled.DirtyGenerationID)
+	if !found || row.BaseGenerationID != settled.CommitGenerationID {
+		t.Fatalf("the routed working-tree generation sits on %d, not on the routed commit generation %d",
+			row.BaseGenerationID, settled.CommitGenerationID)
+	}
+	if !graphview.RouteReady(f.route()) {
+		t.Fatalf("the checkout did not come up: %+v", f.route())
 	}
 }
 

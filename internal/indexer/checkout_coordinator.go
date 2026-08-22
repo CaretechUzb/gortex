@@ -436,9 +436,10 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 //
 // A cycle can settle both slots, so it can carry more than one outcome; the
 // counter reads as "how often did a cycle do this", not as a partition of the
-// cycles. The rescheduled case is deliberately silent here — a lost route flip
-// and a working tree that moved under two builds share the field but are
-// different failures, so each is counted where it is decided.
+// cycles. The rescheduled case is deliberately silent here — a lost route flip,
+// a working tree that moved under two builds and a checkout that committed
+// under the cycle share the field but are different failures, so each is
+// counted where it is decided.
 func recordCoordinatorCycle(out CheckoutCycle) {
 	switch {
 	case out.Err != nil:
@@ -505,7 +506,7 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	}
 	out.CommitGenerationID = commitGeneration
 
-	if err := c.reconcileDirtySlot(ctx, commitGeneration, &route, &out); err != nil {
+	if err := c.reconcileDirtySlot(ctx, commitGeneration, head.TreeOID, &route, &out); err != nil {
 		if errors.Is(err, errRouteMoved) {
 			out.Rescheduled = true
 			c.rescheduleOnLostRoute("route moved under the dirty flip")
@@ -950,9 +951,20 @@ func (c *CheckoutCoordinator) clearDirtySlot(ctx context.Context, route *store_s
 // generation that fails that check is withdrawn before the rebuild starts
 // rather than after it ends, since the pair it forms with the routed commit
 // generation describes no state the checkout has ever been in.
+//
+// targetTree is the committed tree the commit slot was settled against, and the
+// sample has to agree with it before anything is built or kept. A commit layer
+// takes as long as the tree it indexes, and a checkout is free to commit while
+// one is being built for it: the sample taken afterwards then describes the
+// working tree of a HEAD the layer beneath knows nothing about, and a layer
+// built from it would carry no payload for the paths the new commit moved —
+// they are committed, not dirty — so the pair would serve the old tree's
+// content as the checkout's current state. The cycle reschedules instead, and
+// the next one rebuilds the commit slot for the head the checkout is really at.
 func (c *CheckoutCoordinator) reconcileDirtySlot(
 	ctx context.Context,
 	commitGeneration int64,
+	targetTree string,
 	route *store_sqlite.CheckoutRoute,
 	out *CheckoutCycle,
 ) error {
@@ -961,6 +973,15 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		return fmt.Errorf("indexer: sample %s: %w", c.root, err)
 	}
 	c.noteDirtyFingerprint(sample.Fingerprint)
+	if sample.HeadTree != targetTree {
+		out.Rescheduled = true
+		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeHeadMoved)
+		c.logger.Debug("checkout coordinator: the checkout committed under the cycle",
+			zap.String("checkout", c.checkoutID),
+			zap.String("built_for", targetTree), zap.String("now_at", sample.HeadTree))
+		c.Signal("the checkout moved to another commit under the cycle")
+		return nil
+	}
 	if route.DirtyGenerationID > 0 {
 		row, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
 		if err != nil {
