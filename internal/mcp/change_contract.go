@@ -275,7 +275,7 @@ func (s *Server) lowerEditSource(ctx context.Context, req mcp.CallToolRequest) (
 	for _, n := range nodes {
 		changed = append(changed, refFromNode(n))
 	}
-	verificationFiles, verr := s.workspaceEditVerificationFiles(edit)
+	verificationFiles, verr := s.workspaceEditVerificationFiles(ctx, edit)
 	if verr != nil {
 		return nil, verr
 	}
@@ -295,14 +295,14 @@ func (s *Server) lowerEditSource(ctx context.Context, req mcp.CallToolRequest) (
 // owner and one repository-local path. Verification command synthesis consumes
 // only this canonical form, never the caller's absolute, URI, or graph-qualified
 // spelling.
-func (s *Server) workspaceEditVerificationFiles(edit lsp.WorkspaceEdit) ([]verificationFile, error) {
+func (s *Server) workspaceEditVerificationFiles(ctx context.Context, edit lsp.WorkspaceEdit) ([]verificationFile, error) {
 	fileEdits, err := s.groupEditByFile(edit)
 	if err != nil {
 		return nil, err
 	}
 	files := make([]verificationFile, 0, len(fileEdits))
 	for _, fe := range fileEdits {
-		_, rel, err := s.resolveFilePath(fe.overlayPath)
+		_, rel, err := s.resolveFilePath(ctx, fe.overlayPath)
 		if err != nil {
 			return nil, fmt.Errorf("cannot determine repository ownership for workspace edit path %q: %w", fe.overlayPath, err)
 		}

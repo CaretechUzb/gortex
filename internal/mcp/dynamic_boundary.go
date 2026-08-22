@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"regexp"
@@ -108,11 +109,11 @@ func anyAgentNamed(candidates []string) bool {
 // dispatch boundaries inside it, resolving candidate targets through the
 // caller's reader. Returns nil when the source can't be read or no dispatch is
 // found.
-func (s *Server) dynamicBoundariesForSymbol(r graph.Reader, node *graph.Node) []DynamicBoundary {
+func (s *Server) dynamicBoundariesForSymbol(ctx context.Context, r graph.Reader, node *graph.Node) []DynamicBoundary {
 	if node == nil || node.StartLine <= 0 {
 		return nil
 	}
-	absPath, err := s.resolveNodePath(node)
+	absPath, err := s.resolveNodePath(ctx, node)
 	if err != nil {
 		return nil
 	}

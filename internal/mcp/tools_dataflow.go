@@ -207,7 +207,7 @@ func (s *Server) dataflowRefiner(ctx context.Context) *dataflow.Refiner {
 		if fn.StartLine == 0 || fn.EndLine == 0 {
 			return dataflow.FuncSource{}, fmt.Errorf("symbol has no line range: %s", fn.ID)
 		}
-		absPath, err := s.resolveNodePath(fn)
+		absPath, err := s.resolveNodePath(ctx, fn)
 		if err != nil {
 			return dataflow.FuncSource{}, err
 		}

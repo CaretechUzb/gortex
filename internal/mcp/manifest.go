@@ -248,7 +248,7 @@ func (s *Server) manifestSymbolSource(ctx context.Context, n *graph.Node) string
 	if n.StartLine <= 0 || n.EndLine <= 0 {
 		return ""
 	}
-	absPath, err := s.resolveNodePath(n)
+	absPath, err := s.resolveNodePath(ctx, n)
 	if err != nil {
 		return ""
 	}

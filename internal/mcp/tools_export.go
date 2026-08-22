@@ -100,7 +100,7 @@ func (s *Server) handleExportGraph(ctx context.Context, req mcp.CallToolRequest)
 			if err != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("export: resolve output path %q: %v", p, err)), nil
 			}
-			if err := s.guardSymlinkWithinRepo(abs); err != nil {
+			if err := s.guardSymlinkWithinRepo(ctx, abs); err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 		}

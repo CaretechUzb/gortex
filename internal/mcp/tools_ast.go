@@ -92,7 +92,7 @@ func (s *Server) handleSearchAST(ctx context.Context, req mcp.CallToolRequest) (
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	targets, err := s.buildASTTargets(language, pathPrefix, allowedRepos)
+	targets, err := s.buildASTTargets(ctx, language, pathPrefix, allowedRepos)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -141,7 +141,7 @@ func (s *Server) handleSearchAST(ctx context.Context, req mcp.CallToolRequest) (
 // Path resolution: KindFile nodes carry repo-prefixed paths; the
 // engine needs absolute paths to read file bytes, so we resolve via
 // `s.resolveGraphPath` (which knows the repo roots).
-func (s *Server) buildASTTargets(language, pathPrefix string, allowedRepos map[string]bool) ([]astquery.Target, error) {
+func (s *Server) buildASTTargets(ctx context.Context, language, pathPrefix string, allowedRepos map[string]bool) ([]astquery.Target, error) {
 	if s.graph == nil {
 		return nil, fmt.Errorf("search_ast: no graph available")
 	}
@@ -167,7 +167,7 @@ func (s *Server) buildASTTargets(language, pathPrefix string, allowedRepos map[s
 		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
-		abs, err := s.resolveNodePath(n)
+		abs, err := s.resolveNodePath(ctx, n)
 		if err != nil {
 			// Indexed file whose repo we can't currently
 			// resolve (rare; happens during an in-flight

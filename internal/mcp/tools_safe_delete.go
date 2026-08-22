@@ -114,7 +114,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	// calls (parse-gate validated), and flags embedded references as manual.
 	var appliedPatches, failedPatches []callerPatch
 	if req.GetBool("propagate", false) && len(refs) > 0 {
-		plan := s.buildPropagationPlan(g, node)
+		plan := s.buildPropagationPlan(ctx, g, node)
 		manual := countManual(plan)
 		if dryRun {
 			return s.respondJSONOrTOON(ctx, req, map[string]any{
@@ -195,7 +195,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		closure, cascadeTruncated = computeCascadeClosure(g, node, cascadeIntoTests)
 	}
 
-	absPath, err := s.resolveNodePath(node)
+	absPath, err := s.resolveNodePath(ctx, node)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -255,7 +255,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 			if cn.StartLine == 0 || cn.EndLine == 0 {
 				return mcp.NewToolResultError(fmt.Sprintf("cascade target has no line range: %s", entry.ID)), nil
 			}
-			cAbs, err := s.resolveNodePath(cn)
+			cAbs, err := s.resolveNodePath(ctx, cn)
 			if err != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("resolve cascade target %s: %v", entry.ID, err)), nil
 			}

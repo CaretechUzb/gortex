@@ -41,7 +41,7 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 		// response and therefore never saw a receipt id. Resolution failure is
 		// not fatal here: the raw spelling is still matched against the ledger.
 		lookup := rawPath
-		if absPath, relPath, err := s.resolveFilePath(rawPath); err == nil {
+		if absPath, relPath, err := s.resolveFilePath(ctx, rawPath); err == nil {
 			if record, ok := s.mutationCommits.recentForPath(relPath); ok {
 				return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
 			}

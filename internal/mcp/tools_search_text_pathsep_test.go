@@ -84,9 +84,9 @@ func TestGraphRelPath_LoneRepoForwardSlash(t *testing.T) {
 	nodeKey := "solo/" + filepath.FromSlash("pkg/sub/main.go")
 	require.NotNil(t, g.GetNode(nodeKey), "fixture invariant: a lone repo's node ids carry its prefix")
 
-	require.Equal(t, nodeKey, srv.graphRelPath("solo/pkg/sub/main.go"),
+	require.Equal(t, nodeKey, srv.graphRelPath(context.Background(), "solo/pkg/sub/main.go"),
 		"a forward-slash path must be normalised to the graph's spelling")
-	require.Equal(t, nodeKey, srv.graphRelPath(nodeKey),
+	require.Equal(t, nodeKey, srv.graphRelPath(context.Background(), nodeKey),
 		"an already OS-spelled path is unchanged (idempotent)")
 
 	res := callTool(t, srv, "get_file_summary", map[string]any{"path": "pkg/sub/main.go"})

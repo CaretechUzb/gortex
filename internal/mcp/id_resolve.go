@@ -116,7 +116,7 @@ func (s *Server) resolveSymbolID(ctx context.Context, id string) string {
 	// Fallback: anchor the id's file-path part against the repo that owns
 	// the file on disk, so a repo-relative id still resolves when the
 	// session cwd doesn't map to a tracked repo (e.g. a cross-repo edit).
-	if rel := s.graphRelID(id); rel != id && reader.GetNode(rel) != nil {
+	if rel := s.graphRelID(ctx, id); rel != id && reader.GetNode(rel) != nil {
 		return rel
 	}
 	return id
@@ -125,12 +125,12 @@ func (s *Server) resolveSymbolID(ctx context.Context, id string) string {
 // graphRelID normalises the file-path part of a symbol id (path::Name) to
 // the graph's stored repo-prefixed form, leaving the name part untouched.
 // An id without a "::" path part is returned unchanged.
-func (s *Server) graphRelID(id string) string {
+func (s *Server) graphRelID(ctx context.Context, id string) string {
 	parts := strings.SplitN(id, "::", 2)
 	if len(parts) != 2 {
 		return id
 	}
-	return s.graphRelPath(parts[0]) + "::" + parts[1]
+	return s.graphRelPath(ctx, parts[0]) + "::" + parts[1]
 }
 
 // symbolIDArg extracts the required "id" argument and normalizes it via

@@ -1058,7 +1058,7 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 	if spec.Facade == "change" && spec.Operation == "impact" {
 		if rawPath, exists := normalized["path"]; exists {
 			if path := strings.TrimSpace(fmt.Sprint(rawPath)); path != "" {
-				path = s.graphRelPath(path)
+				path = s.graphRelPath(ctx, path)
 				eng := s.engineFor(ctx)
 				ids := make([]string, 0)
 				if eng != nil {

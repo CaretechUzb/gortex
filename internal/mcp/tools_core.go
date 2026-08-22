@@ -197,7 +197,7 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 	// Decorate nodes with absolute paths once, up front, so every output
 	// format below surfaces an openable path. The canonical graph nodes
 	// are copied, never mutated.
-	sg.Nodes = s.withAbsPaths(sg.Nodes)
+	sg.Nodes = s.withAbsPaths(ctx, sg.Nodes)
 	// Diagram formats render the subgraph directly — one place serves
 	// every traversal tool (callers/dependencies/usages/...), so a
 	// `gortex query ... --format mermaid|dot` gets a real diagram.
@@ -1374,7 +1374,7 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 
 	detail := req.GetString("detail", "brief")
 	if detail == "brief" {
-		return s.respondScopedJSONOrTOON(ctx, req, s.withAbsPath(node).Brief(), resolved)
+		return s.respondScopedJSONOrTOON(ctx, req, s.withAbsPath(ctx, node).Brief(), resolved)
 	}
 
 	// Full: include node + direct edges.
@@ -1382,7 +1382,7 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 	out := filterEdgesByResolvedScope(eng, eng.GetOutEdges(node.ID), resolved)
 	in := filterEdgesByResolvedScope(eng, eng.GetInEdges(node.ID), resolved)
 	return s.respondScopedJSONOrTOON(ctx, req, map[string]any{
-		"node":      s.withAbsPath(node),
+		"node":      s.withAbsPath(ctx, node),
 		"out_edges": out,
 		"in_edges":  in,
 	}, resolved)
@@ -1918,7 +1918,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	recordLastSearchFromNodes(sess, q, page)
 	// Decorate the page with absolute file paths so every output format
 	// below surfaces an openable path alongside the repo-relative one.
-	page = s.withAbsPaths(page)
+	page = s.withAbsPaths(ctx, page)
 	// Capture the final ranked, scoped page once, before JSON/TOON/GCX encoding.
 	captureLocalizationSearchSymbols(ctx, page)
 	nextCursor := ""
@@ -2187,7 +2187,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	// Normalise to the graph's stored path form so a repo-relative path
 	// (internal/x.go) doesn't miss the repo-prefixed nodes in multi-repo
 	// mode — the cause of spurious file_not_indexed misses.
-	fp = s.graphRelPath(fp)
+	fp = s.graphRelPath(ctx, fp)
 
 	// Auto re-index stale file before querying.
 	s.ensureFresh([]string{fp})
@@ -2454,7 +2454,7 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 		// The reach is a floor because dispatch is dynamic — scan the seed's
 		// body for the exact runtime-dispatch sites so the agent gets
 		// {site, form, key, candidates} instead of a read-spiral.
-		if db := s.dynamicBoundariesForSymbol(boundaryReader, boundaryReader.GetNode(id)); len(db) > 0 {
+		if db := s.dynamicBoundariesForSymbol(ctx, boundaryReader, boundaryReader.GetNode(id)); len(db) > 0 {
 			sg.DynamicBoundaries = db
 		}
 	}
@@ -2515,7 +2515,7 @@ func (s *Server) handleFindOverrides(ctx context.Context, req mcp.CallToolReques
 	// here.
 	nodes = s.scopedNodeSlice(ctx, nodes)
 	nodes = filterNodesByResolvedScope(nodes, resolved)
-	nodes = s.withAbsPaths(nodes)
+	nodes = s.withAbsPaths(ctx, nodes)
 
 	if s.isGCX(ctx, req) {
 		sg := &query.SubGraph{Nodes: nodes, TotalNodes: len(nodes)}
@@ -2559,7 +2559,7 @@ func (s *Server) handleFindImplementations(ctx context.Context, req mcp.CallTool
 	// doesn't take QueryOptions, so the boundary is enforced here.
 	impls = s.scopedNodeSlice(ctx, impls)
 	impls = filterNodesByResolvedScope(impls, resolved)
-	impls = s.withAbsPaths(impls)
+	impls = s.withAbsPaths(ctx, impls)
 
 	if s.isGCX(ctx, req) {
 		// Keep only the implements-edges whose implementation survived
@@ -2760,7 +2760,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// diagram formats go through the shared subgraph renderer.
 	format := req.GetString("format", "")
 	if !s.isTOON(ctx, req) && !isCompact(req) && format != "mermaid" && format != "dot" {
-		sg.Nodes = s.withAbsPaths(sg.Nodes)
+		sg.Nodes = s.withAbsPaths(ctx, sg.Nodes)
 		return s.respondScopedJSONOrTOON(ctx, req, newUsageResponse(sg, s.readerFor(ctx)), resolved)
 	}
 	return s.returnScopedSubGraph(ctx, req, sg, resolved)

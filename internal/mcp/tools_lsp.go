@@ -261,7 +261,7 @@ func (s *Server) guardCallerPath(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	return s.guardSymlinkWithinRepo(abs)
+	return s.guardSymlinkWithinRepo(ctx, abs)
 }
 
 // handleApplyCodeAction implements the `apply_code_action` tool.

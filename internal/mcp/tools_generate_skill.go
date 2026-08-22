@@ -71,7 +71,7 @@ func (s *Server) handleGenerateSkill(ctx context.Context, req mcp.CallToolReques
 		return mcp.NewToolResultError("directory is required"), nil
 	}
 
-	absDir, _, err := s.resolveFilePath(rawDir)
+	absDir, _, err := s.resolveFilePath(ctx, rawDir)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("resolve directory: %v", err)), nil
 	}
@@ -115,7 +115,7 @@ func (s *Server) handleGenerateSkill(ctx context.Context, req mcp.CallToolReques
 		// every indexed repo root, so an absolute output_dir can no longer
 		// escape into the home dir / system paths (SECURITY.md confinement
 		// invariant). Refuse rather than fall back to the literal path.
-		resolved, _, rerr := s.resolveFilePath(outputDir)
+		resolved, _, rerr := s.resolveFilePath(ctx, outputDir)
 		if rerr != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("resolve output_dir: %v", rerr)), nil
 		}

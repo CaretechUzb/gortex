@@ -351,7 +351,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	// Normalise to the graph's stored path form so a repo-relative path
 	// (internal/x.go) doesn't miss the repo-prefixed nodes in multi-repo
 	// mode — the cause of spurious "no symbols found for file" misses.
-	fp = s.graphRelPath(fp)
+	fp = s.graphRelPath(ctx, fp)
 
 	// Auto re-index stale file before querying.
 	s.ensureFresh([]string{fp})
@@ -461,8 +461,16 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		for _, n := range sg.Nodes {
 			if n.Kind == graph.KindFile {
 				out.File = map[string]any{"id": n.ID, "language": n.Language}
+				// The same anchor the fast path keeps: without it the
+				// whole-file compressed view below has no node to resolve a
+				// path from, so every backend without a FileEditingContext
+				// bundle answered compress_bodies with nothing at all.
+				fileNodeForScope = n
 				break
 			}
+		}
+		if fileNodeForScope == nil {
+			fileNodeForScope = sg.Nodes[0]
 		}
 		for _, n := range sg.Nodes {
 			if n.Kind == graph.KindFile {
@@ -569,7 +577,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 					viewReadFailure = viewErr.Error()
 				}
 			} else if anchor != nil {
-				if absPath, rerr := s.resolveNodePath(anchor); rerr == nil {
+				if absPath, rerr := s.resolveNodePath(ctx, anchor); rerr == nil {
 					if content, ok := s.overlayContentFor(ctx, absPath); ok {
 						fileBytes = []byte(content)
 					} else if b, ferr := os.ReadFile(absPath); ferr == nil {
@@ -895,7 +903,7 @@ func (s *Server) suggestSymbolIDs(ctx context.Context, id string) string {
 	}
 	// 2. Nearest-named symbols in the same file — the stale-name case.
 	if pathPart != "" && len(out) < 5 {
-		if sg := eng.GetFileSymbols(s.graphRelPath(pathPart)); sg != nil {
+		if sg := eng.GetFileSymbols(s.graphRelPath(ctx, pathPart)); sg != nil {
 			type scored struct {
 				n    *graph.Node
 				dist int
@@ -986,11 +994,11 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		source, startLine, totalFileChars, _ = extractLinesFromContent(
 			string(content), node.StartLine, node.EndLine, contextLines)
 	} else {
-		absPath, resolveErr := s.resolveNodePath(node)
+		absPath, resolveErr := s.resolveNodePath(ctx, node)
 		if resolveErr != nil {
 			return mcp.NewToolResultError(resolveErr.Error()), nil
 		}
-		if guardErr := s.guardSymlinkWithinRepo(absPath); guardErr != nil {
+		if guardErr := s.guardSymlinkWithinRepo(ctx, absPath); guardErr != nil {
 			return mcp.NewToolResultError(guardErr.Error()), nil
 		}
 		var err error
@@ -1296,7 +1304,7 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 
 		// Source code (optional).
 		if includeSource && node.StartLine > 0 && node.EndLine > 0 {
-			if absPath, err := s.resolveNodePath(node); err == nil {
+			if absPath, err := s.resolveNodePath(ctx, node); err == nil {
 				if source, fromLine, totalFileChars, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, contextLines); err == nil {
 					entry["source"] = source
 					entry["from_line"] = fromLine
@@ -1657,7 +1665,7 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 
 	// 1. Get the example source.
 	if node.StartLine > 0 && node.EndLine > 0 {
-		if absPath, err := s.resolveNodePath(node); err == nil {
+		if absPath, err := s.resolveNodePath(ctx, node); err == nil {
 			if source, _, _, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, 0); err == nil {
 				result["example_source"] = elideSourceForPattern(source, maxSourceLines)
 			}
@@ -1705,7 +1713,7 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 		}
 		// Get the registration source (the caller function that wires this symbol).
 		if cn.StartLine > 0 && cn.EndLine > 0 {
-			if absPath, err := s.resolveNodePath(cn); err == nil {
+			if absPath, err := s.resolveNodePath(ctx, cn); err == nil {
 				if source, _, _, err := s.readLinesForCtx(ctx, absPath, cn.StartLine, cn.EndLine, 0); err == nil {
 					entry["source"] = elideSourceForPattern(source, maxSourceLines)
 				}
@@ -1735,7 +1743,7 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 			}
 			// Get test source.
 			if tn.StartLine > 0 && tn.EndLine > 0 {
-				if absPath, err := s.resolveNodePath(tn); err == nil {
+				if absPath, err := s.resolveNodePath(ctx, tn); err == nil {
 					if source, _, _, err := s.readLinesForCtx(ctx, absPath, tn.StartLine, tn.EndLine, 0); err == nil {
 						entry["source"] = elideSourceForPattern(source, maxSourceLines)
 					}
@@ -2195,7 +2203,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		if !graded && sourcesEmbedded < smartCtxMaxSource &&
 			(sym.Kind == graph.KindFunction || sym.Kind == graph.KindMethod) &&
 			sym.StartLine > 0 && sym.EndLine > 0 {
-			if absPath, err := s.resolveNodePath(sym); err == nil {
+			if absPath, err := s.resolveNodePath(ctx, sym); err == nil {
 				if source, _, totalFileChars, err := s.readLinesForCtx(ctx, absPath, sym.StartLine, sym.EndLine, 0); err == nil {
 					if red, did := s.maybeRedactConfigLeaf(sym.Language, sym.FilePath, false, source); did {
 						source = red
@@ -2652,7 +2660,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 	// Resolve abs paths per node/edge — single rootPath is wrong in
 	// multi-repo mode where each repo has its own root.
 	resolvePath := func(graphPath string) string {
-		abs, err := s.resolveGraphPath(graphPath)
+		abs, err := s.resolveGraphPath(ctx, graphPath)
 		if err != nil {
 			return ""
 		}
@@ -2820,7 +2828,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 	// still matches disk cannot be invalidated between verification and write.
 	absPaths := make([]string, 0, len(fileSet))
 	for relPath := range fileSet {
-		abs, err := s.resolveGraphPath(relPath)
+		abs, err := s.resolveGraphPath(ctx, relPath)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("could not resolve %s: %v", relPath, err)), nil
 		}
@@ -2832,7 +2840,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 	}
 	defer releaseMutation()
 
-	writes, planErr := s.planRenameWrites(edits, allowParseErrors)
+	writes, planErr := s.planRenameWrites(ctx, edits, allowParseErrors)
 	if planErr != nil {
 		return mcp.NewToolResultError(planErr.Error()), nil
 	}
@@ -2909,7 +2917,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	// Resolve file path.
-	absPath, err := s.resolveNodePath(node)
+	absPath, err := s.resolveNodePath(ctx, node)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -3105,7 +3113,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	}
 	s.attachMutationFreshness(resp, node.FilePath, absPath, reindexOutcome)
 	if evidenceRequested {
-		s.attachMutationPhysicalEvidence(resp, absPath, content, true)
+		s.attachMutationPhysicalEvidence(ctx, resp, absPath, content, true)
 	}
 	attachMutationCommit(resp, commit)
 	// Retained last so a replayed retry returns the complete original payload,

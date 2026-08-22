@@ -622,7 +622,7 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 		return nil
 	}
 
-	allTargets, err := s.buildASTTargets("", "", allowedRepos)
+	allTargets, err := s.buildASTTargets(ctx, "", "", allowedRepos)
 	if err != nil || len(allTargets) == 0 {
 		return nil
 	}

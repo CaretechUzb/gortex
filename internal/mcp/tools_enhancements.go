@@ -734,7 +734,7 @@ func (s *Server) handlePrefetchContext(ctx context.Context, req mcp.CallToolRequ
 			}
 			n := candidates[i].Node
 			if n.StartLine > 0 && n.EndLine > 0 {
-				if absPath, err := s.resolveNodePath(n); err == nil {
+				if absPath, err := s.resolveNodePath(ctx, n); err == nil {
 					if source, _, _, err := readLines(absPath, n.StartLine, n.EndLine, 0); err == nil {
 						candidates[i].Source = source
 					}
@@ -2606,11 +2606,17 @@ func (s *Server) handleFindHotspots(ctx context.Context, req mcp.CallToolRequest
 // resolve file paths through the multi-repo aware Server.resolveGraphPath
 // instead of relying on a single Indexer.RootPath which is empty in
 // multi-repo mode.
-type scaffoldReader struct{ s *Server }
+// The reader carries the request it was built for: analysis.SourceReader takes
+// no context, and path resolution needs one to place a path in the checkout the
+// request reads.
+type scaffoldReader struct {
+	s   *Server
+	ctx context.Context
+}
 
 func (r scaffoldReader) Graph() graph.Store { return r.s.graph }
 func (r scaffoldReader) ResolveFilePath(graphPath string) string {
-	abs, err := r.s.resolveGraphPath(graphPath)
+	abs, err := r.s.resolveGraphPath(r.ctx, graphPath)
 	if err != nil {
 		return ""
 	}
@@ -2633,7 +2639,7 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 		dryRun = v
 	}
 
-	result, err := analysis.GenerateScaffold(s.engine, scaffoldReader{s}, exampleID, newName)
+	result, err := analysis.GenerateScaffold(s.engine, scaffoldReader{s: s, ctx: ctx}, exampleID, newName)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -2879,7 +2885,7 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 
 		// Source
 		if node.StartLine > 0 && node.EndLine > 0 {
-			if absPath, err := s.resolveNodePath(node); err == nil {
+			if absPath, err := s.resolveNodePath(ctx, node); err == nil {
 				if source, _, _, readErr := readLines(absPath, node.StartLine, node.EndLine, 0); readErr == nil {
 					info.Source = source
 				}
@@ -4053,7 +4059,7 @@ func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem, w
 		res.Status, res.Error = "failed", "symbol has no line range"
 		return res
 	}
-	absPath, resolveErr := s.resolveNodePath(node)
+	absPath, resolveErr := s.resolveNodePath(ctx, node)
 	if resolveErr != nil {
 		res.Status, res.Error = "failed", resolveErr.Error()
 		return res
@@ -4180,7 +4186,7 @@ func (s *Server) applyBatchFileEdit(ctx context.Context, edit batchEditItem, wri
 		res.Status, res.Error = "failed", "old_string and new_string are identical"
 		return res
 	}
-	absPath, relPath, resolveErr := s.resolveFilePath(edit.Path)
+	absPath, relPath, resolveErr := s.resolveFilePath(ctx, edit.Path)
 	if resolveErr != nil {
 		res.Status, res.Error = "failed", resolveErr.Error()
 		return res

@@ -538,10 +538,11 @@ func (s *Server) repoPrefixForCheckout(ctx context.Context, checkout store_sqlit
 // refuseRoutedViewMutation blocks a source-mutating tool whose request reads
 // through a routed view.
 //
-// The write tools resolve a path against the canonical checkout root, so a
-// write issued while reading a worktree's view would land in the wrong
-// working copy. Refusing is the honest answer until the write path learns to
-// follow the view; editing an automatic worktree comes with that.
+// Path resolution follows the view, but nothing else on the write path does:
+// the view is a leased snapshot of generations, and a write beneath it leaves
+// the stack this request read describing content that is no longer there.
+// Refusing is the honest answer until the write path can invalidate the route
+// it wrote through; editing an automatic worktree comes with that.
 func (s *Server) refuseRoutedViewMutation(ctx context.Context, tool string) *mcp.CallToolResult {
 	view := requestViewFromContext(ctx)
 	if !view.routed() || !s.facades.mutatesSource(tool) {

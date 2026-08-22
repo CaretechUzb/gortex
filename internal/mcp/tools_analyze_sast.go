@@ -113,7 +113,7 @@ func (s *Server) handleAnalyzeSAST(ctx context.Context, req mcp.CallToolRequest,
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	targets, err := s.buildASTTargets("", pathPrefix, allowedRepos)
+	targets, err := s.buildASTTargets(ctx, "", pathPrefix, allowedRepos)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
