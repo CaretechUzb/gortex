@@ -513,7 +513,7 @@ func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
 		ftf, fuc := usageFromFlavor(g, e.From, fn)
 		if err := enc.WriteRow(
 			e.From, e.To, string(e.Kind), e.Context, e.ReturnUsage, e.Origin, tier, e.Confidence,
-			fname, fpath, fline, nodeIsTest(fn), nodeTestRole(fn), nodeTestRunner(fn), ftf, fuc,
+			fname, fpath, fline, graph.NodeIsTest(g, fn), nodeTestRole(fn), nodeTestRunner(fn), ftf, fuc,
 		); err != nil {
 			return nil, err
 		}
@@ -533,7 +533,7 @@ func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
 // third caller_notes section when get_callers attached concurrency
 // annotations. The third section is omitted entirely when empty so the
 // other traversal tools' wire output is byte-identical to before.
-func encodeSubGraph(tool string, sg *query.SubGraph) ([]byte, error) {
+func encodeSubGraph(tool string, sg *query.SubGraph, g graph.Store) ([]byte, error) {
 	var buf bytes.Buffer
 	nodes := make([]*graph.Node, 0, len(sg.Nodes))
 	for _, n := range sg.Nodes {
@@ -565,7 +565,7 @@ func encodeSubGraph(tool string, sg *query.SubGraph) ([]byte, error) {
 		nodeMeta...,
 	)
 	for _, n := range nodes {
-		if err := nodeEnc.WriteRow(n.ID, string(n.Kind), nodeShort(n), n.FilePath, n.AbsoluteFilePath, n.StartLine, nodeIsTest(n), nodeTestRole(n), nodeTestRunner(n)); err != nil {
+		if err := nodeEnc.WriteRow(n.ID, string(n.Kind), nodeShort(n), n.FilePath, n.AbsoluteFilePath, n.StartLine, graph.NodeIsTest(g, n), nodeTestRole(n), nodeTestRunner(n)); err != nil {
 			return nil, err
 		}
 	}

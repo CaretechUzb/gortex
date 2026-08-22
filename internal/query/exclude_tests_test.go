@@ -61,3 +61,43 @@ func TestFindUsagesScoped_ExcludeTestsCoversUnstampedKinds(t *testing.T) {
 		require.NotEqual(t, testParam.ID, n.ID, "test param node leaked into a production-only result")
 	}
 }
+
+// TestFindUsagesScoped_ExcludeTestsCoversAnnotationOwnerChildren pins
+// the classifier's owner hop: an annotation-discovered test (a #[test]
+// fn in a production-looking path) is stamped on the function node
+// only, so its parameter child has neither a stamp nor a test-looking
+// path. The child must inherit the owner's test identity through the
+// `<owner-id>#...` ID convention.
+func TestFindUsagesScoped_ExcludeTestsCoversAnnotationOwnerChildren(t *testing.T) {
+	g := graph.New()
+	target := &graph.Node{
+		ID: "src/widget.rs::Widget", Kind: graph.KindType,
+		Name: "Widget", FilePath: "src/widget.rs", StartLine: 3,
+	}
+	// As the annotation pass leaves it: the fn is stamped, the child not.
+	testFn := &graph.Node{
+		ID: "src/lib.rs::check_widget", Kind: graph.KindFunction,
+		Name: "check_widget", FilePath: "src/lib.rs", StartLine: 40,
+		Meta: map[string]any{"is_test": true, "test_role": "test"},
+	}
+	testParam := &graph.Node{
+		ID: "src/lib.rs::check_widget#param:w", Kind: graph.KindParam,
+		Name: "w", FilePath: "src/lib.rs", StartLine: 40,
+	}
+	prodCaller := &graph.Node{
+		ID: "src/main.rs::run", Kind: graph.KindFunction,
+		Name: "run", FilePath: "src/main.rs", StartLine: 10,
+	}
+	for _, n := range []*graph.Node{target, testFn, testParam, prodCaller} {
+		g.AddNode(n)
+	}
+	g.AddEdge(&graph.Edge{From: prodCaller.ID, To: target.ID, Kind: graph.EdgeCalls, FilePath: "src/main.rs", Line: 12})
+	g.AddEdge(&graph.Edge{From: testFn.ID, To: target.ID, Kind: graph.EdgeCalls, FilePath: "src/lib.rs", Line: 42})
+	g.AddEdge(&graph.Edge{From: testParam.ID, To: target.ID, Kind: graph.EdgeReferences, FilePath: "src/lib.rs", Line: 40})
+
+	eng := NewEngine(g)
+	sg := eng.FindUsagesScoped(target.ID, QueryOptions{ExcludeTests: true})
+
+	require.Len(t, sg.Edges, 1, "the stamped owner's param child must be excluded with it")
+	require.Equal(t, prodCaller.ID, sg.Edges[0].From)
+}

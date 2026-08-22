@@ -243,10 +243,10 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 		if tool == "" {
 			tool = "subgraph"
 		}
-		return s.gcxResponseWithBudget(req)(encodeSubGraph(tool, sg))
+		return s.gcxResponseWithBudget(req)(encodeSubGraph(tool, sg, s.graph))
 	}
 	if s.isTOON(ctx, req) {
-		return subGraphToTOON(sg)
+		return subGraphToTOON(sg, s.graph)
 	}
 	return s.respondJSONOrTOON(ctx, req, sg)
 }
@@ -367,7 +367,7 @@ func (s *Server) respondJSONOrTOON(ctx context.Context, req mcp.CallToolRequest,
 }
 
 // subGraphToTOON converts a SubGraph to a TOON-encoded text result.
-func subGraphToTOON(sg *query.SubGraph) (*mcp.CallToolResult, error) {
+func subGraphToTOON(sg *query.SubGraph, g graph.Store) (*mcp.CallToolResult, error) {
 	var edgeRows []toonEdgeRow
 	for _, e := range sg.Edges {
 		label := e.ConfidenceLabel
@@ -388,8 +388,17 @@ func subGraphToTOON(sg *query.SubGraph) (*mcp.CallToolResult, error) {
 			Label:      label,
 		})
 	}
+	nodeRows := nodesToTOONRows(sg.Nodes)
+	// Subgraph rows ride next to the exclude_tests filter, so their
+	// is_test column uses the same shared classifier (stamp → owner →
+	// path); pure listing tools keep the raw stamp.
+	for i, n := range sg.Nodes {
+		if i < len(nodeRows) {
+			nodeRows[i].IsTest = graph.NodeIsTest(g, n)
+		}
+	}
 	result := toonSubGraphResult{
-		Nodes:                 nodesToTOONRows(sg.Nodes),
+		Nodes:                 nodeRows,
 		Edges:                 edgeRows,
 		Total:                 sg.TotalNodes,
 		Truncated:             sg.Truncated,
@@ -2796,7 +2805,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// tell at a glance whether the usage list already covers tests instead
 	// of re-grepping *_test.go files. Rides every wire format below; nil
 	// for an empty result (the Caveat above covers that case).
-	sg.UsageSummary = usageSummaryOf(sg)
+	sg.UsageSummary = usageSummaryOf(sg, s.graph)
 	// Proactive discovery cue: when the target is dispatch-heavy, point at
 	// find_implementations (once per session). Additive — the only response
 	// content the diet adds.
@@ -3161,12 +3170,13 @@ func truncateUsageRows(sg *query.SubGraph, limit int, targetID string) {
 // usageSummaryOf computes the compact completeness rollup attached to a
 // find_usages response: the total reference count, the number of
 // distinct files those references live in, and how many originate in
-// test files. It reuses the exact per-node test classification
-// (nodeIsTest — the from_is_test column) and file resolution as the
+// test files. It reuses the shared test classifier (graph.NodeIsTest —
+// the same authority order the exclude_tests filter and the
+// from_is_test column apply) and the same file resolution as the
 // per-usage rows, so the rollup never disagrees with the edges it
 // summarizes. Returns nil for an empty result — the zero-edge Caveat
 // already explains that case, and an all-zero summary would be noise.
-func usageSummaryOf(sg *query.SubGraph) *query.UsageSummary {
+func usageSummaryOf(sg *query.SubGraph, g graph.Store) *query.UsageSummary {
 	if sg == nil || len(sg.Edges) == 0 {
 		return nil
 	}
@@ -3186,7 +3196,7 @@ func usageSummaryOf(sg *query.SubGraph) *query.UsageSummary {
 			file = "(unknown)"
 		}
 		files[file] = struct{}{}
-		if nodeIsTest(from) {
+		if graph.NodeIsTest(g, from) {
 			testRefs++
 		}
 	}

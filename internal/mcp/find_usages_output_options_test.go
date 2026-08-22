@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -283,6 +284,55 @@ func TestFindUsages_CompactHonorsByteBudget(t *testing.T) {
 	})
 	require.LessOrEqual(t, len(out), 300, "compact output must respect max_bytes")
 	require.Contains(t, out, "trimmed", "a budget-trimmed compact response must say so")
+}
+
+// TestFindUsages_TestLabelsMatchTheFilter pins that the output
+// metadata classifies test rows with the same classifier the
+// exclude_tests filter uses: a file-level node (is_test_file only) and
+// a bare param node under a test directory count in
+// usage_summary.n_test_refs and carry from_is_test=true on the GCX
+// wire, instead of being filtered as tests but labeled as production.
+func TestFindUsages_TestLabelsMatchTheFilter(t *testing.T) {
+	g := graph.New()
+	target := &graph.Node{ID: "src/WidgetService.cs::WidgetService", Kind: graph.KindType, Name: "WidgetService", FilePath: "src/WidgetService.cs", StartLine: 5}
+	prod := &graph.Node{ID: "src/Consumer.cs::Consumer.Use", Kind: graph.KindMethod, Name: "Use", FilePath: "src/Consumer.cs", StartLine: 12}
+	testFile := &graph.Node{
+		ID: `Test\WidgetService_Tests.cs`, Kind: graph.KindFile,
+		Name: "WidgetService_Tests.cs", FilePath: `Test\WidgetService_Tests.cs`,
+		Meta: map[string]any{"is_test_file": true},
+	}
+	testParam := &graph.Node{
+		ID: `Test\WidgetService_Tests.cs::WidgetServiceTests.Run#param:svc`, Kind: graph.KindParam,
+		Name: "svc", FilePath: `Test\WidgetService_Tests.cs`, StartLine: 20,
+	}
+	for _, n := range []*graph.Node{target, prod, testFile, testParam} {
+		g.AddNode(n)
+	}
+	g.AddEdge(&graph.Edge{From: prod.ID, To: target.ID, Kind: graph.EdgeCalls, FilePath: "src/Consumer.cs", Line: 14})
+	g.AddEdge(&graph.Edge{From: testFile.ID, To: target.ID, Kind: graph.EdgeImports, FilePath: testFile.FilePath, Line: 1})
+	g.AddEdge(&graph.Edge{From: testParam.ID, To: target.ID, Kind: graph.EdgeReferences, FilePath: testParam.FilePath, Line: 20})
+	eng := query.NewEngine(g)
+	eng.SetSearch(search.NewNull())
+	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
+
+	var resp struct {
+		UsageSummary *query.UsageSummary `json:"usage_summary"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(findUsagesText(t, srv, map[string]any{"id": target.ID})), &resp))
+	require.NotNil(t, resp.UsageSummary)
+	require.Equal(t, 3, resp.UsageSummary.NRefs)
+	require.Equal(t, 2, resp.UsageSummary.NTestRefs,
+		"n_test_refs must count the unstamped test-path rows the filter would drop")
+
+	gcx := findUsagesText(t, srv, map[string]any{"id": target.ID, "format": "gcx"})
+	for _, line := range strings.Split(gcx, "\n") {
+		if strings.HasPrefix(line, testParam.ID+"\t") || strings.HasPrefix(line, testFile.ID+"\t") {
+			require.Contains(t, line, "\ttrue", "test-path rows must carry from_is_test=true: %s", line)
+		}
+		if strings.HasPrefix(line, prod.ID+"\t") {
+			require.NotContains(t, line, "\ttrue", "the production row must stay from_is_test=false: %s", line)
+		}
+	}
 }
 
 // TestFindUsages_CompactWinsOverGCX pins the `compact` option against

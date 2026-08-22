@@ -12,7 +12,6 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/search/rerank"
-	"github.com/zzet/gortex/internal/testpath"
 )
 
 // SearchProvider is a function that returns the current search backend.
@@ -454,7 +453,7 @@ func (e *Engine) FindUsagesScoped(nodeID string, opts QueryOptions) *SubGraph {
 			if opts.hasScopeFilter() && (from == nil || !opts.ScopeAllows(from)) {
 				continue
 			}
-			if opts.ExcludeTests && isTestSource(from) {
+			if opts.ExcludeTests && e.isTestSource(from) {
 				continue
 			}
 			filtered = append(filtered, edge)
@@ -1341,7 +1340,7 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 		}
 		// ExcludeTests drops neighbours flagged as tests during a reverse
 		// traversal — a no-op for forward/bidirectional walks.
-		if opts.ExcludeTests && !forward && !bidir && isTestSource(neighbor) {
+		if opts.ExcludeTests && !forward && !bidir && e.isTestSource(neighbor) {
 			return ""
 		}
 		// Workspace/project scope: neighbours outside the bound scope are
@@ -1804,22 +1803,11 @@ func isCodeSymbolKind(n *graph.Node) bool {
 
 // isTestSource reports whether a node originates in test code. Used by
 // QueryOptions.ExcludeTests to drop callers/users that originate in
-// tests, leaving production callers.
-//
-// The indexer's test-edge pass stamps Meta["is_test"] on function and
-// method symbols only — a file-level from-node under a test directory
-// carries is_test_file instead, and parameter nodes carry no flag at
-// all. Trusting the stamp alone leaks exactly those kinds into a
-// production-only answer, so unflagged nodes fall back to the canonical
-// path predicate — the same signal the stamp is derived from.
-func isTestSource(n *graph.Node) bool {
-	if n == nil {
-		return false
-	}
-	if v, _ := n.Meta["is_test"].(bool); v {
-		return true
-	}
-	return testpath.IsTestFile(n.FilePath)
+// tests, leaving production callers. Delegates to the shared classifier
+// (see graph.NodeIsTest for the stamp → owner → path authority order),
+// so the filter and the output metadata can never disagree.
+func (e *Engine) isTestSource(n *graph.Node) bool {
+	return graph.NodeIsTest(e.g, n)
 }
 
 func dedup(edges []*graph.Edge) []*graph.Edge {
