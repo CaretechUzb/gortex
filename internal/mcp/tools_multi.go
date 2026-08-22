@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,7 +14,6 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/indexer"
-	"github.com/zzet/gortex/internal/reconcile"
 )
 
 // trackAcceptedHeadroom is how long before the MCP request deadline the
@@ -40,8 +38,12 @@ func (s *Server) registerMultiRepoTools() {
 
 	s.addTool(
 		mcp.NewTool("untrack_repository",
-			mcp.WithDescription("Remove a repository from the tracked workspace at runtime. Evicts nodes/edges and persists to config."),
+			mcp.WithDescription("Remove a repository from the tracked workspace at runtime. Evicts nodes/edges and persists to config. "+
+				"A checkout the family can still serve from another corpus is demoted into the automatic lane and the call runs "+
+				"outright; a plan that removes rows — a primary corpus with its closure, or a checkout with nowhere to be demoted "+
+				"to — is previewed instead and needs confirm:true."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Path or repo prefix to remove")),
+			mcp.WithBoolean("confirm", mcp.Description("Run a plan that removes rows. Without it such a plan is only previewed.")),
 		),
 		s.handleUntrackRepository,
 	)
@@ -232,36 +234,30 @@ func (s *Server) handleUntrackRepository(ctx context.Context, req mcp.CallToolRe
 		return repoNotTrackedGuidance(path), nil
 	}
 
-	// The lifecycle revokes the tracking intents, runs the forget saga and
-	// drives every side effect from it: watcher detach, graph eviction,
-	// config persist, session invalidation, analysis rerun.
-	result, err := s.lifecycle.Untrack(ctx, path)
+	// What an untrack of this path does is a property of the catalog, so it is
+	// read before anything is torn down. A plan that removes rows is shown and
+	// not run; a plan that keeps the checkout is the ordinary untrack.
+	preview, err := s.lifecycle.PreviewUntrack(ctx, path)
 	if err != nil {
-		if errors.Is(err, reconcile.ErrIntentNotRevocable) {
-			return mcp.NewToolResultError(fmt.Sprintf(
-				"cannot untrack %s: it is still wanted by another tracking source (%v)",
-				path, err)), nil
-		}
-		return mcp.NewToolResultError(err.Error()), nil
+		return untrackFailure(path, err), nil
+	}
+	if destructiveUntrackPlan(preview.Plan) && !req.GetBool("confirm", false) {
+		return s.respondJSONOrTOON(ctx, req, untrackPreviewPayload("untrack", preview,
+			"nothing was written; call untrack_repository again with confirm:true to run this plan"))
 	}
 
-	payload := map[string]any{
-		"status":        "untracked",
-		"prefix":        result.Prefix,
-		"nodes_removed": result.NodesRemoved,
-		"edges_removed": result.EdgesRemoved,
+	// The lifecycle revokes the tracking intents, runs the plan's saga and
+	// drives every side effect from it: watcher detach, graph eviction,
+	// config persist, session invalidation, analysis rerun.
+	result, err := s.lifecycle.ApplyUntrack(ctx, preview)
+	if err != nil {
+		return untrackFailure(path, err), nil
 	}
-	if len(result.Revoked) > 0 {
-		payload["revoked_intents"] = result.Revoked
+	status := "untracked"
+	if result.Demoted {
+		status = "demoted"
 	}
-	if len(result.Dependents) > 0 {
-		dependents := make([]string, 0, len(result.Dependents))
-		for _, dep := range result.Dependents {
-			dependents = append(dependents, dep.Detail)
-		}
-		payload["dependents"] = dependents
-	}
-	return s.respondJSONOrTOON(ctx, req, payload)
+	return s.respondJSONOrTOON(ctx, req, untrackResultPayload(status, result))
 }
 
 // handleSetActiveProject validates the project name, updates the active project,

@@ -79,16 +79,31 @@ func TestTrackUntrackRepositoryDrivesTheCheckoutLifecycle(t *testing.T) {
 	assert.Equal(t, store_sqlite.IntentSourceMCPTrack, intents[0].SourceKind,
 		"the tool call is what is recorded as having asked")
 
+	// The lone tracked repository owns its family's primary corpus, so the
+	// untrack plan removes rows — which is previewed and not run.
+	var payload struct {
+		Status          string   `json:"status"`
+		Plan            string   `json:"plan"`
+		Prefix          string   `json:"prefix"`
+		ConfirmRequired bool     `json:"confirm_required"`
+		Revoked         []string `json:"revoked_intents"`
+	}
 	req := mcplib.CallToolRequest{}
 	req.Params.Arguments = map[string]any{"path": repo}
 	res, err := srv.handleUntrackRepository(ctx, req)
 	require.NoError(t, err)
 	require.False(t, res.IsError, "untrack_repository failed: %+v", res.Content)
-	var payload struct {
-		Status  string   `json:"status"`
-		Prefix  string   `json:"prefix"`
-		Revoked []string `json:"revoked_intents"`
-	}
+	require.NoError(t, json.Unmarshal([]byte(extractTextFromContent(t, res.Content)), &payload))
+	assert.Equal(t, "preview", payload.Status)
+	assert.Equal(t, "primary_closure", payload.Plan)
+	assert.True(t, payload.ConfirmRequired)
+	require.NotNil(t, mi.GetMetadata(prefix), "a preview writes nothing")
+
+	req.Params.Arguments = map[string]any{"path": repo, "confirm": true}
+	res, err = srv.handleUntrackRepository(ctx, req)
+	require.NoError(t, err)
+	require.False(t, res.IsError, "untrack_repository failed: %+v", res.Content)
+	payload.Status, payload.Plan = "", ""
 	require.NoError(t, json.Unmarshal([]byte(extractTextFromContent(t, res.Content)), &payload))
 	assert.Equal(t, "untracked", payload.Status)
 	assert.Equal(t, prefix, payload.Prefix)

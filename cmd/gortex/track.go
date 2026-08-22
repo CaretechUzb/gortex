@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -23,7 +24,16 @@ var (
 	trackAsWorktree  bool
 	trackWait        bool
 	trackWaitTimeout time.Duration
+	untrackConfirm   bool
+	untrackFormat    string
 )
+
+// untrackDaemonTool is the daemon-tool relay seam. Untrack goes through the
+// tool rather than the control socket because what an untrack does depends on
+// the family: a checkout the family can still serve is demoted outright, and a
+// plan that removes rows is previewed and needs --confirm. Both decisions are
+// the tool's, so the CLI and an agent see the same one.
+var untrackDaemonTool = requireDaemonTool
 
 // trackStatusFn fetches the daemon status; indirected through a package var so
 // the --wait poll loop can be exercised in tests without a running daemon.
@@ -44,9 +54,16 @@ var trackCmd = &cobra.Command{
 var untrackCmd = &cobra.Command{
 	Use:   "untrack <path>",
 	Short: "Remove a repository from the tracked workspace",
-	Long:  "Resolves the path and removes the matching entry from the global config.",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runUntrack,
+	Long: `Resolves the path and removes the matching entry from the global config.
+
+Against a running daemon what happens depends on what the checkout's family can
+still serve it from. A checkout another corpus can serve is demoted into the
+family's automatic lane and the call runs outright. A plan that removes rows —
+a primary corpus with everything composed over it, or a checkout with nowhere
+to be demoted to — is previewed instead, and runs only with --confirm.`,
+	Args:         cobra.ExactArgs(1),
+	SilenceUsage: true,
+	RunE:         runUntrack,
 }
 
 func init() {
@@ -58,6 +75,9 @@ func init() {
 		"Block until the daemon has indexed the repo and the graph is queryable (useful for CI / one-shot scripts)")
 	trackCmd.Flags().DurationVar(&trackWaitTimeout, "wait-timeout", 10*time.Minute,
 		"With --wait, fail if indexing has not settled within this duration (0 = wait forever)")
+	untrackCmd.Flags().BoolVar(&untrackConfirm, "confirm", false,
+		"Run a plan that removes rows. Without it such a plan is only previewed.")
+	untrackCmd.Flags().StringVar(&untrackFormat, "format", "text", "output format: text|json")
 	rootCmd.AddCommand(trackCmd)
 	rootCmd.AddCommand(untrackCmd)
 }
@@ -379,20 +399,8 @@ func runUntrack(cmd *cobra.Command, args []string) error {
 
 	emitUntrackBanner(w, target, daemon.IsRunning())
 
-	if daemon.IsRunning() {
-		c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
-		if err == nil {
-			defer c.Close()
-			resp, ctlErr := c.Control(daemon.ControlUntrack, daemon.UntrackParams{PathOrPrefix: target})
-			if ctlErr != nil {
-				return ctlErr
-			}
-			if !resp.OK {
-				return fmt.Errorf("untrack rejected: %s %s", resp.ErrorCode, resp.ErrorMsg)
-			}
-			emitUntrackSummary(w, target, untrackResult{viaDaemon: true})
-			return nil
-		}
+	if index, reachable := untrackDaemonIndex(target); reachable {
+		return untrackViaDaemon(cmd, w, index, target)
 	}
 
 	// Standalone fallback.
@@ -410,13 +418,73 @@ func runUntrack(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// untrackDaemonIndex picks the repository the untrack tool call is routed
+// through, and reports false when no running daemon owns it.
+//
+// False is what keeps `gortex untrack` offline-safe: a repo the daemon never
+// loaded is still a line in the user's config, and removing that line is
+// exactly what the standalone fallback is for.
+func untrackDaemonIndex(target string) (string, bool) {
+	if !daemon.IsRunning() {
+		return "", false
+	}
+	// A bare repo prefix names no directory, so the call is routed through the
+	// caller's own working directory instead; the prefix rides as the tool's
+	// argument either way.
+	index := target
+	if !filepath.IsAbs(target) {
+		index = "."
+	}
+	abs, err := filepath.Abs(index)
+	if err != nil {
+		return "", false
+	}
+	if !daemonOwnsRepo(abs) {
+		return "", false
+	}
+	return index, true
+}
+
+// untrackViaDaemon runs the untrack tool and renders what it decided: a
+// preview the caller has to confirm, or the plan it carried out.
+func untrackViaDaemon(cmd *cobra.Command, w io.Writer, index, target string) error {
+	toolArgs := map[string]any{"path": target}
+	if untrackConfirm {
+		toolArgs["confirm"] = true
+	}
+	raw, err := untrackDaemonTool(index, "untrack_repository", toolArgs)
+	if err != nil {
+		return err
+	}
+	if untrackFormat == "json" {
+		return emitDaemonJSON(cmd, raw)
+	}
+	var payload checkoutOutcome
+	if err := json.Unmarshal(raw, &payload); err != nil || payload.Status == "" {
+		// Anything that is not one of this tool's own answers — the
+		// not-tracked guidance, a shape a newer daemon added — is printed as
+		// it came rather than squeezed into a summary card.
+		return emitDaemonJSON(cmd, raw)
+	}
+	if payload.Status == "preview" {
+		renderCheckoutOutcome(cmd.OutOrStdout(), target, payload,
+			"gortex untrack "+target+" --confirm")
+		return nil
+	}
+	emitUntrackSummary(w, target, untrackResult{viaDaemon: true, demoted: payload.Demoted})
+	return nil
+}
+
 // untrackResult mirrors trackResult — kept distinct so the two summaries can
 // drift apart later (e.g. untrack might want to show whether the repo had
 // pending edits before removal) without one breaking the other.
 type untrackResult struct {
 	viaDaemon  bool
 	configOnly bool
-	repoCount  int // tracked repo count *after* removal (configOnly path)
+	// demoted reports that the checkout kept its identity and moved to the
+	// family's automatic lane instead of being removed.
+	demoted   bool
+	repoCount int // tracked repo count *after* removal (configOnly path)
 }
 
 // emitUntrackBanner prints the gortex mesh banner + subtitle indicating which
@@ -444,6 +512,8 @@ func emitUntrackBanner(w io.Writer, target string, daemonUp bool) {
 func emitUntrackSummary(w io.Writer, target string, r untrackResult) {
 	if !progress.IsTTY(w) {
 		switch {
+		case r.demoted:
+			fmt.Fprintf(w, "[gortex] demoted %s to its family's automatic lane (via daemon)\n", target)
 		case r.viaDaemon:
 			fmt.Fprintf(w, "[gortex] untracked %s (via daemon)\n", target)
 		case r.configOnly:
@@ -454,6 +524,9 @@ func emitUntrackSummary(w io.Writer, target string, r untrackResult) {
 
 	var stats []string
 	switch {
+	case r.demoted:
+		stats = append(stats, progress.Stat("via daemon", "", progress.StatGood))
+		stats = append(stats, progress.Stat("served from", "the family primary", progress.StatGood))
 	case r.viaDaemon:
 		stats = append(stats, progress.Stat("via daemon", "", progress.StatGood))
 		stats = append(stats, progress.Stat("index", "dropped", progress.StatGood))

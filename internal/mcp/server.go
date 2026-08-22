@@ -1841,6 +1841,10 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	// Register multi-repo tools when multi-repo components are available.
 	if s.multiIndexer != nil || s.configManager != nil {
 		s.registerMultiRepoTools()
+		// The checkout administration surface reads and drives the same
+		// lifecycle the track / untrack tools do, so it is registered on the
+		// same condition.
+		s.registerCheckoutAdminTools()
 	}
 
 	// Workspace-scope bootstrap tools (list_repos, workspace_info).

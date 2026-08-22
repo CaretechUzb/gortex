@@ -23,6 +23,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/releases"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
@@ -400,6 +401,14 @@ func (c *realController) EnrichCochange(ctx context.Context, p daemon.EnrichCoch
 
 // Untrack evicts a repo from the graph and drops it from config.
 // PathOrPrefix accepts either an absolute path or a repo prefix.
+//
+// What an untrack does is a property of the checkout's family, so the plan is
+// read before anything is torn down and the destructive ones are shown rather
+// than run. The control socket carries the same gate as the tool surface for
+// one reason: an older CLI binary against a newer daemon sends nothing but a
+// path, and a request it means as "drop this one checkout" must not become a
+// retirement of the family's whole automatic lane because the daemon learned
+// how to do that.
 func (c *realController) Untrack(ctx context.Context, p daemon.UntrackParams) (json.RawMessage, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -411,17 +420,30 @@ func (c *realController) Untrack(ctx context.Context, p daemon.UntrackParams) (j
 		return nil, fmt.Errorf("checkout lifecycle not initialized")
 	}
 
-	// The lifecycle resolves the selector, revokes every revocable tracking
-	// intent, and runs the forget saga — which detaches the watcher before
-	// evicting from the graph (a late fsnotify event must not race the
-	// eviction), then persists the config and invalidates every session.
-	result, err := c.lifecycle.Untrack(ctx, p.PathOrPrefix)
+	preview, err := c.lifecycle.PreviewUntrack(ctx, p.PathOrPrefix)
+	if err != nil {
+		return nil, err
+	}
+	if !p.Confirm && destructiveUntrackPlan(preview.Plan) {
+		return json.Marshal(untrackPreviewPayload(preview))
+	}
+
+	// The lifecycle revokes every revocable tracking intent and runs the
+	// plan's saga — which detaches the watcher before evicting from the graph
+	// (a late fsnotify event must not race the eviction), then persists the
+	// config and invalidates every session.
+	result, err := c.lifecycle.ApplyUntrack(ctx, preview)
 	if err != nil {
 		return nil, err
 	}
 
+	status := "untracked"
+	if result.Demoted {
+		status = "demoted"
+	}
 	payload := map[string]any{
-		"status":        "untracked",
+		"status":        status,
+		"plan":          string(result.Plan),
 		"prefix":        result.Prefix,
 		"nodes_removed": result.NodesRemoved,
 		"edges_removed": result.EdgesRemoved,
@@ -430,13 +452,55 @@ func (c *realController) Untrack(ctx context.Context, p daemon.UntrackParams) (j
 		payload["revoked_intents"] = result.Revoked
 	}
 	if len(result.Dependents) > 0 {
-		dependents := make([]string, 0, len(result.Dependents))
-		for _, dep := range result.Dependents {
-			dependents = append(dependents, dep.Detail)
-		}
-		payload["dependents"] = dependents
+		payload["dependents"] = dependentDetails(result.Dependents)
 	}
 	return json.Marshal(payload)
+}
+
+// destructiveUntrackPlan reports whether a plan removes rows a caller has to be
+// asked about. A plan that keeps the checkout — an eviction of a repository
+// with no catalog identity, or a demotion into the family's automatic lane —
+// is the ordinary untrack and runs as it always has.
+func destructiveUntrackPlan(plan indexer.UntrackPlan) bool {
+	switch plan {
+	case indexer.UntrackPlanForget, indexer.UntrackPlanPrimaryClosure:
+		return true
+	default:
+		return false
+	}
+}
+
+// untrackPreviewPayload renders a plan that was shown instead of run.
+func untrackPreviewPayload(preview indexer.UntrackPreview) map[string]any {
+	payload := map[string]any{
+		"status":           "preview",
+		"plan":             string(preview.Plan),
+		"prefix":           preview.Prefix,
+		"is_primary":       preview.IsPrimary,
+		"confirm_required": true,
+		"detail": "nothing was written; repeat the untrack with confirm to run this plan, " +
+			"or use the untrack_repository / forget_checkout tools",
+	}
+	if preview.IsPrimary {
+		payload["sole_primary"] = preview.SolePrimary
+	}
+	if len(preview.Closure) > 0 {
+		payload["closure"] = dependentDetails(preview.Closure)
+	}
+	if len(preview.Preserved) > 0 {
+		payload["preserved"] = dependentDetails(preview.Preserved)
+	}
+	return payload
+}
+
+// dependentDetails flattens closure rows to the one-line statements the control
+// socket has always carried.
+func dependentDetails(dependents []reconcile.Dependent) []string {
+	out := make([]string, 0, len(dependents))
+	for _, dep := range dependents {
+		out = append(out, dep.Detail)
+	}
+	return out
 }
 
 // Reload re-reads the global config, indexes new repos that were added

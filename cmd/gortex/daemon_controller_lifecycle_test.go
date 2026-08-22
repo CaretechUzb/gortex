@@ -97,7 +97,24 @@ func TestControllerTrackUntrackDrivesTheCheckoutLifecycle(t *testing.T) {
 	assert.Equal(t, store_sqlite.IntentSourceCLITrack, intents[0].SourceKind,
 		"the control-socket call is what is recorded as having asked")
 
+	// The wire verb carries the same preview-and-confirm gate as the tool
+	// surface: a plan that removes rows is shown, not run, so an older CLI
+	// binary — which sends nothing but a path — cannot escalate a request to
+	// drop one checkout into a retirement of its family.
 	raw, err = c.Untrack(ctx, daemon.UntrackParams{PathOrPrefix: repo})
+	require.NoError(t, err)
+	var previewed struct {
+		Status          string `json:"status"`
+		Plan            string `json:"plan"`
+		ConfirmRequired bool   `json:"confirm_required"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &previewed))
+	assert.Equal(t, "preview", previewed.Status)
+	assert.Equal(t, string(indexer.UntrackPlanPrimaryClosure), previewed.Plan)
+	assert.True(t, previewed.ConfirmRequired)
+	assert.NotNil(t, mi.GetMetadata(tracked.Prefix), "an unconfirmed untrack writes nothing")
+
+	raw, err = c.Untrack(ctx, daemon.UntrackParams{PathOrPrefix: repo, Confirm: true})
 	require.NoError(t, err)
 	var untracked struct {
 		Status  string   `json:"status"`

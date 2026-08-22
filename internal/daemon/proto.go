@@ -240,6 +240,11 @@ type TrackParams struct {
 // UntrackParams is the payload for ControlUntrack.
 type UntrackParams struct {
 	PathOrPrefix string `json:"path_or_prefix"`
+	// Confirm runs a plan that removes rows. Without it such a plan is
+	// previewed and nothing is written, which is what keeps a client that
+	// predates the plan-shaped untrack — every older CLI binary — from
+	// escalating a request to drop one checkout into a family teardown.
+	Confirm bool `json:"confirm,omitempty"`
 }
 
 // ProbeResponse is the payload returned under Result on a successful
