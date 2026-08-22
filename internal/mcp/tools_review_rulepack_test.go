@@ -92,7 +92,7 @@ func TestReviewRulepackMatches_JoinsRepoRelativeChangedFiles(t *testing.T) {
 		"pkg/widget.go": reviewRulepackFixture,
 	})
 
-	matches := srv.reviewRulepackMatches(context.Background(), []string{"pkg/widget.go"}, prefix, nil)
+	matches := srv.reviewRulepackMatches(context.Background(), []string{"pkg/widget.go"}, changedPathsRepoRelative, prefix, nil)
 	require.NotEmpty(t, matches,
 		"repo-relative changed file must join the prefixed graph path %q/pkg/widget.go", prefix)
 
@@ -114,8 +114,36 @@ func TestReviewRulepackMatches_IgnoresUnchangedFiles(t *testing.T) {
 		"pkg/other.go":  "package pkg\n\nfunc Other() {}\n",
 	})
 
-	matches := srv.reviewRulepackMatches(context.Background(), []string{"pkg/other.go"}, prefix, nil)
+	matches := srv.reviewRulepackMatches(context.Background(), []string{"pkg/other.go"}, changedPathsRepoRelative, prefix, nil)
 	require.Empty(t, matches, "a file outside the changeset must not be scanned")
+}
+
+// TestReviewRulepackMatches_PrefixShadowedPathScansOnlyTheChangedTarget pins
+// the case that makes inferring the path domain unsafe. The repo's own tree
+// carries a top-level directory named like the repo prefix, so the changed
+// git-relative path `repo-a/pkg/widget.go` is *also* a well-formed graph key
+// for the different, unchanged file `pkg/widget.go`.
+//
+// Guessing "this already looks prefixed" skips the real key
+// `repo-a/repo-a/pkg/widget.go` — the changed file is never scanned, and the
+// unchanged shadow is scanned in its place. Both files carry the detector
+// fixture, so a wrong-target scan still returns matches and only the reported
+// path distinguishes the two outcomes.
+func TestReviewRulepackMatches_PrefixShadowedPathScansOnlyTheChangedTarget(t *testing.T) {
+	srv, prefix := setupPrefixedReviewServer(t, map[string]string{
+		"pkg/widget.go":        reviewRulepackFixture,
+		"repo-a/pkg/widget.go": reviewRulepackFixture,
+	})
+	require.Equal(t, "repo-a", prefix, "the fixture's shadow directory must equal the repo prefix")
+
+	matches := srv.reviewRulepackMatches(context.Background(),
+		[]string{"repo-a/pkg/widget.go"}, changedPathsRepoRelative, prefix, nil)
+
+	require.NotEmpty(t, matches, "the changed nested file must be scanned")
+	for _, m := range matches {
+		require.Equal(t, "repo-a/pkg/widget.go", m.File,
+			"only the changed target may be scanned; %q is the unchanged shadow", m.File)
+	}
 }
 
 // TestReviewRulepackMatches_AcceptsAlreadyPrefixedChangedFiles covers the
@@ -127,7 +155,7 @@ func TestReviewRulepackMatches_AcceptsAlreadyPrefixedChangedFiles(t *testing.T) 
 	})
 
 	matches := srv.reviewRulepackMatches(context.Background(),
-		[]string{prefix + "/pkg/widget.go"}, prefix, nil)
+		[]string{prefix + "/pkg/widget.go"}, changedPathsGraphKeyed, prefix, nil)
 	require.NotEmpty(t, matches, "an already-prefixed changed file must still join")
 	require.Equal(t, "pkg/widget.go", matches[0].File)
 }
