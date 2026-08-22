@@ -39,6 +39,10 @@ const (
 	sagaRetirePrimaryClosure sagaKind = "retire_primary_closure"
 	// sagaForgetFamily removes what is left of a family, including its row.
 	sagaForgetFamily sagaKind = "forget_family"
+	// sagaRetireGraph gives up one dedicated graph and leaves the checkout
+	// that owned it in place. It is the demotion half of the primary closure:
+	// the same two phases, without the rows that carry the identity.
+	sagaRetireGraph sagaKind = "retire_dedicated_graph"
 )
 
 // sagaPhase is one durable step. The value is written to the journal before
@@ -88,6 +92,10 @@ var sagaPhases = map[sagaKind][]sagaPhase{
 		phaseForgetFamilyCheckouts,
 		phaseDeleteFamilyRow,
 	},
+	sagaRetireGraph: {
+		phaseDeleteRefViews,
+		phaseReleaseGraph,
+	},
 }
 
 // sagaTarget is what a journal entry carries in its opaque payload: which
@@ -119,6 +127,8 @@ func (t sagaTarget) cleanupID() string {
 		return "retire-primary-closure:" + t.GraphID
 	case sagaForgetFamily:
 		return "forget-family:" + t.FamilyID
+	case sagaRetireGraph:
+		return "retire-graph:" + t.GraphID
 	}
 	return string(t.Kind)
 }

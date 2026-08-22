@@ -44,6 +44,11 @@ const (
 // prefix that names nothing this daemon tracks.
 var ErrCheckoutNotTracked = errors.New("indexer: no tracked repository matches")
 
+// errNoCatalog reports a flow that only means anything against a catalog: the
+// mode changes are moves between catalog rows, so a store without one has no
+// automatic lane to move between.
+var errNoCatalog = errors.New("indexer: this store keeps no checkout catalog")
+
 // LifecycleNotifier is what has to be told that the tracked-repository set
 // changed. The MCP server implements it; a daemon without one still keeps
 // its catalog, config and watcher coherent.
@@ -84,6 +89,12 @@ type CheckoutLifecycleConfig struct {
 	// RefViews bounds how much ref-view payload the store keeps. A zero value
 	// takes the shipped defaults.
 	RefViews RefViewRetention
+
+	// indexBarrier is a test seam: it runs inside a promotion, between the
+	// sample the new corpus has to describe and the index that builds it,
+	// which is exactly the window the re-sample exists to close. nil in
+	// production.
+	indexBarrier func()
 }
 
 // CheckoutLifecycle is the single owner of checkout lifecycle side effects.
@@ -129,6 +140,12 @@ type CheckoutLifecycle struct {
 	refViews  map[string]*RefViewManager
 	// refViewRetention bounds how much ref-view payload survives a sweep.
 	refViewRetention RefViewRetention
+	// indexBarrier is the promotion's test seam; nil in production.
+	indexBarrier func()
+	// routeBarrier stands in for the route withdrawal a promotion runs after
+	// the mode flip, which is the one write no fixture can make the catalog
+	// refuse. A test seam; nil in production.
+	routeBarrier func(context.Context, string) error
 
 	// mu guards only the two late-bound collaborators. Neither is held
 	// across a saga: the hooks re-enter the lifecycle, and holding a lock
@@ -167,6 +184,7 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		coordinators:     map[string]*CheckoutCoordinator{},
 		owed:             map[int64]struct{}{},
 		refViewRetention: cfg.RefViews.withDefaults(),
+		indexBarrier:     cfg.indexBarrier,
 	}
 	if l.leases == nil {
 		l.leases = graphview.NewLeaseManager()
@@ -282,6 +300,16 @@ func (l *CheckoutLifecycle) Register(
 	// end drives the same cleanup hooks a sweep does, and each of them tells
 	// the sessions the tracked set moved.
 	defer l.beginBatch()()
+
+	// A linked worktree of a family that already has a corpus is named by the
+	// rule at the naming seam rather than by its basename or its branch. The
+	// name is pinned onto the entry, so the indexer persists it and every later
+	// pass reads the decision back instead of taking it again.
+	if entry.Name == "" {
+		if prefix := l.dedicatedPrefixFor(ctx, absPath); prefix != "" {
+			entry.Name = prefix
+		}
+	}
 
 	result, err := l.mi.TrackRepoCtx(ctx, entry)
 	if err != nil {
@@ -683,47 +711,91 @@ type UntrackResult struct {
 	EdgesRemoved int
 	// Revoked names the intent sources that were withdrawn.
 	Revoked []string
-	// Dependents is the preview of what the forget took with it.
+	// Dependents is the preview of what the untrack took with it.
 	Dependents []reconcile.Dependent
+	// Plan is the transaction that ran.
+	Plan UntrackPlan
+	// Demoted reports that the checkout kept its identity and moved to the
+	// family's automatic lane instead of being removed.
+	Demoted bool
 }
 
-// Untrack forgets one checkout, whichever surface asked.
+// Untrack stops tracking one checkout, whichever surface asked.
 //
-// The order is the point: every revocable tracking intent is withdrawn first
-// (a non-revocable one aborts before anything is torn down), then the forget
-// saga runs under the checkout's incarnation and drives the cleanup hooks —
-// watcher detach, graph eviction, config persist, session invalidation — so
-// the same sequence happens no matter who called.
+// What that means depends on what the family can still serve the checkout
+// from, so the plan is read from the catalog first and executed second — see
+// PreviewUntrack, which is the same decision and the payload a caller renders
+// before asking.
+//
+// The order inside every plan is the point: every revocable tracking intent is
+// withdrawn first (a non-revocable one aborts before anything is torn down),
+// then the transaction runs under the checkout's incarnation — or the family's
+// primary epoch — and drives the cleanup hooks, so the same sequence happens no
+// matter who called.
 func (l *CheckoutLifecycle) Untrack(ctx context.Context, pathOrPrefix string) (UntrackResult, error) {
-	if l == nil || l.mi == nil {
-		return UntrackResult{}, errors.New("indexer: checkout lifecycle is not wired")
-	}
-	prefix := l.ResolvePrefix(pathOrPrefix)
-	if prefix == "" {
-		return UntrackResult{}, fmt.Errorf("%w: %s", ErrCheckoutNotTracked, pathOrPrefix)
-	}
-	out := UntrackResult{Prefix: prefix}
-
-	checkout, err := l.checkoutForPrefix(ctx, prefix)
+	preview, err := l.PreviewUntrack(ctx, pathOrPrefix)
 	if err != nil {
-		return out, err
+		return UntrackResult{}, err
 	}
-	if checkout == nil {
+	return l.ApplyUntrack(ctx, preview)
+}
+
+// ApplyUntrack executes one previewed plan.
+//
+// It is separate from PreviewUntrack because the destructive plans are shown
+// before they are run: a caller renders the preview, asks, and then hands the
+// same value back here — so what a user confirmed and what happens are one
+// decision rather than two reads of a catalog that may have moved between
+// them. The guards inside each plan are what catch a catalog that did.
+//
+// The first of those guards is the identity itself. A checkout that was
+// re-keyed between the preview and the confirm is a different incarnation of
+// the path, and the plan the caller was shown was decided against the one it
+// replaced — so the confirm refuses rather than demoting or forgetting an
+// identity nobody was asked about. Nothing has been revoked at that point.
+func (l *CheckoutLifecycle) ApplyUntrack(ctx context.Context, preview UntrackPreview) (UntrackResult, error) {
+	out := UntrackResult{
+		Prefix:     preview.Prefix,
+		CheckoutID: preview.CheckoutID,
+		Plan:       preview.Plan,
+		Dependents: preview.Closure,
+	}
+	if preview.Plan == UntrackPlanEvict {
 		// No catalog identity: a store without a catalog, or a directory git
 		// does not administer. The side effects are the same ones the hooks
 		// run, in the same order.
-		out.NodesRemoved, out.EdgesRemoved = l.evictRepo(prefix)
+		out.NodesRemoved, out.EdgesRemoved = l.evictRepo(preview.Prefix)
 		return out, nil
 	}
-	out.CheckoutID = checkout.CheckoutID
+	if preview.Plan == UntrackPlanBlocked {
+		return out, blockedUntrack(preview)
+	}
 
-	dependents, err := l.rec.Dependents(ctx, checkout.CheckoutID)
+	checkout, err := l.checkoutStateOf(ctx, preview.CheckoutID)
 	if err != nil {
 		return out, err
 	}
-	out.Dependents = dependents
+	if preview.Incarnation != "" && checkout.Incarnation != preview.Incarnation {
+		return out, fmt.Errorf(
+			"%w: checkout %s was re-keyed between the preview and the confirm; preview the untrack again",
+			store_sqlite.ErrCatalogStaleGuard, preview.Prefix)
+	}
 
-	revocation, err := l.rec.RevokeTrackingIntents(ctx, checkout.CheckoutID)
+	// The demote plan is the one whose precondition is a pair of rows rather
+	// than the checkout's own, so it is re-asked here — before anything is
+	// revoked, so a refusal leaves the tracked set exactly as the preview
+	// found it.
+	var owned, primary *store_sqlite.DedicatedGraph
+	if preview.Plan == UntrackPlanDemote {
+		if owned, primary, err = l.familyGraphsFor(ctx, checkout); err != nil {
+			return out, err
+		}
+		if err := demotableNow(checkout, preview.Prefix, owned, primary); err != nil {
+			return out, err
+		}
+	}
+
+	revocation, err := l.rec.RevokeTrackingIntents(ctx, preview.CheckoutID)
 	if err != nil {
 		return out, err
 	}
@@ -734,19 +806,83 @@ func (l *CheckoutLifecycle) Untrack(ctx context.Context, pathOrPrefix string) (U
 	// The eviction happens inside the saga, so its counts are read off the
 	// repository's last index before it runs — which is the same estimate
 	// the store's own repo purge reports.
-	before := l.mi.GetMetadata(prefix)
-	if err := l.rec.ForgetCheckout(ctx, checkout.CheckoutID, checkout.Incarnation); err != nil {
-		return out, err
+	before := l.mi.GetMetadata(preview.Prefix)
+
+	switch preview.Plan {
+	case UntrackPlanDemote:
+		if err := l.demote(ctx, checkout, owned, primary.GraphID); err != nil {
+			return out, err
+		}
+		out.Demoted = true
+	case UntrackPlanPrimaryClosure:
+		if err := l.rec.RetirePrimaryClosure(ctx, preview.GraphID, preview.PrimaryEpoch); err != nil {
+			return out, err
+		}
+	default:
+		if err := l.rec.ForgetCheckout(ctx, checkout.CheckoutID, checkout.Incarnation); err != nil {
+			return out, err
+		}
 	}
+
 	if before != nil {
 		out.NodesRemoved, out.EdgesRemoved = before.NodeCount, before.EdgeCount
 	}
-	// The saga evicts through ReleaseGraph. A checkout that never had a
+	// The sagas evict through ReleaseGraph. A checkout that never had a
 	// graph binding still has to leave the corpus.
-	if l.mi.GetMetadata(prefix) != nil {
-		out.NodesRemoved, out.EdgesRemoved = l.evictRepo(prefix)
+	if l.mi.GetMetadata(preview.Prefix) != nil {
+		out.NodesRemoved, out.EdgesRemoved = l.evictRepo(preview.Prefix)
 	}
 	return out, nil
+}
+
+// familyGraphsFor reads the graph a checkout owns and its family's primary,
+// which is the pair every mode change is decided against.
+func (l *CheckoutLifecycle) familyGraphsFor(
+	ctx context.Context, checkout store_sqlite.Checkout,
+) (owned, primary *store_sqlite.DedicatedGraph, err error) {
+	graphs, err := l.catalog.ListDedicatedGraphs(ctx, checkout.FamilyID)
+	if err != nil {
+		return nil, nil, err
+	}
+	for i := range graphs {
+		if graphs[i].OwnerCheckoutID == checkout.CheckoutID {
+			owned = &graphs[i]
+		}
+		if graphs[i].IsPrimaryBase {
+			primary = &graphs[i]
+		}
+	}
+	return owned, primary, nil
+}
+
+// demotableNow re-asks, at confirm time, the question the demote plan was
+// chosen by: is the checkout's own graph still not the family's base, and is a
+// different ready primary still there to serve it from.
+//
+// Both are catalog rows another actor can move between the preview and the
+// confirm, and the demotion cannot survive either of them moving. Rehoming onto
+// a primary that has gone leaves the checkout automatic with nothing under it;
+// rehoming onto its OWN graph — the case where that graph became the primary —
+// flips the checkout to automatic and then cannot retire the corpus it is being
+// served from, leaving a family whose base is owned by an automatic checkout.
+func demotableNow(
+	checkout store_sqlite.Checkout, prefix string, owned, primary *store_sqlite.DedicatedGraph,
+) error {
+	var blockers []string
+	if owned != nil && owned.IsPrimaryBase {
+		blockers = append(blockers, "graph "+owned.GraphID+
+			" has become the primary base of family "+checkout.FamilyID+" since the preview")
+	}
+	if primary == nil || primary.OwnerCheckoutID == checkout.CheckoutID ||
+		primary.State != reconcile.GraphStateReady {
+		blockers = append(blockers, "family "+checkout.FamilyID+
+			" has no other ready primary corpus to serve this checkout from")
+	}
+	if len(blockers) == 0 {
+		return nil
+	}
+	blockers = append(blockers, "preview the untrack again to see what it would do now")
+	return fmt.Errorf("%w: %s: %s", ErrUntrackBlocked, prefix, strings.Join(blockers, "; "))
 }
 
 // --- reload -------------------------------------------------------------
@@ -1063,7 +1199,10 @@ func (l *CheckoutLifecycle) probeDirFor(ctx context.Context, familyID, fallback 
 // The mode is read from the catalog rather than from the report, which carries
 // states and actions but not modes. A dedicated checkout — the primary itself,
 // or a worktree someone tracked explicitly — is served from its own corpus and
-// has nothing for a coordinator to do.
+// has nothing for a coordinator to do, and the route it may still hold from the
+// automatic lane it came from is withdrawn here. Only a coordinator ever writes
+// one, so a route under a dedicated checkout routes nothing and holds two
+// generations out of the retirement scan until it goes.
 func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconcile.FamilyReport) {
 	if l == nil || l.store == nil || l.catalog == nil {
 		return
@@ -1077,8 +1216,13 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 			continue
 		}
 		checkout, found, err := l.catalog.GetCheckout(ctx, entry.CheckoutID)
-		if err != nil || !found || checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic {
+		if err != nil || !found {
 			l.dropCoordinator(entry.CheckoutID)
+			continue
+		}
+		if checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic {
+			l.dropCoordinator(entry.CheckoutID)
+			l.withdrawStaleRoute(ctx, entry.CheckoutID)
 			continue
 		}
 		l.ensureCoordinator(ctx, report.PrimaryGraphID, checkout)
@@ -1101,16 +1245,48 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 	if live {
 		return
 	}
-
-	primary, found, err := l.catalog.GetDedicatedGraph(ctx, primaryGraphID)
-	if err != nil || !found || primary.RepoPrefix == "" {
+	coordinator, err := l.buildCoordinator(ctx, primaryGraphID, checkout)
+	if err != nil {
+		l.logger.Warn("checkout lifecycle: could not start a checkout coordinator",
+			zap.String("checkout", checkout.CheckoutID),
+			zap.String("root", checkout.RootPath), zap.Error(err))
 		return
+	}
+	if coordinator == nil {
+		return
+	}
+	if !l.installCoordinator(checkout.CheckoutID, coordinator) {
+		return
+	}
+	coordinator.Signal("checkout registered")
+}
+
+// buildCoordinator constructs one checkout's coordinator against a graph,
+// without registering it. It reports (nil, nil) when the graph cannot back a
+// coordinator yet — a primary that is bound in the catalog but has not
+// finished indexing, which the next sweep tries again.
+//
+// Construction and registration are separate because a transition builds a
+// coordinator to drive one off-route rebuild with, and only registers it once
+// that rebuild has installed the route. A coordinator that went into the
+// registry first would have its loop signalled onto a route it is still
+// building the layers for.
+func (l *CheckoutLifecycle) buildCoordinator(
+	ctx context.Context, primaryGraphID string, checkout store_sqlite.Checkout,
+) (*CheckoutCoordinator, error) {
+	if l.store == nil || l.catalog == nil {
+		return nil, nil
+	}
+	primary, found, err := l.catalog.GetDedicatedGraph(ctx, primaryGraphID)
+	if err != nil {
+		return nil, err
+	}
+	if !found || primary.RepoPrefix == "" {
+		return nil, nil
 	}
 	idx := l.mi.GetIndexer(primary.RepoPrefix)
 	if idx == nil {
-		// The primary is bound in the catalog but not served yet — a boot that
-		// has not finished indexing it. The next sweep tries again.
-		return
+		return nil, nil
 	}
 
 	index := config.Default().Index
@@ -1119,7 +1295,7 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 		repoCfg := l.cfgMgr.GetRepoConfig(primary.RepoPrefix)
 		index, watch = repoCfg.Index, repoCfg.Watch
 	}
-	coordinator, err := NewCheckoutCoordinator(CheckoutCoordinatorConfig{
+	return NewCheckoutCoordinator(CheckoutCoordinatorConfig{
 		CheckoutID:   checkout.CheckoutID,
 		CheckoutRoot: checkout.RootPath,
 		FamilyID:     checkout.FamilyID,
@@ -1143,22 +1319,21 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 		// long to wait means it for its views too.
 		Debounce: time.Duration(watch.DebounceMs) * time.Millisecond,
 	})
-	if err != nil {
-		l.logger.Warn("checkout lifecycle: could not start a checkout coordinator",
-			zap.String("checkout", checkout.CheckoutID),
-			zap.String("root", checkout.RootPath), zap.Error(err))
-		return
-	}
+}
 
+// installCoordinator puts a coordinator in the registry, and reports whether
+// it got the slot. A coordinator that lost a race is closed here rather than
+// handed back, so a caller cannot leak the goroutine it just lost.
+func (l *CheckoutLifecycle) installCoordinator(checkoutID string, coordinator *CheckoutCoordinator) bool {
 	l.coordMu.Lock()
-	if _, raced := l.coordinators[checkout.CheckoutID]; raced {
+	if _, raced := l.coordinators[checkoutID]; raced {
 		l.coordMu.Unlock()
 		_ = coordinator.Close()
-		return
+		return false
 	}
-	l.coordinators[checkout.CheckoutID] = coordinator
+	l.coordinators[checkoutID] = coordinator
 	l.coordMu.Unlock()
-	coordinator.Signal("checkout registered")
+	return true
 }
 
 // dropCoordinator stops one checkout's coordinator and takes over what it was
@@ -1214,6 +1389,27 @@ func (l *CheckoutLifecycle) oweRoutedGenerations(ctx context.Context, checkoutID
 		return
 	}
 	l.oweRetirement(route.CommitGenerationID, route.DirtyGenerationID)
+}
+
+// withdrawStaleRoute removes a route row left under a checkout that has stopped
+// being served through the automatic lane, and takes over the generations it
+// was naming.
+//
+// It is the sweep's half of a promotion: the flip is the commit point and the
+// withdrawal that follows it is cleanup, so a withdrawal that failed there
+// leaves a row for the next pass over the family to find. Reading the route
+// first is what keeps the read cheap for the checkouts — every dedicated one,
+// every sweep — that have no route at all.
+func (l *CheckoutLifecycle) withdrawStaleRoute(ctx context.Context, checkoutID string) {
+	if l == nil || l.catalog == nil || checkoutID == "" {
+		return
+	}
+	route, found, err := l.catalog.GetCheckoutRoute(ctx, checkoutID)
+	if err != nil || !found {
+		return
+	}
+	l.oweRetirement(route.CommitGenerationID, route.DirtyGenerationID)
+	l.withdrawAutomaticRoute(ctx, checkoutID)
 }
 
 // SignalCheckout marks one checkout dirty, and reports whether anything was

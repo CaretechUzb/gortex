@@ -90,6 +90,12 @@ const (
 // flips again, because that would be forcing its answer over the winner's.
 var errRouteMoved = errors.New("indexer: the checkout route moved under this coordinator")
 
+// errCheckoutUnsettled reports that two working-tree builds in a row were torn
+// by edits landing under them. A cycle answers it by rescheduling; a caller
+// driving a transition has to decide whether to wait for the checkout to go
+// quiet or to give up.
+var errCheckoutUnsettled = errors.New("indexer: the working tree moved under two builds")
+
 // CheckoutCoordinatorConfig is what one coordinator needs to serve one
 // automatic checkout.
 type CheckoutCoordinatorConfig struct {
@@ -201,6 +207,12 @@ type CheckoutCoordinator struct {
 	stop   chan struct{}
 	done   chan struct{}
 	once   sync.Once
+
+	// cycleMu serializes the loop's own cycles against a caller-driven
+	// transition. Both move this checkout's route, and a transition that
+	// builds off-route only keeps its promise if the loop cannot flip the
+	// route to a half-built state while it is building.
+	cycleMu sync.Mutex
 
 	mu sync.Mutex
 	// retained is the commit-layer reuse cache, most recently routed first.
@@ -387,7 +399,9 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	reason := c.reason
 	c.mu.Unlock()
 
+	c.cycleMu.Lock()
 	out := c.reconcile(ctx)
+	c.cycleMu.Unlock()
 	switch {
 	case out.Err != nil:
 		c.logger.Warn("checkout coordinator: reconcile failed",
@@ -460,6 +474,135 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		out.Err = err
 	}
 	return out
+}
+
+// RehomeTo rebuilds this checkout's whole stack over another dedicated graph
+// and installs it in one route write.
+//
+// It is the transition primitive both mode changes are built on. The layers
+// are built while the route still says whatever it said before, and the graph
+// and both generation pointers move together in a single compare-and-set, so a
+// reader materializing during the rebuild gets the old stack or the new one —
+// never a route naming the new graph with no layers over it, which is what the
+// ordinary cycle leaves for the length of a build when it finds the primary
+// moved under it.
+//
+// A checkout with no route at all — a dedicated one being demoted — has its
+// route installed by the same write. There is nothing to compare against in
+// that case: only a coordinator writes a checkout's route, and a checkout that
+// has none has no coordinator either.
+func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (CheckoutCycle, error) {
+	var out CheckoutCycle
+	if c == nil {
+		return out, errors.New("indexer: no coordinator to rehome")
+	}
+	c.cycleMu.Lock()
+	defer c.cycleMu.Unlock()
+
+	dedicated, found, err := c.catalog.GetDedicatedGraph(ctx, graphID)
+	if err != nil {
+		return out, err
+	}
+	if !found {
+		return out, fmt.Errorf("%w: dedicated graph %s", store_sqlite.ErrCatalogNotFound, graphID)
+	}
+	base, err := graphBase(ctx, c.catalog, dedicated)
+	if err != nil {
+		return out, err
+	}
+	head, err := gitstate.SampleHEAD(ctx, c.root)
+	if err != nil {
+		return out, fmt.Errorf("indexer: sample HEAD of %s: %w", c.root, err)
+	}
+	if head.TreeOID == "" {
+		return out, fmt.Errorf("indexer: checkout %s has no HEAD tree", c.root)
+	}
+	route, routed, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil {
+		return out, err
+	}
+
+	commitGeneration, reused, err := c.resolveCommitLayer(ctx, base, head.TreeOID)
+	if err != nil {
+		return out, err
+	}
+	out.CommitGenerationID, out.CommitBuilt, out.CommitReused = commitGeneration, !reused, reused
+
+	dirtyGeneration, err := c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration)
+	if err != nil {
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		return out, err
+	}
+	if dirtyGeneration == 0 {
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		out.Rescheduled = true
+		return out, errCheckoutUnsettled
+	}
+	out.DirtyGenerationID, out.DirtyBuilt = dirtyGeneration, true
+
+	if err := c.installStack(ctx, route, routed, base.graphID, commitGeneration, dirtyGeneration); err != nil {
+		c.abandonBuild(ctx, dirtyGeneration, true)
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		if errors.Is(err, errRouteMoved) {
+			out.Rescheduled = true
+		}
+		return out, err
+	}
+
+	// Everything the cache held was built over the graph the checkout has just
+	// left, so none of it can ever be routed here again — except the layer
+	// this transition routed, which the cache may have supplied.
+	c.dropRetained(ctx, commitGeneration)
+	c.retainCommit(ctx, generationIdentityKey(c.commitIdentity(base, head.TreeOID)), commitGeneration)
+	c.rememberRoutedDirty(dirtyGeneration)
+	if routed {
+		c.offerRetire(ctx, route.DirtyGenerationID)
+		c.offerRetire(ctx, route.CommitGenerationID)
+	}
+	return out, nil
+}
+
+// installStack points a checkout's route at a graph and both of its
+// generations in one write.
+func (c *CheckoutCoordinator) installStack(
+	ctx context.Context,
+	route store_sqlite.CheckoutRoute,
+	routed bool,
+	graphID string,
+	commitGeneration, dirtyGeneration int64,
+) error {
+	if !routed {
+		return c.catalog.UpsertCheckoutRoute(ctx, store_sqlite.CheckoutRoute{
+			CheckoutID:         c.checkoutID,
+			GraphID:            graphID,
+			CommitGenerationID: commitGeneration,
+			DirtyGenerationID:  dirtyGeneration,
+			State:              store_sqlite.RouteActive,
+		})
+	}
+	err := c.catalog.FlipCheckoutRoute(ctx, store_sqlite.FlipCheckoutRouteRequest{
+		CheckoutID:         c.checkoutID,
+		ExpectedRouteEpoch: route.RouteEpoch,
+		GraphID:            graphID,
+		CommitGenerationID: commitGeneration,
+		DirtyGenerationID:  dirtyGeneration,
+		State:              store_sqlite.RouteActive,
+	})
+	if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+		return fmt.Errorf("%w: whole stack", errRouteMoved)
+	}
+	return err
+}
+
+// abandonBuild gives up a generation a transition will not route. One this
+// call built is superseded and offered for collection; one it took from the
+// reuse cache belongs to the cycle that built it and is left alone.
+func (c *CheckoutCoordinator) abandonBuild(ctx context.Context, generationID int64, built bool) {
+	if generationID <= 0 || !built {
+		return
+	}
+	c.supersede(ctx, generationID)
+	c.offerRetire(ctx, generationID)
 }
 
 // primaryBase reads the family's primary dedicated graph and the committed
@@ -570,7 +713,7 @@ func (c *CheckoutCoordinator) ensureRoute(ctx context.Context, base primaryBase)
 	route.CommitGenerationID, route.DirtyGenerationID = 0, 0
 	route.RouteEpoch++
 	route.State = store_sqlite.RoutePending
-	c.dropRetained(ctx)
+	c.dropRetained(ctx, 0)
 	c.offerRetire(ctx, previousDirty)
 	c.offerRetire(ctx, previousCommit)
 	return route, nil
@@ -603,18 +746,44 @@ func (c *CheckoutCoordinator) reconcileCommitSlot(
 	}
 
 	previous := route.CommitGenerationID
-	if cached, ok := c.cachedCommit(ctx, key); ok {
-		if err := c.moveCommitSlot(ctx, route, cached); err != nil {
-			// A cached generation is another cycle's work, not this one's, so
-			// a lost flip leaves it exactly as it was.
-			return 0, err
-		}
-		out.CommitReused = true
-		c.retainCommit(ctx, key, cached)
-		c.releaseCommit(ctx, previous)
-		return cached, nil
+	generationID, reused, err := c.resolveCommitLayer(ctx, base, targetTree)
+	if err != nil {
+		return 0, err
 	}
+	if !reused {
+		out.CommitBuilt = true
+	}
+	if err := c.moveCommitSlot(ctx, route, generationID); err != nil {
+		if !reused {
+			c.supersede(ctx, generationID)
+			c.offerRetire(ctx, generationID)
+		}
+		// A cached generation is another cycle's work, not this one's, so a
+		// lost flip leaves it exactly as it was.
+		return 0, err
+	}
+	if reused {
+		out.CommitReused = true
+	}
+	c.retainCommit(ctx, key, generationID)
+	c.releaseCommit(ctx, previous)
+	return generationID, nil
+}
 
+// resolveCommitLayer reaches a commit generation describing one tree over one
+// base, re-routing a retained generation with that identity when the cache
+// holds one and building otherwise.
+//
+// It touches the route not at all. That is what lets a transition build a
+// whole stack for a graph the checkout is not being served from yet and only
+// then decide, in one write, that it is.
+func (c *CheckoutCoordinator) resolveCommitLayer(
+	ctx context.Context, base primaryBase, targetTree string,
+) (generationID int64, reused bool, err error) {
+	identity := c.commitIdentity(base, targetTree)
+	if cached, ok := c.cachedCommit(ctx, generationIdentityKey(identity)); ok {
+		return cached, true, nil
+	}
 	generationID, report, err := c.builder.BuildCommitLayer(ctx, CommitLayerRequest{
 		Identity:      identity,
 		Base:          c.store.AtGeneration(0),
@@ -627,22 +796,14 @@ func (c *CheckoutCoordinator) reconcileCommitSlot(
 		ProjectID:     c.projectID,
 	})
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	out.CommitBuilt = true
 	if report.ClosureTruncated {
 		c.logger.Warn("checkout coordinator: commit layer closure truncated",
 			zap.String("checkout", c.checkoutID), zap.Int64("generation", generationID),
 			zap.Int("cap", report.ClosureCap))
 	}
-	if err := c.moveCommitSlot(ctx, route, generationID); err != nil {
-		c.supersede(ctx, generationID)
-		c.offerRetire(ctx, generationID)
-		return 0, err
-	}
-	c.retainCommit(ctx, key, generationID)
-	c.releaseCommit(ctx, previous)
-	return generationID, nil
+	return generationID, false, nil
 }
 
 // moveCommitSlot points the commit slot at a different generation, dropping
@@ -766,18 +927,49 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		}
 	}
 
-	dirtyBase, err := c.commitLayerReader(commitGeneration)
+	generationID, err := c.buildDirtyLayerOver(ctx, route.GraphID, commitGeneration)
 	if err != nil {
 		return err
 	}
-	identity := c.dirtyIdentity(route.GraphID, commitGeneration)
+	if generationID == 0 {
+		// The route still names the last coherent state, which is the point: a
+		// stale view of a real state beats a torn view of a state that never was.
+		out.Rescheduled = true
+		c.Signal("the working tree moved under two builds")
+		return nil
+	}
+	out.DirtyBuilt = true
+	previous := route.DirtyGenerationID
+	if err := c.flip(ctx, route, store_sqlite.RouteSlotDirty, generationID); err != nil {
+		c.supersede(ctx, generationID)
+		c.offerRetire(ctx, generationID)
+		return err
+	}
+	out.DirtyGenerationID = generationID
+	c.offerRetire(ctx, previous)
+	return nil
+}
 
-	// Two attempts, no more. Each build re-samples the checkout itself and
-	// refuses to publish a payload the working tree has already moved past, so
-	// the second attempt is the "one more try against what it is now" the
-	// refusal is worth. A checkout under a stream of edits would invalidate
-	// every attempt, and a coordinator that kept trying would spin instead of
-	// letting the next quiet window decide.
+// buildDirtyLayerOver builds the working-tree layer over one commit
+// generation, and reports 0 with a nil error when two attempts in a row were
+// torn by edits landing under them.
+//
+// Two attempts, no more. Each build re-samples the checkout itself and refuses
+// to publish a payload the working tree has already moved past, so the second
+// attempt is the "one more try against what it is now" the refusal is worth. A
+// checkout under a stream of edits would invalidate every attempt, and a caller
+// that kept trying would spin instead of letting the next quiet window decide.
+//
+// Like resolveCommitLayer it writes nothing to the route: what the checkout
+// reads is the caller's decision.
+func (c *CheckoutCoordinator) buildDirtyLayerOver(
+	ctx context.Context, graphID string, commitGeneration int64,
+) (int64, error) {
+	dirtyBase, err := c.commitLayerReader(commitGeneration)
+	if err != nil {
+		return 0, err
+	}
+	identity := c.dirtyIdentity(graphID, commitGeneration)
 	for attempt := 0; attempt < 2; attempt++ {
 		generationID, _, err := c.builder.BuildDirtyLayer(ctx, DirtyLayerRequest{
 			Identity:     identity,
@@ -789,19 +981,10 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 			buildBarrier: c.dirtyBarrier,
 		})
 		if err == nil {
-			out.DirtyBuilt = true
-			previous := route.DirtyGenerationID
-			if err := c.flip(ctx, route, store_sqlite.RouteSlotDirty, generationID); err != nil {
-				c.supersede(ctx, generationID)
-				c.offerRetire(ctx, generationID)
-				return err
-			}
-			out.DirtyGenerationID = generationID
-			c.offerRetire(ctx, previous)
-			return nil
+			return generationID, nil
 		}
 		if !errors.Is(err, ErrDirtySnapshotChanged) {
-			return err
+			return 0, err
 		}
 		// The refused attempt is a whole payload for a state the checkout has
 		// already left. confirmDirtySnapshot superseded it, and nothing will
@@ -813,12 +996,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 			c.offerRetire(ctx, torn.GenerationID)
 		}
 	}
-
-	// The route still names the last coherent state, which is the point: a
-	// stale view of a real state beats a torn view of a state that never was.
-	out.Rescheduled = true
-	c.Signal("the working tree moved under two builds")
-	return nil
+	return 0, nil
 }
 
 // commitLayerReader is the reader a dirty-layer build computes its affected
@@ -988,12 +1166,19 @@ func (c *CheckoutCoordinator) forgetRetained(generationID int64) {
 // dropRetained empties the reuse cache and offers everything it held for
 // retirement. The graph the cached generations composed over is gone, so none
 // of them will ever be routed again.
-func (c *CheckoutCoordinator) dropRetained(ctx context.Context) {
+//
+// keep names the one generation to spare — the layer a transition has just
+// routed, which is in the cache because it was reachable there and must not be
+// collected out from under the route it now serves. 0 spares nothing.
+func (c *CheckoutCoordinator) dropRetained(ctx context.Context, keep int64) {
 	c.mu.Lock()
 	retained := c.retained
 	c.retained = nil
 	c.mu.Unlock()
 	for _, entry := range retained {
+		if entry.generationID == keep {
+			continue
+		}
 		c.offerRetire(ctx, entry.generationID)
 	}
 }

@@ -167,6 +167,36 @@ SELECT common_dir_identity, display_remote, state, primary_epoch, created_at, la
 	return family, true, nil
 }
 
+// ListRepositoryFamilies returns every family the catalog holds, ordered by
+// family id so two passes over an unchanged catalog see the same order.
+//
+// It is the entry point for a whole-catalog read. Every other listing is keyed
+// by a family, a graph or a checkout, so without this the only way to enumerate
+// what the daemon knows is to re-derive the families from the tracked corpus —
+// which misses exactly the ones whose roots have gone away.
+func (c *Catalog) ListRepositoryFamilies(ctx context.Context) ([]RepositoryFamily, error) {
+	rows, err := c.store.db.QueryContext(ctx, `
+SELECT family_id, common_dir_identity, display_remote, state, primary_epoch, created_at, last_seen
+  FROM repository_families ORDER BY family_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RepositoryFamily
+	for rows.Next() {
+		var family RepositoryFamily
+		if err := rows.Scan(&family.FamilyID, &family.CommonDirIdentity, &family.DisplayRemote,
+			&family.State, &family.PrimaryEpoch, &family.CreatedAt, &family.LastSeen); err != nil {
+			return nil, err
+		}
+		out = append(out, family)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DeleteRepositoryFamily removes a family. Checkouts and dedicated graphs
 // reference it with ON DELETE RESTRICT, so SQLite refuses the delete until the
 // family is empty — the row is the last thing a family teardown removes.
@@ -551,6 +581,35 @@ SELECT transition_id, cause, prior_desired_mode, prior_effective_mode, requested
 	transition.SourceSnapshotHash = snapshotHash.String
 	transition.State = IntentTransitionState(state)
 	return transition, true, nil
+}
+
+// UpdateIntentTransitionProgress records how far an in-flight mode change
+// got. Both ids guard the write, so a caller holding a stale transition id
+// cannot stamp progress onto the transition that replaced its own.
+//
+// A transition that stays pending is one a retry may adopt; the error it
+// carries is why the last attempt stopped, not a terminal verdict.
+func (c *Catalog) UpdateIntentTransitionProgress(
+	ctx context.Context,
+	checkoutID, transitionID string,
+	state IntentTransitionState,
+	lastError string,
+	lastProgress int64,
+) error {
+	if err := requireCatalogID("checkout_id", checkoutID); err != nil {
+		return err
+	}
+	if err := requireCatalogID("transition_id", transitionID); err != nil {
+		return err
+	}
+	if err := requireCatalogValue("state", state, intentTransitionStates); err != nil {
+		return err
+	}
+	return c.execGuarded(ctx, fmt.Sprintf("transition %s on checkout %s", transitionID, checkoutID), `
+UPDATE intent_transitions
+   SET state = ?, last_error = ?, last_progress = ?
+ WHERE transition_id = ? AND checkout_id = ?`,
+		string(state), lastError, lastProgress, transitionID, checkoutID)
 }
 
 // CompleteIntentTransition releases the transition slot: it deletes the row

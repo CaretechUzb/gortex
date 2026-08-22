@@ -113,6 +113,14 @@ const (
 	DependentRefView DependentKind = "ref_view"
 	// DependentRoute is a checkout route pointing at the graph.
 	DependentRoute DependentKind = "route"
+	// DependentGraph is a dedicated graph — the corpus a checkout's nodes
+	// live in.
+	DependentGraph DependentKind = "graph"
+	// DependentLayer is one built payload generation of a checkout.
+	DependentLayer DependentKind = "layer"
+	// DependentFamily is the repository family row itself, which goes when
+	// the retirement leaves it with no graph to be served from.
+	DependentFamily DependentKind = "family"
 )
 
 // Dependent is one row that only exists because a checkout does.
